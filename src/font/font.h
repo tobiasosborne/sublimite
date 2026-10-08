@@ -5,7 +5,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include "base/base.h"
+#include "work/work.h"
 
 #define FONT_ATLAS_PAGE_DIM   1024u
 #define FONT_ATLAS_MAX_PAGES  8u
@@ -33,6 +36,15 @@ typedef struct font_cell {
     uint32_t descent;
 } font_cell;
 
+/* Baked ASCII atlas (0x20..0x7E) for one pixel size. Static const data. */
+typedef struct font_ascii_atlas {
+    uint32_t           px;
+    font_cell          cell;
+    const font_metric *metrics;   /* 95 entries, cp - 0x20 */
+    const uint8_t     *pixels;    /* one row of 95 cells */
+    size_t             pixels_len;
+} font_ascii_atlas;
+
 typedef struct font {
     _Alignas(16) unsigned char info[FONT_OPAQUE_BYTES]; /* opaque stbtt_fontinfo */
     const unsigned char *data;
@@ -40,6 +52,7 @@ typedef struct font {
     uint32_t px;
     float    scale;
     font_cell cell;
+    const font_ascii_atlas *atlas; /* baked atlas matching this font at px, or NULL */
 } font_t;
 
 typedef struct font_bitmap {
@@ -79,6 +92,31 @@ const font_metric *font_ascii_glyph(uint32_t cp);      /* NULL outside ASCII */
 const uint8_t     *font_ascii_pixels(size_t *len);     /* one row of cells */
 font_cell          font_ascii_cell(void);
 uint32_t           font_ascii_px(void);
+
+/* Atlas selection by requested px (15 and 30 are baked); NULL if none. */
+const font_ascii_atlas *font_ascii_atlas_for_px(uint32_t px);
+const font_metric      *font_ascii_atlas_glyph(const font_ascii_atlas *a, uint32_t cp);
+
+/* ---- Fallback font discovery (fontconfig via dlopen, on a work-pool worker) */
+#define FONT_FALLBACK_PATH_MAX 512u
+#define FONT_FALLBACK_MSG_KIND 0x46414C42u   /* "FALB" */
+
+typedef struct font_fallback {
+    _Atomic uint32_t done;            /* 1 once discovery finished (release) */
+    /* Valid after done == 1: */
+    char       cjk[FONT_FALLBACK_PATH_MAX];    /* "" if none */
+    char       emoji[FONT_FALLBACK_PATH_MAX];  /* monochrome emoji; "" if none */
+    int        have_fontconfig;       /* libfontconfig.so.1 loaded */
+    uint64_t   elapsed_ns;
+    pthread_t  worker;                /* thread that ran the discovery */
+} font_fallback;
+
+/* Synchronous discovery with the given soname (test seam). Fills fb, sets done. */
+void font_fallback_discover(font_fallback *fb, const char *soname);
+/* work_job fn: ctx->arg is a font_fallback*. Publishes FONT_FALLBACK_MSG_KIND. */
+void font_fallback_job(work_ctx *c);
+/* Reads a font file into arena memory (for the fallback face). NULL on failure. */
+unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len);
 
 /* Shelf allocator over FONT_ATLAS_PAGE_DIM square R8 pages. */
 void font_atlas_init(font_atlas *a, uint32_t max_pages);

@@ -2,6 +2,27 @@
 #include "font/font.h"
 #include <string.h>
 
+/* stb_truetype allocations go to a per-call arena (Law 2: no libc malloc on
+ * the typing path). info->userdata points at a font_stb_ctx that exists only
+ * inside font_raster_glyph; otherwise userdata is NULL and stb gets NULL back
+ * (metrics paths never allocate in stb). free is a no-op: the caller resets
+ * the arena to its mark. */
+typedef struct font_stb_ctx {
+    edit_arena *arena;
+    int         failed;
+} font_stb_ctx;
+
+static void *font_stb_alloc(size_t n, void *u)
+{
+    font_stb_ctx *c = (font_stb_ctx *)u;
+    if (!c) return NULL;
+    void *p = edit_arena_alloc(c->arena, n ? n : 1u, 16);
+    if (!p) c->failed = 1;
+    return p;
+}
+#define STBTT_malloc(x, u) font_stb_alloc((size_t)(x), (u))
+#define STBTT_free(x, u)   ((void)(x), (void)(u))
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wall"
 #pragma GCC diagnostic ignored "-Wextra"
@@ -18,6 +39,7 @@
 #pragma GCC diagnostic pop
 
 #include "font/atlas_ascii.h"
+#include "font/atlas_ascii_15.h"
 
 _Static_assert(sizeof(stbtt_fontinfo) <= FONT_OPAQUE_BYTES, "font blob too small");
 
@@ -63,7 +85,10 @@ int font_init(font_t *f, const unsigned char *ttf, size_t len)
 {
     if (!f || !ttf || len < 12) return FONT_ERR_ARG;
     memset(f->info, 0, sizeof f->info);
-    if (!stbtt_InitFont(info_of(f), ttf, 0)) return FONT_ERR_INIT;
+    int off = stbtt_GetFontOffsetForIndex(ttf, 0);   /* handles .ttc collections */
+    if (off < 0 || !stbtt_InitFont(info_of(f), ttf, off)) return FONT_ERR_INIT;
+    info_of(f)->userdata = NULL;
+    f->atlas = NULL;
     f->data = ttf;
     f->len = len;
     f->px = 0;
@@ -71,6 +96,8 @@ int font_init(font_t *f, const unsigned char *ttf, size_t len)
     memset(&f->cell, 0, sizeof f->cell);
     return FONT_OK;
 }
+
+static const font_ascii_atlas *atlas_matching(const font_t *f);
 
 int font_set_px(font_t *f, uint32_t px)
 {
@@ -93,6 +120,7 @@ int font_set_px(font_t *f, uint32_t px)
         if (m.advance > 0 && (uint32_t)m.advance > maxadv) maxadv = (uint32_t)m.advance;
     }
     f->cell.cell_w = maxadv;
+    f->atlas = atlas_matching(f);
     return FONT_OK;
 }
 
@@ -129,9 +157,18 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     if (out->w == 0 || out->h == 0) return FONT_OK;
     uint8_t *px = edit_arena_alloc(arena, (size_t)out->w * out->h, 1);
     if (!px) return FONT_ERR_NOMEM;
+    memset(px, 0, (size_t)out->w * out->h);
+    /* stb scratch (vertices, edges, scanlines) comes from the same arena after
+     * the bitmap and is released by rewinding to this mark. */
+    edit_arena_mark_t mk = edit_arena_mark(arena);
+    font_stb_ctx ctx = { arena, 0 };
+    info_of(f)->userdata = &ctx;
     /* stb writes a box-sized bitmap whose origin is the box's top-left. */
     stbtt_MakeGlyphBitmap(cinfo_of(f), px, (int)out->w, (int)out->h, (int)out->w,
                           f->scale, f->scale, g);
+    info_of(f)->userdata = NULL;
+    edit_arena_reset_to_mark(arena, mk);
+    if (ctx.failed) return FONT_ERR_NOMEM;
     out->pixels = px;
     return FONT_OK;
 }
@@ -153,26 +190,64 @@ int font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,
     return FONT_OK;
 }
 
+static const font_ascii_atlas atlases[2] = {
+    { 15u, { FONT_ATLAS_CELL_W_15, FONT_ATLAS_CELL_H_15, FONT_ATLAS_ASCENT_15,
+             FONT_ATLAS_CELL_H_15 - FONT_ATLAS_ASCENT_15 },
+      font_atlas_metrics_15, font_atlas_pixels_15, sizeof font_atlas_pixels_15 },
+    { 30u, { FONT_ATLAS_CELL_W, FONT_ATLAS_CELL_H, FONT_ATLAS_ASCENT,
+             FONT_ATLAS_CELL_H - FONT_ATLAS_ASCENT },
+      font_atlas_metrics, font_atlas_pixels, sizeof font_atlas_pixels },
+};
+
+const font_ascii_atlas *font_ascii_atlas_for_px(uint32_t px)
+{
+    for (size_t i = 0; i < 2; i++)
+        if (atlases[i].px == px) return &atlases[i];
+    return NULL;
+}
+
+const font_metric *font_ascii_atlas_glyph(const font_ascii_atlas *a, uint32_t cp)
+{
+    if (!a || cp < FONT_ASCII_FIRST || cp > FONT_ASCII_LAST) return NULL;
+    return &a->metrics[cp - FONT_ASCII_FIRST];
+}
+
+/* The baked atlas is used only if every baked metric and the cell equal the
+ * live font's values, so a different face (e.g. CJK fallback) never gets it. */
+static const font_ascii_atlas *atlas_matching(const font_t *f)
+{
+    const font_ascii_atlas *a = font_ascii_atlas_for_px(f->px);
+    if (!a) return NULL;
+    if (a->cell.cell_w != f->cell.cell_w || a->cell.cell_h != f->cell.cell_h ||
+        a->cell.ascent != f->cell.ascent)
+        return NULL;
+    for (uint32_t cp = FONT_ASCII_FIRST; cp <= FONT_ASCII_LAST; cp++) {
+        int g = 0;
+        font_metric m;
+        const font_metric *b = &a->metrics[cp - FONT_ASCII_FIRST];
+        if (glyph_of(f, cp, &g) != FONT_OK) return NULL;
+        metrics_of_glyph(f, g, &m);
+        if (m.advance != b->advance || m.bearing_x != b->bearing_x ||
+            m.bearing_y != b->bearing_y || m.w != b->w || m.h != b->h)
+            return NULL;
+    }
+    return a;
+}
+
 const font_metric *font_ascii_glyph(uint32_t cp)
 {
-    if (cp < FONT_ASCII_FIRST || cp > FONT_ASCII_LAST) return NULL;
-    return &font_atlas_metrics[cp - FONT_ASCII_FIRST];
+    return font_ascii_atlas_glyph(&atlases[1], cp);
 }
 
 const uint8_t *font_ascii_pixels(size_t *len)
 {
-    if (len) *len = sizeof font_atlas_pixels;
-    return font_atlas_pixels;
+    if (len) *len = atlases[1].pixels_len;
+    return atlases[1].pixels;
 }
 
-font_cell font_ascii_cell(void)
-{
-    font_cell c = { FONT_ATLAS_CELL_W, FONT_ATLAS_CELL_H, FONT_ATLAS_ASCENT,
-                    FONT_ATLAS_CELL_H - FONT_ATLAS_ASCENT };
-    return c;
-}
+font_cell font_ascii_cell(void) { return atlases[1].cell; }
 
-uint32_t font_ascii_px(void) { return FONT_ATLAS_PX; }
+uint32_t font_ascii_px(void) { return atlases[1].px; }
 
 void font_atlas_init(font_atlas *a, uint32_t max_pages)
 {
