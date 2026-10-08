@@ -92,8 +92,10 @@ check: $(TEST_SAN)
 	@set -e; for t in $(TEST_SAN); do echo "== $$t"; $$t; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 
 # Benches: release build, each must exit 0 (gate met).
+# Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;
+# the full piece matrix is run by tools/bench_variant.sh on an idle box).
 bench: $(BENCH_BIN)
-	@set -e; for b in $(BENCH_BIN); do echo "== $$b"; $$b; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
+	@set -e; for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; $$b $$args; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
 
 fuzz: $(FUZZ_BIN)
 	@echo "fuzz: $(words $(FUZZ_BIN)) fuzzers built"
