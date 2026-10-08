@@ -2,6 +2,7 @@
  * (clipboard is not on the typing path). INCR transfers are a known gap: requests that come back as INCR
  * fail; we refuse to serve data larger than one X request (BIG-REQUESTS makes that ~16 MB). */
 #include "clip.h"
+#include <xcb/xcbext.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,6 +13,11 @@ typedef struct x11_clip {
     uint8_t *own[NSEL];
     size_t own_len[NSEL];
     uint32_t own_time[NSEL];
+    xcb_get_selection_owner_cookie_t owner_cookie[NSEL];
+    xcb_get_property_cookie_t property_cookie[NSEL];
+    bool owner_pending[NSEL], property_pending[NSEL];
+    uint32_t local_requests[NSEL];
+    size_t max_bytes;                 /* BIG-REQUESTS negotiation happens at init */
     uint8_t *got;
     size_t got_len;
     xcb_atom_t a_sel[NSEL];            /* CLIPBOARD, PRIMARY */
@@ -35,6 +41,7 @@ int x11_clip_init(plat *p) {
     }
     c->a_sel[1] = XCB_ATOM_PRIMARY;
     c->a_string = XCB_ATOM_STRING;
+    c->max_bytes = (size_t)xcb_get_maximum_request_length(C(p)) * 4;
     p->clip = c;
     return PLAT_OK;
 }
@@ -42,7 +49,11 @@ int x11_clip_init(plat *p) {
 void x11_clip_destroy(plat *p) {
     x11_clip *c = CL(p);
     if (!c) return;
-    for (int i = 0; i < NSEL; i++) free(c->own[i]);
+    for (int i = 0; i < NSEL; i++) {
+        if (c->owner_pending[i]) xcb_discard_reply(C(p), c->owner_cookie[i].sequence);
+        if (c->property_pending[i]) xcb_discard_reply(C(p), c->property_cookie[i].sequence);
+        free(c->own[i]);
+    }
     free(c->got);
     free(c);
     p->clip = NULL;
@@ -85,23 +96,15 @@ int plat_clip_set(plat *p, int which, const void *utf8, size_t len) {
     uint8_t *copy = malloc(len ? len : 1);
     if (!copy) return PLAT_ERR_FAIL;
     if (len) memcpy(copy, utf8, len);
+    if (c->owner_pending[which]) xcb_discard_reply(C(p), c->owner_cookie[which].sequence);
     free(c->own[which]);
     c->own[which] = copy; c->own_len[which] = len;
     uint32_t t = p->last_time;
     xcb_set_selection_owner(C(p), (xcb_window_t)p->win, c->a_sel[which], t);
-    xcb_get_selection_owner_reply_t *r =
-        xcb_get_selection_owner_reply(C(p), xcb_get_selection_owner(C(p), c->a_sel[which]), NULL);
-    bool ok = r && r->owner == p->win;
-    free(r);
-    if (!ok && t) {            /* our timestamp was older than the current owner's: retry with CurrentTime */
-        t = 0;
-        xcb_set_selection_owner(C(p), (xcb_window_t)p->win, c->a_sel[which], t);
-        r = xcb_get_selection_owner_reply(C(p), xcb_get_selection_owner(C(p), c->a_sel[which]), NULL);
-        ok = r && r->owner == p->win;
-        free(r);
-    }
+    c->owner_cookie[which] = xcb_get_selection_owner(C(p), c->a_sel[which]);
+    c->owner_pending[which] = true;
     c->own_time[which] = t;
-    if (!ok) { free(c->own[which]); c->own[which] = NULL; c->own_len[which] = 0; return PLAT_ERR_FAIL; }
+    xcb_flush(C(p));
     return PLAT_OK;
 }
 
@@ -117,6 +120,11 @@ static int store_got(x11_clip *c, const uint8_t *d, size_t n) {
 int plat_clip_request(plat *p, int which) {
     x11_clip *c = CL(p);
     if (!c || which < 0 || which >= NSEL) return PLAT_ERR_FAIL;
+    if (c->owner_pending[which]) {
+        if (c->local_requests[which] == UINT32_MAX) return PLAT_ERR_FAIL;
+        c->local_requests[which]++;
+        return PLAT_OK;
+    }
     if (c->own[which]) {            /* we own it: deliver without a round trip */
         plat_event ev;
         memset(&ev, 0, sizeof ev);
@@ -153,7 +161,7 @@ static void serve(plat *p, const xcb_selection_request_event_t *rq) {
     int w = which_of(c, rq->selection);
     xcb_atom_t prop = rq->property ? rq->property : rq->target;
     if (w < 0 || !c->own[w] || rq->owner != p->win) { refuse(p, rq); return; }
-    size_t maxb = (size_t)xcb_get_maximum_request_length(C(p)) * 4;
+    size_t maxb = c->max_bytes;
     xcb_connection_t *cn = C(p);
     if (rq->target == c->a_targets) {
         xcb_atom_t t[5] = { c->a_targets, c->a_timestamp, c->a_utf8, c->a_textplain, c->a_string };
@@ -202,24 +210,74 @@ bool x11_clip_event(plat *p, const xcb_generic_event_t *e, plat_event *ev) {
         int w = which_of(c, x->selection);
         if (w < 0) return false;
         ev->clip_which = (uint8_t)w; ev->code = 1;
+        if (c->property_pending[w]) {
+            xcb_discard_reply(C(p), c->property_cookie[w].sequence);
+            c->property_pending[w] = false;
+        }
         if (x->property == XCB_ATOM_NONE) return true;
-        xcb_get_property_reply_t *r = xcb_get_property_reply(C(p),
-            xcb_get_property(C(p), 1, (xcb_window_t)p->win, x->property, XCB_GET_PROPERTY_TYPE_ANY, 0, 0x3fffffff), NULL);
-        if (!r) return true;
+        c->property_cookie[w] = xcb_get_property(C(p), 1, (xcb_window_t)p->win, x->property,
+                                                XCB_GET_PROPERTY_TYPE_ANY, 0, 0x3fffffff);
+        c->property_pending[w] = true;
+        xcb_flush(C(p));
+    }
+    return false;
+}
+
+bool x11_clip_poll(plat *p) {
+    x11_clip *c = CL(p);
+    if (!c) return false;
+    bool progress = false;
+    for (int w = 0; w < NSEL; w++) {
+        void *reply = NULL;
+        xcb_generic_error_t *error = NULL;
+        if (c->owner_pending[w] &&
+            xcb_poll_for_reply(C(p), c->owner_cookie[w].sequence, &reply, &error)) {
+            progress = true;
+            c->owner_pending[w] = false;
+            xcb_get_selection_owner_reply_t *r = reply;
+            bool ok = !error && r && r->owner == p->win;
+            free(r); free(error);
+            if (!ok && c->own_time[w]) {
+                /* Same timestamp fallback as before, without waiting in a callback. */
+                c->own_time[w] = 0;
+                xcb_set_selection_owner(C(p), p->win, c->a_sel[w], XCB_CURRENT_TIME);
+                c->owner_cookie[w] = xcb_get_selection_owner(C(p), c->a_sel[w]);
+                c->owner_pending[w] = true;
+                xcb_flush(C(p));
+            } else {
+                if (!ok) {
+                    free(c->own[w]); c->own[w] = NULL; c->own_len[w] = 0;
+                    plat_event ev = { .kind = PLAT_EV_CLIPBOARD, .code = 2, .clip_which = (uint8_t)w };
+                    x11_push_event(p, &ev);
+                }
+                while (c->local_requests[w]) {
+                    c->local_requests[w]--;
+                    plat_clip_request(p, w);
+                }
+            }
+        }
+        reply = NULL; error = NULL;
+        if (!c->property_pending[w] ||
+            !xcb_poll_for_reply(C(p), c->property_cookie[w].sequence, &reply, &error)) continue;
+        progress = true;
+        c->property_pending[w] = false;
+        xcb_get_property_reply_t *r = reply;
+        plat_event ev = { .kind = PLAT_EV_CLIPBOARD, .code = 1, .clip_which = (uint8_t)w };
+        if (!r || error) { free(r); free(error); x11_push_event(p, &ev); continue; }
         const uint8_t *v = xcb_get_property_value(r);
         size_t n = (size_t)xcb_get_property_value_length(r);
         if (r->format == 8 && r->type == c->a_utf8) {
-            if (store_got(c, v, n) == 0) { ev->clip_ok = true; ev->code = 0; }
+            if (store_got(c, v, n) == 0) { ev.clip_ok = true; ev.code = 0; }
         } else if (r->format == 8 && r->type == c->a_string) {
             uint8_t *u = malloc(n * 2 + 1);
             if (u) {
                 size_t m = x11_latin1_to_utf8(v, n, u);
-                if (store_got(c, u, m) == 0) { ev->clip_ok = true; ev->code = 0; }
+                if (store_got(c, u, m) == 0) { ev.clip_ok = true; ev.code = 0; }
                 free(u);
             }
         }                           /* INCR (type == a_incr) and other types: failure, see header */
         free(r);
-        return true;
+        x11_push_event(p, &ev);
     }
-    return false;
+    return progress;
 }

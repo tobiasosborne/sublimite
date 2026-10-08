@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <xcb/xcb.h>
 
 static int g_fail;
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
@@ -30,6 +31,13 @@ static void pump(plat *a, sink *sa, plat *b, sink *sb, int rounds) {
 static void roundtrip(plat *a, sink *sa, plat *b, sink *sb, int which, const char *text) {
     size_t n = strlen(text), got = 0;
     CHECK(plat_clip_set(a, which, text, n) == PLAT_OK, "set %d", which);
+    /* set now queues ownership: establish server ordering before a different
+     * connection requests it, then let the loop complete the owner check. */
+    xcb_connection_t *c = a->conn;
+    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL);
+    CHECK(r != NULL, "ownership request reached server");
+    free(r);
+    pump(a, sa, b, sb, 1);
     sb->arrived = sb->failed = 0;
     CHECK(plat_clip_request(b, which) == PLAT_OK, "request %d", which);
     for (int i = 0; i < 50 && !sb->arrived && !sb->failed; i++) pump(a, sa, b, sb, 1);
@@ -68,6 +76,24 @@ int main(void) {
     size_t got = 0;
     const uint8_t *d = plat_clip_data(&b, &got);
     CHECK(sb.arrived == 1 && d && got == 6 && memcmp(d, "b owns", 6) == 0, "self request");
+    /* Pending owner replies can be superseded. A timestamp older than b's
+     * ownership must retry with CurrentTime; a local paste waits for confirmation. */
+    a.last_time = 1;
+    sa.arrived = sa.failed = 0;
+    CHECK(plat_clip_set(&a, PLAT_CLIP_CLIPBOARD, "superseded", 10) == PLAT_OK, "pending set");
+    CHECK(plat_clip_set(&a, PLAT_CLIP_CLIPBOARD, "latest", 6) == PLAT_OK, "replacement set");
+    CHECK(plat_clip_request(&a, PLAT_CLIP_CLIPBOARD) == PLAT_OK, "pending local request");
+    CHECK(plat_clip_request(&a, PLAT_CLIP_CLIPBOARD) == PLAT_OK, "second pending local request");
+    for (int i = 0; i < 50 && sa.arrived < 2 && !sa.failed; i++) pump(&a, &sa, &b, &sb, 1);
+    d = plat_clip_data(&a, &got);
+    CHECK(sa.arrived == 2 && !sa.failed && d && got == 6 && memcmp(d, "latest", 6) == 0,
+          "timestamp retry and replacement local data");
+    sb.arrived = sb.failed = 0;
+    CHECK(plat_clip_request(&b, PLAT_CLIP_CLIPBOARD) == PLAT_OK, "replacement peer request");
+    for (int i = 0; i < 50 && !sb.arrived && !sb.failed; i++) pump(&a, &sa, &b, &sb, 1);
+    d = plat_clip_data(&b, &got);
+    CHECK(sb.arrived == 1 && !sb.failed && d && got == 6 && memcmp(d, "latest", 6) == 0,
+          "replacement peer data");
     plat_shutdown(&a);
     plat_shutdown(&b);
     if (g_fail) { puts("x11_live_test: FAILED"); return 1; }

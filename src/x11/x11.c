@@ -365,15 +365,35 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
 }
 
 static void drain(plat *p, const plat_callbacks *cb) {
-    plat_event ev;
-    while (x11_q_pop(IN(p), &ev)) if (cb->on_event) cb->on_event(cb->ud, &ev);
+    for (;;) {
+        xcb_generic_event_t *e;
+        /* A reply wait in any callback/dispatch can consume the fd and queue
+         * events inside XCB. Check that queue first, then read the socket.
+         * Repeat after each direct dispatch callback and each queued callback. */
+        while ((e = xcb_poll_for_queued_event(C(p))) || (e = xcb_poll_for_event(C(p)))) {
+            dispatch(p, cb, e);
+            free(e);
+        }
+        bool progress = x11_clip_poll(p);
+        plat_event ev;
+        if (x11_q_pop(IN(p), &ev)) {
+            if (cb->on_event) cb->on_event(cb->ud, &ev);
+            continue;
+        }
+        /* Reply polling can itself read events, even if no reply completed. */
+        e = xcb_poll_for_queued_event(C(p));
+        if (e) { dispatch(p, cb, e); free(e); continue; }
+        if (!progress) break;
+    }
 }
 
 int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
     struct pollfd fds[4];
     uint64_t t_end = trace_now_ns() + (timeout_ms > 0 ? (uint64_t)timeout_ms * UINT64_C(1000000) : 0);
     while (!p->quit) {
-        drain(p, cb);                     /* events queued outside the loop (e.g. local clipboard hits) */
+        drain(p, cb);                     /* reach quiescence before every sleeping poll */
+        if (xcb_connection_has_error(C(p))) return PLAT_ERR_FAIL;
+        if (p->quit) break;
         int to = -1;
         if (timeout_ms >= 0) {
             uint64_t now = trace_now_ns();
@@ -392,8 +412,12 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         p->iterations++;
         if (fds[1].revents & POLLIN) {
             uint64_t x; if (read(p->timer_fd, &x, sizeof x) > 0 && cb->on_blink) cb->on_blink(cb->ud);
+            drain(p, cb);
         }
-        if (work_i >= 0 && (fds[work_i].revents & POLLIN) && cb->on_work) cb->on_work(cb->ud);
+        if (work_i >= 0 && (fds[work_i].revents & POLLIN) && cb->on_work) {
+            cb->on_work(cb->ud);
+            drain(p, cb);
+        }
         if (fds[2].revents & POLLIN) {
             uint64_t x; ssize_t rr = read(p->repeat_fd, &x, sizeof x); (void)rr;
             plat_event rev;
@@ -405,8 +429,6 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
             rearm_repeat(p);
         }
         if (fds[0].revents & (POLLERR | POLLHUP)) return PLAT_ERR_FAIL;
-        xcb_generic_event_t *e;
-        while ((e = xcb_poll_for_event(C(p)))) { dispatch(p, cb, e); free(e); }
         drain(p, cb);
         if (xcb_connection_has_error(C(p))) return PLAT_ERR_FAIL;
     }

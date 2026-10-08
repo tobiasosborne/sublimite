@@ -116,7 +116,10 @@ void plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz);
 bool plat_poll_event(plat *p, plat_event *out);
 
 /* ---- clipboard (P2.2) ---- */
-/* Take ownership of a selection; the bytes (UTF-8) are copied (malloc, not the typing path). */
+/* Request ownership; bytes (UTF-8) are copied (malloc, not the typing path).
+ * PLAT_OK means queued, not confirmed: the loop checks ownership asynchronously,
+ * retries stale timestamps with CurrentTime, and reports failure as CLIPBOARD code 2.
+ * A local request during confirmation is deferred until that check completes. */
 int  plat_clip_set(plat *p, int which, const void *utf8, size_t len);
 /* Asynchronous request; result arrives as PLAT_EV_CLIPBOARD, then plat_clip_data(). */
 int  plat_clip_request(plat *p, int which);
