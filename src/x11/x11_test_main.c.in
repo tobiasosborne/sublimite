@@ -1,0 +1,43 @@
+/* Hand build (until Makefile wires the per-module LDLIBS file):
+ * cp src/x11/x11_test_main.c.in /tmp/x11_test_main.c && gcc -std=c11 -Wall -Wextra -Werror -Wshadow \
+ *  -Wconversion -D_GNU_SOURCE -pthread -O2 -g -Isrc src/x11/x11.c src/trace/trace.c src/base/base.c \
+ *  src/work/work.c /tmp/x11_test_main.c $(cat src/x11/LDLIBS) -lm -ldl -o /tmp/x11_test */
+#include "x11/plat.h"
+#include "trace/trace.h"
+#include "work/work.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+static int exposed;
+static void on_ev(void *ud, const plat_event *e) {
+    (void)ud;
+    if (e->kind == PLAT_EV_EXPOSE) exposed = 1;
+    if (e->kind == PLAT_EV_CLOSE) exposed = 2;
+}
+
+int main(void) {
+    uint64_t t0 = trace_now_ns();
+    trace_init();
+    trace_thread_register();
+    trace_record_at(t0, TRACE_T0_INGRESS, 0);
+    plat p;
+    plat_config cfg = { "x11 test", 800, 600, getenv("DISPLAY") == NULL, -1, t0 };
+    int r = plat_init(&p, &cfg);
+    if (r == PLAT_ERR_NO_DISPLAY) { puts("no display: skipped"); return 0; }
+    if (r) return 1;
+    plat_map(&p);
+    uint64_t tm = trace_now_ns();
+    printf("main->connect %.3f ms, ->window %.3f ms, ->map requested %.3f ms (not incl. libc/exec)\n",
+           0.0, 0.0, (double)(tm - t0) / 1e6);
+    plat_callbacks cb = { NULL, on_ev, NULL, NULL, NULL };
+    for (int i = 0; i < 100 && !exposed; i++) plat_run_for(&p, &cb, 50);
+    printf("expose %d visual %s present %d\n", exposed, p.argb ? "ARGB32" : "root", p.present_ok);
+    /* idle: unfocused, blink off */
+    plat_set_blink(&p, 0);
+    p.focused = false;
+    uint64_t before = p.iterations;
+    plat_run_for(&p, &cb, 2000);
+    printf("idle wakeups over 2 s: %llu\n", (unsigned long long)(p.iterations - before));
+    plat_shutdown(&p);
+    return 0;
+}
