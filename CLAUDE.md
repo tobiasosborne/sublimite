@@ -6,13 +6,14 @@ Read order, every session: `HANDOFF.md` → this file → `PLAN.md` §1 (workflo
 
 1. **Gates are binding.** `perf/01-perf-target.md` §0.2 is the contract. Every module ships with `tests/<m>_test.c`, `bench/<m>_bench.c` (prints p50/p99 vs its gate, non-zero exit on miss) and, if it parses or mutates, `fuzz/<m>_fuzz.c`. `make check` (ASan/UBSan, clang) and `make bench` (release, gcc) must pass before a bead closes.
 2. **No malloc on the typing path** (input → mutation → layout → submit). Pools and arenas from `src/base` only. The counting-allocator test enforces it.
-3. **One bead per worker, then stop.** Do exactly the bead's scope. Found something else? `bd create` a new bead, do not fix it. Stop at ~100K tokens (Haiku) / 200K (Sonnet): paste test and bench output into the bead, state what is missing, leave it open for the coordinator.
+3. **One bead per worker, then stop.** Do exactly the bead's scope. Found something else? report it, do not fix it (workers never run `bd` or `git`; the coordinator does). Budget ~100K tokens (Haiku) / 200K (Sonnet): when reached, make the tree build, write STATUS.md in your module, report what is missing. Briefs carry scope and acceptance, never wall-clock deadlines.
 4. **Numbers carry evidence tags**: (P) physics, (M) measured, (E) estimate, (G) gate; measured also [bat] or [AC]. Check `/sys/class/power_supply/BAT0/status` before any measurement and stamp it.
 5. **Settled decisions stay settled** (HANDOFF §2, PRD §8, PLAN §6). C11, no toolkit, raw xcb/xkbcommon/wayland-client, GL 3.3 via dlopen on a worker, piece tree + chunked add buffer, static link. Do not re-ask.
 6. **Docs in lockstep.** A design choice made while coding goes into `docs/decisions/<bead>.md`; a review goes to `docs/reviews/`; each session ends with a `docs/worklog/YYYY-MM-DD.md` entry and an updated `HANDOFF.md`.
 7. **Tracking is beads only** (`bd`). No TODO files, no issue lists in markdown.
 8. **Reviews**: Sonnet for quick bug hunts on diffs; Codex (`codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh -s read-only --skip-git-repo-check -o docs/reviews/<name>.md "<prompt>"`) for epic-end and best-of modules. Prompt it to relentlessly find all problems with severity and a concrete fix. Every BLOCKER/MAJOR becomes a bead.
-9. **No Fable subagents.** The main session is the consultant; Opus coordinates; Haiku/Sonnet implement; Opus synthesises best-of; Codex reviews and test-drives.
+9. **Red-green TDD where possible.** Write the failing test (or fuzz op / bench) first, see it fail, then implement until green, then refactor. A bead's report shows the red run and the green run. Frozen specs (P1.3-style header + suite before implementations) are this rule applied at module scale.
+10. **No Fable subagents.** The main session is the consultant; Opus coordinates; Haiku/Sonnet implement; Opus synthesises best-of; Codex reviews and test-drives.
 
 ## Code conventions
 
