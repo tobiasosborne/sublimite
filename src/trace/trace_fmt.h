@@ -4,6 +4,12 @@
  *   char     magic[8] = "EDTRACE1"
  *   uint32_t version (1), nrings, rec_size (16), ring_cap (65536)
  *   per ring: uint32_t ring_index, uint32_t count, count x trace_rec (oldest first)
+ * Optional tagged section after the rings (P0.6; header version stays 1, old
+ * loaders ignore trailing bytes):
+ *   uint32_t tag 'INPT' (0x54504e49), version (1), rec_size (48), count (<= 16384)
+ *   uint64_t dropped
+ *   count x trace_input_rec (oldest first, seq == dropped + index)
+ * Nothing may follow the section. See docs/decisions/P0.6.md.
  */
 #ifndef EDITOR_TRACE_TRACE_FMT_H
 #define EDITOR_TRACE_TRACE_FMT_H
@@ -15,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TRACE_FMT_INPT_TAG 0x54504e49u
+
 _Static_assert(sizeof(trace_rec) == 16, "trace_rec must be 16 bytes");
 
 typedef struct trace_gate_pair {
@@ -22,41 +30,31 @@ typedef struct trace_gate_pair {
     uint64_t ns;
 } trace_gate_pair;
 
-/* Loads a dump into a malloc'd array. Caller frees *out. Returns 0 on success. */
-static inline int trace_fmt_load(FILE *f, trace_rec **out, size_t *n_out) {
-    char magic[8];
-    uint32_t hdr[4];
-    trace_rec *all = NULL;
-    size_t n = 0, cap = 0;
+/* A loaded dump. Free with trace_fmt_dump_free. */
+typedef struct trace_dump {
+    trace_rec *recs;            /* timing records, all rings concatenated */
+    size_t nrecs;
+    int has_input;              /* 1 if an INPT section was present */
+    trace_input_rec *in;        /* input records, oldest first */
+    size_t nin;
+    uint64_t in_dropped;        /* events overwritten before the dump */
+} trace_loaded;
 
+/* Loads and validates a dump (old version-1 or with an INPT section). Returns 0 on
+ * success; on failure returns -1 and *d is zeroed (nothing to free). Defined in trace_load.c. */
+int trace_fmt_load_dump(FILE *f, trace_loaded *d);
+void trace_fmt_dump_free(trace_loaded *d);
+
+/* Timing records only (legacy entry point). Caller frees *out. Returns 0 on success. */
+static inline int trace_fmt_load(FILE *f, trace_rec **out, size_t *n_out) {
+    trace_loaded d;
     *out = NULL;
     *n_out = 0;
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "EDTRACE1", 8) != 0) return -1;
-    if (fread(hdr, sizeof hdr[0], 4, f) != 4) return -1;
-    if (hdr[0] != 1u || hdr[2] != sizeof(trace_rec) || hdr[3] == 0u) return -1;
-    if (hdr[1] > TRACE_MAX_THREADS) return -1;
-
-    for (uint32_t r = 0; r < hdr[1]; r++) {
-        uint32_t blk[2];
-        if (fread(blk, sizeof blk[0], 2, f) != 2) goto fail;
-        if (blk[1] > hdr[3]) goto fail;
-        if (n + blk[1] > cap) {
-            size_t ncap = cap ? cap * 2 : 4096;
-            while (ncap < n + blk[1]) ncap *= 2;
-            trace_rec *tmp = realloc(all, ncap * sizeof *all);
-            if (tmp == NULL) goto fail;
-            all = tmp;
-            cap = ncap;
-        }
-        if (blk[1] > 0 && fread(all + n, sizeof *all, blk[1], f) != blk[1]) goto fail;
-        n += blk[1];
-    }
-    *out = all;
-    *n_out = n;
+    if (trace_fmt_load_dump(f, &d) != 0) return -1;
+    free(d.in);
+    *out = d.recs;
+    *n_out = d.nrecs;
     return 0;
-fail:
-    free(all);
-    return -1;
 }
 
 static inline int trace_fmt_cmp_pair(const void *a, const void *b) {

@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define BATCHES 1000u
@@ -56,6 +57,23 @@ int main(void) {
         clk[b] = ns / BATCH;
     }
 
+    /* Input-event append (P0.6): mixed key/pointer/resize appends, same method. */
+    static uint64_t in_call[BATCHES];
+    for (unsigned b = 0; b < BATCHES; b++) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (unsigned i = 0; i < BATCH; i++) {
+            switch (i & 3u) {
+            case 0: trace_input_key((uint64_t)i, TRACE_IN_KEY_DOWN, 0x61u, 0x1u, 0, "a", 1); break;
+            case 1: trace_input_pointer((uint64_t)i, TRACE_IN_POINTER_MOVE, (int32_t)i, 5, 0, 0); break;
+            case 2: trace_input_wheel((uint64_t)i, 0, 65536, 0); break;
+            default: trace_input_resize((uint64_t)i, i, i); break;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+        in_call[b] = ns / BATCH;
+    }
+    qsort(in_call, BATCHES, sizeof in_call[0], cmp_u64);
     qsort(per_call, BATCHES, sizeof per_call[0], cmp_u64);
     qsort(clk, BATCHES, sizeof clk[0], cmp_u64);
     {
@@ -64,6 +82,20 @@ int main(void) {
                BATCHES, BATCH, (unsigned long long)p50, (unsigned long long)p99, GATE_P50_NS);
         printf("clock_gettime  (reference, same method): p50=%llu ns p99=%llu ns\n",
                (unsigned long long)pct(clk, BATCHES, 50), (unsigned long long)pct(clk, BATCHES, 99));
+        uint64_t ip50 = pct(in_call, BATCHES, 50), ip99 = pct(in_call, BATCHES, 99);
+        char bat[32] = "n/a";
+        FILE *bf = fopen("/sys/class/power_supply/BAT0/status", "r");
+        if (bf != NULL) {
+            if (fgets(bat, sizeof bat, bf) == NULL) strcpy(bat, "n/a");
+            bat[strcspn(bat, "\n")] = '\0';
+            fclose(bf);
+        }
+        printf("trace_input    n=10^6 batches=%u x %u: p50=%llu ns p99=%llu ns (gate p50 < %u) (M)[%s]\n",
+               BATCHES, BATCH, (unsigned long long)ip50, (unsigned long long)ip99, GATE_P50_NS, bat);
+        if (ip50 >= GATE_P50_NS) {
+            printf("trace_bench: INPUT GATE MISS\n");
+            rc = 1;
+        }
         if (p50 >= GATE_P50_NS) {
             printf("trace_bench: GATE MISS\n");
             rc = 1;
