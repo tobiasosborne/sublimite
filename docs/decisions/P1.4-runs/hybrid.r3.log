@@ -1,0 +1,260 @@
+BENCH row=build col=text_size p50=18103 p99=18103 unit=B n=1 gate=none status=TRACK
+# piece_bench quick=0 huge=0 cap=60s corpus=/tmp/edit-corpus power=Charging [AC]
+BENCH row=code_1m col=open p50=0.170 p99=1.225 unit=ms n=20 gate=none status=TRACK
+BENCH row=code_1m col=first_op p50=0.171 p99=1.227 unit=ms n=20 gate=none status=TRACK
+BENCH row=code_1m col=mem_open p50=1052248 p99=1052248 unit=B n=1 gate=p99<=1376256B status=PASS
+BENCH row=code_1m col=insert p50=0.613 p99=2.930 unit=us n=1024 gate=p99<=50us status=PASS
+BENCH row=code_1m col=delete p50=0.351 p99=2.002 unit=us n=976 gate=p99<=50us status=PASS
+BENCH row=code_1m col=peak_mem p50=1350469 p99=1350469 unit=B n=1 gate=p99<=1718087B status=PASS
+BENCH row=code_1m col=pieces p50=2720 p99=2720 unit=count n=1 gate=none status=TRACK
+BENCH row=code_1m col=read_viewport p50=5.438 p99=7.816 unit=us n=300 gate=none status=TRACK
+BENCH row=code_1m col=byte_to_line p50=0.151 p99=0.278 unit=us n=1000 gate=none status=TRACK
+BENCH row=code_1m col=line_to_byte p50=0.181 p99=0.509 unit=us n=1000 gate=none status=TRACK
+
+== code_1m ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.170        1.225 ms         20  none                     TRACK
+first_op                      0.171        1.227 ms         20  none                     TRACK
+mem_open                1052248.000  1052248.000 B           1  p99<=1376256B            PASS
+insert                        0.613        2.930 us       1024  p99<=50us                PASS
+delete                        0.351        2.002 us        976  p99<=50us                PASS
+peak_mem                1350469.000  1350469.000 B           1  p99<=1718087B            PASS
+pieces                     2720.000     2720.000 count       1  none                     TRACK
+read_viewport                 5.438        7.816 us        300  none                     TRACK
+byte_to_line                  0.151        0.278 us       1000  none                     TRACK
+line_to_byte                  0.181        0.509 us       1000  none                     TRACK
+context: G5 open warm 6 / 9 ms (s0.2), end-to-end incl. frame; not a gate here
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+BENCH row=log_1g col=open p50=0.738 p99=0.955 unit=ms n=5 gate=none status=TRACK
+BENCH row=log_1g col=first_op p50=0.740 p99=0.957 unit=ms n=5 gate=none status=TRACK
+BENCH row=log_1g col=mem_open p50=403664 p99=403664 unit=B n=1 gate=p99<=2524288B status=PASS
+BENCH row=log_1g col=insert p50=3.889 p99=7.501 unit=us n=1024 gate=p99<=50us status=PASS
+BENCH row=log_1g col=delete p50=0.182 p99=1.720 unit=us n=976 gate=p99<=50us status=PASS
+BENCH row=log_1g col=peak_mem p50=1013954 p99=1013954 unit=B n=1 gate=p99<=4468071B status=PASS
+BENCH row=log_1g col=pieces p50=19407 p99=19407 unit=count n=1 gate=none status=TRACK
+BENCH row=log_1g col=read_viewport p50=2.970 p99=6.834 unit=us n=300 gate=none status=TRACK
+BENCH row=log_1g col=byte_to_line p50=2.577 p99=5.127 unit=us n=1000 gate=none status=TRACK
+BENCH row=log_1g col=line_to_byte p50=2.468 p99=4.691 unit=us n=1000 gate=none status=TRACK
+
+== log_1g ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.738        0.955 ms          5  none                     TRACK
+first_op                      0.740        0.957 ms          5  none                     TRACK
+mem_open                 403664.000   403664.000 B           1  p99<=2524288B            PASS
+insert                        3.889        7.501 us       1024  p99<=50us                PASS
+delete                        0.182        1.720 us        976  p99<=50us                PASS
+peak_mem                1013954.000  1013954.000 B           1  p99<=4468071B            PASS
+pieces                    19407.000    19407.000 count       1  none                     TRACK
+read_viewport                 2.970        6.834 us        300  none                     TRACK
+byte_to_line                  2.577        5.127 us       1000  none                     TRACK
+line_to_byte                  2.468        4.691 us       1000  none                     TRACK
+context: G5 open warm 6 / 9 ms (s0.2), end-to-end incl. frame; not a gate here
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+BENCH row=oneline_1g col=open p50=0.792 p99=0.957 unit=ms n=5 gate=none status=TRACK
+BENCH row=oneline_1g col=first_op p50=0.795 p99=0.961 unit=ms n=5 gate=none status=TRACK
+BENCH row=oneline_1g col=mem_open p50=403664 p99=403664 unit=B n=1 gate=p99<=2524288B status=PASS
+BENCH row=oneline_1g col=insert p50=4.034 p99=7.453 unit=us n=1024 gate=p99<=50us status=PASS
+BENCH row=oneline_1g col=delete p50=0.198 p99=1.997 unit=us n=976 gate=p99<=50us status=PASS
+BENCH row=oneline_1g col=peak_mem p50=1013954 p99=1013954 unit=B n=1 gate=p99<=4468071B status=PASS
+BENCH row=oneline_1g col=pieces p50=19407 p99=19407 unit=count n=1 gate=none status=TRACK
+BENCH row=oneline_1g col=read_viewport p50=3.340 p99=6.777 unit=us n=300 gate=none status=TRACK
+BENCH row=oneline_1g col=byte_to_line p50=2.634 p99=6.326 unit=us n=1000 gate=none status=TRACK
+BENCH row=oneline_1g col=line_to_byte p50=0.157 p99=0.517 unit=us n=1000 gate=none status=TRACK
+
+== oneline_1g ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.792        0.957 ms          5  none                     TRACK
+first_op                      0.795        0.961 ms          5  none                     TRACK
+mem_open                 403664.000   403664.000 B           1  p99<=2524288B            PASS
+insert                        4.034        7.453 us       1024  p99<=50us                PASS
+delete                        0.198        1.997 us        976  p99<=50us                PASS
+peak_mem                1013954.000  1013954.000 B           1  p99<=4468071B            PASS
+pieces                    19407.000    19407.000 count       1  none                     TRACK
+read_viewport                 3.340        6.777 us        300  none                     TRACK
+byte_to_line                  2.634        6.326 us       1000  none                     TRACK
+line_to_byte                  0.157        0.517 us       1000  none                     TRACK
+context: G5 open warm 6 / 9 ms (s0.2), end-to-end incl. frame; not a gate here
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+piece_bench: row oneline_10g SKIP (needs --huge)
+BENCH row=oneline_10g col=open p50=0.000 p99=0.000 unit=ns n=0 gate=none status=SKIP
+
+== oneline_10g ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.000        0.000 ns          0  none                     SKIP
+BENCH row=dense_short col=open p50=28.136 p99=30.957 unit=ms n=10 gate=none status=TRACK
+BENCH row=dense_short col=first_op p50=28.137 p99=30.961 unit=ms n=10 gate=none status=TRACK
+BENCH row=dense_short col=mem_open p50=67134096 p99=67134096 unit=B n=1 gate=p99<=83951616B status=PASS
+BENCH row=dense_short col=insert p50=1.397 p99=4.726 unit=us n=1024 gate=p99<=50us status=PASS
+BENCH row=dense_short col=delete p50=1.182 p99=3.203 unit=us n=976 gate=p99<=50us status=PASS
+BENCH row=dense_short col=peak_mem p50=67465215 p99=67465215 unit=B n=1 gate=p99<=84420551B status=PASS
+BENCH row=dense_short col=pieces p50=4044 p99=4044 unit=count n=1 gate=none status=TRACK
+BENCH row=dense_short col=read_viewport p50=1.698 p99=2.210 unit=us n=300 gate=none status=TRACK
+BENCH row=dense_short col=byte_to_line p50=1.440 p99=4.975 unit=us n=1000 gate=none status=TRACK
+BENCH row=dense_short col=line_to_byte p50=2.676 p99=5.994 unit=us n=1000 gate=none status=TRACK
+
+== dense_short ==
+col                             p50          p99 unit        n  gate                     status
+open                         28.136       30.957 ms         10  none                     TRACK
+first_op                     28.137       30.961 ms         10  none                     TRACK
+mem_open               67134096.000 67134096.000 B           1  p99<=83951616B           PASS
+insert                        1.397        4.726 us       1024  p99<=50us                PASS
+delete                        1.182        3.203 us        976  p99<=50us                PASS
+peak_mem               67465215.000 67465215.000 B           1  p99<=84420551B           PASS
+pieces                     4044.000     4044.000 count       1  none                     TRACK
+read_viewport                 1.698        2.210 us        300  none                     TRACK
+byte_to_line                  1.440        4.975 us       1000  none                     TRACK
+line_to_byte                  2.676        5.994 us       1000  none                     TRACK
+context: G5 open warm 6 / 9 ms (s0.2), end-to-end incl. frame; not a gate here
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+BENCH row=random_edits_1e5 col=open p50=0.812 p99=0.956 unit=ms n=3 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=first_op p50=0.814 p99=0.959 unit=ms n=3 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=mem_open p50=403664 p99=403664 unit=B n=1 gate=p99<=2524288B status=PASS
+BENCH row=random_edits_1e5 col=batch_total p50=53.056 p99=111.298 unit=ms n=3 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=insert p50=0.606 p99=1.631 unit=us n=49906 gate=p99<=50us status=PASS
+BENCH row=random_edits_1e5 col=delete p50=0.271 p99=0.716 unit=us n=50094 gate=p99<=50us status=PASS
+BENCH row=random_edits_1e5 col=peak_mem p50=16567035 p99=16567035 unit=B n=1 gate=p99<=22483484B status=PASS
+BENCH row=random_edits_1e5 col=pieces p50=165427 p99=165427 unit=count n=1 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=read_viewport p50=3.660 p99=5.005 unit=us n=300 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=byte_to_line p50=1.587 p99=3.850 unit=us n=1000 gate=none status=TRACK
+BENCH row=random_edits_1e5 col=line_to_byte p50=1.597 p99=3.509 unit=us n=1000 gate=none status=TRACK
+
+== random_edits_1e5 ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.812        0.956 ms          3  none                     TRACK
+first_op                      0.814        0.959 ms          3  none                     TRACK
+mem_open                 403664.000   403664.000 B           1  p99<=2524288B            PASS
+batch_total                  53.056      111.298 ms          3  none                     TRACK
+insert                        0.606        1.631 us      49906  p99<=50us                PASS
+delete                        0.271        0.716 us      50094  p99<=50us                PASS
+peak_mem               16567035.000 16567035.000 B           1  p99<=22483484B           PASS
+pieces                   165427.000   165427.000 count       1  none                     TRACK
+read_viewport                 3.660        5.005 us        300  none                     TRACK
+byte_to_line                  1.587        3.850 us       1000  none                     TRACK
+line_to_byte                  1.597        3.509 us       1000  none                     TRACK
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+note: batch_total gate (G9) includes a full frame; kernel passing is necessary, not sufficient
+BENCH row=typing_1e4 col=open p50=1.289 p99=1.388 unit=ms n=3 gate=none status=TRACK
+BENCH row=typing_1e4 col=first_op p50=1.290 p99=1.389 unit=ms n=3 gate=none status=TRACK
+BENCH row=typing_1e4 col=mem_open p50=1052248 p99=1052248 unit=B n=1 gate=p99<=1376256B status=PASS
+BENCH row=typing_1e4 col=batch_total p50=1.251 p99=1.628 unit=ms n=11 gate=none status=TRACK
+BENCH row=typing_1e4 col=insert p50=0.046 p99=0.079 unit=us n=9474 gate=p99<=50us status=PASS
+BENCH row=typing_1e4 col=delete p50=0.056 p99=0.105 unit=us n=526 gate=p99<=50us status=PASS
+BENCH row=typing_1e4 col=peak_mem p50=1128296 p99=1128296 unit=B n=1 gate=p99<=1390772B status=PASS
+BENCH row=typing_1e4 col=pieces p50=21 p99=21 unit=count n=1 gate=none status=TRACK
+BENCH row=typing_1e4 col=read_viewport p50=3.056 p99=4.414 unit=us n=300 gate=none status=TRACK
+BENCH row=typing_1e4 col=byte_to_line p50=1.377 p99=2.903 unit=us n=1000 gate=none status=TRACK
+BENCH row=typing_1e4 col=line_to_byte p50=1.029 p99=1.866 unit=us n=1000 gate=none status=TRACK
+
+== typing_1e4 ==
+col                             p50          p99 unit        n  gate                     status
+open                          1.289        1.388 ms          3  none                     TRACK
+first_op                      1.290        1.389 ms          3  none                     TRACK
+mem_open                1052248.000  1052248.000 B           1  p99<=1376256B            PASS
+batch_total                   1.251        1.628 ms         11  none                     TRACK
+insert                        0.046        0.079 us       9474  p99<=50us                PASS
+delete                        0.056        0.105 us        526  p99<=50us                PASS
+peak_mem                1128296.000  1128296.000 B           1  p99<=1390772B            PASS
+pieces                       21.000       21.000 count       1  none                     TRACK
+read_viewport                 3.056        4.414 us        300  none                     TRACK
+byte_to_line                  1.377        2.903 us       1000  none                     TRACK
+line_to_byte                  1.029        1.866 us       1000  none                     TRACK
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+note: batch_total gate (G9) includes a full frame; kernel passing is necessary, not sufficient
+BENCH row=undo_1e4 col=open p50=0.755 p99=0.900 unit=ms n=3 gate=none status=TRACK
+BENCH row=undo_1e4 col=first_op p50=0.758 p99=0.902 unit=ms n=3 gate=none status=TRACK
+BENCH row=undo_1e4 col=mem_open p50=403664 p99=403664 unit=B n=1 gate=p99<=2524288B status=PASS
+BENCH row=undo_1e4 col=batch_total p50=5.423 p99=33.069 unit=ms n=11 gate=p50<=63ms,p99<=84ms status=PASS
+BENCH row=undo_1e4 col=delete p50=0.241 p99=1.382 unit=us n=10000 gate=p99<=50us status=PASS
+BENCH row=undo_1e4 col=insert_ref p50=0.174 p99=0.258 unit=us n=10000 gate=none status=TRACK
+BENCH row=undo_1e4 col=peak_mem p50=1794000 p99=1794000 unit=B n=1 gate=p99<=6422376B status=PASS
+BENCH row=undo_1e4 col=pieces p50=36382 p99=36382 unit=count n=1 gate=none status=TRACK
+BENCH row=undo_1e4 col=read_viewport p50=2.829 p99=3.520 unit=us n=300 gate=none status=TRACK
+BENCH row=undo_1e4 col=byte_to_line p50=2.168 p99=4.948 unit=us n=1000 gate=none status=TRACK
+BENCH row=undo_1e4 col=line_to_byte p50=2.248 p99=4.875 unit=us n=1000 gate=none status=TRACK
+
+== undo_1e4 ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.755        0.900 ms          3  none                     TRACK
+first_op                      0.758        0.902 ms          3  none                     TRACK
+mem_open                 403664.000   403664.000 B           1  p99<=2524288B            PASS
+batch_total                   5.423       33.069 ms         11  p50<=63ms,p99<=84ms      PASS
+delete                        0.241        1.382 us      10000  p99<=50us                PASS
+insert_ref                    0.174        0.258 us      10000  none                     TRACK
+peak_mem                1794000.000  1794000.000 B           1  p99<=6422376B            PASS
+pieces                    36382.000    36382.000 count       1  none                     TRACK
+read_viewport                 2.829        3.520 us        300  none                     TRACK
+byte_to_line                  2.168        4.948 us       1000  none                     TRACK
+line_to_byte                  2.248        4.875 us       1000  none                     TRACK
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+note: batch_total gate (G9) includes a full frame; kernel passing is necessary, not sufficient
+BENCH row=undo_1e5 col=open p50=0.765 p99=0.915 unit=ms n=3 gate=none status=TRACK
+BENCH row=undo_1e5 col=first_op p50=0.767 p99=0.918 unit=ms n=3 gate=none status=TRACK
+BENCH row=undo_1e5 col=mem_open p50=403664 p99=403664 unit=B n=1 gate=p99<=2524288B status=PASS
+BENCH row=undo_1e5 col=batch_total p50=113.827 p99=168.321 unit=ms n=3 gate=none status=TRACK
+BENCH row=undo_1e5 col=delete p50=0.447 p99=1.901 unit=us n=100000 gate=p99<=50us status=PASS
+BENCH row=undo_1e5 col=insert_ref p50=0.273 p99=0.730 unit=us n=100000 gate=none status=TRACK
+BENCH row=undo_1e5 col=peak_mem p50=10287344 p99=10287344 unit=B n=1 gate=p99<=27368130B status=PASS
+BENCH row=undo_1e5 col=pieces p50=216209 p99=216209 unit=count n=1 gate=none status=TRACK
+BENCH row=undo_1e5 col=read_viewport p50=3.714 p99=4.944 unit=us n=300 gate=none status=TRACK
+BENCH row=undo_1e5 col=byte_to_line p50=1.645 p99=4.046 unit=us n=1000 gate=none status=TRACK
+BENCH row=undo_1e5 col=line_to_byte p50=1.689 p99=3.673 unit=us n=1000 gate=none status=TRACK
+
+== undo_1e5 ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.765        0.915 ms          3  none                     TRACK
+first_op                      0.767        0.918 ms          3  none                     TRACK
+mem_open                 403664.000   403664.000 B           1  p99<=2524288B            PASS
+batch_total                 113.827      168.321 ms          3  none                     TRACK
+delete                        0.447        1.901 us     100000  p99<=50us                PASS
+insert_ref                    0.273        0.730 us     100000  none                     TRACK
+peak_mem               10287344.000 10287344.000 B           1  p99<=27368130B           PASS
+pieces                   216209.000   216209.000 count       1  none                     TRACK
+read_viewport                 3.714        4.944 us        300  none                     TRACK
+byte_to_line                  1.645        4.046 us       1000  none                     TRACK
+line_to_byte                  1.689        3.673 us       1000  none                     TRACK
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+note: batch_total gate (G9) includes a full frame; kernel passing is necessary, not sufficient
+BENCH row=paste_1m col=paste_1m p50=0.078 p99=0.537 unit=ms n=20 gate=p50<=5ms,p99<=15ms status=PASS
+BENCH row=paste_1m col=peak_mem p50=2100952 p99=2100952 unit=B n=1 gate=p99<=2690144B status=PASS
+BENCH row=paste_1m col=pieces p50=33 p99=33 unit=count n=1 gate=none status=TRACK
+
+== paste_1m ==
+col                             p50          p99 unit        n  gate                     status
+paste_1m                      0.078        0.537 ms         20  p50<=5ms,p99<=15ms       PASS
+peak_mem                2100952.000  2100952.000 B           1  p99<=2690144B            PASS
+pieces                       33.000       33.000 count       1  none                     TRACK
+note: G9 1 MB paste 5 / 15 ms includes a full frame; kernel passing is necessary, not sufficient
+BENCH row=snapshots_100 col=insert p50=0.951 p99=5.186 unit=us n=4967 gate=p99<=50us status=PASS
+BENCH row=snapshots_100 col=delete p50=0.693 p99=5.046 unit=us n=5033 gate=p99<=50us status=PASS
+BENCH row=snapshots_100 col=snapshot_take p50=1.177 p99=3.752 unit=us n=100 gate=none status=TRACK
+BENCH row=snapshots_100 col=read_viewport p50=8.650 p99=16.388 unit=us n=100 gate=none status=TRACK
+BENCH row=snapshots_100 col=peak_mem p50=16586977 p99=16586977 unit=B n=1 gate=none status=TRACK
+BENCH row=snapshots_100 col=pathcopy_ref p50=19200000 p99=19200000 unit=B n=1 gate=none status=TRACK
+BENCH row=snapshots_100 col=pieces p50=9439 p99=9439 unit=count n=1 gate=none status=TRACK
+BENCH row=snapshots_100 col=snapshot_release_all p50=2.802 p99=2.802 unit=ms n=1 gate=none status=TRACK
+
+== snapshots_100 ==
+col                             p50          p99 unit        n  gate                     status
+insert                        0.951        5.186 us       4967  p99<=50us                PASS
+delete                        0.693        5.046 us       5033  p99<=50us                PASS
+snapshot_take                 1.177        3.752 us        100  none                     TRACK
+read_viewport                 8.650       16.388 us        100  none                     TRACK
+peak_mem               16586977.000 16586977.000 B           1  none                     TRACK
+pathcopy_ref           19200000.000 19200000.000 B           1  none                     TRACK
+pieces                     9439.000     9439.000 count       1  none                     TRACK
+snapshot_release_all          2.802        2.802 ms          1  none                     TRACK
+context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)
+context: pathcopy_ref = 1920 B per edit while a snapshot is live (perf s2.6); peak_mem is TRACK, not gated
+BENCH row=line_jump_1e7 col=open p50=0.613 p99=0.964 unit=ms n=5 gate=none status=TRACK
+BENCH row=line_jump_1e7 col=line_to_byte_first p50=73.889 p99=127.029 unit=ms n=5 gate=p50<=30ms,p99<=50ms status=MISS
+BENCH row=line_jump_1e7 col=line_to_byte p50=0.000 p99=0.000 unit=ms n=200 gate=none status=TRACK
+BENCH row=line_jump_1e7 col=byte_to_line p50=0.003 p99=0.005 unit=ms n=200 gate=none status=TRACK
+
+== line_jump_1e7 ==
+col                             p50          p99 unit        n  gate                     status
+open                          0.613        0.964 ms          5  none                     TRACK
+line_to_byte_first           73.889      127.029 ms          5  p50<=30ms,p99<=50ms      MISS
+line_to_byte                  0.000        0.000 ms        200  none                     TRACK
+byte_to_line                  0.003        0.005 ms        200  none                     TRACK
+context: G7j unindexed jump 30 / 50 ms is Target A, warm, [AC, prov]; this box is on battery
+# piece_bench GATE MISS
