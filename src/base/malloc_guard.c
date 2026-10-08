@@ -1,7 +1,7 @@
 /* Counting interposition for malloc/calloc/realloc, used by the no-malloc
  * law tests. Underneath we call glibc's exported __libc_* entry points, so
  * no dlsym bootstrap (and no recursion) is involved. Compiled out under
- * AddressSanitizer, which owns malloc itself. */
+ * AddressSanitizer and ThreadSanitizer, which own malloc themselves. */
 #include "base/base.h"
 
 #include <stddef.h>
@@ -9,8 +9,9 @@
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
-#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-#define EDIT_GUARD_ASAN 1
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) || \
+    defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+#define EDIT_GUARD_ASAN 1   /* any sanitizer runtime owns malloc: stay inert */
 #else
 #define EDIT_GUARD_ASAN 0
 #endif
