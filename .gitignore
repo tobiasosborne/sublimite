@@ -8,3 +8,4 @@ variants/
 .dolt/
 *.db
 .beads-credential-key
+build/
