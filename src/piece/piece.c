@@ -20,7 +20,7 @@ typedef struct core {           /* shared: add chunks + mapping */
     uint64_t add_len;
 } core;
 
-struct piece_tree { core *c; pc *p; size_t n, cap; piece_allocator a; int edited; };
+struct piece_tree { core *c; pc *p; size_t n, cap; piece_allocator a; int edited; int run; uint64_t run_end, run_add; };
 struct piece_snapshot {
     atomic_int rc; core *c; piece_allocator a;
     pc *p; size_t n; uint8_t **ch; size_t nch;
@@ -157,6 +157,23 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *d, size_t len) {
     uint64_t start;
     if (add_append(t, d, len, &start)) return PIECE_ERR_NOMEM;
     t->edited = 1;
+    if (t->run && t->run_end == off && t->run_add == start && (start & (CH_SIZE - 1)) &&
+        len <= CH_SIZE - (start & (CH_SIZE - 1))) {
+        uint64_t pos = 0;
+        for (size_t i = 0; i < t->n; i++) {
+            pos += t->p[i].len;
+            if (pos == off) {
+                if (t->p[i].add && t->p[i].off + t->p[i].len == start) {
+                    t->p[i].len += len;
+                    t->run_end = off + len; t->run_add = start + len;
+                    return 0;
+                }
+                break;
+            }
+            if (pos > off) break;
+        }
+    }
+    t->run = 0;
     size_t at = split_at(t, off);
     /* pieces must not span chunk boundaries */
     pc tmp[1 << 8]; size_t k = 0;
@@ -176,26 +193,62 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *d, size_t len) {
     memcpy(t->p + at, buf, k * sizeof *buf);
     t->n += k;
     if (buf != tmp) t->a.free(t->a.ctx, buf, chunks * sizeof *buf);
+    t->run = 1; t->run_end = off + len; t->run_add = start + len;
     return 0;
 }
 
-int piece_delete(piece_tree *t, uint64_t off, uint64_t len) {
+static int ref_push(piece_ref *r, uint64_t o, uint64_t l) {
+    if (r->nspans && r->span[r->nspans - 1].add_off + r->span[r->nspans - 1].len == o) {
+        r->span[r->nspans - 1].len += l;
+    } else {
+        if (r->nspans >= PIECE_REF_SPANS) return 1;
+        r->span[r->nspans].add_off = o; r->span[r->nspans].len = l; r->nspans++;
+    }
+    r->len += l;
+    return 0;
+}
+static int rd(const core *c, uint8_t *const *ch, const pc *p, size_t n, uint64_t off, uint8_t *dst, size_t len);
+
+int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref) {
     uint64_t total = piece_len(t);
     if (off > total || len > total - off) return PIECE_ERR_RANGE;
+    piece_ref local; if (!ref) ref = &local;
+    memset(ref, 0, sizeof *ref);
     if (!len) return 0;
-    t->edited = 1;
-    /* copy deleted original-sourced bytes into the add buffer (G10f accounting
-     * / mapping independence); the stub keeps no handle to them. */
-    uint64_t pos = 0;
+    t->edited = 1; t->run = 0;
+    /* pass 1: estimate span count (conservative) */
+    uint64_t pos = 0; size_t est = 0; int prev_orig = 0;
     for (size_t i = 0; i < t->n; i++) {
         uint64_t s = pos, e = pos + t->p[i].len;
         pos = e;
         if (e <= off) continue;
         if (s >= off + len) break;
-        if (!t->p[i].add) {
+        if (t->p[i].add) { est++; prev_orig = 0; }
+        else if (!prev_orig) { est++; prev_orig = 1; }
+    }
+    if (est > PIECE_REF_SPANS) {
+        uint8_t *tmp = t->a.alloc(t->a.ctx, (size_t)len);
+        if (!tmp) return PIECE_ERR_NOMEM;
+        uint64_t st;
+        if (rd(t->c, t->c->ch, t->p, t->n, off, tmp, (size_t)len) ||
+            add_append(t, tmp, (size_t)len, &st)) {
+            t->a.free(t->a.ctx, tmp, (size_t)len); return PIECE_ERR_NOMEM;
+        }
+        t->a.free(t->a.ctx, tmp, (size_t)len);
+        ref_push(ref, st, len);
+    } else {
+        pos = 0;
+        for (size_t i = 0; i < t->n; i++) {
+            uint64_t s = pos, e = pos + t->p[i].len;
+            pos = e;
+            if (e <= off) continue;
+            if (s >= off + len) break;
             uint64_t a = s > off ? s : off, b = e < off + len ? e : off + len, st;
-            if (add_append(t, t->c->orig + t->p[i].off + (a - s), (size_t)(b - a), &st))
-                return PIECE_ERR_NOMEM;
+            if (!t->p[i].add) {
+                if (add_append(t, t->c->orig + t->p[i].off + (a - s), (size_t)(b - a), &st))
+                    return PIECE_ERR_NOMEM;
+            } else st = t->p[i].off + (a - s);
+            if (ref_push(ref, st, b - a)) return PIECE_ERR_NOMEM; /* unreachable */
         }
     }
     if (pgrow(t, 2)) return PIECE_ERR_NOMEM;
@@ -203,6 +256,32 @@ int piece_delete(piece_tree *t, uint64_t off, uint64_t len) {
     size_t b = split_at(t, off + len);
     memmove(t->p + a, t->p + b, (t->n - b) * sizeof *t->p);
     t->n -= b - a;
+    return 0;
+}
+
+int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref) {
+    if (off > piece_len(t)) return PIECE_ERR_RANGE;
+    if (ref->nspans > PIECE_REF_SPANS) return PIECE_ERR_RANGE;
+    size_t k = 0;
+    for (uint32_t i = 0; i < ref->nspans; i++) {
+        uint64_t o = ref->span[i].add_off, l = ref->span[i].len;
+        if (o > t->c->add_len || l > t->c->add_len - o) return PIECE_ERR_RANGE;
+        k += (size_t)((l + CH_SIZE - 1) >> CH_SHIFT) + 1;
+    }
+    if (!k) return 0;
+    if (pgrow(t, k + 1)) return PIECE_ERR_NOMEM;
+    t->edited = 1; t->run = 0;
+    size_t at = split_at(t, off);
+    for (uint32_t i = 0; i < ref->nspans; i++) {
+        uint64_t o = ref->span[i].add_off, rem = ref->span[i].len;
+        while (rem) {
+            uint64_t take = CH_SIZE - (o & (CH_SIZE - 1));
+            if (take > rem) take = rem;
+            memmove(t->p + at + 1, t->p + at, (t->n - at) * sizeof *t->p);
+            t->p[at++] = (pc){ o, take, 1 }; t->n++;
+            o += take; rem -= take;
+        }
+    }
     return 0;
 }
 

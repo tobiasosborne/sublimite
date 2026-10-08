@@ -17,7 +17,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     pm_init(&m, ib, init);
     piece_snapshot *snap = NULL; pm_model sm = {0};
     while (i < size) {
-        uint8_t op = data[i++] % 6;
+        uint8_t op = data[i++] % 7;
         if (op == 0 || op == 1) {            /* insert */
             NEED(3); uint64_t off = ((uint64_t)data[i] << 8 | data[i + 1]) % (m.n + 1); size_t l = data[i + 2] % 40; i += 3;
             NEED(l ? 1 : 0); uint8_t b[40];
@@ -27,15 +27,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         } else if (op == 2 || op == 3) {     /* delete */
             NEED(3); uint64_t off = m.n ? ((uint64_t)data[i] << 8 | data[i + 1]) % (m.n + 1) : 0;
             uint64_t l = data[i + 2]; i += 3; if (l > m.n - off) l = m.n - off;
-            if (piece_delete(t, off, l)) FAIL();
+            if (piece_delete(t, off, l, NULL)) FAIL();
             pm_delete(&m, off, l);
         } else if (op == 4) {                /* snapshot swap */
             if (snap) { piece_snapshot_release(snap); pm_free(&sm); }
             snap = piece_snapshot_take(t); if (!snap) FAIL();
             pm_init(&sm, m.d, m.n);
+        } else if (op == 6) {                /* delete then reinsert by ref */
+            NEED(5); uint64_t off = m.n ? ((uint64_t)data[i] << 8 | data[i + 1]) % (m.n + 1) : 0;
+            uint64_t l = data[i + 2]; uint64_t off2; i += 3; if (l > m.n - off) l = m.n - off;
+            uint8_t sv[256]; if (l && piece_read(t, off, sv, (size_t)l)) FAIL();
+            piece_ref r; if (piece_delete(t, off, l, &r) || r.len != l) FAIL();
+            pm_delete(&m, off, l);
+            off2 = ((uint64_t)data[i] << 8 | data[i + 1]) % (m.n + 1); i += 2;
+            if (piece_insert_ref(t, off2, &r)) FAIL();
+            pm_insert(&m, off2, sv, (size_t)l);
         } else {                             /* out-of-range must fail */
             uint8_t c; if (piece_read(t, m.n, &c, 1) == 0) FAIL();
-            if (piece_delete(t, m.n, 1) == 0) FAIL();
+            if (piece_delete(t, m.n, 1, NULL) == 0) FAIL();
         }
         if (piece_len(t) != m.n || piece_line_count(t) != pm_line_count(&m)) FAIL();
         if (m.n) {

@@ -52,7 +52,7 @@ static void t_empty(void) {
     CHECK(!piece_iter_next(&it, &p, &n));
     uint8_t c; CHECK(piece_read(t, 0, &c, 1) != 0);
     CHECK(piece_read(t, 0, &c, 0) == 0);
-    CHECK(piece_delete(t, 0, 1) != 0 && piece_insert(t, 1, (const uint8_t *)"x", 1) != 0);
+    CHECK(piece_delete(t, 0, 1, NULL) != 0 && piece_insert(t, 1, (const uint8_t *)"x", 1) != 0);
     CHECK(piece_insert(t, 0, (const uint8_t *)"", 0) == 0 && piece_len(t) == 0);
     piece_destroy(t);
 }
@@ -76,11 +76,11 @@ static void t_basic(void) {
         CHECK(same(t, &m) && lines_ok(t, &m, 200));
     }
     /* delete across piece boundaries */
-    CHECK(piece_delete(t, 2, m.n - 4) == 0); pm_delete(&m, 2, m.n - 4);
+    CHECK(piece_delete(t, 2, m.n - 4, NULL) == 0); pm_delete(&m, 2, m.n - 4);
     CHECK(same(t, &m) && lines_ok(t, &m, 100));
-    CHECK(piece_delete(t, 0, m.n) == 0); pm_delete(&m, 0, m.n);
+    CHECK(piece_delete(t, 0, m.n, NULL) == 0); pm_delete(&m, 0, m.n);
     CHECK(same(t, &m) && piece_len(t) == 0);
-    CHECK(piece_delete(t, 0, 1) != 0);
+    CHECK(piece_delete(t, 0, 1, NULL) != 0);
     pm_free(&m); piece_destroy(t);
 }
 
@@ -95,7 +95,7 @@ static void t_crlf(void) {
     /* split a CRLF pair with an insert, then delete the LF only */
     CHECK(piece_insert(t, 2, (const uint8_t *)"X", 1) == 0); pm_insert(&m, 2, (const uint8_t *)"X", 1);
     CHECK(same(t, &m) && piece_line_count(t) == 5);
-    CHECK(piece_delete(t, 3, 1) == 0); pm_delete(&m, 3, 1);
+    CHECK(piece_delete(t, 3, 1, NULL) == 0); pm_delete(&m, 3, 1);
     CHECK(same(t, &m) && piece_line_count(t) == 4 && lines_ok(t, &m, 100));
     pm_free(&m); piece_destroy(t);
 }
@@ -110,7 +110,7 @@ static void t_undo(void) {
         uint64_t off = rnd() % (m.n + 1), len = rnd() % 3000; if (len > m.n - off) len = m.n - off;
         uint8_t *save = malloc(len + 1);
         CHECK(piece_read(t, off, save, len) == 0);
-        CHECK(piece_delete(t, off, len) == 0); pm_delete(&m, off, len);
+        CHECK(piece_delete(t, off, len, NULL) == 0); pm_delete(&m, off, len);
         CHECK(same(t, &m));
         CHECK(piece_insert(t, off, save, len) == 0); pm_insert(&m, off, save, len);
         free(save);
@@ -133,7 +133,7 @@ static void t_mapped(void) {
     CHECK(piece_init_mapped(t, map, 5000, &h) == 0 && mc.rc >= 1);
     CHECK(same(t, &m));
     uint8_t save[1000]; CHECK(piece_read(t, 100, save, 1000) == 0);
-    CHECK(piece_delete(t, 100, 1000) == 0); pm_delete(&m, 100, 1000);
+    CHECK(piece_delete(t, 100, 1000, NULL) == 0); pm_delete(&m, 100, 1000);
     piece_snapshot *s = piece_snapshot_take(t); CHECK(s);
     memset(map, 'Z', 5000); /* mapping changes behind the deleted range: only deleted bytes are protected */
     uint8_t *tail = malloc(m.n);
@@ -160,7 +160,7 @@ static void t_snapshot(void) {
         uint8_t b[300]; size_t l = rnd() % 300; for (size_t j = 0; j < l; j++) b[j] = (uint8_t)(rnd() % 5 ? 'x' : '\n');
         uint64_t off = rnd() % (m.n + 1);
         if (rnd() & 1) { CHECK(piece_insert(t, off, b, l) == 0); pm_insert(&m, off, b, l); }
-        else { uint64_t d = rnd() % 400; if (d > m.n - off) d = m.n - off; CHECK(piece_delete(t, off, d) == 0); pm_delete(&m, off, d); }
+        else { uint64_t d = rnd() % 400; if (d > m.n - off) d = m.n - off; CHECK(piece_delete(t, off, d, NULL) == 0); pm_delete(&m, off, d); }
     }
     CHECK(same(t, &m));
     CHECK(piece_snapshot_len(s1) == frozen.n && piece_snapshot_line_count(s1) == pm_line_count(&frozen));
@@ -198,7 +198,7 @@ static void t_threads(void) {
     piece_snapshot *s = piece_snapshot_take(t);
     pthread_t th[3]; rdarg ra[3];
     for (int i = 0; i < 3; i++) { ra[i] = (rdarg){ piece_snapshot_retain(s), &fz, 1 }; pthread_create(&th[i], NULL, reader, &ra[i]); }
-    for (int i = 0; i < 500; i++) { piece_insert(t, rnd() % (piece_len(t) + 1), (const uint8_t *)"zz\n", 3); piece_delete(t, rnd() % (piece_len(t) - 4), 3); }
+    for (int i = 0; i < 500; i++) { piece_insert(t, rnd() % (piece_len(t) + 1), (const uint8_t *)"zz\n", 3); piece_delete(t, rnd() % (piece_len(t) - 4), 3, NULL); }
     for (int i = 0; i < 3; i++) { pthread_join(th[i], NULL); CHECK(ra[i].ok); piece_snapshot_release(ra[i].s); }
     piece_snapshot_release(s); piece_destroy(t); free(o); pm_free(&fz);
 }
@@ -228,7 +228,7 @@ static void t_random(void) {
         } else {
             uint64_t off = rnd() % m.n, l = rnd() % 8 == 0 ? rnd() % 500 : rnd() % 4;
             if (l > m.n - off) l = m.n - off;
-            CHECK(piece_delete(t, off, l) == 0); pm_delete(&m, off, l); deleted += l;
+            CHECK(piece_delete(t, off, l, NULL) == 0); pm_delete(&m, off, l); deleted += l;
         }
         CHECK(piece_len(t) == m.n);
         if (i % 1000 == 0) { CHECK(same(t, &m)); CHECK(lines_ok(t, &m, 3)); }
@@ -256,9 +256,57 @@ static void t_mapped_mem(void) {
     piece_destroy(t); CHECK(c.live == 0 && mc.rc == 0); free(o);
 }
 
+
+static void t_coalesce(void) {
+    g_name = "coalesce";
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a);
+    CHECK(piece_init_copy(t, (const uint8_t *)"0123456789", 10) == 0);
+    for (int i = 0; i < 10000; i++) CHECK(piece_insert(t, 5 + (uint64_t)i, (const uint8_t *)"x", 1) == 0);
+    CHECK(piece_len(t) == 10010 && piece_piece_count(t) <= 3);
+    uint64_t pc0 = piece_piece_count(t);
+    CHECK(piece_insert(t, 0, (const uint8_t *)"y", 1) == 0);      /* elsewhere breaks run */
+    CHECK(piece_insert(t, 10006, (const uint8_t *)"z", 1) == 0); /* old cursor: not adjacent in add buffer */
+    CHECK(piece_piece_count(t) >= pc0 + 2);
+    piece_destroy(t);
+    t = piece_create(&a);
+    for (int i = 0; i < 10000; i++) CHECK(piece_insert(t, (uint64_t)i, (const uint8_t *)"q", 1) == 0);
+    CHECK(piece_piece_count(t) <= 2 && piece_len(t) == 10000);
+    piece_destroy(t);
+}
+
+static void t_ref(void) {
+    g_name = "ref";
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a);
+    enum { N = 3000 };
+    uint8_t o[N]; for (int i = 0; i < N; i++) o[i] = (uint8_t)('a' + i % 26 + (i % 7 == 0 ? -32 : 0));
+    CHECK(piece_init_copy(t, o, N) == 0);
+    pm_model m; pm_init(&m, o, N);
+    for (int i = 0; i < 40; i++) {                     /* build mixed content */
+        uint64_t off = rnd() % (m.n + 1); uint8_t b[9] = "ab\ncd\nef\n"; size_t l = 1 + rnd() % 8;
+        CHECK(piece_insert(t, off, b, l) == 0); pm_insert(&m, off, b, l);
+    }
+    for (int it = 0; it < 300; it++) {
+        uint64_t off = rnd() % (m.n + 1), l = rnd() % (it % 3 == 0 ? m.n - off + 1 : 200);
+        if (l > m.n - off) l = m.n - off;
+        uint8_t *save = malloc(l + 1); CHECK(piece_read(t, off, save, (size_t)l) == 0);
+        piece_ref r; uint64_t pcnt0 = piece_piece_count(t); (void)pcnt0;
+        CHECK(piece_delete(t, off, l, &r) == 0);
+        CHECK(r.len == l && r.nspans <= PIECE_REF_SPANS && (l == 0 || r.nspans >= 1));
+        pm_delete(&m, off, l); CHECK(same(t, &m));
+        uint64_t off2 = rnd() % (m.n + 1);
+        CHECK(piece_insert_ref(t, off2, &r) == 0); pm_insert(&m, off2, save, (size_t)l);
+        CHECK(same(t, &m)); CHECK(lines_ok(t, &m, 20));
+        free(save);
+    }
+    CHECK(piece_insert_ref(t, m.n + 1, &(piece_ref){0}) != 0);
+    piece_ref bad = { 1, 1, {{ 1ull << 40, 1 }} };
+    CHECK(piece_insert_ref(t, 0, &bad) != 0);
+    pm_free(&m); piece_destroy(t);
+}
+
 int main(void) {
     rng_s = 12345;
-    t_empty(); t_basic(); t_crlf(); t_undo(); t_mapped(); t_snapshot(); t_threads(); t_random(); t_mapped_mem();
+    t_empty(); t_basic(); t_crlf(); t_undo(); t_mapped(); t_snapshot(); t_threads(); t_random(); t_mapped_mem(); t_coalesce(); t_ref();
     printf(g_fail ? "piece_test: FAILED\n" : "piece_test: all passed\n");
     return g_fail;
 }

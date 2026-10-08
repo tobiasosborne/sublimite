@@ -40,6 +40,24 @@
  * persistent path copying for snapshots, leaf entry ~24 B, ~72 B/piece amortized,
  * add buffer in 64 KiB chunks, lazy newline counts for unindexed mapped pieces.
  * Implementations are compared on this API, not on layout.
+ *
+ * ALLOCATOR BACKING (P1.3b): piece_allocator hooks should be backed by
+ * src/base: fixed-size requests (nodes, chunks, snapshot headers) by an
+ * edit_pool, variable/bulk requests by an edit_arena (see src/base/base.h),
+ * so that no malloc happens on the typing path.
+ *
+ * APPEND COALESCING (P1.3b, REQUIRED): if an insert's bytes land in the add
+ * buffer immediately after the previous insert's bytes (nothing else was
+ * appended to the add buffer in between, same add chunk) AND its byte offset
+ * equals the end offset of that previous insert (no other mutation in between),
+ * the implementation MUST extend the existing piece instead of creating a new
+ * one. Typing N single bytes at the cursor therefore yields <= 2 pieces. Any
+ * intervening insert elsewhere, delete or insert_ref breaks the run. A piece
+ * never spans an add-chunk boundary, so a run may start a new piece there.
+ *
+ * REINSERT BY REFERENCE (P1.3b): piece_delete may fill a piece_ref describing
+ * where the deleted bytes now live in the add buffer; piece_insert_ref later
+ * re-creates pieces pointing at them with no byte copying (undo/redo).
  */
 #ifndef PIECE_H
 #define PIECE_H
@@ -88,15 +106,34 @@ int piece_init_copy(piece_tree *t, const uint8_t *data, size_t len);
 int piece_init_mapped(piece_tree *t, const uint8_t *mapped, size_t len,
                       const piece_map_hooks *hooks);
 
+/* Location of deleted bytes in the add buffer (offsets are logical add-buffer
+ * offsets, chunk-spanning allowed). Always complete; see piece_delete. */
+#define PIECE_REF_SPANS 8
+typedef struct piece_ref {
+    uint32_t nspans;
+    uint64_t len;                       /* total bytes = sum of span lens */
+    struct { uint64_t add_off, len; } span[PIECE_REF_SPANS];
+} piece_ref;
+
 /* Mutation. O(log n) expected (+ O(len) copy of inserted bytes).
  * insert: off in [0, piece_len]. Bytes are copied into the add buffer.
  * delete: off+len <= piece_len. Any ORIGINAL-sourced bytes in the deleted range
  * are copied into the add buffer at delete time, so the tree never again needs
  * the mapping for them (undo stays byte-exact even if the mapping changes).
- * Callers implement undo as inverse ops: read the range with piece_read before
- * deleting, and re-insert it later. len == 0 is a successful no-op. */
+ * ref (may be NULL): if non-NULL it is filled with the add-buffer location of
+ * the deleted bytes, in content order (original bytes were copied there; add
+ * bytes already live there, possibly as several spans). If more than
+ * PIECE_REF_SPANS spans would be needed, the whole deleted range is instead
+ * copied into ONE new add-buffer span, so the ref is always complete. The
+ * G10f bound is unchanged (a delete adds at most `len` add bytes). len == 0
+ * is a successful no-op with an empty ref (nspans == 0). */
 int piece_insert(piece_tree *t, uint64_t off, const uint8_t *data, size_t len);
-int piece_delete(piece_tree *t, uint64_t off, uint64_t len);
+int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref);
+/* Reinsert the bytes described by `ref` (from a piece_delete on this tree) at
+ * byte offset `off` without copying them. Add-buffer bytes are never freed or
+ * moved while the tree lives, so a ref stays valid for the tree's lifetime.
+ * PIECE_ERR_RANGE if off > piece_len or a span lies outside the add buffer. */
+int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref);
 
 /* Queries. */
 uint64_t piece_len(const piece_tree *t);
