@@ -176,6 +176,14 @@ Battery rerun / GPU wake probe / photodiode rig (HANDOFF §4); Windows (M3); neu
 
 ## 5. Ordering and parallelism
 
+**Velocity rules (Tobias, 2026-10-08: "I want velocity").** Measured 2026-10-08: 15 beads in 27 min at 11 workers, ≈ 73K tokens per bead. The critical path (bench matrix → kernel variants → Pareto/synthesis → review → undo → editor loop → M0 bench; then tabs → save → hot exit → Astra fixes) is ≈ 10–12 h of the ≈ 25–30 h estimate; width beyond the graph's ≈ 12 concurrent beads buys nothing. To approach the floor:
+1. **Reviews never gate.** Codex reviews are read-only: start the next epic the moment code lands; findings arrive as beads.
+2. **Pipeline against frozen interfaces.** Layout, view, GL variants, X11 input, CPU raster build against `piece.h` and the cell-grid interface, not the winning kernel; run them during the kernel competition. Freeze `render.h` and `plat.h` before fan-out, as `piece.h` was.
+3. **Builds wide, benches quiet.** Any number of concurrent compiles/tests; gate benches queue on an idle machine (concurrent builds halved a scan number today) and stamp power status.
+4. **Coordinator owns `bd` and `git`** (single-writer tracker); workers never wait on it. Spawn up to 12 workers at once.
+5. **Width costs tokens linearly; only widen competitions where the Pareto question is open** (kernel, GL present path, after-idle experiments). Elsewhere one worker.
+
+
 Critical path: P0 → P1.3 → P1.4 (best-of, the longest single item) → P1.5 → P3.3 → P3.5. Everything in P1 except the piece tree and P2 entirely can run in parallel with P1.4. Suggested coordinator schedule:
 
 1. P0.1–P0.5 sequentially (small).

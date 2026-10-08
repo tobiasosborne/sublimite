@@ -10,6 +10,9 @@ Read: this → `CLAUDE.md` → `PLAN.md` §1 → `bd ready --type task`. Previou
 ## Workflow in force (PLAN.md §1, memory `editor-agent-workflow`)
 Fable = consultant, never codes, no Fable subagents. Opus coordinator spawns one Haiku 5.5 (default) or Sonnet worker per bead, ~100K tokens, then terminates it. Workers never run `bd`, `git`, or edit the Makefile (it globs). `mode:par` = implement every candidate, measure, Pareto; `mode:best` = 2–3 independent impls → Opus best-of; Codex gpt-6.1-sol xhigh for deep review; gpt-6-astra test drive after MVP. Tobias: "create possibilities, measure results, don't just theorise" and is happy to reimplement the kernel several ways and pick Pareto-optimal over use cases.
 
+## Velocity (binding, PLAN.md §5)
+Tobias wants velocity. Run up to 12 workers; never gate an epic on its Codex review; pipeline P2/P3 interface work during the P1.4 kernel competition; keep gate benches off a loaded machine. Estimate: ≈ 25–30 h active to the trial at today's pace, ≈ 12 h if the critical path is kept busy.
+
 ## Next (in order, all `bd ready --type task`)
 0. **Token-budget hook** (haiku, new bead to create): PostToolUse hook that sums usage from the transcript and injects a stop instruction at 80K (Haiku) / 160K (Sonnet); use the update-config skill. Two Haikus declined beads today because briefs carried a wall-clock deadline; never do that again (CLAUDE.md law 3).
 1. **P1.4a** frozen bench matrix (sonnet) → **P1.4** four kernel designs in parallel (4 sonnets) → Pareto → possible Opus synthesis → Codex review.
