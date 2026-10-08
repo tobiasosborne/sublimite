@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"start"},"uuid":"u1"}
+{"type":"assistant","message":{"id":"m1","model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":38000,"output_tokens":100}},"uuid":"a1"}

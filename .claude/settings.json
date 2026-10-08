@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/tools/hooks/token_budget.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
