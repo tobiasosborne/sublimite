@@ -100,12 +100,30 @@ static void test_fast_rejects_bad_opts(void) {
     CHECK(trace_replay(g_src, 1, &bad, NULL, NULL) != 0, "NULL sink rejected");
 }
 
+/* Checks each delivery against its absolute deadline: event i must be
+ * delivered no earlier than start + (t0_i - t0_0) / speed, minus 100 us of
+ * slack. A late delivery shortens the next measured gap legitimately, so
+ * per-gap bounds are wrong; the upper bound is loose (200 ms) so a stalled
+ * box does not fail. */
+static void check_deadlines(const char *tag, size_t n, double speed, uint64_t start) {
+    for (size_t i = 0; i < n && i < TRACE_INPUT_CAP; i++) {
+        uint64_t offset = (uint64_t)((double)(g_src[i].t0_ns - g_src[0].t0_ns) / speed);
+        uint64_t rel = g_when[i] - start;
+        CHECK(rel + 100000u >= offset, "%s event %zu at %llu ns, deadline %llu ns",
+              tag, i, (unsigned long long)rel, (unsigned long long)offset);
+        CHECK(rel < offset + 200000000u, "%s event %zu at %llu ns, far too late",
+              tag, i, (unsigned long long)rel);
+        if (i > 0) printf("%s event %zu: %llu us (deadline %llu us)\n", tag, i,
+                          (unsigned long long)(rel / 1000u), (unsigned long long)(offset / 1000u));
+    }
+}
+
 static void test_timing_gaps(void) {
-    /* Three events 2 ms apart at 1x: each delivery must wait at least the
-     * recorded gap (absolute deadlines never return early); the upper bound
-     * is loose because the box is loaded by other workers. */
+    /* Three events 2 ms apart at 1x: each delivery must not precede its
+     * absolute deadline relative to the replay start. */
     trace_replay_opts o = { 0, 1.0 };
     size_t n = 3;
+    uint64_t start;
     for (size_t i = 0; i < n; i++) {
         g_src[i].seq = i;
         g_src[i].t0_ns = IN_BASE + i * GAP_NS;
@@ -113,28 +131,22 @@ static void test_timing_gaps(void) {
         g_src[i].p.focus.focused = 1;
     }
     g_ngot = 0;
+    start = trace_now_ns();
     CHECK(trace_replay(g_src, n, &o, collect_sink, NULL) == 0, "replay 1x");
     CHECK(g_ngot == n, "1x delivered %zu", g_ngot);
-    for (size_t i = 1; i < n && i < TRACE_INPUT_CAP; i++) {
-        uint64_t gap = g_when[i] - g_when[i - 1];
-        CHECK(gap >= GAP_NS - 100000u, "1x gap %zu=%llu ns, want >= 2 ms", i, (unsigned long long)gap);
-        CHECK(gap < 200000000u, "1x gap %zu=%llu ns, far too late", i, (unsigned long long)gap);
-        printf("1x gap %zu: %llu us\n", i, (unsigned long long)(gap / 1000u));
-    }
+    check_deadlines("1x", n, 1.0, start);
 }
 
 static void test_speed_scales_gaps(void) {
-    /* --speed=2 halves the recorded gaps: 2 ms events become 1 ms apart. */
+    /* --speed=2 halves the recorded offsets: 2 ms events become 1 ms apart. */
     trace_replay_opts o = { 0, 2.0 };
     size_t n = 3;
+    uint64_t start;
     g_ngot = 0;
+    start = trace_now_ns();
     CHECK(trace_replay(g_src, n, &o, collect_sink, NULL) == 0, "replay 2x");
     CHECK(g_ngot == n, "2x delivered %zu", g_ngot);
-    for (size_t i = 1; i < n && i < TRACE_INPUT_CAP; i++) {
-        uint64_t gap = g_when[i] - g_when[i - 1];
-        CHECK(gap >= GAP_NS / 2 - 100000u, "2x gap %zu=%llu ns, want >= 1 ms", i, (unsigned long long)gap);
-        CHECK(gap < 200000000u, "2x gap %zu=%llu ns, far too late", i, (unsigned long long)gap);
-    }
+    check_deadlines("2x", n, 2.0, start);
 }
 
 int main(int argc, char **argv) {
