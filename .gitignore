@@ -1,0 +1,5 @@
+variants/
+*.o
+/edit
+/build/
+.beads/*.db
