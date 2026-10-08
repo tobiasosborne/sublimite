@@ -1,15 +1,17 @@
 /* src/font/font.c - see font.h. stb_truetype is vendored in vendor/. */
 #include "font/font.h"
+#include <setjmp.h>
 #include <string.h>
 
 /* stb_truetype allocations go to a per-call arena (Law 2: no libc malloc on
  * the typing path). info->userdata points at a font_stb_ctx that exists only
  * inside font_raster_glyph; otherwise userdata is NULL and stb gets NULL back
  * (metrics paths never allocate in stb). free is a no-op: the caller resets
- * the arena to its mark. */
+ * the arena to its mark. On exhaustion, leave stb immediately: its scanline
+ * allocation dereferences NULL and its active-edge allocation asserts. */
 typedef struct font_stb_ctx {
     edit_arena *arena;
-    int         failed;
+    jmp_buf     nomem;
 } font_stb_ctx;
 
 static void *font_stb_alloc(size_t n, void *u)
@@ -17,7 +19,7 @@ static void *font_stb_alloc(size_t n, void *u)
     font_stb_ctx *c = (font_stb_ctx *)u;
     if (!c) return NULL;
     void *p = edit_arena_alloc(c->arena, n ? n : 1u, 16);
-    if (!p) c->failed = 1;
+    if (!p) longjmp(c->nomem, 1);
     return p;
 }
 #define STBTT_malloc(x, u) font_stb_alloc((size_t)(x), (u))
@@ -155,20 +157,30 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     out->w = out->m.w;
     out->h = out->m.h;
     if (out->w == 0 || out->h == 0) return FONT_OK;
+    if ((size_t)out->w > SIZE_MAX / out->h) return FONT_ERR_NOMEM;
+    edit_arena_mark_t start = edit_arena_mark(arena);
     uint8_t *px = edit_arena_alloc(arena, (size_t)out->w * out->h, 1);
     if (!px) return FONT_ERR_NOMEM;
     memset(px, 0, (size_t)out->w * out->h);
     /* stb scratch (vertices, edges, scanlines) comes from the same arena after
      * the bitmap and is released by rewinding to this mark. */
     edit_arena_mark_t mk = edit_arena_mark(arena);
-    font_stb_ctx ctx = { arena, 0 };
+    font_stb_ctx ctx;
+    ctx.arena = arena;
+    /* All stb-owned storage is in this arena and STBTT_free is a no-op, so
+     * unwinding on allocation failure needs only the arena rewind. start is
+     * unchanged after setjmp; do not read modified automatic locals here. */
+    if (setjmp(ctx.nomem)) {
+        info_of(f)->userdata = NULL;
+        edit_arena_reset_to_mark(arena, start);
+        return FONT_ERR_NOMEM;
+    }
     info_of(f)->userdata = &ctx;
     /* stb writes a box-sized bitmap whose origin is the box's top-left. */
     stbtt_MakeGlyphBitmap(cinfo_of(f), px, (int)out->w, (int)out->h, (int)out->w,
                           f->scale, f->scale, g);
     info_of(f)->userdata = NULL;
     edit_arena_reset_to_mark(arena, mk);
-    if (ctx.failed) return FONT_ERR_NOMEM;
     out->pixels = px;
     return FONT_OK;
 }

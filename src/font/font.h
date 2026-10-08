@@ -81,7 +81,9 @@ int  font_set_px(font_t *f, uint32_t px);
 int  font_cell_metrics(const font_t *f, font_cell *out);
 /* Metrics of a codepoint without rasterising. */
 int  font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out);
-/* Rasterises cp into arena memory. FONT_ERR_MISSING for absent glyphs. */
+/* Rasterises cp into arena memory. FONT_ERR_MISSING for absent glyphs.
+ * FONT_ERR_NOMEM leaves pixels NULL and the arena at its entry mark.
+ * A font_t must not be rasterised concurrently (stb userdata is per-call). */
 int  font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out);
 /* Composites a bitmap into a cell_w x cell_h R8 cell (caller zeroes it). */
 int  font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,

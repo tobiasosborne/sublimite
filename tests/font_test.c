@@ -75,6 +75,85 @@ static void test_raster(font_t *f, edit_arena *a)
     CHECK(font_raster_glyph(f, 0x110000u, a, &b) == FONT_ERR_MISSING);
 }
 
+/* A bitmap fits, but stb's heap scanline for a wide glyph does not. */
+static void test_raster_exhaustion(font_t *f, edit_arena *normal)
+{
+    CHECK(font_set_px(f, 256) == FONT_OK);
+    font_metric m;
+    CHECK(font_glyph_metrics(f, 'W', &m) == FONT_OK);
+    CHECK(m.w > 64u && m.h > 0);
+    size_t bitmap_bytes = (size_t)m.w * m.h;
+    edit_arena tiny;
+    CHECK(edit_arena_init(&tiny, bitmap_bytes + 768u) == 0);
+    font_bitmap b;
+    fprintf(stderr, "font_test: wide W scratch exhaustion\n");
+    CHECK(font_raster_glyph(f, 'W', &tiny, &b) == FONT_ERR_NOMEM);
+    CHECK(b.pixels == NULL);
+    CHECK(tiny.used == 0);
+    edit_arena_free(&tiny);
+
+    edit_arena_mark_t mk = edit_arena_mark(normal);
+    CHECK(font_raster_glyph(f, 'W', normal, &b) == FONT_OK);
+    CHECK(b.pixels != NULL && b.w == m.w && b.h == m.h);
+    int any = 0;
+    for (size_t i = 0; b.pixels && i < bitmap_bytes; i++) any |= b.pixels[i] != 0;
+    CHECK(any);
+    edit_arena_reset_to_mark(normal, mk);
+    printf("font_test: wide W exhaustion returns FONT_ERR_NOMEM; normal arena succeeds\n");
+    CHECK(font_set_px(f, 30) == FONT_OK);
+}
+
+/* Exhaust bitmap, outline, flattening, edges, scanline and active-edge heap
+ * storage, including composite/curved glyphs and non-aligned entry marks. */
+static void test_raster_exhaustion_sweep(font_t *f)
+{
+    static const uint32_t cps[] = { 'W', '@', 0xE9u, 'i' };
+    static const size_t scratch[] = {
+        0, 1, 16, 32, 64, 128, 256, 512, 768, 1024, 2048, 4096,
+        8192, 16384, 32768, 65536
+    };
+    const size_t capacity = 1u << 20;
+    edit_arena a;
+    CHECK(edit_arena_init(&a, capacity) == 0);
+    if (!a.base) return;
+    unsigned char *prefix = edit_arena_alloc(&a, 7, 1);
+    memset(prefix, 0xA5, 7);
+    edit_arena_mark_t entry = edit_arena_mark(&a);
+    for (uint32_t px = 30; px <= 256; px += 226) {
+        CHECK(font_set_px(f, px) == FONT_OK);
+        for (size_t c = 0; c < sizeof cps / sizeof cps[0]; c++) {
+            font_metric m;
+            CHECK(font_glyph_metrics(f, cps[c], &m) == FONT_OK);
+            size_t bitmap_bytes = (size_t)m.w * m.h;
+            int saw_failure = 0, saw_success = 0;
+            font_bitmap b;
+            a.size = entry + bitmap_bytes - 1u;
+            CHECK(font_raster_glyph(f, cps[c], &a, &b) == FONT_ERR_NOMEM);
+            CHECK(b.pixels == NULL && a.used == entry);
+            for (size_t s = 0; s < sizeof scratch / sizeof scratch[0]; s++) {
+                a.size = entry + bitmap_bytes + scratch[s];
+                int r = font_raster_glyph(f, cps[c], &a, &b);
+                CHECK(r == FONT_ERR_NOMEM || r == FONT_OK);
+                if (r == FONT_ERR_NOMEM) {
+                    saw_failure = 1;
+                    CHECK(b.pixels == NULL && a.used == entry);
+                } else {
+                    saw_success = 1;
+                    CHECK(b.pixels != NULL && a.used == entry + bitmap_bytes);
+                }
+                CHECK(b.w == m.w && b.h == m.h);
+                for (size_t i = 0; i < entry; i++) CHECK(prefix[i] == 0xA5);
+                edit_arena_reset_to_mark(&a, entry);
+            }
+            CHECK(saw_failure && saw_success);
+        }
+    }
+    a.size = capacity;  /* restore mmap extent before munmap */
+    edit_arena_free(&a);
+    CHECK(font_set_px(f, 30) == FONT_OK);
+    printf("font_test: bitmap/scratch exhaustion sweep and arena rollback passed\n");
+}
+
 static void test_shelf(void)
 {
     font_atlas at;
@@ -116,14 +195,16 @@ static void test_no_malloc(font_t *f, edit_arena *a)
         return;
     }
     edit_malloc_guard_begin();
+    int bad = 0;
     for (int i = 0; i < 600; i++) {
         int r = font_raster_glyph(f, cps[i % 6], a, &b);
-        if (r != FONT_OK) break;
+        bad |= r != FONT_OK;
         edit_arena_reset_to_mark(a, mk);
     }
     size_t n = edit_malloc_guard_end();
     printf("font_test: mallocs during 600 rasterisations: %zu\n", n);
     CHECK(n == 0);
+    CHECK(!bad);
 }
 
 static void test_atlas_px(const unsigned char *ttf, size_t len)
@@ -196,6 +277,14 @@ int main(void)
 
     test_bake_consistency(&f);
     test_raster(&f, &a);
+    test_raster_exhaustion(&f, &a);
+    if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+    test_raster_exhaustion_sweep(&f);
+    if (edit_malloc_guard_active()) {
+        size_t n = edit_malloc_guard_end();
+        printf("font_test: mallocs during exhaustion sweep: %zu\n", n);
+        CHECK(n == 0);
+    }
     test_shelf();
     test_no_malloc(&f, &a);
     test_atlas_px(ttf, len);
