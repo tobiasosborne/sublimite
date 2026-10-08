@@ -60,7 +60,7 @@ edit/
 
 Compiler: gcc 13 (release), clang 18 (sanitizers, fuzzing). No CMake, no meson: the Makefile is small enough for Haiku to read whole.
 
-Dependencies on A: libxcb 1.15, xkbcommon 1.6, EGL 1.5 / GL, wayland-client 1.22, freetype 26.1 (atlas baking only, not linked into the editor). **Missing on this machine and needed by P2:** `libxcb-xkb1-dev`, `libxkbcommon-x11-dev`, `libxcb-present-dev`; tree-sitter is vendored, not a package.
+Dependencies on A: libxcb 1.15, xkbcommon 1.6, EGL 1.5 / GL, wayland-client 1.22, freetype 26.1 (atlas baking only, not linked into the editor). **Missing on this machine and needed by P2:** `libxcb-xkb-dev`, `libxkbcommon-x11-dev`, `libxcb-present-dev`; tree-sitter is vendored, not a package.
 
 Working command name: `edit` (PRD §11 open question; rename is a one-line change in the Makefile). Embedded font: DejaVu Sans Mono (on this machine, licence permits embedding; swap later if JetBrains Mono is wanted).
 
