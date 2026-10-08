@@ -13,7 +13,8 @@ Read order, every session: `HANDOFF.md` → this file → `PLAN.md` §1 (workflo
 7. **Tracking is beads only** (`bd`). No TODO files, no issue lists in markdown.
 8. **Reviews**: Sonnet for quick bug hunts on diffs; Codex (`codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh -s read-only --skip-git-repo-check -o docs/reviews/<name>.md "<prompt>"`) for epic-end and best-of modules. Prompt it to relentlessly find all problems with severity and a concrete fix. Every BLOCKER/MAJOR becomes a bead.
 9. **Red-green TDD where possible.** Write the failing test (or fuzz op / bench) first, see it fail, then implement until green, then refactor. A bead's report shows the red run and the green run. Frozen specs (P1.3-style header + suite before implementations) are this rule applied at module scale.
-10. **No Fable subagents.** The main session is the consultant; Opus coordinates; Haiku/Sonnet implement; Opus synthesises best-of; Codex reviews and test-drives.
+10. **No Fable subagents.** The main session is the consultant; Opus coordinates; Haiku/Sonnet implement; Opus synthesises best-of; Codex reviews and test-drives. **Codex `gpt-6.1-sol` (high/xhigh) is Opus-grade** and may implement, synthesise and review via `codex exec --approve-for-me -C <dir>`; prefer it over Opus/Sonnet workers while Codex is behind pace. `gpt-5.6-luna` is below Haiku grade: never for code.
+11. **Pace ceiling.** Claude usage stays within +2 % of uniform pace on every `quota` window; the coordinator checks `quota` before each dispatch wave and routes to Codex sol when over (PLAN §5.6–5.7).
 
 ## Code conventions
 

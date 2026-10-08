@@ -14,7 +14,8 @@ Perf measurements (battery rerun, GPU wake probe, photodiode) are **deferred** b
 | Coordinator | Opus subagent | one per session | reads `bd ready`, picks the next bead, spawns one worker per bead, checks the result against the bead's acceptance criteria, closes or reopens, raises new beads for problems found, writes `docs/worklog/` entries |
 | Sub-coordinator | Opus subagent | per epic when the coordinator judges it worthwhile | same as coordinator for one epic (e.g. the renderer, the piece tree best-of) |
 | Worker | Haiku (default) or Sonnet | **one bead, then terminated** | implements exactly the bead, runs its tests and benchmark, updates the bead with results, closes it |
-| Synthesiser | Opus | one per best-of bead | reads 2–3 independent implementations, writes the best-of implementation, documents what was taken from where |
+| Codex worker | `codex exec -m gpt-6.1-sol -c model_reasoning_effort=high` (xhigh for synthesis) `--approve-for-me --skip-git-repo-check -C <dir> -o <report.md> "<brief>"` | one bead, like any worker | **Opus-grade** (Tobias, 2026-10-08 evening). Takes any bead an Opus or Sonnet worker would: synthesis, mode:best implementations, kernel designs, hard debugging. Preferred over Opus/Sonnet while Codex quota is behind pace. `gpt-5.6-luna` is below Haiku grade: never for code. Same brief rules: one bead, no `bd`/`git`/Makefile, red-green report, STATUS.md on budget. |
+| Synthesiser | Opus or Codex sol xhigh | one per best-of bead | reads 2–3 independent implementations, writes the best-of implementation, documents what was taken from where |
 | Quick reviewer | Sonnet | one per review | bug hunt on a diff; findings become beads |
 | Deep reviewer | `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh -s read-only --skip-git-repo-check -o <out.md>` | one per review | relentless review of a module; findings become beads |
 | Test driver | `codex exec -m gpt-6-astra` with computer use | after the MVP lands | drives the built editor, files every edge case, crash, mis-render as a bead |
@@ -182,6 +183,8 @@ Battery rerun / GPU wake probe / photodiode rig (HANDOFF §4); Windows (M3); neu
 3. **Builds wide, benches quiet.** Any number of concurrent compiles/tests; gate benches queue on an idle machine (concurrent builds halved a scan number today) and stamp power status.
 4. **Coordinator owns `bd` and `git`** (single-writer tracker); workers never wait on it. Spawn up to 12 workers at once.
 5. **Width costs tokens linearly; only widen competitions where the Pareto question is open** (kernel, GL present path, after-idle experiments). Elsewhere one worker.
+6. **Pace ceiling (Tobias, 2026-10-08 evening).** Claude usage may run at most **2 % ahead of uniform pace** on every window the `quota` CLI reports (5-hour session, Weekly, Fable weekly; PACE column, `+X% ahead`). The coordinator runs `quota` before every dispatch wave and records the line in the worklog. If any Claude window is more than +2 % ahead, no new Claude workers (Haiku, Sonnet, Opus) are spawned; beads go to Codex sol until the delta is back under. Pace is defined in `~/Projects/quota-app/README.md` ("How pacing works": `u* = elapsed / L`, delta = used − u*).
+7. **Codex sol is a worker pool, not only a reviewer.** While Codex Weekly is behind pace, route Opus-grade beads (synthesis, mode:best, kernel designs, hard debugging) to `gpt-6.1-sol` high/xhigh via `codex exec --approve-for-me`; keep Claude quota for the coordinator and Haiku standard beads. When Codex reaches pace, balance the two by their pace deltas.
 
 
 Critical path: P0 → P1.3 → P1.4 (best-of, the longest single item) → P1.5 → P3.3 → P3.5. Everything in P1 except the piece tree and P2 entirely can run in parallel with P1.4. Suggested coordinator schedule:
