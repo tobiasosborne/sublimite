@@ -14,6 +14,8 @@ REL_F  := -O2 -g -msse2
 SAN_F  := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
 FUZZ_F := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -O1 -g
 LDLIBS := -lm -ldl
+# Per-module extra libraries: a one-line file src/<m>/LDLIBS (e.g. "-lxcb -lxkbcommon") is appended to every link.
+LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
 SRCS   := $(sort $(wildcard src/*/*.c))
