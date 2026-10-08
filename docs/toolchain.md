@@ -33,3 +33,6 @@ sudo apt install libxcb-xkb-dev libxkbcommon-x11-dev libxcb-present-dev
 - `make fuzz` builds `build/fuzz/<m>_fuzz` (libFuzzer); run manually.
 - Adding a module: drop files in `src/<m>/`, `tests/<m>_test.c`, `bench/<m>_bench.c`, `fuzz/<m>_fuzz.c`. The Makefile globs.
 - `tools/ci.sh` runs the full battery.
+
+## libFuzzer link
+clang 18 selects `/usr/lib/gcc/x86_64-linux-gnu/14` (partial install, no libstdc++) and `-fsanitize=fuzzer` fails with `cannot find -lstdc++`. The Makefile passes `--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13` on fuzz links. Workers building fuzzers by hand need the same flag.

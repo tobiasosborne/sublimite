@@ -2,6 +2,9 @@
 # bench/<m>_bench.c, fuzz/<m>_fuzz.c, tools/<name>.c; never edit this file.
 CC_RELEASE ?= gcc
 CC_SAN     ?= clang
+# clang 18 on this box selects a half-installed gcc-14 dir and cannot find -lstdc++ (libFuzzer needs it); pin gcc 13. See docs/toolchain.md.
+GCC_DIR    ?= $(firstword $(wildcard /usr/lib/gcc/x86_64-linux-gnu/13))
+CLANG_GCC  := $(if $(GCC_DIR),--gcc-install-dir=$(GCC_DIR),)
 AR         ?= ar
 
 WARN   := -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread
@@ -79,7 +82,7 @@ $(B)/san/tests/%: $(B)/san/tests/%.o $(SAN_LIB)
 	$(CC_SAN) $(SAN_F) -pthread $< $(SAN_LIB) $(LDLIBS) -o $@
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 	@mkdir -p $(@D)
-	$(CC_SAN) -fsanitize=fuzzer,address,undefined -pthread $< $(FUZZ_LIB) $(LDLIBS) -o $@
+	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(FUZZ_LIB) $(LDLIBS) -o $@
 
 # ---- phony drivers ----
 # Test binaries are built in sanitizer config under build/san/tests/.
