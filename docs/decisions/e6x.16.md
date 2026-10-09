@@ -158,3 +158,15 @@ also compiled each bench explicitly with Clang, the required warning flags,
 `-fsanitize=address,undefined -fno-omit-frame-pointer`, the display guard,
 `build/san/libedit.a` and the same libraries as its release link, then ran
 `--pace-self-check` with leak detection disabled. Both passed.
+
+## Real-display run (2026-10-09 16:52–16:53, batch 2, Tobias's go 16:10)
+`EDIT_ALLOW_REAL_DISPLAY=1 DISPLAY=:0`, power "Not charging" [AC], 1-min load 14.7–15.3 (about 10 workers running), panel refresh measured 16.67 ms (60 Hz). 600 refresh-paced frames each, TRACK:
+
+| Backend / atlas | missed refreshes / 600 | longest stall | notes |
+|---|---|---|---|
+| EGL 15 px | 1 | 31.2 ms | submit p50/p99 1.24/1.58 ms; ingress→T5 4.94/18.9 ms |
+| EGL 30 px | 3 | 37.2 ms | submit 0.47/0.64 ms |
+| raster 15 px | 316 | 66.6 ms | strips p50 ≈ 5.5–6.2 ms each under load; ingress→T5 16.1/36.3 ms |
+| raster 30 px | 75 | 50.1 ms | |
+
+Reading (policy: notes, not beads): under load the 4-worker CPU raster cannot hold 60 Hz scrolling at 15 px; EGL nearly can (1–3 misses). This supports switching the editor's single backend call site to EGL (follow-up).
