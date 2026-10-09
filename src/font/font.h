@@ -18,7 +18,7 @@ enum {
     FONT_OK          = 0,
     FONT_ERR_MISSING = -1,  /* codepoint has no glyph in this font */
     FONT_ERR_NOMEM   = -2,  /* arena or atlas exhausted */
-    FONT_ERR_INIT    = -3,  /* bad TTF data */
+    FONT_ERR_INIT    = -3,  /* malformed or unsupported font data */
     FONT_ERR_ARG     = -4
 };
 
@@ -50,6 +50,9 @@ typedef struct font {
     const unsigned char *data;
     size_t   len;
     uint32_t px;
+    uint32_t face_index;  /* TTC face selected at init (0 for plain TTF) */
+    uint32_t glyf_len;    /* validated glyf table length; 0 for CFF outlines */
+    uint32_t num_glyphs;  /* validated maxp numGlyphs */
     float    scale;
     font_cell cell;
     const font_ascii_atlas *atlas; /* baked atlas matching this font at px, or NULL */
@@ -74,8 +77,13 @@ typedef struct font_atlas {
     font_atlas_page  pages[FONT_ATLAS_MAX_PAGES];
 } font_atlas;
 
-/* Loads TTF bytes (caller keeps them alive). Does not set a size. */
+/* Loads immutable font bytes (caller keeps them alive). Does not set a size.
+ * Every table the raster path reads is bounds-checked against len first
+ * (docs/decisions/P2.3c.md); malformed data returns FONT_ERR_INIT and clears f.
+ * font_init selects face 0; font_init_index selects face `index` of a TTC
+ * (index must be 0 for a plain TTF/OTF). */
 int  font_init(font_t *f, const unsigned char *ttf, size_t len);
+int  font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t index);
 /* Sets the pixel height and recomputes scale and cell metrics. */
 int  font_set_px(font_t *f, uint32_t px);
 int  font_cell_metrics(const font_t *f, font_cell *out);
@@ -108,12 +116,24 @@ typedef struct font_fallback {
     /* Valid after done == 1: */
     char       cjk[FONT_FALLBACK_PATH_MAX];    /* "" if none */
     char       emoji[FONT_FALLBACK_PATH_MAX];  /* monochrome emoji; "" if none */
+    uint32_t   cjk_index;             /* FC_INDEX of cjk: pass to font_init_index */
+    uint32_t   emoji_index;
     int        have_fontconfig;       /* libfontconfig.so.1 loaded */
     uint64_t   elapsed_ns;
     pthread_t  worker;                /* thread that ran the discovery */
 } font_fallback;
 
-/* Synchronous discovery with the given soname (test seam). Fills fb, sets done. */
+/* Threading rule: one writer. Before (re)submitting font_fallback_job on an fb
+ * that has run before, the owner calls font_fallback_reset(fb) on the thread
+ * that submits, after every reader of the previous result has finished; that
+ * clears done (release) and the results, so a stale done can never be observed
+ * while a new run is queued or running. Readers load done with acquire and
+ * touch the other fields only if it is 1. Discovery cannot revoke a reader that
+ * already saw done == 1: the owner must not reset under a live reader.
+ * No concurrent discovery on one fb. */
+void font_fallback_reset(font_fallback *fb);
+/* Synchronous discovery with the given soname (test seam). Resets fb, fills it,
+ * publishes done (release). */
 void font_fallback_discover(font_fallback *fb, const char *soname);
 /* work_job fn: ctx->arg is a font_fallback*. Publishes FONT_FALLBACK_MSG_KIND. */
 void font_fallback_job(work_ctx *c);

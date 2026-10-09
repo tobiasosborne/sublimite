@@ -22,6 +22,18 @@ static void *font_stb_alloc(size_t n, void *u)
     if (!p) longjmp(c->nomem, 1);
     return p;
 }
+/* stb asserts on outline data that disagrees with its header box (found by
+ * font_fuzz). Asserts are fatal by default; route them to the same error
+ * boundary. stb's assert macro carries no context, so the active boundary is a
+ * thread-local pointer set only for the duration of a stb call (the one
+ * deliberate exception to the no-globals rule; see docs/decisions/P2.3c.md). */
+static _Thread_local font_stb_ctx *font_stb_cur;
+static void font_stb_assert_fail(void)
+{
+    if (font_stb_cur) longjmp(font_stb_cur->nomem, 2);
+    __builtin_trap();
+}
+#define STBTT_assert(x) ((x) ? (void)0 : font_stb_assert_fail())
 #define STBTT_malloc(x, u) font_stb_alloc((size_t)(x), (u))
 #define STBTT_free(x, u)   ((void)(x), (void)(u))
 
@@ -64,11 +76,196 @@ static int cp_valid(uint32_t cp)
     return cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu);
 }
 
+/* ---- Bounded readers. stb_truetype trusts the file; every byte stb can touch
+ * on our paths is validated here first (docs/decisions/P2.3c.md). All bounds
+ * are against the full buffer length, in uint64_t arithmetic. ---- */
+static int in_buf(size_t len, uint64_t off, uint64_t n)
+{
+    return off <= len && n <= len - off;
+}
+static uint32_t rd16(const unsigned char *d, uint64_t o) { return (uint32_t)d[o] << 8 | d[o + 1]; }
+static uint32_t rd32(const unsigned char *d, uint64_t o)
+{
+    return (uint32_t)d[o] << 24 | (uint32_t)d[o + 1] << 16 | (uint32_t)d[o + 2] << 8 | d[o + 3];
+}
+static int32_t rds16(const unsigned char *d, uint64_t o)
+{
+    uint32_t v = rd16(d, o);
+    return v >= 0x8000u ? (int32_t)v - 0x10000 : (int32_t)v;
+}
+
+/* First directory record named tag (as stb picks it); table must lie in the
+ * buffer. Returns 1 and the extent, 0 if absent or out of bounds. */
+static int find_table(const unsigned char *d, size_t len, uint64_t base, const char *tag,
+                      uint64_t *off, uint64_t *tlen)
+{
+    uint32_t n = rd16(d, base + 4);
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t rec = base + 12u + 16u * i;
+        if (memcmp(d + rec, tag, 4) != 0) continue;
+        *off = rd32(d, rec + 8);
+        *tlen = rd32(d, rec + 12);
+        return in_buf(len, *off, *tlen);
+    }
+    return 0;
+}
+
+/* Bounded cmap lookup over the subtable stb selected. Formats 0, 4, 6, 12, 13;
+ * anything else (or any read outside the buffer) yields glyph 0. */
+static uint32_t cmap_lookup(const font_t *f, uint32_t cp)
+{
+    const unsigned char *d = f->data;
+    size_t len = f->len;
+    uint64_t im = (uint32_t)cinfo_of(f)->index_map;
+    if (!in_buf(len, im, 4)) return 0;
+    switch (rd16(d, im)) {
+    case 0: {
+        uint32_t bytes = rd16(d, im + 2);
+        if (bytes >= 6u && cp < bytes - 6u && in_buf(len, im + 6u + cp, 1)) return d[im + 6u + cp];
+        return 0;
+    }
+    case 6: {
+        if (!in_buf(len, im, 10)) return 0;
+        uint32_t first = rd16(d, im + 6), count = rd16(d, im + 8);
+        if (cp < first || cp - first >= count || !in_buf(len, im + 10u + 2u * (cp - first), 2)) return 0;
+        return rd16(d, im + 10u + 2u * (cp - first));
+    }
+    case 4: {
+        if (cp > 0xFFFFu || !in_buf(len, im, 14)) return 0;
+        uint32_t sc = rd16(d, im + 6) >> 1;
+        if (sc == 0 || !in_buf(len, im + 14, UINT64_C(8) * sc + 2u)) return 0;
+        uint64_t endc = im + 14, startc = im + 16 + UINT64_C(2) * sc;
+        uint64_t delta = im + 16 + UINT64_C(4) * sc, rngo = im + 16 + UINT64_C(6) * sc;
+        uint32_t lo = 0, hi = sc;                 /* first segment with end >= cp */
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2u;
+            if (rd16(d, endc + UINT64_C(2) * mid) < cp) lo = mid + 1u; else hi = mid;
+        }
+        if (lo >= sc) return 0;
+        uint32_t start = rd16(d, startc + UINT64_C(2) * lo);
+        if (cp < start) return 0;
+        uint32_t ro = rd16(d, rngo + UINT64_C(2) * lo), dl = rd16(d, delta + UINT64_C(2) * lo);
+        if (ro == 0) return (cp + dl) & 0xFFFFu;
+        uint64_t at = rngo + UINT64_C(2) * lo + ro + UINT64_C(2) * (cp - start);
+        if (!in_buf(len, at, 2)) return 0;
+        uint32_t g = rd16(d, at);
+        return g ? (g + dl) & 0xFFFFu : 0u;
+    }
+    case 12:
+    case 13: {
+        if (!in_buf(len, im, 16)) return 0;
+        uint32_t fmt = rd16(d, im), ng = rd32(d, im + 12);
+        if (!in_buf(len, im + 16, UINT64_C(12) * ng)) return 0;
+        uint32_t lo = 0, hi = ng;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2u;
+            if (rd32(d, im + 16 + UINT64_C(12) * mid + 4) < cp) lo = mid + 1u; else hi = mid;
+        }
+        if (lo >= ng) return 0;
+        uint64_t gp = im + 16 + UINT64_C(12) * lo;
+        uint32_t sc = rd32(d, gp), sg = rd32(d, gp + 8);
+        if (cp < sc) return 0;
+        return fmt == 12 ? sg + (cp - sc) : sg;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* glyf entry [o, e) of glyph g, relative to the glyf table; loca was validated
+ * monotonic and inside glyf at init. */
+static void glyf_range(const font_t *f, uint32_t g, uint64_t *o, uint64_t *e)
+{
+    const stbtt_fontinfo *fi = cinfo_of(f);
+    const unsigned char *d = f->data;
+    if (fi->indexToLocFormat == 0) {
+        *o = UINT64_C(2) * rd16(d, (uint64_t)fi->loca + UINT64_C(2) * g);
+        *e = UINT64_C(2) * rd16(d, (uint64_t)fi->loca + UINT64_C(2) * g + 2u);
+    } else {
+        *o = rd32(d, (uint64_t)fi->loca + UINT64_C(4) * g);
+        *e = rd32(d, (uint64_t)fi->loca + UINT64_C(4) * g + 4u);
+    }
+}
+
+/* Validates the TrueType outline of glyph g exactly as stb will walk it:
+ * contour end points, instruction skip, flag run-lengths, x/y delta bytes, and
+ * composite components (depth and count bounded, XY-offset form only). All
+ * reads stay inside the glyph's own loca range. */
+#define FONT_COMPOSITE_DEPTH  6
+#define FONT_COMPOSITE_BUDGET 256
+static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget)
+{
+    if (g >= f->num_glyphs) return 1;         /* stb returns an empty shape */
+    uint64_t o, e;
+    glyf_range(f, g, &o, &e);
+    if (o == e) return 1;
+    if (e - o < 10u) return 0;
+    const unsigned char *b = f->data + cinfo_of(f)->glyf + o;
+    uint64_t n = e - o;
+    int32_t nc = rds16(b, 0);
+    if (nc == 0) return 1;
+    if (nc > 0) {
+        uint64_t p = 10u + UINT64_C(2) * (uint32_t)nc + 2u;
+        if (p > n) return 0;
+        uint32_t prev = 0, npts = 0;
+        for (int32_t i = 0; i < nc; i++) {
+            uint32_t ep = rd16(b, 10u + UINT64_C(2) * (uint32_t)i);
+            if (i > 0 && ep <= prev) return 0;
+            prev = ep;
+        }
+        npts = prev + 1u;
+        uint32_t lastcont = nc > 1 ? rd16(b, 10u + UINT64_C(2) * (uint32_t)(nc - 2)) + 1u : 0u;
+        p += rd16(b, 10u + UINT64_C(2) * (uint32_t)nc);   /* instructions */
+        uint64_t xb = 0, yb = 0;
+        uint32_t fc = 0, flags = 0;
+        for (uint32_t i = 0; i < npts; i++) {
+            if (fc == 0) {
+                if (p >= n) return 0;
+                flags = b[p++];
+                if (flags & 8u) { if (p >= n) return 0; fc = b[p++]; }
+            } else {
+                fc--;
+            }
+            xb += (flags & 2u) ? 1u : ((flags & 16u) ? 0u : 2u);
+            yb += (flags & 4u) ? 1u : ((flags & 32u) ? 0u : 2u);
+            /* stb reads point i+1 when a contour opens off-curve; a one-point
+             * final contour that opens off-curve would read past its array. */
+            if (i == npts - 1u && i == lastcont && !(flags & 1u)) return 0;
+        }
+        return p + xb + yb <= n;
+    }
+    if (depth >= FONT_COMPOSITE_DEPTH) return 0;
+    uint64_t p = 10;
+    uint32_t cflags;
+    do {
+        if (p + 4u > n || --*budget < 0) return 0;
+        cflags = rd16(b, p);
+        uint32_t gi = rd16(b, p + 2);
+        p += 4u;
+        if (!(cflags & 2u)) return 0;             /* point matching: stb asserts */
+        p += (cflags & 1u) ? 4u : 2u;
+        if (cflags & 8u) p += 2u;
+        else if (cflags & 0x40u) p += 4u;
+        else if (cflags & 0x80u) p += 8u;
+        if (p > n) return 0;
+        if (!shape_ok(f, gi, depth + 1, budget)) return 0;
+    } while (cflags & 0x20u);
+    return 1;
+}
+
 static int glyph_of(const font_t *f, uint32_t cp, int *g)
 {
     if (!cp_valid(cp)) return FONT_ERR_MISSING;
-    *g = stbtt_FindGlyphIndex(cinfo_of(f), (int)cp);
-    return *g == 0 ? FONT_ERR_MISSING : FONT_OK;
+    uint32_t id = cmap_lookup(f, cp);
+    if (id == 0) return FONT_ERR_MISSING;
+    if (id >= f->num_glyphs) return FONT_ERR_MISSING;
+    if (f->glyf_len) {                  /* TrueType outlines: stb reads a 10-byte header for the box */
+        uint64_t o, e;
+        glyf_range(f, id, &o, &e);
+        if (o != e && e - o < 10u) return FONT_ERR_INIT;
+    }
+    *g = (int)id;
+    return FONT_OK;
 }
 
 static void metrics_of_glyph(const font_t *f, int g, font_metric *m)
@@ -85,17 +282,83 @@ static void metrics_of_glyph(const font_t *f, int g, font_metric *m)
 
 int font_init(font_t *f, const unsigned char *ttf, size_t len)
 {
-    if (!f || !ttf || len < 12) return FONT_ERR_ARG;
-    memset(f->info, 0, sizeof f->info);
-    int off = stbtt_GetFontOffsetForIndex(ttf, 0);   /* handles .ttc collections */
-    if (off < 0 || !stbtt_InitFont(info_of(f), ttf, off)) return FONT_ERR_INIT;
+    return font_init_index(f, ttf, len, 0);
+}
+
+int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t index)
+{
+    if (!f) return FONT_ERR_ARG;
+    memset(f, 0, sizeof *f);
+    if (!ttf || len < 12) return FONT_ERR_ARG;
+    uint64_t base = 0;
+    uint32_t sfnt = rd32(ttf, 0);
+    if (sfnt == 0x74746366u) {                  /* "ttcf" */
+        uint32_t ver = rd32(ttf, 4), nf = rd32(ttf, 8);
+        if (ver != 0x00010000u && ver != 0x00020000u) return FONT_ERR_INIT;
+        if (nf == 0 || nf > (len - 12u) / 4u || index >= nf) return FONT_ERR_INIT;
+        base = rd32(ttf, 12u + UINT64_C(4) * index);
+        if (!in_buf(len, base, 12)) return FONT_ERR_INIT;
+        sfnt = rd32(ttf, base);
+    } else if (index != 0) {
+        return FONT_ERR_INIT;
+    }
+    if (sfnt != 0x00010000u && sfnt != 0x74727565u && sfnt != 0x4F54544Fu && sfnt != 0x74797031u)
+        return FONT_ERR_INIT;                   /* 1.0, "true", "OTTO", "typ1" */
+    uint32_t nt = rd16(ttf, base + 4);
+    if (!in_buf(len, base + 12, UINT64_C(16) * nt)) return FONT_ERR_INIT;
+
+    uint64_t cmap, cmap_n, head, head_n, hhea, hhea_n, hmtx, hmtx_n, maxp, maxp_n;
+    if (!find_table(ttf, len, base, "cmap", &cmap, &cmap_n) || cmap_n < 4) return FONT_ERR_INIT;
+    if (!find_table(ttf, len, base, "head", &head, &head_n) || head_n < 54) return FONT_ERR_INIT;
+    if (!find_table(ttf, len, base, "hhea", &hhea, &hhea_n) || hhea_n < 36) return FONT_ERR_INIT;
+    if (!find_table(ttf, len, base, "hmtx", &hmtx, &hmtx_n)) return FONT_ERR_INIT;
+    if (!find_table(ttf, len, base, "maxp", &maxp, &maxp_n) || maxp_n < 6) return FONT_ERR_INIT;
+    uint64_t glyf = 0, glyf_n = 0, loca = 0, loca_n = 0, cff = 0, cff_n = 0;
+    int have_glyf = find_table(ttf, len, base, "glyf", &glyf, &glyf_n);
+    int have_loca = find_table(ttf, len, base, "loca", &loca, &loca_n);
+    if (have_glyf != have_loca) return FONT_ERR_INIT;
+    if (have_glyf && glyf_n == 0) return FONT_ERR_INIT;
+    if (!have_glyf && (!find_table(ttf, len, base, "CFF ", &cff, &cff_n) || cff_n < 4))
+        return FONT_ERR_INIT;
+
+    uint32_t ng = rd16(ttf, maxp + 4);
+    if (ng == 0) return FONT_ERR_INIT;
+    if (rd16(ttf, head + 18) == 0) return FONT_ERR_INIT;           /* unitsPerEm */
+    int32_t asc = rds16(ttf, hhea + 4), dsc = rds16(ttf, hhea + 6);
+    if (asc <= 0 || dsc > 0) return FONT_ERR_INIT;                 /* cell_h = asc - dsc > 0 */
+    if (cmap_n < 4u + UINT64_C(8) * rd16(ttf, cmap + 2)) return FONT_ERR_INIT;
+    uint32_t nhm = rd16(ttf, hhea + 34);
+    if (nhm == 0 || nhm > ng || hmtx_n < UINT64_C(4) * nhm + UINT64_C(2) * (ng - nhm)) return FONT_ERR_INIT;
+    if (have_glyf) {
+        uint32_t fmt = rd16(ttf, head + 50);
+        if (fmt > 1u) return FONT_ERR_INIT;
+        uint64_t esz = fmt ? 4u : 2u;
+        if (loca_n < (ng + UINT64_C(1)) * esz) return FONT_ERR_INIT;
+        uint64_t prev = 0;
+        for (uint32_t i = 0; i <= ng; i++) {   /* monotonic and inside glyf */
+            uint64_t v = fmt ? rd32(ttf, loca + UINT64_C(4) * i) : UINT64_C(2) * rd16(ttf, loca + UINT64_C(2) * i);
+            if (v < prev || v > glyf_n) return FONT_ERR_INIT;
+            prev = v;
+        }
+    }
+
+    if (!stbtt_InitFont(info_of(f), ttf, (int)base)) {
+        memset(f, 0, sizeof *f);
+        return FONT_ERR_INIT;
+    }
     info_of(f)->userdata = NULL;
-    f->atlas = NULL;
+    /* Belt and braces: stb's view must agree with ours on the tables we proved. */
+    if (info_of(f)->numGlyphs != (int)ng || (uint64_t)info_of(f)->loca != loca ||
+        (uint64_t)info_of(f)->glyf != glyf || info_of(f)->index_map <= 0 ||
+        !in_buf(len, (uint32_t)info_of(f)->index_map, 4)) {
+        memset(f, 0, sizeof *f);
+        return FONT_ERR_INIT;
+    }
     f->data = ttf;
     f->len = len;
-    f->px = 0;
-    f->scale = 0.0f;
-    memset(&f->cell, 0, sizeof f->cell);
+    f->face_index = index;
+    f->glyf_len = (uint32_t)glyf_n;
+    f->num_glyphs = ng;
     return FONT_OK;
 }
 
@@ -153,6 +416,10 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     memset(&out->m, 0, sizeof out->m);
     int r = glyph_of(f, cp, &g);
     if (r != FONT_OK) return r;
+    if (f->glyf_len) {      /* stb walks the outline unchecked: prove it in-bounds first */
+        int budget = FONT_COMPOSITE_BUDGET;
+        if (!shape_ok(f, (uint32_t)g, 0, &budget)) return FONT_ERR_INIT;
+    }
     metrics_of_glyph(f, g, &out->m);
     out->w = out->m.w;
     out->h = out->m.h;
@@ -170,15 +437,26 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     /* All stb-owned storage is in this arena and STBTT_free is a no-op, so
      * unwinding on allocation failure needs only the arena rewind. start is
      * unchanged after setjmp; do not read modified automatic locals here. */
-    if (setjmp(ctx.nomem)) {
+    int fail = 0;
+    switch (setjmp(ctx.nomem)) {
+    case 0:
+        break;
+    case 2:
+        fail = FONT_ERR_INIT;      /* stb assertion: inconsistent outline */
+        /* fallthrough */
+    default:
+        if (!fail) fail = FONT_ERR_NOMEM;
+        font_stb_cur = NULL;
         info_of(f)->userdata = NULL;
         edit_arena_reset_to_mark(arena, start);
-        return FONT_ERR_NOMEM;
+        return fail;
     }
+    font_stb_cur = &ctx;
     info_of(f)->userdata = &ctx;
     /* stb writes a box-sized bitmap whose origin is the box's top-left. */
     stbtt_MakeGlyphBitmap(cinfo_of(f), px, (int)out->w, (int)out->h, (int)out->w,
                           f->scale, f->scale, g);
+    font_stb_cur = NULL;
     info_of(f)->userdata = NULL;
     edit_arena_reset_to_mark(arena, mk);
     out->pixels = px;

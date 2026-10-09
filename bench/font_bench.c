@@ -53,6 +53,13 @@ int main(void)
     bench_samples s;
     bench_samples_init(&s, samples_buf, N_OPS);
     volatile uint32_t sink = 0;
+    {   /* warm up, then law-2 gate: zero libc mallocs across the whole timed loop */
+        edit_arena_mark_t wm = edit_arena_mark(&a);
+        font_bitmap wb;
+        (void)font_raster_glyph(&f, 0xE9u, &a, &wb);
+        edit_arena_reset_to_mark(&a, wm);
+    }
+    if (edit_malloc_guard_active()) edit_malloc_guard_begin();
     for (unsigned i = 0; i < N_OPS; i++) {
         edit_arena_mark_t mk = edit_arena_mark(&a);
         font_bitmap b;
@@ -63,7 +70,11 @@ int main(void)
         (void)r;
         edit_arena_reset_to_mark(&a, mk);
     }
+    size_t mallocs = 0;
+    if (edit_malloc_guard_active()) mallocs = edit_malloc_guard_end();
     uint64_t p50 = bench_p50(&s), p99 = bench_p99(&s);
+    printf("BENCH name=font_raster_mallocs n=%u value=%zu gate=0 guard=%d tag=(G)(M)\n",
+           N_OPS, mallocs, edit_malloc_guard_active() ? 1 : 0);
     printf("BENCH name=font_raster n=%zu p50=%llu p99=%llu gate_p50=%llu dropped=%zu tag=(G)(M)[%s] loaded\n",
            s.n, (unsigned long long)p50, (unsigned long long)p99,
            (unsigned long long)GATE_P50, s.dropped, power_state());
@@ -103,6 +114,6 @@ int main(void)
     }
     edit_arena_free(&a);
     free(ttf);
-    if (s.dropped || p50 > GATE_P50) return 1;
+    if (s.dropped || p50 > GATE_P50 || mallocs != 0) return 1;
     return 0;
 }

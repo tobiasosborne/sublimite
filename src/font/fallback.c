@@ -37,6 +37,7 @@ typedef struct fc_api {
     FcPattern *(*FontMatch)(FcConfig *, FcPattern *, FcResult *);
     void       (*ConfigDestroy)(FcConfig *);
     void       (*Fini)(void);
+    FcResult   (*PatternGetInteger)(const FcPattern *, const char *, int, int *);
     FcResult   (*PatternGetString)(const FcPattern *, const char *, int, FcChar8 **);
     FcResult   (*PatternGetBool)(const FcPattern *, const char *, int, FcBool *);
     FcResult   (*PatternGetCharSet)(const FcPattern *, const char *, int, FcCharSet **);
@@ -67,6 +68,7 @@ static int fc_bind(fc_api *a, void *h)
     BIND(FontMatch, "FcFontMatch");
     BIND(ConfigDestroy, "FcConfigDestroy");
     BIND(Fini, "FcFini");
+    BIND(PatternGetInteger, "FcPatternGetInteger");
     BIND(PatternGetString, "FcPatternGetString");
     BIND(PatternGetBool, "FcPatternGetBool");
     BIND(PatternGetCharSet, "FcPatternGetCharSet");
@@ -77,9 +79,10 @@ static int fc_bind(fc_api *a, void *h)
 /* Best font covering cp. lang may be NULL. mono_only rejects colour fonts.
  * Copies the file path into out (empty when nothing suitable). */
 static void fc_query(const fc_api *a, FcConfig *cfg, uint32_t cp, const char *lang,
-                     int mono_only, char *out)
+                     int mono_only, char *out, uint32_t *index)
 {
     out[0] = 0;
+    *index = 0;
     FcPattern *pat = a->PatternCreate();
     FcCharSet *cs = a->CharSetCreate();
     if (!pat || !cs) goto done;
@@ -95,13 +98,20 @@ static void fc_query(const fc_api *a, FcConfig *cfg, uint32_t cp, const char *la
         FcChar8 *file = NULL;
         FcCharSet *mcs = NULL;
         FcBool color = 0;
+        int face = 0;
         int ok = a->PatternGetString(m, "file", 0, &file) == FC_RESULT_MATCH && file;
+        /* FC_INDEX: face within a TTC. High 16 bits select a named variation
+         * instance, which stb cannot render: reject those. */
+        ok = ok && a->PatternGetInteger(m, "index", 0, &face) == FC_RESULT_MATCH &&
+             face >= 0 && face <= 0xffff;
         ok = ok && a->PatternGetCharSet(m, "charset", 0, &mcs) == FC_RESULT_MATCH &&
              mcs && a->CharSetHasChar(mcs, cp);
         if (ok && mono_only && a->PatternGetBool(m, "color", 0, &color) == FC_RESULT_MATCH && color)
             ok = 0;
-        if (ok && strlen((const char *)file) < FONT_FALLBACK_PATH_MAX)
+        if (ok && strlen((const char *)file) < FONT_FALLBACK_PATH_MAX) {
             memcpy(out, file, strlen((const char *)file) + 1);
+            *index = (uint32_t)face;
+        }
         a->PatternDestroy(m);
     }
 done:
@@ -109,12 +119,21 @@ done:
     if (pat) a->PatternDestroy(pat);
 }
 
+void font_fallback_reset(font_fallback *fb)
+{
+    atomic_store_explicit(&fb->done, 0u, memory_order_release);
+    fb->cjk[0] = 0;
+    fb->emoji[0] = 0;
+    fb->cjk_index = 0;
+    fb->emoji_index = 0;
+    fb->have_fontconfig = 0;
+    fb->elapsed_ns = 0;
+}
+
 void font_fallback_discover(font_fallback *fb, const char *soname)
 {
     uint64_t t0 = now_ns();
-    fb->cjk[0] = 0;
-    fb->emoji[0] = 0;
-    fb->have_fontconfig = 0;
+    font_fallback_reset(fb);
     fb->worker = pthread_self();
     void *h = soname ? dlopen(soname, RTLD_NOW | RTLD_LOCAL) : NULL;
     fc_api api;
@@ -122,8 +141,8 @@ void font_fallback_discover(font_fallback *fb, const char *soname)
         FcConfig *cfg = api.InitLoadConfigAndFonts();
         if (cfg) {
             fb->have_fontconfig = 1;
-            fc_query(&api, cfg, 0x4E2Du, "zh", 0, fb->cjk);
-            fc_query(&api, cfg, 0x1F600u, NULL, 1, fb->emoji);
+            fc_query(&api, cfg, 0x4E2Du, "zh-cn", 0, fb->cjk, &fb->cjk_index);
+            fc_query(&api, cfg, 0x1F600u, NULL, 1, fb->emoji, &fb->emoji_index);
             api.ConfigDestroy(cfg);   /* paths are copied out */
             api.Fini();
         }
