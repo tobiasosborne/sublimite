@@ -186,6 +186,24 @@ static inline render_cell *row_ptr(layout *l)
     return l->grid->cells + (size_t)l->row * l->grid->dims.cols;
 }
 
+/* pos remains at LF for next-row bookkeeping/checkpoint compatibility. The
+ * logical cursor stop is before CR when this line ends in CRLF. */
+static bool row_cursor_end(layout *l, bool newline)
+{
+    uint64_t end = l->pos;
+    if (end != l->cursor && !(newline && end > 0 && end - 1 == l->cursor)) return false;
+    if (newline && end > l->row_byte[l->row]) {
+        uint8_t previous = 0;
+        if (end > l->win_pos && end - l->win_pos <= l->win_len) {
+            previous = l->win[(size_t)(end - l->win_pos - 1)];
+        } else if (src_read(l, end - 1, &previous, 1) == 0) {
+            l->bytes_read++; /* Indexed seeks may start at LF, after the CR. */
+        }
+        if (previous == '\r') end--;
+    }
+    return end == l->cursor;
+}
+
 int layout_set_checkpoints(layout *l, layout_checkpoint_store *s)
 {
     if (!l || layout_busy(l)) return LAYOUT_ERR_STATE;
@@ -454,7 +472,7 @@ int layout_run(layout *l)
         if (!ended) break;
         /* row complete: cursor sitting on the newline / EOF draws a blank cursor cell */
         uint32_t written = gw + l->vis;
-        if (l->marks && l->pos == l->cursor && l->vis < text_cols && l->col >= hscroll) {
+        if (l->marks && l->vis < text_cols && l->col >= hscroll && row_cursor_end(l, nl)) {
             render_cell *c = &tx[l->vis];
             *c = blank_cell(l);
             c->fg = l->cfg.cursor_fg; c->bg = l->cfg.cursor_bg; c->attrs = RENDER_ATTR_CURSOR;

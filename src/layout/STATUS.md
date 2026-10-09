@@ -1,4 +1,32 @@
-# Layout status — P4.1 / edit-457.1, finishing run 2026-10-09
+# Layout status — P3.1c / edit-zzj.11, 2026-10-09
+
+Review §§5–6 of docs/reviews/view-1.md are fixed. Wrap-off end-of-line
+cursor rendering resolves the logical stop before CRLF, including exact
+checkpoint seeks that start at LF. LF scanner/checkpoint and next-row offsets
+are unchanged. Public viewport and runtime hscroll are now uint64_t, matching
+view and absolute column checkpoints; existing callers must rebuild.
+Wrap-on still ignores horizontal scroll. No wrap implementation, view/editor
+source or frozen header was changed. See docs/decisions/P3.1c.md for red/green.
+
+Regressions cover actual view End/Right/document-End stops for LF, CRLF, lone
+CR and EOF in both wrap modes and slice configurations, indexed CRLF endpoints,
+partial relayout and snapshots. A compact tab fixture with worker-built exact
+columns checks view-to-layout scroll preservation beyond UINT32_MAX, visible
+EOF cursor, partial relayout and large-column wrapped descriptors.
+Release `make all`, `make fuzz` (22 fuzzers), both release/ASan/UBSan module suites
+and full `make check` (42 test binaries plus replay CLI checks) pass.
+Layout fuzzer: 1,192 runs in 122 seconds, no failures or artifacts (M)[AC],
+BAT0=Not charging, load1=5.58 before launch; seed=311, max_total_time=120,
+max_len=4096, timeout=30. The full sanitizer suite required outside-sandbox
+Xvfb :99 socket access; ASAN_OPTIONS=detect_leaks=0, coordinator reruns leaks on.
+One full layout bench ran at 2026-10-09 08:02:29 UTC, (M)[AC], BAT0=Not charging,
+load1=6.07 (wrapped subcampaign load1=6.91). Exit 1 for shared-box timing misses;
+indexed wrap-off rows passed. All rows are TRACK; no retry/tuning/gate change.
+Raw rows are in the worker report, selected gated rows in P3.1c.md. No scoped
+correctness work remains. Existing P4.1 limitations below remain; coordinator
+owns gate verdicts and leak-enabled verification.
+
+## P4.1 implementation and earlier verification
 
 Module implementation complete: opt-in streaming word wrap at text-area width,
 capped leading-indent continuations, blank continuation gutters, intact Unicode

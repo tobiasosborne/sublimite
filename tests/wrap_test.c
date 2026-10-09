@@ -56,6 +56,49 @@ static void row(fixture *f,uint32_t r,const char *want)
     CHECK(strcmp(text,want)==0);
 }
 static void destroy(fixture *f) { piece_destroy(f->tree); edit_arena_free(&f->arena); }
+/* Pass view stops unchanged: CRLF's stop belongs before CR, not before LF. */
+static void cursor_stops(void)
+{
+    const char *texts[]={"a\nb","a\r\nb","a\rb","a","a\r\n"};
+    const view_key keys[]={VIEW_RIGHT,VIEW_END,VIEW_DOC_END};
+    for(unsigned wrapping=0;wrapping<2;wrapping++) {
+        for(unsigned sliced=0;sliced<2;sliced++) {
+            for(size_t i=0;i<sizeof texts/sizeof *texts;i++) {
+                fixture f; init(&f,texts[i],8,3,sliced);
+                CHECK(layout_set_wrap(&f.l,wrapping!=0)==0);
+                CHECK(render_frame_begin(&f.g,++f.frame)==0);
+                CHECK(layout_begin(&f.l,f.tree,(layout_viewport){0,0,0,0})==0); run(&f);
+                for(size_t k=0;k<sizeof keys/sizeof *keys;k++) {
+                    view v; view_config cfg={4,3,8,NULL,NULL}; view_init(&v,f.tree,&cfg);
+                    CHECK(view_set_wrap(&v,wrapping!=0,&f.l)==VIEW_OK);
+                    view_change ch; CHECK(view_command(&v,keys[k],false,NULL,0,&ch)==VIEW_OK);
+                    uint64_t stop=keys[k]==VIEW_RIGHT?1:keys[k]==VIEW_END?(i==2?3:1):strlen(texts[i]);
+                    CHECK(v.state.selection.cursor==stop);
+                    layout_set_cursor(&f.l,v.state.selection.cursor);
+                    CHECK(render_frame_begin(&f.g,++f.frame)==0);
+                    /* Keep every stop in this fixed viewport: this test checks
+                     * the byte-stop handoff independently of view scrolling. */
+                    CHECK(layout_begin(&f.l,f.tree,(layout_viewport){0,0,0,0})==0);
+                    run(&f);
+                    uint32_t r=keys[k]==VIEW_DOC_END && (i==0 || i==1 || i==4)?1u:0u;
+                    uint32_t c=keys[k]==VIEW_DOC_END?(i==2?3u:i==4?0u:1u):keys[k]==VIEW_END && i==2?3u:1u;
+                    if(!(f.cells[r*8u+c].attrs&RENDER_ATTR_CURSOR))
+                        fprintf(stderr,"cursor stop mode=%u slice=%u text=%zu key=%zu byte=%llu cell=%u,%u\n",
+                                wrapping,sliced,i,k,(unsigned long long)stop,r,c);
+                    CHECK(f.cells[r*8u+c].attrs&RENDER_ATTR_CURSOR);
+                    CHECK(f.cells[r*8u+c].bg==3);
+                    if(keys[k]==VIEW_RIGHT && i==2) CHECK(f.cells[c].attrs&RENDER_ATTR_INVERSE);
+                    else CHECK(f.cells[r*8u+c].atlas_slot==RENDER_NO_SLOT);
+                    unsigned cursors=0;
+                    for(size_t j=0;j<24;j++) cursors+=(f.cells[j].attrs&RENDER_ATTR_CURSOR)!=0;
+                    CHECK(cursors==1);
+                }
+                destroy(&f);
+            }
+        }
+    }
+    puts("wrap_test: view cursor stops LF/CRLF/lone CR/EOF passed (wrap off/on, sliced/one-shot)");
+}
 static void basic(void)
 {
     fixture f; init(&f,"  alpha beta gamma\nabcdefghijk\n",10,8,0); show(&f);
@@ -160,6 +203,73 @@ static void newline_edits(void)
     destroy(&a); destroy(&b);
 }
 static void checkpoint_message(const work_msg *msg,void *ctx) { (void)layout_checkpoint_event(ctx,msg); }
+static int large_column_seed(void *ctx,const piece_tree *tree,uint64_t line,
+                             uint64_t byte_target,uint64_t col_target,uint64_t *byte,uint64_t *column)
+{
+    const layout_checkpoint_store *store=ctx;
+    if(store->source!=tree || line!=0) return 0;
+    size_t chosen=0;
+    for(size_t i=0;i<store->count;i++)
+        if(store->entries[i].byte<=byte_target && store->entries[i].column<=col_target) chosen=i;
+    *byte=store->entries[chosen].byte; *column=store->entries[chosen].column;
+    return 1;
+}
+static void large_hscroll(void)
+{
+    /* A compact, real tree with exact columns beyond UINT32_MAX: no huge file
+     * or artificial runtime/checkpoint state is needed. The worker publishes
+     * a checkpoint after these tabs, so UI painting decodes only the suffix. */
+    char text[LAYOUT_CHECKPOINT_STRIDE+10u];
+    memset(text,'\t',LAYOUT_CHECKPOINT_STRIDE);
+    memcpy(text+LAYOUT_CHECKPOINT_STRIDE,"abcdefghi",10);
+    const uint64_t base=(uint64_t)LAYOUT_CHECKPOINT_STRIDE*UINT32_MAX;
+    for(unsigned sliced=0;sliced<2;sliced++) {
+        fixture f; init(&f,text,8,3,sliced);
+        CHECK(layout_set_wrap(&f.l,false)==0);
+        f.l.cfg.tab_width=UINT32_MAX; f.l.tab=UINT32_MAX;
+        layout_checkpoint_store store; CHECK(layout_checkpoint_init(&store,&f.arena,sizeof text)==0);
+        CHECK(layout_set_checkpoints(&f.l,&store)==0);
+        work_pool *pool=malloc(sizeof *pool); CHECK(pool && work_pool_init(pool,1,0)==0);
+        piece_snapshot *snap=piece_snapshot_take(f.tree); CHECK(snap);
+        CHECK(layout_checkpoint_request(&store,pool,snap,f.tree,0,UINT32_MAX)==0);
+        piece_snapshot_release(snap);
+        unsigned waits=0;
+        while(store.pending) {
+            (void)work_mailbox_drain(pool,checkpoint_message,&store);
+            struct timespec ts={0,1000000}; if(store.pending) (void)nanosleep(&ts,NULL);
+            CHECK(++waits<20000);
+        }
+        CHECK(store.complete && store.columns==base+9);
+        view v; view_config cfg={UINT32_MAX,3,8,large_column_seed,&store}; view_init(&v,f.tree,&cfg);
+        view_change ch; CHECK(view_command(&v,VIEW_DOC_END,false,NULL,0,&ch)==VIEW_OK);
+        CHECK(v.state.selection.cursor==strlen(text) && v.state.hscroll==base+2);
+        layout_viewport vp={v.state.first_byte,v.state.first_line,0,1};
+        /* Compile against both header widths so the old representation fails
+         * at runtime rather than -Wconversion rejecting the regression build. */
+        vp.hscroll=_Generic(vp.hscroll,uint32_t:(uint32_t)v.state.hscroll,uint64_t:v.state.hscroll);
+        CHECK(vp.hscroll==v.state.hscroll);
+        layout_set_cursor(&f.l,v.state.selection.cursor);
+        CHECK(render_frame_begin(&f.g,++f.frame)==0);
+        CHECK(layout_begin(&f.l,f.tree,vp)==0);
+        CHECK(f.l.hscroll==v.state.hscroll);
+        run(&f); row(&f,0,"cdefghi");
+        CHECK(f.cells[7].attrs&RENDER_ATTR_CURSOR);
+        CHECK(!layout_approximate(&f.l) && f.l.bytes_scanned<LAYOUT_CHECKPOINT_STRIDE);
+        CHECK(render_frame_begin(&f.g,++f.frame)==0);
+        CHECK(layout_relayout_rows(&f.l,0,1)==LAYOUT_MORE); run(&f);
+        CHECK(f.l.hscroll==v.state.hscroll && (f.cells[7].attrs&RENDER_ATTR_CURSOR));
+        CHECK(layout_set_wrap(&f.l,true)==0);
+        layout_wrap_row seed; bool approximate=false;
+        CHECK(layout_visual_row(&f.l,f.tree,v.state.selection.cursor,0,&seed,&approximate)==0);
+        CHECK(seed.column>=base && seed.end_column==base+9);
+        CHECK(render_frame_begin(&f.g,++f.frame)==0);
+        CHECK(layout_begin_visual(&f.l,f.tree,vp,&seed)==0); run(&f);
+        CHECK(f.l.hscroll==0); /* Wrapping ignores horizontal scroll by contract. */
+        CHECK(f.cells[seed.end_column-seed.column+seed.indent].attrs&RENDER_ATTR_CURSOR);
+        work_pool_shutdown(pool); free(pool); destroy(&f);
+    }
+    puts("wrap_test: uint64 view hscroll/checkpoint/cursor passed (wrap off/on, sliced/one-shot)");
+}
 static void long_line(void)
 {
     size_t n=2u*1024u*1024u; char *text=malloc(n+1); CHECK(text);
@@ -327,4 +437,4 @@ static void resize(void)
         destroy(&a);
     }
 }
-int main(void) { lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }
+int main(void) { large_hscroll(); cursor_stops(); lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }

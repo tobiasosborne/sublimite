@@ -505,6 +505,33 @@ static void test_checkpoints(void)
     fx_free(&f); edit_arena_free(&arena); free(text);
 }
 
+static void test_crlf_cursor_indexed(void)
+{
+    fx f; fx_make(&f, 8, 3, nogutter(), "a\r\nb", 4);
+    edit_arena arena; CHECK(edit_arena_init(&arena, 4096) == 0);
+    layout_checkpoint_store store;
+    CHECK(layout_checkpoint_init(&store, &arena, 4) == LAYOUT_DONE);
+    CHECK(layout_set_checkpoints(&f.l, &store) == LAYOUT_DONE);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    show(&f, 0, 0); build_checkpoint(pool, &store, &f);
+    CHECK(store.complete && store.newline && store.end == 2 && store.columns == 1);
+    layout_set_cursor(&f.l, 1);
+    show(&f, 0, 1); /* Exact seek starts at LF; CR is outside the read window. */
+    CHECK(cell(&f, 0, 0)->attrs & RENDER_ATTR_CURSOR);
+    CHECK(cell(&f, 0, 0)->atlas_slot == RENDER_NO_SLOT && f.row_byte[1] == 3);
+    fx_frame(&f); CHECK(layout_relayout_rows(&f.l, 0, 1) == LAYOUT_MORE); run_all(&f);
+    CHECK(cell(&f, 0, 0)->attrs & RENDER_ATTR_CURSOR);
+    piece_snapshot *snapshot = piece_snapshot_take(f.t); CHECK(snapshot != NULL);
+    fx_frame(&f);
+    CHECK(layout_begin_snapshot(&f.l, snapshot, (layout_viewport){0, 0, 0, 2}) == LAYOUT_DONE);
+    run_all(&f);
+    CHECK(cell(&f, 0, 1)->attrs & RENDER_ATTR_CURSOR);
+    CHECK(f.row_byte[1] == 3);
+    piece_snapshot_release(snapshot);
+    work_pool_shutdown(pool); free(pool); fx_free(&f); edit_arena_free(&arena);
+}
+
 /* No synthetic cluster boundary at a window or budget boundary. */
 static void test_budgeted_cluster(void)
 {
@@ -609,7 +636,7 @@ static void test_resize(void)
 
 int main(void)
 {
-    test_resize(); test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
+    test_crlf_cursor_indexed(); test_resize(); test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
     test_gutter(); test_hscroll_eof(); test_slices(); test_dirty(); test_cursor(); test_long_line_bounded(); test_checkpoints(); test_budgeted_cluster(); test_no_allocations(); test_cluster_window_boundary(); test_short_line_before_long(); test_cache_invalid_right_context();
     if (fails) { printf("layout_test: %d FAILED\n", fails); return 1; }
     printf("layout_test: all passed\n");

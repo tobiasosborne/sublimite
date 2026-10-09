@@ -74,7 +74,7 @@ typedef struct layout_config {
 typedef struct layout_viewport {
     uint64_t first_byte;         /* start of a line */
     uint64_t first_line;         /* its 0-based number, or LAYOUT_LINE_UNKNOWN (exact lookup) */
-    uint32_t hscroll;            /* columns */
+    uint64_t hscroll;            /* absolute document columns (ignored with wrap on) */
     uint64_t line_count;         /* total lines (gutter width), or 0 / LAYOUT_LINE_UNKNOWN to ask the
                                     buffer; the editor's line index should supply it: the P1.3 stub
                                     kernel's piece_line_count is a ~1 ms scan. layout_edit keeps it. */
@@ -149,7 +149,8 @@ typedef struct layout {
     uint32_t *row_used;          /* [rows] cells possibly non-blank (cells beyond are blank) */
     const void *src; int is_snap;
     uint64_t total, line_count, first_byte, first_line, cursor, sel_lo, sel_hi;
-    uint32_t hscroll, gw, text_cols, tab;
+    uint64_t hscroll;
+    uint32_t gw, text_cols, tab;
     bool approximate, marks;
     uint32_t row, row_end;       /* work range [row, row_end) */
     int phase;                   /* 0 start row, 1 text, 2 skip to newline */
