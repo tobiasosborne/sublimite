@@ -1,6 +1,9 @@
-# HANDOFF — editor project, session 3 (updated 2026-10-09 08:30)
+# HANDOFF — editor project, session 3 interrupted (updated 2026-10-09 08:35)
 
 Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task`. Session details: `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
+
+## Interrupted state (read first)
+Tobias stopped session 3 at 08:35 on 2026-10-09 for a machine restart while six workers were mid-bead. Their partial, unverified edits are in **`git stash list` → "session3-interrupted"** (includes untracked `src/find/`, `tests/find_test.c`, `docs/decisions/P0.6c.md`, `vendor/ucd/GraphemeBreakTest.txt`). The tree at HEAD is clean and `make check` green. The six beads are open again with a note: **edit-4w1.20** (P1.4a-b bench row), **edit-e6x.14** (P2.0 render.h freeze), **edit-4w1.18** (P1.1c), **edit-4w1.23** (P1.10a find spec), **edit-e6x.10** (P2.3c), **edit-yy5.9** (P0.6c, its Haiku worker had finished; the stash probably holds a complete fix). Start by redispatching these from the clean tree; a worker may be pointed at the stash (`git stash show -p stash@{0} -- <paths>`) as a starting point, but must still show red then green.
 
 ## State
 - `main`, `make check` green (14 test binaries), `make all` / `make fuzz` green. Beads snapshot in `.beads/issues.jsonl` (re-export each session).
