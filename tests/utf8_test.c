@@ -67,6 +67,74 @@ static int ref_width(uint32_t cp)
 
 static size_t enc_len(uint32_t cp) { return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4; }
 
+
+/* ---- independent grapheme oracle: UAX #29 break decision between unit i-1 and
+ * i by scanning left for context (no running state), over the generated
+ * property tables. Invalid bytes are Control. Shared shape with fuzz/utf8_fuzz.c. */
+enum { R_OTHER, R_CR, R_LF, R_CTL, R_EXT, R_ZWJ, R_SPC, R_PRE, R_RI, R_L, R_V, R_T, R_LV, R_LVT, R_PICT };
+static int ref_in(const utf8_range *t, size_t n, uint32_t cp)
+{
+    for (size_t i = 0; i < n; i++) if (cp >= t[i].lo && cp <= t[i].hi) return 1;
+    return 0;
+}
+#define RIN(tab, cp) ref_in(tab, NELEM(tab), cp)
+static int ref_class(int valid, uint32_t cp)
+{
+    if (!valid) return R_CTL;
+    if (cp == '\r') return R_CR;
+    if (cp == '\n') return R_LF;
+    if (RIN(UCD_CONTROL, cp)) return R_CTL;
+    if (cp == 0x200D) return R_ZWJ;
+    if (RIN(UCD_EXTEND, cp)) return R_EXT;
+    if (RIN(UCD_SPACINGMARK, cp)) return R_SPC;
+    if (RIN(UCD_PREPEND, cp)) return R_PRE;
+    if (RIN(UCD_REGIONAL_INDICATOR, cp)) return R_RI;
+    if (RIN(UCD_HANGUL_L, cp)) return R_L;
+    if (RIN(UCD_HANGUL_V, cp)) return R_V;
+    if (RIN(UCD_HANGUL_T, cp)) return R_T;
+    if (RIN(UCD_HANGUL_LV, cp)) return R_LV;
+    if (RIN(UCD_HANGUL_LVT, cp)) return R_LVT;
+    if (RIN(UCD_EXT_PICT, cp)) return R_PICT;
+    return R_OTHER;
+}
+static int ref_incb(int valid, uint32_t cp)       /* 1 Consonant, 2 Linker, 3 Extend */
+{
+    if (!valid) return 0;
+    if (RIN(UCD_INCB_CONSONANT, cp)) return 1;
+    if (RIN(UCD_INCB_LINKER, cp)) return 2;
+    if (RIN(UCD_INCB_EXTEND, cp)) return 3;
+    return 0;
+}
+/* c[], ib[]: classes of units 0..m-1. Returns 1 if there is a break before unit i (1 <= i < m). */
+static int ref_break(const int *c, const int *ib, int i)
+{
+    int a = c[i - 1], b = c[i];
+    if (a == R_CR && b == R_LF) return 0;
+    if (a == R_CR || a == R_LF || a == R_CTL) return 1;
+    if (b == R_CR || b == R_LF || b == R_CTL) return 1;
+    if (a == R_L && (b == R_L || b == R_V || b == R_LV || b == R_LVT)) return 0;
+    if ((a == R_LV || a == R_V) && (b == R_V || b == R_T)) return 0;
+    if ((a == R_LVT || a == R_T) && b == R_T) return 0;
+    if (b == R_EXT || b == R_ZWJ || b == R_SPC) return 0;
+    if (a == R_PRE) return 0;
+    if (ib[i] == 1) {                                   /* GB9c */
+        int j = i - 1, linker = 0;
+        while (j >= 0 && (ib[j] == 2 || ib[j] == 3)) { linker |= ib[j] == 2; j--; }
+        if (j >= 0 && ib[j] == 1 && linker) return 0;
+    }
+    if (a == R_ZWJ && b == R_PICT) {                    /* GB11 */
+        int j = i - 2;
+        while (j >= 0 && c[j] == R_EXT) j--;
+        if (j >= 0 && c[j] == R_PICT) return 0;
+    }
+    if (a == R_RI && b == R_RI) {                       /* GB12, GB13 */
+        int k = 0, j = i - 1;
+        while (j >= 0 && c[j] == R_RI) { k++; j--; }
+        if (k % 2 == 1) return 0;
+    }
+    return 1;
+}
+
 /* ---------------------------------------------------------------- decode */
 #define VALID(s, n, c, l) do { utf8_step t_ = dec(s, n); CHECK(t_.valid == 1 && t_.cp == (c) && t_.len == (l)); } while (0)
 #define INV(s) do { utf8_step t_ = dec(s, sizeof(s) - 1); \
@@ -243,6 +311,8 @@ static void t_width(void)
     CHECK(utf8_cell_width(0x1F600) == 2);
     CHECK(utf8_cell_width(0x20000) == 2);
     CHECK(utf8_cell_width(0x2FFFE) == 1);
+    CHECK(utf8_cell_width(0x2FFFD) == 2);        /* unassigned, EAW=W: tables, not a blanket 1 */
+    CHECK(utf8_cell_width(0xE01F0) == 0);        /* unassigned, Default_Ignorable */
     CHECK(utf8_cell_width(0x3FFFD) == 2);
     CHECK(utf8_cell_width(0xE0001) == 0);
     CHECK(utf8_cell_width(0xE0100) == 0);
@@ -262,6 +332,16 @@ static size_t G(const char *s, size_t n)
 static void t_grapheme(void)
 {
     CHECK(G("", 0) == 0);
+    CHECK(GS("\xE2\x80\x8B\xCC\x81") == 3);                 /* GB4: ZWSP (Cf, Control) / Extend */
+    CHECK(GS("\xD8\x80\xE2\x80\x8B") == 2);                 /* GB5: Prepend / ZWSP */
+    CHECK(GS("\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95") == 9);  /* GB9c: KA VIRAMA KA */
+    CHECK(GS("\xE0\xA4\x95\xE0\xA5\x8D\xE2\x80\x8D\xE0\xA4\x95") == 12); /* KA VIRAMA ZWJ KA */
+    CHECK(GS("\xE0\xA4\x95\xE0\xA4\x95") == 3);           /* no linker: break */
+    CHECK(GS("a\xE0\xA5\x8D\xE0\xA4\x95") == 4);           /* linker without Consonant start: break */
+    CHECK(GS("\xE0\xA4\x95\xE0\xA5\x8D" "a") == 6);        /* virama extends, then break */
+    CHECK(GS("\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95") == 15); /* chained */
+    CHECK(GS("\xE2\x80\x8D\xE0\xA5\x8D\xE0\xA4\xA4") == 6);   /* cluster starting at ZWJ never opens a conjunct (fuzz find) */
+    CHECK(GS("\xE0\xA5\x8D\xE0\xA4\x95") == 3);
     CHECK(GS("a") == 1);
     CHECK(GS("ab") == 1);
     CHECK(GS("e\xCC\x81x") == 3);                    /* e + combining acute */
@@ -313,6 +393,64 @@ static void t_grapheme(void)
     CHECK(GS("\xF0\x9F\x87\xBA") == 4);
     /* ZWSP is Control in GCB (v2 joined it to the base) */
     CHECK(GS("a\xE2\x80\x8B") == 1);
+}
+
+/* Full byte-boundary vectors from the unmodified Unicode 15.1 conformance file
+ * (vendor/ucd/GraphemeBreakTest.txt, 1187 cases). Runs from the repo root. */
+static void t_grapheme_conformance(void)
+{
+    FILE *f = fopen("vendor/ucd/GraphemeBreakTest.txt", "r");
+    CHECK(f != NULL);
+    if (!f) return;
+    char line[4096];
+    size_t cases = 0, bad = 0, lineno = 0;
+    while (fgets(line, sizeof line, f)) {
+        lineno++;
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        uint8_t *bytes = malloc(1024);                  /* heap: ASan sees overreads of the string */
+        uint8_t want[1025] = {0}, got[1025] = {0};
+        size_t n = 0;
+        int boundary = 0, have = 0;
+        for (char *tok = strtok(line, " \t\r\n"); tok; tok = strtok(NULL, " \t\r\n")) {
+            if (strcmp(tok, "\xC3\xB7") == 0) { boundary = 1; if (!have) want[0] = 1; else want[n] = 1; }
+            else if (strcmp(tok, "\xC3\x97") == 0) boundary = 0;
+            else {
+                char *end;
+                unsigned long cp = strtoul(tok, &end, 16);
+                CHECK(*end == '\0' && cp <= 0x10FFFF && n + 4 <= 1024);
+                if (*end || cp > 0x10FFFF || n + 4 > 1024) break;
+                want[n] = (uint8_t)boundary;
+                n += utf8_encode((uint32_t)cp, bytes + n);
+                have = 1;
+            }
+        }
+        if (!have) { free(bytes); continue; }
+        cases++;
+        want[n] = 1;                                    /* GB2: break at end */
+        want[0] = 1;                                    /* GB1 */
+        uint8_t *exact = malloc(n);
+        memcpy(exact, bytes, n);
+        got[0] = 1;
+        for (size_t off = 0; off < n;) {
+            size_t step = utf8_grapheme_next(exact + off, n - off);
+            CHECK(step > 0 && step <= n - off);
+            if (!step || step > n - off) break;
+            off += step;
+            got[off] = 1;
+        }
+        if (memcmp(want, got, n + 1)) {
+            if (bad < 8) printf("GraphemeBreakTest boundary mismatch at line %zu\n", lineno);
+            bad++;
+        }
+        free(exact);
+        free(bytes);
+    }
+    CHECK(!ferror(f));
+    fclose(f);
+    CHECK(cases == 1187);
+    CHECK(bad == 0);
+    printf("GraphemeBreakTest: %zu cases, %zu mismatches\n", cases, bad);
 }
 
 /* ------------------------------------------------------------ ascii_run */
@@ -390,6 +528,139 @@ static void t_random(void)
     free(buf);
 }
 
+
+/* ---- grapheme_prev, cluster width, property oracle ---- */
+static void t_grapheme_prev_cases(void)
+{
+    uint8_t *h = malloc(32);
+    CHECK(utf8_grapheme_prev(h, 0) == 0);
+    memcpy(h, "ab", 2);
+    CHECK(utf8_grapheme_prev(h, 2) == 1);
+    memcpy(h, "e\xCC\x81", 3);
+    CHECK(utf8_grapheme_prev(h, 3) == 0);
+    CHECK(utf8_grapheme_prev(h, 1) == 0);
+    memcpy(h, "\r\n", 2);
+    CHECK(utf8_grapheme_prev(h, 2) == 0);
+    memcpy(h, "\n\n", 2);
+    CHECK(utf8_grapheme_prev(h, 2) == 1);
+    memcpy(h, "a\xE2\x80\x8B\xCC\x81", 6);                /* ZWSP / Extend */
+    CHECK(utf8_grapheme_prev(h, 6) == 4);
+    CHECK(utf8_grapheme_prev(h, 4) == 1);
+    memcpy(h, "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95", 9);  /* GB9c: one cluster */
+    CHECK(utf8_grapheme_prev(h, 9) == 0);
+    memcpy(h, "\xF0\x9F\x87\xBA\xF0\x9F\x87\xB8\xF0\x9F\x87\xAB", 12); /* RI RI | RI */
+    CHECK(utf8_grapheme_prev(h, 12) == 8);
+    CHECK(utf8_grapheme_prev(h, 8) == 0);
+    memcpy(h, "x\xFF\xCC\x81", 4);                       /* invalid byte then orphan mark */
+    CHECK(utf8_grapheme_prev(h, 4) == 2);                  /* U+0301 after an invalid byte: GB4 break */
+    CHECK(utf8_grapheme_prev(h, 2) == 1);
+    free(h);
+}
+
+static int cw(const char *s, size_t n)
+{
+    uint8_t *h = malloc(n ? n : 1);
+    memcpy(h, s, n);
+    int w = utf8_cluster_width(h, n);
+    free(h);
+    return w;
+}
+#define CWS(s) cw(s, sizeof(s) - 1)
+
+static void t_cluster_width(void)
+{
+    CHECK(cw("", 0) == 0);
+    CHECK(CWS("a") == 1);
+    CHECK(CWS("e\xCC\x81") == 1);                          /* base + mark */
+    CHECK(CWS("\xCC\x81") == 0);                           /* lone mark */
+    CHECK(CWS("\xD8\x80\xD8\xA8") == 1);                   /* Prepend U+0600 + BEH: not 0 */
+    CHECK(CWS("\xD8\x80") == 0);
+    CHECK(CWS("\xE0\xB5\x8E") == 1);                       /* U+0D4E Prepend, visible */
+    CHECK(CWS("\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8") == 2); /* L V T: 2, not 3 */
+    CHECK(CWS("\xE1\x84\x80") == 2);
+    CHECK(CWS("\xEA\xB0\x80") == 2);                       /* LV (EAW W anyway) */
+    CHECK(CWS("\xE1\x85\xA1\xE1\x86\xA8") == 2);           /* orphan V T */
+    CHECK(CWS("\xE1\x85\x9F") == 0);                       /* U+115F alone: zero width wins */
+    CHECK(CWS("\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95") == 1); /* Devanagari conjunct */
+    CHECK(CWS("\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7") == 2); /* family, not 6 */
+    CHECK(CWS("\xE2\x9D\xA4\xE2\x80\x8D\xE2\x9D\xA4") == 2);  /* narrow pict ZWJ narrow pict */
+    CHECK(CWS("\xE2\x9D\xA4") == 1);
+    CHECK(CWS("\xE2\x9D\xA4\xEF\xB8\x8F") == 2);           /* heart + VS16 */
+    CHECK(CWS("\xE2\x9D\xA4\xEF\xB8\x8E") == 1);           /* heart + VS15 */
+    CHECK(CWS("1\xEF\xB8\x8F\xE2\x83\xA3") == 2);          /* keycap */
+    CHECK(CWS("#\xE2\x83\xA3") == 2);
+    CHECK(CWS("1") == 1);
+    CHECK(CWS("a\xEF\xB8\x8F") == 1);                      /* VS16 does not widen a letter */
+    CHECK(CWS("\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBD") == 2);   /* thumbs up + skin tone */
+    CHECK(CWS("\xF0\x9F\x87\xBA\xF0\x9F\x87\xB8") == 2);   /* flag */
+    CHECK(CWS("\xF0\x9F\x8F\xB3\xEF\xB8\x8F\xE2\x80\x8D\xF0\x9F\x8C\x88") == 2); /* rainbow flag */
+    CHECK(CWS("\xE4\xB8\x80\xCC\x81") == 2);               /* wide + mark */
+    CHECK(CWS("\xFF") == 1);                               /* invalid byte: 1 (not AD-zero) */
+    CHECK(CWS("\xAD") == 1);
+    CHECK(CWS("\xC2\xAD") == 1);                           /* U+00AD is a Control cluster: placeholder */
+    CHECK(CWS("\r\n") == 1);
+    CHECK(CWS("\t") == 1);
+    CHECK(CWS("\xE2\x80\x8B") == 1);                       /* ZWSP (Control) */
+    /* cluster length agrees with grapheme_next, ASCII fast path with the slow path */
+    uint8_t *h = malloc(8);
+    for (uint32_t a = 0; a < 0x80; a++)
+        for (uint32_t b = 0; b < 0x80; b++) {
+            h[0] = (uint8_t)a; h[1] = (uint8_t)b;
+            int w;
+            size_t l = utf8_cluster(h, 2, &w);
+            CHECK_BREAK(l == utf8_grapheme_next(h, 2) && w >= 0 && w <= 2 && (l == 2) == (a == '\r' && b == '\n'));
+        }
+    free(h);
+}
+
+/* Random property soup against the oracle: segmentation, prev, cluster width bounds. */
+static void t_oracle_random(void)
+{
+    static const uint32_t pool[] = { 'a', 'b', ' ', 0x7F, 0xA0, 0xAD, 0xE9, 0x301, 0x308, 0x600, 0x605, 0x903, 0x915, 0x939,
+        0x94D, 0x9CD, 0x995, 0xACD, 0x200B, 0x200C, 0x200D, 0x2028, 0x2764, 0xFE0F, 0x20E3, 0x1100, 0x1160, 0x11A8, 0xAC00,
+        0xAC01, 0x1F600, 0x1F3FD, 0x1F468, 0x1F1E6, 0x1F1E7, 0x1F1E8, 0xE0020, 0xE007F, 0x4E00, 0xD4E, '\r', '\n', '\t', '1' };
+    for (int round = 0; round < 20000; round++) {
+        uint8_t *buf = malloc(160);
+        int c[48], ib[48];
+        size_t pos[49];
+        size_t n = 0;
+        int m = 0, units = 1 + (int)(rnd() % 40);
+        for (int i = 0; i < units; i++) {
+            if (rnd() % 12 == 0)
+                buf[n++] = (uint8_t)(0x80 | rnd());        /* stray continuation or lead byte */
+            else
+                n += utf8_encode(pool[rnd() % NELEM(pool)], buf + n);
+        }
+        for (size_t o = 0; o < n && m < 48;) {             /* units as the decoder sees them */
+            utf8_step s = utf8_decode(buf + o, n - o);
+            pos[m] = o;
+            c[m] = ref_class(s.valid, s.cp);
+            ib[m] = ref_incb(s.valid, s.cp);
+            o += s.len;
+            m++;
+        }
+        pos[m] = n;
+        uint8_t *exact = malloc(n);
+        memcpy(exact, buf, n);
+        int i = 0;
+        for (size_t off = 0; off < n;) {
+            size_t g = utf8_grapheme_next(exact + off, n - off);
+            int j = i + 1;                                  /* ref: extend until the next break */
+            while (j < m && !ref_break(c, ib, j)) j++;
+            CHECK_BREAK(g == pos[j] - off);
+            CHECK_BREAK(utf8_grapheme_prev(exact, off + g) == off);
+            int w;
+            CHECK_BREAK(utf8_cluster(exact + off, n - off, &w) == g && w >= 0 && w <= 2);
+            for (int k = i + 1; k < j; k++)                 /* unit ends inside the cluster: its start */
+                CHECK_BREAK(utf8_grapheme_prev(exact, pos[k]) == off);
+            off += g;
+            i = j;
+        }
+        free(exact);
+        free(buf);
+    }
+}
+
 /* Fast paths in utf8.c rely on these table facts; fail loudly if a table
  * regeneration breaks them. */
 static void t_table_facts(void)
@@ -397,6 +668,13 @@ static void t_table_facts(void)
     CHECK(UCD_ZERO_WIDTH[0].lo == 0xAD && UCD_ZERO_WIDTH[0].hi == 0xAD && UCD_ZERO_WIDTH[1].lo >= 0x300);
     CHECK(UCD_WIDE[0].lo >= 0x1100);
     CHECK(UCD_EXTEND[0].lo >= 0x300 && UCD_SPACINGMARK[0].lo >= 0x300 && UCD_PREPEND[0].lo >= 0x300);
+    CHECK(UCD_CONTROL[0].lo == 0 && UCD_INCB_CONSONANT[0].lo >= 0x900 && UCD_INCB_LINKER[0].lo >= 0x900);
+    for (uint32_t cp = 0; cp < 0x300; cp++) {              /* gcb_of fast path below U+0300 */
+        int ctl = cp == '\r' || cp == '\n' ? 0 : (ref_in(UCD_CONTROL, NELEM(UCD_CONTROL), cp));
+        CHECK_BREAK(ctl == (cp < 0x20 && cp != '\r' && cp != '\n') + (cp >= 0x7F && cp <= 0x9F) + (cp == 0xAD));
+        CHECK_BREAK(!ref_in(UCD_EXTEND, NELEM(UCD_EXTEND), cp) && !ref_in(UCD_SPACINGMARK, NELEM(UCD_SPACINGMARK), cp));
+        CHECK_BREAK(!ref_in(UCD_PREPEND, NELEM(UCD_PREPEND), cp));
+    }
     CHECK(UCD_EXT_PICT[0].lo >= 0x80 && UCD_HANGUL_L[0].lo >= 0x300 && UCD_REGIONAL_INDICATOR[0].lo >= 0x300);
 }
 
@@ -409,6 +687,10 @@ int main(void)
     t_all_scalars();
     t_width();
     t_grapheme();
+    t_grapheme_conformance();
+    t_grapheme_prev_cases();
+    t_cluster_width();
+    t_oracle_random();
     t_ascii_run();
     t_random();
     free(tail4);

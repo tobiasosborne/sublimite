@@ -33,6 +33,8 @@ int main(void) {
         {"HANGUL_T", TABLE(UCD_HANGUL_T)}, {"HANGUL_LV", TABLE(UCD_HANGUL_LV)},
         {"HANGUL_LVT", TABLE(UCD_HANGUL_LVT)}, {"PREPEND", TABLE(UCD_PREPEND)},
         {"SPACINGMARK", TABLE(UCD_SPACINGMARK)}, {"EXTEND", TABLE(UCD_EXTEND)},
+        {"CONTROL", TABLE(UCD_CONTROL)}, {"INCB_CONSONANT", TABLE(UCD_INCB_CONSONANT)},
+        {"INCB_LINKER", TABLE(UCD_INCB_LINKER)}, {"INCB_EXTEND", TABLE(UCD_INCB_EXTEND)},
     };
     size_t total = 0;
     int fail = 0;
@@ -48,6 +50,13 @@ int main(void) {
     fail |= !in_table(TABLE(UCD_EXT_PICT), 0x1F600);
     fail |= !in_table(TABLE(UCD_REGIONAL_INDICATOR), 0x1F1E6);
     fail |= !in_table(TABLE(UCD_HANGUL_L), 0x1100);
+    fail |= !in_table(TABLE(UCD_CONTROL), 0x200B);      /* Cf, GCB Control */
+    fail |= in_table(TABLE(UCD_CONTROL), 0x200D);       /* ZWJ is not Control */
+    fail |= in_table(TABLE(UCD_CONTROL), 0x200C);       /* nor ZWNJ (Extend) */
+    fail |= !in_table(TABLE(UCD_INCB_CONSONANT), 0x0915);
+    fail |= !in_table(TABLE(UCD_INCB_LINKER), 0x094D);
+    fail |= !in_table(TABLE(UCD_INCB_EXTEND), 0x200D);
+    fail |= in_table(TABLE(UCD_INCB_CONSONANT), 0x094D);
     fail |= in_table(TABLE(UCD_WIDE), 0x0041);
     fail |= in_table(TABLE(UCD_EXT_PICT), 0x0041);
     fail |= in_table(TABLE(UCD_HANGUL_L), 0x0041);

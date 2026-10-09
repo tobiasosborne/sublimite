@@ -84,9 +84,13 @@ int utf8_cell_width_table(uint32_t cp);
 /* Terminal cells for one scalar: 0 for Mn/Me/Mc/Cf, Default_Ignorable and
  * variation selectors; 2 for East Asian Wide/Fullwidth and
  * Emoji_Presentation (zero wins where both apply); 1 otherwise, including
- * controls, unassigned code points and anything > U+10FFFF (the renderer
- * draws controls as placeholders). Below U+0300 the only table entry is
- * U+00AD (Cf); tests/utf8_test.c checks that and every code point. */
+ * controls and anything > U+10FFFF (the renderer draws controls as
+ * placeholders). Below U+0300 the only table entry is U+00AD (Cf);
+ * tests/utf8_test.c checks that and every code point.
+ * Unassigned code points follow the same tables, not a blanket 1: U+2FFFD
+ * (EAW=W) is 2 and U+E01F0 (Default_Ignorable) is 0. This is the width of a
+ * scalar; invalid bytes are not scalars and need width 1 from the caller
+ * (utf8_cluster does it); clusters use utf8_cluster_width. */
 static inline int utf8_cell_width(uint32_t cp)
 {
     if (cp < 0x300)
@@ -95,14 +99,46 @@ static inline int utf8_cell_width(uint32_t cp)
 }
 
 /* Byte length of the extended grapheme cluster at p[0..n) per UAX #29
- * (Unicode 15.1) rules GB3..GB13 except GB9c (Indic conjuncts; no InCB table
- * yet). Control is approximated as Cc + U+2028/2029; invalid bytes are
- * single-byte clusters. Returns 0 iff n == 0; otherwise 1..n and always a
- * unit boundary. */
+ * (Unicode 15.1) rules GB3..GB13 including GB9c (Indic conjuncts), with the
+ * real Grapheme_Cluster_Break=Control table. An invalid byte is a one-byte
+ * cluster and acts as Control to its neighbours (a break before and after it).
+ * Returns 0 iff n == 0; otherwise 1..n and always a unit boundary. Passes all
+ * 1187 cases of GraphemeBreakTest.txt (tests/utf8_test.c). Cost is linear in
+ * the cluster length, which is unbounded (a base plus a million marks is one
+ * cluster); callers on the UI thread budget it (P1.1d). */
 size_t utf8_grapheme_next(const uint8_t *p, size_t n);
 
-/* Length of the all-ASCII prefix of p[0..n): the bulk skip for layout and
- * scanning (every ASCII byte is one valid unit). 32 bytes per step, never
+/* Start of the grapheme cluster that contains byte off-1 of base[0..off),
+ * segmenting forward from the nearest certain break (invalid byte, CR,
+ * Control, or LF after a non-CR) at or before it, or from base[0]. When off
+ * is a cluster boundary (the usual cursor-left case) this is the start of the
+ * cluster ending at off, i.e. exactly the cluster utf8_grapheme_next would
+ * have stepped over. off must be a unit boundary of base[0..off), and base[0]
+ * a cluster start. Reads only base[0..off-1]. off == 0 returns 0. */
+size_t utf8_grapheme_prev(const uint8_t *base, size_t off);
+
+/* Terminal cells of the first cluster of p[0..n), and its byte length
+ * (== utf8_grapheme_next). Rule (layout uses this, not a sum of scalar widths):
+ *   - invalid byte, CR, LF, Control (incl. tab): 1 (the renderer draws a
+ *     placeholder; tab stops are the layout's business);
+ *   - otherwise take the first scalar with utf8_cell_width > 0 (so Prepend,
+ *     Cf and marks in front of a base are skipped); none: 0;
+ *   - if that scalar is Hangul (L, V, T, LV, LVT) the cluster is 2, however
+ *     many jamo follow (an orphan V or T block is also 2);
+ *   - if the base has width 1 and is Extended_Pictographic and the cluster
+ *     contains VS16 (U+FE0F) or a ZWJ followed by an Extended_Pictographic
+ *     scalar, or the base is [0-9#*] and the cluster contains U+20E3: 2;
+ *   - else the base width (flags, modifier sequences: the base's 2).
+ * VS15 (U+FE0E) does not narrow a wide base. Always 0..2. */
+size_t utf8_cluster(const uint8_t *p, size_t n, int *width);
+
+/* Width part of utf8_cluster for the cluster at p[0..n). */
+int utf8_cluster_width(const uint8_t *p, size_t n);
+
+/* Length of the all-ASCII prefix of p[0..n): a decode/validation shortcut
+ * for layout and scanning (every ASCII byte is one valid unit). It includes
+ * tabs, CR, LF and other controls, so it does NOT mean "one cell per byte":
+ * layout must handle tabs and line breaks itself. 32 bytes per step, never
  * reads beyond p[n-1]. */
 static inline size_t utf8_ascii_run(const uint8_t *p, size_t n)
 {

@@ -10,8 +10,19 @@
  *     boundary; clusters tile the input;
  *   - cell_width is 0..2 and the inline and table paths agree;
  *   - ascii_run equals a byte loop (every start below 64, then every 61st);
- *   - encode of arbitrary 32-bit values decodes back to the value or U+FFFD. */
+ *   - encode of arbitrary 32-bit values decodes back to the value or U+FFFD;
+ *   - (P1.1c) byte-exact reconstruction: re-encoding valid units and copying
+ *     invalid bytes rebuilds the input; invalid bytes have cluster width 1;
+ *   - (P1.1c) every truncated decode view lives in its own exact-size heap
+ *     block, so any read past p[k-1] is an ASan error;
+ *   - (P1.1c) grapheme oracle: the first 512 units are segmented by an
+ *     independent UAX #29 implementation (pairwise rules over left context,
+ *     binary search over the tables) and must equal utf8_grapheme_next;
+ *   - (P1.1c) utf8_grapheme_prev from every cluster end returns that
+ *     cluster's start, from every unit end inside one too; utf8_cluster
+ *     returns the same length as grapheme_next and a width 0..2. */
 #include "utf8/utf8.h"
+#include "utf8/tables.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +50,84 @@ static utf8_step ref_decode(const uint8_t *p, size_t n)
     return s;
 }
 
+/* ---- independent grapheme oracle (same shape as tests/utf8_test.c) ---- */
+#define NELEM(a) (sizeof(a) / sizeof((a)[0]))
+enum { R_OTHER, R_CR, R_LF, R_CTL, R_EXT, R_ZWJ, R_SPC, R_PRE, R_RI, R_L, R_V, R_T, R_LV, R_LVT, R_PICT };
+static int ref_in(const utf8_range *t, size_t n, uint32_t cp)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < t[mid].lo) hi = mid;
+        else if (cp > t[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+#define RIN(tab, cp) ref_in(tab, NELEM(tab), cp)
+static int ref_class(int valid, uint32_t cp)
+{
+    if (!valid) return R_CTL;
+    if (cp == '\r') return R_CR;
+    if (cp == '\n') return R_LF;
+    if (RIN(UCD_CONTROL, cp)) return R_CTL;
+    if (cp == 0x200D) return R_ZWJ;
+    if (RIN(UCD_EXTEND, cp)) return R_EXT;
+    if (RIN(UCD_SPACINGMARK, cp)) return R_SPC;
+    if (RIN(UCD_PREPEND, cp)) return R_PRE;
+    if (RIN(UCD_REGIONAL_INDICATOR, cp)) return R_RI;
+    if (RIN(UCD_HANGUL_L, cp)) return R_L;
+    if (RIN(UCD_HANGUL_V, cp)) return R_V;
+    if (RIN(UCD_HANGUL_T, cp)) return R_T;
+    if (RIN(UCD_HANGUL_LV, cp)) return R_LV;
+    if (RIN(UCD_HANGUL_LVT, cp)) return R_LVT;
+    if (RIN(UCD_EXT_PICT, cp)) return R_PICT;
+    return R_OTHER;
+}
+static int ref_incb(int valid, uint32_t cp)
+{
+    if (!valid) return 0;
+    if (RIN(UCD_INCB_CONSONANT, cp)) return 1;
+    if (RIN(UCD_INCB_LINKER, cp)) return 2;
+    if (RIN(UCD_INCB_EXTEND, cp)) return 3;
+    return 0;
+}
+static int ref_break(const int *c, const int *ib, int i)
+{
+    int a = c[i - 1], b = c[i];
+    if (a == R_CR && b == R_LF) return 0;
+    if (a == R_CR || a == R_LF || a == R_CTL) return 1;
+    if (b == R_CR || b == R_LF || b == R_CTL) return 1;
+    if (a == R_L && (b == R_L || b == R_V || b == R_LV || b == R_LVT)) return 0;
+    if ((a == R_LV || a == R_V) && (b == R_V || b == R_T)) return 0;
+    if ((a == R_LVT || a == R_T) && b == R_T) return 0;
+    if (b == R_EXT || b == R_ZWJ || b == R_SPC) return 0;
+    if (a == R_PRE) return 0;
+    if (ib[i] == 1) {
+        int j = i - 1, linker = 0;
+        while (j >= 0 && (ib[j] == 2 || ib[j] == 3)) { linker |= ib[j] == 2; j--; }
+        if (j >= 0 && ib[j] == 1 && linker) return 0;
+    }
+    if (a == R_ZWJ && b == R_PICT) {
+        int j = i - 2;
+        while (j >= 0 && c[j] == R_EXT) j--;
+        if (j >= 0 && c[j] == R_PICT) return 0;
+    }
+    if (a == R_RI && b == R_RI) {
+        int k = 0, j = i - 1;
+        while (j >= 0 && c[j] == R_RI) { k++; j--; }
+        if (k % 2 == 1) return 0;
+    }
+    return 1;
+}
+
+static uint8_t *exact_copy(const uint8_t *p, size_t n)    /* own heap block: ASan bounds at p+n */
+{
+    uint8_t *q = malloc(n ? n : 1);
+    if (q) memcpy(q, p, n);
+    return q;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
@@ -48,7 +137,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         return 0;
     }
     uint8_t *unit = calloc(size + 1, 1);            /* unit[o] = 1 iff o is a unit boundary */
-    if (!unit) return 0;
+    uint8_t *rebuilt = malloc(size);
+    if (!unit || !rebuilt) { free(unit); free(rebuilt); return 0; }
     size_t off = 0, units = 0;
     while (off < size) {
         size_t rem = size - off;
@@ -58,12 +148,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (s.valid) {
             uint8_t e[4];
             REQUIRE(utf8_encode(s.cp, e) == s.len && memcmp(e, data + off, s.len) == 0);
+            memcpy(rebuilt + off, e, s.len);
         } else {
             REQUIRE(s.len == 1 && s.cp == data[off] && data[off] >= 0x80);
+            rebuilt[off] = (uint8_t)s.cp;           /* invalid: the original byte */
+            REQUIRE(utf8_cluster_width(data + off, rem) == 1);   /* never the width of scalar U+00xx */
         }
-        for (size_t k = 1; k < 4 && k < rem; k++) {  /* truncated view */
-            utf8_step t = utf8_decode(data + off, k), tr = ref_decode(data + off, k);
+        for (size_t k = 1; k < 4 && k < rem; k++) {  /* truncated view, own heap block */
+            uint8_t *v = exact_copy(data + off, k);
+            REQUIRE(v);
+            utf8_step t = utf8_decode(v, k), tr = ref_decode(v, k);
             REQUIRE(t.cp == tr.cp && t.len == tr.len && t.valid == tr.valid && t.len <= k);
+            free(v);
         }
         int w = utf8_cell_width(s.cp);
         REQUIRE(w >= 0 && w <= 2 && w == utf8_cell_width_table(s.cp));
@@ -73,6 +169,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         REQUIRE(utf8_prev(data, off) == off - s.len);
     }
     unit[size] = 1;
+    REQUIRE(memcmp(rebuilt, data, size) == 0);      /* byte-exact round trip, malformed input included */
+    free(rebuilt);
     size_t back = 0;
     for (size_t o = size; o > 0; back++) {
         size_t p = utf8_prev(data, o);
@@ -83,7 +181,38 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     for (off = 0; off < size;) {
         size_t g = utf8_grapheme_next(data + off, size - off);
         REQUIRE(g >= 1 && g <= size - off && unit[off + g]);
+        int w;
+        REQUIRE(utf8_cluster(data + off, size - off, &w) == g && w >= 0 && w <= 2);
         off += g;
+    }
+    {   /* oracle over the first 512 units; the view is cut exactly after them */
+        enum { MU = 512 };
+        int c[MU], ib[MU];
+        size_t pos[MU + 1];
+        int m = 0;
+        for (size_t o = 0; o < size && m < MU; m++) {
+            utf8_step s = utf8_decode(data + o, size - o);
+            pos[m] = o;
+            c[m] = ref_class(s.valid, s.cp);
+            ib[m] = ref_incb(s.valid, s.cp);
+            o += s.len;
+            pos[m + 1] = o;
+        }
+        uint8_t *v = exact_copy(data, pos[m]);
+        REQUIRE(v);
+        int i = 0;
+        for (size_t o = 0; o < pos[m];) {
+            int j = i + 1;
+            while (j < m && !ref_break(c, ib, j)) j++;
+            size_t g = utf8_grapheme_next(v + o, pos[m] - o);
+            REQUIRE(g == pos[j] - o);
+            REQUIRE(utf8_grapheme_prev(v, o + g) == o);
+            for (int k = i + 1; k < j; k++)          /* unit ends inside the cluster */
+                REQUIRE(utf8_grapheme_prev(v, pos[k]) == o);
+            o += g;
+            i = j;
+        }
+        free(v);
     }
     for (size_t st = 0; st < size; st += st < 64 ? 1 : 61) {   /* bounded: inputs reach 4 KiB */
         size_t r = st;

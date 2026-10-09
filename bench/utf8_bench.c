@@ -2,7 +2,8 @@
  * <= 96 KiB decode or <= 500 shaped chars per slice):
  *   decode_width_500: decode + utf8_cell_width of 500 scalars, p50 <= 5 us, p99 <= 10 us (G)
  *   ascii_skip_96k:   utf8_ascii_run over 96 KiB of ASCII, >= 8 GB/s at p50 (G), i.e. p50 <= 12288 ns
- *   grapheme_500:     utf8_grapheme_next over the same windows, reported, not gated
+ *   grapheme_500:     utf8_grapheme_next over the same windows, TRACK (not gated)
+ *   cluster_500:      utf8_cluster (length + cluster width) over the same windows, TRACK
  * Class mix for the 500-scalar windows, by scalar count:
  *   55 % ASCII printable U+0020..U+007E, 20 % Latin-1 U+00A0..U+00FF,
  *   15 % CJK U+4E00..U+A1FF, 10 % emoji U+1F300..U+1F44F.
@@ -63,6 +64,28 @@ static uint64_t graphemes(const uint8_t *p, size_t n)
     return c;
 }
 
+/* Cluster step: utf8_cluster (length + cell width) over a window; TRACK only. */
+static uint64_t clusters(const uint8_t *p, size_t n)
+{
+    uint64_t c = 0;
+    for (size_t off = 0; off < n;) {
+        int w;
+        off += utf8_cluster(p + off, n - off, &w);
+        c += (uint64_t)w;
+    }
+    return c;
+}
+
+/* bench_report's ci95 is the median's; print both quantiles with their own labelled interval. */
+static void print_ci(const bench_samples *s)
+{
+    uint64_t lo, hi;
+    bench_ci95(s, 0.50, &lo, &hi);
+    printf("  p50 %llu ns ci95 [%llu,%llu]", (unsigned long long)bench_p50(s), (unsigned long long)lo, (unsigned long long)hi);
+    bench_ci95(s, 0.99, &lo, &hi);
+    printf("; p99 %llu ns ci95 [%llu,%llu]\n", (unsigned long long)bench_p99(s), (unsigned long long)lo, (unsigned long long)hi);
+}
+
 static void print_power(void)
 {
     char st[32], gov[64] = "unknown";
@@ -76,7 +99,7 @@ static void print_power(void)
     printf("power: battery=%s governor=%s tag=(M)%s\n", st, gov, bench_evidence_tag());
 }
 
-static int run_mix(const char *name, const char *gname, int iid, int gated, uint8_t *text, size_t *start, uint64_t *v)
+static int run_mix(const char *name, const char *gname, const char *cname, int iid, int gated, uint8_t *text, size_t *start, uint64_t *v)
 {
     size_t n = 0;
     for (int w = 0; w < WINDOWS; w++) {
@@ -97,6 +120,7 @@ static int run_mix(const char *name, const char *gname, int iid, int gated, uint
     int miss = bench_report(name, &s, gated ? 5000 : 0, gated ? 10000 : 0);
     printf("  -> p50 %.1f ns/scalar, p99 %llu ns vs 5000/10000 (%s)\n", (double)bench_p50(&s) / SCALARS,
            (unsigned long long)bench_p99(&s), gated ? "gated" : "not gated");
+    print_ci(&s);
 
     bench_samples_init(&s, v, SAMPLES);
     for (int i = 0; i < SAMPLES; i++) {
@@ -104,7 +128,15 @@ static int run_mix(const char *name, const char *gname, int iid, int gated, uint
         BENCH_TIME(&s, sink += graphemes(text + start[w], start[w + 1] - start[w]));
     }
     (void)bench_report(gname, &s, 0, 0);
-    printf("  -> p50 %.1f ns/scalar (not gated)\n", (double)bench_p50(&s) / SCALARS);
+    printf("  -> p50 %.1f ns/scalar (TRACK)\n", (double)bench_p50(&s) / SCALARS);
+
+    bench_samples_init(&s, v, SAMPLES);
+    for (int i = 0; i < SAMPLES; i++) {
+        int w = i % WINDOWS;
+        BENCH_TIME(&s, sink += clusters(text + start[w], start[w + 1] - start[w]));
+    }
+    (void)bench_report(cname, &s, 0, 0);
+    printf("  -> p50 %.1f ns/scalar (TRACK)\n", (double)bench_p50(&s) / SCALARS);
     return miss;
 }
 
@@ -119,8 +151,8 @@ int main(void)
 
     print_power();
     int miss = 0;
-    miss |= run_mix("utf8_decode_width_500_runs", "utf8_grapheme_500_runs", 0, 1, text, start, v);
-    (void)run_mix("utf8_decode_width_500_iid", "utf8_grapheme_500_iid", 1, 0, text, start, v);
+    miss |= run_mix("utf8_decode_width_500_runs", "utf8_grapheme_500_runs", "utf8_cluster_500_runs", 0, 1, text, start, v);
+    (void)run_mix("utf8_decode_width_500_iid", "utf8_grapheme_500_iid", "utf8_cluster_500_iid", 1, 0, text, start, v);
 
     bench_samples s;
     bench_samples_init(&s, v, SKIP_SAMPLES);
@@ -128,8 +160,9 @@ int main(void)
     for (int i = 0; i < SKIP_SAMPLES; i++)
         BENCH_TIME(&s, sink += utf8_ascii_run(ascii, SKIP_BYTES));
     miss |= bench_report("utf8_ascii_skip_96k", &s, 12288, 0);
-    printf("  -> p50 %.2f GB/s, p99 %.2f GB/s (gate >= 8 GB/s at p50)\n",
+    printf("  -> throughput at p50 latency %.2f GB/s (gate >= 8 GB/s); throughput at p99 latency (slow tail) %.2f GB/s\n",
            (double)SKIP_BYTES / (double)bench_p50(&s), (double)SKIP_BYTES / (double)bench_p99(&s));
+    print_ci(&s);
 
     printf("%s\n", miss ? "BENCH GATE MISSED" : "BENCH GATE PASSED");
     free(v); free(ascii); free(start); free(text);
