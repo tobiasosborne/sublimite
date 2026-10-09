@@ -1,0 +1,46 @@
+P4.14 verification, DISPLAY=:99 EDIT_DISPLAY=:99 only
+
+Red before implementation (exit 1):
+zygote contract: FAIL missing executable variants/P4.14/a/launch
+
+First-frame instrumentation RED (invalid run excluded):
+First-frame audit RED: FAIL 307/472 complete rows have ready after first present
+
+Cleanup RED (exit 1):
+zygote contract: FAIL cleanup private runtime variant=b
+zygote contract: FAIL cleanup private runtime variant=c
+
+Final release contract GREEN (exit 0):
+zygote contract: PASS A/B/C exec, IPC wait, real map/present completion, unmap, repeated warm launch
+(M)[AC], Not charging, load1=14.38; lifecycle self-check, not timing matrix
+
+Final clang ASan/UBSan contract GREEN (exit 0; detect_leaks=0):
+zygote contract: PASS A/B/C exec, IPC wait, real map/present completion, unmap, repeated warm launch
+(M)[AC], Not charging, load1=17.46; lifecycle self-check, not timing matrix
+
+Valid timing audit GREEN:
+First-frame audit GREEN: PASS 600/600 ordered rows; 200 per variant; strict A/B/C order
+Summary audit: PASS all 12 percentile rows match raw nearest-rank samples
+(M)[AC], Not charging, per-launch load1=26.24..28.10
+
+GCC make all: exit 0 (strict C11 warning flags; common bench included)
+Clang ASan/UBSan make check: exit 0, ASAN_OPTIONS=detect_leaks=0
+check: 41 test binaries passed
+test_replay_cli: all passed
+make fuzz: exit 0
+fuzz: 21 fuzzers built
+sh -n tools/zygote_bench.sh: exit 0
+
+IPC decoder fuzz smoke, no persistent corpus:
+ASAN_OPTIONS=detect_leaks=0 ./build/fuzz/ipc_fuzz -max_total_time=30 -max_len=8192
+Done 860988 runs in 31 second(s)
+exit 0, no sanitizer findings; (M)[AC], Not charging, pre-run load1=26.33
+
+Infrastructure: sandbox-only make check failed to connect to X11 (cli_test).
+The required complete suite passed in the approved local-socket environment.
+Xvfb already existed in that environment; no X server was successfully started
+by this worker. Real DISPLAY :0 and EDIT_ALLOW_REAL_DISPLAY were never used.
+LSan disabled per task; coordinator can rerun leaks enabled.
+One initial timing attempt was stopped for a first-frame instrumentation bug;
+its raw file is invalid-first-frame.log. Only results.log is the valid matrix.
+No quiet-box retry, cold cache eviction, corpus regeneration, git or bd.

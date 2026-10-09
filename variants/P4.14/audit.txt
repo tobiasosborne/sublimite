@@ -1,0 +1,16 @@
+First-frame audit GREEN: PASS 600/600 ordered rows; 200 per variant; strict A/B/C order
+Summary audit: PASS all 12 percentile rows match raw nearest-rank samples
+Launch interval=87.809803460s (M)[AC], Not charging, load1=26.24..28.10
+Paired A-C map_ns: p50_ns=28522020 p99_ns=90862964 C_faster_pairs=199/200 (M)[AC], Not charging, load1=26.24..28.10
+Paired A-C ready_map_ns: p50_ns=205811509 p99_ns=420814494 C_faster_pairs=200/200 (M)[AC], Not charging, load1=26.24..28.10
+Paired A-C present_ns: p50_ns=205335107 p99_ns=423142360 C_faster_pairs=200/200 (M)[AC], Not charging, load1=26.24..28.10
+Paired A-C complete_ns: p50_ns=220666573 p99_ns=446883193 C_faster_pairs=200/200 (M)[AC], Not charging, load1=26.24..28.10
+variant=a minor_delta: p50=13185 p99=13189 max=13189 (M)[AC], Not charging, load1=26.24..28.10
+variant=a major_delta: p50=0 p99=0 max=0 (M)[AC], Not charging, load1=26.24..28.10
+variant=a rss_kib: p50=55464 p99=55532 max=55536 (M)[AC], Not charging, load1=26.24..28.10
+variant=b minor_delta: p50=0 p99=1 max=2 (M)[AC], Not charging, load1=26.24..28.10
+variant=b major_delta: p50=0 p99=0 max=0 (M)[AC], Not charging, load1=26.24..28.10
+variant=b rss_kib: p50=155936 p99=155952 max=155952 (M)[AC], Not charging, load1=26.24..28.10
+variant=c minor_delta: p50=0 p99=1 max=26 (M)[AC], Not charging, load1=26.24..28.10
+variant=c major_delta: p50=0 p99=0 max=0 (M)[AC], Not charging, load1=26.24..28.10
+variant=c rss_kib: p50=55516 p99=55536 max=55536 (M)[AC], Not charging, load1=26.24..28.10

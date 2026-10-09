@@ -1,0 +1,7 @@
+Not charging
+14.38
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+WARM variant=b gl_result=-10 rss_kib=155852 hwm_kib=169280 minor=39227 major=0 evidence=(M)[AC] power=Not charging load1=14.38
+WARM variant=c gl_result=0 rss_kib=55336 hwm_kib=55336 minor=13162 major=0 evidence=(M)[AC] power=Not charging load1=14.38
+zygote contract: PASS A/B/C exec, IPC wait, real map/present completion, unmap, repeated warm launch
