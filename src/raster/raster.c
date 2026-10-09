@@ -26,6 +26,15 @@ _Static_assert(sizeof(msg_payload) <= WORK_MSG_DATA, "raster message fits mailbo
 
 struct cpu_state;
 typedef struct strip_job { struct cpu_state *st; uint32_t index, njobs; raster_palette palette; } strip_job;
+/* Immutable inputs, initialized before work_submit's mailbox handoff. The
+ * worker never reads subsequently written UI fields from cpu_state. */
+typedef struct fence_job {
+    xcb_connection_t *conn;
+    xcb_special_event_t *special;
+    xcb_pixmap_t pixmap;
+    uint32_t frame;
+    unsigned int sequence;
+} fence_job;
 
 typedef struct cpu_state {
     xcb_connection_t *conn;
@@ -58,12 +67,24 @@ typedef struct cpu_state {
     size_t nhandles;
     uint32_t pending; /* UI only: decremented by strip work messages */
     /* fence job */
-    _Atomic uint32_t armed;
-    unsigned int fence_seq;
+    bool strip_done[RASTER_JOBS], fence_done, present_done;
+    bool present_issued; /* retain issued X requests on fence enqueue failure */
+    fence_job fence;
+    work_handle fence_handle;
     uint64_t last_ust, last_msc;   /* UI-thread copy of the latest Present completion */
-    uint32_t fence_frame;
     raster_metrics metrics;
 } cpu_state;
+
+/* Essential acknowledgements must outlive mailbox saturation. UI draining
+ * makes progress; quiescent shutdown/cancel interrupts a waiting producer. */
+static void publish_completion(work_ctx *c, const work_msg *m)
+{
+    while (!work_should_stop(c)) {
+        if (work_publish(c, m)) return;
+        struct timespec pause = {0, 50000};
+        nanosleep(&pause, NULL);
+    }
+}
 
 static void post(work_ctx *c, uint32_t kind, uint64_t ns, int32_t status, uint64_t ust, uint64_t msc)
 {
@@ -71,17 +92,19 @@ static void post(work_ctx *c, uint32_t kind, uint64_t ns, int32_t status, uint64
     msg_payload p = {.ns = ns, .ust = ust, .msc = msc, .status = status};
     m.kind = kind; m.generation = c->generation;
     memcpy(m.data, &p, sizeof p);
-    (void)work_publish(c, &m);
+    publish_completion(c, &m);
 }
 
 typedef struct row_ctx { cpu_state *st; work_ctx *work; raster_palette *palette; } row_ctx;
+static bool row_should_stop(void *u) { return work_should_stop(u); }
 static void do_row(void *u, uint32_t row)
 {
     row_ctx *ctx = u;
     if (work_should_stop(ctx->work)) return;
     cpu_state *st = ctx->st;
-    raster_row_cached(&st->scene, st->pix + (size_t)row * st->scene.dims.cell_h * st->stride_px,
-                    st->stride_px, row, ctx->palette);
+    (void)raster_row_cached_cancellable(&st->scene,
+        st->pix + (size_t)row * st->scene.dims.cell_h * st->stride_px,
+        st->stride_px, row, ctx->palette, row_should_stop, ctx->work);
 }
 
 static void strip_job_fn(work_ctx *c)
@@ -99,7 +122,7 @@ static void strip_job_fn(work_ctx *c)
     work_msg m = {.kind = MSG_STRIPS, .generation = c->generation};
     msg_payload payload = {.ns = end, .ust = start, .msc = j->index};
     memcpy(m.data, &payload, sizeof payload);
-    (void)work_publish(c, &m);
+    publish_completion(c, &m);
 }
 
 /* UI only. A failed submit cancels its jobs before returning and their stale
@@ -129,16 +152,11 @@ static void upload_strip(cpu_state *st, uint32_t index)
 
 static void fence_job_fn(work_ctx *c)
 {
-    cpu_state *st = c->arg;
-    int fd = xcb_get_file_descriptor(st->conn);
+    const fence_job *job = c->arg;
+    int fd = xcb_get_file_descriptor(job->conn);
     uint64_t deadline = trace_now_ns() + UINT64_C(2000000000);
-    while (!atomic_load_explicit(&st->armed, memory_order_acquire)) {
-        if (work_should_stop(c)) return;
-        struct timespec ts = {0, 20000};
-        nanosleep(&ts, NULL);
-    }
-    const uint32_t frame = st->fence_frame;
-    const unsigned int seq = st->fence_seq;
+    const uint32_t frame = job->frame;
+    const unsigned int seq = job->sequence;
     int32_t status = 0;
     uint64_t t5 = 0, t6 = 0, ust = 0, msc = 0;
     uint32_t present_info = 0;
@@ -148,7 +166,7 @@ static void fence_job_fn(work_ctx *c)
         bool progressed = false;
         if (!got_fence) {
             void *reply = NULL; xcb_generic_error_t *err = NULL;
-            if (xcb_poll_for_reply(st->conn, seq, &reply, &err)) {
+            if (xcb_poll_for_reply(job->conn, seq, &reply, &err)) {
                 t5 = trace_now_ns(); got_fence = true; progressed = true;
                 if (err || !reply || !((xcb_sync_query_fence_reply_t *)reply)->triggered) status = -1;
                 free(reply); free(err);
@@ -156,7 +174,7 @@ static void fence_job_fn(work_ctx *c)
             }
         }
         xcb_generic_event_t *e;
-        while ((e = xcb_poll_for_special_event(st->conn, st->special)) != NULL) {
+        while ((e = xcb_poll_for_special_event(job->conn, job->special)) != NULL) {
             progressed = true;
             const xcb_present_generic_event_t *ge = (const xcb_present_generic_event_t *)e;
             if (ge->evtype == XCB_PRESENT_COMPLETE_NOTIFY) {
@@ -168,22 +186,22 @@ static void fence_job_fn(work_ctx *c)
                 }
             } else if (ge->evtype == XCB_PRESENT_IDLE_NOTIFY) {
                 const xcb_present_idle_notify_event_t *ie = (const xcb_present_idle_notify_event_t *)e;
-                if (ie->serial == frame && ie->pixmap == st->pixmap) got_idle = true;
+                if (ie->serial == frame && ie->pixmap == job->pixmap) got_idle = true;
             }
             free(e);
         }
-        while ((e = xcb_poll_for_event(st->conn)) != NULL) {
+        while ((e = xcb_poll_for_event(job->conn)) != NULL) {
             progressed = true;
             if (e->response_type == 0) status = -1;
             free(e);
         }
-        if (status != 0 || xcb_connection_has_error(st->conn) || trace_now_ns() > deadline) {
+        if (status != 0 || xcb_connection_has_error(job->conn) || trace_now_ns() > deadline) {
             post(c, MSG_FAIL, 0, -1, 0, 0); return;
         }
         if (got_fence && got_present && got_idle) {
             /* Last access to state before publishing: UI may start N+1 as soon
              * as it drains this message. Never discard an early Present event. */
-            post(c, MSG_PRESENT, t6 > t5 ? t6 : t5, (int32_t)present_info, ust, msc);
+            post(c, MSG_PRESENT, t6, (int32_t)present_info, ust, msc);
             return;
         }
         /* Event polling may have read the fence reply into XCB's reply queue
@@ -213,6 +231,23 @@ static void cpu_release(cpu_state *st)
     st->shmid = -1;
 }
 
+/* The kernels emit exactly 0x00RRGGBB, with opaque alpha for depth 32.
+ * Storage bpp alone says nothing about visual channel interpretation. */
+static bool cpu_visual_rgb888(const xcb_setup_t *setup, uint32_t visual, uint8_t depth)
+{
+    if (depth != 24 && depth != 32) return false;
+    for (xcb_screen_iterator_t screen = xcb_setup_roots_iterator(setup); screen.rem; xcb_screen_next(&screen))
+        for (xcb_depth_iterator_t d = xcb_screen_allowed_depths_iterator(screen.data); d.rem; xcb_depth_next(&d)) {
+            if (d.data->depth != depth) continue;
+            for (xcb_visualtype_iterator_t v = xcb_depth_visuals_iterator(d.data); v.rem; xcb_visualtype_next(&v))
+                if (v.data->visual_id == visual)
+                    return v.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR &&
+                        v.data->red_mask == 0x00ff0000u && v.data->green_mask == 0x0000ff00u &&
+                        v.data->blue_mask == 0x000000ffu;
+        }
+    return false;
+}
+
 static int cpu_init(render_backend *b, const render_config *cfg)
 {
     cpu_state *st = b->state;
@@ -240,7 +275,7 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     bool depth_ok = false;
     for (xcb_format_iterator_t it = xcb_setup_pixmap_formats_iterator(setup); it.rem; xcb_format_next(&it))
         if (it.data->depth == st->depth && it.data->bits_per_pixel == 32) depth_ok = true;
-    if (!fmt_ok || !depth_ok) goto fail;
+    if (!fmt_ok || !depth_ok || !cpu_visual_rgb888(setup, pl->visual, pl->depth)) goto fail;
     xcb_shm_query_version_reply_t *sv = xcb_shm_query_version_reply(st->conn, xcb_shm_query_version(st->conn), NULL);
     if (sv == NULL) goto fail;
     free(sv);
@@ -319,7 +354,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     cpu_state *st = b->state;
     if (!st->up) return RENDER_ERR_STATE;
     if (st->have_frame) return RENDER_ERR_BUSY; /* previous frame not yet fully presented */
-    if (count > st->max_strips) return RENDER_ERR_CAPACITY;
+    if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT) return RENDER_ERR_CAPACITY;
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
     uint32_t cols = g->dims.cols, total = 0;
     for (size_t i = 0; i < count; i++) {
@@ -337,6 +372,9 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     st->metrics.jobs = njobs;
     if (!njobs) st->metrics.ready_ns = trace_now_ns();
     st->nhandles = 0;
+    memset(st->strip_done, 0, sizeof st->strip_done);
+    st->fence_done = false; st->present_done = false; st->present_issued = false;
+    st->fence_handle = (work_handle){0};
     st->pending = njobs;
     for (uint32_t j = 0; j < njobs; j++) {
         st->jobs[j].st = st; st->jobs[j].index = j; st->jobs[j].njobs = njobs;
@@ -363,41 +401,56 @@ static int cpu_present(render_backend *b, uint32_t frame_id)
     cpu_state *st = b->state;
     if (!st->up || !st->have_frame || frame_id != st->frame_id) return RENDER_ERR_STATE;
     if (st->pending != 0) return RENDER_ERR_BUSY;
-    atomic_store_explicit(&st->armed, 0, memory_order_relaxed);
-    work_job fj = {fence_job_fn, st, frame_id, WORK_RASTER};
+    if (!st->present_issued) {
+        st->metrics.present_ns = trace_now_ns();
+        xcb_sync_reset_fence(st->conn, st->device_fence);
+        xcb_sync_trigger_fence(st->conn, st->device_fence);
+        xcb_sync_await_fence(st->conn, 1, &st->device_fence);
+        xcb_sync_query_fence_cookie_t ck = xcb_sync_query_fence(st->conn, st->device_fence);
+        st->metrics.fence_sequence = ck.sequence;
+        /* Query the uploaded drawable before the scheduled window copy. */
+        st->metrics.present_sequence = xcb_present_pixmap(st->conn, st->win, st->pixmap, frame_id, 0, 0, 0, 0, 0,
+            st->device_fence, 0, XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL).sequence;
+        xcb_flush(st->conn);
+        st->metrics.issue_ns = trace_now_ns() - st->metrics.present_ns;
+        st->fence = (fence_job){st->conn, st->special, st->pixmap, frame_id, ck.sequence};
+        st->present_issued = true;
+    }
+    work_job fj = {fence_job_fn, &st->fence, frame_id, WORK_RASTER};
     work_handle h = work_submit(st->pool, fj);
     if (h.epoch == 0) return RENDER_ERR_BUSY;
+    st->fence_handle = h;
     st->handles[st->nhandles++] = h;
-    st->metrics.present_ns = trace_now_ns();
-    xcb_sync_reset_fence(st->conn, st->device_fence);
-    xcb_sync_trigger_fence(st->conn, st->device_fence);
-    xcb_sync_await_fence(st->conn, 1, &st->device_fence);
-    xcb_sync_query_fence_cookie_t ck = xcb_sync_query_fence(st->conn, st->device_fence);
-    st->metrics.fence_sequence = ck.sequence;
-    st->fence_seq = ck.sequence; st->fence_frame = frame_id;
-    /* Query the uploaded drawable before the scheduled window copy. T5 is
-     * upload device completion plus T4, not T6/display completion. */
-    st->metrics.present_sequence = xcb_present_pixmap(st->conn, st->win, st->pixmap, frame_id, 0, 0, 0, 0, 0,
-        st->device_fence, 0, XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL).sequence;
-    xcb_flush(st->conn);
-    st->metrics.issue_ns = trace_now_ns() - st->metrics.present_ns;
-    atomic_store_explicit(&st->armed, 1, memory_order_release);
     st->have_frame = false;
     return RENDER_OK;
 }
 
+static bool owns_message(work_handle handle, const work_msg *msg)
+{
+    return handle.epoch != 0 && handle.slot == msg->slot_ && handle.epoch == msg->epoch_;
+}
+
 static int cpu_event(render_backend *b, const render_event *event)
 {
+    cpu_state *st = b->state;
+    const work_msg *m = event->work;
     msg_payload p;
-    memcpy(&p, event->work->data, sizeof p);
-    switch (event->work->kind) {
+    memcpy(&p, m->data, sizeof p);
+    if (event->frame_id != st->metrics.frame_id || m->generation != st->metrics.frame_id)
+        return RENDER_ERR_UNSUPPORTED;
+    if (m->kind == MSG_STRIPS) {
+        if (p.msc >= st->metrics.jobs || p.msc >= st->nhandles ||
+            !owns_message(st->handles[p.msc], m)) return RENDER_ERR_UNSUPPORTED;
+    } else if (m->kind == MSG_FENCE || m->kind == MSG_PRESENT || m->kind == MSG_FAIL) {
+        if (!owns_message(st->fence_handle, m)) return RENDER_ERR_UNSUPPORTED;
+    } else return RENDER_ERR_UNSUPPORTED;
+    switch (m->kind) {
     case MSG_STRIPS: {
-        cpu_state *st = b->state;
-        if (event->frame_id != st->metrics.frame_id || p.msc >= RASTER_JOBS) return RENDER_ERR_FRAME;
-        if (!st->pending || st->metrics.strip_ns[p.msc]) return RENDER_ERR_STATE;
+        if (!st->pending || st->strip_done[p.msc]) return RENDER_ERR_STATE;
         uint64_t upload_start = trace_now_ns();
         upload_strip(st, (uint32_t)p.msc);
         uint64_t queued = trace_now_ns();
+        st->strip_done[p.msc] = true;
         st->pending--;
         st->metrics.strip_ns[p.msc] = p.ns - p.ust;
         st->metrics.queue_ns[p.msc] = p.ust - st->metrics.submit_ns;
@@ -407,13 +460,17 @@ static int cpu_event(render_backend *b, const render_event *event)
         return RENDER_OK;
     }
     case MSG_FENCE:
-        ((cpu_state *)b->state)->metrics.server_ns = p.ns;
+        if (st->fence_done) return RENDER_ERR_STATE;
+        st->fence_done = true;
+        st->metrics.server_ns = p.ns;
         if (p.status != 0) return RENDER_ERR_DEVICE;
         return render_backend_signal(b, RENDER_EVENT_DEVICE_DONE, event->frame_id, p.ns);
     case MSG_PRESENT:
-        ((cpu_state *)b->state)->metrics.present_kind = (uint32_t)p.status / 256u;
-        ((cpu_state *)b->state)->metrics.present_mode = (uint32_t)p.status % 256u;
-        ((cpu_state *)b->state)->last_ust = p.ust; ((cpu_state *)b->state)->last_msc = p.msc;
+        if (st->present_done) return RENDER_ERR_STATE;
+        st->present_done = true;
+        st->metrics.present_kind = (uint32_t)p.status / 256u;
+        st->metrics.present_mode = (uint32_t)p.status % 256u;
+        st->last_ust = p.ust; st->last_msc = p.msc;
         return render_backend_signal(b, RENDER_EVENT_PRESENT_COMPLETE, event->frame_id, p.ns);
     case MSG_FAIL: return RENDER_ERR_DEVICE;
     default: return RENDER_ERR_UNSUPPORTED;
@@ -448,7 +505,8 @@ int render_cpu_backend(render_backend *b)
 
 bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc)
 {
-    if (b == NULL || !b->initialized || b->state == NULL) return false;
+    if (b == NULL || !b->initialized || b->state == NULL ||
+        b->ops.init != cpu_init || b->ops.event != cpu_event) return false;
     const cpu_state *st = b->state;
     if (ust) *ust = st->last_ust;
     if (msc) *msc = st->last_msc;
@@ -457,7 +515,8 @@ bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc)
 
 bool raster_frame_metrics(const render_backend *b, raster_metrics *out)
 {
-    if (!b || !b->initialized || !b->state || !out) return false;
+    if (!b || !b->initialized || !b->state || !out ||
+        b->ops.init != cpu_init || b->ops.event != cpu_event) return false;
     *out = ((const cpu_state *)b->state)->metrics;
     return out->frame_id != 0;
 }

@@ -14,6 +14,9 @@ int render_cpu_backend(render_backend *b);
 bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
 
 #define RASTER_JOBS 4u
+/* Per-frame descriptor budget; larger init storage does not enlarge UI work.
+ * Layout must bind a compact table within this budget (unused slots count). */
+#define RASTER_FRAME_GLYPH_LIMIT 4096u
 
 /* UI-only diagnostic snapshot. Worker timings arrive through work messages.
  * Times are CLOCK_MONOTONIC ns, durations are explicit; no allocation. */
@@ -39,8 +42,9 @@ typedef struct raster_scene {
     uint32_t alpha_or;
 } raster_scene;
 
-/* Render one cell row (cell_h pixel rows) into dst, whose row 0 is the first
- * pixel row of the surface (pixel = 0x00RRGGBB | alpha_or), stride in pixels.
+/* Render one cell row (cell_h pixel rows) into dst, whose row 0 is the
+ * first pixel row of the requested cell row; stride is in pixels. Callers of a
+ * full surface pass surface + row * cell_h * stride. Pixels = 0x00RRGGBB | alpha_or.
  * Scalar is the reference; SSE2 must be pixel-exact equal. */
 void raster_row_scalar(const raster_scene *s, uint32_t *dst, size_t stride_px, uint32_t row);
 void raster_row_sse2(const raster_scene *s, uint32_t *dst, size_t stride_px, uint32_t row);
@@ -61,6 +65,14 @@ void raster_row_cached(const raster_scene *s, uint32_t *dst, size_t stride_px,
 /* Aligned 8/16-pixel cells: complete cache lines with streaming stores.
  * Other sizes/alignment use the regular SSE2 kernel. Includes the store fence. */
 void raster_row_sse2_stream(const raster_scene *s, uint32_t *dst, size_t stride_px, uint32_t row);
+
+/* Same row-local destination and exact pixels, with a stop check before each
+ * cell and each <=256-pixel batch. False means interrupted: do not upload the
+ * partial row. NULL stop completes the row. Cache belongs to the worker. */
+typedef bool (*raster_stop_fn)(void *user);
+bool raster_row_cached_cancellable(const raster_scene *s, uint32_t *dst,
+    size_t stride_px, uint32_t row, raster_palette *palette,
+    raster_stop_fn stop, void *user);
 
 /* Visit dirty-row ordinals [lo,hi) of the strip list, in order. */
 typedef void (*raster_row_fn)(void *user, uint32_t row);

@@ -264,3 +264,65 @@ void raster_row_cached(const raster_scene *s, uint32_t *dst, size_t stride_px,
         }
     }
 }
+
+/* A cell row can be arbitrarily large. Keep cancellation independent of both
+ * dimensions: at most 256 output pixels per tile. Narrow cells combine pixel
+ * rows into a tile; wide cells split a pixel row. Palette construction is fixed
+ * at 256 entries, with the per-job miss budget. */
+bool raster_row_cached_cancellable(const raster_scene *s, uint32_t *dst,
+    size_t stride_px, uint32_t row, raster_palette *palette,
+    raster_stop_fn stop, void *user)
+{
+    const uint32_t ch = s->dims.cell_h;
+    const __m128i zero = _mm_setzero_si128(), aor = _mm_set1_epi32((int)s->alpha_or);
+    for (uint32_t col = 0; col < s->dims.cols; col++) {
+        if (stop && stop(user)) return false;
+        cell_geom g;
+        if (!cell_setup(s, col, &s->cells[(size_t)row * s->dims.cols + col], &g)) continue;
+        const uint32_t *table = g.cov ? palette_for(palette, g.fg, g.bg) : NULL;
+        __m128i bgv = _mm_set1_epi32((int)(g.bg | s->alpha_or));
+        __m128i fgv = _mm_set1_epi32((int)(g.fg | s->alpha_or));
+        __m128i f = _mm_unpacklo_epi8(_mm_set1_epi32((int)g.fg), zero);
+        __m128i bg = _mm_unpacklo_epi8(_mm_set1_epi32((int)g.bg), zero);
+        __m128i diff = _mm_sub_epi16(f, bg), bg255 = _mm_mullo_epi16(bg, _mm_set1_epi16(255));
+        uint32_t ystep = g.rw <= 256u ? 256u / g.rw : 1u;
+        for (uint32_t yfirst = 0; yfirst < ch;) {
+            uint32_t ny = ch - yfirst < ystep ? ch - yfirst : ystep;
+            for (uint32_t first = 0; first < g.rw;) {
+                if (stop && stop(user)) return false;
+                uint32_t count = g.rw - first < 256u ? g.rw - first : 256u;
+                uint32_t end = first + count;
+                for (uint32_t y = yfirst; y < yfirst + ny; y++) {
+                    uint32_t *d = dst + (size_t)y * stride_px + g.x0;
+                    if (g.underline && y == ch - 1u) {
+                        fill_px(d + first, count, g.fg | s->alpha_or);
+                    } else {
+                        uint32_t x = first;
+                        if (g.cov && y < g.gh && x < g.gw) {
+                            const uint8_t *src = g.cov + (size_t)y * g.cov_stride;
+                            uint32_t covered_end = g.gw < end ? g.gw : end;
+                            for (; covered_end - x >= 4u; x += 4u) {
+                                __m128i v;
+                                if (table) {
+                                    v = _mm_or_si128(_mm_setr_epi32((int)table[src[x]], (int)table[src[x+1]],
+                                        (int)table[src[x+2]], (int)table[src[x+3]]), aor);
+                                } else {
+                                    uint32_t cov4;
+                                    memcpy(&cov4, src+x, 4);
+                                    v = cov4 == 0 ? bgv : cov4 == UINT32_MAX ? fgv : blend4(diff,bg255,aor,cov4);
+                                }
+                                _mm_storeu_si128((__m128i *)(void *)(d+x), v);
+                            }
+                            for (; x < covered_end; x++)
+                                d[x] = (table ? table[src[x]] : blend_px(g.fg,g.bg,src[x])) | s->alpha_or;
+                        }
+                        fill_px(d+x, end-x, g.bg | s->alpha_or);
+                    }
+                }
+                first = end;
+            }
+            yfirst += ny;
+        }
+    }
+    return true;
+}

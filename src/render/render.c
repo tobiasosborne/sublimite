@@ -1,4 +1,5 @@
 #include "render/render.h"
+#include "raster/raster.h"
 #include "trace/trace.h"
 #include <limits.h>
 #include <string.h>
@@ -141,13 +142,8 @@ static int render_atlas_validate(const render_grid *g, size_t *bytes)
     return RENDER_OK;
 }
 
-int render_grid_validate(const render_grid *g)
+static int render_cells_validate(const render_grid *g)
 {
-    int rc = render_grid_storage(g);
-    if (rc != RENDER_OK) return rc;
-    size_t bytes;
-    rc = render_atlas_validate(g, &bytes);
-    if (rc != RENDER_OK) return rc;
     size_t count = (size_t)g->dims.cols * g->dims.rows;
     for (size_t i = 0; i < count; i++) {
         const render_cell *c = &g->cells[i];
@@ -174,6 +170,16 @@ int render_grid_validate(const render_grid *g)
         }
     }
     return RENDER_OK;
+}
+
+int render_grid_validate(const render_grid *g)
+{
+    int rc = render_grid_storage(g);
+    if (rc != RENDER_OK) return rc;
+    size_t bytes;
+    rc = render_atlas_validate(g, &bytes);
+    if (rc != RENDER_OK) return rc;
+    return render_cells_validate(g);
 }
 
 void render_trace_device_done(void *user, uint32_t frame_id, uint64_t ns)
@@ -284,13 +290,17 @@ int render_backend_submit(render_backend *b, const render_grid *g, const render_
     if (b->full_required && !g->full_frame) return RENDER_ERR_STRIPS;
     if (g->glyph_count > b->config.max_glyphs || g->page_count > b->config.max_pages)
         return RENDER_ERR_CAPACITY;
+    /* CPU submissions have a fixed descriptor-work budget, checked before
+     * dereferencing or scanning the table, including zero-damage frames. */
+    if ((b->info.capabilities & RENDER_CAP_RASTER_POOL) &&
+        g->glyph_count > RASTER_FRAME_GLYPH_LIMIT) return RENDER_ERR_CAPACITY;
     size_t bytes;
     rc = render_atlas_validate(g, &bytes);
     if (rc != RENDER_OK) return rc;
     if (bytes > b->config.max_atlas_bytes) return RENDER_ERR_CAPACITY;
     rc = render_strips_validate(g, strips, count);
     if (rc != RENDER_OK) return rc;
-    rc = render_grid_validate(g);
+    rc = render_cells_validate(g);
     if (rc != RENDER_OK) return rc;
     /* Implementations must not signal inside submit: adapter activates only
      * after success. Completion mailboxes are dispatched by UI after return. */

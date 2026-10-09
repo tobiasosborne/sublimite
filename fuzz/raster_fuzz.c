@@ -10,12 +10,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 typedef struct rd { const uint8_t *p; size_t n, i; } rd;
 static uint32_t take(rd *r) { return r->n ? r->p[r->i++ % r->n] : 0; }
 
+typedef struct stop_state {uint32_t checks, limit;} stop_state;
+static bool stop_batch(void *u)
+{
+    stop_state *s = u;
+    return ++s->checks >= s->limit;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 8) return 0;
     rd r = {data, size, 0};
     render_dims d = {1 + take(&r) % 40, 1 + take(&r) % 3, 1 + take(&r) % 32, 1 + take(&r) % 32};
     if (take(&r) & 1u) d.cell_w = (take(&r) & 1u) ? 8u : 16u;
+    /* Cross 256-pixel cancellation batches as well as ordinary font sizes. */
+    if ((take(&r) & 15u) == 0) d.cell_w = 255u + take(&r);
     size_t n = (size_t)d.cols * d.rows;
     render_cell cells[120];
     uint8_t page0[32 * 32];
@@ -61,6 +70,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         memset(b2, 0xa5, px * 4);
         raster_row_cached(&s, b2, stride, row, &palette);
         if (memcmp(a, b2, px * 4) != 0 || palette.rebuilds > RASTER_PALETTE_SLOTS) abort();
+        memset(b2, 0xa5, px * 4);
+        if (!raster_row_cached_cancellable(&s,b2,stride,row,&palette,NULL,NULL) ||
+            memcmp(a,b2,px*4) != 0) abort();
+        memset(b2,0xa5,px*4);
+        stop_state stop = {0,1u+take(&r)%32u};
+        bool done = raster_row_cached_cancellable(&s,b2,stride,row,&palette,stop_batch,&stop);
+        if (done) { if (memcmp(a,b2,px*4) != 0) abort(); }
+        else {
+            if (stop.checks != stop.limit) abort();
+            /* Independent work bound: between checks at most 256 pixel stores.
+             * Guard padding must stay untouched even on an interrupted row. */
+            size_t written = 0;
+            for (size_t i=0;i<px;i++) if (b2[i] != 0xa5a5a5a5u) written++;
+            if (written > (size_t)(stop.checks-1u)*256u) abort();
+            for (uint32_t y=0;y<d.cell_h;y++)
+                for (size_t x=(size_t)d.cols*d.cell_w;x<stride;x++)
+                    if (b2[(size_t)y*stride+x] != 0xa5a5a5a5u) abort();
+        }
     }
     free(a); free(b2);
     (void)n;
