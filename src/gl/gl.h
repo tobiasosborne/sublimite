@@ -1,7 +1,9 @@
 #ifndef EDIT_GL_H
 #define EDIT_GL_H
 #include "render/render.h"
-/* Init-only environment: EDIT_GL_VBO=orphan|persistent (default orphan),
+/* Opt-in P2.4b experiment: EDIT_GL_UPLOAD=subdata|orphan|persistent.
+ * Unset keeps the existing renderer and EDIT_GL_VBO behavior.
+ * Init-only environment: EDIT_GL_VBO=orphan|persistent (default orphan),
  * EDIT_GL_SWAP_INTERVAL=0|1 (default 0). Init-only loader fault seams:
  * EDIT_GL_EGL_LIBRARY / EDIT_GL_GL_LIBRARY override the default sonames.
  * No GL/EGL libraries are linked. */
@@ -16,4 +18,14 @@ uint64_t gl_displayed_msc(const render_backend *b);
 /* Test-only diagnostic: retained framebuffer, top-left RGBA8, caller storage.
  * glReadPixels is synchronous; never use on a production typing path. */
 int gl_read_pixels(render_backend *b, uint8_t *rgba, size_t bytes);
+/* Experimental mapped-cell lease (UI, allocation/native-call free). Acquire
+ * only when idle; BUSY leaves grid/output unchanged. preserve copies retained
+ * cells between mapped slots for partial layout. Full layout uses false.
+ * Fill grid.cells directly, then gl_cells_submit: on success cells becomes
+ * NULL and all saved aliases are read-only until that slot is reacquired.
+ * Ordinary render_backend_submit with caller-owned cells still copies them.
+ * Do not use render_backend_submit directly with a writable leased grid. */
+int gl_cells_acquire(render_backend *b, render_grid *g, bool preserve);
+int gl_cells_submit(render_backend *b, render_grid *g,
+                    const render_strip *strips, size_t count);
 #endif

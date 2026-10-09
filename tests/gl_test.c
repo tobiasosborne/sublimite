@@ -10,6 +10,8 @@
 #define gl_device_name gl_test_device_name
 #define gl_displayed_msc gl_test_displayed_msc
 #define gl_read_pixels gl_test_read_pixels
+#define gl_cells_acquire gl_test_cells_acquire
+#define gl_cells_submit gl_test_cells_submit
 #include "../src/gl/gl.c"
 #undef render_gl_backend
 #undef gl_present_complete
@@ -17,6 +19,8 @@
 #undef gl_device_name
 #undef gl_displayed_msc
 #undef gl_read_pixels
+#undef gl_cells_acquire
+#undef gl_cells_submit
 static EGLBoolean gl_reject_bind(EGLDisplay display, EGLSurface draw,
                                  EGLSurface read, EGLContext context)
 { (void)display; (void)draw; (void)read; (void)context; return EGL_FALSE; }
@@ -52,6 +56,147 @@ static int gl_snapshot_test(void)
         if (mode!=0) GL_CHECK(memcmp(instances,mapped,4*sizeof(gl_instance))==0);
     }
     puts("gl_test: snapshot input->submit: 10000 frames per VBO mode incl. changing atlas, 0 allocations, no native calls");
+    return 0;
+}
+/* Native dispatch encodes timeout/signalled/failed in the fake fence handle;
+ * no globals, no timing assumptions and no claims of GPU completion. */
+static GLenum gl_ring_script_wait(GLsync fence,GLbitfield flags,GLuint64 timeout)
+{
+    if (flags!=0 || timeout!=0) return GL_WAIT_FAILED;
+    if ((uintptr_t)fence==1) return GL_TIMEOUT_EXPIRED;
+    return (uintptr_t)fence==2 ? GL_ALREADY_SIGNALED : GL_WAIT_FAILED;
+}
+static void gl_ring_script_delete(GLsync fence) { (void)fence; }
+static int gl_ring_unit_test(void)
+{
+    render_cell slots[GL_CELL_RING][12], cpu[12]; uint64_t dirty[1]; render_grid g;
+    gl_strip strips[2]; uint8_t seen[1], cache[1], atlas_dirty[1]; size_t offsets[1];
+    gl_state s={.upload=GL_UPLOAD_PERSISTENT,.cell_bytes=sizeof cpu,.dims={4,3,4,4},
+        .strips=strips,.glyph_seen=seen,.atlas_cache=cache,.atlas_dirty=atlas_dirty,
+        .atlas_width=1,.atlas_height=1,.page_offsets=offsets,
+        .gClientWaitSync=gl_ring_script_wait,.gDeleteSync=gl_ring_script_delete};
+    for (uint32_t i=0;i<GL_CELL_RING;i++) {
+        s.ring[i].cells=slots[i];
+        for (size_t j=0;j<12;j++) slots[i][j]=(render_cell){0,RENDER_NO_SLOT,0,0,0,0};
+    }
+    render_backend b={0}; GL_CHECK(gl_test_factory(&b)==RENDER_OK);
+    b.state=&s; b.initialized=true;
+    b.config=(render_config){.dims=s.dims,.max_width=16,.max_height=12,.max_cells=12};
+    GL_CHECK(render_grid_init(&g,s.dims,cpu,12,dirty,1)==RENDER_OK);
+    s.ring[0].fence=(GLsync)(uintptr_t)1;
+    GL_CHECK(gl_test_cells_acquire(&b,&g,false)==RENDER_ERR_BUSY && g.cells==cpu && !s.leased);
+    GL_CHECK(gl_ring_poll(&s)==RENDER_OK && s.ring[0].fence!=NULL);
+    s.ring[0].fence=(GLsync)(uintptr_t)3;
+    GL_CHECK(gl_ring_poll(&s)==RENDER_ERR_DEVICE && s.ring[0].fence!=NULL);
+    s.ring[0].fence=(GLsync)(uintptr_t)2;
+    GL_CHECK(gl_ring_poll(&s)==RENDER_OK && s.ring[0].fence==NULL);
+    for (uint32_t id=1;id<=10;id++) {
+        edit_malloc_guard_begin();
+        int rc=gl_test_cells_acquire(&b,&g,id!=1);
+        if (rc==RENDER_OK) rc=render_frame_begin(&g,id);
+        if (rc==RENDER_OK) {
+            if (id!=1 && g.cells[0].bg!=id-1) rc=RENDER_ERR_DEVICE;
+            g.cells[0].bg=id;
+            rc=render_mark_full(&g);
+        }
+        render_strip full={0,3};
+        if (rc==RENDER_OK) rc=gl_test_cells_submit(&b,&g,&full,1);
+        size_t allocations=edit_malloc_guard_end();
+        GL_CHECK(rc==RENDER_OK && allocations==0 && g.cells==NULL);
+        GL_CHECK(s.ring_current==(id-1)%GL_CELL_RING && slots[s.ring_current][0].bg==id);
+        GL_CHECK(gl_test_cells_acquire(&b,&g,true)==RENDER_ERR_BUSY && g.cells==NULL);
+        s.ring[s.ring_current].fence=(GLsync)(uintptr_t)2;
+        GL_CHECK(gl_ring_poll(&s)==RENDER_OK);
+        /* Adapter completions alone are scripted; the ring unit is not a
+         * native lifecycle test. */
+        b.active=false;
+    }
+    GL_CHECK(gl_test_cells_acquire(&b,&g,true)==RENDER_OK);
+    render_cell *lease=g.cells;
+    GL_CHECK(gl_test_cells_acquire(&b,&g,true)==RENDER_ERR_BUSY && g.cells==lease);
+    GL_CHECK(render_frame_begin(&g,11)==RENDER_OK && render_mark_full(&g)==RENDER_OK);
+    g.cells[0].reserved=1; render_strip full={0,3};
+    GL_CHECK(gl_test_cells_submit(&b,&g,&full,1)==RENDER_ERR_CELL && g.cells==lease && s.leased);
+    g.cells[0].reserved=0;
+    GL_CHECK(gl_test_cells_submit(&b,&g,&full,1)==RENDER_OK && g.cells==NULL);
+    b.active=false;
+    /* Ordinary grids retain the frozen copy-on-submit guarantee. */
+    for (size_t i=0;i<12;i++) cpu[i]=(render_cell){0,RENDER_NO_SLOT,0,0x123456,0,0};
+    g.cells=cpu;
+    GL_CHECK(render_frame_begin(&g,12)==RENDER_OK && render_mark_full(&g)==RENDER_OK);
+    GL_CHECK(render_backend_submit(&b,&g,&full,1)==RENDER_OK);
+    cpu[0].bg=0;
+    GL_CHECK(slots[s.ring_current][0].bg==0x123456);
+    puts("gl_test: cell ring PASS (triple wrap, timeout/failed fences, lease revocation, retained cells, retry, copy fallback, 0 allocations)");
+    return 0;
+}
+/* Exercise the merged pacing callback itself. Only presentation/pumping are
+ * scripted: this checks CPU scroll/lease ownership, not native T5/T6 or MSC. */
+static int gl_pace_test_pump(gl_driver *d);
+#define main gl_test_bench_main
+#define gl_cells_acquire gl_test_cells_acquire
+#define gl_cells_submit gl_test_cells_submit
+#define gl_displayed_msc gl_test_displayed_msc
+#define gl_driver_pump gl_pace_test_pump
+#include "../bench/gl_bench.c"
+#undef main
+#undef gl_cells_acquire
+#undef gl_cells_submit
+#undef gl_displayed_msc
+#undef gl_driver_pump
+static int gl_pace_test_present(render_backend *b,uint32_t id)
+{
+    gl_state *s=b->state;
+    if (id!=b->active_frame) return RENDER_ERR_FRAME;
+    s->ring[s->ring_current].fence=(GLsync)(uintptr_t)2;
+    return RENDER_OK;
+}
+static int gl_pace_test_pump(gl_driver *d)
+{
+    render_backend *b=d->backend; gl_state *s=b->state;
+    int rc=gl_ring_poll(s);
+    if (rc==RENDER_OK) rc=render_backend_signal(b,RENDER_EVENT_DEVICE_DONE,b->active_frame,bench_now_ns());
+    if (rc==RENDER_OK) rc=render_backend_signal(b,RENDER_EVENT_PRESENT_COMPLETE,b->active_frame,bench_now_ns());
+    s->msc++;
+    return rc;
+}
+static int gl_pace_lease_test(void)
+{
+    const char *selected=getenv("EDIT_GL_UPLOAD"); char saved[16];
+    bool restore=selected!=NULL;
+    if (restore) { GL_CHECK(strlen(selected)<sizeof saved); strcpy(saved,selected); }
+    GL_CHECK(setenv("EDIT_GL_UPLOAD","persistent",1)==0);
+    render_cell slots[GL_CELL_RING][12],cpu[12],previous[12]; uint64_t dirty[1]; render_grid g;
+    gl_strip strips[2]; uint8_t seen[95],cache[16],atlas_dirty[4],pixels[16]={0}; size_t offsets[1];
+    uint32_t images[95][4]; render_glyph glyphs[95];
+    render_atlas_page page={pixels,sizeof pixels,4,4,4};
+    gl_state s={.upload=GL_UPLOAD_PERSISTENT,.cell_bytes=sizeof cpu,.dims={4,3,4,4},
+        .strips=strips,.glyph_seen=seen,.atlas_cache=cache,.atlas_dirty=atlas_dirty,
+        .atlas_width=4,.atlas_height=4,.page_offsets=offsets,.images=images,
+        .gClientWaitSync=gl_ring_script_wait,.gDeleteSync=gl_ring_script_delete};
+    for (uint32_t i=0;i<GL_CELL_RING;i++) s.ring[i].cells=slots[i];
+    for (uint32_t i=0;i<95;i++) glyphs[i]=(render_glyph){32u+i,0,0,0,4,4};
+    render_backend b={0}; GL_CHECK(gl_test_factory(&b)==RENDER_OK);
+    b.state=&s; b.initialized=true; b.ops.present=gl_pace_test_present;
+    gl_bench_hooks hooks={0};
+    b.config=(render_config){.dims=s.dims,.max_width=16,.max_height=12,.max_cells=12,
+        .max_glyphs=95,.max_pages=1,.max_atlas_bytes=16,
+        .hooks={gl_bench_device,gl_bench_complete,&hooks}};
+    GL_CHECK(render_grid_init(&g,s.dims,cpu,12,dirty,1)==RENDER_OK);
+    g.pages=&page; g.page_count=1; g.glyphs=glyphs; g.glyph_count=95;
+    uint32_t id=0,seed=UINT32_C(0x37216e9d);
+    gl_bench_fill(cpu,12,&seed);
+    gl_driver driver={.backend=&b}; gl_pace_rig rig={&driver,&g,&hooks,&id,&seed};
+    for (uint32_t frame=0;frame<10;frame++) {
+        render_pace_frame out={0};
+        GL_CHECK(gl_pace_frame(&rig,frame!=0,&out)==0);
+        GL_CHECK(g.cells==NULL && !b.active && !s.leased);
+        GL_CHECK(s.ring_current==frame%GL_CELL_RING && out.msc==frame+1u);
+        if (frame!=0) GL_CHECK(memcmp(slots[s.ring_current],previous+4,8*sizeof(render_cell))==0);
+        memcpy(previous,slots[s.ring_current],sizeof previous);
+    }
+    GL_CHECK(restore ? setenv("EDIT_GL_UPLOAD",saved,1)==0 : unsetenv("EDIT_GL_UPLOAD")==0);
+    puts("gl_test: paced persistent scroll PASS (merged callback, lease reacquire/revoke, retained rows, ring wrap, 0 allocations; scripted completion)");
     return 0;
 }
 /* The frozen suite's old guard also encloses present/event. Session 5 scopes
@@ -135,8 +280,9 @@ static int gl_readback_init(render_backend *b,const render_config *cfg)
     gl_state *s=b->state; memset(s,0,sizeof *s);
     s->platform=cfg->platform; s->dims=cfg->dims;
     s->max_width=cfg->max_width; s->max_height=cfg->max_height;
+    if (gl_select_upload(s)!=RENDER_OK) return RENDER_ERR_ARG;
     const char *mode=getenv("EDIT_GL_VBO");
-    s->requested_persistent=mode!=NULL && strcmp(mode,"persistent")==0;
+    s->requested_persistent=s->upload==GL_UPLOAD_LEGACY && mode!=NULL && strcmp(mode,"persistent")==0;
     int rc=gl_context_init(s,cfg,0);
     if (rc==RENDER_OK) {
         if (!s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) rc=RENDER_ERR_INIT;
@@ -158,6 +304,8 @@ static int gl_readback_unit_test(void)
         gl_driver_cleanup(&d); puts("gl_test: readback unit SKIP: EGL context unavailable"); return 0;
     }
     GL_CHECK(rc==RENDER_OK);
+    const char *upload=getenv("EDIT_GL_UPLOAD");
+    if (upload!=NULL) GL_CHECK(strcmp(gl_buffer_mode(&b),upload)==0);
     uint8_t coverage[256],wide[512];
     for (size_t i=0;i<256;i++) coverage[i]=(uint8_t)i;
     memset(wide,255,sizeof wide);
@@ -172,13 +320,18 @@ static int gl_readback_unit_test(void)
     memcpy(expected,cells,sizeof cells);
     GL_CHECK(render_grid_init(&grid,cfg.dims,cells,12,dirty,1)==RENDER_OK);
     grid.pages=pages; grid.page_count=2; grid.glyphs=glyphs; grid.glyph_count=2;
+    bool direct=upload!=NULL && strcmp(upload,"persistent")==0;
+    if (direct) {
+        GL_CHECK(gl_cells_acquire(&b,&grid,false)==RENDER_OK);
+        memcpy(grid.cells,expected,sizeof expected);
+    }
     edit_malloc_guard_begin();
     rc=render_frame_begin(&grid,1);
     if (rc==RENDER_OK) rc=render_mark_full(&grid);
     render_strip full={0,3};
-    if (rc==RENDER_OK) rc=render_backend_submit(&b,&grid,&full,1);
+    if (rc==RENDER_OK) rc=direct ? gl_cells_submit(&b,&grid,&full,1) : render_backend_submit(&b,&grid,&full,1);
     size_t allocations=edit_malloc_guard_end();
-    GL_CHECK(rc==RENDER_OK && allocations==0);
+    GL_CHECK(rc==RENDER_OK && allocations==0 && (!direct || grid.cells==NULL));
     memset(cells,0,sizeof cells); memset(glyphs,0,sizeof glyphs); memset(pages,0,sizeof pages);
     gl_state *s=b.state; GL_CHECK(gl_bind(s)); gl_upload_pending(s); gl_draw(s);
     uint8_t rgba[64*48*4]; GL_CHECK(gl_test_read_pixels(&b,rgba,sizeof rgba)==RENDER_OK);
@@ -195,7 +348,7 @@ static int gl_readback_unit_test(void)
     }
     /* White-box retained-damage checks exercise the same GL drawing code.
      * No display or T6 completion is fabricated to release the adapter slot. */
-    memcpy(cells,expected,sizeof cells); grid.page_count=0; grid.glyph_count=0;
+    memcpy(cells,expected,sizeof cells); grid.cells=cells; grid.page_count=0; grid.glyph_count=0;
     for (size_t i=0;i<12;i++) {
         cells[i].glyph_index=0; cells[i].atlas_slot=RENDER_NO_SLOT; cells[i].attrs=0;
         if (i>=4 && i<8) cells[i].bg=0x345678;
@@ -210,6 +363,24 @@ static int gl_readback_unit_test(void)
         GL_CHECK(updated[off]==0x34 && updated[off+1]==0x56 && updated[off+2]==0x78 && updated[off+3]==255);
     GL_CHECK(gl_submit(&b,&grid,NULL,0)==RENDER_OK); gl_upload_pending(s); gl_draw(s);
     GL_CHECK(gl_test_read_pixels(&b,rgba,sizeof rgba)==RENDER_OK && memcmp(rgba,updated,sizeof rgba)==0);
+    if (direct) {
+        /* Actual mapped layout/readback across more than one ring revolution,
+         * with strip-only writes and retained-row preservation. */
+        b.active=false;
+        for (uint32_t id=2;id<11;id++) {
+            GL_CHECK(gl_cells_acquire(&b,&grid,true)==RENDER_OK);
+            GL_CHECK(render_frame_begin(&grid,id)==RENDER_OK);
+            for (size_t i=4;i<8;i++) grid.cells[i].bg=0x100000u+id;
+            GL_CHECK(render_mark_rows(&grid,1,1)==RENDER_OK);
+            GL_CHECK(gl_cells_submit(&b,&grid,&middle,1)==RENDER_OK && grid.cells==NULL);
+            gl_upload_pending(s); gl_draw(s);
+            GL_CHECK(gl_test_read_pixels(&b,rgba,sizeof rgba)==RENDER_OK);
+            GL_CHECK(memcmp(rgba,updated,64*16*4)==0 && memcmp(rgba+64*32*4,updated+64*32*4,64*16*4)==0);
+            GL_CHECK(rgba[64*16*4]==0x10 && rgba[64*16*4+1]==0 && rgba[64*16*4+2]==id);
+            b.active=false;
+        }
+        puts("gl_test: coherent mapped cells readback PASS (direct writes, triple ring wrap, retained strip)");
+    }
     printf("gl_test: readback unit PASS (4x3, all 256 alpha values, inverse, underline, wide, snapshot), VBO=%s renderer=%s\n",
         gl_buffer_mode(&b),gl_device_name(&b));
     gl_driver_cleanup(&d); return 0;
@@ -376,6 +547,12 @@ int main(int argc, char **argv)
     trace_init(); GL_CHECK(trace_thread_register()>=0);
     GL_CHECK(gl_snapshot_test()==0);
     GL_CHECK(gl_trace_unit_test()==0);
+    GL_CHECK(gl_ring_unit_test()==0);
+    GL_CHECK(gl_pace_lease_test()==0);
+    /* The trace registry has a finite lifetime thread budget. Run its frozen
+     * conformance before the extra per-variant native init workers. */
+    GL_CHECK(strips_test()==0 && arguments_test()==0 && cells_test()==0);
+    GL_CHECK(async_test()==0 && trace_test()==0);
     render_backend b={0}; GL_CHECK(render_gl_backend(&b)==RENDER_OK);
     if (getenv("DISPLAY")==NULL || getenv("DISPLAY")[0]=='\0') {
         render_config cfg={.dims={4,3,4,4},.max_width=16,.max_height=12,.max_cells=12,
@@ -387,12 +564,20 @@ int main(int argc, char **argv)
         puts("gl_test: SKIP no DISPLAY; clean unsupported init verified"); return 0;
     }
     GL_CHECK(gl_failure_test()==0);
-    GL_CHECK(gl_readback_unit_test()==0);
+    const char *selected=getenv("EDIT_GL_UPLOAD");
+    if (selected!=NULL) GL_CHECK(gl_readback_unit_test()==0);
+    else {
+        const char *modes[]={"subdata","orphan","persistent"};
+        GL_CHECK(gl_readback_unit_test()==0); /* legacy default stays covered */
+        for (size_t i=0;i<3;i++) {
+            GL_CHECK(setenv("EDIT_GL_UPLOAD",modes[i],1)==0);
+            GL_CHECK(gl_readback_unit_test()==0);
+        }
+        GL_CHECK(unsetenv("EDIT_GL_UPLOAD")==0);
+    }
     int pixels_result=gl_pixels_test();
     GL_CHECK(pixels_result==0 || pixels_result==2);
     if (pixels_result==2) {
-        GL_CHECK(strips_test()==0 && arguments_test()==0 && cells_test()==0);
-        GL_CHECK(async_test()==0 && trace_test()==0);
         puts("gl_test: PASS (snapshot law 2, failure cleanup, frozen grid/adapter checks; native lifecycle SKIP)");
         return 0;
     }

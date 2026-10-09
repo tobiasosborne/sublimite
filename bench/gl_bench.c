@@ -12,6 +12,27 @@ static void gl_bench_device(void *u,uint32_t id,uint64_t ns)
 { gl_bench_hooks *h=u; h->device_ns=ns; h->frame=id; render_trace_device_done(NULL,id,ns); }
 static void gl_bench_complete(void *u,uint32_t id,uint64_t ns)
 { gl_bench_hooks *h=u; h->complete_ns=ns; h->frame=id; render_trace_present_complete(NULL,id,ns); }
+static void gl_bench_load(char *load,size_t capacity)
+{
+    bench__copy(load,capacity,"unknown");
+    FILE *f=fopen("/proc/loadavg","r");
+    if (f==NULL) return;
+    char value[32];
+    if (fscanf(f,"%31s",value)==1) bench__copy(load,capacity,value);
+    fclose(f);
+}
+static int gl_bench_report(const char *name,const bench_samples *samples,uint64_t gate50,uint64_t gate99)
+{
+    if (getenv("EDIT_GL_UPLOAD")==NULL) return bench_report(name,samples,gate50,gate99);
+    uint64_t p50=bench_p50(samples),p99=bench_p99(samples),lo=0,hi=0;
+    bench_ci95(samples,0.50,&lo,&hi);
+    bool pass=samples->n!=0 && samples->dropped==0 && (gate50==0 || p50<=gate50) && (gate99==0 || p99<=gate99);
+    char load[32]; gl_bench_load(load,sizeof load);
+    printf("BENCH name=%s n=%zu p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=%llu gate_p99=%llu pass=%d status=TRACK evidence=(M) power=%s load1=%s upload=%s\n",
+        name,samples->n,(unsigned long long)p50,(unsigned long long)p99,(unsigned long long)lo,(unsigned long long)hi,
+        (unsigned long long)gate50,(unsigned long long)gate99,pass ? 1 : 0,bench_evidence_tag(),load,getenv("EDIT_GL_UPLOAD"));
+    return pass ? 0 : 1;
+}
 static uint32_t gl_bench_random(uint32_t *seed)
 { uint32_t x=*seed; x^=x<<13; x^=x>>17; x^=x<<5; *seed=x; return x; }
 static void gl_bench_fill(render_cell *cells,size_t count,uint32_t *seed)
@@ -25,12 +46,23 @@ static void gl_bench_fill(render_cell *cells,size_t count,uint32_t *seed)
 static int gl_bench_snapshot(gl_driver *d,render_grid *g,uint32_t id,bool full,uint64_t *ingress)
 {
     edit_malloc_guard_begin();
-    int rc=render_frame_begin(g,id);
+    *ingress=bench_now_ns();
+    const char *upload=getenv("EDIT_GL_UPLOAD");
+    bool direct=upload!=NULL && strcmp(upload,"persistent")==0;
+    int rc=direct ? gl_cells_acquire(d->backend,g,!full) : RENDER_OK;
+    if (rc==RENDER_OK) rc=render_frame_begin(g,id);
+    /* Same synthetic layout workload in all experiments, written directly
+     * into the CPU grid or mapped lease. Start timing before lease/layout. */
+    if (rc==RENDER_OK && upload!=NULL) {
+        uint32_t seed=UINT32_C(0x37216e9d)^id;
+        if (full) gl_bench_fill(g->cells,(size_t)g->dims.cols*g->dims.rows,&seed);
+        else g->cells[(size_t)(g->dims.rows/2)*g->dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
+    }
     if (rc==RENDER_OK) rc=full ? render_mark_full(g) : render_mark_rows(g,g->dims.rows/2,1);
     render_strip strips[120]; size_t count=0;
     if (rc==RENDER_OK) rc=render_dirty_strips(g,strips,120,&count);
-    *ingress=bench_now_ns();
-    if (rc==RENDER_OK) rc=render_backend_submit(d->backend,g,strips,count);
+    if (upload==NULL) *ingress=bench_now_ns(); /* preserve legacy timing */
+    if (rc==RENDER_OK) rc=direct ? gl_cells_submit(d->backend,g,strips,count) : render_backend_submit(d->backend,g,strips,count);
     size_t allocations=edit_malloc_guard_end();
     return allocations==0 ? rc : RENDER_ERR_DEVICE;
 }
@@ -86,17 +118,26 @@ static int gl_pace_frame(void *user, bool scrolling, render_pace_frame *out)
     uint32_t id = ++*r->id;
     uint64_t start = bench_now_ns();
     edit_malloc_guard_begin();
-    if (scrolling) {
+    const char *upload = getenv("EDIT_GL_UPLOAD");
+    bool direct = upload != NULL && strcmp(upload,"persistent") == 0;
+    /* Submit revokes a mapped lease. Acquire before reading retained cells or
+     * mutating the next scroll; baseline initializes a fresh region in full. */
+    int rc = direct ? gl_cells_acquire(b,g,scrolling) : RENDER_OK;
+    if (rc == RENDER_OK && upload != NULL && !scrolling) {
+        *r->seed = UINT32_C(0x37216e9d);
+        gl_bench_fill(g->cells,(size_t)g->dims.cols * g->dims.rows,r->seed);
+    }
+    if (rc == RENDER_OK && scrolling) {
         size_t n = (size_t)g->dims.cols * g->dims.rows;
         memmove(g->cells,g->cells + g->dims.cols,(n - g->dims.cols) * sizeof *g->cells);
         gl_bench_fill(g->cells + n - g->dims.cols,g->dims.cols,r->seed);
     }
-    int rc = render_frame_begin(g,id);
+    if (rc == RENDER_OK) rc = render_frame_begin(g,id);
     if (rc == RENDER_OK) rc = render_mark_full(g);
     render_strip strips[120]; size_t count = 0;
     if (rc == RENDER_OK) rc = render_dirty_strips(g,strips,120,&count);
     uint64_t submit_start = bench_now_ns();
-    if (rc == RENDER_OK) rc = render_backend_submit(b,g,strips,count);
+    if (rc == RENDER_OK) rc = direct ? gl_cells_submit(b,g,strips,count) : render_backend_submit(b,g,strips,count);
     uint64_t submit_end = bench_now_ns();
     size_t allocations = edit_malloc_guard_end();
     if (rc != RENDER_OK || allocations) return -1;
@@ -129,11 +170,11 @@ static void gl_scroll_track(gl_driver *driver, render_grid *grid, gl_bench_hooks
     gl_pace_rig r = {driver,grid,hooks,id,seed};
     render_pace_run(stdout,name,names,sizeof names / sizeof names[0],gl_pace_frame,&r);
 }
-static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
+static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only)
 {
     char track_name[80]; snprintf(track_name,sizeof track_name,"A_egl_scroll_600_%upx",px);
     const char *skip_reason = render_pace_skip_reason(getenv("DISPLAY"));
-    if (skip_reason) {
+    if (skip_reason && !upload_only) {
         render_pace_skip(stdout,track_name,skip_reason);
         if (scroll_only) return 0;
     }
@@ -155,13 +196,13 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
         .hooks={gl_bench_device,gl_bench_complete,&hooks}};
     int rc=gl_driver_prepare(&driver,&backend,&cfg);
     if (rc!=RENDER_OK) {
-        if (!skip_reason) render_pace_skip(stdout,track_name,"X11_unavailable");
+        if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"X11_unavailable");
         printf("BENCH name=egl_init_%upx status=SKIP reason=X11_unavailable result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return scroll_only ? 0 : 2;
     }
     rc=gl_driver_init(&driver);
     if (rc!=RENDER_OK) {
-        if (!skip_reason) render_pace_skip(stdout,track_name,"EGL_or_matching_Present_unsupported");
+        if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"EGL_or_matching_Present_unsupported");
         printf("BENCH name=egl_init_%upx status=SKIP reason=EGL_or_matching_Present_unsupported result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return scroll_only ? 0 : 2;
     }
@@ -170,6 +211,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
         gl_scroll_track(&driver,&grid,&hooks,&id,&seed,track_name);
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 0;
     }
+    if (getenv("EDIT_GL_UPLOAD")!=NULL) puts("egl_bench: layout=synthetic_cell_fill G3=layout_to_T5 G1=layout_to_T4; editor ingress/mutation outside this microbench");
     printf("egl_bench: px=%u VBO=%s surface=2880x1800 cells=%zu timing=T5_after_SwapBuffers minimap=absent allowance_ns=180000(E) indicative=concurrent_workers\n",
            px,gl_buffer_mode(&backend),ncells);
     printf("egl_bench: renderer=%s native_window=%ux%u swap_interval=%s T6=Present_PIXMAP_Complete\n",gl_device_name(&backend),driver.platform.width,driver.platform.height,getenv("EDIT_GL_SWAP_INTERVAL"));
@@ -177,7 +219,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
     uint64_t sample_buf[10000]; bench_samples samples;
     bench_samples_init(&samples,sample_buf,2000); (void)bench_add(&samples,driver.init_ns);
     char name[80]; int failed=0;
-    if (px==15) failed=bench_report("init_cost",&samples,0,0);
+    if (px==15) failed=gl_bench_report("init_cost",&samples,0,0);
     else printf("egl_bench: init_cost_30px_ns=%llu TRACK (M)%s\n",(unsigned long long)driver.init_ns,bench_evidence_tag());
     size_t warm=quick ? 20 : 200, n=quick ? 100 : 2000;
     for (size_t i=0;i<warm;i++) GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
@@ -189,20 +231,25 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
         (void)bench_add(&samples,elapsed);
     }
     (void)snprintf(name,sizeof name,"full_frame_warm_%upx",px);
-    bool indicative=strcmp(bench_evidence_tag(),"[AC]")!=0;
+    bool experiment=getenv("EDIT_GL_UPLOAD")!=NULL;
+    bool indicative=experiment || strcmp(bench_evidence_tag(),"[AC]")!=0;
     printf("egl_bench: %s reference_gate_p50_ns=5000000 reference_gate_p99_ns=5560000(G) verdict=%s\n",
-        name,indicative ? "TRACK_battery" : "gate_pending_quiet_box");
-    failed|=bench_report(name,&samples,indicative ? 0 : 5000000,indicative ? 0 : 5560000);
+        name,experiment ? "TRACK_shared_box" : (indicative ? "TRACK_battery" : "gate_pending_quiet_box"));
+    failed|=gl_bench_report(name,&samples,indicative ? 0 : 5000000,indicative ? 0 : 5560000);
     printf("egl_bench: mean_submit_ns=%llu mean_present_ns=%llu mean_fence_poll_ns=%llu (M)%s\n",
         (unsigned long long)(submit_total/n),(unsigned long long)(present_total/n),(unsigned long long)(fence_total/n),bench_evidence_tag());
     if (px==15) {
         bench_samples_init(&samples,sample_buf,2000);
         for (size_t i=0;i<n;i++) {
-            cells[(size_t)(dims.rows/2)*dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
+            if (!experiment) cells[(size_t)(dims.rows/2)*dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
             GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,false,&elapsed)==RENDER_OK);
+            /* G1 ends at T4. Full frame G3 continues to device fence T5. */
+            if (experiment) elapsed=hooks.submit_ns+hooks.present_ns;
             (void)bench_add(&samples,elapsed);
         }
-        failed|=bench_report("typing_row",&samples,0,0);
+        if (experiment) puts("egl_bench: typing_row reference_gate_p50_ns=1000000 reference_gate_p99_ns=2000000(G) timing=layout_to_T4 verdict=TRACK_shared_box");
+        failed|=gl_bench_report("typing_row",&samples,0,0);
+        if (upload_only) { gl_driver_cleanup(&driver); edit_arena_free(&arena); return failed; }
         if (skip_reason == NULL) {
             const char *old_interval=getenv("EDIT_GL_SWAP_INTERVAL");
             char saved_interval[8]; bench__copy(saved_interval,sizeof saved_interval,old_interval);
@@ -249,7 +296,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only)
                 GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
                 (void)bench_add(&samples,elapsed);
             }
-            failed|=bench_report("first_frame_after_idle",&samples,0,0);
+            failed|=gl_bench_report("first_frame_after_idle",&samples,0,0);
         } else puts("BENCH name=first_frame_after_idle status=SKIP reason=quick_mode");
     }
     if (skip_reason == NULL) {
@@ -271,25 +318,40 @@ int main(int argc,char **argv)
 {
     (void)setvbuf(stdout,NULL,_IOLBF,0);
     if (argc == 2 && !strcmp(argv[1],"--pace-self-check")) return render_pace_self_check();
-    bool quick=false;
+    const char *upload=getenv("EDIT_GL_UPLOAD");
+    bool quick=false, focus=false, valid=true;
     bool scroll_only = argc == 2 && strcmp(argv[1],"--scroll-track")==0;
-    if (argc==2 && strcmp(argv[1],"--quick")==0) quick=true;
-    else if (argc!=1 && !scroll_only) { fprintf(stderr,"usage: %s [--quick|--scroll-track|--pace-self-check]; EDIT_GL_VBO=orphan|persistent\n",argv[0]); return 1; }
+    if (!scroll_only) for (int i=1;i<argc;i++) {
+        if (!quick && strcmp(argv[i],"--quick")==0) quick=true;
+        else if (!focus && strcmp(argv[i],"--upload-only")==0) focus=true;
+        else valid=false;
+    }
+    if (!valid) {
+        fprintf(stderr,"usage: %s [--quick [--upload-only]|--upload-only [--quick]|--scroll-track|--pace-self-check]; EDIT_GL_VBO=orphan|persistent; EDIT_GL_UPLOAD=subdata|orphan|persistent\n",argv[0]);
+        return 1;
+    }
+    if (upload!=NULL && strcmp(upload,"subdata")!=0 && strcmp(upload,"orphan")!=0 && strcmp(upload,"persistent")!=0) {
+        fprintf(stderr,"gl_bench: invalid EDIT_GL_UPLOAD=%s\n",upload); return 1;
+    }
+    /* A selected experiment defaults to its focused comparison. An explicit
+     * scroll request still runs both paced sizes, using the selected upload. */
+    bool upload_only=!scroll_only && (focus || upload!=NULL);
     if (scroll_only) GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","1",1)==0);
     if (getenv("EDIT_GL_SWAP_INTERVAL")==NULL) GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","0",0)==0);
     trace_init(); GL_BENCH_CHECK(trace_thread_register()>=0);
     char power[32]; bench_battery_status(power,sizeof power);
-    printf("POWER status=%s evidence=(M)%s\n",power,bench_evidence_tag());
+    char load[32]; gl_bench_load(load,sizeof load);
+    printf("POWER status=%s evidence=(M)%s load1=%s upload=%s verdict=TRACK\n",power,bench_evidence_tag(),load,upload!=NULL ? upload : "legacy");
     if (scroll_only) {
-        int first = gl_bench_run(15,false,true);
-        int second = gl_bench_run(30,false,true);
+        int first = gl_bench_run(15,false,true,false);
+        int second = gl_bench_run(30,false,true,false);
         return first | second;
     }
     uint64_t text_bytes=gl_bench_text_bytes(argv[0]);
-    printf("BENCH name=binary_size n=1 p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 text_bytes=%llu units=bytes status=TRACK pass=1 power=%s\n",
+    printf("BENCH name=binary_size n=1 p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 text_bytes=%llu units=bytes status=TRACK pass=1 evidence=(M) power=%s load1=%s upload=%s\n",
         (unsigned long long)text_bytes,(unsigned long long)text_bytes,(unsigned long long)text_bytes,
-        (unsigned long long)text_bytes,(unsigned long long)text_bytes,bench_evidence_tag());
-    int a=gl_bench_run(15,quick,false); if (a==2) return 2;
-    int b=gl_bench_run(30,quick,false); if (b==2) return 2;
+        (unsigned long long)text_bytes,(unsigned long long)text_bytes,bench_evidence_tag(),load,upload!=NULL ? upload : "legacy");
+    int a=gl_bench_run(15,quick,false,upload_only); if (a==2 || upload_only) return a;
+    int b=gl_bench_run(30,quick,false,upload_only); if (b==2) return 2;
     return a|b;
 }
