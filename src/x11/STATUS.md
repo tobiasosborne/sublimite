@@ -111,3 +111,14 @@ Pure decoder fuzz: 2363697 runs / 121 s, no errors (M)[AC], load 6.49.
 Single final TRACK bench (Not charging [AC], load 7.20): translation p50/p99
 341/621 ns, zero allocations; startup subset 8.282/8.934 ms, exit 0 (M).
 No full G4a verdict and no bench rerun.
+
+## P2.2h (edit-e6x.24): clipboard bulk work off the UI thread
+Done: receive growth/copy/Latin-1 conversion, final shrink and big-blob frees run on a private src/work bulk worker
+behind a mailbox; the UI thread only hands replies over and receives completed buffers. Memory accounting stays
+exact (see docs/decisions/P2.2h.md). New API in clip.h: x11_clip_ui_bytes, x11_clip_max_poll_ns, x11_clip_buf_*
+and x11_clip_set_buf (zero-copy publish). tests/x11_clip_test.c: 64 MiB receive latency/bytes/mem test, Latin-1
+expansion, worker-side limit failure, zero-copy set.
+Missing: plat_clip_set still memcpy's on the caller (borrowed buffer; use x11_clip_set_buf); serving converts Latin-1
+per chunk on the UI thread; the 1 ms polling wake instead of the pool eventfd (needs an x11.c edit, proposed).
+Verify: DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=1 make check; run build/tests/x11_clip_test for the
+release numbers (guard test of "no allocation when typing is queued" is active only in the release build).

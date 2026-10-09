@@ -685,6 +685,105 @@ static void test_memory_budget(plat *a, sink *sa, rawp *r) {
     free(d); free(pd); rp_close(&primary); plat_shutdown(&b);
 }
 
+/* P2.2h (#13 rest): receive growth, copy and Latin-1 conversion run on a worker. While a 64 MiB selection arrives the
+ * UI thread only hands chunks over: its bulk bytes stay under one slice budget, each poll stays short, memory is exact. */
+#include "base/base.h"
+/* G1 typing budget 2.0 ms p99 for the release build; ASan's allocator (quarantine recycling of huge blocks inside the
+ * UI thread's own malloc calls) inflates the sanitizer run, which therefore only guards against multi-ms regressions. */
+#if defined(__SANITIZE_ADDRESS__)
+#define POLL_CPU_LIMIT_NS 20000000u
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define POLL_CPU_LIMIT_NS 20000000u
+#endif
+#endif
+#ifndef POLL_CPU_LIMIT_NS
+#define POLL_CPU_LIMIT_NS 2000000u
+#endif
+static void recv_big(plat *a, sink *sa, rawp *r, unsigned mode, const uint8_t *d, size_t n, size_t expect, const char *what) {
+    rp_own(r, mode, d, n, 256 * 1024); pump(a, sa, r, 3);
+    sa->arrived = sa->failed = 0;
+    (void)x11_clip_ui_bytes(a, true); (void)x11_clip_max_poll_ns(a, true, NULL);
+    CHECK(plat_clip_request(a, PLAT_CLIP_CLIPBOARD) == PLAT_OK, "%s: request", what);
+    uint64_t t0 = now_ms(), end = t0 + 90000;
+    while (!sa->arrived && !sa->failed && now_ms() < end) pump(a, sa, r, 1);
+    uint64_t took = now_ms() - t0;
+    size_t ui = x11_clip_ui_bytes(a, true); uint64_t cpu = 0, worst = x11_clip_max_poll_ns(a, true, &cpu);
+    size_t got = 0; const uint8_t *g = plat_clip_data(a, &got);
+    CHECK(sa->arrived == 1 && !sa->failed && g && got == expect, "%s: arrived %d failed %d, %zu of %zu bytes", what, sa->arrived, sa->failed, got, expect);
+    for (int i = 0; i < 400 && x11_clip_busy(a); i++) pump(a, sa, r, 1);     /* deferred frees of the previous paste */
+    CHECK(x11_clip_mem(a) == expect, "%s: mem %zu is not exactly the %zu byte buffer", what, x11_clip_mem(a), expect);
+    CHECK(x11_clip_busy(a) == 0, "%s: receive released", what);
+    CHECK(ui <= SLICE_LIMIT, "%s: UI thread touched %zu bulk bytes (limit %u)", what, ui, SLICE_LIMIT);
+    CHECK(cpu <= POLL_CPU_LIMIT_NS, "%s: worst UI poll CPU %.3f ms (limit %.1f ms)", what, (double)cpu / 1e6, (double)POLL_CPU_LIMIT_NS / 1e6);
+    printf("x11_clip_test: %s: %zu MiB in %llu ms, UI bulk bytes %zu, worst UI poll %.3f ms wall / %.3f ms CPU (G1 typing budget 1.0 ms p50 / 2.0 ms p99)\n",
+           what, expect >> 20, (unsigned long long)took, ui, (double)worst / 1e6, (double)cpu / 1e6);
+}
+static void test_large_paste_latency(plat *a, sink *sa, rawp *r) {
+    a->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 30000, 0);
+    size_t n = 64u * 1024u * 1024u; uint8_t *d = pattern(n);
+    recv_big(a, sa, r, OWN_INCR, d, n, n, "64 MiB UTF8 INCR");
+    size_t g_len = 0; const uint8_t *g = plat_clip_data(a, &g_len);
+    CHECK(g && g_len == n && memcmp(g, d, n) == 0, "64 MiB receive is byte identical");
+    /* typing while a paste is pending: a poll with input queued allocates nothing and does no clip work */
+    plat_event key = { .kind = PLAT_EV_KEY };
+    CHECK(x11_push_event(a, &key), "queue a key");
+    if (edit_malloc_guard_active()) {
+        edit_malloc_guard_begin(); (void)x11_clip_poll(a); size_t allocs = edit_malloc_guard_end();
+        CHECK(allocs == 0, "poll with typing queued made %zu allocations", allocs);
+    } else (void)x11_clip_poll(a);
+    pump(a, sa, r, 2);
+    free(d);
+    /* Latin-1 expansion (STRING INCR) doubles the size: 8 MiB of 0xe9 -> 16 MiB, converted off the UI thread */
+    size_t m = 8u * 1024u * 1024u; d = malloc(m); memset(d, 0xe9, m);
+    recv_big(a, sa, r, OWN_STRING_INCR, d, m, 2 * m, "8 MiB Latin-1 INCR");
+    g = plat_clip_data(a, &g_len);
+    bool ok = g && g_len == 2 * m;
+    for (size_t i = 0; ok && i < g_len; i += 2) if (g[i] != 0xc3 || g[i + 1] != 0xa9) ok = false;
+    CHECK(ok, "Latin-1 expansion correct");
+    free(d);
+    /* the worker enforces the 64 MiB limit on the expanded size: 36 MiB of 0xe9 would become 72 MiB */
+    size_t big = 36u * 1024u * 1024u; d = malloc(big); memset(d, 0xe9, big);
+    size_t before = x11_clip_mem(a);
+    rp_own(r, OWN_STRING_INCR, d, big, 256 * 1024); pump(a, sa, r, 3);
+    sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
+    uint64_t end = now_ms() + 60000;
+    while (now_ms() < end && !sa->failed && !sa->arrived) pump(a, sa, r, 1);
+    CHECK(sa->failed == 1 && !sa->arrived, "expansion beyond 64 MiB must fail (ok %d, failed %d)", sa->arrived, sa->failed);
+    for (int i = 0; i < 1000 && (r->owner_busy || x11_clip_busy(a)); i++) pump(a, sa, r, 1);
+    CHECK(x11_clip_busy(a) == 0 && x11_clip_mem(a) == before, "failed worker receive released its buffer (%zu vs %zu)", x11_clip_mem(a), before);
+    free(d);
+    x11_clip_set_limits(a, 0, 5000, 0);
+    rp_own(r, OWN_NONE, NULL, 0, 0); pump(a, sa, r, 3);
+}
+
+/* Large owners hand over a buffer filled elsewhere: adopting it moves no bytes on the UI thread. */
+static void test_zero_copy_set(plat *a, sink *sa, rawp *r) {
+    a->last_time = 0;
+    size_t n = 20u * 1024u * 1024u;
+    x11_clip_buf *b = x11_clip_buf_new(n);
+    CHECK(b != NULL, "buf_new");
+    if (!b) return;
+    uint8_t *src = pattern(n); memcpy(x11_clip_buf_data(b), src, n);     /* the producer's copy, off the clip path */
+    (void)x11_clip_ui_bytes(a, true);
+    CHECK(x11_clip_set_buf(a, PLAT_CLIP_CLIPBOARD, b) == PLAT_OK, "set_buf");
+    CHECK(x11_clip_ui_bytes(a, true) == 0, "adopting a buffer moved bytes on the UI thread");
+    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(a->conn, xcb_get_input_focus(a->conn), NULL); free(f);
+    pump(a, sa, r, 3);
+    CHECK(x11_clip_mem(a) >= n && x11_clip_mem(a) < n + 8192, "adopted buffer is accounted (%zu)", x11_clip_mem(a));
+    sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
+    pump_until(a, sa, r, NULL, &sa->arrived, 2000);
+    size_t got = 0; const uint8_t *g = plat_clip_data(a, &got);
+    CHECK(sa->arrived == 1 && got == n && g && memcmp(g, src, n) == 0, "adopted buffer pastes back identical");
+    x11_clip_set_budget(a, n - 1);
+    x11_clip_buf *b2 = x11_clip_buf_new(n);
+    CHECK(x11_clip_set_buf(a, PLAT_CLIP_PRIMARY, b2) == PLAT_ERR_FAIL, "over-budget adopt fails (and consumes the buffer)");
+    x11_clip_set_budget(a, 128u * 1024u * 1024u);
+    free(src);
+    CHECK(plat_clip_set(a, PLAT_CLIP_CLIPBOARD, "x", 1) == PLAT_OK, "plain set still works");
+    pump(a, sa, r, 3);
+}
+
 /* #15: the STRING fallback gets a fresh conversion deadline. */
 static void test_string_fallback_deadline(plat *a, sink *sa, rawp *r) {
     static const uint8_t lat[] = { 'c', 'a', 'f', 0xe9 };
@@ -1022,6 +1121,8 @@ int main(void) {
     test_string_fallback_deadline(&a, &sa, &r);
     test_multiple_order(&a, &sa, &r);
     test_memory_budget(&a, &sa, &r);
+    test_zero_copy_set(&a, &sa, &r);
+    test_large_paste_latency(&a, &sa, &r);
     rp_close(&r);
     plat_shutdown(&a);
     test_manager_save(0, "manager saves");

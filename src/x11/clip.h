@@ -19,7 +19,21 @@ void x11_clip_set_limits(plat *p, size_t incr_chunk, uint32_t timeout_ms, uint32
 size_t x11_clip_mem(const plat *p);
 void   x11_clip_set_budget(plat *p, size_t bytes);
 size_t x11_clip_max_slice(plat *p, bool reset);
-/* In-flight transfers (serving INCR/MULTIPLE jobs plus receives that are not idle): 0 when quiescent. */
+/* P2.2h instrumentation. ui_bytes = bulk bytes copied, converted or realloc-moved by clip code on the calling (UI)
+ * thread since the last reset; x11_clip_max_poll_ns = wall time of the longest single x11_clip_poll / x11_clip_event call
+ * (*cpu_ns_out, if given, receives the thread-CPU time of the longest call: preemption-free). */
+size_t   x11_clip_ui_bytes(plat *p, bool reset);
+uint64_t x11_clip_max_poll_ns(plat *p, bool reset, uint64_t *cpu_ns_out);
+/* Zero-copy publish for large owners (P2.2h): a producer fills a clipboard buffer on any thread, the UI thread only adopts
+ * it. plat_clip_set stays correct but copies synchronously (the caller's buffer is borrowed), so it is for small texts.
+ * x11_clip_buf_new/_data/_free are thread-agnostic (no clip state); x11_clip_set_buf consumes the buffer whether it
+ * succeeds or not (PLAT_ERR_FAIL when over the memory budget). The buffer is immutable once adopted. */
+typedef struct clip_blob x11_clip_buf;
+x11_clip_buf *x11_clip_buf_new(size_t len);          /* NULL above 64 MiB or on OOM; len bytes uninitialised */
+uint8_t      *x11_clip_buf_data(x11_clip_buf *b);
+void          x11_clip_buf_free(x11_clip_buf *b);    /* only for a buffer that was not adopted */
+int           x11_clip_set_buf(plat *p, int which, x11_clip_buf *b);
+/* In-flight transfers (serving INCR/MULTIPLE jobs, receives that are not idle, deferred buffer frees): 0 when quiescent. */
 size_t x11_clip_busy(const plat *p);
 /* Earliest monotonic deadline (ns, trace_now_ns clock) the loop must wake for, 0 = none. */
 uint64_t x11_clip_deadline(const plat *p);
