@@ -19,7 +19,7 @@ Read order, every session: `HANDOFF.md` → this file → `PLAN.md` §1 (workflo
 ## Code conventions
 
 - C11, `-std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion`, gcc 13 release, clang 18 sanitizers.
-- One directory per module under `src/`, one public header, `snake_case`, `module_` prefix on every exported symbol, no globals except the trace ring and the allocator hook.
+- One directory per module under `src/`, one public header, `snake_case`, `module_` prefix on every exported symbol, no globals except the trace ring, the allocator hook and the file module's single process-wide SIGBUS service (`file_bus`, 2026-10-09, docs/decisions/P1.7c.md §10: the signal ABI has no context argument; fixed mapping registry, lock-free, installed once; nothing per-file). `src/file/check_signal_globals.py` enforces it.
 - Fixed-width types, `size_t` for sizes, byte offsets are `uint64_t`.
 - Errors are return codes; no `abort()` outside `ASSERT`. No `printf` on the UI thread.
 - Threads: UI thread owns the buffer; workers get snapshots. Shared state crosses only through `src/work` mailboxes.
