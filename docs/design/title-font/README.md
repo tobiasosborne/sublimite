@@ -1,3 +1,5 @@
+> **Decision (Tobias, 2026-10-09 14:35): Bodoni Moda Italic, lower case.** "They are really all good, but I marginally prefer Bodoni Moda Italic." The project name and title are all lower case: `sublimité`. Lower-case render: `bodoni-moda-italic-lowercase.png`. Runner-up: CAT Eckmann.
+
 # Title font for *Sublimité*
 
 Research note, 2026-10-09. Scope: the title lettering only (logo, about box, README/site header,
