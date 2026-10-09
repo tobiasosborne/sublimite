@@ -22,8 +22,12 @@
  * unless FILE_SAVE_FORCE, and the worker re-checks the identity under the
  * file lock immediately before the rename, so the check cannot be raced by
  * more than the rename itself. Save by rename never modifies a mapped inode.
- * SIGBUS on external truncation of a mapped file is NOT handled here (stat
- * detection only); see docs/decisions/P1.7.md.
+ * SIGBUS (P1.7b): a process-wide handler turns reads past the new EOF of an
+ * externally truncated mapped original (any thread) into zero-filled reads and
+ * sets the same sticky "changed" state (FILE_CHG_TRUNCATED); file_changed and
+ * file_check report it. Faults outside our mappings chain to the previous
+ * handler / default action. Bytes read after the fault are zeros: the UI must
+ * treat the buffer as stale and offer reload/keep. See docs/decisions/P1.7.md.
  *
  * SAVE (perf s2.8). file_save_begin (UI): change check, piece_snapshot_take,
  * enqueue. Returning 0 IS the ack. The worker writes a temp file in the same

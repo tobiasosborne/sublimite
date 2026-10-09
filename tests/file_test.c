@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -451,6 +452,79 @@ static void t_save_cancel(void)
     work_cancel(&pool, bh);
 }
 
+
+/* ---- P1.7b: SIGBUS on external truncation of a mapped original ---- */
+typedef struct { piece_snapshot *s; uint8_t *buf; size_t n; int rc; _Atomic int done; } rd_arg;
+static void rd_job(work_ctx *c)
+{
+    rd_arg *a = c->arg;
+    a->rc = piece_snapshot_read(a->s, 0, a->buf, a->n);
+    atomic_store(&a->done, 1);
+}
+
+static void sigbus_case(int use_worker)
+{
+    size_t n = 4u << 20, keep = 8192;
+    uint8_t *d = malloc(n); fill(d, n, 11);
+    write_file("sb.txt", d, n);
+    char p[512]; path_of(p, sizeof p, "sb.txt");
+    file *f; file_msg m;
+    file_open_opts o = { 1, 0 };
+    CHECK(file_open_begin(&pool, p, &o, &f) == 0 && file_open_mode(f) == FILE_MODE_MMAP);
+    CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *t = new_tree();
+    CHECK(file_attach(f, t) == 0);
+    piece_snapshot *s = piece_snapshot_take(t);
+    CHECK(truncate(p, (off_t)keep) == 0);                 /* external truncation */
+    uint8_t *b = malloc(n);
+    if (use_worker) {
+        rd_arg a = { s, b, n, -1, 0 };
+        work_handle h = work_submit(&pool, (work_job){ rd_job, &a, 0, WORK_BULK });
+        for (int i = 0; i < 10000 && !atomic_load(&a.done); i++) sleep_ms(1);
+        CHECK(atomic_load(&a.done));
+        (void)h;
+        CHECK(a.rc == 0);
+    } else {
+        CHECK(piece_read(t, 0, b, n) == 0);               /* UI thread read */
+    }
+    CHECK(memcmp(b, d, keep) == 0);                       /* surviving bytes intact */
+    int z = 1; for (size_t i = keep; i < n; i++) if (b[i]) { z = 0; break; }
+    CHECK(z);                                             /* tail reads as zeros */
+    CHECK(file_changed(f));
+    uint32_t r = 0;
+    CHECK(file_check(f, &r) == 1 && (r & FILE_CHG_TRUNCATED));
+    piece_snapshot_release(s); piece_destroy(t); file_close(f);
+    free(b); free(d);
+}
+
+/* A SIGBUS outside our mappings must still be fatal (handler chains to default). */
+static void sigbus_foreign(void)
+{
+    char p[512]; path_of(p, sizeof p, "fx.txt");
+    uint8_t d[8192]; fill(d, sizeof d, 12);
+    write_file("fx.txt", d, sizeof d);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open(p, O_RDWR);
+        { int dn = open("/dev/null", O_WRONLY); if (dn >= 0) { (void)dup2(dn, 2); close(dn); } }
+        uint8_t *a = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd, 0);
+        if (fd < 0 || a == MAP_FAILED || ftruncate(fd, 0) != 0) _exit(90);
+        volatile uint8_t x = a[4096]; (void)x;
+        _exit(91);
+    }
+    int st = 0; CHECK(waitpid(pid, &st, 0) == pid);
+    /* SIGBUS, or ASan's abort report of it; never a clean/recovered exit */
+    CHECK(WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st) != 0 && WEXITSTATUS(st) != 90 && WEXITSTATUS(st) != 91));
+}
+
+static void t_sigbus(void)
+{
+    sigbus_foreign();                                   /* before any handler use: baseline */
+    sigbus_case(0);
+    sigbus_case(1);
+    sigbus_foreign();                                   /* after: still chained */
+}
+
 int main(void)
 {
     const char *base = getenv("TMPDIR");
@@ -459,16 +533,51 @@ int main(void)
     trace_init();
     EDIT_ASSERT(work_pool_init(&pool, 1, 0) == 0);
 
-    if (getenv("FT_V")) fprintf(stderr, "run eol\n"); t_eol();
-    if (getenv("FT_V")) fprintf(stderr, "run open_small_copy\n"); t_open_small_copy();
-    if (getenv("FT_V")) fprintf(stderr, "run prefix_before_copy\n"); t_prefix_before_copy();
-    if (getenv("FT_V")) fprintf(stderr, "run mmap_threshold\n"); t_mmap_threshold();
-    if (getenv("FT_V")) fprintf(stderr, "run change\n"); t_change();
-    if (getenv("FT_V")) fprintf(stderr, "run save_roundtrip\n"); t_save_roundtrip();
-    if (getenv("FT_V")) fprintf(stderr, "run save_isolation\n"); t_save_isolation();
-    if (getenv("FT_V")) fprintf(stderr, "run save_changed\n"); t_save_changed();
-    if (getenv("FT_V")) fprintf(stderr, "run save_cancel\n"); t_save_cancel();
-    if (getenv("FT_V")) fprintf(stderr, "run durability\n"); t_durability();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run eol\n");
+    }
+    t_eol();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run open_small_copy\n");
+    }
+    t_open_small_copy();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run prefix_before_copy\n");
+    }
+    t_prefix_before_copy();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run mmap_threshold\n");
+    }
+    t_mmap_threshold();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run change\n");
+    }
+    t_change();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run save_roundtrip\n");
+    }
+    t_save_roundtrip();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run save_isolation\n");
+    }
+    t_save_isolation();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run save_changed\n");
+    }
+    t_save_changed();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run save_cancel\n");
+    }
+    t_save_cancel();
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run durability\n");
+    }
+    t_durability();
+
+    if (getenv("FT_V")) {
+        fprintf(stderr, "run sigbus\n");
+    }
+    t_sigbus();
 
     work_pool_shutdown(&pool);
     char cmd[300]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

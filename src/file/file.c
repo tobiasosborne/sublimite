@@ -3,6 +3,7 @@
 #include "base/base.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sched.h>
@@ -21,12 +22,116 @@
 #define FILE_WRITE_CHUNK  (256u << 10)
 #define FILE_NAME_MAX_KEEP 100
 
+/* ---------------- SIGBUS guard (P1.7b; policy in docs/decisions/P1.7.md) -------
+ * A mapped original truncated by another process faults with SIGBUS on any read
+ * past the new EOF, on any thread, inside any reader of the mapping (piece
+ * iterators, scan, lineidx, layout). One process-wide handler serves them all:
+ * if the fault address lies in a registered mapping it maps anonymous zero
+ * pages over [faulting page, end of mapping) (mmap is async-signal-safe), sets
+ * the slot's `faulted` flag and returns, so the faulting read completes with
+ * zeros. file_check/file_changed turn the flag into FILE_CHG_TRUNCATED and the
+ * sticky "source changed" state. Anything else chains to the previous handler
+ * (or the default action). The registry is a fixed lock-free table: the only
+ * file-scope state besides the allocator hook and the trace ring, because a
+ * signal handler cannot reach per-object state. */
+#define FILE_GUARD_SLOTS 256
+typedef struct guard_slot {
+    _Atomic uintptr_t addr;       /* 0 = free; published last (release) */
+    _Atomic size_t len;
+    _Atomic int faulted;
+} guard_slot;
+static guard_slot g_slots[FILE_GUARD_SLOTS];
+static struct sigaction g_old_bus;
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static int g_installed;
+
+static void guard_chain(int sig, siginfo_t *si, void *uc)
+{
+    if ((g_old_bus.sa_flags & SA_SIGINFO) && g_old_bus.sa_sigaction) {
+        g_old_bus.sa_sigaction(sig, si, uc);
+    } else if (g_old_bus.sa_handler != SIG_DFL && g_old_bus.sa_handler != SIG_IGN) {
+        g_old_bus.sa_handler(sig);
+    } else {
+        /* default action: reinstall SIG_DFL and return; the instruction re-faults and kills us */
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        (void)sigaction(SIGBUS, &dfl, NULL);
+    }
+}
+
+static void guard_handler(int sig, siginfo_t *si, void *uc)
+{
+    int saved = errno;
+    uintptr_t a = (uintptr_t)si->si_addr;
+    if (si->si_code == BUS_ADRERR || si->si_code == BUS_OBJERR) {
+        for (int i = 0; i < FILE_GUARD_SLOTS; i++) {
+            uintptr_t base = atomic_load_explicit(&g_slots[i].addr, memory_order_acquire);
+            if (base == 0) continue;
+            size_t len = atomic_load_explicit(&g_slots[i].len, memory_order_relaxed);
+            if (a < base || a - base >= len) continue;
+            uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+            uintptr_t from = a & ~(pg - 1u);
+            if (from < base) from = base;
+            if (mmap((void *)from, base + len - from, PROT_READ,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != MAP_FAILED) {
+                atomic_store_explicit(&g_slots[i].faulted, 1, memory_order_release);
+                errno = saved;
+                return;
+            }
+            break;                                   /* cannot recover: chain */
+        }
+    }
+    errno = saved;
+    guard_chain(sig, si, uc);
+}
+
+static void guard_install(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = guard_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    g_installed = sigaction(SIGBUS, &sa, &g_old_bus) == 0;
+}
+
+/* Returns a slot index or -1 (table full / handler not installed). */
+static int guard_register(void *addr, size_t len)
+{
+    pthread_once(&g_once, guard_install);
+    if (!g_installed) return -1;
+    for (int i = 0; i < FILE_GUARD_SLOTS; i++) {
+        uintptr_t zero = 0;
+        /* claim with a sentinel so two openers cannot take the same slot */
+        if (atomic_compare_exchange_strong(&g_slots[i].addr, &zero, 1)) {
+            atomic_store_explicit(&g_slots[i].faulted, 0, memory_order_relaxed);
+            atomic_store_explicit(&g_slots[i].len, len, memory_order_relaxed);
+            atomic_store_explicit(&g_slots[i].addr, (uintptr_t)addr, memory_order_release);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void guard_unregister(int slot)
+{
+    if (slot >= 0) atomic_store_explicit(&g_slots[slot].addr, 0, memory_order_release);
+}
+
+static int guard_faulted(int slot)
+{
+    return slot >= 0 && atomic_load_explicit(&g_slots[slot].faulted, memory_order_acquire);
+}
+
 /* ---------------- mapping (refcounted; the piece tree/snapshots hold refs) --- */
 typedef struct file_map {
     _Atomic int refs;
     void *addr;
     size_t len;
     int fd;
+    int slot;                     /* SIGBUS guard slot */
 } file_map;
 
 static void map_acquire(void *ctx) { atomic_fetch_add_explicit(&((file_map *)ctx)->refs, 1, memory_order_relaxed); }
@@ -34,6 +139,7 @@ static void map_release(void *ctx)
 {
     file_map *m = ctx;
     if (atomic_fetch_sub_explicit(&m->refs, 1, memory_order_acq_rel) == 1) {
+        guard_unregister(m->slot);
         munmap(m->addr, m->len);
         if (m->fd >= 0) close(m->fd);
         free(m);
@@ -205,6 +311,11 @@ static void open_job(work_ctx *c)
             if (m->fd >= 0) close(m->fd);
             free(m);
             goto done;
+        }
+        m->slot = guard_register(m->addr, m->len);
+        if (m->slot < 0) {
+            munmap(m->addr, m->len); close(m->fd); free(m);
+            status = FILE_ERR_NOMEM; goto done;
         }
         atomic_init(&m->refs, 1);
         f->map = m;
@@ -384,6 +495,7 @@ static uint32_t check_locked(file *f)
         if (fstat(f->map->fd, &st) == 0 && (uint64_t)st.st_size < (uint64_t)f->map->len)
             r |= FILE_CHG_TRUNCATED;
     }
+    if (f->map && guard_faulted(f->map->slot)) r |= FILE_CHG_TRUNCATED;
     if (r) f->changed = 1;
     return r;
 }
@@ -403,7 +515,7 @@ int file_changed(const file *f)
     file *m = (file *)f;
     int c;
     pthread_mutex_lock(&m->mu);
-    c = m->changed;
+    c = m->changed || (m->map && guard_faulted(m->map->slot));
     pthread_mutex_unlock(&m->mu);
     return c;
 }
