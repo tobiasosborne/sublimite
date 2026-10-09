@@ -274,6 +274,7 @@ typedef struct file_map {
     int fd;
     int slot;                     /* SIGBUS guard slot */
     file_id identity;             /* identity of the actual snapshot backing */
+    int private_copy;             /* malloc backing, using the same lifetime hooks */
 } file_map;
 
 static void map_acquire(void *ctx) { atomic_fetch_add_explicit(&((file_map *)ctx)->refs, 1, memory_order_relaxed); }
@@ -282,18 +283,28 @@ static void map_release(void *ctx)
     file_map *m = ctx;
     if (atomic_fetch_sub_explicit(&m->refs, 1, memory_order_acq_rel) == 1) {
         guard_unregister(m->slot);
-        munmap(m->addr, m->len);
+        if (m->private_copy) free(m->addr);
+        else munmap(m->addr, m->len);
         if (m->fd >= 0) close(m->fd);
         free(m);
     }
 }
 
+/* Worker-owned physical transaction. UI passes it from preparation to commit
+ * only after receiving SAVE_PREPARED; no descriptor operation is done by decode. */
+typedef struct save_transaction {
+    file_save_args args;
+    int fd, dfd;
+    char base[NAME_MAX + 1], tmp[NAME_MAX + 1];
+    uint64_t done;
+} save_transaction;
+static void transaction_discard(save_transaction *tx);
+
 /* ---------------- file object ---------------- */
 struct file {
     work_pool *pool;
     char path[PATH_MAX];
-    char dir[PATH_MAX];
-    char base[NAME_MAX + 1];
+    char requested_path[PATH_MAX]; /* immutable worker input */
     uint32_t generation;
     uint64_t threshold;
     int fd;                       /* source fd until attach/close */
@@ -301,6 +312,7 @@ struct file {
 
     uint8_t *prefix;
     size_t prefix_len;
+    int prefix_owned;
     file_prefix_info info;
     file_mode mode;
     uint64_t size;
@@ -312,6 +324,20 @@ struct file {
     _Atomic int ready;            /* 1 = content ready for attach */
     int attached;
     work_handle open_h;
+    work_handle prefix_h;
+    _Atomic int prefix_fin;
+    struct {
+        char path[PATH_MAX];
+        file_id id;
+        uint8_t *bytes;
+        size_t len;
+        file_prefix_info info;
+        file_mode mode;
+        int fd, status, err_no;
+    } prefix_result;
+    _Atomic int prefix_result_ready;
+    int prefix_installed;
+    int open_status;
     _Atomic int open_fin;         /* 1 when no open job is pending */
     struct {
         uint8_t *data;
@@ -323,14 +349,19 @@ struct file {
     int open_installed;
     file_id open_identity;        /* immutable open-job input */
 
-    pthread_mutex_t mu;           /* shared precommit validation vs UI changes */
     file_id id;
     int changed;
     int ifd, iwd;
+    int watch_refresh;
     uint64_t source_generation;
     void (*step)(void *, int);    /* UI-owned hooks, captured at submit */
     void *step_ctx;
     work_handle jobs[WORK_MAX_JOBS]; /* includes completed, undrained jobs */
+    work_handle check_h;
+    _Atomic int check_fin, check_result_ready;
+    int check_installed, check_requested;
+    struct { file_id observed; uint32_t map_reasons; uint64_t generation; } check_result;
+    struct { file_map *map; uint64_t generation; } check;
 
     struct {
         piece_snapshot *snap;
@@ -343,12 +374,20 @@ struct file {
         uint64_t source_generation;
         uint64_t source_faults;
         file_map *source_map;
+        int authorized;          /* immutable commit input, decided by UI */
     } save;
+    save_transaction transaction;
+    work_handle prepare_h;
+    _Atomic int prepare_fin;
+    int prepare_status, commit_pending;
+    int save_aborted, abort_pending;
+    work_handle abort_h;
+    _Atomic int abort_fin;
     work_handle save_h;
     _Atomic int save_fin;
     struct {
         file_id id;
-        int status;
+        int status, err_no;
     } save_result;
     _Atomic int save_result_ready;
     int save_installed;
@@ -356,8 +395,13 @@ struct file {
     int save_replaced_installed;
 };
 
-static void file_sync(file *f);
-static void install_replaced_locked(file *f);
+static void file_sync(file *f, uint32_t kind);
+static void install_replaced(file *f);
+static void open_job(work_ctx *c);
+static void save_commit_job(work_ctx *c);
+static void save_commit_pump(file *f);
+static void invalidate_save(file *f);
+static void save_abort_pump(file *f);
 
 uint64_t file_default_copy_threshold(void)
 {
@@ -411,14 +455,24 @@ static bool post(work_ctx *c, uint32_t kind, file *f, int status, uint32_t mode,
     m.kind = kind;
     m.generation = gen;
     memcpy(m.data, &pl, sizeof pl);
-    return work_publish(c, &m);
+    /* Terminal/phase messages transfer ownership. A full mailbox is
+     * backpressure, never permission to lose that transfer. Cancellation
+     * invalidates the delivery and lets close's physical wait make progress. */
+    while (!work_should_stop(c)) {
+        if (work_publish(c, &m)) return true;
+        struct timespec delay = { 0, 1000000 };
+        nanosleep(&delay, NULL);
+    }
+    return false;
 }
 
 int file_msg_decode(const work_msg *m, file_msg *out)
 {
     msg_payload pl;
     if (m->kind != FILE_MSG_OPEN_READY && m->kind != FILE_MSG_OPEN_FAILED &&
-        m->kind != FILE_MSG_SAVE_DONE)
+        m->kind != FILE_MSG_SAVE_DONE && m->kind != FILE_MSG_PREFIX_READY &&
+        m->kind != FILE_MSG_CHECK_DONE && m->kind != FILE_MSG_REPLACED &&
+        m->kind != FILE_MSG_SAVE_PREPARED)
         return 1;
     memcpy(&pl, m->data, sizeof pl);
     out->kind = m->kind;
@@ -428,7 +482,13 @@ int file_msg_decode(const work_msg *m, file_msg *out)
     out->mode = pl.mode;
     out->size = pl.size;
     out->err_no = pl.err_no;
-    if (pl.f) file_sync(pl.f);
+    if (pl.f) file_sync(pl.f, m->kind);
+    if (m->kind == FILE_MSG_CHECK_DONE || m->kind == FILE_MSG_REPLACED ||
+        m->kind == FILE_MSG_SAVE_PREPARED) return 1;
+    if (m->kind == FILE_MSG_PREFIX_READY && pl.f->open_status != FILE_OK) {
+        out->kind = FILE_MSG_OPEN_FAILED;
+        out->status = pl.f->open_status;
+    }
     return 0;
 }
 
@@ -466,6 +526,77 @@ static void id_stat_path(const char *path, file_id *id)
 }
 
 /* ---------------- open ---------------- */
+static void prefix_job(work_ctx *c)
+{
+    file *f = c->arg;
+    struct stat st;
+    int fd = -1, rc = FILE_OK, en = 0;
+    uint8_t *bytes = NULL;
+    if (work_should_stop(c)) { rc = FILE_ERR_CANCELLED; goto done; }
+    if (realpath(f->requested_path, f->prefix_result.path) == NULL) {
+        en = errno; rc = FILE_ERR_IO; goto done;
+    }
+    /* NONBLOCK is required before fstat: FIFOs must not await a writer. */
+    fd = open(f->prefix_result.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) != 0) { en = errno; rc = FILE_ERR_IO; goto done; }
+    if (!S_ISREG(st.st_mode)) { rc = FILE_ERR_NOTREG; goto done; }
+    if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX) { en = EFBIG; rc = FILE_ERR_IO; goto done; }
+    id_from_stat(&f->prefix_result.id, &st);
+    uint64_t threshold = f->threshold ? f->threshold : file_default_copy_threshold();
+    f->prefix_result.mode = ((uint64_t)st.st_size < threshold || st.st_size == 0)
+                           ? FILE_MODE_COPY : FILE_MODE_MMAP;
+    size_t want = (uint64_t)st.st_size < FILE_PREFIX_MAX ? (size_t)st.st_size : FILE_PREFIX_MAX;
+    bytes = malloc(want ? want : 1);
+    if (!bytes) { rc = FILE_ERR_NOMEM; goto done; }
+    size_t off = 0;
+    while (off < want) {
+        if (work_should_stop(c)) { rc = FILE_ERR_CANCELLED; goto done; }
+        /* Prefix acquisition/scanning is off the UI; cancellation is checked
+         * even on short reads and repeated EINTR. */
+        size_t n = want - off;
+        if (n > 65536u) n = 65536u;
+        ssize_t got = pread(fd, bytes + off, n, (off_t)off);
+        if (got < 0) { if (errno == EINTR) continue; en = errno; rc = FILE_ERR_IO; goto done; }
+        if (got == 0) break;
+        off += (size_t)got;
+    }
+    f->prefix_result.len = off;
+    file_prefix_info info = {0};
+    for (size_t scanned = 0; scanned < off;) {
+        if (work_should_stop(c)) { rc = FILE_ERR_CANCELLED; goto done; }
+        size_t n = off-scanned < 16384u ? off-scanned : 16384u;
+        file_prefix_info chunk; file_prefix_scan(bytes+scanned, n, &chunk);
+        info.lf += chunk.lf; info.crlf += chunk.crlf; info.cr += chunk.cr;
+        if (scanned && bytes[scanned-1] == '\r' && bytes[scanned] == '\n') {
+            info.lf--; info.crlf++; info.cr--;
+        }
+        scanned += n;
+    }
+    info.kind = info.lf+info.crlf == 0 ? FILE_EOL_NONE : info.crlf == 0 ? FILE_EOL_LF
+                : info.lf == 0 ? FILE_EOL_CRLF : FILE_EOL_MIXED;
+    info.dominant = info.crlf > info.lf ? FILE_EOL_CRLF : FILE_EOL_LF;
+    info.has_bom = off >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
+    f->prefix_result.info = info;
+done:
+    if (rc != FILE_OK) {
+        if (fd >= 0) close(fd);
+        fd = -1; free(bytes); bytes = NULL;
+    }
+    f->prefix_result.fd = fd;
+    f->prefix_result.bytes = bytes;
+    f->prefix_result.status = rc;
+    f->prefix_result.err_no = en;
+    atomic_store_explicit(&f->prefix_result_ready, 1, memory_order_release);
+    uint32_t kind = rc == FILE_OK ? FILE_MSG_PREFIX_READY : FILE_MSG_OPEN_FAILED;
+    (void)post(c, kind, f, rc, (uint32_t)f->prefix_result.mode,
+               f->prefix_result.len, en, f->generation);
+    if (rc == FILE_OK && f->prefix_result.mode == FILE_MODE_COPY &&
+        f->prefix_result.id.size <= f->prefix_result.len)
+        (void)post(c, FILE_MSG_OPEN_READY, f, FILE_OK, FILE_MODE_COPY,
+                   f->prefix_result.len, 0, f->generation);
+    atomic_store_explicit(&f->prefix_fin, 1, memory_order_release);
+}
+
 static void open_job(work_ctx *c)
 {
     file *f = c->arg;
@@ -525,86 +656,47 @@ done:
 
 int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opts, file **out)
 {
-    file *f = NULL;
-    struct stat st;
-    char resolved[PATH_MAX];
-    int fd = -1, rc = FILE_ERR_IO, en = 0;
-
     *out = NULL;
-    if (realpath(path, resolved) == NULL) { en = errno; goto fail; }
-    fd = open(resolved, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || fstat(fd, &st) != 0) { en = errno; goto fail; }
-    if (!S_ISREG(st.st_mode)) { rc = FILE_ERR_NOTREG; goto fail; }
-    f = calloc(1, sizeof *f);
-    if (f == NULL) { rc = FILE_ERR_NOMEM; goto fail; }
+    if (!pool || !path) return FILE_ERR_STATE;
+    size_t len = strnlen(path, PATH_MAX);
+    if (len >= PATH_MAX) { errno = ENAMETOOLONG; return FILE_ERR_IO; }
+    file *f = calloc(1, sizeof *f);
+    if (f == NULL) return FILE_ERR_NOMEM;
     f->pool = pool;
-    f->fd = fd;
+    memcpy(f->requested_path, path, len + 1);
+    f->fd = -1; f->prefix_result.fd = -1;
+    f->prefix_owned = 1;
     f->ifd = -1; f->iwd = -1;
     f->generation = opts ? opts->generation : 0;
-    f->threshold = (opts && opts->copy_threshold) ? opts->copy_threshold : file_default_copy_threshold();
-    f->size = (uint64_t)st.st_size;
-    pthread_mutex_init(&f->mu, NULL);
+    f->threshold = opts ? opts->copy_threshold : 0;
+    f->transaction.fd = -1; f->transaction.dfd = -1;
     atomic_init(&f->ready, 0);
     atomic_init(&f->open_fin, 1);
+    atomic_init(&f->prefix_fin, 0);
+    atomic_init(&f->prefix_result_ready, 0);
+    atomic_init(&f->check_fin, 1);
+    atomic_init(&f->check_result_ready, 0);
+    f->check_installed = 1;
     atomic_init(&f->save_fin, 1);
+    atomic_init(&f->prepare_fin, 1);
+    atomic_init(&f->abort_fin, 1);
     atomic_init(&f->open_result_ready, 0);
     atomic_init(&f->save_result_ready, 0);
     atomic_init(&f->save_replaced_ready, 0);
     f->open_installed = 1;
     f->save_installed = 1;
     f->save_replaced_installed = 1;
-    id_from_stat(&f->id, &st);
-    f->open_identity = f->id;
-
-    if (strlen(resolved) >= sizeof f->path) { rc = FILE_ERR_IO; en = ENAMETOOLONG; goto fail; }
-    memcpy(f->path, resolved, strlen(resolved) + 1);
-    {
-        const char *sl = strrchr(f->path, '/');
-        size_t dl = sl == f->path ? 1 : (size_t)(sl - f->path);
-        memcpy(f->dir, f->path, dl);
-        f->dir[dl] = '\0';
-        snprintf(f->base, sizeof f->base, "%s", sl + 1);
+    /* An existing raster worker provides the interactive lane; configurations
+     * without one still use asynchronous BULK, but cannot promise G5 under
+     * unrelated bulk I/O. A dedicated work class is a separate proposal. */
+    work_class cls = pool->n_workers > pool->n_bulk ? WORK_RASTER : WORK_BULK;
+    f->prefix_h = work_submit(pool, (work_job){ prefix_job, f, f->generation, cls });
+    if (!f->prefix_h.epoch) {
+        free(f); return FILE_ERR_POOL;
     }
-
-    /* bounded prefix: the only read on the UI thread */
-    {
-        size_t want = f->size < FILE_PREFIX_MAX ? (size_t)f->size : FILE_PREFIX_MAX, off = 0;
-        f->prefix = malloc(want ? want : 1);
-        if (f->prefix == NULL) { rc = FILE_ERR_NOMEM; goto fail; }
-        while (off < want) {
-            ssize_t r = pread(fd, f->prefix + off, want - off, (off_t)off);
-            if (r < 0) { if (errno == EINTR) continue; en = errno; goto fail; }
-            if (r == 0) break;
-            off += (size_t)r;
-        }
-        f->prefix_len = off;
-        file_prefix_scan(f->prefix, off, &f->info);
-    }
-
-    f->mode = (f->size < f->threshold || f->size == 0) ? FILE_MODE_COPY : FILE_MODE_MMAP;
-    if (f->mode == FILE_MODE_COPY && f->size <= f->prefix_len) {
-        atomic_store(&f->ready, 1);       /* prefix is the whole file: no job */
-    } else {
-        f->open_installed = 0;
-        atomic_store(&f->open_fin, 0);
-        f->open_h = work_submit(pool, (work_job){ open_job, f, f->generation, WORK_BULK });
-        if (f->open_h.epoch == 0) { atomic_store(&f->open_fin, 1); rc = FILE_ERR_POOL; goto fail; }
-        f->jobs[f->open_h.slot] = f->open_h;
-    }
+    f->jobs[f->prefix_h.slot] = f->prefix_h;
     *out = f;
     return FILE_OK;
-fail:
-    if (f) {
-        free(f->prefix);
-        pthread_mutex_destroy(&f->mu);
-        free(f);
-    }
-    if (fd >= 0) close(fd);
-    if (en) {
-        /* no file object to carry errno; keep it in errno for the caller */
-        errno = en;
-    }
-    return rc;
 }
 
 /* Wait until the slot's job for `h` has finished or was skipped. */
@@ -630,9 +722,14 @@ void file_close(file *f)
      * each slot's handle, so every completion carrying f is invalidated. */
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
         if (f->jobs[i].epoch) work_cancel(f->pool, f->jobs[i]);
+    wait_job(f, f->prefix_h, &f->prefix_fin);
     wait_job(f, f->open_h, &f->open_fin);
+    wait_job(f, f->prepare_h, &f->prepare_fin);
     wait_job(f, f->save_h, &f->save_fin);
+    wait_job(f, f->abort_h, &f->abort_fin);
+    wait_job(f, f->check_h, &f->check_fin);
     if (f->save.snap) piece_snapshot_release(f->save.snap);
+    transaction_discard(&f->transaction);
     if (f->fd >= 0) close(f->fd);
     if (f->ifd >= 0) close(f->ifd);
     if (f->map) map_release(f->map);
@@ -641,8 +738,11 @@ void file_close(file *f)
         free(f->open_result.data);
     }
     free(f->data);
-    free(f->prefix);
-    pthread_mutex_destroy(&f->mu);
+    if (f->prefix_owned) free(f->prefix);
+    if (!f->prefix_installed && atomic_load_explicit(&f->prefix_result_ready, memory_order_acquire)) {
+        if (f->prefix_result.fd >= 0) close(f->prefix_result.fd);
+        free(f->prefix_result.bytes);
+    }
     free(f);
 }
 
@@ -651,10 +751,10 @@ const file_prefix_info *file_prefix_info_of(const file *f) { return &f->info; }
 uint64_t file_size(const file *f) { return f->size; }
 file_mode file_open_mode(const file *f) { return f->mode; }
 const char *file_path(const file *f) { return f->path; }
-int file_errno(const file *f) { file_sync((file *)f); return f->err_no; }
+int file_prefix_ready(const file *f) { return f->prefix_installed && f->open_status == FILE_OK; }
+int file_errno(const file *f) { return f->err_no; }
 int file_open_ready(const file *f)
 {
-    file_sync((file *)f);
     return atomic_load_explicit(&((file *)f)->ready, memory_order_acquire);
 }
 
@@ -662,19 +762,24 @@ int file_attach(file *f, piece_tree *t)
 {
     int rc;
     if (f->attached || !file_open_ready(f)) return FILE_ERR_STATE;
-    if (f->mode == FILE_MODE_MMAP) {
-        piece_map_hooks h = { f->map, map_acquire, map_release };
-        rc = piece_init_mapped(t, (const uint8_t *)f->map->addr, f->map->len, &h);
-    } else if (f->data) {
-        rc = piece_init_copy(t, f->data, f->data_len);
-    } else {
-        rc = piece_init_copy(t, f->prefix, f->prefix_len);
+    if (f->mode == FILE_MODE_COPY && !f->map) {
+        file_map *m = calloc(1, sizeof *m);
+        if (!m) return FILE_ERR_NOMEM;
+        atomic_init(&m->refs, 1); m->fd = -1; m->slot = -1; m->private_copy = 1;
+        if (f->data) {
+            m->addr = f->data; m->len = f->data_len; f->data = NULL;
+        } else {
+            m->addr = f->prefix; m->len = f->prefix_len; f->prefix_owned = 0;
+        }
+        f->map = m;
     }
+    piece_map_hooks h = { f->map, map_acquire, map_release };
+    rc = piece_init_mapped(t, (const uint8_t *)f->map->addr, f->map->len, &h);
     if (rc != 0) return FILE_ERR_NOMEM;
     f->attached = 1;
     free(f->data);
     f->data = NULL;
-    if (f->fd >= 0) { close(f->fd); f->fd = -1; }
+    /* Source fd is released at off-path close; attachment performs no I/O. */
     return FILE_OK;
 }
 
@@ -694,25 +799,27 @@ static uint32_t map_change(file_map *m)
     return r;
 }
 
-static uint32_t check_locked(file *f)
+static uint32_t check_now(file *f)
 {
     file_id now;
     uint32_t r;
-    install_replaced_locked(f);
     id_stat_path(f->path, &now);
     r = id_diff(&f->id, &now);
     r |= map_change(f->map);
-    if (r && !f->changed) { f->changed = 1; f->source_generation++; }
+    if (r && !f->changed) {
+        f->changed = 1; f->source_generation++; invalidate_save(f);
+    }
     return r;
 }
 
 int file_check(file *f, uint32_t *reasons)
 {
     uint32_t r;
-    file_sync(f);
-    pthread_mutex_lock(&f->mu);
-    r = check_locked(f);
-    pthread_mutex_unlock(&f->mu);
+    if (!f->prefix_installed || f->open_status != FILE_OK) {
+        if (reasons) *reasons = 0;
+        return 0;
+    }
+    r = check_now(f);
     if (reasons) *reasons = r;
     return r != 0;
 }
@@ -721,27 +828,21 @@ int file_changed(const file *f)
 {
     file *m = (file *)f;
     int c;
-    file_sync(m);
-    pthread_mutex_lock(&m->mu);
     c = m->changed || (m->map && guard_faulted(m->map->slot));
-    pthread_mutex_unlock(&m->mu);
     return c;
 }
 
 int file_resolve_keep(file *f)
 {
-    file_sync(f);
-    pthread_mutex_lock(&f->mu);
     if (map_change(f->map)) {
-        if (!f->changed) f->source_generation++;
+        if (!f->changed) { f->source_generation++; invalidate_save(f); }
         f->changed = 1;
-        pthread_mutex_unlock(&f->mu);
         return FILE_ERR_CHANGED;
     }
     id_stat_path(f->path, &f->id);
     f->source_generation++;
     f->changed = 0;
-    pthread_mutex_unlock(&f->mu);
+    invalidate_save(f);
     return FILE_OK;
 }
 
@@ -749,8 +850,15 @@ static const uint32_t WATCH_MASK = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_D
 
 int file_watch_start(file *f)
 {
-    file_sync(f);
-    if (f->ifd >= 0) return f->ifd;
+    if (!file_prefix_ready(f)) return -1;
+    if (f->ifd >= 0) {
+        if (f->watch_refresh) {
+            if (f->iwd >= 0) (void)inotify_rm_watch(f->ifd, f->iwd);
+            f->iwd = inotify_add_watch(f->ifd, f->path, WATCH_MASK);
+            f->watch_refresh = f->iwd < 0;
+        }
+        return f->ifd;
+    }
     f->ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (f->ifd < 0) return -1;
     f->iwd = inotify_add_watch(f->ifd, f->path, WATCH_MASK);
@@ -758,28 +866,79 @@ int file_watch_start(file *f)
     return f->ifd;
 }
 
+static void check_job(work_ctx *c)
+{
+    file *f = c->arg;
+    id_stat_path(f->path, &f->check_result.observed);
+    f->check_result.map_reasons = map_change(f->check.map);
+    f->check_result.generation = f->check.generation;
+    atomic_store_explicit(&f->check_result_ready, 1, memory_order_release);
+    (void)post(c, FILE_MSG_CHECK_DONE, f, FILE_OK, 0, 0, 0, f->generation);
+    atomic_store_explicit(&f->check_fin, 1, memory_order_release);
+}
+
 int file_watch_poll(file *f)
 {
     int got = 0;
-    file_sync(f);
     if (f->ifd >= 0) {
         char buf[4096] __attribute__((aligned(8)));
-        for (;;) {
-            ssize_t r = read(f->ifd, buf, sizeof buf);
-            if (r <= 0) break;
-            got = 1;
-        }
+        /* One nonblocking buffer per call. Repeated EINTR and a continuous
+         * alternating producer both return to the event loop. */
+        ssize_t r = read(f->ifd, buf, sizeof buf);
+        got = r > 0;
     }
-    if (got) (void)file_check(f, NULL);
+    if (got) f->check_requested = 1;
+    if (f->check_requested && f->check_installed &&
+        atomic_load_explicit(&f->check_fin, memory_order_acquire) && file_prefix_ready(f)) {
+        f->check.map = f->map;
+        f->check.generation = f->source_generation;
+        f->check_installed = 0;
+        atomic_store_explicit(&f->check_result_ready, 0, memory_order_relaxed);
+        atomic_store(&f->check_fin, 0);
+        f->check_h = work_submit(f->pool, (work_job){ check_job, f, f->generation, WORK_BULK });
+        if (f->check_h.epoch) {
+            f->jobs[f->check_h.slot] = f->check_h;
+            f->check_requested = 0;
+        } else { atomic_store(&f->check_fin, 1); f->check_installed = 1; }
+    }
     return file_changed(f);
 }
 
-/* UI-only installation. The release publication precedes the mailbox message;
- * readiness/status polling also installs it, so no mailbox drain is required
- * merely to observe completion. Workers never mutate UI content or watches. */
-static void file_sync(file *f)
+/* UI-only installation reached exclusively through mailbox decode. Readiness
+ * and status getters inspect only installed UI state. */
+static void file_sync(file *f, uint32_t kind)
 {
-    if (!f->open_installed && atomic_load_explicit(&f->open_result_ready, memory_order_acquire)) {
+    if ((kind == FILE_MSG_PREFIX_READY || kind == FILE_MSG_OPEN_FAILED) &&
+        !f->prefix_installed && atomic_load_explicit(&f->prefix_result_ready, memory_order_acquire)) {
+        f->prefix_installed = 1;
+        f->open_status = f->prefix_result.status;
+        f->err_no = f->prefix_result.err_no;
+        f->fd = f->prefix_result.fd;
+        f->prefix = f->prefix_result.bytes;
+        f->prefix_len = f->prefix_result.len;
+        f->info = f->prefix_result.info;
+        f->size = f->prefix_result.id.size;
+        f->id = f->prefix_result.id;
+        f->open_identity = f->id;
+        f->mode = f->prefix_result.mode;
+        memcpy(f->path, f->prefix_result.path, sizeof f->path);
+        if (f->open_status == FILE_OK) {
+            if (!(f->mode == FILE_MODE_COPY && f->size <= f->prefix_len)) {
+                f->open_installed = 0;
+                atomic_store(&f->open_fin, 0);
+                f->open_h = work_submit(f->pool, (work_job){ open_job, f, f->generation, WORK_BULK });
+                if (f->open_h.epoch) f->jobs[f->open_h.slot] = f->open_h;
+                else {
+                    atomic_store(&f->open_fin, 1); f->open_installed = 1;
+                    f->open_status = FILE_ERR_POOL;
+                }
+            }
+        }
+    }
+    if (kind == FILE_MSG_OPEN_READY && f->prefix_installed && !f->open_h.epoch &&
+        f->open_status == FILE_OK) atomic_store(&f->ready, 1);
+    if ((kind == FILE_MSG_OPEN_READY || kind == FILE_MSG_OPEN_FAILED) &&
+        !f->open_installed && atomic_load_explicit(&f->open_result_ready, memory_order_acquire)) {
         f->map = f->open_result.map;
         f->data = f->open_result.data;
         f->data_len = f->open_result.data_len;
@@ -787,29 +946,38 @@ static void file_sync(file *f)
         f->open_installed = 1;
         if (f->open_result.status == FILE_OK) atomic_store(&f->ready, 1);
     }
-    if ((!f->save_installed && atomic_load_explicit(&f->save_result_ready, memory_order_acquire)) ||
-        (!f->save_replaced_installed && atomic_load_explicit(&f->save_replaced_ready, memory_order_acquire))) {
-        pthread_mutex_lock(&f->mu);
-        install_replaced_locked(f);
-        if (!f->save_installed && atomic_load_explicit(&f->save_result_ready, memory_order_acquire)) {
+    if ((kind == FILE_MSG_SAVE_DONE || kind == FILE_MSG_REPLACED) &&
+        ((!f->save_installed && kind == FILE_MSG_SAVE_DONE && atomic_load_explicit(&f->save_result_ready, memory_order_acquire)) ||
+        (!f->save_replaced_installed && atomic_load_explicit(&f->save_replaced_ready, memory_order_acquire)))) {
+        install_replaced(f);
+        if (kind == FILE_MSG_SAVE_DONE && !f->save_installed && atomic_load_explicit(&f->save_result_ready, memory_order_acquire)) {
             int rc = f->save_result.status;
+            if (rc == FILE_ERR_IO || rc == FILE_ERR_DIRSYNC) f->err_no = f->save_result.err_no;
             if (rc == FILE_OK || rc == FILE_ERR_DIRSYNC) {
                 if (f->source_generation == f->save.source_generation) f->changed = 0;
-                if (f->ifd >= 0) {
-                    if (f->iwd >= 0) (void)inotify_rm_watch(f->ifd, f->iwd);
-                    f->iwd = inotify_add_watch(f->ifd, f->path, WATCH_MASK);
-                }
+                if (f->ifd >= 0) f->watch_refresh = 1;
             } else if (rc == FILE_ERR_CHANGED) {
                 if (!f->changed) f->source_generation++;
                 f->changed = 1;
             }
             f->save_installed = 1;
         }
-        pthread_mutex_unlock(&f->mu);
+    }
+    if (kind == FILE_MSG_CHECK_DONE && !f->check_installed && atomic_load_explicit(&f->check_result_ready, memory_order_acquire)) {
+        uint32_t r = id_diff(&f->id, &f->check_result.observed) | f->check_result.map_reasons;
+        if (r && f->source_generation == f->check_result.generation) {
+            if (!f->changed) { f->source_generation++; invalidate_save(f); }
+            f->changed = 1;
+        }
+        f->check_installed = 1;
+    }
+    if (kind == FILE_MSG_SAVE_PREPARED) {
+        f->commit_pending = 1;
+        save_commit_pump(f);
     }
 }
 
-static void install_replaced_locked(file *f)
+static void install_replaced(file *f)
 {
     if (!f->save_replaced_installed &&
         atomic_load_explicit(&f->save_replaced_ready, memory_order_acquire)) {
@@ -821,11 +989,16 @@ static void install_replaced_locked(file *f)
 /* ---------------- durable save ---------------- */
 static void step_call(file_save_args *a, int s) { if (a->step) a->step(a->step_ctx, s); }
 
-static int write_all(int fd, const uint8_t *p, size_t n)
+static int write_all(file_save_args *a, int fd, const uint8_t *p, size_t n)
 {
     while (n) {
+        if (a->stop && a->stop(a->stop_ctx)) return FILE_ERR_CANCELLED;
         ssize_t w = write(fd, p, n);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            a->err_no = errno; return FILE_ERR_IO;
+        }
+        if (w == 0) { a->err_no = EIO; return FILE_ERR_IO; }
         p += (size_t)w;
         n -= (size_t)w;
     }
@@ -843,99 +1016,114 @@ static void split_path(const char *path, char *dir, size_t dn, char *base, size_
     snprintf(base, bn, "%s", sl + 1);
 }
 
-int file_save_write(file_save_args *a)
+static void transaction_discard(save_transaction *tx)
 {
-    char dir[PATH_MAX], base[NAME_MAX + 1], tmp[NAME_MAX + 1];
-    struct timespec ts;
-    int fd = -1, dfd = -1, rc = FILE_ERR_IO, locked = 0;
-    uint64_t total = piece_snapshot_len(a->snap), done = 0;
+    if (tx->fd >= 0) { close(tx->fd); tx->fd = -1; }
+    if (tx->dfd >= 0) {
+        if (tx->tmp[0]) (void)unlinkat(tx->dfd, tx->tmp, 0);
+        close(tx->dfd); tx->dfd = -1;
+    }
+}
+
+static int transaction_prepare(save_transaction *tx)
+{
+    file_save_args *a = &tx->args;
+    char dir[PATH_MAX]; struct timespec ts;
+    uint64_t total = piece_snapshot_len(a->snap);
     int mid_fired = 0;
-    piece_iter it;
-    const uint8_t *p;
-    size_t n;
-
-    a->written = 0;
-    a->err_no = 0;
-    split_path(a->path, dir, sizeof dir, base, sizeof base);
-    dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd < 0) { a->err_no = errno; return FILE_ERR_IO; }
+    a->written = 0; a->err_no = 0; tx->done = 0;
+    tx->fd = -1; tx->dfd = -1; tx->tmp[0] = '\0';
+    if (a->stop && a->stop(a->stop_ctx)) return FILE_ERR_CANCELLED;
+    split_path(a->path, dir, sizeof dir, tx->base, sizeof tx->base);
+    tx->dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (tx->dfd < 0) { a->err_no = errno; return FILE_ERR_IO; }
     clock_gettime(CLOCK_REALTIME, &ts);
-    snprintf(tmp, sizeof tmp, ".%.*s.edit-%ld-%llu.tmp", FILE_NAME_MAX_KEEP, base, (long)getpid(),
-             (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec);
-
-    fd = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) { a->err_no = errno; close(dfd); return FILE_ERR_IO; }
+    snprintf(tx->tmp, sizeof tx->tmp, ".%.*s.edit-%ld-%llu.tmp", FILE_NAME_MAX_KEEP,
+             tx->base, (long)getpid(), (unsigned long long)ts.tv_sec * 1000000000ull +
+             (unsigned long long)ts.tv_nsec);
+    tx->fd = openat(tx->dfd, tx->tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (tx->fd < 0) {
+        /* A failed O_EXCL may name somebody else's temp: never unlink it. */
+        a->err_no = errno; tx->tmp[0] = '\0'; transaction_discard(tx); return FILE_ERR_IO;
+    }
     step_call(a, FILE_STEP_TEMP_CREATED);
-
+    piece_iter it; const uint8_t *bytes; size_t n;
     piece_iter_begin_snapshot(&it, a->snap, 0);
-    while (piece_iter_next(&it, &p, &n)) {
+    int rc = FILE_ERR_IO;
+    while (piece_iter_next(&it, &bytes, &n)) {
         while (n) {
             size_t k = n < FILE_WRITE_CHUNK ? n : FILE_WRITE_CHUNK;
-            if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
-            if (write_all(fd, p, k) != 0) { a->err_no = errno; goto fail; }
-            p += k; n -= k; done += k;
-            if (!mid_fired && done * 2 >= total) { mid_fired = 1; step_call(a, FILE_STEP_MID_WRITE); }
+            rc = write_all(a, tx->fd, bytes, k);
+            if (rc != FILE_OK) goto fail;
+            bytes += k; n -= k; tx->done += k;
+            if (!mid_fired && tx->done * 2 >= total) {
+                mid_fired = 1; step_call(a, FILE_STEP_MID_WRITE);
+            }
         }
     }
+    rc = FILE_ERR_IO;
     if (!mid_fired) step_call(a, FILE_STEP_MID_WRITE);
-    if (fchmod(fd, (mode_t)(a->mode ? a->mode : 0644)) != 0) { a->err_no = errno; goto fail; }
+    if (fchmod(tx->fd, (mode_t)(a->mode ? a->mode : 0644)) != 0) { a->err_no = errno; goto fail; }
     step_call(a, FILE_STEP_TEMP_WRITTEN);
-    if (fsync(fd) != 0) { a->err_no = errno; goto fail; }
+    if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
+    if (fsync(tx->fd) != 0) { a->err_no = errno; goto fail; }
     step_call(a, FILE_STEP_FSYNCED);
+    return FILE_OK;
+fail:
+    transaction_discard(tx); return rc;
+}
 
+static int transaction_commit(save_transaction *tx)
+{
+    file_save_args *a = &tx->args;
+    int rc = FILE_ERR_IO, locked = 0;
     if (a->lock) { pthread_mutex_lock(a->lock); locked = 1; }
     if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
     if (a->expect) {
-        file_id now;
-        struct stat st;
+        file_id now; struct stat st;
         memset(&now, 0, sizeof now);
-        if (fstatat(dfd, base, &st, 0) == 0) id_from_stat(&now, &st);
+        if (fstatat(tx->dfd, tx->base, &st, 0) == 0) id_from_stat(&now, &st);
         if (id_diff(a->expect, &now)) { rc = FILE_ERR_CHANGED; goto fail; }
     }
-    {
-        struct stat st;
-        if (fstat(fd, &st) != 0) { a->err_no = errno; goto fail; }
-        if (a->validate) {
-            rc = a->validate(a->validate_ctx);
-            if (rc != FILE_OK) goto fail;
-        }
-        rc = FILE_ERR_IO;
-        if (renameat(dfd, tmp, dfd, base) != 0) { a->err_no = errno; goto fail; }
-        if (a->out_id) id_from_stat(a->out_id, &st);
-        if (a->replaced) a->replaced(a->replaced_ctx);
-    }
+    struct stat st;
+    if (fstat(tx->fd, &st) != 0) { a->err_no = errno; goto fail; }
+    if (a->validate) { rc = a->validate(a->validate_ctx); if (rc != FILE_OK) goto fail; }
+    rc = FILE_ERR_IO;
+    if (renameat(tx->dfd, tx->tmp, tx->dfd, tx->base) != 0) { a->err_no = errno; goto fail; }
+    tx->tmp[0] = '\0';
+    if (a->out_id) id_from_stat(a->out_id, &st);
+    if (a->replaced) a->replaced(a->replaced_ctx);
     if (locked) { pthread_mutex_unlock(a->lock); locked = 0; }
-    close(fd); fd = -1;
-    a->written = done;
+    close(tx->fd); tx->fd = -1;
+    a->written = tx->done;
     step_call(a, FILE_STEP_RENAMED);
-
-    {
-        if (fsync(dfd) != 0) {
-            a->err_no = errno;
-            close(dfd);
-            return FILE_ERR_DIRSYNC;
-        }
-        close(dfd);
+    if (fsync(tx->dfd) != 0) {
+        a->err_no = errno; transaction_discard(tx); return FILE_ERR_DIRSYNC;
     }
+    transaction_discard(tx);
     step_call(a, FILE_STEP_DIR_SYNCED);
     return FILE_OK;
 fail:
     if (locked) pthread_mutex_unlock(a->lock);
-    if (fd >= 0) close(fd);
-    (void)unlinkat(dfd, tmp, 0);
-    close(dfd);
+    transaction_discard(tx); return rc;
+}
+
+int file_save_write(file_save_args *a)
+{
+    save_transaction tx = { .args = *a, .fd = -1, .dfd = -1 };
+    int rc = transaction_prepare(&tx);
+    if (rc == FILE_OK) rc = transaction_commit(&tx);
+    a->written = tx.args.written; a->err_no = tx.args.err_no;
     return rc;
 }
 
 static int stop_cb(void *ctx) { return work_should_stop((work_ctx *)ctx); }
 
-/* Called under f->mu immediately before rename. Path identity alone cannot
+/* Called immediately before rename. Path identity alone cannot
  * validate a tree whose original inode survived an earlier replacement. */
 static int source_validate(void *ctx)
 {
     file *f = ctx;
-    if (f->source_generation != f->save.source_generation) return FILE_ERR_CHANGED;
-    if (!(f->save.flags & FILE_SAVE_FORCE) && f->changed) return FILE_ERR_CHANGED;
     file_map *m = f->save.source_map;
     if (m) {
         if (guard_faults(m->slot) != f->save.source_faults) return FILE_ERR_CHANGED;
@@ -945,13 +1133,15 @@ static int source_validate(void *ctx)
         id_from_stat(&now, &st);
         if (id_diff(&f->save.source_id, &now)) return FILE_ERR_CHANGED;
     }
-    return FILE_OK;
+    return f->save.authorized ? FILE_OK : FILE_ERR_CHANGED;
 }
 
 static void publish_replaced(void *ctx)
 {
-    file *f = ctx;
+    work_ctx *c = ctx;
+    file *f = c->arg;
     atomic_store_explicit(&f->save_replaced_ready, 1, memory_order_release);
+    (void)post(c, FILE_MSG_REPLACED, f, FILE_OK, 0, 0, 0, f->save.generation);
 }
 
 static void save_job(work_ctx *c)
@@ -967,27 +1157,107 @@ static void save_job(work_ctx *c)
     a.step_ctx = f->save.step_ctx;
     a.stop = stop_cb;
     a.stop_ctx = c;
-    a.lock = &f->mu;
     a.out_id = &f->save_result.id;
     a.validate = source_validate;
     a.validate_ctx = f;
     a.replaced = publish_replaced;
-    a.replaced_ctx = f;
+    a.replaced_ctx = c;
 
-    int rc = file_save_write(&a);
+    int rc = FILE_OK;
+    if (f->save.source_map && (f->save.flags & FILE_SAVE_FORCE)) {
+        struct stat st;
+        if (fstat(f->save.source_map->fd, &st) != 0) { a.err_no = errno; rc = FILE_ERR_IO; }
+        else id_from_stat(&f->save.source_id, &st);
+    }
+    f->transaction.args = a;
+    if (rc == FILE_OK) rc = transaction_prepare(&f->transaction);
     piece_snapshot_release(f->save.snap);
     f->save.snap = NULL;
+    f->prepare_status = rc;
+    if (rc == FILE_OK) {
+        (void)post(c, FILE_MSG_SAVE_PREPARED, f, FILE_OK, 0, 0, 0, f->save.generation);
+    } else {
+        f->save_result.status = rc;
+        f->save_result.err_no = f->transaction.args.err_no;
+        atomic_store_explicit(&f->save_result_ready, 1, memory_order_release);
+        (void)post(c, FILE_MSG_SAVE_DONE, f, rc, 0, 0, f->save_result.err_no, f->save.generation);
+        atomic_store_explicit(&f->save_fin, 1, memory_order_release);
+    }
+    atomic_store_explicit(&f->prepare_fin, 1, memory_order_release);
+}
+
+/* UI continuation. Mutable source state never crosses to a worker: the
+ * mailbox returns preparation ownership, then this captures a fresh immutable
+ * authorization. Worker checks backing identity/fault epoch again before
+ * rename. The remaining last-validation-to-rename race is unchanged. */
+static void save_commit_pump(file *f)
+{
+    if (!f->commit_pending) return;
+    f->save.authorized = f->source_generation == f->save.source_generation &&
+                         ((f->save.flags & FILE_SAVE_FORCE) || !file_changed(f));
+    work_handle h = work_submit(f->pool, (work_job){ save_commit_job, f, f->save.generation, WORK_BULK });
+    if (h.epoch) {
+        f->save_h = h; f->jobs[h.slot] = h; f->commit_pending = 0;
+    }
+}
+
+static void save_commit_job(work_ctx *c)
+{
+    file *f = c->arg;
+    f->transaction.args.stop_ctx = c;
+    f->transaction.args.replaced_ctx = c;
+    int rc = f->save.authorized ? transaction_commit(&f->transaction) : FILE_ERR_CHANGED;
+    if (!f->save.authorized) transaction_discard(&f->transaction);
     f->save_result.status = rc;
+    f->save_result.err_no = f->transaction.args.err_no;
     atomic_store_explicit(&f->save_result_ready, 1, memory_order_release);
-    (void)post(c, FILE_MSG_SAVE_DONE, f, rc, 0, a.written, a.err_no, f->save.generation);
+    (void)post(c, FILE_MSG_SAVE_DONE, f, rc, 0, f->transaction.args.written,
+               f->save_result.err_no, f->save.generation);
     atomic_store_explicit(&f->save_fin, 1, memory_order_release);
+}
+
+static void save_abort_job(work_ctx *c)
+{
+    file *f = c->arg;
+    /* Same BULK queue as commit: a skipped/cancelled commit has relinquished
+     * every descriptor before this continuation runs. Its mailbox epoch is
+     * independent, so source invalidation does not lose the terminal result. */
+    transaction_discard(&f->transaction);
+    f->save_result.status = FILE_ERR_CHANGED;
+    f->save_result.err_no = 0;
+    atomic_store_explicit(&f->save_result_ready, 1, memory_order_release);
+    (void)post(c, FILE_MSG_SAVE_DONE, f, FILE_ERR_CHANGED, 0,
+               f->transaction.args.written, 0, f->save.generation);
+    atomic_store_explicit(&f->save_fin, 1, memory_order_release);
+    atomic_store_explicit(&f->abort_fin, 1, memory_order_release);
+}
+
+static void save_abort_pump(file *f)
+{
+    if (!f->abort_pending) return;
+    work_handle h = work_submit(f->pool, (work_job){ save_abort_job, f, f->save.generation, WORK_BULK });
+    if (h.epoch) {
+        f->abort_h = h; f->jobs[h.slot] = h; f->abort_pending = 0;
+    }
+}
+
+static void invalidate_save(file *f)
+{
+    if (f->save_installed || !f->save_h.epoch || f->save_replaced_installed || f->save_aborted) return;
+    f->save_aborted = 1;
+    work_cancel(f->pool, f->save_h);
+    f->abort_pending = 1;
+    atomic_store(&f->abort_fin, 0);
+    save_abort_pump(f);
 }
 
 int file_save_busy(const file *f)
 {
-    int busy = !atomic_load_explicit(&((file *)f)->save_fin, memory_order_acquire);
-    file_sync((file *)f);
-    return busy;
+    save_commit_pump((file *)f);
+    save_abort_pump((file *)f);
+    return !f->save_installed || !atomic_load_explicit(&f->save_fin, memory_order_acquire) ||
+           !atomic_load_explicit(&f->prepare_fin, memory_order_acquire) ||
+           !atomic_load_explicit(&f->abort_fin, memory_order_acquire);
 }
 
 void file_set_step_hook(file *f, void (*step)(void *, int), void *ctx)
@@ -1000,8 +1270,8 @@ int file_save_begin(file *f, piece_tree *t, unsigned flags, uint32_t generation)
 {
     piece_snapshot *s;
     if (file_save_busy(f)) return FILE_ERR_BUSY;
+    if (!file_open_ready(f) || !f->attached) return FILE_ERR_STATE;
     if (!(flags & FILE_SAVE_FORCE)) {
-        (void)file_check(f, NULL);
         if (file_changed(f)) return FILE_ERR_CHANGED;
     }
     s = piece_snapshot_take(t);
@@ -1011,38 +1281,31 @@ int file_save_begin(file *f, piece_tree *t, unsigned flags, uint32_t generation)
     f->save.generation = generation;
     f->save.step = f->step;
     f->save.step_ctx = f->step_ctx;
-    pthread_mutex_lock(&f->mu);
     f->save.expect = f->id;
     f->save.mode = f->id.mode;
     f->save.source_generation = f->source_generation;
-    f->save.source_map = f->map;
-    f->save.source_faults = f->map ? guard_faults(f->map->slot) : 0;
-    pthread_mutex_unlock(&f->mu);
-    if (f->map) {
-        if (flags & FILE_SAVE_FORCE) {
-            struct stat st;
-            if (fstat(f->map->fd, &st) != 0) {
-                f->err_no = errno;
-                piece_snapshot_release(s); f->save.snap = NULL;
-                return FILE_ERR_IO;
-            }
-            id_from_stat(&f->save.source_id, &st);
-        } else f->save.source_id = f->map->identity;
-    }
+    f->save.source_map = f->mode == FILE_MODE_MMAP ? f->map : NULL;
+    f->save.source_faults = f->save.source_map ? guard_faults(f->save.source_map->slot) : 0;
+    if (f->save.source_map) f->save.source_id = f->save.source_map->identity;
     f->save_installed = 0;
     f->save_replaced_installed = 0;
     atomic_store_explicit(&f->save_result_ready, 0, memory_order_relaxed);
     atomic_store_explicit(&f->save_replaced_ready, 0, memory_order_relaxed);
     atomic_store(&f->save_fin, 0);
-    f->save_h = work_submit(f->pool, (work_job){ save_job, f, generation, WORK_BULK });
-    if (f->save_h.epoch == 0) {
+    atomic_store(&f->prepare_fin, 0);
+    f->save_h = (work_handle){0};
+    f->abort_h = (work_handle){0};
+    f->save_aborted = 0; f->abort_pending = 0;
+    f->prepare_h = work_submit(f->pool, (work_job){ save_job, f, generation, WORK_BULK });
+    if (f->prepare_h.epoch == 0) {
         atomic_store(&f->save_fin, 1);
+        atomic_store(&f->prepare_fin, 1);
         piece_snapshot_release(s);
         f->save.snap = NULL;
         f->save_installed = 1;
         f->save_replaced_installed = 1;
         return FILE_ERR_POOL;
     }
-    f->jobs[f->save_h.slot] = f->save_h;
+    f->jobs[f->prepare_h.slot] = f->prepare_h;
     return FILE_OK;
 }

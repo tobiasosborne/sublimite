@@ -24,9 +24,9 @@ typedef struct fuzz_model {
 } fuzz_model;
 typedef struct fuzz_completion {
     file *f;
-    uint32_t generation;
+    uint32_t kind, generation;
     file_msg msg;
-    int seen;
+    int seen, prefix, opened, prepared, replaced;
 } fuzz_completion;
 typedef struct fuzz_blocker {
     _Atomic int started, release, done;
@@ -46,8 +46,20 @@ static void fuzz_pause(void)
 }
 static void fuzz_collect(const work_msg *wm, void *ud)
 {
-    fuzz_completion *c = ud; file_msg m;
-    if (file_msg_decode(wm, &m) == FILE_OK && m.f == c->f && m.generation == c->generation) {
+    fuzz_completion *c = ud; file_msg m = {0};
+    int decoded = file_msg_decode(wm, &m);
+    if (m.f != c->f || m.generation != c->generation) return;
+    if (decoded != FILE_OK) {
+        if (wm->kind == FILE_MSG_SAVE_PREPARED) fuzz_require(++c->prepared == 1);
+        if (wm->kind == FILE_MSG_REPLACED) fuzz_require(++c->replaced == 1 && c->prepared == 1);
+        return;
+    }
+    if (m.kind == FILE_MSG_PREFIX_READY) fuzz_require(++c->prefix == 1 && m.status == FILE_OK);
+    if (m.kind == FILE_MSG_OPEN_READY) fuzz_require(++c->opened == 1 && c->prefix == 1);
+    if (m.kind == FILE_MSG_OPEN_FAILED) fuzz_require(c->kind == FILE_MSG_OPEN_FAILED);
+    if (m.kind == FILE_MSG_SAVE_DONE && m.status == FILE_OK)
+        fuzz_require(c->prepared == 1 && c->replaced == 1);
+    if (m.kind == c->kind) {
         fuzz_require(!c->seen);
         c->msg = m; c->seen = 1;
     }
@@ -56,13 +68,15 @@ static void fuzz_wait(fuzz_model *m, fuzz_completion *c)
 {
     for (unsigned i = 0; i < 100000 && !c->seen; i++) {
         (void)work_mailbox_drain(&m->pool, fuzz_collect, c);
+        if (c->kind == FILE_MSG_SAVE_DONE) (void)file_save_busy(c->f);
         if (!c->seen) fuzz_pause();
     }
     fuzz_require(c->seen);
 }
 static void fuzz_discard(const work_msg *wm, void *ud)
 {
-    (void)wm; (void)ud;
+    (void)ud; file_msg msg;
+    (void)file_msg_decode(wm, &msg);
 }
 static void fuzz_write(const char *path, const uint8_t *bytes, size_t len)
 {
@@ -106,14 +120,14 @@ static void fuzz_open(fuzz_model *m, int mapped)
 {
     file_open_opts opts = {.copy_threshold = mapped ? 1 : MODEL_CAP + 1u, .generation = ++m->generation};
     fuzz_require(file_open_begin(&m->pool, m->path, &opts, &m->f) == FILE_OK);
+    fuzz_require(!file_prefix_ready(m->f) && !file_open_ready(m->f));
+    fuzz_completion c = {.f = m->f, .kind = FILE_MSG_OPEN_READY, .generation = opts.generation};
+    fuzz_wait(m, &c);
+    fuzz_require(c.prefix == 1 && c.opened == 1 && c.msg.status == FILE_OK && c.msg.size == m->disk_len);
+    fuzz_require(file_prefix_ready(m->f) && file_open_ready(m->f));
     size_t n = 0; const uint8_t *p = file_prefix(m->f, &n);
     fuzz_require(n == m->disk_len && (n == 0 || (p && memcmp(p, m->disk, n) == 0)));
     fuzz_require(file_size(m->f) == m->disk_len);
-    if (!file_open_ready(m->f)) {
-        fuzz_completion c = {.f = m->f, .generation = opts.generation};
-        fuzz_wait(m, &c);
-        fuzz_require(c.msg.kind == FILE_MSG_OPEN_READY && c.msg.status == FILE_OK && c.msg.size == m->disk_len);
-    }
     piece_allocator a = piece_default_allocator(); m->tree = piece_create(&a);
     fuzz_require(m->tree && file_attach(m->f, m->tree) == FILE_OK);
     fuzz_require(file_attach(m->f, m->tree) == FILE_ERR_STATE);
@@ -157,9 +171,11 @@ static void fuzz_save(fuzz_model *m, uint8_t key)
     memcpy(m->disk, m->bytes, m->len); m->disk_len = m->len;
     fuzz_insert(m, key, &key, 1);
     atomic_store(&b.release, 1);
-    fuzz_completion c = {.f = m->f, .generation = gen}; fuzz_wait(m, &c);
+    fuzz_completion c = {.f = m->f, .kind = FILE_MSG_SAVE_DONE, .generation = gen}; fuzz_wait(m, &c);
     fuzz_require(c.msg.kind == FILE_MSG_SAVE_DONE && c.msg.status == FILE_OK && c.msg.size == m->disk_len);
-    for (unsigned i = 0; i < 100000 && file_save_busy(m->f); i++) fuzz_pause();
+    for (unsigned i = 0; i < 100000 && file_save_busy(m->f); i++) {
+        (void)work_mailbox_drain(&m->pool, fuzz_collect, &c); fuzz_pause();
+    }
     fuzz_require(!file_save_busy(m->f) && atomic_load(&b.done));
     fuzz_disk(m); fuzz_no_temps(m); fuzz_tree(m);
 }
@@ -250,7 +266,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         case 7: {
             file *bad = NULL;
-            fuzz_require(file_open_begin(&m.pool, m.dir, NULL, &bad) == FILE_ERR_NOTREG && bad == NULL);
+            file_open_opts opts = {.generation = ++m.generation};
+            fuzz_require(file_open_begin(&m.pool, m.dir, &opts, &bad) == FILE_OK && bad != NULL);
+            fuzz_require(!file_prefix_ready(bad) && !file_open_ready(bad));
+            fuzz_completion c = {.f = bad, .kind = FILE_MSG_OPEN_FAILED, .generation = opts.generation};
+            fuzz_wait(&m, &c);
+            fuzz_require(c.msg.status == FILE_ERR_NOTREG && c.prefix == 0 && c.opened == 0);
+            fuzz_require(!file_prefix_ready(bad) && !file_open_ready(bad));
+            file_close(bad);
+            (void)work_mailbox_drain(&m.pool, fuzz_discard, NULL);
             break;
         }
         }

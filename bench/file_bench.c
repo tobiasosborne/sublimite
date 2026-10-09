@@ -22,7 +22,7 @@
 typedef struct collector {
     file *f;
     uint32_t kind, generation;
-    int seen, bad;
+    int seen, bad, failed, prefix, opened, prepared, replaced;
     file_msg msg;
     render_backend *backend;
 } collector;
@@ -158,8 +158,22 @@ static void collect(const work_msg *wm, void *ud)
         render_event ev = { .kind = RENDER_EVENT_WORK, .frame_id = c->backend->active_frame, .work = wm };
         (void)render_backend_event(c->backend, &ev);
     }
-    file_msg m;
-    if (file_msg_decode(wm, &m) == 0 && m.f == c->f && m.kind == c->kind && m.generation == c->generation) {
+    /* Decode internal notifications too: SAVE_PREPARED authorizes/enqueues
+     * commit on UI, and REPLACED installs the new identity before SAVE_DONE. */
+    file_msg m = {0};
+    int decoded = file_msg_decode(wm, &m);
+    if (!c->f || m.f != c->f || m.generation != c->generation) return;
+    if (decoded != FILE_OK) {
+        if (wm->kind == FILE_MSG_SAVE_PREPARED && ++c->prepared != 1) c->bad = 1;
+        if (wm->kind == FILE_MSG_REPLACED && (++c->replaced != 1 || c->prepared != 1)) c->bad = 1;
+        return;
+    }
+    if (m.kind == FILE_MSG_PREFIX_READY && (++c->prefix != 1 || m.status != FILE_OK)) c->bad = 1;
+    if (m.kind == FILE_MSG_OPEN_READY && (++c->opened != 1 || c->prefix != 1)) c->bad = 1;
+    if (m.kind == FILE_MSG_OPEN_FAILED) { c->failed = 1; c->msg = m; }
+    if (m.kind == FILE_MSG_SAVE_DONE && m.status == FILE_OK &&
+        (c->prepared != 1 || c->replaced != 1)) c->bad = 1;
+    if (m.kind == c->kind) {
         if (c->seen) c->bad = 1;
         c->seen++; c->msg = m;
     }
@@ -167,11 +181,23 @@ static void collect(const work_msg *wm, void *ud)
 static int await_message(work_pool *pool, collector *c)
 {
     uint64_t start = bench_now_ns();
-    while (!c->seen && bench_now_ns() - start < 60000000000ull) {
+    while (!c->seen && !c->bad && !c->failed && bench_now_ns() - start < 60000000000ull) {
         (void)work_mailbox_drain(pool, collect, c);
+        if (c->kind == FILE_MSG_SAVE_DONE) (void)file_save_busy(c->f);
         if (!c->seen) pause_briefly();
     }
-    return c->seen == 1 && !c->bad ? 0 : 1;
+    return c->seen == 1 && !c->bad && !c->failed ? 0 : 1;
+}
+/* Physical retirement is required before a new trial, but is outside the
+ * G8d interval, which ends at decoded durable SAVE_DONE receipt. */
+static int finish_save(work_pool *pool, collector *c)
+{
+    uint64_t start = bench_now_ns();
+    while (file_save_busy(c->f) && bench_now_ns() - start < 60000000000ull) {
+        (void)work_mailbox_drain(pool, collect, c);
+        pause_briefly();
+    }
+    return file_save_busy(c->f) || c->bad;
 }
 static void bulk_busy(work_ctx *ctx)
 {
@@ -420,9 +446,15 @@ static int open_row(work_pool *pool, view *v, const char *name, const char *path
         file *f = NULL; file_open_opts opts = {.generation = i + 1u};
         uint64_t start = bench_now_ns();
         int opened = file_open_begin(pool, path, &opts, &f);
+        collector c = {.f = f, .kind = FILE_MSG_PREFIX_READY, .generation = opts.generation,
+                       .backend = &v->backend};
+        v->pending = &c;
+        rc = opened != FILE_OK;
+        if (!rc) rc = await_message(pool, &c) || c.msg.status != FILE_OK ||
+                      !file_prefix_ready(f) || c.msg.size != n;
         uint64_t acquired = bench_now_ns();
         size_t got = 0; const uint8_t *bytes = f ? file_prefix(f, &got) : NULL;
-        rc = opened != FILE_OK || (f && file_size(f) != size) || !prefix_correct(bytes, got, expected, n);
+        if (!rc) rc = file_size(f) != size || !prefix_correct(bytes, got, expected, n);
         if (!rc) rc = layout_prefix(v, bytes, got);
         if (!rc) rc = memcmp(v->expected, v->cells, sizeof v->cells) != 0 || render_grid_validate(&v->grid) != 0;
         if (!rc) rc = submit_view(v, pool);
@@ -430,8 +462,10 @@ static int open_row(work_pool *pool, view *v, const char *name, const char *path
         stop_busy(pool, &busy);
         if (!rc) { (void)bench_add(&prefix, acquired - start); (void)bench_add(&endpoint, submitted - start); }
         if (finish_frame(v, pool)) rc = 1;
+        rc |= c.bad || c.failed;
+        v->pending = NULL;
         if (f) file_close(f);
-        collector c = {0}; (void)work_mailbox_drain(pool, collect, &c);
+        collector drain = {0}; (void)work_mailbox_drain(pool, collect, &drain);
         if ((i + 1u) % 10u == 0) printf("PROGRESS G5_%s busy%u done=%u/%u\n", name, jobs, i + 1u, samples);
     }
     char row[128]; snprintf(row, sizeof row, "primitive_prefix_%s_busy%u", name, jobs);
@@ -511,9 +545,10 @@ static int save_row(work_pool *pool, view *v, uint64_t size, unsigned jobs, unsi
     uint64_t *at = calloc(samples, sizeof(uint64_t)), *dt = calloc(samples, sizeof(uint64_t));
     if (!at || !dt) rc = 1;
     if (!rc) rc = file_open_begin(pool, path, NULL, &f) != FILE_OK;
-    if (!rc && !file_open_ready(f)) {
+    if (!rc) {
         collector c = {.f = f, .kind = FILE_MSG_OPEN_READY};
-        rc = await_message(pool, &c) || c.msg.status != FILE_OK;
+        rc = await_message(pool, &c) || c.msg.status != FILE_OK || c.msg.size != size ||
+             !file_open_ready(f) || !file_prefix_ready(f);
     }
     piece_allocator a = piece_default_allocator();
     if (!rc) { t = piece_create(&a); rc = !t || file_attach(f, t) != FILE_OK; }
@@ -539,6 +574,7 @@ static int save_row(work_pool *pool, view *v, uint64_t size, unsigned jobs, unsi
         stop_busy(pool, &busy);
         if (!rc) rc = await_message(pool, &c) || !completion_correct(&c.msg, f, generation, piece_len(t));
         uint64_t complete = bench_now_ns();
+        if (!rc) rc = finish_save(pool, &c);
         if (!rc) {
             piece_snapshot *snap = piece_snapshot_take(t);
             rc = !snap || output_correct(path, snap);

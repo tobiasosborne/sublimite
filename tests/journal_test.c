@@ -415,7 +415,10 @@ static int verify_save_marker(const char *path, const journal_base *b, uint64_t 
     save_marker_check c={.base=b,.cutoff=cutoff,.phase=phase}; journal_replay_result rr;
     CHECK(journal_replay_file(path,check_save_marker,&c,&rr)==0 && c.seen && !rr.corrupt); return 0;
 }
-typedef struct save_message { unsigned done; int status; } save_message;
+typedef struct save_message {
+    unsigned prefix, opened, failed, prepared, replaced, done;
+    int status;
+} save_message;
 typedef struct save_pause { _Atomic bool entered, release; } save_pause;
 static void pause_save(void *ctx, int step)
 {
@@ -427,93 +430,221 @@ static void pause_save(void *ctx, int step)
 static void save_route(const work_msg *m, void *ctx)
 {
     save_message *s=ctx; file_msg fm;
-    if(!file_msg_decode(m,&fm) && fm.kind==FILE_MSG_SAVE_DONE) { s->done++; s->status=fm.status; }
+    int rc=file_msg_decode(m,&fm);
+    if(m->kind==FILE_MSG_SAVE_PREPARED) s->prepared++;
+    if(m->kind==FILE_MSG_REPLACED) s->replaced++;
+    if(rc) return;
+    if(fm.kind==FILE_MSG_PREFIX_READY) s->prefix++;
+    if(fm.kind==FILE_MSG_OPEN_READY) s->opened++;
+    if(fm.kind==FILE_MSG_OPEN_FAILED) { s->failed++; s->status=fm.status; }
+    if(fm.kind==FILE_MSG_SAVE_DONE) { s->done++; s->status=fm.status; }
 }
+typedef struct save_dispatch { journal *j; save_message *completion; } save_dispatch;
+static void save_drain(const work_msg *m, void *ctx)
+{
+    save_dispatch *s=ctx;
+    if(!journal_receive(s->j,m)) save_route(m,s->completion);
+}
+/* Blocking fixture/startup protocol: readiness comes only from live mailbox
+ * receipt. On failure/cancellation, close before draining stale notifications. */
+static int save_open(work_pool *pool, journal *j, const char *path,
+                     const file_open_opts *opts, save_message *completion, file **out)
+{
+    int rc=file_open_begin(pool,path,opts,out);
+    if(rc) return rc;
+    save_dispatch dispatch={j,completion};
+    for(unsigned wait=0;wait<2000;wait++) {
+        (void)work_mailbox_drain(pool,save_drain,&dispatch);
+        if(completion->failed) { rc=completion->status; break; }
+        if(completion->opened && file_open_ready(*out)) return FILE_OK;
+        pause_ms();
+    }
+    if(!rc) rc=FILE_ERR_STATE;
+    file_close(*out); *out=NULL;
+    (void)work_mailbox_drain(pool,save_drain,&dispatch);
+    return rc;
+}
+static int save_wait(work_pool *pool, journal *j, file *f, save_message *completion)
+{
+    save_dispatch dispatch={j,completion};
+    for(unsigned wait=0;wait<2000;wait++) {
+        (void)work_mailbox_drain(pool,save_drain,&dispatch);
+        if(completion->done && !file_save_busy(f)) return completion->status;
+        pause_ms();
+    }
+    return FILE_ERR_STATE;
+}
+#define SAVE_CHECK(x) do { if (!(x)) { fprintf(stderr,"journal_test:%d FAIL %s\n",__LINE__,#x); failed=1; goto cleanup; } } while (0)
 static int save_test(void)
 {
     char path[]="/tmp/journal-save-XXXXXX", target[]="/tmp/journal-target-XXXXXX";
-    CHECK(temp(path)>=0 && temp(target)>=0);
-    int fd=open(target,O_WRONLY); CHECK(fd>=0 && write(fd,"abcdef",6)==6); close(fd);
-    journal_base b; CHECK(journal_capture_base(target,&b)==0);
+    int failed=0, fd=-1;
+    bool pool_ready=false;
+    work_pool pool; journal *j=NULL; file *f=NULL; piece_tree *t=NULL;
+    fault_disk *d=NULL; uint8_t *overflow=NULL;
+    journal_save save={0};
+    save_restore before={{NULL,NULL}}, recovered={{NULL,NULL}};
+    save_pause paused; atomic_init(&paused.entered,false); atomic_init(&paused.release,false);
+    SAVE_CHECK(temp(path)>=0 && temp(target)>=0);
+    fd=open(target,O_WRONLY); SAVE_CHECK(fd>=0 && write(fd,"abcdef",6)==6); close(fd); fd=-1;
+    journal_base b; SAVE_CHECK(journal_capture_base(target,&b)==0);
     uint8_t bp[4137], empty[41]={0}, del[16]={0}, other[9]={0}, later[9]={0};
     base_payload(bp,&b); del[8]=3; other[8]='Y'; later[8]='X';
     journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
                          {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other,9}};
-    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
-    CHECK(journal_set_base(j,1,&b)==0 && journal_delete(j,1,0,3)==0);
-    CHECK(journal_set_base(j,2,&(journal_base){.path=""})==0 && journal_insert(j,2,0,(const uint8_t *)"Y",1)==0);
-    journal_save save={0}; CHECK(journal_save_prepare(j,1,&b,cp,4,&save)==JOURNAL_OK);
-    CHECK(save.prepared && save.sequence==4 && access(save.previous_path,F_OK)==0);
-    CHECK(verify_save_marker(path,&b,4,1)==0);
+    SAVE_CHECK(work_pool_init(&pool,1,0)==0); pool_ready=true;
+    SAVE_CHECK(journal_open(&j,path,&pool,NULL)==0);
+    SAVE_CHECK(journal_set_base(j,1,&b)==0 && journal_delete(j,1,0,3)==0);
+    SAVE_CHECK(journal_set_base(j,2,&(journal_base){.path=""})==0 && journal_insert(j,2,0,(const uint8_t *)"Y",1)==0);
+    SAVE_CHECK(journal_save_prepare(j,1,&b,cp,4,&save)==JOURNAL_OK);
+    SAVE_CHECK(save.prepared && save.sequence==4 && access(save.previous_path,F_OK)==0);
+    SAVE_CHECK(verify_save_marker(path,&b,4,1)==0);
     /* Crash after prepare, before replacement: generation is already valid. */
     piece_allocator before_allocator=piece_default_allocator();
-    save_restore before={{piece_create(&before_allocator),piece_create(&before_allocator)}};
-    journal_replay_result before_rr; CHECK(journal_replay_file(path,load_save,&before,&before_rr)==0);
+    before=(save_restore){{piece_create(&before_allocator),piece_create(&before_allocator)}};
+    journal_replay_result before_rr; SAVE_CHECK(journal_replay_file(path,load_save,&before,&before_rr)==0);
     uint8_t before_text[3];
-    CHECK(piece_len(before.trees[0])==3 && piece_read(before.trees[0],0,before_text,3)==0 && !memcmp(before_text,"def",3));
-    CHECK(piece_len(before.trees[1])==1 && piece_read(before.trees[1],0,before_text,1)==0 && before_text[0]=='Y');
-    piece_destroy(before.trees[0]); piece_destroy(before.trees[1]);
+    SAVE_CHECK(piece_len(before.trees[0])==3 && piece_read(before.trees[0],0,before_text,3)==0 && !memcmp(before_text,"def",3));
+    SAVE_CHECK(piece_len(before.trees[1])==1 && piece_read(before.trees[1],0,before_text,1)==0 && before_text[0]=='Y');
+    piece_destroy(before.trees[0]); piece_destroy(before.trees[1]); before=(save_restore){{NULL,NULL}};
     save_message completion={0}; journal_set_message_handler(j,save_route,&completion);
     /* Compose with the real asynchronous file save entry point. */
-    file *f; CHECK(file_open_begin(&pool,target,NULL,&f)==0 && file_open_ready(f));
-    piece_allocator a=piece_default_allocator(); piece_tree *t=piece_create(&a); CHECK(t && file_attach(f,t)==0);
-    save_pause paused; atomic_init(&paused.entered,false); atomic_init(&paused.release,false);
+    SAVE_CHECK(save_open(&pool,j,target,NULL,&completion,&f)==FILE_OK);
+    SAVE_CHECK(completion.prefix==1 && completion.opened==1 && completion.failed==0);
+    piece_allocator a=piece_default_allocator(); t=piece_create(&a); SAVE_CHECK(t && file_attach(f,t)==0);
     file_set_step_hook(f,pause_save,&paused);
-    CHECK(piece_delete(t,0,3,NULL)==0); CHECK(file_save_begin(f,t,0,1)==0);
+    SAVE_CHECK(piece_delete(t,0,3,NULL)==0); SAVE_CHECK(file_save_begin(f,t,0,1)==0);
     unsigned wait=0;
     while(!atomic_load_explicit(&paused.entered,memory_order_acquire) && wait++<2000) pause_ms();
-    CHECK(wait<2000 && file_save_busy(f));
-    CHECK(piece_insert(t,0,(const uint8_t *)"X",1)==0);
-    CHECK(journal_insert(j,1,0,(const uint8_t *)"X",1)==0);
-    CHECK(journal_insert(j,2,1,(const uint8_t *)"Z",1)==0);
+    SAVE_CHECK(wait<2000 && file_save_busy(f));
+    SAVE_CHECK(piece_insert(t,0,(const uint8_t *)"X",1)==0);
+    SAVE_CHECK(journal_insert(j,1,0,(const uint8_t *)"X",1)==0);
+    SAVE_CHECK(journal_insert(j,2,1,(const uint8_t *)"Z",1)==0);
     atomic_store_explicit(&paused.release,true,memory_order_release);
-    CHECK(journal_flush(j)==0);
-    CHECK(completion.done==1 && completion.status==FILE_OK);
-    CHECK(journal_get_stats(j).durable_sequence==7);
-    CHECK(verify_save(path,"Xdef")==0); /* crash after save, before checkpoint */
-    CHECK(journal_capture_base(target,&b)==0 && b.size==3); base_payload(bp,&b);
+    SAVE_CHECK(journal_flush(j)==0);
+    SAVE_CHECK(save_wait(&pool,j,f,&completion)==FILE_OK);
+    SAVE_CHECK(completion.done==1 && completion.status==FILE_OK);
+    SAVE_CHECK(completion.prepared==1 && completion.replaced==1 && !file_save_busy(f));
+    SAVE_CHECK(journal_get_stats(j).durable_sequence==7);
+    SAVE_CHECK(verify_save(path,"Xdef")==0); /* crash after save, before checkpoint */
+    SAVE_CHECK(journal_capture_base(target,&b)==0 && b.size==3); base_payload(bp,&b);
     uint8_t other_now[10]={0}; memcpy(other_now+8,"YZ",2);
     journal_record next[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_INSERT,1,0,later,9},
                            {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other_now,10}};
-    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path;
-    journal_io io=fault_io(d); CHECK(journal_set_io(j,&io)==0);
+    d=calloc(1,sizeof *d); SAVE_CHECK(d); d->path=path;
+    journal_io io=fault_io(d); SAVE_CHECK(journal_set_io(j,&io)==0);
     /* Seed the durable old-generation image at installation of the seam. */
-    fd=open(path,O_RDWR); CHECK(fd>=0 && fault_sync(d,fd,false)==0); close(fd);
-    struct stat saved_stat; CHECK(stat(path,&saved_stat)==0); d->durable_name=saved_stat.st_ino;
+    fd=open(path,O_RDWR); SAVE_CHECK(fd>=0 && fault_sync(d,fd,false)==0); close(fd); fd=-1;
+    struct stat saved_stat; SAVE_CHECK(stat(path,&saved_stat)==0); d->durable_name=saved_stat.st_ino;
     /* Metadata must fit through the checkpoint path even if appends are FULL. */
-    uint8_t *overflow=calloc(1,JOURNAL_DEFAULT_BATCH_BYTES); CHECK(overflow);
-    CHECK(journal_insert(j,1,0,overflow,JOURNAL_DEFAULT_BATCH_BYTES)==JOURNAL_FULL); free(overflow);
+    overflow=calloc(1,JOURNAL_DEFAULT_BATCH_BYTES); SAVE_CHECK(overflow);
+    SAVE_CHECK(journal_insert(j,1,0,overflow,JOURNAL_DEFAULT_BATCH_BYTES)==JOURNAL_FULL); free(overflow); overflow=NULL;
     /* Failed marker data sync preserves the previous base and all edits. */
     d->fail_sync=d->syncs+1;
-    CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
-    CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
-    CHECK(journal_get_stats(j).error==JOURNAL_FULL); d->fail_sync=0;
+    SAVE_CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
+    SAVE_CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
+    SAVE_CHECK(journal_get_stats(j).error==JOURNAL_FULL); d->fail_sync=0;
     /* Both pre-rename and post-rename/directory-barrier failures preserve it. */
     d->fail_rename=1;
-    CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
-    CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
+    SAVE_CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
+    SAVE_CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
     d->fail_rename=0; d->fail_dir=d->dirs+2;
-    CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
-    CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
+    SAVE_CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
+    SAVE_CHECK(access(save.previous_path,F_OK)==0 && verify_save(path,"Xdef")==0);
     /* Power loss selects the old checkpoint; ordinary restart may see new.
      * Both generations restore Xdef and the independent second buffer. */
     disk_image *old=NULL;
     for(size_t i=0;i<d->images;i++) if(d->image[i].inode==d->durable_name) old=&d->image[i];
-    CHECK(old);
-    save_restore recovered={{piece_create(&a),piece_create(&a)}}; journal_replay_result rr;
-    CHECK(journal_replay_bytes(old->bytes,old->size,load_save,&recovered,&rr)==0);
+    SAVE_CHECK(old);
+    recovered=(save_restore){{piece_create(&a),piece_create(&a)}}; journal_replay_result rr;
+    SAVE_CHECK(journal_replay_bytes(old->bytes,old->size,load_save,&recovered,&rr)==0);
     uint8_t recovered_text[4];
-    CHECK(piece_len(recovered.trees[0])==4 && piece_read(recovered.trees[0],0,recovered_text,4)==0 && !memcmp(recovered_text,"Xdef",4));
-    CHECK(piece_len(recovered.trees[1])==2 && piece_read(recovered.trees[1],0,recovered_text,2)==0 && !memcmp(recovered_text,"YZ",2));
+    SAVE_CHECK(piece_len(recovered.trees[0])==4 && piece_read(recovered.trees[0],0,recovered_text,4)==0 && !memcmp(recovered_text,"Xdef",4));
+    SAVE_CHECK(piece_len(recovered.trees[1])==2 && piece_read(recovered.trees[1],0,recovered_text,2)==0 && !memcmp(recovered_text,"YZ",2));
+    piece_destroy(recovered.trees[0]); piece_destroy(recovered.trees[1]); recovered=(save_restore){{NULL,NULL}};
+    SAVE_CHECK(journal_retry(j)==0); d->fail_dir=0;
+    SAVE_CHECK(journal_save_finish(j,&save,&b,next,4)==0);
+    SAVE_CHECK(!save.prepared && access(save.previous_path,F_OK)!=0 && verify_save(path,"Xdef")==0);
+    SAVE_CHECK(verify_save_marker(path,&b,4,2)==0);
+cleanup:
+    /* A failing assertion must release the pause before close joins the job.
+     * Close invalidates unread file messages before freeing their payloads. */
+    atomic_store_explicit(&paused.release,true,memory_order_release);
+    file_close(f); piece_destroy(t);
+    piece_destroy(before.trees[0]); piece_destroy(before.trees[1]);
     piece_destroy(recovered.trees[0]); piece_destroy(recovered.trees[1]);
-    CHECK(journal_retry(j)==0); d->fail_dir=0;
-    CHECK(journal_save_finish(j,&save,&b,next,4)==0);
-    CHECK(!save.prepared && access(save.previous_path,F_OK)!=0 && verify_save(path,"Xdef")==0);
-    CHECK(verify_save_marker(path,&b,4,2)==0);
-    file_close(f); piece_destroy(t); journal_close(j); free(d); work_mailbox_drain(&pool,route,NULL);
-    work_pool_shutdown(&pool); unlink(path); unlink(target);
+    journal_close(j); free(d); free(overflow);
+    if(fd>=0) close(fd);
+    if(pool_ready) { work_mailbox_drain(&pool,route,NULL); work_pool_shutdown(&pool); }
+    if(*save.previous_path) unlink(save.previous_path);
+    unlink(path); unlink(target);
+    if(failed) return failed;
     puts("journal_test: save ok (file_save_begin, retained generation, post-save edits, two buffers, marker/rename/dir failures)"); return 0;
 }
+static int file_mailbox_test(void)
+{
+    char path[]="/tmp/journal-mailbox-XXXXXX", target[]="/tmp/journal-mailbox-target-XXXXXX";
+    int failed=0, fd=-1;
+    bool pool_ready=false;
+    work_pool pool; journal *j=NULL; file *f=NULL; piece_tree *t=NULL;
+    save_message completion={0};
+    save_dispatch dispatch={NULL,&completion};
+    SAVE_CHECK(temp(path)>=0 && temp(target)>=0);
+    SAVE_CHECK(work_pool_init(&pool,1,0)==0); pool_ready=true;
+    SAVE_CHECK(journal_open(&j,path,&pool,NULL)==0); dispatch.j=j;
+    journal_set_message_handler(j,save_route,&completion);
+    /* The explicit file wait must also deliver a pending journal completion. */
+    SAVE_CHECK(journal_insert(j,7,0,(const uint8_t *)"J",1)==0 && journal_pump(j,1,true)==0);
+    for(unsigned variant=0;variant<3;variant++) {
+        size_t len=variant==2?0:6;
+        fd=open(target,O_WRONLY|O_TRUNC);
+        SAVE_CHECK(fd>=0 && write(fd,"abcdef",len)==(ssize_t)len); close(fd); fd=-1;
+        file_open_opts opts={.copy_threshold=variant==1?1:1024};
+        completion=(save_message){0};
+        SAVE_CHECK(save_open(&pool,j,target,&opts,&completion,&f)==FILE_OK);
+        SAVE_CHECK(completion.prefix==1 && completion.opened==1 && !completion.failed);
+        SAVE_CHECK(file_prefix_ready(f) && file_open_ready(f) && file_size(f)==len);
+        SAVE_CHECK(file_open_mode(f)==(variant==1?FILE_MODE_MMAP:FILE_MODE_COPY));
+        SAVE_CHECK(journal_get_stats(j).durable_sequence==1);
+        piece_allocator a=piece_default_allocator(); t=piece_create(&a);
+        SAVE_CHECK(t && file_attach(f,t)==FILE_OK && piece_insert(t,0,(const uint8_t *)"X",1)==0);
+        SAVE_CHECK(file_save_begin(f,t,0,0)==FILE_OK);
+        /* An already-flushed journal has no reason to wait/drain file work. */
+        SAVE_CHECK(journal_flush(j)==0 && completion.done==0);
+        SAVE_CHECK(save_wait(&pool,j,f,&completion)==FILE_OK);
+        SAVE_CHECK(completion.prepared==1 && completion.replaced==1 && completion.done==1);
+        uint8_t actual[8]={0}; fd=open(target,O_RDONLY);
+        SAVE_CHECK(fd>=0 && read(fd,actual,sizeof actual)==(ssize_t)(len+1)); close(fd); fd=-1;
+        SAVE_CHECK(!memcmp(actual,"Xabcdef",len+1));
+        file_close(f); f=NULL; piece_destroy(t); t=NULL;
+    }
+    /* Unread prefix results own descriptors/bytes; close cancels delivery and
+     * frees them in both copy and mmap acquisition, without decoding stale f. */
+    for(unsigned variant=0;variant<2;variant++) {
+        file_open_opts opts={.copy_threshold=variant==1?1:1024};
+        completion=(save_message){0};
+        SAVE_CHECK(file_open_begin(&pool,target,&opts,&f)==FILE_OK);
+        unsigned wait=0;
+        while(atomic_load(&pool.mb[0].head)==atomic_load(&pool.mb[0].tail) && wait++<2000) pause_ms();
+        SAVE_CHECK(wait<2000 && !file_prefix_ready(f) && !file_open_ready(f));
+        file_close(f); f=NULL;
+        SAVE_CHECK(work_mailbox_drain(&pool,save_drain,&dispatch)==0);
+        SAVE_CHECK(!completion.prefix && !completion.opened && !completion.failed);
+    }
+    SAVE_CHECK(unlink(target)==0);
+    completion=(save_message){0};
+    SAVE_CHECK(save_open(&pool,j,target,NULL,&completion,&f)==FILE_ERR_IO && !f);
+    SAVE_CHECK(completion.failed==1 && !completion.prefix && !completion.opened);
+cleanup:
+    file_close(f); piece_destroy(t); journal_close(j);
+    if(fd>=0) close(fd);
+    if(pool_ready) { work_mailbox_drain(&pool,route,NULL); work_pool_shutdown(&pool); }
+    unlink(path); unlink(target);
+    if(failed) return failed;
+    puts("journal_test: file mailbox ok (copy, mmap, empty, open failure, unread close, independent save wait)");
+    return 0;
+}
+#undef SAVE_CHECK
 static int worker_test(void)
 {
     char path[]="/tmp/journal-worker-XXXXXX"; CHECK(temp(path)>=0); work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
@@ -1079,6 +1210,7 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--retry")) return retry_test();
         if(!strcmp(argv[1],"--barriers")) return barriers_test();
         if(!strcmp(argv[1],"--save")) return save_test();
+        if(!strcmp(argv[1],"--file-mailbox")) return file_mailbox_test();
         if(!strcmp(argv[1],"--worker")) return worker_test();
         if(!strcmp(argv[1],"--cadence")) return cadence_test();
         if(!strcmp(argv[1],"--save-names")) return save_names_test();
@@ -1091,7 +1223,7 @@ int main(int argc, char **argv)
     CHECK(page_cache_test()==0 && append_failure_test()==0 && append_gap_test()==0);
     CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
-    CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && worker_test()==0 &&
+    CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && file_mailbox_test()==0 && worker_test()==0 &&
           cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0 &&
           retained_external_test(false)==0 && retained_external_test(true)==0 && retained_copy_test()==0);
 

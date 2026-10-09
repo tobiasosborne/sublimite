@@ -1,16 +1,20 @@
 /* file.h -- file open / change detection / durable atomic save (bead P1.7).
  *
- * OPEN (perf s2.4). file_open_begin runs on the UI thread and does only:
- * open, fstat, realpath, ONE bounded pread of the first FILE_PREFIX_MAX
- * (1 MiB) bytes, EOL/BOM scan of that prefix. It returns with the prefix
- * readable (file_prefix) -- that is the "published" first viewport source.
- * Everything else is a work job: copy mode (size < copy threshold) reads the
+ * OPEN (perf s2.4). file_open_begin only captures the path/options and enqueues
+ * prefix acquisition. Canonicalization, open(O_NONBLOCK), type checks, prefix
+ * reads and sliced EOL/BOM scans run on a worker. FILE_MSG_PREFIX_READY exposes
+ * the first viewport source; file_prefix_ready distinguishes an empty prefix
+ * from a pending one. Consume file messages through file_msg_decode.
+ * A pool with a raster worker uses that lane for acquisition; a bulk-only pool
+ * cannot promise G5 while unrelated bulk I/O is active (P1.7d proposal).
+ * Everything else is a bulk work job: copy mode (size < copy threshold) reads the
  * whole file into a buffer; map mode mmaps it read-only and prefetches the head.
  * The job posts FILE_MSG_OPEN_READY (or FILE_MSG_OPEN_FAILED) through
  * work_publish; the UI then calls file_attach, which hands the data to the
- * piece tree (piece_init_copy / piece_init_mapped) -- workers never touch the
- * tree. If the whole file fits the prefix and copy mode applies, no job is
- * submitted: file_open_ready() is already 1 and NO message will arrive.
+ * piece tree through piece_init_mapped lifetime hooks for either backing mode.
+ * Workers never touch the tree. Small copies also report OPEN_READY; filesystem
+ * errors are asynchronous OPEN_FAILED results with errno in the payload/getter.
+ * Terminal/phase publication retries while cancellable on mailbox saturation.
  * Copy threshold = min(256 MiB, RAM/32), injectable via file_open_opts.
  *
  * CHANGE DETECTION (perf s2.14). Identity = (dev, ino, size, mtime_ns). Checked
@@ -22,8 +26,8 @@
  * mapped original returns FILE_ERR_CHANGED: reload is required until the piece
  * contract supports rebasing derived metadata (docs/decisions/P1.7c.md s5).
  * reload = file_close + file_open_begin. A save refuses with FILE_ERR_CHANGED
- * unless FILE_SAVE_FORCE, and the worker re-checks the identity under the
- * file lock immediately before the rename, including the snapshot's original
+ * unless FILE_SAVE_FORCE. The worker checks identity immediately before rename,
+ * including the snapshot's original
  * inode, recovery epoch and UI invalidation generation. FORCE accepts an
  * already changed source; a later invalidation still rejects that save.
  * The remaining race is the last validation to rename. Save by rename never
@@ -35,17 +39,22 @@
  * handler / default action. Bytes read after the fault are zeros: the UI must
  * treat the buffer as stale and offer reload. See docs/decisions/P1.7c.md.
  *
- * SAVE (perf s2.8). file_save_begin (UI): change check, piece_snapshot_take,
+ * SAVE (perf s2.8). file_save_begin (UI): cached change state, piece_snapshot_take,
  * enqueue. Returning 0 IS the ack. The worker writes a temp file in the same
  * directory, fsyncs it, renames over the target, fsyncs the same retained parent
  * directory descriptor, then
- * posts FILE_MSG_SAVE_DONE. Temp name: ".<base>.edit-<pid>-<ns>.tmp" in the
+ * posts FILE_MSG_SAVE_DONE. Authoritative checks and FORCE backing stat run on
+ * the worker. Status/readiness installation performs no filesystem operations;
+ * Preparation transfers back to the UI through SAVE_PREPARED to capture
+ * immutable authorization for a commit continuation; no UI/worker mutex exists.
+ * Temp name: ".<base>.edit-<pid>-<ns>.tmp" in the
  * target directory; a crash can leave such a file but never a partial target.
  *
  * THREADS: file_* except file_save_write and the internal jobs are UI-thread
- * only. One open job and one save job per file at a time. Worker result records
- * are immutable after release publication; mailbox decode/readiness/status
- * calls install them on the UI. Watches are managed only on the UI.
+ * only. One open pipeline and one save pipeline per file at a time. Worker result records
+ * are immutable after release publication; only mailbox decode installs them
+ * on the UI. Readiness/status polling never installs unreceived results.
+ * Watches are managed only on the UI.
  * ERRORS: return codes, 0 = success. No printf. */
 #ifndef EDITOR_FILE_FILE_H
 #define EDITOR_FILE_FILE_H
@@ -118,7 +127,11 @@ uint64_t file_default_copy_threshold(void);
 enum {
     FILE_MSG_OPEN_READY  = 0x46490001u,
     FILE_MSG_OPEN_FAILED = 0x46490002u,
-    FILE_MSG_SAVE_DONE   = 0x46490003u   /* status 0 or a FILE_ERR_* */
+    FILE_MSG_SAVE_DONE   = 0x46490003u,  /* status 0 or a FILE_ERR_* */
+    FILE_MSG_PREFIX_READY = 0x46490004u,
+    FILE_MSG_CHECK_DONE   = 0x46490005u, /* internal; decode installs, returns 1 */
+    FILE_MSG_REPLACED     = 0x46490006u, /* internal; decode installs, returns 1 */
+    FILE_MSG_SAVE_PREPARED = 0x46490007u /* internal; decode queues commit, returns 1 */
 };
 
 typedef struct file_msg {
@@ -131,9 +144,10 @@ typedef struct file_msg {
     int32_t err_no;
 } file_msg;
 
-/* UI-only. Returns 0 and fills *out if m->kind is a file message, installing
- * the file's published result state before exposing the decoded notification.
- * Decode only live notifications delivered by this file's work pool. */
+/* UI-only. Decode every live pool notification. Returns 0 and fills *out for
+ * public file notifications, installing state before exposing them. Internal
+ * CHECK_DONE/REPLACED/SAVE_PREPARED install/continue ownership then return 1;
+ * unrelated messages also return 1. Never decode retained/cancelled copies. */
 int file_msg_decode(const work_msg *m, file_msg *out);
 
 /* ---- open ---- */
@@ -145,10 +159,11 @@ int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opt
 void file_close(file *f);
 
 const uint8_t *file_prefix(const file *f, size_t *len);
+int file_prefix_ready(const file *f);      /* prefix/identity available, even if empty */
 const file_prefix_info *file_prefix_info_of(const file *f);
 uint64_t file_size(const file *f);          /* size at open (stat) */
 file_mode file_open_mode(const file *f);
-const char *file_path(const file *f);       /* canonical (realpath) */
+const char *file_path(const file *f);       /* canonical after PREFIX_READY; "" while pending */
 int file_errno(const file *f);              /* errno of the last FILE_ERR_IO */
 /* 1 once the full content is ready for file_attach. */
 int file_open_ready(const file *f);
@@ -164,16 +179,19 @@ int file_changed(const file *f);
  * flag. FILE_ERR_CHANGED if the mapped backing changed/faulted: accepting it
  * would leave cached tree/snapshot newline counts inconsistent. */
 int file_resolve_keep(file *f);
-/* Optional inotify. start returns the fd to poll (>= 0) or -1. poll drains it
- * (non-blocking) and, if anything was seen, runs file_check; returns the
- * changed state. */
+/* Optional inotify. start is explicit off-path setup/refresh (may do I/O).
+ * After a save call start again to refresh the watch on the replacement.
+ * poll reads at most one 4096-byte nonblocking buffer, coalesces a BULK identity
+ * check, and returns cached changed state. Route CHECK_DONE through decode;
+ * detection is asynchronous. Saturated submission is retried on a later poll. */
 int file_watch_start(file *f);
 int file_watch_poll(file *f);
 
 /* ---- save ---- */
 #define FILE_SAVE_FORCE 1u   /* overwrite even if the source changed */
 int file_save_begin(file *f, piece_tree *t, unsigned flags, uint32_t generation);
-/* 1 if a save job is queued or running. */
+/* UI-only. 1 until completion is decoded and the job finishes. Also retries
+ * enqueue of a commit continuation after temporary pool saturation (no I/O). */
 int file_save_busy(const file *f);
 
 /* Synchronous core used by the job (exported for the durability test, which

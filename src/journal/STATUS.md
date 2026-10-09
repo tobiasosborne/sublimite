@@ -50,6 +50,26 @@ found or fixed in this bead.
 Historical P1.9f/P1.9e status follows; RAM-only enqueue and worker CRC statements
 below are superseded by P1.9g.
 
+P1.7d file-contract fix-up (edit-4w1.42): the composed save fixture now awaits
+file open by draining the worker mailbox and decoding every live file message,
+including internal save continuations. `file_open_begin` acknowledges enqueue;
+small/empty files need receipt before attachment too. `journal_flush` protects
+journal durability and does not wait for independent file saves: callers keep
+draining until SAVE_DONE is decoded and the file is no longer busy. No journal
+implementation/header or write/durability policy changed in this fix-up.
+`journal_test --file-mailbox` covers copy/mmap/empty readiness, mixed delivery,
+open failure, unread-result close and independent save waits; `--save` retains
+the recovery/fault cases and cleans up after a failed assertion. Contract,
+ownership audit and red/green evidence: ../../docs/decisions/P1.7d.md.
+Final fix-up verification: make all and make fuzz pass,
+(M)[AC, Not charging; launch load1=20.50]; full ASan/UBSan/LSan make check passes
+outside sandbox on :99, 39 test binaries plus replay CLI,
+(M)[AC, Not charging; launch load1=19.98]. The temporary paused-save failure
+cleanup probe also passes with LSan enabled,
+(M)[AC, Not charging; load1=13.87]. Supplied docs/source lack the advertised
+P1.9g section/synchronous per-edit append; transport changes are outside this
+fix-up and coordinator reconciliation is required.
+
 File review §6 is fixed: save preparation retains a private inode via reflink
 or a bounded WORK_BULK copy, rather than a hard link to the writable original.
 The source is validated around retention, the private identity is captured,

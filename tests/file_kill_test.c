@@ -25,9 +25,6 @@ typedef struct file_test_context {
 typedef struct file_cancel_context { int step, stopped, seen; } file_cancel_context;
 typedef struct file_job_context {
     _Atomic int started, release, done;
-    file *f;
-    file_msg completion;
-    int seen;
 } file_job_context;
 #define CHECK(test, cond) do { if (!(cond)) { \
     fprintf(stderr, "file_kill_test:%d: FAIL %s\n", __LINE__, #cond); (test)->failures++; \
@@ -138,50 +135,59 @@ static void file_test_blocker(work_ctx *ctx)
     while (!atomic_load(&job->release) && !work_should_stop(ctx)) file_test_pause();
     atomic_store(&job->done, 1);
 }
-static void file_test_collect(const work_msg *wm, void *ctx)
-{
-    file_job_context *job = ctx; file_msg msg;
-    if (file_msg_decode(wm, &msg) == FILE_OK && msg.f == job->f && msg.kind == FILE_MSG_SAVE_DONE) {
-        job->seen++; job->completion = msg;
-    }
-}
 static void file_test_allocation(file_test_context *test)
 {
     work_pool pool; edit_arena arena;
-    CHECK(test, edit_arena_init(&arena, 16u << 20) == 0);
-    CHECK(test, work_pool_init(&pool, 1, 0) == 0);
+    int rc = edit_arena_init(&arena, 16u << 20);
+    CHECK(test, rc == 0);
+    if (rc) return;
+    rc = work_pool_init(&pool, 1, 0);
+    CHECK(test, rc == 0);
+    if (rc) { edit_arena_free(&arena); return; }
     uint8_t bytes[4096]; memset(bytes, 'a', sizeof bytes);
     CHECK(test, file_test_write(test->path, bytes, sizeof bytes) == 0);
     file *f = NULL; CHECK(test, file_open_begin(&pool, test->path, NULL, &f) == FILE_OK);
     piece_allocator alloc = {&arena, file_test_alloc, file_test_free};
-    piece_tree *tree = piece_create(&alloc); CHECK(test, tree && f && file_attach(f, tree) == FILE_OK);
-    if (!tree || !f) { if (tree) piece_destroy(tree); if (f) file_close(f); work_pool_shutdown(&pool); edit_arena_free(&arena); return; }
+    piece_tree *tree = piece_create(&alloc);
+    CHECK(test, tree && f);
+    if (!tree || !f) goto cleanup;
+    CHECK(test, !file_prefix_ready(f) && !file_open_ready(f) && file_attach(f, tree) == FILE_ERR_STATE);
+    collector opened = {.f = f, .kind = FILE_MSG_OPEN_READY};
+    rc = await_message(&pool, &opened);
+    CHECK(test, rc == 0 && opened.prefix == 1 && opened.opened == 1 &&
+                opened.msg.status == FILE_OK && opened.msg.size == sizeof bytes && file_open_ready(f));
+    if (rc) goto cleanup;
+    rc = file_attach(f, tree);
+    CHECK(test, rc == FILE_OK);
+    if (rc) goto cleanup;
     /* Warm snapshot infrastructure, then force a FRESH snapshot for each ack. */
     piece_snapshot *warm = piece_snapshot_take(tree); CHECK(test, warm != NULL);
     if (warm) piece_snapshot_release(warm);
     for (uint32_t generation = 1; generation <= 8; generation++) {
         uint8_t byte = (uint8_t)('A' + generation);
         CHECK(test, piece_delete(tree, 0, 1, NULL) == 0 && piece_insert(tree, 0, &byte, 1) == 0);
-        file_job_context job = {.f = f};
+        file_job_context job = {0};
         work_handle h = work_submit(&pool, (work_job){file_test_blocker, &job, 0, WORK_BULK});
         CHECK(test, h.epoch != 0);
         while (!atomic_load(&job.started)) file_test_pause();
         edit_malloc_guard_begin();
-        int rc = file_save_begin(f, tree, 0, generation);
+        rc = file_save_begin(f, tree, 0, generation);
         size_t allocations = edit_malloc_guard_end();
         CHECK(test, rc == FILE_OK);
         if (edit_malloc_guard_active()) CHECK(test, allocations == 0);
         atomic_store(&job.release, 1);
-        for (unsigned i = 0; i < 100000 && (!job.seen || file_save_busy(f)); i++) {
-            (void)work_mailbox_drain(&pool, file_test_collect, &job); file_test_pause();
-        }
-        CHECK(test, atomic_load(&job.done) && job.seen == 1 && job.completion.status == FILE_OK &&
-                    job.completion.generation == generation && job.completion.size == sizeof bytes);
+        collector saved = {.f = f, .kind = FILE_MSG_SAVE_DONE, .generation = generation};
+        CHECK(test, await_message(&pool, &saved) == 0 && finish_save(&pool, &saved) == 0 &&
+                    atomic_load(&job.done) && completion_correct(&saved.msg, f, generation, sizeof bytes));
         bytes[0] = byte; CHECK(test, file_test_bytes(test->path, bytes, sizeof bytes));
         CHECK(test, file_test_temps(test, 0) == 0);
     }
     printf("file_save_alloc: %s pooled fresh ack guard=%s\n", test->failures ? "FAIL" : "PASS", edit_malloc_guard_active() ? "active" : "ASan-inert (release required)");
-    piece_destroy(tree); file_close(f); work_pool_shutdown(&pool); edit_arena_free(&arena);
+cleanup:
+    if (tree) piece_destroy(tree);
+    if (f) file_close(f);
+    collector drain = {0}; (void)work_mailbox_drain(&pool, collect, &drain);
+    work_pool_shutdown(&pool); edit_arena_free(&arena);
 }
 static void file_test_viewport(file_test_context *test)
 {
@@ -221,8 +227,11 @@ static int file_test_queued_open_child(file_test_context *test)
     if (work_pool_init(&pool, 1, 4) != 0) return 1;
     view *v = calloc(1, sizeof *v);
     if (!v || view_init(v, &pool)) return 1;
+    uint8_t expected[4096]; size_t expected_len = 0;
+    if (fixture(test->path, sizeof expected, 0, expected, &expected_len, 0) ||
+        layout_prefix(v, expected, expected_len)) return 1;
+    memcpy(v->expected, v->cells, sizeof v->cells);
     /* Exercise a skipped frame ID, as used by the untimed reference grid. */
-    v->serial = 1;
     const unsigned conditions[] = {0, 1, 3};
     size_t repeats = getenv("FILE_KILL_STRESS") ? 100u : 3u;
     for (size_t i = 0; i < 3u * repeats; i++) {
@@ -233,16 +242,30 @@ static int file_test_queued_open_child(file_test_context *test)
         file_open_opts opts = {.copy_threshold = 1, .generation = (uint32_t)i + 1u};
         if (getenv("FT_V") && i % repeats == 0) fprintf(stderr, "file queued-open probe: open\n");
         if (file_open_begin(&pool, test->path, &opts, &f) != FILE_OK) return 1;
+        if (file_prefix_ready(f) || file_open_ready(f)) return 1;
+        collector c = {.f = f, .kind = FILE_MSG_PREFIX_READY, .generation = opts.generation,
+                       .backend = &v->backend};
+        v->pending = &c;
+        if (await_message(&pool, &c) || c.msg.status != FILE_OK || c.msg.size != expected_len ||
+            c.msg.mode != FILE_MODE_MMAP || !file_prefix_ready(f)) return 1;
+        /* The queued BULK stage must not be required for the first viewport. */
+        if (busy.count && (c.opened || file_open_ready(f))) return 1;
         size_t n = 0; const uint8_t *bytes = file_prefix(f, &n);
+        if (!prefix_correct(bytes, n, expected, expected_len)) {
+            fprintf(stderr, "file queued-open probe: FAIL prefix bytes before first viewport\n");
+            return 1;
+        }
         if (layout_prefix(v, bytes, n)) return 1;
+        if (memcmp(v->expected, v->cells, sizeof v->cells) != 0 || render_grid_validate(&v->grid) != 0) return 1;
         if (getenv("FT_V") && i % repeats == 0) fprintf(stderr, "file queued-open probe: submit\n");
         if (submit_view(v, &pool)) return 1;
         if (getenv("FT_V") && i % repeats == 0) fprintf(stderr, "file queued-open probe: release bulk\n");
         stop_busy(&pool, &busy);
-        if (finish_frame(v, &pool)) return 1;
+        if (finish_frame(v, &pool) || c.bad || c.failed) return 1;
+        v->pending = NULL;
         if (getenv("FT_V") && i % repeats == 0) fprintf(stderr, "file queued-open probe: close\n");
         file_close(f);
-        collector c = {0}; (void)work_mailbox_drain(&pool, collect, &c);
+        collector drain = {0}; (void)work_mailbox_drain(&pool, collect, &drain);
     }
     render_backend_shutdown(&v->backend); free(v->state); plat_shutdown(&v->platform); free(v);
     work_pool_shutdown(&pool);
@@ -256,7 +279,10 @@ static int file_test_queued_save_child(file_test_context *test)
     view *v = calloc(1, sizeof *v);
     if (!v || view_init(v, &pool)) return 1;
     file *f = NULL;
-    if (file_open_begin(&pool, test->path, NULL, &f) != FILE_OK || !file_open_ready(f)) return 1;
+    if (file_open_begin(&pool, test->path, NULL, &f) != FILE_OK) return 1;
+    collector opened = {.f = f, .kind = FILE_MSG_OPEN_READY};
+    if (await_message(&pool, &opened) || opened.msg.status != FILE_OK ||
+        !file_open_ready(f)) return 1;
     piece_allocator alloc = piece_default_allocator(); piece_tree *tree = piece_create(&alloc);
     if (!tree || file_attach(f, tree) != FILE_OK) return 1;
     for (uint64_t i = 0; i < 4096; i++)
@@ -276,7 +302,8 @@ static int file_test_queued_save_child(file_test_context *test)
         if (getenv("FT_V")) fprintf(stderr, "file queued-save probe: release bulk\n");
         stop_busy(&pool, &busy);
         if (getenv("FT_V")) fprintf(stderr, "file queued-save probe: completion\n");
-        if (await_message(&pool, &c) || !completion_correct(&c.msg, f, i + 1u, piece_len(tree))) return 1;
+        if (await_message(&pool, &c) || !completion_correct(&c.msg, f, i + 1u, piece_len(tree)) ||
+            finish_save(&pool, &c)) return 1;
         piece_snapshot *snapshot = piece_snapshot_take(tree);
         if (!snapshot || output_correct(test->path, snapshot)) return 1;
         piece_snapshot_release(snapshot);
