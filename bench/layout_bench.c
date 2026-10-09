@@ -144,7 +144,7 @@ static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, 
     if (real) {
         u = calloc(1, sizeof *u); EDIT_ASSERT(u);
         EDIT_ASSERT(edit_arena_init(&u->files, 64u << 20) == 0 && edit_arena_init(&u->storage, 12u << 20) == 0);
-        work_pool *workers = malloc(sizeof *workers);
+        work_pool *workers = aligned_alloc(_Alignof(work_pool), sizeof *workers);
         EDIT_ASSERT(workers && work_pool_init(workers, 1, 0) == 0);
         EDIT_ASSERT(work_submit(workers, (work_job){unicode_job, u, 1, WORK_BULK}).epoch);
         struct pollfd fd_ready = {work_pool_eventfd(workers), POLLIN, 0};
@@ -176,7 +176,7 @@ static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, 
         if (edit_arena_init(&arena, reserve) != 0 ||
             layout_checkpoint_init(&store, &arena, (uint64_t)st.st_size) != LAYOUT_DONE ||
             layout_set_checkpoints(&l, &store) != LAYOUT_DONE) return 1;
-        pool = malloc(sizeof *pool);
+        pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
         if (!pool || work_pool_init(pool, 1, 0) != 0) return 1;
         piece_snapshot *snapshot = piece_snapshot_take(t);
         if (!snapshot) return 1;

@@ -1066,7 +1066,9 @@ int main(int argc, char **argv)
     CHECK(waiting<2000);
     work_handle handles[WORK_MAX_JOBS]; size_t submitted=0;
     for(size_t i=0;i<WORK_MAX_JOBS;i++) { handles[i]=work_submit(&pool,(work_job){other_message,NULL,0,WORK_BULK}); if(handles[i].epoch) submitted++; }
-    CHECK(submitted==WORK_MAX_JOBS-2); /* journal job still reserves one slot */
+    /* Raster uses the reserved suffix; the unread journal completion keeps
+     * one shared bulk slot reserved. All remaining bulk slots must be usable. */
+    CHECK(submitted==WORK_MAX_JOBS-WORK_RASTER_RESERVE-1);
     for(size_t i=0;i<WORK_MAX_JOBS;i++) work_cancel(&pool,handles[i]);
     CHECK(journal_flush(j)==0 && other_count==1);
     work_cancel(&pool,other_handle);

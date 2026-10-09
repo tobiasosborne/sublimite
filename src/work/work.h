@@ -1,9 +1,14 @@
 /* work.h - fixed worker pool + UI-thread mailbox (P1.8).
  * Threads are created once in work_pool_init (each calls trace_thread_register).
- * work_submit / work_cancel / work_mailbox_drain: UI thread only.
+ * Pool lifecycle, eventfd access, submit, cancel and drain: UI thread only;
+ * serialize them on that thread. Do not overlap shutdown/init with any use.
+ * Callbacks may submit/cancel; nested drains return 0. Shutdown/init must wait
+ * until the outer drain returns. A pool must be initialized before any use;
+ * after shutdown, submit/cancel are harmless and shutdown is idempotent.
  * work_publish / work_should_stop: worker thread (inside a job) only.
- * No allocation here; the caller owns the work_pool storage. Idle workers
- * sleep on a condvar (no wakeups when nothing is queued). */
+ * No allocation here; the caller owns storage aligned to _Alignof(work_pool)
+ * (64 bytes). Heap callers use aligned_alloc(_Alignof(work_pool), sizeof *p).
+ * Idle workers sleep on a condvar (no wakeups when nothing is queued). */
 #ifndef EDITOR_WORK_WORK_H
 #define EDITOR_WORK_WORK_H
 
@@ -18,6 +23,9 @@
 #define WORK_MAX_JOBS     64u     /* in-flight (queued + running) jobs */
 #define WORK_MAILBOX_CAP  256u    /* messages per worker, power of two */
 #define WORK_MSG_DATA     48u
+#define WORK_RASTER_RESERVE (WORK_MAX_RASTER + 1u) /* one full worker batch + completion */
+#define WORK_DRAIN_MAX_MESSAGES 64u
+#define WORK_DRAIN_BUDGET_NS 500000ull  /* (G) between-callback UI slice budget */
 
 typedef enum work_class { WORK_BULK = 0, WORK_RASTER = 1 } work_class;
 
@@ -88,17 +96,31 @@ typedef struct work_pool {
     int efd;
     _Atomic uint64_t dropped_stale;
     _Atomic uint64_t dropped_full;
+    bool draining;                     /* UI-only callback reentrancy guard */
+    uint32_t drain_next;                /* UI-only round-robin mailbox cursor */
 } work_pool;
 
-/* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success. */
+/* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success, -1 on
+ * failure. Failure releases all initialized resources and leaves an inactive
+ * pool safe for shutdown, refused submit/cancel, or another init. Never init
+ * an active pool; shutdown first. */
 int  work_pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster);
-/* Cancels everything, drops queued jobs, joins threads. Running jobs must poll. */
+/* Cancels everything, drops queued jobs, joins threads. Running jobs must poll.
+ * After return every busy bit and queue count is zero. Arguments always remain
+ * caller-owned, including dropped jobs. Undrained messages remain reserved
+ * until drained (and are stale); drain is allowed after shutdown. */
 void work_pool_shutdown(work_pool *p);
 int  work_pool_eventfd(const work_pool *p);
 
-/* Returns handle with epoch 0 if the pool is full / shutting down. */
+/* Returns handle with epoch 0 if the pool is full / shutting down, or all
+ * otherwise free slots exhausted their identities. Slots retire before epoch
+ * wrap. Handles belong to one initialized pool lifetime; discard all handles
+ * before shutdown/reinitialization and never use them with another pool. */
 work_handle work_submit(work_pool *p, work_job job);
-/* Logical cancel: returns immediately. No-op on a stale handle. */
+/* Logical cancel: no-op on a stale handle. Removes queued jobs immediately;
+ * running jobs hold their slot until they return. Does not free job arguments.
+ * With raster workers configured, bulk cannot use the final
+ * WORK_RASTER_RESERVE slots; raster prefers those slots then shares the rest. */
 void work_cancel(work_pool *p, work_handle h);
 
 /* Worker side. */
@@ -107,7 +129,19 @@ uint64_t work_cancel_time_ns(const work_ctx *c);/* when cancelled (0 if not) */
 /* Returns false if dropped (stale job or mailbox full). */
 bool     work_publish(work_ctx *c, const work_msg *m);
 
-/* UI side: clears the eventfd, delivers pending live messages. Returns count. */
+/* UI side: delivers at most WORK_DRAIN_MAX_MESSAGES examined messages, stopping
+ * between callbacks at WORK_DRAIN_BUDGET_NS from entry. Returns delivered count
+ * (stale messages also consume budget). Each callback must itself be bounded;
+ * a callback or OS descheduling can overrun the wall-time deadline. Check input
+ * between calls. Nested drains on the same pool return 0. Partial drains re-arm
+ * eventfd so the caller can resume after checking input. */
 size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), void *ud);
+/* Explicit slice controls: maximum examined messages and absolute
+ * CLOCK_MONOTONIC deadline in ns (0 disables the deadline). max_messages=0
+ * consumes nothing. Callback must be non-NULL. Valid after shutdown as well. */
+size_t work_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
+                                  void *ud, size_t max_messages, uint64_t deadline_ns);
+/* UI-only continuation check; also true when all remaining messages are stale. */
+bool work_mailbox_pending(const work_pool *p);
 
 #endif

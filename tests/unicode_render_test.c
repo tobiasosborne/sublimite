@@ -45,7 +45,7 @@ static void setup(fixture *f, uint32_t px)
     unsigned char *bytes = font_load_file("vendor/DejaVuSansMono.ttf", &f->files, &len);
     CHECK(bytes && font_init(&f->primary, bytes, len) == FONT_OK);
     CHECK(font_set_px(&f->primary, px) == FONT_OK);
-    work_pool *pool = malloc(sizeof *pool);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
     CHECK(pool && work_pool_init(pool, 1, 0) == 0);
     work_handle handle = work_submit(pool, (work_job){prepare_job, f, 1, WORK_BULK});
     CHECK(handle.epoch);

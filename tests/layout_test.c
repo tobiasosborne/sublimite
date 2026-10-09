@@ -465,7 +465,7 @@ static void test_checkpoints(void)
     layout_checkpoint_store store;
     CHECK(layout_checkpoint_init(&store, &arena, n + 5) == LAYOUT_DONE);
     CHECK(layout_set_checkpoints(&f.l, &store) == LAYOUT_DONE);
-    work_pool *pool = malloc(sizeof *pool);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
     CHECK(work_pool_init(pool, 1, 0) == 0);
     show(&f, 0, 1000000);
     CHECK(layout_approximate(&f.l) && f.l.bytes_scanned <= LAYOUT_BYTE_BUDGET + LAYOUT_WIN);

@@ -781,7 +781,9 @@ static int review_saturated_delivery(void)
         struct timespec pause={0,50000}; nanosleep(&pause,NULL);
     } while (true);
     T(review_wait_free(&pool,h)==0);
-    (void)work_mailbox_drain(&pool,review_collect,NULL);
+    /* Bounded drains may leave unrelated traffic ahead of the completion. */
+    while (work_mailbox_pending(&pool))
+        (void)work_mailbox_drain(&pool,review_collect,NULL);
     bool strip_delivered=review_message_count==1 && review_messages[0].kind==MSG_STRIPS &&
         review_messages[0].slot_==h.slot && review_messages[0].epoch_==h.epoch;
     if (!strip_delivered) {work_pool_shutdown(&pool); review_real_mailbox=false; T(strip_delivered);}
@@ -800,7 +802,8 @@ static int review_saturated_delivery(void)
         struct timespec pause={0,50000}; nanosleep(&pause,NULL);
     } while (true);
     T(review_wait_free(&pool,h)==0);
-    (void)work_mailbox_drain(&pool,review_collect,NULL);
+    while (work_mailbox_pending(&pool))
+        (void)work_mailbox_drain(&pool,review_collect,NULL);
     bool fence_delivered=review_message_count==2 && review_messages[0].kind==MSG_FENCE &&
         review_messages[1].kind==MSG_PRESENT;
     work_pool_shutdown(&pool); review_real_mailbox=false;

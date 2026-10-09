@@ -514,7 +514,8 @@ static int bulk_start(rig *r, bulk_fixture *fixture, unsigned scenario)
 
 static int bulk_self_check(void)
 {
-    rig *r = calloc(1,sizeof *r); if (!r) return 1;
+    rig *r = aligned_alloc(_Alignof(rig), sizeof *r); if (!r) return 1;
+    memset(r, 0, sizeof *r);
     if (work_pool_init(&r->pool,1,1) != 0) { free(r); return 1; }
     int fail = 0;
     for (unsigned scenario = 0; scenario < bulk_case_count(); scenario++) {
@@ -556,7 +557,8 @@ int main(int argc, char **argv)
         puts("SKIP G3/G3z/G3i: no DISPLAY; not measured"); return fixture_status(track);
     }
     trace_init(); (void)trace_thread_register();
-    rig *r = calloc(1,sizeof *r); if (!r) return 1;
+    rig *r = aligned_alloc(_Alignof(rig), sizeof *r); if (!r) return 1;
+    memset(r, 0, sizeof *r);
     r->track = track;
     plat_config pc = {"raster_bench",2880,1800,false,-1,0};
     if (plat_init(&r->pl,&pc) != PLAT_OK) {

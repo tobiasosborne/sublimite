@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void *piece_alloc(void *ctx, size_t n) { return edit_arena_alloc(ctx, n, 16); }
 static void piece_free(void *ctx, void *p, size_t n) { (void)ctx; (void)p; (void)n; }
@@ -39,7 +40,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     *out = NULL;
     render_backend_info info;
     if (render_backend_query(backend, &info)) return EDITOR_ERR_ARG;
-    editor *e = calloc(1, sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
+    editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
+    memset(e, 0, sizeof *e);
     e->cfg = *config; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;

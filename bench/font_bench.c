@@ -105,7 +105,7 @@ int main(void)
     static font_fallback fb;
     unicode_setup u = {0}; u.fb = &fb; u.primary = &f;
     EDIT_ASSERT(edit_arena_init(&u.files, 64u << 20) == 0);
-    work_pool *pool = malloc(sizeof *pool);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
     EDIT_ASSERT(pool && work_pool_init(pool, 1, 0) == 0);
     EDIT_ASSERT(work_submit(pool, (work_job){unicode_job, &u, 1, WORK_BULK}).epoch != 0);
     struct pollfd fd = {work_pool_eventfd(pool), POLLIN, 0};

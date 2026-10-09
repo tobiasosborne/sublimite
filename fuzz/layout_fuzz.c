@@ -103,7 +103,7 @@ static void fuzz_long_line(const uint8_t *data, size_t size)
     }
     piece_allocator allocator = piece_default_allocator(); piece_tree *tree = piece_create(&allocator);
     if (!tree || piece_init_copy(tree, text, len) != PIECE_OK) __builtin_trap();
-    work_pool *pool = malloc(sizeof *pool);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
     edit_arena arena;
     if (!pool || work_pool_init(pool, 1, 0) != 0 || edit_arena_init(&arena, 2048) != 0) __builtin_trap();
     layout_checkpoint_store store;
