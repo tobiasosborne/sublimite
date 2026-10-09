@@ -4,6 +4,7 @@
 #include "trace/trace.h"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,12 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#include <sanitizer/allocator_interface.h>
+#define OBSERVE_ALLOCATIONS 1
+#endif
+#endif
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: FAIL %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -51,15 +58,324 @@ static size_t flat_span(void *ctx, uint64_t off, const uint8_t **p)
 }
 static lineidx_src mk(flat *f) { return (lineidx_src){ f, f->n, flat_span, NULL }; }
 
+/* A worker lease paused inside span(), without scheduler timing guesses. */
+typedef struct {
+    const uint8_t *b;
+    uint64_t n;
+    bool repeat;
+    _Atomic bool entered, resume, released;
+} lease;
+
+static size_t lease_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    lease *s = ctx;
+    if (off >= s->n) return 0;
+    *p = s->b + (s->repeat ? 0 : off);
+    atomic_store_explicit(&s->entered, true, memory_order_release);
+    while (!atomic_load_explicit(&s->resume, memory_order_acquire)) sched_yield();
+    uint64_t k = s->n - off;
+    return (size_t)(k > LINEIDX_CHUNK ? LINEIDX_CHUNK : k);
+}
+
+static void lease_release(void *ctx)
+{
+    lease *s = ctx;
+    free((void *)s->b);
+    atomic_store_explicit(&s->released, true, memory_order_release);
+}
+
+static bool lease_entered(lease *s)
+{
+    for (unsigned i = 0; i < 20000; i++) {
+        if (atomic_load_explicit(&s->entered, memory_order_acquire)) return true;
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    }
+    return false;
+}
+
+typedef struct { uint8_t b[LINEIDX_CHUNK]; uint64_t n, served; } synthetic;
+static size_t synthetic_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    synthetic *s = ctx;
+    if (off >= s->n) return 0;
+    uint64_t k = s->n - off;
+    if (k > sizeof s->b) k = sizeof s->b;
+    *p = s->b;
+    s->served += k;
+    return (size_t)k;
+}
+
+static void test_review_capacity(void)
+{
+    lineidx *x = lineidx_create(0);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_edit(x, 0, 0, 1ull << 32) == -1);
+    CHECK(lineidx_len(x) == 0 && lineidx_chunk_count(x) == 1);
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == 1);
+    lineidx_destroy(x);
+
+    synthetic s = { .n = 8ull * LINEIDX_CHUNK };
+    memset(s.b, '\n', sizeof s.b);
+    lineidx_src src = { &s, s.n, synthetic_span, NULL };
+    x = lineidx_create(0);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_edit(x, 0, 0, s.n) == 0);
+    CHECK(lineidx_chunk_count(x) == 8);
+    CHECK(lineidx_refresh(x, &src) == 1);
+    CHECK(s.served <= LINEIDX_CHUNK);
+    CHECK(!lineidx_complete(x));
+    lineidx_destroy(x);
+
+    x = lineidx_create(0);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_edit(x, 0, 0, LINEIDX_CHUNK + 1u) == 0);
+    CHECK(lineidx_chunk_count(x) == 2);
+    lineidx_destroy(x);
+}
+
+static void test_review_overflow(void)
+{
+    uint8_t b[] = "a\nb";
+    flat f = { b, sizeof b - 1, 0, 0 };
+    lineidx_src s = mk(&f);
+    lineidx *x = lineidx_create(f.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_seek_line(x, &s, 2, f.n).exact);
+    CHECK(lineidx_edit(x, 0, 0, UINT64_MAX) == -1);
+    CHECK(lineidx_len(x) == f.n && lineidx_chunk_count(x) == 1);
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == 2);
+    CHECK(lineidx_line_to_byte(x, &s, 1).value == 2);
+    lineidx_destroy(x);
+    x = lineidx_create(UINT64_MAX);
+    CHECK(x == NULL);
+    lineidx_destroy(x);
+    CHECK(lineidx_create_reserved(0, SIZE_MAX) == NULL);
+
+    lease live = { .b = b, .n = f.n };
+    lineidx_src leased = { &live, live.n, lease_span, NULL };
+    x = lineidx_create(live.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &pool, &leased) == 0);
+    REQUIRE(lease_entered(&live));
+    CHECK(lineidx_edit(x, 0, 0, UINT64_MAX) == -1);
+    CHECK(lineidx_edit(x, 0, 0, 1ull << 32) == -1);
+    CHECK(lineidx_building(x)); /* neither overflow nor capacity refusal cancels */
+    atomic_store_explicit(&live.resume, true, memory_order_release);
+    lineidx_destroy(x);
+}
+
+static void check_epoch_lease(uint32_t epoch)
+{
+    work_pool wp;
+    REQUIRE(work_pool_init(&wp, 1, 0) == 0);
+    atomic_store(&wp.slots[0].epoch, epoch);
+    uint8_t *b = malloc(LINEIDX_CHUNK);
+    REQUIRE(b != NULL);
+    memset(b, '\n', LINEIDX_CHUNK);
+    lease s = { .b = b, .n = LINEIDX_CHUNK };
+    lineidx_src src = { &s, s.n, lease_span, lease_release };
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &wp, &src) == 0);
+    REQUIRE(lease_entered(&s));
+    bool running = lineidx_building(x);
+    CHECK(running);
+    /* On the broken code, avoid deliberately freeing the running job here. */
+    if (running) {
+        lineidx_build_cancel(x);
+        CHECK(!atomic_load(&s.released));
+        CHECK(lineidx_building(x));
+    }
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    /* The red version's building() already lies; use the test pool's physical
+     * acknowledgement before cleanup, so its expected failure cannot itself
+     * turn into a second use-after-free in destroy(). */
+    for (unsigned i = 0; i < 20000 && atomic_load(&wp.slots[0].busy); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(atomic_load(&wp.slots[0].busy) == 0);
+    if (atomic_load(&wp.slots[0].busy)) work_pool_shutdown(&wp);
+    lineidx_destroy(x);
+    CHECK(atomic_load(&s.released));
+    work_pool_shutdown(&wp);
+}
+
+static void test_review_epoch(void)
+{
+    check_epoch_lease(UINT32_MAX - 2u);
+    check_epoch_lease(UINT32_MAX - 1u); /* cancel wraps the lease epoch to zero */
+}
+
+static void test_review_boundaries(void)
+{
+    const uint64_t n = 200000;
+    uint8_t *b = malloc(n);
+    REQUIRE(b != NULL);
+    memset(b, 'z', n);
+    flat f = { b, n, 9000, 0 };
+    lineidx_src s = mk(&f);
+    lineidx *x = lineidx_create(n);
+    REQUIRE(x != NULL);
+    lineidx_result q = lineidx_line_to_byte(x, &s, 1);
+    CHECK(!q.exact && q.value == 0);
+    q = lineidx_seek_line(x, &s, UINT64_MAX, 0);
+    CHECK(!q.exact && q.value == 0);
+    /* CRLF straddling the alignment window and a fragment boundary. */
+    b[65535] = '\r'; b[65536] = '\n';
+    f.frag = 1;
+    q = lineidx_line_to_byte(x, &s, 1700);
+    CHECK(!q.exact && q.value == 65537);
+    f.frag = 9000;
+    q = lineidx_line_to_byte(x, &s, UINT64_MAX);
+    CHECK(!q.exact && (q.value == 0 || b[q.value - 1] == '\n'));
+    b[n - 1] = '\n';
+    q = lineidx_line_to_byte(x, &s, UINT64_MAX);
+    CHECK(!q.exact && q.value == n);
+    lineidx_destroy(x);
+
+    memset(b, 'z', n);
+    b[7] = '\n';
+    x = lineidx_create(n);
+    REQUIRE(x != NULL);
+    q = lineidx_seek_line(x, &s, 2, LINEIDX_CHUNK);
+    CHECK(!q.exact && q.value == 8); /* fallback when prefix ends inside a long line */
+    q = lineidx_line_to_byte(x, &s, UINT64_MAX);
+    CHECK(!q.exact && q.value == 8);
+    lineidx_destroy(x);
+    free(b);
+}
+
+static void test_review_memory(void)
+{
+    uint8_t b[LINEIDX_CHUNK];
+    memset(b, '\n', sizeof b);
+    const uint64_t n = 10000000000ull;
+    lease s = { .b = b, .n = n, .repeat = true };
+    lineidx_src src = { &s, n, lease_span, NULL };
+#ifdef OBSERVE_ALLOCATIONS
+    size_t before = __sanitizer_get_current_allocated_bytes();
+#endif
+    lineidx *x = lineidx_create(n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(lease_entered(&s));
+    size_t owned = lineidx_mem_bytes(x);
+#ifdef OBSERVE_ALLOCATIONS
+    size_t observed = __sanitizer_get_current_allocated_bytes() - before;
+    CHECK(owned == observed);
+    CHECK(observed <= 6882816u); /* G10f allowance from review §12. */
+    fprintf(stderr, "  10 GB geometry + paused job: %zu B accounted, %zu B allocator-observed\n", owned, observed);
+#endif
+    CHECK(owned <= 6882816u);
+    lineidx_build_cancel(x);
+    CHECK(lineidx_mem_bytes(x) == owned); /* retired scratch is still owned */
+    /* Never stack more scratch arrays behind a still-running lease. */
+    CHECK(lineidx_build_start(x, &pool, &src) == -1);
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    lineidx_destroy(x);
+#ifdef OBSERVE_ALLOCATIONS
+    CHECK(__sanitizer_get_current_allocated_bytes() == before);
+#endif
+}
+
+static void test_review_owned_source(void)
+{
+#ifdef OBSERVE_ALLOCATIONS
+    size_t before = __sanitizer_get_current_allocated_bytes();
+#endif
+    uint8_t *b = malloc(LINEIDX_CHUNK);
+    REQUIRE(b != NULL);
+    memset(b, '\n', LINEIDX_CHUNK);
+    lease s = { .b = b, .n = LINEIDX_CHUNK };
+    lineidx_src src = { &s, s.n, lease_span, lease_release };
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start_owned(x, &pool, &src, LINEIDX_CHUNK) == 0);
+    REQUIRE(lease_entered(&s));
+#ifdef OBSERVE_ALLOCATIONS
+    CHECK(lineidx_mem_bytes(x) == __sanitizer_get_current_allocated_bytes() - before);
+#endif
+    lineidx_build_cancel(x);
+    CHECK(!atomic_load(&s.released));
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    lineidx_destroy(x);
+    CHECK(atomic_load(&s.released));
+#ifdef OBSERVE_ALLOCATIONS
+    CHECK(__sanitizer_get_current_allocated_bytes() == before);
+#endif
+
+    s = (lease){ .b = malloc(LINEIDX_CHUNK), .n = LINEIDX_CHUNK };
+    REQUIRE(s.b != NULL);
+    memset((void *)s.b, '\n', LINEIDX_CHUNK);
+    src.ctx = &s;
+    x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(lease_entered(&s));
+    CHECK(lineidx_mem_bytes(x) == SIZE_MAX); /* unknown owned storage cannot pass a guard */
+    lineidx_build_cancel(x);
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    lineidx_destroy(x);
+}
+
+static void count_message(const work_msg *m, void *ctx)
+{
+    (void)m;
+    size_t *n = ctx;
+    (*n)++;
+}
+
+/* Opt-in red reproducer: proper handoff requires a src/work API amendment.
+ * See P1.6b §13; excluded from the passing suite until that bead lands. */
+static void test_review_mailbox(void)
+{
+    uint8_t b[LINEIDX_CHUNK];
+    memset(b, '\n', sizeof b);
+    lease s = { .b = b, .n = sizeof b };
+    lineidx_src src = { &s, s.n, lease_span, NULL };
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(lease_entered(&s));
+    work_handle h = { 0, atomic_load(&pool.slots[0].epoch) };
+    work_cancel(&pool, h); /* pool rejects all messages from this lease */
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    size_t delivered = 0;
+    (void)work_mailbox_drain(&pool, count_message, &delivered);
+    CHECK(delivered == 0);
+    CHECK(lineidx_poll(x) == 0);
+    CHECK(!lineidx_complete(x));
+    lineidx_destroy(x);
+}
+
 static bool wait_complete(lineidx *x, int ms)
 {
     for (int i = 0; i < ms; i++) {
         lineidx_poll(x);
+        size_t delivered = 0;
+        (void)work_mailbox_drain(&pool, count_message, &delivered);
         if (lineidx_complete(x)) return true;
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
     return false;
+}
+
+static void test_review_wide_count(void)
+{
+    synthetic s = { .n = 1ull << 32 };
+    memset(s.b, '\n', sizeof s.b);
+    lineidx_src src = { &s, s.n, synthetic_span, NULL };
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    CHECK(lineidx_build_start(x, &pool, &src) == 0);
+    CHECK(wait_complete(x, 20000));
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == (1ull << 32) + 1u);
+    CHECK(!lineidx_any_nonascii(x));
+    CHECK(lineidx_line_to_byte(x, &src, 1).value == 1);
+    CHECK(lineidx_line_to_byte(x, &src, (1ull << 32) - 1u).value == (1ull << 32) - 1u);
+    lineidx_destroy(x);
 }
 
 static void check_queries(lineidx *x, const uint8_t *b, uint64_t n, int samples)
@@ -247,7 +563,7 @@ static void test_edits(void)
             lineidx_result r = lineidx_line_count(x);
             CHECK(!r.exact || n == 0);
         }
-        lineidx_refresh(x, &gs);
+        while (lineidx_refresh(x, &gs)) { }
         CHECK(lineidx_complete(x));
         check_queries(x, b, n, 12);
     }
@@ -264,20 +580,31 @@ static void test_edits(void)
     free(b);
 }
 
-static void test_edit_during_build(void)
+static void check_snapshot_edit(uint64_t off, uint64_t del, uint64_t il)
 {
     uint64_t n = 16u << 20;
     uint8_t *b = mkbuf(n, 0);
     lineidx *x = lineidx_create(n);
     REQUIRE(x != NULL);
-    flat slow = { b, n, 0, 40 };
-    lineidx_src ss = mk(&slow);
-    CHECK(lineidx_build_start(x, &pool, &ss) == 0);
-    nanosleep(&(struct timespec){0, 3000000}, NULL);
+    uint8_t *copy = malloc(n);
+    REQUIRE(copy != NULL);
+    memcpy(copy, b, n);
+    uint64_t old_lines = n_lines(copy, n);
+    lease slow = { .b = copy, .n = n };
+    lineidx_src ss = { &slow, n, lease_span, lease_release };
+    CHECK(lineidx_build_start_owned(x, &pool, &ss, (size_t)n) == 0);
+    REQUIRE(lease_entered(&slow));
     uint8_t ins[100]; memset(ins, '\n', sizeof ins);
     lineidx_poll(x);
-    CHECK(lineidx_edit(x, 5u << 20, 10, sizeof ins) == 0);   /* cancels the build */
-    model_edit(&b, &n, 5u << 20, 10, ins, sizeof ins);
+    CHECK(lineidx_edit(x, off, del, il) == 0);
+    CHECK(!atomic_load(&slow.released));
+    model_edit(&b, &n, off, del, ins, il);
+    CHECK(copy != b && n_lines(copy, ss.len) == old_lines);
+    atomic_store_explicit(&slow.resume, true, memory_order_release);
+    for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(!lineidx_building(x));
+    CHECK(atomic_load(&slow.released));
     flat cur = { b, n, 0, 0 };
     lineidx_src cs = mk(&cur);
     lineidx_refresh(x, &cs);
@@ -288,11 +615,19 @@ static void test_edit_during_build(void)
     free(b);
 }
 
+static void test_edit_during_build(void)
+{
+    check_snapshot_edit(5u << 20, 10, 100);
+    check_snapshot_edit(LINEIDX_CHUNK - 1u, 100, 100);
+    check_snapshot_edit(LINEIDX_CHUNK, LINEIDX_CHUNK + 17u, 50);
+    check_snapshot_edit(0, 0, 100);
+}
+
 static void test_no_malloc(void)
 {
     uint64_t n = 4u << 20;
     uint8_t *b = mkbuf(n, 0);
-    lineidx *x = lineidx_create(n);
+    lineidx *x = lineidx_create_reserved(n, 256); /* reserve this test's typing burst */
     REQUIRE(x != NULL);
     flat f = { b, n, 0, 0 };
     lineidx_src s = mk(&f);
@@ -307,10 +642,10 @@ static void test_no_malloc(void)
         sink += lineidx_byte_to_line(x, &s, off).value;
         sink += lineidx_line_count(x).value;
         sink += lineidx_seek_line(x, &s, rnd() % 50000, 1u << 20).value;
-        if (lineidx_edit(x, off, 0, sizeof ins) != 0) fails++;
+        CHECK(lineidx_edit(x, off, 0, sizeof ins) == 0);
         model_edit(&b, &n, off, 0, ins, sizeof ins);   /* model malloc is counted: compensate below */
         f.b = b; f.n = n; s.len = n;
-        lineidx_refresh(x, &s);
+        while (lineidx_refresh(x, &s)) { }
     }
     size_t mallocs = edit_malloc_guard_end();
     /* model_edit mallocs once per iteration; the index itself must add none */
@@ -409,10 +744,29 @@ static void test_corpus(const char *path)
     munmap((void *)m, (size_t)n);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     trace_init();
     CHECK(work_pool_init(&pool, 1, 0) == 0);
+    if (argc == 2) {
+        if (strcmp(argv[1], "--review=1") == 0) test_review_capacity();
+        else if (strcmp(argv[1], "--review=2") == 0) test_review_overflow();
+        else if (strcmp(argv[1], "--review=3") == 0) test_review_epoch();
+        else if (strcmp(argv[1], "--review=4") == 0) test_edit_during_build();
+        else if (strcmp(argv[1], "--review=5") == 0) test_review_boundaries();
+        else if (strcmp(argv[1], "--review=12") == 0) { test_review_memory(); test_review_owned_source(); }
+        else if (strcmp(argv[1], "--review=13") == 0) test_review_mailbox();
+        else if (strcmp(argv[1], "--review=alloc") == 0) test_no_malloc();
+        else return 2;
+        goto finish;
+    }
+    fprintf(stderr, "-- review_capacity\n"); test_review_capacity();
+    fprintf(stderr, "-- review_overflow\n"); test_review_overflow();
+    fprintf(stderr, "-- review_epoch\n"); test_review_epoch();
+    fprintf(stderr, "-- review_boundaries\n"); test_review_boundaries();
+    fprintf(stderr, "-- review_memory\n"); test_review_memory();
+    fprintf(stderr, "-- review_owned_source\n"); test_review_owned_source();
+    fprintf(stderr, "-- review_wide_count\n"); test_review_wide_count();
     fprintf(stderr, "-- shapes\n"); test_shapes();
     fprintf(stderr, "-- estimate_and_cancel_resume\n"); test_estimate_and_cancel_resume();
     fprintf(stderr, "-- seek_partial\n"); test_seek_partial();
@@ -425,6 +779,7 @@ int main(void)
     fprintf(stderr, "-- corpus\n"); test_corpus("/tmp/edit-corpus/unicode.txt");
     fprintf(stderr, "-- corpus\n"); test_corpus("/tmp/edit-corpus/malformed.txt");
     fprintf(stderr, "-- corpus\n"); test_corpus("/tmp/edit-corpus/oneline_1g.txt");
+finish:
     work_pool_shutdown(&pool);
     if (fails) { fprintf(stderr, "lineidx_test: %d failure(s)\n", fails); return 1; }
     puts("lineidx_test: ok");

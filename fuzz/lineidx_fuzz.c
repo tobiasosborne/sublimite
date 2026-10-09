@@ -23,6 +23,21 @@ static size_t flat_span(void *ctx, uint64_t off, const uint8_t **p)
 static void free_snap(void *ctx) { flat *f = ctx; free((void *)f->b); free(f); }
 
 static work_pool pool;
+static void discard_message(const work_msg *m, void *ctx) { (void)m; (void)ctx; }
+static void drain(void) { (void)work_mailbox_drain(&pool, discard_message, NULL); }
+static void wait_for(lineidx *x, bool complete)
+{
+    struct timespec begin, now;
+    if (clock_gettime(CLOCK_MONOTONIC, &begin) != 0) FAIL();
+    for (;;) {
+        lineidx_poll(x);
+        drain();
+        if (complete ? lineidx_complete(x) : !lineidx_building(x)) return;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) FAIL();
+        if (now.tv_sec - begin.tv_sec >= 10) FAIL();
+        nanosleep(&(struct timespec){0, 20000}, NULL);
+    }
+}
 int LLVMFuzzerInitialize(int *argc, char ***argv);
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
@@ -51,6 +66,7 @@ static uint64_t m_b2l(const uint8_t *b, uint64_t n, uint64_t off)
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    drain();
     if (size < 4) return 0;
     uint64_t n = ((uint64_t)data[0] << 8 | data[1]) * 9u % MAXN;
     uint32_t density = data[2] % 64u + 1u;
@@ -60,10 +76,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
         b[k] = (s % density == 0) ? '\n' : (s & 0x100) ? (uint8_t)(s >> 24) : 'a';
     }
-    lineidx *x = lineidx_create(n);
+    /* Each edit consumes eight input bytes and adds at most two chunks.
+     * Reserve on the allocating path for this input's entire edit sequence. */
+    lineidx *x = lineidx_create_reserved(n, size);
     if (!x) FAIL();
     size_t i = 4;
     while (i < size) {
+        drain();
         uint8_t op = data[i++] % 6;
         flat cur = { b, n };
         lineidx_src cs = { &cur, n, flat_span, NULL };
@@ -88,16 +107,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else if (op == 2) {                           /* build, then poll / cancel / wait */
             NEED(2);
             uint8_t how = data[i++], polls = data[i++];
+            lineidx_build_cancel(x);
+            wait_for(x, false);                         /* one source lease at a time */
             flat *snap = malloc(sizeof *snap);
             uint8_t *copy = malloc(n ? n : 1);
             memcpy(copy, b, n);
             snap->b = copy; snap->n = n;
             lineidx_src ss = { snap, n, flat_span, free_snap };
-            if (lineidx_build_start(x, &pool, &ss) != 0) { free_snap(snap); }
+            if (lineidx_build_start_owned(x, &pool, &ss, sizeof *snap + (size_t)(n ? n : 1)) != 0) { free_snap(snap); FAIL(); }
             for (unsigned k = 0; k < polls % 8u; k++) lineidx_poll(x);
             if (how & 1) lineidx_build_cancel(x);
             else if (how & 2) {                         /* wait until done */
-                for (int k = 0; k < 2000000 && !lineidx_complete(x); k++) { lineidx_poll(x); nanosleep(&(struct timespec){0, 20000}, NULL); }
+                wait_for(x, true);
+                if (!lineidx_complete(x)) FAIL();
             }
         } else if (op == 3) {                           /* queries vs naive */
             NEED(4);
@@ -109,7 +131,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             lineidx_result q = lineidx_line_to_byte(x, &cs, ln);
             if (q.value > n) FAIL();
             if (q.exact && q.value != m_l2b(b, n, ln)) FAIL();
-            if (!q.exact && q.value && b[q.value - 1] != '\n' && q.value != n) { /* estimate must sit on a boundary if one lay nearby */ }
+            if (!q.exact && q.value && b[q.value - 1] != '\n') FAIL();
             q = lineidx_byte_to_line(x, &cs, off);
             if (q.exact && q.value != m_b2l(b, n, off)) FAIL();
             lineidx_result c = lineidx_line_count(x);
@@ -124,12 +146,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             lineidx_result q = lineidx_seek_line(x, &cs, ln, budget);
             if (q.value > n) FAIL();
             if (q.exact && q.value != m_l2b(b, n, ln)) FAIL();
+            if (!q.exact && q.value && b[q.value - 1] != '\n') FAIL();
         } else {                                        /* poll */
             lineidx_poll(x);
         }
     }
 done:
     lineidx_destroy(x);
+    drain();
     free(b);
     return 0;
 }

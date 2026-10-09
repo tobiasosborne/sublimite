@@ -22,6 +22,7 @@ _Static_assert(sizeof(entry) == 16, "16 B per chunk");
 typedef struct lineidx_job {
     struct lineidx_job *next;             /* retired list */
     lineidx_src src;
+    size_t source_bytes;
     work_pool *pool;
     work_handle h;
     size_t n;
@@ -85,7 +86,7 @@ static uint64_t nth_newline(const lineidx_src *s, uint64_t start, uint64_t len, 
     return UINT64_MAX;
 }
 
-/* Start of the line containing the last '\n' in [lo, hi), else hi. */
+/* Real line start after the last '\n' in [lo, hi), or UINT64_MAX. */
 static uint64_t align_back(const lineidx_src *s, uint64_t lo, uint64_t hi)
 {
     uint64_t pos = lo, last = UINT64_MAX;
@@ -98,7 +99,7 @@ static uint64_t align_back(const lineidx_src *s, uint64_t lo, uint64_t hi)
         if (q) last = pos + (uint64_t)(q - p);
         pos += m;
     }
-    return last == UINT64_MAX ? hi : last + 1;
+    return last == UINT64_MAX ? UINT64_MAX : last + 1;
 }
 
 static uint64_t chunk_len(const lineidx *x, size_t i)
@@ -143,7 +144,12 @@ static bool job_done(const lineidx_job *j)
     if (p->efd < 0) return true;                        /* pool shut down: workers joined */
     const work_slot *s = &p->slots[j->h.slot];
     if (atomic_load_explicit(&s->busy, memory_order_acquire) == 0) return true;
-    return atomic_load_explicit(&s->epoch, memory_order_acquire) >= j->h.epoch + 2u;
+    uint32_t epoch = atomic_load_explicit(&s->epoch, memory_order_acquire);
+    /* submit advances the epoch; cancel advances it once. Neither a live
+     * lease nor its cancelled lease is complete merely because it wrapped.
+     * Any other epoch belongs to a later lease, after busy went to zero.
+     * Equality (including wrapping +1) is conservative even after ABA. */
+    return epoch != j->h.epoch && epoch != j->h.epoch + 1u;
 }
 
 static void job_free(lineidx_job *j)
@@ -206,13 +212,16 @@ out:
 
 /* ---- lifecycle ---- */
 
-lineidx *lineidx_create(uint64_t len)
+lineidx *lineidx_create_reserved(uint64_t len, size_t extra_chunks)
 {
-    size_t n = (size_t)((len + LINEIDX_CHUNK - 1) / LINEIDX_CHUNK);
-    if (n == 0) n = 1;
+    if (len > LINEIDX_MAX_LEN) return NULL;
+    uint64_t chunks = len / LINEIDX_CHUNK + (len % LINEIDX_CHUNK != 0);
+    if (chunks == 0) chunks = 1;
+    if (chunks > SIZE_MAX - extra_chunks || chunks + extra_chunks > SIZE_MAX / sizeof(entry)) return NULL;
+    size_t n = (size_t)chunks;
     lineidx *x = calloc(1, sizeof *x);
     if (!x) return NULL;
-    x->cap = 2 * n + 64;
+    x->cap = n + extra_chunks;
     x->e = malloc(x->cap * sizeof(entry));
     x->sb_cap = (x->cap >> SB_SHIFT) + 2;
     x->sb = malloc(x->sb_cap * sizeof(uint64_t));
@@ -228,6 +237,8 @@ lineidx *lineidx_create(uint64_t len)
     derive(x);
     return x;
 }
+
+lineidx *lineidx_create(uint64_t len) { return lineidx_create_reserved(len, 64); }
 
 void lineidx_destroy(lineidx *x)
 {
@@ -254,7 +265,24 @@ bool lineidx_any_nonascii(const lineidx *x)
 }
 size_t lineidx_mem_bytes(const lineidx *x)
 {
-    return x->n * sizeof(entry) + ((x->n >> SB_SHIFT) + 1) * sizeof(uint64_t);
+    size_t bytes = x->cap * sizeof(entry);
+    if (sizeof *x > SIZE_MAX - bytes) return SIZE_MAX;
+    bytes += sizeof *x;
+    size_t summaries = x->sb_cap * sizeof(uint64_t);
+    if (summaries > SIZE_MAX - bytes) return SIZE_MAX;
+    bytes += summaries;
+    const lineidx_job *j = x->job ? x->job : x->retired;
+    while (j) {
+        size_t arrays = (j->n + 1) * sizeof(uint64_t) + j->n * sizeof(uint64_t);
+        if (arrays > SIZE_MAX - sizeof *j) return SIZE_MAX;
+        size_t scratch = sizeof *j + arrays;
+        if (scratch > SIZE_MAX - bytes) return SIZE_MAX;
+        bytes += scratch;
+        if (j->source_bytes > SIZE_MAX - bytes) return SIZE_MAX;
+        bytes += j->source_bytes;
+        j = j == x->job ? x->retired : j->next;
+    }
+    return bytes;
 }
 
 bool lineidx_building(lineidx *x)
@@ -297,9 +325,12 @@ void lineidx_build_cancel(lineidx *x)
     reap(x);
 }
 
-int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
+int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap,
+                             size_t source_bytes)
 {
+    if (snap->len != x->len || !snap->span) return -1;
     lineidx_build_cancel(x);
+    if (x->retired) return -1;                    /* one scratch/source lease at a time */
     derive(x);
     if (x->pfx_n == x->n) {                       /* nothing left to do */
         if (snap->release) snap->release(snap->ctx);
@@ -322,6 +353,7 @@ int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
     atomic_init(&j->done_n, 0);
     atomic_init(&j->fn_done, 0);
     j->src = *snap;
+    j->source_bytes = source_bytes;
     j->pool = pool;
     work_job wj = { build_fn, j, ++x->gen, WORK_BULK };
     j->h = work_submit(pool, wj);
@@ -332,6 +364,11 @@ int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
     }
     x->job = j;
     return 0;
+}
+
+int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
+{
+    return lineidx_build_start_owned(x, pool, snap, snap->release ? SIZE_MAX : 0);
 }
 
 /* ---- edits ---- */
@@ -349,12 +386,16 @@ static size_t find_chunk(const lineidx *x, uint64_t off)   /* last c with start 
 int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
 {
     if (off > x->len || del > x->len - off) return -1;
-    lineidx_build_cancel(x);                       /* keeps finished work, then stops the job */
+    if (ins_len > LINEIDX_MAX_LEN - (x->len - del)) return -1;
     size_t c0 = find_chunk(x, off);
     size_t c1 = del ? find_chunk(x, off + del - 1) : c0;
     uint64_t s0 = x->e[c0].start;
     uint64_t e1 = (c1 + 1 < x->n ? x->e[c1 + 1].start : x->len);
     uint64_t newlen = (e1 - s0) - del + ins_len;
+    uint64_t pieces = newlen / LINEIDX_CHUNK + (newlen % LINEIDX_CHUNK != 0);
+    size_t kept = x->n - (c1 - c0 + 1);
+    if (pieces > x->cap - kept) return -1;
+    lineidx_build_cancel(x);                       /* preflight complete, now mutate */
     for (size_t i = c0; i <= c1; i++) if (x->e[i].fl & FL_EDITED) x->n_edited--;
     /* drop c0+1..c1 */
     if (c1 > c0) {
@@ -377,22 +418,19 @@ int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
     } else {
         e->fl = FL_EDITED;
         x->n_edited++;
-        if (newlen > 2ull * LINEIDX_CHUNK) {          /* split into 64 KiB pieces if the table has room */
-            size_t k = (size_t)((newlen - 1) / LINEIDX_CHUNK);   /* extra entries */
-            if (x->n + k <= x->cap) {
-                memmove(&x->e[c0 + 1 + k], &x->e[c0 + 1], (x->n - c0 - 1) * sizeof(entry));
-                for (size_t i = 1; i <= k; i++) {
-                    x->e[c0 + i].start = s0 + (uint64_t)i * LINEIDX_CHUNK;
-                    x->e[c0 + i].nl = 0;
-                    x->e[c0 + i].fl = FL_EDITED;
-                }
-                x->n += k;
-                x->n_edited += k;
+        if (pieces > 1) {                          /* preflight guarantees storage */
+            size_t k = (size_t)pieces - 1;
+            memmove(&x->e[c0 + 1 + k], &x->e[c0 + 1], (x->n - c0 - 1) * sizeof(entry));
+            for (size_t i = 1; i <= k; i++) {
+                x->e[c0 + i].start = s0 + (uint64_t)i * LINEIDX_CHUNK;
+                x->e[c0 + i].nl = 0;
+                x->e[c0 + i].fl = FL_EDITED;
             }
+            x->n += k;
+            x->n_edited += k;
         }
     }
     x->dirty = true;
-    if (x->n >> SB_SHIFT >= x->sb_cap) return -1;     /* cannot happen: n <= cap */
     return 0;
 }
 
@@ -408,8 +446,10 @@ size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
         e->nl = (uint32_t)nl;
         e->fl = FL_BUILT | (na ? FL_NONASCII : 0);
         done++;
+        x->n_edited--;
+        break;                                    /* at most 64 KiB of content */
     }
-    x->n_edited = 0;
+    if (!done) x->n_edited = 0;
     x->dirty = true;
     return done;
 }
@@ -454,9 +494,20 @@ static lineidx_result l2b_derived(lineidx *x, const lineidx_src *cur, uint64_t l
     uint64_t d = density(x);
     uint64_t want = line - x->pfx_lines;
     uint64_t est = (want > (x->len - pb) / d) ? x->len : pb + want * d;
-    if (est >= x->len) return (lineidx_result){ x->len, false };
-    uint64_t lo = est > pb + LINEIDX_CHUNK ? est - LINEIDX_CHUNK : pb;
-    return (lineidx_result){ align_back(cur, lo, est), false };
+    uint64_t lo = est - pb > LINEIDX_CHUNK ? est - LINEIDX_CHUNK : pb;
+    uint64_t aligned = align_back(cur, lo, est);
+    if (aligned == UINT64_MAX) {
+        /* Chunk starts need not be line starts. Recover the last proven line
+         * anchor in the built prefix with at most one bounded chunk scan. */
+        aligned = 0;
+        for (size_t i = x->pfx_n; i > 0; i--) {
+            if (!x->e[i - 1].nl) continue;
+            uint64_t q = nth_newline(cur, x->e[i - 1].start, chunk_len(x, i - 1), x->e[i - 1].nl - 1u);
+            if (q != UINT64_MAX) aligned = q + 1;
+            break;
+        }
+    }
+    return (lineidx_result){ aligned, false };
 }
 
 lineidx_result lineidx_line_to_byte(lineidx *x, const lineidx_src *cur, uint64_t line)
