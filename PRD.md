@@ -110,7 +110,7 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 
 ## 11. Open questions
 
-- Product and command name (`edit` collides with nothing on Linux but is generic; `ed` is taken).
+- ~~Product and command name~~ **Settled 2026-10-09: the product is "Sublimité"** (command and binary `sublimite`, ASCII, no accent; window title and `_NET_WM_NAME` "Sublimité", `WM_CLASS` `sublimite`/`Sublimite`; journal/config dir `~/.local/share/sublimite`, `~/.config/sublimite`). Sublime, lite, and *sublimité*. The reference is Wolfgang Hildesheimer, "Meine Erlebnisse im Zeitalter der Ausrufe" (*Lieblose Legenden*): „Man sah einander tief in die Augen und rief: »Quelle sublimité!«" — the hollow exclamation of an age that only exclaims. A tool named after the exclamation, with nothing in it to exclaim about. `edit` stays as the development shorthand in beads and docs until the rename lands.
 - Default font to embed (licence must allow embedding; DejaVu Sans Mono or JetBrains Mono).
 - Whether the hot-exit journal should also back a cross-session "scratch" buffer (Sublime's untitled tabs that never get saved).
 - Initial grammar list: confirm the ten above against what actually gets edited in the trial.
