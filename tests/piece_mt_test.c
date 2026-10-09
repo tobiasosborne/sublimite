@@ -3,6 +3,7 @@
 #include "piece/piece_test.h"
 #include "base/base.h"
 #include "piece_model.h"
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -36,6 +37,43 @@ static int kernel_threads_test(void) {
 #endif
 
 #ifdef PIECE_TESTING
+typedef struct {
+    pthread_barrier_t *barrier;
+    piece_snapshot *snapshot, *retained;
+} owner_race_job;
+static void *owner_race_retain(void *ctx) {
+    owner_race_job *j = ctx;
+    (void)pthread_barrier_wait(j->barrier);
+    j->retained = piece_snapshot_retain(j->snapshot);
+    return NULL;
+}
+static int owner_race_test(void) {
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
+    REQUIRE(!piece_init_copy(t, (const uint8_t *)"x", 1));
+    piece_snapshot *s = piece_snapshot_take(t); REQUIRE(s);
+    piece_test_snapshot_set_owners(s, UINT_MAX - 1);
+    pthread_barrier_t barrier; REQUIRE(!pthread_barrier_init(&barrier, NULL, 5));
+    pthread_t threads[4]; owner_race_job jobs[4];
+    for (unsigned i = 0; i < 4; i++) {
+        jobs[i] = (owner_race_job){ &barrier, s, NULL };
+        REQUIRE(!pthread_create(&threads[i], NULL, owner_race_retain, &jobs[i]));
+    }
+    (void)pthread_barrier_wait(&barrier);
+    unsigned retained = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        REQUIRE(!pthread_join(threads[i], NULL)); retained += jobs[i].retained != NULL;
+    }
+    REQUIRE(retained == 1 && piece_test_snapshot_owners(s) == UINT_MAX);
+    for (unsigned i = 0; i < 4; i++) if (jobs[i].retained) piece_snapshot_release(jobs[i].retained);
+    REQUIRE(piece_test_snapshot_owners(s) == UINT_MAX - 1);
+    piece_test_snapshot_set_owners(s, 2);
+    REQUIRE(!pthread_barrier_destroy(&barrier));
+    piece_destroy(t);
+    uint8_t b = 0; REQUIRE(!piece_snapshot_read(s, 0, &b, 1) && b == 'x');
+    piece_snapshot_release(s);
+    puts("snapshot owner race: ok (one winner for the final slot; no wrap)");
+    return 0;
+}
 static int cursor_test(void) {
     piece_allocator a = piece_default_allocator();
     piece_tree *t = piece_create(&a);
@@ -333,7 +371,7 @@ int main(int argc, char **argv) {
     bad |= kernel_threads_test();
 #endif
 #ifdef PIECE_TESTING
-    bad |= cursor_test(); bad |= compact_test();
+    bad |= owner_race_test(); bad |= cursor_test(); bad |= compact_test();
 #ifdef PIECE_GAP_TRIAL
     bad |= gap_test();
 #endif
