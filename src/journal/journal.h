@@ -64,7 +64,8 @@ typedef struct journal journal;
 /* Optional off-path syscall seam; callbacks have POSIX return/errno semantics.
  * sync receives directory=true for namespace barriers, false for data barriers.
  * NULL callbacks use real syscalls; contexts must outlive all jobs, including
- * temporary checkpoint jobs. Set only with no active worker. Append never calls
+ * retained-base and temporary checkpoint jobs. A write hook selects the bounded
+ * retained-base copy fallback instead of reflinking. Set only with no active worker. Append never calls
  * these hooks. open_with_io also covers the creation-directory barrier. */
 typedef struct journal_io {
     void *ctx;
@@ -91,7 +92,9 @@ int journal_retry(journal *j);
 /* Recoverable save order (all checkpoint work is off the typing path):
  * 1. Build a COMPLETE session checkpoint at the current UI snapshot. Include one
  *    matching previous BASE for id and all state/edits for every other buffer.
- * 2. save_prepare flushes, retains/syncs the previous inode under a hard link,
+ * 2. save_prepare flushes, retains the previous bytes in a private reflink or
+ *    bounded worker copy, validates the source across retention, syncs the new
+ *    inode and its directory,
  *    substitutes every BASE matching that named identity/path, adds a SAVE
  *    marker with the saved cutoff,
  *    durably rotates. Named previous paths must be absolute (file_path works).
@@ -106,7 +109,7 @@ int journal_retry(journal *j);
  *    finish can retire their shared retained generation.
  * 5. save_finish flushes and persists cutoff + new identity inside the new
  *    checkpoint before its rename, then rotates and syncs the
- *    new name, THEN retires the previous link. Requires no concurrent mutation
+ *    new name, THEN retires the previous generation. Requires no concurrent mutation
  *    between checkpoint construction and either call.
  * Recovery needs no live token: pre-rotation BASE loads the retained generation
  * and replays all its ops; post-rotation BASE loads the saved generation and
@@ -193,7 +196,7 @@ int journal_replay_file(const char *path, journal_visit visit, void *ctx,
  * Capture canonicalizes into base->captured_path (off path); named paths in
  * manually built records must already be canonical absolute paths. Missing,
  * unreadable, short-read or changed bases yield BASE_CHANGED. The optional read
- * seam applies only to BASE prefixes, not journal transport reads. */
+ * seam applies only to BASE prefixes, not journal transport or bulk-copy reads. */
 int journal_capture_base(const char *path, journal_base *base);
 int journal_capture_base_with_io(const char *path, journal_base *base, const journal_io *io);
 int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx,

@@ -444,6 +444,136 @@ static int save_shared_base_test(void)
     journal_close(j); work_pool_shutdown(&pool); unlink(path); unlink(target);
     puts("journal_test: save retains a named base shared by two buffers"); return 0;
 }
+static int retained_external_test(bool alias_writer)
+{
+    char directory[]="/tmp/journal-retained-XXXXXX"; CHECK(mkdtemp(directory));
+    char path[256], target[256], alias[256];
+    CHECK(snprintf(path,sizeof path,"%s/journal",directory)>0);
+    CHECK(snprintf(target,sizeof target,"%s/target",directory)>0);
+    CHECK(snprintf(alias,sizeof alias,"%s/alias",directory)>0);
+    int oldfd=open(target,O_RDWR|O_CREAT|O_EXCL,0600);
+    CHECK(oldfd>=0 && write(oldfd,"abcdef",6)==6);
+    CHECK(link(target,alias)==0);
+    journal_base b; CHECK(journal_capture_base(target,&b)==0);
+    uint8_t bp[4137], empty[41]={0}, del[16]={0}, other[9]={0};
+    base_payload(bp,&b); del[8]=3; other[8]='Y';
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
+                         {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other,9}};
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    journal_save save={0}; CHECK(journal_save_prepare(j,1,&b,cp,4,&save)==0);
+    CHECK(verify_save_marker(path,&b,4,1)==0);
+    piece_allocator a=piece_default_allocator(); piece_tree *tree=piece_create(&a);
+    CHECK(tree && piece_init_copy(tree,(const uint8_t *)"def",3)==0);
+    piece_snapshot *snap=piece_snapshot_take(tree); CHECK(snap);
+    file_save_args args={.path=target,.snap=snap}; CHECK(file_save_write(&args)==FILE_OK);
+    piece_snapshot_release(snap); piece_destroy(tree);
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"X",1)==0);
+    CHECK(journal_insert(j,2,1,(const uint8_t *)"Z",1)==0 && journal_flush(j)==0);
+    CHECK(journal_get_stats(j).durable_sequence==7);
+    /* The target was replaced, but both writers still reach the old inode. */
+    if(alias_writer) {
+        int fd=open(alias,O_WRONLY); CHECK(fd>=0 && pwrite(fd,"UVWXYZ",6,0)==6); close(fd);
+    } else CHECK(ftruncate(oldfd,2)==0 && pwrite(oldfd,"qq",2,0)==2);
+    journal_close(j); /* crash selection before finish: no live token needed */
+    CHECK(verify_save(path,"Xdef")==0);
+    struct stat old, retained;
+    CHECK(fstat(oldfd,&old)==0 && stat(save.previous_path,&retained)==0);
+    CHECK(old.st_dev!=retained.st_dev || old.st_ino!=retained.st_ino);
+    close(oldfd); work_pool_shutdown(&pool);
+    CHECK(unlink(save.previous_path)==0 && unlink(alias)==0 && unlink(target)==0 && unlink(path)==0 && rmdir(directory)==0);
+    printf("journal_test: retained recovery survives %s (replacement, acknowledged post-save edits, restart before finish)\n",
+           alias_writer?"hard-link alias overwrite":"old-fd truncate/overwrite"); return 0;
+}
+typedef struct retained_copy_fault {
+    const char *target;
+    pthread_t owner;
+    ino_t inode;
+    unsigned writes, failure;
+    bool data_synced, directory_synced, published, worker_io;
+} retained_copy_fault;
+static ssize_t retained_copy_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    retained_copy_fault *f=ctx; struct stat sb;
+    if(fstat(fd,&sb)) return -1;
+    if(!f->inode) f->inode=sb.st_ino;
+    if(sb.st_ino==f->inode) {
+        f->worker_io=pthread_equal(pthread_self(),f->owner)==0;
+        f->writes++;
+        if(f->failure==1 && f->writes==2) { errno=EIO; return -1; }
+        if(f->failure==2 && f->writes==1) {
+            int source=open(f->target,O_WRONLY); struct stat before;
+            if(source<0 || fstat(source,&before)) return -1;
+            /* Beyond the identity prefix, with restored mtime: ctime must
+             * still reveal a source mutation during the bounded copy. */
+            struct timespec times[2]={before.st_atim,before.st_mtim};
+            int rc=pwrite(source,"!",1,80000)==1?futimens(source,times):-1;
+            close(source); if(rc) return -1;
+        }
+        if(f->writes==1 && n>17) n=17;
+    }
+    return pwrite(fd,p,n,(off_t)off);
+}
+static int retained_copy_sync(void *ctx, int fd, bool directory)
+{
+    retained_copy_fault *f=ctx; struct stat sb; if(fstat(fd,&sb)) return -1;
+    if(!directory && sb.st_ino==f->inode) {
+        if(f->failure==3) { errno=EIO; return -1; }
+        f->data_synced=true;
+    }
+    if(directory && !f->directory_synced) {
+        if(!f->data_synced || f->failure==4) { errno=EIO; return -1; }
+        f->directory_synced=true;
+    }
+    return directory?fsync(fd):fdatasync(fd);
+}
+static int retained_copy_rename(void *ctx, const char *from, const char *to)
+{
+    retained_copy_fault *f=ctx;
+    if(!f->data_synced || !f->directory_synced) { errno=EIO; return -1; }
+    f->published=true; return rename(from,to);
+}
+static int retained_copy_test(void)
+{
+    for(unsigned failure=0;failure<=4;failure++) {
+        char directory[]="/tmp/journal-retained-copy-XXXXXX"; CHECK(mkdtemp(directory));
+        char path[256], target[256];
+        CHECK(snprintf(path,sizeof path,"%s/journal",directory)>0);
+        CHECK(snprintf(target,sizeof target,"%s/target",directory)>0);
+        uint8_t bytes[131089]; for(size_t i=0;i<sizeof bytes;i++) bytes[i]=(uint8_t)(i%251u);
+        int fd=open(target,O_WRONLY|O_CREAT|O_EXCL,0600);
+        CHECK(fd>=0 && write(fd,bytes,sizeof bytes)==(ssize_t)sizeof bytes); close(fd);
+        journal_base b; CHECK(journal_capture_base(target,&b)==0);
+        uint8_t bp[4137]; base_payload(bp,&b);
+        journal_record cp={JOURNAL_BASE,1,0,bp,41+strlen(target)};
+        work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+        journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+        /* A write seam requests the copy fallback, making its fault oracle
+         * independent of filesystem reflink support. */
+        retained_copy_fault faults={.target=target,.owner=pthread_self(),.failure=failure};
+        journal_io io={.ctx=&faults,.write=retained_copy_write,.sync=retained_copy_sync,.rename=retained_copy_rename};
+        CHECK(journal_set_io(j,&io)==0);
+        journal_save save={0}; int rc=journal_save_prepare(j,1,&b,&cp,1,&save);
+        if(failure) {
+            CHECK(rc==(failure==2?JOURNAL_BASE_CHANGED:JOURNAL_IO));
+            CHECK(!save.prepared && !faults.published && journal_get_stats(j).accepted_sequence==0);
+            struct stat sb; CHECK(stat(path,&sb)==0 && sb.st_size==0);
+            CHECK(!*save.previous_path || access(save.previous_path,F_OK)!=0);
+        } else {
+            CHECK(rc==0 && save.prepared && faults.writes>=4 && faults.worker_io);
+            CHECK(faults.data_synced && faults.directory_synced && faults.published);
+            journal_base retained; CHECK(journal_capture_base(save.previous_path,&retained)==0);
+            CHECK(retained.inode!=b.inode && retained.size==sizeof bytes);
+            uint8_t actual[sizeof bytes]; fd=open(save.previous_path,O_RDONLY);
+            CHECK(fd>=0 && read(fd,actual,sizeof actual)==(ssize_t)sizeof actual); close(fd);
+            CHECK(!memcmp(bytes,actual,sizeof bytes));
+            CHECK(unlink(save.previous_path)==0);
+        }
+        journal_close(j); work_pool_shutdown(&pool);
+        CHECK(unlink(target)==0 && unlink(path)==0 && rmdir(directory)==0);
+    }
+    puts("journal_test: retained worker copy ok (short writes, exact multi-chunk bytes, mutation rejection, data/directory failures before publication)"); return 0;
+}
 static int cadence_test(void)
 {
     char path[]="/tmp/journal-cadence-test-XXXXXX"; CHECK(temp(path)>=0);
@@ -808,12 +938,16 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--cadence")) return cadence_test();
         if(!strcmp(argv[1],"--save-names")) return save_names_test();
         if(!strcmp(argv[1],"--save-shared")) return save_shared_base_test();
+        if(!strcmp(argv[1],"--retained-fd")) return retained_external_test(false);
+        if(!strcmp(argv[1],"--retained-alias")) return retained_external_test(true);
+        if(!strcmp(argv[1],"--retained-copy")) return retained_copy_test();
         return 2;
     }
     CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
     CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && worker_test()==0 &&
-          cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0);
+          cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0 &&
+          retained_external_test(false)==0 && retained_external_test(true)==0 && retained_copy_test()==0);
 
     char path[] = "/tmp/journal-test-XXXXXX", basepath[] = "/tmp/journal-base-XXXXXX";
     CHECK(temp(path) >= 0); CHECK(temp(basepath) >= 0);

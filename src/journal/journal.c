@@ -2,7 +2,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/fs.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -602,8 +604,84 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
 }
 
 
-/* Retained generation is a hard link: file_save_* replaces the target inode
- * atomically, so the previous contents stay immutable under this pathname. */
+typedef struct journal_retention {
+    const journal_base *previous;
+    const char *path;
+    const journal_io *io;
+    int fd, error;
+    journal_base base;
+    _Atomic bool done;
+} journal_retention;
+/* Bounded fallback: no whole-file mapping/allocation, and no bulk I/O on the
+ * owner thread. A write hook requests copying so fault seams observe the data. */
+static int retain_copy(work_ctx *ctx, journal_retention *r, int source)
+{
+    uint8_t bytes[65536]; uint64_t off=0;
+    if(ftruncate(r->fd,0)) return JOURNAL_IO;
+    while(off<r->previous->size) {
+        if(work_should_stop(ctx)) return JOURNAL_IO;
+        size_t n=sizeof bytes, got=0, written=0;
+        if(r->previous->size-off<n) n=(size_t)(r->previous->size-off);
+        if(read_at(source,bytes,n,off,&got) || got!=n) return JOURNAL_BASE_CHANGED;
+        int rc=write_at(r->io,r->fd,bytes,n,off,&written); if(rc) return rc;
+        off+=n;
+    }
+    return 0;
+}
+static int retain_generation(work_ctx *ctx, journal_retention *r)
+{
+    int source=open(r->previous->path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(source<0) return JOURNAL_BASE_CHANGED;
+    struct stat before,after,named; const journal_base *p=r->previous; int rc=0;
+    if(fstat(source,&before) || !S_ISREG(before.st_mode) || before.st_size<0 || before.st_mtim.tv_sec<0 ||
+       (uint64_t)before.st_size!=p->size || (uint64_t)before.st_ino!=p->inode || (uint64_t)before.st_dev!=p->device ||
+       (uint64_t)before.st_mtim.tv_sec*1000000000u+(uint64_t)before.st_mtim.tv_nsec!=p->mtime_ns) rc=JOURNAL_BASE_CHANGED;
+    if(!rc) {
+        int cloned=-1;
+        if(!r->io->write) {
+            do { cloned=ioctl(r->fd,FICLONE,source); } while(cloned<0 && errno==EINTR && !work_should_stop(ctx));
+        }
+        if(cloned<0) rc=retain_copy(ctx,r,source);
+    }
+    /* The retained inode has its own identity. Check its expected bytes, and
+     * detect source changes throughout clone/copy using size/mtime/ctime and
+     * pathname identity, including changes outside the small BASE prefix. */
+    if(!rc) rc=journal_capture_base_with_io(r->path,&r->base,r->io);
+    if(!rc && (r->base.size!=p->size || r->base.prefix_len!=p->prefix_len || r->base.prefix_crc!=p->prefix_crc ||
+               (r->base.inode==p->inode && r->base.device==p->device))) rc=JOURNAL_BASE_CHANGED;
+    if(!rc && (fstat(source,&after) || stat(p->path,&named) || !stat_equal(&before,&after) || !stat_equal(&after,&named))) rc=JOURNAL_BASE_CHANGED;
+    close(source);
+    if(!rc) rc=io_sync(r->io,r->fd,false);
+    if(!rc) rc=sync_parent(r->path,r->io);
+    return rc;
+}
+static void retention_worker(work_ctx *ctx)
+{
+    journal_retention *r=ctx->arg;
+    r->error=retain_generation(ctx,r);
+    atomic_store_explicit(&r->done,true,memory_order_release);
+    /* No retention storage is touched after ownership returns to the owner. */
+}
+static int retain_base(journal *j, const journal_base *previous, char *path, journal_base *base)
+{
+    int fd=mkostemp(path,O_CLOEXEC); if(fd<0) return JOURNAL_IO;
+    journal_retention r={.previous=previous,.path=path,.io=&j->io,.fd=fd};
+    atomic_init(&r.done,false);
+    work_handle handle;
+    do {
+        handle=work_submit(j->pool,(work_job){retention_worker,&r,0,WORK_BULK});
+        if(!handle.epoch) { work_mailbox_drain(j->pool,drain,j); delay(); }
+    } while(!handle.epoch);
+    while(!atomic_load_explicit(&r.done,memory_order_acquire)) {
+        work_mailbox_drain(j->pool,drain,j); delay();
+    }
+    close(fd);
+    if(r.error) { (void)unlink(path); path[0]=0; return r.error; }
+    *base=r.base; base->path=path;
+    return 0;
+}
+/* A private reflink/copy freezes recovery data even when the old inode remains
+ * writable through an external descriptor or another hard-link pathname. */
 int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
                          const journal_record *checkpoint, size_t count, journal_save *save)
 {
@@ -629,13 +707,7 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
         if(n>sizeof save->previous_path-sizeof name) return JOURNAL_INVALID;
         memcpy(save->previous_path,previous->path,n);
         memcpy(save->previous_path+n,name,sizeof name);
-        int fd=mkstemp(save->previous_path); if(fd<0) return JOURNAL_IO; close(fd);
-        if(unlink(save->previous_path) || linkat(AT_FDCWD,previous->path,AT_FDCWD,save->previous_path,AT_SYMLINK_FOLLOW)) return JOURNAL_IO;
-        retained.path=save->previous_path;
-        rc=journal_check_base(&retained); if(rc) return rc;
-        fd=open(save->previous_path,O_RDONLY|O_CLOEXEC); if(fd<0) return JOURNAL_IO;
-        rc=io_sync(&j->io,fd,false); close(fd);
-        if(!rc) rc=sync_parent(save->previous_path,&j->io);
+        rc=retain_base(j,previous,save->previous_path,&retained);
         if(rc) return rc;
     }
     uint8_t retained_data[4137], marker[4153]={0}; size_t retained_size=0;

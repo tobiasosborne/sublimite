@@ -1,4 +1,37 @@
-# Journal status — P1.9e / edit-4w1.33 + edit-4w1.31
+# Journal status — P1.9f / edit-4w1.45
+
+File review §6 is fixed: save preparation retains a private inode via reflink
+or a bounded WORK_BULK copy, rather than a hard link to the writable original.
+The source is validated around retention, the private identity is captured,
+and snapshot data plus its parent directory are synced before PREPARED is
+published. Every matching BASE uses that private identity; the SAVE marker
+still carries the intended target and cutoff. A write seam forces the copy
+fallback for deterministic transfer-failure tests. Prepublication retention
+failures remove incomplete snapshots; ambiguous checkpoint failures preserve
+complete snapshots for recovery under the existing transaction protocol.
+
+New regressions restore acknowledged post-save edits after writes through an
+old descriptor and a hard-link alias. Forced-copy tests verify exact bytes
+across chunks, worker execution, source mutation rejection (outside the prefix
+with restored mtime), short writes, and data/directory failures before publish.
+Red/green evidence and stamped verification are in
+[P1.9f.md](../../docs/decisions/P1.9f.md). Verified 2026-10-09: GCC make all
+passed ([AC], launch load1=4.71); ASan/UBSan make check passed 33 test binaries
+and replay CLI checks (M)[AC], launch load1=3.00. The successful check used
+approved local socket access after sandbox IPC creation returned EPERM; both
+display variables stayed :99. Release journal tests passed with an active
+malloc guard and 0 append allocations (M)[AC], launch load1=5.42. make fuzz
+built 19 fuzzers (M)[AC], launch load1=3.00; journal fuzz completed 18779 runs
+in 121 s without findings (M)[AC], launch load1=4.83, requested limit 120 s (G).
+LeakSanitizer was disabled only for the sandbox runner.
+
+The final journal benchmark ran once, TRACK only: paste enqueue p50/p99
+0.218/0.400 ms (M)[AC], load1=11.62; single-byte/1 KiB append p99
+668/904 ns (M)[AC], load1=11.62/11.49. Exact-content, disk-exhaustion and idle
+sync self-checks passed. No quiet-box or whole-editor gate verdict is claimed.
+No unresolved implementation finding remains in this scope. Fallback retention
+needs disk space for one previous generation; startup cleanup remains owned by
+the application. P1.9d/P1.9e semantics and fsync defaults remain intact.
 
 P1.9d's recoverable save transaction, retained generations, retryable failed
 batches and deterministic crash oracle remain implemented and covered.
@@ -40,7 +73,7 @@ reported delivery waits; whole-editor G1/G9 and actual index/find workloads
 remain integration checks for the coordinator. Replay labels wire and payload
 throughput separately. Shared-box performance measurements are TRACK only.
 
-Verified 2026-10-09. Paired red/green transcripts and full stamped TRACK rows
+P1.9e verification (historical): verified 2026-10-09. Paired red/green transcripts and full stamped TRACK rows
 are in [P1.9.md](../../docs/decisions/P1.9.md), P1.9e. GCC make all passed
 ([AC], launch load 9.59); ASan/UBSan make check passed 24 test binaries and replay
 CLI checks ([AC], launch load 5.30), with X11 tests executed using approved local
@@ -64,7 +97,7 @@ coordinator integration work. LSan is disabled only for this sandbox runner.
 
 Verify with DISPLAY=:99 EDIT_DISPLAY=:99: make all; ASAN_OPTIONS=detect_leaks=0
 make check (needs local socket access); release build/tests/journal_test;
-make fuzz; ASAN_OPTIONS=detect_leaks=0 build/fuzz/journal_fuzz -max_total_time=300
+make fuzz; ASAN_OPTIONS=detect_leaks=0 build/fuzz/journal_fuzz -max_total_time=120
 -max_len=16384 -timeout=10 -artifact_prefix=/tmp/ /tmp/journal-fuzz-corpus;
 build/tests/journal_kill_test --trials=1000; build/bench/journal_bench. Take fresh
 BAT0/status and loadavg stamps before each measured run; do not regenerate the
