@@ -1,6 +1,7 @@
 /* layout (P3.1): see layout.h. */
 #include "layout/layout.h"
 #include "utf8/utf8.h"
+#include "layout/wrap.h"
 #include <string.h>
 
 #define L_REFILL_MARGIN 128u      /* bytes guaranteed ahead of a cluster unless EOF */
@@ -67,7 +68,7 @@ static int src_read(const layout *l, uint64_t off, uint8_t *dst, size_t n)
 
 static int begin_common(layout *l, layout_viewport vp)
 {
-    if (vp.first_byte > l->total) return LAYOUT_ERR_ARG;
+    if (vp.first_byte > l->total || (l->wrap && l->grid->dims.rows > l->wrap_capacity)) return LAYOUT_ERR_ARG;
     if (vp.first_line == LAYOUT_LINE_UNKNOWN) {
         vp.first_line = l->is_snap ? piece_snapshot_byte_to_line((const piece_snapshot *)l->src, vp.first_byte)
                                    : piece_byte_to_line((const piece_tree *)l->src, vp.first_byte);
@@ -83,12 +84,14 @@ static int begin_common(layout *l, layout_viewport vp)
     if (gw != l->gw) {                      /* old gutter cells may be anywhere: re-clear */
         for (uint32_t r = 0; r < l->grid->dims.rows; r++) l->row_used[r] = l->grid->dims.cols;
     }
+    if (l->wrap) layout_wrap_geometry(l);
     set_gw(l, gw);
     l->row_byte[0] = vp.first_byte;
     l->row = 0;
     l->row_end = l->grid->dims.rows;
     l->phase = 0;
     l->win_len = l->wi = 0; l->win_eof = false;
+    if (l->wrap) layout_wrap_begin(l);
     return render_mark_full(l->grid);
 }
 
@@ -112,6 +115,7 @@ int layout_begin_snapshot(layout *l, const piece_snapshot *s, layout_viewport vp
 
 void layout_set_cursor(layout *l, uint64_t byte)
 {
+    l->wrap_cursor_end = false;
     l->cursor = byte;
     l->marks = l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
 }
@@ -126,7 +130,7 @@ bool layout_approximate(const layout *l) { return l->approximate; }
 uint32_t layout_gutter_width(const layout *l) { return l->gw; }
 bool layout_busy(const layout *l) { return l->row < l->row_end; }
 
-static void refill(layout *l)
+void layout_refill(layout *l)
 {
     uint64_t left = l->total - l->pos;
     uint32_t n = left < LAYOUT_WIN ? (uint32_t)left : LAYOUT_WIN;
@@ -217,7 +221,7 @@ static void row_seek(layout *l, uint64_t start)
     }
 }
 
-static void scanned(layout *l, size_t n)
+void layout_consume(layout *l, size_t n)
 {
     l->bytes_scanned += n; l->row_scanned += n;
     l->pos += n; l->wi += (uint32_t)n;
@@ -226,7 +230,7 @@ static void scanned(layout *l, size_t n)
 /* Segmentation cache stores only complete clusters with the next decoded unit as right
  * context (four validation bytes for an invalid unit). Equality implies the same boundary and width;
  * callback results are deliberately NOT cached (atlas slots can change). */
-static int cluster_get(layout *l, const uint8_t **bytes, size_t *clen, int *width, size_t byte_budget)
+int layout_decode_cluster(layout *l, const uint8_t **bytes, size_t *clen, int *width, size_t byte_budget)
 {
     layout_cluster_cache_entry *entry = NULL;
     uint64_t key[4] = {0, 0, 0, 0};
@@ -243,7 +247,7 @@ static int cluster_get(layout *l, const uint8_t **bytes, size_t *clen, int *widt
                 layout_cluster_cache_entry *candidate = &l->cluster_cache[base + i];
                 if (candidate->valid && candidate->len <= byte_budget && memcmp(candidate->key, p, candidate->key_len) == 0) {
                     *bytes = p; *clen = candidate->len; *width = candidate->width;
-                    scanned(l, *clen); l->cache_hits++;
+                    layout_consume(l, *clen); l->cache_hits++;
                     candidate->stamp = (uint32_t)(l->cache_hits + l->cache_misses);
                     return UTF8_G_END;
                 }
@@ -276,7 +280,7 @@ static int cluster_get(layout *l, const uint8_t **bytes, size_t *clen, int *widt
         l->cluster_saved += (uint32_t)copy;
         *bytes = l->cluster_bytes; *clen = (size_t)(l->cluster_len + used);
     }
-    l->cluster_len += used; scanned(l, used);
+    l->cluster_len += used; layout_consume(l, used);
     if (rc == UTF8_G_END) l->cluster_active = false;
     else if (rc == UTF8_G_MORE) { l->win_len = l->wi; l->win_eof = false; }
     return rc;
@@ -285,6 +289,7 @@ static int cluster_get(layout *l, const uint8_t **bytes, size_t *clen, int *widt
 int layout_run(layout *l)
 {
     if (!l || !l->grid) return LAYOUT_ERR_ARG;
+    if (l->wrap) return layout_wrap_run(l);
     const uint32_t budget = l->cfg.slice_clusters ? l->cfg.slice_clusters : UINT32_MAX;
     const uint32_t text_cols = l->text_cols, gw = l->gw, tab = l->tab;
     const uint64_t hscroll = l->hscroll;
@@ -326,7 +331,7 @@ int layout_run(layout *l)
                     l->win_len = l->wi = 0; l->win_eof = false;
                 }
                 if (l->bytes_scanned - call_start >= LAYOUT_BYTE_BUDGET) goto more;
-                if (l->wi + L_REFILL_MARGIN > l->win_len && !l->win_eof) refill(l);
+                if (l->wi + L_REFILL_MARGIN > l->win_len && !l->win_eof) layout_refill(l);
                 if (l->wi >= l->win_len && !l->cluster_active) { ended = true; break; }
                 const uint8_t *p = l->win + l->wi;
                 uint32_t b = l->wi < l->win_len ? p[0] : 0;
@@ -342,10 +347,10 @@ int layout_run(layout *l)
                         else { c->glyph_index = b; c->atlas_slot = b - 0x20u; }
                         if (l->marks) style_at(l, at, &c->fg, &c->bg, &c->attrs);
                     }
-                    l->col++; scanned(l, 1); units++;
+                    l->col++; layout_consume(l, 1); units++;
                     continue;
                 }
-                if (!l->cluster_active && b == '\r' && avail >= 2 && p[1] == '\n') { scanned(l, 1); continue; }
+                if (!l->cluster_active && b == '\r' && avail >= 2 && p[1] == '\n') { layout_consume(l, 1); continue; }
                 if (!l->cluster_active && b == '\t') {
                     uint32_t w = tab - (uint32_t)(l->col % tab);
                     for (uint32_t k = 0; k < w && l->vis < text_cols; k++) {
@@ -354,7 +359,7 @@ int layout_run(layout *l)
                         *c = blank_cell(l);
                         if (l->marks && !(k > 0 && at == l->cursor)) style_at(l, at, &c->fg, &c->bg, &c->attrs);
                     }
-                    l->col += w; scanned(l, 1); units++;
+                    l->col += w; layout_consume(l, 1); units++;
                     continue;
                 }
                 /* general path: control, invalid, non-ASCII cluster */
@@ -364,13 +369,13 @@ int layout_run(layout *l)
                 int w = 1;
                 if (!l->cluster_active && (b < 0x20 || b == 0x7f || !utf8_decode(p, avail).valid)) {
                     attrs = RENDER_ATTR_INVERSE;
-                    scanned(l, 1);
+                    layout_consume(l, 1);
                 } else {
                     bool continued = l->cluster_active;
                     at = continued ? l->cluster_at : l->pos;
                     uint64_t left_budget = LAYOUT_BYTE_BUDGET - (l->bytes_scanned - call_start);
                     size_t step_budget = left_budget < UTF8_GRAPHEME_BUDGET ? (size_t)left_budget : UTF8_GRAPHEME_BUDGET;
-                    int rc = cluster_get(l, &p, &clen, &w, step_budget);
+                    int rc = layout_decode_cluster(l, &p, &clen, &w, step_budget);
                     if (rc != UTF8_G_END) goto more;
                     b = p[0];
                     if (w == 0) { units++; continue; }
@@ -430,7 +435,7 @@ int layout_run(layout *l)
                     l->approximate = true; ended = true; break;
                 }
                 if (units >= budget || l->bytes_scanned - call_start >= LAYOUT_BYTE_BUDGET) goto more;
-                if (l->wi >= l->win_len && !l->win_eof) refill(l);
+                if (l->wi >= l->win_len && !l->win_eof) layout_refill(l);
                 if (l->wi >= l->win_len) { ended = true; break; }
                 const uint8_t *q = l->win + l->wi;
                 size_t rem = l->win_len - l->wi;
@@ -440,7 +445,7 @@ int layout_run(layout *l)
                 if (left < rem) rem = (size_t)left;
                 const uint8_t *nlp = memchr(q, '\n', rem);
                 size_t adv = nlp ? (size_t)(nlp - q) : rem;
-                scanned(l, adv);
+                layout_consume(l, adv);
                 units += (uint32_t)(adv / L_SKIP_UNIT) + 1;
                 if (nlp) { ended = true; nl = true; break; }
             }
@@ -466,6 +471,7 @@ int layout_relayout_rows(layout *l, uint32_t first, uint32_t count)
 {
     if (!l || !l->src) return LAYOUT_ERR_STATE;
     if (layout_busy(l)) return LAYOUT_ERR_STATE;
+    if (l->wrap) return layout_wrap_relayout(l, first, count);
     uint32_t rows = l->grid->dims.rows;
     if (first == 0 && count == rows) l->approximate = false;
     if (first > rows || count > rows - first) return LAYOUT_ERR_ARG;
@@ -498,6 +504,7 @@ int layout_edit(layout *l, uint64_t off, uint64_t old_len, uint64_t new_len,
                 uint64_t old_nl, uint64_t new_nl)
 {
     if (!l || !l->src || l->is_snap) return LAYOUT_ERR_STATE;
+    if (l->wrap) return layout_wrap_edit(l, off, old_len, new_len, old_nl, new_nl);
     layout_checkpoint_invalidate(l->checkpoints, off, old_len, new_len, old_nl, new_nl);
     l->cluster_active = false;
     l->bytes_scanned = l->bytes_read = l->cache_hits = l->cache_misses = 0;

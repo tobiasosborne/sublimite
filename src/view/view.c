@@ -1,4 +1,5 @@
 #include "view/view.h"
+#include "layout/layout.h"
 #include <string.h>
 
 /* Each scan begins at a certified boundary; no window edge is a boundary. */
@@ -212,6 +213,32 @@ static void follow_line(view *v)
 }
 static int finish_move(view *v)
 {
+    if(v->state.wrap && v->wrap_layout) {
+        v->state.hscroll=0;
+        uint64_t cursor=v->state.selection.cursor;
+        layout_wrap_row r; bool approx=false;
+        int query=v->edited?layout_visual_row_fresh(v->wrap_layout,v->tree,cursor,&r,&approx):
+            layout_visual_row(v->wrap_layout,v->tree,cursor,0,&r,&approx);
+        if(query==LAYOUT_DONE) {
+            if(cursor<v->state.visual_byte) v->state.visual_byte=r.start;
+            /* Cached viewport row membership avoids logical-line scrolling. */
+            uint32_t n=v->wrap_layout->grid->dims.rows;
+            uint64_t bottom=v->wrap_layout->wrap_rows[n-1].next;
+            if(bottom!=LAYOUT_VOID_ROW && cursor>=bottom && !(cursor==bottom && v->state.visual_end)) {
+                /* One-row downward motion exposes one row and advances top
+                 * by one visual row. Larger jumps follow the target directly. */
+                layout_wrap_row top;
+                if(!v->edited && r.start==bottom &&
+                   layout_visual_row(v->wrap_layout,v->tree,v->state.visual_byte,1,&top,&approx)==LAYOUT_DONE)
+                    v->state.visual_byte=top.start;
+                else v->state.visual_byte=r.start;
+            }
+            v->state.first_line=piece_byte_to_line(v->tree,v->state.visual_byte);
+            v->state.first_byte=piece_line_to_byte(v->tree,v->state.first_line);
+            v->state.approximate|=approx;
+        }
+        v->busy=false; return 0;
+    }
     follow_line(v);
     v->line=piece_byte_to_line(v->tree,v->state.selection.cursor);
     column_begin(v,S_BYTE_COL,v->line,v->state.selection.cursor); v->phase=P_FOLLOW;
@@ -231,13 +258,80 @@ static int remove_range(view *v, uint64_t lo, uint64_t hi, view_change *change)
     scan_begin(v,S_CEIL,near_seed(v,lo),piece_len(v->tree),lo,0);
     v->phase=P_REPAIR; return 0;
 }
+bool view_wrap_default(const char *path)
+{
+    if(!path || !*path) return true;
+    const char *dot=strrchr(path,'.');
+    return dot && (!strcmp(dot,".md") || !strcmp(dot,".txt") || !strcmp(dot,".tex"));
+}
+int view_set_wrap(view *v,bool enabled,struct layout *context)
+{
+    if(!v || v->busy || (enabled && (!context || !context->wrap))) return VIEW_ERR_ARG;
+    v->state.wrap=enabled; v->wrap_layout=context;
+    v->state.hscroll=0; v->state.visual_byte=v->state.first_byte; v->state.visual_end=false;
+    v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
+    return VIEW_OK;
+}
+int view_wrap_file(view *v,struct layout *context,const char *path)
+{
+    if(!v || !context || v->busy) return VIEW_ERR_ARG;
+    bool enabled=view_wrap_default(path);
+    if(layout_set_wrap(context,enabled)!=LAYOUT_DONE) return VIEW_ERR_ARG;
+    return view_set_wrap(v,enabled,context);
+}
+static int visual_command(view *v,view_key key)
+{
+    layout_wrap_row current,dest; bool approximate=false;
+    int rc=layout_visual_row(v->wrap_layout,v->tree,v->origin,0,&current,&approximate);
+    if(rc<0) return VIEW_ERR_ARG;
+    v->state.approximate|=approximate;
+    if(v->state.visual_end && current.start==v->origin && v->origin) {
+        layout_wrap_row previous;
+        if(layout_visual_row(v->wrap_layout,v->tree,v->origin,-1,&previous,&approximate)==LAYOUT_DONE &&
+           !previous.newline && previous.next==v->origin) current=previous;
+        v->state.approximate|=approximate;
+    }
+    v->state.visual_end=false; v->wrap_target_soft=false;
+    bool up=key==VIEW_UP || key==VIEW_PAGE_UP;
+    if(key==VIEW_HOME) {
+        /* Smart Home on the first row; continuation Home is its first cluster. */
+        v->wrap_target_soft=!current.newline && current.next!=LAYOUT_VOID_ROW;
+        scan_begin(v,S_HOME,current.start,current.end,0,current.column);
+        if(current.continuation) { v->result=current.start; v->phase=P_APPLY; }
+        return VIEW_OK;
+    }
+    if(key==VIEW_END) { v->result=current.end; v->state.visual_end=!current.newline && current.next!=LAYOUT_VOID_ROW; v->phase=P_APPLY; return VIEW_OK; }
+    if(v->state.selection.preferred_col==VIEW_PREFERRED_UNSET) {
+        scan_begin(v,S_BYTE_COL,current.start,v->origin,v->origin,current.column);
+        rc=scan_run(v); if(rc!=VIEW_OK) return rc;
+        v->state.selection.preferred_col=v->column-current.column+(current.continuation?current.indent:0);
+        if(v->state.selection.preferred_col>v->wrap_layout->text_cols) v->state.selection.preferred_col=v->wrap_layout->text_cols;
+    }
+    dest=current;
+    uint32_t count=(key==VIEW_PAGE_UP || key==VIEW_PAGE_DOWN)?v->config.rows:1;
+    for(uint32_t i=0;i<count;i++) {
+        layout_wrap_row next;
+        rc=layout_visual_row(v->wrap_layout,v->tree,dest.start,up?-1:1,&next,&approximate);
+        if(rc<0) return VIEW_ERR_ARG;
+        v->state.approximate|=approximate;
+        if(next.start==dest.start) { v->result=approximate?dest.start:up?0:piece_len(v->tree); v->phase=P_APPLY; return VIEW_OK; }
+        dest=next;
+    }
+    uint64_t preferred=v->state.selection.preferred_col;
+    uint32_t indent=dest.continuation?dest.indent:0;
+    uint64_t target=dest.column+(preferred>indent?preferred-indent:0);
+    uint64_t end=dest.end; v->wrap_target_soft=!dest.newline && dest.next!=LAYOUT_VOID_ROW;
+    scan_begin(v,S_COL_BYTE,dest.start,end,target,dest.column);
+    v->phase=P_VERTICAL_DEST;
+    return VIEW_OK;
+}
 static bool deletion(view_key key) { return key>=VIEW_BACKSPACE && key<=VIEW_WORD_DELETE; }
 static bool vertical(view_key key) { return key>=VIEW_UP && key<=VIEW_PAGE_DOWN; }
 static int advance(view *v, view_change *change)
 {
     for(;;) {
         if(v->phase==P_APPLY) {
-            set_cursor(v,v->result); (void)finish_move(v); continue;
+            set_cursor(v,v->result); (void)finish_move(v); if(!v->busy) return 0; continue;
         }
         int rc=scan_run(v); if(rc!=0) return rc;
         if(v->phase==P_VERTICAL_COL) {
@@ -245,6 +339,7 @@ static int advance(view *v, view_change *change)
             column_begin(v,S_COL_BYTE,v->line,v->state.selection.preferred_col);
             v->phase=P_VERTICAL_DEST;
         } else if(v->phase==P_VERTICAL_DEST) {
+            if(v->state.wrap) v->state.visual_end=v->wrap_target_soft && v->result==v->end;
             v->phase=P_APPLY;
         } else if(v->phase==P_MOVE) {
             if(deletion(v->key)) {
@@ -252,14 +347,15 @@ static int advance(view *v, view_change *change)
                 if(rc!=0) return rc;
             } else if(v->key==VIEW_SELECT_WORD) {
                 v->state.selection.anchor=v->lo; v->state.selection.cursor=v->hi;
-                (void)finish_move(v);
+                (void)finish_move(v); if(!v->busy) return 0;
             } else {
                 if(v->key==VIEW_HOME && v->result==v->origin) v->result=piece_line_to_byte(v->tree,v->line);
+                if(v->state.wrap && v->key==VIEW_HOME) v->state.visual_end=v->wrap_target_soft && v->result==v->end;
                 v->phase=P_APPLY;
             }
         } else if(v->phase==P_REPAIR) {
             v->state.selection.cursor=v->result; v->state.selection.anchor=v->result;
-            (void)finish_move(v);
+            (void)finish_move(v); if(!v->busy) return 0;
         } else if(v->phase==P_FOLLOW) {
             uint64_t col=v->column;
             if(col<v->state.hscroll) v->state.hscroll=col;
@@ -284,6 +380,7 @@ int view_continue(view *v, view_change *change)
     if(!v || !change || !v->tree) return VIEW_ERR_ARG;
     *change=(view_change){0}; v->scanned=0;
     if(!v->busy) return VIEW_OK;
+    if(!v->busy) return VIEW_OK;
     int rc=advance(v,change); if(rc!=VIEW_MORE) v->busy=false; return rc;
 }
 int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t len, view_change *change)
@@ -296,11 +393,14 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t 
     v->scanned=0; v->busy=true; v->shift=shift; v->key=key; v->origin=cursor; v->edited=false;
     v->lo=min_u64(cursor,anchor); v->hi=max_u64(cursor,anchor);
     v->state.approximate=false;
+    if(!v->state.wrap || !(vertical(key) || key==VIEW_HOME || key==VIEW_END)) v->state.visual_end=false;
     v->line=piece_byte_to_line(v->tree,cursor);
     uint64_t start=piece_line_to_byte(v->tree,v->line), end=line_end(v,v->line);
     v->phase=P_MOVE;
     if(!vertical(key)) v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
-    if(key==VIEW_TYPE) {
+    if(v->state.wrap && v->wrap_layout && (vertical(key) || key==VIEW_HOME || key==VIEW_END)) {
+        int rc=visual_command(v,key); if(rc!=VIEW_OK) { v->busy=false; return rc; }
+    } else if(key==VIEW_TYPE) {
         /* Insert first: insertion failure leaves the selection/text intact.
          * A later delete failure reports the insertion prefix, per piece API. */
         uint64_t lo=v->lo, old=v->hi-v->lo;
@@ -369,5 +469,6 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t 
             v->result=up?0:total; v->phase=P_APPLY;
         }
     }
+    if(!v->busy) return VIEW_OK;
     int rc=advance(v,change); if(rc!=VIEW_MORE) v->busy=false; return rc;
 }

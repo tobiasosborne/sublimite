@@ -26,6 +26,9 @@ typedef struct view_state {
     view_selection selection;
     uint64_t first_line, first_byte, hscroll;
     bool approximate;
+    bool wrap; /* per-buffer flag; view_init remains wrap-off for old callers */
+    bool visual_end; /* cursor affinity at a soft row end */
+    uint64_t visual_byte; /* first visible visual row */
 } view_state;
 
 /* Optional exact checkpoint seed. Return 1 with a grapheme boundary and its
@@ -61,6 +64,8 @@ typedef struct view {
     size_t win_len;
     int run_class, cluster_class;
     utf8_cseg cluster;
+    struct layout *wrap_layout;
+    bool wrap_target_soft;
     uint8_t win[VIEW_WINDOW + 4u];
 } view;
 
@@ -77,4 +82,12 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text,
 int view_continue(view *v, view_change *change);
 void view_cancel(view *v);
 bool view_busy(const view *v);
+/* Tiny P4.1 defaults; NULL/empty = untitled. Config overrides are P6.4. */
+bool view_wrap_default(const char *path);
+/* Apply open-time defaults to both the buffer flag and its layout. Reserve
+ * layout_wrap_init first for text/untitled buffers; begin after this call. */
+int view_wrap_file(view *v, struct layout *context, const char *path);
+/* Bind caller-owned layout query context; configured text width must match
+ * layout's text area. Toggle resets preferred column and horizontal scroll. */
+int view_set_wrap(view *v, bool enabled, struct layout *context);
 #endif

@@ -260,6 +260,8 @@ static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, 
     return miss;
 }
 
+static int run_wrapped(const char *dir);
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : "/tmp/edit-corpus";
@@ -269,6 +271,7 @@ int main(int argc, char **argv)
     char status[32]; bench_battery_status(status, sizeof status);
     printf("power=%s %s; (M) indicative under concurrent builds\n", status, bench_evidence_tag());
     printf("G: 300-row x 360-col full layout <= 150 us p50 and p99 (PLAN P3.1); layout state=%zu B\n", sizeof(layout));
+    if(argc>3 && strcmp(argv[3],"--wrap-only")==0) return run_wrapped(dir);
     int miss = 0;
     miss |= run(dir, "ascii_code.c", 360, 300, true, false, false);
     miss |= run(dir, "log_1g.txt", 360, 300, true, false, false);
@@ -280,5 +283,102 @@ int main(int argc, char **argv)
     miss |= run(dir, "oneline_1g.txt", 360, 300, true, false, false);
     miss |= run(dir, "unicode.txt", 360, 300, false, false, true);
     miss |= run(dir, "unicode.txt", 360, 120, false, true, true);
+    miss |= run_wrapped(dir);
+    return miss;
+}
+
+/* P4.1 rows are kept separate from the existing P3.1 gates above. */
+static int wrap_complete(layout *l)
+{
+    int rc; do { rc=layout_run(l); } while(rc==LAYOUT_MORE); return rc;
+}
+static int wrapped_file(const char *dir,const char *file)
+{
+    if(only && !strstr(file,only)) return 0;
+    char path[512]; snprintf(path,sizeof path,"%s/%s",dir,file);
+    int fd=open(path,O_RDONLY); struct stat st;
+    if(fd<0 || fstat(fd,&st)!=0 || st.st_size<=0) return 1;
+    size_t size=(size_t)st.st_size;
+    const uint8_t *map=mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);
+    if(map==MAP_FAILED) { close(fd); return 1; }
+    bool prose=!strcmp(file,"oneline_1g.txt");
+    piece_allocator al=piece_default_allocator(); piece_tree *tree=piece_create(&al);
+    if(!tree || piece_init_mapped(tree,map,size,&hooks)!=PIECE_OK) return 1;
+    const font_ascii_atlas *atlas=font_ascii_atlas_for_px(15);
+    render_cell *cells=malloc(360u*300u*sizeof *cells);
+    uint64_t rb[300],bits[8]; uint32_t ru[300]; render_glyph glyphs[95];
+    render_grid grid; render_atlas_page page={atlas->pixels,atlas->pixels_len,(size_t)atlas->cell.cell_w*95,atlas->cell.cell_w*95,atlas->cell.cell_h};
+    layout l; layout_config cfg={0}; cfg.fg=0xdddddd; cfg.bg=0x101010; cfg.gutter=true; cfg.glyph=stub_glyph;
+    edit_arena arena;
+    if(!cells || edit_arena_init(&arena,prose?((size/LAYOUT_CHECKPOINT_STRIDE+2)*sizeof(layout_checkpoint)+65536):65536)!=0 ||
+       render_grid_init(&grid,(render_dims){360,300,atlas->cell.cell_w,atlas->cell.cell_h},cells,108000,bits,8)!=0) return 1;
+    layout_ascii_glyphs(atlas,glyphs); grid.glyphs=glyphs; grid.glyph_count=95; grid.pages=&page; grid.page_count=1;
+    if(layout_init(&l,&grid,&cfg,rb,ru)!=0 || layout_wrap_init(&l,&arena)!=0 || layout_set_wrap(&l,true)!=0) return 1;
+    uint64_t lines=prose?1:piece_line_count(tree), starts[STARTS], first[STARTS];
+    for(uint32_t i=0;i<STARTS;i++) { first[i]=prose?0:(lines/STARTS)*i; starts[i]=prose?0:piece_line_to_byte(tree,first[i]); }
+    uint64_t values[SAMPLES], typing_values[SAMPLES]; bench_samples samples,typing;
+    bench_samples_init(&samples,values,SAMPLES); bench_samples_init(&typing,typing_values,SAMPLES);
+    uint32_t frame=0; uint64_t scanned=0;
+    for(uint32_t i=0;i<SAMPLES+64;i++) {
+        uint32_t k=i%STARTS;
+        if(render_frame_begin(&grid,++frame)!=0) return 1;
+        uint64_t begin=bench_now_ns();
+        if(layout_begin(&l,tree,(layout_viewport){starts[k],first[k],0,lines})!=0 || wrap_complete(&l)!=0) return 1;
+        uint64_t dt=bench_now_ns()-begin;
+        if(i>=64) { (void)bench_add(&samples,dt); scanned+=l.bytes_scanned; }
+        /* A relayout of the edited logical line, excluding mutation/setup.
+         * Unicode's corpus lines are short; prose's first logical line spans
+         * the viewport, so that TRACK row intentionally updates all its rows. */
+        if(i>=64) {
+            uint64_t off=rb[150]+1;
+            if(off==0 || off>piece_len(tree) || piece_insert(tree,off,(const uint8_t *)"x",1)!=0 || render_frame_begin(&grid,++frame)!=0) return 1;
+            begin=bench_now_ns();
+            if(layout_edit(&l,off,0,1,0,0)<0 || wrap_complete(&l)!=0) return 1;
+            (void)bench_add(&typing,bench_now_ns()-begin);
+            if(piece_delete(tree,off,1,NULL)!=0 || render_frame_begin(&grid,++frame)!=0 ||
+               layout_edit(&l,off,1,0,0,0)<0 || wrap_complete(&l)!=0) return 1;
+        }
+    }
+    if(render_grid_validate(&grid)!=0) return 1;
+    char name[128]; snprintf(name,sizeof name,"layout_wrapped_%s_360x300",file);
+    int miss=bench_report(name,&samples,300000,300000);
+    snprintf(name,sizeof name,"layout_wrapped_%s_typing_row_TRACK",file);
+    (void)bench_report(name,&typing,0,0);
+    printf("wrap_stats file=%s scanned_bytes=%llu descriptor_bytes=%zu (M) %s\n",file,(unsigned long long)scanned,600u*sizeof(layout_wrap_row),bench_evidence_tag());
+    if(prose) {
+        layout_checkpoint_store store; work_pool *pool=malloc(sizeof *pool);
+        if(!pool || layout_checkpoint_init(&store,&arena,size)!=0 || layout_set_checkpoints(&l,&store)!=0 || work_pool_init(pool,1,0)!=0) return 1;
+        piece_snapshot *snapshot=piece_snapshot_take(tree); if(!snapshot) return 1;
+        if(layout_checkpoint_request(&store,pool,snapshot,tree,0,4)!=0) return 1;
+        piece_snapshot_release(snapshot);
+        struct pollfd event={work_pool_eventfd(pool),POLLIN,0};
+        while(store.pending) { (void)poll(&event,1,100); (void)work_mailbox_drain(pool,checkpoint_message,&store); }
+        if(!store.complete) return 1;
+        layout_wrap_row seed; bool approximate=false;
+        if(layout_visual_row(&l,tree,100000000,0,&seed,&approximate)!=0 || seed.start>100000000 || seed.next<=100000000 || seed.column!=seed.start) return 1;
+        bench_samples deep; bench_samples_init(&deep,values,200);
+        for(unsigned i=0;i<216;i++) {
+            if(render_frame_begin(&grid,++frame)!=0) return 1;
+            uint64_t begin=bench_now_ns();
+            if(layout_begin_visual(&l,tree,(layout_viewport){0,0,0,1},&seed)!=0 || wrap_complete(&l)!=0) return 1;
+            if(i>=16) (void)bench_add(&deep,bench_now_ns()-begin);
+            if(l.bytes_scanned>150000 || l.bytes_read>10u*LAYOUT_WIN) return 1;
+        }
+        miss|=bench_report("layout_wrapped_oneline_1g.txt_byte_100000000_TRACK",&deep,300000,300000);
+        printf("wrap_deep_stats seed=%llu column=%llu approximate=%u scanned=%llu read=%llu (M) %s\n",
+               (unsigned long long)seed.start,(unsigned long long)seed.column,(unsigned)approximate,
+               (unsigned long long)l.bytes_scanned,(unsigned long long)l.bytes_read,bench_evidence_tag());
+        work_pool_shutdown(pool); free(pool);
+    }
+    edit_arena_free(&arena); free(cells); piece_destroy(tree); munmap((void *)map,size); close(fd);
+    return miss;
+}
+static int run_wrapped(const char *dir)
+{
+    char status[32],load[32]="unknown"; bench_battery_status(status,sizeof status);
+    FILE *f=fopen("/proc/loadavg","r"); if(f) { if(fscanf(f,"%31s",load)!=1) memcpy(load,"unknown",8); fclose(f); }
+    printf("wrap power=%s %s load1=%s; (M) shared-box TRACK verdict, gates unchanged\n",status,bench_evidence_tag(),load);
+    int miss=wrapped_file(dir,"unicode.txt");
+    miss|=wrapped_file(dir,"oneline_1g.txt");
     return miss;
 }

@@ -1,5 +1,8 @@
 /* layout (P3.1, edit-zzj.1): viewport of a piece tree/snapshot -> render.h cell grid.
  *
+ * P4.1 adds opt-in wrapping through layout_wrap_init/layout_set_wrap; the
+ * original description below applies to the default wrap-off path.
+ *
  * No wrap yet: one grid row per buffer line, clipped at the right edge, with a
  * horizontal scroll offset in columns. Tabs expand to the next multiple of
  * tab_width (columns count from the line start, the gutter excluded). Grapheme
@@ -131,6 +134,14 @@ void layout_checkpoint_invalidate(layout_checkpoint_store *s, uint64_t off,
                                   uint64_t old_len, uint64_t new_len,
                                   uint64_t old_nl, uint64_t new_nl);
 
+/* Wrapped row descriptor; caller-visible for viewport/motion adapters. Columns
+ * count from logical line start; indent is synthetic on continuation rows. */
+typedef struct layout_wrap_row {
+    uint64_t start, end, next, line_start, line, column, end_column, last;
+    uint32_t indent;
+    bool newline, continuation, approximate;
+} layout_wrap_row;
+
 typedef struct layout {
     render_grid *grid;
     layout_config cfg;
@@ -155,6 +166,12 @@ typedef struct layout {
     utf8_cseg cluster_seg;
     layout_cluster_cache_entry cluster_cache[LAYOUT_CLUSTER_CACHE];
     uint8_t cluster_bytes[LAYOUT_WIN];
+    /* P4.1 private wrap state. Reserved once with layout_wrap_init. */
+    layout_wrap_row *wrap_rows, *wrap_plan;
+    bool wrap, wrap_planning, wrap_leading, wrap_sink, wrap_cr, wrap_cursor_end;
+    uint32_t wrap_first, wrap_after, wrap_fill, wrap_break_vis, wrap_written;
+    uint64_t wrap_break_byte, wrap_break_col, wrap_break_last, wrap_last;
+    uint32_t wrap_indent, wrap_capacity;
     uint8_t win[LAYOUT_WIN];
 } layout;
 
@@ -196,4 +213,26 @@ bool layout_approximate(const layout *l);
 uint32_t layout_gutter_width(const layout *l);
 bool layout_busy(const layout *l);
 
+/* Open-time reserve: two descriptors per viewport row; no typing allocation.
+ * Init preserves wrap-off. Toggle only while idle; begin again after toggle or
+ * resize. Existing begin/viewport callers keep their original semantics. */
+int layout_wrap_init(layout *l, edit_arena *arena);
+int layout_set_wrap(layout *l, bool enabled);
+/* Trailing affinity places a soft-boundary cursor on the preceding row.
+ * Ordinary layout_set_cursor keeps its existing leading-affinity behavior. */
+void layout_set_cursor_visual(layout *l, uint64_t byte, bool trailing);
+/* Start at a previously obtained visual row (logical line fields included).
+ * Width/tab/gutter must match when using a descriptor from a preceding frame. */
+int layout_begin_visual(layout *l, const piece_tree *t, layout_viewport vp,
+                        const layout_wrap_row *first);
+/* Query a visual row containing a cluster-boundary byte, or an adjacent row.
+ * direction -1/0/+1. Work bounded by LAYOUT_BYTE_BUDGET; exact published column
+ * checkpoints seed deep fallback. approximate is explicit if no wrap boundary
+ * index exists near a deep byte. No allocation; no grid mutation. */
+int layout_visual_row(const layout *l, const piece_tree *t, uint64_t byte,
+                      int direction, layout_wrap_row *out, bool *approximate);
+
+/* Query after a mutation before layout_edit: ignore stale row/checkpoint data. */
+int layout_visual_row_fresh(const layout *l, const piece_tree *t, uint64_t byte,
+                            layout_wrap_row *out, bool *approximate);
 #endif

@@ -147,6 +147,21 @@ static void fuzz_long_line(const uint8_t *data, size_t size)
         for (size_t i = 0; i < store.count; i++) if (store.entries[i].byte >= off) __builtin_trap();
         /* Supersede partial redraw with the next published-index full layout. */
     }
+    if(layout_wrap_init(l,&arena)!=0 || layout_set_wrap(l,true)!=0) __builtin_trap();
+    size_t target_byte=len/2, boundary=0;
+    while(boundary<target_byte) { int width; boundary+=utf8_cluster(text+boundary,len-boundary,&width); }
+    layout_wrap_row seed; bool approximate;
+    if(layout_visual_row(l,tree,boundary,0,&seed,&approximate)!=0) __builtin_trap();
+    size_t certified=0;
+    while(certified<seed.start) { int width; certified+=utf8_cluster(text+certified,len-certified,&width); }
+    if(certified!=seed.start) __builtin_trap();
+    if(render_frame_begin(&grid,++frame)!=0 || layout_begin_visual(l,tree,(layout_viewport){0,0,0,1},&seed)!=0) __builtin_trap();
+    int wrap_result; unsigned wrap_guard=0;
+    do {
+        uint64_t before=l->bytes_scanned; wrap_result=layout_run(l);
+        if(l->bytes_scanned-before>LAYOUT_BYTE_BUDGET+4 || ++wrap_guard>100000) __builtin_trap();
+    } while(wrap_result==LAYOUT_MORE);
+    if(wrap_result!=LAYOUT_DONE || render_grid_validate(&grid)!=0) __builtin_trap();
     work_pool_shutdown(pool); free(pool); free(l); edit_arena_free(&arena); piece_destroy(tree); free(text);
 }
 
@@ -175,6 +190,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     uint64_t bits[2][1], rb[2][12];
     uint32_t ru[2][12];
     render_grid g[2];
+    edit_arena wrap_arena[2];
+    bool wrapping=(data[4]&2u)!=0;
     layout_config cfg = {0};
     cfg.tab_width = tab; cfg.gutter = gutter; cfg.fg = 0xffffff; cfg.bg = 0; cfg.gutter_fg = 0x808080;
     cfg.gutter_bg = 0x101010; cfg.cursor_fg = 1; cfg.cursor_bg = 2; cfg.sel_fg = 3; cfg.sel_bg = 4;
@@ -187,6 +204,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         g[k].pages = &page; g[k].page_count = 1; g[k].glyphs = glyphs; g[k].glyph_count = 96;
         cfg.slice_clusters = k ? slice : 0;
         if (layout_init(&lay[k], &g[k], &cfg, rb[k], ru[k]) != LAYOUT_DONE) __builtin_trap();
+        if(edit_arena_init(&wrap_arena[k],8192)!=0 || layout_wrap_init(&lay[k],&wrap_arena[k])!=0 || layout_set_wrap(&lay[k],wrapping)!=0) __builtin_trap();
         if (ins & 0x80) {                    /* marks are absolute byte offsets: edit check runs without them */
             layout_set_cursor(&lay[k], pick % (len + 1));
             layout_set_selection(&lay[k], pick % (len + 1), (pick * 7) % (len + 2));
@@ -202,7 +220,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         while ((rc = layout_run(&lay[k])) == LAYOUT_MORE) if (++guard > 100000) __builtin_trap();
         if (rc != LAYOUT_DONE || render_grid_validate(&g[k]) != RENDER_OK) __builtin_trap();
     }
-    if (memcmp(cells[0], cells[1], n * sizeof **cells) != 0) __builtin_trap();
+    if (memcmp(cells[0], cells[1], n * sizeof **cells) != 0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0) __builtin_trap();
     /* one edit through layout_edit vs a fresh layout */
     static const char *snip[] = { "x", "\n", "\xE4\xB8\xAD", "\t", "ab\ncd", "\xCC\x81" };
     const char *s = snip[ins % 6]; size_t sl = strlen(s), nl = 0;
@@ -218,10 +236,42 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (render_frame_begin(&g[1], ++fr) != RENDER_OK) __builtin_trap();
         if (layout_begin(&lay[1], t, (layout_viewport){first_byte, LAYOUT_LINE_UNKNOWN, hs, 0}) < 0) __builtin_trap();
         while ((rc = layout_run(&lay[1])) == LAYOUT_MORE) {}
-        if (!(ins & 0x80) && memcmp(cells[0], cells[1], n * sizeof **cells) != 0) __builtin_trap();
+        if (!(ins & 0x80) && (memcmp(cells[0], cells[1], n * sizeof **cells) != 0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0)) __builtin_trap();
         if (render_grid_validate(&g[1]) != RENDER_OK) __builtin_trap();
     }
-    for (int k = 0; k < 2; k++) free(cells[k]);
+    if((ins&0x40u) && piece_len(t)>first_byte) {
+        uint64_t remaining=piece_len(t)-first_byte;
+        uint64_t remove=1u+pick%5u; if(remove>remaining) remove=remaining;
+        uint64_t off_delete=first_byte+(pick*37u)%(remaining-remove+1u);
+        uint8_t removed[5]; if(piece_read(t,off_delete,removed,(size_t)remove)!=0) __builtin_trap();
+        uint64_t old_newlines=0;
+        for(size_t i=0;i<remove;i++) old_newlines+=removed[i]=='\n';
+        if(piece_delete(t,off_delete,remove,NULL)!=0 || render_frame_begin(&g[0],++fr)!=0 ||
+           layout_edit(&lay[0],off_delete,remove,0,old_newlines,0)<0) __builtin_trap();
+        unsigned guard=0;
+        while((rc=layout_run(&lay[0]))==LAYOUT_MORE) if(++guard>100000) __builtin_trap();
+        if(rc!=0 || render_grid_validate(&g[0])!=0 || render_frame_begin(&g[1],++fr)!=0 ||
+           layout_begin(&lay[1],t,(layout_viewport){first_byte,LAYOUT_LINE_UNKNOWN,hs,0})<0) __builtin_trap();
+        while((rc=layout_run(&lay[1]))==LAYOUT_MORE) {}
+        if(rc!=0 || (!(ins&0x80u) && (memcmp(cells[0],cells[1],n*sizeof **cells)!=0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0))) __builtin_trap();
+    }
+    /* Resize and toggle back and forth, compare sliced vs one-shot output. */
+    for(unsigned pass=0;pass<3;pass++) {
+        uint32_t width=1u+(data[pass]+pass)%cols;
+        for(int k=0;k<2;k++) {
+            g[k].dims.cols=width;
+            /* Existing wrap-off callers initialize repacked storage. Wrapped
+             * begin must handle its own changed stride/stale cell extents. */
+            if(pass%2u!=0) for(uint32_t r=0;r<rows;r++) ru[k][r]=width;
+            if(layout_set_wrap(&lay[k],pass%2u==0)!=0 || render_frame_begin(&g[k],++fr)!=0 ||
+               layout_begin(&lay[k],t,(layout_viewport){first_byte,LAYOUT_LINE_UNKNOWN,hs,0})<0) __builtin_trap();
+            unsigned guard=0; int result;
+            while((result=layout_run(&lay[k]))==LAYOUT_MORE) if(++guard>100000) __builtin_trap();
+            if(result!=LAYOUT_DONE || render_grid_validate(&g[k])!=RENDER_OK) __builtin_trap();
+        }
+        if(memcmp(cells[0],cells[1],(size_t)width*rows*sizeof **cells)!=0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0) __builtin_trap();
+    }
+    for (int k = 0; k < 2; k++) { edit_arena_free(&wrap_arena[k]); free(cells[k]); }
     piece_destroy(t);
     return 0;
 }
