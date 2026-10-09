@@ -7,6 +7,8 @@
  *     (ASCII, Latin-1, CJK, symbols, input-derived) return clean codes;
  *   - a successful raster has pixels iff w*h > 0 and the arena is rewound. */
 #include "font/font.h"
+#include "font_cffseed.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,6 +16,28 @@
 
 static edit_arena arena;
 static int arena_ready;
+
+/* P2.3e CFF seeds: FONT_FUZZ_SEED_DIR=<dir> writes the three synthetic OTFs
+ * (cffseed_build variants 0..2) as seed files and exits; run the fuzzer with
+ * that dir as corpus. Generated at run time, nothing vendored. */
+int LLVMFuzzerInitialize(int *argc, char ***argv)
+{
+    (void)argc; (void)argv;
+    const char *dir = getenv("FONT_FUZZ_SEED_DIR");
+    if (!dir) return 0;
+    static uint8_t buf[4096];
+    for (int v = 0; v < 3; v++) {
+        cffseed_layout L;
+        size_t n = cffseed_build(buf, sizeof buf, v, &L);
+        if (n == 0 || n > sizeof buf) exit(2);
+        char path[512];
+        snprintf(path, sizeof path, "%s/cff_seed_%d.otf", dir, v);
+        FILE *fp = fopen(path, "wb");
+        if (!fp || fwrite(buf, 1, n, fp) != n) exit(2);
+        fclose(fp);
+    }
+    exit(0);
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {

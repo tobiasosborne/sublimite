@@ -5,6 +5,9 @@
 #include "font/font.h"
 #include "work/work.h"
 #include "../vendor/stb_truetype.h"   /* declarations only: glyph ids for hostile-glyph tests */
+#include "../fuzz/font_cffseed.h"
+#include <signal.h>
+#include <unistd.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -233,6 +236,159 @@ static void test_font_bounds(const unsigned char *ttf, size_t len)
 }
 
 /* Synthetic 2-face TTC: header, face 0 = ttf, face 1 = ttf with a different hhea ascent. */
+
+/* ---- P2.3e: hostile CFF/OTTO data. A synthetic OTF (fuzz/font_cffseed.h) is
+ * mutated byte by byte, truncated inside every CFF structure and given
+ * out-of-range offsets; the Noto CJK CFF faces on this box get the same
+ * truncation treatment. Exact-size malloc blocks: ASan flags any read past
+ * len; a stb assert or a hang is also a failure. ---- */
+static void on_alarm(int sig)
+{
+    (void)sig;
+    static const char m[] = "font_test: TIMEOUT in CFF test (interpreter has no step budget)\n";
+    if (write(2, m, sizeof m - 1) < 0) {}
+    _exit(3);
+}
+
+/* Init on an exact-size copy; if it works, metrics+raster every glyph and the
+ * cmapped codepoints. Returns the init result; any clean error code is fine. */
+static int cff_exercise(const unsigned char *b, size_t n, uint32_t index, uint32_t *rastered)
+{
+    unsigned char *c = malloc(n ? n : 1u);
+    if (!c) return -99;
+    if (n) memcpy(c, b, n);
+    font_t f;
+    int r = font_init_index(&f, c, n, index);
+    if (r == FONT_OK) {
+        edit_arena a;
+        CHECK(edit_arena_init(&a, 1u << 20) == 0);
+        if (font_set_px(&f, 20) == FONT_OK) {
+            static const uint32_t cps[] = { 'A', 'B', 'C', 'g', 0x4E2Du, 0x20ACu };
+            for (size_t i = 0; i < sizeof cps / sizeof cps[0]; i++) {
+                edit_arena_mark_t mk = edit_arena_mark(&a);
+                font_bitmap bm;
+                font_metric m;
+                int mr = font_glyph_metrics(&f, cps[i], &m);
+                CHECK(mr == FONT_OK || mr == FONT_ERR_MISSING || mr == FONT_ERR_INIT);
+                int rr = font_raster_glyph(&f, cps[i], &a, &bm);
+                CHECK(rr == FONT_OK || rr == FONT_ERR_MISSING || rr == FONT_ERR_INIT || rr == FONT_ERR_NOMEM);
+                if (rr == FONT_OK && bm.pixels && rastered) (*rastered)++;
+                edit_arena_reset_to_mark(&a, mk);
+            }
+        }
+        edit_arena_free(&a);
+    }
+    free(c);
+    return r;
+}
+
+static void test_cff_synthetic(void)
+{
+    signal(SIGALRM, on_alarm);
+    for (int variant = 0; variant < 3; variant += 2) {
+        unsigned char buf[4096];
+        cffseed_layout L;
+        size_t n = cffseed_build(buf, sizeof buf, variant, &L);
+        CHECK(n > 0);
+        if (!n) continue;
+        uint32_t rast = 0;
+        CHECK(cff_exercise(buf, n, 0, &rast) == FONT_OK);
+        CHECK(rast >= 2);                         /* A and B drew pixels */
+
+        /* every byte of the CFF table replaced by 0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a, 0x0e */
+        static const unsigned char vals[] = { 0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a, 0x0e, 0x1d };
+        unsigned char *m = malloc(n);
+        CHECK(m != NULL);
+        for (size_t at = L.cff_off; m && at < L.cff_off + L.cff_len; at++) {
+            for (size_t k = 0; k < sizeof vals; k++) {
+                memcpy(m, buf, n);
+                m[at] = vals[k];
+                alarm(10);
+                (void)cff_exercise(m, n, 0, NULL);
+                alarm(0);
+            }
+        }
+        /* truncation: CFF table cut at every length (directory record patched) */
+        for (size_t cut = 0; m && cut < L.cff_len; cut++) {
+            memcpy(m, buf, L.cff_off + cut);
+            put32(m + L.rec_cff + 12, (uint32_t)cut);
+            alarm(10);
+            CHECK(cff_exercise(m, L.cff_off + cut, 0, NULL) == FONT_ERR_INIT);   /* every cut loses INDEX bytes */
+            alarm(0);
+        }
+        /* 32-bit fields pushed far outside: charstrings offset, INDEX counts and offsets */
+        static const uint32_t big[] = { 0x7fffffffu, 0xffffffffu, 0x40000000u, 0x20000000u, 0x10000u, 0x00ffffffu };
+        for (size_t k = 0; m && k < sizeof big / sizeof big[0]; k++) {
+            memcpy(m, buf, n);
+            put32(m + L.cs_off_pos, big[k]);
+            alarm(10);
+            CHECK(cff_exercise(m, n, 0, NULL) == FONT_ERR_INIT);
+            alarm(0);
+            memcpy(m, buf, n);
+            put32(m + L.priv_pos + 1, big[k]);          /* Subrs offset in Private */
+            (void)cff_exercise(m, n, 0, NULL);
+            memcpy(m, buf, n);
+            put16(m + L.cs_idx, 0xffffu);                 /* count */
+            m[L.cs_idx + 2] = (unsigned char)(1 + (k & 3));
+            (void)cff_exercise(m, n, 0, NULL);
+        }
+        free(m);
+    }
+    /* the budget case: glyph B costs 20^9 interpreter steps without a cap */
+    unsigned char buf[4096];
+    cffseed_layout L;
+    size_t n = cffseed_build(buf, sizeof buf, 1, &L);
+    CHECK(n > 0);
+    alarm(10);
+    uint32_t rast = 0;
+    CHECK(cff_exercise(buf, n, 0, &rast) == FONT_OK);
+    alarm(0);
+    CHECK(rast >= 1);                                 /* A still draws, B is refused or empty */
+    printf("font_test: hostile CFF (byte flips, truncations, offsets, subr bomb) handled cleanly\n");
+}
+
+static const char *noto_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+
+static void test_cff_noto(void)
+{
+    edit_arena fa;
+    size_t flen = 0;
+    if (access(noto_path, R_OK) != 0) { printf("font_test: %s missing, CFF system-font cases skipped\n", noto_path); return; }
+    CHECK(edit_arena_init(&fa, (size_t)192u << 20) == 0);
+    unsigned char *b = font_load_file(noto_path, &fa, &flen);
+    CHECK(b != NULL);
+    if (b) {
+        uint32_t rast = 0;
+        for (uint32_t idx = 0; idx < 3; idx++) {   /* real CFF CID fonts must still load */
+            font_t f;
+            CHECK(font_init_index(&f, b, flen, idx) == FONT_OK);
+            CHECK(font_set_px(&f, 30) == FONT_OK);
+        }
+        CHECK(cff_exercise(b, flen, 2, &rast) == FONT_OK);
+        CHECK(rast >= 1);
+        uint64_t base = be32(b + 12 + 4u * 2u);
+        size_t rec = rec_of(b, base, "CFF ");
+        size_t off = be32(b + rec + 8), tl = be32(b + rec + 12);
+        static const uint64_t cuts[] = { 0, 3, 4, 5, 8, 100, 1000, 100000, 1000003, 0 };
+        for (size_t k = 0; k < sizeof cuts / sizeof cuts[0]; k++) {
+            size_t cut = cuts[k] ? cuts[k] : tl / 2;
+            if (k == 9) cut = tl - 1;
+            if (cut >= tl) continue;
+            unsigned char *c = malloc(off + cut);
+            CHECK(c != NULL);
+            if (!c) continue;
+            memcpy(c, b, off + cut);
+            put32(c + rec + 12, (uint32_t)cut);
+            alarm(60);
+            (void)cff_exercise(c, off + cut, 2, NULL);
+            alarm(0);
+            free(c);
+        }
+    }
+    edit_arena_free(&fa);
+    printf("font_test: Noto CJK CFF faces load; truncated copies rejected cleanly\n");
+}
+
 static void test_ttc(const unsigned char *ttf, size_t len)
 {
     size_t hdr = 20;
@@ -573,6 +729,8 @@ int main(void)
     test_atlas_px(ttf, len);
     test_font_bounds(ttf, len);
     test_ttc(ttf, len);
+    test_cff_synthetic();
+    test_cff_noto();
     test_fallback();
 
     edit_arena_free(&a);

@@ -268,21 +268,240 @@ static int glyph_of(const font_t *f, uint32_t cp, int *g)
     return FONT_OK;
 }
 
-static void metrics_of_glyph(const font_t *f, int g, font_metric *m)
+/* Metrics read the outline box. TrueType boxes come from the 10-byte glyph
+ * header (validated), but the CFF box runs the charstring interpreter, whose
+ * asserts (e.g. a hintmask running off its charstring) are routed to a
+ * boundary like the raster path: FONT_ERR_INIT, never a trap. */
+static int metrics_of_glyph(const font_t *f, int g, font_metric *m)
 {
     int adv = 0, lsb = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     stbtt_GetGlyphHMetrics(cinfo_of(f), g, &adv, &lsb);
-    stbtt_GetGlyphBitmapBox(cinfo_of(f), g, f->scale, f->scale, &x0, &y0, &x1, &y1);
+    if (f->glyf_len) {
+        stbtt_GetGlyphBitmapBox(cinfo_of(f), g, f->scale, f->scale, &x0, &y0, &x1, &y1);
+    } else {
+        font_stb_ctx ctx;
+        ctx.arena = NULL;
+        if (setjmp(ctx.nomem)) {
+            font_stb_cur = NULL;
+            return FONT_ERR_INIT;
+        }
+        font_stb_cur = &ctx;
+        stbtt_GetGlyphBitmapBox(cinfo_of(f), g, f->scale, f->scale, &x0, &y0, &x1, &y1);
+        font_stb_cur = NULL;
+    }
     m->advance = round_f((float)adv * f->scale);
     m->bearing_x = x0;
     m->bearing_y = y0;
     m->w = x1 > x0 ? (uint32_t)(x1 - x0) : 0u;
     m->h = y1 > y0 ? (uint32_t)(y1 - y0) : 0u;
+    return FONT_OK;
+}
+
+
+/* ---- CFF validation (P2.3e, edit-e6x.15). stb's CFF parser bounds itself by a
+ * 512 MB constant instead of the table length and asserts on malformed INDEX /
+ * DICT data, so before stbtt_InitFont every structure stb will walk (name, top,
+ * string, global subr INDEXes, top DICT operands, Private + local Subrs, the
+ * FDArray and FDSelect, the charstrings INDEX) is parsed here, in uint64_t,
+ * against the table length, and anything stb could assert on or read outside
+ * the table is rejected. Charstring bodies are bounded by their INDEX items. ---- */
+typedef struct cff_view { const unsigned char *d; uint64_t n; } cff_view;
+#define CFF_MAX_LEN UINT64_C(0x1fffffff)
+
+static uint64_t cff_rdn(const cff_view *c, uint64_t o, uint32_t n)
+{
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < n; i++) v = v << 8 | c->d[o + i];
+    return v;
+}
+
+/* Validate an INDEX at pos: header, monotone offsets from 1, data inside the table. */
+static int cff_index(const cff_view *c, uint64_t pos, uint64_t *end, uint32_t *count)
+{
+    if (!in_buf(c->n, pos, 2)) return 0;
+    uint32_t cnt = rd16(c->d, pos);
+    *count = cnt;
+    if (cnt == 0) { *end = pos + 2; return 1; }
+    if (!in_buf(c->n, pos + 2, 1)) return 0;
+    uint32_t os = c->d[pos + 2];
+    if (os < 1u || os > 4u) return 0;
+    uint64_t offs = pos + 3, tab = (uint64_t)(cnt + 1u) * os;
+    if (!in_buf(c->n, offs, tab)) return 0;
+    uint64_t prev = 1;
+    for (uint32_t i = 0; i <= cnt; i++) {
+        uint64_t v = cff_rdn(c, offs + (uint64_t)i * os, os);
+        if (v < prev) return 0;
+        prev = v;
+    }
+    if (!in_buf(c->n, offs + tab, prev - 1u)) return 0;
+    *end = offs + tab + (prev - 1u);
+    return 1;
+}
+
+/* Extent of item i of an INDEX already accepted by cff_index (count >= 1). */
+static void cff_item(const cff_view *c, uint64_t pos, uint32_t i, uint64_t *a, uint64_t *b)
+{
+    uint32_t cnt = rd16(c->d, pos), os = c->d[pos + 2];
+    uint64_t base = pos + 3 + (uint64_t)(cnt + 1u) * os - 1u;
+    *a = base + cff_rdn(c, pos + 3 + (uint64_t)i * os, os);
+    *b = base + cff_rdn(c, pos + 3 + (uint64_t)(i + 1u) * os, os);
+}
+
+/* Walk DICT [a,b) strictly (no reserved operand bytes, no truncation). If `key`
+ * is present, the first nout operands (integers only, as stb reads them) are
+ * stored in out[]; *got is how many operands the first match had. */
+static int cff_dict(const cff_view *c, uint64_t a, uint64_t b, uint32_t key, uint32_t nout,
+                    uint32_t *out, uint32_t *got)
+{
+    const unsigned char *d = c->d;
+    int found = 0;
+    uint64_t p = a;
+    *got = 0;
+    while (p < b) {
+        uint32_t vals[2] = { 0, 0 }, k = 0;
+        int isi[2] = { 1, 1 };
+        while (p < b && d[p] >= 28) {
+            uint32_t b0 = d[p], v = 0;
+            int isint = 1;
+            if (b0 == 30) {
+                isint = 0;
+                p++;
+                for (;;) {
+                    if (p >= b) return 0;
+                    uint32_t x = d[p++];
+                    if ((x & 0xFu) == 0xFu || (x >> 4) == 0xFu) break;
+                }
+            } else if (b0 == 28) {
+                if (!in_buf(b, p, 3)) return 0;
+                v = rd16(d, p + 1); p += 3;
+            } else if (b0 == 29) {
+                if (!in_buf(b, p, 5)) return 0;
+                v = rd32(d, p + 1); p += 5;
+            } else if (b0 == 31 || b0 == 255) {
+                return 0;
+            } else if (b0 <= 246) {
+                v = b0 - 139u; p++;
+            } else {
+                if (!in_buf(b, p, 2)) return 0;
+                uint32_t b1 = d[p + 1];
+                v = b0 <= 250 ? (b0 - 247u) * 256u + b1 + 108u : 0u - (b0 - 251u) * 256u - b1 - 108u;
+                p += 2;
+            }
+            if (k < 2) { vals[k] = v; isi[k] = isint; }
+            k++;
+        }
+        if (p >= b) return 0;
+        uint32_t op = d[p++];
+        if (op == 12) {
+            if (p >= b) return 0;
+            op = d[p++] | 0x100u;
+        }
+        if (op == key && !found) {
+            found = 1;
+            *got = k < nout ? k : nout;
+            for (uint32_t i = 0; i < *got; i++) {
+                if (!isi[i]) return 0;               /* stb would feed a real number to cff_int */
+                out[i] = vals[i];
+            }
+        }
+    }
+    return 1;
+}
+
+/* Private DICT named by the Private operand of the font/top DICT [a,b), and its Subrs INDEX. */
+static int cff_private(const cff_view *c, uint64_t a, uint64_t b)
+{
+    uint32_t loc[2] = { 0, 0 }, got = 0, so = 0;
+    if (!cff_dict(c, a, b, 18, 2, loc, &got)) return 0;
+    if (!loc[0] || !loc[1]) return 1;
+    if (!in_buf(c->n, loc[1], loc[0])) return 0;
+    if (!cff_dict(c, loc[1], (uint64_t)loc[1] + loc[0], 19, 1, &so, &got)) return 0;
+    if (!so) return 1;
+    uint64_t at = (uint64_t)loc[1] + so, e;
+    uint32_t cnt;
+    return cff_index(c, at, &e, &cnt);
+}
+
+static int cff_fdselect(const cff_view *c, uint64_t at, uint32_t nfd, uint32_t ng)
+{
+    if (at >= c->n || nfd == 0) return 0;
+    uint32_t fmt = c->d[at];
+    if (fmt == 0) {
+        if (!in_buf(c->n, at + 1, ng)) return 0;
+        for (uint32_t i = 0; i < ng; i++) if (c->d[at + 1 + i] >= nfd) return 0;
+        return 1;
+    }
+    if (fmt != 3 || !in_buf(c->n, at + 1, 2)) return 0;
+    uint32_t nr = rd16(c->d, at + 1);
+    if (nr == 0 || !in_buf(c->n, at + 3, UINT64_C(3) * nr + 2)) return 0;
+    uint32_t start = rd16(c->d, at + 3);
+    if (start != 0) return 0;
+    for (uint32_t r = 0; r < nr; r++) {
+        uint64_t q = at + 3 + UINT64_C(3) * r;
+        uint32_t fd = c->d[q + 2], end = rd16(c->d, q + 3);
+        if (fd >= nfd || end < start) return 0;
+        start = end;
+    }
+    return start >= ng;
+}
+
+static int cff_validate(const unsigned char *cff, uint64_t n, uint32_t ng)
+{
+    if (n < 4 || n > CFF_MAX_LEN) return 0;
+    cff_view c = { cff, n };
+    uint64_t p = cff[2], e;
+    uint32_t cnt, got;
+    if (p < 4 || p > n) return 0;
+    if (!cff_index(&c, p, &e, &cnt)) return 0;                     /* Name INDEX */
+    p = e;
+    if (!cff_index(&c, p, &e, &cnt) || cnt < 1) return 0;          /* Top DICT INDEX */
+    uint64_t ta, tb;
+    cff_item(&c, p, 0, &ta, &tb);
+    p = e;
+    if (!cff_index(&c, p, &e, &cnt)) return 0;                     /* String INDEX */
+    p = e;
+    if (!cff_index(&c, p, &e, &cnt)) return 0;                     /* Global Subrs */
+
+    uint32_t cs = 0, cstype = 2, fda = 0, fdsel = 0;
+    if (!cff_dict(&c, ta, tb, 17, 1, &cs, &got)) return 0;
+    if (!cff_dict(&c, ta, tb, 0x100u | 6u, 1, &cstype, &got)) return 0;
+    if (!cff_dict(&c, ta, tb, 0x100u | 36u, 1, &fda, &got)) return 0;
+    if (!cff_dict(&c, ta, tb, 0x100u | 37u, 1, &fdsel, &got)) return 0;
+    if (cstype != 2 || cs == 0 || cs >= n) return 0;
+    if (!cff_private(&c, ta, tb)) return 0;
+    if (fda) {
+        if (!fdsel || fda >= n) return 0;
+        uint32_t nfd;
+        if (!cff_index(&c, fda, &e, &nfd) || nfd == 0) return 0;
+        for (uint32_t i = 0; i < nfd; i++) {
+            uint64_t fa, fb;
+            cff_item(&c, fda, i, &fa, &fb);
+            if (!cff_private(&c, fa, fb)) return 0;
+        }
+        if (!cff_fdselect(&c, fdsel, nfd, ng)) return 0;
+    }
+    uint32_t ncs;
+    if (!cff_index(&c, cs, &e, &ncs) || ncs < ng) return 0;        /* CharStrings: one per glyph */
+    return 1;
 }
 
 int font_init(font_t *f, const unsigned char *ttf, size_t len)
 {
     return font_init_index(f, ttf, len, 0);
+}
+
+/* setjmp boundary kept in its own frame so no caller local can be clobbered. */
+static int stb_init_guarded(font_t *f, const unsigned char *ttf, int base)
+{
+    int ok = 0;
+    font_stb_ctx ictx;
+    ictx.arena = NULL;
+    if (setjmp(ictx.nomem) == 0) {
+        font_stb_cur = &ictx;
+        ok = stbtt_InitFont(info_of(f), ttf, base);
+    }
+    font_stb_cur = NULL;
+    return ok;
 }
 
 int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t index)
@@ -323,6 +542,7 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
 
     uint32_t ng = rd16(ttf, maxp + 4);
     if (ng == 0) return FONT_ERR_INIT;
+    if (!have_glyf && !cff_validate(ttf + cff, cff_n, ng)) return FONT_ERR_INIT;
     if (rd16(ttf, head + 18) == 0) return FONT_ERR_INIT;           /* unitsPerEm */
     int32_t asc = rds16(ttf, hhea + 4), dsc = rds16(ttf, hhea + 6);
     if (asc <= 0 || dsc > 0) return FONT_ERR_INIT;                 /* cell_h = asc - dsc > 0 */
@@ -342,7 +562,10 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
         }
     }
 
-    if (!stbtt_InitFont(info_of(f), ttf, (int)base)) {
+    /* The validators above should make every stb assert unreachable; the
+     * boundary is the backstop so a missed case is an init error, not a trap. */
+    int stb_ok = stb_init_guarded(f, ttf, (int)base);
+    if (!stb_ok) {
         memset(f, 0, sizeof *f);
         return FONT_ERR_INIT;
     }
@@ -381,7 +604,7 @@ int font_set_px(font_t *f, uint32_t px)
         int g = 0;
         font_metric m;
         if (glyph_of(f, cp, &g) != FONT_OK) continue;
-        metrics_of_glyph(f, g, &m);
+        if (metrics_of_glyph(f, g, &m) != FONT_OK) continue;
         if (m.advance > 0 && (uint32_t)m.advance > maxadv) maxadv = (uint32_t)m.advance;
     }
     f->cell.cell_w = maxadv;
@@ -402,8 +625,7 @@ int font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out)
     if (!f || !out || !f->data || f->px == 0) return FONT_ERR_ARG;
     int r = glyph_of(f, cp, &g);
     if (r != FONT_OK) return r;
-    metrics_of_glyph(f, g, out);
-    return FONT_OK;
+    return metrics_of_glyph(f, g, out);
 }
 
 int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
@@ -420,7 +642,8 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
         int budget = FONT_COMPOSITE_BUDGET;
         if (!shape_ok(f, (uint32_t)g, 0, &budget)) return FONT_ERR_INIT;
     }
-    metrics_of_glyph(f, g, &out->m);
+    r = metrics_of_glyph(f, g, &out->m);
+    if (r != FONT_OK) { out->m.w = out->m.h = 0; return r; }
     out->w = out->m.w;
     out->h = out->m.h;
     if (out->w == 0 || out->h == 0) return FONT_OK;
@@ -516,7 +739,7 @@ static const font_ascii_atlas *atlas_matching(const font_t *f)
         font_metric m;
         const font_metric *b = &a->metrics[cp - FONT_ASCII_FIRST];
         if (glyph_of(f, cp, &g) != FONT_OK) return NULL;
-        metrics_of_glyph(f, g, &m);
+        if (metrics_of_glyph(f, g, &m) != FONT_OK) return NULL;
         if (m.advance != b->advance || m.bearing_x != b->bearing_x ||
             m.bearing_y != b->bearing_y || m.w != b->w || m.h != b->h)
             return NULL;

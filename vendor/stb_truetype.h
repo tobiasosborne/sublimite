@@ -2007,9 +2007,15 @@ static stbtt__buf stbtt__cid_get_glyph_subrs(const stbtt_fontinfo *info, int gly
    return stbtt__get_subrs(info->cff, stbtt__cff_index_get(info->fontdicts, fdselector));
 }
 
+// EDIT PATCH P2.3e: step budget. A hostile font can nest subrs 10 deep with
+// dozens of calls per level (~20^9 steps); real glyphs need a few thousand.
+#ifndef STBTT_CFF_MAX_STEPS
+#define STBTT_CFF_MAX_STEPS 100000
+#endif
 static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, stbtt__csctx *c)
 {
    int in_header = 1, maskbits = 0, subr_stack_height = 0, sp = 0, v, i, b0;
+   int steps = 0; // EDIT PATCH P2.3e
    int has_subrs = 0, clear_stack;
    float s[48];
    stbtt__buf subr_stack[10], subrs = info->subrs, b;
@@ -2020,6 +2026,7 @@ static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, st
    // this currently ignores the initial width value, which isn't needed if we have hmtx
    b = stbtt__cff_index_get(info->charstrings, glyph_index);
    while (b.cursor < b.size) {
+      if (++steps > STBTT_CFF_MAX_STEPS) return STBTT__CSERR("step budget"); // EDIT PATCH P2.3e
       i = 0;
       clear_stack = 1;
       b0 = stbtt__buf_get8(&b);
