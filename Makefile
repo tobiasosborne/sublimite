@@ -48,10 +48,19 @@ lib: $(REL_LIB)
 # ---- objects (one tree per configuration) ----
 $(B)/rel/%.o: %.c
 	@mkdir -p $(@D)
-	$(CC_RELEASE) $(WARN) $(REL_F) $(INC) $(DEP) -c $< -o $@
+	$(CC_RELEASE) $(WARN) $(REL_F) $(INC) $(GUARD) $(DEP) -c $< -o $@
 $(B)/san/%.o: %.c
 	@mkdir -p $(@D)
-	$(CC_SAN) $(WARN) $(SAN_F) $(INC) $(DEP) -c $< -o $@
+	$(CC_SAN) $(WARN) $(SAN_F) $(INC) $(GUARD) $(DEP) -c $< -o $@
+
+# Real-display guard (2026-10-09): every test and bench object force-includes
+# tests/display_guard.h (DISPLAY :0 -> $EDIT_DISPLAY or :99 unless EDIT_ALLOW_REAL_DISPLAY),
+# and check/bench run binaries on a safe display: a private Xvfb from xvfb-run is kept,
+# anything that names the real display 0 (or no DISPLAY) becomes $${EDIT_DISPLAY:-:99}.
+SAFE_DISPLAY = d=$${DISPLAY:-}; if [ -z "$${EDIT_ALLOW_REAL_DISPLAY:-}" ]; then case "$$d" in ""|:0|:0.*|unix:0|unix:0.*|localhost:0|localhost:0.*) d=$${EDIT_DISPLAY:-:99};; esac; fi
+GUARD_OBJ := $(TESTS:%.c=$(B)/rel/%.o) $(TESTS:%.c=$(B)/san/%.o) $(BENCHS:%.c=$(B)/rel/%.o)
+$(GUARD_OBJ): GUARD := -include tests/display_guard.h
+$(GUARD_OBJ): tests/display_guard.h
 $(B)/fuzz/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC_SAN) $(WARN) $(FUZZ_F) $(INC) $(DEP) -c $< -o $@
@@ -89,7 +98,7 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 # ---- phony drivers ----
 # Test binaries are built in sanitizer config under build/san/tests/.
 check: $(TEST_SAN) $(B)/tools/replay
-	@set -e; for t in $(TEST_SAN); do echo "== $$t"; $$t; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
+	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; DISPLAY=$$d $$t; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
 
 # Shell contract tests that need release benches (slow, ~1 min): run on demand.
@@ -101,7 +110,7 @@ check-sh: $(B)/tools/replay $(B)/bench/piece_bench
 # Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;
 # the full piece matrix is run by tools/bench_variant.sh on an idle box).
 bench: $(BENCH_BIN)
-	@set -e; for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; $$b $$args; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
+	@set -e; $(SAFE_DISPLAY); for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; DISPLAY=$$d $$b $$args; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
 
 fuzz: $(FUZZ_BIN)
 	@echo "fuzz: $(words $(FUZZ_BIN)) fuzzers built"
