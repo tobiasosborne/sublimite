@@ -114,3 +114,47 @@ Verification complete for the implemented scope:
   duplicate checks, verified in release and sanitizers. No bench rerun.
 
 Section 4 remains an explicit unresolved MAJOR, not a green or closed finding.
+
+# P2.6 reference-window integration — edit-e6x.6
+
+Done (tooling only; raster/render implementation and headers unchanged):
+- `tools/refwin.c`: bare xcb, one baked glyph through the editor CPU backend,
+  fixed startup reservations, guarded key-to-submit path, matching-frame CSV,
+  compositor bypass request and finite-run acknowledgement handshake.
+- `tools/keyinject.c`: dlopen xcb-xtest (runtime available, development package
+  absent), checked press/release requests, explicit XSendEvent fallback,
+  Present UST/MSC phase scheduling, seeded per-pair phases, alternating target
+  order, observed anchor MSC and unwrapped actual phase offsets.
+- `tools/refwin_protocol.h`: instance-local metadata/acknowledgement wire and
+  CSV contract; `tools/refwin_pairs.py`: strict editor trace join, complete-run
+  validation and signed per-pair T4/T5/T6 differences.
+- `tests/refwin_test.c`: actual editor + reference + injector on :99, expected
+  text and complete monotonic CSV, missing-pair/wrong-frame negative controls.
+  Release, ASan/UBSan and forced synthetic fallback pass. Standalone tool
+  binaries also pass a seeded-phase smoke test.
+- T6 mirrors the editor trace's earliest matching platform/backend observation;
+  NotifyMSC serials avoid ordinary application frame IDs. Focus presentations
+  are drained before sampling and exact key-frame identity is checked offline.
+
+Verification: GCC `make all` exit 0; Clang `make check` reports 44 test binaries
+and replay CLI checks passed, with ASAN_OPTIONS=detect_leaks=0; `make fuzz`
+reports 22 existing fuzzers built. After final T6 observer normalization, the
+affected release/sanitizer/fallback harnesses all passed again. Trace fuzz:
+675,558 runs in 11 s (M)[AC], load1=5.50, BAT0 Not charging, no finding.
+One historical TRACK sample (M)[AC], load1=14.43 is in P2.6.md, with raw CSV
+and trace paths; it predates that final T6 normalization and is not a gate.
+
+Missing/external: coordinator-announced real-display paired run and optical
+G2c verdict; real refresh period and actual phase matching tolerance; leak-on
+coordinator rerun. Xvfb has no real vblank, so :99 phase locking is approximate.
+Optional EGL reference was not added. Local X11 sockets require execution
+outside the sandbox; existing full-suite private-Xvfb fixtures are unchanged.
+
+Verify (DISPLAY=:99 EDIT_DISPLAY=:99 for every native invocation):
+  make all
+  ASAN_OPTIONS=detect_leaks=0 make check
+  make fuzz
+  build/tests/refwin_test
+  build/tests/refwin_test --send-event
+CLI/CSV/join commands, limitations, red/green and stamped evidence:
+  docs/decisions/P2.6.md
