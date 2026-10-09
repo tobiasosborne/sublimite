@@ -13,6 +13,12 @@ bool x11_clip_poll(plat *p);
 /* Limits (defaults: up to 256 KiB INCR chunk and threshold, 5 s peer timeout, 1 s clipboard-manager save wait).
  * Any argument 0 keeps the current value, except save_timeout_ms where UINT32_MAX disables the save. Tests shrink them. */
 void x11_clip_set_limits(plat *p, size_t incr_chunk, uint32_t timeout_ms, uint32_t save_timeout_ms);
+/* Memory and slice accounting (P2.2d). mem = every clipboard byte alive: owned/shared blobs, the paste buffer and
+ * receive buffers (capacity). budget defaults to 128 MiB; tests shrink it. max_slice = most bytes copied, converted or
+ * written inside one x11_clip_poll / x11_clip_event call since the last reset (reset != 0 clears it). */
+size_t x11_clip_mem(const plat *p);
+void   x11_clip_set_budget(plat *p, size_t bytes);
+size_t x11_clip_max_slice(plat *p, bool reset);
 /* In-flight transfers (serving INCR/MULTIPLE jobs plus receives that are not idle): 0 when quiescent. */
 size_t x11_clip_busy(const plat *p);
 /* Earliest monotonic deadline (ns, trace_now_ns clock) the loop must wake for, 0 = none. */

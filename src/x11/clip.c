@@ -18,7 +18,8 @@
 #define OWN_BUDGET (128u * 1024u * 1024u)
 #define MAX_WAITERS 256u
 
-typedef struct clip_blob { size_t refs, len; uint8_t data[]; } clip_blob;
+#define SLICE_BYTES (1024u * 1024u)       /* (E) about 0.2 ms of memcpy plus socket write per UI slice */
+typedef struct clip_blob { size_t refs, len, cap; uint8_t data[]; } clip_blob;
 typedef struct clip_receive {
     uint32_t state;                  /* 0 idle, 1 notify, 2 property reply, 3 INCR chunk */
     uint32_t waiters;
@@ -29,8 +30,9 @@ typedef struct clip_receive {
     uint64_t drain_end;
     xcb_get_property_cookie_t cookie;
     uint64_t deadline;
-    uint8_t *data;
-    size_t len, cap;
+    clip_blob *buf;                  /* growing receive buffer, accounted by capacity */
+    size_t len, raw;                 /* decoded bytes; raw property bytes of an INCR transfer */
+    uint32_t lower;                  /* INCR advertised lower bound */
 } clip_receive;
 struct clip_job;
 typedef struct clip_serve {
@@ -44,7 +46,10 @@ typedef struct clip_serve {
     uint32_t write, barrier;
 } clip_serve;
 typedef struct clip_job {
-    uint32_t state;                  /* 0 free, 1 MULTIPLE property, 2 checked writes */
+    uint32_t state;                  /* 0 free, 1 MULTIPLE property, 2 checked writes, 3 writes in progress, 4 finished, notify held */
+    uint64_t seq;                    /* arrival order */
+    xcb_atom_t held_prop;
+    size_t next;
     xcb_selection_request_event_t rq;
     clip_blob *blob;
     uint32_t stamp;
@@ -58,7 +63,10 @@ typedef struct clip_job {
 } clip_job;
 typedef struct x11_clip {
     clip_blob *own[NSEL];
-    size_t own_bytes, max_chunk, chunk;
+    size_t mem, max_chunk, chunk;
+    uint64_t job_seq;
+    uint32_t local_ready[NSEL];       /* confirmed local pastes whose completion is not yet queued */
+    uint64_t local_at[NSEL];
     uint32_t own_time[NSEL];
     bool confirmed[NSEL], retried[NSEL];
     bool uncertain[NSEL];
@@ -73,8 +81,8 @@ typedef struct x11_clip {
     clip_serve tx[NSERVE];
     clip_job jobs[NJOB];
     uint32_t timeout_ms, save_ms;
-    uint8_t *got;
-    size_t got_len;
+    clip_blob *got;                   /* paste buffer: shared with the owned blob for local pastes */
+    size_t budget, slice, max_slice;
     xcb_atom_t sel[NSEL], prop[NSEL], claim_prop[NSEL];
     xcb_atom_t utf8, targets, textplain, incr, timestamp, multiple, atom_pair, manager, save, save_prop, null_type;
     bool saving, save_done;
@@ -82,6 +90,7 @@ typedef struct x11_clip {
 } x11_clip;
 #define CL(p) ((x11_clip *)(p)->clip)
 
+static void note(x11_clip *c, size_t n) { c->slice += n; if (c->slice > c->max_slice) c->max_slice = c->slice; }
 static uint64_t deadline_after(uint32_t ms) { return trace_now_ns() + (uint64_t)ms * UINT64_C(1000000); }
 static bool older(uint32_t a, uint32_t b) { return a && b && (int32_t)(a - b) < 0; }
 static int which_of(const x11_clip *c, xcb_atom_t sel) {
@@ -89,8 +98,16 @@ static int which_of(const x11_clip *c, xcb_atom_t sel) {
     return -1;
 }
 static void blob_unref(x11_clip *c, clip_blob *b) {
-    if (b && --b->refs == 0) { c->own_bytes -= b->len; free(b); }
+    if (b && --b->refs == 0) { c->mem -= b->cap; free(b); }
 }
+static bool mem_fits(const x11_clip *c, size_t extra) { return extra <= c->budget && c->mem <= c->budget - extra; }
+static bool slice_room(const x11_clip *c, size_t n) { return c->slice == 0 || c->slice + n <= SLICE_BYTES; }
+static void set_got(x11_clip *c, clip_blob *b) {
+    clip_blob *old = c->got;
+    if (b) b->refs++;
+    c->got = b; blob_unref(c, old);
+}
+static void rx_drop(x11_clip *c, clip_receive *r) { blob_unref(c, r->buf); r->buf = NULL; r->len = 0; }
 static void tx_free(plat *p, clip_serve *s) {
     if (s->checking) { xcb_discard_reply(C(p), s->write); xcb_discard_reply(C(p), s->barrier); }
     xcb_window_t win = s->win;
@@ -102,15 +119,15 @@ static void tx_free(plat *p, clip_serve *s) {
         if (!other) { uint32_t mask = 0; xcb_change_window_attributes(C(p), win, XCB_CW_EVENT_MASK, &mask); }
     }
 }
-static void job_free(plat *p, clip_job *j) {
+static void job_release(plat *p, clip_job *j) {
     if (j->state == 1) xcb_discard_reply(C(p), j->cookie);
-    if (j->state == 2) {
-        xcb_discard_reply(C(p), j->barrier);
-        for (unsigned i = 0; i < j->nchecks; i++) xcb_discard_reply(C(p), j->checks[i]);
+    if (j->state == 2 || j->state == 3) {
+        if (j->state == 2) xcb_discard_reply(C(p), j->barrier);
+        for (unsigned i = 0; i < j->nchecks; i++) if (j->checks[i]) xcb_discard_reply(C(p), j->checks[i]);
     }
-    blob_unref(CL(p), j->blob);
-    memset(j, 0, sizeof *j);
+    blob_unref(CL(p), j->blob); j->blob = NULL; j->nchecks = 0;
 }
+static void job_free(plat *p, clip_job *j) { job_release(p, j); memset(j, 0, sizeof *j); }
 
 int x11_clip_init(plat *p) {
     x11_clip *c = calloc(1, sizeof *c);
@@ -137,7 +154,7 @@ int x11_clip_init(plat *p) {
     c->max_chunk = (size_t)xcb_get_setup(C(p))->maximum_request_length * 4u - 64u;
     if (c->max_chunk > CHUNK_MAX) c->max_chunk = CHUNK_MAX;
     c->chunk = c->max_chunk;
-    c->timeout_ms = 5000; c->save_ms = 1000;
+    c->timeout_ms = 5000; c->save_ms = 1000; c->budget = OWN_BUDGET;
     p->clip = c;
     return PLAT_OK;
 }
@@ -151,9 +168,9 @@ void x11_clip_destroy(plat *p) {
         if (c->rx[w].state == 2) xcb_discard_reply(C(p), c->rx[w].cookie.sequence);
         if (c->clear_pending[w]) xcb_discard_reply(C(p), c->clear_cookie[w]);
         if (c->rx[w].win) xcb_destroy_window(C(p), c->rx[w].win);
-        free(c->rx[w].data); blob_unref(c, c->own[w]);
+        rx_drop(c, &c->rx[w]); blob_unref(c, c->own[w]);
     }
-    free(c->got); free(c); p->clip = NULL;
+    blob_unref(c, c->got); free(c); p->clip = NULL;
 }
 
 /* Consume a whole UTF-8 sequence even when only its Latin-1 replacement fits the output chunk. */
@@ -233,12 +250,6 @@ static void result(plat *p, int w, bool ok, uint32_t code) {
     plat_event e = { .kind = PLAT_EV_CLIPBOARD, .clip_which = (uint8_t)w, .clip_ok = ok, .code = code };
     x11_push_event(p, &e);
 }
-static bool store_got(x11_clip *c, const uint8_t *d, size_t n) {
-    uint8_t *b = malloc(n ? n : 1);
-    if (!b) return false;
-    if (n) memcpy(b, d, n);
-    free(c->got); c->got = b; c->got_len = n; return true;
-}
 static void claim(plat *p, int w, uint32_t time) {
     x11_clip *c = CL(p);
     c->own_time[w] = time;
@@ -254,17 +265,28 @@ static void claim(plat *p, int w, uint32_t time) {
     c->owner_deadline[w] = deadline_after(c->timeout_ms);
     xcb_flush(C(p));
 }
+static bool queue_empty(const plat *p) { return !p->in || ((const x11_input *)p->in)->qh == ((const x11_input *)p->in)->qt; }
+static bool set_fits(const x11_clip *c, int which, size_t len) {
+    /* A blob nobody else holds is released by the replacement, so it does not count against the new one. */
+    size_t reclaim = c->own[which] && c->own[which]->refs == 1 ? c->own[which]->cap : 0;
+    return len <= DATA_MAX && len <= c->budget && c->mem - reclaim <= c->budget - len;
+}
 int plat_clip_set(plat *p, int which, const void *utf8, size_t len) {
     x11_clip *c = CL(p);
-    if (!c || which < 0 || which >= NSEL || (len && !utf8) || len > DATA_MAX || len > OWN_BUDGET - c->own_bytes)
-        return PLAT_ERR_FAIL;
+    if (!c || which < 0 || which >= NSEL || (len && !utf8) || len > DATA_MAX) return PLAT_ERR_FAIL;
+    if (!set_fits(c, which, len)) {
+        /* The paste buffer is the only reclaimable storage; drop it when nothing queued can still read it. */
+        bool idle = queue_empty(p) && !c->local_ready[0] && !c->local_ready[1];
+        if (idle && c->got) set_got(c, NULL);
+        if (!set_fits(c, which, len)) return PLAT_ERR_FAIL;
+    }
     clip_blob *b = malloc(sizeof *b + len);
     if (!b) return PLAT_ERR_FAIL;
-    b->refs = 1; b->len = len; if (len) memcpy(b->data, utf8, len);
+    b->refs = 1; b->len = len; b->cap = len; if (len) memcpy(b->data, utf8, len);
     if (c->claiming[which] == 2) xcb_discard_reply(C(p), c->owner_cookie[which]);
     if (c->clear_pending[which]) xcb_discard_reply(C(p), c->clear_cookie[which]);
     c->clear_pending[which] = c->clear_deferred[which] = false; c->clear_deadline[which] = 0;
-    blob_unref(c, c->own[which]); c->own_bytes += len; c->own[which] = b;
+    blob_unref(c, c->own[which]); c->mem += len; c->own[which] = b;
     c->confirmed[which] = false; c->retried[which] = false; c->uncertain[which] = false;
     claim(p, which, p->last_time);
     return PLAT_OK;
@@ -272,7 +294,10 @@ int plat_clip_set(plat *p, int which, const void *utf8, size_t len) {
 
 static void rx_convert(plat *p, int w, xcb_atom_t target) {
     x11_clip *c = CL(p); clip_receive *r = &c->rx[w];
-    r->state = 1; r->target = target; r->type = 0; r->offset = 0; r->incr = false;
+    r->state = 1; r->target = target; r->type = 0; r->offset = 0; r->incr = false; r->raw = 0; r->lower = 0;
+    rx_drop(c, r);
+    /* Every conversion phase (UTF8_STRING, then the STRING fallback) gets its own deadline. */
+    r->deadline = deadline_after(c->timeout_ms);
     /* Preserve P2.2's CurrentTime conversion behavior: an unrelated old key event
      * must not make a well-behaved owner refuse a later programmatic paste. */
     r->time = XCB_CURRENT_TIME;
@@ -280,16 +305,21 @@ static void rx_convert(plat *p, int w, xcb_atom_t target) {
     xcb_convert_selection(C(p), r->win, c->sel[w], target, c->prop[w], r->time);
     xcb_flush(C(p));
 }
+static void redispatch(plat *p, int w, unsigned n) {
+    for (unsigned i = 0; i < n; i++) if (plat_clip_request(p, w) != PLAT_OK) result(p, w, false, 1);
+}
 int plat_clip_request(plat *p, int which) {
     x11_clip *c = CL(p);
     if (!c || which < 0 || which >= NSEL) return PLAT_ERR_FAIL;
-    if (c->claiming[which]) {
+    if (c->claiming[which] || c->clear_pending[which]) {      /* ownership is being (re)checked: hold the paste */
         if (c->local_requests[which] == MAX_WAITERS) return PLAT_ERR_FAIL;
         c->local_requests[which]++; return PLAT_OK;
     }
     if (c->confirmed[which] && c->own[which]) {
-        bool ok = store_got(c, c->own[which]->data, c->own[which]->len);
-        result(p, which, ok, ok ? 0u : 1u); return PLAT_OK;
+        /* Completion is queued at delivery time (x11_clip_poll), never here: each completion event must see
+         * its own selection's data in the single plat_clip_data buffer. */
+        if (c->local_ready[which] == MAX_WAITERS) return PLAT_ERR_FAIL;
+        c->local_ready[which]++; c->local_at[which] = trace_now_ns() | 1u; return PLAT_OK;
     }
     clip_receive *r = &c->rx[which];
     if (r->waiters == MAX_WAITERS || r->draining) return PLAT_ERR_FAIL;
@@ -306,15 +336,25 @@ int plat_clip_request(plat *p, int which) {
     rx_convert(p, which, c->utf8); return PLAT_OK;
 }
 const uint8_t *plat_clip_data(const plat *p, size_t *len) {
-    const x11_clip *c = CL(p); *len = c ? c->got_len : 0; return c ? c->got : NULL;
+    const x11_clip *c = CL(p); *len = c && c->got ? c->got->len : 0; return c && c->got ? c->got->data : NULL;
 }
 static void rx_finish(plat *p, int w, bool ok) {
     x11_clip *c = CL(p); clip_receive *r = &c->rx[w];
     if (r->state == 2) xcb_discard_reply(C(p), r->cookie.sequence);
-    if (ok) { free(c->got); c->got = r->data; c->got_len = r->len; r->data = NULL; }
+    if (ok && !r->buf) {
+        r->buf = malloc(sizeof *r->buf);
+        if (r->buf) { r->buf->refs = 1; r->buf->len = r->buf->cap = 0; } else ok = false;
+    }
+    if (ok) {
+        clip_blob *b = r->buf; b->len = r->len;
+        clip_blob *t = realloc(b, sizeof *b + b->len);           /* give the unused tail back */
+        if (t) { c->mem -= t->cap - t->len; t->cap = t->len; b = t; }
+        set_got(c, b); b->refs--;                                /* got holds the only reference */
+        r->buf = NULL; r->len = 0;
+    } else rx_drop(c, r);
     unsigned waiters = r->waiters;
     xcb_window_t request_win = r->win;
-    free(r->data); memset(r, 0, sizeof *r);
+    memset(r, 0, sizeof *r);
     xcb_delete_property(C(p), request_win, c->prop[w]);
     xcb_destroy_window(C(p), request_win); xcb_flush(C(p));
     for (unsigned i = 0; i < waiters; i++) result(p, w, ok, ok ? 0u : 1u);
@@ -326,29 +366,33 @@ static void rx_get(plat *p, int w) {
                                  (uint32_t)((c->max_chunk + 3u) / 4u));
     r->state = 2; xcb_flush(C(p));
 }
-static bool rx_append(clip_receive *r, const x11_clip_property *v) {
+static bool rx_append(x11_clip *c, clip_receive *r, const x11_clip_property *v) {
     size_t n = v->len;
     if (v->type == XCB_ATOM_STRING) {
         for (size_t i = 0; i < v->len; i++) if (v->data[i] >= 0x80) n++;
     }
     if (n > DATA_MAX - r->len) return false;
-    size_t need = r->len + n;
-    if (need > r->cap || !r->data) {
-        size_t cap = r->cap ? r->cap : 4096;
+    size_t need = r->len + n, have = r->buf ? r->buf->cap : 0;
+    if (need > have || !r->buf) {
+        size_t cap = have ? have : 4096;
         while (cap < need) cap *= 2;
         if (cap > DATA_MAX) cap = DATA_MAX;
-        uint8_t *b = realloc(r->data, cap);
+        /* realloc may hold old and new at once: charge the full new capacity against the shared budget first. */
+        if (!mem_fits(c, cap)) { cap = need > 4096 ? need : 4096; if (!mem_fits(c, cap)) return false; }
+        clip_blob *b = realloc(r->buf, sizeof *b + cap);
         if (!b) return false;
-        r->data = b; r->cap = cap;
+        if (!r->buf) { b->refs = 1; b->len = 0; b->cap = 0; }
+        c->mem += cap - b->cap; b->cap = cap; r->buf = b;
     }
-    if (v->type == XCB_ATOM_STRING) x11_latin1_to_utf8(v->data, v->len, r->data + r->len);
-    else if (n) memcpy(r->data + r->len, v->data, n);
-    r->len += n; return true;
+    if (v->type == XCB_ATOM_STRING) x11_latin1_to_utf8(v->data, v->len, r->buf->data + r->len);
+    else if (n) memcpy(r->buf->data + r->len, v->data, n);
+    note(c, n);
+    r->len += n; r->raw += v->len; return true;
 }
 static void rx_reject_incr(plat *p, int w) {
     x11_clip *c = CL(p); clip_receive *r = &c->rx[w];
     for (unsigned i = 0; i < r->waiters; i++) result(p, w, false, 1);
-    r->waiters = 0; free(r->data); r->data = NULL; r->len = r->cap = 0;
+    r->waiters = 0; rx_drop(c, r);
     r->incr = r->draining = true; r->state = 3; r->offset = 0;
     r->deadline = r->drain_end = deadline_after(c->timeout_ms);
     xcb_delete_property(C(p), r->win, c->prop[w]); xcb_flush(C(p));
@@ -368,10 +412,11 @@ static void rx_reply(plat *p, int w, const xcb_get_property_reply_t *reply) {
     int kind = x11_clip_decode_transfer(&v, c->utf8, c->textplain, c->incr, r->type, !r->incr && !r->offset);
     if (kind == 1) {
         /* The advertised size is a lower bound, never an allocation instruction. */
+        memcpy(&r->lower, v.data, 4); r->raw = 0;
         r->incr = true; r->state = 3; r->deadline = deadline_after(c->timeout_ms);
         xcb_delete_property(C(p), r->win, c->prop[w]); xcb_flush(C(p)); return;
     }
-    if (kind < 0 || !rx_append(r, &v)) {
+    if (kind < 0 || !rx_append(c, r, &v)) {
         if (r->incr || v.type == c->incr) rx_reject_incr(p, w); else rx_finish(p, w, false);
         return;
     }
@@ -380,7 +425,9 @@ static void rx_reply(plat *p, int w, const xcb_get_property_reply_t *reply) {
         if (v.len / 4u > UINT32_MAX - r->offset) { rx_finish(p, w, false); return; }
         r->offset += (uint32_t)(v.len / 4u); rx_get(p, w); return;
     }
-    if (!r->incr || !v.len) { rx_finish(p, w, true); return; }
+    if (!r->incr) { rx_finish(p, w, true); return; }
+    /* The INCR integer is a lower bound on the bytes that will arrive: an earlier terminator is a truncation. */
+    if (!v.len) { rx_finish(p, w, r->raw >= r->lower); return; }
     r->offset = 0; r->state = 3; r->deadline = deadline_after(c->timeout_ms);
     xcb_delete_property(C(p), r->win, c->prop[w]); xcb_flush(C(p));
 }
@@ -389,6 +436,45 @@ static void notify(plat *p, const xcb_selection_request_event_t *rq, xcb_atom_t 
     xcb_selection_notify_event_t n = { .response_type = XCB_SELECTION_NOTIFY, .time = rq->time,
         .requestor = rq->requestor, .selection = rq->selection, .target = rq->target, .property = prop };
     xcb_send_event(C(p), 0, rq->requestor, 0, (const char *)&n); xcb_flush(C(p));
+}
+/* Replies for the same request tuple (requestor, selection, target, time) must arrive in request order
+ * (ICCCM): a failure or early finish waits behind every older job with that tuple. */
+static bool same_tuple(const xcb_selection_request_event_t *a, const xcb_selection_request_event_t *b) {
+    return a->requestor == b->requestor && a->selection == b->selection && a->target == b->target && a->time == b->time;
+}
+static bool tuple_blocked(const x11_clip *c, const clip_job *j) {
+    for (unsigned k = 0; k < NJOB; k++) {
+        const clip_job *o = &c->jobs[k];
+        if (o != j && o->state && o->seq < j->seq && same_tuple(&o->rq, &j->rq)) return true;
+    }
+    return false;
+}
+static void release_held(plat *p) {
+    x11_clip *c = CL(p);
+    for (;;) {
+        clip_job *best = NULL;
+        for (unsigned k = 0; k < NJOB; k++) {
+            clip_job *o = &c->jobs[k];
+            if (o->state == 4 && !tuple_blocked(c, o) && (!best || o->seq < best->seq)) best = o;
+        }
+        if (!best) return;
+        notify(p, &best->rq, best->held_prop); job_free(p, best);
+    }
+}
+static void job_finish(plat *p, clip_job *j, xcb_atom_t prop) {
+    if (tuple_blocked(CL(p), j)) { job_release(p, j); j->state = 4; j->held_prop = prop; j->deadline = 0; return; }
+    notify(p, &j->rq, prop); job_free(p, j); release_held(p);
+}
+/* An immediate refusal also queues behind older same-tuple jobs that are still running. */
+static void refuse(plat *p, const xcb_selection_request_event_t *rq) {
+    x11_clip *c = CL(p);
+    clip_job probe; memset(&probe, 0, sizeof probe); probe.rq = *rq; probe.seq = c->job_seq + 1u;
+    if (tuple_blocked(c, &probe)) {
+        for (unsigned i = 0; i < NJOB; i++) if (!c->jobs[i].state) {
+            clip_job *j = &c->jobs[i]; j->rq = *rq; j->seq = ++c->job_seq; j->state = 4; j->held_prop = XCB_ATOM_NONE; return;
+        }
+    }
+    notify(p, rq, XCB_ATOM_NONE);
 }
 static int tx_new(plat *p, clip_job *j, xcb_atom_t target, xcb_atom_t prop) {
     x11_clip *c = CL(p);
@@ -430,33 +516,39 @@ static unsigned convert(plat *p, clip_job *j, xcb_atom_t target, xcb_atom_t prop
         } else {
             const uint8_t *data = j->blob->data; size_t len = j->blob->len;
             if (target == XCB_ATOM_STRING) { len = x11_utf8_to_latin1(data, len, c->scratch); data = c->scratch; }
+            note(c, len);
             ck = xcb_change_property_checked(C(p), XCB_PROP_MODE_REPLACE, j->rq.requestor, prop, target, 8, (uint32_t)len, data);
         }
     } else return 0;
     return ck.sequence;
 }
+/* Convert pairs while the slice budget lasts; the rest continues from x11_clip_poll (state 3). */
 static void job_start_writes(plat *p, clip_job *j) {
     x11_clip *c = CL(p);
-    j->nchecks = (unsigned)j->npairs;
-    for (size_t i = 0; i < j->npairs; i++) {
+    for (; j->next < j->npairs; j->next++) {
+        size_t i = j->next;
         xcb_atom_t target = j->pairs[2u * i], prop = j->pairs[2u * i + 1u];
+        bool textual = target == c->utf8 || target == c->textplain || target == XCB_ATOM_STRING;
+        if (textual && !slice_room(c, j->blob->len < c->chunk ? j->blob->len : 0)) break;
         bool conflict = j->multiple && prop == j->rq.property;
         for (size_t k = 0; k < i; k++) if (prop == j->pairs[2u * k + 1u] && prop) conflict = true;
         j->checks[i] = conflict ? 0 : convert(p, j, target, prop, &j->slots[i]);
         if (conflict) j->slots[i] = -1;
         if (!j->checks[i]) j->pairs[2u * i + 1u] = XCB_ATOM_NONE;
+        j->nchecks = (unsigned)i + 1u;
     }
-    j->state = 2; j->barrier = xcb_get_input_focus(C(p)).sequence;
-    j->deadline = deadline_after(c->timeout_ms); xcb_flush(C(p));
+    j->deadline = deadline_after(c->timeout_ms);
+    if (j->next < j->npairs) { j->state = 3; return; }
+    j->state = 2; j->barrier = xcb_get_input_focus(C(p)).sequence; xcb_flush(C(p));
 }
 static void serve(plat *p, const xcb_selection_request_event_t *rq) {
     x11_clip *c = CL(p); int w = which_of(c, rq->selection);
     if (w < 0 || !c->own[w] || rq->owner != p->win || older(rq->time, c->own_time[w]) ||
-        (rq->target == c->multiple && !rq->property)) { notify(p, rq, XCB_ATOM_NONE); return; }
+        (rq->target == c->multiple && !rq->property)) { refuse(p, rq); return; }
     clip_job *j = NULL;
     for (unsigned i = 0; i < NJOB; i++) if (!c->jobs[i].state) { j = &c->jobs[i]; break; }
     if (!j) { notify(p, rq, XCB_ATOM_NONE); return; }
-    j->rq = *rq; j->blob = c->own[w]; j->blob->refs++; j->stamp = c->own_time[w];
+    j->rq = *rq; j->blob = c->own[w]; j->blob->refs++; j->stamp = c->own_time[w]; j->seq = ++c->job_seq; j->next = 0;
     j->deadline = deadline_after(c->timeout_ms); j->multiple = rq->target == c->multiple;
     if (j->multiple) {
         j->state = 1;
@@ -479,10 +571,13 @@ static void clear_query(plat *p, int w) {
 bool x11_clip_event(plat *p, const xcb_generic_event_t *e, plat_event *ev) {
     x11_clip *c = CL(p);
     if (!c) return false;
+    c->slice = 0;
     uint8_t t = e->response_type & 0x7f;
     if (t == XCB_SELECTION_REQUEST) { serve(p, (const xcb_selection_request_event_t *)e); return false; }
     if (t == XCB_SELECTION_CLEAR) {
         const xcb_selection_clear_event_t *x = (const xcb_selection_clear_event_t *)e;
+        /* Only the server generates Clear for an ownership change; a SendEvent copy (bit 0x80) is a forgery. */
+        if (e->response_type & 0x80) return false;
         int w = which_of(c, x->selection);
         if (w < 0 || x->owner != p->win || !c->own[w] || older(x->time, c->own_time[w])) return false;
         if (c->claiming[w]) { c->clear_deferred[w] = true; return false; }
@@ -536,6 +631,17 @@ static bool barrier_done(plat *p, unsigned seq, bool *ok) {
     if (!xcb_poll_for_reply(C(p), seq, &reply, &error)) return false;
     *ok = reply && !error; free(reply); free(error); return true;
 }
+/* Hand held local pastes on once ownership is settled: confirmed -> deliver from the shared blob in
+ * x11_clip_poll; otherwise ask the real owner. */
+static void flush_local(plat *p, int w) {
+    x11_clip *c = CL(p);
+    if (c->claiming[w] || c->clear_pending[w]) return;
+    unsigned requests = c->local_requests[w]; c->local_requests[w] = 0;
+    if (!requests) return;
+    if (c->confirmed[w] && c->own[w]) {
+        c->local_ready[w] += requests; c->local_at[w] = trace_now_ns() | 1u;
+    } else redispatch(p, w, requests);
+}
 static void owner_finish(plat *p, int w, bool ok) {
     x11_clip *c = CL(p);
     c->claiming[w] = 0; c->owner_deadline[w] = 0; c->confirmed[w] = ok && c->own[w];
@@ -543,15 +649,25 @@ static void owner_finish(plat *p, int w, bool ok) {
      * or a query may have raced. Only SelectionClear or a replacement releases it. */
     c->uncertain[w] = !ok;
     if (!ok) result(p, w, false, 2);
+    /* A Clear that arrived while claiming may be newer than a successful query: check again even on success,
+     * and keep local pastes held until that answer is in. */
     if (c->clear_deferred[w]) {
         c->clear_deferred[w] = false;
-        if (!ok) clear_query(p, w);
+        if (c->own[w]) clear_query(p, w);
     }
-    unsigned requests = c->local_requests[w]; c->local_requests[w] = 0;
-    if (requests && c->confirmed[w] && c->own[w]) {
-        bool stored = store_got(c, c->own[w]->data, c->own[w]->len);
-        for (unsigned i = 0; i < requests; i++) result(p, w, stored, stored ? 0u : 1u);
-    } else for (unsigned i = 0; i < requests; i++) plat_clip_request(p, w);
+    flush_local(p, w);
+}
+/* Queue the completions of confirmed local pastes. Runs only when the input queue is empty, one selection per
+ * call, so each batch of events sees its own selection in the single plat_clip_data buffer. */
+static bool deliver_local(plat *p, int w) {
+    x11_clip *c = CL(p);
+    unsigned n = c->local_ready[w]; c->local_ready[w] = 0; c->local_at[w] = 0;
+    if (!n) return false;
+    if (c->confirmed[w] && c->own[w] && !c->claiming[w] && !c->clear_pending[w]) {
+        set_got(c, c->own[w]);
+        for (unsigned i = 0; i < n; i++) result(p, w, true, 0);
+    } else { c->local_requests[w] += n; flush_local(p, w); }   /* ownership changed meanwhile: hold or ask the owner */
+    return true;
 }
 static void tx_send(plat *p, clip_serve *s) {
     x11_clip *c = CL(p);
@@ -560,6 +676,7 @@ static void tx_send(plat *p, clip_serve *s) {
     const uint8_t *data = s->blob->data + (size_t)s->offset;
     size_t consumed = n;
     if (s->target == XCB_ATOM_STRING) { n = latin_chunk(data, left, c->scratch, c->chunk, &consumed); data = c->scratch; }
+    note(c, n);
     s->write = xcb_change_property_checked(C(p), XCB_PROP_MODE_APPEND, s->win, s->prop, s->target, 8, (uint32_t)n, data).sequence;
     s->barrier = xcb_get_input_focus(C(p)).sequence; s->checking = true;
     s->offset += consumed; s->zero = n == 0; s->deleted = false;
@@ -576,10 +693,14 @@ static void job_transfers(plat *p, clip_job *j, bool announced) {
 }
 static void job_poll(plat *p, clip_job *j, uint64_t now, bool *progress) {
     x11_clip *c = CL(p);
-    if (!j->state) return;
+    if (!j->state || j->state == 4) return;
     if (now >= j->deadline) {
         job_transfers(p, j, false);
-        notify(p, &j->rq, XCB_ATOM_NONE); job_free(p, j); *progress = true; return;
+        job_finish(p, j, XCB_ATOM_NONE); *progress = true; return;
+    }
+    if (j->state == 3) {
+        if (!slice_room(c, j->blob->len < c->chunk ? j->blob->len : 0)) { *progress = true; return; }
+        job_start_writes(p, j); *progress = true; return;
     }
     if (j->state == 1) {
         void *reply = NULL; xcb_generic_error_t *error = NULL;
@@ -588,7 +709,7 @@ static void job_poll(plat *p, clip_job *j, uint64_t now, bool *progress) {
         x11_clip_property v;
         bool ok = !error && reply_view(reply, &v) && x11_clip_decode_pairs(&v, c->atom_pair, j->pairs, MAX_PAIRS, &j->npairs);
         free(reply); free(error);
-        if (!ok) { notify(p, &j->rq, XCB_ATOM_NONE); job_free(p, j); return; }
+        if (!ok) { job_finish(p, j, XCB_ATOM_NONE); return; }
         job_start_writes(p, j); return;
     }
     bool ok = false;
@@ -598,7 +719,7 @@ static void job_poll(plat *p, clip_job *j, uint64_t now, bool *progress) {
     if (j->nchecks > j->npairs) {
         ok = checked_ok(p, j->checks[j->npairs]) && ok;
         job_transfers(p, j, ok);
-        notify(p, &j->rq, ok ? j->rq.property : XCB_ATOM_NONE); job_free(p, j); return;
+        job_finish(p, j, ok ? j->rq.property : XCB_ATOM_NONE); return;
     }
     for (size_t i = 0; i < j->npairs; i++) {
         bool written = checked_ok(p, j->checks[i]) && ok;
@@ -610,7 +731,7 @@ static void job_poll(plat *p, clip_job *j, uint64_t now, bool *progress) {
     }
     if (!j->multiple) {
         job_transfers(p, j, j->pairs[1] != XCB_ATOM_NONE);
-        notify(p, &j->rq, j->pairs[1]); job_free(p, j); return;
+        job_finish(p, j, j->pairs[1]); return;
     }
     j->checks[j->npairs] = xcb_change_property_checked(C(p), XCB_PROP_MODE_REPLACE, j->rq.requestor, j->rq.property,
                                                       c->atom_pair, 32, (uint32_t)(j->npairs * 2u), j->pairs).sequence;
@@ -618,10 +739,13 @@ static void job_poll(plat *p, clip_job *j, uint64_t now, bool *progress) {
 }
 bool x11_clip_poll(plat *p) {
     x11_clip *c = CL(p); if (!c) return false;
+    c->slice = 0;
     /* Deliver already queued completions before replacing the single plat_clip_data
      * buffer with another selection's result (both receives can finish together). */
     if (!c->saving && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt) return false;
     bool progress = false; uint64_t now = trace_now_ns();
+    for (int w = 0; w < NSEL; w++)
+        if (c->local_ready[w] && deliver_local(p, w)) return true;     /* its events are queued: drain them first */
     for (int w = 0; w < NSEL; w++) {
         if (c->claiming[w] && now >= c->owner_deadline[w]) {
             if (c->claiming[w] == 2) xcb_discard_reply(C(p), c->owner_cookie[w]);
@@ -642,7 +766,7 @@ bool x11_clip_poll(plat *p) {
             void *reply = NULL; xcb_generic_error_t *error = NULL;
             if (now >= c->clear_deadline[w]) {
                 xcb_discard_reply(C(p), c->clear_cookie[w]); c->clear_pending[w] = false;
-                c->clear_deadline[w] = 0; progress = true;
+                c->clear_deadline[w] = 0; progress = true; flush_local(p, w);
             } else if (xcb_poll_for_reply(C(p), c->clear_cookie[w], &reply, &error)) {
                 xcb_get_selection_owner_reply_t *owner = reply;
                 if (owner && !error && owner->owner != p->win && c->own[w]) {
@@ -650,11 +774,13 @@ bool x11_clip_poll(plat *p) {
                     result(p, w, false, 2);
                 }
                 free(reply); free(error); c->clear_pending[w] = false; c->clear_deadline[w] = 0; progress = true;
+                flush_local(p, w);
             }
         }
         clip_receive *r = &c->rx[w];
         if (r->state && now >= r->deadline) { rx_finish(p, w, false); progress = true; }
-        if (r->state == 2) {
+        if (r->state == 2 && !slice_room(c, c->max_chunk)) progress = true;      /* budget spent: next slice */
+        else if (r->state == 2) {
             void *reply = NULL; xcb_generic_error_t *error = NULL;
             if (xcb_poll_for_reply(C(p), r->cookie.sequence, &reply, &error)) {
                 r->state = r->incr ? 3u : 1u; progress = true;
@@ -675,7 +801,7 @@ bool x11_clip_poll(plat *p) {
             ok = checked_ok(p, s->write) && ok; s->checking = false; progress = true;
             if (!ok) { tx_free(p, s); continue; }
         }
-        if (s->deleted) { tx_send(p, s); progress = true; }
+        if (s->deleted) { if (slice_room(c, c->chunk)) tx_send(p, s); progress = true; }
     }
     return progress;
 }
@@ -685,10 +811,16 @@ void x11_clip_set_limits(plat *p, size_t chunk, uint32_t timeout_ms, uint32_t sa
     if (timeout_ms) c->timeout_ms = timeout_ms;
     if (save_timeout_ms) c->save_ms = save_timeout_ms == UINT32_MAX ? 0 : save_timeout_ms;
 }
+size_t x11_clip_mem(const plat *p) { const x11_clip *c = CL(p); return c ? c->mem : 0; }
+void x11_clip_set_budget(plat *p, size_t bytes) { x11_clip *c = CL(p); if (c && bytes) c->budget = bytes; }
+size_t x11_clip_max_slice(plat *p, bool reset) {
+    x11_clip *c = CL(p); if (!c) return 0;
+    size_t m = c->max_slice; if (reset) c->max_slice = 0; return m;
+}
 size_t x11_clip_busy(const plat *p) {
     const x11_clip *c = CL(p); if (!c) return 0;
     size_t n = 0;
-    for (int w = 0; w < NSEL; w++) if (c->rx[w].state) n++;
+    for (int w = 0; w < NSEL; w++) if (c->rx[w].state || c->local_ready[w]) n++;
     for (unsigned i = 0; i < NSERVE; i++) if (c->tx[i].blob) n++;
     for (unsigned i = 0; i < NJOB; i++) if (c->jobs[i].state) n++;
     return n;
@@ -697,7 +829,7 @@ uint64_t x11_clip_deadline(const plat *p) {
     const x11_clip *c = CL(p); if (!c) return 0;
     uint64_t d = 0;
 #define EARLIER(v) do { uint64_t x = (v); if (x && (!d || x < d)) d = x; } while (0)
-    for (int w = 0; w < NSEL; w++) { EARLIER(c->owner_deadline[w]); EARLIER(c->clear_deadline[w]); EARLIER(c->rx[w].deadline); }
+    for (int w = 0; w < NSEL; w++) { EARLIER(c->local_at[w]); EARLIER(c->owner_deadline[w]); EARLIER(c->clear_deadline[w]); EARLIER(c->rx[w].deadline); }
     for (unsigned i = 0; i < NSERVE; i++) EARLIER(c->tx[i].deadline);
     for (unsigned i = 0; i < NJOB; i++) EARLIER(c->jobs[i].deadline);
 #undef EARLIER

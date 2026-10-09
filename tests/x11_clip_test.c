@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <xcb/xcb.h>
 
+static uint64_t now_ms(void) { return trace_now_ns() / 1000000u; }
 static int g_fail;
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
     fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); g_fail = 1; } } while (0)
@@ -45,6 +46,10 @@ typedef struct rawp {
     int own;
     const uint8_t *data; size_t data_len, off, chunk;
     xcb_window_t req_win; xcb_atom_t req_prop, req_target; bool owner_busy;
+    uint32_t lb_force;                       /* INCR header lower bound override (0 = real size) */
+    int delay_ms;                            /* OWN_NO_UTF8: answer each request this late */
+    xcb_selection_request_event_t dq; uint64_t dq_at;
+    xcb_atom_t nprops[8]; int nn;            /* MULTIPLE SelectionNotify properties in arrival order */
 } rawp;
 
 static void rp_open(rawp *r) {
@@ -67,7 +72,7 @@ static void rp_close(rawp *r) { free(r->got); xcb_disconnect(r->c); }
 
 static void rp_reset_req(rawp *r) {
     r->notified = r->failed = r->is_incr = r->done = false;
-    free(r->got); r->got = NULL; r->got_len = 0;
+    free(r->got); r->got = NULL; r->got_len = 0; r->nn = 0;
 }
 
 static void rp_append(rawp *r, const uint8_t *v, size_t n) {
@@ -106,14 +111,43 @@ static void rp_put_chunk(rawp *r) {
     xcb_flush(r->c);
 }
 
+static void rp_request(rawp *r, const xcb_selection_request_event_t *q) {
+    if (r->own == OWN_SILENT || r->own == OWN_NONE) {
+        r->req_win = q->requestor; r->req_prop = q->property; r->req_target = q->target;
+        return;
+    }
+    if (r->reject_old_time && q->time == 1) rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time);
+    else if (q->target == r->utf8 && (r->own == OWN_NO_UTF8 || r->own == OWN_STRING_INCR)) { rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time); }
+    else if (q->target == r->string && r->own == OWN_NO_UTF8) {
+        xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->string, 8,
+                            (uint32_t)r->data_len, r->data);
+        rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
+    } else if ((q->target == r->utf8 && (r->own == OWN_INCR || r->own == OWN_INCR_STALL || r->own == OWN_INCR_OVERSIZE)) ||
+               (q->target == r->string && r->own == OWN_STRING_INCR)) {
+        uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+        uint32_t lb = r->own == OWN_INCR_OVERSIZE ? UINT32_MAX : r->lb_force ? r->lb_force : (uint32_t)r->data_len;
+        xcb_change_window_attributes(r->c, q->requestor, XCB_CW_EVENT_MASK, &mask);
+        r->req_win = q->requestor; r->req_prop = q->property; r->req_target = q->target; r->off = 0;
+        r->owner_busy = r->own != OWN_INCR_STALL;
+        xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->incr, 32, 1, &lb);
+        rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
+    } else if (q->target == r->utf8 && r->own == OWN_PLAIN) {
+        xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->utf8, 8,
+                            (uint32_t)r->data_len, r->data);
+        rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
+    } else rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time);
+}
+
 /* One non-blocking step: handles requester notifications and, if it owns CLIPBOARD, requests against it. */
 static void rp_step(rawp *r) {
     xcb_generic_event_t *e;
+    if (r->dq_at && now_ms() >= r->dq_at) { r->dq_at = 0; rp_request(r, &r->dq); }
     while ((e = xcb_poll_for_event(r->c))) {
         uint8_t t = e->response_type & 0x7f;
         if (t == XCB_SELECTION_NOTIFY) {
             const xcb_selection_notify_event_t *n = (const xcb_selection_notify_event_t *)e;
             r->notified = true;
+            if (n->target == r->multiple && r->nn < 8) r->nprops[r->nn++] = n->property;
             if (n->property == XCB_ATOM_NONE) r->failed = true;
             else if (n->target == r->multiple) r->done = true;
             else if (!r->stall) rp_read_prop(r, n->property, false);
@@ -126,30 +160,8 @@ static void rp_step(rawp *r) {
                 rp_put_chunk(r);
         } else if (t == XCB_SELECTION_REQUEST) {
             const xcb_selection_request_event_t *q = (const xcb_selection_request_event_t *)e;
-            if (r->own == OWN_SILENT || r->own == OWN_NONE) {
-                r->req_win = q->requestor; r->req_prop = q->property; r->req_target = q->target;
-                free(e); continue;
-            }
-            if (r->reject_old_time && q->time == 1) rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time);
-            else if (q->target == r->utf8 && (r->own == OWN_NO_UTF8 || r->own == OWN_STRING_INCR)) { rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time); }
-            else if (q->target == r->string && r->own == OWN_NO_UTF8) {
-                xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->string, 8,
-                                    (uint32_t)r->data_len, r->data);
-                rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
-            } else if ((q->target == r->utf8 && (r->own == OWN_INCR || r->own == OWN_INCR_STALL || r->own == OWN_INCR_OVERSIZE)) ||
-                       (q->target == r->string && r->own == OWN_STRING_INCR)) {
-                uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
-                uint32_t lb = r->own == OWN_INCR_OVERSIZE ? UINT32_MAX : (uint32_t)r->data_len;
-                xcb_change_window_attributes(r->c, q->requestor, XCB_CW_EVENT_MASK, &mask);
-                r->req_win = q->requestor; r->req_prop = q->property; r->req_target = q->target; r->off = 0;
-                r->owner_busy = r->own != OWN_INCR_STALL;
-                xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->incr, 32, 1, &lb);
-                rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
-            } else if (q->target == r->utf8 && r->own == OWN_PLAIN) {
-                xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, q->requestor, q->property, r->utf8, 8,
-                                    (uint32_t)r->data_len, r->data);
-                rp_send_notify(r, q->requestor, q->selection, q->target, q->property, q->time);
-            } else rp_send_notify(r, q->requestor, q->selection, q->target, XCB_ATOM_NONE, q->time);
+            if (r->delay_ms && r->own == OWN_NO_UTF8) { r->dq = *q; r->dq_at = now_ms() + (uint64_t)r->delay_ms; }
+            else rp_request(r, q);
         }
         free(e);
     }
@@ -168,7 +180,6 @@ static void pump(plat *a, sink *sa, rawp *r, int rounds) {
     for (int i = 0; i < rounds; i++) { plat_run_for(a, &ca, 4); if (r) rp_step(r); }
 }
 
-static uint64_t now_ms(void) { return trace_now_ns() / 1000000u; }
 
 static bool pump_until(plat *a, sink *sa, rawp *r, const bool *flag, const int *counter, int limit_ms) {
     uint64_t end = now_ms() + (uint64_t)limit_ms;
@@ -499,9 +510,215 @@ static void test_stale_events(plat *a, sink *sa, rawp *r) {
     xcb_flush(r->c);
     pump_until(a, sa, r, &r->notified, NULL, 1000);
     CHECK(r->notified && r->failed, "SelectionRequest older than our ownership refused");
-    send_clear(r, a, stamp + 1u);
+    rp_own(r, OWN_NONE, NULL, 0, 0);                    /* real takeover: the server sends the Clear (forgeries are ignored, #1) */
     pump_until(a, sa, r, NULL, &sa->lost, 1000);
-    CHECK(sa->lost == 1, "current SelectionClear honoured");
+    CHECK(sa->lost == 1, "genuine SelectionClear honoured");
+}
+
+
+/* ===== review fixes (edit-e6x.18, docs/decisions/P2.2d.md) ===== */
+static uint32_t server_time(rawp *r) {
+    unsigned seq = xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p4, XCB_ATOM_INTEGER, 8, 1, "t").sequence;
+    xcb_flush(r->c);
+    uint32_t stamp = 0;
+    while (!stamp) {
+        xcb_generic_event_t *e = xcb_wait_for_event(r->c);
+        if (!e) return 0;
+        if ((e->response_type & 0x7f) == XCB_PROPERTY_NOTIFY) {
+            xcb_property_notify_event_t *v = (xcb_property_notify_event_t *)e;
+            if (v->window == r->win && v->atom == r->p4 && v->state == XCB_PROPERTY_NEW_VALUE && v->sequence == (uint16_t)seq)
+                stamp = v->time;
+        }
+        free(e);
+    }
+    return stamp;
+}
+static void barrier(plat *a) {
+    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(a->conn, xcb_get_input_focus(a->conn), NULL);
+    free(f);
+}
+
+/* #1: only a server-generated SelectionClear (real ownership change) may free our data. */
+static void test_forged_clear(plat *a, sink *sa, rawp *r) {
+    a->last_time = server_time(r);
+    set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "keep me", 7);
+    sa->lost = 0;
+    send_clear(r, a, a->last_time + 1000u);               /* forged by SendEvent: nobody took the selection */
+    pump(a, sa, r, 10);
+    CHECK(sa->lost == 0, "forged SelectionClear raised a loss event");
+    rp_reset_req(r);
+    xcb_convert_selection(r->c, r->win, r->clipboard, r->utf8, r->p1, XCB_CURRENT_TIME); xcb_flush(r->c);
+    pump_until(a, sa, r, &r->done, NULL, 1000);
+    CHECK(r->done && r->got_len == 7 && memcmp(r->got, "keep me", 7) == 0, "forged SelectionClear destroyed the clipboard data");
+    rp_own(r, OWN_NONE, NULL, 0, 0);                       /* a genuine takeover generates a real Clear */
+    pump_until(a, sa, r, NULL, &sa->lost, 1000);
+    CHECK(sa->lost == 1, "genuine ownership transfer must still release (lost %d)", sa->lost);
+}
+
+/* #4: every local completion sees its own selection's data, also with callback-initiated requests. */
+typedef struct loc_sink { plat *a; unsigned done[2]; bool bad, chained; } loc_sink;
+static void on_loc(void *ud, const plat_event *e) {
+    loc_sink *s = ud;
+    if (e->kind != PLAT_EV_CLIPBOARD || e->code != 0) return;
+    size_t n = 0; const uint8_t *d = plat_clip_data(s->a, &n);
+    const char *want = e->clip_which == 0 ? "clipboard" : "primary"; size_t wn = strlen(want);
+    if (!d || n != wn || memcmp(d, want, wn)) s->bad = true;
+    s->done[e->clip_which]++;
+    if (!s->chained && e->clip_which == 0) { s->chained = true; plat_clip_request(s->a, PLAT_CLIP_PRIMARY); }
+}
+static void test_local_completion_data(plat *a, sink *sa, rawp *r) {
+    a->last_time = 0;
+    set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "clipboard", 9);
+    set_and_confirm(a, sa, r, PLAT_CLIP_PRIMARY, "primary", 7);
+    loc_sink s = { .a = a }; plat_callbacks cb = { &s, on_loc, NULL, NULL, NULL };
+    plat_clip_request(a, PLAT_CLIP_CLIPBOARD); plat_clip_request(a, PLAT_CLIP_PRIMARY);
+    uint64_t end = now_ms() + 2000;
+    while (now_ms() < end && (s.done[0] < 1 || s.done[1] < 2)) { plat_run_for(a, &cb, 4); rp_step(r); }
+    CHECK(s.done[0] == 1 && s.done[1] == 2, "local completions delivered (%u/%u)", s.done[0], s.done[1]);
+    CHECK(!s.bad, "a local completion exposed another selection's data");
+}
+
+/* #5: a takeover that lands after the confirmation query must not be forgotten. */
+static void test_takeover_after_confirmation(plat *a, sink *sa, rawp *r) {
+    a->last_time = server_time(r);
+    sa->lost = sa->arrived = sa->failed = 0;
+    plat_clip_set(a, PLAT_CLIP_CLIPBOARD, "mine", 4);
+    barrier(a);                                            /* our claim and owner query are answered (owner = us) */
+    plat_clip_request(a, PLAT_CLIP_CLIPBOARD);             /* queued behind the confirmation */
+    rp_own(r, OWN_PLAIN, "theirs", 6, 0);                  /* the takeover and its Clear arrive after the reply */
+    barrier(a);
+    pump_until(a, sa, r, NULL, &sa->arrived, 2000);
+    size_t n = 0; const uint8_t *d = plat_clip_data(a, &n);
+    CHECK(sa->lost == 1, "takeover after confirmation reports the loss (lost %d)", sa->lost);
+    CHECK(sa->arrived == 1 && d && n == 6 && memcmp(d, "theirs", 6) == 0, "paste after takeover returned stale data (%zu bytes)", n);
+    a->last_time = 0;
+}
+
+/* #6: an INCR transfer that ends below its advertised lower bound is a failure. */
+static void test_incr_short(plat *a, sink *sa, rawp *r) {
+    struct { int mode; const char *what; size_t n; uint32_t lb; } cs[] = {
+        { OWN_INCR, "one byte below a 4096 lower bound", 1, 4096 },
+        { OWN_INCR, "immediate terminator below the lower bound", 0, 4096 },
+        { OWN_STRING_INCR, "STRING transfer below the lower bound", 1, 4096 },
+        { OWN_INCR, "control: exactly the lower bound", 1, 1 },
+    };
+    for (unsigned i = 0; i < 4; i++) {
+        r->lb_force = cs[i].lb;
+        rp_own(r, (unsigned)cs[i].mode, "x", cs[i].n, 1); pump(a, sa, r, 3);
+        sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
+        uint64_t end = now_ms() + 2000;
+        while (now_ms() < end && !sa->arrived && !sa->failed) pump(a, sa, r, 1);
+        pump(a, sa, r, 3);
+        if (i < 3) CHECK(sa->failed == 1 && !sa->arrived, "INCR %s must fail (ok %d, failed %d)", cs[i].what, sa->arrived, sa->failed);
+        else CHECK(sa->arrived == 1 && !sa->failed, "INCR %s must succeed (ok %d, failed %d)", cs[i].what, sa->arrived, sa->failed);
+        CHECK(x11_clip_busy(a) == 0, "INCR short case %u released", i);
+    }
+    r->lb_force = 0;
+}
+
+/* #13: bulk clipboard work is bounded per slice; local pastes share the immutable blob. */
+#define SLICE_LIMIT (1024u * 1024u)
+static void test_bulk_slices(plat *a, sink *sa, rawp *r) {
+    a->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 5000, 0);
+    size_t big = 20u * 1024u * 1024u; uint8_t *d = pattern(big);
+    set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, d, big);
+    (void)x11_clip_max_slice(a, true);
+    sa->arrived = sa->failed = 0;
+    plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
+    pump_until(a, sa, r, NULL, &sa->arrived, 2000);
+    size_t n = 0; const uint8_t *g = plat_clip_data(a, &n);
+    CHECK(sa->arrived == 1 && n == big && g && memcmp(g, d, big) == 0, "20 MiB local paste delivered");
+    size_t m = x11_clip_max_slice(a, true);
+    CHECK(m <= SLICE_LIMIT, "local paste moved %zu bytes in one slice (limit %u)", m, SLICE_LIMIT);
+    free(d);
+    /* MULTIPLE with 64 direct conversions of ~200 KB each */
+    size_t each = 200000; d = pattern(each);
+    set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, d, each);
+    xcb_atom_t pairs[128], props[64]; char nm[24];
+    for (unsigned i = 0; i < 64; i++) { snprintf(nm, sizeof nm, "RP_BULK%u", i); props[i] = intern(r->c, nm); pairs[2 * i] = r->utf8; pairs[2 * i + 1] = props[i]; }
+    rp_reset_req(r);
+    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p1, r->atom_pair, 32, 128, pairs);
+    xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p1, XCB_CURRENT_TIME); xcb_flush(r->c);
+    (void)x11_clip_max_slice(a, true);
+    pump_until(a, sa, r, &r->done, NULL, 10000);
+    m = x11_clip_max_slice(a, true);
+    CHECK(r->done && !r->failed, "64-pair MULTIPLE answered");
+    CHECK(m <= SLICE_LIMIT + 256u * 1024u, "MULTIPLE moved %zu bytes in one slice (limit %u)", m, SLICE_LIMIT + 256u * 1024u);
+    for (unsigned i = 0; i < 64; i += 21) {
+        xcb_get_property_reply_t *g2 = xcb_get_property_reply(r->c,
+            xcb_get_property(r->c, 0, r->win, props[i], XCB_GET_PROPERTY_TYPE_ANY, 0, 0), NULL);
+        CHECK(g2 && g2->bytes_after == each, "bulk property %u complete (%u)", i, g2 ? g2->bytes_after : 0u);
+        free(g2);
+    }
+    free(d);
+    pump(a, sa, r, 3);
+    CHECK(x11_clip_busy(a) == 0, "bulk MULTIPLE released");
+}
+
+/* #14: one budget covers owned blobs, the paste buffer and receive buffers. */
+static void test_memory_budget(plat *a, sink *sa, rawp *r) {
+    (void)a; (void)sa; (void)r;
+    plat b; if (!open_plat(&b)) { CHECK(false, "second plat"); return; }
+    sink sb; memset(&sb, 0, sizeof sb);
+    rawp primary; rp_open(&primary); primary.clipboard = XCB_ATOM_PRIMARY;
+    x11_clip_set_budget(&b, 1024u * 1024u);
+    uint8_t *d = pattern(600000);
+    CHECK(plat_clip_set(&b, PLAT_CLIP_CLIPBOARD, d, 600000) == PLAT_OK, "first 600 KB set within 1 MiB");
+    CHECK(plat_clip_set(&b, PLAT_CLIP_PRIMARY, d, 600000) == PLAT_ERR_FAIL, "second 600 KB set must exceed the 1 MiB budget");
+    pump(&b, &sb, &primary, 3);
+    size_t m0 = x11_clip_mem(&b);
+    CHECK(m0 >= 600000 && m0 < 700000, "mem counts the owned blob (%zu)", m0);
+    uint8_t *pd = pattern(700000);
+    rp_own(&primary, OWN_PLAIN, pd, 700000, 0); pump(&b, &sb, &primary, 3);
+    plat_clip_request(&b, PLAT_CLIP_PRIMARY);
+    uint64_t end = now_ms() + 3000;
+    while (now_ms() < end && !sb.arrived && !sb.failed) pump(&b, &sb, &primary, 1);
+    CHECK(sb.failed == 1 && !sb.arrived, "a receive that would exceed the budget must fail (ok %d, failed %d)", sb.arrived, sb.failed);
+    pump(&b, &sb, &primary, 3);
+    CHECK(x11_clip_mem(&b) == m0, "failed receive released its buffer (%zu vs %zu)", x11_clip_mem(&b), m0);
+    /* a local paste shares the owned blob: no second copy */
+    set_and_confirm(&b, &sb, &primary, PLAT_CLIP_CLIPBOARD, d, 600000);
+    size_t m1 = x11_clip_mem(&b);
+    sb.arrived = sb.failed = 0; plat_clip_request(&b, PLAT_CLIP_CLIPBOARD);
+    pump_until(&b, &sb, NULL, NULL, &sb.arrived, 1000);
+    CHECK(sb.arrived == 1 && x11_clip_mem(&b) <= m1 + 8, "local paste duplicated the blob (%zu -> %zu)", m1, x11_clip_mem(&b));
+    free(d); free(pd); rp_close(&primary); plat_shutdown(&b);
+}
+
+/* #15: the STRING fallback gets a fresh conversion deadline. */
+static void test_string_fallback_deadline(plat *a, sink *sa, rawp *r) {
+    static const uint8_t lat[] = { 'c', 'a', 'f', 0xe9 };
+    x11_clip_set_limits(a, 0, 600, 0);
+    rp_own(r, OWN_NO_UTF8, lat, sizeof lat, 0); pump(a, sa, r, 3);
+    r->delay_ms = 400;                                      /* refusal at ~400 ms, STRING reply ~400 ms later */
+    sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
+    uint64_t end = now_ms() + 3000;
+    while (now_ms() < end && !sa->arrived && !sa->failed) pump(a, sa, r, 1);
+    size_t n = 0; const uint8_t *g = plat_clip_data(a, &n);
+    CHECK(sa->arrived == 1 && !sa->failed && g && n == 5 && memcmp(g, "caf\xc3\xa9", 5) == 0,
+          "late UTF8 refusal then timely STRING must succeed (ok %d, failed %d)", sa->arrived, sa->failed);
+    r->delay_ms = 0; r->dq_at = 0; x11_clip_set_limits(a, 0, 5000, 0);
+}
+
+/* #28: notifications for identical MULTIPLE tuples keep arrival order. */
+static void test_multiple_order(plat *a, sink *sa, rawp *r) {
+    a->last_time = server_time(r);
+    set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "ordered", 7);
+    xcb_atom_t good[2] = { r->utf8, r->p4 };
+    rp_reset_req(r);
+    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p1, r->string, 8, 1, "x");   /* malformed */
+    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p2, r->atom_pair, 32, 2, good);
+    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p3, r->string, 8, 1, "y");   /* malformed */
+    uint32_t t = a->last_time;
+    xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p1, t);
+    xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p2, t);
+    xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p3, t);
+    xcb_flush(r->c);
+    uint64_t end = now_ms() + 3000;
+    while (now_ms() < end && r->nn < 3) pump(a, sa, r, 1);
+    CHECK(r->nn == 3 && r->nprops[0] == XCB_ATOM_NONE && r->nprops[1] == r->p2 && r->nprops[2] == XCB_ATOM_NONE,
+          "MULTIPLE notifications out of order: %u %u %u (want none, p2, none)", r->nprops[0], r->nprops[1], r->nprops[2]);
+    a->last_time = 0;
 }
 
 /* ---- clipboard manager ---- */
@@ -794,6 +1011,14 @@ int main(void) {
     test_owner_confirmation_timeout(&a, &sa, &r);
     test_stale_events(&a, &sa, &r);
     test_focus_modes(&a, &sa, &r);
+    test_forged_clear(&a, &sa, &r);
+    test_local_completion_data(&a, &sa, &r);
+    test_takeover_after_confirmation(&a, &sa, &r);
+    test_incr_short(&a, &sa, &r);
+    test_bulk_slices(&a, &sa, &r);
+    test_string_fallback_deadline(&a, &sa, &r);
+    test_multiple_order(&a, &sa, &r);
+    test_memory_budget(&a, &sa, &r);
     rp_close(&r);
     plat_shutdown(&a);
     test_manager_save(0, "manager saves");
