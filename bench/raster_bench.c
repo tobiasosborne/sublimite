@@ -2,7 +2,8 @@
  * Missing minimap, real bulk integration and vblank make acceptance unmeasured:
  * exit 2 in gate mode, exit 1 on error/miss, explicit --track permits subsets.
  * Usage: [--quick] [--idle 0..8] [--track] [--target A|B|all]
- *        [--kernel-only] [--kernel-samples N] | --self-check */
+ *        [--kernel-only] [--kernel-samples N] | --self-check
+ *        --scroll-track [--target A|B|all] | --pace-self-check */
 #include "raster/raster.h"
 #include "base/base.h"
 #include "font/font.h"
@@ -10,6 +11,7 @@
 #include "x11/plat.h"
 #include "trace/trace.h"
 #include "harness.h"
+#include "render_pace.h"
 #include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
@@ -163,7 +165,8 @@ static void teardown_rig(rig *r)
 
 /* Submit (full or one row) and present; returns ingress -> T5 (ns) or 0 on error.
  * Waits for T6 afterwards (outside the measurement). */
-static uint64_t one_frame(rig *r, bool full, uint32_t row, uint64_t *t6_out)
+static uint64_t one_frame_impl(rig *r, bool full, uint32_t row, uint64_t *t6_out,
+                               bool scrolling, render_pace_frame *pace)
 {
     uint32_t id = r->next_id++;
     uint64_t t0 = bench_now_ns();
@@ -171,7 +174,11 @@ static uint64_t one_frame(rig *r, bool full, uint32_t row, uint64_t *t6_out)
     r->first_mutation_ns = 0;
     r->event_error = RENDER_OK;
     edit_malloc_guard_begin();
-    if (full) for (int k = 0; k < 64; k++) fill_cell(r, rnd(r) % ((size_t)r->dims.cols * r->dims.rows));
+    if (scrolling) {
+        size_t n = (size_t)r->dims.cols * r->dims.rows;
+        memmove(r->cells,r->cells + r->dims.cols,(n - r->dims.cols) * sizeof *r->cells);
+        for (size_t k = n - r->dims.cols; k < n; k++) fill_cell(r,k);
+    } else if (full) for (int k = 0; k < 64; k++) fill_cell(r, rnd(r) % ((size_t)r->dims.cols * r->dims.rows));
     if (render_frame_begin(&r->g, id) != RENDER_OK) goto error;
     size_t count = 0;
     if (full) { if (render_mark_full(&r->g) != RENDER_OK) goto error; }
@@ -180,7 +187,9 @@ static uint64_t one_frame(rig *r, bool full, uint32_t row, uint64_t *t6_out)
         if (render_mark_rows(&r->g, row, 1) != RENDER_OK) goto error;
     }
     if (render_dirty_strips(&r->g, r->strips, (size_t)r->dims.rows / 2 + 1, &count) != RENDER_OK) goto error;
+    uint64_t submit_start = bench_now_ns();
     if (render_backend_submit(&r->b, &r->g, r->strips, count) != RENDER_OK) goto error;
+    uint64_t submit_end = bench_now_ns();
     r->submit_allocs = edit_malloc_guard_end();
     if (edit_malloc_guard_active() && r->submit_allocs) goto error;
     edit_malloc_guard_begin();
@@ -195,10 +204,57 @@ static uint64_t one_frame(rig *r, bool full, uint32_t row, uint64_t *t6_out)
     r->present_allocs = edit_malloc_guard_end();
     if (r->event_error != RENDER_OK || r->t5_id != id || r->t6_id != id || r->t5 <= t0) goto error;
     if (t6_out) *t6_out = r->t6;
+    if (pace) {
+        pace->complete_ns = r->t6;
+        pace->stage[0] = submit_start - t0;
+        pace->stage[1] = submit_end - submit_start;
+        pace->stage[2] = r->t5 - t0;
+    }
     return r->t5 - t0;
 error:
     (void)edit_malloc_guard_end();
     return 0;
+}
+static uint64_t one_frame(rig *r, bool full, uint32_t row, uint64_t *t6_out)
+{ return one_frame_impl(r,full,row,t6_out,false,NULL); }
+
+static int raster_pace_frame(void *user, bool scrolling, render_pace_frame *out)
+{
+    rig *r = user;
+    if (!one_frame_impl(r,true,0,NULL,scrolling,out)) return -1;
+    raster_metrics m; uint64_t ust;
+    if (!raster_frame_metrics(&r->b,&m) || m.frame_id != r->t6_id ||
+        !raster_last_present(&r->b,&ust,&out->msc)) return -1;
+    out->msc_available = true;
+    out->drops_available = true;
+    out->dropped = m.present_kind != 0 || m.present_mode == 2;
+    for (size_t j = 0; j < RASTER_JOBS; j++) {
+        out->stage[3 + j] = m.strip_ns[j];
+        out->stage[7 + j] = m.queue_ns[j];
+        out->stage[15 + j] = m.upload_issue_ns[j];
+    }
+    if (m.ready_ns < m.submit_ns || m.server_ns < m.present_ns ||
+        m.upload_queued_ns < m.submit_ns) return -1;
+    out->stage[11] = m.ready_ns - m.submit_ns;
+    out->stage[12] = m.present_ns > m.ready_ns ? m.present_ns - m.ready_ns : 0;
+    out->stage[13] = m.issue_ns;
+    out->stage[14] = m.server_ns - m.present_ns;
+    out->stage[19] = m.upload_queued_ns - m.submit_ns;
+    if (r->t6 < r->t5) return -1;
+    out->stage[20] = r->t6 - r->t5;
+    return 0;
+}
+static void raster_scroll_track(rig *r, uint32_t px)
+{
+    char name[96]; snprintf(name,sizeof name,"%s_raster_scroll_600_%upx",r->target.name,px);
+    const char *reason = render_pace_skip_reason(getenv("DISPLAY"));
+    if (reason) { render_pace_skip(stdout,name,reason); return; }
+    const char *names[] = {"grid_mutation_damage", "submit", "ingress_to_T5",
+        "strip0", "strip1", "strip2", "strip3", "queue0", "queue1", "queue2", "queue3",
+        "submit_to_strips_ready", "ready_to_present", "present_issue", "server_tail_completion",
+        "upload_issue0", "upload_issue1", "upload_issue2", "upload_issue3", "submit_to_uploads_queued",
+        "T5_to_completion"};
+    render_pace_run(stdout,name,names,sizeof names / sizeof names[0],raster_pace_frame,r);
 }
 
 static int run_size(rig *r, uint32_t px, bool quick, int *fail)
@@ -533,12 +589,14 @@ static int bulk_self_check(void)
 int main(int argc, char **argv)
 {
     (void)setvbuf(stdout,NULL,_IOLBF,0);
+    if (argc == 2 && !strcmp(argv[1],"--pace-self-check")) return render_pace_self_check();
     if (argc == 2 && !strcmp(argv[1],"--self-check")) return self_check();
-    bool quick = false, kernel_only = false, track = false;
+    bool quick = false, kernel_only = false, track = false, scroll_only = false;
     int idle_n = 5, target_pick = -1; uint32_t kernel_samples = 200;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i],"--quick")) { quick = true; idle_n = 1; }
         else if (!strcmp(argv[i],"--track")) track = true;
+        else if (!strcmp(argv[i],"--scroll-track")) { scroll_only = true; track = true; }
         else if (!strcmp(argv[i],"--kernel-only")) kernel_only = true;
         else if (!strcmp(argv[i],"--target") && i + 1 < argc) {
             const char *arg = argv[++i];
@@ -553,15 +611,32 @@ int main(int argc, char **argv)
             if (idle) idle_n = (int)value; else kernel_samples = (uint32_t)value;
         } else return 1;
     }
+    const char *pace_skip = render_pace_skip_reason(getenv("DISPLAY"));
+    if ((scroll_only || !kernel_only) && pace_skip) {
+        for (int ti = 0; ti < 2; ti++) {
+            if (target_pick >= 0 && ti != target_pick) continue;
+            for (unsigned si = 0; si < 2; si++) {
+                char name[96]; snprintf(name,sizeof name,"%s_raster_scroll_600_%upx",
+                    target_for(ti == 1).name,si == 0 ? 15u : 30u);
+                render_pace_skip(stdout,name,pace_skip);
+            }
+        }
+        if (scroll_only) return 0;
+    }
     if (!getenv("DISPLAY") || !*getenv("DISPLAY")) {
         puts("SKIP G3/G3z/G3i: no DISPLAY; not measured"); return fixture_status(track);
     }
     trace_init(); (void)trace_thread_register();
-    rig *r = aligned_alloc(_Alignof(rig), sizeof *r); if (!r) return 1;
+    rig *r = aligned_alloc(_Alignof(rig), sizeof *r);
+    if (!r) {
+        if (scroll_only) render_pace_skip(stdout,"raster_scroll_600","rig_storage_unavailable");
+        return scroll_only ? 0 : 1;
+    }
     memset(r, 0, sizeof *r);
     r->track = track;
     plat_config pc = {"raster_bench",2880,1800,false,-1,0};
     if (plat_init(&r->pl,&pc) != PLAT_OK) {
+        if (scroll_only) render_pace_skip(stdout,"raster_scroll_600","X11_unavailable");
         puts("SKIP G3/G3z/G3i: cannot open display; not measured"); free(r); return fixture_status(track);
     }
     char status[32], load[32] = "unknown"; bench_battery_status(status,sizeof status);
@@ -574,7 +649,10 @@ int main(int argc, char **argv)
     puts("SKIP G3z: real-vblank fixture unverified (Xvfb :99 has no real vblank); not measured");
     puts("SKIP acceptance contention: index/find/save integration absent; synthetic memory/queue cases are TRACK");
     if (target_pick != 0) puts("B resolution on this X11 host is a proxy, not the Windows B acceptance fixture");
-    if (work_pool_init(&r->pool,1,4) != 0) { plat_shutdown(&r->pl); free(r); return 1; }
+    if (work_pool_init(&r->pool,1,4) != 0) {
+        if (scroll_only) render_pace_skip(stdout,"raster_scroll_600","worker_pool_unavailable");
+        plat_shutdown(&r->pl); free(r); return scroll_only ? 0 : 1;
+    }
     plat_map(&r->pl); plat_callbacks cb = {.on_event = raster_bench_noop};
     (void)plat_run_for(&r->pl,&cb,500);
     int fail = 0;
@@ -590,7 +668,7 @@ int main(int argc, char **argv)
         /* Preserve the separate backend-init diagnostic. */
         uint64_t init_vals[5]; bench_samples init_samples;
         bench_samples_init(&init_samples,init_vals,5);
-        for (unsigned k = 0; k < 5; k++) {
+        for (unsigned k = 0; k < (scroll_only ? 0u : 5u); k++) {
             const font_ascii_atlas *a = font_ascii_atlas_for_px(15);
             if (!a) { fail = 1; break; }
             render_dims dims = {r->target.width / a->cell.cell_w,r->target.height / a->cell.cell_h,
@@ -608,14 +686,22 @@ int main(int argc, char **argv)
             if (init_rc != RENDER_OK) { fail = 1; break; }
             (void)bench_add(&init_samples,ns);
         }
-        if (!fail) {
+        if (!fail && !scroll_only) {
             char name[96]; snprintf(name,sizeof name,"%s_init_cost_TRACK",r->target.name);
             fail |= raster_report_fp(stdout,name,&init_samples,0,0);
         }
         for (unsigned si = 0; si < 2 && !fail; si++) {
             r->next_id = 1; r->rng = 12345;
-            if (setup_rig(r,sizes[si]) != 0) { teardown_rig(r); fail = 1; break; }
+            if (setup_rig(r,sizes[si]) != 0) {
+                if (scroll_only) render_pace_skip(stdout,"raster_scroll_600","backend_init_unavailable");
+                teardown_rig(r);
+                if (scroll_only) continue;
+                fail = 1; break;
+            }
             r->next_id = 1;
+            if (scroll_only) {
+                raster_scroll_track(r,sizes[si]); teardown_rig(r); continue;
+            }
             for (unsigned scenario = 0; scenario < bulk_case_count() && !fail; scenario++) {
                 if (kernel_only && scenario != 0) break;
                 r->bulk_name = cases[scenario];
@@ -642,6 +728,8 @@ int main(int argc, char **argv)
                     fail |= report_idle(stdout,name,&idle,r->target,track,seconds);
                 }
             }
+            /* Last use of this rig: a diagnostic error cannot affect an old gate. */
+            if (!kernel_only && !fail && !pace_skip) raster_scroll_track(r,sizes[si]);
             teardown_rig(r);
         }
     }
