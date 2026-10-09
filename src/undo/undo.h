@@ -1,36 +1,46 @@
-/* P1.5: UI-thread inverse log. The tree outlives the log; all mutations of
- * that tree must go through this log until undo_clear/undo_destroy.
- * Records (one contiguous add span each) cost exactly 64 bytes from a base
- * pool. init reserves max_records + 8 slots, the extra 512 B is fixed scratch
- * for capturing insert redo refs (plus mmap page rounding and the caller-owned
- * control block). No allocation by undo after init; piece calls use the tree
- * allocator as specified in piece.h. Cursor blobs are
- * copied byte-for-byte and never interpreted. Zero-length edits are no-ops.
+/* UI-thread inverse log over piece.h. Tree must outlive the log; mutations
+ * go through this log. Span records occupy 64 B. init reserves lazy virtual
+ * capacity for worst-case capture expansion; no undo allocation after init.
+ * Allocated records (including retired history) stay packed. Whole free tail
+ * pages are decommitted. committed_bytes counts all touched/retained pages;
+ * reserved_bytes is address space, not the physical G10f charge.
  *
- * Groups: adjacent inserts, backspaces, or forward deletes of the SAME kind,
- * with nondecreasing timestamps <= 300 ms apart, join a burst. Explicit groups
- * may contain arbitrary operations; nesting is rejected. Empty groups do not
- * clear redo. break_burst closes automatic grouping only.
- * Cap: 1..max_records span records, across undo AND redo. Drop whole oldest
- * groups, never part of a group. A single oversized group is discarded at its
- * end (or on crossing the cap for a burst). Trimming is deferred while an
- * explicit or partially replayed group is open; groups exceeding the
- * physical reserve reject further edits with NOMEM. If reducing the cap would
- * drop an undone prerequisite, discard all redo. No document bytes are freed.
+ * Adjacent same-kind edits with nondecreasing timestamps <= 300 ms apart join
+ * a burst. Explicit groups may mix operations; nesting is rejected. Boundary
+ * cursor blobs are copied unchanged. Empty/failed edits retain redo.
  *
- * Errors: edit failures leave content/history/redo unchanged. Batch replay is
- * atomic PER piece operation, not per group (piece.h has no transactions).
- * On error change reports the successful prefix, including records/groups,
- * merged dirty range and last completed group's cursor. A partial group locks
- * editing, cap changes, group begin and opposite replay (BUSY); retry the same
- * direction to finish, or clear history to accept the partial document. If
- * reference expansion exhausts the fixed pool, clear is the recovery path. Return
- * errors even when progress occurred; always inspect change before rendering.
- * Dirty [off,off+len) conservatively covers pre/post bytes in their respective
- * coordinate spaces; from a length-changing mutation to EOF is dirty. The
- * endpoint may exceed current EOF after deletions. Batch merges once, and
- * restores the cursor of the last fully completed group. has_state is false
- * until a complete group has replayed. At history end return OK with no change.
+ * Cap counts active undo+redo span records. Eviction always detaches complete
+ * groups. At most 16 boundaries are visited per trim; very large cap
+ * reductions can discard extra oldest history to keep detachment bounded.
+ * Each edit reclaims at most UNDO_RECLAIM_RECORDS retired records; call
+ * undo_maintain between input checks to amortise the remainder. Retired records
+ * remain owned memory and must be included in G10f until reclaimed. No piece
+ * add-buffer bytes are freed. Explicit/partial groups are protected. Edit
+ * admission uses max_records+8 slots; replay reserves expansion capacity for
+ * all of them, so first-undo capture cannot permanently exhaust scratch.
+ *
+ * Edit failures leave content and logical history unchanged. Replay is atomic
+ * per piece operation. Whole-group failure atomicity remains BLOCKED on the
+ * piece.h amendment proposal in docs/decisions/P1.5d.md. On NOMEM a partial
+ * group keeps its retry position and locks edits, cap changes and opposite
+ * replay. A borrowed pre-group snapshot is available throughout partial
+ * replay: render/save that view, never the intermediate tree. clear accepts
+ * the current tree and discards history/view; destroy releases the view.
+ *
+ * Slice budgets count piece mutations, not expanded span records; a capture
+ * may report up to eight records for one operation. deadline_ns is an absolute
+ * CLOCK_MONOTONIC deadline (UINT64_MAX disables it). Check the deadline before
+ * every operation; the frozen piece API cannot interrupt one costly mutation
+ * or snapshot acquisition. UNDO_MORE means work remains, including a normal
+ * yield inside a group. Retry the same direction with the remaining group
+ * count (subtract change.groups), after checking input. Boundary state is
+ * reported only on group completion. Legacy replay calls have no slice limit.
+ *
+ * change describes only this call's successful prefix, including on error or
+ * MORE: records/operations, completed groups and their last boundary state,
+ * conservative dirty [off,off+len). Length changes dirty through the larger
+ * pre/post EOF; the endpoint can exceed current EOF. Merge slices and submit
+ * one final frame for the requested batch. History end is OK/no change.
  */
 #ifndef EDIT_UNDO_H
 #define EDIT_UNDO_H
@@ -40,6 +50,8 @@
 #define UNDO_ERR_RANGE PIECE_ERR_RANGE
 #define UNDO_ERR_NOMEM PIECE_ERR_NOMEM
 #define UNDO_ERR_BUSY 3
+#define UNDO_MORE 4
+#define UNDO_RECLAIM_RECORDS 16u
 #define UNDO_BURST_NS UINT64_C(300000000)
 #define UNDO_STATE_BYTES 16
 typedef struct undo_state { uint8_t bytes[UNDO_STATE_BYTES]; } undo_state;
@@ -47,20 +59,24 @@ typedef enum undo_kind { UNDO_INSERT = 1, UNDO_BACKSPACE = 2,
                          UNDO_DELETE = 3 } undo_kind;
 typedef struct undo_change {
     uint64_t off, len;
-    size_t records, groups;
+    size_t records, groups, operations;
     int has_state;
     undo_state state;
 } undo_change;
 typedef struct undo_stats {
     size_t records, undo_groups, redo_groups, live_bytes, reserved_bytes;
-    /* live_bytes: pool live counter x stride; reserved_bytes: actual mmap. */
+    size_t retired_records, committed_bytes;
+    /* live_bytes includes retired slots; committed_bytes includes page slack. */
 } undo_stats;
 /* Caller-owned; fields private. No copies while initialized. */
 typedef struct undo_log {
     edit_pool pool;
     piece_tree *tree;
     uint32_t head, tail, cursor;
-    size_t count, cap, max_records;
+    size_t count, cap, max_records, applied_count;
+    size_t retired_count, page_bytes, committed_bytes;
+    uint32_t retired_head, retired_tail, replay_first;
+    piece_snapshot *replay_view;
     uint64_t last_time, last_off, last_len;
     undo_kind last_kind;
     int burst, open, partial;
@@ -82,5 +98,15 @@ int undo_delete(undo_log *u, uint64_t off, uint64_t len, undo_kind kind,
                 const undo_state *after);
 int undo_undo(undo_log *u, size_t groups, undo_change *change);
 int undo_redo(undo_log *u, size_t groups, undo_change *change);
+int undo_undo_slice(undo_log *u, size_t groups, size_t operation_budget,
+                    uint64_t deadline_ns, undo_change *change);
+int undo_redo_slice(undo_log *u, size_t groups, size_t operation_budget,
+                    uint64_t deadline_ns, undo_change *change);
+/* Borrowed until group completion/clear/destroy; NULL outside a multi-record
+ * group's replay. Retain it yourself if a worker needs a longer lifetime. */
+const piece_snapshot *undo_replay_snapshot(const undo_log *u);
+/* Reclaim <= record_budget slots, decommit wholly unused tail pages; returns
+ * slots reclaimed. Safe during replay; does not change content/logical history. */
+size_t undo_maintain(undo_log *u, size_t record_budget);
 undo_stats undo_get_stats(const undo_log *u);
 #endif

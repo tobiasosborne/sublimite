@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <time.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"undo_test:%d: FAIL %s\n",__LINE__,#x); exit(1); } } while (0)
 static undo_state state(uint8_t v) { undo_state s; memset(&s,v,sizeof s); return s; }
 static void same(piece_tree *t, const char *s) {
@@ -103,7 +105,7 @@ static void eight_span_capture(void) {
         CHECK(undo_group_end(&u,&s)==0);del(&u,off,17,UNDO_DELETE,20);
         CHECK(undo_undo(&u,2,&c)==0 && c.groups==2);same(t,text);
     }
-    CHECK(undo_undo(&u,1,&c)==0 && c.records==8 && c.groups==1 && c.state.bytes[0]==1);
+    CHECK(undo_undo_slice(&u,1,1,UINT64_MAX,&c)==0 && c.operations==1 && c.records==8 && c.groups==1 && c.state.bytes[0]==1);
     same(t,"");CHECK(undo_get_stats(&u).records==18);
     CHECK(undo_redo(&u,1,&c)==0 && c.records==8 && c.state.bytes[0]==2);same(t,text);
     CHECK(undo_set_cap(&u,7)==0 && undo_get_stats(&u).records==0);
@@ -131,13 +133,13 @@ static void edge_cases(void) {
     ins(&u,4,"e",2,0,0);CHECK(undo_undo(&u,1,&c)==0);same(t,"abcd");finish(&u);
 }
 
-typedef struct failing { piece_allocator backing; size_t calls, fail; } failing;
-static void *fall(void *ctx,size_t n) { failing *f=ctx; f->calls++; if(f->fail && f->calls==f->fail) return NULL; return f->backing.alloc(f->backing.ctx,n); }
+typedef struct failing { piece_allocator backing; size_t calls, fail; int persistent; } failing;
+static void *fall(void *ctx,size_t n) { failing *f=ctx; f->calls++; if(f->fail && (f->persistent?f->calls>=f->fail:f->calls==f->fail)) return NULL; return f->backing.alloc(f->backing.ctx,n); }
 static void ffree(void *ctx,void *p,size_t n) { failing *f=ctx; f->backing.free(f->backing.ctx,p,n); }
 static void failures(void) {
     size_t saw=0;
     for(size_t fail=1;fail<8;fail++) {
-        failing f={piece_default_allocator(),0,0}; piece_allocator a={&f,fall,ffree};
+        failing f={piece_default_allocator(),0,0,0}; piece_allocator a={&f,fall,ffree};
         piece_tree *t=piece_create(&a); CHECK(t); undo_log u; CHECK(undo_init(&u,t,128)==0);
         CHECK(piece_init_copy(t,(const uint8_t *)"orig",4)==0);
         undo_state s=state(0); f.calls=0; f.fail=fail;
@@ -146,7 +148,7 @@ static void failures(void) {
         f.fail=0; finish(&u);
     }
     CHECK(saw>0);
-    failing f={piece_default_allocator(),0,0}; piece_allocator a={&f,fall,ffree};
+    failing f={piece_default_allocator(),0,0,0}; piece_allocator a={&f,fall,ffree};
     piece_tree *t=piece_create(&a); undo_log u; CHECK(t && undo_init(&u,t,128)==0);
     ins(&u,0,"x",0,1,2); undo_change c; CHECK(undo_undo(&u,1,&c)==0);
     f.calls=0; f.fail=1; uint8_t big[70000]; memset(big,'z',sizeof big); undo_state s=state(0);
@@ -161,8 +163,8 @@ static void replay_failures(void) {
     CHECK(text && before && after);
     for(size_t i=0;i<BIG;i++) text[i]=(uint8_t)('a'+i%26);
     size_t failed=0,partial=0;
-    for(size_t mode=0;mode<2;mode++) for(size_t k=1;k<=4;k++) {
-        failing f={piece_default_allocator(),0,0};piece_allocator a={&f,fall,ffree};
+    for(size_t mode=0;mode<2;mode++) for(size_t k=1;k<=32;k++) {
+        failing f={piece_default_allocator(),0,0,0};piece_allocator a={&f,fall,ffree};
         piece_tree *t=piece_create(&a);CHECK(t);undo_log u;CHECK(undo_init(&u,t,64)==0);
         undo_state s=state(5);
         CHECK(undo_group_begin(&u,&s)==0);
@@ -188,9 +190,16 @@ static void replay_failures(void) {
                 CHECK(undo_set_cap(&u,32)==UNDO_ERR_BUSY);
                 undo_change rejected;CHECK(undo_redo(&u,1,&rejected)==UNDO_ERR_BUSY);
             }
-            f.fail=0;CHECK(undo_undo(&u,1,&c)==0 && c.groups==1);
+            size_t pn=(size_t)piece_len(t);CHECK(piece_read(t,0,after,pn)==0);
+            f.calls=0;f.fail=1;f.persistent=1;
+            for(size_t retry=0;retry<3;retry++) {
+                CHECK(undo_undo(&u,1,&c)==UNDO_ERR_NOMEM && c.records==0 && c.groups==0 && !c.has_state);
+                CHECK(piece_len(t)==pn && piece_read(t,0,before,pn)==0 && memcmp(before,after,pn)==0);
+                if(u.partial) CHECK(undo_replay_snapshot(&u) && piece_snapshot_len(undo_replay_snapshot(&u))==bn);
+            }
+            f.fail=0;f.persistent=0;CHECK(undo_undo(&u,1,&c)==0 && c.groups==1);
             same(t,"");CHECK(undo_redo(&u,1,&c)==0);
-            CHECK(piece_len(t)==bn && piece_read(t,0,after,bn)==0 && memcmp(before,after,bn)==0);
+            CHECK(piece_len(t)==bn && piece_read(t,0,after,bn)==0 && memcmp(text,after,BIG)==0 && (!mode || after[BIG]=='Z'));
         }
         f.fail=0;finish(&u);
     }
@@ -201,12 +210,12 @@ static void replay_failures(void) {
 
 static void pool_exhaustion(void) {
     undo_log u;piece_tree *t;start(&u,&t,1);undo_state s=state(0);
-    CHECK(undo_group_begin(&u,&s)==0);ins(&u,0,"a",0,0,0);ins(&u,1,"b",1,0,0);
+    CHECK(undo_group_begin(&u,&s)==0);for(size_t i=0;i<9;i++) ins(&u,i,"a",i,0,0);
     undo_stats before=undo_get_stats(&u);
-    CHECK(undo_insert(&u,2,(const uint8_t *)"c",1,2,&s,&s)==UNDO_ERR_NOMEM);
+    CHECK(undo_insert(&u,9,(const uint8_t *)"c",1,9,&s,&s)==UNDO_ERR_NOMEM);
     undo_stats after=undo_get_stats(&u);CHECK(after.records==before.records && after.live_bytes==before.live_bytes);
-    same(t,"ab");CHECK(undo_group_end(&u,&s)==0 && undo_get_stats(&u).records==0);
-    ins(&u,2,"c",3,0,0);undo_change c;CHECK(undo_undo(&u,1,&c)==0);same(t,"ab");finish(&u);
+    same(t,"aaaaaaaaa");CHECK(undo_group_end(&u,&s)==0 && undo_get_stats(&u).records==0);
+    ins(&u,9,"c",10,0,0);undo_change c;CHECK(undo_undo(&u,1,&c)==0);same(t,"aaaaaaaaa");finish(&u);
 }
 
 static void *arena_alloc(void *ctx,size_t n) { return edit_arena_alloc(ctx,n,16); }
@@ -224,4 +233,170 @@ static void no_malloc(void) {
     undo_change c; CHECK(undo_undo(&u,1,&c)==0 && c.groups==1); same(t,"");
     CHECK(undo_redo(&u,1,&c)==0 && piece_len(t)==10001); finish(&u); edit_arena_free(&arena);
 }
-int main(void) { grouping(); explicit_cap(); references(); fragmented_insert(); eight_span_capture(); edge_cases(); failures(); replay_failures(); pool_exhaustion(); no_malloc(); puts("undo_test: all passed"); return 0; }
+static void original_tests(void) { grouping(); explicit_cap(); references(); fragmented_insert(); eight_span_capture(); edge_cases(); failures(); replay_failures(); pool_exhaustion(); no_malloc(); puts("undo_test: all passed"); }
+
+/* P1.5d regressions, written before implementation. */
+static void review_2(void) {
+    undo_log u; piece_tree *t; undo_change c; start(&u,&t,12);
+    CHECK(piece_init_copy(t,(const uint8_t *)"0123456789",10)==0);
+    undo_state s=state(0); CHECK(undo_group_begin(&u,&s)==0);
+    ins(&u,10,"Z",0,0,0); ins(&u,5,"abcdefghij",1,0,0);
+    CHECK(undo_group_end(&u,&s)==0);
+    for(size_t i=0;i<9;i++) ins(&u,0,"Y",i+2,0,0);
+    del(&u,0,17,UNDO_DELETE,20);
+    CHECK(undo_undo(&u,10,&c)==0 && c.groups==10);
+    CHECK(undo_undo(&u,1,&c)==0 && c.groups==1); same(t,"0123456789");
+    finish(&u);
+    start(&u,&t,1); CHECK(undo_group_begin(&u,&s)==0);
+    for(size_t i=0;i<9;i++) ins(&u,i,"a",i,0,0);
+    CHECK(undo_insert(&u,9,(const uint8_t *)"b",1,9,&s,&s)==UNDO_ERR_NOMEM);
+    finish(&u); puts("review 2: expansion and one-slot admission passed");
+}
+static size_t resident(const edit_pool *p) {
+    size_t pages=p->map_bytes/4096; unsigned char *v=malloc(pages); CHECK(v);
+    CHECK(mincore(p->base,p->map_bytes,v)==0); size_t n=0;
+    for(size_t i=0;i<pages;i++) if(v[i]&1u) n+=4096;
+    free(v); return n;
+}
+static void review_3(void) {
+    undo_log u;piece_tree *t;start(&u,&t,100000);
+    for(size_t i=0;i<100000;i++) ins(&u,i,"a",i,0,0);
+    undo_clear(&u); CHECK(undo_set_cap(&u,1)==0);
+    size_t n=resident(&u.pool); printf("review 3: cleared resident pool=%zu allowance=4096\n",n);
+    CHECK(n<=4096 && undo_get_stats(&u).committed_bytes==0);
+    /* Reclaim an old half while relocating the live suffix, including both
+     * boundary records. Every remaining slot occupies the packed prefix. */
+    CHECK(undo_set_cap(&u,100000)==0);undo_break_burst(&u);
+    for(size_t i=0;i<50000;i++) ins(&u,100000+i,"b",i,1,2);
+    undo_break_burst(&u);
+    for(size_t i=0;i<50000;i++) ins(&u,150000+i,"c",i,3,4);
+    CHECK(undo_set_cap(&u,50000)==0);
+    while(undo_maintain(&u,16)) {}
+    undo_stats packed=undo_get_stats(&u);
+    CHECK(packed.records==50000 && packed.retired_records==0 && packed.live_bytes==50000*64);
+    CHECK(packed.committed_bytes-packed.live_bytes<u.page_bytes);
+    CHECK(resident(&u.pool)<=packed.committed_bytes);
+    undo_change c;CHECK(undo_undo(&u,1,&c)==0 && c.groups==1 && c.state.bytes[0]==3 && piece_len(t)==150000);
+    CHECK(undo_redo(&u,1,&c)==0 && c.groups==1 && c.state.bytes[0]==4 && piece_len(t)==200000);
+    undo_clear(&u);CHECK(resident(&u.pool)==0);finish(&u);
+}
+static void review_4(void) {
+    undo_log u;piece_tree *t;undo_change c;start(&u,&t,100000);
+    for(size_t i=0;i<100000;i++) ins(&u,i,"a",i,0,0);
+    CHECK(undo_undo(&u,1,&c)==0);size_t before=u.pool.live;
+    ins(&u,0,"b",100001,0,0);
+    size_t reclaimed=before+1-u.pool.live;
+    printf("review 4: redo records reclaimed by key=%zu bound=16\n",reclaimed);
+    CHECK(reclaimed<=16); CHECK(undo_get_stats(&u).redo_groups==0);
+    for(size_t i=1;i<1024;i++) {
+        before=u.pool.live;ins(&u,i,"b",100001+i,5,6);
+        CHECK(before+1-u.pool.live<=16);
+    }
+    while(undo_maintain(&u,16)) {}
+    CHECK(undo_get_stats(&u).records==1024 && undo_get_stats(&u).retired_records==0);
+    CHECK(undo_undo(&u,1,&c)==0 && c.groups==1 && c.state.bytes[0]==0);same(t,"");
+    CHECK(undo_redo(&u,1,&c)==0 && c.groups==1 && c.state.bytes[0]==6 && piece_len(t)==1024);finish(&u);
+    start(&u,&t,100000);
+    for(size_t i=0;i<100000;i++) ins(&u,i,"a",i,0,0);
+    before=u.pool.live;ins(&u,100000,"b",100001,0,0);
+    CHECK(before+1-u.pool.live<=16);CHECK(undo_get_stats(&u).records==0);finish(&u);
+}
+static void review_5(void) {
+    undo_log u;piece_tree *t;undo_change c;start(&u,&t,100000);
+    for(size_t i=0;i<100000;i++) ins(&u,i,"a",i,1,2);
+    int rc=undo_undo_slice(&u,1,1,UINT64_MAX,&c);
+    printf("review 5: first slice rc=%d records=%zu groups=%zu\n",rc,c.records,c.groups);
+    CHECK(rc==UNDO_MORE && c.records==1 && c.groups==0 && !c.has_state);
+    const piece_snapshot *view=undo_replay_snapshot(&u);CHECK(view && piece_snapshot_len(view)==100000);
+    uint8_t b[32];CHECK(piece_snapshot_read(view,0,b,sizeof b)==0);
+    for(size_t i=0;i<sizeof b;i++) CHECK(b[i]=='a');
+    CHECK(undo_redo_slice(&u,1,1,UINT64_MAX,&c)==UNDO_ERR_BUSY);
+    CHECK(undo_undo_slice(&u,1,32,0,&c)==UNDO_MORE && c.records==0 && c.operations==0 && c.groups==0);
+    CHECK(undo_replay_snapshot(&u)==view);
+    size_t records=1,groups=0;
+    do {rc=undo_undo_slice(&u,1,32,UINT64_MAX,&c);CHECK(c.records<=32);records+=c.records;groups+=c.groups;} while(rc==UNDO_MORE);
+    CHECK(rc==0 && records==100000 && groups==1 && c.state.bytes[0]==1);
+    CHECK(!undo_replay_snapshot(&u));same(t,"");finish(&u);
+}
+static void review_1(void) {
+    /* Compiled regression, intentionally skipped pending the exact
+     * "piece.h amendment proposal" in docs/decisions/P1.5d.md. Undo-owned
+     * reservations cannot make inverse piece mutations allocation-free. */
+    if(!getenv("UNDO_TEST_REQUIRE_ATOMIC_GROUP")) {
+        puts("review 1: SKIP group atomicity; docs/decisions/P1.5d.md piece.h amendment proposal");
+        return;
+    }
+    /* Review mode=1: NOMEM after removing Z must leave the entire group intact. */
+    enum { BIG=1024*1024 };uint8_t *text=malloc(BIG),*b=malloc(BIG+1);CHECK(text&&b);memset(text,'a',BIG);
+    size_t failed=0;
+    for(size_t k=1;k<=20;k++) {
+        failing f={piece_default_allocator(),0,0,0};piece_allocator a={&f,fall,ffree};piece_tree *t=piece_create(&a);CHECK(t);
+        undo_log u;CHECK(undo_init(&u,t,64)==0);undo_state st=state(5);undo_change c;
+        CHECK(undo_group_begin(&u,&st)==0);CHECK(undo_insert(&u,0,text,BIG,0,&st,&st)==0);ins(&u,BIG,"Z",1,0,0);CHECK(undo_group_end(&u,&st)==0);
+        CHECK(undo_group_begin(&u,&st)==0);for(size_t i=0;i<9;i++) ins(&u,2*i+1,"X",i,0,0);CHECK(undo_group_end(&u,&st)==0);del(&u,0,BIG+9,UNDO_DELETE,10);
+        CHECK(undo_undo(&u,2,&c)==0);f.calls=0;f.fail=k;int rc=undo_undo(&u,1,&c);
+        if(rc==UNDO_ERR_NOMEM) {
+            failed++;printf("review 1: allocation=%zu successful_prefix=%zu tree_len=%llu original=%d\n",k,c.records,(unsigned long long)piece_len(t),BIG+1);
+            CHECK(c.records==0 && c.groups==0 && !c.has_state && u.partial==0);
+            CHECK(piece_len(t)==BIG+1 && piece_read(t,0,b,BIG+1)==0 && memcmp(b,text,BIG)==0 && b[BIG]=='Z');
+        } else CHECK(rc==0 && c.groups==1 && piece_len(t)==0);
+        f.fail=0;finish(&u);
+    }
+    CHECK(failed>0);free(b);free(text);
+}
+static void review_8(void) {
+    /* Redo a large mixed group under every allocation failure and persistent retries. */
+    enum { BIG=1024*1024 };uint8_t *text=malloc(BIG);CHECK(text);memset(text,'a',BIG);size_t failures_seen=0;
+    for(size_t k=1;k<=40;k++) {
+        failing f={piece_default_allocator(),0,0,0};piece_allocator a={&f,fall,ffree};piece_tree *t=piece_create(&a);CHECK(t);undo_log u;CHECK(undo_init(&u,t,64)==0);
+        undo_state st=state(9);undo_change c;CHECK(undo_group_begin(&u,&st)==0);ins(&u,0,"Z",0,0,0);CHECK(undo_insert(&u,1,text,BIG,1,&st,&st)==0);CHECK(undo_group_end(&u,&st)==0);
+        CHECK(undo_undo(&u,1,&c)==0);f.calls=0;f.fail=k;int rc=undo_redo(&u,1,&c);
+        if(rc==UNDO_ERR_NOMEM) {
+            failures_seen++;if(c.records) {const piece_snapshot *view=undo_replay_snapshot(&u);CHECK(view && piece_snapshot_len(view)==0);}
+            CHECK(c.groups==0 && !c.has_state);
+            size_t pn=(size_t)piece_len(t);CHECK(pn<=1);uint8_t prior[1];CHECK(piece_read(t,0,prior,pn)==0);
+            f.calls=0;f.fail=1;f.persistent=1;
+            for(size_t retry=0;retry<3;retry++) {
+                CHECK(undo_redo(&u,1,&c)==UNDO_ERR_NOMEM && c.records==0 && c.groups==0 && !c.has_state && c.len==0);
+                uint8_t current[1];CHECK(piece_len(t)==pn && piece_read(t,0,current,pn)==0 && memcmp(prior,current,pn)==0);
+            }
+            f.fail=0;f.persistent=0;CHECK(undo_redo(&u,1,&c)==0 && c.groups==1 && c.state.bytes[0]==9);
+            CHECK(c.off==pn && c.len==BIG+1-pn);
+        }
+        f.fail=0;finish(&u);
+    }
+    CHECK(failures_seen>0);free(text);printf("review 8: redo failure positions=%zu passed\n",failures_seen);
+}
+static void batch_failure_reporting(void) {
+    enum { BIG=1024*1024 };uint8_t *text=malloc(BIG),*bytes=malloc(BIG+2);CHECK(text && bytes);memset(text,'a',BIG);
+    size_t after_group=0;
+    for(size_t k=1;k<=32;k++) {
+        failing f={piece_default_allocator(),0,0,0};piece_allocator pa={&f,fall,ffree};piece_tree *t=piece_create(&pa);CHECK(t);
+        undo_log u;CHECK(undo_init(&u,t,64)==0);undo_change c;undo_state bs=state(7),as=state(9);
+        ins(&u,0,"Q",0,2,3);CHECK(undo_group_begin(&u,&bs)==0);ins(&u,1,"Z",1,7,8);
+        CHECK(undo_insert(&u,2,text,BIG,2,&bs,&as)==0 && undo_group_end(&u,&as)==0);
+        CHECK(undo_undo(&u,2,&c)==0 && c.groups==2);same(t,"");
+        f.calls=0;f.fail=k;int rc=undo_redo(&u,2,&c);
+        if(rc==UNDO_ERR_NOMEM) {
+            CHECK(c.groups<=1 && c.has_state==(c.groups!=0));
+            size_t done=c.groups,pn=(size_t)piece_len(t);CHECK(pn<=2);
+            if(done) { after_group++;CHECK(c.state.bytes[0]==3 && c.off==0 && c.len==pn); }
+            if(u.partial) {
+                const piece_snapshot *view=undo_replay_snapshot(&u);uint8_t q;
+                CHECK(view && piece_snapshot_len(view)==1 && piece_snapshot_read(view,0,&q,1)==0 && q=='Q');
+            }
+            f.fail=0;CHECK(undo_redo(&u,2-done,&c)==0 && c.groups==2-done && c.state.bytes[0]==9);
+            CHECK(c.off==pn && c.len==BIG+2-pn);
+        } else CHECK(rc==0 && c.groups==2 && c.state.bytes[0]==9 && c.off==0 && c.len==BIG+2);
+        CHECK(piece_len(t)==BIG+2 && piece_read(t,0,bytes,BIG+2)==0 && bytes[0]=='Q' && bytes[1]=='Z' && memcmp(bytes+2,text,BIG)==0);
+        CHECK(!undo_replay_snapshot(&u));f.fail=0;finish(&u);
+    }
+    CHECK(after_group>0);free(bytes);free(text);puts("review 8: completed-group state and dirty range across batch failures passed");
+}
+int main(int argc,char **argv) {
+    if(argc==2) {
+        switch(atoi(argv[1])) {case 1:review_1();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
+        return 0;
+    }
+    review_1();original_tests();review_2();review_3();review_4();review_5();review_8();batch_failure_reporting();return 0;
+}
