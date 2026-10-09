@@ -35,7 +35,7 @@ Every bead carries a `mode:` label.
 ### 1.4 Review and test policy
 
 - Every module ships with: unit tests (`tests/<module>_test.c`), a fuzzer entry point where it parses or mutates (`fuzz/<module>_fuzz.c`, libFuzzer via clang), and a benchmark against its gate (`bench/<module>_bench.c`, prints p50/p99 and the gate, exits non-zero on miss).
-- `make check` = build with `-fsanitize=address,undefined` + run tests. `make bench` = release build + run benches. Both must pass before a bead closes.
+- `make check` = build with `-fsanitize=address,undefined` + run tests; must pass before a bead closes. `make bench` = release build + run benches; run once per module on a quiet [AC] box when it lands, re-run only by beads that touch the hot path or when a row was within 20 % of its gate (CLAUDE.md law 1 bench policy, 2026-10-09).
 - Codex deep review is mandatory at the end of each epic and for every `mode:best` module; the prompt is "relentlessly find all problems: memory safety, data races, gate regressions, spec deviations, missing tests; severity BLOCKER/MAJOR/MINOR; concrete fix for each". Output goes to `docs/reviews/<epic>-<n>.md`; each BLOCKER/MAJOR becomes a bead before the epic closes.
 - No `malloc` on the typing path (input → mutation → layout → submit). Enforced by a test that installs a counting allocator hook and types 10 000 keys.
 
@@ -44,7 +44,7 @@ Every bead carries a `mode:` label.
 - One epic per phase section below (P0 … P6). Beads are children of epics; `bd dep` records the arrows written in the "deps" column.
 - Labels: `mode:std|par|best`, `model:haiku|sonnet`, `review:sonnet|codex|none`, `gate:G1` etc. where a gate applies.
 - Bead description = the scope line plus the acceptance list below, verbatim. Workers do not read this plan; the bead must be self-contained.
-- The coordinator closes a bead only after reading the test and bench output pasted into the bead.
+- The coordinator closes a bead only after reading the test output pasted into the bead (and the bench output when the bead's module landed or its hot path changed).
 
 ## 2. Repository layout and build
 
