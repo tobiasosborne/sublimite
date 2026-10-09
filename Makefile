@@ -40,7 +40,7 @@ FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
 EDIT_BIN  := $(if $(MAINC),$(B)/edit)
 
-.PHONY: all lib check bench fuzz clean
+.PHONY: all lib check check-sh bench fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)
 lib: $(REL_LIB)
@@ -88,8 +88,14 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 
 # ---- phony drivers ----
 # Test binaries are built in sanitizer config under build/san/tests/.
-check: $(TEST_SAN)
+check: $(TEST_SAN) $(B)/tools/replay
 	@set -e; for t in $(TEST_SAN); do echo "== $$t"; $$t; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
+	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
+
+# Shell contract tests that need release benches (slow, ~1 min): run on demand.
+check-sh: $(B)/tools/replay $(B)/bench/piece_bench
+	sh tools/test_replay_cli.sh $(B)
+	sh tools/test_bench_variant.sh
 
 # Benches: release build, each must exit 0 (gate met).
 # Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;
