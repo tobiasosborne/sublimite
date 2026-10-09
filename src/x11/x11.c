@@ -331,16 +331,17 @@ found:
     xcb_create_window(c, p->depth, p->win, s->root, 0, 0, (uint16_t)cfg->width, (uint16_t)cfg->height, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, p->visual,
                       XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, vals);
-    const char *title = cfg->title ? cfg->title : "edit";
+    const char *title = cfg->title ? cfg->title : "sublimité";
     xcb_atom_t a_name = atom(c, "_NET_WM_NAME"), a_utf8 = atom(c, "UTF8_STRING"), a_pid = atom(c, "_NET_WM_PID");
     p->wm_protocols = atom(c, "WM_PROTOCOLS");
     p->wm_delete = atom(c, "WM_DELETE_WINDOW");
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, a_name, a_utf8, 8, (uint32_t)strlen(title), title);
-    xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, (uint32_t)strlen(title), title);
+    const char *legacy_title = strcmp(title, "sublimité") == 0 ? "sublimite" : title;
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, (uint32_t)strlen(legacy_title), legacy_title);
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, p->wm_protocols, XCB_ATOM_ATOM, 32, 1, &p->wm_delete);
     uint32_t pid = (uint32_t)getpid();
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, a_pid, XCB_ATOM_CARDINAL, 32, 1, &pid);
-    static const char cls[] = "edit\0edit";
+    static const char cls[] = "sublimite\0sublimite";
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, p->win, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, sizeof cls, cls);
     /* Present */
     const xcb_query_extension_reply_t *ext = xcb_get_extension_data(c, &xcb_present_id);

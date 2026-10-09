@@ -30,15 +30,15 @@ static ipc_result address(const char *runtime, struct sockaddr_un *a, socklen_t 
     if(runtime!=NULL) {
         struct stat st;
         if(runtime[0]!='/' || stat(runtime,&st)!=0 || !S_ISDIR(st.st_mode) || st.st_uid!=getuid() || (st.st_mode&077u)!=0) return IPC_INVALID;
-        n=snprintf(a->sun_path,sizeof a->sun_path,"%s/edit-%lu.sock",runtime,(unsigned long)getuid());
+        n=snprintf(a->sun_path,sizeof a->sun_path,"%s/sublimite-%lu.sock",runtime,(unsigned long)getuid());
         if(n<0 || (size_t)n>=sizeof a->sun_path) return IPC_LIMIT;
         *len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+(size_t)n+1u);
     } else {
         const char *ns=getenv("EDIT_IPC_NAMESPACE");
         if(ns!=NULL) {
             if(ns[0]=='\0') return IPC_INVALID;
-            n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"edit-%lu-%s",(unsigned long)getuid(),ns);
-        } else n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"edit-%lu",(unsigned long)getuid());
+            n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu-%s",(unsigned long)getuid(),ns);
+        } else n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu",(unsigned long)getuid());
         if(n<0 || (size_t)n>=sizeof a->sun_path-1) return IPC_LIMIT;
         *len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     }

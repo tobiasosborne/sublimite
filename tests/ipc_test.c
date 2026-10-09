@@ -41,19 +41,19 @@ static void parser(const char *dir)
         {"x:abc","/x:abc",1,1,IPC_OK}
     };
     for(size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
-        char *av[]={"edit",(char *)cases[i].arg}; ipc_args a={0};
+        char *av[]={"sublimite",(char *)cases[i].arg}; ipc_args a={0};
         CHECK(ipc_parse_args(2,av,&a)==cases[i].rc);
         if(cases[i].rc==IPC_OK) { char want[IPC_PATH_CAP]; CHECK(snprintf(want,sizeof want,"%s%s",dir,cases[i].suffix)>0);
             CHECK(a.request.count==1 && strcmp(a.request.paths[0].path,want)==0);
             CHECK(a.request.paths[0].line==cases[i].line && a.request.paths[0].col==cases[i].col); }
         ipc_args_fini(&a);
     }
-    char *av[]={"edit","--wait","--new-instance","-","--","--odd"}; ipc_args a={0};
+    char *av[]={"sublimite","--wait","--new-instance","-","--","--odd"}; ipc_args a={0};
     CHECK(ipc_parse_args(6,av,&a)==IPC_OK && a.request.wait && a.request.new_instance && a.request.has_stdin);
     CHECK(a.request.count==1); int p[2]; CHECK(pipe(p)==0); CHECK(write(p[1],"a\0b\nc",5)==5); close(p[1]);
     CHECK(ipc_args_read_stdin(&a,p[0])==IPC_OK && a.request.stdin_size==5); close(p[0]); ipc_args_fini(&a);
-    char *bad[]={"edit","--bad"}; CHECK(ipc_parse_args(2,bad,&a)==IPC_INVALID);
-    char *dup[]={"edit","-","-"}; CHECK(ipc_parse_args(3,dup,&a)==IPC_INVALID);
+    char *bad[]={"sublimite","--bad"}; CHECK(ipc_parse_args(2,bad,&a)==IPC_INVALID);
+    char *dup[]={"sublimite","-","-"}; CHECK(ipc_parse_args(3,dup,&a)==IPC_INVALID);
     CHECK(chdir(cwd)==0);
 }
 static void wire_tests(void)
@@ -85,7 +85,7 @@ static void roundtrip(const char *dir, bool wait, bool input)
 static int raw_connect(const char *dir)
 {
     struct sockaddr_un a={0}; a.sun_family=AF_UNIX;
-    CHECK(snprintf(a.sun_path,sizeof a.sun_path,"%s/edit-%lu.sock",dir,(unsigned long)getuid())>0);
+    CHECK(snprintf(a.sun_path,sizeof a.sun_path,"%s/sublimite-%lu.sock",dir,(unsigned long)getuid())>0);
     int fd=socket(AF_UNIX,SOCK_STREAM,0); CHECK(fd>=0);
     CHECK(connect(fd,(struct sockaddr *)&a,sizeof a)==0); return fd;
 }
@@ -136,7 +136,7 @@ static void wait_tokens(const char *dir)
 }
 static void endpoint_validation(const char *dir)
 {
-    char path[IPC_PATH_CAP]; CHECK(snprintf(path,sizeof path,"%s/edit-%lu.sock",dir,(unsigned long)getuid())>0);
+    char path[IPC_PATH_CAP]; CHECK(snprintf(path,sizeof path,"%s/sublimite-%lu.sock",dir,(unsigned long)getuid())>0);
     int fd=open(path,O_CREAT|O_WRONLY,0600); CHECK(fd>=0); close(fd);
     ipc_server s={0}; CHECK(ipc_server_init(&s,dir)==IPC_INVALID); struct stat st; CHECK(stat(path,&st)==0 && S_ISREG(st.st_mode)); CHECK(unlink(path)==0);
     CHECK(chmod(dir,0755)==0); CHECK(ipc_server_init(&s,dir)==IPC_INVALID); CHECK(chmod(dir,0700)==0);
@@ -144,7 +144,7 @@ static void endpoint_validation(const char *dir)
     const char *ns=getenv("EDIT_IPC_NAMESPACE"); CHECK(ns!=NULL && ns[0]!='\0');
     char saved[108], alternate[108], name[108];
     CHECK(snprintf(saved,sizeof saved,"%s",ns)>0);
-    int n=snprintf(name,sizeof name,"edit-%lu-%s",(unsigned long)getuid(),saved);
+    int n=snprintf(name,sizeof name,"sublimite-%lu-%s",(unsigned long)getuid(),saved);
     CHECK(n>0 && (size_t)n<sizeof name);
     struct sockaddr_un bound={0}; socklen_t len=sizeof bound;
     CHECK(getsockname(s.listener,(struct sockaddr *)&bound,&len)==0);
@@ -209,7 +209,7 @@ static void callback_results(const char *dir, bool reject)
 static void stale(const char *dir)
 {
     struct sockaddr_un a={0}; a.sun_family=AF_UNIX;
-    CHECK(snprintf(a.sun_path,sizeof a.sun_path,"%s/edit-%lu.sock",dir,(unsigned long)getuid())>0);
+    CHECK(snprintf(a.sun_path,sizeof a.sun_path,"%s/sublimite-%lu.sock",dir,(unsigned long)getuid())>0);
     int fd=socket(AF_UNIX,SOCK_STREAM,0); CHECK(fd>=0); CHECK(bind(fd,(struct sockaddr *)&a,sizeof a)==0); close(fd);
     ipc_server s={0}; CHECK(ipc_server_init(&s,dir)==IPC_OK); ipc_server_fini(&s);
 }
@@ -240,7 +240,7 @@ static int run_suite(void)
     parser(dir); wire_tests(); roundtrip(dir,false,false); roundtrip(dir,true,false); roundtrip(dir,false,true); stale(dir); race(dir); fragmented(dir); wait_tokens(dir); callback_results(dir,true); callback_results(dir,false); endpoint_validation(dir);
     char p[IPC_PATH_CAP]; const char *names[]={"a:1","link","real"};
     for(size_t i=0;i<3;i++) { CHECK(snprintf(p,sizeof p,"%s/%s",dir,names[i])>0); if(i==2) CHECK(rmdir(p)==0); else CHECK(unlink(p)==0); }
-    CHECK(snprintf(p,sizeof p,"%s/edit-%lu.lock",dir,(unsigned long)getuid())>0); CHECK(unlink(p)==0); CHECK(rmdir(dir)==0);
+    CHECK(snprintf(p,sizeof p,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0); CHECK(unlink(p)==0); CHECK(rmdir(dir)==0);
     puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints ok"); return 0;
 }
 

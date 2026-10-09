@@ -545,7 +545,7 @@ static int checkpoint_temp(const journal *j, char *name, size_t cap)
 {
     uint64_t nonce=clock_ns();
     for(unsigned i=0;i<64;i++) {
-        int n=snprintf(name,cap,".edit-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
+        int n=snprintf(name,cap,".sublimite-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
         if(n<0 || (size_t)n>=cap) return -1;
         int fd=openat(j->directory_fd,name,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
         if(fd>=0 || errno!=EEXIST) return fd;
@@ -703,7 +703,7 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
     journal_base retained=*previous;
     if(*previous->path) {
         size_t n=(size_t)(strrchr(previous->path,'/')-previous->path)+1;
-        const char name[]=".edit-base-XXXXXX";
+        const char name[]=".sublimite-base-XXXXXX";
         if(n>sizeof save->previous_path-sizeof name) return JOURNAL_INVALID;
         memcpy(save->previous_path,previous->path,n);
         memcpy(save->previous_path+n,name,sizeof name);

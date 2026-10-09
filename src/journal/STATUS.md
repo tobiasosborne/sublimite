@@ -106,3 +106,14 @@ existing /tmp/edit-corpus.
 The application still owns complete UI checkpoints/restoration, save-completion
 routing, recovery conflicts and retained-generation cleanup. Configured cadence
 and its defaults remain unchanged; the loss-window decision is edit-4w1.34.
+
+Runtime rename (edit-457.18):
+journal_default_dir resolves XDG_DATA_HOME/sublimite or
+HOME/.local/share/sublimite without creating directories; CLI startup uses it.
+Checkpoint/backup temporary names use sublimite. Verify runtime_test, cli_test
+and journal_test with DISPLAY=:99 EDIT_DISPLAY=:99; make check uses ASan/UBSan.
+Decision/evidence: ../../docs/decisions/rename-sublimite.md.
+Final rename verification: gcc make all passed; clang ASan/UBSan make check
+passed with leaks disabled; make fuzz built all fuzzers. Focused identity and
+isolated desktop-install contracts passed. Complete red/green and stamped
+fuzz results are in the decision document; no hot-path bench was rerun.

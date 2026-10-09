@@ -46,6 +46,6 @@ int main(void)
     printf("ipc_bench TRACK (M)%s load1=%s status=%s; gate_p99=10000000ns (G); includes callback, ACK, client exit/reap\n",bench__tag_from_power(power),load,power);
     int result=bench_report("ipc_handoff",&s,0,10000000);
     ipc_server_fini(&server);
-    char lock[IPC_PATH_CAP]; REQUIRE(snprintf(lock,sizeof lock,"%s/edit-%lu.lock",dir,(unsigned long)getuid())>0);
+    char lock[IPC_PATH_CAP]; REQUIRE(snprintf(lock,sizeof lock,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0);
     REQUIRE(unlink(lock)==0 && rmdir(dir)==0); return result;
 }

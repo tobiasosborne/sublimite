@@ -59,3 +59,23 @@ runs are recorded in the decision doc. Release `x11_input_test` and sanitizer
 regressions. `make all` and `make fuzz` exit 0. Final `make check`: 30 test binaries and
 the replay CLI passed (M)[AC], Not charging, one-minute load 3.08,
 `DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0`.
+
+Runtime rename (edit-457.18):
+Default title/_NET_WM_NAME sublimité (UTF8_STRING), ASCII WM_NAME sublimite,
+WM_CLASS sublimite/sublimite. Verify build/tests/x11_identity_test on :99;
+editor_test and cli_test verify the editor window identity.
+Decision/evidence: ../../docs/decisions/rename-sublimite.md.
+Final rename verification: gcc make all passed; clang ASan/UBSan make check
+passed with leaks disabled; make fuzz built all fuzzers. Focused identity and
+isolated desktop-install contracts passed. Complete red/green and stamped
+fuzz results are in the decision document; no hot-path bench was rerun.
+
+Amendment (edit-457.18): always lower case; UTF-8 title/_NET_WM_NAME
+`sublimité`, ASCII WM_NAME `sublimite`, both WM_CLASS parts `sublimite`.
+Focused X11 readback passed after the amended expectations failed first.
+No remaining identity work; font/wordmark work is deferred. Verify with
+DISPLAY=:99 EDIT_DISPLAY=:99 make all/check/fuzz and the identity tests above.
+Amendment evidence: ../../docs/decisions/rename-sublimite.md.
+Amendment final verification: gcc make all, clang ASan/UBSan make check
+(detect_leaks=0), make fuzz and the focused contracts passed; no new open
+problem. Stamped X11 fuzz smoke evidence is in the decision document.

@@ -38,7 +38,7 @@ TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
 BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
 FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
-EDIT_BIN  := $(if $(MAINC),$(B)/edit)
+EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
 .PHONY: all lib check check-sh bench fuzz clean
 .SECONDARY:
@@ -77,7 +77,7 @@ $(FUZZ_LIB): $(FUZZ_OBJ)
 	rm -f $@; $(AR) rcs $@ $^
 
 # ---- binaries ----
-$(B)/edit: $(B)/rel/src/main.o $(REL_LIB)
+$(B)/sublimite: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_LIB) $(LDLIBS) -o $@
 $(B)/tools/%: $(B)/rel/tools/%.o $(REL_LIB)
 	@mkdir -p $(@D)

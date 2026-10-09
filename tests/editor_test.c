@@ -200,6 +200,10 @@ static int native_input(void)
     render_backend b = {0}; T(render_cpu_backend(&b) == 0);
     editor_config cfg = {.cols = 32, .rows = 8}; editor *e = NULL;
     T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); plat *p = b.config.platform;
+    xcb_get_property_reply_t *title = xcb_get_property_reply(p->conn,
+        xcb_get_property(p->conn, 0, p->win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 64), NULL);
+    T(title != NULL && xcb_get_property_value_length(title) == 9);
+    T(memcmp(xcb_get_property_value(title), "sublimite", 9) == 0); free(title);
     T(native_key(e, p, "AC01", 0) == 0); T(expect(e, "a", 1) == 0);
     T(native_key(e, p, "RTRN", 0) == 0); T(expect(e, "a\n", 2) == 0);
     T(native_key(e, p, "BKSP", 0) == 0); T(expect(e, "a", 1) == 0);

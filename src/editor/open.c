@@ -98,7 +98,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = layout_init(&e->lay, &e->grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) goto fail;
     view_config vc = {4, rows, cols > 12 ? cols - 12 : 1, NULL, NULL}; view_init(&e->v, e->tree, &vc);
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
-        plat_config pc = {config->path ? config->path : "edit", cols * dims.cell_w, rows * dims.cell_h, false, work_pool_eventfd(&e->pool), 0};
+        plat_config pc = {"sublimité", cols * dims.cell_w, rows * dims.cell_h, false, work_pool_eventfd(&e->pool), 0};
         rc = plat_init(&e->platform, &pc); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
     }

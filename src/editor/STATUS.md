@@ -74,7 +74,7 @@ criterion remains open. No repeated G1 runs were made to seek a quiet box.
 Remaining: raster G11; hard slice preemption for giant view/undo commands (needs
 dependency API work); automatic post-edit index rebuilding; saved-file/journal
 transaction integration and recovery UI beyond M0. The CLI preserves a unique
-adjacent journal and reports its path; Ctrl+S is intentionally omitted while the
+XDG data-directory journal and reports its path; Ctrl+S is intentionally omitted while the
 save transaction dependency is in flight. Home/End are omitted after finding
 the view EOF/End bug recorded in the decision. No out-of-scope module was fixed.
 
@@ -144,3 +144,26 @@ dependency source was changed.
 Actual CLI smoke on `:99`: native `abc`, Backspace, Enter, `x`, WM close; exit 0,
 then a separate journal replay verifies `ab\nx` exactly. Its scratch file and
 journal were created only under `/tmp`.
+
+Runtime rename (edit-457.18): CLI/binary `sublimite`, file and untitled windows
+use sublimité. `editor_runtime_display` honours the explicit real-display
+opt-in; pure tests pass literals and all live runs use :99. `editor_config_dir`
+resolves the XDG config directory (the config parser remains unimplemented).
+Main creates journals in the XDG sublimité data directory and writes
+EDIT_TRACE_DUMP after editor_close joins workers. Verify with runtime_test,
+cli_test, editor_test and tools/test_runtime_identity.sh after make all, then
+make check with DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0.
+Design/evidence: ../../docs/decisions/rename-sublimite.md.
+Final rename verification: gcc make all passed; clang ASan/UBSan make check
+passed with leaks disabled; make fuzz built all fuzzers. Focused identity and
+isolated desktop-install contracts passed. Complete red/green and stamped
+fuzz results are in the decision document; no hot-path bench was rerun.
+
+Amendment (edit-457.18): file and untitled windows use lower-case `sublimité`;
+cli_test and editor_test pass the amended title assertions. main.c is unchanged:
+EDIT_ALLOW_REAL_DISPLAY selection and EDIT_TRACE_DUMP remain intact. No
+remaining identity work; the existing config-parser limitation remains.
+Amendment red/green and verification: ../../docs/decisions/rename-sublimite.md.
+Amendment final verification: gcc make all, clang ASan/UBSan make check
+(detect_leaks=0), make fuzz and the focused contracts passed; no new open
+problem. Stamped X11 fuzz smoke evidence is in the decision document.

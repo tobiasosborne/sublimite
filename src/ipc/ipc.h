@@ -51,7 +51,7 @@ typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
 /* Caller-owned, zero-init before init; runtime NULL uses XDG_RUNTIME_DIR,
  * or a Linux abstract socket if unset. IPC_EXISTS means another server won.
  * Test hook: when EDIT_IPC_NAMESPACE is set, the abstract name on both server
- * and client is edit-<uid>-<namespace> instead of the default edit-<uid>.
+ * and client is sublimite-<uid>-<namespace> instead of the default sublimite-<uid>.
  * Use a unique namespace per test process, inherited by its forked clients.
  * Empty namespaces return IPC_INVALID; names too long return IPC_LIMIT.
  * Filesystem endpoints ignore this hook. Set it before IPC calls, and keep

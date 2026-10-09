@@ -19,6 +19,10 @@ typedef enum journal_error {
     JOURNAL_OK = 0, JOURNAL_IO, JOURNAL_INVALID, JOURNAL_FULL,
     JOURNAL_BUSY, JOURNAL_BASE_CHANGED, JOURNAL_CALLBACK, JOURNAL_NOMEM
 } journal_error;
+/* Resolve the default journal directory without creating it. Absolute XDG_DATA_HOME
+ * wins; otherwise use HOME/.local/share. Caller owns output; setup only. */
+int journal_default_dir(char *out, size_t cap);
+
 typedef enum journal_type {
     JOURNAL_BASE = 1, JOURNAL_INSERT, JOURNAL_DELETE, JOURNAL_VIEW,
     JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE

@@ -74,3 +74,23 @@ exit 0 (M)[AC], Full, load1=6.32; DISPLAY/EDIT_DISPLAY=:99, detect_leaks=0.
 IPC decoder fuzz: 2,619,395 runs in 61 seconds, exit 0, no sanitizer
 findings (M)[AC], Full, load1=11.17; no persistent corpus generated.
 Benchmark not rerun: startup/test-only change, no typing-path change.
+
+Runtime rename (edit-457.18):
+Filesystem and abstract socket names now use sublimite-<uid>, including
+.lock paths and the existing EDIT_IPC_NAMESPACE suffix. Desktop entry and
+installer use sublimite/sublimité. Verify ipc_test on :99 and
+sh tools/test_runtime_identity.sh after make all. IPC/editor routing remains
+the existing separate integration work.
+Decision/evidence: ../../docs/decisions/rename-sublimite.md.
+Final rename verification: gcc make all passed; clang ASan/UBSan make check
+passed with leaks disabled; make fuzz built all fuzzers. Focused identity and
+isolated desktop-install contracts passed. Complete red/green and stamped
+fuzz results are in the decision document; no hot-path bench was rerun.
+
+Amendment (edit-457.18): desktop Name/StartupWMClass use lower-case
+`sublimité`/`sublimite`; the isolated installer contract passes. Socket and
+binary names already use `sublimite`; no IPC source changes were needed.
+Amendment evidence: ../../docs/decisions/rename-sublimite.md.
+Amendment final verification: gcc make all, clang ASan/UBSan make check
+(detect_leaks=0), make fuzz and the focused contracts passed; no new open
+problem. Stamped X11 fuzz smoke evidence is in the decision document.
