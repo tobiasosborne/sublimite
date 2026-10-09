@@ -21,8 +21,33 @@ static void setup(void) {
     g_ready = 1;
 }
 
+/* Queue interleavings model bounded ingress/delivery, including counter wrap.
+ * No XI2/clipboard parser changes belong to this bead. */
+static void fuzz_input_order(const uint8_t *data, size_t size) {
+    x11_input in;
+    memset(&in, 0, sizeof in);
+    in.qh = in.qt = UINT32_MAX - X11_QUEUE_CAP / 2;
+    uint32_t produced = 0, delivered = 0;
+    for (size_t i = 0; i < size; i++) {
+        plat_event ev;
+        if ((data[i] & 1u) || in.qt - in.qh == X11_QUEUE_CAP) {
+            if (x11_q_pop(&in, &ev) && ev.code != delivered++) __builtin_trap();
+        }
+        if (data[i] & 2u) {
+            memset(&ev, 0, sizeof ev);
+            ev.kind = (plat_ev_kind)(data[i] % (PLAT_EV_KEYMAP + 1));
+            ev.code = produced++;
+            if (!x11_q_push(&in, &ev)) __builtin_trap();
+        }
+    }
+    plat_event ev;
+    while (x11_q_pop(&in, &ev)) if (ev.code != delivered++) __builtin_trap();
+    if (produced != delivered || in.q_dropped) __builtin_trap();
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    fuzz_input_order(data, size);
     if (!g_ready) setup();
     plat_event e;
     uint64_t now = 1000000000ull;

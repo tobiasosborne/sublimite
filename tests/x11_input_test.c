@@ -52,6 +52,7 @@ static void run_table(x11_input *in, const row *t, size_t n, const char *layout)
         xcb_key_press_event_t r = kev(t[i].code, t[i].state, 1001);
         x11_input_key(in, &r, false, 5000000001ull, &e);
         CHECK(!e.press, "%s/%s: release", layout, t[i].name);
+        CHECK(e.utf8_len == 0, "§9 %s/%s: release has no insertion text", layout, t[i].name);
     }
 }
 
@@ -148,7 +149,7 @@ static void test_swallowed_release(struct xkb_context *ctx) {
     CHECK(x11_input_key(&in, &sh, false, 1000000003ull, &e) && !e.press, "shift release delivered");
     CHECK(x11_input_key(&in, &x, true, 1000000004ull, &e) && e.keysym == XKB_KEY_eacute,
           "sequence survives the modifier");
-    CHECK(x11_input_key(&in, &x, false, 1000000005ull, &e) && !e.press, "composed key release delivered");
+    CHECK(x11_input_key(&in, &x, false, 1000000005ull, &e) && !e.press && e.utf8_len == 0, "§9 composed key release has no insertion text");
     CHECK(!x11_input_key(&in, &d, true, 1000000006ull, &e), "dead key again");
     x11_input_key(&in, &d, false, 1000000007ull, &e);
     CHECK(!x11_input_key(&in, &a, true, 1000000008ull, &e), "cancelling key consumed");
@@ -263,6 +264,88 @@ static void test_repeat(struct xkb_context *ctx) {
     x11_input_destroy(&in);
 }
 
+static void test_repeat_modifiers(struct xkb_context *ctx) {
+    x11_input in;
+    struct xkb_keymap *km = mk(ctx, "us");
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "keymap"); return; }
+    plat_event e;
+    uint64_t now = UINT64_C(1000000000);
+    xcb_key_press_event_t a = kev(K_A, S_SHIFT, 100), sh = kev(K_LSHIFT, S_SHIFT, 101);
+    x11_input_key(&in, &a, true, now, &e);
+    uint64_t deadline = x11_repeat_deadline(&in);
+    x11_input_key(&in, &sh, false, now + 1, &e);
+    CHECK(x11_repeat_poll(&in, deadline, &e) && e.keysym == XKB_KEY_a && e.utf8_len == 1 &&
+          e.utf8[0] == 'a' && !(e.mods & PLAT_MOD_SHIFT), "§7 shift release updates repeat");
+    sh.state = 0;
+    deadline = x11_repeat_deadline(&in);
+    x11_input_key(&in, &sh, true, deadline - 1, &e);
+    CHECK(x11_repeat_deadline(&in) == deadline && x11_repeat_poll(&in, deadline, &e) &&
+          e.keysym == XKB_KEY_A && (e.mods & PLAT_MOD_SHIFT), "§7 shift press preserves repeat and updates modifiers");
+    x11_input_focus_reset(&in);
+    a.state = S_CTRL;
+    xcb_key_press_event_t ctrl = kev(K_LCTRL, S_CTRL, 102);
+    x11_input_key(&in, &a, true, now, &e);
+    deadline = x11_repeat_deadline(&in);
+    x11_input_key(&in, &ctrl, false, now + 1, &e);
+    CHECK(x11_repeat_poll(&in, deadline, &e) && e.utf8_len == 1 && !(e.mods & PLAT_MOD_CTRL),
+          "§7 ctrl release changes repeated shortcut to text");
+    x11_input_focus_reset(&in);
+    a.state = 0;
+    x11_input_key(&in, &a, true, now, &e);
+    xcb_key_press_event_t caps = kev(66, 0, 103);
+    deadline = x11_repeat_deadline(&in);
+    x11_input_key(&in, &caps, true, now + 1, &e);
+    CHECK(x11_repeat_poll(&in, deadline, &e) && e.keysym == XKB_KEY_A,
+          "§7 caps press preserves repeat and applies lock");
+    caps.state = S_CAPS;
+    x11_input_key(&in, &caps, false, deadline + 1, &e);
+    deadline = x11_repeat_deadline(&in);
+    x11_input_key(&in, &caps, true, deadline - 1, &e);
+    x11_input_key(&in, &caps, false, deadline - 1, &e);
+    CHECK(x11_repeat_poll(&in, deadline, &e) && e.keysym == XKB_KEY_a && !(e.mods & PLAT_MOD_CAPS),
+          "§7 second caps cycle clears repeated lock");
+    x11_input_destroy(&in);
+}
+
+static void test_repeat_rates(struct xkb_context *ctx) {
+    x11_input in;
+    struct xkb_keymap *km = mk(ctx, "us");
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "keymap"); return; }
+    const uint32_t rates[] = { 1, 1000, 1000000000u, 1000000001u, UINT32_MAX };
+    for (size_t i = 0; i < sizeof rates / sizeof rates[0]; i++) {
+        x11_input_focus_reset(&in);
+        in.rep_rate_hz = rates[i]; in.rep_delay_ms = 0;
+        xcb_key_press_event_t a = kev(K_A, 0, 100);
+        plat_event e;
+        x11_input_key(&in, &a, true, UINT64_C(1000000000), &e);
+        CHECK(x11_repeat_poll(&in, UINT64_C(1000000000), &e) &&
+              x11_repeat_deadline(&in) > UINT64_C(1000000000), "§10 rate %u advances deadline", rates[i]);
+    }
+    x11_input_destroy(&in);
+}
+
+static void test_extended_buttons(struct xkb_context *ctx) {
+    x11_input in;
+    struct xkb_keymap *km = mk(ctx, "us");
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "keymap"); return; }
+    plat_event e;
+    xcb_button_press_event_t b = { .detail = 8 };
+    x11_input_button(&in, &b, true, UINT64_C(1000000000), true, &e);
+    CHECK(e.buttons == (1u << 7), "§19 core button 8 held after press");
+    b.detail = 9;
+    x11_input_button(&in, &b, true, UINT64_C(1000000001), true, &e);
+    CHECK(x11_input_buttons(&in, (2u << 13) | S_SHIFT) == ((1u << 7) | (1u << 8)),
+          "§19 extended drag state stays separate from core group/modifiers");
+    CHECK(e.buttons == ((1u << 7) | (1u << 8)), "§19 core button 9 retains button 8");
+    b.detail = 8;
+    x11_input_button(&in, &b, false, UINT64_C(1000000002), true, &e);
+    CHECK(e.buttons == (1u << 8), "§19 release clears only button 8");
+    b.detail = 32;
+    x11_input_button(&in, &b, true, UINT64_C(1000000003), true, &e);
+    CHECK((e.buttons & (1u << 31)) != 0, "§19 supports held button 32");
+    x11_input_destroy(&in);
+}
+
 static void test_clock(void) {
     const uint64_t S = 1000000000ull, MS = 1000000ull;
     x11_clock c;
@@ -314,6 +397,31 @@ static void test_buttons_queue(struct xkb_context *ctx) {
     x11_input_destroy(&in);
 }
 
+/* A fresh US state must not lazily grow XKB action filters on first typing.
+ * Exercise distinct keys and held modifiers, not just a warmed repeated letter. */
+static void test_cold_no_malloc(struct xkb_context *ctx) {
+    struct xkb_keymap *km = mk(ctx, "us");
+    x11_input in;
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "cold keymap"); return; }
+    plat_event e;
+    const uint16_t states[] = { 0, S_SHIFT, S_CTRL, S_ALT, S_ALTGR,
+                                S_SHIFT | S_CTRL, S_CAPS | S_NUM };
+    edit_malloc_guard_begin();
+    for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+        for (uint32_t code = 8; code < 256; code++) {
+            xcb_key_press_event_t k = kev((uint8_t)code, states[i], 100);
+            x11_input_key(&in, &k, true, UINT64_C(1000000000), &e);
+        }
+        for (uint32_t code = 8; code < 256; code++) {
+            xcb_key_press_event_t k = kev((uint8_t)code, states[i], 100);
+            x11_input_key(&in, &k, false, UINT64_C(1000000001), &e);
+        }
+    }
+    size_t n = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) CHECK(n == 0, "§7 cold key transitions made %zu allocations", n);
+    x11_input_destroy(&in);
+}
+
 /* Law 2: translation, repeat, wheel and queueing must not malloc (counted only where the guard is real, i.e. not ASan). */
 static void test_no_malloc(struct xkb_context *ctx) {
     static const char compose[] = "<dead_acute> <e> : \"\xc3\xa9\" eacute\n";
@@ -355,8 +463,12 @@ int main(void) {
     test_focus(ctx);
     test_xi2_events(ctx);
     test_repeat(ctx);
+    test_repeat_modifiers(ctx);
+    test_repeat_rates(ctx);
+    test_extended_buttons(ctx);
     test_clock();
     test_buttons_queue(ctx);
+    test_cold_no_malloc(ctx);
     test_no_malloc(ctx);
     xkb_context_unref(ctx);
     if (g_fail) { puts("x11_input_test: FAILED"); return 1; }

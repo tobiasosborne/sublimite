@@ -4,6 +4,8 @@
 #include "xi2.h"
 #include "clip.h"
 #include <limits.h>
+#include "work/work.h"
+#include <sys/socket.h>
 #include "trace/trace.h"
 #include <locale.h>
 #include <xcb/xcbext.h>
@@ -54,7 +56,7 @@ static int setup_keyboard(plat *p) {
     if (!loc || !*loc) loc = "C";
     struct xkb_compose_table *ct = xkb_compose_table_new_from_locale(ctx, loc, XKB_COMPOSE_COMPILE_NO_FLAGS);
     x11_input *in = calloc(1, sizeof *in);
-    if (!in) { xkb_keymap_unref(km); xkb_context_unref(ctx); return PLAT_ERR_FAIL; }
+    if (!in) { if (ct) xkb_compose_table_unref(ct); xkb_keymap_unref(km); xkb_context_unref(ctx); return PLAT_ERR_FAIL; }
     if (x11_input_init(in, km, ct) != 0) { free(in); xkb_keymap_unref(km); xkb_context_unref(ctx); return PLAT_ERR_FAIL; }
     in->ctx = ctx;
     p->in = in;
@@ -63,12 +65,16 @@ static int setup_keyboard(plat *p) {
     xcb_xkb_per_client_flags_reply_t *f = xcb_xkb_per_client_flags_reply(c,
         xcb_xkb_per_client_flags(c, XCB_XKB_ID_USE_CORE_KBD, XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT,
                                  XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT, 0, 0, 0), NULL);
+    bool repeat_ok = f && (f->supported & XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT) &&
+                     (f->value & XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT);
     free(f);
-    uint16_t ev = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY | XCB_XKB_EVENT_TYPE_MAP_NOTIFY;
+    if (!repeat_ok) return PLAT_ERR_FAIL;
+    uint16_t ev = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY | XCB_XKB_EVENT_TYPE_MAP_NOTIFY |
+                  XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
     uint16_t parts = XCB_XKB_MAP_PART_KEY_TYPES | XCB_XKB_MAP_PART_KEY_SYMS | XCB_XKB_MAP_PART_MODIFIER_MAP |
                      XCB_XKB_MAP_PART_EXPLICIT_COMPONENTS | XCB_XKB_MAP_PART_KEY_ACTIONS |
                      XCB_XKB_MAP_PART_KEY_BEHAVIORS | XCB_XKB_MAP_PART_VIRTUAL_MODS | XCB_XKB_MAP_PART_VIRTUAL_MOD_MAP;
-    xcb_xkb_select_events(c, (xcb_xkb_device_spec_t)p->xkb_dev, ev, 0, ev, parts, parts, NULL);
+    xcb_xkb_select_events(c, XCB_XKB_ID_USE_CORE_KBD, ev, 0, ev, parts, parts, NULL);
     return PLAT_OK;
 }
 
@@ -125,20 +131,144 @@ static void setup_xi2(plat *p) {
     p->core_wheel = !xi2_has_scroll(x);
 }
 
-static void rescan_xi2(plat *p) {
-    xi2 *x = XI(p);
-    uint8_t b[8];
-    xcb_generic_error_t *err;
-    void *rep = NULL;
-    xi2_build_query_device(x->opcode, b, 0);
-    xi_send(C(p), b, 8, true, &err, &rep);
-    if (rep && !err) {
-        const uint8_t *r = rep;
-        uint32_t l; memcpy(&l, r + 4, 4);
-        xi2_parse_query_device(x, r, 32 + (size_t)l * 4);
+/* Runtime keymap I/O uses its own connection on the bulk worker. The UI
+ * connection only sends/polls device queries; no dispatch path waits for replies. */
+typedef struct keyboard_result {
+    struct xkb_context *ctx;
+    struct xkb_keymap *keymap;
+    struct xkb_state *state;
+    int32_t device;
+} keyboard_result;
+
+typedef struct x11_runtime {
+    work_pool pool;
+    xcb_connection_t *keyboard_conn;
+    keyboard_result result;
+    bool map_pending, map_dirty, xi_dirty;
+    unsigned xi_cookie;
+    plat *owner;
+} x11_runtime;
+
+static void keyboard_result_destroy(keyboard_result *r) {
+    if (r->state) xkb_state_unref(r->state);
+    if (r->keymap) xkb_keymap_unref(r->keymap);
+    if (r->ctx) xkb_context_unref(r->ctx);
+    memset(r, 0, sizeof *r);
+}
+
+static void rebuild_keyboard(work_ctx *job) {
+    x11_runtime *rt = job->arg;
+    keyboard_result r = {0};
+    if (!work_should_stop(job)) {
+        r.ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        r.device = xkb_x11_get_core_keyboard_device_id(rt->keyboard_conn);
+        if (r.ctx && r.device >= 0 && !work_should_stop(job))
+            r.keymap = xkb_x11_keymap_new_from_device(r.ctx, rt->keyboard_conn, r.device,
+                                                    XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (r.keymap && !work_should_stop(job)) r.state = x11_input_prepare_state(r.keymap);
     }
-    free(rep); free(err);
-    p->core_wheel = !xi2_has_scroll(x);
+    /* One worker/job at a time; publish provides the synchronization. Shutdown
+     * joins before reclaiming this result, even if cancellation drops the message. */
+    rt->result = r;
+    work_msg msg = { .kind = 1 };
+    (void)work_publish(job, &msg);
+}
+
+static int setup_runtime(plat *p) {
+    x11_runtime *rt = calloc(1, sizeof *rt);
+    if (!rt) return PLAT_ERR_FAIL;
+    rt->owner = p;
+    rt->keyboard_conn = xcb_connect(NULL, NULL);
+    if (!rt->keyboard_conn || xcb_connection_has_error(rt->keyboard_conn) ||
+        !xkb_x11_setup_xkb_extension(rt->keyboard_conn, 1, 0, XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS,
+                                    NULL, NULL, NULL, NULL) || work_pool_init(&rt->pool, 1, 0) != 0) {
+        if (rt->keyboard_conn) xcb_disconnect(rt->keyboard_conn);
+        free(rt);
+        return PLAT_ERR_FAIL;
+    }
+    IN(p)->runtime = rt;
+    return PLAT_OK;
+}
+
+static void request_keymap(plat *p) {
+    x11_runtime *rt = IN(p)->runtime;
+    if (rt) rt->map_dirty = true; /* coalesce mapping storms into one outstanding build */
+}
+
+static void rearm_repeat(plat *p);
+
+static void keyboard_ready(const work_msg *msg, void *ud) {
+    (void)msg;
+    x11_runtime *rt = ud;
+    plat *p = rt->owner;
+    keyboard_result *r = &rt->result;
+    rt->map_pending = false;
+    if (!rt->map_dirty && r->state) {
+        x11_input_adopt_keymap(IN(p), r->keymap, r->state);
+        if (IN(p)->ctx) xkb_context_unref(IN(p)->ctx);
+        IN(p)->ctx = r->ctx;
+        p->xkb_dev = r->device;
+        rearm_repeat(p);
+        memset(r, 0, sizeof *r);
+        plat_event ev = { .kind = PLAT_EV_KEYMAP };
+        (void)x11_q_push(IN(p), &ev);
+    }
+    keyboard_result_destroy(r);
+}
+
+static void request_xi2_rescan(plat *p) {
+    x11_runtime *rt = IN(p)->runtime;
+    if (rt) rt->xi_dirty = true;
+}
+
+static void poll_rescans(plat *p) {
+    x11_runtime *rt = IN(p)->runtime;
+    if (!rt) return;
+    /* Apply a replacement only after preceding queued input was delivered. */
+    if (IN(p)->qh == IN(p)->qt) (void)work_mailbox_drain(&rt->pool, keyboard_ready, rt);
+    if (rt->map_dirty && !rt->map_pending) {
+        work_job job = { rebuild_keyboard, rt, 0, WORK_BULK };
+        work_handle h = work_submit(&rt->pool, job);
+        if (h.epoch) { rt->map_pending = true; rt->map_dirty = false; }
+    }
+    if (!p->xi) return;
+    if (rt->xi_cookie) {
+        void *reply = NULL;
+        xcb_generic_error_t *err = NULL;
+        if (xcb_poll_for_reply(C(p), rt->xi_cookie, &reply, &err)) {
+            rt->xi_cookie = 0;
+            if (reply && !err && !rt->xi_dirty) {
+                uint32_t length; memcpy(&length, (const uint8_t *)reply + 4, 4);
+                (void)xi2_parse_query_device(XI(p), reply, 32 + (size_t)length * 4);
+                p->core_wheel = !xi2_has_scroll(XI(p));
+            }
+            free(reply); free(err);
+        }
+    }
+    if (rt->xi_dirty && !rt->xi_cookie) {
+        uint8_t b[8];
+        (void)xi2_build_query_device(XI(p)->opcode, b, 0);
+        struct iovec parts[4];
+        parts[2].iov_base = b; parts[2].iov_len = sizeof b;
+        xcb_protocol_request_t rq = { 1, NULL, b[0], 0 };
+        rt->xi_cookie = xcb_send_request(C(p), 0, parts + 2, &rq);
+        rt->xi_dirty = false;
+        xcb_flush(C(p));
+    }
+}
+
+static void shutdown_runtime(plat *p) {
+    x11_runtime *rt = IN(p)->runtime;
+    if (!rt) return;
+    if (rt->xi_cookie) xcb_discard_reply(C(p), rt->xi_cookie);
+    /* Wake a worker blocked in xkbcommon's synchronous reply wait before join.
+     * This is the dedicated worker connection; UI/XI/clipboard are unaffected. */
+    (void)shutdown(xcb_get_file_descriptor(rt->keyboard_conn), SHUT_RDWR);
+    work_pool_shutdown(&rt->pool);
+    keyboard_result_destroy(&rt->result);
+    xcb_disconnect(rt->keyboard_conn);
+    free(rt);
+    IN(p)->runtime = NULL;
 }
 
 bool x11_push_event(plat *p, const plat_event *ev) { return x11_q_push(IN(p), ev); }
@@ -153,8 +283,7 @@ static void rearm_repeat(plat *p) {
 
 void plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz) {
     if (!p->in) return;
-    IN(p)->rep_delay_ms = delay_ms; IN(p)->rep_rate_hz = rate_hz;
-    if (!rate_hz) x11_repeat_cancel(IN(p));
+    x11_repeat_configure(IN(p), delay_ms, rate_hz, trace_now_ns());
     rearm_repeat(p);
 }
 
@@ -163,6 +292,7 @@ bool plat_poll_event(plat *p, plat_event *out) { return p->in && x11_q_pop(IN(p)
 int plat_init(plat *p, const plat_config *cfg) {
     memset(p, 0, sizeof *p);
     p->timer_fd = p->work_fd = p->repeat_fd = -1;
+    if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
     if (cfg->headless) return PLAT_ERR_NO_DISPLAY;
     int scr_n = 0;
     xcb_connection_t *c = xcb_connect(NULL, &scr_n);
@@ -225,6 +355,7 @@ found:
     /* P2.2 input: keymap + XI2 + selections. Failure of the keyboard setup is fatal (no input is useless);
      * XI2 absence only degrades the wheel to core buttons. */
     if (setup_keyboard(p) != PLAT_OK) { plat_shutdown(p); return PLAT_ERR_FAIL; }
+    if (setup_runtime(p) != PLAT_OK) { plat_shutdown(p); return PLAT_ERR_FAIL; }
     setup_xi2(p);
     if (!p->xi) p->core_wheel = true;
     if (x11_clip_init(p) != PLAT_OK) { plat_shutdown(p); return PLAT_ERR_FAIL; }
@@ -263,13 +394,14 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
     case XCB_EXPOSE: {
         xcb_expose_event_t *x = (xcb_expose_event_t *)e;
         ev.kind = PLAT_EV_EXPOSE; ev.w = x->width; ev.h = x->height; ev.x = x->x; ev.y = x->y;
-        cb->on_event(cb->ud, &ev); break; }
+        if (cb->on_event) cb->on_event(cb->ud, &ev);
+        break; }
     case XCB_CONFIGURE_NOTIFY: {
         xcb_configure_notify_event_t *x = (xcb_configure_notify_event_t *)e;
         if (x->width != p->width || x->height != p->height) {
             p->width = x->width; p->height = x->height;
             ev.kind = PLAT_EV_RESIZE; ev.w = x->width; ev.h = x->height;
-            cb->on_event(cb->ud, &ev);
+            if (cb->on_event) cb->on_event(cb->ud, &ev);
         }
         break; }
     case XCB_FOCUS_IN: case XCB_FOCUS_OUT: {
@@ -280,11 +412,12 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         /* releases while unfocused are never seen: forget held keys and any repeat or compose in flight */
         x11_input_focus_reset(IN(p)); rearm_repeat(p);
         ev.kind = PLAT_EV_FOCUS; ev.focused = p->focused;
-        cb->on_event(cb->ud, &ev); break; }
+        if (cb->on_event) cb->on_event(cb->ud, &ev);
+        break; }
     case XCB_CLIENT_MESSAGE: {
         xcb_client_message_event_t *x = (xcb_client_message_event_t *)e;
         if (x->type == p->wm_protocols && x->data.data32[0] == p->wm_delete) {
-            ev.kind = PLAT_EV_CLOSE; cb->on_event(cb->ud, &ev);
+            ev.kind = PLAT_EV_CLOSE; if (cb->on_event) cb->on_event(cb->ud, &ev);
         }
         break; }
     case XCB_KEY_PRESS: case XCB_KEY_RELEASE: {
@@ -311,7 +444,7 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         if (p->xi) break;                         /* XI2 supplies motion */
         p->last_time = x->time;
         ev.kind = PLAT_EV_MOTION; ev.state = x->state; ev.x = x->event_x; ev.y = x->event_y; ev.time_ms = x->time;
-        ev.mods = x11_mods_from_state(IN(p), x->state); ev.buttons = (x->state >> 8) & 0x1fu;
+        ev.mods = x11_mods_from_state(IN(p), x->state); ev.buttons = x11_input_buttons(IN(p), x->state);
         ev.t0_ns = x11_clock_map(&IN(p)->clock, x->time, trace_now_ns());
         x11_q_push(IN(p), &ev); break; }
     case XCB_SELECTION_REQUEST: case XCB_SELECTION_CLEAR: case XCB_SELECTION_NOTIFY: case XCB_PROPERTY_NOTIFY:
@@ -324,7 +457,7 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
             size_t n = 32 + 4 + (size_t)g->length * 4;     /* xcb inserts a 4-byte full_sequence after byte 32 */
             if (xi2_decode(XI(p), (const uint8_t *)e, n, true, &r)) {
                 plat_event evs[2];
-                if (r.device_changed) rescan_xi2(p);
+                if (r.device_changed) request_xi2_rescan(p);
                 else if (r.time_ms) p->last_time = r.time_ms;
                 int ne = x11_xi2_events(IN(p), &r, trace_now_ns(), evs);
                 for (int i = 0; i < ne; i++) {
@@ -344,46 +477,57 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         if (p->xkb_event && t == p->xkb_event) {
             /* XKB event: first byte after response_type is xkbType: 0 NewKeyboardNotify, 1 MapNotify */
             uint8_t xt = ((const uint8_t *)e)[1];
+            if (xt == XCB_XKB_STATE_NOTIFY) {
+                const xcb_xkb_state_notify_event_t *s = (const xcb_xkb_state_notify_event_t *)e;
+                (void)x11_mods_from_state(IN(p), (uint32_t)s->mods | ((uint32_t)(s->group & 3u) << 13));
+            }
             if (xt == XCB_XKB_NEW_KEYBOARD_NOTIFY || xt == XCB_XKB_MAP_NOTIFY) {
-                struct xkb_keymap *km = load_keymap(p, IN(p)->ctx);
-                if (km && x11_input_set_keymap(IN(p), km) == 0) {
-                    rearm_repeat(p);
-                    ev.kind = PLAT_EV_KEYMAP; x11_q_push(IN(p), &ev);
-                } else if (km) xkb_keymap_unref(km);
+                request_keymap(p);
             }
         }
         break;
     }
 }
 
-static void drain(plat *p, const plat_callbacks *cb) {
-    for (;;) {
-        xcb_generic_event_t *e;
-        /* A reply wait in any callback/dispatch can consume the fd and queue
-         * events inside XCB. Check that queue first, then read the socket.
-         * Repeat after each direct dispatch callback and each queued callback. */
-        while ((e = xcb_poll_for_queued_event(C(p))) || (e = xcb_poll_for_event(C(p)))) {
-            dispatch(p, cb, e);
-            free(e);
-        }
-        bool progress = x11_clip_poll(p);
+/* One bounded slice. A true result means more buffered work may remain:
+ * poll with timeout zero so timers/work run before the next slice. */
+static bool drain(plat *p, const plat_callbacks *cb, uint64_t t_end) {
+    uint64_t slice_end = trace_now_ns() + UINT64_C(1000000);
+    if (t_end && t_end < slice_end) slice_end = t_end;
+    for (unsigned n = 0; n < 64 && !p->quit; n++) {
+        if (trace_now_ns() >= slice_end) return true;
         plat_event ev;
+        /* Deliver preceding input before dispatching another raw event. This
+         * reserves the entire ring for that event's (at most two) translations
+         * and prevents direct callbacks/state changes from overtaking it. */
         if (x11_q_pop(IN(p), &ev)) {
             if (cb->on_event) cb->on_event(cb->ud, &ev);
             continue;
         }
-        /* Reply polling can itself read events, even if no reply completed. */
+        xcb_generic_event_t *e = xcb_poll_for_queued_event(C(p));
+        if (!e) e = xcb_poll_for_event(C(p));
+        if (e) { dispatch(p, cb, e); free(e); continue; }
+        poll_rescans(p);
+        bool progress = x11_clip_poll(p);
+        /* Reply polling can both enqueue platform events and read X events.
+         * Deliver its queued input before any subsequent raw callback. */
+        if (IN(p)->qh != IN(p)->qt || progress) continue;
         e = xcb_poll_for_queued_event(C(p));
         if (e) { dispatch(p, cb, e); free(e); continue; }
-        if (!progress) break;
+        return false;
     }
+    return true;
 }
 
 int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
-    struct pollfd fds[4];
+    struct pollfd fds[5];
     uint64_t t_end = trace_now_ns() + (timeout_ms > 0 ? (uint64_t)timeout_ms * UINT64_C(1000000) : 0);
     while (!p->quit) {
-        drain(p, cb);                     /* reach quiescence before every sleeping poll */
+        /* Expiry/reply progress also runs under a continuously readable X fd.
+         * Clipboard internals retain their own transfer bounds. */
+        poll_rescans(p);
+        (void)x11_clip_poll(p);
+        bool buffered = drain(p, cb, timeout_ms > 0 ? t_end : 0);
         if (xcb_connection_has_error(C(p))) return PLAT_ERR_FAIL;
         if (p->quit) break;
         int to = -1;
@@ -399,36 +543,45 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
             int clip_to = ms > INT_MAX ? INT_MAX : (int)ms;
             if (to < 0 || clip_to < to) to = clip_to;
         }
+        if (buffered) to = 0;
         nfds_t n = 0;
         fds[n].fd = xcb_get_file_descriptor(C(p)); fds[n++].events = POLLIN;
         fds[n].fd = p->timer_fd; fds[n++].events = POLLIN;
         fds[n].fd = p->repeat_fd; fds[n++].events = POLLIN;
         int work_i = -1;
         if (p->work_fd >= 0) { work_i = (int)n; fds[n].fd = p->work_fd; fds[n++].events = POLLIN; }
+        x11_runtime *rt = IN(p)->runtime;
+        int keyboard_i = -1;
+        if (rt) {
+            keyboard_i = (int)n;
+            fds[n].fd = work_pool_eventfd(&rt->pool); fds[n++].events = POLLIN;
+        }
         int r = poll(fds, n, to);
         if (r < 0) continue;
         if (r == 0) continue;             /* clipboard deadline: drain expires it, keep running */
         p->iterations++;
+        if (keyboard_i >= 0 && (fds[keyboard_i].revents & POLLIN)) poll_rescans(p);
         if (fds[1].revents & POLLIN) {
             uint64_t x; if (read(p->timer_fd, &x, sizeof x) > 0 && cb->on_blink) cb->on_blink(cb->ud);
-            drain(p, cb);
+            if (p->quit) break;
         }
         if (work_i >= 0 && (fds[work_i].revents & POLLIN) && cb->on_work) {
             cb->on_work(cb->ud);
-            drain(p, cb);
+            if (p->quit) break;
         }
         if (fds[2].revents & POLLIN) {
             uint64_t x; ssize_t rr = read(p->repeat_fd, &x, sizeof x); (void)rr;
             plat_event rev;
             uint64_t now = trace_now_ns();
-            while (x11_repeat_poll(IN(p), now, &rev)) {
+            for (unsigned emitted = 0; emitted < 4 && !p->quit &&
+                 IN(p)->qt - IN(p)->qh < X11_QUEUE_CAP && x11_repeat_poll(IN(p), now, &rev); emitted++) {
                 trace_record_at(rev.t0_ns, TRACE_T0_INGRESS, 0);
                 x11_q_push(IN(p), &rev);
             }
             rearm_repeat(p);
         }
         if (fds[0].revents & (POLLERR | POLLHUP)) return PLAT_ERR_FAIL;
-        drain(p, cb);
+        /* Next turn checks XCB queues even if these callbacks consumed fd readiness. */
         if (xcb_connection_has_error(C(p))) return PLAT_ERR_FAIL;
     }
     return PLAT_OK;
@@ -437,6 +590,7 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
 int plat_run(plat *p, const plat_callbacks *cb) { return plat_run_for(p, cb, -1); }
 
 void plat_shutdown(plat *p) {
+    if (p->in) shutdown_runtime(p);
     x11_clip_save_on_exit(p);
     if (p->timer_fd >= 0) close(p->timer_fd);
     if (p->repeat_fd >= 0) close(p->repeat_fd);

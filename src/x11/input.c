@@ -33,7 +33,7 @@ int x11_input_init(x11_input *in, struct xkb_keymap *keymap, struct xkb_compose_
     in->rep_delay_ms = 400; in->rep_rate_hz = 30;
     in->ctab = ctab;
     if (ctab) in->cstate = xkb_compose_state_new(ctab, XKB_COMPOSE_STATE_NO_FLAGS);
-    if (x11_input_set_keymap(in, keymap) != 0) {      /* we were handed ctab: release it (keymap stays the caller's) */
+    if ((ctab && !in->cstate) || x11_input_set_keymap(in, keymap) != 0) {      /* we were handed ctab: release it (keymap stays the caller's) */
         if (in->cstate) xkb_compose_state_unref(in->cstate);
         if (in->ctab) xkb_compose_table_unref(in->ctab);
         in->cstate = NULL; in->ctab = NULL;
@@ -42,16 +42,34 @@ int x11_input_init(x11_input *in, struct xkb_keymap *keymap, struct xkb_compose_
     return 0;
 }
 
+struct xkb_state *x11_input_prepare_state(struct xkb_keymap *keymap) {
+    struct xkb_state *st = xkb_state_new(keymap);
+    if (!st) return NULL;
+    /* XKB lazily grows its action-filter array. Prime simultaneous core keys
+     * during setup/on the worker, then release them and discard the warm-up
+     * modifier/group state before this state reaches the input path. */
+    for (uint32_t k = 8; k < 256; k++) {
+        xkb_state_update_mask(st, 0, 0, 0, 0, 0, 0);
+        xkb_state_update_key(st, k, XKB_KEY_DOWN);
+    }
+    for (uint32_t k = 8; k < 256; k++) xkb_state_update_key(st, k, XKB_KEY_UP);
+    xkb_state_update_mask(st, 0, 0, 0, 0, 0, 0);
+    return st;
+}
+
 int x11_input_set_keymap(x11_input *in, struct xkb_keymap *keymap) {
-    struct xkb_state *st = keymap ? xkb_state_new(keymap) : NULL;
+    struct xkb_state *st = keymap ? x11_input_prepare_state(keymap) : NULL;
     if (!st) return -1;
+    x11_input_adopt_keymap(in, keymap, st);
+    return 0;
+}
+
+void x11_input_adopt_keymap(x11_input *in, struct xkb_keymap *keymap, struct xkb_state *state) {
     if (in->state) xkb_state_unref(in->state);
     if (in->keymap) xkb_keymap_unref(in->keymap);
-    in->keymap = keymap; in->state = st;
+    in->keymap = keymap; in->state = state;
     cache_mods(in);
-    x11_repeat_cancel(in);
-    if (in->cstate) xkb_compose_state_reset(in->cstate);
-    return 0;
+    x11_input_focus_reset(in);
 }
 
 void x11_input_destroy(x11_input *in) {
@@ -65,7 +83,11 @@ void x11_input_destroy(x11_input *in) {
 
 /* Make in->state's effective modifiers/group equal those in a core event state word. */
 static void sync_state(x11_input *in, uint32_t state) {
-    xkb_state_update_mask(in->state, state & 0xffu, 0, 0, 0, 0, (state >> 13) & 3u);
+    uint32_t lock_mask = 0;
+    for (unsigned i = 4; i <= 5; i++)
+        if (in->mod_idx[i] < 8) lock_mask |= 1u << in->mod_idx[i];
+    xkb_state_update_mask(in->state, state & 0xffu & ~lock_mask, 0, state & lock_mask,
+                          0, 0, (state >> 13) & 3u);
 }
 
 static uint16_t mods_now(const x11_input *in) {
@@ -79,6 +101,7 @@ static uint16_t mods_now(const x11_input *in) {
 
 uint16_t x11_mods_from_state(x11_input *in, uint32_t state) {
     sync_state(in, state);
+    in->rep_state = state & (0xffu | (3u << 13));
     return mods_now(in);
 }
 
@@ -117,19 +140,31 @@ static bool is_modifier_sym(uint32_t s) {
 bool x11_input_key(x11_input *in, const xcb_key_press_event_t *ev, bool press, uint64_t now_ns, plat_event *out) {
     uint32_t k = ev->detail;
     memset(out, 0, sizeof *out);
-    if (press && is_down(in, k)) return false;     /* server autorepeat (detectable mode): ours replaces it */
+    if (press && is_down(in, k)) {
+        (void)x11_mods_from_state(in, ev->state);
+        return false;
+    }     /* server autorepeat (detectable mode): ours replaces it */
     if (!press && ((in->swallowed[(k >> 3) & 31] >> (k & 7)) & 1)) {   /* its press never reached the consumer */
         in->swallowed[(k >> 3) & 31] &= (uint8_t)~(1u << (k & 7));
         set_down(in, k, false);
         return false;
     }
+    bool was_down = is_down(in, k);
     set_down(in, k, press);
     x11_translate(in, k, ev->state, out);
     out->press = press; out->time_ms = ev->time;
     out->x = ev->event_x; out->y = ev->event_y;
-    out->buttons = (ev->state >> 8) & 0x1fu;
+    out->buttons = x11_input_buttons(in, ev->state);
     out->t0_ns = x11_clock_map(&in->clock, ev->time, now_ns);
+    /* The core mask describes state before this transition. Apply the key to
+     * xkb after translating it, then keep the post-event state for repeat. */
+    if (!press && !was_down && is_modifier_sym(out->keysym))
+        xkb_state_update_key(in->state, k, XKB_KEY_DOWN); /* held before focus arrived */
+    xkb_state_update_key(in->state, k, press ? XKB_KEY_DOWN : XKB_KEY_UP);
+    in->rep_state = (uint32_t)xkb_state_serialize_mods(in->state, XKB_STATE_MODS_EFFECTIVE) |
+                   ((uint32_t)xkb_state_serialize_layout(in->state, XKB_STATE_LAYOUT_EFFECTIVE) << 13);
     if (!press) {
+        out->utf8_len = 0;
         if (in->rep_active && in->rep_key == k) x11_repeat_cancel(in);
         return true;
     }
@@ -160,9 +195,9 @@ bool x11_input_key(x11_input *in, const xcb_key_press_event_t *ev, bool press, u
     }
     /* Arm repeat (modifiers and keys the keymap says don't repeat never do). */
     if (in->rep_rate_hz && xkb_keymap_key_repeats(in->keymap, k)) {
-        in->rep_active = true; in->rep_key = k; in->rep_state = ev->state;
+        in->rep_active = true; in->rep_key = k;
         in->rep_next_ns = now_ns + (uint64_t)in->rep_delay_ms * NS_PER_MS;
-    } else {
+    } else if (!is_modifier_sym(out->keysym)) {
         x11_repeat_cancel(in);
     }
     return true;
@@ -174,7 +209,8 @@ void x11_repeat_cancel(x11_input *in) { in->rep_active = false; in->rep_next_ns 
 
 bool x11_repeat_poll(x11_input *in, uint64_t now_ns, plat_event *out) {
     if (!in->rep_active || !in->rep_rate_hz || now_ns < in->rep_next_ns) return false;
-    uint64_t iv = UINT64_C(1000000000) / in->rep_rate_hz;
+    uint32_t rate = in->rep_rate_hz > X11_REPEAT_MAX_HZ ? X11_REPEAT_MAX_HZ : in->rep_rate_hz;
+    uint64_t iv = UINT64_C(1000000000) / rate;
     memset(out, 0, sizeof *out);
     x11_translate(in, in->rep_key, in->rep_state, out);
     out->press = true; out->repeat = true;
@@ -184,12 +220,23 @@ bool x11_repeat_poll(x11_input *in, uint64_t now_ns, plat_event *out) {
     return true;
 }
 
+void x11_repeat_configure(x11_input *in, uint32_t delay_ms, uint32_t rate_hz, uint64_t now_ns) {
+    in->rep_delay_ms = delay_ms;
+    in->rep_rate_hz = rate_hz > X11_REPEAT_MAX_HZ ? X11_REPEAT_MAX_HZ : rate_hz;
+    if (!rate_hz) x11_repeat_cancel(in);
+    else if (in->rep_active) in->rep_next_ns = now_ns + (uint64_t)delay_ms * NS_PER_MS;
+}
+
+uint32_t x11_input_buttons(const x11_input *in, uint32_t state) {
+    return ((state >> 8) & 0x1fu) | in->held_buttons;
+}
+
 bool x11_input_button(x11_input *in, const xcb_button_press_event_t *ev, bool press, uint64_t now_ns,
                       bool core_wheel, plat_event *out) {
     memset(out, 0, sizeof *out);
     out->time_ms = ev->time; out->x = ev->event_x; out->y = ev->event_y;
     out->state = ev->state; out->mods = x11_mods_from_state(in, ev->state);
-    out->buttons = (ev->state >> 8) & 0x1fu;
+    out->buttons = x11_input_buttons(in, ev->state);
     out->t0_ns = x11_clock_map(&in->clock, ev->time, now_ns);
     uint32_t b = ev->detail;
     if (b >= 4 && b <= 7) {
@@ -202,9 +249,10 @@ bool x11_input_button(x11_input *in, const xcb_button_press_event_t *ev, bool pr
         return true;
     }
     out->kind = PLAT_EV_BUTTON; out->press = press; out->code = b;
-    if (b >= 1 && b <= 5) {                        /* core state is pre-event; reflect the transition */
+    if (b >= 1 && b <= 32) {                        /* core state is pre-event; reflect the transition */
         if (press) out->buttons |= 1u << (b - 1); else out->buttons &= ~(1u << (b - 1));
     }
+    if (b >= 8 && b <= 32) in->held_buttons = out->buttons & ~0x1fu;
     return true;
 }
 
@@ -229,8 +277,13 @@ bool x11_focus_relevant(uint8_t mode, uint8_t detail) {
 }
 
 void x11_input_focus_reset(x11_input *in) {
+    for (uint32_t k = 0; k < 256; k++)
+        if (is_down(in, k)) xkb_state_update_key(in->state, k, XKB_KEY_UP);
+    sync_state(in, 0);
+    in->rep_state = 0;
     memset(in->down, 0, sizeof in->down);
     memset(in->swallowed, 0, sizeof in->swallowed);
+    in->held_buttons = 0;
     x11_repeat_cancel(in);
     if (in->cstate) xkb_compose_state_reset(in->cstate);
 }
