@@ -103,6 +103,23 @@ int main(void)
     work_cancel(&pool, h);
     CHECK(work_mailbox_drain(&pool, collect, &c) == 0);
 
+    /* finished slot reused before drain: A's messages must still arrive */
+    atomic_store(&ran, 0);
+    work_handle ha = work_submit(&pool, (work_job){ job_pub, (void *)(uintptr_t)3, 1, WORK_BULK });
+    CHECK(ha.epoch != 0);
+    while (atomic_load(&ran) < 1 || atomic_load(&pool.slots[ha.slot].busy)) sleep_ms(1);
+    work_handle hb2 = work_submit(&pool, (work_job){ job_noop, NULL, 2, WORK_BULK });
+    CHECK(hb2.epoch != 0);
+    sleep_ms(20);
+    c.n = 0;
+    CHECK(work_mailbox_drain(&pool, collect, &c) == 3);
+    for (uint32_t i = 0; i < 3 && i < c.n; i++) CHECK(c.seen[i] == i);
+    sleep_ms(10);
+    /* slot is reusable again after the drain */
+    work_handle hc2 = work_submit(&pool, (work_job){ job_noop, NULL, 3, WORK_BULK });
+    CHECK(hc2.epoch != 0 && hc2.slot == ha.slot);
+    sleep_ms(20);
+
     /* shutdown with jobs queued and one running */
     atomic_store(&started, 0);
     (void)work_submit(&pool, (work_job){ job_block, NULL, 0, WORK_BULK });

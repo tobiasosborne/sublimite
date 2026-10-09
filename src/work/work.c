@@ -102,7 +102,8 @@ work_handle work_submit(work_pool *p, work_job job)
         return h;
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) {
         work_slot *s = &p->slots[i];
-        if (atomic_load_explicit(&s->busy, memory_order_acquire))
+        if (atomic_load_explicit(&s->busy, memory_order_acquire) ||
+            atomic_load_explicit(&s->pending, memory_order_acquire))
             continue;
         s->job = job;
         uint32_t ep = atomic_fetch_add_explicit(&s->epoch, 1u, memory_order_acq_rel) + 1u;
@@ -173,6 +174,7 @@ bool work_publish(work_ctx *c, const work_msg *m)
     *dst = *m;
     dst->slot_ = (uint32_t)(c->slot - p->slots);
     dst->epoch_ = c->epoch;
+    atomic_fetch_add_explicit(&c->slot->pending, 1u, memory_order_relaxed);
     atomic_store_explicit(&mb->tail, t + 1u, memory_order_release);
     uint64_t one = 1;
     ssize_t r = write(p->efd, &one, sizeof one);
@@ -194,12 +196,16 @@ size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), vo
             work_msg m = mb->msgs[h % WORK_MAILBOX_CAP];
             h++;
             atomic_store_explicit(&mb->head, h, memory_order_release);
-            if (atomic_load_explicit(&p->slots[m.slot_].epoch, memory_order_acquire) != m.epoch_) {
+            work_slot *s = &p->slots[m.slot_];
+            if (atomic_load_explicit(&s->epoch, memory_order_acquire) != m.epoch_) {
                 atomic_fetch_add_explicit(&p->dropped_stale, 1, memory_order_relaxed);
-                continue;
+            } else {
+                cb(&m, ud);
+                n++;
             }
-            cb(&m, ud);
-            n++;
+            /* Release the slot for reuse only now: until here its epoch could
+             * not have been bumped by a new submit (P1.8b). */
+            atomic_fetch_sub_explicit(&s->pending, 1u, memory_order_release);
         }
     }
     return n;

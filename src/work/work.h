@@ -60,6 +60,7 @@ typedef struct work_slot {
     _Atomic uint32_t epoch;      /* bumped by cancel; job stops when != ctx.epoch */
     _Atomic uint64_t cancel_ns;  /* CLOCK_MONOTONIC at cancel; written before epoch */
     _Atomic uint32_t busy;       /* 1 from submit until the worker is done with it */
+    _Atomic uint32_t pending;    /* published, not yet drained; slot is not reused while >0 */
 } work_slot;
 
 typedef struct work_mailbox {
