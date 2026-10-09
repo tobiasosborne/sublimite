@@ -167,3 +167,16 @@ Amendment red/green and verification: ../../docs/decisions/rename-sublimite.md.
 Amendment final verification: gcc make all, clang ASan/UBSan make check
 (detect_leaks=0), make fuzz and the focused contracts passed; no new open
 problem. Stamped X11 fuzz smoke evidence is in the decision document.
+
+P3.6 first-frame link-order experiment (edit-zzj.7): common startup benchmark,
+profile trace/linker order and three isolated candidates are complete under
+variants/P3.6. Production sources and Makefile are unchanged. One stamped,
+interleaved 200-launch-per-candidate warm Xvfb :99 series found lower median
+code RSS for ordered code but inconclusive paired latency. Recommendation:
+reject adoption now; no winner.patch. Cold-cache and real-display effects were
+not measured. Decision, Pareto tables, exact endpoint/page interpretation,
+red/green and verification commands: ../../docs/decisions/P3.6.md.
+Verify with tools/linkorder_bench.sh selftest and
+variants/P3.6/common/contract.sh. Full GCC release build, clang ASan/UBSan
+check (41 test binaries, leaks disabled), and fuzz build (21 fuzzers) passed. Remaining limitations are
+recorded in the decision.
