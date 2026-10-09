@@ -20,7 +20,12 @@
  *     binary search over the tables) and must equal utf8_grapheme_next;
  *   - (P1.1c) utf8_grapheme_prev from every cluster end returns that
  *     cluster's start, from every unit end inside one too; utf8_cluster
- *     returns the same length as grapheme_next and a width 0..2. */
+ *     returns the same length as grapheme_next and a width 0..2;
+ *   - (P1.1d) resumable step: for random budgets and a random chunking of the
+ *     input (each call sees an exact-size heap copy of what is available, eof
+ *     only on the last), the boundaries equal the one-shot utf8_grapheme_next
+ *     boundaries and no call exceeds budget + 3 bytes; utf8_grapheme_prev_step
+ *     with a random budget equals utf8_grapheme_prev at random offsets. */
 #include "utf8/utf8.h"
 #include "utf8/tables.h"
 #include <stdlib.h>
@@ -213,6 +218,53 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             i = j;
         }
         free(v);
+    }
+    {   /* resumable step == one-shot, random budget and chunking (seeded from the input) */
+        uint32_t seed = 2166136261u;
+        for (size_t i = 0; i < size && i < 64; i++) seed = (seed ^ data[i]) * 16777619u;
+        size_t lim = size < 4096 ? size : 4096;
+        for (int rep = 0; rep < 3; rep++) {
+            seed = seed * 1664525u + 1013904223u;
+            size_t budget = (seed >> 8) % 9;                       /* 0..8, 0 means 1 */
+            seed = seed * 1664525u + 1013904223u;
+            size_t chunk = 1 + (seed >> 8) % 11;                   /* bytes revealed per refill */
+            utf8_gseg g;
+            utf8_gseg_init(&g);
+            size_t pos = 0, avail = chunk < lim ? chunk : lim, guard = 0;
+            size_t want = utf8_grapheme_next(data, lim);           /* first cluster, one-shot, within lim */
+            size_t len = 0;
+            while (guard++ < 8 * lim + 16) {
+                uint8_t *v = exact_copy(data + pos, avail - pos);
+                REQUIRE(v);
+                size_t used = 0;
+                int eof = avail == lim;
+                int r = utf8_grapheme_step(&g, v, avail - pos, budget, eof, &used);
+                free(v);
+                REQUIRE(used <= avail - pos);
+                REQUIRE(used <= (budget ? budget : 1) + 3);
+                pos += used;
+                len += used;
+                if (r == UTF8_G_END) break;
+                if (r == UTF8_G_MORE) { REQUIRE(!eof); avail = avail + chunk < lim ? avail + chunk : lim; }
+                else REQUIRE(r == UTF8_G_BUDGET);
+            }
+            REQUIRE(guard <= 8 * lim + 16);
+            REQUIRE(len == want);
+        }
+        for (int rep = 0; rep < 4 && size; rep++) {
+            seed = seed * 1664525u + 1013904223u;
+            size_t poff = (seed >> 8) % (lim + 1);
+            seed = seed * 1664525u + 1013904223u;
+            size_t budget = (seed >> 8) % 7;
+            uint8_t *v = exact_copy(data, lim);                   /* view cut at lim: prev reads nothing past off */
+            REQUIRE(v);
+            utf8_gprev s;
+            utf8_gprev_init(&s);
+            size_t start = 0, guard = 0;
+            while (!utf8_grapheme_prev_step(&s, v, poff, budget, &start)) REQUIRE(guard++ < 16 * lim + 16);
+            REQUIRE(start == utf8_grapheme_prev(v, poff));
+            free(v);
+        }
     }
     for (size_t st = 0; st < size; st += st < 64 ? 1 : 61) {   /* bounded: inputs reach 4 KiB */
         size_t r = st;

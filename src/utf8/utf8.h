@@ -117,6 +117,65 @@ size_t utf8_grapheme_next(const uint8_t *p, size_t n);
  * a cluster start. Reads only base[0..off-1]. off == 0 returns 0. */
 size_t utf8_grapheme_prev(const uint8_t *base, size_t off);
 
+/* ---- Resumable, budgeted segmentation (P1.1d) ----
+ * utf8_grapheme_next is linear in the cluster length and a cluster is
+ * unbounded ('a' + 24,576 x U+0301 is one 49,153-byte cluster, ~0.7 ms (M)),
+ * so a UI-thread caller (layout, 0.5 ms slice) uses the step API: it consumes
+ * at most `budget` bytes (rounded up to the unit that crosses it), and the
+ * state in utf8_gseg carries everything the rules remember, so the next call
+ * continues the same cluster at p + *used. Segmentation of a chunked input is
+ * identical to the one-shot result for every chunking and budget (tests and
+ * fuzz check it), and a short n never manufactures a boundary: a truncated
+ * multi-byte tail is reported as UTF8_G_MORE, not decoded as invalid bytes.
+ *
+ * Usage: utf8_gseg g; utf8_gseg_init(&g); then, from the cluster start p:
+ *   loop { r = utf8_grapheme_step(&g, p + len, n - len, budget, eof, &used);
+ *          len += used; if (r == UTF8_G_END) break; if (r == UTF8_G_MORE) ...refill... }
+ * On UTF8_G_END the state is reset (ready for the next cluster) and len is the
+ * cluster length; the next cluster starts at p + len. */
+typedef struct {
+    uint8_t prev, pict, pict_zwj, ri_odd, incb;    /* UAX #29 left context (private) */
+    uint8_t started;                                /* the cluster has its first scalar */
+} utf8_gseg;
+
+enum {
+    UTF8_G_END = 0,     /* the cluster ended; *used bytes are in it (0 only for n == 0 at eof) */
+    UTF8_G_BUDGET = 1,  /* budget spent mid-cluster; call again at p + *used */
+    UTF8_G_MORE = 2     /* input exhausted (or a truncated multi-byte tail) with eof == 0:
+                           append bytes and call again at p + *used; the tail is NOT consumed */
+};
+
+/* Default budget: bytes per call. About 15 ns/byte on the slowest chain
+ * (combining marks), so 4096 bytes is ~60 us (M), 8x under the 0.5 ms slice. */
+#define UTF8_GRAPHEME_BUDGET 4096u
+
+static inline void utf8_gseg_init(utf8_gseg *g) { memset(g, 0, sizeof *g); }
+
+/* Continue the cluster in g over p[0..n). budget 0 is treated as 1 (every
+ * call with n > 0 makes progress). eof != 0: p+n is the end of the text, so a
+ * truncated tail is invalid bytes and n exhausted means END. An invalid byte
+ * is its own cluster (fresh g) or ends the current one without being consumed. */
+int utf8_grapheme_step(utf8_gseg *g, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used);
+
+/* Bounded backward variant of utf8_grapheme_prev. Why one is needed: the
+ * backward scan stops at the nearest certain break (invalid byte, CR, Control,
+ * LF), which in text made of marks/Prepend/ZWJ chains may be arbitrarily far
+ * back, and the forward replay costs the same. State carries both phases. */
+typedef struct {
+    size_t q;           /* scan position (phase 0) / replay position (phase 1) */
+    size_t start;       /* start of the cluster being replayed */
+    utf8_gseg seg;
+    uint8_t phase;
+} utf8_gprev;
+
+static inline void utf8_gprev_init(utf8_gprev *s) { memset(s, 0, sizeof *s); }
+
+/* Resumable utf8_grapheme_prev(base, off): spends at most about `budget` bytes
+ * per call (budget 0 = 1). Returns 1 when done (*start = the result, equal to
+ * utf8_grapheme_prev), 0 when out of budget (call again with the same base,
+ * off and s; base and off must not change). Reads only base[0..off-1]. */
+int utf8_grapheme_prev_step(utf8_gprev *s, const uint8_t *base, size_t off, size_t budget, size_t *start);
+
 /* Terminal cells of the first cluster of p[0..n), and its byte length
  * (== utf8_grapheme_next). Rule (layout uses this, not a sum of scalar widths):
  *   - invalid byte, CR, LF, Control (incl. tab): 1 (the renderer draws a

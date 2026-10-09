@@ -395,6 +395,8 @@ static void t_grapheme(void)
     CHECK(GS("a\xE2\x80\x8B") == 1);
 }
 
+static size_t seg_chunked(const uint8_t *src, size_t n, size_t split, size_t budget, size_t *ends);
+
 /* Full byte-boundary vectors from the unmodified Unicode 15.1 conformance file
  * (vendor/ucd/GraphemeBreakTest.txt, 1187 cases). Runs from the repo root. */
 static void t_grapheme_conformance(void)
@@ -403,7 +405,7 @@ static void t_grapheme_conformance(void)
     CHECK(f != NULL);
     if (!f) return;
     char line[4096];
-    size_t cases = 0, bad = 0, lineno = 0;
+    size_t cases = 0, bad = 0, lineno = 0, chunk_bad = 0;
     while (fgets(line, sizeof line, f)) {
         lineno++;
         char *comment = strchr(line, '#');
@@ -439,6 +441,19 @@ static void t_grapheme_conformance(void)
             off += step;
             got[off] = 1;
         }
+        {   /* resumable API, every split and several budgets: identical boundaries */
+            size_t *ends = malloc((n + 1) * sizeof *ends);
+            static const size_t budgets[] = { 0, 2, 4096 };
+            for (size_t k = 0; k < NELEM(budgets); k++)
+                for (size_t split = 0; split <= n; split++) {
+                    uint8_t gs[1025] = {0};
+                    size_t nc = seg_chunked(exact, n, split, budgets[k], ends);
+                    gs[0] = 1;
+                    for (size_t j = 0; j < nc; j++) gs[ends[j]] = 1;
+                    if (memcmp(want, gs, n + 1)) { chunk_bad++; break; }
+                }
+            free(ends);
+        }
         if (memcmp(want, got, n + 1)) {
             if (bad < 8) printf("GraphemeBreakTest boundary mismatch at line %zu\n", lineno);
             bad++;
@@ -449,8 +464,201 @@ static void t_grapheme_conformance(void)
     CHECK(!ferror(f));
     fclose(f);
     CHECK(cases == 1187);
-    CHECK(bad == 0);
-    printf("GraphemeBreakTest: %zu cases, %zu mismatches\n", cases, bad);
+    CHECK(bad == 0 && chunk_bad == 0);
+    printf("GraphemeBreakTest: %zu cases, %zu mismatches, %zu chunked mismatches\n", cases, bad, chunk_bad);
+}
+
+/* ------------------------------------------------- resumable step (P1.1d) */
+
+/* Segment src[0..n) with the step API. The first call sees only src[0..split)
+ * (eof = 0) and each later call sees everything (or, after MORE, the rest), so
+ * a split inside a multi-byte unit must come back as MORE, never as a boundary.
+ * Each call gets an exact-size heap copy of what is available (ASan sees overreads). */
+static size_t seg_chunked(const uint8_t *src, size_t n, size_t split, size_t budget, size_t *ends)
+{
+    utf8_gseg g;
+    utf8_gseg_init(&g);
+    size_t pos = 0, avail = split < n ? split : n, nc = 0, guard = 0;
+    while (pos < n && guard++ < 4 * n + 16) {
+        size_t m = avail - pos, used = 99;
+        uint8_t *v = malloc(m ? m : 1);
+        memcpy(v, src + pos, m);
+        int eof = avail == n;
+        int r = utf8_grapheme_step(&g, v, m, budget, eof, &used);
+        free(v);
+        CHECK(used <= m);
+        if (used > m) break;
+        pos += used;
+        if (r == UTF8_G_END) {
+            ends[nc++] = pos;
+        } else if (r == UTF8_G_MORE) {
+            CHECK(!eof);
+            avail = n;
+        } else {
+            CHECK(r == UTF8_G_BUDGET && used >= 1 && used <= (budget ? budget : 1) + 3);
+        }
+    }
+    CHECK(pos == n);
+    return nc;
+}
+
+static size_t seg_oneshot(const uint8_t *src, size_t n, size_t *ends)
+{
+    size_t nc = 0;
+    for (size_t off = 0; off < n;) {
+        off += utf8_grapheme_next(src + off, n - off);
+        ends[nc++] = off;
+    }
+    return nc;
+}
+
+/* Every split position x several budgets must give the one-shot boundaries. */
+static int chunked_equals(const uint8_t *src, size_t n)
+{
+    size_t *a = malloc((n + 1) * sizeof *a), *b = malloc((n + 1) * sizeof *b);
+    size_t na = seg_oneshot(src, n, a);
+    static const size_t budgets[] = { 0, 1, 2, 3, 5, 4096 };
+    int ok = 1;
+    for (size_t k = 0; k < NELEM(budgets) && ok; k++)
+        for (size_t split = 0; split <= n && ok; split++) {
+            size_t nb = seg_chunked(src, n, split, budgets[k], b);
+            ok = nb == na && !memcmp(a, b, na * sizeof *a);
+        }
+    free(a);
+    free(b);
+    return ok;
+}
+
+static uint8_t *chain(const char *head, const char *unit, size_t reps, size_t *n)
+{
+    size_t hl = strlen(head), ul = strlen(unit);
+    uint8_t *b = malloc(hl + ul * reps + 8);
+    memcpy(b, head, hl);
+    for (size_t i = 0; i < reps; i++) memcpy(b + hl + i * ul, unit, ul);
+    *n = hl + ul * reps;
+    return b;
+}
+
+/* Drive step with the default budget: returns calls, total in *len. */
+static size_t drive_budget(const uint8_t *b, size_t n, size_t budget, size_t *len, size_t *first_used, int *first_r)
+{
+    utf8_gseg g;
+    utf8_gseg_init(&g);
+    size_t pos = 0, calls = 0;
+    int r;
+    do {
+        size_t used = 0;
+        r = utf8_grapheme_step(&g, b + pos, n - pos, budget, 1, &used);
+        if (!calls) { *first_used = used; *first_r = r; }
+        pos += used;
+        calls++;
+    } while (r == UTF8_G_BUDGET && calls < n + 2);
+    CHECK(r == UTF8_G_END);
+    *len = pos;
+    return calls;
+}
+
+static void t_step(void)
+{
+    size_t used = 7, n;
+    utf8_gseg g;
+    utf8_gseg_init(&g);
+    CHECK(utf8_grapheme_step(&g, (const uint8_t *)"", 0, 10, 1, &used) == UTF8_G_END && used == 0);
+    utf8_gseg_init(&g);
+    CHECK(utf8_grapheme_step(&g, (const uint8_t *)"", 0, 10, 0, &used) == UTF8_G_MORE && used == 0);
+    /* a truncated tail is never a boundary: 'a' + first byte of U+0301 */
+    {
+        const uint8_t *t = place((const uint8_t *)"a\xCC", 2);
+        utf8_gseg_init(&g);
+        CHECK(utf8_grapheme_step(&g, t, 2, 100, 0, &used) == UTF8_G_MORE && used == 1);
+        const uint8_t *u = place((const uint8_t *)"\xCC\x81", 2);
+        CHECK(utf8_grapheme_step(&g, u, 2, 100, 1, &used) == UTF8_G_END && used == 2);
+        utf8_gseg_init(&g);                           /* at eof the same tail is an invalid byte: break before it */
+        CHECK(utf8_grapheme_step(&g, place((const uint8_t *)"a\xCC", 2), 2, 100, 1, &used) == UTF8_G_END && used == 1);
+    }
+    {   /* fresh invalid byte: own cluster; E0 80 is invalid even without eof (not a prefix) */
+        const uint8_t *t = place((const uint8_t *)"\xE0\x80", 2);
+        utf8_gseg_init(&g);
+        CHECK(utf8_grapheme_step(&g, t, 2, 100, 0, &used) == UTF8_G_END && used == 1);
+        const uint8_t *e = place((const uint8_t *)"\xE2\x82", 2);
+        utf8_gseg_init(&g);
+        CHECK(utf8_grapheme_step(&g, e, 2, 100, 0, &used) == UTF8_G_MORE && used == 0);
+    }
+    /* budget stops a 49,153-byte cluster early, and the pieces add up */
+    {
+        uint8_t *b = chain("a", "\xCC\x81", 24576, &n);
+        CHECK(n == 49153 && utf8_grapheme_next(b, n) == n);
+        size_t len, fu; int fr;
+        size_t calls = drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr);
+        CHECK(fr == UTF8_G_BUDGET && fu >= UTF8_GRAPHEME_BUDGET && fu <= UTF8_GRAPHEME_BUDGET + 3);
+        CHECK(len == n && calls >= 12 && calls <= 13);
+        calls = drive_budget(b, n, 1, &len, &fu, &fr);
+        CHECK(len == n && fu == 1 && fr == UTF8_G_BUDGET);
+        free(b);
+    }
+    {   /* Prepend chain then a letter; ZWJ emoji chain; RI pairs; Hangul */
+        size_t len, fu; int fr;
+        uint8_t *b = chain("", "\xD8\x80", 20000, &n);
+        b[n++] = 'a';
+        CHECK(utf8_grapheme_next(b, n) == n);
+        CHECK(drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr) > 1 && len == n && fr == UTF8_G_BUDGET);
+        free(b);
+        b = chain("\xF0\x9F\x91\xA8", "\xE2\x80\x8D\xF0\x9F\x91\xA9", 6000, &n);
+        CHECK(utf8_grapheme_next(b, n) == n);
+        CHECK(drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr) > 1 && len == n && fr == UTF8_G_BUDGET);
+        free(b);
+    }
+    /* chunked == unchunked for hand-made tricky sequences */
+    {
+        static const char *cases[] = {
+            "a\xCC\x81" "b", "\r\n\r", "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7",
+            "\xF0\x9F\x87\xA6\xF0\x9F\x87\xA7\xF0\x9F\x87\xA8", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95",
+            "\xD8\x80\xD8\x80" "a" "\xE1\x84\x80\xE1\x85\xA1", "a\xE2\x82", "\x80\xCC\x81\xFF", "\xF0\x9F\x98",
+        };
+        for (size_t i = 0; i < NELEM(cases); i++)
+            CHECK(chunked_equals((const uint8_t *)cases[i], strlen(cases[i])));
+    }
+}
+
+/* Backward step: same result as utf8_grapheme_prev for every offset, any budget. */
+static int prev_step_equals(const uint8_t *b, size_t n, size_t budget)
+{
+    for (size_t off = 0; off <= n; off++) {
+        utf8_gprev s;
+        utf8_gprev_init(&s);
+        size_t start = 123, guard = 0;
+        while (!utf8_grapheme_prev_step(&s, b, off, budget, &start) && guard++ < 4 * n + 16) {}
+        if (start != utf8_grapheme_prev(b, off)) return 0;
+    }
+    return 1;
+}
+
+static void t_prev_step(void)
+{
+    static const char *cases[] = {
+        "a\xCC\x81" "b", "\r\n\r", "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9",
+        "\xF0\x9F\x87\xA6\xF0\x9F\x87\xA7\xF0\x9F\x87\xA8", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\x95",
+        "x\xD8\x80\xD8\x80" "a" "\xE1\x84\x80\xE1\x85\xA1\n\x80\xCC\x81",
+    };
+    for (size_t i = 0; i < NELEM(cases); i++) {
+        size_t n = strlen(cases[i]);
+        uint8_t *b = malloc(n);
+        memcpy(b, cases[i], n);
+        CHECK(prev_step_equals(b, n, 1));
+        CHECK(prev_step_equals(b, n, 3));
+        CHECK(prev_step_equals(b, n, 4096));
+        free(b);
+    }
+    size_t n;
+    uint8_t *b = chain("a", "\xCC\x81", 24576, &n);   /* 49,153-byte cluster, both directions */
+    utf8_gprev s;
+    utf8_gprev_init(&s);
+    size_t start = 9, calls = 1;
+    while (!utf8_grapheme_prev_step(&s, b, n, UTF8_GRAPHEME_BUDGET, &start) && calls < 1000) calls++;
+    CHECK(start == 0 && calls > 1 && calls < 100);
+    utf8_gprev_init(&s);                                 /* first call alone must not finish */
+    CHECK(utf8_grapheme_prev_step(&s, b, n, UTF8_GRAPHEME_BUDGET, &start) == 0);
+    free(b);
 }
 
 /* ------------------------------------------------------------ ascii_run */
@@ -689,6 +897,8 @@ int main(void)
     t_grapheme();
     t_grapheme_conformance();
     t_grapheme_prev_cases();
+    t_step();
+    t_prev_step();
     t_cluster_width();
     t_oracle_random();
     t_ascii_run();

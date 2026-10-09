@@ -173,13 +173,9 @@ static enum gcb gcb_of(uint32_t cp)
 /* Explicit segmentation state: everything the rules remember about the
  * scalars already inside the cluster. Plain data, so a caller can suspend
  * and resume a cluster scan (P1.1d). */
-typedef struct {
-    uint8_t prev;       /* enum gcb of the last scalar */
-    uint8_t pict;       /* inside ExtPict Extend* (GB11 left side) */
-    uint8_t pict_zwj;   /* last scalar is a ZWJ that followed ExtPict Extend* */
-    uint8_t ri_odd;     /* odd number of RI ending at the last scalar */
-    uint8_t incb;       /* 0: no open conjunct; 1: Consonant [Extend Linker]*; 2: ... Linker ... */
-} gstate;
+typedef utf8_gseg gstate;   /* fields: prev (enum gcb of the last scalar), pict (inside ExtPict Extend*, GB11),
+                               pict_zwj (last is a ZWJ after ExtPict Extend*), ri_odd (odd RI count),
+                               incb (0 none; 1 Consonant [Extend Linker]*; 2 ... Linker ...) */
 
 static int incb_of(uint32_t cp, enum gcb g, const gstate *st)
 {
@@ -287,6 +283,112 @@ size_t utf8_grapheme_prev(const uint8_t *base, size_t off)
         q += utf8_grapheme_next(base + q, off - q);
     }
     return start;
+}
+
+
+/* ---- resumable, budgeted segmentation (P1.1d) ---- */
+
+/* Is p[0..n), n >= 1, a proper prefix of a valid multi-byte sequence? Then the
+ * bytes are not invalid, just not all here yet. */
+static int partial_tail(const uint8_t *p, size_t n)
+{
+    uint8_t b = p[0];
+    if (b < 0xC2 || b > 0xF4)
+        return 0;
+    size_t need = b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+    if (n >= need)
+        return 0;
+    if (n >= 2) {
+        uint8_t lo = 0x80, hi = 0xBF;
+        if (b == 0xE0) lo = 0xA0;
+        else if (b == 0xED) hi = 0x9F;
+        else if (b == 0xF0) lo = 0x90;
+        else if (b == 0xF4) hi = 0x8F;
+        if (p[1] < lo || p[1] > hi)
+            return 0;
+    }
+    if (n >= 3 && (p[2] & 0xC0) != 0x80)
+        return 0;
+    return 1;
+}
+
+int utf8_grapheme_step(utf8_gseg *g, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used)
+{
+    size_t i = 0;
+    if (budget == 0)
+        budget = 1;
+    for (;;) {
+        if (i >= n) {
+            *used = i;
+            if (!eof)
+                return UTF8_G_MORE;
+            utf8_gseg_init(g);
+            return UTF8_G_END;
+        }
+        if (i >= budget) {
+            *used = i;
+            return UTF8_G_BUDGET;
+        }
+        utf8_step s = utf8_decode(p + i, n - i);
+        if (!s.valid) {
+            if (!eof && partial_tail(p + i, n - i)) {
+                *used = i;
+                return UTF8_G_MORE;
+            }
+            *used = i + !g->started;                /* fresh: a one-byte cluster; else GB5 break before it */
+            utf8_gseg_init(g);
+            return UTF8_G_END;
+        }
+        if (!g->started) {
+            gstate_start(g, s.cp);
+            g->started = 1;
+        } else if (!gstate_join(g, s.cp)) {
+            *used = i;
+            utf8_gseg_init(g);
+            return UTF8_G_END;
+        }
+        i += s.len;
+    }
+}
+
+int utf8_grapheme_prev_step(utf8_gprev *s, const uint8_t *base, size_t off, size_t budget, size_t *start)
+{
+    size_t left = budget ? budget : 1;
+    if (s->phase == 0) {
+        if (off == 0) {
+            *start = 0;
+            return 1;
+        }
+        if (s->q == 0)                              /* fresh: first candidate is the last unit */
+            s->q = utf8_prev(base, off);
+        s->phase = 1;                               /* phase 1 = back scan */
+    }
+    if (s->phase == 1) {
+        while (s->q > 0 && !safe_start(base, s->q, off)) {
+            if (left == 0)
+                return 0;
+            size_t pq = utf8_prev(base, s->q);
+            left = left > s->q - pq ? left - (s->q - pq) : 0;
+            s->q = pq;
+        }
+        s->start = s->q;
+        utf8_gseg_init(&s->seg);
+        s->phase = 2;                               /* phase 2 = forward replay */
+    }
+    while (s->q < off) {
+        if (left == 0)
+            return 0;
+        if (!s->seg.started)
+            s->start = s->q;
+        size_t used;
+        int r = utf8_grapheme_step(&s->seg, base + s->q, off - s->q, left, 1, &used);
+        s->q += used;
+        left = left > used ? left - used : 0;
+        if (r == UTF8_G_BUDGET && s->q < off)
+            return 0;
+    }
+    *start = s->start;
+    return 1;
 }
 
 /* ----------------------------------------------------------- cluster width */
