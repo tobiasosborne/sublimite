@@ -3,6 +3,7 @@
  * Default sink prints one line per event. Exit 1 on a malformed dump, 2 on usage. */
 #include "../src/trace/trace_fmt.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,8 +64,8 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "--speed=", 8) == 0) {
             char *end = NULL;
             o.speed = strtod(argv[i] + 8, &end);
-            if (end == argv[i] + 8 || *end != '\0' || !(o.speed > 0.0)) {
-                fprintf(stderr, "replay: bad --speed\n");
+            if (end == argv[i] + 8 || *end != '\0' || !isfinite(o.speed) || !(o.speed > 0.0)) {
+                fprintf(stderr, "replay: --speed must be a finite number > 0\n");
                 return 2;
             }
         } else if (argv[i][0] == '-' || path != NULL) {

@@ -7,6 +7,7 @@
 #include "../src/trace/trace.h"
 #include "../src/trace/trace_fmt.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -93,9 +94,12 @@ static void test_fast_order_and_payload(void) {
 static void test_fast_rejects_bad_opts(void) {
     trace_replay_opts bad = { 0, 0.0 };
     trace_replay_opts nan_opts = { 0, 0.0 };
+    trace_replay_opts inf_opts = { 0, 1.0 };
     CHECK(trace_replay(g_src, 0, &bad, collect_sink, NULL) != 0, "speed 0 must be rejected");
     nan_opts.speed = -1.0;
     CHECK(trace_replay(g_src, 0, &nan_opts, collect_sink, NULL) != 0, "negative speed rejected");
+    inf_opts.speed = INFINITY;
+    CHECK(trace_replay(g_src, 0, &inf_opts, collect_sink, NULL) != 0, "speed inf must be rejected");
     CHECK(trace_replay(g_src, 1, NULL, collect_sink, NULL) != 0, "NULL opts rejected");
     CHECK(trace_replay(g_src, 1, &bad, NULL, NULL) != 0, "NULL sink rejected");
 }

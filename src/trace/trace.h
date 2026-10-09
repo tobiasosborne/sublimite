@@ -87,7 +87,7 @@ typedef struct trace_input_rec {
     union {
         struct { uint32_t keysym, state; uint8_t utf8[8]; uint8_t utf8_len, repeat; } key;
         struct { int32_t x, y; uint32_t button, mods; } pointer;
-        struct { int32_t dx, dy; uint32_t mods; } wheel;      /* 16.16 fixed point */
+        struct { int32_t dx, dy; uint32_t mods; } wheel;      /* 8.8 fixed point: PLAT_WHEEL_UNIT, 256 per notch (src/x11/plat.h) */
         struct { uint32_t w, h; } resize;
         struct { uint32_t focused; } focus;
         struct { uint32_t selection, length; } clipboard;
