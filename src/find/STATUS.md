@@ -1,73 +1,74 @@
-# Find status — P1.10 simd-filter-verify (edit-4w1.10)
+# Find status — P1.10b best-of fold-in (edit-4w1.52)
 
-Worker continuation completed 2026-10-09 in this variant worktree, on top of the
-synthesised piece kernel. Implementation selection and gate acceptance remain
-coordinator work. Design, complete numbers and RED/GREEN evidence:
-[decision](../../docs/decisions/P1.10-simd-filter-verify.md).
+The P1.10 pick is the SIMD filter/verify kernel. Its uncovered losing-variant
+tests and verifier edges are folded in by this bead. Comparison, every port,
+design argument and red-green evidence:
+[P1.10b decision](../../docs/decisions/P1.10b.md). Historical pick and design:
+[P1.10](../../docs/decisions/P1.10.md),
+[SIMD filter/verify](../../docs/decisions/P1.10-simd-filter-verify.md).
 
 ## Done
 
-- Rank-selected two-byte SIMD filter, SSE2 baseline and runtime AVX2 dispatch,
-  bounded full-needle verification, deterministic Two-Way fallback when
-  `verified_bytes > 4 * scanned_starts + 8 * needle_length`.
-- One-byte exact counting with bounded offsets, fragmented-snapshot windows,
-  long-needle reader Two-Way, reference regex engine with literal-prefix search.
-- Combined polling meter, including failed comparisons, advances, AVX2 lookahead,
-  preprocessing and snapshot copies. The inherited final boundary fix polls
-  on `>= FIND_POLL_UNITS` and charges Two-Way retirement before match return.
-- New deterministic regression exercises every comparison/retirement boundary
-  for periodic/nonperiodic matches and right/left misses. Temporarily reverting
-  each match-return fix produces RED; restoring the checkpoint produces GREEN.
-  Production find sources are unchanged by this continuation.
-- `make all`: exit 0. `make check`: 24 ASan/UBSan binaries and replay CLI passed
-  on existing Xvfb :99 with socket access, `ASAN_OPTIONS=detect_leaks=0`.
-  Both GCC find tests also passed; the frozen release test checks allocations.
-- `make fuzz`: 12 fuzzers built, exit 0. Frozen `find_fuzz`: 1,380,831 runs in
-  301 seconds, no crash or sanitizer finding, (M)[AC], Charging, launch load 3.45.
-- Quick and full frozen matrices each ran once and passed all correctness
-  checks, including cancellation and stale-publication suppression. Quick exit
-  0; full exit 1 from ordinary reference timing misses. All measurements TRACK.
+- `tests/find_bestof_test.c`: every uncovered Two-Way-only test family,
+  exhaustive binary critical-factorisation cases, periodic powers/perturbations,
+  all byte values and count boundaries, every random single/pair snapshot cut,
+  tiny spans, long needles, arbitrary streaming offsets, oversized-needle
+  cancellation, adversarial/dense subjects, and regex prefix failures/retries.
+- Deterministic probes cover cancellation at every actual poll of representative
+  count/next paths, preprocessing, stitch-copy checkpoints, long snapshot
+  matching/misses, and periodic memory. Existing short Two-Way comparison and
+  retirement boundary tests remain green.
+- Fixed the picked long snapshot verifier's repeated tree seeks: independent
+  forward suffix/prefix readers, ascending prefix comparisons, metered span
+  advances, constant stack space, no allocation. The regex reader remains
+  rewindable for anchors and overlapping prefix retries.
+- Traversal regression RED: seeks/span fetches 4608/4608 (M)[AC], `Not charging`,
+  launch load 11.96, versus three seeks/3072 fetches (G fixture bounds).
+  GREEN: 2/768 (M)[AC], `Not charging`, release launch load 27.71.
+- Additive long-snapshot fuzz operation with an independent KMP oracle; the
+  original small-subject literal/regex operations are retained. Needles and
+  spans exercise the repaired reader, count/next and precancel clearing.
+- GCC `make all` and all release find suites passed. Clang `make fuzz` built
+  all fuzzers; full ASan/UBSan `make check` and replay CLI passed on Xvfb :99,
+  with `ASAN_OPTIONS=detect_leaks=0`. Result lines are in the decision record.
+- `find_fuzz`: 21541 executions in 301 seconds (M)[AC], `Not charging`, launch
+  load 27.00, exit 0, no mismatch or ASan/UBSan finding.
+- The find quick matrix ran once, all correctness/cancellation/publication
+  checks passed, exit 0, (M)[AC], `Not charging`, launch load 27.71, TRACK only.
+  Existing `/tmp/edit-corpus` fixtures were reused unchanged.
 
-## TRACK numbers and remaining work
+## Remaining / limits
 
-Full stamp: 2026-10-09 12:49:04 +08:00, Charging, (M)[AC], launch load 4.09;
-observed mid-run load 7.86 at 13:27:31, Full, (M)[AC]. Full n=31, times in ms:
+No functional find item remains for this fold-in. The coordinator owns full
+performance gate verdicts and the LeakSanitizer-enabled rerun. The sandboxed
+check cannot connect to Xvfb; use access to the existing safe display socket.
+The frozen restarted NFA's no-prefix regex path remains slow and ungated, as
+recorded in the original design. No new regex linearity claim is made.
 
-| Row | p50 / p99 (M)[AC], load 4.09 at launch | Reference p50 / p99 (G) |
-|---|---:|---:|
-| `G6_ERROR` | 193.871830 / 393.045078 | 80 / 125 |
-| `G6_newline` | 110.269708 / 159.944659 | 80 / 125 |
-| `G6v_a31b` | 143.954184 / 207.331407 | 160 / 250 |
-| `G6v_first_last_middle` | 130.128522 / 143.445114 | 160 / 250 |
-| `G6v_first_last_early` | 130.719536 / 213.778502 | 160 / 250 |
-| `G6c_logical_TRACK` | 0.000189 / 0.000225 | 1 / 5 logical |
-
-No functional item remains for this continuation. The ordinary timing misses
-need quiet-box acceptance measurements and comparison with the other variant;
-the loaded run does not settle their cause. The reference regex-without-prefix
-row is slow and ungated; its complete numbers are in the decision. Worker return
-is wall time, distinct from logical acknowledgement and the worker CPU-slice
-bound. The coordinator must rerun with LeakSanitizer enabled.
+`src/find/find.h` and `tests/find_test.c` match their frozen hashes. No Makefile,
+picked-suite, losing-worktree, or unrelated-module edits are needed.
 
 ## Verify
 
-Use `DISPLAY=:99 EDIT_DISPLAY=:99` for every command. The sandbox cannot connect
-to the live Xvfb socket; full `make check` needs access to the existing :99
-socket. Leak detection is disabled below only for the documented sandbox
-restriction; the coordinator should enable it.
+All commands use the existing Xvfb display; never enable the real-display bypass.
+Leak detection is disabled below only for this sandbox; the coordinator enables
+it for the final leak check.
 
 ```sh
 DISPLAY=:99 EDIT_DISPLAY=:99 make all
 DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
+DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/find_bestof_test
+DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/find_simd_filter_verify_test
+DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/find_test
 DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz
+cat /sys/class/power_supply/BAT0/status
+cut -d' ' -f1 /proc/loadavg
 DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 \
-  ./build/fuzz/find_fuzz -max_total_time=300 -max_len=4096
-DISPLAY=:99 EDIT_DISPLAY=:99 ./build/bench/find_bench --quick
-DISPLAY=:99 EDIT_DISPLAY=:99 ./build/bench/find_bench
+  ./build/fuzz/find_fuzz -max_total_time=300 -max_len=4096 -print_final_stats=1
 ```
 
-Before measurements, read `cat /sys/class/power_supply/BAT0/status` and
-`cut -d' ' -f1 /proc/loadavg`; retain both stamps. Use the existing
-`/tmp/edit-corpus`; the frozen benchmark creates its all-a fixture untimed.
-Frozen headers, `tests/find_test.c`, `fuzz/find_fuzz.c`, `bench/find_bench.c`
-and Makefile are unchanged. No build integration change is needed.
+The benchmark command is `DISPLAY=:99 EDIT_DISPLAY=:99
+./build/bench/find_bench --quick`; check power/load first, stamp them, and follow
+the one-run benchmark policy. The best-of test contains a counted production
+source copy for deterministic probes and checks normal linked entry points
+against its independent models as well.

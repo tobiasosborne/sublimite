@@ -56,6 +56,24 @@ static inline uint8_t get_byte(reader *r,uint64_t off)
     }
     return r->p[(size_t)(off-r->base)];
 }
+/* Literal Two-Way has independent, monotonically advancing suffix/prefix
+ * cursors. Seek once per cursor, then traverse each span at most once. Keep
+ * the regex reader above rewindable for overlapping prefix retries/anchors. */
+static inline uint8_t get_byte_forward(reader *r,uint64_t off,meter *m)
+{
+    if (!r->p) {
+        if (step(m)) return 0;
+        piece_iter_begin_snapshot(&r->it,r->source->snapshot,off);
+        r->base=off;
+        (void)piece_iter_next(&r->it,&r->p,&r->n);
+    }
+    while (off-r->base>=(uint64_t)r->n) {
+        if (step(m)) return 0;
+        r->base+=r->n;
+        (void)piece_iter_next(&r->it,&r->p,&r->n);
+    }
+    return r->p[(size_t)(off-r->base)];
+}
 static inline find_code add_result(find_result *r,uint64_t off)
 {
     if (r->total==UINT64_MAX) return FIND_ERR_LIMIT;

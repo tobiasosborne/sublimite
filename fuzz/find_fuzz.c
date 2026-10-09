@@ -105,9 +105,76 @@ static bool model_next(model *m,size_t off,size_t *start,size_t *end)
     }
     return false;
 }
+/* P1.10b gap: the small endpoint-set subjects cannot enter the long-needle
+ * snapshot verifier. Generate bounded periodic/critical-prefix subjects and
+ * compare against an independent KMP model, also from arbitrary next offsets. */
+static uint64_t long_model(const uint8_t *h,size_t hn,const uint8_t *n,size_t nn,
+                          const size_t *prefix,size_t from,find_result *out)
+{
+    out->total=0; out->stored=0;
+    size_t matched=0;
+    for (size_t i=from;i<hn;i++) {
+        while (matched && h[i]!=n[matched]) matched=prefix[matched-1];
+        if (h[i]==n[matched]) matched++;
+        if (matched==nn) {
+            if (out->stored<FIND_MAX_OFFSETS) out->offsets[out->stored++]=i+1-nn;
+            out->total++; matched=0; /* non-overlapping */
+        }
+    }
+    return out->stored?out->offsets[0]:FIND_UNSET;
+}
+static void long_snapshot_op(const uint8_t *data,size_t size)
+{
+    if (size<8 || (data[0]&63u)!=0) return;
+    uint8_t h[16448],n[8192]; size_t prefix[8192];
+    size_t nn=2049+(((size_t)data[1]<<8)|data[2])%6144,hn=2*nn+64;
+    size_t period=1+data[3]%7u;
+    for (size_t i=0;i<hn;i++) h[i]=(uint8_t)(data[(4+i%period)%size]%4u);
+    for (size_t i=0;i<nn;i++) n[i]=(uint8_t)(data[(4+i%period)%size]%4u);
+    if (data[4]%4u) {
+        size_t at=data[4]%4u==1?0:data[4]%4u==2?nn/2:nn-1;
+        n[at]=0xff;
+    }
+    if (data[5]&1u) memcpy(h+17,n,nn);
+    if (data[6]&1u) memcpy(h+nn+33,n,nn);
+    prefix[0]=0;
+    for (size_t i=1;i<nn;i++) {
+        size_t matched=prefix[i-1];
+        while (matched && n[i]!=n[matched]) matched=prefix[matched-1];
+        if (n[i]==n[matched]) matched++;
+        prefix[i]=matched;
+    }
+    find_result want,got;
+    (void)long_model(h,hn,n,nn,prefix,0,&want);
+    find_source flat={h,hn,NULL};
+    EDIT_ASSERT(find_literal(&flat,n,nn,NULL,&got)==FIND_OK);
+    EDIT_ASSERT(got.total==want.total && got.stored==want.stored);
+    EDIT_ASSERT(memcmp(got.offsets,want.offsets,want.stored*sizeof want.offsets[0])==0);
+    piece_allocator allocator=piece_default_allocator(); piece_tree *tree=piece_create(&allocator); EDIT_ASSERT(tree);
+    size_t chunk=16+data[7]%16u;
+    for (size_t end=hn;end;) {
+        size_t lo=end>chunk?end-chunk:0;
+        EDIT_ASSERT(piece_insert(tree,0,h+lo,end-lo)==PIECE_OK); end=lo;
+    }
+    piece_snapshot *snapshot=piece_snapshot_take(tree); EDIT_ASSERT(snapshot); piece_destroy(tree);
+    find_source source={NULL,0,snapshot};
+    EDIT_ASSERT(find_literal(&source,n,nn,NULL,&got)==FIND_OK);
+    EDIT_ASSERT(got.total==want.total && got.stored==want.stored);
+    EDIT_ASSERT(memcmp(got.offsets,want.offsets,want.stored*sizeof want.offsets[0])==0);
+    size_t from=(size_t)data[size-1]*(hn+1)/256;
+    uint64_t next=long_model(h,hn,n,nn,prefix,from,&want); find_match match;
+    EDIT_ASSERT(find_literal_next(&source,n,nn,from,NULL,&match)==FIND_OK);
+    EDIT_ASSERT(match.matched==(next!=FIND_UNSET));
+    if (match.matched) EDIT_ASSERT(match.whole.start==next && match.whole.end==next+nn);
+    atomic_bool stop; atomic_init(&stop,true); find_control control={0}; control.cancel=&stop;
+    EDIT_ASSERT(find_literal(&source,n,nn,&control,&got)==FIND_CANCELLED && got.total==0 && got.stored==0);
+    EDIT_ASSERT(find_literal_next(&source,n,nn,from,&control,&match)==FIND_CANCELLED && !match.matched && match.groups==0 && match.whole.start==FIND_UNSET && match.whole.end==FIND_UNSET);
+    piece_snapshot_release(snapshot);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
 {
     if(size==0) return 0;
+    long_snapshot_op(data,size);
     size_t hn=(size_t)(data[0]%33u); if(hn>size-1) hn=size-1;
     find_source source={data+1,hn,NULL};
     const uint8_t *needle=data+1+hn; size_t nn=size-1-hn; if(nn>40) nn=40;

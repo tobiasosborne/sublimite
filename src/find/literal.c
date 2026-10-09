@@ -101,12 +101,16 @@ static bool tw_prepare(find_lit *l)
     l->tw_ready=true; return true;
 }
 #define UNIT() do { if (charge(m,1)) return -1; } while (0)
-/* Leftmost match start in [from, len-n]. contig: hp/len bytes; else reader. */
+/* Leftmost match start in [from, len-n]. Snapshot suffix/prefix comparisons
+ * use separate forward readers. The critical cut is below the true period;
+ * the nonperiodic shift exceeds the prefix length. Thus a prefix failure
+ * retires all bytes that cursor read, even with ascending comparisons. */
 static inline __attribute__((always_inline))
-int tw_core(find_lit *l,bool contig,const uint8_t *hp,reader *rd,uint64_t len,uint64_t from,uint64_t *out)
+int tw_core(find_lit *l,bool contig,const uint8_t *hp,reader *rd,reader *left,uint64_t len,uint64_t from,uint64_t *out)
 {
     const uint8_t *nd=l->nd; size_t n=l->n, ell=l->ell, per=l->per; meter *m=l->m;
-#define HB(x) (contig ? hp[(size_t)(x)] : get_byte(rd,(x)))
+#define HB(x) (contig ? hp[(size_t)(x)] : get_byte_forward(rd,(x),m))
+#define HL(x) (contig ? hp[(size_t)(x)] : get_byte_forward(left,(x),m))
     if (n>len || from>len-n) return 0;
     uint64_t last=len-n, j=from; size_t memory=0;
     if (l->periodic) {
@@ -114,10 +118,10 @@ int tw_core(find_lit *l,bool contig,const uint8_t *hp,reader *rd,uint64_t len,ui
             size_t i=ell>memory?ell:memory;
             while (i<n) { UNIT(); if (nd[i]!=HB(j+i)) break; i++; }
             if (i>=n) {
-                size_t k=ell;
-                while (k>memory) { UNIT(); if (nd[k-1]!=HB(j+k-1)) break; k--; }
+                size_t k=memory;
+                while (k<ell) { UNIT(); if (nd[k]!=HL(j+k)) break; k++; }
                 UNIT();
-                if (k<=memory) { *out=j; return 1; }
+                if (k>=ell) { *out=j; return 1; }
                 j+=per; memory=n-per;
             } else { UNIT(); j+=i-ell+1; memory=0; }
         }
@@ -126,21 +130,22 @@ int tw_core(find_lit *l,bool contig,const uint8_t *hp,reader *rd,uint64_t len,ui
             size_t i=ell;
             while (i<n) { UNIT(); if (nd[i]!=HB(j+i)) break; i++; }
             if (i>=n) {
-                size_t k=ell;
-                while (k>0) { UNIT(); if (nd[k-1]!=HB(j+k-1)) break; k--; }
+                size_t k=0;
+                while (k<ell) { UNIT(); if (nd[k]!=HL(j+k)) break; k++; }
                 UNIT();
-                if (k==0) { *out=j; return 1; }
+                if (k==ell) { *out=j; return 1; }
                 j+=per;
             } else { UNIT(); j+=i-ell+1; }
         }
     }
 #undef HB
+#undef HL
     return 0;
 }
 static int tw_buf(find_lit *l,const uint8_t *h,size_t len,size_t from,size_t *out)
 {
     if (!tw_prepare(l)) return -1;
-    uint64_t o=0; int r=tw_core(l,true,h,NULL,len,from,&o);
+    uint64_t o=0; int r=tw_core(l,true,h,NULL,NULL,len,from,&o);
     *out=(size_t)o; return r;
 }
 
@@ -288,8 +293,8 @@ static int seek_snap(find_lit *l,const find_source *src,uint64_t len,uint64_t fr
     if ((uint64_t)n>len || from>len-n) return 0;
     if (n>NSNAP_MAX) {
         if (!tw_prepare(l)) return -1;
-        reader rd=reader_init(src);
-        return tw_core(l,false,NULL,&rd,len,from,out);
+        reader rd=reader_init(src),left=reader_init(src);
+        return tw_core(l,false,NULL,&rd,&left,len,from,out);
     }
     uint8_t win[WINMAX];
     piece_iter it; const uint8_t *p; size_t sn, o;
