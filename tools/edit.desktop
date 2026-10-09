@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Edit
+GenericName=Text Editor
+Comment=Edit text files
+Exec=edit -- %F
+TryExec=edit
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;text/x-c;text/x-c++src;text/x-chdr;text/x-python;text/x-shellscript;application/json;application/xml;text/markdown;
+StartupNotify=false
