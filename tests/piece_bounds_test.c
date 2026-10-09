@@ -147,6 +147,177 @@ static int wide_pointer_boundary(void) {
     puts("uint64_t cursor offset: ok (subtract logical start before pointer addition)");
     return 0;
 }
+
+/* Count work, independent of clock speed and shared-machine load. */
+static piece_tree *fragments(size_t n) {
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a);
+    if (!t) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = (uint8_t)(i % 251);
+        if (piece_insert(t, 0, &b, 1)) { piece_destroy(t); return NULL; }
+    }
+    return t;
+}
+static int trim_work(void) {
+    const size_t sizes[] = {16384, 65536};
+    for (size_t j = 0; j < sizeof sizes / sizeof sizes[0]; j++) {
+        piece_tree *t = fragments(sizes[j]); CHECK(t);
+        piece_snapshot *s = piece_snapshot_take(t); CHECK(s); piece_snapshot_release(s);
+        for (unsigned i = 0; i < 10; i++) {
+            piece_test_reset_stats(t); CHECK(!piece_delete(t, 0, 1024, NULL));
+            piece_test_stats st = piece_test_get_stats(t);
+            uint64_t limit = st.pool_returns + 16;
+            printf("trim work: pieces=%zu delete=%u slabs=%llu returns=%llu bound=%llu\n", sizes[j], i,
+                   (unsigned long long)st.slabs_scanned, (unsigned long long)st.pool_returns,
+                   (unsigned long long)limit);
+            CHECK(st.slabs_scanned <= limit);
+            piece_test_reset_stats(t); CHECK(piece_len(t) == sizes[j] - (i + 1u) * 1024u);
+            s = piece_snapshot_take(t); CHECK(s);
+            st = piece_test_get_stats(t); CHECK(st.slabs_scanned <= st.pool_returns + 16);
+            piece_test_reset_stats(t); piece_snapshot_release(s);
+            st = piece_test_get_stats(t); CHECK(st.slabs_scanned <= st.pool_returns + 16);
+        }
+        piece_destroy(t);
+    }
+    /* A released old root can queue a tree-sized amount of dead storage
+     * while another snapshot stays live. Queries/takes drain a fixed batch. */
+    for (unsigned remaining = 0; remaining <= 8; remaining += 8) {
+        piece_tree *t = fragments(65536); CHECK(t);
+        piece_snapshot *old = piece_snapshot_take(t); CHECK(old);
+        CHECK(!piece_delete(t, 0, 65536 - remaining, NULL));
+        piece_snapshot *current = piece_snapshot_take(t); CHECK(current);
+        piece_snapshot_release(old);
+        piece_test_reset_stats(t); CHECK(piece_len(t) == remaining);
+        piece_test_stats st = piece_test_get_stats(t);
+        printf("trim work: pending returns length=%u slabs=%llu bound=64\n", remaining, (unsigned long long)st.slabs_scanned);
+        CHECK(st.slabs_scanned <= 64);
+        piece_test_reset_stats(t); piece_snapshot *next = piece_snapshot_take(t); CHECK(next);
+        st = piece_test_get_stats(t);
+        printf("trim work: pending returns take slabs=%llu bound=64\n", (unsigned long long)st.slabs_scanned);
+        CHECK(st.slabs_scanned <= 64);
+        piece_snapshot_release(next); piece_snapshot_release(current); piece_destroy(t);
+    }
+    puts("foreground slab work: ok (reclaimed storage only, independent of live pool)"); return 0;
+}
+static int range_work(void) {
+    const size_t n = 65536; piece_tree *t = fragments(n); CHECK(t);
+    uint8_t *out = malloc(n); CHECK(out);
+    piece_snapshot *s = piece_snapshot_take(t); CHECK(s);
+    piece_test_memory m = piece_test_get_memory(t);
+    uint64_t limit = m.live[0] + m.live[1];
+    piece_test_reset_stats(t); CHECK(!piece_read(t, 0, out, n));
+    for (size_t i = 0; i < n; i++) CHECK(out[i] == (uint8_t)((n - 1 - i) % 251));
+    piece_test_stats st = piece_test_get_stats(t);
+    printf("range work: tree nodes=%llu bound=%llu height=%u\n",
+           (unsigned long long)st.walk_nodes, (unsigned long long)limit, st.height);
+    CHECK(st.walk_nodes <= limit);
+    piece_test_reset_stats(t); CHECK(!piece_snapshot_read(s, 13, out, n - 26));
+    for (size_t i = 0; i < n - 26; i++) CHECK(out[i] == (uint8_t)((n - 14 - i) % 251));
+    st = piece_test_get_stats(t);
+    printf("range work: snapshot nodes=%llu bound=%llu\n", (unsigned long long)st.walk_nodes, (unsigned long long)limit);
+    CHECK(st.walk_nodes <= limit);
+    piece_test_reset_stats(t); piece_ref r; CHECK(!piece_delete(t, 13, n - 26, &r));
+    st = piece_test_get_stats(t);
+    printf("range work: collect/fallback nodes=%llu bound=%llu\n", (unsigned long long)st.walk_nodes,
+           (unsigned long long)(3 * limit));
+    CHECK(st.walk_nodes <= 3 * limit);
+    CHECK(!piece_insert_ref(t, 13, &r)); CHECK(!piece_read(t, 0, out, n));
+    for (size_t i = 0; i < n; i++) CHECK(out[i] == (uint8_t)((n - 1 - i) % 251));
+    piece_snapshot_release(s); piece_destroy(t); free(out);
+    puts("fragmented range work: ok (tree/snapshot/content/collection/fallback)"); return 0;
+}
+static int ref_work(void) {
+    const size_t n = 1u << 20;
+    uint8_t *data = malloc(n), *out = malloc(n); CHECK(data && out);
+    uint64_t lines = 1;
+    for (size_t i = 0; i < n; i++) { data[i] = i % 31 == 0 ? '\n' : (uint8_t)(i % 251); lines += data[i] == '\n'; }
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); CHECK(t);
+    CHECK(!piece_init_copy(t, (const uint8_t *)"..", 2));
+    CHECK(!piece_insert(t, 1, data, n)); piece_ref r; CHECK(!piece_delete(t, 1, n, &r));
+    for (unsigned i = 0; i < 4; i++) {
+        piece_test_reset_stats(t); CHECK(!piece_insert_ref(t, 1, &r));
+        piece_test_stats st = piece_test_get_stats(t);
+        printf("reference work: replay=%u bytes=%llu bound=510 descents=%llu\n", i,
+               (unsigned long long)st.ref_recount_bytes, (unsigned long long)st.root_descents);
+        CHECK(st.ref_recount_bytes <= 510);
+        CHECK(!st.ref_recount_bytes); /* aligned full chunks use only prefixes */
+        CHECK(st.root_descents <= 2); /* two bounded batches for sixteen chunks */
+        CHECK(piece_line_count(t) == lines); CHECK(!piece_read(t, 1, out, n) && !memcmp(data, out, n));
+        CHECK(!piece_delete(t, 1, n, NULL));
+    }
+    /* Partial endpoints and overlapping/noncontiguous spans use cached block
+     * prefixes too; every span has at most two short recounts. */
+    piece_ref partial = { .nspans = 3, .len = n - 40 + 400,
+                         .span = {{13, n - 40}, {250, 300}, {65530, 100}} };
+    piece_test_reset_stats(t); CHECK(!piece_insert_ref(t, 1, &partial));
+    piece_test_stats st = piece_test_get_stats(t);
+    printf("reference work: partial bytes=%llu bound=1530\n", (unsigned long long)st.ref_recount_bytes);
+    CHECK(st.ref_recount_bytes <= 3 * 510);
+    CHECK(!piece_read(t, 1, out, n - 40)); CHECK(!memcmp(out, data + 13, n - 40));
+    CHECK(!piece_read(t, n - 39, out, 300) && !memcmp(out, data + 250, 300));
+    CHECK(!piece_read(t, n + 261, out, 100) && !memcmp(out, data + 65530, 100));
+    uint64_t expected = 1;
+    for (unsigned i = 0; i < partial.nspans; i++)
+        for (uint64_t k = 0; k < partial.span[i].len; k++) expected += data[partial.span[i].add_off + k] == '\n';
+    CHECK(piece_line_count(t) == expected);
+    piece_destroy(t);
+    /* Force bulk insertion through full leaves and several branch levels,
+     * with COW and an unaligned ADD chunk start. */
+    t = fragments(4096); CHECK(t);
+    CHECK(!piece_insert(t, 2048, data, n)); CHECK(!piece_delete(t, 2048, n, &r));
+    piece_snapshot *s = piece_snapshot_take(t); CHECK(s);
+    CHECK(!piece_insert_ref(t, 2048, &r)); CHECK(!piece_read(t, 2048, out, n) && !memcmp(out, data, n));
+    CHECK(!piece_snapshot_read(s, 0, out, 4096));
+    for (size_t i = 0; i < 4096; i++) CHECK(out[i] == (uint8_t)((4095 - i) % 251));
+    CHECK(!piece_delete(t, 2048, n, NULL)); CHECK(!piece_read(t, 0, out, 4096));
+    for (size_t i = 0; i < 4096; i++) CHECK(out[i] == (uint8_t)((4095 - i) % 251));
+    piece_snapshot_release(s); piece_destroy(t);
+    /* The full-chunk count needs seventeen bits even though every interior
+     * prefix fits in sixteen. Check both ends of that representation. */
+    memset(data, '\n', 65536); t = piece_create(&a); CHECK(t);
+    CHECK(!piece_insert(t, 0, data, 65536)); CHECK(!piece_delete(t, 0, 65536, &r));
+    CHECK(!piece_insert_ref(t, 0, &r) && piece_line_count(t) == 65537);
+    piece_test_reset_stats(t); CHECK(!piece_insert_ref(t, 32769, &r));
+    CHECK(piece_line_count(t) == 131073 && piece_test_get_stats(t).ref_recount_bytes <= 1022);
+    CHECK(!piece_delete(t, 32769, 65536, NULL) && piece_line_count(t) == 65537);
+    CHECK(!piece_delete(t, 0, 65536, NULL));
+    partial.nspans = 1; partial.len = 64513; partial.span[0].add_off = 511; partial.span[0].len = 64513;
+    CHECK(!piece_insert_ref(t, 0, &partial) && piece_line_count(t) == 64514);
+    piece_destroy(t); free(data); free(out);
+    puts("large reference work: ok (bounded prefix edges; bulk replay; exact bytes/newlines)"); return 0;
+}
+static int ref_cache_rollback(void) {
+    uint8_t before[250], inside[777], after[521], out[1027];
+    for (size_t i = 0; i < sizeof before; i++) before[i] = i % 3 == 0 ? '\n' : 'b';
+    for (size_t i = 0; i < sizeof inside; i++) inside[i] = i % 11 == 0 ? '\n' : 'i';
+    for (size_t i = 0; i < sizeof after; i++) after[i] = i % 17 == 0 ? '\n' : 'a';
+    for (unsigned pinned = 0; pinned < 2; pinned++) {
+        piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); CHECK(t);
+        CHECK(!piece_insert(t, 0, before, sizeof before));
+        piece_checkpoint *cp; CHECK(!piece_checkpoint_begin(t, &cp));
+        CHECK(!piece_insert(t, sizeof before, inside, sizeof inside));
+        piece_snapshot *s = pinned ? piece_snapshot_take(t) : NULL; CHECK(!pinned || s);
+        piece_checkpoint_abort(cp);
+        /* Exercise both cursor typing and bulk writes through saved partial
+         * and complete block boundaries after restoration. */
+        CHECK(!piece_insert(t, sizeof before, after, 1));
+        CHECK(!piece_insert(t, sizeof before + 1, after + 1, sizeof after - 1));
+        uint64_t lines = 1;
+        for (size_t i = 0; i < sizeof before; i++) lines += before[i] == '\n';
+        for (size_t i = 0; i < sizeof after; i++) lines += after[i] == '\n';
+        piece_ref r; CHECK(!piece_delete(t, 0, sizeof before + sizeof after, &r));
+        CHECK(!piece_insert_ref(t, 0, &r)); CHECK(piece_line_count(t) == lines);
+        CHECK(!piece_read(t, 0, out, sizeof before + sizeof after));
+        CHECK(!memcmp(out, before, sizeof before) && !memcmp(out + sizeof before, after, sizeof after));
+        piece_destroy(t);
+        if (s) {
+            CHECK(!piece_snapshot_read(s, 0, out, sizeof out));
+            CHECK(!memcmp(out, before, sizeof before) && !memcmp(out + sizeof before, inside, sizeof inside));
+            piece_snapshot_release(s);
+        }
+    }
+    puts("reference prefix rollback: ok (saved partial block; pinned/unpinned transaction snapshot)"); return 0;
+}
 #endif
 
 static int high_offsets(void) {
@@ -221,6 +392,9 @@ int main(int argc, char **argv) {
         bad |= insert_boundary(); bad |= ref_boundary(); bad |= ref_sum_boundary();
     }
     if (argc == 1 || !strcmp(argv[1], "--wide")) bad |= wide_pointer_boundary();
+    if (argc == 1 || !strcmp(argv[1], "--trim-work")) bad |= trim_work();
+    if (argc == 1 || !strcmp(argv[1], "--range-work")) bad |= range_work();
+    if (argc == 1 || !strcmp(argv[1], "--ref-work")) { bad |= ref_work(); bad |= ref_cache_rollback(); }
 #endif
     if (argc == 1 || !strcmp(argv[1], "--wide")) bad |= high_offsets();
     puts(bad ? "piece_bounds_test: FAILED" : "piece_bounds_test: ok");

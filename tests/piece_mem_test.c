@@ -86,16 +86,16 @@ static int deeper_snapshots(int fixed_contract) {
         piece_test_stats st = piece_test_get_stats(t);
         uint64_t path = (uint64_t)st.leaf_bytes + (uint64_t)st.height * st.branch_bytes;
         CHECK(st.height == height && st.pathcopy_bytes == path);
-        /* Each class has two slots per slab, with 16 bytes of bookkeeping.
-         * A class's trailing spare slot is explicitly counted too. */
+        /* Charge the actual private slab metadata. Each
+         * class still has two slots per slab; count trailing spare slots too. */
         double actual_path_funding = (double)path + (double)st.snapshot_bytes +
-                                     8.0 * (double)(height + 2) + (double)st.leaf_bytes +
-                                     (double)st.branch_bytes + (double)st.snapshot_bytes + 48.0;
+                                     (double)(st.slab_overhead / 2) * (double)(height + 2) + (double)st.leaf_bytes +
+                                     (double)st.branch_bytes + (double)st.snapshot_bytes + 3.0 * (double)st.slab_overhead;
         CHECK((double)atomic_load(&m.live) <= (double)before + actual_path_funding);
         uint8_t b; CHECK(piece_snapshot_len(s) == len && !piece_snapshot_read(s, 0, &b, 1) && b == 'x');
-        printf("deep snapshot: height=%u path=%llu header=%zu slab_B_per_slot=8\n", st.height,
-               (unsigned long long)st.pathcopy_bytes, st.snapshot_bytes);
-        if (fixed_contract) CHECK(st.pathcopy_bytes + st.snapshot_bytes + 8u * (height + 2u) <= 1920);
+        printf("deep snapshot: height=%u path=%llu header=%zu slab_B_per_slot=%zu\n", st.height,
+               (unsigned long long)st.pathcopy_bytes, st.snapshot_bytes, st.slab_overhead / 2);
+        if (fixed_contract) CHECK(st.pathcopy_bytes + st.snapshot_bytes + (st.slab_overhead / 2) * (height + 2u) <= 1920);
         piece_snapshot_release(s); piece_destroy(t); CHECK(!atomic_load(&m.live));
     }
     puts("deeper snapshots: ok (actual paths/headers/slab overhead; checked uint64_t depth)"); return 0;

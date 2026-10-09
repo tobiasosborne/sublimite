@@ -15,7 +15,11 @@
 #ifdef PIECE_TESTING
 typedef struct piece_test_stats {
     uint64_t root_descents, cursor_hits, pathcopy_bytes, gap_deletes;
+    /* Completed slabs consumed, returned slots, range/iterator node entries,
+     * and ADD bytes scanned by prefix queries (including ADD entry splits). */
+    uint64_t slabs_scanned, pool_returns, walk_nodes, ref_recount_bytes;
     size_t leaf_bytes, branch_bytes, snapshot_bytes;
+    size_t slab_overhead;
     unsigned height;
 } piece_test_stats;
 piece_test_stats piece_test_get_stats(const piece_tree *t);
@@ -24,6 +28,7 @@ typedef struct piece_test_memory {
     uint64_t deleted_original, fallback_add;
 } piece_test_memory;
 piece_test_memory piece_test_get_memory(const piece_tree *t);
+/* Reset only with snapshot readers/releasers quiescent. */
 void piece_test_reset_stats(piece_tree *t);
 /* Quiescent snapshot only; fake owners do not invoke mapping hooks. Restore
  * the real count before releasing the test's owners. */

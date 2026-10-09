@@ -37,6 +37,10 @@
 #define BRANCH_SZ 400u
 #define SNAPSHOT_SZ 80u
 #define MAXH 32
+#define NL_BLOCK 512u
+#define NL_BLOCKS (65536u / NL_BLOCK)
+#define REF_BATCH (FAN - 2u)
+#define TRIM_QUERY 3
 
 typedef struct node node;
 struct node {
@@ -50,14 +54,31 @@ struct node {
 };
 _Static_assert(offsetof(node, v) + sizeof(((node *)0)->v.l) == LEAF_SZ, "leaf size");
 _Static_assert(sizeof(node) == BRANCH_SZ, "branch size");
+/* Occupancy and all lists share pool_mu, including worker returns. Slabs
+ * retain the existing two slots + 16-byte tail: free-slot words hold queue
+ * links, and the tagged tail holds all-list links and two occupancy bits. */
+#define SLAB_OVERHEAD 16u
+#define FREE_HEADER 32u
+#define SLAB_TAG ((uintptr_t)TOP)
+typedef struct slab_tail { uintptr_t prev_used; node *next; } slab_tail;
+_Static_assert(sizeof(slab_tail) == SLAB_OVERHEAD, "slab tail");
+_Static_assert(sizeof(uintptr_t) == sizeof(uint64_t), "64-bit slab tags");
+#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "slab marker follows the x86-64 little-endian node header"
+#endif
 typedef struct node_pool {
-    node *fl; size_t nfree; _Atomic(node *) remote; atomic_size_t returned;
-    void *slabs; size_t nslabs;
+    node *slabs, *partial, *empty;
+    size_t nslabs, nfree; atomic_size_t returned;
 } node_pool;
 
 typedef struct { uint64_t b, nl, x; } ent;
 
-typedef struct add_chunk { atomic_uint rc; uint8_t data[65536]; } add_chunk;
+/* Prefixes are published as append crosses each block boundary. The mutable
+ * total belongs to the owning writer; snapshot byte/line queries do not read
+ * it. Rollback restores it together with the saved ADD boundary. */
+typedef struct add_chunk {
+    atomic_uint rc; uint32_t nl_total; uint16_t nl_prefix[NL_BLOCKS]; uint8_t data[65536];
+} add_chunk;
 typedef struct retired { add_chunk **p; size_t cap; } retired;
 /* Append-only within one view. Only checkpoint rollback forks the directory;
  * snapshots retain their original view and its immutable published prefix. */
@@ -148,47 +169,94 @@ static inline uint64_t entry_x(const node *n, unsigned i) {
 static inline void entry_x_set(node *n, unsigned i, uint64_t x) {
     if (n->leaf) n->v.l.x[i] = x; else n->v.in.ch[i] = (node *)(uintptr_t)x;
 }
-static size_t slab_nodes(size_t k) { (void)k; return 2; }
 static size_t slot_size(unsigned p) { return p == 0 ? LEAF_SZ : p == 1 ? BRANCH_SZ : SNAPSHOT_SZ; }
-static int pool_slab(core *c, unsigned pi) {
-    node_pool *p = &c->pool[pi]; size_t nn = slab_nodes(p->nslabs), slot = slot_size(pi);
-    size_t sz = nn * slot + 16;
-    uint8_t *raw = c->a.alloc(c->a.ctx, sz);
-    if (!raw) return PIECE_ERR_NOMEM;
-    *(void **)(void *)(raw + sz - 16) = p->slabs;
-    p->slabs = raw; p->nslabs++;
-    for (size_t i = nn; i-- > 0;) {
-        node *n = (node *)(void *)(raw + i * slot);
-        atomic_init(&n->rc, 0); n->nextfree = p->fl; p->fl = n; POISON((uint8_t *)n + 16, slot - 16);
-    }
-    p->nfree += nn; return 0;
+static node *slab_slot(node *s, size_t slot, unsigned i) {
+    return (node *)(void *)((uint8_t *)s + i * slot);
 }
-static void pool_drain(core *c, unsigned pi) {
-    node_pool *p = &c->pool[pi];
-    node *h = atomic_exchange_explicit(&p->remote, NULL, memory_order_acquire);
-    while (h) { node *nx = h->nextfree; h->nextfree = p->fl; p->fl = h; p->nfree++; h = nx; }
+static slab_tail *slab_end(node *s, size_t slot) {
+    return (slab_tail *)(void *)((uint8_t *)s + 2 * slot);
+}
+/* The next slot's kind (or snapshot padding, initialized to zero) never has
+ * its high bit set. The tail's tagged first word always does. Read only that
+ * immutable halfword, not the neighbouring atomic reference count. This
+ * identifies either slot without extra live-node/slab bytes or a lookup. */
+static node *slot_slab(node *n, size_t slot) {
+    uint16_t marker;
+    memcpy(&marker, (uint8_t *)n + slot + offsetof(node, leaf), sizeof marker);
+    return marker & UINT16_C(0x8000) ? (node *)(void *)((uint8_t *)n - slot) : n;
+}
+static unsigned slab_used(const slab_tail *tail) { return (unsigned)(tail->prev_used & 3u); }
+static node *slab_prev(const slab_tail *tail) { return (node *)(tail->prev_used & ~(SLAB_TAG | (uintptr_t)3)); }
+static void slab_set_prev(slab_tail *tail, node *prev) {
+    tail->prev_used = SLAB_TAG | (uintptr_t)prev | slab_used(tail);
+}
+/* Free nodes keep next at offset eight and prev at offset sixteen. The first
+ * eight bytes remain a normal rc/count/kind header for slot_slab and probes. */
+static node *queue_prev(const node *n) {
+    node *prev; memcpy(&prev, (const uint8_t *)n + 16, sizeof prev); return prev;
+}
+static void queue_set_prev(node *n, node *prev) { memcpy((uint8_t *)n + 16, &prev, sizeof prev); }
+static void slab_enqueue(node **head, node *n) {
+    queue_set_prev(n, NULL); n->nextfree = *head;
+    if (*head) queue_set_prev(*head, n);
+    *head = n;
+}
+static void slab_dequeue(node **head, node *n) {
+    node *prev = queue_prev(n), *next = n->nextfree;
+    if (prev) prev->nextfree = next; else *head = next;
+    if (next) queue_set_prev(next, prev);
+}
+static int pool_grow(core *c, unsigned pi) {
+    node_pool *p = &c->pool[pi]; size_t slot = slot_size(pi), sz = 2 * slot + SLAB_OVERHEAD;
+    node *s = c->a.alloc(c->a.ctx, sz);
+    if (!s) return PIECE_ERR_NOMEM;
+    EDIT_ASSERT(!((uintptr_t)s & (SLAB_TAG | (uintptr_t)15)));
+    slab_tail *tail = slab_end(s, slot); tail->prev_used = SLAB_TAG; tail->next = p->slabs;
+    if (p->slabs) slab_set_prev(slab_end(p->slabs, slot), s);
+    p->slabs = s; p->nslabs++;
+    for (unsigned i = 0; i < 2; i++) {
+        node *n = slab_slot(s, slot, i);
+        atomic_init(&n->rc, 0); n->cnt = 0; n->leaf = 0;
+        POISON((uint8_t *)n + FREE_HEADER, slot - FREE_HEADER);
+    }
+    slab_enqueue(&p->empty, s); p->nfree += 2; return 0;
 }
 static int pool_reserve_class(core *c, unsigned pi, size_t n) {
     node_pool *p = &c->pool[pi];
-    if (p->nfree >= n) return 0;
-    pool_drain(c, pi);
-    while (p->nfree < n) { int r = pool_slab(c, pi); if (r) return r; }
+    while (p->nfree < n) { int r = pool_grow(c, pi); if (r) return r; }
     return 0;
 }
 static node *pool_get(core *c, unsigned pi) {
-    node_pool *p = &c->pool[pi];
-    EDIT_ASSERT(p->fl); /* every mutation reserves before changing content */
-    node *n = p->fl; p->fl = n->nextfree; p->nfree--;
-    UNPOISON((uint8_t *)n + 16, slot_size(pi) - 16);
+    node_pool *p = &c->pool[pi]; size_t slot = slot_size(pi);
+    node *n = p->partial ? p->partial : p->empty;
+    EDIT_ASSERT(n); /* every mutation reserves before changing content */
+    node *s = slot_slab(n, slot); slab_tail *tail = slab_end(s, slot);
+    unsigned used = slab_used(tail), i = n == s ? 0u : 1u;
+    if (used) slab_dequeue(&p->partial, n);
+    else {
+        slab_dequeue(&p->empty, n); slab_enqueue(&p->partial, slab_slot(s, slot, 1));
+    }
+    EDIT_ASSERT(!(used & (1u << i)));
+    tail->prev_used |= (uintptr_t)1 << i; p->nfree--;
+    UNPOISON((uint8_t *)n + FREE_HEADER, slot - FREE_HEADER);
     return n;
 }
 static void pool_free(core *c, node *n, unsigned pi) { /* any thread */
     pthread_mutex_lock(&c->pool_mu);
-    node_pool *p = &c->pool[pi];
+#ifdef PIECE_TESTING
+    c->stats.pool_returns++;
+#endif
+    node_pool *p = &c->pool[pi]; size_t slot = slot_size(pi);
+    node *s = slot_slab(n, slot); slab_tail *tail = slab_end(s, slot);
+    unsigned used = slab_used(tail), i = n == s ? 0u : 1u;
+    EDIT_ASSERT(used & (1u << i));
     atomic_store_explicit(&n->rc, 0, memory_order_relaxed);
-    POISON((uint8_t *)n + 16, slot_size(pi) - 16);
-    node *h = atomic_load_explicit(&p->remote, memory_order_relaxed);
-    do { n->nextfree = h; } while (!atomic_compare_exchange_weak_explicit(&p->remote, &h, n, memory_order_release, memory_order_relaxed));
+    POISON((uint8_t *)n + FREE_HEADER, slot - FREE_HEADER);
+    tail->prev_used &= ~((uintptr_t)1 << i); p->nfree++;
+    if (used == 3) slab_enqueue(&p->partial, n);
+    else {
+        slab_dequeue(&p->partial, slab_slot(s, slot, 1u - i)); slab_enqueue(&p->empty, s);
+    }
     atomic_fetch_add_explicit(&p->returned, 1, memory_order_relaxed);
     pthread_mutex_unlock(&c->pool_mu);
 }
@@ -197,40 +265,34 @@ static node *node_new(core *c, int leaf) {
     atomic_init(&n->rc, 1); n->cnt = 0; n->leaf = (uint16_t)leaf; n->add_high = 0;
     return n;
 }
-/* Coarse whole-slab trimming remains for the separate performance bead.
- * Reservations, return completion and core teardown share pool_mu, so the last
- * snapshot releaser may trim immediately without racing an owner reservation.
- * force==2 is unused-reservation rollback, also safe with pinned snapshots. */
+/* Only completed slabs are queued: work follows reclaimed storage, never
+ * the live pool. Reservations hold pool_mu until their operation finishes.
+ * Forced rollback/final-owner cleanup drains the same queue with pinned roots. */
 static void pool_trim_locked(core *c, int force) {
-    if (force != 2 && atomic_load_explicit(&c->rc, memory_order_acquire) != 1) return;
-    if (!force && atomic_load_explicit(&c->pool[0].returned, memory_order_relaxed) < 64 &&
+    if ((!force || force == TRIM_QUERY) && atomic_load_explicit(&c->pool[0].returned, memory_order_relaxed) < 64 &&
         atomic_load_explicit(&c->pool[1].returned, memory_order_relaxed) < 64) return;
+    /* Queries/takes consume a fixed batch even if workers queued a large
+     * retired version. Mutation/release cleanup follows its reclaimed work. */
+    size_t budget = force == TRIM_QUERY ? 64 : SIZE_MAX;
     for (unsigned pi = 0; pi < 3; pi++) {
-        node_pool *p = &c->pool[pi]; void *slab = p->slabs;
-        p->fl = NULL; p->nfree = 0; p->slabs = NULL; p->nslabs = 0;
-        atomic_store_explicit(&p->remote, NULL, memory_order_relaxed);
-        atomic_store_explicit(&p->returned, 0, memory_order_relaxed);
-        size_t slot = slot_size(pi), nn = slab_nodes(0), sz = nn * slot + 16;
-        while (slab) {
-            uint8_t *raw = slab; void **tail = (void **)(void *)(raw + sz - 16); void *next = tail[0];
-            int live = 0;
-            for (size_t i = 0; i < nn; i++) {
-                node *n = (node *)(void *)(raw + i * slot);
-                if (atomic_load_explicit(&n->rc, memory_order_relaxed)) live = 1;
-            }
-            if (!live) { UNPOISON(raw, sz); c->a.free(c->a.ctx, raw, sz); }
-            else {
-                tail[0] = p->slabs; p->slabs = raw; p->nslabs++;
-                for (size_t i = 0; i < nn; i++) {
-                    node *n = (node *)(void *)(raw + i * slot);
-                    if (!atomic_load_explicit(&n->rc, memory_order_relaxed)) {
-                        n->nextfree = p->fl; p->fl = n; p->nfree++;
-                    }
-                }
-            }
-            slab = next;
+        node_pool *p = &c->pool[pi];
+        size_t sz = 2 * slot_size(pi) + SLAB_OVERHEAD;
+        while (p->empty && budget) {
+#ifdef PIECE_TESTING
+            c->stats.slabs_scanned++;
+#endif
+            node *s = p->empty; slab_dequeue(&p->empty, s);
+            size_t slot = slot_size(pi); slab_tail *tail = slab_end(s, slot); node *prev = slab_prev(tail);
+            if (prev) slab_end(prev, slot)->next = tail->next; else p->slabs = tail->next;
+            if (tail->next) slab_set_prev(slab_end(tail->next, slot), prev);
+            p->nslabs--; p->nfree -= 2;
+            UNPOISON(s, sz); c->a.free(c->a.ctx, s, sz);
+            budget--;
         }
     }
+    /* Preserve the wakeup while a bounded drain still has queued work. */
+    if (!c->pool[0].empty && !c->pool[1].empty && !c->pool[2].empty)
+        for (unsigned pi = 0; pi < 3; pi++) atomic_store_explicit(&c->pool[pi].returned, 0, memory_order_relaxed);
 }
 static void pool_trim(core *c, int force) {
     pthread_mutex_lock(&c->pool_mu);
@@ -353,6 +415,12 @@ static add_store *add_store_prefix(core *c, uint64_t len) {
     }
     return v;
 }
+static inline uint64_t nl_count(const uint8_t *p, size_t n);
+static uint64_t chunk_prefix(const add_chunk *ch, size_t off) {
+    size_t block = off / NL_BLOCK, edge = off % NL_BLOCK;
+    if (block == NL_BLOCKS) return ch->nl_total;
+    return ch->nl_prefix[block] + (edge ? nl_count(ch->data + block * NL_BLOCK, edge) : 0);
+}
 /* Prepay a writable saved boundary before publishing the first snapshot
  * that can observe transaction bytes in it. Abort itself only swaps storage;
  * the restored edit path requires no checkpoint-specific allocation/copy. */
@@ -365,6 +433,8 @@ static int checkpoint_snapshot_storage(piece_tree *t) {
     add_chunk **tbl = atomic_load_explicit(&cp->restore->tbl, memory_order_acquire);
     size_t i = (size_t)(mark >> CH_SHIFT);
     memcpy(ch->data, tbl[i]->data, (size_t)(mark & CH_MASK));
+    memcpy(ch->nl_prefix, tbl[i]->nl_prefix, ((size_t)(mark & CH_MASK) / NL_BLOCK + 1) * sizeof ch->nl_prefix[0]);
+    ch->nl_total = (uint32_t)chunk_prefix(tbl[i], (size_t)(mark & CH_MASK));
     add_chunk *old = tbl[i]; tbl[i] = ch; chunk_unref(c, old);
     cp->boundary_private = 1; return 0;
 }
@@ -378,11 +448,11 @@ static void core_unref(core *c) {
     add_store_unref(c, c->add);
     orig_store_unref(c, c->original);
     for (unsigned pi = 0; pi < 3; pi++) {
-        node_pool *p = &c->pool[pi]; void *slab = p->slabs;
-        for (size_t k = p->nslabs; k-- > 0;) {
-            size_t sz = slab_nodes(k) * slot_size(pi) + 16;
-            void *nx = *(void **)(void *)((uint8_t *)slab + sz - 16);
-            UNPOISON(slab, sz); a.free(a.ctx, slab, sz); slab = nx;
+        node_pool *p = &c->pool[pi]; node *slab = p->slabs;
+        while (slab) {
+            size_t sz = 2 * slot_size(pi) + SLAB_OVERHEAD;
+            node *next = slab_end(slab, slot_size(pi))->next;
+            UNPOISON(slab, sz); a.free(a.ctx, slab, sz); slab = next;
         }
     }
     pthread_mutex_destroy(&c->pool_mu); a.free(a.ctx, c, sizeof *c);
@@ -424,7 +494,7 @@ static void owner_trim(piece_tree *t, int force) {
         atomic_load_explicit(&c->pool[1].returned, memory_order_relaxed) < 64) return;
     if (t->cached_snapshot && atomic_load_explicit(&t->cached_snapshot->rc, memory_order_acquire) == 1)
         snapshot_uncache(t);
-    pool_trim(c, force);
+    pool_trim(c, TRIM_QUERY);
 }
 
 static inline const uint8_t *view_data(const uint8_t *original, const add_store *v, uint64_t x) {
@@ -456,15 +526,16 @@ static int add_reserve(piece_tree *t, uint64_t n) {
         }
         add_chunk *ch = c->a.alloc(c->a.ctx, sizeof *ch);
         if (!ch) return PIECE_ERR_NOMEM;
-        atomic_init(&ch->rc, 1); tbl[v->nch++] = ch;
+        atomic_init(&ch->rc, 1); ch->nl_total = 0; ch->nl_prefix[0] = 0; tbl[v->nch++] = ch;
     }
     return 0;
 }
 /* append n bytes (space must be reserved) */
+static uint64_t add_write(core *c, uint64_t a, const uint8_t *p, size_t n);
 static void add_append(piece_tree *t, const uint8_t *p, size_t n) {
     while (n) {
         size_t room = (size_t)(CH_SIZE - (t->add_len & CH_MASK)), k = n < room ? n : room;
-        memcpy(add_ptr(t->c, t->add_len), p, k);
+        (void)add_write(t->c, t->add_len, p, k);
         t->add_len = length_add(t->add_len, k); p += k; n -= k;
     }
 }
@@ -472,6 +543,37 @@ static void add_append(piece_tree *t, const uint8_t *p, size_t n) {
 static inline uint64_t nl_count(const uint8_t *p, size_t n) {
     if (n < 48) { uint64_t r = 0; for (size_t i = 0; i < n; i++) r += p[i] == '\n'; return r; }
     return scan_count(p, n).newlines;
+}
+/* Copy and index new bytes once. No checkpoint state, allocation or old-byte
+ * recount is needed on an ordinary append, including one-byte cursor typing. */
+static uint64_t add_write(core *c, uint64_t a, const uint8_t *p, size_t n) {
+    add_chunk **tbl = atomic_load_explicit(&c->add->tbl, memory_order_acquire);
+    add_chunk *ch = tbl[a >> CH_SHIFT]; size_t off = (size_t)(a & CH_MASK);
+    uint64_t total = 0;
+    while (n) {
+        size_t room = NL_BLOCK - off % NL_BLOCK, take = n < room ? n : room;
+        uint64_t count = nl_count(p, take);
+        memcpy(ch->data + off, p, take); ch->nl_total += (uint32_t)count; total += count;
+        off += take; p += take; n -= take;
+        /* The full-chunk total may be 65536; earlier prefixes fit in u16. */
+        if (!(off % NL_BLOCK) && off < CH_SIZE) ch->nl_prefix[off / NL_BLOCK] = (uint16_t)ch->nl_total;
+    }
+    return total;
+}
+/* One chunk fragment: full blocks use cached counts; each endpoint recounts
+ * at most NL_BLOCK-1 bytes. A same-block fragment scans just its own bytes. */
+static uint64_t add_nl(const core *c, uint64_t a, size_t n) {
+    add_chunk **tbl = atomic_load_explicit(&c->add->tbl, memory_order_acquire);
+    const add_chunk *ch = tbl[a >> CH_SHIFT]; size_t lo = (size_t)(a & CH_MASK), hi = lo + n;
+    EDIT_ASSERT(hi <= CH_SIZE);
+    size_t recounted = lo / NL_BLOCK == hi / NL_BLOCK ? n : lo % NL_BLOCK + hi % NL_BLOCK;
+#ifdef PIECE_TESTING
+    ((core *)(uintptr_t)c)->stats.ref_recount_bytes += recounted;
+#else
+    (void)recounted;
+#endif
+    if (lo / NL_BLOCK == hi / NL_BLOCK) return nl_count(ch->data + lo, n);
+    return chunk_prefix(ch, hi) - chunk_prefix(ch, lo);
 }
 
 /* ------------------------------------------------------------- entries */
@@ -488,8 +590,13 @@ static void ent_split(const core *c, const ent *e, uint64_t s, ent *L, ent *R) {
     if (e->nl & UNK) { L->nl = R->nl = UNK; return; }
     if (!e->nl) { L->nl = R->nl = 0; return; }
     const uint8_t *p = ent_data(c, e->x);
-    if (s <= e->b - s) { uint64_t l = nl_count(p, (size_t)s); L->nl = l; R->nl = e->nl - l; }
-    else { uint64_t r = nl_count(p + s, (size_t)(e->b - s)); R->nl = r; L->nl = e->nl - r; }
+    if (s <= e->b - s) {
+        uint64_t l = e->x & TOP ? add_nl(c, e->x & ~TOP, (size_t)s) : nl_count(p, (size_t)s);
+        L->nl = l; R->nl = e->nl - l;
+    } else {
+        uint64_t r = e->x & TOP ? add_nl(c, (e->x & ~TOP) + s, (size_t)(e->b - s)) : nl_count(p + s, (size_t)(e->b - s));
+        R->nl = r; L->nl = e->nl - r;
+    }
 }
 static uint64_t ent_nl(const core *c, const add_store *view, const uint8_t *original, node *n, unsigned i);
 
@@ -540,7 +647,8 @@ static node *splice(core *c, node *n, unsigned i, unsigned ndel, const ent *ins,
         for (unsigned j = 0; j < nins; j++) ent_put(n, i + j, &ins[j]);
         n->cnt = (uint16_t)total; node_add_high(n); return NULL;
     }
-    ent tmp[FAN + 4]; unsigned m = 0;
+    EDIT_ASSERT(total <= 2 * FAN);
+    ent tmp[2 * FAN]; unsigned m = 0;
     for (unsigned j = 0; j < i; j++) tmp[m++] = ent_get(n, j);
     for (unsigned j = 0; j < nins; j++) tmp[m++] = ins[j];
     for (unsigned j = i + ndel; j < n->cnt; j++) tmp[m++] = ent_get(n, j);
@@ -554,26 +662,37 @@ static node *splice(core *c, node *n, unsigned i, unsigned ndel, const ent *ins,
 }
 
 /* --------------------------------------------------------------- insert */
-static node *ins_rec(core *c, node *n, uint64_t off, const ent *ne) {
+static node *ins_batch_rec(core *c, node *n, uint64_t off, const ent *ne, unsigned nne) {
+    EDIT_ASSERT(nne && nne <= REF_BATCH);
     if (n->leaf) {
-        unsigned k = 0; uint64_t cum = 0; ent rep[3]; unsigned nr, ndel = 0, at;
+        unsigned k = 0; uint64_t cum = 0; ent rep[FAN]; unsigned nr = 0, ndel = 0, at;
         for (; k < n->cnt; k++) { if (off <= cum + bytes(n, k)) break; cum += bytes(n, k); }
-        if (k == n->cnt || off == cum + bytes(n, k)) { at = k == n->cnt ? k : k + 1; rep[0] = *ne; nr = 1; }
-        else if (off == cum) { at = k; rep[0] = *ne; nr = 1; }
+        if (k == n->cnt || off == cum + bytes(n, k)) {
+            at = k == n->cnt ? k : k + 1;
+            for (unsigned j = 0; j < nne; j++) rep[nr++] = ne[j];
+        } else if (off == cum) {
+            at = k;
+            for (unsigned j = 0; j < nne; j++) rep[nr++] = ne[j];
+        }
         else {
             ent e = ent_get(n, k), L, R; ent_split(c, &e, off - cum, &L, &R);
-            rep[0] = L; rep[1] = *ne; rep[2] = R; nr = 3; ndel = 1; at = k;
+            rep[nr++] = L;
+            for (unsigned j = 0; j < nne; j++) rep[nr++] = ne[j];
+            rep[nr++] = R; ndel = 1; at = k;
         }
         return splice(c, n, at, ndel, rep, nr);
     }
     unsigned i = 0; uint64_t cum = 0;
     while (i + 1 < n->cnt && off > cum + bytes(n, i)) { cum += bytes(n, i); i++; }
     node *ch = cow(c, n->v.in.ch[i]); n->v.in.ch[i] = ch;
-    node *sib = ins_rec(c, ch, off - cum, ne);
+    node *sib = ins_batch_rec(c, ch, off - cum, ne, nne);
     ent e[2]; e[0] = summ(ch, ch);
     if (!sib) { ent_put(n, i, &e[0]); node_add_high(n); return NULL; }
     e[1] = summ(sib, sib);
     return splice(c, n, i, 1, e, 2);
+}
+static node *ins_rec(core *c, node *n, uint64_t off, const ent *ne) {
+    return ins_batch_rec(c, n, off, ne, 1);
 }
 static void root_grow(piece_tree *t, node *sib) {
     core *c = t->c; node *r = node_new(c, 0); ent e[2];
@@ -581,15 +700,16 @@ static void root_grow(piece_tree *t, node *sib) {
     ent_put(r, 0, &e[0]); ent_put(r, 1, &e[1]); r->cnt = 2; node_add_high(r);
     t->root = r; t->height++;
 }
-static void ins_piece(piece_tree *t, uint64_t off, const ent *ne) {
+static void ins_batch(piece_tree *t, uint64_t off, const ent *ne, unsigned nne) {
     t->cursor_valid = 0;
 #ifdef PIECE_TESTING
     t->c->stats.root_descents++;
 #endif
     t->root = cow(t->c, t->root);
-    node *sib = ins_rec(t->c, t->root, off, ne);
+    node *sib = ins_batch_rec(t->c, t->root, off, ne, nne);
     if (sib) root_grow(t, sib);
 }
+static void ins_piece(piece_tree *t, uint64_t off, const ent *ne) { ins_batch(t, off, ne, 1); }
 /* The cursor cache borrows flat's bounded local lookup, retaining the B+ path
  * as well as the leaf. It is usable only while that entire path is exclusive.
  * Structural changes elsewhere and snapshot_take invalidate it. */
@@ -634,9 +754,7 @@ static int cursor_extend(piece_tree *t, uint64_t off, const uint8_t *data, size_
     node *leaf = t->cursor[t->cursor_depth]; unsigned k = t->cursor_slot;
     EDIT_ASSERT(t->cursor_start + bytes(leaf, k) == off);
     EDIT_ASSERT(entry_x(leaf, k) & TOP);
-    uint64_t nl;
-    if (len == 1) { nl = data[0] == '\n'; *add_ptr(t->c, t->add_len) = data[0]; }
-    else { nl = nl_count(data, len); memcpy(add_ptr(t->c, t->add_len), data, len); }
+    uint64_t nl = add_write(t->c, t->add_len, data, len);
     leaf->add_high = length_add(t->add_len, len);
     bytes_set(leaf, k, length_add(bytes(leaf, k), len));
     if (nl) nl_st(leaf, k, nl_ld(leaf, k) + nl);
@@ -758,13 +876,21 @@ static node *del_rec(core *c, node *n, uint64_t lo, uint64_t hi) {
 
 /* ----------------------------------------------------------------- walk */
 typedef struct { node *leaf; uint64_t leaf_start, k, k_start; } walk;
-static void walk_seek(walk *w, const node *root, uint64_t pos) {
+static void walk_visit(const core *c) {
+    (void)c;
+#ifdef PIECE_TESTING
+    __atomic_fetch_add(&((core *)(uintptr_t)c)->stats.walk_nodes, 1, __ATOMIC_RELAXED);
+#endif
+}
+static void walk_seek(const core *c, walk *w, const node *root, uint64_t pos) {
     const node *n = root; uint64_t base = 0;
     while (!n->leaf) {
+        walk_visit(c);
         unsigned i = 0;
         while (i + 1 < n->cnt && pos >= base + bytes(n, i)) { base += bytes(n, i); i++; }
         n = n->v.in.ch[i];
     }
+    walk_visit(c);
     unsigned k = 0; uint64_t ks = base;
     while (k + 1 < n->cnt && pos >= ks + bytes(n, k)) { ks += bytes(n, k); k++; }
     w->leaf = (node *)(uintptr_t)n; w->k = k; w->k_start = ks;
@@ -772,10 +898,10 @@ static void walk_seek(walk *w, const node *root, uint64_t pos) {
     w->leaf_start = base;
 }
 /* next entry fragment at *pos; returns 0 at end */
-static int walk_next(walk *w, const node *root, uint64_t total, uint64_t *pos, uint64_t *x, uint64_t *skip, uint64_t *n) {
+static int walk_next(const core *c, walk *w, const node *root, uint64_t total, uint64_t *pos, uint64_t *x, uint64_t *skip, uint64_t *n) {
     if (!w->leaf || w->k >= w->leaf->cnt) {
         if (*pos >= total) return 0;
-        walk_seek(w, root, *pos);
+        walk_seek(c, w, root, *pos);
     }
     node *l = w->leaf; unsigned k = (unsigned)w->k;
     *x = entry_x(l, k); *skip = *pos - w->k_start; *n = bytes(l, k) - *skip;
@@ -784,10 +910,60 @@ static int walk_next(walk *w, const node *root, uint64_t total, uint64_t *pos, u
 }
 static uint64_t node_total(const node *n) { uint64_t s = 0; for (unsigned i = 0; i < n->cnt; i++) s = length_add(s, bytes(n, i)); return s; }
 
-static int read_range(const add_store *v, const uint8_t *original, const node *root, uint64_t total, uint64_t off, uint8_t *dst, size_t len) {
+/* Call-local traversal for ranges. Each ancestor is entered once; advancing
+ * leaves climbs the saved path and descends only the next intersected subtree.
+ * The public iterator keeps its frozen four-word scratch representation. */
+typedef struct range_walk {
+    walk entry; const node *path[MAXH]; unsigned index[MAXH], depth;
+} range_walk;
+static void range_seek(const core *c, range_walk *w, const node *root, uint64_t pos) {
+    const node *n = root; uint64_t base = 0; w->depth = 0;
+    walk_visit(c);
+    while (!n->leaf) {
+        unsigned i = 0;
+        while (i + 1 < n->cnt && pos >= base + bytes(n, i)) { base += bytes(n, i); i++; }
+        EDIT_ASSERT(w->depth < MAXH);
+        w->path[w->depth] = n; w->index[w->depth++] = i;
+        n = n->v.in.ch[i]; walk_visit(c);
+    }
+    walk *e = &w->entry; e->leaf = (node *)(uintptr_t)n; e->leaf_start = base;
+    e->k = 0; e->k_start = base;
+    while (e->k + 1 < n->cnt && pos >= e->k_start + bytes(n, (unsigned)e->k)) {
+        e->k_start += bytes(n, (unsigned)e->k); e->k++;
+    }
+}
+static int range_advance(const core *c, range_walk *w) {
+    while (w->depth) {
+        unsigned d = w->depth - 1; const node *parent = w->path[d];
+        if (w->index[d] + 1 == parent->cnt) { w->depth--; continue; }
+        const node *n = parent->v.in.ch[++w->index[d]]; walk_visit(c);
+        while (!n->leaf) {
+            EDIT_ASSERT(w->depth < MAXH);
+            w->path[w->depth] = n; w->index[w->depth++] = 0;
+            n = n->v.in.ch[0]; walk_visit(c);
+        }
+        w->entry.leaf = (node *)(uintptr_t)n; w->entry.k = 0;
+        w->entry.leaf_start = w->entry.k_start;
+        return 1;
+    }
+    return 0;
+}
+static int range_next(const core *c, range_walk *w, const node *root, uint64_t total,
+                      uint64_t *pos, uint64_t *x, uint64_t *skip, uint64_t *n) {
+    if (*pos >= total) return 0;
+    walk *e = &w->entry;
+    if (!e->leaf) range_seek(c, w, root, *pos);
+    else if (e->k == e->leaf->cnt && !range_advance(c, w)) return 0;
+    unsigned k = (unsigned)e->k;
+    *x = entry_x(e->leaf, k); *skip = *pos - e->k_start; *n = bytes(e->leaf, k) - *skip;
+    *pos += *n; e->k_start += bytes(e->leaf, k); e->k++;
+    return 1;
+}
+
+static int read_range(const core *c, const add_store *v, const uint8_t *original, const node *root, uint64_t total, uint64_t off, uint8_t *dst, size_t len) {
     if (off > total || len > total - off) return PIECE_ERR_RANGE;
-    walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n;
-    while (pos < end && walk_next(&w, root, total, &pos, &x, &skip, &n)) {
+    range_walk w = {0}; uint64_t pos = off, end = off + len, x, skip, n;
+    while (pos < end && range_next(c, &w, root, total, &pos, &x, &skip, &n)) {
         uint64_t take = n < end - (pos - n) ? n : end - (pos - n);
         memcpy(dst, view_data(original, v, x) + skip, (size_t)take); dst += take;
         if (take < n) break;
@@ -859,7 +1035,7 @@ piece_tree *piece_create(const piece_allocator *a) {
     if (!c->add) { pthread_mutex_destroy(&c->pool_mu); a->free(a->ctx, c, sizeof *c); return NULL; }
     c->original = orig_store_new(c, NULL, 0, 0, NULL);
     if (!c->original) { core_unref(c); return NULL; }
-    for (unsigned pi = 0; pi < 3; pi++) { atomic_init(&c->pool[pi].remote, NULL); atomic_init(&c->pool[pi].returned, 0); }
+    for (unsigned pi = 0; pi < 3; pi++) atomic_init(&c->pool[pi].returned, 0);
     piece_tree *t = a->alloc(a->ctx, sizeof *t);
     if (!t) { core_unref(c); return NULL; }
     memset(t, 0, sizeof *t); t->c = c;
@@ -968,8 +1144,7 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *data, size_t len) {
     uint64_t cur = off; size_t rem = len;
     while (rem) {
         size_t room = (size_t)(CH_SIZE - (t->add_len & CH_MASK)), seg = rem < room ? rem : room;
-        uint64_t a0 = t->add_len, nl = nl_count(data, seg);
-        memcpy(add_ptr(c, a0), data, seg);
+        uint64_t a0 = t->add_len;
         if (t->run_valid && cur == t->run_end && t->run_addend == a0 && (a0 & CH_MASK)) {
             /* The preceding path may be shared with a snapshot: own it first. */
             node *n = cow(c, t->root); t->root = n; uint64_t rel = cur;
@@ -989,22 +1164,25 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *data, size_t len) {
             EDIT_ASSERT(cursor_extend(t, cur, data, seg));
             cur = length_add(cur, seg); data += seg; rem -= seg; continue;
         }
-        ent e = { seg, nl, a0 | TOP };
+        ent e = { seg, add_write(c, a0, data, seg), a0 | TOP };
         if (!cursor_insert(t, cur, &e)) { ins_piece(t, cur, &e); if (len == 1) cursor_seek(t, cur + seg); }
         t->len = length_add(t->len, seg);
         t->add_len = length_add(a0, seg);
         t->run_valid = 1; t->run_end = length_add(cur, seg); t->run_addend = t->add_len;
         cur = length_add(cur, seg); data += seg; rem -= seg;
     }
+    /* Bulk reservations can be large. Reclaim their unused slabs on this
+     * bulk call, so a later small edit/query never inherits their cleanup. */
+    if (np > 1) pool_trim_locked(c, 2);
     t->inited = 1; return pool_done(c, 0);
 }
 
 /* collect add-buffer spans of [off, off+len); copies original fragments into the add buffer when r != NULL */
 static unsigned collect(piece_tree *t, uint64_t off, uint64_t len, piece_ref *r, uint64_t *copy_bytes) {
     core *c = t->c; uint64_t total = t->len;
-    walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n, cur = t->add_len, cb = 0;
+    range_walk w = {0}; uint64_t pos = off, end = off + len, x, skip, n, cur = t->add_len, cb = 0;
     unsigned ns = 0; int have = 0; uint64_t pend = 0;
-    while (pos < end && walk_next(&w, t->root, total, &pos, &x, &skip, &n)) {
+    while (pos < end && range_next(c, &w, t->root, total, &pos, &x, &skip, &n)) {
         uint64_t used = n < end - (pos - n) ? n : end - (pos - n), ao;
         if (x & TOP) ao = (x & ~TOP) + skip;
         else {
@@ -1065,15 +1243,15 @@ int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref) {
     t->run_valid = 0;
     if (!ref && ns > PIECE_REF_SPANS) {
         if ((r = add_reserve(t, cb))) return pool_done(c, r);
-        walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n;
-        while (pos < end && walk_next(&w, t->root, total, &pos, &x, &skip, &n)) {
+        range_walk w = {0}; uint64_t pos = off, end = off + len, x, skip, n;
+        while (pos < end && range_next(c, &w, t->root, total, &pos, &x, &skip, &n)) {
             uint64_t used = n < end - (pos - n) ? n : end - (pos - n);
             if (!(x & TOP)) add_append(t, ent_data(c, x) + skip, (size_t)used);
         }
     } else if (ns > PIECE_REF_SPANS) {
         if ((r = add_reserve(t, len))) return pool_done(c, r);
-        walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n, base = t->add_len;
-        while (pos < end && walk_next(&w, t->root, total, &pos, &x, &skip, &n)) {
+        range_walk w = {0}; uint64_t pos = off, end = off + len, x, skip, n, base = t->add_len;
+        while (pos < end && range_next(c, &w, t->root, total, &pos, &x, &skip, &n)) {
             uint64_t used = n < end - (pos - n) ? n : end - (pos - n);
             add_append(t, ent_data(c, x) + skip, (size_t)used);
         }
@@ -1117,17 +1295,22 @@ int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref) {
     int r = reserve_insert(t, (size_t)nseg);
     if (r) return pool_done(c, r);
     t->cursor_valid = 0; t->run_valid = 0;
-    uint64_t cur = off;
+    uint64_t cur = off, batch_bytes = 0; ent batch[REF_BATCH]; unsigned nbatch = 0;
     for (unsigned i = 0; i < ref->nspans; i++) {
         uint64_t a = ref->span[i].add_off, l = ref->span[i].len;
         while (l) {
             uint64_t room = CH_SIZE - (a & CH_MASK), n = l < room ? l : room;
-            ent e = { n, nl_count(add_ptr(c, a), (size_t)n), a | TOP };
-            ins_piece(t, cur, &e);
-            t->len = length_add(t->len, n);
-            cur = length_add(cur, n); a = length_add(a, n); l -= n;
+            batch[nbatch++] = (ent){ n, add_nl(c, a, (size_t)n), a | TOP };
+            batch_bytes = length_add(batch_bytes, n); a = length_add(a, n); l -= n;
+            if (nbatch == REF_BATCH) {
+                ins_batch(t, cur, batch, nbatch);
+                t->len = length_add(t->len, batch_bytes); cur = length_add(cur, batch_bytes);
+                nbatch = 0; batch_bytes = 0;
+            }
         }
     }
+    if (nbatch) { ins_batch(t, cur, batch, nbatch); t->len = length_add(t->len, batch_bytes); }
+    if (nseg > 1) pool_trim_locked(c, 2);
     return pool_done(c, 0);
 }
 
@@ -1190,6 +1373,13 @@ void piece_checkpoint_abort(piece_checkpoint *cp) {
     }
     old->sealed = 1; add_store_prune(c, old); pthread_mutex_unlock(&old->mu);
     add_store_unref(c, old);
+    /* Restore the ordinary append cache now, never on a later inactive edit.
+     * A surviving transaction snapshot has its prepaid separate boundary. */
+    if (t->add_len & CH_MASK) {
+        add_chunk **tbl = atomic_load_explicit(&c->add->tbl, memory_order_relaxed);
+        add_chunk *tail = tbl[t->add_len >> CH_SHIFT];
+        tail->nl_total = (uint32_t)chunk_prefix(tail, (size_t)(t->add_len & CH_MASK));
+    }
     c->a.free(c->a.ctx, cp, sizeof *cp); pool_trim(c, 2);
 }
 
@@ -1202,7 +1392,7 @@ static uint64_t count_pieces(const node *n) {
 uint64_t piece_piece_count(const piece_tree *t) { owner_trim((piece_tree *)(uintptr_t)t, t->len == 0); return count_pieces(t->root); }
 uint64_t piece_line_count(const piece_tree *t) { return tree_nl(t->c, t->c->add, t->c->orig, t->root) + 1; }
 int piece_read(const piece_tree *t, uint64_t off, uint8_t *dst, size_t len) {
-    return read_range(t->c->add, t->c->orig, t->root, node_total(t->root), off, dst, len);
+    return read_range(t->c, t->c->add, t->c->orig, t->root, node_total(t->root), off, dst, len);
 }
 uint64_t piece_line_to_byte(const piece_tree *t, uint64_t line) { return l2b(t->c, t->c->add, t->c->orig, t->root, node_total(t->root), line); }
 uint64_t piece_byte_to_line(const piece_tree *t, uint64_t off) { return b2l(t->c, t->c->add, t->c->orig, t->root, node_total(t->root), off); }
@@ -1247,7 +1437,7 @@ piece_snapshot *piece_snapshot_retain(piece_snapshot *s) {
 void piece_snapshot_release(piece_snapshot *s) { snapshot_drop(s, 1); }
 uint64_t piece_snapshot_len(const piece_snapshot *s) { return s->len; }
 uint64_t piece_snapshot_line_count(const piece_snapshot *s) { return tree_nl(s->c, s->add, s->original->data, s->root) + 1; }
-int piece_snapshot_read(const piece_snapshot *s, uint64_t off, uint8_t *dst, size_t len) { return read_range(s->add, s->original->data, s->root, s->len, off, dst, len); }
+int piece_snapshot_read(const piece_snapshot *s, uint64_t off, uint8_t *dst, size_t len) { return read_range(s->c, s->add, s->original->data, s->root, s->len, off, dst, len); }
 uint64_t piece_snapshot_line_to_byte(const piece_snapshot *s, uint64_t line) { return l2b(s->c, s->add, s->original->data, s->root, s->len, line); }
 uint64_t piece_snapshot_byte_to_line(const piece_snapshot *s, uint64_t off) { return b2l(s->c, s->add, s->original->data, s->root, s->len, off); }
 
@@ -1259,12 +1449,12 @@ static void iter_begin(piece_iter *it, const void *src, int snap, uint64_t off, 
 void piece_iter_begin(piece_iter *it, const piece_tree *t, uint64_t off) { iter_begin(it, t, 0, off, node_total(t->root)); }
 void piece_iter_begin_snapshot(piece_iter *it, const piece_snapshot *s, uint64_t off) { iter_begin(it, s, 1, off, s->len); }
 int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
-    const uint8_t *original; const add_store *v; const node *root; uint64_t total;
-    if (it->is_snap) { const piece_snapshot *s = it->src; original = s->original->data; v = s->add; root = s->root; total = s->len; }
-    else { const piece_tree *t = it->src; original = t->c->orig; v = t->c->add; root = t->root; total = node_total(t->root); }
+    const core *c; const uint8_t *original; const add_store *v; const node *root; uint64_t total;
+    if (it->is_snap) { const piece_snapshot *s = it->src; c = s->c; original = s->original->data; v = s->add; root = s->root; total = s->len; }
+    else { const piece_tree *t = it->src; c = t->c; original = t->c->orig; v = t->c->add; root = t->root; total = node_total(t->root); }
     walk w; w.leaf = (node *)(uintptr_t)it->priv[0]; w.leaf_start = it->priv[1]; w.k = it->priv[2]; w.k_start = it->priv[3];
     uint64_t x, skip, len;
-    if (!walk_next(&w, root, total, &it->pos, &x, &skip, &len)) return 0;
+    if (!walk_next(c, &w, root, total, &it->pos, &x, &skip, &len)) return 0;
     it->priv[0] = (uint64_t)(uintptr_t)w.leaf; it->priv[1] = w.leaf_start; it->priv[2] = w.k; it->priv[3] = w.k_start;
     *p = view_data(original, v, x) + skip; *n = (size_t)len;
     return 1;
@@ -1272,23 +1462,31 @@ int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
 
 #ifdef PIECE_TESTING
 piece_test_stats piece_test_get_stats(const piece_tree *t) {
-    piece_test_stats s = t->c->stats; s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; s.snapshot_bytes = SNAPSHOT_SZ; s.height = (unsigned)t->height; return s;
+    core *c = t->c; pthread_mutex_lock(&c->pool_mu);
+    piece_test_stats s = {0};
+    s.root_descents = c->stats.root_descents; s.cursor_hits = c->stats.cursor_hits;
+    s.pathcopy_bytes = c->stats.pathcopy_bytes; s.gap_deletes = c->stats.gap_deletes;
+    s.slabs_scanned = c->stats.slabs_scanned; s.pool_returns = c->stats.pool_returns;
+    s.walk_nodes = __atomic_load_n(&c->stats.walk_nodes, __ATOMIC_RELAXED);
+    s.ref_recount_bytes = c->stats.ref_recount_bytes;
+    s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; s.snapshot_bytes = SNAPSHOT_SZ;
+    s.slab_overhead = SLAB_OVERHEAD; s.height = (unsigned)t->height;
+    pthread_mutex_unlock(&c->pool_mu); return s;
 }
 piece_test_memory piece_test_get_memory(const piece_tree *t) {
     core *c = t->c; piece_test_memory m = {0};
     m.deleted_original = t->deleted_original; m.fallback_add = t->fallback_add;
     pthread_mutex_lock(&c->pool_mu);
     for (unsigned pi = 0; pi < 3; pi++) {
-        size_t nn = slab_nodes(0), slot = slot_size(pi), sz = nn * slot + 16;
-        for (void *slab = c->pool[pi].slabs; slab;) {
-            uint8_t *raw = slab; m.slabs[pi]++;
-            for (size_t i = 0; i < nn; i++) {
-                node *n = (node *)(void *)(raw + i * slot);
+        size_t slot = slot_size(pi);
+        for (node *slab = c->pool[pi].slabs; slab; slab = slab_end(slab, slot)->next) {
+            m.slabs[pi]++;
+            for (unsigned i = 0; i < 2; i++) {
+                node *n = slab_slot(slab, slot, i);
                 if (!atomic_load_explicit(&n->rc, memory_order_relaxed)) continue;
                 m.live[pi]++;
                 if (!pi) { m.leaf_pieces += n->cnt; if (n->cnt < FAN / 2) m.underfull_leaves++; }
             }
-            slab = *(void **)(void *)(raw + sz - 16);
         }
     }
     pthread_mutex_unlock(&c->pool_mu); return m;
