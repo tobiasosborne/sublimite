@@ -159,7 +159,7 @@ also compiled each bench explicitly with Clang, the required warning flags,
 `build/san/libedit.a` and the same libraries as its release link, then ran
 `--pace-self-check` with leak detection disabled. Both passed.
 
-## Real-display run (2026-10-09 16:52–16:53, batch 2, Tobias's go 16:10)
+## Real-display run (2026-10-09 16:52–16:53, batch 2) — EXTERNAL display (HDMI-1, 60 Hz), superseded by batch 3 below
 `EDIT_ALLOW_REAL_DISPLAY=1 DISPLAY=:0`, power "Not charging" [AC], 1-min load 14.7–15.3 (about 10 workers running), panel refresh measured 16.67 ms (60 Hz). 600 refresh-paced frames each, TRACK:
 
 | Backend / atlas | missed refreshes / 600 | longest stall | notes |
@@ -169,4 +169,16 @@ also compiled each bench explicitly with Clang, the required warning flags,
 | raster 15 px | 316 | 66.6 ms | strips p50 ≈ 5.5–6.2 ms each under load; ingress→T5 16.1/36.3 ms |
 | raster 30 px | 75 | 50.1 ms | |
 
-Reading (policy: notes, not beads): under load the 4-worker CPU raster cannot hold 60 Hz scrolling at 15 px; EGL nearly can (1–3 misses). This supports switching the editor's single backend call site to EGL (follow-up).
+Batch 2 ran on the external HDMI display (Tobias, 16:40), and desktop notifications were not muted, so its longest-stall numbers may include a notification popup. Kept for reference only.
+
+## Real-display run on the internal panel (2026-10-09 17:02:15–17:02:45, batch 3)
+`xrandr`: eDP-1 2880x1800+0+0 at **90.00 Hz** (primary; HDMI-1 1920x1080+2880+0 at 60 Hz also connected). Bench windows verified by `wmctrl -lpG` at 0,128 2880x1666, i.e. on eDP-1 (210 samples). Cinnamon notifications muted for the batch (`org.cinnamon.desktop.notifications display-notifications` false, restored by trap at 17:04:52); no notification entries in the user journal for the window. Power "Not charging" [AC], load 6–8. Measured display interval p50 11.11 ms. 600 refresh-paced frames each, TRACK:
+
+| Backend / atlas | missed refreshes / 600 | longest stall | display interval p50 / p99 |
+|---|---|---|---|
+| **EGL 15 px** | **0** | 14.4 ms | 11.11 / 11.45 ms |
+| **EGL 30 px** | **0** | 11.9 ms | 11.12 / 11.43 ms |
+| raster 15 px | 41 | 32.9 ms | 11.13 / 22.42 ms |
+| raster 30 px | 52 | 36.4 ms | 11.13 / 22.37 ms |
+
+Reading: on the internal 90 Hz panel EGL holds every refresh at both atlas sizes under load 6–8; the CPU raster misses 7–9 %. Consultant 17:00: the editor's backend call site switches to EGL with raster fallback (edit-zzj.15).
