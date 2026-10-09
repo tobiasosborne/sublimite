@@ -1,5 +1,33 @@
 # Work module
 
+P1.8d (edit-4w1.51 + edit-e6x.25) adds generation/lease-selective mailbox
+receive, optional registered dispatch, physical lease-completion acknowledgement,
+and atomic all-or-nothing batch enqueue. Lineidx adopts only sealed ranges
+delivered by work validation; source retirement uses the public completion API.
+Raster submits its entire strip batch atomically and has no failed-submit
+waiting rollback. Existing work callers and signatures remain source-compatible.
+See `docs/decisions/P1.8d.md` for contracts and red/green evidence.
+
+Selective receive keeps foreign messages/reservations in their worker ring;
+a foreign head continues to own ring capacity until its client/shared dispatcher
+drains it. Registered handlers let existing ordinary drains safely deliver
+owned results. Unbind before freeing receiver state. Slot completion identities
+do not wrap within a pool lifetime; discard handles before reinitialization.
+New APIs allocate nothing; the release guard covers batch, bind, receive and
+completion query. Default tests include both formerly opt-in review probes.
+
+Release probes, expanded work/lineidx checks, final GCC all/fuzz builds,
+release allocation guard and final work TSan pass. Lineidx TSan and both fuzz
+campaigns passed. Each affected module's single TRACK bench exited successfully;
+benches and campaigns preceded the final dormant-cursor wrap guard, which is
+covered by the default work suite and final TSan. Final full ASan/UBSan validation
+after that guard passes, including live raster conformance and replay CLI.
+No assigned implementation or test blocker remains. All evidence is
+recorded in P1.8d. Verify new cases with release or sanitizer `work_test receive`,
+`work_test batch`, `lineidx_test --review=13`, and `raster_test --review 4`.
+Keep `DISPLAY=:99 EDIT_DISPLAY=:99`; sanitizer workers use
+`ASAN_OPTIONS=detect_leaks=0`. Broader commands remain below.
+
 P1.8c (edit-4w1.49) implements work-scan-1 §§1–8, 15, 17, 18. Fixed recursive
 drain, heap caller alignment, epoch wrap, queued shutdown reservations,
 inactive-pool submission, synchronization failure unwinding, bulk cancellation

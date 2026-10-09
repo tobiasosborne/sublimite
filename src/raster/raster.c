@@ -125,8 +125,8 @@ static void strip_job_fn(work_ctx *c)
     publish_completion(c, &m);
 }
 
-/* UI only. A failed submit cancels its jobs before returning and their stale
- * messages are dropped by work; the retained pixmap is never touched. */
+/* UI only. Atomic batch refusal starts no jobs; upload requires a validated
+ * owned strip completion. */
 static void upload_strip(cpu_state *st, uint32_t index)
 {
     /* Stage only off-screen pixels. Disjoint job row runs allow the server's
@@ -376,22 +376,16 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     st->fence_done = false; st->present_done = false; st->present_issued = false;
     st->fence_handle = (work_handle){0};
     st->pending = njobs;
+    work_job batch[RASTER_JOBS];
     for (uint32_t j = 0; j < njobs; j++) {
         st->jobs[j].st = st; st->jobs[j].index = j; st->jobs[j].njobs = njobs;
-        work_job job = {strip_job_fn, &st->jobs[j], g->frame_id, WORK_RASTER};
-        work_handle h = work_submit(st->pool, job);
-        if (h.epoch == 0) {
-            for (size_t k = 0; k < st->nhandles; k++) work_cancel(st->pool, st->handles[k]);
-            /* wait for jobs already started: they only touch backend-owned memory */
-            for (size_t k = 0; k < st->nhandles; k++)
-                while (atomic_load_explicit(&st->pool->slots[st->handles[k].slot].busy, memory_order_acquire) &&
-                       atomic_load_explicit(&st->pool->slots[st->handles[k].slot].epoch, memory_order_acquire) == st->handles[k].epoch + 1u) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); }
-            st->nhandles = 0;
-            st->pending = 0;
-            return RENDER_ERR_CAPACITY;
-        }
-        st->handles[st->nhandles++] = h;
+        batch[j] = (work_job){strip_job_fn, &st->jobs[j], g->frame_id, WORK_RASTER};
     }
+    if (work_submit_batch(st->pool, batch, njobs, st->handles) != 0) {
+        st->pending = 0;
+        return RENDER_ERR_CAPACITY;
+    }
+    st->nhandles = njobs;
     st->have_frame = true;
     return RENDER_OK;
 }

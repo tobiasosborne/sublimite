@@ -723,6 +723,14 @@ static void test_allocations(void)
     result("section17 allocation_guard", before);
 }
 
+static void test_selective_receive(void);
+static void test_atomic_batch(void);
+static void test_receive_slices(void);
+static void test_receive_routes(void);
+static void test_finished_leases(void);
+static void test_batch_contracts(void);
+static void test_new_api_allocations(void);
+static void test_dormant_receive_wrap(void);
 int main(int argc, char **argv)
 {
     resolve_sync();
@@ -733,10 +741,340 @@ int main(int argc, char **argv)
         {"7", test_churn}, {"8", test_slice}, {"15", test_live_ordering},
         {"15", test_full_wrap}, {"15", test_state_machine},
         {"17", test_allocations}, {"18", test_shutdown_stamp},
-        {"basic", test_reservations}, {"8", test_budget_controls}, {"7", test_cancel_fifo}
+        {"basic", test_reservations}, {"8", test_budget_controls}, {"7", test_cancel_fifo},
+        {"receive", test_selective_receive}, {"batch", test_atomic_batch},
+        {"receive", test_receive_slices}, {"receive", test_receive_routes},
+        {"receive", test_finished_leases}, {"batch", test_batch_contracts},
+        {"receive", test_dormant_receive_wrap},
+        {"17", test_new_api_allocations}
     };
     for (size_t i = 0; i < sizeof tests / sizeof tests[0]; i++)
         if (argc == 1 || strcmp(argv[1], tests[i].name) == 0) tests[i].fn();
     printf("work_test: %s\n", atomic_load(&fails) ? "FAIL" : "ok");
     return atomic_load(&fails) ? 1 : 0;
+}
+
+typedef struct selective_collection { work_handle h; uint32_t generation, next; size_t n; } selective_collection;
+static void collect_selected(const work_msg *m, void *arg)
+{
+    selective_collection *s = arg;
+    CHECK(m->slot_ == s->h.slot && m->epoch_ == s->h.epoch);
+    CHECK(m->generation == s->generation);
+    CHECK(m->kind == s->next++);
+    s->n++;
+}
+static void test_selective_receive(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    fixture foreign = {.n = 3}, selected = {.n = 2};
+    work_handle a = work_submit(&pool, (work_job){job_pub, &foreign, 10, WORK_BULK});
+    CHECK(a.epoch); wait_finished(a);
+    work_handle b = work_submit(&pool, (work_job){job_pub, &selected, 11, WORK_BULK});
+    CHECK(b.epoch); wait_finished(b);
+    selective_collection received = {.h = b, .generation = 11};
+    (void)work_mailbox_receive_bounded(&pool, b, 11, collect_selected, &received, WORK_MAILBOX_CAP, 0);
+    CHECK(received.n == 2);
+    CHECK(atomic_load(&pool.slots[a.slot].pending) == 3);
+    CHECK(atomic_load(&pool.slots[b.slot].pending) == 0);
+    collection others = {0};
+    (void)work_mailbox_drain_bounded(&pool, collect, &others, WORK_MAILBOX_CAP, 0);
+    CHECK(others.n == 3);
+    printf("work_test: receive selected=%zu foreign=%zu\n", received.n, others.n);
+    work_pool_shutdown(&pool);
+    result("selective_receive", before);
+}
+static void test_atomic_batch(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    fixture blocked = {0}, queued = {0}, batch = {0};
+    work_handle blocker = work_submit(&pool, (work_job){job_block, &blocked, 0, WORK_BULK});
+    CHECK(blocker.epoch); (void)wait_value(&blocked.started, 1);
+    work_handle fill[WORK_MAX_JOBS - 3u];
+    for (size_t i = 0; i < WORK_MAX_JOBS - 3u; i++) {
+        fill[i] = work_submit(&pool, (work_job){job_noop, &queued, 0, WORK_BULK});
+        CHECK(fill[i].epoch);
+    }
+    work_job jobs[4]; work_handle handles[4], untouched[4];
+    for (size_t i = 0; i < 4; i++) {
+        jobs[i] = (work_job){job_noop, &batch, 22, WORK_BULK};
+        handles[i] = (work_handle){UINT32_MAX, UINT32_MAX};
+    }
+    memcpy(untouched, handles, sizeof handles);
+    uint32_t count_before = pool.queue[WORK_BULK].count;
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(memcmp(handles, untouched, sizeof handles) == 0);
+    CHECK(pool.queue[WORK_BULK].count == count_before);
+    CHECK(atomic_load(&pool.slots[WORK_MAX_JOBS - 2u].epoch) == 1);
+    CHECK(atomic_load(&pool.slots[WORK_MAX_JOBS - 1u].epoch) == 1);
+    printf("work_test: batch fail_at=3 queue_delta=%u handles_unchanged=%d\n",
+        pool.queue[WORK_BULK].count - count_before, memcmp(handles, untouched, sizeof handles) == 0);
+    for (size_t i = 0; i < WORK_MAX_JOBS - 3u; i++) work_cancel(&pool, fill[i]);
+    work_cancel(&pool, blocker); wait_finished(blocker);
+    work_pool_shutdown(&pool);
+    CHECK(atomic_load(&batch.ran) == 0);
+    result("atomic_batch", before);
+}
+
+static void test_receive_slices(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    uint32_t origin = UINT32_MAX - 2u;
+    atomic_store(&pool.mb[0].head, origin);
+    atomic_store(&pool.mb[0].tail, origin);
+    fixture foreign = {.n = 129}, target = {.n = 3};
+    work_handle a = work_submit(&pool, (work_job){job_pub, &foreign, 30, WORK_BULK});
+    CHECK(a.epoch); wait_finished(a);
+    work_handle b = work_submit(&pool, (work_job){job_pub, &target, 31, WORK_BULK});
+    CHECK(b.epoch); wait_finished(b);
+    selective_collection received = {.h = b, .generation = 31};
+    CHECK(work_mailbox_receive_bounded(&pool, b, 32, collect_selected, &received, 130, 0) == 0);
+    CHECK(atomic_load(&pool.slots[b.slot].pending) == 3);
+    CHECK(work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 0, 0) == 0);
+    CHECK(work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, WORK_MAILBOX_CAP, trace_now_ns()) == 0);
+    for (size_t i = 0; i < 160 && received.n < 3; i++)
+        (void)work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 1, 0);
+    CHECK(received.n == 3);
+    CHECK(atomic_load(&pool.mb[0].head) == origin); /* foreign head still owns capacity */
+    CHECK(atomic_load(&pool.slots[a.slot].pending) == 129);
+    struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
+    CHECK(poll(&fd, 1, 0) == 1 && (fd.revents & POLLIN));
+    collection others = {0};
+    while (work_mailbox_pending(&pool))
+        (void)work_mailbox_drain_bounded(&pool, collect, &others, 1, 0);
+    CHECK(others.n == 129);
+    CHECK(atomic_load(&pool.mb[0].head) == origin + 132u);
+    CHECK(atomic_load(&pool.slots[a.slot].pending) == 0);
+    work_pool_shutdown(&pool);
+    result("receive_slices_generation_wrap_continuation", before);
+}
+
+typedef struct bound_collection { selective_collection selected; size_t nested; } bound_collection;
+static void bound_cb(const work_msg *m, void *arg)
+{
+    bound_collection *bound = arg;
+    collect_selected(m, &bound->selected);
+    CHECK(atomic_load(&pool.slots[m->slot_].pending) > 0);
+    bound->nested += work_mailbox_receive_bounded(&pool, bound->selected.h,
+        bound->selected.generation, discard, NULL, WORK_MAILBOX_CAP, 0);
+    bound->nested += work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+}
+static void test_receive_routes(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(1)) return;
+    fixture target = {.n = 3}, foreign = {.n = 2};
+    work_handle a = work_submit(&pool, (work_job){job_pub, &target, 41, WORK_BULK});
+    CHECK(a.epoch); wait_finished(a);
+    work_handle b = work_submit(&pool, (work_job){job_pub, &foreign, 42, WORK_RASTER});
+    CHECK(b.epoch); wait_finished(b);
+    bound_collection bound = {.selected = {.h = a, .generation = 41}};
+    CHECK(work_mailbox_bind(&pool, a, 40, bound_cb, &bound) == -1);
+    CHECK(work_mailbox_bind(&pool, a, 41, bound_cb, &bound) == 0);
+    selective_collection others = {.h = b, .generation = 42};
+    CHECK(work_mailbox_drain_bounded(&pool, collect_selected, &others, WORK_MAILBOX_CAP, 0) == 5);
+    CHECK(bound.selected.n == 3 && bound.nested == 0 && others.n == 2);
+    work_handle reuse = work_submit(&pool, (work_job){job_pub, &target, 43, WORK_BULK});
+    CHECK(reuse.epoch && reuse.slot == a.slot); wait_finished(reuse);
+    bound.selected = (selective_collection){.h = reuse, .generation = 43};
+    CHECK(work_mailbox_bind(&pool, reuse, 43, bound_cb, &bound) == 0);
+    CHECK(work_mailbox_bind(&pool, a, 41, NULL, NULL) == 0); /* cannot erase replacement binding */
+    CHECK(work_mailbox_receive_bounded(&pool, reuse, 43, discard, NULL, WORK_MAILBOX_CAP, 0) == 3);
+    CHECK(bound.selected.n == 3);
+    work_handle cancelled = work_submit(&pool, (work_job){job_pub, &target, 44, WORK_BULK});
+    CHECK(cancelled.epoch); wait_finished(cancelled);
+    bound.selected = (selective_collection){.h = cancelled, .generation = 44};
+    CHECK(work_mailbox_bind(&pool, cancelled, 44, bound_cb, &bound) == 0);
+    work_cancel(&pool, cancelled);
+    CHECK(work_mailbox_receive_bounded(&pool, cancelled, 44, bound_cb, &bound, WORK_MAILBOX_CAP, 0) == 0);
+    CHECK(bound.selected.n == 0 && atomic_load(&pool.slots[cancelled.slot].pending) == 0);
+    CHECK(work_mailbox_bind(&pool, cancelled, 44, NULL, NULL) == 0);
+    work_handle shutdown = work_submit(&pool, (work_job){job_pub, &target, 45, WORK_BULK});
+    CHECK(shutdown.epoch); wait_finished(shutdown);
+    work_pool_shutdown(&pool);
+    CHECK(work_mailbox_receive_bounded(&pool, shutdown, 45, discard, NULL, WORK_MAILBOX_CAP, 0) == 0);
+    CHECK(!work_mailbox_pending(&pool));
+    result("receive_binding_cancel_shutdown_reentrancy", before);
+}
+
+static void test_finished_leases(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    fixture first = {0}, second = {0}, never_run = {0};
+    work_handle done = work_submit(&pool, (work_job){job_noop, &first, 1, WORK_BULK});
+    CHECK(done.epoch); wait_finished(done);
+    CHECK(work_handle_finished(&pool, done));
+    work_handle live = work_submit(&pool, (work_job){job_block, &second, 2, WORK_BULK});
+    CHECK(live.slot == done.slot && live.epoch == done.epoch + 1u);
+    (void)wait_value(&second.started, 1);
+    CHECK(work_handle_finished(&pool, done)); /* epoch+1 is replacement, not cancellation */
+    CHECK(!work_handle_finished(&pool, live));
+    work_handle queued = work_submit(&pool, (work_job){job_noop, &never_run, 3, WORK_BULK});
+    CHECK(queued.epoch && !work_handle_finished(&pool, queued));
+    work_cancel(&pool, queued);
+    CHECK(work_handle_finished(&pool, queued) && atomic_load(&never_run.ran) == 0);
+    work_cancel(&pool, live); wait_finished(live);
+    CHECK(work_handle_finished(&pool, live));
+    work_pool_shutdown(&pool);
+    CHECK(work_handle_finished(&pool, live));
+    result("physical_lease_completion_reuse", before);
+}
+
+typedef struct batch_visibility {
+    const work_handle *handles;
+    size_t count;
+    _Atomic uint32_t ran;
+} batch_visibility;
+static void job_batch_visible(work_ctx *c)
+{
+    batch_visibility *v = c->arg;
+    /* The first dequeued job must see all outputs and immutable job inputs.
+     * This is the only bulk worker, so no later job can finish/reuse yet. */
+    for (size_t i = 0; i < v->count; i++) {
+        work_handle h = v->handles[i];
+        CHECK(h.epoch != 0 && h.slot < WORK_MAX_JOBS);
+        if (h.slot >= WORK_MAX_JOBS) continue;
+        CHECK(c->pool->slots[h.slot].job.arg == v && c->pool->slots[h.slot].job.generation == 51);
+        for (size_t j = 0; j < i; j++) CHECK(v->handles[j].slot != h.slot);
+    }
+    atomic_fetch_add_explicit(&v->ran, 1, memory_order_release);
+}
+static void test_batch_contracts(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    work_handle handles[WORK_MAX_JOBS];
+    work_job jobs[WORK_MAX_JOBS];
+    fixture pub = {.n = 1};
+    /* Undrained completions, even from physically finished jobs, own slots. */
+    for (uint32_t i = 0; i < WORK_MAX_JOBS - 2u; i++) {
+        work_handle h = work_submit(&pool, (work_job){job_pub, &pub, 50, WORK_BULK});
+        CHECK(h.epoch); wait_finished(h);
+    }
+    batch_visibility visible = {.handles = handles, .count = WORK_MAX_JOBS};
+    for (size_t i = 0; i < WORK_MAX_JOBS; i++) {
+        jobs[i] = (work_job){job_batch_visible, &visible, 51, WORK_BULK};
+        handles[i] = (work_handle){UINT32_MAX, UINT32_MAX};
+    }
+    work_handle saved[WORK_MAX_JOBS]; memcpy(saved, handles, sizeof saved);
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(memcmp(saved, handles, sizeof saved) == 0 && atomic_load(&visible.ran) == 0);
+    while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
+    jobs[3].fn = NULL;
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(memcmp(saved, handles, sizeof saved) == 0);
+    jobs[3].fn = job_batch_visible;
+    jobs[3].cls = WORK_RASTER;
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    jobs[3].cls = (work_class)42;
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    jobs[3].cls = WORK_BULK;
+    CHECK(work_submit_batch(&pool, NULL, 4, handles) == -1);
+    CHECK(work_submit_batch(&pool, jobs, 4, NULL) == -1);
+    CHECK(work_submit_batch(&pool, jobs, WORK_MAX_JOBS + 1u, handles) == -1);
+    CHECK(work_submit_batch(NULL, NULL, 0, NULL) == 0);
+    CHECK(work_submit_batch(&pool, jobs, WORK_MAX_JOBS, handles) == 0);
+    (void)wait_value(&visible.ran, WORK_MAX_JOBS);
+    for (size_t i = 0; i < WORK_MAX_JOBS; i++) {
+        wait_finished(handles[i]);
+        CHECK(work_handle_finished(&pool, handles[i]));
+    }
+    work_pool_shutdown(&pool);
+    memcpy(saved, handles, sizeof saved);
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(memcmp(saved, handles, sizeof saved) == 0);
+    result("batch_pending_invalid_full_publication_shutdown", before);
+
+    if (!init_pool(0)) return;
+    for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) atomic_store(&pool.slots[i].epoch, UINT32_MAX - 1u);
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(memcmp(saved, handles, sizeof saved) == 0 && pool.queue[0].count == 0);
+    work_pool_shutdown(&pool);
+    result("batch_retired_identities", before);
+
+    if (!init_pool(1)) return;
+    fixture blocked = {0}, cancelled = {0}, raster = {.n = 1};
+    work_handle blocker = work_submit(&pool, (work_job){job_block, &blocked, 0, WORK_BULK});
+    CHECK(blocker.epoch); (void)wait_value(&blocked.started, 1);
+    size_t shared = WORK_MAX_JOBS - WORK_RASTER_RESERVE;
+    for (size_t i = 0; i < shared - 1; i++) jobs[i] = (work_job){job_noop, &cancelled, 52, WORK_BULK};
+    jobs[shared - 1] = (work_job){job_pub, &raster, 53, WORK_RASTER};
+    CHECK(work_submit_batch(&pool, jobs, shared, handles) == 0);
+    wait_finished(handles[shared - 1]);
+    CHECK(handles[shared - 1].slot >= shared);
+    for (size_t i = 0; i < shared - 1; i++) work_cancel(&pool, handles[i]);
+    CHECK(atomic_load(&cancelled.ran) == 0);
+    work_cancel(&pool, blocker); wait_finished(blocker);
+    while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
+    work_pool_shutdown(&pool);
+    result("batch_mixed_foreground_reserve_cancellation", before);
+}
+
+static void test_new_api_allocations(void)
+{
+    if (!edit_malloc_guard_active()) return; /* release guard covered by test_allocations */
+    int before = atomic_load(&fails);
+    if (!init_pool(1)) return;
+    fixture pub = {.n = 1};
+    work_job jobs[4]; work_handle handles[4];
+    for (size_t i = 0; i < 4; i++) jobs[i] = (work_job){job_pub, &pub, 61, WORK_RASTER};
+    edit_malloc_guard_begin();
+    CHECK(work_submit_batch(&pool, jobs, 4, handles) == 0);
+    for (size_t i = 0; i < 4; i++) {
+        wait_finished(handles[i]);
+        CHECK(work_handle_finished(&pool, handles[i]));
+        CHECK(work_mailbox_bind(&pool, handles[i], 61, discard, NULL) == 0);
+        (void)work_mailbox_receive_bounded(&pool, handles[i], 61, discard, NULL, WORK_MAILBOX_CAP, 0);
+        CHECK(work_mailbox_bind(&pool, handles[i], 61, NULL, NULL) == 0);
+    }
+    size_t allocations = edit_malloc_guard_end();
+    CHECK(allocations == 0 && !work_mailbox_pending(&pool));
+    printf("work_test: new_api ui_allocations=%zu guard_active=1\n", allocations);
+    work_pool_shutdown(&pool);
+    result("new_api_allocation_guard", before);
+}
+
+typedef struct receive_wrap_fixture { _Atomic uint32_t phase, ready; } receive_wrap_fixture;
+static void job_receive_wrap(work_ctx *c)
+{
+    receive_wrap_fixture *f = c->arg;
+    for (uint32_t stage = 0; stage < 3; stage++) {
+        while (atomic_load_explicit(&f->phase, memory_order_acquire) != stage)
+            if (work_should_stop(c)) return;
+        uint32_t count = stage == 0 ? 2u : 3u;
+        for (uint32_t i = 0; i < count; i++) {
+            work_msg m = {.kind = i, .generation = stage == 2 ? c->generation : c->generation + 1u};
+            CHECK(work_publish(c, &m));
+        }
+        atomic_store_explicit(&f->ready, stage + 1u, memory_order_release);
+    }
+}
+static void test_dormant_receive_wrap(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    receive_wrap_fixture f = {0};
+    work_handle h = work_submit(&pool, (work_job){job_receive_wrap, &f, 71, WORK_BULK});
+    CHECK(h.epoch); (void)wait_value(&f.ready, 1);
+    selective_collection selected = {.h = h, .generation = 71};
+    CHECK(work_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, 2, 0) == 0);
+    (void)work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+    /* Compress a dormant selector's nearly-full counter cycle. The ring is
+     * empty and its producer is paused, just as in the existing wrap fixture. */
+    uint32_t origin = UINT32_MAX - 2u;
+    atomic_store(&pool.mb[0].head, origin); atomic_store(&pool.mb[0].tail, origin);
+    atomic_store_explicit(&f.phase, 1, memory_order_release);
+    (void)wait_value(&f.ready, 2);
+    (void)work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+    CHECK(atomic_load(&pool.mb[0].head) == 0);
+    atomic_store_explicit(&f.phase, 2, memory_order_release);
+    wait_finished(h);
+    CHECK(work_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, WORK_MAILBOX_CAP, 0) == 3);
+    CHECK(selected.n == 3);
+    work_pool_shutdown(&pool);
+    while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
+    result("dormant_receive_cursor_wrap_order", before);
 }

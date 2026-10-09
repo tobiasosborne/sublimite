@@ -7,8 +7,10 @@
  * piece_snapshot without depending on any of them.
  *
  * THREADS: a lineidx is owned by the UI thread. The only cross-thread data is
- * the per-build job block (results array + published count), written by the
- * single work_pool bulk worker and read by lineidx_poll. A lineidx_src given
+ * sealed per-build result ranges, published and generation/lease validated by
+ * work mailboxes before UI adoption. Poll selectively receives this build's
+ * messages; ordinary shared-pool drains invoke its registered receiver too.
+ * Physical source retirement uses work's completion acknowledgement. A lineidx_src given
  * to lineidx_build_start is read from the worker: it must be immutable (a
  * piece_snapshot, a mapping) and its span callback thread-safe. Its release
  * hook (optional) runs once, after the worker is finished with it.

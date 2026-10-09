@@ -324,8 +324,7 @@ static void count_message(const work_msg *m, void *ctx)
     (*n)++;
 }
 
-/* Opt-in red reproducer: proper handoff requires a src/work API amendment.
- * See P1.6b §13; excluded from the passing suite until that bead lands. */
+/* Cancelled results must reach the UI only through work validation. */
 static void test_review_mailbox(void)
 {
     uint8_t b[LINEIDX_CHUNK];
@@ -744,6 +743,8 @@ static void test_corpus(const char *path)
     munmap((void *)m, (size_t)n);
 }
 
+static void test_mailbox_pressure(void);
+static void test_completed_slot_reuse(void);
 int main(int argc, char **argv)
 {
     trace_init();
@@ -755,7 +756,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[1], "--review=4") == 0) test_edit_during_build();
         else if (strcmp(argv[1], "--review=5") == 0) test_review_boundaries();
         else if (strcmp(argv[1], "--review=12") == 0) { test_review_memory(); test_review_owned_source(); }
-        else if (strcmp(argv[1], "--review=13") == 0) test_review_mailbox();
+        else if (strcmp(argv[1], "--review=13") == 0) {
+            test_review_mailbox(); test_mailbox_pressure(); test_completed_slot_reuse();
+        }
         else if (strcmp(argv[1], "--review=alloc") == 0) test_no_malloc();
         else return 2;
         goto finish;
@@ -766,6 +769,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "-- review_boundaries\n"); test_review_boundaries();
     fprintf(stderr, "-- review_memory\n"); test_review_memory();
     fprintf(stderr, "-- review_owned_source\n"); test_review_owned_source();
+    fprintf(stderr, "-- review_mailbox\n"); test_review_mailbox();
+    fprintf(stderr, "-- mailbox_pressure\n"); test_mailbox_pressure();
+    fprintf(stderr, "-- completed_slot_reuse\n"); test_completed_slot_reuse();
     fprintf(stderr, "-- review_wide_count\n"); test_review_wide_count();
     fprintf(stderr, "-- shapes\n"); test_shapes();
     fprintf(stderr, "-- estimate_and_cancel_resume\n"); test_estimate_and_cancel_resume();
@@ -784,4 +790,88 @@ finish:
     if (fails) { fprintf(stderr, "lineidx_test: %d failure(s)\n", fails); return 1; }
     puts("lineidx_test: ok");
     return 0;
+}
+
+static void foreign_mailbox_job(work_ctx *c)
+{
+    for (uint32_t i = 0; i < WORK_MAILBOX_CAP; i++) {
+        work_msg m = {.kind = 99, .generation = c->generation};
+        memcpy(m.data, &i, sizeof i);
+        CHECK(work_publish(c, &m));
+    }
+}
+static void foreign_message(const work_msg *m, void *arg)
+{
+    size_t *count = arg;
+    uint32_t ordinal;
+    memcpy(&ordinal, m->data, sizeof ordinal);
+    CHECK(m->kind == 99 && m->generation == 81 && ordinal == *count);
+    (*count)++;
+}
+static void test_mailbox_pressure(void)
+{
+    work_pool wp;
+    REQUIRE(work_pool_init(&wp, 1, 0) == 0);
+    work_handle foreign = work_submit(&wp, (work_job){foreign_mailbox_job, NULL, 81, WORK_BULK});
+    REQUIRE(foreign.epoch != 0);
+    for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, foreign); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(work_handle_finished(&wp, foreign));
+    uint8_t b[LINEIDX_CHUNK]; memset(b, '\n', sizeof b);
+    lease s = {.b = b, .n = 33ull * LINEIDX_CHUNK, .repeat = true, .resume = true};
+    lineidx_src src = {&s, s.n, lease_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &wp, &src) == 0);
+    for (unsigned i = 0; i < 20000 && atomic_load(&wp.dropped_full) == 0; i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(atomic_load(&wp.dropped_full) != 0);
+    CHECK(lineidx_poll(x) == 0);
+    CHECK(atomic_load(&wp.slots[foreign.slot].pending) == WORK_MAILBOX_CAP);
+    size_t foreign_count = 0;
+    bool completed = false;
+    for (unsigned i = 0; i < 20000; i++) {
+        /* Existing callers may pump the shared pool before their first poll. */
+        (void)work_mailbox_drain(&wp, foreign_message, &foreign_count);
+        (void)lineidx_poll(x);
+        if (lineidx_complete(x)) { completed = true; break; }
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    }
+    CHECK(completed && foreign_count == WORK_MAILBOX_CAP);
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == s.n + 1u);
+    lineidx_destroy(x);
+    work_pool_shutdown(&wp);
+    fprintf(stderr, "lineidx mailbox: full-ring retry + foreign FIFO + shared dispatcher ok\n");
+}
+static void hold_replacement(work_ctx *c)
+{
+    while (!work_should_stop(c)) sched_yield();
+}
+static void test_completed_slot_reuse(void)
+{
+    work_pool wp;
+    REQUIRE(work_pool_init(&wp, 1, 0) == 0);
+    uint8_t b[] = "a\nb\n";
+    flat f = {.b = b, .n = sizeof b - 1};
+    lineidx_src src = mk(&f);
+    lineidx *x = lineidx_create(src.len);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &wp, &src) == 0);
+    work_handle completed = {0, 2};
+    for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, completed); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(work_handle_finished(&wp, completed));
+    size_t stolen = 0;
+    while (work_mailbox_pending(&wp)) (void)work_mailbox_drain(&wp, count_message, &stolen);
+    CHECK(stolen == 0); /* the bound receiver, rather than fallback, adopted */
+    work_handle replacement = work_submit(&wp, (work_job){hold_replacement, NULL, 82, WORK_BULK});
+    REQUIRE(replacement.epoch != 0);
+    CHECK(replacement.slot == completed.slot && replacement.epoch == completed.epoch + 1u);
+    CHECK(lineidx_poll(x) == 1);
+    CHECK(lineidx_complete(x) && lineidx_line_count(x).value == 3);
+    CHECK(!lineidx_building(x));
+    lineidx_destroy(x);
+    work_cancel(&wp, replacement);
+    work_pool_shutdown(&wp);
+    fprintf(stderr, "lineidx mailbox: completed lease survives slot reuse ok\n");
 }

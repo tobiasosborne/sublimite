@@ -2,7 +2,6 @@
 #include "lineidx/lineidx.h"
 #include "scan/scan.h"
 
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -28,9 +27,9 @@ typedef struct lineidx_job {
     size_t n;
     size_t applied;                       /* UI thread */
     uint64_t *starts;                     /* n + 1 */
-    _Atomic uint64_t *res;                /* n: RES_DONE | RES_NA | nl */
-    _Atomic uint64_t done_n;              /* prefix of chunks whose res is final */
-    _Atomic uint32_t fn_done;
+    uint64_t *res;                        /* immutable once its range is mailed */
+    uint32_t generation;
+    size_t received;                     /* UI: newly adopted since last poll */
 } lineidx_job;
 
 struct lineidx {
@@ -139,24 +138,15 @@ static uint64_t cum_lines(const lineidx *x, size_t c)
 
 static bool job_done(const lineidx_job *j)
 {
-    if (atomic_load_explicit(&((lineidx_job *)j)->fn_done, memory_order_acquire)) return true;
-    const work_pool *p = j->pool;
-    if (p->efd < 0) return true;                        /* pool shut down: workers joined */
-    const work_slot *s = &p->slots[j->h.slot];
-    if (atomic_load_explicit(&s->busy, memory_order_acquire) == 0) return true;
-    uint32_t epoch = atomic_load_explicit(&s->epoch, memory_order_acquire);
-    /* submit advances the epoch; cancel advances it once. Neither a live
-     * lease nor its cancelled lease is complete merely because it wrapped.
-     * Any other epoch belongs to a later lease, after busy went to zero.
-     * Equality (including wrapping +1) is conservative even after ABA. */
-    return epoch != j->h.epoch && epoch != j->h.epoch + 1u;
+    return work_handle_finished(j->pool, j->h);
 }
 
 static void job_free(lineidx_job *j)
 {
+    (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     if (j->src.release) j->src.release(j->src.ctx);
     free(j->starts);
-    free((void *)j->res);
+    free(j->res);
     free(j);
 }
 
@@ -174,40 +164,67 @@ static void retire_job(lineidx *x)
 {
     lineidx_job *j = x->job;
     if (!j) return;
+    (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     x->job = NULL;
     j->next = x->retired;
     x->retired = j;
 }
 
+typedef struct result_range { uint64_t first, end; } result_range;
+_Static_assert(sizeof(result_range) <= WORK_MSG_DATA, "line index range fits mailbox");
+
+static bool publish_range(work_ctx *c, size_t first, size_t end)
+{
+    work_msg msg = {.kind = LINEIDX_MSG_PROGRESS, .generation = c->generation};
+    result_range range = {first, end};
+    memcpy(msg.data, &range, sizeof range);
+    while (!work_should_stop(c)) {
+        if (work_publish(c, &msg)) return true;
+        nanosleep(&(struct timespec){0, 50000}, NULL);
+    }
+    return false;
+}
+
+/* Only a validated mailbox callback may read sealed worker result ranges.
+ * No independent atomic prefix/result channel exists. The worker never writes
+ * a mailed entry again; work retains callback ownership until it returns. */
+static void apply_results(const work_msg *msg, void *ud)
+{
+    lineidx *x = ud;
+    lineidx_job *j = x->job;
+    if (!j || msg->kind != LINEIDX_MSG_PROGRESS || msg->generation != j->generation ||
+        msg->slot_ != j->h.slot || msg->epoch_ != j->h.epoch) return;
+    result_range range;
+    memcpy(&range, msg->data, sizeof range);
+    if (range.first != j->applied || range.end < range.first || range.end > j->n) return;
+    for (size_t i = (size_t)range.first; i < (size_t)range.end; i++) {
+        entry *e = &x->e[i];
+        if (e->fl & FL_BUILT) continue;
+        uint64_t r = j->res[i];
+        e->nl = (uint32_t)(r & UINT32_MAX);
+        e->fl = FL_BUILT | ((r & RES_NA) ? FL_NONASCII : 0);
+        j->received++;
+        x->dirty = true;
+    }
+    j->applied = (size_t)range.end;
+}
+
 static void build_fn(work_ctx *c)
 {
     lineidx_job *j = c->arg;
-    size_t i = 0;
-    for (; i < j->n; i++) {
-        if ((i & 15u) == 0) {
-            atomic_store_explicit(&j->done_n, i, memory_order_release);
-            if (work_should_stop(c)) goto out;
-            if ((i & 63u) == 0 && i > 0) {
-                work_msg m = {0};
-                m.kind = LINEIDX_MSG_PROGRESS;
-                m.generation = c->generation;
-                (void)work_publish(c, &m);
-            }
+    size_t sealed = 0;
+    for (size_t i = 0; i < j->n; i++) {
+        if ((i & 15u) == 0 && work_should_stop(c)) return;
+        if (!(j->res[i] & RES_DONE)) {
+            uint64_t nl, na;
+            scan_range(&j->src, j->starts[i], j->starts[i + 1] - j->starts[i], &nl, &na);
+            j->res[i] = RES_DONE | (na ? RES_NA : 0) | nl;
         }
-        if (atomic_load_explicit(&j->res[i], memory_order_relaxed) & RES_DONE) continue;
-        uint64_t nl, na;
-        scan_range(&j->src, j->starts[i], j->starts[i + 1] - j->starts[i], &nl, &na);
-        atomic_store_explicit(&j->res[i], RES_DONE | (na ? RES_NA : 0) | nl, memory_order_relaxed);
+        if (((i + 1u) & 15u) == 0 || i + 1u == j->n) {
+            if (!publish_range(c, sealed, i + 1u)) return;
+            sealed = i + 1u;
+        }
     }
-    atomic_store_explicit(&j->done_n, j->n, memory_order_release);
-    {
-        work_msg m = {0};
-        m.kind = LINEIDX_MSG_PROGRESS;
-        m.generation = c->generation;
-        (void)work_publish(c, &m);
-    }
-out:
-    atomic_store_explicit(&j->fn_done, 1, memory_order_release);
 }
 
 /* ---- lifecycle ---- */
@@ -297,17 +314,9 @@ size_t lineidx_poll(lineidx *x)
     lineidx_job *j = x->job;
     size_t got = 0;
     if (j) {
-        size_t d = (size_t)atomic_load_explicit(&j->done_n, memory_order_acquire);
-        for (size_t i = j->applied; i < d && i < x->n; i++) {
-            entry *e = &x->e[i];
-            if (e->fl & FL_BUILT) continue;
-            uint64_t r = atomic_load_explicit(&j->res[i], memory_order_relaxed);
-            e->nl = (uint32_t)(r & 0xFFFFFFFFu);
-            e->fl = FL_BUILT | ((r & RES_NA) ? FL_NONASCII : 0);
-            got++;
-        }
-        if (d > j->applied) j->applied = d;
-        if (got) x->dirty = true;
+        (void)work_mailbox_receive(j->pool, j->h, j->generation, apply_results, x);
+        got = j->received;
+        j->received = 0;
         if (j->applied >= j->n) retire_job(x);
     }
     reap(x);
@@ -341,21 +350,20 @@ int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *sn
     j->n = x->n;
     j->starts = malloc((x->n + 1) * sizeof(uint64_t));
     j->res = malloc(x->n * sizeof(uint64_t));
-    if (!j->starts || !j->res) { free(j->starts); free((void *)j->res); free(j); return -1; }
+    if (!j->starts || !j->res) { free(j->starts); free(j->res); free(j); return -1; }
     for (size_t i = 0; i < x->n; i++) {
         j->starts[i] = x->e[i].start;
         uint64_t r = 0;
         if (x->e[i].fl & FL_BUILT)
             r = RES_DONE | ((x->e[i].fl & FL_NONASCII) ? RES_NA : 0) | x->e[i].nl;
-        atomic_init(&j->res[i], r);
+        j->res[i] = r;
     }
     j->starts[x->n] = x->len;
-    atomic_init(&j->done_n, 0);
-    atomic_init(&j->fn_done, 0);
     j->src = *snap;
     j->source_bytes = source_bytes;
     j->pool = pool;
-    work_job wj = { build_fn, j, ++x->gen, WORK_BULK };
+    j->generation = ++x->gen;
+    work_job wj = { build_fn, j, j->generation, WORK_BULK };
     j->h = work_submit(pool, wj);
     if (j->h.epoch == 0) {
         j->src.release = NULL;                     /* caller keeps ownership */
@@ -363,6 +371,16 @@ int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *sn
         return -1;
     }
     x->job = j;
+    if (work_mailbox_bind(pool, j->h, j->generation, apply_results, x) != 0) {
+        /* Submit/bind are serialized UI calls, so a successful submission's
+         * identity cannot change here. Preserve refusal ownership if misused. */
+        work_cancel(pool, j->h);
+        while (!job_done(j)) nanosleep(&(struct timespec){0, 100000}, NULL);
+        x->job = NULL;
+        j->src.release = NULL;
+        job_free(j);
+        return -1;
+    }
     return 0;
 }
 

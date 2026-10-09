@@ -436,6 +436,16 @@ static work_job review_queued[RASTER_JOBS + 1u];
 static work_msg review_messages[8];
 static size_t review_message_count;
 static bool review_enqueue_full, review_partial_capacity, review_run_at_submit;
+static uint32_t review_fail_at = 2;
+static bool review_watch_sleep;
+static pthread_t review_ui_thread;
+static unsigned review_rollback_waits;
+static int review_sleep(const struct timespec *pause, struct timespec *remaining)
+{
+    if (review_watch_sleep && pthread_equal(pthread_self(), review_ui_thread))
+        review_rollback_waits++;
+    return nanosleep(pause, remaining);
+}
 
 static bool review_should_stop(const work_ctx *c)
 {
@@ -463,7 +473,7 @@ static work_handle review_submit(work_pool *p, work_job job)
 {
     if (!review_fake || review_real_mailbox) return work_submit(p, job);
     review_submit_calls++;
-    if (review_enqueue_full || (review_partial_capacity && review_submit_calls == 2)) return (work_handle){0};
+    if (review_enqueue_full || (review_partial_capacity && review_submit_calls == review_fail_at)) return (work_handle){0};
     uint32_t index = review_submit_calls - 1u;
     if (index >= RASTER_JOBS + 1u) return (work_handle){0};
     review_queued[index] = job; /* worker remains paused until explicitly run */
@@ -472,6 +482,21 @@ static work_handle review_submit(work_pool *p, work_job job)
         job.fn(&c); /* strongest scheduling race: execute before returning */
     }
     return (work_handle){index, 9};
+}
+static int review_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles)
+{
+    if (!review_fake || review_real_mailbox) return work_submit_batch(p, jobs, count, handles);
+    if (review_enqueue_full || (review_partial_capacity && count >= review_fail_at)) {
+        review_submit_calls = review_fail_at;
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        uint32_t index = review_submit_calls++;
+        if (index >= RASTER_JOBS + 1u) return -1;
+        review_queued[index] = jobs[i];
+        handles[i] = (work_handle){index, 9};
+    }
+    return 0;
 }
 static uint64_t review_now(void) { return review_fake ? review_clock : trace_now_ns(); }
 static int review_flush(xcb_connection_t *c) { return review_fake ? 1 : xcb_flush(c); }
@@ -541,8 +566,10 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #define raster_last_present raster_review_last_present
 #define raster_frame_metrics raster_review_frame_metrics
 #define work_submit review_submit
+#define work_submit_batch review_submit_batch
 #define work_publish review_publish
 #define work_should_stop review_should_stop
+#define nanosleep review_sleep
 #define trace_now_ns review_now
 #define xcb_shm_put_image review_put
 #define xcb_flush review_flush
@@ -561,8 +588,10 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #undef raster_last_present
 #undef raster_frame_metrics
 #undef work_submit
+#undef work_submit_batch
 #undef work_publish
 #undef work_should_stop
+#undef nanosleep
 #undef trace_now_ns
 #undef xcb_shm_put_image
 #undef xcb_flush
@@ -583,6 +612,7 @@ static void review_reset_fixture(void)
     review_stop_calls = 0; review_stop_at = 0; review_publish_calls = 0;
     review_publish_failures = 0; review_clock = 100; review_observation = 0;
     review_message_count = 0; review_enqueue_full = false; review_partial_capacity = false; review_run_at_submit = false;
+    review_fail_at = 2; review_watch_sleep = false; review_rollback_waits = 0;
     memset(review_queued, 0, sizeof review_queued);
     memset(review_messages, 0, sizeof review_messages);
 }
@@ -644,9 +674,7 @@ static int review_ownership(void)
     T(b.complete_seen);
     return 0;
 }
-/* Desired atomic-batch behavior stays RED until the proposed work API exists.
- * A queued owned job remains busy behind unrelated work; its cancellation does
- * not make its slot immediately reusable. Only this explicit probe runs it. */
+/* Atomic batch refusal must avoid the old UI waiting rollback. */
 static void *review_release_slot(void *u)
 {
     work_pool *p = u;
@@ -1009,20 +1037,64 @@ static int review_budget_track(void)
     review_fake=false;
     return 0;
 }
+static int review_batch_rollback(void);
 static int review_cases(const char *which)
 {
     if (!strcmp(which,"budget-track")) return review_budget_track();
+    if (!strcmp(which,"batch")) return review_batch_rollback();
     const struct {const char *id; int (*fn)(void);} cases[]={
-        {"1",review_ownership},{"4",review_capacity_proposal},{"2",review_diagnostics},{"3",review_visual},
+        {"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
         {"5",review_delivery},{"6",review_glyph_budget},{"7",review_cancellation},
         {"8",review_handoff},{"15",review_origin},{"17",review_timestamp}};
     for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
-        if (!strcmp(which,"all") && !strcmp(cases[i].id,"4")) continue;
         if (strcmp(which,"all") && strcmp(which,cases[i].id)) continue;
         int rc=cases[i].fn();
         printf("P2.5b section %s: %s\n",cases[i].id,rc?"RED":"GREEN");
         if (rc) return rc;
     }
     review_fake=false;
+    return 0;
+}
+
+/* Third enqueue of a full strip batch fails after two workers obtained leases.
+ * A helper eventually releases them so the old UI rollback is observable
+ * without hanging the test. The assertion counts UI sleeps, not scheduler time. */
+static void *review_release_batch(void *arg)
+{
+    work_pool *p = arg;
+    struct timespec pause = {0, 100000000};
+    (void)nanosleep(&pause, NULL);
+    for (uint32_t i = 0; i < 2; i++)
+        atomic_store_explicit(&p->slots[i].busy, 0, memory_order_release);
+    return NULL;
+}
+static int review_batch_rollback(void)
+{
+    review_reset_fixture(); review_partial_capacity = true; review_fail_at = 3;
+    work_pool p = {.efd = -1};
+    for (uint32_t i = 0; i < 2; i++) {
+        atomic_store(&p.slots[i].busy, 1);
+        atomic_store(&p.slots[i].epoch, 10); /* cancelled predecessor of handle 9 */
+    }
+    render_cell cells[RASTER_JOBS] = {{0}};
+    render_strip full = {0, RASTER_JOBS}, copied;
+    cpu_state st = {.up = true, .pool = &p, .max_strips = 1, .cells = cells, .strips = &copied};
+    render_grid grid = {.dims = {1, RASTER_JOBS, 1, 1}, .cells = cells, .frame_id = 7};
+    render_backend backend = review_backend(&st);
+    pthread_t helper;
+    T(pthread_create(&helper, NULL, review_release_batch, &p) == 0);
+    review_ui_thread = pthread_self(); review_watch_sleep = true;
+    int rc = cpu_submit(&backend, &grid, &full, 1);
+    review_watch_sleep = false;
+    T(pthread_join(helper, NULL) == 0);
+    printf("raster batch: fail_at=3 strips=4 UI_rollback_waits=%u retained_jobs=%zu\n",
+           review_rollback_waits, st.nhandles);
+    T(rc == RENDER_ERR_CAPACITY);
+    T(review_rollback_waits == 0);
+    T(st.nhandles == 0 && st.pending == 0 && !st.have_frame);
+    for (size_t i = 0; i < RASTER_JOBS; i++) T(review_queued[i].fn == NULL);
+    review_partial_capacity = false; review_submit_calls = 0;
+    T(cpu_submit(&backend, &grid, &full, 1) == RENDER_OK);
+    T(st.nhandles == RASTER_JOBS && st.pending == RASTER_JOBS && st.have_frame);
     return 0;
 }
