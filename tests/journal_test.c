@@ -93,7 +93,7 @@ static int fault_rename(void *ctx, const char *from, const char *to)
     return 0;
 }
 static journal_io fault_io(fault_disk *d)
-{ return (journal_io){d,fault_write,fault_sync,fault_rename}; }
+{ return (journal_io){.ctx=d,.write=fault_write,.sync=fault_sync,.rename=fault_rename}; }
 static int durable_replay(fault_disk *d, model *m, journal_replay_result *rr)
 {
     for(size_t i=0;i<d->images;i++) if(d->image[i].inode==d->durable_name)
@@ -339,8 +339,8 @@ static int save_test(void)
     fd=open(path,O_RDWR); CHECK(fd>=0 && fault_sync(d,fd,false)==0); close(fd);
     struct stat saved_stat; CHECK(stat(path,&saved_stat)==0); d->durable_name=saved_stat.st_ino;
     /* Metadata must fit through the checkpoint path even if appends are FULL. */
-    uint8_t *overflow=calloc(1,262080); CHECK(overflow);
-    CHECK(journal_insert(j,1,0,overflow,262080)==JOURNAL_FULL); free(overflow);
+    uint8_t *overflow=calloc(1,JOURNAL_DEFAULT_BATCH_BYTES); CHECK(overflow);
+    CHECK(journal_insert(j,1,0,overflow,JOURNAL_DEFAULT_BATCH_BYTES)==JOURNAL_FULL); free(overflow);
     /* Failed marker data sync preserves the previous base and all edits. */
     d->fail_sync=d->syncs+1;
     CHECK(journal_save_finish(j,&save,&b,next,4)==JOURNAL_IO && save.prepared);
@@ -486,9 +486,321 @@ static int cadence_test(void)
     journal_close(j); free(d); work_pool_shutdown(&pool); unlink(path);
     puts("journal_test: cadence parameter ok (byte boundary, timer, force, rotation)"); return 0;
 }
+
+static int full_test(void)
+{
+    char path[]="/tmp/journal-full-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal_options opts={.max_file_bytes=4096}; journal *j;
+    CHECK(journal_open(&j,path,&pool,&opts)==0);
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0 && journal_flush(j)==0);
+    CHECK(journal_insert(j,1,1,(const uint8_t *)"b",1)==JOURNAL_FULL);
+    CHECK(journal_flush(j)==JOURNAL_FULL);
+    journal_stats st=journal_get_stats(j);
+    CHECK(st.error==JOURNAL_FULL && st.accepted_sequence==1 && st.durable_sequence==1);
+    uint8_t op[10]={0}; memcpy(op+8,"ab",2);
+    journal_record cp={JOURNAL_INSERT,1,0,op,sizeof op};
+    CHECK(journal_rotate(j,&cp,1)==0 && journal_flush(j)==0);
+    model m={0}; journal_replay_result rr;
+    CHECK(journal_replay_file(path,apply,&m,&rr)==0 && m.len==2 && !memcmp(m.text,"ab",2));
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: FULL flush reports suspension; complete checkpoint clears it"); return 0;
+}
+static int paste_test(bool split)
+{
+    char path[]="/tmp/journal-paste-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    size_t n=split?1000000u:1048576u;
+    uint8_t *bytes=malloc(n); CHECK(bytes); for(size_t i=0;i<n;i++) bytes[i]=(uint8_t)(i*17u);
+    int rc=0; edit_malloc_guard_begin();
+    for(size_t off=0;off<n && !rc;) {
+        size_t k=split?262072u:n; if(k>n-off) k=n-off;
+        rc=journal_insert(j,1,off,bytes+off,k); off+=k;
+    }
+    size_t allocations=edit_malloc_guard_end(); CHECK(rc==JOURNAL_OK && allocations==0);
+    CHECK(journal_flush(j)==0);
+    piece_allocator a=piece_default_allocator(); piece_tree *t=piece_create(&a); CHECK(t);
+    journal_replay_result rr; CHECK(journal_replay_file(path,apply_tree,t,&rr)==0);
+    uint8_t chunk[4096]; CHECK(piece_len(t)==n);
+    for(size_t off=0;off<n;off+=sizeof chunk) {
+        size_t k=n-off; if(k>sizeof chunk) k=sizeof chunk;
+        CHECK(piece_read(t,off,chunk,k)==0 && !memcmp(chunk,bytes+off,k));
+    }
+    /* Admission covers every split record before any sequence is accepted. */
+    uint64_t accepted=journal_get_stats(j).accepted_sequence;
+    CHECK(journal_insert(j,1,n,bytes,SIZE_MAX)==JOURNAL_INVALID);
+    CHECK(journal_get_stats(j).accepted_sequence==accepted);
+    CHECK(journal_insert(j,1,n,bytes,n)==0); accepted=journal_get_stats(j).accepted_sequence;
+    CHECK(journal_insert(j,1,2*n,bytes,n)==JOURNAL_FULL);
+    CHECK(journal_get_stats(j).accepted_sequence==accepted && journal_flush(j)==JOURNAL_FULL);
+    journal_close(j); piece_destroy(t); free(bytes); work_pool_shutdown(&pool); unlink(path);
+    printf("journal_test: %s paste accepted, replay bytes exact, allocations=0\n",split?"split 1 MB":"atomic 1 MiB"); return 0;
+}
+typedef struct checkpoint_verify { piece_tree *tree; size_t bytes, inserts; } checkpoint_verify;
+static int checkpoint_visit(void *ctx, const journal_record *r)
+{
+    checkpoint_verify *c=ctx;
+    if(r->type!=JOURNAL_INSERT) return 0;
+    if(get64(r->data)!=c->bytes) return 1;
+    for(size_t i=8;i<r->size;i++) if(r->data[i]!=(uint8_t)((c->bytes+i-8)*17u)) return 1;
+    if(journal_apply_piece(c->tree,r)) return 1;
+    c->bytes+=r->size-8; c->inserts++; return 0;
+}
+static int untitled_test(void)
+{
+    char path[]="/tmp/journal-untitled-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    size_t n=65u*1024u*1024u+1u, chunk=200000, count=(n+chunk-1)/chunk;
+    uint8_t *data=malloc(n+8*count); journal_record *cp=calloc(count+4,sizeof *cp); CHECK(data && cp);
+    uint8_t base[41]={0}; cp[0]=(journal_record){JOURNAL_BASE,1,0,base,sizeof base};
+    size_t used=0;
+    for(size_t i=0;i<count;i++) {
+        size_t k=n-i*chunk; if(k>chunk) k=chunk;
+        uint8_t *p=data+used; uint64_t off=i*chunk;
+        for(unsigned bit=0;bit<8;bit++) p[bit]=(uint8_t)(off>>(bit*8));
+        for(size_t x=0;x<k;x++) p[x+8]=(uint8_t)((off+x)*17u);
+        cp[i+1]=(journal_record){JOURNAL_INSERT,1,0,p,k+8}; used+=k+8;
+    }
+    uint8_t view[32]={0}, tabs[24]={0}, window[8]={0}; tabs[0]=1; tabs[16]=1;
+    cp[count+1]=(journal_record){JOURNAL_VIEW,1,0,view,sizeof view};
+    cp[count+2]=(journal_record){JOURNAL_TABS,0,0,tabs,sizeof tabs};
+    cp[count+3]=(journal_record){JOURNAL_WINDOW,0,0,window,sizeof window};
+    int rc=0; while(!rc) rc=journal_append(j,JOURNAL_INSERT,1,cp[1].data,cp[1].size);
+    CHECK(rc==JOURNAL_FULL); rc=journal_flush(j); CHECK(rc==0 || rc==JOURNAL_FULL);
+    CHECK(journal_rotate(j,cp,count+4)==JOURNAL_OK);
+    CHECK(journal_get_stats(j).error==0 && journal_flush(j)==0);
+    piece_allocator a=piece_default_allocator(); checkpoint_verify c={.tree=piece_create(&a)}; CHECK(c.tree);
+    journal_replay_result rr; CHECK(journal_replay_file(path,checkpoint_visit,&c,&rr)==0 && !rr.corrupt);
+    CHECK(c.bytes==n && c.inserts==count && rr.records==count+4 && piece_len(c.tree)==n);
+    uint8_t text[4096];
+    for(size_t off=0;off<n;off+=sizeof text) {
+        size_t k=n-off; if(k>sizeof text) k=sizeof text;
+        CHECK(piece_read(c.tree,off,text,k)==0);
+        for(size_t i=0;i<k;i++) CHECK(text[i]==(uint8_t)((off+i)*17u));
+    }
+    CHECK(journal_insert(j,1,n,(const uint8_t *)"!",1)==0 && journal_flush(j)==0);
+    piece_destroy(c.tree); journal_close(j); free(cp); free(data); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: untitled checkpoint >64 MiB restores exact content and resumes appends"); return 0;
+}
+static int paths_test(void)
+{
+    char directory[]="/tmp/journal-paths-XXXXXX"; CHECK(mkdtemp(directory));
+    char cwd[4097]; CHECK(getcwd(cwd,sizeof cwd));
+    char path[512], basepath[512], alias[512], other[512];
+    CHECK(snprintf(path,sizeof path,"%s/journal",directory)>0);
+    CHECK(snprintf(basepath,sizeof basepath,"%s/notes",directory)>0);
+    CHECK(snprintf(alias,sizeof alias,"%s/alias",directory)>0);
+    CHECK(snprintf(other,sizeof other,"%s/other",directory)>0);
+    int fd=open(basepath,O_WRONLY|O_CREAT,0600); CHECK(fd>=0 && write(fd,"abc",3)==3); close(fd);
+    CHECK(symlink("notes",alias)==0 && mkdir(other,0700)==0 && chdir(directory)==0);
+    journal_base b; CHECK(journal_capture_base("alias",&b)==0);
+    CHECK(b.path[0]=='/' && !strcmp(b.path,basepath));
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,"journal",&pool,NULL)==0 && journal_set_base(j,1,&b)==0 && journal_flush(j)==0);
+    CHECK(chdir(other)==0 && journal_check_base(&b)==0);
+    uint8_t bp[4137], op[9]={0}; base_payload(bp,&b); op[0]=3; op[8]='!';
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(b.path)},{JOURNAL_INSERT,1,0,op,9}};
+    CHECK(journal_rotate(j,cp,2)==0); journal_close(j);
+    CHECK(access("journal",F_OK)!=0);
+    piece_allocator a=piece_default_allocator(); piece_tree *t=piece_create(&a); CHECK(t && piece_init_copy(t,(const uint8_t *)"abc",3)==0);
+    journal_replay_result rr; CHECK(journal_replay_file(path,apply_tree,t,&rr)==0 && piece_len(t)==4);
+    uint8_t text[4]; CHECK(piece_read(t,0,text,4)==0 && !memcmp(text,"abc!",4));
+    piece_destroy(t); work_pool_shutdown(&pool); CHECK(chdir(cwd)==0);
+    unlink(path); unlink(alias); unlink(basepath); CHECK(rmdir(other)==0 && rmdir(directory)==0);
+    puts("journal_test: canonical base and journal paths survive cwd changes"); return 0;
+}
+static void repair_crc(uint8_t *p, size_t n)
+{
+    memset(p+12,0,4); uint32_t crc=UINT32_MAX;
+    for(size_t i=0;i<n;i++) { crc^=p[i]; for(unsigned k=0;k<8;k++) crc=(crc>>1)^((crc&1u)?0x82f63b78u:0u); }
+    crc=~crc; for(unsigned k=0;k<4;k++) p[12+k]=(uint8_t)(crc>>(k*8));
+}
+static int schema_test(bool parser)
+{
+    char path[]="/tmp/journal-schema-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    uint8_t tabs[16]={0}, window[8]={0};
+    if(!parser) {
+        CHECK(journal_append(j,JOURNAL_WINDOW,99,window,sizeof window)==JOURNAL_INVALID);
+        CHECK(journal_append(j,JOURNAL_TABS,99,tabs,sizeof tabs)==JOURNAL_INVALID);
+        CHECK(journal_get_stats(j).accepted_sequence==0 && journal_get_stats(j).error==0);
+    } else {
+        CHECK(journal_set_window(j,1,1)==0 && journal_set_tabs(j,NULL,0,0)==0 && journal_flush(j)==0);
+        uint8_t bytes[4096]; int fd=open(path,O_RDONLY); CHECK(fd>=0 && read(fd,bytes,sizeof bytes)==sizeof bytes); close(fd);
+        for(unsigned which=0;which<2;which++) {
+            uint8_t copy[4096]; memcpy(copy,bytes,sizeof copy); size_t start=which?40:0, len=which?48:40;
+            copy[start+24]=99; repair_crc(copy+start,len);
+            model m={0}; journal_replay_result rr;
+            CHECK(journal_replay_bytes(copy,sizeof copy,apply,&m,&rr)==0);
+            CHECK(rr.corrupt && rr.valid_bytes==start && rr.records==which && rr.last_sequence==which);
+        }
+    }
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    printf("journal_test: session IDs rejected by %s\n",parser?"CRC-repaired parser":"writer"); return 0;
+}
+static ssize_t unreadable_base(void *ctx, int fd, uint8_t *p, size_t n, uint64_t off)
+{ (void)ctx; (void)fd; (void)p; (void)n; (void)off; errno=EIO; return -1; }
+static ssize_t short_base(void *ctx, int fd, uint8_t *p, size_t n, uint64_t off)
+{ (void)ctx; return off?0:pread(fd,p,n>1?1:n,(off_t)off); }
+static int base_read_test(void)
+{
+    char path[]="/tmp/journal-base-read-XXXXXX", basepath[]="/tmp/journal-unreadable-XXXXXX";
+    CHECK(temp(path)>=0 && temp(basepath)>=0);
+    int fd=open(basepath,O_WRONLY); CHECK(fd>=0 && write(fd,"abc",3)==3); close(fd);
+    journal_base b; journal_io io={.read=unreadable_base};
+    CHECK(journal_capture_base_with_io(basepath,&b,&io)==JOURNAL_BASE_CHANGED);
+    io.read=short_base; CHECK(journal_capture_base_with_io(basepath,&b,&io)==JOURNAL_BASE_CHANGED);
+    CHECK(journal_capture_base(basepath,&b)==0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0 && journal_set_base(j,1,&b)==0 && journal_flush(j)==0); journal_close(j);
+    struct stat before,after; CHECK(stat(path,&before)==0);
+    io.read=unreadable_base; model m={0}; journal_replay_result rr;
+    CHECK(journal_replay_file_with_io(path,apply,&m,&rr,&io)==JOURNAL_BASE_CHANGED && m.records==0);
+    CHECK(stat(path,&after)==0 && before.st_size==after.st_size);
+    CHECK(unlink(basepath)==0 && journal_check_base(&b)==JOURNAL_BASE_CHANGED);
+    work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: unreadable/short/missing bases are conflicts; replay leaves log intact"); return 0;
+}
+static int rotate_name_test(void)
+{
+    char directory[]="/tmp/journal-long-name-XXXXXX"; CHECK(mkdtemp(directory));
+    char path[512]; CHECK(snprintf(path,sizeof path,"%s/",directory)>0);
+    size_t start=strlen(path); memset(path+start,'j',255); path[start+255]=0;
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0 && journal_insert(j,1,0,(const uint8_t *)"a",1)==0 && journal_flush(j)==0);
+    uint8_t op[9]={0}; op[8]='b'; journal_record cp={JOURNAL_INSERT,1,0,op,sizeof op};
+    CHECK(journal_rotate(j,&cp,1)==JOURNAL_OK);
+    model m={0}; journal_replay_result rr; CHECK(journal_replay_file(path,apply,&m,&rr)==0 && m.len==1 && m.text[0]=='b');
+    journal_close(j); work_pool_shutdown(&pool); unlink(path); CHECK(rmdir(directory)==0);
+    puts("journal_test: 255-byte journal basename rotates with independent temporary name"); return 0;
+}
+
+
+static int open_options_test(void)
+{
+    char path[]="/tmp/journal-invalid-options-XXXXXX"; CHECK(temp(path)>=0 && unlink(path)==0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j=NULL;
+    journal_options opts={.batch_bytes=8193};
+    CHECK(journal_open(&j,path,&pool,&opts)==JOURNAL_INVALID && !j && access(path,F_OK)!=0);
+    opts=(journal_options){.max_file_bytes=4097};
+    CHECK(journal_open(&j,path,&pool,&opts)==JOURNAL_INVALID && !j && access(path,F_OK)!=0);
+    opts=(journal_options){.sync_bytes=4097};
+    CHECK(journal_open(&j,path,&pool,&opts)==JOURNAL_INVALID && !j && access(path,F_OK)!=0);
+    work_pool_shutdown(&pool); puts("journal_test: invalid setup options create no journal"); return 0;
+}
+static int rotate_path_test(void)
+{
+    char root[]="/tmp/journal-long-path-XXXXXX"; CHECK(mkdtemp(root));
+    char paths[18][4097]; strcpy(paths[0],root); size_t depth=0;
+    while(strlen(paths[depth])<4093) {
+        size_t len=strlen(paths[depth]), n=4093-len-1; if(n>245) n=245;
+        CHECK(depth+1<18 && n>0); memcpy(paths[depth+1],paths[depth],len); paths[depth+1][len++]='/';
+        memset(paths[depth+1]+len,'d',n); paths[depth+1][len+n]=0; depth++;
+        CHECK(mkdir(paths[depth],0700)==0);
+    }
+    char path[4097]; size_t len=strlen(paths[depth]); CHECK(len==4093);
+    memcpy(path,paths[depth],len); memcpy(path+len,"/j",3);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0 && journal_insert(j,1,0,(const uint8_t *)"a",1)==0 && journal_flush(j)==0);
+    uint8_t op[9]={0}; op[8]='b'; journal_record cp={JOURNAL_INSERT,1,0,op,sizeof op};
+    CHECK(journal_rotate(j,&cp,1)==JOURNAL_OK);
+    model m={0}; journal_replay_result rr; CHECK(journal_replay_file(path,apply,&m,&rr)==0 && m.len==1 && m.text[0]=='b');
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    do { CHECK(rmdir(paths[depth])==0); } while(depth--);
+    puts("journal_test: 4095-byte journal path rotates via retained directory fd"); return 0;
+}
+static int directory_fd_test(void)
+{
+    char root[]="/tmp/journal-directory-fd-XXXXXX"; CHECK(mkdtemp(root));
+    char path[512], renamed[512], newpath[512];
+    CHECK(snprintf(path,sizeof path,"%s/log",root)>0 && snprintf(renamed,sizeof renamed,"%s-moved",root)>0);
+    CHECK(snprintf(newpath,sizeof newpath,"%s/log",renamed)>0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0 && journal_insert(j,1,0,(const uint8_t *)"a",1)==0 && journal_flush(j)==0);
+    CHECK(rename(root,renamed)==0);
+    uint8_t op[9]={0}; op[8]='b'; journal_record cp={JOURNAL_INSERT,1,0,op,sizeof op};
+    CHECK(journal_rotate(j,&cp,1)==0 && journal_flush(j)==0); journal_close(j);
+    model m={0}; journal_replay_result rr;
+    CHECK(journal_replay_file(newpath,apply,&m,&rr)==0 && m.len==1 && m.text[0]=='b');
+    work_pool_shutdown(&pool); unlink(newpath); CHECK(rmdir(renamed)==0);
+    puts("journal_test: journal rotation survives parent directory rename"); return 0;
+}
+/* Boundaries and byte snapshots come from the scripted mutations, before
+ * encoding; expected prefix never depends on the parser's accepted count. */
+static int exact_check(const uint8_t *bytes, size_t n, const size_t *starts,
+                        const model *snapshots, bool flip, size_t changed)
+{
+    size_t count=0;
+    while(count<8 && starts[count+1]<=n && (!flip || changed>=starts[count+1])) count++;
+    size_t boundary=starts[count];
+    if(count==8 && n==starts[9] && !flip) boundary=n;
+    model actual={0}; journal_replay_result rr;
+    CHECK(journal_replay_bytes(bytes,n,apply,&actual,&rr)==0);
+    const model *expected=&snapshots[count];
+    CHECK(rr.valid_bytes==boundary && rr.records==count && rr.last_sequence==count);
+    CHECK(actual.records==count && actual.len==expected->len && !memcmp(actual.text,expected->text,actual.len));
+    CHECK(rr.corrupt==(boundary!=n)); return 0;
+}
+static int exact_prefix_test(void)
+{
+    char path[]="/tmp/journal-exact-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0);
+    size_t starts[10]={0}; model *snapshots=calloc(9,sizeof *snapshots); CHECK(snapshots);
+    uint8_t data[17000];
+    for(size_t i=0;i<8;i++) {
+        if(i%2==0) {
+            memset(data,(int)('a'+i),sizeof data); CHECK(journal_insert(j,1,0,data,sizeof data)==0);
+            snapshots[i+1].len=sizeof data; memcpy(snapshots[i+1].text,data,sizeof data);
+            starts[i+1]=starts[i]+sizeof data+40;
+        } else { CHECK(journal_delete(j,1,0,sizeof data)==0); starts[i+1]=starts[i]+48; }
+        snapshots[i+1].records=i+1;
+    }
+    CHECK(journal_flush(j)==0); starts[9]=(size_t)journal_get_stats(j).file_bytes; journal_close(j);
+    uint8_t *bytes=malloc(starts[9]), *copy=malloc(starts[9]); CHECK(bytes && copy);
+    int fd=open(path,O_RDONLY); CHECK(fd>=0 && read(fd,bytes,starts[9])==(ssize_t)starts[9]); close(fd);
+    CHECK(exact_check(bytes,starts[9],starts,snapshots,false,0)==0);
+    for(size_t cut=0;cut<4096;cut++) CHECK(exact_check(bytes,cut,starts,snapshots,false,0)==0);
+    for(size_t cut=65536-64;cut<65536+64;cut++) CHECK(exact_check(bytes,cut,starts,snapshots,false,0)==0);
+    for(size_t i=0;i<9;i++) {
+        size_t lo=starts[i]>32?starts[i]-32:0, hi=starts[i]+32; if(hi>starts[9]) hi=starts[9];
+        for(size_t x=lo;x<hi;x++) {
+            memcpy(copy,bytes,starts[9]); copy[x]^=1;
+            CHECK(exact_check(copy,starts[9],starts,snapshots,true,x)==0);
+            CHECK(exact_check(bytes,x,starts,snapshots,false,0)==0);
+        }
+    }
+    /* File truncation agrees with the independent scripted boundary too. */
+    for(size_t i=1;i<10;i++) {
+        size_t cut=starts[i]-1, completed=i>8?8:i-1, boundary=starts[completed];
+        fd=open(path,O_WRONLY|O_TRUNC); CHECK(fd>=0 && write(fd,bytes,cut)==(ssize_t)cut); close(fd);
+        model actual={0}; journal_replay_result rr;
+        CHECK(journal_replay_file(path,apply,&actual,&rr)==0 && rr.valid_bytes==boundary && rr.last_sequence==completed && rr.records==completed);
+        CHECK(actual.len==snapshots[completed].len && !memcmp(actual.text,snapshots[completed].text,actual.len));
+        struct stat sb; CHECK(stat(path,&sb)==0 && (size_t)sb.st_size==boundary);
+    }
+    free(copy); free(bytes); free(snapshots); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: exact scripted corruption/truncation prefix (first page, 64 KiB, PAD, byte contents)"); return 0;
+}
 int main(int argc, char **argv)
 {
     if(argc==2) {
+        if(!strcmp(argv[1],"--open-options")) return open_options_test();
+        if(!strcmp(argv[1],"--rotate-path")) return rotate_path_test();
+        if(!strcmp(argv[1],"--directory-fd")) return directory_fd_test();
+        if(!strcmp(argv[1],"--exact-prefix")) return exact_prefix_test();
+        if(!strcmp(argv[1],"--full")) return full_test();
+        if(!strcmp(argv[1],"--paste-split")) return paste_test(true);
+        if(!strcmp(argv[1],"--paste-atomic")) return paste_test(false);
+        if(!strcmp(argv[1],"--untitled")) return untitled_test();
+        if(!strcmp(argv[1],"--paths")) return paths_test();
+        if(!strcmp(argv[1],"--schema-writer")) return schema_test(false);
+        if(!strcmp(argv[1],"--schema-parser")) return schema_test(true);
+        if(!strcmp(argv[1],"--base-read")) return base_read_test();
+        if(!strcmp(argv[1],"--rotate-name")) return rotate_name_test();
         if(!strcmp(argv[1],"--retry")) return retry_test();
         if(!strcmp(argv[1],"--barriers")) return barriers_test();
         if(!strcmp(argv[1],"--save")) return save_test();
@@ -498,6 +810,8 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--save-shared")) return save_shared_base_test();
         return 2;
     }
+    CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
+          paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
     CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && worker_test()==0 &&
           cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0);
 
@@ -514,12 +828,14 @@ int main(int argc, char **argv)
     CHECK(journal_set_window(j, 1200, 800) == 0);
     CHECK(journal_flush(j) == 0);
     edit_malloc_guard_begin();
-    for (unsigned i=0;i<10000;i++) CHECK(journal_insert(j, 7, 0, (const uint8_t *)"x", 1) == JOURNAL_OK || journal_get_stats(j).error == JOURNAL_FULL);
+    for (unsigned i=0;i<10000;i++) CHECK(journal_insert(j, 7, 0, (const uint8_t *)"x", 1) == JOURNAL_OK);
     CHECK(edit_malloc_guard_end() == 0);
     printf("journal_test: malloc_guard=%s append_allocations=0\n",edit_malloc_guard_active()?"active":"ASan-inactive (release run required)");
+    /* All 10000 guarded appends succeeded. Now separately saturate the queue. */
+    while(journal_insert(j,7,0,(const uint8_t *)"x",1)==0) {}
     /* FULL is sticky and accepted prefix is retained. */
     CHECK(journal_insert(j, 7, 0, (const uint8_t *)"x", 1) == JOURNAL_FULL);
-    CHECK(journal_flush(j) == 0);
+    CHECK(journal_flush(j) == JOURNAL_FULL);
     journal_stats st = journal_get_stats(j); CHECK(st.durable_sequence == st.accepted_sequence);
     journal_close(j);
     model m = {0}; journal_replay_result rr;
@@ -538,11 +854,18 @@ int main(int argc, char **argv)
         if(i>=record_start+record_len) record_start+=record_len;
         memcpy(copy, bytes, small); copy[i] ^= 1; model a = {0};
         CHECK(journal_replay_bytes(copy, small, apply, &a, &rr) == 0);
-        CHECK(rr.corrupt && rr.valid_bytes <= record_start);
+        CHECK(rr.corrupt && rr.valid_bytes == record_start);
     }
     char tornpath[] = "/tmp/journal-torn-XXXXXX"; CHECK(temp(tornpath) >= 0);
-    for (size_t n=small-4096;n<small;n++) {
-        model a = {0}; CHECK(journal_replay_bytes(bytes, n, apply, &a, &rr) == 0); CHECK(rr.valid_bytes <= n);
+    for (size_t n=0;n<small;n++) {
+        model a = {0}; CHECK(journal_replay_bytes(bytes, n, apply, &a, &rr) == 0); size_t boundary=0; uint64_t seq=0;
+        while(boundary+32<=n) {
+            size_t len=(size_t)((uint32_t)bytes[boundary+4] | (uint32_t)bytes[boundary+5]<<8 | (uint32_t)bytes[boundary+6]<<16 | (uint32_t)bytes[boundary+7]<<24);
+            if(len>n-boundary) break;
+            if(bytes[boundary+8]) seq++;
+            boundary+=len;
+        }
+        CHECK(rr.valid_bytes==boundary && rr.last_sequence==seq && rr.records==seq);
         fd=open(tornpath,O_WRONLY|O_TRUNC); CHECK(fd>=0); CHECK(write(fd,bytes,n)==(ssize_t)n); close(fd);
         uint64_t expected_valid=rr.valid_bytes;
         a=(model){0}; CHECK(journal_replay_file(tornpath,apply,&a,&rr)==0);
@@ -573,7 +896,7 @@ int main(int argc, char **argv)
     CHECK(journal_insert(j, 7, 0, big, 4000) == 0);
     CHECK(journal_insert(j, 7, 0, big, 4000) == 0);
     CHECK(journal_insert(j, 7, 0, big, 4000) == JOURNAL_FULL);
-    work_cancel(&pool, blocker); CHECK(journal_flush(j) == 0);
+    work_cancel(&pool, blocker); CHECK(journal_flush(j) == JOURNAL_FULL);
     st = journal_get_stats(j); CHECK(st.durable_sequence == 3 && st.file_bytes == 12288);
     /* Rotation removes pre-save operations, preserving a complete session. */
     uint8_t op[11] = {0}; memcpy(op+8, "new", 3);
@@ -589,7 +912,7 @@ int main(int argc, char **argv)
     opts=(journal_options){.batch_bytes=8192,.max_file_bytes=4096}; CHECK(journal_open(&j,path,&pool,&opts)==0);
     CHECK(journal_insert(j,7,0,(const uint8_t *)"x",1)==0); CHECK(journal_flush(j)==0);
     CHECK(journal_insert(j,7,1,(const uint8_t *)"y",1)==JOURNAL_FULL);
-    CHECK(journal_flush(j)==0); CHECK(journal_get_stats(j).file_bytes==4096);
+    CHECK(journal_flush(j)==JOURNAL_FULL); CHECK(journal_get_stats(j).file_bytes==4096);
     journal_record invalid={99,7,0,op,sizeof op};
     CHECK(journal_rotate(j,&invalid,1)==JOURNAL_INVALID);
     m=(model){0}; CHECK(journal_replay_file(path,apply,&m,&rr)==0 && m.len==1 && m.text[0]=='x');

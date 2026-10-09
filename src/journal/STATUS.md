@@ -1,73 +1,75 @@
-# Journal status — P1.9d / edit-4w1.32
+# Journal status — P1.9e / edit-4w1.33 + edit-4w1.31
 
-Verified 2026-10-09, Session 6, after rebase onto the synthesised piece kernel.
-This continuation changes documentation only. Implementation, tests, fuzzer,
-benchmark, and protected files match their starting source hashes.
+P1.9d's recoverable save transaction, retained generations, retryable failed
+batches and deterministic crash oracle remain implemented and covered.
 
-The recoverable save transaction is implemented: prepare retains and syncs the
-previous named base generation and publishes a complete PREPARED checkpoint
-before file replacement. Finish publishes the saved identity/cutoff and a
-complete current checkpoint before retiring that retained generation. Recovery
-selects its content source through BASE. Shared-base buffers retain their source
-as well; callers preserve other in-flight saves in complete checkpoints.
+P1.9e implements review MAJOR 4–7/9 and MINOR 10–13. Flush drains accepted
+records and returns sticky FULL; complete checkpoints (including save prepare/
+finish) resolve that suspension. Default touched queue data is 2 MiB + 8 KiB
+(E), shared by the session. Logical INSERT calls preflight all chunks before
+accepting any portion and admit idle default 1 MB/1 MiB pastes with no typing
+allocation, syscall, wait or submission. The worker completes wire CRCs before
+writing, with cancellation polling and exact checksummed retry bytes.
 
-Failed worker writes retain the sealed batch, exact progress, offset, and force
-request. After completion receipt, `journal_retry` retries it before the second
-accepted batch. A complete checkpoint can also resolve worker I/O failure.
-Installed replacements with a failed directory barrier suspend I/O and expose
-no new-generation durable acknowledgement until that barrier is retried.
+Complete checkpoints are preflighted and get their exact wire size plus the
+original configured log budget as their file bound. This admits large untitled
+snapshots; append never grows the bound. Stats expose checkpoint, file-limit
+and queue bytes. G10/G10f integration must account for this fixed session pool
+in addition to per-file tree/undo/content memory; full-editor gates are not
+established by this module benchmark.
 
-Deterministic fault tests cover short write/EIO, sync-only retry, a record
-straddling the sync boundary, creation and checkpoint directory barriers,
-pre/post-rename failures, and real file saves with post-snapshot edits to two
-buffers. Separate synced inode images and directory-name selection model power
-loss. SIGKILL recovery applies records through `journal_apply_piece` and compares
-the resulting piece bytes to an independent seeded byte model; its predicate is
-acknowledged <= recovered <= issued. Fault fuzzing also exercises write/sync
-retry against byte-model and piece-tree recovery.
+Captured BASE paths are canonical absolute paths in caller-owned struct
+storage (copies borrow the captured object's path); decoded paths use caller
+storage. Manual BASE/SAVE records require canonical absolute paths. Journal
+setup owns its canonical path and parent-directory fd; rotation uses a short
+independent temporary leaf and fd-relative operations, including directory
+barrier retry. Tests cover cwd/parent rename and maximal leaf/full-path lengths.
+Unreadable/short/missing/changed bases are conflicts, with a BASE-only read fault
+seam. TABS/WINDOW IDs must be zero. Unit/fuzz corruption and truncation oracles
+require the exact independently scripted prefix, sequence and contents.
 
-Session 6 reproduced a failing assertion for each of review BLOCKER 2, MAJOR 3,
-and MAJOR 8 by temporarily reverting its relevant behavior, then restored it
-and observed green. Exact transcripts and fresh verification measurements are
-in [P1.9.md](../../docs/decisions/P1.9.md).
+The starting P1.9d branch already removed the worker's post-publication hold;
+this work preserves that return and verifies it against a temporary restored
+wait variant and stamped CPU-per-sync TRACK rows. No src/work changes needed.
 
-Fresh results: GCC `make all` exited 0; ASan/UBSan `make check` passed 23 test
-binaries plus the replay CLI checks on :99; `make fuzz` built 12 fuzzers. Release
-append allocations were 0 (M)[AC], load 5.73. The journal fuzzer completed
-76830 runs / 301 s (M)[AC], launch load 4.12, with no findings. The full kill
-test passed 1000 trials / 167.04 s (M)[AC], launch load 4.10. One benchmark run
-exited 0: append p99 0.264 us / 5.193 us (M)[AC], load 3.56, TRACK only. Full
-stamped benchmark lines and independent recovery counts are in the decision doc.
+The default-option benchmark covers verified 1 MB pastes, 100000 mixed edits,
+BASE loading/two buffers/session restoration, normal timer pumping, explicit
+stand-in bulk contention, reported pre-delivery pacing, default disk exhaustion,
+and tiny/zero-data idle sync. Component enqueue measurements exclude the
+reported delivery waits; whole-editor G1/G9 and actual index/find workloads
+remain integration checks for the coordinator. Replay labels wire and payload
+throughput separately. Shared-box performance measurements are TRACK only.
 
-Verify from the worktree (Xvfb :99; local socket access is needed for the full
-check; LeakSanitizer is disabled only for this sandbox runner):
+Verified 2026-10-09. Paired red/green transcripts and full stamped TRACK rows
+are in [P1.9.md](../../docs/decisions/P1.9.md), P1.9e. GCC make all passed
+([AC], launch load 9.59); ASan/UBSan make check passed 24 test binaries and replay
+CLI checks ([AC], launch load 5.30), with X11 tests executed using approved local
+socket access on safe Xvfb surfaces. make fuzz built 12 fuzzers ([AC], load 9.59).
+Final journal fuzz completed 51079 runs / 301 s (M)[AC], launch load 5.30, without
+findings. Final SIGKILL recovery passed 1000 trials / 211.77 s (M)[AC], launch
+load 5.30. Release malloc guard was active: 0 append allocations (M)[AC], load
+12.54, with all guarded appends and paste chunks successful.
 
-```sh
-cat /sys/class/power_supply/BAT0/status
-cut -d' ' -f1 /proc/loadavg
-DISPLAY=:99 EDIT_DISPLAY=:99 make all
-DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
-DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/journal_test
-DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz
-mkdir -p /tmp/journal-fuzz-corpus
-DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 ./build/fuzz/journal_fuzz -max_total_time=300 -max_len=16384 -timeout=10 -artifact_prefix=/tmp/ /tmp/journal-fuzz-corpus
-DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/journal_kill_test --trials=1000
-DISPLAY=:99 EDIT_DISPLAY=:99 ./build/bench/journal_bench
-```
+The final default-option benchmark passed. Paste enqueue p50/p99 was
+0.168 / 0.229 ms (M)[AC], load 5.84; worker CPU per sync was 144.213 us, with
+0.000 us during the undrained-completion interval (M)[AC], load 5.84. The restored
+wait variant measured 641.824 / 474.407 us respectively (M)[AC], load 11.70;
+loads differ, so this is TRACK rather than a controlled performance ratio.
+Both 100000-edit sessions restored exact contents and session state. The
+1 KiB fixture reported 288 pre-delivery pauses, max 26.843 ms (M)[AC], load
+7.11; enqueue measurements exclude those reported waits. Default disk exhaustion
+returned FULL after protecting its accepted prefix. Tiny/zero-data idle sync
+rows passed. Full-editor frame/memory and quiet-box battery verdicts remain
+coordinator integration work. LSan is disabled only for this sandbox runner.
 
-Take a fresh power/load stamp before each run. Bench measurements on this shared
-box are TRACK; printed pass fields do not supply the coordinator's quiet-box
-gate verdict. The release journal test checks the active malloc guard; the
-ASan build intentionally uses the inert guard.
+Verify with DISPLAY=:99 EDIT_DISPLAY=:99: make all; ASAN_OPTIONS=detect_leaks=0
+make check (needs local socket access); release build/tests/journal_test;
+make fuzz; ASAN_OPTIONS=detect_leaks=0 build/fuzz/journal_fuzz -max_total_time=300
+-max_len=16384 -timeout=10 -artifact_prefix=/tmp/ /tmp/journal-fuzz-corpus;
+build/tests/journal_kill_test --trials=1000; build/bench/journal_bench. Take fresh
+BAT0/status and loadavg stamps before each measured run; do not regenerate the
+existing /tmp/edit-corpus.
 
-The editor startup/save UI still owns complete checkpoint construction, buffer
-and session restoration, file-save completion routing, conflict handling, and
-retained-generation cleanup after recovery. This module supplies the protocol.
-No unresolved in-scope recovery/retry defect was found in this continuation.
-
-The default sync cadence remains configurable and unchanged; the loss-window
-decision is edit-4w1.34. Review MAJOR 4–7/9 and MINOR findings remain
-edit-4w1.33, including FULL/flush semantics, large paste/untitled limits,
-generic path handling, rotation temporary-name expansion, parser/schema issues,
-and benchmark workload coverage. The coordinator still needs a quiet-box
-performance verdict and a LeakSanitizer-enabled check outside this runner.
+The application still owns complete UI checkpoints/restoration, save-completion
+routing, recovery conflicts and retained-generation cleanup. Configured cadence
+and its defaults remain unchanged; the loss-window decision is edit-4w1.34.

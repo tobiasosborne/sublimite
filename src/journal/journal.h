@@ -10,6 +10,8 @@
 #define JOURNAL_HEADER 32u
 #define JOURNAL_MAX_RECORD (1024u * 1024u)
 #define JOURNAL_MESSAGE 0x4a524e4cu
+#define JOURNAL_DEFAULT_BATCH_BYTES (JOURNAL_MAX_RECORD + JOURNAL_PAGE)
+#define JOURNAL_DEFAULT_FILE_BYTES 67108864ull
 #define JOURNAL_DEFAULT_SYNC_BYTES 65536ull
 #define JOURNAL_DEFAULT_SYNC_NS 1000000000ull
 
@@ -27,6 +29,9 @@ typedef struct journal_base {
     uint32_t prefix_crc, prefix_len;
     /* Empty path means never saved; size must be zero, edits create content. */
     const char *path;
+    /* Capture owns its canonical path here. Copies borrow the captured object's
+     * path, so that object must outlive them; decode uses caller-owned storage. */
+    char captured_path[4097];
 } journal_base;
 typedef struct journal_view {
     uint64_t cursor, anchor, scroll_byte, scroll_x;
@@ -43,8 +48,8 @@ typedef struct journal_replay_result {
 } journal_replay_result;
 typedef int (*journal_visit)(void *, const journal_record *);
 typedef struct journal_options {
-    size_t batch_bytes;        /* page multiple >= 8192; default 256 KiB, two buffers */
-    uint64_t max_file_bytes;   /* page multiple; default 64 MiB */
+    size_t batch_bytes;        /* page multiple >= 8192; default 1 MiB + page, two buffers */
+    uint64_t max_file_bytes;   /* page multiple; default 64 MiB log budget; checkpoint adds its size */
     uint64_t sync_bytes;       /* page multiple >= 4096; 0 = current 64 KiB default */
     uint64_t sync_interval_ns; /* 0 = current 1 s default; explicit force always syncs */
 } journal_options;
@@ -53,6 +58,7 @@ typedef struct journal_stats {
     uint64_t file_bytes, syncs, last_sync_ns, max_sync_interval_ns;
     uint64_t last_sync_bytes, max_sync_bytes;
     int error;
+    uint64_t file_limit_bytes, checkpoint_bytes, queue_bytes;
 } journal_stats;
 typedef struct journal journal;
 /* Optional off-path syscall seam; callbacks have POSIX return/errno semantics.
@@ -65,6 +71,7 @@ typedef struct journal_io {
     ssize_t (*write)(void *, int, const uint8_t *, size_t, uint64_t);
     int (*sync)(void *, int, bool);
     int (*rename)(void *, const char *, const char *);
+    ssize_t (*read)(void *, int, uint8_t *, size_t, uint64_t); /* BASE prefix only */
 } journal_io;
 /* Zero-initialize each save token. Its sequence is the saved snapshot cutoff
  * in the PREPARED checkpoint generation (checkpoint record count). */
@@ -127,9 +134,15 @@ void journal_close(journal *j);
 /* Typing path: no malloc, syscalls, locks, or worker submission. A FULL error
  * is sticky: later mutations must not be journaled until a complete rotation.
  * Application may keep editing but must surface that recovery is suspended.
- * No accepted records are discarded. size excludes header. */
+ * Records are copied/encoded here; their CRCs are completed on the worker
+ * before writing. No accepted records are discarded. size excludes header. Named BASE/SAVE
+ * paths must be canonical absolute paths (capture supplies owned storage). */
 int journal_append(journal *j, uint32_t type, uint64_t id,
                    const uint8_t *data, size_t size);
+/* One logical INSERT: preflight all capacity/disk/sequence bounds, then split
+ * into wire records <=1 MiB. FULL accepts none of this call. No pump/wait/alloc.
+ * Default empty current batch admits a 1 MiB paste plus normal session metadata.
+ * Existing backlog can still suspend recovery; caller surfaces FULL. */
 int journal_insert(journal *j, uint64_t id, uint64_t off,
                    const uint8_t *bytes, size_t size);
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len);
@@ -150,6 +163,9 @@ journal_stats journal_get_stats(const journal *j);
  * pool must be private to this journal. Async pump/receive needs no handler. */
 void journal_set_message_handler(journal *j,
                                  void (*handler)(const work_msg *, void *), void *ctx);
+/* Drain accepted records, then return sticky FULL while recovery is suspended.
+ * Clean exit: on FULL build/rotate a complete CURRENT checkpoint, require OK
+ * from flush, then close. IO takes precedence over FULL. */
 int journal_flush(journal *j); /* blocking; setup/save/exit only */
 /* Complete session checkpoint. Use the save transaction BEFORE file_save_begin
  * when a named BASE will be replaced. Include each BASE,
@@ -159,7 +175,9 @@ int journal_flush(journal *j); /* blocking; setup/save/exit only */
  * failure it can replace both retained batches with a complete checkpoint.
  * Failure before rename preserves the old recovery prefix and retry state.
  * Failure at the directory barrier suspends IO and reports durable_sequence=0
- * for the new generation until retry completes that barrier. */
+ * for the new generation until retry completes that barrier. Checkpoint size
+ * is preflighted; its durable bytes plus the original configured log budget
+ * bound the new file. Large untitled checkpoints may exceed the old log limit. */
 int journal_rotate(journal *j, const journal_record *records, size_t count);
 /* Parser: visits only structurally valid, CRC-checked records. Callback must
  * apply atomically; nonzero stops WITHOUT truncating that record. */
@@ -172,8 +190,14 @@ int journal_replay_file(const char *path, journal_visit visit, void *ctx,
                         journal_replay_result *result);
 /* Capture/check base identity, stat before/after prefix read. Off typing path.
  * check compares size/mtime/inode/device + CRC32C of first <=4096 bytes.
- * Missing or changed base yields BASE_CHANGED, never automatic rebase. */
+ * Capture canonicalizes into base->captured_path (off path); named paths in
+ * manually built records must already be canonical absolute paths. Missing,
+ * unreadable, short-read or changed bases yield BASE_CHANGED. The optional read
+ * seam applies only to BASE prefixes, not journal transport reads. */
 int journal_capture_base(const char *path, journal_base *base);
+int journal_capture_base_with_io(const char *path, journal_base *base, const journal_io *io);
+int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx,
+                                journal_replay_result *result, const journal_io *io);
 int journal_decode_base(const journal_record *record, journal_base *base,
                         char *path, size_t capacity);
 int journal_check_base(const journal_base *base);
