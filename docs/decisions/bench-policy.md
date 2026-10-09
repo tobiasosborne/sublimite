@@ -17,3 +17,10 @@ Tobias: "I am a bit concerned we are getting sucked into benchmark process porn 
 
 ## Evidence tags
 Unchanged (law 4) for gate verdicts. TRACK rows need no power stamp.
+
+## Addendum 14:45 (Tobias)
+After the first real-display run (G1 submit 1.5/14.9 ms, pixels 9.7/27.5 ms p50/p99 under load 8): "I am happy with the key timings so far. I don't see huge value in benchmarking on a quiet box yet. Let us develop further and if Astra or I notice any lag we can revisit. Noisy timings are *far* more representative of work."
+- The single quiet investigation run is cancelled. zzj.9, e6x.5, 4w1.6 close with their loaded numbers recorded as (M)[AC, loaded].
+- Variant picks (find simd vs twoway, GL egl vs glx) are made on back-to-back runs on the box as it is, same minute, interleaved A/B/A/B; the pick is relative, not a gate verdict.
+- Perf beads are opened from observed lag (Tobias, Astra P5.1/P5.1b) with a repro, not from gate rows.
+- Gate rows stay in the benches as regression guards that run when a bead touches the module; a miss under load is a note, not a blocker.
