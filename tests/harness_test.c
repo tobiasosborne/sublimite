@@ -180,7 +180,8 @@ static void test_report_and_gate(void)
                 CHECK(strstr(line, "BENCH name=ctr_pass n=10 p50=20000000 p99=40000000 ") != NULL);
                 CHECK(strstr(line, "ci95=[") != NULL);
                 CHECK(strstr(line, "gate_p50=25000000 gate_p99=50000000 pass=1 power=") != NULL);
-                CHECK(strstr(line, "power=[bat]") != NULL || strstr(line, "power=[AC]") != NULL);
+                CHECK(strstr(line, "power=[bat]") != NULL || strstr(line, "power=[AC]") != NULL ||
+                      strstr(line, "power=[unknown]") != NULL);
             }
         }
         CHECK(lines == 5);
@@ -197,10 +198,33 @@ static void test_battery(void)
     const char *tag;
     bench_battery_status(st, sizeof st);
     CHECK(strcmp(st, "Discharging") == 0 || strcmp(st, "Charging") == 0 ||
-          strcmp(st, "Full") == 0 || strcmp(st, "unknown") == 0);
+          strcmp(st, "Full") == 0 || strcmp(st, "Not charging") == 0 ||
+          strcmp(st, "unknown") == 0);
     tag = bench_evidence_tag();
-    CHECK(strcmp(tag, "[bat]") == 0 || strcmp(tag, "[AC]") == 0);
+    CHECK(strcmp(tag, "[bat]") == 0 || strcmp(tag, "[AC]") == 0 || strcmp(tag, "[unknown]") == 0);
     CHECK((strcmp(st, "Discharging") == 0) == (strcmp(tag, "[bat]") == 0));
+}
+
+static void test_power_status(void)
+{
+    CHECK(strcmp(bench__power_from_status("Discharging"), "Discharging") == 0);
+    CHECK(strcmp(bench__power_from_status("Charging"), "Charging") == 0);
+    CHECK(strcmp(bench__power_from_status("Not charging"), "Not charging") == 0);
+    CHECK(strcmp(bench__power_from_status("Full"), "Full") == 0);
+    CHECK(strcmp(bench__power_from_status("Unknown"), "unknown") == 0);
+    CHECK(strcmp(bench__power_from_status(""), "unknown") == 0);
+    CHECK(strcmp(bench__power_from_status("\n"), "unknown") == 0);
+    CHECK(strcmp(bench__power_from_status(NULL), "unknown") == 0);
+    CHECK(strcmp(bench__power_from_status("Discharging\n"), "Discharging") == 0);
+    CHECK(strcmp(bench__power_from_status("Not charging\n"), "Not charging") == 0);
+    CHECK(strcmp(bench__power_from_status("Full \r\n"), "Full") == 0);
+    CHECK(strcmp(bench__power_from_status("Not charging \t\n"), "Not charging") == 0);
+    CHECK(strcmp(bench__power_from_status("Not  charging"), "unknown") == 0);
+    CHECK(strcmp(bench__tag_from_power("Discharging"), "[bat]") == 0);
+    CHECK(strcmp(bench__tag_from_power("Charging"), "[AC]") == 0);
+    CHECK(strcmp(bench__tag_from_power("Not charging"), "[AC]") == 0);
+    CHECK(strcmp(bench__tag_from_power("Full"), "[AC]") == 0);
+    CHECK(strcmp(bench__tag_from_power("unknown"), "[unknown]") == 0);
 }
 
 static void test_time_macro(void)
@@ -224,6 +248,7 @@ int main(void)
     test_ci_uniform();
     test_report_and_gate();
     test_battery();
+    test_power_status();
     test_time_macro();
     printf("harness_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

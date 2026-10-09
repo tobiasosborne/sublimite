@@ -184,24 +184,47 @@ static inline void bench__copy(char *buf, size_t n, const char *src)
     buf[i] = '\0';
 }
 
-/* Writes "Discharging", "Charging", "Full" or "unknown" into buf. */
+static inline int bench__is(const char *s, size_t len, const char *lit)
+{
+    size_t n = strlen(lit);
+    return len == n && memcmp(s, lit, n) == 0;
+}
+
+/* Normalises the raw text of /sys/class/power_supply/BAT0/status: trailing
+ * newline, CR, space or tab are ignored. Returns one of "Discharging",
+ * "Charging", "Not charging", "Full" or "unknown" (anything else, including
+ * NULL or empty text). Pure: no I/O. */
+static inline const char *bench__power_from_status(const char *raw)
+{
+    size_t len;
+    if (raw == NULL)
+        return "unknown";
+    len = strlen(raw);
+    while (len > 0 && (raw[len - 1] == '\n' || raw[len - 1] == '\r' ||
+                       raw[len - 1] == ' ' || raw[len - 1] == '\t'))
+        len--;
+    if (bench__is(raw, len, "Discharging"))
+        return "Discharging";
+    if (bench__is(raw, len, "Charging"))
+        return "Charging";
+    if (bench__is(raw, len, "Not charging"))
+        return "Not charging";
+    if (bench__is(raw, len, "Full"))
+        return "Full";
+    return "unknown";
+}
+
+/* Writes the normalised power state ("Discharging", "Charging",
+ * "Not charging", "Full" or "unknown") into buf. An unreadable file is
+ * "unknown". */
 static inline char *bench_battery_status(char *buf, size_t n)
 {
     char tmp[64];
     const char *out = "unknown";
     FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
     if (f != NULL) {
-        if (fgets(tmp, sizeof tmp, f) != NULL) {
-            size_t len = strlen(tmp);
-            while (len > 0 && (tmp[len - 1] == '\n' || tmp[len - 1] == ' ' || tmp[len - 1] == '\r'))
-                tmp[--len] = '\0';
-            if (strcmp(tmp, "Discharging") == 0)
-                out = "Discharging";
-            else if (strcmp(tmp, "Charging") == 0)
-                out = "Charging";
-            else if (strcmp(tmp, "Full") == 0)
-                out = "Full";
-        }
+        if (fgets(tmp, sizeof tmp, f) != NULL)
+            out = bench__power_from_status(tmp);
         fclose(f);
     }
     if (buf != NULL)
@@ -209,11 +232,24 @@ static inline char *bench_battery_status(char *buf, size_t n)
     return buf;
 }
 
+/* Maps a normalised power state to its evidence tag: battery-only runs are
+ * "[bat]"; AC-powered states are "[AC]". Anything else is "[unknown]", never
+ * a claim of AC power. */
+static inline const char *bench__tag_from_power(const char *power)
+{
+    if (strcmp(power, "Discharging") == 0)
+        return "[bat]";
+    if (strcmp(power, "Charging") == 0 || strcmp(power, "Not charging") == 0 ||
+        strcmp(power, "Full") == 0)
+        return "[AC]";
+    return "[unknown]";
+}
+
 static inline const char *bench_evidence_tag(void)
 {
     char st[32];
     bench_battery_status(st, sizeof st);
-    return strcmp(st, "Discharging") == 0 ? "[bat]" : "[AC]";
+    return bench__tag_from_power(st);
 }
 
 /* ---- report ---- */
