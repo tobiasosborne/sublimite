@@ -1,7 +1,7 @@
 /* x11_clip_test.c - selection transfers against a raw xcb peer (P2.2b): INCR both directions, MULTIPLE,
  * STRING fallback, unsolicited/stale selection events, request timeouts, clipboard-manager save and the
  * grab-mode focus rule. The peer is a hand-written ICCCM client so the plat code is not tested against itself.
- * Skips cleanly (exit 0) with no display. Never takes over a real CLIPBOARD_MANAGER. */
+ * Only missing Xvfb can skip (EDIT_X11_STRICT=1 makes that fatal too). Never takes over a real CLIPBOARD_MANAGER. */
 #include "x11/plat.h"
 #include "x11_xvfb.h"
 #include "x11/clip.h"
@@ -986,11 +986,14 @@ static void test_wire_decoders(void) {
 int main(void) {
     test_wire_decoders();
     if (g_fail) return 1;
-    if (!xvfb_start()) { puts("x11_clip_test: skipped (no Xvfb)"); return 0; }
+    if (!xvfb_start()) {
+        if (getenv("EDIT_X11_STRICT")) { fprintf(stderr, "x11_clip_test: FAIL (private Xvfb unavailable)\n"); return 1; }
+        puts("x11_clip_test: skipped (private Xvfb unavailable)"); return 0;
+    }
     trace_init();
     trace_thread_register();
     plat a;
-    if (!open_plat(&a)) { puts("x11_clip_test: display unusable, skipped"); return 0; }
+    if (!open_plat(&a)) { fprintf(stderr, "x11_clip_test: FAIL (plat_init after private Xvfb startup)\n"); return 1; }
     sink sa; memset(&sa, 0, sizeof sa);
     rawp r;
     rp_open(&r);

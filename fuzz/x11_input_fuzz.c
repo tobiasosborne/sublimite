@@ -45,9 +45,12 @@ static void fuzz_input_order(const uint8_t *data, size_t size) {
     if (produced != delivered || in.q_dropped) __builtin_trap();
 }
 
+static void fuzz_clip_sequences(const uint8_t *data, size_t size);
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     fuzz_input_order(data, size);
+    fuzz_clip_sequences(data, size);
     if (!g_ready) setup();
     plat_event e;
     uint64_t now = 1000000000ull;
@@ -169,4 +172,219 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (x11_clock_map(&c, ms, now) > now) __builtin_trap();
     }
     return 0;
+}
+
+/* Optional live operation stream against a raw ICCCM peer. Set
+ * EDIT_X11_FUZZ_LIVE=1: missing private Xvfb is fatal, never a silent skip.
+ * The byte stream selects bounded transactions and their payload/chunk split;
+ * the model checks one completion per accepted request and its exact bytes.
+ * No keyboard/window/runtime refactor is needed to exercise clip.c. */
+#include "../tests/x11_xvfb.h"
+#include "trace/trace.h"
+#include <poll.h>
+
+typedef struct clip_peer {
+    plat p;
+    x11_input queue;
+    xcb_connection_t *raw;
+    xcb_window_t win;
+    xcb_atom_t clipboard, primary, utf8, incr;
+    uint8_t bytes[32];
+    size_t len, split;
+    unsigned mode, phase, completed;
+    bool requested, expected_failure;
+    int expected_which;
+    const uint8_t *expected_bytes;
+    size_t expected_len;
+    xcb_selection_request_event_t request;
+} clip_peer;
+
+static void clip_assert(bool ok, const char *what) {
+    if (!ok) { fprintf(stderr, "§21 clipboard model: %s\n", what); __builtin_trap(); }
+}
+static void clip_barrier(xcb_connection_t *c) {
+    xcb_get_input_focus_reply_t *reply = xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL);
+    clip_assert(reply != NULL, "server barrier"); free(reply);
+}
+static xcb_atom_t clip_atom(xcb_connection_t *c, const char *name) {
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c,
+        xcb_intern_atom(c, 0, (uint16_t)strlen(name), name), NULL);
+    clip_assert(reply != NULL, "intern atom"); xcb_atom_t a = reply->atom; free(reply); return a;
+}
+static xcb_window_t clip_window(xcb_connection_t *c) {
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+    xcb_window_t win = xcb_generate_id(c);
+    uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_generic_error_t *err = xcb_request_check(c, xcb_create_window_checked(c, XCB_COPY_FROM_PARENT,
+        win, screen->root, 0, 0, 10, 10, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT,
+        XCB_CW_EVENT_MASK, &mask));
+    clip_assert(!err, "create peer window"); free(err); return win;
+}
+static uint32_t clip_server_time(clip_peer *h) {
+    unsigned sequence = xcb_change_property(h->raw, XCB_PROP_MODE_REPLACE, h->win,
+                                            h->incr, XCB_ATOM_INTEGER, 8, 1, "t").sequence;
+    clip_barrier(h->raw);
+    uint32_t stamp = 0;
+    xcb_generic_event_t *event;
+    while ((event = xcb_poll_for_event(h->raw))) {
+        if ((event->response_type & 0x7fu) == XCB_PROPERTY_NOTIFY) {
+            const xcb_property_notify_event_t *n = (const xcb_property_notify_event_t *)event;
+            if (n->window == h->win && n->atom == h->incr && n->sequence == (uint16_t)sequence) stamp = n->time;
+        }
+        free(event);
+    }
+    clip_assert(stamp != 0, "server timestamp for racing claim"); return stamp;
+}
+static void clip_notify(clip_peer *h, bool wrong_tuple) {
+    const xcb_selection_request_event_t *q = &h->request;
+    xcb_selection_notify_event_t n = { .response_type = XCB_SELECTION_NOTIFY, .requestor = q->requestor,
+        .selection = q->selection, .target = wrong_tuple ? XCB_ATOM_STRING : q->target,
+        .property = q->property, .time = q->time };
+    xcb_send_event(h->raw, 0, q->requestor, 0, (const char *)&n);
+}
+static void clip_chunk(clip_peer *h) {
+    const xcb_selection_request_event_t *q = &h->request;
+    size_t off = h->phase ? h->split : 0;
+    size_t len = h->phase == 0 ? h->split : h->phase == 1 ? h->len - h->split : 0;
+    if (h->mode == 2) len = 0; /* premature INCR terminator */
+    xcb_atom_t type = h->mode == 3 && h->phase == 1 ? XCB_ATOM_STRING : h->utf8;
+    xcb_change_property(h->raw, XCB_PROP_MODE_REPLACE, q->requestor, q->property, type, 8,
+                        (uint32_t)len, h->bytes + off);
+    h->phase++;
+}
+static void clip_raw_step(clip_peer *h) {
+    xcb_generic_event_t *event;
+    while ((event = xcb_poll_for_event(h->raw))) {
+        uint8_t type = event->response_type & 0x7fu;
+        if (type == XCB_SELECTION_REQUEST) {
+            h->request = *(const xcb_selection_request_event_t *)event;
+            h->requested = true;
+            const xcb_selection_request_event_t *q = &h->request;
+            clip_assert(q->target == h->utf8, "UTF8 conversion target");
+            if (h->mode == 4) { free(event); continue; } /* silent owner -> timeout */
+            if (h->mode == 7) clip_notify(h, true); /* must not complete this request */
+            if (h->mode >= 1 && h->mode <= 3) {
+                uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+                xcb_change_window_attributes(h->raw, q->requestor, XCB_CW_EVENT_MASK, &mask);
+                uint32_t lower = (uint32_t)h->len;
+                xcb_change_property(h->raw, XCB_PROP_MODE_REPLACE, q->requestor, q->property, h->incr, 32, 1, &lower);
+            } else {
+                xcb_change_property(h->raw, XCB_PROP_MODE_REPLACE, q->requestor, q->property, h->utf8, 8,
+                                    (uint32_t)h->len, h->bytes);
+            }
+            clip_notify(h, false);
+        } else if (type == XCB_PROPERTY_NOTIFY && h->requested && h->mode >= 1 && h->mode <= 3) {
+            const xcb_property_notify_event_t *n = (const xcb_property_notify_event_t *)event;
+            if (n->window == h->request.requestor && n->atom == h->request.property &&
+                n->state == XCB_PROPERTY_DELETE && h->phase < 3) clip_chunk(h);
+        }
+        free(event);
+    }
+}
+static void clip_completion(void *ud, const plat_event *out) {
+    clip_peer *h = ud;
+    if (out->kind != PLAT_EV_CLIPBOARD || out->code == 2) return;
+    if (out->clip_which != h->expected_which || out->code != (h->expected_failure ? 1u : 0u))
+        fprintf(stderr, "mode=%u selection=%u expected=%d code=%u expected_failure=%d\n",
+                h->mode, out->clip_which, h->expected_which, out->code, h->expected_failure);
+    clip_assert(out->clip_which == h->expected_which && out->code == (h->expected_failure ? 1u : 0u) &&
+                out->clip_ok == !h->expected_failure, "completion selection/status");
+    if (!h->expected_failure) {
+        size_t got = 0; const uint8_t *bytes = plat_clip_data(&h->p, &got);
+        if (got != h->expected_len) fprintf(stderr, "op mode=%u expected=%zu got=%zu\n", h->mode, h->expected_len, got);
+        clip_assert(got == h->expected_len && bytes && memcmp(bytes, h->expected_bytes, got) == 0,
+                    "completion/data association");
+    }
+    h->completed++;
+}
+static void clip_app_step(clip_peer *h, int which, const uint8_t *want, size_t len, bool failure) {
+    h->expected_which = which; h->expected_bytes = want; h->expected_len = len; h->expected_failure = failure;
+    plat_callbacks cb = { h, clip_completion, NULL, NULL, NULL };
+    clip_assert(plat_run_for(&h->p, &cb, 0) == PLAT_OK, "nonblocking clipboard dispatch");
+}
+static void clip_finish(clip_peer *h, int which, const uint8_t *want, size_t len, bool failure, unsigned count) {
+    uint64_t end = trace_now_ns() + UINT64_C(2000000000);
+    while (h->completed < count && trace_now_ns() < end) {
+        xcb_flush(h->p.conn); xcb_flush(h->raw);
+        clip_raw_step(h); clip_app_step(h, which, want, len, failure);
+        if (h->completed < count) {
+            struct pollfd fds[2] = { { xcb_get_file_descriptor(h->p.conn), POLLIN, 0 },
+                                    { xcb_get_file_descriptor(h->raw), POLLIN, 0 } };
+            (void)poll(fds, 2, 1);
+        }
+    }
+    clip_assert(h->completed == count, "exactly one completion per request (watchdog)");
+    /* Rejections can have property deletion/reply cleanup still in flight.
+     * Settle that traffic before the next accepted request, while checking
+     * every queued completion against the same model. */
+    for (unsigned i = 0; i < 16; i++) {
+        clip_barrier(h->raw); clip_barrier(h->p.conn);
+        clip_raw_step(h); xcb_flush(h->raw);
+        clip_app_step(h, which, want, len, failure);
+        clip_assert(h->completed == count, "no duplicate completion");
+        if (!x11_clip_busy(&h->p)) break;
+    }
+
+}
+static void fuzz_clip_sequences(const uint8_t *data, size_t size) {
+    if (!getenv("EDIT_X11_FUZZ_LIVE") || !size) return;
+    static bool started;
+    if (!started) {
+        clip_assert(xvfb_start() != 0, "private Xvfb required in live mode");
+        trace_init(); trace_thread_register(); started = true;
+    }
+    clip_peer h; memset(&h, 0, sizeof h);
+    h.p.conn = xcb_connect(NULL, NULL); h.raw = xcb_connect(NULL, NULL);
+    clip_assert(!xcb_connection_has_error(h.p.conn) && !xcb_connection_has_error(h.raw), "private connections");
+    h.p.win = clip_window(h.p.conn); h.win = clip_window(h.raw);
+    h.p.in = &h.queue;
+    h.p.timer_fd = h.p.repeat_fd = h.p.work_fd = -1;
+    clip_assert(x11_clip_init(&h.p) == PLAT_OK, "clipboard initialization");
+    x11_clip_set_limits(&h.p, 4, 250, UINT32_MAX);
+    h.clipboard = clip_atom(h.raw, "CLIPBOARD"); h.primary = XCB_ATOM_PRIMARY;
+    h.utf8 = clip_atom(h.raw, "UTF8_STRING"); h.incr = clip_atom(h.raw, "INCR");
+    size_t ops = size < 8 ? size : 8;
+    for (size_t i = 0; i < ops; i++) {
+        h.mode = data[i] % 8u; h.phase = h.completed = 0; h.requested = false;
+        x11_clip_set_limits(&h.p, 0, 250, UINT32_MAX);
+        h.len = 2u + data[(i + 1) % size] % 30u;
+        h.split = 1u + data[(i + 2) % size] % (h.len - 1u);
+        for (size_t j = 0; j < h.len; j++) h.bytes[j] = (uint8_t)('a' + data[(i + j) % size] % 26u);
+        int which = (data[i] & 8u) ? PLAT_CLIP_PRIMARY : PLAT_CLIP_CLIPBOARD;
+        xcb_atom_t selection = which == PLAT_CLIP_PRIMARY ? h.primary : h.clipboard;
+        if (h.mode == 6) {
+            /* Alternating local selections: bytes observed from each callback
+             * must match that selection, including deferred owner confirmation. */
+            clip_assert(plat_clip_set(&h.p, which, h.bytes, h.len) == PLAT_OK, "local claim");
+            clip_assert(plat_clip_request(&h.p, which) == PLAT_OK, "pending local request");
+            clip_finish(&h, which, h.bytes, h.len, false, 1);
+            continue;
+        }
+        if (h.mode == 5) {
+            h.p.last_time = clip_server_time(&h);
+            clip_assert(plat_clip_set(&h.p, which, "old", 3) == PLAT_OK, "racing claim");
+            clip_barrier(h.p.conn); /* server accepted claim; confirmation still pending */
+            clip_assert(plat_clip_request(&h.p, which) == PLAT_OK, "request behind racing confirmation");
+        }
+        xcb_set_selection_owner(h.raw, h.win, selection, XCB_CURRENT_TIME);
+        clip_barrier(h.raw);
+        if (h.mode == 5) {
+            clip_barrier(h.p.conn);
+            clip_finish(&h, which, h.bytes, h.len, false, 1);
+            h.p.last_time = 0;
+            continue;
+        }
+        /* Finish ownership loss before asking the raw owner. */
+        clip_app_step(&h, which, h.bytes, h.len, false);
+        x11_clip_set_limits(&h.p, 0, h.mode == 4 ? 2u : 250u, UINT32_MAX);
+        int rc = plat_clip_request(&h.p, which);
+        if (rc != PLAT_OK) fprintf(stderr, "fuzz op=%zu mode=%u which=%d rc=%d busy=%zu completed=%u\n",
+                                  i, h.mode, which, rc, x11_clip_busy(&h.p), h.completed);
+        clip_assert(rc == PLAT_OK, "remote request accepted");
+        clip_finish(&h, which, h.bytes, h.len, h.mode == 2 || h.mode == 3 || h.mode == 4, 1);
+        clip_assert(h.requested, "raw peer received conversion");
+    }
+    x11_clip_destroy(&h.p);
+    clip_assert(x11_clip_mem(&h.p) == 0, "destroy releases clipboard memory");
+    xcb_disconnect(h.p.conn); xcb_disconnect(h.raw);
 }

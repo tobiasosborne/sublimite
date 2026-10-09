@@ -79,3 +79,35 @@ Amendment evidence: ../../docs/decisions/rename-sublimite.md.
 Amendment final verification: gcc make all, clang ASan/UBSan make check
 (detect_leaks=0), make fuzz and the focused contracts passed; no new open
 problem. Stamped X11 fuzz smoke evidence is in the decision document.
+## P2.2g — edit-e6x.21 (review §21–25)
+
+Done: clipboard sequence fuzz operations against a private raw peer; P2.2f
+populated XI2 reachability confirmed without changing XI2. Startup rejects
+invalid dimensions and checked colormap/window/Present errors with cleanup.
+Clipboard test initialization failures after Xvfb startup are fatal;
+EDIT_X11_STRICT=1 also rejects unavailable private infrastructure. Startup bench
+errors and subset budget misses fail; --self-check is synthetic, unmeasured.
+The live test now includes tests/x11_test_main.c.in with mapping, expose, resize,
+focus, close, real Present serial/timestamps, burst/order and zero-idle-wakeup
+assertions; an independent parent watchdog bounds it. Historical manual template
+under src/x11 is untouched. See docs/decisions/P2.2g.md for each red/green.
+
+Verified: make all exit 0; make check passed 35 sanitizer binaries and replay CLI
+with DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 EDIT_X11_STRICT=1;
+make fuzz built 20 fuzzers. Final raw-peer fuzz: 9364 runs / 121 s, no errors
+(M)[AC], Not charging, load 7.20. Leak detection remains for coordinator.
+
+Missing in this bead: full G4a exec → completed CPU buffer + map + accepted input,
+including verified cold-cache mode, requires an editor/raster fixture outside
+scope. The current platform subset passing cannot establish the full gate.
+Earlier clipboard bulk-work and XI2/input proposals and manual touchpad/evtrace
+checks remain as documented in P2.2d–f; this bead does not address them.
+
+Additional restricted clipboard issue discovered by §21's raw-peer model:
+CurrentTime (last_time=0) ownership race fails completion/data association;
+nonzero server-time recipe passes. Reproducer and clip.c proposal are in P2.2g.
+No clipboard fix or default failing test was introduced outside the bead scope.
+Pure decoder fuzz: 2363697 runs / 121 s, no errors (M)[AC], load 6.49.
+Single final TRACK bench (Not charging [AC], load 7.20): translation p50/p99
+341/621 ns, zero allocations; startup subset 8.282/8.934 ms, exit 0 (M).
+No full G4a verdict and no bench rerun.

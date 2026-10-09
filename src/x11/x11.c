@@ -289,10 +289,20 @@ void plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz) {
 
 bool plat_poll_event(plat *p, plat_event *out) { return p->in && x11_q_pop(IN(p), out); }
 
+/* Startup may wait for checked requests; runtime dispatch stays nonblocking. */
+static bool init_request_ok(xcb_connection_t *c, xcb_void_cookie_t cookie) {
+    xcb_generic_error_t *err = xcb_request_check(c, cookie);
+    bool ok = !err && !xcb_connection_has_error(c);
+    free(err);
+    return ok;
+}
+
 int plat_init(plat *p, const plat_config *cfg) {
     memset(p, 0, sizeof *p);
     p->timer_fd = p->work_fd = p->repeat_fd = -1;
     if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
+    if (!cfg->width || !cfg->height || cfg->width > UINT16_MAX || cfg->height > UINT16_MAX)
+        return PLAT_ERR_FAIL;
     if (cfg->headless) return PLAT_ERR_NO_DISPLAY;
     int scr_n = 0;
     xcb_connection_t *c = xcb_connect(NULL, &scr_n);
@@ -318,7 +328,9 @@ int plat_init(plat *p, const plat_config *cfg) {
     }
 found:
     p->colormap = xcb_generate_id(c);
-    xcb_create_colormap(c, XCB_COLORMAP_ALLOC_NONE, p->colormap, s->root, p->visual);
+    if (!init_request_ok(c, xcb_create_colormap_checked(c, XCB_COLORMAP_ALLOC_NONE, p->colormap, s->root, p->visual))) {
+        plat_shutdown(p); return PLAT_ERR_FAIL;
+    }
     p->win = xcb_generate_id(c);
     p->width = cfg->width; p->height = cfg->height;
     uint32_t vals[4] = {
@@ -328,9 +340,11 @@ found:
         XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_PROPERTY_CHANGE,
         p->colormap };
     /* value order: BACK_PIXEL, BORDER_PIXEL, EVENT_MASK, COLORMAP */
-    xcb_create_window(c, p->depth, p->win, s->root, 0, 0, (uint16_t)cfg->width, (uint16_t)cfg->height, 0,
+    if (!init_request_ok(c, xcb_create_window_checked(c, p->depth, p->win, s->root, 0, 0, (uint16_t)cfg->width, (uint16_t)cfg->height, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, p->visual,
-                      XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, vals);
+                      XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, vals))) {
+        plat_shutdown(p); return PLAT_ERR_FAIL;
+    }
     const char *title = cfg->title ? cfg->title : "sublimité";
     xcb_atom_t a_name = atom(c, "_NET_WM_NAME"), a_utf8 = atom(c, "UTF8_STRING"), a_pid = atom(c, "_NET_WM_PID");
     p->wm_protocols = atom(c, "WM_PROTOCOLS");
@@ -348,10 +362,13 @@ found:
     if (ext && ext->present) {
         xcb_present_query_version_reply_t *v = xcb_present_query_version_reply(
             c, xcb_present_query_version(c, 1, 0), NULL);
-        if (v) {
-            p->present_ok = true; p->present_opcode = ext->major_opcode; free(v);
-            xcb_present_select_input(c, xcb_generate_id(c), p->win, XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY);
+        if (!v) { plat_shutdown(p); return PLAT_ERR_FAIL; }
+        free(v);
+        if (!init_request_ok(c, xcb_present_select_input_checked(c, xcb_generate_id(c), p->win,
+                                                               XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY))) {
+            plat_shutdown(p); return PLAT_ERR_FAIL;
         }
+        p->present_ok = true; p->present_opcode = ext->major_opcode;
     }
     /* P2.2 input: keymap + XI2 + selections. Failure of the keyboard setup is fatal (no input is useless);
      * XI2 absence only degrades the wheel to core buttons. */

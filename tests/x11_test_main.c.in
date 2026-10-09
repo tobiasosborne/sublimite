@@ -1,0 +1,134 @@
+/* Automated window/Present/idle fixture, included by tests/x11_live_test.c.
+ * Promotes the old src/x11 manual smoke template into the test build.
+ * CHECK and g_fail belong to the live runner; all callback state is per fixture. */
+typedef struct window_sink {
+    plat *p;
+    unsigned expose, resize, focus_in, focus_out, close, blink, present, keys, buttons;
+    uint32_t width, height, serial;
+    uint64_t ust, msc;
+    unsigned delivered, close_at, present_at;
+} window_sink;
+
+static void window_event(void *ud, const plat_event *e) {
+    window_sink *s = ud;
+    switch (e->kind) {
+    case PLAT_EV_EXPOSE: s->expose++; break;
+    case PLAT_EV_RESIZE: s->resize++; s->width = e->w; s->height = e->h; break;
+    case PLAT_EV_FOCUS: if (e->focused) s->focus_in++; else s->focus_out++; break;
+    case PLAT_EV_CLOSE: s->close++; s->close_at = s->delivered; break;
+    case PLAT_EV_KEY:
+        CHECK(e->press == ((s->keys & 1u) == 0), "§25 key press/release order");
+        CHECK(e->code == 38, "§25 burst key code");
+        CHECK(e->press || !e->utf8_len, "§25 release inserts no text");
+        s->keys++; s->delivered++; break;
+    case PLAT_EV_BUTTON:
+        CHECK(e->code == 1 && e->press == ((s->buttons & 1u) == 0), "§25 button order");
+        s->buttons++; s->delivered++; break;
+    default: break;
+    }
+}
+static void window_blink(void *ud) { ((window_sink *)ud)->blink++; }
+static void window_present(void *ud, uint32_t serial, uint64_t ust, uint64_t msc) {
+    window_sink *s = ud;
+    s->present++; s->present_at = s->delivered; s->serial = serial; s->ust = ust; s->msc = msc;
+}
+static void window_barrier(xcb_connection_t *c) {
+    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL);
+    CHECK(r != NULL, "§25 X server barrier"); free(r);
+}
+static void window_pump(plat *p, const plat_callbacks *cb, const unsigned *count) {
+    uint64_t end = trace_now_ns() + UINT64_C(2000000000);
+    do {
+        CHECK(plat_run_for(p, cb, 10) == PLAT_OK, "§25 loop result");
+    } while (!*count && trace_now_ns() < end && !g_fail);
+}
+static void test_window_contracts(plat *p) {
+    xcb_connection_t *peer = xcb_connect(NULL, NULL);
+    CHECK(peer && !xcb_connection_has_error(peer), "§25 independent peer");
+    if (!peer || xcb_connection_has_error(peer)) { if (peer) xcb_disconnect(peer); return; }
+    window_sink s = { .p = p };
+    plat_callbacks cb = { &s, window_event, window_blink, NULL, window_present };
+    plat_set_repeat(p, 0, 0);
+    plat_set_blink(p, 0);
+    plat_map(p);
+    window_barrier(p->conn);
+    xcb_get_window_attributes_reply_t *attrs = xcb_get_window_attributes_reply(
+        peer, xcb_get_window_attributes(peer, p->win), NULL);
+    CHECK(attrs && attrs->map_state == XCB_MAP_STATE_VIEWABLE, "§25 mapped window is viewable");
+    free(attrs);
+    window_pump(p, &cb, &s.expose);
+    CHECK(s.expose > 0, "§25 map delivers Expose");
+    uint32_t dims[] = { 320, 240 };
+    xcb_configure_window(peer, p->win, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, dims);
+    window_barrier(peer);
+    window_pump(p, &cb, &s.resize);
+    CHECK(s.resize == 1 && s.width == 320 && s.height == 240 && p->width == 320 && p->height == 240,
+          "§25 resize callback and platform dimensions");
+    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, p->win, XCB_CURRENT_TIME);
+    window_barrier(peer);
+    window_pump(p, &cb, &s.focus_in);
+    CHECK(s.focus_in == 1 && p->focused, "§25 focus-in callback/state");
+    CHECK(p->present_ok, "§25 private Xvfb supports Present");
+    if (p->present_ok) {
+        xcb_pixmap_t pixmap = xcb_generate_id(peer);
+        xcb_generic_error_t *err = xcb_request_check(peer,
+            xcb_create_pixmap_checked(peer, p->depth, pixmap, p->win, 320, 240));
+        CHECK(!err, "§25 create Present pixmap"); free(err);
+        /* Real server-generated pixmap completion, with a distinctive serial. */
+        xcb_key_press_event_t prior = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = p->win, .same_screen = 1 };
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&prior);
+        prior.response_type = XCB_KEY_RELEASE;
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&prior);
+        const uint32_t serial = UINT32_C(0x21a5);
+        err = xcb_request_check(peer, xcb_present_pixmap_checked(peer, p->win, pixmap, serial,
+            0, 0, 0, 0, 0, 0, 0, XCB_PRESENT_OPTION_ASYNC, 0, 0, 0, 0, NULL));
+        CHECK(!err, "§25 Present request accepted"); free(err);
+        window_pump(p, &cb, &s.present);
+        CHECK(s.present == 1 && s.serial == serial && s.ust > 0 && s.msc > 0,
+              "§25 matching Present callback (got %u, serial %u)", s.present, s.serial);
+        CHECK(s.present_at == 2, "§25 Present callback follows preceding input");
+        s.keys = s.delivered = 0;
+        xcb_free_pixmap(peer, pixmap);
+    }
+    /* Burst larger than the input ring, followed by close, all on one raw peer.
+     * Delivery must preserve both every transition and the final close position. */
+    enum { PAIRS = 300 };
+    for (unsigned i = 0; i < PAIRS; i++) {
+        xcb_key_press_event_t k = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = p->win, .same_screen = 1 };
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&k);
+        k.response_type = XCB_KEY_RELEASE;
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&k);
+        xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 1, .event = p->win, .same_screen = 1 };
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_BUTTON_PRESS, (const char *)&b);
+        b.response_type = XCB_BUTTON_RELEASE;
+        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_BUTTON_RELEASE, (const char *)&b);
+    }
+    xcb_client_message_event_t close = { .response_type = XCB_CLIENT_MESSAGE, .format = 32,
+        .window = p->win, .type = p->wm_protocols };
+    close.data.data32[0] = p->wm_delete;
+    xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_NO_EVENT, (const char *)&close);
+    window_barrier(peer);
+    window_pump(p, &cb, &s.close);
+    CHECK(s.keys == 2 * PAIRS && s.buttons == 2 * PAIRS, "§25 burst preserves every transition (%u keys, %u buttons)", s.keys, s.buttons);
+    CHECK(s.close == 1 && s.close_at == 4 * PAIRS, "§25 close follows preceding input callbacks");
+    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_CURRENT_TIME);
+    window_barrier(peer);
+    window_pump(p, &cb, &s.focus_out);
+    CHECK(s.focus_out == 1 && !p->focused, "§25 focus-out callback/state");
+    /* Flush residual map/resize/Present events before counting idle wakeups. */
+    window_barrier(p->conn);
+    CHECK(plat_run_for(p, &cb, 50) == PLAT_OK, "§25 settle before idle");
+    plat_set_blink(p, 1); /* must be ignored while unfocused */
+    uint64_t before = p->iterations;
+    CHECK(plat_run_for(p, &cb, 100) == PLAT_OK, "§25 unfocused idle returns");
+    CHECK(p->iterations == before && s.blink == 0, "§25 unfocused idle has zero wakeups/blinks");
+    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, p->win, XCB_CURRENT_TIME);
+    window_barrier(peer);
+    CHECK(plat_run_for(p, &cb, 50) == PLAT_OK && p->focused, "§25 refocus before disabled-blink idle");
+    plat_set_blink(p, 0);
+    before = p->iterations;
+    CHECK(plat_run_for(p, &cb, 100) == PLAT_OK, "§25 blink-disabled idle returns");
+    CHECK(p->iterations == before && s.blink == 0, "§25 blink-disabled idle has zero wakeups/blinks");
+    xcb_disconnect(peer);
+    puts(g_fail ? "§25 window/Present/idle: FAILED" : "§25 window/Present/idle: ok");
+}
