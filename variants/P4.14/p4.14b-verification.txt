@@ -1,0 +1,102 @@
+edit-457.23 / P4.14b verification
+make all: PASS (GCC, exit 0; final harness cleanup compiled)
+make check: PASS (clang ASan/UBSan, exit 0; ASAN_OPTIONS=detect_leaks=0)
+check: 47 test binaries passed
+test_replay_cli: all passed
+make fuzz: PASS (exit 0)
+fuzz: 24 fuzzers built
+IPC fuzz smoke: exit 0; no sanitizer finding; (M)[AC] power=Not charging load1=8.67
+Done 234894 runs in 11 second(s)
+Shell syntax: sh -n tools/zygote_bench.sh PASS
+Standalone endpoint test: GCC and clang ASan/UBSan PASS; includes failed-pre-fork cleanup
+CLI contracts: PASS; never set EDIT_ALLOW_REAL_DISPLAY; every connection/window used :99
+RED (before argument implementation):
+Traceback (most recent call last):
+  File "/home/tobias/Projects/editor/.wt/edit-457.23/variants/P4.14/test_cli.py", line 21, in <module>
+    assert run.returncode == 2 and message in run.stderr, (
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: zygote CLI contract: FAIL ['--build', '--real-display']: exit=1; missing build/libedit.a; run make all / make check first
+RED (before endpoint validator implementation):
+In file included from variants/P4.14/contract_test.c:5:
+variants/P4.14/contract_test.c: In function ‘main’:
+variants/P4.14/contract_test.c:20:12: error: implicit declaration of function ‘zygote_record_valid’ [-Werror=implicit-function-declaration]
+   20 |     assert(zygote_record_valid(&r, 100, true)); /* fence later than CPU ready */
+      |            ^~~~~~~~~~~~~~~~~~~
+cc1: all warnings being treated as errors
+GREEN:
+zygote CLI contract: PASS opt-in refusal, launch bounds, missing/unknown/conflicting arguments
+zygote executable guard contract: PASS driver and A/B/C/D independently refuse missing permission
+zygote endpoint contract: PASS CPU readiness, native fence/Present identity, dual display guard
+zygote endpoint contract: PASS CPU readiness, native fence/Present identity, dual display guard
+Release --run --launches 2: exit 0; final valid smoke; TRACK only
+ESTIMATE duration_s=26 launches_per_variant=2 order=ABC_then_D display=:99 real_display=0 evidence=(E)[AC] power=Not charging load1=7.82 includes=service_startup_launches_idle excludes=build conservative_not_deadline=1
+WARM variant=b backend=cpu_fallback gl_result=-10 init_ns=2052560900 service_fork_exec_ready_ns=2058123412 rss_kib=155904 hwm_kib=169092 minor=40457 major=0 evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+WARM variant=c backend=cpu gl_result=0 init_ns=150306430 service_fork_exec_ready_ns=156453914 rss_kib=55304 hwm_kib=55304 minor=13166 major=0 evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+DEVICE variant=a backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+DEVICE variant=b backend=cpu_fallback gl_result=-10 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+NATIVE_GL variant=b status=SKIP reason=Xvfb_native_Present_unsupported fallback=CPU
+DEVICE variant=c backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+DEVICE variant=d backend=cpu_fallback gl_result=-10 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.82 verdict=TRACK
+NATIVE_GL variant=d status=SKIP reason=Xvfb_native_Present_unsupported fallback=CPU
+IDLE variant=b elapsed_ns=12000149564 cpu_ticks=0 tick_hz=100 context_switch_delta=0 evidence=(M)[AC] power=Not charging load1=7.68 verdict=TRACK
+IDLE variant=c elapsed_ns=12000149564 cpu_ticks=0 tick_hz=100 context_switch_delta=0 evidence=(M)[AC] power=Not charging load1=7.68 verdict=TRACK
+MEMORY variant=b Rss:              155908 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=b Pss:               90146 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=b Private_Clean:       460 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=b Private_Dirty:     78816 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=c Rss:               55472 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=c Pss:               50498 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=c Private_Clean:         0 kB evidence=(M)[AC] power=Not charging load1=7.49
+MEMORY variant=c Private_Dirty:     48184 kB evidence=(M)[AC] power=Not charging load1=7.49
+AFTER_IDLE variant=b backend=cpu_fallback idle_ns=16220588714 map_ns=1740384 present_ns=2058046 device_ns=3620515 complete_ns=27564612 frame=5 displayed_msc=0 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+AFTER_IDLE variant=c backend=cpu idle_ns=16217144518 map_ns=2304534 present_ns=2515642 device_ns=4053222 complete_ns=14512410 frame=5 displayed_msc=0 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_map_requested n=2 p50_ns=21027970 p99_ns=21331656 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_ready_and_map n=2 p50_ns=132396344 p99_ns=135434639 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_first_present_request n=2 p50_ns=132533055 p99_ns=135546312 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_device_done n=2 p50_ns=144721289 p99_ns=147901759 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_first_present_complete n=2 p50_ns=164078365 p99_ns=165670497 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_map_requested n=2 p50_ns=4096749 p99_ns=5098457 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_ready_and_map n=2 p50_ns=4716632 p99_ns=6020005 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_first_present_request n=2 p50_ns=4870511 p99_ns=6086077 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_device_done n=2 p50_ns=8826051 p99_ns=21223439 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_first_present_complete n=2 p50_ns=24203716 p99_ns=44510258 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_map_requested n=2 p50_ns=4447576 p99_ns=4458184 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_ready_and_map n=2 p50_ns=4985808 p99_ns=5488601 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_first_present_request n=2 p50_ns=5015081 p99_ns=5573295 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_device_done n=2 p50_ns=8717192 p99_ns=16116663 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_first_present_complete n=2 p50_ns=30468730 p99_ns=31717689 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_map_requested n=2 p50_ns=1865527101 p99_ns=1904972189 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_ready_and_map n=2 p50_ns=1983125243 p99_ns=2009753711 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_first_present_request n=2 p50_ns=1983185274 p99_ns=2009831753 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_device_done n=2 p50_ns=1991779866 p99_ns=2021709116 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_first_present_complete n=2 p50_ns=2012184115 p99_ns=2046033059 evidence=(M)[AC] power=Not charging load1=7.49 verdict=TRACK
+zygote contract: PASS A/B/C interleaved, D normal GL exec, IPC wait, matching readiness/fence/Present, map/unmap, cleanup
+Sanitizer --self-check --launches 2: exit 0; instrumented numbers excluded as bench evidence
+zygote contract: PASS A/B/C interleaved, D normal GL exec, IPC wait, matching readiness/fence/Present, map/unmap, cleanup
+Independent final release audit:
+First-frame audit GREEN: PASS 8/8 ordered rows; 2 per variant; strict A/B/C order then D
+Summary audit: PASS all 20 percentile rows match raw nearest-rank samples
+Launch interval=2.685400620s (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C map_ns: p50_ns=16569786 p99_ns=16884080 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C ready_map_ns: p50_ns=126907743 p99_ns=130448831 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C device_ns: p50_ns=128604626 p99_ns=139184567 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C present_ns: p50_ns=126959760 p99_ns=130531231 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C complete_ns: p50_ns=133609635 p99_ns=133952808 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a minor_delta: p50=13187 p99=13188 max=13188 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a rss_kib: p50=55472 p99=55528 max=55528 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b minor_delta: p50=0 p99=1 max=1 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b rss_kib: p50=155908 p99=155908 max=155908 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c minor_delta: p50=1 p99=26 max=26 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c rss_kib: p50=55468 p99=55472 max=55472 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d minor_delta: p50=40041 p99=40300 max=40300 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d rss_kib: p50=155988 p99=157432 max=157432 (M)[AC], power=see raw rows, load1=7.68..7.82
+Independent sanitizer and historical audits: PASS
+Excluded: p4.14b-excluded-mixed-build.log (overlapped builds changed generated binaries)
+Earlier smoke: p4.14b-dry-run.log predates dimensions/after-idle diagnostics
+Native GL/device-driver execution on a real display remains coordinator-only; worker never ran :0.
+Missing: full CLI file/session/journal workload, effects batch labels, on-glass/compositor, GPU power, owned graphics peak, focused/unfocused G11, cold cache, leak-on verification.
+Full build/check/fuzz logs: /tmp/edit-457.23-{all,check,fuzz-build,fuzz-smoke}.log

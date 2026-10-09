@@ -1,0 +1,6 @@
+In file included from variants/P4.14/contract_test.c:5:
+variants/P4.14/contract_test.c: In function ‘main’:
+variants/P4.14/contract_test.c:20:12: error: implicit declaration of function ‘zygote_record_valid’ [-Werror=implicit-function-declaration]
+   20 |     assert(zygote_record_valid(&r, 100, true)); /* fence later than CPU ready */
+      |            ^~~~~~~~~~~~~~~~~~~
+cc1: all warnings being treated as errors

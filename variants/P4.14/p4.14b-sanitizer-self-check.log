@@ -1,0 +1,60 @@
+Not charging
+7.06
+ESTIMATE duration_s=14 launches_per_variant=2 order=ABC_then_D display=:99 real_display=0 evidence=(E)[AC] power=Not charging load1=7.06 includes=service_startup_launches_idle excludes=build conservative_not_deadline=1
+CONDITIONS swap_interval=0 vbo=orphan viewport=120x40_cells workload=empty_document cadence=back_to_back effects=caller_record_required
+COVERAGE on_glass=SKIP compositor_timing=SKIP owned_graphics_peak=SKIP gpu_power=SKIP focused_blink_G11=SKIP cold_cache=SKIP
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+WARM variant=b backend=cpu_fallback gl_result=-10 init_ns=2034337189 service_fork_exec_ready_ns=2045717150 rss_kib=282172 hwm_kib=282172 minor=68396 major=0 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+WARM variant=c backend=cpu gl_result=0 init_ns=131486846 service_fork_exec_ready_ns=143854954 rss_kib=66332 hwm_kib=66332 minor=18300 major=0 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+DEVICE variant=a backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+SAMPLE round=0 variant=a backend=cpu start_ns=17863182042474 map_ns=22362929 ready_map_ns=151017185 present_ns=151112300 device_ns=157677726 complete_ns=170489275 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=18490 major_delta=0 rss_kib=66972 gl_result=0 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+DEVICE variant=b backend=cpu_fallback gl_result=-10 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+NATIVE_GL variant=b status=SKIP reason=Xvfb_native_Present_unsupported fallback=CPU
+SAMPLE round=0 variant=b backend=cpu_fallback start_ns=17863375493630 map_ns=10117070 ready_map_ns=11762916 present_ns=12635874 device_ns=19088653 complete_ns=43786769 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=177 major_delta=0 rss_kib=283052 gl_result=-10 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+DEVICE variant=c backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+SAMPLE round=0 variant=c backend=cpu start_ns=17863441627381 map_ns=10082044 ready_map_ns=11565597 present_ns=13104086 device_ns=19516013 complete_ns=44339965 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=207 major_delta=0 rss_kib=67368 gl_result=0 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+SAMPLE round=1 variant=a backend=cpu start_ns=17863509517550 map_ns=31150321 ready_map_ns=238993592 present_ns=239109501 device_ns=246244975 complete_ns=259958749 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=18489 major_delta=0 rss_kib=67120 gl_result=0 evidence=(M)[AC] power=Not charging load1=7.06 verdict=TRACK
+SAMPLE round=1 variant=b backend=cpu_fallback start_ns=17863793378842 map_ns=8803670 ready_map_ns=10496962 present_ns=10711762 device_ns=11490942 complete_ns=25317781 ready_frame=3 present_frame=3 device_frame=3 complete_frame=3 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=71 major_delta=0 rss_kib=283328 gl_result=-10 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SAMPLE round=1 variant=c backend=cpu start_ns=17863843332471 map_ns=11525822 ready_map_ns=13283688 present_ns=13521442 device_ns=15036254 complete_ns=25807504 ready_frame=3 present_frame=3 device_frame=3 complete_frame=3 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=81 major_delta=0 rss_kib=67672 gl_result=0 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+DEVICE variant=d backend=cpu_fallback gl_result=-10 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+NATIVE_GL variant=d status=SKIP reason=Xvfb_native_Present_unsupported fallback=CPU
+SAMPLE round=0 variant=d backend=cpu_fallback start_ns=17863894251597 map_ns=1998480782 ready_map_ns=2138269480 present_ns=2138365215 device_ns=2146648766 complete_ns=2158713828 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=68008 major_delta=0 rss_kib=282656 gl_result=-10 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SAMPLE round=1 variant=d backend=cpu_fallback start_ns=17866120654322 map_ns=2045057568 ready_map_ns=2182777461 present_ns=2182923869 device_ns=2188055975 complete_ns=2197735602 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=67658 major_delta=0 rss_kib=282768 gl_result=-10 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+MEMORY variant=b Rss:              283336 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=b Pss:              217623 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=b Private_Clean:       456 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=b Private_Dirty:    206288 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=c Rss:               67680 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=c Pss:               62518 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=c Private_Clean:         0 kB evidence=(M)[AC] power=Not charging load1=7.14
+MEMORY variant=c Private_Dirty:     60188 kB evidence=(M)[AC] power=Not charging load1=7.14
+BENCH variant=a backend=cpu name=exec_map_requested n=2 p50_ns=22362929 p99_ns=31150321 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_ready_and_map n=2 p50_ns=151017185 p99_ns=238993592 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_first_present_request n=2 p50_ns=151112300 p99_ns=239109501 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_device_done n=2 p50_ns=157677726 p99_ns=246244975 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=a backend=cpu name=exec_first_present_complete n=2 p50_ns=170489275 p99_ns=259958749 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SIZE variant=a binary_bytes=7908704 max_rss_kib=67120 max_hwm_kib=67120 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_map_requested n=2 p50_ns=8803670 p99_ns=10117070 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_ready_and_map n=2 p50_ns=10496962 p99_ns=11762916 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_first_present_request n=2 p50_ns=10711762 p99_ns=12635874 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_device_done n=2 p50_ns=11490942 p99_ns=19088653 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=b backend=cpu_fallback name=exec_first_present_complete n=2 p50_ns=25317781 p99_ns=43786769 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SIZE variant=b binary_bytes=7911616 max_rss_kib=283328 max_hwm_kib=283328 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_map_requested n=2 p50_ns=10082044 p99_ns=11525822 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_ready_and_map n=2 p50_ns=11565597 p99_ns=13283688 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_first_present_request n=2 p50_ns=13104086 p99_ns=13521442 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_device_done n=2 p50_ns=15036254 p99_ns=19516013 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=c backend=cpu name=exec_first_present_complete n=2 p50_ns=25807504 p99_ns=44339965 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SIZE variant=c binary_bytes=7908704 max_rss_kib=67672 max_hwm_kib=67672 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_map_requested n=2 p50_ns=1998480782 p99_ns=2045057568 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_ready_and_map n=2 p50_ns=2138269480 p99_ns=2182777461 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_first_present_request n=2 p50_ns=2138365215 p99_ns=2182923869 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_device_done n=2 p50_ns=2146648766 p99_ns=2188055975 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+BENCH variant=d backend=cpu_fallback name=exec_first_present_complete n=2 p50_ns=2158713828 p99_ns=2197735602 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+SIZE variant=d binary_bytes=7911688 max_rss_kib=282768 max_hwm_kib=282768 evidence=(M)[AC] power=Not charging load1=7.14 verdict=TRACK
+zygote contract: PASS A/B/C interleaved, D normal GL exec, IPC wait, matching readiness/fence/Present, map/unmap, cleanup

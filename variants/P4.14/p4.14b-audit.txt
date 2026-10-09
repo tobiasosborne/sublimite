@@ -1,0 +1,20 @@
+First-frame audit GREEN: PASS 8/8 ordered rows; 2 per variant; strict A/B/C order then D
+Summary audit: PASS all 20 percentile rows match raw nearest-rank samples
+Launch interval=2.685400620s (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C map_ns: p50_ns=16569786 p99_ns=16884080 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C ready_map_ns: p50_ns=126907743 p99_ns=130448831 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C device_ns: p50_ns=128604626 p99_ns=139184567 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C present_ns: p50_ns=126959760 p99_ns=130531231 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+Paired A-C complete_ns: p50_ns=133609635 p99_ns=133952808 C_faster_pairs=2/2 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a minor_delta: p50=13187 p99=13188 max=13188 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=a rss_kib: p50=55472 p99=55528 max=55528 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b minor_delta: p50=0 p99=1 max=1 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=b rss_kib: p50=155908 p99=155908 max=155908 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c minor_delta: p50=1 p99=26 max=26 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=c rss_kib: p50=55468 p99=55472 max=55472 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d minor_delta: p50=40041 p99=40300 max=40300 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d major_delta: p50=0 p99=0 max=0 (M)[AC], power=see raw rows, load1=7.68..7.82
+variant=d rss_kib: p50=155988 p99=157432 max=157432 (M)[AC], power=see raw rows, load1=7.68..7.82

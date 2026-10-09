@@ -1,0 +1,19 @@
+Not charging
+6.48
+ESTIMATE duration_s=26 launches_per_variant=2 order=ABC_then_D display=:99 real_display=0 evidence=(E)[AC] power=Not charging load1=6.48 includes=service_startup_launches_idle excludes=build conservative_not_deadline=1
+CONDITIONS swap_interval=0 vbo=orphan viewport=120x40_cells workload=empty_document cadence=back_to_back effects=caller_record_required
+COVERAGE on_glass=SKIP compositor_timing=SKIP owned_graphics_peak=SKIP gpu_power=SKIP focused_blink_G11=SKIP cold_cache=SKIP
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+zygote launch rejected: variant=b result=0 gl_result=0 native_gl=0
+zygote contract: FAIL launch variant=b round=1
+WARM variant=b backend=cpu_fallback gl_result=-10 init_ns=2087584389 service_fork_exec_ready_ns=2094212472 rss_kib=155956 hwm_kib=169336 minor=39569 major=0 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+WARM variant=c backend=cpu gl_result=0 init_ns=111555939 service_fork_exec_ready_ns=118186351 rss_kib=55376 hwm_kib=55376 minor=13165 major=0 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+DEVICE variant=a backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+SAMPLE round=0 variant=a backend=cpu start_ns=17727191098350 map_ns=44596239 ready_map_ns=387786297 present_ns=388088847 device_ns=399856746 complete_ns=416397408 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=17641 major_delta=0 rss_kib=67884 gl_result=0 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+DEVICE variant=b backend=cpu_fallback gl_result=-10 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+NATIVE_GL variant=b status=SKIP reason=Xvfb_native_Present_unsupported fallback=CPU
+SAMPLE round=0 variant=b backend=cpu_fallback start_ns=17727670312535 map_ns=3747832 ready_map_ns=4375943 present_ns=4533014 device_ns=14425779 complete_ns=37284130 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=1 major_delta=0 rss_kib=155960 gl_result=-10 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+DEVICE variant=c backend=cpu gl_result=0 device="CPU raster" driver="XShm/Present" evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+SAMPLE round=0 variant=c backend=cpu start_ns=17727727968539 map_ns=5366547 ready_map_ns=6156996 present_ns=6249582 device_ns=20392156 complete_ns=30582603 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=25 major_delta=0 rss_kib=55536 gl_result=0 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK
+SAMPLE round=1 variant=a backend=cpu start_ns=17727778967726 map_ns=50066100 ready_map_ns=303939819 present_ns=304115417 device_ns=311734804 complete_ns=331176765 ready_frame=1 present_frame=1 device_frame=1 complete_frame=1 displayed_msc=0 cols=120 rows=40 width=960 height=600 minor_delta=17607 major_delta=0 rss_kib=67640 gl_result=0 evidence=(M)[AC] power=Not charging load1=6.48 verdict=TRACK

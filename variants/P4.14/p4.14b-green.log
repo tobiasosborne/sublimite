@@ -1,0 +1,4 @@
+zygote CLI contract: PASS opt-in refusal, launch bounds, missing/unknown/conflicting arguments
+zygote executable guard contract: PASS driver and A/B/C/D independently refuse missing permission
+zygote endpoint contract: PASS CPU readiness, native fence/Present identity, dual display guard
+zygote endpoint contract: PASS CPU readiness, native fence/Present identity, dual display guard

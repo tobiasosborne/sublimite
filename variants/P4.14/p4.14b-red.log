@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/home/tobias/Projects/editor/.wt/edit-457.23/variants/P4.14/test_cli.py", line 21, in <module>
+    assert run.returncode == 2 and message in run.stderr, (
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: zygote CLI contract: FAIL ['--build', '--real-display']: exit=1; missing build/libedit.a; run make all / make check first
