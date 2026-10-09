@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
+#define CLIENT_TIMEOUT_MS 30000
 typedef struct capture { size_t calls; ipc_token token; bool stdin_seen; } capture;
 static ipc_result opened(const ipc_request *r, ipc_token token, void *ctx)
 {
@@ -70,9 +71,11 @@ static void roundtrip(const char *dir, bool wait, bool input)
     if(init_rc!=IPC_OK) fprintf(stderr,"init rc=%d errno=%d (%s)\n",(int)init_rc,errno,strerror(errno));
     CHECK(init_rc==IPC_OK);
     pid_t child=fork(); CHECK(child>=0);
-    if(child==0) { ipc_request r=request(wait,input); _exit(ipc_client_send(dir,&r,2000)==IPC_OK?0:2); }
+    if(child==0) { ipc_request r=request(wait,input); ipc_result rc=ipc_client_send(dir,&r,CLIENT_TIMEOUT_MS);
+        if(rc!=IPC_OK) fprintf(stderr,"roundtrip: ipc_result=%d expected=%d\n",(int)rc,(int)IPC_OK);
+        _exit(rc==IPC_OK?0:2); }
     capture c={0};
-    for(int i=0;i<20 && c.calls==0;i++) { struct pollfd p={ipc_server_fd(&s),POLLIN,0}; CHECK(poll(&p,1,1000)>0); CHECK(ipc_server_drain(&s,opened,&c)==IPC_OK); }
+    for(int i=0;i<20 && c.calls==0;i++) { struct pollfd p={ipc_server_fd(&s),POLLIN,0}; CHECK(poll(&p,1,CLIENT_TIMEOUT_MS)>0); CHECK(ipc_server_drain(&s,opened,&c)==IPC_OK); }
     CHECK(c.calls==1 && c.stdin_seen==input);
     if(wait) { int status=0; CHECK(waitpid(child,&status,WNOHANG)==0); CHECK(ipc_server_report_closed(&s,c.token)==IPC_OK); CHECK(ipc_server_drain(&s,opened,&c)==IPC_OK); }
     int status=0; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
@@ -88,7 +91,7 @@ static int raw_connect(const char *dir)
 }
 static void drain_ready(ipc_server *s, capture *c)
 {
-    struct pollfd p={ipc_server_fd(s),POLLIN,0}; CHECK(poll(&p,1,1000)>0);
+    struct pollfd p={ipc_server_fd(s),POLLIN,0}; CHECK(poll(&p,1,CLIENT_TIMEOUT_MS)>0);
     edit_malloc_guard_begin();
     CHECK(ipc_server_drain(s,opened,c)==IPC_OK);
     size_t allocations=edit_malloc_guard_end();
@@ -138,32 +141,69 @@ static void endpoint_validation(const char *dir)
     ipc_server s={0}; CHECK(ipc_server_init(&s,dir)==IPC_INVALID); struct stat st; CHECK(stat(path,&st)==0 && S_ISREG(st.st_mode)); CHECK(unlink(path)==0);
     CHECK(chmod(dir,0755)==0); CHECK(ipc_server_init(&s,dir)==IPC_INVALID); CHECK(chmod(dir,0700)==0);
     CHECK(unsetenv("XDG_RUNTIME_DIR")==0); CHECK(ipc_server_init(&s,NULL)==IPC_OK);
-    ipc_server other={0}; CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS); ipc_server_fini(&s);
+    const char *ns=getenv("EDIT_IPC_NAMESPACE"); CHECK(ns!=NULL && ns[0]!='\0');
+    char saved[108], alternate[108], name[108];
+    CHECK(snprintf(saved,sizeof saved,"%s",ns)>0);
+    int n=snprintf(name,sizeof name,"edit-%lu-%s",(unsigned long)getuid(),saved);
+    CHECK(n>0 && (size_t)n<sizeof name);
+    struct sockaddr_un bound={0}; socklen_t len=sizeof bound;
+    CHECK(getsockname(s.listener,(struct sockaddr *)&bound,&len)==0);
+    CHECK(bound.sun_path[0]=='\0' && len==offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
+    CHECK(memcmp(bound.sun_path+1,name,(size_t)n)==0);
+    ipc_server other={0}; CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS);
+    CHECK(snprintf(alternate,sizeof alternate,"%s-other",saved)>0);
+    CHECK(setenv("EDIT_IPC_NAMESPACE",alternate,1)==0);
+    roundtrip(NULL,false,true); /* Independent abstract server AND client. */
+    char oversized[108]; memset(oversized,'x',sizeof oversized-1); oversized[sizeof oversized-1]='\0';
+    ipc_request r=request(false,false);
+    CHECK(setenv("EDIT_IPC_NAMESPACE",oversized,1)==0);
+    CHECK(ipc_server_init(&other,NULL)==IPC_LIMIT && ipc_client_send(NULL,&r,CLIENT_TIMEOUT_MS)==IPC_LIMIT);
+    CHECK(ipc_server_init(&other,dir)==IPC_OK); ipc_server_fini(&other); /* Hook is abstract-only. */
+    CHECK(setenv("EDIT_IPC_NAMESPACE","",1)==0);
+    CHECK(ipc_server_init(&other,NULL)==IPC_INVALID && ipc_client_send(NULL,&r,CLIENT_TIMEOUT_MS)==IPC_INVALID);
+    CHECK(setenv("EDIT_IPC_NAMESPACE",saved,1)==0);
+    CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS); ipc_server_fini(&s);
     CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
 }
 
+typedef struct callback_state { ipc_server *server; size_t calls; } callback_state;
 static ipc_result rejected(const ipc_request *r, ipc_token token, void *ctx)
 {
-    (void)r; (void)token; (void)ctx; return IPC_REJECTED;
+    (void)r; (void)token; callback_state *state=ctx; state->calls++; return IPC_REJECTED;
 }
 static ipc_result close_now(const ipc_request *r, ipc_token token, void *ctx)
 {
-    CHECK(r->wait); CHECK(ipc_server_report_closed(ctx,token)==IPC_OK); return IPC_OK;
+    callback_state *state=ctx; state->calls++;
+    CHECK(r->wait); CHECK(ipc_server_report_closed(state->server,token)==IPC_OK); return IPC_OK;
 }
 static void callback_results(const char *dir, bool reject)
 {
     ipc_server s={0}; CHECK(ipc_server_init(&s,dir)==IPC_OK);
+    callback_state state={&s,0};
+    /* Accept a partial request before releasing the real client. A token is
+     * assigned on accept, so it cannot prove the callback has sent an ACK. */
+    int pending=raw_connect(dir), start[2]; CHECK(pipe(start)==0);
+    CHECK(write(pending,"E",1)==1);
     pid_t child=fork(); CHECK(child>=0);
-    if(child==0) { ipc_request r=request(true,false); ipc_result rc=ipc_client_send(dir,&r,2000); _exit(rc==(reject?IPC_REJECTED:IPC_OK)?0:2); }
-    for(int i=0;i<3;i++) {
-        struct pollfd p={ipc_server_fd(&s),POLLIN,0}; CHECK(poll(&p,1,1000)>0);
-        CHECK(ipc_server_drain(&s,reject?rejected:close_now,&s)==IPC_OK);
-        int status; pid_t done=waitpid(child,&status,WNOHANG);
-        if(done==child) { CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0); ipc_server_fini(&s); return; }
-        /* Callback has sent ACK; child can finish before another fd event. */
-        if(s.next_token>0) { CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0); ipc_server_fini(&s); return; }
+    if(child==0) { close(pending); close(start[1]); char b;
+        CHECK(read(start[0],&b,1)==1); close(start[0]);
+        ipc_request r=request(true,false); ipc_result rc=ipc_client_send(dir,&r,CLIENT_TIMEOUT_MS);
+        ipc_result expected=reject?IPC_REJECTED:IPC_OK;
+        if(rc!=expected) fprintf(stderr,"callback_results: reject=%d ipc_result=%d expected=%d (IPC_TIMEOUT=%d)\n",reject,(int)rc,(int)expected,(int)IPC_TIMEOUT);
+        _exit(rc==expected?0:2); }
+    close(start[0]);
+    bool started=false;
+    while(state.calls==0) {
+        struct pollfd p={ipc_server_fd(&s),POLLIN,0}; CHECK(poll(&p,1,CLIENT_TIMEOUT_MS)>0);
+        CHECK(ipc_server_drain(&s,reject?rejected:close_now,&state)==IPC_OK);
+        if(!started) {
+            CHECK(s.next_token==1 && state.calls==0);
+            CHECK(write(start[1],"x",1)==1); close(start[1]); close(pending); started=true;
+        }
     }
-    CHECK(false);
+    CHECK(state.calls==1);
+    int status; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+    ipc_server_fini(&s);
 }
 
 static void stale(const char *dir)
@@ -191,12 +231,35 @@ static void race(const char *dir)
     for(size_t i=0;i<2;i++) { int status; CHECK(waitpid(children[i],&status,0)==children[i] && WEXITSTATUS(status)==0); }
     close(start[1]); close(result[0]); close(finish[1]);
 }
-int main(void)
+static int run_suite(void)
 {
-    alarm(30); char tmp[]="/tmp/edit-ipc-test-XXXXXX"; char *dir=mkdtemp(tmp); CHECK(dir!=NULL); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
-    parser(dir); wire_tests(); roundtrip(dir,false,false); roundtrip(dir,true,false); roundtrip(dir,false,true); stale(dir); race(dir); fragmented(dir); wait_tokens(dir); endpoint_validation(dir); callback_results(dir,true); callback_results(dir,false);
+    alarm(120); char tmp[]="/tmp/edit-ipc-test-XXXXXX"; char *dir=mkdtemp(tmp); CHECK(dir!=NULL); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
+    /* mkdtemp makes this namespace unique across processes and worktrees.
+     * Forked clients must inherit it rather than choose their own endpoint. */
+    CHECK(setenv("EDIT_IPC_NAMESPACE",dir+5,1)==0);
+    parser(dir); wire_tests(); roundtrip(dir,false,false); roundtrip(dir,true,false); roundtrip(dir,false,true); stale(dir); race(dir); fragmented(dir); wait_tokens(dir); callback_results(dir,true); callback_results(dir,false); endpoint_validation(dir);
     char p[IPC_PATH_CAP]; const char *names[]={"a:1","link","real"};
     for(size_t i=0;i<3;i++) { CHECK(snprintf(p,sizeof p,"%s/%s",dir,names[i])>0); if(i==2) CHECK(rmdir(p)==0); else CHECK(unlink(p)==0); }
     CHECK(snprintf(p,sizeof p,"%s/edit-%lu.lock",dir,(unsigned long)getuid())>0); CHECK(unlink(p)==0); CHECK(rmdir(dir)==0);
     puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints ok"); return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if(argc==1) return run_suite();
+    CHECK(argc==2 && strcmp(argv[1],"--parallel")==0);
+    size_t failures=0;
+    for(size_t round=0;round<20;round++) {
+        pid_t children[4];
+        for(size_t i=0;i<4;i++) {
+            children[i]=fork(); CHECK(children[i]>=0);
+            if(children[i]==0) exit(run_suite());
+        }
+        for(size_t i=0;i<4;i++) {
+            int status; CHECK(waitpid(children[i],&status,0)==children[i]);
+            if(!WIFEXITED(status) || WEXITSTATUS(status)!=0) failures++;
+        }
+    }
+    printf("ipc_test parallel: 20 rounds x 4 processes = 80 runs, %zu failures\n",failures);
+    return failures==0?0:1;
 }

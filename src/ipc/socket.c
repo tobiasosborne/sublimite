@@ -34,7 +34,11 @@ static ipc_result address(const char *runtime, struct sockaddr_un *a, socklen_t 
         if(n<0 || (size_t)n>=sizeof a->sun_path) return IPC_LIMIT;
         *len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+(size_t)n+1u);
     } else {
-        n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"edit-%lu",(unsigned long)getuid());
+        const char *ns=getenv("EDIT_IPC_NAMESPACE");
+        if(ns!=NULL) {
+            if(ns[0]=='\0') return IPC_INVALID;
+            n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"edit-%lu-%s",(unsigned long)getuid(),ns);
+        } else n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"edit-%lu",(unsigned long)getuid());
         if(n<0 || (size_t)n>=sizeof a->sun_path-1) return IPC_LIMIT;
         *len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     }

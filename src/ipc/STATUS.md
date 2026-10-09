@@ -24,6 +24,8 @@ env DISPLAY=:99 EDIT_DISPLAY=:99 make all
 env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
 env DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz
 env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/ipc_test
+env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/ipc_test --parallel
+env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 ./build/san/tests/ipc_test --parallel
 env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 ./build/fuzz/ipc_fuzz -max_total_time=60 -max_len=8192
 cat /sys/class/power_supply/BAT0/status
 cut -d' ' -f1 /proc/loadavg
@@ -50,3 +52,25 @@ Verification completed 2026-10-09:
 
 No module implementation work remains. Integration and coordinator leak/quiet
 box checks are the deliberately deferred follow-up described above.
+
+edit-457.17 test isolation: abstract fallback now supports the documented
+`EDIT_IPC_NAMESPACE` test hook; the unset default and filesystem endpoints
+retain their names. Tests always use a private per-process namespace, inherited
+by forked clients, and cover independent abstract endpoints and hook bounds.
+Callback regressions force an accepted incomplete peer before releasing the
+client, drain until actual callback completion, and log unexpected ipc_result
+values. A generous readiness/client deadline replaces scheduling-sensitive
+startup waits; exit status still asserts the expected result kind.
+
+Red release parallel loop: 8/80 failures (M)[AC], Full, load1=7.34.
+Controlled callback red: IPC_TIMEOUT (6), expected IPC_REJECTED (8), child
+exit 2 (M)[AC], Full, load1=6.50; accepting a peer was mistaken for sending ACK.
+Green release parallel loop: 0/80 failures (M)[AC], Full, load1=5.03.
+Green ASan/UBSan parallel loop: 0/80 failures (M)[AC], Full, load1=11.17.
+Gcc `make all`: exit 0 (M)[AC], Full, load1=5.03.
+Clang ASan/UBSan `make check`: 33 test binaries and replay CLI checks passed,
+exit 0 (M)[AC], Full, load1=6.32; DISPLAY/EDIT_DISPLAY=:99, detect_leaks=0.
+`make fuzz`: 19 fuzzers built, exit 0 (M)[AC], Full, load1=6.32.
+IPC decoder fuzz: 2,619,395 runs in 61 seconds, exit 0, no sanitizer
+findings (M)[AC], Full, load1=11.17; no persistent corpus generated.
+Benchmark not rerun: startup/test-only change, no typing-path change.
