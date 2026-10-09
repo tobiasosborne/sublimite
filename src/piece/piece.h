@@ -12,6 +12,8 @@
  * it may be handed to any worker thread and read concurrently by many threads
  * with no locking. piece_snapshot_release may be called from any thread (once
  * per snapshot). A snapshot stays valid after the tree is destroyed.
+ * THREADS (P1.4a-b): no thread creation inside piece_*; bulk counting of
+ * unindexed mapped bytes belongs to P1.6 lineidx on the src/work pool.
  *
  * ERRORS: functions returning int return 0 on success, non-zero on failure
  * (PIECE_ERR_RANGE: offset/len out of range, PIECE_ERR_NOMEM: allocator

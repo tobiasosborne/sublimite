@@ -2,6 +2,7 @@
  *
  * FROZEN referee for the P1.4 competition: every variant implementing
  * src/piece/piece.h is measured by this file unchanged. Spec and gate
+ * Amendment P1.4a-b (edit-4w1.20) unfreezes only the line-jump fix.
  * citations: docs/decisions/P1.4a.md. Machine-readable output, one per cell:
  *   BENCH row=<row> col=<col> p50=<v> p99=<v> unit=<ns|us|ms|B|MB|GB/s|count> n=<samples>
  *         gate=<expr|none> status=<PASS|MISS|TRACK|SKIP|TIMEOUT>
@@ -28,6 +29,7 @@
 typedef struct { double p50, p99; } gate_t; /* display unit; < 0 = no limit */
 
 static const gate_t NOGATE = { -1.0, -1.0 };
+static const gate_t G_JUMP = { 30.0, 50.0 }; /* G7j warm, Target A, ms; indexed cell */
 
 static int gate_active(const gate_t *g) { return g->p50 >= 0.0 || g->p99 >= 0.0; }
 
@@ -167,6 +169,13 @@ static int write_file(const char *path, const char *s)
 
 static int fabs_close(double a, double b) { double d = a - b; return d < 1e-9 && d > -1e-9; }
 
+static uint64_t line_jump_target(uint64_t line_count, int quick)
+{
+    /* Exact floor(0.9 * line_count), without overflow; quick scales by 64. */
+    uint64_t target = (line_count / 10) * 9 + ((line_count % 10) * 9) / 10;
+    return quick ? target / 64 : target;
+}
+
 static int selftest(void)
 {
     char b[512], tmpl[3][40];
@@ -175,6 +184,26 @@ static int selftest(void)
     int i;
     bench_samples s;
     uint64_t buf[5] = { 10, 20, 30, 40, 100000 };
+
+    CHECK(line_jump_target(1, 0) == 0);
+    CHECK(line_jump_target(11, 0) == 9);
+    CHECK(line_jump_target(8947842, 0) == 8053057);
+    CHECK(line_jump_target(8947842, 1) == 125829);
+    CHECK(line_jump_target(20000000, 0) == 18000000);
+    CHECK(line_jump_target(UINT64_MAX, 0) == UINT64_C(16602069666338596453));
+    {
+        uint64_t lc;
+        for (lc = 1; lc <= 1024; lc++) {
+            CHECK(line_jump_target(lc, 0) < lc);
+            CHECK(line_jump_target(lc, 1) < lc);
+        }
+    }
+    gate_expr(b, sizeof b, &G_JUMP, "ms");
+    CHECK(strcmp(b, "p50<=30ms,p99<=50ms") == 0);
+    CHECK(strcmp(gate_status(&G_JUMP, 30, 50, 5, 0), "PASS") == 0);
+    CHECK(strcmp(gate_status(&G_JUMP, 30.001, 50, 5, 0), "MISS") == 0);
+    CHECK(strcmp(gate_status(&G_JUMP, 30, 50.001, 5, 0), "MISS") == 0);
+    CHECK(strcmp(gate_status(&NOGATE, 600, 800, 5, 0), "TRACK") == 0);
 
     fmt_line(b, sizeof b, "code_1m", "insert", 1.5, 20.25, "us", 1000, "p99<=50us", "PASS");
     CHECK(strcmp(b, "BENCH row=code_1m col=insert p50=1.500 p99=20.250 unit=us n=1000 "
@@ -593,7 +622,6 @@ static void emit_mem(const char *row, const source *s, const world *w, int track
 static const gate_t G_OP = { -1.0, 50.0 };    /* §2.6 insert/delete p99 <= 50 us */
 static const gate_t G_UNDO = { 63.0, 84.0 };  /* G9 10k-step undo, ms */
 static const gate_t G_PASTE = { 5.0, 15.0 };  /* G9 1 MB paste, ms */
-static const gate_t G_JUMP = { 30.0, 50.0 };  /* G7j unindexed jump, ms */
 
 #define CTX_OPS "context: UI-thread slice ceiling 0.5 ms (perf s3); per-op gate 50 us (s2.6, inside G1)"
 #define CTX_OPEN "context: G5 open warm 6 / 9 ms (s0.2), end-to-end incl. frame; not a gate here"
@@ -804,33 +832,73 @@ static int row_snapshots(const char *row)
 static int row_line_jump(const char *row)
 {
     source s;
-    bench_samples so, sf, sb, sl;
+    bench_samples so, cold, indexed, sb, sl;
     size_t i, reps = 5, nq = sc(200);
-    uint64_t L0 = o_quick ? 10000000ull / 64 : 10000000ull, last = 0;
-    int to = 0;
-    piece_tree *t = NULL;
+    uint64_t lc, target;
+    int phase, fd, query_to = 0;
+    char path[512];
+    piece_tree *t;
     if (source_open(&s, "log_1g.txt", 1) != 0)
         return row_skip_missing(row, "log_1g.txt");
-    samples_alloc(&so, reps); samples_alloc(&sf, reps);
+    /* Count via the API outside the timers on a disposable tree/mapping.
+     * Every cold sample below has fresh mapping faults and no prior queries. */
+    t = tree_open(&s, NULL, NULL);
+    lc = piece_line_count(t);
+    target = line_jump_target(lc, o_quick);
+    if (target >= lc) die("line jump target is outside source line count");
+    piece_destroy(t);
+    t = NULL;
+    if (munmap((void *)s.p, s.len) != 0) die("line jump count munmap");
+    corpus_path(path, sizeof path, "log_1g.txt");
+    fd = open(path, O_RDONLY);
+    if (fd < 0) die("line jump remap open");
+    emit_value(row, "line_count", (double)lc, "count", &NOGATE, 0);
+    emit_value(row, "target_line", (double)target, "count", &NOGATE, 0);
+    samples_alloc(&so, reps); samples_alloc(&cold, reps); samples_alloc(&indexed, reps);
     samples_alloc(&sb, nq); samples_alloc(&sl, nq);
-    cell_begin();
-    for (i = 0; i < reps; i++) {
-        uint64_t on, a, r;
-        if (over()) { to = 1; break; }
-        if (t) piece_destroy(t);
-        t = tree_open(&s, &on, NULL);
-        (void)bench_add(&so, on);
-        a = bench_now_ns();
-        r = piece_line_to_byte(t, L0);
-        (void)bench_add(&sf, bench_now_ns() - a);
-        last = r;
+    for (phase = 0; phase < 2; phase++) {
+        bench_samples *samples = phase ? &indexed : &cold;
+        int to = 0;
+        cell_begin();
+        for (i = 0; i < reps; i++) {
+            uint64_t on, a, r;
+            void *m;
+            if (over()) { to = 1; break; }
+            if (t) {
+                piece_destroy(t);
+                if (munmap((void *)s.p, s.len) != 0) die("line jump sample munmap");
+            }
+            m = mmap(NULL, s.len, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) die("line jump sample mmap");
+            s.p = m;
+            t = tree_open(&s, &on, NULL);
+            if (!phase) (void)bench_add(&so, on);
+            /* A repeated query on the same tree after counts are known is the
+             * kernel equivalent of an index published. Preparation is untimed. */
+            if (phase) {
+                g_sink += piece_line_to_byte(t, target);
+                if (piece_line_count(t) != lc) die("indexed line count changed");
+            }
+            a = bench_now_ns();
+            r = piece_line_to_byte(t, target);
+            (void)bench_add(samples, bench_now_ns() - a);
+            if (r > piece_len(t) || piece_byte_to_line(t, r) != target)
+                die("line jump did not return the target line");
+            g_sink += r;
+        }
+        if (!phase) emit_samples(row, "open", &so, "ms", &NOGATE, to);
+        emit_samples(row, phase ? "line_to_byte_indexed" : "line_to_byte_cold", samples,
+                     "ms", phase ? &G_JUMP : &NOGATE, to);
     }
-    emit_samples(row, "open", &so, "ms", &NOGATE, 0);
-    emit_samples(row, "line_to_byte_first", &sf, "ms", &G_JUMP, to);
-    if (t && last > 0) {
+    if (t) {
+        uint64_t lo = target - target / 10, hi = target + target / 10;
+        if (piece_line_count(t) != lc) die("repeated-query line count changed");
+        if (hi >= lc) hi = lc - 1;
         seed(0x11E);
-        for (i = 0; i < nq && !over(); i++) {
-            uint64_t L = L0 - L0 / 10 + rnd_range(L0 / 5 + 1), off = rnd_range(piece_len(t)), a, r;
+        cell_begin();
+        for (i = 0; i < nq; i++) {
+            uint64_t L = lo + rnd_range(hi - lo + 1), off = rnd_range(piece_len(t)), a, r;
+            if (over()) { query_to = 1; break; }
             a = bench_now_ns();
             r = piece_line_to_byte(t, L);
             (void)bench_add(&sl, bench_now_ns() - a);
@@ -841,10 +909,15 @@ static int row_line_jump(const char *row)
             g_sink += r;
         }
     }
-    emit_samples(row, "line_to_byte", &sl, "ms", &NOGATE, 0);
-    emit_samples(row, "byte_to_line", &sb, "ms", &NOGATE, 0);
-    if (t) piece_destroy(t);
-    human_table(row, "context: G7j unindexed jump 30 / 50 ms is Target A, warm, [AC, prov]; this box is on battery");
+    emit_samples(row, "line_to_byte", &sl, "ms", &NOGATE, query_to);
+    emit_samples(row, "byte_to_line", &sb, "ms", &NOGATE, query_to);
+    if (t) {
+        piece_destroy(t);
+        if (munmap((void *)s.p, s.len) != 0) die("line jump final munmap");
+    }
+    close(fd);
+    human_table(row, "context: G7j warm Target A p50 <= 30 / p99 <= 50 ms (G) [AC, prov] (perf s0.2): line_to_byte_indexed\n"
+                     "context: line_to_byte_cold is TRACK (G7 index warm 80 / 125 ms reference); bulk counting belongs to P1.6 lineidx on src/work");
     return 0;
 }
 

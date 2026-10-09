@@ -13,7 +13,10 @@ fi
 [ -d "$var" ] || { echo "bench_variant: no such dir $var" >&2; exit 2; }
 if [ "$var" = src/piece ]; then name=intree; else name=$(basename "$var"); fi
 out=build/variants/$name
-rm -rf "$out"; mkdir -p "$out/v" "$out/o"
+# Only replace outputs owned by this script; keep workers' fuzz binaries/logs.
+rm -rf "$out/v" "$out/o"
+rm -f "$out/libother.a" "$out/piece_bench.o" "$out/piece_bench"
+mkdir -p "$out/v" "$out/o"
 CF="-std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -O2 -g -msse2 -I$var -Isrc"
 
 vobjs=
