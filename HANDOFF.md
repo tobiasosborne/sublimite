@@ -1,31 +1,27 @@
-# HANDOFF — editor project, session 5 crashed (updated 2026-10-09 12:20)
+# HANDOFF — editor project, session 6 running (updated 2026-10-09 13:15)
 
 Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task` and `bd ready -n 40`. Session details: `docs/worklog/2026-10-09.md` (sessions 4, 5 and the crash recovery), `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
 
 ## Method (session 4–5, keep)
 Every worker gets its own git worktree `.wt/<bead>` on branch `wt/<bead>` (`.wt/` is in `.git/info/exclude`), created from main. The coordinator verifies there (`make check`, **`make all`** (release test builds catch gcc-only warnings), the module bench), commits on the branch and cherry-picks onto main. Workers never run git. **Display: nothing opens a window on :0** (P0.2c guard, 6a39d6d; Xvfb :99 must be running; binding until ~16:30 on 2026-10-09 and a good default after). Codex launch line: `env DISPLAY=:99 EDIT_DISPLAY=:99 timeout 5400 codex exec -m gpt-6.1-sol -c model_reasoning_effort=<high|xhigh> --approve-for-me --skip-git-repo-check -C .wt/<bead> -o docs/worker-reports/<bead>.md "<brief>"`.
 
-## Crash state (read first)
-The laptop hard-reset at ~12:09 on 2026-10-09 (nordvpn); the coordinator died at 12:07 inside the piece-matrix AC run. Main is clean at 6a39d6d (+ this checkpoint commit); `make all` and `make check` were green on main at 11:58. Every worktree's on-disk edits are WIP-committed on its `wt/*` branch ("WIP s5 (crash checkpoint 12:07)"). Full per-bead detail: worklog "Session 5 crash". Nothing is running.
+## Session 6 live state (coordinator, updated 13:15; read first)
+Session 6 coordinator (Opus) running since 12:28. Session 5 crash recovery is done (worklog "Session 6"). Workers run in `.wt/<bead>` worktrees; briefs and logs are in the session-6 scratchpad (lost on reboot: rebuild briefs from the bead + the worker's STATUS.md/decision doc). If this session dies, every live worktree's edits are on disk: WIP-commit them on their `wt/*` branch and relaunch "continue".
 
-**Before anything else:** (1) `make all && ./build/tools/mkcorpus` (`/tmp/edit-corpus` was lost with /tmp; 2.4 GB, disk at 93 %); (2) start `Xvfb :99 -screen 0 2880x1800x24 -nolisten tcp -noreset`; (3) `quota`.
-
-| Bead | Worktree | State | Action |
+| Bead | Worker | Worktree | State |
 |---|---|---|---|
-| edit-e6x.4 gl egl / glx | .wt/edit-e6x.4-egl, -glx | done, reports `docs/worker-reports/edit-e6x.4-{egl,glx}-s5.md` | verify (make all + check + fuzz build), cherry-pick, AC bench rows on :99 (present rows SKIP under Xvfb) |
-| edit-e6x.5 raster | .wt/edit-e6x.5 | done, report `-s5.md`; G3/G3z need quiet AC | verify, cherry-pick, AC bench |
-| edit-zzj.2 view | .wt/edit-zzj.2 | done, report, `src/view/STATUS.md` | verify, cherry-pick |
-| edit-zzj.9 layout long lines | .wt/edit-zzj.9 | done, report, `src/layout/STATUS.md`; 150 us unicode verdict needs quiet AC | verify, cherry-pick, AC bench |
-| edit-4w1.10 twoway-only | .wt/edit-4w1.10-twoway-only | done, report | verify; AC bench; variant decision with simd |
-| edit-4w1.10 simd-filter-verify | .wt/edit-4w1.10-simd-filter-verify | worker killed while rerunning check + 300 s fuzz after a last Two-Way cancellation boundary fix; no report | relaunch Codex xhigh "continue: rerun make check, 300 s fuzz, bench, write report" |
-| edit-4w1.32 journal save txn | .wt/edit-4w1.32 | code + tests done (22 tests, 1000 SIGKILL trials, fuzz clean), report never written | relaunch Codex xhigh "continue: verify state, write P1.9.md + report only" |
-| edit-4w1.35 undo review fixes | .wt/edit-4w1.35 | red regression tests written, no fixes yet | relaunch Codex xhigh "continue" (BLOCKER-1 may need a piece.h amendment → consultant OK) |
-| edit-4w1.22 piece deep review | none (read-only on main) | killed at 8 min, no output | relaunch Codex xhigh `-s read-only -o docs/reviews/P1.4-1.md`; brief from the bead |
-| edit-e6x.11 x11 finish | .wt/edit-e6x.11 | P2.2b.md + STATUS written, -noreset fix, fuzz was running; no report | relaunch Claude Sonnet "finish: fuzz 300 s result, G4a row, report" (not Codex: safety filter) |
-| edit-4w1.6 lineidx | main | AC run 12:01: G7 warm 117/207 ms vs 80/125, G7j 53.7 ms vs 3 ms MISS on a loaded box | re-bench quiet; if G7j still misses by >10x, open a bug |
-| edit-4w1.26 undo bench gate | main | AC 12:01: in-tree 10k 1.78/3.50 ms (G9 63/84) | make the row gated, close |
+| edit-zzj.3 P3.3 editor loop (M0, top priority) | Codex xhigh 12:40 | .wt/edit-zzj.3 | running; deps rewired e6x.4 → e6x.5 (raster backend behind render.h) |
+| edit-4w1.10 find simd-filter-verify | Codex xhigh 12:34 | .wt/edit-4w1.10-simd-filter-verify | running; twoway-only done on wt/edit-4w1.10-twoway-only; pick = one quiet run |
+| edit-4w1.33 journal P1.9e (+ edit-4w1.31 folded in) | Codex xhigh 12:55 | .wt/edit-4w1.33 | running; worktree cut from the damaged main (6257fe9): rebase before verifying |
+| edit-4w1.35 undo fixes | done 13:12 | .wt/edit-4w1.35 | verifying; findings 2-8 fixed; BLOCKER 1 needs the piece.h checkpoint amendment (consultant decision pending) |
+| edit-4w1.36 piece BLOCKER 1-2 + MAJOR 11 | Codex xhigh 13:12 | .wt/edit-4w1.36 | running; .37 (G10f) and .38 (perf) chained after it |
+| edit-457.1 word wrap | Codex high 13:03 | .wt/edit-457.1 | running |
+| edit-457.2 / .4 / .5 / .9 indent, tabs, minimap, ipc | Codex high 13:08 | .wt/edit-457.{2,4,5,9} | running as standalone modules; integration bead edit-457.16 |
+| reviews x11, raster, view | Codex xhigh read-only 13:08-13:13 | main | → docs/reviews/x11-1.md, P2.5-1.md, view-1.md |
+| edit-e6x.4 GL egl/glx | done | .wt/edit-e6x.4-{egl,glx} + variants/P2.4 | pick from a real-display bench (announce to the consultant first; present rows SKIP under Xvfb) |
+| edit-zzj.9, edit-e6x.5, edit-4w1.6, edit-457.11 | landed | main | close after ONE quiet investigation run (lineidx G7/G7j, layout log_1g + unicode, raster G3/G3z, scan_count) when load < 2 |
 
-Piece matrix r1 on AC (12:05): 36 PASS, 0 MISS. r2/r3 + bptree baseline were killed; rerun (`tools/bench_variant.sh src/piece`, ~95 s each) on a quiet box and record under docs/decisions/P1.4-runs/ before closing edit-4w1.25.
+Bench policy (13:15, docs/decisions/bench-policy.md): one quiet [AC] run per module when it lands; never run or read gates on a loaded box.
 
 ## State
 - Landed in session 4 (main): P1.4 decision (bptree base), P1.4a-b bench row fix, P0.6c, P0.4b harness power, P1.7 file, P1.1c + P1.1d utf8, P2.3c font, P2.0 **render.h frozen**, P1.5 undo, P1.9 journal, P1.8b work fix, P1.10a **find.h frozen**, P3.1 layout, P1.6 lineidx (bead open for bench).
