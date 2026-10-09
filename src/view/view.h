@@ -6,8 +6,10 @@
 #include "piece/piece.h"
 #include "utf8/utf8.h"
 
-#define VIEW_SCAN_BOUND 65536u
+#define VIEW_SCAN_BOUND 4096u
 #define VIEW_WINDOW 4096u
+#define VIEW_MUTATION_BOUND 2048u
+#define VIEW_SLICE_NS UINT64_C(200000)
 #define VIEW_PREFERRED_UNSET UINT64_MAX
 enum { VIEW_OK = 0, VIEW_MORE = 4, VIEW_ERR_BUSY = 5, VIEW_ERR_ARG = 6 };
 typedef enum view_key {
@@ -48,6 +50,7 @@ typedef struct view_change {
     uint64_t offset, old_len, new_len;
     bool changed; /* also inspect on errors/MORE: a successful edit prefix */
 } view_change;
+struct undo_log;
 
 /* Caller-owned runtime, not journal data. Scratch fields are private. */
 typedef struct view {
@@ -67,21 +70,83 @@ typedef struct view {
     struct layout *wrap_layout;
     bool wrap_target_soft;
     uint8_t win[VIEW_WINDOW + 4u];
+    view_state before_state, completed_state;
+    uint64_t completed_len;
+    uint64_t deadline_ns, deadline_check_work, column_start, last_seed;
+    struct { uint64_t byte, col, start; bool valid; } seeds[16];
+    unsigned seed_next;
+    uint32_t seed_tab;
+    struct undo_log *undo;
+    bool undo_group_open;
+    view_state restore_state;
+    bool cursor_before, anchor_before;
+    /* Private cooperative line queries: no opaque exact-count calls. */
+    struct { uint64_t byte, line; bool valid; } lines[32];
+    struct { uint64_t target, result; unsigned kind; } queries[16];
+    unsigned line_next, query_next, query_kind;
+    uint64_t query_target, query_pos, query_line;
+    uint64_t home_start, visual_column;
+    uint32_t visual_indent;
+    /* Owned TYPE bytes for a deferred small insertion. */
+    uint8_t pending_text[VIEW_WINDOW];
+    size_t pending_len;
+    uint64_t bulk_offset, bulk_remaining, bulk_target;
+    bool bulk_insert;
 } view;
 
 void view_init(view *v, piece_tree *tree, const view_config *config);
-/* All commands/resumes do zero libc allocations, at most VIEW_SCAN_BOUND
- * byte work in view (piece line queries/mutations follow frozen piece API).
- * MORE: keep tree/input stable and call view_continue, or view_cancel before
- * another command. TYPE consumes its data synchronously; no pointer retained.
- * During a post-edit boundary repair MORE the visible selection is at byte 0.
- * Column fallback stops after 64 KiB and sets state.approximate; movement
- * segmentation itself is exact and resumable, never split/truncate a cluster. */
+/* Commands/resumes allocate no libc storage. View decoding and line queries
+ * use at most VIEW_SCAN_BOUND charged byte work per call. Deadlines are checked
+ * between bounded chunks; scheduling/page faults and opaque piece/layout calls
+ * are outside this work bound. Uncached P4 layout queries retain their own API.
+ * MORE: keep the tree stable, process this call's change, invalidate affected
+ * checkpoints, then call view_continue or view_cancel before another command.
+ * TYPE consumes all input synchronously; no caller pointer is retained.
+ * Selection capture above VIEW_MUTATION_BOUND is sliced. Small TYPE input is
+ * copied into runtime scratch before an initial unchanged MORE; larger input
+ * is inserted synchronously under the legacy API. Each continuation reports
+ * ONLY its own successful replacement prefix in that call's tree coordinates.
+ * Process changes on MORE/errors too; cancellation accepts any committed prefix.
+ * During edited repair/capture MORE the visible selection/viewport is at byte 0.
+ * Columns and segmentation are exact and resumable. Resume following before
+ * drawing. Cancellation restores movement's prior completed state, or a visible
+ * byte-zero fallback after edits, preserving the buffer's wrap flag.
+ * Empty TYPE on unchanged completed state is a no-op. Legacy editor callers
+ * that install a new repair target or change tree length still get bounded
+ * repair/follow; use notify/restore for arbitrary external mutations. */
+/* All APIs with a change output clear a nonnull output even on argument errors. */
 int view_command(view *v, view_key key, bool shift, const uint8_t *text,
                  size_t len, view_change *change);
 int view_continue(view *v, view_change *change);
 void view_cancel(view *v);
 bool view_busy(const view *v);
+/* Optional mutation routing, attach before editing; log/tree must match and
+ * neither may be busy. No ownership transfer. Each editing command is one
+ * explicit undo group (including replacement and a committed error prefix).
+ * Group completion waits for repair/follow or cancellation; before/after blobs
+ * contain cursor then anchor as two uint64_t values. Detach only while idle;
+ * direct edits after detaching require caller undo_clear before reattachment.
+ * Replay/external edits require cancellation before mutation and normalized
+ * state/checkpoints before commands; view_restore/view_notify_edit provide it. */
+int view_set_undo(view *v, struct undo_log *log);
+typedef enum view_affinity { VIEW_AFFINITY_BEFORE, VIEW_AFFINITY_AFTER } view_affinity;
+/* After external mutation: cancel pending work BEFORE changing the tree and
+ * invalidate external checkpoints. Supply the replacement tuple in coordinates
+ * of the old tree; view still holds its old selection/viewport. Endpoints before
+ * the range stay put; endpoints beyond it shift by the byte delta; an endpoint
+ * in the removed range (or at an insertion) chooses its start/end by affinity.
+ * The old nonempty range's right endpoint maps to the new right endpoint.
+ * Repair joined clusters toward BEFORE/AFTER, reset preferred column, normalize
+ * viewport, follow the cursor. MORE resumes through view_continue, cancellation
+ * accepts external text with the byte-zero fallback. No mutation/undo recording
+ * and no emitted change. Invalid calls clear a nonnull output and keep state.
+ * Wrapped following inherits the layout-query limitation noted above. */
+int view_notify_edit(view *v, const view_change *edit, view_affinity cursor_affinity,
+                     view_affinity anchor_affinity, view_change *change);
+/* Untrusted journal/undo state: clamp endpoints to EOF, repair forward to full
+ * cluster boundaries, reset preferred column and validate/follow the viewport.
+ * Restored byte offsets refer to the CURRENT tree (no rebasing). */
+int view_restore(view *v, const view_state *state, view_change *change);
 /* Tiny P4.1 defaults; NULL/empty = untitled. Config overrides are P6.4. */
 bool view_wrap_default(const char *path);
 /* Apply open-time defaults to both the buffer flag and its layout. Reserve
