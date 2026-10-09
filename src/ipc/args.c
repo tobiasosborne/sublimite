@@ -27,6 +27,11 @@ static ipc_result canonical(const char *cwd, const char *path, char *out)
         memcpy(full,cwd,cn); full[cn]='/'; memcpy(full+cn+1,path,pn+1);
     }
     out[0]='/'; out[1]='\0'; size_t used=1;
+    /* known: every component so far exists and out is its real path. A regular
+     * file prefix followed by anything else is ENOTDIR, exactly as the kernel
+     * resolves it (edit-457.21 review §3); lexical rules apply only after the
+     * first genuinely missing component. */
+    bool known=true, isdir=true;
     char *cursor=full;
     while(*cursor) {
         while(*cursor=='/') cursor++;
@@ -34,20 +39,31 @@ static ipc_result canonical(const char *cwd, const char *path, char *out)
         char *part=cursor;
         while(*cursor && *cursor!='/') cursor++;
         char saved=*cursor; *cursor='\0';
+        if(known && !isdir) return IPC_INVALID;
         if(strcmp(part,"..")==0) {
             while(used>1 && out[used-1]!='/') used--;
             if(used>1) used--;
             out[used]='\0';
+            if(known) isdir=true;
         } else if(strcmp(part,".")!=0) {
             size_t n=strlen(part), sep=used>1?1u:0u;
             if(used+sep+n+1>IPC_PATH_CAP) return IPC_LIMIT;
             if(sep) out[used++]='/';
             memcpy(out+used,part,n+1); used+=n;
-            if(realpath(out,resolved)!=NULL) { used=strlen(resolved); memcpy(out,resolved,used+1); }
-            else if(errno!=ENOENT && errno!=ENOTDIR) return IPC_IO;
+            if(known) {
+                struct stat st;
+                if(realpath(out,resolved)!=NULL) {
+                    used=strlen(resolved); memcpy(out,resolved,used+1);
+                    isdir=stat(out,&st)==0 && S_ISDIR(st.st_mode);
+                } else if(errno==ENOENT) known=false;
+                else if(errno==ENOTDIR) return IPC_INVALID;
+                else return IPC_IO;
+            }
         }
         *cursor=saved;
     }
+    /* A trailing slash demands a directory. */
+    if(strlen(full)>1 && full[strlen(full)-1]=='/' && !(known && isdir)) return IPC_INVALID;
     return IPC_OK;
 }
 static int coordinate(const char *s, uint32_t *out)
@@ -92,7 +108,11 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
         if(out->request.count==IPC_MAX_PATHS || strlen(arg)>=IPC_PATH_CAP) { rc=IPC_LIMIT; goto fail; }
         char name[IPC_PATH_CAP], path[IPC_PATH_CAP]; memcpy(name,arg,strlen(arg)+1);
         uint32_t line=1,col=1; struct stat st;
-        if(stat(name,&st)!=0) {
+        /* A directory entry of that exact name (even a dangling symlink) wins over
+         * coordinate parsing; only true absence enables suffixes, and every other
+         * lookup failure is an error, never "absent" (edit-457.21 review §4). */
+        if(lstat(name,&st)!=0) {
+            if(errno!=ENOENT) { rc=errno==ENOTDIR?IPC_INVALID:IPC_IO; goto fail; }
             char *last=strrchr(name,':'); uint32_t value=1;
             int numeric=last!=NULL?coordinate(last+1,&value):0;
             if(numeric<0) { rc=IPC_INVALID; goto fail; }

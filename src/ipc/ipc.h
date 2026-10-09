@@ -9,6 +9,17 @@
 #define IPC_PATH_CAP 4096u
 #define IPC_MAX_WIRE (1024u * 1024u)
 #define IPC_MAX_CLIENTS 32u
+/* edit-457.21: bounded UI work per drain call (§10), request deadlines and
+ * pressure eviction (§11), lifecycle lock deadline (§12), receive pool (§14). */
+#define IPC_DRAIN_BYTES (256u * 1024u)
+#define IPC_DRAIN_CALLBACKS 8u
+#define IPC_DRAIN_ACCEPTS 8u
+#define IPC_REQUEST_DEADLINE_MS 5000u
+#define IPC_EVICT_IDLE_MS 500u
+#define IPC_LOCK_TIMEOUT_MS 1000u
+#define IPC_RX_SMALL_SIZE (64u * 1024u)
+#define IPC_RX_SMALL_COUNT 16u
+#define IPC_RX_BIG_COUNT 2u
 
 typedef enum ipc_result {
     IPC_OK = 0, IPC_EXISTS, IPC_INVALID, IPC_LIMIT, IPC_IO,
@@ -38,14 +49,21 @@ ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out);
 
 typedef uint64_t ipc_token;
 struct ipc_peer;
+struct ipc_rx;
 typedef struct ipc_server {
     int fd, listener, lock_fd;
     edit_arena arena;
     struct ipc_peer *peers;
     uint64_t next_token;
-    char socket_path[108];
+    char socket_path[108]; /* leaf name inside dir_fd (edit-457.21); abstract: empty */
     uint64_t socket_device, socket_inode;
     bool owns_path;
+    /* edit-457.21 additions. Init sets the defaults; tests may lower them. */
+    int dir_fd, timer_fd;
+    uint32_t request_deadline_ms, evict_idle_ms;
+    uint64_t wait_drops;  /* wait clients that vanished before their closed reply */
+    uint64_t drain_bytes; /* bytes received by the most recent drain call */
+    struct ipc_rx *rx;
 } ipc_server;
 typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
 /* Caller-owned, zero-init before init; runtime NULL uses XDG_RUNTIME_DIR,
@@ -65,6 +83,22 @@ int ipc_server_fd(const ipc_server *server);
 ipc_result ipc_server_drain(ipc_server *server, ipc_open_callback callback, void *ctx);
 ipc_result ipc_server_report_closed(ipc_server *server, ipc_token token);
 void ipc_server_fini(ipc_server *server);
+/* edit-457.21 additions. True while the wait client behind token is still
+ * connected and unanswered. The loop MUST sweep its token associations after
+ * any drain that raised server->wait_drops and drop entries that are not live
+ * (a client that gave up). Live tokens never exceed IPC_MAX_CLIENTS. */
+bool ipc_server_token_live(const ipc_server *server, ipc_token token);
+/* Server with no endpoint: for --new-instance. It never binds, locks or
+ * connects to the shared socket; only adopted wait channels live in it. */
+ipc_result ipc_server_init_isolated(ipc_server *server);
+/* --wait for a launch that is the UI process (primary or isolated). Before
+ * the UI starts, main creates a pair with ipc_launcher_pair and fork()s. The
+ * child (UI) adopts adopt_fd and associates the returned token with the
+ * initial request; the parent calls ipc_launcher_wait(launcher_fd) and exits
+ * with its result once the closed reply arrives (IPC_IO if the UI exits first). */
+ipc_result ipc_launcher_pair(int fds[2]);
+ipc_result ipc_server_adopt_wait(ipc_server *server, int adopt_fd, ipc_token *token);
+ipc_result ipc_launcher_wait(int launcher_fd);
 /* Startup-only blocking handoff. timeout_ms bounds connect/send/ACK;
  * -1 means infinite. After ACK, --wait always waits without a deadline.
  * IPC_EXISTS/new_instance selection is the caller's startup policy. */

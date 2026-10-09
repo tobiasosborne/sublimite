@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -231,29 +233,413 @@ static void race(const char *dir)
     for(size_t i=0;i<2;i++) { int status; CHECK(waitpid(children[i],&status,0)==children[i] && WEXITSTATUS(status)==0); }
     close(start[1]); close(result[0]); close(finish[1]);
 }
-static int run_suite(void)
+
+/* ---- edit-457.21 review-fix tests -------------------------------------- */
+static void rm_rf(const char *path)
+{
+    pid_t c=fork(); CHECK(c>=0);
+    if(c==0) { execlp("rm","rm","-rf",path,(char *)NULL); _exit(127); }
+    int st; CHECK(waitpid(c,&st,0)==c);
+}
+static void subdir(const char *dir, const char *name, char *out)
+{
+    CHECK(snprintf(out,IPC_PATH_CAP,"%s/%s",dir,name)>0); CHECK(mkdir(out,0700)==0);
+}
+static uint64_t now_ms(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (uint64_t)ts.tv_sec*1000u+(uint64_t)ts.tv_nsec/1000000u;
+}
+static void touch_file(const char *dir, const char *name, mode_t mode)
+{
+    char p[IPC_PATH_CAP]; CHECK(snprintf(p,sizeof p,"%s/%s",dir,name)>0);
+    int f=open(p,O_CREAT|O_WRONLY,mode); CHECK(f>=0); close(f); CHECK(chmod(p,mode)==0);
+}
+static void sock_path(const char *dir, char *out)
+{
+    CHECK(snprintf(out,IPC_PATH_CAP,"%s/sublimite-%lu.sock",dir,(unsigned long)getuid())>0);
+}
+static void lock_path(const char *dir, char *out)
+{
+    CHECK(snprintf(out,IPC_PATH_CAP,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0);
+}
+static ipc_result count_only(const ipc_request *r, ipc_token token, void *ctx)
+{
+    (void)r; capture *c=ctx; c->calls++; c->token=token; return IPC_OK;
+}
+/* One poll+drain step. Returns the poll result (0 on timeout). */
+static int pump(ipc_server *s, ipc_open_callback cb, void *ctx, int timeout_ms)
+{
+    struct pollfd p={ipc_server_fd(s),POLLIN,0}; int n=poll(&p,1,timeout_ms);
+    CHECK(n>=0); if(n>0) CHECK(ipc_server_drain(s,cb,ctx)==IPC_OK); return n;
+}
+static pid_t spawn_client(const char *runtime, bool wait, ipc_result expected)
+{
+    pid_t child=fork(); CHECK(child>=0);
+    if(child==0) { ipc_request r=request(wait,false); ipc_result rc=ipc_client_send(runtime,&r,CLIENT_TIMEOUT_MS);
+        if(rc!=expected) fprintf(stderr,"client: ipc_result=%d expected=%d\n",(int)rc,(int)expected);
+        _exit(rc==expected?0:2); }
+    return child;
+}
+static void reap_ok(pid_t child)
+{
+    int status; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+}
+static void serve_one(ipc_server *s, capture *c)
+{
+    for(int i=0;i<40 && c->calls==0;i++) (void)pump(s,count_only,c,500);
+    CHECK(c->calls==1);
+}
+
+/* 1: aliased input must never overrun the output buffer. */
+static void t_wire_alias(const char *dir)
+{
+    (void)dir;
+    struct { uint8_t wire[44]; uint8_t canary[32]; } g;
+    memset(&g,0xA5,sizeof g); memset(g.wire,0,sizeof g.wire); memcpy(g.wire,"/a",3);
+    ipc_request r={0}; r.cwd="/tmp"; r.count=1; r.paths[0]=(ipc_path){(const char *)g.wire,1,1};
+    size_t n=99; ipc_result rc=ipc_wire_encode(&r,g.wire,sizeof g.wire,&n);
+    for(size_t i=0;i<sizeof g.canary;i++) CHECK(g.canary[i]==0xA5);
+    CHECK(rc==IPC_INVALID && n==0);
+    /* cwd and stdin aliasing the output are rejected too */
+    uint8_t buf[256]; memset(buf,0,sizeof buf); memcpy(buf,"/tmp",5);
+    ipc_request c2={0}; c2.cwd=(const char *)buf; CHECK(ipc_wire_encode(&c2,buf,sizeof buf,&n)==IPC_INVALID);
+    ipc_request c3=request(false,true); c3.stdin_data=buf+200; c3.stdin_size=5;
+    CHECK(ipc_wire_encode(&c3,buf,sizeof buf,&n)==IPC_INVALID);
+    /* decode then re-encode into the same storage: rejected; into other storage: identical */
+    ipc_request src=request(true,true); uint8_t a[256], b[256], out[256]; size_t na=0, nb=0, no=0; ipc_request d={0};
+    CHECK(ipc_wire_encode(&src,a,sizeof a,&na)==IPC_OK && ipc_wire_decode(a,na,&d)==IPC_OK);
+    CHECK(ipc_wire_encode(&d,a,sizeof a,&nb)==IPC_INVALID);
+    CHECK(ipc_wire_encode(&d,b,sizeof b,&nb)==IPC_OK && nb==na && memcmp(a,b,na)==0);
+    memcpy(out,a,na); no=na; CHECK(ipc_wire_decode(out,no,&d)==IPC_OK);
+    CHECK(ipc_wire_encode(&d,out+1,sizeof out-1,&nb)==IPC_INVALID); /* overlapping, shifted */
+}
+
+/* 17: table-driven wire validation with required results. */
+static void t_wire_table(const char *dir)
+{
+    (void)dir;
+    static uint8_t good[8192], mut[8192]; size_t n=0; ipc_request r=request(true,true), out;
+    CHECK(ipc_wire_encode(&r,good,sizeof good,&n)==IPC_OK);
+    static const uint8_t expect[]={'E','D','I','P',1,3,0,0, 0,0,0,0, 1,0,0,0, 5,0,0,0, 5,0,0,0,
+        '/','t','m','p',0, 13,0,0,0, 12,0,0,0, 3,0,0,0, '/','t','m','p','/','e','x','a','m','p','l','e',0, 'a',0,'b','\n','c'};
+    CHECK(n==sizeof expect); uint8_t exp2[sizeof expect]; memcpy(exp2,expect,n); exp2[8]=(uint8_t)n;
+    CHECK(memcmp(good,exp2,n)==0);
+    const struct { const char *name; size_t at; uint8_t val; } t[]={
+        {"magic0",0,'X'},{"magic1",1,'X'},{"magic2",2,'X'},{"magic3",3,'X'},{"ver0",4,0},{"ver2",4,2},
+        {"flag-unknown",5,7},{"flag-hi",5,0x80},{"stdin-flag-cleared",5,1},{"reserved6",6,1},{"reserved7",7,1},
+        {"len-small",8,(uint8_t)(54+5-1)},{"len-big",8,(uint8_t)(54+5+1)},{"count129",12,129},{"count2",12,2},
+        {"cwdn0",16,0},{"cwdn1",16,1},{"cwdn-big",16,200},{"cwd-relative",24,'t'},{"cwd-no-nul",28,'x'},
+        {"inputn-small",20,4},{"inputn-big",20,6},{"inputn-no-flag-mismatch",23,1},
+        {"path-n0",29,0},{"path-n1",29,1},{"path-n-big",29,200},{"path-n-short",29,12},{"line0",33,0},{"col0",37,0},
+        {"path-relative",41,'x'},{"path-nul-inside",44,0},{"path-no-nul",53,'x'},{"path-len-hi",30,1}};
+    for(size_t i=0;i<sizeof t/sizeof t[0];i++) {
+        memcpy(mut,good,n); mut[t[i].at]=t[i].val; memset(&out,0xFF,sizeof out);
+        ipc_result rc=ipc_wire_decode(mut,n,&out);
+        if(rc!=IPC_PROTOCOL) fprintf(stderr,"table %s: rc=%d\n",t[i].name,(int)rc);
+        CHECK(rc==IPC_PROTOCOL);
+        CHECK(out.count==0 && out.cwd==NULL && out.stdin_data==NULL && out.stdin_size==0 && !out.wait && !out.has_stdin);
+    }
+    /* header-only frames: valid empty request, and truncated variants */
+    uint8_t h[24+2]; memset(h,0,sizeof h); memcpy(h,"EDIP",4); h[4]=1; h[8]=26; h[16]=2; h[24]='/'; h[25]=0;
+    memset(&out,0xFF,sizeof out); CHECK(ipc_wire_decode(h,26,&out)==IPC_OK && out.count==0 && !out.wait);
+    CHECK(ipc_wire_decode(NULL,26,&out)==IPC_PROTOCOL && out.cwd==NULL);
+    static uint8_t big[IPC_MAX_WIRE+1];
+    CHECK(ipc_wire_decode(big,sizeof big,&out)==IPC_PROTOCOL);
+    /* maximum frame round trips exactly; one more byte is IPC_LIMIT */
+    static uint8_t maxw[IPC_MAX_WIRE]; static uint8_t payload[IPC_MAX_WIRE];
+    ipc_request m=request(false,true); m.stdin_data=payload; m.stdin_size=IPC_MAX_WIRE-54u;
+    size_t mn=0; CHECK(ipc_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_OK && mn==IPC_MAX_WIRE);
+    CHECK(ipc_wire_decode(maxw,mn,&out)==IPC_OK && out.stdin_size==IPC_MAX_WIRE-54u);
+    m.stdin_size++; CHECK(ipc_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_LIMIT && mn==0);
+    uint8_t empty_in[1]; ipc_request e=request(false,false); e.stdin_data=empty_in; e.stdin_size=1;
+    CHECK(ipc_wire_encode(&e,mut,sizeof mut,&mn)==IPC_INVALID);
+}
+
+/* 3, 4: pathname semantics and literal-name precedence. */
+static void t_parser_paths(const char *dir)
+{
+    char sub[IPC_PATH_CAP], saved[IPC_PATH_CAP]; subdir(dir,"parse",sub);
+    CHECK(getcwd(saved,sizeof saved)!=NULL); CHECK(chdir(sub)==0);
+    touch_file(sub,"leaf",0600); touch_file(sub,"victim",0600); touch_file(sub,"loop",0600);
+    CHECK(mkdir("sd",0700)==0); CHECK(symlink("nowhere","dang:1")==0); CHECK(symlink("loop:1","loop:1")==0);
+    CHECK(symlink("leaf","lnk")==0);
+    const struct { const char *arg,*suffix; uint32_t line; bool ok; } c[]={
+        {"leaf/../victim","",0,false},{"leaf/",NULL,0,false},{"leaf/.",NULL,0,false},{"leaf/..",NULL,0,false},
+        {"leaf/missing",NULL,0,false},{"lnk/../victim",NULL,0,false},{"lnk/",NULL,0,false},
+        {"sd/","/sd",1,true},{"sd/.","/sd",1,true},{"missing/../x","/x",1,true},{"missing/y","/missing/y",1,true},
+        {"sd/../leaf","/leaf",1,true},{"dang:1","/dang:1",1,true},{"nonexist:3","/nonexist",3,true},
+        {"loop:1",NULL,0,false},{"loop:1:2",NULL,0,true}};
+    for(size_t i=0;i<sizeof c/sizeof c[0];i++) {
+        char *av[]={"sublimite",(char *)c[i].arg}; ipc_args a={0}; ipc_result rc=ipc_parse_args(2,av,&a);
+        if((rc==IPC_OK)!=c[i].ok) fprintf(stderr,"parse case %zu '%s': rc=%d path=%s\n",i,c[i].arg,(int)rc,rc==IPC_OK?a.request.paths[0].path:"-");
+        if(strcmp(c[i].arg,"loop:1:2")==0) { if(rc==IPC_OK) ipc_args_fini(&a); continue; }
+        CHECK((rc==IPC_OK)==c[i].ok);
+        if(rc==IPC_OK) { char want[IPC_PATH_CAP]; CHECK(snprintf(want,sizeof want,"%s%s",sub,c[i].suffix)>0);
+            CHECK(strcmp(a.request.paths[0].path,want)==0 && a.request.paths[0].line==c[i].line); ipc_args_fini(&a); }
+    }
+    CHECK(chdir(saved)==0); rm_rf(sub);
+}
+
+/* 2: lifecycle operations are pinned to the verified directory. */
+static void t_runtime_swap(const char *dir)
+{
+    char rt[IPC_PATH_CAP], moved[IPC_PATH_CAP], sock[IPC_PATH_CAP], victim[IPC_PATH_CAP];
+    subdir(dir,"rt",rt); CHECK(snprintf(moved,sizeof moved,"%s/rt-moved",dir)>0);
+    CHECK(snprintf(victim,sizeof victim,"%s/victim",dir)>0);
+    int vf=open(victim,O_CREAT|O_WRONLY,0644); CHECK(vf>=0); close(vf); CHECK(chmod(victim,0644)==0);
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK);
+    struct stat st; sock_path(rt,sock); CHECK(lstat(sock,&st)==0 && S_ISSOCK(st.st_mode) && (st.st_mode&0777)==0600);
+    CHECK(rename(rt,moved)==0); CHECK(mkdir(rt,0700)==0);
+    CHECK(symlink(victim,sock)==0); /* decoy: a symlink sitting where the socket used to be */
+    ipc_server_fini(&s);
+    char moved_sock[IPC_PATH_CAP]; sock_path(moved,moved_sock);
+    CHECK(lstat(moved_sock,&st)!=0 && errno==ENOENT); /* removed through the pinned directory */
+    CHECK(lstat(sock,&st)==0 && S_ISLNK(st.st_mode)); /* decoy untouched */
+    CHECK(stat(victim,&st)==0 && (st.st_mode&0777)==0644);
+    /* a symlink planted at the socket name is never chmod'ed or followed */
+    CHECK(unlink(sock)==0); CHECK(symlink(victim,sock)==0);
+    CHECK(ipc_server_init(&s,rt)==IPC_INVALID); CHECK(stat(victim,&st)==0 && (st.st_mode&0777)==0644);
+    rm_rf(rt); rm_rf(moved); CHECK(unlink(victim)==0);
+}
+
+/* 10: bounded UI work per drain call. */
+static void t_drain_budget(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir,"budget",rt);
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
+    uint8_t frame[256]; size_t n=0; ipc_request r=request(false,false); CHECK(ipc_wire_encode(&r,frame,sizeof frame,&n)==IPC_OK);
+    int fds[24];
+    for(size_t i=0;i<24;i++) { fds[i]=raw_connect(rt); CHECK(write(fds[i],frame,n)==(ssize_t)n); }
+    usleep(20000);
+    CHECK(ipc_server_drain(&s,count_only,&c)==IPC_OK);
+    if(c.calls>IPC_DRAIN_CALLBACKS) fprintf(stderr,"drain ran %zu callbacks in one call (budget %u)\n",c.calls,IPC_DRAIN_CALLBACKS);
+    CHECK(c.calls>0 && c.calls<=IPC_DRAIN_CALLBACKS);
+    for(int i=0;i<40 && c.calls<24;i++) (void)pump(&s,count_only,&c,200);
+    CHECK(c.calls==24);
+    for(size_t i=0;i<24;i++) close(fds[i]);
+    for(int i=0;i<10;i++) (void)pump(&s,count_only,&c,20);
+    /* byte budget: 8 near-complete 60 KB frames */
+    static uint8_t body[60000]; memset(body,'x',sizeof body);
+    ipc_request big=request(false,true); big.stdin_data=body; big.stdin_size=sizeof body;
+    static uint8_t wire[IPC_RX_SMALL_SIZE]; CHECK(ipc_wire_encode(&big,wire,sizeof wire,&n)==IPC_OK);
+    c.calls=0; int bf[8];
+    for(size_t i=0;i<8;i++) { bf[i]=raw_connect(rt); CHECK(write(bf[i],wire,n-1)==(ssize_t)(n-1)); }
+    usleep(20000);
+    usleep(20000);
+    CHECK(ipc_server_drain(&s,count_only,&c)==IPC_OK);
+    if(s.drain_bytes==0 || s.drain_bytes>IPC_DRAIN_BYTES) fprintf(stderr,"drain_bytes=%llu budget=%u\n",(unsigned long long)s.drain_bytes,IPC_DRAIN_BYTES);
+    CHECK(s.drain_bytes>0 && s.drain_bytes<=IPC_DRAIN_BYTES);
+    for(size_t i=0;i<8;i++) CHECK(write(bf[i],wire+n-1,1)==1);
+    for(int i=0;i<60 && c.calls<8;i++) { (void)pump(&s,count_only,&c,200); CHECK(s.drain_bytes<=IPC_DRAIN_BYTES); }
+    CHECK(c.calls==8);
+    for(size_t i=0;i<8;i++) close(bf[i]);
+    ipc_server_fini(&s); rm_rf(rt);
+}
+
+/* 11: incomplete clients cannot hold every slot forever. */
+static void silent_fill(ipc_server *s, const char *rt, int *fds)
+{
+    capture c={0};
+    for(size_t i=0;i<IPC_MAX_CLIENTS;i++) fds[i]=raw_connect(rt);
+    for(int i=0;i<20 && s->next_token<IPC_MAX_CLIENTS;i++) (void)pump(s,count_only,&c,50);
+    CHECK(s->next_token==IPC_MAX_CLIENTS);
+}
+static void t_slot_exhaust(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir,"slots",rt); int fds[IPC_MAX_CLIENTS]; capture c={0};
+    /* A: absolute pre-ACK deadline; the timer wakes the epoll fd by itself */
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK); s.request_deadline_ms=200; s.evict_idle_ms=600000;
+    silent_fill(&s,rt,fds);
+    int woke=pump(&s,count_only,&c,3000);
+    if(woke==0) fprintf(stderr,"deadline timer never woke the loop\n");
+    CHECK(woke>0);
+    for(size_t i=0;i<IPC_MAX_CLIENTS;i++) { /* later arrivals expire on their own timer ticks */
+        char b; ssize_t got=recv(fds[i],&b,1,MSG_DONTWAIT);
+        for(int k=0;k<20 && got!=0;k++) { (void)pump(&s,count_only,&c,300); got=recv(fds[i],&b,1,MSG_DONTWAIT); }
+        CHECK(got==0); close(fds[i]); }
+    pid_t ch=spawn_client(rt,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
+    ipc_server_fini(&s);
+    /* B: pressure eviction of the longest-idle incomplete client */
+    CHECK(ipc_server_init(&s,rt)==IPC_OK); s.request_deadline_ms=600000; s.evict_idle_ms=100; c.calls=0;
+    silent_fill(&s,rt,fds); usleep(150000);
+    ch=spawn_client(rt,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
+    for(size_t i=0;i<IPC_MAX_CLIENTS;i++) close(fds[i]);
+    ipc_server_fini(&s); rm_rf(rt);
+}
+
+/* 12: lifecycle lock waits are bounded. */
+static void t_lock_timeout(const char *dir)
+{
+    char rt[IPC_PATH_CAP], lp[IPC_PATH_CAP], sp[IPC_PATH_CAP]; subdir(dir,"lock",rt); lock_path(rt,lp); sock_path(rt,sp);
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK); ipc_server_fini(&s);
+    alarm(15);
+    int hold=open(lp,O_RDWR|O_CLOEXEC); CHECK(hold>=0); CHECK(flock(hold,LOCK_EX)==0);
+    uint64_t t0=now_ms(); ipc_result rc=ipc_server_init(&s,rt); uint64_t dt=now_ms()-t0;
+    if(rc!=IPC_TIMEOUT) fprintf(stderr,"init under held lock: rc=%d after %llu ms\n",(int)rc,(unsigned long long)dt);
+    CHECK(rc==IPC_TIMEOUT && dt<IPC_LOCK_TIMEOUT_MS+1500u);
+    CHECK(flock(hold,LOCK_UN)==0);
+    CHECK(ipc_server_init(&s,rt)==IPC_OK);
+    CHECK(flock(hold,LOCK_EX)==0);
+    t0=now_ms(); ipc_server_fini(&s); dt=now_ms()-t0; CHECK(dt<IPC_LOCK_TIMEOUT_MS+1500u);
+    struct stat st; CHECK(lstat(sp,&st)==0 && S_ISSOCK(st.st_mode)); /* ownership preserved, not unlinked blind */
+    CHECK(flock(hold,LOCK_UN)==0); close(hold);
+    CHECK(ipc_server_init(&s,rt)==IPC_OK); ipc_server_fini(&s); /* stale socket recovered */
+    CHECK(lstat(sp,&st)!=0);
+    alarm(120); rm_rf(rt);
+}
+
+/* 13 + 17: foreign credentials, squatting, fallback endpoint. */
+static void t_foreign_cred(const char *dir)
+{
+    char rt[IPC_PATH_CAP], uidbuf[32]; subdir(dir,"cred",rt); CHECK(unsetenv("XDG_RUNTIME_DIR")==0);
+    char ns[128]; CHECK(snprintf(ns,sizeof ns,"%s-cred",getenv("EDIT_IPC_NAMESPACE"))>0);
+    CHECK(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); CHECK(setenv("EDIT_IPC_FALLBACK_DIR",rt,1)==0);
+    CHECK(snprintf(uidbuf,sizeof uidbuf,"%lu",(unsigned long)getuid()+1ul)>0);
+    ipc_request r=request(false,false); capture c={0};
+    /* client refuses a server whose credentials are foreign */
+    ipc_server s={0}; CHECK(ipc_server_init(&s,NULL)==IPC_OK);
+    CHECK(setenv("EDIT_IPC_TEST_PEER_UID",uidbuf,1)==0);
+    ipc_result rc=ipc_client_send(NULL,&r,1000);
+    if(rc!=IPC_REJECTED) fprintf(stderr,"client foreign-server rc=%d\n",(int)rc);
+    CHECK(rc==IPC_REJECTED);
+    /* server refuses a foreign client: connection dropped, callback never runs */
+    pid_t ch=fork(); CHECK(ch>=0);
+    if(ch==0) { unsetenv("EDIT_IPC_TEST_PEER_UID"); ipc_result x=ipc_client_send(NULL,&r,5000); _exit(x==IPC_IO?0:2); }
+    for(int i=0;i<10;i++) { int st; if(waitpid(ch,&st,WNOHANG)==ch) { CHECK(WIFEXITED(st) && WEXITSTATUS(st)==0); ch=-1; break; } (void)pump(&s,count_only,&c,200); }
+    CHECK(ch==-1 && c.calls==0);
+    ipc_server_fini(&s);
+    /* another uid squats the abstract name: we fall back to the private path */
+    struct sockaddr_un a={0}; a.sun_family=AF_UNIX;
+    int n=snprintf(a.sun_path+1,sizeof a.sun_path-1,"sublimite-%lu-%s",(unsigned long)getuid(),ns); CHECK(n>0);
+    int squat=socket(AF_UNIX,SOCK_STREAM,0); CHECK(squat>=0);
+    CHECK(bind(squat,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0 && listen(squat,4)==0);
+    rc=ipc_server_init(&s,NULL);
+    if(rc!=IPC_OK) fprintf(stderr,"init with squatted abstract name: rc=%d\n",(int)rc);
+    CHECK(rc==IPC_OK);
+    char sp[IPC_PATH_CAP]; sock_path(rt,sp); struct stat st; CHECK(lstat(sp,&st)==0 && S_ISSOCK(st.st_mode));
+    ipc_server other={0}; CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS);
+    ch=spawn_client(NULL,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
+    ipc_server_fini(&s); close(squat);
+    CHECK(unsetenv("EDIT_IPC_TEST_PEER_UID")==0); CHECK(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
+    CHECK(setenv("EDIT_IPC_NAMESPACE",ns+0,1)==0);
+    char saved[128]; CHECK(snprintf(saved,sizeof saved,"%s",ns)>0); saved[strlen(ns)-5]='\0';
+    CHECK(setenv("EDIT_IPC_NAMESPACE",saved,1)==0); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
+    rm_rf(rt);
+}
+
+/* 14: receive storage is a small shared pool, released after the callback. */
+static void t_memory(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir,"mem",rt);
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
+    if(s.arena.size>4u*1024u*1024u) fprintf(stderr,"ipc arena is %zu bytes\n",s.arena.size);
+    CHECK(s.arena.size<=4u*1024u*1024u);
+    uint8_t hdr[24]; memset(hdr,0,sizeof hdr); memcpy(hdr,"EDIP",4); hdr[4]=1; hdr[10]=0x10; /* total = 1 MiB */
+    int big[IPC_RX_BIG_COUNT+1];
+    for(size_t i=0;i<=IPC_RX_BIG_COUNT;i++) { big[i]=raw_connect(rt); CHECK(write(big[i],hdr,sizeof hdr)==(ssize_t)sizeof hdr); }
+    for(int i=0;i<12;i++) (void)pump(&s,count_only,&c,50);
+    uint8_t reply[8]; CHECK(recv(big[IPC_RX_BIG_COUNT],reply,8,0)==8 && reply[4]=='A' && reply[5]==IPC_BUSY); /* bounded admission */
+    for(size_t i=0;i<IPC_RX_BIG_COUNT;i++) CHECK(recv(big[i],reply,8,MSG_DONTWAIT)<0 && errno==EAGAIN);
+    pid_t ch=spawn_client(rt,false,IPC_OK); serve_one(&s,&c); reap_ok(ch); /* small work still flows */
+    for(size_t i=0;i<=IPC_RX_BIG_COUNT;i++) close(big[i]);
+    for(int i=0;i<10;i++) (void)pump(&s,count_only,&c,20);
+    c.calls=0;
+    for(int k=0;k<60;k++) { ch=spawn_client(rt,false,IPC_OK); size_t want=c.calls+1; for(int i=0;i<40 && c.calls<want;i++) (void)pump(&s,count_only,&c,500); CHECK(c.calls==want); reap_ok(ch); }
+    ipc_server_fini(&s); rm_rf(rt);
+}
+
+/* 15: wait associations are retired when the client disconnects. */
+static void t_wait_disconnect(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir,"waitdrop",rt);
+    ipc_server s={0}; CHECK(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
+    uint8_t bytes[256], reply[8]; size_t n=0; ipc_request r=request(true,false); CHECK(ipc_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
+    for(int k=0;k<100;k++) {
+        int fd=raw_connect(rt); CHECK(write(fd,bytes,n)==(ssize_t)n);
+        size_t want=c.calls+1; for(int i=0;i<40 && c.calls<want;i++) (void)pump(&s,count_only,&c,200);
+        CHECK(c.calls==want); CHECK(recv(fd,reply,8,0)==8 && reply[4]=='A');
+        ipc_token t=c.token; CHECK(ipc_server_token_live(&s,t));
+        close(fd);
+        for(int i=0;i<40 && ipc_server_token_live(&s,t);i++) (void)pump(&s,count_only,&c,50);
+        if(ipc_server_token_live(&s,t)) fprintf(stderr,"token %llu still live after disconnect (cycle %d)\n",(unsigned long long)t,k);
+        CHECK(!ipc_server_token_live(&s,t));
+        CHECK(s.wait_drops==(uint64_t)k+1u);
+        CHECK(ipc_server_report_closed(&s,t)==IPC_INVALID);
+    }
+    CHECK(!ipc_server_token_live(&s,0) && !ipc_server_token_live(&s,12345678));
+    /* a wait client that got its closed reply is retired without counting as a drop */
+    int fd=raw_connect(rt); CHECK(write(fd,bytes,n)==(ssize_t)n); size_t want=c.calls+1;
+    for(int i=0;i<40 && c.calls<want;i++) (void)pump(&s,count_only,&c,200);
+    CHECK(ipc_server_report_closed(&s,c.token)==IPC_OK); CHECK(recv(fd,reply,8,0)==8); CHECK(recv(fd,reply,8,0)==8 && reply[4]=='C'); close(fd);
+    for(int i=0;i<5;i++) (void)pump(&s,count_only,&c,20);
+    CHECK(s.wait_drops==100u);
+    ipc_server_fini(&s); rm_rf(rt);
+}
+
+/* 16: --wait for primary and isolated launches. */
+static pid_t launcher_child(int fds[2], ipc_result expected)
+{
+    CHECK(ipc_launcher_pair(fds)==IPC_OK);
+    pid_t ch=fork(); CHECK(ch>=0);
+    if(ch==0) { close(fds[0]); ipc_result x=ipc_launcher_wait(fds[1]);
+        if(x!=expected) fprintf(stderr,"launcher: rc=%d expected=%d\n",(int)x,(int)expected);
+        _exit(x==expected?0:2); }
+    close(fds[1]); return ch;
+}
+static void t_launcher(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir,"launch",rt);
+    for(int isolated=0;isolated<2;isolated++) {
+        ipc_server s={0}; ipc_result rc=isolated?ipc_server_init_isolated(&s):ipc_server_init(&s,rt); CHECK(rc==IPC_OK);
+        if(isolated) { char sp[IPC_PATH_CAP]; struct stat st; sock_path(rt,sp); CHECK(s.listener<0 && !s.owns_path && lstat(sp,&st)!=0); }
+        int fds[2]; pid_t ch=launcher_child(fds,IPC_OK); ipc_token t=0;
+        CHECK(ipc_server_adopt_wait(&s,fds[0],&t)==IPC_OK && t!=0 && ipc_server_token_live(&s,t));
+        usleep(50000); int st; CHECK(waitpid(ch,&st,WNOHANG)==0); /* launcher blocks until completion */
+        CHECK(ipc_server_report_closed(&s,t)==IPC_OK); reap_ok(ch);
+        capture c={0}; for(int i=0;i<5;i++) (void)pump(&s,count_only,&c,20);
+        CHECK(!ipc_server_token_live(&s,t) && s.wait_drops==0);
+        /* the UI process goes away first: the launcher must fail, not report success */
+        ch=launcher_child(fds,IPC_IO); CHECK(ipc_server_adopt_wait(&s,fds[0],&t)==IPC_OK);
+        ipc_server_fini(&s); reap_ok(ch);
+        /* malformed adoption */
+        CHECK(isolated?ipc_server_init_isolated(&s)==IPC_OK:ipc_server_init(&s,rt)==IPC_OK);
+        CHECK(ipc_server_adopt_wait(&s,-1,&t)==IPC_INVALID && ipc_server_adopt_wait(&s,0,NULL)==IPC_INVALID);
+        ipc_server_fini(&s);
+    }
+    rm_rf(rt);
+}
+static int run_suite(const char *only)
 {
     alarm(120); char tmp[]="/tmp/edit-ipc-test-XXXXXX"; char *dir=mkdtemp(tmp); CHECK(dir!=NULL); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
     /* mkdtemp makes this namespace unique across processes and worktrees.
      * Forked clients must inherit it rather than choose their own endpoint. */
     CHECK(setenv("EDIT_IPC_NAMESPACE",dir+5,1)==0);
-    parser(dir); wire_tests(); roundtrip(dir,false,false); roundtrip(dir,true,false); roundtrip(dir,false,true); stale(dir); race(dir); fragmented(dir); wait_tokens(dir); callback_results(dir,true); callback_results(dir,false); endpoint_validation(dir);
+#define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
+    T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
+    T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
+    T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
+    T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));
+    T("memory",t_memory(dir)); T("wait_disconnect",t_wait_disconnect(dir)); T("launcher",t_launcher(dir));
+#undef T
+    if(only!=NULL) { rm_rf(dir); return 0; }
     char p[IPC_PATH_CAP]; const char *names[]={"a:1","link","real"};
     for(size_t i=0;i<3;i++) { CHECK(snprintf(p,sizeof p,"%s/%s",dir,names[i])>0); if(i==2) CHECK(rmdir(p)==0); else CHECK(unlink(p)==0); }
     CHECK(snprintf(p,sizeof p,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0); CHECK(unlink(p)==0); CHECK(rmdir(dir)==0);
-    puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints ok"); return 0;
+    puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints, review-fix suites ok"); return 0;
 }
 
 int main(int argc, char **argv)
 {
-    if(argc==1) return run_suite();
+    if(argc==1) return run_suite(NULL);
+    if(argc==2 && strcmp(argv[1],"--parallel")!=0) return run_suite(argv[1]); /* run one named test */
     CHECK(argc==2 && strcmp(argv[1],"--parallel")==0);
     size_t failures=0;
     for(size_t round=0;round<20;round++) {
         pid_t children[4];
         for(size_t i=0;i<4;i++) {
             children[i]=fork(); CHECK(children[i]>=0);
-            if(children[i]==0) exit(run_suite());
+            if(children[i]==0) exit(run_suite(NULL));
         }
         for(size_t i=0;i<4;i++) {
             int status; CHECK(waitpid(children[i],&status,0)==children[i]);

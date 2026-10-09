@@ -94,3 +94,12 @@ Amendment evidence: ../../docs/decisions/rename-sublimite.md.
 Amendment final verification: gcc make all, clang ASan/UBSan make check
 (detect_leaks=0), make fuzz and the focused contracts passed; no new open
 problem. Stamped X11 fuzz smoke evidence is in the decision document.
+
+## edit-457.21 (review fixes P4-modules-1 §1-4, 10-17) — PARTIAL, budget reached
+Done and green (release + ASan/UBSan leaks on, `ipc_test` full suite; `./build/tests/ipc_test <name>` runs one):
+§1 wire alias (INVALID on overlap), §2 pinned O_PATH dir fd + openat/unlinkat/chmod via /proc fd,
+§3/§4 args (ENOTDIR, trailing slash, lstat literal precedence), §10 drain budgets, §11 deadline timerfd + idle
+eviction, §12 bounded flock, §13 squat fallback (EDIT_IPC_FALLBACK_DIR | /run/user/uid, EDIT_IPC_TEST_PEER_UID hook),
+§14 3 MiB shared rx pool + IPC_BUSY, §15 ipc_server_token_live + wait_drops, §16 init_isolated/launcher_pair/adopt_wait/launcher_wait.
+MISSING: fuzz/ipc_fuzz.c exact-result oracle (§17 fuzz half), bench/ipc_bench.c memory assertion,
+docs/decisions/P4.9c.md (full), `make check` / `make fuzz` / 120 s fuzz not run, ASan parallel loop not run.
