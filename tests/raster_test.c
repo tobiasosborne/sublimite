@@ -1,11 +1,6 @@
-/* P2.5 raster tests: SSE2 == scalar (random grids), strip partitioning,
- * frozen render conformance suite driven through the CPU backend on a real X11
- * window (skips cleanly without DISPLAY), and a live XShm pixel read-back.
- * Conformance: tests/render_test.c is included UNCHANGED with
- * RENDER_TEST_EXTERNAL; its release-only "0 allocations over 10,000 frames"
- * assertion is neutralised for this driver because libxcb mallocs every packet
- * it receives (T5/T6 handling). The typing path itself (submit) is checked
- * for zero allocations separately below. See docs/decisions/P2.5.md. */
+/* Raster kernels and live conformance. The unchanged render suite is scoped
+ * by this driver to count each ingress-through-submit window (P2.0 addendum).
+ * Present/completion and libxcb reply allocations are outside that window. */
 #include "raster/raster.h"
 #include "base/base.h"
 #include "work/work.h"
@@ -31,16 +26,85 @@ xcb_void_cookie_t xcb_shm_put_image(xcb_connection_t *conn, xcb_drawable_t drawa
     uint8_t format, uint8_t send, xcb_shm_seg_t seg, uint32_t offset)
 {
     atomic_fetch_add_explicit(&upload_calls, 1, memory_order_relaxed);
+    /* Negative-control run: the old even-XOR test accepted stale pixels. */
+    if (getenv("EDIT_RASTER_DROP_PARTIAL") && sh < th) return (xcb_void_cookie_t){0};
     return real_shm_put(conn, drawable, gc, tw, th, sx, sy, sw, sh,
                         dx, dy, depth, format, send, seg, offset);
 }
 
+/* Driver-local state; no backend or frozen-suite changes. */
+typedef struct allocation_scope {
+    bool enabled, window;
+    size_t allocations, frames;
+} allocation_scope;
+static allocation_scope *scope_state(void)
+{
+    static allocation_scope scope;
+    return &scope;
+}
+static void scoped_guard_begin(void)
+{
+    allocation_scope *scope = scope_state();
+    *scope = (allocation_scope){.enabled = true, .window = true};
+    edit_malloc_guard_begin();
+}
+static void scoped_window_end(void)
+{
+    allocation_scope *scope = scope_state();
+    if (scope->window) {
+        scope->allocations += edit_malloc_guard_end();
+        scope->window = false;
+    }
+}
+static size_t scoped_guard_end(void)
+{
+    allocation_scope *scope = scope_state();
+    scoped_window_end(); scope->enabled = false;
+    printf("raster law2: windows=%zu allocations=%zu guard=%d scope=input->submit\n",
+        scope->frames, scope->allocations, edit_malloc_guard_active());
+    /* A truncated loop must fail even if no allocation was observed. */
+    return scope->allocations + (scope->frames != 10000 ? 1u : 0u);
+}
+static int scoped_frame_begin(render_grid *g, uint32_t id)
+{
+    allocation_scope *scope = scope_state();
+    if (scope->enabled && !scope->window) {
+        edit_malloc_guard_begin(); scope->window = true;
+    }
+    return render_frame_begin(g, id);
+}
+static int scoped_submit(render_backend *b, const render_grid *g,
+                         const render_strip *strips, size_t count)
+{
+    allocation_scope *scope = scope_state();
+    if (scope->enabled && g->frame_id == 1000 && getenv("EDIT_RASTER_ALLOC_AT_1000")) {
+        void *(*volatile allocate)(size_t) = malloc;
+        void *p = allocate(1); free(p);
+    }
+    int rc = render_backend_submit(b,g,strips,count);
+    if (scope->enabled) {
+        scope->frames++; scoped_window_end();
+        if (edit_malloc_guard_active() && scope->allocations != 0) {
+            fprintf(stderr,"raster law2: FAIL frame=%u allocations=%zu scope=input->submit\n",
+                    g->frame_id,scope->allocations);
+            return RENDER_ERR_DEVICE;
+        }
+    }
+    return rc;
+}
 #define RENDER_TEST_EXTERNAL 1
 #define main render_conformance_main
-#define edit_malloc_guard_active() (false)
+#define edit_malloc_guard_begin scoped_guard_begin
+#define edit_malloc_guard_end scoped_guard_end
+#define render_frame_begin scoped_frame_begin
+#define render_backend_submit scoped_submit
 #include "render_test.c"
+static bool external_guard_enabled(void) { return edit_malloc_guard_active(); }
 #undef main
-#undef edit_malloc_guard_active
+#undef edit_malloc_guard_begin
+#undef edit_malloc_guard_end
+#undef render_frame_begin
+#undef render_backend_submit
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "raster_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 
@@ -194,6 +258,7 @@ int render_test_prepare(render_backend *b, render_config *cfg)
         plat_config pc = {"raster_test", 64, 128, false, -1, 0};
         if (plat_init(&g_plat, &pc) != PLAT_OK) return RENDER_ERR_INIT;
         if (work_pool_init(&g_pool, 1, 4) != 0) { plat_shutdown(&g_plat); return RENDER_ERR_INIT; }
+        plat_map(&g_plat);
         g_up = true;
     }
     cfg->platform = &g_plat; cfg->workers = &g_pool;
@@ -214,6 +279,27 @@ int render_test_pump(render_backend *b)
 void render_test_cleanup(void) { }
 
 static void noop_ev(void *ud, const plat_event *e) { (void)ud; (void)e; }
+
+static int compare_window(const render_config *cfg, const render_cell *cells,
+                          const render_glyph *glyph, const render_atlas_page *page)
+{
+    xcb_connection_t *c = g_plat.conn;
+    xcb_get_image_reply_t *im = xcb_get_image_reply(c,
+        xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, g_plat.win, 0, 0, 32, 96, ~0u), NULL);
+    T(im != NULL);
+    T(xcb_get_image_data_length(im) >= 32 * 96 * 4);
+    const uint32_t *got = (const uint32_t *)xcb_get_image_data(im);
+    uint32_t want[32 * 96];
+    raster_scene scene = {cfg->dims, cells, glyph, 1, page, 1, 0};
+    for (uint32_t row = 0; row < 6; row++)
+        raster_row_scalar(&scene, want + (size_t)row * 16 * 32, 32, row);
+    size_t bad = 0;
+    for (size_t i = 0; i < 32 * 96; i++) if ((got[i] & 0xffffffu) != want[i]) bad++;
+    free(im);
+    if (bad) fprintf(stderr, "raster_test: %zu window pixels differ\n", bad);
+    T(bad == 0);
+    return 0;
+}
 
 /* Real X: paint a frame through XShm and read the window back. */
 static int live_pixel_test(void)
@@ -268,37 +354,38 @@ static int live_pixel_test(void)
     T(metrics.submit_ns > 0 && metrics.ready_ns >= metrics.submit_ns);
     T(metrics.present_ns >= metrics.ready_ns && metrics.server_ns >= metrics.present_ns);
     for (uint32_t j = 0; j < metrics.jobs; j++) T(metrics.strip_ns[j] > 0);
-    /* zero allocations on the submit path (typing path) */
+    T(compare_window(&cfg, cells, &glyph, &page) == 0);
+    uint32_t initial_fg = cells[8].fg;
+    /* Compare EACH non-cancelling edit against a fresh full scalar image,
+     * including all unchanged rows. Disconnected runs cross job partitions. */
     for (uint32_t id = 2; id < 12; id++) {
-        render_strip row = {2, 1};
+        render_strip strips[3]; size_t count = 0;
+        deadline = trace_now_ns() + UINT64_C(3000000000);
         edit_malloc_guard_begin();
-        cells[8].fg ^= 0x010101u;
-        T(render_frame_begin(&g, id) == RENDER_OK && render_mark_rows(&g, 2, 1) == RENDER_OK);
-        rc = render_backend_submit(&b, &g, &row, 1);
+        cells[8].fg = (initial_fg + id * 0x010203u) & 0xffffffu;
+        T(render_frame_begin(&g, id) == RENDER_OK);
+        T(render_mark_rows(&g, 2, 1) == RENDER_OK);
+        if (id % 2 == 0) {
+            cells[0].bg = id * 0x030201u;
+            cells[20].bg = id * 0x010307u;
+            T(render_mark_rows(&g, 0, 1) == RENDER_OK);
+            T(render_mark_rows(&g, 5, 1) == RENDER_OK);
+        } else {
+            cells[12].bg = id * 0x010305u;
+            T(render_mark_rows(&g, 3, 1) == RENDER_OK);
+        }
+        T(render_dirty_strips(&g, strips, 3, &count) == RENDER_OK);
+        rc = render_backend_submit(&b, &g, strips, count);
         size_t allocs = edit_malloc_guard_end();
         T(rc == RENDER_OK);
         if (edit_malloc_guard_active()) T(allocs == 0);
         while ((rc = render_backend_present(&b, id)) == RENDER_ERR_BUSY) { render_test_pump(&b); T(trace_now_ns() < deadline); }
         T(rc == RENDER_OK);
         while (b.active) { render_test_pump(&b); T(trace_now_ns() < deadline); }
+        T(cells[8].fg != initial_fg);
+        T(compare_window(&cfg, cells, &glyph, &page) == 0);
     }
-    /* read back */
-    xcb_connection_t *c = g_plat.conn;
-    xcb_get_image_reply_t *im = xcb_get_image_reply(c,
-        xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, g_plat.win, 0, 0, 32, 96, ~0u), NULL);
-    if (im == NULL) { printf("raster_test: window readback unavailable, pixel compare skipped\n"); }
-    else {
-        T(xcb_get_image_data_length(im) >= 32 * 96 * 4);
-        const uint32_t *got = (const uint32_t *)xcb_get_image_data(im);
-        uint32_t want[32 * 96];
-        raster_scene s = {cfg.dims, cells, &glyph, 1, &page, 1, 0};
-        for (uint32_t r = 0; r < 6; r++) raster_row_scalar(&s, want + (size_t)r * 16 * 32, 32, r);
-        size_t bad = 0;
-        for (size_t i = 0; i < 32 * 96; i++) if ((got[i] & 0xffffffu) != want[i]) bad++;
-        free(im);
-        if (bad) fprintf(stderr, "raster_test: %zu window pixels differ\n", bad);
-        T(bad == 0);
-    }
+    printf("raster pixels: PASS full + 10 individual partial comparisons (disconnected/boundaries/unchanged rows)\n");
     render_backend_shutdown(&b);
     free(state);
     return 0;
@@ -308,6 +395,7 @@ int main(int argc, char **argv)
 {
     *(void **)(&real_shm_put) = dlsym(RTLD_NEXT, "xcb_shm_put_image");
     T(real_shm_put != NULL);
+    T(!edit_malloc_guard_active() || external_guard_enabled());
     if (kernel_random_test() || blend_exact_test() || partition_test()) return 1;
     printf("raster_test: kernels PASS (SSE2 == scalar on 4000 random grids, 10240 blends, partitions)\n");
     plat probe;
