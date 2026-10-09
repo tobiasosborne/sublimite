@@ -18,6 +18,12 @@ int main(void)
     alarm(60);
     char dir[]="/tmp/edit-ipc-bench-XXXXXX"; REQUIRE(mkdtemp(dir)!=NULL);
     ipc_server server={0}; REQUIRE(ipc_server_init(&server,dir)==IPC_OK);
+    /* G10 margin (edit-457.21 §14): the receive pool is 16x64 KiB + 2x1 MiB = 3 MiB (+ peer table);
+     * the old 33.5 MB arena (32 x 1 MiB) must not come back. */
+    size_t pool=(size_t)IPC_RX_SMALL_COUNT*IPC_RX_SMALL_SIZE+(size_t)IPC_RX_BIG_COUNT*IPC_MAX_WIRE;
+    int mem_ok=pool==3u*1024u*1024u && server.arena.size>=pool && server.arena.size<=pool+256u*1024u;
+    printf("ipc_bench memory (E/G): rx_pool=%zu arena=%zu bytes, gate arena<=%zu; %s\n",pool,server.arena.size,pool+256u*1024u,mem_ok?"ok":"MISS");
+    REQUIRE(server.arena.size<4u*1024u*1024u);
     uint64_t samples[200]; bench_samples s; bench_samples_init(&s,samples,200);
     size_t calls=0;
     for(size_t i=0;i<200;i++) {
@@ -45,6 +51,7 @@ int main(void)
     if(f!=NULL) { if(fscanf(f,"%63s",load)!=1) strcpy(load,"unknown"); fclose(f); }
     printf("ipc_bench TRACK (M)%s load1=%s status=%s; gate_p99=10000000ns (G); includes callback, ACK, client exit/reap\n",bench__tag_from_power(power),load,power);
     int result=bench_report("ipc_handoff",&s,0,10000000);
+    if(!mem_ok) result=1;
     ipc_server_fini(&server);
     char lock[IPC_PATH_CAP]; REQUIRE(snprintf(lock,sizeof lock,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0);
     REQUIRE(unlink(lock)==0 && rmdir(dir)==0); return result;

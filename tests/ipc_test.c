@@ -609,12 +609,13 @@ static void t_launcher(const char *dir)
     }
     rm_rf(rt);
 }
-static int run_suite(const char *only)
+static int run_suite(const char *only, int ns_fd)
 {
     alarm(120); char tmp[]="/tmp/edit-ipc-test-XXXXXX"; char *dir=mkdtemp(tmp); CHECK(dir!=NULL); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
     /* mkdtemp makes this namespace unique across processes and worktrees.
      * Forked clients must inherit it rather than choose their own endpoint. */
     CHECK(setenv("EDIT_IPC_NAMESPACE",dir+5,1)==0);
+    if(ns_fd>=0) { size_t l=strlen(dir+5); CHECK(write(ns_fd,dir+5,l+1u)==(ssize_t)(l+1u)); close(ns_fd); } /* --parallel: report the namespace */
 #define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
     T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
@@ -629,23 +630,39 @@ static int run_suite(const char *only)
     puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints, review-fix suites ok"); return 0;
 }
 
-int main(int argc, char **argv)
+#define PAR_MAX 16u
+/* --parallel [N [ROUNDS]]: N independent suites at once, each with its own
+ * EDIT_IPC_NAMESPACE (reported over a pipe and checked pairwise distinct). A
+ * shared endpoint, a leaked default name or a cross-talking client fails here
+ * (edit-457.17 isolation regression). Defaults 4 x 1: part of nothing in
+ * `make check`, which stays at one serial suite. */
+static int parallel(size_t n, size_t rounds)
 {
-    if(argc==1) return run_suite(NULL);
-    if(argc==2 && strcmp(argv[1],"--parallel")!=0) return run_suite(argv[1]); /* run one named test */
-    CHECK(argc==2 && strcmp(argv[1],"--parallel")==0);
     size_t failures=0;
-    for(size_t round=0;round<20;round++) {
-        pid_t children[4];
-        for(size_t i=0;i<4;i++) {
-            children[i]=fork(); CHECK(children[i]>=0);
-            if(children[i]==0) exit(run_suite(NULL));
+    for(size_t round=0;round<rounds;round++) {
+        pid_t children[PAR_MAX]; int rd[PAR_MAX]; char ns[PAR_MAX][64];
+        for(size_t i=0;i<n;i++) {
+            int p[2]; CHECK(pipe(p)==0); children[i]=fork(); CHECK(children[i]>=0);
+            if(children[i]==0) { close(p[0]); exit(run_suite(NULL,p[1])); }
+            close(p[1]); rd[i]=p[0];
         }
-        for(size_t i=0;i<4;i++) {
+        for(size_t i=0;i<n;i++) {
+            memset(ns[i],0,sizeof ns[i]); size_t got=0; ssize_t k;
+            while(got<sizeof ns[i]-1u && (k=read(rd[i],ns[i]+got,1))==1) { got++; if(ns[i][got-1]==0) break; }
+            close(rd[i]); CHECK(got>1u);
+            for(size_t j=0;j<i;j++) CHECK(strcmp(ns[i],ns[j])!=0);
             int status; CHECK(waitpid(children[i],&status,0)==children[i]);
             if(!WIFEXITED(status) || WEXITSTATUS(status)!=0) failures++;
         }
     }
-    printf("ipc_test parallel: 20 rounds x 4 processes = 80 runs, %zu failures\n",failures);
+    printf("ipc_test parallel: %zu rounds x %zu processes = %zu runs, distinct namespaces, %zu failures\n",rounds,n,rounds*n,failures);
     return failures==0?0:1;
+}
+int main(int argc, char **argv)
+{
+    if(argc==1) return run_suite(NULL,-1);
+    if(strcmp(argv[1],"--parallel")!=0) return run_suite(argv[1],-1); /* run one named test */
+    size_t n=argc>2?(size_t)strtoul(argv[2],NULL,10):4u, rounds=argc>3?(size_t)strtoul(argv[3],NULL,10):1u;
+    CHECK(n>=2u && n<=PAR_MAX && rounds>=1u);
+    return parallel(n,rounds);
 }

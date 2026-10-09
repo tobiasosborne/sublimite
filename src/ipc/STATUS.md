@@ -13,20 +13,33 @@ installed CLI remain the separate integration bead. See
 threading, callback lifetimes, startup policy and the five-line wiring sketch.
 
 Bounds: whole request <= 1 MiB, <= 128 paths, path/cwd <= 4096 bytes including
-NUL, <= 32 connected clients. No receive allocations after init. Incomplete
-idle peers retain bounded slots until disconnect; oversize stdin returns an
+NUL, <= 32 connected clients. No receive allocations after init; the receive
+pool is 3 MiB (16 x 64 KiB + 2 x 1 MiB, IPC_BUSY when exhausted; the original
+33.5 MB arena is gone and ipc_bench asserts it stays gone). A drain call is
+bounded (256 KiB, 8 callbacks, 8 accepts). Incomplete peers hold a slot for at
+most 5 s and are evicted after 500 ms idle under slot pressure; lifecycle lock
+waits are bounded to 1 s (init returns IPC_TIMEOUT); oversize stdin returns an
 error. These are explicit API limits, not unfinished implementation.
+
+Review fixes edit-457.21 (P4-modules-1 sections 1-4, 10-17) are all done; see
+../../docs/decisions/P4.9c.md. The fuzzer (fuzz/ipc_fuzz.c) is an exact-result
+oracle over 17 structural mutations plus an end-to-end server/credential check.
+Integrator (edit-457.16) must: sweep wait tokens with ipc_server_token_live when
+server.wait_drops rises; for --wait on primary/isolated launches use
+ipc_launcher_pair + fork + ipc_server_adopt_wait / ipc_launcher_wait.
+Open: if /run/user/<uid> is absent and the abstract name is squatted, init
+returns IPC_EXISTS (no /tmp fallback).
 
 Verify (DISPLAY/EDIT_DISPLAY must stay :99):
 
 ```
 env DISPLAY=:99 EDIT_DISPLAY=:99 make all
-env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
+env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=1 make check
 env DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz
 env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/ipc_test
-env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/ipc_test --parallel
-env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 ./build/san/tests/ipc_test --parallel
-env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 ./build/fuzz/ipc_fuzz -max_total_time=60 -max_len=8192
+env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/tests/ipc_test --parallel 4 1   # N rounds optional: --parallel N ROUNDS
+env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=1 ./build/san/tests/ipc_test --parallel
+env DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=1 ./build/fuzz/ipc_fuzz -max_total_time=120 -max_len=4096 <corpus-dir>
 cat /sys/class/power_supply/BAT0/status
 cut -d' ' -f1 /proc/loadavg
 env DISPLAY=:99 EDIT_DISPLAY=:99 ./build/bench/ipc_bench
@@ -34,8 +47,7 @@ sh -n tools/xdg-install.sh
 ```
 
 Unix socket execution needs the approved local-socket environment; the default
-sandbox returns EPERM. LSan is disabled for sandbox sanitizer runs; the
-coordinator reruns with leaks on. Never invoke xdg-install.sh in any test.
+sandbox returns EPERM. Never invoke xdg-install.sh in any test.
 Benchmark results are TRACK; coordinator supplies quiet-box verdicts.
 
 Verification completed 2026-10-09:
