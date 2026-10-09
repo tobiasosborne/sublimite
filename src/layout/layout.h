@@ -23,12 +23,10 @@
  * page; space has no image and uses RENDER_NO_SLOT). Non-ASCII clusters ask the
  * layout_glyph_fn; without one (or on failure) they draw '?'.
  *
- * Long lines: an absent column index uses a bounded byte-position estimate.
- * Caller-reserved checkpoints are built from snapshots on src/work, then
- * adopted by layout_checkpoint_event on UI. No allocation in layout_run.
- * Grapheme segmentation resumes across windows/slices using utf8_cluster_step.
- * Clusters exceeding LAYOUT_WIN bytes keep exact width/segmentation but draw
- * '?' (approximate=true), since the glyph callback requires contiguous bytes.
+ * Long lines (perf 2.4): the scan of one line is bounded per slice and resumes
+ * in the next. A horizontal offset above LAYOUT_MAX_HSCROLL columns is clamped
+ * to it and layout_approximate() reports true; the checkpoint-based jump
+ * (4 KiB column checkpoints for lines > 64 KiB) is a follow-up bead.
  */
 #ifndef EDITOR_LAYOUT_H
 #define EDITOR_LAYOUT_H
@@ -39,9 +37,6 @@
 #include "render/render.h"
 #include "piece/piece.h"
 #include "font/font.h"
-#include "utf8/utf8.h"
-#include "base/base.h"
-#include "work/work.h"
 
 enum {
     LAYOUT_DONE = 0, LAYOUT_MORE = 1,
@@ -77,60 +72,6 @@ typedef struct layout_viewport {
                                     kernel's piece_line_count is a ~1 ms scan. layout_edit keeps it. */
 } layout_viewport;
 
-#define LAYOUT_CHECKPOINT_STRIDE 4096u
-#define LAYOUT_LONG_LINE 65536u
-#define LAYOUT_BYTE_BUDGET 65536u
-#define LAYOUT_CHECKPOINT_MSG UINT32_C(0x4c435031)
-#define LAYOUT_CLUSTER_CACHE 512u
-
-typedef struct layout_checkpoint { uint64_t byte, column; } layout_checkpoint;
-/* One cached line. Reserve at open time; storage may not be freed until the
- * pool is shut down or the final event has been delivered. Fields private.
- * A worker writes only the unpublished suffix; UI reads the valid prefix. */
-typedef struct layout_checkpoint_store {
-    layout_checkpoint *entries;
-    size_t capacity, count;
-    const void *source;
-    uint64_t start, end, columns;
-    uint32_t tab, generation;
-    bool complete, pending, newline;
-    struct {
-        struct layout_checkpoint_store *store;
-        piece_snapshot *snapshot;
-        const void *source;
-        uint64_t start, pos, column;
-        size_t count;
-        uint32_t tab, generation;
-    } job;
-} layout_checkpoint_store;
-
-typedef struct layout_cluster_cache_entry {
-    uint64_t key[4];
-    uint32_t stamp;
-    uint8_t len, width, valid, key_len;
-} layout_cluster_cache_entry;
-
-/* INIT/open-time only: arena reserves 16 B per 4 KiB plus one sentinel.
- * max_line_bytes is a capacity bound; exhaustion leaves layout approximate. */
-int layout_checkpoint_init(layout_checkpoint_store *s, edit_arena *arena, uint64_t max_line_bytes);
-/* UI: submit a lazy build, retaining snapshot. source is the identity passed
- * to layout_begin[_snapshot], start is a line start. Snapshot creation is the
- * caller's job (outside layout_run); request itself allocates nothing. A store
- * permits one in-flight request; ERR_STATE means drain the preceding event.
- * Re-request after edits resumes from its last valid checkpoint. */
-int layout_checkpoint_request(layout_checkpoint_store *s, work_pool *pool,
-                              piece_snapshot *snapshot, const void *source,
-                              uint64_t start, uint32_t tab_width);
-/* UI mailbox router: true if the message belongs to s (even a stale result).
- * Does not mark/render: caller starts a new frame and relayouts after adoption.
- * All messages must be routed; do not externally cancel the owned job. */
-bool layout_checkpoint_event(layout_checkpoint_store *s, const work_msg *msg);
-/* UI: invalidate checkpoints at/after an edit; called by layout_edit for the
- * attached store. Strictly earlier checkpoints survive. No allocation. */
-void layout_checkpoint_invalidate(layout_checkpoint_store *s, uint64_t off,
-                                  uint64_t old_len, uint64_t new_len,
-                                  uint64_t old_nl, uint64_t new_nl);
-
 typedef struct layout {
     render_grid *grid;
     layout_config cfg;
@@ -146,15 +87,6 @@ typedef struct layout {
     uint64_t col;                /* absolute column in the line */
     uint32_t vis;                /* next text cell */
     uint64_t win_pos; uint32_t wi, win_len; bool win_eof;
-    layout_checkpoint_store *checkpoints;
-    uint64_t bytes_scanned, bytes_read, cache_hits, cache_misses; /* per begin/relayout;
-        consumed decode/tail bytes and physical source-read bytes respectively */
-    uint64_t row_scanned, cluster_at, cluster_len;
-    uint32_t cluster_saved;
-    bool cluster_active, row_indexed;
-    utf8_cseg cluster_seg;
-    layout_cluster_cache_entry cluster_cache[LAYOUT_CLUSTER_CACHE];
-    uint8_t cluster_bytes[LAYOUT_WIN];
     uint8_t win[LAYOUT_WIN];
 } layout;
 
@@ -170,9 +102,6 @@ int layout_init(layout *l, render_grid *g, const layout_config *cfg,
 int layout_begin(layout *l, const piece_tree *t, layout_viewport vp);
 int layout_begin_snapshot(layout *l, const piece_snapshot *s, layout_viewport vp);
 
-/* Attach a caller-owned cache for one line (NULL detaches); UI, idle only.
- * Keep the store alive for the layout lifetime. */
-int layout_set_checkpoints(layout *l, layout_checkpoint_store *s);
 /* Continue; LAYOUT_MORE means call again (after checking input). */
 int layout_run(layout *l);
 

@@ -6,7 +6,6 @@
 #include "layout/layout.h"
 #include <stdlib.h>
 #include <string.h>
-#include <poll.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
@@ -18,142 +17,9 @@ static int glyph_cb(void *ctx, const uint8_t *c, size_t n, uint32_t w, uint32_t 
 
 static layout lay[2];
 
-static void checkpoint_message(const work_msg *msg, void *ud)
-{
-    (void)layout_checkpoint_event(ud, msg);
-}
-static void checkpoint_build(work_pool *pool, layout_checkpoint_store *store, piece_tree *tree, uint32_t tab)
-{
-    piece_snapshot *snapshot = piece_snapshot_take(tree);
-    if (!snapshot || layout_checkpoint_request(store, pool, snapshot, tree, 0, tab) != LAYOUT_DONE) __builtin_trap();
-    piece_snapshot_release(snapshot);
-    struct pollfd fd = {work_pool_eventfd(pool), POLLIN, 0};
-    unsigned guard = 0;
-    while (store->pending) {
-        (void)poll(&fd, 1, 100);
-        (void)work_mailbox_drain(pool, checkpoint_message, store);
-        if (++guard > 1000) __builtin_trap();
-    }
-    if (!store->complete) __builtin_trap();
-}
-
-/* Independent naive forward column/cell model. Uses the one-shot UTF-8
- * oracle, no layout state, checkpoints, cache, or budgeted segmentation. */
-static void naive_line(const uint8_t *text, size_t len, render_cell *cells, uint32_t cols,
-                       uint32_t tab, uint32_t hs)
-{
-    render_cell blank = {0, RENDER_NO_SLOT, 0xffffff, 0, 0, 0};
-    for (uint32_t i = 0; i < cols; i++) cells[i] = blank;
-    uint64_t column = 0; uint32_t vis = 0;
-    for (size_t p = 0; p < len && vis < cols;) {
-        const uint8_t *bytes = text + p;
-        if (*bytes == '\n') break;
-        if (*bytes == '\r' && p + 1 < len && bytes[1] == '\n') { p++; continue; }
-        if (*bytes == '\t') {
-            uint32_t width = tab - (uint32_t)(column % tab);
-            for (uint32_t j = 0; j < width && vis < cols; j++) if (column + j >= hs) cells[vis++] = blank;
-            column += width; p++; continue;
-        }
-        utf8_step first = utf8_decode(bytes, len - p);
-        bool invalid = !first.valid || *bytes < 0x20 || *bytes == 0x7f;
-        int width = 1; size_t n = invalid ? 1 : utf8_cluster(bytes, len - p, &width);
-        uint64_t after = column + (uint32_t)width;
-        if (width && after > hs) {
-            if (width == 2 && (column < hs || vis + 2 > cols)) cells[vis++] = blank;
-            else {
-                uint32_t slot = '?' - 0x20u, glyph = '?';
-                if (!invalid && n == 1 && *bytes < 0x80) {
-                    glyph = *bytes == ' ' ? 0 : *bytes;
-                    slot = *bytes == ' ' ? RENDER_NO_SLOT : *bytes - 0x20u;
-                } else if (!invalid) {
-                    uint32_t selected;
-                    if (glyph_cb(NULL, bytes, n, (uint32_t)width, &selected) == 0) slot = selected;
-                }
-                uint16_t attrs = invalid ? RENDER_ATTR_INVERSE : 0;
-                if (width == 2) attrs |= RENDER_ATTR_WIDE_LEFT;
-                cells[vis++] = (render_cell){glyph, slot, 0xffffff, 0, attrs, 0};
-                if (width == 2) cells[vis++] = (render_cell){0, RENDER_NO_SLOT, 0xffffff, 0, RENDER_ATTR_WIDE_RIGHT, 0};
-            }
-        }
-        column = after; p += n;
-    }
-}
-
-static uint64_t naive_columns(const uint8_t *text, size_t len, uint32_t tab)
-{
-    uint64_t col = 0;
-    for (size_t p = 0; p < len;) {
-        if (text[p] == '\t') { col += tab - col % tab; p++; }
-        else { int width; size_t n = utf8_cluster(text + p, len - p, &width); col += (uint32_t)width; p += n; }
-    }
-    return col;
-}
-
-static void fuzz_long_line(const uint8_t *data, size_t size)
-{
-    size_t capacity = 196608, target = 65537u + (size_t)data[1] * 400u;
-    uint8_t *text = malloc(capacity);
-    if (!text) __builtin_trap();
-    static const char *patterns[] = {"abc", "\t", "\xE4\xB8\xAD", "e\xCC\x81", "\xFF", "\x01",
-        "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xE2\x80\x8D", ("\xD8\x80" "a"), "1\xEF\xB8\x8F\xE2\x83\xA3"};
-    size_t len = 0, index = 8;
-    while (len < target) {
-        const char *pattern = patterns[data[index % size] % 10u]; size_t n = strlen(pattern);
-        memcpy(text + len, pattern, n); len += n; index++;
-    }
-    piece_allocator allocator = piece_default_allocator(); piece_tree *tree = piece_create(&allocator);
-    if (!tree || piece_init_copy(tree, text, len) != PIECE_OK) __builtin_trap();
-    work_pool *pool = malloc(sizeof *pool);
-    edit_arena arena;
-    if (!pool || work_pool_init(pool, 1, 0) != 0 || edit_arena_init(&arena, 2048) != 0) __builtin_trap();
-    layout_checkpoint_store store;
-    if (layout_checkpoint_init(&store, &arena, capacity) != LAYOUT_DONE) __builtin_trap();
-    uint32_t cols = 1u + data[0] % 40u, tab = 1u + data[2] % 8u;
-    uint64_t columns = naive_columns(text, len, tab);
-    uint64_t pick = (uint64_t)data[6] * 257u + data[7];
-    uint32_t hs = (uint32_t)(columns > 65536 ? 65536 + pick % (columns - 65536 + cols) : pick % (columns + cols));
-    render_cell actual[40], expected[40]; uint64_t bits[1], rb[1]; uint32_t ru[1];
-    render_grid grid; const font_ascii_atlas *atlas = font_ascii_atlas_for_px(15);
-    render_glyph glyphs[96]; layout_ascii_glyphs(atlas, glyphs); glyphs[95] = glyphs[31];
-    render_atlas_page page = {atlas->pixels, atlas->pixels_len, (size_t)atlas->cell.cell_w * 95,
-                             atlas->cell.cell_w * 95, atlas->cell.cell_h};
-    if (render_grid_init(&grid, (render_dims){cols, 1, atlas->cell.cell_w, atlas->cell.cell_h},
-                         actual, cols, bits, 1) != RENDER_OK) __builtin_trap();
-    grid.pages = &page; grid.page_count = 1; grid.glyphs = glyphs; grid.glyph_count = 96;
-    layout_config cfg = {0}; cfg.tab_width = tab; cfg.fg = 0xffffff; cfg.glyph = glyph_cb;
-    cfg.slice_clusters = 1u + data[3] % 17u;
-    layout *l = malloc(sizeof *l);
-    if (!l || layout_init(l, &grid, &cfg, rb, ru) != LAYOUT_DONE || layout_set_checkpoints(l, &store) != LAYOUT_DONE)
-        __builtin_trap();
-    uint32_t frame = 0;
-    for (unsigned mutation = 0; mutation < 3; mutation++) {
-        checkpoint_build(pool, &store, tree, tab);
-        if (render_frame_begin(&grid, ++frame) != RENDER_OK ||
-            layout_begin(l, tree, (layout_viewport){0, 0, hs, 1}) != LAYOUT_DONE) __builtin_trap();
-        int rc; unsigned guard = 0;
-        while ((rc = layout_run(l)) == LAYOUT_MORE) if (++guard > 100000) __builtin_trap();
-        naive_line(text, len, expected, cols, tab, hs);
-        if (rc != LAYOUT_DONE || render_grid_validate(&grid) != RENDER_OK ||
-            memcmp(actual, expected, (size_t)cols * sizeof *actual) != 0) __builtin_trap();
-        /* A pathological whole-line cluster may exceed contiguous glyph scratch;
-         * otherwise a published index must resolve approximation. */
-        if (l->cluster_len <= LAYOUT_WIN && layout_approximate(l)) __builtin_trap();
-        if (mutation == 2) break;
-        size_t off = ((size_t)data[7] * 257u + mutation * 4095u) % (len + 1);
-        const char *insert = patterns[data[mutation + 2] % 10u]; size_t n = strlen(insert);
-        if (piece_insert(tree, off, (const uint8_t *)insert, n) != PIECE_OK) __builtin_trap();
-        memmove(text + off + n, text + off, len - off); memcpy(text + off, insert, n); len += n;
-        if (render_frame_begin(&grid, ++frame) != RENDER_OK || layout_edit(l, off, 0, n, 0, 0) < 0) __builtin_trap();
-        for (size_t i = 0; i < store.count; i++) if (store.entries[i].byte >= off) __builtin_trap();
-        /* Supersede partial redraw with the next published-index full layout. */
-    }
-    work_pool_shutdown(pool); free(pool); free(l); edit_arena_free(&arena); piece_destroy(tree); free(text);
-}
-
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 8) return 0;
-    if (size > 8 && (data[5] & 0x80u)) { fuzz_long_line(data, size); return 0; }
     uint32_t cols = 1u + data[0] % 40u, rows = 1u + data[1] % 12u, tab = data[2] % 9u;
     uint32_t hs = (uint32_t)data[3] * (data[4] & 1u ? 1u : 3000u);
     bool gutter = data[5] & 1u;

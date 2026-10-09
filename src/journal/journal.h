@@ -4,11 +4,14 @@
 #include "base/base.h"
 #include "work/work.h"
 #include "piece/piece.h"
+#include <sys/types.h>
 
 #define JOURNAL_PAGE 4096u
 #define JOURNAL_HEADER 32u
 #define JOURNAL_MAX_RECORD (1024u * 1024u)
 #define JOURNAL_MESSAGE 0x4a524e4cu
+#define JOURNAL_DEFAULT_SYNC_BYTES 65536ull
+#define JOURNAL_DEFAULT_SYNC_NS 1000000000ull
 
 typedef enum journal_error {
     JOURNAL_OK = 0, JOURNAL_IO, JOURNAL_INVALID, JOURNAL_FULL,
@@ -16,7 +19,7 @@ typedef enum journal_error {
 } journal_error;
 typedef enum journal_type {
     JOURNAL_BASE = 1, JOURNAL_INSERT, JOURNAL_DELETE, JOURNAL_VIEW,
-    JOURNAL_TABS, JOURNAL_WINDOW
+    JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE
 } journal_type;
 /* All wire integers are little-endian; no native structs are persisted. */
 typedef struct journal_base {
@@ -42,6 +45,8 @@ typedef int (*journal_visit)(void *, const journal_record *);
 typedef struct journal_options {
     size_t batch_bytes;        /* page multiple >= 8192; default 256 KiB, two buffers */
     uint64_t max_file_bytes;   /* page multiple; default 64 MiB */
+    uint64_t sync_bytes;       /* page multiple >= 4096; 0 = current 64 KiB default */
+    uint64_t sync_interval_ns; /* 0 = current 1 s default; explicit force always syncs */
 } journal_options;
 typedef struct journal_stats {
     uint64_t accepted_sequence, written_sequence, durable_sequence;
@@ -50,6 +55,67 @@ typedef struct journal_stats {
     int error;
 } journal_stats;
 typedef struct journal journal;
+/* Optional off-path syscall seam; callbacks have POSIX return/errno semantics.
+ * sync receives directory=true for namespace barriers, false for data barriers.
+ * NULL callbacks use real syscalls; contexts must outlive all jobs, including
+ * temporary checkpoint jobs. Set only with no active worker. Append never calls
+ * these hooks. open_with_io also covers the creation-directory barrier. */
+typedef struct journal_io {
+    void *ctx;
+    ssize_t (*write)(void *, int, const uint8_t *, size_t, uint64_t);
+    int (*sync)(void *, int, bool);
+    int (*rename)(void *, const char *, const char *);
+} journal_io;
+/* Zero-initialize each save token. Its sequence is the saved snapshot cutoff
+ * in the PREPARED checkpoint generation (checkpoint record count). */
+typedef struct journal_save {
+    uint64_t buffer_id, sequence;
+    char previous_path[4097];
+    bool prepared;
+} journal_save;
+int journal_open_with_io(journal **out, const char *path, work_pool *pool,
+                         const journal_options *options, const journal_io *io);
+int journal_set_io(journal *j, const journal_io *io);
+/* Off-path, after receive returns failed-worker ownership. Clear IO suspension,
+ * retaining exact batch progress and both buffers; subsequent pump/flush retries
+ * the failed batch first. Repeats a failed checkpoint-directory barrier BEFORE
+ * permitting new writes/acks. FULL suspension is preserved. */
+int journal_retry(journal *j);
+/* Recoverable save order (all checkpoint work is off the typing path):
+ * 1. Build a COMPLETE session checkpoint at the current UI snapshot. Include one
+ *    matching previous BASE for id and all state/edits for every other buffer.
+ * 2. save_prepare flushes, retains/syncs the previous inode under a hard link,
+ *    substitutes every BASE matching that named identity/path, adds a SAVE
+ *    marker with the saved cutoff,
+ *    durably rotates. Named previous paths must be absolute (file_path works).
+ * 3. Without intervening UI mutation, call file_save_begin on the same tree;
+ *    it takes the snapshot. Appends may continue after it returns. Its return
+ *    acknowledges enqueue only; route FILE_MSG_SAVE_DONE and require FILE_OK.
+ * 4. capture_base(file_path) obtains the new identity. Build another COMPLETE
+ *    CURRENT-session checkpoint: new BASE + edits since the saved cutoff for
+ *    this buffer; preserve other buffers (including their prepared BASE paths
+ *    and SAVE metadata).
+ *    Buffers sharing the replaced path must also be rebased/checkpointed before
+ *    finish can retire their shared retained generation.
+ * 5. save_finish flushes and persists cutoff + new identity inside the new
+ *    checkpoint before its rename, then rotates and syncs the
+ *    new name, THEN retires the previous link. Requires no concurrent mutation
+ *    between checkpoint construction and either call.
+ * Recovery needs no live token: pre-rotation BASE loads the retained generation
+ * and replays all its ops; post-rotation BASE loads the saved generation and
+ * applies only its remaining deltas. SAVE is metadata, never a tree mutation.
+ * Save failure or any journal error: retain previous_path, suspend/resolve IO
+ * and retry; never delete it merely because the call failed (a rename may have
+ * happened). A failed prepare must NOT be followed by file_save_begin.
+ * Tokens for simultaneous saves belong to the caller. Complete checkpoints
+ * must retain every in-flight token's BASE and SAVE metadata; finish refuses to retire a BASE
+ * referenced by the supplied checkpoint. Caller guarantees checkpoint contents
+ * include all accepted edits, as for ordinary rotate. */
+int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
+                         const journal_record *checkpoint, size_t count,
+                         journal_save *save);
+int journal_save_finish(journal *j, journal_save *save, const journal_base *saved,
+                        const journal_record *checkpoint, size_t count);
 /* Setup/close/rotation may allocate or block; never call on typing path.
  * New file only: open refuses a nonempty file (replay + checkpoint first).
  * Caller owns pool and must drain mailboxes through journal_receive (including
@@ -73,7 +139,8 @@ int journal_set_tabs(journal *j, const uint64_t *ids, size_t count, uint64_t act
 int journal_set_window(journal *j, uint32_t width, uint32_t height);
 /* Event-loop timer (<=5 ms recommended), outside the typing path. now_ns is
  * CLOCK_MONOTONIC; force requests a sync even if no new records exist.
- * Worker syncs at >=64 KiB or >=1 s since last sync, plus explicit force.
+ * Worker syncs at the configured byte/time thresholds, plus explicit force.
+ * Zero option fields preserve the current 64 KiB / 1 s defaults.
  * IO/scheduling delays can extend the window; stats expose durable progress. */
 int journal_pump(journal *j, uint64_t now_ns, bool force);
 bool journal_receive(journal *j, const work_msg *message);
@@ -84,10 +151,15 @@ journal_stats journal_get_stats(const journal *j);
 void journal_set_message_handler(journal *j,
                                  void (*handler)(const work_msg *, void *), void *ctx);
 int journal_flush(journal *j); /* blocking; setup/save/exit only */
-/* Complete session checkpoint, after a successful save. Include each BASE,
+/* Complete session checkpoint. Use the save transaction BEFORE file_save_begin
+ * when a named BASE will be replaced. Include each BASE,
  * remaining dirty contents as INSERT from empty base or ops against saved base,
  * views, tabs, window. No old records survive. Atomic rename + directory fsync.
- * Requires no active worker or pending records (flush first). */
+ * Requires no active worker; normally flush first. After received worker IO
+ * failure it can replace both retained batches with a complete checkpoint.
+ * Failure before rename preserves the old recovery prefix and retry state.
+ * Failure at the directory barrier suspends IO and reports durable_sequence=0
+ * for the new generation until retry completes that barrier. */
 int journal_rotate(journal *j, const journal_record *records, size_t count);
 /* Parser: visits only structurally valid, CRC-checked records. Callback must
  * apply atomically; nonzero stops WITHOUT truncating that record. */
@@ -106,6 +178,6 @@ int journal_decode_base(const journal_record *record, journal_base *base,
                         char *path, size_t capacity);
 int journal_check_base(const journal_base *base);
 /* Apply INSERT/DELETE to a supplied tree; BASE and session records handled by
- * caller (check/load base before edits). Range failure returns INVALID. */
+ * caller (check/load base before edits); SAVE is metadata. Range failure returns INVALID. */
 int journal_apply_piece(piece_tree *tree, const journal_record *record);
 #endif

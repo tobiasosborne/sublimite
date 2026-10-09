@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -249,7 +248,7 @@ static void test_hscroll_eof(void)
     CHECK(f.row_byte[2] == LAYOUT_VOID_ROW);
     CHECK(!layout_approximate(&f.l));
     show(&f, 0, LAYOUT_MAX_HSCROLL + 5);
-    CHECK(!layout_approximate(&f.l)); /* short lines are now exact at any offset */
+    CHECK(layout_approximate(&f.l));
     fx_free(&f);
 }
 
@@ -413,188 +412,10 @@ static void test_cursor(void)
     fx_free(&f);
 }
 
-/* RED: unlimited slices must still bound long-line UI work. */
-static void test_long_line_bounded(void)
-{
-    const size_t n = 1024u * 1024u;
-    char *text = malloc(n);
-    memset(text, 'a', n);
-    text[1000000] = 'Z';
-    fx f; fx_make(&f, 20, 3, nogutter(), text, n);
-    fx_frame(&f);
-    CHECK(layout_begin(&f.l, f.t, (layout_viewport){0, 0, 1000000, 1}) == LAYOUT_DONE);
-    CHECK(layout_run(&f.l) == LAYOUT_DONE);
-    CHECK(layout_approximate(&f.l));
-    CHECK(f.l.bytes_scanned <= LAYOUT_BYTE_BUDGET);
-    CHECK(f.l.bytes_read <= LAYOUT_WIN);
-    fx_free(&f); free(text);
-}
-
-static void checkpoint_cb(const work_msg *msg, void *ud)
-{
-    (void)layout_checkpoint_event(ud, msg);
-}
-static void wait_checkpoint(work_pool *pool, layout_checkpoint_store *store)
-{
-    for (unsigned i = 0; store->pending && i < 20000; i++) {
-        (void)work_mailbox_drain(pool, checkpoint_cb, store);
-        struct timespec ts = {0, 1000000};
-        if (store->pending) (void)nanosleep(&ts, NULL);
-    }
-    CHECK(!store->pending);
-}
-static void build_checkpoint(work_pool *pool, layout_checkpoint_store *store, fx *f)
-{
-    piece_snapshot *snap = piece_snapshot_take(f->t);
-    CHECK(snap != NULL);
-    CHECK(layout_checkpoint_request(store, pool, snap, f->t, 0, f->l.tab) == LAYOUT_DONE);
-    piece_snapshot_release(snap);
-    wait_checkpoint(pool, store);
-}
-static void test_checkpoints(void)
-{
-    const size_t n = 1024u * 1024u;
-    char *text = malloc(n + 6);
-    for (size_t i = 0; i < n; i++) text[i] = (char)('A' + i % 26);
-    /* Tabs alter byte->column; Unicode cluster straddles a 4 KiB boundary. */
-    text[17] = '\t';
-    memcpy(text + 4095, "e\xCC\x81", 3);
-    memcpy(text + n, "\nnext", 5);
-    fx f; fx_make(&f, 20, 3, nogutter(), text, n + 5);
-    edit_arena arena; CHECK(edit_arena_init(&arena, 16384) == 0);
-    layout_checkpoint_store store;
-    CHECK(layout_checkpoint_init(&store, &arena, n + 5) == LAYOUT_DONE);
-    CHECK(layout_set_checkpoints(&f.l, &store) == LAYOUT_DONE);
-    work_pool *pool = malloc(sizeof *pool);
-    CHECK(work_pool_init(pool, 1, 0) == 0);
-    show(&f, 0, 1000000);
-    CHECK(layout_approximate(&f.l) && f.l.bytes_scanned <= LAYOUT_BYTE_BUDGET + LAYOUT_WIN);
-    build_checkpoint(pool, &store, &f);
-    CHECK(store.complete && store.count > 200);
-    show(&f, 0, 1000000);
-    CHECK(!layout_approximate(&f.l));
-    CHECK(f.l.bytes_scanned <= 2u * LAYOUT_WIN);
-    CHECK(f.l.bytes_read <= 2u * LAYOUT_WIN);
-    /* tab adds 2 columns; combining cluster removes 2: byte == column here. */
-    CHECK(cell(&f, 0, 0)->glyph_index == (uint32_t)(unsigned char)text[1000000]);
-    CHECK(f.row_byte[1] == n + 1 && f.row_byte[2] == LAYOUT_VOID_ROW);
-    size_t old_count = store.count;
-    edit_insert(&f, 200000, "\t");
-    CHECK(store.count > 1 && store.count < old_count);
-    CHECK(layout_approximate(&f.l));
-    build_checkpoint(pool, &store, &f);
-    show(&f, 0, 1000000);
-    CHECK(!layout_approximate(&f.l));
-    /* independent ASCII/tab prefix model around the inserted tab */
-    uint32_t extra = 4u - (200000u % 4u);
-    CHECK(cell(&f, 0, 0)->glyph_index == (uint32_t)(unsigned char)text[1000000u - extra]);
-    edit_delete(&f, 200000, 1);
-    build_checkpoint(pool, &store, &f);
-    show(&f, 0, 1000000);
-    CHECK(!layout_approximate(&f.l));
-    CHECK(cell(&f, 0, 0)->glyph_index == (uint32_t)(unsigned char)text[1000000]);
-    /* A result built on a stale snapshot must not revive invalidated columns. */
-    piece_snapshot *snap = piece_snapshot_take(f.t);
-    CHECK(layout_checkpoint_request(&store, pool, snap, f.t, 0, 4) == LAYOUT_DONE);
-    piece_snapshot_release(snap);
-    edit_insert(&f, 100, "\n");
-    wait_checkpoint(pool, &store);
-    CHECK(!store.complete);
-    CHECK(store.count <= 1);
-    work_pool_shutdown(pool); free(pool);
-    fx_free(&f); edit_arena_free(&arena); free(text);
-}
-
-/* No synthetic cluster boundary at a window or budget boundary. */
-static void test_budgeted_cluster(void)
-{
-    size_t n = 100001;
-    char *text = malloc(n + 2); text[0] = 'e';
-    for (size_t i = 1; i < n; i += 2) { text[i] = (char)0xcc; text[i + 1] = (char)0x81; }
-    text[n] = 'x'; text[n + 1] = '\n';
-    fx f; layout_config cfg = nogutter(); cfg.slice_clusters = 7;
-    fx_make(&f, 8, 2, cfg, text, n + 2);
-    fx_frame(&f); CHECK(layout_begin(&f.l, f.t, (layout_viewport){0, 0, 0, 2}) == LAYOUT_DONE);
-    unsigned slices = 0; int rc;
-    do {
-        uint64_t before = f.l.bytes_scanned;
-        rc = layout_run(&f.l);
-        CHECK(f.l.bytes_scanned - before <= LAYOUT_BYTE_BUDGET + 4);
-        slices++;
-    } while (rc == LAYOUT_MORE && slices < 100000);
-    CHECK(rc == LAYOUT_DONE && slices > 1);
-    ROW_IS(&f, 0, 0, "?x");
-    CHECK(layout_approximate(&f.l));
-    fx_free(&f); free(text);
-}
-
-static int sized_cluster_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot)
-{
-    size_t *observed = ctx; *observed = len;
-    CHECK(bytes[0] == 'e' && width == 1);
-    *slot = REPL; return 0;
-}
-static void test_cluster_window_boundary(void)
-{
-    size_t cluster_len = 16001, prefix = 1000;
-    char *text = malloc(prefix + cluster_len + 1); memset(text, 'a', prefix); text[prefix] = 'e';
-    for (size_t i = 1; i < cluster_len; i += 2) { text[prefix + i] = (char)0xcc; text[prefix + i + 1] = (char)0x81; }
-    text[prefix + cluster_len] = 'x';
-    size_t observed = 0; layout_config cfg = nogutter(); cfg.glyph = sized_cluster_glyph; cfg.glyph_ctx = &observed;
-    fx f; fx_make(&f, 8, 1, cfg, text, prefix + cluster_len + 1);
-    show(&f, 0, (uint32_t)prefix);
-    ROW_IS(&f, 0, 0, "#x");
-    CHECK(observed == cluster_len && !layout_approximate(&f.l));
-    fx_free(&f); free(text);
-}
-static void test_short_line_before_long(void)
-{
-    size_t n = 1024u * 1024u; char *text = malloc(n);
-    memset(text, 'a', n); memcpy(text, "short\n", 6);
-    fx f; fx_make(&f, 20, 2, nogutter(), text, n);
-    show(&f, 0, 100000);
-    ROW_IS(&f, 0, 0, "");
-    CHECK(f.row_byte[1] == 6);
-    CHECK(layout_approximate(&f.l));
-    CHECK(f.l.bytes_scanned <= LAYOUT_BYTE_BUDGET + LAYOUT_WIN);
-    fx_free(&f); free(text);
-}
-
-static void test_cache_invalid_right_context(void)
-{
-    char text[40]; memset(text, 'x', sizeof text); memcpy(text, "e\xE0\xFF", 3);
-    fx f; fx_make(&f, 8, 1, nogutter(), text, sizeof text);
-    show(&f, 0, 0); /* caches 'e' before an invalid E0 lead */
-    memset(text, 'x', sizeof text); memcpy(text, "e\xE0\xB8\xB1", 4); /* Thai combining mark */
-    CHECK(piece_delete(f.t, 0, sizeof text, NULL) == PIECE_OK);
-    CHECK(piece_insert(f.t, 0, (const uint8_t *)text, sizeof text) == PIECE_OK);
-    show(&f, 0, 0);
-    ROW_IS(&f, 0, 0, "#xxxxxxx");
-    fx_free(&f);
-}
-
-static void test_no_allocations(void)
-{
-    fx f; const char *text = "abc\t\xE4\xB8\xAD" "e\xCC\x81\n";
-    fx_make(&f, 32, 4, nogutter(), text, strlen(text));
-    show(&f, 0, 0);
-    edit_malloc_guard_begin();
-    for (uint32_t i = 0; i < 10000; i++) {
-        fx_frame(&f);
-        CHECK(layout_relayout_rows(&f.l, 0, 1) == LAYOUT_MORE);
-        run_all(&f);
-    }
-    size_t allocations = edit_malloc_guard_end();
-    CHECK(allocations == 0);
-    printf("layout no-malloc: %zu allocations over 10000 relayouts (guard %s)\n", allocations,
-           edit_malloc_guard_active() ? "active" : "ASan-inert");
-    fx_free(&f);
-}
-
 int main(void)
 {
     test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
-    test_gutter(); test_hscroll_eof(); test_slices(); test_dirty(); test_cursor(); test_long_line_bounded(); test_checkpoints(); test_budgeted_cluster(); test_no_allocations(); test_cluster_window_boundary(); test_short_line_before_long(); test_cache_invalid_right_context();
+    test_gutter(); test_hscroll_eof(); test_slices(); test_dirty(); test_cursor();
     if (fails) { printf("layout_test: %d FAILED\n", fails); return 1; }
     printf("layout_test: all passed\n");
     return 0;

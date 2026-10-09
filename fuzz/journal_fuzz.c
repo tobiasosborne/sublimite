@@ -1,5 +1,6 @@
 #include "journal/journal.h"
 #include <fcntl.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -54,6 +55,22 @@ static void structured_bytes(const uint8_t *data, size_t size)
     for(unsigned k=0;k<4;k++) wire[12+k]=(uint8_t)(crc>>(8*k));
     no_visit(wire,total);
 }
+typedef struct fuzz_io { unsigned writes, syncs; bool write_error, sync_error; } fuzz_io;
+static ssize_t fuzz_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    fuzz_io *f=ctx; f->writes++;
+    if(f->write_error && f->writes==1 && n>17) n=17;
+    if(f->write_error && f->writes==2) { errno=EIO; return -1; }
+    return pwrite(fd,p,n,(off_t)off);
+}
+static int fuzz_sync(void *ctx, int fd, bool directory)
+{
+    fuzz_io *f=ctx;
+    if(directory) return fsync(fd);
+    f->syncs++;
+    if(f->sync_error && f->syncs==1) { errno=EIO; return -1; }
+    return fdatasync(fd);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     no_visit(data,size);
@@ -61,7 +78,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if(!size || (data[0]&31u)!=0) return 0;
     char path[]="/tmp/journal-fuzz-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 0; close(fd);
     work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return 0; }
-    journal *j=NULL; if(journal_open(&j,path,&pool,NULL)) { work_pool_shutdown(&pool); unlink(path); return 0; }
+    fuzz_io faults={.write_error=(data[0]&64u)!=0,.sync_error=(data[0]&128u)!=0};
+    journal_io io={.ctx=&faults,.write=fuzz_write,.sync=fuzz_sync};
+    journal *j=NULL; if(journal_open_with_io(&j,path,&pool,NULL,&io)) { work_pool_shutdown(&pool); unlink(path); return 0; }
     fuzz_model model={0}; journal_record operations[64]; uint8_t payloads[64][24]; size_t count=0;
     for(size_t i=1;i+2<size && count<64;i+=3) {
         bool del=model.size && (data[i]&1u);
@@ -73,7 +92,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         EDIT_ASSERT(journal_append(j,r.type,r.buffer_id,r.data,r.size)==0);
         EDIT_ASSERT(apply(&model,&r)==0); operations[count++]=r;
     }
-    EDIT_ASSERT(journal_flush(j)==0); journal_close(j);
+    int flush_rc=journal_flush(j);
+    for(unsigned retries=0;flush_rc==JOURNAL_IO && retries<2;retries++) {
+        EDIT_ASSERT(journal_get_stats(j).accepted_sequence==count);
+        EDIT_ASSERT(journal_retry(j)==0); flush_rc=journal_flush(j);
+    }
+    EDIT_ASSERT(flush_rc==0 && journal_get_stats(j).durable_sequence==count); journal_close(j);
     uint8_t bytes[8192]; fd=open(path,O_RDONLY); EDIT_ASSERT(fd>=0);
     ssize_t got=read(fd,bytes,sizeof bytes); EDIT_ASSERT(got>0 || count==0); close(fd);
     piece_allocator alloc=piece_default_allocator(); fuzz_model actual={.tree=piece_create(&alloc)};

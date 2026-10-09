@@ -17,7 +17,7 @@ static void nap(void) { struct timespec t={0,1000000}; nanosleep(&t,NULL); }
 static int run(work_pool *pool, size_t payload)
 {
     char path[]="/tmp/journal-bench-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 1; close(fd);
-    journal *j; journal_options opts={262144,268435456}; if(journal_open(&j,path,pool,&opts)) return 1;
+    journal *j; journal_options opts={.batch_bytes=262144,.max_file_bytes=268435456}; if(journal_open(&j,path,pool,&opts)) return 1;
     edit_arena a; if(edit_arena_init(&a,100000*sizeof(uint64_t))) return 1;
     uint64_t *samples=edit_arena_alloc(&a,100000*sizeof(uint64_t),16); bench_samples s; bench_samples_init(&s,samples,100000);
     uint8_t data[1024]; memset(data,'x',sizeof data);
@@ -41,11 +41,37 @@ static int run(work_pool *pool, size_t payload)
     printf("TRACK journal_sync payload=%zu syncs=%llu max_bytes=%llu last_bytes=%llu max_interval_ms=%.3f (M)%s threshold=64KiB_or_1s\n",payload,(unsigned long long)stats.syncs,(unsigned long long)stats.max_sync_bytes,(unsigned long long)stats.last_sync_bytes,(double)stats.max_sync_interval_ns/1e6,bench_evidence_tag());
     edit_arena_free(&a); unlink(path); return fail;
 }
+static uint64_t worker_cpu_ns(clockid_t clock)
+{ struct timespec t; if(clock_gettime(clock,&t)) return 0; return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
+static int worker_cpu(work_pool *pool)
+{
+    char path[]="/tmp/journal-cpu-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 1; close(fd);
+    journal *j; if(journal_open(&j,path,pool,NULL)) return 1;
+    clockid_t cpu_clock; if(pthread_getcpuclockid(pool->threads[0],&cpu_clock)) return 1;
+    uint64_t before=worker_cpu_ns(cpu_clock);
+    unsigned syncs=8; uint64_t parked_cpu=0;
+    for(unsigned i=0;i<syncs;i++) {
+        if(journal_insert(j,1,i,(const uint8_t *)"x",1) || journal_pump(j,1,true)) return 1;
+        unsigned waiting=0;
+        while(atomic_load(&pool->mb[0].head)==atomic_load(&pool->mb[0].tail) && waiting++<5000) nap();
+        if(waiting>=5000) return 1;
+        uint64_t start=worker_cpu_ns(cpu_clock);
+        struct timespec pause={0,50000000}; nanosleep(&pause,NULL);
+        parked_cpu+=worker_cpu_ns(cpu_clock)-start;
+        for(unsigned k=0;k<WORK_MAX_JOBS;k++) if(atomic_load(&pool->slots[k].busy)) {
+            fprintf(stderr,"journal_bench: FAIL worker still active after completion\n"); return 1;
+        }
+        if(journal_flush(j)) return 1;
+    }
+    printf("TRACK journal_worker_cpu syncs=%u cpu_us_per_sync=%.3f undrained_50ms_cpu_us_per_sync=%.3f worker_return=1 (M)%s\n",
+           syncs,(double)(worker_cpu_ns(cpu_clock)-before)/(1000.0*syncs),(double)parked_cpu/(1000.0*syncs),bench_evidence_tag());
+    journal_close(j); unlink(path); return 0;
+}
 int main(void)
 {
     char power[32]; printf("power=%s %s; indicative: concurrent workers may be compiling\n",bench_battery_status(power,sizeof power),bench_evidence_tag());
     work_pool pool; if(work_pool_init(&pool,1,0)) return 1;
-    int fail=run(&pool,1); fail|=run(&pool,1024);
+    int fail=worker_cpu(&pool); if(fail) { work_pool_shutdown(&pool); return fail; } fail|=run(&pool,1); fail|=run(&pool,1024);
     /* No explicit flush: demonstrate the time cadence with a quiet journal. */
     char path[]="/tmp/journal-cadence-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 1; close(fd);
     journal *j; if(journal_open(&j,path,&pool,NULL)) return 1;

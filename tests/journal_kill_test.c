@@ -33,12 +33,34 @@ static int operation(kill_model *m, journal *j, const journal_record *record)
     else { memmove(m->data+off+1,m->data+off,m->len-off); m->data[off]=ch; m->len++; }
     m->edits++; return 0;
 }
-static int replay(void *ctx, const journal_record *r) { return operation(ctx,NULL,r); }
+typedef struct recovery { kill_model script; piece_tree *tree; } recovery;
+static int replay(void *ctx, const journal_record *r)
+{
+    recovery *c=ctx;
+    if(operation(&c->script,NULL,r)) return 1;
+    return journal_apply_piece(c->tree,r);
+}
+/* Independent byte oracle: generate the seeded edit choices, then rebuild the
+ * byte array via explicit loops. It neither decodes records nor calls operation
+ * or journal_apply_piece. */
+static kill_model expected_prefix(uint64_t seed, uint64_t count)
+{
+    kill_model m={.rng=seed};
+    for(uint64_t i=0;i<count;i++) {
+        uint64_t x=m.rng; x^=x<<13; x^=x>>7; x^=x<<17; m.rng=x;
+        bool remove=m.len!=0 && (m.len==256 || x%4==0);
+        size_t at=(size_t)((x>>8)%(remove?m.len:m.len+1));
+        if(remove) { for(size_t k=at;k+1<m.len;k++) m.data[k]=m.data[k+1]; m.len--; }
+        else { for(size_t k=m.len;k>at;k--) m.data[k]=m.data[k-1]; m.data[at]=(uint8_t)(x>>32); m.len++; }
+        m.edits++;
+    }
+    return m;
+}
 static void receive(const work_msg *m, void *ctx) { (void)journal_receive(ctx,m); }
 static void child_run(const char *path, progress *p, uint64_t seed)
 {
     work_pool pool; journal *j=NULL;
-    journal_options opt={1048576,16777216};
+    journal_options opt={.batch_bytes=1048576,.max_file_bytes=16777216};
     if(work_pool_init(&pool,1,0) || journal_open(&j,path,&pool,&opt)) { atomic_store(&p->error,1); _exit(2); }
     kill_model model={.rng=seed}; atomic_store_explicit(&p->ready,1,memory_order_release);
     for(uint64_t i=0;i<100000;i++) {
@@ -85,15 +107,20 @@ int main(int argc, char **argv)
         if(kill(child,SIGKILL)) return 2;
         int status=0; while(waitpid(child,&status,0)<0) if(errno!=EINTR) return 2;
         uint64_t issued=atomic_load(&p->issued), ack=atomic_load(&p->acknowledged);
-        kill_model actual={.rng=seed}; journal_replay_result rr;
-        int rc=journal_replay_file(path,replay,&actual,&rr);
-        kill_model expected={.rng=seed}; for(uint64_t i=0;i<actual.edits;i++) if(operation(&expected,NULL,NULL)) return 2;
-        if(timed_out || atomic_load(&p->error) || !WIFSIGNALED(status) || WTERMSIG(status)!=SIGKILL || rc || actual.edits>issued || actual.edits<ack || actual.len!=expected.len || memcmp(actual.data,expected.data,actual.len)) {
+        piece_allocator a=piece_default_allocator();
+        recovery restored={.script={.rng=seed},.tree=piece_create(&a)}; if(!restored.tree) return 2;
+        journal_replay_result rr; int rc=journal_replay_file(path,replay,&restored,&rr);
+        kill_model actual=restored.script, expected=expected_prefix(seed,rr.last_sequence);
+        uint8_t tree_bytes[256];
+        bool tree_equal=piece_len(restored.tree)==expected.len &&
+            piece_read(restored.tree,0,tree_bytes,expected.len)==0 && !memcmp(tree_bytes,expected.data,expected.len);
+        piece_destroy(restored.tree);
+        if(timed_out || atomic_load(&p->error) || !WIFSIGNALED(status) || WTERMSIG(status)!=SIGKILL || rc || !tree_equal || rr.last_sequence!=actual.edits || actual.edits>issued || actual.edits<ack || actual.len!=expected.len || memcmp(actual.data,expected.data,actual.len)) {
             fprintf(stderr,"journal_kill_test: FAIL trial=%u target=%llu issued=%llu ack=%llu replay=%llu rc=%d error=%d\n",t,(unsigned long long)target,(unsigned long long)issued,(unsigned long long)ack,(unsigned long long)actual.edits,rc,atomic_load(&p->error)); unlink(path); return 1;
         }
         total_issued+=issued; total_replayed+=actual.edits; total_ack+=ack; unlink(path);
     }
     munmap(p,sizeof *p);
-    printf("journal_kill_test: ok trials=%u script_edits=100000 issued=%llu replayed=%llu acknowledged=%llu (all replay prefixes within [ack,issued])\n",trials,(unsigned long long)total_issued,(unsigned long long)total_replayed,(unsigned long long)total_ack);
+    printf("journal_kill_test: ok trials=%u script_edits=100000 issued=%llu replayed=%llu acknowledged=%llu (ack<=replayed<=issued; piece_tree==independent_byte_model_at_replayed)\n",trials,(unsigned long long)total_issued,(unsigned long long)total_replayed,(unsigned long long)total_ack);
     return 0;
 }
