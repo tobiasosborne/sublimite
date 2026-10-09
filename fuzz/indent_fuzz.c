@@ -117,5 +117,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     CHECK(indent_detect(s,&snapshot_style)==INDENT_OK);
     CHECK(direct.uses_tabs==snapshot_style.uses_tabs && direct.width==snapshot_style.width);
     CHECK(direct.width>=1 && direct.width<=INDENT_MAX_WIDTH);
-    piece_snapshot_release(s); piece_destroy(t); return 0;
+    piece_snapshot_release(s); piece_destroy(t);
+    if (data[0]&128u) {
+        uint8_t long_bytes[INDENT_TYPING_BYTES*2+1]; memset(long_bytes,' ',sizeof long_bytes);
+        t=piece_create(&a); CHECK(t);
+        CHECK(piece_init_copy(t,long_bytes,sizeof long_bytes)==PIECE_OK);
+        uint64_t long_cursor=(data[1]&1u)?sizeof long_bytes:0;
+        size_t long_cap=(data[2]&1u)?0:sizeof out;
+        CHECK(indent_on_enter(t,long_cursor,out,long_cap,&length)==INDENT_ERR_LIMIT && length==0);
+        CHECK(indent_on_close_brace(t,long_cursor,(indent_style){false,width},&edit)==INDENT_ERR_LIMIT && edit.length==0);
+        piece_destroy(t);
+    }
+    return 0;
 }

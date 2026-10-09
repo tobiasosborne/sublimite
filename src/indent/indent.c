@@ -33,31 +33,34 @@ static bool split_crlf(const piece_tree *t, uint64_t cursor)
 {
     return cursor>0 && cursor<piece_len(t) && byte_at(t,cursor)=='\n' && byte_at(t,cursor-1)=='\r';
 }
-static uint64_t line_start(const piece_tree *t, uint64_t cursor)
+static bool line_start(const piece_tree *t, uint64_t cursor, uint64_t *start)
 {
     uint8_t block[BACK_BLOCK]; uint64_t end=cursor;
-    while (end>0) {
-        size_t n=end>BACK_BLOCK?BACK_BLOCK:(size_t)end;
+    uint64_t bound=cursor>INDENT_TYPING_BYTES?cursor-INDENT_TYPING_BYTES:0;
+    while (end>bound) {
+        size_t n=end-bound>BACK_BLOCK?BACK_BLOCK:(size_t)(end-bound);
         uint64_t lo=end-n; (void)piece_read(t,lo,block,n);
-        for (size_t i=n;i>0;--i) if (block[i-1]=='\n') return lo+i;
+        for (size_t i=n;i>0;--i) if (block[i-1]=='\n') { *start=lo+i; return true; }
         end=lo;
     }
-    return 0;
+    *start=0; return end==0;
 }
 /* No line index queries: mapped buffers must not be indexed as a side effect. */
-static uint64_t line_end(const piece_tree *t, uint64_t cursor, bool *crlf, bool *terminated)
+static bool line_end(const piece_tree *t, uint64_t cursor, bool *crlf, bool *terminated, uint64_t *end)
 {
-    byte_reader r; reader_init(&r,t,cursor,piece_len(t));
+    uint64_t length=piece_len(t);
+    uint64_t hi=length-cursor>INDENT_TYPING_BYTES?cursor+INDENT_TYPING_BYTES:length;
+    byte_reader r; reader_init(&r,t,cursor,hi);
     uint8_t prev=cursor>0?byte_at(t,cursor-1):0, c;
     *crlf=false; *terminated=false;
     while (reader_next(&r,&c)) {
         if (c=='\n') {
             *terminated=true; *crlf=prev=='\r';
-            return r.pos-1-(*crlf?1u:0u);
+            *end=r.pos-1-(*crlf?1u:0u); return true;
         }
         prev=c;
     }
-    return piece_len(t);
+    *end=length; return hi==length;
 }
 indent_code indent_on_enter(const piece_tree *t, uint64_t cursor,
                             uint8_t *out, size_t cap, size_t *length)
@@ -65,10 +68,12 @@ indent_code indent_on_enter(const piece_tree *t, uint64_t cursor,
     if (length) *length=0;
     if (!t || !length || (!out && cap)) return INDENT_ERR_ARGUMENT;
     if (cursor>piece_len(t) || split_crlf(t,cursor)) return INDENT_ERR_RANGE;
-    uint64_t start=line_start(t,cursor), leading=0;
+    uint64_t start, end, leading=0;
+    if (!line_start(t,cursor,&start)) return INDENT_ERR_LIMIT;
     byte_reader r; reader_init(&r,t,start,cursor); uint8_t c;
     while (reader_next(&r,&c) && ws(c)) ++leading;
-    bool crlf, terminated; (void)line_end(t,cursor,&crlf,&terminated);
+    bool crlf, terminated;
+    if (!line_end(t,cursor,&crlf,&terminated,&end)) return INDENT_ERR_LIMIT;
     if (!terminated && start>=2) crlf=byte_at(t,start-2)=='\r';
     size_t newline=crlf?2u:1u;
     if (leading>SIZE_MAX-newline) return INDENT_ERR_RANGE;
@@ -84,8 +89,9 @@ indent_code indent_on_close_brace(const piece_tree *t, uint64_t cursor,
     if (edit) memset(edit,0,sizeof *edit);
     if (!t || !edit || style.width==0 || style.width>INDENT_MAX_WIDTH) return INDENT_ERR_ARGUMENT;
     if (cursor>piece_len(t) || split_crlf(t,cursor)) return INDENT_ERR_RANGE;
-    uint64_t start=line_start(t,cursor); bool crlf, terminated;
-    uint64_t end=line_end(t,cursor,&crlf,&terminated);
+    uint64_t start, end; bool crlf, terminated;
+    if (!line_start(t,cursor,&start) || !line_end(t,cursor,&crlf,&terminated,&end))
+        return INDENT_ERR_LIMIT;
     (void)crlf; (void)terminated;
     edit->lo=cursor; edit->hi=cursor; edit->bytes[0]='}'; edit->length=1;
     byte_reader r; reader_init(&r,t,start,end); uint8_t c;

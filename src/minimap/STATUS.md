@@ -1,53 +1,60 @@
-# minimap — P4.5 / edit-457.5
+# P4.5 / P4.5b minimap status
 
-Standalone implementation complete. Public API is minimap.h: caller-owned
-state/storage, init/fini, density fill, stale query, click/drag hit and inverse
-line-to-strip-row mapping. No allocation/global state/worker/blocking index
-calls in fill. Only bead-scoped files were changed; no editor/lineidx/header/
-Makefile changes. Integration is deferred by coordinator decision.
+Standalone density and navigation module; review §§5–9 addressed within the
+permitted module scope. Decisions and red/green evidence:
+[original contract](../../docs/decisions/P4.5.md) and
+[review fixes](../../docs/decisions/P4.5b.md).
 
-Small-file density is exact under the documented clipped non-space-byte model.
-Large-file density uses <=256 representative nominal chunk-boundary samples,
-shared across adjacent rows, with <=256 bytes per sample. It is approximate;
-actual lineidx chunk starts/counts are not public. Warm fills reuse summaries;
-edits or stale events force fresh summaries. Viewport/hits retain full row
-resolution. Pending-index fills never read source; hits reject stale state.
+Done:
+- Cache validates source identity; additive stable buffer binding handles
+  adapter context reuse. Publication also checks buffer token and revision.
+- Fill writes/marks only changed cells/rows. Actual backend submission tests
+  prove cached typing fills retain typing-only damage and blink fills add none.
+- Pending indexing shows an approximate scrollbar; additive hit_approx gives
+  current byte targets without an index or source reads. Exact hit's stale
+  rejection and all existing prototypes remain intact.
+- Additive prepare/prepare_source, publish and fill_cached APIs support worker
+  snapshot summaries and source-read-free UI fills. Protected sample pages,
+  stale-publication checks, identity switches and allocation guards pass.
+- Fuzzer covers prepared publication, edits, source switching and approximate
+  navigation. Bench self-checks incomplete-index sidebar correctness and
+  records foreground major faults after requesting sample-file eviction.
 
-Tests cover independent density/reference computation, fragmented spans,
-viewport colours, dirty rows, exact large-index hits, click/drag round trips,
-same-size edits, cached fills, sample cap, resize invalidation, argument/source
-errors and release malloc-guard checks. Fuzzer generates line-length vectors,
-whitespace, fragmentation, dimensions and stale/refill events. Benchmark gates
-both warm and after-edit fills and checks stale/refill reference correctness.
+Outstanding (outside this bead's allowed edits):
+- Frozen render_strip encodes full-width rows. Changed sidebar rows still
+  submit text columns. Rectangle/column damage requires a render/backend bead;
+  the proposal is in P4.5b §7. No frozen header was edited.
+- Editor/work/view wiring must adopt cached fill, worker snapshot lifetime and
+  mailbox publication, buffer binding for reused adapters, and byte scrolling
+  for approximate targets. P4.5b §§5,8,9 specify the additive handoff. Legacy
+  synchronous fill can still fault on nonresident bytes; existing large exact
+  hits can scan an index chunk. Use cached fill and approximate drag on UI when
+  residency cannot be guaranteed. Full integrated G3 cost is not measured here.
 
-Verification commands (safe display):
-
+Verify with DISPLAY=:99 EDIT_DISPLAY=:99:
 ```
-DISPLAY=:99 EDIT_DISPLAY=:99 make all
-DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
-DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz
-DISPLAY=:99 EDIT_DISPLAY=:99 build/tests/minimap_test
-DISPLAY=:99 EDIT_DISPLAY=:99 build/bench/minimap_bench
-DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 build/fuzz/minimap_fuzz -max_total_time=300 -max_len=2048
+make all
+ASAN_OPTIONS=detect_leaks=0 make check
+make fuzz
+ASAN_OPTIONS=detect_leaks=0 build/fuzz/minimap_fuzz -max_total_time=120 -max_len=2048 -timeout=10
+```
+Before the single final TRACK bench invocation, read BAT0/status and loadavg:
+```
+cat /sys/class/power_supply/BAT0/status
+cut -d' ' -f1 /proc/loadavg
+build/bench/minimap_bench
 ```
 
-Before measurements: cat /sys/class/power_supply/BAT0/status and
-cut -d' ' -f1 /proc/loadavg. Do not regenerate corpus.
-
-Final policy benchmark returned zero; all (G) p99<=0.5 ms rows passed in a
-shared-box TRACK run (M)[AC], Full, load1=12.67: small warm 0.085377 ms,
-small after edit 0.131373 ms, log_1g warm 0.088010 ms, log_1g after edit
-0.189800 ms. Both stale/reference checks passed. Quiet-box gate verdict is
-pending coordinator verification. See ../../docs/decisions/P4.5.md for design,
-proposed index accessor and the exact UI-thread integration contract.
-
-Final-tree verification: make all exit=0; make check exit=0 (29 test binaries
-passed plus replay CLI); make fuzz exit=0 (16 fuzzers built). Release and
-ASan/UBSan minimap tests pass. Final libFuzzer run: (M)[AC], Full, load1=9.04,
-19823 runs in 301 seconds, exit=0, no sanitizer findings; detect_leaks=0.
-Release fill guards report zero allocations. Both warm and regenerated fills
-are gated by the standalone benchmark, which returned zero.
-Editor-loop integration/combined G3 full-frame measurement is a follow-up bead.
-Coordinator must re-run leak detection outside this sandbox. Existing raster live-X11, x11_clip, x11_live and x11_stall scenarios skipped
-because this sandbox could not connect/create Xvfb sockets. This is outside
-this module's scope; remaining headless and XI2 checks passed.
+Final verification: make all exit=0; make check exit=0, 39 test binaries and
+replay CLI passed (with access to Xvfb :99); make fuzz exit=0, 21 fuzzers built.
+Minimap fuzz: Done 33244 runs in 121 second(s), exit=0, no sanitizer findings,
+(M)[AC], Not charging, load1=4.52. Release allocation guards pass.
+The one final minimap TRACK bench exited zero: (M)[AC], Not charging,
+load1=7.04; p99 ns warm/after-edit including UI publication: small
+148168/159695, log_1g 163587/168443, against (G) 500000 ns. Incomplete-index
+sidebar/drag and reference checks pass; cold-sample verification records
+foreground major faults=0 and source calls=0 with eviction requested.
+Full stamped bench lines and each finding's red/green are in P4.5b.
+LeakSanitizer is disabled in this sandbox; coordinator reruns with leaks on.
+X11 tests require socket access to Xvfb :99 (sandbox-only make check cannot
+connect; the required check is retried with X socket access).

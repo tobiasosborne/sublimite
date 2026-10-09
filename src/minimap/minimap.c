@@ -17,6 +17,15 @@ int minimap_init(minimap *m, minimap_row *rows, size_t max_rows)
     return MINIMAP_OK;
 }
 
+int minimap_bind(minimap *m, const void *identity)
+{
+    if (!m || !m->initialized || !identity) return MINIMAP_ERR_ARG;
+    if (m->buffer_identity != identity) {
+        m->buffer_identity = identity; m->filled = false; m->stale = true;
+    }
+    return MINIMAP_OK;
+}
+
 void minimap_fini(minimap *m)
 {
     if (m) memset(m, 0, sizeof *m);
@@ -26,7 +35,8 @@ bool minimap_stale(const minimap *m, const minimap_input *input)
 {
     return !m || !input || !m->initialized || !m->filled || m->stale
         || !input->index_ready || m->revision != input->revision
-        || m->bytes != input->source.len || m->lines != input->lines;
+        || m->bytes != input->source.len || m->lines != input->lines
+        || m->identity.ctx != input->source.ctx || m->identity.span != input->source.span;
 }
 
 /* Bounded non-space byte count. SSE2 is the repository's baseline ISA.
@@ -153,6 +163,40 @@ static int large_rows(minimap *m, const minimap_input *input)
     return MINIMAP_OK;
 }
 
+int minimap_prepare(minimap *m, const minimap_input *input, uint32_t height)
+{
+    if (!m || !m->initialized || !input || !input->lines || !height
+        || !input->index_ready || (input->source.len && !input->source.span))
+        return MINIMAP_ERR_ARG;
+    if (m->capacity < height) return MINIMAP_ERR_CAPACITY;
+    m->stale = true; m->filled = false; m->height = height;
+    m->lines_per_row = input->lines / height + (input->lines % height != 0);
+    m->active_rows = (uint32_t)(input->lines / m->lines_per_row
+                        + (input->lines % m->lines_per_row != 0));
+    memset(m->rows, 0, (size_t)height * sizeof *m->rows);
+    m->sampled = input->source.len > MINIMAP_SMALL_BYTES || input->lines > MINIMAP_SMALL_LINES;
+    int rc = m->sampled ? large_rows(m, input) : small_rows(m, input);
+    if (rc != MINIMAP_OK) return rc;
+    m->identity = input->source;
+    m->revision = input->revision; m->bytes = input->source.len; m->lines = input->lines;
+    m->filled = true; m->stale = false;
+    return MINIMAP_OK;
+}
+
+int minimap_publish(minimap *m, const minimap_input *input, const minimap *prepared)
+{
+    if (!m || !m->initialized || !prepared || !prepared->initialized || m == prepared)
+        return MINIMAP_ERR_ARG;
+    if (minimap_stale(prepared, input) || m->buffer_identity != prepared->buffer_identity)
+        return MINIMAP_ERR_STALE;
+    if (m->capacity < prepared->height) return MINIMAP_ERR_CAPACITY;
+    /* The two caller-owned row arrays must not overlap. */
+    minimap_row *rows = m->rows; size_t capacity = m->capacity;
+    memcpy(rows, prepared->rows, (size_t)prepared->height * sizeof *rows);
+    *m = *prepared; m->rows = rows; m->capacity = capacity;
+    return MINIMAP_OK;
+}
+
 static uint32_t blend(uint32_t a, uint32_t b, uint32_t t)
 {
     uint32_t color = 0;
@@ -192,21 +236,13 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
 {
     int rc = validate(m, input, grid, first_col, width, style);
     if (rc != MINIMAP_OK) return rc;
-    bool retained = m->filled && m->height == grid->dims.rows;
+    bool retained = m->filled && m->height == grid->dims.rows
+        && m->identity.ctx == input->source.ctx && m->identity.span == input->source.span;
     bool fresh = retained && !minimap_stale(m, input);
     if (input->index_ready && !fresh) {
-        m->stale = true;
-        m->filled = false;
-        m->height = grid->dims.rows;
-        m->lines_per_row = input->lines / m->height + (input->lines % m->height != 0);
-        m->active_rows = (uint32_t)(input->lines / m->lines_per_row
-                            + (input->lines % m->lines_per_row != 0));
-        memset(m->rows, 0, (size_t)m->height * sizeof *m->rows);
-        m->sampled = input->source.len > MINIMAP_SMALL_BYTES || input->lines > MINIMAP_SMALL_LINES;
-        rc = m->sampled ? large_rows(m, input) : small_rows(m, input);
+        rc = minimap_prepare(m, input, grid->dims.rows);
         if (rc != MINIMAP_OK) return rc;
-        m->revision = input->revision; m->bytes = input->source.len; m->lines = input->lines;
-        m->filled = true; m->stale = false; retained = true;
+        retained = true;
     } else m->stale = !input->index_ready;
     uint64_t end = first_line;
     if (first_line < input->lines) {
@@ -215,11 +251,17 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
     }
     for (uint32_t r = 0; r < grid->dims.rows; r++) {
         const minimap_row *v = retained ? &m->rows[r] : NULL;
-        uint32_t density = v ? v->density : 0;
+        uint32_t density = v ? v->density : m->stale ? 64u : 0;
         uint32_t occupied = (uint32_t)(((uint64_t)density * width + 254) / 255);
         uint32_t ink = blend(style->background, style->density, density);
         bool viewport = !m->stale && v && v->line_count && first_line < end
                      && v->first_line < end && first_line < v->first_line + v->line_count;
+        if (m->stale && !retained) {
+            uint64_t row_line = scale(input->lines, r, grid->dims.rows);
+            uint64_t next_line = scale(input->lines, r + 1, grid->dims.rows);
+            viewport = first_line < end && row_line < end
+                && first_line <= next_line;
+        }
         uint32_t background = style->background;
         if (viewport) {
             ink = blend(ink, style->viewport, 128);
@@ -230,12 +272,17 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
             background = blend(background, style->stale, 128);
         }
         render_cell *dst = &grid->cells[(size_t)r * grid->dims.cols + first_col];
-        for (uint32_t c = 0; c < width; c++)
-            dst[c] = (render_cell){ .atlas_slot = RENDER_NO_SLOT, .fg = style->density,
-                                   .bg = c < occupied ? ink : background };
+        bool changed = false;
+        for (uint32_t c = 0; c < width; c++) {
+            render_cell next = { .atlas_slot = RENDER_NO_SLOT, .fg = style->density,
+                                 .bg = c < occupied ? ink : background };
+            if (memcmp(&dst[c], &next, sizeof next) != 0) {
+                dst[c] = next; changed = true;
+            }
+        }
+        if (changed) (void)render_mark_rows(grid, r, 1);
     }
-    /* Validation above guarantees this cannot fail. */
-    return render_mark_rows(grid, 0, grid->dims.rows) == RENDER_OK ? MINIMAP_OK : MINIMAP_ERR_ARG;
+    return MINIMAP_OK;
 }
 
 int minimap_hit(const minimap *m, const minimap_input *input, lineidx *idx,
@@ -262,4 +309,44 @@ int minimap_row_for_line(const minimap *m, uint64_t line, uint32_t *out)
     if (line >= m->lines) line = m->lines - 1;
     *out = (uint32_t)(line / m->lines_per_row);
     return MINIMAP_OK;
+}
+
+int minimap_hit_approx(const minimap_input *input, uint32_t height,
+                       int64_t y, minimap_target *out)
+{
+    if (!input || !input->lines || !height || !out) return MINIMAP_ERR_ARG;
+    uint32_t row = y < 0 ? 0 : (uint64_t)y >= height ? height - 1 : (uint32_t)y;
+    uint32_t divisor = height > 1 ? height - 1 : 1;
+    uint64_t line = scale(input->lines - 1, row, divisor);
+    *out = (minimap_target){line, scale(input->source.len, row, divisor), false};
+    return MINIMAP_OK;
+}
+
+int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *grid,
+                        uint32_t first_col, uint32_t width,
+                        uint64_t first_line, uint64_t visible_lines,
+                        const minimap_style *style)
+{
+    int rc = validate(m, input, grid, first_col, width, style);
+    if (rc != MINIMAP_OK) return rc;
+    minimap_input pending = *input;
+    if (m->height != grid->dims.rows || minimap_stale(m, input)) {
+        pending.index_ready = false;
+        /* Show a current byte scrollbar, never old source density in this UI
+         * path. Legacy fill retains its historical pending-density contract. */
+        m->filled = false;
+    }
+    return minimap_fill(m, &pending, grid, first_col, width,
+                        first_line, visible_lines, style);
+}
+
+int minimap_prepare_source(minimap *m, const minimap_input *input,
+                            const lineidx_src *snapshot_source, uint32_t height)
+{
+    if (!input || !snapshot_source || snapshot_source->len != input->source.len)
+        return MINIMAP_ERR_ARG;
+    minimap_input worker_input = *input; worker_input.source = *snapshot_source;
+    int rc = minimap_prepare(m, &worker_input, height);
+    if (rc == MINIMAP_OK) m->identity = input->source;
+    return rc;
 }

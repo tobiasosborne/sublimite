@@ -181,8 +181,36 @@ static void test_no_malloc(void)
     printf("indent typing malloc guard: %s, allocations=%zu\n",edit_malloc_guard_active()?"active":"ASan inactive",allocations);
     piece_destroy(t);
 }
+static void typing_work_bound(void)
+{
+    uint8_t bytes[32768], out[32770]; memset(bytes,' ',sizeof bytes);
+    piece_tree *t=tree_bytes(bytes,sizeof bytes,false); size_t n=99; indent_edit e;
+    CHECK(indent_on_enter(t,0,out,sizeof out,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_enter(t,0,NULL,0,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_enter(t,sizeof bytes,out,sizeof out,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_close_brace(t,0,(indent_style){false,4},&e)==INDENT_ERR_LIMIT && e.length==0);
+    CHECK(indent_on_close_brace(t,sizeof bytes,(indent_style){false,4},&e)==INDENT_ERR_LIMIT && e.length==0);
+    piece_destroy(t);
+    /* Mapped, unindexed lines: inaccessible pages prove a hard read bound. */
+    size_t bound=INDENT_TYPING_BYTES, total=bound*4;
+    uint8_t *p=mmap(NULL,total,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(p!=MAP_FAILED); memset(p,' ',total);
+    piece_allocator a=piece_default_allocator(); t=piece_create(&a); CHECK(t);
+    CHECK(piece_init_mapped(t,p,total,NULL)==PIECE_OK);
+    CHECK(mprotect(p+bound,total-bound,PROT_NONE)==0);
+    CHECK(indent_on_enter(t,0,out,sizeof out,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_enter(t,0,NULL,0,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_close_brace(t,0,(indent_style){false,4},&e)==INDENT_ERR_LIMIT);
+    CHECK(mprotect(p+bound,total-bound,PROT_READ|PROT_WRITE)==0);
+    CHECK(mprotect(p,total-bound,PROT_NONE)==0);
+    CHECK(indent_on_enter(t,total,out,sizeof out,&n)==INDENT_ERR_LIMIT && n==0);
+    CHECK(indent_on_close_brace(t,total,(indent_style){false,4},&e)==INDENT_ERR_LIMIT);
+    piece_destroy(t); CHECK(munmap(p,total)==0);
+    puts("review 6: long-line typing/zero-capacity work bounded: ok");
+}
 int main(void)
 {
+    typing_work_bound();
     test_enter(); test_close(); test_brackets(); test_whitespace(); test_detect(); test_long_lines_and_window_bound(); test_no_malloc();
     puts("indent_test: all cases passed"); return 0;
 }

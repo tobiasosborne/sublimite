@@ -88,6 +88,25 @@ int main(void)
     printf("typing allocations=%zu (M)%s load1=%s gate_allocations=0(G) guard=%s\n",
            allocations,bench__tag_from_power(guard_power),guard_load,edit_malloc_guard_active()?"active":"inactive");
     fixture_close(&code);
+    uint8_t long_bytes[32768]; memset(long_bytes,' ',sizeof long_bytes);
+    piece_allocator allocator=piece_default_allocator(); piece_tree *long_tree=piece_create(&allocator);
+    EDIT_ASSERT(long_tree && piece_init_copy(long_tree,long_bytes,sizeof long_bytes)==PIECE_OK);
+    for (unsigned query=0;query<2;query++) {
+        bench_samples_init(&samples,times,TYPING_SAMPLES); stamp(); edit_malloc_guard_begin();
+        for (size_t i=0;i<TYPING_SAMPLES;++i) {
+            uint64_t cursor=(i&1u)?sizeof long_bytes:0; indent_edit edit;
+            size_t cap=(i&2u)?sizeof out:0;
+            uint64_t start=bench_now_ns();
+            indent_code result=query==0?indent_on_enter(long_tree,cursor,out,cap,&length):
+                indent_on_close_brace(long_tree,cursor,(indent_style){false,4},&edit);
+            (void)bench_add(&samples,bench_now_ns()-start);
+            EDIT_ASSERT(result==INDENT_ERR_LIMIT);
+            EDIT_ASSERT(query==0?length==0:edit.length==0);
+        }
+        EDIT_ASSERT(edit_malloc_guard_end()==0);
+        fail|=report(query==0?"indent_long_line_enter includes_zero_capacity":"indent_long_line_brace",&samples,20000);
+    }
+    piece_destroy(long_tree);
     if (fixture_open(&log,"/tmp/edit-corpus/log_1g.txt")!=0) { edit_arena_free(&arena); return 2; }
     piece_snapshot *snapshot=piece_snapshot_take(log.tree); EDIT_ASSERT(snapshot);
     bench_samples_init(&samples,times,TYPING_SAMPLES); indent_style style;

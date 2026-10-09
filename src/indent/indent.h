@@ -6,11 +6,13 @@
 #include <stdint.h>
 
 #define INDENT_PREFIX_BYTES (64u * 1024u)
+#define INDENT_TYPING_BYTES 8192u
 #define INDENT_MAX_WIDTH 16u
 #define INDENT_NONE UINT64_MAX
 
 typedef enum indent_code {
-    INDENT_OK = 0, INDENT_ERR_ARGUMENT, INDENT_ERR_RANGE, INDENT_ERR_CAPACITY
+    INDENT_OK = 0, INDENT_ERR_ARGUMENT, INDENT_ERR_RANGE, INDENT_ERR_CAPACITY,
+    INDENT_ERR_LIMIT
 } indent_code;
 typedef struct indent_style { bool uses_tabs; uint8_t width; } indent_style;
 typedef struct indent_range { uint64_t lo, hi; } indent_range;
@@ -24,6 +26,10 @@ typedef struct indent_edit {
  * No state/resources: no init/fini needed. Caller storage must not alias inputs.
  * All offsets/ranges are bytes, windows half-open and must fit the tree.
  * Required result pointers; NULL out permitted only with cap==0.
+ * Enter/brace inspect at most INDENT_TYPING_BYTES in each direction.
+ * If a line boundary is not found within that bound, return ERR_LIMIT with
+ * cleared results, no mutation/output writes. Caller may defer the command;
+ * successful queries retain exact indentation/EOL semantics.
  * On error scalar/results are cleared, except required size on CAPACITY. */
 
 /* Insert LF/CRLF + exact leading SP/TAB before cursor on its current line.
