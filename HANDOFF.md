@@ -1,45 +1,42 @@
-# HANDOFF — editor project, session 6 running (updated 2026-10-09 13:15)
+# HANDOFF — editor project, session 6 running (updated 2026-10-09 15:40)
 
 Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task` and `bd ready -n 40`. Session details: `docs/worklog/2026-10-09.md` (sessions 4, 5 and the crash recovery), `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
 
 ## Method (session 4–5, keep)
 Every worker gets its own git worktree `.wt/<bead>` on branch `wt/<bead>` (`.wt/` is in `.git/info/exclude`), created from main. The coordinator verifies there (`make check`, **`make all`** (release test builds catch gcc-only warnings), the module bench), commits on the branch and cherry-picks onto main. Workers never run git. **Display: nothing opens a window on :0** (P0.2c guard, 6a39d6d; Xvfb :99 must be running; binding until ~16:30 on 2026-10-09 and a good default after). Codex launch line: `env DISPLAY=:99 EDIT_DISPLAY=:99 timeout 5400 codex exec -m gpt-6.1-sol -c model_reasoning_effort=<high|xhigh> --approve-for-me --skip-git-repo-check -C .wt/<bead> -o docs/worker-reports/<bead>.md "<brief>"`.
 
-## Session 6 live state (coordinator, updated 13:15; read first)
-Session 6 coordinator (Opus) running since 12:28. Session 5 crash recovery is done (worklog "Session 6"). Workers run in `.wt/<bead>` worktrees; briefs and logs are in the session-6 scratchpad (lost on reboot: rebuild briefs from the bead + the worker's STATUS.md/decision doc). If this session dies, every live worktree's edits are on disk: WIP-commit them on their `wt/*` branch and relaunch "continue".
+## Session 6 live state (coordinator, updated 15:40; read first)
+Session 6 coordinator (Opus) since 12:28. M0 is on main: editor loop (65990f5), binary `sublimite` (2589a9e), first human drive on :0 OK (docs/decisions/zzj.3.md). GL = EGL (confirmed, docs/decisions/P2.4.md); find = simd-filter-verify (docs/decisions/P1.10.md). Bench policy: CLAUDE.md law 1 (no quiet-box runs; picks interleaved on the box as it is; perf beads only from observed lag). Routing (Tobias 15:25): Codex sol default for everything; Claude Sonnet only for Codex-refused classes (x11/clipboard/parser/security wording) and chores; Claude +2 % ceiling binds. Codex launch: `timeout 9000` (5400 killed three xhigh workers mid-work).
+If this session dies: every live worktree's edits are on disk: WIP-commit on its `wt/*` branch and relaunch "continue" (briefs in the dead session's scratchpad are lost; rebuild from the bead + the worker's STATUS.md/decision doc). Squash only on the merge-base (`git reset --soft $(git merge-base main HEAD)`), never `reset --soft main` (that reverted four landings once: ea67346). Remove `docs/worker-reports/<bead>-s6.md` from main's working tree before cherry-picking a commit that adds it.
 
-| Bead | Worker | Worktree | State |
-|---|---|---|---|
-| edit-zzj.3 P3.3 editor loop (M0, top priority) | Codex xhigh 12:40 | .wt/edit-zzj.3 | running; deps rewired e6x.4 → e6x.5 (raster backend behind render.h) |
-| edit-4w1.10 find simd-filter-verify | Codex xhigh 12:34 | .wt/edit-4w1.10-simd-filter-verify | running; twoway-only done on wt/edit-4w1.10-twoway-only; pick = one quiet run |
-| edit-4w1.33 journal P1.9e (+ edit-4w1.31 folded in) | Codex xhigh 12:55 | .wt/edit-4w1.33 | running; worktree cut from the damaged main (6257fe9): rebase before verifying |
-| edit-4w1.35 undo fixes | done 13:12 | .wt/edit-4w1.35 | verifying; findings 2-8 fixed; BLOCKER 1 needs the piece.h checkpoint amendment (consultant decision pending) |
-| edit-4w1.36 piece BLOCKER 1-2 + MAJOR 11 | Codex xhigh 13:12 | .wt/edit-4w1.36 | running; .37 (G10f) and .38 (perf) chained after it |
-| edit-457.1 word wrap | Codex high 13:03 | .wt/edit-457.1 | running |
-| edit-457.2 / .4 / .5 / .9 indent, tabs, minimap, ipc | Codex high 13:08 | .wt/edit-457.{2,4,5,9} | running as standalone modules; integration bead edit-457.16 |
-| reviews x11, raster, view | Codex xhigh read-only 13:08-13:13 | main | → docs/reviews/x11-1.md, P2.5-1.md, view-1.md |
-| edit-e6x.4 GL egl/glx | done | .wt/edit-e6x.4-{egl,glx} + variants/P2.4 | pick from a real-display bench (announce to the consultant first; present rows SKIP under Xvfb) |
-| edit-zzj.9, edit-e6x.5, edit-4w1.6, edit-457.11 | landed | main | close after ONE quiet investigation run (lineidx G7/G7j, layout log_1g + unicode, raster G3/G3z, scan_count) when load < 2 |
+| Bead | Worker | State |
+|---|---|---|
+| edit-457.16 P4.I wire tabs/indent/minimap/ipc/keys into the loop | Codex xhigh 14:42 | running; chokepoint for zzj.12, zzj.13, zzj.14, 457.8 |
+| edit-zzj.10c view review fixes (port of a timed-out run's patch) | Codex xhigh 15:04 | running |
+| edit-zzj.4 scrolling as src/scroll + integration contract | Codex xhigh 15:19 | running |
+| edit-4w1.53 journal option (b) + PRD §7 | Codex xhigh 15:19 | running; then edit-457.8 hot exit |
+| edit-4w1.42 file UI-thread blocking; edit-4w1.44 file bench honesty | Codex | .44 done 15:30 (verify); .42 running |
+| edit-457.7 save/external change as src/savectl | Codex high 15:19 | running |
+| edit-zzj.7 / zzj.8 / 457.15 experiments (variants/, :99) | Codex high 15:19 | running |
+| edit-4w1.52 find best-of fold-in of twoway | Codex xhigh 15:21 | running |
+| edit-4w1.49 work fixes; edit-457.22 minimap/indent fixes | done | verifying |
+| edit-e6x.24 clipboard off the UI thread | Sonnet done (budget) | needs make check/fuzz by the coordinator |
+| edit-457.21b ipc fixes finisher | Sonnet 15:30 | running |
+| edit-zzj.11 layout CRLF / >4 GiB | brief written | launch once edit-457.1 closes |
 
-Bench policy (13:15, docs/decisions/bench-policy.md): one quiet [AC] run per module when it lands; never run or read gates on a loaded box.
-
-## State
-- Landed in session 4 (main): P1.4 decision (bptree base), P1.4a-b bench row fix, P0.6c, P0.4b harness power, P1.7 file, P1.1c + P1.1d utf8, P2.3c font, P2.0 **render.h frozen**, P1.5 undo, P1.9 journal, P1.8b work fix, P1.10a **find.h frozen**, P3.1 layout, P1.6 lineidx (bead open for bench).
-- Reviews: docs/reviews/P1.5-1.md (undo: 1 BLOCKER, 5 MAJOR → edit-4w1.35, waits on synthesis), docs/reviews/P1.9-1.md (journal: 2 BLOCKER, 7 MAJOR → edit-4w1.32, edit-4w1.33; contract decision edit-4w1.34).
-- `make bench` on main is red until the synthesis lands (stub kernel misses piece rows); find/lineidx/raster gate rows miss on the stub or a loaded box.
+Open chains: piece review perf edit-4w1.38 (after .37 landed 1f029d9) → P1.5e undo flip edit-4w1.40 (checkpoint now on main); work selective receive edit-4w1.51; raster batch enqueue edit-e6x.25 (after .49); editor review fixes edit-zzj.13/.14 (after 457.16); font fixes edit-457.19 (after zzj.11); lineidx slices edit-4w1.47; file semantics edit-4w1.43 (after .42).
+GLX loser cleanup: delete variants/P2.4 and wt/edit-e6x.4-{egl,glx}, wt/edit-4w1.10-twoway-only after edit-4w1.52.
 
 ## Needs Tobias
-- **edit-4w1.34 (label human)**: hot-exit loss window vs PRD "no data loss on crash" (options in the bead; coordinator recommends write() to the page cache per edit, fdatasync every 1 s).
-- edit-e6x.11 items: join group `input` for tools/evtrace (EVIOCSCLOCKID), and a real-touchpad check of XI2 smooth scroll / no doubled wheel events.
-- Law-2 scope question (from P2.5): libxcb mallocs per reply/event, so the frozen render_test's "0 allocations over 10k frames" cannot hold on an X backend's present/completion path; workers assert 0 allocations up to submit only. Decide whether law 2 is "input → submit" (as written) and the conformance suite should say so.
-- Power: the battery was "Discharging" for part of the session; several numbers are (M)[bat] or loaded-box.
+- **edit-w34.4 P5.1b Astra vs Sublime comparison gate (M1→M2)**: every P6 bead, P5.2 and P5.3 depend on it; its verdict's blockers are Tobias's call (waive or fix).
+- Law-2 scope (from P2.5): libxcb mallocs per reply/event; tests assert 0 allocations input → submit only (P2.0 addendum). Confirm that is the law.
+- Decided today (no action): hot exit option (b) (edit-4w1.53 implements it), GL = EGL, third global (file SIGBUS service), name sublimité (lower case), title face provisional (wordmark bead edit-457.20 deferred behind P5.1b), evdev T0 / input group deferred (edit-e6x.17).
 
-## Next (in order)
-1. Corpus + Xvfb :99 + quota (above). Commit the six `docs/worker-reports/*-s5.md` if not yet committed.
-2. Verify + cherry-pick the five finished worktrees (egl, glx, raster, view, layout) and twoway-only; close or re-bench each.
-3. Relaunch the four Codex continuations (simd, journal, undo fixes, piece review) and the Sonnet x11 finisher; check `~/.codex/sessions/$(date +%Y/%m/%d)/` 60 s after each launch.
-4. Quiet-box AC benches: piece matrix r2/r3 + bptree baseline, lineidx, layout log_1g, find variants, raster G3, gl rows; power stamp each.
-5. Then edit-4w1.33 (journal part 2), edit-4w1.25/.26, edit-e6x.16 vsync row, P3.3 editor loop when its deps close.
+## Next (coordinator)
+1. Verify + land what finishes (worktree: make all, make check with leaks on, make fuzz; prep script squashes on the merge-base; then main make all + check).
+2. When edit-457.16 lands: stack edit-zzj.13 (editor review fixes), edit-zzj.12 (raster G11 idle), then edit-457.8 (hot exit, after 4w1.53).
+3. M0 bench run edit-zzj.5 once zzj.4 scrolling is wired; real-display runs need the consultant's go.
+4. Keep 12–16 workers live, mostly Codex; reviews for each new module (law 8).
 
 ## Binding rules added 2026-10-08 evening (PLAN §1.1, §5.6–5.7, CLAUDE.md laws 10–11)
 1. **Pace ceiling.** Run `quota` before every dispatch wave and before any single new Claude worker. If any Claude row (5-hour session, Weekly, Fable weekly) shows PACE more than `+2.0% ahead`, spawn no new Claude workers until it is back under; route work to Codex. Paste the `quota` lines you act on into the worklog. Respect the 5-hour TODAY column (a 12-worker Haiku/Sonnet wave ≈ 1M tokens).
