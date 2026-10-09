@@ -13,14 +13,14 @@ static int g_fail;
 static void p16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static void p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-/* QueryDevice reply: one slave pointer (id 12) with 3 classes: button, scroll V (valuator 3, inc 1.0),
+/* QueryDevice reply: one master pointer (id 12) with 3 classes: button, scroll V (valuator 3, inc 1.0),
  * scroll H (valuator 2, inc 2.5). */
 static size_t mk_query(uint8_t *b) {
     memset(b, 0, 512);
     b[0] = 1;
     p16(b + 8, 1);
     size_t o = 32;
-    p16(b + o, 12); p16(b + o + 2, 3); p16(b + o + 6, 3); p16(b + o + 8, 4);   /* id, type slave ptr, 3 classes, name_len 4 */
+    p16(b + o, 12); p16(b + o + 2, 1); p16(b + o + 6, 3); p16(b + o + 8, 4);   /* id, type master ptr, 3 classes, name_len 4 */
     memcpy(b + o + 12, "mous", 4);
     o += 16;
     p16(b + o, 1); p16(b + o + 2, 2); p16(b + o + 4, 12);                  /* button class, len 2 (8 bytes) */
@@ -31,6 +31,27 @@ static size_t mk_query(uint8_t *b) {
     p16(b + o, 3); p16(b + o + 2, 6); p16(b + o + 4, 12); p16(b + o + 6, 2); p16(b + o + 8, 2);
     p32(b + o + 16, 2); p32(b + o + 20, 0x80000000u);                      /* inc 2.5 */
     o += 24;
+    p32(b + 4, (uint32_t)((o - 32) / 4));
+    return o;
+}
+
+
+/* Review MINOR #4: master (type 1) and slave (type 3) infos for the same source with different valuator numbers.
+ * Events come from masters, so the master's numbering must win regardless of order. */
+static size_t mk_master_slave(uint8_t *b, bool master_first) {
+    memset(b, 0, 512);
+    b[0] = 1;
+    p16(b + 8, 2);
+    size_t o = 32;
+    for (int i = 0; i < 2; i++) {
+        bool master = (i == 0) == master_first;
+        p16(b + o, master ? 2 : 9); p16(b + o + 2, master ? 1 : 3); p16(b + o + 6, 1); p16(b + o + 8, 4);
+        memcpy(b + o + 12, "dev0", 4);
+        o += 16;
+        p16(b + o, 3); p16(b + o + 2, 6); p16(b + o + 4, 9); p16(b + o + 6, master ? 3 : 5); p16(b + o + 8, 1);
+        p32(b + o + 16, 1); p32(b + o + 20, 0);
+        o += 24;
+    }
     p32(b + 4, (uint32_t)((o - 32) / 4));
     return o;
 }
@@ -96,6 +117,29 @@ int main(void) {
     CHECK(xi2_decode(&x, buf, 32, false, &r) && r.device_changed, "device changed");
     n = mk_motion(buf, 12, 0x0c, v2, 2, 51, 61);
     CHECK(xi2_decode(&x, buf, n, false, &r) && !r.wheel, "history reset: first sample after change gives no delta");
+    for (int order = 0; order < 2; order++) {
+        xi2 z;
+        memset(&z, 0, sizeof z);
+        n = mk_master_slave(buf, order == 0);
+        CHECK(xi2_parse_query_device(&z, buf, n) == 1, "only the master's class counts (order %d)", order);
+        CHECK(z.ndev == 1 && z.dev[0].source == 9 && z.dev[0].has[0] && z.dev[0].num[0] == 3,
+              "master numbering wins (order %d): num %u", order, z.ndev ? z.dev[0].num[0] : 0u);
+    }
+    /* DeviceChanged carries its server time */
+    memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1); p32(buf + 12, 4242);
+    CHECK(xi2_decode(&x, buf, 32, false, &r) && r.device_changed && r.time_ms == 4242, "device changed time %u", r.time_ms);
+    /* MINOR #3 time parsing must also reject every truncated DeviceChanged header. */
+    for (size_t l = 0; l < 32; l++) {
+        uint8_t *short_event = malloc(l ? l : 1); memcpy(short_event, buf, l);
+        CHECK(!xi2_decode(&x, short_event, l, false, &r), "truncated DeviceChanged %zu rejected", l);
+        free(short_event);
+    }
+    { uint8_t xb[36] = {0}; memcpy(xb, buf, 32);
+      for (size_t l = 0; l < sizeof xb; l++) {
+          uint8_t *short_event = malloc(l ? l : 1); memcpy(short_event, xb, l);
+          CHECK(!xi2_decode(&x, short_event, l, true, &r), "truncated xcb DeviceChanged %zu rejected", l);
+          free(short_event);
+      } }
     /* wrong extension / not generic */
     n = mk_motion(buf, 12, 0x0c, v2, 2, 0, 0);
     buf[1] = 7;

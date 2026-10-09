@@ -57,6 +57,7 @@ int xi2_parse_query_device(xi2 *x, const uint8_t *r, size_t len) {
     x->ndev = 0;
     for (uint16_t i = 0; i < ninfo; i++) {
         if (off + 12 > len) return -1;
+        bool master = get16(r + off + 2) == 1;     /* events come from master pointers: only their numbering is valid */
         uint16_t ncls = get16(r + off + 6), nlen = get16(r + off + 8);
         off += 12 + (((size_t)nlen + 3) & ~(size_t)3);
         for (uint16_t c = 0; c < ncls; c++) {
@@ -64,7 +65,7 @@ int xi2_parse_query_device(xi2 *x, const uint8_t *r, size_t len) {
             uint16_t type = get16(r + off), clen = get16(r + off + 2);
             size_t bytes = (size_t)clen * 4;
             if (bytes < 8 || off + bytes > len) return -1;
-            if (type == 3 && bytes >= 24) {
+            if (type == 3 && bytes >= 24 && master) {
                 uint16_t src = get16(r + off + 4), num = get16(r + off + 6), st = get16(r + off + 8);
                 double inc = (double)geti32(r + off + 16) + (double)get32(r + off + 20) / 4294967296.0;
                 if ((st == 1 || st == 2) && inc != 0.0) {
@@ -92,10 +93,11 @@ bool xi2_has_scroll(const xi2 *x) { return x->ndev > 0; }
 bool xi2_decode(xi2 *x, const uint8_t *ev, size_t len, bool xcb_layout, xi2_result *r) {
     memset(r, 0, sizeof *r);
     size_t sh = xcb_layout ? 4 : 0;
-    if (len < 12 || ev[0] != 35 || ev[1] != x->opcode) return false;   /* GenericEvent, our extension */
+    if (len < 32u + sh || ev[0] != 35 || ev[1] != x->opcode) return false;   /* GenericEvent, our extension */
     uint16_t type = get16(ev + 8);
     if (type == 1) {                       /* XI_DeviceChanged */
         r->device_changed = true;
+        r->time_ms = get32(ev + 12);
         for (uint32_t i = 0; i < x->ndev; i++) x->dev[i].last_ok[0] = x->dev[i].last_ok[1] = false;
         return true;
     }

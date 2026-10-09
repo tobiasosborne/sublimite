@@ -3,6 +3,7 @@
 #include "input.h"
 #include "xi2.h"
 #include "clip.h"
+#include <limits.h>
 #include "trace/trace.h"
 #include <locale.h>
 #include <xcb/xcbext.h>
@@ -194,7 +195,7 @@ found:
         0, 0,
         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_FOCUS_CHANGE |
         XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS |
-        XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION,
+        XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_PROPERTY_CHANGE,
         p->colormap };
     /* value order: BACK_PIXEL, BORDER_PIXEL, EVENT_MASK, COLORMAP */
     xcb_create_window(c, p->depth, p->win, s->root, 0, 0, (uint16_t)cfg->width, (uint16_t)cfg->height, 0,
@@ -271,15 +272,15 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
             cb->on_event(cb->ud, &ev);
         }
         break; }
-    case XCB_FOCUS_IN: case XCB_FOCUS_OUT:
+    case XCB_FOCUS_IN: case XCB_FOCUS_OUT: {
+        const xcb_focus_in_event_t *f = (const xcb_focus_in_event_t *)e;
+        if (!x11_focus_relevant(f->mode, f->detail)) break;    /* WM key grabs, pointer-only focus: keys may still be held */
         p->focused = (t == XCB_FOCUS_IN);
         if (!p->focused) { struct itimerspec z; memset(&z, 0, sizeof z); timerfd_settime(p->timer_fd, 0, &z, NULL); }
         /* releases while unfocused are never seen: forget held keys and any repeat or compose in flight */
-        memset(IN(p)->down, 0, sizeof IN(p)->down);
-        x11_repeat_cancel(IN(p)); rearm_repeat(p);
-        if (IN(p)->cstate) xkb_compose_state_reset(IN(p)->cstate);
+        x11_input_focus_reset(IN(p)); rearm_repeat(p);
         ev.kind = PLAT_EV_FOCUS; ev.focused = p->focused;
-        cb->on_event(cb->ud, &ev); break;
+        cb->on_event(cb->ud, &ev); break; }
     case XCB_CLIENT_MESSAGE: {
         xcb_client_message_event_t *x = (xcb_client_message_event_t *)e;
         if (x->type == p->wm_protocols && x->data.data32[0] == p->wm_delete) {
@@ -313,7 +314,7 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         ev.mods = x11_mods_from_state(IN(p), x->state); ev.buttons = (x->state >> 8) & 0x1fu;
         ev.t0_ns = x11_clock_map(&IN(p)->clock, x->time, trace_now_ns());
         x11_q_push(IN(p), &ev); break; }
-    case XCB_SELECTION_REQUEST: case XCB_SELECTION_CLEAR: case XCB_SELECTION_NOTIFY:
+    case XCB_SELECTION_REQUEST: case XCB_SELECTION_CLEAR: case XCB_SELECTION_NOTIFY: case XCB_PROPERTY_NOTIFY:
         if (x11_clip_event(p, e, &ev)) x11_q_push(IN(p), &ev);
         break;
     case XCB_GE_GENERIC: {
@@ -322,22 +323,13 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
             xi2_result r;
             size_t n = 32 + 4 + (size_t)g->length * 4;     /* xcb inserts a 4-byte full_sequence after byte 32 */
             if (xi2_decode(XI(p), (const uint8_t *)e, n, true, &r)) {
-                uint64_t now = trace_now_ns();
+                plat_event evs[2];
                 if (r.device_changed) rescan_xi2(p);
-                if (r.time_ms) p->last_time = r.time_ms;
-                uint64_t t0 = x11_clock_map(&IN(p)->clock, r.time_ms, now);
-                uint16_t mods = x11_mods_from_state(IN(p), r.mods);
-                if (r.motion) {
-                    ev.kind = PLAT_EV_MOTION; ev.state = r.mods; ev.x = r.x; ev.y = r.y; ev.time_ms = r.time_ms;
-                    ev.mods = mods; ev.buttons = r.buttons; ev.t0_ns = t0;
-                    x11_q_push(IN(p), &ev);
-                }
-                if (r.wheel) {
-                    memset(&ev, 0, sizeof ev);
-                    ev.kind = PLAT_EV_WHEEL; ev.state = r.mods; ev.x = r.x; ev.y = r.y; ev.time_ms = r.time_ms;
-                    ev.mods = mods; ev.buttons = r.buttons; ev.t0_ns = t0; ev.dx = r.dx; ev.dy = r.dy; ev.smooth = true;
-                    p->xi_scroll_ms = r.time_ms;
-                    x11_q_push(IN(p), &ev);
+                else if (r.time_ms) p->last_time = r.time_ms;
+                int ne = x11_xi2_events(IN(p), &r, trace_now_ns(), evs);
+                for (int i = 0; i < ne; i++) {
+                    if (evs[i].kind == PLAT_EV_WHEEL) p->xi_scroll_ms = r.time_ms;
+                    x11_q_push(IN(p), &evs[i]);
                 }
             }
             break;
@@ -400,6 +392,13 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
             if (now >= t_end) break;
             to = (int)((t_end - now + UINT64_C(999999)) / UINT64_C(1000000));
         }
+        uint64_t clip_deadline = x11_clip_deadline(p);
+        if (clip_deadline) {
+            uint64_t now = trace_now_ns();
+            uint64_t ms = clip_deadline <= now ? 0 : (clip_deadline - now + UINT64_C(999999)) / UINT64_C(1000000);
+            int clip_to = ms > INT_MAX ? INT_MAX : (int)ms;
+            if (to < 0 || clip_to < to) to = clip_to;
+        }
         nfds_t n = 0;
         fds[n].fd = xcb_get_file_descriptor(C(p)); fds[n++].events = POLLIN;
         fds[n].fd = p->timer_fd; fds[n++].events = POLLIN;
@@ -408,7 +407,7 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         if (p->work_fd >= 0) { work_i = (int)n; fds[n].fd = p->work_fd; fds[n++].events = POLLIN; }
         int r = poll(fds, n, to);
         if (r < 0) continue;
-        if (r == 0) break;
+        if (r == 0) continue;             /* clipboard deadline: drain expires it, keep running */
         p->iterations++;
         if (fds[1].revents & POLLIN) {
             uint64_t x; if (read(p->timer_fd, &x, sizeof x) > 0 && cb->on_blink) cb->on_blink(cb->ud);
@@ -438,6 +437,7 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
 int plat_run(plat *p, const plat_callbacks *cb) { return plat_run_for(p, cb, -1); }
 
 void plat_shutdown(plat *p) {
+    x11_clip_save_on_exit(p);
     if (p->timer_fd >= 0) close(p->timer_fd);
     if (p->repeat_fd >= 0) close(p->repeat_fd);
     x11_clip_destroy(p);

@@ -127,6 +127,95 @@ static void test_dead_keys(struct xkb_context *ctx) {
     x11_input_destroy(&in);
 }
 
+
+/* Review MINOR #12: a press consumed by compose must not produce a stray release; pure modifiers pressed
+ * mid-sequence are delivered, not swallowed. */
+static void test_swallowed_release(struct xkb_context *ctx) {
+    static const char compose[] = "<dead_acute> <e> : \"\xc3\xa9\" eacute\n";
+    struct xkb_compose_table *ct = xkb_compose_table_new_from_buffer(ctx, compose, sizeof compose - 1, "C",
+        XKB_COMPOSE_FORMAT_TEXT_V1, XKB_COMPOSE_COMPILE_NO_FLAGS);
+    struct xkb_keymap *km = mk(ctx, "de");
+    x11_input in;
+    if (!ct || !km || x11_input_init(&in, km, ct) != 0) { CHECK(0, "keymap"); return; }
+    in.rep_rate_hz = 0;
+    plat_event e;
+    xcb_key_press_event_t d = kev(K_EQUAL, 0, 100), a = kev(K_A, 0, 101), sh = kev(K_LSHIFT, 0, 102),
+                          x = kev(K_E, 0, 103);
+    CHECK(!x11_input_key(&in, &d, true, 1000000000ull, &e), "dead key press swallowed");
+    CHECK(!x11_input_key(&in, &d, false, 1000000001ull, &e), "swallowed dead key: release swallowed too");
+    CHECK(x11_input_key(&in, &sh, true, 1000000002ull, &e) && e.press && e.keysym == XKB_KEY_Shift_L,
+          "shift mid-sequence is delivered");
+    CHECK(x11_input_key(&in, &sh, false, 1000000003ull, &e) && !e.press, "shift release delivered");
+    CHECK(x11_input_key(&in, &x, true, 1000000004ull, &e) && e.keysym == XKB_KEY_eacute,
+          "sequence survives the modifier");
+    CHECK(x11_input_key(&in, &x, false, 1000000005ull, &e) && !e.press, "composed key release delivered");
+    CHECK(!x11_input_key(&in, &d, true, 1000000006ull, &e), "dead key again");
+    x11_input_key(&in, &d, false, 1000000007ull, &e);
+    CHECK(!x11_input_key(&in, &a, true, 1000000008ull, &e), "cancelling key consumed");
+    CHECK(!x11_input_key(&in, &a, false, 1000000009ull, &e), "cancelling key release consumed");
+    CHECK(x11_input_key(&in, &a, true, 1000000010ull, &e) && e.utf8_len == 1, "next press is normal");
+    CHECK(x11_input_key(&in, &a, false, 1000000011ull, &e) && !e.press, "next release is normal");
+    x11_input_destroy(&in);
+}
+
+/* Review MINOR #14: a failed init releases the compose table it was handed (LeakSanitizer fails the run). */
+static void test_init_failure(struct xkb_context *ctx) {
+    static const char compose[] = "<dead_acute> <e> : \"\xc3\xa9\" eacute\n";
+    struct xkb_compose_table *ct = xkb_compose_table_new_from_buffer(ctx, compose, sizeof compose - 1, "C",
+        XKB_COMPOSE_FORMAT_TEXT_V1, XKB_COMPOSE_COMPILE_NO_FLAGS);
+    x11_input in;
+    CHECK(ct != NULL, "compose table");
+    CHECK(x11_input_init(&in, NULL, ct) == -1, "init without a keymap fails");
+}
+
+/* Review MINOR #11: grab-mode and pointer-detail focus events do not touch keyboard state. */
+static void test_focus(struct xkb_context *ctx) {
+    enum { NORMAL = 0, GRAB = 1, UNGRAB = 2, WHILE_GRABBED = 3, D_ANCESTOR = 0, D_NONLINEAR = 3, D_POINTER = 5, D_NONE = 7 };
+    CHECK(x11_focus_relevant(NORMAL, D_ANCESTOR) && x11_focus_relevant(NORMAL, D_NONLINEAR), "normal focus counts");
+    CHECK(!x11_focus_relevant(GRAB, D_ANCESTOR) && !x11_focus_relevant(UNGRAB, D_ANCESTOR) &&
+          !x11_focus_relevant(WHILE_GRABBED, D_ANCESTOR), "grab modes ignored");
+    CHECK(!x11_focus_relevant(NORMAL, D_POINTER), "pointer detail ignored");
+    CHECK(!x11_focus_relevant(NORMAL, D_NONE) || 1, "detail none is a don't-care");
+    x11_input in;
+    struct xkb_keymap *km = mk(ctx, "us");
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "keymap"); return; }
+    plat_event e;
+    xcb_key_press_event_t a = kev(K_A, 0, 100);
+    x11_input_key(&in, &a, true, 1000000000ull, &e);
+    CHECK(!x11_input_key(&in, &a, true, 1000000001ull, &e), "held key: server repeat dropped");
+    x11_input_focus_reset(&in);
+    CHECK(x11_input_key(&in, &a, true, 1000000002ull, &e), "after a real focus change the key is new again");
+    CHECK(!in.rep_active || in.rep_next_ns > 1000000002ull, "reset cancelled the old repeat");
+    x11_input_destroy(&in);
+}
+
+/* Review MINOR #3: XI_DeviceChanged has no time/mods and must not reset the clock map or xkb state. */
+static void test_xi2_events(struct xkb_context *ctx) {
+    x11_input in;
+    struct xkb_keymap *km = mk(ctx, "us");
+    if (!km || x11_input_init(&in, km, NULL) != 0) { CHECK(0, "keymap"); return; }
+    plat_event out[2];
+    xi2_result m;
+    memset(&m, 0, sizeof m);
+    m.motion = true; m.wheel = true; m.time_ms = 5000; m.mods = 4; m.dy = 256; m.x = 3; m.y = 4;
+    int n = x11_xi2_events(&in, &m, 9000000000ull, out);
+    CHECK(n == 2 && out[0].kind == PLAT_EV_MOTION && out[1].kind == PLAT_EV_WHEEL && out[1].dy == 256 &&
+          (out[1].mods & PLAT_MOD_CTRL), "motion+wheel events");
+    x11_clock before = in.clock;
+    xi2_result dc;
+    memset(&dc, 0, sizeof dc);
+    dc.device_changed = true;
+    n = x11_xi2_events(&in, &dc, 9100000000ull, out);
+    CHECK(n == 0, "device changed yields no events");
+    CHECK(in.clock.valid == before.valid && in.clock.ref_ms == before.ref_ms && in.clock.ref_ns == before.ref_ns,
+          "clock map untouched (ref_ms %u want %u)", in.clock.ref_ms, before.ref_ms);
+    m.time_ms = 5100; m.motion = true; m.wheel = false; m.mods = 0;
+    x11_xi2_events(&in, &m, 9100000000ull, out);
+    CHECK(out[0].t0_ns == 9000000000ull + 100000000ull, "next event keeps its physical time (t0 %llu)",
+          (unsigned long long)out[0].t0_ns);
+    x11_input_destroy(&in);
+}
+
 static void test_repeat(struct xkb_context *ctx) {
     const uint64_t S = 1000000000ull, MS = 1000000ull;
     x11_input in;
@@ -261,6 +350,10 @@ int main(void) {
     if (!ctx) { fprintf(stderr, "no xkb context\n"); return 1; }
     test_tables(ctx);
     test_dead_keys(ctx);
+    test_swallowed_release(ctx);
+    test_init_failure(ctx);
+    test_focus(ctx);
+    test_xi2_events(ctx);
     test_repeat(ctx);
     test_clock();
     test_buttons_queue(ctx);

@@ -3,6 +3,7 @@
 #ifndef EDITOR_X11_INPUT_H
 #define EDITOR_X11_INPUT_H
 #include "plat.h"
+#include "xi2.h"
 #include <xcb/xcb.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
@@ -26,6 +27,7 @@ typedef struct x11_input {
     uint32_t mod_idx[7];            /* PLAT_MOD bit order; XKB_MOD_INVALID if absent */
     x11_clock clock;
     uint8_t down[32];               /* keycode bitmap: keys currently held (drops server repeats) */
+    uint8_t swallowed[32];          /* keycodes whose press was consumed by compose: their release is consumed too */
     uint32_t rep_delay_ms, rep_rate_hz;
     bool     rep_active;
     uint32_t rep_key;               /* keycode being repeated */
@@ -36,7 +38,7 @@ typedef struct x11_input {
     uint32_t q_dropped;
 } x11_input;
 
-/* Takes ownership of keymap (may be replaced later) and ctab (may be NULL). Returns 0 or -1. */
+/* Consumes ctab (may be NULL) even on failure. Owns keymap only on success; caller keeps it on failure. Returns 0 or -1. */
 int  x11_input_init(x11_input *in, struct xkb_keymap *keymap, struct xkb_compose_table *ctab);
 int  x11_input_set_keymap(x11_input *in, struct xkb_keymap *keymap); /* cancels repeat */
 void x11_input_destroy(x11_input *in);
@@ -59,6 +61,15 @@ void x11_repeat_cancel(x11_input *in);
 /* Button translation (core events). Buttons 4-7 become WHEEL when core_wheel (no XI2), else dropped. */
 bool x11_input_button(x11_input *in, const xcb_button_press_event_t *ev, bool press, uint64_t now_ns,
                       bool core_wheel, plat_event *out);
+
+/* Focus events with grab modes (NotifyGrab/Ungrab/WhileGrabbed) or pointer-only detail do not change keyboard
+ * focus: false for those. mode/detail are the X FocusIn/FocusOut fields. */
+bool x11_focus_relevant(uint8_t mode, uint8_t detail);
+/* Forget held keys, repeat and compose state (real focus change). */
+void x11_input_focus_reset(x11_input *in);
+/* Turn a decoded XI2 event into plat events (motion, then wheel); returns count (0..2). XI_DeviceChanged carries no
+ * input modifiers and yields 0 events without touching the clock map or xkb state. */
+int x11_xi2_events(x11_input *in, const xi2_result *r, uint64_t now_ns, plat_event out[2]);
 
 bool x11_q_push(x11_input *in, const plat_event *ev);
 bool x11_q_pop(x11_input *in, plat_event *out);

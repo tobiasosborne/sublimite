@@ -2,6 +2,7 @@
  * The peer grabs the server to order injected events before the awaited reply.
  * Unmapped window, disabled timers and a bounded run avoid incidental wakeups. */
 #include "x11/plat.h"
+#include "x11_xvfb.h"
 #include "trace/trace.h"
 #include <xcb/xcb.h>
 #include <pthread.h>
@@ -226,8 +227,8 @@ static int run_case(trigger mode, const char *name, const char *power) {
 }
 
 int main(void) {
-    if (!getenv("DISPLAY") || !*getenv("DISPLAY")) {
-        puts("x11_stall_test: no DISPLAY, skipped");
+    if (!xvfb_start()) {
+        puts("x11_stall_test: skipped (no Xvfb)");
         return 0;
     }
     const char *power = power_tag(); /* stamp before measuring */

@@ -1,6 +1,8 @@
 /* x11_live_test.c - optional live-X checks (P2.2): keyboard/XI2 setup and a clipboard round trip between two
  * connections in one process. Skips cleanly (exit 0) with no display. */
 #include "x11/plat.h"
+#include "x11_xvfb.h"
+#include "x11/clip.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +22,9 @@ static void on_ev(void *ud, const plat_event *e) {
 
 static int open_plat(plat *p) {
     plat_config cfg = { "x11 live", 100, 100, getenv("DISPLAY") == NULL, -1, 0 };
-    return plat_init(p, &cfg);
+    int r = plat_init(p, &cfg);
+    if (r == PLAT_OK) x11_clip_set_limits(p, 0, 0, UINT32_MAX);
+    return r;
 }
 
 static void pump(plat *a, sink *sa, plat *b, sink *sb, int rounds) {
@@ -48,6 +52,7 @@ static void roundtrip(plat *a, sink *sa, plat *b, sink *sb, int which, const cha
 
 int main(void) {
     plat a, b;
+    if (!xvfb_start()) { puts("x11_live_test: skipped (no Xvfb)"); return 0; }
     int r = open_plat(&a);
     if (r == PLAT_ERR_NO_DISPLAY) { puts("x11_live_test: no display, skipped"); return 0; }
     if (r != PLAT_OK) { fprintf(stderr, "plat_init failed (%d)\n", r); return 1; }

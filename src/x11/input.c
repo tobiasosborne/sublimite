@@ -33,7 +33,12 @@ int x11_input_init(x11_input *in, struct xkb_keymap *keymap, struct xkb_compose_
     in->rep_delay_ms = 400; in->rep_rate_hz = 30;
     in->ctab = ctab;
     if (ctab) in->cstate = xkb_compose_state_new(ctab, XKB_COMPOSE_STATE_NO_FLAGS);
-    if (x11_input_set_keymap(in, keymap) != 0) return -1;
+    if (x11_input_set_keymap(in, keymap) != 0) {      /* we were handed ctab: release it (keymap stays the caller's) */
+        if (in->cstate) xkb_compose_state_unref(in->cstate);
+        if (in->ctab) xkb_compose_table_unref(in->ctab);
+        in->cstate = NULL; in->ctab = NULL;
+        return -1;
+    }
     return 0;
 }
 
@@ -104,10 +109,20 @@ static void set_down(x11_input *in, uint32_t k, bool d) {
     if (d) in->down[(k >> 3) & 31] |= m; else in->down[(k >> 3) & 31] &= (uint8_t)~m;
 }
 
+/* Modifier and lock keysyms never take part in a compose sequence (libxkbcommon ignores them too). */
+static bool is_modifier_sym(uint32_t s) {
+    return (s >= 0xffe1u && s <= 0xffeeu) || (s >= 0xfe01u && s <= 0xfe13u) || s == 0xff7eu || s == 0xff7fu;
+}
+
 bool x11_input_key(x11_input *in, const xcb_key_press_event_t *ev, bool press, uint64_t now_ns, plat_event *out) {
     uint32_t k = ev->detail;
     memset(out, 0, sizeof *out);
     if (press && is_down(in, k)) return false;     /* server autorepeat (detectable mode): ours replaces it */
+    if (!press && ((in->swallowed[(k >> 3) & 31] >> (k & 7)) & 1)) {   /* its press never reached the consumer */
+        in->swallowed[(k >> 3) & 31] &= (uint8_t)~(1u << (k & 7));
+        set_down(in, k, false);
+        return false;
+    }
     set_down(in, k, press);
     x11_translate(in, k, ev->state, out);
     out->press = press; out->time_ms = ev->time;
@@ -119,11 +134,12 @@ bool x11_input_key(x11_input *in, const xcb_key_press_event_t *ev, bool press, u
         return true;
     }
     /* Compose / dead keys: feed the keysym; swallow while composing. */
-    if (in->cstate && out->keysym != XKB_KEY_NoSymbol) {
+    if (in->cstate && out->keysym != XKB_KEY_NoSymbol && !is_modifier_sym(out->keysym)) {
         xkb_compose_state_feed(in->cstate, (xkb_keysym_t)out->keysym);
         switch (xkb_compose_state_get_status(in->cstate)) {
         case XKB_COMPOSE_COMPOSING:
             x11_repeat_cancel(in);
+            in->swallowed[(k >> 3) & 31] |= (uint8_t)(1u << (k & 7));
             return false;
         case XKB_COMPOSE_COMPOSED: {
             char b[16];
@@ -137,6 +153,7 @@ bool x11_input_key(x11_input *in, const xcb_key_press_event_t *ev, bool press, u
         }
         case XKB_COMPOSE_CANCELLED:
             xkb_compose_state_reset(in->cstate);
+            in->swallowed[(k >> 3) & 31] |= (uint8_t)(1u << (k & 7));
             return false;                           /* the cancelling key is consumed (as Xlib/GTK do) */
         default: break;
         }
@@ -203,4 +220,38 @@ bool x11_q_pop(x11_input *in, plat_event *out) {
     *out = in->q[in->qh & (X11_QUEUE_CAP - 1)];
     in->qh++;
     return true;
+}
+
+bool x11_focus_relevant(uint8_t mode, uint8_t detail) {
+    if (mode == 1 || mode == 2 || mode == 3) return false;     /* NotifyGrab, NotifyUngrab, NotifyWhileGrabbed */
+    if (detail == 5 || detail == 6) return false;              /* NotifyPointer, NotifyPointerRoot */
+    return true;
+}
+
+void x11_input_focus_reset(x11_input *in) {
+    memset(in->down, 0, sizeof in->down);
+    memset(in->swallowed, 0, sizeof in->swallowed);
+    x11_repeat_cancel(in);
+    if (in->cstate) xkb_compose_state_reset(in->cstate);
+}
+
+int x11_xi2_events(x11_input *in, const xi2_result *r, uint64_t now_ns, plat_event out[2]) {
+    int n = 0;
+    if (r->device_changed) return 0;
+    uint64_t t0 = x11_clock_map(&in->clock, r->time_ms, now_ns);
+    uint16_t mods = x11_mods_from_state(in, r->mods);
+    if (r->motion) {
+        memset(&out[n], 0, sizeof out[n]);
+        out[n].kind = PLAT_EV_MOTION; out[n].state = r->mods; out[n].x = r->x; out[n].y = r->y;
+        out[n].time_ms = r->time_ms; out[n].mods = mods; out[n].buttons = r->buttons; out[n].t0_ns = t0;
+        n++;
+    }
+    if (r->wheel) {
+        memset(&out[n], 0, sizeof out[n]);
+        out[n].kind = PLAT_EV_WHEEL; out[n].state = r->mods; out[n].x = r->x; out[n].y = r->y;
+        out[n].time_ms = r->time_ms; out[n].mods = mods; out[n].buttons = r->buttons; out[n].t0_ns = t0;
+        out[n].dx = r->dx; out[n].dy = r->dy; out[n].smooth = true;
+        n++;
+    }
+    return n;
 }
