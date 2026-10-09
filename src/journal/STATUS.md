@@ -1,4 +1,54 @@
-# Journal status — P1.9f / edit-4w1.45
+# Journal status — P1.9g / edit-4w1.53
+
+Successful append now encodes/checksums and synchronously pwrite()s each bounded
+record to the kernel page cache on the UI owner. Process crash protects every
+successful append before pump. fdatasync remains on the worker at the existing
+configurable cadence (defaults 1 s / 64 KiB). Pump caches PAD before permitting
+the next batch, and completion preserves newer UI written/file progress.
+
+EAGAIN/ENOSPC/EIO/EINTR/zero/short writes make one attempt, return sticky IO
+with append_errno, and retain all encoded bytes/partial progress in the fixed
+queue. The worker drains missing tails; IO remains sticky until off-path retry
+or complete checkpoint. Later edits cannot cross an unwritten prefix gap.
+Logical INSERT keeps every preflighted chunk on IO; callers must not reappend
+that queued mutation. No typing-path allocation, sync, wait or job submission.
+pending_bytes exposes queue occupancy for benchmark delivery pacing.
+
+The kill oracle requires replay >= the successful page-cache prefix, includes
+a deterministic kill-before-pump case and applies to a piece tree against an
+independent byte oracle. Fault tests cover UI/worker thread ownership, blocked
+workers, PAD, sticky failure and precise short-write retry. Fuzzing checks
+successful prefixes before pump and injected UI/worker failures.
+
+Open constraint: regular-file pwrite may block inside Linux; bounded size and
+one attempt cannot enforce the brief's absolute no-stall condition. O_NONBLOCK
+does not fix that. Failed/refused edits suspend protection; worker scheduling
+and I/O still qualify the power-loss cadence. Full explanation and current
+red/green/verification evidence: [P1.9.md](../../docs/decisions/P1.9.md), P1.9g.
+PRD §7 uses Tobias's exact process/power/kernel crash wording.
+
+journal_save_prepare/finish are unchanged. P1.9d's recoverable save and P1.9f's
+private reflink/copy bases remain tested and intact.
+
+Current measured evidence: make all passed ([AC], load1=23.93); make fuzz built
+21 fuzzers (M)[AC], load1=25.59; journal fuzz completed 5872 runs / 121 s (M)[AC],
+launch load1=26.14, no findings. The single benchmark invocation passed its
+content/fixture checks but reported append p99 36.103 / 114.236 us for 1 B /
+1 KiB (M)[AC], row load1=29.72 / 29.26, above 20 us (G). Paste enqueue p99 was
+36.239 ms (M)[AC], load1=29.72. These are TRACK only; no reruns or quiet-box
+verdict. The decision records complete rows and the Linux syscall limitation.
+Full release SIGKILL recovery passed 1000 trials in 580.64 s (M)[AC], launch
+load1=27.00, protecting every published page-cache prefix. The final full release
+journal suite passed with the active malloc guard reporting 0 append allocations
+(M)[AC], launch load1=11.26.
+Full clang ASan/UBSan make check passed 41 test binaries and replay CLI checks
+(M)[AC], launch load1=24.95, using approved local Unix/Xvfb socket access after
+the sandboxed CLI connection failed. LSan alone was disabled for this runner;
+coordinator rechecks with leaks enabled. No other implementation problem was
+found or fixed in this bead.
+
+Historical P1.9f/P1.9e status follows; RAM-only enqueue and worker CRC statements
+below are superseded by P1.9g.
 
 File review §6 is fixed: save preparation retains a private inode via reflink
 or a bounded WORK_BULK copy, rather than a hard link to the writable original.

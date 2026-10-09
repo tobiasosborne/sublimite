@@ -77,7 +77,7 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 - **Footprint:** binary ≤ 2 MB, ≤ 640 KiB touched before first frame, baseline memory ≤ 87 MB on A (gate G10). Static linking of our code and grammars; `dlopen` only for the GL driver, off the critical path.
 - **Rendering:** GPU path (OpenGL 3.3 via EGL/GLX) is the chosen path on A; multi-threaded CPU raster is the warm fallback and the path for machines without usable GL. Both must exist (perf §3).
 - **Platforms:** v1 Linux, X11 and Wayland backends over one renderer. v2 Windows 11 (Win32, D3D11 or GL), same codebase. 64-bit only.
-- **Reliability:** no data loss on crash (hot exit journal); external-modification race documented and detected (perf §2.14).
+- **Reliability:** no data loss on process crash; at most 1 s / 64 KiB on power loss or kernel crash; external-modification race documented and detected (perf §2.14).
 - **Accessibility, i18n of the UI:** none in v1. English UI strings only.
 
 ## 8. Technical constraints (decided)

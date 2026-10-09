@@ -63,20 +63,28 @@ typedef struct journal_stats {
     uint64_t last_sync_bytes, max_sync_bytes;
     int error;
     uint64_t file_limit_bytes, checkpoint_bytes, queue_bytes;
+    uint64_t pending_bytes;    /* bytes retained in the two UI/worker batches */
+    int append_errno;          /* sticky UI-write errno; short/zero write => EIO */
 } journal_stats;
 typedef struct journal journal;
-/* Optional off-path syscall seam; callbacks have POSIX return/errno semantics.
+/* Optional per-instance syscall seam; callbacks have POSIX return/errno semantics.
  * sync receives directory=true for namespace barriers, false for data barriers.
  * NULL callbacks use real syscalls; contexts must outlive all jobs, including
  * retained-base and temporary checkpoint jobs. A write hook selects the bounded
- * retained-base copy fallback instead of reflinking. Set only with no active worker. Append never calls
- * these hooks. open_with_io also covers the creation-directory barrier. */
+ * retained-base copy fallback instead of reflinking. Set only with no active
+ * worker. write/read/sync/rename remain off path; append_write runs on the UI
+ * owner and must make one attempt without allocation or retry. Its ctx can be
+ * used concurrently by the worker's other hooks. open_with_io also covers the
+ * creation-directory barrier. */
 typedef struct journal_io {
     void *ctx;
     ssize_t (*write)(void *, int, const uint8_t *, size_t, uint64_t);
     int (*sync)(void *, int, bool);
     int (*rename)(void *, const char *, const char *);
     ssize_t (*read)(void *, int, uint8_t *, size_t, uint64_t); /* BASE prefix only */
+    /* Single UI-side positioned write attempt; NULL uses pwrite. Separate from
+     * worker/copy write so fault tests can distinguish thread ownership. */
+    ssize_t (*append_write)(void *, int, const uint8_t *, size_t, uint64_t);
 } journal_io;
 /* Zero-initialize each save token. Its sequence is the saved snapshot cutoff
  * in the PREPARED checkpoint generation (checkpoint record count). */
@@ -88,10 +96,12 @@ typedef struct journal_save {
 int journal_open_with_io(journal **out, const char *path, work_pool *pool,
                          const journal_options *options, const journal_io *io);
 int journal_set_io(journal *j, const journal_io *io);
-/* Off-path, after receive returns failed-worker ownership. Clear IO suspension,
+/* Off-path, after receive returns worker ownership. Clear sticky UI/worker IO,
  * retaining exact batch progress and both buffers; subsequent pump/flush retries
  * the failed batch first. Repeats a failed checkpoint-directory barrier BEFORE
- * permitting new writes/acks. FULL suspension is preserved. */
+ * permitting new writes/acks. FULL suspension is preserved. After clearing a
+ * UI short-write error before drain, append returns BUSY until pump/receive has
+ * filled the prefix gap; never retry the edit that was already queued. */
 int journal_retry(journal *j);
 /* Recoverable save order (all checkpoint work is off the typing path):
  * 1. Build a COMPLETE session checkpoint at the current UI snapshot. Include one
@@ -138,16 +148,26 @@ int journal_save_finish(journal *j, journal_save *save, const journal_base *save
 int journal_open(journal **out, const char *path, work_pool *pool,
                  const journal_options *options);
 void journal_close(journal *j);
-/* Typing path: no malloc, syscalls, locks, or worker submission. A FULL error
+/* Typing path: no malloc, locks, sync, or worker submission. Encode+CRC and one
+ * bounded pwrite per record on this calling thread; OK means the complete
+ * record is in the kernel page cache, so process crash loses no successful
+ * appends. fdatasync stays on the worker (default 1 s / 64 KiB).
+ * A UI syscall error (including EAGAIN/ENOSPC/EIO/EINTR), zero or short write
+ * returns sticky IO with append_errno, retaining the WHOLE record for worker
+ * drain. No UI retry/wait. Do not retry that edit; it was accepted into RAM.
+ * Later appends are refused until suspension is resolved. Linux regular-file
+ * pwrite can itself block; bounded bytes/attempts are not a wall-clock bound.
+ * A FULL error
  * is sticky: later mutations must not be journaled until a complete rotation.
  * Application may keep editing but must surface that recovery is suspended.
- * Records are copied/encoded here; their CRCs are completed on the worker
- * before writing. No accepted records are discarded. size excludes header. Named BASE/SAVE
+ * No accepted records are discarded. size excludes header. Named BASE/SAVE
  * paths must be canonical absolute paths (capture supplies owned storage). */
 int journal_append(journal *j, uint32_t type, uint64_t id,
                    const uint8_t *data, size_t size);
 /* One logical INSERT: preflight all capacity/disk/sequence bounds, then split
  * into wire records <=1 MiB. FULL accepts none of this call. No pump/wait/alloc.
+ * IO retains ALL preflighted chunks, including any not yet attempted; only its
+ * complete written prefix is process-crash protected until worker drain.
  * Default empty current batch admits a 1 MiB paste plus normal session metadata.
  * Existing backlog can still suspend recovery; caller surfaces FULL. */
 int journal_insert(journal *j, uint64_t id, uint64_t off,
@@ -159,7 +179,10 @@ int journal_set_tabs(journal *j, const uint64_t *ids, size_t count, uint64_t act
 int journal_set_window(journal *j, uint32_t width, uint32_t height);
 /* Event-loop timer (<=5 ms recommended), outside the typing path. now_ns is
  * CLOCK_MONOTONIC; force requests a sync even if no new records exist.
- * Worker syncs at the configured byte/time thresholds, plus explicit force.
+ * Caches the batch's PAD before transferring it (so later appends have no
+ * unwritten gap). PAD errors queue worker retry and return sticky IO.
+ * Worker accounts cached bytes, writes only missing tails, and syncs at the
+ * configured byte/time thresholds, plus explicit force.
  * Zero option fields preserve the current 64 KiB / 1 s defaults.
  * IO/scheduling delays can extend the window; stats expose durable progress. */
 int journal_pump(journal *j, uint64_t now_ns, bool force);
@@ -170,7 +193,8 @@ journal_stats journal_get_stats(const journal *j);
  * pool must be private to this journal. Async pump/receive needs no handler. */
 void journal_set_message_handler(journal *j,
                                  void (*handler)(const work_msg *, void *), void *ctx);
-/* Drain accepted records, then return sticky FULL while recovery is suspended.
+/* Drain accepted records, then return sticky UI IO or FULL while suspended.
+ * Worker/directory IO may require journal_retry before drain can continue.
  * Clean exit: on FULL build/rotate a complete CURRENT checkpoint, require OK
  * from flush, then close. IO takes precedence over FULL. */
 int journal_flush(journal *j); /* blocking; setup/save/exit only */

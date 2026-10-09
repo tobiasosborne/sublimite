@@ -102,15 +102,15 @@ static int session(work_pool *pool, size_t payload, bool contention)
         /* The workload generator delays delivery while prior requests are
          * pending. Enqueue never waits/retries FULL; these waits are reported.
          * Use a conservative byte bound for mixed INSERT/DELETE records. */
-        uint64_t pending_limit=JOURNAL_DEFAULT_BATCH_BYTES/(payload+JOURNAL_HEADER+8)/2;
+        uint64_t pending_limit=JOURNAL_DEFAULT_BATCH_BYTES/2;
         journal_stats pending=journal_get_stats(j);
-        if(pending.accepted_sequence-pending.written_sequence>=pending_limit) {
+        if(pending.pending_bytes>=pending_limit) {
             uint64_t wait_start=bench_now_ns(); pauses++;
             do {
                 uint64_t now=bench_now_ns();
                 if(now>=next_tick) { REQUIRE(tick(pool,&r)==0); next_tick=now+5000000u; }
                 REQUIRE(now-wait_start<5000000000ull); nap(); pending=journal_get_stats(j);
-            } while(pending.accepted_sequence-pending.written_sequence>=pending_limit);
+            } while(pending.pending_bytes>=pending_limit);
             uint64_t waited=bench_now_ns()-wait_start; pause_ns+=waited; if(waited>max_pause_ns) max_pause_ns=waited;
         }
         rng^=rng<<13; rng^=rng>>7; rng^=rng<<17;
@@ -141,8 +141,8 @@ static int session(work_pool *pool, size_t payload, bool contention)
     while(r.bulk_done<submitted) { work_mailbox_drain(pool,route,&r); nap(); }
     REQUIRE(!r.bulk_error); journal_stats st=journal_get_stats(j); journal_close(j);
     uint64_t p50=bench_p50(&s), p99=bench_p99(&s);
-    printf("TRACK journal_append payload=%zu edits=%u p50_ns=%llu p99_ns=%llu local_budget_ns=20000_(E) timer_ms=5 final_flush=1 bulk_jobs=%u bulk=index_scan/find_scan/save_write_standins (M)%s\n",
-        payload,SESSION_EDITS,(unsigned long long)p50,(unsigned long long)p99,submitted,evidence(tag,sizeof tag));
+    printf("TRACK journal_append payload=%zu edits=%u p50_ns=%llu p99_ns=%llu gate_p99_ns=20000_(G) within_gate=%d ui_page_cache_write=1 timer_ms=5 final_flush=1 bulk_jobs=%u bulk=index_scan/find_scan/save_write_standins (M)%s\n",
+        payload,SESSION_EDITS,(unsigned long long)p50,(unsigned long long)p99,p99<=20000?1:0,submitted,evidence(tag,sizeof tag));
     printf("TRACK journal_backpressure payload=%zu delivery_pauses=%u total_pause_ms=%.3f max_pause_ms=%.3f measured_enqueue_excludes_delivery_wait=1 (M)%s\n",payload,pauses,(double)pause_ns/1e6,(double)max_pause_ns/1e6,evidence(tag,sizeof tag));
     piece_allocator alloc=piece_default_allocator(); restored c={.trees={piece_create(&alloc),piece_create(&alloc)}}; REQUIRE(c.trees[0] && c.trees[1]);
     journal_replay_result rr; uint64_t begin=bench_now_ns(); REQUIRE(journal_replay_file(path,restore,&c,&rr)==0); uint64_t elapsed=bench_now_ns()-begin;
@@ -225,7 +225,7 @@ static int exhaustion(work_pool *pool)
         /* Wait between logical requests, off path; timer pump, no forced sync. */
         REQUIRE(tick(pool,&r)==0);
         uint64_t start=bench_now_ns();
-        while(journal_get_stats(j).written_sequence<accepted) { REQUIRE(tick(pool,&r)==0 && bench_now_ns()-start<5000000000ull); nap(); }
+        while(journal_get_stats(j).pending_bytes) { REQUIRE(tick(pool,&r)==0 && bench_now_ns()-start<5000000000ull); nap(); }
     }
     REQUIRE(journal_flush(j)==JOURNAL_FULL); journal_stats st=journal_get_stats(j);
     REQUIRE(st.accepted_sequence==accepted && st.durable_sequence==accepted && st.file_bytes<=JOURNAL_DEFAULT_FILE_BYTES && st.file_bytes+n>JOURNAL_DEFAULT_FILE_BYTES);

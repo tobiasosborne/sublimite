@@ -14,9 +14,9 @@
 
 typedef struct journal_batch {
     uint8_t *bytes;
-    size_t used, sealed, progress;
+    size_t used, sealed, progress, cached;
     uint64_t offset, sequence;
-    bool force, checksummed;
+    bool force;
 } journal_batch;
 typedef struct journal_disk {
     int fd;
@@ -28,7 +28,7 @@ struct journal {
     work_pool *pool;
     work_handle handle;
     journal_batch batches[2];
-    journal_disk disk;          /* exclusively worker owned while a job is active */
+    journal_disk disk;          /* worker state; UI also uses its stable fd */
     journal_stats stats;        /* exclusively UI owned */
     uint32_t crc_table[256];
     size_t capacity;
@@ -37,6 +37,8 @@ struct journal {
     int directory_fd;
     unsigned current, active_index;
     bool active, failed, directory_pending;
+    bool append_failed, append_pending;
+    uint64_t pending_sequence;
     int append_error;
     journal_io io;
     void (*message_handler)(const work_msg *, void *);
@@ -71,10 +73,11 @@ static void encode(uint8_t *p, uint32_t type, uint64_t id, uint64_t seq, size_t 
     put32(p,MAGIC); put32(p+4,(uint32_t)n); put32(p+8,type); put32(p+12,0);
     put64(p+16,seq); put64(p+24,id);
 }
-static void seal(journal_batch *b)
+static void seal(journal *j, journal_batch *b)
 {
     b->sealed=sealed_size(b->used); size_t n=b->sealed-b->used;
     memset(b->bytes+b->used,0,n); encode(b->bytes+b->used,PAD,0,0,n);
+    put32(b->bytes+b->used+12,crc_record(j->crc_table,b->bytes+b->used,n));
 }
 static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
 {
@@ -262,32 +265,18 @@ static int sync_disk(journal *j, uint64_t sequence)
     if(d->unsynced>s->max_sync_bytes) s->max_sync_bytes=d->unsynced;
     s->syncs++; s->durable_sequence=sequence; d->unsynced=0; return 0;
 }
-/* Only the worker owns a sealed batch. Complete every wire CRC before any
- * write; retry reuses those exact bytes. Poll between bounded CRC slices. */
-static bool checksum_batch(journal *j, journal_batch *b, work_ctx *ctx)
-{
-    if(b->checksummed) return true;
-    for(size_t pos=0;pos<b->sealed;) {
-        uint8_t *p=b->bytes+pos; size_t n=u32(p+4); put32(p+12,0);
-        uint32_t c=UINT32_MAX;
-        for(size_t off=0;off<n;) {
-            size_t end=off+JOURNAL_PAGE; if(end>n) end=n;
-            for(;off<end;off++) c=j->crc_table[(c^p[off])&255u]^(c>>8);
-            if(work_should_stop(ctx)) return false;
-        }
-        put32(p+12,~c); pos+=n;
-    }
-    b->checksummed=true; return true;
-}
 static void worker(work_ctx *ctx)
 {
     journal *j=ctx->arg; journal_batch *b=&j->batches[j->active_index]; journal_disk *d=&j->disk;
-    if(!checksum_batch(j,b,ctx)) return;
     size_t pos=b->progress; int rc=0; uint64_t initial=d->written_sequence;
     if(d->unsynced>=j->sync_bytes) rc=sync_disk(j,d->written_sequence);
     while(!rc && pos<b->sealed && !work_should_stop(ctx)) {
         size_t n=b->sealed-pos; uint64_t room=j->sync_bytes-d->unsynced; if(n>room) n=(size_t)room;
-        size_t done=0; rc=write_at(&j->io,d->fd,b->bytes+pos,n,b->offset+pos,&done);
+        size_t done=0;
+        /* Account the UI-written prefix at the existing sync boundaries.
+         * Only a failed/short UI write (or its PAD) needs another data write. */
+        if(pos<b->cached) { if(n>b->cached-pos) n=b->cached-pos; done=n; }
+        else rc=write_at(&j->io,d->fd,b->bytes+pos,n,b->offset+pos,&done);
         pos+=done; b->progress=pos; d->unsynced+=done; d->written_sequence=prefix_sequence(b,pos,initial);
         d->stats.written_sequence=d->written_sequence; d->stats.file_bytes=b->offset+pos;
         if(rc) break;
@@ -386,31 +375,57 @@ int journal_retry(journal *j)
         j->directory_pending=false; j->stats.durable_sequence=j->disk.stats.durable_sequence;
     }
     j->stats.error=j->append_error; j->disk.stats.error=0;
+    j->append_failed=false; j->stats.append_errno=0;
     return 0;
 }
 static int reserve_record(journal *j, size_t payload, uint8_t **p)
 {
     if(!j || payload>JOURNAL_MAX_RECORD-32) return JOURNAL_INVALID;
     if(j->stats.error) return j->stats.error;
+    if(j->append_pending) return JOURNAL_BUSY; /* retry must first close the wire gap */
     journal_batch *b=&j->batches[j->current]; size_t n=payload+32;
     if(j->stats.accepted_sequence==UINT64_MAX || n>j->capacity-32 || b->used>j->capacity-32-n || j->reserved>j->limit || sealed_size(b->used+n)>j->limit-j->reserved) { j->stats.error=JOURNAL_FULL; j->append_error=JOURNAL_FULL; return JOURNAL_FULL; }
     *p=b->bytes+b->used; return 0;
 }
-static void finish_record(journal *j, uint8_t *p, uint32_t type, uint64_t id, size_t payload)
+/* Exactly one bounded syscall attempt, never an EINTR/short-write retry on UI.
+ * Preserve its exact prefix; immutable queued bytes let the worker finish it. */
+static int cache_write(journal *j, journal_batch *b, size_t start, size_t n)
 {
-    journal_batch *b=&j->batches[j->current]; j->stats.accepted_sequence++;
+    ssize_t k=j->io.append_write?j->io.append_write(j->io.ctx,j->disk.fd,b->bytes+start,n,j->reserved+start):
+        pwrite(j->disk.fd,b->bytes+start,n,(off_t)(j->reserved+start));
+    int error=k<0?errno:EIO;
+    if(k>0 && (size_t)k<=n) {
+        b->cached=start+(size_t)k;
+        uint64_t end=j->reserved+b->cached;
+        if(end>j->stats.file_bytes) j->stats.file_bytes=end;
+    }
+    if(k>=0 && (size_t)k==n) return 0;
+    j->append_failed=true; j->append_pending=true; j->pending_sequence=b->sequence;
+    j->stats.error=JOURNAL_IO; j->stats.append_errno=error; return JOURNAL_IO;
+}
+static int finish_record(journal *j, uint8_t *p, uint32_t type, uint64_t id, size_t payload)
+{
+    journal_batch *b=&j->batches[j->current]; size_t start=b->used; j->stats.accepted_sequence++;
     encode(p,type,id,j->stats.accepted_sequence,payload+32); b->used+=payload+32; b->sequence=j->stats.accepted_sequence;
+    put32(p+12,crc_record(j->crc_table,p,payload+32));
+    if(j->append_pending) { j->pending_sequence=b->sequence; return JOURNAL_IO; }
+    /* A pump whose work_submit was BUSY may already have cached a PAD here. */
+    b->cached=start;
+    int rc=cache_write(j,b,start,payload+32);
+    if(!rc) j->stats.written_sequence=b->sequence;
+    return rc;
 }
 int journal_append(journal *j, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
 {
     if((!data && size) || ((type==JOURNAL_TABS || type==JOURNAL_WINDOW) && id) || !payload_valid(type,data,size)) return JOURNAL_INVALID;
     uint8_t *p; int rc=reserve_record(j,size,&p); if(rc) return rc;
-    memcpy(p+32,data,size); finish_record(j,p,type,id,size); return 0;
+    memcpy(p+32,data,size); return finish_record(j,p,type,id,size);
 }
 int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, size_t size)
 {
     if(!j || (!bytes && size) || off>UINT64_MAX-size) return JOURNAL_INVALID;
     if(j->stats.error) return j->stats.error;
+    if(j->append_pending) return JOURNAL_BUSY;
     size_t chunk=j->capacity-72; if(chunk>JOURNAL_MAX_RECORD-40) chunk=JOURNAL_MAX_RECORD-40;
     size_t records=size?1+(size-1)/chunk:1;
     if(records>(SIZE_MAX-size)/40) return JOURNAL_INVALID;
@@ -419,14 +434,15 @@ int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, 
        b->used>j->capacity-32-total || j->reserved>j->limit || sealed_size(b->used+total)>j->limit-j->reserved) {
         j->stats.error=JOURNAL_FULL; j->append_error=JOURNAL_FULL; return JOURNAL_FULL;
     }
-    size_t copied=0;
+    size_t copied=0; int rc=0;
     do {
         size_t n=size-copied; if(n>chunk) n=chunk;
         uint8_t *p=b->bytes+b->used; put64(p+32,off+copied);
         if(n) memcpy(p+40,bytes+copied,n);
-        finish_record(j,p,JOURNAL_INSERT,id,n+8); copied+=n;
+        int finished=finish_record(j,p,JOURNAL_INSERT,id,n+8); if(finished) rc=finished;
+        copied+=n;
     } while(copied<size);
-    return 0;
+    return rc;
 }
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len)
 { uint8_t data[16]; if(off>UINT64_MAX-len) return JOURNAL_INVALID; put64(data,off); put64(data+8,len); return journal_append(j,JOURNAL_DELETE,id,data,16); }
@@ -449,26 +465,31 @@ int journal_set_tabs(journal *j, const uint64_t *ids, size_t count, uint64_t act
 {
     if((!ids && count) || count>(JOURNAL_MAX_RECORD-48)/8 || (count?active>=count:active!=0)) return JOURNAL_INVALID;
     uint8_t *p; int rc=reserve_record(j,16+count*8,&p); if(rc) return rc;
-    put64(p+32,count); put64(p+40,active); for(size_t i=0;i<count;i++) put64(p+48+i*8,ids[i]); finish_record(j,p,JOURNAL_TABS,0,16+count*8); return 0;
+    put64(p+32,count); put64(p+40,active); for(size_t i=0;i<count;i++) put64(p+48+i*8,ids[i]); return finish_record(j,p,JOURNAL_TABS,0,16+count*8);
 }
 int journal_set_window(journal *j, uint32_t width, uint32_t height)
 { uint8_t data[8]; put32(data,width); put32(data+4,height); return journal_append(j,JOURNAL_WINDOW,0,data,8); }
 int journal_pump(journal *j, uint64_t now, bool force)
 {
     if(!j) return JOURNAL_INVALID;
-    if(j->stats.error && j->stats.error!=JOURNAL_FULL) return j->stats.error;
+    if(j->stats.error && j->stats.error!=JOURNAL_FULL && (!j->append_failed || j->failed || j->directory_pending)) return j->stats.error;
     if(j->active) return JOURNAL_BUSY;
     unsigned index=j->failed?j->active_index:j->current;
     journal_batch *b=&j->batches[index];
+    int append_rc=0;
     uint64_t elapsed=now>=j->stats.last_sync_ns?now-j->stats.last_sync_ns:0;
     if(!j->failed) {
-        if(!force) {
+        if(!force && !j->append_pending) {
             if(!b->used && (j->stats.written_sequence<=j->stats.durable_sequence || elapsed<j->sync_interval_ns)) return 0;
             if(b->used && b->used<JOURNAL_PAGE-JOURNAL_HEADER && elapsed<j->sync_interval_ns) return 0;
         }
         b->sealed=0; b->progress=0; b->offset=j->reserved;
-        if(b->used) seal(b);
-        b->checksummed=false;
+        if(b->used) {
+            seal(j,b);
+            /* A page gap would hide successful appends in the next batch on
+             * SIGKILL. Cache PAD before transferring this batch to the worker. */
+            if(b->cached==b->used) append_rc=cache_write(j,b,b->used,b->sealed-b->used);
+        }
     }
     b->force=force || (j->failed && b->force);
 
@@ -476,7 +497,7 @@ int journal_pump(journal *j, uint64_t now, bool force)
     j->handle=work_submit(j->pool,(work_job){worker,j,0,WORK_BULK}); if(!j->handle.epoch) return JOURNAL_BUSY;
     j->active=true;
     if(!j->failed) { j->reserved+=b->sealed; j->current^=1u; }
-    return 0;
+    return append_rc;
 }
 bool journal_receive(journal *j, const work_msg *m)
 {
@@ -485,15 +506,26 @@ bool journal_receive(journal *j, const work_msg *m)
     journal_batch *b=&j->batches[j->active_index];
     if(address!=(uintptr_t)(b->bytes+j->capacity)) return false;
     journal_completion *c=(journal_completion *)address;
-    uint64_t accepted=j->stats.accepted_sequence; int sticky=j->stats.error;
+    uint64_t accepted=j->stats.accepted_sequence, written=j->stats.written_sequence, file_bytes=j->stats.file_bytes;
+    int sticky=j->stats.error, append_errno=j->stats.append_errno;
     j->stats=c->stats; j->stats.accepted_sequence=accepted;
+    if(written>j->stats.written_sequence) j->stats.written_sequence=written;
+    if(file_bytes>j->stats.file_bytes) j->stats.file_bytes=file_bytes;
+    j->stats.append_errno=append_errno;
     if(!j->stats.error) j->stats.error=sticky;
     j->failed=c->stats.error!=0;
-    if(!j->failed) { b->used=0; b->sealed=0; b->progress=0; b->checksummed=false; }
+    if(!j->failed) {
+        if(b->sequence>=j->pending_sequence) j->append_pending=false;
+        b->used=0; b->sealed=0; b->progress=0; b->cached=0;
+    }
     j->active=false;
     return true;
 }
-journal_stats journal_get_stats(const journal *j) { return j?j->stats:(journal_stats){.error=JOURNAL_INVALID}; }
+journal_stats journal_get_stats(const journal *j)
+{
+    if(!j) return (journal_stats){.error=JOURNAL_INVALID};
+    journal_stats s=j->stats; s.pending_bytes=j->batches[0].used+j->batches[1].used; return s;
+}
 void journal_set_message_handler(journal *j, void (*handler)(const work_msg *, void *), void *ctx)
 {
     if(j) { j->message_handler=handler; j->message_ctx=ctx; }
@@ -506,13 +538,14 @@ static void drain(const work_msg *m, void *ctx)
 int journal_flush(journal *j)
 {
     if(!j) return JOURNAL_INVALID;
-    if(j->stats.error && j->stats.error!=JOURNAL_FULL) return j->stats.error;
+    if(j->stats.error && j->stats.error!=JOURNAL_FULL && (!j->append_failed || j->failed || j->directory_pending)) return j->stats.error;
     for(;;) {
         if(!j->active && !j->batches[j->current].used && j->stats.durable_sequence==j->stats.accepted_sequence) return j->stats.error;
         work_mailbox_drain(j->pool,drain,j);
         if(!j->active && !j->batches[j->current].used && j->stats.durable_sequence==j->stats.accepted_sequence) return j->stats.error;
-        int rc=journal_pump(j,clock_ns(),true); if(rc && rc!=JOURNAL_BUSY) return rc;
-        if(j->stats.error && j->stats.error!=JOURNAL_FULL) return j->stats.error;
+        int rc=journal_pump(j,clock_ns(),true);
+        if(rc && rc!=JOURNAL_BUSY && !(rc==JOURNAL_IO && j->append_failed && !j->failed && !j->directory_pending)) return rc;
+        if(j->stats.error && j->stats.error!=JOURNAL_FULL && (!j->append_failed || j->failed || j->directory_pending)) return j->stats.error;
         delay();
     }
 }
@@ -555,7 +588,7 @@ static int checkpoint_temp(const journal *j, char *name, size_t cap)
 int journal_rotate(journal *j, const journal_record *records, size_t count)
 {
     if(!j || (!records && count)) return JOURNAL_INVALID;
-    if(j->active || (!j->failed && (j->batches[j->current].used || j->stats.accepted_sequence!=j->stats.durable_sequence))) return JOURNAL_BUSY;
+    if(j->active || (!j->failed && !j->append_failed && (j->batches[j->current].used || j->stats.accepted_sequence!=j->stats.durable_sequence))) return JOURNAL_BUSY;
     uint64_t checkpoint_bytes=0; int rc=checkpoint_size(j,records,count,&checkpoint_bytes); if(rc) return rc;
     char tmpname[80]; int tfd=checkpoint_temp(j,tmpname,sizeof tmpname); if(tfd<0) return JOURNAL_IO;
     int dfd=fcntl(j->directory_fd,F_DUPFD_CLOEXEC,0);
@@ -590,8 +623,9 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
     if(renamed) {
         int oldfd=j->disk.fd;
         j->disk=next->disk; next->disk.fd=-1; j->stats=next->stats; j->reserved=next->reserved;
-        for(unsigned i=0;i<2;i++) { j->batches[i].used=0; j->batches[i].sealed=0; }
+        for(unsigned i=0;i<2;i++) { j->batches[i].used=0; j->batches[i].sealed=0; j->batches[i].cached=0; }
         j->current=0; j->failed=false; j->append_error=0;
+        j->append_failed=false; j->append_pending=false; j->pending_sequence=0;
         j->limit=next->limit; j->disk.stats.checkpoint_bytes=checkpoint_bytes; j->stats.checkpoint_bytes=checkpoint_bytes;
         j->directory_pending=true;
         if(rc || io_sync(&j->io,j->directory_fd,true)) {

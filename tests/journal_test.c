@@ -40,6 +40,140 @@ static void blocked(work_ctx *c) { while (!work_should_stop(c)) pause_ms(); }
 static void route(const work_msg *m, void *ctx) { (void)journal_receive(ctx, m); }
 static int temp(char *p) { int fd = mkstemp(p); if (fd >= 0) close(fd); return fd; }
 
+typedef struct append_fault {
+    pthread_t owner;
+    unsigned attempts, syncs, worker_writes, fail_attempt;
+    int error;
+    size_t short_bytes;
+    bool wrong_thread;
+    uint64_t retry_offset;
+} append_fault;
+static ssize_t append_attempt(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    append_fault *f=ctx; f->attempts++;
+    if(!pthread_equal(pthread_self(),f->owner)) f->wrong_thread=true;
+    if(f->error && (!f->fail_attempt || f->attempts==f->fail_attempt)) { errno=f->error; return -1; }
+    if(f->short_bytes && n>f->short_bytes) n=f->short_bytes;
+    return pwrite(fd,p,n,(off_t)off);
+}
+static ssize_t append_worker_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    append_fault *f=ctx; f->worker_writes++;
+    if(pthread_equal(pthread_self(),f->owner)) f->wrong_thread=true;
+    if(f->worker_writes==1) f->retry_offset=off;
+    return pwrite(fd,p,n,(off_t)off);
+}
+static int append_worker_sync(void *ctx, int fd, bool directory)
+{
+    append_fault *f=ctx;
+    if(directory) return fsync(fd);
+    f->syncs++;
+    if(pthread_equal(pthread_self(),f->owner)) f->wrong_thread=true;
+    return fdatasync(fd);
+}
+/* Read-only replay while the writer is live: replay_file would truncate a
+ * partial suffix, so use an independently read byte image instead. */
+static int cache_replay(const char *path, model *m, journal_replay_result *rr)
+{
+    uint8_t bytes[16384]; int fd=open(path,O_RDONLY); if(fd<0) return JOURNAL_IO;
+    ssize_t n=read(fd,bytes,sizeof bytes); close(fd);
+    return n<0?JOURNAL_IO:journal_replay_bytes(bytes,(size_t)n,apply,m,rr);
+}
+static int page_cache_test(void)
+{
+    char path[]="/tmp/journal-cache-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    append_fault f={.owner=pthread_self()};
+    journal_io io={.ctx=&f,.append_write=append_attempt,.write=append_worker_write,.sync=append_worker_sync};
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    work_handle blocker=work_submit(&pool,(work_job){blocked,NULL,0,WORK_BULK}); CHECK(blocker.epoch);
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
+    model m={0}; journal_replay_result rr;
+    CHECK(cache_replay(path,&m,&rr)==0 && !rr.corrupt && rr.last_sequence==1 && m.len==1 && m.text[0]=='a');
+    CHECK(journal_get_stats(j).written_sequence==1 && journal_get_stats(j).durable_sequence==0);
+    CHECK(f.attempts==1 && !f.syncs && !f.worker_writes);
+    CHECK(journal_pump(j,1,true)==0); /* PAD precedes the next batch, worker blocked */
+    CHECK(journal_insert(j,1,1,(const uint8_t *)"b",1)==0);
+    m=(model){0}; CHECK(cache_replay(path,&m,&rr)==0 && !rr.corrupt && rr.last_sequence==2 && m.len==2 && !memcmp(m.text,"ab",2));
+    CHECK(journal_get_stats(j).written_sequence==2 && journal_get_stats(j).durable_sequence==0 && !f.syncs);
+    work_cancel(&pool,blocker);
+    unsigned wait=0; while(atomic_load(&pool.mb[0].head)==atomic_load(&pool.mb[0].tail) && wait++<2000) pause_ms(); CHECK(wait<2000);
+    work_mailbox_drain(&pool,route,j);
+    CHECK(journal_get_stats(j).written_sequence==2 && journal_get_stats(j).durable_sequence==1 && journal_get_stats(j).file_bytes>=4096+41);
+    CHECK(journal_flush(j)==0);
+    CHECK(journal_get_stats(j).written_sequence==2 && journal_get_stats(j).durable_sequence==2);
+    CHECK(!f.wrong_thread && f.syncs && !f.worker_writes);
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: page cache ok (before pump, blocked worker, PAD gap, completion preserves UI prefix)"); return 0;
+}
+static int append_failure_test(void)
+{
+    const int errors[]={EAGAIN,ENOSPC,EIO,EINTR,0};
+    for(size_t k=0;k<sizeof errors/sizeof errors[0];k++) {
+        char path[]="/tmp/journal-append-error-XXXXXX"; CHECK(temp(path)>=0);
+        work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+        append_fault f={.owner=pthread_self()};
+        journal_io io={.ctx=&f,.append_write=append_attempt,.write=append_worker_write,.sync=append_worker_sync};
+        journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+        CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
+        f.error=errors[k]; f.short_bytes=k==4?17u:0u;
+        edit_malloc_guard_begin();
+        int rc=journal_insert(j,1,1,(const uint8_t *)"b",1);
+        size_t allocations=edit_malloc_guard_end(); CHECK(rc==JOURNAL_IO && allocations==0);
+        CHECK(f.attempts==2 && !f.worker_writes && !f.syncs);
+        journal_stats st=journal_get_stats(j);
+        CHECK(st.error==JOURNAL_IO && st.accepted_sequence==2 && st.written_sequence==1 && st.durable_sequence==0);
+        CHECK(journal_insert(j,1,2,(const uint8_t *)"c",1)==JOURNAL_IO && f.attempts==2);
+        f.error=0; f.short_bytes=0;
+        CHECK(journal_flush(j)==JOURNAL_IO); /* worker drains, sticky error remains */
+        CHECK(journal_get_stats(j).durable_sequence==2 && !f.wrong_thread);
+        CHECK(f.retry_offset==41+(k==4?17u:0u));
+        CHECK(journal_retry(j)==0 && journal_insert(j,1,2,(const uint8_t *)"c",1)==0 && journal_flush(j)==0);
+        model m={0}; journal_replay_result rr;
+        CHECK(cache_replay(path,&m,&rr)==0 && !rr.corrupt && rr.last_sequence==3 && m.len==3 && !memcmp(m.text,"abc",3));
+        journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    }
+    puts("journal_test: append failures ok (EAGAIN/ENOSPC/EIO/EINTR/short, single attempt, retained worker retry, sticky IO, allocations=0)"); return 0;
+}
+static int append_gap_test(void)
+{
+    char path[]="/tmp/journal-append-gap-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    append_fault f={.owner=pthread_self()};
+    journal_io io={.ctx=&f,.append_write=append_attempt,.write=append_worker_write,.sync=append_worker_sync};
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
+    f.error=EAGAIN;
+    CHECK(journal_pump(j,1,true)==JOURNAL_IO); /* PAD failure is reported, worker owns retry */
+    CHECK(journal_insert(j,1,1,(const uint8_t *)"b",1)==JOURNAL_IO);
+    CHECK(journal_flush(j)==JOURNAL_IO && journal_get_stats(j).durable_sequence==1);
+    CHECK(f.retry_offset==41 && !f.wrong_thread);
+    f.error=0; CHECK(journal_retry(j)==0);
+    CHECK(journal_insert(j,1,1,(const uint8_t *)"b",1)==0 && journal_flush(j)==0);
+    model m={0}; journal_replay_result rr;
+    CHECK(cache_replay(path,&m,&rr)==0 && !rr.corrupt && rr.last_sequence==2 && m.len==2 && !memcmp(m.text,"ab",2));
+    journal_close(j);
+    int fd=open(path,O_WRONLY|O_TRUNC); CHECK(fd>=0); close(fd);
+    f=(append_fault){.owner=pthread_self(),.error=EIO,.fail_attempt=2};
+    CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    size_t size=JOURNAL_MAX_RECORD; uint8_t *bytes=malloc(size); CHECK(bytes); memset(bytes,'q',size);
+    edit_malloc_guard_begin(); int rc=journal_insert(j,1,0,bytes,size);
+    size_t allocations=edit_malloc_guard_end(); CHECK(rc==JOURNAL_IO && allocations==0);
+    CHECK(journal_get_stats(j).accepted_sequence==2 && journal_get_stats(j).written_sequence==1 && f.attempts==2);
+    /* Clearing suspension before drain cannot allow offsets after the gap. */
+    CHECK(journal_retry(j)==0 && journal_insert(j,1,size,(const uint8_t *)"!",1)==JOURNAL_BUSY);
+    CHECK(journal_flush(j)==0 && journal_get_stats(j).durable_sequence==2);
+    f.error=0; CHECK(journal_insert(j,1,size,(const uint8_t *)"!",1)==0 && journal_flush(j)==0);
+    journal_close(j);
+    piece_allocator a=piece_default_allocator(); piece_tree *tree=piece_create(&a); CHECK(tree);
+    CHECK(journal_replay_file(path,apply_tree,tree,&rr)==0 && !rr.corrupt && rr.last_sequence==3 && piece_len(tree)==size+1);
+    uint8_t block[4096];
+    for(size_t off=0;off<size;off+=sizeof block) CHECK(piece_read(tree,off,block,sizeof block)==0 && !memcmp(block,bytes+off,sizeof block));
+    CHECK(piece_read(tree,size,block,1)==0 && block[0]=='!');
+    piece_destroy(tree); free(bytes); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: append gaps ok (PAD failure surfaced, split INSERT suffix retained, retry blocks later offsets)"); return 0;
+}
+
 /* Volatile POSIX files and a separate simulated power-loss image. Only data
  * sync copies bytes, and only directory sync commits the journal's name. */
 #define IMAGE_SIZE 300000u
@@ -53,8 +187,15 @@ typedef struct fault_disk {
     unsigned fail_write, fail_sync, fail_dir;
     int fail_rename; /* 1 before, 2 after replacement */
     bool short_write;
+    size_t append_limit;
     uint64_t retry_offset;
 } fault_disk;
+static ssize_t fault_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    fault_disk *d=ctx;
+    if(d->append_limit && n>d->append_limit) n=d->append_limit;
+    return pwrite(fd,p,n,(off_t)off);
+}
 static ssize_t fault_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
 {
     fault_disk *d=ctx; d->writes++;
@@ -93,7 +234,7 @@ static int fault_rename(void *ctx, const char *from, const char *to)
     return 0;
 }
 static journal_io fault_io(fault_disk *d)
-{ return (journal_io){.ctx=d,.write=fault_write,.sync=fault_sync,.rename=fault_rename}; }
+{ return (journal_io){.ctx=d,.write=fault_write,.sync=fault_sync,.rename=fault_rename,.append_write=fault_append}; }
 static int durable_replay(fault_disk *d, model *m, journal_replay_result *rr)
 {
     for(size_t i=0;i<d->images;i++) if(d->image[i].inode==d->durable_name)
@@ -103,7 +244,7 @@ static int durable_replay(fault_disk *d, model *m, journal_replay_result *rr)
 static int retry_test(void)
 {
     char path[]="/tmp/journal-retry-XXXXXX"; CHECK(temp(path)>=0);
-    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; d->short_write=true; d->fail_write=2;
+    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; d->fail_sync=1;
     journal_io io=fault_io(d); work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
     journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
     uint8_t *big=malloc(200000); CHECK(big); memset(big,'q',200000);
@@ -112,10 +253,10 @@ static int retry_test(void)
     CHECK(journal_insert(j,1,200000,(const uint8_t *)"!",1)==0); /* second batch */
     CHECK(journal_flush(j)==JOURNAL_IO);
     journal_stats st=journal_get_stats(j);
-    CHECK(st.accepted_sequence==2 && st.written_sequence==0 && st.durable_sequence==0);
+    CHECK(st.accepted_sequence==2 && st.written_sequence==2 && st.durable_sequence==0);
     CHECK(journal_retry(j)==JOURNAL_OK);
     CHECK(journal_flush(j)==0);
-    CHECK(d->retry_offset==17); /* resume the short write, never discard it */
+    CHECK(d->writes==0); /* already cached bytes are never rewritten */
     st=journal_get_stats(j); CHECK(st.accepted_sequence==2 && st.durable_sequence==2);
     journal_close(j);
     piece_allocator a=piece_default_allocator(); piece_tree *tree=piece_create(&a); CHECK(tree);
@@ -128,7 +269,7 @@ static int retry_test(void)
     memset(d,0,sizeof *d); d->path=path; io=fault_io(d);
     CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
     CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0 && journal_flush(j)==0);
-    d->fail_write=d->writes+2;
+    d->fail_sync=d->syncs+1;
     CHECK(journal_insert(j,1,1,big,200000)==0 && journal_pump(j,1,true)==0);
     CHECK(journal_insert(j,1,200001,(const uint8_t *)"!",1)==0 && journal_flush(j)==JOURNAL_IO);
     CHECK(journal_get_stats(j).accepted_sequence==3 && journal_get_stats(j).durable_sequence==1);
@@ -140,7 +281,7 @@ static int retry_test(void)
     uint64_t last_off=200001;
     for(unsigned k=0;k<8;k++) last_op[k]=(uint8_t)(last_off>>(k*8));
     journal_record complete[]={{JOURNAL_INSERT,1,0,first,9},{JOURNAL_INSERT,1,0,whole,200008},{JOURNAL_INSERT,1,0,last_op,9}};
-    d->fail_write=0; CHECK(journal_rotate(j,complete,3)==0);
+    d->fail_sync=0; CHECK(journal_rotate(j,complete,3)==0);
     CHECK(journal_get_stats(j).durable_sequence==3 && journal_get_stats(j).error==0); journal_close(j);
     tree=piece_create(&a); CHECK(tree && journal_replay_file(path,apply_tree,tree,&rr)==0);
     CHECK(piece_len(tree)==200002 && piece_read(tree,200001,&last,1)==0 && last=='!');
@@ -157,7 +298,7 @@ static int retry_test(void)
     CHECK(journal_get_stats(j).durable_sequence==1); /* retry preserves the force request */
     journal_close(j);
     free(whole); free(big); free(d); work_pool_shutdown(&pool); unlink(path);
-    puts("journal_test: retry ok (short write + EIO, two batches, exact offset, checkpoint replacement)"); return 0;
+    puts("journal_test: retry ok (sync EIO, two cached batches, no rewrites, checkpoint replacement)"); return 0;
 }
 static int barriers_test(void)
 {
@@ -170,7 +311,8 @@ static int barriers_test(void)
      * volatile bytes after the first data sync: exact surviving prefix is 1. */
     CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
     uint8_t big[70000]; memset(big,'b',sizeof big);
-    CHECK(journal_insert(j,1,1,big,sizeof big)==0); d->fail_write=2;
+    d->append_limit=65536-41; /* short UI write ends inside record at the sync boundary */
+    CHECK(journal_insert(j,1,1,big,sizeof big)==JOURNAL_IO); d->append_limit=0; d->fail_write=1;
     CHECK(journal_flush(j)==JOURNAL_IO);
     CHECK(journal_get_stats(j).durable_sequence==1);
     model m={0}; journal_replay_result rr; CHECK(durable_replay(d,&m,&rr)==0);
@@ -918,6 +1060,9 @@ static int exact_prefix_test(void)
 int main(int argc, char **argv)
 {
     if(argc==2) {
+        if(!strcmp(argv[1],"--page-cache")) return page_cache_test();
+        if(!strcmp(argv[1],"--append-failure")) return append_failure_test();
+        if(!strcmp(argv[1],"--append-gap")) return append_gap_test();
         if(!strcmp(argv[1],"--open-options")) return open_options_test();
         if(!strcmp(argv[1],"--rotate-path")) return rotate_path_test();
         if(!strcmp(argv[1],"--directory-fd")) return directory_fd_test();
@@ -943,6 +1088,7 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--retained-copy")) return retained_copy_test();
         return 2;
     }
+    CHECK(page_cache_test()==0 && append_failure_test()==0 && append_gap_test()==0);
     CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
     CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && worker_test()==0 &&

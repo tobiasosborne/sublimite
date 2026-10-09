@@ -56,7 +56,16 @@ static void structured_bytes(const uint8_t *data, size_t size)
     for(unsigned k=0;k<4;k++) wire[12+k]=(uint8_t)(crc>>(8*k));
     no_visit(wire,total);
 }
-typedef struct fuzz_io { unsigned writes, syncs; bool write_error, sync_error; } fuzz_io;
+typedef struct fuzz_io { unsigned writes, syncs, appends; bool write_error, sync_error; int append_error; } fuzz_io;
+static ssize_t fuzz_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    fuzz_io *f=ctx; f->appends++;
+    if(f->write_error && f->appends==1) {
+        if(f->append_error) { errno=f->append_error; return -1; }
+        if(n>17) n=17;
+    }
+    return pwrite(fd,p,n,(off_t)off);
+}
 static ssize_t fuzz_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
 {
     fuzz_io *f=ctx; f->writes++;
@@ -80,7 +89,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     char path[]="/tmp/journal-fuzz-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 0; close(fd);
     work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return 0; }
     fuzz_io faults={.write_error=(data[0]&64u)!=0,.sync_error=(data[0]&128u)!=0};
-    journal_io io={.ctx=&faults,.write=fuzz_write,.sync=fuzz_sync};
+    const int errors[]={0,EAGAIN,ENOSPC,EIO}; faults.append_error=errors[size>1?data[1]%4:0];
+    journal_io io={.ctx=&faults,.write=fuzz_write,.sync=fuzz_sync,.append_write=fuzz_append};
     journal *j=NULL; if(journal_open_with_io(&j,path,&pool,NULL,&io)) { work_pool_shutdown(&pool); unlink(path); return 0; }
     fuzz_model model={0}; journal_record operations[64]; uint8_t payloads[64][24]; size_t count=0, boundaries[65]={0};
     for(size_t i=1;i+2<size && count<64;i+=3) {
@@ -90,9 +100,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         for(unsigned k=0;k<8;k++) p[k]=(uint8_t)((uint64_t)off>>(8*k));
         if(del) p[8]=1; else memset(p+8,data[i+2],n);
         journal_record r={(uint32_t)(del?JOURNAL_DELETE:JOURNAL_INSERT),1,count+1,p,del?16:n+8};
-        EDIT_ASSERT(journal_append(j,r.type,r.buffer_id,r.data,r.size)==0);
+        int append_rc=journal_append(j,r.type,r.buffer_id,r.data,r.size);
+        EDIT_ASSERT(append_rc==0 || append_rc==JOURNAL_IO);
         EDIT_ASSERT(apply(&model,&r)==0); operations[count]=r;
         boundaries[count+1]=boundaries[count]+JOURNAL_HEADER+r.size; count++;
+        EDIT_ASSERT(journal_get_stats(j).accepted_sequence==count);
+        if(append_rc==JOURNAL_IO) break; /* retained op, sticky suspension forbids later offsets */
+        /* Before pump/flush, every successful wire record must already replay. */
+        uint8_t cached[8192]; fd=open(path,O_RDONLY); EDIT_ASSERT(fd>=0);
+        ssize_t cache_size=read(fd,cached,sizeof cached); close(fd); EDIT_ASSERT(cache_size>=0);
+        fuzz_model prefix={0}; journal_replay_result cr;
+        EDIT_ASSERT(journal_replay_bytes(cached,(size_t)cache_size,apply,&prefix,&cr)==0 && !cr.corrupt);
+        EDIT_ASSERT(cr.last_sequence==count && prefix.edits==count && prefix.size==model.size && !memcmp(prefix.bytes,model.bytes,model.size));
     }
     int flush_rc=journal_flush(j);
     for(unsigned retries=0;flush_rc==JOURNAL_IO && retries<2;retries++) {

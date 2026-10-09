@@ -8,9 +8,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Full script has 100000 edits. The kill target is uniform in [1,100000].
+/* Full script has 100000 edits. Trial zero kills before any pump; the remaining
+ * kill targets are uniform in [1,100000].
  * Shared progress is test instrumentation only; journal uses work mailboxes. */
-typedef struct progress { _Atomic uint64_t issued, acknowledged; _Atomic int ready, error; } progress;
+typedef struct progress { _Atomic uint64_t issued, page_cache, acknowledged; _Atomic int ready, error; } progress;
 typedef struct kill_model { uint8_t data[256]; size_t len; uint64_t rng, edits; } kill_model;
 static uint64_t random_next(kill_model *m)
 { uint64_t x=m->rng; x^=x<<13; x^=x>>7; x^=x<<17; m->rng=x; return x; }
@@ -57,15 +58,20 @@ static kill_model expected_prefix(uint64_t seed, uint64_t count)
     return m;
 }
 static void receive(const work_msg *m, void *ctx) { (void)journal_receive(ctx,m); }
-static void child_run(const char *path, progress *p, uint64_t seed)
+static void child_run(const char *path, progress *p, uint64_t seed, bool before_pump)
 {
     work_pool pool; journal *j=NULL;
     journal_options opt={.batch_bytes=1048576,.max_file_bytes=16777216};
     if(work_pool_init(&pool,1,0) || journal_open(&j,path,&pool,&opt)) { atomic_store(&p->error,1); _exit(2); }
     kill_model model={.rng=seed}; atomic_store_explicit(&p->ready,1,memory_order_release);
     for(uint64_t i=0;i<100000;i++) {
-        if(operation(&model,j,NULL)) { atomic_store(&p->error,2); _exit(3); }
+        /* issued is an upper bound even if SIGKILL interrupts append between
+         * its write and publication below. Successful return is the page-cache
+         * commit point required by P1.9g, independently of durable ack/pump. */
         atomic_store_explicit(&p->issued,i+1,memory_order_release);
+        if(operation(&model,j,NULL)) { atomic_store(&p->error,2); _exit(3); }
+        atomic_store_explicit(&p->page_cache,i+1,memory_order_release);
+        if(before_pump) for(;;) nap();
         if((i&255u)==255u) {
             work_mailbox_drain(&pool,receive,j);
             atomic_store_explicit(&p->acknowledged,journal_get_stats(j).durable_sequence,memory_order_release);
@@ -90,23 +96,23 @@ int main(int argc, char **argv)
     if(!trials || trials>10000) return 2;
     progress *p=mmap(NULL,sizeof *p,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     if(p==MAP_FAILED) return 2;
-    uint64_t total_replayed=0, total_issued=0, total_ack=0;
+    uint64_t total_replayed=0, total_issued=0, total_cache=0, total_ack=0;
     for(unsigned t=0;t<trials;t++) {
-        atomic_init(&p->issued,0); atomic_init(&p->acknowledged,0); atomic_init(&p->ready,0); atomic_init(&p->error,0);
+        atomic_init(&p->issued,0); atomic_init(&p->page_cache,0); atomic_init(&p->acknowledged,0); atomic_init(&p->ready,0); atomic_init(&p->error,0);
         uint64_t seed=0x9e3779b97f4a7c15ull^(uint64_t)(t+1)*0x100000001b3ull;
         kill_model target_model={.rng=seed^0x123456789abcdefull};
-        uint64_t target=1+random_next(&target_model)%100000;
+        uint64_t target=t==0?1:1+random_next(&target_model)%100000;
         char path[]="/tmp/journal-kill-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 2; close(fd);
         pid_t child=fork(); if(child<0) return 2;
-        if(child==0) child_run(path,p,seed);
+        if(child==0) child_run(path,p,seed,t==0);
         uint64_t start=now_ns(); bool timed_out=false;
-        while(!atomic_load_explicit(&p->ready,memory_order_acquire) || atomic_load_explicit(&p->issued,memory_order_acquire)<target) {
+        while(!atomic_load_explicit(&p->ready,memory_order_acquire) || atomic_load_explicit(&p->page_cache,memory_order_acquire)<target) {
             if(atomic_load(&p->error) || now_ns()-start>10000000000ull) { timed_out=true; break; }
             nap();
         }
         if(kill(child,SIGKILL)) return 2;
         int status=0; while(waitpid(child,&status,0)<0) if(errno!=EINTR) return 2;
-        uint64_t issued=atomic_load(&p->issued), ack=atomic_load(&p->acknowledged);
+        uint64_t issued=atomic_load(&p->issued), cached=atomic_load(&p->page_cache), ack=atomic_load(&p->acknowledged);
         piece_allocator a=piece_default_allocator();
         recovery restored={.script={.rng=seed},.tree=piece_create(&a)}; if(!restored.tree) return 2;
         journal_replay_result rr; int rc=journal_replay_file(path,replay,&restored,&rr);
@@ -115,12 +121,12 @@ int main(int argc, char **argv)
         bool tree_equal=piece_len(restored.tree)==expected.len &&
             piece_read(restored.tree,0,tree_bytes,expected.len)==0 && !memcmp(tree_bytes,expected.data,expected.len);
         piece_destroy(restored.tree);
-        if(timed_out || atomic_load(&p->error) || !WIFSIGNALED(status) || WTERMSIG(status)!=SIGKILL || rc || !tree_equal || rr.last_sequence!=actual.edits || actual.edits>issued || actual.edits<ack || actual.len!=expected.len || memcmp(actual.data,expected.data,actual.len)) {
-            fprintf(stderr,"journal_kill_test: FAIL trial=%u target=%llu issued=%llu ack=%llu replay=%llu rc=%d error=%d\n",t,(unsigned long long)target,(unsigned long long)issued,(unsigned long long)ack,(unsigned long long)actual.edits,rc,atomic_load(&p->error)); unlink(path); return 1;
+        if(timed_out || atomic_load(&p->error) || !WIFSIGNALED(status) || WTERMSIG(status)!=SIGKILL || rc || !tree_equal || rr.last_sequence!=actual.edits || actual.edits>issued || actual.edits<cached || actual.edits<ack || actual.len!=expected.len || memcmp(actual.data,expected.data,actual.len)) {
+            fprintf(stderr,"journal_kill_test: FAIL trial=%u target=%llu issued=%llu page_cache=%llu ack=%llu replay=%llu rc=%d error=%d\n",t,(unsigned long long)target,(unsigned long long)issued,(unsigned long long)cached,(unsigned long long)ack,(unsigned long long)actual.edits,rc,atomic_load(&p->error)); unlink(path); return 1;
         }
-        total_issued+=issued; total_replayed+=actual.edits; total_ack+=ack; unlink(path);
+        total_issued+=issued; total_cache+=cached; total_replayed+=actual.edits; total_ack+=ack; unlink(path);
     }
     munmap(p,sizeof *p);
-    printf("journal_kill_test: ok trials=%u script_edits=100000 issued=%llu replayed=%llu acknowledged=%llu (ack<=replayed<=issued; piece_tree==independent_byte_model_at_replayed)\n",trials,(unsigned long long)total_issued,(unsigned long long)total_replayed,(unsigned long long)total_ack);
+    printf("journal_kill_test: ok trials=%u script_edits=100000 issued=%llu page_cache=%llu replayed=%llu acknowledged=%llu (page_cache<=replayed<=issued; piece_tree==independent_byte_model_at_replayed; trial0=kill_before_pump)\n",trials,(unsigned long long)total_issued,(unsigned long long)total_cache,(unsigned long long)total_replayed,(unsigned long long)total_ack);
     return 0;
 }
