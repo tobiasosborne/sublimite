@@ -180,4 +180,75 @@ void piece_iter_begin_snapshot(piece_iter *it, const piece_snapshot *s, uint64_t
 /* Returns 1 and sets *p,*n for the next span, or 0 at end. */
 int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n);
 
+/* ---- P1.3c amendment: atomic edit checkpoint (frozen contract) ----
+ *
+ * UI-thread only, including begin/commit/abort. A tree has at most ONE active
+ * checkpoint; different trees may each have one. The tree must outlive it.
+ * commit/abort require a live checkpoint and consume it exactly once; using
+ * a consumed handle, or destroying its tree while it is active, is caller error.
+ *
+ * begin: PIECE_OK with a non-NULL *out, or PIECE_ERR_NOMEM with unchanged
+ * tree content and *out == NULL. It may reserve memory through the tree's
+ * existing piece_allocator. NULL t, NULL out, or a nested begin returns
+ * PIECE_ERR_RANGE; if out is non-NULL, *out is set to NULL on every failure.
+ * A failed begin neither opens nor ends a checkpoint (including a nested one).
+ *
+ * commit: preserve current content and end the checkpoint. Allocates nothing
+ * (no allocator alloc requests, even ones that would fail) and cannot fail.
+ *
+ * abort: restore the EXACT pre-begin bytes, length, line counts, piece counts,
+ * and everything else observable through piece.h queries. Restore the append
+ * coalescing/control state too, so the next edit behaves as if the aborted
+ * edits never happened. Allocates nothing and cannot fail even if EVERY
+ * allocator request after begin returns NULL. It ends the checkpoint.
+ * begin and a commit with no intervening mutation do not break an append run.
+ * Tree iterators/spans follow the existing mutation lifetime rule: abort is a
+ * mutation; restoration does not revive an iterator invalidated by an edit.
+ *
+ * SNAPSHOTS AND REFS: snapshots and piece_refs made BEFORE begin stay valid
+ * across both commit and abort. Snapshots taken INSIDE also stay valid and
+ * keep their own content after abort, later edits and tree destruction; abort
+ * must never overwrite/reuse their live add storage. Refs first produced
+ * inside a COMMITTED checkpoint retain the usual tree-lifetime validity.
+ *
+ * P1.3c exception to P1.3b's lifetime/append-only rule above: refs FIRST
+ * PRODUCED inside an ABORTED checkpoint are invalid; callers must discard
+ * them, even if they describe older add bytes. piece_insert_ref MUST return
+ * PIECE_ERR_RANGE without changing content when invalidity is cheaply
+ * detectable. In particular, a span outside the restored logical add-buffer
+ * high-water mark is RANGE, even when a snapshot retains its physical storage.
+ * Old-range aliases (including empty refs), or offsets reused by later edits,
+ * cannot necessarily be distinguished with the frozen piece_ref layout:
+ * using such an invalid ref is caller error, with no guaranteed return value.
+ * Implementations must document any further detection limitations. No new
+ * per-edit generation bookkeeping is required solely to detect these aliases.
+ *
+ * MEMORY (G10f): all checkpoint reservations, retained roots/path copies and
+ * transaction add bytes are charged while active. Its retained root uses the
+ * existing live-snapshot path-copy allowance. Abort reclaims transaction-only
+ * add bytes/reservations and returns copied nodes to the pool; bounded caches
+ * remain charged to G10f. Repeated begin/abort with no surviving intermediate
+ * snapshots must fit the restored tree's bound WITHOUT accumulating aborted
+ * typed/deleted-byte allowances or hidden retention. Bytes/nodes needed by a
+ * surviving intermediate snapshot remain charged as that snapshot's retained
+ * content/path copies until release; only that ownership may defer reclamation.
+ * Logical add-tail truncation must preserve these immutable snapshot owners.
+ *
+ * PERFORMANCE CONTRACT: when no checkpoint is active, checkpoint support
+ * adds at most ONE predictable branch on the edit path; no checkpoint-driven
+ * allocation, copying, traversal or per-edit accounting in that case.
+ *
+ * Intended implementation (informative; binding in spirit for edit-4w1.37):
+ * checkpoint = retained root (as a snapshot) + add-buffer high-water mark +
+ * counts/control state; abort = swap the retained root back, truncate the
+ * logical add buffer to the mark, return path-copied nodes to the pool;
+ * commit = drop the retained root. Snapshot-owned add tails must remain
+ * immutable without allocator help during abort. Flat-buffer copies are for
+ * the reference model only, not the kernel typing path.
+ */
+typedef struct piece_checkpoint piece_checkpoint;
+int  piece_checkpoint_begin(piece_tree *t, piece_checkpoint **out);
+void piece_checkpoint_commit(piece_checkpoint *c);
+void piece_checkpoint_abort(piece_checkpoint *c);
+
 #endif

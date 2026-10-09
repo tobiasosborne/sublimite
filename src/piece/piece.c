@@ -6,6 +6,7 @@
 #include "base/base.h"
 #include "scan/scan.h"
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,13 +35,14 @@
 #define UNK TOP
 #define LEAF_SZ 272u
 #define BRANCH_SZ 400u
+#define SNAPSHOT_SZ 80u
 #define MAXH 32
 
 typedef struct node node;
 struct node {
     atomic_uint rc;
     uint16_t cnt, leaf;
-    node *nextfree; /* only used after the last owner releases the node */
+    union { node *nextfree; uint64_t add_high; }; /* free link or live ADD high-water */
     union {
         struct { uint32_t b[FAN], nl[FAN]; uint64_t x[FAN]; } l;
         struct { uint64_t b[FAN], nl[FAN]; node *ch[FAN]; } in;
@@ -55,16 +57,32 @@ typedef struct node_pool {
 
 typedef struct { uint64_t b, nl, x; } ent;
 
-typedef struct retired { uint8_t **p; size_t cap; } retired;
-
-typedef struct core {
+typedef struct add_chunk { atomic_uint rc; uint8_t data[65536]; } add_chunk;
+typedef struct retired { add_chunk **p; size_t cap; } retired;
+/* Append-only within one view. Only checkpoint rollback forks the directory;
+ * snapshots retain their original view and its immutable published prefix. */
+typedef struct add_store {
     atomic_uint rc;
+    _Atomic(add_chunk **) tbl;
+    size_t cap, nch;
+    retired ret[24]; int nret, sealed;
+    pthread_mutex_t mu;
+    piece_snapshot *snapshots;
+    atomic_uint_fast64_t live_high;
+} add_store;
+
+typedef struct orig_store {
+    atomic_uint rc; const uint8_t *data; size_t len; int owned, has_mh;
+    piece_map_hooks mh;
+} orig_store;
+typedef struct core {
+    atomic_uint rc; atomic_uint_fast64_t external;
     piece_allocator a;
     piece_map_hooks mh; int has_mh;
     const uint8_t *orig; size_t orig_len; int orig_owned;
-    _Atomic(uint8_t **) tbl; size_t tblcap, nch;
-    retired ret[24]; int nret;
-    node_pool pool[2]; /* leaf/snapshot and branch, owner allocates; any thread returns */
+    add_store *add; orig_store *original;
+    pthread_mutex_t pool_mu;
+    node_pool pool[3]; /* leaves, branches, compact snapshot headers */
 #ifdef PIECE_TESTING
     piece_test_stats stats;
 #endif
@@ -72,15 +90,24 @@ typedef struct core {
 
 struct piece_tree {
     core *c; node *root; int height; piece_snapshot *cached_snapshot;
-    uint64_t add_len; int inited, mapped;
+    piece_checkpoint *checkpoint;
+    uint64_t add_len, deleted_original, fallback_add; int inited, mapped;
     int run_valid; uint64_t run_end, run_addend;
     uint64_t len;
     node *cursor[MAXH]; unsigned cursor_i[MAXH];
     unsigned cursor_depth, cursor_slot; uint64_t cursor_start; int cursor_valid;
 };
 
-struct piece_snapshot { atomic_uint rc; core *c; node *root; uint64_t len; int has_mh; };
-_Static_assert(sizeof(struct piece_snapshot) <= LEAF_SZ, "snapshot header fits a node block");
+struct piece_snapshot {
+    atomic_uint rc; core *c; node *root; uint64_t len; int has_mh;
+    add_store *add; uint64_t add_len;
+    piece_snapshot *prev, *next; orig_store *original;
+};
+struct piece_checkpoint {
+    piece_tree *tree; piece_snapshot *snapshot; add_store *restore;
+    piece_tree saved; int boundary_private;
+};
+_Static_assert(sizeof(struct piece_snapshot) <= SNAPSHOT_SZ, "snapshot header fits its compact block");
 
 /* Public mutations reject growth before touching storage. Every internal
  * length update is consequently bounded by that preflight (or a reserved add
@@ -121,8 +148,8 @@ static inline uint64_t entry_x(const node *n, unsigned i) {
 static inline void entry_x_set(node *n, unsigned i, uint64_t x) {
     if (n->leaf) n->v.l.x[i] = x; else n->v.in.ch[i] = (node *)(uintptr_t)x;
 }
-static size_t slab_nodes(size_t k) { (void)k; return 4; }
-static size_t slot_size(unsigned p) { return p == 0 ? LEAF_SZ : BRANCH_SZ; }
+static size_t slab_nodes(size_t k) { (void)k; return 2; }
+static size_t slot_size(unsigned p) { return p == 0 ? LEAF_SZ : p == 1 ? BRANCH_SZ : SNAPSHOT_SZ; }
 static int pool_slab(core *c, unsigned pi) {
     node_pool *p = &c->pool[pi]; size_t nn = slab_nodes(p->nslabs), slot = slot_size(pi);
     size_t sz = nn * slot + 16;
@@ -156,26 +183,29 @@ static node *pool_get(core *c, unsigned pi) {
     return n;
 }
 static void pool_free(core *c, node *n, unsigned pi) { /* any thread */
+    pthread_mutex_lock(&c->pool_mu);
     node_pool *p = &c->pool[pi];
     atomic_store_explicit(&n->rc, 0, memory_order_relaxed);
     POISON((uint8_t *)n + 16, slot_size(pi) - 16);
     node *h = atomic_load_explicit(&p->remote, memory_order_relaxed);
     do { n->nextfree = h; } while (!atomic_compare_exchange_weak_explicit(&p->remote, &h, n, memory_order_release, memory_order_relaxed));
     atomic_fetch_add_explicit(&p->returned, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&c->pool_mu);
 }
 static node *node_new(core *c, int leaf) {
     node *n = pool_get(c, leaf ? 0u : 1u);
-    atomic_init(&n->rc, 1); n->cnt = 0; n->leaf = (uint16_t)leaf;
+    atomic_init(&n->rc, 1); n->cnt = 0; n->leaf = (uint16_t)leaf; n->add_high = 0;
     return n;
 }
-/* Reclaim wholly free slabs on the owner after a burst of releases. The core
- * reference is dropped after the remote push, so rc==1 also synchronizes with
- * the last snapshot releaser. No producer can then touch these free lists. */
-static void pool_trim(core *c, int force) {
-    if (atomic_load_explicit(&c->rc, memory_order_acquire) != 1) return;
+/* Coarse whole-slab trimming remains for the separate performance bead.
+ * Reservations, return completion and core teardown share pool_mu, so the last
+ * snapshot releaser may trim immediately without racing an owner reservation.
+ * force==2 is unused-reservation rollback, also safe with pinned snapshots. */
+static void pool_trim_locked(core *c, int force) {
+    if (force != 2 && atomic_load_explicit(&c->rc, memory_order_acquire) != 1) return;
     if (!force && atomic_load_explicit(&c->pool[0].returned, memory_order_relaxed) < 64 &&
         atomic_load_explicit(&c->pool[1].returned, memory_order_relaxed) < 64) return;
-    for (unsigned pi = 0; pi < 2; pi++) {
+    for (unsigned pi = 0; pi < 3; pi++) {
         node_pool *p = &c->pool[pi]; void *slab = p->slabs;
         p->fl = NULL; p->nfree = 0; p->slabs = NULL; p->nslabs = 0;
         atomic_store_explicit(&p->remote, NULL, memory_order_relaxed);
@@ -202,18 +232,30 @@ static void pool_trim(core *c, int force) {
         }
     }
 }
+static void pool_trim(core *c, int force) {
+    pthread_mutex_lock(&c->pool_mu);
+    pool_trim_locked(c, force);
+    pthread_mutex_unlock(&c->pool_mu);
+}
+static int pool_done(core *c, int result) {
+    pthread_mutex_unlock(&c->pool_mu); return result;
+}
 /* A leaf root needs only its own possible COW/split. At greater heights a
  * delete visits two boundary paths and may own their merge neighbours. Small
  * fixed slabs keep these reservations inside the tiny-buffer G10f allowance. */
 static int reserve_delete(piece_tree *t, int snapshot) {
+    pthread_mutex_lock(&t->c->pool_mu);
     core *c = t->c; size_t h = (size_t)t->height;
     size_t leaves = h ? 4 : 2;
     size_t branches = h == 0 ? (t->root->cnt == FAN ? 1u : 0u) :
                       h == 1 ? (t->root->cnt == FAN ? 3u : 1u) : 4 * h - 1;
-    int r = pool_reserve_class(c, 0, leaves + (snapshot ? 1u : 0u));
-    return r ? r : pool_reserve_class(c, 1, branches);
+    int r = pool_reserve_class(c, 0, leaves);
+    if (!r) r = pool_reserve_class(c, 1, branches);
+    if (!r && snapshot) r = pool_reserve_class(c, 2, 1);
+    return r;
 }
 static int reserve_insert(piece_tree *t, size_t np) {
+    pthread_mutex_lock(&t->c->pool_mu);
     core *c = t->c; size_t h = (size_t)t->height, leaves, branches;
     if (!h && np <= (FAN - t->root->cnt) / 2u) {
         leaves = atomic_load_explicit(&t->root->rc, memory_order_acquire) > 1 ? 1u : 0u;
@@ -226,15 +268,18 @@ static int reserve_insert(piece_tree *t, size_t np) {
     return r ? r : pool_reserve_class(c, 1, branches);
 }
 
-static void node_unref(core *c, node *n) {
+static void node_unref_locked(core *c, node *n) {
     if (atomic_fetch_sub_explicit(&n->rc, 1, memory_order_acq_rel) != 1) return;
-    if (!n->leaf) for (unsigned i = 0; i < n->cnt; i++) node_unref(c, n->v.in.ch[i]);
+    if (!n->leaf) for (unsigned i = 0; i < n->cnt; i++) node_unref_locked(c, n->v.in.ch[i]);
     pool_free(c, n, n->leaf ? 0u : 1u);
+}
+static void node_unref(core *c, node *n) {
+    pthread_mutex_lock(&c->pool_mu); node_unref_locked(c, n); pthread_mutex_unlock(&c->pool_mu);
 }
 static node *cow(core *c, node *n) {
     if (atomic_load_explicit(&n->rc, memory_order_acquire) == 1) return n;
     node *m = node_new(c, (int)n->leaf);
-    m->cnt = n->cnt;
+    m->cnt = n->cnt; m->add_high = n->add_high;
 #ifdef PIECE_TESTING
     c->stats.pathcopy_bytes += n->leaf ? LEAF_SZ : BRANCH_SZ;
 #endif
@@ -247,15 +292,92 @@ static node *cow(core *c, node *n) {
 }
 
 /* ------------------------------------------------------------ core / add */
+static orig_store *orig_store_new(core *c, const uint8_t *data, size_t len, int owned,
+                                  const piece_map_hooks *hooks) {
+    orig_store *v = c->a.alloc(c->a.ctx, sizeof *v); if (!v) return NULL;
+    memset(v, 0, sizeof *v); atomic_init(&v->rc, 1); v->data = data; v->len = len; v->owned = owned;
+    if (hooks) { v->mh = *hooks; v->has_mh = 1; }
+    return v;
+}
+static void orig_store_unref(core *c, orig_store *v) {
+    if (!v || atomic_fetch_sub_explicit(&v->rc, 1, memory_order_acq_rel) != 1) return;
+    if (v->owned && v->len) c->a.free(c->a.ctx, (void *)(uintptr_t)v->data, v->len);
+    c->a.free(c->a.ctx, v, sizeof *v);
+}
+static void orig_store_install(core *c, orig_store *v) {
+    orig_store *old = c->original; c->original = v;
+    c->orig = v->data; c->orig_len = v->len; c->orig_owned = v->owned;
+    c->mh = v->mh; c->has_mh = v->has_mh; orig_store_unref(c, old);
+}
+static add_store *add_store_new(core *c) {
+    add_store *v = c->a.alloc(c->a.ctx, sizeof *v);
+    if (!v) return NULL;
+    memset(v, 0, sizeof *v); atomic_init(&v->rc, 1);
+    atomic_init(&v->tbl, NULL); atomic_init(&v->live_high, 0);
+    if (pthread_mutex_init(&v->mu, NULL)) { c->a.free(c->a.ctx, v, sizeof *v); return NULL; }
+    return v;
+}
+static void chunk_unref(core *c, add_chunk *ch) {
+    if (atomic_fetch_sub_explicit(&ch->rc, 1, memory_order_acq_rel) == 1)
+        c->a.free(c->a.ctx, ch, sizeof *ch);
+}
+static void add_store_unref(core *c, add_store *v) {
+    if (!v || atomic_fetch_sub_explicit(&v->rc, 1, memory_order_acq_rel) != 1) return;
+    add_chunk **tbl = atomic_load_explicit(&v->tbl, memory_order_relaxed);
+    for (size_t i = 0; i < v->nch; i++) chunk_unref(c, tbl[i]);
+    if (tbl) c->a.free(c->a.ctx, tbl, v->cap * sizeof *tbl);
+    for (int i = 0; i < v->nret; i++) c->a.free(c->a.ctx, v->ret[i].p, v->ret[i].cap * sizeof *tbl);
+    pthread_mutex_destroy(&v->mu); c->a.free(c->a.ctx, v, sizeof *v);
+}
+/* Called under the view lock. A sealed view has no writer; release can reclaim
+ * transaction-only chunks immediately, even while older snapshots survive. */
+static void add_store_prune(core *c, add_store *v) {
+    if (!v->sealed) return;
+    uint64_t high = 0;
+    for (piece_snapshot *s = v->snapshots; s; s = s->next)
+        if (s->add_len > high) high = s->add_len;
+    atomic_store_explicit(&v->live_high, high, memory_order_release);
+    size_t keep = (size_t)chunk_count(high);
+    add_chunk **tbl = atomic_load_explicit(&v->tbl, memory_order_relaxed);
+    while (v->nch > keep) chunk_unref(c, tbl[--v->nch]);
+}
+static add_store *add_store_prefix(core *c, uint64_t len) {
+    add_store *v = add_store_new(c); if (!v) return NULL;
+    size_t n = (size_t)chunk_count(len);
+    if (n) {
+        add_chunk **tbl = c->a.alloc(c->a.ctx, n * sizeof *tbl);
+        if (!tbl) { add_store_unref(c, v); return NULL; }
+        add_chunk **src = atomic_load_explicit(&c->add->tbl, memory_order_acquire);
+        for (size_t i = 0; i < n; i++) { tbl[i] = src[i]; atomic_fetch_add_explicit(&tbl[i]->rc, 1, memory_order_relaxed); }
+        atomic_store_explicit(&v->tbl, tbl, memory_order_relaxed); v->cap = n; v->nch = n;
+    }
+    return v;
+}
+/* Prepay a writable saved boundary before publishing the first snapshot
+ * that can observe transaction bytes in it. Abort itself only swaps storage;
+ * the restored edit path requires no checkpoint-specific allocation/copy. */
+static int checkpoint_snapshot_storage(piece_tree *t) {
+    piece_checkpoint *cp = t->checkpoint; uint64_t mark = cp->saved.add_len;
+    if (cp->boundary_private || !(mark & CH_MASK) || t->root->add_high <= mark) return 0;
+    core *c = t->c; add_chunk *ch = c->a.alloc(c->a.ctx, sizeof *ch);
+    if (!ch) return PIECE_ERR_NOMEM;
+    atomic_init(&ch->rc, 1);
+    add_chunk **tbl = atomic_load_explicit(&cp->restore->tbl, memory_order_acquire);
+    size_t i = (size_t)(mark >> CH_SHIFT);
+    memcpy(ch->data, tbl[i]->data, (size_t)(mark & CH_MASK));
+    add_chunk *old = tbl[i]; tbl[i] = ch; chunk_unref(c, old);
+    cp->boundary_private = 1; return 0;
+}
 static void core_unref(core *c) {
-    if (atomic_fetch_sub_explicit(&c->rc, 1, memory_order_acq_rel) != 1) return;
+    pthread_mutex_lock(&c->pool_mu);
+    unsigned owners = atomic_fetch_sub_explicit(&c->rc, 1, memory_order_acq_rel);
+    if (owners == 2) pool_trim_locked(c, 1);
+    pthread_mutex_unlock(&c->pool_mu);
+    if (owners != 1) return;
     piece_allocator a = c->a;
-    uint8_t **tbl = atomic_load(&c->tbl);
-    for (size_t i = 0; i < c->nch; i++) a.free(a.ctx, tbl[i], CH_SIZE);
-    if (tbl) a.free(a.ctx, tbl, c->tblcap * sizeof *tbl);
-    for (int i = 0; i < c->nret; i++) a.free(a.ctx, c->ret[i].p, c->ret[i].cap * sizeof(uint8_t *));
-    if (c->orig_owned && c->orig_len) a.free(a.ctx, (void *)(uintptr_t)c->orig, c->orig_len);
-    for (unsigned pi = 0; pi < 2; pi++) {
+    add_store_unref(c, c->add);
+    orig_store_unref(c, c->original);
+    for (unsigned pi = 0; pi < 3; pi++) {
         node_pool *p = &c->pool[pi]; void *slab = p->slabs;
         for (size_t k = p->nslabs; k-- > 0;) {
             size_t sz = slab_nodes(k) * slot_size(pi) + 16;
@@ -263,7 +385,7 @@ static void core_unref(core *c) {
             UNPOISON(slab, sz); a.free(a.ctx, slab, sz); slab = nx;
         }
     }
-    a.free(a.ctx, c, sizeof *c);
+    pthread_mutex_destroy(&c->pool_mu); a.free(a.ctx, c, sizeof *c);
 }
 
 /* An unchanged tree shares one immutable snapshot header. Each public owner
@@ -272,9 +394,24 @@ static void core_unref(core *c) {
 static void snapshot_drop(piece_snapshot *s, int external) {
     if (!s) return;
     core *c = s->c;
-    if (external && s->has_mh) c->mh.release(c->mh.ctx);
-    if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) return;
-    node_unref(c, s->root); pool_free(c, (node *)(void *)s, 0); core_unref(c);
+    if (external && s->has_mh) s->original->mh.release(s->original->mh.ctx);
+    pthread_mutex_lock(&c->pool_mu);
+    int no_external = external && atomic_fetch_sub_explicit(&c->external, 1, memory_order_acq_rel) == 1;
+    if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) {
+        if (no_external) pool_trim_locked(c, 2);
+        pthread_mutex_unlock(&c->pool_mu); return;
+    }
+    add_store *v = s->add;
+    pthread_mutex_lock(&v->mu);
+    if (s->prev) s->prev->next = s->next; else v->snapshots = s->next;
+    if (s->next) s->next->prev = s->prev;
+    add_store_prune(c, v);
+    pthread_mutex_unlock(&v->mu);
+    orig_store_unref(c, s->original);
+    node_unref(c, s->root); pool_free(c, (node *)(void *)s, 2);
+    add_store_unref(c, v);
+    if (no_external) pool_trim_locked(c, 2);
+    pthread_mutex_unlock(&c->pool_mu); core_unref(c);
 }
 static void snapshot_uncache(piece_tree *t) {
     piece_snapshot *s = t->cached_snapshot; t->cached_snapshot = NULL;
@@ -290,35 +427,36 @@ static void owner_trim(piece_tree *t, int force) {
     pool_trim(c, force);
 }
 
-static inline const uint8_t *ent_data(const core *c, uint64_t x) {
+static inline const uint8_t *view_data(const uint8_t *original, const add_store *v, uint64_t x) {
     if (x & TOP) {
         uint64_t a = x & ~TOP;
-        uint8_t **tbl = atomic_load_explicit((_Atomic(uint8_t **) *)(uintptr_t)&c->tbl, memory_order_acquire);
-        return tbl[a >> CH_SHIFT] + (a & CH_MASK);
+        add_chunk **tbl = atomic_load_explicit(&v->tbl, memory_order_acquire);
+        return tbl[a >> CH_SHIFT]->data + (a & CH_MASK);
     }
-    return c->orig + x;
+    return original + x;
 }
+static inline const uint8_t *ent_data(const core *c, uint64_t x) { return view_data(c->orig, c->add, x); }
 static inline uint8_t *add_ptr(const core *c, uint64_t a) { return (uint8_t *)(uintptr_t)ent_data(c, a | TOP); }
 
 static int add_reserve(piece_tree *t, uint64_t n) {
-    core *c = t->c;
+    core *c = t->c; add_store *v = c->add;
     if (n >= TOP || t->add_len > TOP - 1 - n) return PIECE_ERR_NOMEM;
     uint64_t need = chunk_count(length_add(t->add_len, n));
-    while (c->nch < need) {
-        uint8_t **tbl = atomic_load(&c->tbl);
-        if (c->nch == c->tblcap) {
-            size_t nc = c->tblcap ? c->tblcap * 2 : 8;
-            if (c->nret >= 24) return PIECE_ERR_NOMEM;
-            uint8_t **nt = c->a.alloc(c->a.ctx, nc * sizeof *nt);
+    while (v->nch < need) {
+        add_chunk **tbl = atomic_load(&v->tbl);
+        if (v->nch == v->cap) {
+            size_t nc = v->cap ? v->cap * 2 : 8;
+            if (v->nret >= 24) return PIECE_ERR_NOMEM;
+            add_chunk **nt = c->a.alloc(c->a.ctx, nc * sizeof *nt);
             if (!nt) return PIECE_ERR_NOMEM;
-            if (c->nch) memcpy(nt, tbl, c->nch * sizeof *nt);
-            atomic_store_explicit(&c->tbl, nt, memory_order_release);
-            if (tbl) { c->ret[c->nret].p = tbl; c->ret[c->nret].cap = c->tblcap; c->nret++; }
-            c->tblcap = nc; tbl = nt;
+            if (v->nch) memcpy(nt, tbl, v->nch * sizeof *nt);
+            atomic_store_explicit(&v->tbl, nt, memory_order_release);
+            if (tbl) { v->ret[v->nret].p = tbl; v->ret[v->nret].cap = v->cap; v->nret++; }
+            v->cap = nc; tbl = nt;
         }
-        uint8_t *ch = c->a.alloc(c->a.ctx, CH_SIZE);
+        add_chunk *ch = c->a.alloc(c->a.ctx, sizeof *ch);
         if (!ch) return PIECE_ERR_NOMEM;
-        tbl[c->nch++] = ch;
+        atomic_init(&ch->rc, 1); tbl[v->nch++] = ch;
     }
     return 0;
 }
@@ -353,22 +491,36 @@ static void ent_split(const core *c, const ent *e, uint64_t s, ent *L, ent *R) {
     if (s <= e->b - s) { uint64_t l = nl_count(p, (size_t)s); L->nl = l; R->nl = e->nl - l; }
     else { uint64_t r = nl_count(p + s, (size_t)(e->b - s)); R->nl = r; L->nl = e->nl - r; }
 }
-static uint64_t ent_nl(const core *c, node *n, unsigned i);
+static uint64_t ent_nl(const core *c, const add_store *view, const uint8_t *original, node *n, unsigned i);
 
 /* exact newline count of entry i, resolving lazily; safe on shared nodes (relaxed atomics, idempotent) */
-static uint64_t ent_nl(const core *c, node *n, unsigned i) {
+static uint64_t ent_nl(const core *c, const add_store *view, const uint8_t *original, node *n, unsigned i) {
     uint64_t v = nl_ld(n, i);
     if (!(v & UNK)) return v;
     uint64_t sum = 0;
-    if (n->leaf) sum = scan_count(ent_data(c, entry_x(n, i)), (size_t)bytes(n, i)).newlines;
+    if (n->leaf) sum = scan_count(view_data(original, view, entry_x(n, i)), (size_t)bytes(n, i)).newlines;
     else {
         node *ch = n->v.in.ch[i];
-        for (unsigned j = 0; j < ch->cnt; j++) sum += ent_nl(c, ch, j);
+        for (unsigned j = 0; j < ch->cnt; j++) sum += ent_nl(c, view, original, ch, j);
     }
     nl_st(n, i, sum);
     return sum;
 }
 
+/* Snapshot storage ownership is bounded by the referenced ADD prefix,
+ * rather than all historical/transaction appends. No change in node size. */
+static void node_add_high(node *n) {
+    uint64_t high = 0;
+    for (unsigned i = 0; i < n->cnt; i++) {
+        uint64_t end = 0;
+        if (n->leaf) {
+            uint64_t x = entry_x(n, i);
+            if (x & TOP) end = length_add(x & ~TOP, bytes(n, i));
+        } else end = n->v.in.ch[i]->add_high;
+        if (end > high) high = end;
+    }
+    n->add_high = high;
+}
 /* replace entries [i, i+ndel) by ins[0..nins); split into a new right sibling when > FAN */
 static node *splice(core *c, node *n, unsigned i, unsigned ndel, const ent *ins, unsigned nins) {
     unsigned total = (unsigned)n->cnt - ndel + nins;
@@ -386,18 +538,18 @@ static node *splice(core *c, node *n, unsigned i, unsigned ndel, const ent *ins,
             }
         }
         for (unsigned j = 0; j < nins; j++) ent_put(n, i + j, &ins[j]);
-        n->cnt = (uint16_t)total; return NULL;
+        n->cnt = (uint16_t)total; node_add_high(n); return NULL;
     }
     ent tmp[FAN + 4]; unsigned m = 0;
     for (unsigned j = 0; j < i; j++) tmp[m++] = ent_get(n, j);
     for (unsigned j = 0; j < nins; j++) tmp[m++] = ins[j];
     for (unsigned j = i + ndel; j < n->cnt; j++) tmp[m++] = ent_get(n, j);
-    if (m <= FAN) { for (unsigned j = 0; j < m; j++) ent_put(n, j, &tmp[j]); n->cnt = (uint16_t)m; return NULL; }
+    if (m <= FAN) { for (unsigned j = 0; j < m; j++) ent_put(n, j, &tmp[j]); n->cnt = (uint16_t)m; node_add_high(n); return NULL; }
     node *r = node_new(c, (int)n->leaf);
     unsigned l = (m + 1) / 2;
     for (unsigned j = 0; j < l; j++) ent_put(n, j, &tmp[j]);
     for (unsigned j = l; j < m; j++) ent_put(r, j - l, &tmp[j]);
-    n->cnt = (uint16_t)l; r->cnt = (uint16_t)(m - l);
+    n->cnt = (uint16_t)l; r->cnt = (uint16_t)(m - l); node_add_high(n); node_add_high(r);
     return r;
 }
 
@@ -419,14 +571,14 @@ static node *ins_rec(core *c, node *n, uint64_t off, const ent *ne) {
     node *ch = cow(c, n->v.in.ch[i]); n->v.in.ch[i] = ch;
     node *sib = ins_rec(c, ch, off - cum, ne);
     ent e[2]; e[0] = summ(ch, ch);
-    if (!sib) { ent_put(n, i, &e[0]); return NULL; }
+    if (!sib) { ent_put(n, i, &e[0]); node_add_high(n); return NULL; }
     e[1] = summ(sib, sib);
     return splice(c, n, i, 1, e, 2);
 }
 static void root_grow(piece_tree *t, node *sib) {
     core *c = t->c; node *r = node_new(c, 0); ent e[2];
     e[0] = summ(t->root, t->root); e[1] = summ(sib, sib);
-    ent_put(r, 0, &e[0]); ent_put(r, 1, &e[1]); r->cnt = 2;
+    ent_put(r, 0, &e[0]); ent_put(r, 1, &e[1]); r->cnt = 2; node_add_high(r);
     t->root = r; t->height++;
 }
 static void ins_piece(piece_tree *t, uint64_t off, const ent *ne) {
@@ -467,6 +619,7 @@ static void cursor_delta(piece_tree *t, uint64_t b, uint64_t nl, int remove) {
         bytes_set(n, i, remove ? bytes(n, i) - b : length_add(bytes(n, i), b));
         nl_st(n, i, remove ? nl_ld(n, i) - nl : nl_ld(n, i) + nl);
     }
+    for (unsigned d = t->cursor_depth; d-- > 0;) node_add_high(t->cursor[d]);
 }
 static void cursor_relocate(piece_tree *t, uint64_t pos, uint64_t start) {
     node *leaf = t->cursor[t->cursor_depth];
@@ -484,10 +637,12 @@ static int cursor_extend(piece_tree *t, uint64_t off, const uint8_t *data, size_
     uint64_t nl;
     if (len == 1) { nl = data[0] == '\n'; *add_ptr(t->c, t->add_len) = data[0]; }
     else { nl = nl_count(data, len); memcpy(add_ptr(t->c, t->add_len), data, len); }
+    leaf->add_high = length_add(t->add_len, len);
     bytes_set(leaf, k, length_add(bytes(leaf, k), len));
     if (nl) nl_st(leaf, k, nl_ld(leaf, k) + nl);
     for (unsigned d = 0; d < t->cursor_depth; d++) {
         node *n = t->cursor[d]; unsigned i = t->cursor_i[d];
+        n->add_high = leaf->add_high;
         n->v.in.b[i] = length_add(n->v.in.b[i], len);
         if (nl) nl_st(n, i, nl_ld(n, i) + nl);
     }
@@ -528,18 +683,18 @@ static void merge_children(core *c, node *n, unsigned j) {   /* merge child j+1 
         ent e = ent_get(b, k); ent_put(a, a->cnt + k, &e);
         if (!b->leaf) atomic_fetch_add_explicit(&b->v.in.ch[k]->rc, 1, memory_order_relaxed);
     }
-    a->cnt = (uint16_t)(a->cnt + b->cnt);
+    a->cnt = (uint16_t)(a->cnt + b->cnt); node_add_high(a);
     node_unref(c, b);
     for (unsigned k = j + 1; k + 1 < n->cnt; k++) { ent e = ent_get(n, k + 1); ent_put(n, k, &e); }
     n->cnt--;
-    ent e = summ(a, a); ent_put(n, j, &e);
+    ent e = summ(a, a); ent_put(n, j, &e); node_add_high(n);
 }
 static void maybe_merge(core *c, node *n, unsigned idx) {
     if (n->cnt < 2 || idx >= n->cnt) return;
     node *ch = n->v.in.ch[idx];
     if (ch->cnt >= 8) return;
-    if (idx + 1 < n->cnt && ch->cnt + n->v.in.ch[idx + 1]->cnt <= 12) merge_children(c, n, idx);
-    else if (idx > 0 && n->v.in.ch[idx - 1]->cnt + ch->cnt <= 12) merge_children(c, n, idx - 1);
+    if (idx + 1 < n->cnt && ch->cnt + n->v.in.ch[idx + 1]->cnt <= FAN) merge_children(c, n, idx);
+    else if (idx > 0 && n->v.in.ch[idx - 1]->cnt + ch->cnt <= FAN) merge_children(c, n, idx - 1);
 }
 static node *del_rec(core *c, node *n, uint64_t lo, uint64_t hi) {
     if (n->leaf) {
@@ -598,7 +753,7 @@ static node *del_rec(core *c, node *n, uint64_t lo, uint64_t hi) {
         maybe_merge(c, n, i0 + nr - 1);
         if (nr == 2) maybe_merge(c, n, i0);
     }
-    return sib;
+    node_add_high(n); return sib;
 }
 
 /* ----------------------------------------------------------------- walk */
@@ -629,32 +784,32 @@ static int walk_next(walk *w, const node *root, uint64_t total, uint64_t *pos, u
 }
 static uint64_t node_total(const node *n) { uint64_t s = 0; for (unsigned i = 0; i < n->cnt; i++) s = length_add(s, bytes(n, i)); return s; }
 
-static int read_range(const core *c, const node *root, uint64_t total, uint64_t off, uint8_t *dst, size_t len) {
+static int read_range(const add_store *v, const uint8_t *original, const node *root, uint64_t total, uint64_t off, uint8_t *dst, size_t len) {
     if (off > total || len > total - off) return PIECE_ERR_RANGE;
     walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n;
     while (pos < end && walk_next(&w, root, total, &pos, &x, &skip, &n)) {
         uint64_t take = n < end - (pos - n) ? n : end - (pos - n);
-        memcpy(dst, ent_data(c, x) + skip, (size_t)take); dst += take;
+        memcpy(dst, view_data(original, v, x) + skip, (size_t)take); dst += take;
         if (take < n) break;
     }
     return 0;
 }
 
 /* ------------------------------------------------------------ line maps */
-static uint64_t tree_nl(const core *c, node *root) {
-    uint64_t s = 0; for (unsigned i = 0; i < root->cnt; i++) s += ent_nl(c, root, i);
+static uint64_t tree_nl(const core *c, const add_store *v, const uint8_t *original, node *root) {
+    uint64_t s = 0; for (unsigned i = 0; i < root->cnt; i++) s += ent_nl(c, v, original, root, i);
     return s;
 }
 /* Descend by newline count. Flagged (unresolved) internal entries are entered instead of resolved
  * up front, so only the prefix before the target is ever scanned; a fully consumed subtree gets its
  * exact count written back. Returns 1 and sets *res when the target lies inside n. */
-static int l2b_rec(const core *c, node *n, uint64_t *need, uint64_t *base, uint64_t *res) {
+static int l2b_rec(const core *c, const add_store *view, const uint8_t *original, node *n, uint64_t *need, uint64_t *base, uint64_t *res) {
     for (unsigned i = 0; i < n->cnt; i++) {
         uint64_t v = nl_ld(n, i);
         if (n->leaf) {
-            if (v & UNK) v = ent_nl(c, n, i);
+            if (v & UNK) v = ent_nl(c, view, original, n, i);
             if (v < *need) { *need -= v; *base += bytes(n, i); continue; }
-            const uint8_t *d = ent_data(c, entry_x(n, i));
+            const uint8_t *d = view_data(original, view, entry_x(n, i));
             const uint8_t *p = scan_find_nth_newline(d, (size_t)bytes(n, i), *need - 1);
             if (!p) return 0;
             *res = *base + (uint64_t)(p - d) + 1;
@@ -662,24 +817,24 @@ static int l2b_rec(const core *c, node *n, uint64_t *need, uint64_t *base, uint6
         }
         if (!(v & UNK) && v < *need) { *need -= v; *base += bytes(n, i); continue; }
         uint64_t need0 = *need;
-        if (l2b_rec(c, n->v.in.ch[i], need, base, res)) return 1;
+        if (l2b_rec(c, view, original, n->v.in.ch[i], need, base, res)) return 1;
         nl_st(n, i, need0 - *need);               /* consumed whole: exact */
     }
     return 0;
 }
-static uint64_t l2b(const core *c, node *root, uint64_t total, uint64_t line) {
+static uint64_t l2b(const core *c, const add_store *view, const uint8_t *original, node *root, uint64_t total, uint64_t line) {
     if (line == 0) return 0;
     uint64_t need = line, base = 0, res = 0;
-    return l2b_rec(c, root, &need, &base, &res) ? res : total;
+    return l2b_rec(c, view, original, root, &need, &base, &res) ? res : total;
 }
-static uint64_t b2l(const core *c, node *root, uint64_t total, uint64_t off) {
-    if (off >= total) return tree_nl(c, root);
+static uint64_t b2l(const core *c, const add_store *view, const uint8_t *original, node *root, uint64_t total, uint64_t off) {
+    if (off >= total) return tree_nl(c, view, original, root);
     uint64_t acc = 0; node *n = root;
     for (;;) {
         unsigned i = 0;
-        while (i + 1 < n->cnt && off >= bytes(n, i)) { acc += ent_nl(c, n, i); off -= bytes(n, i); i++; }
+        while (i + 1 < n->cnt && off >= bytes(n, i)) { acc += ent_nl(c, view, original, n, i); off -= bytes(n, i); i++; }
         if (n->leaf) {
-            const uint8_t *p = ent_data(c, entry_x(n, i));
+            const uint8_t *p = view_data(original, view, entry_x(n, i));
             if (off == 0) return acc;
             if (!(nl_ld(n, i) & UNK) && off > bytes(n, i) / 2)
                 return acc + nl_ld(n, i) - nl_count(p + off, (size_t)(bytes(n, i) - off));
@@ -693,13 +848,26 @@ static uint64_t b2l(const core *c, node *root, uint64_t total, uint64_t off) {
 piece_tree *piece_create(const piece_allocator *a) {
     core *c = a->alloc(a->ctx, sizeof *c);
     if (!c) return NULL;
-    memset(c, 0, sizeof *c); atomic_init(&c->rc, 1); c->a = *a;
-    atomic_init(&c->tbl, NULL);
-    for (unsigned pi = 0; pi < 2; pi++) { atomic_init(&c->pool[pi].remote, NULL); atomic_init(&c->pool[pi].returned, 0); }
+    memset(c, 0, sizeof *c); atomic_init(&c->rc, 1); atomic_init(&c->external, 0); c->a = *a;
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) { a->free(a->ctx, c, sizeof *c); return NULL; }
+    int lock_error = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (!lock_error) lock_error = pthread_mutex_init(&c->pool_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (lock_error) { a->free(a->ctx, c, sizeof *c); return NULL; }
+    c->add = add_store_new(c);
+    if (!c->add) { pthread_mutex_destroy(&c->pool_mu); a->free(a->ctx, c, sizeof *c); return NULL; }
+    c->original = orig_store_new(c, NULL, 0, 0, NULL);
+    if (!c->original) { core_unref(c); return NULL; }
+    for (unsigned pi = 0; pi < 3; pi++) { atomic_init(&c->pool[pi].remote, NULL); atomic_init(&c->pool[pi].returned, 0); }
     piece_tree *t = a->alloc(a->ctx, sizeof *t);
     if (!t) { core_unref(c); return NULL; }
     memset(t, 0, sizeof *t); t->c = c;
-    if (pool_reserve_class(c, 0, 1) || !(t->root = node_new(c, 1))) { a->free(a->ctx, t, sizeof *t); core_unref(c); return NULL; }
+    pthread_mutex_lock(&c->pool_mu);
+    int reserve_error = pool_reserve_class(c, 0, 1);
+    if (!reserve_error) t->root = node_new(c, 1);
+    pthread_mutex_unlock(&c->pool_mu);
+    if (reserve_error) { a->free(a->ctx, t, sizeof *t); core_unref(c); return NULL; }
     return t;
 }
 void piece_destroy(piece_tree *t) {
@@ -708,6 +876,10 @@ void piece_destroy(piece_tree *t) {
     snapshot_uncache(t);
     node_unref(c, t->root);
     if (t->mapped && c->has_mh) c->mh.release(c->mh.ctx);
+    orig_store_unref(c, c->original); c->original = NULL;
+    add_store *v = c->add; c->add = NULL;
+    pthread_mutex_lock(&v->mu); v->sealed = 1; add_store_prune(c, v); pthread_mutex_unlock(&v->mu);
+    add_store_unref(c, v);
     c->a.free(c->a.ctx, t, sizeof *t);
     core_unref(c);
 }
@@ -717,10 +889,11 @@ static int build(piece_tree *t, size_t len, int mapped) {
     if (np == 0) return 0;
     uint64_t nleaf = (np + FAN - 1) / FAN, tot = 0, lv = nleaf;
     for (;;) { tot += lv; if (lv == 1) break; lv = (lv + FAN - 1) / FAN; }
+    pthread_mutex_lock(&c->pool_mu);
     if (pool_reserve_class(c, 0, (size_t)nleaf + 2) ||
-        pool_reserve_class(c, 1, (size_t)(tot - nleaf) + 2)) return PIECE_ERR_NOMEM;
+        pool_reserve_class(c, 1, (size_t)(tot - nleaf) + 2)) { pool_trim_locked(c, 2); return pool_done(c, PIECE_ERR_NOMEM); }
     node **arr = c->a.alloc(c->a.ctx, (size_t)nleaf * sizeof *arr);
-    if (!arr) return PIECE_ERR_NOMEM;
+    if (!arr) { pool_trim_locked(c, 2); return pool_done(c, PIECE_ERR_NOMEM); }
     uint64_t piece = 0; int h = 0;
     for (uint64_t li = 0; li < nleaf; li++) {
         node *l = node_new(c, 1);
@@ -744,30 +917,38 @@ static int build(piece_tree *t, size_t len, int mapped) {
     node *old = t->root; t->root = arr[0]; t->height = h;
     node_unref(c, old);
     c->a.free(c->a.ctx, arr, (size_t)nleaf * sizeof *arr);
-    return 0;
+    return pool_done(c, 0);
 }
 int piece_init_copy(piece_tree *t, const uint8_t *data, size_t len) {
     if (t->inited || t->root->cnt) return PIECE_ERR_RANGE;
     core *c = t->c;
     if (len) {
-        uint8_t *o = c->a.alloc(c->a.ctx, len);
-        if (!o) return PIECE_ERR_NOMEM;
+        uint8_t *o = c->a.alloc(c->a.ctx, len); if (!o) return PIECE_ERR_NOMEM;
         memcpy(o, data, len);
+        orig_store *v = orig_store_new(c, o, len, 1, NULL);
+        if (!v) { c->a.free(c->a.ctx, o, len); return PIECE_ERR_NOMEM; }
         c->orig = o; c->orig_len = len; c->orig_owned = 1;
         int r = build(t, len, 0);
-        if (r) { c->orig = NULL; c->orig_len = 0; c->orig_owned = 0; c->a.free(c->a.ctx, o, len); return r; }
+        if (r) {
+            c->orig = c->original->data; c->orig_len = c->original->len; c->orig_owned = c->original->owned;
+            orig_store_unref(c, v); return r;
+        }
+        orig_store_install(c, v);
     }
     t->len = len; t->inited = 1; snapshot_uncache(t); return 0;
 }
 int piece_init_mapped(piece_tree *t, const uint8_t *mapped, size_t len, const piece_map_hooks *hooks) {
     if (t->inited || t->root->cnt) return PIECE_ERR_RANGE;
     core *c = t->c;
-    if (len) {
-        c->orig = mapped; c->orig_len = len;
-        int r = build(t, len, 1);
-        if (r) { c->orig = NULL; c->orig_len = 0; return r; }
+    orig_store *v = orig_store_new(c, mapped, len, 0, hooks); if (!v) return PIECE_ERR_NOMEM;
+    c->orig = mapped; c->orig_len = len;
+    int r = build(t, len, 1);
+    if (r) {
+        c->orig = c->original->data; c->orig_len = c->original->len;
+        orig_store_unref(c, v); return r;
     }
-    if (hooks) { c->mh = *hooks; c->has_mh = 1; c->mh.acquire(c->mh.ctx); t->mapped = 1; }
+    orig_store_install(c, v);
+    if (hooks) { c->mh.acquire(c->mh.ctx); t->mapped = 1; }
     t->len = len; t->inited = 1; snapshot_uncache(t); return 0;
 }
 
@@ -783,7 +964,7 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *data, size_t len) {
     int r = add_reserve(t, len);
     if (r) return r;
     size_t np = (size_t)chunk_count(length_add(t->add_len & CH_MASK, len));
-    if ((r = reserve_insert(t, np))) return r;
+    if ((r = reserve_insert(t, np))) return pool_done(c, r);
     uint64_t cur = off; size_t rem = len;
     while (rem) {
         size_t room = (size_t)(CH_SIZE - (t->add_len & CH_MASK)), seg = rem < room ? rem : room;
@@ -815,7 +996,7 @@ int piece_insert(piece_tree *t, uint64_t off, const uint8_t *data, size_t len) {
         t->run_valid = 1; t->run_end = length_add(cur, seg); t->run_addend = t->add_len;
         cur = length_add(cur, seg); data += seg; rem -= seg;
     }
-    t->inited = 1; return 0;
+    t->inited = 1; return pool_done(c, 0);
 }
 
 /* collect add-buffer spans of [off, off+len); copies original fragments into the add buffer when r != NULL */
@@ -833,9 +1014,9 @@ static unsigned collect(piece_tree *t, uint64_t off, uint64_t len, piece_ref *r,
         }
         if (have && pend == ao) { if (r) r->span[ns - 1].len = length_add(r->span[ns - 1].len, used); }
         else {
-            if (ns == PIECE_REF_SPANS) return PIECE_REF_SPANS + 1;
+            if (ns == PIECE_REF_SPANS && r) return PIECE_REF_SPANS + 1;
             if (r) { r->span[ns].add_off = ao; r->span[ns].len = used; }
-            ns++;
+            if (ns <= PIECE_REF_SPANS) ns++;
         }
         pend = ao + used; have = 1;
     }
@@ -849,7 +1030,7 @@ static int cursor_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *r
     uint64_t start = t->cursor_start, x = entry_x(leaf, k), bl = bytes(leaf, k);
     if (!(x & TOP) || off < start || off - start >= bl || len > bl - (off - start) ||
         (off > start && off + len < start + bl && leaf->cnt == FAN) ||
-        (len == bl && leaf->cnt == 1 && t->cursor_depth)) return 0;
+        (len == bl && leaf->cnt <= FAN / 2 && t->cursor_depth)) return 0;
     if (ref) { ref->nspans = 1; ref->len = len; ref->span[0].add_off = (x & ~TOP) + off - start; ref->span[0].len = len; }
     uint64_t dn = nl_count(ent_data(t->c, x) + (off - start), (size_t)len);
     if (off + len == start + bl && len < bl) {
@@ -860,7 +1041,7 @@ static int cursor_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *r
         node *sib = del_rec(t->c, leaf, off - base, off - base + len); EDIT_ASSERT(!sib);
         cursor_relocate(t, off, base);
     }
-    cursor_delta(t, len, dn, 1); t->len -= len; t->run_valid = 0;
+    node_add_high(leaf); cursor_delta(t, len, dn, 1); t->len -= len; t->run_valid = 0;
     pool_trim(t->c, t->len == 0);
 #ifdef PIECE_TESTING
     t->c->stats.cursor_hits++;
@@ -876,14 +1057,21 @@ int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref) {
     snapshot_uncache(t); owner_trim(t, t->len == 0);
     if (cursor_delete(t, off, len, ref)) return 0;
     int r = reserve_delete(t, 0);
-    if (r) return r;
+    if (r) return pool_done(c, r);
     piece_ref tmp; piece_ref *rr = ref ? ref : &tmp;
     uint64_t cb = 0;
     unsigned ns = collect(t, off, len, NULL, &cb);
     t->cursor_valid = 0;
     t->run_valid = 0;
-    if (ns > PIECE_REF_SPANS) {
-        if ((r = add_reserve(t, len))) return r;
+    if (!ref && ns > PIECE_REF_SPANS) {
+        if ((r = add_reserve(t, cb))) return pool_done(c, r);
+        walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n;
+        while (pos < end && walk_next(&w, t->root, total, &pos, &x, &skip, &n)) {
+            uint64_t used = n < end - (pos - n) ? n : end - (pos - n);
+            if (!(x & TOP)) add_append(t, ent_data(c, x) + skip, (size_t)used);
+        }
+    } else if (ns > PIECE_REF_SPANS) {
+        if ((r = add_reserve(t, len))) return pool_done(c, r);
         walk w = { 0, 0, 0, 0 }; uint64_t pos = off, end = off + len, x, skip, n, base = t->add_len;
         while (pos < end && walk_next(&w, t->root, total, &pos, &x, &skip, &n)) {
             uint64_t used = n < end - (pos - n) ? n : end - (pos - n);
@@ -891,16 +1079,18 @@ int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref) {
         }
         rr->nspans = 1; rr->len = len; rr->span[0].add_off = base; rr->span[0].len = len;
     } else {
-        if ((r = add_reserve(t, cb))) return r;
+        if ((r = add_reserve(t, cb))) return pool_done(c, r);
         rr->len = len;
         (void)collect(t, off, len, rr, &cb);
         rr->nspans = ns;
     }
+    t->deleted_original = length_add(t->deleted_original, cb);
+    if (ref && ns > PIECE_REF_SPANS) t->fallback_add = length_add(t->fallback_add, len - cb);
     t->len -= len;
     if (off == 0 && len == total) {
         node *nr = node_new(c, 1);
         node_unref(c, t->root); t->root = nr; t->height = 0;
-        pool_trim(c, 1); return 0;
+        pool_trim(c, 1); return pool_done(c, 0);
     }
     t->root = cow(c, t->root);
     node *sib = del_rec(c, t->root, off, off + len);
@@ -908,7 +1098,7 @@ int piece_delete(piece_tree *t, uint64_t off, uint64_t len, piece_ref *ref) {
     while (!t->root->leaf && t->root->cnt == 1) {
         node *old = t->root; t->root = old->v.in.ch[0]; pool_free(c, old, 1); t->height--;
     }
-    pool_trim(c, 0); return 0;
+    pool_trim(c, 0); return pool_done(c, 0);
 }
 
 int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref) {
@@ -925,7 +1115,7 @@ int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref) {
     if (!nseg) return 0;
     snapshot_uncache(t); owner_trim(t, t->len == 0);
     int r = reserve_insert(t, (size_t)nseg);
-    if (r) return r;
+    if (r) return pool_done(c, r);
     t->cursor_valid = 0; t->run_valid = 0;
     uint64_t cur = off;
     for (unsigned i = 0; i < ref->nspans; i++) {
@@ -938,7 +1128,69 @@ int piece_insert_ref(piece_tree *t, uint64_t off, const piece_ref *ref) {
             cur = length_add(cur, n); a = length_add(a, n); l -= n;
         }
     }
-    return 0;
+    return pool_done(c, 0);
+}
+
+/* ----------------------------------------------------------- checkpoints */
+int piece_checkpoint_begin(piece_tree *t, piece_checkpoint **out) {
+    if (out) *out = NULL;
+    if (!t || !out || t->checkpoint) return PIECE_ERR_RANGE;
+    core *c = t->c;
+    piece_checkpoint *cp = c->a.alloc(c->a.ctx, sizeof *cp);
+    if (!cp) return PIECE_ERR_NOMEM;
+    cp->tree = t; cp->saved = *t; cp->boundary_private = 0;
+    cp->restore = add_store_prefix(c, t->add_len);
+    if (!cp->restore) { c->a.free(c->a.ctx, cp, sizeof *cp); return PIECE_ERR_NOMEM; }
+    cp->snapshot = piece_snapshot_take(t);
+    if (!cp->snapshot) {
+        add_store_unref(c, cp->restore); t->cursor_valid = cp->saved.cursor_valid;
+        c->a.free(c->a.ctx, cp, sizeof *cp);
+        return PIECE_ERR_NOMEM;
+    }
+    t->checkpoint = cp; *out = cp; return PIECE_OK;
+}
+void piece_checkpoint_commit(piece_checkpoint *cp) {
+    piece_tree *t = cp->tree; core *c = t->c;
+    t->checkpoint = NULL;
+    piece_snapshot_release(cp->snapshot); add_store_unref(c, cp->restore);
+    c->a.free(c->a.ctx, cp, sizeof *cp);
+}
+void piece_checkpoint_abort(piece_checkpoint *cp) {
+    piece_tree *t = cp->tree; core *c = t->c;
+    add_store *old = c->add;
+    /* Transfer the retained root back before dropping either live root owner. */
+    node *root = cp->snapshot->root;
+    atomic_fetch_add_explicit(&root->rc, 1, memory_order_relaxed);
+    snapshot_uncache(t); node_unref(c, t->root);
+    *t = cp->saved; t->root = root; t->cached_snapshot = NULL; t->checkpoint = NULL;
+    c->add = cp->restore;
+    if (c->original != cp->snapshot->original) {
+        if (c->has_mh) c->mh.release(c->mh.ctx);
+        orig_store *v = cp->snapshot->original;
+        atomic_fetch_add_explicit(&v->rc, 1, memory_order_relaxed);
+        if (v->has_mh) v->mh.acquire(v->mh.ctx);
+        orig_store_install(c, v);
+    }
+    piece_snapshot_release(cp->snapshot);
+    /* An unchanged/intermediate snapshot may still share all or part of the
+     * saved cursor path. Its publication invalidation must survive rollback. */
+    if (t->cursor_valid) for (unsigned d = 0; d <= t->cursor_depth; d++)
+        if (atomic_load_explicit(&t->cursor[d]->rc, memory_order_acquire) != 1) { t->cursor_valid = 0; break; }
+    pthread_mutex_lock(&old->mu);
+    uint64_t high = 0;
+    for (piece_snapshot *s = old->snapshots; s; s = s->next) if (s->add_len > high) high = s->add_len;
+    /* If all transaction observers died, reuse the original saved boundary
+     * and return the prepaid copy too, before pruning the abandoned view. */
+    if (cp->boundary_private && high <= t->add_len) {
+        size_t i = (size_t)(t->add_len >> CH_SHIFT);
+        add_chunk **dst = atomic_load_explicit(&c->add->tbl, memory_order_relaxed);
+        add_chunk **src = atomic_load_explicit(&old->tbl, memory_order_relaxed);
+        add_chunk *backup = dst[i]; dst[i] = src[i]; atomic_fetch_add_explicit(&dst[i]->rc, 1, memory_order_relaxed);
+        chunk_unref(c, backup);
+    }
+    old->sealed = 1; add_store_prune(c, old); pthread_mutex_unlock(&old->mu);
+    add_store_unref(c, old);
+    c->a.free(c->a.ctx, cp, sizeof *cp); pool_trim(c, 2);
 }
 
 /* --------------------------------------------------------------- queries */
@@ -948,12 +1200,12 @@ static uint64_t count_pieces(const node *n) {
     return s;
 }
 uint64_t piece_piece_count(const piece_tree *t) { owner_trim((piece_tree *)(uintptr_t)t, t->len == 0); return count_pieces(t->root); }
-uint64_t piece_line_count(const piece_tree *t) { return tree_nl(t->c, t->root) + 1; }
+uint64_t piece_line_count(const piece_tree *t) { return tree_nl(t->c, t->c->add, t->c->orig, t->root) + 1; }
 int piece_read(const piece_tree *t, uint64_t off, uint8_t *dst, size_t len) {
-    return read_range(t->c, t->root, node_total(t->root), off, dst, len);
+    return read_range(t->c->add, t->c->orig, t->root, node_total(t->root), off, dst, len);
 }
-uint64_t piece_line_to_byte(const piece_tree *t, uint64_t line) { return l2b(t->c, t->root, node_total(t->root), line); }
-uint64_t piece_byte_to_line(const piece_tree *t, uint64_t off) { return b2l(t->c, t->root, node_total(t->root), off); }
+uint64_t piece_line_to_byte(const piece_tree *t, uint64_t line) { return l2b(t->c, t->c->add, t->c->orig, t->root, node_total(t->root), line); }
+uint64_t piece_byte_to_line(const piece_tree *t, uint64_t off) { return b2l(t->c, t->c->add, t->c->orig, t->root, node_total(t->root), off); }
 
 /* -------------------------------------------------------------- snapshots */
 piece_snapshot *piece_snapshot_take(piece_tree *t) {
@@ -962,13 +1214,22 @@ piece_snapshot *piece_snapshot_take(piece_tree *t) {
     if (t->cached_snapshot) return piece_snapshot_retain(t->cached_snapshot);
     core *c = t->c;
     /* Prepay the next edit's COW/merge reservation and the header slot. */
-    if (reserve_delete(t, 1)) return NULL;
-    piece_snapshot *s = (piece_snapshot *)(void *)pool_get(c, 0);
+    if (reserve_delete(t, 1)) { pool_done(c, 0); return NULL; }
+    if (t->checkpoint && checkpoint_snapshot_storage(t)) { pool_done(c, 0); return NULL; }
+    piece_snapshot *s = (piece_snapshot *)(void *)pool_get(c, 2);
     atomic_init(&s->rc, 1); s->c = c; s->root = t->root; s->len = t->len;
     atomic_fetch_add_explicit(&t->root->rc, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&c->rc, 1, memory_order_relaxed);
-    s->has_mh = t->mapped; t->cached_snapshot = s;
-    return piece_snapshot_retain(s);
+    s->original = c->original; atomic_fetch_add_explicit(&s->original->rc, 1, memory_order_relaxed);
+    s->has_mh = t->mapped; s->add = c->add; s->add_len = t->root->add_high;
+    atomic_fetch_add_explicit(&s->add->rc, 1, memory_order_relaxed);
+    pthread_mutex_lock(&s->add->mu);
+    s->prev = NULL; s->next = s->add->snapshots;
+    if (s->next) s->next->prev = s;
+    s->add->snapshots = s;
+    pthread_mutex_unlock(&s->add->mu);
+    t->cached_snapshot = s;
+    piece_snapshot *out = piece_snapshot_retain(s); pool_done(c, 0); return out;
 }
 piece_snapshot *piece_snapshot_retain(piece_snapshot *s) {
     /* The caller already owns s (or its tree cache owns it). Refusing the
@@ -979,15 +1240,16 @@ piece_snapshot *piece_snapshot_retain(piece_snapshot *s) {
         if (owners == UINT_MAX) return NULL;
     } while (!atomic_compare_exchange_weak_explicit(&s->rc, &owners, owners + 1,
                                                    memory_order_relaxed, memory_order_relaxed));
-    if (s->has_mh) s->c->mh.acquire(s->c->mh.ctx);
+    atomic_fetch_add_explicit(&s->c->external, 1, memory_order_relaxed);
+    if (s->has_mh) s->original->mh.acquire(s->original->mh.ctx);
     return s;
 }
 void piece_snapshot_release(piece_snapshot *s) { snapshot_drop(s, 1); }
 uint64_t piece_snapshot_len(const piece_snapshot *s) { return s->len; }
-uint64_t piece_snapshot_line_count(const piece_snapshot *s) { return tree_nl(s->c, s->root) + 1; }
-int piece_snapshot_read(const piece_snapshot *s, uint64_t off, uint8_t *dst, size_t len) { return read_range(s->c, s->root, s->len, off, dst, len); }
-uint64_t piece_snapshot_line_to_byte(const piece_snapshot *s, uint64_t line) { return l2b(s->c, s->root, s->len, line); }
-uint64_t piece_snapshot_byte_to_line(const piece_snapshot *s, uint64_t off) { return b2l(s->c, s->root, s->len, off); }
+uint64_t piece_snapshot_line_count(const piece_snapshot *s) { return tree_nl(s->c, s->add, s->original->data, s->root) + 1; }
+int piece_snapshot_read(const piece_snapshot *s, uint64_t off, uint8_t *dst, size_t len) { return read_range(s->add, s->original->data, s->root, s->len, off, dst, len); }
+uint64_t piece_snapshot_line_to_byte(const piece_snapshot *s, uint64_t line) { return l2b(s->c, s->add, s->original->data, s->root, s->len, line); }
+uint64_t piece_snapshot_byte_to_line(const piece_snapshot *s, uint64_t off) { return b2l(s->c, s->add, s->original->data, s->root, s->len, off); }
 
 /* --------------------------------------------------------------- iterator */
 static void iter_begin(piece_iter *it, const void *src, int snap, uint64_t off, uint64_t total) {
@@ -997,20 +1259,39 @@ static void iter_begin(piece_iter *it, const void *src, int snap, uint64_t off, 
 void piece_iter_begin(piece_iter *it, const piece_tree *t, uint64_t off) { iter_begin(it, t, 0, off, node_total(t->root)); }
 void piece_iter_begin_snapshot(piece_iter *it, const piece_snapshot *s, uint64_t off) { iter_begin(it, s, 1, off, s->len); }
 int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
-    const core *c; const node *root; uint64_t total;
-    if (it->is_snap) { const piece_snapshot *s = it->src; c = s->c; root = s->root; total = s->len; }
-    else { const piece_tree *t = it->src; c = t->c; root = t->root; total = node_total(t->root); }
+    const uint8_t *original; const add_store *v; const node *root; uint64_t total;
+    if (it->is_snap) { const piece_snapshot *s = it->src; original = s->original->data; v = s->add; root = s->root; total = s->len; }
+    else { const piece_tree *t = it->src; original = t->c->orig; v = t->c->add; root = t->root; total = node_total(t->root); }
     walk w; w.leaf = (node *)(uintptr_t)it->priv[0]; w.leaf_start = it->priv[1]; w.k = it->priv[2]; w.k_start = it->priv[3];
     uint64_t x, skip, len;
     if (!walk_next(&w, root, total, &it->pos, &x, &skip, &len)) return 0;
     it->priv[0] = (uint64_t)(uintptr_t)w.leaf; it->priv[1] = w.leaf_start; it->priv[2] = w.k; it->priv[3] = w.k_start;
-    *p = ent_data(c, x) + skip; *n = (size_t)len;
+    *p = view_data(original, v, x) + skip; *n = (size_t)len;
     return 1;
 }
 
 #ifdef PIECE_TESTING
 piece_test_stats piece_test_get_stats(const piece_tree *t) {
-    piece_test_stats s = t->c->stats; s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; return s;
+    piece_test_stats s = t->c->stats; s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; s.snapshot_bytes = SNAPSHOT_SZ; s.height = (unsigned)t->height; return s;
+}
+piece_test_memory piece_test_get_memory(const piece_tree *t) {
+    core *c = t->c; piece_test_memory m = {0};
+    m.deleted_original = t->deleted_original; m.fallback_add = t->fallback_add;
+    pthread_mutex_lock(&c->pool_mu);
+    for (unsigned pi = 0; pi < 3; pi++) {
+        size_t nn = slab_nodes(0), slot = slot_size(pi), sz = nn * slot + 16;
+        for (void *slab = c->pool[pi].slabs; slab;) {
+            uint8_t *raw = slab; m.slabs[pi]++;
+            for (size_t i = 0; i < nn; i++) {
+                node *n = (node *)(void *)(raw + i * slot);
+                if (!atomic_load_explicit(&n->rc, memory_order_relaxed)) continue;
+                m.live[pi]++;
+                if (!pi) { m.leaf_pieces += n->cnt; if (n->cnt < FAN / 2) m.underfull_leaves++; }
+            }
+            slab = *(void **)(void *)(raw + sz - 16);
+        }
+    }
+    pthread_mutex_unlock(&c->pool_mu); return m;
 }
 void piece_test_reset_stats(piece_tree *t) { memset(&t->c->stats, 0, sizeof t->c->stats); }
 void piece_test_snapshot_set_owners(piece_snapshot *s, unsigned owners) {
@@ -1039,7 +1320,7 @@ static node *test_repeat_partial(core *c, node *const full[15], unsigned height,
             ent e = { len, 0, (uint64_t)(uintptr_t)ch }; ent_put(n, n->cnt++, &e);
         }
     }
-    return n;
+    node_add_high(n); return n;
 }
 int piece_test_repeat_byte(piece_tree *t, uint64_t len) {
     if (t->len || !t->add_len || !len || *add_ptr(t->c, 0) == '\n') return PIECE_ERR_RANGE;
@@ -1057,11 +1338,16 @@ int piece_test_repeat_byte(piece_tree *t, uint64_t len) {
             }
             ent_put(full[h], i, &e); full[h]->cnt++;
         }
+        node_add_high(full[h]);
     }
     node *root = test_repeat_partial(c, full, 15, len);
     for (unsigned h = 15; h-- > 0;) node_unref(c, full[h]);
     snapshot_uncache(t); node_unref(c, t->root);
-    t->root = root; t->height = 15; t->len = len; t->inited = 1;
+    int height = 15;
+    while (!root->leaf && root->cnt == 1) {
+        node *old = root; root = old->v.in.ch[0]; pool_free(c, old, 1); height--;
+    }
+    t->root = root; t->height = height; t->len = len; t->inited = 1;
     t->cursor_valid = 0; t->run_valid = 0;
     return PIECE_OK;
 }

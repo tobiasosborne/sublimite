@@ -241,6 +241,83 @@ static int mt_test(void) {
     printf("piece_mt_test: %s (%u snapshots checked, mapping owners=0)\n", bad ? "FAILED" : "ok", checked);
     return bad != 0;
 }
+static int checkpoint_unchanged_snapshot_test(void) {
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
+    for (size_t i = 0; i < 4; i++) REQUIRE(!piece_insert(t, i, (const uint8_t *)"tail" + i, 1));
+    piece_checkpoint *cp = NULL; REQUIRE(!piece_checkpoint_begin(t, &cp));
+    piece_snapshot *s = piece_snapshot_take(t); REQUIRE(s);
+    piece_checkpoint_abort(cp);
+    REQUIRE(!piece_insert(t, 4, (const uint8_t *)"\n", 1));
+    REQUIRE(piece_snapshot_len(s) == 4 && piece_snapshot_line_count(s) == 1);
+    piece_iter it; const uint8_t *p; size_t n;
+    piece_iter_begin_snapshot(&it, s, 0); REQUIRE(piece_iter_next(&it, &p, &n) && n == 4 && !memcmp(p, "tail", 4));
+    piece_snapshot_release(s); piece_destroy(t);
+    puts("checkpoint unchanged snapshot: ok (abort restores run without reusing a shared cursor)"); return 0;
+}
+static int checkpoint_initialization_test(void) {
+    for (unsigned mode = 0; mode < 2; mode++) {
+        mt_ctx maps = {0}; atomic_init(&maps.owners, 0);
+        piece_map_hooks h = { &maps, map_acquire, map_release };
+        piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
+        piece_checkpoint *cp = NULL; REQUIRE(!piece_checkpoint_begin(t, &cp));
+        const uint8_t *old = (const uint8_t *)"old\ntext";
+        REQUIRE(!(mode ? piece_init_mapped(t, old, 8, &h) : piece_init_copy(t, old, 8)));
+        piece_snapshot *inside = piece_snapshot_take(t); REQUIRE(inside);
+        piece_checkpoint_abort(cp); REQUIRE(piece_len(t) == 0);
+        REQUIRE(atomic_load(&maps.owners) == (mode ? 1u : 0u));
+        REQUIRE(!piece_init_copy(t, (const uint8_t *)"new text", 8));
+        uint8_t b[8]; REQUIRE(!piece_snapshot_read(inside, 0, b, sizeof b) && !memcmp(b, old, sizeof b));
+        REQUIRE(piece_snapshot_line_count(inside) == 2);
+        piece_destroy(t);
+        REQUIRE(!piece_snapshot_read(inside, 0, b, sizeof b) && !memcmp(b, old, sizeof b));
+        piece_snapshot_release(inside); REQUIRE(!atomic_load(&maps.owners));
+    }
+    puts("checkpoint initialization: ok (abort restores eligibility; inside original/mapping stays valid)"); return 0;
+}
+/* Workers read transaction tails while abort restores the owning tree and
+ * subsequent edits reuse the same logical offsets. The mapping owners remain
+ * balanced across both kinds of checkpoint outcome and tree destruction. */
+static int checkpoint_mt_test(void) {
+    mt_ctx c = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+    atomic_init(&c.bad, 0); atomic_init(&c.checked, 0); atomic_init(&c.owners, 0);
+    piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
+    uint8_t original[1024]; memset(original, 'o', sizeof original); original[17] = '\n';
+    piece_map_hooks h = { &c, map_acquire, map_release };
+    REQUIRE(!piece_init_mapped(t, original, sizeof original, &h));
+    pthread_t th[4];
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_create(&th[i], NULL, mt_reader, &c));
+    uint8_t *payload = malloc(131091); REQUIRE(payload);
+    /* An append run straddles the saved mark in a partially used add chunk. */
+    REQUIRE(!piece_insert(t, sizeof original, (const uint8_t *)"tail", 4));
+    for (unsigned i = 0; i < 192; i++) {
+        REQUIRE(!piece_insert(t, piece_len(t), (const uint8_t *)"+", 1));
+        uint64_t before_len = piece_len(t), before_pieces = piece_piece_count(t);
+        piece_checkpoint *cp = NULL; REQUIRE(!piece_checkpoint_begin(t, &cp));
+        memset(payload, (int)('a' + i % 26), 131091); payload[65537] = '\n';
+        REQUIRE(!piece_insert(t, before_len, payload, 131091));
+        mt_job *j = malloc(sizeof *j); REQUIRE(j);
+        size_t n = (size_t)piece_len(t); uint8_t *copy = malloc(n); REQUIRE(copy);
+        REQUIRE(!piece_read(t, 0, copy, n)); pm_init(&j->model, copy, n); free(copy);
+        j->s = piece_snapshot_take(t); REQUIRE(j->s);
+        pthread_mutex_lock(&c.mu); j->next = c.head; c.head = j; pthread_cond_signal(&c.cv); pthread_mutex_unlock(&c.mu);
+        if (i % 3) {
+            piece_checkpoint_abort(cp);
+            REQUIRE(piece_len(t) == before_len && piece_piece_count(t) == before_pieces);
+            REQUIRE(!piece_insert(t, before_len, (const uint8_t *)"!", 1));
+            REQUIRE(piece_piece_count(t) == before_pieces);
+        } else {
+            piece_checkpoint_commit(cp);
+            REQUIRE(!piece_delete(t, before_len, 131091, NULL));
+        }
+    }
+    piece_destroy(t); free(payload);
+    pthread_mutex_lock(&c.mu); c.done = 1; pthread_cond_broadcast(&c.cv); pthread_mutex_unlock(&c.mu);
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_join(th[i], NULL));
+    REQUIRE(!atomic_load(&c.bad) && atomic_load(&c.checked) == 192 && !atomic_load(&c.owners));
+    pthread_cond_destroy(&c.cv); pthread_mutex_destroy(&c.mu);
+    puts("checkpoint snapshot threads: ok (abort/reuse/commit/destroy; mapping owners=0)");
+    return 0;
+}
 /* Frozen lifetime edge cases, absent from the old bptree variant's tests. */
 static int init_lifetime_test(void) {
     mt_ctx c = {0}; atomic_init(&c.owners, 0);
@@ -377,6 +454,6 @@ int main(int argc, char **argv) {
 #endif
 #endif
     bad |= init_lifetime_test(); bad |= failure_test(); bad |= small_memory_test(); bad |= repeat_snapshot_test(); bad |= typing_allocator_test();
-    bad |= mt_test();
+    bad |= mt_test(); bad |= checkpoint_mt_test(); bad |= checkpoint_unchanged_snapshot_test(); bad |= checkpoint_initialization_test();
     return bad;
 }

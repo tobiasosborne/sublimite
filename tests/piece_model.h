@@ -1,17 +1,45 @@
 /* Reference model for piece tests: flat buffer, naive, trivially correct. */
 #ifndef PIECE_MODEL_H
 #define PIECE_MODEL_H
+#include "piece/piece.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { uint8_t *d; size_t n, cap; } pm_model;
+typedef struct pm_checkpoint pm_checkpoint;
+typedef struct { uint8_t *d; size_t n, cap; pm_checkpoint *checkpoint; } pm_model;
+struct pm_checkpoint { pm_model *owner; uint8_t *d; size_t n, cap; };
 
 static inline void pm_init(pm_model *m, const uint8_t *d, size_t n) {
-    m->cap = n + 16; m->n = n; m->d = (uint8_t *)malloc(m->cap);
+    m->cap = n + 16; m->n = n; m->d = (uint8_t *)malloc(m->cap); m->checkpoint = NULL;
     if (n) memcpy(m->d, d, n);
 }
-static inline void pm_free(pm_model *m) { free(m->d); m->d = NULL; }
+static inline void pm_free(pm_model *m) {
+    if (m->checkpoint) { free(m->checkpoint->d); free(m->checkpoint); }
+    free(m->d); *m = (pm_model){0};
+}
+/* P1.3c oracle: save a flat copy at begin; abort transfers it back. Kernel
+ * allocator failure injection never applies to this independent model. */
+static inline int pm_checkpoint_begin(pm_model *m, pm_checkpoint **out) {
+    if (out) *out = NULL;
+    if (!m || !out || m->checkpoint) return PIECE_ERR_RANGE;
+    pm_checkpoint *c = malloc(sizeof *c);
+    if (!c) return PIECE_ERR_NOMEM;
+    c->d = malloc(m->cap);
+    if (!c->d) { free(c); return PIECE_ERR_NOMEM; }
+    if (m->n) memcpy(c->d, m->d, m->n);
+    c->owner = m; c->n = m->n; c->cap = m->cap;
+    m->checkpoint = c; *out = c;
+    return PIECE_OK;
+}
+static inline void pm_checkpoint_commit(pm_checkpoint *c) {
+    c->owner->checkpoint = NULL; free(c->d); free(c);
+}
+static inline void pm_checkpoint_abort(pm_checkpoint *c) {
+    pm_model *m = c->owner;
+    free(m->d); m->d = c->d; m->n = c->n; m->cap = c->cap;
+    m->checkpoint = NULL; free(c);
+}
 static inline void pm_insert(pm_model *m, size_t off, const uint8_t *d, size_t n) {
     if (m->n + n > m->cap) { m->cap = (m->n + n) * 2; m->d = (uint8_t *)realloc(m->d, m->cap); }
     memmove(m->d + off + n, m->d + off, m->n - off);

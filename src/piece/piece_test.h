@@ -15,9 +15,15 @@
 #ifdef PIECE_TESTING
 typedef struct piece_test_stats {
     uint64_t root_descents, cursor_hits, pathcopy_bytes, gap_deletes;
-    size_t leaf_bytes, branch_bytes;
+    size_t leaf_bytes, branch_bytes, snapshot_bytes;
+    unsigned height;
 } piece_test_stats;
 piece_test_stats piece_test_get_stats(const piece_tree *t);
+typedef struct piece_test_memory {
+    size_t slabs[3], live[3], underfull_leaves, leaf_pieces;
+    uint64_t deleted_original, fallback_add;
+} piece_test_memory;
+piece_test_memory piece_test_get_memory(const piece_tree *t);
 void piece_test_reset_stats(piece_tree *t);
 /* Quiescent snapshot only; fake owners do not invoke mapping hooks. Restore
  * the real count before releasing the test's owners. */
