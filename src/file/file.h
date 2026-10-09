@@ -17,26 +17,35 @@
  * by file_check (stat of the path; for mapped files also fstat of the mapped
  * inode vs the mapped length) and, optionally, an inotify fd the UI polls
  * (file_watch_*). Detection sets a sticky "changed" state; the UI surfaces
- * reload/keep. file_resolve_keep accepts the disk state as the new baseline;
+ * reload/keep. file_resolve_keep accepts the disk state as the new baseline
+ * only while the mapped original's bytes remain valid. A changed/faulted
+ * mapped original returns FILE_ERR_CHANGED: reload is required until the piece
+ * contract supports rebasing derived metadata (docs/decisions/P1.7c.md s5).
  * reload = file_close + file_open_begin. A save refuses with FILE_ERR_CHANGED
  * unless FILE_SAVE_FORCE, and the worker re-checks the identity under the
- * file lock immediately before the rename, so the check cannot be raced by
- * more than the rename itself. Save by rename never modifies a mapped inode.
+ * file lock immediately before the rename, including the snapshot's original
+ * inode, recovery epoch and UI invalidation generation. FORCE accepts an
+ * already changed source; a later invalidation still rejects that save.
+ * The remaining race is the last validation to rename. Save by rename never
+ * modifies a mapped inode.
  * SIGBUS (P1.7b): a process-wide handler turns reads past the new EOF of an
  * externally truncated mapped original (any thread) into zero-filled reads and
  * sets the same sticky "changed" state (FILE_CHG_TRUNCATED); file_changed and
  * file_check report it. Faults outside our mappings chain to the previous
  * handler / default action. Bytes read after the fault are zeros: the UI must
- * treat the buffer as stale and offer reload/keep. See docs/decisions/P1.7.md.
+ * treat the buffer as stale and offer reload. See docs/decisions/P1.7c.md.
  *
  * SAVE (perf s2.8). file_save_begin (UI): change check, piece_snapshot_take,
  * enqueue. Returning 0 IS the ack. The worker writes a temp file in the same
- * directory, fsyncs it, renames over the target, fsyncs the directory, then
+ * directory, fsyncs it, renames over the target, fsyncs the same retained parent
+ * directory descriptor, then
  * posts FILE_MSG_SAVE_DONE. Temp name: ".<base>.edit-<pid>-<ns>.tmp" in the
  * target directory; a crash can leave such a file but never a partial target.
  *
  * THREADS: file_* except file_save_write and the internal jobs are UI-thread
- * only. One open job and one save job per file at a time.
+ * only. One open job and one save job per file at a time. Worker result records
+ * are immutable after release publication; mailbox decode/readiness/status
+ * calls install them on the UI. Watches are managed only on the UI.
  * ERRORS: return codes, 0 = success. No printf. */
 #ifndef EDITOR_FILE_FILE_H
 #define EDITOR_FILE_FILE_H
@@ -122,13 +131,16 @@ typedef struct file_msg {
     int32_t err_no;
 } file_msg;
 
-/* Returns 0 and fills *out if m->kind is a file message. */
+/* UI-only. Returns 0 and fills *out if m->kind is a file message, installing
+ * the file's published result state before exposing the decoded notification.
+ * Decode only live notifications delivered by this file's work pool. */
 int file_msg_decode(const work_msg *m, file_msg *out);
 
 /* ---- open ---- */
 int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opts,
                     file **out);
-/* Cancels and waits for this file's jobs, releases resources. Snapshots and the
+/* Cancels every outstanding job/message for this file, waits for running job
+ * cleanup, and releases resources. Snapshots and the
  * tree keep any mapping alive through the refcount hooks. */
 void file_close(file *f);
 
@@ -148,7 +160,9 @@ int file_attach(file *f, piece_tree *t);
  * reasons != NULL it receives the FILE_CHG_* bits of this check. */
 int file_check(file *f, uint32_t *reasons);
 int file_changed(const file *f);
-/* User chose "keep": adopt the current disk identity as baseline, clear the flag. */
+/* User chose "keep": adopt the current disk identity as baseline, clear the
+ * flag. FILE_ERR_CHANGED if the mapped backing changed/faulted: accepting it
+ * would leave cached tree/snapshot newline counts inconsistent. */
 int file_resolve_keep(file *f);
 /* Optional inotify. start returns the fd to poll (>= 0) or -1. poll drains it
  * (non-blocking) and, if anything was seen, runs file_check; returns the
@@ -182,6 +196,10 @@ typedef struct file_save_args {
     void *step_ctx;
     int (*stop)(void *ctx);           /* non-zero = cancel; may be NULL */
     void *stop_ctx;
+    int (*validate)(void *ctx);       /* pre-rename source validation; FILE_OK or error */
+    void *validate_ctx;
+    void (*replaced)(void *ctx);      /* publish replacement identity under lock, if any */
+    void *replaced_ctx;
     pthread_mutex_t *lock;            /* held across check+rename+identity; may be NULL */
     file_id *out_id;                  /* identity of the new file; may be NULL */
     uint64_t written;                 /* out */

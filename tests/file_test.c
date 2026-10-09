@@ -1,5 +1,6 @@
 /* file_test.c -- P1.7: open, EOL, change detection, durable save. */
 #include "file/file.h"
+#include "file/file_test.h"
 #include "work/work.h"
 #include "base/base.h"
 #include "trace/trace.h"
@@ -525,13 +526,410 @@ static void t_sigbus(void)
     sigbus_foreign();                                   /* after: still chained */
 }
 
+/* ---- P1.7c review regressions (kept separate from the kill tests) ---- */
+#ifdef FILE_TEST_WRAP
+static _Atomic unsigned sysconf_calls, worker_watch_calls;
+static unsigned wrong_dir_syncs;
+static int check_dir_sync;
+static struct stat expected_dir;
+static pthread_t ui_thread;
+long __real_sysconf(int name);
+long __wrap_sysconf(int name);
+long __wrap_sysconf(int name)
+{
+    atomic_fetch_add(&sysconf_calls, 1);
+    return __real_sysconf(name);
+}
+int __real_inotify_add_watch(int fd, const char *path, uint32_t mask);
+int __wrap_inotify_add_watch(int fd, const char *path, uint32_t mask);
+int __wrap_inotify_add_watch(int fd, const char *path, uint32_t mask)
+{
+    if (!pthread_equal(pthread_self(), ui_thread)) atomic_fetch_add(&worker_watch_calls, 1);
+    return __real_inotify_add_watch(fd, path, mask);
+}
+int __real_inotify_rm_watch(int fd, int wd);
+int __wrap_inotify_rm_watch(int fd, int wd);
+int __wrap_inotify_rm_watch(int fd, int wd)
+{
+    if (!pthread_equal(pthread_self(), ui_thread)) atomic_fetch_add(&worker_watch_calls, 1);
+    return __real_inotify_rm_watch(fd, wd);
+}
+int __real_fsync(int fd);
+int __wrap_fsync(int fd);
+int __wrap_fsync(int fd)
+{
+    struct stat st;
+    if (check_dir_sync && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) &&
+        (st.st_dev != expected_dir.st_dev || st.st_ino != expected_dir.st_ino)) wrong_dir_syncs++;
+    return __real_fsync(fd);
+}
+#endif
+
+typedef struct { _Atomic int arrived, go; int at; } review_pause;
+static void review_pause_hook(void *ctx, int step)
+{
+    review_pause *b = ctx;
+    if (step != b->at) return;
+    atomic_store(&b->arrived, 1);
+    while (!atomic_load(&b->go)) sleep_ms(1);
+}
+static void review_wait_pause(review_pause *b)
+{
+    for (int i = 0; i < 5000 && !atomic_load(&b->arrived); i++) sleep_ms(1);
+    CHECK(atomic_load(&b->arrived));
+}
+static void review_wait_save(file *f)
+{
+    for (int i = 0; i < 5000 && file_save_busy(f); i++) sleep_ms(1);
+    CHECK(!file_save_busy(f));
+}
+static file *review_map(const char *name, piece_tree **t, size_t n)
+{
+    uint8_t *d = malloc(n); memset(d, 'x', n);
+    for (size_t i = 1; i < n; i += 2) d[i] = '\n';
+    write_file(name, d, n); free(d);
+    char p[512]; path_of(p, sizeof p, name);
+    file *f = NULL; file_msg m;
+    file_open_opts o = { 1, 0 };
+    CHECK(file_open_begin(&pool, p, &o, &f) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.status == FILE_OK);
+    *t = new_tree(); CHECK(file_attach(f, *t) == FILE_OK);
+    return f;
+}
+
+static void t_review_ui_publication(void)
+{
+    size_t n = 2u << 20;
+    uint8_t *d = malloc(n); memset(d, 'x', n);
+    write_file("publication.txt", d, n); free(d);
+    char p[512]; path_of(p, sizeof p, "publication.txt");
+    for (unsigned j = 0; j < 32; j++) {
+        file *f = NULL; file_msg m; file_open_opts o = {1, j};
+        CHECK(file_open_begin(&pool, p, &o, &f) == FILE_OK);
+        while (!file_open_ready(f)) {
+            (void)file_check(f, NULL); (void)file_changed(f); (void)file_errno(f);
+        }
+        CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.status == FILE_OK);
+        CHECK(file_errno(f) == 0);
+        file_close(f);
+    }
+    file *f = NULL; CHECK(file_open_begin(&pool, p, NULL, &f) == FILE_OK);
+    file_msg m; CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *t = new_tree(); CHECK(file_attach(f, t) == FILE_OK);
+    review_pause b = { .at = FILE_STEP_FSYNCED };
+    file_set_step_hook(f, review_pause_hook, &b);
+    CHECK(file_save_begin(f, t, 0, 33) == FILE_OK);
+    review_wait_pause(&b);
+    CHECK(file_watch_start(f) >= 0);
+    atomic_store(&b.go, 1);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK);
+    review_wait_save(f);
+    CHECK(file_watch_poll(f) == 0);
+#ifdef FILE_TEST_WRAP
+    CHECK(atomic_load(&worker_watch_calls) == 0);
+#endif
+    /* Identity is installed on the UI even while the namespace sync is still
+     * pending: observing our replacement must not raise an external change. */
+    review_pause after = { .at = FILE_STEP_RENAMED };
+    file_set_step_hook(f, review_pause_hook, &after);
+    CHECK(file_save_begin(f, t, 0, 34) == FILE_OK);
+    review_wait_pause(&after);
+    CHECK(file_check(f, NULL) == 0 && !file_changed(f));
+    atomic_store(&after.go, 1);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK);
+    review_wait_save(f);
+    piece_destroy(t); file_close(f);
+}
+
+static void t_review_late_source_fault(void)
+{
+    size_t n = 1u << 20;
+    piece_tree *t; file *f = review_map("late.txt", &t, n);
+    char p[512]; path_of(p, sizeof p, "late.txt");
+    int oldfd = open(p, O_RDWR); CHECK(oldfd >= 0);
+    file_msg m;
+    CHECK(file_save_begin(f, t, 0, 1) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK);
+    review_wait_save(f);
+    review_pause b = { .at = FILE_STEP_TEMP_CREATED };
+    file_set_step_hook(f, review_pause_hook, &b);
+    CHECK(file_save_begin(f, t, 0, 2) == FILE_OK);
+    review_wait_pause(&b);
+    CHECK(ftruncate(oldfd, 4096) == 0);
+    uint8_t byte = 1;
+    CHECK(piece_read(t, 4096, &byte, 1) == 0 && byte == 0);
+    CHECK(file_check(f, NULL) == 1);
+    atomic_store(&b.go, 1);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED);
+    uint8_t *got = malloc(n);
+    CHECK(read_file("late.txt", got, n) == n);
+    CHECK(got[8192] == 'x' && got[8193] == '\n');
+    CHECK(file_changed(f));
+    free(got); close(oldfd); piece_destroy(t); file_close(f);
+}
+
+static void t_review_keep_counts(void)
+{
+    size_t n = 65536;
+    piece_tree *t; file *f = review_map("counts.txt", &t, n);
+    piece_snapshot *s = piece_snapshot_take(t);
+    CHECK(piece_line_count(t) == n / 2 + 1);
+    CHECK(piece_snapshot_line_count(s) == n / 2 + 1);
+    uint8_t *d = malloc(n); memset(d, 'x', n);
+    write_file("counts.txt", d, n);
+    CHECK(file_check(f, NULL) == 1);
+    /* Accepting this backing would bless stale counts in tree AND snapshot.
+     * Until piece supports rebasing, keep must refuse the compromised source. */
+    CHECK(file_resolve_keep(f) == FILE_ERR_CHANGED);
+    CHECK(file_changed(f));
+    CHECK(tree_equals(t, d, n));
+    CHECK(piece_line_count(t) == n / 2 + 1); /* witness the frozen-contract conflict */
+    piece_snapshot_release(s); piece_destroy(t); file_close(f); free(d);
+}
+
+static void t_review_late_source_identity(void)
+{
+    piece_tree *t; file *f = review_map("source-id.txt", &t, 16384);
+    char p[512]; path_of(p, sizeof p, "source-id.txt");
+    int oldfd = open(p, O_RDWR); CHECK(oldfd >= 0);
+    file_msg m;
+    CHECK(file_save_begin(f, t, 0, 1) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK); review_wait_save(f);
+    review_pause b = { .at = FILE_STEP_FSYNCED };
+    file_set_step_hook(f, review_pause_hook, &b);
+    CHECK(file_save_begin(f, t, 0, 2) == FILE_OK); review_wait_pause(&b);
+    CHECK(pwrite(oldfd, "Q", 1, 10) == 1);
+    struct timespec ts[2] = { { 1100000000, 0 }, { 1100000000, 0 } };
+    CHECK(futimens(oldfd, ts) == 0);
+    /* No UI check and no SIGBUS: validate the snapshot's inode itself. */
+    atomic_store(&b.go, 1);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED);
+    uint8_t got[16384]; CHECK(read_file("source-id.txt", got, sizeof got) == sizeof got);
+    CHECK(got[10] == 'x');
+    close(oldfd); piece_destroy(t); file_close(f);
+}
+
+static void t_review_late_sticky_change(void)
+{
+    write_file("sticky-save.txt", (const uint8_t *)"saved\n", 6);
+    char p[512]; path_of(p, sizeof p, "sticky-save.txt");
+    file *f = NULL; CHECK(file_open_begin(&pool, p, NULL, &f) == FILE_OK);
+    piece_tree *t = new_tree(); CHECK(file_attach(f, t) == FILE_OK);
+    struct stat st; CHECK(stat(p, &st) == 0);
+    review_pause b = { .at = FILE_STEP_FSYNCED };
+    file_set_step_hook(f, review_pause_hook, &b);
+    CHECK(file_save_begin(f, t, 0, 1) == FILE_OK); review_wait_pause(&b);
+    struct timespec ts[2] = { st.st_atim, { 1100000000, 0 } };
+    CHECK(utimensat(AT_FDCWD, p, ts, 0) == 0);
+    CHECK(file_check(f, NULL) == 1);
+    ts[1] = st.st_mtim; CHECK(utimensat(AT_FDCWD, p, ts, 0) == 0);
+    CHECK(file_resolve_keep(f) == FILE_OK); /* clearing changed cannot revive this job */
+    atomic_store(&b.go, 1);
+    file_msg m; CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED);
+    CHECK(stat(p, &st) == 0); /* target was not replaced */
+    piece_destroy(t); file_close(f);
+}
+
+static void t_review_late_force_fault(void)
+{
+    piece_tree *t; file *f = review_map("force-fault.txt", &t, 16384);
+    char p[512]; path_of(p, sizeof p, "force-fault.txt");
+    CHECK(truncate(p, 4096) == 0);
+    uint8_t byte = 1;
+    CHECK(piece_read(t, 8192, &byte, 1) == 0 && byte == 0);
+    CHECK(file_check(f, NULL) == 1);
+    review_pause b = { .at = FILE_STEP_TEMP_CREATED };
+    file_set_step_hook(f, review_pause_hook, &b);
+    CHECK(file_save_begin(f, t, FILE_SAVE_FORCE, 1) == FILE_OK); review_wait_pause(&b);
+    /* This generation was already faulted at acknowledgement. Another fault
+     * must still invalidate it, even though the old boolean stays true. */
+    CHECK(piece_read(t, 4096, &byte, 1) == 0 && byte == 0);
+    atomic_store(&b.go, 1);
+    file_msg m; CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED);
+    struct stat st; CHECK(stat(p, &st) == 0 && st.st_size == 4096);
+    piece_destroy(t); file_close(f);
+}
+
+typedef struct { char from[512], to[512]; int at, replacement; } review_dir_move;
+static void review_move_hook(void *ctx, int step)
+{
+    review_dir_move *m = ctx;
+    if (step != m->at) return;
+    CHECK(rename(m->from, m->to) == 0);
+    /* A pathname reopen would now encounter this unrelated namespace. */
+    if (m->replacement) CHECK(mkdir(m->from, 0700) == 0);
+    else CHECK(symlink("/dev/null", m->from) == 0);
+}
+static void t_review_directory_barrier(void)
+{
+    for (int scenario = 0; scenario < 3; scenario++) {
+        int at = scenario == 0 ? FILE_STEP_TEMP_CREATED : FILE_STEP_RENAMED;
+        review_dir_move m = { .at = at, .replacement = scenario == 2 };
+        snprintf(m.from, sizeof m.from, "%s/parent-%d", dir, scenario);
+        snprintf(m.to, sizeof m.to, "%s/moved-%d", dir, scenario);
+        CHECK(mkdir(m.from, 0700) == 0);
+#ifdef FILE_TEST_WRAP
+        CHECK(stat(m.from, &expected_dir) == 0);
+        check_dir_sync = 1; wrong_dir_syncs = 0;
+#endif
+        char target[600]; snprintf(target, sizeof target, "%s/target", m.from);
+        int fd = open(target, O_WRONLY | O_CREAT, 0600); CHECK(fd >= 0); close(fd);
+        piece_tree *t = new_tree();
+        CHECK(piece_init_copy(t, (const uint8_t *)"saved\n", 6) == 0);
+        piece_snapshot *s = piece_snapshot_take(t);
+        file_save_args a = {0}; a.path = target; a.snap = s;
+        a.step = review_move_hook; a.step_ctx = &m;
+        CHECK(file_save_write(&a) == FILE_OK);
+#ifdef FILE_TEST_WRAP
+        check_dir_sync = 0;
+        CHECK(wrong_dir_syncs == 0);
+#endif
+        snprintf(target, sizeof target, "%s/target", m.to);
+        uint8_t bytes[8] = {0}; fd = open(target, O_RDONLY); CHECK(fd >= 0);
+        CHECK(read(fd, bytes, sizeof bytes) == 6 && memcmp(bytes, "saved\n", 6) == 0);
+        close(fd); piece_snapshot_release(s); piece_destroy(t);
+    }
+}
+
+static void t_review_old_completions(void)
+{
+    write_file("pending.txt", (const uint8_t *)"old\n", 4);
+    char p[512]; path_of(p, sizeof p, "pending.txt");
+    file *f = NULL; CHECK(file_open_begin(&pool, p, NULL, &f) == FILE_OK);
+    piece_tree *t = new_tree(); CHECK(file_attach(f, t) == FILE_OK);
+    CHECK(file_save_begin(f, t, 0, 1) == FILE_OK); review_wait_save(f);
+    CHECK(file_save_begin(f, t, 0, 2) == FILE_OK); review_wait_save(f);
+    file_close(f);
+    coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+    CHECK(c.n == 0); /* no freed file pointer reaches a completion callback */
+    piece_destroy(t);
+}
+
+static void t_review_handler_page_size(void)
+{
+    piece_tree *t; file *f = review_map("page-size.txt", &t, 16384);
+    char p[512]; path_of(p, sizeof p, "page-size.txt");
+    CHECK(truncate(p, 4096) == 0);
+#ifdef FILE_TEST_WRAP
+    unsigned before = atomic_load(&sysconf_calls);
+#endif
+    uint8_t byte = 1;
+    CHECK(piece_read(t, 8192, &byte, 1) == 0 && byte == 0);
+#ifdef FILE_TEST_WRAP
+    CHECK(atomic_load(&sysconf_calls) == before);
+#endif
+    piece_destroy(t); file_close(f);
+}
+
+static volatile sig_atomic_t review_bus_calls, review_bus_mask_ok;
+static void review_bus_one(int sig)
+{
+    sigset_t mask; (void)sigprocmask(SIG_SETMASK, NULL, &mask);
+    review_bus_mask_ok = sig == SIGBUS && sigismember(&mask, SIGUSR1) == 1
+                        && sigismember(&mask, SIGBUS) == 1;
+    review_bus_calls++;
+}
+static void review_bus_info(int sig, siginfo_t *si, void *uc)
+{
+    review_bus_one(sig);
+    if (!si || si->si_signo != SIGBUS || !uc) review_bus_mask_ok = 0;
+}
+static void review_bus_nodefer(int sig)
+{
+    sigset_t mask; (void)sigprocmask(SIG_SETMASK, NULL, &mask);
+    review_bus_mask_ok = sig == SIGBUS && sigismember(&mask, SIGUSR1) == 1
+                        && sigismember(&mask, SIGBUS) == 0;
+    review_bus_calls++;
+    if (review_bus_calls == 1) (void)raise(SIGBUS);
+}
+static void review_signal_setup(const char *mode)
+{
+    struct sigaction sa = {0}; sigemptyset(&sa.sa_mask); sigaddset(&sa.sa_mask, SIGUSR1);
+    if (strcmp(mode, "ignore") == 0) { sa.sa_handler = SIG_IGN; sa.sa_flags = SA_SIGINFO; }
+    else if (strcmp(mode, "default") == 0) sa.sa_handler = SIG_DFL;
+    else if (strcmp(mode, "info") == 0) { sa.sa_sigaction = review_bus_info; sa.sa_flags = SA_SIGINFO; }
+    else if (strcmp(mode, "nodefer") == 0) { sa.sa_handler = review_bus_nodefer; sa.sa_flags = SA_NODEFER; }
+    else { sa.sa_handler = review_bus_one; if (strcmp(mode, "reset") == 0) sa.sa_flags = (int)SA_RESETHAND; }
+    CHECK(sigaction(SIGBUS, &sa, NULL) == 0);
+}
+static void t_review_signal_child(const char *mode)
+{
+    piece_tree *t; file *f = review_map("chain.txt", &t, 16384);
+    CHECK(raise(SIGBUS) == 0);
+    if (strcmp(mode, "default") == 0) _exit(91); /* default must never return */
+    if (strcmp(mode, "ignore") != 0)
+        CHECK(review_bus_calls == (strcmp(mode, "nodefer") == 0 ? 2 : 1) && review_bus_mask_ok);
+    char p[512]; path_of(p, sizeof p, "chain.txt");
+    CHECK(truncate(p, 4096) == 0);
+    uint8_t byte = 1; CHECK(piece_read(t, 8192, &byte, 1) == 0 && byte == 0);
+    if (strcmp(mode, "reset") == 0) { CHECK(raise(SIGBUS) == 0); _exit(92); }
+    piece_destroy(t); file_close(f);
+}
+static void t_review_signal_chaining(void)
+{
+    const char *modes[] = { "ignore", "default", "mask", "info", "reset", "nodefer" };
+    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+        pid_t pid = fork(); CHECK(pid >= 0);
+        if (pid == 0) {
+            (void)setenv("FT_SIGNAL", modes[i], 1);
+            (void)setenv("FT_CASE", "signal_child", 1);
+            execl("/proc/self/exe", "file_test", (char *)NULL); _exit(90);
+        }
+        int st = 0; CHECK(waitpid(pid, &st, 0) == pid);
+        int fatal = strcmp(modes[i], "default") == 0 || strcmp(modes[i], "reset") == 0;
+        int ok = fatal ? WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS
+                       : WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (!ok) fprintf(stderr, "signal chain %s: FAIL status=%d\n", modes[i], st);
+        CHECK(ok);
+    }
+}
+
+static void review_run(const char *name, void (*fn)(void))
+{
+    int before = fails; fn();
+    fprintf(stderr, "%s: %s\n", name, before == fails ? "ok" : "FAIL");
+}
+
+static void t_review_registry(void)
+{
+    int ok = file_test_guard_registry();
+    CHECK((ok & 1) != 0);
+    CHECK((ok & 2) != 0);
+}
+
 int main(void)
 {
     const char *base = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/edit-file-test-XXXXXX", base ? base : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
     trace_init();
+    const char *signal_mode = getenv("FT_SIGNAL");
+    if (signal_mode) review_signal_setup(signal_mode);
+#ifdef FILE_TEST_WRAP
+    ui_thread = pthread_self();
+#endif
     EDIT_ASSERT(work_pool_init(&pool, 1, 0) == 0);
+
+    const char *review_case = getenv("FT_CASE");
+    if (review_case) {
+        if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
+        else if (strcmp(review_case, "1") == 0) review_run("finding1", t_review_registry);
+        else if (strcmp(review_case, "2") == 0) review_run("finding2", t_review_signal_chaining);
+        else if (strcmp(review_case, "3") == 0) review_run("finding3", t_review_ui_publication);
+        else if (strcmp(review_case, "4") == 0) {
+            review_run("finding4", t_review_late_source_fault);
+            review_run("finding4 source identity", t_review_late_source_identity);
+            review_run("finding4 invalidated generation", t_review_late_sticky_change);
+            review_run("finding4 forced late fault", t_review_late_force_fault);
+        }
+        else if (strcmp(review_case, "4force") == 0) review_run("finding4 forced late fault", t_review_late_force_fault);
+        else if (strcmp(review_case, "5") == 0) review_run("finding5", t_review_keep_counts);
+        else if (strcmp(review_case, "7") == 0) review_run("finding7", t_review_directory_barrier);
+        else if (strcmp(review_case, "8") == 0) review_run("finding8", t_review_old_completions);
+        else if (strcmp(review_case, "9") == 0) review_run("finding9", t_review_handler_page_size);
+        else CHECK(0);
+        goto finish;
+    }
 
     if (getenv("FT_V")) {
         fprintf(stderr, "run eol\n");
@@ -579,6 +977,19 @@ int main(void)
     }
     t_sigbus();
 
+    review_run("finding1", t_review_registry);
+    review_run("finding2", t_review_signal_chaining);
+    review_run("finding3", t_review_ui_publication);
+    review_run("finding4", t_review_late_source_fault);
+    review_run("finding4 source identity", t_review_late_source_identity);
+    review_run("finding4 invalidated generation", t_review_late_sticky_change);
+    review_run("finding4 forced late fault", t_review_late_force_fault);
+    review_run("finding5", t_review_keep_counts);
+    review_run("finding7", t_review_directory_barrier);
+    review_run("finding8", t_review_old_completions);
+    review_run("finding9", t_review_handler_page_size);
+
+finish:
     work_pool_shutdown(&pool);
     char cmd[300]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0) fprintf(stderr, "cleanup failed\n");
