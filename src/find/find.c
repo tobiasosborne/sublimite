@@ -1,7 +1,6 @@
-/* Slow, allocation-free specification reference. Deliberately naive literal
- * verification and restarted anchored Thompson runs; P1.10 replaces kernels. */
-#include "find.h"
-#include <string.h>
+/* Regex half of find (frozen P1.10a semantics). Literal search lives in
+ * literal.c; the regex literal prefix is searched with that kernel. */
+#include "literal.h"
 
 #define FIND_MAGIC UINT32_C(0x66696e64)
 #define FIND_NONE UINT16_MAX
@@ -18,113 +17,6 @@ struct find_regex {
     uint8_t prefix[FIND_MAX_STATES];
     state states[FIND_MAX_STATES];
 };
-typedef struct meter {
-    const find_control *control;
-    unsigned units;
-    bool stopped;
-} meter;
-static bool poll_stop(meter *m)
-{
-    const find_control *c=m->control;
-    if (c && ((c->work && work_should_stop(c->work)) ||
-        (c->cancel && atomic_load_explicit(c->cancel,memory_order_acquire)) ||
-        (c->generation && atomic_load_explicit(c->generation,memory_order_acquire)!=c->expected_generation)))
-        m->stopped=true;
-    m->units=0;
-    return m->stopped;
-}
-static bool step(meter *m)
-{
-    m->units++;
-    return m->units>=FIND_POLL_UNITS ? poll_stop(m) : m->stopped;
-}
-static void clear_match(find_match *m)
-{
-    memset(m,0,sizeof *m);
-    m->whole=(find_capture){FIND_UNSET,FIND_UNSET};
-    for (size_t i=0;i<FIND_MAX_GROUPS;i++) m->captures[i]=m->whole;
-}
-static bool source_valid(const find_source *s)
-{ return s && (s->snapshot || s->bytes || s->length==0); }
-static uint64_t source_len(const find_source *s)
-{ return s->snapshot ? piece_snapshot_len(s->snapshot) : (uint64_t)s->length; }
-/* Lazy zero-copy snapshot reader, including verifications across pieces. */
-typedef struct reader {
-    const find_source *source;
-    uint64_t len, base;
-    const uint8_t *p;
-    size_t n;
-    piece_iter it;
-} reader;
-static reader reader_init(const find_source *s)
-{
-    reader r={0}; r.source=s; r.len=source_len(s); return r;
-}
-static uint8_t get_byte(reader *r,uint64_t off)
-{
-    if (!r->source->snapshot) return r->source->bytes[(size_t)off];
-    if (!r->p || off<r->base || off-r->base>=(uint64_t)r->n) {
-        piece_iter_begin_snapshot(&r->it,r->source->snapshot,off);
-        r->base=off;
-        (void)piece_iter_next(&r->it,&r->p,&r->n);
-    }
-    return r->p[(size_t)(off-r->base)];
-}
-static bool literal_seek(reader *r,const uint8_t *needle,size_t n,uint64_t off,meter *m,find_match *out)
-{
-    if (n==0 || (uint64_t)n>r->len-off) return false;
-    uint64_t last=r->len-(uint64_t)n;
-    for (uint64_t i=off;;i++) {
-        size_t k=0;
-        while (k<n) {
-            if (step(m)) return false;
-            if (get_byte(r,i+(uint64_t)k)!=needle[k]) break;
-            k++;
-        }
-        if (k==n) {
-            out->matched=true; out->whole=(find_capture){i,i+(uint64_t)n}; return true;
-        }
-        if (step(m) || i==last) break;
-    }
-    return false;
-}
-find_code find_literal_next(const find_source *source,const uint8_t *needle,size_t n,uint64_t off,
-                            const find_control *control,find_match *match)
-{
-    if (!match) return FIND_ERR_ARGUMENT;
-    clear_match(match);
-    if (!source_valid(source) || (!needle && n) || off>source_len(source)) return FIND_ERR_ARGUMENT;
-    meter m={control,0,false}; reader r=reader_init(source);
-    if (!poll_stop(&m)) (void)literal_seek(&r,needle,n,off,&m,match);
-    if (poll_stop(&m)) { clear_match(match); return FIND_CANCELLED; }
-    return FIND_OK;
-}
-static find_code add_result(find_result *r,uint64_t off)
-{
-    if (r->total==UINT64_MAX) return FIND_ERR_LIMIT;
-    if (r->stored<FIND_MAX_OFFSETS) r->offsets[r->stored++]=off;
-    r->total++; return FIND_OK;
-}
-find_code find_literal(const find_source *source,const uint8_t *needle,size_t n,
-                       const find_control *control,find_result *result)
-{
-    if (!result) return FIND_ERR_ARGUMENT;
-    result->total=0; result->stored=0;
-    if (!source_valid(source) || (!needle && n)) return FIND_ERR_ARGUMENT;
-    meter m={control,0,false}; reader r=reader_init(source); uint64_t off=0;
-    find_code code=FIND_OK;
-    if (!poll_stop(&m)) for (;;) {
-        find_match hit; clear_match(&hit);
-        if (!literal_seek(&r,needle,n,off,&m,&hit)) break;
-        code=add_result(result,hit.whole.start);
-        if (code!=FIND_OK) break;
-        off=hit.whole.end;
-    }
-    if (poll_stop(&m)) code=FIND_CANCELLED;
-    if (code!=FIND_OK) { result->total=0; result->stored=0; }
-    return code;
-}
-
 /* Compiler: closed Thompson fragments, with a conservative common-prefix
  * calculation. Prefix filtering is sound even for nullable branches/loops. */
 typedef struct fragment {
@@ -368,22 +260,26 @@ static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,mete
     }
     if (hit->matched) hit->whole.start=off;
 }
-static bool prefix_matches(reader *r,const find_regex *re,uint64_t off,meter *m)
-{
-    if ((uint64_t)re->prefix_len>r->len-off) return false;
-    for (size_t i=0;i<re->prefix_len;i++) {
-        if (step(m) || get_byte(r,off+i)!=re->prefix[i]) return false;
-    }
-    return true;
-}
+/* Candidate starts come from the literal kernel (rare-byte filter + verify,
+ * Two-Way fallback) when the program has a mandatory literal prefix. */
 static bool regex_seek(reader *r,const find_regex *re,uint64_t off,scratch *s,meter *m,find_match *hit)
 {
+    if (re->prefix_len) {
+        find_lit lit; uint64_t at=0;
+        if (!find_lit_init(&lit,re->prefix,re->prefix_len,m,false)) return false;
+        for (uint64_t i=off;;) {
+            if (find_lit_seek(&lit,r->source,r->len,i,&at)<=0) return false;
+            anchored(r,re,at,s,m,hit);
+            if (hit->matched) return true;
+            if (m->stopped || at==r->len) return false;
+            if (step(m)) return false;
+            i=at+1;
+        }
+    }
     for (uint64_t i=off;;i++) {
         if (step(m)) break;
-        if (prefix_matches(r,re,i,m)) {
-            anchored(r,re,i,s,m,hit);
-            if (hit->matched) return true;
-        }
+        anchored(r,re,i,s,m,hit);
+        if (hit->matched) return true;
         if (m->stopped || i==r->len) break;
     }
     return false;
@@ -429,6 +325,7 @@ find_code find_regex_search(const find_source *source,const find_regex *re,void 
         if (!regex_seek(&r,re,off,memory,&m,&hit)) break;
         code=add_result(result,hit.whole.start);
         if (code!=FIND_OK) break;
+        if (step(&m)) break;
         off=hit.whole.end;
         if (off==hit.whole.start) { if (off==r.len) break; off++; }
     }
