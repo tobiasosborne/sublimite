@@ -3,7 +3,7 @@
 #include <stdlib.h>
 /* Compile the SAME undo implementation with trivial piece calls to isolate
  * bookkeeping (not a subtraction of two noisy timings). All log paths remain. */
-typedef struct undo_bench_tree { uint64_t len; } undo_bench_tree;
+typedef struct undo_bench_tree { uint64_t len,saved; int checkpoint; } undo_bench_tree;
 static uint64_t undo_bench_len(const piece_tree *t) { return ((const undo_bench_tree *)t)->len; }
 static int undo_bench_insert(piece_tree *t,uint64_t off,const uint8_t *p,size_t n) {
     (void)off;(void)p; ((undo_bench_tree *)t)->len+=n; return 0;
@@ -12,10 +12,22 @@ static int undo_bench_delete(piece_tree *t,uint64_t off,uint64_t n,piece_ref *r)
     ((undo_bench_tree *)t)->len-=n; memset(r,0,sizeof *r); r->nspans=1;r->len=n;r->span[0].add_off=off;r->span[0].len=n; return 0;
 }
 static int undo_bench_ref(piece_tree *t,uint64_t off,const piece_ref *r) { (void)off;((undo_bench_tree *)t)->len+=r->len;return 0; }
+static int undo_bench_checkpoint_begin(piece_tree *t,piece_checkpoint **out) {
+    undo_bench_tree *mt=(undo_bench_tree *)t;*out=NULL;
+    if(mt->checkpoint) return PIECE_ERR_RANGE;
+    mt->saved=mt->len;mt->checkpoint=1;*out=(piece_checkpoint *)(void *)mt;return PIECE_OK;
+}
+static void undo_bench_checkpoint_commit(piece_checkpoint *cp) { ((undo_bench_tree *)(void *)cp)->checkpoint=0; }
+static void undo_bench_checkpoint_abort(piece_checkpoint *cp) {
+    undo_bench_tree *mt=(undo_bench_tree *)(void *)cp;mt->len=mt->saved;mt->checkpoint=0;
+}
 #define piece_len undo_bench_len
 #define piece_insert undo_bench_insert
 #define piece_delete undo_bench_delete
 #define piece_insert_ref undo_bench_ref
+#define piece_checkpoint_begin undo_bench_checkpoint_begin
+#define piece_checkpoint_commit undo_bench_checkpoint_commit
+#define piece_checkpoint_abort undo_bench_checkpoint_abort
 #define undo_maintain undo_bench_mock_maintain
 #define undo_undo_slice undo_bench_mock_undo_slice
 #define undo_redo_slice undo_bench_mock_redo_slice
@@ -37,6 +49,9 @@ static int undo_bench_ref(piece_tree *t,uint64_t off,const piece_ref *r) { (void
 #undef piece_insert
 #undef piece_delete
 #undef piece_insert_ref
+#undef piece_checkpoint_begin
+#undef piece_checkpoint_commit
+#undef piece_checkpoint_abort
 #undef undo_maintain
 #undef undo_undo_slice
 #undef undo_redo_slice
@@ -74,8 +89,9 @@ static int memory_gate(const undo_log *u,const memory_meter *m,size_t typed,size
     /* Frozen piece.h fixed initialization allowance, plus one undo page of
      * rounding. Everything else is charged, including retired committed slots.
      * No virtual reservation is counted as physical memory. */
-    size_t fixed=64u*1024u+4096u+u->page_bytes-1;
-    size_t records=st.records+st.retired_records;
+    size_t rounding=(u->page_bytes-1)*(u->replay_committed_bytes?2u:1u);
+    size_t fixed=64u*1024u+4096u+rounding;
+    size_t records=st.records+st.retired_records+st.replay_records;
     uint64_t bound=(uint64_t)fixed+96*piece_piece_count(u->tree)+64*(uint64_t)records+
         (5*(uint64_t)(typed+original)+3)/4+(uint64_t)snapshots;
     uint64_t owned=(uint64_t)m->live+(uint64_t)st.committed_bytes;

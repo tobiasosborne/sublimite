@@ -47,26 +47,39 @@ static void completed(model *m,int reverse,size_t count,undo_state *expected) {
     }
 }
 static void fuzz_replay(undo_log *u,model *m,fuzz_allocator *f,int reverse,size_t requested,uint8_t seed,uint8_t work) {
-    size_t remaining=requested,rounds=0;int inject=1;
+    size_t remaining=requested,rounds=0;
     while(remaining) {
         uint8_t before[MAX_BYTES],after[MAX_BYTES];size_t bn=(size_t)piece_len(u->tree);
         must(bn<=MAX_BYTES && piece_read(u->tree,0,before,bn)==0);
-        f->calls=0;f->fail=inject?1u+seed%8u:0;f->persistent=(seed&16u)!=0;inject=0;
+        int was_partial=u->partial!=0;
+        /* Inject at later operation/slice indexes too, then guarantee a healthy
+         * retry so permanent failure cannot make a vacuous passing history. */
+        f->calls=0;f->fail=rounds<8?1u+(seed+rounds)%16u:0;f->persistent=(seed&16u)!=0;
         undo_change c;size_t budget=1u+work%8u;
         int rc=reverse?undo_undo_slice(u,remaining,budget,UINT64_MAX,&c):undo_redo_slice(u,remaining,budget,UINT64_MAX,&c);
         f->fail=0;
         must(rc==0 || rc==UNDO_MORE || rc==UNDO_ERR_NOMEM);
         must(c.operations<=budget && c.records<=PIECE_REF_SPANS*c.operations && c.groups<=remaining);
         size_t an=(size_t)piece_len(u->tree);must(an<=MAX_BYTES && piece_read(u->tree,0,after,an)==0);
-        if(!c.records) must(bn==an && memcmp(before,after,bn)==0 && c.len==0);
-        for(size_t j=0;j<(bn<an?bn:an);j++) if(before[j]!=after[j]) must(j>=c.off && j<c.off+c.len);
-        if(bn!=an) must(c.records && c.off+c.len>=(bn>an?bn:an));
+        if(rc!=UNDO_ERR_NOMEM || !was_partial) {
+            if(!c.records) must(bn==an && memcmp(before,after,bn)==0 && c.len==0);
+            for(size_t j=0;j<(bn<an?bn:an);j++) if(before[j]!=after[j]) must(j>=c.off && j<c.off+c.len);
+            if(bn!=an) must(c.records && c.off+c.len>=(bn>an?bn:an));
+        }
         undo_state expected={{0}};completed(m,reverse,c.groups,&expected);
         must(c.has_state==(c.groups!=0));if(c.has_state) must(memcmp(&c.state,&expected,sizeof expected)==0);
         remaining-=c.groups;
+        if(rc==UNDO_ERR_NOMEM) {
+            must(!u->partial && !undo_replay_snapshot(u));
+            must(an==m->len && memcmp(after,m->bytes,an)==0);
+        }
         if(u->partial) {
             const piece_snapshot *view=undo_replay_snapshot(u);uint8_t stable[MAX_BYTES];
             must(view && piece_snapshot_len(view)==m->len && piece_snapshot_read(view,0,stable,m->len)==0 && memcmp(stable,m->bytes,m->len)==0);
+            undo_stats st=undo_get_stats(u);
+            must(st.live_bytes==64*(st.records+st.retired_records+st.replay_records));
+            must(st.committed_bytes>=st.live_bytes && st.committed_bytes-st.live_bytes<2*u->page_bytes);
+            must(undo_maintain(u,16)==0);
         }
         if(rc==UNDO_ERR_NOMEM && (seed&16u)) {
             f->calls=0;f->fail=1;f->persistent=1;
@@ -81,6 +94,44 @@ static void fuzz_replay(undo_log *u,model *m,fuzz_allocator *f,int reverse,size_
         must(++rounds<=8192);if(rc==0) break;
     }
     m->burst=0;
+}
+/* Direct piece checkpoint/failure ops must leave existing undo refs valid.
+ * A nested undo replay must reject the caller's checkpoint without consuming
+ * it, then the caller aborts under permanent allocation failure. */
+static void fuzz_checkpoint(undo_log *u,model *m,fuzz_allocator *f,uint8_t seed,uint8_t value) {
+    piece_checkpoint *cp=NULL;
+    f->calls=0;f->fail=1u+seed%8u;f->persistent=(seed&16u)!=0;
+    int rc=piece_checkpoint_begin(u->tree,&cp);
+    must(rc==PIECE_OK || rc==PIECE_ERR_NOMEM);
+    if(rc==PIECE_ERR_NOMEM) must(!cp);
+    else {
+        must(cp);piece_checkpoint *nested=NULL;
+        must(piece_checkpoint_begin(u->tree,&nested)==PIECE_ERR_RANGE && !nested);
+        f->fail=0;
+        if(!m->open && (m->pos || m->pos<m->n)) {
+            undo_change c;
+            int busy=m->pos?undo_undo(u,1,&c):undo_redo(u,1,&c);
+            must(busy==UNDO_ERR_RANGE && c.records==0 && c.groups==0 && !u->partial);
+            m->burst=0;
+        }
+        f->fail=f->calls+1u+seed%8u;
+        uint8_t bytes[17];memset(bytes,value,sizeof bytes);
+        uint64_t off=m->len?(uint64_t)seed%(m->len+1):0;
+        rc=piece_insert(u->tree,off,bytes,sizeof bytes);must(rc==PIECE_OK || rc==PIECE_ERR_NOMEM);
+        if(rc==PIECE_OK) {
+            piece_ref ref;rc=piece_delete(u->tree,off,sizeof bytes,&ref);
+            must(rc==PIECE_OK || rc==PIECE_ERR_NOMEM);
+            if(rc==PIECE_OK) { rc=piece_insert_ref(u->tree,off,&ref);must(rc==PIECE_OK || rc==PIECE_ERR_NOMEM); }
+        }
+        f->fail=f->calls+1;f->persistent=1;size_t calls=f->calls;
+        piece_checkpoint_abort(cp);must(f->calls==calls);
+    }
+    f->fail=0;
+    uint8_t unchanged[MAX_BYTES];must(piece_len(u->tree)==m->len && piece_read(u->tree,0,unchanged,m->len)==0 && memcmp(unchanged,m->bytes,m->len)==0);
+    /* A healthy empty commit is also mandatory. */
+    must(piece_checkpoint_begin(u->tree,&cp)==PIECE_OK && cp);
+    f->fail=f->calls+1;f->persistent=1;size_t calls=f->calls;
+    piece_checkpoint_commit(cp);must(f->calls==calls);f->fail=0;
 }
 /* The reviewed near-capacity fragmentation script, with varied noise bytes.
  * A healthy allocator must never strand expansion inside its two-op group. */
@@ -109,7 +160,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size) {
     piece_allocator a={&allocator,fuzz_alloc,fuzz_free};piece_tree *t=piece_create(&a);must(t!=NULL);
     undo_log u;must(undo_init(&u,t,wide?8192:32)==0);must(undo_set_cap(&u,m->cap)==0);
     for(size_t i=0;i+3<size;i+=4) {
-        uint8_t op=data[i]%10; uint64_t tm=m->tm+(uint64_t)data[i+3]*3000000;
+        uint8_t op=data[i]%11; uint64_t tm=m->tm+(uint64_t)data[i+3]*3000000;
         undo_state before={{0}},after={{0}};before.bytes[0]=data[i+1];after.bytes[0]=data[i+2];
         if(op<4 && m->len<MAX_BYTES-8) {
             undo_kind kind=op==0?UNDO_BACKSPACE:op==1?UNDO_DELETE:UNDO_INSERT;
@@ -160,8 +211,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size) {
             size_t cap=wide?8192:1u+data[i+1]%32u;int rc=undo_set_cap(&u,cap);
             if(m->open) must(rc==UNDO_ERR_BUSY);else {must(rc==0);m->cap=cap;drop(m);m->burst=0;}
         } else if(op==9) { undo_clear(&u);m->n=m->pos=0;m->burst=m->open=0; }
+        else if(op==10) fuzz_checkpoint(&u,m,&allocator,data[i+1],data[i+2]);
         uint8_t b[MAX_BYTES];must(piece_len(t)==m->len && piece_read(t,0,b,m->len)==0 && memcmp(b,m->bytes,m->len)==0);
-        undo_stats st=undo_get_stats(&u);must(st.live_bytes==(st.records+st.retired_records)*64);
+        undo_stats st=undo_get_stats(&u);must(st.live_bytes==(st.records+st.retired_records+st.replay_records)*64 && st.replay_records==0);
         must(st.committed_bytes>=st.live_bytes && st.committed_bytes-st.live_bytes<u.page_bytes);
         if(!m->open) {
             if(st.undo_groups!=m->pos || st.redo_groups!=m->n-m->pos)

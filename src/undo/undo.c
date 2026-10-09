@@ -105,6 +105,8 @@ static void put_retired(undo_log *u,uint32_t id) {
     u->pool.fresh--;u->pool.live--;u->retired_count--;
 }
 size_t undo_maintain(undo_log *u,size_t budget) {
+    /* Saved capture handles and the pre-group packed suffix must stay fixed. */
+    if(u->replay_checkpoint) return 0;
     size_t n=0;
     while(n<budget && u->retired_head) {
         uint32_t id=u->retired_head;
@@ -132,7 +134,87 @@ static void release_view(undo_log *u) {
     if(u->replay_view) piece_snapshot_release(u->replay_view);
     u->replay_view=NULL;u->replay_first=0;
 }
+static undo_record *backup(const undo_log *u,size_t i) {
+    return (undo_record *)(u->replay_pool.base+i*u->replay_pool.stride);
+}
+static void reset_backup(undo_log *u) {
+    u->replay_pool.fresh=u->replay_pool.live=0;
+    if(u->replay_committed_bytes &&
+       madvise(u->replay_pool.base,u->replay_committed_bytes,MADV_DONTNEED)==0)
+        u->replay_committed_bytes=0;
+}
+static void save_capture(undo_log *u,uint32_t id) {
+    /* Unknown insert records have no published ref. Reuse their zero add_off
+     * word for the handle in a full 64 B backup; every other byte is preserved. */
+    EDIT_ASSERT(!(record(u,id)->next&KNOWN) && record(u,id)->add_off==0);
+    EDIT_ASSERT(u->replay_pool.fresh<u->replay_pool.capacity);
+    undo_record *r=backup(u,u->replay_pool.fresh++);u->replay_pool.live++;
+    *r=*record(u,id);r->add_off=id;
+    size_t bytes=(u->replay_pool.fresh*u->replay_pool.stride+u->page_bytes-1)/u->page_bytes*u->page_bytes;
+    if(bytes>u->replay_committed_bytes) u->replay_committed_bytes=bytes;
+}
+static void assert_replay_tree(const undo_log *u) {
+    if(!u->replay_guard) return;
+    /* The linked kernel caches one immutable header until a mutation. Holding
+     * an owner prevents cache eviction/address reuse, even for an empty tree.
+     * Retaking an unchanged cached snapshot allocates nothing. This assertion
+     * deliberately also rejects an attempted direct mutation that invalidates
+     * the cache before failing. No piece-private layout is inspected. */
+    piece_snapshot *current=piece_snapshot_take(u->tree);
+    EDIT_ASSERT(current && current==u->replay_guard);
+    piece_snapshot_release(current);
+}
+static void release_guard(undo_log *u) {
+    if(u->replay_guard) piece_snapshot_release(u->replay_guard);
+    u->replay_guard=NULL;
+}
+static void abort_replay(undo_log *u) {
+    if(!u->replay_checkpoint) return;
+    assert_replay_tree(u);release_guard(u);
+    piece_checkpoint_abort(u->replay_checkpoint);u->replay_checkpoint=NULL;
+    /* Undo captures in reverse order, repairing the neighbor each expansion
+     * changed. All extra span slots are the suffix appended since begin.
+     * Maintenance/trim cannot run while checkpointed, so handles never move. */
+    for(size_t n=u->replay_pool.fresh;n;n--) {
+        undo_record old=*backup(u,n-1);uint32_t id=(uint32_t)old.add_off;old.add_off=0;
+        *record(u,id)=old;
+        uint32_t next=next_id(&old);if(next) set_prev(record(u,next),id);
+    }
+    record(u,u->replay_first)->after=u->replay_first_after;
+    record(u,u->replay_last)->before=u->replay_last_before;
+    record(u,u->replay_last)->after=u->replay_last_after;
+    u->cursor=u->replay_cursor;u->tail=u->replay_tail;
+    u->count=u->replay_count;u->applied_count=u->replay_applied;
+    u->pool.fresh=u->pool.live=u->replay_fresh;
+    u->partial=0;reset_backup(u);decommit(u);release_view(u);
+}
+static int begin_replay(undo_log *u,uint32_t id,int direction) {
+    EDIT_ASSERT(!u->replay_checkpoint && !u->replay_pool.fresh);
+    uint32_t first=direction<0?group_first(u,id):id;
+    group_index g=group(u,first);
+    /* A pre-group view remains necessary for normal in-group slice yields.
+     * Take it before begin so it needs no intermediate-tail reservation. */
+    if(g.count>1) {
+        u->replay_view=piece_snapshot_take(u->tree);
+        if(!u->replay_view) return UNDO_ERR_NOMEM;
+    }
+    int rc=piece_checkpoint_begin(u->tree,&u->replay_checkpoint);
+    if(rc) { release_view(u);return rc; }
+    u->replay_first=first;u->replay_last=g.last;
+    u->replay_first_after=record(u,first)->after;
+    u->replay_last_before=record(u,g.last)->before;
+    u->replay_last_after=record(u,g.last)->after;
+    u->replay_cursor=u->cursor;u->replay_tail=u->tail;
+    u->replay_count=u->count;u->replay_applied=u->applied_count;u->replay_fresh=u->pool.fresh;
+    u->partial=direction;return UNDO_OK;
+}
+static void commit_replay(undo_log *u) {
+    EDIT_ASSERT(u->replay_checkpoint && !u->replay_guard);
+    piece_checkpoint_commit(u->replay_checkpoint);u->replay_checkpoint=NULL;
+    u->partial=0;reset_backup(u);release_view(u);
+}
 void undo_clear(undo_log *u) {
+    abort_replay(u);
     release_view(u);
     u->head=u->tail=u->cursor=u->open_first=0;
     u->retired_head=u->retired_tail=0;
@@ -146,12 +228,17 @@ int undo_init(undo_log *u,piece_tree *tree,size_t max_records) {
     /* Every admitted unknown insertion can expand by seven records. Untouched
      * virtual slots do not contribute to the committed-memory bound. */
     if(edit_pool_init(&u->pool,sizeof(undo_record),8,(max_records+8)*PIECE_REF_SPANS)!=0) return UNDO_ERR_NOMEM;
+    if(edit_pool_init(&u->replay_pool,sizeof(undo_record),8,max_records+8)!=0) {
+        edit_pool_free(&u->pool);return UNDO_ERR_NOMEM;
+    }
     long pg=sysconf(_SC_PAGESIZE);
-    if(pg<=0) { edit_pool_free(&u->pool);return UNDO_ERR_NOMEM; }
+    if(pg<=0) { edit_pool_free(&u->replay_pool);edit_pool_free(&u->pool);return UNDO_ERR_NOMEM; }
     u->page_bytes=(size_t)pg;
     u->tree=tree;u->cap=u->max_records=max_records;return 0;
 }
-void undo_destroy(undo_log *u) { release_view(u);edit_pool_free(&u->pool);memset(u,0,sizeof *u); }
+void undo_destroy(undo_log *u) {
+    abort_replay(u);release_view(u);edit_pool_free(&u->replay_pool);edit_pool_free(&u->pool);memset(u,0,sizeof *u);
+}
 void undo_break_burst(undo_log *u) { u->burst=0; }
 /* Detach at most sixteen groups. Very large cap reductions may discard extra
  * oldest groups (all remaining closed history) to keep the operation bounded.
@@ -300,28 +387,40 @@ static uint64_t now_ns(void) {
 static int replay(undo_log *u,size_t groups,size_t budget,uint64_t deadline,undo_change *c,int direction) {
     if(!c) return UNDO_ERR_RANGE;
     memset(c,0,sizeof *c);
+    assert_replay_tree(u);
     if(u->open || (u->partial && u->partial!=direction)) return UNDO_ERR_BUSY;
     u->burst=0;
+    undo_change completed_change={0};
     while(c->groups<groups) {
         uint32_t id=direction<0?u->cursor:(u->cursor?next_id(record(u,u->cursor)):u->head);
         if(!id) break;
-        if(c->operations>=budget || (deadline!=UINT64_MAX && now_ns()>=deadline)) return UNDO_MORE;
+        if(c->operations>=budget || (deadline!=UINT64_MAX && now_ns()>=deadline)) {
+            if(u->replay_checkpoint && !u->replay_guard) {
+                u->replay_guard=piece_snapshot_take(u->tree);
+                if(!u->replay_guard) { abort_replay(u);*c=completed_change;return UNDO_ERR_NOMEM; }
+            }
+            return UNDO_MORE;
+        }
+        release_guard(u);
         /* Compaction can change id, so resolve it again afterwards. */
         (void)undo_maintain(u,UNDO_RECLAIM_RECORDS);
         id=direction<0?u->cursor:(u->cursor?next_id(record(u,u->cursor)):u->head);
-        if(!u->partial) {
-            u->replay_first=direction<0?group_first(u,id):id;
-            if(group(u,u->replay_first).count>1) {
-                u->replay_view=piece_snapshot_take(u->tree);
-                if(!u->replay_view) { u->replay_first=0;return UNDO_ERR_NOMEM; }
-            }
+        if(!u->replay_checkpoint) {
+            int rc=begin_replay(u,id,direction);
+            if(rc) { *c=completed_change;return rc; }
         }
         undo_record *r=record(u,id);uint64_t before_len=piece_len(u->tree),off=r->off;
         int remove=((r->prev&INSERT)!=0)==(direction<0),rc;
         size_t applied=1;
         if(remove) {
             uint32_t ids[PIECE_REF_SPANS];int unknown=(r->next&KNOWN)==0;
-            if(unknown) { rc=reserve(u,ids,PIECE_REF_SPANS-1);if(rc) { if(!u->partial) release_view(u);return rc; } }
+            if(unknown) {
+                rc=reserve(u,ids,PIECE_REF_SPANS-1);
+                if(rc) { abort_replay(u);*c=completed_change;return rc; }
+                /* A one-operation group has no possible failure after its
+                 * successful capture: commit is void and allocation-free. */
+                if(u->replay_view) save_capture(u,id);
+            }
             piece_ref ref;rc=piece_delete(u->tree,r->off,r->len,&ref);
             if(unknown) {
                 size_t used=0;
@@ -332,15 +431,15 @@ static int replay(undo_log *u,size_t groups,size_t budget,uint64_t deadline,undo
             piece_ref ref={0};ref.nspans=1;ref.len=r->len;ref.span[0].add_off=r->add_off;ref.span[0].len=r->len;
             rc=piece_insert_ref(u->tree,r->off,&ref);
         }
-        if(rc) { if(!u->partial) release_view(u);return rc; }
+        if(rc) { abort_replay(u);*c=completed_change;return rc; }
         r=record(u,id);uint64_t after_len=piece_len(u->tree);
         dirty(c,off,before_len>after_len?before_len:after_len);c->records+=applied;c->operations++;
         int complete=direction<0?(r->prev&START)!=0:(r->next&END)!=0;
-        u->cursor=direction<0?prev_id(r):id;u->partial=complete?0:direction;
+        u->cursor=direction<0?prev_id(r):id;
         if(direction<0) u->applied_count-=applied;else u->applied_count+=applied;
         if(complete) {
             c->groups++;c->has_state=1;c->state=direction<0?r->before:r->after;
-            release_view(u);trim(u);
+            commit_replay(u);trim(u);completed_change=*c;
         }
     }
     return 0;
@@ -356,13 +455,18 @@ int undo_redo(undo_log *u,size_t groups,undo_change *c) { return undo_redo_slice
 const piece_snapshot *undo_replay_snapshot(const undo_log *u) { return u->replay_view; }
 undo_stats undo_get_stats(const undo_log *u) {
     undo_stats s={0};s.records=u->count;s.retired_records=u->retired_count;
-    s.live_bytes=u->pool.live*u->pool.stride;s.reserved_bytes=u->pool.map_bytes;s.committed_bytes=u->committed_bytes;
-    int applied=u->cursor!=0;
+    s.replay_records=u->replay_pool.live;
+    s.live_bytes=u->pool.live*u->pool.stride+u->replay_pool.live*u->replay_pool.stride;
+    s.reserved_bytes=u->pool.map_bytes+u->replay_pool.map_bytes;
+    s.committed_bytes=u->committed_bytes+u->replay_committed_bytes;
+    uint32_t cursor=u->replay_checkpoint?u->replay_cursor:u->cursor;
+    if(u->replay_checkpoint && u->partial<0) cursor=group(u,u->replay_first).last;
+    int applied=cursor!=0;
     for(uint32_t id=u->head;id;id=next_id(record(u,id))) {
         const undo_record *r=record(u,id);
         if(applied && (r->next&END)) s.undo_groups++;
         if(!applied && (r->prev&START)) s.redo_groups++;
-        if(id==u->cursor) applied=0;
+        if(id==cursor) applied=0;
     }
     return s;
 }

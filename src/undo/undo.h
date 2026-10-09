@@ -19,13 +19,20 @@
  * admission uses max_records+8 slots; replay reserves expansion capacity for
  * all of them, so first-undo capture cannot permanently exhaust scratch.
  *
- * Edit failures leave content and logical history unchanged. Replay is atomic
- * per piece operation. Whole-group failure atomicity remains BLOCKED on the
- * piece.h amendment proposal in docs/decisions/P1.5d.md. On NOMEM a partial
- * group keeps its retry position and locks edits, cap changes and opposite
- * replay. A borrowed pre-group snapshot is available throughout partial
- * replay: render/save that view, never the intermediate tree. clear accepts
- * the current tree and discards history/view; destroy releases the view.
+ * Edit failures leave content and logical history unchanged. Replay uses one
+ * piece checkpoint per group. Any failure aborts the entire current group,
+ * restoring exact pre-group bytes, refs and cursor/record metadata; previously
+ * completed groups in the batch stay completed. Retry starts that group anew.
+ * Undo-owned capture scratch is reserved at init and decommitted at boundaries.
+ * Its live/committed/virtual bytes are included in stats (replay_records).
+ *
+ * A checkpoint spans every slice of its group. Edits, cap changes and opposite
+ * replay are BUSY while partial; maintenance pauses until the boundary. Nothing
+ * else may mutate the tree between slices, including a direct piece mutation.
+ * This is asserted using the in-tree kernel's retained current-snapshot identity
+ * (see P1.5e.md). Queries and immutable worker snapshots are permitted. Render/
+ * save the borrowed pre-group view while partial. clear/destroy abort an open
+ * replay checkpoint before discarding history/view. The tree must still live.
  *
  * Slice budgets count piece mutations, not expanded span records; a capture
  * may report up to eight records for one operation. deadline_ns is an absolute
@@ -36,11 +43,16 @@
  * count (subtract change.groups), after checking input. Boundary state is
  * reported only on group completion. Legacy replay calls have no slice limit.
  *
- * change describes only this call's successful prefix, including on error or
- * MORE: records/operations, completed groups and their last boundary state,
+ * change describes this call's prefix: records/operations, completed groups
+ * and their last boundary state,
  * conservative dirty [off,off+len). Length changes dirty through the larger
  * pre/post EOF; the endpoint can exceed current EOF. Merge slices and submit
- * one final frame for the requested batch. History end is OK/no change.
+ * one final frame for the requested batch. MORE includes provisional operations
+ * in the open group; on error that whole group's operations (including earlier
+ * slices) are rolled back. The error's change includes only groups completed in
+ * this call. Discard accumulated provisional counts for the aborted group; its
+ * prior dirty intervals still conservatively cover restoration. Boundary state
+ * is never reported for an aborted group. History end is OK/no change.
  */
 #ifndef EDIT_UNDO_H
 #define EDIT_UNDO_H
@@ -66,7 +78,9 @@ typedef struct undo_change {
 typedef struct undo_stats {
     size_t records, undo_groups, redo_groups, live_bytes, reserved_bytes;
     size_t retired_records, committed_bytes;
-    /* live_bytes includes retired slots; committed_bytes includes page slack. */
+    size_t replay_records;
+    /* live_bytes includes retired/capture scratch slots; committed_bytes
+     * includes page slack in both mappings. */
 } undo_stats;
 /* Caller-owned; fields private. No copies while initialized. */
 typedef struct undo_log {
@@ -77,6 +91,12 @@ typedef struct undo_log {
     size_t retired_count, page_bytes, committed_bytes;
     uint32_t retired_head, retired_tail, replay_first;
     piece_snapshot *replay_view;
+    piece_checkpoint *replay_checkpoint;
+    piece_snapshot *replay_guard;
+    edit_pool replay_pool;
+    size_t replay_committed_bytes, replay_fresh, replay_count, replay_applied;
+    uint32_t replay_cursor, replay_tail, replay_last;
+    undo_state replay_first_after, replay_last_before, replay_last_after;
     uint64_t last_time, last_off, last_len;
     undo_kind last_kind;
     int burst, open, partial;
@@ -106,7 +126,7 @@ int undo_redo_slice(undo_log *u, size_t groups, size_t operation_budget,
  * group's replay. Retain it yourself if a worker needs a longer lifetime. */
 const piece_snapshot *undo_replay_snapshot(const undo_log *u);
 /* Reclaim <= record_budget slots, decommit wholly unused tail pages; returns
- * slots reclaimed. Safe during replay; does not change content/logical history. */
+ * slots reclaimed. Returns zero while a replay checkpoint is active. */
 size_t undo_maintain(undo_log *u, size_t record_budget);
 undo_stats undo_get_stats(const undo_log *u);
 #endif

@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"undo_test:%d: FAIL %s\n",__LINE__,#x); exit(1); } } while (0)
 static undo_state state(uint8_t v) { undo_state s; memset(&s,v,sizeof s); return s; }
 static void same(piece_tree *t, const char *s) {
@@ -162,7 +165,7 @@ static void replay_failures(void) {
     uint8_t *text=malloc(BIG),*before=malloc(BIG+1),*after=malloc(BIG+1);
     CHECK(text && before && after);
     for(size_t i=0;i<BIG;i++) text[i]=(uint8_t)('a'+i%26);
-    size_t failed=0,partial=0;
+    size_t failed=0;
     for(size_t mode=0;mode<2;mode++) for(size_t k=1;k<=32;k++) {
         failing f={piece_default_allocator(),0,0,0};piece_allocator a={&f,fall,ffree};
         piece_tree *t=piece_create(&a);CHECK(t);undo_log u;CHECK(undo_init(&u,t,64)==0);
@@ -182,20 +185,16 @@ static void replay_failures(void) {
         int rc=undo_undo(&u,1,&c);
         if(rc) {
             CHECK(rc==PIECE_ERR_NOMEM);failed++;
-            if(!c.records) {
-                CHECK(piece_len(t)==bn && piece_read(t,0,after,bn)==0 && memcmp(before,after,bn)==0);
-            } else {
-                partial++;CHECK(c.len>0 && c.groups==0 && !c.has_state && u.partial==-1);
-                CHECK(undo_insert(&u,0,(const uint8_t *)"q",1,0,&s,&s)==UNDO_ERR_BUSY);
-                CHECK(undo_set_cap(&u,32)==UNDO_ERR_BUSY);
-                undo_change rejected;CHECK(undo_redo(&u,1,&rejected)==UNDO_ERR_BUSY);
-            }
+            CHECK(c.records==0 && c.operations==0 && c.len==0 && c.groups==0 && !c.has_state && !u.partial);
+            CHECK(piece_len(t)==bn && piece_read(t,0,after,bn)==0 && memcmp(before,after,bn)==0);
+            CHECK(undo_insert(&u,0,NULL,0,0,&s,&s)==UNDO_OK);
+            undo_change rejected;CHECK(undo_redo(&u,0,&rejected)==UNDO_OK);
             size_t pn=(size_t)piece_len(t);CHECK(piece_read(t,0,after,pn)==0);
             f.calls=0;f.fail=1;f.persistent=1;
             for(size_t retry=0;retry<3;retry++) {
                 CHECK(undo_undo(&u,1,&c)==UNDO_ERR_NOMEM && c.records==0 && c.groups==0 && !c.has_state);
                 CHECK(piece_len(t)==pn && piece_read(t,0,before,pn)==0 && memcmp(before,after,pn)==0);
-                if(u.partial) CHECK(undo_replay_snapshot(&u) && piece_snapshot_len(undo_replay_snapshot(&u))==bn);
+                CHECK(!u.partial && !undo_replay_snapshot(&u));
             }
             f.fail=0;f.persistent=0;CHECK(undo_undo(&u,1,&c)==0 && c.groups==1);
             same(t,"");CHECK(undo_redo(&u,1,&c)==0);
@@ -203,8 +202,8 @@ static void replay_failures(void) {
         }
         f.fail=0;finish(&u);
     }
-    CHECK(failed>0 && partial>0);
-    printf("undo_test: replay allocator failures=%zu partial_groups=%zu (resumed)\n",failed,partial);
+    CHECK(failed>0);
+    printf("undo_test: replay allocator failures=%zu (aborted, retried)\n",failed);
     free(after);free(before);free(text);
 }
 
@@ -319,13 +318,7 @@ static void review_5(void) {
     CHECK(!undo_replay_snapshot(&u));same(t,"");finish(&u);
 }
 static void review_1(void) {
-    /* Compiled regression, intentionally skipped pending the exact
-     * "piece.h amendment proposal" in docs/decisions/P1.5d.md. Undo-owned
-     * reservations cannot make inverse piece mutations allocation-free. */
-    if(!getenv("UNDO_TEST_REQUIRE_ATOMIC_GROUP")) {
-        puts("review 1: SKIP group atomicity; docs/decisions/P1.5d.md piece.h amendment proposal");
-        return;
-    }
+    /* Default regression: the piece checkpoint must restore both tree and log. */
     /* Review mode=1: NOMEM after removing Z must leave the entire group intact. */
     enum { BIG=1024*1024 };uint8_t *text=malloc(BIG),*b=malloc(BIG+1);CHECK(text&&b);memset(text,'a',BIG);
     size_t failed=0;
@@ -352,9 +345,9 @@ static void review_8(void) {
         undo_state st=state(9);undo_change c;CHECK(undo_group_begin(&u,&st)==0);ins(&u,0,"Z",0,0,0);CHECK(undo_insert(&u,1,text,BIG,1,&st,&st)==0);CHECK(undo_group_end(&u,&st)==0);
         CHECK(undo_undo(&u,1,&c)==0);f.calls=0;f.fail=k;int rc=undo_redo(&u,1,&c);
         if(rc==UNDO_ERR_NOMEM) {
-            failures_seen++;if(c.records) {const piece_snapshot *view=undo_replay_snapshot(&u);CHECK(view && piece_snapshot_len(view)==0);}
-            CHECK(c.groups==0 && !c.has_state);
-            size_t pn=(size_t)piece_len(t);CHECK(pn<=1);uint8_t prior[1];CHECK(piece_read(t,0,prior,pn)==0);
+            failures_seen++;CHECK(!u.partial && !undo_replay_snapshot(&u));
+            CHECK(c.records==0 && c.operations==0 && c.len==0 && c.groups==0 && !c.has_state);
+            size_t pn=(size_t)piece_len(t);CHECK(pn==0);uint8_t prior[1];CHECK(piece_read(t,0,prior,pn)==0);
             f.calls=0;f.fail=1;f.persistent=1;
             for(size_t retry=0;retry<3;retry++) {
                 CHECK(undo_redo(&u,1,&c)==UNDO_ERR_NOMEM && c.records==0 && c.groups==0 && !c.has_state && c.len==0);
@@ -379,12 +372,9 @@ static void batch_failure_reporting(void) {
         f.calls=0;f.fail=k;int rc=undo_redo(&u,2,&c);
         if(rc==UNDO_ERR_NOMEM) {
             CHECK(c.groups<=1 && c.has_state==(c.groups!=0));
-            size_t done=c.groups,pn=(size_t)piece_len(t);CHECK(pn<=2);
-            if(done) { after_group++;CHECK(c.state.bytes[0]==3 && c.off==0 && c.len==pn); }
-            if(u.partial) {
-                const piece_snapshot *view=undo_replay_snapshot(&u);uint8_t q;
-                CHECK(view && piece_snapshot_len(view)==1 && piece_snapshot_read(view,0,&q,1)==0 && q=='Q');
-            }
+            size_t done=c.groups,pn=(size_t)piece_len(t);CHECK(pn==done && !u.partial && !undo_replay_snapshot(&u));
+            CHECK(c.records==done && c.operations==done);
+            if(done) { after_group++;CHECK(c.state.bytes[0]==3 && c.off==0 && c.len==1);same(t,"Q"); }
             f.fail=0;CHECK(undo_redo(&u,2-done,&c)==0 && c.groups==2-done && c.state.bytes[0]==9);
             CHECK(c.off==pn && c.len==BIG+2-pn);
         } else CHECK(rc==0 && c.groups==2 && c.state.bytes[0]==9 && c.off==0 && c.len==BIG+2);
@@ -393,10 +383,160 @@ static void batch_failure_reporting(void) {
     }
     CHECK(after_group>0);free(bytes);free(text);puts("review 8: completed-group state and dirty range across batch failures passed");
 }
+static void undo_batch_failure_reporting(void) {
+    enum { BIG=1024*1024 };uint8_t *text=malloc(BIG),*bytes=malloc(BIG+2);CHECK(text && bytes);memset(text,'a',BIG);
+    size_t after_group=0;
+    for(size_t k=1;k<=40;k++) {
+        failing f={piece_default_allocator(),0,0,0};piece_allocator pa={&f,fall,ffree};piece_tree *t=piece_create(&pa);CHECK(t);
+        undo_log u;CHECK(undo_init(&u,t,64)==0);undo_change c;undo_state bs=state(7),as=state(9);
+        CHECK(undo_group_begin(&u,&bs)==0);CHECK(undo_insert(&u,0,text,BIG,0,&bs,&as)==0);
+        ins(&u,BIG,"Z",1,7,8);CHECK(undo_group_end(&u,&as)==0);
+        /* Give the first insertion >8 discontinuous add spans on first undo. */
+        CHECK(undo_group_begin(&u,&bs)==0);for(size_t i=0;i<9;i++) ins(&u,2*i+1,"X",i,0,0);
+        CHECK(undo_group_end(&u,&as)==0);del(&u,0,BIG+9,UNDO_DELETE,10);
+        CHECK(undo_undo(&u,2,&c)==0);ins(&u,BIG+1,"Q",11,2,3);
+        f.calls=0;f.fail=k;f.persistent=1;int rc=undo_undo(&u,2,&c);
+        if(rc==UNDO_ERR_NOMEM) {
+            CHECK(c.groups<=1 && c.has_state==(c.groups!=0) && !u.partial && !undo_replay_snapshot(&u));
+            size_t done=c.groups;CHECK(c.records==done && c.operations==done && piece_len(t)==BIG+2-done);
+            if(done) { after_group++;CHECK(c.state.bytes[0]==2 && c.off==BIG+1 && c.len==1); }
+            CHECK(piece_read(t,0,bytes,BIG+2-done)==0 && memcmp(bytes,text,BIG)==0 && bytes[BIG]=='Z' && (done || bytes[BIG+1]=='Q'));
+            f.fail=0;CHECK(undo_undo(&u,2-done,&c)==0 && c.groups==2-done && c.state.bytes[0]==7 && c.off==0 && c.len==BIG+2-done);
+        } else CHECK(rc==0 && c.groups==2 && c.state.bytes[0]==7 && c.off==0 && c.len==BIG+2);
+        same(t,"");f.fail=0;CHECK(undo_redo(&u,2,&c)==0 && c.groups==2 && c.state.bytes[0]==3);
+        CHECK(piece_len(t)==BIG+2 && piece_read(t,0,bytes,BIG+2)==0 && memcmp(bytes,text,BIG)==0 && bytes[BIG]=='Z' && bytes[BIG+1]=='Q');
+        finish(&u);
+    }
+    CHECK(after_group>0);free(bytes);free(text);puts("review 1: completed undo groups survive a later group abort");
+}
+enum { ATOMIC_BIG=1024*1024 };
+static void atomic_fixture(undo_log *u,piece_tree **tree,failing *f,const uint8_t *text,int reverse) {
+    piece_allocator a={f,fall,ffree};*tree=piece_create(&a);CHECK(*tree);
+    CHECK(undo_init(u,*tree,64)==0);undo_state bs=state(11),as=state(12);undo_change c;
+    if(reverse) {
+        CHECK(undo_group_begin(u,&bs)==0);
+        CHECK(undo_insert(u,0,text,ATOMIC_BIG,0,&bs,&as)==0);
+        ins(u,ATOMIC_BIG,"abcdefghij",1,0,0);ins(u,ATOMIC_BIG+10,"Z",2,0,0);
+        CHECK(undo_group_end(u,&as)==0);
+        CHECK(undo_group_begin(u,&bs)==0);
+        for(size_t i=0;i<9;i++) ins(u,2*i+1,"X",i,0,0);
+        CHECK(undo_group_end(u,&as)==0);del(u,0,ATOMIC_BIG+14,UNDO_DELETE,10);
+        CHECK(undo_undo(u,2,&c)==0 && c.groups==2);
+        /* The middle insertion now crosses the copied prefix and old add tail.
+         * Its first capture expands before the large first insertion fails. */
+    } else {
+        CHECK(piece_init_copy(*tree,(const uint8_t *)"orig\n",5)==0);
+        CHECK(undo_group_begin(u,&bs)==0);del(u,1,2,UNDO_DELETE,0);
+        ins(u,1,"Z",1,0,0);CHECK(undo_insert(u,2,text,ATOMIC_BIG,2,&bs,&as)==0);
+        del(u,0,1,UNDO_DELETE,3);CHECK(undo_group_end(u,&as)==0);
+        CHECK(undo_undo(u,1,&c)==0 && c.groups==1);same(*tree,"orig\n");
+    }
+}
+typedef struct saved_log {
+    uint8_t *records,*bytes;
+    size_t fresh,count,applied,len;
+    uint32_t head,tail,cursor;
+    uint64_t pieces,lines;
+    undo_stats stats;
+} saved_log;
+static saved_log save_log(const undo_log *u) {
+    saved_log s={0};s.fresh=u->pool.fresh;s.count=u->count;s.applied=u->applied_count;
+    s.head=u->head;s.tail=u->tail;s.cursor=u->cursor;s.len=(size_t)piece_len(u->tree);
+    s.pieces=piece_piece_count(u->tree);s.lines=piece_line_count(u->tree);s.stats=undo_get_stats(u);
+    s.records=malloc(s.fresh*64);s.bytes=malloc(s.len+1);CHECK(s.records && s.bytes);
+    memcpy(s.records,u->pool.base,s.fresh*64);CHECK(piece_read(u->tree,0,s.bytes,s.len)==0);return s;
+}
+static void check_saved(const undo_log *u,const saved_log *s) {
+    CHECK(!u->partial && !undo_replay_snapshot(u));
+    CHECK(u->head==s->head && u->tail==s->tail && u->cursor==s->cursor);
+    CHECK(u->count==s->count && u->applied_count==s->applied && u->pool.fresh==s->fresh);
+    CHECK(memcmp(u->pool.base,s->records,s->fresh*64)==0);
+    CHECK(piece_len(u->tree)==s->len && piece_piece_count(u->tree)==s->pieces && piece_line_count(u->tree)==s->lines);
+    uint8_t *b=malloc(s->len+1);CHECK(b);CHECK(piece_read(u->tree,0,b,s->len)==0 && memcmp(b,s->bytes,s->len)==0);free(b);
+    undo_stats st=undo_get_stats(u);CHECK(st.records==s->stats.records && st.undo_groups==s->stats.undo_groups && st.redo_groups==s->stats.redo_groups);
+    CHECK(st.live_bytes==s->stats.live_bytes && st.retired_records==s->stats.retired_records);
+}
+static void free_saved(saved_log *s) { free(s->records);free(s->bytes); }
+static int atomic_replay(undo_log *u,int reverse,size_t budget,undo_change *c) {
+    return reverse?undo_undo_slice(u,1,budget,UINT64_MAX,c):undo_redo_slice(u,1,budget,UINT64_MAX,c);
+}
+static void atomic_sweep(void) {
+    uint8_t *text=malloc(ATOMIC_BIG);CHECK(text);
+    for(size_t i=0;i<ATOMIC_BIG;i++) text[i]=(uint8_t)(i%251);
+    size_t failures_seen=0,after_slice=0;
+    for(int reverse=0;reverse<2;reverse++) for(int sliced=0;sliced<2;sliced++) {
+        size_t allocations[4]={0},ops=0;
+        failing healthy={piece_default_allocator(),0,0,0};undo_log probe;piece_tree *pt;
+        atomic_fixture(&probe,&pt,&healthy,text,reverse);
+        int rc;undo_change c;
+        do {
+            healthy.calls=0;rc=atomic_replay(&probe,reverse,sliced?1:SIZE_MAX,&c);
+            CHECK(ops<4 && (rc==UNDO_MORE || rc==UNDO_OK));allocations[ops++]=healthy.calls;
+        } while(rc==UNDO_MORE);
+        finish(&probe);
+        for(size_t op=0;op<ops;op++) for(int persistent=0;persistent<2;persistent++)
+            for(size_t k=1;k<=allocations[op]+1;k++) {
+                failing f={piece_default_allocator(),0,0,0};undo_log u;piece_tree *t;
+                atomic_fixture(&u,&t,&f,text,reverse);saved_log saved=save_log(&u);
+                for(size_t prefix=0;prefix<op;prefix++) CHECK(atomic_replay(&u,reverse,1,&c)==UNDO_MORE);
+                f.calls=0;f.fail=k;f.persistent=persistent;
+                rc=atomic_replay(&u,reverse,sliced?1:SIZE_MAX,&c);
+                if(k<=allocations[op]) {
+                    CHECK(rc==UNDO_ERR_NOMEM && c.records==0 && c.operations==0 && c.groups==0 && !c.has_state && c.len==0);
+                    failures_seen++;if(op) after_slice++;check_saved(&u,&saved);
+                    f.calls=0;f.fail=1;f.persistent=1;
+                    for(size_t retry=0;retry<3;retry++) {
+                        CHECK(atomic_replay(&u,reverse,1,&c)==UNDO_ERR_NOMEM && c.records==0 && c.groups==0);
+                        check_saved(&u,&saved);
+                    }
+                    f.fail=0;CHECK(atomic_replay(&u,reverse,SIZE_MAX,&c)==UNDO_OK && c.groups==1);
+                    CHECK(c.state.bytes[0]==(reverse?11:12));
+                    /* A second round uses only committed refs; transaction-only
+                     * capture refs must have been discarded before the retry. */
+                    CHECK(atomic_replay(&u,!reverse,SIZE_MAX,&c)==UNDO_OK && c.groups==1);
+                    CHECK(atomic_replay(&u,reverse,SIZE_MAX,&c)==UNDO_OK && c.groups==1);
+                } else CHECK(rc==UNDO_OK || rc==UNDO_MORE);
+                f.fail=0;free_saved(&saved);finish(&u);
+            }
+    }
+    CHECK(failures_seen && after_slice);free(text);
+    printf("review 1: exhaustive allocator sweep failures=%zu after_slice=%zu; bytes, queries, records and cursors restored\n",failures_seen,after_slice);
+}
+static void sliced_lifecycle(void) {
+    for(int destroy=0;destroy<2;destroy++) for(int reverse=0;reverse<2;reverse++) {
+        undo_log u;piece_tree *t;start(&u,&t,32);undo_state s=state(4);undo_change c;
+        CHECK(undo_group_begin(&u,&s)==0);ins(&u,0,"a",0,1,2);ins(&u,1,"b",1,2,3);CHECK(undo_group_end(&u,&s)==0);
+        if(!reverse) CHECK(undo_undo(&u,1,&c)==0);
+        const char *pre=reverse?"ab":"";
+        CHECK(atomic_replay(&u,reverse,1,&c)==UNDO_MORE);
+        piece_snapshot *view=piece_snapshot_retain((piece_snapshot *)undo_replay_snapshot(&u));CHECK(view);
+        CHECK(undo_insert(&u,0,(const uint8_t *)"x",1,0,&s,&s)==UNDO_ERR_BUSY);
+        CHECK(undo_set_cap(&u,1)==UNDO_ERR_BUSY && undo_group_begin(&u,&s)==UNDO_ERR_BUSY);
+        /* Maintenance must not relocate the handles saved in replay scratch. */
+        CHECK(undo_maintain(&u,16)==0);
+        if(destroy) undo_destroy(&u);else undo_clear(&u);
+        same(t,pre);uint8_t b[2];CHECK(piece_snapshot_read(view,0,b,strlen(pre))==0 && memcmp(b,pre,strlen(pre))==0);
+        piece_snapshot_release(view);if(!destroy) undo_destroy(&u);piece_destroy(t);
+    }
+    /* A successful same-length out-of-band tree edit between slices is a
+     * contract violation, including when the replacement bytes are identical. */
+    puts("review 5: expecting an assertion in the out-of-band mutation child");
+    fflush(NULL);pid_t child=fork();CHECK(child>=0);
+    if(child==0) {
+        undo_log u;piece_tree *t;start(&u,&t,32);undo_change c;
+        ins(&u,0,"a",0,0,0);ins(&u,1,"b",1,0,0);
+        CHECK(undo_undo_slice(&u,1,1,UINT64_MAX,&c)==UNDO_MORE);
+        CHECK(piece_delete(t,0,1,NULL)==0 && piece_insert(t,0,(const uint8_t *)"a",1)==0);
+        (void)undo_undo_slice(&u,1,1,UINT64_MAX,&c);_exit(0);
+    }
+    int status;CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
+    puts("review 5: slice clear/destroy abort and out-of-band mutation assertion passed");
+}
 int main(int argc,char **argv) {
     if(argc==2) {
-        switch(atoi(argv[1])) {case 1:review_1();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
+        switch(atoi(argv[1])) {case 1:review_1();atomic_sweep();undo_batch_failure_reporting();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();sliced_lifecycle();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
         return 0;
     }
-    review_1();original_tests();review_2();review_3();review_4();review_5();review_8();batch_failure_reporting();return 0;
+    review_1();atomic_sweep();undo_batch_failure_reporting();original_tests();review_2();review_3();review_4();review_5();sliced_lifecycle();review_8();batch_failure_reporting();puts("undo_test: P1.5e all passed");return 0;
 }
