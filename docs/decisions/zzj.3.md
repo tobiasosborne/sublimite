@@ -188,3 +188,19 @@ in 61 seconds with no findings (M)[AC], load1 5.71. The actual `edit` binary
 was also driven on `:99` with native typing and WM close; its flushed journal
 replayed to the independently expected `ab\nx`. Raster G11 remains the unmet
 acceptance criterion; these results are not a claim that the bead is gate-complete.
+
+## First human test drive on the real display (2026-10-09 14:12–14:15, session 6)
+Approved by Tobias via the consultant (14:20 go). Binary: main.c at 51de929 rebuilt in the coordinator's scratchpad with two env-gated changes (honour `EDIT_ALLOW_REAL_DISPLAY`; `EDIT_TRACE_DUMP=<path>` calls `trace_dump()` after `editor_close()`), linked against the same `build/libedit.a`. Both changes are part of edit-457.18. Command: `EDIT_ALLOW_REAL_DISPLAY=1 DISPLAY=:0 EDIT_TRACE_DUMP=… edit /tmp/edit-corpus/ascii_code.c`, raster backend, one window, mapped 14:12:22, closed by a WM close request at 14:15:22, exit 0, session journal kept.
+Tobias typed, moved around and deleted for about 30 s: "all good, I didn't notice any weirdness". No mis-render, stuck key or crash.
+Trace ring (tools/tracedump + per-stage variant), power "Not charging" [AC], 1-min load 7.6–8.2 (about 12 Codex workers running), **TRACK only**:
+
+| Span | n | p50 | p99 |
+|---|---|---|---|
+| T1 − T0 (dequeue) | 886 | 0.778 ms | 3.653 ms |
+| T2 − T0 (mutation done) | 541 | 1.121 ms | 3.958 ms |
+| T3 − T0 (render done) | 886 | 0.839 ms | 11.266 ms |
+| **G1 T4 − T0 (present submitted)** | 886 | **1.544 ms** | **14.914 ms** |
+| G3 T5 − T0 (device done) | 886 | 2.154 ms | 17.542 ms |
+| T6 − T0 (present complete) | 886 | 9.677 ms | 27.514 ms |
+
+n = 886 input events (keys incl. releases, pointer), 541 of them mutations. Caveats: T0 is the X server timestamp (1 ms granularity), so every T0 span carries up to +1 ms quantisation; the T1 − T0 p50 of 0.78 ms is mostly that. On a box at load 8 these say nothing about the G1 gate (1.0/2.0 ms); the quiet verdict comes with the M0 bench (edit-zzj.5) and an evdev T0 (edit-e6x.17 needs group `input`).
