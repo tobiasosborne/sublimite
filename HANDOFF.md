@@ -18,7 +18,7 @@ Tobias paused the machine at 10:05. All workers were killed (Codex) or told to s
 | edit-e6x.4 P2.4 gl (par) | wt/edit-e6x.4-egl, wt/edit-e6x.4-glx | none (killed after 45 min) | unknown; relaunch both with "continue" |
 | edit-4w1.10 P1.10 find (par) | wt/edit-4w1.10-simd-filter-verify, wt/edit-4w1.10-twoway-only | worklog | both pass the frozen suite at an earlier point; LAST EDIT in each is unverified (simd: AVX2 scan uncompiled; twoway: scan_pair regression, revert); all G6/G6v MISS on a loaded box (408–643 ms) |
 | edit-e6x.11 P2.2b x11 | wt/edit-e6x.11 | worklog | input MINORs done; clip.c INCR/MULTIPLE/manager save written (Codex, aborted by provider safety filter); line-663 test fixed; `plat_init` fails intermittently (5/30) in x11_clip_test (cause unknown); new tests/x11_xvfb.h private Xvfb; P2.2b.md, G4a row, fuzz 300 s not done. Route to Claude, not Codex |
-| edit-e6x.15 P2.3e font CFF | wt/edit-e6x.15 | none | Sonnet stopped mid-work; unknown |
+| edit-e6x.15 P2.3e font CFF | wt/edit-e6x.15 | worklog | CFF INDEX/DICT/subr validation + 3-line vendored step-budget patch + synthetic OTF seeds written; red was SIGILL in stbtt__cff_get_index; strict assertions unconfirmed under ASan; fuzz hookup, 600 s fuzz, P2.3e.md, bench not done |
 | edit-4w1.6 P1.6 lineidx | on main | worklog | landed; OPEN only for a quiet-box bench (G7/G7j missed on a loaded box at 5.4 GB/s scan) |
 
 `git stash list` stash@{0} "session3-interrupted": all six beads it belonged to are now closed (edit-4w1.20, e6x.14, 4w1.18, 4w1.23, e6x.10, yy5.9); it can be dropped (`git stash drop`) — not dropped yet.
