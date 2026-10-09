@@ -1,7 +1,12 @@
 # lineidx status
 
-P1.6d / edit-4w1.48 fixes bench review §15–18 only. Implementation and frozen
-headers are unchanged; implementation fixes belong to edit-4w1.46 in parallel.
+P1.6d / edit-4w1.48 fixed bench review §15–18. P1.6b / edit-4w1.46 fixed review
+§1–5, §12 and §14 (verified red/green per finding in docs/decisions/P1.6b.md).
+
+Open from P1.6b: review §13 (results cross threads via private atomics, not
+generation-filtered mailboxes) needs a src/work selective-receive API; opt-in
+red probe `lineidx_test --review=13`. Review §6-§11 (seek budget, UI scans,
+cancel acknowledgement, destroy latency) belong to the later UI-slices bead.
 
 Done: fresh unbuilt G7j request through bulk build, sliced 80×24 layout and null
 submit/present; full-build byte-work checks per sample; independent scalar line,
