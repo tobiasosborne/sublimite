@@ -17,11 +17,16 @@ static int fails;
 /* Exact-size heap window: bytes are placed at the end of an 8-byte heap block,
  * so any read past p[n-1] is an ASan heap-buffer-overflow. */
 enum { TAIL = 8 };
-static uint8_t *tail4;
+/* A ring of PLACE_SLOTS blocks: results of up to PLACE_SLOTS successive
+ * place() calls stay valid together (one shared block aliased them). */
+enum { PLACE_SLOTS = 8 };
+static uint8_t *tail4[PLACE_SLOTS];
+static unsigned tail_next;
 static const uint8_t *place(const uint8_t *src, size_t n)
 {
-    memcpy(tail4 + TAIL - n, src, n);
-    return tail4 + TAIL - n;
+    uint8_t *t = tail4[tail_next++ % PLACE_SLOTS];
+    memcpy(t + TAIL - n, src, n);
+    return t + TAIL - n;
 }
 static utf8_step dec(const char *s, size_t n) { return utf8_decode(place((const uint8_t *)s, n), n); }
 
@@ -886,9 +891,110 @@ static void t_table_facts(void)
     CHECK(UCD_EXT_PICT[0].lo >= 0x80 && UCD_HANGUL_L[0].lo >= 0x300 && UCD_REGIONAL_INDICATOR[0].lo >= 0x300);
 }
 
+static void t_place_alias(void)
+{
+    const uint8_t *a = place((const uint8_t *)"ab", 2), *b = place((const uint8_t *)"cd", 2);
+    CHECK(a != b && a[0] == 'a' && a[1] == 'b' && b[0] == 'c' && b[1] == 'd');
+}
+
+/* ---- (P1.1e) utf8_cluster_step == utf8_cluster at every budget and split. */
+static int cluster_step_ok(const uint8_t *src, size_t n, size_t budget, size_t chunk)
+{
+    size_t off = 0;
+    while (off < n) {
+        int wantw;
+        size_t want = utf8_cluster(src + off, n - off, &wantw);
+        utf8_cseg c;
+        utf8_cseg_init(&c);
+        size_t pos = 0, avail = chunk < n - off ? chunk : n - off;
+        int w = -1, r, eof;
+        unsigned guard = 0;
+        do {
+            size_t used = 0;
+            eof = avail == n - off;
+            uint8_t *v = malloc(avail - pos + 1);
+            memcpy(v, src + off + pos, avail - pos);
+            r = utf8_cluster_step(&c, v, avail - pos, budget, eof, &used, &w);
+            free(v);
+            if (used > (budget ? budget : 1) + 3)
+                return 0;
+            pos += used;
+            if (r == UTF8_G_MORE) {
+                if (eof)
+                    return 0;
+                avail = avail + chunk < n - off ? avail + chunk : n - off;
+            }
+        } while (r != UTF8_G_END && guard++ < 4 * n + 16);
+        if (r != UTF8_G_END || pos != want || w != wantw)
+            return 0;
+        off += want;
+    }
+    return 1;
+}
+
+static void t_cluster_step(void)
+{
+    static const char *samples[] = {
+        "abc", "e\xCC\x81x", "\xE2\x9D\xA4\xEF\xB8\x8F", "\xE2\x9D\xA4\xEF\xB8\x8E", "1\xEF\xB8\x8F\xE2\x83\xA3",
+        "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7", "\xD8\x80\x61", "\xD8\x80\xE2\x9D\xA4\xEF\xB8\x8F",
+        "\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5\xF0\x9F\x87\xAF", "\xE4\xB8\x80\xCC\x81",
+        "\r\n\t\xFF\x80\xE2\x82", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7", "\xCC\x81\xCC\x81", "#\xE2\x83\xA3*\xEF\xB8\x8F\xE2\x83\xA3",
+        "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBD", "\xE2\x9D\xA4\xE2\x80\x8D\xF0\x9F\x94\xA5x",
+    };
+    static const size_t budgets[] = { 0, 1, 2, 3, 5, 4096 };
+    for (size_t i = 0; i < NELEM(samples); i++) {
+        size_t n = strlen(samples[i]);
+        for (size_t k = 0; k < NELEM(budgets); k++)
+            for (size_t chunk = 1; chunk <= n + 1; chunk++)
+                CHECK_BREAK(cluster_step_ok((const uint8_t *)samples[i], n, budgets[k], chunk));
+    }
+    /* random byte soup over an interesting alphabet */
+    static const char *alpha[] = { "a", "\xCC\x81", "\xE2\x80\x8D", "\xEF\xB8\x8F", "\xEF\xB8\x8E", "\xE2\x83\xA3", "\xF0\x9F\x91\xA8",
+                                   "\xE2\x9D\xA4", "\xD8\x80", "\xE1\x84\x80", "\xE1\x85\xA1", "1", "#", "\xF0\x9F\x87\xAF",
+                                   "\xE4\xB8\x80", "\n", "\xFF", "\xE0\xA4\x95", "\xE0\xA5\x8D", "\xF0\x9F\x8F\xBD" };
+    for (int it = 0; it < 3000; it++) {
+        uint8_t buf[64];
+        size_t n = 0, cnt = 1 + rnd() % 10;
+        for (size_t j = 0; j < cnt; j++) {
+            const char *a = alpha[rnd() % NELEM(alpha)];
+            size_t l = strlen(a);
+            memcpy(buf + n, a, l);
+            n += l;
+        }
+        size_t budget = rnd() % 7, chunk = 1 + rnd() % 9;
+        CHECK_BREAK(cluster_step_ok(buf, n, budget, chunk));
+    }
+    /* long clusters: result equals the one-shot, calls bounded by the budget */
+    const struct { const char *h, *u; size_t reps; } L[] = {
+        { "a", "\xCC\x81", 24576 }, { "", "\xD8\x80", 20000 },
+        { "\xF0\x9F\x91\xA8", "\xE2\x80\x8D\xF0\x9F\x91\xA9", 5000 }, { "\xE2\x9D\xA4", "\xCC\x81", 3000 },
+    };
+    for (size_t i = 0; i < NELEM(L); i++) {
+        size_t n;
+        uint8_t *b = chain(L[i].h, L[i].u, L[i].reps, &n);
+        b[n] = 0;
+        int ww;
+        size_t want = utf8_cluster(b, n, &ww);
+        utf8_cseg c;
+        utf8_cseg_init(&c);
+        size_t pos = 0, calls = 0, used;
+        int w = -1, r;
+        do {
+            r = utf8_cluster_step(&c, b + pos, n - pos, UTF8_GRAPHEME_BUDGET, 1, &used, &w);
+            CHECK(used <= UTF8_GRAPHEME_BUDGET + 3);
+            pos += used;
+            calls++;
+        } while (r == UTF8_G_BUDGET && calls < n);
+        CHECK(r == UTF8_G_END && pos == want && w == ww);
+        CHECK(calls > 1);
+        free(b);
+    }
+}
+
 int main(void)
 {
-    tail4 = malloc(TAIL);
+    for (int i = 0; i < PLACE_SLOTS; i++)
+        tail4[i] = malloc(TAIL);
     t_table_facts();
     t_decode_cases();
     t_decode_exhaustive();
@@ -900,10 +1006,13 @@ int main(void)
     t_step();
     t_prev_step();
     t_cluster_width();
+    t_place_alias();
+    t_cluster_step();
     t_oracle_random();
     t_ascii_run();
     t_random();
-    free(tail4);
+    for (int i = 0; i < PLACE_SLOTS; i++)
+        free(tail4[i]);
     printf(fails ? "utf8_test: %d FAILURES\n" : "utf8_test: all passed\n", fails);
     return fails != 0;
 }

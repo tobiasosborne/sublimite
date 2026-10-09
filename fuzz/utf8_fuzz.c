@@ -251,6 +251,32 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             REQUIRE(guard <= 8 * lim + 16);
             REQUIRE(len == want);
         }
+        for (int rep = 0; rep < 3; rep++) {          /* (P1.1e) utf8_cluster_step == utf8_cluster */
+            seed = seed * 1664525u + 1013904223u;
+            size_t budget = (seed >> 8) % 9;
+            seed = seed * 1664525u + 1013904223u;
+            size_t chunk = 1 + (seed >> 8) % 11;
+            utf8_cseg c;
+            utf8_cseg_init(&c);
+            size_t pos = 0, avail = chunk < lim ? chunk : lim, guard = 0;
+            int wantw = 0, w = -1, r = UTF8_G_MORE;
+            size_t want = utf8_cluster(data, lim, &wantw);
+            while (guard++ < 8 * lim + 16) {
+                uint8_t *v = exact_copy(data + pos, avail - pos);
+                REQUIRE(v);
+                size_t used = 0;
+                int eof = avail == lim;
+                r = utf8_cluster_step(&c, v, avail - pos, budget, eof, &used, &w);
+                free(v);
+                REQUIRE(used <= avail - pos);
+                REQUIRE(used <= (budget ? budget : 1) + 3);
+                pos += used;
+                if (r == UTF8_G_END) break;
+                if (r == UTF8_G_MORE) { REQUIRE(!eof); avail = avail + chunk < lim ? avail + chunk : lim; }
+                else REQUIRE(r == UTF8_G_BUDGET);
+            }
+            REQUIRE(r == UTF8_G_END && pos == want && w == wantw);
+        }
         for (int rep = 0; rep < 4 && size; rep++) {
             seed = seed * 1664525u + 1013904223u;
             size_t poff = (seed >> 8) % (lim + 1);

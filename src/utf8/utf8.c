@@ -455,3 +455,87 @@ int utf8_cluster_width(const uint8_t *p, size_t n)
     (void)utf8_cluster(p, n, &w);
     return w;
 }
+
+/* ------------------------------------------------- budgeted cluster width */
+
+enum { CK_PICT = 1, CK_KBASE = 2, CK_VS16 = 4, CK_KEYCAP = 8, CK_ZWJ_SEQ = 16, CK_DONE = 32, CK_FIXED2 = 64 };
+
+static int cseg_result(const utf8_cseg *c)
+{
+    if (!c->w)
+        return 0;
+    if (c->kind & CK_FIXED2)
+        return 2;
+    if (c->w == 1 && (((c->kind & CK_PICT) && (c->kind & (CK_VS16 | CK_ZWJ_SEQ))) ||
+                      ((c->kind & CK_KBASE) && (c->kind & CK_KEYCAP))))
+        return 2;
+    return c->w;
+}
+
+/* Fold the span p[0..len) (whole units, just segmented into the cluster) in. */
+static void cseg_scan(utf8_cseg *c, const uint8_t *p, size_t len)
+{
+    for (size_t i = 0; i < len && !(c->kind & CK_DONE);) {
+        utf8_step s = utf8_decode(p + i, len - i);
+        i += s.len;
+        enum gcb g = s.valid ? gcb_of(s.cp) : G_CONTROL;
+        if (!c->first) {
+            c->first = 1;
+            if (!s.valid || g == G_CR || g == G_LF || g == G_CONTROL) {
+                c->w = 1;
+                c->kind = CK_DONE;
+                return;
+            }
+        }
+        if (!c->w) {
+            int sw = utf8_cell_width(s.cp);
+            if (sw) {
+                c->w = (uint8_t)sw;
+                if (g == G_L || g == G_V || g == G_T || g == G_LV || g == G_LVT) {
+                    c->w = 2;
+                    c->kind = CK_FIXED2 | CK_DONE;
+                    return;
+                }
+                if (sw == 2) {
+                    c->kind = CK_DONE;
+                    return;
+                }
+                if (g == G_PICT)
+                    c->kind |= CK_PICT;
+                if (s.cp == '#' || s.cp == '*' || (s.cp >= '0' && s.cp <= '9'))
+                    c->kind |= CK_KBASE;
+                if (!(c->kind & (CK_PICT | CK_KBASE)))
+                    c->kind |= CK_DONE;
+            }
+        } else {
+            if (s.cp == 0xFE0F)
+                c->kind |= CK_VS16;
+            if (s.cp == 0x20E3)
+                c->kind |= CK_KEYCAP;
+            if (c->prev_zwj && g == G_PICT)
+                c->kind |= CK_ZWJ_SEQ;
+            if ((c->kind & CK_PICT) && (c->kind & (CK_VS16 | CK_ZWJ_SEQ)))
+                c->kind |= CK_DONE;
+            else if ((c->kind & CK_KBASE) && (c->kind & CK_KEYCAP))
+                c->kind |= CK_DONE;
+        }
+        c->prev_zwj = g == G_ZWJ;
+    }
+}
+
+int utf8_cluster_step(utf8_cseg *c, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used, int *width)
+{
+    if (!c->seg.started && n >= 2 && p[0] >= 0x20 && p[0] < 0x7F && p[1] < 0x80) {
+        *used = 1;                                  /* printable ASCII before ASCII: always a break */
+        *width = 1;
+        return UTF8_G_END;
+    }
+    int r = utf8_grapheme_step(&c->seg, p, n, budget, eof, used);
+    if (!(c->kind & CK_DONE))
+        cseg_scan(c, p, *used);
+    if (r == UTF8_G_END) {
+        *width = cseg_result(c);
+        utf8_cseg_init(c);
+    }
+    return r;
+}

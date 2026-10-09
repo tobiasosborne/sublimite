@@ -194,6 +194,31 @@ size_t utf8_cluster(const uint8_t *p, size_t n, int *width);
 /* Width part of utf8_cluster for the cluster at p[0..n). */
 int utf8_cluster_width(const uint8_t *p, size_t n);
 
+/* ---- Budgeted cluster + width (P1.1e) ----
+ * utf8_cluster / utf8_cluster_width are unbounded (they run utf8_grapheme_next
+ * and then a linear width scan), so layout on a 0.5 ms slice uses this: the
+ * grapheme step API with the cluster-width rule folded in, consuming the span
+ * each call completes. The width is decided from the first scalar with a
+ * nonzero width and then only the VS16 / ZWJ+ExtPict / keycap flags matter;
+ * once the answer cannot change the rest of the cluster is segmented but not
+ * scanned. Result identical to utf8_cluster on completion for every budget
+ * and every chunking (tests and fuzz check it).
+ * Usage as utf8_grapheme_step: init once, call at p + len until UTF8_G_END
+ * (refill on UTF8_G_MORE); *width is written only on UTF8_G_END. */
+typedef struct {
+    utf8_gseg seg;
+    uint8_t first;      /* the first scalar was classified */
+    uint8_t w;          /* width of the first scalar with width > 0 (0: none yet) */
+    uint8_t kind;       /* private: base class, flags and the done latch */
+    uint8_t prev_zwj;
+} utf8_cseg;
+
+static inline void utf8_cseg_init(utf8_cseg *c) { memset(c, 0, sizeof *c); }
+
+/* Like utf8_grapheme_step (same budget, eof and *used contract) and, on
+ * UTF8_G_END, *width = the cluster width, 0..2, as utf8_cluster reports it. */
+int utf8_cluster_step(utf8_cseg *c, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used, int *width);
+
 /* Length of the all-ASCII prefix of p[0..n): a decode/validation shortcut
  * for layout and scanning (every ASCII byte is one valid unit). It includes
  * tabs, CR, LF and other controls, so it does NOT mean "one cell per byte":
