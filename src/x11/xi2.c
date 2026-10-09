@@ -46,6 +46,9 @@ static xi2_dev *dev_for(xi2 *x, uint16_t source) {
     return d;
 }
 
+#define QD_MAX_VALS 64                 /* ValuatorClass current values remembered while parsing one reply */
+
+/* Parses into a scratch table and publishes it only when the whole reply validated (review x11-1 #20). */
 int xi2_parse_query_device(xi2 *x, const uint8_t *r, size_t len) {
     if (len < 32 || r[0] != 1) return -1;
     size_t total = 32 + (size_t)get32(r + 4) * 4;
@@ -54,25 +57,38 @@ int xi2_parse_query_device(xi2 *x, const uint8_t *r, size_t len) {
     uint16_t ninfo = get16(r + 8);
     size_t off = 32;
     int found = 0;
-    x->ndev = 0;
+    xi2 t;
+    memset(&t, 0, sizeof t);
+    t.opcode = x->opcode; t.active = x->active;
+    struct { uint16_t src, num; double v; } vals[QD_MAX_VALS];
+    uint32_t nvals = 0;
     for (uint16_t i = 0; i < ninfo; i++) {
         if (off + 12 > len) return -1;
         bool master = get16(r + off + 2) == 1;     /* events come from master pointers: only their numbering is valid */
         uint16_t ncls = get16(r + off + 6), nlen = get16(r + off + 8);
         off += 12 + (((size_t)nlen + 3) & ~(size_t)3);
+        if (off > len) return -1;                  /* padded device name must be present even with zero classes */
         for (uint16_t c = 0; c < ncls; c++) {
             if (off + 8 > len) return -1;
             uint16_t type = get16(r + off), clen = get16(r + off + 2);
             size_t bytes = (size_t)clen * 4;
             if (bytes < 8 || off + bytes > len) return -1;
-            if (type == 3 && bytes >= 24 && master) {
+            if (type == 2 && bytes >= 44 && master) {          /* ValuatorClass: current value seeds the scroll history */
+                if (nvals < QD_MAX_VALS) {
+                    vals[nvals].src = get16(r + off + 4); vals[nvals].num = get16(r + off + 6);
+                    vals[nvals].v = (double)geti32(r + off + 28) + (double)get32(r + off + 32) / 4294967296.0;
+                    nvals++;
+                }
+            } else if (type == 3 && bytes >= 24 && master) {
                 uint16_t src = get16(r + off + 4), num = get16(r + off + 6), st = get16(r + off + 8);
+                uint32_t flags = get32(r + off + 12);
                 double inc = (double)geti32(r + off + 16) + (double)get32(r + off + 20) / 4294967296.0;
                 if ((st == 1 || st == 2) && inc != 0.0) {
-                    xi2_dev *d = dev_for(x, src);
-                    if (d) {
-                        int k = (st == 1) ? 0 : 1;
-                        d->has[k] = true; d->num[k] = num; d->inc[k] = inc; d->last_ok[k] = false;
+                    xi2_dev *d = dev_for(&t, src);
+                    if (d && d->naxes < XI2_MAX_AXES) {
+                        xi2_axis *a = &d->axis[d->naxes++];
+                        a->num = num; a->dir = (st == 1) ? 0 : 1; a->inc = inc;
+                        a->preferred = (flags & 2u) != 0;         /* XIScrollFlagPreferred */
                         found++;
                     }
                 }
@@ -80,6 +96,13 @@ int xi2_parse_query_device(xi2 *x, const uint8_t *r, size_t len) {
             off += bytes;
         }
     }
+    for (uint32_t i = 0; i < t.ndev; i++)
+        for (uint32_t k = 0; k < t.dev[i].naxes; k++)
+            for (uint32_t v = 0; v < nvals; v++)
+                if (vals[v].src == t.dev[i].source && vals[v].num == t.dev[i].axis[k].num) {
+                    t.dev[i].axis[k].last = vals[v].v; t.dev[i].axis[k].last_ok = true;
+                }
+    *x = t;
     return found;
 }
 
@@ -98,7 +121,8 @@ bool xi2_decode(xi2 *x, const uint8_t *ev, size_t len, bool xcb_layout, xi2_resu
     if (type == 1) {                       /* XI_DeviceChanged */
         r->device_changed = true;
         r->time_ms = get32(ev + 12);
-        for (uint32_t i = 0; i < x->ndev; i++) x->dev[i].last_ok[0] = x->dev[i].last_ok[1] = false;
+        for (uint32_t i = 0; i < x->ndev; i++)
+            for (uint32_t k = 0; k < x->dev[i].naxes; k++) { x->dev[i].axis[k].last_ok = false; x->dev[i].axis[k].rem = 0.0; }
         return true;
     }
     if (type != 6 || len < WO(DEV_HDR)) return false;
@@ -117,25 +141,43 @@ bool xi2_decode(xi2 *x, const uint8_t *ev, size_t len, bool xcb_layout, xi2_resu
     xi2_dev *d = NULL;
     for (uint32_t i = 0; i < x->ndev; i++) if (x->dev[i].source == source) d = &x->dev[i];
     size_t nbits = (size_t)vlen * 32, k = 0;
+    double nv[XI2_MAX_AXES];           /* new value per axis of d, committed only after the whole event validated */
+    bool seen[XI2_MAX_AXES] = { false };
     for (size_t bit = 0; bit < nbits; bit++) {
         if (!(ev[WO(moff + (bit >> 3))] & (1u << (bit & 7)))) continue;
         size_t at = WO(voff + k * 8);
         k++;
-        if (at + 8 > len) return false;
+        if (at + 8 > len) { memset(r, 0, sizeof *r); return false; }
         if (bit < 2) { r->motion = true; continue; }       /* valuators 0/1: pointer X/Y */
         if (!d) continue;
         double v = (double)geti32(ev + at) + (double)get32(ev + at + 4) / 4294967296.0;
-        for (int a = 0; a < 2; a++) {
-            if (!d->has[a] || d->num[a] != bit) continue;
-            if (d->last_ok[a]) {
-                double u = (v - d->last[a]) / d->inc[a] * 256.0;
-                if (u > 16777216.0) u = 16777216.0;
-                if (u < -16777216.0) u = -16777216.0;
-                int32_t iu = (int32_t)(u < 0 ? u - 0.5 : u + 0.5);
-                if (iu) { if (a == 0) r->dy += iu; else r->dx += iu; r->wheel = true; }
-            }
-            d->last[a] = v; d->last_ok[a] = true;
+        for (uint32_t a = 0; a < d->naxes; a++)
+            if (d->axis[a].num == bit) { nv[a] = v; seen[a] = true; }
+    }
+    /* commit: per axis delta with the sub-unit remainder carried; per direction the preferred axis wins */
+    int32_t delta[XI2_MAX_AXES] = { 0 };
+    bool moved[XI2_MAX_AXES] = { false };
+    for (uint32_t a = 0; d && a < d->naxes; a++) {
+        if (!seen[a]) continue;
+        xi2_axis *ax = &d->axis[a];
+        if (ax->last_ok) {
+            double u = (nv[a] - ax->last) / ax->inc * 256.0 + ax->rem;
+            if (u > 16777216.0) u = 16777216.0;
+            if (u < -16777216.0) u = -16777216.0;
+            int32_t iu = (int32_t)(u < 0 ? u - 0.5 : u + 0.5);
+            ax->rem = u - (double)iu;
+            delta[a] = iu; moved[a] = true;
         }
+        ax->last = nv[a]; ax->last_ok = true;
+    }
+    for (int dir = 0; dir < 2; dir++) {
+        int pick = -1;
+        for (uint32_t a = 0; d && a < d->naxes; a++) {
+            if (!moved[a] || d->axis[a].dir != dir) continue;
+            if (d->axis[a].preferred) { pick = (int)a; break; }
+            if (pick < 0) pick = (int)a;
+        }
+        if (pick >= 0 && delta[pick]) { if (dir == 0) r->dy += delta[pick]; else r->dx += delta[pick]; r->wheel = true; }
     }
     return true;
 }

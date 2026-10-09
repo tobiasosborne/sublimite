@@ -53,6 +53,58 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     memcpy(copy, data, size);
     xi2_decode(&x, copy, size, false, &r);
     xi2_decode(&x, copy, size, true, &r);
+    /* edit-e6x.20 XI2 ops: a well-shaped QueryDevice reply (master pointer 12, scroll + valuator classes whose numbers,
+     * flags and increments come from fuzz bytes) so the populated decoder is reachable; a rejected parse or decode must
+     * leave the table untouched (all-or-nothing), an accepted one must keep every axis remainder within [-0.5, 0.5]. */
+    if (size >= 16) {
+        uint8_t q[32 + 12 + 4 + 4 * 24 + 2 * 44];
+        memset(q, 0, sizeof q);
+        q[0] = 1; q[8] = 1;
+        size_t o = 32, ncls = 0;
+        q[o] = 12; q[o + 2] = 1; q[o + 8] = 4;
+        o += 16;
+        for (size_t c = 0; c < 6; c++) {
+            uint8_t b0 = data[c], b1 = data[c + 6];
+            if (c < 4) {                                     /* scroll class */
+                q[o] = 3; q[o + 2] = 6; q[o + 4] = 12; q[o + 6] = (uint8_t)(2u + (b0 & 7u)); q[o + 8] = (b1 & 1u) ? 1 : 2;
+                q[o + 12] = (uint8_t)(b1 & 2u); q[o + 16] = (uint8_t)(b0 >> 3) ? (uint8_t)(b0 >> 3) : 1u;
+                o += 24;
+            } else {                                         /* valuator class seeding history */
+                q[o] = 2; q[o + 2] = 11; q[o + 4] = 12; q[o + 6] = (uint8_t)(2u + (b0 & 7u)); q[o + 28] = b1;
+                o += 44;
+            }
+            ncls++;
+        }
+        q[32 + 6] = (uint8_t)ncls;
+        uint32_t words = (uint32_t)((o - 32) / 4); memcpy(q + 4, &words, 4);
+        size_t cut = (data[12] & 1u) ? o : (size_t)data[13] % (o + 1);
+        xi2 w; memset(&w, 0, sizeof w); w.opcode = 131;
+        xi2 snap = w;
+        int rc = xi2_parse_query_device(&w, q, cut);
+        if (rc < 0 && memcmp(&w, &snap, sizeof w) != 0) __builtin_trap();
+        if (rc >= 0) {
+            uint8_t ev[128];
+            for (size_t ei = 0; ei < 4; ei++) {
+                memset(ev, 0, sizeof ev);
+                ev[0] = 35; ev[1] = 131; ev[8] = 6; ev[48] = 1; ev[50] = 1; ev[52] = 12;
+                uint32_t mask = (uint32_t)data[(ei + 14) % size] | ((uint32_t)data[(ei + 3) % size] << 8);
+                memcpy(ev + 84, &mask, 4);
+                memcpy(ev + 88, data + (ei * 5) % (size - 8), 8);
+                size_t elen = 88 + 8 * (size_t)__builtin_popcount(mask & 0xffffu);
+                if (elen > sizeof ev) elen = sizeof ev;
+                if (data[15] & 1u) elen -= (size_t)(data[15] >> 1) % 9u;
+                uint8_t *ec = malloc(elen ? elen : 1);
+                if (!ec) break;
+                memcpy(ec, ev, elen);
+                xi2 pre = w;
+                if (!xi2_decode(&w, ec, elen, false, &r) && memcmp(&w, &pre, sizeof w) != 0) __builtin_trap();
+                free(ec);
+                for (uint32_t i = 0; i < w.ndev; i++)
+                    for (uint32_t a = 0; a < w.dev[i].naxes; a++)
+                        if (!(w.dev[i].axis[a].rem >= -0.5 && w.dev[i].axis[a].rem <= 0.5)) __builtin_trap();
+            }
+        }
+    }
     x11_clip_property v;
     xcb_atom_t pairs[128]; size_t npairs;
     if (x11_clip_decode_property(copy, size, &v)) {

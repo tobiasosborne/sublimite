@@ -78,6 +78,139 @@ static size_t mk_motion(uint8_t *b, uint16_t src, uint8_t mask, const double *va
     return o;
 }
 
+
+/* ---- edit-e6x.20 (review x11-1 #16 #17 #20 #27) ---- */
+typedef struct cls { int kind; uint16_t num; int vert; uint32_t flags; double val; double inc; } cls;   /* kind 2 = valuator, 3 = scroll */
+
+static size_t mk_query_cls(uint8_t *b, const cls *c, int n, int name_len, int truncate_last) {
+    memset(b, 0, 512);
+    b[0] = 1;
+    p16(b + 8, 1);
+    size_t o = 32;
+    p16(b + o, 12); p16(b + o + 2, 1); p16(b + o + 6, (uint16_t)n); p16(b + o + 8, (uint16_t)name_len);
+    o += 12 + (((size_t)name_len + 3) & ~(size_t)3);
+    for (int i = 0; i < n; i++) {
+        if (c[i].kind == 2) {
+            p16(b + o, 2); p16(b + o + 2, 11); p16(b + o + 4, 12); p16(b + o + 6, c[i].num);
+            int32_t ip = (int32_t)floor(c[i].val);
+            p32(b + o + 28, (uint32_t)ip); p32(b + o + 32, (uint32_t)((c[i].val - (double)ip) * 4294967296.0));
+            o += 44;
+        } else {
+            double inc = c[i].inc;
+            p16(b + o, 3); p16(b + o + 2, 6); p16(b + o + 4, 12); p16(b + o + 6, c[i].num);
+            p16(b + o + 8, c[i].vert ? 1 : 2); p32(b + o + 12, c[i].flags);
+            p32(b + o + 16, (uint32_t)(int32_t)floor(inc));
+            p32(b + o + 20, (uint32_t)((inc - floor(inc)) * 4294967296.0));
+            o += 24;
+        }
+    }
+    (void)truncate_last;
+    p32(b + 4, (uint32_t)((o - 32) / 4));
+    return o;
+}
+
+static int sum_dy(xi2 *x, uint16_t src, uint8_t mask, const double *v, int nv, int *dxo) {
+    uint8_t b[256]; xi2_result r;
+    size_t n = mk_motion(b, src, mask, v, nv, 0, 0);
+    if (!xi2_decode(x, b, n, false, &r)) return -99999;
+    if (dxo) *dxo = r.dx;
+    return r.dy;
+}
+
+static void test_e6x20(void) {
+    uint8_t buf[512];
+    xi2 x; xi2_result r;
+    /* #16: first fractional scroll after QueryDevice is delivered (valuator class seeds history). */
+    for (int order = 0; order < 2; order++) {
+        cls c[2] = { { 2, 3, 0, 0, 10.0, 0 }, { 3, 3, 1, 0, 0, 1.0 } };
+        if (order) { cls t = c[0]; c[0] = c[1]; c[1] = t; }
+        memset(&x, 0, sizeof x); x.opcode = 131;
+        size_t n = mk_query_cls(buf, c, 2, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 1, "#16 parse (order %d)", order);
+        double v = 10.25;
+        int dy = sum_dy(&x, 12, 0x08, &v, 1, NULL);
+        CHECK(dy == 64, "#16 first scroll after query: dy %d want 64 (order %d)", dy, order);
+        /* device changed + rescan seeds again */
+        memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1);
+        CHECK(xi2_decode(&x, buf, 32, false, &r) && r.device_changed, "#16 devchg");
+        c[0].val = c[0].kind == 2 ? 20.0 : 0; if (c[1].kind == 2) c[1].val = 20.0;
+        n = mk_query_cls(buf, c, 2, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 1, "#16 reparse");
+        v = 20.5;
+        dy = sum_dy(&x, 12, 0x08, &v, 1, NULL);
+        CHECK(dy == 128, "#16 first scroll after rescan: dy %d want 128", dy);
+    }
+    /* #17: remainder survives: 1024 x (1/1024) = one full notch (256 units). */
+    {
+        cls c[2] = { { 2, 3, 0, 0, 0.0, 0 }, { 3, 3, 1, 0, 0, 1.0 } };
+        memset(&x, 0, sizeof x); x.opcode = 131;
+        size_t n = mk_query_cls(buf, c, 2, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 1, "#17 parse");
+        long total = 0;
+        for (int i = 1; i <= 1024; i++) { double v = (double)i / 1024.0; int d = sum_dy(&x, 12, 0x08, &v, 1, NULL); total += d; }
+        CHECK(total == 256, "#17 cumulative total %ld want 256", total);
+        /* negative, then reversal: net movement back to 0 must conserve */
+        for (int i = 1023; i >= 0; i--) { double v = (double)i / 1024.0; total += sum_dy(&x, 12, 0x08, &v, 1, NULL); }
+        CHECK(total == 0, "#17 after reversal total %ld want 0", total);
+        /* 3 steps of 0.4 notch: 102.4 units each: 102, 102, 103 (remainder carried) */
+        double v = 0.4; long t2 = sum_dy(&x, 12, 0x08, &v, 1, NULL);
+        v = 0.8; t2 += sum_dy(&x, 12, 0x08, &v, 1, NULL);
+        v = 1.2; t2 += sum_dy(&x, 12, 0x08, &v, 1, NULL);
+        CHECK(t2 == 307, "#17 3x0.4 notch total %ld want 307", t2);
+    }
+    /* #20a: QueryDevice with name_len=4 but the name bytes missing (44-byte reply, zero classes). */
+    {
+        memset(&x, 0, sizeof x);
+        memset(buf, 0, 64); buf[0] = 1; p16(buf + 8, 1); p32(buf + 4, 3);
+        p16(buf + 32, 12); p16(buf + 34, 1); p16(buf + 40, 4);
+        CHECK(xi2_parse_query_device(&x, buf, 44) == -1, "#20 missing name rejected");
+    }
+    /* #20b: valid scroll class then truncated class: -1 and the previous table is intact. */
+    {
+        cls c[2] = { { 2, 3, 0, 0, 0.0, 0 }, { 3, 3, 1, 0, 0, 1.0 } };
+        memset(&x, 0, sizeof x); x.opcode = 131;
+        size_t n = mk_query_cls(buf, c, 2, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 1, "#20 seed table");
+        xi2 before = x;
+        cls d[3] = { { 3, 7, 1, 0, 0, 2.0 }, { 3, 8, 0, 0, 0, 2.0 }, { 3, 9, 0, 0, 0, 2.0 } };
+        n = mk_query_cls(buf, d, 3, 4, 0);
+        p16(buf + 32 + 16 + 24 + 2, 200);                    /* second class claims 800 bytes: runs past the reply */
+        CHECK(xi2_parse_query_device(&x, buf, n) == -1, "#20 truncated class rejected");
+        CHECK(memcmp(&x, &before, sizeof x) == 0, "#20 table unchanged after rejected QueryDevice");
+    }
+    /* #20c: motion with one complete scroll value then a missing one: false and history untouched. */
+    {
+        cls c[3] = { { 2, 2, 0, 0, 0.0, 0 }, { 3, 3, 1, 0, 0, 1.0 }, { 3, 2, 0, 0, 0, 1.0 } };
+        memset(&x, 0, sizeof x); x.opcode = 131;
+        size_t n = mk_query_cls(buf, c, 3, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 2, "#20 parse 2 axes");
+        double two[2] = { 0.5, 0.5 };
+        uint8_t b[256];
+        n = mk_motion(b, 12, 0x0c, two, 2, 0, 0);
+        xi2 before = x;
+        CHECK(!xi2_decode(&x, b, n - 8, false, &r), "#20 missing value rejected");
+        CHECK(memcmp(&x, &before, sizeof x) == 0, "#20 history unchanged after rejected motion");
+        CHECK(r.dx == 0 && r.dy == 0 && !r.wheel, "#20 rejected motion reports nothing");
+    }
+    /* #27: two vertical axes; events carrying only one of them still scroll; preferred wins when both move. */
+    for (int perm = 0; perm < 2; perm++) {
+        cls c[3] = { { 2, 3, 0, 0, 0.0, 0 }, { 2, 4, 0, 0, 0.0, 0 }, { 3, 3, 1, 2u, 0, 1.0 } };
+        cls e = { 3, 4, 1, 0u, 0, 1.0 };
+        cls all[4];
+        if (perm == 0) { all[0] = c[0]; all[1] = c[1]; all[2] = c[2]; all[3] = e; }
+        else { all[0] = e; all[1] = c[2]; all[2] = c[1]; all[3] = c[0]; }
+        memset(&x, 0, sizeof x); x.opcode = 131;
+        size_t n = mk_query_cls(buf, all, 4, 4, 0);
+        CHECK(xi2_parse_query_device(&x, buf, n) == 2, "#27 parse two vertical axes (perm %d)", perm);
+        double v = 0.5;
+        CHECK(sum_dy(&x, 12, 0x08, &v, 1, NULL) == 128, "#27 first axis alone (perm %d)", perm);
+        CHECK(sum_dy(&x, 12, 0x10, &v, 1, NULL) == 128, "#27 second axis alone (perm %d)", perm);
+        double both[2] = { 1.0, 1.0 };                          /* each moved +0.5 notch: counted once (preferred) */
+        int dy = sum_dy(&x, 12, 0x18, both, 2, NULL);
+        CHECK(dy == 128, "#27 both axes in one event: dy %d want 128 (perm %d)", dy, perm);
+    }
+}
+
 int main(void) {
     uint8_t buf[512], req[20];
     xi2 x;
@@ -90,8 +223,8 @@ int main(void) {
     /* parse */
     size_t n = mk_query(buf);
     CHECK(xi2_parse_query_device(&x, buf, n) == 2, "two scroll classes");
-    CHECK(x.ndev == 1 && x.dev[0].has[0] && x.dev[0].num[0] == 3 && x.dev[0].has[1] && x.dev[0].num[1] == 2, "classes recorded");
-    CHECK(x.dev[0].inc[1] > 2.49 && x.dev[0].inc[1] < 2.51, "fraction increment");
+    CHECK(x.ndev == 1 && x.dev[0].naxes == 2 && x.dev[0].axis[0].num == 3 && x.dev[0].axis[0].dir == 0 && x.dev[0].axis[1].num == 2 && x.dev[0].axis[1].dir == 1, "classes recorded");
+    CHECK(x.dev[0].axis[1].inc > 2.49 && x.dev[0].axis[1].inc < 2.51, "fraction increment");
     CHECK(xi2_has_scroll(&x), "has scroll");
     /* decode: first event primes, second yields deltas (vertical +2 notches => +512; horizontal -2.5 => -256) */
     xi2_result r;
@@ -122,8 +255,8 @@ int main(void) {
         memset(&z, 0, sizeof z);
         n = mk_master_slave(buf, order == 0);
         CHECK(xi2_parse_query_device(&z, buf, n) == 1, "only the master's class counts (order %d)", order);
-        CHECK(z.ndev == 1 && z.dev[0].source == 9 && z.dev[0].has[0] && z.dev[0].num[0] == 3,
-              "master numbering wins (order %d): num %u", order, z.ndev ? z.dev[0].num[0] : 0u);
+        CHECK(z.ndev == 1 && z.dev[0].source == 9 && z.dev[0].naxes == 1 && z.dev[0].axis[0].num == 3,
+              "master numbering wins (order %d): num %u", order, z.ndev ? z.dev[0].axis[0].num : 0u);
     }
     /* DeviceChanged carries its server time */
     memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1); p32(buf + 12, 4242);
@@ -147,7 +280,7 @@ int main(void) {
     /* xcb layout: same event with the 4-byte full_sequence inserted after byte 32 */
     n = mk_motion(buf, 12, 0x0f, v3, 4, 7, 8);
     { uint8_t xb[512]; memcpy(xb, buf, 32); memset(xb + 32, 0xee, 4); memcpy(xb + 36, buf + 32, n - 32);
-      xi2 y = x; for (uint32_t i = 0; i < y.ndev; i++) y.dev[i].last_ok[0] = y.dev[i].last_ok[1] = false;
+      xi2 y = x; for (uint32_t i = 0; i < y.ndev; i++) for (uint32_t q = 0; q < y.dev[i].naxes; q++) y.dev[i].axis[q].last_ok = false;
       CHECK(xi2_decode(&y, xb, n + 4, true, &r) && r.motion && r.x == 7 && r.y == 8 && r.buttons == 1 && (r.mods & 4), "xcb layout");
       for (size_t l = 0; l < n + 4; l++) { uint8_t *c = malloc(l ? l : 1); memcpy(c, xb, l); xi2_decode(&y, c, l, true, &r); free(c); } }
     /* truncation at every length must not crash or over-read (ASan checks) */
@@ -155,6 +288,7 @@ int main(void) {
     for (size_t l = 0; l < n; l++) { uint8_t *c = malloc(l ? l : 1); memcpy(c, buf, l); xi2_decode(&x, c, l, false, &r); free(c); }
     n = mk_query(buf);
     for (size_t l = 0; l < n; l++) { uint8_t *c = malloc(l ? l : 1); memcpy(c, buf, l); xi2 y; memset(&y, 0, sizeof y); xi2_parse_query_device(&y, c, l); free(c); }
+    test_e6x20();
     if (g_fail) { puts("x11_xi2_test: FAILED"); return 1; }
     puts("x11_xi2_test: ok");
     return 0;
