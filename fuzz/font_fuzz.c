@@ -7,6 +7,7 @@
  *     (ASCII, Latin-1, CJK, symbols, input-derived) return clean codes;
  *   - a successful raster has pixels iff w*h > 0 and the arena is rewound. */
 #include "font/font.h"
+#include "utf8/utf8.h"
 #include "font_cffseed.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,8 +40,49 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     exit(0);
 }
 
+/* P4.11 mode uses only the trusted embedded face: arbitrary cluster bytes,
+ * widths, exact cache keys, cached errors and exhaustion, not malformed-font
+ * parsing. FONT_FUZZ_UNICODE=1 selects it for every input in the campaign. */
+static int unicode_clusters(const uint8_t *data, size_t size)
+{
+    if (size == 0) return 0;
+    edit_arena files, storage;
+    REQUIRE(edit_arena_init(&files, 1u << 20) == 0);
+    REQUIRE(edit_arena_init(&storage, 4u << 20) == 0);
+    size_t len = 0;
+    unsigned char *bytes = font_load_file("vendor/DejaVuSansMono.ttf", &files, &len);
+    font_t primary; font_family family; font_cache cache;
+    REQUIRE(bytes && font_init(&primary, bytes, len) == FONT_OK && font_set_px(&primary, 15) == FONT_OK);
+    REQUIRE(font_family_load(&family, &primary, NULL, &files) == FONT_OK);
+    REQUIRE(font_cache_init(&cache, &family, &storage, 1, 1u + data[0] % 32u,
+                            1u + data[0], 1u << 20) == FONT_OK);
+    for (size_t off = 1; off < size;) {
+        int width; size_t n = utf8_cluster(data + off, size - off, &width);
+        REQUIRE(n && n <= size - off && width >= 0 && width <= 2);
+        if (width != 0 && n <= FONT_CLUSTER_MAX_BYTES) {
+            uint32_t a = RENDER_NO_SLOT, b = RENDER_NO_SLOT;
+            int ra = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &a);
+            REQUIRE(ra == FONT_OK || ra == FONT_ERR_ARG || ra == FONT_ERR_MISSING ||
+                    ra == FONT_ERR_NOMEM || ra == FONT_ERR_INIT);
+            size_t keys = cache.key_used, glyphs = cache.glyph_count, used = storage.used;
+            font_atlas atlas = cache.atlas;
+            int rb = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &b);
+            REQUIRE(ra == rb && a == b && keys == cache.key_used && glyphs == cache.glyph_count && used == storage.used);
+            REQUIRE(memcmp(&atlas, &cache.atlas, sizeof atlas) == 0 && cache.scratch.used == 0);
+            if (ra == FONT_OK && a != RENDER_NO_SLOT) {
+                REQUIRE(a < cache.glyph_count && cache.glyphs[a].w == cache.cell.cell_w * (uint32_t)width);
+                REQUIRE(cache.glyphs[a].page <= cache.atlas.npages && cache.glyphs[a].h == cache.cell.cell_h);
+            }
+        }
+        off += n;
+    }
+    edit_arena_free(&storage); edit_arena_free(&files);
+    return 0;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    if (getenv("FONT_FUZZ_UNICODE")) return unicode_clusters(data, size);
     if (!arena_ready) {
         REQUIRE(edit_arena_init(&arena, 4u << 20) == 0);
         arena_ready = 1;

@@ -27,6 +27,31 @@ static int stub_glyph(void *ctx, const uint8_t *c, size_t n, uint32_t w, uint32_
 static void hold(void *c) { (void)c; }
 static const piece_map_hooks hooks = { NULL, hold, hold };
 
+typedef struct unicode_bench {
+    edit_arena files, storage;
+    font_family family;
+    font_fallback fallback;
+    font_cache cache;
+    int ready, result;
+} unicode_bench;
+static void unicode_job(work_ctx *ctx)
+{
+    unicode_bench *u = ctx->arg;
+    size_t len = 0;
+    unsigned char *bytes = font_load_file("vendor/DejaVuSansMono.ttf", &u->files, &len);
+    font_t primary;
+    EDIT_ASSERT(bytes && font_init(&primary, bytes, len) == FONT_OK && font_set_px(&primary, 15) == FONT_OK);
+    font_fallback_discover(&u->fallback, "libfontconfig.so.1");
+    u->result = font_family_load(&u->family, &primary, &u->fallback, &u->files);
+    work_msg msg = {0}; msg.kind = FONT_FALLBACK_MSG_KIND;
+    EDIT_ASSERT(work_publish(ctx, &msg));
+}
+static void unicode_ready(const work_msg *msg, void *arg)
+{
+    EDIT_ASSERT(msg->kind == FONT_FALLBACK_MSG_KIND);
+    ((unicode_bench *)arg)->ready = 1;
+}
+
 /* Independent stage replay: same first 300 lines, text clipped to 356 columns.
  * Each pass isolates one cost; totals are not an additive wall-time profile. */
 typedef struct profile_token { const uint8_t *p; size_t avail, len; int width; bool general; } profile_token;
@@ -82,7 +107,7 @@ static void checkpoint_message(const work_msg *msg, void *ud)
     (void)layout_checkpoint_event(ud, msg);
 }
 static const char *only;
-static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, bool gated, bool typing)
+static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, bool gated, bool typing, bool real)
 {
     if (only && !strstr(file, only)) return 0;
     char path[512];
@@ -115,6 +140,24 @@ static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, 
     g.pages = &page; g.page_count = 1; g.glyphs = glyphs; g.glyph_count = LAYOUT_ASCII_GLYPHS;
     cfg.tab_width = 4; cfg.gutter = true; cfg.fg = 0xdddddd; cfg.bg = 0x101010;
     cfg.gutter_fg = 0x808080; cfg.gutter_bg = 0x202020; cfg.glyph = stub_glyph;
+    unicode_bench *u = NULL;
+    if (real) {
+        u = calloc(1, sizeof *u); EDIT_ASSERT(u);
+        EDIT_ASSERT(edit_arena_init(&u->files, 64u << 20) == 0 && edit_arena_init(&u->storage, 12u << 20) == 0);
+        work_pool *workers = malloc(sizeof *workers);
+        EDIT_ASSERT(workers && work_pool_init(workers, 1, 0) == 0);
+        EDIT_ASSERT(work_submit(workers, (work_job){unicode_job, u, 1, WORK_BULK}).epoch);
+        struct pollfd fd_ready = {work_pool_eventfd(workers), POLLIN, 0};
+        while (!u->ready) {
+            EDIT_ASSERT(poll(&fd_ready, 1, 10000) > 0);
+            (void)work_mailbox_drain(workers, unicode_ready, u);
+        }
+        work_pool_shutdown(workers); free(workers);
+        EDIT_ASSERT(u->result == FONT_OK);
+        EDIT_ASSERT(font_cache_init(&u->cache, &u->family, &u->storage, 3, 4096, 1u << 20, 1u << 20) == FONT_OK);
+        EDIT_ASSERT(font_cache_bind(&u->cache, &g) == FONT_OK);
+        cfg.glyph = font_cache_glyph; cfg.glyph_ctx = &u->cache;
+    }
     if (layout_init(&l, &g, &cfg, row_byte, row_used) != LAYOUT_DONE) return 1;
 
     uint32_t frame = 0;
@@ -197,13 +240,20 @@ static int run(const char *dir, const char *file, uint32_t cols, uint32_t rows, 
         return 1;
     }
     char name[96];
-    snprintf(name, sizeof name, "layout_%s_%ux%u%s%s", file, cols, rows, typing ? "_typing_row" : "", gated ? "" : "_TRACK");
+    snprintf(name, sizeof name, "layout_%s_%ux%u%s%s%s", file, cols, rows, typing ? "_typing_row" : "",
+             real ? "_font_cache" : "", gated ? "" : "_TRACK");
     if (longline) snprintf(name, sizeof name, "layout_oneline_1g.txt_column_1000000");
     int miss = bench_report(name, &s, gated ? GATE_NS : 0, gated ? GATE_NS : 0);
     if (longline) miss |= bench_report("layout_oneline_1g.txt_column_100000000", &deep, GATE_NS, GATE_NS);
     printf("layout_stats file=%s cluster_cache_hits=%llu misses=%llu scanned_bytes=%llu\n", file,
            (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)scanned_bytes);
     if (longline) { work_pool_shutdown(pool); free(pool); edit_arena_free(&arena); }
+    if (u) {
+        printf("font_cache_stats hits=%llu misses=%llu glyphs=%zu pages=%u\n",
+               (unsigned long long)u->cache.hits, (unsigned long long)u->cache.misses,
+               u->cache.glyph_count, u->cache.atlas.npages);
+        edit_arena_free(&u->storage); edit_arena_free(&u->files); free(u);
+    }
     if (sum == 1) puts("");
     piece_destroy(t); munmap((void *)map, (size_t)st.st_size); close(fd);
     free(cells); free(row_byte); free(row_used);
@@ -220,13 +270,15 @@ int main(int argc, char **argv)
     printf("power=%s %s; (M) indicative under concurrent builds\n", status, bench_evidence_tag());
     printf("G: 300-row x 360-col full layout <= 150 us p50 and p99 (PLAN P3.1); layout state=%zu B\n", sizeof(layout));
     int miss = 0;
-    miss |= run(dir, "ascii_code.c", 360, 300, true, false);
-    miss |= run(dir, "log_1g.txt", 360, 300, true, false);
-    miss |= run(dir, "unicode.txt", 360, 300, false, false);
-    miss |= run(dir, "malformed.txt", 360, 300, false, false);
-    (void)run(dir, "ascii_code.c", 360, 120, false, false);
-    (void)run(dir, "log_1g.txt", 360, 120, false, false);
-    (void)run(dir, "ascii_code.c", 360, 120, false, true);
-    miss |= run(dir, "oneline_1g.txt", 360, 300, true, false);
+    miss |= run(dir, "ascii_code.c", 360, 300, true, false, false);
+    miss |= run(dir, "log_1g.txt", 360, 300, true, false, false);
+    miss |= run(dir, "unicode.txt", 360, 300, false, false, false);
+    miss |= run(dir, "malformed.txt", 360, 300, false, false, false);
+    (void)run(dir, "ascii_code.c", 360, 120, false, false, false);
+    (void)run(dir, "log_1g.txt", 360, 120, false, false, false);
+    (void)run(dir, "ascii_code.c", 360, 120, false, true, false);
+    miss |= run(dir, "oneline_1g.txt", 360, 300, true, false, false);
+    miss |= run(dir, "unicode.txt", 360, 300, false, false, true);
+    miss |= run(dir, "unicode.txt", 360, 120, false, true, true);
     return miss;
 }

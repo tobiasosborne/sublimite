@@ -9,11 +9,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 
 #define N_OPS 20000u
 #define GATE_P50 50000ull
 
 static uint64_t samples_buf[N_OPS];
+
+typedef struct unicode_setup {
+    font_fallback *fb;
+    font_t *primary;
+    font_family family;
+    edit_arena files;
+    int result, ready;
+} unicode_setup;
+static void unicode_job(work_ctx *ctx)
+{
+    unicode_setup *u = ctx->arg;
+    font_fallback_discover(u->fb, "libfontconfig.so.1");
+    u->result = font_family_load(&u->family, u->primary, u->fb, &u->files);
+    work_msg msg = {0}; msg.kind = FONT_FALLBACK_MSG_KIND;
+    EDIT_ASSERT(work_publish(ctx, &msg));
+}
+static void unicode_ready(const work_msg *msg, void *arg)
+{
+    EDIT_ASSERT(msg->kind == FONT_FALLBACK_MSG_KIND);
+    ((unicode_setup *)arg)->ready = 1;
+}
 
 static const char *power_state(void)
 {
@@ -79,9 +101,20 @@ int main(void)
            s.n, (unsigned long long)p50, (unsigned long long)p99,
            (unsigned long long)GATE_P50, s.dropped, power_state());
 
-    /* Tracked: fallback discovery (fontconfig on this thread, as a worker would). */
+    /* Tracked: real worker discovery and font-file loading; never timed as typing. */
     static font_fallback fb;
-    font_fallback_discover(&fb, "libfontconfig.so.1");
+    unicode_setup u = {0}; u.fb = &fb; u.primary = &f;
+    EDIT_ASSERT(edit_arena_init(&u.files, 64u << 20) == 0);
+    work_pool *pool = malloc(sizeof *pool);
+    EDIT_ASSERT(pool && work_pool_init(pool, 1, 0) == 0);
+    EDIT_ASSERT(work_submit(pool, (work_job){unicode_job, &u, 1, WORK_BULK}).epoch != 0);
+    struct pollfd fd = {work_pool_eventfd(pool), POLLIN, 0};
+    while (!u.ready) {
+        EDIT_ASSERT(poll(&fd, 1, 10000) > 0);
+        (void)work_mailbox_drain(pool, unicode_ready, &u);
+    }
+    work_pool_shutdown(pool); free(pool);
+    EDIT_ASSERT(u.result == FONT_OK);
     printf("BENCH name=font_fallback_discover n=1 ns=%llu gate=none fontconfig=%d cjk=%s emoji=%s tag=(M)[%s] loaded\n",
            (unsigned long long)fb.elapsed_ns, fb.have_fontconfig,
            fb.cjk[0] ? fb.cjk : "none", fb.emoji[0] ? fb.emoji : "none", power_state());
@@ -93,7 +126,7 @@ int main(void)
     if (fb.cjk[0] && edit_arena_init(&fa, (size_t)128u << 20) == 0)
         cjk = font_load_file(fb.cjk, &fa, &cjk_len);
     font_t cf;
-    if (cjk && font_init(&cf, cjk, cjk_len) == FONT_OK && font_set_px(&cf, 30) == FONT_OK) {
+    if (cjk && font_init_index(&cf, cjk, cjk_len, fb.cjk_index) == FONT_OK && font_set_px(&cf, 30) == FONT_OK) {
         bench_samples cs;
         bench_samples_init(&cs, samples_buf, N_OPS);
         int bad = 0;
@@ -112,6 +145,38 @@ int main(void)
     } else {
         printf("BENCH name=font_raster_cjk_4E2D SKIP (no fallback font found)\n");
     }
+    edit_arena storage;
+    EDIT_ASSERT(edit_arena_init(&storage, 8u << 20) == 0);
+    font_cache cache;
+    EDIT_ASSERT(font_cache_init(&cache, &u.family, &storage, 2, 1024, 65536, 1u << 20) == FONT_OK);
+    const uint8_t *clusters[] = {(const uint8_t *)"e\xcc\x81", (const uint8_t *)"\xe4\xb8\xad",
+                                (const uint8_t *)"\xf0\x9f\x98\x80"};
+    const size_t lengths[] = {3, 3, 4}; const uint32_t widths[] = {1, 2, 2};
+    bench_samples cold; bench_samples_init(&cold, samples_buf, N_OPS);
+    for (size_t i = 0; i < 3; i++) {
+        uint32_t slot; uint64_t t0 = bench_now_ns();
+        int rc = font_cache_glyph(&cache, clusters[i], lengths[i], widths[i], &slot);
+        (void)bench_add(&cold, bench_now_ns() - t0);
+        EDIT_ASSERT(rc == FONT_OK || rc == FONT_ERR_MISSING);
+    }
+    print_row("font_cluster_cold_TRACK", &cold, bench_p50(&cold), bench_p99(&cold));
+    bench_samples warm; bench_samples_init(&warm, samples_buf, N_OPS);
+    size_t storage_used = storage.used;
+    if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+    for (size_t i = 0; i < N_OPS; i++) {
+        uint32_t slot = 0; size_t k = i % 3;
+        uint64_t t0 = bench_now_ns();
+        int rc = font_cache_glyph(&cache, clusters[k], lengths[k], widths[k], &slot);
+        (void)bench_add(&warm, bench_now_ns() - t0);
+        EDIT_ASSERT(rc == FONT_OK || rc == FONT_ERR_MISSING);
+        sink += slot;
+    }
+    size_t cache_mallocs = edit_malloc_guard_active() ? edit_malloc_guard_end() : 0;
+    EDIT_ASSERT(cache_mallocs == 0 && storage.used == storage_used);
+    print_row("font_cluster_cached_TRACK", &warm, bench_p50(&warm), bench_p99(&warm));
+    printf("BENCH name=font_cluster_mallocs n=%u value=%zu gate=0 guard=%d tag=(G)(M)[%s] loaded\n",
+           N_OPS, cache_mallocs, edit_malloc_guard_active() ? 1 : 0, power_state());
+    edit_arena_free(&storage); edit_arena_free(&u.files);
     edit_arena_free(&a);
     free(ttf);
     if (s.dropped || p50 > GATE_P50 || mallocs != 0) return 1;

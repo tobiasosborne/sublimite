@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include "base/base.h"
 #include "work/work.h"
+#include "render/render.h"
 
 #define FONT_ATLAS_PAGE_DIM   1024u
 #define FONT_ATLAS_MAX_PAGES  8u
@@ -145,5 +146,62 @@ void font_atlas_init(font_atlas *a, uint32_t max_pages);
 /* 0 on success with (page, x, y); FONT_ERR_NOMEM when every page is full. */
 int  font_atlas_alloc(font_atlas *a, uint32_t w, uint32_t h,
                       uint32_t *page, uint32_t *x, uint32_t *y);
+
+/* P4.11: monochrome cluster composition. Family preparation is INIT/worker
+ * only (file I/O). primary must be sized and have a matching baked atlas.
+ * fb must be published (done acquire == 1); NULL selects embedded-only.
+ * Immutable font bytes remain borrowed; arena and family outlive the cache.
+ * Unsupported fallback files return their error, leaving the primary usable.
+ * A family is exclusively owned: raster calls mutate stb's scratch userdata. */
+#define FONT_FAMILY_MAX_FACES 3u
+#define FONT_CLUSTER_MAX_BYTES 16384u
+typedef struct font_family {
+    font_t faces[FONT_FAMILY_MAX_FACES];
+    uint32_t count;
+} font_family;
+int font_family_load(font_family *family, const font_t *primary,
+                     const font_fallback *fb, edit_arena *arena);
+/* Sequence controls are invisible, not missing glyphs. This is not a width
+ * table; widths/segmentation always come from utf8. */
+int font_cluster_ignorable(uint32_t cp);
+
+typedef struct font_cache_entry {
+    uint64_t hash;
+    size_t key;
+    uint32_t len, width, slot;
+    int result;
+} font_cache_entry;
+typedef struct font_cache {
+    font_family *family;
+    font_cell cell;
+    font_atlas atlas;
+    render_atlas_page pages[FONT_ATLAS_MAX_PAGES + 1u];
+    render_glyph *glyphs;
+    font_cache_entry *entries;
+    uint8_t *keys, *image;
+    size_t capacity, key_capacity, key_used, glyph_count;
+    edit_arena scratch;
+    render_grid *grid;
+    uint64_t hits, misses;
+} font_cache;
+/* INIT only: reserve all pages, exact keys, glyphs, cell image and scratch.
+ * Append-only cache, no eviction: rectangles remain immutable through T5.
+ * Exhaustion returns NOMEM; existing entries stay usable. init failure rolls
+ * back arena. Scratch capacity bounds raster complexity without any malloc.
+ * Keep exclusive UI ownership after worker preparation/handoff. */
+int font_cache_init(font_cache *cache, font_family *family, edit_arena *arena,
+                    uint32_t max_pages, size_t entries, size_t key_bytes,
+                    size_t scratch_bytes);
+/* UI: bind one grid with matching cell dimensions. Updates its table counts
+ * as glyphs are appended; bind again to switch grids. No allocation. */
+int font_cache_bind(font_cache *cache, render_grid *grid);
+/* layout_glyph_fn-compatible. width (1/2) comes from utf8_cluster; exact UTF-8
+ * key plus width identifies a precomposed image. Invalid bytes return ARG;
+ * layout draws one inverse '?' per invalid byte without calling this API.
+ * Zero-width marks merge at the base pen, all faces use the primary baseline.
+ * ZWJ sequences use overlaid monochrome scalar outlines, not shaped ligatures.
+ * No fontconfig, I/O, malloc, or arena growth, including on cold misses. */
+int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
+                     uint32_t width, uint32_t *slot);
 
 #endif
