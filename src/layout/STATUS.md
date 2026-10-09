@@ -1,72 +1,76 @@
-# Layout status — P4.1 / edit-457.1
+# Layout status — P4.1 / edit-457.1, finishing run 2026-10-09
 
-Implemented: opt-in streaming word wrap at text-area width; capped leading-indent
-continuations; blank continuation gutters; intact Unicode clusters and wide
-pairs; CRLF-aware endpoints; visual-row descriptors and scrolling seeds;
-wrapped cursor/selection rendering and soft-End affinity; visual navigation
-adapter in view; per-buffer flag and .md/.txt/.tex/untitled open-time defaults.
-No font or frozen-header changes. Wrap-off uses the existing P3.1 path.
+Module implementation complete: opt-in streaming word wrap at text-area width,
+capped leading-indent continuations, blank continuation gutters, intact Unicode
+clusters/wide pairs, CRLF-aware endpoints, visual-row descriptors/scroll seeds,
+wrapped cursor/selection rendering, soft-End affinity and visual Up/Down/Home/End.
+Per-buffer defaults enable .md/.txt/.tex/untitled and leave code wrap-off.
+No frozen headers changed. Existing default wrap-off scan/render behavior remains.
 
-Wrap implementation is isolated in wrap.c / private wrap.h. layout.c contains
-hooks and reuses its existing cluster decoder/window/cache. Storage is two
-caller-arena descriptor arrays, reserved at open. Newline-free edits plan only
-the affected logical line's visible rows, shift cached suffix cells/metadata,
-then repaint that line. Shrinking exposes bottom rows; those alone are decoded.
-Busy layouts/geometry changes retain full-restart behavior. Right-context edits
-within a decoded unit's lookahead are included even just beyond the viewport.
+Wrap is isolated in wrap.c/private wrap.h; layout.c has dispatch/geometry hooks
+and shares its bounded decoder/window/cache. Storage remains two caller-arena
+descriptor arrays, reserved at open. Newline-free edits plan the affected logical
+line, shift its cached suffix, and paint it; shrinkage decodes newly exposed
+bottom rows. Busy layouts and geometry changes restart. Grid-width changes now
+clear the entire repacked active extent in both wrap modes, including growth into
+unused caller storage. No caller-side cell clearing is required on width changes.
 
-Long-line visible layout never scans the unused tail. Deep uncached queries use
-P3.1b's exact column checkpoints and certified boundaries, with an explicitly
-estimated word-wrap phase. Cached visual seeds keep subsequent layout local.
-Column checkpoints alone cannot give exact global word-wrap phase for arbitrary
-widths; a width-dependent visual-break index would be needed for that guarantee.
-No arbitrary UTF-8 window edge is a cursor boundary. Existing cluster scratch /
-bounded oversized-grapheme behavior remains. P3.1b checkpoint.c is unchanged;
-its lifecycle/publication instructions are in docs/decisions/P3.1b.md.
+Home's whitespace-row affinity fix was already on main. Its strengthened test
+checks endpoint rendering, Shift-Down/Up, repeated Home and continuation Home.
+Additional finishing-run red-green fixes cover wrap-off resize and edits inside
+word lookahead discarded by a soft-break rewind. The bottom scratch descriptor
+retains that examined endpoint while idle; repaint republishes it and suffix
+byte shifts adjust it. This adds no storage/public fields/allocation. Edits in
+the unused long-line tail still produce no damage. Both previous fuzz artifacts
+now replay successfully. Exact red/green output is in docs/decisions/P4.1.md.
 
-Verification: tests/wrap_test.c covers word/hard wrap, indent/tabs, wide/combining
-clusters and motion, CRLF, narrow/gutter-only geometry, snapshots, file defaults,
-soft-End affinity, hidden separators, row shifts vs fresh layouts, newline edits,
-indent removal, deep checkpoints, and lookahead changes outside the viewport.
-Release malloc guard reports zero over 10,000 relayouts and 10,000 typing edits
-(M)[AC], Not charging, load1=6.34; zero allocations is the law-2 gate (G).
-Existing layout_test/view_test also pass with their active guards.
+Tests cover widths growing/shrinking, toggling wrap, gutters, wide clusters,
+poisoned inactive storage, sliced vs fresh one-shot layout, indentation/tabs,
+visual motion, file defaults, newline edits, row shifts, checkpoints, snapshots,
+hidden separators and grapheme/word lookahead. Final gcc `make all` and clang
+ASan/UBSan `make check` passed, including 39 test binaries and replay CLI checks.
+Release guards measured zero allocations over 10,000 relayouts and 10,000 typing
+edits (M)[AC], BAT0=Not charging, load1=7.07; zero is the law-2 gate (G).
 
-Red evidence: undefined new wrap APIs before implementation; soft End incorrectly
-stopped on the last character; hidden separator cursor missing; and an edit to
-the next unit changed the final visible cluster while incremental output stayed
-stale. All regression cases are green. One fuzzer artifact exposed the same
-right-context issue and replays cleanly after the fix.
+`make fuzz`: 20 fuzzers built. Layout campaign: 5,043 runs in 601 seconds,
+no sanitizer/property failure (M)[AC], Not charging, load1=4.25 before launch;
+seed=4571, max_total_time=600, max_len=4096, timeout=30. Width fuzzing compares a
+reused sliced layout with freshly initialized one-shot output, with no manual
+stale-cell clearing, and includes both growth/shrinkage and wrap toggles.
 
-Gates stay unchanged: P3.1 wrap-off 150 us p50/p99 (G); added wrapped 300 x 360
-rows 300 us p50/p99 (G); typing rows TRACK. Latest wrapped bench (M)[AC], Full,
-load1=6.63, shared-box TRACK evidence only:
+One full layout bench campaign at 2026-10-09 07:03:02 UTC: (M)[AC], Not charging,
+load1=6.97 before launch; wrapped subcampaign load1=8.28. Shared-box TRACK only;
+binary exit 1 correctly reports observed gate misses. Gates remain 150 us
+p50/p99 for original wrap-off rows (G), 300 us for wrapped rows (G).
 
-| Row | p50 / p99, us (M)[AC], load1=6.63 | Gate / outcome |
+| Wrapped row | p50 / p99, us (M)[AC], load1=8.28 | Gate / observed outcome |
 |---|---:|---|
-| unicode.txt wrapped | 415.566 / 743.131 | 300 / 300 (G), observed miss |
-| oneline_1g.txt ASCII prose wrapped | 404.459 / 715.078 | 300 / 300 (G), observed miss |
-| indexed ASCII byte 100,000,000 | 352.654 / 609.868 | 300 / 300 (G), observed miss |
-| Unicode typing logical row | 6.053 / 15.583 | TRACK |
-| ASCII typing logical row (fills viewport) | 449.859 / 819.165 | TRACK |
+| Unicode full viewport | 735.419 / 1006.498 | 300 / 300 (G), miss |
+| ASCII prose full viewport | 731.102 / 3742.199 | 300 / 300 (G), miss |
+| Indexed ASCII byte 100,000,000 | 705.048 / 764.190 | 300 / 300 (G), miss |
+| Unicode typing logical row | 11.114 / 23.875 | TRACK |
+| ASCII typing logical row filling viewport | 832.359 / 3833.118 | TRACK |
 
-Deep ASCII scan consumes 107,441 bytes and reads 131,072 bytes (M)[AC], load1=6.63,
-independent of the unused GiB tail. Descriptor storage for this viewport is
-43,200 bytes (M)[AC], load1=6.63. The deep query flags estimated wrap phase while
-preserving exact checkpoint columns and grapheme boundaries. Typing bench times
-exclude mutation/render submit; they do not certify the full G1 1.0/2.0 ms (G)
-input-to-frame budget. The existing off rows also miss under load; no quiet
-verdict is claimed and no limits were loosened. No bench retries for quietness.
+Original ASCII/log viewport rows also observed misses; indexed wrap-off column
+rows passed. Full raw rows and stamps are in docs/decisions/P4.1.md. No retries
+for quietness, gate relaxation or load-driven tuning. Deep wrapped layout scans
+107,441 bytes and reads 131,072 bytes; descriptors use 43,200 bytes for this
+viewport (M)[AC], Not charging, load1=8.28. No unused GiB-tail scan is performed.
 
-Missing: coordinator's quiet-box gate verdict and full editor-loop G1 integration.
-Wire view_wrap_file at open; pass visual_byte through layout_visual_row /
-layout_begin_visual on visual scroll, and visual_end to layout_set_cursor_visual.
-Config.toml overrides remain P6.4. Exact uncached global deep wrap phase remains
-explicitly approximate with the current column-only index.
+Deep uncached queries preserve certified grapheme boundaries/checkpoint columns
+but explicitly estimate width-dependent global word-wrap phase. An exact global
+phase needs a visual-break index. Existing checkpoint lifecycle is unchanged.
+The coordinator still owns the gate verdict, leak-enabled rerun and full editor
+G1 integration. Wire view_wrap_file at open, visual_byte via layout_visual_row /
+layout_begin_visual when scrolling, and visual_end via layout_set_cursor_visual.
+Typing bench excludes mutation/submit; it cannot certify input-to-frame latency.
+Config.toml overrides remain P6.4. No new unresolved module failure was found.
 
-Verify with DISPLAY=:99 EDIT_DISPLAY=:99: make all; ASAN_OPTIONS=detect_leaks=0
-make check; make fuzz; build/tests/{layout,view,wrap}_test; and
-build/bench/layout_bench /tmp/edit-corpus '' --wrap-only (or the complete bench).
-Full X11 tests need socket access outside the sandbox; final verification used
-private virtual Xvfb servers, never :0. LSan remains disabled per the sandbox
-restriction; coordinator reruns with leak detection enabled.
+Verify with DISPLAY=:99 EDIT_DISPLAY=:99: `make all`;
+`ASAN_OPTIONS=detect_leaks=0 make check`; `make fuzz`;
+`build/tests/{layout,view,wrap}_test`; `build/fuzz/layout_fuzz` with the recorded
+campaign flags and an existing seed corpus; and one
+`build/bench/layout_bench /tmp/edit-corpus` (or `'' --wrap-only` for wrapped rows).
+Full X11 tests need socket access outside the sandbox; all commands target :99,
+with existing X11 tests using private virtual servers. LSan is disabled only for
+this sandbox; the coordinator reruns with leaks enabled.

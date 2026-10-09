@@ -197,10 +197,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     cfg.gutter_bg = 0x101010; cfg.cursor_fg = 1; cfg.cursor_bg = 2; cfg.sel_fg = 3; cfg.sel_bg = 4;
     cfg.glyph = glyph_cb;
     for (int k = 0; k < 2; k++) {
-        cells[k] = malloc(n * sizeof **cells);
+        cells[k] = malloc(40u * rows * sizeof **cells);
         bits[k][0] = 0;
         if (!cells[k] || render_grid_init(&g[k], (render_dims){cols, rows, a->cell.cell_w, a->cell.cell_h},
-                                          cells[k], n, bits[k], 1) != RENDER_OK) __builtin_trap();
+                                          cells[k], 40u * rows, bits[k], 1) != RENDER_OK) __builtin_trap();
         g[k].pages = &page; g[k].page_count = 1; g[k].glyphs = glyphs; g[k].glyph_count = 96;
         cfg.slice_clusters = k ? slice : 0;
         if (layout_init(&lay[k], &g[k], &cfg, rb[k], ru[k]) != LAYOUT_DONE) __builtin_trap();
@@ -255,21 +255,28 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         while((rc=layout_run(&lay[1]))==LAYOUT_MORE) {}
         if(rc!=0 || (!(ins&0x80u) && (memcmp(cells[0],cells[1],n*sizeof **cells)!=0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0))) __builtin_trap();
     }
-    /* Resize and toggle back and forth, compare sliced vs one-shot output. */
+    /* Resize up/down and toggle; reused sliced layout vs fresh one-shot.
+     * No caller-side clearing: begin owns changed strides in both modes. */
+    lay[0].cfg.slice_clusters=slice;
     for(unsigned pass=0;pass<3;pass++) {
-        uint32_t width=1u+(data[pass]+pass)%cols;
+        uint32_t width=1u+(data[pass]+pass)%40u;
         for(int k=0;k<2;k++) {
             g[k].dims.cols=width;
-            /* Existing wrap-off callers initialize repacked storage. Wrapped
-             * begin must handle its own changed stride/stale cell extents. */
-            if(pass%2u!=0) for(uint32_t r=0;r<rows;r++) ru[k][r]=width;
+            if(k==1) {
+                cfg.slice_clusters=0;
+                if(layout_init(&lay[k],&g[k],&cfg,rb[k],ru[k])!=LAYOUT_DONE ||
+                   layout_wrap_init(&lay[k],&wrap_arena[k])!=LAYOUT_DONE) __builtin_trap();
+                layout_set_cursor(&lay[k],lay[0].cursor);
+                layout_set_selection(&lay[k],lay[0].sel_lo,lay[0].sel_hi);
+            }
             if(layout_set_wrap(&lay[k],pass%2u==0)!=0 || render_frame_begin(&g[k],++fr)!=0 ||
                layout_begin(&lay[k],t,(layout_viewport){first_byte,LAYOUT_LINE_UNKNOWN,hs,0})<0) __builtin_trap();
             unsigned guard=0; int result;
             while((result=layout_run(&lay[k]))==LAYOUT_MORE) if(++guard>100000) __builtin_trap();
             if(result!=LAYOUT_DONE || render_grid_validate(&g[k])!=RENDER_OK) __builtin_trap();
         }
-        if(memcmp(cells[0],cells[1],(size_t)width*rows*sizeof **cells)!=0 || memcmp(rb[0],rb[1],rows*sizeof **rb)!=0) __builtin_trap();
+        if(memcmp(cells[0],cells[1],(size_t)width*rows*sizeof **cells)!=0 ||
+           memcmp(rb[0],rb[1],rows*sizeof **rb)!=0 || memcmp(ru[0],ru[1],rows*sizeof **ru)!=0) __builtin_trap();
     }
     for (int k = 0; k < 2; k++) { edit_arena_free(&wrap_arena[k]); free(cells[k]); }
     piece_destroy(t);

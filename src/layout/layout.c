@@ -84,7 +84,8 @@ static int begin_common(layout *l, layout_viewport vp)
     if (gw != l->gw) {                      /* old gutter cells may be anywhere: re-clear */
         for (uint32_t r = 0; r < l->grid->dims.rows; r++) l->row_used[r] = l->grid->dims.cols;
     }
-    if (l->wrap) layout_wrap_geometry(l);
+    /* A width change repacks the same cell storage in either wrap mode. */
+    layout_wrap_geometry(l);
     set_gw(l, gw);
     l->row_byte[0] = vp.first_byte;
     l->row = 0;

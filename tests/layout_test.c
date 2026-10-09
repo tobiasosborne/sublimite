@@ -591,9 +591,25 @@ static void test_no_allocations(void)
     fx_free(&f);
 }
 
+static void test_resize(void)
+{
+    const char *text="abcdef\n\xe4\xb8\xad" "\nlast\n";
+    const uint32_t widths[]={5,13,1,20,7};
+    fx f; layout_config cfg=nogutter(); cfg.slice_clusters=1;
+    fx_make(&f,20,6,cfg,text,strlen(text)); show(&f,0,0);
+    for(size_t i=0;i<sizeof widths/sizeof *widths;i++) {
+        f.g.dims.cols=widths[i]; show(&f,0,0);
+        fx fresh; fx_make(&fresh,widths[i],6,nogutter(),text,strlen(text)); show(&fresh,0,0);
+        CHECK(same_grid(&f,&fresh));
+        CHECK(memcmp(f.row_byte,fresh.row_byte,6u*sizeof *f.row_byte)==0);
+        fx_free(&fresh);
+    }
+    fx_free(&f);
+}
+
 int main(void)
 {
-    test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
+    test_resize(); test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
     test_gutter(); test_hscroll_eof(); test_slices(); test_dirty(); test_cursor(); test_long_line_bounded(); test_checkpoints(); test_budgeted_cluster(); test_no_allocations(); test_cluster_window_boundary(); test_short_line_before_long(); test_cache_invalid_right_context();
     if (fails) { printf("layout_test: %d FAILED\n", fails); return 1; }
     printf("layout_test: all passed\n");

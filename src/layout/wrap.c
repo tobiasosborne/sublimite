@@ -15,8 +15,19 @@ static layout_wrap_row *descriptor(layout *l,uint32_t row)
 {
     return &(l->wrap_planning?l->wrap_plan:l->wrap_rows)[row];
 }
+/* While idle, the last scratch descriptor's next stores the bottom row's
+ * examined endpoint, including word lookahead discarded by a soft-break rewind.
+ * Planning may reuse it; painting that bottom row publishes it again. */
+static void remember_context(layout *l)
+{
+    if(!l->wrap_sink && !l->wrap_planning && l->row+1u==l->grid->dims.rows) {
+        uint64_t *end=&l->wrap_plan[l->row].next;
+        if(l->pos>*end) *end=l->pos;
+    }
+}
 static void position(layout *l,uint64_t byte)
 {
+    if(byte<l->pos) remember_context(l);
     l->pos=byte;
     if(l->win_len && byte>=l->win_pos && byte-l->win_pos<=l->win_len) l->wi=(uint32_t)(byte-l->win_pos);
     else { l->win_len=l->wi=0; l->win_eof=false; }
@@ -48,7 +59,8 @@ int layout_set_wrap(layout *l,bool enabled)
 void layout_wrap_geometry(layout *l)
 {
     /* Columns change the physical cell stride. Clear the whole active extent
-     * when painting the new geometry, including newly exposed caller storage. */
+     * when painting the new geometry in either mode, including newly exposed
+     * caller storage. Previous row_used extents no longer describe these rows. */
     if(l->gw+l->text_cols!=l->grid->dims.cols)
         for(uint32_t r=0;r<l->grid->dims.rows;r++) l->row_used[r]=l->grid->dims.cols;
 }
@@ -85,6 +97,8 @@ static void start_row(layout *l,render_cell *cells)
     l->wrap_leading=!r->continuation;
     l->wrap_break_byte=LAYOUT_VOID_ROW; l->wrap_last=r->start;
     l->cluster_active=false; l->phase=1; l->wrap_cr=false; l->row_scanned=0;
+    if(!l->wrap_sink && !l->wrap_planning && l->row+1u==l->grid->dims.rows)
+        l->wrap_plan[l->row].next=r->start;
     gutter(l,cells,r);
     if(!l->wrap_sink && !l->wrap_planning) for(uint32_t c=0;c<l->vis;c++) cells[l->gw+c]=blank(l);
 }
@@ -144,6 +158,7 @@ static int finish_plan(layout *l)
 }
 static int end_row(layout *l,render_cell *cells,bool newline,bool eof)
 {
+    remember_context(l);
     layout_wrap_row *r=descriptor(l,l->row);
     r->end=l->pos-(newline && l->wrap_cr?1u:0u); r->end_column=l->col; r->last=l->wrap_last;
     r->indent=l->wrap_indent; r->newline=newline; r->approximate=l->approximate;
@@ -395,6 +410,8 @@ int layout_wrap_relayout(layout *l,uint32_t first,uint32_t count)
 static void shift_bytes(layout *l,uint32_t from,uint64_t off,uint64_t old_len,uint64_t new_len)
 {
     uint32_t rows=l->grid->dims.rows;
+    uint64_t *context=&l->wrap_plan[rows-1u].next;
+    if(from<rows && *context>=off+old_len) *context=*context-old_len+new_len;
     for(uint32_t i=from;i<rows;i++) {
         layout_wrap_row *r=&l->wrap_rows[i];
         if(r->start==LAYOUT_VOID_ROW) continue;
@@ -426,9 +443,11 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
     while(found+1<rows && l->row_byte[found+1]<=off) found++;
     if(l->row_byte[found]==LAYOUT_VOID_ROW) return LAYOUT_DONE;
     layout_wrap_row *hit=&l->wrap_rows[found];
-    /* The next decoded unit is right context for the last visible cluster.
-     * Editing one of its continuation bytes can turn it into a combining mark. */
-    if(off>hit->end && off-hit->end>4u) return LAYOUT_DONE;
+    /* A soft break can rewind past an examined word. Its bytes still affect
+     * this row's partition; the next scalar can also change its final cluster. */
+    uint64_t context=hit->end;
+    if(found+1u==rows && l->wrap_plan[found].next>context) context=l->wrap_plan[found].next;
+    if(off>context && off-context>4u) return LAYOUT_DONE;
     uint32_t first=found; while(first && l->wrap_rows[first-1].line_start==hit->line_start) first--;
     if(l->wrap_rows[first].continuation && off<l->wrap_rows[first].start) return LAYOUT_RESET;
     uint32_t after=found+1; while(after<rows && l->row_byte[after]!=LAYOUT_VOID_ROW && l->wrap_rows[after].line_start==hit->line_start) after++;

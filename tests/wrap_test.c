@@ -105,6 +105,11 @@ static void navigation(void)
     CHECK(view_command(&v,VIEW_UP,false,NULL,0,&ch)==0); CHECK(v.state.selection.cursor==13);
     CHECK(view_wrap_default(NULL) && view_wrap_default("") && view_wrap_default("note.md") && view_wrap_default("note.txt") && view_wrap_default("note.tex"));
     CHECK(!view_wrap_default("code.c") && !view_wrap_default("note.md.c"));
+    const char *paths[]={NULL,"","note.md","note.txt","note.tex","code.c","note.md.c"};
+    for(size_t i=0;i<sizeof paths/sizeof *paths;i++) {
+        CHECK(view_wrap_file(&v,&f.l,paths[i])==VIEW_OK);
+        CHECK(v.state.wrap==(i<5) && f.l.wrap==v.state.wrap);
+    }
     destroy(&f);
 }
 static void hard_end(void)
@@ -239,6 +244,24 @@ static void lookahead_edit(void)
     CHECK(memcmp(a.cells,b.cells,5u*sizeof(render_cell))==0);
     destroy(&a); destroy(&b);
 }
+static void lookahead_word_edit(void)
+{
+    fixture a,b; const char *text="a abcdefghijklmnopqrstuvwxyz0123456789";
+    init(&a,text,16,1,2); init(&b,text,16,1,0); show(&a); show(&b);
+    CHECK(a.l.wrap_rows[0].end==2); /* rollback after decoding part of the word */
+    CHECK(piece_insert(a.tree,10,(const uint8_t *)"\n",1)==0 && piece_insert(b.tree,10,(const uint8_t *)"\n",1)==0);
+    CHECK(render_frame_begin(&a.g,++a.frame)==0 && layout_edit(&a.l,10,0,1,0,1)>=0); run(&a); show(&b);
+    CHECK(memcmp(a.cells,b.cells,16u*sizeof(render_cell))==0);
+    CHECK(a.l.wrap_rows[0].end==10);
+    CHECK(piece_delete(a.tree,10,1,NULL)==0 && piece_delete(b.tree,10,1,NULL)==0);
+    CHECK(render_frame_begin(&a.g,++a.frame)==0 && layout_edit(&a.l,10,1,0,1,0)>=0); run(&a); show(&b);
+    CHECK(memcmp(a.cells,b.cells,16u*sizeof(render_cell))==0);
+    /* An edit in the unused tail still performs no rendering. */
+    CHECK(piece_insert(a.tree,strlen(text),(const uint8_t *)"tail",4)==0);
+    CHECK(render_frame_begin(&a.g,++a.frame)==0 && layout_edit(&a.l,strlen(text),0,4,0,0)==LAYOUT_DONE);
+    CHECK(a.bits[0]==0 && !a.g.full_frame);
+    destroy(&a); destroy(&b);
+}
 static void wide_navigation(void)
 {
     fixture f; init(&f,"abcd\xe4\xb8\xad" "e\xcc\x81x",5,4,2); show(&f);
@@ -258,7 +281,15 @@ static void whitespace_home(void)
     view v; view_config cfg={4,6,5,NULL,NULL}; view_init(&v,f.tree,&cfg); CHECK(view_set_wrap(&v,true,&f.l)==0);
     v.state.selection.cursor=v.state.selection.anchor=1; view_change ch;
     CHECK(view_command(&v,VIEW_HOME,false,NULL,0,&ch)==0 && v.state.selection.cursor==5 && v.state.visual_end);
+    layout_set_cursor_visual(&f.l,v.state.selection.cursor,v.state.visual_end); show(&f);
+    CHECK((f.cells[4].attrs&RENDER_ATTR_CURSOR) && !(f.cells[7].attrs&RENDER_ATTR_CURSOR));
+    CHECK(view_command(&v,VIEW_DOWN,true,NULL,0,&ch)==0 && v.state.selection.cursor==8 && v.state.selection.anchor==5);
+    CHECK(view_command(&v,VIEW_UP,false,NULL,0,&ch)==0 && v.state.selection.cursor==5 && v.state.visual_end);
     CHECK(view_command(&v,VIEW_HOME,false,NULL,0,&ch)==0 && v.state.selection.cursor==0 && !v.state.visual_end);
+    v.state.selection.cursor=v.state.selection.anchor=6;
+    CHECK(view_command(&v,VIEW_HOME,false,NULL,0,&ch)==0 && v.state.selection.cursor==5 && !v.state.visual_end);
+    layout_set_cursor_visual(&f.l,v.state.selection.cursor,v.state.visual_end); show(&f);
+    CHECK(!(f.cells[4].attrs&RENDER_ATTR_CURSOR) && (f.cells[7].attrs&RENDER_ATTR_CURSOR));
     destroy(&f);
 }
 static void gutter_only_boundary(void)
@@ -273,13 +304,27 @@ static void gutter_only_boundary(void)
 }
 static void resize(void)
 {
-    const char *text="one two three four\n  alpha beta gamma delta\nlast";
-    fixture a,b; init(&a,text,9,8,3); show(&a);
-    a.g.dims.cols=13; show(&a); /* caller capacity already covers the wider grid */
-    init(&b,text,13,8,0); show(&b);
-    CHECK(memcmp(a.cells,b.cells,13u*8u*sizeof(render_cell))==0); destroy(&b);
-    a.g.dims.cols=5; show(&a); init(&b,text,5,8,0); show(&b);
-    CHECK(memcmp(a.cells,b.cells,5u*8u*sizeof(render_cell))==0);
-    destroy(&a); destroy(&b);
+    const char *text="one two three four\n  alpha \xe4\xb8\xad" " beta gamma delta\nlast\n";
+    const uint32_t widths[]={13,5,1,40,9};
+    /* Poison inactive caller storage too: growing must initialize new cells.
+     * Both wrap modes own repacking; callers only change the grid dimensions. */
+    for(unsigned mode=0;mode<4;mode++) {
+        fixture a,b; init(&a,text,9,8,3); a.l.cfg.gutter=(mode&2u)!=0;
+        CHECK(layout_set_wrap(&a.l,(mode&1u)!=0)==0);
+        for(size_t i=9u*8u;i<ROWS*COLS;i++) a.cells[i]=(render_cell){0,RENDER_NO_SLOT,99,100,0,0};
+        show(&a);
+        for(size_t i=0;i<sizeof widths/sizeof *widths;i++) {
+            a.g.dims.cols=widths[i];
+            bool wrapping=((mode+(unsigned)i)&1u)!=0;
+            CHECK(layout_set_wrap(&a.l,wrapping)==0); show(&a);
+            init(&b,text,widths[i],8,0); b.l.cfg.gutter=a.l.cfg.gutter;
+            CHECK(layout_set_wrap(&b.l,wrapping)==0); show(&b);
+            CHECK(memcmp(a.cells,b.cells,(size_t)widths[i]*8u*sizeof(render_cell))==0);
+            CHECK(memcmp(a.rb,b.rb,8u*sizeof *a.rb)==0);
+            CHECK(memcmp(a.used,b.used,8u*sizeof *a.used)==0);
+            destroy(&b);
+        }
+        destroy(&a);
+    }
 }
-int main(void) { resize(); gutter_only_boundary(); whitespace_home(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }
+int main(void) { lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }
