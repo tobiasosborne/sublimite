@@ -99,7 +99,10 @@ static void large_and_errors(void)
     memset(cells,0,sizeof cells);
     minimap_input in = {src, lineidx_line_count(idx).value, 8, lineidx_complete(idx)};
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && m.stale && f.calls == 0);
-    (void)lineidx_seek_line(idx,&src,UINT64_MAX,n); CHECK(lineidx_complete(idx));
+    /* Index setup resumes the bounded lineidx API between UI slices. */
+    for (unsigned slice = 0; slice < 20000 && !lineidx_complete(idx); slice++)
+        (void)lineidx_seek_line(idx,&src,UINT64_MAX,n);
+    CHECK(lineidx_complete(idx));
     in.lines = lineidx_line_count(idx).value; in.index_ready = true; f.calls = 0;
     edit_malloc_guard_begin();
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && !m.stale && m.sampled);
@@ -138,7 +141,9 @@ static void large_and_errors(void)
     in.revision++; in.index_ready = false;
     CHECK(minimap_stale(&m,&in));
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && m.stale);
-    (void)lineidx_refresh(idx,&src); CHECK(lineidx_complete(idx));
+    for (unsigned slice = 0; slice < 20000 && !lineidx_complete(idx); slice++)
+        (void)lineidx_refresh(idx,&src);
+    CHECK(lineidx_complete(idx));
     in.lines = lineidx_line_count(idx).value; in.index_ready = true;
     CHECK(minimap_stale(&m,&in));
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && !m.stale);

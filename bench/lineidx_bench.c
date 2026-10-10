@@ -593,6 +593,136 @@ static int self_check_17(void)
     return fail;
 }
 
+/* P1.6c additional rows. The P1.6d rows above remain unchanged. */
+typedef struct cancel_source {
+    uint8_t byte;
+    _Atomic bool entered, resume;
+    _Atomic unsigned calls;
+} cancel_source;
+static uint64_t worker_cpu_now(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) fail_fast("thread CPU clock failed");
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static size_t cancel_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    cancel_source *s = ctx;
+    if (off >= LINEIDX_CHUNK) return 0;
+    atomic_fetch_add_explicit(&s->calls, 1, memory_order_relaxed);
+    atomic_store_explicit(&s->entered, true, memory_order_release);
+    while (!atomic_load_explicit(&s->resume, memory_order_acquire)) nap(50);
+    uint64_t begin = worker_cpu_now();
+    while (worker_cpu_now() - begin < 2000000ull) { }
+    *p = &s->byte;
+    return 1;
+}
+static int cancellation_rows(work_pool *p, int reps, uint64_t timeout)
+{
+    uint64_t logical_buf[200], cpu_buf[200], cpu_max = 0;
+    bench_samples logical, cpu;
+    bench_samples_init(&logical, logical_buf, 200);
+    bench_samples_init(&cpu, cpu_buf, 200);
+    evidence stamp = measurement_stamp();
+    for (int r = 0; r < reps; r++) {
+        stamp = measurement_stamp();
+        cancel_source source = {.byte = 'a'};
+        lineidx_src src = {&source, LINEIDX_CHUNK, cancel_span, NULL};
+        lineidx *x = lineidx_create(src.len);
+        if (!x || lineidx_build_start_owned(x, p, &src, 0) != 0) fail_fast("G6c submit failed");
+        uint64_t deadline = bench_now_ns() + timeout;
+        while (!atomic_load_explicit(&source.entered, memory_order_acquire)) {
+            if (bench_now_ns() >= deadline) fail_fast("G6c worker start timeout");
+            nap(50);
+        }
+        uint64_t begin = bench_now_ns();
+        lineidx_build_cancel(x);
+        bench_add(&logical, bench_now_ns() - begin); /* logical return only */
+        atomic_store_explicit(&source.resume, true, memory_order_release);
+        if (!wait_index(x, p, deadline, false, "G6c physical completion")) fail_fast("G6c retirement failed");
+        uint64_t slice = lineidx_cancel_cpu_ns(x);
+        if (!slice || atomic_load(&source.calls) != 1u || lineidx_complete(x))
+            fail_fast("G6c polling/publication suppression failed");
+        bench_add(&cpu, slice);
+        if (slice > cpu_max) cpu_max = slice;
+        index_destroy(x, p, timeout);
+    }
+    int rc = report_stamped(stdout, "TRACK_G6c_lineidx_cancel_logical", &logical, 1000000, 5000000, &stamp);
+    rc |= report_stamped(stdout, "TRACK_G6c_lineidx_cancel_cpu_slice", &cpu, 5000000, 5000000, &stamp);
+    printf("# G6c worker_next_cpu_max=%llu ns (M)%s load=%s gate_max=5000000 ns (G) publication_suppression=PASS\n",
+           (unsigned long long)cpu_max, stamp.power, stamp.load);
+    return rc | (cpu_max > 5000000ull ? 1 : 0);
+}
+typedef struct seek_source { flat f; _Atomic uint64_t bytes; } seek_source;
+static size_t seek_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    seek_source *s = ctx;
+    if (off >= s->f.n) return 0;
+    uint64_t k = s->f.n - off;
+    if (k > 16384u) k = 16384u;
+    *p = s->f.b + off;
+    atomic_fetch_add_explicit(&s->bytes, k, memory_order_relaxed);
+    return (size_t)k;
+}
+static int worker_seek_row(work_pool *p, fixture *file, const oracle *reference,
+                            int reps, uint64_t timeout, bool calibrated, bool track)
+{
+    uint64_t buf[200]; bench_samples samples;
+    bench_samples_init(&samples, buf, 200);
+    evidence stamp = measurement_stamp();
+    for (int r = 0; r < reps + 2; r++) {
+        const uint8_t *m = map_file(file);
+        if (!m) fail_fast("async G7j mapping failed");
+        seek_source source = {.f = {m, file->n}};
+        lineidx_src src = {&source, file->n, seek_span, NULL};
+        lineidx *x = lineidx_create(file->n); viewport v;
+        if (!x || viewport_init(&v, &source.f) != 0 || lineidx_built_prefix(x) != 0)
+            fail_fast("async G7j fresh open setup failed");
+        /* Prepare a controlled prefix outside the timer. Each call is a UI
+         * slice; no worker can race ahead of this prefix. Always stop before
+         * the target, even for an uncalibrated alternate fixture. */
+        size_t prefix = lineidx_chunk_count(x) / 2u;
+        uint64_t target_chunk = reference->byte ? (reference->byte - 1u) / LINEIDX_CHUNK : 0;
+        if (prefix > target_chunk) prefix = (size_t)target_chunk;
+        lineidx_src seed_src = {&source.f, file->n, flat_span, NULL};
+        uint64_t seed_deadline = bench_now_ns() + timeout;
+        while (lineidx_built_prefix(x) < prefix) {
+            (void)lineidx_seek_line(x, &seed_src, UINT64_MAX, LINEIDX_CHUNK);
+            if (bench_now_ns() >= seed_deadline) fail_fast("async G7j prefix setup timeout");
+        }
+        uint64_t prefix_bytes = (uint64_t)prefix * LINEIDX_CHUNK;
+        if (lineidx_built_prefix(x) != prefix || (reference->byte && prefix_bytes >= reference->byte))
+            fail_fast("async G7j prefix reached target before request");
+        stamp = measurement_stamp();
+        uint64_t begin = bench_now_ns(), deadline = begin + timeout;
+        if (lineidx_seek_start_owned(x, p, &src, reference->target, 0) != 0)
+            fail_fast("async G7j request failed");
+        lineidx_result answer;
+        while (!lineidx_seek_result(x, &answer)) {
+            drain(p);
+            if (bench_now_ns() >= deadline) fail_fast("async G7j completion timeout");
+            nap(50);
+        }
+        if (!answer.exact || answer.value != reference->byte ||
+            viewport_submit(&v, answer.value, reference->target, reference->lines, deadline) != 0)
+            fail_fast("async G7j offset/viewport failed");
+        uint64_t elapsed = bench_now_ns() - begin;
+        if (r >= 2) bench_add(&samples, elapsed);
+        uint64_t bytes = atomic_load(&source.bytes);
+        uint64_t needed = reference->byte - prefix_bytes;
+        if (bytes < needed || bytes - needed > LINEIDX_CHUNK ||
+            (calibrated && bytes >= file->n - prefix_bytes) || !viewport_correct(&v, &source.f, reference))
+            fail_fast("async G7j independent byte/cell oracle failed");
+        printf("# async G7j sample=%d partial_prefix_chunks=%zu prefix_bytes=%llu scanned_bytes=%llu target_byte=%llu viewport_submitted=1 (M)%s load=%s\n",
+               r, prefix, (unsigned long long)prefix_bytes, (unsigned long long)bytes,
+               (unsigned long long)reference->byte, stamp.power, stamp.load);
+        viewport_free(&v); index_destroy(x, p, timeout); munmap((void *)m, (size_t)file->n);
+    }
+    puts("# async partial G7j warm contract (G) p50=30 ms p99=50 ms; measured on the box as it is; null viewport backend");
+    return report_stamped(stdout, "TRACK_G7j_worker_partial_seek_viewport_90pct_fixture_warm", &samples,
+                          calibrated && !track ? 30000000 : 0, calibrated && !track ? 50000000 : 0, &stamp);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--self-check") == 0) {
@@ -797,6 +927,8 @@ int main(int argc, char **argv)
         munmap((void *)m, (size_t)n);
     }
 
+    rc |= cancellation_rows(&pool, reps, parsed.timeout);
+    if (!cold) rc |= worker_seek_row(&pool, &file, &reference, reps, parsed.timeout, gate_fixture, track);
     work_pool_shutdown(&pool);
     int result = finish_run(rc, cold, gate_fixture, track);
     printf("lineidx_bench: %s\n", track || !gate_fixture ? "TRACK only; gates unvalidated" :

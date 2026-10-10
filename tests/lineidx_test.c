@@ -335,7 +335,11 @@ static void test_review_mailbox(void)
     REQUIRE(x != NULL);
     CHECK(lineidx_build_start(x, &pool, &src) == 0);
     REQUIRE(lease_entered(&s));
-    work_handle h = { 0, atomic_load(&pool.slots[0].epoch) };
+    work_handle h = {0};
+    for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) {
+        if (atomic_load(&pool.slots[i].busy)) { h.slot = i; h.epoch = atomic_load(&pool.slots[i].epoch); break; }
+    }
+    REQUIRE(h.epoch != 0);
     work_cancel(&pool, h); /* pool rejects all messages from this lease */
     atomic_store_explicit(&s.resume, true, memory_order_release);
     for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
@@ -501,7 +505,8 @@ static void test_seek_partial(void)
     lineidx_result r = lineidx_seek_line(x, &s, target, 1u << 20);   /* budget too small */
     CHECK(!r.exact);
     CHECK(r.value == 0 || b[r.value - 1] == '\n');
-    r = lineidx_seek_line(x, &s, target, n);                          /* enough */
+    for (unsigned i = 0; i < 256 && !r.exact; i++)
+        r = lineidx_seek_line(x, &s, target, n); /* separately bounded slices */
     CHECK(r.exact && r.value == n_l2b(b, n, target));
     CHECK(lineidx_built_prefix(x) > 0);
     /* the recorded prefix now answers exactly with no scan budget */
@@ -626,7 +631,11 @@ static void test_no_malloc(void)
 {
     uint64_t n = 4u << 20;
     uint8_t *b = mkbuf(n, 0);
-    lineidx *x = lineidx_create_reserved(n, 256); /* reserve this test's typing burst */
+    const unsigned keys = 10000;
+    uint8_t *extended = realloc(b, (size_t)n + (size_t)keys * 64u);
+    REQUIRE(extended != NULL);
+    b = extended;
+    lineidx *x = lineidx_create_reserved(n, keys); /* reserve this test's typing burst */
     REQUIRE(x != NULL);
     flat f = { b, n, 0, 0 };
     lineidx_src s = mk(&f);
@@ -635,20 +644,25 @@ static void test_no_malloc(void)
     uint8_t ins[64]; memset(ins, 'a', sizeof ins);
     edit_malloc_guard_begin();
     volatile uint64_t sink = 0;
-    for (int i = 0; i < 200; i++) {
+    for (unsigned i = 0; i < keys; i++) {
         uint64_t off = rnd() % (n + 1);
         sink += lineidx_line_to_byte(x, &s, rnd() % 50000).value;
         sink += lineidx_byte_to_line(x, &s, off).value;
         sink += lineidx_line_count(x).value;
         sink += lineidx_seek_line(x, &s, rnd() % 50000, 1u << 20).value;
         CHECK(lineidx_edit(x, off, 0, sizeof ins) == 0);
-        model_edit(&b, &n, off, 0, ins, sizeof ins);   /* model malloc is counted: compensate below */
+        /* The independent byte model also uses its open-path reserve, so the
+         * guard covers the whole burst without subtracting model allocations. */
+        memmove(b + off + sizeof ins, b + off, (size_t)(n - off));
+        memcpy(b + off, ins, sizeof ins);
+        n += sizeof ins;
         f.b = b; f.n = n; s.len = n;
         while (lineidx_refresh(x, &s)) { }
     }
     size_t mallocs = edit_malloc_guard_end();
-    /* model_edit mallocs once per iteration; the index itself must add none */
-    if (edit_malloc_guard_active()) CHECK(mallocs == 200);
+    if (edit_malloc_guard_active()) CHECK(mallocs == 0);
+    fprintf(stderr, "lineidx typing: keys=%u allocations=%zu guard=%s\n",
+            keys, mallocs, edit_malloc_guard_active() ? "active" : "sanitizer skipped");
     (void)sink;
     lineidx_destroy(x);
     free(b);
@@ -664,7 +678,7 @@ static void test_memory(void)
     CHECK(chunks == (size_t)(n / LINEIDX_CHUNK));
     size_t mem = lineidx_mem_bytes(x);
     fprintf(stderr, "  1 GiB index: %zu chunks, %zu B live (%.3f B/chunk)\n", chunks, mem, (double)mem / (double)chunks);
-    CHECK(mem <= chunks * 16 + 4096);
+    CHECK(mem <= chunks * 16 + chunks / 2); /* existing 16.5 B/chunk guard */
     lineidx_destroy(x);
 }
 
@@ -745,6 +759,352 @@ static void test_corpus(const char *path)
 
 static void test_mailbox_pressure(void);
 static void test_completed_slot_reuse(void);
+typedef struct { uint8_t *b; uint64_t n, calls; size_t span_size; } metered;
+static size_t metered_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    metered *s = ctx;
+    if (off >= s->n) return 0;
+    s->calls++;
+    *p = s->b + off;
+    uint64_t k = s->span_size ? s->span_size : 1;
+    return (size_t)(k < s->n - off ? k : s->n - off);
+}
+static void test_review_seek_budget(void)
+{
+    uint8_t b[LINEIDX_CHUNK + 1u];
+    memset(b, 'a', sizeof b);
+    b[LINEIDX_CHUNK - 1u] = '\n';
+    const uint64_t budgets[] = {0, 1, LINEIDX_CHUNK - 1u, LINEIDX_CHUNK, LINEIDX_CHUNK + 1u};
+    for (size_t i = 0; i < sizeof budgets / sizeof budgets[0]; i++) {
+        metered s = {.b = b, .n = sizeof b, .span_size = 4096};
+        lineidx_src src = {&s, s.n, metered_span, NULL};
+        lineidx *x = lineidx_create(s.n);
+        REQUIRE(x != NULL);
+        lineidx_result q = lineidx_seek_line(x, &src, 1, budgets[i]);
+        CHECK(lineidx_scanned_bytes(x) <= budgets[i]);
+        CHECK(q.exact == (budgets[i] >= LINEIDX_CHUNK));
+        if (q.exact) CHECK(q.value == LINEIDX_CHUNK);
+        lineidx_destroy(x);
+    }
+    metered s = {.b = b, .n = sizeof b, .span_size = 4096};
+    lineidx_src src = {&s, s.n, metered_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    lineidx_result q = lineidx_seek_line(x, &src, 1, LINEIDX_CHUNK - 1u);
+    CHECK(!q.exact && lineidx_built_prefix(x) == 0);
+    s.calls = 0;
+    q = lineidx_seek_line(x, &src, 1, 1);
+    CHECK(q.exact && q.value == LINEIDX_CHUNK && s.calls == 1);
+    lineidx_destroy(x);
+    b[0] = '\n';
+    x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    s.calls = 0;
+    q = lineidx_seek_line(x, &src, 1, 1);
+    CHECK(q.exact && q.value == 1 && s.calls == 1 && lineidx_built_prefix(x) == 0);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 6: strict byte budget + partial continuation ok\n");
+}
+static void test_review_ui_seek(void)
+{
+    uint8_t b[4u * LINEIDX_CHUNK];
+    memset(b, 'a', sizeof b); b[sizeof b - 1u] = '\n';
+    metered s = {.b = b, .n = sizeof b};
+    lineidx_src src = {&s, s.n, metered_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    lineidx_result q = lineidx_seek_line(x, &src, 1, s.n);
+    CHECK(s.calls <= 256);
+    CHECK(!q.exact);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 7: synchronous continuation yields at span limit\n");
+}
+static void test_seek_changed_target(void)
+{
+    uint8_t b[32]; memset(b, '\n', sizeof b);
+    flat f = {.b = b, .n = sizeof b}; lineidx_src src = mk(&f);
+    lineidx *x = lineidx_create(f.n);
+    REQUIRE(x != NULL);
+    lineidx_result q = lineidx_seek_line(x, &src, 10, 16);
+    CHECK(q.exact && q.value == 10 && !lineidx_complete(x));
+    q = lineidx_seek_line(x, &src, 5, 16);
+    CHECK(q.exact && q.value == 5);
+    lineidx_destroy(x);
+}
+static void test_seek_skips_refreshed_chunk(void)
+{
+    uint8_t b[3u * LINEIDX_CHUNK];
+    memset(b, 'a', sizeof b);
+    memset(b + LINEIDX_CHUNK, '\n', LINEIDX_CHUNK);
+    b[sizeof b - 1u] = '\n';
+    flat f = {.b = b, .n = sizeof b}; lineidx_src src = mk(&f);
+    lineidx *x = lineidx_create(f.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_edit(x, LINEIDX_CHUNK, 0, 0) == 0);
+    REQUIRE(lineidx_refresh(x, &src) == 1);
+    CHECK(lineidx_built_prefix(x) == 0);
+    uint64_t target = LINEIDX_CHUNK + 1ull;
+    lineidx_result q = lineidx_seek_line(x, &src, target, 1);
+    CHECK(!q.exact);
+    for (unsigned i = 0; i < 8 && !q.exact; i++)
+        q = lineidx_seek_line(x, &src, target, LINEIDX_CHUNK);
+    CHECK(q.exact && q.value == sizeof b);
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == target + 1u);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 6: continuation skips independently refreshed chunks\n");
+}
+static void test_seek_indexed_fragmented(void)
+{
+    uint8_t b[LINEIDX_CHUNK]; memset(b, 'a', sizeof b); b[sizeof b - 1u] = '\n';
+    flat f = {.b = b, .n = sizeof b}; lineidx_src src = mk(&f);
+    lineidx *x = lineidx_create(f.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0 && wait_complete(x, 20000));
+    metered s = {.b = b, .n = sizeof b, .span_size = 1};
+    src = (lineidx_src){&s, s.n, metered_span, NULL};
+    lineidx_result q = {0};
+    for (unsigned i = 0; i < 1024 && !q.exact; i++) {
+        s.calls = 0;
+        q = lineidx_seek_line(x, &src, 1, 0);
+        CHECK(s.calls <= 256);
+    }
+    CHECK(q.exact && q.value == sizeof b);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 7: indexed fragmented seek resumes between slices\n");
+}
+static void test_review_worker_seek(void)
+{
+    uint8_t b[LINEIDX_CHUNK]; memset(b, '\n', sizeof b);
+    lease s = {.b = b, .n = 64ull * LINEIDX_CHUNK, .repeat = true};
+    lineidx_src src = {&s, s.n, lease_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    int started = lineidx_seek_start_owned(x, &pool, &src, 17ull * LINEIDX_CHUNK + 123u, 0);
+    CHECK(started == 0);
+    if (started == 0) {
+        REQUIRE(lease_entered(&s));
+        lineidx_result result = {0};
+        CHECK(!lineidx_seek_result(x, &result));
+        atomic_store_explicit(&s.resume, true, memory_order_release);
+        bool ready = false;
+        for (unsigned i = 0; i < 20000; i++) {
+            if (lineidx_seek_result(x, &result)) { ready = true; break; }
+            nanosleep(&(struct timespec){0, 1000000}, NULL);
+        }
+        CHECK(ready && result.exact && result.value == 17ull * LINEIDX_CHUNK + 123u);
+        CHECK(lineidx_built_prefix(x) < lineidx_chunk_count(x));
+        lineidx_build_cancel(x);
+        CHECK(!lineidx_seek_result(x, &result));
+    }
+    lineidx_destroy(x);
+    fprintf(stderr, "review 7: worker seek publishes target before full index\n");
+}
+static void test_review_metadata(void)
+{
+    uint8_t b[LINEIDX_CHUNK]; memset(b, '\n', sizeof b);
+    lease s = {.b = b, .n = 10000000000ull, .repeat = true};
+    lineidx_src src = {&s, s.n, lease_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(lease_entered(&s));
+    uint64_t before = lineidx_foreground_work(x);
+    CHECK(lineidx_edit(x, 0, 0, 1) == 0);
+    (void)lineidx_line_count(x);
+    CHECK(lineidx_foreground_work(x) - before <= 4096);
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    lineidx_destroy(x);
+
+    s = (lease){.b = b, .n = 128ull * LINEIDX_CHUNK, .repeat = true, .resume = true};
+    src = (lineidx_src){&s, s.n, lease_span, NULL};
+    x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0);
+    for (unsigned i = 0; i < 20000; i++) {
+        bool busy = false;
+        for (unsigned k = 0; k < WORK_MAX_JOBS; k++) busy |= atomic_load(&pool.slots[k].busy) != 0;
+        if (!busy) break;
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    }
+    size_t applied = lineidx_poll(x);
+    CHECK(applied <= 64);
+    CHECK(!lineidx_complete(x));
+    CHECK(wait_complete(x, 20000));
+    before = lineidx_foreground_work(x);
+    for (unsigned i = 0; i < 100; i++) CHECK(lineidx_complete(x));
+    CHECK(lineidx_foreground_work(x) - before <= 4096);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 8: 10 GB edit/query and backlog adoption bounded\n");
+}
+static void test_large_metadata_edits(void)
+{
+    synthetic s = {.n = 10000000000ull}; memset(s.b, '\n', sizeof s.b);
+    lineidx_src src = {&s, s.n, synthetic_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(wait_complete(x, 120000));
+    for (unsigned i = 0; i < 64; i++) {
+        uint64_t off = i % 4u == 0 ? 0 : i % 4u == 1 ? s.n / 3u : i % 4u == 2 ? s.n * 2u / 3u : s.n;
+        uint64_t del = off == s.n ? 0 : (i % 5u == 0 ? 7ull * LINEIDX_CHUNK : 3);
+        uint64_t ins = i % 2u ? 17 : 9;
+        uint64_t before = lineidx_foreground_work(x);
+        REQUIRE(lineidx_edit(x, off, del, ins) == 0);
+        CHECK(lineidx_foreground_work(x) - before <= 4096);
+        s.n = s.n - del + ins; src.len = s.n;
+        unsigned refreshed = 0;
+        while (lineidx_refresh(x, &src)) refreshed++;
+        CHECK(refreshed <= 2 && lineidx_complete(x));
+        lineidx_result q = lineidx_line_count(x);
+        CHECK(q.exact && q.value == s.n + 1u);
+        q = lineidx_line_to_byte(x, &src, off / 2u);
+        CHECK(q.exact && q.value == off / 2u);
+        q = lineidx_byte_to_line(x, &src, s.n - 1u);
+        CHECK(q.exact && q.value == s.n - 1u);
+        CHECK(!lineidx_any_nonascii(x));
+        before = lineidx_foreground_work(x);
+        CHECK(lineidx_refresh(x, &src) == 0);
+        CHECK(lineidx_foreground_work(x) == before);
+    }
+    /* A large deletion detaches a whole subtree without sweeping its leaves. */
+    uint64_t before = lineidx_foreground_work(x), del = s.n / 2u;
+    CHECK(lineidx_edit(x, 0, del, 5) == 0);
+    CHECK(lineidx_foreground_work(x) - before <= 4096);
+    s.n = s.n - del + 5u; src.len = s.n;
+    while (lineidx_refresh(x, &src)) { }
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == s.n + 1u);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 8: indexed 10 GB edits at start/middle/EOF + subtree deletion ok\n");
+}
+typedef struct { uint8_t b[LINEIDX_CHUNK]; uint64_t n; size_t span_size;
+    _Atomic unsigned calls; _Atomic bool entered, resume, released;
+    uint64_t cost_ns; _Atomic uint64_t cpu_ns;
+    unsigned pause_at;
+} polling_source;
+static uint64_t test_cpu_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+static size_t polling_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    polling_source *s = ctx;
+    if (off >= s->n) return 0;
+    unsigned call = atomic_fetch_add(&s->calls, 1);
+    if (call == s->pause_at) {
+        atomic_store_explicit(&s->entered, true, memory_order_release);
+        while (!atomic_load_explicit(&s->resume, memory_order_acquire))
+            nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    uint64_t begin = test_cpu_ns();
+    while (test_cpu_ns() - begin < s->cost_ns) { }
+    atomic_fetch_add(&s->cpu_ns, test_cpu_ns() - begin);
+    *p = s->b;
+    uint64_t k = s->n - off;
+    return (size_t)(k > s->span_size ? s->span_size : k);
+}
+static void polling_release(void *ctx) { polling_source *s = ctx; atomic_store(&s->released, true); }
+static bool await_flag(_Atomic bool *flag)
+{
+    for (unsigned i = 0; i < 20000; i++) {
+        if (atomic_load_explicit(flag, memory_order_acquire)) return true;
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    }
+    return false;
+}
+static void test_review_cancel(void)
+{
+    work_pool wp;
+    REQUIRE(work_pool_init(&wp, 1, 0) == 0);
+    polling_source s = {.n = LINEIDX_CHUNK, .span_size = LINEIDX_CHUNK, .resume = true};
+    lineidx_src src = {&s, s.n, polling_span, polling_release};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start_owned(x, &wp, &src, 0) == 0);
+    work_handle h = {0, 2};
+    for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, h); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    REQUIRE(work_handle_finished(&wp, h));
+    lineidx_build_cancel(x);
+    CHECK(atomic_load(&wp.slots[h.slot].epoch) != h.epoch);
+    CHECK(!atomic_load(&s.released));
+    size_t delivered = 0;
+    (void)work_mailbox_drain(&wp, count_message, &delivered);
+    CHECK(delivered == 0 && !lineidx_complete(x));
+    lineidx_destroy(x);
+    CHECK(atomic_load(&s.released));
+    work_pool_shutdown(&wp);
+    fprintf(stderr, "review 9: cancel invalidates before receive/release\n");
+}
+static void test_review_polling(bool enlarged)
+{
+    polling_source s = {.n = enlarged ? 32ull * LINEIDX_CHUNK + 1u : LINEIDX_CHUNK,
+        .span_size = enlarged ? LINEIDX_CHUNK : 4096, .cost_ns = enlarged ? 0 : 2000000};
+    lineidx *x = enlarged ? lineidx_create_reserved(1, 64) : lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    if (enlarged) CHECK(lineidx_edit(x, 0, 0, 32ull * LINEIDX_CHUNK) == 0);
+    lineidx_src src = {&s, s.n, polling_span, NULL};
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(await_flag(&s.entered));
+    lineidx_build_cancel(x);
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(!lineidx_building(x));
+    CHECK(atomic_load(&s.calls) == 1);
+    CHECK(atomic_load(&s.cpu_ns) <= 5000000);
+    CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
+    CHECK(!lineidx_complete(x));
+    lineidx_destroy(x);
+    fprintf(stderr, "review %s: cancelled first span requests no further data\n", enlarged ? "work-scan 9" : "10");
+}
+static void test_review_fragmented(void)
+{
+    polling_source s = {.n = LINEIDX_CHUNK, .span_size = 1, .pause_at = 10000};
+    memset(s.b, '\n', sizeof s.b);
+    lineidx_src src = {&s, s.n, polling_span, NULL};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start(x, &pool, &src) == 0);
+    REQUIRE(await_flag(&s.entered));
+    lineidx_build_cancel(x);
+    atomic_store_explicit(&s.resume, true, memory_order_release);
+    for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    CHECK(!lineidx_building(x));
+    CHECK(atomic_load(&s.calls) == 10001);
+    CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
+    CHECK(!lineidx_complete(x) && lineidx_poll(x) == 0);
+    lineidx_destroy(x);
+    fprintf(stderr, "review 10: one-byte source cancels inside partially counted chunk\n");
+}
+typedef struct { _Atomic bool entered, resume; } bulk_hold;
+static void held_bulk(work_ctx *c)
+{
+    bulk_hold *s = c->arg;
+    atomic_store_explicit(&s->entered, true, memory_order_release);
+    while (!atomic_load_explicit(&s->resume, memory_order_acquire) && !work_should_stop(c)) sched_yield();
+}
+static void test_review_queued_destroy(void)
+{
+    work_pool wp;
+    REQUIRE(work_pool_init(&wp, 1, 0) == 0);
+    bulk_hold hold = {0};
+    work_handle h = work_submit(&wp, (work_job){held_bulk, &hold, 44, WORK_BULK});
+    REQUIRE(h.epoch != 0 && await_flag(&hold.entered));
+    polling_source s = {.n = LINEIDX_CHUNK, .span_size = LINEIDX_CHUNK};
+    lineidx_src src = {&s, s.n, polling_span, polling_release};
+    lineidx *x = lineidx_create(s.n);
+    REQUIRE(x != NULL);
+    REQUIRE(lineidx_build_start_owned(x, &wp, &src, 0) == 0);
+    lineidx_destroy(x); /* must return while unrelated job is still held */
+    CHECK(!atomic_load(&hold.resume) && !work_handle_finished(&wp, h));
+    CHECK(atomic_load(&s.released) && atomic_load(&s.calls) == 0);
+    atomic_store_explicit(&hold.resume, true, memory_order_release);
+    work_pool_shutdown(&wp);
+    fprintf(stderr, "review 11: queued destroy returns before unrelated bulk job\n");
+}
 int main(int argc, char **argv)
 {
     trace_init();
@@ -755,6 +1115,13 @@ int main(int argc, char **argv)
         else if (strcmp(argv[1], "--review=3") == 0) test_review_epoch();
         else if (strcmp(argv[1], "--review=4") == 0) test_edit_during_build();
         else if (strcmp(argv[1], "--review=5") == 0) test_review_boundaries();
+        else if (strcmp(argv[1], "--review=6") == 0) { test_review_seek_budget(); test_seek_changed_target(); test_seek_skips_refreshed_chunk(); }
+        else if (strcmp(argv[1], "--review=7") == 0) { test_review_ui_seek(); test_review_worker_seek(); test_seek_indexed_fragmented(); }
+        else if (strcmp(argv[1], "--review=8") == 0) { test_review_metadata(); test_large_metadata_edits(); }
+        else if (strcmp(argv[1], "--review=9") == 0) test_review_cancel();
+        else if (strcmp(argv[1], "--review=10") == 0) { test_review_polling(false); test_review_fragmented(); }
+        else if (strcmp(argv[1], "--review=11") == 0) test_review_queued_destroy();
+        else if (strcmp(argv[1], "--review=work9") == 0) test_review_polling(true);
         else if (strcmp(argv[1], "--review=12") == 0) { test_review_memory(); test_review_owned_source(); }
         else if (strcmp(argv[1], "--review=13") == 0) {
             test_review_mailbox(); test_mailbox_pressure(); test_completed_slot_reuse();
@@ -764,6 +1131,19 @@ int main(int argc, char **argv)
         goto finish;
     }
     fprintf(stderr, "-- review_capacity\n"); test_review_capacity();
+    fprintf(stderr, "-- review_seek_budget\n"); test_review_seek_budget();
+    fprintf(stderr, "-- seek_changed_target\n"); test_seek_changed_target();
+    fprintf(stderr, "-- seek_skips_refreshed_chunk\n"); test_seek_skips_refreshed_chunk();
+    fprintf(stderr, "-- review_ui_seek\n"); test_review_ui_seek();
+    fprintf(stderr, "-- review_worker_seek\n"); test_review_worker_seek();
+    fprintf(stderr, "-- seek_indexed_fragmented\n"); test_seek_indexed_fragmented();
+    fprintf(stderr, "-- review_metadata\n"); test_review_metadata();
+    fprintf(stderr, "-- large_metadata_edits\n"); test_large_metadata_edits();
+    fprintf(stderr, "-- review_cancel\n"); test_review_cancel();
+    fprintf(stderr, "-- review_polling\n"); test_review_polling(false);
+    fprintf(stderr, "-- review_fragmented\n"); test_review_fragmented();
+    fprintf(stderr, "-- review_enlarged_polling\n"); test_review_polling(true);
+    fprintf(stderr, "-- review_queued_destroy\n"); test_review_queued_destroy();
     fprintf(stderr, "-- review_overflow\n"); test_review_overflow();
     fprintf(stderr, "-- review_epoch\n"); test_review_epoch();
     fprintf(stderr, "-- review_boundaries\n"); test_review_boundaries();

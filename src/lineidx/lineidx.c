@@ -1,262 +1,564 @@
-/* lineidx.c -- sparse line index (P1.6). Design: docs/decisions/P1.6.md. */
+/* Sparse line index. See docs/decisions/P1.6{b,c}.md. */
 #include "lineidx/lineidx.h"
 #include "scan/scan.h"
-
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define FL_BUILT    1u
+#define FL_BUILT 1u
 #define FL_NONASCII 2u
-#define FL_EDITED   4u
-#define SB_SHIFT    6u                    /* one summary per 64 chunks (4 MiB) */
-#define SB_N        (1u << SB_SHIFT)
-#define RES_DONE    (1ull << 63)
-#define RES_NA      (1ull << 32)
-#define DEFAULT_BPL 40u                   /* bytes per line before any evidence */
+#define FL_EDITED 4u
+#define RES_DONE (1ull << 63)
+#define RES_NA (1ull << 32)
+#define BLOCK_MAX 512u
+#define POLL_CHUNKS 64u
+#define PUBLISH_CHUNKS 16u
+#define SPAN_MAX 256u
+#define SCAN_BLOCK 16384u
+#define UI_CPU_NS 500000ull
+#define MSG_SEEK (LINEIDX_MSG_PROGRESS + 1u)
+#define DEFAULT_BPL 40u
 
-typedef struct entry { uint64_t start; uint32_t nl; uint32_t fl; } entry;
+/* Relative lengths avoid an absolute-offset update of the suffix. Leaves are
+ * linked within bounded blocks; the block treap holds incremental summaries.
+ * IDs are private fixed-pool indices, with zero reserved as null. */
+typedef struct entry { uint32_t next, len, nl, fl; } entry;
 _Static_assert(sizeof(entry) == 16, "16 B per chunk");
+typedef struct block {
+    uint64_t own_bytes, own_lines, bytes, lines;
+    uint32_t left, right, parent, head, tail, count, total, priority;
+    uint32_t edited, nonascii, unbuilt;
+    uint16_t own_edited, own_nonascii, own_unbuilt;
+} block;
 
 typedef struct lineidx_job {
-    struct lineidx_job *next;             /* retired list */
+    struct lineidx_job *next;
     lineidx_src src;
     size_t source_bytes;
     work_pool *pool;
     work_handle h;
-    size_t n;
-    size_t applied;                       /* UI thread */
-    uint64_t *starts;                     /* n + 1 */
-    uint64_t *res;                        /* immutable once its range is mailed */
-    uint32_t generation;
-    size_t received;                     /* UI: newly adopted since last poll */
+    size_t n, applied, available;
+    uint64_t *starts, *res;
+    uint32_t generation, apply_block, apply_entry;
+    bool seeking;
+    uint64_t target;
+    uint64_t cpu_begin, cancel_cpu_ns; /* worker; read only after work completion */
 } lineidx_job;
-
 struct lineidx {
     entry *e;
-    size_t n, cap;
+    block *b;
+    size_t n, cap, block_cap;
+    uint32_t root, garbage, free_entry, free_block, free_blocks, sequence;
+    size_t free_entries;
     uint64_t len;
-    size_t n_edited;
-    bool dirty;                           /* derived state stale */
-    size_t pfx_n;                         /* leading built chunks */
-    uint64_t pfx_lines;                   /* newlines in them */
-    uint64_t *sb;                         /* sb[k] = newlines in chunks [0, 64k), k*64 <= pfx_n */
-    size_t sb_cap;
+    bool dirty;
+    size_t pfx_n;
+    uint64_t pfx_lines, pfx_bytes;
     lineidx_job *job, *retired;
     uint32_t gen;
+    uint64_t seek_pos, seek_nl, seek_na, seek_last, seek_line, seek_value;
+    bool seek_cached, async_ready;
+    uint64_t query_start, query_end, query_pos, query_nl, query_line, query_last;
+    bool query_active;
+    uint64_t async_value;
+    uint32_t refresh_id;
+    uint64_t refresh_pos, refresh_nl, refresh_na;
+    uint64_t foreground_work, scanned_bytes;
+    uint64_t last_cancel_cpu_ns;
 };
 
 size_t lineidx_entry_bytes(void) { return sizeof(entry); }
+uint64_t lineidx_foreground_work(const lineidx *x) { return x->foreground_work; }
+uint64_t lineidx_scanned_bytes(const lineidx *x) { return x->scanned_bytes; }
+static uint64_t now_ns(clockid_t clock)
+{
+    struct timespec ts;
+    if (clock_gettime(clock, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* ---- summarized fixed-pool chunk rope (UI only) ---- */
+static void pull(lineidx *x, uint32_t id)
+{
+    block *v = &x->b[id], *l = &x->b[v->left], *r = &x->b[v->right];
+    x->foreground_work++;
+    v->bytes = l->bytes + v->own_bytes + r->bytes;
+    v->lines = l->lines + v->own_lines + r->lines;
+    v->total = l->total + v->count + r->total;
+    v->edited = l->edited + v->own_edited + r->edited;
+    v->nonascii = l->nonascii + v->own_nonascii + r->nonascii;
+    v->unbuilt = l->unbuilt + v->own_unbuilt + r->unbuilt;
+    if (v->left) l->parent = id;
+    if (v->right) r->parent = id;
+}
+static void recount(lineidx *x, uint32_t id)
+{
+    block *v = &x->b[id];
+    v->own_bytes = v->own_lines = 0;
+    v->own_edited = v->own_nonascii = v->own_unbuilt = 0;
+    for (uint32_t i = v->head; i; i = x->e[i].next) {
+        const entry *e = &x->e[i];
+        x->foreground_work++;
+        v->own_bytes += e->len; v->own_lines += e->nl;
+        if (e->fl & FL_EDITED) v->own_edited++;
+        if (e->fl & FL_NONASCII) v->own_nonascii++;
+        if (!(e->fl & FL_BUILT)) v->own_unbuilt++;
+    }
+    pull(x, id);
+}
+static void update_up(lineidx *x, uint32_t id)
+{
+    while (id) { pull(x, id); id = x->b[id].parent; }
+    x->dirty = true;
+}
+static uint32_t merge(lineidx *x, uint32_t a, uint32_t b)
+{
+    if (!a || !b) {
+        uint32_t id = a ? a : b;
+        if (id) x->b[id].parent = 0;
+        return id;
+    }
+    uint32_t root;
+    if (x->b[a].priority < x->b[b].priority) {
+        x->b[a].right = merge(x, x->b[a].right, b);
+        pull(x, a); root = a;
+    } else {
+        x->b[b].left = merge(x, a, x->b[b].left);
+        pull(x, b); root = b;
+    }
+    x->b[root].parent = 0;
+    return root;
+}
+static void release_block(lineidx *x, uint32_t id)
+{
+    memset(&x->b[id], 0, sizeof x->b[id]);
+    x->b[id].left = x->free_block;
+    x->free_block = id; x->free_blocks++;
+}
+/* Retire a detached block in O(tree height), linking all of its entries into
+ * the free pool in O(1). No sweep of a deleted range is needed. */
+static bool reclaim_one(lineidx *x)
+{
+    uint32_t id = x->garbage;
+    if (!id) return false;
+    block *v = &x->b[id];
+    x->garbage = merge(x, v->left, v->right);
+    x->e[v->tail].next = x->free_entry;
+    x->free_entry = v->head; x->free_entries += v->count;
+    release_block(x, id);
+    return true;
+}
+static uint32_t take_block(lineidx *x)
+{
+    if (!x->free_block && !reclaim_one(x)) return 0;
+    uint32_t id = x->free_block;
+    x->free_block = x->b[id].left; x->free_blocks--;
+    memset(&x->b[id], 0, sizeof x->b[id]);
+    uint32_t z = (x->sequence += 0x9e3779b9u);
+    z = (z ^ (z >> 16)) * 0x85ebca6bu;
+    z = (z ^ (z >> 13)) * 0xc2b2ae35u;
+    x->b[id].priority = z ^ (z >> 16);
+    return id;
+}
+static uint32_t take_entry(lineidx *x)
+{
+    if (!x->free_entry && !reclaim_one(x)) return 0;
+    uint32_t id = x->free_entry;
+    x->free_entry = x->e[id].next; x->free_entries--;
+    memset(&x->e[id], 0, sizeof x->e[id]);
+    return id;
+}
+static void split(lineidx *x, uint32_t root, uint32_t n, uint32_t *a, uint32_t *b)
+{
+    if (!root) { *a = *b = 0; return; }
+    block *v = &x->b[root];
+    uint32_t left = x->b[v->left].total;
+    if (n < left) {
+        split(x, v->left, n, a, &v->left);
+        pull(x, root); *b = root;
+    } else if (n > left + v->count) {
+        split(x, v->right, n - left - v->count, &v->right, b);
+        pull(x, root); *a = root;
+    } else if (n == left) {
+        *a = v->left; v->left = 0; pull(x, root); *b = root;
+    } else if (n == left + v->count) {
+        *b = v->right; v->right = 0; pull(x, root); *a = root;
+    } else {
+        uint32_t other = take_block(x), k = n - left;
+        block *w = &x->b[other];
+        uint32_t tail = v->head;
+        for (uint32_t i = 1; i < k; i++) { x->foreground_work++; tail = x->e[tail].next; }
+        uint32_t old_left = v->left, old_right = v->right;
+        w->head = x->e[tail].next; w->tail = v->tail; w->count = v->count - k;
+        x->e[tail].next = 0;
+        v->tail = tail; v->count = k; v->left = v->right = 0;
+        recount(x, root); recount(x, other);
+        *a = merge(x, old_left, root); *b = merge(x, other, old_right);
+    }
+    if (*a) x->b[*a].parent = 0;
+    if (*b) x->b[*b].parent = 0;
+}
+static uint32_t edge_block(const lineidx *x, uint32_t root, bool last)
+{
+    while (root && (last ? x->b[root].right : x->b[root].left))
+        root = last ? x->b[root].right : x->b[root].left;
+    return root;
+}
+/* Adjacent blocks coalesce after each edit. Thus live block capacity scales
+ * with chunks / (BLOCK_MAX/2), rather than the number of edits. */
+static uint32_t concat(lineidx *x, uint32_t a, uint32_t b)
+{
+    if (!a || !b) return merge(x, a, b);
+    uint32_t last = edge_block(x, a, true), first = edge_block(x, b, false);
+    if (x->b[last].count + x->b[first].count > BLOCK_MAX) return merge(x, a, b);
+    uint32_t left, right, one, two;
+    split(x, a, x->b[a].total - x->b[last].count, &left, &one);
+    split(x, b, x->b[first].count, &two, &right);
+    x->e[x->b[one].tail].next = x->b[two].head;
+    x->b[one].tail = x->b[two].tail;
+    x->b[one].count += x->b[two].count;
+    recount(x, one); release_block(x, two);
+    return merge(x, merge(x, left, one), right);
+}
+typedef struct location { uint32_t block, id, ordinal; uint64_t byte, lines; } location;
+static location locate(lineidx *x, uint32_t ordinal)
+{
+    location at = {0};
+    uint32_t root = x->root, k = ordinal;
+    while (root) {
+        block *v = &x->b[root], *l = &x->b[v->left];
+        x->foreground_work++;
+        if (k < l->total) { root = v->left; continue; }
+        at.byte += l->bytes; at.lines += l->lines; at.ordinal += l->total;
+        k -= l->total;
+        if (k < v->count) {
+            at.block = root; at.id = v->head;
+            while (k--) {
+                x->foreground_work++;
+                at.byte += x->e[at.id].len; at.lines += x->e[at.id].nl;
+                at.id = x->e[at.id].next; at.ordinal++;
+            }
+            return at;
+        }
+        k -= v->count; at.byte += v->own_bytes; at.lines += v->own_lines;
+        at.ordinal += v->count; root = v->right;
+    }
+    return at;
+}
+static location locate_byte(lineidx *x, uint64_t off)
+{
+    if (off == x->len) return locate(x, (uint32_t)x->n - 1u);
+    location at = {0};
+    uint32_t root = x->root;
+    while (root) {
+        block *v = &x->b[root], *l = &x->b[v->left];
+        x->foreground_work++;
+        if (off < at.byte + l->bytes) { root = v->left; continue; }
+        at.byte += l->bytes; at.lines += l->lines; at.ordinal += l->total;
+        if (off < at.byte + v->own_bytes) {
+            at.block = root; at.id = v->head;
+            while (off >= at.byte + x->e[at.id].len) {
+                x->foreground_work++;
+                at.byte += x->e[at.id].len; at.lines += x->e[at.id].nl;
+                at.id = x->e[at.id].next; at.ordinal++;
+            }
+            return at;
+        }
+        at.byte += v->own_bytes; at.lines += v->own_lines; at.ordinal += v->count;
+        root = v->right;
+    }
+    return at;
+}
+static uint32_t first_flag(lineidx *x, bool edited)
+{
+    uint32_t root = x->root, ordinal = 0;
+    while (root) {
+        block *v = &x->b[root], *l = &x->b[v->left];
+        x->foreground_work++;
+        if (edited ? l->edited : l->unbuilt) { root = v->left; continue; }
+        ordinal += l->total;
+        if (edited ? v->own_edited : v->own_unbuilt) {
+            for (uint32_t id = v->head; id; id = x->e[id].next, ordinal++) {
+                x->foreground_work++;
+                if (edited ? (x->e[id].fl & FL_EDITED) != 0 : !(x->e[id].fl & FL_BUILT)) return ordinal;
+            }
+        }
+        ordinal += v->count; root = v->right;
+    }
+    return (uint32_t)x->n;
+}
+static void derive(lineidx *x)
+{
+    if (!x->dirty) return;
+    if (!x->b[x->root].unbuilt) {
+        x->pfx_n = x->n; x->pfx_bytes = x->len; x->pfx_lines = x->b[x->root].lines;
+    } else {
+        location at = locate(x, first_flag(x, false));
+        x->pfx_n = at.ordinal; x->pfx_bytes = at.byte; x->pfx_lines = at.lines;
+    }
+    x->dirty = false;
+}
+static void set_built(lineidx *x, location at, uint32_t nl, bool na)
+{
+    entry *e = &x->e[at.id]; block *v = &x->b[at.block];
+    v->own_lines = v->own_lines - e->nl + nl;
+    if (e->fl & FL_EDITED) v->own_edited--;
+    if (e->fl & FL_NONASCII) v->own_nonascii--;
+    if (!(e->fl & FL_BUILT)) v->own_unbuilt--;
+    if (na) v->own_nonascii++;
+    e->nl = nl; e->fl = FL_BUILT | (na ? FL_NONASCII : 0);
+    update_up(x, at.block);
+}
+static uint32_t successor(const lineidx *x, uint32_t id)
+{
+    if (x->b[id].right) return edge_block(x, x->b[id].right, false);
+    uint32_t parent = x->b[id].parent;
+    while (parent && x->b[parent].right == id) { id = parent; parent = x->b[id].parent; }
+    return parent;
+}
 
 /* ---- content helpers ---- */
-
 static void scan_range(const lineidx_src *s, uint64_t start, uint64_t len, uint64_t *nl, uint64_t *na)
 {
     uint64_t pos = start, end = start + len, a = 0, b = 0;
     while (pos < end) {
         const uint8_t *p;
         size_t k = s->span(s->ctx, pos, &p);
-        if (k == 0) break;
+        if (!k) break;
         if (k > end - pos) k = (size_t)(end - pos);
-        scan_counts c = scan_count(p, k);
-        a += c.newlines; b += c.nonascii;
-        pos += k;
+        scan_counts c = scan_count(p, k); a += c.newlines; b += c.nonascii; pos += k;
     }
     *nl = a; *na = b;
 }
-
-/* Absolute offset of the k-th (0-based) newline in [start, start+len), or UINT64_MAX. */
 static uint64_t nth_newline(const lineidx_src *s, uint64_t start, uint64_t len, uint64_t k)
 {
     uint64_t pos = start, end = start + len;
     while (pos < end) {
         const uint8_t *p;
         size_t m = s->span(s->ctx, pos, &p);
-        if (m == 0) break;
+        if (!m) break;
         if (m > end - pos) m = (size_t)(end - pos);
-        uint64_t c = scan_count(p, m).newlines;
-        if (k < c) {
+        uint64_t count = scan_count(p, m).newlines;
+        if (k < count) {
             const uint8_t *q = scan_find_nth_newline(p, m, k);
             return q ? pos + (uint64_t)(q - p) : UINT64_MAX;
         }
-        k -= c;
-        pos += m;
+        k -= count; pos += m;
     }
     return UINT64_MAX;
 }
-
-/* Real line start after the last '\n' in [lo, hi), or UINT64_MAX. */
 static uint64_t align_back(const lineidx_src *s, uint64_t lo, uint64_t hi)
 {
-    uint64_t pos = lo, last = UINT64_MAX;
+    uint64_t pos = lo, last = 0;
     while (pos < hi) {
         const uint8_t *p;
         size_t m = s->span(s->ctx, pos, &p);
-        if (m == 0) break;
+        if (!m) break;
         if (m > hi - pos) m = (size_t)(hi - pos);
         const uint8_t *q = memrchr(p, '\n', m);
-        if (q) last = pos + (uint64_t)(q - p);
+        if (q) last = pos + (uint64_t)(q - p) + 1u;
         pos += m;
     }
-    return last == UINT64_MAX ? UINT64_MAX : last + 1;
+    return last;
 }
-
-static uint64_t chunk_len(const lineidx *x, size_t i)
+static location locate_line(lineidx *x, uint64_t line)
 {
-    return (i + 1 < x->n ? x->e[i + 1].start : x->len) - x->e[i].start;
-}
-
-/* ---- derived state ---- */
-
-static void derive(lineidx *x)
-{
-    if (!x->dirty) return;
-    size_t i = 0;
-    uint64_t cum = 0;
-    while (i < x->n && (x->e[i].fl & FL_BUILT)) {
-        if ((i & (SB_N - 1)) == 0) x->sb[i >> SB_SHIFT] = cum;
-        cum += x->e[i].nl;
-        i++;
+    location at = {0}; uint32_t root = x->root;
+    while (root) {
+        block *v = &x->b[root], *l = &x->b[v->left];
+        x->foreground_work++;
+        if (line <= at.lines + l->lines) { root = v->left; continue; }
+        at.byte += l->bytes; at.lines += l->lines; at.ordinal += l->total;
+        if (line <= at.lines + v->own_lines) {
+            at.block = root; at.id = v->head;
+            while (at.lines + x->e[at.id].nl < line) {
+                x->foreground_work++;
+                at.byte += x->e[at.id].len; at.lines += x->e[at.id].nl;
+                at.id = x->e[at.id].next; at.ordinal++;
+            }
+            return at;
+        }
+        at.byte += v->own_bytes; at.lines += v->own_lines; at.ordinal += v->count;
+        root = v->right;
     }
-    x->pfx_n = i;
-    x->pfx_lines = cum;
-    x->dirty = false;
+    return at;
 }
 
-static uint64_t pfx_bytes(const lineidx *x) { return x->pfx_n < x->n ? x->e[x->pfx_n].start : x->len; }
-
-/* newlines in chunks [0, c), c <= pfx_n */
-static uint64_t cum_lines(const lineidx *x, size_t c)
-{
-    size_t k = c >> SB_SHIFT;
-    uint64_t s = x->sb[k];
-    for (size_t i = k << SB_SHIFT; i < c; i++) s += x->e[i].nl;
-    return s;
-}
-
-/* ---- jobs ---- */
-
-static bool job_done(const lineidx_job *j)
-{
-    return work_handle_finished(j->pool, j->h);
-}
-
+/* ---- sealed worker ranges; UI callbacks only stage availability ---- */
+static bool job_done(const lineidx_job *j) { return work_handle_finished(j->pool, j->h); }
 static void job_free(lineidx_job *j)
 {
     (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     if (j->src.release) j->src.release(j->src.ctx);
-    free(j->starts);
-    free(j->res);
-    free(j);
+    free(j->starts); free(j->res); free(j);
 }
-
 static void reap(lineidx *x)
 {
-    lineidx_job **pp = &x->retired;
-    while (*pp) {
-        lineidx_job *j = *pp;
-        if (job_done(j)) { *pp = j->next; job_free(j); }
-        else pp = &j->next;
+    if (x->retired && job_done(x->retired)) {
+        lineidx_job *j = x->retired;
+        x->last_cancel_cpu_ns = j->cancel_cpu_ns;
+        x->retired = j->next; job_free(j);
     }
 }
-
 static void retire_job(lineidx *x)
 {
     lineidx_job *j = x->job;
     if (!j) return;
     (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
-    x->job = NULL;
-    j->next = x->retired;
-    x->retired = j;
+    x->job = NULL; j->next = x->retired; x->retired = j;
 }
-
 typedef struct result_range { uint64_t first, end; } result_range;
-_Static_assert(sizeof(result_range) <= WORK_MSG_DATA, "line index range fits mailbox");
-
-static bool publish_range(work_ctx *c, size_t first, size_t end)
+static bool worker_stop(work_ctx *c)
 {
-    work_msg msg = {.kind = LINEIDX_MSG_PROGRESS, .generation = c->generation};
-    result_range range = {first, end};
-    memcpy(msg.data, &range, sizeof range);
-    while (!work_should_stop(c)) {
+    if (!work_should_stop(c)) return false;
+    lineidx_job *j = c->arg;
+    if (!j->cancel_cpu_ns && j->cpu_begin)
+        j->cancel_cpu_ns = now_ns(CLOCK_THREAD_CPUTIME_ID) - j->cpu_begin;
+    return true;
+}
+static bool publish(work_ctx *c, uint32_t kind, const void *data, size_t size)
+{
+    work_msg msg = {.kind = kind, .generation = c->generation};
+    memcpy(msg.data, data, size);
+    lineidx_job *j = c->arg;
+    while (!worker_stop(c)) {
+        j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
         if (work_publish(c, &msg)) return true;
         nanosleep(&(struct timespec){0, 50000}, NULL);
     }
     return false;
 }
-
-/* Only a validated mailbox callback may read sealed worker result ranges.
- * No independent atomic prefix/result channel exists. The worker never writes
- * a mailed entry again; work retains callback ownership until it returns. */
-static void apply_results(const work_msg *msg, void *ud)
+static bool publish_range(work_ctx *c, size_t first, size_t end)
 {
-    lineidx *x = ud;
-    lineidx_job *j = x->job;
-    if (!j || msg->kind != LINEIDX_MSG_PROGRESS || msg->generation != j->generation ||
-        msg->slot_ != j->h.slot || msg->epoch_ != j->h.epoch) return;
-    result_range range;
-    memcpy(&range, msg->data, sizeof range);
-    if (range.first != j->applied || range.end < range.first || range.end > j->n) return;
-    for (size_t i = (size_t)range.first; i < (size_t)range.end; i++) {
-        entry *e = &x->e[i];
-        if (e->fl & FL_BUILT) continue;
-        uint64_t r = j->res[i];
-        e->nl = (uint32_t)(r & UINT32_MAX);
-        e->fl = FL_BUILT | ((r & RES_NA) ? FL_NONASCII : 0);
-        j->received++;
-        x->dirty = true;
-    }
-    j->applied = (size_t)range.end;
+    if (first == end) return !worker_stop(c);
+    result_range range = {first, end};
+    return publish(c, LINEIDX_MSG_PROGRESS, &range, sizeof range);
 }
-
+static void receive_results(const work_msg *msg, void *ud)
+{
+    lineidx *x = ud; lineidx_job *j = x->job;
+    if (!j || msg->generation != j->generation || j->generation != x->gen ||
+        msg->slot_ != j->h.slot || msg->epoch_ != j->h.epoch) return;
+    if (msg->kind == LINEIDX_MSG_PROGRESS) {
+        result_range range; memcpy(&range, msg->data, sizeof range);
+        if (range.first != j->available || range.end < range.first || range.end > j->n) return;
+        j->available = (size_t)range.end;
+    } else if (msg->kind == MSG_SEEK && j->seeking) {
+        uint64_t value; memcpy(&value, msg->data, sizeof value);
+        if (value <= x->len) { x->async_value = value; x->async_ready = true; }
+    }
+}
+/* Poll on both sides of each indivisible source callback. Large offered spans
+ * are scanned in SCAN_BLOCK byte blocks, independent of entry geometry. */
+static bool scan_worker(work_ctx *c, lineidx_job *j, size_t i, uint64_t cum,
+                         uint64_t *nl, uint64_t *na, bool *found, uint64_t *answer)
+{
+    uint64_t pos = j->starts[i], end = j->starts[i + 1u], a = 0, b = 0;
+    *found = false;
+    while (pos < end) {
+        if (worker_stop(c)) return false;
+        const uint8_t *p;
+        j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+        size_t k = j->src.span(j->src.ctx, pos, &p);
+        if (worker_stop(c) || !k) return false;
+        if (k > end - pos) k = (size_t)(end - pos);
+        while (k) {
+            size_t batch = k > SCAN_BLOCK ? SCAN_BLOCK : k;
+            scan_counts counts = scan_count(p, batch);
+            if (j->seeking && cum + a < j->target && counts.newlines >= j->target - cum - a) {
+                const uint8_t *q = scan_find_nth_newline(p, batch, j->target - cum - a - 1u);
+                *answer = pos + (uint64_t)(q - p) + 1u; *found = true;
+            }
+            a += counts.newlines; b += counts.nonascii; pos += batch;
+            if (worker_stop(c)) return false;
+            if (*found) break;
+            p += batch; k -= batch;
+        }
+        if (*found) break;
+    }
+    *nl = a; *na = b;
+    return pos == end || *found;
+}
 static void build_fn(work_ctx *c)
 {
     lineidx_job *j = c->arg;
     size_t sealed = 0;
+    uint64_t cum = 0;
+    j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    if (j->seeking && j->target == 0) {
+        uint64_t zero = 0; (void)publish(c, MSG_SEEK, &zero, sizeof zero); return;
+    }
     for (size_t i = 0; i < j->n; i++) {
-        if ((i & 15u) == 0 && work_should_stop(c)) return;
-        if (!(j->res[i] & RES_DONE)) {
+        if (worker_stop(c)) return;
+        if ((i & 15u) == 0) j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+        uint64_t r = j->res[i], count = r & UINT32_MAX;
+        bool scan = !(r & RES_DONE) || (j->seeking && j->target <= cum + count);
+        bool found = false; uint64_t answer = 0;
+        if (scan) {
             uint64_t nl, na;
-            scan_range(&j->src, j->starts[i], j->starts[i + 1] - j->starts[i], &nl, &na);
+            if (!scan_worker(c, j, i, cum, &nl, &na, &found, &answer)) return;
+            count = nl;
+            if (found) {
+                /* Only earlier, fully counted chunks are made available. The
+                 * exact target offset itself travels in its own message. */
+                if (!publish_range(c, sealed, i)) return;
+                (void)publish(c, MSG_SEEK, &answer, sizeof answer); return;
+            }
             j->res[i] = RES_DONE | (na ? RES_NA : 0) | nl;
         }
-        if (((i + 1u) & 15u) == 0 || i + 1u == j->n) {
+        cum += count;
+        if (((i + 1u) & (PUBLISH_CHUNKS - 1u)) == 0 || i + 1u == j->n) {
             if (!publish_range(c, sealed, i + 1u)) return;
             sealed = i + 1u;
         }
     }
+    if (j->seeking) { uint64_t end = j->src.len; (void)publish(c, MSG_SEEK, &end, sizeof end); }
 }
 
 /* ---- lifecycle ---- */
-
 lineidx *lineidx_create_reserved(uint64_t len, size_t extra_chunks)
 {
     if (len > LINEIDX_MAX_LEN) return NULL;
     uint64_t chunks = len / LINEIDX_CHUNK + (len % LINEIDX_CHUNK != 0);
-    if (chunks == 0) chunks = 1;
-    if (chunks > SIZE_MAX - extra_chunks || chunks + extra_chunks > SIZE_MAX / sizeof(entry)) return NULL;
-    size_t n = (size_t)chunks;
+    if (!chunks) chunks = 1;
+    if (chunks > SIZE_MAX - extra_chunks || chunks + extra_chunks >= UINT32_MAX) return NULL;
+    size_t cap = (size_t)chunks + extra_chunks;
     lineidx *x = calloc(1, sizeof *x);
     if (!x) return NULL;
-    x->cap = n + extra_chunks;
-    x->e = malloc(x->cap * sizeof(entry));
-    x->sb_cap = (x->cap >> SB_SHIFT) + 2;
-    x->sb = malloc(x->sb_cap * sizeof(uint64_t));
-    if (!x->e || !x->sb) { free(x->e); free(x->sb); free(x); return NULL; }
-    x->n = n;
-    x->len = len;
-    for (size_t i = 0; i < n; i++) {
-        x->e[i].start = (uint64_t)i * LINEIDX_CHUNK;
-        x->e[i].nl = 0;
-        x->e[i].fl = len == 0 ? FL_BUILT : 0;
+    x->cap = cap; x->block_cap = cap / (BLOCK_MAX / 2u) + 5u;
+    x->e = calloc(cap + 1u, sizeof *x->e);
+    x->b = calloc(x->block_cap + 1u, sizeof *x->b);
+    if (!x->e || !x->b) { free(x->e); free(x->b); free(x); return NULL; }
+    for (size_t i = 1; i <= cap; i++) x->e[i].next = i < cap ? (uint32_t)i + 1u : 0;
+    x->free_entry = 1; x->free_entries = cap;
+    for (size_t i = 1; i <= x->block_cap; i++) x->b[i].left = i < x->block_cap ? (uint32_t)i + 1u : 0;
+    x->free_block = 1; x->free_blocks = (uint32_t)x->block_cap;
+    x->n = (size_t)chunks; x->len = len;
+    uint64_t remaining = len;
+    for (size_t i = 0; i < x->n;) {
+        uint32_t id = take_block(x); block *v = &x->b[id];
+        for (uint32_t k = 0; k < BLOCK_MAX && i < x->n; k++, i++) {
+            uint32_t e = take_entry(x);
+            uint32_t bytes = (uint32_t)(remaining > LINEIDX_CHUNK ? LINEIDX_CHUNK : remaining);
+            x->e[e].len = bytes; x->e[e].fl = len == 0 ? FL_BUILT : 0;
+            remaining -= bytes;
+            if (v->tail) x->e[v->tail].next = e; else v->head = e;
+            v->tail = e; v->count++;
+        }
+        recount(x, id); x->root = merge(x, x->root, id);
     }
-    x->dirty = true;
-    derive(x);
-    return x;
+    x->dirty = true; derive(x); return x;
 }
-
 lineidx *lineidx_create(uint64_t len) { return lineidx_create_reserved(len, 64); }
-
+void lineidx_build_cancel(lineidx *x)
+{
+    if (!x) return;
+    if (x->job) {
+        lineidx_job *j = x->job;
+        work_cancel(j->pool, j->h); x->gen++; retire_job(x);
+    }
+    x->async_ready = false;
+}
 void lineidx_destroy(lineidx *x)
 {
     if (!x) return;
@@ -265,311 +567,329 @@ void lineidx_destroy(lineidx *x)
         reap(x);
         if (x->retired) nanosleep(&(struct timespec){0, 100000}, NULL);
     }
-    free(x->e);
-    free(x->sb);
-    free(x);
+    free(x->e); free(x->b); free(x);
 }
-
 uint64_t lineidx_len(const lineidx *x) { return x->len; }
+uint64_t lineidx_cancel_cpu_ns(const lineidx *x)
+{
+    const lineidx_job *j = x->retired ? x->retired : x->job;
+    return j && job_done(j) ? j->cancel_cpu_ns : x->last_cancel_cpu_ns;
+}
 size_t lineidx_chunk_count(const lineidx *x) { return x->n; }
 size_t lineidx_built_prefix(lineidx *x) { derive(x); return x->pfx_n; }
-bool lineidx_complete(lineidx *x) { derive(x); return x->pfx_n == x->n; }
-bool lineidx_chunk_nonascii(const lineidx *x, size_t i) { return i < x->n && (x->e[i].fl & FL_NONASCII); }
-bool lineidx_any_nonascii(const lineidx *x)
+bool lineidx_complete(lineidx *x) { return x->b[x->root].unbuilt == 0; }
+bool lineidx_any_nonascii(const lineidx *x) { return x->b[x->root].nonascii != 0; }
+bool lineidx_chunk_nonascii(const lineidx *x, size_t ordinal)
 {
-    for (size_t i = 0; i < x->n; i++) if (x->e[i].fl & FL_NONASCII) return true;
+    if (ordinal >= x->n) return false;
+    uint32_t root = x->root, k = (uint32_t)ordinal;
+    while (root) {
+        const block *v = &x->b[root]; uint32_t left = x->b[v->left].total;
+        if (k < left) { root = v->left; continue; }
+        k -= left;
+        if (k < v->count) {
+            uint32_t id = v->head;
+            while (k--) id = x->e[id].next;
+            return (x->e[id].fl & FL_NONASCII) != 0;
+        }
+        k -= v->count; root = v->right;
+    }
     return false;
 }
 size_t lineidx_mem_bytes(const lineidx *x)
 {
-    size_t bytes = x->cap * sizeof(entry);
-    if (sizeof *x > SIZE_MAX - bytes) return SIZE_MAX;
-    bytes += sizeof *x;
-    size_t summaries = x->sb_cap * sizeof(uint64_t);
-    if (summaries > SIZE_MAX - bytes) return SIZE_MAX;
-    bytes += summaries;
+    size_t bytes = sizeof *x + (x->cap + 1u) * sizeof *x->e + (x->block_cap + 1u) * sizeof *x->b;
     const lineidx_job *j = x->job ? x->job : x->retired;
     while (j) {
-        size_t arrays = (j->n + 1) * sizeof(uint64_t) + j->n * sizeof(uint64_t);
-        if (arrays > SIZE_MAX - sizeof *j) return SIZE_MAX;
-        size_t scratch = sizeof *j + arrays;
+        size_t scratch = sizeof *j + (j->n + 1u) * sizeof(uint64_t) + j->n * sizeof(uint64_t);
         if (scratch > SIZE_MAX - bytes) return SIZE_MAX;
         bytes += scratch;
         if (j->source_bytes > SIZE_MAX - bytes) return SIZE_MAX;
-        bytes += j->source_bytes;
-        j = j == x->job ? x->retired : j->next;
+        bytes += j->source_bytes; j = j == x->job ? x->retired : j->next;
     }
     return bytes;
 }
-
 bool lineidx_building(lineidx *x)
 {
     reap(x);
     if (x->retired) return true;
-    return x->job && !job_done(x->job);
+    return x->job && (!job_done(x->job) || x->job->applied < x->job->available);
 }
-
 size_t lineidx_poll(lineidx *x)
 {
     lineidx_job *j = x->job;
     size_t got = 0;
+    uint64_t deadline = now_ns(CLOCK_MONOTONIC) + UI_CPU_NS;
+    uint64_t cpu_deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
     if (j) {
-        (void)work_mailbox_receive(j->pool, j->h, j->generation, apply_results, x);
-        got = j->received;
-        j->received = 0;
-        if (j->applied >= j->n) retire_job(x);
+        (void)work_mailbox_receive_bounded(j->pool, j->h, j->generation, receive_results, x, 4, deadline);
+        while (j->applied < j->available && got < POLL_CHUNKS && now_ns(CLOCK_THREAD_CPUTIME_ID) < cpu_deadline) {
+            location at = {.block = j->apply_block, .id = j->apply_entry};
+            entry *e = &x->e[at.id];
+            if (!(e->fl & FL_BUILT)) {
+                uint64_t r = j->res[j->applied];
+                set_built(x, at, (uint32_t)(r & UINT32_MAX), (r & RES_NA) != 0); got++;
+            }
+            j->applied++; j->apply_entry = e->next;
+            if (!j->apply_entry && j->applied < j->n) {
+                j->apply_block = successor(x, j->apply_block);
+                j->apply_entry = x->b[j->apply_block].head;
+            }
+            /* Built entries also consume this slice's traversal budget. */
+            if ((j->applied & (POLL_CHUNKS - 1u)) == 0 || now_ns(CLOCK_THREAD_CPUTIME_ID) >= cpu_deadline) break;
+        }
+        if ((j->applied == j->n || (j->seeking && x->async_ready && j->applied == j->available)) && job_done(j)) retire_job(x);
     }
-    reap(x);
-    return got;
+    reap(x); return got;
 }
-
-void lineidx_build_cancel(lineidx *x)
+static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
+                       size_t source_bytes, bool seeking, uint64_t target)
 {
-    if (!x) return;
-    lineidx_poll(x);
-    if (x->job) {
-        work_cancel(x->job->pool, x->job->h);
-        retire_job(x);
-    }
-    reap(x);
-}
-
-int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap,
-                             size_t source_bytes)
-{
-    if (snap->len != x->len || !snap->span) return -1;
-    lineidx_build_cancel(x);
-    if (x->retired) return -1;                    /* one scratch/source lease at a time */
+    if (!snap || snap->len != x->len || !snap->span) return -1;
+    lineidx_build_cancel(x); reap(x);
+    if (x->retired) return -1;
+    x->last_cancel_cpu_ns = 0;
     derive(x);
-    if (x->pfx_n == x->n) {                       /* nothing left to do */
+    if (!seeking && lineidx_complete(x)) {
         if (snap->release) snap->release(snap->ctx);
         return 0;
     }
     lineidx_job *j = calloc(1, sizeof *j);
     if (!j) return -1;
-    j->n = x->n;
-    j->starts = malloc((x->n + 1) * sizeof(uint64_t));
-    j->res = malloc(x->n * sizeof(uint64_t));
+    j->n = x->n; j->starts = malloc((j->n + 1u) * sizeof *j->starts); j->res = malloc(j->n * sizeof *j->res);
     if (!j->starts || !j->res) { free(j->starts); free(j->res); free(j); return -1; }
-    for (size_t i = 0; i < x->n; i++) {
-        j->starts[i] = x->e[i].start;
-        uint64_t r = 0;
-        if (x->e[i].fl & FL_BUILT)
-            r = RES_DONE | ((x->e[i].fl & FL_NONASCII) ? RES_NA : 0) | x->e[i].nl;
-        j->res[i] = r;
+    uint32_t leaf = edge_block(x, x->root, false); size_t i = 0; uint64_t pos = 0;
+    while (leaf) {
+        for (uint32_t id = x->b[leaf].head; id; id = x->e[id].next) {
+            const entry *e = &x->e[id];
+            j->starts[i] = pos; pos += e->len;
+            j->res[i++] = (e->fl & FL_BUILT) ? RES_DONE | ((e->fl & FL_NONASCII) ? RES_NA : 0) | e->nl : 0;
+        }
+        leaf = successor(x, leaf);
     }
-    j->starts[x->n] = x->len;
-    j->src = *snap;
-    j->source_bytes = source_bytes;
-    j->pool = pool;
-    j->generation = ++x->gen;
-    work_job wj = { build_fn, j, j->generation, WORK_BULK };
-    j->h = work_submit(pool, wj);
-    if (j->h.epoch == 0) {
-        j->src.release = NULL;                     /* caller keeps ownership */
-        job_free(j);
-        return -1;
-    }
+    j->starts[j->n] = pos; j->src = *snap; j->source_bytes = source_bytes;
+    j->pool = pool; j->generation = ++x->gen; j->seeking = seeking; j->target = target;
+    j->apply_block = edge_block(x, x->root, false); j->apply_entry = x->b[j->apply_block].head;
+    j->h = work_submit(pool, (work_job){build_fn, j, j->generation, WORK_BULK});
+    if (!j->h.epoch) { j->src.release = NULL; job_free(j); return -1; }
     x->job = j;
-    if (work_mailbox_bind(pool, j->h, j->generation, apply_results, x) != 0) {
-        /* Submit/bind are serialized UI calls, so a successful submission's
-         * identity cannot change here. Preserve refusal ownership if misused. */
+    if (work_mailbox_bind(pool, j->h, j->generation, receive_results, x) != 0) {
         work_cancel(pool, j->h);
         while (!job_done(j)) nanosleep(&(struct timespec){0, 100000}, NULL);
-        x->job = NULL;
-        j->src.release = NULL;
-        job_free(j);
-        return -1;
+        x->job = NULL; j->src.release = NULL; job_free(j); return -1;
     }
     return 0;
 }
-
+int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap, size_t source_bytes)
+{ return start_job(x, pool, snap, source_bytes, false, 0); }
 int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
+{ return lineidx_build_start_owned(x, pool, snap, snap->release ? SIZE_MAX : 0); }
+int lineidx_seek_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap, uint64_t line, size_t source_bytes)
+{ return start_job(x, pool, snap, source_bytes, true, line); }
+bool lineidx_seek_result(lineidx *x, lineidx_result *result)
 {
-    return lineidx_build_start_owned(x, pool, snap, snap->release ? SIZE_MAX : 0);
+    (void)lineidx_poll(x);
+    if (!x->async_ready) return false;
+    if (result) *result = (lineidx_result){x->async_value, true};
+    return true;
 }
 
-/* ---- edits ---- */
-
-static size_t find_chunk(const lineidx *x, uint64_t off)   /* last c with start <= off */
-{
-    size_t lo = 0, hi = x->n;
-    while (hi - lo > 1) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (x->e[mid].start <= off) lo = mid; else hi = mid;
-    }
-    return lo;
-}
-
+/* ---- bounded foreground edits and edited-range lookup ---- */
 int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
 {
-    if (off > x->len || del > x->len - off) return -1;
-    if (ins_len > LINEIDX_MAX_LEN - (x->len - del)) return -1;
-    size_t c0 = find_chunk(x, off);
-    size_t c1 = del ? find_chunk(x, off + del - 1) : c0;
-    uint64_t s0 = x->e[c0].start;
-    uint64_t e1 = (c1 + 1 < x->n ? x->e[c1 + 1].start : x->len);
-    uint64_t newlen = (e1 - s0) - del + ins_len;
+    if (off > x->len || del > x->len - off || ins_len > LINEIDX_MAX_LEN - (x->len - del)) return -1;
+    location first = locate_byte(x, off), last = del ? locate_byte(x, off + del - 1u) : first;
+    uint64_t end = last.byte + x->e[last.id].len;
+    uint64_t newlen = end - first.byte - del + ins_len;
     uint64_t pieces = newlen / LINEIDX_CHUNK + (newlen % LINEIDX_CHUNK != 0);
-    size_t kept = x->n - (c1 - c0 + 1);
-    if (pieces > x->cap - kept) return -1;
-    lineidx_build_cancel(x);                       /* preflight complete, now mutate */
-    for (size_t i = c0; i <= c1; i++) if (x->e[i].fl & FL_EDITED) x->n_edited--;
-    /* drop c0+1..c1 */
-    if (c1 > c0) {
-        memmove(&x->e[c0 + 1], &x->e[c1 + 1], (x->n - c1 - 1) * sizeof(entry));
-        x->n -= c1 - c0;
-    }
-    /* shift later starts */
-    for (size_t i = c0 + 1; i < x->n; i++) x->e[i].start = x->e[i].start - del + ins_len;
-    x->len = x->len - del + ins_len;
-    entry *e = &x->e[c0];
-    e->start = s0;
-    e->nl = 0;
-    if (newlen == 0) {
-        if (x->n > 1) {
-            memmove(&x->e[c0], &x->e[c0 + 1], (x->n - c0 - 1) * sizeof(entry));
-            x->n--;
-        } else {
-            e->fl = FL_BUILT;                        /* empty content: exactly zero lines breaks */
+    uint32_t removed = last.ordinal - first.ordinal + 1u;
+    size_t kept = x->n - removed;
+    /* Admission is bounded too: a large replacement needs a rebuilt index on
+     * the allocating path. Refusal precedes cancellation or model mutation. */
+    if (pieces > x->cap - kept || pieces > LINEIDX_EDIT_MAX_CHUNKS) return -1;
+    while (x->free_blocks < 3 && reclaim_one(x)) { }
+    if (x->free_blocks < 3) return -1;
+    lineidx_build_cancel(x);
+    uint32_t a, b, removed_tree, c;
+    split(x, x->root, first.ordinal, &a, &b);
+    split(x, b, removed, &removed_tree, &c);
+    x->garbage = merge(x, x->garbage, removed_tree);
+    uint32_t replacement = 0;
+    if (pieces || !kept) {
+        replacement = take_block(x); block *v = &x->b[replacement];
+        uint64_t remaining = newlen;
+        uint32_t count = pieces ? (uint32_t)pieces : 1u;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t id = take_entry(x);
+            uint32_t len = (uint32_t)(remaining > LINEIDX_CHUNK ? LINEIDX_CHUNK : remaining);
+            x->e[id].len = len; x->e[id].fl = newlen ? FL_EDITED : FL_BUILT;
+            remaining -= len;
+            if (v->tail) x->e[v->tail].next = id; else v->head = id;
+            v->tail = id; v->count++; x->foreground_work++;
         }
-    } else {
-        e->fl = FL_EDITED;
-        x->n_edited++;
-        if (pieces > 1) {                          /* preflight guarantees storage */
-            size_t k = (size_t)pieces - 1;
-            memmove(&x->e[c0 + 1 + k], &x->e[c0 + 1], (x->n - c0 - 1) * sizeof(entry));
-            for (size_t i = 1; i <= k; i++) {
-                x->e[c0 + i].start = s0 + (uint64_t)i * LINEIDX_CHUNK;
-                x->e[c0 + i].nl = 0;
-                x->e[c0 + i].fl = FL_EDITED;
-            }
-            x->n += k;
-            x->n_edited += k;
-        }
+        recount(x, replacement);
     }
-    x->dirty = true;
+    x->root = concat(x, concat(x, a, replacement), c);
+    x->n = x->b[x->root].total; x->len = x->len - del + ins_len; x->dirty = true;
+    x->seek_pos = x->seek_nl = x->seek_na = x->seek_last = 0; x->seek_cached = false;
+    x->query_active = false;
+    x->refresh_id = 0;
     return 0;
 }
-
 size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
 {
-    size_t done = 0;
-    if (x->n_edited == 0 || cur->len != x->len) return 0;
-    for (size_t i = 0; i < x->n; i++) {
-        entry *e = &x->e[i];
-        if (!(e->fl & FL_EDITED)) continue;
-        uint64_t nl, na;
-        scan_range(cur, e->start, chunk_len(x, i), &nl, &na);
-        e->nl = (uint32_t)nl;
-        e->fl = FL_BUILT | (na ? FL_NONASCII : 0);
-        done++;
-        x->n_edited--;
-        break;                                    /* at most 64 KiB of content */
+    if (!x->b[x->root].edited || cur->len != x->len) return 0;
+    location at = locate(x, first_flag(x, true));
+    if (x->refresh_id != at.id) {
+        x->refresh_id = at.id; x->refresh_pos = at.byte; x->refresh_nl = x->refresh_na = 0;
     }
-    if (!done) x->n_edited = 0;
-    x->dirty = true;
-    return done;
+    uint64_t end = at.byte + x->e[at.id].len;
+    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    for (unsigned spans = 0; spans < SPAN_MAX && x->refresh_pos < end; spans++) {
+        const uint8_t *p; size_t k = cur->span(cur->ctx, x->refresh_pos, &p);
+        if (!k) return 0;
+        if (k > end - x->refresh_pos) k = (size_t)(end - x->refresh_pos);
+        scan_counts counts = scan_count(p, k);
+        x->refresh_nl += counts.newlines; x->refresh_na += counts.nonascii; x->refresh_pos += k;
+        x->scanned_bytes += k;
+        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+    }
+    if (x->refresh_pos != end) return 0;
+    set_built(x, at, (uint32_t)x->refresh_nl, x->refresh_na != 0); x->refresh_id = 0; return 1;
 }
 
 /* ---- queries ---- */
-
-static uint64_t density(const lineidx *x)       /* bytes per line, >= 1 */
+static uint64_t density(const lineidx *x)
 {
-    uint64_t pb = pfx_bytes(x);
-    if (x->pfx_n > 0 && x->pfx_lines > 0) {
-        uint64_t d = pb / x->pfx_lines;
-        return d ? d : 1;
-    }
+    if (x->pfx_lines) { uint64_t d = x->pfx_bytes / x->pfx_lines; return d ? d : 1; }
     return DEFAULT_BPL;
 }
-
 lineidx_result lineidx_line_count(lineidx *x)
 {
     derive(x);
-    if (x->pfx_n == x->n) return (lineidx_result){ x->pfx_lines + 1, true };
-    uint64_t pb = pfx_bytes(x);
-    return (lineidx_result){ x->pfx_lines + 1 + (x->len - pb) / density(x), false };
+    if (x->pfx_n == x->n) return (lineidx_result){x->pfx_lines + 1u, true};
+    return (lineidx_result){x->pfx_lines + 1u + (x->len - x->pfx_bytes) / density(x), false};
 }
-
-static lineidx_result l2b_derived(lineidx *x, const lineidx_src *cur, uint64_t line)
-{
-    if (line == 0) return (lineidx_result){ 0, true };
-    if (line <= x->pfx_lines) {
-        size_t lo = 0, hi = ((x->pfx_n - 1) >> SB_SHIFT) + 1;     /* largest k with sb[k] < line */
-        while (hi - lo > 1) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (x->sb[mid] < line) lo = mid; else hi = mid;
-        }
-        size_t c = lo << SB_SHIFT;
-        uint64_t cum = x->sb[lo];
-        while (c < x->pfx_n && cum + x->e[c].nl < line) { cum += x->e[c].nl; c++; }
-        uint64_t q = nth_newline(cur, x->e[c].start, chunk_len(x, c), line - cum - 1);
-        return (lineidx_result){ q == UINT64_MAX ? x->len : q + 1, q != UINT64_MAX };
-    }
-    if (x->pfx_n == x->n) return (lineidx_result){ x->len, true };   /* past the last line */
-    uint64_t pb = pfx_bytes(x);
-    uint64_t d = density(x);
-    uint64_t want = line - x->pfx_lines;
-    uint64_t est = (want > (x->len - pb) / d) ? x->len : pb + want * d;
-    uint64_t lo = est - pb > LINEIDX_CHUNK ? est - LINEIDX_CHUNK : pb;
-    uint64_t aligned = align_back(cur, lo, est);
-    if (aligned == UINT64_MAX) {
-        /* Chunk starts need not be line starts. Recover the last proven line
-         * anchor in the built prefix with at most one bounded chunk scan. */
-        aligned = 0;
-        for (size_t i = x->pfx_n; i > 0; i--) {
-            if (!x->e[i - 1].nl) continue;
-            uint64_t q = nth_newline(cur, x->e[i - 1].start, chunk_len(x, i - 1), x->e[i - 1].nl - 1u);
-            if (q != UINT64_MAX) aligned = q + 1;
-            break;
-        }
-    }
-    return (lineidx_result){ aligned, false };
-}
-
 lineidx_result lineidx_line_to_byte(lineidx *x, const lineidx_src *cur, uint64_t line)
 {
     derive(x);
-    return l2b_derived(x, cur, line);
+    if (!line) return (lineidx_result){0, true};
+    if (line <= x->pfx_lines) {
+        location at = locate_line(x, line);
+        uint64_t q = nth_newline(cur, at.byte, x->e[at.id].len, line - at.lines - 1u);
+        return (lineidx_result){q == UINT64_MAX ? x->len : q + 1u, q != UINT64_MAX};
+    }
+    if (x->pfx_n == x->n) return (lineidx_result){x->len, true};
+    uint64_t pb = x->pfx_bytes, d = density(x), want = line - x->pfx_lines;
+    uint64_t est = want > (x->len - pb) / d ? x->len : pb + want * d;
+    uint64_t lo = est - pb > LINEIDX_CHUNK ? est - LINEIDX_CHUNK : pb;
+    uint64_t anchor = align_back(cur, lo, est);
+    if (!anchor && x->pfx_lines) {
+        location at = locate_line(x, x->pfx_lines);
+        uint64_t q = nth_newline(cur, at.byte, x->e[at.id].len, x->pfx_lines - at.lines - 1u);
+        if (q != UINT64_MAX) anchor = q + 1u;
+    }
+    return (lineidx_result){anchor, false};
 }
-
 lineidx_result lineidx_byte_to_line(lineidx *x, const lineidx_src *cur, uint64_t off)
 {
-    derive(x);
-    if (off > x->len) off = x->len;
-    size_t c = find_chunk(x, off);
-    if (c < x->pfx_n) {
-        uint64_t nl, na;
-        scan_range(cur, x->e[c].start, off - x->e[c].start, &nl, &na);
-        return (lineidx_result){ cum_lines(x, c) + nl, true };
+    derive(x); if (off > x->len) off = x->len;
+    location at = locate_byte(x, off);
+    if (at.ordinal < x->pfx_n) {
+        uint64_t nl, na; scan_range(cur, at.byte, off - at.byte, &nl, &na);
+        return (lineidx_result){at.lines + nl, true};
     }
-    uint64_t pb = pfx_bytes(x);
-    if (off <= pb) return (lineidx_result){ x->pfx_lines, true };
-    return (lineidx_result){ x->pfx_lines + (off - pb) / density(x), false };
+    if (off <= x->pfx_bytes) return (lineidx_result){x->pfx_lines, true};
+    return (lineidx_result){x->pfx_lines + (off - x->pfx_bytes) / density(x), false};
 }
-
+static lineidx_result seek_known(lineidx *x, const lineidx_src *cur, location at,
+                                  uint64_t line, uint64_t len, uint64_t budget)
+{
+    uint64_t end = at.byte + len;
+    if (!x->query_active || x->query_start != at.byte || x->query_end != end || x->query_line != line) {
+        x->query_start = x->query_pos = at.byte; x->query_end = end;
+        x->query_nl = at.lines; x->query_line = line; x->query_last = 0;
+        x->query_active = true;
+    }
+    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    for (unsigned spans = 0; spans < SPAN_MAX && budget && x->query_pos < end; spans++) {
+        uint64_t pos = x->query_pos, cum = x->query_nl;
+        const uint8_t *p; size_t k = cur->span(cur->ctx, pos, &p);
+        if (!k) break;
+        if (k > end - pos) k = (size_t)(end - pos);
+        if (k > budget) k = (size_t)budget;
+        if (k > SCAN_BLOCK) k = SCAN_BLOCK;
+        scan_counts counts = scan_count(p, k);
+        x->scanned_bytes += k;
+        if (cum < line && counts.newlines >= line - cum) {
+            const uint8_t *q = scan_find_nth_newline(p, k, line - cum - 1u);
+            x->seek_value = pos + (uint64_t)(q - p) + 1u;
+            x->seek_line = line; x->seek_cached = true;
+            x->query_active = false;
+            return (lineidx_result){x->seek_value, true};
+        }
+        const uint8_t *last = memrchr(p, '\n', k);
+        if (last) x->query_last = pos + (uint64_t)(last - p) + 1u;
+        x->query_nl += counts.newlines; x->query_pos += k; budget -= k;
+        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+    }
+    return (lineidx_result){x->query_last, false};
+}
 lineidx_result lineidx_seek_line(lineidx *x, const lineidx_src *cur, uint64_t line, uint64_t budget)
 {
     derive(x);
-    if (line > x->pfx_lines && x->pfx_n < x->n && cur->len == x->len) {
-        size_t c = x->pfx_n;
-        uint64_t cum = x->pfx_lines, spent = 0;
-        while (c < x->n && cum < line && spent < budget) {
-            entry *e = &x->e[c];
-            if (!(e->fl & FL_BUILT)) {
-                uint64_t len = chunk_len(x, c), nl, na;
-                scan_range(cur, e->start, len, &nl, &na);
-                if (e->fl & FL_EDITED) x->n_edited--;
-                e->nl = (uint32_t)nl;
-                e->fl = FL_BUILT | (na ? FL_NONASCII : 0);
-                spent += len;
-            }
-            cum += e->nl;
-            c++;
-        }
-        x->dirty = true;
-        derive(x);
+    if (!line) return (lineidx_result){0, true};
+    if (x->seek_cached && x->seek_line == line) return (lineidx_result){x->seek_value, true};
+    if (cur->len != x->len) return (lineidx_result){0, false};
+    if (line <= x->pfx_lines) {
+        location at = locate_line(x, line);
+        return seek_known(x, cur, at, line, x->e[at.id].len, LINEIDX_CHUNK);
     }
-    return l2b_derived(x, cur, line);
+    if (x->pfx_n == x->n) return (lineidx_result){x->len, true};
+    if (x->seek_pos < x->pfx_bytes) { x->seek_pos = x->pfx_bytes; x->seek_nl = x->seek_na = 0; }
+    if (budget > LINEIDX_CHUNK) budget = LINEIDX_CHUNK;
+    if (line <= x->pfx_lines + x->seek_nl) {
+        location at = locate(x, (uint32_t)x->pfx_n);
+        return seek_known(x, cur, at, line, x->seek_pos - at.byte, budget);
+    }
+    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    for (unsigned spans = 0; spans < SPAN_MAX && budget && x->pfx_n < x->n; spans++) {
+        location at = locate(x, (uint32_t)x->pfx_n);
+        uint64_t end = at.byte + x->e[at.id].len;
+        const uint8_t *p; size_t k = cur->span(cur->ctx, x->seek_pos, &p);
+        if (!k) break;
+        if (k > end - x->seek_pos) k = (size_t)(end - x->seek_pos);
+        if (k > budget) k = (size_t)budget;
+        if (k > SCAN_BLOCK) k = SCAN_BLOCK;
+        scan_counts counts = scan_count(p, k);
+        uint64_t cum = x->pfx_lines + x->seek_nl;
+        bool found = cum < line && counts.newlines >= line - cum;
+        uint64_t answer = 0;
+        if (found) {
+            const uint8_t *q = scan_find_nth_newline(p, k, line - cum - 1u);
+            answer = x->seek_pos + (uint64_t)(q - p) + 1u;
+        }
+        const uint8_t *last = memrchr(p, '\n', k);
+        if (last) x->seek_last = x->seek_pos + (uint64_t)(last - p) + 1u;
+        x->seek_nl += counts.newlines; x->seek_na += counts.nonascii;
+        x->seek_pos += k; budget -= k; x->scanned_bytes += k;
+        if (x->seek_pos == end) {
+            set_built(x, at, (uint32_t)x->seek_nl, x->seek_na != 0);
+            x->seek_nl = x->seek_na = 0; derive(x);
+            /* Refresh or worker adoption can have built following chunks.
+             * Their counts are already in the derived prefix. */
+            x->seek_pos = x->pfx_bytes;
+        }
+        if (found) {
+            x->seek_cached = true; x->seek_line = line; x->seek_value = answer;
+            return (lineidx_result){answer, true};
+        }
+        if (line <= x->pfx_lines) {
+            location known = locate_line(x, line);
+            return seek_known(x, cur, known, line, x->e[known.id].len, budget);
+        }
+        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+    }
+    if (x->pfx_n == x->n) return (lineidx_result){x->len, true};
+    return (lineidx_result){x->seek_last, false};
 }

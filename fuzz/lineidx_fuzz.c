@@ -3,10 +3,11 @@
 #include "base/base.h"
 #include "trace/trace.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
-#define FAIL() __builtin_trap()
+#define FAIL() do { fprintf(stderr, "lineidx_fuzz:%d: failure\n", __LINE__); __builtin_trap(); } while (0)
 #define NEED(k) do { if (i + (k) > size) goto done; } while (0)
 #define MAXN (600u * 1024u)
 
@@ -83,7 +84,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t i = 4;
     while (i < size) {
         drain();
-        uint8_t op = data[i++] % 6;
+        uint8_t op = data[i++] % 7;
         flat cur = { b, n };
         lineidx_src cs = { &cur, n, flat_span, NULL };
         if (op == 0) {                                  /* edit */
@@ -143,10 +144,40 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             uint64_t ln = ((uint64_t)data[i] << 8 | data[i + 1]) % (lc + 3);
             uint64_t budget = (uint64_t)data[i + 2] * data[i + 3] * 600u;
             i += 4;
+            bool no_prefix = lineidx_built_prefix(x) == 0;
+            uint64_t bytes = lineidx_scanned_bytes(x);
             lineidx_result q = lineidx_seek_line(x, &cs, ln, budget);
+            if (no_prefix && lineidx_scanned_bytes(x) - bytes > budget) FAIL();
             if (q.value > n) FAIL();
             if (q.exact && q.value != m_l2b(b, n, ln)) FAIL();
             if (!q.exact && q.value && b[q.value - 1] != '\n') FAIL();
+        } else if (op == 6) {                            /* worker seek / cancel */
+            NEED(3);
+            uint64_t lc = m_lines(b, n);
+            uint64_t target = ((uint64_t)data[i] << 8 | data[i + 1]) % (lc + 3u);
+            uint8_t how = data[i + 2]; i += 3;
+            lineidx_build_cancel(x); wait_for(x, false);
+            flat *snap = malloc(sizeof *snap);
+            uint8_t *copy = malloc(n ? n : 1u);
+            memcpy(copy, b, n); snap->b = copy; snap->n = n;
+            lineidx_src ss = {snap, n, flat_span, free_snap};
+            if (lineidx_seek_start_owned(x, &pool, &ss, target, sizeof *snap + (size_t)(n ? n : 1u)) != 0) {
+                free_snap(snap); FAIL();
+            }
+            if (how & 1u) {
+                lineidx_build_cancel(x);
+                if (lineidx_seek_result(x, NULL)) FAIL();
+            } else {
+                struct timespec begin, now;
+                if (clock_gettime(CLOCK_MONOTONIC, &begin) != 0) FAIL();
+                lineidx_result q;
+                while (!lineidx_seek_result(x, &q)) {
+                    drain();
+                    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec - begin.tv_sec >= 10) FAIL();
+                    nanosleep(&(struct timespec){0, 20000}, NULL);
+                }
+                if (!q.exact || q.value != m_l2b(b, n, target)) FAIL();
+            }
         } else {                                        /* poll */
             lineidx_poll(x);
         }

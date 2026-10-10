@@ -98,7 +98,9 @@ static int correction(void)
     uint64_t cursor = start + 11 * 7 + 3, row_before = (cursor - start) / 11;
     /* Publication can land BETWEEN an event transition and its resolution. */
     CHECK(scroll_wheel(&s, 256) == 0);
-    CHECK(lineidx_seek_line(index, &src, UINT64_MAX, sizeof bytes).exact);
+    for (unsigned slice = 0; slice < 20000 && !lineidx_complete(index); slice++)
+        (void)lineidx_seek_line(index, &src, UINT64_MAX, sizeof bytes);
+    CHECK(lineidx_complete(index));
     CHECK(scroll_resolve(&s, index, &src, 0) == 0 && !s.approximate);
     CHECK(s.first_byte == start + 33 && s.first_line == start / 11 + 3 && s.subrow_q8 == 701);
     CHECK(scroll_wheel(&s, -256) == 0 && scroll_resolve(&s, index, &src, 0) == 0);
@@ -181,7 +183,7 @@ static int bounded_and_allocations(void)
     edit_malloc_guard_begin();
     guarding = true;
     CHECK(scroll_seek_line(&s, 1) == 0 && scroll_resolve(&s, index, &src, 1) == 0);
-    CHECK(lineidx_built_prefix(index) == 1); /* lineidx rounds budget to one chunk */
+    CHECK(lineidx_built_prefix(index) == 0); /* seek respects the one-byte budget */
     CHECK(scroll_wheel(&s, 1) == 0 && scroll_resolve(&s, index, &src, 0) == 0 && s.subrow_q8 == 51);
     CHECK(scroll_wheel(&s, -256) == 0 && scroll_resolve(&s, index, &src, 0) == 0 && s.first_byte == 0 && s.subrow_q8 == 0);
     for (unsigned i = 0; i < 1000; i++) {
@@ -246,10 +248,15 @@ static int follow_proof(void)
     CHECK(scroll_init(&s, (scroll_config){1, 17, 0}, (scroll_extent){sizeof bytes, 100, false}) == 0);
     before = s;
     CHECK(!lineidx_seek_line(index, &src, UINT64_MAX, 1).exact);
+    CHECK(lineidx_built_prefix(index) == 0); /* one byte cannot build a chunk */
+    for (unsigned slice = 0; slice < 20000 && lineidx_built_prefix(index) == 0; slice++)
+        (void)lineidx_seek_line(index, &src, UINT64_MAX, LINEIDX_CHUNK);
     CHECK(lineidx_built_prefix(index) == 1);
     CHECK(scroll_follow_cursor(&s, index, &src, 150000) == SCROLL_MORE);
     CHECK(memcmp(&s, &before, sizeof s) == 0);
-    CHECK(lineidx_seek_line(index, &src, UINT64_MAX, sizeof bytes).exact);
+    for (unsigned slice = 0; slice < 20000 && !lineidx_complete(index); slice++)
+        (void)lineidx_seek_line(index, &src, UINT64_MAX, sizeof bytes);
+    CHECK(lineidx_complete(index));
     CHECK(scroll_follow_cursor(&s, index, &src, 150000) == 0);
     CHECK(s.first_byte == 1024 && s.first_line == 1 && !s.approximate);
     size_t allocations = edit_malloc_guard_end();
