@@ -1,12 +1,13 @@
 /* P1.6d: G7 new mapping -> exact index, G7j fresh index request -> correct
  * 80x24 viewport submitted/presented to the null backend. ASCII fixtures.
- * Usage: [--file=PATH] [--reps=3..200] [--track] [--cold]
+ * Usage: [--file=PATH] [--reps=3..200] [--track] [--cold] [--compare-scan]
  *        [--timeout-ms=1..600000] | --self-check[=15|16|17|18|race|pending]
  * --cold: manual root eviction + mincore verification BEFORE EVERY sample.
  * Warm-only gated success exits 3 (cold unvalidated). --track never claims gates.
  * --partial was removed: G7j always starts with nothing built. */
 #include "lineidx/lineidx.h"
 #include "layout/layout.h"
+#include "scan/scan.h"
 #include "../bench/harness.h"
 
 #include <errno.h>
@@ -347,7 +348,7 @@ typedef struct options {
     const char *file;
     int reps;
     uint64_t timeout;
-    bool cold, track;
+    bool cold, track, compare_scan;
 } options;
 
 static bool parse_uint(const char *text, uint64_t low, uint64_t high, uint64_t *value)
@@ -363,11 +364,12 @@ static bool parse_uint(const char *text, uint64_t low, uint64_t high, uint64_t *
 
 static bool parse_options(int argc, char **argv, options *out)
 {
-    *out = (options){"/tmp/edit-corpus/log_1g.txt", 9, 30000000000ull, false, false};
+    *out = (options){"/tmp/edit-corpus/log_1g.txt", 9, 30000000000ull, false, false, false};
     for (int i = 1; i < argc; i++) {
         uint64_t value = 0;
         if (strcmp(argv[i], "--cold") == 0) out->cold = true;
         else if (strcmp(argv[i], "--track") == 0) out->track = true;
+        else if (strcmp(argv[i], "--compare-scan") == 0) out->compare_scan = true;
         else if (strncmp(argv[i], "--file=", 7) == 0 && argv[i][7]) out->file = argv[i] + 7;
         else if (strncmp(argv[i], "--reps=", 7) == 0 && parse_uint(argv[i] + 7, 3, 200, &value))
             out->reps = (int)value;
@@ -375,7 +377,7 @@ static bool parse_options(int argc, char **argv, options *out)
             out->timeout = value * 1000000;
         else return false;
     }
-    return true;
+    return !(out->compare_scan && out->cold);
 }
 
 typedef struct blocked_source { _Atomic bool entered, release; } blocked_source;
@@ -773,6 +775,54 @@ static int worker_seek_row(work_pool *p, fixture *file, const oracle *reference,
                           calibrated && !track ? 30000000 : 0, calibrated && !track ? 50000000 : 0, &stamp);
 }
 
+/* Compare the build path with its scanner on exactly the same prefaulted
+ * fixture. Alternate order each round to expose load drift; every sample has
+ * an independent count check. Link this bench object against the historical
+ * lineidx object before libedit.a to run the identical experiment there.
+ * These are TRACK rows, with no change to the ordinary G7/G7j workload. */
+static int compare_scan_rows(work_pool *pool, const flat *f, const oracle *reference,
+                             int reps, uint64_t timeout)
+{
+    uint64_t storage[2][200];
+    bench_samples samples[2];
+    for (size_t i = 0; i < 2; i++) bench_samples_init(&samples[i], storage[i], 200);
+    evidence stamp = measurement_stamp();
+    for (int round = 0; round < reps + 2; round++) {
+        for (int turn = 0; turn < 2; turn++) {
+            int variant = (round + turn) % 2;
+            stamp = measurement_stamp();
+            uint64_t elapsed;
+            if (variant == 0) {
+                flat source = *f;
+                lineidx_src src = {&source, f->n, flat_span, NULL};
+                lineidx *x = lineidx_create(f->n);
+                if (!x) fail_fast("comparison index allocation failed");
+                uint64_t begin = bench_now_ns();
+                if (lineidx_build_start(x, pool, &src) != 0 ||
+                    !wait_index(x, pool, begin + timeout, true, "comparison build"))
+                    fail_fast("comparison build failed");
+                elapsed = bench_now_ns() - begin;
+                if (!index_correct(x, reference)) fail_fast("comparison build count failed");
+                index_destroy(x, pool, timeout);
+            } else {
+                uint64_t begin = bench_now_ns();
+                scan_counts counts = scan_count(f->b, (size_t)f->n);
+                elapsed = bench_now_ns() - begin;
+                if (counts.newlines + 1u != reference->lines)
+                    fail_fast("comparison raw scan count failed");
+            }
+            if (round >= 2) bench_add(&samples[variant], elapsed);
+            printf("# comparison round=%d turn=%d variant=%s elapsed_ns=%llu bytes=%llu (M)%s load=%s\n",
+                   round, turn, variant == 0 ? "index" : "raw_scan",
+                   (unsigned long long)elapsed, (unsigned long long)f->n, stamp.power, stamp.load);
+        }
+    }
+    int rc = report_stamped(stdout, "TRACK_compare_prefaulted_index", &samples[0], 0, 0, &stamp);
+    rc |= report_stamped(stdout, "TRACK_compare_raw_scan", &samples[1], 0, 0, &stamp);
+    puts("# comparison excludes mmap/create; index includes request, worker and UI adoption; raw scan is the payload floor; gates unvalidated");
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--self-check") == 0) {
@@ -790,7 +840,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--self-check=pending") == 0) return self_check_pending_batches();
     options parsed;
     if (!parse_options(argc, argv, &parsed)) {
-        fputs("invalid workload: use --file=PATH --reps=3..200 --track --cold --timeout-ms=1..600000; --partial removed (fresh index required)\n", stderr);
+        fputs("invalid workload: use --file=PATH --reps=3..200 --track --cold --compare-scan --timeout-ms=1..600000; comparison requires warm input; --partial removed (fresh index required)\n", stderr);
         return 2;
     }
     int reps = parsed.reps, rc = 0;
@@ -821,6 +871,12 @@ int main(int argc, char **argv)
     uint64_t lc = reference.lines, target = reference.target, want = reference.byte;
     printf("# line_count=%llu target_line=%llu target_byte=%llu\n",
            (unsigned long long)lc, (unsigned long long)target, (unsigned long long)want);
+    if (parsed.compare_scan) {
+        int result = compare_scan_rows(&pool, &f0, &reference, reps, parsed.timeout);
+        work_pool_shutdown(&pool);
+        munmap((void *)m0, (size_t)n);
+        return result;
+    }
     munmap((void *)m0, (size_t)n);
 
     uint64_t buf[256];
