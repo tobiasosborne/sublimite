@@ -88,8 +88,14 @@ static int query_child(font_fallback *owner, work_ctx *ctx, uint32_t cp,
     if (!error) error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     const char *program = owner->discovery_program ? owner->discovery_program : "/usr/bin/fc-match";
     char *const args[] = {(char *)program, "-f", "%{file}\n%{index}\n%{color}\n%{charset}\n", (char *)pattern, NULL};
+    posix_spawnattr_t attrs;
+    int have_attrs = posix_spawnattr_init(&attrs) == 0;
+    if (!have_attrs && !error) error = EINVAL;
+    if (!error) error = posix_spawnattr_setpgroup(&attrs, 0);
+    if (!error) error = posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETPGROUP);
     pid_t pid = 0;
-    if (!error) error = posix_spawn(&pid, program, &actions, NULL, args, environ);
+    if (!error) error = posix_spawn(&pid, program, &actions, &attrs, args, environ);
+    if (have_attrs) (void)posix_spawnattr_destroy(&attrs);
     (void)posix_spawn_file_actions_destroy(&actions); close(fds[1]);
     if (error) { close(fds[0]); return 1; }
     atomic_store_explicit(&owner->child_pid, (uint32_t)pid, memory_order_release);
@@ -98,14 +104,19 @@ static int query_child(font_fallback *owner, work_ctx *ctx, uint32_t cp,
     uint64_t start = discovery_time();
     while (!reaped || !eof) {
         if (discovery_stop(owner, ctx)) cancelled = 1;
-        if (!reaped && (cancelled || output.invalid || discovery_time() - start >= UINT64_C(30000000000)) && !killed) {
-            (void)kill(pid, SIGKILL); killed = 1;
+        if ((cancelled || output.invalid || discovery_time() - start >= UINT64_C(30000000000)) && !killed) {
+            /* The direct child may already be reaped while descendants hold
+             * stdout. Pipe lifetime and process-group cleanup are independent. */
+            (void)kill(-pid, SIGKILL); killed = 1;
+            close(fds[0]); fds[0] = -1; eof = 1;
         }
-        char bytes[512];
-        ssize_t n = read(fds[0], bytes, sizeof bytes);
-        if (n > 0) query_feed(&output, bytes, (size_t)n);
-        else if (n == 0) eof = 1;
-        else if (errno != EAGAIN && errno != EINTR) { output.invalid = 1; eof = 1; }
+        if (!eof) {
+            char bytes[512];
+            ssize_t n = read(fds[0], bytes, sizeof bytes);
+            if (n > 0) query_feed(&output, bytes, (size_t)n);
+            else if (n == 0) eof = 1;
+            else if (errno != EAGAIN && errno != EINTR) { output.invalid = 1; eof = 1; }
+        }
         if (!reaped) {
             pid_t result = waitpid(pid, &status, WNOHANG);
             if (result == pid) reaped = 1;
@@ -117,7 +128,8 @@ static int query_child(font_fallback *owner, work_ctx *ctx, uint32_t cp,
             else { struct timespec delay = {0,1000000}; (void)nanosleep(&delay, NULL); }
         }
     }
-    close(fds[0]); atomic_store_explicit(&owner->child_pid, 0u, memory_order_release);
+    if (fds[0] >= 0) close(fds[0]);
+    atomic_store_explicit(&owner->child_pid, 0u, memory_order_release);
     if (cancelled || discovery_stop(owner, ctx)) return 0;
     if (!killed && !output.invalid && WIFEXITED(status) && WEXITSTATUS(status) == 0 && output.line == 4) *available = 1;
     char *end = NULL; errno = 0; unsigned long face = strtoul(output.index, &end, 10);

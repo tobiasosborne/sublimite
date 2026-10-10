@@ -150,18 +150,24 @@ static int compose_cluster(font_cache *cache, const uint8_t *bytes, size_t len, 
         utf8_step step = utf8_decode(cache->pending_key + cache->pending_off, len - cache->pending_off);
         /* The complete key has already been validated. Controls count as work
          * too, so an invisible-only sequence also has a bounded continuation. */
-        work++;
+        if (!font_cluster_ignorable(step.cp) && work &&
+            work + cache->family->count > FONT_COMPOSE_MAX_GLYPHS) return FONT_MORE;
+        work += font_cluster_ignorable(step.cp) ? 1u : cache->family->count;
         if (font_cluster_ignorable(step.cp)) { cache->pending_off += step.len; continue; }
-        font_t *face = NULL; font_metric metric;
+        font_bitmap b;
+        int rc = FONT_ERR_MISSING;
         for (uint32_t i = 0; i < cache->family->count; i++) {
-            int rc = font_glyph_metrics(&cache->family->faces[i], step.cp, &metric);
-            if (rc == FONT_OK) { face = &cache->family->faces[i]; break; }
-            if (rc != FONT_ERR_MISSING) return rc;
+            font_metric metric;
+            int attempt = font_glyph_ui_metrics(&cache->family->faces[i], step.cp, &metric);
+            if (attempt == FONT_OK) {
+                edit_arena_reset(&cache->scratch);
+                cache->rasterizations++;
+                attempt = font_raster_glyph_ui(&cache->family->faces[i], step.cp, &cache->scratch, &b);
+            }
+            if (attempt == FONT_OK) { rc = FONT_OK; break; }
+            if (attempt == FONT_ERR_INIT) rc = FONT_ERR_INIT;
+            else if (attempt != FONT_ERR_MISSING) return attempt;
         }
-        if (!face) return FONT_ERR_MISSING;
-        font_bitmap b; edit_arena_reset(&cache->scratch);
-        cache->rasterizations++;
-        int rc = font_raster_glyph(face, step.cp, &cache->scratch, &b);
         if (rc != FONT_OK) return rc;
         int zero = utf8_cell_width(step.cp) == 0;
         int32_t pen = zero && b.m.advance == 0 ? cache->pending_advance : 0;

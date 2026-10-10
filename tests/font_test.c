@@ -4,13 +4,17 @@
 #include "base/base.h"
 #include "font/font.h"
 #include "font/file.h"
+#include "layout/layout.h"
 #include "work/work.h"
 #include "../vendor/stb_truetype.h"   /* declarations only: glyph ids for hostile-glyph tests */
 #include "../fuzz/font_cffseed.h"
 #include <signal.h>
+#include <limits.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
 #include <poll.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,6 +95,41 @@ static int init_exact(const unsigned char *b, size_t n, uint32_t index, int *ok_
     }
     free(c);
     return r;
+}
+
+/* Sparse address-space fixture: no multi-gigabyte disk or physical copy. */
+static void test_signed_offsets(const unsigned char *ttf, size_t len)
+{
+    size_t huge = (size_t)INT_MAX + 4096u;
+    unsigned char *bytes = mmap(NULL, huge, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    CHECK(bytes != MAP_FAILED);
+    if (bytes == MAP_FAILED) return;
+    memcpy(bytes, ttf, len);
+    font_t face;
+    CHECK(font_init(&face, bytes, huge) == FONT_ERR_INIT);
+    CHECK(face.data == NULL);
+    size_t head = tab_off(ttf, "head");
+    memcpy(bytes + UINT64_C(0x80000000), ttf + head, 54u);
+    put32(bytes + rec_of(bytes, 0, "head") + 8u, 0x80000000u);
+    CHECK(font_init(&face, bytes, huge) == FONT_ERR_INIT && face.data == NULL);
+    memcpy(bytes, "ttcf", 4); put32(bytes + 4u, 0x10000u);
+    put32(bytes + 8u, 1); put32(bytes + 12u, 0x80000000u);
+    CHECK(font_init_index(&face, bytes, huge, 0) == FONT_ERR_INIT && face.data == NULL);
+    CHECK(munmap(bytes, huge) == 0);
+    /* stb also narrows cmap-relative offsets during initialization. Reject
+     * before its signed byte shifts or relative-offset addition execute. */
+    bytes = malloc(len); CHECK(bytes);
+    if (!bytes) return;
+    memcpy(bytes, ttf, len);
+    size_t cmap = tab_off(bytes, "cmap");
+    for (uint32_t i = 0; i < be16(bytes + cmap + 2u); i++) {
+        size_t record = cmap + 4u + 8u * i;
+        put32(bytes + record + 4u, 0x80000000u);
+    }
+    CHECK(font_init(&face, bytes, len) == FONT_ERR_INIT && face.data == NULL);
+    free(bytes);
+    if (!failures) puts("P2-1 §3 GREEN: sparse oversized font and cmap-relative offsets refused before stb");
 }
 
 static void test_font_bounds(const unsigned char *ttf, size_t len)
@@ -282,6 +321,194 @@ static int cff_exercise(const unsigned char *b, size_t n, uint32_t index, uint32
     }
     free(c);
     return r;
+}
+
+/* Replace B in the minimal CFF while preserving INDEX and Private offsets. */
+static size_t cff_with_outline(unsigned char *buf, size_t cap,
+                               const unsigned char *outline, size_t outline_len)
+{
+    cffseed_layout seed_layout;
+    size_t n = cffseed_build(buf, cap, 0, &seed_layout);
+    if (!n || outline_len < 3u) return 0;
+    size_t data = seed_layout.cs_idx + 11u;
+    size_t bstart = data + be16(buf + seed_layout.cs_idx + 7u) - 1u;
+    size_t growth = outline_len - 3u;
+    if (n + growth > cap || outline_len + 13u > 65535u) return 0;
+    memmove(buf + bstart + outline_len, buf + bstart + 3u, n - bstart - 3u);
+    memcpy(buf + bstart, outline, outline_len);
+    put16(buf + seed_layout.cs_idx + 9u, (uint32_t)(outline_len + 13u));
+    put32(buf + seed_layout.cs_off_pos + 11u,
+          be32(buf + seed_layout.cs_off_pos + 11u) + (uint32_t)growth);
+    put32(buf + seed_layout.rec_cff + 12u, (uint32_t)(seed_layout.cff_len + growth));
+    return n + growth;
+}
+
+static void test_cff_coordinates(void)
+{
+    unsigned char *bytes = malloc(65536u), *outline = malloc(60000u);
+    CHECK(bytes && outline);
+    if (!bytes || !outline) { free(bytes); free(outline); return; }
+    edit_arena scratch; CHECK(edit_arena_init(&scratch, 1u << 20) == 0);
+    for (unsigned variant = 0; variant < 2; variant++) {
+        size_t at = 0;
+        outline[at++] = 139; outline[at++] = 139; outline[at++] = 21;
+        unsigned lines = variant ? 1u : 7000u;
+        for (unsigned i = 0; i < lines; i++) {
+            outline[at++] = 28; outline[at++] = 0x7f; outline[at++] = 0xff;
+            outline[at++] = 140; outline[at++] = 5;
+        }
+        outline[at++] = 14;
+        size_t n = cff_with_outline(bytes, 65536u, outline, at);
+        CHECK(n);
+        size_t hhea = tab_off(bytes, "hhea");
+        put16(bytes + hhea + 4u, 1); put16(bytes + hhea + 6u, 0);
+        font_t face; CHECK(font_init(&face, bytes, n) == FONT_OK);
+        CHECK(font_set_px(&face, 15) == FONT_OK);
+        font_metric metric; font_bitmap bitmap;
+        CHECK(font_glyph_metrics(&face, 'B', &metric) == FONT_ERR_INIT);
+        CHECK(font_raster_glyph(&face, 'B', &scratch, &bitmap) == FONT_ERR_INIT);
+        CHECK(scratch.used == 0);
+    }
+    edit_arena_free(&scratch); free(bytes); free(outline);
+    if (!failures) puts("P2-1 §4 GREEN: extreme coordinates and small-ascent bitmap rejected");
+}
+
+static void test_cff_errors(const unsigned char *ttf, size_t len)
+{
+    unsigned char bytes[4096]; cffseed_layout seed_layout;
+    edit_arena scratch; CHECK(edit_arena_init(&scratch, 1u << 20) == 0);
+    font_t face;
+    for (unsigned variant = 0; variant < 3; variant++) {
+        static const unsigned char no_end[] = {139,139,21};
+        static const unsigned char bad_return[] = {11,139,139};
+        size_t n = variant == 2 ? cffseed_build(bytes, sizeof bytes, 1, &seed_layout) :
+            cff_with_outline(bytes, sizeof bytes, variant ? bad_return : no_end, 3);
+        CHECK(n && font_init(&face, bytes, n) == FONT_OK);
+        CHECK(font_set_px(&face, 15) == FONT_OK);
+        font_metric metric; font_bitmap bitmap;
+        CHECK(font_glyph_metrics(&face, 'B', &metric) == FONT_ERR_INIT);
+        CHECK(font_raster_glyph(&face, 'B', &scratch, &bitmap) == FONT_ERR_INIT);
+        CHECK(font_raster_glyph(&face, 'A', &scratch, &bitmap) == FONT_OK && bitmap.pixels);
+        edit_arena_reset(&scratch);
+    }
+    static const unsigned char empty[] = {139,139,14};
+    size_t n = cff_with_outline(bytes, sizeof bytes, empty, 3);
+    CHECK(font_init(&face, bytes, n) == FONT_OK && font_set_px(&face, 15) == FONT_OK);
+    font_bitmap bitmap;
+    CHECK(font_raster_glyph(&face, 'B', &scratch, &bitmap) == FONT_OK);
+    CHECK(!bitmap.pixels && !bitmap.w && !bitmap.h);
+
+    /* Malformed mapped glyph must fall through to a healthy covering face. */
+    font_t primary; CHECK(font_init(&primary, ttf, len) == FONT_OK);
+    CHECK(font_set_px(&primary, 15) == FONT_OK);
+    font_family family; CHECK(font_family_load(&family, &primary, NULL, &scratch) == FONT_OK);
+    edit_arena storage; CHECK(edit_arena_init(&storage, 4u << 20) == 0);
+    font_cache cache; CHECK(font_cache_init(&cache, &family, &storage, 1, 32, 1024, 1u << 20) == FONT_OK);
+    n = cffseed_build(bytes, sizeof bytes, 1, &seed_layout);
+    CHECK(font_init(&face, bytes, n) == FONT_OK && font_set_px(&face, 15) == FONT_OK);
+    family.faces[1] = primary; family.faces[0] = face; family.count = 2;
+    uint32_t slot = RENDER_NO_SLOT;
+    CHECK(font_cache_glyph(&cache, (const uint8_t *)"B", 1, 1, &slot) == FONT_OK);
+    CHECK(slot != RENDER_NO_SLOT);
+    family.count = 1;
+    CHECK(font_cache_glyph(&cache, (const uint8_t *)"BB", 2, 2, &slot) == FONT_ERR_INIT);
+    edit_arena_free(&storage); edit_arena_free(&scratch);
+    if (!failures) puts("P2-1 §30 GREEN: CFF errors rejected, empty glyph preserved, fallback recovers");
+}
+
+static uint64_t s9_time(void)
+{
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static void test_tt_ui_budget(const unsigned char *ttf, size_t len)
+{
+    font_t original; CHECK(font_init(&original, ttf, len) == FONT_OK);
+    uint32_t glyph = (uint32_t)stbtt_FindGlyphIndex((const stbtt_fontinfo *)(const void *)original.info, 'A');
+    size_t loca = tab_off(ttf, "loca"), glyf = tab_off(ttf, "glyf");
+    int format = (int)be16(ttf + tab_off(ttf, "head") + 50u);
+    uint32_t start = format ? be32(ttf + loca + 4u * glyph) : 2u * be16(ttf + loca + 2u * glyph);
+    uint32_t end = format ? be32(ttf + loca + 4u * (glyph + 1u)) : 2u * be16(ttf + loca + 2u * (glyph + 1u));
+    size_t outline_len = 14u + 1024u;
+    CHECK(end > start && outline_len > end - start);
+    size_t growth = outline_len - (end - start);
+    unsigned char *bytes = malloc(len + growth); CHECK(bytes);
+    if (!bytes) return;
+    memcpy(bytes, ttf, glyf + start);
+    unsigned char *outline = bytes + glyf + start;
+    memset(outline, 0, outline_len);
+    put16(outline, 1); put16(outline + 6u, 10); put16(outline + 8u, 10);
+    put16(outline + 10u, 1023);
+    memset(outline + 14u, 0x31, 1024u); /* on-curve, identical tiny coordinates */
+    memcpy(outline + outline_len, ttf + glyf + end, len - glyf - end);
+    for (uint32_t i = 0; i < be16(ttf + 4u); i++) {
+        size_t rec = 12u + 16u * i;
+        uint32_t offset = be32(ttf + rec + 8u);
+        if (offset >= glyf + end) put32(bytes + rec + 8u, offset + (uint32_t)growth);
+    }
+    size_t rec = rec_of(bytes, 0, "glyf");
+    put32(bytes + rec + 12u, (uint32_t)(tab_len(ttf, "glyf") + growth));
+    loca = tab_off(bytes, "loca");
+    for (uint32_t i = glyph + 1u; i <= original.num_glyphs; i++) {
+        uint32_t offset = format ? be32(bytes + loca + 4u * i) : 2u * be16(bytes + loca + 2u * i);
+        if (format) put32(bytes + loca + 4u * i, offset + (uint32_t)growth);
+        else put16(bytes + loca + 2u * i, (offset + (uint32_t)growth) / 2u);
+    }
+    font_t face; CHECK(font_init(&face, bytes, len + growth) == FONT_OK);
+    CHECK(font_set_px(&face, 15) == FONT_OK);
+    edit_arena scratch; CHECK(edit_arena_init(&scratch, 1u << 20) == 0);
+    font_bitmap bitmap; font_metric metric;
+    CHECK(font_raster_glyph(&face, 'A', &scratch, &bitmap) == FONT_OK);
+    edit_arena_reset(&scratch);
+    CHECK(font_glyph_ui_metrics(&face, 'A', &metric) == FONT_ERR_INIT);
+    CHECK(font_raster_glyph_ui(&face, 'A', &scratch, &bitmap) == FONT_ERR_INIT);
+    CHECK(scratch.used == 0);
+    edit_arena_free(&scratch); free(bytes);
+}
+
+static void test_ui_outline_budget(const unsigned char *ttf, size_t len)
+{
+    test_tt_ui_budget(ttf, len);
+    unsigned char bytes[16384], outline[12000];
+    size_t at = 0;
+    outline[at++] = 139; outline[at++] = 139; outline[at++] = 21;
+    /* Thousands of overlapping lines: tiny bitmap, excessive execution. */
+    for (unsigned i = 0; i < 2000u; i++) {
+        outline[at++] = i % 2u ? 138 : 140;
+        outline[at++] = i % 2u ? 138 : 140;
+        outline[at++] = 5;
+    }
+    outline[at++] = 14;
+    size_t n = cff_with_outline(bytes, sizeof bytes, outline, at);
+    font_t primary = {0}, hostile = {0};
+    CHECK(n && font_init(&hostile, bytes, n) == FONT_OK && font_set_px(&hostile, 15) == FONT_OK);
+    CHECK(font_init(&primary, ttf, len) == FONT_OK && font_set_px(&primary, 15) == FONT_OK);
+    edit_arena storage, files;
+    CHECK(edit_arena_init(&storage, 4u << 20) == 0);
+    CHECK(edit_arena_init(&files, 1u << 20) == 0);
+    font_family family; CHECK(font_family_load(&family, &primary, NULL, &files) == FONT_OK);
+    font_cache cache; CHECK(font_cache_init(&cache, &family, &storage, 1, 32, 1024, 1u << 20) == FONT_OK);
+    family.faces[0] = hostile;
+    uint64_t rejected_max = 0, normal_max = 0;
+    for (unsigned i = 0; i < 16u; i++) {
+        uint32_t slot = RENDER_NO_SLOT;
+        uint64_t start = s9_time();
+        CHECK(font_cache_glyph(&cache, (const uint8_t *)"B", 1, 1, &slot) == FONT_ERR_INIT);
+        uint64_t elapsed = s9_time() - start;
+        if (elapsed > rejected_max) rejected_max = elapsed;
+        CHECK(slot == RENDER_NO_SLOT && cache.scratch.used == 0);
+        start = s9_time();
+        font_bitmap bitmap;
+        CHECK(font_raster_glyph_ui(&primary, 0xe9u, &cache.scratch, &bitmap) == FONT_OK);
+        elapsed = s9_time() - start;
+        if (elapsed > normal_max) normal_max = elapsed;
+        edit_arena_reset(&cache.scratch);
+    }
+    printf("P2-1 §31 slices (M)[AC], shared loaded box, paired rejection/normal max: %llu/%llu ns; TRACK only\n",
+           (unsigned long long)rejected_max, (unsigned long long)normal_max);
+    edit_arena_free(&files); edit_arena_free(&storage);
+    if (!failures) puts("P2-1 §31 GREEN: tiny-bitmap high-outline workload refused on UI");
 }
 
 static void test_cff_synthetic(void)
@@ -809,6 +1036,88 @@ static void test_discovery_cancellation(void)
     if (!failures) puts("review work-scan §9 GREEN: production discovery cancels and reaps an unbounded helper; no adoption");
 }
 
+static void test_discovery_inherited_stdout(void)
+{
+    font_fallback fb = {0}; fb.discovery_program = "/proc/self/exe";
+    CHECK(setenv("FONT_REVIEW_CHILD", "inherited", 1) == 0);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    work_handle handle = work_submit(pool, (work_job){font_fallback_job, &fb, 19, WORK_BULK});
+    CHECK(handle.epoch);
+    for (unsigned i = 0; i < 300u && !atomic_load(&fb.child_pid); i++) usleep(1000);
+    CHECK(atomic_load(&fb.child_pid));
+    usleep(100000); /* direct helper exits; descendant keeps the pipe open */
+    work_cancel(pool, handle);
+    for (unsigned i = 0; i < 250u && !work_handle_finished(pool, handle); i++) usleep(1000);
+    CHECK(work_handle_finished(pool, handle));
+    CHECK(!atomic_load(&fb.done));
+    work_pool_shutdown(pool); free(pool);
+    CHECK(unsetenv("FONT_REVIEW_CHILD") == 0);
+    if (!failures) puts("P2-1 §32 GREEN: cancellation finishes after helper exits with inherited stdout");
+}
+
+static void adopt_runtime(const work_msg *msg, void *arg)
+{
+    font_runtime *owner = arg;
+    if (font_runtime_event(owner, msg)) CHECK(font_runtime_event(owner, msg) == 0);
+}
+
+static void test_runtime_owner(void)
+{
+    edit_arena files, storage;
+    CHECK(edit_arena_init(&files, 1u << 20) == 0);
+    CHECK(edit_arena_init(&storage, 4u << 20) == 0);
+    font_runtime owner;
+    font_runtime_config config = {"vendor/DejaVuSansMono.ttf", NULL, 15, 1, 32, 1024, 1u << 20};
+    uint32_t pages = 0; size_t glyphs = 0, pixels = 0;
+    CHECK(font_runtime_limits(&config, &pages, &glyphs, &pixels) == FONT_OK);
+    CHECK(pages == 2 && glyphs == 127 && pixels > 1024u * 1024u);
+    CHECK(font_runtime_init(&owner, &config, &files, &storage) == FONT_OK);
+    uint32_t slot = RENDER_NO_SLOT;
+    CHECK(font_runtime_glyph(&owner, (const uint8_t *)"\xc3\xa9", 2, 1, &slot) == FONT_MORE);
+    CHECK(slot == RENDER_NO_SLOT && files.used == 0 && storage.used == 0);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    CHECK(pool && work_pool_init(pool, 1, 0) == 0);
+    work_handle handle = work_submit(pool, (work_job){font_runtime_prepare_job, &owner, 29, WORK_BULK});
+    CHECK(handle.epoch);
+    for (unsigned i = 0; i < 1000u && !work_handle_finished(pool, handle); i++) usleep(1000);
+    CHECK(work_handle_finished(pool, handle) && !owner.adopted);
+    CHECK(font_runtime_glyph(&owner, (const uint8_t *)"\xc3\xa9", 2, 1, &slot) == FONT_MORE);
+    (void)work_mailbox_receive(pool, handle, 29, adopt_runtime, &owner);
+    CHECK(owner.adopted && owner.result == FONT_OK && !pthread_equal(owner.worker, pthread_self()));
+    render_cell cells[4]; uint64_t dirty = 0, row_byte = 0; uint32_t row_used = 0;
+    render_grid grid;
+    CHECK(render_grid_init(&grid, (render_dims){4,1,owner.cache.cell.cell_w,owner.cache.cell.cell_h},
+                           cells, 4, &dirty, 1) == RENDER_OK);
+    CHECK(font_runtime_bind(&owner, &grid) == FONT_OK);
+    layout_config cfg = {0}; cfg.fg = 0xffffff; cfg.glyph = font_runtime_glyph; cfg.glyph_ctx = &owner;
+    layout view;
+    CHECK(layout_init(&view, &grid, &cfg, &row_byte, &row_used) == LAYOUT_DONE);
+    piece_allocator allocator = piece_default_allocator(); piece_tree *tree = piece_create(&allocator);
+    static const uint8_t text[] = "\xc3\xa9 e\xcc\x81";
+    CHECK(tree && piece_init_copy(tree, text, sizeof text - 1u) == PIECE_OK);
+    CHECK(render_frame_begin(&grid, 1) == RENDER_OK);
+    CHECK(layout_begin(&view, tree, (layout_viewport){0,0,0,1}) == LAYOUT_DONE);
+    if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+    int result; unsigned slices = 0;
+    do { result = layout_run(&view); CHECK(++slices < 32u); } while (result == LAYOUT_MORE && slices < 32u);
+    if (edit_malloc_guard_active()) CHECK(edit_malloc_guard_end() == 0);
+    CHECK(result == LAYOUT_DONE && !layout_approximate(&view));
+    CHECK(cells[0].glyph_index != '?' && cells[2].glyph_index != '?');
+    CHECK(cells[0].atlas_slot >= 95u && cells[2].atlas_slot >= 95u);
+    CHECK(render_grid_validate(&grid) == RENDER_OK);
+    /* Independently rasterize covered U+00E9 and compare its atlas bytes. */
+    uint8_t expected[1920] = {0}; font_bitmap bitmap;
+    CHECK(font_raster_glyph(&owner.family.faces[0], 0xe9, &owner.cache.scratch, &bitmap) == FONT_OK);
+    CHECK(font_place_in_cell(&owner.family.faces[0], &bitmap, expected, grid.dims.cell_w, grid.dims.cell_h) == FONT_OK);
+    render_glyph glyph = grid.glyphs[cells[0].atlas_slot];
+    for (uint32_t y = 0; y < glyph.h; y++) CHECK(memcmp(expected + (size_t)y * glyph.w,
+        grid.pages[glyph.page].pixels + (size_t)(glyph.y + y) * grid.pages[glyph.page].stride + glyph.x, glyph.w) == 0);
+    piece_destroy(tree); work_pool_shutdown(pool); free(pool);
+    edit_arena_free(&storage); edit_arena_free(&files);
+    if (!failures) puts("P2-1 §29 GREEN: worker-prepared owner adopts through mailbox; Unicode grid/pixels match");
+}
+
 typedef struct fallback_adoption { font_fallback *fb; int got; } fallback_adoption;
 static void adopt_fallback(const work_msg *msg, void *arg)
 {
@@ -878,6 +1187,12 @@ int main(int argc, char **argv)
 {
     /* fc-match-compatible test child deliberately never returns. */
     if (argc > 1 && strcmp(argv[1], "-f") == 0 && getenv("FONT_REVIEW_CHILD")) {
+        if (strcmp(getenv("FONT_REVIEW_CHILD"), "inherited") == 0) {
+            pid_t descendant = fork();
+            if (descendant < 0) _exit(2);
+            if (descendant == 0) { usleep(3000000); _exit(0); }
+            _exit(0);
+        }
         for (;;) atomic_signal_fence(memory_order_seq_cst);
     }
     size_t len = 0;
@@ -896,6 +1211,17 @@ int main(int argc, char **argv)
         return failures ? 1 : 0;
     }
     if (getenv("FONT_REVIEW_FILE")) { test_file_rollback(); return failures ? 1 : 0; }
+    if (getenv("FONT_REVIEW_S9")) {
+        if (strcmp(getenv("FONT_REVIEW_S9"), "4") == 0) test_cff_coordinates();
+        else if (strcmp(getenv("FONT_REVIEW_S9"), "30") == 0) test_cff_errors(ttf, len);
+        else if (strcmp(getenv("FONT_REVIEW_S9"), "31") == 0) test_ui_outline_budget(ttf, len);
+        else if (strcmp(getenv("FONT_REVIEW_S9"), "32") == 0) test_discovery_inherited_stdout();
+        else if (strcmp(getenv("FONT_REVIEW_S9"), "29") == 0) test_runtime_owner();
+        else test_signed_offsets(ttf, len);
+        edit_arena_free(&a); free(ttf);
+        return failures ? 1 : 0;
+    }
+    test_signed_offsets(ttf, len);
     test_file_rollback();
     test_atlas_identity(ttf, len);
     if (getenv("FONT_REVIEW_IDENTITY")) return failures ? 1 : 0;
@@ -914,8 +1240,13 @@ int main(int argc, char **argv)
     test_atlas_px(ttf, len);
     test_font_bounds(ttf, len);
     test_ttc(ttf, len);
+    test_cff_coordinates();
+    test_cff_errors(ttf, len);
+    test_ui_outline_budget(ttf, len);
     test_cff_synthetic();
     test_cff_noto();
+    test_runtime_owner();
+    test_discovery_inherited_stdout();
     test_discovery_cancellation();
     test_cancelled_discovery();
     test_discovery_pressure();

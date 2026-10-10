@@ -3,7 +3,7 @@
 Review fixes: baked ASCII requires INIT SHA-256/face identity; full-advance
 Mono marks stay cell-relative; zero-advance proportional marks use the base
 pen; Unicode 15.1 default-ignorable controls preserve covered bases; full-span
-UTF-8 validation precedes cache admission. Parser/CFF internals unchanged.
+UTF-8 validation precedes cache admission. The edit-tkw continuation also guards signed offsets and CFF conversions/errors; see docs/decisions/edit-tkw.md.
 
 Cache: fixed-arena append-only pixels/slots through T5. Positive and separately
 bounded negative tables have fixed probe limits and independent key storage.
@@ -36,9 +36,7 @@ no runtime font-cache owner. Wiring that owner and rotating exhausted cache
 storage after T5 or quiescent shutdown with full damage/redraw remain outside
 this font/layout review fix. The font API and deferred integration test provide
 the status, correct-content retry and lifetime boundaries; no automatic editor
-cache retirement is claimed. A single raster call cannot
-be preempted; hard latency guarantees for complex individual glyphs require
-worker preparation. Full bidi/contextual shaping/color emoji remain out of scope.
+cache retirement is claimed. UI cache calls now admit bounded TT/CFF outlines, curve subdivision and bitmap work; excessive complexity returns FONT_ERR_INIT and may use a healthy fallback. General rasterization remains worker-only for larger workloads; scheduling cannot be given a hard wall-time guarantee. Full bidi/contextual shaping/color emoji remain out of scope.
 
 Verify: make all; DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0
 make check; make fuzz; FONT_FUZZ_UNICODE=1 ASAN_OPTIONS=detect_leaks=0
@@ -50,3 +48,27 @@ Final make all and make check exited zero; release allocation guards passed.
 Unicode, seeded Unicode and parser fuzz campaigns completed cleanly. The
 once-only loaded bench exited one on its long-cluster tail observation; this
 is TRACK and does not establish a timing gate verdict.
+
+edit-tkw / session 9: retained and verified the interrupted font changes.
+Font admission caps the whole buffer at INT_MAX and proves supported cmap
+relative additions before stb reads/narrows them. CFF preflight rejects
+coordinates outside output-vertex range and distinguishes interpreter failure
+from successful empty outlines; scaled endpoints/spans are checked before
+conversion/allocation. Foreground raster has structural outline, subdivision,
+point and scanline bounds. Isolated discovery owns a process group and bounds
+pipe draining even after the direct child is reaped. Fuzz raw seeds always
+select face zero; startup verifies every generated seed's A/B interpreter paths.
+
+font_runtime provides INIT reservation, worker family/cache preparation,
+authenticated mailbox adoption, grid binding and a layout callback. The editor
+hook and cache retirement sequence are documented in docs/decisions/edit-tkw.md;
+no src/editor changes or production editor Unicode integration are claimed.
+Session evidence and remaining integration work: docs/worker-reports/edit-tkw-s9.md.
+
+Session 9 final verification: make all and make check exited zero, clang
+ASan/UBSan with detect_leaks=0 and UBSan halt enabled, normal user on :99.
+Release font allocation guards and Unicode grid/pixel suite passed. Final
+CFF-seeded font fuzz ran the requested 60 s clean, with UBSan halt enabled.
+Leak-enabled rerun remains with the coordinator. Earlier shared-display
+clipboard interference and the namespace-root permission-fixture failure
+are recorded in the report; neither prompted out-of-scope source changes.

@@ -18,6 +18,8 @@
 static edit_arena arena;
 static int arena_ready;
 
+static int exercise_face(const uint8_t *data, size_t size, uint32_t index);
+
 /* P2.3e CFF seeds: FONT_FUZZ_SEED_DIR=<dir> writes the three synthetic OTFs
  * (cffseed_build variants 0..2) as seed files and exits; run the fuzzer with
  * that dir as corpus. Generated at run time, nothing vendored. */
@@ -25,19 +27,32 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     (void)argc; (void)argv;
     const char *dir = getenv("FONT_FUZZ_SEED_DIR");
-    if (!dir) return 0;
-    static uint8_t buf[4096];
+    uint8_t buf[4096];
     for (int v = 0; v < 3; v++) {
         cffseed_layout L;
         size_t n = cffseed_build(buf, sizeof buf, v, &L);
         if (n == 0 || n > sizeof buf) exit(2);
+        /* Verify that the driver actually admits each unchanged seed. */
+        REQUIRE(exercise_face(buf, n, 0) == 1);
+        font_t seed;
+        REQUIRE(font_init(&seed, buf, n) == FONT_OK && font_set_px(&seed, 15) == FONT_OK);
+        font_bitmap bitmap;
+        edit_arena_reset(&arena);
+        REQUIRE(font_raster_glyph(&seed, 'A', &arena, &bitmap) == FONT_OK && bitmap.pixels);
+        edit_arena_reset(&arena);
+        int result = font_raster_glyph(&seed, 'B', &arena, &bitmap);
+        REQUIRE(v == 1 ? result == FONT_ERR_INIT : result == FONT_OK && bitmap.pixels);
+        edit_arena_reset(&arena);
+        fprintf(stderr, "CFF seed %d: face zero initialization and A/B paths verified\n", v);
+        if (!dir) continue;
         char path[512];
         snprintf(path, sizeof path, "%s/cff_seed_%d.otf", dir, v);
         FILE *fp = fopen(path, "wb");
         if (!fp || fwrite(buf, 1, n, fp) != n) exit(2);
         fclose(fp);
     }
-    exit(0);
+    if (dir) exit(0);
+    return 0;
 }
 
 /* P4.11 mode uses only the trusted embedded face: arbitrary cluster bytes,
@@ -112,22 +127,20 @@ static int unicode_clusters(const uint8_t *data, size_t size)
     return 0;
 }
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+static int exercise_face(const uint8_t *data, size_t size, uint32_t index)
 {
-    if (getenv("FONT_FUZZ_UNICODE")) return unicode_clusters(data, size);
     if (!arena_ready) {
         REQUIRE(edit_arena_init(&arena, 4u << 20) == 0);
         arena_ready = 1;
     }
     if (size < 12) return 0;
-    uint32_t index = data[size - 1] & 3u;
     font_t f;
     int r = font_init_index(&f, data, size, index);
     REQUIRE(r == FONT_OK || r == FONT_ERR_INIT || r == FONT_ERR_ARG);
     if (r != FONT_OK) return 0;
     uint32_t px = 10u + (data[size / 2] % 3u) * 11u;
     REQUIRE(font_set_px(&f, px) == FONT_OK);
-    uint32_t cps[16] = { 'A', 'g', '@', 'W', 0xE9u, 0x20ACu, 0x4E2Du, 0x3042u, 0x2588u, 0x1F600u };
+    uint32_t cps[16] = { 'A', 'B', '@', 'W', 0xE9u, 0x20ACu, 0x4E2Du, 0x3042u, 0x2588u, 0x1F600u };
     for (size_t i = 10; i < 16; i++) {
         size_t at = (size_t)(i * 2654435761u) % (size - 3u);
         cps[i] = ((uint32_t)data[at] << 8 | data[at + 1]) % 0x30000u;
@@ -142,7 +155,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         REQUIRE(rr == FONT_OK || rr == FONT_ERR_MISSING || rr == FONT_ERR_INIT || rr == FONT_ERR_NOMEM);
         if (rr == FONT_OK) REQUIRE((b.pixels != NULL) == ((size_t)b.w * b.h > 0));
         edit_arena_reset_to_mark(&arena, mk);
+        int ur = font_raster_glyph_ui(&f, cps[i], &arena, &b);
+        REQUIRE(ur == FONT_OK || ur == FONT_ERR_MISSING || ur == FONT_ERR_INIT || ur == FONT_ERR_NOMEM);
+        edit_arena_reset_to_mark(&arena, mk);
         REQUIRE(edit_arena_mark(&arena) == mk);
+    }
+    return 1;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (getenv("FONT_FUZZ_UNICODE")) return unicode_clusters(data, size);
+    (void)exercise_face(data, size, 0);
+    /* Optional 0xff + four-byte face control prefix, independent of font
+     * bytes. Raw seeds always exercise face zero; prefixed TTCs also reach
+     * additional selected faces without a charstring byte choosing them. */
+    if (size > 5u && data[0] == 0xffu) {
+        uint32_t index = (uint32_t)data[1] << 24 | (uint32_t)data[2] << 16 |
+                         (uint32_t)data[3] << 8 | data[4];
+        (void)exercise_face(data + 5u, size - 5u, 0);
+        if (index) (void)exercise_face(data + 5u, size - 5u, index);
     }
     return 0;
 }

@@ -95,6 +95,15 @@ int  font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out);
 /* Rasterises cp into arena memory. FONT_ERR_MISSING for absent glyphs.
  * FONT_ERR_NOMEM leaves pixels NULL and the arena at its entry mark.
  * A font_t must not be rasterised concurrently (stb userdata is per-call). */
+/* UI cache admission: at most 256 expanded TT points / 16 components,
+ * or 2048 CFF steps / 256 vertices, 64x64 bitmap, bounded outline*box work.
+ * Excess complexity returns INIT; use general metrics/raster on a worker
+ * for content requiring a larger workload. No elapsed-time guarantee under
+ * descheduling; these are structural work bounds measured on the loaded box. */
+int font_glyph_ui_metrics(const font_t *f, uint32_t cp, font_metric *out);
+/* Same admission plus at most 4096 curve subdivision visits / 512 points.
+ * Scratch is rolled back on refusal; only this bounded raster API is UI-safe. */
+int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out);
 int  font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out);
 /* Composites a bitmap into a cell_w x cell_h R8 cell (caller zeroes it). */
 int  font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,
@@ -237,5 +246,45 @@ int font_cache_bind(font_cache *cache, render_grid *grid);
  * No fontconfig, I/O, malloc, or arena growth, including on cold misses. */
 int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
                      uint32_t width, uint32_t *slot);
+
+/* Worker-prepared runtime owner. Construct at INIT with exclusive, disjoint
+ * file/cache arenas. Config fallback (if present) must already be adopted and
+ * remain immutable until physical job completion. Submit prepare_job once;
+ * adopt only in a live work-mailbox callback. No owner/cache use by UI until
+ * adoption; prepare_job writes nothing after publishing. All font bytes,
+ * owner, arenas and atlas descriptors survive every borrowing backend T5 and
+ * physical work completion/message drain. Rebuild in a separate owner, then
+ * switch at a safe backend boundary with full relayout; reclaim at quiescence.
+ * No teardown API can prove the editor's backend retirement on its behalf. */
+#define FONT_RUNTIME_MSG_KIND 0xF002u
+typedef struct font_runtime_config {
+    /* Must identify the baked embedded primary; sizes supported by its atlas. */
+    const char *primary_path;
+    const font_fallback *fallback;
+    uint32_t px, max_pages;
+    size_t entries, key_bytes, scratch_bytes;
+} font_runtime_config;
+typedef struct font_runtime {
+    font_family family;
+    font_cache cache;
+    font_runtime_config config;
+    char primary_path[FONT_FALLBACK_PATH_MAX];
+    edit_arena *files, *storage;
+    pthread_t worker;
+    int adopted, result, staged_result, fallback_error;
+    uint32_t staged_generation, staged_slot, staged_epoch;
+} font_runtime;
+/* Backend reservation before submission: baked page + every reserved runtime
+ * page, entries+95 descriptors; rejected configs exceed renderer glyph cap. */
+int font_runtime_limits(const font_runtime_config *config, uint32_t *pages,
+                        size_t *glyphs, size_t *pixel_bytes);
+int font_runtime_init(font_runtime *owner, const font_runtime_config *config,
+                      edit_arena *files, edit_arena *storage);
+void font_runtime_prepare_job(work_ctx *ctx);
+int font_runtime_event(font_runtime *owner, const work_msg *msg);
+int font_runtime_bind(font_runtime *owner, render_grid *grid);
+/* layout callback; MORE until mailbox adoption, then bounded cache lookup. */
+int font_runtime_glyph(void *ctx, const uint8_t *bytes, size_t len,
+                       uint32_t width, uint32_t *slot);
 
 #endif

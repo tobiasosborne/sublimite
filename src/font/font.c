@@ -1,6 +1,8 @@
 /* src/font/font.c - see font.h. stb_truetype is vendored in vendor/. */
 #include "font/font.h"
 #include <setjmp.h>
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 
 /* stb_truetype allocations go to a per-call arena (Law 2: no libc malloc on
@@ -11,6 +13,7 @@
  * allocation dereferences NULL and its active-edge allocation asserts. */
 typedef struct font_stb_ctx {
     edit_arena *arena;
+    uint32_t work;
     jmp_buf     nomem;
 } font_stb_ctx;
 
@@ -51,6 +54,9 @@ static void font_stb_assert_fail(void)
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "../../vendor/stb_truetype.h"
 #pragma GCC diagnostic pop
+
+#include "font/cff_guard.h"
+#include "font/ui_raster.h"
 
 #include "font/atlas_ascii.h"
 #include "font/atlas_ascii_15.h"
@@ -193,7 +199,7 @@ static void glyf_range(const font_t *f, uint32_t g, uint64_t *o, uint64_t *e)
  * reads stay inside the glyph's own loca range. */
 #define FONT_COMPOSITE_DEPTH  6
 #define FONT_COMPOSITE_BUDGET 256
-static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget)
+static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget, int *points)
 {
     if (g >= f->num_glyphs) return 1;         /* stb returns an empty shape */
     uint64_t o, e;
@@ -205,6 +211,7 @@ static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget)
     int32_t nc = rds16(b, 0);
     if (nc == 0) return 1;
     if (nc > 0) {
+        if (points && nc > *points) return 0;
         uint64_t p = 10u + UINT64_C(2) * (uint32_t)nc + 2u;
         if (p > n) return 0;
         uint32_t prev = 0, npts = 0;
@@ -214,6 +221,10 @@ static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget)
             prev = ep;
         }
         npts = prev + 1u;
+        if (points) {
+            if (npts > (uint32_t)*points) return 0;
+            *points -= (int)npts;
+        }
         uint32_t lastcont = nc > 1 ? rd16(b, 10u + UINT64_C(2) * (uint32_t)(nc - 2)) + 1u : 0u;
         p += rd16(b, 10u + UINT64_C(2) * (uint32_t)nc);   /* instructions */
         uint64_t xb = 0, yb = 0;
@@ -248,7 +259,7 @@ static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget)
         else if (cflags & 0x40u) p += 4u;
         else if (cflags & 0x80u) p += 8u;
         if (p > n) return 0;
-        if (!shape_ok(f, gi, depth + 1, budget)) return 0;
+        if (!shape_ok(f, gi, depth + 1, budget, points)) return 0;
     } while (cflags & 0x20u);
     return 1;
 }
@@ -272,12 +283,13 @@ static int glyph_of(const font_t *f, uint32_t cp, int *g)
  * header (validated), but the CFF box runs the charstring interpreter, whose
  * asserts (e.g. a hintmask running off its charstring) are routed to a
  * boundary like the raster path: FONT_ERR_INIT, never a trap. */
-static int metrics_of_glyph(const font_t *f, int g, font_metric *m)
+static int metrics_of_glyph(const font_t *f, int g, font_metric *m, int ui)
 {
     int adv = 0, lsb = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     stbtt_GetGlyphHMetrics(cinfo_of(f), g, &adv, &lsb);
+    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
     if (f->glyf_len) {
-        stbtt_GetGlyphBitmapBox(cinfo_of(f), g, f->scale, f->scale, &x0, &y0, &x1, &y1);
+        (void)stbtt_GetGlyphBox(cinfo_of(f), g, &bx0, &by0, &bx1, &by1);
     } else {
         font_stb_ctx ctx;
         ctx.arena = NULL;
@@ -286,14 +298,34 @@ static int metrics_of_glyph(const font_t *f, int g, font_metric *m)
             return FONT_ERR_INIT;
         }
         font_stb_cur = &ctx;
-        stbtt_GetGlyphBitmapBox(cinfo_of(f), g, f->scale, f->scale, &x0, &y0, &x1, &y1);
+        stbtt__csctx bounds = STBTT__CSCTX_INIT(1);
+        if (!font_cff_run(cinfo_of(f), g, &bounds, ui ? 2048 : STBTT_CFF_MAX_STEPS, ui ? 256 : INT_MAX)) {
+            font_stb_cur = NULL;
+            return FONT_ERR_INIT;
+        }
+        bx0 = bounds.min_x; by0 = bounds.min_y;
+        bx1 = bounds.max_x; by1 = bounds.max_y;
         font_stb_cur = NULL;
     }
+    /* Match stb's float multiply/round, but prove the conversion first. */
+    double left = floorf((float)bx0 * f->scale);
+    double top = floorf(-(float)by1 * f->scale);
+    double right = ceilf((float)bx1 * f->scale);
+    double bottom = ceilf(-(float)by0 * f->scale);
+    if (!isfinite(left) || !isfinite(top) || !isfinite(right) || !isfinite(bottom) ||
+        left < INT_MIN || top < INT_MIN || right > INT_MAX || bottom > INT_MAX ||
+        left > INT_MAX || top > INT_MAX || right < INT_MIN || bottom < INT_MIN)
+        return FONT_ERR_INIT;
+    x0 = (int)left; y0 = (int)top; x1 = (int)right; y1 = (int)bottom;
+    int64_t w = (int64_t)x1 - x0, h = (int64_t)y1 - y0;
+    /* Bound output/scratch work before any bitmap allocation or stb pass. */
+    if (w < 0 || h < 0 || w > 4096 || h > 4096 || w * h > 16777216)
+        return FONT_ERR_INIT;
     m->advance = round_f((float)adv * f->scale);
     m->bearing_x = x0;
     m->bearing_y = y0;
-    m->w = x1 > x0 ? (uint32_t)(x1 - x0) : 0u;
-    m->h = y1 > y0 ? (uint32_t)(y1 - y0) : 0u;
+    m->w = x1 > x0 ? (uint32_t)((int64_t)x1 - x0) : 0u;
+    m->h = y1 > y0 ? (uint32_t)((int64_t)y1 - y0) : 0u;
     return FONT_OK;
 }
 
@@ -511,6 +543,8 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
     if (!f) return FONT_ERR_ARG;
     memset(f, 0, sizeof *f);
     if (!ttf || len < 12) return FONT_ERR_ARG;
+    /* stb stores table and face offsets in signed int, including additions. */
+    if (len > (size_t)INT_MAX) return FONT_ERR_INIT;
     uint64_t base = 0;
     uint32_t sfnt = rd32(ttf, 0);
     if (sfnt == 0x74746366u) {                  /* "ttcf" */
@@ -549,6 +583,20 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
     int32_t asc = rds16(ttf, hhea + 4), dsc = rds16(ttf, hhea + 6);
     if (asc <= 0 || dsc > 0) return FONT_ERR_INIT;                 /* cell_h = asc - dsc > 0 */
     if (cmap_n < 4u + UINT64_C(8) * rd16(ttf, cmap + 2)) return FONT_ERR_INIT;
+    /* stb reads every supported encoding offset, even records superseded by
+     * a later selection. Prove each relative addition in uint64_t before its
+     * ttULONG read and narrowing to index_map; checking afterwards is too late. */
+    for (uint32_t i = 0; i < rd16(ttf, cmap + 2); i++) {
+        uint64_t record = cmap + 4u + UINT64_C(8) * i;
+        uint32_t platform = rd16(ttf, record), encoding = rd16(ttf, record + 2u);
+        if (platform != STBTT_PLATFORM_ID_UNICODE &&
+            !(platform == STBTT_PLATFORM_ID_MICROSOFT &&
+              (encoding == STBTT_MS_EID_UNICODE_BMP || encoding == STBTT_MS_EID_UNICODE_FULL)))
+            continue;
+        uint64_t relative = rd32(ttf, record + 4u), absolute = cmap + relative;
+        if (relative > cmap_n || cmap_n - relative < 4u ||
+            absolute > (uint64_t)INT_MAX || !in_buf(len, absolute, 4u)) return FONT_ERR_INIT;
+    }
     uint32_t nhm = rd16(ttf, hhea + 34);
     if (nhm == 0 || nhm > ng || hmtx_n < UINT64_C(4) * nhm + UINT64_C(2) * (ng - nhm)) return FONT_ERR_INIT;
     if (have_glyf) {
@@ -607,7 +655,7 @@ int font_set_px(font_t *f, uint32_t px)
         int g = 0;
         font_metric m;
         if (glyph_of(f, cp, &g) != FONT_OK) continue;
-        if (metrics_of_glyph(f, g, &m) != FONT_OK) continue;
+        if (metrics_of_glyph(f, g, &m, 0) != FONT_OK) continue;
         if (m.advance > 0 && (uint32_t)m.advance > maxadv) maxadv = (uint32_t)m.advance;
     }
     f->cell.cell_w = maxadv;
@@ -628,10 +676,42 @@ int font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out)
     if (!f || !out || !f->data || f->px == 0) return FONT_ERR_ARG;
     int r = glyph_of(f, cp, &g);
     if (r != FONT_OK) return r;
-    return metrics_of_glyph(f, g, out);
+    return metrics_of_glyph(f, g, out, 0);
 }
 
-int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
+/* Foreground admission is deliberately narrower than worker rasterization.
+ * Bound expanded outlines, interpreter work and scanline/output work before
+ * the cache invokes stb. Unsupported complexity is an INIT error, not blank
+ * successful content or a missing-coverage verdict. */
+int font_glyph_ui_metrics(const font_t *f, uint32_t cp, font_metric *out)
+{
+    if (!f || !out || !f->data || !f->px) return FONT_ERR_ARG;
+    int g = 0;
+    int result = glyph_of(f, cp, &g);
+    if (result != FONT_OK) return result;
+    uint32_t vertices = 0;
+    if (f->glyf_len) {
+        int components = 16, points = 256;
+        if (!shape_ok(f, (uint32_t)g, 0, &components, &points)) return FONT_ERR_INIT;
+        vertices = (uint32_t)(256 - points) * 2u + 16u;
+    } else {
+        font_stb_ctx ctx; ctx.arena = NULL;
+        if (setjmp(ctx.nomem)) { font_stb_cur = NULL; return FONT_ERR_INIT; }
+        font_stb_cur = &ctx;
+        stbtt__csctx bounds = STBTT__CSCTX_INIT(1);
+        int ok = font_cff_run(cinfo_of(f), g, &bounds, 2048, 256);
+        font_stb_cur = NULL;
+        if (!ok) return FONT_ERR_INIT;
+        vertices = (uint32_t)bounds.num_vertices;
+    }
+    result = metrics_of_glyph(f, g, out, 1);
+    if (result != FONT_OK) return result;
+    if (out->w > 64u || out->h > 64u ||
+        (uint64_t)vertices * (out->w + out->h) > 16384u) return FONT_ERR_INIT;
+    return FONT_OK;
+}
+
+static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int ui)
 {
     int g = 0;
     if (!f || !arena || !out || !f->data || f->px == 0) return FONT_ERR_ARG;
@@ -641,11 +721,11 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     memset(&out->m, 0, sizeof out->m);
     int r = glyph_of(f, cp, &g);
     if (r != FONT_OK) return r;
-    if (f->glyf_len) {      /* stb walks the outline unchecked: prove it in-bounds first */
+    if (f->glyf_len && !ui) { /* UI admission below performs the bounded proof. */
         int budget = FONT_COMPOSITE_BUDGET;
-        if (!shape_ok(f, (uint32_t)g, 0, &budget)) return FONT_ERR_INIT;
+        if (!shape_ok(f, (uint32_t)g, 0, &budget, NULL)) return FONT_ERR_INIT;
     }
-    r = metrics_of_glyph(f, g, &out->m);
+    r = ui ? font_glyph_ui_metrics(f, cp, &out->m) : metrics_of_glyph(f, g, &out->m, 0);
     if (r != FONT_OK) { out->m.w = out->m.h = 0; return r; }
     out->w = out->m.w;
     out->h = out->m.h;
@@ -660,6 +740,7 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     edit_arena_mark_t mk = edit_arena_mark(arena);
     font_stb_ctx ctx;
     ctx.arena = arena;
+    ctx.work = 0;
     /* All stb-owned storage is in this arena and STBTT_free is a no-op, so
      * unwinding on allocation failure needs only the arena rewind. start is
      * unchanged after setjmp; do not read modified automatic locals here. */
@@ -680,13 +761,50 @@ int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *ou
     font_stb_cur = &ctx;
     info_of(f)->userdata = &ctx;
     /* stb writes a box-sized bitmap whose origin is the box's top-left. */
-    stbtt_MakeGlyphBitmap(cinfo_of(f), px, (int)out->w, (int)out->h, (int)out->w,
-                          f->scale, f->scale, g);
+    if (ui) {
+        stbtt_vertex *vertices = NULL;
+        int count;
+        if (f->glyf_len) count = stbtt_GetGlyphShape(cinfo_of(f), g, &vertices);
+        else {
+            stbtt__csctx count_ctx = STBTT__CSCTX_INIT(1);
+            if (!font_cff_run(cinfo_of(f), g, &count_ctx, 2048, 256)) font_stb_assert_fail();
+            count = count_ctx.num_vertices;
+            vertices = font_stb_alloc((size_t)count * sizeof *vertices, &ctx);
+            stbtt__csctx output_ctx = STBTT__CSCTX_INIT(0);
+            output_ctx.pvertices = vertices;
+            if (!font_cff_run(cinfo_of(f), g, &output_ctx, 2048, 256) ||
+                output_ctx.num_vertices != count) font_stb_assert_fail();
+        }
+        if (count > 528) font_stb_assert_fail();
+        int *lengths = NULL, contours = 0;
+        stbtt__point *points = font_ui_flatten(vertices, count, 0.35f / f->scale,
+                                              &lengths, &contours, &ctx);
+        if (points) {
+            uint32_t total = 0;
+            for (int i = 0; i < contours; i++) total += (uint32_t)lengths[i];
+            if ((uint64_t)total * (out->w + out->h) > 16384u) font_stb_assert_fail();
+            stbtt__bitmap bitmap = {(int)out->w, (int)out->h, (int)out->w, px};
+            stbtt__rasterize(&bitmap, points, lengths, contours, f->scale, f->scale,
+                            0, 0, out->m.bearing_x, out->m.bearing_y, 1, &ctx);
+        }
+    } else {
+        stbtt_MakeGlyphBitmap(cinfo_of(f), px, (int)out->w, (int)out->h, (int)out->w,
+                              f->scale, f->scale, g);
+    }
     font_stb_cur = NULL;
     info_of(f)->userdata = NULL;
     edit_arena_reset_to_mark(arena, mk);
     out->pixels = px;
     return FONT_OK;
+}
+
+int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
+{
+    return raster_glyph(f, cp, arena, out, 0);
+}
+int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
+{
+    return raster_glyph(f, cp, arena, out, 1);
 }
 
 int font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,
@@ -741,7 +859,7 @@ static const font_ascii_atlas *atlas_matching(const font_t *f)
         font_metric m;
         const font_metric *b = &a->metrics[cp - FONT_ASCII_FIRST];
         if (glyph_of(f, cp, &g) != FONT_OK) return NULL;
-        if (metrics_of_glyph(f, g, &m) != FONT_OK) return NULL;
+        if (metrics_of_glyph(f, g, &m, 0) != FONT_OK) return NULL;
         if (m.advance != b->advance || m.bearing_x != b->bearing_x ||
             m.bearing_y != b->bearing_y || m.w != b->w || m.h != b->h)
             return NULL;
