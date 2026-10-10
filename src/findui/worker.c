@@ -7,18 +7,26 @@
 static void scan_trace(const findui_slot *slot, uint32_t generation)
 { if (slot->hook) slot->hook(slot->hook_user, generation); }
 
-/* Retrying a full mailbox preserves exact counts/ranges. Sleeping here uses
- * no CPU slice and is interrupted logically by the next cancellation poll.
- * No locks, UI callbacks or UI-owned result storage are touched by the job. */
+/* Search produces a bounded private outbox. Publication is a continuation:
+ * a full mailbox returns the sole bulk lane to its FIFO immediately. */
 static bool publish(work_ctx *context, const work_msg *message)
 {
     findui_slot *slot = context->arg;
-    while (!work_should_stop(context) && !file_snapshot_faulted(slot->snapshot)) {
-        if (work_publish(context, message)) return true;
-        const struct timespec delay = {0, 100000};
-        (void)nanosleep(&delay, NULL);
+    if (work_should_stop(context) || file_snapshot_faulted(slot->snapshot)) return false;
+    if (!slot->outbox_count && work_publish(context, message)) return true;
+    EDIT_ASSERT(slot->outbox_count < slot->outbox_capacity);
+    slot->outbox[slot->outbox_count++] = *message;
+    return true;
+}
+static void deliver(work_ctx *context, findui_slot *slot)
+{
+    while (slot->outbox_next < slot->outbox_count && !work_should_stop(context) &&
+           !file_snapshot_faulted(slot->snapshot)) {
+        if (!work_publish(context, &slot->outbox[slot->outbox_next])) {
+            (void)work_continue(context); return;
+        }
+        slot->outbox_next++;
     }
-    return false;
 }
 static bool flush(work_ctx *context, findui_batch *batch, size_t *count)
 {
@@ -121,7 +129,7 @@ static find_code program(findui_slot *slot, work_ctx *context, find_regex **rege
                          size_t *error_offset)
 {
     *regex = NULL;
-    if (!slot->options.regex && slot->options.match_case) return FIND_OK;
+    if (!slot->options.regex) return FIND_OK;
     if (work_should_stop(context)) return FIND_CANCELLED;
     if (slot->options.regex) {
         find_code code = find_regex_compile(slot->program, find_regex_bytes(),
@@ -170,10 +178,13 @@ typedef struct visitor_output {
     work_ctx *context;
     findui_batch *batch;
     size_t *batched;
+    const findui_slot *slot;
 } visitor_output;
 static bool emit_range(void *user,uint64_t ordinal,find_capture range)
 {
     visitor_output *out=user;
+    if (out->slot->page_request && (ordinal < out->slot->page_first ||
+        ordinal - out->slot->page_first >= out->slot->page_count)) return true;
     if (*out->batched && ordinal!=out->batch->ordinal+*out->batched &&
         !flush(out->context,out->batch,out->batched)) return false;
     if (!*out->batched) out->batch->ordinal=ordinal;
@@ -183,6 +194,7 @@ static bool emit_range(void *user,uint64_t ordinal,find_capture range)
 void findui_worker_run(work_ctx *context)
 {
     findui_slot *slot = context->arg;
+    if (slot->publishing) { deliver(context, slot); return; }
     find_regex *regex;
     size_t error_offset = 0;
     find_code code = program(slot, context, &regex, &error_offset);
@@ -193,18 +205,20 @@ void findui_worker_run(work_ctx *context)
     findui_batch batch = {.owner = slot->owner};
     size_t batched = 0;
     uint64_t visible=FIND_UNSET;
-    if (code==FIND_OK && !slot->options.whole_word) {
-        visitor_output output={context,&batch,&batched};
+    if (code==FIND_OK && (!slot->options.whole_word || !slot->options.regex)) {
+        visitor_output output={context,&batch,&batched,slot};
         find_visit visit={.prefix_capacity=slot->cache_capacity,
                           .visible_capacity=slot->visible_capacity,
                           .wanted=slot->desired_index,.window_start=slot->window_start,
                           .window_end=slot->window_end,.emit=emit_range,.user=&output};
         scan_trace(slot,context->generation);
         code=regex ? find_regex_visit(&source,regex,slot->scratch,FIND_MAX_SCRATCH_BYTES,&control,&visit)
-                   : find_literal_visit(&source,slot->query,slot->query_length,&control,&visit);
+                   : slot->options.match_case && !slot->options.whole_word && !(slot->window_request && slot->query_length == 1) ? find_literal_visit(&source,slot->query,slot->query_length,&control,&visit)
+                   : findui_literal_visit(slot,context,&visit);
         total=visit.total; visible=visit.visible;
     }
-    while (slot->options.whole_word && code == FIND_OK && !work_should_stop(context)) {
+    if (slot->options.regex && slot->options.whole_word) visible = 0;
+    while (slot->options.regex && slot->options.whole_word && code == FIND_OK && !work_should_stop(context)) {
         find_match match;
         scan_trace(slot, context->generation);
         code = regex ? find_regex_next_budget(&source, regex, offset, slot->scratch,
@@ -218,14 +232,13 @@ void findui_worker_run(work_ctx *context)
         if (code != FIND_OK) break;
         if (accepted) {
             if (total == UINT64_MAX) { code = FIND_ERR_LIMIT; break; }
+            bool shown = intersects(range, slot->window_start, slot->window_end);
             bool wanted = total < slot->cache_capacity || total == slot->desired_index ||
-                          intersects(range, slot->window_start, slot->window_end);
+                          (shown && visible < slot->visible_capacity);
+            if (shown) visible++;
             if (wanted) {
-                if (batched && total != batch.ordinal + batched && !flush(context, &batch, &batched)) return;
-                if (!batched) batch.ordinal = total;
-                batch.ranges[batched++] = range;
-                /* Flush a first match immediately for incremental feedback. */
-                if ((batched == 2 || total == 0) && !flush(context, &batch, &batched)) return;
+                visitor_output output = {context, &batch, &batched, slot};
+                if (!emit_range(&output, total, (find_capture){range.start, range.end})) return;
             }
             total++;
         }
@@ -243,5 +256,5 @@ void findui_worker_run(work_ctx *context)
                        .error_offset=error_offset,.code=(int32_t)code,.visible=visible};
     work_msg message = {.kind = FINDUI_MSG_DONE, .generation = context->generation};
     memcpy(message.data, &done, sizeof done);
-    (void)publish(context, &message);
+    if (publish(context, &message)) { slot->publishing = true; deliver(context, slot); }
 }

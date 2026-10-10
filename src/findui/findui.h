@@ -7,6 +7,7 @@
 #include "undo/undo.h"
 
 #define FINDUI_QUERY_BYTES FIND_MAX_PATTERN
+#define FINDUI_REPLACE_BYTES 8192u
 #define FINDUI_NO_INDEX UINT64_MAX
 #define FINDUI_MSG_ONE UINT32_C(0x46490101)
 #define FINDUI_MSG_TWO UINT32_C(0x46490102)
@@ -61,8 +62,27 @@ findui_state findui_get_state(const findui_panel *panel);
 /* Retains snapshot; source change invalidates ALL old results, including when
  * the length stays the same. revision is the host's monotonically changing
  * document identity/version. Window is half-open; results keep absolute byte
- * offsets. A changed window restarts on the worker, so late windows work even
- * when the first-match cache fills. Empty query means no matches, also regex. */
+ * offsets. Window requests retain count, selection and first-cache identity.
+ * A running count finishes without restart; a separate worker request refreshes
+ * highlights. Single-byte literal windows scan only their requested range. Empty query means no matches, also regex. */
+/* Full source storage lease: retain covers snapshot headers/nodes, allocator
+ * context, arena and original mapping, through final snapshot release. Hooks
+ * run on the UI owner. Final release is only in explicit maintenance/disposal,
+ * never worker completion or typing service. identity is nonzero per source.
+ * Legacy set_source requires that full storage already outlive panel disposal.
+ * Leased source changes may return BUSY until maintenance drains retirements.
+ * The host may evict/free storage only after source_retired acknowledges it;
+ * save/other snapshot owners need their own leases and acknowledgements. */
+typedef struct findui_source_lease {
+    void *user;
+    uint64_t identity;
+    void (*retain)(void *user);
+    void (*release)(void *user);
+} findui_source_lease;
+findui_code findui_set_source_leased(findui_panel *panel, piece_snapshot *snapshot,
+                                    uint64_t revision, const findui_source_lease *lease);
+findui_code findui_maintain(findui_panel *panel); /* explicit off-input maintenance */
+bool findui_source_retired(const findui_panel *panel, void *user, uint64_t identity);
 findui_code findui_set_source(findui_panel *panel, piece_snapshot *snapshot,
                              uint64_t revision);
 findui_code findui_set_window(findui_panel *panel, uint64_t start, uint64_t end);
@@ -85,6 +105,25 @@ findui_code findui_next(findui_panel *panel, int direction, findui_range *select
 findui_code findui_highlights(const findui_panel *panel, uint64_t start, uint64_t end,
                              findui_range *ranges, size_t capacity, size_t *count);
 
+/* Optional host mutation adapter. The host preflights its index/history/journal
+ * capacity before a group opens. Each bounded mutation callback owns undo plus
+ * all editor bookkeeping, including a successful edit followed by a host error.
+ * changed reports that prefix independently of error. Callbacks are UI-only,
+ * allocation-free and non-reentrant. Storage outlives the replacement group.
+ * The standalone undo fallback requires the caller to supply its own binding;
+ * it cannot update an editor through an opaque undo_log. */
+typedef struct findui_mutation_result { int error; bool changed; } findui_mutation_result;
+typedef struct findui_mutation_host {
+    void *user;
+    int (*preflight)(void *user, size_t maximum_operations, uint64_t maximum_deleted_bytes,
+                     size_t replacement_bytes);
+    findui_mutation_result (*delete_)(void *user, undo_log *undo, uint64_t off, uint64_t bytes,
+                                     uint64_t time_ns, const undo_state *before, const undo_state *after);
+    findui_mutation_result (*insert)(void *user, undo_log *undo, uint64_t off, const uint8_t *bytes,
+                                    size_t length, uint64_t time_ns, const undo_state *before, const undo_state *after);
+} findui_mutation_host;
+findui_code findui_set_mutation_host(findui_panel *panel, const findui_mutation_host *host);
+
 /* Literal replacement bytes, including in regex mode. Host must bind the
  * SAME tree/version used to take the source snapshot; revision detects stale
  * results without scanning the live tree. record_limit is the host-guaranteed
@@ -92,10 +131,15 @@ findui_code findui_highlights(const findui_panel *panel, uint64_t start, uint64_
  * budgets eight delete spans plus one insert per match and existing records.
  * Begin gathers only worker-produced ranges, applies nothing, opens one group.
  * Step applies right-to-left up to match_budget/deadline_ns (0=no deadline).
+ * Cache overflow uses worker-fetched immutable pages; host keeps routing mailbox
+ * messages and calling service between steps. One delete slice is at most
+ * FINDUI_REPLACE_BYTES. A partially deleted match yields MORE with replaced=0.
+ * Cancel/failure preserves that partial match in the same undo group. Regex
+ * admission conservatively uses source bytes to bound sliced undo records.
  * MORE keeps the group open: host defers other document edits/replay. A failure
  * closes the successful prefix as one undo group and reports the undo error.
- * Cancel closes the prefix too. One operation can exceed a time slice under
- * the frozen undo/piece API. No automatic replacement scan on the UI thread. */
+ * Cancel closes the prefix too. Deadlines are checked between bounded byte
+ * slices and before insertion; OS descheduling can exceed wall-time deadlines. No automatic replacement scan on the UI thread. */
 findui_code findui_replace_one(findui_panel *panel, undo_log *undo,
                               uint64_t revision, size_t record_limit,
                               uint64_t time_ns, const undo_state *before,

@@ -136,8 +136,8 @@ static int cancel_worker(void *argument)
 }
 int main(int argc,char **argv)
 {
-    if (argc>1 && strcmp(argv[1],"--count")==0) {
-        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",3,false};
+    if (argc>1 && (strcmp(argv[1],"--count")==0 || strcmp(argv[1],"--word")==0)) {
+        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",3,false,strcmp(argv[1],"--word")==0};
         for (int i=2;i<argc;i++) {
             if (strcmp(argv[i],"--gate")==0) args.track=false;
             else if (strcmp(argv[i],"--track")==0) args.track=true;

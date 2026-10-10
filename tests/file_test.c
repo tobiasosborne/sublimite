@@ -642,7 +642,8 @@ static size_t p1_span(void *ctx, uint64_t off, const uint8_t **p)
 static void p1_find_hook(void *ctx, uint32_t generation)
 {
     p1_source *s = ctx; (void)generation;
-    if (s->inject && !s->injected && ++s->find_calls == 2)
+    /* The persistent literal visitor starts one scan, rather than one per match. */
+    if (s->inject && !s->injected && ++s->find_calls == 1)
         s->injected = file_test_recover(s->address);
 }
 static void p1_find_receive(const work_msg *msg, void *ctx)

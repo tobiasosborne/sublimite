@@ -1,3 +1,28 @@
+# edit-lez — P4-modules-2 §§21–30, session 9
+
+Incomplete bead. Implemented literal ASCII folding, persistent/SIMD literal
+word counting, bounded word publication, resumable mailbox delivery, retained
+viewport count/selection, independent first-offset cache, paged replacement,
+byte-sliced large-match deletion, host mutation adapter and full source leases.
+
+Remaining: generic regex whole-word visitor; bounded multi-byte/regex viewport
+scans and immediate window priority; actual editor mutation binding; editor
+buffer eviction/reload and independent save-storage leases. Page fetching
+rescans the immutable source. Regex undo admission is conservative. Host and
+lease APIs require coordinator integration; legacy standalone APIs remain.
+
+Red/green transcripts, loaded TRACK comparisons and final verification status:
+[mandatory worker report](../../docs/worker-reports/edit-lez-s9.md).
+Design/lifetime contract: [decision](../../docs/decisions/edit-lez.md).
+Final GCC 13 make all and Clang 18 ASan/UBSan make check exited 0:
+59 sanitizer binaries plus replay CLI passed, using Xvfb :99 only and
+ASAN_OPTIONS=detect_leaks=0. Final findui fuzz: (M)[AC]14992 runs in
+(M)[AC]61 seconds, clean. Release typing allocator guard and diff checks pass.
+Coordinator must rerun LeakSanitizer enabled and keep partial findings open.
+No new globals, typing allocation, frozen find-header or editor-internal edits.
+
+---
+
 # edit-4w1.58 — P1-1 §§7–11, session 8
 
 Completed bounded dense popcount counting, core visitor integration for the

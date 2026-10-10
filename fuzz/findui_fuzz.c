@@ -220,6 +220,11 @@ static void map_release(void *ctx)
     mapping_lease *lease = ctx;
     if (atomic_fetch_sub(&lease->refs, 1) == 1) { free(lease->bytes); lease->bytes = NULL; }
 }
+static void fill_mailbox(work_ctx *context)
+{
+    work_msg message = {0};
+    for (size_t i = 0; i < WORK_MAILBOX_CAP; i++) MUST(work_publish(context, &message));
+}
 static void capacity_and_lifecycle(const uint8_t *data, size_t size)
 {
     if (!size || !(data[0] & 0x80u)) return;
@@ -241,9 +246,15 @@ static void capacity_and_lifecycle(const uint8_t *data, size_t size)
     bind(&panel, tree, 1); MUST(findui_show(&panel, true, false) == FINDUI_OK);
     MUST(findui_set_window(&panel, 0, 1024) == FINDUI_OK);
     MUST(findui_set_options(&panel, (findui_options){false, true, true}) == FINDUI_OK);
+    /* Bounded search output no longer fills a mailbox by itself. Saturate it
+     * independently so the search must retain its snapshot while publishing. */
+    work_handle filler = work_submit(pool, (work_job){fill_mailbox, NULL, 1, WORK_BULK});
+    MUST(filler.epoch);
+    for (size_t i = 0; i < 100000 && !work_handle_finished(pool, filler); i++) pause_worker();
+    MUST(work_handle_finished(pool, filler));
     MUST(findui_set_query(&panel, (const uint8_t *)"a", 1) == FINDUI_OK);
-    /* Whole-word output fills the mailbox. No drain means its worker still
-     * owns the mapped snapshot when source/query/window edits cancel it. */
+    /* No drain means its worker still owns the mapped snapshot when
+     * source/query/window edits cancel it. */
     for (size_t i = 0; i < 100000 && !atomic_load(&pool->dropped_full); i++) pause_worker();
     MUST(atomic_load(&pool->dropped_full));
     piece_destroy(tree); tree = NULL; MUST(atomic_load(&lease.refs));
@@ -356,9 +367,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 undo_state before = {{0}}, after = {{0}};
                 findui_code code = all ? findui_replace_all(&panel, &undo, revision, 65536, i, &before, &after)
                                       : findui_replace_one(&panel, &undo, revision, 65536, i, &before, &after);
-                if (all && m->count > m->cache_capacity) {
-                    MUST(code == FINDUI_ERR_LIMIT); continue;
-                }
                 MUST(code == FINDUI_OK); size_t total = 0, replaced;
                 MUST(findui_replace_step(&panel, 1, 1, &replaced) == FINDUI_MORE && replaced == 0);
                 if (b & 0x80u) {
@@ -366,8 +374,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                     compare(&panel, pool, tree, m); continue;
                 }
                 if (inject) fault.fail_at = fault.calls + 1u + a % 8u;
-                do { code = findui_replace_step(&panel, 1u + b % 4u, 0, &replaced); total += replaced; }
-                while (code == FINDUI_MORE);
+                do {
+                    MUST(findui_service(&panel) <= FINDUI_MORE);
+                    (void)work_mailbox_drain(pool, route, &panel);
+                    code = findui_replace_step(&panel, 1u + b % 4u, 0, &replaced); total += replaced;
+                    if (code == FINDUI_MORE) pause_worker();
+                } while (code == FINDUI_MORE);
                 fault.fail_at = 0;
                 if (inject) {
                     MUST(code == FINDUI_OK || code == FINDUI_ERR_UNDO);
@@ -399,8 +411,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else if (op == 13) {
             uint64_t start = a % (m->length + 1), end = b % (m->length + 1);
             if (start > end) { uint64_t swap = start; start = end; end = swap; }
-            if ((start != m->window_start || end != m->window_end) &&
-                findui_get_state(&panel).match_index == FINDUI_NO_INDEX) m->selected = 0;
             m->window_start = start; m->window_end = end;
             MUST(findui_set_window(&panel, start, end) == FINDUI_OK);
         }
