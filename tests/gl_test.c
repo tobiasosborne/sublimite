@@ -46,6 +46,7 @@ static xcb_generic_event_t *gl_review_poll(xcb_connection_t *conn, xcb_special_e
 void gl_review_plat_shutdown(plat *p);
 #define plat_init gl_review_plat_init
 #define plat_map gl_review_plat_map
+#define plat_set_present_events gl_review_plat_set_present_events
 #define plat_set_blink gl_review_plat_set_blink
 #define plat_quit gl_review_plat_quit
 #define plat_run gl_review_plat_run
@@ -63,6 +64,7 @@ void gl_review_plat_shutdown(plat *p);
 #undef dispatch
 #undef plat_init
 #undef plat_map
+#undef plat_set_present_events
 #undef plat_set_blink
 #undef plat_quit
 #undef plat_run

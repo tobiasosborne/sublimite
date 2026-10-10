@@ -1,6 +1,8 @@
 #include "editor/private.h"
 #include "font/font.h"
 #include "trace/trace.h"
+#include "raster/raster.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -26,6 +28,21 @@ static void init_result(const work_msg *msg, void *ctx)
     if (msg->kind != UINT32_C(0x4544494e)) return;
     memcpy(&a->result, msg->data, sizeof a->result); a->received = true;
 }
+static int init_backend(editor *e, render_config config, void *state)
+{
+    backend_init arg = {e, config, state, RENDER_ERR_INIT, false};
+    work_handle handle = work_submit(&e->pool, (work_job){init_worker, &arg, 0, WORK_BULK});
+    if (!handle.epoch) return EDITOR_ERR_MEMORY;
+    /* Retain the argument and arena state until both mailbox receipt and
+     * physical completion, including before reclaiming a failed attempt. */
+    while (!arg.received || !work_handle_finished(&e->pool, handle)) {
+        (void)work_mailbox_receive(&e->pool, handle, 0, init_result, &arg);
+        if (arg.received && work_handle_finished(&e->pool, handle)) break;
+        struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
+        (void)poll(&ready, 1, 1);
+    }
+    return arg.result;
+}
 void editor_close(editor *e)
 {
     if (!e) return;
@@ -50,6 +67,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     *out = NULL;
     render_backend_info info;
     if (render_backend_query(backend, &info)) return EDITOR_ERR_ARG;
+    render_backend fallback = {0};
+    bool may_fallback = config->raster_fallback && (info.capabilities & RENDER_CAP_GPU);
+    if (may_fallback && render_cpu_backend(&fallback)) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
     e->poll_fd = -1; e->drag_tab = SIZE_MAX;
@@ -68,7 +88,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->buffer_capacity = live + closed;
     rc = tabs_init(&e->tabs, live, closed); if (rc) goto fail;
     e->tabs_ready = true;
-    uint32_t nraster = (backend->info.capabilities & RENDER_CAP_RASTER_POOL) ? 4u : 0u;
+    uint32_t nraster = (may_fallback || (info.capabilities & RENDER_CAP_RASTER_POOL)) ? 4u : 0u;
     if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
     e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
@@ -77,7 +97,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
     size_t reserve = 2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         (size_t)e->max_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
-        e->buffer_capacity * sizeof(editor_buffer *) + backend->info.state_size + 2u * 1024u * 1024u;
+        e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
+        (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) + 2u * 1024u * 1024u;
     rc = edit_arena_init(&e->arena, reserve); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);
     if (!e->buffers) { rc = EDITOR_ERR_MEMORY; goto fail; }
@@ -124,23 +145,33 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         rc = plat_init(&e->platform, &pc); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
     }
+    edit_arena_mark_t backend_mark = edit_arena_mark(&e->arena);
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
     if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_config render = {.dims = dims, .max_width = e->max_cols * dims.cell_w, .max_height = e->max_rows * dims.cell_h,
         .max_cells = cells, .max_glyphs = LAYOUT_ASCII_GLYPHS, .max_pages = 1, .max_atlas_bytes = atlas->pixels_len,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool};
-    backend_init arg = {e, render, state, RENDER_ERR_INIT, false};
-    work_handle handle = work_submit(&e->pool, (work_job){init_worker, &arg, 0, WORK_BULK});
-    if (!handle.epoch) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    /* The UI does not inspect backend state until receiving the immutable
-     * result. Retain initialization storage until physical job completion. */
-    while (!arg.received || !work_handle_finished(&e->pool, handle)) {
-        (void)work_mailbox_receive(&e->pool, handle, 0, init_result, &arg);
-        if (arg.received && work_handle_finished(&e->pool, handle)) break;
-        struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
-        (void)poll(&ready, 1, 1);
+    rc = init_backend(e, render, state);
+    if (rc && may_fallback) {
+        e->stats.backend_init_error = rc;
+        const char *reason = rc == RENDER_ERR_UNSUPPORTED ? "EGL/GL/Present unavailable" :
+            rc == RENDER_ERR_INIT ? "EGL/GL initialization failed" :
+            rc == RENDER_ERR_ARG ? "invalid GL configuration" : "backend initialization error";
+        fprintf(stderr, "sublimite: EGL init failed: %s (code=%d); using raster; no retry\n", reason, rc);
+        /* init owns rollback of its native/heap resources on failure (GL's
+         * gl_release). The editor owns the state storage: reclaim the failed
+         * attempt before replacing its descriptor. editor_close shuts down
+         * the successful backend before freeing that same arena. */
+        edit_arena_reset_to_mark(&e->arena, backend_mark);
+        *backend = fallback;
+        state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
+        if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        rc = init_backend(e, render, state);
     }
-    rc = arg.result; if (rc) goto fail;
+    if (rc) goto fail;
+    if (e->has_platform && (backend->info.capabilities & RENDER_CAP_RASTER_POOL)) {
+        rc = plat_set_present_events(&e->platform, false); if (rc) goto fail;
+    }
     if (config->journal_path) {
         rc = journal_open(&e->journal, config->journal_path, &e->pool, NULL); if (rc) goto fail;
         journal_set_message_handler(e->journal, editor_route_work, e);

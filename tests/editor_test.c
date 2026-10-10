@@ -1,6 +1,7 @@
 #include "editor/editor.h"
 #include "editor/private.h"
 #include "raster/raster.h"
+#include "gl/gl.h"
 #include "base/base.h"
 #include "trace/trace.h"
 #include "journal/journal.h"
@@ -629,14 +630,169 @@ static int review_suite(const char *only)
             (only && (!strcmp(only, "all") || !strcmp(only, cases[i].name)))) failed |= cases[i].fn();
     return failed;
 }
-int main(void)
+static int backend_selection(void)
+{
+    render_backend b = {0};
+    T(editor_backend_select(&b, NULL) == 0);
+    T((b.info.capabilities & RENDER_CAP_GPU) != 0);
+    T(editor_backend_select(&b, "gl") == 0);
+    T((b.info.capabilities & RENDER_CAP_GPU) != 0);
+    T(editor_backend_select(&b, "raster") == 0);
+    T((b.info.capabilities & RENDER_CAP_RASTER_POOL) != 0);
+    render_backend saved = b;
+    T(editor_backend_select(&b, "typo") == EDITOR_ERR_ARG);
+    T(memcmp(&b, &saved, sizeof b) == 0);
+    puts("editor_test: default EGL and gl/raster override passed"); return 0;
+}
+static int injected_gpu_init_failure(render_backend *b, const render_config *cfg)
+{ return worker_failed_init(b, cfg); }
+static int backend_fallback_case(bool injected)
+{
+    render_backend b = {0}; T(editor_backend_select(&b, NULL) == 0);
+    editor_config cfg = {.cols = 32, .rows = 8, .raster_fallback = true};
+    /* A deterministic init return tests the selected default independently
+     * of native capabilities; the loader seam also exercises real cleanup. */
+    if (injected) b.ops.init = injected_gpu_init_failure;
+    else T(setenv("EDIT_GL_EGL_LIBRARY", "/tmp/edit-zzj.15-no-such-EGL.so", 1) == 0);
+    editor *e = NULL;
+    FILE *log = tmpfile(); T(log != NULL);
+    int saved_stderr = dup(STDERR_FILENO); T(saved_stderr >= 0);
+    T(dup2(fileno(log), STDERR_FILENO) >= 0);
+    int opened = editor_open(&e, &cfg, &b);
+    T(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    T(opened == 0);
+    T(editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
+    T((b.info.capabilities & RENDER_CAP_RASTER_POOL) != 0);
+    if (!injected) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
+    /* Capture through typing/close too: a later retry/log must fail the
+     * one-line assertion, even after the loader fault has been removed. */
+    T(dup2(fileno(log), STDERR_FILENO) >= 0);
+    T(settle(e) == 0); T(press(e, key('x', 0, "x")) == 0);
+    T(expect(e, "x", 1) == 0);
+    T((b.info.capabilities & RENDER_CAP_RASTER_POOL) != 0);
+    editor_close(e);
+    T(dup2(saved_stderr, STDERR_FILENO) >= 0); close(saved_stderr);
+    rewind(log); char line[256]; T(fgets(line, sizeof line, log) != NULL);
+    T(strstr(line, "EGL init failed:") && strstr(line, "code=") && strstr(line, "using raster; no retry"));
+    T(fgets(line, sizeof line, log) == NULL); fclose(log);
+    T(!b.initialized && b.state == NULL);
+    /* With fallback disabled a GPU init error remains an error. */
+    T(editor_backend_select(&b, NULL) == 0); cfg.raster_fallback = false;
+    if (injected) b.ops.init = injected_gpu_init_failure;
+    else T(setenv("EDIT_GL_EGL_LIBRARY", "/tmp/edit-zzj.15-no-such-EGL.so", 1) == 0);
+    T(editor_open(&e, &cfg, &b) == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
+    T(e == NULL && !b.initialized);
+    if (!injected) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
+    printf("editor_test: default EGL %s failure -> raster, one log through typing/close passed\n",
+        injected ? "injected init" : "dlopen"); return 0;
+}
+static int backend_fallback(void)
+{
+    T(backend_fallback_case(true) == 0);
+    T(backend_fallback_case(false) == 0);
+    puts("editor_test: failed EGL init falls back once and stays raster passed"); return 0;
+}
+static int gpu_polled_event(render_backend *b, const render_event *ev)
+{
+    if (!ev->work || ev->work->kind != GL_POLL_MESSAGE) return RENDER_ERR_UNSUPPORTED;
+    ((delayed *)b->state)->ready = true;
+    return delayed_present(b, b->active_frame);
+}
+static int gpu_polled_present(render_backend *b, uint32_t id)
+{ (void)b; (void)id; return 0; }
+static int backend_gpu_completion(void)
+{
+    /* Native EGL fails on :99. This seam models a fence observed only after
+     * present, with no new input/mailbox traffic to wake the editor. */
+    render_backend b = {.info = {"editor GPU poll test", sizeof(delayed), 16, RENDER_CAP_HEADLESS | RENDER_CAP_GPU},
+        .ops = {delayed_init, delayed_resize, delayed_submit, gpu_polled_present, gpu_polled_event, delayed_close}};
+    editor_config cfg = {.cols = 16, .rows = 3}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0);
+    T(settle(e) == 0);
+    T(b.device_seen && b.complete_seen && !b.active);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
+    uint64_t before = editor_get_stats(e).poll_returns;
+    T(editor_step(e, 100) == EDITOR_OK);
+    T(editor_get_stats(e).poll_returns == before + 1);
+    T(b.stats.submitted_frames == 2);
+    editor_close(e);
+    puts("editor_test: GPU completion progresses and idle disarms polling passed"); return 0;
+}
+static int selected_backend_test(const char *name, bool require_gl)
+{
+    editor *e = NULL;
+    int result = 1;
+    bool path_created = false;
+    char path[] = "/tmp/editor-selected-XXXXXX";
+    counted c = {0};
+#define SELECT_T(c) do { if (!(c)) { fprintf(stderr, "editor_test:%d: FAIL %s\n", __LINE__, #c); goto cleanup; } } while (0)
+    render_backend b = {0}; SELECT_T(editor_backend_select(&b, name) == 0);
+    int fd = mkstemp(path); SELECT_T(fd >= 0); path_created = true; close(fd);
+    editor_config cfg = {.cols = 40, .rows = 8, .journal_path = path, .raster_fallback = true,
+        .hook_ctx = &c, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle(e) == 0);
+    SELECT_T(!require_gl || (b.info.capabilities & RENDER_CAP_GPU));
+    for (unsigned i = 0; i < 10000; i += 100) {
+        for (unsigned j = 0; j < 100; j++) {
+            plat_event ev = j % 2 ? key(XKB_KEY_BackSpace, 0, NULL) : key('x', 0, "x");
+            SELECT_T(editor_inject(e, &ev) == 0);
+        }
+        SELECT_T(settle(e) == 0);
+    }
+    SELECT_T(!c.active && !c.suspended && c.allocations == 0 && editor_length(e) == 0);
+    editor_stats s = editor_get_stats(e);
+    SELECT_T(s.mutations == 10000 && s.journal_records == 10000 && !s.journal_error);
+    printf("editor_test: requested=%s actual=%s 10000 keys mallocs=%zu guard=%s\n",
+        name ? name : "default", b.info.name, c.allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    SELECT_T(editor_flush(e) == 0); editor_close(e); e = NULL; unlink(path); path_created = false;
+    /* Same idle fixture as idle_policy, without a journal deadline. Test both
+     * natural Xvfb EGL failure and the explicit raster override. */
+    SELECT_T(editor_backend_select(&b, name) == 0); cfg.journal_path = NULL;
+    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle(e) == 0);
+    SELECT_T(!require_gl || (b.info.capabilities & RENDER_CAP_GPU));
+    uint64_t deadline = trace_now_ns() + UINT64_C(15000000000);
+    while (editor_get_stats(e).blinking && trace_now_ns() < deadline) SELECT_T(editor_step(e, -1) >= 0);
+    SELECT_T(settle(e) == 0);
+    s = editor_get_stats(e); SELECT_T(!s.blinking && s.cursor_visible);
+    uint64_t before = s.poll_returns;
+    SELECT_T(editor_step(e, 100) == EDITOR_OK);
+    SELECT_T(editor_get_stats(e).poll_returns == before + 1);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; SELECT_T(press(e, focus) == 0);
+    before = editor_get_stats(e).poll_returns;
+    SELECT_T(editor_step(e, 100) == EDITOR_OK);
+    SELECT_T(editor_get_stats(e).poll_returns == before + 1);
+    printf("editor_test: requested=%s actual=%s idle/unfocused background wakeups=0 passed\n", name ? name : "default", b.info.name);
+    result = 0;
+cleanup:
+    /* Assertions retain their strength, but failure must still release the
+     * live backend's worker allocations before returning to main/LSan. */
+    if (c.active) { (void)edit_malloc_guard_end(); c.active = false; }
+    c.suspended = false;
+    editor_close(e);
+    if (path_created) unlink(path);
+    return result;
+#undef SELECT_T
+}
+int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    if (argc == 2) {
+        if (!strcmp(argv[1], "--selection")) return backend_selection();
+        if (!strcmp(argv[1], "--fallback")) return backend_fallback();
+        if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
+        if (!strcmp(argv[1], "--backend-only")) return selected_backend_test(getenv("EDIT_BACKEND"), false);
+        if (!strcmp(argv[1], "--require-gl")) return selected_backend_test("gl", true);
+        return 2;
+    }
     const char *allocation = getenv("EDITOR_ALLOC_ONLY");
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(review_suite(NULL) == 0);
+    T(backend_selection() == 0); T(backend_fallback() == 0); T(backend_gpu_completion() == 0);
+    const char *name = getenv("EDIT_BACKEND");
+    if (name) T(selected_backend_test(name, false) == 0);
+    else { T(selected_backend_test("gl", false) == 0); T(selected_backend_test("raster", false) == 0); }
     T(scrolled_undo() == 0);
     T(stopped_error() == 0);
     T(script(false) == 0); T(allocation_test(false) == 0);

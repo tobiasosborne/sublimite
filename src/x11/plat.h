@@ -83,6 +83,7 @@ typedef struct plat {
     uint8_t depth;
     bool argb, present_ok, focused, quit;
     uint8_t present_opcode;
+    uint32_t present_eid;
     uint32_t wm_protocols, wm_delete;
     int timer_fd, work_fd;
     uint32_t width, height;
@@ -102,6 +103,8 @@ typedef struct plat {
 int  plat_init(plat *p, const plat_config *cfg);
 void plat_map(plat *p);
 void plat_set_blink(plat *p, uint32_t ms);  /* 0 disarms; ignored while unfocused */
+/* Raster owns completion on its private connection; avoid duplicate UI wakes. */
+int  plat_set_present_events(plat *p, bool enabled);
 void plat_quit(plat *p);
 int  plat_run(plat *p, const plat_callbacks *cb);
 /* timeout_ms < 0 blocks forever (only for the real app); >=0 bounded run for tests. */

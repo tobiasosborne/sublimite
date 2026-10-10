@@ -1,5 +1,6 @@
 #include "editor/private.h"
 #include "trace/trace.h"
+#include "gl/gl.h"
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -126,10 +127,31 @@ static void platform_work(void *ctx)
     editor *e = ctx; int rc = editor_poll_sources(e); if (rc) e->error = rc;
     e->pump_stopped = true; plat_quit(&e->platform);
 }
+static bool gpu_pending(const editor *e)
+{
+    return (e->backend->info.capabilities & RENDER_CAP_GPU) &&
+        e->backend->active && e->backend->presented;
+}
+static void platform_complete(void *ctx, uint32_t serial, uint64_t ust, uint64_t msc)
+{
+    editor *e = ctx;
+    if (!gpu_pending(e)) return;
+    int rc = gl_present_complete(e->backend, serial, ust, msc);
+    if (rc && rc != RENDER_ERR_FRAME && rc != RENDER_ERR_STATE) e->error = rc;
+}
 static int pump(editor *e, int timeout)
 {
+    if (gpu_pending(e)) {
+        work_msg msg = {.kind = GL_POLL_MESSAGE};
+        render_event ev = {RENDER_EVENT_WORK, e->backend->active_frame, 0, &msg};
+        int rc = render_backend_event(e->backend, &ev);
+        if (rc) return fail(e, rc);
+        /* A completed frame may unblock already prepared/input work. */
+        if (!e->backend->active) timeout = 0;
+    }
     if (e->has_platform && e->queue_count < EDITOR_INPUT_CAP) {
-        plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work};
+        plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work,
+            .on_present_complete = platform_complete};
         uint64_t before = e->platform.iterations;
         e->platform.quit = false; e->pump_stopped = false;
         int rc = plat_run_for(&e->platform, &cb, timeout);
@@ -241,6 +263,10 @@ static bool runnable(const editor *e)
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
     if (runnable(e)) return 0;
+    /* A private XCB event or unsignalled GPU fence can outlast its sole
+     * platform callback. Retry only an outstanding presented GPU frame.
+     * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
+    if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
     uint64_t deadline = e->blinking ? e->next_blink : UINT64_MAX;
     if (e->journal) {
         journal_stats s = journal_get_stats(e->journal);
@@ -265,17 +291,22 @@ int editor_inject(editor *e, const plat_event *event)
     size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
     e->queue[at] = *event; e->queue_count++; return 0;
 }
+static int close_result(editor *e)
+{
+    int rc = editor_flush(e);
+    return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
+}
 int editor_step(editor *e, int timeout_ms)
 {
     if (!e || !e->tree) return EDITOR_ERR_ARG;
-    if (e->quit) return EDITOR_CLOSED;
+    if (e->quit) return close_result(e);
     if (e->error) return e->error;
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
-    if (e->quit) return EDITOR_CLOSED;
+    if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
     uint64_t start = trace_now_ns();
     rc = blink(e, start); if (rc) return rc;
@@ -321,7 +352,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (rc) return fail(e, rc);
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
-    if (e->quit) return EDITOR_CLOSED;
+    if (e->quit) return close_result(e);
     return runnable(e) ? EDITOR_MORE : EDITOR_OK;
 }
 int editor_run(editor *e)

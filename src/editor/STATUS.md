@@ -30,6 +30,26 @@ The following P4.I status is retained as the rebased integration record.
 
 # Editor status — P4.I / edit-457.16
 
+edit-zzj.15 session 8: production WIP retained after rebase. Strengthened
+default-selection fallback tests cover injected RENDER_ERR_INIT, real dlopen
+failure, exact error propagation when policy is disabled, and one diagnostic
+captured through typing/close. Controlled removal of selection/fallback/GPU
+polling and a duplicate-log mutation reproduce red; retained implementation
+is green. Release editor_test passes with active zero-allocation guards on
+both selections; Xvfb EGL selection explicitly falls back to cpu-raster.
+Final gcc 13 make all and clang 18 ASan/UBSan make check exit 0 (M)[AC],
+49 sanitizer binaries plus replay CLI (M)[AC]. LeakSanitizer disabled;
+coordinator reruns leaks on. Editor fuzz ran 61 s, 16111 executions (M)[AC]
+for the requested 60 s budget (G), exit 0. Release GL suite also passes,
+including active snapshot-submit allocation checks and native lifecycle skip.
+G11 rows ran back to back with no after-idle/unfocused background wakes;
+focused raster blink costs/wakes remain an inherited separate issue. G1's
+long-corpus null reference hit its settle deadline before either native row;
+main-source bench/editor-loop diagnostic reproduces that deadline.
+no native EGL or G1 gate verdict is claimed. Mandatory session evidence and
+current decisions: ../../docs/worker-reports/edit-zzj.15-s8.md and
+../../docs/decisions/edit-zzj.15.md. The P4.I status below is preserved.
+
 Session 8 finisher (2026-10-10): the supplied WIP's missing-path fix/unique
 fixture were already green. A controlled removal of only worker ENOENT fallback
 reproduced the missing-path assertion; byte-for-byte restoration returned the
@@ -40,6 +60,23 @@ Final gcc 13 make all and clang 18 ASan/UBSan make check exit 0 (49 test
 binaries plus replay CLI). LeakSanitizer disabled; coordinator reruns leaks on.
 Editor/tabs/ipc fuzz each exit 0 after 61 seconds (M)[AC], with
 10002/73374/1517045 runs respectively. Release editor_test is also green.
+Implemented: public editor API and native/injected event loop, backend
+selection in `src/main.c`, fixed reservations, piece/undo mutations, view
+movement and repair, dirty layout slices, queue depth one/coalescing, deferred
+resize, trace endpoints, mutation journal staging/pumping, negative stopped-loop
+errors, blink timeout/unfocus policy. No dependency module changes.
+
+edit-zzj.15: EGL is the application default; EDIT_BACKEND=gl|raster overrides
+selection. GPU init failure logs its reason/code once and initializes raster
+using fresh state and reserved workers; no loop retry. EGL Present callbacks
+and bounded outstanding-frame polls are wired into the existing loop. No GL
+poll/retry timer remains when the backend is inactive. Release allocation and
+idle fixtures cover both selections, explicitly reporting raster fallback on
+Xvfb. G1/G11 bench rows retain null/raster and add accurately labeled GL rows;
+--require-gl prevents fallback from passing the native coordinator check.
+Design, red/green, scoped limitations and exact real-display verification:
+../../docs/decisions/zzj.15.md. Native GL allocation/idle requires that coordinator
+check; GL renderer fixes remain edit-e6x.26. P4.I wiring is otherwise preserved.
 
 Latest one-shot TRACK campaign (M)[AC], BAT0 Not charging, Xvfb :99,
 load1=26.73: raster G3 ingress-to-T5 p50/p99 20.348306/42.608195 ms;

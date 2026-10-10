@@ -364,7 +364,8 @@ found:
             c, xcb_present_query_version(c, 1, 0), NULL);
         if (!v) { plat_shutdown(p); return PLAT_ERR_FAIL; }
         free(v);
-        if (!init_request_ok(c, xcb_present_select_input_checked(c, xcb_generate_id(c), p->win,
+        p->present_eid = xcb_generate_id(c);
+        if (!init_request_ok(c, xcb_present_select_input_checked(c, p->present_eid, p->win,
                                                                XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY))) {
             plat_shutdown(p); return PLAT_ERR_FAIL;
         }
@@ -400,6 +401,13 @@ void plat_set_blink(plat *p, uint32_t ms) {
         it.it_interval = it.it_value;
     }
     timerfd_settime(p->timer_fd, 0, &it, NULL);
+}
+
+int plat_set_present_events(plat *p, bool enabled) {
+    if (!p || !p->conn) return PLAT_ERR_FAIL;
+    if (!p->present_ok) return PLAT_OK;
+    return init_request_ok(C(p), xcb_present_select_input_checked(C(p), p->present_eid, p->win,
+        enabled ? XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY : 0)) ? PLAT_OK : PLAT_ERR_FAIL;
 }
 
 void plat_quit(plat *p) { p->quit = true; }

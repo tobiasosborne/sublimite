@@ -1,7 +1,6 @@
 #include "editor/editor.h"
 #include "editor/runtime.h"
 #include "journal/journal.h"
-#include "raster/raster.h"
 #include "trace/trace.h"
 #include <errno.h>
 #include <stdio.h>
@@ -44,11 +43,11 @@ int main(int argc, char **argv)
     close(fd);
     trace_init(); (void)trace_thread_register();
     render_backend backend = {0};
-    /* The only application backend selection site. A future GL factory can
-     * fill the same handle; the editor loop depends solely on render.h. */
-    int rc = render_cpu_backend(&backend);
+    /* The only application backend selection site; init may fall back once. */
+    int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
     editor *e = NULL;
-    editor_config config = {.journal_path = journal_path, .start_empty = true, .server = owns_server ? &server : NULL};
+    editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true,
+        .server = owns_server ? &server : NULL};
     if (!rc) rc = editor_open(&e, &config, &backend);
     if (!rc) rc = editor_open_request(e, &args.request, 0);
     ipc_args_fini(&args);

@@ -172,6 +172,8 @@ struct render_backend;
  * validation, queue depth, stats and tracing are identical for every backend.
  * All entries required; factory fills an instance, no global vtable needed.
  * ops receive b->state and may signal via render_backend_signal on UI.
+ * init must release any acquired native/heap resources before returning an
+ * error; shutdown owns them after success. The caller owns state storage.
  * submit must not signal before it returns; present/event may signal on UI.
  * event handles routed work messages; frame fence/Present events are handled
  * by the common adapter. Return UNSUPPORTED for unrecognised work messages. */

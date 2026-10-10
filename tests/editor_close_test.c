@@ -39,8 +39,12 @@ static int close_case(bool native)
     plat_event key = {.kind=PLAT_EV_KEY,.press=true,.keysym='a',.utf8_len=1,.utf8={'a'}};
     T(editor_inject(e,&key) == 0);
     for (unsigned i = 0; i < 100 && !editor_length(e); i++) T(editor_step(e,0) >= 0);
-    T(editor_length(e) == 1 && e->op_count == 1);
-    for (size_t i = 0; i < EDITOR_INPUT_CAP; i++) T(editor_inject(e,&key) == 0);
+    /* Mutations are now journaled before layout/submission, even while the
+     * earlier frame is held. Native input drains only with queue capacity. */
+    T(editor_length(e) == 1 && e->op_count == 0);
+    T(journal_get_stats(e->journal).accepted_sequence > 0);
+    size_t queued = native ? EDITOR_INPUT_CAP - 1u : EDITOR_INPUT_CAP;
+    for (size_t i = 0; i < queued; i++) T(editor_inject(e,&key) == 0);
     e->v.busy = true;
     if (native) {
         plat *p = &e->platform;
