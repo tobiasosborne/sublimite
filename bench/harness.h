@@ -345,6 +345,14 @@ static inline int bench_gate_report(const char *name, const bench_samples *s, ui
     return bench_exit_code(bench_judge(s, gate_p50_ns, gate_p99_ns, required_n), track);
 }
 
+/* Combine independently reported rows without turning REFUSED (3) into a
+ * boolean success/miss. Structural/timing failure (1) takes precedence. */
+static inline int bench_merge_exit(int left, int right)
+{
+    if (left == 1 || right == 1) return 1;
+    return left == 3 || right == 3 ? 3 : 0;
+}
+
 /* Cold runs are manual. Procedure (Linux):
  *   sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
  *   verify with fincore <file> (resident pages should be 0) and

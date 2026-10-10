@@ -1,5 +1,7 @@
 /* tests/harness_test.c - checks for bench/harness.h (P0.4). */
-#include "../bench/harness.h"
+#define main editor_bench_entry
+#include "../bench/editor_bench.c"
+#undef main
 
 #include <stdlib.h>
 
@@ -278,8 +280,139 @@ static void test_gate_verdict(void)
     }
 }
 
+static void test_editor_bench_honesty(void)
+{
+    stamp tag = power_stamp();
+    render_backend b = {0};
+    samples measured = {0};
+    editor_config cfg = target_a_config();
+    cfg.hook_ctx = &measured; cfg.on_ingress = ingress;
+    cfg.on_submit = submitted; cfg.on_present = presented;
+    editor *e = NULL;
+    CHECK(render_null_backend(&b) == 0);
+    CHECK(editor_open(&e, &cfg, &b) == 0);
+    if (!e) return;
+    CHECK(settle(e) == 0);
+    uint32_t width = b.config.dims.cols * b.config.dims.cell_w;
+    uint32_t height = b.config.dims.rows * b.config.dims.cell_h;
+    printf("PROBE A runtime=%ux%u requested=2880x1800 (G)\n", width, height);
+    CHECK(width == 2880 && height == 1800);
+    plat_event ev = event(false);
+    key_sample keys[3] = {{0}};
+    measured.keys = keys; measured.count = 3; measured.first_sequence = 1;
+    uint64_t injection = bench_now_ns(); keys[0].injected = injection;
+    CHECK(editor_inject(e, &ev) == 0);
+    struct timespec delay = {.tv_nsec = 20000000};
+    CHECK(nanosleep(&delay, NULL) == 0);
+    CHECK(settle(e) == 0);
+    uint64_t reported = keys[0].t4 - keys[0].injected;
+    uint64_t end_to_end = measured.frame.present_ns - injection;
+    printf("PROBE G1 injected_wait=20000000 (G) reported=%" PRIu64 " injection_to_T4=%" PRIu64 " (M)%s\n",
+           reported, end_to_end, tag.power);
+    CHECK(reported >= UINT64_C(20000000));
+    measured.frame = (editor_frame){0};
+    keys[1].injected = bench_now_ns(); CHECK(editor_inject(e, &ev) == 0);
+    keys[2].injected = bench_now_ns(); CHECK(editor_inject(e, &ev) == 0);
+    CHECK(settle(e) == 0);
+    printf("PROBE queued_keys first=%" PRIu64 " last=%" PRIu64 " dequeue_sequence=%" PRIu64 " (M)%s\n",
+           measured.frame.first_sequence, measured.frame.last_sequence, measured.sequence, tag.power);
+    CHECK(measured.completed == 3 && !measured.invalid);
+    CHECK(keys[1].frame == keys[2].frame && keys[1].frame != keys[0].frame);
+    CHECK(keys[1].t4 >= keys[1].injected && keys[2].t4 >= keys[2].injected);
+    editor_close(e);
+    int structural_rc = row_result(0, true, true);
+    printf("PROBE structural_failure TRACK exit=%d expected=1 (G)\n", structural_rc);
+    CHECK(structural_rc == 1);
+    uint64_t value = 1; bench_samples tiny;
+    bench_samples_init(&tiny, &value, 1); CHECK(bench_add(&tiny, 1) == 0);
+    int refused = gate_row("editor_probe_insufficient", &tiny, 100, 100, false, &tag);
+    printf("PROBE insufficient_samples exit=%d expected=3 (G)\n", refused);
+    CHECK(refused == 3);
+    CHECK(bench_merge_exit(0, 3) == 3);
+    CHECK(bench_merge_exit(3, 0) == 3);
+    CHECK(bench_merge_exit(3, 3) == 3);
+    CHECK(bench_merge_exit(3, 1) == 1);
+    CHECK(bench_merge_exit(1, 3) == 1);
+}
+
+typedef struct bench_delayed { bool ready; } bench_delayed;
+static int bench_delayed_init(render_backend *b, const render_config *cfg)
+{ (void)cfg; ((bench_delayed *)b->state)->ready = true; return 0; }
+static int bench_delayed_resize(render_backend *b, render_dims dims)
+{ (void)b; (void)dims; return 0; }
+static int bench_delayed_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t n)
+{ (void)b; (void)g; (void)strips; (void)n; return 0; }
+static int bench_delayed_present(render_backend *b, uint32_t id)
+{
+    if (!((bench_delayed *)b->state)->ready) return RENDER_ERR_BUSY;
+    int rc = render_backend_signal(b, RENDER_EVENT_DEVICE_DONE, id, 0);
+    return rc ? rc : render_backend_signal(b, RENDER_EVENT_PRESENT_COMPLETE, id, 0);
+}
+static int bench_delayed_event(render_backend *b, const render_event *ev)
+{ (void)b; (void)ev; return RENDER_ERR_UNSUPPORTED; }
+static void bench_delayed_close(render_backend *b) { (void)b; }
+static void test_active_frame_samples(void)
+{
+    render_backend b = {.info = {"bench delayed probe", sizeof(bench_delayed), 16, RENDER_CAP_HEADLESS},
+        .ops = {bench_delayed_init, bench_delayed_resize, bench_delayed_submit,
+                bench_delayed_present, bench_delayed_event, bench_delayed_close}};
+    samples measured = {0};
+    editor_config cfg = {.cols = 32, .rows = 8, .hook_ctx = &measured,
+        .on_ingress = ingress, .on_submit = submitted, .on_present = presented};
+    editor *e = NULL; CHECK(editor_open(&e, &cfg, &b) == 0);
+    if (!e) return;
+    CHECK(settle(e) == 0);
+    key_sample keys[4] = {{0}};
+    measured.keys = keys; measured.count = 4; measured.first_sequence = 1;
+    ((bench_delayed *)b.state)->ready = false;
+    plat_event ev = event(false);
+    keys[0].injected = bench_now_ns(); CHECK(editor_inject(e, &ev) == 0);
+    for (unsigned i = 0; i < 100 && !b.active; i++) CHECK(editor_step(e, 0) >= 0);
+    CHECK(b.active && keys[0].submit && !keys[0].t4);
+    for (size_t i = 1; i < 4; i++) {
+        keys[i].injected = bench_now_ns(); CHECK(editor_inject(e, &ev) == 0);
+    }
+    for (unsigned i = 0; i < 8; i++) CHECK(editor_step(e, 0) >= 0);
+    CHECK(measured.completed == 0);
+    struct timespec delay = {.tv_nsec = 20000000}; CHECK(nanosleep(&delay, NULL) == 0);
+    ((bench_delayed *)b.state)->ready = true; CHECK(settle(e) == 0);
+    CHECK(!measured.invalid && measured.completed == 4);
+    for (size_t i = 0; i < 4; i++) CHECK(keys[i].t4 - keys[i].injected >= UINT64_C(20000000));
+    CHECK(keys[0].frame != keys[1].frame && keys[1].frame == keys[2].frame && keys[2].frame == keys[3].frame);
+    printf("PROBE active_frame keys=4 completed=%zu coalesced=3 (M)%s\n", measured.completed, bench_evidence_tag());
+    /* A duplicate callback is structural, including under TRACK. */
+    presented(&measured, &measured.frame);
+    CHECK(measured.invalid && row_result(0, measured.invalid, true) == 1);
+    editor_close(e);
+}
+static void test_structural_counts(void)
+{
+    samples measured = {.completed = 2};
+    editor_stats before = {.mutations = 16, .journal_records = 16};
+    editor_stats after = {.mutations = 18, .journal_records = 18};
+    CHECK(!typing_structure(&measured, before, after, 2));
+    after.mutations--;
+    CHECK(row_result(0, typing_structure(&measured, before, after, 2), true) == 1);
+    after.mutations++; after.journal_records--;
+    CHECK(row_result(0, typing_structure(&measured, before, after, 2), true) == 1);
+    after.journal_records++; after.journal_error = 1;
+    CHECK(row_result(0, typing_structure(&measured, before, after, 2), true) == 1);
+    after.journal_error = 0; measured.allocations = 1;
+    CHECK(row_result(0, typing_structure(&measured, before, after, 2), true) == 1);
+    measured.allocations = 0; measured.completed = 1;
+    CHECK(row_result(0, typing_structure(&measured, before, after, 2), true) == 1);
+    CHECK(row_result(1, false, true) == 0);
+    CHECK(row_result(1, false, false) == 1);
+    CHECK(row_result(3, false, false) == 3);
+    puts("PROBE structural counts, allocation, missing/duplicate frame failures remain fatal in TRACK");
+}
+
 int main(void)
 {
+    trace_init(); (void)trace_thread_register();
+    test_editor_bench_honesty();
+    test_active_frame_samples();
+    test_structural_counts();
     test_gate_verdict();
     test_percentiles_small();
     test_counterexample();
