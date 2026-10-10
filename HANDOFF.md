@@ -1,4 +1,19 @@
-# HANDOFF — sublimité, session 9 wound down (updated 2026-10-11 07:20)
+# HANDOFF — sublimité, session 10: process reset (updated 2026-10-11)
+
+## Session 10 (read first; supersedes every "gate", "bench run" and "review slice" instruction below)
+Tobias, 2026-10-11: **"Perf is a goal, not a progress blocker. Milestones are the priority. If landing milestones is slowed by perf then the process is a failure."** Decision doc: `docs/decisions/2026-10-11-perf-is-a-goal.md`. CLAUDE.md laws 1 and 8 are rewritten, PRD §9 milestones now exit by use, PLAN §1.4 amended, `perf/01-perf-target.md` is a reference goal sheet. No code changed.
+
+**Next coordinator, in this order:**
+1. **edit-pi6 (P0):** build release, announce, launch on :0, hand the editor to Tobias for an hour on the real display. Capture the trace ring. Every lag or wrong-text report becomes a bead with a repro. Then close M0 (edit-zzj) regardless of the reports. Nothing else outranks this.
+2. **One dedicated editor worker** (Codex sol high), queue: ck4 slice 2 (§3 Ctrl+S recoverable save, §6 startup restore only), then edit-73j (clicks place the cursor, wheel scroll, find/replace inside the editor, Unicode glyphs via the font runtime: missing M1 features), then edit-457.8 hot exit. Everyone else builds in their own modules toward M1/M2 (edit-5ih font selection, v0o.1 Wayland, v0o.2 tree-sitter runtime, v0o.7 config).
+3. **Do not** open beads from bench rows, re-run M0/M1 bench campaigns, or convert review MAJORs into beads. P3 review beads are backlog; pull one only when Tobias, a fuzzer or the trace points at it. edit-lwq (benches exit 0) is a mechanical P3 bead for a Haiku/Codex worker when convenient.
+4. Push after each main-level clean `make all && make check`.
+
+Everything below is session 9's state, kept for reference. Its "Needs Tobias" gate decisions (G7j, G8d, undo reserve, raster defaults) are **withdrawn**: tracked numbers, no decision required.
+
+---
+
+# Session 9 wound down (2026-10-11 07:20)
 
 Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task` and `bd ready -n 40`. Session details: `docs/worklog/2026-10-10.md` (sessions 8 and 9), `docs/worklog/2026-10-09.md` (sessions 4–7), `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
 

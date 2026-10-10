@@ -86,24 +86,24 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 - Text buffer: piece tree over an immutable original (copy or mmap) plus a chunked append-only add buffer, per-node byte and newline counts; sparse 64 KiB chunk index (perf §2.6, §2.5).
 - Threading: UI thread does input, edit, layout, submit; workers do index, find, save, highlight; all cancellable within 5 ms logical ack (G6c).
 - Grammar engine: tree-sitter (C library, statically linked). Shaping: HarfBuzz is **not** linked in v1; monospace cell layout with a combining-mark pass; revisit if a prose font is wanted.
-- Agent-built codebase: every module ships with its benchmark against the relevant gate; a gate regression fails CI.
+- Agent-built codebase: every module ships with its benchmark; bench rows are tracked numbers, not CI failures (2026-10-11, Tobias: perf is a goal, not a progress blocker; only the typing-latency guard G1 is enforced).
 
-## 9. Milestones (each gated, none dated yet)
+## 9. Milestones (exit by use, not by gate; 2026-10-11)
 
 | | Scope | Exit criterion |
 |---|---|---|
-| **M0 glass** | X11 window, GL text, piece tree, typing, scrolling, one file | G1, G3, G3i, G4a green on A on battery; keystroke-to-photon measured with a photodiode once |
-| **M1 editor** | tabs, minimap, find/replace, undo, wrap, auto-indent, save, hot exit, CLI, single instance, xdg integration, large-file path | all enforced A gates green; a day of real use possible |
+| **M0 glass** | X11 window, GL text, piece tree, typing, scrolling, one file | Tobias types in it on the real display for an hour and reports lag; G1 tracked |
+| **M1 editor** | tabs, minimap, find/replace, undo, wrap, auto-indent, save, hot exit, CLI, single instance, xdg integration, large-file path | a day of real use by Tobias; perf rows reported, none blocking |
 | **M2 daily** | Wayland backend, tree-sitter highlighting (async), config, themes, polish | the two-week trial starts |
 | **v1 done** | | Sublime uninstalled |
-| **M3 Windows** | Win32 + D3D11/GL backend, B fixture measured | B gates green on the real B machine |
+| **M3 Windows** | Win32 + D3D11/GL backend, B fixture measured | usable on the real B machine; B rows reported |
 | **R1 spike** | speculative neural highlighting | go/no-go against G1/G3 |
 
 ## 10. Risks
 
 1. **After-idle penalty on A.** Measured CPU first-frame-after-idle misses a whole refresh; the GPU path's own wake cost is unmeasured. If GPU wake is also slow, G3i cannot be met and the aspiration drops to "one-frame slip allowed" permanently. First measurement in M0.
-2. **All measurements were on AC.** Battery rerun is the first task of M0; scan-dependent gates are provisional until then.
-3. **Wayland compositor latency is unknown** and not controllable from the app; Mutter/Muffin frame scheduling may add a frame. Mitigation: measure both backends with the same photodiode rig; the X11 compositor-bypass fullscreen mode has no Wayland equivalent.
+2. **All measurements were on AC.** Battery numbers are tracked when Tobias uses the editor on battery; no rerun ritual.
+3. **Wayland compositor latency is unknown** and not controllable from the app; Mutter/Muffin frame scheduling may add a frame. Mitigation: compare both backends with the trace ring on the same box; the X11 compositor-bypass fullscreen mode has no Wayland equivalent.
 4. **Tree-sitter against the frame gate** on large files and pathological grammars. Mitigation: viewport-first, hard per-frame budget, plain-text fallback; grammar set is small and fixed.
 5. **Unicode without HarfBuzz**: monospace cell layout breaks on some combining sequences and all ligatures. Accepted for v1; prose is still readable.
 6. **Agent-written C**: memory safety. Mitigation: ASan/UBSan in CI, fuzzing of the buffer, parser and journal replay; no `malloc` on the typing path.

@@ -1,4 +1,6 @@
-# 01 — Performance target, v3.4
+# 01 — Performance target, v3.4 (reference goal sheet)
+
+> **Status 2026-10-11 (Tobias):** this document is the perf **goal**, not a progress blocker. Nothing in §0.2 binds a bead, an epic or a milestone; the rows are tracked numbers printed by the benches. The one enforced guard is G1 typing latency as a regression test. Milestones exit by use (PRD §9). The photodiode measurement, A/B/C hardware classes and k-multipliers below are planning material from session 1 and were never requested as deliverables.
 
 v3.3 = v3 (round-2 verification) + v3.1 / v3.2 (measured raster + upload, 00-profile Addenda 2–3) + v3.3 (round-3 verification `02-review-verify3.md`: endpoints, units, propagation; **no gate limit changed**). Tag `(M)[AC,A-hw]` = measured on **A hardware at B resolution, not the B fixture**. **C model (E):** every C CPU cost = the A-panel measurement scaled by C's pixel count (or strip width) × 4, with A-panel after-idle factors. **A** and **B** are *release* gates. **C** gates are **PROVISIONAL [est]**: tracked, but not enforced in CI until a real C SKU exists and has been measured. Scan-dependent A gates are **provisional [AC] until the battery rerun** (§5, first follow-up).
 
