@@ -4,6 +4,7 @@
 #undef main
 #include "trace/trace_fmt.h"
 #include <dirent.h>
+#include "ipc_isolation.h"
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -41,9 +42,35 @@ static void pause_poll(void)
     struct timespec pause = {0, 10000000}; (void)nanosleep(&pause, NULL);
 }
 /* 0 = passed, 1 = failed, 2 = skipped. */
-static int session(const char *file, const char *dump, bool fail_dump)
+static ipc_result decoy_open(const ipc_request *request, ipc_token token, void *ctx)
+{
+    (void)request; (void)token;
+    unsigned *calls = ctx; ++*calls;
+    return IPC_OK;
+}
+static int same_display_handoff(const char *file, ipc_server *decoy)
+{
+    pid_t child = fork(); if (child < 0) return 1;
+    if (!child) {
+        char *args[] = {"sublimite", (char *)file, NULL};
+        _exit(editor_cli_main(2, args));
+    }
+    unsigned calls = 0; int status = 0; pid_t waited = 0;
+    uint64_t deadline = trace_now_ns() + UINT64_C(30000000000);
+    while (!waited && trace_now_ns() < deadline) {
+        if (ipc_server_drain(decoy, decoy_open, &calls) != IPC_OK) break;
+        waited = child_wait(child, &status, WNOHANG);
+        if (!waited) pause_poll();
+    }
+    if (waited != child) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); return 1; }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) || calls != 1) return 1;
+    puts("cli_test: same-display launcher handoff preserved; child_exit=0 handoffs=1");
+    return 0;
+}
+static int session(const char *file, const char *dump, bool fail_dump, ipc_server *decoy)
 {
     int result = 1, status = 0;
+    unsigned handed_off = 0;
     pid_t child = -1;
     xcb_connection_t *c = NULL;
     xcb_get_property_reply_t *title = NULL;
@@ -71,9 +98,12 @@ static int session(const char *file, const char *dump, bool fail_dump)
     uint64_t deadline = trace_now_ns() +
         (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT") ? 0 : (uint64_t)wait_seconds * UINT64_C(1000000000));
     while (!window && trace_now_ns() < deadline) {
+        if (decoy) T(ipc_server_drain(decoy, decoy_open, &handed_off) == IPC_OK);
         pid_t waited = child_wait(child, &status, WNOHANG | WUNTRACED);
         if (waited == child && (WIFEXITED(status) || WIFSIGNALED(status))) child = -1;
         if (waited != 0) fprintf(stderr, "cli_test: editor exited or stopped before window (status=%d)\n", status);
+        if (waited != 0) fprintf(stderr, "cli_test: decoy handoffs=%u window=%u child_exit=%d\n",
+            handed_off, window, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         T(waited == 0);
         T(!xcb_connection_has_error(c));
         window = find_window(c, screen->root, pid_atom, child);
@@ -89,6 +119,8 @@ static int session(const char *file, const char *dump, bool fail_dump)
         result = 2; goto cleanup;
     }
     T(window != XCB_WINDOW_NONE);
+    T(handed_off == 0);
+    puts("cli_test: decoy bypassed; child window created; handoffs=0");
     title = xcb_get_property_reply(c,
         xcb_get_property(c, 0, window, intern(c, "_NET_WM_NAME"), XCB_GET_PROPERTY_TYPE_ANY, 0, 64), NULL);
     T(!getenv("CLI_TEST_FORCE_ASSERT_FAILURE"));
@@ -122,7 +154,8 @@ cleanup:
 int main(void)
 {
     int result = 1;
-    bool root_created = false;
+    bool root_created = false, decoy_live = false;
+    ipc_server decoy = {0};
     FILE *f = NULL;
     DIR *d = NULL;
     char root[] = "/tmp/sublimite-cli-XXXXXX", file[4097] = "", dump[4097] = "", dir[4097] = "";
@@ -133,9 +166,30 @@ int main(void)
     T(snprintf(dir, sizeof dir, "%s/sublimite", root) > 0);
     f = fopen(file, "wb"); T(f && fputs("hello\n", f) >= 0);
     int closed = fclose(f); f = NULL; T(closed == 0);
-    int ran = session(file, dump, false);
+    T(setenv("XDG_RUNTIME_DIR", root, 1) == 0);
+    const char *decoy_display = getenv("CLI_TEST_DECOY_DISPLAY");
+    T(setenv("DISPLAY", decoy_display ? decoy_display : ":99", 1) == 0);
+    T(ipc_server_init_display(&decoy, NULL, getenv("DISPLAY")) == IPC_OK); decoy_live = true;
+    T(setenv("DISPLAY", ":99", 1) == 0);
+    fprintf(stderr, "cli_test: decoy display=%s launcher=:99 shared runtime regression\n",
+        getenv("CLI_TEST_DECOY_DISPLAY") ? getenv("CLI_TEST_DECOY_DISPLAY") : ":99");
+    /* The mismatch case deliberately keeps the shared runtime: production
+     * must reject cross-display routing independently of test isolation. */
+    if (!decoy_display) {
+        T(same_display_handoff(file, &decoy) == 0);
+        T(test_ipc_isolate() != NULL);
+    }
+    int ran = session(file, dump, false, &decoy);
     if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
-    ran = session(file, root, true);
+    ipc_server_fini(&decoy); decoy_live = false;
+    /* Always cover different displays in make check, on a shared runtime.
+     * This decoy owns only an IPC socket; it never opens a window on :98. */
+    T(ipc_server_init_display(&decoy, NULL, ":98") == IPC_OK); decoy_live = true;
+    fputs("cli_test: different-display decoy, shared runtime regression\n", stderr);
+    ran = session(file, dump, false, &decoy);
+    if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
+    ipc_server_fini(&decoy); decoy_live = false;
+    ran = session(file, root, true, NULL);
     if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
@@ -145,14 +199,32 @@ int main(void)
         struct stat st; T(stat(path, &st) == 0 && st.st_size > 0 && (st.st_mode & 0777) == 0600);
         journals++; T(unlink(path) == 0);
     }
-    T(journals == 2); closed = closedir(d); d = NULL; T(closed == 0 && rmdir(dir) == 0);
+    T(journals == 3); closed = closedir(d); d = NULL; T(closed == 0 && rmdir(dir) == 0);
+    char decoy_lock[4097]; (void)snprintf(decoy_lock, sizeof decoy_lock, "%s/sublimite-%lu.lock", root, (unsigned long)getuid());
+    (void)unlink(decoy_lock);
+    d = opendir(root); T(d != NULL);
+    struct dirent *endpoint;
+    while ((endpoint = readdir(d))) {
+        if (!strncmp(endpoint->d_name, "sublimite-", 10)) T(unlinkat(dirfd(d), endpoint->d_name, 0) == 0);
+    }
+    T(closedir(d) == 0); d = NULL;
     T(unlink(file) == 0 && unlink(dump) == 0 && rmdir(root) == 0);
     puts("cli_test: file window identity, XDG session journals, quiescent trace dump and dump error passed");
     result = 0;
 cleanup:
+    if (decoy_live) ipc_server_fini(&decoy);
+    char lock[4097]; (void)snprintf(lock, sizeof lock, "%s/sublimite-%lu.lock", root, (unsigned long)getuid());
+    (void)unlink(lock);
     if (f) (void)fclose(f);
     if (d) (void)closedir(d);
     if (root_created) {
+        d = opendir(root);
+        if (d) {
+            struct dirent *remaining_endpoint;
+            while ((remaining_endpoint = readdir(d)))
+                if (!strncmp(remaining_endpoint->d_name, "sublimite-", 10)) (void)unlinkat(dirfd(d), remaining_endpoint->d_name, 0);
+            (void)closedir(d); d = NULL;
+        }
         /* A skipped/failed session may have left partial journals. */
         d = opendir(dir);
         if (d) {

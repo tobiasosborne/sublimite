@@ -15,10 +15,14 @@ int main(int argc, char **argv)
     if (parsed == IPC_OK && args.request.has_stdin) parsed = ipc_args_read_stdin(&args, STDIN_FILENO);
     if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }
     ipc_server server = {0}; bool owns_server = false;
+    const char *display = getenv("DISPLAY");
+    const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
+    if (selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
+    display = getenv("DISPLAY");
     if (!args.request.new_instance) {
-        ipc_result role = ipc_server_init(&server, NULL);
+        ipc_result role = ipc_server_init_display(&server, NULL, display);
         if (role == IPC_EXISTS) {
-            ipc_result sent = ipc_client_send(NULL, &args.request, 2000);
+            ipc_result sent = ipc_client_send_display(NULL, display, &args.request, 2000);
             ipc_args_fini(&args);
             if (sent != IPC_OK) fprintf(stderr, "sublimite: handoff error %d\n", sent);
             return sent == IPC_OK ? 0 : 2;
@@ -26,9 +30,6 @@ int main(int argc, char **argv)
         if (role != IPC_OK) { fprintf(stderr, "sublimite: IPC startup error %d\n", role); ipc_args_fini(&args); return 2; }
         owns_server = true;
     }
-    const char *display = getenv("DISPLAY");
-    const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
-    if (selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
     char journal_path[4097];
     if (journal_default_dir(journal_path, sizeof journal_path) != JOURNAL_OK) {
         fprintf(stderr, "sublimite: cannot resolve journal directory\n"); goto startup_fail;

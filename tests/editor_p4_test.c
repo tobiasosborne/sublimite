@@ -1,3 +1,4 @@
+#include "ipc_isolation.h"
 #include "editor/editor.h"
 #include "editor/private.h" /* arrange an incomplete index without a worker race */
 #include "raster/raster.h"
@@ -443,7 +444,7 @@ static int ipc_wait_sweep(ipc_server *server)
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
-    char runtime[] = "/tmp/editor-p4-ipc-XXXXXX"; T(mkdtemp(runtime) != NULL);
+    const char *runtime = test_ipc_isolate(); T(runtime != NULL);
     ipc_server server = {0}; T(ipc_server_init(&server, runtime) == IPC_OK);
     T(ipc_wait_sweep(&server) == 0);
     T(ipc_pending_input(&server, runtime) == 0);

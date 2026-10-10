@@ -76,6 +76,13 @@ typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
  * it stable for the endpoint lifetime; do not change it from another thread.
  * All server calls belong to the loop thread; fini only after successful init. */
 ipc_result ipc_server_init(ipc_server *server, const char *runtime);
+/* CLI endpoints include a lossless, bounded encoding of the selected DISPLAY.
+ * Different display strings never share a primary. NULL preserves the general
+ * IPC endpoint; overlong display names return IPC_LIMIT before binding/sending.
+ * Pass the same display to server and client, including fallback endpoints. */
+ipc_result ipc_server_init_display(ipc_server *server, const char *runtime, const char *display);
+ipc_result ipc_client_send_display(const char *runtime, const char *display,
+                                   const ipc_request *request, int timeout_ms);
 int ipc_server_fd(const ipc_server *server);
 /* Nonblocking; borrowed request is valid only inside callback. Callback OK
  * queues ACK; other result rejects. Retain token for wait; copy desired data.

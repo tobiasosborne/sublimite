@@ -68,43 +68,62 @@ static void ep_close(endpoint *ep)
 /* Open and verify the runtime directory once; every later operation goes
  * through this descriptor, so renaming or replacing the path afterwards
  * cannot redirect lock, bind, chmod or unlink (edit-457.21 review §2). */
-static ipc_result resolve_dir(const char *runtime, endpoint *ep)
+static ipc_result display_suffix(const char *display, char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (display == NULL) return IPC_OK; /* legacy/general IPC callers */
+    size_t n = strlen(display);
+    if (n == 0) return IPC_INVALID;
+    if (cap < 3u || n > (cap - 3u) / 2u) return IPC_LIMIT;
+    out[0] = '-'; out[1] = 'd';
+    const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char byte = (unsigned char)display[i];
+        out[2u + 2u*i] = hex[byte >> 4]; out[3u + 2u*i] = hex[byte & 15u];
+    }
+    out[2u + 2u*n] = '\0'; return IPC_OK;
+}
+static ipc_result resolve_dir(const char *runtime, const char *display, endpoint *ep)
 {
     if(runtime[0]!='/') return IPC_INVALID;
     int fd=open(runtime,O_PATH|O_DIRECTORY|O_CLOEXEC);
     if(fd<0) return IPC_INVALID;
     struct stat st;
     if(fstat(fd,&st)!=0 || !S_ISDIR(st.st_mode) || st.st_uid!=getuid() || (st.st_mode&077u)!=0) { close(fd); return IPC_INVALID; }
-    int n=snprintf(ep->leaf,sizeof ep->leaf,"sublimite-%lu.sock",(unsigned long)getuid());
+    char suffix[64]; ipc_result rc=display_suffix(display,suffix,sizeof suffix);
+    if(rc!=IPC_OK) { close(fd); return rc; }
+    int n=snprintf(ep->leaf,sizeof ep->leaf,"sublimite-%lu%s.sock",(unsigned long)getuid(),suffix);
     if(n<0 || (size_t)n>=sizeof ep->leaf) { close(fd); return IPC_LIMIT; }
     n=snprintf(ep->addr.sun_path,sizeof ep->addr.sun_path,"/proc/self/fd/%d/%s",fd,ep->leaf);
     if(n<0 || (size_t)n>=sizeof ep->addr.sun_path) { close(fd); return IPC_LIMIT; }
     ep->len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+(size_t)n+1u);
     ep->dir_fd=fd; ep->abstract=false; return IPC_OK;
 }
-static ipc_result resolve(const char *runtime, endpoint *ep)
+static ipc_result resolve(const char *runtime, const char *display, endpoint *ep)
 {
     memset(ep,0,sizeof *ep); ep->addr.sun_family=AF_UNIX; ep->dir_fd=-1;
     if(runtime==NULL) runtime=getenv("XDG_RUNTIME_DIR");
-    if(runtime!=NULL) return resolve_dir(runtime,ep);
+    if(runtime!=NULL) return resolve_dir(runtime,display,ep);
     struct sockaddr_un *a=&ep->addr; int n;
+    char suffix[64]; ipc_result rc=display_suffix(display,suffix,sizeof suffix);
+    if(rc!=IPC_OK) return rc;
     const char *ns=getenv("EDIT_IPC_NAMESPACE");
     if(ns!=NULL) {
         if(ns[0]=='\0') return IPC_INVALID;
-        n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu-%s",(unsigned long)getuid(),ns);
-    } else n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu",(unsigned long)getuid());
+        n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu-%s%s",(unsigned long)getuid(),ns,suffix);
+    } else n=snprintf(a->sun_path+1,sizeof a->sun_path-1,"sublimite-%lu%s",(unsigned long)getuid(),suffix);
     if(n<0 || (size_t)n>=sizeof a->sun_path-1) return IPC_LIMIT;
     ep->len=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     ep->abstract=true; return IPC_OK;
 }
 /* Private filesystem endpoint used when another uid has squatted the abstract
  * name (review §13): EDIT_IPC_FALLBACK_DIR (test hook) or /run/user/<uid>. */
-static ipc_result resolve_fallback(endpoint *ep)
+static ipc_result resolve_fallback(const char *display, endpoint *ep)
 {
     memset(ep,0,sizeof *ep); ep->addr.sun_family=AF_UNIX; ep->dir_fd=-1;
     char buf[64]; const char *d=getenv("EDIT_IPC_FALLBACK_DIR");
     if(d==NULL) { (void)snprintf(buf,sizeof buf,"/run/user/%lu",(unsigned long)getuid()); d=buf; }
-    return resolve_dir(d,ep);
+    return resolve_dir(d,display,ep);
 }
 static ipc_result ready(int fd, short events, uint64_t deadline)
 {
@@ -167,10 +186,10 @@ static ipc_result deliver(const endpoint *ep, uint8_t *wire, size_t n, bool wait
     if(fd>=0) close(fd);
     return rc;
 }
-ipc_result ipc_client_send(const char *runtime, const ipc_request *r, int timeout_ms)
+ipc_result ipc_client_send_display(const char *runtime, const char *display, const ipc_request *r, int timeout_ms)
 {
     if(timeout_ms < -1) return IPC_INVALID;
-    endpoint ep; ipc_result rc=resolve(runtime,&ep);
+    endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
     if(rc!=IPC_OK) return rc;
     edit_arena arena={0}; if(edit_arena_init(&arena,IPC_MAX_WIRE)!=0) { ep_close(&ep); return IPC_IO; }
     uint8_t *wire=edit_arena_alloc(&arena,IPC_MAX_WIRE,1); size_t n=0;
@@ -179,7 +198,7 @@ ipc_result ipc_client_send(const char *runtime, const ipc_request *r, int timeou
     if(rc==IPC_OK) rc=deliver(&ep,wire,n,r->wait,deadline);
     if(rc==IPC_REJECTED && ep.abstract) {
         /* Foreign uid on the abstract name; nothing was sent. Try the private path. */
-        endpoint fb; if(resolve_fallback(&fb)==IPC_OK) {
+        endpoint fb; if(resolve_fallback(display,&fb)==IPC_OK) {
             ipc_result r2=deliver(&fb,wire,n,r->wait,deadline); ep_close(&fb);
             if(r2!=IPC_IO) rc=r2;
         }
@@ -507,18 +526,18 @@ done:
     }
     return rc;
 }
-ipc_result ipc_server_init(ipc_server *s, const char *runtime)
+ipc_result ipc_server_init_display(ipc_server *s, const char *runtime, const char *display)
 {
     if(s==NULL) return IPC_INVALID;
     reset_server(s);
-    endpoint ep; ipc_result rc=resolve(runtime,&ep);
+    endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
     if(rc!=IPC_OK) return rc;
     bool foreign=false; bool abstract=ep.abstract;
     rc=start_endpoint(s,&ep,&foreign);
     ep_close(&ep);
     if(rc!=IPC_OK && abstract && foreign) {
         reset_server(s);
-        if(resolve_fallback(&ep)!=IPC_OK) return IPC_EXISTS; /* no private directory: report the squat */
+        if(resolve_fallback(display,&ep)!=IPC_OK) return IPC_EXISTS; /* no private directory: report the squat */
         rc=start_endpoint(s,&ep,&foreign); ep_close(&ep);
     }
     return rc;
@@ -555,4 +574,13 @@ ipc_result ipc_launcher_wait(int fd)
     if(fd<0) return IPC_INVALID;
     ipc_result rc=receive_reply(fd,'C',UINT64_MAX);
     close(fd); return rc;
+}
+
+ipc_result ipc_server_init(ipc_server *s, const char *runtime)
+{
+    return ipc_server_init_display(s, runtime, NULL);
+}
+ipc_result ipc_client_send(const char *runtime, const ipc_request *r, int timeout_ms)
+{
+    return ipc_client_send_display(runtime, NULL, r, timeout_ms);
 }

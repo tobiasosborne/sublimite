@@ -1,3 +1,4 @@
+#include "../tests/ipc_isolation.h"
 #include "ipc/ipc.h"
 #include "harness.h"
 #include <poll.h>
@@ -16,7 +17,7 @@ static ipc_result opened(const ipc_request *r, ipc_token token, void *ctx)
 int main(void)
 {
     alarm(60);
-    char dir[]="/tmp/edit-ipc-bench-XXXXXX"; REQUIRE(mkdtemp(dir)!=NULL);
+    const char *dir=test_ipc_isolate(); REQUIRE(dir!=NULL);
     ipc_server server={0}; REQUIRE(ipc_server_init(&server,dir)==IPC_OK);
     /* G10 margin (edit-457.21 §14): the receive pool is 16x64 KiB + 2x1 MiB = 3 MiB (+ peer table);
      * the old 33.5 MB arena (32 x 1 MiB) must not come back. */

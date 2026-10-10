@@ -1,4 +1,5 @@
 #include "ipc/ipc.h"
+#include "ipc_isolation.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -760,9 +761,38 @@ static void t_launcher(const char *dir)
     }
     rm_rf(rt);
 }
+/* Display routing is exact for filesystem and abstract endpoints. */
+static void t_display(const char *dir)
+{
+    for (unsigned abstract = 0; abstract < 2; abstract++) {
+        if (abstract) CHECK(unsetenv("XDG_RUNTIME_DIR") == 0);
+        const char *runtime = abstract ? NULL : dir;
+        ipc_server first = {0}, second = {0}, duplicate = {0};
+        CHECK(ipc_server_init_display(&first, runtime, ":99") == IPC_OK);
+        CHECK(ipc_server_init_display(&duplicate, runtime, ":99") == IPC_EXISTS);
+        CHECK(ipc_server_init_display(&second, runtime, ":98") == IPC_OK);
+        capture seen = {0}, wrong = {0};
+        pid_t child = fork(); CHECK(child >= 0);
+        if (!child) {
+            ipc_request r = request(false, false);
+            _exit(ipc_client_send_display(runtime, ":99", &r, CLIENT_TIMEOUT_MS) == IPC_OK ? 0 : 2);
+        }
+        serve_one(&first, &seen); reap_ok(child);
+        CHECK(ipc_server_drain(&second, count_only, &wrong) == IPC_OK && wrong.calls == 0);
+        CHECK(ipc_server_init_display(&duplicate, runtime, "") == IPC_INVALID);
+        char long_display[128]; memset(long_display, 'x', sizeof long_display - 1u);
+        long_display[sizeof long_display - 1u] = '\0';
+        CHECK(ipc_server_init_display(&duplicate, runtime, long_display) == IPC_LIMIT);
+        ipc_request r = request(false, false);
+        CHECK(ipc_client_send_display(runtime, long_display, &r, CLIENT_TIMEOUT_MS) == IPC_LIMIT);
+        ipc_server_fini(&first); ipc_server_fini(&second);
+        CHECK(setenv("XDG_RUNTIME_DIR", dir, 1) == 0);
+    }
+    puts("ipc_test: exact display routing, same-display handoff, distinct primaries and bounds passed");
+}
 static int run_suite(const char *only, int ns_fd)
 {
-    alarm(120); char tmp[]="/tmp/edit-ipc-test-XXXXXX"; char *dir=mkdtemp(tmp); CHECK(dir!=NULL); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
+    alarm(120); const char *dir=test_ipc_isolate(); CHECK(dir!=NULL);
     /* mkdtemp makes this namespace unique across processes and worktrees.
      * Forked clients must inherit it rather than choose their own endpoint. */
     CHECK(setenv("EDIT_IPC_NAMESPACE",dir+5,1)==0);
@@ -773,12 +803,17 @@ static int run_suite(const char *only, int ns_fd)
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));
-    T("memory",t_memory(dir)); T("wait_disconnect",t_wait_disconnect(dir)); T("launcher",t_launcher(dir));
+    T("display",t_display(dir)); T("memory",t_memory(dir)); T("wait_disconnect",t_wait_disconnect(dir)); T("launcher",t_launcher(dir));
 #undef T
     if(only!=NULL) { rm_rf(dir); return 0; }
     char p[IPC_PATH_CAP]; const char *names[]={"a:1","link","real"};
     for(size_t i=0;i<3;i++) { CHECK(snprintf(p,sizeof p,"%s/%s",dir,names[i])>0); if(i==2) CHECK(rmdir(p)==0); else CHECK(unlink(p)==0); }
-    CHECK(snprintf(p,sizeof p,"%s/sublimite-%lu.lock",dir,(unsigned long)getuid())>0); CHECK(unlink(p)==0); CHECK(rmdir(dir)==0);
+    const char *display_names[] = {"-d3a3939", "-d3a3938", ""};
+    for (size_t i=0;i<3;i++) {
+        CHECK(snprintf(p,sizeof p,"%s/sublimite-%lu%s.lock",dir,(unsigned long)getuid(),display_names[i])>0);
+        CHECK(unlink(p)==0);
+    }
+    CHECK(rmdir(dir)==0);
     puts("ipc_test: parser, wire, roundtrip, --wait, stdin, stale, race, fragments, tokens, endpoints, review-fix suites ok"); return 0;
 }
 

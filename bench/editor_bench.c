@@ -1,3 +1,4 @@
+#include "../tests/ipc_isolation.h"
 #include "editor/editor.h"
 #include "editor/private.h"
 #include "raster/raster.h"
@@ -722,13 +723,12 @@ static int tab_row(bool raster, bool track)
 }
 static int ipc_row(bool track)
 {
-    stamp tag = power_stamp(); char relative[] = "build/editor-ipc-bench-XXXXXX", runtime[4096];
-    REQUIRE(mkdtemp(relative) != NULL); REQUIRE(realpath(relative, runtime) != NULL);
-    REQUIRE(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
+    stamp tag = power_stamp(); const char *runtime = test_ipc_isolate();
+    REQUIRE(runtime != NULL);
     char path[8192], arg[16384]; (void)snprintf(path, sizeof path, "%s/file.txt", runtime);
     REQUIRE(strlen(path) + 5 < sizeof arg); strcpy(arg, path); strcat(arg, ":2:2");
     FILE *f = fopen(path, "w"); REQUIRE(f != NULL); REQUIRE(fputs("abc\ndef\n", f) >= 0); REQUIRE(fclose(f) == 0);
-    ipc_server server = {0}; REQUIRE(ipc_server_init(&server, runtime) == IPC_OK);
+    ipc_server server = {0}; REQUIRE(ipc_server_init_display(&server, runtime, getenv("DISPLAY")) == IPC_OK);
     render_backend b = {0}; REQUIRE(render_null_backend(&b) == 0);
     editor_config cfg = {.cols = 32, .rows = 8, .server = &server, .start_empty = true,
         .arena_bytes = 4u * 1024u * 1024u, .history_keys = 128};
@@ -757,7 +757,7 @@ static int ipc_row(bool track)
         tag.power, tag.load, editor_get_stats(e).tabs, track ? "TRACK" : "GATE");
     editor_close(e); ipc_server_fini(&server); unlink(path);
     char lock[8192]; (void)snprintf(lock, sizeof lock, "%s/sublimite-%lu.lock", runtime, (unsigned long)getuid());
-    unlink(lock); REQUIRE(rmdir(runtime) == 0); return miss;
+    unlink(lock); return miss;
 }
 int main(int argc, char **argv)
 {

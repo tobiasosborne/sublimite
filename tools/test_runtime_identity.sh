@@ -9,6 +9,14 @@ test -f tools/sublimite.desktop
 grep -q '^Name=sublimité$' tools/sublimite.desktop
 grep -q '^Exec=sublimite %F$' tools/sublimite.desktop
 grep -q '^StartupWMClass=sublimite$' tools/sublimite.desktop
+# Every editor invocation gets a private filesystem/abstract IPC endpoint.
+work=$(mktemp -d "$b/xdg-install-XXXXXX")
+work=$(CDPATH= cd "$work" && pwd)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+mkdir -m 700 "$work/runtime"
+XDG_RUNTIME_DIR="$work/runtime"
+EDIT_IPC_NAMESPACE=${work##*/}
+export XDG_RUNTIME_DIR EDIT_IPC_NAMESPACE
 set +e
 "$b/sublimite" 2>"$b/runtime-usage.txt"
 rc=$?
@@ -17,9 +25,6 @@ test "$rc" -eq 2
 grep -q '^usage: sublimite <file>$' "$b/runtime-usage.txt"
 echo 'test_runtime_identity: binary, usage and desktop passed'
 # Exercise the installer with isolated XDG storage and stubbed desktop commands.
-work=$(mktemp -d "$b/xdg-install-XXXXXX")
-work=$(CDPATH= cd "$work" && pwd)
-trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir -p "$work/bin" "$work/data"
 cat > "$work/bin/xdg-mime" <<'STUB'
 #!/bin/sh
