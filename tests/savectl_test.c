@@ -77,9 +77,7 @@ static void contents(const char *path, const char *expected)
 static file_id base_id(const char *path)
 {
     struct stat st; CHECK(stat(path,&st)==0);
-    return (file_id){.dev=(uint64_t)st.st_dev,.ino=(uint64_t)st.st_ino,.size=(uint64_t)st.st_size,
-        .mtime_ns=(uint64_t)st.st_mtim.tv_sec*UINT64_C(1000000000)+(uint64_t)st.st_mtim.tv_nsec,
-        .mode=(uint32_t)st.st_mode & 07777u,.exists=1};
+    file_id id; file_id_from_stat(&id,&st); return id;
 }
 static void nap(void) { struct timespec t={0,100000}; (void)nanosleep(&t,NULL); }
 static void wait_controller(fixture *f)

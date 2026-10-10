@@ -128,6 +128,15 @@ typedef struct file_id {
 #define FILE_CHG_METADATA  32u  /* mode/owner/group/ctime changed */
 #define FILE_CHG_TRUNCATED 16u   /* mapped inode shorter than the mapping */
 
+/* Shared worker-side identity helpers. stat_path uses lstat on a canonical
+ * entry, returning an absent ID for ENOENT/ENOTDIR. diff compares extended
+ * metadata when both IDs carry it; legacy IDs retain their original contract.
+ * from_stat/diff are CPU-only; stat_path performs filesystem I/O. */
+struct stat;
+void file_id_from_stat(file_id *id, const struct stat *st);
+uint32_t file_id_diff(const file_id *a, const file_id *b);
+int file_id_stat_path(const char *path, file_id *id);
+
 typedef struct file_open_opts {
     uint64_t copy_threshold;   /* 0 = file_default_copy_threshold() */
     uint32_t generation;       /* copied into every message */

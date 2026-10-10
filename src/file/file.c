@@ -498,7 +498,7 @@ static uint64_t mtime_ns(const struct stat *st)
     return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim.tv_nsec;
 }
 
-static void id_from_stat(file_id *id, const struct stat *st)
+void file_id_from_stat(file_id *id, const struct stat *st)
 {
     id->dev = (uint64_t)st->st_dev;
     id->ino = (uint64_t)st->st_ino;
@@ -511,7 +511,7 @@ static void id_from_stat(file_id *id, const struct stat *st)
     id->metadata_valid = 1; id->type = (uint32_t)(st->st_mode & S_IFMT);
 }
 
-static uint32_t id_diff(const file_id *a, const file_id *b)
+uint32_t file_id_diff(const file_id *a, const file_id *b)
 {
     uint32_t r = 0;
     if (!b->exists) return a->exists ? FILE_CHG_GONE : FILE_CHG_NONE;
@@ -525,10 +525,10 @@ static uint32_t id_diff(const file_id *a, const file_id *b)
     return r;
 }
 
-static int id_stat_path(const char *path, file_id *id)
+int file_id_stat_path(const char *path, file_id *id)
 {
     struct stat st;
-    if (lstat(path, &st) == 0) { id_from_stat(id, &st); return FILE_OK; }
+    if (lstat(path, &st) == 0) { file_id_from_stat(id, &st); return FILE_OK; }
     if (errno == ENOENT || errno == ENOTDIR) {
         memset(id, 0, sizeof *id); return FILE_OK;
     }
@@ -544,14 +544,14 @@ static int acquisition_validate(int fd, const char *path, const file_id *expecte
     struct stat st;
     file_id now;
     if (fstat(fd, &st) != 0) { *en = errno; return FILE_ERR_IO; }
-    id_from_stat(&now, &st);
-    if (id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns) return FILE_ERR_CHANGED;
+    file_id_from_stat(&now, &st);
+    if (file_id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns) return FILE_ERR_CHANGED;
     if (lstat(path, &st) != 0) {
         if (errno == ENOENT || errno == ENOTDIR) return FILE_ERR_CHANGED;
         *en = errno; return FILE_ERR_IO;
     }
-    id_from_stat(&now, &st);
-    if (!S_ISREG(st.st_mode) || id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns)
+    file_id_from_stat(&now, &st);
+    if (!S_ISREG(st.st_mode) || file_id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns)
         return FILE_ERR_CHANGED;
     return FILE_OK;
 }
@@ -579,7 +579,7 @@ static void prefix_job(work_ctx *c)
     if (fstat(fd, &st) != 0) { en = errno; rc = FILE_ERR_IO; goto done; }
     if (!S_ISREG(st.st_mode)) { rc = FILE_ERR_NOTREG; goto done; }
     if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX) { en = EFBIG; rc = FILE_ERR_IO; goto done; }
-    id_from_stat(&f->prefix_result.id, &st);
+    file_id_from_stat(&f->prefix_result.id, &st);
     uint64_t threshold = f->threshold ? f->threshold : file_default_copy_threshold();
     f->prefix_result.mode = ((uint64_t)st.st_size < threshold || st.st_size == 0)
                            ? FILE_MODE_COPY : FILE_MODE_MMAP;
@@ -831,9 +831,9 @@ static uint32_t map_change(file_map *m, int *err_no, file_id *version)
     if (m && m->fd >= 0) {
         struct stat st;
         if (fstat(m->fd, &st) == 0) {
-            file_id now; id_from_stat(&now, &st);
+            file_id now; file_id_from_stat(&now, &st);
             if (version) *version = now;
-            r = id_diff(&m->identity, &now) & ~FILE_CHG_METADATA;
+            r = file_id_diff(&m->identity, &now) & ~FILE_CHG_METADATA;
             if ((uint64_t)st.st_size < (uint64_t)m->len) r |= FILE_CHG_TRUNCATED;
         } else *err_no = errno;
     }
@@ -846,10 +846,10 @@ static uint32_t check_now(file *f)
     file_id now;
     uint32_t r;
     int en = 0;
-    if (id_stat_path(f->path, &now) != FILE_OK) {
+    if (file_id_stat_path(f->path, &now) != FILE_OK) {
         f->err_no = errno; return FILE_CHG_NONE;
     }
-    r = id_diff(&f->id, &now);
+    r = file_id_diff(&f->id, &now);
     r |= map_change(f->map, &en, NULL);
     if (en) f->err_no = en;
     if (r && !f->changed) {
@@ -883,7 +883,7 @@ int file_resolve_keep(file *f)
     file_id now;
     int en = 0;
     if (!file_prefix_ready(f)) return FILE_ERR_STATE;
-    if (id_stat_path(f->path, &now) != FILE_OK) { f->err_no = errno; return FILE_ERR_IO; }
+    if (file_id_stat_path(f->path, &now) != FILE_OK) { f->err_no = errno; return FILE_ERR_IO; }
     if (now.exists && now.type != S_IFREG) return FILE_ERR_CHANGED;
     file_id backing;
     uint32_t backing_reasons = map_change(f->map, &en, &backing);
@@ -894,7 +894,7 @@ int file_resolve_keep(file *f)
      * Retired inodes acquire a new ctime from unlink/rename-over; those may
      * still be kept while their actual bytes and fault epoch remain intact. */
     if (f->map && backing.exists && now.exists && now.dev == backing.dev && now.ino == backing.ino)
-        backing_reasons |= id_diff(&f->map->identity, &backing) & FILE_CHG_METADATA;
+        backing_reasons |= file_id_diff(&f->map->identity, &backing) & FILE_CHG_METADATA;
     if (backing_reasons) {
         if (!f->changed) { f->source_generation++; invalidate_save(f); }
         f->changed = 1;
@@ -937,7 +937,7 @@ int file_watch_start(file *f)
 static void check_job(work_ctx *c)
 {
     file *f = c->arg;
-    f->check_result.status = id_stat_path(f->path, &f->check_result.observed);
+    f->check_result.status = file_id_stat_path(f->path, &f->check_result.observed);
     f->check_result.err_no = f->check_result.status == FILE_OK ? 0 : errno;
     int en = 0;
     f->check_result.map_reasons = map_change(f->check.map, &en, NULL);
@@ -1058,7 +1058,7 @@ static void file_sync(file *f, uint32_t kind)
     }
     if (kind == FILE_MSG_CHECK_DONE && !f->check_installed && atomic_load_explicit(&f->check_result_ready, memory_order_acquire)) {
         uint32_t r = f->check_result.map_reasons;
-        if (f->check_result.status == FILE_OK) r |= id_diff(&f->id, &f->check_result.observed);
+        if (f->check_result.status == FILE_OK) r |= file_id_diff(&f->id, &f->check_result.observed);
         if (f->check_result.err_no) f->err_no = f->check_result.err_no;
         if (r && f->source_generation == f->check_result.generation) {
             if (!f->changed) { f->source_generation++; invalidate_save(f); }
@@ -1206,15 +1206,15 @@ static int metadata_capture(save_transaction *tx)
     memset(&tx->metadata_id, 0, sizeof tx->metadata_id);
     if (fstatat(tx->dfd, tx->base, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno != ENOENT) { a->err_no = errno; return FILE_ERR_IO; }
-    } else id_from_stat(&tx->metadata_id, &st);
+    } else file_id_from_stat(&tx->metadata_id, &st);
     if (tx->metadata_id.exists && S_ISLNK(st.st_mode)) return FILE_ERR_CHANGED;
-    if (a->expect && id_diff(a->expect, &tx->metadata_id)) return FILE_ERR_CHANGED;
+    if (a->expect && file_id_diff(a->expect, &tx->metadata_id)) return FILE_ERR_CHANGED;
     if (!tx->metadata_id.exists || !S_ISREG(st.st_mode)) return FILE_OK;
     tx->metadata_fd = openat(tx->dfd, tx->base, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (tx->metadata_fd < 0) { a->err_no = errno; return FILE_ERR_IO; }
     if (fstat(tx->metadata_fd, &st) != 0) { a->err_no = errno; return FILE_ERR_IO; }
-    file_id observed; id_from_stat(&observed, &st);
-    if (id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
+    file_id observed; file_id_from_stat(&observed, &st);
+    if (file_id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
     return FILE_OK;
 }
 static int metadata_apply(save_transaction *tx)
@@ -1231,8 +1231,8 @@ static int metadata_apply(save_transaction *tx)
         }
         if (metadata_xattrs(tx->metadata_fd, tx->fd) != 0) { a->err_no = errno; return FILE_ERR_IO; }
         if (fstat(tx->metadata_fd, &st) != 0) { a->err_no = errno; return FILE_ERR_IO; }
-        file_id observed; id_from_stat(&observed, &st);
-        if (id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
+        file_id observed; file_id_from_stat(&observed, &st);
+        if (file_id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
     }
     /* chown and ACL installation can change permission bits; mode comes last. */
     if (fchmod(tx->fd, (mode_t)mode) != 0) { a->err_no = errno; return FILE_ERR_IO; }
@@ -1300,9 +1300,9 @@ static int transaction_commit(save_transaction *tx)
     {
         file_id now; struct stat st;
         memset(&now, 0, sizeof now);
-        if (fstatat(tx->dfd, tx->base, &st, AT_SYMLINK_NOFOLLOW) == 0) id_from_stat(&now, &st);
+        if (fstatat(tx->dfd, tx->base, &st, AT_SYMLINK_NOFOLLOW) == 0) file_id_from_stat(&now, &st);
         else if (errno != ENOENT && errno != ENOTDIR) { a->err_no = errno; goto fail; }
-        if ((now.exists && S_ISLNK(st.st_mode)) || id_diff(&tx->metadata_id, &now) || (a->expect && id_diff(a->expect, &now))) {
+        if ((now.exists && S_ISLNK(st.st_mode)) || file_id_diff(&tx->metadata_id, &now) || (a->expect && file_id_diff(a->expect, &now))) {
             rc = FILE_ERR_CHANGED; goto fail;
         }
     }
@@ -1317,7 +1317,7 @@ static int transaction_commit(save_transaction *tx)
     if (fstat(tx->fd, &renamed) != 0) identity_error = errno;
     else st = renamed;
     if (a->out_id) {
-        id_from_stat(a->out_id, &st);
+        file_id_from_stat(a->out_id, &st);
         if (identity_error) a->out_id->metadata_valid = 0;
     }
     if (a->replaced) a->replaced(a->replaced_ctx);
@@ -1359,8 +1359,8 @@ static int source_validate(void *ctx)
         struct stat st;
         file_id now;
         if (fstat(m->fd, &st) != 0) return FILE_ERR_CHANGED;
-        id_from_stat(&now, &st);
-        if (id_diff(&f->save.source_id, &now) & ~FILE_CHG_METADATA) return FILE_ERR_CHANGED;
+        file_id_from_stat(&now, &st);
+        if (file_id_diff(&f->save.source_id, &now) & ~FILE_CHG_METADATA) return FILE_ERR_CHANGED;
     }
     return f->save.authorized ? FILE_OK : FILE_ERR_CHANGED;
 }
@@ -1396,7 +1396,7 @@ static void save_job(work_ctx *c)
     if (f->save.source_map && (f->save.flags & FILE_SAVE_FORCE)) {
         struct stat st;
         if (fstat(f->save.source_map->fd, &st) != 0) { a.err_no = errno; rc = FILE_ERR_IO; }
-        else id_from_stat(&f->save.source_id, &st);
+        else file_id_from_stat(&f->save.source_id, &st);
     }
     f->transaction.args = a;
     if (rc == FILE_OK) rc = transaction_prepare(&f->transaction);

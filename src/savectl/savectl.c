@@ -64,23 +64,21 @@ struct savectl {
 
 static file_id identity(const struct stat *st)
 {
-    return (file_id){.dev=(uint64_t)st->st_dev,.ino=(uint64_t)st->st_ino,
-        .size=(uint64_t)st->st_size,
-        .mtime_ns=(uint64_t)st->st_mtim.tv_sec*UINT64_C(1000000000)+(uint64_t)st->st_mtim.tv_nsec,
-        .mode=(uint32_t)st->st_mode & 07777u,.exists=1};
+    file_id id;
+    file_id_from_stat(&id,st);
+    return id;
 }
 static bool same(file_id a, file_id b)
 {
-    return a.exists==b.exists && (!a.exists ||
-        (a.dev==b.dev && a.ino==b.ino && a.size==b.size && a.mtime_ns==b.mtime_ns));
+    return file_id_diff(&a,&b)==FILE_CHG_NONE;
 }
 static int disk_id(const char *path, file_id *out)
 {
-    struct stat st;
     *out=(file_id){0};
-    if (stat(path,&st)) return errno==ENOENT ? FILE_OK : FILE_ERR_IO;
-    if (!S_ISREG(st.st_mode) || st.st_size<0) return FILE_ERR_NOTREG;
-    *out=identity(&st); return FILE_OK;
+    int rc=file_id_stat_path(path,out);
+    if (rc) return rc;
+    if (out->exists && (out->type!=S_IFREG || out->size>INT64_MAX)) return FILE_ERR_NOTREG;
+    return FILE_OK;
 }
 static int validate(void *ctx)
 {
@@ -106,6 +104,9 @@ static void reload_worker(savectl *s)
     reload_bytes *copy=NULL;
     if (fstat(fd,&before)) { r->file_error=FILE_ERR_IO; goto end; }
     if (!S_ISREG(before.st_mode) || before.st_size<0) { r->file_error=FILE_ERR_NOTREG; goto end; }
+    r->file_error=disk_id(s->path,&r->id);
+    if (r->file_error) goto end;
+    if (!same(identity(&before),r->id)) { r->file_error=FILE_ERR_CHANGED; goto end; }
     uint64_t len=(uint64_t)before.st_size;
     if (len>SIZE_MAX) { r->file_error=FILE_ERR_NOMEM; goto end; }
     copy=calloc(1,sizeof *copy);
@@ -169,9 +170,11 @@ static void worker(work_ctx *ctx)
                 r->replaced=r->file_error==FILE_OK || r->file_error==FILE_ERR_DIRSYNC;
                 if (!r->file_error && s->options.journal) {
                     r->journal_error=journal_capture_base(s->path,&r->base);
-                    file_id captured={.dev=r->base.device,.ino=r->base.inode,
-                        .size=r->base.size,.mtime_ns=r->base.mtime_ns,.exists=1};
-                    if (!r->journal_error && !same(captured,r->id)) r->file_error=FILE_ERR_CHANGED;
+                    /* Journal BASE has only these identity fields. The save
+                     * result retains the complete file identity separately. */
+                    if (!r->journal_error && (r->base.device!=r->id.dev ||
+                        r->base.inode!=r->id.ino || r->base.size!=r->id.size ||
+                        r->base.mtime_ns!=r->id.mtime_ns)) r->file_error=FILE_ERR_CHANGED;
                 }
             }
             piece_snapshot_release(s->task.snapshot);
