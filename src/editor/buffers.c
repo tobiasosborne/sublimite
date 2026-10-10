@@ -63,6 +63,7 @@ minimap_input editor_map_input(editor_buffer *b)
 void editor_buffer_destroy(editor_buffer *b)
 {
     if (!b) return;
+    editor_large_close(b);
     minimap_fini(&b->map);
     if (b->index) lineidx_destroy(b->index);
     if (b->file) file_close(b->file);
@@ -82,6 +83,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     *out = NULL;
     if ((!bytes && len) || (path && strlen(path) >= IPC_PATH_CAP)) return EDITOR_ERR_ARG;
     editor_buffer *b = calloc(1, sizeof *b); if (!b) return EDITOR_ERR_MEMORY;
+    b->pool = &e->pool;
     int rc = 0;
     b->base.path = "";
     if (path) {
@@ -89,7 +91,8 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
          * same generation after attachment and immediately before publication. */
         if (e->journal) (void)journal_capture_base(path, &b->base);
         memcpy(b->path, path, strlen(path) + 1);
-        rc = file_open_begin(&e->pool, path, NULL, &b->file);
+        file_open_opts opts = {.copy_threshold = e->cfg.copy_threshold};
+        rc = file_open_begin(&e->pool, path, &opts, &b->file);
         if (rc) goto fail;
         e->opening = b->file; e->open_error = 0;
         while (b->file && !file_open_ready(b->file)) {
@@ -121,7 +124,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     if (e->journal && b->file && (!*b->base.path || journal_check_base(&b->base) || file_check(b->file, NULL))) {
         rc = EDITOR_ERR_IO; goto fail;
     }
-    b->lines = piece_line_count(b->tree);
+    editor_large_init(b);
     b->history_cap = e->cfg.history_keys ? e->cfg.history_keys : 32768;
     if (b->history_cap > (SIZE_MAX - 8) / (2 * sizeof(editor_delta))) { rc = EDITOR_ERR_ARG; goto fail; }
     rc = undo_init(&b->undo, b->tree, 2 * b->history_cap + 8); if (rc) goto fail;
@@ -146,6 +149,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         lineidx_src src = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
         if (lineidx_build_start(b->index, &e->pool, &src)) { piece_snapshot_release(snap); rc = EDITOR_ERR_MEMORY; goto fail; }
     }
+    editor_large_start(e, b);
     b->initial = (view_state){.selection = {.preferred_col = VIEW_PREFERRED_UNSET},
         .wrap = e->cfg.wrap_mode ? e->cfg.wrap_mode > 0 : view_wrap_default(b->path)};
     *out = b; return 0;

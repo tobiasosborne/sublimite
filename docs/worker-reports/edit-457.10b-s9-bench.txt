@@ -1,0 +1,24 @@
+STAMP (M)[AC] BAT0=Not charging load1=9.49 loaded TRACK shared box
+BENCH name=editor_large_log_1g_G5_open_first_viewport n=7 p50=3096028 p99=3701982 ci95=[2812532,3701982] gate_p50=6000000 gate_p99=9000000 pass=1 power=[AC]
+BENCH name=editor_large_log_1g_G7_open_index_exact n=7 p50=275096519 p99=304164999 ci95=[177474594,304164999] gate_p50=80000000 gate_p99=125000000 pass=0 power=[AC]
+LINES log_1g estimated_at_first_viewport=8947713 exact_after_index=8947842 (G7 gate is 1 GB; sparse_10g tracked)
+BENCH name=editor_large_log_1g_fg_ingress_submit n=764 p50=217183 p99=284750 ci95=[215840,218845] gate_p50=1000000 gate_p99=2000000 pass=1 power=[AC]
+FG log_1g mix=index_active samples=764 (G)G1<=1/2ms TRACK
+BENCH name=editor_large_log_1g_G6_find_1worker n=5 p50=237740870 p99=246102308 ci95=[233756759,246102308] gate_p50=80000000 gate_p99=125000000 pass=0 power=[AC]
+FIND log_1g total=298542 (exact count; first 4096 offsets stored)
+BENCH name=editor_large_find_1worker_arrows_fg_ingress_submit n=73 p50=250063 p99=338368 ci95=[245468,252250] gate_p50=1000000 gate_p99=2000000 pass=1 power=[AC]
+FG find_1worker_arrows mix=find_active samples=73 (G)G1<=1/2ms TRACK
+BENCH name=editor_large_typing_line1000_find_1worker_fg_ingress_submit n=500 p50=229271 p99=498566 ci95=[224229,240065] gate_p50=1000000 gate_p99=2000000 pass=1 power=[AC]
+FG typing_line1000_find_1worker mix=find_active samples=500 (G)G1<=1/2ms TRACK
+ALLOC typing_1worker allocations=0 (G)=0
+THREE find_done_and_save_done_ms=2631.4 (tracked, not gated) save_status=0 find_total=298542 index_exact=1
+BENCH name=editor_large_arrows_3workers_fg_ingress_submit n=930 p50=394739 p99=1982673 ci95=[389248,399906] gate_p50=1000000 gate_p99=2000000 pass=1 power=[AC]
+FG arrows_3workers mix=index+warm+find+save samples=930 (G)G1<=1/2ms TRACK
+BENCH name=editor_large_typing_line1000_find+save_fg_ingress_submit n=501 p50=582034 p99=3914113 ci95=[534812,667231] gate_p50=1000000 gate_p99=2000000 pass=0 power=[AC]
+FG typing_line1000_find+save mix=find_loop+save samples=501 (G)G1<=1/2ms TRACK
+ALLOC typing_3workers allocations=0 (G)=0
+BENCH name=editor_large_sparse_10g_G5_open_first_viewport n=3 p50=18908837 p99=35724480 ci95=[11747993,35724480] gate_p50=6000000 gate_p99=9000000 pass=0 power=[AC]
+BENCH name=editor_large_sparse_10g_G7_open_index_exact n=3 p50=4645825171 p99=5294786302 ci95=[2979101379,5294786302] gate_p50=80000000 gate_p99=125000000 pass=0 power=[AC]
+LINES sparse_10g estimated_at_first_viewport=1 exact_after_index=1 (G7 gate is 1 GB; sparse_10g tracked)
+BENCH name=editor_large_sparse_10g_fg_ingress_submit n=4100 p50=626633 p99=2945879 ci95=[623407,630513] gate_p50=1000000 gate_p99=2000000 pass=0 power=[AC]
+FG sparse_10g mix=index_active samples=4100 (G)G1<=1/2ms TRACK

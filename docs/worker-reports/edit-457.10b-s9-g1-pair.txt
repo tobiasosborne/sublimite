@@ -1,0 +1,14 @@
+FAIL 15 trace_now_ns()<deadline
+FAIL 38 settle(e)==0
+G1_PAIR main (M)[AC] BAT0=Charging load1=18.31 lines=8947842 target=8053057 null viewport=180x60
+key=0 settle_ns=3987029715
+key=1 settle_ns=6747788512
+key=2 settle_ns=4843763010
+key=3 settle_ns=4147894341
+key=4 settle_ns=1810248343
+key=5 settle_ns=2069285963
+key=6 settle_ns=3165402536
+FAIL 15 trace_now_ns()<deadline
+FAIL 38 settle(e)==0
+G1_PAIR port (M)[AC] BAT0=Not charging load1=22.34 lines=8947842 target=8053057 null viewport=180x60
+key=0 settle_ns=2766716909

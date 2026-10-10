@@ -49,6 +49,7 @@ typedef struct editor_config {
      * multiple turns. No key mutation/layout run/backend submit occurs inside
      * it. IPC open/setup and bounded index maintenance also run there. */
     void (*on_io)(void *, bool entering);
+    uint64_t copy_threshold;           /* 0 = file default; off-path test override */
 } editor_config;
 typedef struct editor_stats {
     uint64_t input_sequence, submitted_sequence, presented_sequence;

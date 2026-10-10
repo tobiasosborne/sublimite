@@ -11,6 +11,7 @@
 #include "keys/keys.h"
 #include "indent/indent.h"
 #include "minimap/minimap.h"
+#include "editor/large_private.h"
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
 #define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
@@ -27,6 +28,8 @@ typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t 
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
+    work_pool *pool;
+    editor_large lg;
     piece_tree *tree;
     undo_log undo;
     file *file;
@@ -128,4 +131,11 @@ void editor_retire_buffers(editor *e);
 lineidx_src editor_source(editor_buffer *b);
 minimap_input editor_map_input(editor_buffer *b);
 void editor_modified(editor *e);
+/* large.c: UI-owned per-buffer state, mailbox-only worker results. */
+void editor_large_init(editor_buffer *b);
+void editor_large_start(editor *e, editor_buffer *b);
+void editor_large_close(editor_buffer *b);
+void editor_large_index_progress(editor *e);
+void editor_large_file_msg(editor *e, const file_msg *fm);
+bool editor_large_receive(editor *e, const work_msg *msg);
 #endif

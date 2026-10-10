@@ -29,6 +29,25 @@ Design: [decision record](../../docs/decisions/edit-zzj.13.md).
 
 The session 8 integration record is retained below.
 
+# edit-457.10b session 9 — large-file port
+
+Per-buffer large-file state, bounded mapped open, estimated/exact index swap,
+worker warm/find/save and owner-routed completions are implemented. Warm snapshots
+are reserved at open and queued after index publication. Bound mailbox receivers
+cover prepared IPC buffers before tab installation; teardown cancels/joins before
+reclaiming the arena. No new globals or dependency module changes.
+
+Release and forced ASan large-file contracts are green. Final forced all/check
+exited zero: gcc 13 release, clang 18 ASan/UBSan, 60 test binaries and replay CLI. Final editor module fuzz is clean for 61 s (M)[AC], 2870 runs (M)[AC], against
+60 s (G); leaks disabled, coordinator reruns leaks on. DISPLAY/EDIT_DISPLAY :99.
+Loaded large-file benches and a back-to-back warm-order comparison are recorded;
+no timing gate pass is claimed. The separate edit-czn far-line typing stall
+persists in both original main logic and the port and is not fixed here.
+
+Complete per-finding red/green, measurements and missing acceptance items:
+../../docs/worker-reports/edit-457.10b-s9.md. Decisions:
+../../docs/decisions/edit-457.10b.md. Earlier editor status follows unchanged.
+
 # Editor review continuation — edit-zzj.13 session 8
 
 Current review work and red/green evidence are in

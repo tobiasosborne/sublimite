@@ -16,7 +16,7 @@ static void record_slice(editor *e, uint64_t start)
 static int layout_slice(editor *e)
 {
     layout *l = &e->lay;
-    if (l->wrap) return layout_run(l);
+    if (l->wrap || !e->buffer->lg.warm_done) return layout_run(l);
     /* Piece leaves cover at most 64 KiB and their newline counts are warm.
      * Seed each logical row independently: layout's bounded clipped-tail scan
      * is allowed to stop without discovering the next line's newline. */
@@ -110,8 +110,10 @@ void editor_route_work(const work_msg *msg, void *ctx)
             (void)lineidx_poll(e->buffers[i]->index);
         return;
     }
+    if (editor_large_receive(e, msg)) return;
     file_msg fm;
     if (file_msg_decode(msg, &fm) == 0) {
+        editor_large_file_msg(e, &fm);
         if (fm.f == e->opening) e->open_error = fm.status;
         else if (fm.status && !e->error) e->error = fm.status;
         return;
@@ -313,6 +315,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
+    editor_large_index_progress(e);
     uint64_t start = trace_now_ns();
     rc = blink(e, start);
     if (!rc) rc = resize(e);
