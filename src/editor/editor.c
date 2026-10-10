@@ -309,7 +309,10 @@ static int submit(editor *e)
     /* A bounded consumer (including minimap) may adopt the final index range
      * after this turn's pump. Publish before this frame can leave the editor. */
     editor_large_index_progress(e);
-    if (e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (e->op_count || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    int metadata = editor_journal_metadata(e);
+    if (metadata == JOURNAL_BUSY) return 0;
+    if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     editor_large_index_progress(e);
@@ -407,7 +410,7 @@ static int blink(editor *e, uint64_t now)
 
 static bool runnable(const editor *e)
 {
-    bool can_drain = (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES));
+    bool can_drain = (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || !e->op_count);
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         const editor_buffer *b = e->buffers[i];
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
@@ -464,6 +467,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
+    editor_journal_staged(e);
     editor_large_index_progress(e);
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
@@ -474,7 +478,7 @@ int editor_step(editor *e, int timeout_ms)
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
         if (e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
-        else if (e->queue_count && (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
+        else if (e->queue_count && (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || !e->op_count)) {
             plat_event ev = e->queue[e->queue_head];
             e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
             rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
@@ -505,14 +509,14 @@ int editor_step(editor *e, int timeout_ms)
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     rc = present(e);
-    if (!rc && e->journal && !e->dirty && !e->journal_waiting) {
+    if (!rc && e->journal && !e->journal_waiting) {
         journal_stats s = journal_get_stats(e->journal); uint64_t now = trace_now_ns();
         /* Pump only when the default batch/deadline admission is due. A
          * successful pump has scheduled a job; its mailbox advances sync.
          * BUSY on admission is retried, since it can mean a full work pool. */
         if (s.accepted_sequence > s.durable_sequence &&
-            (s.pending_bytes >= JOURNAL_PAGE - JOURNAL_HEADER || now - s.last_sync_ns >= UINT64_C(1000000000))) {
-            int jr = journal_pump(e->journal, now, false);
+            (e->op_count || e->journal_metadata_pending || s.pending_bytes >= JOURNAL_PAGE - JOURNAL_HEADER || now - s.last_sync_ns >= UINT64_C(1000000000))) {
+            int jr = journal_pump(e->journal, now, e->op_count != 0 || e->journal_metadata_pending);
             if (!jr) e->journal_waiting = true;
             else if (jr != JOURNAL_BUSY) e->stats.journal_error = jr;
         }
@@ -576,9 +580,20 @@ uint64_t editor_line_count(const editor *e) { return e ? e->buffer->lines : 0; }
 int editor_flush(editor *e)
 {
     if (!e) return EDITOR_ERR_ARG;
-    editor_journal_staged(e);
     if (!e->journal) return 0;
-    int rc = journal_flush(e->journal);
+    while (e->op_count && !e->stats.journal_error) {
+        size_t before = e->op_count;
+        editor_journal_staged(e);
+        if (e->op_count && e->op_count == before) {
+            int jr = journal_flush(e->journal); if (jr) break;
+        }
+    }
+    int metadata = 0;
+    if (!e->stats.journal_error) do {
+        metadata = editor_journal_metadata(e);
+        if (metadata == JOURNAL_BUSY) { int jr = journal_flush(e->journal); if (jr) { metadata = jr; break; } }
+    } while (metadata == JOURNAL_BUSY);
+    int rc = metadata ? metadata : journal_flush(e->journal);
     e->journal_waiting = false;
     if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error)
         return editor_checkpoint(e);

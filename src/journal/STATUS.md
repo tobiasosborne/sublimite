@@ -1,3 +1,10 @@
+# edit-ck4 — session 9
+
+BASE v2 persists ctime; protected append/delete complement insert credit. Failed-token cancellation publishes a validated complete CURRENT checkpoint before artifact retirement. TARGET persists intended association separately from BASE.
+
+Evidence and remaining acceptance: [worker report](../../docs/worker-reports/edit-ck4-s9.md).
+Design: [decision record](../../docs/decisions/edit-ck4.md). No new globals; leaks-disabled sanitizer verification requires coordinator rerun with leaks enabled.
+
 # Journal status — P1.9h / edit-4w1.54
 
 Session 8 adds `journal_insert_step`: one protected INSERT prefix per caller

@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "journal_test:%d FAIL %s\n", __LINE__, #x); return 1; } } while (0)
 typedef struct model { uint8_t text[32768]; size_t len; uint64_t records; uint32_t views, tabs, windows;
@@ -399,8 +400,9 @@ static void base_payload(uint8_t *p, const journal_base *b)
 {
     uint64_t values[]={b->size,b->mtime_ns,b->inode,b->device};
     for(unsigned i=0;i<4;i++) for(unsigned k=0;k<8;k++) p[i*8+k]=(uint8_t)(values[i]>>(k*8));
-    for(unsigned k=0;k<4;k++) { p[32+k]=(uint8_t)(b->prefix_crc>>(k*8)); p[36+k]=(uint8_t)(b->prefix_len>>(k*8)); }
+    for(unsigned k=0;k<4;k++) { p[32+k]=(uint8_t)(b->prefix_crc>>(k*8)); p[36+k]=(uint8_t)((b->prefix_len|(*b->path?JOURNAL_BASE_V2:0))>>(k*8)); }
     strcpy((char *)p+40,b->path);
+    if(*b->path) for(unsigned k=0;k<8;k++) p[41+strlen(b->path)+k]=(uint8_t)(b->ctime_ns>>(k*8));
 }
 typedef struct save_restore { piece_tree *trees[2]; } save_restore;
 static int load_save(void *ctx, const journal_record *r)
@@ -521,9 +523,9 @@ static int save_test(void)
     SAVE_CHECK(temp(path)>=0 && temp(target)>=0);
     fd=open(target,O_WRONLY); SAVE_CHECK(fd>=0 && write(fd,"abcdef",6)==6); close(fd); fd=-1;
     journal_base b; SAVE_CHECK(journal_capture_base(target,&b)==0);
-    uint8_t bp[4137], empty[41]={0}, del[16]={0}, other[9]={0}, later[9]={0};
+    uint8_t bp[JOURNAL_BASE_MAX], empty[41]={0}, del[16]={0}, other[9]={0}, later[9]={0};
     base_payload(bp,&b); del[8]=3; other[8]='Y'; later[8]='X';
-    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
                          {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other,9}};
     SAVE_CHECK(work_pool_init(&pool,1,0)==0); pool_ready=true;
     SAVE_CHECK(journal_open(&j,path,&pool,NULL)==0);
@@ -562,7 +564,7 @@ static int save_test(void)
     SAVE_CHECK(verify_save(path,"Xdef")==0); /* crash after save, before checkpoint */
     SAVE_CHECK(journal_capture_base(target,&b)==0 && b.size==3); base_payload(bp,&b);
     uint8_t other_now[10]={0}; memcpy(other_now+8,"YZ",2);
-    journal_record next[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_INSERT,1,0,later,9},
+    journal_record next[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)}, {JOURNAL_INSERT,1,0,later,9},
                            {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other_now,10}};
     d=calloc(1,sizeof *d); SAVE_CHECK(d); d->path=path;
     journal_io io=fault_io(d); SAVE_CHECK(journal_set_io(j,&io)==0);
@@ -701,9 +703,9 @@ static int save_names_test(void)
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
     journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
     journal_base b; CHECK(journal_capture_base(target,&b)==0);
-    uint8_t bp[4137], del[16]={0}, text[11]={0}; base_payload(bp,&b);
+    uint8_t bp[JOURNAL_BASE_MAX], del[16]={0}, text[11]={0}; base_payload(bp,&b);
     del[8]=3; memcpy(text+8,"new",3);
-    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)},
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)},
         {JOURNAL_DELETE,1,0,del,16},{JOURNAL_INSERT,1,0,text,11}};
     journal_save save={0};
     CHECK(journal_save_prepare(j,1,&b,cp,3,&save)==0);
@@ -726,9 +728,9 @@ static int save_shared_base_test(void)
     CHECK(temp(path)>=0 && temp(target)>=0);
     int fd=open(target,O_WRONLY); CHECK(fd>=0 && write(fd,"abcdef",6)==6); close(fd);
     journal_base b; CHECK(journal_capture_base(target,&b)==0);
-    uint8_t bp[4137], del[16]={0}, other[9]={0}; base_payload(bp,&b); del[8]=3; other[0]=6; other[8]='Z';
-    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)},{JOURNAL_DELETE,1,0,del,16},
-        {JOURNAL_BASE,2,0,bp,41+strlen(target)},{JOURNAL_INSERT,2,0,other,9}};
+    uint8_t bp[JOURNAL_BASE_MAX], del[16]={0}, other[9]={0}; base_payload(bp,&b); del[8]=3; other[0]=6; other[8]='Z';
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)},{JOURNAL_DELETE,1,0,del,16},
+        {JOURNAL_BASE,2,0,bp,49+strlen(target)},{JOURNAL_INSERT,2,0,other,9}};
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
     journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
     journal_save save={0}; CHECK(journal_save_prepare(j,1,&b,cp,4,&save)==0);
@@ -743,8 +745,8 @@ static int save_shared_base_test(void)
     CHECK(journal_capture_base(target,&b)==0); base_payload(bp,&b);
     uint8_t later[9]={0}, snapshot[16]={0};
     later[8]='X'; memcpy(snapshot+8,"abcdefZY",8);
-    journal_record next[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)},{JOURNAL_INSERT,1,0,later,9},
-        {JOURNAL_BASE,2,0,bp,41+strlen(target)},{JOURNAL_DELETE,2,0,del,16},
+    journal_record next[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)},{JOURNAL_INSERT,1,0,later,9},
+        {JOURNAL_BASE,2,0,bp,49+strlen(target)},{JOURNAL_DELETE,2,0,del,16},
         {JOURNAL_INSERT,2,0,snapshot,16}};
     CHECK(journal_save_finish(j,&save,&b,next,5)==0 && verify_two_buffers(path,"Xdef","abcdefZY")==0);
     journal_close(j); work_pool_shutdown(&pool); unlink(path); unlink(target);
@@ -761,9 +763,9 @@ static int retained_external_test(bool alias_writer)
     CHECK(oldfd>=0 && write(oldfd,"abcdef",6)==6);
     CHECK(link(target,alias)==0);
     journal_base b; CHECK(journal_capture_base(target,&b)==0);
-    uint8_t bp[4137], empty[41]={0}, del[16]={0}, other[9]={0};
+    uint8_t bp[JOURNAL_BASE_MAX], empty[41]={0}, del[16]={0}, other[9]={0};
     base_payload(bp,&b); del[8]=3; other[8]='Y';
-    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,49+strlen(target)}, {JOURNAL_DELETE,1,0,del,16},
                          {JOURNAL_BASE,2,0,empty,41}, {JOURNAL_INSERT,2,0,other,9}};
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
     journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
@@ -855,8 +857,8 @@ static int retained_copy_test(void)
         int fd=open(target,O_WRONLY|O_CREAT|O_EXCL,0600);
         CHECK(fd>=0 && write(fd,bytes,sizeof bytes)==(ssize_t)sizeof bytes); close(fd);
         journal_base b; CHECK(journal_capture_base(target,&b)==0);
-        uint8_t bp[4137]; base_payload(bp,&b);
-        journal_record cp={JOURNAL_BASE,1,0,bp,41+strlen(target)};
+        uint8_t bp[JOURNAL_BASE_MAX]; base_payload(bp,&b);
+        journal_record cp={JOURNAL_BASE,1,0,bp,49+strlen(target)};
         work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
         journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
         /* A write seam requests the copy fallback, making its fault oracle
@@ -1041,8 +1043,8 @@ static int paths_test(void)
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
     journal *j; CHECK(journal_open(&j,"journal",&pool,NULL)==0 && journal_set_base(j,1,&b)==0 && journal_flush(j)==0);
     CHECK(chdir(other)==0 && journal_check_base(&b)==0);
-    uint8_t bp[4137], op[9]={0}; base_payload(bp,&b); op[0]=3; op[8]='!';
-    journal_record cp[]={{JOURNAL_BASE,1,0,bp,41+strlen(b.path)},{JOURNAL_INSERT,1,0,op,9}};
+    uint8_t bp[JOURNAL_BASE_MAX], op[9]={0}; base_payload(bp,&b); op[0]=3; op[8]='!';
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,49+strlen(b.path)},{JOURNAL_INSERT,1,0,op,9}};
     CHECK(journal_rotate(j,cp,2)==0); journal_close(j);
     CHECK(access("journal",F_OK)!=0);
     piece_allocator a=piece_default_allocator(); piece_tree *t=piece_create(&a); CHECK(t && piece_init_copy(t,(const uint8_t *)"abc",3)==0);
@@ -1333,8 +1335,8 @@ static int retention_metadata_test(void)
     journal_io io={.ctx=&oracle,.sync=metadata_data_sync,.metadata_sync=metadata_full_sync};
     CHECK(journal_set_io(j,&io)==0);
     journal_base b; CHECK(journal_capture_base(target,&b)==0);
-    uint8_t payload[4137]; base_payload(payload,&b);
-    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    uint8_t payload[JOURNAL_BASE_MAX]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,49+strlen(b.path)}; journal_save save={0};
     CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0);
     CHECK(oracle.full_synced);
     journal_base retained; CHECK(journal_capture_base(save.previous_path,&retained)==0 && retained.mtime_ns==oracle.mtime);
@@ -1360,8 +1362,8 @@ static int retention_channel_test(void)
     retention_channel c={.pool=&pool,.before=atomic_load(&pool.mb[0].head)};
     journal_io io={.ctx=&c,.rename=retention_channel_rename}; CHECK(journal_set_io(j,&io)==0);
     journal_base b; CHECK(journal_capture_base(target,&b)==0);
-    uint8_t payload[4137]; base_payload(payload,&b);
-    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    uint8_t payload[JOURNAL_BASE_MAX]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,49+strlen(b.path)}; journal_save save={0};
     CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0 && c.mailbox);
     journal_close(j); work_pool_shutdown(&pool); unlink(save.previous_path); unlink(path); unlink(target);
     puts("journal_test: retention completion crosses the routed work mailbox"); return 0;
@@ -1401,8 +1403,8 @@ static int long_base_retention_test(void)
     memcpy(path,paths[depth],len); memcpy(path+len,"/j",3);
     int fd=open(target,O_WRONLY|O_CREAT|O_EXCL,0600); CHECK(fd>=0 && write(fd,"abc",3)==3); close(fd);
     journal_base b; CHECK(journal_capture_base(target,&b)==0 && strlen(b.path)==4095);
-    uint8_t payload[4137]; base_payload(payload,&b);
-    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)};
+    uint8_t payload[JOURNAL_BASE_MAX]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,49+strlen(b.path)};
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
     journal_save save={0}; CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0 && save.prepared);
     CHECK(strlen(save.previous_path)<4095);
@@ -1508,10 +1510,10 @@ static int overlapping_saves_test(void)
         CHECK(temp(path)>=0 && temp(ta)>=0 && temp(tb)>=0);
         CHECK(replace_fixture(ta,"abc")==0 && replace_fixture(tb,"def")==0);
         journal_base original[2]; CHECK(journal_capture_base(ta,&original[0])==0 && journal_capture_base(tb,&original[1])==0);
-        uint8_t bases[2][4137], ops[2][9]={{0}}; base_payload(bases[0],&original[0]); base_payload(bases[1],&original[1]);
+        uint8_t bases[2][JOURNAL_BASE_MAX], ops[2][9]={{0}}; base_payload(bases[0],&original[0]); base_payload(bases[1],&original[1]);
         ops[0][0]=3; ops[0][8]='A'; ops[1][0]=3; ops[1][8]='B';
-        journal_record cp[]={{JOURNAL_BASE,1,0,bases[0],41+strlen(ta)},{JOURNAL_INSERT,1,0,ops[0],9},
-            {JOURNAL_BASE,2,0,bases[1],41+strlen(tb)},{JOURNAL_INSERT,2,0,ops[1],9}};
+        journal_record cp[]={{JOURNAL_BASE,1,0,bases[0],49+strlen(ta)},{JOURNAL_INSERT,1,0,ops[0],9},
+            {JOURNAL_BASE,2,0,bases[1],49+strlen(tb)},{JOURNAL_INSERT,2,0,ops[1],9}};
         work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
         fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; journal_io io=fault_io(d);
         journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
@@ -1552,7 +1554,7 @@ static int overlapping_saves_test(void)
         CHECK(journal_capture_base(ta,&saved[0])==0 && journal_capture_base(tb,&saved[1])==0);
         for(unsigned step=0;step<2;step++) {
             unsigned id=reverse?1-step:step, other=1-id;
-            uint8_t bp[2][4137], deltas[2][10]={{0}}, marker[4153]={0};
+            uint8_t bp[2][JOURNAL_BASE_MAX], deltas[2][10]={{0}}, marker[JOURNAL_BASE_MAX+16]={0};
             for(unsigned b=0;b<2;b++) {
                 bool rebased=b==id || !tokens[b].prepared;
                 const journal_base *base=rebased?&saved[b]:&retained[b]; base_payload(bp[b],base);
@@ -1562,11 +1564,11 @@ static int overlapping_saves_test(void)
             }
             const journal_base *other_target=tokens[other].prepared?&original[other]:&saved[other];
             wire64(marker,tokens[other].sequence); wire32(marker+8,tokens[other].prepared?1:2); base_payload(marker+16,other_target);
-            journal_record finish[]={{JOURNAL_BASE,1,0,bp[0],41+strlen((const char *)bp[0]+40)},
+            journal_record finish[]={{JOURNAL_BASE,1,0,bp[0],49+strlen((const char *)bp[0]+40)},
                 {JOURNAL_INSERT,1,0,deltas[0],tokens[0].prepared && id!=0?10:9},
-                {JOURNAL_BASE,2,0,bp[1],41+strlen((const char *)bp[1]+40)},
+                {JOURNAL_BASE,2,0,bp[1],49+strlen((const char *)bp[1]+40)},
                 {JOURNAL_INSERT,2,0,deltas[1],tokens[1].prepared && id!=1?10:9},
-                {JOURNAL_SAVE,other+1,0,marker,57+strlen(other_target->path)}};
+                {JOURNAL_SAVE,other+1,0,marker,65+strlen(other_target->path)}};
             d->fail_rename=1;
             CHECK(journal_save_finish(j,&tokens[id],&saved[id],finish,5)==JOURNAL_IO);
             CHECK(access(tokens[id].previous_path,F_OK)==0);
@@ -1794,8 +1796,8 @@ static int save_ack_repro(void)
     char path[]="/tmp/journal-save-ack-XXXXXX", target[]="/tmp/journal-save-ack-base-XXXXXX";
     CHECK(temp(path)>=0 && temp(target)>=0);
     work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
-    journal_base b; CHECK(journal_capture_base(target,&b)==0); uint8_t payload[4137]; base_payload(payload,&b);
-    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    journal_base b; CHECK(journal_capture_base(target,&b)==0); uint8_t payload[JOURNAL_BASE_MAX]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,49+strlen(b.path)}; journal_save save={0};
     uint64_t begin=monotonic_ns(); timed_blocker blocker; atomic_init(&blocker.until,begin+200000000);
     work_handle handle=work_submit(&pool,(work_job){timed_bulk,&blocker,0,WORK_BULK}); CHECK(handle.epoch);
     CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0);
@@ -1804,9 +1806,42 @@ static int save_ack_repro(void)
     printf("journal_test: save-ack repro elapsed_ns=%llu (M) G8s_p99_ns=5000000 (G)\n",(unsigned long long)elapsed);
     CHECK(elapsed<=5000000); return 0;
 }
+static int ck4_generation_test(void)
+{
+    char source[]="build/ck4-generation-XXXXXX", log[]="build/ck4-generation-log-XXXXXX";
+    int fd=mkstemp(source); CHECK(fd>=0);
+    uint8_t bytes[8192]; memset(bytes,'a',sizeof bytes);
+    CHECK(write(fd,bytes,sizeof bytes)==(ssize_t)sizeof bytes);
+    struct stat before; CHECK(fstat(fd,&before)==0); close(fd);
+    CHECK(temp(log)>=0);
+    pid_t child=fork(); CHECK(child>=0);
+    if(!child) {
+        work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+        journal *j; journal_base base;
+        CHECK(journal_capture_base(source,&base)==0);
+        CHECK(journal_open(&j,log,&pool,NULL)==0);
+        CHECK(journal_set_base(j,1,&base)==0);
+        CHECK(journal_insert(j,1,8192,(const uint8_t *)"!",1)==0);
+        _exit(0);
+    }
+    int status; CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    fd=open(source,O_WRONLY); CHECK(fd>=0);
+    CHECK(pwrite(fd,"z",1,7000)==1);
+    struct timespec times[2]={before.st_atim,before.st_mtim};
+    CHECK(futimens(fd,times)==0); close(fd);
+    model m={0}; journal_replay_result rr;
+    int rc=journal_replay_file(log,apply,&m,&rr);
+    unlink(source); unlink(log);
+    CHECK(rc==JOURNAL_BASE_CHANGED && m.records==0);
+    puts("P4-3 section 5: abrupt child exit, beyond-prefix rewrite/restored mtime rejected before callbacks");
+    return 0;
+}
 int main(int argc, char **argv)
 {
+    if(argc==1) CHECK(ck4_generation_test()==0);
     if(argc==2) {
+        if(!strcmp(argv[1],"--ck4-generation")) return ck4_generation_test();
         if(!strcmp(argv[1],"--crc-wire")) return crc_wire_test();
         if(!strcmp(argv[1],"--crc-cpu")) return crc_cpu_test();
         if(!strcmp(argv[1],"--insert-steps")) return insert_steps_test();

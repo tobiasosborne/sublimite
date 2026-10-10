@@ -1,4 +1,5 @@
 #include "journal/journal.h"
+#include "file/file.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -126,14 +127,20 @@ static void seal(journal *j, journal_batch *b)
 static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
 {
     switch(type) {
-    case JOURNAL_BASE:
-        if(n<41 || n>4137 || p[n-1]!=0 || memchr(p+40,0,n-41)!=NULL || u32(p+36)>4096 || u32(p+36)>u64(p)) return false;
-        if(p[40]!=0 && (p[40]!='/' || u32(p+36)!=(u64(p)<4096?(uint32_t)u64(p):4096u))) return false;
-        if(p[40]==0 && (u64(p)!=0 || u64(p+8)!=0 || u64(p+16)!=0 || u64(p+24)!=0 || u32(p+32)!=0 || u32(p+36)!=0)) return false;
+    case JOURNAL_BASE: {
+        bool v2=n>=40 && (u32(p+36)&JOURNAL_BASE_V2)!=0;
+        size_t tail=v2?8u:0u;
+        uint32_t prefix=n>=40?u32(p+36)&~JOURNAL_BASE_V2:0;
+        if(n<41+tail || n>4137+tail || p[n-tail-1]!=0 ||
+           memchr(p+40,0,n-tail-41)!=NULL || prefix>4096 || prefix>u64(p)) return false;
+        if(p[40]!=0 && (p[40]!='/' || prefix!=(u64(p)<4096?(uint32_t)u64(p):4096u))) return false;
+        if(p[40]==0 && (v2 || u64(p)!=0 || u64(p+8)!=0 || u64(p+16)!=0 || u64(p+24)!=0 || u32(p+32)!=0 || prefix!=0)) return false;
         return true;
+    }
     case JOURNAL_SAVE: return n>=57 && (u32(p+8)==1 || u32(p+8)==2) && u32(p+12)==0 && payload_valid(JOURNAL_BASE,p+16,n-16);
     case JOURNAL_INSERT: return n>=8;
     case JOURNAL_DELETE: return n==16 && u64(p)<=UINT64_MAX-u64(p+8);
+    case JOURNAL_TARGET: return n>=1 && n<=4097 && p[n-1]==0 && memchr(p,0,n-1)==NULL;
     case JOURNAL_VIEW: return n==32;
     case JOURNAL_TABS: return n>=16 && (n-16)%8==0 && u64(p)==(n-16)/8 && (u64(p)==0 ? u64(p+8)==0 : u64(p+8)<u64(p));
     case JOURNAL_WINDOW: return n==8;
@@ -248,7 +255,7 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
     if(!*path) { *base=(journal_base){.path=path}; return 0; }
     char canonical[4097];
     if(strlen(path)>4096 || !realpath(path,canonical)) return JOURNAL_BASE_CHANGED;
-    int fd=open(canonical,O_RDONLY|O_CLOEXEC); if(fd<0) return JOURNAL_BASE_CHANGED;
+    int fd=open(canonical,O_RDONLY|O_CLOEXEC|O_NONBLOCK); if(fd<0) return JOURNAL_BASE_CHANGED;
     struct stat before,after,atpath; uint8_t prefix[4096]; journal_crc table; size_t got=0; int rc=0;
     if(fstat(fd,&before) || !S_ISREG(before.st_mode) || before.st_size<0 || before.st_mtim.tv_sec<0) rc=JOURNAL_BASE_CHANGED;
     if(!rc) {
@@ -268,10 +275,25 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
         crc_init(&table); *base=(journal_base){.size=(uint64_t)before.st_size,
             .mtime_ns=(uint64_t)before.st_mtim.tv_sec*1000000000u+(uint64_t)before.st_mtim.tv_nsec,
             .inode=(uint64_t)before.st_ino,.device=(uint64_t)before.st_dev,
+            .ctime_ns=(uint64_t)before.st_ctim.tv_sec*1000000000u+(uint64_t)before.st_ctim.tv_nsec,
             .prefix_crc=crc_data(&table,prefix,got),.prefix_len=(uint32_t)got};
         strcpy(base->captured_path,canonical); base->path=base->captured_path;
     }
     close(fd); return rc;
+}
+int journal_base_from_prefix(const char *path, const file_id *identity,
+                             const uint8_t *prefix, size_t size, journal_base *base)
+{
+    if(!path || path[0]!='/' || strlen(path)>4096 || !identity || !base ||
+       !identity->exists || identity->type!=S_IFREG || (!prefix && size)) return JOURNAL_INVALID;
+    size_t n=identity->size<4096?(size_t)identity->size:4096u;
+    if(size<n) return JOURNAL_INVALID;
+    journal_crc crc; crc_init(&crc);
+    *base=(journal_base){.size=identity->size,.mtime_ns=identity->mtime_ns,
+        .ctime_ns=identity->ctime_ns,.inode=identity->ino,.device=identity->dev,
+        .prefix_crc=crc_data(&crc,prefix,n),.prefix_len=(uint32_t)n};
+    strcpy(base->captured_path,path); base->path=base->captured_path;
+    return 0;
 }
 int journal_capture_base(const char *path, journal_base *base)
 { return journal_capture_base_with_io(path,base,NULL); }
@@ -279,14 +301,20 @@ static int check_base_io(const journal_base *base, const journal_io *io)
 {
     if(!base || !base->path) return JOURNAL_INVALID;
     journal_base now; int rc=journal_capture_base_with_io(base->path,&now,io); if(rc) return rc;
-    return base->size==now.size && base->mtime_ns==now.mtime_ns && base->inode==now.inode && base->device==now.device && base->prefix_len==now.prefix_len && base->prefix_crc==now.prefix_crc?0:JOURNAL_BASE_CHANGED;
+    return base->size==now.size && base->mtime_ns==now.mtime_ns && base->ctime_ns==now.ctime_ns && base->inode==now.inode && base->device==now.device && base->prefix_len==now.prefix_len && base->prefix_crc==now.prefix_crc?0:JOURNAL_BASE_CHANGED;
 }
 int journal_check_base(const journal_base *base)
 { return check_base_io(base,NULL); }
 int journal_decode_base(const journal_record *r, journal_base *base, char *path, size_t cap)
 {
-    if(!r || !base || !path || !r->data || r->type!=JOURNAL_BASE || !payload_valid(r->type,r->data,r->size) || cap<r->size-40) return JOURNAL_INVALID;
-    memcpy(path,r->data+40,r->size-40); *base=(journal_base){.size=u64(r->data),.mtime_ns=u64(r->data+8),.inode=u64(r->data+16),.device=u64(r->data+24),.prefix_crc=u32(r->data+32),.prefix_len=u32(r->data+36),.path=path}; return 0;
+    if(!r || !base || !path || !r->data || r->type!=JOURNAL_BASE || !payload_valid(r->type,r->data,r->size)) return JOURNAL_INVALID;
+    bool v2=(u32(r->data+36)&JOURNAL_BASE_V2)!=0;
+    size_t path_size=r->size-40-(v2?8u:0u);
+    if(cap<path_size) return JOURNAL_INVALID;
+    memcpy(path,r->data+40,path_size);
+    *base=(journal_base){.size=u64(r->data),.mtime_ns=u64(r->data+8),.inode=u64(r->data+16),.device=u64(r->data+24),.prefix_crc=u32(r->data+32),.prefix_len=u32(r->data+36)&~JOURNAL_BASE_V2,.path=path,
+        .ctime_ns=v2?u64(r->data+r->size-8):0};
+    return 0;
 }
 int journal_apply_piece(piece_tree *tree, const journal_record *r)
 {
@@ -514,6 +542,20 @@ int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, 
 }
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len)
 { uint8_t data[16]; if(off>UINT64_MAX-len) return JOURNAL_INVALID; put64(data,off); put64(data+8,len); return journal_append(j,JOURNAL_DELETE,id,data,16); }
+int journal_append_protected(journal *j, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
+{
+    uint8_t *record;
+    int rc=reserve_record(j,size,&record); if(rc) return rc;
+    uint64_t end=j->reserved+sealed_size(j->batches[j->current].used+size+32);
+    if(end>j->stats.durable_bytes && end-j->stats.durable_bytes>j->sync_bytes) return JOURNAL_BUSY;
+    return journal_append(j,type,id,data,size);
+}
+int journal_delete_protected(journal *j, uint64_t id, uint64_t off, uint64_t len)
+{
+    if(off>UINT64_MAX-len) return JOURNAL_INVALID;
+    uint8_t data[16]; put64(data,off); put64(data+8,len);
+    return journal_append_protected(j,JOURNAL_DELETE,id,data,sizeof data);
+}
 int journal_insert_step(journal *j, uint64_t id, uint64_t off,
                         const uint8_t *bytes, size_t size, size_t *progress)
 {
@@ -541,17 +583,24 @@ int journal_insert_step(journal *j, uint64_t id, uint64_t off,
     if(j->stats.accepted_sequence!=accepted) *progress+=n;
     return rc?rc:(*progress<size?JOURNAL_BUSY:JOURNAL_OK);
 }
-static int base_data(const journal_base *base, uint8_t *data, size_t *size)
+int journal_encode_base(const journal_base *base, uint8_t *data, size_t cap, size_t *size)
 {
-    if(!base || !base->path || strlen(base->path)>4096 || base->prefix_len>4096 || base->prefix_len>base->size) return JOURNAL_INVALID;
+    if(!base || !base->path || !data || !size || strlen(base->path)>4096 || base->prefix_len>4096 || base->prefix_len>base->size) return JOURNAL_INVALID;
+    size_t n=strlen(base->path)+1, tail=*base->path?8u:0u;
+    if(cap<40+n+tail) return JOURNAL_INVALID;
     put64(data,base->size); put64(data+8,base->mtime_ns); put64(data+16,base->inode); put64(data+24,base->device);
-    put32(data+32,base->prefix_crc); put32(data+36,base->prefix_len);
-    size_t n=strlen(base->path)+1; memcpy(data+40,base->path,n); *size=40+n;
+    put32(data+32,base->prefix_crc); put32(data+36,base->prefix_len|(tail?JOURNAL_BASE_V2:0));
+    memcpy(data+40,base->path,n);
+    if(tail) put64(data+40+n,base->ctime_ns);
+    *size=40+n+tail;
     return payload_valid(JOURNAL_BASE,data,*size)?0:JOURNAL_INVALID;
 }
+static int base_data(const journal_base *base, uint8_t *data, size_t *size)
+{ return journal_encode_base(base,data,JOURNAL_BASE_MAX,size); }
+
 int journal_set_base(journal *j, uint64_t id, const journal_base *base)
 {
-    uint8_t data[4137]; size_t n=0; int rc=base_data(base,data,&n);
+    uint8_t data[JOURNAL_BASE_MAX]; size_t n=0; int rc=base_data(base,data,&n);
     return rc?rc:journal_append(j,JOURNAL_BASE,id,data,n);
 }
 int journal_set_view(journal *j, uint64_t id, const journal_view *v)
@@ -785,7 +834,8 @@ static int retain_generation(work_ctx *ctx, journal_retention *r)
     struct stat before,after,named; const journal_base *p=r->previous; int rc=0;
     if(fstat(source,&before) || !S_ISREG(before.st_mode) || before.st_size<0 || before.st_mtim.tv_sec<0 ||
        (uint64_t)before.st_size!=p->size || (uint64_t)before.st_ino!=p->inode || (uint64_t)before.st_dev!=p->device ||
-       (uint64_t)before.st_mtim.tv_sec*1000000000u+(uint64_t)before.st_mtim.tv_nsec!=p->mtime_ns) rc=JOURNAL_BASE_CHANGED;
+       (uint64_t)before.st_mtim.tv_sec*1000000000u+(uint64_t)before.st_mtim.tv_nsec!=p->mtime_ns ||
+       (uint64_t)before.st_ctim.tv_sec*1000000000u+(uint64_t)before.st_ctim.tv_nsec!=p->ctime_ns) rc=JOURNAL_BASE_CHANGED;
     if(!rc) {
         int cloned=-1;
         if(!r->io->write) {
@@ -840,7 +890,7 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
     if(!j || !previous || !previous->path || !checkpoint || !count || !save || save->prepared ||
        count>j->limit/JOURNAL_HEADER || count>SIZE_MAX/sizeof(journal_record)-1 ||
        (*previous->path && previous->path[0]!='/') || strlen(previous->path)>4096) return JOURNAL_INVALID;
-    uint8_t original[4137]; size_t original_size=0;
+    uint8_t original[JOURNAL_BASE_MAX]; size_t original_size=0;
     int rc=base_data(previous,original,&original_size); if(rc) return rc;
     size_t found=count;
     for(size_t i=0;i<count;i++) if(checkpoint[i].type==JOURNAL_BASE && checkpoint[i].buffer_id==id) {
@@ -869,7 +919,7 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
         rc=retain_base(j,previous,save->previous_path,&retained);
         if(rc) return rc;
     }
-    uint8_t retained_data[4137], marker[4153]={0}; size_t retained_size=0;
+    uint8_t retained_data[JOURNAL_BASE_MAX], marker[JOURNAL_BASE_MAX+16]={0}; size_t retained_size=0;
     rc=base_data(&retained,retained_data,&retained_size); if(rc) return rc;
     put64(marker,save->sequence); put32(marker+8,1); memcpy(marker+16,original,original_size);
     edit_arena a;
@@ -896,7 +946,7 @@ int journal_save_finish(journal *j, journal_save *save, const journal_base *save
     if(!j || !save || !save->prepared || !saved || !saved->path || !*saved->path ||
        !checkpoint || !count || count>j->limit/JOURNAL_HEADER ||
        count>SIZE_MAX/sizeof(journal_record)-1) return JOURNAL_INVALID;
-    uint8_t marker[4153]={0}; size_t n=0; int rc=base_data(saved,marker+16,&n); if(rc) return rc;
+    uint8_t marker[JOURNAL_BASE_MAX+16]={0}; size_t n=0; int rc=base_data(saved,marker+16,&n); if(rc) return rc;
     bool found=false;
     for(size_t i=0;i<count;i++) if(checkpoint[i].type==JOURNAL_BASE) {
         journal_base b; char path[4097]; rc=journal_decode_base(&checkpoint[i],&b,path,sizeof path); if(rc) return rc;
@@ -925,4 +975,31 @@ int journal_save_finish(journal *j, journal_save *save, const journal_base *save
         rc=sync_parent(save->previous_path,&j->io); if(rc) return rc;
     }
     save->prepared=false; return 0;
+}
+
+int journal_save_cancel(journal *j, journal_save *save, const journal_record *checkpoint, size_t count)
+{
+    if(!j || !save || (!save->prepared && !*save->previous_path) || !checkpoint || !count) return JOURNAL_INVALID;
+    for(size_t i=0;i<count;i++) if(checkpoint[i].type==JOURNAL_BASE) {
+        journal_base base; char path[4097];
+        int rc=journal_decode_base(&checkpoint[i],&base,path,sizeof path); if(rc) return rc;
+        if(*save->previous_path && !strcmp(path,save->previous_path)) return JOURNAL_INVALID;
+        rc=journal_check_base(&base); if(rc) return rc;
+    }
+    int rc=journal_flush(j);
+    if(rc && rc!=JOURNAL_IO && rc!=JOURNAL_FULL) return rc;
+    if(rc==JOURNAL_IO) {
+        /* An ambiguous PREPARE rename can leave an unacknowledged namespace
+         * barrier. Repair it off path before rotating; true writeback loss
+         * remains IO and is repaired by the fresh CURRENT generation below. */
+        int retry=journal_retry(j);
+        if(retry && retry!=JOURNAL_IO && retry!=JOURNAL_FULL) return retry;
+    }
+    rc=journal_rotate(j,checkpoint,count); if(rc) return rc;
+    if(*save->previous_path) {
+        if(unlink(save->previous_path) && errno!=ENOENT) return JOURNAL_IO;
+        rc=sync_parent(save->previous_path,&j->io); if(rc) return rc;
+    }
+    save->prepared=false; save->previous_path[0]=0;
+    return 0;
 }

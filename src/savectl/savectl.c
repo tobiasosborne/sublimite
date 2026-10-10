@@ -9,11 +9,12 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <unistd.h>
+#include <sys/random.h>
 
 /* Epoch and the prepare-return acknowledgement are shared atomic fields.
  * Frozen task input is borrowed by a worker; a separate result lease transfers ownership only via
  * its generation-validated terminal mailbox message. */
-typedef enum operation { OP_SAVE, OP_FINISH, OP_RECOVER_FINISH, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD } operation;
+typedef enum operation { OP_SAVE, OP_FINISH, OP_RECOVER_FINISH, OP_CANCEL, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD } operation;
 typedef struct reload_bytes {
     _Atomic size_t refs;
     uint8_t *bytes;
@@ -52,6 +53,7 @@ typedef struct notification { savectl *owner; completion *lease; bool handoff; }
 struct savectl {
     savectl_options options;
     char path[4097];
+    int reload_cache_fd;
     file_id baseline;
     savectl_state state;
     bool modified, active, event, external, ready_reload, needs_finish, closing;
@@ -123,6 +125,28 @@ static int stop(void *ctx)
     if (rc) s->completion->value.stop_error=rc;
     return rc!=FILE_OK;
 }
+static int private_reload_backing(savectl *s)
+{
+    int fd=openat(s->reload_cache_fd,".",O_TMPFILE|O_RDWR|O_CLOEXEC,0600);
+    if(fd>=0) return fd;
+    for(unsigned attempt=0;attempt<64;attempt++) {
+        uint64_t nonce[2]; size_t got=0;
+        while(got<sizeof nonce) {
+            ssize_t n=getrandom((uint8_t *)nonce+got,sizeof nonce-got,0);
+            if(n<0 && errno==EINTR) continue;
+            if(n<=0) return -1;
+            got+=(size_t)n;
+        }
+        char name[80];
+        int n=snprintf(name,sizeof name,".sublimite-reload-%llx-%llx",(unsigned long long)nonce[0],(unsigned long long)nonce[1]);
+        if(n<0 || (size_t)n>=sizeof name) { errno=EINVAL; return -1; }
+        fd=openat(s->reload_cache_fd,name,O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR|O_CLOEXEC,0600);
+        if(fd<0) { if(errno==EEXIST) continue; return -1; }
+        if(unlinkat(s->reload_cache_fd,name,0)) { int en=errno; (void)close(fd); errno=en; return -1; }
+        return fd;
+    }
+    errno=EEXIST; return -1;
+}
 static void reload_worker(savectl *s)
 {
     result *r=&s->completion->value;
@@ -147,6 +171,7 @@ static void reload_worker(savectl *s)
         char *slash=strrchr(directory,'/');
         if (slash==directory) slash[1]=0; else *slash=0;
         int backing=open(directory,O_TMPFILE|O_RDWR|O_CLOEXEC,0600);
+        if (backing<0) backing=private_reload_backing(s);
         if (backing<0) { r->file_error=FILE_ERR_IO; goto end; }
         int cloned=-1;
         uint64_t threshold=s->options.reload_copy_threshold;
@@ -197,6 +222,16 @@ end:
     else r->reload=copy;
     (void)close(fd);
 }
+static void save_replaced(void *ctx) { ((result *)ctx)->replaced=true; }
+static int sync_target_parent(savectl *s)
+{
+    char path[4097]; strcpy(path,s->path); char *slash=strrchr(path,'/');
+    if(slash==path) slash[1]=0; else *slash=0;
+    int fd=open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC); if(fd<0) return FILE_ERR_DIRSYNC;
+    int rc; do { rc=fsync(fd); } while(rc<0 && errno==EINTR);
+    int saved_errno=errno; (void)close(fd); errno=saved_errno;
+    return rc<0?FILE_ERR_DIRSYNC:FILE_OK;
+}
 static void worker(work_ctx *ctx)
 {
     savectl *s=ctx->arg;
@@ -239,26 +274,28 @@ static void worker(work_ctx *ctx)
                     .mode=s->options.create_mode_valid ? s->options.create_mode : s->task.expect.mode,
                     .mode_valid=s->options.create_mode_valid,.expect=&s->task.expect,
                     .stop=stop,.stop_ctx=s,.validate=validate,.validate_ctx=s,
-                    .out_id=&r->id,.step=s->options.step,.step_ctx=s->options.step_ctx};
+                    .out_id=&r->id,.replaced=save_replaced,.replaced_ctx=r,.step=s->options.step,.step_ctx=s->options.step_ctx};
                 r->file_error=file_save_write(&args); r->err_no=args.err_no;
                 if (r->file_error==FILE_ERR_CANCELLED && r->stop_error)
                     r->file_error=r->stop_error;
-                r->replaced=r->file_error==FILE_OK || r->file_error==FILE_ERR_DIRSYNC;
-                if (!r->file_error && s->options.journal) {
+                if (r->replaced && s->options.journal && r->id.metadata_valid) {
                     r->journal_error=journal_capture_base(s->path,&r->base);
-                    /* Journal BASE has only these identity fields. The save
-                     * result retains the complete file identity separately. */
+                    /* Match persisted generation fields to the replacement result. */
                     if (!r->journal_error && (r->base.device!=r->id.dev ||
                         r->base.inode!=r->id.ino || r->base.size!=r->id.size ||
-                        r->base.mtime_ns!=r->id.mtime_ns)) r->file_error=FILE_ERR_CHANGED;
+                        r->base.mtime_ns!=r->id.mtime_ns || r->base.ctime_ns!=r->id.ctime_ns)) r->file_error=FILE_ERR_CHANGED;
                 }
             }
             piece_snapshot_release(s->task.snapshot);
             if (s->task.request_mode) s->task.request.release(s->task.request.ctx);
+        } else if (op==OP_CANCEL) {
+            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
+            if(!r->file_error) r->journal_error=journal_save_cancel(s->options.journal,&lease->token,s->task.checkpoint,s->task.count);
         } else if (op==OP_FINISH || op==OP_RECOVER_FINISH) {
-            if (op==OP_RECOVER_FINISH)
+            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
+            if (!r->file_error && op==OP_RECOVER_FINISH)
                 r->journal_error=journal_rotate(s->options.journal,s->task.checkpoint,s->task.count);
-            if (!r->journal_error)
+            if (!r->file_error && !r->journal_error)
                 r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
                     s->task.checkpoint,s->task.count);
         }
@@ -303,7 +340,7 @@ static int submit(savectl *s, operation op)
     s->handle=work_submit(s->options.pool,(work_job){worker,s,s->generation,WORK_BULK});
     if (!s->handle.epoch) return SAVECTL_POOL;
     s->active=true;
-    s->journal_leased=s->options.journal && (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH);
+    s->journal_leased=s->options.journal && (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH || op==OP_CANCEL);
     if (op==OP_DISCARD) s->result.reload=NULL;
     (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,controller_message,s);
     return SAVECTL_OK;
@@ -319,6 +356,10 @@ int savectl_create(savectl **out, const savectl_options *o, bool modified)
     if (!s) return SAVECTL_NOMEM;
     s->completion=calloc(1,sizeof *s->completion);
     if (!s->completion) { free(s); return SAVECTL_NOMEM; }
+    const char *cache=o->reload_cache_dir;
+    if(!cache) { cache=getenv("TMPDIR"); if(!cache || cache[0]!='/') cache="/tmp"; }
+    s->reload_cache_fd=cache[0]=='/'?open(cache,O_RDONLY|O_DIRECTORY|O_CLOEXEC):-1;
+    if(s->reload_cache_fd<0) { free(s->completion); free(s); return SAVECTL_INVALID; }
     s->options=*o; strcpy(s->path,o->path); s->options.path=s->path;
     s->baseline=o->baseline; s->modified=modified;
     if (o->source) {
@@ -339,6 +380,7 @@ int savectl_destroy(savectl *s)
         return SAVECTL_BUSY;
     if (s->handle.epoch)
         (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,NULL,NULL);
+    (void)close(s->reload_cache_fd);
     free(s->completion);
     file_source_release(s->options.source);
     free(s); return SAVECTL_OK;
@@ -388,6 +430,8 @@ savectl_model savectl_get_model(const savectl *s)
             (s->options.source_mode!=FILE_MODE_MMAP || s->options.validate_source!=NULL),
         .busy=s->active,.needs_finish=s->needs_finish,
         .journal_leased=s->journal_leased,
+        .can_recover_cancel=s->options.journal && !s->closing && !s->active &&
+            (s->token.prepared || s->token.previous_path[0]),
         .file_error=s->file_error,.journal_error=s->journal_error,.err_no=s->err_no};
 }
 int savectl_save(savectl *s, piece_tree *tree, const journal_base *previous,
@@ -453,6 +497,14 @@ int savectl_recover_finish(savectl *s, const journal_record *checkpoint, size_t 
     s->task.checkpoint=checkpoint; s->task.count=count;
     int rc=submit(s,OP_RECOVER_FINISH);
     if (!rc) s->state=SAVECTL_SAVING;
+    return rc;
+}
+int savectl_recover_cancel(savectl *s, const journal_record *checkpoint, size_t count)
+{
+    if(!s || !s->options.journal || !checkpoint || !count) return SAVECTL_INVALID;
+    if(s->closing || s->active || (!s->token.prepared && !s->token.previous_path[0])) return SAVECTL_BUSY;
+    s->task.checkpoint=checkpoint; s->task.count=count;
+    int rc=submit(s,OP_CANCEL); if(!rc) s->state=SAVECTL_SAVING;
     return rc;
 }
 const journal_base *savectl_saved_base(const savectl *s) { return s->needs_finish ? &s->saved_base : NULL; }
@@ -542,9 +594,13 @@ void savectl_tick(savectl *s)
         s->active=false; s->journal_leased=false;
         if (op!=OP_DISCARD) {
             s->file_error=r->file_error; s->err_no=r->err_no;
-            if (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH) s->journal_error=r->journal_error;
+            if (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH || op==OP_CANCEL) s->journal_error=r->journal_error;
+            if (op==OP_SAVE && r->replaced && s->options.journal && *r->base.captured_path && !r->journal_error) {
+                s->saved_base=r->base; s->saved_base.path=s->saved_base.captured_path;
+                s->needs_finish=true;
+            }
             if (r->file_error || r->journal_error) {
-                if (r->replaced) s->baseline=r->id;
+                if (r->replaced && r->id.metadata_valid) s->baseline=r->id;
                 if (r->file_error==FILE_ERR_CHANGED || r->journal_error==JOURNAL_BASE_CHANGED) changed(s);
                 else s->state=SAVECTL_FAILED;
             } else if (op==OP_SAVE) {
@@ -556,6 +612,9 @@ void savectl_tick(savectl *s)
                 } else saved(s);
             } else if (op==OP_FINISH || op==OP_RECOVER_FINISH) {
                 s->needs_finish=false; s->token.previous_path[0]=0; saved(s);
+            } else if (op==OP_CANCEL) {
+                s->needs_finish=false; s->token=(journal_save){0};
+                s->modified=true; s->state=s->external?SAVECTL_EXTERNAL_MODIFIED:SAVECTL_IDLE;
             } else if (op==OP_KEEP) {
                 if (atomic_load_explicit(&s->epoch,memory_order_relaxed)==s->task.epoch) {
                     s->baseline=r->id; s->external=false; s->state=SAVECTL_IDLE;

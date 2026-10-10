@@ -26,11 +26,16 @@ int journal_default_dir(char *out, size_t cap);
 
 typedef enum journal_type {
     JOURNAL_BASE = 1, JOURNAL_INSERT, JOURNAL_DELETE, JOURNAL_VIEW,
-    JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE
+    JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE, JOURNAL_TARGET
 } journal_type;
+#define JOURNAL_BASE_V2 UINT32_C(0x80000000)
+#define JOURNAL_BASE_MAX 4145u
+/* BASE v2: prefix_len bit 31 selects an eight-byte ctime suffix after the
+ * NUL-terminated path. Legacy named BASEs cannot prove a generation and are
+ * rejected at file recovery; legacy empty BASEs remain valid. */
 /* All wire integers are little-endian; no native structs are persisted. */
 typedef struct journal_base {
-    uint64_t size, mtime_ns, inode, device;
+    uint64_t size, mtime_ns, inode, device, ctime_ns;
     uint32_t prefix_crc, prefix_len;
     /* Empty path means never saved; size must be zero, edits create content. */
     const char *path;
@@ -151,6 +156,11 @@ int journal_retry(journal *j);
 int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
                          const journal_record *checkpoint, size_t count,
                          journal_save *save);
+/* Resolve a failed/ambiguous transaction without acknowledging Saved. Host
+ * supplies a complete CURRENT checkpoint with every BASE reconciled. Fresh
+ * durable publication precedes retained-artifact retirement; retry preserves
+ * the token on all failures, including an already-unlinked artifact. */
+int journal_save_cancel(journal *j, journal_save *save, const journal_record *checkpoint, size_t count);
 int journal_save_finish(journal *j, journal_save *save, const journal_base *saved,
                         const journal_record *checkpoint, size_t count);
 /* Setup/close/rotation may allocate or block; never call on typing path.
@@ -205,6 +215,9 @@ int journal_insert(journal *j, uint64_t id, uint64_t off,
  * wait, sync or submission. Bytes/attempts bound CPU work, NOT syscall wall time. */
 int journal_insert_step(journal *j, uint64_t id, uint64_t off,
                         const uint8_t *bytes, size_t size, size_t *progress);
+/* Complete-record admission including eventual PAD, for DELETE/metadata. */
+int journal_append_protected(journal *j, uint32_t type, uint64_t id, const uint8_t *data, size_t size);
+int journal_delete_protected(journal *j, uint64_t id, uint64_t off, uint64_t len);
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len);
 int journal_set_base(journal *j, uint64_t id, const journal_base *base);
 int journal_set_view(journal *j, uint64_t id, const journal_view *view);
@@ -259,10 +272,16 @@ int journal_replay_file(const char *path, journal_visit visit, void *ctx,
  * manually built records must already be canonical absolute paths. Missing,
  * unreadable, short-read or changed bases yield BASE_CHANGED. The optional read
  * seam applies only to BASE prefixes, not journal transport or bulk-copy reads. */
+struct file_id;
+/* CPU-only construction from the SAME worker-validated file original/prefix.
+ * Call before retiring acquisition prefix storage. No path discovery or I/O. */
+int journal_base_from_prefix(const char *path, const struct file_id *identity,
+                             const uint8_t *prefix, size_t size, journal_base *base);
 int journal_capture_base(const char *path, journal_base *base);
 int journal_capture_base_with_io(const char *path, journal_base *base, const journal_io *io);
 int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx,
                                 journal_replay_result *result, const journal_io *io);
+int journal_encode_base(const journal_base *base, uint8_t *data, size_t cap, size_t *size);
 int journal_decode_base(const journal_record *record, journal_base *base,
                         char *path, size_t capacity);
 int journal_check_base(const journal_base *base);

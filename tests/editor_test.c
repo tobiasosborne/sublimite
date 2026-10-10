@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct counted { bool active, suspended; size_t allocations, frames; } counted;
@@ -431,8 +433,8 @@ static int review_suffix_at(unsigned mode)
             T(journal_insert(e->journal, e->buffer->id, 0, large, JOURNAL_DEFAULT_BATCH_BYTES) == JOURNAL_FULL); free(large);
         }
         e->stage[0] = 'a'; e->stage[1] = 'b'; e->stage_used = 2; e->op_count = 2;
-        e->ops[0] = (editor_jop){0, 1, 0, true, e->buffer->id};
-        e->ops[1] = (editor_jop){1, 1, 1, true, e->buffer->id};
+        e->ops[0] = (editor_jop){.len=1, .insert=true, .id=e->buffer->id};
+        e->ops[1] = (editor_jop){.off=1, .len=1, .at=1, .insert=true, .id=e->buffer->id};
         uint64_t accepted = journal_get_stats(e->journal).accepted_sequence;
         editor_journal_staged(e); T(e->stats.journal_error == (mode ? JOURNAL_IO : JOURNAL_FULL));
         /* IO accepted the first record into the journal's retained batch;
@@ -1343,10 +1345,265 @@ static int index_eventual_repair(void)
     printf("P1-1 section 6: inactive exact counts/jump, bulk cancellation/retry, mallocs=%zu guard=%s passed (M)[AC]\n",
         allocations, edit_malloc_guard_active() ? "active" : "ASan-inert"); return 0;
 }
+/* P4-3 process recovery probes. _exit bypasses all orderly flush/close. */
+static int ck4_restore(void *ctx, const journal_record *r)
+{
+    replay_model *m = ctx;
+    if (r->type == JOURNAL_BASE) {
+        journal_base base; char path[4097];
+        if (journal_decode_base(r, &base, path, sizeof path) || base.size > sizeof m->bytes) return 1;
+        m->len = (size_t)base.size;
+        if (*path) {
+            int fd = open(path, O_RDONLY); if (fd < 0) return 1;
+            ssize_t n = read(fd, m->bytes, m->len); close(fd);
+            if (n != (ssize_t)m->len) return 1;
+        }
+        return 0;
+    }
+    return replay(ctx, r);
+}
+typedef struct ck4_session { replay_model buffers[3]; } ck4_session;
+static int ck4_session_restore(void *ctx, const journal_record *record)
+{
+    ck4_session *session=ctx;
+    if(!record->buffer_id) return 0;
+    if(record->buffer_id>3) return 1;
+    return ck4_restore(&session->buffers[record->buffer_id-1],record);
+}
+static int ck4_recovery(unsigned choice)
+{
+    char source[] = "build/ck4-source-XXXXXX", log[] = "build/ck4-log-XXXXXX";
+    int fd = mkstemp(source); T(fd >= 0 && write(fd, "a", 1) == 1); close(fd);
+    fd = mkstemp(log); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.path = source, .journal_path = log, .cols = 32, .rows = 4, .copy_threshold = choice >= 3 ? 1 : 0};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        uint64_t unrelated;
+        T(editor_add_buffer(e,NULL,(const uint8_t *)"other",5,&unrelated)==0); T(settle(e)==0);
+        T(editor_add_buffer(e,NULL,(const uint8_t *)"closed",6,&unrelated)==0); T(settle(e)==0);
+        T(editor_close_tab(e,tabs_active_index(&e->tabs))==0); T(settle(e)==0);
+        T(editor_select_tab(e,0)==0); T(settle(e)==0);
+        T(press(e, key('x', 0, "x")) == 0);
+        if (!choice) {
+            T(press(e, key('s', PLAT_MOD_CTRL, NULL)) == 0);
+            uint64_t deadline = trace_now_ns() + UINT64_C(1000000000);
+            char saved[2] = {0};
+            do {
+                T(editor_step(e, 0) >= 0);
+                fd = open(source, O_RDONLY); T(fd >= 0);
+                ssize_t n = read(fd, saved, sizeof saved); close(fd);
+                if (n == 2 && !memcmp(saved, "xa", 2)) break;
+                sched_yield();
+            } while (trace_now_ns() < deadline);
+            T(!memcmp(saved, "xa", 2));
+        } else {
+            if(choice>=3) {
+                char next[128]; T(snprintf(next,sizeof next,"%s.new",source)>0);
+                fd=open(next,O_WRONLY|O_CREAT|O_EXCL,0600); T(fd>=0 && write(fd,"z",1)==1); close(fd);
+                T(rename(next,source)==0);
+            } else {
+                fd = open(source, O_WRONLY | O_TRUNC); T(fd >= 0 && write(fd, "z", 1) == 1); close(fd);
+            }
+            uint64_t deadline = trace_now_ns() + UINT64_C(2000000000);
+            while (!e->buffer->source_stale) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+            T(editor_source_resolve(e, choice == 2 || choice == 4) == 0); T(settle(e) == 0);
+            T(!e->buffer->source_stale);
+            if (choice == 1 || choice == 3) T(editor_tab(e, tabs_active_index(&e->tabs))->modified);
+        }
+        T(press(e, key('y', 0, "y")) == 0);
+        _exit(0);
+    }
+    int status; T(waitpid(child, &status, 0) == child);
+    T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    ck4_session session = {0}; journal_replay_result result;
+    int rc = journal_replay_file(log, ck4_session_restore, &session, &result);
+    replay_model model = session.buffers[0];
+    unlink(source); unlink(log);
+    T(rc == JOURNAL_OK);
+    const char *expected = choice == 2 || choice == 4 ? "zy" : "xya";
+    T(model.len == strlen(expected) && !memcmp(model.bytes, expected, model.len));
+    T(session.buffers[1].len==5 && !memcmp(session.buffers[1].bytes,"other",5));
+    T(session.buffers[2].len==6 && !memcmp(session.buffers[2].bytes,"closed",6));
+    printf("P4-3 section %s: mode=%s choice=%s child abrupt exit; selected/unrelated/closed recovery exact\n",
+        choice ? "4" : "3", choice>=3?"mapped":"COPY", choice==2 || choice==4?"Reload":"Keep");
+    return 0;
+}
+static int ck4_startup(void)
+{
+    char root[4097]; T(getcwd(root,sizeof root));
+    size_t n=strlen(root); const char suffix[]="/build/ck4-startup-XXXXXX";
+    T(n+sizeof suffix<sizeof root); memcpy(root+n,suffix,sizeof suffix); T(mkdtemp(root));
+    char directory[4097]; int len=snprintf(directory,sizeof directory,"%s/sublimite",root);
+    T(len>0 && (size_t)len<sizeof directory);
+    char previous[4097]="", current[4097]="";
+    for(unsigned launch=0;launch<2;launch++) {
+        int input[2]; T(pipe(input)==0); pid_t child=fork(); T(child>=0);
+        if(!child) {
+            close(input[1]); T(dup2(input[0],STDIN_FILENO)>=0); close(input[0]);
+            T(setenv("XDG_DATA_HOME",root,1)==0); T(setenv("EDIT_BACKEND","raster",1)==0);
+            T(setenv("DISPLAY",":99",1)==0); T(setenv("EDIT_DISPLAY",":99",1)==0);
+            int output=open("build/ck4-startup-child.log",O_WRONLY|O_CREAT|O_APPEND,0600);
+            T(output>=0); T(dup2(output,STDERR_FILENO)>=0); close(output);
+            if(!launch) execl("build/sublimite","sublimite","--new-instance","-",(char *)NULL);
+            else execl("build/sublimite","sublimite","--new-instance",(char *)NULL);
+            _exit(99);
+        }
+        close(input[0]); if(!launch) T(write(input[1],"unsaved",7)==7); close(input[1]);
+        uint64_t deadline=trace_now_ns()+UINT64_C(5000000000); bool ready=false;
+        do {
+            DIR *dir=opendir(directory);
+            if(dir) {
+                struct dirent *entry;
+                while((entry=readdir(dir))) if(!strncmp(entry->d_name,"session-",8)) {
+                    len=snprintf(current,sizeof current,"%s/%s",directory,entry->d_name);
+                    T(len>0 && (size_t)len<sizeof current);
+                    struct stat info;
+                    if(strcmp(previous,current) && stat(current,&info)==0 && info.st_size>0) { ready=true; break; }
+                }
+                closedir(dir);
+            }
+            if(!ready) { struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL); }
+        } while(!ready && trace_now_ns()<deadline);
+        T(kill(child,SIGKILL)==0); int status; T(waitpid(child,&status,0)==child); T(ready);
+        if(!launch) strcpy(previous,current);
+    }
+    replay_model model={0}; journal_replay_result result;
+    int rc=journal_replay_file(current,ck4_restore,&model,&result);
+    T(rc==0 && model.len==7 && !memcmp(model.bytes,"unsaved",7));
+    unlink(previous); unlink(current); rmdir(directory);
+    return 0;
+}
+typedef struct ck4_power { uint8_t image[256u*1024u]; size_t len; } ck4_power;
+static int ck4_sync_image(void *ctx, int fd, bool directory)
+{
+    if(directory) return fsync(fd);
+    ck4_power *power=ctx;
+    if(fdatasync(fd)) return -1;
+    ssize_t n=pread(fd,power->image,sizeof power->image,0);
+    if(n<0) return -1;
+    power->len=(size_t)n; return 0;
+}
+static int ck4_busy_submit(render_backend *backend, const render_grid *grid, const render_strip *strips, size_t count)
+{ (void)backend; (void)grid; (void)strips; (void)count; return RENDER_ERR_BUSY; }
+static int ck4_credit(void)
+{
+    char log[]="build/ck4-credit-XXXXXX"; int fd=mkstemp(log); T(fd>=0); close(fd);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.journal_path=log,.cols=16,.rows=2}; editor *e=NULL;
+    T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0); T(editor_flush(e)==0);
+    ck4_power *power=calloc(1,sizeof *power); T(power);
+    journal_io io={.ctx=power,.sync=ck4_sync_image}; T(journal_set_io(e->journal,&io)==0);
+    review_hold hold={0}; work_handle bulk=work_submit(&e->pool,(work_job){review_hold_job,&hold,0,WORK_BULK}); T(bulk.epoch);
+    while(!atomic_load(&hold.entered)) sched_yield();
+    size_t size=128u*1024u; memset(e->stage,'q',size); e->stage_used=size;
+    e->ops[0]=(editor_jop){.id=e->buffer->id,.insert=true,.len=size}; e->op_count=1;
+    editor_journal_staged(e);
+    T(journal_get_stats(e->journal).unprotected_bytes<=JOURNAL_DEFAULT_SYNC_BYTES);
+    int (*submit_fn)(render_backend *,const render_grid *,const render_strip *,size_t)=backend.ops.submit;
+    backend.ops.submit=ck4_busy_submit; T(editor_begin_frame(e)==0); e->paint_ready=true;
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000);
+    while(e->op_count || journal_get_stats(e->journal).durable_sequence<journal_get_stats(e->journal).accepted_sequence) {
+        T(editor_step(e,0)>=0); T(e->dirty);
+        T(journal_get_stats(e->journal).unprotected_bytes<=JOURNAL_DEFAULT_SYNC_BYTES);
+        T(trace_now_ns()<deadline);
+        sched_yield();
+    }
+    uint8_t *bytes=malloc(size); T(bytes); review_bytes model={bytes,0,size}; journal_replay_result result;
+    T(journal_replay_bytes(power->image,power->len,review_replay_bytes,&model,&result)==0);
+    T(model.len==size); for(size_t j=0;j<size;j++) T(bytes[j]=='q');
+    atomic_store(&hold.release,true); backend.ops.submit=submit_fn;
+    T(settle(e)==0); editor_close(e); unlink(log); free(bytes); free(power);
+    puts("P4-3 section 8: complete-record credit bounded; independent durable image exact with dirty frames and occupied bulk worker");
+    return 0;
+}
+typedef struct ck4_metadata { journal_view views[2]; uint64_t ids[2], active, count; uint32_t width,height; } ck4_metadata;
+static int ck4_meta_restore(void *ctx,const journal_record *record)
+{
+    ck4_metadata *meta=ctx; const uint8_t *p=record->data;
+    if(record->type==JOURNAL_VIEW && record->buffer_id && record->buffer_id<=2)
+        meta->views[record->buffer_id-1]=(journal_view){le64(p),le64(p+8),le64(p+16),le64(p+24)};
+    else if(record->type==JOURNAL_TABS) {
+        meta->count=le64(p); meta->active=le64(p+8); if(meta->count>2) return 1;
+        for(size_t j=0;j<meta->count;j++) meta->ids[j]=le64(p+16+j*8);
+    } else if(record->type==JOURNAL_WINDOW) {
+        meta->width=(uint32_t)le64(p); meta->height=(uint32_t)(le64(p)>>32);
+    }
+    return 0;
+}
+static int ck4_metadata_test(void)
+{
+    char log[]="build/ck4-metadata-XXXXXX"; int fd=mkstemp(log); T(fd>=0); close(fd);
+    pid_t child=fork(); T(child>=0);
+    if(!child) {
+        render_backend backend={0}; T(render_null_backend(&backend)==0);
+        editor_config cfg={.journal_path=log,.cols=32,.rows=4}; editor *e=NULL;
+        T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+        uint64_t id; T(editor_add_buffer(e,NULL,(const uint8_t *)"ab",2,&id)==0); T(id==2); T(settle(e)==0);
+        T(editor_set_cursor(e,2)==0); T(settle(e)==0);
+        T(press(e,key(XKB_KEY_Left,PLAT_MOD_SHIFT,NULL))==0);
+        T(tabs_reorder(&e->tabs,1,0)==0); T(editor_begin_frame(e)==0); T(settle(e)==0);
+        plat_event resized={.kind=PLAT_EV_RESIZE,.w=320,.h=120}; T(press(e,resized)==0);
+        T(editor_flush(e)==0); _exit(0);
+    }
+    int status; T(waitpid(child,&status,0)==child); T(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    ck4_metadata meta={0}; journal_replay_result result;
+    T(journal_replay_file(log,ck4_meta_restore,&meta,&result)==0); unlink(log);
+    T(meta.count==2 && meta.active==0 && meta.ids[0]==2 && meta.ids[1]==1);
+    T(meta.views[1].cursor==1 && meta.views[1].anchor==2 && meta.views[1].scroll_x==0);
+    T(meta.width==320 && meta.height==120);
+    puts("P4-3 section 7: healthy flush survives abrupt child exit with exact selection/tab order/active/window metadata");
+    return 0;
+}
+static int ck4_fifo(void)
+{
+    char root[]="build/ck4-fifo-XXXXXX"; T(mkdtemp(root));
+    char fifo[128],log[128]; T(snprintf(fifo,sizeof fifo,"%s/pipe",root)>0);
+    T(snprintf(log,sizeof log,"%s/journal",root)>0); T(mkfifo(fifo,0600)==0);
+    pid_t child=fork(); T(child>=0);
+    if(!child) {
+        alarm(2); render_backend backend={0}; T(render_null_backend(&backend)==0);
+        editor_config cfg={.path=fifo,.journal_path=log,.cols=16,.rows=2}; editor *e=NULL;
+        int rc=editor_open(&e,&cfg,&backend); editor_close(e);
+        _exit(rc==EDITOR_ERR_IO?0:1);
+    }
+    int status; T(waitpid(child,&status,0)==child); unlink(fifo); unlink(log); rmdir(root);
+    T(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    puts("P4-3 section 10: journal-enabled editor rejects FIFO without a writer; child completes before alarm");
+    return 0;
+}
+static int ck4_target_visit(void *ctx,const journal_record *record)
+{
+    bool *found=ctx;
+    if(record->type==JOURNAL_TARGET && record->buffer_id==1 && record->size==sizeof "build/ck4-intended-missing" &&
+        !memcmp(record->data,"build/ck4-intended-missing",record->size)) *found=true;
+    return 0;
+}
+static int ck4_target(void)
+{
+    char log[]="build/ck4-target-XXXXXX"; int fd=mkstemp(log); T(fd>=0); close(fd);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.path="build/ck4-intended-missing",.journal_path=log,.cols=16,.rows=2}; editor *e=NULL;
+    T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0); T(editor_flush(e)==0); editor_close(e);
+    bool found=false; journal_replay_result result;
+    T(journal_replay_file(log,ck4_target_visit,&found,&result)==0); unlink(log); T(found);
+    puts("P4-3 section 7: missing named target association persisted independently of empty content BASE"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
+        if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
+        if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
+        if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
+        if (!strcmp(argv[1], "--ck4-credit")) return ck4_credit();
+        if (!strcmp(argv[1], "--ck4-startup")) return ck4_startup();
+        if (!strcmp(argv[1], "--ck4-save")) return ck4_recovery(0);
+        if (!strcmp(argv[1], "--ck4-keep")) return ck4_recovery(1);
+        if (!strcmp(argv[1], "--ck4-reload")) return ck4_recovery(2);
+        if (!strcmp(argv[1], "--ck4-mapped-keep")) return ck4_recovery(3);
+        if (!strcmp(argv[1], "--ck4-mapped-reload")) return ck4_recovery(4);
         if (!strcmp(argv[1], "--index-capacity")) return index_capacity_typing();
         if (!strcmp(argv[1], "--index-refusal")) return index_capacity_refusal();
         if (!strcmp(argv[1], "--index-repair")) return index_eventual_repair();
@@ -1363,6 +1620,8 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
+    T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);
     T(index_capacity_typing() == 0); T(index_capacity_refusal() == 0); T(index_eventual_repair() == 0);
     T(partial_line_start() == 0);

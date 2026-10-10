@@ -21,19 +21,32 @@
 
 static _Thread_local bool ui_no_io;
 int stat(const char *path, struct stat *st) { CHECK(!ui_no_io); return (int)syscall(SYS_newfstatat,AT_FDCWD,path,st,0); }
-int fstat(int fd, struct stat *st) { CHECK(!ui_no_io); return (int)syscall(SYS_fstat,fd,st); }
+int fstat(int fd, struct stat *st)
+{
+    CHECK(!ui_no_io);
+    if(getenv("EDIT_CK4_ID_FAIL") && (fcntl(fd,F_GETFL)&O_ACCMODE)==O_WRONLY) {
+        char entry[64],path[4097]; int n=snprintf(entry,sizeof entry,"/proc/self/fd/%d",fd);
+        CHECK(n>0 && (size_t)n<sizeof entry); ssize_t size=readlink(entry,path,sizeof path-1);
+        if(size>0) { path[size]=0; if(strstr(path,"/source/target")) { errno=EIO; return -1; } }
+    }
+    return (int)syscall(SYS_fstat,fd,st);
+}
 int fstatat(int fd, const char *path, struct stat *st, int flags)
 { CHECK(!ui_no_io); return (int)syscall(SYS_newfstatat,fd,path,st,flags); }
 int open(const char *path, int flags, ...)
 {
-    CHECK(!ui_no_io); mode_t mode=0;
-    if (flags & O_CREAT) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
+    CHECK(!ui_no_io);
+    if (getenv("EDIT_CK4_NO_TMPFILE") && (flags & O_TMPFILE)==O_TMPFILE) { errno=EOPNOTSUPP; return -1; }
+    mode_t mode=0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE)==O_TMPFILE) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
     return (int)syscall(SYS_openat,AT_FDCWD,path,flags,mode);
 }
 int openat(int fd, const char *path, int flags, ...)
 {
-    CHECK(!ui_no_io); mode_t mode=0;
-    if (flags & O_CREAT) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
+    CHECK(!ui_no_io);
+    if (getenv("EDIT_CK4_NO_TMPFILE") && (flags & O_TMPFILE)==O_TMPFILE) { errno=EOPNOTSUPP; return -1; }
+    mode_t mode=0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE)==O_TMPFILE) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
     return (int)syscall(SYS_openat,fd,path,flags,mode);
 }
 int fsync(int fd) { CHECK(!ui_no_io); return (int)syscall(SYS_fsync,fd); }
@@ -271,8 +284,8 @@ static void le32(uint8_t *p, uint32_t n) { for (unsigned i=0;i<4u;++i) p[i]=(uin
 static size_t base_payload(uint8_t *p, const journal_base *b)
 {
     le64(p,b->size); le64(p+8,b->mtime_ns); le64(p+16,b->inode); le64(p+24,b->device);
-    le32(p+32,b->prefix_crc); le32(p+36,b->prefix_len);
-    size_t n=strlen(b->path); memcpy(p+40,b->path,n+1); return 41+n;
+    le32(p+32,b->prefix_crc); le32(p+36,b->prefix_len|(*b->path?JOURNAL_BASE_V2:0));
+    size_t n=strlen(b->path); memcpy(p+40,b->path,n+1); if(*b->path) le64(p+41+n,b->ctime_ns); return 41+n+(*b->path?8u:0u);
 }
 static int restore(void *ctx, const journal_record *r)
 {
@@ -292,7 +305,7 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
     work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(jp); CHECK((uintptr_t)jp % _Alignof(work_pool) == 0); CHECK(work_pool_init(jp,1,0)==0);
     journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
     journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
-    uint8_t bp[4137], insert[9]={0}; le64(insert,3); insert[8]='!';
+    uint8_t bp[JOURNAL_BASE_MAX], insert[9]={0}; le64(insert,3); insert[8]='!';
     size_t bsize=base_payload(bp,&previous);
     journal_record cp[]={{JOURNAL_BASE,1,0,bp,bsize},{JOURNAL_INSERT,1,0,insert,sizeof insert}};
     CHECK(journal_set_base(j,1,&previous)==0); CHECK(journal_insert(j,1,3,(const uint8_t *)"!",1)==0);
@@ -326,16 +339,18 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
             contents(f.path,"disk changed");
             const journal_save *token=savectl_save_token(f.s); CHECK(token && token->prepared);
             CHECK(access(token->previous_path,F_OK)==0); contents(token->previous_path,"old");
-            /* Test teardown deliberately resolves retained recovery. Production
-             * must checkpoint/recover before retiring this generation. */
-            CHECK(unlink(token->previous_path)==0);
+            uint8_t empty[41]={0}, text[13]={0}; memcpy(text+8,"old!!",5);
+            journal_record current[]={{JOURNAL_BASE,1,0,empty,sizeof empty},{JOURNAL_INSERT,1,0,text,sizeof text}};
+            CHECK(savectl_recover_cancel(f.s,current,2)==0); wait_controller(&f);
+            CHECK(!savectl_save_token(f.s)->previous_path[0] && savectl_get_model(f.s).modified);
+            puts("P4-3 section 32: pre-rename failure cancels through complete CURRENT checkpoint, no manual token deletion");
         } else {
             CHECK(savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).modified);
             CHECK(!savectl_get_model(f.s).journal_leased); contents(f.path,"old!");
             char retained[4097]; strcpy(retained,savectl_save_token(f.s)->previous_path);
             CHECK(access(retained,F_OK)==0);
             const journal_base *saved_base=savectl_saved_base(f.s); CHECK(saved_base);
-            uint8_t nextbase[4137], later[9]={0}; le64(later,4); later[8]='!';
+            uint8_t nextbase[JOURNAL_BASE_MAX], later[9]={0}; le64(later,4); later[8]='!';
             journal_record next[]={{JOURNAL_BASE,1,0,nextbase,base_payload(nextbase,saved_base)},
                 {JOURNAL_INSERT,1,0,later,sizeof later}};
             journal_record invalid=next[0]; invalid.buffer_id=2;
@@ -371,7 +386,7 @@ static void journal_handoff_crash(void)
         journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
         journal_base previous; CHECK(journal_capture_base(path,&previous)==0);
         CHECK(journal_set_base(j,1,&previous)==0);
-        uint8_t bp[4137], empty[41]={0};
+        uint8_t bp[JOURNAL_BASE_MAX], empty[41]={0};
         journal_record cp[]={{JOURNAL_BASE,1,0,bp,base_payload(bp,&previous)},
             {JOURNAL_BASE,2,0,empty,sizeof empty}};
         pause_job pause={.step=FILE_STEP_FSYNCED};
@@ -430,7 +445,7 @@ static void finish_writeback_recovery(void)
     CHECK(work_pool_init(jp,1,0)==0); journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
     journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
     CHECK(journal_set_base(j,1,&previous)==0);
-    uint8_t bp[4137], first[9]={0}, empty[41]={0}; le64(first,3); first[8]='!';
+    uint8_t bp[JOURNAL_BASE_MAX], first[9]={0}, empty[41]={0}; le64(first,3); first[8]='!';
     journal_record cp[]={{JOURNAL_BASE,1,0,bp,base_payload(bp,&previous)},
         {JOURNAL_INSERT,1,0,first,sizeof first},{JOURNAL_BASE,2,0,empty,sizeof empty}};
     CHECK(savectl_destroy(f.s)==0);
@@ -442,7 +457,7 @@ static void finish_writeback_recovery(void)
     journal_save retained=*savectl_save_token(f.s);
     CHECK(retained.prepared && access(retained.previous_path,F_OK)==0);
     edit(&f); CHECK(journal_insert(j,2,0,(const uint8_t *)"other",5)==0);
-    uint8_t nextbase[4137], later[9]={0}, other[13]={0}; le64(later,4); later[8]='!';
+    uint8_t nextbase[JOURNAL_BASE_MAX], later[9]={0}, other[13]={0}; le64(later,4); later[8]='!';
     memcpy(other+8,"other",5);
     journal_record next[]={{JOURNAL_BASE,1,0,nextbase,base_payload(nextbase,savectl_saved_base(f.s))},
         {JOURNAL_INSERT,1,0,later,sizeof later},{JOURNAL_BASE,2,0,empty,sizeof empty},
@@ -484,7 +499,7 @@ typedef struct session_request_test {
     journal_base previous;
     size_t buffers;
     journal_record *records;
-    uint8_t base[4137], empty[41], insert[9];
+    uint8_t base[JOURNAL_BASE_MAX], empty[41], insert[9];
     _Atomic unsigned preparations, releases;
     bool fail;
 } session_request_test;
@@ -968,7 +983,7 @@ static void journal_base_conflict(bool notified)
     work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(jp); CHECK((uintptr_t)jp % _Alignof(work_pool) == 0); CHECK(work_pool_init(jp,1,0)==0);
     journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
     journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
-    uint8_t bp[4137], insert[9]={0}; le64(insert,3); insert[8]='!';
+    uint8_t bp[JOURNAL_BASE_MAX], insert[9]={0}; le64(insert,3); insert[8]='!';
     journal_record cp[]={{JOURNAL_BASE,1,0,bp,base_payload(bp,&previous)},
         {JOURNAL_INSERT,1,0,insert,sizeof insert}};
     CHECK(journal_set_base(j,1,&previous)==0);
@@ -1047,9 +1062,114 @@ static void known_unrelated_slot_reuse(void)
     work_pool_shutdown(f.pool); free(f.pool); piece_destroy(f.tree);
     CHECK(unlink(f.path) == 0 && rmdir(f.dir) == 0);
 }
+typedef struct ck4_directory_fault { file_id directory; unsigned hits; } ck4_directory_fault;
+static void ck4_close_directory(void *ctx,int step)
+{
+    ck4_directory_fault *fault=ctx;
+    if(step!=FILE_STEP_RENAMED) return;
+    for(int fd=3;fd<256;fd++) {
+        struct stat st;
+        if(fstat(fd,&st)==0 && S_ISDIR(st.st_mode) && (uint64_t)st.st_dev==fault->directory.dev &&
+           (uint64_t)st.st_ino==fault->directory.ino) { CHECK(close(fd)==0); fault->hits++; }
+    }
+}
+static void ck4_directory_recovery(bool identity_failure)
+{
+    fixture f; init(&f,"old");
+    char target_dir[160],target[200],log[160];
+    CHECK(snprintf(target_dir,sizeof target_dir,"%s/source",f.dir)>0); CHECK(mkdir(target_dir,0700)==0);
+    CHECK(snprintf(target,sizeof target,"%s/target",target_dir)>0); CHECK(rename(f.path,target)==0);
+    CHECK(snprintf(log,sizeof log,"%s/journal",f.dir)>0);
+    work_pool jp; CHECK(work_pool_init(&jp,1,0)==0); journal *j=NULL; CHECK(journal_open(&j,log,&jp,NULL)==0);
+    journal_base previous; CHECK(journal_capture_base(target,&previous)==0);
+    uint8_t base[JOURNAL_BASE_MAX],insert[9]={0}; le64(insert,3); insert[8]='!';
+    journal_record cp[]={{JOURNAL_BASE,1,0,base,base_payload(base,&previous)},{JOURNAL_INSERT,1,0,insert,9}};
+    CHECK(journal_set_base(j,1,&previous)==0); CHECK(journal_insert(j,1,3,(const uint8_t *)"!",1)==0);
+    CHECK(savectl_destroy(f.s)==0);
+    ck4_directory_fault fault={.directory=base_id(target_dir)};
+    savectl_options options={.pool=f.pool,.path=target,.baseline=base_id(target),.source_mode=FILE_MODE_COPY,
+        .journal=j,.journal_pool=&jp,.buffer_id=1,.reload_allocator=piece_default_allocator(),
+        .step=identity_failure?NULL:ck4_close_directory,.step_ctx=&fault};
+    CHECK(savectl_create(&f.s,&options,false)==0); edit(&f);
+    if(identity_failure) CHECK(setenv("EDIT_CK4_ID_FAIL","1",1)==0);
+    CHECK(savectl_save(f.s,f.tree,&previous,cp,2)==0); wait_controller(&f);
+    if(identity_failure) {
+        CHECK(unsetenv("EDIT_CK4_ID_FAIL")==0);
+        CHECK(savectl_get_model(f.s).file_error==FILE_ERR_IO && savectl_get_model(f.s).can_recover_cancel);
+        CHECK(!savectl_get_model(f.s).needs_finish); contents(target,"old!");
+        uint8_t empty[41]={0}, text[12]={0}; memcpy(text+8,"old!",4);
+        journal_record current[]={{JOURNAL_BASE,1,0,empty,sizeof empty},{JOURNAL_INSERT,1,0,text,sizeof text}};
+        CHECK(savectl_recover_cancel(f.s,current,2)==0); wait_controller(&f);
+        CHECK(savectl_get_model(f.s).modified && !savectl_save_token(f.s)->previous_path[0]);
+        journal_close(j); work_pool_shutdown(&jp); CHECK(unlink(log)==0);
+        CHECK(rename(target,f.path)==0 && rmdir(target_dir)==0); finish_fixture(&f);
+        puts("P4-3 section 32: post-rename identity failure remains ambiguous, explicit complete-current cancellation releases retention and stays dirty");
+        return;
+    }
+    CHECK(fault.hits==1 && savectl_get_model(f.s).file_error==FILE_ERR_DIRSYNC); contents(target,"old!");
+    CHECK(savectl_get_model(f.s).needs_finish);
+    const journal_base *saved=savectl_saved_base(f.s); CHECK(saved);
+    uint8_t next[JOURNAL_BASE_MAX]; journal_record current={JOURNAL_BASE,1,0,next,base_payload(next,saved)};
+    CHECK(savectl_recover_finish(f.s,&current,1)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).state==SAVECTL_SAVED && !savectl_get_model(f.s).modified);
+    CHECK(!savectl_save_token(f.s)->previous_path[0]);
+    journal_close(j); work_pool_shutdown(&jp); CHECK(unlink(log)==0);
+    CHECK(rename(target,f.path)==0 && rmdir(target_dir)==0); finish_fixture(&f);
+    puts("P4-3 section 32: post-rename directory barrier failure reconciles through public recovery, no manual token deletion");
+}
+static void ck4_readonly_reload(void)
+{
+    fixture f; init(&f,"old");
+    put(f.path,"new bytes"); savectl_file_event(f.s); edit(&f); wait_controller(&f);
+    CHECK(chmod(f.dir,0555)==0); CHECK(setenv("EDIT_CK4_NO_TMPFILE","1",1)==0);
+    CHECK(savectl_reload(f.s)==0); wait_controller(&f);
+    CHECK(chmod(f.dir,0700)==0); CHECK(unsetenv("EDIT_CK4_NO_TMPFILE")==0);
+    piece_tree *replacement=NULL; savectl_view view={0}; int rc;
+    do { rc=savectl_take_reload(f.s,&replacement,&view); } while(rc==SAVECTL_BUSY && savectl_get_model(f.s).state!=SAVECTL_FAILED);
+    CHECK(rc==0 && replacement);
+    uint8_t bytes[9]; CHECK(piece_read(replacement,0,bytes,sizeof bytes)==0 && !memcmp(bytes,"new bytes",sizeof bytes));
+    piece_destroy(f.tree); f.tree=replacement; finish_fixture(&f);
+    puts("P4-3 section 33: read-only source parent and unsupported O_TMPFILE reload through private writable backing");
+}
+static int ck4_ambiguous_rename(void *ctx,const char *from,const char *to)
+{
+    bool *fail=ctx; int rc=rename(from,to);
+    if(!rc && *fail) { *fail=false; errno=EIO; return -1; }
+    return rc;
+}
+static void ck4_prepare_recovery(void)
+{
+    fixture f; init(&f,"old"); edit(&f);
+    char log[160]; CHECK(snprintf(log,sizeof log,"%s/journal",f.dir)>0);
+    work_pool jp; CHECK(work_pool_init(&jp,1,0)==0); journal *j=NULL;
+    bool fail=false; journal_io io={.ctx=&fail,.rename=ck4_ambiguous_rename};
+    CHECK(journal_open_with_io(&j,log,&jp,NULL,&io)==0);
+    journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
+    uint8_t base[JOURNAL_BASE_MAX],insert[9]={0}; le64(insert,3); insert[8]='!';
+    journal_record cp[]={{JOURNAL_BASE,1,0,base,base_payload(base,&previous)},{JOURNAL_INSERT,1,0,insert,9}};
+    CHECK(journal_set_base(j,1,&previous)==0); CHECK(journal_insert(j,1,3,(const uint8_t *)"!",1)==0);
+    CHECK(savectl_destroy(f.s)==0);
+    savectl_options options={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),.source_mode=FILE_MODE_COPY,
+        .journal=j,.journal_pool=&jp,.buffer_id=1,.reload_allocator=piece_default_allocator()};
+    CHECK(savectl_create(&f.s,&options,true)==0); fail=true;
+    CHECK(savectl_save(f.s,f.tree,&previous,cp,2)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).journal_error==JOURNAL_IO && savectl_get_model(f.s).can_recover_cancel);
+    CHECK(savectl_save_token(f.s)->previous_path[0] && !savectl_save_token(f.s)->prepared); contents(f.path,"old");
+    uint8_t empty[41]={0},text[12]={0}; memcpy(text+8,"old!",4);
+    journal_record current[]={{JOURNAL_BASE,1,0,empty,sizeof empty},{JOURNAL_INSERT,1,0,text,sizeof text}};
+    CHECK(savectl_recover_cancel(f.s,current,2)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).modified && !savectl_save_token(f.s)->previous_path[0]);
+    journal_close(j); work_pool_shutdown(&jp); CHECK(unlink(log)==0); finish_fixture(&f);
+    puts("P4-3 section 32: failed ambiguous PREPARE retains artifact until complete CURRENT recovery publishes durably");
+}
 int main(int argc, char **argv)
 {
     trace_init();
+    if (argc>1 && !strcmp(argv[1],"--ck4-prepare")) { ck4_prepare_recovery(); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--ck4-identity")) { ck4_directory_recovery(true); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--ck4-readonly")) { ck4_readonly_reload(); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--ck4-abort")) { journal_transaction(false,true); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--ck4-directory")) { ck4_directory_recovery(false); return 0; }
     if (argc>1 && !strcmp(argv[1],"--bounded-request")) { bounded_request_status(false); bounded_request_status(true); return 0; }
     if (argc>1 && !strcmp(argv[1],"--finish-recovery")) { finish_writeback_recovery(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--journal-handoff")) { journal_handoff_crash(); return 0; }
@@ -1062,6 +1182,7 @@ int main(int argc, char **argv)
     if (argc>1 && !strcmp(argv[1],"--reload-failure")) { reload_allocation_recovery(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--mailbox-protocol")) { mailbox_terminal_protocol(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--file-source")) { for (unsigned i=0;i<4u;++i) mapped_file_source(i); puts("savectl retained actual mapped identity/guard: ok"); return 0; }
+    ck4_prepare_recovery(); ck4_readonly_reload(); ck4_directory_recovery(false); ck4_directory_recovery(true);
     journal_handoff_crash(); finish_writeback_recovery(); bounded_request_status(false); bounded_request_status(true);
     mailbox_terminal_protocol();
     for (unsigned i=0;i<4u;++i) mapped_file_source(i);

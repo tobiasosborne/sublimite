@@ -86,6 +86,7 @@ void editor_buffer_destroy(editor_buffer *b)
 }
 void editor_retire_buffers(editor *e)
 {
+    if (e->op_count) return; /* staged tree ranges still borrow buffer arenas */
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i] && e->buffers[i]->retired) {
         editor_buffer_destroy(e->buffers[i]); e->buffers[i] = NULL;
     }
@@ -99,9 +100,6 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     int rc = 0;
     b->base.path = "";
     if (path) {
-        /* Capture before the file worker loads any bytes, then validate the
-         * same generation after attachment and immediately before publication. */
-        if (e->journal) (void)journal_capture_base(path, &b->base);
         memcpy(b->path, path, strlen(path) + 1);
         file_open_opts opts = {.copy_threshold = e->cfg.copy_threshold};
         rc = file_open_begin(&e->pool, path, &opts, &b->file);
@@ -124,6 +122,15 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         }
         e->opening = NULL;
         if (b->file) {
+            /* File's nonblocking worker acquisition has already rejected
+             * nonregular descriptors and supplied the canonical identity and
+             * owned prefix from one validated opened generation. */
+            if (e->journal) {
+                size_t prefix_size = 0; const uint8_t *prefix = file_prefix(b->file, &prefix_size);
+                rc = journal_base_from_prefix(file_path(b->file), file_prefix_identity(b->file),
+                    prefix, prefix_size, &b->base);
+                if (rc) goto fail;
+            }
             b->watch_fd = file_watch_start(b->file);
             struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};
             if (b->watch_fd < 0 || epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, b->watch_fd, &event)) {
@@ -148,7 +155,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         rc = piece_init_copy(b->preview, prefix, prefix_len);
     } else rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len);
     if (rc) goto fail;
-    if (e->journal && b->file && (!*b->base.path || journal_check_base(&b->base) || file_check(b->file, NULL))) {
+    if (e->journal && b->file && (!*b->base.path || file_check(b->file, NULL))) {
         rc = EDITOR_ERR_IO; goto fail;
     }
     if (b->pending_open) {
@@ -198,7 +205,7 @@ int editor_adopt_open(editor *e, editor_buffer *b)
 {
     if (b->source_stale || !b->pending_open || !file_open_ready(b->file)) return 0;
     if (b == e->buffer && (e->dirty || e->backend->active || view_busy(&e->v))) return 0;
-    if (file_check(b->file, NULL) || (e->journal && journal_check_base(&b->base))) return EDITOR_ERR_IO;
+    if (file_check(b->file, NULL) || (e->journal && !*b->base.path)) return EDITOR_ERR_IO;
     int rc = file_attach(b->file, b->tree); if (rc) return EDITOR_ERR_IO;
     b->pending_open = false;
     editor_large_init(b);
@@ -247,20 +254,40 @@ int editor_activate(editor *e)
     e->old_selection = live.selection; editor_restart_blink(e, trace_now_ns());
     return editor_full_layout(e);
 }
+static int protected_record(editor *e, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
+{
+    int rc;
+    while ((rc = journal_append_protected(e->journal, type, id, data, size)) == JOURNAL_BUSY) {
+        rc = journal_flush(e->journal); if (rc) return rc;
+    }
+    return rc;
+}
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id)
 {
     int rc = 0;
     if (e->journal) {
-        if (b->file) rc = journal_check_base(&b->base);
-        if (!rc) rc = journal_set_base(e->journal, id, &b->base);
+        if (b->file) rc = file_check(b->file, NULL);
+        uint8_t data[JOURNAL_BASE_MAX]; size_t size = 0;
+        if (!rc) rc = journal_encode_base(&b->base, data, sizeof data, &size);
+        if (!rc) rc = protected_record(e, JOURNAL_BASE, id, data, size);
         if (!rc && !b->file && piece_len(b->tree)) {
             piece_iter it; piece_iter_begin(&it, b->tree, 0); const uint8_t *p; size_t n; uint64_t off = 0;
-            while (piece_iter_next(&it, &p, &n)) { rc = journal_insert(e->journal, id, off, p, n); if (rc) break; off += n; }
+            while (!rc && piece_iter_next(&it, &p, &n)) {
+                size_t progress = 0;
+                while (progress < n) {
+                    rc = journal_insert_step(e->journal, id, off, p, n, &progress);
+                    if (rc == JOURNAL_BUSY) { rc = journal_flush(e->journal); if (rc) break; }
+                    else if (rc) break;
+                }
+                off += n;
+            }
         }
+        if (!rc && *b->path) rc = protected_record(e, JOURNAL_TARGET, id, (const uint8_t *)b->path, strlen(b->path) + 1);
         if (rc) e->stats.journal_error = rc;
     }
     return rc ? EDITOR_ERR_IO : 0;
 }
+
 static int install(editor *e, editor_buffer *b, uint64_t *id)
 {
     size_t slot = 0; while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
@@ -465,6 +492,7 @@ int editor_poll_sources(editor *e)
         }
     }
     size_t messages = work_mailbox_drain(&e->pool, editor_route_work, e);
+    if (e->journal_pool_ready) messages += work_mailbox_drain(&e->journal_pool, editor_route_work, e);
     if (messages) for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         if (b && b->file && b->watch_pending && !b->source_stale) (void)file_watch_poll(b->file);
@@ -557,10 +585,48 @@ int editor_check_sources(editor *e)
     if (choice == 1) {
         int rc = file_resolve_keep(b->file);
         if (rc) return 0; /* Unsafe mapped keep retains the visible prompt. */
-        b->source_stale = false; return editor_full_layout(e);
+        journal_base previous = b->base;
+        if (e->journal) {
+            rc = journal_capture_base(b->path, &b->base);
+            if (!rc) rc = journal_flush(e->journal);
+            if (!rc) rc = editor_checkpoint(e);
+            if (rc) {
+                b->base = previous;
+                b->base.path = *previous.path ? b->base.captured_path : "";
+                return 0;
+            }
+        }
+        b->saved_lost = true;
+        b->source_stale = false; editor_modified(e);
+        return editor_full_layout(e);
     }
-    size_t old_tab = tabs_active_index(&e->tabs); uint64_t id;
-    int rc = editor_add_buffer(e, b->path, NULL, 0, &id);
-    if (rc) return 0; /* Keep the old suspended generation available on failure. */
-    return editor_close_tab(e, old_tab);
+    /* Replace the borrowed resources of the same logical tab. The tabs module
+     * owns identity/order/MRU/wait membership; the editor owns these leases. */
+    editor_buffer *replacement = NULL;
+    int rc = editor_buffer_prepare(e, b->path, NULL, 0, &replacement);
+    if (rc) return 0;
+    if (replacement->pending_open) { editor_buffer_destroy(replacement); return 0; }
+    size_t slot = 0;
+    while (slot < e->buffer_capacity && e->buffers[slot] != b) slot++;
+    if (slot == e->buffer_capacity) { editor_buffer_destroy(replacement); return EDITOR_ERR_ARG; }
+    tabs_tab *tab = &e->tabs.slots[e->tabs.active];
+    view_state previous = e->v.state, live = previous;
+    uint64_t len = piece_len(replacement->tree);
+    if (live.selection.cursor > len) live.selection.cursor = len;
+    if (live.selection.anchor > len) live.selection.anchor = len;
+    if (live.first_byte > len) live.first_byte = len;
+    if (live.visual_byte > len) live.visual_byte = len;
+    replacement->id = b->id; replacement->wait_token = b->wait_token;
+    replacement->initial = live;
+    e->buffers[slot] = replacement; e->buffer = replacement; e->v.state = live;
+    if (e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    if (rc) {
+        e->buffers[slot] = b; e->buffer = b; e->v.state = previous;
+        editor_buffer_destroy(replacement); return 0;
+    }
+    tab->buffer = replacement->tree; tab->undo = &replacement->undo;
+    tab->state = live; tab->modified = false;
+    e->tree = replacement->tree; e->undo = &replacement->undo;
+    b->wait_token = 0; editor_buffer_destroy(b);
+    return editor_activate(e);
 }

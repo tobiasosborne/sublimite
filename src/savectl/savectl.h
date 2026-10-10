@@ -18,7 +18,7 @@ typedef struct savectl_view {
 typedef struct savectl_model {
     savectl_state state;
     const char *status, *banner;
-    bool modified, can_reload, can_keep, busy, needs_finish, journal_leased;
+    bool modified, can_reload, can_keep, busy, needs_finish, journal_leased, can_recover_cancel;
     int file_error, journal_error, err_no;
     bool saving_frame_pending;
     uint64_t request_id, request_ns, saving_submitted_ns;
@@ -47,6 +47,7 @@ typedef struct savectl_options {
     size_t (*reload_mark)(void *ctx);
     void (*reload_reset)(void *ctx, size_t mark);
     uint64_t buffer_id;
+    const char *reload_cache_dir; /* setup-reserved writable directory; NULL uses TMPDIR or /tmp */
     uint64_t reload_copy_threshold; /* clone threshold; 0 uses file policy */
     void (*step)(void *ctx, int step);
     void *step_ctx;
@@ -147,6 +148,11 @@ int savectl_finish(savectl *s, const journal_record *checkpoint, size_t count);
  * immutable records through returned lease. Any failure preserves needs_finish
  * and the retained token, including ambiguous rename/directory errors. */
 int savectl_recover_finish(savectl *s, const journal_record *checkpoint, size_t count);
+/* Failed prepare/pre-rename/ambiguous replacement recovery. Complete CURRENT
+ * checkpoint must no longer depend on this token's retained BASE. Durably sync
+ * target namespace, publish checkpoint, then retire retention. Never installs
+ * Saved; kept content remains modified. Failure preserves the recovery token. */
+int savectl_recover_cancel(savectl *s, const journal_record *checkpoint, size_t count);
 const journal_base *savectl_saved_base(const savectl *s);
 /* Borrowed UI token, available once prepare hands back journal ownership,
  * including during file work. NULL while journal_leased. Copy before close. */

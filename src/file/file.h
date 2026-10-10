@@ -211,6 +211,9 @@ int file_prefix_ready(const file *f);      /* prefix/identity available, even if
 const file_prefix_info *file_prefix_info_of(const file *f);
 uint64_t file_size(const file *f);          /* size at open (stat) */
 file_mode file_open_mode(const file *f);
+/* Immutable identity of the worker-validated original prefix; NULL before
+ * successful PREFIX_READY. CPU-only; borrowed until file_close. */
+const file_id *file_prefix_identity(const file *f);
 const char *file_path(const file *f);       /* canonical after PREFIX_READY; "" while pending */
 int file_errno(const file *f);              /* errno of the last FILE_ERR_IO */
 /* 1 once the full content is ready for file_attach. */

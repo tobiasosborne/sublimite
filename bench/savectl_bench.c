@@ -35,9 +35,9 @@ static void put32(uint8_t *p, uint32_t n) { for (unsigned i=0;i<4u;++i) p[i]=(ui
 static journal_record base_record(uint8_t *p, const journal_base *b)
 {
     put64(p,b->size); put64(p+8,b->mtime_ns); put64(p+16,b->inode); put64(p+24,b->device);
-    put32(p+32,b->prefix_crc); put32(p+36,b->prefix_len);
-    size_t n=strlen(b->path); memcpy(p+40,b->path,n+1);
-    return (journal_record){JOURNAL_BASE,1,0,p,n+41};
+    put32(p+32,b->prefix_crc); put32(p+36,b->prefix_len|(*b->path?JOURNAL_BASE_V2:0));
+    size_t n=strlen(b->path); memcpy(p+40,b->path,n+1); if(*b->path) put64(p+41+n,b->ctime_ns);
+    return (journal_record){JOURNAL_BASE,1,0,p,n+41+(*b->path?8u:0u)};
 }
 static double load_stamp(char *power, size_t n)
 {
@@ -115,7 +115,7 @@ static int run_size(save_batch *batch)
     char power[32]; (void)load_stamp(power,sizeof power);
     for (size_t i=0;i<iterations;++i) {
         if (i%1000u==0) printf("PROGRESS bytes=%zu samples=%zu (M)%s\n",bytes,i,bench__tag_from_power(power));
-        uint8_t payload[4137]; journal_record checkpoint=base_record(payload,&previous);
+        uint8_t payload[JOURNAL_BASE_MAX]; journal_record checkpoint=base_record(payload,&previous);
         savectl_modified(s);
         uint64_t start=bench_now_ns();
         if (savectl_save(s,tree,&previous,&checkpoint,1)) goto controller_end;

@@ -47,6 +47,7 @@ void editor_close(editor *e)
 {
     if (!e) return;
     if (e->journal) { (void)editor_flush(e); journal_close(e->journal); e->journal = NULL; }
+    if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     if (e->backend) render_backend_shutdown(e->backend);
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
@@ -103,6 +104,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);
     if (!e->buffers) { rc = EDITOR_ERR_MEMORY; goto fail; }
     memset(e->buffers, 0, e->buffer_capacity * sizeof *e->buffers);
+    e->journal_tabs = edit_arena_alloc(&e->arena, 16 + live * 8, 8);
+    e->journal_tabs_cached = edit_arena_alloc(&e->arena, 16 + live * 8, 8);
+    if (!e->journal_tabs || !e->journal_tabs_cached) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->ops = edit_arena_alloc(&e->arena, EDITOR_STAGE_OPS * sizeof *e->ops, 16);
     e->stage = edit_arena_alloc(&e->arena, EDITOR_STAGE_BYTES, 16);
     e->indent_bytes = edit_arena_alloc(&e->arena, EDITOR_STAGE_BYTES, 16);
@@ -173,7 +177,10 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         rc = plat_set_present_events(&e->platform, false); if (rc) goto fail;
     }
     if (config->journal_path) {
-        rc = journal_open(&e->journal, config->journal_path, &e->pool, NULL); if (rc) goto fail;
+        if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        e->journal_pool_ready = true;
+        rc = add_poll_fd(e, work_pool_eventfd(&e->journal_pool)); if (rc) goto fail;
+        rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL); if (rc) goto fail;
         journal_set_message_handler(e->journal, editor_route_work, e);
     }
     if (!config->start_empty) {

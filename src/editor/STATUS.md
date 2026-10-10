@@ -1,3 +1,10 @@
+# edit-ck4 — session 9
+
+Partial P4-3 recovery integration: source-choice checkpoints, healthy metadata/target records, protected journal slices and a private durability worker. Save/session-root wiring and startup recovery remain open; pending COPY reload and asynchronous request preparation remain incomplete.
+
+Evidence and remaining acceptance: [worker report](../../docs/worker-reports/edit-ck4-s9.md).
+Design: [decision record](../../docs/decisions/edit-ck4.md). No new globals; leaks-disabled sanitizer verification requires coordinator rerun with leaks enabled.
+
 # edit-zzj.13b slice 3 / session 9
 
 Implemented: automatic burst undo grouping (13), constant-time public undo

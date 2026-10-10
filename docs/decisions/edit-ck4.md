@@ -1,0 +1,117 @@
+# edit-ck4 — journal/recovery integration decisions
+
+Scope: P4-3 §§3,4,5,6,8,7,10,32,33, in that order. Current result is partial;
+[the worker report](../worker-reports/edit-ck4-s9.md) is the acceptance record.
+The session-root save path and startup session discovery remain open.
+
+## BASE generation schema
+
+Keep prefix checksum semantics and path offset stable. BASE v2 uses the high
+bit of encoded prefix_len as a schema discriminator and appends little-endian
+ctime after the NUL-terminated path. Empty BASE retains its legacy encoding.
+All layout constants are wire contracts (G), not timing measurements. Decode
+removes the discriminator from the public prefix length. File recovery compares
+ctime before delivering BASE or edit callbacks; old named generations without
+ctime conflict on current Linux filesystems instead of applying their deltas to
+an unproven original. Replay preserves the conflict artifact.
+
+Expose journal_encode_base so editor checkpoints use the same schema as save
+prepare/finish. Savectl's test/fuzz/bench producers also carry ctime; no benchmark
+workload, gate or timing policy changes. Retained originals have their own ctime
+identity and preserve full metadata barriers.
+
+## File API gap and normal BASE acquisition
+
+File already acquires a canonical path, complete file_id and owned prefix from
+one validated opened descriptor on its nonblocking worker path, but did not
+expose that immutable prefix identity. Add file_prefix_identity as a CPU-only
+borrowed getter available after successful prefix publication, before close.
+This is the only file implementation change. journal_base_from_prefix consumes
+that identity and the acquisition prefix before mapped attachment retires the
+prefix allocation. No separate foreground journal path discovery/open is needed.
+Standalone journal capture uses O_NONBLOCK so it rejects FIFO descriptors before
+reading. Resumable editor/IPC request preparation is still missing; this change
+does not turn the existing blocking setup state machine into an asynchronous API.
+
+## Source resolution
+
+Keep rebases the retained tree against the accepted disk BASE through a complete
+session checkpoint and marks its history conservatively dirty. Resume only after
+checkpoint publication; keep the source suspended on failure.
+
+Reload substitutes the editor-owned buffer/undo/view leases within the existing
+logical tab. Tabs currently provide no replacement-lease API, so the editor
+updates only these borrowed-resource fields in its owned tab storage; it does
+not change tab identity/order/MRU bookkeeping. Old resources retire only after
+durable checkpoint publication. This avoids retaining an obsolete BASE as a
+closed conflicting generation and preserves wait membership. The explicit view
+clamp is to EOF; wider navigation-boundary findings are outside this bead.
+Pending-remainder COPY replacements currently remain suspended and need a future
+asynchronous replacement state. Multiple stale named BASEs likewise require a
+staged session-wide source-choice plan before complete checkpoint publication.
+
+## Durability execution and admission
+
+Reserve a per-editor private journal work_pool/eventfd instead of sharing the
+bulk execution lane. Route its completions through the existing owner mailbox
+router. Pump independently of frame dirtiness, including credit-refused work.
+
+Use journal_insert_step and protected append/delete admission for complete
+records, including eventual PAD, relative to received durable fences. Setup
+registration streams initial unsaved contents using the same credit with
+explicit off-path flushes. Normal metadata shares that credit. Hold frame
+publication while content/metadata is incomplete.
+
+Large undo/redo journal ranges borrow the committed UI tree, park subsequent
+input, and defer buffer retirement until the range drains. Taking a new snapshot
+after undo commit introduced a failure point outside undo's rollback checkpoint;
+the existing allocator sweep caught it. A borrowed tree needs no post-commit
+allocation and remains stable under the parked-input/retained-arena contract.
+No new typing-path malloc is introduced. The dedicated pool and byte credit do
+not prove an unconditional wall-clock device/syscall bound.
+
+## Healthy metadata and target association
+
+Coalesce accepted VIEW/TABS/WINDOW values in reserved storage at ordinary frame
+submission and explicit flush. Cache only successful appends; credit refusal
+keeps the metadata pending. Each tab's embedded editor-owned undo lease gives
+constant-work access to its buffer owner, avoiding repeated buffer-table scans.
+The bounded tab list is encoded into prepaid storage. TARGET is an independent
+record carrying the intended pathname, including missing named files whose
+content BASE is empty. Complete checkpoints retain associations. Startup replay
+of this metadata still belongs to the missing session-discovery implementation.
+
+## Failed save recovery
+
+Use file_save_args.replaced to preserve replacement knowledge independently of
+return status. A known replacement plus validated saved BASE can finish after a
+directory barrier failure. Sync the target parent before finish, even when it is
+different from the journal parent. Do not infer a successful generation from a
+post-rename identity failure; retain ambiguity and permit explicit cancellation.
+
+savectl_recover_cancel exclusively leases the journal to publish a complete
+CURRENT checkpoint through journal_save_cancel, then retires retention and its
+namespace barrier. Cancel never installs Saved and leaves the current contents
+dirty. Failed PREPARE with an ambiguous journal rename can have an unreceived
+namespace barrier: retry that barrier off path before rotating. Writeback loss
+still requires fresh CURRENT publication. All failures preserve the token for
+retry; every other live token must remain represented in the caller's checkpoint.
+The editor has not yet adopted these recovery UI operations because §3 is open.
+
+## Reload private backing
+
+Retain a configurable writable cache directory descriptor during controller
+setup; default to an absolute TMPDIR or the system temporary directory. Try
+source-parent temporary backing/reflink first. If that fails, create private
+backing through the retained cache directory. Unsupported O_TMPFILE falls back
+to a cryptographically random exclusive/no-follow temporary entry, immediately
+unlinked through that same directory descriptor. Copy uses bounded scratch and
+checks source identity before and after. Cache/source directory access is off
+path; no write access to the readable source parent is required for fallback.
+
+## Acceptance
+
+No new globals. No change to Enter/brace indentation or large-file routing.
+Release and sanitizer validation, red/green transcripts, partial requirements and
+LeakSanitizer limitations are recorded in the worker report. No whole-editor
+performance gate or unqualified power-loss time bound is claimed.

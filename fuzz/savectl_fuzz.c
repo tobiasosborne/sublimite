@@ -74,9 +74,9 @@ static void put32(uint8_t *p, uint32_t n)
 static journal_record checkpoint_base(uint8_t *p, const journal_base *b)
 {
     put64(p, b->size); put64(p + 8, b->mtime_ns); put64(p + 16, b->inode); put64(p + 24, b->device);
-    put32(p + 32, b->prefix_crc); put32(p + 36, b->prefix_len);
-    size_t n = strlen(b->path); memcpy(p + 40, b->path, n + 1);
-    return (journal_record){JOURNAL_BASE, 1, 0, p, 41 + n};
+    put32(p + 32, b->prefix_crc); put32(p + 36, b->prefix_len|(*b->path?JOURNAL_BASE_V2:0));
+    size_t n = strlen(b->path); memcpy(p + 40, b->path, n + 1); if(*b->path) put64(p+41+n,b->ctime_ns);
+    return (journal_record){JOURNAL_BASE, 1, 0, p, 41 + n + (*b->path?8u:0u)};
 }
 static work_pool *new_pool(void)
 {
@@ -123,7 +123,7 @@ static void journal_session(const uint8_t *data, size_t size)
     REQUIRE(tree && piece_init_copy(tree, (const uint8_t *)"base", 4) == 0);
     uint8_t edit_byte = size > 1 ? data[1] : '!';
     REQUIRE(piece_insert(tree, 4, &edit_byte, 1) == 0); savectl_modified(s);
-    uint8_t bp[4137], insert[9]; put64(insert, 4); insert[8] = edit_byte;
+    uint8_t bp[JOURNAL_BASE_MAX], insert[9]; put64(insert, 4); insert[8] = edit_byte;
     journal_record cp[] = {checkpoint_base(bp, &previous), {JOURNAL_INSERT, 1, 0, insert, sizeof insert}};
     if (scenario == 1) cp[0].buffer_id = 2;
     if (scenario == 2) replace_disk(path, (const uint8_t *)"other", 5);

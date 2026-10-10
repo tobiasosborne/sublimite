@@ -1,3 +1,10 @@
+# edit-ck4 — session 9
+
+Replacement callback preserves ambiguous outcomes. Known post-rename barrier failures can finish; failed PREPARE/pre-rename/unknown-identity outcomes can recover_cancel through complete CURRENT publication. Reload falls back to setup-reserved writable cache backing and secure unlinked temporary files.
+
+Evidence and remaining acceptance: [worker report](../../docs/worker-reports/edit-ck4-s9.md).
+Design: [decision record](../../docs/decisions/edit-ck4.md). No new globals; leaks-disabled sanitizer verification requires coordinator rerun with leaks enabled.
+
 # savectl — edit-mdv continuation
 
 Session 9: P4-modules-2 review §§9–17 have implementation and red/green

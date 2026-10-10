@@ -63,45 +63,52 @@ static int stage_delete(editor *e, uint64_t off, uint64_t len)
 {
     if (!len || !e->journal) return 0;
     if (e->op_count == EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
-    e->ops[e->op_count++] = (editor_jop){off, len, 0, false, e->buffer->id}; return 0;
+    e->ops[e->op_count++] = (editor_jop){.off=off, .len=len, .id=e->buffer->id}; return 0;
 }
 static int stage_insert(editor *e, uint64_t off, const uint8_t *p, size_t n)
 {
     if (!n || !e->journal) return 0;
     if (e->op_count == EDITOR_STAGE_OPS || n > EDITOR_STAGE_BYTES - e->stage_used) return EDITOR_ERR_MEMORY;
-    e->ops[e->op_count++] = (editor_jop){off, n, e->stage_used, true, e->buffer->id};
+    e->ops[e->op_count++] = (editor_jop){.off=off, .len=n, .at=e->stage_used, .insert=true, .id=e->buffer->id};
     memcpy(e->stage + e->stage_used, p, n); e->stage_used += n; return 0;
 }
 static int stage_tree(editor *e, uint64_t off, uint64_t n)
 {
     if (!n || !e->journal) return 0;
-    while (n) {
-        if (e->op_count == EDITOR_STAGE_OPS || e->stage_used == EDITOR_STAGE_BYTES) {
-            editor_journal_staged(e);
-            if (e->stats.journal_error) return EDITOR_ERR_IO;
-        }
-        size_t room = EDITOR_STAGE_BYTES - e->stage_used;
-        size_t count = n < room ? (size_t)n : room;
-        int rc = piece_read(e->tree, off, e->stage + e->stage_used, count); if (rc) return rc;
-        e->ops[e->op_count++] = (editor_jop){off, count, e->stage_used, true, e->buffer->id};
-        e->stage_used += count; off += count; n -= count;
-    }
+    if (e->op_count == EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
+    /* Input remains parked until this borrowed tree range is journaled;
+     * editor retirement keeps its arena alive. No post-commit allocation. */
+    e->ops[e->op_count++] = (editor_jop){.off=off, .len=n, .insert=true,
+        .id=e->buffer->id, .tree=e->tree};
     return 0;
 }
 void editor_journal_staged(editor *e)
 {
     size_t consumed = 0;
     while (consumed < e->op_count) {
-        editor_jop op = e->ops[consumed];
+        editor_jop *op = &e->ops[consumed];
         if (e->stats.journal_error) break;
         uint64_t before = journal_get_stats(e->journal).accepted_sequence;
-        int rc = op.insert ? journal_insert(e->journal, op.id, op.off, e->stage + op.at, (size_t)op.len) :
-                            journal_delete(e->journal, op.id, op.off, op.len);
-        /* IO can accept a whole logical call into journal-owned retry storage.
-         * Do not duplicate it; FULL/BUSY accept nothing and stay in this queue. */
-        if (journal_get_stats(e->journal).accepted_sequence != before) {
+        int rc;
+        if (!op->insert) rc = journal_delete_protected(e->journal, op->id, op->off, op->len);
+        else if (op->tree) {
+            size_t n = op->len - op->progress < sizeof e->journal_scratch ?
+                (size_t)(op->len - op->progress) : sizeof e->journal_scratch;
+            rc = piece_read(op->tree, op->off + op->progress, e->journal_scratch, n);
+            if (!rc) {
+                size_t done = 0;
+                rc = journal_insert_step(e->journal, op->id, op->off + op->progress,
+                    e->journal_scratch, n, &done);
+                op->progress += done;
+                if (!rc && op->progress < op->len) rc = JOURNAL_BUSY;
+            }
+        } else rc = journal_insert_step(e->journal, op->id, op->off,
+            e->stage + op->at, (size_t)op->len, &op->progress);
+        bool accepted = journal_get_stats(e->journal).accepted_sequence != before;
+        if (accepted && (!op->insert || op->progress == op->len)) {
             consumed++; e->stats.journal_records++;
         }
+        if (rc == JOURNAL_BUSY) break;
         if (rc) { e->stats.journal_error = rc; break; }
     }
     e->op_count -= consumed;

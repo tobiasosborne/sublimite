@@ -873,6 +873,8 @@ const uint8_t *file_prefix(const file *f, size_t *len) { *len = f->prefix_len; r
 const file_prefix_info *file_prefix_info_of(const file *f) { return &f->info; }
 uint64_t file_size(const file *f) { return f->size; }
 file_mode file_open_mode(const file *f) { return f->mode; }
+const file_id *file_prefix_identity(const file *f)
+{ return f && file_prefix_ready(f) ? &f->open_identity : NULL; }
 const char *file_path(const file *f) { return f->path; }
 int file_prefix_ready(const file *f) { return f->prefix_installed && f->open_status == FILE_OK; }
 int file_errno(const file *f) { return f->err_no; }

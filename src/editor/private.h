@@ -24,7 +24,7 @@ typedef struct editor_piece_storage {
     bool ready;
 } editor_piece_storage;
 typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; } editor_delta;
-typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; } editor_jop;
+typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
@@ -36,6 +36,8 @@ typedef struct editor_buffer {
     undo_log undo;
     file *file;
     journal_base base;
+    journal_view journal_view_state;
+    bool journal_view_valid;
     lineidx *index;
     editor_delta *history;
     size_t history_head, history_count, history_cursor, history_cap;
@@ -69,7 +71,13 @@ struct editor {
     int open_error;
     view v;
     journal *journal;
-    work_pool pool;
+    work_pool pool, journal_pool;
+    bool journal_pool_ready;
+    uint8_t journal_scratch[JOURNAL_INSERT_SLICE_BYTES];
+    uint8_t *journal_tabs, *journal_tabs_cached;
+    size_t journal_tabs_size;
+    uint32_t journal_width, journal_height;
+    bool journal_metadata_pending;
     plat platform;
     render_backend *backend;
     render_grid grid;
@@ -128,6 +136,7 @@ void editor_restart_blink(editor *e, uint64_t now);
 void editor_route_work(const work_msg *msg, void *ctx);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
+int editor_journal_metadata(editor *e);
 int editor_handle_key(editor *e, const plat_event *ev);
 int editor_continue_action(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
