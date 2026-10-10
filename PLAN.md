@@ -6,6 +6,8 @@ Perf measurements (battery rerun, GPU wake probe, photodiode) are **deferred** b
 
 ## 1. Workflow
 
+**The improvement loop (Tobias, 2026-10-11):** land a batch of fixes → rebuild → run the Astra vs Sublime drive (`edit-w34.4`, brief `build/astra/brief.md`, launched by Tobias) → every deviation becomes a bead (`src:astra`) → repeat. Sublime is the golden master minimum; the drive's verdict is the only hand-over gate. Go wide: one worker per bead, Codex sol for most, Sonnet for small ones; Claude and Codex quota are not the constraint.
+
 ### 1.1 Roles
 
 | Role | Model | Lifetime | Does |

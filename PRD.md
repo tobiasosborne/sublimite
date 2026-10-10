@@ -12,7 +12,8 @@ One user, on this ThinkPad (Target A in the perf target) today and on a commodit
 
 ## 3. Goals
 
-1. **Instant.** Every enforced gate in `perf/01-perf-target.md` §0.2 passes on Target A on battery. The headline ones: typing input-to-present 1 ms p50 / 2 ms p99; full frame in half a refresh; start to first frame 25 ms p50; open any file to first viewport 6 ms, independent of size.
+1. **Instant, measured against Sublime Text.** (Tobias, 2026-10-11.) Sublime Text is the **golden master minimum**: on every action the Astra comparison drive records, sublimité must do at least what Sublime does, and must never take a frame longer than Sublime to show the result (key→glyph, scroll, open, tab switch, find, large files, measured in 60 Hz frames on video plus the trace ring). The goal is to **outperform** Sublime on every dimension Tobias cares about, above all wherever Sublime lags, jumps or stutters. `perf/01-perf-target.md` §0.2 stays as the physics goal sheet behind that.
+1b. **Beautiful.** Current best design: typography, spacing, colour, chrome, minimap and motion at the level of the best-designed editors of the day, not a 2010 toolkit look. A design spec with mock-ups precedes the chrome work and Tobias approves it.
 2. **Everywhere.** Reachable by every route: `edit path[:line[:col]]` from a shell, double-click via xdg-open, from an agent pointing at a file, and a running instance that takes new files into tabs.
 3. **Sublime's hands.** Default keybindings are Sublime Text's. No relearning.
 4. **Three kinds of text, one editor.** Small code and config files; multi-gigabyte logs; prose with word wrap. All first-class, none degrading the others.
