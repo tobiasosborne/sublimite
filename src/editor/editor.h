@@ -67,7 +67,9 @@ typedef struct editor_stats {
 int editor_open(editor **out, const editor_config *config, render_backend *backend);
 void editor_close(editor *e);
 /* Fixed queue; stamp ingress when drained by step, not when injected. Native
- * events and injected events take the same command/layout/submit path. */
+ * events and injected events take the same command/layout/submit path.
+ * CLOSE requests an immediate stop, even when command storage is full.
+ * Shutdown flushes applied edits; commands still queued are not applied. */
 int editor_inject(editor *e, const plat_event *event);
 /* One UI turn, checking input between bounded layout/view continuations.
  * timeout < 0 may sleep indefinitely; 0 never sleeps. MORE means runnable

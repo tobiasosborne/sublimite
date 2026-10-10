@@ -18,6 +18,164 @@
 #include "../tools/keyinject.c"
 #undef main
 
+/* Dry runs must not create CSVs or send keys, and must preserve focus. */
+static int test_dry_command(bool injector, uint32_t window, const char *expected, int status_expected, const char *option, const char *value)
+{
+    FILE *log = tmpfile();
+    if (!log) return 1;
+    pid_t child = fork();
+    if (!child) {
+        if (dup2(fileno(log), STDERR_FILENO) < 0) _exit(127);
+        char win[32]; (void)snprintf(win,sizeof win,"%" PRIu32,window);
+        char *args[] = {injector ? "keyinject" : "refwin", "--dry-run", "--window", win, "--synthetic-clock", (char *)option, (char *)value, NULL, NULL};
+        int count = option ? 7 : 5;
+        if (option && !value) { args[6] = "--target"; args[7] = "reference"; count = 8; }
+        exit(injector ? keyinject_tool_main(count,args) : refwin_tool_main(count,args));
+    }
+    int status = 0, rc = 1;
+    if (child > 0 && waitpid(child,&status,0) == child && WIFEXITED(status)) {
+        rewind(log); char message[8192];
+        size_t n = fread(message,1,sizeof message-1u,log); message[n] = 0;
+        if (WEXITSTATUS(status) == status_expected && strstr(message,expected) &&
+            (status_expected || (strstr(message,"XTEST=available") && strstr(message,"NotifyMSC UST_ns=") &&
+            strstr(message,"period=") && !strstr(message,"configured")))) rc = 0;
+        else fprintf(stderr,"refwin_test: dry-run RED: exit=%d expected=%d diagnostic=%s expected=%s\n",
+            WEXITSTATUS(status),status_expected,message,expected);
+    }
+    fclose(log); return rc;
+}
+static int test_preflight(void)
+{
+    xcb_connection_t *c = xcb_connect(NULL,NULL);
+    if (!c || xcb_connection_has_error(c)) { if (c) xcb_disconnect(c); return 1; }
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+    uint32_t values[] = {1, XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE};
+    xcb_window_t w = xcb_generate_id(c);
+    int rc = 1;
+    if (!refproto_checked(c,xcb_create_window_checked(c,XCB_COPY_FROM_PARENT,w,screen->root,10,10,32,32,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK,values))) goto done;
+    if (test_dry_command(true,w,"window not viewable",1,NULL,NULL) ||
+        test_dry_command(false,w,"window not viewable",1,NULL,NULL)) goto done;
+    if (test_dry_command(true,UINT32_MAX,"GetWindowAttributes failed",1,NULL,NULL) ||
+        test_dry_command(false,UINT32_MAX,"GetWindowAttributes failed",1,NULL,NULL)) goto done;
+    if (!refproto_checked(c,xcb_map_window_checked(c,w))) goto done;
+    char paired_window[32];
+    (void)snprintf(paired_window,sizeof paired_window,"%" PRIu32,screen->root);
+    if (test_dry_command(true,w,"reference readiness property missing",1,"--editor-window",paired_window)) goto done;
+    /* XTest will not deliver a fresh press for a key already held down.
+     * A dry run must diagnose this without releasing the existing key. */
+    refproto_display input;
+    if (refproto_display_open(&input,"held-key-fixture",true)) { refproto_display_close(&input); goto done; }
+    if (refproto_request(&input,w,input.fake(input.conn,XCB_KEY_PRESS,38,XCB_CURRENT_TIME,input.root,0,0,0),"hold fixture key")) {
+        refproto_display_close(&input); goto done;
+    }
+    int held = test_dry_command(true,w,"keyboard is not idle: keycode=38 down",1,NULL,NULL) ||
+        test_dry_command(false,w,"keyboard is not idle: keycode=38 down",1,NULL,NULL);
+    xcb_query_keymap_reply_t *held_map = xcb_query_keymap_reply(c,xcb_query_keymap(c),NULL);
+    bool still_held = held_map && ((uint8_t)held_map->keys[38u/8u] & (1u << (38u%8u)));
+    free(held_map);
+    int released = refproto_request(&input,w,input.fake(input.conn,XCB_KEY_RELEASE,38,XCB_CURRENT_TIME,input.root,0,0,0),"release fixture key");
+    refproto_display_close(&input);
+    if (held || !still_held || released) goto done;
+    xcb_generic_event_t *held_event;
+    while ((held_event = xcb_poll_for_event(c))) free(held_event);
+    if (test_dry_command(true,w,"keycode has no server mapping",1,"--keycode","8") ||
+        test_dry_command(false,w,"keycode has no server mapping",1,"--keycode","8") ||
+        test_dry_command(true,w,"reference readiness property missing",1,"--wait-reference",NULL)) goto done;
+    xcb_atom_t marker = refproto_atom(c,"_EDIT_REF_READY");
+    uint32_t ready_words[] = {1,39};
+    if (!refproto_checked(c,xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,w,marker,XCB_ATOM_CARDINAL,32,2,ready_words)) ||
+        test_dry_command(true,w,"reference readiness version/keycode mismatch",1,"--wait-reference",NULL)) goto done;
+    ready_words[1] = 38;
+    if (!refproto_checked(c,xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,w,marker,XCB_ATOM_CARDINAL,32,2,ready_words)) ||
+        test_dry_command(true,w,"dry-run PASS",0,"--wait-reference",NULL) ||
+        test_dry_command(true,w,"dry-run PASS",0,"--editor-window",paired_window)) goto done;
+    char csv_path[] = "/tmp/edit-refwin-dry-csv-XXXXXX";
+    int csv_fd = mkstemp(csv_path);
+    if (csv_fd < 0) goto done;
+    if (write(csv_fd,"sentinel",8) != 8) { close(csv_fd); unlink(csv_path); goto done; }
+    close(csv_fd);
+    xcb_get_input_focus_reply_t *before = xcb_get_input_focus_reply(c,xcb_get_input_focus(c),NULL);
+    if (!before) goto done;
+    int dry = test_dry_command(true,w,"dry-run PASS",0,"--csv",csv_path) || test_dry_command(false,w,"dry-run PASS",0,"--csv",csv_path);
+    int assertion = test_dry_command(true,w,"--period-ns assertion failed",1,"--period-ns","11111111");
+    FILE *csv = fopen(csv_path,"r"); char contents[16] = {0};
+    bool untouched = csv && fread(contents,1,sizeof contents,csv) == 8 && !memcmp(contents,"sentinel",8);
+    if (csv) fclose(csv);
+    unlink(csv_path);
+    xcb_get_input_focus_reply_t *after = xcb_get_input_focus_reply(c,xcb_get_input_focus(c),NULL);
+    bool restored = after && before->focus == after->focus;
+    free(before); free(after);
+    xcb_generic_event_t *event;
+    bool key = false;
+    while ((event = xcb_poll_for_event(c))) {
+        uint8_t type = event->response_type & 0x7fu;
+        if (type == XCB_KEY_PRESS || type == XCB_KEY_RELEASE) key = true;
+        free(event);
+    }
+    if (!dry && !assertion && untouched && restored && !key) rc = 0;
+    if (!rc) puts("refwin_test: dry-run checks mapped/focusable targets, preserves focus/CSV, rejects missing targets/wrong rates, injects no keys PASS");
+done:
+    xcb_destroy_window(c,w); xcb_disconnect(c); return rc;
+}
+
+static int test_event_diagnostics(void)
+{
+    FILE *log = tmpfile();
+    if (!log) return 1;
+    pid_t child = fork();
+    if (!child) {
+        if (dup2(fileno(log),STDERR_FILENO) < 0) _exit(127);
+        refproto_display d;
+        if (refproto_display_open(&d,"diagnostic-test",true)) _exit(1);
+        d.timeout_ns = 1000000;
+        refproto_clock clock = {0};
+        int bad_window = refproto_msc(&d,UINT32_MAX,0,&clock);
+        int timeout = refproto_wait(&d,d.root,255,123,&clock,NULL);
+        int zero = refproto_clock_valid(&d,d.root,(refproto_clock){0,0});
+        refproto_display_close(&d);
+        exit(bad_window < 0 && timeout < 0 && zero < 0 ? 0 : 1);
+    }
+    int status = 0, rc = 1;
+    if (child > 0 && waitpid(child,&status,0) == child && WIFEXITED(status) && !WEXITSTATUS(status)) {
+        rewind(log); char message[4096];
+        size_t n = fread(message,1,sizeof message-1u,log); message[n] = 0;
+        if (strstr(message,"Present NotifyMSC: X error=3") &&
+            strstr(message,"Present event timeout: expected kind=255 serial=123") &&
+            strstr(message,"Present UST is zero: UST_ns=0 MSC=0")) rc = 0;
+        else fprintf(stderr,"refwin_test: incorrect event diagnostics: %s",message);
+    }
+    if (rc) { rewind(log); char line[512]; while (fgets(line,sizeof line,log)) fputs(line,stderr); }
+    fclose(log);
+    if (!rc) puts("refwin_test: exact NotifyMSC X error, event timeout and zero-clock diagnostics PASS");
+    return rc;
+}
+
+static int test_period_math(void)
+{
+    uint64_t period = 0;
+    if (refproto_period((refproto_clock){1000000000,10},(refproto_clock){1050000000,13},&period) ||
+        period != 16666666u || refproto_period((refproto_clock){10,1},(refproto_clock){10,2},&period) == 0 ||
+        refproto_period((refproto_clock){10,2},(refproto_clock){20,2},&period) == 0 ||
+        !refproto_period_matches(11111111,11111112) || refproto_period_matches(11111111,16666667)) return 1;
+    pid_t child = fork();
+    if (!child) {
+        const char *script =
+            "from tools.refwin_pairs import pair_rows\n"
+            "a=dict(pair_id=1,target='reference',inject_ns=1,msc=1,t4_ns=2,t5_ns=3,t6_ns=3,frame_id=1,phase_ns=100,period_ns=11111111,actual_phase_ns=100)\n"
+            "b=dict(a,target='editor',inject_ns=2,t4_ns=3,t5_ns=4,t6_ns=4,period_ns=11111112)\n"
+            "pair_rows([a,b],1,1,0)\n"
+            "b['period_ns']=16666667\n"
+            "try: pair_rows([a,b],1,1,0)\n"
+            "except ValueError: pass\n"
+            "else: raise AssertionError('90/60 Hz pair accepted')\n";
+        execlp("python3","python3","-B","-c",script,(char *)NULL); _exit(127);
+    }
+    int status = 0;
+    if (child < 0 || waitpid(child,&status,0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 1;
+    puts("refwin_test: measured period arithmetic and 90/60 Hz pair rejection PASS"); return 0;
+}
+
 static int test_rows(const char *path, bool paired)
 {
     FILE *f = fopen(path, "r");
@@ -99,7 +257,7 @@ static int test_join(const char *injections, const char *frames, const char *tra
         }
         execlp("python3","python3","tools/refwin_pairs.py",injections,"--reference-frames",frames,
             "--editor-trace",trace,"--csv",joined,"--differences",differences,"--pairs",pairs,
-            "--phase-tolerance-ns","16000000",(char *)NULL);
+            "--phase-tolerance-ns","16000000","--synthetic-clock",(char *)NULL);
         _exit(127);
     }
     int status = 0;
@@ -130,6 +288,7 @@ static int test_wrong_frame(const char *source, const char *dest)
 
 int main(int argc, char **argv)
 {
+    (void)setvbuf(stdout,NULL,_IONBF,0);
     bool fallback = argc == 2 && !strcmp(argv[1],"--send-event");
     bool track = argc == 2 && !strcmp(argv[1],"--track");
     if (argc != 1 && !fallback && !track) return 2;
@@ -141,6 +300,7 @@ int main(int argc, char **argv)
         refproto_number("18446744073709551615",UINT64_MAX,&number) || number != UINT64_MAX) return 1;
     /* This test deliberately uses the already running, shared Xvfb only. */
     if (setenv("DISPLAY", ":99", 1) || setenv("EDIT_DISPLAY", ":99", 1)) return 1;
+    if (test_period_math() || test_event_diagnostics() || test_preflight()) return 1;
     char dir[] = "/tmp/edit-refwin-test-XXXXXX";
     if (!mkdtemp(dir)) return 1;
     char frames[256], injections[256], trace[256], joined[256], differences[256], wrong_frame[256];
@@ -156,8 +316,8 @@ int main(int argc, char **argv)
     if (ref == 0) {
         close(pipefd[0]);
         char fd[32]; (void)snprintf(fd, sizeof fd, "%d", pipefd[1]);
-        char *args[] = {"refwin", "--pairs", "12", "--csv", frames, "--ready-fd", fd, NULL};
-        exit(refwin_tool_main(7, args));
+        char *args[] = {"refwin", "--pairs", "12", "--csv", frames, "--ready-fd", fd, "--synthetic-clock", NULL};
+        exit(refwin_tool_main(8, args));
     }
     close(pipefd[1]);
     FILE *ready = fdopen(pipefd[0], "r");
@@ -187,9 +347,9 @@ int main(int argc, char **argv)
             char editor_win[32]; (void)snprintf(editor_win,sizeof editor_win,"%" PRIu32,editor_window);
             char *args[] = {"keyinject", "--window", win, "--pairs", "12", "--csv", injections,
                             "--target", "reference", "--wait-reference", "--phase-ns", "1000000",
-                            "--editor-window",editor_win,"--send-event",NULL};
-            if (!fallback) args[14] = NULL;
-            exit(keyinject_tool_main(fallback ? 15 : 14, args));
+                            "--editor-window",editor_win,"--synthetic-clock","--send-event",NULL};
+            if (!fallback) args[15] = NULL;
+            exit(keyinject_tool_main(fallback ? 16 : 15, args));
         }
         int status = 0;
         if (injector > 0 && waitpid(injector, &status, 0) == injector && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&

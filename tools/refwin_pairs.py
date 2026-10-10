@@ -81,7 +81,7 @@ def complete_editor(rows, frames):
             row[column] = min(events[event])
 
 
-def pair_rows(rows, count, first, tolerance):
+def pair_rows(rows, count, first, tolerance, synthetic_clock=False):
     grouped, previous = {}, {}
     for row in sorted(rows, key=lambda item: item["inject_ns"]):
         pair, target = row["pair_id"], row["target"]
@@ -108,8 +108,13 @@ def pair_rows(rows, count, first, tolerance):
     differences = []
     for pair in range(first, first + count):
         ref, editor = grouped[pair, "reference"], grouped[pair, "editor"]
-        if ref["phase_ns"] != editor["phase_ns"] or ref["period_ns"] != editor["period_ns"]:
-            raise ValueError(f"pair {pair}: requested phases/periods differ")
+        if ref["phase_ns"] != editor["phase_ns"]:
+            raise ValueError(f"pair {pair}: requested phases differ")
+        # Independent measurements may round/jitter slightly. 1% is a setup
+        # rate tolerance, not the G2c latency gate. Never accept 90/60 Hz pairs.
+        low = min(ref["period_ns"], editor["period_ns"])
+        if not synthetic_clock and abs(ref["period_ns"] - editor["period_ns"]) > low // 100:
+            raise ValueError(f"pair {pair}: measured target refresh periods differ (place both on the same output)")
         if abs(ref["actual_phase_ns"] - editor["actual_phase_ns"]) > tolerance:
             raise ValueError(f"pair {pair}: actual phases differ by more than {tolerance} ns")
         diff = {"pair_id": pair}
@@ -125,6 +130,7 @@ def main():
     parser.add_argument("injections", type=Path)
     parser.add_argument("--reference-frames", type=Path, help="optional refwin CSV; injectors using --wait-reference already have endpoints")
     parser.add_argument("--editor-trace", type=Path)
+    parser.add_argument("--synthetic-clock", action="store_true", help="Xvfb TRACK only: skip measured rate comparison")
     parser.add_argument("--pairs", type=int, required=True, help="expected count; truncated runs must fail")
     parser.add_argument("--first-pair", type=int, default=1)
     parser.add_argument("--phase-tolerance-ns", type=int, required=True, help="coordinator-selected matching tolerance; never an optical gate")
@@ -152,7 +158,7 @@ def main():
                 raise ValueError("unmatched reference frames")
         if args.editor_trace:
             complete_editor(rows, read_trace(args.editor_trace))
-        differences = pair_rows(rows, args.pairs, args.first_pair, args.phase_tolerance_ns)
+        differences = pair_rows(rows, args.pairs, args.first_pair, args.phase_tolerance_ns, args.synthetic_clock)
         # Validate the whole run before creating either output file.
         with open(args.csv, "w", newline="", encoding="ascii") as output:
             writer = csv.DictWriter(output, fieldnames=FIELDS, lineterminator="\n")
@@ -162,6 +168,8 @@ def main():
             writer = csv.DictWriter(output, fieldnames=list(differences[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(differences)
+        if args.synthetic_clock:
+            print("TRACK SYNTHETIC-CLOCK: rate comparison disabled; cannot establish real vblank/G2c")
         for stage in ("t4", "t5", "t6"):
             values = sorted(row[f"{stage}_editor_minus_reference_ns"] for row in differences)
             p50 = values[math.ceil(len(values) * 0.50) - 1]

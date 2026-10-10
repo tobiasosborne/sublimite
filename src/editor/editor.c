@@ -243,6 +243,8 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
 int editor_inject(editor *e, const plat_event *event)
 {
     if (!e || !event || event->utf8_len > PLAT_UTF8_MAX) return EDITOR_ERR_ARG;
+    /* Closing is control flow, independent of command/view/journal capacity. */
+    if (event->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
     if (e->queue_count == EDITOR_INPUT_CAP) return EDITOR_ERR_INPUT_FULL;
     size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
     e->queue[at] = *event; e->queue_count++; return 0;
@@ -250,13 +252,14 @@ int editor_inject(editor *e, const plat_event *event)
 int editor_step(editor *e, int timeout_ms)
 {
     if (!e || !e->tree) return EDITOR_ERR_ARG;
+    if (e->quit) return EDITOR_CLOSED;
     if (e->error) return e->error;
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
-    if (e->quit) return EDITOR_CLOSED;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
+    if (e->quit) return EDITOR_CLOSED;
     if (rc) return fail(e, rc);
     uint64_t start = trace_now_ns();
     rc = blink(e, start); if (rc) return rc;

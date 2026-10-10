@@ -122,3 +122,53 @@ Missing: plat_clip_set still memcpy's on the caller (borrowed buffer; use x11_cl
 per chunk on the UI thread; the 1 ms polling wake instead of the pool eventfd (needs an x11.c edit, proposed).
 Verify: DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=1 make check; run build/tests/x11_clip_test for the
 release numbers (guard test of "no allocation when typing is queued" is active only in the release build).
+
+## P2.6 tooling — edit-e6x.28
+
+Done: tools/keyinject and tools/refwin share checked Present/XTest, mapping,
+focus and per-window UST/MSC preflight. Both support non-injecting --dry-run;
+refwin can probe an existing placed --window. Injector periods are measured,
+--period-ns is an assertion, paired rate mismatches/movement/clock changes fail,
+and runtime errors name the failed stage with window/frame/pair context.
+Reference defaults to override-redirect; --managed preserves a WM alternative.
+Explicit --synthetic-clock is for Xvfb TRACK only; it never sets a fake period.
+No platform/backend implementation or editor shutdown changes.
+
+Verify: DISPLAY=:99 EDIT_DISPLAY=:99 make all; the same environment with
+ASAN_OPTIONS=detect_leaks=0 make check; make fuzz; build/tests/refwin_test
+--send-event; build/tools/refwin --dry-run --synthetic-clock. Test coverage and
+the exact coordinator-only eDP-1 placement/notification-muting/batch sequence
+are appended to ../../docs/decisions/P2.6.md. The sequence passes bash -n.
+
+Missing: actual real-display preflight/batch, hardware vblank/CRTC/compositor
+and optical G2c evidence, coordinator leak-detection rerun. Batch 2's original
+catch-all failure cannot be diagnosed retrospectively; next diagnostics will
+identify the failed precondition. Xvfb proves functional clock/event/protocol
+behavior only. Editor close failure remains edit-zzj.13, outside this bead.
+
+Final verification for edit-e6x.28: gcc make all exit zero; clang ASan/UBSan
+make check reports 48 passed binaries plus replay CLI; make fuzz builds 25
+fuzzers. Release XTest, forced-XSendEvent, temporary-window dry run and exact
+standalone no-input diagnostic checks passed on :99. The existing X11 decoder
+fuzz smoke completed 1,542,532 runs / 31 s without sanitizer errors (M)[AC],
+Not charging, load1=3.44; it does not fuzz the new preflight. Full evidence and
+synthetic MSC diagnostic stamps are appended to P2.6.md. No real-display or
+hot-path benchmark was run.
+
+## edit-e6x.28 session 8 continuation
+
+Current scope includes the minimal editor-loop urgent-close fix; the earlier
+"outside this bead" statement above is historical. Both tool dry runs now
+reject a held keyboard without releasing keys, and injection rechecks before
+each sample. Scripted clock state is per-fixture, with no globals. Added a
+no-input timeout/retained-CSV regression and tool protocol arithmetic fuzzer.
+Native close with held Present now verifies staged-journal durability/replay.
+See docs/decisions/edit-e6x.28.md and docs/worker-reports/edit-e6x.28-s8.md for
+final verification, the hardware/leak-detection limitations, pending-input
+preservation reconciliation, and the unrelated sanitizer shutdown observation.
+
+Final s8 verification: GCC 13 make all and clang 18 ASan/UBSan make check
+returned zero; 51 test binaries plus replay CLI passed (M)[AC], leaks disabled.
+make fuzz built 26 targets; tool-protocol, X11 input and editor fuzz each ran
+clean for 61 seconds (M)[AC]. The first check's unrelated use-after-free remains
+reported for coordinator follow-up; later green does not erase that observation.
