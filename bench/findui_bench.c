@@ -13,7 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SAMPLES 64u
+#define SAMPLES BENCH_INTERACTION_MIN_N
+_Static_assert(SAMPLES >= BENCH_INTERACTION_MIN_N, "G6c needs qualified samples");
 
 typedef struct observation {
     pthread_t caller;

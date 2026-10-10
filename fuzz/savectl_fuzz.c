@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 
 #define REQUIRE(x) EDIT_ASSERT(x)
 typedef struct fuzz_pause {
@@ -64,15 +65,211 @@ static void verify(savectl *s, piece_tree *tree, const char *path, const fuzz_mo
     REQUIRE(read(fd,text,sizeof text)==(ssize_t)m->disk_len); REQUIRE(close(fd)==0);
     REQUIRE(!memcmp(text,m->disk,m->disk_len));
 }
+static void put64(uint8_t *p, uint64_t n)
+{ for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(n >> (i * 8u)); }
+static void put32(uint8_t *p, uint32_t n)
+{ for (unsigned i = 0; i < 4; i++) p[i] = (uint8_t)(n >> (i * 8u)); }
+static journal_record checkpoint_base(uint8_t *p, const journal_base *b)
+{
+    put64(p, b->size); put64(p + 8, b->mtime_ns); put64(p + 16, b->inode); put64(p + 24, b->device);
+    put32(p + 32, b->prefix_crc); put32(p + 36, b->prefix_len);
+    size_t n = strlen(b->path); memcpy(p + 40, b->path, n + 1);
+    return (journal_record){JOURNAL_BASE, 1, 0, p, 41 + n};
+}
+static work_pool *new_pool(void)
+{
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); REQUIRE(pool);
+    REQUIRE((uintptr_t)pool % _Alignof(work_pool) == 0);
+    REQUIRE(work_pool_init(pool, 1, 0) == 0); return pool;
+}
+static void disk_is(const char *path, const uint8_t *bytes, size_t length)
+{
+    uint8_t actual[256]; REQUIRE(length <= sizeof actual);
+    int fd = open(path, O_RDONLY); REQUIRE(fd >= 0);
+    REQUIRE(read(fd, actual, sizeof actual) == (ssize_t)length && close(fd) == 0);
+    REQUIRE(memcmp(bytes, actual, length) == 0);
+}
+typedef struct io_fault { _Atomic bool fail_sync; } io_fault;
+static int sync_hook(void *ctx, int fd, bool directory)
+{
+    io_fault *fault = ctx;
+    if (atomic_exchange(&fault->fail_sync, false)) { errno = EIO; return -1; }
+    return directory ? fsync(fd) : fdatasync(fd);
+}
+static void journal_session(const uint8_t *data, size_t size)
+{
+    if (!size) return;
+    char directory[] = "/tmp/edit-savectl-journal-fuzz-XXXXXX"; REQUIRE(mkdtemp(directory));
+    char path[128], logpath[128];
+    REQUIRE(snprintf(path, sizeof path, "%s/target", directory) > 0);
+    REQUIRE(snprintf(logpath, sizeof logpath, "%s/journal", directory) > 0);
+    replace_disk(path, (const uint8_t *)"base", 4);
+    work_pool *pool = new_pool(), *jp = new_pool();
+    io_fault fault = {0}; journal_io io = {.ctx=&fault, .sync=sync_hook};
+    journal *j = NULL; REQUIRE(journal_open_with_io(&j, logpath, jp, NULL, &io) == 0);
+    journal_base previous; REQUIRE(journal_capture_base(path, &previous) == 0);
+    REQUIRE(journal_set_base(j, 1, &previous) == 0);
+    struct stat st; REQUIRE(stat(path, &st) == 0); file_id id; file_id_from_stat(&id, &st);
+    unsigned scenario = data[0] % 6u;
+    fuzz_pause pause = {0};
+    savectl_options options = {.pool=pool, .path=path, .baseline=id, .source_mode=FILE_MODE_COPY,
+        .journal=j, .journal_pool=jp, .buffer_id=1, .reload_allocator=piece_default_allocator(),
+        .step=pause_hook, .step_ctx=&pause};
+    REQUIRE(options.journal != NULL);
+    savectl *s = NULL; REQUIRE(savectl_create(&s, &options, false) == 0);
+    piece_allocator allocator = piece_default_allocator(); piece_tree *tree = piece_create(&allocator);
+    REQUIRE(tree && piece_init_copy(tree, (const uint8_t *)"base", 4) == 0);
+    uint8_t edit_byte = size > 1 ? data[1] : '!';
+    REQUIRE(piece_insert(tree, 4, &edit_byte, 1) == 0); savectl_modified(s);
+    uint8_t bp[4137], insert[9]; put64(insert, 4); insert[8] = edit_byte;
+    journal_record cp[] = {checkpoint_base(bp, &previous), {JOURNAL_INSERT, 1, 0, insert, sizeof insert}};
+    if (scenario == 1) cp[0].buffer_id = 2;
+    if (scenario == 2) replace_disk(path, (const uint8_t *)"other", 5);
+    if (scenario == 3) atomic_store(&pause.enabled, true);
+    if (scenario == 4) atomic_store(&fault.fail_sync, true);
+    REQUIRE(savectl_save(s, tree, &previous, cp, 2) == 0);
+    REQUIRE(savectl_get_model(s).journal_leased);
+    /* Partial drains and a reused work slot must preserve the lease/result. */
+    (void)work_mailbox_drain_bounded(pool, route, s, 1, 0); savectl_tick(s);
+    if (scenario == 3) {
+        while (!atomic_load(&pause.entered)) (void)sched_yield();
+        REQUIRE(savectl_get_model(s).busy);
+        replace_disk(path, (const uint8_t *)"other", 5);
+        if (data[0] & 0x80u) savectl_file_event(s);
+        atomic_store(&pause.released, true);
+    }
+    settle(s, pool); savectl_model model = savectl_get_model(s);
+    REQUIRE(!model.journal_leased && model.modified);
+    if (scenario == 1 || scenario == 2 || scenario == 4) {
+        REQUIRE(model.state == SAVECTL_FAILED);
+        REQUIRE(model.journal_error == (scenario == 1 ? JOURNAL_INVALID :
+                                       scenario == 2 ? JOURNAL_BASE_CHANGED : JOURNAL_IO));
+        disk_is(path, (const uint8_t *)(scenario == 2 ? "other" : "base"), scenario == 2 ? 5u : 4u);
+    } else if (scenario == 3) {
+        REQUIRE(model.banner && (model.file_error == FILE_ERR_CHANGED ||
+                ((data[0] & 0x80u) && model.file_error == FILE_OK)));
+        const journal_save *token = savectl_save_token(s);
+        REQUIRE(token && token->prepared && token->previous_path[0]);
+        disk_is(token->previous_path, (const uint8_t *)"base", 4);
+        REQUIRE(savectl_save(s, tree, &previous, cp, 2) == SAVECTL_BUSY);
+        disk_is(path, (const uint8_t *)"other", 5);
+    } else {
+        uint8_t expected[5] = {'b','a','s','e',edit_byte}; disk_is(path, expected, sizeof expected);
+        REQUIRE(model.needs_finish && !model.file_error && !model.journal_error);
+        const journal_save *token = savectl_save_token(s); REQUIRE(token && token->prepared);
+        char retained[4097]; strcpy(retained, token->previous_path);
+        disk_is(retained, (const uint8_t *)"base", 4);
+        journal_record next = checkpoint_base(bp, savectl_saved_base(s));
+        journal_record invalid = next; invalid.buffer_id = 2;
+        REQUIRE(savectl_finish(s, &invalid, 1) == 0); settle(s, pool);
+        REQUIRE(savectl_get_model(s).needs_finish && savectl_get_model(s).journal_error == JOURNAL_INVALID);
+        REQUIRE(access(retained, F_OK) == 0);
+        if (scenario == 5) {
+            atomic_store(&fault.fail_sync, true);
+            REQUIRE(savectl_finish(s, &next, 1) == 0); settle(s, pool);
+            REQUIRE(savectl_get_model(s).needs_finish && savectl_get_model(s).journal_error == JOURNAL_IO);
+            /* A failed sync requires a complete checkpoint in a fresh inode. */
+            int retry = journal_get_stats(j).error == JOURNAL_IO ? journal_retry(j) : JOURNAL_OK;
+            REQUIRE(retry == JOURNAL_OK || retry == JOURNAL_IO);
+            REQUIRE(journal_rotate(j, &next, 1) == 0);
+        }
+        REQUIRE(savectl_finish(s, &next, 1) == 0); settle(s, pool);
+        REQUIRE(!savectl_get_model(s).needs_finish && !savectl_get_model(s).modified);
+        REQUIRE(savectl_get_model(s).state == SAVECTL_SAVED && access(retained, F_OK) != 0);
+    }
+    /* Resolve the complete current session checkpoint before retiring any
+     * ambiguous retained generation during fixture teardown. */
+    journal_base current; REQUIRE(journal_capture_base(path, &current) == 0);
+    journal_record resolved = checkpoint_base(bp, &current);
+    int retry = journal_get_stats(j).error == JOURNAL_IO ? journal_retry(j) : JOURNAL_OK;
+    REQUIRE(retry == JOURNAL_OK || retry == JOURNAL_IO);
+    int flushed = journal_flush(j); REQUIRE(flushed == JOURNAL_OK || flushed == JOURNAL_IO);
+    REQUIRE(journal_rotate(j, &resolved, 1) == 0);
+    const journal_save *token = savectl_save_token(s);
+    if (token && token->previous_path[0]) REQUIRE(unlink(token->previous_path) == 0 || errno == ENOENT);
+    while (savectl_destroy(s) == SAVECTL_BUSY) { savectl_tick(s); (void)sched_yield(); }
+    piece_destroy(tree); journal_close(j); work_pool_shutdown(jp); work_pool_shutdown(pool); free(jp); free(pool);
+    REQUIRE(unlink(logpath) == 0 && unlink(path) == 0 && rmdir(directory) == 0);
+}
+typedef struct acquisition_fault { size_t calls, fail_at; unsigned validations, fail_validation; } acquisition_fault;
+static void *reload_alloc(void *ctx, size_t size)
+{
+    acquisition_fault *fault = ctx;
+    if (++fault->calls == fault->fail_at) return NULL;
+    piece_allocator allocator = piece_default_allocator(); return allocator.alloc(allocator.ctx, size);
+}
+static void reload_free(void *ctx, void *ptr, size_t size)
+{ (void)ctx; piece_allocator allocator = piece_default_allocator(); allocator.free(allocator.ctx, ptr, size); }
+static int source_guard(void *ctx)
+{
+    acquisition_fault *fault = ctx;
+    return ++fault->validations == fault->fail_validation ? FILE_ERR_IO : FILE_OK;
+}
+static void acquisition_session(const uint8_t *data, size_t size)
+{
+    if (!size) return;
+    char directory[] = "/tmp/edit-savectl-acquire-fuzz-XXXXXX"; REQUIRE(mkdtemp(directory));
+    char path[128], away[128]; REQUIRE(snprintf(path, sizeof path, "%s/target", directory) > 0);
+    REQUIRE(snprintf(away, sizeof away, "%s-away", directory) > 0);
+    replace_disk(path, (const uint8_t *)"base", 4);
+    struct stat before; REQUIRE(stat(path, &before) == 0); file_id id; file_id_from_stat(&id, &before);
+    work_pool *pool = new_pool(); acquisition_fault fault = {0};
+    unsigned scenario = data[0] % 6u;
+    savectl_options options = {.pool=pool, .path=path, .baseline=id, .source_mode=FILE_MODE_COPY,
+        .reload_allocator={&fault, reload_alloc, reload_free}};
+    if (scenario == 0 || scenario == 1) {
+        options.source_mode = FILE_MODE_MMAP; options.validate_source = source_guard; options.source_ctx = &fault;
+        fault.fail_validation = scenario + 1;
+    }
+    savectl *s = NULL; REQUIRE(savectl_create(&s, &options, true) == 0);
+    piece_allocator allocator = piece_default_allocator(); piece_tree *tree = piece_create(&allocator);
+    REQUIRE(tree && piece_init_copy(tree, (const uint8_t *)"base", 4) == 0);
+    if (scenario == 0 || scenario == 1) {
+        REQUIRE(savectl_save(s, tree, NULL, NULL, 0) == 0); settle(s, pool);
+        REQUIRE(savectl_get_model(s).state == SAVECTL_FAILED && savectl_get_model(s).file_error == FILE_ERR_IO);
+        REQUIRE(savectl_get_model(s).modified); disk_is(path, (const uint8_t *)"base", 4);
+    } else if (scenario == 2 || scenario == 3) {
+        REQUIRE(unlink(path) == 0);
+        if (scenario == 3) REQUIRE(mkdir(path, 0700) == 0);
+        REQUIRE(savectl_reload(s) == 0); settle(s, pool);
+        REQUIRE(savectl_get_model(s).state == SAVECTL_FAILED);
+        REQUIRE(savectl_get_model(s).file_error == (scenario == 2 ? FILE_ERR_IO : FILE_ERR_NOTREG));
+        REQUIRE(savectl_get_model(s).modified && piece_len(tree) == 4);
+        if (scenario == 3) REQUIRE(rmdir(path) == 0);
+        replace_disk(path, (const uint8_t *)"base", 4);
+    } else if (scenario == 4) {
+        REQUIRE(savectl_reload(s) == 0); settle(s, pool);
+        fault.fail_at = 1u + (size > 1 ? data[1] % 4u : 0u);
+        piece_tree *replacement = NULL; savectl_view view = {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+        int code = savectl_take_reload(s, &replacement, &view);
+        if (code == SAVECTL_NOMEM) {
+            REQUIRE(!replacement && view.cursor == UINT64_MAX && piece_len(tree) == 4);
+            fault.fail_at = 0;
+            REQUIRE(savectl_take_reload(s, &replacement, &view) == 0);
+        } else REQUIRE(code == 0);
+        uint8_t text[4]; REQUIRE(replacement && piece_read(replacement, 0, text, 4) == 0);
+        REQUIRE(memcmp(text, "base", 4) == 0); piece_destroy(tree); tree = replacement;
+    } else {
+        REQUIRE(rename(directory, away) == 0);
+        REQUIRE(savectl_save(s, tree, NULL, NULL, 0) == 0); settle(s, pool);
+        REQUIRE(savectl_get_model(s).file_error == FILE_ERR_IO && savectl_get_model(s).modified);
+        REQUIRE(rename(away, directory) == 0); disk_is(path, (const uint8_t *)"base", 4);
+    }
+    while (savectl_destroy(s) == SAVECTL_BUSY) { savectl_tick(s); (void)sched_yield(); }
+    piece_destroy(tree); work_pool_shutdown(pool); free(pool);
+    REQUIRE(unlink(path) == 0 && rmdir(directory) == 0);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!size) return 0;
     trace_init();
+    journal_session(data, size);
+    acquisition_session(data, size);
     char directory[]="/tmp/edit-savectl-fuzz-XXXXXX"; REQUIRE(mkdtemp(directory));
     char path[128]; REQUIRE(snprintf(path,sizeof path,"%s/target",directory)>0);
     int fd=open(path,O_WRONLY|O_CREAT|O_EXCL,0600); REQUIRE(fd>=0 && write(fd,"base",4)==4); close(fd);
     struct stat st; REQUIRE(stat(path,&st)==0);
-    work_pool *pool=calloc(1,sizeof *pool); REQUIRE(pool && work_pool_init(pool,1,0)==0);
+    work_pool *pool=aligned_alloc(_Alignof(work_pool),sizeof *pool); REQUIRE(pool); REQUIRE((uintptr_t)pool % _Alignof(work_pool) == 0); REQUIRE(work_pool_init(pool,1,0)==0);
     fuzz_pause pause={0};
     savectl_options options={.step=pause_hook,.step_ctx=&pause,.pool=pool,.path=path,.source_mode=FILE_MODE_COPY,
         .reload_allocator=piece_default_allocator(),

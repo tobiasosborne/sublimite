@@ -81,11 +81,11 @@ static void core_model(const uint8_t *data, size_t size)
         REQUIRE(s.first_line * m.height * 256 + s.subrow_q8 == (uint64_t)m.position);
     }
 }
-typedef struct source { const uint8_t *bytes; size_t size, fragment; } source;
+typedef struct source { const uint8_t *bytes; size_t size, fragment, calls, fail_call; } source;
 static size_t span(void *ctx, uint64_t off, const uint8_t **out)
 {
     source *f = ctx;
-    if (off >= f->size) return 0;
+    if (++f->calls == f->fail_call || off >= f->size) return 0;
     *out = f->bytes + off;
     size_t n = f->size - (size_t)off;
     return n > f->fragment ? f->fragment : n;
@@ -112,7 +112,7 @@ static void index_model(const uint8_t *data, size_t size)
         pos += length; bytes[pos - 1] = '\n'; starts[count++] = pos;
         serial++;
     }
-    source f = {bytes, sizeof bytes, (size_t)data[1] + 1};
+    source f = {.bytes=bytes, .size=sizeof bytes, .fragment=(size_t)data[1] + 1};
     lineidx_src src = {&f, sizeof bytes, span, NULL};
     lineidx *index = lineidx_create(sizeof bytes);
     REQUIRE(index);
@@ -166,9 +166,92 @@ static void index_model(const uint8_t *data, size_t size)
     }
     lineidx_destroy(index);
 }
+static uint64_t scalar_start(const uint8_t *bytes, size_t at)
+{
+    while (at && bytes[at - 1] != '\n') at--;
+    return at;
+}
+static uint64_t scalar_line(const uint8_t *bytes, size_t at)
+{
+    uint64_t line = 0;
+    for (size_t i = 0; i < at; i++) if (bytes[i] == '\n') line++;
+    return line;
+}
+static void complete_index(lineidx *index, const lineidx_src *src)
+{
+    for (size_t i = 0; i < 4096 && !lineidx_complete(index); i++)
+        (void)lineidx_seek_line(index, src, UINT64_MAX, LINEIDX_CHUNK);
+    REQUIRE(lineidx_complete(index));
+}
+/* Long-line proof, staged source errors, and independently transformed
+ * physical anchors across insertion/deletion. Keep the short-line pixel
+ * oracle above too; no production helpers are used for the edit oracle. */
+static void difficult_model(const uint8_t *data, size_t size)
+{
+    if (size < 4) return;
+    uint8_t bytes[FILE_BYTES + 64];
+    memset(bytes, 'x', sizeof bytes);
+    size_t anchor = 1u + data[0];
+    size_t gap = SCROLL_SCAN_BUDGET + 2u + (size_t)data[1] * 128u;
+    REQUIRE(gap > SCROLL_SCAN_BUDGET);
+    bytes[anchor - 1] = '\n'; bytes[anchor + gap] = '\n';
+    source f = {.bytes=bytes, .size=FILE_BYTES, .fragment=1u + (size_t)data[2] * 17u};
+    lineidx_src src = {&f, f.size, span, NULL};
+    lineidx *index = lineidx_create(f.size); REQUIRE(index);
+    scroll_state s;
+    REQUIRE(scroll_init(&s, (scroll_config){1, 17, 0}, (scroll_extent){f.size, 100, false}) == 0);
+    REQUIRE(scroll_seek_byte(&s, anchor) == 0 && scroll_resolve(&s, index, &src, 0) == 0);
+    REQUIRE(s.first_byte == anchor);
+    scroll_state before = s;
+    size_t cursor = anchor + gap - 1;
+    REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == SCROLL_MORE);
+    REQUIRE(memcmp(&s, &before, sizeof s) == 0);
+    REQUIRE(scroll_follow_cursor(&s, index, &src, anchor + SCROLL_SCAN_BUDGET) == 0);
+    REQUIRE(s.first_byte == anchor);
+    /* Fail on a staged callback inside the requested suffix, with unchanged
+     * pending intent as well as unchanged viewport. */
+    REQUIRE(scroll_seek_byte(&s, cursor) == 0); before = s;
+    f.calls = 0; f.fail_call = 1u + data[3] % 8u;
+    REQUIRE(scroll_resolve(&s, index, &src, 0) == SCROLL_ERR_SOURCE);
+    REQUIRE(memcmp(&s, &before, sizeof s) == 0);
+    f.fail_call = 0;
+    REQUIRE(scroll_resolve(&s, index, &src, 0) == 0);
+    complete_index(index, &src);
+    REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == 0);
+    REQUIRE(s.first_byte == scalar_start(bytes, cursor));
+    REQUIRE(s.first_line == scalar_line(bytes, cursor) && !s.approximate);
+    for (size_t i = 0; i < size && i < 16; i++) {
+        size_t off = (data[i] & 1u) ? (size_t)s.first_byte : (size_t)s.first_byte - (s.first_byte != 0);
+        bool insertion = (data[i] & 2u) != 0;
+        uint64_t transformed = s.first_byte;
+        if (insertion) {
+            REQUIRE(lineidx_edit(index, off, 0, 1) == 0);
+            memmove(bytes + off + 1, bytes + off, f.size - off); bytes[off] = '\n'; f.size++;
+            if (off <= transformed) transformed++;
+            if (off <= cursor) cursor++;
+        } else {
+            REQUIRE(lineidx_edit(index, off, 1, 0) == 0);
+            memmove(bytes + off, bytes + off + 1, f.size - off - 1); f.size--;
+            if (off < transformed) transformed--;
+            if (off < cursor) cursor--;
+        }
+        src.len = f.size;
+        /* The host owns byte-anchor transformation after an edit. Deleting
+         * its preceding newline merges rows: independently find the new seed. */
+        s.first_byte = scalar_start(bytes, (size_t)transformed);
+        REQUIRE(scroll_set_extent(&s, (scroll_extent){f.size, 100, false}) == 0);
+        complete_index(index, &src);
+        REQUIRE(scroll_resolve(&s, index, &src, 0) == 0);
+        REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == 0);
+        REQUIRE(s.first_byte == scalar_start(bytes, cursor));
+        REQUIRE(s.first_line == scalar_line(bytes, cursor) && !s.approximate);
+    }
+    lineidx_destroy(index);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    difficult_model(data, size);
     core_model(data, size);
     index_model(data, size);
     return 0;

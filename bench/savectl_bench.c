@@ -8,6 +8,11 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#define SMALL_SAMPLES BENCH_INTERACTION_MIN_N
+#define LARGE_SAMPLES BENCH_INTERACTION_MIN_N
+_Static_assert(SMALL_SAMPLES >= BENCH_INTERACTION_MIN_N, "G8 small needs qualified samples");
+_Static_assert(LARGE_SAMPLES >= BENCH_INTERACTION_MIN_N, "G8 large needs qualified samples");
+
 static void route(const work_msg *msg, void *ctx) { (void)savectl_receive(ctx,msg); }
 static void settle(savectl *s, work_pool *pool)
 {
@@ -77,8 +82,11 @@ static int run_size(size_t bytes, size_t iterations, bool track)
     if (fsync(fd)) { close(fd); goto file_end; }
     close(fd);
     if (mprotect(source,bytes,PROT_READ)) goto file_end;
-    work_pool *pool=calloc(1,sizeof *pool),*jp=calloc(1,sizeof *jp);
+    work_pool *pool=aligned_alloc(_Alignof(work_pool),sizeof *pool),*jp=aligned_alloc(_Alignof(work_pool),sizeof *jp);
     if (!pool || !jp) { free(pool); free(jp); goto file_end; }
+    if ((uintptr_t)pool % _Alignof(work_pool) || (uintptr_t)jp % _Alignof(work_pool)) {
+        fputs("savectl_bench: unaligned work pool\n",stderr); goto pool_free;
+    }
     if (work_pool_init(pool,1,0)) goto pool_free;
     if (work_pool_init(jp,1,0)) goto pool_end;
     journal *j=NULL;
@@ -92,10 +100,10 @@ static int run_size(size_t bytes, size_t iterations, bool track)
         .baseline={.dev=previous.device,.ino=previous.inode,.size=previous.size,.mtime_ns=previous.mtime_ns,
             .mode=(uint32_t)st.st_mode & 07777u,.exists=1},.journal=j,.journal_pool=jp,.buffer_id=1};
     savectl *s=NULL; if (savectl_create(&s,&options,false)) goto tree_end;
-    uint64_t ack_data[128],durable_data[128],transaction_data[128];
+    uint64_t ack_data[SMALL_SAMPLES],durable_data[SMALL_SAMPLES],transaction_data[SMALL_SAMPLES];
     bench_samples ack,durable,transaction;
-    bench_samples_init(&ack,ack_data,128); bench_samples_init(&durable,durable_data,128);
-    bench_samples_init(&transaction,transaction_data,128);
+    bench_samples_init(&ack,ack_data,SMALL_SAMPLES); bench_samples_init(&durable,durable_data,SMALL_SAMPLES);
+    bench_samples_init(&transaction,transaction_data,SMALL_SAMPLES);
     char power[32]; double load=load_stamp(power,sizeof power);
     for (size_t i=0;i<iterations;++i) {
         uint8_t payload[4137]; journal_record checkpoint=base_record(payload,&previous);
@@ -143,7 +151,7 @@ int main(int argc, char **argv)
     bool track=argc==2 && !strcmp(argv[1],"--track");
     if (argc>2 || (argc==2 && !track && strcmp(argv[1],"--gate"))) return 2;
     trace_init();
-    int rc=run_size(FILE_PREFIX_MAX,128,track);
-    int big=run_size((size_t)1u<<30,7,track);
+    int rc=run_size(FILE_PREFIX_MAX,SMALL_SAMPLES,track);
+    int big=run_size((size_t)1u<<30,LARGE_SAMPLES,track);
     return rc?rc:big;
 }

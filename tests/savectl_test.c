@@ -10,42 +10,35 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stdarg.h>
+#include <sys/syscall.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
 
-#ifdef SAVECTL_IO_WRAP
 static _Thread_local bool ui_no_io;
-extern int __real_stat(const char *, struct stat *);
-extern int __real_fstat(int, struct stat *);
-extern int __real_open(const char *, int, ...);
-extern int __real_openat(int, const char *, int, ...);
-extern int __real_fsync(int);
-extern ssize_t __real_pread(int, void *, size_t, off_t);
-extern int __real_close(int);
-int __wrap_stat(const char *path, struct stat *st) { CHECK(!ui_no_io); return __real_stat(path,st); }
-int __wrap_fstat(int fd, struct stat *st) { CHECK(!ui_no_io); return __real_fstat(fd,st); }
-int __wrap_open(const char *path, int flags, ...)
+int stat(const char *path, struct stat *st) { CHECK(!ui_no_io); return (int)syscall(SYS_newfstatat,AT_FDCWD,path,st,0); }
+int fstat(int fd, struct stat *st) { CHECK(!ui_no_io); return (int)syscall(SYS_fstat,fd,st); }
+int fstatat(int fd, const char *path, struct stat *st, int flags)
+{ CHECK(!ui_no_io); return (int)syscall(SYS_newfstatat,fd,path,st,flags); }
+int open(const char *path, int flags, ...)
 {
     CHECK(!ui_no_io); mode_t mode=0;
     if (flags & O_CREAT) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
-    return __real_open(path,flags,mode);
+    return (int)syscall(SYS_openat,AT_FDCWD,path,flags,mode);
 }
-int __wrap_openat(int fd, const char *path, int flags, ...)
+int openat(int fd, const char *path, int flags, ...)
 {
     CHECK(!ui_no_io); mode_t mode=0;
     if (flags & O_CREAT) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
-    return __real_openat(fd,path,flags,mode);
+    return (int)syscall(SYS_openat,fd,path,flags,mode);
 }
-int __wrap_fsync(int fd) { CHECK(!ui_no_io); return __real_fsync(fd); }
-ssize_t __wrap_pread(int fd, void *bytes, size_t n, off_t off) { CHECK(!ui_no_io); return __real_pread(fd,bytes,n,off); }
-int __wrap_close(int fd) { CHECK(!ui_no_io); return __real_close(fd); }
+int fsync(int fd) { CHECK(!ui_no_io); return (int)syscall(SYS_fsync,fd); }
+ssize_t pread(int fd, void *bytes, size_t n, off_t off) { CHECK(!ui_no_io); return (ssize_t)syscall(SYS_pread64,fd,bytes,n,off); }
+int close(int fd) { CHECK(!ui_no_io); return (int)syscall(SYS_close,fd); }
 #define UI_NO_IO(x) do { ui_no_io=true; x; ui_no_io=false; } while (0)
-#else
-#define UI_NO_IO(x) do { x; } while (0)
-#endif
 static void basic(void)
 {
-    work_pool *pool = calloc(1, sizeof *pool); CHECK(pool);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK((uintptr_t)pool % _Alignof(work_pool) == 0);
     CHECK(work_pool_init(pool, 1, 0) == 0);
     savectl_options o = {.pool=pool,.path="/tmp/savectl-uncreated",.source_mode=FILE_MODE_COPY,.reload_allocator=piece_default_allocator()};
     savectl *s = NULL;
@@ -94,7 +87,7 @@ static void init(fixture *f, const char *bytes)
     memset(f,0,sizeof *f); strcpy(f->dir,"/tmp/edit-savectl-test-XXXXXX"); CHECK(mkdtemp(f->dir));
     CHECK(snprintf(f->path,sizeof f->path,"%s/target",f->dir)>0);
     put(f->path,bytes);
-    f->pool=calloc(1,sizeof *f->pool); CHECK(f->pool && work_pool_init(f->pool,1,0)==0);
+    f->pool=aligned_alloc(_Alignof(work_pool),sizeof *f->pool); CHECK(f->pool); CHECK((uintptr_t)f->pool % _Alignof(work_pool) == 0); CHECK(work_pool_init(f->pool,1,0)==0);
     piece_allocator a=piece_default_allocator(); f->tree=piece_create(&a); CHECK(f->tree);
     CHECK(piece_init_copy(f->tree,(const uint8_t *)bytes,strlen(bytes))==0);
     savectl_options o={.pool=f->pool,.path=f->path,.baseline=base_id(f->path),.source_mode=FILE_MODE_COPY,.reload_allocator=piece_default_allocator()};
@@ -126,12 +119,10 @@ static void pause_hook(void *ctx, int step)
 }
 static void blocker(work_ctx *ctx) { pause_hook(ctx->arg,0); }
 
-#ifdef SAVECTL_IO_WRAP
 static _Atomic(pause_job *) publication_pause;
-extern bool __real_work_publish(work_ctx *, const work_msg *);
 bool __wrap_work_publish(work_ctx *ctx, const work_msg *message)
 {
-    bool ok=__real_work_publish(ctx,message);
+    bool ok=work_publish(ctx,message);
     pause_job *p=atomic_load(&publication_pause);
     if (ok && p && message->kind==SAVECTL_MESSAGE) pause_hook(p,0);
     return ok;
@@ -147,7 +138,14 @@ static void notification_orders_completion(void)
     CHECK(savectl_get_model(f.s).state==SAVECTL_SAVED);
     atomic_store(&p.release,true); atomic_store(&publication_pause,NULL); finish_fixture(&f);
 }
-#endif
+/* I/O symbols above interpose controller AND library calls in ordinary
+ * release/sanitizer builds; direct Linux syscalls avoid recursion/dlsym.
+ * Compile the production controller here only to intercept work publication
+ * (work.o also supplies the pool, so link interposition would duplicate it).
+ * The archive does not extract its duplicate savectl object. */
+#define work_publish(...) __wrap_work_publish(__VA_ARGS__)
+#include "../src/savectl/savectl.c"
+#undef work_publish
 static void recreate(fixture *f, pause_job *p)
 {
     CHECK(savectl_destroy(f->s)==0);
@@ -286,7 +284,7 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
 {
     fixture f; init(&f,"old");
     char logpath[160]; CHECK(snprintf(logpath,sizeof logpath,"%s/journal",f.dir)>0);
-    work_pool *jp=calloc(1,sizeof *jp); CHECK(jp && work_pool_init(jp,1,0)==0);
+    work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(jp); CHECK((uintptr_t)jp % _Alignof(work_pool) == 0); CHECK(work_pool_init(jp,1,0)==0);
     journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
     journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
     uint8_t bp[4137], insert[9]={0}; le64(insert,3); insert[8]='!';
@@ -444,12 +442,29 @@ static void edit_after_reload_publication(void)
     CHECK(savectl_get_model(f.s).modified && !savectl_get_model(f.s).banner);
     finish_fixture(&f);
 }
+static void creation_permissions(uint32_t mode, bool valid, uint32_t expected)
+{
+    fixture f; init(&f, "new"); CHECK(savectl_destroy(f.s) == 0); CHECK(unlink(f.path) == 0);
+    savectl_options options = {.pool=f.pool, .path=f.path, .source_mode=FILE_MODE_COPY,
+        .reload_allocator=piece_default_allocator(), .create_mode=mode, .create_mode_valid=valid};
+    CHECK(savectl_create(&f.s, &options, true) == 0);
+    mode_t previous_mask = umask(0777);
+    UI_NO_IO(CHECK(savectl_save(f.s, f.tree, NULL, NULL, 0) == 0)); wait_controller(&f);
+    (void)umask(previous_mask);
+    CHECK(savectl_get_model(f.s).state == SAVECTL_SAVED && !savectl_get_model(f.s).modified);
+    CHECK(base_id(f.path).mode == expected);
+    finish_fixture(&f);
+}
 int main(void)
 {
     trace_init();
-#ifdef SAVECTL_IO_WRAP
     notification_orders_completion();
-#endif
+    puts("savectl normal-build I/O and held-publication guard: ok");
+    creation_permissions(0, true, 0);
+    creation_permissions(0, false, 0644);
+    creation_permissions(0777, false, 0644);
+    creation_permissions(0571, true, 0571);
+    puts("savectl creation permissions/default/umask: ok");
     basic(); ack_queued(); save_states(); failed_io();
     race(true,false); race(false,false); race(true,true);
     puts("savectl §2.14 save/external-change races (notified, unnotified, restored identity): ok");

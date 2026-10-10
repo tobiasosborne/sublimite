@@ -13,7 +13,8 @@
 
 #define COLS 80u
 #define ROWS 24u
-#define JUMPS 5u
+#define JUMPS BENCH_INTERACTION_MIN_N
+_Static_assert(JUMPS >= BENCH_INTERACTION_MIN_N, "G7j needs qualified samples");
 #define STEPS 10000u
 #define HALF_PERIOD_NS UINT64_C(4166666)
 typedef struct source { const uint8_t *bytes; uint64_t size; } source;

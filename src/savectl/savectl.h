@@ -42,6 +42,12 @@ typedef struct savectl_options {
     uint64_t buffer_id;
     void (*step)(void *ctx, int step);
     void *step_ctx;
+    /* New targets only: valid selects exact permission bits, including 0000.
+     * Without it, retain the legacy baseline.mode hint (0 selects 0644).
+     * These are final fchmod bits: process umask is not applied. Existing
+     * targets preserve the file core's captured permissions/ACL policy. */
+    uint32_t create_mode;
+    bool create_mode_valid;
 } savectl_options;
 int savectl_create(savectl **out, const savectl_options *options, bool modified);
 /* Nonblocking; BUSY until job, result, and staged reload are retired. Does not

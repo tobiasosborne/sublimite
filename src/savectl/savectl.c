@@ -161,7 +161,8 @@ static void worker(work_ctx *ctx)
                     &s->task.previous,s->task.checkpoint,s->task.count,&s->token);
             if (!r->file_error && !r->journal_error) {
                 file_save_args args={.path=s->path,.snap=s->task.snapshot,
-                    .mode=s->task.expect.mode,.expect=&s->task.expect,
+                    .mode=s->options.create_mode_valid ? s->options.create_mode : s->task.expect.mode,
+                    .mode_valid=s->options.create_mode_valid,.expect=&s->task.expect,
                     .stop=stop,.stop_ctx=s,.validate=validate,.validate_ctx=s,
                     .out_id=&r->id,.step=s->options.step,.step_ctx=s->options.step_ctx};
                 r->file_error=file_save_write(&args); r->err_no=args.err_no;
