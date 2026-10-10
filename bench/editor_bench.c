@@ -485,6 +485,51 @@ static bool typing_structure(const samples *measured, editor_stats before, edito
         measured->guard || measured->suspended || after.journal_error != 0 ||
         after.mutations - before.mutations != count || after.journal_records - before.journal_records != count;
 }
+/* Checkpoint regression exercises the actual row diagnostic without a display. */
+static int typing_checkpoint(FILE *out, const char *label, const char *workload,
+                             const samples *measured, size_t expected, const stamp *tag)
+{
+    bool incomplete = measured->completed != expected;
+    if (!measured->invalid && !incomplete && !measured->guard && !measured->suspended) return 0;
+    fprintf(out, "STRUCTURAL name=editor_%s_%s_injection_T4_G1 structural=FAIL"
+            " invalid=%d incomplete=%d completed=%zu expected=%zu guard=%d suspended=%d"
+            " allocations=%zu allocation_site=unavailable_count_only_guard (M)%s load1=%s\n",
+            label, workload, measured->invalid, incomplete, measured->completed, expected,
+            measured->guard, measured->suspended, measured->allocations, tag->power, tag->load);
+    return 1;
+}
+static int typing_checkpoint_self_check(void)
+{
+    const stamp tag = {.status = "Not charging", .load = "test", .power = "[AC]"};
+    const char *flags[] = {"invalid=1", "incomplete=1", "guard=1", "suspended=1"};
+    for (size_t i = 0; i < sizeof flags / sizeof flags[0]; i++) {
+        samples measured = {.completed = 8};
+        if (i == 0) measured.invalid = true;
+        if (i == 1) measured.completed = 7;
+        if (i == 2) measured.guard = true;
+        if (i == 3) measured.suspended = true;
+        char line[1024] = {0};
+        FILE *out = fmemopen(line, sizeof line, "w"); REQUIRE(out != NULL);
+        int rc = typing_checkpoint(out, "raster", "serial", &measured, 8, &tag);
+        REQUIRE(fflush(out) == 0); bool printed = line[0] != 0; fclose(out);
+        printf("PROBE typing checkpoint flag=%s rc=%d printed=%d\n", flags[i], rc, printed);
+        REQUIRE(rc == 1 && printed);
+        REQUIRE(strstr(line, "name=editor_raster_serial_injection_T4_G1") != NULL);
+        REQUIRE(strstr(line, flags[i]) != NULL);
+        REQUIRE(strstr(line, "completed=") && strstr(line, "expected=8"));
+        REQUIRE(strstr(line, "invalid=") && strstr(line, "incomplete=") &&
+                strstr(line, "guard=") && strstr(line, "suspended="));
+        REQUIRE(strstr(line, "allocation_site=") && strstr(line, "structural=FAIL"));
+        REQUIRE(bench_merge_exit(rc, 0) == 1 && bench_merge_exit(rc, 3) == 1);
+    }
+    samples measured = {.completed = 8};
+    char line[1024] = {0};
+    FILE *out = fmemopen(line, sizeof line, "w"); REQUIRE(out != NULL);
+    int rc = typing_checkpoint(out, "null", "serial", &measured, 8, &tag);
+    long bytes = ftell(out); fclose(out); REQUIRE(rc == 0 && bytes == 0);
+    puts("editor_bench: typing checkpoint diagnostics and structural exit aggregation passed");
+    return 0;
+}
 #define TYPING_REQUIRE(c) do { if (!(c)) { fprintf(stderr, "editor_bench:%d failed: %s\n", __LINE__, #c); goto cleanup; } } while (0)
 static int typing_row(const char *requested, size_t count, bool track, bool require_gl,
                       unsigned scenario, uint64_t ingress_delay, const char *path, bool partial)
@@ -570,7 +615,17 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
             TYPING_REQUIRE(nanosleep(&delay, NULL) == 0);
         }
         TYPING_REQUIRE(settle(e) == 0);
-        TYPING_REQUIRE(!measured.invalid && measured.completed == end && !measured.guard && !measured.suspended);
+        if (measured.invalid || measured.completed != end || measured.guard || measured.suspended) {
+            /* Logging must happen outside the guard. Preserve its state in
+             * the diagnostic, including allocations counted in its last span. */
+            samples failed = measured;
+            measured.measuring = false;
+            if (measured.guard) {
+                measured.allocations += edit_malloc_guard_end(); measured.guard = false;
+                failed.allocations = measured.allocations;
+            }
+            TYPING_REQUIRE(typing_checkpoint(stderr, label, workload, &failed, end, &tag) == 0);
+        }
         i = end;
     }
     measured.measuring = false;
@@ -712,6 +767,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--self-check")) return settle_self_check();
         if (!strcmp(argv[i], "--self-check-g11")) return g11_accounting_self_check();
+        if (!strcmp(argv[i], "--self-check-typing")) return typing_checkpoint_self_check();
         if (!strcmp(argv[i], "--track")) track = true;
         else if (!strcmp(argv[i], "--require-gl")) require_gl = true;
         else if (!strcmp(argv[i], "--partial-index")) partial = true;
