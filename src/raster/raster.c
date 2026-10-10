@@ -349,12 +349,27 @@ static int cpu_resize(render_backend *b, render_dims dims)
     return RENDER_OK;
 }
 
+/* Every job this backend submitted reads cpu_state (strip jobs via st, the
+ * fence job via st->fence). Frame completion can reach the adapter without the
+ * fence job (platform Present events), so a handle must never be forgotten
+ * while its job can still run: cancel, then wait until the worker is done. */
+static void cpu_join_jobs(cpu_state *st)
+{
+    for (size_t k = 0; k < st->nhandles; k++) work_cancel(st->pool, st->handles[k]);
+    for (size_t k = 0; k < st->nhandles; k++)
+        while (!work_handle_finished(st->pool, st->handles[k])) {
+            struct timespec ts = {0, 50000}; nanosleep(&ts, NULL);
+        }
+    st->nhandles = 0;
+}
+
 static int cpu_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
 {
     cpu_state *st = b->state;
     if (!st->up) return RENDER_ERR_STATE;
     if (st->have_frame) return RENDER_ERR_BUSY; /* previous frame not yet fully presented */
     if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT) return RENDER_ERR_CAPACITY;
+    cpu_join_jobs(st); /* the previous frame's fence job may still be queued or polling */
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
     uint32_t cols = g->dims.cols, total = 0;
     for (size_t i = 0; i < count; i++) {
@@ -371,7 +386,6 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     uint32_t njobs = total < RASTER_JOBS ? total : RASTER_JOBS;
     st->metrics.jobs = njobs;
     if (!njobs) st->metrics.ready_ns = trace_now_ns();
-    st->nhandles = 0;
     memset(st->strip_done, 0, sizeof st->strip_done);
     st->fence_done = false; st->present_done = false; st->present_issued = false;
     st->fence_handle = (work_handle){0};
@@ -475,13 +489,7 @@ static void cpu_shutdown(render_backend *b)
 {
     cpu_state *st = b->state;
     if (!st->up) return;
-    for (size_t k = 0; k < st->nhandles; k++) work_cancel(st->pool, st->handles[k]);
-    for (size_t k = 0; k < st->nhandles; k++)
-        while (atomic_load_explicit(&st->pool->slots[st->handles[k].slot].busy, memory_order_acquire) &&
-               atomic_load_explicit(&st->pool->slots[st->handles[k].slot].epoch, memory_order_acquire) ==
-                   st->handles[k].epoch + 1u) {
-            struct timespec ts = {0, 50000}; nanosleep(&ts, NULL);
-        }
+    cpu_join_jobs(st);
     cpu_release(st);
 }
 

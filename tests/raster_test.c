@@ -391,6 +391,81 @@ static int live_pixel_test(void)
     return 0;
 }
 
+
+/* edit-2vs: a fence job must not outlive the backend. The platform loop can
+ * deliver PRESENT_COMPLETE to the adapter (bench pump_view's present_done) while
+ * the fence job is still queued or polling; the next submit used to forget its
+ * handle, so shutdown could not join it and it read freed backend state. The
+ * fence job is held QUEUED deterministically by occupying every raster worker. */
+typedef struct fence_gate { _Atomic uint32_t started, release; } fence_gate;
+static void fence_gate_job(work_ctx *c)
+{
+    fence_gate *gate = c->arg;
+    atomic_fetch_add(&gate->started, 1u);
+    while (!atomic_load(&gate->release)) { struct timespec t = {0, 100000}; nanosleep(&t, NULL); }
+}
+static int fence_outlives_test(void)
+{
+    render_backend b = {0};
+    render_cell cells[24]; uint64_t bits[1]; render_grid g;
+    uint8_t pixels[8 * 16] = {0};
+    render_atlas_page page = {pixels, sizeof pixels, 8, 8, 16};
+    render_glyph glyph = {65, 0, 0, 0, 8, 16};
+    render_config cfg = {.dims = {4, 6, 8, 16}, .max_width = 32, .max_height = 128, .max_cells = 24,
+        .max_glyphs = 1, .max_pages = 1, .max_atlas_bytes = 128};
+    T(render_test_prepare(&b, &cfg) == RENDER_OK);
+    render_backend_info info; T(render_backend_query(&b, &info) == RENDER_OK);
+    void *state = aligned_alloc(info.state_align > 16 ? info.state_align : 16,
+                                (info.state_size + 63) & ~(size_t)63);
+    T(state != NULL);
+    T(init_on_worker(&b, &cfg, state, info.state_size) == RENDER_OK);
+    T(render_grid_init(&g, cfg.dims, cells, 24, bits, 1) == RENDER_OK);
+    g.pages = &page; g.page_count = 1; g.glyphs = &glyph; g.glyph_count = 1;
+    for (uint32_t i = 0; i < 24; i++) cells[i] = (render_cell){0, RENDER_NO_SLOT, 0x112233u, 0x445566u, 0, 0};
+    T(render_frame_begin(&g, 1) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
+    render_strip full = {0, 6};
+    T(render_backend_submit(&b, &g, &full, 1) == RENDER_OK);
+    for (uint32_t spin = 0; spin < 2000; spin++) {   /* strips done, results mailed */
+        bool busy = false;
+        for (uint32_t slot = 0; slot < WORK_MAX_JOBS; slot++)
+            busy |= atomic_load_explicit(&g_pool.slots[slot].busy, memory_order_acquire) != 0;
+        if (!busy) break;
+        struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+    fence_gate gate; atomic_init(&gate.started, 0); atomic_init(&gate.release, 0);
+    work_handle blockers[4];
+    for (size_t i = 0; i < 4; i++) {
+        blockers[i] = work_submit(&g_pool, (work_job){fence_gate_job, &gate, 0, WORK_RASTER});
+        T(blockers[i].epoch != 0);
+    }
+    uint64_t deadline = trace_now_ns() + UINT64_C(3000000000);
+    while (atomic_load(&gate.started) < 4) { T(trace_now_ns() < deadline); struct timespec t = {0, 100000}; nanosleep(&t, NULL); }
+    int rc;
+    while ((rc = render_backend_present(&b, 1)) == RENDER_ERR_BUSY) { render_test_pump(&b); T(trace_now_ns() < deadline); }
+    T(rc == RENDER_OK);   /* fence job now sits in the queue behind the gate */
+    T(render_backend_signal(&b, RENDER_EVENT_DEVICE_DONE, 1, 0) == RENDER_OK);
+    T(render_backend_signal(&b, RENDER_EVENT_PRESENT_COMPLETE, 1, 0) == RENDER_OK);
+    T(!b.active);          /* frame 1 complete without its fence job */
+    T(render_frame_begin(&g, 2) == RENDER_OK && render_mark_rows(&g, 2, 1) == RENDER_OK);
+    render_strip one[3]; size_t count = 0;
+    T(render_dirty_strips(&g, one, 3, &count) == RENDER_OK);
+    T(render_backend_submit(&b, &g, one, count) == RENDER_OK);
+    render_backend_shutdown(&b);
+    free(state);           /* the backend is gone; no job may touch it now */
+    atomic_store(&gate.release, 1u);
+    for (size_t i = 0; i < 4; i++)
+        while (!work_handle_finished(&g_pool, blockers[i])) { struct timespec t = {0, 100000}; nanosleep(&t, NULL); }
+    for (uint32_t spin = 0; spin < 2000; spin++) {   /* let any straggler run */
+        bool busy = false;
+        for (uint32_t slot = 0; slot < WORK_MAX_JOBS; slot++)
+            busy |= atomic_load_explicit(&g_pool.slots[slot].busy, memory_order_acquire) != 0;
+        if (!busy) break;
+        struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+    printf("raster fence: PASS (queued fence job joined before backend release)\n");
+    return 0;
+}
+
 static int review_cases(const char *which);
 
 int main(int argc, char **argv)
@@ -411,6 +486,7 @@ int main(int argc, char **argv)
     plat_shutdown(&probe);
     if (!(argc > 1 && !strcmp(argv[1], "--live-only")) && render_conformance_main() != 0) return 1;
     if (live_pixel_test() != 0) return 1;
+    if (fence_outlives_test() != 0) return 1;
     if (g_up) { work_pool_shutdown(&g_pool); plat_shutdown(&g_plat); }
     printf("raster_test: PASS (requested conformance, upload ordering, typing allocations, live XShm)\n");
     return 0;
