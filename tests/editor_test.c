@@ -569,6 +569,230 @@ static int review_bursts(void)
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abc", 2) == 0);
     editor_close(e); puts("review 13: typing and repeat deletion bursts, movement boundary passed"); return 0;
 }
+typedef struct review_hold { _Atomic bool release, expired, entered; } review_hold;
+static void review_hold_job(work_ctx *job)
+{
+    review_hold *h = job->arg; atomic_store(&h->entered, true);
+    while (!atomic_load(&h->release) && !work_should_stop(job)) {
+        struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
+    }
+}
+static void *review_release(void *ctx)
+{
+    review_hold *h = ctx;
+    struct timespec pause = {0, 250000000}; (void)nanosleep(&pause, NULL);
+    atomic_store(&h->expired, true); atomic_store(&h->release, true); return NULL;
+}
+static int review_prefix_open(void)
+{
+    char path[] = "build/s9-prefix-fixture-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "prefix\n", 7) == 7); T(ftruncate(fd, 2 * FILE_PREFIX_MAX) == 0); close(fd);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    b.info.capabilities |= RENDER_CAP_RASTER_POOL; /* independent prefix lane */
+    editor_config cfg = {.cols = 32, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    review_hold hold = {0}; work_handle handle = work_submit(&e->pool,
+        (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(handle.epoch);
+    while (!atomic_load(&hold.entered)) { struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL); }
+    pthread_t timer; T(pthread_create(&timer, NULL, review_release, &hold) == 0);
+    uint64_t id; int rc = editor_add_buffer(e, path, NULL, 0, &id);
+    if (!rc) rc = settle(e);
+    bool first_before_remainder = !atomic_load(&hold.expired);
+    T(pthread_join(timer, NULL) == 0); editor_close(e); unlink(path);
+    T(rc == 0); T(first_before_remainder);
+    puts("review 8: first viewport precedes stalled remainder work passed"); return 0;
+}
+static int review_index_backlog(void)
+{
+    size_t n = 16u * 1024u * 1024u; uint8_t *bytes = malloc(n); T(bytes);
+    memset(bytes, 0xff, n);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = n, .cols = 16, .rows = 2, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(n); T(e->buffer->index);
+    lineidx_src src = editor_source(e->buffer);
+    T(lineidx_build_start(e->buffer->index, &e->pool, &src) == 0);
+    /* Let a whole completed backlog arrive without an editor maintenance turn. */
+    for (;;) {
+        bool busy = false;
+        for (size_t i = 0; i < WORK_MAX_JOBS; i++) busy |= atomic_load(&e->pool.slots[i].busy) != 0;
+        if (!busy) break;
+        struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
+    }
+    T(!lineidx_any_nonascii(e->buffer->index));
+    plat_event ev = key('x', 0, "x"); T(editor_handle_key(e, &ev) == 0);
+    T(!lineidx_any_nonascii(e->buffer->index));
+    T(settle(e) == 0); editor_close(e);
+    /* Exercise the editor's own metadata update at the maximum gated size.
+     * No content reads: an unbuilt table can model the sparse suffix without
+     * mapping/touching it. Each action changes only byte zero of the tree. */
+    b = (render_backend){0}; T(render_null_backend(&b) == 0);
+    cfg = (editor_config){.cols = 16, .rows = 2, .wrap_mode = -1}; e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(UINT64_C(10) * 1024 * 1024 * 1024); T(e->buffer->index);
+    uint64_t worst = 0;
+    for (unsigned i = 0; i < 128; i++) {
+        uint64_t before = lineidx_foreground_work(e->buffer->index);
+        ev = i % 2 ? key(XKB_KEY_BackSpace, 0, NULL) : key('x', 0, "x");
+        T(editor_handle_key(e, &ev) == 0);
+        uint64_t visits = lineidx_foreground_work(e->buffer->index) - before;
+        if (visits > worst) worst = visits;
+    }
+    editor_close(e);
+    printf("review 10: 10 GiB beginning edits metadata visits max=%llu (M)[AC], bound=4096 (G)\n",
+        (unsigned long long)worst); T(worst < 4096);
+    puts("review 10: mutation cancels completed backlog without adopting it passed"); return 0;
+}
+static int review_piece_recycling(void)
+{
+    size_t n = 600u * 1024u; uint8_t *bytes = malloc(n); T(bytes); memset(bytes, 'a', n);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = n, .cols = 16, .rows = 2, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    for (unsigned i = 0; i < 4; i++) {
+        T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    }
+    size_t warm = e->buffer->arena.used;
+    for (unsigned i = 0; i < 256; i++) {
+        T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(editor_length(e) == n);
+        T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(editor_length(e) == 1);
+    }
+    size_t growth = e->buffer->arena.used - warm; editor_close(e);
+    printf("review 15: replay arena growth=%zu bytes (M)[AC], bound=65536 bytes (G)\n", growth);
+    T(growth <= 65536); return 0;
+}
+typedef struct review_submit_state { delayed device; uint64_t elapsed; } review_submit_state;
+static int review_slow_submit(render_backend *b, const render_grid *g, const render_strip *s, size_t n)
+{
+    uint64_t start = trace_now_ns(); struct timespec pause = {0, 2000000};
+    (void)nanosleep(&pause, NULL);
+    ((review_submit_state *)b->state)->elapsed = trace_now_ns() - start;
+    return delayed_submit(b, g, s, n);
+}
+static int review_slice_accounting(void)
+{
+    render_backend b = {.info = {"editor submit accounting", sizeof(review_submit_state), 16, RENDER_CAP_HEADLESS},
+        .ops = {delayed_init, delayed_resize, review_slow_submit, delayed_present, delayed_event, delayed_close}};
+    editor_config cfg = {.cols = 16, .rows = 3}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); ((review_submit_state *)b.state)->device.ready = true;
+    T(settle(e) == 0);
+    uint64_t observed = ((review_submit_state *)b.state)->elapsed;
+    uint64_t reported = editor_get_stats(e).longest_slice_ns; editor_close(e);
+    printf("review 11: indivisible submit observed=%llu reported=%llu ns (M)[AC]\n",
+        (unsigned long long)observed, (unsigned long long)reported);
+    T(reported >= observed); return 0;
+}
+static int review_held_sync(void *ctx, int fd, bool directory)
+{
+    review_hold *h = ctx;
+    if (!directory) {
+        atomic_store(&h->entered, true);
+        while (!atomic_load(&h->release)) {
+            struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
+        }
+    }
+    return directory ? fsync(fd) : fdatasync(fd);
+}
+static int review_journal_idle_at(bool queued)
+{
+    char path[] = "build/s9-idle-journal-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.cols = 16, .rows = 2, .journal_path = path}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); T(editor_flush(e) == 0);
+    review_hold hold = {0}; journal_io io = {.ctx = &hold, .sync = review_held_sync};
+    if (!queued) T(journal_set_io(e->journal, &io) == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
+    if (queued) {
+        work_handle handle = work_submit(&e->pool, (work_job){review_hold_job, &hold, 0, WORK_BULK});
+        T(handle.epoch);
+        while (!atomic_load(&hold.entered)) {
+            struct timespec ready = {0, 1000000}; (void)nanosleep(&ready, NULL);
+        }
+    }
+    struct timespec pause = {1, 10000000}; (void)nanosleep(&pause, NULL);
+    T(editor_step(e, 0) >= 0);
+    while (!atomic_load(&hold.entered)) { pause = (struct timespec){0, 1000000}; (void)nanosleep(&pause, NULL); }
+    pthread_t timer; T(pthread_create(&timer, NULL, review_release, &hold) == 0);
+    uint64_t before = editor_get_stats(e).poll_returns, deadline = trace_now_ns() + UINT64_C(150000000);
+    while (trace_now_ns() < deadline) T(editor_step(e, 80) >= 0);
+    uint64_t polls = editor_get_stats(e).poll_returns - before;
+    T(pthread_join(timer, NULL) == 0); T(editor_flush(e) == 0); editor_close(e); unlink(path);
+    printf("review 17: %s job idle polls=%llu (M)[AC], requested-timeout bound=4 (G)\n",
+        queued ? "queued" : "active", (unsigned long long)polls);
+    T(polls <= 4); return 0;
+}
+static int review_journal_idle(void)
+{ int active = review_journal_idle_at(false), queued = review_journal_idle_at(true); return active | queued; }
+typedef struct review_bytes { uint8_t *bytes; size_t len, cap; } review_bytes;
+static int review_replay_bytes(void *ctx, const journal_record *r)
+{
+    review_bytes *m = ctx;
+    if (r->type == JOURNAL_INSERT) {
+        if (r->size < 8) return 1;
+        uint64_t off = le64(r->data); size_t n = r->size - 8;
+        if (off > m->len || n > m->cap - m->len) return 1;
+        size_t at = (size_t)off; memmove(m->bytes + at + n, m->bytes + at, m->len - at);
+        memcpy(m->bytes + at, r->data + 8, n); m->len += n;
+    } else if (r->type == JOURNAL_DELETE) {
+        if (r->size != 16) return 1;
+        uint64_t off = le64(r->data), n = le64(r->data + 8);
+        if (off > m->len || n > m->len - off) return 1;
+        size_t at = (size_t)off, count = (size_t)n;
+        memmove(m->bytes + at, m->bytes + at + count, m->len - at - count); m->len -= count;
+    }
+    return 0;
+}
+static int review_replay_atomic(void)
+{
+    char path[] = "build/s9-atomic-journal-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    size_t n = 600u * 1024u; uint8_t *bytes = malloc(n); T(bytes); memset(bytes, 'a', n);
+    size_t requests = 0, failures = 0;
+    for (size_t position = 0; position <= requests; position++) {
+        unlink(path); render_backend b = {0}; T(render_null_backend(&b) == 0);
+        editor_config cfg = {.initial = bytes, .initial_len = n, .cols = 16, .rows = 2,
+            .journal_path = path, .wrap_mode = -1}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+        T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('x', 0, "x")) == 0);
+        T(editor_flush(e) == 0);
+        editor_piece_storage *s = &e->buffer->piece_storage;
+        size_t before = s->requests, cursor = e->buffer->history_cursor;
+        uint64_t records = editor_get_stats(e).journal_records;
+        view_state view_before = editor_view(e);
+        render_cell visible[32]; memcpy(visible, editor_grid(e)->cells, sizeof visible);
+        if (position) s->fail_request = before + position;
+        plat_event ev = key('z', PLAT_MOD_CTRL, NULL); T(editor_inject(e, &ev) == 0);
+        int rc = editor_step(e, 0);
+        if (!position) { requests = s->requests - before; T(requests > 0); T(rc >= 0); }
+        else if (rc < 0) {
+            failures++; uint8_t current = 0;
+            T(editor_length(e) == 1 && editor_read(e, 0, &current, 1) == 0 && current == 'x');
+            T(e->buffer->history_cursor == cursor && e->buffer->lines == 1);
+            T(editor_view(e).selection.cursor == view_before.selection.cursor &&
+                editor_view(e).selection.anchor == view_before.selection.anchor);
+            T(editor_view(e).first_byte == view_before.first_byte && editor_view(e).first_line == view_before.first_line &&
+                editor_view(e).hscroll == view_before.hscroll && editor_view(e).visual_byte == view_before.visual_byte);
+            T(!memcmp(visible, editor_grid(e)->cells, sizeof visible));
+            T(editor_get_stats(e).journal_records == records && e->op_count == 0);
+        }
+        s->fail_request = 0;
+        if (rc >= 0) T(settle(e) == 0);
+        T(editor_flush(e) == 0); editor_close(e);
+        review_bytes model = {malloc(n + 8), 0, n + 8}; T(model.bytes);
+        journal_replay_result result; T(journal_replay_file(path, review_replay_bytes, &model, &result) == 0);
+        if (rc < 0) T(model.len == 1 && model.bytes[0] == 'x');
+        else T(model.len == n && !memcmp(model.bytes, bytes, n));
+        free(model.bytes); unlink(path);
+    }
+    free(bytes); T(failures > 0);
+    printf("review 22: allocator positions=%zu failures=%zu; tree/view/history/journal rollback passed (M)[AC]\n", requests, failures);
+    return 0;
+}
 static int review_fairness(void)
 {
     render_backend b = {0}; T(render_null_backend(&b) == 0);
@@ -621,12 +845,15 @@ static int review_suite(const char *only)
 {
     struct { const char *name; int (*fn)(void); } cases[] = {
         {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
-        {"6", review_style}, {"7", review_long_line}, {"12", review_large_undo},
-        {"13", review_bursts}, {"14", review_fairness}, {"23", review_init}, {"close", review_close_flush}
+        {"6", review_style}, {"7", review_long_line}, {"8", review_prefix_open}, {"10", review_index_backlog}, {"11-accounting", review_slice_accounting}, {"12", review_large_undo}, {"15", review_piece_recycling},
+        {"13", review_bursts}, {"14", review_fairness}, {"17", review_journal_idle}, {"22", review_replay_atomic}, {"23", review_init}, {"close", review_close_flush}
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
-        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "12") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
+        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "10") ||
+            !strcmp(cases[i].name, "11-accounting") || !strcmp(cases[i].name, "12") ||
+            !strcmp(cases[i].name, "15") || !strcmp(cases[i].name, "17") ||
+            !strcmp(cases[i].name, "22") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
             (only && (!strcmp(only, "all") || !strcmp(only, cases[i].name)))) failed |= cases[i].fn();
     return failed;
 }

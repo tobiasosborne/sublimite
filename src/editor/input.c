@@ -16,11 +16,6 @@ static void restore_selection(view *v, const undo_state *s)
     memcpy(&v->state.selection.anchor, s->bytes + 8, 8);
     v->state.selection.preferred_col = VIEW_PREFERRED_UNSET;
 }
-static void slice_end(editor *e, uint64_t start)
-{
-    uint64_t elapsed = trace_now_ns() - start; e->stats.slices++;
-    if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
-}
 static uint64_t newlines(const editor *e, uint64_t off, uint64_t len)
 {
     uint64_t count = 0; piece_iter it; piece_iter_begin(&it, e->tree, off);
@@ -37,7 +32,8 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
     e->paint_ready = false; e->buffer->revision++;
     e->stats.mutations++; e->buffer->lines = e->buffer->lines - old_nl + new_nl;
     if (e->buffer->index) {
-        (void)lineidx_poll(e->buffer->index);
+        /* A mutation invalidates outstanding results. Adoption and source
+         * retirement belong to the maintenance turn, before input checks. */
         if (lineidx_edit(e->buffer->index, off, old, add)) return EDITOR_ERR_HISTORY;
         e->buffer->index_dirty = true;
     }
@@ -274,7 +270,7 @@ static bool move_key(keys_action action, view_key *out)
 }
 int editor_continue_action(editor *e)
 {
-    view_change c; uint64_t start = trace_now_ns(); int rc = view_continue(&e->v, &c); slice_end(e, start);
+    view_change c; int rc = view_continue(&e->v, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;
     if (rc) return rc;
@@ -359,9 +355,8 @@ int editor_handle_key(editor *e, const plat_event *ev)
                       (action == KEYS_ACTION_WORD_DELETE ? VIEW_WORD_RIGHT : VIEW_RIGHT);
         e->action = EDITOR_ACTION_DELETE;
     } else e->action = EDITOR_ACTION_MOVE;
-    view_change c; uint64_t start = trace_now_ns();
+    view_change c;
     rc = view_command(&e->v, move, moving && binding && (binding->args.flags & KEYS_ARG_EXTEND), NULL, 0, &c);
-    slice_end(e, start);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;
     if (rc) return rc;

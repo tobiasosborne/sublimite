@@ -1,3 +1,34 @@
+# Editor review continuation — edit-zzj.13 session 9
+
+Done: editor-1 findings 10, 15, 17. Finding 22 adopts main's atomic undo
+checkpoint behavior and adds an editor allocator-failure/tree/view/journal
+regression. Finding 11 now measures complete action/staging, resize/blink and
+submit intervals, but its hard preemption requirement remains open.
+
+Remaining: 8, 9, 11, 13, 16, 21. Prefix publication and automatic burst grouping
+have opt-in red reproductions. No private undo record encoding is imported into
+the editor, no dependency module is changed, and no new globals are added.
+Finding 14 was withdrawn before this continuation.
+
+The forced release build and both full sanitizer checks pass: 59 binaries plus
+replay CLI (M)[AC], LeakSanitizer disabled. Final queued-journal/unique-fixture
+checks and the allocator failure/visible-grid replay sweep pass. The backward
+environment clock change caused Make timestamp warnings; requested release,
+sanitizer editor and fuzz targets were forcibly rebuilt. The complete final
+forced sanitizer editor suite passes, including active/queued journal jobs and
+visible-grid replay assertions. Editor fuzz passed
+for 61 seconds (M)[AC] against 60 seconds
+(G), with 16114 runs (M)[AC]. The release editor suite's active guards report
+zero allocations over its typing workloads (M)[AC]. Both paired allocator
+TRACK variants reach the existing G1 settle deadline at the published 0.9-lines
+position on log_1g; no latency verdict is claimed.
+
+Complete scope, red/green and final verification evidence:
+[session 9 report](../../docs/worker-reports/edit-zzj.13-s9.md).
+Design: [decision record](../../docs/decisions/edit-zzj.13.md).
+
+The session 8 integration record is retained below.
+
 # Editor review continuation — edit-zzj.13 session 8
 
 Current review work and red/green evidence are in

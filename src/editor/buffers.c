@@ -6,8 +6,39 @@
 #include <string.h>
 #include <sys/epoll.h>
 
-static void *piece_alloc(void *ctx, size_t n) { return edit_arena_alloc(ctx, n, 16); }
-static void piece_free(void *ctx, void *p, size_t n) { (void)ctx; (void)p; (void)n; }
+typedef struct piece_block { struct piece_block *next; size_t bin; } piece_block;
+_Static_assert(sizeof(piece_block) == 16, "piece payload alignment");
+static void *piece_alloc(void *ctx, size_t n)
+{
+    editor_piece_storage *s = ctx;
+    if (n > SIZE_MAX - sizeof(piece_block)) return NULL;
+    pthread_mutex_lock(&s->mutex);
+    s->requests++;
+    if (s->requests == s->fail_request) { pthread_mutex_unlock(&s->mutex); return NULL; }
+    /* Exact sizes avoid doubling add chunks/original storage. The fixed
+     * class table bounds lookup independently of retired slab count. */
+    size_t bin = 0;
+    while (bin < s->classes && s->size[bin] != n) bin++;
+    if (bin == EDITOR_PIECE_BINS) { pthread_mutex_unlock(&s->mutex); return NULL; }
+    if (bin == s->classes) { s->size[bin] = n; s->classes++; }
+    piece_block *block = s->free[bin];
+    if (block) s->free[bin] = block->next;
+    else block = edit_arena_alloc(s->arena, n + sizeof *block, 16);
+    if (block) block->bin = bin;
+    pthread_mutex_unlock(&s->mutex);
+    return block ? block + 1 : NULL;
+}
+static void piece_free(void *ctx, void *p, size_t n)
+{
+    if (!p) return;
+    editor_piece_storage *s = ctx;
+    piece_block *block = (piece_block *)p - 1;
+    pthread_mutex_lock(&s->mutex);
+    size_t bin = block->bin;
+    EDIT_ASSERT(bin < s->classes && s->size[bin] == n);
+    block->next = s->free[bin]; s->free[bin] = block;
+    pthread_mutex_unlock(&s->mutex);
+}
 static size_t tree_span(void *ctx, uint64_t off, const uint8_t **p)
 {
     piece_iter it; size_t n = 0; piece_iter_begin(&it, ctx, off);
@@ -37,6 +68,7 @@ void editor_buffer_destroy(editor_buffer *b)
     if (b->file) file_close(b->file);
     if (b->undo_ready) undo_destroy(&b->undo);
     if (b->tree) piece_destroy(b->tree);
+    if (b->piece_storage.ready) pthread_mutex_destroy(&b->piece_storage.mutex);
     edit_arena_free(&b->arena); free(b);
 }
 void editor_retire_buffers(editor *e)
@@ -80,7 +112,10 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     size_t reserve = e->cfg.arena_bytes ? e->cfg.arena_bytes : 64u * 1024u * 1024u;
     if (content > SIZE_MAX - reserve) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = edit_arena_init(&b->arena, reserve + content); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    piece_allocator a = {&b->arena, piece_alloc, piece_free};
+    b->piece_storage.arena = &b->arena;
+    if (pthread_mutex_init(&b->piece_storage.mutex, NULL)) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    b->piece_storage.ready = true;
+    piece_allocator a = {&b->piece_storage, piece_alloc, piece_free};
     b->tree = piece_create(&a); if (!b->tree) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len); if (rc) goto fail;
     if (e->journal && b->file && (!*b->base.path || journal_check_base(&b->base) || file_check(b->file, NULL))) {

@@ -13,10 +13,20 @@
 #include "minimap/minimap.h"
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
+#define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
+typedef struct editor_piece_storage {
+    edit_arena *arena;
+    pthread_mutex_t mutex;
+    void *free[EDITOR_PIECE_BINS];
+    size_t size[EDITOR_PIECE_BINS], classes;
+    size_t requests, fail_request; /* per-buffer allocator fault-test seam */
+    bool ready;
+} editor_piece_storage;
 typedef struct editor_delta { uint64_t off, old, add; } editor_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; } editor_jop;
 typedef struct editor_buffer {
     edit_arena arena;
+    editor_piece_storage piece_storage;
     piece_tree *tree;
     undo_log undo;
     file *file;
@@ -82,6 +92,7 @@ struct editor {
     uint32_t extra_first, extra_end, resize_w, resize_h;
     bool dirty, extra_rows, resize_pending, full_pending;
     bool focused, visible, blinking, quit;
+    bool journal_waiting;
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
     uint32_t tab_rows, map_cols;
     tabs_strip strip;

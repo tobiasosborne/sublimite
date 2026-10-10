@@ -8,6 +8,11 @@
 
 static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 static uint64_t max64(uint64_t a, uint64_t b) { return a > b ? a : b; }
+static void record_slice(editor *e, uint64_t start)
+{
+    uint64_t elapsed = trace_now_ns() - start; e->stats.slices++;
+    if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
+}
 static int layout_slice(editor *e)
 {
     layout *l = &e->lay;
@@ -99,7 +104,7 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
-    if (e->journal && journal_receive(e->journal, msg)) return;
+    if (e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
         for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers && e->buffers[i] && e->buffers[i]->index)
             (void)lineidx_poll(e->buffers[i]->index);
@@ -271,7 +276,7 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
     if (e->journal) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;
-        if (s.accepted_sequence > s.durable_sequence) {
+        if (!e->journal_waiting && s.accepted_sequence > s.durable_sequence) {
             uint64_t next = s.last_sync_ns + UINT64_C(1000000000);
             if (next <= now) next = now + UINT64_C(5000000);
             if (next < deadline) deadline = next;
@@ -309,19 +314,19 @@ int editor_step(editor *e, int timeout_ms)
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
     uint64_t start = trace_now_ns();
-    rc = blink(e, start); if (rc) return rc;
-    rc = resize(e); if (rc) return rc;
+    rc = blink(e, start);
+    if (!rc) rc = resize(e);
+    record_slice(e, start); if (rc) return rc;
     for (;;) {
         e->stats.input_checks++;
+        uint64_t slice = trace_now_ns();
         if (view_busy(&e->v)) rc = editor_continue_action(e);
         else if (e->queue_count && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
             plat_event ev = e->queue[e->queue_head];
             e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
             rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
         } else if (layout_busy(&e->lay)) {
-            uint64_t slice = trace_now_ns(); rc = layout_slice(e);
-            uint64_t elapsed = trace_now_ns() - slice; e->stats.slices++;
-            if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
+            rc = layout_slice(e);
             if (rc >= 0) rc = 0;
         } else if (e->full_pending) {
             rc = editor_full_layout(e);
@@ -334,6 +339,7 @@ int editor_step(editor *e, int timeout_ms)
         /* Protect every mutation before yielding to layout or publishing a
          * frame. Successful journal calls establish the page-cache cutoff. */
         editor_journal_staged(e);
+        record_slice(e, slice);
         if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
         if (rc) return fail(e, rc);
         if (e->quit || trace_now_ns() - start >= EDITOR_SLICE_NS) break;
@@ -342,12 +348,21 @@ int editor_step(editor *e, int timeout_ms)
         rc = editor_flush(e);
         return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
     }
-    rc = submit(e); if (rc) return rc;
+    uint64_t submit_start = trace_now_ns(); rc = submit(e);
+    record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     rc = present(e);
-    if (!rc && e->journal && !e->dirty) {
-        int jr = journal_pump(e->journal, trace_now_ns(), false);
-        if (jr && jr != JOURNAL_BUSY) e->stats.journal_error = jr;
+    if (!rc && e->journal && !e->dirty && !e->journal_waiting) {
+        journal_stats s = journal_get_stats(e->journal); uint64_t now = trace_now_ns();
+        /* Pump only when the default batch/deadline admission is due. A
+         * successful pump has scheduled a job; its mailbox advances sync.
+         * BUSY on admission is retried, since it can mean a full work pool. */
+        if (s.accepted_sequence > s.durable_sequence &&
+            (s.pending_bytes >= JOURNAL_PAGE - JOURNAL_HEADER || now - s.last_sync_ns >= UINT64_C(1000000000))) {
+            int jr = journal_pump(e->journal, now, false);
+            if (!jr) e->journal_waiting = true;
+            else if (jr != JOURNAL_BUSY) e->stats.journal_error = jr;
+        }
     }
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (rc) return fail(e, rc);
@@ -410,6 +425,7 @@ int editor_flush(editor *e)
     editor_journal_staged(e);
     if (!e->journal) return 0;
     int rc = journal_flush(e->journal);
+    e->journal_waiting = false;
     if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error)
         return editor_checkpoint(e);
     return rc;
