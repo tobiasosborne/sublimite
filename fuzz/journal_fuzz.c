@@ -4,12 +4,32 @@
 #include <string.h>
 #include <unistd.h>
 
-typedef struct fuzz_model { uint8_t bytes[4096]; size_t size, edits; piece_tree *tree; } fuzz_model;
+typedef struct fuzz_model { uint8_t bytes[4096]; size_t size, edits; piece_tree *tree;
+    journal_view views[2]; uint64_t view_ids[2], tab_ids[3], active, tab_count;
+    uint32_t width, height; unsigned view_count, tabs, windows;
+} fuzz_model;
 static uint64_t read64(const uint8_t *p)
 { uint64_t v=0; for(unsigned i=0;i<8;i++) v|=(uint64_t)p[i]<<(8*i); return v; }
 static int apply(void *ctx, const journal_record *r)
 {
     fuzz_model *m=ctx;
+    if(r->type==JOURNAL_VIEW) {
+        if(m->view_count>=2) return 1;
+        size_t i=m->view_count++;
+        m->views[i]=(journal_view){read64(r->data),read64(r->data+8),read64(r->data+16),read64(r->data+24)};
+        m->view_ids[i]=r->buffer_id; return 0;
+    }
+    if(r->type==JOURNAL_TABS) {
+        uint64_t count=read64(r->data); if(count>3) return 1;
+        m->tab_count=count; m->active=read64(r->data+8); memset(m->tab_ids,0,sizeof m->tab_ids);
+        for(size_t i=0;i<count;i++) m->tab_ids[i]=read64(r->data+16+8*i);
+        m->tabs++; return 0;
+    }
+    if(r->type==JOURNAL_WINDOW) {
+        m->width=(uint32_t)r->data[0] | (uint32_t)r->data[1]<<8 | (uint32_t)r->data[2]<<16 | (uint32_t)r->data[3]<<24;
+        m->height=(uint32_t)r->data[4] | (uint32_t)r->data[5]<<8 | (uint32_t)r->data[6]<<16 | (uint32_t)r->data[7]<<24;
+        m->windows++; return 0;
+    }
     if(r->type!=JOURNAL_INSERT && r->type!=JOURNAL_DELETE) return 0;
     uint64_t off=read64(r->data);
     if(off>m->size) return 1;
@@ -25,6 +45,13 @@ static int apply(void *ctx, const journal_record *r)
     }
     m->edits++; return 0;
 }
+static bool session_equal(const fuzz_model *a, const fuzz_model *b)
+{
+    return a->view_count==b->view_count && a->tabs==b->tabs && a->windows==b->windows &&
+        !memcmp(a->views,b->views,sizeof a->views) && !memcmp(a->view_ids,b->view_ids,sizeof a->view_ids) &&
+        !memcmp(a->tab_ids,b->tab_ids,sizeof a->tab_ids) && a->active==b->active && a->tab_count==b->tab_count &&
+        a->width==b->width && a->height==b->height;
+}
 static void no_visit(const uint8_t *data, size_t size)
 {
     fuzz_model m={0}; journal_replay_result rr;
@@ -34,7 +61,7 @@ static void no_visit(const uint8_t *data, size_t size)
     /* Deterministic replay of accepted prefix has identical contents. */
     fuzz_model prefix={0}; journal_replay_result pr;
     EDIT_ASSERT(journal_replay_bytes(data,(size_t)rr.valid_bytes,apply,&prefix,&pr)==0);
-    EDIT_ASSERT(!pr.corrupt && m.size==prefix.size && memcmp(m.bytes,prefix.bytes,m.size)==0);
+    EDIT_ASSERT(!pr.corrupt && m.size==prefix.size && memcmp(m.bytes,prefix.bytes,m.size)==0 && session_equal(&m,&prefix));
 }
 /* Repair CRC around arbitrary payloads so mutation reaches schema checks,
  * rather than spending all raw-byte coverage on magic/CRC rejection. */
@@ -78,13 +105,93 @@ static int fuzz_sync(void *ctx, int fd, bool directory)
     fuzz_io *f=ctx;
     if(directory) return fsync(fd);
     f->syncs++;
-    if(f->sync_error && f->syncs==1) { errno=EIO; return -1; }
+    if(f->sync_error && f->syncs==1) {
+        /* Consumed writeback EIO may leave clean lost pages. */
+        if(ftruncate(fd,0)) return -1;
+        errno=EIO; return -1;
+    }
     return fdatasync(fd);
+}
+
+static void write64(uint8_t *p, uint64_t value)
+{ for(unsigned k=0;k<8;k++) p[k]=(uint8_t)(value>>(k*8)); }
+static void write32(uint8_t *p, uint32_t value)
+{ for(unsigned k=0;k<4;k++) p[k]=(uint8_t)(value>>(k*8)); }
+static void fuzz_sessions(const uint8_t *data, size_t size)
+{
+    if(size<5 || (data[0]&15u)!=7u) return;
+    char path[]="/tmp/journal-fuzz-session-XXXXXX"; int fd=mkstemp(path); if(fd<0) return; close(fd);
+    work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return; }
+    journal *j; if(journal_open(&j,path,&pool,NULL)) { work_pool_shutdown(&pool); unlink(path); return; }
+    /* Expectations come directly from the generated session, before encoding.
+     * Never infer the expected fields from the parser's record count. */
+    fuzz_model expected={.views={{(uint64_t)data[1]+513,7,(uint64_t)data[2]*4096+1,23},
+        {3,(uint64_t)data[3]+619,(uint64_t)data[4]*4096+9,41}},
+        .view_ids={101,503},.tab_ids={101,503,909},.active=1u+data[4]%2u,.tab_count=3,
+        .width=701u+data[1],.height=503u+data[2],.view_count=2,.tabs=1,.windows=1};
+    EDIT_ASSERT(journal_set_view(j,101,&expected.views[0])==0 && journal_set_view(j,503,&expected.views[1])==0);
+    EDIT_ASSERT(journal_set_tabs(j,expected.tab_ids,3,expected.active)==0 && journal_set_window(j,expected.width,expected.height)==0);
+    EDIT_ASSERT(journal_flush(j)==0);
+    fuzz_model actual={0}; journal_replay_result rr;
+    EDIT_ASSERT(journal_replay_file(path,apply,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));
+    uint8_t views[2][32], tabs[40], window[8];
+    for(unsigned i=0;i<2;i++) {
+        write64(views[i],expected.views[i].cursor); write64(views[i]+8,expected.views[i].anchor);
+        write64(views[i]+16,expected.views[i].scroll_byte); write64(views[i]+24,expected.views[i].scroll_x);
+    }
+    write64(tabs,3); write64(tabs+8,expected.active);
+    for(unsigned i=0;i<3;i++) write64(tabs+16+8*i,expected.tab_ids[i]);
+    write32(window,expected.width); write32(window+4,expected.height);
+    journal_record cp[]={{JOURNAL_VIEW,101,0,views[0],32},{JOURNAL_VIEW,503,0,views[1],32},
+        {JOURNAL_TABS,0,0,tabs,40},{JOURNAL_WINDOW,0,0,window,8}};
+    EDIT_ASSERT(journal_rotate(j,cp,4)==0); journal_close(j);
+    actual=(fuzz_model){0};
+    EDIT_ASSERT(journal_replay_file(path,apply,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));
+    work_pool_shutdown(&pool); unlink(path);
+}
+typedef struct slice_model { const uint8_t *bytes; size_t size, copied; } slice_model;
+static int apply_slice(void *ctx, const journal_record *r)
+{
+    slice_model *m=ctx;
+    if(r->type!=JOURNAL_INSERT || r->buffer_id!=41 || r->size<8) return 1;
+    size_t n=r->size-8;
+    if(read64(r->data)!=m->copied || n>m->size-m->copied ||
+       memcmp(r->data+8,m->bytes+m->copied,n)) return 1;
+    m->copied+=n; return 0;
+}
+static void fuzz_slices(const uint8_t *data, size_t size)
+{
+    if(size<3 || (data[0]&15u)!=3u) return;
+    uint8_t bytes[65536], wire[73728];
+    size_t length=1+(size_t)data[1]*256+data[2];
+    for(size_t i=0;i<length;i++) bytes[i]=data[i%size];
+    char path[]="/tmp/journal-fuzz-slices-XXXXXX"; int fd=mkstemp(path); if(fd<0) return; close(fd);
+    work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return; }
+    journal *j; if(journal_open(&j,path,&pool,NULL)) { work_pool_shutdown(&pool); unlink(path); return; }
+    size_t progress=0;
+    while(progress<length) {
+        size_t before=progress;
+        int rc=journal_insert_step(j,41,0,bytes,length,&progress);
+        EDIT_ASSERT(rc==(progress<length?JOURNAL_BUSY:JOURNAL_OK));
+        EDIT_ASSERT(progress>=before && progress-before<=JOURNAL_INSERT_SLICE_BYTES);
+        EDIT_ASSERT(journal_get_stats(j).unprotected_bytes<=JOURNAL_DEFAULT_SYNC_BYTES);
+        if(progress==before) { EDIT_ASSERT(journal_flush(j)==0); continue; }
+        fd=open(path,O_RDONLY); EDIT_ASSERT(fd>=0);
+        ssize_t n=read(fd,wire,sizeof wire); close(fd); EDIT_ASSERT(n>=0);
+        slice_model m={bytes,progress,0}; journal_replay_result rr;
+        EDIT_ASSERT(journal_replay_bytes(wire,(size_t)n,apply_slice,&m,&rr)==0 && !rr.corrupt && m.copied==progress);
+        /* A caller can abandon the unaccepted tail after any protected step. */
+        if((data[0]&128u) && progress>=length/2) break;
+    }
+    EDIT_ASSERT(journal_flush(j)==0 && journal_get_stats(j).unprotected_bytes==0);
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
 }
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     no_visit(data,size);
     structured_bytes(data,size);
+    fuzz_sessions(data,size);
+    fuzz_slices(data,size);
     if(!size || (data[0]&31u)!=0) return 0;
     char path[]="/tmp/journal-fuzz-XXXXXX"; int fd=mkstemp(path); if(fd<0) return 0; close(fd);
     work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return 0; }
@@ -116,7 +223,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     int flush_rc=journal_flush(j);
     for(unsigned retries=0;flush_rc==JOURNAL_IO && retries<2;retries++) {
         EDIT_ASSERT(journal_get_stats(j).accepted_sequence==count);
-        EDIT_ASSERT(journal_retry(j)==0); flush_rc=journal_flush(j);
+        int retry_rc=journal_retry(j);
+        if(retry_rc==JOURNAL_IO) {
+            faults.sync_error=false;
+            EDIT_ASSERT(journal_rotate(j,operations,count)==0);
+        } else EDIT_ASSERT(retry_rc==0);
+        flush_rc=journal_flush(j);
     }
     EDIT_ASSERT(flush_rc==0 && journal_get_stats(j).durable_sequence==count); journal_close(j);
     uint8_t bytes[8192]; fd=open(path,O_RDONLY); EDIT_ASSERT(fd>=0);

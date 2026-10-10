@@ -8,20 +8,31 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <nmmintrin.h>
+#endif
 
 #define MAGIC 0x314c4e4au
 #define PAD 0u
+#define RETENTION_MESSAGE 0x4a52544eu
+
+typedef struct journal_retention journal_retention;
+typedef struct journal_crc {
+    uint32_t table[256];
+    bool hardware;
+} journal_crc;
 
 typedef struct journal_batch {
     uint8_t *bytes;
     size_t used, sealed, progress, cached;
     uint64_t offset, sequence;
-    bool force;
+    bool force, pad_failed;
 } journal_batch;
 typedef struct journal_disk {
     int fd;
     uint64_t unsynced, written_sequence;
     journal_stats stats;
+    bool writeback_failed;    /* only a fresh complete checkpoint can repair */
 } journal_disk;
 struct journal {
     edit_arena arena;
@@ -30,7 +41,7 @@ struct journal {
     journal_batch batches[2];
     journal_disk disk;          /* worker state; UI also uses its stable fd */
     journal_stats stats;        /* exclusively UI owned */
-    uint32_t crc_table[256];
+    journal_crc crc_table;
     size_t capacity;
     uint64_t limit, log_budget, reserved, sync_bytes, sync_interval_ns;
     char *path, *name;
@@ -43,6 +54,8 @@ struct journal {
     journal_io io;
     void (*message_handler)(const work_msg *, void *);
     void *message_ctx;
+    journal_retention *retention; /* immutable result adopted through mailbox */
+    work_handle retention_handle;
 };
 typedef struct journal_completion { journal_stats stats; } journal_completion;
 /* A completion snapshot lives in the active arena batch after its data.
@@ -58,14 +71,45 @@ static void put32(uint8_t *p, uint32_t v)
 { for(unsigned i=0;i<4;i++) p[i]=(uint8_t)(v>>(8*i)); }
 static void put64(uint8_t *p, uint64_t v)
 { for(unsigned i=0;i<8;i++) p[i]=(uint8_t)(v>>(8*i)); }
-static void crc_init(uint32_t *table)
+static void crc_init(journal_crc *crc)
 {
-    for(uint32_t i=0;i<256;i++) { uint32_t v=i; for(unsigned k=0;k<8;k++) v=(v>>1)^((v&1u)?0x82f63b78u:0u); table[i]=v; }
+    for(uint32_t i=0;i<256;i++) { uint32_t v=i; for(unsigned k=0;k<8;k++) v=(v>>1)^((v&1u)?0x82f63b78u:0u); crc->table[i]=v; }
+    crc->hardware=false;
+#if defined(__x86_64__) && !defined(EDIT_JOURNAL_PORTABLE_CRC)
+    /* Setup only; dispatch state belongs to this encoder/parser instance. */
+    __builtin_cpu_init();
+    crc->hardware=__builtin_cpu_supports("sse4.2")!=0;
+#endif
 }
-static uint32_t crc_data(const uint32_t *table, const uint8_t *p, size_t n)
-{ uint32_t c=UINT32_MAX; for(size_t i=0;i<n;i++) c=table[(c^p[i])&255u]^(c>>8); return ~c; }
-static uint32_t crc_record(const uint32_t *table, const uint8_t *p, size_t n)
-{ uint32_t c=UINT32_MAX; for(size_t i=0;i<n;i++) { uint8_t v=(i>=12 && i<16)?0:p[i]; c=table[(c^v)&255u]^(c>>8); } return ~c; }
+#if defined(__x86_64__)
+__attribute__((target("sse4.2")))
+static uint32_t crc_hardware(uint32_t c, const uint8_t *p, size_t n)
+{
+    while(n>=8) {
+        uint64_t word; memcpy(&word,p,sizeof word);
+        c=(uint32_t)_mm_crc32_u64(c,word); p+=8; n-=8;
+    }
+    while(n) { c=_mm_crc32_u8(c,*p++); n--; }
+    return c;
+}
+#endif
+static uint32_t crc_update(const journal_crc *crc, uint32_t c, const uint8_t *p, size_t n)
+{
+#if defined(__x86_64__)
+    if(crc->hardware) return crc_hardware(c,p,n);
+#endif
+    for(size_t i=0;i<n;i++) c=crc->table[(c^p[i])&255u]^(c>>8);
+    return c;
+}
+static uint32_t crc_data(const journal_crc *crc, const uint8_t *p, size_t n)
+{ return ~crc_update(crc,UINT32_MAX,p,n); }
+static uint32_t crc_record(const journal_crc *crc, const uint8_t *p, size_t n)
+{
+    const uint8_t zero[4]={0};
+    uint32_t c=crc_update(crc,UINT32_MAX,p,12);
+    c=crc_update(crc,c,zero,sizeof zero);
+    return ~crc_update(crc,c,p+16,n-16);
+}
 static size_t sealed_size(size_t used)
 { return (used+JOURNAL_HEADER+JOURNAL_PAGE-1u)&~(size_t)(JOURNAL_PAGE-1u); }
 static void encode(uint8_t *p, uint32_t type, uint64_t id, uint64_t seq, size_t n)
@@ -77,7 +121,7 @@ static void seal(journal *j, journal_batch *b)
 {
     b->sealed=sealed_size(b->used); size_t n=b->sealed-b->used;
     memset(b->bytes+b->used,0,n); encode(b->bytes+b->used,PAD,0,0,n);
-    put32(b->bytes+b->used+12,crc_record(j->crc_table,b->bytes+b->used,n));
+    put32(b->bytes+b->used+12,crc_record(&j->crc_table,b->bytes+b->used,n));
 }
 static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
 {
@@ -96,7 +140,7 @@ static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
     default: return false;
     }
 }
-static bool valid_record(const uint8_t *p, size_t n, uint64_t offset, uint64_t seq, const uint32_t *table)
+static bool valid_record(const uint8_t *p, size_t n, uint64_t offset, uint64_t seq, const journal_crc *table)
 {
     if(u32(p)!=MAGIC || u32(p+4)!=n || crc_record(table,p,n)!=u32(p+12)) return false;
     uint32_t type=u32(p+8);
@@ -120,11 +164,11 @@ static int visit_record(const uint8_t *p, size_t n, journal_visit visit, void *c
 int journal_replay_bytes(const uint8_t *bytes, size_t size, journal_visit visit, void *ctx, journal_replay_result *result)
 {
     if(!result || (!bytes && size)) return JOURNAL_INVALID;
-    *result=(journal_replay_result){0}; uint32_t table[256]; crc_init(table); size_t off=0;
+    *result=(journal_replay_result){0}; journal_crc table; crc_init(&table); size_t off=0;
     while(off<size) {
         if(size-off<32) { result->corrupt=true; break; }
         size_t n=u32(bytes+off+4);
-        if(n<32 || n>JOURNAL_MAX_RECORD || n>size-off || !valid_record(bytes+off,n,off,result->last_sequence,table)) { result->corrupt=true; break; }
+        if(n<32 || n>JOURNAL_MAX_RECORD || n>size-off || !valid_record(bytes+off,n,off,result->last_sequence,&table)) { result->corrupt=true; break; }
         int rc=visit_record(bytes+off,n,visit,ctx,result); if(rc) return rc; off+=n;
     }
     return 0;
@@ -161,6 +205,13 @@ static int io_sync(const journal_io *io, int fd, bool directory)
     while(rc<0 && errno==EINTR);
     return rc<0?JOURNAL_IO:0;
 }
+static int metadata_sync(const journal_io *io, int fd)
+{
+    int rc;
+    do { rc=io->metadata_sync?io->metadata_sync(io->ctx,fd):fsync(fd); }
+    while(rc<0 && errno==EINTR);
+    return rc<0?JOURNAL_IO:0;
+}
 static int check_base_io(const journal_base *base, const journal_io *io);
 int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx, journal_replay_result *result, const journal_io *io)
 {
@@ -168,13 +219,13 @@ int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx
     *result=(journal_replay_result){0}; int fd=open(path,O_RDWR|O_CLOEXEC|O_NOFOLLOW);
     if(fd<0) return JOURNAL_IO;
     edit_arena a; if(edit_arena_init(&a,JOURNAL_MAX_RECORD)) { close(fd); return JOURNAL_NOMEM; }
-    uint8_t *p=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16); uint32_t table[256]; crc_init(table); int rc=0;
+    uint8_t *p=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16); journal_crc table; crc_init(&table); int rc=0;
     for(;;) {
         size_t got=0; rc=read_at(fd,p,32,result->valid_bytes,&got); if(rc || !got) break;
         size_t n=got==32?u32(p+4):0;
         if(got!=32 || n<32 || n>JOURNAL_MAX_RECORD) { result->corrupt=true; break; }
         rc=read_at(fd,p+32,n-32,result->valid_bytes+32,&got); if(rc) break;
-        if(got!=n-32 || !valid_record(p,n,result->valid_bytes,result->last_sequence,table)) { result->corrupt=true; break; }
+        if(got!=n-32 || !valid_record(p,n,result->valid_bytes,result->last_sequence,&table)) { result->corrupt=true; break; }
         if(u32(p+8)==JOURNAL_BASE) {
             journal_record rec={JOURNAL_BASE,u64(p+24),u64(p+16),p+32,n-32};
             journal_base base; char basepath[4097];
@@ -198,7 +249,7 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
     char canonical[4097];
     if(strlen(path)>4096 || !realpath(path,canonical)) return JOURNAL_BASE_CHANGED;
     int fd=open(canonical,O_RDONLY|O_CLOEXEC); if(fd<0) return JOURNAL_BASE_CHANGED;
-    struct stat before,after,atpath; uint8_t prefix[4096]; uint32_t table[256]; size_t got=0; int rc=0;
+    struct stat before,after,atpath; uint8_t prefix[4096]; journal_crc table; size_t got=0; int rc=0;
     if(fstat(fd,&before) || !S_ISREG(before.st_mode) || before.st_size<0 || before.st_mtim.tv_sec<0) rc=JOURNAL_BASE_CHANGED;
     if(!rc) {
         uint64_t base_size=(uint64_t)before.st_size;
@@ -214,10 +265,10 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
     }
     if(!rc && (fstat(fd,&after) || stat(canonical,&atpath) || !stat_equal(&before,&after) || !stat_equal(&after,&atpath))) rc=JOURNAL_BASE_CHANGED;
     if(!rc) {
-        crc_init(table); *base=(journal_base){.size=(uint64_t)before.st_size,
+        crc_init(&table); *base=(journal_base){.size=(uint64_t)before.st_size,
             .mtime_ns=(uint64_t)before.st_mtim.tv_sec*1000000000u+(uint64_t)before.st_mtim.tv_nsec,
             .inode=(uint64_t)before.st_ino,.device=(uint64_t)before.st_dev,
-            .prefix_crc=crc_data(table,prefix,got),.prefix_len=(uint32_t)got};
+            .prefix_crc=crc_data(&table,prefix,got),.prefix_len=(uint32_t)got};
         strcpy(base->captured_path,canonical); base->path=base->captured_path;
     }
     close(fd); return rc;
@@ -254,22 +305,35 @@ static uint64_t prefix_sequence(const journal_batch *b, size_t upto, uint64_t in
     while(pos+32<=upto) { size_t n=u32(b->bytes+pos+4); if(n>upto-pos) break; if(u32(b->bytes+pos+8)!=PAD) seq=u64(b->bytes+pos+16); pos+=n; }
     return seq;
 }
-static int sync_disk(journal *j, uint64_t sequence)
+static size_t prefix_bytes(const journal_batch *b, size_t upto)
+{
+    size_t pos=0;
+    while(pos+32<=upto) {
+        size_t n=u32(b->bytes+pos+4);
+        if(n>upto-pos) break;
+        pos+=n;
+    }
+    return pos;
+}
+static int sync_disk(journal *j, uint64_t sequence, uint64_t complete_bytes)
 {
     journal_disk *d=&j->disk;
-    int rc=io_sync(&j->io,d->fd,false); if(rc) return rc;
+    int rc=io_sync(&j->io,d->fd,false);
+    if(rc) { d->writeback_failed=true; return rc; }
     uint64_t now=clock_ns(); journal_stats *s=&d->stats;
     uint64_t interval=now-s->last_sync_ns;
     if(d->unsynced && interval>s->max_sync_interval_ns) s->max_sync_interval_ns=interval;
     s->last_sync_ns=now; s->last_sync_bytes=d->unsynced;
     if(d->unsynced>s->max_sync_bytes) s->max_sync_bytes=d->unsynced;
-    s->syncs++; s->durable_sequence=sequence; d->unsynced=0; return 0;
+    s->syncs++; s->durable_sequence=sequence;
+    if(complete_bytes>s->durable_bytes) s->durable_bytes=complete_bytes;
+    d->unsynced=0; return 0;
 }
 static void worker(work_ctx *ctx)
 {
     journal *j=ctx->arg; journal_batch *b=&j->batches[j->active_index]; journal_disk *d=&j->disk;
     size_t pos=b->progress; int rc=0; uint64_t initial=d->written_sequence;
-    if(d->unsynced>=j->sync_bytes) rc=sync_disk(j,d->written_sequence);
+    if(d->unsynced>=j->sync_bytes) rc=sync_disk(j,d->written_sequence,d->stats.file_bytes);
     while(!rc && pos<b->sealed && !work_should_stop(ctx)) {
         size_t n=b->sealed-pos; uint64_t room=j->sync_bytes-d->unsynced; if(n>room) n=(size_t)room;
         size_t done=0;
@@ -280,9 +344,9 @@ static void worker(work_ctx *ctx)
         pos+=done; b->progress=pos; d->unsynced+=done; d->written_sequence=prefix_sequence(b,pos,initial);
         d->stats.written_sequence=d->written_sequence; d->stats.file_bytes=b->offset+pos;
         if(rc) break;
-        if(d->unsynced>=j->sync_bytes || clock_ns()-d->stats.last_sync_ns>=j->sync_interval_ns) { rc=sync_disk(j,d->written_sequence); if(rc) break; }
+        if(d->unsynced>=j->sync_bytes || clock_ns()-d->stats.last_sync_ns>=j->sync_interval_ns) { rc=sync_disk(j,d->written_sequence,b->offset+prefix_bytes(b,pos)); if(rc) break; }
     }
-    if(!rc && !work_should_stop(ctx) && (b->force || (d->unsynced && clock_ns()-d->stats.last_sync_ns>=j->sync_interval_ns))) rc=sync_disk(j,d->written_sequence);
+    if(!rc && !work_should_stop(ctx) && (b->force || (d->unsynced && clock_ns()-d->stats.last_sync_ns>=j->sync_interval_ns))) rc=sync_disk(j,d->written_sequence,b->offset+prefix_bytes(b,pos));
     d->stats.error=rc;
     journal_completion *completion=(journal_completion *)(void *)(b->bytes+j->capacity);
     completion->stats=d->stats;
@@ -343,7 +407,7 @@ static int journal_create(journal **out, const char *path, size_t name_offset,
     j->limit=limit; j->log_budget=limit; j->pool=pool; if(io) j->io=*io;
     j->sync_bytes=sync_bytes; j->sync_interval_ns=sync_interval_ns;
     j->path=edit_arena_alloc(&j->arena,strlen(path)+1,1); strcpy(j->path,path); j->name=j->path+name_offset;
-    j->directory_fd=dfd; crc_init(j->crc_table);
+    j->directory_fd=dfd; crc_init(&j->crc_table);
     for(unsigned i=0;i<2;i++) { j->batches[i].bytes=edit_arena_alloc(&j->arena,cap+sizeof(journal_completion),4096); memset(j->batches[i].bytes,0,cap+sizeof(journal_completion)); }
     int rc=io_sync(&j->io,dfd,true); if(rc) { edit_arena_free(&a); return rc; }
     j->disk.fd=fd; j->disk.stats.last_sync_ns=clock_ns();
@@ -364,15 +428,19 @@ int journal_open_with_io(journal **out, const char *path, work_pool *pool, const
 int journal_open(journal **out, const char *path, work_pool *pool, const journal_options *options)
 { return journal_open_with_io(out,path,pool,options,NULL); }
 int journal_set_io(journal *j, const journal_io *io)
-{ if(!j) return JOURNAL_INVALID; if(j->active) return JOURNAL_BUSY; j->io=io?*io:(journal_io){0}; return 0; }
+{ if(!j) return JOURNAL_INVALID; if(j->active || j->retention) return JOURNAL_BUSY; j->io=io?*io:(journal_io){0}; return 0; }
 int journal_retry(journal *j)
 {
     if(!j) return JOURNAL_INVALID;
     if(j->active) return JOURNAL_BUSY;
     if(j->stats.error!=JOURNAL_IO) return JOURNAL_INVALID;
+    /* A consumed writeback error can leave clean, lost pages anywhere in the
+     * unsynced generation, including batches already returned to the UI. */
+    if(j->disk.writeback_failed) return JOURNAL_IO;
     if(j->directory_pending) {
         int rc=io_sync(&j->io,j->directory_fd,true); if(rc) return rc;
         j->directory_pending=false; j->stats.durable_sequence=j->disk.stats.durable_sequence;
+        j->stats.durable_bytes=j->disk.stats.durable_bytes;
     }
     j->stats.error=j->append_error; j->disk.stats.error=0;
     j->append_failed=false; j->stats.append_errno=0;
@@ -407,7 +475,7 @@ static int finish_record(journal *j, uint8_t *p, uint32_t type, uint64_t id, siz
 {
     journal_batch *b=&j->batches[j->current]; size_t start=b->used; j->stats.accepted_sequence++;
     encode(p,type,id,j->stats.accepted_sequence,payload+32); b->used+=payload+32; b->sequence=j->stats.accepted_sequence;
-    put32(p+12,crc_record(j->crc_table,p,payload+32));
+    put32(p+12,crc_record(&j->crc_table,p,payload+32));
     if(j->append_pending) { j->pending_sequence=b->sequence; return JOURNAL_IO; }
     /* A pump whose work_submit was BUSY may already have cached a PAD here. */
     b->cached=start;
@@ -446,6 +514,33 @@ int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, 
 }
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len)
 { uint8_t data[16]; if(off>UINT64_MAX-len) return JOURNAL_INVALID; put64(data,off); put64(data+8,len); return journal_append(j,JOURNAL_DELETE,id,data,16); }
+int journal_insert_step(journal *j, uint64_t id, uint64_t off,
+                        const uint8_t *bytes, size_t size, size_t *progress)
+{
+    if(!j || !progress || *progress>size || (!bytes && size) ||
+       off>UINT64_MAX-size) return JOURNAL_INVALID;
+    if(*progress==size) return 0;
+    size_t n=size-*progress;
+    if(n>JOURNAL_INSERT_SLICE_BYTES) n=JOURNAL_INSERT_SLICE_BYTES;
+    if(n>j->capacity-72) n=j->capacity-72;
+    if(n>j->sync_bytes-72) n=(size_t)(j->sync_bytes-72);
+    uint8_t *record;
+    int preflight=reserve_record(j,n+8,&record); if(preflight) return preflight;
+    /* Reserve the eventual PAD too. Credit is returned only by a received
+     * durability fence at a COMPLETE record boundary, never by worker-accounted
+     * bytes or a partial CRC-protected record. This remains conservative when
+     * the kernel sync also covers newer UI writes in the other batch. */
+    journal_batch *b=&j->batches[j->current];
+    uint64_t end=j->reserved+sealed_size(b->used+n+40);
+    if(end>j->stats.durable_bytes && end-j->stats.durable_bytes>j->sync_bytes)
+        return JOURNAL_BUSY;
+    uint64_t accepted=j->stats.accepted_sequence;
+    int rc=journal_insert(j,id,off+*progress,bytes+*progress,n);
+    /* IO after encoding still owns this record in the fixed queue. Sticky IO,
+     * FULL or a prior transport gap accept nothing; never skip those bytes. */
+    if(j->stats.accepted_sequence!=accepted) *progress+=n;
+    return rc?rc:(*progress<size?JOURNAL_BUSY:JOURNAL_OK);
+}
 static int base_data(const journal_base *base, uint8_t *data, size_t *size)
 {
     if(!base || !base->path || strlen(base->path)>4096 || base->prefix_len>4096 || base->prefix_len>base->size) return JOURNAL_INVALID;
@@ -488,19 +583,25 @@ int journal_pump(journal *j, uint64_t now, bool force)
             seal(j,b);
             /* A page gap would hide successful appends in the next batch on
              * SIGKILL. Cache PAD before transferring this batch to the worker. */
-            if(b->cached==b->used) append_rc=cache_write(j,b,b->used,b->sealed-b->used);
+            if(b->cached==b->used && !b->pad_failed) {
+                append_rc=cache_write(j,b,b->used,b->sealed-b->used);
+                b->pad_failed=append_rc!=0;
+            } else if(b->pad_failed) append_rc=JOURNAL_IO;
         }
     }
     b->force=force || (j->failed && b->force);
 
     j->active_index=index;
-    j->handle=work_submit(j->pool,(work_job){worker,j,0,WORK_BULK}); if(!j->handle.epoch) return JOURNAL_BUSY;
+    j->handle=work_submit(j->pool,(work_job){worker,j,0,WORK_BULK});
+    if(!j->handle.epoch) return append_rc?append_rc:JOURNAL_BUSY;
     j->active=true;
     if(!j->failed) { j->reserved+=b->sealed; j->current^=1u; }
     return append_rc;
 }
+static bool retention_receive(journal *j, const work_msg *m);
 bool journal_receive(journal *j, const work_msg *m)
 {
+    if(j && m && retention_receive(j,m)) return true;
     if(!j || !m || m->kind!=JOURNAL_MESSAGE || !j->active || m->slot_!=j->handle.slot || m->epoch_!=j->handle.epoch) return false;
     uintptr_t address; memcpy(&address,m->data,sizeof address);
     journal_batch *b=&j->batches[j->active_index];
@@ -517,6 +618,7 @@ bool journal_receive(journal *j, const work_msg *m)
     if(!j->failed) {
         if(b->sequence>=j->pending_sequence) j->append_pending=false;
         b->used=0; b->sealed=0; b->progress=0; b->cached=0;
+        b->pad_failed=false;
     }
     j->active=false;
     return true;
@@ -524,7 +626,9 @@ bool journal_receive(journal *j, const work_msg *m)
 journal_stats journal_get_stats(const journal *j)
 {
     if(!j) return (journal_stats){.error=JOURNAL_INVALID};
-    journal_stats s=j->stats; s.pending_bytes=j->batches[0].used+j->batches[1].used; return s;
+    journal_stats s=j->stats; s.pending_bytes=j->batches[0].used+j->batches[1].used;
+    s.unprotected_bytes=s.file_bytes>s.durable_bytes?s.file_bytes-s.durable_bytes:0;
+    return s;
 }
 void journal_set_message_handler(journal *j, void (*handler)(const work_msg *, void *), void *ctx)
 {
@@ -623,13 +727,16 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
     if(renamed) {
         int oldfd=j->disk.fd;
         j->disk=next->disk; next->disk.fd=-1; j->stats=next->stats; j->reserved=next->reserved;
-        for(unsigned i=0;i<2;i++) { j->batches[i].used=0; j->batches[i].sealed=0; j->batches[i].cached=0; }
+        for(unsigned i=0;i<2;i++) {
+            j->batches[i].used=0; j->batches[i].sealed=0; j->batches[i].cached=0;
+            j->batches[i].progress=0; j->batches[i].pad_failed=false;
+        }
         j->current=0; j->failed=false; j->append_error=0;
         j->append_failed=false; j->append_pending=false; j->pending_sequence=0;
         j->limit=next->limit; j->disk.stats.checkpoint_bytes=checkpoint_bytes; j->stats.checkpoint_bytes=checkpoint_bytes;
         j->directory_pending=true;
         if(rc || io_sync(&j->io,j->directory_fd,true)) {
-            rc=JOURNAL_IO; j->stats.error=rc; j->stats.durable_sequence=0;
+            rc=JOURNAL_IO; j->stats.error=rc; j->stats.durable_sequence=0; j->stats.durable_bytes=0;
         } else j->directory_pending=false;
         close(oldfd);
     }
@@ -638,14 +745,23 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
 }
 
 
-typedef struct journal_retention {
+struct journal_retention {
     const journal_base *previous;
     const char *path;
     const journal_io *io;
     int fd, error;
     journal_base base;
-    _Atomic bool done;
-} journal_retention;
+    bool received; /* exclusively UI owned; no shared polling flag */
+};
+static bool retention_receive(journal *j, const work_msg *m)
+{
+    if(m->kind!=RETENTION_MESSAGE || !j->retention ||
+       m->slot_!=j->retention_handle.slot || m->epoch_!=j->retention_handle.epoch) return false;
+    uintptr_t address; memcpy(&address,m->data,sizeof address);
+    if(address!=(uintptr_t)j->retention) return false;
+    j->retention->received=true;
+    return true;
+}
 /* Bounded fallback: no whole-file mapping/allocation, and no bulk I/O on the
  * owner thread. A write hook requests copying so fault seams observe the data. */
 static int retain_copy(work_ctx *ctx, journal_retention *r, int source)
@@ -685,7 +801,7 @@ static int retain_generation(work_ctx *ctx, journal_retention *r)
                (r->base.inode==p->inode && r->base.device==p->device))) rc=JOURNAL_BASE_CHANGED;
     if(!rc && (fstat(source,&after) || stat(p->path,&named) || !stat_equal(&before,&after) || !stat_equal(&after,&named))) rc=JOURNAL_BASE_CHANGED;
     close(source);
-    if(!rc) rc=io_sync(r->io,r->fd,false);
+    if(!rc) rc=metadata_sync(r->io,r->fd);
     if(!rc) rc=sync_parent(r->path,r->io);
     return rc;
 }
@@ -693,22 +809,24 @@ static void retention_worker(work_ctx *ctx)
 {
     journal_retention *r=ctx->arg;
     r->error=retain_generation(ctx,r);
-    atomic_store_explicit(&r->done,true,memory_order_release);
-    /* No retention storage is touched after ownership returns to the owner. */
+    work_msg msg={.kind=RETENTION_MESSAGE}; uintptr_t address=(uintptr_t)r;
+    memcpy(msg.data,&address,sizeof address);
+    while(!work_should_stop(ctx) && !work_publish(ctx,&msg)) delay();
+    /* No result storage is touched after work_publish transfers ownership. */
 }
 static int retain_base(journal *j, const journal_base *previous, char *path, journal_base *base)
 {
     int fd=mkostemp(path,O_CLOEXEC); if(fd<0) return JOURNAL_IO;
     journal_retention r={.previous=previous,.path=path,.io=&j->io,.fd=fd};
-    atomic_init(&r.done,false);
-    work_handle handle;
+    j->retention=&r;
     do {
-        handle=work_submit(j->pool,(work_job){retention_worker,&r,0,WORK_BULK});
-        if(!handle.epoch) { work_mailbox_drain(j->pool,drain,j); delay(); }
-    } while(!handle.epoch);
-    while(!atomic_load_explicit(&r.done,memory_order_acquire)) {
+        j->retention_handle=work_submit(j->pool,(work_job){retention_worker,&r,0,WORK_BULK});
+        if(!j->retention_handle.epoch) { work_mailbox_drain(j->pool,drain,j); delay(); }
+    } while(!j->retention_handle.epoch);
+    while(!r.received) {
         work_mailbox_drain(j->pool,drain,j); delay();
     }
+    j->retention=NULL;
     close(fd);
     if(r.error) { (void)unlink(path); path[0]=0; return r.error; }
     *base=r.base; base->path=path;
@@ -736,10 +854,17 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
     *save=(journal_save){.buffer_id=id,.sequence=count};
     journal_base retained=*previous;
     if(*previous->path) {
-        size_t n=(size_t)(strrchr(previous->path,'/')-previous->path)+1;
+        /* Recovery artifacts belong beside the journal, whose lifetime and
+         * access already protect the recovery session. Reflink may cross
+         * filesystems; retain_generation then falls back to bounded copying. */
+        size_t n=(size_t)(j->name-j->path);
         const char name[]=".sublimite-base-XXXXXX";
-        if(n>sizeof save->previous_path-sizeof name) return JOURNAL_INVALID;
-        memcpy(save->previous_path,previous->path,n);
+        /* For a maximal journal parent use its nearest existing ancestor
+         * that can encode the private leaf. No new namespace is required. */
+        while(n>sizeof save->previous_path-sizeof name-1u) {
+            n--; while(n>1 && j->path[n-1]!='/') n--;
+        }
+        memcpy(save->previous_path,j->path,n);
         memcpy(save->previous_path+n,name,sizeof name);
         rc=retain_base(j,previous,save->previous_path,&retained);
         if(rc) return rc;

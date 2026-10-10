@@ -9,7 +9,10 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "journal_test:%d FAIL %s\n", __LINE__, #x); return 1; } } while (0)
-typedef struct model { uint8_t text[32768]; size_t len; uint64_t records; uint32_t views, tabs, windows; } model;
+typedef struct model { uint8_t text[32768]; size_t len; uint64_t records; uint32_t views, tabs, windows;
+    journal_view view_values[2]; uint64_t view_ids[2], tab_ids[8], tab_active, tab_count;
+    uint32_t width, height;
+} model;
 static uint64_t get64(const uint8_t *p) { uint64_t x = 0; for (unsigned i=0;i<8;i++) x |= (uint64_t)p[i] << (8*i); return x; }
 static int apply(void *ctx, const journal_record *r)
 {
@@ -23,9 +26,21 @@ static int apply(void *ctx, const journal_record *r)
         uint64_t off = get64(r->data), n = get64(r->data + 8);
         if (off > m->len || n > m->len - off) return 1;
         memmove(m->text + (size_t)off, m->text + (size_t)(off+n), m->len - (size_t)(off+n)); m->len -= (size_t)n;
-    } else if (r->type == JOURNAL_VIEW) m->views++;
-    else if (r->type == JOURNAL_TABS) m->tabs++;
-    else if (r->type == JOURNAL_WINDOW) m->windows++;
+    } else if (r->type == JOURNAL_VIEW) {
+        if(m->views>=2) return 1;
+        m->view_values[m->views]=(journal_view){get64(r->data),get64(r->data+8),get64(r->data+16),get64(r->data+24)};
+        m->view_ids[m->views]=r->buffer_id; m->views++;
+    } else if (r->type == JOURNAL_TABS) {
+        uint64_t count=get64(r->data); if(count>8) return 1;
+        m->tab_count=count; m->tab_active=get64(r->data+8);
+        memset(m->tab_ids,0,sizeof m->tab_ids);
+        for(size_t i=0;i<count;i++) m->tab_ids[i]=get64(r->data+16+8*i);
+        m->tabs++;
+    } else if (r->type == JOURNAL_WINDOW) {
+        m->width=(uint32_t)r->data[0] | (uint32_t)r->data[1]<<8 | (uint32_t)r->data[2]<<16 | (uint32_t)r->data[3]<<24;
+        m->height=(uint32_t)r->data[4] | (uint32_t)r->data[5]<<8 | (uint32_t)r->data[6]<<16 | (uint32_t)r->data[7]<<24;
+        m->windows++;
+    }
     m->records++; return 0;
 }
 static int reject(void *ctx, const journal_record *r) { (void)ctx; (void)r; return 1; }
@@ -180,13 +195,13 @@ static int append_gap_test(void)
 typedef struct disk_image { ino_t inode; size_t size; uint8_t bytes[IMAGE_SIZE]; } disk_image;
 typedef struct fault_disk {
     const char *path;
-    disk_image image[8];
+    disk_image image[16];
     size_t images;
     ino_t durable_name;
     unsigned writes, syncs, dirs, renames;
     unsigned fail_write, fail_sync, fail_dir;
     int fail_rename; /* 1 before, 2 after replacement */
-    bool short_write;
+    bool short_write, lose_writeback;
     size_t append_limit;
     uint64_t retry_offset;
 } fault_disk;
@@ -216,12 +231,21 @@ static int fault_sync(void *ctx, int fd, bool directory)
         return 0;
     }
     d->syncs++;
-    if(d->syncs==d->fail_sync) { errno=EIO; return -1; }
+    if(d->syncs==d->fail_sync) {
+        if(d->lose_writeback) {
+            struct stat lost;
+            if(fstat(fd,&lost) || ftruncate(fd,0)) return -1;
+            for(size_t i=0;i<d->images;i++) if(d->image[i].inode==lost.st_ino) {
+                if(pwrite(fd,d->image[i].bytes,d->image[i].size,0)!=(ssize_t)d->image[i].size) return -1;
+            }
+        }
+        errno=EIO; return -1;
+    }
     if(fdatasync(fd)) return -1;
     struct stat sb; if(fstat(fd,&sb) || sb.st_size<0 || (uint64_t)sb.st_size>IMAGE_SIZE) return -1;
     size_t index=0;
     while(index<d->images && d->image[index].inode!=sb.st_ino) index++;
-    if(index==d->images) { if(index==8) return -1; d->images++; }
+    if(index==d->images) { if(index==16) return -1; d->images++; }
     disk_image *im=&d->image[index]; im->inode=sb.st_ino; im->size=(size_t)sb.st_size;
     return pread(fd,im->bytes,im->size,0)==(ssize_t)im->size?0:-1;
 }
@@ -254,9 +278,13 @@ static int retry_test(void)
     CHECK(journal_flush(j)==JOURNAL_IO);
     journal_stats st=journal_get_stats(j);
     CHECK(st.accepted_sequence==2 && st.written_sequence==2 && st.durable_sequence==0);
-    CHECK(journal_retry(j)==JOURNAL_OK);
-    CHECK(journal_flush(j)==0);
-    CHECK(d->writes==0); /* already cached bytes are never rewritten */
+    CHECK(journal_retry(j)==JOURNAL_IO);
+    uint8_t *retry_payload=calloc(1,200008); CHECK(retry_payload); memcpy(retry_payload+8,big,200000);
+    uint8_t retry_last[9]={0}; retry_last[8]='!';
+    for(unsigned k=0;k<8;k++) retry_last[k]=(uint8_t)(200000ull>>(k*8));
+    journal_record retry_cp[]={{JOURNAL_INSERT,1,0,retry_payload,200008},{JOURNAL_INSERT,1,0,retry_last,9}};
+    CHECK(journal_rotate(j,retry_cp,2)==0 && journal_flush(j)==0); free(retry_payload);
+    CHECK(d->writes==0); /* checkpoint UI writes target a fresh inode */
     st=journal_get_stats(j); CHECK(st.accepted_sequence==2 && st.durable_sequence==2);
     journal_close(j);
     piece_allocator a=piece_default_allocator(); piece_tree *tree=piece_create(&a); CHECK(tree);
@@ -290,15 +318,12 @@ static int retry_test(void)
     memset(d,0,sizeof *d); d->path=path; d->fail_sync=1; io=fault_io(d);
     CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
     CHECK(journal_insert(j,1,0,(const uint8_t *)"f",1)==0 && journal_flush(j)==JOURNAL_IO);
-    CHECK(journal_retry(j)==0);
-    CHECK(journal_pump(j,journal_get_stats(j).last_sync_ns,false)==0);
-    unsigned wait=0;
-    while(atomic_load(&pool.mb[0].head)==atomic_load(&pool.mb[0].tail) && wait++<2000) pause_ms();
-    CHECK(wait<2000); work_mailbox_drain(&pool,route,j);
-    CHECK(journal_get_stats(j).durable_sequence==1); /* retry preserves the force request */
+    CHECK(journal_retry(j)==JOURNAL_IO);
+    uint8_t repaired[9]={0}; repaired[8]='f'; journal_record repair={JOURNAL_INSERT,1,0,repaired,9};
+    CHECK(journal_rotate(j,&repair,1)==0 && journal_get_stats(j).durable_sequence==1);
     journal_close(j);
     free(whole); free(big); free(d); work_pool_shutdown(&pool); unlink(path);
-    puts("journal_test: retry ok (sync EIO, two cached batches, no rewrites, checkpoint replacement)"); return 0;
+    puts("journal_test: retry ok (write failures retain progress; sync EIO requires fresh checkpoint)"); return 0;
 }
 static int barriers_test(void)
 {
@@ -315,14 +340,20 @@ static int barriers_test(void)
     CHECK(journal_insert(j,1,1,big,sizeof big)==JOURNAL_IO); d->append_limit=0; d->fail_write=1;
     CHECK(journal_flush(j)==JOURNAL_IO);
     CHECK(journal_get_stats(j).durable_sequence==1);
+    CHECK(journal_get_stats(j).durable_bytes==41 && journal_get_stats(j).unprotected_bytes==65536-41);
     model m={0}; journal_replay_result rr; CHECK(durable_replay(d,&m,&rr)==0);
     CHECK(rr.corrupt && rr.last_sequence==1 && m.len==1 && m.text[0]=='a');
     CHECK(journal_retry(j)==0); CHECK(journal_flush(j)==0);
-    /* Failed fdatasync must not advance acknowledgement; retry only syncs. */
+    /* Failed fdatasync must not advance acknowledgement; repair every byte
+     * of the generation through a fresh complete checkpoint. */
     CHECK(journal_insert(j,1,70001,(const uint8_t *)"!",1)==0);
     d->fail_sync=d->syncs+1; CHECK(journal_flush(j)==JOURNAL_IO);
-    CHECK(journal_get_stats(j).durable_sequence==2); unsigned writes=d->writes;
-    CHECK(journal_retry(j)==0 && journal_flush(j)==0 && d->writes==writes);
+    CHECK(journal_get_stats(j).durable_sequence==2 && journal_retry(j)==JOURNAL_IO);
+    uint8_t first[9]={0}, middle[70008]={0}, tail[9]={0}; first[8]='a'; middle[0]=1;
+    memcpy(middle+8,big,sizeof big); tail[8]='!';
+    for(unsigned k=0;k<8;k++) tail[k]=(uint8_t)(70001ull>>(k*8));
+    journal_record repair[]={{JOURNAL_INSERT,1,0,first,9},{JOURNAL_INSERT,1,0,middle,sizeof middle},{JOURNAL_INSERT,1,0,tail,9}};
+    CHECK(journal_rotate(j,repair,3)==0 && journal_flush(j)==0);
     uint8_t op[11]={0}; memcpy(op+8,"new",3);
     journal_record cp={JOURNAL_INSERT,1,0,op,sizeof op};
     for(unsigned phase=0;phase<3;phase++) {
@@ -336,6 +367,7 @@ static int barriers_test(void)
         if(phase>=1) {
             m=(model){0}; CHECK(journal_replay_file(path,apply,&m,&rr)==0 && m.len==3 && !memcmp(m.text,"new",3));
             CHECK(journal_get_stats(j).error==JOURNAL_IO && journal_get_stats(j).durable_sequence==0);
+            CHECK(journal_get_stats(j).durable_bytes==0 && journal_get_stats(j).unprotected_bytes==journal_get_stats(j).file_bytes);
             CHECK(journal_insert(j,1,3,(const uint8_t *)"!",1)==JOURNAL_IO);
         }
         if(phase==2) {
@@ -346,6 +378,7 @@ static int barriers_test(void)
         if(phase>=1) {
             d->fail_dir=0; CHECK(journal_retry(j)==0);
             CHECK(journal_get_stats(j).durable_sequence==1);
+            CHECK(journal_get_stats(j).durable_bytes==journal_get_stats(j).file_bytes && journal_get_stats(j).unprotected_bytes==0);
             CHECK(journal_insert(j,1,3,(const uint8_t *)"!",1)==0 && journal_flush(j)==0);
             m=(model){0}; CHECK(durable_replay(d,&m,&rr)==0 && m.len==4 && !memcmp(m.text,"new!",4));
         }
@@ -800,6 +833,11 @@ static int retained_copy_sync(void *ctx, int fd, bool directory)
     }
     return directory?fsync(fd):fdatasync(fd);
 }
+static int retained_copy_metadata(void *ctx, int fd)
+{
+    int rc=retained_copy_sync(ctx,fd,false);
+    return rc?rc:fsync(fd);
+}
 static int retained_copy_rename(void *ctx, const char *from, const char *to)
 {
     retained_copy_fault *f=ctx;
@@ -824,7 +862,7 @@ static int retained_copy_test(void)
         /* A write seam requests the copy fallback, making its fault oracle
          * independent of filesystem reflink support. */
         retained_copy_fault faults={.target=target,.owner=pthread_self(),.failure=failure};
-        journal_io io={.ctx=&faults,.write=retained_copy_write,.sync=retained_copy_sync,.rename=retained_copy_rename};
+        journal_io io={.ctx=&faults,.write=retained_copy_write,.sync=retained_copy_sync,.rename=retained_copy_rename,.metadata_sync=retained_copy_metadata};
         CHECK(journal_set_io(j,&io)==0);
         journal_save save={0}; int rc=journal_save_prepare(j,1,&b,&cp,1,&save);
         if(failure) {
@@ -1020,6 +1058,53 @@ static void repair_crc(uint8_t *p, size_t n)
     for(size_t i=0;i<n;i++) { crc^=p[i]; for(unsigned k=0;k<8;k++) crc=(crc>>1)^((crc&1u)?0x82f63b78u:0u); }
     crc=~crc; for(unsigned k=0;k<4;k++) p[12+k]=(uint8_t)(crc>>(k*8));
 }
+typedef struct crc_wire_check { unsigned records; bool mismatch; } crc_wire_check;
+static ssize_t check_crc_write(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    crc_wire_check *check=ctx; uint32_t crc=UINT32_MAX;
+    /* Independent bitwise polynomial oracle: encoder and replay cannot agree
+     * with each other on the same wrong checksum and pass this check. */
+    for(size_t i=0;i<n;i++) {
+        crc^=i>=12 && i<16?0:p[i];
+        for(unsigned k=0;k<8;k++) crc=(crc>>1)^((crc&1u)?0x82f63b78u:0u);
+    }
+    uint32_t encoded=(uint32_t)p[12] | (uint32_t)p[13]<<8 |
+        (uint32_t)p[14]<<16 | (uint32_t)p[15]<<24;
+    if(encoded!=~crc) check->mismatch=true;
+    check->records++;
+    return pwrite(fd,p,n,(off_t)off);
+}
+static int crc_wire_test(void)
+{
+    char path[]="/tmp/journal-crc-wire-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    crc_wire_check check={0}; journal_io io={.ctx=&check,.append_write=check_crc_write};
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    size_t size=JOURNAL_MAX_RECORD-40; uint8_t *payload=malloc(size); CHECK(payload);
+    for(size_t i=0;i<size;i++) payload[i]=(uint8_t)(i*17u+3u);
+    for(size_t n=0;n<256;n++) CHECK(journal_insert(j,1,0,payload,n)==0);
+    CHECK(journal_flush(j)==0 && !check.mismatch);
+    CHECK(journal_insert(j,1,0,payload,size)==0 && journal_flush(j)==0 && !check.mismatch);
+    CHECK(check.records==259); /* small records, two PADs, maximum record */
+    journal_close(j); free(payload); work_pool_shutdown(&pool); unlink(path);
+    /* Decode independently checksummed records from unaligned byte images. */
+    for(size_t n=0;n<256;n++) {
+        uint8_t storage[304]={0}; uint8_t *wire=storage+n%8;
+        const uint32_t header[]={0x314c4e4au,(uint32_t)(40+n),JOURNAL_INSERT,0,1,0,1,0};
+        for(unsigned k=0;k<8;k++) for(unsigned b=0;b<4;b++) wire[4*k+b]=(uint8_t)(header[k]>>(8*b));
+        for(size_t i=0;i<n;i++) wire[40+i]=(uint8_t)(i*31u);
+        repair_crc(wire,40+n);
+        model restored={0}; journal_replay_result rr;
+        CHECK(journal_replay_bytes(wire,40+n,apply,&restored,&rr)==0 && !rr.corrupt && rr.records==1);
+        CHECK(restored.len==n && !memcmp(restored.text,wire+40,n));
+    }
+    char basepath[]="/tmp/journal-crc-vector-XXXXXX"; int fd=mkstemp(basepath); CHECK(fd>=0);
+    CHECK(write(fd,"123456789",9)==9); close(fd);
+    journal_base base; CHECK(journal_capture_base(basepath,&base)==0 && base.prefix_crc==0xe3069283u);
+    unlink(basepath);
+    puts("journal_test: CRC32C wire/BASE vectors match independent oracle (tails, unaligned replay, maximum record)");
+    return 0;
+}
 static int schema_test(bool parser)
 {
     char path[]="/tmp/journal-schema-XXXXXX"; CHECK(temp(path)>=0);
@@ -1188,9 +1273,554 @@ static int exact_prefix_test(void)
     free(copy); free(bytes); free(snapshots); work_pool_shutdown(&pool); unlink(path);
     puts("journal_test: exact scripted corruption/truncation prefix (first page, 64 KiB, PAD, byte contents)"); return 0;
 }
+
+/* P1.9h: failed writeback consumes EIO and loses both the active batch and
+ * an earlier released, unsynced batch. A later sync alone repairs nothing. */
+static int writeback_loss_test(void)
+{
+    char path[]="/tmp/journal-writeback-loss-XXXXXX"; CHECK(temp(path)>=0);
+    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path;
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal_io io=fault_io(d); journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    uint8_t text[5000]; memset(text,'a',sizeof text);
+    CHECK(journal_insert(j,1,0,text,sizeof text)==0);
+    CHECK(journal_pump(j,journal_get_stats(j).last_sync_ns,false)==0);
+    unsigned wait=0;
+    while(atomic_load(&pool.mb[0].head)==atomic_load(&pool.mb[0].tail) && wait++<2000) pause_ms();
+    CHECK(wait<2000); work_mailbox_drain(&pool,route,j);
+    CHECK(journal_get_stats(j).pending_bytes==0 && journal_get_stats(j).durable_sequence==0);
+    d->fail_sync=1; d->lose_writeback=true;
+    CHECK(journal_insert(j,1,sizeof text,(const uint8_t *)"!",1)==0 && journal_flush(j)==JOURNAL_IO);
+    CHECK(journal_get_stats(j).durable_sequence==0);
+    /* A sync-only retry must remain suspended, even if the next sync succeeds. */
+    CHECK(journal_retry(j)==JOURNAL_IO);
+    CHECK(journal_flush(j)==JOURNAL_IO && journal_insert(j,1,0,text,1)==JOURNAL_IO);
+    uint8_t payload[5009]={0}; memcpy(payload+8,text,sizeof text); payload[5008]='!';
+    journal_record cp={JOURNAL_INSERT,1,0,payload,sizeof payload};
+    ino_t old=d->durable_name;
+    CHECK(journal_rotate(j,&cp,1)==0 && d->durable_name!=old);
+    model m={0}; journal_replay_result rr;
+    CHECK(durable_replay(d,&m,&rr)==0 && !rr.corrupt && rr.last_sequence==1 && m.len==5001 && !memcmp(m.text,payload+8,5001));
+    CHECK(journal_get_stats(j).durable_sequence==1 && journal_flush(j)==0);
+    journal_close(j); work_pool_shutdown(&pool); free(d); unlink(path);
+    puts("journal_test: writeback loss requires a fresh checkpoint (released unsynced batch included)"); return 0;
+}
+typedef struct metadata_oracle { bool full_synced; uint64_t mtime; } metadata_oracle;
+static int metadata_data_sync(void *ctx, int fd, bool directory)
+{
+    (void)ctx;
+    if(directory) return fsync(fd);
+    /* Model a filesystem retaining bytes/size but losing nonessential mtime. */
+    struct timespec times[2]={{0,UTIME_OMIT},{1,0}};
+    if(futimens(fd,times)) return -1;
+    return fdatasync(fd);
+}
+static int metadata_full_sync(void *ctx, int fd)
+{
+    metadata_oracle *o=ctx; struct stat st;
+    if(fsync(fd) || fstat(fd,&st)) return -1;
+    o->full_synced=true;
+    o->mtime=(uint64_t)st.st_mtim.tv_sec*1000000000u+(uint64_t)st.st_mtim.tv_nsec;
+    return 0;
+}
+static int retention_metadata_test(void)
+{
+    char path[]="/tmp/journal-metadata-XXXXXX", target[]="/tmp/journal-empty-base-XXXXXX";
+    CHECK(temp(path)>=0 && temp(target)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0);
+    metadata_oracle oracle={0};
+    journal_io io={.ctx=&oracle,.sync=metadata_data_sync,.metadata_sync=metadata_full_sync};
+    CHECK(journal_set_io(j,&io)==0);
+    journal_base b; CHECK(journal_capture_base(target,&b)==0);
+    uint8_t payload[4137]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0);
+    CHECK(oracle.full_synced);
+    journal_base retained; CHECK(journal_capture_base(save.previous_path,&retained)==0 && retained.mtime_ns==oracle.mtime);
+    journal_replay_result rr; CHECK(journal_replay_file(path,NULL,NULL,&rr)==0 && !rr.corrupt);
+    journal_close(j); work_pool_shutdown(&pool); unlink(save.previous_path); unlink(path); unlink(target);
+    puts("journal_test: retained identity has a full metadata barrier (empty BASE mtime survives)"); return 0;
+}
+typedef struct retention_channel { work_pool *pool; uint32_t before; bool mailbox; } retention_channel;
+static int retention_channel_rename(void *ctx, const char *from, const char *to)
+{
+    retention_channel *c=ctx;
+    /* One completed checkpoint job plus one retention completion must have
+     * crossed and been consumed from the work mailbox before publication. */
+    c->mailbox=atomic_load(&c->pool->mb[0].head)-c->before>=2;
+    return rename(from,to);
+}
+static int retention_channel_test(void)
+{
+    char path[]="/tmp/journal-channel-XXXXXX", target[]="/tmp/journal-channel-base-XXXXXX";
+    CHECK(temp(path)>=0 && temp(target)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    CHECK(journal_open(&j,path,&pool,NULL)==0);
+    retention_channel c={.pool=&pool,.before=atomic_load(&pool.mb[0].head)};
+    journal_io io={.ctx=&c,.rename=retention_channel_rename}; CHECK(journal_set_io(j,&io)==0);
+    journal_base b; CHECK(journal_capture_base(target,&b)==0);
+    uint8_t payload[4137]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0 && c.mailbox);
+    journal_close(j); work_pool_shutdown(&pool); unlink(save.previous_path); unlink(path); unlink(target);
+    puts("journal_test: retention completion crosses the routed work mailbox"); return 0;
+}
+static int pad_busy_test(void)
+{
+    char path[]="/tmp/journal-pad-busy-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    append_fault f={.owner=pthread_self()};
+    journal_io io={.ctx=&f,.append_write=append_attempt,.write=append_worker_write};
+    CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0 && journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
+    work_handle slots[WORK_MAX_JOBS];
+    for(size_t i=0;i<WORK_MAX_JOBS;i++) { slots[i]=work_submit(&pool,(work_job){blocked,NULL,0,WORK_BULK}); CHECK(slots[i].epoch); }
+    f.error=EAGAIN;
+    CHECK(journal_pump(j,1,true)==JOURNAL_IO);
+    CHECK(journal_pump(j,1,true)==JOURNAL_IO && f.attempts==2);
+    for(size_t i=0;i<WORK_MAX_JOBS;i++) work_cancel(&pool,slots[i]);
+    CHECK(journal_flush(j)==JOURNAL_IO && journal_get_stats(j).durable_sequence==1 && f.attempts==2);
+    f.error=0; CHECK(journal_retry(j)==0 && journal_flush(j)==0);
+    model m={0}; journal_replay_result rr;
+    CHECK(cache_replay(path,&m,&rr)==0 && !rr.corrupt && m.len==1 && m.text[0]=='a');
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: PAD IO outranks submission BUSY and retries only on worker"); return 0;
+}
+static int long_base_retention_test(void)
+{
+    char root[]="/tmp/journal-long-base-XXXXXX"; CHECK(mkdtemp(root));
+    char paths[18][4097]; strcpy(paths[0],root); size_t depth=0;
+    while(strlen(paths[depth])<4093) {
+        size_t len=strlen(paths[depth]), n=4093-len-1; if(n>245) n=245;
+        CHECK(depth+1<18 && n>0); memcpy(paths[depth+1],paths[depth],len); paths[depth+1][len++]='/';
+        memset(paths[depth+1]+len,'d',n); paths[depth+1][len+n]=0; depth++;
+        CHECK(mkdir(paths[depth],0700)==0);
+    }
+    char target[4097], path[4097]; size_t len=strlen(paths[depth]);
+    memcpy(target,paths[depth],len); memcpy(target+len,"/b",3);
+    memcpy(path,paths[depth],len); memcpy(path+len,"/j",3);
+    int fd=open(target,O_WRONLY|O_CREAT|O_EXCL,0600); CHECK(fd>=0 && write(fd,"abc",3)==3); close(fd);
+    journal_base b; CHECK(journal_capture_base(target,&b)==0 && strlen(b.path)==4095);
+    uint8_t payload[4137]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)};
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    journal_save save={0}; CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0 && save.prepared);
+    CHECK(strlen(save.previous_path)<4095);
+    fd=open(target,O_WRONLY|O_TRUNC); CHECK(fd>=0 && write(fd,"xyz",3)==3); close(fd);
+    journal_replay_result rr; CHECK(journal_replay_file(path,NULL,NULL,&rr)==0 && !rr.corrupt);
+    fd=open(save.previous_path,O_RDONLY); uint8_t bytes[3]; CHECK(fd>=0 && read(fd,bytes,3)==3 && !memcmp(bytes,"abc",3)); close(fd);
+    journal_close(j); work_pool_shutdown(&pool); unlink(save.previous_path); unlink(path); unlink(target);
+    do { CHECK(rmdir(paths[depth])==0); } while(depth--);
+    puts("journal_test: valid 4095-byte BASE retains in bounded recovery directory"); return 0;
+}
+
+
+static bool session_equal(const model *a, const model *b)
+{
+    return a->views==b->views && a->tabs==b->tabs && a->windows==b->windows &&
+        !memcmp(a->view_values,b->view_values,sizeof a->view_values) &&
+        !memcmp(a->view_ids,b->view_ids,sizeof a->view_ids) &&
+        !memcmp(a->tab_ids,b->tab_ids,sizeof a->tab_ids) && a->tab_active==b->tab_active &&
+        a->tab_count==b->tab_count && a->width==b->width && a->height==b->height;
+}
+static void wire64(uint8_t *p, uint64_t v)
+{ for(unsigned k=0;k<8;k++) p[k]=(uint8_t)(v>>(k*8)); }
+static void wire32(uint8_t *p, uint32_t v)
+{ for(unsigned k=0;k<4;k++) p[k]=(uint8_t)(v>>(k*8)); }
+static int session_values_test(void)
+{
+    char path[]="/tmp/journal-session-values-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; journal_io io=fault_io(d);
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    /* Expectations are assigned before encoding, independently of replay. */
+    model expected={.views=2,.tabs=1,.windows=1,
+        .view_values={{79,13,4099,27},{5,93,8187,41}},.view_ids={17,803},
+        .tab_ids={17,803,4099},.tab_active=2,.tab_count=3,.width=1373,.height=911};
+    CHECK(journal_set_view(j,17,&expected.view_values[0])==0);
+    CHECK(journal_set_view(j,803,&expected.view_values[1])==0);
+    CHECK(journal_set_tabs(j,expected.tab_ids,3,2)==0 && journal_set_window(j,1373,911)==0 && journal_flush(j)==0);
+    model actual={0}; journal_replay_result rr;
+    CHECK(cache_replay(path,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));
+    actual=(model){0}; CHECK(durable_replay(d,&actual,&rr)==0 && session_equal(&actual,&expected));
+    uint8_t views[2][32], tabs[40], window[8];
+    for(unsigned i=0;i<2;i++) {
+        wire64(views[i],expected.view_values[i].cursor); wire64(views[i]+8,expected.view_values[i].anchor);
+        wire64(views[i]+16,expected.view_values[i].scroll_byte); wire64(views[i]+24,expected.view_values[i].scroll_x);
+    }
+    wire64(tabs,3); wire64(tabs+8,2); for(unsigned i=0;i<3;i++) wire64(tabs+16+8*i,expected.tab_ids[i]);
+    wire32(window,1373); wire32(window+4,911);
+    journal_record cp[]={{JOURNAL_VIEW,17,0,views[0],32},{JOURNAL_VIEW,803,0,views[1],32},
+        {JOURNAL_TABS,0,0,tabs,40},{JOURNAL_WINDOW,0,0,window,8}};
+    CHECK(journal_rotate(j,cp,4)==0);
+    actual=(model){0}; CHECK(durable_replay(d,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));
+    journal_close(j); actual=(model){0};
+    CHECK(journal_replay_file(path,apply,&actual,&rr)==0 && session_equal(&actual,&expected));
+    uint8_t bytes[4096], mutant[4096]; int fd=open(path,O_RDONLY);
+    CHECK(fd>=0 && read(fd,bytes,sizeof bytes)==sizeof bytes); close(fd);
+    /* Valid-CRC semantic mutants must differ, even though counts/schema match.
+     * Every VIEW field, each tab ID, active index and each dimension is checked. */
+    const size_t offsets[]={32,40,48,56,96,104,112,120,168,176,184,192,232,236};
+    for(size_t k=0;k<sizeof offsets/sizeof offsets[0];k++) {
+        memcpy(mutant,bytes,sizeof mutant); size_t off=offsets[k]; mutant[off]^=(uint8_t)(off==168?2:1);
+        size_t start=off<64?0:off<128?64:off<200?128:200;
+        repair_crc(mutant+start,start<128?64:start==128?72:40);
+        actual=(model){0}; CHECK(journal_replay_bytes(mutant,sizeof mutant,apply,&actual,&rr)==0 && !rr.corrupt);
+        CHECK(actual.views==2 && actual.tabs==1 && actual.windows==1 && !session_equal(&actual,&expected));
+    }
+    work_pool_shutdown(&pool); free(d); unlink(path);
+    puts("journal_test: session values exact after replay/rotation/power image; CRC-valid semantic mutants rejected"); return 0;
+}
+
+typedef struct checkpoint_copy { journal_record records[16]; uint8_t payload[16][4200]; size_t count; } checkpoint_copy;
+static int copy_checkpoint(void *ctx, const journal_record *r)
+{
+    checkpoint_copy *c=ctx;
+    if(c->count==16 || r->size>sizeof c->payload[0]) return 1;
+    size_t i=c->count++; memcpy(c->payload[i],r->data,r->size); c->records[i]=*r; c->records[i].data=c->payload[i];
+    return 0;
+}
+static int check_overlapping_marker(void *ctx, const journal_record *r)
+{
+    if(r->type!=JOURNAL_SAVE) return 0;
+    if(r->buffer_id<1 || r->buffer_id>2) return 1;
+    save_marker_check *expected=ctx;
+    /* Reuse every field of the identity/cutoff oracle, routing by token. */
+    journal_record routed=*r; routed.buffer_id=1;
+    return check_save_marker(&expected[r->buffer_id-1],&routed);
+}
+static int overlapping_markers(const char *path, save_marker_check expected[2])
+{
+    journal_replay_result rr;
+    CHECK(journal_replay_file(path,check_overlapping_marker,expected,&rr)==0);
+    CHECK(expected[0].seen && expected[1].seen && !rr.corrupt); return 0;
+}
+static int replace_fixture(const char *target, const char *text)
+{
+    char temporary[]="/tmp/journal-save-replace-XXXXXX"; int fd=mkstemp(temporary); CHECK(fd>=0);
+    size_t n=strlen(text); CHECK(write(fd,text,n)==(ssize_t)n && fsync(fd)==0); close(fd);
+    CHECK(rename(temporary,target)==0); return 0;
+}
+static int overlapping_saves_test(void)
+{
+    for(unsigned reverse=0;reverse<2;reverse++) {
+        char path[]="/tmp/journal-overlap-XXXXXX", ta[]="/tmp/journal-token-A-XXXXXX", tb[]="/tmp/journal-token-B-XXXXXX";
+        CHECK(temp(path)>=0 && temp(ta)>=0 && temp(tb)>=0);
+        CHECK(replace_fixture(ta,"abc")==0 && replace_fixture(tb,"def")==0);
+        journal_base original[2]; CHECK(journal_capture_base(ta,&original[0])==0 && journal_capture_base(tb,&original[1])==0);
+        uint8_t bases[2][4137], ops[2][9]={{0}}; base_payload(bases[0],&original[0]); base_payload(bases[1],&original[1]);
+        ops[0][0]=3; ops[0][8]='A'; ops[1][0]=3; ops[1][8]='B';
+        journal_record cp[]={{JOURNAL_BASE,1,0,bases[0],41+strlen(ta)},{JOURNAL_INSERT,1,0,ops[0],9},
+            {JOURNAL_BASE,2,0,bases[1],41+strlen(tb)},{JOURNAL_INSERT,2,0,ops[1],9}};
+        work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+        fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; journal_io io=fault_io(d);
+        journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+        journal_save tokens[2]={{0}};
+        CHECK(journal_save_prepare(j,1,&original[0],cp,4,&tokens[0])==0);
+        checkpoint_copy captured={0}; journal_replay_result rr;
+        CHECK(journal_replay_file(path,copy_checkpoint,&captured,&rr)==0 && captured.count==5);
+        char abandoned[3][4097];
+        for(unsigned phase=0;phase<3;phase++) {
+            d->fail_rename=phase<2?(int)phase+1:0;
+            /* retention namespace, temporary-journal setup, publication */
+            d->fail_dir=phase==2?d->dirs+3:0;
+            CHECK(journal_save_prepare(j,2,&original[1],captured.records,captured.count,&tokens[1])==JOURNAL_IO);
+            CHECK(!tokens[1].prepared && tokens[0].prepared);
+            CHECK(access(tokens[0].previous_path,F_OK)==0 && access(tokens[1].previous_path,F_OK)==0);
+            strcpy(abandoned[phase],tokens[1].previous_path);
+            if(phase) {
+                CHECK(journal_get_stats(j).durable_sequence==0);
+                d->fail_dir=0; CHECK(journal_retry(j)==0);
+                save_marker_check failed[2]={{.base=&original[0],.cutoff=4,.phase=1},
+                    {.base=&original[1],.cutoff=5,.phase=1}};
+                CHECK(overlapping_markers(path,failed)==0);
+            }
+            CHECK(verify_two_buffers(path,"abcA","defB")==0);
+        }
+        d->fail_rename=0; d->fail_dir=0;
+        CHECK(journal_save_prepare(j,2,&original[1],captured.records,captured.count,&tokens[1])==0);
+        for(unsigned phase=0;phase<3;phase++) CHECK(unlink(abandoned[phase])==0);
+        save_marker_check markers[2]={{.base=&original[0],.cutoff=tokens[0].sequence,.phase=1},
+            {.base=&original[1],.cutoff=tokens[1].sequence,.phase=1}};
+        CHECK(overlapping_markers(path,markers)==0);
+        CHECK(tokens[0].sequence==4 && tokens[1].sequence==5);
+        CHECK(journal_insert(j,1,4,(const uint8_t *)"!",1)==0 && journal_insert(j,2,4,(const uint8_t *)"?",1)==0 && journal_flush(j)==0);
+        CHECK(verify_two_buffers(path,"abcA!","defB?")==0);
+        journal_base retained[2], saved[2];
+        CHECK(journal_capture_base(tokens[0].previous_path,&retained[0])==0 && journal_capture_base(tokens[1].previous_path,&retained[1])==0);
+        CHECK(replace_fixture(ta,"abcA")==0 && replace_fixture(tb,"defB")==0);
+        CHECK(journal_capture_base(ta,&saved[0])==0 && journal_capture_base(tb,&saved[1])==0);
+        for(unsigned step=0;step<2;step++) {
+            unsigned id=reverse?1-step:step, other=1-id;
+            uint8_t bp[2][4137], deltas[2][10]={{0}}, marker[4153]={0};
+            for(unsigned b=0;b<2;b++) {
+                bool rebased=b==id || !tokens[b].prepared;
+                const journal_base *base=rebased?&saved[b]:&retained[b]; base_payload(bp[b],base);
+                deltas[b][0]=rebased?4:3;
+                if(rebased) deltas[b][8]=b?'?':'!';
+                else { deltas[b][8]=b?'B':'A'; deltas[b][9]=b?'?':'!'; }
+            }
+            const journal_base *other_target=tokens[other].prepared?&original[other]:&saved[other];
+            wire64(marker,tokens[other].sequence); wire32(marker+8,tokens[other].prepared?1:2); base_payload(marker+16,other_target);
+            journal_record finish[]={{JOURNAL_BASE,1,0,bp[0],41+strlen((const char *)bp[0]+40)},
+                {JOURNAL_INSERT,1,0,deltas[0],tokens[0].prepared && id!=0?10:9},
+                {JOURNAL_BASE,2,0,bp[1],41+strlen((const char *)bp[1]+40)},
+                {JOURNAL_INSERT,2,0,deltas[1],tokens[1].prepared && id!=1?10:9},
+                {JOURNAL_SAVE,other+1,0,marker,57+strlen(other_target->path)}};
+            d->fail_rename=1;
+            CHECK(journal_save_finish(j,&tokens[id],&saved[id],finish,5)==JOURNAL_IO);
+            CHECK(access(tokens[id].previous_path,F_OK)==0);
+            if(tokens[other].prepared) CHECK(access(tokens[other].previous_path,F_OK)==0);
+            CHECK(verify_two_buffers(path,"abcA!","defB?")==0);
+            d->fail_rename=2;
+            CHECK(journal_save_finish(j,&tokens[id],&saved[id],finish,5)==JOURNAL_IO);
+            CHECK(tokens[id].prepared && access(tokens[id].previous_path,F_OK)==0 && journal_get_stats(j).durable_sequence==0);
+            CHECK(journal_retry(j)==0); d->fail_rename=0;
+            /* Retiring this token must leave the other prepared BASE intact,
+             * even when the retirement's namespace barrier fails. */
+            d->fail_dir=d->dirs+3;
+            CHECK(journal_save_finish(j,&tokens[id],&saved[id],finish,5)==JOURNAL_IO);
+            CHECK(tokens[id].prepared && access(tokens[id].previous_path,F_OK)!=0);
+            if(tokens[other].prepared) CHECK(access(tokens[other].previous_path,F_OK)==0);
+            CHECK(verify_two_buffers(path,"abcA!","defB?")==0);
+            d->fail_dir=0;
+            CHECK(journal_save_finish(j,&tokens[id],&saved[id],finish,5)==0 && !tokens[id].prepared);
+            markers[0]=(save_marker_check){.base=tokens[0].prepared?&original[0]:&saved[0],.cutoff=tokens[0].sequence,.phase=tokens[0].prepared?1:2};
+            markers[1]=(save_marker_check){.base=tokens[1].prepared?&original[1]:&saved[1],.cutoff=tokens[1].sequence,.phase=tokens[1].prepared?1:2};
+            CHECK(overlapping_markers(path,markers)==0);
+        }
+        journal_close(j); /* recovery has no live save token */
+        CHECK(verify_two_buffers(path,"abcA!","defB?")==0);
+        work_pool_shutdown(&pool); free(d); unlink(path); unlink(ta); unlink(tb);
+    }
+    puts("journal_test: overlapping saves preserve both targets/cutoffs/deltas in both finish orders and publication/retirement failures"); return 0;
+}
+
+/* Diagnostic-only contract probes. A fix requires the caller/work integration
+ * changes proposed in P1.9h; these intentionally remain red until that bead. */
+static uint64_t monotonic_ns(void)
+{ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
+/* CPU-only necessary condition for a large UI slice. This opt-in probe does
+ * not assert a wall-time pwrite bound. Setup, flush and the independent wire
+ * oracle remain outside the measured call. */
+static int crc_cpu_test(void)
+{
+    char path[]="/tmp/journal-crc-cpu-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    size_t size=1000000; uint8_t *bytes=malloc(size); CHECK(bytes);
+    for(size_t i=0;i<size;i++) bytes[i]=(uint8_t)(i*17u);
+    uint64_t samples[9];
+    for(unsigned i=0;i<9;i++) {
+        journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+        struct timespec begin,end;
+        CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begin)==0);
+        CHECK(journal_insert(j,1,0,bytes,size)==0);
+        CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&end)==0);
+        samples[i]=(uint64_t)end.tv_sec*1000000000u+(uint64_t)end.tv_nsec-
+            ((uint64_t)begin.tv_sec*1000000000u+(uint64_t)begin.tv_nsec);
+        journal_close(j); CHECK(truncate(path,0)==0);
+    }
+    for(unsigned i=1;i<9;i++) for(unsigned k=i;k && samples[k]<samples[k-1];k--) {
+        uint64_t value=samples[k]; samples[k]=samples[k-1]; samples[k-1]=value;
+    }
+    work_pool_shutdown(&pool); free(bytes); unlink(path);
+    printf("journal_test: CRC/encode/write CPU p50_ns=%llu (M) UI_slice_ns=500000 (G) wall_time_unbounded=1\n",
+        (unsigned long long)samples[4]);
+    CHECK(samples[4]<=500000); return 0;
+}
+typedef struct slice_replay {
+    const uint8_t *expected;
+    size_t size, copied, records;
+} slice_replay;
+static int restore_slice(void *ctx, const journal_record *r)
+{
+    slice_replay *s=ctx;
+    if(r->type!=JOURNAL_INSERT || r->buffer_id!=17 || r->size<8) return 1;
+    size_t n=r->size-8;
+    if(get64(r->data)!=s->copied || n>s->size-s->copied ||
+       memcmp(r->data+8,s->expected+s->copied,n)) return 1;
+    s->copied+=n; s->records++; return 0;
+}
+static int insert_steps_test(void)
+{
+    char path[]="/tmp/journal-insert-steps-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    append_fault f={.owner=pthread_self()}; journal_io io={.ctx=&f,.append_write=append_attempt};
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    size_t size=1000000, progress=0; uint8_t *bytes=malloc(size); CHECK(bytes);
+    for(size_t i=0;i<size;i++) bytes[i]=(uint8_t)(i*17u);
+    unsigned steps=0;
+    while(progress<size) {
+        size_t before=progress; unsigned attempts=f.attempts;
+        edit_malloc_guard_begin();
+        int rc=journal_insert_step(j,17,0,bytes,size,&progress);
+        size_t allocations=edit_malloc_guard_end();
+        if(progress==before) {
+            CHECK(rc==JOURNAL_BUSY && allocations==0 && f.attempts==attempts);
+            CHECK(journal_flush(j)==0); continue;
+        }
+        CHECK(progress>before && progress-before<=JOURNAL_INSERT_SLICE_BYTES);
+        CHECK(rc==(progress<size?JOURNAL_BUSY:JOURNAL_OK) && allocations==0 && f.attempts==attempts+1);
+        /* Independent page-cache image, before any pump: each completed slice
+         * already restores the scripted prefix. No reliance on accepted stats. */
+        int fd=open(path,O_RDONLY); CHECK(fd>=0); struct stat sb; CHECK(fstat(fd,&sb)==0);
+        uint8_t *wire=malloc((size_t)sb.st_size); CHECK(wire);
+        CHECK(read(fd,wire,(size_t)sb.st_size)==sb.st_size); close(fd);
+        slice_replay restored={bytes,progress,0,0}; journal_replay_result rr;
+        CHECK(journal_replay_bytes(wire,(size_t)sb.st_size,restore_slice,&restored,&rr)==0 && !rr.corrupt && restored.copied==progress);
+        CHECK(restored.records==++steps && rr.records==steps); free(wire);
+    }
+    CHECK(!f.wrong_thread && !f.syncs && !f.worker_writes);
+    unsigned attempts=f.attempts;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&progress)==0 && f.attempts==attempts);
+    size_t invalid=size+1;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&invalid)==JOURNAL_INVALID && invalid==size+1);
+    CHECK(journal_insert_step(j,17,UINT64_MAX,bytes,size,&progress)==JOURNAL_INVALID);
+    CHECK(journal_insert_step(j,17,0,bytes,size,NULL)==JOURNAL_INVALID);
+    CHECK(journal_flush(j)==0); journal_close(j);
+    CHECK(truncate(path,0)==0);
+    journal_options opt={.batch_bytes=8192}; f=(append_fault){.owner=pthread_self(),.error=EAGAIN};
+    CHECK(journal_open_with_io(&j,path,&pool,&opt,&io)==0); progress=0;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&progress)==JOURNAL_IO && progress==8192-72);
+    CHECK(f.attempts==1 && journal_get_stats(j).accepted_sequence==1);
+    size_t retained=progress;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&progress)==JOURNAL_IO && progress==retained && f.attempts==1);
+    f.error=0; CHECK(journal_retry(j)==0 && journal_flush(j)==0);
+    journal_close(j); CHECK(truncate(path,0)==0);
+    opt.sync_bytes=4096; opt.max_file_bytes=4096; f=(append_fault){.owner=pthread_self()};
+    CHECK(journal_open_with_io(&j,path,&pool,&opt,&io)==0); progress=0;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&progress)==JOURNAL_BUSY && progress==4096-72);
+    CHECK(journal_flush(j)==0); retained=progress;
+    CHECK(journal_insert_step(j,17,0,bytes,size,&progress)==JOURNAL_FULL && progress==retained);
+    journal_close(j); work_pool_shutdown(&pool); free(bytes); unlink(path);
+    puts("journal_test: insert continuations bound one record/step, protect every prefix, retain IO progress, allocate zero bytes");
+    return 0;
+}
+static int bulk_loss_repro(void)
+{
+    char path[]="/tmp/journal-bulk-loss-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; journal_io io=fault_io(d);
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    work_handle blocker=work_submit(&pool,(work_job){blocked,NULL,0,WORK_BULK}); CHECK(blocker.epoch);
+    uint8_t *bytes=malloc(800000); CHECK(bytes); memset(bytes,'q',800000);
+    CHECK(journal_insert(j,1,0,bytes,800000)==0 && journal_pump(j,monotonic_ns(),true)==0);
+    CHECK(journal_insert(j,1,800000,bytes,800000)==0);
+    journal_replay_result rr; model restored={0}; CHECK(durable_replay(d,&restored,&rr)==0);
+    uint64_t unprotected=journal_get_stats(j).file_bytes-rr.valid_bytes;
+    work_cancel(&pool,blocker);
+    /* Complete cleanup without overflowing the small durable-image fixture. */
+    CHECK(journal_set_io(j,NULL)==JOURNAL_BUSY);
+    journal_close(j); work_pool_shutdown(&pool); free(bytes); free(d); unlink(path);
+    printf("journal_test: bulk-loss repro unprotected_bytes=%llu (M) limit=65536 (G) durable_records=%llu\n",
+        (unsigned long long)unprotected,(unsigned long long)rr.records);
+    CHECK(unprotected<=JOURNAL_DEFAULT_SYNC_BYTES);
+    return 0;
+}
+static int insert_credit_test(void)
+{
+    char path[]="/tmp/journal-insert-credit-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    fault_disk *d=calloc(1,sizeof *d); CHECK(d); d->path=path; journal_io io=fault_io(d);
+    journal *j; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    work_handle blocker=work_submit(&pool,(work_job){blocked,NULL,0,WORK_BULK}); CHECK(blocker.epoch);
+    uint8_t bytes[100000]; for(size_t i=0;i<sizeof bytes;i++) bytes[i]=(uint8_t)(i*19u);
+    size_t progress=0;
+    for(unsigned i=0;i<16 && progress<sizeof bytes;i++) {
+        size_t before=progress;
+        int rc=journal_insert_step(j,17,0,bytes,sizeof bytes,&progress);
+        CHECK(rc==JOURNAL_BUSY || rc==0);
+        journal_stats st=journal_get_stats(j);
+        struct stat sb; CHECK(stat(path,&sb)==0);
+        CHECK(st.unprotected_bytes==(uint64_t)sb.st_size && st.durable_bytes==0);
+        if(progress==before) break;
+    }
+    CHECK(progress>0 && progress<sizeof bytes);
+    CHECK(journal_pump(j,1,true)==0);
+    size_t stopped=progress;
+    edit_malloc_guard_begin();
+    for(unsigned i=0;i<1000;i++) {
+        CHECK(journal_insert_step(j,17,0,bytes,sizeof bytes,&progress)==JOURNAL_BUSY && progress==stopped);
+        CHECK(journal_get_stats(j).unprotected_bytes<=JOURNAL_DEFAULT_SYNC_BYTES);
+    }
+    CHECK(edit_malloc_guard_end()==0);
+    journal_replay_result rr; CHECK(journal_replay_bytes(NULL,0,NULL,NULL,&rr)==0);
+    disk_image *image=NULL;
+    for(size_t i=0;i<d->images;i++) if(d->image[i].inode==d->durable_name) image=&d->image[i];
+    CHECK(!image || image->size==0); /* power image remains empty behind bulk */
+    work_cancel(&pool,blocker); CHECK(journal_flush(j)==0);
+    journal_stats synced=journal_get_stats(j);
+    CHECK(synced.unprotected_bytes==0 && synced.durable_bytes==synced.file_bytes);
+    while(progress<sizeof bytes) {
+        size_t before=progress;
+        int rc=journal_insert_step(j,17,0,bytes,sizeof bytes,&progress);
+        CHECK(rc==0 || rc==JOURNAL_BUSY);
+        CHECK(journal_get_stats(j).unprotected_bytes<=JOURNAL_DEFAULT_SYNC_BYTES);
+        if(progress==before) CHECK(journal_flush(j)==0);
+    }
+    CHECK(journal_flush(j)==0);
+    image=NULL;
+    for(size_t i=0;i<d->images;i++) if(d->image[i].inode==d->durable_name) image=&d->image[i];
+    CHECK(image);
+    slice_replay restored={bytes,sizeof bytes,0,0};
+    CHECK(journal_replay_bytes(image->bytes,image->size,restore_slice,&restored,&rr)==0 && !rr.corrupt && restored.copied==sizeof bytes);
+    journal_close(j); work_pool_shutdown(&pool); free(d); unlink(path);
+    puts("journal_test: insert credit counts UI cache bytes, bounds blocked-worker loss including PAD, resumes after durable fence"); return 0;
+}
+static ssize_t slow_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    (void)ctx; struct timespec stalled={0,20000000}; nanosleep(&stalled,NULL);
+    return pwrite(fd,p,n,(off_t)off);
+}
+static int append_bound_repro(void)
+{
+    char path[]="/tmp/journal-syscall-bound-XXXXXX"; CHECK(temp(path)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j;
+    journal_io io={.append_write=slow_append}; CHECK(journal_open_with_io(&j,path,&pool,NULL,&io)==0);
+    uint64_t begin=monotonic_ns(); CHECK(journal_insert(j,1,0,(const uint8_t *)"a",1)==0);
+    uint64_t elapsed=monotonic_ns()-begin;
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    printf("journal_test: append-bound repro elapsed_ns=%llu (M) UI_slice_ns=500000 (G) attempts=1\n",(unsigned long long)elapsed);
+    CHECK(elapsed<=500000); return 0;
+}
+typedef struct timed_blocker { _Atomic uint64_t until; } timed_blocker;
+static void timed_bulk(work_ctx *ctx)
+{
+    timed_blocker *b=ctx->arg;
+    while(!work_should_stop(ctx) && monotonic_ns()<atomic_load(&b->until)) pause_ms();
+}
+static int save_ack_repro(void)
+{
+    char path[]="/tmp/journal-save-ack-XXXXXX", target[]="/tmp/journal-save-ack-base-XXXXXX";
+    CHECK(temp(path)>=0 && temp(target)>=0);
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    journal_base b; CHECK(journal_capture_base(target,&b)==0); uint8_t payload[4137]; base_payload(payload,&b);
+    journal_record cp={JOURNAL_BASE,1,0,payload,41+strlen(b.path)}; journal_save save={0};
+    uint64_t begin=monotonic_ns(); timed_blocker blocker; atomic_init(&blocker.until,begin+200000000);
+    work_handle handle=work_submit(&pool,(work_job){timed_bulk,&blocker,0,WORK_BULK}); CHECK(handle.epoch);
+    CHECK(journal_save_prepare(j,1,&b,&cp,1,&save)==0);
+    uint64_t elapsed=monotonic_ns()-begin;
+    journal_close(j); work_pool_shutdown(&pool); unlink(save.previous_path); unlink(path); unlink(target);
+    printf("journal_test: save-ack repro elapsed_ns=%llu (M) G8s_p99_ns=5000000 (G)\n",(unsigned long long)elapsed);
+    CHECK(elapsed<=5000000); return 0;
+}
 int main(int argc, char **argv)
 {
     if(argc==2) {
+        if(!strcmp(argv[1],"--crc-wire")) return crc_wire_test();
+        if(!strcmp(argv[1],"--crc-cpu")) return crc_cpu_test();
+        if(!strcmp(argv[1],"--insert-steps")) return insert_steps_test();
+        if(!strcmp(argv[1],"--insert-credit")) return insert_credit_test();
+        if(!strcmp(argv[1],"--bulk-loss-repro")) return bulk_loss_repro();
+        if(!strcmp(argv[1],"--append-bound-repro")) return append_bound_repro();
+        if(!strcmp(argv[1],"--save-ack-repro")) return save_ack_repro();
+        if(!strcmp(argv[1],"--overlapping-saves")) return overlapping_saves_test();
+        if(!strcmp(argv[1],"--session-values")) return session_values_test();
+        if(!strcmp(argv[1],"--writeback-loss")) return writeback_loss_test();
+        if(!strcmp(argv[1],"--retention-metadata")) return retention_metadata_test();
+        if(!strcmp(argv[1],"--retention-channel")) return retention_channel_test();
+        if(!strcmp(argv[1],"--pad-busy")) return pad_busy_test();
+        if(!strcmp(argv[1],"--long-base")) return long_base_retention_test();
         if(!strcmp(argv[1],"--page-cache")) return page_cache_test();
         if(!strcmp(argv[1],"--append-failure")) return append_failure_test();
         if(!strcmp(argv[1],"--append-gap")) return append_gap_test();
@@ -1220,6 +1850,8 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--retained-copy")) return retained_copy_test();
         return 2;
     }
+    CHECK(insert_credit_test()==0 && insert_steps_test()==0 && crc_wire_test()==0 && overlapping_saves_test()==0 && session_values_test()==0);
+    CHECK(writeback_loss_test()==0 && retention_metadata_test()==0 && retention_channel_test()==0 && pad_busy_test()==0 && long_base_retention_test()==0);
     CHECK(page_cache_test()==0 && append_failure_test()==0 && append_gap_test()==0);
     CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);

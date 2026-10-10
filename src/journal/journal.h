@@ -14,6 +14,7 @@
 #define JOURNAL_DEFAULT_FILE_BYTES 67108864ull
 #define JOURNAL_DEFAULT_SYNC_BYTES 65536ull
 #define JOURNAL_DEFAULT_SYNC_NS 1000000000ull
+#define JOURNAL_INSERT_SLICE_BYTES 16384u
 
 typedef enum journal_error {
     JOURNAL_OK = 0, JOURNAL_IO, JOURNAL_INVALID, JOURNAL_FULL,
@@ -65,14 +66,18 @@ typedef struct journal_stats {
     uint64_t file_limit_bytes, checkpoint_bytes, queue_bytes;
     uint64_t pending_bytes;    /* bytes retained in the two UI/worker batches */
     int append_errno;          /* sticky UI-write errno; short/zero write => EIO */
+    uint64_t durable_bytes;    /* complete wire prefix covered by data + name barriers */
+    uint64_t unprotected_bytes;/* actual page-cache file extent beyond that prefix */
 } journal_stats;
 typedef struct journal journal;
 /* Optional per-instance syscall seam; callbacks have POSIX return/errno semantics.
- * sync receives directory=true for namespace barriers, false for data barriers.
+ * sync receives directory=true for namespace barriers, false for fdatasync.
+ * metadata_sync is a separate full-inode fsync barrier for retained BASEs.
  * NULL callbacks use real syscalls; contexts must outlive all jobs, including
  * retained-base and temporary checkpoint jobs. A write hook selects the bounded
  * retained-base copy fallback instead of reflinking. Set only with no active
- * worker. write/read/sync/rename remain off path; append_write runs on the UI
+ * worker or retention operation. write/read/sync/metadata_sync/rename remain
+ * off path; append_write runs on the UI
  * owner and must make one attempt without allocation or retry. Its ctx can be
  * used concurrently by the worker's other hooks. open_with_io also covers the
  * creation-directory barrier. */
@@ -85,6 +90,9 @@ typedef struct journal_io {
     /* Single UI-side positioned write attempt; NULL uses pwrite. Separate from
      * worker/copy write so fault tests can distinguish thread ownership. */
     ssize_t (*append_write)(void *, int, const uint8_t *, size_t, uint64_t);
+    /* Full inode metadata barrier for identities containing exact mtime.
+     * NULL uses fsync; distinct from the fdatasync data hook above. */
+    int (*metadata_sync)(void *, int);
 } journal_io;
 /* Zero-initialize each save token. Its sequence is the saved snapshot cutoff
  * in the PREPARED checkpoint generation (checkpoint record count). */
@@ -96,9 +104,12 @@ typedef struct journal_save {
 int journal_open_with_io(journal **out, const char *path, work_pool *pool,
                          const journal_options *options, const journal_io *io);
 int journal_set_io(journal *j, const journal_io *io);
-/* Off-path, after receive returns worker ownership. Clear sticky UI/worker IO,
- * retaining exact batch progress and both buffers; subsequent pump/flush retries
- * the failed batch first. Repeats a failed checkpoint-directory barrier BEFORE
+/* Off-path, after receive returns worker ownership. Clear sticky UI/partial-write
+ * IO, retaining exact progress and both buffers; pump/flush retries the failed
+ * append first. A failed fdatasync returns IO here: failed writeback can lose
+ * previously released unsynced batches. Require a COMPLETE CURRENT-session
+ * journal_rotate into a fresh inode before acknowledging or accepting more.
+ * Repeats a failed checkpoint-directory barrier BEFORE
  * permitting new writes/acks. FULL suspension is preserved. After clearing a
  * UI short-write error before drain, append returns BUSY until pump/receive has
  * filled the prefix gap; never retry the edit that was already queued. */
@@ -108,10 +119,12 @@ int journal_retry(journal *j);
  *    matching previous BASE for id and all state/edits for every other buffer.
  * 2. save_prepare flushes, retains the previous bytes in a private reflink or
  *    bounded worker copy, validates the source across retention, syncs the new
- *    inode and its directory,
+ *    inode (full fsync, including identity mtime) and its directory,
  *    substitutes every BASE matching that named identity/path, adds a SAVE
  *    marker with the saved cutoff,
- *    durably rotates. Named previous paths must be absolute (file_path works).
+ *    durably rotates. Artifacts live in the journal directory, or its nearest
+ *    existing ancestor with sufficient path space; cross-device reflinks fall
+ *    back to copying. Named previous paths must be absolute (file_path works).
  * 3. Without intervening UI mutation, call file_save_begin on the same tree;
  *    it takes the snapshot. Appends may continue after it returns. Its return
  *    acknowledges enqueue only; route FILE_MSG_SAVE_DONE and require FILE_OK.
@@ -172,6 +185,26 @@ int journal_append(journal *j, uint32_t type, uint64_t id,
  * Existing backlog can still suspend recovery; caller surfaces FULL. */
 int journal_insert(journal *j, uint64_t id, uint64_t off,
                    const uint8_t *bytes, size_t size);
+/* Caller-driven large-insert continuation. Initialize *progress to zero; keep
+ * bytes/size/id/off stable and immutable until finished. Each call encodes and
+ * attempts ONE record of at most JOURNAL_INSERT_SLICE_BYTES payload bytes (or
+ * the smaller configured batch capacity). BUSY with advanced progress means
+ * a protected prefix and more work: check input before calling again. BUSY
+ * without progress means a transport gap or insufficient durability credit;
+ * force pump/receive outside the typing path, then resume. A step reserves
+ * its eventual PAD and refuses to exceed configured sync_bytes beyond the last
+ * received COMPLETE durable record boundary. This byte bound requires all
+ * intervening append calls to use this interface; legacy appends can exceed it.
+ * Worker/device delays still prevent a wall-clock power-loss bound.
+ * OK means the entire requested prefix is in page cache. On IO, progress also
+ * includes this call's RAM-retained record; suspend completion and drain/retry
+ * off path, never reappend that prefix. FULL accepts none of this step; earlier
+ * successful steps remain accepted. The caller owns mutation/checkpoint order
+ * and publishes full-edit completion only after all steps are protected.
+ * Zero size / already complete progress is a no-op. No allocation, lock,
+ * wait, sync or submission. Bytes/attempts bound CPU work, NOT syscall wall time. */
+int journal_insert_step(journal *j, uint64_t id, uint64_t off,
+                        const uint8_t *bytes, size_t size, size_t *progress);
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len);
 int journal_set_base(journal *j, uint64_t id, const journal_base *base);
 int journal_set_view(journal *j, uint64_t id, const journal_view *view);
@@ -194,7 +227,8 @@ journal_stats journal_get_stats(const journal *j);
 void journal_set_message_handler(journal *j,
                                  void (*handler)(const work_msg *, void *), void *ctx);
 /* Drain accepted records, then return sticky UI IO or FULL while suspended.
- * Worker/directory IO may require journal_retry before drain can continue.
+ * Partial-write/directory IO may require journal_retry before drain continues.
+ * fdatasync IO requires a complete fresh-inode journal_rotate instead.
  * Clean exit: on FULL build/rotate a complete CURRENT checkpoint, require OK
  * from flush, then close. IO takes precedence over FULL. */
 int journal_flush(journal *j); /* blocking; setup/save/exit only */

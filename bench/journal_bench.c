@@ -6,12 +6,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Component TRACK only: input/layout/render and real index/find integration
- * belong to the whole-editor G1/G9 runs. All journals use NULL/default options. */
+/* Default GATE enforces component ceilings; explicit --track is diagnostic.
+ * Input/layout/render and real index/find integration belong to the
+ * whole-editor G1/G9 runs. All journals use NULL/default options. */
 #define SESSION_EDITS 100000u
 #define TEXT_CAP 16384u
 #define BULK_MESSAGE 0x4a424c4bu
 #define REQUIRE(x) do { if(!(x)) { fprintf(stderr,"journal_bench:%d FAIL %s\n",__LINE__,#x); return 1; } } while(0)
+static unsigned append_misses(bench_samples *samples)
+{ return bench_p99(samples)>20000 || samples->dropped?1u:0u; }
+static unsigned paste_misses(bench_samples *samples)
+{ return bench_p50(samples)>5000000 || bench_p99(samples)>15000000 || samples->dropped?1u:0u; }
 static void nap(void) { struct timespec t={0,1000000}; nanosleep(&t,NULL); }
 static int temporary(char *path) { int fd=mkstemp(path); if(fd>=0) close(fd); return fd; }
 static void stamp(const char *row)
@@ -61,12 +66,25 @@ static void competing(work_ctx *ctx)
     while(!work_should_stop(ctx) && !work_publish(ctx,&msg)) nap();
 }
 typedef struct text_model { uint8_t bytes[TEXT_CAP]; size_t size; } text_model;
-typedef struct restored { piece_tree *trees[2]; unsigned bases, views, tabs, windows; uint64_t edits; } restored;
+typedef struct restored { piece_tree *trees[2]; unsigned bases, views, tabs, windows; uint64_t edits;
+    journal_view view[2]; uint64_t tab_ids[2], tab_active; uint32_t width, height;
+} restored;
+static uint64_t read64(const uint8_t *p)
+{ uint64_t value=0; for(unsigned k=0;k<8;k++) value|=(uint64_t)p[k]<<(8*k); return value; }
+static uint32_t read32(const uint8_t *p)
+{ uint32_t value=0; for(unsigned k=0;k<4;k++) value|=(uint32_t)p[k]<<(8*k); return value; }
+
 static int restore(void *ctx, const journal_record *r)
 {
     restored *c=ctx;
-    if(r->type==JOURNAL_TABS) { c->tabs++; return 0; }
-    if(r->type==JOURNAL_WINDOW) { c->windows++; return 0; }
+    if(r->type==JOURNAL_TABS) {
+        if(read64(r->data)!=2) return 1;
+        c->tab_active=read64(r->data+8); c->tab_ids[0]=read64(r->data+16); c->tab_ids[1]=read64(r->data+24);
+        c->tabs++; return 0;
+    }
+    if(r->type==JOURNAL_WINDOW) {
+        c->width=read32(r->data); c->height=read32(r->data+4); c->windows++; return 0;
+    }
     if(r->buffer_id<1 || r->buffer_id>2) return 1;
     piece_tree *tree=c->trees[r->buffer_id-1];
     if(r->type==JOURNAL_BASE) {
@@ -76,10 +94,13 @@ static int restore(void *ctx, const journal_record *r)
         uint8_t data[TEXT_CAP]; ssize_t n=read(fd,data,(size_t)b.size); close(fd);
         return n==(ssize_t)b.size?piece_init_copy(tree,data,(size_t)b.size):1;
     }
-    if(r->type==JOURNAL_VIEW) { c->views++; return 0; }
+    if(r->type==JOURNAL_VIEW) {
+        c->view[r->buffer_id-1]=(journal_view){read64(r->data),read64(r->data+8),read64(r->data+16),read64(r->data+24)};
+        c->views++; return 0;
+    }
     int rc=journal_apply_piece(tree,r); if(!rc) c->edits++; return rc;
 }
-static int session(work_pool *pool, size_t payload, bool contention)
+static int session(work_pool *pool, size_t payload, bool contention, unsigned *misses)
 {
     char tag[128];
     stamp(payload==1?"session_1B":"session_1KiB");
@@ -134,13 +155,14 @@ static int session(work_pool *pool, size_t payload, bool contention)
          * blocking flush between keys; pump runs at the normal timer tick. */
         if(i%64==63) nap();
     }
-    REQUIRE(journal_set_view(j,1,&(journal_view){.cursor=expected[0].size})==0);
-    REQUIRE(journal_set_view(j,2,&(journal_view){.cursor=expected[1].size})==0);
+    journal_view views[2]={{expected[0].size,13,4099,27},{5,expected[1].size,8187,41}};
+    REQUIRE(journal_set_view(j,1,&views[0])==0 && journal_set_view(j,2,&views[1])==0);
     uint64_t ids[]={1,2}; REQUIRE(journal_set_tabs(j,ids,2,1)==0 && journal_set_window(j,1280,720)==0);
     REQUIRE(journal_flush(j)==0);
     while(r.bulk_done<submitted) { work_mailbox_drain(pool,route,&r); nap(); }
     REQUIRE(!r.bulk_error); journal_stats st=journal_get_stats(j); journal_close(j);
     uint64_t p50=bench_p50(&s), p99=bench_p99(&s);
+    *misses+=append_misses(&s);
     printf("TRACK journal_append payload=%zu edits=%u p50_ns=%llu p99_ns=%llu gate_p99_ns=20000_(G) within_gate=%d ui_page_cache_write=1 timer_ms=5 final_flush=1 bulk_jobs=%u bulk=index_scan/find_scan/save_write_standins (M)%s\n",
         payload,SESSION_EDITS,(unsigned long long)p50,(unsigned long long)p99,p99<=20000?1:0,submitted,evidence(tag,sizeof tag));
     printf("TRACK journal_backpressure payload=%zu delivery_pauses=%u total_pause_ms=%.3f max_pause_ms=%.3f measured_enqueue_excludes_delivery_wait=1 (M)%s\n",payload,pauses,(double)pause_ns/1e6,(double)max_pause_ns/1e6,evidence(tag,sizeof tag));
@@ -150,6 +172,9 @@ static int session(work_pool *pool, size_t payload, bool contention)
         uint8_t text[TEXT_CAP]; REQUIRE(piece_len(c.trees[id])==expected[id].size && piece_read(c.trees[id],0,text,expected[id].size)==0 && !memcmp(text,expected[id].bytes,expected[id].size)); piece_destroy(c.trees[id]);
     }
     REQUIRE(!rr.corrupt && c.edits==SESSION_EDITS && c.bases==2 && c.views==2 && c.tabs==1 && c.windows==1);
+    for(unsigned id=0;id<2;id++) REQUIRE(c.view[id].cursor==views[id].cursor && c.view[id].anchor==views[id].anchor &&
+        c.view[id].scroll_byte==views[id].scroll_byte && c.view[id].scroll_x==views[id].scroll_x);
+    REQUIRE(c.tab_ids[0]==1 && c.tab_ids[1]==2 && c.tab_active==1 && c.width==1280 && c.height==720);
     printf("TRACK journal_replay payload=%zu edits=%llu records=%llu wire_MB_s=%.2f inserted_payload_MB_s=%.2f records_s=%.0f wire_bytes=%llu inserted_bytes=%llu deleted_bytes=%llu content_verified=1 base_load=1 buffers=2 session_restored=1 (M)%s\n",
         payload,(unsigned long long)c.edits,(unsigned long long)rr.records,(double)st.file_bytes*1000.0/(double)elapsed,(double)inserted*1000.0/(double)elapsed,(double)rr.records*1e9/(double)elapsed,
         (unsigned long long)st.file_bytes,(unsigned long long)inserted,(unsigned long long)removed,evidence(tag,sizeof tag));
@@ -163,7 +188,7 @@ static int restore_paste(void *ctx, const journal_record *r)
     if(r->type!=JOURNAL_INSERT || r->size-8>c->size-c->copied || memcmp(c->bytes+c->copied,r->data+8,r->size-8)) return 1;
     int rc=journal_apply_piece(c->tree,r); c->copied+=r->size-8; return rc;
 }
-static int paste(work_pool *pool, unsigned requests)
+static int paste(work_pool *pool, unsigned requests, unsigned *misses)
 {
     char tag[128];
     stamp("paste_1MB"); size_t n=1000000; uint8_t *bytes=malloc(n); REQUIRE(bytes);
@@ -180,8 +205,9 @@ static int paste(work_pool *pool, unsigned requests)
         for(size_t off=0;off<n;off+=sizeof text) { size_t k=n-off; if(k>sizeof text) k=sizeof text; REQUIRE(piece_read(c.tree,off,text,k)==0 && !memcmp(text,bytes+off,k)); }
         piece_destroy(c.tree); unlink(path);
     }
-    printf("TRACK journal_paste bytes=%zu requests=%u p50_ms=%.3f p99_ms=%.3f allocations=0 guard=%s content_verified=1 endpoint=journal_enqueue G9_full_frame_ms=5/15_(G)_unmeasured (M)%s\n",
-        n,requests,(double)bench_p50(&s)/1e6,(double)bench_p99(&s)/1e6,edit_malloc_guard_active()?"active":"inactive",evidence(tag,sizeof tag));
+    unsigned failures=paste_misses(&s); *misses+=failures;
+    printf("TRACK journal_paste bytes=%zu requests=%u p50_ms=%.3f p99_ms=%.3f component_ceiling_ms=5/15_(G) within_gate=%d allocations=0 guard=%s content_verified=1 endpoint=journal_enqueue G9_full_frame_ms=5/15_(G)_unmeasured (M)%s\n",
+        n,requests,(double)bench_p50(&s)/1e6,(double)bench_p99(&s)/1e6,failures?0:1,edit_malloc_guard_active()?"active":"inactive",evidence(tag,sizeof tag));
     free(bytes); return 0;
 }
 static uint64_t worker_cpu_ns(clockid_t clk)
@@ -203,6 +229,54 @@ static int worker_cpu(work_pool *pool)
     printf("TRACK journal_worker_cpu syncs=%u cpu_us_per_sync=%.3f undrained_50ms_cpu_us_per_sync=%.3f worker_return=1 (M)%s\n",
         syncs,(double)(worker_cpu_ns(clk)-before)/(1000.0*syncs),(double)parked_cpu/(1000.0*syncs),evidence(tag,sizeof tag));
     journal_close(j); unlink(path); return 0;
+}
+/* TRACK comparison: alternate adjacent variants on the same loaded box.
+ * Sum enqueue calls separately from the continuation's off-path fence waits;
+ * neither endpoint includes editor mutation/layout/submit. */
+static int insert_variants(work_pool *pool)
+{
+    stamp("insert_variants"); char tag[128];
+    size_t size=1000000; uint8_t *bytes=malloc(size); REQUIRE(bytes);
+    for(size_t i=0;i<size;i++) bytes[i]=(uint8_t)(i*17u);
+    uint64_t totals[2][16], calls[2048], completion[2][16];
+    bench_samples total[2], complete[2], steps;
+    for(unsigned v=0;v<2;v++) {
+        bench_samples_init(&total[v],totals[v],16);
+        bench_samples_init(&complete[v],completion[v],16);
+    }
+    bench_samples_init(&steps,calls,2048);
+    for(unsigned pair=0;pair<16;pair++) for(unsigned order=0;order<2;order++) {
+        unsigned variant=(pair+order)%2;
+        char path[]="/tmp/journal-variant-bench-XXXXXX"; REQUIRE(temporary(path)>=0);
+        journal *j; REQUIRE(journal_open(&j,path,pool,NULL)==0);
+        size_t progress=0; uint64_t cpu_calls=0, start=bench_now_ns();
+        if(!variant) {
+            int rc; edit_malloc_guard_begin(); uint64_t before=bench_now_ns();
+            rc=journal_insert(j,1,0,bytes,size); cpu_calls=bench_now_ns()-before;
+            REQUIRE(edit_malloc_guard_end()==0 && rc==0); progress=size;
+        } else while(progress<size) {
+            size_t before_progress=progress;
+            edit_malloc_guard_begin(); uint64_t before=bench_now_ns();
+            int rc=journal_insert_step(j,1,0,bytes,size,&progress);
+            uint64_t elapsed=bench_now_ns()-before;
+            REQUIRE(edit_malloc_guard_end()==0 && (rc==0 || rc==JOURNAL_BUSY));
+            (void)bench_add(&steps,elapsed); cpu_calls+=elapsed;
+            if(progress==before_progress) REQUIRE(journal_flush(j)==0);
+        }
+        (void)bench_add(&total[variant],cpu_calls); (void)bench_add(&complete[variant],bench_now_ns()-start);
+        REQUIRE(journal_flush(j)==0); journal_close(j);
+        piece_allocator a=piece_default_allocator(); paste_replay replayed={bytes,size,0,piece_create(&a)};
+        REQUIRE(replayed.tree); journal_replay_result rr;
+        REQUIRE(journal_replay_file(path,restore_paste,&replayed,&rr)==0 && !rr.corrupt && replayed.copied==size && piece_len(replayed.tree)==size);
+        piece_destroy(replayed.tree); unlink(path);
+    }
+    for(unsigned v=0;v<2;v++) printf("TRACK journal_insert_variant variant=%s pairs=16 bytes=%zu enqueue_sum_p50_ms=%.3f enqueue_sum_p99_ms=%.3f protected_completion_p50_ms=%.3f protected_completion_p99_ms=%.3f content_verified=1 allocations=0 (M)%s\n",
+        v?"continuation":"one_shot",size,(double)bench_p50(&total[v])/1e6,(double)bench_p99(&total[v])/1e6,
+        (double)bench_p50(&complete[v])/1e6,(double)bench_p99(&complete[v])/1e6,evidence(tag,sizeof tag));
+    printf("TRACK journal_insert_step calls=%zu p50_us=%.3f p99_us=%.3f input_check_boundaries=1 byte_credit_enforced=1 wall_time_unbounded=1 (M)%s\n",
+        steps.n,(double)bench_p50(&steps)/1e3,(double)bench_p99(&steps)/1e3,evidence(tag,sizeof tag));
+    REQUIRE(!steps.dropped && !total[0].dropped && !total[1].dropped);
+    free(bytes); return 0;
 }
 typedef struct exhausted_prefix { uint64_t bytes, records; } exhausted_prefix;
 static int restore_exhausted(void *ctx, const journal_record *r)
@@ -250,12 +324,47 @@ static int idle(work_pool *pool, bool zero_data)
     printf("TRACK journal_%s interval_ms=%.3f bytes=%llu saw_unsynced=%d (M)%s\n",zero_data?"zero_data_sync":"idle_sync",(double)st.max_sync_interval_ns/1e6,(unsigned long long)st.last_sync_bytes,saw_unsynced?1:0,evidence(tag,sizeof tag));
     journal_close(j); unlink(path); return 0;
 }
+
+/* This policy function is also used by the real benchmark's final return. */
+static int finish_bench(int correctness, bool track, unsigned misses)
+{
+    return correctness?correctness:(!track && misses?3:0);
+}
+static int gate_self_check(void)
+{
+    /* Deterministic injected latency samples; this does not run a benchmark. */
+    uint64_t delay[100]; for(unsigned i=0;i<100;i++) delay[i]=20001;
+    bench_samples samples; bench_samples_init(&samples,delay,100); samples.n=100;
+    unsigned misses=append_misses(&samples);
+    REQUIRE(finish_bench(0,false,misses)!=0);
+    REQUIRE(finish_bench(0,true,misses)==0 && finish_bench(1,true,misses)==1);
+    REQUIRE(finish_bench(0,false,0)==0);
+    for(unsigned i=0;i<100;i++) delay[i]=20000;
+    REQUIRE(append_misses(&samples)==0);
+    samples.dropped=1; REQUIRE(append_misses(&samples)==1); samples.dropped=0;
+    for(unsigned i=0;i<100;i++) delay[i]=5000001;
+    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==3);
+    for(unsigned i=0;i<100;i++) delay[i]=15000001;
+    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==3);
+    for(unsigned i=0;i<100;i++) delay[i]=5000000;
+    REQUIRE(paste_misses(&samples)==0);
+    puts("journal_bench: gate self-check ok (injected delay fails GATE; TRACK preserves correctness failures)");
+    return 0;
+}
 int main(int argc, char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"--gate-self-check")) return gate_self_check();
+    bool variants=argc==2 && !strcmp(argv[1],"--insert-variants");
+    bool track=variants || (argc==2 && !strcmp(argv[1],"--track")); unsigned misses=0;
     work_pool pool; REQUIRE(work_pool_init(&pool,1,0)==0); int fail=0;
-    if(argc==2 && !strcmp(argv[1],"--worker")) fail=worker_cpu(&pool);
-    else if(argc==2 && !strcmp(argv[1],"--fixtures")) { fail=paste(&pool,1); if(!fail) fail=session(&pool,1,false); }
-    else if(argc!=1) fail=2;
-    else { fail=worker_cpu(&pool); if(!fail) fail=paste(&pool,100); if(!fail) fail=session(&pool,1,true); if(!fail) fail=session(&pool,1024,true); if(!fail) fail=exhaustion(&pool); if(!fail) fail=idle(&pool,false); if(!fail) fail=idle(&pool,true); }
-    work_pool_shutdown(&pool); if(!fail) puts("journal_bench: ok (default options, exact content, TRACK only)"); return fail;
+    if(variants) fail=insert_variants(&pool);
+    else if(argc==2 && !strcmp(argv[1],"--worker")) fail=worker_cpu(&pool);
+    else if(argc==2 && !strcmp(argv[1],"--fixtures")) { fail=paste(&pool,1,&misses); if(!fail) fail=session(&pool,1,false,&misses); }
+    else if(argc!=1 && !track) fail=2;
+    else { fail=worker_cpu(&pool); if(!fail) fail=paste(&pool,100,&misses); if(!fail) fail=session(&pool,1,true,&misses); if(!fail) fail=session(&pool,1024,true,&misses); if(!fail) fail=exhaustion(&pool); if(!fail) fail=idle(&pool,false); if(!fail) fail=idle(&pool,true); }
+    work_pool_shutdown(&pool);
+    int status=finish_bench(fail,track,misses);
+    printf("journal_bench: correctness=%s mode=%s gate_misses=%u status=%d (complete G1/G9 endpoints require editor harness)\n",
+        fail?"FAIL":"ok",track?"TRACK":"GATE",misses,status);
+    return status;
 }

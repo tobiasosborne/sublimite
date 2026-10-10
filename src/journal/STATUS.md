@@ -1,3 +1,86 @@
+# Journal status — P1.9h / edit-4w1.54
+
+Session 8 adds `journal_insert_step`: one protected INSERT prefix per caller
+slice, with a 16 KiB (G) payload ceiling reduced for smaller batch/sync budgets.
+No allocation/lock/sync/submission occurs in the step. A caller-owned progress
+cursor distinguishes BUSY after a protected prefix from BUSY awaiting credit;
+IO includes the RAM-retained record and must not be reappended. Existing
+`journal_insert` keeps its whole-input contract. Complete durable-prefix byte
+stats now include actual UI cache writes; step admission reserves PAD and
+refuses to exceed configured sync_bytes beyond the received durable fence.
+Partial-record fences and failed namespace barriers release no premature credit.
+New unit and fuzz oracles check prefix content, blocked-bulk volume, resumption,
+small sync budgets, sticky FULL/IO and zero typing allocation.
+
+This partially addresses §§4 and 7; legacy append volume, independent worker
+durability scheduling, pwrite wall time and editor/save integration remain open.
+The new standalone savectl already runs journal preparation on a worker but
+leases the journal and defers subsequent journal edits; editor wiring and
+concurrent protected deltas still require integration for §8. Do not close the
+bead. Current session results/remaining work and exact red/green output:
+[worker report](../../docs/worker-reports/edit-4w1.54-s8.md). New design choices:
+[edit-4w1.54.md](../../docs/decisions/edit-4w1.54.md). Session 8 journal fuzz ran
+12824 inputs in 61 s (M)[AC], launch load1=14.83, requested 60 s (G), clean.
+The release journal suite passed with the malloc guard active and append
+allocations=0 (M)[AC], launch load1=13.53. GCC make all exits 0; final clang
+ASan/UBSan make check passes 48 test binaries plus replay CLI checks (M)[AC],
+launch load1=13.53, with LSan disabled and approved local :99 socket access.
+Coordinator must repeat with LSan enabled. The paired
+variant benchmark is TRACK only; bounded calls introduce durability-fence
+completion costs that still need event-loop integration. Session 7 evidence
+and the retained fixes follow; their older verification numbers are historical.
+
+Review P1.9-2 §§1,6,9–14 are addressed. Failed fdatasync poisons the complete
+live generation; journal_retry preserves IO until a complete CURRENT checkpoint
+is synced into a fresh inode and durably published. Partial-write and directory
+barrier retries remain supported. Retained BASEs have a full fsync metadata
+barrier via a distinct syscall seam. Retention results cross routed work
+mailboxes, with storage alive through receipt and no shared done polling.
+PAD IO outranks submission BUSY; a failed PAD is retried only by the worker.
+Retention uses the journal recovery directory or its nearest bounded-path
+ancestor, including when BASE and journal paths approach the pathname limit.
+
+New semantic oracles compare every session field in unit/power-image, SIGKILL,
+fuzz and bench replay. Overlapping save tests preserve both target identities,
+cutoffs, post-save deltas and retained availability in both finish orders,
+including preparation/publication/retirement failures. Default bench GATE mode
+returns nonzero on local append or paste component misses; explicit --track
+reports misses while retaining correctness failures. A deterministic
+--gate-self-check verifies that policy without another timing run.
+
+UNRESOLVED at the full contract level: review §§4,7,8. Shared bulk work
+can still delay durability; actual unsynced cache volume can exceed PRD §7's
+64 KiB bound, including inside one large synchronous append. Synchronous
+regular-file pwrite has no wall-clock UI bound, and save preparation still
+blocks before the file save acknowledgement. The complete fixes require work
+and editor/file integration. Concrete proposals and intentionally failing
+opt-in --bulk-loss-repro, --append-bound-repro, --save-ack-repro tests are in
+[P1.9h.md](../../docs/decisions/P1.9h.md). These probes are outside the passing
+regression suite. The PRD maximum is not reinterpreted as a cadence target;
+this bead does not close those three findings or claim the whole editor gates.
+
+Verification: DISPLAY=:99 EDIT_DISPLAY=:99 make all; ASAN_OPTIONS=detect_leaks=0
+make check; make fuzz; ASAN_OPTIONS=detect_leaks=0 build/fuzz/journal_fuzz
+-max_total_time=120 -max_len=16384 -timeout=10 -artifact_prefix=/tmp/edit-4w1.54-fuzz-
+/tmp/journal-fuzz-corpus. Run build/bench/journal_bench --track once at the end,
+with fresh BAT0/status and load stamps. Coordinator repeats LSan outside this
+sandbox. Historical session 7 results: final GCC make all exit=0 ([AC] load1=6.25); make fuzz
+exit=0, 23 fuzzers built (M)[AC] load1=6.25; journal fuzzer completed 11262 runs
+in 121 s (M)[AC], launch load1=6.84, requested 120 s (G), no findings.
+Final full release journal suite passed with active malloc guard and zero append
+allocations (M)[AC] load1=6.36. Final make all passed ([AC] load1=7.16); full
+clang ASan/UBSan make check passed 45 test binaries and replay CLI checks
+(M)[AC] load1=7.06, including 50 SIGKILL trials with exact session values.
+The check used approved local Unix/Xvfb socket access after sandbox Xvfb
+connection refusal, and disabled only LSan. The one final --track bench passed
+correctness checks and reported one local 1 KiB append miss: p99=31847 ns
+(M)[AC] load1=3.59 versus 20000 ns (G). Single-byte append p99=14271 ns and paste
+p50/p99=3.510/3.836 ms (M)[AC] load1=3.46. No timing rerun or whole-editor gate
+verdict. Complete red/green and bench evidence: P1.9h.md.
+
+Historical status below is superseded by the P1.9h rules above, especially
+sync-only retry, fdatasync retention, and the qualified-cadence statements.
+
 # Journal status — P1.9g / edit-4w1.53
 
 Successful append now encodes/checksums and synchronously pwrite()s each bounded
