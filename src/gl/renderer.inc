@@ -33,7 +33,7 @@ typedef struct gl_state {
     EGLDisplay display;
     EGLContext context;
     EGLSurface surface;
-    bool egl_live, own_arena, persistent, requested_persistent;
+    bool egl_live, own_native_conn, own_arena, persistent, requested_persistent;
     edit_arena arena;
     enum gl_upload upload;
     render_cell *cells;
@@ -503,11 +503,13 @@ static void gl_wake_receive(const work_msg *msg,void *user)
 static int gl_wake_arm(render_backend *b)
 {
     gl_state *s=b->state;
-    if (s->workers==NULL || work_pool_eventfd(s->workers)<0) return RENDER_ERR_UNSUPPORTED;
+    if (s->workers==NULL || work_pool_eventfd(s->workers)<0 ||
+        (!s->workers->foreground_enabled && s->workers->n_workers<=s->workers->n_bulk))
+        return RENDER_ERR_UNSUPPORTED;
     gl_wake_cancel(s);
     s->wake_generation=b->active_frame;
     s->wake=work_submit(s->workers,(work_job){gl_wake_job,NULL,s->wake_generation,
-        s->workers->n_workers>s->workers->n_bulk ? WORK_RASTER : WORK_BULK});
+        s->workers->foreground_enabled ? WORK_FOREGROUND : WORK_RASTER});
     if (s->wake.epoch==0) return RENDER_ERR_BUSY;
     if (work_mailbox_bind(s->workers,s->wake,s->wake_generation,gl_wake_receive,b)!=0) {
         gl_wake_cancel(s); return RENDER_ERR_DEVICE;
@@ -554,13 +556,13 @@ static void gl_release(gl_state *s)
     }
     if (s->context != EGL_NO_CONTEXT && s->eDestroyContext != NULL) (void)s->eDestroyContext(s->display,s->context);
     if (s->surface != EGL_NO_SURFACE && s->eDestroySurface != NULL) (void)s->eDestroySurface(s->display,s->surface);
-    /* EGLDisplay belongs to the native connection, not this backend. A
-     * second window/context can share it; eglTerminate would invalidate that
-     * context too. Destroy our objects/surface/context and release our thread,
-     * leaving the vendor's process-lifetime display cache initialized. */
+    /* Each backend owns its EGL native connection/display. Termination cannot
+     * invalidate a neighbour, and precedes disconnect of the native identity. */
+    if (s->egl_live && s->eTerminate!=NULL) (void)s->eTerminate(s->display);
     if (s->eReleaseThread != NULL) (void)s->eReleaseThread();
     if (s->gl_lib != NULL) (void)dlclose(s->gl_lib);
     if (s->egl_lib != NULL) (void)dlclose(s->egl_lib);
+    if (s->own_native_conn && s->native_conn!=NULL) xcb_disconnect(s->native_conn);
     if (s->own_arena) edit_arena_free(&s->arena);
     memset(s,0,sizeof *s);
 }
@@ -661,7 +663,11 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
 {
     /* Native handles stay alive through shutdown by the render contract.
      * Geometry comes from X, never from UI-owned mutable plat fields. */
-    s->native_conn=cfg->platform->conn; s->native_win=cfg->platform->win;
+    /* plat uses the default DISPLAY too. A separate protocol connection gives
+     * this backend an independently terminable EGLDisplay, without globals. */
+    s->native_conn=xcb_connect(NULL,NULL); s->own_native_conn=true;
+    if (s->native_conn==NULL || xcb_connection_has_error(s->native_conn)) return RENDER_ERR_UNSUPPORTED;
+    s->native_win=cfg->platform->win;
     s->native_visual=cfg->platform->visual;
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(s->native_conn,
         xcb_get_geometry(s->native_conn,s->native_win),NULL);
@@ -726,7 +732,9 @@ static int gl_init(render_backend *b,const render_config *cfg)
      * accepted init capacities here, before any adapter table can be scanned. */
     if (cfg->max_glyphs>GL_FRAME_GLYPH_LIMIT || cfg->max_pages>GL_FRAME_PAGE_LIMIT ||
         cfg->max_atlas_bytes>GL_FRAME_ATLAS_LIMIT) return RENDER_ERR_CAPACITY;
-    if (cfg->workers==NULL || work_pool_eventfd(cfg->workers)<0) return RENDER_ERR_UNSUPPORTED;
+    if (cfg->workers==NULL || work_pool_eventfd(cfg->workers)<0 ||
+        (!cfg->workers->foreground_enabled && cfg->workers->n_workers<=cfg->workers->n_bulk))
+        return RENDER_ERR_UNSUPPORTED;
     s->workers=cfg->workers;
     if (cfg->platform==NULL || cfg->platform->conn==NULL || !cfg->platform->present_ok) return RENDER_ERR_UNSUPPORTED;
     s->platform=cfg->platform; s->dims=cfg->dims; s->max_width=cfg->max_width; s->max_height=cfg->max_height;
@@ -986,10 +994,15 @@ int render_gl_backend(render_backend *b)
         .ops={gl_init,gl_resize,gl_submit,gl_present,gl_event,gl_shutdown}};
     return RENDER_OK;
 }
+/* Authenticate the implementation before interpreting opaque backend storage. */
+static bool gl_is_backend(const render_backend *b)
+{
+    return b!=NULL && b->initialized && b->state!=NULL && b->ops.submit==gl_submit;
+}
 int gl_present_complete(render_backend *b,uint32_t serial,uint64_t ust,uint64_t msc)
 {
     (void)ust;
-    if (b==NULL || !b->initialized) return RENDER_ERR_STATE;
+    if (!gl_is_backend(b)) return RENDER_ERR_STATE;
     gl_state *s=b->state;
     if (!b->active || !b->presented || serial!=s->pending_serial || b->complete_seen) return RENDER_ERR_FRAME;
     (void)msc; /* Untyped platform notices are wake hints, never acknowledgements. */
@@ -1000,12 +1013,12 @@ int gl_present_complete(render_backend *b,uint32_t serial,uint64_t ust,uint64_t 
 }
 int gl_completion_status(const render_backend *b)
 {
-    if (b==NULL || !b->initialized) return RENDER_ERR_STATE;
+    if (!gl_is_backend(b)) return RENDER_ERR_STATE;
     return ((const gl_state *)b->state)->failed ? RENDER_ERR_DEVICE : RENDER_OK;
 }
 const char *gl_buffer_mode(const render_backend *b)
 {
-    if (b==NULL || !b->initialized) return "uninitialized";
+    if (!gl_is_backend(b)) return "uninitialized";
     const gl_state *s=b->state;
     if (s->upload==GL_UPLOAD_SUBDATA) return "subdata";
     if (s->upload==GL_UPLOAD_ORPHAN) return "orphan";
@@ -1013,12 +1026,12 @@ const char *gl_buffer_mode(const render_backend *b)
     return s->persistent ? "persistent" : (s->requested_persistent ? "orphan (ARB_buffer_storage unavailable)" : "orphan");
 }
 const char *gl_device_name(const render_backend *b)
-{ return b!=NULL && b->initialized ? ((const gl_state *)b->state)->device_name : "uninitialized"; }
+{ return gl_is_backend(b) ? ((const gl_state *)b->state)->device_name : "uninitialized"; }
 uint64_t gl_displayed_msc(const render_backend *b)
-{ return b!=NULL && b->initialized ? ((const gl_state *)b->state)->msc : 0; }
+{ return gl_is_backend(b) ? ((const gl_state *)b->state)->msc : 0; }
 int gl_read_pixels(render_backend *b,uint8_t *rgba,size_t bytes)
 {
-    if (b==NULL || !b->initialized || rgba==NULL) return RENDER_ERR_ARG;
+    if (!gl_is_backend(b) || rgba==NULL) return RENDER_ERR_ARG;
     gl_state *s=b->state; uint32_t w=s->dims.cols*s->dims.cell_w,h=s->dims.rows*s->dims.cell_h;
     if (bytes<(size_t)w*h*4) return RENDER_ERR_CAPACITY;
     if (!gl_bind(s)) return RENDER_ERR_DEVICE;
@@ -1038,7 +1051,7 @@ int gl_read_pixels(render_backend *b,uint8_t *rgba,size_t bytes)
  * use the frozen submit-copy guarantee. This API never binds or polls GL. */
 int gl_cells_acquire(render_backend *b,render_grid *g,bool preserve)
 {
-    if (b==NULL || g==NULL || !b->initialized || b->ops.submit!=gl_submit) return RENDER_ERR_ARG;
+    if (g==NULL || !gl_is_backend(b)) return RENDER_ERR_ARG;
     gl_state *s=b->state;
     if (s->upload!=GL_UPLOAD_PERSISTENT) return RENDER_ERR_UNSUPPORTED;
     if (s->failed) return RENDER_ERR_DEVICE;
@@ -1055,7 +1068,7 @@ int gl_cells_acquire(render_backend *b,render_grid *g,bool preserve)
 }
 int gl_cells_submit(render_backend *b,render_grid *g,const render_strip *strips,size_t count)
 {
-    if (b==NULL || g==NULL || !b->initialized || b->ops.submit!=gl_submit) return RENDER_ERR_ARG;
+    if (g==NULL || !gl_is_backend(b)) return RENDER_ERR_ARG;
     gl_state *s=b->state;
     if (s->upload!=GL_UPLOAD_PERSISTENT || !s->leased || g->cells!=s->ring[s->ring_current].cells)
         return RENDER_ERR_STATE;

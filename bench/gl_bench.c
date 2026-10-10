@@ -1,6 +1,9 @@
 #include "gl/gl_driver.h"
 #include "gl_gate.h"
 #include "font/font.h"
+#include "find/find.h"
+#include "file/file.h"
+#include "lineidx/lineidx.h"
 #include "harness.h"
 #include "render_pace.h"
 #include <elf.h>
@@ -9,6 +12,13 @@
 #include <stdio.h>
 #include <unistd.h>
 #define GL_BENCH_CHECK(c) do { if (!(c)) { fprintf(stderr,"gl_bench:%d: FAIL %s\n",__LINE__,#c); return 1; } } while (0)
+/* Cold benchmark-only fault seam, before/after each resource acquisition. */
+static bool gl_bench_fault(const char *stage)
+{
+    const char *selected=getenv("EDIT_GL_BENCH_FAIL");
+    return selected!=NULL && strcmp(selected,stage)==0;
+}
+#define GL_BENCH_OWNER_CHECK(c) do { if (!(c)) { fprintf(stderr,"gl_bench:%d: FAIL %s\n",__LINE__,#c); goto fail; } } while (0)
 typedef struct gl_bench_hooks { uint64_t device_ns, complete_ns, submit_ns, present_ns, fence_ns; uint32_t frame; } gl_bench_hooks;
 static void gl_bench_device(void *u,uint32_t id,uint64_t ns)
 { gl_bench_hooks *h=u; h->device_ns=ns; h->frame=id; render_trace_device_done(NULL,id,ns); }
@@ -97,6 +107,7 @@ static int gl_bench_frame(gl_driver *d,render_grid *g,gl_bench_hooks *hooks,uint
 {
     (*id)++;
     hooks->device_ns=0; hooks->complete_ns=0;
+    if (gl_bench_fault("frame")) return RENDER_ERR_DEVICE;
     uint64_t ingress=0;
     int rc=gl_bench_snapshot(d,g,*id,full,&ingress); if (rc!=RENDER_OK) return rc;
     uint64_t submit_done=bench_now_ns();
@@ -133,12 +144,11 @@ static uint64_t gl_bench_text_bytes(const char *exe)
  * stay queued behind it. Overlap is verified, not assumed. */
 #define GL_BULK_BYTES (32u<<20)
 #define GL_BULK_CHUNK (256u<<10)
-typedef struct gl_bulk_job { uint8_t *buf; int kind; _Atomic uint64_t chunks; } gl_bulk_job;
+typedef struct gl_bulk_job { uint8_t *buf; int kind; _Atomic uint64_t chunks, checksum; } gl_bulk_job;
 typedef struct gl_bulk {
-    work_pool pool; bool live; uint8_t *mem; gl_bulk_job jobs[3]; work_handle h[3]; size_t njobs;
+    work_pool *pool; bool live; uint8_t *mem; gl_bulk_job jobs[3]; work_handle h[3]; size_t njobs;
     uint64_t chunks_at_start;
 } gl_bulk;
-static volatile uint64_t gl_bulk_sink;
 static void gl_bulk_run(work_ctx *c)
 {
     gl_bulk_job *j=c->arg; size_t pos=0; uint64_t h=1469598103934665603ull;
@@ -146,25 +156,27 @@ static void gl_bulk_run(work_ctx *c)
         uint8_t *p=j->buf+pos;
         if (j->kind==0) { for (size_t i=0;i<GL_BULK_CHUNK;i+=8) { uint64_t w; memcpy(&w,p+i,8); h=(h^w)*1099511628211ull; } } /* index: hash scan */
         else if (j->kind==1) { const void *f=memchr(p,0xff,GL_BULK_CHUNK); h+=f!=NULL; }                                   /* find: byte scan */
-        else { memcpy(j->buf+((pos+(GL_BULK_BYTES-GL_BULK_CHUNK)/2)%(GL_BULK_BYTES-GL_BULK_CHUNK)),p,GL_BULK_CHUNK/2); h+=p[0]; }                          /* save: copy-out */
+        else { memmove(j->buf+((pos+(GL_BULK_BYTES-GL_BULK_CHUNK)/2)%(GL_BULK_BYTES-GL_BULK_CHUNK)),p,GL_BULK_CHUNK/2); h+=p[0]; }                          /* save: copy-out */
         pos=(pos+GL_BULK_CHUNK)%(GL_BULK_BYTES-GL_BULK_CHUNK);
         atomic_fetch_add_explicit(&j->chunks,1,memory_order_relaxed);
     }
-    gl_bulk_sink=h;
+    atomic_store_explicit(&j->checksum,h,memory_order_relaxed);
 }
 static uint64_t gl_bulk_chunks(const gl_bulk *b)
 { uint64_t t=0; for (size_t i=0;i<b->njobs;i++) t+=atomic_load_explicit(&b->jobs[i].chunks,memory_order_relaxed); return t; }
-static int gl_bulk_start(gl_bulk *b,size_t njobs)
+static int gl_bulk_start(gl_bulk *b,work_pool *pool,size_t njobs,unsigned active_kind)
 {
     memset(b,0,sizeof *b);
+    if (pool==NULL || work_pool_eventfd(pool)<0 || njobs<1 || njobs>3 || active_kind>2) return -1;
+    b->pool=pool;
     b->mem=malloc(GL_BULK_BYTES);
     if (b->mem==NULL) return -1;
     memset(b->mem,0x41,GL_BULK_BYTES);
-    if (work_pool_init(&b->pool,1,0)!=0) { free(b->mem); b->mem=NULL; return -1; }
     b->live=true; b->njobs=njobs;
     for (size_t i=0;i<njobs;i++) {
-        b->jobs[i].buf=b->mem; b->jobs[i].kind=(int)i; atomic_init(&b->jobs[i].chunks,0);
-        b->h[i]=work_submit(&b->pool,(work_job){gl_bulk_run,&b->jobs[i],1,WORK_BULK});
+        b->jobs[i].buf=b->mem; b->jobs[i].kind=(int)((active_kind+(unsigned)i)%3u); atomic_init(&b->jobs[i].chunks,0);
+        atomic_init(&b->jobs[i].checksum,0);
+        b->h[i]=work_submit(b->pool,(work_job){gl_bulk_run,&b->jobs[i],1,WORK_BULK});
         if (b->h[i].epoch==0) return -1;
     }
     /* Wait until the active job demonstrably runs. */
@@ -180,15 +192,160 @@ static bool gl_bulk_overlapped(const gl_bulk *b)
     if (gl_bulk_chunks(b)<=b->chunks_at_start+1) return false;
     for (size_t i=0;i<b->njobs;i++) {
         bool ran=atomic_load_explicit(&b->jobs[i].chunks,memory_order_relaxed)!=0;
-        if (work_handle_finished(&b->pool,b->h[i])) return false;
+        if (work_handle_finished(b->pool,b->h[i])) return false;
         if (i!=0 && ran) return false;
     }
     return true;
 }
 static void gl_bulk_stop(gl_bulk *b)
 {
-    if (b->live) { for (size_t i=0;i<b->njobs;i++) work_cancel(&b->pool,b->h[i]); work_pool_shutdown(&b->pool); }
+    if (b->live) {
+        for (size_t i=0;i<b->njobs;i++) work_cancel(b->pool,b->h[i]);
+        for (size_t i=0;i<b->njobs;i++) while (!work_handle_finished(b->pool,b->h[i])) {
+            struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+        }
+    }
     free(b->mem); memset(b,0,sizeof *b);
+}
+/* Module-backed contention. UI owns the index; search and save use immutable
+ * snapshots on this exact renderer pool. Allocation/restarts precede frames. */
+typedef struct gl_integrated {
+    work_pool *pool;
+    uint8_t *bytes;
+    size_t size;
+    piece_tree *tree;
+    piece_snapshot *snapshot;
+    lineidx *index;
+    work_handle find_job, save_job;
+    _Atomic uint64_t index_bytes, finds, saves;
+    _Atomic bool failed;
+    unsigned kind;
+    char directory[64], path[96];
+} gl_integrated;
+static size_t gl_integrated_span(void *user,uint64_t offset,const uint8_t **bytes)
+{
+    gl_integrated *load=user;
+    if (offset>=load->size) return 0;
+    size_t count=load->size-(size_t)offset;
+    if (count>LINEIDX_CHUNK) count=LINEIDX_CHUNK;
+    *bytes=load->bytes+(size_t)offset;
+    atomic_fetch_add_explicit(&load->index_bytes,count,memory_order_relaxed);
+    return count;
+}
+static void gl_integrated_find(work_ctx *ctx)
+{
+    gl_integrated *load=ctx->arg;
+    find_source source={.snapshot=load->snapshot}; find_control control={.work=ctx};
+    find_result result;
+    const uint8_t needle[]={'A','\n'};
+    while (!work_should_stop(ctx)) {
+        find_code rc=find_literal(&source,needle,sizeof needle,&control,&result);
+        if (rc==FIND_CANCELLED) return;
+        if (rc!=FIND_OK || result.total!=load->size/64u) {
+            atomic_store_explicit(&load->failed,true,memory_order_release); return;
+        }
+        atomic_fetch_add_explicit(&load->finds,1,memory_order_relaxed);
+    }
+}
+static int gl_integrated_stop_save(void *user)
+{ return work_should_stop(user) ? 1 : 0; }
+static void gl_integrated_save(work_ctx *ctx)
+{
+    gl_integrated *load=ctx->arg;
+    while (!work_should_stop(ctx)) {
+        file_save_args args={.path=load->path,.snap=load->snapshot,.mode=0644,
+            .stop=gl_integrated_stop_save,.stop_ctx=ctx};
+        int rc=file_save_write(&args);
+        if (work_should_stop(ctx)) return;
+        if (rc!=FILE_OK || args.written!=load->size) {
+            atomic_store_explicit(&load->failed,true,memory_order_release); return;
+        }
+        atomic_fetch_add_explicit(&load->saves,1,memory_order_relaxed);
+    }
+}
+static void gl_integrated_stop(gl_integrated *load)
+{
+    if (load->pool!=NULL) {
+        work_cancel(load->pool,load->find_job); work_cancel(load->pool,load->save_job);
+        /* Cancel the index before waiting for any potentially blocking save. */
+        if (load->index!=NULL) lineidx_build_cancel(load->index);
+        while (!work_handle_finished(load->pool,load->find_job) ||
+               !work_handle_finished(load->pool,load->save_job)) {
+            struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+        }
+    }
+    if (load->index!=NULL) lineidx_destroy(load->index);
+    if (load->snapshot!=NULL) piece_snapshot_release(load->snapshot);
+    if (load->tree!=NULL) piece_destroy(load->tree);
+    free(load->bytes);
+    if (load->path[0]!='\0') (void)unlink(load->path);
+    if (load->directory[0]!='\0') (void)rmdir(load->directory);
+    memset(load,0,sizeof *load);
+}
+static int gl_integrated_index_start(gl_integrated *load)
+{
+    load->index=lineidx_create(load->size);
+    if (load->index==NULL) return -1;
+    lineidx_src source={load,load->size,gl_integrated_span,NULL};
+    return lineidx_build_start(load->index,load->pool,&source);
+}
+static int gl_integrated_start(gl_integrated *load,work_pool *pool,unsigned kind,size_t size)
+{
+    memset(load,0,sizeof *load);
+    atomic_init(&load->index_bytes,0); atomic_init(&load->finds,0); atomic_init(&load->saves,0);
+    atomic_init(&load->failed,false);
+    if (pool==NULL || work_pool_eventfd(pool)<0 || kind>3 || size==0 || size%64u!=0) return -1;
+    load->pool=pool; load->kind=kind; load->size=size;
+    load->bytes=malloc(size); if (load->bytes==NULL || gl_bench_fault("integrated-bytes")) goto fail;
+    memset(load->bytes,'A',size);
+    for (size_t i=63;i<size;i+=64) load->bytes[i]='\n';
+    piece_allocator allocator=piece_default_allocator();
+    load->tree=piece_create(&allocator);
+    if (load->tree==NULL || piece_init_mapped(load->tree,load->bytes,size,NULL)!=PIECE_OK) goto fail;
+    if (gl_bench_fault("integrated-tree")) goto fail;
+    load->snapshot=piece_snapshot_take(load->tree);
+    if (load->snapshot==NULL || gl_bench_fault("integrated-snapshot")) goto fail;
+    if (kind==2 || kind==3) {
+        strcpy(load->directory,"build/gl-workloads-XXXXXX");
+        if (mkdtemp(load->directory)==NULL) { load->directory[0]='\0'; goto fail; }
+        (void)snprintf(load->path,sizeof load->path,"%s/saved.txt",load->directory);
+    }
+    if ((kind==0 || kind==3) && gl_integrated_index_start(load)!=0) goto fail;
+    if (gl_bench_fault("integrated-index")) goto fail;
+    if (kind==1 || kind==3) {
+        load->find_job=work_submit(pool,(work_job){gl_integrated_find,load,1,WORK_BULK});
+        if (load->find_job.epoch==0) goto fail;
+    }
+    if (gl_bench_fault("integrated-find")) goto fail;
+    if (kind==2 || kind==3) {
+        load->save_job=work_submit(pool,(work_job){gl_integrated_save,load,1,WORK_BULK});
+        if (load->save_job.epoch==0) goto fail;
+    }
+    if (gl_bench_fault("integrated-save")) goto fail;
+    return 0;
+fail:
+    gl_integrated_stop(load); return -1;
+}
+static int gl_integrated_poll(gl_integrated *load)
+{
+    if (load==NULL) return 0;
+    if (atomic_load_explicit(&load->failed,memory_order_acquire)) return -1;
+    if (load->index!=NULL) {
+        (void)lineidx_poll(load->index);
+        if (lineidx_complete(load->index) && !lineidx_building(load->index)) {
+            lineidx_result lines=lineidx_line_count(load->index);
+            if (!lines.exact || lines.value!=load->size/64u+1u) return -1;
+            lineidx_destroy(load->index); load->index=NULL;
+            if (gl_integrated_index_start(load)!=0) return -1;
+        }
+    }
+    return 0;
+}
+static uint64_t gl_integrated_progress(const gl_integrated *load)
+{
+    if (load->kind==0) return atomic_load_explicit(&load->index_bytes,memory_order_relaxed);
+    if (load->kind==2) return atomic_load_explicit(&load->saves,memory_order_relaxed);
+    return atomic_load_explicit(&load->finds,memory_order_relaxed);
 }
 typedef struct gl_pace_rig {
     gl_driver *driver; render_grid *grid; gl_bench_hooks *hooks;
@@ -257,10 +414,11 @@ static void gl_scroll_track(gl_driver *driver, render_grid *grid, gl_bench_hooks
 /* One scenario: `n` frames of `full` (scroll-one-row full frame, G3) or typing
  * (one cell, G1), collecting T5 (device fence) and T4 (submit+present return). */
 static int gl_bench_measure(gl_driver *d,render_grid *g,gl_bench_hooks *hooks,uint32_t *id,bool full,size_t n,
-                            bench_samples *t5,bench_samples *t4)
+                            bench_samples *t5,bench_samples *t4,gl_integrated *load)
 {
     uint64_t elapsed=0;
     for (size_t i=0;i<n;i++) {
+        GL_BENCH_CHECK(gl_integrated_poll(load)==0);
         GL_BENCH_CHECK(gl_bench_frame(d,g,hooks,id,full,&elapsed)==RENDER_OK);
         (void)bench_add(t5,elapsed);
         (void)bench_add(t4,hooks->submit_ns+hooks->present_ns);
@@ -288,25 +446,30 @@ static int gl_bench_rows(const char *scenario,const char *suffix,bench_samples *
 }
 static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only,bool bulk_only)
 {
+    edit_arena arena={0}; bool arena_live=false;
+    render_backend backend={0}; gl_driver driver={0}; gl_bulk bulk={0}; gl_integrated integrated={0};
+    int failed=0;
     char track_name[80]; snprintf(track_name,sizeof track_name,"A_egl_scroll_600_%upx",px);
     const char *skip_reason = render_pace_skip_reason(getenv("DISPLAY"));
     if (skip_reason && !upload_only) {
         render_pace_skip(stdout,track_name,skip_reason);
         if (scroll_only) return 0;
     }
-    const font_ascii_atlas *atlas=font_ascii_atlas_for_px(px); GL_BENCH_CHECK(atlas!=NULL);
+    const font_ascii_atlas *atlas=font_ascii_atlas_for_px(px); GL_BENCH_OWNER_CHECK(atlas!=NULL);
     render_dims dims={2880u/atlas->cell.cell_w,1800u/atlas->cell.cell_h,atlas->cell.cell_w,atlas->cell.cell_h};
     size_t ncells=(size_t)dims.cols*dims.rows;
-    edit_arena arena; GL_BENCH_CHECK(edit_arena_init(&arena,ncells*sizeof(render_cell)+4096)==0);
+    GL_BENCH_OWNER_CHECK(edit_arena_init(&arena,ncells*sizeof(render_cell)+4096)==0);
+    arena_live=true;
+    GL_BENCH_OWNER_CHECK(!gl_bench_fault("arena"));
     render_cell *cells=edit_arena_alloc(&arena,ncells*sizeof(render_cell),_Alignof(render_cell));
     uint64_t dirty[2]={0}; render_grid grid;
-    GL_BENCH_CHECK(render_grid_init(&grid,dims,cells,ncells,dirty,2)==RENDER_OK);
+    GL_BENCH_OWNER_CHECK(render_grid_init(&grid,dims,cells,ncells,dirty,2)==RENDER_OK);
     render_glyph glyphs[95];
     for (uint32_t i=0;i<95;i++) glyphs[i]=(render_glyph){32u+i,0,i*dims.cell_w,0,dims.cell_w,dims.cell_h};
     render_atlas_page page={atlas->pixels,atlas->pixels_len,(size_t)dims.cell_w*95,dims.cell_w*95,dims.cell_h};
     grid.pages=&page; grid.page_count=1; grid.glyphs=glyphs; grid.glyph_count=95;
     uint32_t seed=0x37216e9du; gl_bench_fill(cells,ncells,&seed);
-    render_backend backend={0}; gl_driver driver; gl_bench_hooks hooks={0};
+    gl_bench_hooks hooks={0};
     render_config cfg={.dims=dims,.max_width=2880,.max_height=1800,.max_cells=ncells,
         .max_glyphs=95,.max_pages=1,.max_atlas_bytes=atlas->pixels_len,
         .hooks={gl_bench_device,gl_bench_complete,&hooks}};
@@ -316,12 +479,14 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
         printf("BENCH name=egl_init_%upx status=SKIP reason=X11_unavailable result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
+    GL_BENCH_OWNER_CHECK(!gl_bench_fault("prepare"));
     rc=gl_driver_init(&driver);
     if (rc!=RENDER_OK) {
         if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"EGL_or_matching_Present_unsupported");
         printf("BENCH name=egl_init_%upx status=SKIP reason=EGL_or_matching_Present_unsupported result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
+    GL_BENCH_OWNER_CHECK(!gl_bench_fault("init"));
     uint32_t id=0; uint64_t elapsed=0;
     if (scroll_only) {
         gl_scroll_track(&driver,&grid,&hooks,&id,&seed,track_name);
@@ -334,7 +499,6 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     puts("egl_bench: every frame asserts 0 counted allocations from begin/damage through submit; present/event outside law 2");
     static uint64_t sample_buf[10000], sample_buf4[10000]; bench_samples samples, samples4;
     bench_samples_init(&samples,sample_buf,2000); (void)bench_add(&samples,driver.init_ns);
-    int failed=0;
     bool experiment=getenv("EDIT_GL_UPLOAD")!=NULL;
     if (px==15) failed=gl_bench_report("init_cost",&samples,0,0);
     else printf("egl_bench: init_cost_30px_ns=%llu TRACK (M)%s\n",(unsigned long long)driver.init_ns,bench_evidence_tag());
@@ -344,9 +508,9 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     size_t warm=quick ? 20 : 200, n=quick ? 100 : required;
     char name[96];
     if (!bulk_only) {
-        for (size_t i=0;i<warm;i++) GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+        for (size_t i=0;i<warm;i++) GL_BENCH_OWNER_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
         bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
-        GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,true,n,&samples,&samples4)==0);
+        GL_BENCH_OWNER_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,true,n,&samples,&samples4,NULL)==0);
         (void)snprintf(name,sizeof name,"full_frame_warm_%upx",px);
         if (experiment) { puts("egl_bench: experiment rows are TRACK_shared_box"); failed|=gl_bench_report(name,&samples,0,0); }
         else {
@@ -363,7 +527,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     if (px==15) {
         if (!bulk_only) {
             bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
-            GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,false,n,&samples,&samples4)==0);
+            GL_BENCH_OWNER_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,false,n,&samples,&samples4,NULL)==0);
             if (experiment) { puts("egl_bench: typing_row reference_gate_p50_ns=1000000 reference_gate_p99_ns=2000000(G) timing=layout_to_T4 verdict=TRACK_shared_box");
                 bench_samples_init(&samples,sample_buf,required);
                 for (size_t i=0;i<samples4.n;i++) (void)bench_add(&samples,samples4.v[i]);
@@ -372,26 +536,57 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
         }
         if (!experiment) {
             /* Bulk-worker scenarios: one active job, the rest queued behind it. */
-            static const struct { const char *name; size_t jobs; } bulks[]={{"bulk_active",1},{"bulk_queued3",3}};
-            for (size_t k=0;k<2;k++) {
-                gl_bulk bulk;
-                if (gl_bulk_start(&bulk,bulks[k].jobs)!=0) {
+            static const struct { const char *name; size_t jobs; unsigned active; } bulks[]={
+                {"surrogate_index_active",1,0},{"surrogate_find_active",1,1},
+                {"surrogate_save_active",1,2},{"surrogate_queued3",3,0}};
+            for (size_t k=0;k<4;k++) {
+                if (gl_bulk_start(&bulk,&driver.workers,bulks[k].jobs,bulks[k].active)!=0) {
                     printf("BENCH name=%s status=REFUSED reason=bulk_worker_did_not_start pass=0\n",bulks[k].name);
                     gl_bulk_stop(&bulk); failed=1; continue;
                 }
+                GL_BENCH_OWNER_CHECK(!gl_bench_fault("bulk"));
                 for (int full=1;full>=0;full--) {
                     bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
                     uint64_t c0=gl_bulk_chunks(&bulk); bulk.chunks_at_start=c0;
-                    GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,full!=0,n,&samples,&samples4)==0);
+                    GL_BENCH_OWNER_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,full!=0,n,&samples,&samples4,NULL)==0);
                     if (!gl_bulk_overlapped(&bulk)) {
                         printf("BENCH name=%s_%s status=REFUSED reason=bulk_overlap_not_verified pass=0\n",bulks[k].name,full ? "full" : "typing");
                         failed=1; continue;
                     }
-                    printf("egl_bench: %s bulk_chunks_during_window=%llu jobs=%zu active=1 queued=%zu\n",bulks[k].name,
+                    printf("egl_bench: %s workload=surrogate same_renderer_pool=1 bulk_chunks_during_window=%llu jobs=%zu active=1 queued=%zu\n",bulks[k].name,
                         (unsigned long long)(gl_bulk_chunks(&bulk)-c0),bulks[k].jobs,bulks[k].jobs-1);
                     failed|=gl_bench_rows(bulks[k].name,bulks[k].name,&samples,&samples4,full!=0,required);
                 }
                 gl_bulk_stop(&bulk);
+            }
+        }
+        if (!experiment) {
+            const char *const scenarios[]={"integrated_index_active","integrated_find_active",
+                "integrated_save_active","integrated_queued3"};
+            for (unsigned kind=0;kind<4;kind++) {
+                GL_BENCH_OWNER_CHECK(gl_integrated_start(&integrated,&driver.workers,kind,GL_BULK_BYTES)==0);
+                GL_BENCH_OWNER_CHECK(!gl_bench_fault("integrated"));
+                for (int full=1;full>=0;full--) {
+                    bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
+                    uint64_t before=gl_integrated_progress(&integrated);
+                    GL_BENCH_OWNER_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,full!=0,n,
+                        &samples,&samples4,&integrated)==0);
+                    uint64_t progress=gl_integrated_progress(&integrated)-before;
+                    bool queued=kind!=3 || (lineidx_building(integrated.index) &&
+                        !work_handle_finished(&driver.workers,integrated.find_job) &&
+                        !work_handle_finished(&driver.workers,integrated.save_job) && atomic_load(&integrated.saves)==0);
+                    if (progress==0 || !queued) {
+                        printf("BENCH name=%s_%s status=REFUSED reason=module_overlap_not_verified pass=0\n",
+                            scenarios[kind],full ? "full" : "typing");
+                        failed=1; continue;
+                    }
+                    printf("egl_bench: %s workload=production_modules same_renderer_pool=1 progress=%llu "
+                        "progress_units=%s jobs=%u active=%s queued=%u\n",scenarios[kind],
+                        (unsigned long long)progress,kind==0 ? "index_source_bytes" : "completed_passes",
+                        kind==3 ? 3u : 1u,kind==0 ? "index" : kind==2 ? "save" : "find",kind==3 ? 2u : 0u);
+                    failed|=gl_bench_rows(scenarios[kind],scenarios[kind],&samples,&samples4,full!=0,required);
+                }
+                gl_integrated_stop(&integrated);
             }
         }
         if (bulk_only) { gl_driver_cleanup(&driver); edit_arena_free(&arena); return failed; }
@@ -400,16 +595,16 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
             const char *old_interval=getenv("EDIT_GL_SWAP_INTERVAL");
             char saved_interval[8]; bench__copy(saved_interval,sizeof saved_interval,old_interval);
             gl_driver_cleanup(&driver);
-            GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","1",1)==0);
+            GL_BENCH_OWNER_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","1",1)==0);
             backend=(render_backend){0};
-            GL_BENCH_CHECK(gl_driver_prepare(&driver,&backend,&cfg)==RENDER_OK && gl_driver_init(&driver)==RENDER_OK);
-            GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+            GL_BENCH_OWNER_CHECK(gl_driver_prepare(&driver,&backend,&cfg)==RENDER_OK && gl_driver_init(&driver)==RENDER_OK);
+            GL_BENCH_OWNER_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
             uint64_t previous=gl_displayed_msc(&backend), misses=0, duplicates=0;
             size_t scroll_n=quick ? 100 : 10000;
             bench_samples_init(&samples,sample_buf,10000);
             for (size_t i=0;i<scroll_n;i++) {
                 /* scroll mutation happens inside gl_bench_frame's timed region */
-                GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+                GL_BENCH_OWNER_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
                 uint64_t msc=gl_displayed_msc(&backend);
                 uint64_t gap=0;
                 if (msc<=previous) { duplicates++; gap=1; }
@@ -428,17 +623,17 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
                 cv==GL_GATE_PASS ? 1 : 0,bench_evidence_tag());
             failed|=gl_gate_exit(cv);
             gl_driver_cleanup(&driver);
-            GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL",saved_interval,1)==0);
+            GL_BENCH_OWNER_CHECK(setenv("EDIT_GL_SWAP_INTERVAL",saved_interval,1)==0);
             backend=(render_backend){0};
-            GL_BENCH_CHECK(gl_driver_prepare(&driver,&backend,&cfg)==RENDER_OK && gl_driver_init(&driver)==RENDER_OK);
-            GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+            GL_BENCH_OWNER_CHECK(gl_driver_prepare(&driver,&backend,&cfg)==RENDER_OK && gl_driver_init(&driver)==RENDER_OK);
+            GL_BENCH_OWNER_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
         } else puts("BENCH name=scroll_10k status=SKIP reason=Xvfb_:99_has_no_real_vblank gate=G3z verdict=unmeasured");
         if (!quick) {
             bench_samples_init(&samples,sample_buf,2000);
             for (size_t i=0;i<5;i++) {
                 struct timespec idle={15,0};
                 while (nanosleep(&idle,&idle)!=0) { }
-                GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+                GL_BENCH_OWNER_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
                 (void)bench_add(&samples,elapsed);
             }
             /* G3i: T = 1e9/90 ns p99, 8 ms p50 (provisional GPU wake). */
@@ -451,40 +646,103 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
         const char *old_interval = getenv("EDIT_GL_SWAP_INTERVAL");
         char saved_interval[8]; bench__copy(saved_interval,sizeof saved_interval,old_interval);
         gl_driver_cleanup(&driver);
-        GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","1",1)==0);
+        GL_BENCH_OWNER_CHECK(setenv("EDIT_GL_SWAP_INTERVAL","1",1)==0);
         backend = (render_backend){0};
         rc = gl_driver_prepare(&driver,&backend,&cfg);
         if (rc == RENDER_OK) rc = gl_driver_init(&driver);
         if (rc == RENDER_OK) gl_scroll_track(&driver,&grid,&hooks,&id,&seed,track_name);
         else render_pace_skip(stdout,track_name,"vsync_context_unavailable");
-        GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL",saved_interval,1)==0);
+        GL_BENCH_OWNER_CHECK(setenv("EDIT_GL_SWAP_INTERVAL",saved_interval,1)==0);
     }
     gl_driver_cleanup(&driver); edit_arena_free(&arena);
     return failed;
+fail:
+    gl_integrated_stop(&integrated);
+    gl_bulk_stop(&bulk);
+    gl_driver_cleanup(&driver);
+    if (arena_live) edit_arena_free(&arena);
+    return 1;
 }
 /* GL-free check of the bulk-load scenarios: for 1 and 3 jobs the active job
  * makes progress for 200 ms while the others stay queued. */
 static int gl_bulk_self_check(void)
 {
-    static const size_t counts[]={1,3};
-    for (size_t k=0;k<2;k++) {
-        gl_bulk b;
-        GL_BENCH_CHECK(gl_bulk_start(&b,counts[k])==0);
-        uint64_t c0=gl_bulk_chunks(&b); b.chunks_at_start=c0;
-        struct timespec ts={0,200000000}; nanosleep(&ts,NULL);
-        bool ok=gl_bulk_overlapped(&b);
-        printf("gl_bench: bulk_self_check jobs=%zu chunks_in_200ms=%llu overlapped=%d\n",counts[k],
-            (unsigned long long)(gl_bulk_chunks(&b)-c0),ok ? 1 : 0);
-        GL_BENCH_CHECK(ok);
-        gl_bulk_stop(&b);
+    work_pool pool;
+    if (work_pool_init(&pool,1,1)!=0) return 1;
+    int result=0;
+    for (unsigned kind=0;kind<4;kind++) {
+        gl_bulk bulk;
+        size_t count=kind==3 ? 3u : 1u;
+        if (gl_bulk_start(&bulk,&pool,count,kind%3u)!=0) {
+            gl_bulk_stop(&bulk); result=1; break;
+        }
+        uint64_t c0=gl_bulk_chunks(&bulk); bulk.chunks_at_start=c0;
+        struct timespec pause={0,200000000}; (void)nanosleep(&pause,NULL);
+        bool ok=gl_bulk_overlapped(&bulk) && bulk.pool==&pool &&
+            bulk.jobs[0].kind==(int)(kind%3u);
+        printf("gl_bench: bulk_self_check jobs=%zu active_kind=%u shared_pool=1 chunks_in_200ms=%llu overlapped=%d evidence=(M) power=%s\n",
+            count,kind%3u,(unsigned long long)(gl_bulk_chunks(&bulk)-c0),ok ? 1 : 0,bench_evidence_tag());
+        bool failed=!ok || gl_bench_fault("self-overlap");
+        gl_bulk_stop(&bulk);
+        if (failed) { result=1; break; }
     }
-    return 0;
+    work_pool_shutdown(&pool);
+    return result;
+}
+static void gl_integrated_ignore(const work_msg *message,void *user)
+{ (void)message; (void)user; }
+static int gl_integrated_self_check(void)
+{
+    work_pool pool;
+    if (work_pool_init(&pool,1,1)!=0) return 1;
+    int result=0;
+    for (unsigned kind=0;kind<4;kind++) {
+        gl_integrated load;
+        if (gl_integrated_start(&load,&pool,kind,1u<<20)!=0) { result=1; break; }
+        uint64_t deadline=bench_now_ns()+UINT64_C(5000000000);
+        while (gl_integrated_progress(&load)==0 && bench_now_ns()<deadline) {
+            (void)work_mailbox_drain(&pool,gl_integrated_ignore,NULL);
+            if (gl_integrated_poll(&load)!=0) break;
+            struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+        }
+        if (kind==3) (void)gl_integrated_poll(&load);
+        bool correct=gl_integrated_progress(&load)>0 && !atomic_load(&load.failed) && load.pool==&pool;
+        if (kind==0) {
+            while (!lineidx_complete(load.index) && bench_now_ns()<deadline) {
+                (void)lineidx_poll(load.index);
+                struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+            }
+            lineidx_result lines=lineidx_line_count(load.index);
+            printf("gl_bench: index_fixture progress=%llu lines=%llu exact=%d expected=%zu building=%d failed=%d\n",
+                (unsigned long long)gl_integrated_progress(&load),(unsigned long long)lines.value,lines.exact ? 1 : 0,
+                load.size/64u+1u,lineidx_building(load.index) ? 1 : 0,atomic_load(&load.failed) ? 1 : 0);
+            correct=correct && lines.exact && lines.value==load.size/64u+1u;
+        }
+        if (kind==2) {
+            FILE *saved=fopen(load.path,"rb"); uint8_t prefix[64];
+            correct=correct && saved!=NULL;
+            if (saved!=NULL) {
+                correct=correct && fread(prefix,1,sizeof prefix,saved)==sizeof prefix &&
+                    memcmp(prefix,load.bytes,sizeof prefix)==0;
+                (void)fclose(saved);
+            }
+        }
+        if (kind==3) correct=correct && lineidx_building(load.index) &&
+            !work_handle_finished(&pool,load.find_job) && !work_handle_finished(&pool,load.save_job) &&
+            atomic_load(&load.saves)==0;
+        printf("gl_bench: integrated_self_check kind=%u module=%s same_pool=1 correct=%d\n",
+            kind,kind==0 ? "lineidx" : kind==1 ? "find_literal" : kind==2 ? "file_save_write" : "queued3",correct ? 1 : 0);
+        gl_integrated_stop(&load);
+        if (!correct) { result=1; break; }
+    }
+    work_pool_shutdown(&pool); return result;
 }
 int main(int argc,char **argv)
 {
     (void)setvbuf(stdout,NULL,_IOLBF,0);
     if (argc == 2 && !strcmp(argv[1],"--pace-self-check")) return render_pace_self_check();
     if (argc == 2 && !strcmp(argv[1],"--bulk-self-check")) return gl_bulk_self_check();
+    if (argc == 2 && !strcmp(argv[1],"--integrated-self-check")) return gl_integrated_self_check();
     const char *upload=getenv("EDIT_GL_UPLOAD");
     bool quick=false, focus=false, valid=true, bulk_only=false, help=false;
     bool scroll_only = argc == 2 && strcmp(argv[1],"--scroll-track")==0;
@@ -497,14 +755,15 @@ int main(int argc,char **argv)
     }
     if (help || !valid) {
         fprintf(help ? stdout : stderr,
-            "usage: %s [--quick] [--upload-only] [--bulk-only] [--scroll-track] [--pace-self-check] [--bulk-self-check] [--help]\n"
-            "  (default)        warm full frame, typing (G1 T4 + T5), bulk_active, bulk_queued3, G3z scroll_10k, G3i, paced scroll\n"
+            "usage: %s [--quick] [--upload-only] [--bulk-only] [--scroll-track] [--pace-self-check] [--bulk-self-check] [--integrated-self-check] [--help]\n"
+            "  (default)        warm full frame, typing (G1 T4 + T5), surrogate_index/find/save_active, surrogate_queued3, G3z scroll_10k, G3i, paced scroll\n"
             "  --quick          100-frame smoke run: gate rows print status=REFUSED (needs %u samples), never PASS\n"
-            "  --bulk-only      only bulk_active (1 background job) and bulk_queued3 (1 active + 2 queued) rows, 15px; the\n"
+            "  --bulk-only      only index/find/save surrogate and queued-three rows, 15px; the\n"
             "                   background overlap is verified and a row without overlap is REFUSED\n"
             "  --upload-only    EDIT_GL_UPLOAD experiments only (TRACK, never qualifying)\n"
             "  --scroll-track / --pace-self-check  paced scroll track / its self check\n"
-            "  --bulk-self-check  GL-free check that bulk_active / bulk_queued3 load really overlaps\n"
+            "  --bulk-self-check  GL-free check that all surrogate workloads share a pool and overlap\n"
+            "  --integrated-self-check  real lineidx, find and durable save on one pool, without GL\n"
             "env: EDIT_GL_VBO=orphan|persistent; EDIT_GL_UPLOAD=subdata|orphan|persistent; DISPLAY must be Xvfb :99, never :0\n"
             "status: PASS | PASS_PARTIAL (renderer-only, no G3 claim) | MISS | UNKNOWN (power unknown) | REFUSED (too few samples)\n"
             "limits are enforced under [AC], [bat] and [unknown]; G3 p99 limit is the exact 1e9/180 ns (printed as num/den)\n"

@@ -17,6 +17,7 @@ typedef struct gl_driver {
     render_config config;
     void *state;
     size_t state_bytes;
+    work_handle init_handle;
     int init_result;
     bool pool_live, plat_live, arena_live, init_done;
     uint64_t init_ns;
@@ -55,6 +56,14 @@ static int gl_driver_pump(gl_driver *d)
 }
 static void gl_driver_cleanup(gl_driver *d)
 {
+    /* A timed-out initializer can still succeed. Its backend and arena stay
+     * owned until the worker physically returns, before any initialized read. */
+    if (d->pool_live && d->init_handle.epoch!=0) {
+        work_cancel(&d->workers,d->init_handle);
+        while (!work_handle_finished(&d->workers,d->init_handle)) {
+            struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+        }
+    }
     if (d->backend != NULL) render_backend_shutdown(d->backend);
     if (d->pool_live) work_pool_shutdown(&d->workers);
     if (d->plat_live) plat_shutdown(&d->platform);
@@ -70,13 +79,13 @@ static int gl_driver_prepare(gl_driver *d, render_backend *b, render_config *cfg
         .height = cfg->dims.rows * cfg->dims.cell_h, .work_eventfd = -1};
     if (plat_init(&d->platform, &pc) != PLAT_OK) return RENDER_ERR_UNSUPPORTED;
     d->plat_live = true; plat_map(&d->platform);
-    if (work_pool_init(&d->workers, 1, 0) != 0) return RENDER_ERR_INIT;
+    if (work_pool_init(&d->workers, 1, 1) != 0) return RENDER_ERR_INIT;
     d->pool_live = true;
     cfg->platform = &d->platform; cfg->workers = &d->workers;
     d->config = *cfg;
     return RENDER_OK;
 }
-static int gl_driver_init(gl_driver *d)
+static int gl_driver_init_for(gl_driver *d,uint64_t timeout_ns)
 {
     render_backend_info info;
     if (render_backend_query(d->backend, &info) != RENDER_OK) return RENDER_ERR_INIT;
@@ -84,15 +93,17 @@ static int gl_driver_init(gl_driver *d)
     d->arena_live = true;
     d->state = edit_arena_alloc(&d->state_arena, info.state_size, info.state_align);
     d->state_bytes = info.state_size;
-    work_handle h = work_submit(&d->workers, (work_job){gl_driver_init_job, d, 1, WORK_BULK});
-    if (h.epoch == 0) return RENDER_ERR_INIT;
-    uint64_t deadline = trace_now_ns() + UINT64_C(10000000000);
+    d->init_handle = work_submit(&d->workers, (work_job){gl_driver_init_job, d, 1, WORK_BULK});
+    if (d->init_handle.epoch == 0) return RENDER_ERR_INIT;
+    uint64_t deadline = trace_now_ns() + timeout_ns;
     while (!d->init_done && trace_now_ns() < deadline) {
-        (void)work_mailbox_drain(&d->workers, gl_driver_init_message, d);
+        (void)work_mailbox_receive(&d->workers,d->init_handle,1,gl_driver_init_message,d);
         struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
     }
     return d->init_done ? d->init_result : RENDER_ERR_INIT;
 }
+static int gl_driver_init(gl_driver *d)
+{ return gl_driver_init_for(d,UINT64_C(10000000000)); }
 static int gl_driver_finish(gl_driver *d, uint32_t id)
 {
     int rc = render_backend_present(d->backend, id);

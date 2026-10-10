@@ -1,3 +1,24 @@
+# GL — edit-40t (session 9)
+
+P2-1 sections 2, 5, 17, 18, 19 and 35 are implemented: authenticated diagnostics,
+owned native connection/EGLDisplay teardown, retained/joined driver init handles,
+independent completion lanes and shared-pool surrogate/module contention with
+owner-specific error cleanup. No new globals or typing-path allocation.
+
+Sections 13, 14 and 20 remain because their concrete fixes require editor
+startup/poll lifecycle and paired injector/joiner files outside this worker’s
+permitted edits. Optional gl_test --review p2-13/p2-14/p2-20 reproduce them and
+intentionally remain red. They are excluded from the default suite.
+
+GCC release make all and clang ASan/UBSan make check pass: 60 test binaries
+plus replay CLI contracts (M) [AC]. Release/sanitizer GL and workload checks
+pass; GL state fuzz ran clean for 61 seconds (M) [AC]. LeakSanitizer was disabled.
+
+Public evidence and final acceptance: docs/worker-reports/edit-40t-s9.md.
+Ownership choices: docs/decisions/edit-40t.md. Native EGL/Present checks SKIP
+explicitly on :99; real-display and LeakSanitizer acceptance remain coordinator
+work. Historical status follows.
+
 # GL — P2.4c review fixes (edit-e6x.26, session 8)
 
 Production uses `src/gl/renderer.inc` with all existing upload modes. Named
