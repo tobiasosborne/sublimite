@@ -25,7 +25,7 @@ static void publish_completion(work_ctx *c, uint32_t kind)
 /* --- open ------------------------------------------------------------- */
 void editor_large_init(editor_buffer *b)
 {
-    if (b->file) trace_record(TRACE_T3_RENDER_DONE, editor_large_trace_frame(b->file));
+    if (b->file && !b->pending_open) trace_record(TRACE_T3_RENDER_DONE, editor_large_trace_frame(b->file));
     editor_large *lg = &b->lg;
     lg->mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP;
     lg->lazy = lg->mapped || (b->file && file_size(b->file) > FILE_PREFIX_MAX);
@@ -35,7 +35,7 @@ void editor_large_init(editor_buffer *b)
     const file_prefix_info *pi = file_prefix_info_of(b->file); size_t plen = 0;
     (void)file_prefix(b->file, &plen);
     lg->prefix_lines = pi->lf + pi->crlf; lg->prefix_bytes = plen;
-    uint64_t size = piece_len(b->tree);
+    uint64_t size = b->pending_open ? file_size(b->file) : piece_len(b->tree);
     if (plen >= size) { b->lines = lg->prefix_lines + 1; lg->lines_exact = true; }
     else b->lines = estimate_line(b, size) + 1;
 }

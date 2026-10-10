@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -112,6 +114,127 @@ static bool settled(editor *e) { editor_stats s = editor_get_stats(e); return !s
 static bool find_done(editor *e) { return editor_large_status_get(e).find_done; }
 static bool save_done(editor *e) { return editor_large_status_get(e).save_done; }
 static bool all_done(editor *e) { editor_large_status s = editor_large_status_get(e); return s.lines_exact && s.find_done && s.warm_done; }
+
+typedef struct mapped_preview_probe {
+    editor *e;
+    bool submitted, before_attachment, before_mapping, correct, queued;
+    _Atomic bool release_mapping;
+    piece_tree *full_tree;
+} mapped_preview_probe;
+static void mapped_hold_mapping(work_ctx *job)
+{
+    mapped_preview_probe *probe = job->arg;
+    uint64_t deadline = trace_now_ns() + UINT64_C(1000000000);
+    while (!atomic_load(&probe->release_mapping) && !work_should_stop(job) && trace_now_ns() < deadline)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+}
+static void mapped_preview_submit(void *ctx, const editor_frame *frame)
+{
+    mapped_preview_probe *probe = ctx; (void)frame;
+    editor *e = probe->e;
+    if (!e || !e->buffer->file || probe->submitted) return;
+    probe->submitted = true;
+    probe->full_tree = e->buffer->tree;
+    probe->before_attachment = e->buffer->pending_open && e->buffer->preview &&
+        e->tree == e->buffer->preview && piece_len(e->buffer->tree) == 0;
+    probe->before_mapping = !file_open_ready(e->buffer->file);
+    atomic_store(&probe->release_mapping, true);
+    const render_grid *grid = editor_grid(e);
+    uint32_t gutter = layout_gutter_width(&e->lay);
+    const render_cell *cell = &grid->cells[(size_t)e->tab_rows * grid->dims.cols + gutter];
+    probe->correct = cell->glyph_index == '?' && (cell->attrs & RENDER_ATTR_INVERSE);
+    plat_event arrow = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Right};
+    probe->queued = editor_inject(e, &arrow) == 0 && e->queue_count == 1;
+}
+static int mapped_preview_first(void)
+{
+    const char *path = "/tmp/edit-corpus/sparse_10g.bin";
+    struct stat st; T(stat(path, &st) == 0);
+    T((uint64_t)st.st_size == UINT64_C(10) * 1024u * 1024u * 1024u);
+    mapped_preview_probe probe = {0};
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    backend.info.capabilities |= RENDER_CAP_RASTER_POOL; /* independent acquisition lane */
+    editor_config cfg = {.cols = 60, .rows = 8, .wrap_mode = -1,
+        .hook_ctx = &probe, .on_submit = mapped_preview_submit};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    probe.e = e;
+    work_handle held = work_submit(&e->pool, (work_job){mapped_hold_mapping, &probe, 0, WORK_BULK}); T(held.epoch);
+    uint64_t id = 0; T(editor_add_buffer(e, path, NULL, 0, &id) == 0);
+    /* Check at the submit boundary, rather than inferring order from timing. */
+    if (!probe.submitted) T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(probe.submitted); T(probe.before_attachment); T(probe.correct); T(probe.queued);
+    T(probe.before_mapping);
+    /* Mapped startup still returns the stable full tree and prepared warm snapshot. */
+    T(e->buffer->tree == probe.full_tree);
+    T(editor_tab(e, tabs_active_index(&e->tabs))->buffer == probe.full_tree);
+    T(!e->buffer->pending_open); T(!e->buffer->preview);
+    T(editor_length(e) == (uint64_t)st.st_size);
+    T(e->buffer->lg.warm && piece_snapshot_len(e->buffer->lg.warm->snap) == (uint64_t)st.st_size);
+    T(e->queue_count == 1); /* Input waits until adoption, outside setup. */
+    editor_close(e);
+    puts("edit-dnc2 G5: correct mapped prefix submitted before full attachment; stable tree, queued input and prepared warm snapshot retained");
+    return 0;
+}
+
+/* The file API currently exposes the full mapped source only after attachment.
+ * Opt-in red for launching a full index once mapping is ready, before attach. */
+static int index_before_attachment_gap(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.start_empty = true, .cols = 60, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    editor_buffer *prepared = NULL;
+    T(editor_buffer_prepare(e, "/tmp/edit-corpus/sparse_10g.bin", NULL, 0, &prepared) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!file_open_ready(prepared->file)) {
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+        T(!e->error); T(trace_now_ns() < deadline);
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    T(prepared->pending_open && piece_len(prepared->tree) == 0);
+    T(lineidx_len(prepared->index) == file_size(prepared->file) && lineidx_building(prepared->index));
+    editor_buffer_destroy(prepared); editor_close(e); return 0;
+}
+
+/* Driving the prefix frame inside mapped open must not admit another IPC open
+ * that switches the active buffer before the caller receives its full tree. */
+static int mapped_startup_ipc(void)
+{
+    char relative[] = "build/editor-dnc2-ipc-XXXXXX";
+    T(mkdtemp(relative));
+    char runtime[IPC_PATH_CAP]; T(realpath(relative, runtime));
+    ipc_server server = {0}; T(ipc_server_init(&server, runtime) == IPC_OK);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 60, .rows = 8, .wrap_mode = -1, .server = &server};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    uint8_t wire[1024]; size_t wire_size = 0;
+    ipc_request request = {.cwd = runtime, .has_stdin = true,
+        .stdin_data = (const uint8_t *)"later", .stdin_size = 5};
+    T(ipc_wire_encode(&request, wire, sizeof wire, &wire_size) == IPC_OK);
+    struct sockaddr_un address; socklen_t address_size = sizeof address;
+    T(getsockname(server.listener, (struct sockaddr *)&address, &address_size) == 0);
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); T(client >= 0);
+    T(connect(client, (struct sockaddr *)&address, address_size) == 0);
+    T(write(client, wire, wire_size) == (ssize_t)wire_size);
+    uint64_t id = 0;
+    T(editor_add_buffer(e, "/tmp/edit-corpus/sparse_10g.bin", NULL, 0, &id) == 0);
+    T(tabs_count(&e->tabs) == 2);
+    T(tabs_active(&e->tabs)->id == id && e->tree == e->buffer->tree);
+    T(editor_length(e) == UINT64_C(10) * 1024u * 1024u * 1024u);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (tabs_count(&e->tabs) != 3) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+    }
+    T(editor_length(e) == 5);
+    close(client); editor_close(e); ipc_server_fini(&server);
+    char lock[128];
+    (void)snprintf(lock, sizeof lock, "%s/sublimite-%lu.lock", relative, (unsigned long)getuid());
+    T(unlink(lock) == 0); T(rmdir(relative) == 0);
+    puts("edit-dnc2 startup: queued IPC open waits for mapped preview adoption and is admitted on a later turn");
+    return 0;
+}
 
 /* Hold the bulk lane so the unindexed frame cannot race a fast index build. */
 static void hold_index(work_ctx *c)
@@ -340,6 +463,9 @@ static int mapped_find_boundaries(void)
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("DNC2_REQUIRE_EARLY_INDEX")) T(index_before_attachment_gap() == 0);
+    T(mapped_startup_ipc() == 0);
+    T(mapped_preview_first() == 0);
     T(mapped_find_boundaries() == 0);
     T(gutter_estimates() == 0);
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);

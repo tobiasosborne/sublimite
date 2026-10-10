@@ -85,6 +85,7 @@ static int open_ed(editor **e, render_backend *b, rig *r, const char *path)
     int rc = editor_open(e, &cfg, b); REQUIRE(rc == 0);
     r->open_trace = editor_large_trace_frame((*e)->buffer->file);
     trace_record_at(r->t0, TRACE_T0_INGRESS, r->open_trace);
+    if (r->first_submit) trace_record_at(r->first_submit, TRACE_T4_PRESENT_SUBMITTED, r->open_trace);
     const render_grid *grid = editor_grid(*e);
     REQUIRE(grid->dims.cols * grid->dims.cell_w == 2880);
     REQUIRE(grid->dims.rows * grid->dims.cell_h == 1800);
@@ -137,6 +138,16 @@ static int attribution(const char *name, int sample, uint32_t frame, bool findin
         if (begin && end && end >= begin)
             printf("ATTR %s sample=%d phase=%s ns=%" PRIu64 " (M)[AC]\n", name, sample, names[i], end - begin);
         else printf("ATTR %s sample=%d phase=%s unavailable\n", name, sample, names[i]);
+    }
+    if (!finding && phases[4] && phases[3]) {
+        printf("ATTR %s sample=%d viewport_before_attachment=%d (M)[AC]\n",
+            name, sample, phases[4] < phases[3]);
+        if (phases[4] < phases[3])
+            printf("ATTR %s sample=%d phase=viewport_attachment ns=%" PRIu64 " (M)[AC]\n",
+                name, sample, phases[3] - phases[4]);
+        if (phases[4] < phases[5])
+            printf("ATTR %s sample=%d phase=viewport_index_submit ns=%" PRIu64 " (M)[AC]\n",
+                name, sample, phases[5] - phases[4]);
     }
     free(records); trace_reset(); return 0;
 }
