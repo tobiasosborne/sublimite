@@ -17,6 +17,7 @@
 
 enum {
     FONT_OK          = 0,
+    FONT_MORE        = 1,   /* bounded composition slice; retry exact key */
     FONT_ERR_MISSING = -1,  /* codepoint has no glyph in this font */
     FONT_ERR_NOMEM   = -2,  /* arena or atlas exhausted */
     FONT_ERR_INIT    = -3,  /* malformed or unsupported font data */
@@ -53,6 +54,7 @@ typedef struct font {
     uint32_t px;
     uint32_t face_index;  /* TTC face selected at init (0 for plain TTF) */
     uint32_t glyf_len;    /* validated glyf table length; 0 for CFF outlines */
+    uint32_t bake_identity; /* INIT SHA-256 of immutable bytes and face matches both bakes */
     uint32_t num_glyphs;  /* validated maxp numGlyphs */
     float    scale;
     font_cell cell;
@@ -112,8 +114,16 @@ const font_metric      *font_ascii_atlas_glyph(const font_ascii_atlas *a, uint32
 #define FONT_FALLBACK_PATH_MAX 512u
 #define FONT_FALLBACK_MSG_KIND 0x46414C42u   /* "FALB" */
 
+typedef struct font_fallback_result {
+    char cjk[FONT_FALLBACK_PATH_MAX], emoji[FONT_FALLBACK_PATH_MAX];
+    uint32_t cjk_index, emoji_index;
+    int have_fontconfig;
+    uint64_t elapsed_ns;
+    pthread_t worker;
+} font_fallback_result;
+
 typedef struct font_fallback {
-    _Atomic uint32_t done;            /* 1 once discovery finished (release) */
+    _Atomic uint32_t done;            /* 1 after exclusive sync run or live mailbox adoption */
     /* Valid after done == 1: */
     char       cjk[FONT_FALLBACK_PATH_MAX];    /* "" if none */
     char       emoji[FONT_FALLBACK_PATH_MAX];  /* monochrome emoji; "" if none */
@@ -122,23 +132,32 @@ typedef struct font_fallback {
     int        have_fontconfig;       /* libfontconfig.so.1 loaded */
     uint64_t   elapsed_ns;
     pthread_t  worker;                /* thread that ran the discovery */
+    font_fallback_result staged;      /* worker-owned; only event() may adopt */
+    uint32_t staged_generation, staged_slot, staged_epoch;
+    const char *discovery_program; /* INIT test seam: trusted absolute fc-match-compatible executable; NULL=system */
+    _Atomic uint32_t child_pid, cancellation_polls; /* discovery lease diagnostics */
 } font_fallback;
 
-/* Threading rule: one writer. Before (re)submitting font_fallback_job on an fb
- * that has run before, the owner calls font_fallback_reset(fb) on the thread
- * that submits, after every reader of the previous result has finished; that
- * clears done (release) and the results, so a stale done can never be observed
- * while a new run is queued or running. Readers load done with acquire and
- * touch the other fields only if it is 1. Discovery cannot revoke a reader that
- * already saw done == 1: the owner must not reset under a live reader.
- * No concurrent discovery on one fb. */
+/* One outstanding discovery per fb. Reset on the owner before submitting,
+ * after physical completion and all previous readers/events are finished.
+ * Async results cross only work mailboxes: done stays zero until event adopts
+ * a live completion. Keep fb alive through physical completion AND message
+ * drain. Do not route stale/handmade messages to font_fallback_event.
+ * Synchronous discovery is for exclusively owned INIT storage (not a pooled
+ * cancellable job); it publishes done directly and cannot be cancelled. */
 void font_fallback_reset(font_fallback *fb);
 /* Synchronous discovery with the given soname (test seam). Resets fb, fills it,
  * publishes done (release). */
 void font_fallback_discover(font_fallback *fb, const char *soname);
-/* work_job fn: ctx->arg is a font_fallback*. Publishes FONT_FALLBACK_MSG_KIND. */
+/* work_job fn: ctx->arg is a font_fallback*. Uses isolated /usr/bin/fc-match
+ * (unavailable executable gracefully gives empty fallbacks). Stages a result and retries full
+ * mailbox publication cancellably. Never sets public done. */
 void font_fallback_job(work_ctx *c);
-/* Reads a font file into arena memory (for the fallback face). NULL on failure. */
+/* UI mailbox callback ONLY: adopt matching live result, once. Returns true
+ * on adoption. Family preparation may then read the public fields/done. */
+int font_fallback_event(font_fallback *fb, const work_msg *msg);
+/* INIT/worker: reads a font file into arena memory. len is required; failure
+ * clears it and preserves the entry arena mark. NULL on failure. */
 unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len);
 
 /* Shelf allocator over FONT_ATLAS_PAGE_DIM square R8 pages. */
@@ -155,6 +174,8 @@ int  font_atlas_alloc(font_atlas *a, uint32_t w, uint32_t h,
  * A family is exclusively owned: raster calls mutate stb's scratch userdata. */
 #define FONT_FAMILY_MAX_FACES 3u
 #define FONT_CLUSTER_MAX_BYTES 16384u
+#define FONT_CACHE_MAX_PROBES 32u
+#define FONT_COMPOSE_MAX_GLYPHS 8u
 typedef struct font_family {
     font_t faces[FONT_FAMILY_MAX_FACES];
     uint32_t count;
@@ -177,17 +198,24 @@ typedef struct font_cache {
     font_atlas atlas;
     render_atlas_page pages[FONT_ATLAS_MAX_PAGES + 1u];
     render_glyph *glyphs;
-    font_cache_entry *entries;
-    uint8_t *keys, *image;
+    font_cache_entry *entries, *negative_entries;
+    uint8_t *keys, *image, *negative_keys, *pending_key;
+    size_t entry_count, negative_capacity, negative_count, negative_used;
+    size_t pending_len, pending_off;
+    uint32_t pending_width;
+    int32_t pending_advance;
+    int resource_error; /* sticky NOMEM until replaced at quiescence; MORE is resumable */
     size_t capacity, key_capacity, key_used, glyph_count;
     edit_arena scratch;
     render_grid *grid;
     uint64_t hits, misses;
+    uint64_t probes, rasterizations; /* work counters, including failed calls */
 } font_cache;
 /* INIT only: reserve all pages, exact keys, glyphs, cell image and scratch.
  * Append-only cache, no eviction: rectangles remain immutable through T5.
  * Exhaustion returns NOMEM; existing entries stay usable. init failure rolls
- * back arena. Scratch capacity bounds raster complexity without any malloc.
+ * back arena. At most FONT_CACHE_MAX_PROBES per table. Negatives use separate
+ * capped storage, preserving positive capacity. Scratch needs no malloc.
  * Keep exclusive UI ownership after worker preparation/handoff. */
 int font_cache_init(font_cache *cache, font_family *family, edit_arena *arena,
                     uint32_t max_pages, size_t entries, size_t key_bytes,
@@ -200,6 +228,12 @@ int font_cache_bind(font_cache *cache, render_grid *grid);
  * layout draws one inverse '?' per invalid byte without calling this API.
  * Zero-width marks merge at the base pen, all faces use the primary baseline.
  * ZWJ sequences use overlaid monochrome scalar outlines, not shaped ligatures.
+ * Cold composition performs at most FONT_COMPOSE_MAX_GLYPHS raster calls and
+ * checks a 250 us cooperative deadline between scalars. FONT_MORE leaves slot
+ * unchanged: retry the exact key after checking input. One pending image per
+ * cache; another cold key abandons its partial image, cache hits preserve it.
+ * NOMEM sets resource_error: retain this cache through T5, then replace storage
+ * and fully relayout. Neither MORE nor NOMEM is a missing-font verdict.
  * No fontconfig, I/O, malloc, or arena growth, including on cold misses. */
 int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
                      uint32_t width, uint32_t *slot);

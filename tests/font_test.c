@@ -3,10 +3,12 @@
  * repo root (make check runs from there). */
 #include "base/base.h"
 #include "font/font.h"
+#include "font/file.h"
 #include "work/work.h"
 #include "../vendor/stb_truetype.h"   /* declarations only: glyph ids for hostile-glyph tests */
 #include "../fuzz/font_cffseed.h"
 #include <signal.h>
+#include <errno.h>
 #include <unistd.h>
 #include <poll.h>
 #include <pthread.h>
@@ -642,11 +644,180 @@ static void test_atlas_px(const unsigned char *ttf, size_t len)
     CHECK(font_set_px(&f, 22) == FONT_OK && f.atlas == NULL);
 }
 
+/* P4.11b review §1: a valid replacement cmap keeps all ASCII metrics. */
+static void test_atlas_identity(const unsigned char *ttf, size_t len)
+{
+    size_t extra = 12u + 16u + 95u * 12u;
+    unsigned char *copy = malloc(len); CHECK(copy);
+    if (!copy) return;
+    memcpy(copy, ttf, len);
+    size_t rec = rec_of(copy, 0, "cmap");
+    unsigned char *cm = copy + be32(copy + rec + 8);
+    CHECK(extra <= be32(copy + rec + 12)); memset(cm, 0, be32(copy + rec + 12));
+    put16(cm + 2, 1); put16(cm + 4, 3); put16(cm + 6, 10); put32(cm + 8, 12);
+    put16(cm + 12, 12); put32(cm + 16, (uint32_t)(extra - 12u)); put32(cm + 24, 95);
+    font_t original, modified;
+    CHECK(font_init(&original, ttf, len) == FONT_OK);
+    for (uint32_t cp = 32; cp < 127; cp++) {
+        uint32_t mapped = cp == 'A' ? 'W' : cp == 'W' ? 'A' : cp;
+        uint32_t gid = (uint32_t)stbtt_FindGlyphIndex((const stbtt_fontinfo *)(const void *)original.info, (int)mapped);
+        unsigned char *g = cm + 28u + (cp - 32u) * 12u;
+        put32(g, cp); put32(g + 4, cp); put32(g + 8, gid);
+    }
+    CHECK(font_init(&modified, copy, len) == FONT_OK);
+    CHECK(font_set_px(&original, 30) == FONT_OK && font_set_px(&modified, 30) == FONT_OK);
+    for (uint32_t cp = 32; cp < 127; cp++) {
+        font_metric a, b;
+        CHECK(font_glyph_metrics(&original, cp, &a) == FONT_OK);
+        CHECK(font_glyph_metrics(&modified, cp, &b) == FONT_OK);
+        CHECK(a.advance == b.advance && a.bearing_x == b.bearing_x && a.bearing_y == b.bearing_y && a.w == b.w && a.h == b.h);
+    }
+    CHECK(modified.atlas == NULL);
+    edit_arena arena; CHECK(edit_arena_init(&arena, 1u << 20) == 0);
+    for (uint32_t px = 15; px <= 30; px += 15) {
+        CHECK(font_set_px(&original, px) == FONT_OK && original.atlas);
+        uint8_t cell[1920];
+        const font_ascii_atlas *bake = original.atlas;
+        for (uint32_t cp = 32; cp < 127; cp++) {
+            font_bitmap b; edit_arena_reset(&arena); memset(cell, 0, sizeof cell);
+            CHECK(font_raster_glyph(&original, cp, &arena, &b) == FONT_OK);
+            CHECK(font_place_in_cell(&original, &b, cell, bake->cell.cell_w, bake->cell.cell_h) == FONT_OK);
+            for (uint32_t y = 0; y < bake->cell.cell_h; y++)
+                CHECK(memcmp(cell + (size_t)y * bake->cell.cell_w,
+                      bake->pixels + ((size_t)y * 95u + cp - 32u) * bake->cell.cell_w, bake->cell.cell_w) == 0);
+        }
+    }
+    edit_arena_free(&arena); free(copy);
+    if (!failures) puts("review §1 GREEN: metrics-preserving cmap rejected; every baked ASCII pixel matches live outlines");
+}
+
+static ssize_t short_read(void *cookie, char *buf, size_t n)
+{
+    (void)cookie; (void)buf; (void)n; return 0;
+}
+static int short_seek(void *cookie, off64_t *off, int whence)
+{
+    off64_t *position = cookie;
+    if (whence == SEEK_END) *off += 4096;
+    else if (whence == SEEK_CUR) *off += *position;
+    *position = *off; return 0;
+}
+static void test_file_rollback(void)
+{
+    edit_arena arena; CHECK(edit_arena_init(&arena, 8192) == 0);
+    CHECK(edit_arena_alloc(&arena, 3, 1) != NULL); size_t mark = arena.used;
+    for (unsigned i = 0; i < 3; i++) {
+        off64_t pos = 0; cookie_io_functions_t ops = {short_read,NULL,short_seek,NULL};
+        FILE *fp = fopencookie(&pos, "rb", ops); CHECK(fp);
+        size_t len = 777;
+        CHECK(font_load_stream(fp, &arena, &len) == NULL);
+        CHECK(arena.used == mark && len == 0);
+        fclose(fp);
+    }
+    size_t len = 888;
+    CHECK(font_load_file("/nonexistent/font-review-fixture", &arena, &len) == NULL && len == 0);
+    CHECK(font_load_file("vendor/DejaVuSansMono.ttf", &arena, NULL) == NULL);
+    edit_arena_free(&arena);
+    if (!failures) puts("review §14 GREEN: short reads roll back arena and clear lengths; NULL length rejected");
+}
+
 static void on_msg(const work_msg *m, void *ud)
 {
     if (m->kind == FONT_FALLBACK_MSG_KIND) (*(int *)ud)++;
 }
 
+typedef struct cancel_probe {
+    font_fallback fb;
+    _Atomic int started, release;
+} cancel_probe;
+static void cancelled_probe_job(work_ctx *ctx)
+{
+    cancel_probe *p = ctx->arg; atomic_store(&p->started, 1);
+    while (!atomic_load(&p->release)) usleep(1000);
+    font_fallback_job(ctx);
+}
+static void test_cancelled_discovery(void)
+{
+    cancel_probe p = {0}; work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    work_handle h = work_submit(pool, (work_job){cancelled_probe_job, &p, 7, WORK_BULK}); CHECK(h.epoch);
+    for (unsigned i = 0; i < 2000 && !atomic_load(&p.started); i++) usleep(1000);
+    CHECK(atomic_load(&p.started)); work_cancel(pool, h); atomic_store(&p.release, 1);
+    for (unsigned i = 0; i < 2000 && !work_handle_finished(pool, h); i++) usleep(1000);
+    CHECK(work_handle_finished(pool, h)); CHECK(atomic_load(&p.fb.done) == 0);
+    work_pool_shutdown(pool); free(pool);
+    /* Also cancel after discovery has physically finished but before its
+     * queued mailbox result is adopted. This catches the original done
+     * side channel at the publication boundary, rather than only at entry. */
+    font_fallback queued = {0};
+    pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    h = work_submit(pool, (work_job){font_fallback_job, &queued, 17, WORK_BULK}); CHECK(h.epoch);
+    for (unsigned i = 0; i < 3000 && !work_handle_finished(pool, h); i++) usleep(1000);
+    CHECK(work_handle_finished(pool, h) && work_mailbox_pending(pool));
+    CHECK(atomic_load(&queued.done) == 0);
+    work_cancel(pool, h);
+    int got = 0; (void)work_mailbox_drain(pool, on_msg, &got);
+    CHECK(got == 0 && !work_mailbox_pending(pool));
+    CHECK(atomic_load(&queued.done) == 0 && queued.cjk[0] == 0 && queued.emoji[0] == 0);
+    work_pool_shutdown(pool); free(pool);
+    if (!failures) puts("review §7 GREEN: cancelled discovery has no adoptable done side channel");
+}
+typedef struct pressure_job {
+    font_fallback fb;
+    _Atomic int filled;
+} pressure_job;
+static void discovery_pressure(work_ctx *ctx)
+{
+    pressure_job *p = ctx->arg; work_msg msg = {0}; msg.kind = 1;
+    for (uint32_t i = 0; i < WORK_MAILBOX_CAP; i++) CHECK(work_publish(ctx, &msg));
+    atomic_store(&p->filled, 1);
+    font_fallback_job(ctx); /* fb is the first member */
+}
+static void test_discovery_pressure(void)
+{
+    pressure_job p = {0}; work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    work_handle h = work_submit(pool, (work_job){discovery_pressure, &p, 8, WORK_BULK}); CHECK(h.epoch);
+    for (unsigned i = 0; i < 2000 && !atomic_load(&p.filled); i++) usleep(1000);
+    CHECK(atomic_load(&p.filled));
+    /* Leave discovery enough time to reach publication, while the mailbox is full. */
+    usleep(100000);
+    int got = 0;
+    for (unsigned i = 0; i < 2000 && !got; i++) { (void)work_mailbox_drain(pool, on_msg, &got); usleep(1000); }
+    CHECK(got == 1);
+    work_pool_shutdown(pool); free(pool);
+    if (!failures) puts("review §8 GREEN: full mailbox drains, terminal discovery completion arrives");
+}
+
+static void test_discovery_cancellation(void)
+{
+    font_fallback fb = {0}; fb.discovery_program = "/proc/self/exe";
+    CHECK(setenv("FONT_REVIEW_CHILD", "1", 1) == 0);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool); CHECK(pool);
+    CHECK(work_pool_init(pool, 1, 0) == 0);
+    work_handle h = work_submit(pool, (work_job){font_fallback_job, &fb, 9, WORK_BULK}); CHECK(h.epoch);
+    uint32_t pid = 0;
+    for (unsigned i = 0; i < 300 && !(pid = atomic_load(&fb.child_pid)); i++) usleep(1000);
+    CHECK(pid != 0); work_cancel(pool, h);
+    for (unsigned i = 0; i < 1000 && !work_handle_finished(pool, h); i++) usleep(1000);
+    CHECK(work_handle_finished(pool, h)); CHECK(atomic_load(&fb.done) == 0);
+    if (pid) CHECK(kill((pid_t)pid, 0) == -1 && errno == ESRCH);
+    CHECK(atomic_load(&fb.cancellation_polls) > 0);
+    int got = 0; (void)work_mailbox_drain(pool, on_msg, &got); CHECK(got == 0);
+    work_pool_shutdown(pool); free(pool); CHECK(unsetenv("FONT_REVIEW_CHILD") == 0);
+    if (!failures) puts("review work-scan §9 GREEN: production discovery cancels and reaps an unbounded helper; no adoption");
+}
+
+typedef struct fallback_adoption { font_fallback *fb; int got; } fallback_adoption;
+static void adopt_fallback(const work_msg *msg, void *arg)
+{
+    fallback_adoption *a = arg;
+    if (font_fallback_event(a->fb, msg)) {
+        a->got++;
+        CHECK(font_fallback_event(a->fb, msg) == 0); /* no repeated adoption */
+    }
+}
 static void test_fallback(void)
 {
     static font_fallback fb;     /* static: ~1 KB, lives past the job */
@@ -656,15 +827,15 @@ static void test_fallback(void)
     pthread_t me = pthread_self();
     CHECK(work_submit(&pool, j).epoch != 0);
     struct pollfd pfd = { work_pool_eventfd(&pool), POLLIN, 0 };
-    int got = 0;
-    for (int i = 0; i < 300 && !got; i++) {   /* up to 30 s */
-        if (poll(&pfd, 1, 100) > 0) work_mailbox_drain(&pool, on_msg, &got);
+    fallback_adoption adoption = {&fb, 0};
+    for (int i = 0; i < 300 && !adoption.got; i++) {   /* up to 30 s */
+        if (poll(&pfd, 1, 100) > 0) work_mailbox_drain(&pool, adopt_fallback, &adoption);
     }
-    CHECK(got == 1);
+    CHECK(adoption.got == 1);
     CHECK(atomic_load(&fb.done) == 1u);
     CHECK(!pthread_equal(fb.worker, me));
-    printf("font_test: fallback fontconfig=%d cjk='%s' emoji='%s' (%.1f ms)\n",
-           fb.have_fontconfig, fb.cjk, fb.emoji, (double)fb.elapsed_ns / 1e6);
+    printf("font_test: fallback fontconfig=%d cjk='%s' emoji='%s'\n",
+           fb.have_fontconfig, fb.cjk, fb.emoji);
     work_pool_shutdown(&pool);
 
     /* #10: a second run must not be observable as done until it finishes. */
@@ -673,12 +844,12 @@ static void test_fallback(void)
     CHECK(fb.cjk[0] == 0 && fb.emoji[0] == 0 && fb.cjk_index == 0);
     CHECK(work_pool_init(&pool, 1, 0) == 0);
     CHECK(work_submit(&pool, j).epoch != 0);
-    got = 0;
+    adoption.got = 0;
     pfd.fd = work_pool_eventfd(&pool);
-    for (int i = 0; i < 300 && !got; i++) {
-        if (poll(&pfd, 1, 100) > 0) work_mailbox_drain(&pool, on_msg, &got);
+    for (int i = 0; i < 300 && !adoption.got; i++) {
+        if (poll(&pfd, 1, 100) > 0) work_mailbox_drain(&pool, adopt_fallback, &adoption);
     }
-    CHECK(got == 1 && atomic_load(&fb.done) == 1u);
+    CHECK(adoption.got == 1 && atomic_load(&fb.done) == 1u);
     work_pool_shutdown(&pool);
     if (fb.cjk[0]) {                      /* FC_INDEX carried: a TTC must open at that face */
         edit_arena fa;
@@ -703,8 +874,12 @@ static void test_fallback(void)
     CHECK(none.cjk[0] == 0 && none.emoji[0] == 0);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* fc-match-compatible test child deliberately never returns. */
+    if (argc > 1 && strcmp(argv[1], "-f") == 0 && getenv("FONT_REVIEW_CHILD")) {
+        for (;;) atomic_signal_fence(memory_order_seq_cst);
+    }
     size_t len = 0;
     unsigned char *ttf = load_ttf(&len);
     if (!ttf) { fprintf(stderr, "font_test: cannot read vendor/DejaVuSansMono.ttf\n"); return 1; }
@@ -714,6 +889,16 @@ int main(void)
     edit_arena a;
     CHECK(edit_arena_init(&a, 1u << 20) == 0);
 
+    if (getenv("FONT_REVIEW_POLLING")) { test_discovery_cancellation(); return failures ? 1 : 0; }
+    if (getenv("FONT_REVIEW_DISCOVERY")) {
+        if (strcmp(getenv("FONT_REVIEW_DISCOVERY"), "7") == 0) test_cancelled_discovery();
+        else test_discovery_pressure();
+        return failures ? 1 : 0;
+    }
+    if (getenv("FONT_REVIEW_FILE")) { test_file_rollback(); return failures ? 1 : 0; }
+    test_file_rollback();
+    test_atlas_identity(ttf, len);
+    if (getenv("FONT_REVIEW_IDENTITY")) return failures ? 1 : 0;
     test_bake_consistency(&f);
     test_raster(&f, &a);
     test_raster_exhaustion(&f, &a);
@@ -731,6 +916,9 @@ int main(void)
     test_ttc(ttf, len);
     test_cff_synthetic();
     test_cff_noto();
+    test_discovery_cancellation();
+    test_cancelled_discovery();
+    test_discovery_pressure();
     test_fallback();
 
     edit_arena_free(&a);

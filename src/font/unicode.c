@@ -2,13 +2,24 @@
 #include "font/font.h"
 #include "utf8/utf8.h"
 #include <string.h>
+#include <time.h>
 
 int font_cluster_ignorable(uint32_t cp)
 {
-    return cp == 0x200cu || cp == 0x200du ||
-           (cp >= 0xfe00u && cp <= 0xfe0fu) ||
-           (cp >= 0xe0100u && cp <= 0xe01efu) ||
-           (cp >= 0xe0020u && cp <= 0xe007fu);
+    /* Unicode 15.1 Default_Ignorable_Code_Point. Keep visible Mn/Me/Mc
+     * separate: zero cell width alone never implies invisible artwork. */
+    return cp == 0xadu || cp == 0x34fu || cp == 0x61cu ||
+           (cp >= 0x115fu && cp <= 0x1160u) ||
+           (cp >= 0x17b4u && cp <= 0x17b5u) ||
+           (cp >= 0x180bu && cp <= 0x180fu) ||
+           (cp >= 0x200bu && cp <= 0x200fu) ||
+           (cp >= 0x202au && cp <= 0x202eu) ||
+           (cp >= 0x2060u && cp <= 0x206fu) || cp == 0x3164u ||
+           (cp >= 0xfe00u && cp <= 0xfe0fu) || cp == 0xfeffu || cp == 0xffa0u ||
+           (cp >= 0xfff0u && cp <= 0xfff8u) ||
+           (cp >= 0x1bca0u && cp <= 0x1bca3u) ||
+           (cp >= 0x1d173u && cp <= 0x1d17au) ||
+           (cp >= 0xe0000u && cp <= 0xe0fffu);
 }
 
 int font_family_load(font_family *family, const font_t *primary,
@@ -56,14 +67,19 @@ int font_cache_init(font_cache *cache, font_family *family, edit_arena *arena,
     memset(cache, 0, sizeof *cache);
     cache->family = family; cache->cell = cell;
     cache->capacity = entries; cache->key_capacity = key_bytes;
+    cache->negative_capacity = entries < 64u ? entries : 64u;
     cache->entries = edit_arena_alloc(arena, entries * sizeof *cache->entries, _Alignof(font_cache_entry));
     cache->glyphs = edit_arena_alloc(arena, (entries + 95u) * sizeof *cache->glyphs, _Alignof(render_glyph));
     cache->keys = edit_arena_alloc(arena, key_bytes, 1);
+    cache->negative_entries = edit_arena_alloc(arena, cache->negative_capacity * sizeof *cache->entries, _Alignof(font_cache_entry));
+    cache->negative_keys = edit_arena_alloc(arena, cache->negative_capacity * 256u, 1);
+    cache->pending_key = edit_arena_alloc(arena, FONT_CLUSTER_MAX_BYTES, 1);
     cache->image = edit_arena_alloc(arena, (size_t)cell.cell_w * 2u * cell.cell_h, 1);
     cache->scratch.base = edit_arena_alloc(arena, scratch_bytes, 16);
     cache->scratch.size = scratch_bytes;
-    if (!cache->entries || !cache->glyphs || !cache->keys || !cache->image || !cache->scratch.base) goto nomem;
+    if (!cache->entries || !cache->glyphs || !cache->keys || !cache->image || !cache->scratch.base || !cache->negative_entries || !cache->negative_keys || !cache->pending_key) goto nomem;
     memset(cache->entries, 0, entries * sizeof *cache->entries);
+    memset(cache->negative_entries, 0, cache->negative_capacity * sizeof *cache->entries);
     const font_ascii_atlas *a = family->faces[0].atlas;
     cache->pages[0] = (render_atlas_page){a->pixels, a->pixels_len,
         (size_t)cell.cell_w * 95u, cell.cell_w * 95u, cell.cell_h};
@@ -114,36 +130,69 @@ static void composite(font_cache *cache, const font_bitmap *b, uint32_t width, i
     }
 }
 
+static uint64_t compose_time(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
 static int compose_cluster(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width)
 {
-    memset(cache->image, 0, (size_t)cache->cell.cell_w * width * cache->cell.cell_h);
-    int32_t advance = 0;
-    for (size_t off = 0; off < len;) {
-        utf8_step s = utf8_decode(bytes + off, len - off);
-        if (!s.valid || s.cp < 0x20u || s.cp == 0x7fu) return FONT_ERR_ARG;
-        off += s.len;
-        if (font_cluster_ignorable(s.cp)) continue;
+    if (cache->pending_len != len || cache->pending_width != width ||
+        memcmp(cache->pending_key, bytes, len) != 0) {
+        memcpy(cache->pending_key, bytes, len);
+        cache->pending_len = len; cache->pending_width = width;
+        cache->pending_off = 0; cache->pending_advance = 0;
+        memset(cache->image, 0, (size_t)cache->cell.cell_w * width * cache->cell.cell_h);
+    }
+    uint64_t start = compose_time(); uint32_t work = 0;
+    while (cache->pending_off < len) {
+        if (work == FONT_COMPOSE_MAX_GLYPHS || (work && compose_time() - start >= 250000u)) return FONT_MORE;
+        utf8_step step = utf8_decode(cache->pending_key + cache->pending_off, len - cache->pending_off);
+        /* The complete key has already been validated. Controls count as work
+         * too, so an invisible-only sequence also has a bounded continuation. */
+        work++;
+        if (font_cluster_ignorable(step.cp)) { cache->pending_off += step.len; continue; }
         font_t *face = NULL; font_metric metric;
         for (uint32_t i = 0; i < cache->family->count; i++) {
-            int rc = font_glyph_metrics(&cache->family->faces[i], s.cp, &metric);
+            int rc = font_glyph_metrics(&cache->family->faces[i], step.cp, &metric);
             if (rc == FONT_OK) { face = &cache->family->faces[i]; break; }
             if (rc != FONT_ERR_MISSING) return rc;
         }
         if (!face) return FONT_ERR_MISSING;
-        font_bitmap b;
-        edit_arena_reset(&cache->scratch);
-        int rc = font_raster_glyph(face, s.cp, &cache->scratch, &b);
+        font_bitmap b; edit_arena_reset(&cache->scratch);
+        cache->rasterizations++;
+        int rc = font_raster_glyph(face, step.cp, &cache->scratch, &b);
         if (rc != FONT_OK) return rc;
-        int zero = utf8_cell_width(s.cp) == 0;
-        /* Negative-bearing combining outlines are relative to the base's
-         * advance; positive-bearing marks (including Mono) are cell-relative.
-         * Multiple spacing components (ZWJ/Hangul) overlay at the origin. */
-        int32_t pen = zero && b.m.bearing_x < 0 ? advance : 0;
+        int zero = utf8_cell_width(step.cp) == 0;
+        int32_t pen = zero && b.m.advance == 0 ? cache->pending_advance : 0;
         if (b.pixels) composite(cache, &b, width, pen);
-        if (!zero) advance = b.m.advance;
+        if (!zero) cache->pending_advance = b.m.advance;
+        cache->pending_off += step.len;
+        edit_arena_reset(&cache->scratch);
     }
-    edit_arena_reset(&cache->scratch);
     return FONT_OK;
+}
+
+static font_cache_entry *cache_probe(font_cache *cache, font_cache_entry *table,
+                                     size_t capacity, const uint8_t *keys,
+                                     uint64_t hash, const uint8_t *bytes,
+                                     size_t len, uint32_t width)
+{
+    size_t at = (size_t)(hash % capacity);
+    for (size_t i = 0; i < capacity && i < FONT_CACHE_MAX_PROBES; i++) {
+        cache->probes++;
+        font_cache_entry *e = &table[at];
+        if (!e->len || (e->hash == hash && e->len == len && e->width == width &&
+                       memcmp(keys + e->key, bytes, len) == 0)) return e;
+        if (++at == capacity) at = 0;
+    }
+    return NULL;
+}
+static int cache_nomem(font_cache *cache)
+{
+    cache->pending_len = 0;
+    cache->resource_error = FONT_ERR_NOMEM;
+    return FONT_ERR_NOMEM;
 }
 
 int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
@@ -152,27 +201,44 @@ int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
     font_cache *cache = ctx;
     if (!cache || !cache->family || !cluster || !len || len > FONT_CLUSTER_MAX_BYTES ||
         !slot || width < 1u || width > 2u) return FONT_ERR_ARG;
+    /* Validate the entire span before coverage, hashing or cache admission. */
+    for (size_t off = 0; off < len;) {
+        utf8_step step = utf8_decode(cluster + off, len - off);
+        if (!step.valid || step.cp < 0x20u || step.cp == 0x7fu) return FONT_ERR_ARG;
+        off += step.len;
+    }
     uint64_t hash = UINT64_C(14695981039346656037);
     for (size_t i = 0; i < len; i++) hash = (hash ^ cluster[i]) * UINT64_C(1099511628211);
     hash = (hash ^ width) * UINT64_C(1099511628211);
-    size_t at = (size_t)(hash % cache->capacity);
-    font_cache_entry *entry = NULL;
-    for (size_t i = 0; i < cache->capacity; i++) {
-        font_cache_entry *e = &cache->entries[at];
-        if (!e->len) { entry = e; break; }
-        if (e->hash == hash && e->len == len && e->width == width &&
-            memcmp(cache->keys + e->key, cluster, len) == 0) {
-            cache->hits++;
-            if (e->result == FONT_OK) *slot = e->slot;
-            return e->result;
-        }
-        if (++at == cache->capacity) at = 0;
+    font_cache_entry *entry = cache_probe(cache, cache->entries, cache->capacity,
+                                          cache->keys, hash, cluster, len, width);
+    font_cache_entry *negative = cache_probe(cache, cache->negative_entries, cache->negative_capacity,
+                                             cache->negative_keys, hash, cluster, len, width);
+    font_cache_entry *hit = entry && entry->len ? entry : negative && negative->len ? negative : NULL;
+    if (hit) {
+        cache->hits++;
+        if (hit->result == FONT_OK) *slot = hit->slot;
+        return hit->result;
     }
     cache->misses++;
-    if (!entry || len > cache->key_capacity - cache->key_used) return FONT_ERR_NOMEM;
     int rc = compose_cluster(cache, cluster, len, width);
     edit_arena_reset(&cache->scratch);
+    if (rc == FONT_MORE) return rc;
+    cache->pending_len = 0;
+    if (rc == FONT_ERR_NOMEM) return cache_nomem(cache);
     if (rc != FONT_OK && rc != FONT_ERR_MISSING) return rc;
+    if (rc == FONT_ERR_MISSING) {
+        /* Admission is optional for negatives; refusal remains MISSING.
+         * Positive keys/rectangles are never consumed by missing scalars. */
+        if (negative && len <= 256u && cache->negative_count < (cache->negative_capacity + 1u) / 2u) {
+            memcpy(cache->negative_keys + cache->negative_used, cluster, len);
+            *negative = (font_cache_entry){hash, cache->negative_used, (uint32_t)len, width, RENDER_NO_SLOT, rc};
+            cache->negative_used += len; cache->negative_count++;
+        }
+        return rc;
+    }
+    if (!entry || len > cache->key_capacity - cache->key_used ||
+        cache->entry_count >= cache->capacity - cache->capacity / 4u) return cache_nomem(cache);
     uint32_t result_slot = RENDER_NO_SLOT;
     if (rc == FONT_OK) {
         size_t bytes = (size_t)cache->cell.cell_w * width * cache->cell.cell_h;
@@ -181,7 +247,7 @@ int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
         if (ink) {
             uint32_t page, x, y, w = cache->cell.cell_w * width, h = cache->cell.cell_h;
             rc = font_atlas_alloc(&cache->atlas, w, h, &page, &x, &y);
-            if (rc != FONT_OK) return rc;
+            if (rc != FONT_OK) return cache_nomem(cache);
             uint8_t *pixels = (uint8_t *)(void *)cache->pages[page + 1u].pixels;
             for (uint32_t row = 0; row < h; row++)
                 memcpy(pixels + (size_t)(y + row) * FONT_ATLAS_PAGE_DIM + x,
@@ -196,7 +262,7 @@ int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
     }
     memcpy(cache->keys + cache->key_used, cluster, len);
     *entry = (font_cache_entry){hash, cache->key_used, (uint32_t)len, width, result_slot, rc};
-    cache->key_used += len;
+    cache->key_used += len; cache->entry_count++;
     if (rc == FONT_OK) *slot = result_slot;
     return rc;
 }

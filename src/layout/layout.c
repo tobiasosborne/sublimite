@@ -412,10 +412,24 @@ int layout_run(layout *l)
                     } else if (l->col + (uint32_t)w > hscroll) {
                         uint32_t s2 = 0;
                         if (clen > LAYOUT_WIN) l->approximate = true; /* exact width; composition exceeds scratch */
-                        else if (l->cfg.glyph && l->cfg.glyph(l->cfg.glyph_ctx, p, clen, (uint32_t)w, &s2) == 0 &&
-                            (s2 == RENDER_NO_SLOT || s2 < l->grid->glyph_count)) {
-                            slot = s2;
-                            gidx = s2 == RENDER_NO_SLOT ? 0 : l->grid->glyphs[s2].glyph_index;
+                        else if (l->cfg.glyph) {
+                            int glyph_rc = l->cfg.glyph(l->cfg.glyph_ctx, p, clen, (uint32_t)w, &s2);
+                            if (glyph_rc == FONT_MORE) {
+                                /* Segmentation consumed the cluster. Replay it
+                                 * on the next slice before visiting another key,
+                                 * preserving the font's one pending image. */
+                                l->pos = at;
+                                l->row_scanned -= clen;
+                                l->win_len = l->wi = 0; l->win_eof = false;
+                                l->cluster_active = false;
+                                goto more;
+                            }
+                            if (glyph_rc == FONT_ERR_NOMEM)
+                                l->approximate = true; /* recover storage after T5 */
+                            if (glyph_rc == FONT_OK && (s2 == RENDER_NO_SLOT || s2 < l->grid->glyph_count)) {
+                                slot = s2;
+                                gidx = s2 == RENDER_NO_SLOT ? 0 : l->grid->glyphs[s2].glyph_index;
+                            }
                         }
                     }
                 }

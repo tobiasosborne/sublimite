@@ -6,6 +6,8 @@
  * after the paths are copied; the library handle is never dlclose'd. Not a typing-path module: libc
  * allocation inside fontconfig is acceptable here. */
 #include "font/font.h"
+#include "font/file.h"
+#include "font/discovery.h"
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
@@ -128,6 +130,8 @@ void font_fallback_reset(font_fallback *fb)
     fb->emoji_index = 0;
     fb->have_fontconfig = 0;
     fb->elapsed_ns = 0;
+    fb->staged_epoch = 0; fb->discovery_program = NULL;
+    atomic_store(&fb->child_pid, 0u); atomic_store(&fb->cancellation_polls, 0u);
 }
 
 void font_fallback_discover(font_fallback *fb, const char *soname)
@@ -155,19 +159,44 @@ void font_fallback_discover(font_fallback *fb, const char *soname)
 
 void font_fallback_job(work_ctx *c)
 {
-    font_fallback *fb = (font_fallback *)c->arg;
-    font_fallback_discover(fb, "libfontconfig.so.1");
-    work_msg m;
-    memset(&m, 0, sizeof m);
-    m.kind = FONT_FALLBACK_MSG_KIND;
-    m.generation = c->generation;
-    (void)work_publish(c, &m);
+    if (work_should_stop(c)) return;
+    font_fallback *fb = c->arg;
+    font_fallback_result local;
+    if (!font_fallback_isolated(fb, &local, c) || work_should_stop(c)) return;
+    fb->staged = local;
+    fb->staged_generation = c->generation;
+    fb->staged_slot = (uint32_t)(c->slot - c->pool->slots); fb->staged_epoch = c->epoch;
+    work_msg msg = {0}; msg.kind = FONT_FALLBACK_MSG_KIND; msg.generation = c->generation;
+    uintptr_t identity = (uintptr_t)fb; memcpy(msg.data, &identity, sizeof identity);
+    /* No reserved completion lane in work: wait for UI drain without losing
+     * the terminal event. Cancellation suppresses both publication and adoption. */
+    while (!work_should_stop(c)) {
+        if (work_publish(c, &msg)) return;
+        struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+    }
 }
 
-unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len)
+int font_fallback_event(font_fallback *fb, const work_msg *msg)
 {
-    FILE *fp = path && arena ? fopen(path, "rb") : NULL;
-    if (!fp) return NULL;
+    if (!fb || !msg || msg->kind != FONT_FALLBACK_MSG_KIND) return 0;
+    uintptr_t identity = 0; memcpy(&identity, msg->data, sizeof identity);
+    if (identity != (uintptr_t)fb || atomic_load_explicit(&fb->done, memory_order_acquire) != 0u ||
+        msg->generation != fb->staged_generation || msg->slot_ != fb->staged_slot ||
+        msg->epoch_ != fb->staged_epoch || !fb->staged_epoch) return 0;
+    memcpy(fb->cjk, fb->staged.cjk, sizeof fb->cjk);
+    memcpy(fb->emoji, fb->staged.emoji, sizeof fb->emoji);
+    fb->cjk_index = fb->staged.cjk_index; fb->emoji_index = fb->staged.emoji_index;
+    fb->have_fontconfig = fb->staged.have_fontconfig;
+    fb->elapsed_ns = fb->staged.elapsed_ns; fb->worker = fb->staged.worker;
+    atomic_store_explicit(&fb->done, 1u, memory_order_release);
+    return 1;
+}
+
+unsigned char *font_load_stream(FILE *fp, edit_arena *arena, size_t *len)
+{
+    if (len) *len = 0;
+    if (!fp || !arena || !len) return NULL;
+    edit_arena_mark_t mark = edit_arena_mark(arena);
     unsigned char *buf = NULL;
     long n = 0;
     if (fseek(fp, 0, SEEK_END) == 0) n = ftell(fp);
@@ -175,7 +204,16 @@ unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len)
         buf = edit_arena_alloc(arena, (size_t)n, 16);
         if (buf && fread(buf, 1, (size_t)n, fp) != (size_t)n) buf = NULL;
     }
-    fclose(fp);
     if (buf) *len = (size_t)n;
+    else edit_arena_reset_to_mark(arena, mark);
+    return buf;
+}
+unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len)
+{
+    if (len) *len = 0;
+    FILE *fp = path && arena && len ? fopen(path, "rb") : NULL;
+    if (!fp) return NULL;
+    unsigned char *buf = font_load_stream(fp, arena, len);
+    fclose(fp);
     return buf;
 }

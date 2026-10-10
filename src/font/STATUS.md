@@ -1,52 +1,52 @@
-# Font status — P4.11 / edit-457.11
+# Font status — P4.11b / edit-457.19
 
-Implemented: fixed-arena, append-only Unicode cluster cache and layout glyph
-callback; embedded + discovered CJK/monochrome emoji family loading with TTC
-face indices; common baseline, coverage-preserving combining composition;
-two-cell images using utf8 widths; immutable fallback atlas pages; exact keys
-including width; negative missing-glyph caching; bounded exhaustion with old
-entries usable; no I/O/fontconfig/libc allocation on glyph lookup.
+Review fixes: baked ASCII requires INIT SHA-256/face identity; full-advance
+Mono marks stay cell-relative; zero-advance proportional marks use the base
+pen; Unicode 15.1 default-ignorable controls preserve covered bases; full-span
+UTF-8 validation precedes cache admission. Parser/CFF internals unchanged.
 
-The headless Unicode suite enumerates the actual corpus-covered scalar set,
-checks the full corpus's cell grids, compares computed pixel expectations to
-scalar/SSE2 raster at both baked sizes, checks invalid bytes (one inverse '?'
-per byte), clipping, cache exhaustion/page growth and no allocations on cold
-and cached paths. Font parser/malformed-font fuzz behavior is unchanged.
+Cache: fixed-arena append-only pixels/slots through T5. Positive and separately
+bounded negative tables have fixed probe limits and independent key storage.
+Cold lookup composes bounded scalar slices, returns FONT_MORE and preserves
+one exact pending image. Wrapped/unwrapped layout returns LAYOUT_MORE and
+replays that key on its next slice; callers can check input between slices.
+Different cold keys abandon pending work, hits preserve it. NOMEM records
+sticky resource_error and layout_approximate; neither NOMEM nor MORE means
+missing font content. No allocations or I/O in cache lookup.
 
-Integration: prepare font_fallback on WORK_BULK; acquire its publication, load
-font_family on INIT worker, hand off through work mailbox. Reserve cache on
-INIT, bind grid with font_cache_bind, set layout_config.glyph=font_cache_glyph
-and glyph_ctx=&cache. Keep fonts sized and immutable and keep all arenas alive
-until quiescent renderer shutdown. Cache/grid ownership is UI-exclusive; one
-bound grid at a time. No caller integration outside this bead's allowed files
-was attempted.
+Discovery: font_fallback_job uses an isolated installed /usr/bin/fc-match child,
+with bounded parent work, cancellation, kill/reap and bounded output parsing.
+Missing CLI gracefully yields embedded-only fallback. Results stay staged until
+font_fallback_event adopts a live mailbox completion matching identity/generation;
+full-mailbox publication retries cancellably. Reset before reuse, retain fb
+through physical completion and message drain. Synchronous soname discovery is
+exclusive INIT only; do not use it inside cancellable pooled jobs.
 
-Scope limits: only the discovered CJK/emoji fallback faces are searched, not
-all installed fonts. Missing visible components use layout's '?'. Invisible
-sequence controls need no glyph. No bidi/IME/contextual script shaping/emoji
-ligature engine; covered ZWJ spacing outlines overlay in their shared image.
-Standalone zero-width clusters and >layout-window composition retain P3.1's
-existing behavior. Cache eviction, concurrent worker raster/cache append and
-runtime size changes are outside this implementation.
+Tests independently compare ASCII, multiple marks, negative Mono/proportional
+fallback marks, controls, covered ZWJ and VS15/VS16 pixels at both baked sizes.
+A deferred render adapter borrows pixels through delayed T5 while UI rebinds
+and appends; opposite-size cache replacement/arena retirement follows T5/T6.
+Fuzzer exercises direct malformed spans, continuation work bounds, collisions,
+exhaustion and small/normal-capacity caches. Bench has pure failure self-checks
+and binding raster tail / cold-slice / pressure / cached budgets; TRACK only
+on the shared box. Run it once, after verification, with power/load stamp.
 
-Verify with the commands and campaign evidence in docs/decisions/P4.11.md.
-Existing bench gates were not loosened. Shared-machine measurements are TRACK;
-the coordinator must establish quiet-box font/layout/G1 verdicts and re-run
-LSan enabled (this sandbox run uses detect_leaks=0).
+Missing integration: the editor on main still binds only baked ASCII and has
+no runtime font-cache owner. Wiring that owner and rotating exhausted cache
+storage after T5 or quiescent shutdown with full damage/redraw remain outside
+this font/layout review fix. The font API and deferred integration test provide
+the status, correct-content retry and lifetime boundaries; no automatic editor
+cache retirement is claimed. A single raster call cannot
+be preempted; hard latency guarantees for complex individual glyphs require
+worker preparation. Full bidi/contextual shaping/color emoji remain out of scope.
 
-Final verification: GCC make all PASS; release font/layout/Unicode PASS;
-Clang ASan/UBSan make check PASS (26 binaries and replay CLI) using :99 outside
-socket restrictions, with LSan disabled. make fuzz builds 14 fuzzers; Unicode
-font campaign: 35,689 runs in 61 s, no findings (M)[AC], load 4.14.
-Full corpus: 529,389 covered / 19,307 uncovered visible clusters; no covered
-placeholders, cold-layout allocation guard zero (M)[AC], preceding load 5.98.
-Computed pixel expectation equals scalar and SSE2 at 15/30 px.
-
-Final benches (M)[AC], load 4.19, ns p50/p99: font raster 4912/5322 (gate p50
-50000 unchanged); cold composed cluster 24215/24599; cached 45/48; real-cache
-Unicode full viewport 345021/403526; Unicode typing row 2154/4080. Font gates
-pass. Layout bench exits with pre-existing ASCII/log gate misses; 10% TRACK
-comparison unresolved (log p50 +39.13%, malformed p99 +16.08%, other rows
-improve). Layout source is unchanged; no repeated quiet-seeking runs. Quiet
-coordinator verdict remains necessary. Large cold clusters have linear
-composition cost; these benches are not whole-path G1 certification.
+Verify: make all; DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0
+make check; make fuzz; FONT_FUZZ_UNICODE=1 ASAN_OPTIONS=detect_leaks=0
+build/fuzz/font_fuzz -max_total_time=60 -max_len=16384. Regression selectors
+and inherited per-finding red/green evidence: docs/decisions/P4.11b.md.
+Session 8 results, limitations and bench observation:
+docs/worker-reports/edit-457.19-s8.md. Coordinator must rerun with leaks on.
+Final make all and make check exited zero; release allocation guards passed.
+Unicode, seeded Unicode and parser fuzz campaigns completed cleanly. The
+once-only loaded bench exited one on its long-cluster tail observation; this
+is TRACK and does not establish a timing gate verdict.

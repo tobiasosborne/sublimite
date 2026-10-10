@@ -54,19 +54,51 @@ static int unicode_clusters(const uint8_t *data, size_t size)
     font_t primary; font_family family; font_cache cache;
     REQUIRE(bytes && font_init(&primary, bytes, len) == FONT_OK && font_set_px(&primary, 15) == FONT_OK);
     REQUIRE(font_family_load(&family, &primary, NULL, &files) == FONT_OK);
-    REQUIRE(font_cache_init(&cache, &family, &storage, 1, 1u + data[0] % 32u,
-                            1u + data[0], 1u << 20) == FONT_OK);
+    size_t capacity = data[0] & 64u ? 8192u : 1u + data[0] % 32u;
+    REQUIRE(font_cache_init(&cache, &family, &storage, 1, capacity,
+                            data[0] & 64u ? 65536u : 1u + data[0], 1u << 20) == FONT_OK);
+    /* Direct API spans include malformed suffixes that segmentation separates. */
+    if (size > 1 && size - 1 <= FONT_CLUSTER_MAX_BYTES) {
+        int invalid = 0;
+        for (size_t off = 1; off < size;) {
+            utf8_step step = utf8_decode(data + off, size - off);
+            if (!step.valid || step.cp < 0x20u || step.cp == 0x7fu) { invalid = 1; break; }
+            off += step.len;
+        }
+        if (invalid) {
+            uint32_t slot = 123; font_atlas before = cache.atlas;
+            REQUIRE(font_cache_glyph(&cache, data + 1, size - 1, 1, &slot) == FONT_ERR_ARG);
+            REQUIRE(slot == 123 && cache.key_used == 0 && cache.negative_used == 0 && cache.glyph_count == 95);
+            REQUIRE(memcmp(&before, &cache.atlas, sizeof before) == 0);
+        }
+    }
     for (size_t off = 1; off < size;) {
         int width; size_t n = utf8_cluster(data + off, size - off, &width);
         REQUIRE(n && n <= size - off && width >= 0 && width <= 2);
         if (width != 0 && n <= FONT_CLUSTER_MAX_BYTES) {
             uint32_t a = RENDER_NO_SLOT, b = RENDER_NO_SLOT;
-            int ra = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &a);
+            int ra; size_t continuations = 0;
+            do {
+                uint64_t probes = cache.probes, rasters = cache.rasterizations;
+                ra = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &a);
+                REQUIRE(cache.probes - probes <= 2u * FONT_CACHE_MAX_PROBES);
+                REQUIRE(cache.rasterizations - rasters <= FONT_COMPOSE_MAX_GLYPHS);
+                REQUIRE(++continuations <= n + 1u);
+            } while (ra == FONT_MORE);
             REQUIRE(ra == FONT_OK || ra == FONT_ERR_ARG || ra == FONT_ERR_MISSING ||
                     ra == FONT_ERR_NOMEM || ra == FONT_ERR_INIT);
             size_t keys = cache.key_used, glyphs = cache.glyph_count, used = storage.used;
             font_atlas atlas = cache.atlas;
-            int rb = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &b);
+            /* Negative admission is optional. Long missing keys and failed
+             * positive admission may need composition again on a repeat. */
+            int rb; continuations = 0;
+            do {
+                uint64_t probes = cache.probes, rasters = cache.rasterizations;
+                rb = font_cache_glyph(&cache, data + off, n, (uint32_t)width, &b);
+                REQUIRE(cache.probes - probes <= 2u * FONT_CACHE_MAX_PROBES);
+                REQUIRE(cache.rasterizations - rasters <= FONT_COMPOSE_MAX_GLYPHS);
+                REQUIRE(++continuations <= n + 1u);
+            } while (rb == FONT_MORE);
             REQUIRE(ra == rb && a == b && keys == cache.key_used && glyphs == cache.glyph_count && used == storage.used);
             REQUIRE(memcmp(&atlas, &cache.atlas, sizeof atlas) == 0 && cache.scratch.used == 0);
             if (ra == FONT_OK && a != RENDER_NO_SLOT) {

@@ -354,6 +354,8 @@ int layout_wrap_run(layout *l)
             position(l,back); l->col=col; l->vis=vis;
             int rc=end_row(l,cells,false,false); if(rc<0) return rc; continue;
         }
+        uint64_t previous_last=l->wrap_last;
+        bool previous_leading=l->wrap_leading;
         l->wrap_last=at;
         if(l->wrap_leading) {
             if(space) { uint64_t lead=l->col+w; uint32_t max_indent=l->text_cols>2?l->text_cols/2u:0;
@@ -371,9 +373,18 @@ int layout_wrap_run(layout *l)
                 else if(!attrs) {
                     uint32_t candidate;
                     if(len>LAYOUT_WIN) l->approximate=true;
-                    else if(l->cfg.glyph && l->cfg.glyph(l->cfg.glyph_ctx,p,len,w,&candidate)==0 &&
-                            (candidate==RENDER_NO_SLOT || candidate<l->grid->glyph_count)) {
-                        slot=candidate; glyph=slot==RENDER_NO_SLOT?0:l->grid->glyphs[slot].glyph_index;
+                    else if(l->cfg.glyph) {
+                        int glyph_rc=l->cfg.glyph(l->cfg.glyph_ctx,p,len,w,&candidate);
+                        if(glyph_rc==FONT_MORE) {
+                            position(l,at); l->row_scanned-=len;
+                            l->cluster_active=false;
+                            l->wrap_last=previous_last; l->wrap_leading=previous_leading;
+                            return LAYOUT_MORE;
+                        }
+                        if(glyph_rc==FONT_ERR_NOMEM) l->approximate=true;
+                        if(glyph_rc==FONT_OK && (candidate==RENDER_NO_SLOT || candidate<l->grid->glyph_count)) {
+                            slot=candidate; glyph=slot==RENDER_NO_SLOT?0:l->grid->glyphs[slot].glyph_index;
+                        }
                     }
                 }
             }

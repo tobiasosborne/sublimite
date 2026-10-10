@@ -485,6 +485,8 @@ static int cff_validate(const unsigned char *cff, uint64_t n, uint32_t ng)
     return 1;
 }
 
+#include "identity.h"
+
 int font_init(font_t *f, const unsigned char *ttf, size_t len)
 {
     return font_init_index(f, ttf, len, 0);
@@ -582,6 +584,7 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
     f->face_index = index;
     f->glyf_len = (uint32_t)glyf_n;
     f->num_glyphs = ng;
+    f->bake_identity = (uint32_t)font_identity_matches(ttf, len, index);
     return FONT_OK;
 }
 
@@ -725,12 +728,11 @@ const font_metric *font_ascii_atlas_glyph(const font_ascii_atlas *a, uint32_t cp
     return &a->metrics[cp - FONT_ASCII_FIRST];
 }
 
-/* The baked atlas is used only if every baked metric and the cell equal the
- * live font's values, so a different face (e.g. CJK fallback) never gets it. */
+/* Content/face identity is required; metrics additionally catch stale bakes. */
 static const font_ascii_atlas *atlas_matching(const font_t *f)
 {
     const font_ascii_atlas *a = font_ascii_atlas_for_px(f->px);
-    if (!a) return NULL;
+    if (!a || !f->bake_identity) return NULL;
     if (a->cell.cell_w != f->cell.cell_w || a->cell.cell_h != f->cell.cell_h ||
         a->cell.ascent != f->cell.ascent)
         return NULL;
