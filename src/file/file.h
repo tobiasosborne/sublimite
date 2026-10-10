@@ -86,6 +86,7 @@
 #define FILE_PREFIX_MAX (1u << 20)
 
 typedef struct file file;
+typedef struct file_source file_source;
 
 /* A backing token is independent of the UI file object. The snapshot lookup
  * borrows its lifetime; acquire/release retain only the physical backing.
@@ -208,6 +209,18 @@ int file_errno(const file *f);              /* errno of the last FILE_ERR_IO */
 int file_open_ready(const file *f);
 /* Give the content to an empty tree. Valid once; FILE_ERR_STATE if not ready. */
 int file_attach(file *f, piece_tree *t);
+
+/* CPU-only acquisition of the actual opened original and its fault service.
+ * Requires full acquisition/attachment. The lease survives file_close and
+ * retains the original descriptor/mapping. Validation is worker-only I/O,
+ * comparing complete original identity and a sticky SIGBUS epoch. Metadata
+ * changes on a detached inode are conservatively rejected as well. */
+int file_source_acquire(file *f, file_source **out);
+file_source *file_source_retain(file_source *source);
+void file_source_release(file_source *source);
+const file_id *file_source_identity(const file_source *source);
+file_mode file_source_mode(const file_source *source);
+int file_source_validate(void *source);
 
 /* ---- change detection ---- */
 /* Stat-based check. Returns 1 if the source changed (sticky), else 0. If

@@ -34,12 +34,18 @@ typedef struct savectl_options {
     const char *path;
     file_id baseline;
     file_mode source_mode;
+    file_source *source; /* optional retained file-owned identity/guard lease */
     int (*validate_source)(void *ctx);
     void *source_ctx;
     journal *journal;
     work_pool *journal_pool; /* actual private journal pool, must differ */
-    piece_allocator reload_allocator; /* UI-owned arena for replacement tree */
+    piece_allocator reload_allocator; /* UI-owned reservation for replacement */
+    /* Optional paired rollback hooks for non-reclaiming allocators. Reservation
+     * is exclusive: no other allocations from mark until install/rollback. */
+    size_t (*reload_mark)(void *ctx);
+    void (*reload_reset)(void *ctx, size_t mark);
     uint64_t buffer_id;
+    uint64_t reload_copy_threshold; /* clone threshold; 0 uses file policy */
     void (*step)(void *ctx, int step);
     void *step_ctx;
     /* New targets only: valid selects exact permission bits, including 0000.
@@ -59,6 +65,14 @@ int savectl_destroy(savectl *s);
 void savectl_close_begin(savectl *s);
 /* Every mutation (including undo/redo) after successfully mutating the tree. */
 void savectl_modified(savectl *s);
+/* Initial history registration and each successful mutation, instead of
+ * modified(). Identity values name content states, never reused across undo
+ * branches. saved names the retained saved history state; saved_valid=false
+ * after eviction/unknown history means conservatively dirty. Both paths
+ * advance revision to invalidate in-flight reloads, even on undo to clean.
+ * Register the new clean history identity after installing a reload. */
+void savectl_content_identity(savectl *s, uint64_t current, uint64_t saved,
+                              bool saved_valid);
 /* CPU only: update latest live offsets; used at reload installation time. */
 void savectl_set_view(savectl *s, savectl_view view);
 savectl_model savectl_get_model(const savectl *s);
@@ -82,9 +96,14 @@ const journal_save *savectl_save_token(const savectl *s);
 void savectl_file_event(savectl *s);
 int savectl_reload(savectl *s);
 int savectl_keep(savectl *s);
-/* Per frame/mailbox wake, CPU only. Completion survives a full work mailbox.
- * receive routes this controller's notifications; tick also works without it.
- * Reload installation is explicit: take_reload builds metadata on the UI
+/* Per frame/mailbox wake, CPU only. A sealed completion lease is received
+ * exclusively through the mailbox. Full-mailbox publication yields the bulk
+ * lane and retries until terminal delivery. tick selectively receives this
+ * controller; the host must also drain foreign shared-pool traffic. */
+/*
+ * Reload installation is explicit: take_reload builds at most 64 original
+ * chunks per call, returning BUSY with outputs unchanged between slices. It
+ * builds metadata on the UI
  * over worker-read, validated private bytes and returns the replacement tree,
  * clamping byte offsets to EOF, preserving horizontal scroll. Caller retires
  * its old tree/undo/index and installs this tree atomically on UI. If a new edit

@@ -119,8 +119,16 @@ typedef struct core {
 #endif
 } core;
 
+typedef struct mapped_build {
+    orig_store *original;
+    node *level[MAXH];
+    uint64_t piece, pieces;
+    size_t len;
+    int height;
+} mapped_build;
 struct piece_tree {
     core *c; node *root; int height; piece_snapshot *cached_snapshot;
+    mapped_build *init;
     piece_checkpoint *checkpoint;
     uint64_t add_len, deleted_original, fallback_add; int inited, mapped;
     int run_valid; uint64_t run_end, run_addend;
@@ -1128,6 +1136,12 @@ void piece_destroy(piece_tree *t) {
     if (!t) return;
     core *c = t->c;
     snapshot_uncache(t);
+    if (t->init) {
+        for (unsigned level = 0; level < MAXH; ++level)
+            if (t->init->level[level]) node_unref(c, t->init->level[level]);
+        orig_store_unref(c, t->init->original);
+        c->a.free(c->a.ctx, t->init, sizeof *t->init);
+    }
     node_unref(c, t->root);
     if (t->mapped && c->has_mh) c->mh.release(c->mh.ctx);
     orig_store_unref(c, c->original); c->original = NULL;
@@ -1207,6 +1221,83 @@ int piece_init_mapped(piece_tree *t, const uint8_t *mapped, size_t len, const pi
     orig_store_install(c, v);
     if (hooks) { c->mh.acquire(c->mh.ctx); t->mapped = 1; }
     t->len = len; t->inited = 1; snapshot_uncache(t); return 0;
+}
+
+/* Streaming bottom-up construction has only one unfinished node per level;
+ * no file-size pointer array is allocated or initialized on the owner. */
+int piece_init_mapped_begin(piece_tree *t, const uint8_t *mapped, size_t len,
+                            const piece_map_hooks *hooks) {
+    if (!t || t->inited || t->root->cnt || t->init) return PIECE_ERR_RANGE;
+    core *c = t->c;
+    mapped_build *b = c->a.alloc(c->a.ctx, sizeof *b);
+    if (!b) return PIECE_ERR_NOMEM;
+    memset(b, 0, sizeof *b);
+    b->original = orig_store_new(c, mapped, len, 0, hooks);
+    if (!b->original) { c->a.free(c->a.ctx, b, sizeof *b); return PIECE_ERR_NOMEM; }
+    t->init = b; b->len = len; b->pieces = chunk_count(len);
+    uint64_t leaves = (b->pieces + FAN - 1) / FAN;
+    while (leaves > 1) { leaves = (leaves + FAN - 1) / FAN; ++b->height; }
+    return PIECE_OK;
+}
+static void init_promote(piece_tree *t, unsigned level) {
+    mapped_build *b = t->init;
+    node *child = b->level[level]; b->level[level] = NULL;
+    node *parent = b->level[level + 1];
+    if (!parent) parent = b->level[level + 1] = node_new(t->c, 0);
+    ent entry = summ(child, child); ent_put(parent, parent->cnt++, &entry);
+}
+int piece_init_mapped_step(piece_tree *t, size_t max_chunks) {
+    if (!t || !t->init) return PIECE_ERR_RANGE;
+    mapped_build *b = t->init;
+    if (!max_chunks) return PIECE_MORE;
+    if (max_chunks > 64) max_chunks = 64;
+    core *c = t->c;
+    uint64_t remaining = b->pieces - b->piece;
+    size_t batch = remaining < max_chunks ? (size_t)remaining : max_chunks;
+    /* Preflight this slice before changing its forest. The height allowance
+     * covers carries and final assembly, including an unfinished prior leaf. */
+    size_t leaf_need = batch / FAN + 2;
+    size_t branch_need = batch / (FAN * FAN) + (size_t)b->height + 2;
+    pthread_mutex_lock(&c->pool_mu);
+    if (pool_reserve_class(c, 0, leaf_need) || pool_reserve_class(c, 1, branch_need))
+        return pool_done(c, PIECE_ERR_NOMEM);
+    for (size_t i = 0; i < batch; ++i) {
+        node *leaf = b->level[0];
+        if (!leaf) leaf = b->level[0] = node_new(c, 1);
+        uint64_t offset = b->piece << CH_SHIFT;
+        uint64_t length = (uint64_t)b->len - offset;
+        if (length > CH_SIZE) length = CH_SIZE;
+        ent entry = { length, UNK, offset };
+        ent_put(leaf, leaf->cnt++, &entry); ++b->piece;
+        if (b->piece < b->pieces) {
+            unsigned level = 0;
+            while (b->level[level] && b->level[level]->cnt == FAN) {
+                init_promote(t, level); ++level;
+            }
+        }
+    }
+    if (b->piece < b->pieces) return pool_done(c, PIECE_MORE);
+    /* Merge the final short right edge; all other nodes are already complete. */
+    unsigned root_level = 0;
+    for (;;) {
+        unsigned low = MAXH, high = 0;
+        for (unsigned level = 0; level < MAXH; ++level) if (b->level[level]) {
+            if (low == MAXH) low = level;
+            high = level;
+        }
+        if (low == MAXH) break; /* empty original */
+        if (low == high) { root_level = low; break; }
+        init_promote(t, low);
+    }
+    if (b->level[root_level]) {
+        node_unref(c, t->root); t->root = b->level[root_level];
+        b->level[root_level] = NULL; t->height = (int)root_level;
+    }
+    orig_store_install(c, b->original);
+    if (c->has_mh) { c->mh.acquire(c->mh.ctx); t->mapped = 1; }
+    t->len = b->len; t->inited = 1;
+    c->a.free(c->a.ctx, b, sizeof *b); t->init = NULL;
+    return pool_done(c, PIECE_OK);
 }
 
 /* -------------------------------------------------------------- mutation */

@@ -307,6 +307,40 @@ int file_backing_faulted(const file_backing *backing)
 { return backing && guard_faulted(backing->slot); }
 int file_snapshot_faulted(const piece_snapshot *snapshot)
 { return file_backing_faulted(file_snapshot_backing(snapshot)); }
+struct file_source {
+    _Atomic size_t refs;
+    file_map *map;
+    file_id identity;
+    file_mode mode;
+    uint64_t faults;
+};
+file_source *file_source_retain(file_source *source)
+{
+    if (source) (void)atomic_fetch_add_explicit(&source->refs,1,memory_order_relaxed);
+    return source;
+}
+void file_source_release(file_source *source)
+{
+    if (source && atomic_fetch_sub_explicit(&source->refs,1,memory_order_acq_rel)==1) {
+        if (source->map) map_release(source->map);
+        free(source);
+    }
+}
+const file_id *file_source_identity(const file_source *source) { return &source->identity; }
+file_mode file_source_mode(const file_source *source) { return source->mode; }
+int file_source_validate(void *ctx)
+{
+    file_source *source=ctx;
+    if (!source) return FILE_ERR_STATE;
+    if (source->mode==FILE_MODE_COPY) return FILE_OK;
+    file_map *mapping=source->map;
+    if (!mapping || guard_faulted(mapping->slot) || guard_faults(mapping->slot)!=source->faults)
+        return FILE_ERR_CHANGED;
+    struct stat st;
+    if (fstat(mapping->fd,&st)) return FILE_ERR_IO;
+    file_id observed; file_id_from_stat(&observed,&st);
+    return file_id_diff(&source->identity,&observed)==FILE_CHG_NONE ? FILE_OK : FILE_ERR_CHANGED;
+}
 
 /* Worker-owned physical transaction. UI passes it from preparation to commit
  * only after receiving SAVE_PREPARED; no descriptor operation is done by decode. */
@@ -853,6 +887,20 @@ int file_attach(file *f, piece_tree *t)
     }
     /* Source fd is released at off-path close; attachment performs no I/O. */
     return FILE_OK;
+}
+
+int file_source_acquire(file *f, file_source **out)
+{
+    if (!out) return FILE_ERR_STATE;
+    *out=NULL;
+    if (!f || !file_open_ready(f) || !f->attached || !f->map) return FILE_ERR_STATE;
+    file_source *source=calloc(1,sizeof *source);
+    if (!source) return FILE_ERR_NOMEM;
+    atomic_init(&source->refs,1);
+    source->mode=f->mode; source->map=f->map; map_acquire(source->map);
+    source->identity=f->mode==FILE_MODE_MMAP ? f->map->identity : f->open_identity;
+    source->faults=guard_faults(f->map->slot);
+    *out=source; return FILE_OK;
 }
 
 /* ---------------- change detection ---------------- */

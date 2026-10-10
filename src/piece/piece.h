@@ -69,6 +69,7 @@
 #define PIECE_OK 0
 #define PIECE_ERR_RANGE 1
 #define PIECE_ERR_NOMEM 2
+#define PIECE_MORE 3
 
 typedef struct piece_tree piece_tree;         /* opaque, UI-thread owned */
 typedef struct piece_snapshot piece_snapshot; /* opaque, immutable, any thread */
@@ -115,6 +116,17 @@ int piece_reclaim(piece_tree *t, size_t budget);
 int piece_init_copy(piece_tree *t, const uint8_t *data, size_t len);
 int piece_init_mapped(piece_tree *t, const uint8_t *mapped, size_t len,
                       const piece_map_hooks *hooks);
+
+/* Owner-thread staged mapped construction for reload. begin retains no hooks
+ * until commit; caller retains mapped bytes throughout construction. step
+ * processes at most min(max_chunks, 64) 64 KiB entries and O(tree height) final metadata,
+ * returning MORE, OK (complete), or NOMEM (stage unchanged this call).
+ * Only step/destroy may be called on the staging tree until OK. destroy rolls
+ * back all staged metadata through allocator.free; arena allocators must supply
+ * an exclusive reservation whose mark can be reset after destruction. */
+int piece_init_mapped_begin(piece_tree *t, const uint8_t *mapped, size_t len,
+                            const piece_map_hooks *hooks);
+int piece_init_mapped_step(piece_tree *t, size_t max_chunks);
 
 /* Location of deleted bytes in the add buffer (offsets are logical add-buffer
  * offsets, chunk-spanning allowed). Always complete; see piece_delete. */

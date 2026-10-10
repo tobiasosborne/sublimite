@@ -1,64 +1,49 @@
-# savectl — edit-457.7 / P4.7
+# savectl — edit-mdv continuation
 
-Standalone controller implemented in savectl.h/c; editor/main/file/journal and
-Makefile remain untouched. Design and Integration contract: docs/decisions/P4.7.md.
+Session 9: P4-modules-2 review §§9–17 have implementation and red/green
+regressions. §1's session 8 full-identity torn-copy protection remains intact.
+Design: docs/decisions/edit-mdv.md. Required standalone public report:
+docs/worker-reports/edit-mdv-s9.md.
 
-Done: nonblocking snapshot/enqueue/save status; revision-aware modified bit;
-worker durable file core; off-UI journal prepare/finish with complete-session
-checkpoint leases; modified conflict banner/keep/reload; automatic unmodified
-reload and latest/clamped view offsets; mutation/event validation at installation;
-immutable private reload backing and UI-only tree metadata construction;
-mailbox-full completion fallback; logical close and deferred cleanup.
+Done: nonblocking/type-safe FIFO acquisition; journal BASE conflict actions;
+host-provided content identity with independent monotonic revision; exact work
+handle retirement; immutable file-backed reload snapshots with bounded scratch;
+owner-thread staged piece construction; failed-install state plus exclusive
+reservation rollback/retry; retained file-owned actual original identity/fault
+lease; sealed generation-validated mailbox-only terminal completion, retrying
+via cooperative work continuation on saturation.
 
-Current integration constraints: real file MMAP needs a worker-safe retained
-original/fault-epoch guard and actual-open baseline accessor that file.h does
-not yet expose. Unguarded MMAP save/keep is refused, never silently unsafe.
-Reload uses private copy memory, not the mmap G10f bound. Journal must use an
-exclusive session lease and its own private pool distinct from savectl's pool;
-caller defers journal operations while leased and builds complete checkpoints.
-Failed retained transactions need the session recovery resolver before replacing
-this controller. No watched-file/event-loop wiring is performed in this bead.
-These accessors/workflows are proposed to edit-4w1.42 / edit-4w1.53 in the decision.
+Current integration constraints: caller supplies unique history identities and
+an invalid saved identity after history eviction. Replacement metadata requires
+a reclaiming allocator or paired mark/reset hooks for an exclusive reservation.
+The temporary snapshot needs O_TMPFILE support, writable target parent and disk
+space; acquisition errors preserve the old tree. The file source guard rejects
+all changed original metadata, including detached-inode ctime changes. Repeated
+mapped saves after detachment may therefore require reload. Returned trees and
+snapshots retain their backing independently, while the host must keep their
+allocator context alive. Final graph cleanup is maintenance work.
 
-Verify (always DISPLAY=:99 EDIT_DISPLAY=:99):
+Remaining in strict order: §18 bounded immutable session save capture, off-path
+checkpoint construction and actual submitted saving-frame G8s measurement; §19
+prepare journal ownership handoff and finish reacquisition/crash test; §20
+fresh-inode writeback recovery guidance and retained-token reconciliation test.
+The editor still has no savectl save/status-frame integration. The journal
+requires a distinct private pool, and the session lease still spans file writes.
+Do not close the complete bead from this partial session.
 
-```
-make all
-ASAN_OPTIONS=detect_leaks=0 make check
-make fuzz
-ASAN_OPTIONS=detect_leaks=0 build/san/tests/savectl_test
-ASAN_OPTIONS=detect_leaks=0 build/fuzz/savectl_fuzz -max_total_time=30 -max_len=64
-cat /sys/class/power_supply/BAT0/status
-cut -d' ' -f1 /proc/loadavg
-build/bench/savectl_bench           # TRACK by default, --gate for verdict run
-```
-
-Optional UI IO interposition verification (without Makefile changes):
+Verification (private DISPLAY=:99 only):
 
 ```
-gcc -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE \
- -pthread -O2 -Isrc -include tests/display_guard.h -DSAVECTL_IO_WRAP \
- tests/savectl_test.c build/libedit.a \
- -Wl,--wrap=stat,--wrap=fstat,--wrap=open,--wrap=openat,--wrap=fsync,--wrap=pread,--wrap=close,--wrap=work_publish \
- -lm -ldl -o /tmp/savectl-io-test
-DISPLAY=:99 EDIT_DISPLAY=:99 /tmp/savectl-io-test
+DISPLAY=:99 EDIT_DISPLAY=:99 make all
+DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 make check
+DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 build/san/tests/savectl_test
+DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 build/san/tests/savectl_reload_test
+DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0 build/fuzz/savectl_fuzz -max_total_time=60 -max_len=64
 ```
 
-Red evidence: first link failed on absent savectl symbols; behavioral red:
-`file_error==FILE_ERR_IO` failed, then source-stop cause preservation fixed it;
-`pthread_equal(pthread_self(),*owner)` failed, then private-byte publication and
-UI metadata installation fixed it. Release/sanitizer/interposition tests pass.
-Final release build: `make: Nothing to be done for 'all'.` (exit 0).
-Final fuzz build: `fuzz: 22 fuzzers built` (exit 0).
-Final module ASan/UBSan and wrapped IO/publication tests: `savectl_test: ok`.
-Final seeded model fuzz: `Done 1151 runs in 31 second(s)` (M)[AC],
-Not charging, load1=5.39. Publication ordering also has a deterministic red/green
-wrapper test holding the worker after its mailbox wake.
-Full suite requires the existing Xvfb :99 outside this sandbox's socket namespace;
-the initial sandbox CLI failure was environmental, with no source change.
-Final full suite (exit 0): `check: 42 test binaries passed`;
-`test_replay_cli: all passed`. ASAN_OPTIONS=detect_leaks=0 throughout;
-the coordinator still needs the leak-enabled rerun.
-
-Single TRACK bench run complete, stamps/timings in P4.7.md. G8s within the recorded
-budgets; G8d exceeds them under shared load. No quiet-box verdict and no rerun.
+Final release all and the complete sanitizer check exited zero; the check
+passed 59 binaries (M)[AC] and its replay CLI shell suite. Final savectl fuzz
+passed 24306 executions in 61 seconds (M)[AC]. Red/green and final logs are
+recorded in the worker report. LeakSanitizer is disabled in the worker sandbox; coordinator reruns with
+leaks enabled. Original bench scope and other review findings outside §§9–20
+have not been silently changed.
