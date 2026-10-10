@@ -1,3 +1,17 @@
+# edit-9lf session 9 — logical tab storage replacement
+
+`tabs_replace` replaces borrowed tree/undo/view in an existing open tab while
+preserving ID, order and MRU. It performs no allocation or destruction; editor
+owns outgoing leases and wait membership. The editor reload regression checks
+nonzero view state and a real child launcher waiting through replacement until
+logical closure. Existing standalone tabs strip damage semantics are unchanged;
+editor composes/compares final chrome in its reserved scratch.
+
+The editor bead is incomplete for controller reload and file reclamation; see
+[the worker report](../../docs/worker-reports/edit-9lf-s9.md) and
+[decision record](../../docs/decisions/edit-9lf.md) for full red/green and final
+validation. Previous standalone status follows.
+
 # tabs — edit-457.4 / P4.4
 
 Standalone implementation complete. Public API: tabs.h. Integration into the

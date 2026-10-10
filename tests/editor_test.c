@@ -6,6 +6,8 @@
 #include "trace/trace.h"
 #include "journal/journal.h"
 #include "x11/input.h"
+#include "findui/findui.h"
+#include <sys/mman.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +20,10 @@
 #include <time.h>
 #include <sched.h>
 #include <dirent.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct counted { bool active, suspended; size_t allocations, frames; } counted;
@@ -687,14 +692,19 @@ static int review_native_allocations(void)
 }
 static int review_replay_slices(void)
 {
+    char journal_path[] = "build/s9-public-replay-XXXXXX";
+    int fd = mkstemp(journal_path); T(fd >= 0); close(fd);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config cfg = {.cols = 40, .rows = 4, .history_keys = 8192}; editor *e = NULL;
+    editor_config cfg = {.cols = 40, .rows = 4, .history_keys = 8192, .journal_path = journal_path}; editor *e = NULL;
     T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     for (unsigned batch = 0; batch < 4; batch++) {
         for (unsigned i = 0; i < 1024; i++) T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY,
             .press = true, .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1, .t0_ns = 1}) == 0);
         T(settle(e) == 0);
     }
+    uint64_t other; T(editor_add_buffer(e, NULL, (const uint8_t *)"other", 5, &other) == 0);
+    T(settle(e) == 0); T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    uint64_t submitted_before = e->stats.submitted_sequence, journal_before = e->stats.journal_records;
     e->stats.longest_slice_ns = 0;
     T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY, .press = true,
         .keysym = 'z', .mods = PLAT_MOD_CTRL}) == 0);
@@ -702,9 +712,21 @@ static int review_replay_slices(void)
     printf("review 11: first undo turn longest_slice_ns=%llu (M)[AC], slice limit=500000 ns (G)\n",
         (unsigned long long)e->stats.longest_slice_ns);
     T(undo_replay_snapshot(e->undo) != NULL); /* group yields before completion */
+    T(e->stats.submitted_sequence == submitted_before && e->stats.journal_records == journal_before);
+    T(editor_length(e) == 4096);
+    uint8_t committed[4096]; T(editor_read(e, 0, committed, sizeof committed) == 0);
+    for (size_t i = 0; i < sizeof committed; i++) T(committed[i] == 'x');
+    T(editor_select_tab(e, 1) == EDITOR_ERR_ARG);
+    T(editor_close_tab(e, 0) == EDITOR_ERR_ARG);
+    T(editor_reopen_tab(e) == EDITOR_ERR_ARG);
+    T(editor_add_buffer(e, NULL, NULL, 0, &other) == EDITOR_ERR_ARG);
+    ipc_request request = {0}; T(editor_open_request(e, &request, 0) == EDITOR_ERR_ARG);
+    T(editor_cycle_tab(e, false) == EDITOR_ERR_ARG);
+    T(editor_set_cursor(e, 0) == EDITOR_ERR_ARG); T(editor_jump_line(e, 0) == EDITOR_ERR_ARG);
+    T(e->action == EDITOR_ACTION_REPLAY_WORK && tabs_active_index(&e->tabs) == 0);
     T(settle(e) == 0); T(editor_length(e) == 0);
     T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(editor_length(e) == 4096);
-    editor_close(e); puts("review 11: multi-record burst undo/redo yields across turns passed"); return 0;
+    editor_close(e); T(unlink(journal_path) == 0); puts("review 11: multi-record burst undo/redo yields across turns passed"); return 0;
 }
 static int review_source_change(void)
 {
@@ -717,8 +739,15 @@ static int review_source_change(void)
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         editor_config cfg = {.path = path, .copy_threshold = 1, .cols = 40, .rows = 4}; editor *e = NULL;
         T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        struct stat original; T(stat(path, &original) == 0);
         fd = open(path, O_WRONLY | (mode ? O_TRUNC : 0)); T(fd >= 0);
-        T(write(fd, "change\n", 7) == 7); close(fd);
+        T(write(fd, "change\n", 7) == 7);
+        /* Same-size writes can share the original's mtime/ctime tick, even
+         * after truncate. Give the identity-based watch/focus checks a
+         * distinct version without relying on filesystem clock resolution. */
+        struct timespec times[2] = {{.tv_nsec = UTIME_OMIT}, original.st_mtim};
+        times[1].tv_sec++;
+        T(futimens(fd, times) == 0); close(fd);
         if (mode) {
             plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = true}; T(editor_inject(e, &focus) == 0);
         }
@@ -748,6 +777,283 @@ static void *review_release(void *ctx)
     review_hold *h = ctx;
     struct timespec pause = {0, 250000000}; (void)nanosleep(&pause, NULL);
     atomic_store(&h->expired, true); atomic_store(&h->release, true); return NULL;
+}
+/* Test-only syscall interposition: a directory-owned marker injects ENOSPC.
+ * No process-global injection state; unrelated fixture directories are normal. */
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args); }
+    struct stat st;
+    if ((flags & O_CREAT) && fstatat(dirfd, "force-enospc", &st, 0) == 0) { errno = ENOSPC; return -1; }
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+}
+static int review_local_errors(void)
+{
+    for (unsigned save = 0; save < 2; save++) {
+        char dir[] = "build/s9-local-errors-XXXXXX"; T(mkdtemp(dir));
+        char path[128], marker[128];
+        T(snprintf(path, sizeof path, "%s/source", dir) > 0);
+        T(snprintf(marker, sizeof marker, "%s/force-enospc", dir) > 0);
+        int fd = open(path, O_CREAT | O_WRONLY, 0600); T(fd >= 0);
+        T(write(fd, "prefix\n", 7) == 7); if (!save) T(ftruncate(fd, 2 * FILE_PREFIX_MAX) == 0); close(fd);
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+        editor_config cfg = {.cols = 32, .rows = 4}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        review_hold hold = {0}; work_handle h = {0};
+        if (!save) {
+            h = work_submit(&e->pool, (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(h.epoch);
+            while (!atomic_load(&hold.entered)) sched_yield();
+        }
+        uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+        editor_buffer *owner = e->buffer;
+        if (save) {
+            fd = open(marker, O_CREAT | O_WRONLY, 0600); T(fd >= 0); close(fd);
+            T(editor_large_save_begin(e) == 0);
+        } else {
+            T(owner->pending_open); T(truncate(path, 7) == 0);
+        }
+        T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+        atomic_store(&hold.release, true);
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (save ? !owner->lg.save_done : !file_changed(owner->file)) {
+            T(editor_step(e, 10) >= 0); T(trace_now_ns() < deadline);
+        }
+        if (save) T(owner->lg.save_status == FILE_ERR_IO && file_errno(owner->file) == ENOSPC);
+        T(!e->error); T(press(e, key('x', 0, "x")) == 0); T(expect(e, "x", 1) == 0);
+        editor_close(e); if (save) T(unlink(marker) == 0); T(unlink(path) == 0); T(rmdir(dir) == 0);
+    }
+    puts("P4-3 11: deferred COPY and inactive ENOSPC errors preserve unrelated editing passed"); return 0;
+}
+typedef struct review_chrome { editor *e; bool checking, damaged; } review_chrome;
+static void review_chrome_submit(void *ctx, const editor_frame *frame)
+{
+    review_chrome *probe = ctx; (void)frame;
+    if (probe->checking && (probe->e->grid.full_frame || (probe->e->grid.dirty[0] & 1u))) probe->damaged = true;
+}
+static int review_chrome_damage(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    review_chrome probe = {0};
+    editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = 3, .cols = 40, .rows = 4,
+        .hook_ctx = &probe, .on_submit = review_chrome_submit}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); probe.e = e; T(settle(e) == 0);
+    T(editor_set_cursor(e, 2) == 0); T(settle(e) == 0);
+    probe.checking = true; T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(!probe.damaged);
+    probe.checking = false; T(press(e, key('x', 0, "x")) == 0);
+    probe.checking = true; probe.damaged = false;
+    T(press(e, key('y', 0, "y")) == 0); T(!probe.damaged);
+    /* Recomposition of identical final chrome, including its stale marker. */
+    T(editor_begin_frame(e) == 0); T(editor_compose(e) == 0); T(!(e->grid.dirty[0] & 1u));
+    editor_close(e); puts("P4-3 40: cursor/text frames omit unchanged final tab chrome passed"); return 0;
+}
+static int review_capture_identity(void)
+{
+    for (size_t dragged = 1; dragged < 3; dragged++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.cols = 64, .rows = 4}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+            .x = (int32_t)(dragged * 16 * e->grid.dims.cell_w + 1), .y = 1};
+        T(press(e, click) == 0); T(tabs_active_index(&e->tabs) == dragged);
+        T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+        uint64_t first = tabs_at(&e->tabs, 0)->id, second = tabs_at(&e->tabs, 1)->id;
+        plat_event motion = {.kind = PLAT_EV_MOTION, .x = 1, .y = 1};
+        T(editor_inject(e, &motion) == 0); T(editor_step(e, 0) >= 0);
+        T(tabs_at(&e->tabs, 0)->id == first && tabs_at(&e->tabs, 1)->id == second);
+        e->map_drag = true; T(editor_select_tab(e, 0) == 0); T(!e->map_drag); T(settle(e) == 0);
+        editor_close(e);
+    }
+    puts("P4-3 41: closed drag owner and switched minimap capture cancel safely passed"); return 0;
+}
+static void review_findui_receive(const work_msg *msg, void *ctx)
+{ (void)findui_accept(ctx, msg); }
+static int review_replace_accounting(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)"a", .initial_len = 1, .cols = 16, .rows = 2}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    undo_state state = {{0}};
+    for (unsigned i = 0; i < 4096; i++) {
+        undo_break_burst(e->undo);
+        T(undo_insert(e->undo, piece_len(e->tree), (const uint8_t *)"x", 1, i + 1u, &state, &state) == 0);
+    }
+    edit_arena arena; T(edit_arena_init(&arena, 16u * 1024u * 1024u) == 0);
+    findui_panel panel = {0}; findui_config config = {&arena, &e->pool, 64, 64, NULL, NULL};
+    T(findui_init(&panel, &config) == FINDUI_OK);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(findui_set_source(&panel, snap, 1) == FINDUI_OK); piece_snapshot_release(snap);
+    T(findui_set_window(&panel, 0, piece_len(e->tree)) == FINDUI_OK);
+    T(findui_show(&panel, true, true) == FINDUI_OK);
+    T(findui_set_query(&panel, (const uint8_t *)"a", 1) == FINDUI_OK);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (findui_get_state(&panel).searching) {
+        T(findui_service(&panel) <= FINDUI_MORE);
+        (void)work_mailbox_drain(&e->pool, review_findui_receive, &panel);
+        T(trace_now_ns() < deadline); sched_yield();
+    }
+    T(findui_get_state(&panel).match_count == 1);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        /* A refusal must read no retained record pages, at any history size. */
+        if (mprotect(e->undo->pool.base, e->undo->pool.map_bytes, PROT_NONE)) _exit(2);
+        _exit(findui_replace_one(&panel, e->undo, 1, 0, 1, &state, &state) == FINDUI_ERR_LIMIT ? 0 : 3);
+    }
+    int status; T(waitpid(child, &status, 0) == child);
+    bool bounded = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    while (findui_dispose(&panel) == FINDUI_MORE) sched_yield();
+    edit_arena_free(&arena); editor_close(e);
+    T(bounded); puts("P4-3 27: replacement refusal reads zero retained record pages passed"); return 0;
+}
+static void review_hold_save(void *ctx, int step)
+{
+    if (step != FILE_STEP_TEMP_CREATED) return;
+    review_hold *hold = ctx; atomic_store(&hold->entered, true);
+    while (!atomic_load(&hold->release)) {
+        struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
+    }
+}
+static int review_retired_save(void)
+{
+    char path[] = "build/s9-retired-XXXXXX"; int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "source", 6) == 6); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .closed_capacity = 1}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    review_hold hold = {0}; file_set_step_hook(e->buffer->file, review_hold_save, &hold);
+    T(editor_large_save_begin(e) == 0);
+    while (!atomic_load(&hold.entered)) sched_yield();
+    uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(editor_close_tab(e, 0) == 0); T(editor_close_tab(e, 1) == 0);
+    pthread_t timer; T(pthread_create(&timer, NULL, review_release, &hold) == 0);
+    T(editor_step(e, 0) >= 0); T(!atomic_load(&hold.expired));
+    T(press(e, key('x', 0, "x")) == 0); T(expect(e, "x", 1) == 0); T(!atomic_load(&hold.expired));
+    T(pthread_join(timer, NULL) == 0); editor_close(e); T(unlink(path) == 0);
+    puts("P4-3 22: evicted buffer retains held save lease during unrelated typing passed"); return 0;
+}
+static int review_reload_identity(void)
+{
+    char path[] = "build/s9-reload-XXXXXX"; int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "a\nb\nc\n", 6) == 6); close(fd);
+    ipc_server server; T(ipc_server_init_isolated(&server) == IPC_OK);
+    int pair[2]; T(ipc_launcher_pair(pair) == IPC_OK); pid_t child = fork(); T(child >= 0);
+    if (!child) { close(pair[0]); ipc_result rc = ipc_launcher_wait(pair[1]); if (rc) fprintf(stderr, "reload launcher result=%d\n", (int)rc); _exit(rc == IPC_OK ? 0 : 1); }
+    close(pair[1]); ipc_token token; T(ipc_server_adopt_wait(&server, pair[0], &token) == IPC_OK);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4, .server = &server}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    ipc_request request = {.count = 1, .wait = true};
+    request.paths[0] = (ipc_path){.path = path, .line = 1, .col = 1};
+    T(editor_open_request(e, &request, token) == 0); T(settle(e) == 0);
+    uint64_t id = e->buffer->id; T(editor_set_cursor(e, 5) == 0); T(settle(e) == 0);
+    e->v.state.first_byte = e->v.state.visual_byte = 2; e->v.state.first_line = 1; e->v.state.hscroll = 3;
+    e->v.state.selection.anchor = 3; e->v.state.selection.preferred_col = 9;
+    view_state saved = e->v.state;
+    fd = open(path, O_WRONLY); T(fd >= 0); T(write(fd, "a\nB\nc\n", 6) == 6); close(fd);
+    T(file_check(e->buffer->file, NULL)); T(editor_check_sources(e) == 0); T(settle(e) == 0);
+    T(editor_source_resolve(e, true) == 0); T(editor_step(e, 0) >= 0); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == 2 && tabs_active_index(&e->tabs) == 1 && e->buffer->id == id);
+    T(e->buffer->wait_token == token && ipc_server_token_live(&server, token));
+    T(e->v.state.selection.cursor == saved.selection.cursor && e->v.state.selection.anchor == saved.selection.anchor);
+    T(e->v.state.first_byte == saved.first_byte && e->v.state.first_line == saved.first_line && e->v.state.hscroll == saved.hscroll);
+    int status; T(waitpid(child, &status, WNOHANG) == 0);
+    T(editor_close_tab(e, 1) == 0); T(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    editor_close(e); ipc_server_fini(&server); T(unlink(path) == 0);
+    puts("P4-3 16: reload preserves logical tab, view and real launcher wait passed"); return 0;
+}
+static int review_prompt_choices(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    plat_event old = key('r', 0, "r"); old.t0_ns = trace_now_ns(); T(editor_inject(e, &old) == 0);
+    e->buffer->source_stale = true; T(editor_full_layout(e) == 0);
+    T(editor_step(e, 0) >= 0); T(e->source_choice == 0); T(settle(e) == 0);
+    T(press(e, key('r', PLAT_MOD_CTRL, NULL)) == 0); T(e->source_choice == 0);
+    plat_event repeat = key('k', 0, "k"); repeat.repeat = true;
+    T(press(e, repeat) == 0); T(e->source_choice == 0);
+    T(press(e, old) == 0); T(e->source_choice == 0);
+    uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    plat_event hidden = key('r', 0, "r"); hidden.t0_ns = trace_now_ns();
+    T(editor_inject(e, &hidden) == 0); T(editor_select_tab(e, 0) == 0);
+    T(editor_step(e, 0) >= 0); T(e->source_choice == 0); T(settle(e) == 0);
+    plat_event fresh = key('r', 0, "r"); T(editor_inject(e, &fresh) == 0);
+    T(editor_step(e, 0) >= 0); T(e->source_choice == 2);
+    editor_close(e); puts("P4-3 14: pre-prompt, modified, repeated and aged recovery keys ignored passed"); return 0;
+}
+static int review_stale_controls(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id; T(editor_add_buffer(e, NULL, (const uint8_t *)"safe", 4, &id) == 0); T(settle(e) == 0);
+    e->buffer->source_stale = true; T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Tab, PLAT_MOD_CTRL, NULL)) == 0); T(tabs_active_index(&e->tabs) == 0);
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+    plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = 1, .y = 1};
+    T(press(e, click) == 0); T(tabs_active_index(&e->tabs) == 0);
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(tabs_count(&e->tabs) == 1);
+    T(press(e, key('T', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(tabs_count(&e->tabs) == 2);
+    T(e->buffer->source_stale); T(press(e, key('x', 0, "x")) == 0); T(editor_length(e) == 4);
+    editor_close(e); puts("P4-3 13: suspended source preserves tab keys and tab pointer controls passed"); return 0;
+}
+static int review_adoption_error(void)
+{
+    char path[] = "build/s9-adoption-error-XXXXXX"; int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "prefix\n", 7) == 7); T(ftruncate(fd, 2 * FILE_PREFIX_MAX) == 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+    editor_config cfg = {.cols = 40, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    review_hold hold = {0}; work_handle h = work_submit(&e->pool, (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(h.epoch);
+    while (!atomic_load(&hold.entered)) sched_yield();
+    uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+    editor_buffer *owner = e->buffer; T(owner->pending_open);
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); atomic_store(&hold.release, true);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!file_open_ready(owner->file)) {
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e); T(trace_now_ns() < deadline); sched_yield();
+    }
+    fd = open(path, O_WRONLY); T(fd >= 0); T(write(fd, "change\n", 7) == 7); close(fd);
+    T(editor_adopt_open(e, owner) == 0); T(owner->source_stale && !e->error);
+    T(press(e, key('x', 0, "x")) == 0); T(expect(e, "x", 1) == 0);
+    editor_close(e); T(unlink(path) == 0);
+    puts("P4-3 11: failed full-source identity adoption stays owner-local passed"); return 0;
+}
+static int review_pending_controls(void)
+{
+    char path[] = "build/s9-controls-XXXXXX"; int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "prefix\n", 7) == 7); T(ftruncate(fd, 2 * FILE_PREFIX_MAX) == 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+    editor_config cfg = {.cols = 40, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    review_hold hold = {0}; work_handle h = work_submit(&e->pool, (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(h.epoch);
+    while (!atomic_load(&hold.entered)) sched_yield();
+    uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+    editor_buffer *pending = e->buffer; T(pending->pending_open);
+    plat_event text = key('x', 0, "x"), next = key(XKB_KEY_Tab, PLAT_MOD_CTRL, NULL);
+    T(editor_inject(e, &text) == 0); T(editor_inject(e, &next) == 0);
+    T(editor_inject(e, &(plat_event){.kind = PLAT_EV_FOCUS, .focused = false}) == 0);
+    for (unsigned i = 0; i < 100; i++) T(editor_step(e, 0) >= 0);
+    T(tabs_active_index(&e->tabs) == 0 && !e->focused);
+    T(editor_length(e) == 0 && e->stats.mutations == 0 && e->queue_count == 1);
+    plat_event y = key('y', 0, "y"); T(editor_inject(e, &y) == 0);
+    for (unsigned i = 0; i < 100; i++) T(editor_step(e, 0) >= 0);
+    T(expect(e, "y", 1) == 0);
+    atomic_store(&hold.release, true);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (pending->pending_open) { T(editor_step(e, 10) >= 0); T(trace_now_ns() < deadline); }
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+    uint8_t bytes[8]; T(editor_read(e, 0, bytes, sizeof bytes) == 0 && !memcmp(bytes, "xprefix\n", 8));
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(expect(e, "y", 1) == 0);
+    editor_close(e); T(unlink(path) == 0);
+    puts("P4-3 12: pending COPY admits controls and retains edit owner passed"); return 0;
 }
 static int review_prefix_open(void)
 {
@@ -1024,13 +1330,13 @@ static int review_close_flush(void)
 static int review_suite(const char *only)
 {
     struct { const char *name; int (*fn)(void); } cases[] = {
-        {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
+        {"p4-40", review_chrome_damage}, {"p4-41", review_capture_identity}, {"p4-27", review_replace_accounting}, {"p4-22", review_retired_save}, {"p4-16", review_reload_identity}, {"p4-14", review_prompt_choices}, {"p4-13", review_stale_controls}, {"p4-12", review_pending_controls}, {"p4-11-adopt", review_adoption_error}, {"p4-11", review_local_errors}, {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
         {"6", review_style}, {"7", review_long_line}, {"8", review_prefix_open}, {"10", review_index_backlog}, {"11-accounting", review_slice_accounting}, {"11-replay", review_replay_slices}, {"12", review_large_undo}, {"15", review_piece_recycling},
         {"13", review_bursts}, {"16", review_source_change}, {"21", review_native_allocations}, {"14", review_fairness}, {"17", review_journal_idle}, {"22", review_replay_atomic}, {"23", review_init}, {"close", review_close_flush}
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
-        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "8") || !strcmp(cases[i].name, "10") ||
+        if ((!only && strcmp(cases[i].name, "p4-27") && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "8") || !strcmp(cases[i].name, "10") ||
             !strcmp(cases[i].name, "11-accounting") || !strcmp(cases[i].name, "11-replay") || !strcmp(cases[i].name, "12") ||
             !strcmp(cases[i].name, "13") || !strcmp(cases[i].name, "16") || !strcmp(cases[i].name, "15") || !strcmp(cases[i].name, "17") ||
             !strcmp(cases[i].name, "21") || !strcmp(cases[i].name, "22") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||

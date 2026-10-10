@@ -111,6 +111,16 @@ int tabs_open(tabs_set *s, const tabs_desc *d, view_state *live, uint64_t *id)
     s->order[s->count++]=slot; prepend_mru(s,slot); s->active=slot; *live=t->state; *id=t->id;
     return TABS_OK;
 }
+int tabs_replace(tabs_set *s, size_t index, piece_tree *buffer, undo_log *undo,
+                 const view_state *state, view_state *live)
+{
+    if(!ready(s) || !buffer || !undo || !state || !live) return TABS_ERR_ARG;
+    if(index>=s->count) return TABS_ERR_RANGE;
+    tabs_tab *tab=&s->slots[s->order[index]];
+    tab->buffer=buffer; tab->undo=undo; tab->state=*state; tab->modified=false;
+    if(s->order[index]==s->active) *live=*state;
+    return TABS_OK;
+}
 int tabs_select(tabs_set *s, size_t index, view_state *live)
 {
     if(!ready(s) || !live) return TABS_ERR_ARG;

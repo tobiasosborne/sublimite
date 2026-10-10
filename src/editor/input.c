@@ -351,9 +351,30 @@ int editor_continue_action(editor *e)
     e->action = EDITOR_ACTION_NONE;
     return editor_refresh_cursor(e, e->old_cursor);
 }
+bool editor_event_control(const editor *e, const plat_event *ev)
+{
+    if (ev->kind != PLAT_EV_KEY) {
+        if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
+            return ev->y >= 0 && (uint32_t)ev->y < e->grid.dims.cell_h;
+        return true;
+    }
+    if (!ev->press) return true;
+    keys_state state = e->keys; const keys_binding *binding = NULL;
+    if (keys_lookup(&state, ev->keysym, ev->mods, &binding) != KEYS_MATCH || !binding) return false;
+    switch (binding->action) {
+    case KEYS_ACTION_NEXT_VIEW_STACK: case KEYS_ACTION_PREVIOUS_VIEW_STACK:
+    case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
+    case KEYS_ACTION_CLOSE: case KEYS_ACTION_CLOSE_FILE: case KEYS_ACTION_REOPEN_FILE:
+    case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB: return true;
+    default: return false;
+    }
+}
 int editor_handle_key(editor *e, const plat_event *ev)
 {
-    if (e->buffer->source_stale) {
+    if (e->buffer->source_stale && !editor_event_control(e, ev)) {
+        if (!e->buffer->prompt_ns || e->buffer->prompt_generation != e->buffer->source_generation ||
+            e->dispatch_serial <= e->buffer->prompt_serial || ev->mods || ev->repeat ||
+            (ev->t0_ns && ev->t0_ns <= e->buffer->prompt_ns)) return 0;
         if (ev->press && (ev->keysym == 'r' || ev->keysym == 'R')) return editor_source_resolve(e, true);
         if (ev->press && (ev->keysym == 'k' || ev->keysym == 'K')) return editor_source_resolve(e, false);
         return 0;

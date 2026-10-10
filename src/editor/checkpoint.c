@@ -17,7 +17,7 @@ int editor_checkpoint(editor *e)
 {
     size_t capacity = 2;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i]; if (!b) continue;
+        editor_buffer *b = e->buffers[i]; if (!b || b->retired) continue;
         uint64_t len = piece_len(b->tree), chunks = len / 4096u + (len % 4096u != 0 ? 1u : 0u);
         if (chunks > SIZE_MAX - capacity - 4u) return JOURNAL_NOMEM;
         capacity += (size_t)chunks + 4u;
@@ -27,7 +27,7 @@ int editor_checkpoint(editor *e)
     if (!records) return JOURNAL_NOMEM;
     size_t count = 0; int rc = JOURNAL_NOMEM;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i]; if (!b) continue;
+        editor_buffer *b = e->buffers[i]; if (!b || b->retired) continue;
         /* Preserve named BASE association. A source conflict must preserve the
          * preceding recovery file, rather than silently relabel the new tree. */
         if (*b->base.path && journal_check_base(&b->base)) { rc = JOURNAL_BASE_CHANGED; goto done; }

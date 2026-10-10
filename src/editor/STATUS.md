@@ -5,6 +5,30 @@ Partial P4-3 recovery integration: source-choice checkpoints, healthy metadata/t
 Evidence and remaining acceptance: [worker report](../../docs/worker-reports/edit-ck4-s9.md).
 Design: [decision record](../../docs/decisions/edit-ck4.md). No new globals; leaks-disabled sanitizer verification requires coordinator rerun with leaks enabled.
 
+# edit-9lf session 9 — P4-3 editor loop/tabs continuation
+
+Implemented regressions/fixes: sections 2, 11, 12, 13, 14, 41, 40. Public tab
+activation refuses sliced replay; reads use its committed snapshot. Deferred
+file/adoption/save failures are owner-local. Pending COPY controls bypass parked
+edits bound to ID/source generation. Stale tabs retain navigation/closure.
+Recovery keys require a submitted prompt and fresh explicit ingress. Capture
+owns stable identity; unchanged final chrome adds no tab-row damage.
+
+Partial: section 16 retains tab/view/wait identity on explicit unjournalled
+reload, but controller revision/silent reload and journal reconciliation remain.
+Section 22 avoids UI teardown waits by retaining file storage until shutdown;
+nonfile leases poll exact known handles/index retirement. File retirement API
+and timely physical reclamation are missing. Retention can exhaust reservation,
+so admission checks free storage before preparing/publishing requests.
+
+Remaining: section 27. The dc4015e bounded undo query has group counts but no
+record count/memory query. The protected-history-page replacement regression is
+opt-in and remains red; undo source/header are unchanged (API-use-only scope).
+No production private-state workaround or new globals. No large.c/open.c hunks
+were edited. Final validation/evidence and limitations are recorded in
+[the required worker report](../../docs/worker-reports/edit-9lf-s9.md), with
+[design choices](../../docs/decisions/edit-9lf.md). This bead remains incomplete.
+
 # edit-zzj.13b slice 3 / session 9
 
 Implemented: automatic burst undo grouping (13), constant-time public undo

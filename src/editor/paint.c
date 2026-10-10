@@ -89,6 +89,34 @@ static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_
     if (len == 3 && !memcmp(text, "\xe2\x80\xa6", 3)) ch = '.';
     *identity = ch; *slot = ch - 0x20u; return true;
 }
+static int compose_chrome(editor *e)
+{
+    uint32_t full = e->grid.dims.cols; int rc;
+    if (e->tab_rows) {
+        size_t active = tabs_active_index(&e->tabs);
+        uint32_t slots = full / 16; if (!slots) slots = 1;
+        size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
+        e->strip = (tabs_strip){0, 0, full, 16, first_tab, 0x8d98a9, 0x171b22, 0xe5e9f0, 0x384356, glyph, e};
+        /* Decoration preparation is complete; reuse its aligned reserved
+         * scratch for the final chrome, including the stale overlay. */
+        if ((size_t)full * sizeof(render_cell) > EDITOR_STAGE_BYTES) return EDITOR_ERR_CAPACITY;
+        render_cell *cells = (render_cell *)e->indent_bytes;
+        memset(cells, 0, (size_t)full * sizeof *cells);
+        uint64_t dirty = 0; render_grid scratch = e->grid;
+        scratch.dims.rows = 1; scratch.cells = cells; scratch.cell_capacity = full;
+        scratch.dirty = &dirty; scratch.dirty_word_capacity = 1; scratch.full_frame = false;
+        rc = tabs_strip_render(&e->tabs, &scratch, &e->strip); if (rc) return rc;
+        if (e->buffer->map.stale) {
+            render_cell *cell = &cells[full - 1];
+            *cell = (render_cell){'!', '!' - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+        }
+        if (memcmp(e->grid.cells, cells, (size_t)full * sizeof *cells)) {
+            memcpy(e->grid.cells, cells, (size_t)full * sizeof *cells);
+            return render_mark_rows(&e->grid, 0, 1);
+        }
+    }
+    return 0;
+}
 int editor_compose(editor *e)
 {
     if (e->buffer->source_stale) {
@@ -96,9 +124,10 @@ int editor_compose(editor *e)
         uint32_t cols = e->grid.dims.cols;
         for (uint32_t c = 0; c < cols; c++) {
             uint32_t ch = c < sizeof status - 1 ? (uint8_t)status[c] : (uint32_t)' ';
-            e->grid.cells[c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+            e->grid.cells[(size_t)e->tab_rows * cols + c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
         }
-        return render_mark_rows(&e->grid, 0, 1);
+        int rc = compose_chrome(e);
+        return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
     }
     if (e->caret_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
@@ -139,38 +168,40 @@ int editor_compose(editor *e)
         }
         if (different) { rc = render_mark_rows(&e->grid, r + e->tab_rows, 1); if (rc) return rc; }
     }
-    if (e->tab_rows) {
-        size_t active = tabs_active_index(&e->tabs);
-        uint32_t slots = full / 16; if (!slots) slots = 1;
-        size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
-        e->strip = (tabs_strip){0, 0, full, 16, first_tab, 0x8d98a9, 0x171b22, 0xe5e9f0, 0x384356, glyph, e};
-        rc = tabs_strip_render(&e->tabs, &e->grid, &e->strip); if (rc) return rc;
-        if (e->buffer->map.stale) {
-            render_cell *cell = &e->grid.cells[full - 1];
-            *cell = (render_cell){'!', '!' - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
-        }
-    }
-    return 0;
+    return compose_chrome(e);
 }
 int editor_pointer(editor *e, const plat_event *ev)
 {
     int64_t col = ev->x < 0 ? -1 : (int64_t)ev->x / e->grid.dims.cell_w;
     int64_t row = ev->y < 0 ? -1 : (int64_t)ev->y / e->grid.dims.cell_h;
     if (ev->kind == PLAT_EV_BUTTON && ev->code == 1) {
-        if (!ev->press) { e->drag_tab = SIZE_MAX; e->map_drag = false; return 0; }
+        if (!ev->press) { e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; return 0; }
         if (e->tab_rows && row == 0 && col >= 0) {
             size_t hit = tabs_strip_hit(&e->tabs, &e->strip, (uint32_t)col);
-            if (hit != SIZE_MAX) { e->drag_tab = hit; return editor_select_tab(e, hit); }
+            if (hit != SIZE_MAX) {
+                int rc = editor_select_tab(e, hit);
+                if (!rc) { e->drag_tab = hit; e->drag_id = tabs_at(&e->tabs, hit)->id; }
+                return rc;
+            }
         }
-        if (e->map_cols && col >= (int64_t)e->text_grid.dims.cols && row >= e->tab_rows) e->map_drag = true;
+        if (!e->buffer->source_stale && !e->buffer->pending_open && e->map_cols &&
+            col >= (int64_t)e->text_grid.dims.cols && row >= e->tab_rows) {
+            e->map_drag = true; e->map_drag_id = e->buffer->id;
+            e->map_drag_generation = e->buffer->source_generation;
+        }
     }
-    if (ev->kind == PLAT_EV_MOTION && e->drag_tab != SIZE_MAX && col >= 0) {
+    if (ev->kind == PLAT_EV_MOTION && e->drag_id && col >= 0) {
+        size_t from = 0;
+        while (from < tabs_count(&e->tabs) && tabs_at(&e->tabs, from)->id != e->drag_id) from++;
+        if (from == tabs_count(&e->tabs)) { e->drag_id = 0; e->drag_tab = SIZE_MAX; return 0; }
         size_t hit = tabs_strip_hit(&e->tabs, &e->strip, (uint32_t)col);
-        if (hit != SIZE_MAX && hit != e->drag_tab) {
-            int rc = tabs_reorder(&e->tabs, e->drag_tab, hit); if (rc) return rc;
+        if (hit != SIZE_MAX && hit != from) {
+            int rc = tabs_reorder(&e->tabs, from, hit); if (rc) return rc;
             e->drag_tab = hit; return editor_begin_frame(e);
         }
     }
+    if (e->map_drag && (e->buffer->source_stale || e->buffer->pending_open ||
+        e->map_drag_id != e->buffer->id || e->map_drag_generation != e->buffer->source_generation)) e->map_drag = false;
     if (e->map_drag) {
         minimap_input input = editor_map_input(e->buffer); minimap_target target;
         int rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, row - e->tab_rows, &target);

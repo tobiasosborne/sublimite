@@ -33,6 +33,9 @@ typedef struct editor_buffer {
     piece_tree *tree, *preview;
     bool pending_open, source_stale, watch_pending;
     int watch_fd;
+    uint64_t prompt_ns, prompt_serial, prompt_generation;
+    int operation_error, operation_errno;
+    uint32_t operation_kind, operation_generation;
     undo_log undo;
     file *file;
     journal_base base;
@@ -41,7 +44,7 @@ typedef struct editor_buffer {
     lineidx *index;
     editor_delta *history;
     size_t history_head, history_count, history_cursor, history_cap;
-    uint64_t id, lines, revision, history_serial;
+    uint64_t id, lines, revision, history_serial, source_generation;
     bool last_repeat;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
@@ -92,6 +95,7 @@ struct editor {
     size_t strip_cap;
     uint32_t max_cols, max_rows;
     plat_event queue[EDITOR_INPUT_CAP];
+    uint64_t queue_owner[EDITOR_INPUT_CAP], queue_generation[EDITOR_INPUT_CAP];
     size_t queue_head, queue_count;
     size_t index_cursor; /* round-robin dirty-buffer maintenance */
     editor_delta edit_delta, replay_delta;
@@ -99,6 +103,8 @@ struct editor {
     bool replay_redo;
     bool explicit_group;
     unsigned source_choice;
+    uint64_t source_choice_id, source_choice_generation;
+    uint64_t event_serial, dispatch_serial, queue_serial[EDITOR_INPUT_CAP];
     editor_jop *ops;
     uint8_t *stage;
     size_t op_count, stage_used;
@@ -118,6 +124,7 @@ struct editor {
     uint32_t tab_rows, map_cols;
     tabs_strip strip;
     size_t drag_tab;
+    uint64_t drag_id, map_drag_id, map_drag_generation;
     bool map_drag, paint_ready, caret_only;
     int raster_poll_fd;
     uint8_t *indent_bytes;
@@ -127,6 +134,7 @@ struct editor {
     int error;
 };
 /* Internal cross-file helpers; UI only. */
+bool editor_activation_busy(const editor *e);
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);
 int editor_refresh_cursor(editor *e, uint64_t old_cursor);
@@ -137,6 +145,7 @@ void editor_route_work(const work_msg *msg, void *ctx);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
 int editor_journal_metadata(editor *e);
+bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);
 int editor_continue_action(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);

@@ -69,6 +69,10 @@ const tabs_tab *tabs_active(const tabs_set *s);
  * outputs unchanged. No allocations or I/O in any API except init/fini. */
 int tabs_open(tabs_set *s, const tabs_desc *d, view_state *live, uint64_t *id);
 int tabs_select(tabs_set *s, size_t index, view_state *live);
+/* Replace borrowed storage/state in the existing logical tab. Keeps ID, order,
+ * MRU and closed-stack membership; caller retires the outgoing handles. */
+int tabs_replace(tabs_set *s, size_t index, piece_tree *buffer, undo_log *undo,
+                 const view_state *state, view_state *live);
 /* Close commits any held cycle, saves live, then chooses MRU survivor if active
  * closed. evicted is required: id==0 means nothing evicted; otherwise the caller
  * may retire its resources after frame/worker references are quiescent. At zero

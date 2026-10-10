@@ -210,7 +210,14 @@ void editor_route_work(const work_msg *msg, void *ctx)
             trace_record(TRACE_T2_MUTATION_DONE, editor_large_trace_frame(fm.f));
         editor_large_file_msg(e, &fm);
         if (fm.f == e->opening) e->open_error = fm.status;
-        else if (fm.status && !e->error) e->error = fm.status;
+        else for (size_t i = 0; i < e->buffer_capacity; i++) {
+            editor_buffer *owner = e->buffers[i];
+            if (!owner || owner->file != fm.f) continue;
+            if (fm.kind == FILE_MSG_SAVE_DONE && fm.generation != owner->lg.save_gen) break;
+            owner->operation_error = fm.status; owner->operation_errno = fm.err_no;
+            owner->operation_kind = fm.kind; owner->operation_generation = fm.generation;
+            break;
+        }
         return;
     }
     if (!e->backend->initialized) return;
@@ -328,6 +335,11 @@ static int submit(editor *e)
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
+    if (e->buffer->source_stale && !e->buffer->prompt_ns) {
+        e->buffer->prompt_ns = e->frame.submit_ns;
+        e->buffer->prompt_serial = e->event_serial;
+        e->buffer->prompt_generation = e->buffer->source_generation;
+    }
     if (e->frame.last_sequence) e->stats.submitted_sequence = e->frame.last_sequence;
     e->dirty = false;
     if (e->cfg.on_submit) e->cfg.on_submit(e->cfg.hook_ctx, &e->frame);
@@ -363,6 +375,7 @@ static int nonkey(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
     if (ev->kind == PLAT_EV_EXPOSE) return editor_full_layout(e);
     if (ev->kind == PLAT_EV_RESIZE) {
+        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
         e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
     }
     if (ev->kind == PLAT_EV_FOCUS) {
@@ -372,13 +385,13 @@ static int nonkey(editor *e, const plat_event *ev)
             int rc = editor_check_sources(e); if (rc) return rc;
         }
         keys_reset(&e->keys); tabs_mru_release(&e->tabs);
-        e->drag_tab = SIZE_MAX; e->map_drag = false;
+        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
         editor_restart_blink(e, trace_now_ns());
         return refresh_caret(e);
     }
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
     if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
-        return e->buffer->source_stale ? 0 : editor_pointer(e, ev);
+        return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);
     return 0;
 }
 void editor_restart_blink(editor *e, uint64_t now)
@@ -408,9 +421,45 @@ static int blink(editor *e, uint64_t now)
     return refresh_caret(e);
 }
 
+static bool queued_owner_live(const editor *e, size_t at)
+{
+    if (!e->queue_owner[at]) return true;
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        if (tab->id != e->queue_owner[at]) continue;
+        for (size_t slot = 0; slot < e->buffer_capacity; slot++) {
+            const editor_buffer *b = e->buffers[slot];
+            if (b && !b->retired && b->id == tab->id) return b->source_generation == e->queue_generation[at] && !b->source_stale;
+        }
+    }
+    return false;
+}
+static size_t queue_pick(const editor *e)
+{
+    /* Journal replay ranges borrow tree storage until every staged record drains. */
+    if (e->journal && e->op_count) return SIZE_MAX;
+    for (size_t n = 0; n < e->queue_count; n++) {
+        size_t at = (e->queue_head + n) % EDITOR_INPUT_CAP;
+        if (!queued_owner_live(e, at) || editor_event_control(e, &e->queue[at])) return n;
+        if (e->queue_owner[at] && e->queue_owner[at] != e->buffer->id) continue;
+        if (!e->buffer->pending_open || e->buffer->source_stale) return n;
+    }
+    return SIZE_MAX;
+}
+static void queue_remove(editor *e, size_t n)
+{
+    /* Only bypassed parked entries move; ordinary head dispatch is constant time. */
+    if (!n) { e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--; return; }
+    for (size_t i = n; i + 1 < e->queue_count; i++) {
+        size_t dst = (e->queue_head + i) % EDITOR_INPUT_CAP, src = (dst + 1) % EDITOR_INPUT_CAP;
+        e->queue[dst] = e->queue[src]; e->queue_owner[dst] = e->queue_owner[src];
+        e->queue_generation[dst] = e->queue_generation[src]; e->queue_serial[dst] = e->queue_serial[src];
+    }
+    e->queue_count--;
+}
 static bool runnable(const editor *e)
 {
-    bool can_drain = (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || !e->op_count);
+    bool can_drain = queue_pick(e) != SIZE_MAX;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         const editor_buffer *b = e->buffers[i];
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
@@ -448,7 +497,11 @@ int editor_inject(editor *e, const plat_event *event)
     if (event->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
     if (e->queue_count == EDITOR_INPUT_CAP) return EDITOR_ERR_INPUT_FULL;
     size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
-    e->queue[at] = *event; e->queue_count++; return 0;
+    e->queue[at] = *event; e->queue_serial[at] = ++e->event_serial;
+    bool parked = e->buffer->pending_open && !editor_event_control(e, event);
+    e->queue_owner[at] = parked ? e->buffer->id : 0;
+    e->queue_generation[at] = parked ? e->buffer->source_generation : 0;
+    e->queue_count++; return 0;
 }
 static int close_result(editor *e)
 {
@@ -478,10 +531,12 @@ int editor_step(editor *e, int timeout_ms)
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
         if (e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
-        else if (e->queue_count && (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || !e->op_count)) {
-            plat_event ev = e->queue[e->queue_head];
-            e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
-            rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
+        else if (queue_pick(e) != SIZE_MAX) {
+            size_t picked = queue_pick(e), at = (e->queue_head + picked) % EDITOR_INPUT_CAP;
+            plat_event ev = e->queue[at]; bool live = queued_owner_live(e, at);
+            e->dispatch_serial = e->queue_serial[at];
+            queue_remove(e, picked);
+            rc = !live ? 0 : ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
         } else if (layout_busy(&e->lay)) {
             rc = layout_slice(e);
             if (rc >= 0) rc = 0;
@@ -534,7 +589,7 @@ int editor_run(editor *e)
 }
 int editor_set_cursor(editor *e, uint64_t byte)
 {
-    if (!e || e->buffer->source_stale || e->buffer->pending_open || byte > piece_len(e->tree) || view_busy(&e->v)) return EDITOR_ERR_ARG;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open || byte > piece_len(e->tree) || editor_activation_busy(e)) return EDITOR_ERR_ARG;
     uint64_t old = e->v.state.selection.cursor;
     e->old_selection = e->v.state.selection;
     e->v.state.selection.cursor = e->v.state.selection.anchor = byte;
@@ -547,7 +602,7 @@ int editor_set_cursor(editor *e, uint64_t byte)
 }
 int editor_jump_line(editor *e, uint64_t line)
 {
-    if (!e || e->buffer->source_stale || e->buffer->pending_open) return EDITOR_ERR_ARG;
+    if (!e || editor_activation_busy(e) || e->buffer->source_stale || e->buffer->pending_open) return EDITOR_ERR_ARG;
     if (e->buffer->index) {
         (void)lineidx_poll(e->buffer->index);
         /* Exact piece queries are warm after open; publication remains the
@@ -561,8 +616,18 @@ int editor_jump_line(editor *e, uint64_t line)
     }
     return editor_set_cursor(e, piece_line_to_byte(e->tree, line));
 }
-uint64_t editor_length(const editor *e) { return e && tabs_count(&e->tabs) ? piece_len(e->tree) : 0; }
-int editor_read(const editor *e, uint64_t off, uint8_t *dst, size_t len) { return e ? piece_read(e->tree, off, dst, len) : EDITOR_ERR_ARG; }
+uint64_t editor_length(const editor *e)
+{
+    if (!e || !tabs_count(&e->tabs)) return 0;
+    const piece_snapshot *snap = undo_replay_snapshot(e->undo);
+    return snap ? piece_snapshot_len(snap) : piece_len(e->tree);
+}
+int editor_read(const editor *e, uint64_t off, uint8_t *dst, size_t len)
+{
+    if (!e) return EDITOR_ERR_ARG;
+    const piece_snapshot *snap = undo_replay_snapshot(e->undo);
+    return snap ? piece_snapshot_read(snap, off, dst, len) : piece_read(e->tree, off, dst, len);
+}
 view_state editor_view(const editor *e) { return e ? e->v.state : (view_state){0}; }
 editor_stats editor_get_stats(const editor *e)
 {
