@@ -172,3 +172,24 @@ returned zero; 51 test binaries plus replay CLI passed (M)[AC], leaks disabled.
 make fuzz built 26 targets; tool-protocol, X11 input and editor fuzz each ran
 clean for 61 seconds (M)[AC]. The first check's unrelated use-after-free remains
 reported for coordinator follow-up; later green does not erase that observation.
+
+## edit-6pc s9 — P2-1 clipboard review §1 / §26 / §27 / §28
+
+Done: paste borrows survive budget-pressure ownership replacement; aggregate request
+admission and capacity-aware completion emission retain partial-batch data; saturated
+MULTIPLE refusals retire older same-tuple jobs in arrival order; memory admission is
+nonblocking and the aligned private worker pool is initialized before dispatch.
+No new globals or typing-path allocations. Code changes remain in clip.c/clip.h and
+the new clipboard regression test. Design: ../../docs/decisions/edit-6pc.md.
+
+Red/green and standalone final evidence: ../../docs/worker-reports/edit-6pc-s9.md.
+GCC 13 make all and focused GCC/clang clipboard tests are green (M)[AC]. Existing
+clipboard integration and all remaining sanitizer binaries after refwin passed.
+Live clipboard-capable x11_input_fuzz: 4,081 runs / 61 seconds, no sanitizer errors
+(M)[AC], Not charging, launch load1=7.49. The initial full make check passed, but
+final-tree full-suite attempts failed in unrelated refwin_test preflight; the last
+failure reports keycode 38 already down on shared :99. Its isolated rerun passed.
+Final full-suite acceptance remains unmet. No shared keys were forcibly released,
+server restarted, or unrelated code changed. Leak detection was disabled; coordinator
+must rerun with leaks enabled. The report also records existing deferred-owner-free
+admission accounting that can temporarily exceed budget, outside this bead.

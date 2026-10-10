@@ -27,7 +27,9 @@ uint64_t x11_clip_max_poll_ns(plat *p, bool reset, uint64_t *cpu_ns_out);
 /* Zero-copy publish for large owners (P2.2h): a producer fills a clipboard buffer on any thread, the UI thread only adopts
  * it. plat_clip_set stays correct but copies synchronously (the caller's buffer is borrowed), so it is for small texts.
  * x11_clip_buf_new/_data/_free are thread-agnostic (no clip state); x11_clip_set_buf consumes the buffer whether it
- * succeeds or not (PLAT_ERR_FAIL when over the memory budget). The buffer is immutable once adopted. */
+ * succeeds or not (PLAT_ERR_FAIL when over the memory budget). Admission does not wait for deferred frees;
+ * after x11_clip_poll reclaims their budget, a caller may retry with a fresh buffer. The last paste's borrowed
+ * bytes stay charged and valid until a later paste completion. The buffer is immutable once adopted. */
 typedef struct clip_blob x11_clip_buf;
 x11_clip_buf *x11_clip_buf_new(size_t len);          /* NULL above 64 MiB or on OOM; len bytes uninitialised */
 uint8_t      *x11_clip_buf_data(x11_clip_buf *b);
