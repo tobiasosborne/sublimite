@@ -9,8 +9,9 @@
 #define FL_BUILT 1u
 #define FL_NONASCII 2u
 #define FL_EDITED 4u
-#define RES_DONE (1ull << 63)
-#define RES_NA (1ull << 32)
+#define RES_DONE (1u << 31)
+#define RES_NA (1u << 30)
+#define RES_COUNT ((1u << 17) - 1u)
 #define BLOCK_MAX 512u
 #define POLL_CHUNKS 64u
 #define PUBLISH_CHUNKS 16u
@@ -19,6 +20,9 @@
 #define UI_CPU_NS 500000ull
 #define MSG_SEEK (LINEIDX_MSG_PROGRESS + 1u)
 #define DEFAULT_BPL 40u
+
+_Static_assert(LINEIDX_CHUNK == (uint32_t)UINT16_MAX + 1u, "length-minus-one fits 16 bits");
+_Static_assert(LINEIDX_CHUNK <= RES_COUNT, "newline count includes a full LF chunk");
 
 /* Relative lengths avoid an absolute-offset update of the suffix. Leaves are
  * linked within bounded blocks; the block treap holds incremental summaries.
@@ -40,12 +44,13 @@ typedef struct lineidx_job {
     work_pool *pool;
     work_handle h;
     size_t n, applied, available;
-    uint64_t *starts, *res;
+    uint16_t *lengths; /* length minus one; empty source is handled separately */
+    uint32_t *res;     /* 17-bit count (including 65536), nonascii, built */
     uint32_t generation, apply_block, apply_entry;
     bool seeking;
     uint64_t target;
     size_t cursor, sealed;                /* worker continuation */
-    uint64_t scan_pos, scan_nl, scan_na, cumulative, answer;
+    uint64_t chunk_start, scan_pos, scan_nl, scan_na, cumulative, answer;
     bool seek_pending;
     uint64_t cpu_begin, cancel_cpu_ns; /* worker; read only after work completion */
 } lineidx_job;
@@ -398,7 +403,7 @@ static void job_free(lineidx_job *j)
 {
     (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     if (j->src.release) j->src.release(j->src.ctx);
-    free(j->starts); free(j->res); free(j);
+    free(j->lengths); free(j->res); free(j);
 }
 static void reap(lineidx *x)
 {
@@ -472,11 +477,12 @@ static void build_fn(work_ctx *c)
     while (j->cursor < j->n) {
         if (worker_stop(c)) return;
         size_t i = j->cursor;
-        uint64_t r = j->res[i], count = r & UINT32_MAX;
+        uint32_t r = j->res[i];
+        uint64_t count = r & RES_COUNT;
+        uint64_t end = j->chunk_start + (j->src.len ? (uint64_t)j->lengths[i] + 1u : 0);
         bool scan = !(r & RES_DONE) || (j->seeking && j->target <= j->cumulative + count);
         if (scan) {
-            uint64_t end = j->starts[i + 1u];
-            if (j->scan_pos < j->starts[i]) j->scan_pos = j->starts[i];
+            if (j->scan_pos < j->chunk_start) j->scan_pos = j->chunk_start;
             while (j->scan_pos < end) {
                 if (worker_stop(c)) return;
                 const uint8_t *p;
@@ -506,9 +512,10 @@ static void build_fn(work_ctx *c)
                 if (spans >= 64u) goto publish_results;
             }
             count = j->scan_nl;
-            j->res[i] = RES_DONE | (j->scan_na ? RES_NA : 0) | count;
+            j->res[i] = RES_DONE | (j->scan_na ? RES_NA : 0) | (uint32_t)count;
             j->scan_nl = j->scan_na = 0;
         }
+        j->chunk_start = end; j->scan_pos = end;
         j->cumulative += count; j->cursor++; chunks++;
         if (chunks >= PUBLISH_CHUNKS || now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
     }
@@ -634,7 +641,7 @@ size_t lineidx_mem_bytes(const lineidx *x)
     size_t bytes = sizeof *x + (x->cap + 1u) * sizeof *x->e + (x->block_cap + 1u) * sizeof *x->b;
     const lineidx_job *j = x->job ? x->job : x->retired;
     while (j) {
-        size_t scratch = sizeof *j + (j->n + 1u) * sizeof(uint64_t) + j->n * sizeof(uint64_t);
+        size_t scratch = sizeof *j + j->n * (sizeof *j->lengths + sizeof *j->res);
         if (scratch > SIZE_MAX - bytes) return SIZE_MAX;
         bytes += scratch;
         if (j->source_bytes > SIZE_MAX - bytes) return SIZE_MAX;
@@ -663,8 +670,8 @@ size_t lineidx_poll(lineidx *x)
             location at = {.block = j->apply_block, .id = j->apply_entry};
             entry *e = &x->e[at.id];
             if (!(e->fl & FL_BUILT)) {
-                uint64_t r = j->res[j->applied];
-                set_built(x, at, (uint32_t)(r & UINT32_MAX), (r & RES_NA) != 0); got++;
+                uint32_t r = j->res[j->applied];
+                set_built(x, at, r & RES_COUNT, (r & RES_NA) != 0); got++;
             }
             j->applied++; j->apply_entry = e->next;
             if (!j->apply_entry && j->applied < j->n) {
@@ -693,18 +700,18 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
     }
     lineidx_job *j = calloc(1, sizeof *j);
     if (!j) return -1;
-    j->n = x->n; j->starts = malloc((j->n + 1u) * sizeof *j->starts); j->res = malloc(j->n * sizeof *j->res);
-    if (!j->starts || !j->res) { free(j->starts); free(j->res); free(j); return -1; }
-    uint32_t leaf = edge_block(x, x->root, false); size_t i = 0; uint64_t pos = 0;
+    j->n = x->n; j->lengths = malloc(j->n * sizeof *j->lengths); j->res = malloc(j->n * sizeof *j->res);
+    if (!j->lengths || !j->res) { free(j->lengths); free(j->res); free(j); return -1; }
+    uint32_t leaf = edge_block(x, x->root, false); size_t i = 0;
     while (leaf) {
         for (uint32_t id = x->b[leaf].head; id; id = x->e[id].next) {
             const entry *e = &x->e[id];
-            j->starts[i] = pos; pos += e->len;
+            j->lengths[i] = (uint16_t)(e->len ? e->len - 1u : 0);
             j->res[i++] = (e->fl & FL_BUILT) ? RES_DONE | ((e->fl & FL_NONASCII) ? RES_NA : 0) | e->nl : 0;
         }
         leaf = successor(x, leaf);
     }
-    j->starts[j->n] = pos; j->src = *snap; j->source_bytes = source_bytes;
+    j->src = *snap; j->source_bytes = source_bytes;
     j->pool = pool; j->generation = ++x->gen; j->seeking = seeking; j->target = target;
     j->backing = x->backing;
     j->seek_pending = seeking && target == 0;

@@ -55,3 +55,29 @@ fuzzer pass. Mapping/cold I/O sources stay on bulk; dirty-index maintenance is
 unchanged. Full evidence and limits: `docs/worker-reports/edit-4w1.56-s8.md`.
 
 Rebase integration and current verification: `docs/worker-reports/edit-4w1.56-s8b.md`.
+
+
+# edit-4w1.57 — P1-1 §5 / §12 ownership and benchmark adoption
+
+Combined mmap ownership is covered by a production file/piece lifecycle test
+using the supplied sparse fixture, independent index/find/save snapshots,
+conservative find state, an allocator census and transient piece-builder
+sampling. Peak is 6,898,888 bytes (M)[AC] against 7,242,880 bytes (G). Worker
+scratch uses compact lengths/results; mmap attachment retires the acquisition
+prefix at a documented handoff. Active/retiring storage remains accounted.
+The file.c change is confined to attachment; no fault/readiness edits.
+
+The benchmark waiter continues bounded adoption while mailbox traffic remains.
+A completed-worker/full-mailbox self-check fails before the fix and passes after
+it; prior final-publication and missing-completion/deadline checks still pass.
+No new globals or typing allocations: the release guard records zero allocations
+for 10,000 keys (M)[AC]. Release and sanitizer lineidx suites pass, make all
+passes, and full make check passes 59 binaries plus replay CLI (M)[AC]. Fuzz
+requested 60 seconds (G), completed 17,146 executions in 61 seconds (M)[AC],
+exit zero. Leak detection was disabled as required; coordinator reruns with
+leaks enabled. All display execution used :99. Back-to-back old/compact TRACK
+rows establish no latency verdict on the loaded box.
+
+Complete red/green evidence, decisions and validation limitations:
+`docs/worker-reports/edit-4w1.57-s9.md` and
+`docs/decisions/edit-4w1.57.md`. Other P1-1 findings remain outside this bead.

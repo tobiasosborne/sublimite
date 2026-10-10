@@ -1,7 +1,7 @@
 /* P1.6d: G7 new mapping -> exact index, G7j fresh index request -> correct
  * 80x24 viewport submitted/presented to the null backend. ASCII fixtures.
  * Usage: [--file=PATH] [--reps=3..200] [--track] [--cold]
- *        [--timeout-ms=1..600000] | --self-check[=15|16|17|18]
+ *        [--timeout-ms=1..600000] | --self-check[=15|16|17|18|race|pending]
  * --cold: manual root eviction + mincore verification BEFORE EVERY sample.
  * Warm-only gated success exits 3 (cold unvalidated). --track never claims gates.
  * --partial was removed: G7j always starts with nothing built. */
@@ -57,13 +57,14 @@ static bool wait_index_observed(lineidx *x, work_pool *p, uint64_t deadline,
         if (after_poll) after_poll(x, ctx);
         bool building = lineidx_building(x);
         /* Worker completion can race the first poll. Stopped does not mean
-         * its final published batch has already been applied on UI. */
+         * its final published batch has already been received or applied on
+         * UI. Pending mailbox traffic requires further bounded adoption. */
         if (complete && !built && !building) {
             (void)lineidx_poll(x);
             built = lineidx_complete(x);
         }
         if (complete ? built : !building) return true;
-        if ((complete && !building) || bench_now_ns() >= deadline) {
+        if ((complete && !building && !work_mailbox_pending(p)) || bench_now_ns() >= deadline) {
             fprintf(stderr, "%s: completion failure prefix=%zu/%zu complete=%d building=%d deadline_expired=%d\n",
                     label, lineidx_built_prefix(x), lineidx_chunk_count(x), built, building,
                     bench_now_ns() >= deadline);
@@ -419,6 +420,55 @@ static int self_check_completion_race(void)
     return adopted ? 0 : 1;
 }
 
+static void fill_before_index(work_ctx *c)
+{
+    for (size_t i = 0; i < WORK_MAILBOX_CAP - 1u; i++) {
+        work_msg msg = {.kind = 99, .generation = c->generation};
+        if (!work_publish(c, &msg)) return;
+    }
+}
+
+static size_t repeated_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    *p = ctx;
+    return off < LINEIDX_CHUNK ? LINEIDX_CHUNK : 0;
+}
+
+/* A completed index behind foreign traffic in a full mailbox. Selective
+ * receive must examine that traffic in bounded slices before it can adopt. */
+static int self_check_pending_batches(void)
+{
+    work_pool pool;
+    if (work_pool_init(&pool, 1, 0) != 0) return 2;
+    uint8_t bytes[LINEIDX_CHUNK];
+    memset(bytes, '\n', sizeof bytes);
+    work_handle foreign = work_submit(&pool, (work_job){fill_before_index, NULL, 99, WORK_BULK});
+    uint64_t deadline = bench_now_ns() + 10000000000ull;
+    while (!work_handle_finished(&pool, foreign)) {
+        if (bench_now_ns() >= deadline) fail_fast("mailbox setup did not finish");
+        nap(50);
+    }
+    lineidx_src src = {bytes, LINEIDX_CHUNK, repeated_span, NULL};
+    lineidx *x = lineidx_create(src.len);
+    if (!x || lineidx_build_start(x, &pool, &src) != 0) return 2;
+    work_handle completed = {1, 2};
+    while (!work_handle_finished(&pool, completed)) {
+        if (bench_now_ns() >= deadline) fail_fast("full-mailbox index did not finish");
+        nap(50);
+    }
+    size_t pending = atomic_load(&pool.slots[foreign.slot].pending) +
+                     atomic_load(&pool.slots[completed.slot].pending);
+    bool adopted = wait_index(x, &pool, deadline, true, "valid pending batches");
+    bool exact = lineidx_line_count(x).exact && lineidx_line_count(x).value == src.len + 1u;
+    printf("SELF_CHECK pending %s completed=1 pending_before=%zu adopted=%d exact=%d\n",
+           adopted && exact && pending == WORK_MAILBOX_CAP ? "PASS" : "FAIL", pending, adopted, exact);
+    lineidx_build_cancel(x);
+    index_destroy(x, &pool, 10000000000ull);
+    drain(&pool);
+    work_pool_shutdown(&pool);
+    return adopted && exact && pending == WORK_MAILBOX_CAP ? 0 : 1;
+}
+
 static int self_check_18(void)
 {
     const char *invalid[] = {"--partial=2", "--partial=nan", "--partial=inf",
@@ -729,6 +779,7 @@ int main(int argc, char **argv)
         int result = self_check_15();
         result |= self_check_16(); result |= self_check_17(); result |= self_check_18();
         result |= self_check_completion_race();
+        result |= self_check_pending_batches();
         return result;
     }
     if (argc == 2 && strcmp(argv[1], "--self-check=15") == 0) return self_check_15();
@@ -736,6 +787,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--self-check=17") == 0) return self_check_17();
     if (argc == 2 && strcmp(argv[1], "--self-check=18") == 0) return self_check_18() | self_check_completion_race();
     if (argc == 2 && strcmp(argv[1], "--self-check=race") == 0) return self_check_completion_race();
+    if (argc == 2 && strcmp(argv[1], "--self-check=pending") == 0) return self_check_pending_batches();
     options parsed;
     if (!parse_options(argc, argv, &parsed)) {
         fputs("invalid workload: use --file=PATH --reps=3..200 --track --cold --timeout-ms=1..600000; --partial removed (fresh index required)\n", stderr);

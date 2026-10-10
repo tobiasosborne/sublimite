@@ -194,6 +194,9 @@ int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opt
  * tree keep any mapping alive through the refcount hooks. */
 void file_close(file *f);
 
+/* Borrowed bytes until close. A successful mmap file_attach retires the
+ * acquisition copy: earlier pointers expire; subsequent queries borrow the
+ * full mapping with the same prefix length. Attach does not touch mapped bytes. */
 const uint8_t *file_prefix(const file *f, size_t *len);
 int file_prefix_ready(const file *f);      /* prefix/identity available, even if empty */
 const file_prefix_info *file_prefix_info_of(const file *f);

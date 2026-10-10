@@ -2,6 +2,8 @@
 #include "piece/piece.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "file/file.h"
+#include "find/find.h"
 
 #include <fcntl.h>
 #include <sched.h>
@@ -274,6 +276,124 @@ static void test_review_memory(void)
     lineidx_destroy(x);
 #ifdef OBSERVE_ALLOCATIONS
     CHECK(__sanitizer_get_current_allocated_bytes() == before);
+#endif
+}
+
+#ifdef OBSERVE_ALLOCATIONS
+typedef struct combined_counter { size_t baseline, peak; } combined_counter;
+static void *combined_alloc(void *ctx, size_t size)
+{
+    combined_counter *counter = ctx;
+    void *p = malloc(size);
+    size_t owned = __sanitizer_get_current_allocated_bytes() - counter->baseline;
+    if (owned > counter->peak) counter->peak = owned;
+    return p;
+}
+static void combined_free(void *ctx, void *p, size_t size)
+{
+    (void)ctx; (void)size;
+    free(p);
+}
+
+static void decode_file_message(const work_msg *msg, void *ctx)
+{
+    (void)ctx;
+    file_msg decoded;
+    (void)file_msg_decode(msg, &decoded);
+}
+
+typedef struct combined_source { lease gate; piece_snapshot *snap; } combined_source;
+static size_t combined_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    combined_source *s = ctx;
+    atomic_store_explicit(&s->gate.entered, true, memory_order_release);
+    while (!atomic_load_explicit(&s->gate.resume, memory_order_acquire)) sched_yield();
+    piece_iter it;
+    size_t n = 0;
+    piece_iter_begin_snapshot(&it, s->snap, off);
+    return piece_iter_next(&it, p, &n) ? n : 0;
+}
+static void combined_release(void *ctx)
+{
+    combined_source *s = ctx;
+    piece_snapshot_release(s->snap);
+    atomic_store_explicit(&s->gate.released, true, memory_order_release);
+}
+#endif
+
+/* Count actual deduplicated malloc ownership, including opaque file/piece/find
+ * storage. Clean file-backed mapping bytes contribute zero to G10f. The
+ * sanitizer allocator census includes every private allocation, counted once. */
+static void test_combined_ownership(void)
+{
+#ifdef OBSERVE_ALLOCATIONS
+    size_t before = __sanitizer_get_current_allocated_bytes();
+    file *f = NULL;
+    file_open_opts opts = {.copy_threshold = 1, .generation = 57};
+    REQUIRE(file_open_begin(&pool, "/tmp/edit-corpus/sparse_10g.bin", &opts, &f) == FILE_OK);
+    uint64_t deadline = 20000;
+    while (!file_open_ready(f) && deadline--) {
+        (void)work_mailbox_drain(&pool, decode_file_message, NULL);
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    }
+    REQUIRE(file_open_ready(f) && file_open_mode(f) == FILE_MODE_MMAP);
+    uint64_t size = file_size(f);
+    REQUIRE(size == 10ull * 1024u * 1024u * 1024u);
+    size_t prefix_len = 0;
+    (void)file_prefix(f, &prefix_len);
+    size_t gate = 32u * (size_t)((size + LINEIDX_CHUNK - 1u) / LINEIDX_CHUNK) + 2000000u;
+    size_t open_owned = __sanitizer_get_current_allocated_bytes() - before;
+    combined_counter counter = {.baseline = before};
+    piece_allocator alloc = {&counter, combined_alloc, combined_free};
+    piece_tree *tree = piece_create(&alloc);
+    REQUIRE(tree != NULL && file_attach(f, tree) == FILE_OK);
+    piece_iter prefix_it;
+    const uint8_t *first = NULL;
+    size_t first_len = 0, attached_prefix_len = 0;
+    piece_iter_begin(&prefix_it, tree, 0);
+    CHECK(piece_iter_next(&prefix_it, &first, &first_len));
+    CHECK(file_prefix(f, &attached_prefix_len) == first && attached_prefix_len == prefix_len);
+    combined_source index_source = {.snap = piece_snapshot_take(tree)};
+    piece_snapshot *find_snapshot = piece_snapshot_take(tree);
+    piece_snapshot *save_snapshot = piece_snapshot_take(tree);
+    REQUIRE(index_source.snap && find_snapshot && save_snapshot);
+    void *program = malloc(FIND_MAX_PROGRAM_BYTES);
+    void *scratch = malloc(FIND_MAX_SCRATCH_BYTES);
+    find_result *result = malloc(sizeof *result);
+    REQUIRE(program && scratch && result);
+    find_regex *regex = NULL;
+    REQUIRE(find_regex_compile(program, FIND_MAX_PROGRAM_BYTES, (const uint8_t *)"z", 1, &regex, NULL) == FIND_OK);
+    CHECK(find_regex_scratch_bytes(regex) <= FIND_MAX_SCRATCH_BYTES);
+    size_t attached_owned = __sanitizer_get_current_allocated_bytes() - before;
+    lineidx *x = lineidx_create(size);
+    REQUIRE(x != NULL);
+    lineidx_src src = {&index_source, size, combined_span, combined_release};
+    REQUIRE(lineidx_build_start_owned(x, &pool, &src, 0) == 0);
+    REQUIRE(lease_entered(&index_source.gate));
+    size_t queued_owned = __sanitizer_get_current_allocated_bytes() - before;
+    size_t peak = queued_owned > attached_owned ? queued_owned : attached_owned;
+    if (open_owned > peak) peak = open_owned;
+    if (counter.peak > peak) peak = counter.peak; /* includes transient piece builder storage */
+    fprintf(stderr, "G10f combined sparse_10g.bin (M)[AC]: open=%zu attached_find_save=%zu index_queued=%zu peak=%zu gate=%zu (G)\n",
+            open_owned, attached_owned, queued_owned, peak, gate);
+    CHECK(peak <= gate);
+    lineidx_build_cancel(x);
+    CHECK(__sanitizer_get_current_allocated_bytes() - before == queued_owned);
+    atomic_store_explicit(&index_source.gate.resume, true, memory_order_release);
+    lineidx_destroy(x);
+    CHECK(atomic_load(&index_source.gate.released));
+    file_close(f);
+    piece_destroy(tree);
+    CHECK(__sanitizer_get_current_allocated_bytes() - before <= gate);
+    uint8_t byte;
+    CHECK(piece_snapshot_read(find_snapshot, size - 1u, &byte, 1) == PIECE_OK);
+    CHECK(piece_snapshot_read(save_snapshot, 0, &byte, 1) == PIECE_OK);
+    piece_snapshot_release(find_snapshot);
+    piece_snapshot_release(save_snapshot);
+    free(result); free(scratch); free(program);
+    CHECK(__sanitizer_get_current_allocated_bytes() == before);
+#else
+    fprintf(stderr, "G10f combined ownership census runs in the sanitizer suite\n");
 #endif
 }
 
@@ -1123,6 +1243,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[1], "--review=11") == 0) test_review_queued_destroy();
         else if (strcmp(argv[1], "--review=work9") == 0) test_review_polling(true);
         else if (strcmp(argv[1], "--review=12") == 0) { test_review_memory(); test_review_owned_source(); }
+        else if (strcmp(argv[1], "--review=combined") == 0) test_combined_ownership();
         else if (strcmp(argv[1], "--review=13") == 0) {
             test_review_mailbox(); test_mailbox_pressure(); test_completed_slot_reuse();
         }
@@ -1148,6 +1269,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "-- review_epoch\n"); test_review_epoch();
     fprintf(stderr, "-- review_boundaries\n"); test_review_boundaries();
     fprintf(stderr, "-- review_memory\n"); test_review_memory();
+    fprintf(stderr, "-- combined_ownership\n"); test_combined_ownership();
     fprintf(stderr, "-- review_owned_source\n"); test_review_owned_source();
     fprintf(stderr, "-- review_mailbox\n"); test_review_mailbox();
     fprintf(stderr, "-- mailbox_pressure\n"); test_mailbox_pressure();

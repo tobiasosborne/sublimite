@@ -844,6 +844,13 @@ int file_attach(file *f, piece_tree *t)
     rc = piece_init_mapped(t, (const uint8_t *)f->map->addr, f->map->len, &h);
     if (rc != 0) return FILE_ERR_NOMEM;
     f->attached = 1;
+    /* The full mapping now owns the prefix bytes. Retire the acquisition copy
+     * only after successful tree handoff; prefix queries borrow the mapping. */
+    if (f->mode == FILE_MODE_MMAP && f->prefix_owned) {
+        free(f->prefix);
+        f->prefix = f->map->addr;
+        f->prefix_owned = 0;
+    }
     /* Source fd is released at off-path close; attachment performs no I/O. */
     return FILE_OK;
 }

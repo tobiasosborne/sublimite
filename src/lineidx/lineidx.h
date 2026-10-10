@@ -5,7 +5,9 @@
  * A line break is exactly '\n'.
  * line_count = newlines + 1. Content is described by a lineidx_src (a span
  * callback), so the index works over a mapped file, a flat buffer or a
- * piece_snapshot without depending on any of them.
+ * piece_snapshot without depending on any of them. A build copies six bytes
+ * of immutable geometry/results per chunk; shared source ownership must be
+ * deduplicated with the file, piece tree and other snapshot consumers for G10f.
  *
  * THREADS: a lineidx is owned by the UI thread. The only cross-thread data is
  * sealed per-build result ranges, published and generation/lease validated by
