@@ -1,3 +1,35 @@
+# edit-4w1.55 — P1-1 §§2–3, session 9
+
+Detected SIGBUS recovery now invalidates derived find/index results through a
+retained backing token. Find polls it and the panel rejects publication/adoption,
+cancels leases, and clears already adopted metadata on use. Line indexes bind
+before scanning, retain the mapping after source retirement, cancel faulted work,
+and refuse exact queries/completion/seek after recovery. The editor binds both
+synchronous and worker indexes. A tiny piece snapshot lifetime-hook accessor is
+the only piece change; mutation/storage algorithms are unchanged.
+
+Readiness getters were already mailbox-only in this main. Deferred file decode
+now also validates the file's recorded work slot/epoch/application generation,
+so cancellation after receipt cannot install readiness. Queued and pending
+prefix/map cancellation, getter-only polling, faults during scanning, before
+adoption, after adoption and after file/tree/snapshot destruction have coverage.
+No new mutable globals: the symbol self-check still reports only file_bus.
+
+Red-first outputs, all final evidence and limits:
+[worker report](../../docs/worker-reports/edit-4w1.55-s9.md).
+Lifetime/adoption choices and loaded back-to-back TRACK comparisons:
+[decision](../../docs/decisions/edit-4w1.55.md).
+
+Final make all and make check exit 0 (M)[AC], GCC 13 release and Clang 18
+ASan/UBSan with the normal strict warning flags. All 59 sanitizer binaries and
+replay CLI passed (M)[AC]. DISPLAY and EDIT_DISPLAY were :99; final check used
+an isolated worktree runtime directory with local socket access. Final file fuzz
+requested 60 s (G), completed 8410 executions in 61 s (M)[AC], exit 0.
+Release file suites and active save/lineidx/editor allocation guards pass;
+10,000 typing keys allocate zero (M)[AC]. ASAN_OPTIONS=detect_leaks=0 is required
+in the sandbox; coordinator reruns with leaks enabled. Undetected mapping races,
+original rebasing and the older unrelated findings below remain outside scope.
+
 # File module status
 
 P1.7e / edit-4w1.43 session-eight continuation: §§17–18, 20–23 have targeted

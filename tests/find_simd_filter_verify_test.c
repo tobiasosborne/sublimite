@@ -202,7 +202,7 @@ static int budget_fallback(void)
     for (size_t m=10;m<=70;m+=3) {
         memset(nd,'a',m); nd[m]='b'; size_t n=m+1;
         CHECK(check_bytes(h,sizeof h,nd,n)==0);
-        meter mt={NULL,0,false}; find_lit l; uint64_t at=0;
+        meter mt={NULL,0,false,NULL}; find_lit l; uint64_t at=0;
         CHECK(find_lit_init(&l,nd,n,&mt,false));
         find_source s={h,sizeof h,NULL};
         CHECK(find_lit_seek(&l,&s,sizeof h,0,&at)==0);
@@ -236,7 +236,7 @@ static int cancellation_accounting(void)
     uint8_t h[257]; memset(h,'a',sizeof h);
     const uint8_t nd[2]={'a','b'};
     find_source s={h,sizeof h,NULL};
-    meter mt={NULL,0,false}; find_lit l; uint64_t at=0;
+    meter mt={NULL,0,false,NULL}; find_lit l; uint64_t at=0;
     CHECK(find_lit_init(&l,nd,sizeof nd,&mt,true));
     /* The critical factorisation of ab is a | b, nonperiodic, shift 2. */
     l.tw_ready=true; l.ell=1; l.per=2; l.periodic=false; mt.units=0;
@@ -279,7 +279,7 @@ static int two_way_cancel_boundaries(void)
         const uint8_t *hay=(const uint8_t *)cases[c].hay;
         const uint8_t *needle=(const uint8_t *)cases[c].needle;
         find_source source={hay,cases[c].n,NULL};
-        meter mt={&control,0,false}; find_lit plan; uint64_t at=FIND_UNSET;
+        meter mt={&control,0,false,NULL}; find_lit plan; uint64_t at=FIND_UNSET;
         CHECK(find_lit_init(&plan,needle,cases[c].n,&mt,true));
         int expected=cases[c].matched?1:0;
         CHECK(find_lit_seek(&plan,&source,source.length,0,&at)==expected);

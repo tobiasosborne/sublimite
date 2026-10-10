@@ -223,7 +223,7 @@ static regex_meter regex_meter_init(const find_control *control,uint64_t length,
 {
     uint64_t scale=64*((uint64_t)states+1);
     uint64_t remaining=length>=UINT64_MAX/scale ? UINT64_MAX : (length+1)*scale;
-    regex_meter m={{control,0,false},remaining,false}; return m;
+    regex_meter m={{control,0,false,NULL},remaining,false}; return m;
 }
 static bool regex_step(regex_meter *m)
 {
@@ -330,6 +330,7 @@ static find_code regex_one(const find_source *source,const find_regex *re,uint64
     if (code!=FIND_OK) return code;
     if (off>source_len(source)) return FIND_ERR_ARGUMENT;
     reader r=reader_init(source); regex_meter m=regex_meter_init(control,r.len,re->count); match->groups=re->groups;
+    m.poll.snapshot=source->snapshot;
     if (budget) m.remaining=*budget;
     if (!poll_stop(&m.poll)) {
         if (scan) (void)regex_seek(&r,re,off,memory,&m,match);
@@ -361,6 +362,7 @@ static find_code regex_search_run(const find_source *source,const find_regex *re
     find_code code=regex_arguments(source,re,memory,size);
     if (code!=FIND_OK) return code;
     reader r=reader_init(source); regex_meter m=regex_meter_init(control,r.len,re->count); uint64_t off=0;
+    m.poll.snapshot=source->snapshot;
     if (!poll_stop(&m.poll)) for (;;) {
         find_match hit; clear_match(&hit); hit.groups=re->groups;
         if (!regex_seek(&r,re,off,memory,&m,&hit)) break;

@@ -1,6 +1,7 @@
 /* Sparse line index. See docs/decisions/P1.6{b,c}.md. */
 #include "lineidx/lineidx.h"
 #include "scan/scan.h"
+#include "file/file.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -34,6 +35,7 @@ typedef struct block {
 typedef struct lineidx_job {
     struct lineidx_job *next;
     lineidx_src src;
+    file_backing *backing; /* borrowed from the index until physical completion */
     size_t source_bytes;
     work_pool *pool;
     work_handle h;
@@ -54,6 +56,9 @@ struct lineidx {
     uint32_t root, garbage, free_entry, free_block, free_blocks, sequence;
     size_t free_entries;
     uint64_t len;
+    file_backing *backing;
+    bool faulted;
+    bool backing_bound;
     bool dirty;
     size_t pfx_n;
     uint64_t pfx_lines, pfx_bytes;
@@ -413,8 +418,8 @@ static void retire_job(lineidx *x)
 typedef struct result_range { uint64_t first, end; } result_range;
 static bool worker_stop(work_ctx *c)
 {
-    if (!work_should_stop(c)) return false;
     lineidx_job *j = c->arg;
+    if (!work_should_stop(c) && !file_backing_faulted(j->backing)) return false;
     if (!j->cancel_cpu_ns && j->cpu_begin)
         j->cancel_cpu_ns = now_ns(CLOCK_THREAD_CPUTIME_ID) - j->cpu_begin;
     return true;
@@ -439,6 +444,7 @@ static void receive_results(const work_msg *msg, void *ud)
     lineidx *x = ud; lineidx_job *j = x->job;
     if (!j || msg->generation != j->generation || j->generation != x->gen ||
         msg->slot_ != j->h.slot || msg->epoch_ != j->h.epoch) return;
+    if (file_backing_faulted(j->backing)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
         result_range range; memcpy(&range, msg->data, sizeof range);
         if (range.first != j->available || range.end < range.first || range.end > j->n) return;
@@ -566,6 +572,25 @@ void lineidx_build_cancel(lineidx *x)
     }
     x->async_ready = false;
 }
+static bool invalidate_backing(lineidx *x)
+{
+    if (!x->faulted && file_backing_faulted(x->backing)) {
+        x->faulted = true;
+        lineidx_build_cancel(x);
+        x->seek_cached = false; x->query_active = false;
+    }
+    return x->faulted;
+}
+int lineidx_bind_snapshot(lineidx *x, const piece_snapshot *snapshot)
+{
+    if (!x || !snapshot || piece_snapshot_len(snapshot) != x->len ||
+        x->backing_bound || x->job || x->retired ||
+        (x->len && x->b[x->root].unbuilt != x->n)) return -1;
+    x->backing = file_snapshot_backing(snapshot);
+    x->backing_bound = true;
+    file_backing_acquire(x->backing);
+    return 0;
+}
 void lineidx_destroy(lineidx *x)
 {
     if (!x) return;
@@ -574,6 +599,7 @@ void lineidx_destroy(lineidx *x)
         reap(x);
         if (x->retired) nanosleep(&(struct timespec){0, 100000}, NULL);
     }
+    file_backing_release(x->backing);
     free(x->e); free(x->b); free(x);
 }
 uint64_t lineidx_len(const lineidx *x) { return x->len; }
@@ -583,12 +609,12 @@ uint64_t lineidx_cancel_cpu_ns(const lineidx *x)
     return j && job_done(j) ? j->cancel_cpu_ns : x->last_cancel_cpu_ns;
 }
 size_t lineidx_chunk_count(const lineidx *x) { return x->n; }
-size_t lineidx_built_prefix(lineidx *x) { derive(x); return x->pfx_n; }
-bool lineidx_complete(lineidx *x) { return x->b[x->root].unbuilt == 0; }
-bool lineidx_any_nonascii(const lineidx *x) { return x->b[x->root].nonascii != 0; }
+size_t lineidx_built_prefix(lineidx *x) { if (invalidate_backing(x)) return 0; derive(x); return x->pfx_n; }
+bool lineidx_complete(lineidx *x) { return !invalidate_backing(x) && x->b[x->root].unbuilt == 0; }
+bool lineidx_any_nonascii(const lineidx *x) { return !file_backing_faulted(x->backing) && x->b[x->root].nonascii != 0; }
 bool lineidx_chunk_nonascii(const lineidx *x, size_t ordinal)
 {
-    if (ordinal >= x->n) return false;
+    if (file_backing_faulted(x->backing) || ordinal >= x->n) return false;
     uint32_t root = x->root, k = (uint32_t)ordinal;
     while (root) {
         const block *v = &x->b[root]; uint32_t left = x->b[v->left].total;
@@ -618,12 +644,14 @@ size_t lineidx_mem_bytes(const lineidx *x)
 }
 bool lineidx_building(lineidx *x)
 {
+    (void)invalidate_backing(x);
     reap(x);
     if (x->retired) return true;
     return x->job && (!job_done(x->job) || x->job->applied < x->job->available);
 }
 size_t lineidx_poll(lineidx *x)
 {
+    (void)invalidate_backing(x);
     lineidx_job *j = x->job;
     size_t got = 0;
     uint64_t deadline = now_ns(CLOCK_MONOTONIC) + UI_CPU_NS;
@@ -631,6 +659,7 @@ size_t lineidx_poll(lineidx *x)
     if (j) {
         (void)work_mailbox_receive_bounded(j->pool, j->h, j->generation, receive_results, x, 4, deadline);
         while (j->applied < j->available && got < POLL_CHUNKS && now_ns(CLOCK_THREAD_CPUTIME_ID) < cpu_deadline) {
+            if (invalidate_backing(x)) { j = NULL; break; }
             location at = {.block = j->apply_block, .id = j->apply_entry};
             entry *e = &x->e[at.id];
             if (!(e->fl & FL_BUILT)) {
@@ -645,7 +674,7 @@ size_t lineidx_poll(lineidx *x)
             /* Built entries also consume this slice's traversal budget. */
             if ((j->applied & (POLL_CHUNKS - 1u)) == 0 || now_ns(CLOCK_THREAD_CPUTIME_ID) >= cpu_deadline) break;
         }
-        if ((j->applied == j->n || (j->seeking && x->async_ready && j->applied == j->available)) && job_done(j)) retire_job(x);
+        if (j && (j->applied == j->n || (j->seeking && x->async_ready && j->applied == j->available)) && job_done(j)) retire_job(x);
     }
     reap(x); return got;
 }
@@ -653,7 +682,7 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
                        size_t source_bytes, bool seeking, uint64_t target, bool foreground)
 {
     if (foreground && !pool->foreground_enabled) return -1;
-    if (!snap || snap->len != x->len || !snap->span) return -1;
+    if (!snap || snap->len != x->len || !snap->span || invalidate_backing(x)) return -1;
     lineidx_build_cancel(x); reap(x);
     if (x->retired) return -1;
     x->last_cancel_cpu_ns = 0;
@@ -677,6 +706,7 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
     }
     j->starts[j->n] = pos; j->src = *snap; j->source_bytes = source_bytes;
     j->pool = pool; j->generation = ++x->gen; j->seeking = seeking; j->target = target;
+    j->backing = x->backing;
     j->seek_pending = seeking && target == 0;
     j->apply_block = edge_block(x, x->root, false); j->apply_entry = x->b[j->apply_block].head;
     j->h = work_submit(pool, (work_job){build_fn, j, j->generation, foreground ? WORK_FOREGROUND : WORK_BULK});
@@ -705,7 +735,7 @@ int lineidx_seek_start_owned(lineidx *x, work_pool *pool, const lineidx_src *sna
 bool lineidx_seek_result(lineidx *x, lineidx_result *result)
 {
     (void)lineidx_poll(x);
-    if (!x->async_ready) return false;
+    if (invalidate_backing(x) || !x->async_ready) return false;
     if (result) *result = (lineidx_result){x->async_value, true};
     return true;
 }
@@ -754,6 +784,7 @@ int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
 }
 size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
 {
+    if (invalidate_backing(x)) return 0;
     if (!x->b[x->root].edited || cur->len != x->len) return 0;
     location at = locate(x, first_flag(x, true));
     if (x->refresh_id != at.id) {
@@ -771,6 +802,7 @@ size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
         if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
     }
     if (x->refresh_pos != end) return 0;
+    if (invalidate_backing(x)) return 0;
     set_built(x, at, (uint32_t)x->refresh_nl, x->refresh_na != 0); x->refresh_id = 0; return 1;
 }
 
@@ -780,13 +812,13 @@ static uint64_t density(const lineidx *x)
     if (x->pfx_lines) { uint64_t d = x->pfx_bytes / x->pfx_lines; return d ? d : 1; }
     return DEFAULT_BPL;
 }
-lineidx_result lineidx_line_count(lineidx *x)
+static lineidx_result line_count_impl(lineidx *x)
 {
     derive(x);
     if (x->pfx_n == x->n) return (lineidx_result){x->pfx_lines + 1u, true};
     return (lineidx_result){x->pfx_lines + 1u + (x->len - x->pfx_bytes) / density(x), false};
 }
-lineidx_result lineidx_line_to_byte(lineidx *x, const lineidx_src *cur, uint64_t line)
+static lineidx_result line_to_byte_impl(lineidx *x, const lineidx_src *cur, uint64_t line)
 {
     derive(x);
     if (!line) return (lineidx_result){0, true};
@@ -807,7 +839,7 @@ lineidx_result lineidx_line_to_byte(lineidx *x, const lineidx_src *cur, uint64_t
     }
     return (lineidx_result){anchor, false};
 }
-lineidx_result lineidx_byte_to_line(lineidx *x, const lineidx_src *cur, uint64_t off)
+static lineidx_result byte_to_line_impl(lineidx *x, const lineidx_src *cur, uint64_t off)
 {
     derive(x); if (off > x->len) off = x->len;
     location at = locate_byte(x, off);
@@ -851,7 +883,7 @@ static lineidx_result seek_known(lineidx *x, const lineidx_src *cur, location at
     }
     return (lineidx_result){x->query_last, false};
 }
-lineidx_result lineidx_seek_line(lineidx *x, const lineidx_src *cur, uint64_t line, uint64_t budget)
+static lineidx_result seek_line_impl(lineidx *x, const lineidx_src *cur, uint64_t line, uint64_t budget)
 {
     derive(x);
     if (!line) return (lineidx_result){0, true};
@@ -908,4 +940,31 @@ lineidx_result lineidx_seek_line(lineidx *x, const lineidx_src *cur, uint64_t li
     }
     if (x->pfx_n == x->n) return (lineidx_result){x->len, true};
     return (lineidx_result){x->seek_last, false};
+}
+
+/* A signal may arrive inside an indivisible source callback/scanner. Recheck
+ * after computation as well as before it; no faulted answer escapes as exact. */
+lineidx_result lineidx_line_count(lineidx *x)
+{
+    if (invalidate_backing(x)) return (lineidx_result){0, false};
+    lineidx_result result = line_count_impl(x);
+    return invalidate_backing(x) ? (lineidx_result){0, false} : result;
+}
+lineidx_result lineidx_line_to_byte(lineidx *x, const lineidx_src *cur, uint64_t line)
+{
+    if (invalidate_backing(x)) return (lineidx_result){0, false};
+    lineidx_result result = line_to_byte_impl(x, cur, line);
+    return invalidate_backing(x) ? (lineidx_result){0, false} : result;
+}
+lineidx_result lineidx_byte_to_line(lineidx *x, const lineidx_src *cur, uint64_t off)
+{
+    if (invalidate_backing(x)) return (lineidx_result){0, false};
+    lineidx_result result = byte_to_line_impl(x, cur, off);
+    return invalidate_backing(x) ? (lineidx_result){0, false} : result;
+}
+lineidx_result lineidx_seek_line(lineidx *x, const lineidx_src *cur, uint64_t line, uint64_t budget)
+{
+    if (invalidate_backing(x)) return (lineidx_result){0, false};
+    lineidx_result result = seek_line_impl(x, cur, line, budget);
+    return invalidate_backing(x) ? (lineidx_result){0, false} : result;
 }

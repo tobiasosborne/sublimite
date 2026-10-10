@@ -165,6 +165,10 @@ piece_snapshot *piece_snapshot_take(piece_tree *t);
 piece_snapshot *piece_snapshot_retain(piece_snapshot *s);
 void piece_snapshot_release(piece_snapshot *s);
 uint64_t piece_snapshot_len(const piece_snapshot *s);
+/* Borrowed external-original lifetime hooks, or NULL for a private original.
+ * Valid while the snapshot is retained; does not acquire or allocate. Lets
+ * backing owners expose generation validity without exposing snapshot layout. */
+const piece_map_hooks *piece_snapshot_mapping(const piece_snapshot *s);
 uint64_t piece_snapshot_line_count(const piece_snapshot *s);
 int piece_snapshot_read(const piece_snapshot *s, uint64_t off, uint8_t *dst, size_t len);
 uint64_t piece_snapshot_line_to_byte(const piece_snapshot *s, uint64_t line);

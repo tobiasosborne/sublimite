@@ -323,16 +323,86 @@ static void file_test_queued(file_test_context *test, int saving)
     int status = 0; CHECK(test, waitpid(pid, &status, 0) == pid);
     CHECK(test, WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
+typedef struct cancelled_open { unsigned prefix, ready; } cancelled_open;
+static void file_test_cancelled_receive(const work_msg *message, void *ctx)
+{
+    cancelled_open *seen = ctx; file_msg decoded = {0};
+    if (file_msg_decode(message, &decoded) != 0) return;
+    if (decoded.kind == FILE_MSG_PREFIX_READY) seen->prefix++;
+    if (decoded.kind == FILE_MSG_OPEN_READY) seen->ready++;
+}
+static void file_test_cancelled_open(file_test_context *test)
+{
+    const uint8_t bytes[] = "readiness\n";
+    CHECK(test, file_test_write(test->path, bytes, sizeof bytes - 1u) == 0);
+    for (unsigned phase = 0; phase < 3; phase++) {
+        work_pool workers; CHECK(test, work_pool_init(&workers, 1, 0) == 0);
+        file_job_context blocker = {0};
+        if (phase == 0) {
+            work_handle busy = work_submit(&workers, (work_job){file_test_blocker, &blocker, 0, WORK_BULK});
+            CHECK(test, busy.epoch != 0);
+            uint64_t deadline = bench_now_ns() + UINT64_C(5000000000);
+            while (!atomic_load(&blocker.started) && bench_now_ns() < deadline) file_test_pause();
+            CHECK(test, atomic_load(&blocker.started));
+        }
+        file *f = NULL; file_open_opts options = {phase == 2 ? 1 : 4096, 91};
+        CHECK(test, file_open_begin(&workers, test->path, &options, &f) == FILE_OK);
+        if (!f) { atomic_store(&blocker.release, 1); work_pool_shutdown(&workers); continue; }
+        cancelled_open seen = {0};
+        if (phase != 0) {
+            uint64_t deadline = bench_now_ns() + UINT64_C(5000000000);
+            if (phase == 2) {
+                while (!seen.prefix && bench_now_ns() < deadline) {
+                    (void)work_mailbox_drain_bounded(&workers, file_test_cancelled_receive, &seen, 1, 0);
+                    file_test_pause();
+                }
+                CHECK(test, seen.prefix == 1 && !seen.ready);
+            }
+            int busy;
+            do {
+                busy = 0;
+                for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
+                    busy |= (int)atomic_load_explicit(&workers.slots[i].busy, memory_order_acquire);
+                if (busy) file_test_pause();
+            } while (busy && bench_now_ns() < deadline);
+            CHECK(test, !busy && work_mailbox_pending(&workers));
+        }
+        for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) {
+            work_slot *slot = &workers.slots[i];
+            if (slot->job.arg == f)
+                work_cancel(&workers, (work_handle){i, atomic_load_explicit(&slot->epoch, memory_order_acquire)});
+        }
+        atomic_store(&blocker.release, 1);
+        /* Getter-only polling must not adopt physically completed output. */
+        CHECK(test, !file_open_ready(f));
+        CHECK(test, phase == 2 || !file_prefix_ready(f));
+        size_t prefix_len = 0; (void)file_prefix(f, &prefix_len);
+        (void)file_size(f); (void)file_errno(f);
+        CHECK(test, !file_open_ready(f));
+        while (work_mailbox_pending(&workers))
+            (void)work_mailbox_drain(&workers, file_test_cancelled_receive, &seen);
+        CHECK(test, !seen.ready && seen.prefix == (phase == 2 ? 1u : 0u));
+        file_close(f); work_pool_shutdown(&workers);
+    }
+    printf("file_cancelled_open: %s queued/pending-prefix/pending-map getters and filtered delivery\n",
+           test->failures ? "FAIL" : "PASS");
+}
 int main(void)
 {
     file_test_context test = {0}; strcpy(test.dir, "/tmp/edit-file-kill-XXXXXX");
     if (!mkdtemp(test.dir)) return 2;
     snprintf(test.path, sizeof test.path, "%s/target", test.dir);
     trace_init();
+    if (getenv("FILE_KILL_CANCEL_ONLY")) {
+        file_test_cancelled_open(&test);
+        CHECK(&test, unlink(test.path) == 0 && rmdir(test.dir) == 0);
+        return test.failures ? 1 : 0;
+    }
     CHECK(&test, self_check(26) == 0);
     CHECK(&test, self_check(27) == 0);
     CHECK(&test, self_check(28) == 0);
     file_test_visibility(&test);
+    file_test_cancelled_open(&test);
     file_test_allocation(&test);
     file_test_viewport(&test);
     file_test_queued(&test, 0);

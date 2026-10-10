@@ -84,7 +84,7 @@ static int dense_count(void)
     find_control control={.work=&context}; find_source source={text,sizeof text,NULL};
     find_result result;
     /* Reference the probe even before production uses popcount. */
-    meter unused={&control,0,false}; (void)find_p1r_popcount(0,&unused); probe.popcounts=0;
+    meter unused={&control,0,false,NULL}; (void)find_p1r_popcount(0,&unused); probe.popcounts=0;
     CHECK(find_p1r_literal(&source,(const uint8_t *)"a",1,&control,&result)==FIND_OK);
     CHECK(result.total==sizeof text && result.stored==FIND_MAX_OFFSETS);
     for (size_t i=0;i<result.stored;i++) CHECK(result.offsets[i]==i);

@@ -1,5 +1,6 @@
 #include "findui/private.h"
 #include "find/visit.h"
+#include "file/file.h"
 #include <string.h>
 #include <time.h>
 
@@ -11,7 +12,8 @@ static void scan_trace(const findui_slot *slot, uint32_t generation)
  * No locks, UI callbacks or UI-owned result storage are touched by the job. */
 static bool publish(work_ctx *context, const work_msg *message)
 {
-    while (!work_should_stop(context)) {
+    findui_slot *slot = context->arg;
+    while (!work_should_stop(context) && !file_snapshot_faulted(slot->snapshot)) {
         if (work_publish(context, message)) return true;
         const struct timespec delay = {0, 100000};
         (void)nanosleep(&delay, NULL);

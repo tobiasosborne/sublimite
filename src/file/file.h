@@ -87,6 +87,19 @@
 
 typedef struct file file;
 
+/* A backing token is independent of the UI file object. The snapshot lookup
+ * borrows its lifetime; acquire/release retain only the physical backing.
+ * Recovery invalidates the token before replacing bytes. Faults are sticky:
+ * derived results must check during computation and immediately before use,
+ * including results computed/adopted before the fault. Copies never fault.
+ * These functions are thread-safe and allocate nothing. */
+typedef struct file_map file_backing;
+file_backing *file_snapshot_backing(const piece_snapshot *snapshot);
+void file_backing_acquire(file_backing *backing);
+void file_backing_release(file_backing *backing);
+int file_backing_faulted(const file_backing *backing);
+int file_snapshot_faulted(const piece_snapshot *snapshot);
+
 typedef enum file_mode { FILE_MODE_COPY = 1, FILE_MODE_MMAP = 2 } file_mode;
 
 typedef enum file_eol {
@@ -168,7 +181,9 @@ typedef struct file_msg {
 /* UI-only. Decode every live pool notification. Returns 0 and fills *out for
  * public file notifications, installing state before exposing them. Internal
  * CHECK_DONE/REPLACED/SAVE_PREPARED install/continue ownership then return 1;
- * unrelated messages also return 1. Never decode retained/cancelled copies. */
+ * unrelated/stale messages also return 1. The work lease and generation are
+ * revalidated before installation, including cancellation after receipt.
+ * The file must still be alive; never decode copies retained past close. */
 int file_msg_decode(const work_msg *m, file_msg *out);
 
 /* ---- open ---- */

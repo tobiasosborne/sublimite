@@ -131,6 +131,11 @@ static void guard_handler(int sig, siginfo_t *si, void *uc)
     guard_chain(sig, si, uc);
 }
 
+int file_test_recover(const void *address)
+{
+    return guard_recover((uintptr_t)address, NULL);
+}
+
 static void guard_install(void)
 {
     struct sigaction sa;
@@ -290,6 +295,18 @@ static void map_release(void *ctx)
         free(m);
     }
 }
+
+file_backing *file_snapshot_backing(const piece_snapshot *snapshot)
+{
+    const piece_map_hooks *hooks = piece_snapshot_mapping(snapshot);
+    return hooks && hooks->acquire == map_acquire && hooks->release == map_release ? hooks->ctx : NULL;
+}
+void file_backing_acquire(file_backing *backing) { if (backing) map_acquire(backing); }
+void file_backing_release(file_backing *backing) { if (backing) map_release(backing); }
+int file_backing_faulted(const file_backing *backing)
+{ return backing && guard_faulted(backing->slot); }
+int file_snapshot_faulted(const piece_snapshot *snapshot)
+{ return file_backing_faulted(file_snapshot_backing(snapshot)); }
 
 /* Worker-owned physical transaction. UI passes it from preparation to commit
  * only after receiving SAVE_PREPARED; no descriptor operation is done by decode. */
@@ -475,6 +492,14 @@ int file_msg_decode(const work_msg *m, file_msg *out)
         m->kind != FILE_MSG_SAVE_PREPARED)
         return 1;
     memcpy(&pl, m->data, sizeof pl);
+    /* Decode can be deferred beyond ordinary delivery. Validate again at the
+     * adoption boundary: a saved message is not a perpetual lease. */
+    if (!pl.f || m->slot_ >= WORK_MAX_JOBS) return 1;
+    file *f = pl.f;
+    work_handle h = f->jobs[m->slot_];
+    if (!h.epoch || h.slot != m->slot_ || h.epoch != m->epoch_ ||
+        atomic_load_explicit(&f->pool->slots[h.slot].epoch, memory_order_acquire) != h.epoch ||
+        m->generation != f->pool->slots[h.slot].job.generation) return 1;
     out->kind = m->kind;
     out->generation = m->generation;
     out->f = pl.f;

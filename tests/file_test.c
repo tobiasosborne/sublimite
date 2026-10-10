@@ -5,6 +5,9 @@
 #include "base/base.h"
 #include "trace/trace.h"
 #include "journal/journal.h"
+#include "find/find.h"
+#include "findui/findui.h"
+#include "lineidx/lineidx.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -619,6 +622,182 @@ static file *review_map(const char *name, piece_tree **t, size_t n)
     CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.status == FILE_OK);
     *t = new_tree(); CHECK(file_attach(f, *t) == FILE_OK);
     return f;
+}
+
+typedef struct p1_source {
+    piece_snapshot *snapshot;
+    const uint8_t *address;
+    int inject, injected;
+    unsigned find_calls;
+} p1_source;
+static size_t p1_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    p1_source *s = ctx;
+    if (s->inject && !s->injected && ++s->find_calls == 2)
+        s->injected = file_test_recover(s->address);
+    piece_iter it; size_t n = 0;
+    piece_iter_begin_snapshot(&it, s->snapshot, off);
+    return piece_iter_next(&it, p, &n) ? n : 0;
+}
+static void p1_find_hook(void *ctx, uint32_t generation)
+{
+    p1_source *s = ctx; (void)generation;
+    if (s->inject && !s->injected && ++s->find_calls == 2)
+        s->injected = file_test_recover(s->address);
+}
+static void p1_find_receive(const work_msg *msg, void *ctx)
+{ (void)findui_accept(ctx, msg); }
+static void p1_discard(const work_msg *msg, void *ctx) { (void)msg; (void)ctx; }
+static void p1_wait_workers(void)
+{
+    for (unsigned retry = 0; retry < 5000; retry++) {
+        int busy = 0;
+        for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
+            busy |= (int)atomic_load_explicit(&pool.slots[i].busy, memory_order_acquire);
+        if (!busy) return;
+        sleep_ms(1);
+    }
+    CHECK(0);
+}
+/* Fault during compute, after compute before delivery, after adoption, and
+ * after the file/tree die. All injections use the real recovery service. */
+static void t_p1_fault_publication(void)
+{
+    for (unsigned phase = 0; phase < 5; phase++) {
+        piece_tree *t; file *f = review_map("p1-fault.txt", &t, 4u * LINEIDX_CHUNK);
+        piece_snapshot *snapshot = piece_snapshot_take(t); CHECK(snapshot != NULL);
+        piece_iter it; const uint8_t *address = NULL; size_t span = 0;
+        piece_iter_begin_snapshot(&it, snapshot, 0);
+        CHECK(piece_iter_next(&it, &address, &span) && span > 0);
+        p1_source source = {.snapshot = snapshot, .address = address, .inject = phase == 0};
+        lineidx_src src = {&source, piece_snapshot_len(snapshot), p1_span, NULL};
+        lineidx *index = lineidx_create(src.len); CHECK(index != NULL);
+        CHECK(lineidx_bind_snapshot(index, snapshot) == 0);
+        CHECK(lineidx_build_start(index, &pool, &src) == 0);
+        p1_wait_workers();
+        if (phase == 2 || phase == 4) {
+            for (unsigned i = 0; i < 100 && !lineidx_complete(index); i++) (void)lineidx_poll(index);
+            CHECK(lineidx_complete(index) && lineidx_line_count(index).exact);
+        }
+        if (phase >= 3) { file_close(f); f = NULL; piece_destroy(t); t = NULL; }
+        if (phase == 4) { piece_snapshot_release(snapshot); snapshot = NULL; source.snapshot = NULL; }
+        if (!source.injected) source.injected = file_test_recover(address);
+        CHECK(source.injected);
+        (void)lineidx_poll(index);
+        CHECK(!lineidx_complete(index));
+        CHECK(!lineidx_line_count(index).exact);
+        CHECK(!lineidx_byte_to_line(index, &src, src.len).exact);
+        CHECK(!lineidx_seek_line(index, &src, 1, LINEIDX_CHUNK).exact);
+        lineidx_destroy(index);
+
+        if (snapshot) {
+            find_result result = {0}; find_source fs = {.snapshot = snapshot};
+            CHECK(find_literal(&fs, (const uint8_t *)"x", 1, NULL, &result) == FIND_CANCELLED);
+            CHECK(result.total == 0 && result.stored == 0);
+            find_match match;
+            CHECK(find_literal_next(&fs, (const uint8_t *)"x", 1, 0, NULL, &match) == FIND_CANCELLED);
+            CHECK(!match.matched);
+            void *program = malloc(find_regex_bytes()), *scratch = malloc(FIND_MAX_SCRATCH_BYTES);
+            find_regex *regex = NULL;
+            CHECK(program && scratch && find_regex_compile(program, find_regex_bytes(),
+                (const uint8_t *)"x+", 2, &regex, NULL) == FIND_OK);
+            CHECK(find_regex_search(&fs, regex, scratch, FIND_MAX_SCRATCH_BYTES, NULL, &result) == FIND_CANCELLED);
+            CHECK(result.total == 0 && result.stored == 0);
+            free(program); free(scratch);
+            piece_snapshot_release(snapshot);
+        }
+        piece_destroy(t); file_close(f);
+        (void)work_mailbox_drain(&pool, p1_discard, NULL);
+    }
+    for (unsigned phase = 0; phase < 3; phase++) {
+        piece_tree *t; file *f = review_map("p1-seek.txt", &t, 4u * LINEIDX_CHUNK);
+        piece_snapshot *snapshot = piece_snapshot_take(t); CHECK(snapshot != NULL);
+        piece_iter it; const uint8_t *address = NULL; size_t span = 0;
+        piece_iter_begin_snapshot(&it, snapshot, 0); CHECK(piece_iter_next(&it, &address, &span));
+        p1_source source = {.snapshot = snapshot, .address = address, .inject = phase == 0};
+        lineidx_src src = {&source, piece_snapshot_len(snapshot), p1_span, NULL};
+        lineidx *index = lineidx_create(src.len); CHECK(index != NULL);
+        CHECK(lineidx_bind_snapshot(index, snapshot) == 0);
+        uint64_t target = src.len / 2u - 1u;
+        CHECK(lineidx_seek_start_owned(index, &pool, &src, target, 0) == 0);
+        p1_wait_workers();
+        lineidx_result result;
+        if (phase == 2) {
+            CHECK(lineidx_seek_result(index, &result));
+            CHECK(result.exact && result.value == target * 2u);
+        }
+        if (!source.injected) source.injected = file_test_recover(address);
+        CHECK(source.injected && !lineidx_seek_result(index, &result));
+        CHECK(!lineidx_line_count(index).exact);
+        lineidx_destroy(index); piece_snapshot_release(snapshot); piece_destroy(t); file_close(f);
+        (void)work_mailbox_drain(&pool, p1_discard, NULL);
+    }
+    for (unsigned phase = 0; phase < 4; phase++) {
+        piece_tree *t; file *f = review_map("p1-find.txt", &t, LINEIDX_CHUNK);
+        piece_snapshot *snapshot = piece_snapshot_take(t); CHECK(snapshot != NULL);
+        piece_iter it; const uint8_t *address = NULL; size_t span = 0;
+        piece_iter_begin_snapshot(&it, snapshot, 0); CHECK(piece_iter_next(&it, &address, &span));
+        p1_source source = {.snapshot = snapshot, .address = address, .inject = phase == 0};
+        edit_arena arena; CHECK(edit_arena_init(&arena, 4u << 20) == 0);
+        findui_panel panel = {0};
+        findui_config config = {&arena, &pool, 16, 16, p1_find_hook, &source};
+        CHECK(findui_init(&panel, &config) == FINDUI_OK);
+        CHECK(findui_set_source(&panel, snapshot, 1) == FINDUI_OK);
+        CHECK(findui_set_options(&panel, (findui_options){.match_case = true, .whole_word = phase == 0}) == FINDUI_OK);
+        CHECK(findui_set_query(&panel, (const uint8_t *)"x", 1) == FINDUI_OK);
+        CHECK(findui_show(&panel, true, false) == FINDUI_OK);
+        p1_wait_workers();
+        if (phase == 2) {
+            for (unsigned i = 0; i < 100 && !findui_get_state(&panel).complete; i++)
+                (void)work_mailbox_drain(&pool, p1_find_receive, &panel);
+            CHECK(findui_get_state(&panel).complete);
+        }
+        if (phase == 3) { file_close(f); f = NULL; piece_destroy(t); t = NULL; }
+        if (!source.injected) source.injected = file_test_recover(address);
+        CHECK(source.injected);
+        (void)work_mailbox_drain(&pool, p1_find_receive, &panel);
+        findui_state state = findui_get_state(&panel);
+        CHECK(!state.complete && !state.searching && state.match_count == 0);
+        CHECK(state.cached_matches == 0 && state.visible_matches == 0);
+        CHECK(state.search_error == FIND_CANCELLED);
+        size_t count = 1; findui_range range;
+        CHECK(findui_highlights(&panel, 0, 1, &range, 1, &count) == FINDUI_ERR_STALE && count == 0);
+        CHECK(findui_next(&panel, 1, &range) == FINDUI_ERR_STALE);
+        (void)findui_service(&panel);
+        while (findui_dispose(&panel) == FINDUI_MORE) sleep_ms(1);
+        edit_arena_free(&arena); piece_snapshot_release(snapshot); piece_destroy(t); file_close(f);
+        (void)work_mailbox_drain(&pool, p1_discard, NULL);
+    }
+}
+
+typedef struct p1_delivery { work_msg message; uint32_t kind; int received; } p1_delivery;
+static void p1_capture(const work_msg *msg, void *ctx)
+{
+    p1_delivery *delivery = ctx;
+    if (msg->kind == delivery->kind) { delivery->message = *msg; delivery->received = 1; }
+    else { file_msg decoded; (void)file_msg_decode(msg, &decoded); }
+}
+static void t_p1_cancel_readiness(void)
+{
+    for (unsigned mapped = 0; mapped < 2; mapped++) {
+        write_file("p1-cancel.txt", (const uint8_t *)"x\n", 2);
+        char path[512]; path_of(path, sizeof path, "p1-cancel.txt");
+        file_open_opts opts = {mapped ? 1 : 4096, 73}; file *f = NULL;
+        CHECK(file_open_begin(&pool, path, &opts, &f) == FILE_OK);
+        p1_delivery delivery = {.kind = FILE_MSG_OPEN_READY};
+        for (unsigned i = 0; i < 5000 && !delivery.received; i++) {
+            (void)work_mailbox_drain(&pool, p1_capture, &delivery); sleep_ms(1);
+        }
+        CHECK(delivery.received && !file_open_ready(f));
+        work_handle handle = {delivery.message.slot_, delivery.message.epoch_};
+        work_cancel(&pool, handle);
+        file_msg decoded;
+        CHECK(file_msg_decode(&delivery.message, &decoded) != 0);
+        CHECK(!file_open_ready(f));
+        piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_ERR_STATE);
+        piece_destroy(tree); file_close(f);
+        (void)work_mailbox_drain(&pool, p1_discard, NULL);
+    }
 }
 
 static void t_review_ui_publication(void)
@@ -1892,6 +2071,8 @@ int main(void)
     if (review_case) {
         if (semantic_dispatch(review_case)) {}
         else if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
+        else if (strcmp(review_case, "p1-fault") == 0) review_run("P1-1 section 2", t_p1_fault_publication);
+        else if (strcmp(review_case, "p1-cancel") == 0) review_run("P1-1 section 3", t_p1_cancel_readiness);
         else if (strcmp(review_case, "1") == 0) review_run("finding1", t_review_registry);
         else if (strcmp(review_case, "2") == 0) review_run("finding2", t_review_signal_chaining);
         else if (strcmp(review_case, "3") == 0) review_run("finding3", t_review_ui_publication);
@@ -1972,6 +2153,8 @@ int main(void)
     }
     t_sigbus();
 
+    review_run("P1-1 section 2", t_p1_fault_publication);
+    review_run("P1-1 section 3", t_p1_cancel_readiness);
     review_run("finding1", t_review_registry);
     review_run("finding2", t_review_signal_chaining);
     review_run("finding3", t_review_ui_publication);

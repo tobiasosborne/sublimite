@@ -100,6 +100,9 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
     if (ir != INDENT_OK) { rc = EDITOR_ERR_ARG; goto fail; }
     b->index = lineidx_create(piece_len(b->tree)); if (!b->index) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    rc = lineidx_bind_snapshot(b->index, snap); piece_snapshot_release(snap);
+    if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
     if (piece_len(b->tree) <= MINIMAP_SMALL_BYTES) {
         lineidx_src src = editor_source(b);
         (void)lineidx_seek_line(b->index, &src, b->lines, MINIMAP_SMALL_BYTES);

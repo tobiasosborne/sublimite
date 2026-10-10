@@ -103,6 +103,7 @@ findui_code findui_render(const findui_panel *panel, render_grid *grid, uint32_t
         }
     }
     if (render_mark_rows(grid, first_row, row_count) != RENDER_OK) return FINDUI_ERR_ARGUMENT;
+    (void)findui_get_state(panel); /* validate already adopted backing metadata */
     painter paint = {grid, style, first_row};
     for (uint32_t row = first_row; row < first_row + row_count; row++) {
         paint.row = row;

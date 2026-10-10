@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "work/work.h"
+#include "piece/piece.h"
 
 #define LINEIDX_CHUNK 65536u
 #define LINEIDX_MAX_LEN (UINT64_MAX - 1u) /* leaves room for newlines + 1 */
@@ -54,6 +55,12 @@ typedef struct lineidx_result { uint64_t value; bool exact; } lineidx_result;
  * Rejects len > LINEIDX_MAX_LEN, chunk capacity >= UINT32_MAX (private pool
  * IDs), or unrepresentable allocation sizes. */
 lineidx *lineidx_create(uint64_t len);
+/* Bind the original's file backing before any scan/build. Retains only its
+ * lifetime token, so completed metadata remains invalidatable after snapshot
+ * retirement/file close. Refuses rebinding or an already started index.
+ * A fault makes all answers inexact and cancels pending adoption; reload uses
+ * a new index. Non-file/private snapshots need no token. No allocation. */
+int lineidx_bind_snapshot(lineidx *x, const piece_snapshot *snapshot);
 /* Allocating path: reserve additional bounded chunks for later edits. The
  * ordinary create reserves 64. All foreground operations still allocate zero. */
 lineidx *lineidx_create_reserved(uint64_t len, size_t extra_chunks);

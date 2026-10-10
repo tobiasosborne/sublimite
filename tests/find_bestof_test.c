@@ -332,7 +332,7 @@ static int snapshot_traversal(test_context *t)
     memcpy(n,h,N); h[0]='c';
     snapshot=build_snapshot(h,H,cuts,sizeof cuts/sizeof cuts[0],&spans); CHECK(snapshot);
     probe=(find_bestof_probe){0}; s=(find_source){(const uint8_t *)&probe,0,snapshot};
-    meter m={NULL,0,false}; find_lit plan; uint64_t at=FIND_UNSET;
+    meter m={NULL,0,false,NULL}; find_lit plan; uint64_t at=FIND_UNSET;
     CHECK(find_bestof_lit_init(&plan,n,N,&m,true));
     CHECK(find_bestof_lit_seek(&plan,&s,H,0,&at)==1 && at==N/2);
     CHECK(plan.periodic && plan.ell>2000 && plan.ell<plan.per);
@@ -395,7 +395,7 @@ static int poll_boundaries(test_context *t)
     piece_snapshot *snapshot=build_snapshot(h,H,NULL,0,NULL); CHECK(snapshot);
     uint8_t dst[WINMAX]; memset(dst,0x55,sizeof dst);
     find_bestof_probe probe={0}; probe.cancel_at=2;
-    work_ctx ctx={0}; ctx.arg=&probe; find_control c={0}; c.work=&ctx; meter m={&c,0,false};
+    work_ctx ctx={0}; ctx.arg=&probe; find_control c={0}; c.work=&ctx; meter m={&c,0,false,NULL};
     CHECK(gather(snapshot,dst,0,sizeof dst,&m)==0 && m.stopped && probe.polls==2);
     for (size_t i=0;i<sizeof dst;i++) CHECK(dst[i]==(i<FIND_POLL_UNITS?'a':0x55));
     piece_snapshot_release(snapshot); return 0;

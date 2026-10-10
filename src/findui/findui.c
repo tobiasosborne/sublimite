@@ -1,4 +1,5 @@
 #include "findui/private.h"
+#include "file/file.h"
 #include <string.h>
 #include <time.h>
 
@@ -52,6 +53,14 @@ static void clear_results(findui_impl *impl)
     impl->state.cache_overflow = false; impl->state.visible_overflow = false;
     impl->state.complete = false; impl->state.searching = false;
     impl->state.search_error = FIND_OK; impl->state.error_offset = 0;
+}
+static bool invalidate_source(findui_impl *impl)
+{
+    if (!file_snapshot_faulted(impl->source)) return false;
+    cancel_jobs(impl);
+    clear_results(impl);
+    impl->state.search_error = FIND_CANCELLED;
+    return true;
 }
 static findui_code editable(const findui_impl *impl)
 {
@@ -108,6 +117,7 @@ findui_code findui_service(findui_panel *panel)
 {
     findui_impl *impl = implementation(panel);
     if (!impl) return FINDUI_ERR_ARGUMENT;
+    (void)invalidate_source(impl);
     reap(impl);
     if (!impl->pending_submit) return FINDUI_OK;
     if (work_pool_eventfd(impl->config.workers) < 0) return FINDUI_ERR_BUSY;
@@ -147,7 +157,8 @@ findui_code findui_dispose(findui_panel *panel)
 }
 findui_state findui_get_state(const findui_panel *panel)
 {
-    const findui_impl *impl = implementation(panel);
+    findui_impl *impl = implementation(panel);
+    if (impl) (void)invalidate_source(impl);
     if (impl) return impl->state;
     return (findui_state){.match_index = FINDUI_NO_INDEX, .selected = {FIND_UNSET, FIND_UNSET}};
 }
@@ -159,6 +170,7 @@ bool findui_accept(findui_panel *panel, const work_msg *message)
     uint64_t owner;
     memcpy(&owner, message->data, sizeof owner);
     if (owner != (uint64_t)(uintptr_t)impl) return false;
+    if (invalidate_source(impl)) return true;
     if (impl->disposing || impl->state.replacing || message->generation != impl->state.generation ||
         !impl->state.searching) return true;
     if (message->kind == FINDUI_MSG_DONE) {
@@ -290,6 +302,7 @@ findui_code findui_focus_replacement(findui_panel *panel, bool focus)
 findui_code findui_next(findui_panel *panel, int direction, findui_range *selected)
 {
     findui_impl *impl = implementation(panel); findui_code code = editable(impl);
+    if (impl && invalidate_source(impl)) return FINDUI_ERR_STALE;
     if (code != FINDUI_OK) return code;
     if (!selected || (direction != -1 && direction != 1)) return FINDUI_ERR_ARGUMENT;
     if (!impl->state.complete) return impl->state.searching ? FINDUI_ERR_BUSY : FINDUI_ERR_FIND;
@@ -308,8 +321,9 @@ findui_code findui_next(findui_panel *panel, int direction, findui_range *select
 findui_code findui_highlights(const findui_panel *panel, uint64_t start, uint64_t end,
                              findui_range *ranges, size_t capacity, size_t *count)
 {
-    const findui_impl *impl = implementation(panel);
+    findui_impl *impl = implementation(panel);
     if (!impl || !count || start > end || (capacity && !ranges)) return FINDUI_ERR_ARGUMENT;
+    if (invalidate_source(impl)) { *count = 0; return FINDUI_ERR_STALE; }
     if (impl->state.replacing) return FINDUI_ERR_BUSY;
     if (start < impl->window_start || end > impl->window_end) return FINDUI_ERR_STALE;
     if (impl->state.visible_overflow) { *count = impl->state.visible_matches; return FINDUI_ERR_LIMIT; }
@@ -333,6 +347,7 @@ static findui_code replace_begin(findui_panel *panel, undo_log *undo, uint64_t r
 {
     findui_impl *impl = implementation(panel); findui_code code = editable(impl);
     if (code != FINDUI_OK) return code;
+    if (invalidate_source(impl)) return FINDUI_ERR_STALE;
     if (!undo || !before || !after) return FINDUI_ERR_ARGUMENT;
     if (!impl->source || revision != impl->state.revision) return FINDUI_ERR_STALE;
     if (!impl->state.complete) return impl->state.searching ? FINDUI_ERR_BUSY : FINDUI_ERR_FIND;
@@ -377,6 +392,10 @@ findui_code findui_replace_step(findui_panel *panel, size_t match_budget, uint64
     if (!impl || !replaced) return FINDUI_ERR_ARGUMENT;
     *replaced = 0;
     if (!impl->state.replacing) return FINDUI_OK;
+    if (invalidate_source(impl)) {
+        (void)replace_end(impl); impl->state.search_error = FIND_CANCELLED;
+        return FINDUI_ERR_STALE;
+    }
     while (impl->replace_remaining && *replaced < match_budget) {
         if (deadline_ns && now_ns() >= deadline_ns) return FINDUI_MORE;
         findui_range range = impl->replace_single ? impl->replace_selected : impl->cache[impl->replace_remaining - 1];

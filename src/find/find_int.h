@@ -2,16 +2,19 @@
 #ifndef EDIT_FIND_INT_H
 #define EDIT_FIND_INT_H
 #include "find.h"
+#include "file/file.h"
 #include <string.h>
 
 typedef struct meter {
     const find_control *control;
     unsigned units;
     bool stopped;
+    const piece_snapshot *snapshot;
 } meter;
 static inline bool poll_stop(meter *m)
 {
     const find_control *c=m->control;
+    if (file_snapshot_faulted(m->snapshot)) m->stopped=true;
     if (c && ((c->work && work_should_stop(c->work)) ||
         (c->cancel && atomic_load_explicit(c->cancel,memory_order_acquire)) ||
         (c->generation && atomic_load_explicit(c->generation,memory_order_acquire)!=c->expected_generation)))

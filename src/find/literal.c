@@ -389,7 +389,7 @@ static find_code literal_run(const find_source *source,const uint8_t *needle,siz
     if (!result) return FIND_ERR_ARGUMENT;
     result->total=0; result->stored=0;
     if (!source_valid(source) || (!needle && n)) return FIND_ERR_ARGUMENT;
-    meter m={control,0,false}; find_code code=FIND_OK;
+    meter m={control,0,false,source->snapshot}; find_code code=FIND_OK;
     if (!poll_stop(&m) && n>0) {
         find_lit l; uint64_t len=source_len(source);
         if (find_lit_init(&l,needle,n,&m,mode==1)) {
@@ -443,7 +443,7 @@ find_code find_literal_next(const find_source *source,const uint8_t *needle,size
     if (!match) return FIND_ERR_ARGUMENT;
     clear_match(match);
     if (!source_valid(source) || (!needle && n) || off>source_len(source)) return FIND_ERR_ARGUMENT;
-    meter m={control,0,false};
+    meter m={control,0,false,source->snapshot};
     if (!poll_stop(&m) && n>0) {
         find_lit l; uint64_t at=0;
         if (find_lit_init(&l,needle,n,&m,false) && find_lit_seek(&l,source,source_len(source),off,&at)>0) {
