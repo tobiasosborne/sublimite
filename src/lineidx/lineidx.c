@@ -38,6 +38,10 @@ typedef struct block {
 
 typedef struct lineidx_job {
     struct lineidx_job *next;
+    struct lineidx *owner; /* non-NULL for prepaid storage */
+    bool preparing;
+    size_t prepared;
+    uint32_t prepare_block, prepare_entry;
     lineidx_src src;
     file_backing *backing; /* borrowed from the index until physical completion */
     size_t source_bytes;
@@ -67,7 +71,7 @@ struct lineidx {
     bool dirty;
     size_t pfx_n;
     uint64_t pfx_lines, pfx_bytes;
-    lineidx_job *job, *retired;
+    lineidx_job *job, *retired, *reserved;
     uint32_t gen;
     uint64_t seek_pos, seek_nl, seek_na, seek_last, seek_line, seek_value;
     bool seek_cached, async_ready;
@@ -398,12 +402,16 @@ static location locate_line(lineidx *x, uint64_t line)
 }
 
 /* ---- sealed worker ranges; UI callbacks only stage availability ---- */
-static bool job_done(const lineidx_job *j) { return work_handle_finished(j->pool, j->h); }
+static bool job_done(const lineidx_job *j)
+{ return !j->preparing && (!j->h.epoch || work_handle_finished(j->pool, j->h)); }
 static void job_free(lineidx_job *j)
 {
-    (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
+    if (j->h.epoch) (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     if (j->src.release) j->src.release(j->src.ctx);
-    free(j->lengths); free(j->res); free(j);
+    if (j->owner) {
+        uint16_t *lengths = j->lengths; uint32_t *res = j->res; lineidx *owner = j->owner;
+        memset(j, 0, sizeof *j); j->lengths = lengths; j->res = res; j->owner = owner;
+    } else { free(j->lengths); free(j->res); free(j); }
 }
 static void reap(lineidx *x)
 {
@@ -417,7 +425,7 @@ static void retire_job(lineidx *x)
 {
     lineidx_job *j = x->job;
     if (!j) return;
-    (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
+    if (j->h.epoch) (void)work_mailbox_bind(j->pool, j->h, j->generation, NULL, NULL);
     x->job = NULL; j->next = x->retired; x->retired = j;
 }
 typedef struct result_range { uint64_t first, end; } result_range;
@@ -575,7 +583,8 @@ void lineidx_build_cancel(lineidx *x)
     if (!x) return;
     if (x->job) {
         lineidx_job *j = x->job;
-        work_cancel(j->pool, j->h); x->gen++; retire_job(x);
+        if (j->h.epoch) work_cancel(j->pool, j->h);
+        j->preparing = false; x->gen++; retire_job(x);
     }
     x->async_ready = false;
 }
@@ -607,6 +616,7 @@ void lineidx_destroy(lineidx *x)
         if (x->retired) nanosleep(&(struct timespec){0, 100000}, NULL);
     }
     file_backing_release(x->backing);
+    if (x->reserved) { free(x->reserved->lengths); free(x->reserved->res); free(x->reserved); }
     free(x->e); free(x->b); free(x);
 }
 uint64_t lineidx_len(const lineidx *x) { return x->len; }
@@ -639,9 +649,10 @@ bool lineidx_chunk_nonascii(const lineidx *x, size_t ordinal)
 size_t lineidx_mem_bytes(const lineidx *x)
 {
     size_t bytes = sizeof *x + (x->cap + 1u) * sizeof *x->e + (x->block_cap + 1u) * sizeof *x->b;
+    if (x->reserved) bytes += sizeof *x->reserved + x->cap * (sizeof *x->reserved->lengths + sizeof *x->reserved->res);
     const lineidx_job *j = x->job ? x->job : x->retired;
     while (j) {
-        size_t scratch = sizeof *j + j->n * (sizeof *j->lengths + sizeof *j->res);
+        size_t scratch = j->owner ? 0 : sizeof *j + j->n * (sizeof *j->lengths + sizeof *j->res);
         if (scratch > SIZE_MAX - bytes) return SIZE_MAX;
         bytes += scratch;
         if (j->source_bytes > SIZE_MAX - bytes) return SIZE_MAX;
@@ -656,6 +667,64 @@ bool lineidx_building(lineidx *x)
     if (x->retired) return true;
     return x->job && (!job_done(x->job) || x->job->applied < x->job->available);
 }
+static void prepare_job(lineidx *x)
+{
+    lineidx_job *j = x->job;
+    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    size_t limit = j->prepared + POLL_CHUNKS;
+    while (j->prepared < j->n && j->prepared < limit) {
+        const entry *e = &x->e[j->prepare_entry];
+        j->lengths[j->prepared] = (uint16_t)(e->len ? e->len - 1u : 0);
+        j->res[j->prepared++] = (e->fl & FL_BUILT) ? RES_DONE | ((e->fl & FL_NONASCII) ? RES_NA : 0) | e->nl : 0;
+        x->foreground_work++;
+        j->prepare_entry = e->next;
+        if (!j->prepare_entry && j->prepared < j->n) {
+            j->prepare_block = successor(x, j->prepare_block);
+            j->prepare_entry = x->b[j->prepare_block].head;
+        }
+        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+    }
+    if (j->prepared != j->n) return;
+    j->preparing = false;
+    j->h = work_submit(j->pool, (work_job){build_fn, j, j->generation, WORK_BULK});
+    if (!j->h.epoch || work_mailbox_bind(j->pool, j->h, j->generation, receive_results, x)) {
+        if (j->h.epoch) work_cancel(j->pool, j->h);
+        retire_job(x);
+    }
+}
+bool lineidx_build_preparing(const lineidx *x)
+{ return x && x->job && x->job->preparing; }
+bool lineidx_build_needs_poll(const lineidx *x)
+{
+    if (!x) return false;
+    const lineidx_job *j = x->job;
+    return (j && (j->preparing || j->applied < j->available || job_done(j))) ||
+           (x->retired && job_done(x->retired));
+}
+int lineidx_build_reserve(lineidx *x)
+{
+    if (x->reserved) return 0;
+    lineidx_job *j = calloc(1, sizeof *j);
+    if (!j) return -1;
+    j->lengths = malloc(x->cap * sizeof *j->lengths);
+    j->res = malloc(x->cap * sizeof *j->res);
+    if (!j->lengths || !j->res) { free(j->lengths); free(j->res); free(j); return -1; }
+    j->owner = x; x->reserved = j; return 0;
+}
+int lineidx_build_start_prepaid(lineidx *x, work_pool *pool, const lineidx_src *snap)
+{
+    if (!x->reserved || !snap || snap->len != x->len || !snap->span || invalidate_backing(x)) return -1;
+    /* Refuse without cancelling a live lease. Maintenance retries after poll
+     * has adopted or physically retired it. */
+    if (x->job || x->retired) return -1;
+    if (lineidx_complete(x)) { if (snap->release) snap->release(snap->ctx); return 0; }
+    lineidx_job *j = x->reserved;
+    j->n = x->n; j->src = *snap; j->source_bytes = snap->release ? SIZE_MAX : 0;
+    j->pool = pool; j->generation = ++x->gen; j->backing = x->backing;
+    j->prepare_block = j->apply_block = edge_block(x, x->root, false);
+    j->prepare_entry = j->apply_entry = x->b[j->apply_block].head;
+    j->preparing = true; x->job = j; return 0;
+}
 size_t lineidx_poll(lineidx *x)
 {
     (void)invalidate_backing(x);
@@ -663,6 +732,7 @@ size_t lineidx_poll(lineidx *x)
     size_t got = 0;
     uint64_t deadline = now_ns(CLOCK_MONOTONIC) + UI_CPU_NS;
     uint64_t cpu_deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    if (j && j->preparing) { prepare_job(x); reap(x); return 0; }
     if (j) {
         (void)work_mailbox_receive_bounded(j->pool, j->h, j->generation, receive_results, x, 4, deadline);
         while (j->applied < j->available && got < POLL_CHUNKS && now_ns(CLOCK_THREAD_CPUTIME_ID) < cpu_deadline) {
@@ -698,10 +768,14 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
         if (snap->release) snap->release(snap->ctx);
         return 0;
     }
-    lineidx_job *j = calloc(1, sizeof *j);
-    if (!j) return -1;
-    j->n = x->n; j->lengths = malloc(j->n * sizeof *j->lengths); j->res = malloc(j->n * sizeof *j->res);
-    if (!j->lengths || !j->res) { free(j->lengths); free(j->res); free(j); return -1; }
+    lineidx_job *j = x->reserved;
+    if (!j) {
+        j = calloc(1, sizeof *j);
+        if (!j) return -1;
+        j->lengths = malloc(x->n * sizeof *j->lengths); j->res = malloc(x->n * sizeof *j->res);
+        if (!j->lengths || !j->res) { free(j->lengths); free(j->res); free(j); return -1; }
+    }
+    j->n = x->n;
     uint32_t leaf = edge_block(x, x->root, false); size_t i = 0;
     while (leaf) {
         for (uint32_t id = x->b[leaf].head; id; id = x->e[id].next) {
@@ -748,20 +822,51 @@ bool lineidx_seek_result(lineidx *x, lineidx_result *result)
 }
 
 /* ---- bounded foreground edits and edited-range lookup ---- */
-int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
+typedef struct edit_plan {
+    location first, last;
+    uint64_t newlen, pieces;
+    uint32_t removed;
+    size_t kept;
+} edit_plan;
+static int plan_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len, edit_plan *p)
 {
     if (off > x->len || del > x->len - off || ins_len > LINEIDX_MAX_LEN - (x->len - del)) return -1;
-    location first = locate_byte(x, off), last = del ? locate_byte(x, off + del - 1u) : first;
-    uint64_t end = last.byte + x->e[last.id].len;
-    uint64_t newlen = end - first.byte - del + ins_len;
-    uint64_t pieces = newlen / LINEIDX_CHUNK + (newlen % LINEIDX_CHUNK != 0);
-    uint32_t removed = last.ordinal - first.ordinal + 1u;
-    size_t kept = x->n - removed;
-    /* Admission is bounded too: a large replacement needs a rebuilt index on
-     * the allocating path. Refusal precedes cancellation or model mutation. */
-    if (pieces > x->cap - kept || pieces > LINEIDX_EDIT_MAX_CHUNKS) return -1;
+    p->first = locate_byte(x, off);
+    p->last = del ? locate_byte(x, off + del - 1u) : p->first;
+    /* Repack adjacent short chunks with the touched range. A full chunk plus
+     * its growing typing tail stays two chunks instead of one tail per key. */
+    if (ins_len || del) {
+        if (p->first.ordinal) {
+            location prev = locate(x, p->first.ordinal - 1u);
+            if (x->e[prev.id].len < LINEIDX_CHUNK) p->first = prev;
+        }
+        if ((size_t)p->last.ordinal + 1u < x->n) {
+            location next = locate(x, p->last.ordinal + 1u);
+            if (x->e[next.id].len < LINEIDX_CHUNK) p->last = next;
+        }
+    }
+    uint64_t end = p->last.byte + x->e[p->last.id].len;
+    p->newlen = end - p->first.byte - del + ins_len;
+    p->pieces = p->newlen / LINEIDX_CHUNK + (p->newlen % LINEIDX_CHUNK != 0);
+    p->removed = p->last.ordinal - p->first.ordinal + 1u;
+    p->kept = x->n - p->removed;
+    if (p->pieces > x->cap - p->kept || p->pieces > LINEIDX_EDIT_MAX_CHUNKS) return -1;
     while (x->free_blocks < 3 && reclaim_one(x)) { }
-    if (x->free_blocks < 3) return -1;
+    return x->free_blocks < 3 ? -1 : 0;
+}
+int lineidx_edit_check(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
+{
+    edit_plan p;
+    return plan_edit(x, off, del, ins_len, &p);
+}
+int lineidx_edit(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len)
+{
+    edit_plan p;
+    if (plan_edit(x, off, del, ins_len, &p)) return -1;
+    location first = p.first;
+    uint64_t newlen = p.newlen, pieces = p.pieces;
+    uint32_t removed = p.removed;
+    size_t kept = p.kept;
     lineidx_build_cancel(x);
     uint32_t a, b, removed_tree, c;
     split(x, x->root, first.ordinal, &a, &b);

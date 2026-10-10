@@ -210,10 +210,18 @@ static int reject_text(editor *e, const undo_state *before)
     int rc = end_edit_group(e, before);
     return rc ? rc : editor_refresh_cursor(e, e->old_cursor);
 }
+static int check_index_edit(editor *e, uint64_t off, uint64_t old, uint64_t add)
+{
+    if (e->buffer->index && lineidx_edit_check(e->buffer->index, off, old, add)) {
+        e->stats.rejected_commands++; return EDITOR_ERR_CAPACITY;
+    }
+    return 0;
+}
 static int delete_part(editor *e, uint64_t lo, uint64_t old, undo_kind kind,
                        const undo_state *before)
 {
     if (!old) return 0;
+    int check = check_index_edit(e, lo, old, 0); if (check) return check;
     uint64_t nl = newlines(e, lo, old);
     undo_state after = *before; memcpy(after.bytes, &lo, 8); memcpy(after.bytes + 8, &lo, 8);
     int rc = undo_delete(e->undo, lo, old, kind, e->edit_time_ns, before, &after); if (rc) return rc;
@@ -227,6 +235,9 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
     if (!old && !n && tk == TEXT_BYTES) { e->v.state.selection = e->old_selection; e->action = EDITOR_ACTION_NONE; return editor_refresh_cursor(e, e->old_cursor); }
     if (e->journal && (e->op_count + 3 > EDITOR_STAGE_OPS || n > EDITOR_STAGE_BYTES - e->stage_used)) {
         e->stats.rejected_commands++; return editor_refresh_cursor(e, e->old_cursor);
+    }
+    if (tk == TEXT_BYTES) {
+        int check = check_index_edit(e, lo, old, n); if (check) return check;
     }
     e->v.state.selection = e->old_selection;
     undo_state before = save_selection(&e->v), after = before;
@@ -248,6 +259,7 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
         lo = edit.lo; e->indent_bytes[0] = edit.bytes[0]; text = e->indent_bytes; n = edit.length;
     }
     if (n) {
+        rc = check_index_edit(e, lo, 0, n); if (rc) return prefix_error(e, rc);
         uint64_t target = lo + n, nl = 0;
         for (size_t i = 0; i < n; i++) nl += text[i] == '\n' ? 1u : 0u;
         memcpy(after.bytes, &target, 8); memcpy(after.bytes + 8, &target, 8);
@@ -288,6 +300,8 @@ static int replay_history(editor *e, bool redo)
     if ((!redo && !e->buffer->history_cursor) || (redo && e->buffer->history_cursor == e->buffer->history_count)) return editor_refresh_cursor(e, e->old_cursor);
     editor_delta d = *delta_at(e, redo ? e->buffer->history_cursor : e->buffer->history_cursor - 1);
     if (e->journal && e->op_count + 2 > EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
+    int check = check_index_edit(e, d.off, redo ? d.old : d.add, redo ? d.add : d.old);
+    if (check) return check;
     e->replay_delta = d; e->replay_redo = redo;
     e->replay_old_nl = newlines(e, d.off, redo ? d.old : d.add);
     e->replay_before_len = piece_len(e->tree);

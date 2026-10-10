@@ -157,6 +157,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
     if (ir != INDENT_OK) { rc = EDITOR_ERR_ARG; goto fail; }
     b->index = lineidx_create(b->pending_open ? file_size(b->file) : piece_len(b->tree)); if (!b->index) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    if (lineidx_build_reserve(b->index)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     if (!b->pending_open) {
         snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
         rc = lineidx_bind_snapshot(b->index, snap); piece_snapshot_release(snap);
@@ -419,21 +420,41 @@ int editor_poll_sources(editor *e)
         ipc_result rc = ipc_server_drain(e->cfg.server, open_request, e);
         if (rc != IPC_OK) return EDITOR_ERR_IO;
     }
-    /* Index refresh is one existing bounded chunk query per UI turn, outside
-     * minimap_fill. Pending revisions paint the module's stale tint. */
-    if (e->buffer && e->buffer->index && !e->buffer->pending_open && !e->buffer->source_stale) {
-        editor_buffer *b = e->buffer; lineidx_src src = editor_source(b);
+    /* One eligible index per turn, including inactive tabs. Replay's checkpoint
+     * exposes provisional tree bytes, so leave its index alone until commit. */
+    for (size_t checked = 0; checked < e->buffer_capacity; checked++) {
+        size_t at = e->index_cursor;
+        e->index_cursor = (at + 1u) % e->buffer_capacity;
+        editor_buffer *b = e->buffers[at];
+        if (!b || !b->index || (!b->index_dirty && !lineidx_building(b->index)) || b->retired || b->pending_open || b->source_stale ||
+            (b == e->buffer && e->action == EDITOR_ACTION_REPLAY_WORK)) continue;
+        lineidx_src src = editor_source(b);
         (void)lineidx_poll(b->index);
         bool before = lineidx_complete(b->index) && !lineidx_building(b->index);
         if (b->index_dirty && !lineidx_building(b->index)) {
-            if (!lineidx_refresh(b->index, &src) && !lineidx_complete(b->index))
-                (void)lineidx_seek_line(b->index, &src, b->lines - 1, LINEIDX_CHUNK);
-            b->index_dirty = !lineidx_complete(b->index);
+            (void)lineidx_refresh(b->index, &src);
+            if (!lineidx_complete(b->index)) {
+                piece_snapshot *snap = piece_snapshot_take(b->tree);
+                if (snap) {
+                    lineidx_src immutable = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
+                    if (lineidx_build_start_prepaid(b->index, &e->pool, &immutable)) {
+                        piece_snapshot_release(snap);
+                        /* Unreserved legacy/injected indexes still make bounded
+                         * progress, independent of estimated line counts. */
+                        (void)lineidx_seek_line(b->index, &src, UINT64_MAX, LINEIDX_CHUNK);
+                    }
+                } else (void)lineidx_seek_line(b->index, &src, UINT64_MAX, LINEIDX_CHUNK);
+            }
         }
         bool ready = lineidx_complete(b->index) && !lineidx_building(b->index);
-        if (b->map.stale && ready && (!before || b->map.revision != b->revision || !e->dirty)) {
+        if (ready) {
+            lineidx_result total = lineidx_line_count(b->index);
+            b->lines = total.value; b->index_dirty = false;
+        }
+        if (b == e->buffer && b->map.stale && ready && (!before || b->map.revision != b->revision || !e->dirty)) {
             int rc = editor_begin_frame(e); if (rc) return rc;
         }
+        break;
     }
     return e->error;
 }

@@ -462,3 +462,27 @@ restart/repair and metadata maintenance belong to their separate beads.
 Full red/green, exact trace attribution, final build/row verification, and
 limitations: ../../docs/worker-reports/edit-czn-s9.md. Design:
 ../../docs/decisions/edit-czn.md.
+
+## edit-zzj.16 session 9 — capacity and index repair
+
+P1-1 sections 1 and 6 now have focused red/green editor regressions. Capacity
+admission precedes ordinary replacement, insertion/deletion and undo/redo tree
+mutation; adjacent short index chunks are repacked instead of retaining one
+per-character tail. Refusal preserves the existing negative-error loop policy.
+Dirty indexes use prepaid snapshot restart and bounded preparation/refresh,
+including inactive buffers, staged initial results and retirement/admission
+retry. Unreserved indexes retain bounded seek to the full content rather than
+an estimated line target. Active replay's provisional tree is excluded.
+large.c retains estimated viewport numbering and its exact publication policy.
+No new globals, indentation algorithm or IPC-drain changes.
+
+Design: ../../docs/decisions/edit-zzj.16.md. Complete red/green, final verification,
+benchmark limitations and coordinator leak-on requirement:
+../../docs/worker-reports/edit-zzj.16-s9.md.
+
+Final verification (M)[AC]: gcc 13 strict make all exits zero; clang 18
+ASan/UBSan make check passes 60 test binaries and replay CLI with leaks disabled.
+Editor and lineidx fuzz each complete 61 seconds clean against 60 seconds (G).
+The release editor suite and focused prepaid repair guard record zero allocations.
+Paired TRACK benchmark timing/structural limits and the coordinator leak-on rerun
+are fully recorded in docs/worker-reports/edit-zzj.16-s9.md.

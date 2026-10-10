@@ -21,8 +21,9 @@
  * physical completion. Logical cancellation never invokes it.
  *
  * ALLOCATION: lineidx_create / lineidx_build_start allocate (open path, not
- * typing path). lineidx_edit, lineidx_refresh, lineidx_poll and every query
- * never allocate (the table has fixed capacity). */
+ * typing path). lineidx_edit/check, lineidx_refresh, lineidx_poll, prepaid
+ * restart and every query never allocate (the table has fixed capacity).
+ * Reserve prepaid build storage on the open path with lineidx_build_reserve. */
 #ifndef LINEIDX_H
 #define LINEIDX_H
 #include <stddef.h>
@@ -77,6 +78,17 @@ void lineidx_destroy(lineidx *x);
  * allocation failure) the caller keeps ownership. With no retiring lease,
  * if nothing is unbuilt it releases at once and returns 0. */
 int  lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap);
+/* Open-path reservation for allocation-free post-edit restarts. Storage is one
+ * job and six bytes per capacity entry, retained until destroy. */
+int lineidx_build_reserve(lineidx *x);
+/* Uses the reservation and an immutable source (same ownership/refusal rules).
+ * Poll copies at most 64 geometry entries per turn before submitting bulk work.
+ * Retirement or exhausted worker slots retain dirty state for caller retry. */
+int lineidx_build_start_prepaid(lineidx *x, work_pool *pool, const lineidx_src *snap);
+/* True while poll needs UI turns to prepare a prepaid job (no mailbox yet). */
+bool lineidx_build_preparing(const lineidx *x);
+/* UI work is staged or preparation/physical retirement can advance now. */
+bool lineidx_build_needs_poll(const lineidx *x);
 /* Interactive build for an unindexed jump. Requires a foreground-enabled
  * pool and a resident/nonblocking source. Same ownership as build_start;
  * yields between bounded batches and on mailbox backpressure. Ordinary
@@ -104,6 +116,11 @@ size_t lineidx_poll(lineidx *x);
 /* True while queued/running, retiring, or with staged results awaiting adoption.
  * Does not pump mailboxes; call poll when awaiting index completion. */
 bool lineidx_building(lineidx *x);
+
+/* Same admission as edit, without cancelling work or changing live geometry.
+ * May reclaim detached metadata. With no intervening edit, a successful check
+ * guarantees edit admission. No allocation or content reads. */
+int  lineidx_edit_check(lineidx *x, uint64_t off, uint64_t del, uint64_t ins_len);
 
 /* Edit the modelled content: [off, off+del) replaced by ins_len bytes.
  * Cancels a running build first, keeps adopted counts, and replaces touched

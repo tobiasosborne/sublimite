@@ -81,3 +81,26 @@ rows establish no latency verdict on the loaded box.
 Complete red/green evidence, decisions and validation limitations:
 `docs/worker-reports/edit-4w1.57-s9.md` and
 `docs/decisions/edit-4w1.57.md`. Other P1-1 findings remain outside this bead.
+
+## edit-zzj.16 session 9 — editor admission and prepaid restart
+
+lineidx_edit_check shares edit's geometry/capacity planner without cancellation
+or live-model mutation; edits repack adjacent short chunks. Optional open-path
+build reservation retains one compact job/scratch slot, reused by ordinary
+initial builds and post-edit restarts. Prepaid restarts copy at most 64 entries
+per poll with the existing 0.5 ms CPU bound (G), then submit through work.
+Cancellation defers source release and slot reuse until physical retirement;
+UI readiness covers preparation, staged adoption and completed retirement.
+Memory accounting counts reserved storage once. No new globals.
+
+Supplemental lineidx_test covers bounded preparation, cancellation, retirement
+ownership/refusal, repeated reuse, exact counts and the active release allocation
+guard. Evidence and limits: ../../docs/worker-reports/edit-zzj.16-s9.md.
+Design: ../../docs/decisions/edit-zzj.16.md.
+
+Final verification (M)[AC]: gcc 13 strict make all exits zero; clang 18
+ASan/UBSan make check passes 60 test binaries and replay CLI with leaks disabled.
+Editor and lineidx fuzz each complete 61 seconds clean against 60 seconds (G).
+The release editor suite and focused prepaid repair guard record zero allocations.
+Paired TRACK benchmark timing/structural limits and the coordinator leak-on rerun
+are fully recorded in docs/worker-reports/edit-zzj.16-s9.md.

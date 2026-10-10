@@ -85,6 +85,7 @@ struct editor {
     uint32_t max_cols, max_rows;
     plat_event queue[EDITOR_INPUT_CAP];
     size_t queue_head, queue_count;
+    size_t index_cursor; /* round-robin dirty-buffer maintenance */
     editor_delta edit_delta, replay_delta;
     uint64_t replay_old_nl, replay_before_len;
     bool replay_redo;

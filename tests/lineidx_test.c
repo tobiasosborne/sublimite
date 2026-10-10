@@ -1225,12 +1225,84 @@ static void test_review_queued_destroy(void)
     work_pool_shutdown(&wp);
     fprintf(stderr, "review 11: queued destroy returns before unrelated bulk job\n");
 }
+/* Supplemental lifecycle coverage for the repair API used by the editor. */
+static void test_prepaid_restart(void)
+{
+    const size_t n = 129u * LINEIDX_CHUNK;
+    uint8_t *bytes = malloc(n + 1u); REQUIRE(bytes);
+    memset(bytes, 'a', n + 1u); bytes[LINEIDX_CHUNK] = '\n'; bytes[n - 1u] = '\n';
+    flat f = {bytes, n, 0, 0}; lineidx_src src = mk(&f);
+    lineidx *x = lineidx_create(n); REQUIRE(x);
+    REQUIRE(lineidx_build_reserve(x) == 0);
+    size_t memory = lineidx_mem_bytes(x);
+    edit_malloc_guard_begin();
+    CHECK(lineidx_build_start_prepaid(x, &pool, &src) == 0);
+    CHECK(lineidx_build_preparing(x));
+    uint64_t visits = lineidx_foreground_work(x);
+    CHECK(lineidx_poll(x) == 0);
+    CHECK(lineidx_foreground_work(x) - visits <= 64u);
+    CHECK(lineidx_build_preparing(x));
+    CHECK(lineidx_edit_check(x, 0, 0, 1) == 0);
+    CHECK(lineidx_edit(x, 0, 0, 1) == 0); /* cancel preparation, no live worker */
+    CHECK(lineidx_build_start_prepaid(x, &pool, &src) == -1); /* retiring ownership */
+    (void)lineidx_poll(x);
+    memmove(bytes + 1u, bytes, n); bytes[0] = 'x'; f.n++; src = mk(&f);
+    CHECK(lineidx_build_start_prepaid(x, &pool, &src) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!lineidx_complete(x) || lineidx_building(x)) {
+        (void)lineidx_poll(x);
+        if (trace_now_ns() >= deadline) { CHECK(false); break; }
+        sched_yield();
+    }
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) CHECK(allocations == 0);
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == 3u);
+    CHECK(lineidx_mem_bytes(x) == memory);
+    /* Reuse the same prepaid slot after a completed job. */
+    CHECK(lineidx_edit(x, 0, 1, 0) == 0); memmove(bytes, bytes + 1u, n); f.n--; src = mk(&f);
+    CHECK(lineidx_build_start_prepaid(x, &pool, &src) == 0);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!lineidx_complete(x) || lineidx_building(x)) {
+        (void)lineidx_poll(x);
+        if (trace_now_ns() >= deadline) { CHECK(false); break; }
+        sched_yield();
+    }
+    CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == 3u);
+    /* Physical lease retirement owns accepted sources; refusal owns nothing. */
+    CHECK(lineidx_edit(x, 0, 0, 0) == 0);
+    (void)lineidx_poll(x);
+    uint8_t *leased_bytes = malloc(n); REQUIRE(leased_bytes); memcpy(leased_bytes, bytes, n);
+    lease accepted = {.b = leased_bytes, .n = n};
+    lineidx_src immutable = {&accepted, n, lease_span, lease_release};
+    REQUIRE(lineidx_build_start_prepaid(x, &pool, &immutable) == 0);
+    while (lineidx_build_preparing(x)) (void)lineidx_poll(x);
+    REQUIRE(lease_entered(&accepted));
+    lineidx_build_cancel(x);
+    CHECK(!atomic_load(&accepted.released));
+    lease refused = {.b = bytes, .n = n};
+    lineidx_src other = {&refused, n, lease_span, lease_release};
+    CHECK(lineidx_build_start_prepaid(x, &pool, &other) == -1);
+    CHECK(!atomic_load(&refused.released));
+    atomic_store(&accepted.resume, true);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (lineidx_building(x)) {
+        (void)lineidx_poll(x);
+        if (trace_now_ns() >= deadline) { CHECK(false); break; }
+        sched_yield();
+    }
+    CHECK(atomic_load(&accepted.released));
+    CHECK(lineidx_build_start_prepaid(x, &pool, &src) == 0);
+    lineidx_destroy(x); free(bytes);
+    fprintf(stderr, "prepaid restart: bounded preparation, cancellation/reuse, mallocs=%zu guard=%s passed (M)[AC]\n",
+        allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+}
 int main(int argc, char **argv)
 {
     trace_init();
     CHECK(work_pool_init(&pool, 1, 0) == 0);
     if (argc == 2) {
-        if (strcmp(argv[1], "--review=1") == 0) test_review_capacity();
+        if (strcmp(argv[1], "--prepaid") == 0) test_prepaid_restart();
+        else if (strcmp(argv[1], "--review=1") == 0) test_review_capacity();
         else if (strcmp(argv[1], "--review=2") == 0) test_review_overflow();
         else if (strcmp(argv[1], "--review=3") == 0) test_review_epoch();
         else if (strcmp(argv[1], "--review=4") == 0) test_edit_during_build();
@@ -1251,6 +1323,7 @@ int main(int argc, char **argv)
         else return 2;
         goto finish;
     }
+    test_prepaid_restart();
     fprintf(stderr, "-- review_capacity\n"); test_review_capacity();
     fprintf(stderr, "-- review_seek_budget\n"); test_review_seek_budget();
     fprintf(stderr, "-- seek_changed_target\n"); test_seek_changed_target();

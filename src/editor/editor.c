@@ -399,9 +399,13 @@ static int blink(editor *e, uint64_t now)
 static bool runnable(const editor *e)
 {
     bool can_drain = (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES));
+    for (size_t i = 0; i < e->buffer_capacity; i++) {
+        const editor_buffer *b = e->buffers[i];
+        if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
+            (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
+    }
     return e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice || (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
-           (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty) ||
-           (!e->buffer->source_stale && e->buffer->index_dirty && !lineidx_building(e->buffer->index));
+           (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty);
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {

@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <sched.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct counted { bool active, suspended; size_t allocations, frames; } counted;
@@ -1235,10 +1236,120 @@ static int partial_line_start(void)
     editor_close(e);
     puts("editor_test: partial index deep typing reuses viewport line starts passed"); return 0;
 }
+static int index_capacity_typing(void)
+{
+    char path[] = "build/s9-index-capacity-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    uint8_t *bytes = malloc(LINEIDX_CHUNK); T(bytes);
+    memset(bytes, 'a', LINEIDX_CHUNK); bytes[LINEIDX_CHUNK - 1u] = '\n';
+    T(write(fd, bytes, LINEIDX_CHUNK) == LINEIDX_CHUNK); close(fd); free(bytes);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 32, .rows = 4, .wrap_mode = -1}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+    for (unsigned i = 0; i < 256; i++) {
+        plat_event ev = key('x', 0, "x");
+        int rc = editor_handle_key(e, &ev);
+        if (rc) fprintf(stderr, "capacity typing: key=%u rc=%d tree=%llu index=%llu\n", i + 1u, rc,
+            (unsigned long long)editor_length(e), (unsigned long long)lineidx_len(e->buffer->index));
+        T(lineidx_len(e->buffer->index) == editor_length(e)); T(rc == 0);
+    }
+    T(lineidx_chunk_count(e->buffer->index) <= 3u);
+    T(settle(e) == 0); editor_close(e); unlink(path);
+    puts("P1-1 section 1: file-backed successive typing keeps bounded index geometry passed"); return 0;
+}
+static int index_capacity_refusal(void)
+{
+    uint8_t *bytes = malloc(LINEIDX_CHUNK + 1u); T(bytes); memset(bytes, 'a', LINEIDX_CHUNK + 1u);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = LINEIDX_CHUNK, .cols = 16, .rows = 2, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create_reserved(LINEIDX_CHUNK, 0); T(e->buffer->index);
+    uint64_t revision = e->buffer->revision; size_t history = e->buffer->history_cursor;
+    plat_event ev = key('x', 0, "xx");
+    e->v.state.selection.cursor = 1; e->v.state.selection.anchor = 0;
+    int rc = editor_handle_key(e, &ev); T(rc == EDITOR_ERR_CAPACITY);
+    T(editor_length(e) == LINEIDX_CHUNK && lineidx_len(e->buffer->index) == LINEIDX_CHUNK);
+    T(e->buffer->revision == revision && e->buffer->history_cursor == history);
+    uint8_t first; T(editor_read(e, 0, &first, 1) == 0 && first == 'a');
+    editor_close(e);
+    cfg.initial_len = LINEIDX_CHUNK + 1u; e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('x', 0, "x")) == 0);
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create_reserved(1, 0); T(e->buffer->index);
+    revision = e->buffer->revision; history = e->buffer->history_cursor;
+    ev = key('z', PLAT_MOD_CTRL, NULL); rc = editor_handle_key(e, &ev); T(rc == EDITOR_ERR_CAPACITY);
+    T(editor_length(e) == 1 && lineidx_len(e->buffer->index) == 1);
+    T(e->buffer->revision == revision && e->buffer->history_cursor == history);
+    T(editor_read(e, 0, &first, 1) == 0 && first == 'x');
+    editor_close(e); free(bytes);
+    puts("P1-1 section 1: replacement and undo capacity refuse before buffer/history mutation passed"); return 0;
+}
+static int index_eventual_repair(void)
+{
+    char path[] = "build/s9-index-repair-XXXXXX"; int fd = mkstemp(path); T(fd >= 0);
+    const size_t n = 4u * FILE_PREFIX_MAX;
+    uint8_t *bytes = malloc(n); T(bytes); memset(bytes, 'a', n);
+    for (size_t i = FILE_PREFIX_MAX; i < n; i += 128u) bytes[i] = '\n';
+    T(write(fd, bytes, n) == (ssize_t)n); close(fd); free(bytes);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 16, .rows = 2, .wrap_mode = -1}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (e->buffer->pending_open) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(settle(e) == 0);
+    /* Reproduce edit before the low-density prefix's bulk index arrives. */
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(n); T(e->buffer->index);
+    T(lineidx_build_reserve(e->buffer->index) == 0);
+    e->buffer->lines = 1; e->buffer->lg.lines_exact = false;
+    edit_malloc_guard_begin();
+    T(press(e, key('x', 0, "x")) == 0);
+    editor_buffer *edited = e->buffer;
+    /* Dirty inactive buffers must also resume; maintenance owns their trees. */
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!lineidx_complete(edited->index) || lineidx_building(edited->index)) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
+    }
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) T(allocations == 0);
+    T(lineidx_complete(edited->index));
+    T(lineidx_line_count(edited->index).exact && lineidx_line_count(edited->index).value == 24577u);
+    T(edited->lines == 24577u && edited->lg.lines_exact);
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+    T(editor_jump_line(e, 20000u) == EDITOR_OK); T(settle(e) == 0);
+    /* Queue a restart behind real bulk work, then cancel that queued snapshot
+     * with another edit. Both revisions must survive retirement and retry. */
+    review_hold hold = {0}; work_handle held = work_submit(&e->pool,
+        (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(held.epoch);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!atomic_load(&hold.entered)) { T(trace_now_ns() < deadline); sched_yield(); }
+    lineidx_destroy(edited->index); edited->index = lineidx_create(editor_length(e)); T(edited->index);
+    T(lineidx_build_reserve(edited->index) == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    for (unsigned i = 0; i < 8u; i++) T(editor_step(e, 0) >= 0);
+    T(lineidx_building(edited->index) && !lineidx_complete(edited->index));
+    T(press(e, key('x', 0, "x")) == 0);
+    atomic_store(&hold.release, true);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!editor_index_complete(e) || lineidx_building(edited->index)) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
+    }
+    T(lineidx_len(edited->index) == editor_length(e));
+    T(lineidx_line_count(edited->index).exact && lineidx_line_count(edited->index).value == 24577u);
+    T(editor_jump_line(e, 20000u) == EDITOR_OK); T(settle(e) == 0);
+    editor_close(e); unlink(path);
+    printf("P1-1 section 6: inactive exact counts/jump, bulk cancellation/retry, mallocs=%zu guard=%s passed (M)[AC]\n",
+        allocations, edit_malloc_guard_active() ? "active" : "ASan-inert"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
+        if (!strcmp(argv[1], "--index-capacity")) return index_capacity_typing();
+        if (!strcmp(argv[1], "--index-refusal")) return index_capacity_refusal();
+        if (!strcmp(argv[1], "--index-repair")) return index_eventual_repair();
         if (!strcmp(argv[1], "--raster-blink")) return raster_blink_damage();
         if (!strcmp(argv[1], "--line-start-only")) return partial_line_start();
         if (!strcmp(argv[1], "--selection")) return backend_selection();
@@ -1253,6 +1364,7 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(review_suite(NULL) == 0);
+    T(index_capacity_typing() == 0); T(index_capacity_refusal() == 0); T(index_eventual_repair() == 0);
     T(partial_line_start() == 0);
     T(backend_selection() == 0); T(backend_fallback() == 0); T(backend_gpu_completion() == 0);
     const char *name = getenv("EDIT_BACKEND");
