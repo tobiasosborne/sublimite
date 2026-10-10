@@ -246,7 +246,8 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     REQUIRE(settle(e) == 0);
     REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
     REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
-    uint64_t values[32]; bench_samples cpu; bench_samples_init(&cpu, values, 32);
+    uint64_t values[BENCH_INTERACTION_MIN_N]; bench_samples cpu;
+    bench_samples_init(&cpu, values, BENCH_INTERACTION_MIN_N);
     uint64_t worker_jobs = 0, inline_frames = 0;
     uint64_t wake_start = editor_get_stats(e).poll_returns, wall = bench_now_ns();
     bool measuring = !b.active;
@@ -261,7 +262,7 @@ static int idle_row(const char *requested, bool track, bool require_gl)
         }
         if (editor_get_stats(e).blinks > blink_count) {
             REQUIRE(measuring);
-            (void)bench_add(&cpu, process_ns() - start);
+            REQUIRE(bench_add(&cpu, process_ns() - start) == 0);
             raster_metrics m;
             if (raster_frame_metrics(&b, &m)) {
                 worker_jobs += m.jobs + m.completion_jobs;
@@ -274,7 +275,29 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     uint64_t wakes = s.poll_returns - wake_start;
     uint64_t elapsed = bench_now_ns() - wall;
     double rate = (double)wakes * 1e9 / (double)elapsed;
-    char name[80]; (void)snprintf(name, sizeof name, "editor_%s_G11_process_cpu", label);
+    /* Null CPU-per-blink gets an independent full interaction population.
+     * Advance only this benchmark instance's private deadline to due-now:
+     * the normal poll/blink/caret/submit path still runs once per sample.
+     * Keep the real ten-second window above for wakeup/idle policy, and keep
+     * raster/GL's existing CPU MISS rows untouched for edit-zzj.12. */
+    bool synthetic = !strcmp(requested, "null");
+    if (synthetic) {
+        bench_samples_init(&cpu, values, BENCH_INTERACTION_MIN_N);
+        e->blinking = true;
+        for (size_t i = 0; i < BENCH_INTERACTION_MIN_N; i++) {
+            uint64_t before = editor_get_stats(e).blinks;
+            e->next_blink = bench_now_ns(); e->last_input = e->next_blink;
+            uint64_t start = process_ns();
+            int rc = editor_step(e, -1); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
+            REQUIRE(settle(e) == 0);
+            uint64_t used = process_ns() - start;
+            REQUIRE(editor_get_stats(e).blinks == before + 1);
+            REQUIRE(bench_add(&cpu, used) == 0);
+        }
+        e->blinking = false; e->next_blink = 0;
+    }
+    char name[96]; (void)snprintf(name, sizeof name, "editor_%s_G11_process_cpu%s", label,
+                                synthetic ? "_synthetic_due_now" : "");
     int miss = gate_row(name, &cpu, G11_P50, G11_P99, track, &tag);
     /* A bounded observation adds exactly one external test-deadline timeout.
      * Subtract that known timeout, retaining all earlier poll returns. */
@@ -535,10 +558,12 @@ static int tab_row(bool raster, bool track)
     REQUIRE(settle_ready(e) == 0);
     REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
     REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
-    uint64_t frame_values[200], map_values[200]; bench_samples frames, maps;
-    bench_samples_init(&frames, frame_values, 200); bench_samples_init(&maps, map_values, 200);
+    uint64_t frame_values[BENCH_INTERACTION_MIN_N], map_values[BENCH_INTERACTION_MIN_N];
+    bench_samples frames, maps;
+    bench_samples_init(&frames, frame_values, BENCH_INTERACTION_MIN_N);
+    bench_samples_init(&maps, map_values, BENCH_INTERACTION_MIN_N);
     measured.measuring = true;
-    for (unsigned i = 0; i < 200; i++) {
+    for (size_t i = 0; i < BENCH_INTERACTION_MIN_N; i++) {
         uint64_t fills = editor_get_stats(e).minimap_fills;
         plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Tab, .mods = PLAT_MOD_CTRL};
         REQUIRE(editor_inject(e, &ev) == 0);
@@ -551,16 +576,16 @@ static int tab_row(bool raster, bool track)
         uint64_t ready = b.device_ns > b.submitted_ns ? b.device_ns : b.submitted_ns;
         REQUIRE(ready >= measured.ingress);
         REQUIRE(editor_get_stats(e).minimap_fills > fills && !editor_get_stats(e).minimap_stale);
-        (void)bench_add(&frames, ready - measured.ingress);
-        (void)bench_add(&maps, editor_get_stats(e).minimap_ns);
+        REQUIRE(bench_add(&frames, ready - measured.ingress) == 0);
+        REQUIRE(bench_add(&maps, editor_get_stats(e).minimap_ns) == 0);
     }
     measured.measuring = false;
     char name[96]; (void)snprintf(name, sizeof name, "editor_%s_100tabs_ingress_T5_G3", raster ? "raster" : "null");
     int miss = gate_row(name, &frames, UINT64_C(5000000), UINT64_C(5560000), track, &tag);
     (void)snprintf(name, sizeof name, "editor_%s_100tabs_minimap_inside_frame", raster ? "raster" : "null");
     miss = bench_merge_exit(miss, gate_row(name, &maps, 0, UINT64_C(500000), track, &tag));
-    printf("G3 %s (M)%s load1=%s tabs=100 A=2880x1800 switches=200 allocations=%zu minimap_fills=%" PRIu64 " stale=%d mode=%s\n",
-        raster ? "raster" : "null", tag.power, tag.load, measured.allocations,
+    printf("G3 %s (M)%s load1=%s tabs=100 A=2880x1800 switches=%zu allocations=%zu minimap_fills=%" PRIu64 " stale=%d mode=%s\n",
+        raster ? "raster" : "null", tag.power, tag.load, frames.n, measured.allocations,
         editor_get_stats(e).minimap_fills, editor_get_stats(e).minimap_stale, track ? "TRACK" : "GATE");
     bool structural = measured.allocations != 0; editor_close(e); return row_result(miss, structural, track);
 }

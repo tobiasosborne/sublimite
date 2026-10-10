@@ -427,6 +427,51 @@ static void test_structural_counts(void)
     puts("PROBE structural counts, allocation, missing/duplicate frame failures remain fatal in TRACK");
 }
 
+/* Exercise the real row schedules, rather than a duplicate of their constants.
+ * Timing misses are allowed on the shared box; population loss is not. */
+static void test_editor_row_populations(void)
+{
+    int output[2];
+    int pipe_rc = pipe(output);
+    CHECK(pipe_rc == 0);
+    if (pipe_rc != 0) return;
+    fflush(stdout);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child < 0) { close(output[0]); close(output[1]); return; }
+    if (child == 0) {
+        close(output[0]);
+        if (dup2(output[1], STDOUT_FILENO) < 0) _exit(2);
+        close(output[1]);
+        int tabs_rc = tab_row(false, false);
+        int idle_rc = idle_row("null", false, false);
+        fflush(stdout);
+        _exit(tabs_rc < 0 || idle_rc < 0 ? 2 : 0);
+    }
+    close(output[1]);
+    FILE *rows = fdopen(output[0], "r");
+    CHECK(rows != NULL);
+    size_t frames = 0, maps = 0, blinks = 0;
+    if (rows) {
+        char line[1024], name[128]; size_t n;
+        while (fgets(line, sizeof line, rows)) {
+            fputs(line, stdout);
+            if (sscanf(line, "BENCH name=%127s n=%zu", name, &n) != 2) continue;
+            if (!strcmp(name, "editor_null_100tabs_ingress_T5_G3")) frames = n;
+            if (!strcmp(name, "editor_null_100tabs_minimap_inside_frame")) maps = n;
+            if (!strncmp(name, "editor_null_G11_process_cpu", strlen("editor_null_G11_process_cpu")) && n > blinks)
+                blinks = n;
+        }
+        fclose(rows);
+    } else close(output[0]);
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(frames >= BENCH_INTERACTION_MIN_N);
+    CHECK(maps >= BENCH_INTERACTION_MIN_N);
+    CHECK(blinks >= BENCH_INTERACTION_MIN_N);
+}
+
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
@@ -443,6 +488,7 @@ int main(void)
     test_battery();
     test_power_status();
     test_time_macro();
+    test_editor_row_populations();
     printf("harness_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
