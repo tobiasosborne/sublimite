@@ -1,0 +1,36 @@
+ENV (M)[AC][xvfb, indicative only]; proxy smoke, no gate or variant verdict
+2026-10-10T04:32:18.833355+00:00 CONFIG trials=2 idle_seconds=15.0 hint_lead_ms=50 order=A/B/C/A/B/C status=TRACK
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+2026-10-10T04:32:19.794408+00:00 variant=a binary_bytes=846848 READY renderer=llvmpipe (LLVM 20.1.2, 256 bits) surface=2880x1800 cells=43200 power=(M)[AC] evidence=xvfb-indicative-only load1=18.48 status=Not charging
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+2026-10-10T04:32:20.897614+00:00 variant=b binary_bytes=848616 READY renderer=llvmpipe (LLVM 20.1.2, 256 bits) surface=2880x1800 cells=43200 power=(M)[AC] evidence=xvfb-indicative-only load1=18.48 status=Not charging
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+2026-10-10T04:32:21.722628+00:00 variant=c binary_bytes=848616 READY renderer=llvmpipe (LLVM 20.1.2, 256 bits) surface=2880x1800 cells=43200 power=(M)[AC] evidence=xvfb-indicative-only load1=18.60 status=Not charging
+2026-10-10T04:32:36.735666+00:00 BEFORE variant=a trial=1 condition=N status=Not charging load1=17.48
+2026-10-10T04:32:36.811864+00:00 variant=a trial=1 SAMPLE condition=N idle_ns=16941438736 frame_ns=75966748 key_ns=75967373 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181636 minflt=30896 majflt=0 allocations=0 power=(M)[AC] load1=17.48 status=Not charging
+2026-10-10T04:32:51.822796+00:00 BEFORE variant=b trial=1 condition=N status=Not charging load1=15.86
+2026-10-10T04:32:51.874067+00:00 variant=b trial=1 SAMPLE condition=N idle_ns=30925341047 frame_ns=51052677 key_ns=51053169 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181284 minflt=30239 majflt=0 allocations=0 power=(M)[AC] load1=15.86 status=Not charging
+2026-10-10T04:33:06.886490+00:00 BEFORE variant=c trial=1 condition=N status=Not charging load1=14.25
+2026-10-10T04:33:06.936729+00:00 variant=c trial=1 SAMPLE condition=N idle_ns=45164073530 frame_ns=50030972 key_ns=50031419 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181956 minflt=29831 majflt=0 allocations=0 power=(M)[AC] load1=14.25 status=Not charging
+2026-10-10T04:33:21.948046+00:00 BEFORE variant=a trial=1 condition=H status=Not charging load1=12.92
+2026-10-10T04:33:22.080333+00:00 variant=a trial=1 SAMPLE condition=H idle_ns=45136349395 frame_ns=81927957 key_ns=81996019 hint_wall_ns=59 hint_cpu_ns=7573 rss_kib=181636 minflt=30896 majflt=0 allocations=0 power=(M)[AC] load1=12.92 status=Not charging
+2026-10-10T04:33:37.091958+00:00 BEFORE variant=b trial=1 condition=H status=Not charging load1=11.14
+2026-10-10T04:33:37.212508+00:00 variant=b trial=1 SAMPLE condition=H idle_ns=45218076759 frame_ns=70185360 key_ns=70253703 hint_wall_ns=224722 hint_cpu_ns=231612 rss_kib=181284 minflt=30239 majflt=0 allocations=0 power=(M)[AC] load1=11.14 status=Not charging
+2026-10-10T04:33:52.212892+00:00 BEFORE variant=c trial=1 condition=H status=Not charging load1=10.06
+2026-10-10T04:33:52.352669+00:00 variant=c trial=1 SAMPLE condition=H idle_ns=45276311311 frame_ns=39321793 key_ns=89550667 hint_wall_ns=100222202 hint_cpu_ns=100221202 rss_kib=181956 minflt=29831 majflt=0 allocations=0 power=(M)[AC] load1=10.06 status=Not charging
+2026-10-10T04:34:07.366740+00:00 BEFORE variant=a trial=2 condition=N status=Not charging load1=9.99
+2026-10-10T04:34:07.514731+00:00 variant=a trial=2 SAMPLE condition=N idle_ns=45288518445 frame_ns=145806243 key_ns=145807019 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181636 minflt=30896 majflt=0 allocations=0 power=(M)[AC] load1=9.99 status=Not charging
+2026-10-10T04:34:22.515129+00:00 BEFORE variant=b trial=2 condition=N status=Not charging load1=11.49
+2026-10-10T04:34:22.636178+00:00 variant=b trial=2 SAMPLE condition=N idle_ns=45305063917 frame_ns=118572999 key_ns=118573535 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181284 minflt=30239 majflt=0 allocations=0 power=(M)[AC] load1=11.49 status=Not charging
+2026-10-10T04:34:37.646992+00:00 BEFORE variant=c trial=2 condition=N status=Not charging load1=11.21
+2026-10-10T04:34:37.764787+00:00 variant=c trial=2 SAMPLE condition=N idle_ns=45294539618 frame_ns=117512646 key_ns=117513221 hint_wall_ns=0 hint_cpu_ns=0 rss_kib=181956 minflt=29831 majflt=0 allocations=0 power=(M)[AC] load1=11.21 status=Not charging
+2026-10-10T04:34:52.766741+00:00 BEFORE variant=a trial=2 condition=H status=Not charging load1=10.95
+2026-10-10T04:34:52.990106+00:00 variant=a trial=2 SAMPLE condition=H idle_ns=45252185422 frame_ns=173019520 key_ns=173084915 hint_wall_ns=54 hint_cpu_ns=6663 rss_kib=181636 minflt=30896 majflt=0 allocations=0 power=(M)[AC] load1=10.95 status=Not charging
+2026-10-10T04:35:08.003740+00:00 BEFORE variant=b trial=2 condition=H status=Not charging load1=11.51
+2026-10-10T04:35:08.176864+00:00 variant=b trial=2 SAMPLE condition=H idle_ns=45367711362 frame_ns=122335911 key_ns=122903862 hint_wall_ns=228866 hint_cpu_ns=234328 rss_kib=181284 minflt=30239 majflt=0 allocations=0 power=(M)[AC] load1=11.51 status=Not charging
+2026-10-10T04:35:23.177737+00:00 BEFORE variant=c trial=2 condition=H status=Not charging load1=12.16
+2026-10-10T04:35:23.454340+00:00 variant=c trial=2 SAMPLE condition=H idle_ns=45413125380 frame_ns=176134859 key_ns=226374413 hint_wall_ns=100230672 hint_cpu_ns=74789413 rss_kib=181956 minflt=29831 majflt=0 allocations=0 power=(M)[AC] load1=12.16 status=Not charging
+2026-10-10T04:35:23.716815+00:00 DONE all samples collected; proxy only, no gate verdict or variant choice
