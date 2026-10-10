@@ -90,6 +90,8 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 
 ## 9. Milestones (exit by use, not by gate; 2026-10-11)
 
+Precondition for every hand-over to Tobias: the Astra vs Sublime Text comparison drive (PLAN P5.1b) has run on that build and its report lists what diverges, what is missing and the verdict. Tobias sees a build only after Astra has.
+
 | | Scope | Exit criterion |
 |---|---|---|
 | **M0 glass** | X11 window, GL text, piece tree, typing, scrolling, one file | Tobias does his own work in it on the real display and declares M0 done or lists the blockers; no duration, no gate row |
