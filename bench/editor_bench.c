@@ -1,4 +1,5 @@
 #include "editor/editor.h"
+#include "editor/private.h"
 #include "raster/raster.h"
 #include "font/font.h"
 #include "trace/trace.h"
@@ -104,17 +105,43 @@ static void io_boundary(void *ctx, bool entering)
         edit_malloc_guard_begin(); s->guard = true; s->suspended = false;
     }
 }
+static bool settled(editor_stats s, const render_backend *b)
+{
+    return !s.pending && (!s.render_active || b->presented);
+}
+static int settle_self_check(void)
+{
+    render_backend b = {.active = true, .presented = true};
+    editor_stats s = {.render_active = true};
+    REQUIRE(settled(s, &b));
+    s.pending = true; REQUIRE(!settled(s, &b));
+    s.pending = false; b.presented = false; REQUIRE(!settled(s, &b));
+    puts("editor_bench: settle permits undamaged submitted frame with delayed Present completion");
+    return 0;
+}
 static int settle(editor *e)
 {
     uint64_t deadline = bench_now_ns() + UINT64_C(5000000000);
     for (;;) {
         editor_stats before = editor_get_stats(e);
-        if (!before.pending && !before.render_active) return 0;
+        if (settled(before, e->backend)) return 0;
+        int rc = editor_step(e, 20); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
+        editor_stats s = editor_get_stats(e);
+        if (settled(s, e->backend)) return 0;
+        REQUIRE(bench_now_ns() < deadline);
+    }
+}
+/* Rows ending at T5 explicitly drain the retained backend slot. The main settle endpoint is damage submitted (T4). */
+static int settle_ready(editor *e)
+{
+    uint64_t deadline = bench_now_ns() + UINT64_C(5000000000);
+    e->caret_only = false;
+    do {
         int rc = editor_step(e, 20); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
         editor_stats s = editor_get_stats(e);
         if (!s.pending && !s.render_active) return 0;
         REQUIRE(bench_now_ns() < deadline);
-    }
+    } while (true);
 }
 static plat_event event(bool back)
 {
@@ -170,7 +197,7 @@ static int idle_row(const char *requested, bool track, bool require_gl)
 {
     stamp tag = power_stamp();
     render_backend b = {0}; REQUIRE(row_backend(&b, requested) == 0);
-    /* G11 uses the same A viewport as G1. Process CPU time includes every
+    /* G11 uses an asserted A viewport. Process CPU time includes every
      * worker and is an upper bound on summed per-thread running time. */
     editor_config cfg = target_a_config(); cfg.raster_fallback = true;
     editor *e = NULL; REQUIRE(editor_open(&e, &cfg, &b) == 0);
@@ -182,13 +209,30 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     const char *label = row_label(&b, requested);
     printf("BACKEND requested=%s actual=%s init_error=%d\n", requested, b.info.name, editor_get_stats(e).backend_init_error);
     REQUIRE(settle(e) == 0);
+    REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
+    REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
     uint64_t values[32]; bench_samples cpu; bench_samples_init(&cpu, values, 32);
+    uint64_t worker_jobs = 0, inline_frames = 0;
     uint64_t wake_start = editor_get_stats(e).poll_returns, wall = bench_now_ns();
+    bool measuring = !b.active;
     while (editor_get_stats(e).blinking) {
         uint64_t blink_count = editor_get_stats(e).blinks, start = process_ns();
         int rc = editor_step(e, -1); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
         REQUIRE(settle(e) == 0);
-        if (editor_get_stats(e).blinks > blink_count) (void)bench_add(&cpu, process_ns() - start);
+        if (!measuring && !b.active && !editor_get_stats(e).pending && !editor_get_stats(e).blinks) {
+            /* Setup completion is outside the blink window. No separate
+             * Present wait or completion deadline when nothing is damaged. */
+            wake_start = editor_get_stats(e).poll_returns; wall = bench_now_ns(); measuring = true;
+        }
+        if (editor_get_stats(e).blinks > blink_count) {
+            REQUIRE(measuring);
+            (void)bench_add(&cpu, process_ns() - start);
+            raster_metrics m;
+            if (raster_frame_metrics(&b, &m)) {
+                worker_jobs += m.jobs + m.completion_jobs;
+                inline_frames += m.inline_cells != 0;
+            }
+        }
         REQUIRE(bench_now_ns() - wall < UINT64_C(15000000000));
     }
     editor_stats s = editor_get_stats(e);
@@ -203,12 +247,13 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
     REQUIRE(editor_inject(e, &focus) == 0); REQUIRE(settle(e) == 0);
     uint64_t unfocused; REQUIRE(observe_quiet(e, &unfocused) == 0);
-    bool structural = wakes > 20 || quiet || unfocused;
+    bool structural = wakes > 20 || quiet || unfocused || worker_jobs;
     printf("G11 %s (M)%s load1=%s blinks=%" PRIu64 " poll_returns=%" PRIu64 " wakeups/s=%.3f idle=%" PRIu64 " unfocused=%" PRIu64 " (G)<=2/s,0,0 mode=%s structural=%s\n",
         label, tag.power, tag.load, s.blinks, wakes, rate, quiet, unfocused, track ? "TRACK" : "GATE", structural ? "FAIL" : "OK");
     /* The fixed ten-second blink policy permits nineteen blinks plus its
      * terminal timeout. The observation starts after setup, so a raw rate
      * can exceed 2 slightly solely from that truncated first interval. */
+    printf("G11 %s structural worker_jobs=%" PRIu64 " inline_frames=%" PRIu64 "\n", label, worker_jobs, inline_frames);
     editor_close(e); return row_result(miss, structural, track);
 }
 /* Real bounded kernels share the editor backend's public worker pool. Their
@@ -442,7 +487,7 @@ static int tab_row(bool raster, bool track)
     cfg.max_cols = cfg.cols; cfg.max_rows = cfg.rows;
     editor *e = NULL; REQUIRE(editor_open(&e, &cfg, &b) == 0);
     for (unsigned i = 1; i < 100; i++) { uint64_t id; REQUIRE(editor_add_buffer(e, NULL, cfg.initial, len, &id) == 0); }
-    REQUIRE(settle(e) == 0);
+    REQUIRE(settle_ready(e) == 0);
     REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
     REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
     uint64_t frame_values[200], map_values[200]; bench_samples frames, maps;
@@ -453,7 +498,7 @@ static int tab_row(bool raster, bool track)
         plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Tab, .mods = PLAT_MOD_CTRL};
         REQUIRE(editor_inject(e, &ev) == 0);
         ev.keysym = XKB_KEY_Control_L; ev.press = false; ev.mods = 0;
-        REQUIRE(editor_inject(e, &ev) == 0); REQUIRE(settle(e) == 0);
+        REQUIRE(editor_inject(e, &ev) == 0); REQUIRE(settle_ready(e) == 0);
         REQUIRE(measured.frame.present_ns >= measured.ingress && !measured.guard && !measured.suspended);
         /* G3 ends at compositor-ready T5, after the XShm fence, rather
          * than the T4 upload submission measured by the legacy key row. */
@@ -519,6 +564,7 @@ int main(int argc, char **argv)
     uint64_t ingress_delay = 0; unsigned scenarios = 4;
     const char *path = "/tmp/edit-corpus/log_1g.txt";
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--self-check")) return settle_self_check();
         if (!strcmp(argv[i], "--track")) track = true;
         else if (!strcmp(argv[i], "--require-gl")) require_gl = true;
         else if (!strcmp(argv[i], "--no-idle")) idle = false;

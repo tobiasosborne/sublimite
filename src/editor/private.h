@@ -100,7 +100,8 @@ struct editor {
     uint32_t tab_rows, map_cols;
     tabs_strip strip;
     size_t drag_tab;
-    bool map_drag, paint_ready;
+    bool map_drag, paint_ready, caret_only;
+    int raster_poll_fd;
     uint8_t *indent_bytes;
     indent_range *ws_ranges;
     size_t ws_count;

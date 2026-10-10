@@ -72,7 +72,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (may_fallback && render_cpu_backend(&fallback)) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->drag_tab = SIZE_MAX;
+    e->poll_fd = -1; e->raster_poll_fd = -1; e->drag_tab = SIZE_MAX;
     e->cfg = *config; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;

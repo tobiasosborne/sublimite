@@ -392,3 +392,24 @@ Verify with tools/linkorder_bench.sh selftest and
 variants/P3.6/common/contract.sh. Full GCC release build, clang ASan/UBSan
 check (41 test binaries, leaks disabled), and fuzz build (21 fuzzers) passed. Remaining limitations are
 recorded in the decision.
+
+## edit-zzj.12 session 9 — raster G11 caret path
+
+Prepared blink/unfocus paint now changes only the caret cell or wide pair,
+without strip/fence worker submissions. Raster uses inline SSE2, cell-sized
+XShm uploads and a bounded Present update region. Genuine completion is
+observed on existing loop turns; waiting damage arms the private X fd in the
+existing epoll set. No completion polling timer is added. General fence-job
+work and teardown are byte-for-byte unchanged. The benchmark's undamaged
+settle endpoint is T4; T5 rows keep an explicit readiness wait.
+
+Focused worker-lease, selection/wide/wrap, scalar pixel and delayed-Present
+regressions are green. GCC 13 forced full release build passes. Editor/raster
+fuzz completed cleanly for at least 60 seconds (G), leaks disabled. Final
+loaded-box G11 (M)[AC]: raster CPU p50/p99 0.109487/0.126305 ms, nineteen inline
+frames with zero worker jobs, twenty UI polls and no after-idle/unfocused wakes.
+The 0.1 ms median gate (G) still misses; no acceptance/closure is claimed.
+Final clang 18 ASan/UBSan make check exits zero: 59 test binaries plus replay
+CLI, leaks disabled (M)[AC]. The unrelated transient view assertion, clock-skew
+handling, pasted red/green and complete limitations are in
+../../docs/worker-reports/edit-zzj.12-s9.md. Design: ../../docs/decisions/edit-zzj.12.md.

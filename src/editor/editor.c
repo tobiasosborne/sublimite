@@ -1,10 +1,15 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include "gl/gl.h"
+#include "raster/raster.h"
+#include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
 #include <stdlib.h>
+
+static bool runnable(const editor *e);
+static int refresh_caret(editor *e);
 
 static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 static uint64_t max64(uint64_t a, uint64_t b) { return a > b ? a : b; }
@@ -38,6 +43,7 @@ static int fail(editor *e, int cause)
 }
 int editor_begin_frame(editor *e)
 {
+    e->caret_only = false;
     if (e->dirty) return 0;
     if (e->grid.frame_id == UINT32_MAX) return RENDER_ERR_FRAME;
     int rc = render_frame_begin(&e->grid, e->grid.frame_id + 1u);
@@ -48,6 +54,7 @@ int editor_begin_frame(editor *e)
 }
 int editor_full_layout(editor *e)
 {
+    e->caret_only = false;
     int rc = editor_begin_frame(e); if (rc) return rc;
     rc = render_mark_full(&e->grid); if (rc) return rc;
     e->paint_ready = false;
@@ -78,7 +85,7 @@ static uint32_t cursor_row(const editor *e, uint64_t byte)
     while (r + 1 < e->text_grid.dims.rows && e->row_byte[r + 1] <= byte) r++;
     return r;
 }
-int editor_refresh_cursor(editor *e, uint64_t old_cursor)
+static int refresh_cursor(editor *e, uint64_t old_cursor, bool caret)
 {
     int rc = editor_begin_frame(e); if (rc) return rc;
     e->paint_ready = false;
@@ -90,7 +97,7 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
         return editor_full_layout(e);
     uint32_t a = cursor_row(e, old_cursor), b = cursor_row(e, s.selection.cursor);
     uint32_t lo = a < b ? a : b, hi = (a > b ? a : b) + 1u;
-    if (s.selection.cursor != s.selection.anchor || e->old_selection.cursor != e->old_selection.anchor) { lo = 0; hi = e->text_grid.dims.rows; }
+    if (!caret && (s.selection.cursor != s.selection.anchor || e->old_selection.cursor != e->old_selection.anchor)) { lo = 0; hi = e->text_grid.dims.rows; }
     if (layout_busy(&e->lay)) {
         if (lo < e->lay.row || hi > e->lay.row_end) {
             if (e->extra_rows) { if (lo > e->extra_first) lo = e->extra_first; if (hi < e->extra_end) hi = e->extra_end; }
@@ -100,6 +107,11 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
     }
     rc = layout_relayout_rows(&e->lay, lo, hi - lo);
     return rc < 0 ? rc : 0;
+}
+int editor_refresh_cursor(editor *e, uint64_t old_cursor)
+{
+    e->caret_only = false;
+    return refresh_cursor(e, old_cursor, false);
 }
 void editor_route_work(const work_msg *msg, void *ctx)
 {
@@ -146,8 +158,31 @@ static void platform_complete(void *ctx, uint32_t serial, uint64_t ust, uint64_t
     int rc = gl_present_complete(e->backend, serial, ust, msc);
     if (rc && rc != RENDER_ERR_FRAME && rc != RENDER_ERR_STATE) e->error = rc;
 }
+/* A clean caret frame has no work waiting for completion. Observe its XCB
+ * queue on the next existing blink/input turn, without a completion-only wake.
+ * When damage is waiting, arm the same epoll set used by platform on_work. */
+static int raster_poll_set(editor *e)
+{
+    int fd = raster_completion_fd(e->backend);
+    if (e->caret_only && !e->dirty && !e->queue_count && !e->resize_pending) fd = -1;
+    if (fd == e->raster_poll_fd) return 0;
+    if (e->raster_poll_fd >= 0 && epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, e->raster_poll_fd, NULL))
+        return EDITOR_ERR_IO;
+    e->raster_poll_fd = -1;
+    if (fd >= 0) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
+        if (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &ev)) return EDITOR_ERR_IO;
+        e->raster_poll_fd = fd;
+    }
+    return 0;
+}
 static int pump(editor *e, int timeout)
 {
+    bool active = e->backend->active;
+    int raster_rc = raster_poll_completions(e->backend);
+    if (raster_rc) return fail(e, raster_rc);
+    if (active && !e->backend->active && runnable(e)) timeout = 0;
+    raster_rc = raster_poll_set(e); if (raster_rc) return raster_rc;
     if (gpu_pending(e)) {
         work_msg msg = {.kind = GL_POLL_MESSAGE};
         render_event ev = {RENDER_EVENT_WORK, e->backend->active_frame, 0, &msg};
@@ -192,7 +227,12 @@ static int submit(editor *e)
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
+    if (e->caret_only && !count) {
+        e->dirty = false; /* Visibility changed outside the viewport: no pixels to submit. */
+        return 0;
+    }
     trace_record(TRACE_T3_RENDER_DONE, e->grid.frame_id);
+    raster_set_caret_only(e->backend, e->caret_only);
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
@@ -239,7 +279,7 @@ static int nonkey(editor *e, const plat_event *ev)
         keys_reset(&e->keys); tabs_mru_release(&e->tabs);
         e->drag_tab = SIZE_MAX; e->map_drag = false;
         editor_restart_blink(e, trace_now_ns());
-        return editor_refresh_cursor(e, e->v.state.selection.cursor);
+        return refresh_caret(e);
     }
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
     if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) return editor_pointer(e, ev);
@@ -250,6 +290,16 @@ void editor_restart_blink(editor *e, uint64_t now)
     e->last_input = now; e->visible = true; e->blinking = e->focused;
     e->next_blink = e->focused ? now + EDITOR_BLINK_NS : 0;
 }
+static int refresh_caret(editor *e)
+{
+    /* Retain decorations and minimize composition only if this turn started
+     * from a fully prepared grid. Concurrent input/layout takes the full path. */
+    bool caret = !e->dirty && e->paint_ready && !layout_busy(&e->lay) &&
+                 !view_busy(&e->v) && !e->queue_count && !e->resize_pending;
+    int rc = refresh_cursor(e, e->v.state.selection.cursor, caret);
+    if (caret && !rc && !e->grid.full_frame && !e->full_pending) { e->caret_only = true; e->paint_ready = true; }
+    return rc;
+}
 static int blink(editor *e, uint64_t now)
 {
     if (!e->blinking || now < e->next_blink) return 0;
@@ -258,8 +308,9 @@ static int blink(editor *e, uint64_t now)
         if (e->visible) return 0;
         e->visible = true;
     } else { e->visible = !e->visible; e->stats.blinks++; e->next_blink = now + EDITOR_BLINK_NS; }
-    return editor_refresh_cursor(e, e->v.state.selection.cursor);
+    return refresh_caret(e);
 }
+
 static bool runnable(const editor *e)
 {
     bool can_drain = !e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES);
@@ -317,6 +368,7 @@ int editor_step(editor *e, int timeout_ms)
     if (rc) return fail(e, rc);
     editor_large_index_progress(e);
     uint64_t start = trace_now_ns();
+    if (e->queue_count) e->caret_only = false;
     rc = blink(e, start);
     if (!rc) rc = resize(e);
     record_slice(e, start); if (rc) return rc;

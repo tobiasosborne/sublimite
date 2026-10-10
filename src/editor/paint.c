@@ -83,6 +83,20 @@ static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_
 }
 int editor_compose(editor *e)
 {
+    if (e->caret_only) {
+        uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
+        for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+            if (!(e->text_grid.dirty[r / 64] & (UINT64_C(1) << (r % 64)))) continue;
+            render_cell *dst = e->grid.cells + (size_t)(r + e->tab_rows) * full;
+            const render_cell *src = e->text_grid.cells + (size_t)r * tc;
+            if (memcmp(dst, src, (size_t)tc * sizeof *dst)) {
+                memcpy(dst, src, (size_t)tc * sizeof *dst);
+                int rc = render_mark_rows(&e->grid, r + e->tab_rows, 1);
+                if (rc) return rc;
+            }
+        }
+        return 0;
+    }
     minimap_input input = editor_map_input(e->buffer);
     minimap_style colors = {0x171b22, 0x8091a8, 0x687d98, 0xbf853d};
     uint64_t first = e->v.state.first_line, visible = 0;

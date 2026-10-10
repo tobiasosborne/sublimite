@@ -1,4 +1,5 @@
 #include "editor/private.h"
+#include "raster/raster.h"
 #include "trace/trace.h"
 #include <errno.h>
 #include <poll.h>
@@ -352,6 +353,8 @@ int editor_poll_sources(editor *e)
     struct epoll_event events[2];
     if (epoll_wait(e->poll_fd, events, 2, 0) < 0 && errno != EINTR) return EDITOR_ERR_IO;
     (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+    int raster_rc = raster_poll_completions(e->backend);
+    if (raster_rc) return raster_rc;
     editor_retire_buffers(e);
     /* Opening can allocate. Finish queued input and submit its containing
      * frame before admitting setup work, even if the view itself is idle. */

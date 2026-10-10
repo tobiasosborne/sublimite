@@ -19,6 +19,7 @@
 #include <xcb/sync.h>
 #include <xcb/xcb.h>
 #include <xcb/xcbext.h>
+#include <xcb/xfixes.h>
 
 enum { MSG_STRIPS = 1, MSG_FENCE = 2, MSG_PRESENT = 3, MSG_FAIL = 4 };
 typedef struct msg_payload { uint64_t ns, ust, msc; int32_t status; } msg_payload;
@@ -61,6 +62,10 @@ typedef struct cpu_state {
     size_t nstrips;
     uint32_t total_rows, frame_id;
     bool have_frame;
+    bool snapshot_valid, inline_frame, caret_hint;
+    uint32_t inline_at[2], inline_count;
+    bool inline_fence, inline_present, inline_idle;
+    uint64_t inline_t6;
     /* jobs */
     strip_job jobs[RASTER_JOBS];
     work_handle handles[RASTER_JOBS + 1u];
@@ -281,6 +286,12 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     free(sv);
     const xcb_query_extension_reply_t *pe = xcb_get_extension_data(st->conn, &xcb_present_id);
     if (pe == NULL || !pe->present) goto fail;
+    xcb_xfixes_query_version_reply_t *xv = xcb_xfixes_query_version_reply(st->conn,
+        xcb_xfixes_query_version(st->conn, 2, 0), NULL);
+    if (!xv) goto fail;
+    bool regions_ok = xv->major_version >= 2;
+    free(xv);
+    if (!regions_ok) goto fail;
     xcb_present_query_version_reply_t *pv = xcb_present_query_version_reply(
         st->conn, xcb_present_query_version(st->conn, 1, 0), NULL);
     if (pv == NULL) goto fail;
@@ -346,6 +357,7 @@ static int cpu_resize(render_backend *b, render_dims dims)
     cpu_state *st = b->state;
     if (!st->up) return RENDER_ERR_STATE;
     st->scene.dims = dims;
+    st->snapshot_valid = false;
     return RENDER_OK;
 }
 
@@ -363,6 +375,54 @@ static void cpu_join_jobs(cpu_state *st)
     st->nhandles = 0;
 }
 
+/* Only a retained cursor colour/attribute change may use cell comparison.
+ * Cap inline work at two 4096-pixel cells; larger cells keep worker slicing.
+ * General damage still rasterizes every marked cell (atlas pixel changes can
+ * be in place). Validated wide pairs remain a bounded two-cell scene. */
+static bool inline_cursor_damage(cpu_state *st, const render_grid *g,
+                                 const render_strip *strips, size_t count)
+{
+    st->inline_count = 0;
+    if (!st->caret_hint || !st->snapshot_valid ||
+        (uint64_t)g->dims.cell_w * g->dims.cell_h > 4096u || count != 1 || strips[0].row_count != 1 ||
+        memcmp(&st->scene.dims, &g->dims, sizeof g->dims) ||
+        st->scene.glyph_count != g->glyph_count || st->scene.page_count != g->page_count ||
+        (g->glyph_count && memcmp(st->glyphs, g->glyphs, g->glyph_count * sizeof *g->glyphs)) ||
+        (g->page_count && memcmp(st->pages, g->pages, g->page_count * sizeof *g->pages))) return false;
+    uint32_t start = strips[0].first_row * g->dims.cols;
+    for (uint32_t col = 0; col < g->dims.cols; col++) {
+        const render_cell *a = &st->cells[start + col], *z = &g->cells[start + col];
+        if (!memcmp(a, z, sizeof *a)) continue;
+        if ((uint64_t)col * g->dims.cell_w > INT16_MAX || st->inline_count == 2 || !((a->attrs | z->attrs) & RENDER_ATTR_CURSOR) ||
+            ((a->attrs ^ z->attrs) & (uint16_t)~(RENDER_ATTR_CURSOR | RENDER_ATTR_SELECTION)) ||
+            a->glyph_index != z->glyph_index || a->atlas_slot != z->atlas_slot ||
+            a->reserved != z->reserved) return false;
+        st->inline_at[st->inline_count++] = start + col;
+    }
+    return st->inline_count != 0;
+}
+static void upload_cursor_cells(cpu_state *st)
+{
+    const render_dims d = st->scene.dims;
+    for (uint32_t i = 0; i < st->inline_count; i++) {
+        uint32_t at = st->inline_at[i], row = at / d.cols, col = at % d.cols;
+        uint32_t x = col * d.cell_w, y = row * d.cell_h;
+        if (st->cells[at].attrs & RENDER_ATTR_WIDE_RIGHT) continue;
+        /* A bounded cell scene keeps the existing pixel-exact kernel and avoids
+         * drawing neighbouring cells beyond a validated wide pair. */
+        raster_scene cell = st->scene;
+        cell.dims.cols = (st->cells[at].attrs & RENDER_ATTR_WIDE_LEFT) ? 2u : 1u;
+        cell.dims.rows = 1;
+        cell.cells = st->cells + at;
+        raster_row_sse2(&cell, st->pix + (size_t)y * st->stride_px + x, st->stride_px, 0);
+        xcb_shm_put_image(st->conn, st->pixmap, st->gc,
+            (uint16_t)st->max_w, (uint16_t)st->max_h, (uint16_t)x, (uint16_t)y,
+            (uint16_t)(cell.dims.cols * d.cell_w), (uint16_t)d.cell_h, (int16_t)x, (int16_t)y,
+            st->depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, st->seg, 0);
+    }
+    xcb_flush(st->conn);
+}
+
 static int cpu_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
 {
     cpu_state *st = b->state;
@@ -371,6 +431,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT) return RENDER_ERR_CAPACITY;
     cpu_join_jobs(st); /* the previous frame's fence job may still be queued or polling */
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
+    st->inline_frame = inline_cursor_damage(st, g, strips, count);
     uint32_t cols = g->dims.cols, total = 0;
     for (size_t i = 0; i < count; i++) {
         memcpy(&st->cells[(size_t)strips[i].first_row * cols], &g->cells[(size_t)strips[i].first_row * cols],
@@ -383,13 +444,23 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     st->scene.dims = g->dims;
     st->scene.glyph_count = g->glyph_count; st->scene.page_count = g->page_count;
     st->nstrips = count; st->total_rows = total; st->frame_id = g->frame_id;
-    uint32_t njobs = total < RASTER_JOBS ? total : RASTER_JOBS;
+    uint32_t njobs = st->inline_frame ? 0 : (total < RASTER_JOBS ? total : RASTER_JOBS);
     st->metrics.jobs = njobs;
     if (!njobs) st->metrics.ready_ns = trace_now_ns();
     memset(st->strip_done, 0, sizeof st->strip_done);
     st->fence_done = false; st->present_done = false; st->present_issued = false;
     st->fence_handle = (work_handle){0};
     st->pending = njobs;
+    if (st->inline_frame) {
+        st->inline_fence = st->inline_present = st->inline_idle = false;
+        uint64_t start = trace_now_ns();
+        upload_cursor_cells(st);
+        st->metrics.inline_cells = st->inline_count;
+        st->metrics.upload_issue_ns[0] = trace_now_ns() - start;
+        st->metrics.upload_queued_ns = st->metrics.ready_ns = trace_now_ns();
+        st->have_frame = true;
+        return RENDER_OK;
+    }
     work_job batch[RASTER_JOBS];
     for (uint32_t j = 0; j < njobs; j++) {
         st->jobs[j].st = st; st->jobs[j].index = j; st->jobs[j].njobs = njobs;
@@ -401,6 +472,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     }
     st->nhandles = njobs;
     st->have_frame = true;
+    st->snapshot_valid = true;
     return RENDER_OK;
 }
 
@@ -416,14 +488,34 @@ static int cpu_present(render_backend *b, uint32_t frame_id)
         xcb_sync_await_fence(st->conn, 1, &st->device_fence);
         xcb_sync_query_fence_cookie_t ck = xcb_sync_query_fence(st->conn, st->device_fence);
         st->metrics.fence_sequence = ck.sequence;
+        xcb_xfixes_region_t update = 0;
+        if (st->inline_frame) {
+            xcb_rectangle_t rects[2];
+            for (uint32_t i = 0; i < st->inline_count; i++) {
+                uint32_t at = st->inline_at[i];
+                rects[i] = (xcb_rectangle_t){
+                    (int16_t)((at % st->scene.dims.cols) * st->scene.dims.cell_w),
+                    (int16_t)((at / st->scene.dims.cols) * st->scene.dims.cell_h),
+                    (uint16_t)st->scene.dims.cell_w, (uint16_t)st->scene.dims.cell_h};
+            }
+            update = xcb_generate_id(st->conn);
+            xcb_xfixes_create_region(st->conn, update, st->inline_count, rects);
+        }
         /* Query the uploaded drawable before the scheduled window copy. */
-        st->metrics.present_sequence = xcb_present_pixmap(st->conn, st->win, st->pixmap, frame_id, 0, 0, 0, 0, 0,
+        st->metrics.present_sequence = xcb_present_pixmap(st->conn, st->win, st->pixmap, frame_id, 0, update, 0, 0, 0,
             st->device_fence, 0, XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL).sequence;
+        /* Present snapshots the update region before this ordered destroy. */
+        if (update) xcb_xfixes_destroy_region(st->conn, update);
         xcb_flush(st->conn);
         st->metrics.issue_ns = trace_now_ns() - st->metrics.present_ns;
         st->fence = (fence_job){st->conn, st->special, st->pixmap, frame_id, ck.sequence};
         st->present_issued = true;
     }
+    if (st->inline_frame) {
+        st->have_frame = false;
+        return RENDER_OK;
+    }
+    st->metrics.completion_jobs = 1;
     work_job fj = {fence_job_fn, &st->fence, frame_id, WORK_RASTER};
     work_handle h = work_submit(st->pool, fj);
     if (h.epoch == 0) return RENDER_ERR_BUSY;
@@ -502,6 +594,68 @@ int render_cpu_backend(render_backend *b)
                  RENDER_CAP_DEVICE_TIMING | RENDER_CAP_PRESENT_TIMING | RENDER_CAP_RASTER_POOL},
         .ops = {cpu_init, cpu_resize, cpu_submit, cpu_present, cpu_event, cpu_shutdown}
     };
+    return RENDER_OK;
+}
+
+void raster_set_caret_only(render_backend *b, bool enabled)
+{
+    if (b && b->initialized && b->state && b->ops.init == cpu_init)
+        ((cpu_state *)b->state)->caret_hint = enabled;
+}
+
+int raster_completion_fd(const render_backend *b)
+{
+    if (!b || !b->initialized || !b->state || b->ops.init != cpu_init) return -1;
+    const cpu_state *st = b->state;
+    /* The legacy full-frame fence worker owns its own connection reads. */
+    return st->inline_frame && b->active && b->presented ? xcb_get_file_descriptor(st->conn) : -1;
+}
+int raster_poll_completions(render_backend *b)
+{
+    if (raster_completion_fd(b) < 0) return RENDER_OK;
+    cpu_state *st = b->state;
+    bool progressed;
+    do {
+        progressed = false;
+        if (!st->inline_fence) {
+            void *reply = NULL; xcb_generic_error_t *err = NULL;
+            if (xcb_poll_for_reply(st->conn, st->metrics.fence_sequence, &reply, &err)) {
+                bool ok = !err && reply && ((xcb_sync_query_fence_reply_t *)reply)->triggered;
+                free(reply); free(err);
+                if (!ok) return RENDER_ERR_DEVICE;
+                st->inline_fence = true; progressed = true;
+                st->metrics.server_ns = trace_now_ns();
+                int rc = render_backend_signal(b, RENDER_EVENT_DEVICE_DONE, st->frame_id, st->metrics.server_ns);
+                if (rc) return rc;
+            }
+        }
+        xcb_generic_event_t *ev;
+        while ((ev = xcb_poll_for_special_event(st->conn, st->special)) != NULL) {
+            progressed = true;
+            const xcb_present_generic_event_t *ge = (const xcb_present_generic_event_t *)ev;
+            if (ge->evtype == XCB_PRESENT_COMPLETE_NOTIFY) {
+                const xcb_present_complete_notify_event_t *pe = (const xcb_present_complete_notify_event_t *)ev;
+                if (pe->serial == st->frame_id && pe->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
+                    st->inline_present = true; st->inline_t6 = trace_now_ns();
+                    st->last_ust = pe->ust; st->last_msc = pe->msc;
+                    st->metrics.present_kind = pe->kind; st->metrics.present_mode = pe->mode;
+                }
+            } else if (ge->evtype == XCB_PRESENT_IDLE_NOTIFY) {
+                const xcb_present_idle_notify_event_t *ie = (const xcb_present_idle_notify_event_t *)ev;
+                if (ie->serial == st->frame_id && ie->pixmap == st->pixmap) st->inline_idle = true;
+            }
+            free(ev);
+        }
+        while ((ev = xcb_poll_for_event(st->conn)) != NULL) {
+            bool error = ev->response_type == 0; free(ev); progressed = true;
+            if (error) return RENDER_ERR_DEVICE;
+        }
+    } while (progressed);
+    if (xcb_connection_has_error(st->conn)) return RENDER_ERR_DEVICE;
+    if (st->inline_fence && st->inline_present && st->inline_idle) {
+        st->present_done = true;
+        return render_backend_signal(b, RENDER_EVENT_PRESENT_COMPLETE, st->frame_id, st->inline_t6);
+    }
     return RENDER_OK;
 }
 

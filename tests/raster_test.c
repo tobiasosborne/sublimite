@@ -274,7 +274,7 @@ int render_test_pump(render_backend *b)
     struct pollfd p = {work_pool_eventfd(&g_pool), POLLIN, 0};
     (void)poll(&p, 1, 1);
     (void)work_mailbox_drain(&g_pool, pump_cb, b);
-    return RENDER_OK;
+    return raster_poll_completions(b);
 }
 void render_test_cleanup(void) { }
 
@@ -385,6 +385,29 @@ static int live_pixel_test(void)
         T(cells[8].fg != initial_fg);
         T(compare_window(&cfg, cells, &glyph, &page) == 0);
     }
+    /* Caret-only submit: compare every window pixel with the full scalar
+     * reference, including preserved cells outside the uploaded rectangle. */
+    for (uint32_t id = 12; id < 16; id++) {
+        deadline = trace_now_ns() + UINT64_C(3000000000);
+        T(render_frame_begin(&g, id) == RENDER_OK);
+        cells[9].attrs ^= RENDER_ATTR_CURSOR;
+        cells[9].fg = (cells[9].fg ^ 0x808080u) & 0xffffffu;
+        cells[9].bg = (cells[9].bg ^ 0x303030u) & 0xffffffu;
+        T(render_mark_rows(&g, 2, 1) == RENDER_OK);
+        render_strip one = {2, 1};
+        raster_set_caret_only(&b, true);
+        edit_malloc_guard_begin();
+        T(render_backend_submit(&b, &g, &one, 1) == RENDER_OK);
+        size_t allocs = edit_malloc_guard_end();
+        if (edit_malloc_guard_active()) T(allocs == 0);
+        T(render_backend_present(&b, id) == RENDER_OK);
+        T(raster_frame_metrics(&b, &metrics));
+        T(metrics.jobs == 0 && metrics.completion_jobs == 0 && metrics.inline_cells == 1);
+        while (b.active) { T(render_test_pump(&b) == RENDER_OK); T(trace_now_ns() < deadline); }
+        T(compare_window(&cfg, cells, &glyph, &page) == 0);
+    }
+    raster_set_caret_only(&b, false);
+    puts("raster pixels: PASS inline caret, full-window scalar comparison and zero worker jobs");
     printf("raster pixels: PASS full + 10 individual partial comparisons (disconnected/boundaries/unchanged rows)\n");
     render_backend_shutdown(&b);
     free(state);
@@ -585,7 +608,7 @@ static xcb_void_cookie_t review_put(xcb_connection_t *c, xcb_drawable_t d,
     review_uploads++;
     return (xcb_void_cookie_t){1};
 }
-static int review_fd(xcb_connection_t *c) { return review_fake ? -1 : xcb_get_file_descriptor(c); }
+static int review_fd(xcb_connection_t *c) { return review_fake ? 42 : xcb_get_file_descriptor(c); }
 static int review_error(xcb_connection_t *c) { return review_fake ? 0 : xcb_connection_has_error(c); }
 static int review_reply(xcb_connection_t *c, unsigned seq, void **reply, xcb_generic_error_t **err)
 {
@@ -641,6 +664,9 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #define render_cpu_backend raster_review_backend
 #define raster_last_present raster_review_last_present
 #define raster_frame_metrics raster_review_frame_metrics
+#define raster_completion_fd raster_review_completion_fd
+#define raster_poll_completions raster_review_poll_completions
+#define raster_set_caret_only raster_review_set_caret_only
 #define work_submit review_submit
 #define work_submit_batch review_submit_batch
 #define work_publish review_publish
@@ -663,6 +689,9 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #undef render_cpu_backend
 #undef raster_last_present
 #undef raster_frame_metrics
+#undef raster_completion_fd
+#undef raster_poll_completions
+#undef raster_set_caret_only
 #undef work_submit
 #undef work_submit_batch
 #undef work_publish
@@ -1053,6 +1082,38 @@ static int review_timestamp(void)
     T(t5.ns==300 && t6.ns==200 && t6.ust==55 && t6.msc==66);
     return 0;
 }
+/* The UI path keeps real T5/T6 identity and pixmap reuse requirements while
+ * accepting either transport order. A late Present is not a polling deadline. */
+static int review_inline_completion(void)
+{
+    for (unsigned fence_first = 0; fence_first < 2; fence_first++) {
+        review_reset_fixture();
+        cpu_state st = {.up = true, .inline_frame = true, .present_issued = true,
+            .frame_id = 7, .pixmap = 42, .metrics = {.frame_id = 7, .fence_sequence = 4}};
+        render_backend b = review_backend(&st);
+        delivery seen = {0}; b.config.hooks.user = &seen;
+        b.presented = true; b.submitted_ns = 100;
+        T(raster_review_completion_fd(&b) == 42);
+        if (fence_first) {
+            review_observation = 3; /* fence readable, Present remains delayed */
+            T(raster_review_poll_completions(&b) == RENDER_OK);
+            T(b.active && b.device_seen && !b.complete_seen);
+            T(seen.t5_count == 1 && seen.t6_count == 0);
+            review_clock = UINT64_C(9000000000); /* beyond legacy fence deadline */
+            T(raster_review_poll_completions(&b) == RENDER_OK && b.active);
+            review_observation = 0;
+        }
+        T(raster_review_poll_completions(&b) == RENDER_OK);
+        T(!b.active && b.t5_sent && b.t6_sent);
+        T(seen.t5_count == 1 && seen.t6_count == 1 && seen.t5_id == 7 && seen.t6_id == 7);
+        T(seen.t5_ns == 300 && seen.t6_ns == 200);
+        T(review_submit_calls == 0 && st.nhandles == 0);
+        T(raster_review_poll_completions(&b) == RENDER_OK);
+        T(seen.t5_count == 1 && seen.t6_count == 1);
+    }
+    puts("G11 UI completion: both event orders, delayed Present, no worker jobs or timer passed");
+    return 0;
+}
 /* Optional TRACK self-check for the descriptor cap on the Target-A viewport.
  * Only validation/snapshot/enqueue is timed: the fake scheduler retains jobs
  * without running them, then discards the synthetic frame between samples.
@@ -1121,7 +1182,7 @@ static int review_cases(const char *which)
     const struct {const char *id; int (*fn)(void);} cases[]={
         {"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
         {"5",review_delivery},{"6",review_glyph_budget},{"7",review_cancellation},
-        {"8",review_handoff},{"15",review_origin},{"17",review_timestamp}};
+        {"8",review_handoff},{"15",review_origin},{"17",review_timestamp},{"G11",review_inline_completion}};
     for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
         if (strcmp(which,"all") && strcmp(which,cases[i].id)) continue;
         int rc=cases[i].fn();

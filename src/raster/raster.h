@@ -9,6 +9,15 @@
  * with a window) and config.workers (pool with >= 1 WORK_RASTER worker). */
 int render_cpu_backend(render_backend *b);
 
+/* Private completion connection. UI integrates this fd with its existing poll
+ * set and drains it on readiness or before preparing another frame. No timers,
+ * allocation, worker submission or blocking waits in these calls. */
+/* Hint only for a frame whose sole change is caret visibility. Caller must
+ * preserve atlas pixels and all other paint. General submissions default off. */
+void raster_set_caret_only(render_backend *b, bool enabled);
+int raster_completion_fd(const render_backend *b);
+int raster_poll_completions(render_backend *b);
+
 /* UST (us) and MSC of the latest matching-frame Present completion (UI only,
  * valid after that frame's PRESENT_COMPLETE event was routed). */
 bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
@@ -22,6 +31,7 @@ bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
  * Times are CLOCK_MONOTONIC ns, durations are explicit; no allocation. */
 typedef struct raster_metrics {
     uint32_t frame_id, jobs, present_kind, present_mode;
+    uint32_t inline_cells, completion_jobs;
     uint32_t fence_sequence, present_sequence;
     uint64_t submit_ns, ready_ns, present_ns, issue_ns, server_ns;
     uint64_t strip_ns[RASTER_JOBS], queue_ns[RASTER_JOBS];

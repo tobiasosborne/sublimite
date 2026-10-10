@@ -139,6 +139,63 @@ static int allocation_test(bool raster)
         edit_malloc_guard_active() ? "active" : "ASan-inert");
     return 0;
 }
+/* G11: one blink must leave the strip/fence pool asleep. Force its deadline
+ * rather than wait for a noisy wall-clock interval. */
+static int raster_blink_damage(void)
+{
+    for (unsigned mode = 0; mode < 4; mode++) {
+        render_backend b = {0}; T(render_cpu_backend(&b) == 0);
+        uint8_t wrapped[320]; memset(wrapped, 'a', sizeof wrapped);
+        const uint8_t *text = mode == 1 ? (const uint8_t *)"abc \nxyz" :
+            mode == 2 ? (const uint8_t *)"a\xe4\xb8\xad" : mode == 3 ? wrapped : NULL;
+        size_t len = mode == 1 ? 8u : mode == 2 ? 4u : mode == 3 ? sizeof wrapped : 0u;
+        editor_config cfg = {.cols = 160, .rows = 60, .initial = text, .initial_len = len,
+            .wrap_mode = mode == 3 ? 1 : -1}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+        if (mode) { T(editor_set_cursor(e, mode == 3 ? 200u : 1u) == 0); T(settle(e) == 0); }
+        if (mode == 1) T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+        uint64_t fills = e->stats.minimap_fills;
+        for (unsigned toggle = 0; toggle < 2; toggle++) {
+            uint32_t epochs[WORK_MAX_JOBS];
+            for (uint32_t slot = 0; slot < WORK_MAX_JOBS; slot++)
+                epochs[slot] = atomic_load_explicit(&e->pool.slots[slot].epoch, memory_order_acquire);
+            render_cell before[160 * 60]; memcpy(before, e->grid.cells, sizeof before);
+            e->next_blink = trace_now_ns();
+            T(editor_step(e, 0) >= 0);
+            raster_metrics m; T(raster_frame_metrics(&b, &m));
+            size_t changed = 0;
+            for (size_t i = 0; i < 160u * 60u; i++)
+                if (memcmp(&before[i], &e->grid.cells[i], sizeof before[i])) changed++;
+            printf("G11 blink: mode=%u jobs=%u cells=%zu minimap_fills=%llu\n", mode, m.jobs, changed,
+                (unsigned long long)(e->stats.minimap_fills - fills));
+            T(m.jobs == 0);
+            T(changed > 0 && changed <= 2 && m.inline_cells == changed && m.completion_jobs == 0);
+            for (uint32_t slot = 0; slot < WORK_MAX_JOBS; slot++) {
+                const work_slot *job = &e->pool.slots[slot];
+                uint32_t epoch = atomic_load_explicit(&job->epoch, memory_order_acquire);
+                /* The first caret submit retires the preceding full-frame
+                 * leases. Cancellation bumps an epoch and leaves cancel_ns;
+                 * a new submission clears cancel_ns and must still fail. */
+                T(epoch == epochs[slot] || (toggle == 0 && epoch == epochs[slot] + 1u &&
+                    atomic_load_explicit(&job->cancel_ns, memory_order_acquire) != 0 &&
+                    work_handle_finished(&e->pool, (work_handle){slot, epochs[slot]}) &&
+                    !atomic_load_explicit(&job->busy, memory_order_acquire)));
+            }
+            T(e->stats.minimap_fills == fills);
+            e->caret_only = false; /* Explicit test drain, rather than deferred idle observation. */
+            T(settle(e) == 0);
+        }
+        plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+        T(editor_inject(e, &focus) == 0); T(editor_step(e, 0) >= 0);
+        raster_metrics m; T(raster_frame_metrics(&b, &m));
+        T(m.jobs == 0 && m.completion_jobs == 0);
+        T(!editor_get_stats(e).blinking && !editor_get_stats(e).pending);
+        e->caret_only = false; T(settle(e) == 0);
+        editor_close(e);
+    }
+    puts("editor_test: G11 inline caret damage and sleeping worker pool passed");
+    return 0;
+}
 static int idle_policy(void)
 {
     render_backend b = {0}; T(render_null_backend(&b) == 0);
@@ -1004,6 +1061,7 @@ int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
+        if (!strcmp(argv[1], "--raster-blink")) return raster_blink_damage();
         if (!strcmp(argv[1], "--selection")) return backend_selection();
         if (!strcmp(argv[1], "--fallback")) return backend_fallback();
         if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
@@ -1024,6 +1082,7 @@ int main(int argc, char **argv)
     T(stopped_error() == 0);
     T(script(false) == 0); T(allocation_test(false) == 0);
     T(script(true) == 0); T(allocation_test(true) == 0);
+    T(raster_blink_damage() == 0);
     T(idle_policy() == 0);
     T(queue_depth() == 0);
     T(native_input() == 0);
