@@ -1,4 +1,5 @@
 #include "editor/private.h"
+#include "editor/theme.h"
 #include "trace/trace.h"
 #include <string.h>
 
@@ -68,6 +69,13 @@ int editor_paint_prepare(editor *e)
     rc = indent_trailing_ws_ranges(e->tree, lo, hi, e->ws_ranges, e->max_rows, &count);
     if (rc != INDENT_OK && rc != INDENT_ERR_CAPACITY) return EDITOR_ERR_ARG;
     e->ws_count = count < e->max_rows ? count : e->max_rows;
+    /* The existing decoration relayout writes the gutter too: choose its
+     * theme colour once, with no extra row pass or allocation. Publication
+     * already requests full layout before this frame reaches submit. */
+    bool estimated = !e->buffer->lg.lines_exact || e->buffer->lg.top_estimated;
+    e->lay.cfg.gutter_fg = estimated
+        ? editor_theme_estimated_gutter(e->layout_cfg.gutter_fg, e->layout_cfg.gutter_bg)
+        : e->layout_cfg.gutter_fg;
     e->paint_ready = true;
     layout_set_paint(&e->lay, paint, e);
     int lr = layout_relayout_rows(&e->lay, 0, e->text_grid.dims.rows);

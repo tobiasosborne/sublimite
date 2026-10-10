@@ -1,7 +1,8 @@
 /* edit-457.10 / P4.10: large-file behavioural contract through the editor loop.
  * A ~1.6 MB generated fixture is forced into mmap mode (copy_threshold 4 KiB),
  * so the estimate -> exact swap, find, save and background-worker paths run in
- * `make check`. The 1 GiB / 10 GiB rows live in bench/editor_large_bench.c. */
+ * `make check`. edit-9yd also reads the 1 GiB log corpus for gutter publication;
+ * the large-file timing rows live in bench/editor_large_bench.c. */
 #include "editor/editor.h"
 #include "editor/large.h"
 #include "editor/private.h"
@@ -23,9 +24,46 @@
 #define TOTAL_LINES (A_LINES + B_LINES + 1u)
 #define LOOSE_STEP_NS UINT64_C(250000000)   /* loose assert, loaded box */
 
-typedef struct hooks { bool active, suspended; size_t allocations, frames; } hooks;
+typedef struct hooks {
+    bool active, suspended;
+    size_t allocations, frames;
+    editor *observe;
+    uint32_t estimated_fg, first_exact_frame;
+    size_t estimated_frames, exact_frames;
+    bool gutter_error;
+} hooks;
 static void ingress(void *c, uint64_t s, uint64_t n) { hooks *h = c; (void)s; (void)n; if (!h->active) { edit_malloc_guard_begin(); h->active = true; } }
-static void submitted(void *c, const editor_frame *f) { hooks *h = c; (void)f; if (h->active) { h->allocations += edit_malloc_guard_end(); h->active = false; } h->frames++; }
+static void submitted(void *c, const editor_frame *f)
+{
+    hooks *h = c;
+    if (h->active) { h->allocations += edit_malloc_guard_end(); h->active = false; }
+    h->frames++;
+    if (!h->observe) return;
+    editor *e = h->observe;
+    editor_large_status s = editor_large_status_get(e);
+    bool estimated = !s.lines_exact || s.top_estimated;
+    if (editor_index_complete(e) && estimated) h->gutter_error = true;
+    uint32_t fg = estimated ? h->estimated_fg : e->layout_cfg.gutter_fg;
+    const render_grid *g = editor_grid(e);
+    uint32_t gw = layout_gutter_width(&e->lay);
+    size_t digits = 0;
+    /* Inspect the cell dump at submit, including the first exact frame. */
+    for (uint32_t r = e->tab_rows; r < g->dims.rows; r++) {
+        for (uint32_t col = 0; col < gw; col++) {
+            const render_cell *cell = &g->cells[(size_t)r * g->dims.cols + col];
+            if (cell->glyph_index < '0' || cell->glyph_index > '9') continue;
+            digits++;
+            if (cell->fg != fg || cell->bg != e->layout_cfg.gutter_bg || cell->attrs)
+                h->gutter_error = true;
+        }
+    }
+    if (!digits) h->gutter_error = true;
+    if (estimated) h->estimated_frames++;
+    else {
+        if (!h->exact_frames) h->first_exact_frame = f->id;
+        h->exact_frames++;
+    }
+}
 static void io_boundary(void *c, bool entering)
 {
     hooks *h = c;
@@ -58,6 +96,100 @@ static bool settled(editor *e) { editor_stats s = editor_get_stats(e); return !s
 static bool find_done(editor *e) { return editor_large_status_get(e).find_done; }
 static bool save_done(editor *e) { return editor_large_status_get(e).save_done; }
 static bool all_done(editor *e) { editor_large_status s = editor_large_status_get(e); return s.lines_exact && s.find_done && s.warm_done; }
+
+/* Hold the bulk lane so the unindexed frame cannot race a fast index build. */
+static void hold_index(work_ctx *c)
+{
+    _Atomic bool *release = c->arg;
+    while (!atomic_load(release) && !work_should_stop(c))
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+}
+static size_t gutter_snapshot_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    piece_iter it; size_t n = 0; piece_iter_begin_snapshot(&it, ctx, off);
+    return piece_iter_next(&it, p, &n) ? n : 0;
+}
+static void gutter_snapshot_release(void *ctx) { piece_snapshot_release(ctx); }
+static int gutter_estimates(void)
+{
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    hooks h = {.estimated_fg = 0x4c525d};
+    editor_config cfg = {.cols = 60, .rows = 8, .wrap_mode = -1,
+        .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    uint64_t id = 0;
+    T(editor_add_buffer(e, "/tmp/edit-corpus/log_1g.txt", NULL, 0, &id) == 0);
+    T(editor_length(e) == UINT64_C(1073741824));
+    T(editor_large_status_get(e).mapped); T(!editor_large_status_get(e).lines_exact);
+    /* Open needs the bulk lane for mapping. Restart its index behind the hold
+     * after acquisition, before any large-file frame can be submitted. */
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK});
+    T(held.epoch);
+    lineidx_src src = {snap, editor_length(e), gutter_snapshot_span, gutter_snapshot_release};
+    T(lineidx_build_start(e->buffer->index, &e->pool, &src) == 0);
+    h.observe = e;
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    const render_grid *g = editor_grid(e);
+    uint32_t gw = layout_gutter_width(&e->lay);
+    const render_cell *digit = &g->cells[(size_t)e->tab_rows * g->dims.cols + gw - 2u];
+    T(digit->glyph_index == '1');
+    T(digit->fg != e->layout_cfg.gutter_fg);
+    T(h.estimated_frames == 1); T(!h.gutter_error);
+    /* The dim style follows configured colours rather than a fixed palette. */
+    e->layout_cfg.gutter_fg = 0xe0c080; e->layout_cfg.gutter_bg = 0x204060;
+    e->lay.cfg.gutter_bg = e->layout_cfg.gutter_bg; h.estimated_fg = 0x808070;
+    T(editor_full_layout(e) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(!h.gutter_error);
+    h.allocations = 0;
+    plat_event arrow = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Right};
+    T(editor_inject(e, &arrow) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(h.allocations == 0); T(!h.gutter_error);
+    T(editor_large_goto_byte(e, UINT64_C(536870912)) == 0);
+    T(editor_large_status_get(e).top_estimated);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(!h.gutter_error); T(!h.exact_frames);
+    /* Unfocus suppresses unrelated blink frames on a loaded index run. */
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+    T(editor_inject(e, &focus) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(!h.gutter_error);
+    uint32_t estimated_frame = g->frame_id;
+    atomic_store(&release, true);
+    uint64_t deadline = trace_now_ns() + UINT64_C(20000000000);
+    while (!h.exact_frames) {
+        int rc = editor_step(e, 5); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+        T(trace_now_ns() < deadline);
+    }
+    /* No stale estimated submission may slip between publication and exact. */
+    T(editor_large_status_get(e).lines_exact);
+    T(!editor_large_status_get(e).top_estimated);
+    T(h.first_exact_frame == estimated_frame + 1u); T(!h.gutter_error);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    /* A caret-only frame retains the exact gutter without repainting it. */
+    focus.focused = true;
+    T(editor_inject(e, &focus) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(!h.gutter_error);
+    h.observe = NULL;
+    T(editor_select_tab(e, 0) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    h.allocations = 0;
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_x, .utf8_len = 1, .utf8 = {'x'}};
+    T(editor_inject(e, &key) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(h.allocations == 0);
+    editor_close(e);
+    puts("edit-9yd: unindexed 1 GiB gutter is dim; first publication frame is exact; theme and allocation checks passed");
+    return 0;
+}
 
 /* Completion must survive backpressure in the shared work mailbox. */
 static void fill_mailbox(work_ctx *c)
@@ -106,6 +238,7 @@ static int prepared_completion(editor *e)
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    T(gutter_estimates() == 0);
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
     struct stat st; T(stat(path, &st) == 0); uint64_t size = (uint64_t)st.st_size;
