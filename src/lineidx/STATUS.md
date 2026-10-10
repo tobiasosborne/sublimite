@@ -44,3 +44,14 @@ line-to-byte/byte-to-line queries retain single-chunk source scans; use seek for
 resumable UI queries. `bench/scroll_bench.c` still assumes bulk synchronous seek
 and needs a separate migration. Real renderer/display and cold performance
 verdicts remain unvalidated. No new globals or other-module production fixes.
+
+# edit-4w1.56 — work-service integration
+
+Background and resident-source foreground builds now use bounded continuations.
+Foreground start/prioritize retain the same immutable source/results lease and
+yield on mailbox backpressure. The copied-file editor jump and G7j bench use the
+new work service. Fragmented-span work-bound/source-release tests and the lineidx
+fuzzer pass. Mapping/cold I/O sources stay on bulk; dirty-index maintenance is
+unchanged. Full evidence and limits: `docs/worker-reports/edit-4w1.56-s8.md`.
+
+Rebase integration and current verification: `docs/worker-reports/edit-4w1.56-s8b.md`.

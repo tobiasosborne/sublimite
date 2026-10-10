@@ -1,0 +1,3 @@
+Implemented the foreground lane, bounded indexing, and lease-safe priority. `make all`, `make check` (leaks disabled), fuzz, and TSan pass.
+
+Full foreground acceptance still needs mapped/cold-source and find integration. The [required report](/home/tobias/Projects/sublimite/.wt/edit-4w1.56/docs/worker-reports/edit-4w1.56-s8.md) includes red/green evidence and the unrelated raster teardown fault. No commits made.

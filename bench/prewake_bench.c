@@ -91,7 +91,7 @@ static void *prewake_init_worker(void *ctx)
     f->init_result=gl_context_init(s,&f->config,0);
     if (f->init_result==0) {
         if (!s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) f->init_result=-1;
-        else { s->bound=false; if (!s->eReleaseThread()) f->init_result=-1; }
+        else if (!s->eReleaseThread()) f->init_result=-1;
     }
     return NULL;
 }

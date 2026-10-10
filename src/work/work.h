@@ -26,8 +26,11 @@
 #define WORK_RASTER_RESERVE (WORK_MAX_RASTER + 1u) /* one full worker batch + completion */
 #define WORK_DRAIN_MAX_MESSAGES 64u
 #define WORK_DRAIN_BUDGET_NS 500000ull  /* (G) between-callback UI slice budget */
+#define WORK_FOREGROUND_RESERVE 2u /* active request + undrained completion */
+#define WORK_FOREGROUND_WORKER WORK_MAX_WORKERS /* separate mailbox identity */
+#define WORK_MAX_MAILBOXES (WORK_MAX_WORKERS + 1u)
 
-typedef enum work_class { WORK_BULK = 0, WORK_RASTER = 1 } work_class;
+typedef enum work_class { WORK_BULK = 0, WORK_RASTER = 1, WORK_FOREGROUND = 2 } work_class;
 
 /* 64-byte message. kind/generation/data belong to the app; slot_/epoch_ are
  * filled by work_publish and used to drop messages of cancelled jobs. */
@@ -49,6 +52,7 @@ typedef struct work_ctx {
     uint32_t generation;   /* caller's tag, copied from the job */
     uint32_t worker;       /* mailbox index */
     void    *arg;
+    bool continue_;       /* worker-private: request another invocation */
 } work_ctx;
 
 typedef struct work_job {
@@ -76,6 +80,8 @@ typedef struct work_slot {
     uint32_t receive_epoch, receive_generation;
     uint32_t receive_scan_generation;
     uint32_t receive_pos[WORK_MAX_WORKERS], receive_next;
+    uint32_t receive_foreground_pos; /* UI-only cursor for the optional lane */
+    uint32_t mailbox_worker; /* under pool.mu: last invocation's producer identity */
 } work_slot;
 
 typedef struct work_mailbox {
@@ -106,6 +112,14 @@ typedef struct work_pool {
     _Atomic uint64_t dropped_full;
     bool draining;                     /* UI-only callback reentrancy guard */
     uint32_t drain_next;                /* UI-only round-robin mailbox cursor */
+    /* Optional foreground lane. Existing n_workers/arrays describe only the
+     * bulk/raster workers; its ctx.worker is WORK_FOREGROUND_WORKER. */
+    work_queue foreground_queue;
+    pthread_cond_t foreground_cv;
+    pthread_t foreground_thread;
+    work_ctx foreground_wctx;
+    work_mailbox foreground_mb;
+    bool foreground_enabled, foreground_started;
 } work_pool;
 
 /* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success, -1 on
@@ -113,6 +127,17 @@ typedef struct work_pool {
  * pool safe for shutdown, refused submit/cancel, or another init. Never init
  * an active pool; shutdown first. */
 int  work_pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster);
+/* Same lifecycle/error contract, plus one dedicated foreground worker and
+ * mailbox. WORK_FOREGROUND never waits for a bulk/raster function to return,
+ * even during blocking bulk I/O. Two slots are reserved from other classes;
+ * the existing raster reserve remains independent. Foreground/raster prefer
+ * their own reserves, then share bulk capacity, never each other's reserves.
+ * Foreground jobs must be bounded CPU work/continuations and poll cancellation
+ * at least every 5 ms CPU; blocking I/O/discovery belongs to WORK_BULK. A long
+ * foreground job delays subsequent foreground requests. OS scheduling and
+ * memory-bandwidth contention are not hard wall-time guarantees. No change
+ * to legacy work_pool_init behavior: it refuses WORK_FOREGROUND submissions. */
+int  work_pool_init_foreground(work_pool *p, uint32_t n_bulk, uint32_t n_raster);
 /* Cancels everything, drops queued jobs, joins threads. Running jobs must poll.
  * After return every busy bit and queue count is zero. Arguments always remain
  * caller-owned, including dropped jobs. Undrained messages remain reserved
@@ -125,10 +150,22 @@ int  work_pool_eventfd(const work_pool *p);
  * wrap. Handles belong to one initialized pool lifetime; discard all handles
  * before shutdown/reinitialization and never use them with another pool. */
 work_handle work_submit(work_pool *p, work_job job);
+/* UI-only priority upgrade for an existing BULK/FOREGROUND lease. Requires a
+ * foreground-enabled pool and a bounded, nonblocking continuation job. Queued
+ * work moves immediately; a running invocation keeps its current physical
+ * owner and moves only after it returns with work_continue. No preemption of
+ * blocking I/O: never prioritize an I/O/discovery job. Identity, argument,
+ * result reservations and completion ownership stay unchanged. Before the
+ * first migrated invocation, the UI must drain results from the old worker;
+ * other foreground jobs remain runnable while that delivery is pending.
+ * This preserves per-lease result order across the mailbox handoff. Returns -1
+ * for an inactive pool, stale identity or raster lease; otherwise 0, including
+ * an already finished valid lease. No allocation or additional slot. */
+int work_prioritize(work_pool *p, work_handle h);
 /* UI-only atomic enqueue. Returns 0 on success, -1 on invalid arguments,
  * capacity/identity exhaustion, unavailable class, or inactive pool. count is
  * at most WORK_MAX_JOBS; zero succeeds without accessing jobs/handles/pool.
- * Both classes may appear, preserving input FIFO order within each class.
+ * All available classes may appear, preserving input FIFO order within each class.
  * Failure changes no slots, queues, or output handles and starts no jobs.
  * Success fills handles in input order before any worker can dequeue the batch.
  * No allocation. Arrays must not overlap pool storage or each other. */
@@ -146,6 +183,17 @@ void work_cancel(work_pool *p, work_handle h);
 
 /* Worker side. */
 bool     work_should_stop(const work_ctx *c);   /* poll at least every 5 ms CPU */
+/* Worker-only cooperative continuation. Request, then return promptly from
+ * fn. The same lease/argument/generation goes to the back of its class FIFO;
+ * finished stays false until the final invocation returns. No new slot or
+ * allocation. Return false when cancelled. Arguments remain caller-owned
+ * until work_handle_finished, including cancellation between invocations.
+ * Invocations may change worker (also within the raster class). A new worker
+ * waits for the old worker's result reservations/callbacks to drain before
+ * invoking the continuation, preserving per-lease order. Other jobs still run.
+ * Continuations must not wait for I/O or a full mailbox on the foreground
+ * lane: retain progress and retry in a later invocation instead. */
+bool     work_continue(work_ctx *c);
 uint64_t work_cancel_time_ns(const work_ctx *c);/* when cancelled (0 if not) */
 /* Returns false if dropped (stale job or mailbox full). */
 bool     work_publish(work_ctx *c, const work_msg *m);

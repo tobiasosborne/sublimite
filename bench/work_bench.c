@@ -16,6 +16,7 @@
 #define WAIT_NS 2000000000ull
 #define RUN_NS 60000000000ull
 #define CPU_GATE_NS 5000000ull
+#define FOREGROUND_TRIALS 32u
 
 typedef struct scan_state {
     unsigned char *buf;
@@ -190,6 +191,109 @@ static int retire(work_pool *pool, work_handle handle, uint64_t deadline)
     return 0;
 }
 
+typedef struct foreground_state {
+    int fd;
+    _Atomic uint64_t started, complete;
+} foreground_state;
+
+static void blocked_bulk(work_ctx *ctx)
+{
+    foreground_state *state = ctx->arg;
+    atomic_store(&state->started, 1);
+    unsigned char byte;
+    ssize_t n;
+    do { n = read(state->fd, &byte, 1); } while (n < 0 && errno == EINTR);
+    atomic_store(&state->complete, n == 1 ? 1u : 2u);
+}
+
+static void foreground_job(work_ctx *ctx)
+{
+    work_msg msg = {.generation = ctx->generation};
+    if (!work_publish(ctx, &msg)) (void)work_continue(ctx);
+}
+
+/* Paired queue-delay comparison on the current loaded box. Bulk I/O remains
+ * blocked for both variants; the legacy variant can only reply after release.
+ * The wait cap is a fixture control, not a timing gate verdict. */
+static int run_foreground_bench(void)
+{
+    char power[32];
+    bench_battery_status(power, sizeof power);
+    const char *tag = bench__tag_from_power(power);
+    FILE *load_file = fopen("/proc/loadavg", "r");
+    double load = -1.0;
+    if (load_file) { if (fscanf(load_file, "%lf", &load) != 1) load = -1.0; fclose(load_file); }
+    printf("TRACK foreground paired fixture (M)%s load1=%.2f power=%s; G7j queue reference=30/50 ms (G)\n",
+           tag, load, power);
+    trace_init();
+    for (uint32_t count = 1; count <= 3; count += 2) {
+        uint64_t values[2][FOREGROUND_TRIALS];
+        bench_samples samples[2];
+        unsigned independent[2] = {0};
+        for (unsigned variant = 0; variant < 2; variant++)
+            bench_samples_init(&samples[variant], values[variant], FOREGROUND_TRIALS);
+        for (unsigned trial = 0; trial < FOREGROUND_TRIALS; trial++) {
+            /* Alternate order to avoid assigning warmup/load drift to a lane. */
+            for (unsigned turn = 0; turn < 2; turn++) {
+                unsigned variant = (trial + turn) % 2u;
+                work_pool pool;
+                int pipe_fds[2];
+                if (pipe(pipe_fds) != 0 || work_pool_init_foreground(&pool, 1, 0) != 0) return 2;
+                foreground_state states[3] = {{0}};
+                work_handle bulk[3];
+                for (uint32_t i = 0; i < count; i++) {
+                    states[i].fd = pipe_fds[0];
+                    bulk[i] = work_submit(&pool, (work_job){blocked_bulk, &states[i], 1, WORK_BULK});
+                    if (!valid_handle(bulk[i], "blocked bulk")) return 2;
+                }
+                if (wait_value(&states[0].started, bench_now_ns() + WAIT_NS, "bulk I/O start")) return 2;
+                unsigned received = 0;
+                uint64_t request = bench_now_ns();
+                work_handle h = work_submit(&pool, (work_job){foreground_job, NULL, 2,
+                    variant ? WORK_FOREGROUND : WORK_BULK});
+                if (!valid_handle(h, "foreground request")) return 2;
+                uint64_t deadline = request + (variant ? WAIT_NS : 5000000ull);
+                while (!received && bench_now_ns() < deadline) {
+                    (void)work_mailbox_receive(&pool, h, 2, delivered, &received);
+                    if (!received) nanosleep(&(struct timespec){0, 50000}, NULL);
+                }
+                if (received && !atomic_load(&states[0].complete)) independent[variant]++;
+                unsigned char bytes[3] = {1, 1, 1};
+                if (write(pipe_fds[1], bytes, count) != (ssize_t)count) return 2;
+                deadline = bench_now_ns() + WAIT_NS;
+                while (!received && bench_now_ns() < deadline) {
+                    (void)work_mailbox_receive(&pool, h, 2, delivered, &received);
+                    if (!received) nanosleep(&(struct timespec){0, 50000}, NULL);
+                }
+                if (received != 1) return 2;
+                (void)bench_add(&samples[variant], bench_now_ns() - request);
+                if (retire(&pool, h, deadline)) return 2;
+                for (uint32_t i = 0; i < count; i++) {
+                    if (retire(&pool, bulk[i], deadline) || atomic_load(&states[i].complete) != 1) return 2;
+                }
+                work_pool_shutdown(&pool);
+                close(pipe_fds[0]); close(pipe_fds[1]);
+                if (variant && independent[variant] != trial + 1u) {
+                    fprintf(stderr, "work_bench FAIL: foreground request made no progress while bulk I/O was blocked\n");
+                    return 1;
+                }
+            }
+        }
+        for (unsigned variant = 0; variant < 2; variant++) {
+            char name[80];
+            (void)snprintf(name, sizeof name, "work_foreground_%s_bulk%u_TRACK",
+                           variant ? "lane" : "fifo", count);
+            printf("TRACK (M)%s load1=%.2f independent_before_bulk_release=%u/%u ",
+                   tag, load, independent[variant], FOREGROUND_TRIALS);
+            (void)bench_report(name, &samples[variant], 0, 0);
+        }
+        /* Independence is a progress assertion under a generous watchdog;
+         * the latency percentiles above remain TRACK, not gate verdicts. */
+        if (independent[0] != 0) return 2;
+    }
+    return 0;
+}
+
 static int run_bench(void)
 {
     char power[32];
@@ -269,7 +373,10 @@ static int run_bench(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--foreground") == 0)
+        return supervise(run_foreground_bench, RUN_NS, "foreground paired benchmark");
     if (argc == 2 && strcmp(argv[1], "--self-check-cancel") == 0) return self_check_cancel();
     if (argc == 2 && strcmp(argv[1], "--self-check-deadlines") == 0) return self_check_deadlines();
-    return supervise(run_bench, RUN_NS, "benchmark including cleanup");
+    int rc = supervise(run_bench, RUN_NS, "benchmark including cleanup");
+    return rc | supervise(run_foreground_bench, RUN_NS, "foreground paired benchmark");
 }

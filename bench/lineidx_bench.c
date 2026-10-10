@@ -187,7 +187,7 @@ static size_t counted_span(void *ctx, uint64_t off, const uint8_t **p)
     return count;
 }
 
-/* A fresh, entirely unbuilt index; the request starts the bulk worker. There is
+/* A fresh, entirely unbuilt index; the request starts the interactive worker. There is
  * no worker seek API yet, so this path builds the full index before laying out.
  * This deliberately charges that extra work to the G7j end-to-end interval. */
 static lineidx_result jump_request(lineidx *x, work_pool *p, uint64_t timeout, const lineidx_src *s,
@@ -199,7 +199,7 @@ static lineidx_result jump_request(lineidx *x, work_pool *p, uint64_t timeout, c
     counted_source counted = {.src = s, .bytes = 0};
     lineidx_src worker_src = {&counted, s->len, counted_span, NULL};
     uint64_t deadline = bench_now_ns() + timeout;
-    if (lineidx_build_start(x, p, &worker_src) != 0 || !wait_index(x, p, deadline, true, "G7j"))
+    if (lineidx_build_start_foreground(x, p, &worker_src) != 0 || !wait_index(x, p, deadline, true, "G7j"))
         fail_fast("jump worker submission/completion failed");
     seen->scanned_bytes = atomic_load_explicit(&counted.bytes, memory_order_relaxed);
     lineidx_result answer = lineidx_line_to_byte(x, s, target);
@@ -285,7 +285,7 @@ static int self_check_15(void)
     flat f = {bytes, n};
     lineidx_src src = {&f, n, flat_span, NULL};
     work_pool pool;
-    if (work_pool_init(&pool, 1, 0) != 0) return 2;
+    if (work_pool_init_foreground(&pool, 1, 0) != 0) return 2;
     lineidx *x = lineidx_create(n);
     jump_observation seen = {0};
     viewport v;
@@ -323,7 +323,7 @@ static int self_check_16(void)
     flat f = {data, sizeof data - 1};
     lineidx_src faulty = {&f, f.n, no_newline_span, NULL};
     work_pool pool;
-    if (work_pool_init(&pool, 1, 0) != 0) return 2;
+    if (work_pool_init_foreground(&pool, 1, 0) != 0) return 2;
     oracle o = {0};
     int result = reference_metadata(&f, &faulty, &o);
     bool independent = result == 0 && o.lines == 4 && o.target == 3 && o.byte == 7;
@@ -404,7 +404,7 @@ static void finish_after_poll(lineidx *x, void *ctx)
 static int self_check_completion_race(void)
 {
     work_pool pool;
-    if (work_pool_init(&pool, 1, 0) != 0) return 2;
+    if (work_pool_init_foreground(&pool, 1, 0) != 0) return 2;
     lineidx *x = lineidx_create(1);
     blocked_source blocked = {.entered = false, .release = false};
     lineidx_src src = {&blocked, 1, blocked_span, NULL};
@@ -436,7 +436,7 @@ static int self_check_18(void)
     fflush(stdout);
     lineidx *x = lineidx_create(128);
     work_pool pool;
-    if (!x || work_pool_init(&pool, 1, 0) != 0) return 2;
+    if (!x || work_pool_init_foreground(&pool, 1, 0) != 0) return 2;
     bool waited = wait_index(x, &pool, bench_now_ns() + 1000000, true, "SELF_CHECK 18 unsubmitted");
     lineidx_destroy(x);
     x = lineidx_create(1);
@@ -748,7 +748,7 @@ int main(int argc, char **argv)
     char st[32];
     printf("# lineidx_bench file=%s reps=%d fresh_index=1 cold=%d track=%d power=%s\n",
            file.path, reps, cold, track, bench_battery_status(st, sizeof st));
-    if (work_pool_init(&pool, 1, 0) != 0) { fprintf(stderr, "pool init failed\n"); return 2; }
+    if (work_pool_init_foreground(&pool, 1, 0) != 0) { fprintf(stderr, "pool init failed\n"); return 2; }
 
     uint64_t n = 0;
     const uint8_t *m0 = map_file(&file);

@@ -68,6 +68,16 @@ void lineidx_destroy(lineidx *x);
  * allocation failure) the caller keeps ownership. With no retiring lease,
  * if nothing is unbuilt it releases at once and returns 0. */
 int  lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap);
+/* Interactive build for an unindexed jump. Requires a foreground-enabled
+ * pool and a resident/nonblocking source. Same ownership as build_start;
+ * yields between bounded batches and on mailbox backpressure. Ordinary
+ * background indexing and sources requiring blocking I/O use build_start. */
+int  lineidx_build_start_foreground(lineidx *x, work_pool *pool, const lineidx_src *snap);
+/* Upgrade a live background build when a resident-source interactive jump
+ * needs it. Same snapshot/scratch/work lease; queued work moves immediately,
+ * running work moves at its next bounded continuation. Caller must guarantee
+ * span does not block on I/O. Returns -1 if no live build can be prioritized. */
+int  lineidx_build_prioritize(lineidx *x);
 /* As above, with the bytes retained by the source lease included in memory
  * accounting. Use 0 for borrowed storage. The ordinary start uses SIZE_MAX
  * (unknown) when snap has a release hook. A retiring lease refuses a restart

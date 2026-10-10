@@ -69,7 +69,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = tabs_init(&e->tabs, live, closed); if (rc) goto fail;
     e->tabs_ready = true;
     uint32_t nraster = (backend->info.capabilities & RENDER_CAP_RASTER_POOL) ? 4u : 0u;
-    if (work_pool_init(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
     e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;

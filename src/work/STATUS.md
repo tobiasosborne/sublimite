@@ -1,3 +1,31 @@
+# edit-4w1.56 — session 8
+
+P1-1 §4: optional foreground lane, independent capacity/mailbox, cooperative
+continuations and lease-preserving priority are implemented. The editor and jump
+bench enable the lane. Copied-file jumps prioritize the existing index build;
+background and foreground index builds both yield bounded CPU batches.
+
+Migration waits for old-worker result/callback reservations before its first
+foreground invocation, preserving per-lease order across mailboxes. Other
+foreground jobs can run during the handoff. Continuations and upgrades allocate
+nothing and keep caller-owned arguments until physical completion. Blocking
+bulk I/O retains its own execution resource and completion ownership.
+
+Release work/editor allocation guards, work TSan, foreground real-client tests,
+index span-bound/lease tests, benchmark self-checks, GCC all, and work/lineidx fuzz
+campaigns pass. Final full ASan/UBSan make check passes all test binaries and replay CLI;
+LeakSanitizer is disabled for this worker. The final seeded work fuzzer uses
+two raster workers and validates handoff between all producer identities. The final full suite previously
+exposed an unrelated raster fence/viewport teardown use-after-free; raster/file
+code is untouched. Mapped/cold-source jumps need nonblocking I/O continuation
+integration before using the CPU foreground lane. Dirty-index repair and
+production find continuations are separate consumer work, not claimed here.
+
+See `docs/decisions/edit-4w1.56.md` and
+`docs/worker-reports/edit-4w1.56-s8.md` for the pasted red/green evidence and
+remaining system coverage. New module fuzzer: `build/fuzz/work_fuzz`; seeds under
+`/tmp/edit-corpus/work-fuzz`. Display only `:99`.
+
 # Work module
 
 P1.8d (edit-4w1.51 + edit-e6x.25) adds generation/lease-selective mailbox
@@ -52,7 +80,8 @@ afterwards.
 Verify with `DISPLAY=:99 EDIT_DISPLAY=:99 make all`, release
 `build/tests/work_test` (allocation guard must be active),
 `ASAN_OPTIONS=detect_leaks=0 DISPLAY=:99 EDIT_DISPLAY=:99 make check`, and
-`DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz`. No work-module fuzzer exists. The randomized work state machine
+`DISPLAY=:99 EDIT_DISPLAY=:99 make fuzz`. At P1.8c there was no work-module fuzzer (session 8 adds the target above).
+The randomized work state machine
 and live mailbox tests can additionally run under GCC TSan (`-fno-pie -no-pie`)
 using `TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R <binary> 15`. Tail/head
 relaxed mutants are rejected by that driver; production passed.

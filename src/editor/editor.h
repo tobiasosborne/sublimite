@@ -85,6 +85,9 @@ int editor_step(editor *e, int timeout_ms);
 int editor_run(editor *e);
 /* Setup/test navigation; byte must be a grapheme boundary. */
 int editor_set_cursor(editor *e, uint64_t byte);
+/* An incomplete resident copy build is prioritized on the foreground worker;
+ * returns EDITOR_MORE until publication. Mapping I/O and dirty-index repair
+ * retain their background service; the caller retries after editor_step. */
 int editor_jump_line(editor *e, uint64_t line);
 uint64_t editor_length(const editor *e);
 int editor_read(const editor *e, uint64_t off, uint8_t *dst, size_t len);

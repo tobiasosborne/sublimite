@@ -42,6 +42,9 @@ typedef struct lineidx_job {
     uint32_t generation, apply_block, apply_entry;
     bool seeking;
     uint64_t target;
+    size_t cursor, sealed;                /* worker continuation */
+    uint64_t scan_pos, scan_nl, scan_na, cumulative, answer;
+    bool seek_pending;
     uint64_t cpu_begin, cancel_cpu_ns; /* worker; read only after work completion */
 } lineidx_job;
 struct lineidx {
@@ -416,17 +419,13 @@ static bool worker_stop(work_ctx *c)
         j->cancel_cpu_ns = now_ns(CLOCK_THREAD_CPUTIME_ID) - j->cpu_begin;
     return true;
 }
+/* Backpressure retains progress and yields the execution resource. */
 static bool publish(work_ctx *c, uint32_t kind, const void *data, size_t size)
 {
+    if (worker_stop(c)) return false;
     work_msg msg = {.kind = kind, .generation = c->generation};
     memcpy(msg.data, data, size);
-    lineidx_job *j = c->arg;
-    while (!worker_stop(c)) {
-        j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
-        if (work_publish(c, &msg)) return true;
-        nanosleep(&(struct timespec){0, 50000}, NULL);
-    }
-    return false;
+    return work_publish(c, &msg);
 }
 static bool publish_range(work_ctx *c, size_t first, size_t end)
 {
@@ -434,6 +433,7 @@ static bool publish_range(work_ctx *c, size_t first, size_t end)
     result_range range = {first, end};
     return publish(c, LINEIDX_MSG_PROGRESS, &range, sizeof range);
 }
+_Static_assert(sizeof(result_range) <= WORK_MSG_DATA, "line index range fits mailbox");
 static void receive_results(const work_msg *msg, void *ud)
 {
     lineidx *x = ud; lineidx_job *j = x->job;
@@ -448,71 +448,78 @@ static void receive_results(const work_msg *msg, void *ud)
         if (value <= x->len) { x->async_value = value; x->async_ready = true; }
     }
 }
-/* Poll on both sides of each indivisible source callback. Large offered spans
- * are scanned in SCAN_BLOCK byte blocks, independent of entry geometry. */
-static bool scan_worker(work_ctx *c, lineidx_job *j, size_t i, uint64_t cum,
-                         uint64_t *nl, uint64_t *na, bool *found, uint64_t *answer)
-{
-    uint64_t pos = j->starts[i], end = j->starts[i + 1u], a = 0, b = 0;
-    *found = false;
-    while (pos < end) {
-        if (worker_stop(c)) return false;
-        const uint8_t *p;
-        j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
-        size_t k = j->src.span(j->src.ctx, pos, &p);
-        if (worker_stop(c) || !k) return false;
-        if (k > end - pos) k = (size_t)(end - pos);
-        while (k) {
-            size_t batch = k > SCAN_BLOCK ? SCAN_BLOCK : k;
-            scan_counts counts = scan_count(p, batch);
-            if (j->seeking && cum + a < j->target && counts.newlines >= j->target - cum - a) {
-                const uint8_t *q = scan_find_nth_newline(p, batch, j->target - cum - a - 1u);
-                *answer = pos + (uint64_t)(q - p) + 1u; *found = true;
-            }
-            a += counts.newlines; b += counts.nonascii; pos += batch;
-            if (worker_stop(c)) return false;
-            if (*found) break;
-            p += batch; k -= batch;
-        }
-        if (*found) break;
-    }
-    *nl = a; *na = b;
-    return pos == end || *found;
-}
+/* One bounded invocation, preserving partial chunk/seek counts. Cancellation
+ * surrounds each callback and 16 KiB scanner block. CPU checkpoints belong to
+ * the current worker thread, since a continuation may move between workers. */
 static void build_fn(work_ctx *c)
 {
     lineidx_job *j = c->arg;
-    size_t sealed = 0;
-    uint64_t cum = 0;
     j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
-    if (j->seeking && j->target == 0) {
-        uint64_t zero = 0; (void)publish(c, MSG_SEEK, &zero, sizeof zero); return;
+    uint64_t deadline = j->cpu_begin + 4000000ull;
+    size_t bytes = 0, spans = 0, chunks = 0;
+    if (worker_stop(c)) return;
+    if (j->cursor > j->sealed) {
+        if (!publish_range(c, j->sealed, j->cursor)) goto yield;
+        j->sealed = j->cursor;
     }
-    for (size_t i = 0; i < j->n; i++) {
+    if (j->seek_pending) goto seek_result;
+    while (j->cursor < j->n) {
         if (worker_stop(c)) return;
-        if ((i & 15u) == 0) j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+        size_t i = j->cursor;
         uint64_t r = j->res[i], count = r & UINT32_MAX;
-        bool scan = !(r & RES_DONE) || (j->seeking && j->target <= cum + count);
-        bool found = false; uint64_t answer = 0;
+        bool scan = !(r & RES_DONE) || (j->seeking && j->target <= j->cumulative + count);
         if (scan) {
-            uint64_t nl, na;
-            if (!scan_worker(c, j, i, cum, &nl, &na, &found, &answer)) return;
-            count = nl;
-            if (found) {
-                /* Only earlier, fully counted chunks are made available. The
-                 * exact target offset itself travels in its own message. */
-                if (!publish_range(c, sealed, i)) return;
-                (void)publish(c, MSG_SEEK, &answer, sizeof answer); return;
+            uint64_t end = j->starts[i + 1u];
+            if (j->scan_pos < j->starts[i]) j->scan_pos = j->starts[i];
+            while (j->scan_pos < end) {
+                if (worker_stop(c)) return;
+                const uint8_t *p;
+                j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+                size_t k = j->src.span(j->src.ctx, j->scan_pos, &p);
+                if (worker_stop(c) || !k) return;
+                if (k > end - j->scan_pos) k = (size_t)(end - j->scan_pos);
+                spans++;
+                while (k) {
+                    size_t batch = k > SCAN_BLOCK ? SCAN_BLOCK : k;
+                    scan_counts counts = scan_count(p, batch);
+                    bool found = j->seeking && j->cumulative + j->scan_nl < j->target &&
+                        counts.newlines >= j->target - j->cumulative - j->scan_nl;
+                    if (found) {
+                        const uint8_t *q = scan_find_nth_newline(p, batch,
+                            j->target - j->cumulative - j->scan_nl - 1u);
+                        j->answer = j->scan_pos + (uint64_t)(q - p) + 1u;
+                    }
+                    j->scan_nl += counts.newlines; j->scan_na += counts.nonascii;
+                    j->scan_pos += batch; bytes += batch;
+                    if (worker_stop(c)) return;
+                    if (found) { j->seek_pending = true; goto publish_results; }
+                    p += batch; k -= batch;
+                    if (bytes >= 16u * LINEIDX_CHUNK || now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline)
+                        goto publish_results;
+                }
+                if (spans >= 64u) goto publish_results;
             }
-            j->res[i] = RES_DONE | (na ? RES_NA : 0) | nl;
+            count = j->scan_nl;
+            j->res[i] = RES_DONE | (j->scan_na ? RES_NA : 0) | count;
+            j->scan_nl = j->scan_na = 0;
         }
-        cum += count;
-        if (((i + 1u) & (PUBLISH_CHUNKS - 1u)) == 0 || i + 1u == j->n) {
-            if (!publish_range(c, sealed, i + 1u)) return;
-            sealed = i + 1u;
-        }
+        j->cumulative += count; j->cursor++; chunks++;
+        if (chunks >= PUBLISH_CHUNKS || now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
     }
-    if (j->seeking) { uint64_t end = j->src.len; (void)publish(c, MSG_SEEK, &end, sizeof end); }
+    if (j->seeking && j->cursor == j->n) {
+        j->answer = j->src.len; j->seek_pending = true;
+    }
+publish_results:
+    if (!publish_range(c, j->sealed, j->cursor)) goto yield;
+    j->sealed = j->cursor;
+    if (j->seek_pending) goto seek_result;
+    if (j->cursor < j->n) goto yield;
+    return;
+seek_result:
+    if (!publish(c, MSG_SEEK, &j->answer, sizeof j->answer)) goto yield;
+    return;
+yield:
+    if (!worker_stop(c)) (void)work_continue(c);
 }
 
 /* ---- lifecycle ---- */
@@ -643,8 +650,9 @@ size_t lineidx_poll(lineidx *x)
     reap(x); return got;
 }
 static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
-                       size_t source_bytes, bool seeking, uint64_t target)
+                       size_t source_bytes, bool seeking, uint64_t target, bool foreground)
 {
+    if (foreground && !pool->foreground_enabled) return -1;
     if (!snap || snap->len != x->len || !snap->span) return -1;
     lineidx_build_cancel(x); reap(x);
     if (x->retired) return -1;
@@ -669,8 +677,9 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
     }
     j->starts[j->n] = pos; j->src = *snap; j->source_bytes = source_bytes;
     j->pool = pool; j->generation = ++x->gen; j->seeking = seeking; j->target = target;
+    j->seek_pending = seeking && target == 0;
     j->apply_block = edge_block(x, x->root, false); j->apply_entry = x->b[j->apply_block].head;
-    j->h = work_submit(pool, (work_job){build_fn, j, j->generation, WORK_BULK});
+    j->h = work_submit(pool, (work_job){build_fn, j, j->generation, foreground ? WORK_FOREGROUND : WORK_BULK});
     if (!j->h.epoch) { j->src.release = NULL; job_free(j); return -1; }
     x->job = j;
     if (work_mailbox_bind(pool, j->h, j->generation, receive_results, x) != 0) {
@@ -681,11 +690,18 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
     return 0;
 }
 int lineidx_build_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap, size_t source_bytes)
-{ return start_job(x, pool, snap, source_bytes, false, 0); }
+{ return start_job(x, pool, snap, source_bytes, false, 0, false); }
 int lineidx_build_start(lineidx *x, work_pool *pool, const lineidx_src *snap)
 { return lineidx_build_start_owned(x, pool, snap, snap->release ? SIZE_MAX : 0); }
+int lineidx_build_start_foreground(lineidx *x, work_pool *pool, const lineidx_src *snap)
+{ return start_job(x, pool, snap, snap->release ? SIZE_MAX : 0, false, 0, true); }
+int lineidx_build_prioritize(lineidx *x)
+{
+    if (!x || !x->job) return -1;
+    return work_prioritize(x->job->pool, x->job->h);
+}
 int lineidx_seek_start_owned(lineidx *x, work_pool *pool, const lineidx_src *snap, uint64_t line, size_t source_bytes)
-{ return start_job(x, pool, snap, source_bytes, true, line); }
+{ return start_job(x, pool, snap, source_bytes, true, line, false); }
 bool lineidx_seek_result(lineidx *x, lineidx_result *result)
 {
     (void)lineidx_poll(x);

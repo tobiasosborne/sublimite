@@ -346,9 +346,15 @@ int editor_jump_line(editor *e, uint64_t line)
 {
     if (!e) return EDITOR_ERR_ARG;
     if (e->buffer->index) {
-        /* Exact piece queries are warm after open; publication is still the
-         * prerequisite for line-based benchmark positioning. */
-        if (!lineidx_complete(e->buffer->index)) return EDITOR_MORE;
+        (void)lineidx_poll(e->buffer->index);
+        /* Exact piece queries are warm after open; publication remains the
+         * prerequisite for positioning in the active buffer. */
+        if (!lineidx_complete(e->buffer->index)) {
+            if (!e->buffer->index_dirty && (!e->buffer->file ||
+                file_open_mode(e->buffer->file) == FILE_MODE_COPY))
+                (void)lineidx_build_prioritize(e->buffer->index);
+            return EDITOR_MORE;
+        }
     }
     return editor_set_cursor(e, piece_line_to_byte(e->tree, line));
 }

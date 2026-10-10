@@ -1,0 +1,5 @@
+- All conflicts resolved; both behaviors preserved.
+- `make all` and `make check` passed: 58 tests plus replay checks.
+- Lineidx and work fuzzers passed 30 seconds each.
+- [Resolution report](docs/worker-reports/edit-4w1.56-s8b.md) written; no conflict markers remain.
+- Git state unchanged; coordinator can stage and continue the rebase.
