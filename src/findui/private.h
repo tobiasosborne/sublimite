@@ -12,7 +12,7 @@ typedef struct findui_slot {
     piece_snapshot *snapshot;
     work_handle handle;
     uint64_t owner, window_start, window_end, desired_index;
-    size_t query_length, cache_capacity;
+    size_t query_length, cache_capacity, visible_capacity;
     uint8_t query[FINDUI_QUERY_BYTES];
     findui_options options;
     findui_scan_hook hook;
@@ -45,6 +45,7 @@ typedef struct findui_batch {
 typedef struct findui_done {
     uint64_t owner, count, error_offset;
     int32_t code;
+    uint64_t visible; /* exact visitor count; UNSET for word-filter stream */
 } findui_done;
 _Static_assert(sizeof(findui_batch) <= WORK_MSG_DATA, "mailbox batch size");
 _Static_assert(sizeof(findui_done) <= WORK_MSG_DATA, "mailbox completion size");

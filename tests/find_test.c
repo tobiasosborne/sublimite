@@ -1,6 +1,7 @@
 #include "find/find.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "../bench/find_supervise.h"
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -285,9 +286,18 @@ static int cancellation(void)
     CHECK(find_literal(&j.s,NULL,0,&ctl,&j.r)==FIND_CANCELLED);
     edit_arena_free(&a); return 0;
 }
-int main(void)
+static int run_find_tests(void *unused)
 {
+    (void)unused;
     CHECK(sizeof(find_result)<=64*1024);
     CHECK(literal_cases()==0); CHECK(literal_edges()==0); CHECK(regex_contract()==0); CHECK(snapshot_cases()==0); CHECK(regex_cases()==0); CHECK(cancellation()==0);
     puts("find_test: ok (frozen P1.10a)"); return 0;
+}
+int main(void)
+{
+    /* Keep the frozen assertions intact, but bound lost starts, worker returns
+     * and shutdown as one fixture. Timeout kills the child before its storage
+     * can be released; the parent never joins an unresponsive worker. */
+    return find_fixture_supervise(run_find_tests, NULL, UINT64_C(30000000000),
+                                  "frozen find tests through shutdown");
 }

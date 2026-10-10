@@ -1,3 +1,24 @@
+# edit-4w1.58 — P1-1 §§7–11, session 8
+
+Completed bounded dense popcount counting, core visitor integration for the
+panel, shared regex retry limits and rejecting/supervised find benchmarks.
+Full details and runtime red/green evidence:
+[worker report](../../docs/worker-reports/edit-4w1.58-s8.md);
+[design decisions](../../docs/decisions/edit-4w1.58.md).
+
+Both module fuzz targets completed cleanly for the requested duration. Release
+module tests and the active editor typing allocator guard passed. Final GCC 13
+make all and Clang 18 ASan/UBSan make check both exited 0:
+51 sanitizer binaries plus replay CLI passed. Invocations used Xvfb :99 and
+ASAN_OPTIONS=detect_leaks=0. Successful supervised fixtures preserve normal
+exit/leak-check hooks; timed-out fixtures retain arguments until termination.
+Coordinator: rerun with leaks enabled; supply the absent official all-a corpus
+fixture for the official G6 matrix. Loaded measurements are TRACK comparisons.
+The frozen find public header and its semantic assertions remain intact; test
+fixture execution is now supervised. The regex engine returns FIND_ERR_LIMIT
+on its documented request-wide state/candidate budget; a streaming replacement
+is deferred. Whole-word filtering keeps the existing candidate/overlap policy.
+
 # Find status — P1.10b best-of fold-in (edit-4w1.52)
 
 The P1.10 pick is the SIMD filter/verify kernel. Its uncovered losing-variant

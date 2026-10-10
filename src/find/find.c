@@ -1,6 +1,7 @@
 /* Regex half of find (frozen P1.10a semantics). Literal search lives in
  * literal.c; the regex literal prefix is searched with that kernel. */
 #include "literal.h"
+#include "visit.h"
 
 #define FIND_MAGIC UINT32_C(0x66696e64)
 #define FIND_NONE UINT16_MAX
@@ -203,13 +204,42 @@ typedef struct scratch {
     bool seen[FIND_MAX_STATES];
 } scratch;
 size_t find_regex_scratch_bytes(const find_regex *re) { return re?sizeof(scratch):0; }
+/* The restarted reference NFA is bounded until a streaming replacement lands.
+ * One call may visit at most 64*(states+1)*(source_bytes+1) states/candidates.
+ * The budget covers every retry and every emitted match, never resets at a
+ * candidate, and returns LIMIT rather than an inexact successful count. */
+typedef struct regex_meter {
+    meter poll;
+    uint64_t remaining;
+    bool limited;
+} regex_meter;
+uint64_t find_regex_work_budget(const find_regex *re,uint64_t length)
+{
+    if (!re || re->magic!=FIND_MAGIC) return 0;
+    uint64_t scale=64*((uint64_t)re->count+1);
+    return length>=UINT64_MAX/scale ? UINT64_MAX : (length+1)*scale;
+}
+static regex_meter regex_meter_init(const find_control *control,uint64_t length,size_t states)
+{
+    uint64_t scale=64*((uint64_t)states+1);
+    uint64_t remaining=length>=UINT64_MAX/scale ? UINT64_MAX : (length+1)*scale;
+    regex_meter m={{control,0,false},remaining,false}; return m;
+}
+static bool regex_step(regex_meter *m)
+{
+    if (!m->remaining) { m->limited=true; return true; }
+    m->remaining--;
+    return step(&m->poll);
+}
+static bool regex_stopped(const regex_meter *m)
+{ return m->limited || m->poll.stopped; }
 static size_t closure(reader *r,const find_regex *re,scratch *s,thread seed,
-                      uint64_t pos,thread *dest,size_t count,meter *m,find_match *best)
+                      uint64_t pos,thread *dest,size_t count,regex_meter *m,find_match *best)
 {
     size_t top=0; s->stack[top++]=seed;
-    while (top && !m->stopped) {
+    while (top && !regex_stopped(m)) {
         thread t=s->stack[--top];
-        if (step(m)) break;
+        if (regex_step(m)) break;
         if (s->seen[t.state]) continue;
         s->seen[t.state]=true; const state *st=&re->states[t.state];
         switch (st->kind) {
@@ -237,7 +267,7 @@ static size_t closure(reader *r,const find_regex *re,scratch *s,thread seed,
     }
     return count;
 }
-static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,meter *m,find_match *hit)
+static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,regex_meter *m,find_match *hit)
 {
     clear_match(hit); hit->groups=re->groups;
     thread seed={0}; seed.state=re->start;
@@ -245,12 +275,12 @@ static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,mete
     memset(s->seen,0,sizeof s->seen);
     size_t count=closure(r,re,s,seed,off,s->lists[0],0,m,hit);
     unsigned current=0; uint64_t pos=off;
-    while (count && pos<r->len && !m->stopped) {
+    while (count && pos<r->len && !regex_stopped(m)) {
         uint8_t c=get_byte(r,pos); size_t next_count=0;
         memset(s->seen,0,sizeof s->seen);
-        for (size_t i=0;i<count && !m->stopped;i++) {
+        for (size_t i=0;i<count && !regex_stopped(m);i++) {
             thread t=s->lists[current][i]; const state *st=&re->states[t.state];
-            if (step(m)) break;
+            if (regex_step(m)) break;
             if (class_has(st->cls,c)) {
                 t.state=st->out;
                 next_count=closure(r,re,s,t,pos+1,s->lists[1u-current],next_count,m,hit);
@@ -262,25 +292,25 @@ static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,mete
 }
 /* Candidate starts come from the literal kernel (rare-byte filter + verify,
  * Two-Way fallback) when the program has a mandatory literal prefix. */
-static bool regex_seek(reader *r,const find_regex *re,uint64_t off,scratch *s,meter *m,find_match *hit)
+static bool regex_seek(reader *r,const find_regex *re,uint64_t off,scratch *s,regex_meter *m,find_match *hit)
 {
     if (re->prefix_len) {
         find_lit lit; uint64_t at=0;
-        if (!find_lit_init(&lit,re->prefix,re->prefix_len,m,false)) return false;
+        if (!find_lit_init(&lit,re->prefix,re->prefix_len,&m->poll,false)) return false;
         for (uint64_t i=off;;) {
             if (find_lit_seek(&lit,r->source,r->len,i,&at)<=0) return false;
             anchored(r,re,at,s,m,hit);
             if (hit->matched) return true;
-            if (m->stopped || at==r->len) return false;
-            if (step(m)) return false;
+            if (regex_stopped(m) || at==r->len) return false;
+            if (regex_step(m)) return false;
             i=at+1;
         }
     }
     for (uint64_t i=off;;i++) {
-        if (step(m)) break;
+        if (regex_step(m)) break;
         anchored(r,re,i,s,m,hit);
         if (hit->matched) return true;
-        if (m->stopped || i==r->len) break;
+        if (regex_stopped(m) || i==r->len) break;
     }
     return false;
 }
@@ -291,45 +321,73 @@ static find_code regex_arguments(const find_source *source,const find_regex *re,
     return size<sizeof(scratch)?FIND_ERR_MEMORY:FIND_OK;
 }
 static find_code regex_one(const find_source *source,const find_regex *re,uint64_t off,
-                           void *memory,size_t size,const find_control *control,find_match *match,bool scan)
+                           void *memory,size_t size,const find_control *control,find_match *match,bool scan,
+                           uint64_t *budget)
 {
     if (!match) return FIND_ERR_ARGUMENT;
     clear_match(match);
     find_code code=regex_arguments(source,re,memory,size);
     if (code!=FIND_OK) return code;
     if (off>source_len(source)) return FIND_ERR_ARGUMENT;
-    meter m={control,0,false}; reader r=reader_init(source); match->groups=re->groups;
-    if (!poll_stop(&m)) {
+    reader r=reader_init(source); regex_meter m=regex_meter_init(control,r.len,re->count); match->groups=re->groups;
+    if (budget) m.remaining=*budget;
+    if (!poll_stop(&m.poll)) {
         if (scan) (void)regex_seek(&r,re,off,memory,&m,match);
         else anchored(&r,re,off,memory,&m,match);
     }
-    if (poll_stop(&m)) { clear_match(match); return FIND_CANCELLED; }
+    if (budget) *budget=m.remaining;
+    if (poll_stop(&m.poll)) { clear_match(match); return FIND_CANCELLED; }
+    if (m.limited) { clear_match(match); return FIND_ERR_LIMIT; }
     return FIND_OK;
 }
 find_code find_regex_captures(const find_source *source,const find_regex *re,uint64_t off,
                               void *memory,size_t size,const find_control *control,find_match *match)
-{ return regex_one(source,re,off,memory,size,control,match,false); }
+{ return regex_one(source,re,off,memory,size,control,match,false,NULL); }
 find_code find_regex_next(const find_source *source,const find_regex *re,uint64_t off,
                           void *memory,size_t size,const find_control *control,find_match *match)
-{ return regex_one(source,re,off,memory,size,control,match,true); }
-find_code find_regex_search(const find_source *source,const find_regex *re,void *memory,size_t size,
-                            const find_control *control,find_result *result)
+{ return regex_one(source,re,off,memory,size,control,match,true,NULL); }
+find_code find_regex_next_budget(const find_source *source,const find_regex *re,uint64_t off,
+                                void *memory,size_t size,const find_control *control,
+                                uint64_t *budget,find_match *match)
+{
+    if (!budget) { if (match) clear_match(match); return FIND_ERR_ARGUMENT; }
+    return regex_one(source,re,off,memory,size,control,match,true,budget);
+}
+static find_code regex_search_run(const find_source *source,const find_regex *re,void *memory,size_t size,
+                            const find_control *control,find_result *result,find_visit *visit)
 {
     if (!result) return FIND_ERR_ARGUMENT;
     result->total=0; result->stored=0;
     find_code code=regex_arguments(source,re,memory,size);
     if (code!=FIND_OK) return code;
-    meter m={control,0,false}; reader r=reader_init(source); uint64_t off=0;
-    if (!poll_stop(&m)) for (;;) {
+    reader r=reader_init(source); regex_meter m=regex_meter_init(control,r.len,re->count); uint64_t off=0;
+    if (!poll_stop(&m.poll)) for (;;) {
         find_match hit; clear_match(&hit); hit.groups=re->groups;
         if (!regex_seek(&r,re,off,memory,&m,&hit)) break;
+        if (!find_visit_add(visit,result->total,hit.whole)) { code=FIND_CANCELLED; break; }
         code=add_result(result,hit.whole.start);
         if (code!=FIND_OK) break;
-        if (step(&m)) break;
+        if (regex_step(&m)) break;
         off=hit.whole.end;
         if (off==hit.whole.start) { if (off==r.len) break; off++; }
     }
-    if (poll_stop(&m)) code=FIND_CANCELLED;
+    if (m.limited) code=FIND_ERR_LIMIT;
+    if (poll_stop(&m.poll)) code=FIND_CANCELLED;
     if (code!=FIND_OK) { result->total=0; result->stored=0; }
+    return code;
+}
+
+find_code find_regex_search(const find_source *source,const find_regex *re,void *memory,size_t size,
+                            const find_control *control,find_result *result)
+{ return regex_search_run(source,re,memory,size,control,result,NULL); }
+find_code find_regex_visit(const find_source *source,const find_regex *re,void *memory,size_t size,
+                           const find_control *control,find_visit *visit)
+{
+    if (!visit || !visit->emit) return FIND_ERR_ARGUMENT;
+    visit->total=0; visit->visible=0;
+    find_result result;
+    find_code code=regex_search_run(source,re,memory,size,control,&result,visit);
+    if (code==FIND_OK) visit->total=result.total;
+    else visit->visible=0;
     return code;
 }

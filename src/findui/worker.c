@@ -1,4 +1,5 @@
 #include "findui/private.h"
+#include "find/visit.h"
 #include <string.h>
 #include <time.h>
 
@@ -163,6 +164,20 @@ static find_code whole_word(const findui_slot *slot, work_ctx *context,
     }
     return FIND_OK;
 }
+typedef struct visitor_output {
+    work_ctx *context;
+    findui_batch *batch;
+    size_t *batched;
+} visitor_output;
+static bool emit_range(void *user,uint64_t ordinal,find_capture range)
+{
+    visitor_output *out=user;
+    if (*out->batched && ordinal!=out->batch->ordinal+*out->batched &&
+        !flush(out->context,out->batch,out->batched)) return false;
+    if (!*out->batched) out->batch->ordinal=ordinal;
+    out->batch->ranges[(*out->batched)++]=(findui_range){range.start,range.end};
+    return (*out->batched!=2 && ordinal!=0) || flush(out->context,out->batch,out->batched);
+}
 void findui_worker_run(work_ctx *context)
 {
     findui_slot *slot = context->arg;
@@ -172,13 +187,26 @@ void findui_worker_run(work_ctx *context)
     find_source source = {.snapshot = slot->snapshot};
     find_control control = {.work = context};
     uint64_t offset = 0, total = 0, length = piece_snapshot_len(slot->snapshot);
+    uint64_t regex_budget=find_regex_work_budget(regex,length);
     findui_batch batch = {.owner = slot->owner};
     size_t batched = 0;
-    while (code == FIND_OK && !work_should_stop(context)) {
+    uint64_t visible=FIND_UNSET;
+    if (code==FIND_OK && !slot->options.whole_word) {
+        visitor_output output={context,&batch,&batched};
+        find_visit visit={.prefix_capacity=slot->cache_capacity,
+                          .visible_capacity=slot->visible_capacity,
+                          .wanted=slot->desired_index,.window_start=slot->window_start,
+                          .window_end=slot->window_end,.emit=emit_range,.user=&output};
+        scan_trace(slot,context->generation);
+        code=regex ? find_regex_visit(&source,regex,slot->scratch,FIND_MAX_SCRATCH_BYTES,&control,&visit)
+                   : find_literal_visit(&source,slot->query,slot->query_length,&control,&visit);
+        total=visit.total; visible=visit.visible;
+    }
+    while (slot->options.whole_word && code == FIND_OK && !work_should_stop(context)) {
         find_match match;
         scan_trace(slot, context->generation);
-        code = regex ? find_regex_next(&source, regex, offset, slot->scratch,
-                                       FIND_MAX_SCRATCH_BYTES, &control, &match)
+        code = regex ? find_regex_next_budget(&source, regex, offset, slot->scratch,
+                                              FIND_MAX_SCRATCH_BYTES, &control, &regex_budget, &match)
                      : find_literal_next(&source, slot->query, slot->query_length,
                                          offset, &control, &match);
         if (code != FIND_OK || !match.matched) break;
@@ -209,7 +237,8 @@ void findui_worker_run(work_ctx *context)
     }
     if (work_should_stop(context)) return;
     if (!flush(context, &batch, &batched)) return;
-    findui_done done = {slot->owner, code == FIND_OK ? total : 0, error_offset, (int32_t)code};
+    findui_done done = {.owner=slot->owner,.count=code==FIND_OK ? total : 0,
+                       .error_offset=error_offset,.code=(int32_t)code,.visible=visible};
     work_msg message = {.kind = FINDUI_MSG_DONE, .generation = context->generation};
     memcpy(message.data, &done, sizeof done);
     (void)publish(context, &message);

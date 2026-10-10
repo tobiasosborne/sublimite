@@ -1,6 +1,7 @@
 /* P1.10 literal search, variant simd-filter-verify. See
  * docs/decisions/P1.10-simd-filter-verify.md. */
 #include "literal.h"
+#include "visit.h"
 #include <emmintrin.h>
 #include <immintrin.h>
 #include "base/base.h"
@@ -346,7 +347,7 @@ int find_lit_seek(find_lit *l,const find_source *s,uint64_t len,uint64_t from,ui
 }
 
 /* ---- single-byte counting fast path ------------------------------------ */
-static find_code count_byte(find_lit *l,const uint8_t *p,size_t sn,uint64_t base,find_result *r)
+static find_code count_byte(find_lit *l,const uint8_t *p,size_t sn,uint64_t base,find_result *r,find_visit *visit)
 {
     meter *m=l->m; const __m128i v=_mm_set1_epi8((char)l->c1); size_t i=0;
 #define LD(k) _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(const void *)(p+i+(k)*16)),v)
@@ -355,26 +356,35 @@ static find_code count_byte(find_lit *l,const uint8_t *p,size_t sn,uint64_t base
         uint64_t mk=(uint64_t)(unsigned)_mm_movemask_epi8(LD(0))|((uint64_t)(unsigned)_mm_movemask_epi8(LD(1))<<16)|
                     ((uint64_t)(unsigned)_mm_movemask_epi8(LD(2))<<32)|((uint64_t)(unsigned)_mm_movemask_epi8(LD(3))<<48);
         if (mk) {
-            if (r->stored>=FIND_MAX_OFFSETS) { while (mk) { mk&=mk-1; r->total++; } }
-            else while (mk) {
+            if (!find_visit_mask(visit,mk,base+i,r->total)) return FIND_CANCELLED;
+            while (mk && r->stored<FIND_MAX_OFFSETS) {
                 find_code c=add_result(r,base+i+(size_t)__builtin_ctzll(mk));
                 if (c!=FIND_OK) return c;
                 mk&=mk-1;
             }
+            /* Without -mpopcnt GCC's runtime helper uses fixed-work SWAR;
+             * clang emits fixed-work SWAR inline. Never loop over discarded
+             * bits. The count also checks the same overflow as add_result. */
+            unsigned count=(unsigned)__builtin_popcountll(mk);
+            if (r->total>UINT64_MAX-count) return FIND_ERR_LIMIT;
+            r->total+=count;
         }
         i+=64;
     }
 #undef LD
     for (;i<sn;i++) {
         if (charge(m,2)) return FIND_CANCELLED;
-        if (p[i]==l->c1) { find_code c=add_result(r,base+i); if (c!=FIND_OK) return c; }
+        if (p[i]==l->c1) {
+            if (!find_visit_add(visit,r->total,(find_capture){base+i,base+i+1})) return FIND_CANCELLED;
+            find_code c=add_result(r,base+i); if (c!=FIND_OK) return c;
+        }
     }
     return FIND_OK;
 }
 
 /* ---- public ------------------------------------------------------------ */
-find_code find_literal_mode(const find_source *source,const uint8_t *needle,size_t n,
-                            const find_control *control,find_result *result,int mode)
+static find_code literal_run(const find_source *source,const uint8_t *needle,size_t n,
+                            const find_control *control,find_result *result,int mode,find_visit *visit)
 {
     if (!result) return FIND_ERR_ARGUMENT;
     result->total=0; result->stored=0;
@@ -384,12 +394,12 @@ find_code find_literal_mode(const find_source *source,const uint8_t *needle,size
         find_lit l; uint64_t len=source_len(source);
         if (find_lit_init(&l,needle,n,&m,mode==1)) {
             if (n==1 && mode==0) {
-                if (!source->snapshot) code=count_byte(&l,source->bytes,source->length,0,result);
+                if (!source->snapshot) code=count_byte(&l,source->bytes,source->length,0,result,visit);
                 else {
                     piece_iter it; const uint8_t *p; size_t sn; uint64_t base=0;
                     piece_iter_begin_snapshot(&it,source->snapshot,0);
                     while (code==FIND_OK && piece_iter_next(&it,&p,&sn)) {
-                        code=count_byte(&l,p,sn,base,result); base+=sn;
+                        code=count_byte(&l,p,sn,base,result,visit); base+=sn;
                     }
                 }
             } else {
@@ -397,6 +407,7 @@ find_code find_literal_mode(const find_source *source,const uint8_t *needle,size
                 for (;;) {
                     int r=find_lit_seek(&l,source,len,pos,&at);
                     if (r<=0) break;
+                    if (!find_visit_add(visit,result->total,(find_capture){at,at+n})) { code=FIND_CANCELLED; break; }
                     code=add_result(result,at);
                     if (code!=FIND_OK) break;
                     pos=at+n;
@@ -406,6 +417,20 @@ find_code find_literal_mode(const find_source *source,const uint8_t *needle,size
     }
     if (poll_stop(&m)) code=FIND_CANCELLED;
     if (code!=FIND_OK) { result->total=0; result->stored=0; }
+    return code;
+}
+find_code find_literal_mode(const find_source *source,const uint8_t *needle,size_t n,
+                            const find_control *control,find_result *result,int mode)
+{ return literal_run(source,needle,n,control,result,mode,NULL); }
+find_code find_literal_visit(const find_source *source,const uint8_t *needle,size_t n,
+                             const find_control *control,find_visit *visit)
+{
+    if (!visit || !visit->emit) return FIND_ERR_ARGUMENT;
+    visit->total=0; visit->visible=0;
+    find_result result;
+    find_code code=literal_run(source,needle,n,control,&result,0,visit);
+    if (code==FIND_OK) visit->total=result.total;
+    else visit->visible=0;
     return code;
 }
 find_code find_literal(const find_source *source,const uint8_t *needle,size_t n,

@@ -378,8 +378,52 @@ static void painting_and_no_malloc(void)
     finish(&f);
     puts("findui_test: bottom-row rendering, damage validation and typing allocation guard passed");
 }
+static void bounded_count_worker(void)
+{
+    uint8_t text[1024u*1024u]; memset(text,'a',sizeof text);
+    fixture f; start(&f,text,sizeof text,8,4);
+    query(&f,"a");
+    findui_state state=findui_get_state(&f.panel);
+    unsigned scans=atomic_load(&f.hook.scans);
+    printf("P1R8 dense worker: count=%llu cached=%zu scans=%u\n",
+           (unsigned long long)state.match_count,state.cached_matches,scans);
+    fflush(stdout);
+    CHECK(state.complete && state.match_count==sizeof text && state.cached_matches==8);
+    CHECK(scans<=16); /* core counts discarded matches, no next() per byte */
+    CHECK(state.visible_overflow && state.visible_matches==sizeof text);
+    CHECK(findui_set_window(&f.panel,sizeof text-4,sizeof text)==FINDUI_OK);
+    wait_result(&f);
+    findui_range ranges[4]; size_t count;
+    CHECK(findui_highlights(&f.panel,sizeof text-4,sizeof text,ranges,4,&count)==FINDUI_OK && count==4);
+    CHECK(ranges[0].start==sizeof text-4 && ranges[3].end==sizeof text);
+    findui_range selected;
+    CHECK(findui_next(&f.panel,-1,&selected)==FINDUI_MORE);
+    wait_result(&f); state=findui_get_state(&f.panel);
+    CHECK(state.match_index==sizeof text-1 && state.selected.start==sizeof text-1);
+    CHECK(findui_set_options(&f.panel,(findui_options){true,true,false})==FINDUI_OK);
+    wait_result(&f); state=findui_get_state(&f.panel);
+    CHECK(state.complete && state.match_count==sizeof text);
+    CHECK(atomic_load(&f.hook.scans)<=32);
+    finish(&f);
+    puts("P1R8: PASS bounded core count, visible overflow, late window, lazy ordinal, regex");
+}
+static void filtered_regex_budget(void)
+{
+    uint8_t text[4096]; memset(text,'a',sizeof text);
+    fixture f; start(&f,text,sizeof text,8,4);
+    CHECK(findui_set_options(&f.panel,(findui_options){true,true,true})==FINDUI_OK);
+    query(&f,"a*b|a");
+    findui_state state=findui_get_state(&f.panel);
+    printf("P1R9 filtered regex: complete=%d error=%d scans=%u\n",
+           state.complete,(int)state.search_error,atomic_load(&f.hook.scans));
+    fflush(stdout);
+    CHECK(!state.complete && state.search_error==FIND_ERR_LIMIT && !state.match_count);
+    finish(&f);
+}
 int main(void)
 {
+    filtered_regex_budget();
+    bounded_count_worker();
     incremental_cancel(); wrap_and_visible(); toggles(); replace_groups(); replacement_failure_and_cancel(); lifecycle_and_backpressure(); painting_and_no_malloc();
     puts("findui_test: all passed");
     return 0;

@@ -118,6 +118,7 @@ findui_code findui_service(findui_panel *panel)
         slot->owner = (uint64_t)(uintptr_t)impl;
         slot->window_start = impl->window_start; slot->window_end = impl->window_end;
         slot->desired_index = impl->desired_index; slot->cache_capacity = impl->config.match_capacity;
+        slot->visible_capacity = impl->config.visible_capacity;
         slot->query_length = impl->state.query_length;
         memcpy(slot->query, impl->query, slot->query_length);
         slot->options = impl->state.options; slot->hook = impl->config.scan_hook;
@@ -172,6 +173,10 @@ bool findui_accept(findui_panel *panel, const work_msg *message)
         } else {
             impl->state.match_count = done.count;
             impl->state.cache_overflow = done.count > impl->config.match_capacity;
+            if (done.visible != FIND_UNSET) {
+                impl->state.visible_matches = done.visible>SIZE_MAX ? SIZE_MAX : (size_t)done.visible;
+                impl->state.visible_overflow = done.visible > impl->config.visible_capacity;
+            }
             if (!done.count) { impl->state.match_index = FINDUI_NO_INDEX; impl->state.selected = unset_range(); }
         }
         return true;

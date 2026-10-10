@@ -1,6 +1,9 @@
 #include "findui/findui.h"
+#include "find/find.h"
 #include "../bench/harness.h"
+#include "find_supervise.h"
 #include <fcntl.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -47,8 +50,12 @@ static work_handle handle_for(const work_pool *pool, uint32_t generation)
             return (work_handle){i, atomic_load(&pool->slots[i].epoch)};
     return (work_handle){0, 0};
 }
-int main(int argc, char **argv)
+#include "findui_count.h"
+typedef struct cancel_arguments { int argc; char **argv; } cancel_arguments;
+static int cancel_worker(void *argument)
 {
+    cancel_arguments *args=argument;
+    int argc=args->argc; char **argv=args->argv;
     bool gate_mode = argc == 2 && strcmp(argv[1], "--gate") == 0;
     if (argc > 2 || (argc == 2 && !gate_mode && strcmp(argv[1], "--track") != 0)) return 2;
     char power[64], load[64];
@@ -128,4 +135,29 @@ int main(int argc, char **argv)
     if (tree) piece_destroy(tree);
     edit_arena_free(&arena); (void)munmap(mapping, length);
     return result;
+}
+int main(int argc,char **argv)
+{
+    if (argc>1 && strcmp(argv[1],"--count")==0) {
+        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",3,false};
+        for (int i=2;i<argc;i++) {
+            if (strcmp(argv[i],"--gate")==0) args.gate=true;
+            else if (strcmp(argv[i],"--track")==0) args.gate=false;
+            else if (strcmp(argv[i],"--fixture")==0 && i+1<argc) args.path=argv[++i];
+            else if (strcmp(argv[i],"--samples")==0 && i+1<argc) {
+                char *end=NULL; unsigned long n=strtoul(argv[++i],&end,10);
+                if (!end || *end || !n || n>64) return 2;
+                args.samples=(size_t)n;
+            } else return 2;
+        }
+        char power[64],load[64];
+        if (!stamp(power,sizeof power,load,sizeof load)) return 2;
+        printf("findui_count: (M)%s power=%s load1=%s fixture=%s\n",
+               bench_evidence_tag(),power,load,args.path);
+        return find_fixture_supervise(count_worker,&args,UINT64_C(600000000000),
+                                      "panel count through shutdown");
+    }
+    cancel_arguments args={argc,argv};
+    return find_fixture_supervise(cancel_worker,&args,UINT64_C(600000000000),
+                                  "panel cancellation through shutdown");
 }

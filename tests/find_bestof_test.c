@@ -45,12 +45,14 @@ static bool find_bestof_work_should_stop(const work_ctx *ctx)
 #define find_literal_mode find_bestof_literal_mode
 #define find_literal find_bestof_literal
 #define find_literal_next find_bestof_literal_next
+#define find_literal_visit find_bestof_literal_visit
 #include "../src/find/literal.c"
 #undef find_lit_init
 #undef find_lit_seek
 #undef find_literal_mode
 #undef find_literal
 #undef find_literal_next
+#undef find_literal_visit
 #undef work_should_stop
 
 typedef struct test_context {
