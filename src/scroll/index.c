@@ -1,33 +1,49 @@
 #include "scroll/scroll.h"
+#include <string.h>
+#include <time.h>
 
-static int source_span(const lineidx_src *src, uint64_t off, uint64_t max,
-                       const uint8_t **bytes, size_t *count)
+#define SPAN_LIMIT 256u
+#define SPAN_BYTES 4096u
+#define SLICE_NS UINT64_C(500000)
+typedef struct slice {
+    const lineidx_src *source;
+    uint64_t left, deadline;
+    unsigned calls;
+    int status;
+} slice;
+static uint64_t now_ns(void)
 {
-    *count = src->span(src->ctx, off, bytes);
-    if (!*count || !*bytes) return SCROLL_ERR_SOURCE;
-    uint64_t remaining = src->len - off;
-    if (*count > remaining) *count = (size_t)remaining;
-    if (*count > max) *count = (size_t)max;
-    return SCROLL_OK;
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
-/* A real line start <= target. No newline in the bounded suffix: retain the
- * last known earlier boundary (0 is always valid), explicitly approximate.
- * Following requires proof that no intervening newline was skipped. */
-static int align_byte(const lineidx_src *src, uint64_t target, uint64_t known,
-                      bool allow_coarse, uint64_t *out)
+static size_t limited_span(void *ctx, uint64_t off, const uint8_t **out)
 {
-    uint64_t lo = target > SCROLL_SCAN_BUDGET ? target - SCROLL_SCAN_BUDGET : 0;
-    uint64_t pos = lo, start = known <= lo ? known : 0;
-    while (pos < target) {
-        const uint8_t *p = NULL; size_t n;
-        int rc = source_span(src, pos, target - pos, &p, &n);
-        if (rc) return rc;
-        for (size_t i = 0; i < n; i++) if (p[i] == '\n') start = pos + i + 1;
-        pos += n;
+    slice *b = ctx;
+    *out = NULL;
+    if (b->status) return 0;
+    if (!b->left || b->calls == SPAN_LIMIT || now_ns() >= b->deadline) {
+        b->status = SCROLL_MORE; return 0;
     }
-    if (!allow_coarse && start < lo) return SCROLL_MORE;
-    *out = start;
-    return SCROLL_OK;
+    b->calls++;
+    size_t n = b->source->span(b->source->ctx, off, out);
+    if (!n || !*out) { b->status = SCROLL_ERR_SOURCE; return 0; }
+    uint64_t limit = b->source->len - off;
+    if (limit > b->left) limit = b->left;
+    if (limit > SPAN_BYTES) limit = SPAN_BYTES;
+    if (n > limit) n = (size_t)limit;
+    b->left -= n;
+    return n;
+}
+static int read_span(slice *b, uint64_t off, uint64_t end, const uint8_t **p, size_t *n)
+{
+    /* Charge only the bytes this operation can examine. */
+    uint64_t saved = b->left;
+    if (b->left > end - off) b->left = end - off;
+    uint64_t allowed = b->left;
+    *n = limited_span(b, off, p);
+    b->left = saved - (allowed - b->left);
+    return b->status;
 }
 static uint64_t estimate_byte(const scroll_state *s, uint64_t rows, bool down)
 {
@@ -37,182 +53,299 @@ static uint64_t estimate_byte(const scroll_state *s, uint64_t rows, bool down)
     uint64_t delta = rows > available / density ? available : rows * density;
     return down ? s->first_byte + delta : s->first_byte - delta;
 }
-static int relative_byte(scroll_state *s, const lineidx_src *src,
-                         bool allow_coarse, uint64_t *out)
+/* Each walker preserves its exact cursor and counters at a yielded callback. */
+enum { ALIGN = 1, DOWN, UP_COUNT, UP_FIND, BOTTOM, COUNT };
+static void align_start(scroll_resolver *r, uint64_t target, uint64_t known, bool coarse)
 {
-    bool down = !s->pending_up;
-    uint64_t rows = s->pending_rows;
-    if (!rows) { *out = s->first_byte; return SCROLL_OK; }
-    uint64_t pos = s->first_byte, left = rows, spent = 0;
-    if (down) {
-        while (left && pos < src->len && spent < SCROLL_SCAN_BUDGET) {
-            const uint8_t *p = NULL; size_t n;
-            int rc = source_span(src, pos, SCROLL_SCAN_BUDGET - spent, &p, &n);
+    r->pos = target > SCROLL_SCAN_BUDGET ? target - SCROLL_SCAN_BUDGET : 0;
+    r->start = known <= r->pos ? known : 0;
+    r->end = target; r->coarse = coarse; r->scan_kind = ALIGN;
+}
+static int align_run(scroll_resolver *r, slice *b, uint64_t *out)
+{
+    while (r->pos < r->end) {
+        const uint8_t *p; size_t n;
+        int rc = read_span(b, r->pos, r->end, &p, &n);
+        if (rc) return rc;
+        for (size_t i = 0; i < n; i++) if (p[i] == '\n') r->start = r->pos + i + 1u;
+        r->pos += n;
+    }
+    uint64_t lo = r->end > SCROLL_SCAN_BUDGET ? r->end - SCROLL_SCAN_BUDGET : 0;
+    if (!r->coarse && r->start < lo) return SCROLL_MORE;
+    *out = r->start; r->scan_kind = 0; return SCROLL_OK;
+}
+static void relative_start(scroll_resolver *r, uint64_t rows, bool up, bool coarse)
+{
+    r->pos = r->next.first_byte; r->left = rows; r->spent = 0;
+    r->coarse = coarse; r->walk_rows = rows; r->walk_up = up;
+    r->scan_kind = up ? UP_COUNT : DOWN;
+    r->block_end = 0;
+    if (up && rows && r->pos) { r->pos--; r->spent++; }
+}
+static int relative_run(scroll_resolver *r, slice *b, uint64_t *out)
+{
+    if (r->scan_kind == ALIGN) return align_run(r, b, out);
+    if (!r->left) { *out = r->next.first_byte; r->scan_kind = 0; return SCROLL_OK; }
+    if (r->scan_kind == DOWN) {
+        while (r->left && r->pos < r->source.len && r->spent < SCROLL_SCAN_BUDGET) {
+            uint64_t end = r->source.len;
+            if (end - r->pos > SCROLL_SCAN_BUDGET - r->spent) end = r->pos + SCROLL_SCAN_BUDGET - r->spent;
+            const uint8_t *p; size_t n;
+            int rc = read_span(b, r->pos, end, &p, &n);
             if (rc) return rc;
             size_t i = 0;
-            for (; i < n; i++) if (p[i] == '\n' && --left == 0) { i++; break; }
-            pos += i; spent += i;
+            for (; i < n; i++) if (p[i] == '\n' && --r->left == 0) { i++; break; }
+            r->pos += i; r->spent += i;
         }
-        if (!left) { *out = pos; return SCROLL_OK; }
-        if (pos == src->len) {
-            s->first_line = s->first_line > left ? s->first_line - left : 0;
-            return align_byte(src, pos, s->first_byte, allow_coarse, out);
+        if (!r->left) { *out = r->pos; r->scan_kind = 0; return SCROLL_OK; }
+        if (r->pos == r->source.len) {
+            r->next.first_line = r->next.first_line > r->left ? r->next.first_line - r->left : 0;
+            align_start(r, r->pos, r->next.first_byte, r->coarse);
+            return align_run(r, b, out);
         }
     } else {
-        if (left && pos) { pos--; spent++; }
-        while (left && pos && spent < SCROLL_SCAN_BUDGET) {
-            uint64_t nbytes = pos < 4096 ? pos : 4096;
-            if (nbytes > SCROLL_SCAN_BUDGET - spent) nbytes = SCROLL_SCAN_BUDGET - spent;
-            uint64_t lo = pos - nbytes, ppos = lo, count = 0;
-            /* Fragmented source: count a backward block's newlines, then
-             * locate the desired newline in forward order. */
-            while (ppos < pos) {
-                const uint8_t *p = NULL; size_t n;
-                int rc = source_span(src, ppos, pos - ppos, &p, &n);
+        while ((r->pos || r->block_end) && r->spent < SCROLL_SCAN_BUDGET) {
+            if (!r->block_end) {
+                uint64_t n = r->pos < SPAN_BYTES ? r->pos : SPAN_BYTES;
+                if (n > SCROLL_SCAN_BUDGET - r->spent) n = SCROLL_SCAN_BUDGET - r->spent;
+                r->block_end = r->pos; r->start = r->pos - n;
+                r->pos = r->start; r->count = 0;
+            }
+            while (r->pos < r->block_end) {
+                const uint8_t *p; size_t n;
+                int rc = read_span(b, r->pos, r->block_end, &p, &n);
                 if (rc) return rc;
-                for (size_t i = 0; i < n; i++) if (p[i] == '\n') count++;
-                ppos += n;
-            }
-            if (count >= left) {
-                uint64_t nth = count - left; ppos = lo;
-                while (ppos < pos) {
-                    const uint8_t *p = NULL; size_t n;
-                    int rc = source_span(src, ppos, pos - ppos, &p, &n);
-                    if (rc) return rc;
-                    for (size_t i = 0; i < n; i++) if (p[i] == '\n') {
-                        if (!nth) { *out = ppos + i + 1; return SCROLL_OK; }
-                        nth--;
-                    }
-                    ppos += n;
+                for (size_t i = 0; i < n; i++) if (p[i] == '\n') {
+                    if (r->scan_kind == UP_FIND) {
+                        if (!r->nth) { *out = r->pos + i + 1u; r->scan_kind = 0; return SCROLL_OK; }
+                        r->nth--;
+                    } else r->count++;
                 }
+                r->pos += n;
             }
-            left -= count; spent += nbytes; pos = lo;
+            if (r->count >= r->left) {
+                r->nth = r->count - r->left; r->pos = r->start; r->scan_kind = UP_FIND;
+                continue;
+            }
+            r->left -= r->count; r->spent += r->block_end - r->start;
+            r->pos = r->start; r->block_end = 0;
         }
-        if (!pos) {
-            if (rows && (left > 1 || !s->first_byte)) s->subrow_q8 = 0;
-            *out = 0; return SCROLL_OK;
+        if (!r->pos) {
+            if (r->left > 1 || !r->next.first_byte) r->next.subrow_q8 = 0;
+            *out = 0; r->scan_kind = 0; return SCROLL_OK;
         }
     }
-    if (!allow_coarse) return SCROLL_MORE;
-    return align_byte(src, estimate_byte(s, rows, down), s->first_byte, true, out);
+    if (!r->coarse) return SCROLL_MORE;
+    uint64_t byte = estimate_byte(&r->next, r->walk_rows, !r->walk_up);
+    align_start(r, byte, r->next.first_byte, true);
+    return align_run(r, b, out);
 }
-/* Unknown line counts still obey EOF. Keep a full viewport where a bounded
- * suffix scan can prove the end. Idle publication never calls this helper. */
-static int clamp_bottom(scroll_state *s, const lineidx_src *src, bool allow_coarse)
+/* Query index metadata without reading a byte: legacy byte_to_line provides
+ * the chunk's baseline count when its first span returns zero. Capture that
+ * chunk seed, then count the suffix through our own resumable scanner. The
+ * intentionally incomplete legacy result is never published. */
+typedef struct seed { uint64_t start; bool requested; } seed;
+static size_t seed_span(void *ctx, uint64_t off, const uint8_t **out)
 {
-    uint64_t pos = s->first_byte, spent = 0, newlines = 0;
-    while (pos < src->len && spent < SCROLL_SCAN_BUDGET && newlines < s->config.rows) {
-        const uint8_t *p = NULL; size_t n;
-        int rc = source_span(src, pos, SCROLL_SCAN_BUDGET - spent, &p, &n);
+    seed *q = ctx; q->start = off; q->requested = true; *out = NULL; return 0;
+}
+static int byte_line(scroll_resolver *r, slice *b, uint64_t byte, lineidx_result *out)
+{
+    if (!r->query_active) {
+        seed q = {0, false};
+        lineidx_src src = {&q, r->source.len, seed_span, NULL};
+        lineidx_result value = lineidx_byte_to_line(r->index, &src, byte);
+        if (!q.requested) { *out = value; return SCROLL_OK; }
+        r->query_active = true; r->query_byte = q.start; r->query_line = value.value;
+        r->query_exact = value.exact;
+    }
+    while (r->query_byte < byte) {
+        const uint8_t *p; size_t n;
+        int rc = read_span(b, r->query_byte, byte, &p, &n);
+        if (rc) return rc;
+        for (size_t i = 0; i < n; i++) if (p[i] == '\n') r->query_line++;
+        r->query_byte += n;
+    }
+    *out = (lineidx_result){r->query_line, r->query_exact};
+    r->query_active = false; return SCROLL_OK;
+}
+static void bottom_start(scroll_resolver *r, bool coarse)
+{
+    r->pos = r->next.first_byte; r->spent = r->count = 0;
+    r->coarse = coarse; r->scan_kind = BOTTOM;
+}
+static int bottom_run(scroll_resolver *r, slice *b)
+{
+    if (r->scan_kind != BOTTOM) {
+        int rc = relative_run(r, b, &r->next.first_byte);
+        if (rc) return rc;
+        r->next.subrow_q8 = 0; return SCROLL_OK;
+    }
+    while (r->pos < r->source.len && r->spent < SCROLL_SCAN_BUDGET && r->count < r->next.config.rows) {
+        uint64_t end = r->source.len;
+        if (end - r->pos > SCROLL_SCAN_BUDGET - r->spent) end = r->pos + SCROLL_SCAN_BUDGET - r->spent;
+        const uint8_t *p; size_t n;
+        int rc = read_span(b, r->pos, end, &p, &n);
         if (rc) return rc;
         size_t i = 0;
-        for (; i < n; i++) if (p[i] == '\n' && ++newlines == s->config.rows) { i++; break; }
-        pos += i; spent += i;
+        for (; i < n; i++) if (p[i] == '\n' && ++r->count == r->next.config.rows) { i++; break; }
+        r->pos += i; r->spent += i;
     }
-    if (pos < src->len || newlines >= s->config.rows) return SCROLL_OK;
-    uint64_t missing = (uint64_t)s->config.rows - 1 - newlines;
-    if (missing) {
-        scroll_state back = *s;
-        back.pending_rows = missing; back.pending_up = true;
-        uint64_t byte;
-        int rc = relative_byte(&back, src, allow_coarse, &byte);
-        if (rc) return rc;
-        s->first_byte = byte;
-        s->first_line = s->first_line > missing ? s->first_line - missing : 0;
+    if (r->pos < r->source.len || r->count >= r->next.config.rows) {
+        r->scan_kind = 0; return SCROLL_OK;
     }
-    s->subrow_q8 = 0;
-    return SCROLL_OK;
+    uint64_t missing = (uint64_t)r->next.config.rows - 1u - r->count;
+    r->next.first_line = r->next.first_line > missing ? r->next.first_line - missing : 0;
+    r->next.subrow_q8 = 0;
+    if (!missing) { r->scan_kind = 0; return SCROLL_OK; }
+    relative_start(r, missing, true, r->coarse);
+    return relative_run(r, b, &r->next.first_byte);
 }
-int scroll_resolve(scroll_state *s, lineidx *index, const lineidx_src *source, uint64_t budget)
+static int resolve_run(scroll_resolver *r, slice *b)
 {
-    if (!s || !index || !source || !source->span || source->len != lineidx_len(index) ||
+    scroll_state *s = &r->next;
+    for (;;) {
+        if (r->phase == 0) {
+            lineidx_result count = lineidx_line_count(r->index);
+            s->extent = (scroll_extent){r->source.len, count.value, count.exact};
+            if (s->request == SCROLL_BYTE) { align_start(r, s->target_byte, s->first_byte, true); r->phase = 1; }
+            else if (s->request == SCROLL_RELATIVE && s->approximate) {
+                relative_start(r, s->pending_rows, s->pending_up, true); r->phase = 2;
+            } else r->phase = s->request == SCROLL_READY ? 5u : 3u;
+        } else if (r->phase == 1 || r->phase == 2) {
+            int rc = r->phase == 1 ? align_run(r, b, &s->first_byte) : relative_run(r, b, &s->first_byte);
+            if (rc) return rc;
+            r->phase = 4;
+        } else if (r->phase == 3) {
+            lineidx_src src = {b, r->source.len, limited_span, NULL};
+            lineidx_result byte = lineidx_seek_line(r->index, &src, s->first_line, b->left);
+            if (b->status) return b->status;
+            if (!byte.exact) return SCROLL_MORE;
+            s->first_byte = byte.value; r->phase = 4;
+        } else if (r->phase == 4) {
+            if (!r->before.extent.exact || s->request == SCROLL_BYTE) { bottom_start(r, true); r->phase = 6; }
+            else r->phase = 5;
+        } else if (r->phase == 6) {
+            int rc = bottom_run(r, b); if (rc) return rc; r->phase = 5;
+        } else {
+            lineidx_result line;
+            int rc = byte_line(r, b, s->first_byte, &line); if (rc) return rc;
+            if (line.exact || s->request == SCROLL_BYTE) s->first_line = line.value;
+            s->approximate = !line.exact;
+            if (s->request != SCROLL_READY || line.exact) s->anchor_line = s->first_line;
+            s->request = SCROLL_READY; s->pending_rows = 0;
+            lineidx_result count = lineidx_line_count(r->index);
+            s->extent = (scroll_extent){r->source.len, count.value, count.exact};
+            r->phase = 0; return SCROLL_OK;
+        }
+    }
+}
+static int follow_run(scroll_resolver *r, slice *b)
+{
+    scroll_state *s = &r->next;
+    for (;;) {
+        int rc;
+        if (r->follow_phase == 0) {
+            rc = resolve_run(r, b); if (rc) return rc; r->follow_phase = 1;
+        } else if (r->follow_phase == 1) {
+            lineidx_result cursor;
+            rc = byte_line(r, b, r->cursor, &cursor); if (rc) return rc;
+            r->query_line = cursor.value; r->query_exact = cursor.exact;
+            if (cursor.exact && !s->approximate) {
+                rc = scroll_follow(s, cursor.value); if (rc) return rc;
+                r->follow_phase = 8; continue;
+            }
+            uint32_t margin = s->config.margin, limit = (s->config.rows - 1u) / 2u;
+            if (margin > limit) margin = limit;
+            r->slot = margin;
+            if (r->cursor >= s->first_byte) {
+                if (r->cursor - s->first_byte <= SCROLL_SCAN_BUDGET) {
+                    r->pos = s->first_byte; r->end = r->cursor; r->count = 0;
+                    r->follow_phase = 2; continue;
+                }
+                r->slot = s->config.rows - margin - 1u;
+            }
+            r->follow_phase = 3;
+        } else if (r->follow_phase == 2) {
+            while (r->pos < r->end) {
+                const uint8_t *p; size_t n;
+                rc = read_span(b, r->pos, r->end, &p, &n); if (rc) return rc;
+                for (size_t i = 0; i < n; i++) if (p[i] == '\n') r->count++;
+                r->pos += n;
+            }
+            uint64_t margin = r->slot;
+            if (r->count >= margin && r->count < s->config.rows - margin &&
+                (r->count != margin || !s->subrow_q8)) return SCROLL_OK;
+            if (r->count >= s->config.rows - margin) r->slot = s->config.rows - margin - 1u;
+            r->follow_phase = 3;
+        } else if (r->follow_phase == 3) {
+            if (r->query_exact) r->follow_phase = 4;
+            else { align_start(r, r->cursor, s->first_byte, false); r->follow_phase = 5; }
+        } else if (r->follow_phase == 4) {
+            lineidx_src src = {b, r->source.len, limited_span, NULL};
+            lineidx_result byte = lineidx_seek_line(r->index, &src, r->query_line, b->left);
+            if (b->status) return b->status;
+            if (!byte.exact) return SCROLL_MORE;
+            s->first_byte = byte.value; r->follow_phase = 6;
+        } else if (r->follow_phase == 5) {
+            rc = align_run(r, b, &s->first_byte); if (rc) return rc; r->follow_phase = 6;
+        } else if (r->follow_phase == 6) {
+            s->first_line = r->query_line > r->slot ? r->query_line - r->slot : 0;
+            s->pending_rows = r->slot; s->pending_up = true; s->subrow_q8 = 0;
+            relative_start(r, r->slot, true, false); r->follow_phase = 7;
+        } else if (r->follow_phase == 7) {
+            rc = relative_run(r, b, &s->first_byte); if (rc) return rc;
+            bottom_start(r, false); r->follow_phase = 9;
+        } else if (r->follow_phase == 8) return resolve_run(r, b);
+        else if (r->follow_phase == 9) {
+            rc = bottom_run(r, b); if (rc) return rc; r->follow_phase = 10;
+        } else {
+            lineidx_result top;
+            rc = byte_line(r, b, s->first_byte, &top); if (rc) return rc;
+            s->first_line = s->anchor_line = top.value; s->approximate = !top.exact;
+            s->pending_rows = 0; s->request = SCROLL_READY; return SCROLL_OK;
+        }
+    }
+}
+static int run_slice(scroll_state *s, scroll_resolver *r, lineidx *index,
+                     const lineidx_src *source, uint64_t cursor, bool following,
+                     uint64_t budget, uint64_t deadline)
+{
+    if (!s || !r || !index || !source || !source->span || source->len != lineidx_len(index) ||
         source->len != s->extent.bytes || budget > SCROLL_SCAN_BUDGET ||
         (s->request != SCROLL_LINE && s->request != SCROLL_BYTE && s->first_byte > source->len) ||
         (s->request == SCROLL_BYTE && s->target_byte > source->len) ||
-        !s->config.rows || !s->config.row_height) return SCROLL_ERR_ARG;
-    scroll_state next = *s;
-    lineidx_result count = lineidx_line_count(index);
-    next.extent = (scroll_extent){source->len, count.value, count.exact};
-    int rc = SCROLL_OK;
-    bool new_byte = s->request != SCROLL_READY;
-    if (s->request == SCROLL_BYTE) {
-        rc = align_byte(source, s->target_byte, s->first_byte, true, &next.first_byte);
-    } else if (s->request == SCROLL_RELATIVE && s->approximate) {
-        /* A just-published prefix must not reinterpret a pending relative
-         * delta as an absolute request in the old estimated line space. */
-        rc = relative_byte(&next, source, true, &next.first_byte);
-    } else if (s->request != SCROLL_READY) {
-        lineidx_result byte = budget ? lineidx_seek_line(index, source, s->first_line, budget) :
-            lineidx_line_to_byte(index, source, s->first_line);
-        if (byte.exact || s->request == SCROLL_LINE) next.first_byte = byte.value;
-        else rc = relative_byte(&next, source, true, &next.first_byte);
+        !s->config.rows || !s->config.row_height ||
+        (following && (cursor > source->len || s->request != SCROLL_READY))) return SCROLL_ERR_ARG;
+    if (!r->active || r->following != following || r->cursor != cursor || r->index != index ||
+        r->source.ctx != source->ctx || r->source.span != source->span || r->source.len != source->len ||
+        memcmp(&r->before, s, sizeof *s)) {
+        memset(r, 0, sizeof *r); r->active = true; r->before = r->next = *s;
+        r->index = index; r->source = *source; r->cursor = cursor; r->following = following;
     }
-    if (rc) return rc;
-    if (new_byte && (!s->extent.exact || s->request == SCROLL_BYTE)) {
-        rc = clamp_bottom(&next, source, true);
-        if (rc) return rc;
-    }
-    lineidx_result line = lineidx_byte_to_line(index, source, next.first_byte);
-    if (line.exact || s->request == SCROLL_BYTE) next.first_line = line.value;
-    next.approximate = !line.exact;
-    /* Publication relabels the physical viewport, never seeks from its old
-     * density estimate and never follows a cursor after pure scrolling. */
-    if (new_byte || line.exact) next.anchor_line = next.first_line;
-    next.request = SCROLL_READY;
-    next.pending_rows = 0;
-    count = lineidx_line_count(index);
-    next.extent = (scroll_extent){source->len, count.value, count.exact};
-    *s = next;
-    return SCROLL_OK;
+    uint64_t current = now_ns();
+    slice b = {source, budget ? budget : SCROLL_SCAN_BUDGET,
+        deadline ? deadline : current + SLICE_NS, 0, SCROLL_OK};
+    int rc = following ? follow_run(r, &b) : resolve_run(r, &b);
+    if (b.status) rc = b.status;
+    if (rc == SCROLL_OK) *s = r->next;
+    if (rc != SCROLL_MORE || !b.status) r->active = false;
+    return rc;
 }
-int scroll_follow_cursor(scroll_state *s, lineidx *index,
-                         const lineidx_src *source, uint64_t cursor_byte)
+int scroll_resolve_slice(scroll_state *s, scroll_resolver *r, lineidx *index,
+                         const lineidx_src *source, uint64_t budget, uint64_t deadline_ns)
+{ return run_slice(s, r, index, source, 0, false, budget, deadline_ns); }
+int scroll_follow_cursor_slice(scroll_state *s, scroll_resolver *r, lineidx *index,
+                               const lineidx_src *source, uint64_t cursor_byte,
+                               uint64_t budget, uint64_t deadline_ns)
+{ return run_slice(s, r, index, source, cursor_byte, true, budget, deadline_ns); }
+int scroll_resolve(scroll_state *s, lineidx *index, const lineidx_src *source, uint64_t budget)
 {
-    if (!s || !source || cursor_byte > source->len || s->request != SCROLL_READY) return SCROLL_ERR_ARG;
-    scroll_state next = *s;
-    int rc = scroll_resolve(&next, index, source, 0);
-    if (rc) return rc;
-    lineidx_result cursor = lineidx_byte_to_line(index, source, cursor_byte);
-    if (cursor.exact && !next.approximate) {
-        rc = scroll_follow(&next, cursor.value);
-        if (!rc) rc = scroll_resolve(&next, index, source, 0);
-        if (!rc) *s = next;
-        return rc;
-    }
-    uint32_t margin = next.config.margin, limit = (next.config.rows - 1) / 2;
-    if (margin > limit) margin = limit;
-    uint64_t slot = margin;
-    if (cursor_byte >= next.first_byte) {
-        uint64_t distance = cursor_byte - next.first_byte, rows = 0;
-        if (distance <= SCROLL_SCAN_BUDGET) {
-            uint64_t pos = next.first_byte;
-            while (pos < cursor_byte) {
-                const uint8_t *p = NULL; size_t n;
-                rc = source_span(source, pos, cursor_byte - pos, &p, &n);
-                if (rc) return rc;
-                for (size_t i = 0; i < n; i++) if (p[i] == '\n') rows++;
-                pos += n;
-            }
-            if (rows >= margin && rows < next.config.rows - margin &&
-                (rows != margin || !next.subrow_q8)) { *s = next; return SCROLL_OK; }
-            if (rows >= next.config.rows - margin) slot = next.config.rows - margin - 1u;
-        } else slot = next.config.rows - margin - 1u;
-    }
-    uint64_t start;
-    if (cursor.exact) start = lineidx_line_to_byte(index, source, cursor.value).value;
-    else {
-        rc = align_byte(source, cursor_byte, next.first_byte, false, &start);
-        if (rc) return rc;
-    }
-    next.first_byte = start;
-    next.first_line = cursor.value > slot ? cursor.value - slot : 0;
-    next.pending_rows = slot; next.pending_up = true; next.subrow_q8 = 0;
-    rc = relative_byte(&next, source, false, &next.first_byte);
-    if (!rc) rc = clamp_bottom(&next, source, false);
-    if (rc) return rc;
-    lineidx_result top = lineidx_byte_to_line(index, source, next.first_byte);
-    next.first_line = top.value; next.anchor_line = top.value; next.approximate = !top.exact;
-    next.pending_rows = 0; next.request = SCROLL_READY;
-    *s = next;
-    return SCROLL_OK;
+    scroll_resolver r = {0};
+    return scroll_resolve_slice(s, &r, index, source, budget, 0);
+}
+int scroll_follow_cursor(scroll_state *s, lineidx *index, const lineidx_src *source, uint64_t cursor_byte)
+{
+    scroll_resolver r = {0};
+    return scroll_follow_cursor_slice(s, &r, index, source, cursor_byte, 0, 0);
 }

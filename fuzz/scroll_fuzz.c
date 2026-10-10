@@ -35,6 +35,23 @@ static void follow(model *m, uint64_t cursor)
         m->position = (int64_t)(cursor - (m->rows - margin - 1)) * m->height * 256;
     if (m->position > maximum(m)) m->position = maximum(m);
 }
+/* Pump the caller-owned bounded adapter; no model changes. */
+static int resolve(scroll_state *s, lineidx *index, const lineidx_src *src)
+{
+    scroll_resolver r = {0};
+    int rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10000 && rc == SCROLL_MORE; i++)
+        rc = scroll_resolve_slice(s, &r, index, src, 0, 0);
+    return rc;
+}
+static int follow_cursor(scroll_state *s, lineidx *index, const lineidx_src *src, uint64_t cursor)
+{
+    scroll_resolver r = {0};
+    int rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10000 && rc == SCROLL_MORE; i++)
+        rc = scroll_follow_cursor_slice(s, &r, index, src, cursor, 0, 0);
+    return rc;
+}
 static void core_model(const uint8_t *data, size_t size)
 {
     scroll_state s;
@@ -121,7 +138,7 @@ static void index_model(const uint8_t *data, size_t size)
     /* Start well away from either endpoint and before any index publication. */
     size_t physical = count / 2;
     REQUIRE(scroll_seek_byte(&s, starts[physical]) == 0);
-    REQUIRE(scroll_resolve(&s, index, &src, 0) == 0 && s.first_byte == starts[physical]);
+    REQUIRE(resolve(&s, index, &src) == 0 && s.first_byte == starts[physical]);
     model m = {.position = (int64_t)physical * 17 * 256, .rows = 24, .height = 17, .margin = 3, .lines = count};
     for (size_t i = 0; i + 3 < size && i < 512; i += 4) {
         unsigned op = data[i] % 7u;
@@ -151,13 +168,13 @@ static void index_model(const uint8_t *data, size_t size)
             (void)lineidx_seek_line(index, &src, UINT64_MAX, LINEIDX_CHUNK);
         } else {
             size_t cursor = (size_t)data[i + 1] * (count - 1) / 255;
-            REQUIRE(scroll_follow_cursor(&s, index, &src, starts[cursor]) == 0);
+            REQUIRE(follow_cursor(&s, index, &src, starts[cursor]) == 0);
             follow(&m, cursor);
         }
         physical = (size_t)(m.position / ((int64_t)m.height * 256));
         /* Also exercise publication landing after an event, before resolve. */
         if (data[i + 3] & 1u) (void)lineidx_seek_line(index, &src, UINT64_MAX, LINEIDX_CHUNK);
-        REQUIRE(scroll_resolve(&s, index, &src, 0) == 0);
+        REQUIRE(resolve(&s, index, &src) == 0);
         REQUIRE(s.first_byte == starts[physical]);
         REQUIRE(s.subrow_q8 == (uint64_t)(m.position % ((int64_t)m.height * 256)));
         REQUIRE(s.first_byte == 0 || bytes[s.first_byte - 1] == '\n');

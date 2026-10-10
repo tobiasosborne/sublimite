@@ -45,22 +45,68 @@ int scroll_key_motion(scroll_state *s, scroll_key key, view_key *motion);
  * Margins shrink to (rows-1)/2. Fully visible rows, including sub-row clipping. */
 int scroll_follow(scroll_state *s, uint64_t cursor_line);
 
-/* Explicit lineidx/source adapter. No allocation; budget <= 65536. A nonzero
- * seek budget publishes a bounded prefix via lineidx_seek_line (UI only).
- * Resolve each pending event before another transition. Approximate relative
- * scrolling walks physical newlines from the byte anchor. Idle publication
- * corrects ONLY its line label, preserving bytes/pixels and cursor placement.
- * A fresh extent is adopted here without clamping/moving the existing anchor.
- * Source must match index and remain stable throughout the call. */
+/* Caller-owned continuation, zero-initialized at setup. Private fields; no
+ * allocation. A new state/source/index cancels the previous pending operation.
+ * Source bytes and index must remain unchanged between slices (publication is
+ * allowed); zero this object after a source edit or cancellation. */
+typedef struct scroll_resolver {
+    scroll_state before, next;
+    lineidx *index;
+    lineidx_src source;
+    uint64_t cursor, pos, end, start, left, spent, count, block_end, nth;
+    uint64_t query_byte, query_line, slot, walk_rows;
+    uint32_t phase, follow_phase, scan_kind;
+    bool active, following, coarse, query_exact, query_active, walk_up;
+} scroll_resolver;
+/* The complete operation shares <= budget bytes, <= 256 source callbacks,
+ * and an absolute CLOCK_MONOTONIC deadline (0: entry + 0.5 ms). budget=0
+ * chooses the default 64 KiB slice; positive budgets are literal. Each callback
+ * must be resident/nonblocking and bounded; bytes returned are capped at 4 KiB.
+ * MORE leaves s unchanged, retaining progress only in resolver/index. Repeat
+ * after checking input. Errors discard the continuation and preserve s. */
+int scroll_resolve_slice(scroll_state *s, scroll_resolver *resolver, lineidx *index,
+                         const lineidx_src *source, uint64_t budget, uint64_t deadline_ns);
+int scroll_follow_cursor_slice(scroll_state *s, scroll_resolver *resolver, lineidx *index,
+                               const lineidx_src *source, uint64_t cursor_byte,
+                               uint64_t budget, uint64_t deadline_ns);
+/* Compatibility one-slice calls. For fragmented sources or multi-stage
+ * operations use the caller-owned continuation API to ensure progress. */
 int scroll_resolve(scroll_state *s, lineidx *index, const lineidx_src *source,
                    uint64_t budget);
-/* Post-motion/edit policy for callers holding a cursor BYTE. Physical row
- * counting near the viewport avoids mixing different density estimates.
- * Far cursors use a bounded line-start seed and physical margin backtracking.
- * Call only after resolve, with request == SCROLL_READY. MORE means a bounded
- * scan could not prove the cursor's line/margins: retain the pending motion
- * and retry after index publication. MORE preserves the physical viewport.
- * A new pure scroll cancels that caller-owned pending-follow intent. */
 int scroll_follow_cursor(scroll_state *s, lineidx *index,
                          const lineidx_src *source, uint64_t cursor_byte);
+/* Resident source bridge: immutable snapshot bytes are copied on WORK_BULK
+ * into two fixed caller-owned windows and adopted ONLY through work mailboxes.
+ * Init/close are setup/maintenance operations. Keep source.ctx/backing alive
+ * until close returns OK; release ownership remains with the caller. Never
+ * use a raw mapped source with the foreground slice API. A missing window
+ * keeps navigation pending (MORE); failures preserve the viewport. */
+#define SCROLL_RESIDENT_WINDOWS 2u
+#define SCROLL_RESIDENT_MSG UINT32_C(0x5343524c)
+struct scroll_resident;
+typedef struct scroll_resident_window {
+    struct scroll_resident *owner;
+    work_handle handle;
+    uint64_t start;
+    size_t length, filled;
+    uint32_t id, generation, state;
+    int error;
+    uint8_t bytes[SCROLL_SCAN_BUDGET];
+} scroll_resident_window;
+typedef struct scroll_resident {
+    work_pool *pool;
+    lineidx_src snapshot;
+    scroll_resident_window windows[SCROLL_RESIDENT_WINDOWS];
+    uint32_t generation, replacement;
+    bool pending, closing;
+} scroll_resident;
+int scroll_resident_init(scroll_resident *r, work_pool *pool, const lineidx_src *snapshot);
+/* Bounded mailbox adoption; called by the resident slice wrappers too. */
+void scroll_resident_poll(scroll_resident *r);
+int scroll_resident_close(scroll_resident *r);
+int scroll_resolve_resident(scroll_state *s, scroll_resolver *resolver, lineidx *index,
+                            scroll_resident *resident, uint64_t budget, uint64_t deadline_ns);
+int scroll_follow_cursor_resident(scroll_state *s, scroll_resolver *resolver, lineidx *index,
+                                  scroll_resident *resident, uint64_t cursor_byte,
+                                  uint64_t budget, uint64_t deadline_ns);
 #endif

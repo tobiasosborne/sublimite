@@ -134,6 +134,17 @@ static bool correct_viewport(const viewport *v, const source *f, uint64_t byte)
     }
     return true;
 }
+/* Keep continuation/adoption/waiting inside the end-to-end request timer. */
+static int resolve_viewport(scroll_state *s, lineidx *index, const lineidx_src *src, uint64_t deadline)
+{
+    scroll_resolver resolver = {0};
+    int rc;
+    do {
+        rc = scroll_resolve_slice(s, &resolver, index, src, 0, 0);
+        if (bench_now_ns() >= deadline) return -1;
+    } while (rc == SCROLL_MORE);
+    return rc;
+}
 int main(int argc, char **argv)
 {
     bool track = argc == 2 && strcmp(argv[1], "--track") == 0;
@@ -155,6 +166,8 @@ int main(int argc, char **argv)
     viewport v;
     if (viewport_init(&v, &f)) { viewport_free(&v); munmap(mapping, (size_t)f.size); return 2; }
     printf("scroll_bench: TRACK=%d warm mapped corpus, 80x24 null frames; (G) jump p50<=30ms p99<=50ms; (G) work max<=T/2=4.166667ms, 0/10000 over-budget steps\n", track);
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    if (!pool || work_pool_init(pool, 1, 0)) return 2;
     uint64_t jump_values[JUMPS]; stamp jump_stamps[JUMPS];
     bench_samples jumps; bench_samples_init(&jumps, jump_values, JUMPS);
     lineidx *index = NULL;
@@ -167,11 +180,23 @@ int main(int argc, char **argv)
         jump_stamps[i] = read_stamp();
         uint64_t start = bench_now_ns();
         if (scroll_seek_line(&s, target)) return 2;
-        /* Single synchronous partial-prefix request, stopping at the target
-         * chunk. Its entire scan is charged. Editor integration must schedule
-         * bounded work/cancellation; this benchmark does not invent an async API. */
-        lineidx_result result = lineidx_seek_line(index, &src, target, f.size);
-        if (!result.exact || scroll_resolve(&s, index, &src, 0) || produce_frame(&v, &s, lines)) return 2;
+        uint64_t deadline = start + UINT64_C(10000000000);
+        /* Enqueue an immutable-source seek and pump bounded mailbox adoption.
+         * Waiting, exact-result adoption, resolution and correct submission
+         * are all charged; no full-file foreground scan is admitted. */
+        if (lineidx_seek_start_owned(index, pool, &src, target, 0)) return 2;
+        lineidx_result result = {0, false};
+        while (!lineidx_seek_result(index, &result)) {
+            if (bench_now_ns() >= deadline) {
+                lineidx_build_cancel(index);
+                fprintf(stderr, "scroll_bench: jump timeout before exact adoption\n");
+                return 2;
+            }
+            struct timespec delay = {0, 100000};
+            (void)nanosleep(&delay, NULL);
+        }
+        if (!result.exact || result.value != expected ||
+            resolve_viewport(&s, index, &src, deadline) || produce_frame(&v, &s, lines)) return 2;
         uint64_t duration = bench_now_ns() - start;
         if (s.first_byte != expected || s.first_line != target || !correct_viewport(&v, &f, expected)) return 2;
         (void)bench_add(&jumps, duration);
@@ -194,7 +219,7 @@ int main(int argc, char **argv)
     }
     scroll_state s;
     if (scroll_init(&s, (scroll_config){ROWS, v.grid.dims.cell_h, 3}, (scroll_extent){f.size, lines, true}) ||
-        scroll_seek_line(&s, target - 20000) || scroll_resolve(&s, index, &src, 0)) return 2;
+        scroll_seek_line(&s, target - 20000) || resolve_viewport(&s, index, &src, bench_now_ns() + UINT64_C(10000000000))) return 2;
     uint64_t work_values[STEPS]; bench_samples work; bench_samples_init(&work, work_values, STEPS);
     stamp cadence_stamp = read_stamp();
     uint64_t maximum_ns = 0; size_t slow = 0;
@@ -202,7 +227,7 @@ int main(int argc, char **argv)
         int32_t delta = (i % 7u == 0) ? 256 : (int32_t)(i % 61u) + 1;
         if (i >= STEPS / 2) delta = -delta;
         uint64_t start = bench_now_ns();
-        if (scroll_wheel(&s, delta) || scroll_resolve(&s, index, &src, 0) || produce_frame(&v, &s, lines)) return 2;
+        if (scroll_wheel(&s, delta) || resolve_viewport(&s, index, &src, start + UINT64_C(10000000000)) || produce_frame(&v, &s, lines)) return 2;
         uint64_t duration = bench_now_ns() - start;
         if (duration > maximum_ns) maximum_ns = duration;
         if (duration > HALF_PERIOD_NS) slow++;
@@ -215,7 +240,16 @@ int main(int argc, char **argv)
         bench__tag_from_power(cadence_stamp.power), cadence_stamp.load, cadence_stamp.power, STEPS,
         bench_p50(&work), bench_p99(&work), maximum_ns, slow, HALF_PERIOD_NS, track);
     puts("G3z displayed refreshes: UNMEASURED; requires real display and editor wiring. Sub-row pixel origin is retained by scroll; null render currently draws integral rows.");
-    lineidx_destroy(index); viewport_free(&v); munmap(mapping, (size_t)f.size);
+    lineidx_destroy(index);
+    /* A cancelled seek must never become adoptable, including a fast worker
+     * completion racing cancellation. Outside the descriptive sample timer. */
+    index = lineidx_create(f.size);
+    if (!index || lineidx_seek_start_owned(index, pool, &src, target, 0)) return 2;
+    lineidx_build_cancel(index);
+    lineidx_result cancelled;
+    if (lineidx_seek_result(index, &cancelled)) return 2;
+    lineidx_destroy(index);
+    work_pool_shutdown(pool); free(pool); viewport_free(&v); munmap(mapping, (size_t)f.size);
     {
         int rc = bench_exit_code(jump_verdict, track);
         if (!track && slow != 0) rc = 1;
