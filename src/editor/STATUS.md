@@ -413,3 +413,28 @@ Final clang 18 ASan/UBSan make check exits zero: 59 test binaries plus replay
 CLI, leaks disabled (M)[AC]. The unrelated transient view assertion, clock-skew
 handling, pasted red/green and complete limitations are in
 ../../docs/worker-reports/edit-zzj.12-s9.md. Design: ../../docs/decisions/edit-zzj.12.md.
+
+# edit-czn session 9 — deep-file line starts
+
+The reported log_1g G1 prefix replay is reproduced and traced to the editor's
+legacy post-edit view normalization, before T2. The editor now imports its
+certified viewport/preceding anchors into the existing fixed view cache,
+retains a capped backward-scan anchor through a boundary line join, and reuses
+layout row starts. Unresolved clipped rows use capped tail scans or the
+existing partial lineidx query; no lineidx implementation/policy change.
+
+Focused regressions cover unbuilt metadata at beginning/deep/EOF positions,
+character/Enter/backspace edits, and deletion of the preceding viewport
+newline. Existing long-clipped-line first-frame/edit/undo coverage remains
+green. Final-source ASan/UBSan check passed 59 binaries and replay CLI (M)[AC],
+leaks disabled. Editor fuzz completed 61 seconds, 12821 executions clean
+(M)[AC], against 60 seconds (G). The full existing benchmark matrix and final-source confirmations completed
+in TRACK mode; zero typing allocations were observed (M)[AC]. Forced gcc
+release make all exited zero after the host clock correction. Loaded-box
+p99 misses and native EGL fallback prevent a G1 gate certification. Giant
+line/query work outside the certified-anchor cap remains unproved; index
+restart/repair and metadata maintenance belong to their separate beads.
+
+Full red/green, exact trace attribution, final build/row verification, and
+limitations: ../../docs/worker-reports/edit-czn-s9.md. Design:
+../../docs/decisions/edit-czn.md.

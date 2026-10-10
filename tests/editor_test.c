@@ -1057,11 +1057,70 @@ cleanup:
     return result;
 #undef SELECT_T
 }
+static int partial_line_start(void)
+{
+    const size_t len = 8u * 1024u * 1024u;
+    uint8_t *bytes = malloc(len); T(bytes != NULL);
+    for (size_t i = 0; i < len; i++) bytes[i] = i % 128u == 127u ? '\n' : 'a';
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
+    const uint64_t starts[] = {0, (uint64_t)(len / 128u * 9u / 10u) * 128u, len - 128u};
+    for (size_t at = 0; at < sizeof starts / sizeof starts[0]; at++) {
+        uint64_t start = starts[at];
+        T(editor_set_cursor(e, start + 10u) == 0); T(settle(e) == 0);
+        lineidx_destroy(e->buffer->index);
+        e->buffer->index = lineidx_create(len); T(e->buffer->index != NULL);
+        e->buffer->index_dirty = false;
+        for (unsigned i = 0; i < 12; i++) {
+            plat_event ev = i % 2u ? key(XKB_KEY_BackSpace, 0, NULL) :
+                (i % 4u == 2u ? key(XKB_KEY_Return, 0, NULL) : key('x', 0, "x"));
+            uint64_t frames = b.stats.submitted_frames;
+            T(editor_inject(e, &ev) == 0);
+            unsigned turns = 0;
+            do {
+                T(editor_step(e, 0) >= 0); turns++;
+                if (view_busy(&e->v) && e->v.query_kind && e->v.query_pos < start)
+                    fprintf(stderr, "partial line-start: query_byte=%llu below viewport_byte=%llu\n",
+                        (unsigned long long)e->v.query_pos, (unsigned long long)start);
+                T(!view_busy(&e->v) || !e->v.query_kind || e->v.query_pos >= start);
+            }
+            while (editor_get_stats(e).pending && turns < 16u);
+            if (editor_get_stats(e).pending)
+                fprintf(stderr, "partial line-start: turns=%u query_byte=%llu viewport_byte=%llu\n", turns,
+                    (unsigned long long)e->v.query_pos, (unsigned long long)start);
+            T(!editor_get_stats(e).pending);
+            T(b.stats.submitted_frames > frames);
+            T(editor_view(e).first_byte == start);
+            T(e->row_byte[1] == (i % 4u == 2u ? start + 11u : start + 128u + (i % 2u ? 0u : 1u)));
+            T(!editor_index_complete(e));
+        }
+    }
+    uint64_t join = starts[1];
+    T(editor_set_cursor(e, join) == 0); T(settle(e) == 0);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(len); T(e->buffer->index != NULL);
+    e->buffer->index_dirty = false;
+    plat_event back = key(XKB_KEY_BackSpace, 0, NULL); T(editor_inject(e, &back) == 0);
+    unsigned turns = 0;
+    do {
+        T(editor_step(e, 0) >= 0); turns++;
+        if (view_busy(&e->v) && e->v.query_kind && e->v.query_pos < join - 128u)
+            fprintf(stderr, "partial joined line-start: query_byte=%llu below anchor_byte=%llu\n",
+                (unsigned long long)e->v.query_pos, (unsigned long long)(join - 128u));
+        T(!view_busy(&e->v) || !e->v.query_kind || e->v.query_pos >= join - 128u);
+    } while (editor_get_stats(e).pending && turns < 16u);
+    T(!editor_get_stats(e).pending && editor_view(e).first_byte == join - 128u);
+    T(editor_length(e) == len - 1u);
+    editor_close(e);
+    puts("editor_test: partial index deep typing reuses viewport line starts passed"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
         if (!strcmp(argv[1], "--raster-blink")) return raster_blink_damage();
+        if (!strcmp(argv[1], "--line-start-only")) return partial_line_start();
         if (!strcmp(argv[1], "--selection")) return backend_selection();
         if (!strcmp(argv[1], "--fallback")) return backend_fallback();
         if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
@@ -1074,6 +1133,7 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(review_suite(NULL) == 0);
+    T(partial_line_start() == 0);
     T(backend_selection() == 0); T(backend_fallback() == 0); T(backend_gpu_completion() == 0);
     const char *name = getenv("EDIT_BACKEND");
     if (name) T(selected_backend_test(name, false) == 0);

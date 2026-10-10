@@ -3,6 +3,7 @@
 #include "raster/raster.h"
 #include "font/font.h"
 #include "trace/trace.h"
+#include "trace/trace_fmt.h"
 #include "base/base.h"
 #include "harness.h"
 #include "work/work.h"
@@ -128,7 +129,12 @@ static int settle(editor *e)
         int rc = editor_step(e, 20); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
         editor_stats s = editor_get_stats(e);
         if (settled(s, e->backend)) return 0;
-        REQUIRE(bench_now_ns() < deadline);
+        if (bench_now_ns() >= deadline) {
+            fprintf(stderr, "SETTLE deadline: view_busy=%d layout_busy=%d view_query_byte=%" PRIu64 " layout_row=%u phase=%u mutations=%" PRIu64 " slice_max_ns=%" PRIu64 "\n",
+                view_busy(&e->v), layout_busy(&e->lay), e->v.query_pos,
+                e->lay.row, e->lay.phase, s.mutations, s.longest_slice_ns);
+            return -1;
+        }
     }
 }
 /* Rows ending at T5 explicitly drain the retained backend slot. The main settle endpoint is damage submitted (T4). */
@@ -140,7 +146,12 @@ static int settle_ready(editor *e)
         int rc = editor_step(e, 20); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
         editor_stats s = editor_get_stats(e);
         if (!s.pending && !s.render_active) return 0;
-        REQUIRE(bench_now_ns() < deadline);
+        if (bench_now_ns() >= deadline) {
+            fprintf(stderr, "SETTLE deadline: view_busy=%d layout_busy=%d view_query_byte=%" PRIu64 " layout_row=%u phase=%u mutations=%" PRIu64 " slice_max_ns=%" PRIu64 "\n",
+                view_busy(&e->v), layout_busy(&e->lay), e->v.query_pos,
+                e->lay.row, e->lay.phase, s.mutations, s.longest_slice_ns);
+            return -1;
+        }
     } while (true);
 }
 static plat_event event(bool back)
@@ -192,6 +203,30 @@ static int gate_row(const char *name, const bench_samples *s, uint64_t p50, uint
                     bool track, const stamp *tag)
 {
     return bench_gate_report(name, s, p50, p99, BENCH_INTERACTION_MIN_N, track, tag->status, tag->load);
+}
+/* Called only after editor_close has joined every recording worker. */
+static void typing_trace(const char *label, const char *power)
+{
+    const char *dump = getenv("EDIT_TRACE_DUMP");
+    if (!dump) return;
+    FILE *out = fopen(dump, "wb");
+    if (!out) return;
+    int rc = trace_dump(out); fclose(out); if (rc) return;
+    FILE *in = fopen(dump, "rb"); if (!in) return;
+    trace_rec *recs = NULL; size_t n = 0;
+    rc = trace_fmt_load(in, &recs, &n); fclose(in); if (rc) return;
+    const enum trace_ev from[] = {TRACE_T1_DEQUEUE, TRACE_T2_MUTATION_DONE, TRACE_T3_RENDER_DONE};
+    const enum trace_ev to[] = {TRACE_T2_MUTATION_DONE, TRACE_T3_RENDER_DONE, TRACE_T4_PRESENT_SUBMITTED};
+    const char *names[] = {"T2-T1", "T3-T2", "T4-T3"};
+    for (size_t i = 0; i < sizeof from / sizeof from[0]; i++) {
+        uint64_t *values = NULL; size_t count = 0;
+        if (!trace_fmt_latencies(recs, n, from[i], to[i], &values, &count)) {
+            uint64_t p50 = trace_fmt_pct(values, count, 50), p99 = trace_fmt_pct(values, count, 99);
+            printf("TRACE %s %s n=%zu p50_ns=%" PRIu64 " p99_ns=%" PRIu64 " (M)%s\n", label, names[i], count, p50, p99, power);
+        }
+        free(values);
+    }
+    free(recs);
 }
 static int idle_row(const char *requested, bool track, bool require_gl)
 {
@@ -353,8 +388,9 @@ static bool typing_structure(const samples *measured, editor_stats before, edito
 }
 #define TYPING_REQUIRE(c) do { if (!(c)) { fprintf(stderr, "editor_bench:%d failed: %s\n", __LINE__, #c); goto cleanup; } } while (0)
 static int typing_row(const char *requested, size_t count, bool track, bool require_gl,
-                      unsigned scenario, uint64_t ingress_delay, const char *path)
+                      unsigned scenario, uint64_t ingress_delay, const char *path, bool partial)
 {
+    trace_reset();
     const char *workload = scenario == 0 ? "serial" : scenario == 1 ? "queued_active_frame" :
                            scenario == 2 ? "active_index" : "queued_index_find_save";
     int result = -1;
@@ -362,6 +398,7 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
     key_sample *keys = NULL;
     bulk_mix mix = {.fd = -1};
     editor *e = NULL;
+    const char *label = requested;
     bool journal_created = false;
     samples measured = {0};
     stamp tag = power_stamp();
@@ -376,7 +413,7 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
     TYPING_REQUIRE(!require_gl || strcmp(requested, "gl") || (b.info.capabilities & RENDER_CAP_GPU));
     TYPING_REQUIRE(b.config.dims.cols * b.config.dims.cell_w == 2880);
     TYPING_REQUIRE(b.config.dims.rows * b.config.dims.cell_h == 1800);
-    const char *label = row_label(&b, requested);
+    label = row_label(&b, requested);
     printf("BACKEND requested=%s actual=%s init_error=%d TARGET A=%ux%u font_px=%u (M)%s\n",
            requested, b.info.name, editor_get_stats(e).backend_init_error,
            b.config.dims.cols * b.config.dims.cell_w, b.config.dims.rows * b.config.dims.cell_h, cfg.font_px, tag.power);
@@ -386,6 +423,14 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
     TYPING_REQUIRE(editor_set_cursor(e, editor_length(e) * 9 / 10) == 0); TYPING_REQUIRE(settle(e) == 0);
     printf("POSITION %s byte=%" PRIu64 " index=%s workload=%s edits=alternating_insert_backspace\n",
            label, editor_view(e).selection.cursor, editor_index_complete(e) ? "published" : "progressing", workload);
+    if (partial) {
+        /* Setup only: destroy joins any index worker before replacing it. */
+        lineidx_destroy(e->buffer->index);
+        e->buffer->index = lineidx_create(editor_length(e));
+        TYPING_REQUIRE(e->buffer->index != NULL);
+        e->buffer->index_dirty = false;
+        printf("INDEX %s deliberately_unbuilt before warmup; viewport anchor retained\n", label);
+    }
     for (unsigned i = 0; i < 16; i++) {
         plat_event ev = event((i & 1u) != 0); TYPING_REQUIRE(editor_inject(e, &ev) == 0); TYPING_REQUIRE(settle(e) == 0);
     }
@@ -467,7 +512,7 @@ cleanup:
     if (measured.guard) { measured.allocations += edit_malloc_guard_end(); measured.guard = false; }
     measured.suspended = false;
     bulk_stop(&mix);
-    if (e) editor_close(e);
+    if (e) { editor_close(e); typing_trace(label, tag.power); }
     if (journal_created && unlink(journal_path) != 0) result = -1;
     free(keys); free(values);
     return result;
@@ -560,13 +605,14 @@ static int ipc_row(bool track)
 }
 int main(int argc, char **argv)
 {
-    bool track = false, idle = true, typing = true, p4 = true, ipc_only = false, require_gl = false; size_t count = 10000;
+    bool track = false, idle = true, typing = true, p4 = true, ipc_only = false, require_gl = false, partial = false; size_t count = 10000;
     uint64_t ingress_delay = 0; unsigned scenarios = 4;
     const char *path = "/tmp/edit-corpus/log_1g.txt";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--self-check")) return settle_self_check();
         if (!strcmp(argv[i], "--track")) track = true;
         else if (!strcmp(argv[i], "--require-gl")) require_gl = true;
+        else if (!strcmp(argv[i], "--partial-index")) partial = true;
         else if (!strcmp(argv[i], "--no-idle")) idle = false;
         else if (!strcmp(argv[i], "--idle-only")) { typing = false; p4 = false; }
         else if (!strcmp(argv[i], "--p4-only")) { typing = false; idle = false; }
@@ -581,7 +627,7 @@ int main(int argc, char **argv)
             ingress_delay = (uint64_t)ms * UINT64_C(1000000);
         }
         else if (!strncmp(argv[i], "--keys=", 7)) count = (size_t)strtoull(argv[i] + 7, NULL, 10);
-        else { fprintf(stderr, "usage: editor_bench [--track] [--require-gl] [--no-idle|--idle-only|--p4-only|--ipc-only] [--no-p4] [--keys=N] [--serial-only] [--ingress-delay-ms=N] [--file=PATH]\n"); return 2; }
+        else { fprintf(stderr, "usage: editor_bench [--track] [--require-gl] [--partial-index] [--no-idle|--idle-only|--p4-only|--ipc-only] [--no-p4] [--keys=N] [--serial-only] [--ingress-delay-ms=N] [--file=PATH]\n"); return 2; }
     }
     const char *override = getenv("EDIT_BACKEND");
     if (override && strcmp(override, "gl") && strcmp(override, "raster")) return 2;
@@ -595,7 +641,7 @@ int main(int argc, char **argv)
         const char *name = names[i];
         if (override && strcmp(name, "null") && strcmp(name, override)) continue;
         for (unsigned scenario = 0; scenario < scenarios; scenario++) {
-            int rc = typing_row(name, count, track, require_gl, scenario, ingress_delay, path);
+            int rc = typing_row(name, count, track, require_gl, scenario, ingress_delay, path, partial);
             if (rc < 0) return 1;
             rows = bench_merge_exit(rows, rc);
         }

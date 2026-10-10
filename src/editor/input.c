@@ -27,8 +27,20 @@ static uint64_t newlines(const editor *e, uint64_t off, uint64_t len)
     }
     return count;
 }
+static void joined_line_anchor(editor *e, uint64_t off, uint64_t line)
+{
+    /* Deleting the newline before the viewport invalidates its start. The
+     * deleted newline count certifies the preceding line's number; certify
+     * its byte start with a backward scan capped at one index chunk. */
+    uint64_t start;
+    if (editor_line_start_before(e, off, &start)) {
+        e->repair_line_byte = start; e->repair_line_number = line;
+        e->repair_line_valid = true;
+    }
+}
 static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t old_nl, uint64_t new_nl)
 {
+    e->repair_line_valid = false;
     e->paint_ready = false; e->buffer->revision++;
     e->stats.mutations++; e->buffer->lines = e->buffer->lines - old_nl + new_nl;
     if (e->buffer->index) {
@@ -40,7 +52,11 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
     int rc = editor_begin_frame(e); if (rc) return rc;
     if (!e->lay.src || e->full_pending) { e->full_pending = true; return 0; }
     rc = layout_edit(&e->lay, off, old, add, old_nl, new_nl);
-    if (rc == LAYOUT_RESET) { e->full_pending = true; return 0; }
+    if (rc == LAYOUT_RESET) {
+        if (!e->buffer->lg.top_estimated && off + old == e->lay.first_byte && old_nl <= e->lay.first_line)
+            joined_line_anchor(e, off, e->lay.first_line - old_nl);
+        e->full_pending = true; return 0;
+    }
     return rc < 0 ? rc : 0;
 }
 static int stage_delete(editor *e, uint64_t off, uint64_t len)
@@ -137,7 +153,7 @@ static int repair(editor *e, uint64_t target)
     e->v.state.selection.cursor = e->v.state.selection.anchor = target;
     view_change c; int rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
-    if (rc == VIEW_MORE) { e->action = EDITOR_ACTION_REPAIR; return 0; }
+    if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPAIR; return 0; }
     if (rc) return rc;
     return finish_edit(e);
 }
@@ -154,7 +170,7 @@ static int replay_follow(editor *e)
     e->v.state.selection.anchor = e->v.state.selection.cursor;
     view_change c; int rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
-    if (rc == VIEW_MORE) { e->action = EDITOR_ACTION_REPLAY; return 0; }
+    if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPLAY; return 0; }
     if (rc) return rc;
     return finish_replay_follow(e);
 }
@@ -356,6 +372,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         e->action = EDITOR_ACTION_DELETE;
     } else e->action = EDITOR_ACTION_MOVE;
     view_change c;
+    editor_seed_view_lines(e);
     rc = view_command(&e->v, move, moving && binding && (binding->args.flags & KEYS_ARG_EXTEND), NULL, 0, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;

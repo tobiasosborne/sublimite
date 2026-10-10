@@ -18,6 +18,10 @@ static void xvfb_stop(void) {
     if (xvfb_pid > 0) { kill(xvfb_pid, SIGTERM); waitpid(xvfb_pid, NULL, 0); xvfb_pid = -1; }
 }
 static int xvfb_start(void) {
+    /* An explicitly selected safe display is already owned by the caller. */
+    const char *display = getenv("DISPLAY"), *requested = getenv("EDIT_DISPLAY");
+    if (display && requested && !strcmp(display, ":99") && !strcmp(requested, ":99"))
+        return 1;
     if (access("/usr/bin/Xvfb", X_OK) != 0) return 0;
     int fds[2];
     if (pipe(fds)) return 0;

@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <string.h>
 
 static bool runnable(const editor *e);
 static int refresh_caret(editor *e);
@@ -18,17 +19,91 @@ static void record_slice(editor *e, uint64_t start)
     uint64_t elapsed = trace_now_ns() - start; e->stats.slices++;
     if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
 }
+bool editor_line_start_before(editor *e, uint64_t end, uint64_t *start)
+{
+    /* Certify a line start from the bytes, never inspecting over one chunk. */
+    uint8_t bytes[4096]; uint64_t pos = end, left = LINEIDX_CHUNK;
+    while (pos && left) {
+        size_t take = (size_t)min64(pos, min64(left, sizeof bytes));
+        pos -= take; left -= take;
+        if (piece_read(e->tree, pos, bytes, take)) return false;
+        for (size_t i = take; i; i--) if (bytes[i - 1u] == '\n') {
+            *start = pos + i; return true;
+        }
+    }
+    if (pos) return false;
+    *start = 0; return true;
+}
+void editor_seed_view_lines(editor *e)
+{
+    /* Legacy empty-TYPE repair clears view's query cache after a mutation.
+     * Layout has already rebased this certified logical-line anchor. Restore
+     * it before the continuation so repair never replays the file prefix. */
+    view *v = &e->v;
+    if (e->buffer->lg.top_estimated || e->lay.src != e->tree ||
+        (e->full_pending && !e->repair_line_valid)) return;
+    uint64_t byte = e->full_pending ? e->repair_line_byte : e->lay.first_byte;
+    uint64_t line = e->full_pending ? e->repair_line_number : e->lay.first_line;
+    if (byte > piece_len(e->tree)) return;
+    unsigned slot = v->line_next++ % 32u;
+    v->lines[slot].byte = byte; v->lines[slot].line = line; v->lines[slot].valid = true;
+    uint64_t cursor = view_busy(v) ? v->restore_state.selection.cursor : v->state.selection.cursor;
+    if (byte && line && cursor <= byte) {
+        /* Left/backspace at the first visible line needs the preceding
+         * anchor too. Exclude the newline immediately before this start. */
+        uint64_t previous;
+        if (editor_line_start_before(e, byte - 1u, &previous)) {
+            slot = v->line_next++ % 32u;
+            v->lines[slot].byte = previous; v->lines[slot].line = line - 1u;
+            v->lines[slot].valid = true;
+        }
+    }
+    if (v->query_kind && v->query_pos < byte) {
+        /* Restart the active query through the newly installed cache rather
+         * than continuing its pre-anchor scan. The phase/target stay owned
+         * by view and it selects an eligible anchor on its next call. */
+        v->query_kind = 0;
+        v->query_pos = byte;
+    }
+}
 static int layout_slice(editor *e)
 {
     layout *l = &e->lay;
     if (l->wrap || !e->buffer->lg.warm_done) return layout_run(l);
-    /* Piece leaves cover at most 64 KiB and their newline counts are warm.
-     * Seed each logical row independently: layout's bounded clipped-tail scan
-     * is allowed to stop without discovering the next line's newline. */
+    /* Ordinary rows carry their starts forward from the bounded layout scan.
+     * Only a clipped long tail needs a query; the partial index bounds that
+     * query to a chunk and may supply an approximate start. */
     uint32_t end = l->row_end;
     if (l->phase == 0 && l->row < end) {
         uint64_t line = l->first_line + l->row;
-        e->row_byte[l->row] = line < e->buffer->lines ? piece_line_to_byte(e->tree, line) : LAYOUT_VOID_ROW;
+        if (line >= e->buffer->lines) e->row_byte[l->row] = LAYOUT_VOID_ROW;
+        else if (e->row_byte[l->row] == LAYOUT_VOID_ROW && e->buffer->index) {
+            /* Preserve following rows for a clipped tail close to its newline.
+             * Never search farther than one chunk, even with no index. */
+            uint64_t pos = l->pos, total = piece_len(e->tree), left = 0;
+            if (l->row && e->row_byte[l->row - 1u] != LAYOUT_VOID_ROW &&
+                l->row_scanned >= LAYOUT_LONG_LINE && pos >= e->row_byte[l->row - 1u] &&
+                pos - e->row_byte[l->row - 1u] == l->row_scanned && pos < total)
+                left = total - pos;
+            if (left > LINEIDX_CHUNK) left = LINEIDX_CHUNK;
+            uint8_t bytes[4096]; bool found = false;
+            while (left) {
+                size_t take = left < sizeof bytes ? (size_t)left : sizeof bytes;
+                if (piece_read(e->tree, pos, bytes, take)) break;
+                const uint8_t *nl = memchr(bytes, '\n', take);
+                if (nl) {
+                    e->row_byte[l->row] = pos + (uint64_t)(nl - bytes) + 1u;
+                    found = true; break;
+                }
+                pos += take; left -= take;
+            }
+            if (!found) {
+                lineidx_src src = editor_source(e->buffer);
+                lineidx_result start = lineidx_line_to_byte(e->buffer->index, &src, line);
+                e->row_byte[l->row] = start.value;
+                l->approximate |= !start.exact;
+            }
+        }
     }
     if (l->row < end) l->row_end = l->row + 1u;
     int rc = layout_run(l);

@@ -91,9 +91,11 @@ struct editor {
     view_selection old_selection;
     view_selection replay_selection;
     uint64_t old_cursor, key_ns, last_input, next_blink;
+    uint64_t repair_line_byte, repair_line_number;
     editor_frame frame, active_frame;
     uint32_t extra_first, extra_end, resize_w, resize_h;
     bool dirty, extra_rows, resize_pending, full_pending;
+    bool repair_line_valid;
     bool focused, visible, blinking, quit;
     bool journal_waiting;
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
@@ -112,6 +114,8 @@ struct editor {
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);
 int editor_refresh_cursor(editor *e, uint64_t old_cursor);
+void editor_seed_view_lines(editor *e);
+bool editor_line_start_before(editor *e, uint64_t end, uint64_t *start);
 void editor_restart_blink(editor *e, uint64_t now);
 void editor_route_work(const work_msg *msg, void *ctx);
 void editor_journal_staged(editor *e);
