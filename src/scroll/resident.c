@@ -1,4 +1,5 @@
 #include "scroll/scroll.h"
+#include "file/file.h"
 #include <string.h>
 #include <time.h>
 
@@ -17,20 +18,24 @@ static void acquire_window(work_ctx *ctx)
     scroll_resident_window *w = ctx->arg;
     const lineidx_src *src = &w->owner->snapshot;
     uint64_t deadline = monotonic_ns() + UINT64_C(500000);
+    if (file_backing_faulted(w->owner->backing)) w->error = SCROLL_ERR_SOURCE;
     for (unsigned calls = 0; calls < 256u && w->filled < w->length && !w->error; calls++) {
         if (work_should_stop(ctx)) return;
         const uint8_t *p = NULL;
         size_t n = src->span(src->ctx, w->start + w->filled, &p);
+        if (file_backing_faulted(w->owner->backing)) { w->error = SCROLL_ERR_SOURCE; break; }
         if (!n || !p) { w->error = SCROLL_ERR_SOURCE; break; }
         if (n > w->length - w->filled) n = w->length - w->filled;
         if (n > 4096u) n = 4096u;
         /* This is the only raw snapshot dereference: storage faults happen
          * on the bulk worker before the resident window is published. */
         memcpy(w->bytes + w->filled, p, n);
+        if (file_backing_faulted(w->owner->backing)) { w->error = SCROLL_ERR_SOURCE; break; }
         w->filled += n;
         if (monotonic_ns() >= deadline) break;
     }
     if (!w->error && w->filled < w->length) { (void)work_continue(ctx); return; }
+    if (file_backing_faulted(w->owner->backing)) w->error = SCROLL_ERR_SOURCE;
     work_msg msg = {.kind = SCROLL_RESIDENT_MSG, .generation = ctx->generation};
     resident_result result = {w->id, w->error};
     memcpy(msg.data, &result, sizeof result);
@@ -42,6 +47,8 @@ static void receive_window(const work_msg *msg, void *ctx)
     resident_result result;
     memcpy(&result, msg->data, sizeof result);
     if (msg->kind != SCROLL_RESIDENT_MSG || msg->generation != w->generation || result.window != w->id) return;
+    if (file_backing_faulted(w->owner->backing)) result.error = SCROLL_ERR_SOURCE;
+    w->error = result.error;
     w->state = result.error ? WINDOW_FAILED : WINDOW_READY;
 }
 int scroll_resident_init(scroll_resident *r, work_pool *pool, const lineidx_src *snapshot)
@@ -49,6 +56,14 @@ int scroll_resident_init(scroll_resident *r, work_pool *pool, const lineidx_src 
     if (!r || !pool || !snapshot || !snapshot->span || snapshot->len > LINEIDX_MAX_LEN) return SCROLL_ERR_ARG;
     memset(r, 0, sizeof *r); r->pool = pool; r->snapshot = *snapshot;
     for (uint32_t i = 0; i < SCROLL_RESIDENT_WINDOWS; i++) { r->windows[i].owner = r; r->windows[i].id = i; }
+    return SCROLL_OK;
+}
+int scroll_resident_bind_snapshot(scroll_resident *r, const piece_snapshot *snapshot)
+{
+    if (!r || !r->pool || !snapshot || r->closing || r->generation || r->backing ||
+        piece_snapshot_len(snapshot) != r->snapshot.len) return SCROLL_ERR_ARG;
+    r->backing = file_snapshot_backing(snapshot);
+    file_backing_acquire(r->backing);
     return SCROLL_OK;
 }
 void scroll_resident_poll(scroll_resident *r)
@@ -73,12 +88,14 @@ int scroll_resident_close(scroll_resident *r)
         (void)work_mailbox_bind(r->pool, w->handle, w->generation, NULL, NULL);
         if (!work_handle_finished(r->pool, w->handle)) finished = false;
     }
-    return finished ? SCROLL_OK : SCROLL_MORE;
+    if (!finished) return SCROLL_MORE;
+    file_backing_release(r->backing); r->backing = NULL;
+    return SCROLL_OK;
 }
 static size_t resident_span(void *ctx, uint64_t off, const uint8_t **out)
 {
     scroll_resident *r = ctx; *out = NULL;
-    if (r->closing || off >= r->snapshot.len) return 0;
+    if (r->closing || file_backing_faulted(r->backing) || off >= r->snapshot.len) return 0;
     uint64_t start = off / SCROLL_SCAN_BUDGET * SCROLL_SCAN_BUDGET;
     for (uint32_t i = 0; i < SCROLL_RESIDENT_WINDOWS; i++) {
         scroll_resident_window *w = &r->windows[i];
@@ -113,6 +130,7 @@ static int resident_slice(scroll_state *s, scroll_resolver *resolver, lineidx *i
                           uint64_t budget, uint64_t deadline)
 {
     if (!r || !r->pool || r->closing) return SCROLL_ERR_ARG;
+    if (file_backing_faulted(r->backing)) { resolver->active = false; return SCROLL_ERR_SOURCE; }
     /* One shared wall deadline covers adoption AND resolution. */
     if (!deadline) deadline = monotonic_ns() + UINT64_C(500000);
     for (uint32_t i = 0; i < SCROLL_RESIDENT_WINDOWS; i++) {
@@ -123,8 +141,12 @@ static int resident_slice(scroll_state *s, scroll_resolver *resolver, lineidx *i
     }
     r->pending = false;
     lineidx_src src = {r, r->snapshot.len, resident_span, NULL};
+    scroll_state before = *s;
     int rc = following ? scroll_follow_cursor_slice(s, resolver, index, &src, cursor, budget, deadline) :
         scroll_resolve_slice(s, resolver, index, &src, budget, deadline);
+    if (file_backing_faulted(r->backing)) {
+        *s = before; resolver->active = false; return SCROLL_ERR_SOURCE;
+    }
     if (rc == SCROLL_ERR_SOURCE && r->pending) {
         resolver->active = true; return SCROLL_MORE;
     }

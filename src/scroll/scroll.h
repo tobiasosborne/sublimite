@@ -175,14 +175,20 @@ typedef struct scroll_resident_window {
     int error;
     uint8_t bytes[SCROLL_SCAN_BUDGET];
 } scroll_resident_window;
+struct file_map;
 typedef struct scroll_resident {
     work_pool *pool;
+    struct file_map *backing;
     lineidx_src snapshot;
     scroll_resident_window windows[SCROLL_RESIDENT_WINDOWS];
     uint32_t generation, replacement;
     bool pending, closing;
 } scroll_resident;
+/* Unbound sources must be nonfaultable. File-backed sources must bind their
+ * validation snapshot before requesting a window. The bridge retains its
+ * backing token through physical close; ctx/storage ownership stays caller's. */
 int scroll_resident_init(scroll_resident *r, work_pool *pool, const lineidx_src *snapshot);
+int scroll_resident_bind_snapshot(scroll_resident *r, const piece_snapshot *snapshot);
 /* Bounded mailbox adoption; called by the resident slice wrappers too. */
 void scroll_resident_poll(scroll_resident *r);
 int scroll_resident_close(scroll_resident *r);

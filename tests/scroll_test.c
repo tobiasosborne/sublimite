@@ -1,5 +1,7 @@
 #include "scroll/scroll.h"
 #include "base/base.h"
+#include "file/file.h"
+#include "file/file_test.h"
 #include "editor/editor.h"
 #include <limits.h>
 #include <stdio.h>
@@ -883,8 +885,93 @@ cleanup:
     editor_close(e);
     return result;
 }
+static void *resident_piece_alloc(void *ctx, size_t size) { (void)ctx; return malloc(size); }
+static void resident_piece_free(void *ctx, void *pointer, size_t size) { (void)ctx; (void)size; free(pointer); }
+typedef struct mapped_resident_probe {
+    piece_snapshot *snapshot;
+    _Atomic bool entered, release;
+    bool hold;
+} mapped_resident_probe;
+static size_t mapped_resident_span(void *ctx, uint64_t off, const uint8_t **out)
+{
+    mapped_resident_probe *p = ctx;
+    piece_iter it; size_t n = 0;
+    piece_iter_begin_snapshot(&it, p->snapshot, off);
+    if (!piece_iter_next(&it, out, &n)) return 0;
+    if (p->hold) {
+        atomic_store(&p->entered, true);
+        while (!atomic_load(&p->release)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    return n;
+}
+static void resident_file_receive(const work_msg *msg, void *ctx)
+{
+    (void)ctx; file_msg decoded;
+    (void)file_msg_decode(msg, &decoded);
+}
+static int mapped_resident_faults(bool after_publication)
+{
+    int result = 1, fd = -1; bool initialized = false, resident_initialized = false;
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    file *f = NULL; piece_tree *tree = NULL; piece_snapshot *snap = NULL; lineidx *index = NULL;
+    scroll_resident r; mapped_resident_probe probe = {0};
+    char path[] = "build/scroll-resident-fault-XXXXXX";
+    fd = mkstemp(path); CHECK(fd >= 0);
+    uint8_t bytes[2u * SCROLL_SCAN_BUDGET]; memset(bytes, 'a', sizeof bytes);
+    for (size_t i = 9; i < sizeof bytes; i += 10u) bytes[i] = '\n';
+    CHECK(write(fd, bytes, sizeof bytes) == (ssize_t)sizeof bytes);
+    CHECK(pool && work_pool_init(pool, 1, 0) == 0); initialized = true;
+    file_open_opts opts = {.copy_threshold = 1};
+    CHECK(file_open_begin(pool, path, &opts, &f) == FILE_OK);
+    for (unsigned i = 0; i < 100000 && !file_open_ready(f); i++) {
+        (void)work_mailbox_drain(pool, resident_file_receive, NULL);
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    CHECK(file_open_ready(f)); piece_allocator allocator = {NULL, resident_piece_alloc, resident_piece_free};
+    tree = piece_create(&allocator); CHECK(tree && file_attach(f, tree) == FILE_OK);
+    snap = piece_snapshot_take(tree); CHECK(snap);
+    probe.snapshot = snap; probe.hold = !after_publication;
+    lineidx_src src = {&probe, sizeof bytes, mapped_resident_span, NULL};
+    CHECK(scroll_resident_init(&r, pool, &src) == SCROLL_OK); resident_initialized = true;
+    CHECK(scroll_resident_bind_snapshot(&r, snap) == SCROLL_OK);
+    scroll_state s; scroll_resolver resolver = {0};
+    index = lineidx_create(sizeof bytes); CHECK(index);
+    CHECK(scroll_init(&s, (scroll_config){4, 17, 1}, (scroll_extent){sizeof bytes, 1, false}) == 0);
+    CHECK(scroll_seek_byte(&s, 12345) == 0); scroll_state before = s;
+    CHECK(scroll_resolve_resident(&s, &resolver, index, &r, 0, 0) == SCROLL_MORE);
+    if (!after_publication) {
+        for (unsigned i = 0; i < 100000 && !atomic_load(&probe.entered); i++) nanosleep(&(struct timespec){0, 100000}, NULL);
+        CHECK(atomic_load(&probe.entered)); CHECK(ftruncate(fd, 0) == 0); atomic_store(&probe.release, true);
+    }
+    for (unsigned i = 0; i < 100000 && !work_handle_finished(pool, r.windows[0].handle); i++) nanosleep(&(struct timespec){0, 100000}, NULL);
+    CHECK(work_handle_finished(pool, r.windows[0].handle)); scroll_resident_poll(&r);
+    if (after_publication) {
+        CHECK(r.windows[0].error == 0);
+        CHECK(ftruncate(fd, 0) == 0);
+        uint8_t byte;
+        CHECK(piece_snapshot_read(snap, 100000u, &byte, 1) == PIECE_OK);
+    }
+    CHECK(file_snapshot_faulted(snap));
+    if (!after_publication) CHECK(r.windows[0].error == SCROLL_ERR_SOURCE);
+    CHECK(scroll_resolve_resident(&s, &resolver, index, &r, 0, 0) == SCROLL_ERR_SOURCE);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    result = 0;
+cleanup:
+    atomic_store(&probe.release, true);
+    if (resident_initialized) (void)scroll_resident_close(&r);
+    if (initialized) work_pool_shutdown(pool);
+    if (resident_initialized) (void)scroll_resident_close(&r);
+    lineidx_destroy(index); piece_snapshot_release(snap); piece_destroy(tree); if (f) file_close(f);
+    free(pool); if (fd >= 0) close(fd); unlink(path);
+    if (!result) printf("P4-3 section 31: real mapped truncation %s preserves viewport passed\n",
+        after_publication ? "after publication" : "during copy");
+    return result;
+}
+
 int main(int argc, char **argv)
 {
+    if (getenv("P4_RESIDENT_FAULT")) return mapped_resident_faults(false) || mapped_resident_faults(true);
+    if (mapped_resident_faults(false) || mapped_resident_faults(true)) return 1;
     if (argc == 2 && strcmp(argv[1], "--require-editor-scroll") == 0)
         return editor_observability(true);
     if (argc != 1) return 2;

@@ -168,6 +168,7 @@ void editor_modified(editor *e);
 void editor_large_init(editor_buffer *b);
 void editor_large_start(editor *e, editor_buffer *b);
 void editor_large_close(editor_buffer *b);
+void editor_large_keep(editor_buffer *b);
 void editor_large_index_progress(editor *e);
 void editor_large_file_msg(editor *e, const file_msg *fm);
 bool editor_large_receive(editor *e, const work_msg *msg);

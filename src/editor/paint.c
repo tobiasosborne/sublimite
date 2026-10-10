@@ -24,10 +24,17 @@ static bool byte_visible(editor *e, uint64_t byte)
         }
         return false;
     }
-    uint64_t line = piece_byte_to_line(e->tree, byte);
-    if (line < e->v.state.first_line || line - e->v.state.first_line >= e->text_grid.dims.rows) return false;
-    uint64_t start = e->row_byte[line - e->v.state.first_line];
-    if (start == LAYOUT_VOID_ROW || byte < start || byte - start >= LAYOUT_BYTE_BUDGET) return false;
+    /* Prepared row starts bound visibility without warming any preceding
+     * original subtree. A clipped tail beyond the prepared window is hidden. */
+    uint64_t start = LAYOUT_VOID_ROW;
+    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+        uint64_t row = e->row_byte[r];
+        if (row == LAYOUT_VOID_ROW || row > byte) continue;
+        uint64_t end = r + 1u < e->text_grid.dims.rows ? e->row_byte[r + 1u] : e->lay.pos;
+        if (end != LAYOUT_VOID_ROW && byte >= end) continue;
+        if (start == LAYOUT_VOID_ROW || row > start) start = row;
+    }
+    if (start == LAYOUT_VOID_ROW || byte - start >= LAYOUT_BYTE_BUDGET) return false;
     size_t n = (size_t)(byte - start + 1), at = 0; uint64_t col = 0;
     if (piece_read(e->tree, start, e->indent_bytes, n)) return false;
     while (at + 1 < n) {

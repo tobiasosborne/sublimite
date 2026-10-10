@@ -770,8 +770,26 @@ static void known_default_long_query(void)
     CHECK(state.complete && state.match_count == 1);
     finish(&f);
 }
+/* Sparse source exposes repeated window scans after a complete global count.
+ * Opt-in until a bounded/spooled matcher plan is implemented. */
+static void sparse_window_work(void)
+{
+    size_t length = 4u * 1024u * 1024u;
+    uint8_t *bytes = malloc(length); CHECK(bytes); memset(bytes, 'x', length);
+    for (size_t i = 0; i < 5000u; i++) memcpy(bytes + i * 800u, "ab", 2);
+    fixture f; start(&f, bytes, length, 64, 64); free(bytes);
+    query(&f, "ab"); CHECK(findui_get_state(&f.panel).match_count == 5000);
+    unsigned before = atomic_load(&f.hook.scans);
+    CHECK(findui_set_window(&f.panel, 3000000u, 3000100u) == FINDUI_OK); wait_result(&f);
+    unsigned after = atomic_load(&f.hook.scans);
+    printf("P4-3 section 29: sparse window new source-search stages=%u (M)[AC]\n", after - before); fflush(stdout);
+    CHECK(after == before); /* plan retrieval must avoid another source scan */
+    finish(&f);
+}
+
 int main(void)
 {
+    if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
     replacement_paged_noop();
     full_source_lifetime();
     replacement_host_bookkeeping();

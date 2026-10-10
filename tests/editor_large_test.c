@@ -11,10 +11,13 @@
 #include "trace/trace.h"
 #include "file/file_test.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -375,6 +378,8 @@ static void fill_mailbox(work_ctx *c)
     for (unsigned i = 0; i <= WORK_MAILBOX_CAP; i++) if (!work_publish(c, &msg)) break;
     atomic_store(full, true);
 }
+static void completion_marker(work_ctx *ctx)
+{ atomic_store((_Atomic bool *)ctx->arg, true); }
 static int mailbox_pressure(editor *e, const uint8_t *needle)
 {
     _Atomic bool full; atomic_init(&full, false);
@@ -384,6 +389,13 @@ static int mailbox_pressure(editor *e, const uint8_t *needle)
     while (!atomic_load(&full)) { T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 1000000}, NULL); }
     T(editor_large_find_begin(e, needle, 6) == 0);
     while (!atomic_load(&e->buffer->lg.find->released)) { T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 1000000}, NULL); }
+    _Atomic bool marked; atomic_init(&marked, false);
+    work_handle marker = work_submit(&e->pool, (work_job){completion_marker, &marked, 0, WORK_BULK}); T(marker.epoch);
+    /* Keep the mailbox saturated. A sealed publisher must yield the lane. */
+    while (!work_handle_finished(&e->pool, marker)) {
+        T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    T(atomic_load(&marked));
     T(step_until(e, find_done, UINT64_C(500000000)) == 0);
     T(editor_large_status_get(e).find_total == 2);
     while (!work_handle_finished(&e->pool, h)) nanosleep(&(struct timespec){0, 1000000}, NULL);
@@ -460,9 +472,330 @@ static int mapped_find_boundaries(void)
     return 0;
 }
 
+/* A cancelled lease may still be inside its callback after Keep. */
+typedef struct restart_probe {
+    editor_large_find_job *job;
+    _Atomic bool entered, release, valid;
+} restart_probe;
+static void held_find_argument(work_ctx *ctx)
+{
+    restart_probe *p = ctx->arg;
+    atomic_store(&p->entered, true);
+    while (!atomic_load(&p->release))
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+    /* Deliberately finish an indivisible read after logical cancellation. */
+    atomic_store(&p->valid, piece_snapshot_len(p->job->snap) == 7);
+    p->job->rc = FIND_CANCELLED;
+}
+static int cancelled_find_restart(void)
+{
+    char path[] = "build/editor-find-restart-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, "source\n", 7) == 7); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    editor_large *lg = &e->buffer->lg;
+    restart_probe probe = {0};
+    probe.job = calloc(1, sizeof *probe.job); T(probe.job);
+    probe.job->snap = piece_snapshot_take(e->tree); T(probe.job->snap);
+    atomic_init(&probe.job->released, false);
+    lg->find = probe.job; lg->find_gen = 1; lg->find_running = true;
+    lg->find_h = work_submit(&e->pool, (work_job){held_find_argument, &probe, 1, WORK_BULK});
+    T(lg->find_h.epoch); work_handle old = lg->find_h;
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!atomic_load(&probe.entered)) { T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 100000}, NULL); }
+    fd = open(path, O_WRONLY | O_TRUNC); T(fd >= 0);
+    T(write(fd, "change\n", 7) == 7); close(fd);
+    /* Watch identity work shares bulk; focus validation supplies the change. */
+    T(file_check(e->buffer->file, NULL) != 0);
+    T(editor_check_sources(e) == 0); T(e->buffer->source_stale);
+    T(editor_source_resolve(e, false) == 0); T(editor_check_sources(e) == 0);
+    T(!e->buffer->source_stale); T(!work_handle_finished(&e->pool, old));
+    int rc = editor_large_find_begin(e, (const uint8_t *)"source", 6);
+    atomic_store(&probe.release, true);
+    T(rc == 0);
+    while (!work_handle_finished(&e->pool, old)) { T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 100000}, NULL); }
+    T(atomic_load(&probe.valid));
+    T(step_until(e, find_done, UINT64_C(5000000000)) == 0);
+    T(editor_large_status_get(e).find_total == 1);
+    editor_close(e); unlink(path);
+    puts("P4-3 section 1: held cancelled find survives Keep and restart passed");
+    return 0;
+}
+
+static int keep_restarts_background(void)
+{
+    char path[] = "build/editor-keep-background-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    uint8_t bytes[8192]; memset(bytes, 'x', sizeof bytes); bytes[8191] = '\n';
+    T(write(fd, bytes, sizeof bytes) == (ssize_t)sizeof bytes); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    editor_large_close(e->buffer);
+    e->buffer->lg.warm_h = (work_handle){0}; e->buffer->lg.warm_done = false;
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle hold = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(hold.epoch);
+    editor_large_start(e, e->buffer); T(e->buffer->lg.warm_h.epoch);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(sizeof bytes); T(e->buffer->index);
+    T(lineidx_build_reserve(e->buffer->index) == 0);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    lineidx_src src = {snap, sizeof bytes, gutter_snapshot_span, gutter_snapshot_release};
+    T(lineidx_build_start_prepaid(e->buffer->index, &e->pool, &src) == 0);
+    e->buffer->lg.lines_exact = false; e->buffer->index_dirty = false;
+    char replacement[] = "build/editor-keep-new-XXXXXX";
+    fd = mkstemp(replacement); T(fd >= 0); T(write(fd, "new\n", 4) == 4); close(fd);
+    T(rename(replacement, path) == 0); T(file_check(e->buffer->file, NULL) == 1);
+    T(editor_check_sources(e) == 0); T(e->buffer->source_stale);
+    T(editor_source_resolve(e, false) == 0); T(editor_check_sources(e) == 0);
+    T(!e->buffer->source_stale);
+    bool dirty = e->buffer->index_dirty;
+    atomic_store(&release, true);
+    T(dirty);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!editor_index_complete(e) || !editor_large_status_get(e).warm_done) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+    }
+    T(editor_line_count(e) == 2); editor_close(e); unlink(path);
+    puts("P4-3 section 15: Keep restarts incomplete index and cancelled warm lease passed");
+    return 0;
+}
+
+static int explicit_coordinates(void)
+{
+    for (unsigned mapped = 0; mapped < 2; mapped++) {
+        char path[] = "build/editor-position-XXXXXX";
+        int fd = mkstemp(path); T(fd >= 0);
+        size_t length = 2u * FILE_PREFIX_MAX + 200u;
+        uint8_t *bytes = malloc(length); T(bytes); memset(bytes, 'x', length);
+        for (size_t i = FILE_PREFIX_MAX; i < length; i += 10u) bytes[i] = '\n';
+        T(write(fd, bytes, length) == (ssize_t)length); close(fd);
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.cols = 40, .rows = 4, .wrap_mode = -1,
+            .copy_threshold = mapped ? 1u : length + 1u};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        ipc_request request = {.count = 1};
+        request.paths[0] = (ipc_path){.path = path, .line = 100, .col = 3};
+        T(editor_open_request(e, &request, 0) == 0);
+        T(e->buffer->lines > editor_view(e).first_line);
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        T(editor_view(e).selection.cursor == FILE_PREFIX_MAX + 981u + 2u);
+        T(editor_view(e).first_line == 99);
+        editor_close(e); free(bytes); unlink(path);
+    }
+    puts("P4-3 section 17: COPY coordinates and misleading mapped prefix resolve exactly passed");
+    return 0;
+}
+
+static int byte_jump_boundaries(void)
+{
+    uint8_t *bytes = malloc(200000u); T(bytes); memset(bytes, 'a', 200000u);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = 200000u, .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    int rc = editor_large_goto_byte(e, 150000u);
+    T(rc == 0 || rc == EDITOR_MORE);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (rc == EDITOR_MORE) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+        rc = editor_large_goto_byte(e, 150000u);
+    }
+    T(rc == 0); T(editor_view(e).first_byte == 0);
+    T(editor_view(e).selection.cursor == 150000u);
+    editor_close(e); free(bytes);
+    const uint8_t clusters[] = "a\xcc\x81" "\xe4\xb8\xad" "\r\n" "z";
+    const uint64_t repaired[] = {0, 0, 0, 3, 3, 3, 6, 6, 8, 9};
+    backend = (render_backend){0}; T(render_null_backend(&backend) == 0);
+    cfg.initial = clusters; cfg.initial_len = sizeof clusters - 1u;
+    T(editor_open(&e, &cfg, &backend) == 0);
+    for (uint64_t at = 0; at < sizeof repaired / sizeof repaired[0]; at++) {
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        T(editor_large_goto_byte(e, at) == 0);
+        T(editor_view(e).selection.cursor == repaired[at]);
+    }
+    editor_close(e);
+    puts("P4-3 section 18: long-line start and UTF-8/combining/CRLF byte boundaries passed");
+    return 0;
+}
+
+/* Only the paint operation is inside the fault census; workers are retired. */
+static int cold_bracket_paint(void)
+{
+    char path[] = "build/editor-cold-paint-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    uint8_t block[4096]; memset(block, 'a', sizeof block);
+    for (size_t i = 0; i < sizeof block; i += 128u) { block[i] = '('; block[i + 1u] = ')'; block[i + 127u] = '\n'; }
+    size_t length = 32u * 1024u * 1024u;
+    for (size_t i = 0; i < length; i += sizeof block) T(write(fd, block, sizeof block) == (ssize_t)sizeof block);
+    close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    editor_large_close(e->buffer); lineidx_build_cancel(e->buffer->index);
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(length); T(e->buffer->index);
+    uint64_t start = length - 4u * 128u;
+    e->v.state.first_byte = e->v.state.visual_byte = start;
+    e->v.state.first_line = start / 128u;
+    e->v.state.selection.cursor = e->v.state.selection.anchor = start;
+    e->buffer->lines = length / 128u + 1u;
+    e->buffer->lg.warm_done = false;
+    T(editor_full_layout(e) == 0);
+    while (layout_busy(&e->lay)) T(layout_run(&e->lay) >= 0);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    const uint8_t *mapped = NULL; size_t n = 0;
+    T(file_snapshot_bytes(snap, NULL, &mapped, &n) == 1 && n == length);
+    T(madvise((void *)mapped, n, MADV_DONTNEED) == 0);
+    struct rusage before, after; T(getrusage(RUSAGE_THREAD, &before) == 0);
+    e->paint_ready = false; T(editor_paint_prepare(e) == 0);
+    T(getrusage(RUSAGE_THREAD, &after) == 0);
+    long faults = after.ru_minflt - before.ru_minflt;
+    printf("P4-3 section 20: cold deep bracket paint minor faults=%ld (M)[AC], loose bound=128 (G)\n", faults);
+    T(faults < 128); T(e->bracket_mate == start + 1u);
+    piece_snapshot_release(snap); editor_close(e); unlink(path);
+    return 0;
+}
+
+/* This requires input/layout accounting changes outside the supplied files.
+ * Keep an explicit red reproducer without making the ordinary suite fail. */
+static int estimated_newline_delete(void)
+{
+    uint8_t bytes[200]; memset(bytes, 'a', 100); memset(bytes + 100, '\n', 100);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes, .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    e->buffer->lg.lines_exact = false; e->buffer->lg.lazy = true;
+    e->buffer->lines = e->lay.line_count = 1;
+    e->v.state.selection.cursor = 200; e->v.state.selection.anchor = 100;
+    plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_BackSpace};
+    T(editor_handle_key(e, &ev) == 0);
+    printf("P4-3 section 19: post-delete estimated lines=%llu bytes=%llu (M)[AC]\n",
+        (unsigned long long)editor_line_count(e), (unsigned long long)editor_length(e));
+    T(editor_line_count(e) >= 1 && editor_line_count(e) <= editor_length(e) + 1u);
+    T(e->lay.line_count >= 1 && e->lay.line_count <= editor_length(e) + 1u);
+    editor_close(e); return 0;
+}
+
+static int warm_repaint(void)
+{
+    char path[] = "build/editor-warm-repaint-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    uint8_t bytes[8192]; memset(bytes, 'a', sizeof bytes); bytes[8191] = '\n';
+    T(write(fd, bytes, sizeof bytes) == (ssize_t)sizeof bytes); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!e->buffer->lg.warm_done) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    e->buffer->lg.warm_done = false; e->full_pending = false;
+    work_handle h = e->buffer->lg.warm_h; T(h.epoch);
+    work_msg msg = {.kind = EDITOR_LARGE_MSG_WARM, .slot_ = h.slot, .epoch_ = h.epoch, .generation = 1};
+    T(editor_large_receive(e, &msg)); editor_large_index_progress(e);
+    T(e->buffer->lg.warm_done); T(e->full_pending);
+    editor_close(e); unlink(path);
+    puts("P4-3 section 21: warm completion requests an idle correcting frame passed"); return 0;
+}
+static int lazy_long_line_rows(void)
+{
+    char path[] = "build/editor-lazy-long-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    size_t n = 100000u; uint8_t *bytes = malloc(n); T(bytes); memset(bytes, 'a', n);
+    T(write(fd, bytes, n) == (ssize_t)n); T(write(fd, "\nvisible\n", 9) == 9); close(fd); free(bytes);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    editor_large_close(e->buffer); e->buffer->lg.warm_done = false;
+    T(editor_full_layout(e) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(e->row_byte[1] == n + 1u);
+    editor_close(e); unlink(path); return 0;
+}
+
+typedef struct lane_probe { _Atomic bool *released; _Atomic bool observed; } lane_probe;
+static void observe_lane(work_ctx *ctx)
+{
+    lane_probe *p = ctx->arg;
+    atomic_store(&p->observed, !atomic_load(p->released));
+}
+static int cooperative_large_jobs(void)
+{
+    char path[] = "build/editor-large-lane-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    uint8_t block[4096]; memset(block, 'a', sizeof block);
+    for (size_t i = 0; i < 8u * 1024u * 1024u; i += sizeof block)
+        T(write(fd, block, sizeof block) == (ssize_t)sizeof block);
+    close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!e->buffer->lg.warm_done) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    for (unsigned mode = getenv("P4_WARM_LANE") ? 1u : 0u; mode < 2; mode++) {
+        _Atomic bool release; atomic_init(&release, false);
+        work_handle hold = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(hold.epoch);
+        lane_probe p = {0};
+        if (mode) {
+            editor_large_close(e->buffer); e->buffer->lg.warm_h = (work_handle){0};
+            e->buffer->lg.warm_done = false; editor_large_start(e, e->buffer);
+            T(e->buffer->lg.warm_h.epoch); p.released = &e->buffer->lg.warm->released;
+        } else {
+            T(editor_large_find_begin(e, (const uint8_t *)"aa", 2) == 0);
+            p.released = &e->buffer->lg.find->released;
+        }
+        work_handle marker = work_submit(&e->pool, (work_job){observe_lane, &p, 0, WORK_BULK}); T(marker.epoch);
+        atomic_store(&release, true);
+        deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (!work_handle_finished(&e->pool, marker)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+        T(atomic_load(&p.observed));
+        while (!atomic_load(p.released)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    }
+    editor_close(e); unlink(path);
+    puts("P4-3 section 28: production find/warm yield bulk lane before completion passed"); return 0;
+}
+
+static int mailbox_yield(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    const uint8_t text[] = "NEEDLE\nNEEDLE\n";
+    editor_config cfg = {.initial = text, .initial_len = sizeof text - 1u, .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(mailbox_pressure(e, (const uint8_t *)"NEEDLE") == 0);
+    editor_close(e);
+    puts("P4-3 section 28: sealed find publication yields behind a saturated mailbox passed"); return 0;
+}
+
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("P4_MAILBOX_YIELD")) return mailbox_yield();
+    T(mailbox_yield() == 0);
+    if (getenv("P4_COOPERATIVE_JOBS")) return cooperative_large_jobs();
+    T(cooperative_large_jobs() == 0);
+    if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
+    if (getenv("P4_WARM_REPAINT")) return warm_repaint();
+    T(warm_repaint() == 0);
+    if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete();
+    if (getenv("P4_COLD_PAINT")) return cold_bracket_paint();
+    T(cold_bracket_paint() == 0);
+    if (getenv("P4_BYTE_JUMP")) return byte_jump_boundaries();
+    T(byte_jump_boundaries() == 0);
+    if (getenv("P4_COORDINATES")) return explicit_coordinates();
+    T(explicit_coordinates() == 0);
+    if (getenv("P4_KEEP_BACKGROUND")) return keep_restarts_background();
+    T(keep_restarts_background() == 0);
+    if (getenv("P4_FIND_RESTART")) return cancelled_find_restart();
+    T(cancelled_find_restart() == 0);
     if (getenv("DNC2_REQUIRE_EARLY_INDEX")) T(index_before_attachment_gap() == 0);
     T(mapped_startup_ipc() == 0);
     T(mapped_preview_first() == 0);

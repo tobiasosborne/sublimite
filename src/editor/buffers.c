@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/epoll.h>
 
 typedef struct piece_block { struct piece_block *next; size_t bin; } piece_block;
@@ -93,6 +94,7 @@ void editor_retire_buffers(editor *e)
         (void)work_mailbox_bind(&e->pool, b->lg.warm_h, 1, NULL, NULL);
         (void)work_mailbox_bind(&e->pool, b->lg.find_h, b->lg.find_gen, NULL, NULL);
         work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
+        work_cancel(&e->pool, b->lg.find_retiring_h);
         if (b->index) { lineidx_build_cancel(b->index); (void)lineidx_poll(b->index); }
         if (b->watch_fd >= 0) {
             (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, b->watch_fd, NULL); b->watch_fd = -1;
@@ -101,7 +103,8 @@ void editor_retire_buffers(editor *e)
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
         if (b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
-            !work_handle_finished(&e->pool, b->lg.find_h) || (b->index && lineidx_building(b->index))) continue;
+            !work_handle_finished(&e->pool, b->lg.find_h) ||
+            !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
         editor_buffer_destroy(b); e->buffers[i] = NULL;
         break; /* at most one physically ready buffer per maintenance turn */
     }
@@ -409,20 +412,60 @@ void editor_modified(editor *e)
 }
 static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t col)
 {
-    /* An explicit off-prefix IPC position needs the full source before its
-     * first correct viewport; ordinary prefix opens use deferred adoption. */
-    if (b->pending_open && file_open_mode(b->file) == FILE_MODE_MMAP && (line > 1 || col > 1)) {
+    /* Keep the requested coordinates until acquisition and a worker seek
+     * certify the source. Density estimates cannot clamp launch intent. */
+    if (b->pending_open && (line > 1 || col > 1)) {
         int rc = wait_open_ready(e, b); if (rc) return rc;
         rc = editor_adopt_open(e, b); if (rc) return rc;
     }
-    if (b->pending_open && (line > 1 || col > 1)) return EDITOR_ERR_CAPACITY;
     piece_tree *source = b->pending_open ? b->preview : b->tree;
     uint64_t ln = line ? (uint64_t)line - 1 : 0;
-    if (ln >= b->lines) ln = b->lines - 1;
-    uint64_t start = piece_line_to_byte(source, ln), end = piece_len(source);
-    if (ln + 1 < b->lines) end = piece_line_to_byte(source, ln + 1);
+    uint64_t start = 0, end = piece_len(source);
+    if (ln) {
+        piece_snapshot *snap = piece_snapshot_take(source);
+        if (!snap) return EDITOR_ERR_MEMORY;
+        lineidx_src owned = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
+        lineidx_build_cancel(b->index);
+        while (lineidx_seek_start_owned(b->index, &e->pool, &owned, ln, SIZE_MAX)) {
+            (void)lineidx_poll(b->index);
+            (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+            if (e->error || b->source_stale || file_snapshot_faulted(snap)) {
+                piece_snapshot_release(snap); return EDITOR_ERR_IO;
+            }
+            nanosleep(&(struct timespec){0, 100000}, NULL);
+        }
+        lineidx_result target;
+        while (!lineidx_seek_result(b->index, &target)) {
+            (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+            if (e->error || b->source_stale || file_changed(b->file)) return EDITOR_ERR_IO;
+            nanosleep(&(struct timespec){0, 100000}, NULL);
+        }
+        /* Seeking stops as soon as the requested LF is found, including
+         * before the target chunk is globally counted. Its offset itself is
+         * the proof; only a proven EOF may clamp the requested line. */
+        while (lineidx_building(b->index)) {
+            (void)lineidx_poll(b->index);
+            nanosleep(&(struct timespec){0, 100000}, NULL);
+        }
+        start = target.value;
+        lineidx_result total = lineidx_line_count(b->index);
+        if (total.exact && ln >= total.value) {
+            ln = total.value - 1u;
+            lineidx_src current = editor_source(b);
+            lineidx_result anchor = lineidx_line_to_byte(b->index, &current, ln);
+            if (!anchor.exact) return EDITOR_ERR_IO;
+            start = anchor.value;
+        }
+        b->index_dirty = !lineidx_complete(b->index);
+    }
     size_t n = end - start > VIEW_SCAN_BOUND ? VIEW_SCAN_BOUND : (size_t)(end - start);
     int rc = piece_read(source, start, e->indent_bytes, n); if (rc) return rc;
+    /* The seek proves the target line; this already resident bounded sample
+     * proves following rows too. A low density estimate must not suppress
+     * the certified target viewport while the full index is still pending. */
+    uint64_t proven_lines = ln + 1u;
+    for (size_t i = 0; i < n; i++) proven_lines += e->indent_bytes[i] == '\n' ? 1u : 0u;
+    if (b->lines < proven_lines) b->lines = proven_lines;
     size_t at = 0; uint64_t cells = 0, target = col ? (uint64_t)col - 1 : 0;
     while (at < n && cells < target && e->indent_bytes[at] != '\n' &&
            !(e->indent_bytes[at] == '\r' && at + 1 < n && e->indent_bytes[at + 1] == '\n')) {
@@ -632,6 +675,7 @@ int editor_check_sources(editor *e)
         }
         b->saved_lost = true;
         b->source_stale = false; b->prompt_ns = 0; editor_modified(e);
+        editor_large_keep(b);
         return editor_full_layout(e);
     }
     size_t slot = 0;
