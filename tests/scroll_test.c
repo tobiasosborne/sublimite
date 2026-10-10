@@ -1,5 +1,6 @@
 #include "scroll/scroll.h"
 #include "base/base.h"
+#include "editor/editor.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -600,8 +601,297 @@ cleanup:
     lineidx_destroy(index);
     return result;
 }
-int main(void)
+typedef struct wrapped_fixture {
+    uint64_t bytes;
+    uint32_t width, calls;
+    bool pending, fail, malformed, eof;
+} wrapped_fixture;
+static int wrapped_row(void *ctx, uint64_t ordinal, scroll_visual_row *out)
 {
+    wrapped_fixture *f = ctx;
+    f->calls++;
+    if (f->pending) return SCROLL_MORE;
+    if (f->fail) return SCROLL_ERR_SOURCE;
+    uint64_t rows = (f->bytes + f->width - 1u) / f->width;
+    if (!rows) rows = 1;
+    bool past = ordinal >= rows;
+    if (past && !f->eof) return SCROLL_ERR_SOURCE;
+    if (past) ordinal = rows - 1;
+    uint64_t start = ordinal * f->width;
+    uint64_t end = start + f->width;
+    if (end > f->bytes) end = f->bytes;
+    *out = (scroll_visual_row){.ordinal = ordinal, .byte = start,
+        .end = end, .column = start, .indent = ordinal ? 2u : 0u};
+    if (f->malformed) out->ordinal++;
+    return past ? SCROLL_EOF : SCROLL_OK;
+}
+static int wrapped_locate(void *ctx, uint64_t byte, bool trailing, scroll_visual_row *out)
+{
+    wrapped_fixture *f = ctx;
+    if (byte && (byte == f->bytes || (trailing && byte % f->width == 0))) byte--;
+    return wrapped_row(ctx, byte / f->width, out);
+}
+static int wrapped_navigation(void)
+{
+    int result = 1;
+    bool guarding = false;
+    wrapped_fixture f = {200, 5, 0, false, false, false, false};
+    scroll_visual_source source = {&f, 200, 40, 1, wrapped_row, wrapped_locate, true};
+    scroll_visual_row seed;
+    CHECK(wrapped_row(&f, 0, &seed) == 0);
+    scroll_visual s;
+    scroll_visual_resolver r = {0};
+    view_key motion;
+    CHECK(scroll_visual_init(&s, (scroll_config){4, 17, 1}, &source, seed) == 0);
+    edit_malloc_guard_begin(); guarding = true;
+    CHECK(scroll_visual_wheel(&s, 1) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(s.first.byte == 0 && s.viewport.subrow_q8 == 51);
+    CHECK(scroll_visual_wheel(&s, 255) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(s.first.ordinal == 3 && s.first.byte == 15 && s.first.indent == 2 && s.viewport.subrow_q8 == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_PAGE_DOWN, &motion) == 0 && motion == VIEW_PAGE_DOWN);
+    scroll_visual before = s;
+    f.calls = 0;
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 1) == SCROLL_MORE && f.calls == 0);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    f.pending = true;
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == SCROLL_MORE);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    f.pending = false;
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(s.first.ordinal == 7 && s.first.byte == 35);
+    /* Width reflow uses the old byte anchor, not the obsolete row ordinal. */
+    f.width = 10; source.rows = 20; source.generation++;
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 17, 1}, &source) == 0);
+    before = s; f.calls = 0;
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == SCROLL_MORE && f.calls == 1);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(s.first.ordinal == 3 && s.first.byte == 30);
+    CHECK(scroll_visual_follow_slice(&s, &r, 30, true, 2, 0) == 0);
+    CHECK(s.first.ordinal == 1); /* trailing cursor belongs to row 2 */
+    CHECK(scroll_visual_follow_slice(&s, &r, 70, false, 2, 0) == 0);
+    CHECK(s.first.ordinal == 5); /* leading cursor belongs to row 7 */
+    before = s; f.calls = 0;
+    CHECK(scroll_visual_follow_slice(&s, &r, 200, false, 1, 0) == SCROLL_MORE && f.calls == 1);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    CHECK(scroll_visual_follow_slice(&s, &r, 200, false, 1, 0) == 0);
+    CHECK(s.first.ordinal == 16 && s.first.byte == 160);
+    CHECK(scroll_visual_wheel(&s, INT32_MAX) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0 && s.first.ordinal == 16 && s.viewport.subrow_q8 == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_HOME, &motion) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0 && s.first.byte == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0 && s.first.byte == 160);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_PAGE_UP, &motion) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0 && s.first.byte == 120);
+    CHECK(scroll_visual_resize(&s, (scroll_config){50, 9, 20}, &source) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 2, 0) == 0 && s.first.byte == 0);
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 17, 1}, &source) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 2, 0) == 0);
+    for (unsigned i = 0; i < 1000; i++) {
+        CHECK(scroll_visual_wheel(&s, (i & 1u) ? -256 : 256) == 0);
+        CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    }
+    CHECK(scroll_visual_follow_slice(&s, &r, 100, false, 1, 0) == SCROLL_MORE);
+    /* New wheel intent cancels a partially resolved follow. */
+    CHECK(scroll_visual_wheel(&s, 256) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0 && s.first.ordinal == 3);
+    before = s; f.fail = true;
+    CHECK(scroll_visual_follow_slice(&s, &r, 100, false, 2, 0) == SCROLL_ERR_SOURCE);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    f.fail = false; f.malformed = true;
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == SCROLL_ERR_SOURCE);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    f.malformed = false;
+    /* A lazy wrap producer must not require a whole-buffer visual count. */
+    source.rows = 1; source.exact = false; source.generation++; f.eof = true;
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 17, 1}, &source) == 0);
+    int rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) {
+        f.calls = 0;
+        rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+        CHECK(f.calls <= 1);
+    }
+    CHECK(rc == 0 && s.first.ordinal == 3 && !s.source.exact);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    CHECK(scroll_visual_wheel(&s, -256) == 0);
+    rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+    CHECK(rc == 0 && s.first.ordinal == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_PAGE_DOWN, &motion) == 0);
+    rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+    CHECK(rc == 0 && s.first.ordinal == 4);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    CHECK(scroll_visual_follow_slice(&s, &r, 70, false, 2, 0) == SCROLL_MORE);
+    CHECK(scroll_visual_follow_slice(&s, &r, 70, false, 2, 0) == 0);
+    CHECK(s.first.ordinal == 5);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+    CHECK(rc == 0 && s.first.ordinal == 16 && s.source.rows == 20 && s.source.exact);
+    /* Discover EOF by bottom lookahead, not just by stepping past last row. */
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 17, 1}, &source) == 0);
+    rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+    CHECK(rc == 0 && !s.source.exact);
+    CHECK(scroll_visual_wheel(&s, 256) == 0);
+    rc = SCROLL_MORE;
+    for (unsigned i = 0; i < 10 && rc == SCROLL_MORE; i++) rc = scroll_visual_resolve_slice(&s, &r, 1, 0);
+    CHECK(rc == 0 && s.first.ordinal == 16 && s.source.exact);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_HOME, &motion) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(scroll_visual_pixels(&s, 16 * 256) == 0);
+    source.rows = 20; source.exact = true;
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 5, 1}, &source) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 2, 0) == 0);
+    CHECK(s.first.ordinal == 3 && s.viewport.subrow_q8 == 256);
+    size_t allocations = edit_malloc_guard_end(); guarding = false;
+    CHECK(allocations == 0);
+    printf("scroll_test: wrapped wheel/page/reflow/EOF/follow affinity, bounded pending/error/cancel PASS; allocations=%zu guard=%s\n",
+        allocations, edit_malloc_guard_active() ? "active" : "sanitizer-inert");
+    result = 0;
+cleanup:
+    if (guarding) (void)edit_malloc_guard_end();
+    return result;
+}
+static int renderer_origin(void)
+{
+    int result = 1;
+    scroll_state s;
+    scroll_frame_plan p, before;
+    uint32_t row;
+    uint64_t within;
+    CHECK(scroll_init(&s, (scroll_config){4, 17, 1}, (scroll_extent){100, 20, true}) == 0);
+    CHECK(scroll_plan_frame(&s, 80, 68, NULL, &p) == 0);
+    CHECK(p.origin_y_q8 == 0 && p.layout_rows == 5 && p.full_damage);
+    before = p;
+    CHECK(scroll_wheel(&s, 1) == 0);
+    CHECK(scroll_plan_frame(&s, 80, 68, &before, &p) == 0);
+    CHECK(p.origin_y_q8 == -51 && p.clip_height == 68 && p.full_damage);
+    CHECK(scroll_frame_hit(&p, 0, &row, &within) == 0 && row == 0 && within == 51);
+    CHECK(scroll_frame_hit(&p, 68 * 256 - 1, &row, &within) == 0 && row == 4 && within == 50);
+    /* Last laid-out row covers the fractional lower edge. */
+    CHECK((int64_t)p.layout_rows * 17 * 256 + p.origin_y_q8 >= 68 * 256);
+    before = p;
+    CHECK(scroll_plan_frame(&s, 80, 68, &before, &p) == 0 && !p.full_damage);
+    before = p;
+    CHECK(scroll_frame_hit(&p, 68 * 256, &row, &within) == SCROLL_ERR_ARG);
+    CHECK(scroll_frame_hit(&p, -1, &row, &within) == SCROLL_ERR_ARG);
+    CHECK(scroll_plan_frame(&s, 80, 69, NULL, &p) == SCROLL_ERR_ARG);
+    CHECK(memcmp(&p, &before, sizeof p) == 0);
+    CHECK(scroll_wheel(&s, -1) == 0);
+    CHECK(scroll_plan_frame(&s, 80, 68, &before, &p) == 0 && p.origin_y_q8 == 0 && p.full_damage);
+    puts("scroll_test: Q8 origin/clip/overscan, inverse hit transform and damage PASS");
+    result = 0;
+cleanup:
+    return result;
+}
+static int huge_visual_row(void *ctx, uint64_t ordinal, scroll_visual_row *out)
+{
+    (void)ctx;
+    *out = (scroll_visual_row){.ordinal = ordinal, .byte = ordinal,
+        .end = ordinal, .line_start = ordinal, .line = ordinal};
+    return 0;
+}
+static int huge_visual_locate(void *ctx, uint64_t byte, bool trailing, scroll_visual_row *out)
+{ (void)trailing; return huge_visual_row(ctx, byte, out); }
+static int wrapped_integer_limits(void)
+{
+    int result = 1;
+    scroll_visual_source source = {NULL, LINEIDX_MAX_LEN, UINT64_MAX, 1,
+        huge_visual_row, huge_visual_locate, true};
+    scroll_visual_row seed = {0};
+    scroll_visual s;
+    scroll_visual_resolver r = {0};
+    view_key motion;
+    CHECK(scroll_visual_init(&s, (scroll_config){4, 17, 1}, &source, seed) == 0);
+    CHECK(scroll_visual_key_motion(&s, SCROLL_END, &motion) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(s.first.ordinal == UINT64_MAX - 4u);
+    CHECK(scroll_visual_pixels(&s, -1) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 1, 0) == 0);
+    CHECK(scroll_visual_resize(&s, (scroll_config){4, 1, 1}, &source) == 0);
+    CHECK(scroll_visual_resolve_slice(&s, &r, 2, 0) == 0);
+    CHECK(s.first.ordinal == UINT64_MAX - 4u && s.viewport.subrow_q8 == 0);
+    puts("scroll_test: wrapped resize carry saturates at integer-limit EOF PASS");
+    result = 0;
+cleanup:
+    return result;
+}
+typedef struct frame_observer {
+    uint32_t submitted_id, presented_id;
+    size_t submissions, presentations;
+} frame_observer;
+static void observe_submit(void *ctx, const editor_frame *frame)
+{
+    frame_observer *o = ctx;
+    o->submitted_id = frame->id; o->submissions++;
+}
+static void observe_present(void *ctx, const editor_frame *frame)
+{
+    frame_observer *o = ctx;
+    o->presented_id = frame->id; o->presentations++;
+}
+static int settle_editor(editor *e)
+{
+    for (unsigned i = 0; i < 10000; i++) {
+        int rc = editor_step(e, 0);
+        if (rc != EDITOR_OK && rc != EDITOR_MORE) return rc;
+        editor_stats stats = editor_get_stats(e);
+        if (!stats.pending && !stats.render_active) return 0;
+    }
+    return EDITOR_MORE;
+}
+/* Capability probe, not a displayed-cadence verdict. --require-editor-scroll
+ * preserves the failing integration check for the editor owner's follow-up. */
+static int editor_observability(bool require_scroll)
+{
+    int result = 1;
+    editor *e = NULL;
+    render_backend backend = {0};
+    frame_observer observer = {0};
+    uint8_t bytes[400];
+    for (size_t i = 0; i < sizeof bytes; i++) bytes[i] = i % 10 == 9 ? '\n' : (uint8_t)'a';
+    editor_config config = {.initial = bytes, .initial_len = sizeof bytes,
+        .cols = 32, .rows = 8, .wrap_mode = -1, .hook_ctx = &observer,
+        .on_submit = observe_submit, .on_present = observe_present};
+    CHECK(render_null_backend(&backend) == 0);
+    CHECK(editor_open(&e, &config, &backend) == 0 && settle_editor(e) == 0);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+    CHECK(editor_inject(e, &focus) == 0 && settle_editor(e) == 0);
+    CHECK(observer.submissions && observer.submissions == observer.presentations);
+    CHECK(observer.submitted_id == observer.presented_id);
+    size_t baseline = observer.submissions;
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .dy = 1, .smooth = true};
+    CHECK(editor_inject(e, &wheel) == 0 && settle_editor(e) == 0);
+    wheel.dy = 256;
+    CHECK(editor_inject(e, &wheel) == 0 && settle_editor(e) == 0);
+    if (require_scroll) CHECK(observer.submissions > baseline);
+    else {
+        /* The absence is explicit and must not be mistaken for a G3z pass. */
+        CHECK(observer.submissions == observer.presentations);
+        CHECK(observer.submitted_id == observer.presented_id);
+        printf("scroll_test: public editor/null frame IDs correlate at submit/present; wheel frames=%s; displayed G3z UNAVAILABLE (hook required) PASS\n",
+            observer.submissions > baseline ? "available" : "absent");
+    }
+    result = 0;
+cleanup:
+    editor_close(e);
+    return result;
+}
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--require-editor-scroll") == 0)
+        return editor_observability(true);
+    if (argc != 1) return 2;
+    if (renderer_origin()) return 1;
+    if (wrapped_navigation()) return 1;
+    if (wrapped_integer_limits()) return 1;
+    if (editor_observability(false)) return 1;
     if (resident_failure_and_retirement() || resident_navigation() || complete_operation_budget() || follow_operation_budget() || delegated_source_errors() || accumulation() || keys_and_follow() || correction() || unindexed_ends() || follow_proof() || bounded_and_allocations()) return 1;
     puts("scroll_test: PASS");
     return 0;

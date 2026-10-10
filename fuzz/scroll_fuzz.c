@@ -3,9 +3,10 @@
  * byte seeking and prefix publication, including event/publication races. */
 #include "scroll/scroll.h"
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
-#define REQUIRE(x) do { if (!(x)) __builtin_trap(); } while (0)
+#define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "scroll_fuzz:%d: FAIL %s\n", __LINE__, #x); __builtin_trap(); } } while (0)
 #define FILE_BYTES (3u * LINEIDX_CHUNK)
 #define MAX_LINES (FILE_BYTES / 7u + 2u)
 
@@ -217,24 +218,24 @@ static void difficult_model(const uint8_t *data, size_t size)
     lineidx *index = lineidx_create(f.size); REQUIRE(index);
     scroll_state s;
     REQUIRE(scroll_init(&s, (scroll_config){1, 17, 0}, (scroll_extent){f.size, 100, false}) == 0);
-    REQUIRE(scroll_seek_byte(&s, anchor) == 0 && scroll_resolve(&s, index, &src, 0) == 0);
+    REQUIRE(scroll_seek_byte(&s, anchor) == 0 && resolve(&s, index, &src) == 0);
     REQUIRE(s.first_byte == anchor);
     scroll_state before = s;
     size_t cursor = anchor + gap - 1;
     REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == SCROLL_MORE);
     REQUIRE(memcmp(&s, &before, sizeof s) == 0);
-    REQUIRE(scroll_follow_cursor(&s, index, &src, anchor + SCROLL_SCAN_BUDGET) == 0);
+    REQUIRE(follow_cursor(&s, index, &src, anchor + SCROLL_SCAN_BUDGET) == 0);
     REQUIRE(s.first_byte == anchor);
     /* Fail on a staged callback inside the requested suffix, with unchanged
      * pending intent as well as unchanged viewport. */
     REQUIRE(scroll_seek_byte(&s, cursor) == 0); before = s;
     f.calls = 0; f.fail_call = 1u + data[3] % 8u;
-    REQUIRE(scroll_resolve(&s, index, &src, 0) == SCROLL_ERR_SOURCE);
+    REQUIRE(resolve(&s, index, &src) == SCROLL_ERR_SOURCE);
     REQUIRE(memcmp(&s, &before, sizeof s) == 0);
     f.fail_call = 0;
-    REQUIRE(scroll_resolve(&s, index, &src, 0) == 0);
+    REQUIRE(resolve(&s, index, &src) == 0);
     complete_index(index, &src);
-    REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == 0);
+    REQUIRE(follow_cursor(&s, index, &src, cursor) == 0);
     REQUIRE(s.first_byte == scalar_start(bytes, cursor));
     REQUIRE(s.first_line == scalar_line(bytes, cursor) && !s.approximate);
     for (size_t i = 0; i < size && i < 16; i++) {
@@ -258,16 +259,118 @@ static void difficult_model(const uint8_t *data, size_t size)
         s.first_byte = scalar_start(bytes, (size_t)transformed);
         REQUIRE(scroll_set_extent(&s, (scroll_extent){f.size, 100, false}) == 0);
         complete_index(index, &src);
-        REQUIRE(scroll_resolve(&s, index, &src, 0) == 0);
-        REQUIRE(scroll_follow_cursor(&s, index, &src, cursor) == 0);
+        REQUIRE(resolve(&s, index, &src) == 0);
+        REQUIRE(follow_cursor(&s, index, &src, cursor) == 0);
         REQUIRE(s.first_byte == scalar_start(bytes, cursor));
         REQUIRE(s.first_line == scalar_line(bytes, cursor) && !s.approximate);
     }
     lineidx_destroy(index);
 }
+typedef struct visual_fixture { uint64_t bytes; uint32_t width, calls; bool pending; } visual_fixture;
+static int visual_row(void *ctx, uint64_t ordinal, scroll_visual_row *out)
+{
+    visual_fixture *f = ctx;
+    f->calls++;
+    if (f->pending) return SCROLL_MORE;
+    uint64_t rows = (f->bytes + f->width - 1u) / f->width;
+    if (!rows) rows = 1;
+    bool past = ordinal >= rows;
+    if (past) ordinal = rows - 1;
+    uint64_t start = ordinal * f->width, end = start + f->width;
+    if (end > f->bytes) end = f->bytes;
+    *out = (scroll_visual_row){.ordinal = ordinal, .byte = start, .end = end, .column = start};
+    return past ? SCROLL_EOF : SCROLL_OK;
+}
+static int visual_locate(void *ctx, uint64_t byte, bool trailing, scroll_visual_row *out)
+{
+    visual_fixture *f = ctx;
+    if (byte && (byte == f->bytes || (trailing && byte % f->width == 0))) byte--;
+    return visual_row(ctx, byte / f->width, out);
+}
+static void visual_model(const uint8_t *data, size_t size)
+{
+    if (size < 4) return;
+    visual_fixture f = {.bytes = (uint64_t)data[0] * 8u, .width = (uint32_t)data[1] % 32u + 1u};
+    model m = {.rows = 4, .height = 17, .margin = 1,
+        .lines = (f.bytes + f.width - 1u) / f.width};
+    if (!m.lines) m.lines = 1;
+    scroll_visual_source source = {&f, f.bytes, m.lines, 1, visual_row, visual_locate, true};
+    scroll_visual_row seed;
+    REQUIRE(visual_row(&f, 0, &seed) == 0);
+    scroll_visual s;
+    scroll_visual_resolver r = {0};
+    REQUIRE(scroll_visual_init(&s, (scroll_config){m.rows, m.height, m.margin}, &source, seed) == 0);
+    for (size_t i = 2; i + 2 < size && i < 258; i += 3) {
+        unsigned op = data[i] % 5u;
+        int64_t delta = (int64_t)data[i + 1] - 128;
+        uint64_t cursor = 0;
+        bool following = false, trailing = (data[i + 2] & 1u) != 0;
+        if (op == 0) {
+            REQUIRE(scroll_visual_wheel(&s, (int32_t)delta) == 0);
+            move(&m, delta * 3 * m.height);
+        } else if (op == 1) {
+            REQUIRE(scroll_visual_pixels(&s, delta * 256) == 0);
+            move(&m, delta * 256);
+        } else if (op == 2) {
+            scroll_key key = (scroll_key)(data[i + 2] % 4u); view_key motion;
+            REQUIRE(scroll_visual_key_motion(&s, key, &motion) == 0);
+            if (key == SCROLL_HOME) m.position = 0;
+            else if (key == SCROLL_END) m.position = maximum(&m);
+            else {
+                m.position -= m.position % ((int64_t)m.height * 256);
+                move(&m, (key == SCROLL_PAGE_UP ? -1 : 1) * (int64_t)m.rows * m.height * 256);
+            }
+        } else if (op == 3) {
+            cursor = ((uint64_t)data[i + 1] * 8u) % (f.bytes + 1u);
+            uint64_t byte = cursor;
+            if (byte && (byte == f.bytes || (trailing && byte % f.width == 0))) byte--;
+            follow(&m, byte / f.width);
+            following = true;
+        } else {
+            uint64_t old_row = (uint64_t)m.position / ((uint64_t)m.height * 256u);
+            uint64_t old_sub = (uint64_t)m.position % ((uint64_t)m.height * 256u);
+            uint64_t anchor = old_row * f.width;
+            f.width = (uint32_t)data[i + 1] % 32u + 1u;
+            m.rows = (uint32_t)data[i + 2] % 12u + 1u;
+            m.height = (uint32_t)data[i + 1] % 64u + 1u;
+            m.lines = (f.bytes + f.width - 1u) / f.width;
+            if (!m.lines) m.lines = 1;
+            m.position = (int64_t)(anchor / f.width) * m.height * 256 + (int64_t)old_sub;
+            if (m.position > maximum(&m)) m.position = maximum(&m);
+            source.rows = trailing ? m.lines : 1;
+            source.exact = trailing; source.generation++;
+            REQUIRE(scroll_visual_resize(&s, (scroll_config){m.rows, m.height, m.margin}, &source) == 0);
+        }
+        scroll_visual before = s;
+        f.pending = true; f.calls = 0;
+        int rc = following ? scroll_visual_follow_slice(&s, &r, cursor, trailing, 1, 0) :
+            scroll_visual_resolve_slice(&s, &r, 1, 0);
+        REQUIRE(rc == SCROLL_MORE && f.calls <= 1 && memcmp(&s, &before, sizeof s) == 0);
+        f.pending = false;
+        for (unsigned slice = 0; slice < 16 && rc == SCROLL_MORE; slice++) {
+            f.calls = 0;
+            rc = following ? scroll_visual_follow_slice(&s, &r, cursor, trailing, 1, 0) :
+                scroll_visual_resolve_slice(&s, &r, 1, 0);
+            REQUIRE(f.calls <= 1);
+            if (rc == SCROLL_MORE) REQUIRE(memcmp(&s, &before, sizeof s) == 0);
+        }
+        REQUIRE(rc == 0);
+        REQUIRE(s.first.ordinal == (uint64_t)m.position / ((uint64_t)m.height * 256u));
+        REQUIRE(s.first.byte == s.first.ordinal * f.width);
+        REQUIRE(s.viewport.subrow_q8 == (uint64_t)m.position % ((uint64_t)m.height * 256u));
+        scroll_frame_plan plan;
+        REQUIRE(scroll_plan_frame(&s.viewport, 80, m.rows * m.height, NULL, &plan) == 0);
+        REQUIRE(plan.origin_y_q8 == -(int64_t)s.viewport.subrow_q8 && plan.layout_rows == m.rows + 1u);
+        uint32_t hit; uint64_t within;
+        REQUIRE(scroll_frame_hit(&plan, (int64_t)m.rows * m.height * 256 - 1, &hit, &within) == 0);
+        uint64_t y = (uint64_t)m.rows * m.height * 256u - 1u + s.viewport.subrow_q8;
+        REQUIRE(hit == y / ((uint64_t)m.height * 256u) && within == y % ((uint64_t)m.height * 256u));
+    }
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    visual_model(data, size);
     difficult_model(data, size);
     core_model(data, size);
     index_model(data, size);

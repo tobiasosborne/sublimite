@@ -239,7 +239,7 @@ int main(int argc, char **argv)
     printf("BENCH G3z_work_proxy (M)%s load1=%s power=%s n=%u p50_ns=%" PRIu64 " p99_ns=%" PRIu64 " max_ns=%" PRIu64 " over_T_half=%zu (G)max_ns<=%" PRIu64 " (G)over_T_half=0 TRACK=%d\n",
         bench__tag_from_power(cadence_stamp.power), cadence_stamp.load, cadence_stamp.power, STEPS,
         bench_p50(&work), bench_p99(&work), maximum_ns, slow, HALF_PERIOD_NS, track);
-    puts("G3z displayed refreshes: UNMEASURED; requires real display and editor wiring. Sub-row pixel origin is retained by scroll; null render currently draws integral rows.");
+    puts("G3z displayed_verdict=UNAVAILABLE: work_proxy is a CPU regression comparison plus synthetic null completion, not displayed cadence. Requires editor on_refresh(displayed frame ID, refresh sequence, completion time, immutable scroll plan and sidebar identity); see docs/decisions/P3.4.md. Renderer origin/clip wiring remains external.");
     lineidx_destroy(index);
     /* A cancelled seek must never become adoptable, including a fast worker
      * completion racing cancellation. Outside the descriptive sample timer. */

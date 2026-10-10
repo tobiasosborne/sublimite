@@ -6,6 +6,39 @@ static bool extent_valid(scroll_extent e)
 { return e.bytes <= LINEIDX_MAX_LEN && e.lines != 0 && e.lines <= e.bytes + 1; }
 static bool valid(const scroll_state *s)
 { return s && config_valid(s->config) && extent_valid(s->extent); }
+int scroll_plan_frame(const scroll_state *s, uint32_t width, uint32_t height,
+                      const scroll_frame_plan *previous, scroll_frame_plan *out)
+{
+    if (!valid(s) || !out || !width || !height || s->config.rows == UINT32_MAX ||
+        height > (uint64_t)s->config.rows * s->config.row_height ||
+        s->subrow_q8 >= (uint64_t)s->config.row_height * SCROLL_PIXEL_UNIT)
+        return SCROLL_ERR_ARG;
+    scroll_frame_plan p = {.first_byte = s->first_byte, .first_row = s->first_line,
+        .origin_y_q8 = -(int64_t)s->subrow_q8, .clip_width = width,
+        .clip_height = height, .row_height = s->config.row_height,
+        .layout_rows = s->config.rows + 1u};
+    p.full_damage = !previous || previous->first_byte != p.first_byte ||
+        previous->first_row != p.first_row || previous->origin_y_q8 != p.origin_y_q8 ||
+        previous->clip_width != p.clip_width || previous->clip_height != p.clip_height ||
+        previous->row_height != p.row_height || previous->layout_rows != p.layout_rows;
+    *out = p;
+    return SCROLL_OK;
+}
+int scroll_frame_hit(const scroll_frame_plan *p, int64_t y_q8,
+                     uint32_t *row, uint64_t *within_q8)
+{
+    if (!p || !row || !within_q8 || !p->row_height || !p->layout_rows ||
+        p->origin_y_q8 > 0 || p->origin_y_q8 <= -(int64_t)p->row_height * SCROLL_PIXEL_UNIT ||
+        y_q8 < 0 || (uint64_t)y_q8 >= (uint64_t)p->clip_height * SCROLL_PIXEL_UNIT)
+        return SCROLL_ERR_ARG;
+    uint64_t document_y = (uint64_t)y_q8 + (uint64_t)(-p->origin_y_q8);
+    uint64_t height = (uint64_t)p->row_height * SCROLL_PIXEL_UNIT;
+    uint64_t ordinal = document_y / height;
+    if (ordinal >= p->layout_rows) return SCROLL_ERR_ARG;
+    *row = (uint32_t)ordinal;
+    *within_q8 = document_y % height;
+    return SCROLL_OK;
+}
 static uint64_t max_top(const scroll_state *s)
 {
     uint64_t lines = s->extent.exact ? s->extent.lines : s->extent.bytes + 1;
