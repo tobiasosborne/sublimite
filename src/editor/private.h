@@ -20,6 +20,7 @@ typedef struct editor_buffer {
     piece_tree *tree;
     undo_log undo;
     file *file;
+    journal_base base;
     lineidx *index;
     editor_delta *history;
     size_t history_head, history_count, history_cursor, history_cap;
@@ -99,8 +100,10 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor);
 void editor_restart_blink(editor *e, uint64_t now);
 void editor_route_work(const work_msg *msg, void *ctx);
 void editor_journal_staged(editor *e);
+int editor_checkpoint(editor *e);
 int editor_handle_key(editor *e, const plat_event *ev);
 int editor_continue_action(editor *e);
+int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
                           size_t len, editor_buffer **out);
 void editor_buffer_destroy(editor_buffer *b);

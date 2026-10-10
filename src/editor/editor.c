@@ -7,6 +7,23 @@
 
 static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 static uint64_t max64(uint64_t a, uint64_t b) { return a > b ? a : b; }
+static int layout_slice(editor *e)
+{
+    layout *l = &e->lay;
+    if (l->wrap) return layout_run(l);
+    /* Piece leaves cover at most 64 KiB and their newline counts are warm.
+     * Seed each logical row independently: layout's bounded clipped-tail scan
+     * is allowed to stop without discovering the next line's newline. */
+    uint32_t end = l->row_end;
+    if (l->phase == 0 && l->row < end) {
+        uint64_t line = l->first_line + l->row;
+        e->row_byte[l->row] = line < e->buffer->lines ? piece_line_to_byte(e->tree, line) : LAYOUT_VOID_ROW;
+    }
+    if (l->row < end) l->row_end = l->row + 1u;
+    int rc = layout_run(l);
+    l->row_end = end;
+    return rc == LAYOUT_DONE && layout_busy(l) ? LAYOUT_MORE : rc;
+}
 static int fail(editor *e, int cause)
 {
     e->stats.error_cause = cause;
@@ -111,7 +128,7 @@ static void platform_work(void *ctx)
 }
 static int pump(editor *e, int timeout)
 {
-    if (e->has_platform) {
+    if (e->has_platform && e->queue_count < EDITOR_INPUT_CAP) {
         plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work};
         uint64_t before = e->platform.iterations;
         e->platform.quit = false; e->pump_stopped = false;
@@ -154,7 +171,6 @@ static int submit(editor *e)
     if (e->frame.last_sequence) e->stats.submitted_sequence = e->frame.last_sequence;
     e->dirty = false;
     if (e->cfg.on_submit) e->cfg.on_submit(e->cfg.hook_ctx, &e->frame);
-    editor_journal_staged(e);
     return 0;
 }
 static int resize(editor *e)
@@ -272,7 +288,7 @@ int editor_step(editor *e, int timeout_ms)
             e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
             rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
         } else if (layout_busy(&e->lay)) {
-            uint64_t slice = trace_now_ns(); rc = layout_run(&e->lay);
+            uint64_t slice = trace_now_ns(); rc = layout_slice(e);
             uint64_t elapsed = trace_now_ns() - slice; e->stats.slices++;
             if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
             if (rc >= 0) rc = 0;
@@ -284,8 +300,16 @@ int editor_step(editor *e, int timeout_ms)
             if (rc >= 0) rc = 0;
         } else if (e->dirty && !e->paint_ready) rc = editor_paint_prepare(e);
         else break;
+        /* Protect every mutation before yielding to layout or publishing a
+         * frame. Successful journal calls establish the page-cache cutoff. */
+        editor_journal_staged(e);
+        if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
         if (rc) return fail(e, rc);
         if (e->quit || trace_now_ns() - start >= EDITOR_SLICE_NS) break;
+    }
+    if (e->quit) {
+        rc = editor_flush(e);
+        return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
     }
     rc = submit(e); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
@@ -347,6 +371,9 @@ int editor_flush(editor *e)
 {
     if (!e) return EDITOR_ERR_ARG;
     editor_journal_staged(e);
-    if (e->stats.journal_error) return e->stats.journal_error;
-    return e->journal ? journal_flush(e->journal) : 0;
+    if (!e->journal) return 0;
+    int rc = journal_flush(e->journal);
+    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error)
+        return editor_checkpoint(e);
+    return rc;
 }

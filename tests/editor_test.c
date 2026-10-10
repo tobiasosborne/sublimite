@@ -1,4 +1,5 @@
 #include "editor/editor.h"
+#include "editor/private.h"
 #include "raster/raster.h"
 #include "base/base.h"
 #include "trace/trace.h"
@@ -9,6 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct counted { bool active, suspended; size_t allocations, frames; } counted;
@@ -123,7 +129,9 @@ static int allocation_test(bool raster)
         }
         T(settle(e) == 0);
     }
-    T(!c.active && !c.suspended); T(c.allocations == 0); T(editor_length(e) == 0);
+    T(!c.active && !c.suspended);
+    if (c.allocations) fprintf(stderr, "editor allocation diagnostic: backend=%s allocations=%zu\n", raster ? "raster" : "null", c.allocations);
+    T(c.allocations == 0); T(editor_length(e) == 0);
     editor_stats s = editor_get_stats(e); T(s.mutations == 10000 && s.journal_records == 10000 && !s.journal_error);
     T(editor_flush(e) == 0); editor_close(e); unlink(path);
     printf("editor_test: %s 10000 keys mallocs=%zu guard=%s\n", raster ? "raster" : "null", c.allocations,
@@ -249,9 +257,386 @@ static int stopped_error(void)
     T(editor_length(e) == 0 && editor_step(e, 0) == rc);
     editor_close(e); puts("editor_test: mutation error is negative and stops the loop passed"); return 0;
 }
+
+/* Review regressions run separately so every finding keeps its own red line. */
+static void raw_key(plat *p, const char *name)
+{
+    x11_input *in = p->in;
+    xkb_keycode_t code = xkb_keymap_key_by_name(in->keymap, name);
+    EDIT_ASSERT(code <= UINT8_MAX);
+    xcb_key_press_event_t ev = {.response_type = XCB_KEY_PRESS, .detail = (uint8_t)code,
+        .event = p->win, .same_screen = 1};
+    (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&ev);
+    ev.response_type = XCB_KEY_RELEASE;
+    (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&ev);
+}
+static void raw_close(plat *p)
+{
+    xcb_client_message_event_t ev = {.response_type = XCB_CLIENT_MESSAGE, .format = 32,
+        .window = p->win, .type = p->wm_protocols, .data.data32 = {p->wm_delete, 0, 0, 0, 0}};
+    (void)xcb_send_event(p->conn, 0, p->win, 0, (const char *)&ev); (void)xcb_flush(p->conn);
+}
+static void raw_barrier(plat *p)
+{
+    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(p->conn, xcb_get_input_focus(p->conn), NULL);
+    free(r);
+}
+static int review_native_order(void)
+{
+    for (unsigned kind = 0; kind < 3; kind++) {
+        render_backend b = {0}; T(render_cpu_backend(&b) == 0);
+        editor_config cfg = {.cols = 32, .rows = 8}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); plat *p = b.config.platform;
+        raw_key(p, "AC01");
+        if (kind == 0) raw_close(p);
+        else if (kind == 1) {
+            xcb_focus_out_event_t ev = {.response_type = XCB_FOCUS_OUT, .event = p->win,
+                .mode = XCB_NOTIFY_MODE_NORMAL, .detail = XCB_NOTIFY_DETAIL_NONLINEAR};
+            (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&ev);
+        } else {
+            xcb_configure_notify_event_t ev = {.response_type = XCB_CONFIGURE_NOTIFY, .event = p->win,
+                .window = p->win, .width = 264, .height = 120};
+            (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&ev);
+        }
+        raw_barrier(p);
+        if (kind == 0) {
+            int rc = 0;
+            for (unsigned i = 0; i < 200 && rc != EDITOR_CLOSED; i++) rc = editor_step(e, 0);
+            T(rc == EDITOR_CLOSED);
+        } else T(settle(e) == 0);
+        T(expect(e, "a", 1) == 0); editor_close(e);
+    }
+    puts("review 1: native batched key/close, key/focus, key/resize ordered passed"); return 0;
+}
+static int review_native_burst(void)
+{
+    render_backend b = {0}; T(render_cpu_backend(&b) == 0);
+    editor_config cfg = {.cols = 32, .rows = 8}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); plat *p = b.config.platform;
+    for (unsigned i = 0; i < 1300; i++) {
+        raw_key(p, "AC01");
+        xcb_expose_event_t ev = {.response_type = XCB_EXPOSE, .window = p->win, .width = 256, .height = 120};
+        (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_EXPOSURE, (const char *)&ev);
+    }
+    raw_barrier(p);
+    for (unsigned i = 0; i < 10000 && editor_length(e) < 1300; i++) T(editor_step(e, 1) >= 0);
+    T(editor_length(e) == 1300); T(settle(e) == 0); editor_close(e);
+    puts("review 2: native burst beyond both queue capacities preserves all keys passed"); return 0;
+}
+static void kill_submit(void *ctx, const editor_frame *f)
+{ (void)ctx; if (f->last_sequence) (void)kill(getpid(), SIGKILL); }
+static int review_crash_at(unsigned point)
+{
+    char path[] = "/tmp/editor-crash-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        render_backend b = {0}; if (render_null_backend(&b)) _exit(10);
+        editor_config cfg = {.cols = 32, .rows = 8, .journal_path = path,
+            .on_submit = point == 0 ? kill_submit : NULL, .on_present = point == 1 ? kill_submit : NULL};
+        editor *e = NULL; if (editor_open(&e, &cfg, &b) || settle(e) || editor_flush(e)) _exit(11);
+        plat_event ev = key('x', 0, "x"); if (editor_inject(e, &ev)) _exit(12);
+        if (point == 2) {
+            /* Force a continuation after mutation, before layout/submission. */
+            e->lay.cfg.slice_clusters = 1;
+            if (editor_step(e, 0) < 0 || editor_length(e) != 1) _exit(13);
+            (void)kill(getpid(), SIGKILL);
+        } else if (point == 3) {
+            if (settle(e) || editor_flush(e)) _exit(14);
+            (void)kill(getpid(), SIGKILL);
+        } else if (settle(e)) _exit(15);
+        _exit(16);
+    }
+    int status = 0; T(waitpid(child, &status, 0) == child);
+    T(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    replay_model m = {0}; journal_replay_result r;
+    T(journal_replay_file(path, replay, &m, &r) == 0); unlink(path);
+    T(m.len == 1 && m.bytes[0] == 'x');
+    printf("review 3/P1.9-2.2: SIGKILL point=%u recovery=x passed\n", point); return 0;
+}
+static int review_crash(void)
+{ int rc = 0; for (unsigned p = 0; p < 4; p++) rc |= review_crash_at(p); return rc; }
+static ssize_t reject_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{ (void)ctx; (void)fd; (void)p; (void)n; (void)off; errno = EIO; return -1; }
+static int review_suffix_at(unsigned mode)
+{
+    {
+        char path[] = "/tmp/editor-suffix-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+        render_backend b = {0}; T(render_null_backend(&b) == 0);
+        editor_config cfg = {.journal_path = path, .cols = 16, .rows = 4}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); T(editor_flush(e) == 0);
+        if (mode) { journal_io io = {.append_write = reject_append}; T(journal_set_io(e->journal, &io) == 0); }
+        else {
+            /* Exhaust admission before staging the suffix. */
+            uint8_t *large = malloc(JOURNAL_DEFAULT_BATCH_BYTES); T(large != NULL);
+            memset(large, 'q', JOURNAL_DEFAULT_BATCH_BYTES);
+            T(journal_insert(e->journal, e->buffer->id, 0, large, JOURNAL_DEFAULT_BATCH_BYTES) == JOURNAL_FULL); free(large);
+        }
+        e->stage[0] = 'a'; e->stage[1] = 'b'; e->stage_used = 2; e->op_count = 2;
+        e->ops[0] = (editor_jop){0, 1, 0, true, e->buffer->id};
+        e->ops[1] = (editor_jop){1, 1, 1, true, e->buffer->id};
+        uint64_t accepted = journal_get_stats(e->journal).accepted_sequence;
+        editor_journal_staged(e); T(e->stats.journal_error == (mode ? JOURNAL_IO : JOURNAL_FULL));
+        /* IO accepted the first record into the journal's retained batch;
+         * FULL accepted nothing. Preserve only the unaccepted editor suffix. */
+        T(e->op_count == (mode ? 1u : 2u)); T(e->stage_used == 2);
+        if (mode) {
+            T(e->ops[0].off == 1 && journal_get_stats(e->journal).accepted_sequence == accepted + 1);
+            T(journal_set_io(e->journal, NULL) == 0);
+        }
+        editor_close(e); unlink(path);
+    }
+    puts("review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed"); return 0;
+}
+static int review_suffix(void)
+{ int a = review_suffix_at(0), b = review_suffix_at(1); return a | b; }
+static int reject_sync(void *ctx, int fd, bool directory)
+{ (void)ctx; (void)fd; (void)directory; errno = EIO; return -1; }
+static int review_journal_exit_at(unsigned mode)
+{
+    char path[] = "/tmp/editor-journal-exit-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.journal_path = path, .cols = 16, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); T(editor_flush(e) == 0);
+    if (!mode) {
+        uint8_t *large = calloc(1, JOURNAL_DEFAULT_BATCH_BYTES); T(large != NULL);
+        T(journal_insert(e->journal, e->buffer->id, 0, large, JOURNAL_DEFAULT_BATCH_BYTES) == JOURNAL_FULL); free(large);
+    } else if (mode == 1) {
+        journal_io io = {.append_write = reject_append}; T(journal_set_io(e->journal, &io) == 0);
+    }
+    plat_event ev = key('x', 0, "x"); T(editor_inject(e, &ev) == 0);
+    if (mode < 2) T(editor_step(e, 0) == EDITOR_ERR_IO);
+    else {
+        T(settle(e) == 0);
+        journal_io io = {.sync = reject_sync}; T(journal_set_io(e->journal, &io) == 0);
+        T(journal_flush(e->journal) == JOURNAL_IO);
+        T(journal_get_stats(e->journal).durable_sequence < journal_get_stats(e->journal).accepted_sequence);
+    }
+    T(editor_length(e) == 1); T(journal_set_io(e->journal, NULL) == 0);
+    T(editor_flush(e) == 0); T(e->op_count == 0 && e->stage_used == 0);
+    editor_close(e); replay_model m = {0}; journal_replay_result r;
+    T(journal_replay_file(path, replay, &m, &r) == 0); T(m.len == 1 && m.bytes[0] == 'x'); unlink(path);
+    printf("review 4: exit checkpoint after FULL/append IO/sync IO mode=%u restores current tree passed\n", mode); return 0;
+}
+static int review_journal_exit(void)
+{ int a = review_journal_exit_at(0), b = review_journal_exit_at(1), c = review_journal_exit_at(2); return a | b | c; }
+typedef struct checkpoint_model { replay_model buffers[2]; size_t views; bool tabs, closed; } checkpoint_model;
+static int checkpoint_replay(void *ctx, const journal_record *r)
+{
+    checkpoint_model *m = ctx;
+    if (r->type == JOURNAL_TABS) {
+        if (r->size != (m->closed ? 24u : 32u) || le64(r->data) != (m->closed ? 1u : 2u) ||
+            le64(r->data + 8) != (m->closed ? 0u : 1u) || le64(r->data + 16) != (m->closed ? 2u : 1u) ||
+            (!m->closed && le64(r->data + 24) != 2)) return 1;
+        m->tabs = true; return 0;
+    }
+    if (r->type == JOURNAL_WINDOW) return 0;
+    if (!r->buffer_id || r->buffer_id > 2) return 1;
+    replay_model *b = &m->buffers[r->buffer_id - 1];
+    if (r->type == JOURNAL_BASE) {
+        journal_base base; char name[4097];
+        if (journal_decode_base(r, &base, name, sizeof name)) return 1;
+        if (*name) {
+            int fd = open(name, O_RDONLY); if (fd < 0) return 1;
+            ssize_t n = read(fd, b->bytes, sizeof b->bytes); close(fd); if (n < 0) return 1;
+            b->len = (size_t)n;
+        }
+        return 0;
+    }
+    if (r->type == JOURNAL_VIEW) {
+        if (r->size != 32 || le64(r->data) != 1 || le64(r->data + 8) != 1 ||
+            le64(r->data + 16) != 0 || le64(r->data + 24) != 0) return 1;
+        m->views++; return 0;
+    }
+    return replay(b, r);
+}
+static int review_checkpoint_session_at(bool closed)
+{
+    char path[] = "/tmp/editor-checkpoint-XXXXXX", source[] = "/tmp/editor-named-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0); close(fd);
+    fd = mkstemp(source); T(fd >= 0); T(write(fd, "aaaa", 4) == 4); close(fd);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.path = source, .journal_path = path, .cols = 16, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); T(press(e, key('x', 0, "x")) == 0);
+    uint64_t id = 0; T(editor_add_buffer(e, NULL, (const uint8_t *)"two", 3, &id) == 0 && id == 2);
+    T(settle(e) == 0); T(press(e, key('y', 0, "y")) == 0); T(editor_flush(e) == 0);
+    if (closed) { T(editor_close_tab(e, 0) == 0); T(settle(e) == 0); }
+    uint8_t *large = calloc(1, JOURNAL_DEFAULT_BATCH_BYTES); T(large != NULL);
+    T(journal_insert(e->journal, id, 0, large, JOURNAL_DEFAULT_BATCH_BYTES) == JOURNAL_FULL); free(large);
+    T(editor_flush(e) == 0); editor_close(e);
+    checkpoint_model model = {.closed = closed}; journal_replay_result result;
+    T(journal_replay_file(path, checkpoint_replay, &model, &result) == 0);
+    T(model.buffers[0].len == 5 && !memcmp(model.buffers[0].bytes, "xaaaa", 5));
+    T(model.buffers[1].len == 4 && !memcmp(model.buffers[1].bytes, "ytwo", 4));
+    T(model.views == 2 && model.tabs); unlink(path); unlink(source);
+    puts("review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed"); return 0;
+}
+static int review_checkpoint_session(void)
+{ int a = review_checkpoint_session_at(false), b = review_checkpoint_session_at(true); return a | b; }
+static int review_base_race(void)
+{
+    char source[] = "/tmp/editor-base-race-XXXXXX", path[] = "/tmp/editor-base-log-XXXXXX";
+    int fd = mkstemp(source); T(fd >= 0); T(write(fd, "aaaa", 4) == 4); close(fd);
+    fd = mkstemp(path); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.journal_path = path, .start_empty = true, .cols = 16, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0);
+    editor_buffer *b = NULL; T(editor_buffer_prepare(e, source, NULL, 0, &b) == 0);
+    uint8_t bytes[4]; T(piece_read(b->tree, 0, bytes, 4) == 0 && !memcmp(bytes, "aaaa", 4));
+    fd = open(source, O_WRONLY | O_TRUNC); T(fd >= 0); T(write(fd, "bbbb", 4) == 4); close(fd);
+    T(editor_register_journal(e, b, 1) == EDITOR_ERR_IO);
+    T(journal_get_stats(e->journal).accepted_sequence == 0);
+    editor_buffer_destroy(b); editor_close(e); unlink(source); unlink(path);
+    puts("review 5/P1.9-2.3: source changed between attachment and BASE registration rejected passed"); return 0;
+}
+static int review_style(void)
+{
+    const char *initial = "abcdefghijklmnopqrstuv\nnext";
+    for (unsigned mode = 0; mode < 4; mode++) {
+        render_backend b = {0}; T(render_null_backend(&b) == 0);
+        editor_config cfg = {.cols = 32, .rows = 4, .initial = (const uint8_t *)initial,
+            .initial_len = strlen(initial), .wrap_mode = -1}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+        T(editor_full_layout(e) == 0); e->lay.cfg.slice_clusters = 3;
+        T(layout_run(&e->lay) == LAYOUT_MORE); T(e->lay.row == 0 && e->lay.phase == 1);
+        /* Style changes can also arrive during the final decoration pass. */
+        e->paint_ready = true;
+        if (mode < 2) {
+            e->old_selection = e->v.state.selection; e->v.state.selection.cursor = 1;
+            if (!mode) e->v.state.selection.anchor = 1;
+        } else if (mode == 2) e->visible = false;
+        else e->focused = false;
+        T(editor_refresh_cursor(e, 0) == 0); T(settle(e) == 0);
+        const render_grid *g = editor_grid(e); uint32_t col = layout_gutter_width(&e->lay);
+        const render_cell *a = &g->cells[g->dims.cols + col], *z = a + 1;
+        T(!(a->attrs & RENDER_ATTR_CURSOR));
+        if (mode < 2) T(z->attrs & RENDER_ATTR_CURSOR);
+        if (mode == 1) T(a->bg == e->layout_cfg.sel_bg);
+        editor_close(e);
+    }
+    puts("review 6: submitted mid-row caret/selection/blink/focus cells passed"); return 0;
+}
+static int review_long_line(void)
+{
+    size_t n = 70000, len = 2 * n + 16; uint8_t *bytes = malloc(len); T(bytes != NULL);
+    memset(bytes, 'a', n); memcpy(bytes + n, "\nvisible\n", 9);
+    memset(bytes + n + 9, 'b', n); memcpy(bytes + 2 * n + 9, "\nagain\n", 7);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 7, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
+    const render_grid *g = editor_grid(e); uint32_t col = layout_gutter_width(&e->lay);
+    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[2u * g->dims.cols + col + 6].glyph_index == 'e');
+    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    T(b.stats.submitted_frames == 1);
+    T(press(e, key('x', 0, "x")) == 0);
+    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    editor_close(e); puts("review 7: multiple long clipped lines preserve subsequent rows in first frame and edit/undo passed"); return 0;
+}
+static int review_large_undo(void)
+{
+    size_t n = 600u * 1024u; uint8_t *bytes = malloc(n); T(bytes != NULL); memset(bytes, 'a', n);
+    char path[] = "/tmp/editor-large-undo-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = n, .journal_path = path,
+        .cols = 32, .rows = 4, .wrap_mode = -1}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0); T(editor_length(e) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(editor_length(e) == n);
+    T(editor_flush(e) == 0);
+    uint8_t tail[8]; T(editor_read(e, n - 8, tail, 8) == 0 && !memcmp(tail, "aaaaaaaa", 8));
+    editor_close(e); unlink(path); puts("review 12: journaled large deletion and undo passed"); return 0;
+}
+static int review_bursts(void)
+{
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.cols = 32, .rows = 4}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    T(press(e, key('a', 0, "a")) == 0); T(press(e, key('b', 0, "b")) == 0);
+    T(press(e, key('c', 0, "c")) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(editor_length(e) == 0);
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(expect(e, "abc", 3) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    plat_event repeat = key(XKB_KEY_BackSpace, 0, NULL); repeat.repeat = true;
+    T(press(e, repeat) == 0); T(press(e, repeat) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abc", 3) == 0);
+    T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(press(e, key('x', 0, "x")) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abc", 2) == 0);
+    editor_close(e); puts("review 13: typing and repeat deletion bursts, movement boundary passed"); return 0;
+}
+static int review_fairness(void)
+{
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.cols = 32, .rows = 8}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    uint64_t before = b.stats.submitted_frames;
+    for (unsigned turn = 0; turn < 64; turn++) {
+        while (e->queue_count < EDITOR_INPUT_CAP) {
+            plat_event ev = key('x', 0, "x"); T(editor_inject(e, &ev) == 0);
+        }
+        T(editor_step(e, 0) >= 0);
+    }
+    T(b.stats.submitted_frames > before && editor_get_stats(e).submitted_sequence > 0);
+    editor_close(e); puts("review 14: sustained arrivals make containing-frame progress passed"); return 0;
+}
+static int worker_owned_init(render_backend *b, const render_config *cfg)
+{
+    (void)b;
+    return pthread_equal(pthread_self(), cfg->workers->threads[0]) ? 0 : RENDER_ERR_INIT;
+}
+static int worker_failed_init(render_backend *b, const render_config *cfg)
+{ (void)b; return pthread_equal(pthread_self(), cfg->workers->threads[0]) ? RENDER_ERR_INIT : RENDER_ERR_ARG; }
+static int review_init(void)
+{
+    render_backend b = {.info = {"mailbox init test", sizeof(delayed), 16, RENDER_CAP_HEADLESS},
+        .ops = {worker_owned_init, delayed_resize, delayed_submit, delayed_present, delayed_event, delayed_close}};
+    editor_config cfg = {.cols = 16, .rows = 3}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(b.initialized); editor_close(e);
+    b.ops.init = worker_failed_init; e = NULL;
+    T(editor_open(&e, &cfg, &b) == RENDER_ERR_INIT); T(e == NULL && !b.initialized && b.state == NULL);
+    puts("review 23: backend init success/failure executes on work pool and adopts mailbox result passed"); return 0;
+}
+static int review_close_flush(void)
+{
+    char path[] = "/tmp/editor-close-flush-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
+    render_backend b = {0}; T(render_cpu_backend(&b) == 0);
+    editor_config cfg = {.journal_path = path, .cols = 32, .rows = 8}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    T(native_key(e, b.config.platform, "AC01", 0) == 0);
+    raw_close(b.config.platform); raw_barrier(b.config.platform);
+    /* Production run uses an indefinite wait. CLOSE must bypass frame finishing
+     * and return a flushed acknowledgement on this very turn. */
+    int rc = editor_step(e, -1); T(rc == EDITOR_CLOSED);
+    journal_stats js = journal_get_stats(e->journal); T(js.durable_sequence == js.accepted_sequence);
+    editor_close(e); replay_model m = {0}; journal_replay_result r;
+    T(journal_replay_file(path, replay, &m, &r) == 0 && m.len == 1 && m.bytes[0] == 'a'); unlink(path);
+    puts("required WM_DELETE_WINDOW: one turn, flushed recovery and shutdown passed"); return 0;
+}
+static int review_suite(const char *only)
+{
+    struct { const char *name; int (*fn)(void); } cases[] = {
+        {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
+        {"6", review_style}, {"7", review_long_line}, {"12", review_large_undo},
+        {"13", review_bursts}, {"14", review_fairness}, {"23", review_init}, {"close", review_close_flush}
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
+        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "12") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
+            (only && (!strcmp(only, "all") || !strcmp(only, cases[i].name)))) failed |= cases[i].fn();
+    return failed;
+}
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    const char *allocation = getenv("EDITOR_ALLOC_ONLY");
+    if (allocation) return allocation_test(!strcmp(allocation, "raster"));
+    const char *only = getenv("EDITOR_REVIEW_ONLY");
+    if (only) return review_suite(only);
+    T(review_suite(NULL) == 0);
     T(scrolled_undo() == 0);
     T(stopped_error() == 0);
     T(script(false) == 0); T(allocation_test(false) == 0);

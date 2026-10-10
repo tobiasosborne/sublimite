@@ -5,10 +5,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "runtime_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
+typedef struct directory_oracle { const char *root; unsigned barriers; bool fail; } directory_oracle;
+static int parent_barrier(void *ctx, int fd)
+{
+    directory_oracle *o = ctx; struct stat sb, root;
+    if (fstat(fd, &sb) || stat(o->root, &root)) return -1;
+    if (sb.st_dev == root.st_dev && sb.st_ino == root.st_ino) o->barriers |= 1u;
+    char child[4097]; (void)snprintf(child, sizeof child, "%s/a", o->root);
+    if (!stat(child, &root) && sb.st_dev == root.st_dev && sb.st_ino == root.st_ino) o->barriers |= 2u;
+    if (o->fail) { errno = EIO; return -1; }
+    return fsync(fd);
+}
+static int directory_test(void)
+{
+    char root[] = "/tmp/editor-dir-XXXXXX", path[4097]; T(mkdtemp(root) != NULL);
+    directory_oracle oracle = {.root = root};
+    T(snprintf(path, sizeof path, "%s/a/b", root) > 0);
+    T(editor_make_directory(path, parent_barrier, &oracle) == 0); T(oracle.barriers == 3u);
+    /* A failed namespace barrier must prevent journal startup acknowledgement. */
+    oracle.fail = true; T(snprintf(path, sizeof path, "%s/c/d", root) > 0);
+    T(editor_make_directory(path, parent_barrier, &oracle) == EDITOR_ERR_IO);
+    struct stat sb; T(stat(path, &sb) < 0 && errno == ENOENT);
+    T(snprintf(path, sizeof path, "%s/a/b", root) > 0); T(rmdir(path) == 0);
+    T(snprintf(path, sizeof path, "%s/a", root) > 0); T(rmdir(path) == 0); T(rmdir(root) == 0);
+    puts("P1.9-2.5: every created directory parent barrier observed; failure stops startup passed"); return 0;
+}
 int main(void)
 {
+    T(directory_test() == 0);
     const char *real[] = {NULL, "", ":0", ":0.0", "unix:0", "localhost:0.1", ":00", "bad"};
     for (size_t i = 0; i < sizeof real / sizeof real[0]; i++) {
         T(strcmp(editor_runtime_display(real[i], ":99", NULL), ":99") == 0);

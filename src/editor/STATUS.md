@@ -1,3 +1,33 @@
+# Editor review continuation — edit-zzj.13 session 8
+
+Current review work and red/green evidence are in
+[the worker report](../../docs/worker-reports/edit-zzj.13-s8.md) and
+[the decision record](../../docs/decisions/edit-zzj.13.md).
+
+Completed/adopted: editor-1 blockers 1–7; P1.9-2 sections 2, 3 and 5;
+WM_DELETE_WINDOW flushed acknowledgement; editor-1 12 and 23.
+Main already supplies 1/2/6; controlled-fault regressions prove those fixes.
+Failure recovery retains unaccepted staging and builds a fresh current-state
+checkpoint only at explicit flush/exit. Backend init uses work mailboxes.
+Long clipped lines reseed each subsequent logical row from exact piece queries.
+
+Remain/unverified: editor-1 8–11, 13–17, 21 and 22. This bead stays open.
+The inherited burst-grouping reproduction is opt-in and still red. Source
+change detection, whole-file setup/slices, allocator recycling, idle journal
+polling and native guard attribution are not addressed. Newer undo rollback
+may alter 22, but an editor injected-failure test is still missing.
+
+Final gcc make all is green. Final gcc make all and clang ASan/UBSan make check exit 0,
+including 49 test binaries and replay CLI. The fairness draft is withdrawn.
+Final release editor and P4.I sanitizer suites are green; active release guard
+counts 0 allocations across 10000 keys per backend (M)[AC]. Final
+editor fuzz timed run is clean for 61 s with 41432 runs (M)[AC], against 60 s (G).
+A separate campaign found an inherited preferred-column view/model mismatch;
+its exact reproducer and legacy-row confirmation are preserved in the report.
+LeakSanitizer disabled; coordinator must rerun with leaks enabled.
+
+The following P4.I status is retained as the rebased integration record.
+
 # Editor status — P4.I / edit-457.16
 
 Session 8 finisher (2026-10-10): the supplied WIP's missing-path fix/unique

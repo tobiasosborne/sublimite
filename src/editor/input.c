@@ -63,21 +63,38 @@ static int stage_insert(editor *e, uint64_t off, const uint8_t *p, size_t n)
 static int stage_tree(editor *e, uint64_t off, uint64_t n)
 {
     if (!n || !e->journal) return 0;
-    if (e->op_count == EDITOR_STAGE_OPS || n > EDITOR_STAGE_BYTES - e->stage_used) return EDITOR_ERR_MEMORY;
-    size_t count = (size_t)n;
-    int rc = piece_read(e->tree, off, e->stage + e->stage_used, count); if (rc) return rc;
-    e->ops[e->op_count++] = (editor_jop){off, n, e->stage_used, true, e->buffer->id}; e->stage_used += count; return 0;
+    while (n) {
+        if (e->op_count == EDITOR_STAGE_OPS || e->stage_used == EDITOR_STAGE_BYTES) {
+            editor_journal_staged(e);
+            if (e->stats.journal_error) return EDITOR_ERR_IO;
+        }
+        size_t room = EDITOR_STAGE_BYTES - e->stage_used;
+        size_t count = n < room ? (size_t)n : room;
+        int rc = piece_read(e->tree, off, e->stage + e->stage_used, count); if (rc) return rc;
+        e->ops[e->op_count++] = (editor_jop){off, count, e->stage_used, true, e->buffer->id};
+        e->stage_used += count; off += count; n -= count;
+    }
+    return 0;
 }
 void editor_journal_staged(editor *e)
 {
-    for (size_t i = 0; i < e->op_count; i++) {
-        editor_jop op = e->ops[i];
+    size_t consumed = 0;
+    while (consumed < e->op_count) {
+        editor_jop op = e->ops[consumed];
         if (e->stats.journal_error) break;
+        uint64_t before = journal_get_stats(e->journal).accepted_sequence;
         int rc = op.insert ? journal_insert(e->journal, op.id, op.off, e->stage + op.at, (size_t)op.len) :
                             journal_delete(e->journal, op.id, op.off, op.len);
-        if (rc) e->stats.journal_error = rc; else e->stats.journal_records++;
+        /* IO can accept a whole logical call into journal-owned retry storage.
+         * Do not duplicate it; FULL/BUSY accept nothing and stay in this queue. */
+        if (journal_get_stats(e->journal).accepted_sequence != before) {
+            consumed++; e->stats.journal_records++;
+        }
+        if (rc) { e->stats.journal_error = rc; break; }
     }
-    e->op_count = e->stage_used = 0;
+    e->op_count -= consumed;
+    if (e->op_count) memmove(e->ops, e->ops + consumed, e->op_count * sizeof *e->ops);
+    else e->stage_used = 0;
 }
 static editor_delta *delta_at(editor *e, size_t i) { return &e->buffer->history[(e->buffer->history_head + i) % e->buffer->history_cap]; }
 static void remember(editor *e, editor_delta d)
@@ -214,7 +231,7 @@ static int replay_history(editor *e, bool redo)
     if ((!redo && !e->buffer->history_cursor) || (redo && e->buffer->history_cursor == e->buffer->history_count)) return editor_refresh_cursor(e, e->old_cursor);
     editor_delta d = *delta_at(e, redo ? e->buffer->history_cursor : e->buffer->history_cursor - 1);
     uint64_t old = redo ? d.old : d.add, add = redo ? d.add : d.old;
-    if (e->journal && (e->op_count + 2 > EDITOR_STAGE_OPS || add > EDITOR_STAGE_BYTES - e->stage_used)) return EDITOR_ERR_MEMORY;
+    if (e->journal && e->op_count + 2 > EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
     uint64_t old_nl = newlines(e, d.off, old), before_len = piece_len(e->tree);
     undo_change c; int rc = redo ? undo_redo(e->undo, 1, &c) : undo_undo(e->undo, 1, &c);
     uint64_t after_len = piece_len(e->tree);

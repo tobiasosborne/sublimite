@@ -7,4 +7,7 @@ const char *editor_runtime_display(const char *display, const char *safe, const 
 /* Resolve without creating: absolute XDG_CONFIG_HOME or HOME/.config.
  * Setup only; returns EDITOR_OK / EDITOR_ERR_ARG. */
 int editor_config_dir(char *out, size_t cap);
+/* Setup only: create an absolute directory chain, synchronizing each parent.
+ * NULL callback uses fsync; the callback seam must provide that barrier. */
+int editor_make_directory(const char *path, int (*sync_parent)(void *, int), void *ctx);
 #endif

@@ -10,22 +10,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int make_directory(char *path)
-{
-    /* Resolved absolute path, setup only. Existing parents may be shared. */
-    for (char *p = path + 1; ; p++) {
-        if (*p != '/' && *p != '\0') continue;
-        char saved = *p; *p = '\0';
-        int rc = mkdir(path, 0700);
-        if (rc && errno == EEXIST) {
-            struct stat st; rc = stat(path, &st);
-            if (!rc && !S_ISDIR(st.st_mode)) { errno = ENOTDIR; rc = -1; }
-        }
-        *p = saved;
-        if (rc) return -1;
-        if (!saved) return 0;
-    }
-}
 int main(int argc, char **argv)
 {
     ipc_args args = {0}; ipc_result parsed = ipc_parse_args(argc, argv, &args);
@@ -50,7 +34,7 @@ int main(int argc, char **argv)
     if (journal_default_dir(journal_path, sizeof journal_path) != JOURNAL_OK) {
         fprintf(stderr, "sublimite: cannot resolve journal directory\n"); goto startup_fail;
     }
-    if (make_directory(journal_path)) { perror("sublimite: journal directory"); goto startup_fail; }
+    if (editor_make_directory(journal_path, NULL, NULL)) { perror("sublimite: journal directory"); goto startup_fail; }
     const char suffix[] = "/session-XXXXXX";
     size_t n = strlen(journal_path);
     if (n > sizeof journal_path - sizeof suffix) goto startup_fail;

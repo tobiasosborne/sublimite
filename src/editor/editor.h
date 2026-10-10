@@ -74,6 +74,8 @@ int editor_inject(editor *e, const plat_event *event);
 /* One UI turn, checking input between bounded layout/view continuations.
  * timeout < 0 may sleep indefinitely; 0 never sleeps. MORE means runnable
  * work remains; OK means wait for input/worker/timer; CLOSED means WM close.
+ * Mutations reach page-cache recovery storage before yielding the turn or
+ * acknowledging a frame. CLOSED acknowledges an explicit journal flush.
  * Submit callbacks precede present/completion handling and journal pumping.
  * Hooks must not re-enter the editor. Our typing code allocates nothing;
  * XCB's event/reply allocations occur in the platform/completion pump.
@@ -90,7 +92,8 @@ view_state editor_view(const editor *e);
 editor_stats editor_get_stats(const editor *e);
 bool editor_index_complete(editor *e);
 uint64_t editor_line_count(const editor *e);
-/* Blocking journal flush, outside the typing path. */
+/* Blocking journal flush/checkpoint, outside the typing path. Failure recovery
+ * may allocate and rotate a complete current-state checkpoint before exit. */
 int editor_flush(editor *e);
 /* Allocating open path, UI thread; synchronous acceptance/partial-open rollback.
  * Requests and payloads are copied before return. token=0 for local startup.

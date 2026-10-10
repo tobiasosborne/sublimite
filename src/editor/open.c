@@ -5,13 +5,26 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <poll.h>
+#include <time.h>
 
-typedef struct backend_init { editor *e; render_config config; void *state; int result; } backend_init;
-static void *init_worker(void *ctx)
+typedef struct backend_init { editor *e; render_config config; void *state; int result; bool received; } backend_init;
+static void init_worker(work_ctx *job)
 {
-    backend_init *a = ctx; (void)trace_thread_register();
-    a->result = render_backend_init(a->e->backend, &a->config, a->state, a->e->backend->info.state_size);
-    return NULL;
+    backend_init *a = job->arg;
+    int result = work_should_stop(job) ? RENDER_ERR_INIT :
+        render_backend_init(a->e->backend, &a->config, a->state, a->e->backend->info.state_size);
+    work_msg msg = {.kind = UINT32_C(0x4544494e)};
+    memcpy(msg.data, &result, sizeof result);
+    while (!work_should_stop(job) && !work_publish(job, &msg)) {
+        struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+    }
+}
+static void init_result(const work_msg *msg, void *ctx)
+{
+    backend_init *a = ctx;
+    if (msg->kind != UINT32_C(0x4544494e)) return;
+    memcpy(&a->result, msg->data, sizeof a->result); a->received = true;
 }
 void editor_close(editor *e)
 {
@@ -116,9 +129,18 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     render_config render = {.dims = dims, .max_width = e->max_cols * dims.cell_w, .max_height = e->max_rows * dims.cell_h,
         .max_cells = cells, .max_glyphs = LAYOUT_ASCII_GLYPHS, .max_pages = 1, .max_atlas_bytes = atlas->pixels_len,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool};
-    backend_init arg = {e, render, state, RENDER_ERR_INIT}; pthread_t thread;
-    if (pthread_create(&thread, NULL, init_worker, &arg)) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    (void)pthread_join(thread, NULL); rc = arg.result; if (rc) goto fail;
+    backend_init arg = {e, render, state, RENDER_ERR_INIT, false};
+    work_handle handle = work_submit(&e->pool, (work_job){init_worker, &arg, 0, WORK_BULK});
+    if (!handle.epoch) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    /* The UI does not inspect backend state until receiving the immutable
+     * result. Retain initialization storage until physical job completion. */
+    while (!arg.received || !work_handle_finished(&e->pool, handle)) {
+        (void)work_mailbox_receive(&e->pool, handle, 0, init_result, &arg);
+        if (arg.received && work_handle_finished(&e->pool, handle)) break;
+        struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
+        (void)poll(&ready, 1, 1);
+    }
+    rc = arg.result; if (rc) goto fail;
     if (config->journal_path) {
         rc = journal_open(&e->journal, config->journal_path, &e->pool, NULL); if (rc) goto fail;
         journal_set_message_handler(e->journal, editor_route_work, e);

@@ -51,7 +51,11 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     if ((!bytes && len) || (path && strlen(path) >= IPC_PATH_CAP)) return EDITOR_ERR_ARG;
     editor_buffer *b = calloc(1, sizeof *b); if (!b) return EDITOR_ERR_MEMORY;
     int rc = 0;
+    b->base.path = "";
     if (path) {
+        /* Capture before the file worker loads any bytes, then validate the
+         * same generation after attachment and immediately before publication. */
+        if (e->journal) (void)journal_capture_base(path, &b->base);
         memcpy(b->path, path, strlen(path) + 1);
         rc = file_open_begin(&e->pool, path, NULL, &b->file);
         if (rc) goto fail;
@@ -79,6 +83,9 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     piece_allocator a = {&b->arena, piece_alloc, piece_free};
     b->tree = piece_create(&a); if (!b->tree) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len); if (rc) goto fail;
+    if (e->journal && b->file && (!*b->base.path || journal_check_base(&b->base) || file_check(b->file, NULL))) {
+        rc = EDITOR_ERR_IO; goto fail;
+    }
     b->lines = piece_line_count(b->tree);
     b->history_cap = e->cfg.history_keys ? e->cfg.history_keys : 32768;
     if (b->history_cap > (SIZE_MAX - 8) / (2 * sizeof(editor_delta))) { rc = EDITOR_ERR_ARG; goto fail; }
@@ -135,13 +142,12 @@ int editor_activate(editor *e)
     e->old_selection = live.selection; editor_restart_blink(e, trace_now_ns());
     return editor_full_layout(e);
 }
-static int register_journal(editor *e, editor_buffer *b, uint64_t id)
+int editor_register_journal(editor *e, editor_buffer *b, uint64_t id)
 {
     int rc = 0;
     if (e->journal) {
-        journal_base base = {.path = b->path};
-        if (b->file) rc = journal_capture_base(file_path(b->file), &base);
-        if (!rc) rc = journal_set_base(e->journal, id, &base);
+        if (b->file) rc = journal_check_base(&b->base);
+        if (!rc) rc = journal_set_base(e->journal, id, &b->base);
         if (!rc && !b->file && piece_len(b->tree)) {
             piece_iter it; piece_iter_begin(&it, b->tree, 0); const uint8_t *p; size_t n; uint64_t off = 0;
             while (piece_iter_next(&it, &p, &n)) { rc = journal_insert(e->journal, id, off, p, n); if (rc) break; off += n; }
@@ -171,7 +177,7 @@ int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t 
     if (e->error || e->stats.journal_error) return EDITOR_ERR_IO;
     editor_retire_buffers(e);
     editor_buffer *b = NULL; int rc = editor_buffer_prepare(e, path, bytes, len, &b);
-    if (!rc) rc = register_journal(e, b, e->tabs.next_id);
+    if (!rc) rc = editor_register_journal(e, b, e->tabs.next_id);
     if (!rc) rc = install(e, b, id);
     if (!rc) rc = editor_activate(e);
     if (rc && b && !b->id) editor_buffer_destroy(b);
@@ -282,7 +288,7 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         if (rc) break;
         if (path) { rc = position_buffer(e, prepared[i], request->paths[i].line, request->paths[i].col); if (rc) break; }
     }
-    for (size_t i = 0; !rc && i < count; i++) rc = register_journal(e, prepared[i], e->tabs.next_id + i);
+    for (size_t i = 0; !rc && i < count; i++) rc = editor_register_journal(e, prepared[i], e->tabs.next_id + i);
     if (rc) { for (size_t i = 0; i < count; i++) editor_buffer_destroy(prepared[i]); return rc; }
     /* All fallible file/memory work precedes tab publication. The reserved tab
      * and buffer slots make this commit allocation-free. */
