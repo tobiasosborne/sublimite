@@ -34,16 +34,15 @@ static double load_stamp(char *power, size_t n)
     if (fp) { if (fscanf(fp,"%lf",&load)!=1) load=-1; fclose(fp); }
     return load;
 }
+/* Default is a gated verdict (MISS -> exit 1, REFUSED for too few samples -> exit 3);
+ * track=true is the explicit descriptive mode (review P4-modules-2 s31/s32). */
 static int report(const char *name, bench_samples *samples, uint64_t g50, uint64_t g99,
-                   const char *power, double load, bool gates)
+                   const char *power, double load, bool track, size_t required)
 {
-    uint64_t p50=bench_p50(samples),p99=bench_p99(samples);
-    printf("TRACK %s n=%zu p50=%.3f ms p99=%.3f ms (M)%s load1=%.2f power=%s; gate=%.0f/%.0f ms (G)\n",
-        name,samples->n,(double)p50/1e6,(double)p99/1e6,bench__tag_from_power(power),load,power,
-        (double)g50/1e6,(double)g99/1e6);
-    return samples->n==0 || (gates && (p50>g50 || p99>g99));
+    char load_text[32]; (void)snprintf(load_text,sizeof load_text,"%.2f",load);
+    return bench_gate_report(name,samples,g50,g99,required,track,power,load_text);
 }
-static int run_size(size_t bytes, size_t iterations, bool gates)
+static int run_size(size_t bytes, size_t iterations, bool track)
 {
     int rc=1;
     char directory[]="/tmp/edit-savectl-bench-XXXXXX";
@@ -118,11 +117,11 @@ static int run_size(size_t bytes, size_t iterations, bool gates)
         if (model.state!=SAVECTL_SAVED || model.modified) goto controller_end;
         (void)bench_add(&transaction,bench_now_ns()-start);
     }
-    rc=report(bytes>FILE_PREFIX_MAX ? "G8s_ack_1GB" : "G8s_ack_1MB",&ack,2000000,5000000,power,load,gates);
+    rc=report(bytes>FILE_PREFIX_MAX ? "G8s_ack_1GB" : "G8s_ack_1MB",&ack,2000000,5000000,power,load,track,BENCH_INTERACTION_MIN_N);
     rc|=report(bytes>FILE_PREFIX_MAX ? "G8d_1GB_warm_durable" : "G8d_1MB_durable",&durable,
         bytes>FILE_PREFIX_MAX ? UINT64_C(1500000000) : UINT64_C(10000000),
-        bytes>FILE_PREFIX_MAX ? UINT64_C(2500000000) : UINT64_C(50000000),power,load,gates);
-    rc|=report(bytes>FILE_PREFIX_MAX ? "journal_saved_1GB" : "journal_saved_1MB",&transaction,0,0,power,load,false);
+        bytes>FILE_PREFIX_MAX ? UINT64_C(2500000000) : UINT64_C(50000000),power,load,track,BENCH_INTERACTION_MIN_N);
+    rc|=report(bytes>FILE_PREFIX_MAX ? "journal_saved_1GB" : "journal_saved_1MB",&transaction,0,0,power,load,true,0);
 controller_end:
     settle(s,pool);
     const journal_save *token=savectl_save_token(s);
@@ -141,9 +140,10 @@ directory_end: (void)rmdir(directory);
 }
 int main(int argc, char **argv)
 {
-    bool gates=argc==2 && !strcmp(argv[1],"--gate");
+    bool track=argc==2 && !strcmp(argv[1],"--track");
+    if (argc>2 || (argc==2 && !track && strcmp(argv[1],"--gate"))) return 2;
     trace_init();
-    int rc=run_size(FILE_PREFIX_MAX,128,gates);
-    if (!rc) rc=run_size((size_t)1u<<30,7,gates);
-    return rc;
+    int rc=run_size(FILE_PREFIX_MAX,128,track);
+    int big=run_size((size_t)1u<<30,7,track);
+    return rc?rc:big;
 }

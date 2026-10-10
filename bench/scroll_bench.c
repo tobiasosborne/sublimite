@@ -1,5 +1,5 @@
 /* Warm G7j partial-prefix seek -> correct null-backend viewport, then G3z
- * work proxy. Default exits nonzero on a miss; --track records shared-box
+ * work proxy. Default exits nonzero on a miss or when a verdict is REFUSED (too few samples); --track records shared-box
  * observations without issuing a gate verdict. Never opens a display. */
 #include "scroll/scroll.h"
 #include "layout/layout.h"
@@ -180,7 +180,13 @@ int main(int argc, char **argv)
     }
     uint64_t unsorted[JUMPS]; memcpy(unsorted, jump_values, sizeof unsorted);
     uint64_t p50 = bench_p50(&jumps), p99 = bench_p99(&jumps);
-    bool jump_miss = p50 > 30000000 || p99 > 50000000;
+    bench_verdict_kind jump_verdict = bench_judge(&jumps, 30000000, 50000000, BENCH_INTERACTION_MIN_N);
+    {
+        char ci[512];
+        (void)bench_gate_line(ci, sizeof ci, "G7j_warm", &jumps, 30000000, 50000000,
+                              BENCH_INTERACTION_MIN_N, track, jump_stamps[0].power, jump_stamps[0].load);
+        puts(ci);
+    }
     for (unsigned i = 0; i < JUMPS; i++) {
         if (unsorted[i] == p50) printf("BENCH G7j_warm p50_ns=%" PRIu64 " (M)%s load1=%s (G)<=30000000 TRACK=%d\n", p50, bench__tag_from_power(jump_stamps[i].power), jump_stamps[i].load, track);
         if (unsorted[i] == p99) printf("BENCH G7j_warm p99_ns=%" PRIu64 " (M)%s load1=%s (G)<=50000000 TRACK=%d\n", p99, bench__tag_from_power(jump_stamps[i].power), jump_stamps[i].load, track);
@@ -209,6 +215,9 @@ int main(int argc, char **argv)
         bench_p50(&work), bench_p99(&work), maximum_ns, slow, HALF_PERIOD_NS, track);
     puts("G3z displayed refreshes: UNMEASURED; requires real display and editor wiring. Sub-row pixel origin is retained by scroll; null render currently draws integral rows.");
     lineidx_destroy(index); viewport_free(&v); munmap(mapping, (size_t)f.size);
-    if (track) return 0;
-    return jump_miss || slow != 0 ? 1 : 0;
+    {
+        int rc = bench_exit_code(jump_verdict, track);
+        if (!track && slow != 0) rc = 1;
+        return rc;
+    }
 }

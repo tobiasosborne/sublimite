@@ -38,7 +38,7 @@ static bool stamp(char *power, size_t capacity, char *load, size_t load_capacity
 {
     FILE *file = fopen("/sys/class/power_supply/BAT0/status", "r");
     if (!file || !fgets(power, (int)capacity, file)) { if (file) (void)fclose(file); return false; }
-    (void)fclose(file); power[strcspn(power, "\n")] = 0;
+    (void)fclose(file); { char norm[64]; bench__copy(norm, sizeof norm, bench__power_from_status(power)); bench__copy(power, capacity, norm); }
     file = fopen("/proc/loadavg", "r");
     if (!file || !fgets(load, (int)load_capacity, file)) { if (file) (void)fclose(file); return false; }
     (void)fclose(file); load[strcspn(load, " ")] = 0; return true;
@@ -56,13 +56,12 @@ static int cancel_worker(void *argument)
 {
     cancel_arguments *args=argument;
     int argc=args->argc; char **argv=args->argv;
-    bool gate_mode = argc == 2 && strcmp(argv[1], "--gate") == 0;
-    if (argc > 2 || (argc == 2 && !gate_mode && strcmp(argv[1], "--track") != 0)) return 2;
+    bool track = argc == 2 && strcmp(argv[1], "--track") == 0;
+    if (argc > 2 || (argc == 2 && !track && strcmp(argv[1], "--gate") != 0)) return 2;
     char power[64], load[64];
     if (!stamp(power, sizeof power, load, sizeof load)) { fputs("findui_bench: power/load unavailable\n", stderr); return 1; }
-    bool ac = strcmp(power, "Charging") == 0 || strcmp(power, "Full") == 0 || strcmp(power, "Not charging") == 0;
-    const char *tag = ac ? "AC" : "bat";
-    printf("findui_bench: power=%s [%s] load1=%s fixture=/tmp/edit-corpus/log_1g.txt TRACK\n", power, tag, load);
+    const char *tag = bench__tag_from_power(power);
+    printf("findui_bench: power=%s %s load1=%s fixture=/tmp/edit-corpus/log_1g.txt track=%d\n", power, tag, load, track);
     int fd = open("/tmp/edit-corpus/log_1g.txt", O_RDONLY);
     struct stat metadata;
     if (fd < 0 || fstat(fd, &metadata) || metadata.st_size != (off_t)(UINT64_C(1024) * 1024u * 1024u)) {
@@ -116,13 +115,11 @@ static int cancel_worker(void *argument)
         if (bench_add(&samples, elapsed)) goto done;
         (void)work_mailbox_drain(pool, route, &panel);
     }
-    uint64_t p50 = bench_p50(&samples), p99 = bench_p99(&samples);
-    bool met = p50 <= UINT64_C(1000000) && p99 <= UINT64_C(5000000);
-    printf("G6c_findui_keystroke logical_ack (M)[%s] load1=%s n=%zu p50_ms=%.6f p99_ms=%.6f (G)1/5ms comparison=%s verdict=TRACK\n",
-           tag, load, samples.n, (double)p50 / 1e6, (double)p99 / 1e6, met ? "within" : "over");
-    printf("findui_scan_thread_check (M)[%s] load1=%s calling_thread_scans=%u expected=(G)0\n",
+    int verdict = bench_gate_report("G6c_findui_keystroke_logical_ack", &samples, UINT64_C(1000000),
+                                    UINT64_C(5000000), BENCH_INTERACTION_MIN_N, track, power, load);
+    printf("findui_scan_thread_check (M)%s load1=%s calling_thread_scans=%u expected=(G)0\n",
            tag, load, atomic_load(&seen.on_caller));
-    result = atomic_load(&seen.on_caller) || (gate_mode && !met) ? 1 : 0;
+    result = atomic_load(&seen.on_caller) ? 1 : verdict;
  done:
     if (panel.private_) {
         while (findui_dispose(&panel) == FINDUI_MORE) {
@@ -141,8 +138,8 @@ int main(int argc,char **argv)
     if (argc>1 && strcmp(argv[1],"--count")==0) {
         count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",3,false};
         for (int i=2;i<argc;i++) {
-            if (strcmp(argv[i],"--gate")==0) args.gate=true;
-            else if (strcmp(argv[i],"--track")==0) args.gate=false;
+            if (strcmp(argv[i],"--gate")==0) args.track=false;
+            else if (strcmp(argv[i],"--track")==0) args.track=true;
             else if (strcmp(argv[i],"--fixture")==0 && i+1<argc) args.path=argv[++i];
             else if (strcmp(argv[i],"--samples")==0 && i+1<argc) {
                 char *end=NULL; unsigned long n=strtoul(argv[++i],&end,10);

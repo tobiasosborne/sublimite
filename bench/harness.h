@@ -283,6 +283,68 @@ static inline int bench_report(const char *name, const bench_samples *s,
     return bench_report_fp(stdout, name, s, gate_p50_ns, gate_p99_ns);
 }
 
+/* ---- qualified gate verdicts (edit-yqu, review P4-modules-2 s31/s32) ----
+ * A gate verdict needs enough samples: perf/01-perf-target.md 4 requires
+ * >= BENCH_INTERACTION_MIN_N (10 000) samples per interaction scenario. With
+ * fewer, the verdict is REFUSED (never PASS) and the line still prints the
+ * descriptive p50/p99 and their order-statistic 95 % intervals. A miss is a
+ * miss regardless of sample count. The exit code is non-zero for MISS and
+ * REFUSED by default; only an explicit --track (track != 0) opts out. */
+#define BENCH_INTERACTION_MIN_N 10000u
+
+typedef enum bench_verdict_kind { BENCH_PASS = 0, BENCH_MISS = 1, BENCH_REFUSED = 2 } bench_verdict_kind;
+
+static inline bench_verdict_kind bench_judge(const bench_samples *s, uint64_t gate_p50_ns,
+                                             uint64_t gate_p99_ns, size_t required_n)
+{
+    uint64_t p50 = bench_p50(s), p99 = bench_p99(s);
+    if (s->n == 0 || s->dropped != 0 || (gate_p50_ns != 0 && p50 > gate_p50_ns) ||
+        (gate_p99_ns != 0 && p99 > gate_p99_ns))
+        return BENCH_MISS;
+    return s->n < required_n ? BENCH_REFUSED : BENCH_PASS;
+}
+
+static inline int bench_exit_code(bench_verdict_kind v, int track)
+{
+    if (track || v == BENCH_PASS)
+        return 0;
+    return v == BENCH_MISS ? 1 : 3;
+}
+
+/* Formats one verdict line into buf; returns the snprintf length. power is
+ * the normalised power state; the evidence tag comes from it ([unknown] when
+ * unrecognised, never [bat]). */
+static inline int bench_gate_line(char *buf, size_t cap, const char *name, const bench_samples *s,
+                                  uint64_t gate_p50_ns, uint64_t gate_p99_ns, size_t required_n,
+                                  int track, const char *power, const char *load)
+{
+    uint64_t l50, h50, l99, h99;
+    bench_verdict_kind v = bench_judge(s, gate_p50_ns, gate_p99_ns, required_n);
+    const char *word = track ? "TRACK" : v == BENCH_PASS ? "PASS" : v == BENCH_MISS ? "MISS" : "REFUSED";
+    bench_ci95(s, 0.50, &l50, &h50);
+    bench_ci95(s, 0.99, &l99, &h99);
+    return snprintf(buf, cap,
+        "BENCH name=%s n=%zu required_n=%zu p50=%llu p99=%llu ci95_p50=[%llu,%llu] "
+        "ci95_p99=[%llu,%llu] gate_p50=%llu gate_p99=%llu dropped=%zu (M)%s power=%s load1=%s verdict=%s%s",
+        name, s->n, required_n, (unsigned long long)bench_p50(s), (unsigned long long)bench_p99(s),
+        (unsigned long long)l50, (unsigned long long)h50, (unsigned long long)l99,
+        (unsigned long long)h99, (unsigned long long)gate_p50_ns, (unsigned long long)gate_p99_ns,
+        s->dropped, bench__tag_from_power(power), power, load, word,
+        (!track && v == BENCH_REFUSED) ? " (insufficient samples; no verdict)" : "");
+}
+
+/* Prints the line and returns the process exit contribution. */
+static inline int bench_gate_report(const char *name, const bench_samples *s, uint64_t gate_p50_ns,
+                                    uint64_t gate_p99_ns, size_t required_n, int track,
+                                    const char *power, const char *load)
+{
+    char line[512];
+    (void)bench_gate_line(line, sizeof line, name, s, gate_p50_ns, gate_p99_ns, required_n, track,
+                          power, load);
+    puts(line);
+    return bench_exit_code(bench_judge(s, gate_p50_ns, gate_p99_ns, required_n), track);
+}
+
 /* Cold runs are manual. Procedure (Linux):
  *   sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
  *   verify with fincore <file> (resident pages should be 0) and

@@ -240,8 +240,47 @@ static void test_time_macro(void)
     bench_evict_caches_hint();
 }
 
+static void test_gate_verdict(void)
+{
+    uint64_t buf[64];
+    bench_samples s;
+    uint64_t v[5] = {1, 2, 3, 4, 5};
+    size_t i;
+    /* too few samples: refused, never PASS, even when every value is far under the gate */
+    fill(&s, buf, 64, v, 5);
+    CHECK(bench_judge(&s, 100, 100, 10) == BENCH_REFUSED);
+    CHECK(bench_exit_code(BENCH_REFUSED, 0) != 0);
+    CHECK(bench_exit_code(BENCH_REFUSED, 1) == 0);
+    CHECK(bench_judge(&s, 100, 100, 5) == BENCH_PASS);
+    CHECK(bench_exit_code(BENCH_PASS, 0) == 0);
+    /* a miss exits non-zero by default; --track opts out */
+    CHECK(bench_judge(&s, 1, 1, 5) == BENCH_MISS);
+    CHECK(bench_exit_code(BENCH_MISS, 0) != 0);
+    CHECK(bench_exit_code(BENCH_MISS, 1) == 0);
+    /* a miss is a miss even with too few samples (refusal does not hide it) */
+    CHECK(bench_judge(&s, 1, 1, 10) == BENCH_MISS);
+    /* dropped samples are a miss */
+    bench_samples_init(&s, buf, 2);
+    for (i = 0; i < 3; i++)
+        (void)bench_add(&s, 1);
+    CHECK(bench_judge(&s, 100, 100, 1) == BENCH_MISS);
+    /* unknown power never claims battery */
+    CHECK(strcmp(bench__tag_from_power(bench__power_from_status("Unknown\n")), "[unknown]") == 0);
+    {
+        char line[256];
+        fill(&s, buf, 64, v, 5);
+        CHECK(bench_gate_line(line, sizeof line, "x", &s, 100, 100, 10, 0, "Unknown", "0.1") > 0);
+        CHECK(strstr(line, "REFUSED") != NULL);
+        CHECK(strstr(line, "[unknown]") != NULL);
+        CHECK(strstr(line, "[bat]") == NULL);
+        CHECK(strstr(line, "required_n=10") != NULL);
+        CHECK(strstr(line, "ci95_p50=") != NULL && strstr(line, "ci95_p99=") != NULL);
+    }
+}
+
 int main(void)
 {
+    test_gate_verdict();
     test_percentiles_small();
     test_counterexample();
     test_empty_and_overflow();

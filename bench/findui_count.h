@@ -3,7 +3,7 @@
 typedef struct count_arguments {
     const char *path;
     size_t samples;
-    bool gate;
+    bool track;
 } count_arguments;
 static int count_worker(void *argument)
 {
@@ -77,8 +77,9 @@ static int count_worker(void *argument)
         (void)munmap(mapping,length);
     }
     (void)close(fd);
-    int miss=bench_report("G6_findui_dense_a",&times,UINT64_C(80000000),UINT64_C(125000000));
-    printf("findui_count: exact total/first 4096 PASS; mapping=NEW; (M)%s; verdict=%s\n",
-           bench_evidence_tag(),args->gate ? (miss ? "MISS" : "PASS") : "TRACK");
-    return args->gate && miss ? 1 : 0;
+    char power[64]; bench_battery_status(power,sizeof power);
+    int rc=bench_gate_report("G6_findui_dense_a",&times,UINT64_C(80000000),UINT64_C(125000000),
+                             BENCH_INTERACTION_MIN_N,args->track,power,"-");
+    printf("findui_count: exact total/first 4096 checked; mapping=NEW; (M)%s\n",bench__tag_from_power(power));
+    return rc;
 }
