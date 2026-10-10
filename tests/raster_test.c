@@ -114,6 +114,7 @@ static bool external_guard_enabled(void) { return edit_malloc_guard_active(); }
 #undef edit_malloc_guard_end
 #undef render_frame_begin
 #undef render_backend_submit
+#include "editor/private.h"
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "raster_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 
@@ -862,38 +863,76 @@ static void *review_release_slot(void *u)
 }
 /* P2-1 section 7: completion published, physical return held behind a gate.
  * Count sleeps rather than treating this loaded host's timing as a gate. */
-/* Explicit G10 diagnostic: expected RED until default capacity policy is
- * changed. It is outside the correctness suite and never conceals a gate miss. */
-static int review_default_memory_gate(void)
+/* G10 A raster share: 87 MB less the planned 16.228 MB non-surface
+ * baseline and one 20.736 MB target-A CPU buffer at backend handoff.
+ * This is a necessary subsystem limit, not a whole-editor G10 verdict. */
+static int review_default_memory_gate(bool target_capacity)
 {
-#ifdef RASTER_CENSUS
-    bool miss=false;
-    for (unsigned fallback=0; fallback<2; fallback++) {
-        render_backend b={0}; editor *e=NULL;
-        editor_config cfg={.raster_fallback=true};
+    const uint64_t raster_share = UINT64_C(50036000);
+    bool miss = false;
+    for (unsigned fallback = 0; fallback < 2; fallback++) {
+        render_backend b = {0}; editor *e = NULL;
+        /* Leave max_cols/max_rows unset: production metadata defaults.
+         * Override only the visible geometry to the binding target A. */
+        editor_config cfg = {.cols = 360, .rows = 120, .font_px = 15,
+                             .raster_fallback = true, .start_empty = true};
+        if (target_capacity) { cfg.max_cols = 360; cfg.max_rows = 120; }
         if (fallback) {
-            T(setenv("EDIT_GL_EGL_LIBRARY","missing-edit-5o0-libEGL.so",1)==0);
-            T(render_gl_backend(&b)==RENDER_OK);
-        } else T(render_cpu_backend(&b)==RENDER_OK);
-        size_t before=__sanitizer_get_current_allocated_bytes();
-        T(editor_open(&e,&cfg,&b)==EDITOR_OK);
-        size_t private_bytes=__sanitizer_get_current_allocated_bytes()-before;
-        uint64_t surface=(uint64_t)b.config.max_width*b.config.max_height*4u;
-        uint64_t lower_bound=private_bytes+2u*surface;
-        printf("P2-1 section 10: %s heap_allocations=%zu SHM=%llu (M)[AC] native_pixmap_payload=%llu (E) "
-            "owned_peak_lower_bound=%llu gate=87000000 (G) %s\n",
-            fallback ? "failed-EGL-to-raster" : "default-raster",private_bytes,
-            (unsigned long long)surface,(unsigned long long)surface,
-            (unsigned long long)lower_bound,lower_bound>87000000u ? "RED" : "GREEN");
-        miss |= lower_bound>87000000u;
+            T(setenv("EDIT_GL_EGL_LIBRARY", "missing-edit-apl-libEGL.so", 1) == 0);
+            T(render_gl_backend(&b) == RENDER_OK);
+        } else T(render_cpu_backend(&b) == RENDER_OK);
+#ifdef RASTER_CENSUS
+        size_t heap_before = __sanitizer_get_current_allocated_bytes();
+#endif
+        T(editor_open(&e, &cfg, &b) == EDITOR_OK);
+        T(b.config.dims.cols * b.config.dims.cell_w == 2880);
+        T(b.config.dims.rows * b.config.dims.cell_h == 1800);
+        /* The private backend is included below for its existing review
+         * fixtures. Inspect real production storage, not a benchmark config. */
+        const cpu_state *st = b.state;
+        T(st != NULL && b.info.state_size == sizeof *st);
+        T(st->max_w == b.config.max_width && st->max_h == b.config.max_height);
+        T(st->cells && st->glyphs && st->pages && st->strips && st->pix);
+        uint64_t snapshots = st->max_cells * sizeof *st->cells +
+            st->max_glyphs * sizeof *st->glyphs + st->max_pages * sizeof *st->pages +
+            st->max_strips * sizeof *st->strips;
+        uint64_t shm = (uint64_t)st->max_w * st->max_h * sizeof *st->pix;
+        xcb_get_geometry_reply_t *native = xcb_get_geometry_reply(st->conn,
+            xcb_get_geometry(st->conn, st->pixmap), NULL);
+        T(native != NULL);
+        uint64_t pixmap = (uint64_t)native->width * native->height * 4u;
+        free(native);
+        /* jobs/palettes/fence inputs are embedded in state; no additional
+         * strip-worker framebuffer. State is a subset of the editor arena. */
+        uint64_t backend_owned = sizeof *st + snapshots + shm + pixmap;
+        printf("P4-3 section 9: %s %s target=2880x1800 snapshot=%llu state_workers=%zu "
+            "SHM=%llu (M)[AC] native_pixmap_payload=%llu (E) "
+            "backend_owned_lower_bound=%llu (E) raster_share=%llu (G,derived) %s\n",
+            target_capacity ? "explicit-capacity-option" : "production-defaults",
+            fallback ? "failed-EGL-to-raster" : "default-raster",
+            (unsigned long long)snapshots, sizeof *st, (unsigned long long)shm,
+            (unsigned long long)pixmap, (unsigned long long)backend_owned,
+            (unsigned long long)raster_share, backend_owned > raster_share ? "RED" : "GREEN");
+        printf("P4-3 section 9: editor_arena=%zu (M)[AC] (includes backend state; "
+               "do not add it twice); backend payload excludes XCB/stacks/driver/transient peaks\n", e->arena.size);
+#ifdef RASTER_CENSUS
+        size_t heap_after = __sanitizer_get_current_allocated_bytes();
+        T(heap_after >= heap_before);
+        size_t heap_owned = heap_after - heap_before;
+        /* Includes all startup heap (and the backend connection), plus mmap
+         * arena reservation. Backend state is inside this arena already. */
+        uint64_t startup = heap_owned + e->arena.size + shm + pixmap;
+        printf("P4-3 section 9: startup_heap=%zu (M)[AC] "
+               "deduplicated_startup_lower_bound=%llu (E) G10=87000000 (G) %s\n",
+               heap_owned, (unsigned long long)startup,
+               startup > UINT64_C(87000000) ? "RED" : "GREEN");
+        miss |= startup > UINT64_C(87000000);
+#endif
+        miss |= backend_owned > raster_share;
         editor_close(e);
-        if (fallback) T(unsetenv("EDIT_GL_EGL_LIBRARY")==0);
+        if (fallback) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
     }
     T(!miss);
-#else
-    puts("P2-1 section 10: allocation census requires ASan build");
-    return 2;
-#endif
     return 0;
 }
 static int review_nonblocking_retirement(void)
@@ -1408,7 +1447,8 @@ static int review_cases(const char *which)
     if (!strcmp(which,"P2-1-15")) return review_inline_deadline();
     if (!strcmp(which,"P2-1-12-gate")) return review_pending_acceptance_gate();
     if (!strcmp(which,"P2-1-11")) return review_page_cell_budget();
-    if (!strcmp(which,"P2-1-10-gate")) return review_default_memory_gate();
+    if (!strcmp(which,"P4-3-9-gate") || !strcmp(which,"P2-1-10-gate")) return review_default_memory_gate(false);
+    if (!strcmp(which,"P4-3-9-capacity-option")) return review_default_memory_gate(true);
     if (!strcmp(which,"P2-1-9")) return raster_native_resize_test();
     if (!strcmp(which,"budget-track")) return review_budget_track(false);
     if (!strcmp(which,"budget-max-track")) return review_budget_track(true);
