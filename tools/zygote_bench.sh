@@ -40,6 +40,10 @@ fi
 set -- "$mode"
 if [ -n "$launches" ]; then set -- "$@" --launches "$launches"; fi
 if [ "$real" = 1 ]; then set -- "$@" --real-display; fi
+if [ "$mode" != --build ] && [ "${EDIT_DISPLAY_LOCK_SCRIPT:-}" != "$0" ]; then
+    export EDIT_DISPLAY_LOCK_SCRIPT="$0"
+    exec sh tools/with_display_lock.sh sh "$0" "$@"
+fi
 cc=${CC:-gcc}
 flags='-std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -O2 -g'
 lib=build/libedit.a

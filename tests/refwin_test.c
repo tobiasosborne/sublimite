@@ -1,10 +1,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "editor/editor.h"
@@ -300,6 +303,21 @@ int main(int argc, char **argv)
         refproto_number("18446744073709551615",UINT64_MAX,&number) || number != UINT64_MAX) return 1;
     /* This test deliberately uses the already running, shared Xvfb only. */
     if (setenv("DISPLAY", ":99", 1) || setenv("EDIT_DISPLAY", ":99", 1)) return 1;
+    /* Direct invocations use the same lane as make check. A valid inherited
+     * open-file description avoids recursively waiting on our own wrapper.
+     * This changes ownership/timeout diagnostics only, never preflight checks. */
+    const char *lock_fd = getenv("EDIT_DISPLAY_LOCK_FD");
+    uint64_t descriptor = 0;
+    struct stat inherited, shared;
+    bool locked = lock_fd && !refproto_number(lock_fd,INT_MAX,&descriptor) &&
+        !fstat((int)descriptor,&inherited) && !stat("/tmp/edit-xvfb-99.lock",&shared) &&
+        inherited.st_dev == shared.st_dev && inherited.st_ino == shared.st_ino &&
+        !flock((int)descriptor,LOCK_EX | LOCK_NB);
+    if (!locked) {
+        execl("/bin/sh","sh","tools/with_display_lock.sh",argv[0],
+              argc == 2 ? argv[1] : NULL,(char *)NULL);
+        perror("refwin_test: display lock wrapper"); return 1;
+    }
     if (test_period_math() || test_event_diagnostics() || test_preflight()) return 1;
     char dir[] = "/tmp/edit-refwin-test-XXXXXX";
     if (!mkdtemp(dir)) return 1;

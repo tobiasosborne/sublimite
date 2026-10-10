@@ -4,6 +4,10 @@ set -eu
 cd "$(dirname "$0")/.."
 export DISPLAY=:99 EDIT_DISPLAY=:99
 unset EDIT_ALLOW_REAL_DISPLAY
+if [ "${EDIT_DISPLAY_LOCK_SCRIPT:-}" != "$0" ]; then
+    export EDIT_DISPLAY_LOCK_SCRIPT="$0"
+    exec sh tools/with_display_lock.sh sh "$0" "$@"
+fi
 out=build/prewake/evidence-s8
 mkdir -p "$out"
 for variant in a b c; do

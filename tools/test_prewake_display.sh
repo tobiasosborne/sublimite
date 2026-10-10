@@ -2,6 +2,10 @@
 # Exercise coordinator opt-in on :99 only; check mode opens no window.
 set -eu
 cd "$(dirname "$0")/.."
+if [ "${EDIT_DISPLAY_LOCK_SCRIPT:-}" != "$0" ]; then
+    export DISPLAY=:99 EDIT_DISPLAY_LOCK_SCRIPT="$0"
+    exec sh tools/with_display_lock.sh sh "$0" "$@"
+fi
 exe=build/prewake/prewake-a
 env DISPLAY=:99 EDIT_DISPLAY=:99 EDIT_ALLOW_REAL_DISPLAY=1 "$exe" --display-check --real-display
 if env -u EDIT_ALLOW_REAL_DISPLAY DISPLAY=:99 EDIT_DISPLAY=:99 "$exe" --display-check --real-display; then

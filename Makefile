@@ -35,6 +35,10 @@ FUZZ_LIB := $(B)/fuzz/libedit.a
 
 TEST_REL  := $(patsubst tests/%.c,$(B)/tests/%,$(TESTS))
 TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
+# Display ownership includes focus, selection, Present and live raster/GL tests.
+# Keep other module tests outside the cross-worktree lane; new editor/X11 tests match
+# automatically. All callers share tools/with_display_lock.sh.
+DISPLAY_TEST_SAN := $(filter $(B)/san/tests/cli_test $(B)/san/tests/editor% $(B)/san/tests/x11% $(B)/san/tests/ref% $(B)/san/tests/gl% $(B)/san/tests/raster_test,$(TEST_SAN))
 BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
 FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
@@ -98,8 +102,9 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 # ---- phony drivers ----
 # Test binaries are built in sanitizer config under build/san/tests/.
 check: $(TEST_SAN) $(B)/tools/replay
-	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; DISPLAY=$$d $$t; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
+	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; case " $(DISPLAY_TEST_SAN) " in *" $$t "*) DISPLAY=$$d sh tools/with_display_lock.sh $$t;; *) DISPLAY=$$d $$t;; esac; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
+	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
 
 # Shell contract tests that need release benches (slow, ~1 min): run on demand.
 check-sh: $(B)/tools/replay $(B)/bench/piece_bench
