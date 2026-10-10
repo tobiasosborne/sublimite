@@ -319,6 +319,48 @@ static void resource_retention(void)
     for(size_t i=0;i<2;++i) { undo_destroy(&logs[i]); piece_destroy(trees[i]); }
     puts("tabs_test: closed buffer, undo history and view retention passed");
 }
+static int memory_census(bool enforce_reserve)
+{
+    tabs_set set; CHECK(tabs_init(&set,100,16)==0);
+    piece_allocator allocator=piece_default_allocator();
+    piece_tree *tree=piece_create(&allocator); CHECK(tree);
+    CHECK(piece_init_copy(tree,(const uint8_t *)"small\n",6)==0);
+    /* Buffers are excluded by the bench: distinct logs can borrow one tree
+     * for this empty-history census; their mapping sizes are tree-independent. */
+    undo_log logs[100];
+    size_t control=0, history=0, replay=0, committed=0;
+    for(size_t i=0;i<100;++i) {
+        CHECK(undo_init(&logs[i],tree,8)==0);
+        undo_stats stats=undo_get_stats(&logs[i]);
+        control+=sizeof logs[i]; history+=logs[i].pool.map_bytes;
+        replay+=logs[i].replay_pool.map_bytes; committed+=stats.committed_bytes;
+        CHECK(stats.reserved_bytes==logs[i].pool.map_bytes+logs[i].replay_pool.map_bytes);
+        CHECK(stats.records==0 && stats.live_bytes==0 && stats.committed_bytes==0);
+    }
+    size_t own=tabs_owned_bytes(&set), reserve=own+control+history+replay;
+    char power[32]="unknown", load[32]="unknown";
+    FILE *file=fopen("/sys/class/power_supply/BAT0/status","r");
+    if(file) { if(!fgets(power,sizeof power,file)) strcpy(power,"unknown"); fclose(file); }
+    power[strcspn(power,"\n")]=0;
+    file=fopen("/proc/loadavg","r");
+    if(file) { if(fscanf(file,"%31s",load)!=1) strcpy(load,"unknown"); fclose(file); }
+    const char *tag=strcmp(power,"Discharging")==0?"bat":
+        (strcmp(power,"Charging")==0 || strcmp(power,"Full")==0 ||
+         strcmp(power,"Not charging")==0)?"AC":"unknown";
+    printf("tabs_test: census (M)[%s] power=%s load1=%s tab_control=%zu tab_arena=%zu "
+        "undo_control=%zu history_reserve=%zu replay_reserve=%zu undo_committed=%zu "
+        "combined_reserve=%zu combined_committed=%zu gate_bytes=1000000(G) reserve=%s\n",
+        tag,power,load,sizeof set,set.arena.size,
+        control,history,replay,committed,reserve,own+control+committed,
+        reserve<=1000000u?"PASS":"MISS");
+    for(size_t i=0;i<100;++i) undo_destroy(&logs[i]);
+    piece_destroy(tree); tabs_fini(&set);
+    if(enforce_reserve && reserve>1000000u) {
+        puts("edit-fff RED: tabs plus caller undo reserve exceeds 1000000 B(G)");
+        return 1;
+    }
+    return 0;
+}
 static void allocations(void)
 {
     tabs_set s; CHECK(tabs_init(&s,100,16)==0);
@@ -358,8 +400,10 @@ static void allocations(void)
     tabs_fini(&s);
     for(size_t i=0;i<100;++i) { undo_destroy(&logs[i]); piece_destroy(trees[i]); }
 }
-int main(void)
+int main(int argc, char **argv)
 {
+    if(argc==2 && strcmp(argv[1],"memory-gate")==0) return memory_census(true);
+    CHECK(argc==1); CHECK(memory_census(false)==0);
     sequences(); rendering(); errors_and_eviction(); resource_retention(); allocations();
     puts("tabs_test: all passed"); return 0;
 }

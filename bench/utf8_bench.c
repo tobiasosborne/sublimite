@@ -104,7 +104,10 @@ static void print_power(void)
         fclose(f);
         gov[strcspn(gov, "\n")] = '\0';
     }
-    printf("power: battery=%s governor=%s tag=(M)%s\n", st, gov, bench_evidence_tag());
+    char load[32] = "unknown";
+    FILE *lf = fopen("/proc/loadavg", "r");
+    if (lf) { if (fscanf(lf, "%31s", load) != 1) strcpy(load, "unknown"); fclose(lf); }
+    printf("power: battery=%s governor=%s tag=(M)%s load1=%s\n", st, gov, bench_evidence_tag(), load);
 }
 
 static int run_mix(const char *name, const char *gname, const char *cname, int iid, int gated, uint8_t *text, size_t *start, uint64_t *v)

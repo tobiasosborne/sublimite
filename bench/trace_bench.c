@@ -3,6 +3,7 @@
  * and divided by 1000, so the timer read is amortised out. Also reports the
  * cost of a bare clock_gettime for context. Exit 1 on gate miss. */
 #include "../src/trace/trace.h"
+#include "harness.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,12 @@ int main(void) {
     static uint64_t clk[BATCHES];
     struct timespec t0, t1;
     int rc = 0;
+
+    char power[32], load[32] = "unknown";
+    bench_battery_status(power, sizeof power);
+    FILE *lf = fopen("/proc/loadavg", "r");
+    if (lf) { if (fscanf(lf, "%31s", load) != 1) strcpy(load, "unknown"); fclose(lf); }
+    printf("POWER status=%s (M)%s load1=%s\n", power, bench__tag_from_power(power), load);
 
     trace_init();
     if (trace_thread_register() < 0) {
