@@ -118,13 +118,19 @@ void layout_set_cursor(layout *l, uint64_t byte)
 {
     l->wrap_cursor_end = false;
     l->cursor = byte;
-    l->marks = l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
+    l->marks = l->paint || l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
 }
 
 void layout_set_selection(layout *l, uint64_t lo, uint64_t hi)
 {
     l->sel_lo = lo; l->sel_hi = hi;
-    l->marks = l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
+    l->marks = l->paint || l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
+}
+void layout_set_paint(layout *l, layout_paint_fn paint, void *ctx)
+{
+    if (!l) return;
+    l->paint = paint; l->paint_ctx = ctx;
+    l->marks = paint || l->cursor != UINT64_MAX || l->sel_hi > l->sel_lo;
 }
 
 bool layout_approximate(const layout *l) { return l->approximate; }
@@ -146,6 +152,7 @@ void layout_refill(layout *l)
 /* Cursor / selection style of the cell for the character at byte p. */
 static inline void style_at(const layout *l, uint64_t p, uint32_t *fg, uint32_t *bg, uint16_t *at)
 {
+    if (l->paint) l->paint(l->paint_ctx, p, fg, bg, at);
     if (p == l->cursor) { *fg = l->cfg.cursor_fg; *bg = l->cfg.cursor_bg; *at |= RENDER_ATTR_CURSOR; }
     else if (p >= l->sel_lo && p < l->sel_hi) { *fg = l->cfg.sel_fg; *bg = l->cfg.sel_bg; *at |= RENDER_ATTR_SELECTION; }
 }
@@ -377,6 +384,7 @@ int layout_run(layout *l)
                         render_cell *c = &tx[l->vis++];
                         *c = blank_cell(l);
                         if (l->marks && !(k > 0 && at == l->cursor)) style_at(l, at, &c->fg, &c->bg, &c->attrs);
+                        else if (l->paint) l->paint(l->paint_ctx, at, &c->fg, &c->bg, &c->attrs);
                     }
                     l->col += w; layout_consume(l, 1); units++;
                     continue;

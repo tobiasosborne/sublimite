@@ -61,6 +61,10 @@ enum {
  * RENDER_NO_SLOT for a blank cell. Return 0 on success, nonzero to get '?'. */
 typedef int (*layout_glyph_fn)(void *ctx, const uint8_t *cluster, size_t len,
                                uint32_t width, uint32_t *slot);
+/* Optional viewport decorations, before cursor/selection colours. UI-owned
+ * context must remain stable during a run; callback allocates nothing. */
+typedef void (*layout_paint_fn)(void *ctx, uint64_t byte, uint32_t *fg,
+                               uint32_t *bg, uint16_t *attrs);
 
 typedef struct layout_config {
     uint32_t tab_width;          /* 0 -> 4 */
@@ -152,6 +156,8 @@ typedef struct layout {
     uint64_t hscroll;
     uint32_t gw, text_cols, tab;
     bool approximate, marks;
+    layout_paint_fn paint;
+    void *paint_ctx;
     uint32_t row, row_end;       /* work range [row, row_end) */
     int phase;                   /* 0 start row, 1 text, 2 skip to newline */
     uint64_t pos;                /* current byte */
@@ -209,6 +215,7 @@ int layout_edit(layout *l, uint64_t off, uint64_t old_len, uint64_t new_len,
  * resolved while laying out; call layout_relayout_rows for rows that change. */
 void layout_set_cursor(layout *l, uint64_t byte);
 void layout_set_selection(layout *l, uint64_t lo, uint64_t hi);
+void layout_set_paint(layout *l, layout_paint_fn paint, void *ctx);
 
 bool layout_approximate(const layout *l);
 uint32_t layout_gutter_width(const layout *l);

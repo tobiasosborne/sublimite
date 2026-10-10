@@ -7,6 +7,19 @@ are unchanged. Public viewport and runtime hscroll are now uint64_t, matching
 view and absolute column checkpoints; existing callers must rebuild.
 Wrap-on still ignores horizontal scroll. No wrap implementation, view/editor
 source or frozen header was changed. See docs/decisions/P3.1c.md for red/green.
+P4.I integration adds optional `layout_set_paint` byte decorations before cursor/
+selection colours in both wrap modes, including cells where repeated cursor
+styling is suppressed. NULL preserves the original layout behavior. The callback
+is UI-owned, allocation-free and stable for a run. Editor loop tests cover bracket,
+EOF/clipped windows and trailing-space/tab paint with null and raster backends.
+No wrapping/CRLF/4 GiB algorithm fix is included. Evidence: ../../docs/decisions/P4.I.md.
+
+Implemented: opt-in streaming word wrap at text-area width; capped leading-indent
+continuations; blank continuation gutters; intact Unicode clusters and wide
+pairs; CRLF-aware endpoints; visual-row descriptors and scrolling seeds;
+wrapped cursor/selection rendering and soft-End affinity; visual navigation
+adapter in view; per-buffer flag and .md/.txt/.tex/untitled open-time defaults.
+No font or frozen-header changes. Wrap-off uses the existing P3.1 path.
 
 Regressions cover actual view End/Right/document-End stops for LF, CRLF, lone
 CR and EOF in both wrap modes and slice configurations, indexed CRLF endpoints,

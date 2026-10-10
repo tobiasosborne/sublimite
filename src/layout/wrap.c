@@ -8,6 +8,7 @@ static render_cell blank(const layout *l)
 }
 static void style(const layout *l,uint64_t byte,render_cell *c)
 {
+    if(l->paint) l->paint(l->paint_ctx,byte,&c->fg,&c->bg,&c->attrs);
     if(byte==l->cursor) { c->fg=l->cfg.cursor_fg; c->bg=l->cfg.cursor_bg; c->attrs|=RENDER_ATTR_CURSOR; }
     else if(byte>=l->sel_lo && byte<l->sel_hi) { c->fg=l->cfg.sel_fg; c->bg=l->cfg.sel_bg; c->attrs|=RENDER_ATTR_SELECTION; }
 }
@@ -249,6 +250,7 @@ static uint32_t ascii_span(layout *l,render_cell *cells,const uint8_t *p,size_t 
                 uint32_t b=p[i];
                 render_cell c={b==' '?0:b,b==' '?RENDER_NO_SLOT:b-0x20u,fg,bg,0,0};
                 if(!(l->wrap_cursor_end && r->continuation && at+i==r->start && at+i==l->cursor)) style(l,at+i,&c);
+                else if(l->paint) l->paint(l->paint_ctx,at+i,&c.fg,&c.bg,&c.attrs);
                 dst[i]=c;
             }
         }
@@ -380,10 +382,12 @@ int layout_wrap_run(layout *l)
                 for(uint32_t c=0;c<draw;c++) {
                     dst[c]=blank(l);
                     if(l->marks && !(c && at==l->cursor)) style(l,at,&dst[c]);
+                    else if(l->paint) l->paint(l->paint_ctx,at,&dst[c].fg,&dst[c].bg,&dst[c].attrs);
                 }
             } else {
                 render_cell cell={glyph,slot,l->cfg.fg,l->cfg.bg,attrs,0};
                 if(l->marks && !(l->wrap_cursor_end && r->continuation && at==r->start && at==l->cursor)) style(l,at,&cell);
+                else if(l->paint) l->paint(l->paint_ctx,at,&cell.fg,&cell.bg,&cell.attrs);
                 if(w==2 && draw==2) {
                     cell.attrs|=RENDER_ATTR_WIDE_LEFT; dst[0]=cell;
                     cell.glyph_index=0; cell.atlas_slot=RENDER_NO_SLOT;

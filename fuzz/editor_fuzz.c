@@ -71,12 +71,13 @@ static size_t at_column(const model *m, size_t start, size_t col)
     }
     return pos;
 }
+static void p4_ops(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size > MODEL_STEPS * 4u) size = MODEL_STEPS * 4u;
     render_backend b = {0}; EDIT_ASSERT(render_null_backend(&b) == 0);
     editor_config cfg = {.initial = (const uint8_t *)"ab\ncd", .initial_len = 5,
-        .cols = 32, .rows = 8, .max_cols = 40, .max_rows = 12, .history_keys = MODEL_STEPS, .arena_bytes = 4u * 1024u * 1024u};
+        .cols = 32, .rows = 8, .wrap_mode = -1, .max_cols = 40, .max_rows = 12, .history_keys = MODEL_STEPS, .arena_bytes = 4u * 1024u * 1024u};
     editor *e = NULL; EDIT_ASSERT(editor_open(&e, &cfg, &b) == 0); settle(e);
     model m = {.bytes = {'a','b','\n','c','d'}, .len = 5, .preferred = SIZE_MAX};
     history hist[MODEL_STEPS]; size_t nh = 0, applied = 0;
@@ -145,5 +146,94 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         EDIT_ASSERT(s.cursor == m.cursor && s.anchor == m.anchor);
     }
-    editor_close(e); return 0;
+    editor_close(e); p4_ops(data, size); return 0;
+}
+
+/* Independent ASCII oracle for the integrated tab/IPC/indent path. The legacy
+ * Unicode/navigation oracle above deliberately pins wrap off; this pass uses
+ * file defaults and compares buffer identity/content across activations. */
+typedef struct p4_model { model text; uint64_t id; } p4_model;
+static void p4_ops(const uint8_t *data, size_t size)
+{
+    render_backend b = {0}; EDIT_ASSERT(render_null_backend(&b) == 0);
+    const char initial[] = "    a\n    \n( )  \n";
+    editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1,
+        .cols = 32, .rows = 6, .max_cols = 40, .max_rows = 12, .tab_capacity = 8,
+        .closed_capacity = 4, .history_keys = MODEL_STEPS, .arena_bytes = 4u * 1024u * 1024u};
+    editor *e = NULL; EDIT_ASSERT(editor_open(&e, &cfg, &b) == 0); settle(e);
+    p4_model models[24] = {0}; size_t count = 1;
+    memcpy(models[0].text.bytes, initial, sizeof initial - 1); models[0].text.len = sizeof initial - 1;
+    models[0].id = editor_tab(e, 0)->id;
+    for (size_t i = 0; i + 3 < size; i += 4) {
+        const tabs_tab *active = editor_tab(e, editor_get_stats(e).active_tab);
+        model *m = NULL;
+        if (active) for (size_t j = 0; j < count; j++) if (models[j].id == active->id) m = &models[j].text;
+        EDIT_ASSERT(!active || m);
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true}; bool inject = true;
+        unsigned op = data[i] % 12u;
+        if (!m && op < 7) op = 8;
+        switch (op) {
+        case 0: {
+            size_t start = line_start(m, m->cursor), leading = 0;
+            while (start + leading < m->cursor && m->bytes[start + leading] == ' ') leading++;
+            if (m->len + leading + 1 > MODEL_BYTES) { inject = false; break; }
+            uint8_t text[MODEL_BYTES]; text[0] = '\n'; memset(text + 1, ' ', leading);
+            replace(m, m->cursor, 0, text, leading + 1); ev.keysym = XKB_KEY_Return; break;
+        }
+        case 1: {
+            size_t start = line_start(m, m->cursor), end = line_end(m, m->cursor), at = m->cursor;
+            bool blank = true; for (size_t j = start; j < end; j++) blank &= m->bytes[j] == ' ';
+            if (blank && at > start) at = start + ((at - start - 1) / 4) * 4;
+            if (m->len == MODEL_BYTES && at == m->cursor) { inject = false; break; }
+            uint8_t ch = '}'; replace(m, at, m->cursor - at, &ch, 1);
+            ev.keysym = '}'; ev.utf8_len = 1; ev.utf8[0] = '}'; break;
+        }
+        case 2: {
+            if (m->len == MODEL_BYTES) { inject = false; break; }
+            uint8_t ch = data[i + 1] & 1 ? ' ' : 'x'; replace(m, m->cursor, 0, &ch, 1);
+            ev.keysym = ch; ev.utf8_len = 1; ev.utf8[0] = ch; break;
+        }
+        case 3:
+            if (m->cursor) replace(m, m->cursor - 1, 1, NULL, 0);
+            ev.keysym = XKB_KEY_BackSpace; break;
+        case 4:
+            m->cursor = m->anchor = data[i + 1] % (m->len + 1);
+            EDIT_ASSERT(editor_set_cursor(e, m->cursor) == 0); inject = false; break;
+        case 5: ev.keysym = XKB_KEY_Tab; ev.mods = PLAT_MOD_CTRL; break;
+        case 6: ev.keysym = XKB_KEY_Control_L; ev.press = false; break;
+        case 7: ev.keysym = 'w'; ev.mods = PLAT_MOD_CTRL; break;
+        case 8: ev.keysym = 'T'; ev.mods = PLAT_MOD_CTRL | PLAT_MOD_SHIFT; break;
+        case 9: {
+            inject = false;
+            if (editor_get_stats(e).tabs < 8 && count < 24) {
+                uint8_t wire[1024], payload[sizeof initial - 1]; size_t encoded = 0;
+                memcpy(payload, initial, sizeof payload); if (data[i + 1] & 1u) payload[5] = 0;
+                ipc_request request = {.cwd = "/tmp", .has_stdin = true,
+                    .stdin_data = payload, .stdin_size = sizeof payload}, decoded;
+                EDIT_ASSERT(ipc_wire_encode(&request, wire, sizeof wire, &encoded) == IPC_OK);
+                EDIT_ASSERT(ipc_wire_decode(wire, encoded, &decoded) == IPC_OK);
+                EDIT_ASSERT(editor_open_request(e, &decoded, 0) == 0);
+                models[count].text = (model){.len = sizeof initial - 1};
+                memcpy(models[count].text.bytes, payload, sizeof payload);
+                models[count++].id = editor_tab(e, editor_get_stats(e).active_tab)->id;
+            }
+            break;
+        }
+        case 10:
+            inject = false;
+            if (editor_get_stats(e).tabs) EDIT_ASSERT(editor_select_tab(e, data[i + 1] % editor_get_stats(e).tabs) == 0);
+            break;
+        default: ev.keysym = 'f'; ev.mods = PLAT_MOD_CTRL; break;
+        }
+        if (inject) EDIT_ASSERT(editor_inject(e, &ev) == 0);
+        settle(e);
+        active = editor_tab(e, editor_get_stats(e).active_tab);
+        if (active) {
+            m = NULL; for (size_t j = 0; j < count; j++) if (models[j].id == active->id) m = &models[j].text;
+            EDIT_ASSERT(m && editor_length(e) == m->len);
+            uint8_t actual[MODEL_BYTES]; EDIT_ASSERT(editor_read(e, 0, actual, m->len) == 0 && !memcmp(actual, m->bytes, m->len));
+            EDIT_ASSERT(editor_view(e).selection.cursor == m->cursor);
+        } else EDIT_ASSERT(editor_length(e) == 0);
+    }
+    editor_close(e);
 }

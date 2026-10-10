@@ -18,37 +18,56 @@ int editor_begin_frame(editor *e)
     if (e->dirty) return 0;
     if (e->grid.frame_id == UINT32_MAX) return RENDER_ERR_FRAME;
     int rc = render_frame_begin(&e->grid, e->grid.frame_id + 1u);
+    if (!rc) rc = render_frame_begin(&e->text_grid, e->grid.frame_id);
+    if (!rc) rc = render_frame_begin(&e->map_grid, e->grid.frame_id);
     if (!rc) { e->dirty = true; e->frame = (editor_frame){.id = e->grid.frame_id}; }
     return rc;
 }
 int editor_full_layout(editor *e)
 {
     int rc = editor_begin_frame(e); if (rc) return rc;
+    rc = render_mark_full(&e->grid); if (rc) return rc;
+    e->paint_ready = false;
     view_state s = e->v.state;
     uint32_t hs = s.hscroll > UINT32_MAX ? UINT32_MAX : (uint32_t)s.hscroll;
-    layout_viewport vp = {s.first_byte, s.first_line, hs, e->lines};
-    layout_set_cursor(&e->lay, e->visible && e->focused ? s.selection.cursor : UINT64_MAX);
+    layout_viewport vp = {s.first_byte, s.first_line, hs, e->buffer->lines};
+    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
     layout_set_selection(&e->lay, min64(s.selection.cursor, s.selection.anchor), max64(s.selection.cursor, s.selection.anchor));
     e->extra_rows = false; e->full_pending = false;
-    return layout_begin(&e->lay, e->tree, vp);
+    /* Establish the incoming gutter/text width before asking for a visual
+     * seed; a preceding tab or resize can have different query geometry. */
+    rc = layout_begin(&e->lay, e->tree, vp); if (rc) return rc;
+    if (s.wrap && s.visual_byte != s.first_byte) {
+        layout_wrap_row first; bool approximate;
+        rc = layout_visual_row(&e->lay, e->tree, s.visual_byte, 0, &first, &approximate);
+        if (!rc) {
+            rc = layout_begin_visual(&e->lay, e->tree, vp, &first);
+            e->v.state.visual_byte = first.start;
+            e->v.state.approximate |= approximate;
+        }
+    }
+    e->v.config.cols = e->lay.text_cols ? e->lay.text_cols : 1;
+    return rc;
 }
 static uint32_t cursor_row(const editor *e, uint64_t byte)
 {
     uint32_t r = 0;
-    while (r + 1 < e->grid.dims.rows && e->row_byte[r + 1] <= byte) r++;
+    while (r + 1 < e->text_grid.dims.rows && e->row_byte[r + 1] <= byte) r++;
     return r;
 }
 int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 {
     int rc = editor_begin_frame(e); if (rc) return rc;
+    e->paint_ready = false;
     view_state s = e->v.state;
-    layout_set_cursor(&e->lay, e->visible && e->focused ? s.selection.cursor : UINT64_MAX);
+    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
     layout_set_selection(&e->lay, min64(s.selection.cursor, s.selection.anchor), max64(s.selection.cursor, s.selection.anchor));
-    if (e->full_pending || !e->lay.src || s.first_byte != e->lay.first_byte || s.first_line != e->lay.first_line || s.hscroll != e->lay.hscroll)
+    if (e->full_pending || !e->lay.src || s.first_byte != e->lay.first_byte || s.first_line != e->lay.first_line ||
+        (!s.wrap && s.hscroll != e->lay.hscroll) || (s.wrap && s.visual_byte != e->row_byte[0]))
         return editor_full_layout(e);
     uint32_t a = cursor_row(e, old_cursor), b = cursor_row(e, s.selection.cursor);
     uint32_t lo = a < b ? a : b, hi = (a > b ? a : b) + 1u;
-    if (s.selection.cursor != s.selection.anchor || e->old_selection.cursor != e->old_selection.anchor) { lo = 0; hi = e->grid.dims.rows; }
+    if (s.selection.cursor != s.selection.anchor || e->old_selection.cursor != e->old_selection.anchor) { lo = 0; hi = e->text_grid.dims.rows; }
     if (layout_busy(&e->lay)) {
         if (lo < e->lay.row || hi > e->lay.row_end) {
             if (e->extra_rows) { if (lo > e->extra_first) lo = e->extra_first; if (hi < e->extra_end) hi = e->extra_end; }
@@ -63,9 +82,17 @@ void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
     if (e->journal && journal_receive(e->journal, msg)) return;
-    if (msg->kind == LINEIDX_MSG_PROGRESS) { if (e->index) (void)lineidx_poll(e->index); return; }
+    if (msg->kind == LINEIDX_MSG_PROGRESS) {
+        for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers && e->buffers[i] && e->buffers[i]->index)
+            (void)lineidx_poll(e->buffers[i]->index);
+        return;
+    }
     file_msg fm;
-    if (file_msg_decode(msg, &fm) == 0) { if (fm.status && !e->error) e->error = fm.status; return; }
+    if (file_msg_decode(msg, &fm) == 0) {
+        if (fm.f == e->opening) e->open_error = fm.status;
+        else if (fm.status && !e->error) e->error = fm.status;
+        return;
+    }
     if (!e->backend->initialized) return;
     render_event ev = {RENDER_EVENT_WORK, msg->generation, 0, msg};
     int rc = render_backend_event(e->backend, &ev);
@@ -79,7 +106,7 @@ static void platform_event(void *ctx, const plat_event *ev)
 }
 static void platform_work(void *ctx)
 {
-    editor *e = ctx; (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+    editor *e = ctx; int rc = editor_poll_sources(e); if (rc) e->error = rc;
     e->pump_stopped = true; plat_quit(&e->platform);
 }
 static int pump(editor *e, int timeout)
@@ -93,12 +120,12 @@ static int pump(editor *e, int timeout)
         if (timeout > 0 && !e->pump_stopped && rc == PLAT_OK) e->stats.poll_returns++;
         if (rc) return fail(e, rc);
     } else if (timeout != 0 && e->pool_ready) {
-        struct pollfd p = {work_pool_eventfd(&e->pool), POLLIN, 0};
+        struct pollfd p = {e->poll_fd, POLLIN, 0};
         int rc = poll(&p, 1, timeout);
         if (rc >= 0) e->stats.poll_returns++;
         else if (errno != EINTR) return EDITOR_ERR_IO;
     }
-    if (e->pool_ready) (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+    if (e->pool_ready) return editor_poll_sources(e);
     return e->error;
 }
 static int present(editor *e)
@@ -115,9 +142,10 @@ static int present(editor *e)
 }
 static int submit(editor *e)
 {
-    if (!e->dirty || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (!e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     size_t count = 0;
-    int rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
+    int rc = editor_compose(e); if (rc) return rc;
+    rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
     trace_record(TRACE_T3_RENDER_DONE, e->grid.frame_id);
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc == RENDER_ERR_BUSY) return 0;
@@ -142,8 +170,16 @@ static int resize(editor *e)
     if (dims.cols == e->grid.dims.cols && dims.rows == e->grid.dims.rows) return 0;
     int rc = render_backend_resize(e->backend, dims); if (rc) return rc;
     e->grid.dims = dims;
-    e->v.config.rows = dims.rows; e->v.config.cols = dims.cols > 12 ? dims.cols - 12 : 1;
-    rc = layout_init(&e->lay, &e->grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) return rc;
+    e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
+    e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
+    e->map_grid.dims.rows = e->text_grid.dims.rows;
+    e->v.config.rows = e->text_grid.dims.rows;
+    /* Reinit clears cells for a changed compact stride; retain open-time wrap storage. */
+    layout_wrap_row *rows = e->lay.wrap_rows, *plan = e->lay.wrap_plan; uint32_t cap = e->lay.wrap_capacity;
+    rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) return rc;
+    e->lay.wrap_rows = rows; e->lay.wrap_plan = plan; e->lay.wrap_capacity = cap;
+    e->lay.cfg.tab_width = e->buffer->style.width; e->lay.tab = e->buffer->style.width;
+    rc = layout_set_wrap(&e->lay, e->v.state.wrap); if (rc) return rc;
     return editor_full_layout(e);
 }
 static int nonkey(editor *e, const plat_event *ev)
@@ -154,10 +190,14 @@ static int nonkey(editor *e, const plat_event *ev)
         e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
     }
     if (ev->kind == PLAT_EV_FOCUS) {
-        e->focused = ev->focused; undo_break_burst(&e->undo);
+        e->focused = ev->focused; undo_break_burst(e->undo);
+        keys_reset(&e->keys); tabs_mru_release(&e->tabs);
+        e->drag_tab = SIZE_MAX; e->map_drag = false;
         editor_restart_blink(e, trace_now_ns());
         return editor_refresh_cursor(e, e->v.state.selection.cursor);
     }
+    if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
+    if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) return editor_pointer(e, ev);
     return 0;
 }
 void editor_restart_blink(editor *e, uint64_t now)
@@ -177,9 +217,10 @@ static int blink(editor *e, uint64_t now)
 }
 static bool runnable(const editor *e)
 {
-    bool can_drain = !e->journal || (e->op_count + 2 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES);
+    bool can_drain = !e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES);
     return (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
-           (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty);
+           (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty) ||
+           (e->buffer->index_dirty && !lineidx_building(e->buffer->index));
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
@@ -223,7 +264,7 @@ int editor_step(editor *e, int timeout_ms)
     for (;;) {
         e->stats.input_checks++;
         if (view_busy(&e->v)) rc = editor_continue_action(e);
-        else if (e->queue_count && (!e->journal || (e->op_count + 2 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
+        else if (e->queue_count && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
             plat_event ev = e->queue[e->queue_head];
             e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
             rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
@@ -232,11 +273,14 @@ int editor_step(editor *e, int timeout_ms)
             uint64_t elapsed = trace_now_ns() - slice; e->stats.slices++;
             if (elapsed > e->stats.longest_slice_ns) e->stats.longest_slice_ns = elapsed;
             if (rc >= 0) rc = 0;
+        } else if (e->full_pending) {
+            rc = editor_full_layout(e);
         } else if (e->extra_rows) {
             e->extra_rows = false;
             rc = layout_relayout_rows(&e->lay, e->extra_first, e->extra_end - e->extra_first);
             if (rc >= 0) rc = 0;
-        } else break;
+        } else if (e->dirty && !e->paint_ready) rc = editor_paint_prepare(e);
+        else break;
         if (rc) return fail(e, rc);
         if (e->quit || trace_now_ns() - start >= EDITOR_SLICE_NS) break;
     }
@@ -267,20 +311,21 @@ int editor_set_cursor(editor *e, uint64_t byte)
     e->v.state.selection.preferred_col = VIEW_PREFERRED_UNSET;
     e->v.state.first_line = piece_byte_to_line(e->tree, byte);
     e->v.state.first_byte = piece_line_to_byte(e->tree, e->v.state.first_line);
-    e->v.state.hscroll = 0; undo_break_burst(&e->undo);
+    e->v.state.visual_byte = e->v.state.first_byte; e->v.state.visual_end = false;
+    e->v.state.hscroll = 0; undo_break_burst(e->undo);
     return editor_refresh_cursor(e, old);
 }
 int editor_jump_line(editor *e, uint64_t line)
 {
     if (!e) return EDITOR_ERR_ARG;
-    if (e->index) {
+    if (e->buffer->index) {
         /* Exact piece queries are warm after open; publication is still the
          * prerequisite for line-based benchmark positioning. */
-        if (!lineidx_complete(e->index)) return EDITOR_MORE;
+        if (!lineidx_complete(e->buffer->index)) return EDITOR_MORE;
     }
     return editor_set_cursor(e, piece_line_to_byte(e->tree, line));
 }
-uint64_t editor_length(const editor *e) { return e ? piece_len(e->tree) : 0; }
+uint64_t editor_length(const editor *e) { return e && tabs_count(&e->tabs) ? piece_len(e->tree) : 0; }
 int editor_read(const editor *e, uint64_t off, uint8_t *dst, size_t len) { return e ? piece_read(e->tree, off, dst, len) : EDITOR_ERR_ARG; }
 view_state editor_view(const editor *e) { return e ? e->v.state : (view_state){0}; }
 editor_stats editor_get_stats(const editor *e)
@@ -289,11 +334,12 @@ editor_stats editor_get_stats(const editor *e)
     editor_stats s = e->stats;
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
-    s.pending = e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending;
+    s.pending = e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }
-bool editor_index_complete(editor *e) { return e && (!e->index || lineidx_complete(e->index)); }
-uint64_t editor_line_count(const editor *e) { return e ? e->lines : 0; }
+bool editor_index_complete(editor *e) { return e && (!e->buffer->index || lineidx_complete(e->buffer->index)); }
+uint64_t editor_line_count(const editor *e) { return e ? e->buffer->lines : 0; }
 int editor_flush(editor *e)
 {
     if (!e) return EDITOR_ERR_ARG;
