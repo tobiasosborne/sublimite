@@ -1015,6 +1015,38 @@ static void reload_fifo(void)
     puts("savectl reload regular-to-FIFO rejects without writer: ok");
 }
 
+static void reuse_receive(const work_msg *message, void *ctx)
+{ (void)savectl_receive(ctx, message); }
+typedef struct reuse_probe { _Atomic bool entered, release; } reuse_probe;
+static void reuse_probe_worker(work_ctx *ctx)
+{
+    reuse_probe *probe = ctx->arg; atomic_store(&probe->entered, true);
+    while (!atomic_load(&probe->release)) (void)sched_yield();
+}
+/* Regression for #12, fixed on main: completed controller work slots
+ * may belong to unrelated running/queued epochs at close. */
+static void known_unrelated_slot_reuse(void)
+{
+    fixture f; init(&f, "base"); edit(&f);
+    CHECK(savectl_save(f.s, f.tree, NULL, NULL, 0) == SAVECTL_OK); wait_controller(&f);
+    for (size_t i = 0; i < WORK_MAX_JOBS; i++)
+        while (atomic_load(&f.pool->slots[i].busy)) (void)sched_yield();
+    (void)work_mailbox_drain(f.pool, reuse_receive, f.s);
+    reuse_probe probe = {0}; work_handle handles[WORK_MAX_JOBS]; size_t n = 0;
+    for (; n < WORK_MAX_JOBS; n++) {
+        handles[n] = work_submit(f.pool, (work_job){reuse_probe_worker, &probe, 90, WORK_BULK});
+        if (!handles[n].epoch) break;
+    }
+    CHECK(n > 0); while (!atomic_load(&probe.entered)) (void)sched_yield();
+    savectl_close_begin(f.s);
+    int code = savectl_destroy(f.s);
+    printf("KNOWN unrelated slot reuse: destroy=%d expected=0 queued=%zu\n", code, n); fflush(stdout);
+    CHECK(code == SAVECTL_OK);
+    f.s = NULL; atomic_store(&probe.release, true);
+    for (size_t i = 0; i < n; i++) while (atomic_load(&f.pool->slots[handles[i].slot].busy)) (void)sched_yield();
+    work_pool_shutdown(f.pool); free(f.pool); piece_destroy(f.tree);
+    CHECK(unlink(f.path) == 0 && rmdir(f.dir) == 0);
+}
 int main(int argc, char **argv)
 {
     trace_init();
@@ -1035,6 +1067,7 @@ int main(int argc, char **argv)
     for (unsigned i=0;i<4u;++i) mapped_file_source(i);
     reload_allocation_recovery(); reload_construction_slices(); reload_memory_bound(); destroy_reused_slot(); undo_clean_identity();
     reload_fifo(); journal_base_conflict(false); journal_base_conflict(true);
+    if (getenv("EDIT_YQU_KNOWN_FAILURES")) known_unrelated_slot_reuse();
     notification_orders_completion();
     puts("savectl normal-build I/O and held-publication guard: ok");
     creation_permissions(0, true, 0);

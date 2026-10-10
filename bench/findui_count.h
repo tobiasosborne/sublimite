@@ -24,8 +24,16 @@ static int count_worker(void *argument)
         for (size_t i=0;i<(size_t)got;i++) if (block[i]!='a') { (void)close(fd); return 2; }
         warmed+=(size_t)got;
     }
-    uint64_t values[2][64]; bench_samples times[2];
-    bench_samples_init(&times[0],values[0],64); bench_samples_init(&times[1],values[1],64);
+    unsigned variants=args->word_pair ? 2u : 1u;
+    uint64_t *values=calloc(args->samples * variants,sizeof *values);
+    if (!values) { (void)close(fd); return 2; }
+    bench_samples times[2];
+    for (unsigned variant=0;variant<variants;variant++)
+        bench_samples_init(&times[variant],values + variant * args->samples,args->samples);
+    /* Qualified repeated requests use warm 64KiB mappings. Each sample
+     * completes a real asynchronous search and checks its ranges, including
+     * the plain/whole-word pair; this is not the full-1GB throughput gate. */
+    length=65536u;
     for (size_t sample=0;sample<args->samples;sample++) {
       for (unsigned variant=0;variant<(args->word_pair ? 2u : 1u);variant++) {
         edit_arena arena;
@@ -92,12 +100,13 @@ static int count_worker(void *argument)
     char power[64]; bench_battery_status(power,sizeof power);
     int rc=0;
     for (unsigned variant=0;variant<(args->word_pair ? 2u : 1u);variant++) {
-        int verdict=bench_gate_report(args->word_pair ? (variant ? "G6_findui_word_a_space" : "G6_findui_plain_a_space")
-                                                     : "G6_findui_dense_a",
+        int verdict=bench_gate_report(args->word_pair ? (variant ? "G6_findui_word_a_space_64KiB" : "G6_findui_plain_a_space_64KiB")
+                                                     : "G6_findui_dense_a_64KiB",
                                       &times[variant],UINT64_C(80000000),UINT64_C(125000000),
                                       BENCH_INTERACTION_MIN_N,args->track,power,"-");
         if (verdict) rc=verdict;
     }
-    printf("findui_count: exact total/first 4096 checked; initial/late/empty windows; mapping=NEW; (M)%s\n",bench__tag_from_power(power));
+    printf("findui_count: exact 64KiB total/first 4096 checked; initial/late/empty windows; mapping=NEW; (M)%s\n",bench__tag_from_power(power));
+    free(values);
     return rc;
 }

@@ -8,7 +8,9 @@
 #define MODEL_GROUPS 128u
 #define MUST(x) EDIT_ASSERT(x)
 
-typedef struct token { bool allowed[256]; uint8_t anchor; size_t minimum, maximum; } token;
+typedef struct token { bool allowed[256]; uint8_t anchor, kind; size_t minimum, maximum, left, right; } token;
+#define MODEL_NODES (MODEL_QUERY * 3u)
+
 typedef struct history { uint8_t before[MODEL_BYTES], after[MODEL_BYTES]; size_t bn, an; } history;
 typedef struct model {
     uint8_t bytes[MODEL_BYTES], query[MODEL_QUERY], replacement[4];
@@ -34,81 +36,143 @@ static void case_class(bool *allowed)
         if (allowed[lower] || allowed[upper]) allowed[lower] = allowed[upper] = true;
     }
 }
-static bool parse(const model *m, token *tokens, size_t *count)
+/* Recursive syntax tree and endpoint sets are independent of the Thompson
+ * compiler/executor. Covers groups, alternation, empty branches and repeats. */
+typedef struct oracle_parser {
+    const model *subject;
+    token *nodes;
+    size_t at, count;
+    bool valid;
+} oracle_parser;
+static size_t node(oracle_parser *p, uint8_t kind)
 {
-    *count = 0;
-    for (size_t at = 0; at < m->qn;) {
-        token *t = &tokens[(*count)++]; memset(t, 0, sizeof *t);
-        t->minimum = t->maximum = 1;
-        uint8_t byte = m->query[at++];
+    MUST(p->count < MODEL_NODES);
+    size_t id = p->count++;
+    memset(&p->nodes[id], 0, sizeof p->nodes[id]); p->nodes[id].kind = kind;
+    return id;
+}
+static size_t expression(oracle_parser *p);
+static size_t atom(oracle_parser *p)
+{
+    const model *m = p->subject;
+    uint8_t byte = m->query[p->at++];
+    size_t id;
+    if (byte == '(') {
+        id = expression(p);
+        if (p->at == m->qn || m->query[p->at++] != ')') p->valid = false;
+    } else {
+        id = node(p, 0); token *t = &p->nodes[id];
         if (byte == '^' || byte == '$') t->anchor = byte;
-        else if (byte == '.' ) {
+        else if (byte == '.') {
             for (size_t i = 0; i < 256; i++) t->allowed[i] = i != '\n';
         } else if (byte == '[') {
-            bool negate = at < m->qn && m->query[at] == '^', any = false;
-            if (negate) at++;
-            while (at < m->qn && m->query[at] != ']') {
-                uint8_t low = m->query[at++];
-                if (low == '\\') { if (at == m->qn) return false; low = m->query[at++]; }
-                uint8_t high = low;
-                if (at + 1 < m->qn && m->query[at] == '-' && m->query[at + 1] != ']') {
-                    at++; high = m->query[at++];
-                    if (high == '\\') { if (at == m->qn) return false; high = m->query[at++]; }
-                    if (high < low) return false;
+            bool negate = p->at < m->qn && m->query[p->at] == '^', any = false;
+            if (negate) p->at++;
+            while (p->at < m->qn && m->query[p->at] != ']') {
+                uint8_t low = m->query[p->at++], high;
+                if (low == '\\') {
+                    if (p->at == m->qn) { p->valid = false; break; }
+                    low = m->query[p->at++];
+                }
+                high = low;
+                if (p->at + 1 < m->qn && m->query[p->at] == '-' && m->query[p->at + 1] != ']') {
+                    p->at++; high = m->query[p->at++];
+                    if (high == '\\') {
+                        if (p->at == m->qn) { p->valid = false; break; }
+                        high = m->query[p->at++];
+                    }
+                    if (high < low) p->valid = false;
                 }
                 for (unsigned i = low; i <= (unsigned)high; i++) t->allowed[i] = true;
                 any = true;
             }
-            if (!any || at == m->qn) return false;
-            at++;
+            if (!any || p->at == m->qn) p->valid = false;
+            else p->at++;
             if (!m->options.match_case) case_class(t->allowed);
             if (negate) for (size_t i = 0; i < 256; i++) t->allowed[i] = !t->allowed[i];
         } else {
-            if (byte == '*' || byte == '+' || byte == '?') return false;
-            if (byte == '\\') { if (at == m->qn) return false; byte = m->query[at++]; }
+            if (byte == '*' || byte == '+' || byte == '?' || byte == '{' || byte == '}') p->valid = false;
+            if (byte == '\\') {
+                if (p->at == m->qn) p->valid = false;
+                else { byte = m->query[p->at++]; if (byte >= '0' && byte <= '9') p->valid = false; }
+            }
             t->allowed[byte] = true;
             if (!m->options.match_case) case_class(t->allowed);
         }
-        if (at < m->qn && (m->query[at] == '*' || m->query[at] == '+' || m->query[at] == '?')) {
-            if (t->anchor) return false;
-            uint8_t repeat = m->query[at++];
-            t->minimum = repeat == '+' ? 1 : 0;
-            t->maximum = repeat == '?' ? 1 : MODEL_BYTES;
-        }
     }
-    return true;
+    if (p->at < m->qn && (m->query[p->at] == '*' || m->query[p->at] == '+' || m->query[p->at] == '?')) {
+        if (p->nodes[id].anchor) p->valid = false;
+        uint8_t repeat = m->query[p->at++];
+        size_t repeated = node(p, 4); token *t = &p->nodes[repeated]; t->left = id;
+        t->minimum = repeat == '+' ? 1 : 0;
+        t->maximum = repeat == '?' ? 1 : MODEL_BYTES + 1u;
+        id = repeated;
+    }
+    return id;
 }
-/* Independent endpoint-set matcher for concatenation, classes, quantifiers
- * and multiline anchors. Input edits/templates stay within this grammar.
- * Uses no find functions and does not share the production transformer. */
-static bool anchored(const model *m, const token *tokens, size_t count, size_t start, size_t *end)
+static size_t concatenate(oracle_parser *p)
 {
-    bool current[MODEL_BYTES + 1] = {false}, next[MODEL_BYTES + 1];
-    current[start] = true;
-    for (size_t ti = 0; ti < count; ti++) {
-        memset(next, 0, sizeof next); const token *t = &tokens[ti];
-        for (size_t pos = start; pos <= m->length; pos++) if (current[pos]) {
-            if (t->anchor) {
-                if ((t->anchor == '^' && (!pos || m->bytes[pos - 1] == '\n')) ||
-                    (t->anchor == '$' && (pos == m->length || m->bytes[pos] == '\n'))) next[pos] = true;
-            } else {
-                size_t consumed = 0;
-                if (!t->minimum) next[pos] = true;
-                while (consumed < t->maximum && pos + consumed < m->length && t->allowed[m->bytes[pos + consumed]]) {
-                    consumed++; if (consumed >= t->minimum) next[pos + consumed] = true;
-                }
-            }
-        }
-        memcpy(current, next, sizeof current);
+    size_t id = node(p, 1);
+    const model *m = p->subject;
+    while (p->valid && p->at < m->qn && m->query[p->at] != '|' && m->query[p->at] != ')') {
+        size_t right = atom(p), combined = node(p, 2);
+        p->nodes[combined].left = id; p->nodes[combined].right = right; id = combined;
     }
-    for (size_t pos = m->length + 1; pos-- > start;) if (current[pos]) { *end = pos; return true; }
+    return id;
+}
+static size_t expression(oracle_parser *p)
+{
+    size_t id = concatenate(p);
+    while (p->valid && p->at < p->subject->qn && p->subject->query[p->at] == '|') {
+        p->at++;
+        size_t right = concatenate(p), combined = node(p, 3);
+        p->nodes[combined].left = id; p->nodes[combined].right = right; id = combined;
+    }
+    return id;
+}
+static bool parse(const model *m, token *nodes, size_t *root)
+{
+    oracle_parser p = {m, nodes, 0, 0, true}; *root = expression(&p);
+    return p.valid && p.at == m->qn;
+}
+static void endpoints(const model *m, const token *nodes, size_t id, const bool *input, bool *output)
+{
+    const token *t = &nodes[id];
+    memset(output, 0, MODEL_BYTES + 1u);
+    if (t->kind == 1) memcpy(output, input, MODEL_BYTES + 1u);
+    else if (t->kind == 2 || t->kind == 3) {
+        bool intermediate[MODEL_BYTES + 1u];
+        endpoints(m, nodes, t->left, input, intermediate);
+        endpoints(m, nodes, t->right, t->kind == 2 ? intermediate : input, output);
+        if (t->kind == 3) for (size_t i = 0; i <= m->length; i++) output[i] |= intermediate[i];
+    } else if (t->kind == 4) {
+        bool current[MODEL_BYTES + 1u], next[MODEL_BYTES + 1u]; memcpy(current, input, sizeof current);
+        if (!t->minimum) memcpy(output, input, sizeof current);
+        for (size_t count = 1; count <= t->maximum; count++) {
+            endpoints(m, nodes, t->left, current, next);
+            if (count >= t->minimum) for (size_t i = 0; i <= m->length; i++) output[i] |= next[i];
+            if (!memcmp(current, next, sizeof current)) break;
+            memcpy(current, next, sizeof current);
+        }
+    } else for (size_t pos = 0; pos <= m->length; pos++) if (input[pos]) {
+        if (t->anchor) {
+            if ((t->anchor == '^' && (!pos || m->bytes[pos - 1] == '\n')) ||
+                (t->anchor == '$' && (pos == m->length || m->bytes[pos] == '\n'))) output[pos] = true;
+        } else if (pos < m->length && t->allowed[m->bytes[pos]]) output[pos + 1] = true;
+    }
+}
+static bool anchored(const model *m, const token *nodes, size_t root, size_t start, size_t *end)
+{
+    bool input[MODEL_BYTES + 1u] = {false}, output[MODEL_BYTES + 1u]; input[start] = true;
+    endpoints(m, nodes, root, input, output);
+    for (size_t pos = m->length + 1; pos-- > start;) if (output[pos]) { *end = pos; return true; }
     return false;
 }
 static void enumerate(model *m)
 {
     m->count = 0; m->valid = true;
     if (!m->qn) return;
-    token tokens[MODEL_QUERY]; size_t tn = 0;
+    token tokens[MODEL_NODES]; size_t tn = 0;
     if (m->options.regex && !parse(m, tokens, &tn)) { m->valid = false; return; }
     for (size_t start = 0; start <= m->length;) {
         size_t end = start; bool hit = false;
@@ -296,6 +360,37 @@ static void capacity_and_lifecycle(const uint8_t *data, size_t size)
     }
     work_pool_shutdown(pool); piece_destroy(tree); edit_arena_free(&arena);
 }
+/* Default folded literals must not disappear from capacity coverage. The
+ * known regex-limit defect is preserved as an opt-in expected-behavior unit
+ * regression; accept ONLY that exact current error or the correct scalar
+ * result here, so other errors/wrong counts still fail fuzzing. */
+static void default_long_query(const uint8_t *data, size_t size)
+{
+    if (!size || !(data[0] & 0x40u)) return;
+    edit_arena arena; MUST(edit_arena_init(&arena, 8u * 1024u * 1024u) == 0);
+    work_pool *pool = edit_arena_alloc(&arena, sizeof *pool, _Alignof(work_pool));
+    MUST(pool && work_pool_init(pool, 1, 0) == 0);
+    findui_panel panel = {0}; findui_config config = {&arena, pool, 8, 8, NULL, NULL};
+    MUST(findui_init(&panel, &config) == FINDUI_OK);
+    uint8_t text[1024], query_bytes[512];
+    size_t qn = 255u + data[0] % 258u;
+    for (size_t i = 0; i < qn; i++) {
+        query_bytes[i] = (uint8_t)('a' + data[i % size] % 26u);
+        text[i] = (uint8_t)(query_bytes[i] - ('a' - 'A'));
+        text[qn + i] = query_bytes[i];
+    }
+    piece_allocator allocator = {&arena, allocate, release}; piece_tree *tree = piece_create(&allocator);
+    MUST(tree && piece_init_copy(tree, text, qn * 2u) == PIECE_OK);
+    bind(&panel, tree, 1); MUST(findui_show(&panel, true, false) == FINDUI_OK);
+    /* No set_options: exercise the actual initialized default. */
+    MUST(findui_set_query(&panel, query_bytes, qn) == FINDUI_OK); wait_result(&panel, pool);
+    findui_state state = findui_get_state(&panel);
+    MUST(!state.options.match_case && !state.options.regex);
+    if (state.complete) MUST(state.match_count == 2 && state.selected.start == 0 && state.selected.end == qn);
+    else MUST(state.search_error == FIND_ERR_LIMIT && state.match_count == 0);
+    while (findui_dispose(&panel) == FINDUI_MORE) pause_worker();
+    work_pool_shutdown(pool); piece_destroy(tree); edit_arena_free(&arena);
+}
 typedef struct allocation_fault { edit_arena *arena; size_t calls, fail_at; } allocation_fault;
 static void *fault_alloc(void *ctx, size_t bytes)
 {
@@ -306,6 +401,7 @@ static void *fault_alloc(void *ctx, size_t bytes)
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size > 384) size = 384;
+    default_long_query(data, size);
     capacity_and_lifecycle(data, size);
     edit_arena arena; MUST(edit_arena_init(&arena, 16u * 1024u * 1024u) == 0);
     model *m = edit_arena_alloc(&arena, sizeof *m, _Alignof(model)); MUST(m); memset(m, 0, sizeof *m);
@@ -351,7 +447,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             search_changed = old_options.regex != m->options.regex ||
                 old_options.match_case != m->options.match_case || old_options.whole_word != m->options.whole_word;
         } else if (op == 6) {
-            const char *patterns[] = {"a", "ab", "a+", "a?", ".*", "[ab]+", "[^aB]*", "[A-b]", "^a", "b$", "\\+", "[a-z]+", "[", "\\", "[z-a]"};
+            const char *patterns[] = {"(a|b)", "(ab|A)?b+", "a|", "(a|b)*", "((a|B)+)?", "(a", "a)", "a**", "a{2}", "\\1", "a", "ab", "a+", "a?", ".*", "[ab]+", "[^aB]*", "[A-b]", "^a", "b$", "\\+", "[a-z]+", "[", "\\", "[z-a]"};
             const char *pattern = patterns[a % (sizeof patterns / sizeof *patterns)];
             m->raw_query = false; m->qn = strlen(pattern); memcpy(m->query, pattern, m->qn);
             MUST(findui_set_query(&panel, m->query, m->qn) == FINDUI_OK); search_changed = true;

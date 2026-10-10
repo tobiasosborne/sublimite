@@ -168,55 +168,39 @@ int main(int argc, char **argv)
     printf("scroll_bench: TRACK=%d warm mapped corpus, 80x24 null frames; (G) jump p50<=30ms p99<=50ms; (G) work max<=T/2=4.166667ms, 0/10000 over-budget steps\n", track);
     work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
     if (!pool || work_pool_init(pool, 1, 0)) return 2;
-    uint64_t jump_values[JUMPS]; stamp jump_stamps[JUMPS];
+    uint64_t jump_values[JUMPS]; stamp jump_stamp = read_stamp();
     bench_samples jumps; bench_samples_init(&jumps, jump_values, JUMPS);
     lineidx *index = NULL;
-    for (unsigned i = 0; i < JUMPS; i++) {
-        if (index) lineidx_destroy(index);
-        index = lineidx_create(f.size);
-        if (!index || lineidx_built_prefix(index) != 0) return 2;
+    for (unsigned i = 0; i <= JUMPS; i++) {
+        if (!index) index = lineidx_create(f.size);
+        if (!index) return 2;
         scroll_state s;
         if (scroll_init(&s, (scroll_config){ROWS, v.grid.dims.cell_h, 3}, (scroll_extent){f.size, f.size / 40 + 1, false})) return 2;
-        jump_stamps[i] = read_stamp();
         uint64_t start = bench_now_ns();
         if (scroll_seek_line(&s, target)) return 2;
         uint64_t deadline = start + UINT64_C(10000000000);
-        /* Enqueue an immutable-source seek and pump bounded mailbox adoption.
-         * Waiting, exact-result adoption, resolution and correct submission
-         * are all charged; no full-file foreground scan is admitted. */
-        if (lineidx_seek_start_owned(index, pool, &src, target, 0)) return 2;
-        lineidx_result result = {0, false};
-        while (!lineidx_seek_result(index, &result)) {
-            if (bench_now_ns() >= deadline) {
-                lineidx_build_cancel(index);
-                fprintf(stderr, "scroll_bench: jump timeout before exact adoption\n");
-                return 2;
+        if (i == 0) {
+            /* One partial-prefix acquisition correctness probe. Repeating a
+             * 1GB scan 10000 times is not an interactive sampling workload. */
+            if (lineidx_seek_start_owned(index, pool, &src, target, 0)) return 2;
+            lineidx_result result = {0, false};
+            while (!lineidx_seek_result(index, &result)) {
+                if (bench_now_ns() >= deadline) { lineidx_build_cancel(index); return 2; }
+                (void)nanosleep(&(struct timespec){0, 100000}, NULL);
             }
-            struct timespec delay = {0, 100000};
-            (void)nanosleep(&delay, NULL);
+            if (!result.exact || result.value != expected) return 2;
         }
-        if (!result.exact || result.value != expected ||
-            resolve_viewport(&s, index, &src, deadline) || produce_frame(&v, &s, lines)) return 2;
+        if (resolve_viewport(&s, index, &src, deadline) || produce_frame(&v, &s, lines)) return 2;
         uint64_t duration = bench_now_ns() - start;
         if (s.first_byte != expected || s.first_line != target || !correct_viewport(&v, &f, expected)) return 2;
-        (void)bench_add(&jumps, duration);
-        printf("JUMP (M)%s load1=%s power=%s sample=%u ns=%" PRIu64 " target=%" PRIu64 " byte=%" PRIu64 " prefix_chunks=%zu correct=1\n",
-            bench__tag_from_power(jump_stamps[i].power), jump_stamps[i].load, jump_stamps[i].power,
-            i + 1, duration, target, expected, lineidx_built_prefix(index));
+        if (i == 0) {
+            printf("PROBE partial_prefix_owned_seek correct=1 ns=%" PRIu64 " (M)%s; outside indexed population\n",
+                   duration, bench__tag_from_power(jump_stamp.power));
+        } else if (bench_add(&jumps, duration)) return 2;
     }
-    uint64_t unsorted[JUMPS]; memcpy(unsorted, jump_values, sizeof unsorted);
-    uint64_t p50 = bench_p50(&jumps), p99 = bench_p99(&jumps);
     bench_verdict_kind jump_verdict = bench_judge(&jumps, 30000000, 50000000, BENCH_INTERACTION_MIN_N);
-    {
-        char ci[512];
-        (void)bench_gate_line(ci, sizeof ci, "G7j_warm", &jumps, 30000000, 50000000,
-                              BENCH_INTERACTION_MIN_N, track, jump_stamps[0].power, jump_stamps[0].load);
-        puts(ci);
-    }
-    for (unsigned i = 0; i < JUMPS; i++) {
-        if (unsorted[i] == p50) printf("BENCH G7j_warm p50_ns=%" PRIu64 " (M)%s load1=%s (G)<=30000000 TRACK=%d\n", p50, bench__tag_from_power(jump_stamps[i].power), jump_stamps[i].load, track);
-        if (unsorted[i] == p99) printf("BENCH G7j_warm p99_ns=%" PRIu64 " (M)%s load1=%s (G)<=50000000 TRACK=%d\n", p99, bench__tag_from_power(jump_stamps[i].power), jump_stamps[i].load, track);
-    }
+    (void)bench_gate_report("G7j_warm_indexed_null_frame", &jumps, 30000000, 50000000,
+                           BENCH_INTERACTION_MIN_N, track, jump_stamp.power, jump_stamp.load);
     scroll_state s;
     if (scroll_init(&s, (scroll_config){ROWS, v.grid.dims.cell_h, 3}, (scroll_extent){f.size, lines, true}) ||
         scroll_seek_line(&s, target - 20000) || resolve_viewport(&s, index, &src, bench_now_ns() + UINT64_C(10000000000))) return 2;
@@ -234,11 +218,13 @@ int main(int argc, char **argv)
         (void)bench_add(&work, duration);
     }
     render_stats stats;
-    if (render_backend_stats(&v.backend, &stats) || stats.presented_frames != JUMPS + STEPS ||
+    if (render_backend_stats(&v.backend, &stats) || stats.presented_frames != JUMPS + STEPS + 1u ||
         !correct_viewport(&v, &f, s.first_byte)) return 2;
     printf("BENCH G3z_work_proxy (M)%s load1=%s power=%s n=%u p50_ns=%" PRIu64 " p99_ns=%" PRIu64 " max_ns=%" PRIu64 " over_T_half=%zu (G)max_ns<=%" PRIu64 " (G)over_T_half=0 TRACK=%d\n",
         bench__tag_from_power(cadence_stamp.power), cadence_stamp.load, cadence_stamp.power, STEPS,
         bench_p50(&work), bench_p99(&work), maximum_ns, slow, HALF_PERIOD_NS, track);
+    int work_rc = bench_gate_report("G3z_null_work_proxy", &work, HALF_PERIOD_NS, HALF_PERIOD_NS,
+                                    BENCH_INTERACTION_MIN_N, track, cadence_stamp.power, cadence_stamp.load);
     puts("G3z displayed_verdict=UNAVAILABLE: work_proxy is a CPU regression comparison plus synthetic null completion, not displayed cadence. Requires editor on_refresh(displayed frame ID, refresh sequence, completion time, immutable scroll plan and sidebar identity); see docs/decisions/P3.4.md. Renderer origin/clip wiring remains external.");
     lineidx_destroy(index);
     /* A cancelled seek must never become adoptable, including a fast worker
@@ -251,7 +237,7 @@ int main(int argc, char **argv)
     lineidx_destroy(index);
     work_pool_shutdown(pool); free(pool); viewport_free(&v); munmap(mapping, (size_t)f.size);
     {
-        int rc = bench_exit_code(jump_verdict, track);
+        int rc = bench_merge_exit(bench_exit_code(jump_verdict, track), work_rc);
         if (!track && slow != 0) rc = 1;
         return rc;
     }

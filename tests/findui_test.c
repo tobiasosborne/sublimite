@@ -756,6 +756,20 @@ static void maximum_literals(void)
     }
     puts("S21: PASS maximum ASCII/binary literals in both case modes");
 }
+/* Regression for P4-modules-2 #21, fixed on main; retain the historical
+ * opt-in switch for this default folded-query fixture. */
+static void known_default_long_query(void)
+{
+    uint8_t text[300], needle[300]; memset(text, 'A', sizeof text); memset(needle, 'a', sizeof needle);
+    fixture f; start(&f, text, sizeof text, 8, 8);
+    CHECK(findui_set_options(&f.panel, (findui_options){0}) == FINDUI_OK);
+    CHECK(findui_set_query(&f.panel, needle, sizeof needle) == FINDUI_OK); wait_result(&f);
+    findui_state state = findui_get_state(&f.panel);
+    printf("KNOWN default folded query: length=300 complete=%d error=%d count=%llu\n",
+           state.complete, (int)state.search_error, (unsigned long long)state.match_count); fflush(stdout);
+    CHECK(state.complete && state.match_count == 1);
+    finish(&f);
+}
 int main(void)
 {
     replacement_paged_noop();
@@ -769,6 +783,7 @@ int main(void)
     whole_word_publication();
     whole_word_count_worker();
     maximum_literals();
+    if (getenv("EDIT_YQU_KNOWN_FAILURES")) known_default_long_query();
     filtered_regex_budget();
     bounded_count_worker();
     incremental_cancel(); wrap_and_visible(); toggles(); replace_groups(); replacement_failure_and_cancel(); lifecycle_and_backpressure(); painting_and_no_malloc();

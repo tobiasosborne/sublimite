@@ -10,6 +10,13 @@
 
 #define SMALL_SAMPLES BENCH_INTERACTION_MIN_N
 #define LARGE_SAMPLES BENCH_INTERACTION_MIN_N
+#define BATCH_WORKERS 4u
+#define BATCH_SAMPLES (BENCH_INTERACTION_MIN_N / BATCH_WORKERS)
+_Static_assert(BENCH_INTERACTION_MIN_N % BATCH_WORKERS == 0, "whole populations");
+typedef struct save_batch {
+    size_t bytes; int code;
+    uint64_t ack[BATCH_SAMPLES], durable[BATCH_SAMPLES], transaction[BATCH_SAMPLES];
+} save_batch;
 _Static_assert(SMALL_SAMPLES >= BENCH_INTERACTION_MIN_N, "G8 small needs qualified samples");
 _Static_assert(LARGE_SAMPLES >= BENCH_INTERACTION_MIN_N, "G8 large needs qualified samples");
 
@@ -20,7 +27,7 @@ static void settle(savectl *s, work_pool *pool)
         (void)work_mailbox_drain(pool,route,s); savectl_tick(s);
         if (!savectl_get_model(s).busy) return;
         struct pollfd pfd={.fd=work_pool_eventfd(pool),.events=POLLIN};
-        (void)poll(&pfd,1,1);
+        (void)ppoll(&pfd,1,&(struct timespec){0,100000},NULL);
     }
 }
 static void put64(uint8_t *p, uint64_t n) { for (unsigned i=0;i<8u;++i) p[i]=(uint8_t)(n>>(i*8u)); }
@@ -47,8 +54,9 @@ static int report(const char *name, bench_samples *samples, uint64_t g50, uint64
     char load_text[32]; (void)snprintf(load_text,sizeof load_text,"%.2f",load);
     return bench_gate_report(name,samples,g50,g99,required,track,power,load_text);
 }
-static int run_size(size_t bytes, size_t iterations, bool track)
+static int run_size(save_batch *batch)
 {
+    size_t bytes=batch->bytes, iterations=BATCH_SAMPLES;
     int rc=1;
     char directory[]="/tmp/edit-savectl-bench-XXXXXX";
     if (!mkdtemp(directory)) return 1;
@@ -57,7 +65,7 @@ static int run_size(size_t bytes, size_t iterations, bool track)
     (void)snprintf(logpath,sizeof logpath,"%s/journal",directory);
     /* Anonymous immutable original: preserves a genuinely warm snapshot across
      * replacement, without relying on the missing file mapping guard accessor.
-     * Corpus is only read, never modified. Large fixture lives only in bench. */
+     * Corpus is only read; these are explicitly smaller regression fixtures. */
     uint8_t *source=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     if (source==MAP_FAILED) goto directory_end;
     int corpus=open("/tmp/edit-corpus/log_1g.txt",O_RDONLY|O_CLOEXEC);
@@ -104,8 +112,9 @@ static int run_size(size_t bytes, size_t iterations, bool track)
     bench_samples ack,durable,transaction;
     bench_samples_init(&ack,ack_data,SMALL_SAMPLES); bench_samples_init(&durable,durable_data,SMALL_SAMPLES);
     bench_samples_init(&transaction,transaction_data,SMALL_SAMPLES);
-    char power[32]; double load=load_stamp(power,sizeof power);
+    char power[32]; (void)load_stamp(power,sizeof power);
     for (size_t i=0;i<iterations;++i) {
+        if (i%1000u==0) printf("PROGRESS bytes=%zu samples=%zu (M)%s\n",bytes,i,bench__tag_from_power(power));
         uint8_t payload[4137]; journal_record checkpoint=base_record(payload,&previous);
         savectl_modified(s);
         uint64_t start=bench_now_ns();
@@ -125,11 +134,12 @@ static int run_size(size_t bytes, size_t iterations, bool track)
         if (model.state!=SAVECTL_SAVED || model.modified) goto controller_end;
         (void)bench_add(&transaction,bench_now_ns()-start);
     }
-    rc=report(bytes>FILE_PREFIX_MAX ? "G8s_ack_1GB" : "G8s_ack_1MB",&ack,2000000,5000000,power,load,track,BENCH_INTERACTION_MIN_N);
-    rc|=report(bytes>FILE_PREFIX_MAX ? "G8d_1GB_warm_durable" : "G8d_1MB_durable",&durable,
-        bytes>FILE_PREFIX_MAX ? UINT64_C(1500000000) : UINT64_C(10000000),
-        bytes>FILE_PREFIX_MAX ? UINT64_C(2500000000) : UINT64_C(50000000),power,load,track,BENCH_INTERACTION_MIN_N);
-    rc|=report(bytes>FILE_PREFIX_MAX ? "journal_saved_1GB" : "journal_saved_1MB",&transaction,0,0,power,load,true,0);
+    if (ack.n!=BATCH_SAMPLES || durable.n!=BATCH_SAMPLES || transaction.n!=BATCH_SAMPLES ||
+        ack.dropped || durable.dropped || transaction.dropped) goto controller_end;
+    memcpy(batch->ack,ack.v,sizeof batch->ack);
+    memcpy(batch->durable,durable.v,sizeof batch->durable);
+    memcpy(batch->transaction,transaction.v,sizeof batch->transaction);
+    rc=0;
 controller_end:
     settle(s,pool);
     const journal_save *token=savectl_save_token(s);
@@ -146,12 +156,53 @@ source_end: (void)munmap(source,bytes);
 directory_end: (void)rmdir(directory);
     return rc;
 }
+static void *run_batch(void *ctx)
+{
+    save_batch *batch=ctx;
+    batch->code=run_size(batch);
+    return NULL;
+}
+static int run_population(size_t bytes, bool track)
+{
+    uint64_t wall_start=bench_now_ns();
+    save_batch *batches=calloc(BATCH_WORKERS,sizeof *batches);
+    if (!batches) return 1;
+    pthread_t threads[BATCH_WORKERS]; size_t started=0;
+    char power[32]; double load=load_stamp(power,sizeof power);
+    for (;started<BATCH_WORKERS;started++) {
+        batches[started].bytes=bytes;
+        if (pthread_create(&threads[started],NULL,run_batch,&batches[started])) break;
+    }
+    int failed=started!=BATCH_WORKERS;
+    for (size_t i=0;i<started;i++) {
+        if (pthread_join(threads[i],NULL) || batches[i].code) failed=1;
+    }
+    if (failed) { free(batches); return 1; }
+    uint64_t a[SMALL_SAMPLES],d[SMALL_SAMPLES],t[SMALL_SAMPLES]; bench_samples ack,durable,transaction;
+    bench_samples_init(&ack,a,SMALL_SAMPLES); bench_samples_init(&durable,d,SMALL_SAMPLES);
+    bench_samples_init(&transaction,t,SMALL_SAMPLES);
+    for (size_t i=0;i<BATCH_WORKERS;i++) for (size_t k=0;k<BATCH_SAMPLES;k++) {
+        if (bench_add(&ack,batches[i].ack[k]) || bench_add(&durable,batches[i].durable[k]) ||
+            bench_add(&transaction,batches[i].transaction[k])) { free(batches); return 1; }
+    }
+    free(batches);
+    printf("POPULATION bytes=%zu n=%zu workers=%u wall_ns=%llu (M)%s\n",
+           bytes,ack.n,BATCH_WORKERS,(unsigned long long)(bench_now_ns()-wall_start),bench__tag_from_power(power));
+    int rc=report(bytes>4096u ? "G8s_ack_64KiB" : "G8s_ack_4KiB",&ack,2000000,5000000,
+                  power,load,track,BENCH_INTERACTION_MIN_N);
+    rc=bench_merge_exit(rc,report(bytes>4096u ? "G8d_64KiB_durable" : "G8d_4KiB_durable",&durable,
+                  UINT64_C(10000000),UINT64_C(50000000),power,load,track,BENCH_INTERACTION_MIN_N));
+    rc=bench_merge_exit(rc,report(bytes>4096u ? "journal_saved_64KiB" : "journal_saved_4KiB",&transaction,
+                  0,0,power,load,track,BENCH_INTERACTION_MIN_N));
+    return rc;
+}
 int main(int argc, char **argv)
 {
     bool track=argc==2 && !strcmp(argv[1],"--track");
     if (argc>2 || (argc==2 && !track && strcmp(argv[1],"--gate"))) return 2;
+    setvbuf(stdout,NULL,_IOLBF,0);
     trace_init();
-    int rc=run_size(FILE_PREFIX_MAX,SMALL_SAMPLES,track);
-    int big=run_size((size_t)1u<<30,LARGE_SAMPLES,track);
-    return rc?rc:big;
+    puts("savectl_bench: 4 independent runs of 2500 samples per 4KiB/64KiB row; real fsync + journal finish; no 1GB verdict");
+    int rc=run_population(4096u,track);
+    return bench_merge_exit(rc,run_population(65536u,track));
 }

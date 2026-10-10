@@ -2,6 +2,7 @@
 #include "find/find.h"
 #include "../bench/harness.h"
 #include "find_supervise.h"
+#include "interaction.h"
 #include <fcntl.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -137,15 +138,13 @@ static int cancel_worker(void *argument)
 int main(int argc,char **argv)
 {
     if (argc>1 && (strcmp(argv[1],"--count")==0 || strcmp(argv[1],"--word")==0)) {
-        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",3,false,strcmp(argv[1],"--word")==0};
+        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",BENCH_INTERACTION_MIN_N,false,strcmp(argv[1],"--word")==0};
         for (int i=2;i<argc;i++) {
             if (strcmp(argv[i],"--gate")==0) args.track=false;
             else if (strcmp(argv[i],"--track")==0) args.track=true;
             else if (strcmp(argv[i],"--fixture")==0 && i+1<argc) args.path=argv[++i];
             else if (strcmp(argv[i],"--samples")==0 && i+1<argc) {
-                char *end=NULL; unsigned long n=strtoul(argv[++i],&end,10);
-                if (!end || *end || !n || n>64) return 2;
-                args.samples=(size_t)n;
+                if (bench_interaction_samples(argv[++i], &args.samples)) return 2;
             } else return 2;
         }
         char power[64],load[64];

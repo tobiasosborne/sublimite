@@ -2,6 +2,7 @@
  * Random core wheel, XI2 deltas, pixels, page/doc keys, resize, follow,
  * byte seeking and prefix publication, including event/publication races. */
 #include "scroll/scroll.h"
+#include "base/base.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -99,11 +100,12 @@ static void core_model(const uint8_t *data, size_t size)
         REQUIRE(s.first_line * m.height * 256 + s.subrow_q8 == (uint64_t)m.position);
     }
 }
-typedef struct source { const uint8_t *bytes; size_t size, fragment, calls, fail_call; } source;
+typedef struct source { const uint8_t *bytes; size_t size, fragment, calls, fail_call; bool null_failure; } source;
 static size_t span(void *ctx, uint64_t off, const uint8_t **out)
 {
     source *f = ctx;
-    if (++f->calls == f->fail_call || off >= f->size) return 0;
+    if (++f->calls == f->fail_call) { *out = NULL; return f->null_failure ? 1u : 0u; }
+    if (off >= f->size) return 0;
     *out = f->bytes + off;
     size_t n = f->size - (size_t)off;
     return n > f->fragment ? f->fragment : n;
@@ -368,9 +370,46 @@ static void visual_model(const uint8_t *data, size_t size)
     }
 }
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+/* Fully published index metadata still delegates suffix/line walks to the
+ * source. Fail early/late and with a nonzero span carrying NULL; never publish
+ * a false exact viewport or mutate its pending intent on an error. */
+static void indexed_errors(const uint8_t *data, size_t size)
+{
+    if (size < 4) return;
+    uint8_t bytes[FILE_BYTES]; memset(bytes, 'x', sizeof bytes);
+    size_t width = 8u + data[0] % 25u;
+    for (size_t off = width - 1u; off < sizeof bytes; off += width) bytes[off] = '\n';
+    source f = {.bytes=bytes, .size=sizeof bytes, .fragment=1u + data[1] % 16u};
+    lineidx_src src = {&f, f.size, span, NULL};
+    lineidx *index = lineidx_create(f.size); REQUIRE(index); complete_index(index, &src);
+    size_t prefix = lineidx_built_prefix(index);
+    for (unsigned operation = 0; operation < 5; operation++) {
+        scroll_state s;
+        REQUIRE(scroll_init(&s, (scroll_config){4, 17, 1},
+                           (scroll_extent){f.size, scalar_line(bytes, f.size) + 1u, true}) == 0);
+        REQUIRE(scroll_seek_line(&s, 40) == 0 && resolve(&s, index, &src) == 0);
+        if (operation == 0) REQUIRE(scroll_seek_line(&s, 80) == 0);
+        else if (operation == 1) REQUIRE(scroll_seek_byte(&s, width * 70u + 3u) == 0);
+        else if (operation == 4) REQUIRE(scroll_wheel(&s, 256) == 0);
+        scroll_state before = s;
+        f.calls = 0; f.fail_call = 1u + data[2] % 8u; f.null_failure = (data[3] & 1u) != 0;
+        scroll_resolver resolver = {0};
+        int rc = operation == 3 ? scroll_follow_cursor_slice(&s, &resolver, index, &src, width * 90u + 2u, 0, 0)
+                                : scroll_resolve_slice(&s, &resolver, index, &src, 0, 0);
+        REQUIRE(rc == SCROLL_ERR_SOURCE && f.calls == f.fail_call);
+        REQUIRE(memcmp(&s, &before, sizeof s) == 0 && lineidx_built_prefix(index) == prefix);
+        f.fail_call = 0;
+        REQUIRE((operation == 3 ? follow_cursor(&s, index, &src, width * 90u + 2u)
+                               : resolve(&s, index, &src)) == SCROLL_OK);
+        REQUIRE(s.first_byte == scalar_start(bytes, (size_t)s.first_byte));
+        REQUIRE(s.first_line == scalar_line(bytes, (size_t)s.first_byte) && !s.approximate);
+    }
+    lineidx_destroy(index);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     visual_model(data, size);
+    indexed_errors(data, size);
     difficult_model(data, size);
     core_model(data, size);
     index_model(data, size);

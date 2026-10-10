@@ -4,6 +4,7 @@
 #undef main
 
 #include <stdlib.h>
+#include "../bench/interaction.h"
 
 static int failures = 0;
 static int checks = 0;
@@ -280,6 +281,25 @@ static void test_gate_verdict(void)
     }
 }
 
+static void test_interaction_population(void)
+{
+    size_t n = 17;
+    CHECK(bench_interaction_samples("10000", &n) == 0 && n == BENCH_INTERACTION_MIN_N);
+    CHECK(bench_interaction_samples("20000", &n) == 0 && n == 20000);
+    const char *invalid[] = {"0", "3", "64", "9999", "-10000", "+10000", "10000x", "", "999999999999999999999999999999"};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        n = 17;
+        CHECK(bench_interaction_samples(invalid[i], &n) != 0 && n == 17);
+    }
+    uint64_t values[BENCH_INTERACTION_MIN_N];
+    bench_samples population;
+    bench_samples_init(&population, values, BENCH_INTERACTION_MIN_N);
+    for (size_t i = 1; i < BENCH_INTERACTION_MIN_N; i++) CHECK(bench_add(&population, 1) == 0);
+    CHECK(bench_judge(&population, 100, 100, BENCH_INTERACTION_MIN_N) == BENCH_REFUSED);
+    CHECK(bench_add(&population, 1) == 0);
+    CHECK(bench_judge(&population, 100, 100, BENCH_INTERACTION_MIN_N) == BENCH_PASS);
+}
+
 static void test_editor_bench_honesty(void)
 {
     stamp tag = power_stamp();
@@ -414,6 +434,7 @@ int main(void)
     test_active_frame_samples();
     test_structural_counts();
     test_gate_verdict();
+    test_interaction_population();
     test_percentiles_small();
     test_counterexample();
     test_empty_and_overflow();
