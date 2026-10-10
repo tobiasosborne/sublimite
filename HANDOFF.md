@@ -1,61 +1,42 @@
-# HANDOFF — sublimité, session 7 wound down (updated 2026-10-09 21:35)
+# HANDOFF — sublimité, session 8 wound down (updated 2026-10-10 15:35)
 
-Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task` and `bd ready -n 40`. Session details: `docs/worklog/2026-10-09.md` (sessions 4, 5 and the crash recovery), `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
+Read: this → `CLAUDE.md` → `PLAN.md` §1 and §5 → `bd ready --type task` and `bd ready -n 40`. Session details: `docs/worklog/2026-10-10.md` (session 8), `docs/worklog/2026-10-09.md` (sessions 4–7), `docs/worklog/2026-10-08.md` (sessions 2, 3). Session 1's long handoff is in git history (commit 20e9887); its §2 settled decisions still bind.
 
 ## Method (session 4–5, keep)
 **Public repo (17:15, 2026-10-09):** https://github.com/tobiasosborne/sublimite (AGPL-3.0-or-later), remote `origin`, main tracks origin/main. `git push origin main` after each coordinator status check-in and at session end (not per bead; the beads pre-push hook runs). Only main goes up; `wt/*` stay local. Nothing in the tree may contain secrets or private data (worker reports and decision docs are public). `bd` stays local: no federation/sync daemon.
 Every worker gets its own git worktree `.wt/<bead>` on branch `wt/<bead>` (`.wt/` is in `.git/info/exclude`), created from main. The coordinator verifies there (`make check`, **`make all`** (release test builds catch gcc-only warnings), the module bench), commits on the branch and cherry-picks onto main. Workers never run git. **Display: nothing opens a window on :0** (P0.2c guard, 6a39d6d; Xvfb :99 must be running; binding until ~16:30 on 2026-10-09 and a good default after). Codex launch line: `env DISPLAY=:99 EDIT_DISPLAY=:99 timeout 5400 codex exec -m gpt-6.1-sol -c model_reasoning_effort=<high|xhigh> --approve-for-me --skip-git-repo-check -C .wt/<bead> -o docs/worker-reports/<bead>.md "<brief>"`.
 
-## Session 7 state (2026-10-09 21:30; read first, then the session 6 table below)
-Short evening session (Tobias had 15 min; Fable as consultant did the coordinator's restoration work itself). **Repo moved** from `~/Projects/editor` to `~/Projects/sublimite`: every `.wt/<bead>` worktree registration was repaired by hand (`git worktree repair` alone did not fix it: both `.wt/<b>/.git` and `.git/worktrees/<b>/gitdir` still pointed at the old path). Xvfb :99 restarted; `/tmp/edit-corpus` was gone and was regenerated (2.4 GB; disk 95 %, no `--huge`). Main 13e5b12 re-verified: `make all` 0, `make check` 0 (4m51 wall, ASan/UBSan with leaks on). Quota 21:08: Claude 5-hour 0 %, Weekly 42.0 % (+0.3 % ahead of pace), Fable 39.0 %.
+## Session 8 state (2026-10-10 15:35; read first)
+Fable as coordinator, ~75 min, Tobias: "go wide, use codex hard, claude up to pace". Machine had rebooted: Xvfb :99 restarted, corpus regenerated (`mkcorpus` + `truncate -s 10G sparse_10g.bin` + a 1 GiB 'a' stream for `all_a_1g.txt`), disk 95 %. Wave: 11 Codex sol high continuations (`timeout 2700`, 40-min budget, mandatory report at minute 30), the P4-modules-2 review (xhigh, read-only), 2 Sonnet workers. **Eleven beads landed on main and pushed** (each verified in its worktree with `make all` 0 and `make check` 0 with leaks on): 457.16 P4.I wiring (1c47575, unblocked five beads), e6x.27, 4w1.47, 457.19, 4w1.54, zzj.8 (experiment code; bead stays open), e6x.28, e6x.26, 4w1.43, 4w1.58, 4w1.59 — see the worklog table for commits and caveats. **P4.I is landed: the M1 modules are wired into the loop.**
 
-**All WIP branches rebased onto main** (each was one squashed WIP commit; ten rebased clean; 457.16 had three conflicts, resolved: `src/editor/open.c` keeps main's `aligned_alloc`+`memset` and adds the WIP's `poll_fd = -1; drag_tab = SIZE_MAX` init plus its epoll/unistd includes; `src/editor/STATUS.md` took the WIP version; `src/layout/STATUS.md` is the union). 457.16 after rebase: `make all` 0, `make check` has exactly one red (`editor_p4_test` tabs_script(raster): `editor_add_buffer("/tmp/edit-457.16-new.c")` fails, null backend passes). `wt/edit-457.16-snap` is now redundant (delete after 457.16 lands). zzj.13 and zzj.15 were NOT rebased (they sit on the snapshot; rebase them onto 457.16's landed state).
+**Not landed (WIP on `wt/*`, nothing lives only in a working tree):**
+- **edit-457.10 large-file path** (Sonnet, green on base 81db552, wt/edit-457.10 8ed7b61): written against the single-buffer editor; P4.I made it multi-buffer (`editor_buffer`, `e->buffers[i]`). Needs a Codex port of `src/editor/large.c` onto `editor_buffer`, then land. Its findings are filed: **edit-czn (P1)** G1 typing row at 0.9 × lines on log_1g already fails on unmodified HEAD (each edit keeps layout busy 1–30 s), edit-9yd gutter marks estimated numbers.
+- **edit-4w1.56 work foreground lane**: Codex run green on 81db552, but the squash 980fb75 conflicts with 4w1.47 (lineidx.c, 7 hunks) and P4.I (editor.c/open.c). A Codex resolver ran at 15:04 in the mid-rebase worktree → see "Wind-down" below for the outcome.
+- **edit-zzj.15 EGL default**: first run green without LSan; the leaks-on check found 2.2 MB leaked from `init_worker` (open.c:15, EGL attempt on the fallback path) + editor_test:373/395. Fixer ran at 15:00 → see "Wind-down".
+- **edit-zzj.13 editor review fixes**: 25-min slice after the rebase onto P4.I; finding 14 withdrawn; "a separate inherited failure is preserved" (read its report). Verified at wind-down → see "Wind-down".
+- **P4-modules-2 review landed**: `docs/reviews/P4-modules-2.md` (Codex xhigh, 55 min, read-only, reviewed through e9ce63a): 39 findings, 1 BLOCKER (savectl reload installs torn bytes when an external writer restores mtime), 36 MAJOR, 2 MINOR. Filed as four beads: **edit-mdv (P1)** savectl §1, 9-20; edit-ovu scroll §2-8; edit-lez findui §21-30; edit-yqu bench/test/fuzz honesty §31-39.
 
-**Ten Codex sol high workers launched 21:23, detached (`setsid nohup`, `timeout 9000`), reports to `docs/worker-reports/<bead>-s7.md`, logs in the session scratchpad:** 457.16 finisher (verify WIP, fix the one red, acceptance through the loop, docs/decisions/P4.I.md, no new scope); continuations 4w1.54, 457.19, 4w1.43, 4w1.47, e6x.26, e6x.28, 4w1.56, 4w1.58, 4w1.59. Plus the **P4-modules-2 read-only review rerun** (xhigh, on main, → docs/reviews/P4-modules-2.md). Briefs: bead description + review doc pointer + CLAUDE.md rules + red/green + make all/check/fuzz. Not relaunched: zzj.8 (rebased, needs collect/verify, no worker), zzj.13/zzj.15 (wait for 457.16).
+**New beads this session:** edit-5ih P6.4b user font selection (Tobias likes Iosevka; DejaVu stays default; blocked on P6.4), edit-czn (above), edit-9yd (above), **edit-2vs (P1)** raster `fence_job_fn` use-after-free seen once in file_kill_test under ASan (intermittent; freed by `file_test_queued_save_child`).
 
-**Wind-down 21:31 (Tobias had to go):** all eleven Codex processes killed after ~8 min of work; no report and no review output was written (P4-modules-2 lost again: rerun). Every dirty worktree WIP-committed on its `wt/*` branch ("WIP s7 (wind-down 21:31)"): 457.16 e30e834 (5 paths, was patching the tabs_script fixture), 457.19 a11878f, 4w1.43 ff5573b, 4w1.47 c208ce7, 4w1.54 1f8f4d4, 4w1.56 c6a5da4, 4w1.58 e7d8a52, e6x.26 2829889, e6x.28 7e44734; 4w1.59, zzj.8, zzj.13, zzj.15 unchanged. All `wt/*` branches are now on main 13e5b12 except zzj.13/zzj.15 (snapshot). Briefs used are reproducible from the bead descriptions + the review doc each bead names; relaunch with the same launch line (the `-s7` report names are free).
+**Process lessons (binding for the next wave):**
+1. `codex exec -o <path>` writes the model's FINAL MESSAGE to `<path>` at exit and **clobbers a report the worker wrote there earlier**. Use `-o docs/worker-reports/<bead>-s<n>-final.md` and tell the worker to write `docs/worker-reports/<bead>-s<n>.md`. This session's reports were recovered from the captured stdout transcripts (`recover_report.py` in the session scratchpad; recovered files carry some `+`-prefixed patch noise); e6x.26's handwritten report was only partially recoverable.
+2. Land in dependency order and **rebase each remaining WIP branch immediately after every landing** that touches its files; two branches (457.10, 4w1.56) went from clean to semantic conflicts within the session because P4.I and 4w1.47 landed under them.
+3. Workers add a "worker addendum" to HANDOFF.md and a `docs/worklog/<date>.md` of their own: the land script discards both (`git checkout HANDOFF.md; rm docs/worklog/<today>.md`) before squashing. Tell workers not to touch either.
+4. Close a bead only after the land script prints `LANDED` (two beads were closed before a rebase conflict surfaced and had to be reopened).
+5. Workers cannot run LeakSanitizer; two of twelve worktrees that were "green" for the worker failed the leaks-on check. Keep the coordinator rerun.
 
-**Next coordinator:** (1) Xvfb :99, `make all && make check` on main, `quota`; relaunch the ten workers + the P4-modules-2 review (nothing is running); (2) for each finished worktree: `make all`, `make check` with leaks on, module bench if the hot path moved, then squash on the merge-base, cherry-pick to main; land 457.16 first; (3) rebase zzj.13/zzj.15 onto main after that and relaunch; (4) file beads from P4-modules-2; (5) push main.
-
-## Session 6 wind-down state (2026-10-09 17:40; superseded where the session 7 block says so)
-Session 6 coordinator (Opus) 12:28–17:45, stopped by Tobias at 17:30. Main is green at the last verified point (17:20: make all, make check with leaks on, 48 test binaries, make fuzz) and pushed. **M0 is on main** (editor loop + `sublimite` binary + first human drive on :0); the M1 standalone modules (tabs, indent, minimap, ipc, keys, savectl, findui, scroll) are on main, their wiring (edit-457.16) is not. Every live worker was killed at 17:37 and every dirty worktree WIP-committed on its `wt/*` branch ("WIP s6 (wind-down 17:40)"); nothing lives only in a working tree. Codex launch line now uses `timeout 9000` (5400 killed long xhigh runs mid-work).
-
-**Before anything:** Xvfb :99 (`Xvfb :99 -screen 0 2880x1800x24 -nolisten tcp -noreset`) if gone; `/tmp/edit-corpus` survives unless the machine rebooted (`./build/tools/mkcorpus`, never `--huge`).
-
-Prep rule for every branch (learned today): squash on the merge-base (`git reset --soft $(git merge-base main HEAD)`), `git rebase main` and LOOK for CONFLICT; never `reset --soft main`; never amend while a rebase is in progress; remove `docs/worker-reports/<bead>-s6.md` from main's working tree before cherry-picking a commit that adds it; never commit a bench that needs uncommitted variants/.
-
-| Bead | Branch (last commit) | State | Next action |
-|---|---|---|---|
-| edit-457.16 P4.I wiring (chokepoint) | wt/edit-457.16 (301a7d1 WIP) | substantively done per its rollout (suites green, 0 allocs over 10k keys with 100 tabs + IPC); killed while polishing; no report | rebase (known conflict src/editor/open.c, resolved in wt/edit-457.16-snap 90919f7), verify, Codex high finisher "verify, fix red, write report, no new scope", land |
-| edit-zzj.13 editor review fixes (+P1.9-2 §2/3/5, WM_DELETE_WINDOW → exit within a frame) | wt/edit-zzj.13 (1efc6e1 WIP, on the 457.16 snapshot) | started 17:25, early | continue after 457.16 lands |
-| edit-zzj.15 EGL default backend, raster fallback | wt/edit-zzj.15 (19b4672 WIP, on the snapshot) | started 17:25, early | continue after 457.16 |
-| edit-4w1.54 journal re-review fixes | wt/edit-4w1.54 (e251eba WIP) | ~1 h in | continue |
-| edit-4w1.47 lineidx UI slices | wt/edit-4w1.47 (03688a4 WIP) | ~45 min in | continue |
-| edit-4w1.43 file keep/check/save semantics | wt/edit-4w1.43 (57b42ad WIP) | ~15 min in | continue |
-| edit-457.19 font review fixes | wt/edit-457.19 (543bbe7 WIP) | ~45 min in | continue |
-| edit-e6x.26 GL review fixes | wt/edit-e6x.26 (e8bcd57 WIP) | ~30 min in | continue |
-| edit-e6x.28 G2c tools vs real Present clock (P3) | wt/edit-e6x.28 (883143a WIP) | ~30 min in | continue |
-| edit-zzj.8 prewake experiment | wt/edit-zzj.8 (bb45fe0 WIP) | ~2 h, no report | collect/verify, decide on a real-display run |
-| edit-4w1.56 work foreground lane / edit-4w1.58 find+findui P1-1 / edit-4w1.59 piece reclamation lock | wt/edit-4w1.{56,58,59} (WIP) | started 17:26, early | continue |
-| review P4-modules-2 (scroll/savectl/findui) | read-only | see worklog (killed at 17:40 if unwritten: output lost) | rerun if lost |
-| edit-457.15 zygote | main (29db433, harness eb0c614) | needs the real-display run | next real-display batch |
-
-Held for Claude quota (weekly +1.2 % ahead at 17:07): edit-e6x.27 GL bench honesty (Sonnet). Blocked behind 457.16: zzj.12 (raster G11), zzj.13, zzj.14, zzj.15, 457.8 (hot exit), zzj.16. Other open: 4w1.55 (after 4w1.43), 4w1.57 (after 4w1.47), 457.20 wordmark (deferred behind P5.1b), e6x.17 (deferred).
-
-**Cancelled real-display batch** (not yet announced): zygote run (`tools/zygote_bench.sh --real-display`, docs/decisions/P4.14.md "P4.14b harness"), G2c pairs (after e6x.28), prewake (zzj.8) if needed. Real-display rules: one announcement per batch via the consultant; mute Cinnamon notifications with a restoring trap; put windows on eDP-1 (internal 2880x1800 @ 90 Hz; HDMI-1 1920x1080 @ 60 Hz may be connected); record xrandr.
+**Next coordinator:** (1) Xvfb :99, `make all && make check` on main, `quota`; (2) finish/land 4w1.56, zzj.15, zzj.13 per the wind-down notes; (3) Codex port of 457.10 onto `editor_buffer`, land; (4) edit-mdv (savectl BLOCKER) early; (5) edit-czn before any G1 claim; (6) then the HANDOFF "Next" list below from item 4 (EGL real-display check, M0 bench edit-zzj.5, M1 beads toward P5.1b); (7) file the inherited P4.I contract gaps from docs/worker-reports/edit-457.16-s8.md (IPC wait-token sweep, minimap cached publication, indent LIMIT no-mutation for selections) as beads.
 
 ## Needs Tobias
 - **edit-w34.4 P5.1b Astra vs Sublime comparison gate (M1→M2)**: every P6 bead, P5.2 and P5.3 depend on it; its verdict's blockers are Tobias's call (waive or fix).
 - Law-2 scope (from P2.5): libxcb mallocs per reply/event; tests assert 0 allocations input → submit only (P2.0 addendum). Confirm that is the law.
 - Decided today (no action): hot exit option (b) (edit-4w1.53 implements it), GL = EGL, third global (file SIGBUS service), name sublimité (lower case), title face provisional (wordmark bead edit-457.20 deferred behind P5.1b), evdev T0 / input group deferred (edit-e6x.17).
 
-## Next (in order)
-1. Xvfb :99; `make all && make check` on main.
-2. edit-457.16: verify the WIP as is, finisher, land (unblocks five beads).
-3. Rebase + relaunch the WIP continuations above (Codex sol, `timeout 9000`); zzj.13 and zzj.15 onto 457.16's landed state.
-4. Land zzj.15 (EGL default), then a real-display check of the editor on EGL (announce).
-5. M0 bench edit-zzj.5 (needs the scroll wiring), then M1 beads (457.8 hot exit, 457.10 large files, 457.12 M1 bench) toward the P5.1b gate.
-6. Push main after each status check-in and at session end.
+## Next (in order; after the session 8 items above)
+1. Land zzj.15 (EGL default), then a real-display check of the editor on EGL (announce; Present/MSC lanes of e6x.26 and the G2c pairs of e6x.28 run there too).
+2. M0 bench edit-zzj.5 (scroll wiring is in via P4.I), then M1 beads (457.8 hot exit, 457.10 large files, 457.12 M1 bench) toward the P5.1b gate.
+3. Real-display batch: zygote run (`tools/zygote_bench.sh --real-display`), G2c pairs, prewake variants (docs/decisions/edit-zzj.8.md DRAFT has the command line and trial plan).
+4. Push main after each status check-in and at session end.
 
 ## Binding rules added 2026-10-08 evening (PLAN §1.1, §5.6–5.7, CLAUDE.md laws 10–11)
 1. **Pace ceiling.** Run `quota` before every dispatch wave and before any single new Claude worker. If any Claude row (5-hour session, Weekly, Fable weekly) shows PACE more than `+2.0% ahead`, spawn no new Claude workers until it is back under; route work to Codex. Paste the `quota` lines you act on into the worklog. Respect the 5-hour TODAY column (a 12-worker Haiku/Sonnet wave ≈ 1M tokens).
