@@ -3,7 +3,7 @@
 typedef struct count_arguments {
     const char *path;
     size_t samples;
-    bool track, word_pair;
+    bool track, word_pair, guard;
 } count_arguments;
 static int count_worker(void *argument)
 {
@@ -30,10 +30,21 @@ static int count_worker(void *argument)
     bench_samples times[2];
     for (unsigned variant=0;variant<variants;variant++)
         bench_samples_init(&times[variant],values + variant * args->samples,args->samples);
-    /* Qualified repeated requests use warm 64KiB mappings. Each sample
-     * completes a real asynchronous search and checks its ranges, including
-     * the plain/whole-word pair; this is not the full-1GB throughput gate. */
-    length=65536u;
+    /* A word-pair fixture is file-backed too: prepare it once, then take a
+     * fresh mapping for every full-source request. Faults stay in the timer. */
+    if (args->word_pair) {
+        char pattern_path[]="build/edit-findui-word-XXXXXX";
+        int pattern=mkstemp(pattern_path);
+        if (pattern<0 || ftruncate(pattern,(off_t)length)) _exit(2);
+        (void)unlink(pattern_path);
+        uint8_t *prepared=mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_SHARED,pattern,0);
+        if (prepared==MAP_FAILED) _exit(2);
+        for (size_t i=0;i<length;i++) prepared[i]=i%2 ? (uint8_t)' ' : (uint8_t)'a';
+        if (msync(prepared,length,MS_SYNC) || munmap(prepared,length)) _exit(2);
+        (void)close(fd); fd=pattern;
+    }
+    if (args->guard) length=65536u;
+    printf("WORKLOAD findui bytes=%zu mapping=NEW samples=%zu kind=%s (G)\n",length,args->samples,args->guard ? "regression" : "G6_full_source");
     for (size_t sample=0;sample<args->samples;sample++) {
       for (unsigned variant=0;variant<(args->word_pair ? 2u : 1u);variant++) {
         edit_arena arena;
@@ -49,14 +60,8 @@ static int count_worker(void *argument)
         uint64_t window_start=windows[sample%3][0], window_end=windows[sample%3][1];
         if (findui_init(&panel,&config)!=FINDUI_OK) _exit(2);
         uint64_t start=bench_now_ns(), deadline=start+UINT64_C(30000000000);
-        void *mapping=args->word_pair ? mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0)
-                                     : mmap(NULL,length,PROT_READ,MAP_PRIVATE,fd,0);
+        void *mapping=mmap(NULL,length,PROT_READ,MAP_PRIVATE,fd,0);
         if (mapping==MAP_FAILED) _exit(2);
-        if (args->word_pair) {
-            uint8_t *bytes=mapping;
-            for (size_t i=0;i<length;i++) bytes[i]=i%2 ? (uint8_t)' ' : (uint8_t)'a';
-            start=bench_now_ns(); deadline=start+UINT64_C(30000000000);
-        }
         if (piece_init_mapped(tree,mapping,length,NULL)) _exit(2);
         piece_snapshot *snapshot=piece_snapshot_take(tree);
         if (!snapshot) _exit(2);
@@ -100,13 +105,14 @@ static int count_worker(void *argument)
     char power[64]; bench_battery_status(power,sizeof power);
     int rc=0;
     for (unsigned variant=0;variant<(args->word_pair ? 2u : 1u);variant++) {
-        int verdict=bench_gate_report(args->word_pair ? (variant ? "G6_findui_word_a_space_64KiB" : "G6_findui_plain_a_space_64KiB")
-                                                     : "G6_findui_dense_a_64KiB",
-                                      &times[variant],UINT64_C(80000000),UINT64_C(125000000),
+        int verdict=bench_gate_report(args->guard ? "findui_count_64KiB_regression" : args->word_pair ? (variant ? "G6_findui_word_a_space_1GiB_new_mapping" : "G6_findui_plain_a_space_1GiB_new_mapping")
+                                                     : "G6_findui_dense_a_1GiB_new_mapping",
+                                      &times[variant],args->guard ? UINT64_C(10000000) : UINT64_C(80000000),
+                                      args->guard ? UINT64_C(20000000) : UINT64_C(125000000),
                                       BENCH_INTERACTION_MIN_N,args->track,power,"-");
         if (verdict) rc=verdict;
     }
-    printf("findui_count: exact 64KiB total/first 4096 checked; initial/late/empty windows; mapping=NEW; (M)%s\n",bench__tag_from_power(power));
+    printf("findui_count: exact %zu-byte total/first 4096 checked; initial/late/empty windows; mapping=NEW; (M)%s\n",length,bench__tag_from_power(power));
     free(values);
-    return rc;
+    return args->samples<BENCH_INTERACTION_MIN_N ? 3 : rc;
 }

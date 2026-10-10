@@ -335,7 +335,8 @@ static void real_mapped_fault(const uint8_t *data, const char *path, work_pool *
 }
 static void multichunk_reload(const uint8_t *data, size_t size, const char *path, work_pool *pool)
 {
-    size_t chunks = 3u + (size > 1 ? data[1] % 6u : 0u), length = chunks * FILE_PREFIX_MAX;
+    size_t chunks = (data[0] & 0x10u) ? 5u + (size > 1 ? data[1] % 4u : 0u) : 3u + (size > 1 ? data[1] % 6u : 0u);
+    size_t length = chunks * FILE_PREFIX_MAX;
     uint8_t *block = malloc(FILE_PREFIX_MAX); REQUIRE(block); memset(block, 'a', FILE_PREFIX_MAX);
     int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0600); REQUIRE(fd >= 0);
     for (size_t i = 0; i < chunks; i++) REQUIRE(write(fd, block, FILE_PREFIX_MAX) == FILE_PREFIX_MAX);
@@ -356,21 +357,69 @@ static void multichunk_reload(const uint8_t *data, size_t size, const char *path
         if (got > 0) break;
         REQUIRE(got < 0 && (errno == EAGAIN || errno == EINTR)); (void)sched_yield();
     }
-    memset(block, 'b', FILE_PREFIX_MAX);
-    struct timespec times[2] = {st.st_atim, st.st_mtim};
-    for (size_t i = 0; i < chunks; i++) {
-        size_t chunk = (data[0] & 0x80u) ? chunks - i - 1u : i;
-        REQUIRE(pwrite(fd, block, FILE_PREFIX_MAX, (off_t)(chunk * FILE_PREFIX_MAX)) == FILE_PREFIX_MAX);
-        REQUIRE(futimens(fd, times) == 0); /* restored mtime after every chunk */
-        if (data[0] & 0x40u) (void)sched_yield();
+    /* Deterministic coherent >4MiB acquisition: no rewrite race. */
+    if (!(data[0] & 0x10u)) {
+        memset(block, 'b', FILE_PREFIX_MAX);
+        struct timespec times[2] = {st.st_atim, st.st_mtim};
+        /* The restored-mtime rewrite is only detectable through ctime, and
+         * ctime comes from the kernel's coarse (jiffy) clock. Creating the
+         * file and rewriting it inside one tick leaves ctime identical, so
+         * the rewrite is then genuinely undetectable (BASE v2 and file_id
+         * both compare ctime). Wait for the coarse clock to pass the
+         * captured ctime so every rewrite below moves it. */
+        for (unsigned spin = 0;; spin++) {
+            struct timespec now; REQUIRE(clock_gettime(CLOCK_REALTIME_COARSE, &now) == 0);
+            if (now.tv_sec > st.st_ctim.tv_sec || (now.tv_sec == st.st_ctim.tv_sec && now.tv_nsec > st.st_ctim.tv_nsec)) break;
+            REQUIRE(spin < 10000000u); (void)sched_yield();
+        }
+        for (size_t i = 0; i < chunks; i++) {
+            size_t chunk = (data[0] & 0x80u) ? chunks - i - 1u : i;
+            REQUIRE(pwrite(fd, block, FILE_PREFIX_MAX, (off_t)(chunk * FILE_PREFIX_MAX)) == FILE_PREFIX_MAX);
+            REQUIRE(futimens(fd, times) == 0); /* restored mtime after every chunk */
+            if (data[0] & 0x40u) (void)sched_yield();
+        }
+        REQUIRE(fstat(fd, &st) == 0 && st.st_size == (off_t)length);
+        REQUIRE(st.st_mtim.tv_sec == times[1].tv_sec && st.st_mtim.tv_nsec == times[1].tv_nsec);
     }
-    REQUIRE(fstat(fd, &st) == 0 && st.st_size == (off_t)length);
-    REQUIRE(st.st_mtim.tv_sec == times[1].tv_sec && st.st_mtim.tv_nsec == times[1].tv_nsec);
     settle(s, pool); savectl_model result = savectl_get_model(s);
     if (result.file_error) REQUIRE(result.file_error == FILE_ERR_CHANGED && result.modified && result.banner);
     else {
         piece_tree *replacement = NULL; savectl_view view;
-        REQUIRE(savectl_take_reload(s, &replacement, &view) == SAVECTL_OK && replacement);
+        view = (savectl_view){UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+        int code = SAVECTL_BUSY; unsigned slices = 0;
+        do {
+            code = savectl_take_reload(s, &replacement, &view);
+            if (code == SAVECTL_BUSY) {
+                REQUIRE(!replacement && view.cursor == UINT64_MAX && view.anchor == UINT64_MAX &&
+                        view.scroll_byte == UINT64_MAX && view.scroll_x == UINT64_MAX);
+                /* The owner services events between bounded installation slices. */
+                (void)work_mailbox_drain_bounded(pool, route, s, 1, 0); savectl_tick(s);
+                REQUIRE(++slices < 1024);
+                unsigned action=size>2 ? data[2]%4u : 0u;
+                if (slices==1 && action) {
+                    piece_tree *live=NULL;
+                    if (action==1) {
+                        live=piece_create(&allocator);
+                        REQUIRE(live && piece_init_copy(live,(const uint8_t *)"old",3)==PIECE_OK);
+                        REQUIRE(piece_insert(live,3,(const uint8_t *)"x",1)==PIECE_OK);
+                        savectl_modified(s);
+                    } else if (action==2) savectl_file_event(s);
+                    else savectl_close_begin(s);
+                    /* A newer edit/event/close invalidates the staged generation.
+                     * Never adopt it or change either output on BUSY. */
+                    REQUIRE(savectl_take_reload(s,&replacement,&view)==SAVECTL_BUSY);
+                    REQUIRE(!replacement && view.cursor==UINT64_MAX && view.anchor==UINT64_MAX &&
+                            view.scroll_byte==UINT64_MAX && view.scroll_x==UINT64_MAX);
+                    if (live) {
+                        uint8_t current[4]; REQUIRE(piece_read(live,0,current,4)==PIECE_OK && !memcmp(current,"oldx",4));
+                        REQUIRE(savectl_get_model(s).modified); piece_destroy(live);
+                    }
+                    goto reload_end;
+                }
+            }
+        } while (code == SAVECTL_BUSY);
+        REQUIRE(code == SAVECTL_OK && replacement);
+        if ((data[0] & 0x10u) && length > 4u * FILE_PREFIX_MAX) REQUIRE(slices > 0);
         uint8_t first; REQUIRE(piece_read(replacement, 0, &first, 1) == PIECE_OK);
         REQUIRE(first == 'a' || first == 'b');
         for (size_t off = 0; off < length; off += FILE_PREFIX_MAX) {
@@ -379,7 +428,8 @@ static void multichunk_reload(const uint8_t *data, size_t size, const char *path
         }
         piece_destroy(replacement);
     }
-    while (savectl_destroy(s) == SAVECTL_BUSY) { savectl_tick(s); (void)sched_yield(); }
+reload_end:
+    while (savectl_destroy(s) == SAVECTL_BUSY) { (void)work_mailbox_drain(pool,route,s); savectl_tick(s); (void)sched_yield(); }
     REQUIRE(close(fd) == 0 && close(events) == 0); free(block);
 }
 typedef struct reuse_hold { _Atomic bool entered, released; } reuse_hold;
@@ -418,15 +468,17 @@ static void reused_slots(const uint8_t *data, const char *path, work_pool *pool)
         while (!atomic_load(&hold.entered)) (void)sched_yield();
         savectl_close_begin(s);
         int code = savectl_destroy(s);
-        /* Known #12: destroy currently waits on unrelated slot reuse. Unit
-         * regression requires immediate OK; fuzz allows this exact BUSY until
-         * the owning module fixes the epoch check. */
-        REQUIRE(code == SAVECTL_OK || code == SAVECTL_BUSY);
+#ifdef SAVECTL_FUZZ_NEGATIVE_OLD_EPOCH
+        code = SAVECTL_BUSY; /* controlled old physical-slot verdict */
+#endif
+        /* A retired controller does not own the new physical slot epoch.
+         * Require destruction while unrelated reused work is still held. */
+        REQUIRE(code == SAVECTL_OK);
         for (size_t i = 0; i < submitted; i++) if ((data[0] + i) & 1u) work_cancel(pool, handles[i]);
         atomic_store(&hold.released, true);
         for (size_t i = 0; i < submitted; i++)
             while (atomic_load(&pool->slots[handles[i].slot].busy)) (void)sched_yield();
-        if (code == SAVECTL_BUSY) REQUIRE(savectl_destroy(s) == SAVECTL_OK);
+
         REQUIRE(file_id_stat_path(path, &options.baseline) == FILE_OK);
     }
     piece_destroy(tree);

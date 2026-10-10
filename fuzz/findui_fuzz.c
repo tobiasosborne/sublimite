@@ -360,10 +360,9 @@ static void capacity_and_lifecycle(const uint8_t *data, size_t size)
     }
     work_pool_shutdown(pool); piece_destroy(tree); edit_arena_free(&arena);
 }
-/* Default folded literals must not disappear from capacity coverage. The
- * known regex-limit defect is preserved as an opt-in expected-behavior unit
- * regression; accept ONLY that exact current error or the correct scalar
- * result here, so other errors/wrong counts still fail fuzzing. */
+/* Default folded literals use the full literal capacity, independently checked
+ * against two scalar ASCII-folded matches. The macro injects the historical
+ * bad result for a controlled negative run; ordinary fuzzing must reject it. */
 static void default_long_query(const uint8_t *data, size_t size)
 {
     if (!size || !(data[0] & 0x40u)) return;
@@ -386,8 +385,11 @@ static void default_long_query(const uint8_t *data, size_t size)
     MUST(findui_set_query(&panel, query_bytes, qn) == FINDUI_OK); wait_result(&panel, pool);
     findui_state state = findui_get_state(&panel);
     MUST(!state.options.match_case && !state.options.regex);
-    if (state.complete) MUST(state.match_count == 2 && state.selected.start == 0 && state.selected.end == qn);
-    else MUST(state.search_error == FIND_ERR_LIMIT && state.match_count == 0);
+#ifdef FINDUI_FUZZ_NEGATIVE_OLD_LIMIT
+    state.complete = false; state.search_error = FIND_ERR_LIMIT; state.match_count = 0;
+#endif
+    MUST(state.complete && state.search_error == FIND_OK && state.match_count == 2 &&
+         state.selected.start == 0 && state.selected.end == qn);
     while (findui_dispose(&panel) == FINDUI_MORE) pause_worker();
     work_pool_shutdown(pool); piece_destroy(tree); edit_arena_free(&arena);
 }

@@ -319,7 +319,7 @@ static int run_slice(scroll_state *s, scroll_resolver *r, lineidx *index,
         (following && (cursor > source->len || s->request != SCROLL_READY))) return SCROLL_ERR_ARG;
     if (!r->active || r->following != following || r->cursor != cursor || r->index != index ||
         r->source.ctx != source->ctx || r->source.span != source->span || r->source.len != source->len ||
-        memcmp(&r->before, s, sizeof *s)) {
+        (r->before.config.rows != s->config.rows || r->before.config.row_height != s->config.row_height || r->before.config.margin != s->config.margin || r->before.extent.bytes != s->extent.bytes || r->before.extent.lines != s->extent.lines || r->before.extent.exact != s->extent.exact || r->before.first_line != s->first_line || r->before.first_byte != s->first_byte || r->before.subrow_q8 != s->subrow_q8 || r->before.anchor_line != s->anchor_line || r->before.target_byte != s->target_byte || r->before.pending_rows != s->pending_rows || r->before.request != s->request || r->before.approximate != s->approximate || r->before.pending_up != s->pending_up)) {
         memset(r, 0, sizeof *r); r->active = true; r->before = r->next = *s;
         r->index = index; r->source = *source; r->cursor = cursor; r->following = following;
     }

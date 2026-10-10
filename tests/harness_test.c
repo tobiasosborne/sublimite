@@ -11,6 +11,8 @@
 
 #include <stdlib.h>
 #include "../bench/interaction.h"
+#include "scroll/scroll.h"
+#include "../bench/savectl_deadline.h"
 
 static int failures = 0;
 static int checks = 0;
@@ -522,7 +524,7 @@ static void test_editor_row_populations(void)
         if (dup2(output[1], STDOUT_FILENO) < 0) _exit(2);
         close(output[1]);
         int tabs_rc = tab_row(false, false);
-        int idle_rc = idle_row("null", false, false);
+        int idle_rc = idle_row("null", false, false, false);
         fflush(stdout);
         _exit(tabs_rc < 0 || idle_rc < 0 ? 2 : 0);
     }
@@ -537,7 +539,7 @@ static void test_editor_row_populations(void)
             if (sscanf(line, "BENCH name=%127s n=%zu", name, &n) != 2) continue;
             if (!strcmp(name, "editor_null_100tabs_ingress_T5_G3")) frames = n;
             if (!strcmp(name, "editor_null_100tabs_minimap_inside_frame")) maps = n;
-            if (!strncmp(name, "editor_null_G11_process_cpu", strlen("editor_null_G11_process_cpu")) && n > blinks)
+            if (!strcmp(name, "editor_null_blink_cpu_regression_due_now") && n > blinks)
                 blinks = n;
         }
         fclose(rows);
@@ -550,9 +552,62 @@ static void test_editor_row_populations(void)
     CHECK(blinks >= BENCH_INTERACTION_MIN_N);
 }
 
+/* Refresh equivalent intent from storage with different padding each slice. */
+static size_t padding_span(void *ctx, uint64_t off, const uint8_t **out)
+{
+    const uint8_t *bytes = ctx;
+    if (off >= 4096) return 0;
+    *out = bytes + off; return 1;
+}
+static void test_logical_padding_continuation(void)
+{
+    uint8_t bytes[4096]; memset(bytes, 'x', sizeof bytes); bytes[2047] = '\n';
+    lineidx *index = lineidx_create(sizeof bytes); CHECK(index != NULL);
+    if (!index) return;
+    lineidx_src src = {bytes, sizeof bytes, padding_span, NULL};
+    scroll_state s;
+    CHECK(scroll_init(&s, (scroll_config){1, 17, 0}, (scroll_extent){sizeof bytes, 2, false}) == 0);
+    CHECK(scroll_seek_byte(&s, 2050) == 0);
+    scroll_resolver r = {0}; int rc = SCROLL_MORE;
+    size_t slices = 0;
+    while (rc == SCROLL_MORE && slices < 5000) {
+        /* Only modify padding after extent.exact, never a semantic field. */
+        unsigned char *padding = (unsigned char *)&s.extent + offsetof(scroll_extent, exact) + sizeof s.extent.exact;
+        size_t n = sizeof s.extent - offsetof(scroll_extent, exact) - sizeof s.extent.exact;
+        memset(padding, (slices & 1u) ? 0x55 : 0xaa, n);
+        rc = scroll_resolve_slice(&s, &r, index, &src, 8, bench_now_ns() + UINT64_C(1000000000));
+        slices++;
+    }
+    printf("PROBE logical_padding slices=%zu result=%d first_byte=%" PRIu64 " expected=2048 (G)\n", slices, rc, s.first_byte);
+    CHECK(rc == SCROLL_OK && s.first_byte == 2048 && s.request == SCROLL_READY);
+    lineidx_destroy(index);
+}
+
+/* Controlled lost publication and stuck join: arguments stay alive in the
+ * fixture until its monotonic phase timer or outer supervisor terminates it. */
+static int harness_stuck_wait(void *ctx)
+{
+    bool phase=*(bool *)ctx;
+    if (phase) {
+        timer_t timer;
+        if (savectl_deadline_init(&timer) || savectl_deadline_arm(timer,UINT64_C(10000000))) return 1;
+    }
+    for (;;) (void)nanosleep(&(struct timespec){0,1000000},NULL);
+}
+static void test_fixture_deadlines(void)
+{
+    bool phase=true;
+    CHECK(savectl_fixture_supervise(harness_stuck_wait,&phase,UINT64_C(100000000),"harness phase wait")==2);
+    phase=false;
+    CHECK(savectl_fixture_supervise(harness_stuck_wait,&phase,UINT64_C(100000000),"harness missing retirement")==2);
+    puts("PROBE fixture phase and retirement deadlines preserve structural failure");
+}
+
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    test_fixture_deadlines();
+    test_logical_padding_continuation();
     test_editor_bench_honesty();
     test_active_frame_samples();
     test_structural_counts();

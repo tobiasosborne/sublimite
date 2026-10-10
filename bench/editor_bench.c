@@ -43,71 +43,7 @@ static stamp power_stamp(void)
     printf("STAMP (M)%s BAT0=%s load1=%s shared box\n", s.power, s.status, s.load);
     return s;
 }
-typedef struct key_sample {
-    uint64_t injected, dequeued, submit, t4;
-    uint32_t frame;
-} key_sample;
-typedef struct samples {
-    editor_frame frame;
-    uint64_t ingress, sequence;
-    bool guard, suspended, measuring;
-    size_t allocations;
-    key_sample *keys;
-    size_t count, completed;
-    uint64_t first_sequence;
-    bool invalid;
-} samples;
-static void ingress(void *ctx, uint64_t sequence, uint64_t ns)
-{
-    samples *s = ctx; s->ingress = ns; s->sequence = sequence;
-    if (s->keys) {
-        if (sequence < s->first_sequence || sequence - s->first_sequence >= s->count) s->invalid = true;
-        else {
-            key_sample *k = &s->keys[sequence - s->first_sequence];
-            if (!k->injected || k->dequeued || ns < k->injected) s->invalid = true;
-            k->dequeued = ns;
-        }
-    }
-    if (s->measuring && !s->guard && !s->suspended) { edit_malloc_guard_begin(); s->guard = true; }
-}
-static void submitted(void *ctx, const editor_frame *f)
-{
-    samples *s = ctx;
-    if (!f->last_sequence) return;
-    if (s->guard) { s->allocations += edit_malloc_guard_end(); s->guard = false; }
-    s->frame = *f;
-    if (s->keys) {
-        for (uint64_t seq = f->first_sequence; seq <= f->last_sequence; seq++) {
-            if (seq < s->first_sequence) continue;
-            if (seq - s->first_sequence >= s->count) { s->invalid = true; break; }
-            key_sample *k = &s->keys[seq - s->first_sequence];
-            if (k->submit || !k->dequeued || f->submit_ns < k->dequeued) s->invalid = true;
-            k->submit = f->submit_ns; k->frame = f->id;
-        }
-    }
-}
-static void presented(void *ctx, const editor_frame *f)
-{
-    samples *s = ctx; if (f->last_sequence) s->frame = *f;
-    if (s->keys && f->last_sequence) {
-        for (uint64_t seq = f->first_sequence; seq <= f->last_sequence; seq++) {
-            if (seq < s->first_sequence) continue;
-            if (seq - s->first_sequence >= s->count) { s->invalid = true; break; }
-            key_sample *k = &s->keys[seq - s->first_sequence];
-            if (k->t4 || k->frame != f->id || f->present_ns < k->submit) s->invalid = true;
-            else { k->t4 = f->present_ns; s->completed++; }
-        }
-    }
-}
-static void io_boundary(void *ctx, bool entering)
-{
-    samples *s = ctx;
-    if (entering && s->guard) {
-        s->allocations += edit_malloc_guard_end(); s->guard = false; s->suspended = true;
-    } else if (!entering && s->suspended) {
-        edit_malloc_guard_begin(); s->guard = true; s->suspended = false;
-    }
-}
+#include "editor_accounting.h"
 static bool settled(editor_stats s, const render_backend *b)
 {
     return !s.pending && (!s.render_active || b->presented);
@@ -197,10 +133,6 @@ static editor_config target_a_config(void)
     cfg.max_cols = cfg.cols; cfg.max_rows = cfg.rows;
     return cfg;
 }
-static int row_result(int timing, bool structural, bool track)
-{
-    return structural ? 1 : track ? 0 : timing;
-}
 static int gate_row(const char *name, const bench_samples *s, uint64_t p50, uint64_t p99,
                     bool track, const stamp *tag)
 {
@@ -289,7 +221,7 @@ static int g11_accounting_self_check(void)
     puts("G11 accounting: delayed completion CPU retained through retirement");
     return 0;
 }
-static int idle_row(const char *requested, bool track, bool require_gl)
+static int idle_row(const char *requested, bool track, bool require_gl, bool qualify)
 {
     stamp tag = power_stamp();
     render_backend b = {0}; REQUIRE(row_backend(&b, requested) == 0);
@@ -350,12 +282,36 @@ static int idle_row(const char *requested, bool track, bool require_gl)
         REQUIRE(!window.pending);
     }
     uint64_t switches_end; REQUIRE(g11_scheduling_switches(&switches_end)==0);
-    /* Null CPU-per-blink gets an independent full interaction population.
-     * Advance only this benchmark instance's private deadline to due-now:
-     * the normal poll/blink/caret/submit path still runs once per sample.
-     * Keep the real ten-second window above for wakeup/idle policy;
-     * raster/GL retain their real-cadence CPU sample schedules. */
-    bool synthetic = !strcmp(requested, "null");
+    /* Qualify by repeating complete real-cadence idle sessions. Each blink
+     * still waits EDITOR_BLINK_NS; sample-count policy never advances it to due
+     * now. The optional short guard is explicitly outside G11 certification. */
+    if (qualify) {
+        while (cpu.n<BENCH_INTERACTION_MIN_N) {
+            uint64_t episode=bench_now_ns(), episode_wakes=editor_get_stats(e).poll_returns;
+            e->blinking=true; e->last_input=episode; e->next_blink=episode+EDITOR_BLINK_NS;
+            cpu_marker=process_ns();
+            while (editor_get_stats(e).blinking && cpu.n<BENCH_INTERACTION_MIN_N) {
+                uint64_t before=editor_get_stats(e).blinks;
+                int rc=editor_step(e,-1); REQUIRE(rc==EDITOR_OK || rc==EDITOR_MORE);
+                REQUIRE(settle(e)==0);
+                bool blink=editor_get_stats(e).blinks>before;
+                if (blink) {
+                    raster_metrics metrics;
+                    if (raster_frame_metrics(&b,&metrics)) {
+                        worker_jobs+=metrics.jobs+metrics.completion_jobs;
+                        inline_frames+=metrics.inline_cells!=0;
+                    }
+                }
+                uint64_t cpu_now=process_ns();
+                g11_cpu_turn(&window,&cpu,blink,!b.active,cpu_now-cpu_marker); cpu_marker=cpu_now;
+                REQUIRE(bench_now_ns()-episode<UINT64_C(15000000000));
+            }
+            REQUIRE(editor_get_stats(e).poll_returns-episode_wakes<=20);
+        }
+        REQUIRE(cpu.n==BENCH_INTERACTION_MIN_N && !cpu.dropped && !window.pending);
+    }
+    bool synthetic=!qualify && !strcmp(requested,"null");
+    if (synthetic) printf("G11 real_cadence_cpu verdict=REFUSED n=%zu required_n=%u (G); separate due-now guard follows\n",cpu.n,BENCH_INTERACTION_MIN_N);
     if (synthetic) {
         bench_samples_init(&cpu, values, BENCH_INTERACTION_MIN_N);
         e->blinking = true;
@@ -371,12 +327,11 @@ static int idle_row(const char *requested, bool track, bool require_gl)
         }
         e->blinking = false; e->next_blink = 0;
     }
-    char name[96]; (void)snprintf(name, sizeof name, "editor_%s_G11_process_cpu%s", label,
-                                synthetic ? "_synthetic_due_now" : "");
-    int miss = gate_row(name, &cpu, G11_P50, G11_P99, track, &tag);
+    char name[96]; (void)snprintf(name,sizeof name,synthetic ? "editor_%s_blink_cpu_regression_due_now" : "editor_%s_G11_process_cpu_real_cadence",label);
+    int miss = gate_row(name, &cpu, synthetic ? UINT64_C(1000000) : G11_P50, synthetic ? UINT64_C(2000000) : G11_P99, track, &tag);
     printf("G11_schedule_TRACK %s process_context_switches=%llu (M)%s wakeup trace unavailable; qualifying wakeup gate unmeasured\n",
         label,(unsigned long long)(switches_end-switches_start),tag.power);
-    if (!track) miss=bench_merge_exit(miss,2);
+    if (!track) miss=bench_merge_exit(miss,3);
     /* A bounded observation adds exactly one external test-deadline timeout.
      * Subtract that known timeout, retaining all earlier poll returns. */
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
@@ -479,12 +434,6 @@ static void bulk_stop(bulk_mix *mix)
     if (mix->mapping) (void)munmap((void *)mix->mapping, mix->length);
     if (mix->fd >= 0) close(mix->fd);
     *mix = (bulk_mix){.fd = -1};
-}
-static bool typing_structure(const samples *measured, editor_stats before, editor_stats after, size_t count)
-{
-    return measured->invalid || measured->completed != count || measured->allocations != 0 ||
-        measured->guard || measured->suspended || after.journal_error != 0 ||
-        after.mutations - before.mutations != count || after.journal_records - before.journal_records != count;
 }
 /* Checkpoint regression exercises the actual row diagnostic without a display. */
 static int typing_checkpoint(FILE *out, const char *label, const char *workload,
@@ -761,7 +710,7 @@ static int ipc_row(bool track)
 }
 int main(int argc, char **argv)
 {
-    bool track = false, idle = true, typing = true, p4 = true, ipc_only = false, require_gl = false, partial = false; size_t count = 10000;
+    bool track = false, idle = true, typing = true, p4 = true, ipc_only = false, require_gl = false, partial = false, idle_guard = false; size_t count = 10000;
     uint64_t ingress_delay = 0; unsigned scenarios = 4;
     const char *path = "/tmp/edit-corpus/log_1g.txt";
     for (int i = 1; i < argc; i++) {
@@ -772,6 +721,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--require-gl")) require_gl = true;
         else if (!strcmp(argv[i], "--partial-index")) partial = true;
         else if (!strcmp(argv[i], "--no-idle")) idle = false;
+        else if (!strcmp(argv[i], "--idle-guard")) { idle_guard=true; typing=false; p4=false; }
         else if (!strcmp(argv[i], "--idle-only")) { typing = false; p4 = false; }
         else if (!strcmp(argv[i], "--p4-only")) { typing = false; idle = false; }
         else if (!strcmp(argv[i], "--no-p4")) p4 = false;
@@ -807,7 +757,7 @@ int main(int argc, char **argv)
     if (idle) for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         const char *name = names[i];
         if (override && strcmp(name, "null") && strcmp(name, override)) continue;
-        int rc = idle_row(name, track, require_gl); if (rc < 0) return 1; rows = bench_merge_exit(rows, rc);
+        int rc = idle_row(name, track, require_gl, !idle_guard); if (rc < 0) return 1; rows = bench_merge_exit(rows, rc);
     }
     int f = 0, g = 0, h = 0;
     if (p4) { f = tab_row(false, track); if (f < 0) return 1; g = tab_row(true, track); if (g < 0) return 1; h = ipc_row(track); if (h < 0) return 1; }

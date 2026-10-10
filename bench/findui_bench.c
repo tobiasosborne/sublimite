@@ -138,10 +138,12 @@ static int cancel_worker(void *argument)
 int main(int argc,char **argv)
 {
     if (argc>1 && (strcmp(argv[1],"--count")==0 || strcmp(argv[1],"--word")==0)) {
-        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",BENCH_INTERACTION_MIN_N,false,strcmp(argv[1],"--word")==0};
+        count_arguments args={"/tmp/edit-corpus/all_a_1g.txt",BENCH_INTERACTION_MIN_N,false,strcmp(argv[1],"--word")==0,false};
         for (int i=2;i<argc;i++) {
             if (strcmp(argv[i],"--gate")==0) args.track=false;
             else if (strcmp(argv[i],"--track")==0) args.track=true;
+            else if (strcmp(argv[i],"--guard")==0) args.guard=true;
+            else if (strcmp(argv[i],"--probe")==0) args.samples=1;
             else if (strcmp(argv[i],"--fixture")==0 && i+1<argc) args.path=argv[++i];
             else if (strcmp(argv[i],"--samples")==0 && i+1<argc) {
                 if (bench_interaction_samples(argv[++i], &args.samples)) return 2;
@@ -151,7 +153,7 @@ int main(int argc,char **argv)
         if (!stamp(power,sizeof power,load,sizeof load)) return 2;
         printf("findui_count: (M)%s power=%s load1=%s fixture=%s\n",
                bench_evidence_tag(),power,load,args.path);
-        return find_fixture_supervise(count_worker,&args,UINT64_C(600000000000),
+        return find_fixture_supervise(count_worker,&args,UINT64_C(120000000000)+(uint64_t)args.samples*UINT64_C(120000000000),
                                       "panel count through shutdown");
     }
     cancel_arguments args={argc,argv};
