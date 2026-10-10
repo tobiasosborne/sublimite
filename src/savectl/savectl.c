@@ -10,10 +10,10 @@
 #include <linux/fs.h>
 #include <unistd.h>
 
-/* Epoch is the sole shared mutable controller field. Frozen task input is
- * borrowed by a worker; a separate result lease transfers ownership only via
+/* Epoch and the prepare-return acknowledgement are shared atomic fields.
+ * Frozen task input is borrowed by a worker; a separate result lease transfers ownership only via
  * its generation-validated terminal mailbox message. */
-typedef enum operation { OP_SAVE, OP_FINISH, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD } operation;
+typedef enum operation { OP_SAVE, OP_FINISH, OP_RECOVER_FINISH, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD } operation;
 typedef struct reload_bytes {
     _Atomic size_t refs;
     uint8_t *bytes;
@@ -45,9 +45,10 @@ typedef struct completion {
     result value;
     journal_save token;
     uint32_t generation;
+    bool prepared, handoff_pending;
     bool pending; /* worker-owned until terminal message transfers the lease */
 } completion;
-typedef struct notification { savectl *owner; completion *lease; } notification;
+typedef struct notification { savectl *owner; completion *lease; bool handoff; } notification;
 struct savectl {
     savectl_options options;
     char path[4097];
@@ -63,6 +64,9 @@ struct savectl {
     bool reload_reserved;
     int file_error, journal_error, err_no;
     _Atomic uint64_t epoch;
+    _Atomic bool prepare_returned;
+    bool journal_leased, saving_frame_pending;
+    uint64_t request_id, request_ns, saving_submitted_ns;
     bool received;
     completion *completion;
     work_handle handle;
@@ -71,6 +75,8 @@ struct savectl {
         uint64_t epoch, revision;
         file_id expect;
         piece_snapshot *snapshot;
+        savectl_request request;
+        bool request_mode;
         journal_base previous;
         const journal_record *checkpoint;
         size_t count;
@@ -196,9 +202,14 @@ static void worker(work_ctx *ctx)
     savectl *s=ctx->arg;
     completion *lease=s->completion;
     if (lease->pending) goto publish;
+    if (lease->handoff_pending) goto handoff;
+    if (lease->prepared && !atomic_load_explicit(&s->prepare_returned,memory_order_acquire)) {
+        (void)work_continue(ctx); return;
+    }
     result *r=&lease->value;
-    lease->token=s->task.token;
-    lease->generation=ctx->generation;
+    if (!lease->prepared) {
+        lease->token=s->task.token; lease->generation=ctx->generation;
+    }
     operation op=s->task.op;
     if (op==OP_DISCARD) { *r=(result){0}; bytes_release(s->task.discard); }
     else {
@@ -212,9 +223,17 @@ static void worker(work_ctx *ctx)
             if (r->file_error==FILE_ERR_IO) r->err_no=errno;
         } else if (op==OP_SAVE) {
             r->file_error=validate(s);
-            if (!r->file_error && s->options.journal)
-                r->journal_error=journal_save_prepare(s->options.journal,s->options.buffer_id,
-                    &s->task.previous,s->task.checkpoint,s->task.count,&lease->token);
+            if (!r->file_error && s->options.journal && !lease->prepared) {
+                savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
+                if (s->task.request_mode)
+                    r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
+                if (!r->journal_error)
+                    r->journal_error=journal_save_prepare(s->options.journal,s->options.buffer_id,
+                        &checkpoint.previous,checkpoint.records,checkpoint.count,&lease->token);
+            }
+            if (!r->file_error && !r->journal_error && s->options.journal && !lease->prepared) {
+                lease->prepared=true; lease->handoff_pending=true; goto handoff;
+            }
             if (!r->file_error && !r->journal_error) {
                 file_save_args args={.path=s->path,.snap=s->task.snapshot,
                     .mode=s->options.create_mode_valid ? s->options.create_mode : s->task.expect.mode,
@@ -235,18 +254,32 @@ static void worker(work_ctx *ctx)
                 }
             }
             piece_snapshot_release(s->task.snapshot);
-        } else if (op==OP_FINISH)
-            r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
-                s->task.checkpoint,s->task.count);
+            if (s->task.request_mode) s->task.request.release(s->task.request.ctx);
+        } else if (op==OP_FINISH || op==OP_RECOVER_FINISH) {
+            if (op==OP_RECOVER_FINISH)
+                r->journal_error=journal_rotate(s->options.journal,s->task.checkpoint,s->task.count);
+            if (!r->journal_error)
+                r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
+                    s->task.checkpoint,s->task.count);
+        }
     }
     lease->pending=true;
 publish:;
     work_msg msg={.kind=SAVECTL_MESSAGE,.generation=ctx->generation};
-    notification note={s,lease}; memcpy(msg.data,&note,sizeof note);
+    notification note={s,lease,false}; memcpy(msg.data,&note,sizeof note);
     /* Successful publication seals/transfers the lease; touch no output or
      * controller storage afterwards. Saturation retries as a FIFO continuation
      * so this terminal obligation never monopolizes the bulk lane. */
     if (!work_publish(ctx,&msg)) (void)work_continue(ctx);
+    return;
+handoff:;
+    work_msg phase={.kind=SAVECTL_MESSAGE,.generation=ctx->generation};
+    notification transfer={s,lease,true}; memcpy(phase.data,&transfer,sizeof transfer);
+    /* Only the token is published here. No further journal call occurs until
+     * a new explicit finish lease. The UI copies it before acknowledging. */
+    lease->handoff_pending=false;
+    if (!work_publish(ctx,&phase)) lease->handoff_pending=true;
+    (void)work_continue(ctx);
 }
 static void controller_message(const work_msg *message, void *ctx)
 { (void)savectl_receive(ctx,message); }
@@ -262,12 +295,15 @@ static int submit(savectl *s, operation op)
     s->task.base.path=s->task.base.captured_path;
     s->task.discard=op==OP_DISCARD ? s->result.reload : NULL;
     s->received=false; s->completion->pending=false;
+    s->completion->prepared=false; s->completion->handoff_pending=false;
+    atomic_store_explicit(&s->prepare_returned,false,memory_order_relaxed);
     if (s->handle.epoch)
         (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,NULL,NULL);
     ++s->generation;
     s->handle=work_submit(s->options.pool,(work_job){worker,s,s->generation,WORK_BULK});
     if (!s->handle.epoch) return SAVECTL_POOL;
     s->active=true;
+    s->journal_leased=s->options.journal && (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH);
     if (op==OP_DISCARD) s->result.reload=NULL;
     (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,controller_message,s);
     return SAVECTL_OK;
@@ -292,7 +328,7 @@ int savectl_create(savectl **out, const savectl_options *o, bool modified)
         s->options.source_ctx=o->source;
         s->baseline=*file_source_identity(o->source);
     }
-    atomic_init(&s->epoch,0);
+    atomic_init(&s->epoch,0); atomic_init(&s->prepare_returned,false);
     *out=s; return SAVECTL_OK;
 }
 int savectl_destroy(savectl *s)
@@ -342,23 +378,27 @@ savectl_model savectl_get_model(const savectl *s)
     case SAVECTL_RELOADING: status="reloading"; break;
     case SAVECTL_IDLE: break;
     }
+    if (s->saving_frame_pending) status="saving";
     return (savectl_model){.state=s->state,.status=status,
+        .saving_frame_pending=s->saving_frame_pending,.request_id=s->request_id,
+        .request_ns=s->request_ns,.saving_submitted_ns=s->saving_submitted_ns,
         .banner=s->external ? "File changed on disk. Reload or keep edits." : NULL,
-        .modified=s->modified,.can_reload=s->external && !s->closing && !s->active && !s->ready_reload && !s->result.reload && !s->needs_finish && !s->token.prepared && !s->token.previous_path[0],
-        .can_keep=s->external && !s->closing && !s->active && !s->ready_reload && !s->result.reload && !s->needs_finish && !s->token.prepared && !s->token.previous_path[0] &&
+        .modified=s->modified,.can_reload=s->external && !s->closing && !s->saving_frame_pending && !s->active && !s->ready_reload && !s->result.reload && !s->needs_finish && !s->token.prepared && !s->token.previous_path[0],
+        .can_keep=s->external && !s->closing && !s->saving_frame_pending && !s->active && !s->ready_reload && !s->result.reload && !s->needs_finish && !s->token.prepared && !s->token.previous_path[0] &&
             (s->options.source_mode!=FILE_MODE_MMAP || s->options.validate_source!=NULL),
         .busy=s->active,.needs_finish=s->needs_finish,
-        .journal_leased=s->active && (s->task.op==OP_SAVE || s->task.op==OP_FINISH) && s->options.journal!=NULL,
+        .journal_leased=s->journal_leased,
         .file_error=s->file_error,.journal_error=s->journal_error,.err_no=s->err_no};
 }
 int savectl_save(savectl *s, piece_tree *tree, const journal_base *previous,
                  const journal_record *checkpoint, size_t count)
 {
     if (!s || !tree) return SAVECTL_INVALID;
-    if (s->closing || s->active || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
+    if (s->closing || s->active || s->saving_frame_pending || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
     if (s->external) return FILE_ERR_CHANGED;
     if (s->options.source_mode==FILE_MODE_MMAP && !s->options.validate_source) return SAVECTL_SOURCE_GUARD;
     if (s->options.journal && (!previous || !checkpoint || !count)) return SAVECTL_INVALID;
+    s->task.request_mode=false;
     s->task.snapshot=piece_snapshot_take(tree);
     if (!s->task.snapshot) return SAVECTL_NOMEM;
     if (previous) s->task.previous=*previous;
@@ -371,6 +411,32 @@ int savectl_save(savectl *s, piece_tree *tree, const journal_base *previous,
     s->file_error=0; s->journal_error=0; s->err_no=0;
     return SAVECTL_OK;
 }
+int savectl_save_request(savectl *s, const savectl_request *request)
+{
+    if (!s || !request || !request->snapshot || !request->release || !request->request_ns ||
+        (s->options.journal && !request->prepare) || s->request_id==UINT64_MAX) return SAVECTL_INVALID;
+    if (s->closing || s->active || s->saving_frame_pending || s->ready_reload || s->result.reload ||
+        s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
+    if (s->external) return FILE_ERR_CHANGED;
+    if (s->options.source_mode==FILE_MODE_MMAP && !s->options.validate_source) return SAVECTL_SOURCE_GUARD;
+    s->task.snapshot=request->snapshot; s->task.request=*request; s->task.request_mode=true;
+    int rc=submit(s,OP_SAVE);
+    if (rc) return rc; /* caller still owns both transferred references */
+    s->saved_revision=s->revision;
+    s->saved_content_id=s->content_id; s->saved_content_known=s->content_known;
+    s->state=SAVECTL_SAVING;
+    s->file_error=0; s->journal_error=0; s->err_no=0;
+    ++s->request_id; s->request_ns=request->request_ns; s->saving_submitted_ns=0;
+    s->saving_frame_pending=true;
+    return SAVECTL_OK;
+}
+int savectl_status_frame_submitted(savectl *s, uint64_t request_id, uint64_t submitted_ns)
+{
+    if (!s || !s->saving_frame_pending || request_id!=s->request_id || submitted_ns<s->request_ns)
+        return SAVECTL_INVALID;
+    s->saving_submitted_ns=submitted_ns; s->saving_frame_pending=false;
+    return SAVECTL_OK;
+}
 int savectl_finish(savectl *s, const journal_record *checkpoint, size_t count)
 {
     if (!s || !checkpoint || !count) return SAVECTL_INVALID;
@@ -380,8 +446,17 @@ int savectl_finish(savectl *s, const journal_record *checkpoint, size_t count)
     if (!rc) s->state=SAVECTL_SAVING;
     return rc;
 }
+int savectl_recover_finish(savectl *s, const journal_record *checkpoint, size_t count)
+{
+    if (!s || !checkpoint || !count) return SAVECTL_INVALID;
+    if (s->closing || s->active || !s->needs_finish) return SAVECTL_BUSY;
+    s->task.checkpoint=checkpoint; s->task.count=count;
+    int rc=submit(s,OP_RECOVER_FINISH);
+    if (!rc) s->state=SAVECTL_SAVING;
+    return rc;
+}
 const journal_base *savectl_saved_base(const savectl *s) { return s->needs_finish ? &s->saved_base : NULL; }
-const journal_save *savectl_save_token(const savectl *s) { return s->active ? NULL : &s->token; }
+const journal_save *savectl_save_token(const savectl *s) { return s->journal_leased ? NULL : &s->token; }
 void savectl_file_event(savectl *s)
 {
     if (s->closing) return;
@@ -391,7 +466,7 @@ void savectl_file_event(savectl *s)
 int savectl_reload(savectl *s)
 {
     if (!s || !s->options.reload_allocator.alloc || !s->options.reload_allocator.free) return SAVECTL_INVALID;
-    if (s->closing || s->active || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
+    if (s->closing || s->active || s->saving_frame_pending || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
     int rc=submit(s,OP_RELOAD);
     if (!rc) { s->state=SAVECTL_RELOADING; s->event=false; }
     return rc;
@@ -399,7 +474,7 @@ int savectl_reload(savectl *s)
 int savectl_keep(savectl *s)
 {
     if (!s) return SAVECTL_INVALID;
-    if (s->closing || s->active || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
+    if (s->closing || s->active || s->saving_frame_pending || s->ready_reload || s->result.reload || s->needs_finish || s->token.prepared || s->token.previous_path[0]) return SAVECTL_BUSY;
     if (!s->external) return SAVECTL_INVALID;
     if (s->options.source_mode==FILE_MODE_MMAP && !s->options.validate_source) return SAVECTL_SOURCE_GUARD;
     return submit(s,OP_KEEP);
@@ -411,8 +486,14 @@ bool savectl_receive(savectl *s, const work_msg *m)
     if (note.owner!=s || note.lease!=s->completion) return false;
     if (m->generation==s->generation && s->active && !s->received &&
         note.lease->generation==s->generation) {
-        s->result=note.lease->value; s->token=note.lease->token;
-        s->received=true; savectl_tick(s);
+        if (note.handoff) {
+            s->token=note.lease->token;
+            s->journal_leased=false;
+            atomic_store_explicit(&s->prepare_returned,true,memory_order_release);
+        } else {
+            s->result=note.lease->value; s->token=note.lease->token;
+            s->received=true; savectl_tick(s);
+        }
     }
     return true;
 }
@@ -458,10 +539,10 @@ void savectl_tick(savectl *s)
     if (s->active && s->received) {
         operation op=s->task.op;
         result *r=&s->result;
-        s->active=false;
+        s->active=false; s->journal_leased=false;
         if (op!=OP_DISCARD) {
             s->file_error=r->file_error; s->err_no=r->err_no;
-            if (op==OP_SAVE || op==OP_FINISH) s->journal_error=r->journal_error;
+            if (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH) s->journal_error=r->journal_error;
             if (r->file_error || r->journal_error) {
                 if (r->replaced) s->baseline=r->id;
                 if (r->file_error==FILE_ERR_CHANGED || r->journal_error==JOURNAL_BASE_CHANGED) changed(s);
@@ -473,7 +554,7 @@ void savectl_tick(savectl *s)
                     s->saved_base.path=s->saved_base.captured_path;
                     s->needs_finish=true;
                 } else saved(s);
-            } else if (op==OP_FINISH) {
+            } else if (op==OP_FINISH || op==OP_RECOVER_FINISH) {
                 s->needs_finish=false; s->token.previous_path[0]=0; saved(s);
             } else if (op==OP_KEEP) {
                 if (atomic_load_explicit(&s->epoch,memory_order_relaxed)==s->task.epoch) {

@@ -132,8 +132,13 @@ static void journal_session(const uint8_t *data, size_t size)
     /* Partial drains and a reused work slot must preserve the lease/result. */
     (void)work_mailbox_drain_bounded(pool, route, s, 1, 0); savectl_tick(s);
     if (scenario == 3) {
-        while (!atomic_load(&pause.entered)) (void)sched_yield();
-        REQUIRE(savectl_get_model(s).busy);
+        while (!atomic_load(&pause.entered)) {
+            (void)work_mailbox_drain_bounded(pool,route,s,1,0); savectl_tick(s);
+            (void)sched_yield();
+        }
+        REQUIRE(savectl_get_model(s).busy && !savectl_get_model(s).journal_leased);
+        REQUIRE(savectl_save_token(s) && savectl_save_token(s)->prepared);
+        REQUIRE(journal_set_window(j,640,480)==0);
         replace_disk(path, (const uint8_t *)"other", 5);
         if (data[0] & 0x80u) savectl_file_event(s);
         atomic_store(&pause.released, true);
@@ -171,9 +176,10 @@ static void journal_session(const uint8_t *data, size_t size)
             /* A failed sync requires a complete checkpoint in a fresh inode. */
             int retry = journal_get_stats(j).error == JOURNAL_IO ? journal_retry(j) : JOURNAL_OK;
             REQUIRE(retry == JOURNAL_OK || retry == JOURNAL_IO);
-            REQUIRE(journal_rotate(j, &next, 1) == 0);
+            REQUIRE(savectl_recover_finish(s, &next, 1) == 0); settle(s,pool);
+        } else {
+            REQUIRE(savectl_finish(s, &next, 1) == 0); settle(s, pool);
         }
-        REQUIRE(savectl_finish(s, &next, 1) == 0); settle(s, pool);
         REQUIRE(!savectl_get_model(s).needs_finish && !savectl_get_model(s).modified);
         REQUIRE(savectl_get_model(s).state == SAVECTL_SAVED && access(retained, F_OK) != 0);
     }

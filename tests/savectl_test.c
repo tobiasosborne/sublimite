@@ -12,6 +12,10 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <dirent.h>
+#include <errno.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
 
@@ -276,7 +280,7 @@ static int restore(void *ctx, const journal_record *r)
     if (r->type==JOURNAL_BASE) {
         journal_base b; char path[4097]; CHECK(journal_decode_base(r,&b,path,sizeof path)==0);
         uint8_t bytes[128]; CHECK(b.size<=sizeof bytes);
-        int fd=open(path,O_RDONLY); CHECK(fd>=0); CHECK(read(fd,bytes,sizeof bytes)==(ssize_t)b.size); close(fd);
+        if (*path) { int fd=open(path,O_RDONLY); CHECK(fd>=0); CHECK(read(fd,bytes,sizeof bytes)==(ssize_t)b.size); close(fd); }
         CHECK(piece_init_copy(tree,bytes,(size_t)b.size)==0);
     } else if (r->type==JOURNAL_INSERT || r->type==JOURNAL_DELETE) CHECK(journal_apply_piece(tree,r)==0);
     return 0;
@@ -307,9 +311,14 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
         CHECK(savectl_get_model(f.s).journal_error==JOURNAL_INVALID);
         CHECK(savectl_get_model(f.s).modified); contents(f.path,"old");
     } else {
-        pause_wait(&p);
-        /* Caller defers journal records during the exclusive worker lease. */
+        for (unsigned i=0;i<100000u && !atomic_load(&p.entered);++i) {
+            savectl_tick(f.s); nap();
+        }
+        CHECK(atomic_load(&p.entered));
+        CHECK(!savectl_get_model(f.s).journal_leased);
+        /* Appends may continue once prepare has returned ownership. */
         edit(&f); savectl_content_identity(f.s,101,99,true);
+        CHECK(journal_insert(j,1,4,(const uint8_t *)"!",1)==0);
         if (fail_file) { put(f.path,"disk changed"); savectl_file_event(f.s); }
         atomic_store(&p.release,true); wait_controller(&f);
         if (fail_file) {
@@ -343,6 +352,224 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
         }
     }
     journal_close(j); work_pool_shutdown(jp); free(jp); CHECK(unlink(logpath)==0); finish_fixture(&f);
+}
+static int restore_other(void *ctx, const journal_record *record)
+{ return record->buffer_id==2 ? restore(ctx,record) : 0; }
+/* A crashed save must not strand another buffer's accepted appends. */
+static void journal_handoff_crash(void)
+{
+    char directory[]="/tmp/edit-savectl-crash-XXXXXX"; CHECK(mkdtemp(directory));
+    char path[160], logpath[160];
+    CHECK(snprintf(path,sizeof path,"%s/target",directory)>0);
+    CHECK(snprintf(logpath,sizeof logpath,"%s/journal",directory)>0);
+    put(path,"old");
+    pid_t child=fork(); CHECK(child>=0);
+    if (!child) {
+        work_pool *pool=aligned_alloc(_Alignof(work_pool),sizeof *pool);
+        work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(pool && jp);
+        CHECK(work_pool_init(pool,1,0)==0 && work_pool_init(jp,1,0)==0);
+        journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
+        journal_base previous; CHECK(journal_capture_base(path,&previous)==0);
+        CHECK(journal_set_base(j,1,&previous)==0);
+        uint8_t bp[4137], empty[41]={0};
+        journal_record cp[]={{JOURNAL_BASE,1,0,bp,base_payload(bp,&previous)},
+            {JOURNAL_BASE,2,0,empty,sizeof empty}};
+        pause_job pause={.step=FILE_STEP_FSYNCED};
+        savectl_options options={.pool=pool,.path=path,.baseline=base_id(path),
+            .source_mode=FILE_MODE_COPY,.journal=j,.journal_pool=jp,.buffer_id=1,
+            .step=pause_hook,.step_ctx=&pause};
+        savectl *controller=NULL; CHECK(savectl_create(&controller,&options,true)==0);
+        piece_allocator allocator=piece_default_allocator(); piece_tree *tree=piece_create(&allocator);
+        CHECK(tree && piece_init_copy(tree,(const uint8_t *)"saved",5)==0);
+        CHECK(savectl_save(controller,tree,&previous,cp,2)==0);
+        CHECK(savectl_get_model(controller).journal_leased);
+        /* Published prepare returns ownership before the file-only stage. */
+        for (unsigned i=0;i<100000u && !atomic_load(&pause.entered);++i) {
+            UI_NO_IO(savectl_tick(controller)); nap();
+        }
+        CHECK(atomic_load(&pause.entered));
+        CHECK(!savectl_get_model(controller).journal_leased);
+        CHECK(savectl_get_model(controller).busy);
+        CHECK(journal_insert(j,2,0,(const uint8_t *)"other-buffer",12)==0);
+        CHECK(journal_set_view(j,2,&(journal_view){.cursor=12})==0);
+        /* Process crash before rename/finish; no orderly journal flush. */
+        CHECK(kill(getpid(),SIGKILL)==0); _exit(1);
+    }
+    int status=0; CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    contents(path,"old");
+    piece_allocator allocator=piece_default_allocator(); piece_tree *other=piece_create(&allocator); CHECK(other);
+    journal_replay_result rr;
+    /* Replay both buffers separately: buffer 2 starts from the empty BASE. */
+    CHECK(journal_replay_file(logpath,restore_other,other,&rr)==0);
+    uint8_t text[12]; CHECK(piece_len(other)==12);
+    CHECK(piece_read(other,0,text,sizeof text)==0 && !memcmp(text,"other-buffer",12));
+    piece_destroy(other);
+    DIR *dir=opendir(directory); CHECK(dir); struct dirent *entry;
+    while ((entry=readdir(dir))) if (strcmp(entry->d_name,".") && strcmp(entry->d_name,"..")) {
+        char artifact[320]; CHECK(snprintf(artifact,sizeof artifact,"%s/%s",directory,entry->d_name)>0);
+        CHECK(unlink(artifact)==0);
+    }
+    CHECK(closedir(dir)==0 && rmdir(directory)==0);
+    puts("savectl prepare handoff/other-buffer crash replay: ok");
+}
+typedef struct finish_fault { _Atomic bool fail_data; } finish_fault;
+static int finish_sync(void *ctx, int fd, bool directory)
+{
+    finish_fault *fault=ctx;
+    if (!directory && atomic_exchange(&fault->fail_data,false)) { errno=EIO; return -1; }
+    return directory ? fsync(fd) : fdatasync(fd);
+}
+static int restore_first(void *ctx, const journal_record *record)
+{ return record->buffer_id==1 ? restore(ctx,record) : 0; }
+static void finish_writeback_recovery(void)
+{
+    fixture f; init(&f,"old"); edit(&f);
+    char logpath[160]; CHECK(snprintf(logpath,sizeof logpath,"%s/journal",f.dir)>0);
+    work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(jp);
+    CHECK(work_pool_init(jp,1,0)==0); journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
+    journal_base previous; CHECK(journal_capture_base(f.path,&previous)==0);
+    CHECK(journal_set_base(j,1,&previous)==0);
+    uint8_t bp[4137], first[9]={0}, empty[41]={0}; le64(first,3); first[8]='!';
+    journal_record cp[]={{JOURNAL_BASE,1,0,bp,base_payload(bp,&previous)},
+        {JOURNAL_INSERT,1,0,first,sizeof first},{JOURNAL_BASE,2,0,empty,sizeof empty}};
+    CHECK(savectl_destroy(f.s)==0);
+    savectl_options options={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),
+        .source_mode=FILE_MODE_COPY,.journal=j,.journal_pool=jp,.buffer_id=1};
+    CHECK(savectl_create(&f.s,&options,true)==0);
+    CHECK(savectl_save(f.s,f.tree,&previous,cp,3)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).needs_finish);
+    journal_save retained=*savectl_save_token(f.s);
+    CHECK(retained.prepared && access(retained.previous_path,F_OK)==0);
+    edit(&f); CHECK(journal_insert(j,2,0,(const uint8_t *)"other",5)==0);
+    uint8_t nextbase[4137], later[9]={0}, other[13]={0}; le64(later,4); later[8]='!';
+    memcpy(other+8,"other",5);
+    journal_record next[]={{JOURNAL_BASE,1,0,nextbase,base_payload(nextbase,savectl_saved_base(f.s))},
+        {JOURNAL_INSERT,1,0,later,sizeof later},{JOURNAL_BASE,2,0,empty,sizeof empty},
+        {JOURNAL_INSERT,2,0,other,sizeof other}};
+    finish_fault fault={.fail_data=true}; journal_io io={.ctx=&fault,.sync=finish_sync};
+    CHECK(journal_set_io(j,&io)==0);
+    CHECK(savectl_finish(f.s,next,4)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).journal_error==JOURNAL_IO);
+    CHECK(journal_retry(j)==JOURNAL_IO && journal_retry(j)==JOURNAL_IO);
+    CHECK(savectl_finish(f.s,next,4)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).journal_error==JOURNAL_IO);
+    CHECK(!memcmp(&retained,savectl_save_token(f.s),sizeof retained));
+    file_id old_log=base_id(logpath);
+    int old_log_fd=open(logpath,O_RDONLY); CHECK(old_log_fd>=0);
+    /* A failed fresh rotation also preserves the token for another attempt. */
+    atomic_store(&fault.fail_data,true);
+    CHECK(savectl_recover_finish(f.s,next,4)==0); wait_controller(&f);
+    CHECK(savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).journal_error==JOURNAL_IO);
+    CHECK(!memcmp(&retained,savectl_save_token(f.s),sizeof retained));
+    CHECK(access(retained.previous_path,F_OK)==0);
+    CHECK(savectl_recover_finish(f.s,next,4)==0);
+    CHECK(savectl_get_model(f.s).journal_leased); wait_controller(&f);
+    CHECK(base_id(logpath).ino!=old_log.ino); CHECK(close(old_log_fd)==0);
+    CHECK(!savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).modified);
+    CHECK(savectl_get_model(f.s).state==SAVECTL_SAVED);
+    CHECK(!savectl_save_token(f.s)->prepared && access(retained.previous_path,F_OK)!=0);
+    contents(f.path,"old!");
+    piece_allocator allocator=piece_default_allocator();
+    piece_tree *one=piece_create(&allocator), *two=piece_create(&allocator); CHECK(one && two);
+    journal_replay_result rr; CHECK(journal_replay_file(logpath,restore_first,one,&rr)==0);
+    CHECK(journal_replay_file(logpath,restore_other,two,&rr)==0);
+    uint8_t text[5]; CHECK(piece_read(one,0,text,5)==0 && !memcmp(text,"old!!",5));
+    CHECK(piece_read(two,0,text,5)==0 && !memcmp(text,"other",5));
+    piece_destroy(one); piece_destroy(two); journal_close(j); work_pool_shutdown(jp); free(jp);
+    CHECK(unlink(logpath)==0); finish_fixture(&f);
+    puts("savectl finish writeback/fresh-inode retry/retained-token reconciliation: ok");
+}
+typedef struct session_request_test {
+    journal_base previous;
+    size_t buffers;
+    journal_record *records;
+    uint8_t base[4137], empty[41], insert[9];
+    _Atomic unsigned preparations, releases;
+    bool fail;
+} session_request_test;
+static int prepare_session(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint *out)
+{
+    CHECK(!ui_no_io);
+    session_request_test *session=ctx;
+    (void)atomic_fetch_add(&session->preparations,1);
+    if (session->fail) return JOURNAL_NOMEM;
+    session->records=calloc(session->buffers*2,sizeof *session->records); CHECK(session->records);
+    size_t size=base_payload(session->base,&session->previous);
+    le64(session->insert,0); session->insert[8]='x';
+    for (size_t i=0;i<session->buffers;++i) {
+        session->records[i*2]=(journal_record){JOURNAL_BASE,i+1,0,
+            i ? session->empty : session->base,i ? sizeof session->empty : size};
+        if (i) session->records[i*2+1]=(journal_record){JOURNAL_INSERT,i+1,0,
+            session->insert,sizeof session->insert};
+        else {
+            uint8_t byte=0; CHECK(piece_snapshot_read(snapshot,3,&byte,1)==0 && byte=='!');
+            /* Selected buffer already has this one-byte immutable delta. */
+            session->records[1]=(journal_record){JOURNAL_INSERT,1,0,
+                (const uint8_t *)"\3\0\0\0\0\0\0\0!",9};
+        }
+    }
+    *out=(savectl_checkpoint){session->previous,session->records,session->buffers*2};
+    return JOURNAL_OK;
+}
+static void release_session(void *ctx)
+{
+    CHECK(!ui_no_io); session_request_test *session=ctx;
+    free(session->records); session->records=NULL;
+    (void)atomic_fetch_add(&session->releases,1);
+}
+static void bounded_request_status(bool failure)
+{
+    fixture f; init(&f,"old"); edit(&f);
+    char logpath[160]; CHECK(snprintf(logpath,sizeof logpath,"%s/journal",f.dir)>0);
+    work_pool *jp=aligned_alloc(_Alignof(work_pool),sizeof *jp); CHECK(jp && work_pool_init(jp,1,0)==0);
+    journal *j=NULL; CHECK(journal_open(&j,logpath,jp,NULL)==0);
+    session_request_test session={.buffers=2048,.fail=failure};
+    CHECK(journal_capture_base(f.path,&session.previous)==0);
+    CHECK(journal_set_base(j,1,&session.previous)==0);
+    CHECK(savectl_destroy(f.s)==0);
+    savectl_options options={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),
+        .source_mode=FILE_MODE_COPY,.journal=j,.journal_pool=jp,.buffer_id=1};
+    CHECK(savectl_create(&f.s,&options,true)==0);
+    pause_job backend={0}; CHECK(work_submit(f.pool,(work_job){blocker,&backend,0,WORK_BULK}).epoch);
+    pause_wait(&backend);
+    /* Snapshot/root publication is setup here, not hidden in ack timing. */
+    savectl_request request={.snapshot=piece_snapshot_take(f.tree),.ctx=&session,
+        .prepare=prepare_session,.release=release_session,.request_ns=100}; CHECK(request.snapshot);
+    edit_malloc_guard_begin();
+    UI_NO_IO(CHECK(savectl_save_request(f.s,&request)==0));
+    savectl_model model=savectl_get_model(f.s);
+    CHECK(edit_malloc_guard_end()==0);
+    CHECK(model.busy && model.saving_frame_pending && !strcmp(model.status,"saving"));
+    CHECK(model.request_id && model.request_ns==100 && !model.saving_submitted_ns);
+    CHECK(!atomic_load(&session.preparations) && !atomic_load(&session.releases));
+    /* A busy backend cannot yet submit; polling/ticking must not ack a frame. */
+    UI_NO_IO(savectl_tick(f.s)); CHECK(savectl_get_model(f.s).saving_frame_pending);
+    CHECK(savectl_status_frame_submitted(f.s,model.request_id+1,150)==SAVECTL_INVALID);
+    CHECK(savectl_status_frame_submitted(f.s,model.request_id,99)==SAVECTL_INVALID);
+    atomic_store(&backend.release,true); wait_controller(&f);
+    CHECK(atomic_load(&session.preparations)==1 && atomic_load(&session.releases)==1);
+    model=savectl_get_model(f.s);
+    CHECK(model.saving_frame_pending && !strcmp(model.status,"saving"));
+    CHECK(model.state==(failure ? SAVECTL_FAILED : SAVECTL_SAVING));
+    UI_NO_IO(CHECK(savectl_status_frame_submitted(f.s,model.request_id,200)==0));
+    CHECK(!savectl_get_model(f.s).saving_frame_pending && savectl_get_model(f.s).saving_submitted_ns==200);
+    CHECK(savectl_status_frame_submitted(f.s,model.request_id,201)==SAVECTL_INVALID);
+    if (failure) {
+        CHECK(model.journal_error==JOURNAL_NOMEM); contents(f.path,"old");
+    } else {
+        CHECK(model.needs_finish); contents(f.path,"old!");
+        /* Complete generated session exists on disk after releasing its storage. */
+        piece_allocator allocator=piece_default_allocator(); piece_tree *other=piece_create(&allocator); CHECK(other);
+        journal_replay_result rr; CHECK(journal_replay_file(logpath,restore_other,other,&rr)==0);
+        uint8_t byte=0; CHECK(piece_read(other,0,&byte,1)==0 && byte=='x'); piece_destroy(other);
+        char retained[4097]; strcpy(retained,savectl_save_token(f.s)->previous_path);
+        /* Test teardown resolves recovery explicitly, rather than pretending a
+         * partial one-buffer checkpoint is an application finish. */
+        CHECK(unlink(retained)==0);
+    }
+    journal_close(j); work_pool_shutdown(jp); free(jp); CHECK(unlink(logpath)==0); finish_fixture(&f);
+    puts("savectl bounded session request/worker preparation/submitted-status hook: ok");
 }
 static void flood(work_ctx *ctx)
 {
@@ -791,6 +1018,9 @@ static void reload_fifo(void)
 int main(int argc, char **argv)
 {
     trace_init();
+    if (argc>1 && !strcmp(argv[1],"--bounded-request")) { bounded_request_status(false); bounded_request_status(true); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--finish-recovery")) { finish_writeback_recovery(); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--journal-handoff")) { journal_handoff_crash(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--fifo")) { reload_fifo(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--journal-conflict")) { journal_base_conflict(false); journal_base_conflict(true); return 0; }
     if (argc>1 && !strcmp(argv[1],"--undo-clean")) { undo_clean_identity(); return 0; }
@@ -800,6 +1030,7 @@ int main(int argc, char **argv)
     if (argc>1 && !strcmp(argv[1],"--reload-failure")) { reload_allocation_recovery(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--mailbox-protocol")) { mailbox_terminal_protocol(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--file-source")) { for (unsigned i=0;i<4u;++i) mapped_file_source(i); puts("savectl retained actual mapped identity/guard: ok"); return 0; }
+    journal_handoff_crash(); finish_writeback_recovery(); bounded_request_status(false); bounded_request_status(true);
     mailbox_terminal_protocol();
     for (unsigned i=0;i<4u;++i) mapped_file_source(i);
     reload_allocation_recovery(); reload_construction_slices(); reload_memory_bound(); destroy_reused_slot(); undo_clean_identity();
