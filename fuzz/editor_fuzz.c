@@ -1,4 +1,5 @@
 #include "editor/editor.h"
+#include "undo/undo.h"
 #include "base/base.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <string.h>
@@ -83,7 +84,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     history hist[MODEL_STEPS]; size_t nh = 0, applied = 0;
     for (size_t i = 0; i + 3 < size; i += 4) {
         model before = m; bool mutation = false, shift = (data[i + 1] & 1u) != 0;
-        plat_event ev = {.kind = PLAT_EV_KEY, .press = true};
+        /* This byte/selection model replays one edit at a time. Explicitly
+         * separated event times preserve those boundaries; editor_test's
+         * default burst contracts exercise same-time automatic grouping. */
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true,
+            .t0_ns = (i / 4u + 1u) * (UNDO_BURST_NS + 1u)};
         switch (data[i] % 16u) {
         case 0: case 1: case 2: {
             const char *texts[] = {"a", "x", "中", "e\xcc\x81", "\xcc\x81", "👩", "\xe2\x80\x8d", "\xff"};
@@ -169,7 +174,11 @@ static void p4_ops(const uint8_t *data, size_t size)
         model *m = NULL;
         if (active) for (size_t j = 0; j < count; j++) if (models[j].id == active->id) m = &models[j].text;
         EDIT_ASSERT(!active || m);
-        plat_event ev = {.kind = PLAT_EV_KEY, .press = true}; bool inject = true;
+        /* This byte/selection model replays one edit at a time. Explicitly
+         * separated event times preserve those boundaries; editor_test's
+         * default burst contracts exercise same-time automatic grouping. */
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true,
+            .t0_ns = (i / 4u + 1u) * (UNDO_BURST_NS + 1u)}; bool inject = true;
         unsigned op = data[i] % 12u;
         if (!m && op < 7) op = 8;
         switch (op) {

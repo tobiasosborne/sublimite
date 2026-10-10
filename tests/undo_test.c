@@ -533,10 +533,37 @@ static void sliced_lifecycle(void) {
     CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
     puts("review 5: slice clear/destroy abort and out-of-band mutation assertion passed");
 }
+static void bounded_history(void) {
+    undo_log u; piece_tree *t; undo_change c; start(&u,&t,64);
+    ins(&u,0,"a",0,0,0);ins(&u,1,"b",1,0,0);
+    undo_break_burst(&u);ins(&u,2,"c",2,0,0);
+    CHECK(undo_undo(&u,1,&c)==0);
+    /* The query must work even when the entire retained record mapping is
+     * inaccessible. This checks the work bound without a loaded-box timer. */
+    pid_t child=fork();CHECK(child>=0);
+    if(child==0) {
+        CHECK(mprotect(u.pool.base,u.pool.map_bytes,PROT_NONE)==0);
+        undo_history h=undo_get_history(&u);
+        _exit(h.undo_groups==1 && h.redo_groups==1 && h.group_serial==2?0:2);
+    }
+    int status;CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    CHECK(undo_redo(&u,1,&c)==0);
+    for(unsigned i=0;i<100;i++) {
+        undo_break_burst(&u);ins(&u,piece_len(t),"x",i,0,0);
+        undo_history h=undo_get_history(&u);undo_stats st=undo_get_stats(&u);
+        CHECK(h.undo_groups==st.undo_groups && h.redo_groups==st.redo_groups);
+    }
+    CHECK(undo_get_history(&u).evicted_groups>0);
+    CHECK(undo_set_cap(&u,1)==0);
+    CHECK(undo_get_history(&u).undo_groups==undo_get_stats(&u).undo_groups);
+    undo_clear(&u);CHECK(undo_get_history(&u).undo_groups==0);finish(&u);
+    puts("review editor 9: bounded group query, bursts, replay, eviction and clear passed");
+}
 int main(int argc,char **argv) {
     if(argc==2) {
-        switch(atoi(argv[1])) {case 1:review_1();atomic_sweep();undo_batch_failure_reporting();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();sliced_lifecycle();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
+        switch(atoi(argv[1])) {case 1:review_1();atomic_sweep();undo_batch_failure_reporting();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();sliced_lifecycle();break;case 9:bounded_history();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
         return 0;
     }
-    review_1();atomic_sweep();undo_batch_failure_reporting();original_tests();review_2();review_3();review_4();review_5();sliced_lifecycle();review_8();batch_failure_reporting();puts("undo_test: P1.5e all passed");return 0;
+    bounded_history();review_1();atomic_sweep();undo_batch_failure_reporting();original_tests();review_2();review_3();review_4();review_5();sliced_lifecycle();review_8();batch_failure_reporting();puts("undo_test: P1.5e all passed");return 0;
 }

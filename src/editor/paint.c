@@ -91,6 +91,15 @@ static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_
 }
 int editor_compose(editor *e)
 {
+    if (e->buffer->source_stale) {
+        const char status[] = "Source changed: R reload / K keep";
+        uint32_t cols = e->grid.dims.cols;
+        for (uint32_t c = 0; c < cols; c++) {
+            uint32_t ch = c < sizeof status - 1 ? (uint8_t)status[c] : (uint32_t)' ';
+            e->grid.cells[c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+        }
+        return render_mark_rows(&e->grid, 0, 1);
+    }
     if (e->caret_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
         for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {

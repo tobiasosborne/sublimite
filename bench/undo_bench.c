@@ -44,6 +44,7 @@ static void undo_bench_checkpoint_abort(piece_checkpoint *cp) {
 #define undo_undo undo_bench_mock_undo
 #define undo_redo undo_bench_mock_redo
 #define undo_get_stats undo_bench_mock_get_stats
+#define undo_get_history undo_bench_mock_get_history
 #include "../src/undo/undo.c"
 #undef piece_len
 #undef piece_insert
@@ -68,6 +69,7 @@ static void undo_bench_checkpoint_abort(piece_checkpoint *cp) {
 #undef undo_undo
 #undef undo_redo
 #undef undo_get_stats
+#undef undo_get_history
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"undo_bench:%d failed: %s\n",__LINE__,#x); return 1; } } while(0)
 /* Regression probes exercise the existing decision, before fixing it. */
 static int replay_verdict(bench_samples *real,bench_samples *mock) {

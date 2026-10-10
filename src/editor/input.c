@@ -111,17 +111,38 @@ void editor_journal_staged(editor *e)
 static editor_delta *delta_at(editor *e, size_t i) { return &e->buffer->history[(e->buffer->history_head + i) % e->buffer->history_cap]; }
 static void remember(editor *e, editor_delta d)
 {
-    e->buffer->history_count = e->buffer->history_cursor;
-    if (e->buffer->history_count == e->buffer->history_cap) {
-        e->buffer->history_head = (e->buffer->history_head + 1) % e->buffer->history_cap; e->buffer->history_count--; e->buffer->history_cursor--;
-        if (e->buffer->saved_cursor) e->buffer->saved_cursor--; else e->buffer->saved_lost = true;
+    editor_buffer *b = e->buffer;
+    undo_history h = undo_get_history(e->undo);
+    b->history_count = b->history_cursor;
+    if (b->history_cursor && b->history_serial == h.group_serial) {
+        editor_delta *last = delta_at(e, b->history_cursor - 1);
+        if (d.add) last->add += d.add;
+        else { last->off = d.off; last->old += d.old; }
+        last->after = d.after;
+        /* A saved boundary extended by this burst no longer names saved bytes. */
+        if (b->saved_cursor == b->history_cursor) b->saved_lost = true;
+    } else {
+        if (b->history_count == b->history_cap) {
+            b->history_head = (b->history_head + 1) % b->history_cap; b->history_count--; b->history_cursor--;
+            if (b->saved_cursor) b->saved_cursor--; else b->saved_lost = true;
+        }
+        *delta_at(e, b->history_count++) = d; b->history_cursor = b->history_count;
     }
-    *delta_at(e, e->buffer->history_count++) = d; e->buffer->history_cursor = e->buffer->history_count;
-    size_t groups = undo_get_stats(e->undo).undo_groups;
-    while (e->buffer->history_count > groups) {
-        e->buffer->history_head = (e->buffer->history_head + 1) % e->buffer->history_cap; e->buffer->history_count--; e->buffer->history_cursor--;
-        if (e->buffer->saved_cursor) e->buffer->saved_cursor--; else e->buffer->saved_lost = true;
+    b->history_serial = h.group_serial;
+    if (b->history_count > h.undo_groups) {
+        size_t drop = b->history_count - h.undo_groups;
+        b->history_head = (b->history_head + drop) % b->history_cap;
+        b->history_count -= drop; b->history_cursor -= drop;
+        if (b->saved_cursor >= drop) b->saved_cursor -= drop;
+        else { b->saved_cursor = 0; b->saved_lost = true; }
     }
+}
+static int end_edit_group(editor *e, const undo_state *after)
+{
+    e->edit_delta.after = *after;
+    if (!e->explicit_group) return 0;
+    e->explicit_group = false;
+    return undo_group_end(e->undo, after);
 }
 static int finish_edit(editor *e)
 {
@@ -141,7 +162,7 @@ static int finish_edit(editor *e)
         e->v.state.approximate |= approximate;
     }
     undo_state after = save_selection(&e->v);
-    int rc = undo_group_end(e->undo, &after); if (rc) return rc;
+    int rc = end_edit_group(e, &after); if (rc) return rc;
     remember(e, e->edit_delta); editor_modified(e); e->action = EDITOR_ACTION_NONE;
     trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
     return editor_refresh_cursor(e, e->old_cursor);
@@ -178,7 +199,7 @@ typedef enum text_kind { TEXT_BYTES, TEXT_ENTER, TEXT_BRACE } text_kind;
 static int prefix_error(editor *e, int cause)
 {
     undo_state after = save_selection(&e->v);
-    (void)undo_group_end(e->undo, &after);
+    (void)end_edit_group(e, &after);
     if (e->edit_delta.old || e->edit_delta.add) { remember(e, e->edit_delta); editor_modified(e); }
     e->action = EDITOR_ACTION_NONE; return cause;
 }
@@ -186,7 +207,7 @@ static int reject_text(editor *e, const undo_state *before)
 {
     e->stats.rejected_commands++;
     if (e->edit_delta.old || e->edit_delta.add) return repair(e, e->edit_delta.off);
-    int rc = undo_group_end(e->undo, before);
+    int rc = end_edit_group(e, before);
     return rc ? rc : editor_refresh_cursor(e, e->old_cursor);
 }
 static int delete_part(editor *e, uint64_t lo, uint64_t old, undo_kind kind,
@@ -195,7 +216,7 @@ static int delete_part(editor *e, uint64_t lo, uint64_t old, undo_kind kind,
     if (!old) return 0;
     uint64_t nl = newlines(e, lo, old);
     undo_state after = *before; memcpy(after.bytes, &lo, 8); memcpy(after.bytes + 8, &lo, 8);
-    int rc = undo_delete(e->undo, lo, old, kind, e->key_ns, before, &after); if (rc) return rc;
+    int rc = undo_delete(e->undo, lo, old, kind, e->edit_time_ns, before, &after); if (rc) return rc;
     e->edit_delta.off = lo; e->edit_delta.old += old;
     e->v.state.selection.cursor = e->v.state.selection.anchor = lo;
     rc = stage_delete(e, lo, old); if (!rc) rc = changed(e, lo, old, 0, nl, 0); return rc;
@@ -209,8 +230,10 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
     }
     e->v.state.selection = e->old_selection;
     undo_state before = save_selection(&e->v), after = before;
-    int rc = undo_group_begin(e->undo, &before); if (rc) return rc;
-    e->edit_delta = (editor_delta){lo, 0, 0};
+    e->explicit_group = tk != TEXT_BYTES || (old && n) ||
+        (e->old_selection.cursor != e->old_selection.anchor);
+    int rc = e->explicit_group ? undo_group_begin(e->undo, &before) : 0; if (rc) return rc;
+    e->edit_delta = (editor_delta){.off = lo, .before = before};
     rc = delete_part(e, lo, old, kind, &before); if (rc) return prefix_error(e, rc);
     if (tk == TEXT_ENTER) {
         indent_code ir = indent_on_enter(e->tree, lo, e->indent_bytes, EDITOR_STAGE_BYTES, &n);
@@ -228,7 +251,7 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
         uint64_t target = lo + n, nl = 0;
         for (size_t i = 0; i < n; i++) nl += text[i] == '\n' ? 1u : 0u;
         memcpy(after.bytes, &target, 8); memcpy(after.bytes + 8, &target, 8);
-        rc = undo_insert(e->undo, lo, text, n, e->key_ns, &before, &after);
+        rc = undo_insert(e->undo, lo, text, n, e->edit_time_ns, &before, &after);
         if (rc) return prefix_error(e, rc);
         e->edit_delta.add = n; e->v.state.selection.cursor = e->v.state.selection.anchor = target;
         rc = stage_insert(e, lo, text, n); if (!rc) rc = changed(e, lo, 0, n, 0, nl);
@@ -238,30 +261,37 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
 }
 static int mutate(editor *e, uint64_t lo, uint64_t old, const uint8_t *text, size_t n, undo_kind kind)
 { return mutate_text(e, lo, old, text, n, kind, TEXT_BYTES); }
+static int replay_slice(editor *e)
+{
+    editor_delta d = e->replay_delta; bool redo = e->replay_redo;
+    uint64_t old = redo ? d.old : d.add, add = redo ? d.add : d.old;
+    undo_change c;
+    uint64_t deadline = trace_now_ns() + UINT64_C(100000);
+    int rc = redo ? undo_redo_slice(e->undo, 1, 8, deadline, &c) : undo_undo_slice(e->undo, 1, 8, deadline, &c);
+    if (rc == UNDO_MORE) { e->action = EDITOR_ACTION_REPLAY_WORK; return 0; }
+    e->action = EDITOR_ACTION_NONE;
+    if (c.groups) {
+        uint64_t after_len = piece_len(e->tree), before_len = e->replay_before_len;
+        add = after_len >= before_len ? old + after_len - before_len : old - (before_len - after_len);
+        int jr = stage_delete(e, d.off, old); if (!jr) jr = stage_tree(e, d.off, add);
+        if (jr) return jr;
+        int er = changed(e, d.off, old, add, e->replay_old_nl, newlines(e, d.off, add)); if (er) return er;
+        restore_selection(&e->v, redo ? &d.after : &d.before);
+        if (redo) e->buffer->history_cursor++; else e->buffer->history_cursor--;
+        editor_modified(e); trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
+        er = replay_follow(e); if (er) return er;
+    }
+    return rc;
+}
 static int replay_history(editor *e, bool redo)
 {
     if ((!redo && !e->buffer->history_cursor) || (redo && e->buffer->history_cursor == e->buffer->history_count)) return editor_refresh_cursor(e, e->old_cursor);
     editor_delta d = *delta_at(e, redo ? e->buffer->history_cursor : e->buffer->history_cursor - 1);
-    uint64_t old = redo ? d.old : d.add, add = redo ? d.add : d.old;
     if (e->journal && e->op_count + 2 > EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
-    uint64_t old_nl = newlines(e, d.off, old), before_len = piece_len(e->tree);
-    undo_change c; int rc = redo ? undo_redo(e->undo, 1, &c) : undo_undo(e->undo, 1, &c);
-    uint64_t after_len = piece_len(e->tree);
-    if (c.records) {
-        /* The dirty suffix in undo_change is not a byte delta. Successful
-         * replay prefixes affect only this key's replacement interval. */
-        add = after_len >= before_len ? old + after_len - before_len : old - (before_len - after_len);
-        int jr = stage_delete(e, d.off, old); if (!jr) jr = stage_tree(e, d.off, add);
-        if (jr) return jr;
-        int er = changed(e, d.off, old, add, old_nl, newlines(e, d.off, add)); if (er) return er;
-        if (c.has_state) restore_selection(&e->v, &c.state);
-        else e->v.state.selection.cursor = e->v.state.selection.anchor = d.off;
-        if (c.groups) { if (redo) e->buffer->history_cursor++; else e->buffer->history_cursor--; }
-        editor_modified(e);
-        trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
-        er = replay_follow(e); if (er) return er;
-    }
-    return rc;
+    e->replay_delta = d; e->replay_redo = redo;
+    e->replay_old_nl = newlines(e, d.off, redo ? d.old : d.add);
+    e->replay_before_len = piece_len(e->tree);
+    return replay_slice(e);
 }
 static bool move_key(keys_action action, view_key *out)
 {
@@ -286,6 +316,7 @@ static bool move_key(keys_action action, view_key *out)
 }
 int editor_continue_action(editor *e)
 {
+    if (e->action == EDITOR_ACTION_REPLAY_WORK) return replay_slice(e);
     view_change c; int rc = view_continue(&e->v, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;
@@ -301,6 +332,11 @@ int editor_continue_action(editor *e)
 }
 int editor_handle_key(editor *e, const plat_event *ev)
 {
+    if (e->buffer->source_stale) {
+        if (ev->press && (ev->keysym == 'r' || ev->keysym == 'R')) return editor_source_resolve(e, true);
+        if (ev->press && (ev->keysym == 'k' || ev->keysym == 'K')) return editor_source_resolve(e, false);
+        return 0;
+    }
     if (!ev->press) {
         if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R) tabs_mru_release(&e->tabs);
         return 0;
@@ -335,7 +371,10 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (!stack && e->tabs.cycling) tabs_mru_release(&e->tabs);
     if (!tabs_count(&e->tabs) && !reopen) return 0;
     e->old_selection = e->v.state.selection; e->old_cursor = e->old_selection.cursor;
-    e->key_ns = trace_now_ns(); editor_restart_blink(e, e->key_ns);
+    e->key_ns = trace_now_ns(); e->edit_time_ns = ev->t0_ns ? ev->t0_ns : e->key_ns;
+    editor_restart_blink(e, e->key_ns);
+    if (e->buffer->last_repeat && !ev->repeat) undo_break_burst(e->undo);
+    e->buffer->last_repeat = ev->repeat;
     uint64_t seq = ++e->stats.input_sequence;
     if (e->cfg.on_ingress) e->cfg.on_ingress(e->cfg.hook_ctx, seq, e->key_ns);
     int rc = editor_begin_frame(e); if (rc) return rc;
@@ -346,6 +385,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
     trace_input_key(ev->t0_ns ? ev->t0_ns : e->key_ns, TRACE_IN_KEY_DOWN, ev->keysym, ev->mods,
                     ev->repeat, (const char *)ev->utf8, ev->utf8_len);
     if (tab) {
+        undo_break_burst(e->undo);
         if (stack) return editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);
         if (close) return editor_close_tab(e, tabs_active_index(&e->tabs));
         if (reopen) return editor_reopen_tab(e);
@@ -363,7 +403,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         text_kind tk = ch == '\n' ? TEXT_ENTER : n == 1 && *p == '}' ? TEXT_BRACE : TEXT_BYTES;
         return mutate_text(e, lo, old, p, n, UNDO_DELETE, tk);
     }
-    undo_break_burst(e->undo);
+    if (moving) undo_break_burst(e->undo);
     if (back || del) {
         e->delete_kind = back ? UNDO_BACKSPACE : UNDO_DELETE;
         if (old) return mutate(e, lo, old, NULL, 0, e->delete_kind);

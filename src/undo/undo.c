@@ -127,6 +127,7 @@ static void clear_redo(undo_log *u) {
     if(!first) return;
     /* Applied record count is maintained across capture and replay. */
     retire(u,first,u->tail,u->count-u->applied_count);
+    u->total_groups=u->applied_groups;
     u->tail=u->cursor;
     if(u->cursor) set_next(record(u,u->cursor),0);else u->head=0;
 }
@@ -219,6 +220,7 @@ void undo_clear(undo_log *u) {
     u->head=u->tail=u->cursor=u->open_first=0;
     u->retired_head=u->retired_tail=0;
     u->count=u->applied_count=u->retired_count=0;
+    u->total_groups=u->applied_groups=0;
     u->pool.fresh=u->pool.live=0;u->pool.free_head=NULL;
     u->burst=u->open=u->partial=0;decommit(u);
 }
@@ -255,6 +257,7 @@ static void trim(undo_log *u) {
         u->head=next;u->applied_count-=(size_t)g.count;
         if(next) set_prev(record(u,next),0);else u->tail=0;
         retire(u,first,g.last,(size_t)g.count);work++;
+        u->total_groups--;u->applied_groups--;u->evicted_groups++;
     }
     if(u->count>u->cap && u->head && (!u->open || u->head!=u->open_first)) {
         uint32_t last=u->open_first?prev_id(record(u,u->open_first)):u->tail;
@@ -265,6 +268,9 @@ static void trim(undo_log *u) {
         /* An open group is the applied suffix; otherwise all history goes. */
         u->applied_count=u->head?u->count-n:0;u->cursor=u->head?u->tail:0;
         retire(u,first,last,n);
+        size_t retained=u->open_first?1u:0u;
+        u->evicted_groups+=u->total_groups-retained;
+        u->total_groups=u->applied_groups=retained;
     }
     if(!u->tail) u->burst=0;
 }
@@ -303,6 +309,7 @@ static void append_edit(undo_log *u,const uint32_t *ids,size_t n,const piece_ref
                         const undo_state *before,const undo_state *after) {
     int join=joins(u,kind,off,len,tm);uint32_t first=ids[0];size_t count=n;
     clear_redo(u);
+    if(!join) { u->total_groups++;u->applied_groups++;u->group_serial++; }
     if(join) {
         first=group_first(u,u->tail);count+=(size_t)group(u,first).count;
         record(u,u->tail)->next&=~END;
@@ -438,6 +445,7 @@ static int replay(undo_log *u,size_t groups,size_t budget,uint64_t deadline,undo
         u->cursor=direction<0?prev_id(r):id;
         if(direction<0) u->applied_count-=applied;else u->applied_count+=applied;
         if(complete) {
+            if(direction<0) u->applied_groups--;else u->applied_groups++;
             c->groups++;c->has_state=1;c->state=direction<0?r->before:r->after;
             commit_replay(u);trim(u);completed_change=*c;
         }
@@ -469,4 +477,8 @@ undo_stats undo_get_stats(const undo_log *u) {
         if(id==cursor) applied=0;
     }
     return s;
+}
+
+undo_history undo_get_history(const undo_log *u) {
+    return (undo_history){u->applied_groups,u->total_groups-u->applied_groups,u->evicted_groups,u->group_serial};
 }

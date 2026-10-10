@@ -23,21 +23,24 @@ typedef struct editor_piece_storage {
     size_t requests, fail_request; /* per-buffer allocator fault-test seam */
     bool ready;
 } editor_piece_storage;
-typedef struct editor_delta { uint64_t off, old, add; } editor_delta;
+typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; } editor_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; } editor_jop;
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
     work_pool *pool;
     editor_large lg;
-    piece_tree *tree;
+    piece_tree *tree, *preview;
+    bool pending_open, source_stale, watch_pending;
+    int watch_fd;
     undo_log undo;
     file *file;
     journal_base base;
     lineidx *index;
     editor_delta *history;
     size_t history_head, history_count, history_cursor, history_cap;
-    uint64_t id, lines, revision;
+    uint64_t id, lines, revision, history_serial;
+    bool last_repeat;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
     indent_style style;
@@ -48,7 +51,7 @@ typedef struct editor_buffer {
     ipc_token wait_token;
 } editor_buffer;
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
-typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY } editor_action;
+typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK } editor_action;
 struct editor {
     editor_config cfg;
     editor_stats stats;
@@ -82,7 +85,11 @@ struct editor {
     uint32_t max_cols, max_rows;
     plat_event queue[EDITOR_INPUT_CAP];
     size_t queue_head, queue_count;
-    editor_delta edit_delta;
+    editor_delta edit_delta, replay_delta;
+    uint64_t replay_old_nl, replay_before_len;
+    bool replay_redo;
+    bool explicit_group;
+    unsigned source_choice;
     editor_jop *ops;
     uint8_t *stage;
     size_t op_count, stage_used;
@@ -90,7 +97,7 @@ struct editor {
     undo_kind delete_kind;
     view_selection old_selection;
     view_selection replay_selection;
-    uint64_t old_cursor, key_ns, last_input, next_blink;
+    uint64_t old_cursor, key_ns, edit_time_ns, last_input, next_blink;
     uint64_t repair_line_byte, repair_line_number;
     editor_frame frame, active_frame;
     uint32_t extra_first, extra_end, resize_w, resize_h;
@@ -126,6 +133,8 @@ int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
                           size_t len, editor_buffer **out);
 void editor_buffer_destroy(editor_buffer *b);
+int editor_adopt_open(editor *e, editor_buffer *b);
+int editor_check_sources(editor *e);
 int editor_activate(editor *e);
 int editor_cycle_tab(editor *e, bool reverse);
 int editor_compose(editor *e);

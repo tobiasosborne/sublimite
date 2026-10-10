@@ -27,7 +27,8 @@ void editor_large_init(editor_buffer *b)
 {
     editor_large *lg = &b->lg;
     lg->mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP;
-    if (!lg->mapped) { b->lines = piece_line_count(b->tree); lg->lines_exact = true; lg->warm_done = true; return; }
+    lg->lazy = lg->mapped || (b->file && file_size(b->file) > FILE_PREFIX_MAX);
+    if (!lg->lazy) { b->lines = piece_line_count(b->tree); lg->lines_exact = true; lg->warm_done = true; return; }
     /* No foreground scan of a mapped original: the bounded prefix gives a
      * newline density; the total is an estimate until the index is published. */
     const file_prefix_info *pi = file_prefix_info_of(b->file); size_t plen = 0;
@@ -62,7 +63,7 @@ static void queue_warm(editor *e, editor_buffer *b)
 }
 void editor_large_start(editor *e, editor_buffer *b)
 {
-    editor_large_warm_job *j = b->lg.mapped && !b->lg.warm_done ? calloc(1, sizeof *j) : NULL;
+    editor_large_warm_job *j = b->lg.lazy && !b->lg.warm_done ? calloc(1, sizeof *j) : NULL;
     if (!j) return;
     j->snap = piece_snapshot_take(b->tree); if (!j->snap) { free(j); return; }
     atomic_init(&j->released, false);
@@ -92,7 +93,7 @@ void editor_large_close(editor_buffer *b)
 static void index_progress(editor *e, editor_buffer *b)
 {
     editor_large *lg = &b->lg;
-    if (!lg->mapped || !b->index || !lineidx_complete(b->index)) return;
+    if (b->pending_open || b->source_stale || !lg->lazy || !b->index || !lineidx_complete(b->index)) return;
     queue_warm(e, b);
     bool changed = !lg->lines_exact;
     if (changed) {
@@ -133,6 +134,7 @@ static void buffer_receive(const work_msg *msg, void *ctx)
 {
     editor_buffer *b = ctx;
     editor_large *lg = &b->lg;
+    if (b->source_stale) return;
     if (msg->kind == EDITOR_LARGE_MSG_WARM && matches(msg, lg->warm_h)) lg->warm_done = true;
     if (msg->kind == EDITOR_LARGE_MSG_FIND && matches(msg, lg->find_h) && msg->generation == lg->find_gen && lg->find_running) {
         lg->find_running = false; lg->find_done = true;
@@ -168,7 +170,7 @@ editor_large_status editor_large_status_get(const editor *e)
 }
 int editor_large_goto_byte(editor *e, uint64_t byte)
 {
-    if (!e || view_busy(&e->v)) return EDITOR_ERR_ARG;
+    if (!e || view_busy(&e->v) || e->buffer->source_stale || e->buffer->pending_open) return EDITOR_ERR_ARG;
     editor_buffer *b = e->buffer;
     uint64_t len = piece_len(b->tree); if (byte > len) byte = len;
     uint64_t probe = byte < EDITOR_LARGE_PROBE_BYTES ? byte : EDITOR_LARGE_PROBE_BYTES, start = byte - probe;
@@ -196,7 +198,7 @@ int editor_large_goto_byte(editor *e, uint64_t byte)
 }
 uint64_t editor_large_line_to_byte(editor *e, uint64_t line, bool *exact)
 {
-    if (!e) return 0;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open) { if (exact) *exact = false; return 0; }
     editor_buffer *b = e->buffer;
     if (!b->index) { if (exact) *exact = true; return piece_line_to_byte(b->tree, line); }
     lineidx_src cur = editor_source(b);
@@ -214,7 +216,7 @@ static void find_fn(work_ctx *c)
 }
 int editor_large_find_begin(editor *e, const uint8_t *needle, size_t len)
 {
-    if (!e || !needle || !len || len > EDITOR_LARGE_NEEDLE_MAX || e->buffer->lg.find_running) return EDITOR_ERR_ARG;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open || !needle || !len || len > EDITOR_LARGE_NEEDLE_MAX || e->buffer->lg.find_running) return EDITOR_ERR_ARG;
     editor_buffer *b = e->buffer;
     editor_large *lg = &b->lg;
     if (lg->find) {
@@ -235,7 +237,7 @@ int editor_large_find_begin(editor *e, const uint8_t *needle, size_t len)
 }
 int editor_large_save_begin(editor *e)
 {
-    if (!e || !e->buffer->file || e->buffer->lg.save_running) return EDITOR_ERR_ARG;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open || !e->buffer->file || e->buffer->lg.save_running) return EDITOR_ERR_ARG;
     editor_buffer *b = e->buffer;
     b->lg.save_done = false; b->lg.save_status = 0;
     if (file_save_begin(b->file, b->tree, 0, ++b->lg.save_gen)) return EDITOR_ERR_IO;

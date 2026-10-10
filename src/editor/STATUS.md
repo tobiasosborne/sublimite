@@ -1,3 +1,27 @@
+# edit-zzj.13b slice 3 / session 9
+
+Implemented: automatic burst undo grouping (13), constant-time public undo
+history query and editor ring accounting (9), mapped-source watch/focus/bulk
+identity integration and stale-source suspension with minimal reload/keep (16),
+and calibrated native core-key allocation attribution in the default suite (21).
+
+Partial: pending copy-open preview/adoption (8) is default-tested, but mapped
+acquisition still retains the existing OPEN_READY startup contract. Multi-record
+undo/redo now uses sliced replay (11); indivisible mutation/newline scans,
+large replay staging, resize initialization and submit validation remain.
+No hard 0.5 ms slice certification is claimed.
+
+Release make all, the editor suite with active allocation guards and final
+editor fuzz are green. Final full make check exits 2 at the unchanged refwin
+preflight; its standalone retry is green. That final full-check acceptance
+failure is recorded explicitly in the worker report. LeakSanitizer is disabled;
+the coordinator must rerun the complete suite with leaks enabled.
+
+The exact red/green, public decisions, acceptance gaps and final verification
+are in [the mandatory worker report](../../docs/worker-reports/edit-zzj.13b-s9.md)
+and [the decision record](../../docs/decisions/edit-zzj.13b.md). No new globals.
+The earlier module integration records follow unchanged.
+
 # Editor review continuation — edit-zzj.13 session 9
 
 Done: editor-1 findings 10, 15, 17. Finding 22 adopts main's atomic undo

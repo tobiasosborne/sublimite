@@ -11,7 +11,7 @@ typedef struct editor_large_find_job {
 } editor_large_find_job;
 typedef struct editor_large_warm_job { piece_snapshot *snap; _Atomic bool released; } editor_large_warm_job;
 typedef struct editor_large {
-    bool mapped, lines_exact, top_estimated, warm_done;
+    bool mapped, lazy, lines_exact, top_estimated, warm_done;
     uint64_t prefix_lines, prefix_bytes;
     editor_large_warm_job *warm; work_handle warm_h;
     editor_large_find_job *find; work_handle find_h; bool find_running, find_done;

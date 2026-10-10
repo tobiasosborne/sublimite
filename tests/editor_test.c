@@ -624,7 +624,113 @@ static int review_bursts(void)
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abc", 3) == 0);
     T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(press(e, key('x', 0, "x")) == 0);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abc", 2) == 0);
-    editor_close(e); puts("review 13: typing and repeat deletion bursts, movement boundary passed"); return 0;
+    T(press(e, key('x', 0, "x")) == 0);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
+    focus.focused = true; T(press(e, focus) == 0);
+    T(press(e, key('y', 0, "y")) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abxc", 3) == 0);
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(expect(e, "abxyc", 4) == 0);
+    struct timespec pause = {0, 310000000}; T(nanosleep(&pause, NULL) == 0);
+    T(press(e, key('q', 0, "q")) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "abxyc", 4) == 0);
+    editor_close(e); puts("review 13: typing/repeat bursts, movement/focus/timeout boundaries passed"); return 0;
+}
+/* Attribute the native translation interval independently of editor ingress.
+ * XCB dequeue/packet allocation uses Law 2's library exemption; the
+ * actual XKB translation call is the one used by platform dispatch. */
+static size_t native_translation_probe(x11_input *in, const xcb_key_press_event_t *raw)
+{
+    void *(*volatile allocate)(size_t) = malloc;
+    edit_malloc_guard_begin();
+    void *probe = allocate(17); plat_event translated;
+    x11_translate(in, raw->detail, raw->state, &translated);
+    free(probe);
+    return edit_malloc_guard_end();
+}
+static int review_native_allocations(void)
+{
+    render_backend backend = {0}; T(render_cpu_backend(&backend) == 0);
+    counted c = {0}; editor_config cfg = {.cols = 32, .rows = 4,
+        .hook_ctx = &c, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    plat *p = backend.config.platform; x11_input *in = p->in;
+    xcb_key_press_event_t calibration = {.detail = 38};
+    size_t calibrated = native_translation_probe(in, &calibration);
+    T(!edit_malloc_guard_active() || calibrated == 1);
+    size_t native_allocations = 0, keys = 0;
+    for (unsigned i = 0; i < 100; i++) {
+        raw_key(p, "AC01"); raw_barrier(p);
+        xcb_generic_event_t *raw;
+        while ((raw = xcb_poll_for_event(p->conn)) != NULL) {
+            uint8_t type = raw->response_type & 0x7fu;
+            if (type == XCB_KEY_PRESS || type == XCB_KEY_RELEASE) {
+                plat_event translated; uint64_t now = trace_now_ns();
+                edit_malloc_guard_begin();
+                bool deliver = x11_input_key(in, (const xcb_key_press_event_t *)(const void *)raw,
+                                             type == XCB_KEY_PRESS, now, &translated);
+                native_allocations += edit_malloc_guard_end();
+                if (deliver) { T(editor_inject(e, &translated) == 0); if (translated.press) keys++; }
+            }
+            free(raw);
+        }
+        T(settle(e) == 0);
+    }
+    T(keys == 100 && native_allocations == 0 && c.allocations == 0);
+    T(editor_length(e) == 100);
+    editor_close(e);
+    printf("review 21: native dequeue-to-translation mallocs=%zu; mutation-to-submit=%zu; guard=%s (M)[AC]\n",
+        native_allocations, c.allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    return 0;
+}
+static int review_replay_slices(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4, .history_keys = 8192}; editor *e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    for (unsigned batch = 0; batch < 4; batch++) {
+        for (unsigned i = 0; i < 1024; i++) T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY,
+            .press = true, .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1, .t0_ns = 1}) == 0);
+        T(settle(e) == 0);
+    }
+    e->stats.longest_slice_ns = 0;
+    T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY, .press = true,
+        .keysym = 'z', .mods = PLAT_MOD_CTRL}) == 0);
+    T(editor_step(e, 0) >= 0);
+    printf("review 11: first undo turn longest_slice_ns=%llu (M)[AC], slice limit=500000 ns (G)\n",
+        (unsigned long long)e->stats.longest_slice_ns);
+    T(undo_replay_snapshot(e->undo) != NULL); /* group yields before completion */
+    T(settle(e) == 0); T(editor_length(e) == 0);
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(editor_length(e) == 4096);
+    editor_close(e); puts("review 11: multi-record burst undo/redo yields across turns passed"); return 0;
+}
+static int review_source_change(void)
+{
+    for (unsigned mode = 0; mode < 2; mode++) {
+        char directory[] = "build/editor-source-change-XXXXXX"; T(mkdtemp(directory));
+        char path[128]; int length = snprintf(path, sizeof path, "%s/source", directory);
+        T(length > 0 && (size_t)length < sizeof path);
+        int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+        T(write(fd, "source\n", 7) == 7); close(fd);
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.path = path, .copy_threshold = 1, .cols = 40, .rows = 4}; editor *e = NULL;
+        T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        fd = open(path, O_WRONLY | (mode ? O_TRUNC : 0)); T(fd >= 0);
+        T(write(fd, "change\n", 7) == 7); close(fd);
+        if (mode) {
+            plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = true}; T(editor_inject(e, &focus) == 0);
+        }
+        uint64_t deadline = trace_now_ns() + UINT64_C(1000000000);
+        while (!editor_get_stats(e).source_stale && trace_now_ns() < deadline) T(editor_step(e, 10) >= 0);
+        T(editor_get_stats(e).source_stale);
+        uint64_t mutations = editor_get_stats(e).mutations;
+        T(press(e, key('x', 0, "x")) == 0); T(editor_get_stats(e).mutations == mutations);
+        T(editor_source_resolve(e, false) == 0); T(editor_step(e, 0) >= 0);
+        T(editor_get_stats(e).source_stale); /* unsafe mapped keep is refused */
+        T(editor_source_resolve(e, true) == 0); T(editor_step(e, 0) >= 0); T(settle(e) == 0);
+        T(!editor_get_stats(e).source_stale); T(expect(e, "change\n", 0) == 0);
+        editor_close(e); unlink(path); T(rmdir(directory) == 0);
+    }
+    puts("review 16: mapped watch overwrite, focus truncate, edit suspension and reload/keep passed"); return 0;
 }
 typedef struct review_hold { _Atomic bool release, expired, entered; } review_hold;
 static void review_hold_job(work_ctx *job)
@@ -656,7 +762,21 @@ static int review_prefix_open(void)
     uint64_t id; int rc = editor_add_buffer(e, path, NULL, 0, &id);
     if (!rc) rc = settle(e);
     bool first_before_remainder = !atomic_load(&hold.expired);
-    T(pthread_join(timer, NULL) == 0); editor_close(e); unlink(path);
+    if (!rc && first_before_remainder) {
+        T(e->buffer->pending_open && editor_length(e) == FILE_PREFIX_MAX);
+        T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY, .press = true,
+            .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1}) == 0);
+        T(editor_step(e, 0) >= 0); T(e->queue_count == 1 && e->stats.mutations == 0);
+    }
+    T(pthread_join(timer, NULL) == 0);
+    if (!rc) {
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (e->buffer->pending_open) { T(editor_step(e, 10) >= 0); T(trace_now_ns() < deadline); }
+        T(settle(e) == 0); T(editor_length(e) == 2u * FILE_PREFIX_MAX + 1u);
+        T(e->stats.mutations == 1 && e->queue_count == 0);
+        uint8_t first[8]; T(editor_read(e, 0, first, sizeof first) == 0 && !memcmp(first, "xprefix\n", 8));
+    }
+    editor_close(e); unlink(path);
     T(rc == 0); T(first_before_remainder);
     puts("review 8: first viewport precedes stalled remainder work passed"); return 0;
 }
@@ -902,15 +1022,15 @@ static int review_suite(const char *only)
 {
     struct { const char *name; int (*fn)(void); } cases[] = {
         {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
-        {"6", review_style}, {"7", review_long_line}, {"8", review_prefix_open}, {"10", review_index_backlog}, {"11-accounting", review_slice_accounting}, {"12", review_large_undo}, {"15", review_piece_recycling},
-        {"13", review_bursts}, {"14", review_fairness}, {"17", review_journal_idle}, {"22", review_replay_atomic}, {"23", review_init}, {"close", review_close_flush}
+        {"6", review_style}, {"7", review_long_line}, {"8", review_prefix_open}, {"10", review_index_backlog}, {"11-accounting", review_slice_accounting}, {"11-replay", review_replay_slices}, {"12", review_large_undo}, {"15", review_piece_recycling},
+        {"13", review_bursts}, {"16", review_source_change}, {"21", review_native_allocations}, {"14", review_fairness}, {"17", review_journal_idle}, {"22", review_replay_atomic}, {"23", review_init}, {"close", review_close_flush}
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
-        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "10") ||
-            !strcmp(cases[i].name, "11-accounting") || !strcmp(cases[i].name, "12") ||
-            !strcmp(cases[i].name, "15") || !strcmp(cases[i].name, "17") ||
-            !strcmp(cases[i].name, "22") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
+        if ((!only && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "8") || !strcmp(cases[i].name, "10") ||
+            !strcmp(cases[i].name, "11-accounting") || !strcmp(cases[i].name, "11-replay") || !strcmp(cases[i].name, "12") ||
+            !strcmp(cases[i].name, "13") || !strcmp(cases[i].name, "16") || !strcmp(cases[i].name, "15") || !strcmp(cases[i].name, "17") ||
+            !strcmp(cases[i].name, "21") || !strcmp(cases[i].name, "22") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
             (only && (!strcmp(only, "all") || !strcmp(only, cases[i].name)))) failed |= cases[i].fn();
     return failed;
 }

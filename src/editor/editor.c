@@ -131,6 +131,10 @@ int editor_full_layout(editor *e)
 {
     e->caret_only = false;
     int rc = editor_begin_frame(e); if (rc) return rc;
+    if (e->buffer->source_stale) {
+        e->lay.row = e->lay.row_end; e->full_pending = e->extra_rows = false;
+        e->paint_ready = true; return render_mark_full(&e->grid);
+    }
     rc = render_mark_full(&e->grid); if (rc) return rc;
     e->paint_ready = false;
     view_state s = e->v.state;
@@ -298,7 +302,7 @@ static int present(editor *e)
 }
 static int submit(editor *e)
 {
-    if (!e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
@@ -351,13 +355,18 @@ static int nonkey(editor *e, const plat_event *ev)
     }
     if (ev->kind == PLAT_EV_FOCUS) {
         e->focused = ev->focused; undo_break_burst(e->undo);
+        if (ev->focused && e->buffer->file) {
+            (void)file_check(e->buffer->file, NULL);
+            int rc = editor_check_sources(e); if (rc) return rc;
+        }
         keys_reset(&e->keys); tabs_mru_release(&e->tabs);
         e->drag_tab = SIZE_MAX; e->map_drag = false;
         editor_restart_blink(e, trace_now_ns());
         return refresh_caret(e);
     }
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
-    if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) return editor_pointer(e, ev);
+    if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
+        return e->buffer->source_stale ? 0 : editor_pointer(e, ev);
     return 0;
 }
 void editor_restart_blink(editor *e, uint64_t now)
@@ -369,6 +378,7 @@ static int refresh_caret(editor *e)
 {
     /* Retain decorations and minimize composition only if this turn started
      * from a fully prepared grid. Concurrent input/layout takes the full path. */
+    if (e->buffer->source_stale) return 0;
     bool caret = !e->dirty && e->paint_ready && !layout_busy(&e->lay) &&
                  !view_busy(&e->v) && !e->queue_count && !e->resize_pending;
     int rc = refresh_cursor(e, e->v.state.selection.cursor, caret);
@@ -388,10 +398,10 @@ static int blink(editor *e, uint64_t now)
 
 static bool runnable(const editor *e)
 {
-    bool can_drain = !e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES);
-    return (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
+    bool can_drain = (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES));
+    return e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice || (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty) ||
-           (e->buffer->index_dirty && !lineidx_building(e->buffer->index));
+           (!e->buffer->source_stale && e->buffer->index_dirty && !lineidx_building(e->buffer->index));
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
@@ -444,14 +454,14 @@ int editor_step(editor *e, int timeout_ms)
     editor_large_index_progress(e);
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
-    rc = blink(e, start);
-    if (!rc) rc = resize(e);
+    rc = e->action == EDITOR_ACTION_REPLAY_WORK ? 0 : blink(e, start);
+    if (!rc && e->action != EDITOR_ACTION_REPLAY_WORK) rc = resize(e);
     record_slice(e, start); if (rc) return rc;
     for (;;) {
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
-        if (view_busy(&e->v)) rc = editor_continue_action(e);
-        else if (e->queue_count && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
+        if (e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
+        else if (e->queue_count && (!e->buffer->pending_open || e->buffer->source_stale) && (!e->journal || (e->op_count + 3 <= EDITOR_STAGE_OPS && e->stage_used + PLAT_UTF8_MAX <= EDITOR_STAGE_BYTES))) {
             plat_event ev = e->queue[e->queue_head];
             e->queue_head = (e->queue_head + 1) % EDITOR_INPUT_CAP; e->queue_count--;
             rc = ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
@@ -507,7 +517,7 @@ int editor_run(editor *e)
 }
 int editor_set_cursor(editor *e, uint64_t byte)
 {
-    if (!e || byte > piece_len(e->tree) || view_busy(&e->v)) return EDITOR_ERR_ARG;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open || byte > piece_len(e->tree) || view_busy(&e->v)) return EDITOR_ERR_ARG;
     uint64_t old = e->v.state.selection.cursor;
     e->old_selection = e->v.state.selection;
     e->v.state.selection.cursor = e->v.state.selection.anchor = byte;
@@ -520,7 +530,7 @@ int editor_set_cursor(editor *e, uint64_t byte)
 }
 int editor_jump_line(editor *e, uint64_t line)
 {
-    if (!e) return EDITOR_ERR_ARG;
+    if (!e || e->buffer->source_stale || e->buffer->pending_open) return EDITOR_ERR_ARG;
     if (e->buffer->index) {
         (void)lineidx_poll(e->buffer->index);
         /* Exact piece queries are warm after open; publication remains the
@@ -543,7 +553,8 @@ editor_stats editor_get_stats(const editor *e)
     editor_stats s = e->stats;
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
-    s.pending = e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
+    s.pending = e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }

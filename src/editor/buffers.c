@@ -52,7 +52,7 @@ static size_t snapshot_span(void *ctx, uint64_t off, const uint8_t **p)
 }
 static void snapshot_release(void *ctx) { piece_snapshot_release(ctx); }
 lineidx_src editor_source(editor_buffer *b)
-{ return (lineidx_src){b->tree, piece_len(b->tree), tree_span, NULL}; }
+{ return (lineidx_src){b->pending_open ? b->preview : b->tree, piece_len(b->pending_open ? b->preview : b->tree), tree_span, NULL}; }
 minimap_input editor_map_input(editor_buffer *b)
 {
     lineidx_src src = editor_source(b);
@@ -70,6 +70,7 @@ void editor_buffer_destroy(editor_buffer *b)
     if (b->file) file_close(b->file);
     if (b->undo_ready) undo_destroy(&b->undo);
     if (b->tree) piece_destroy(b->tree);
+    if (b->preview) piece_destroy(b->preview);
     if (b->piece_storage.ready) pthread_mutex_destroy(&b->piece_storage.mutex);
     edit_arena_free(&b->arena); free(b);
 }
@@ -84,7 +85,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     *out = NULL;
     if ((!bytes && len) || (path && strlen(path) >= IPC_PATH_CAP)) return EDITOR_ERR_ARG;
     editor_buffer *b = calloc(1, sizeof *b); if (!b) return EDITOR_ERR_MEMORY;
-    b->pool = &e->pool;
+    b->pool = &e->pool; b->watch_fd = -1;
     int rc = 0;
     b->base.path = "";
     if (path) {
@@ -96,7 +97,8 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         rc = file_open_begin(&e->pool, path, &opts, &b->file);
         if (rc) goto fail;
         e->opening = b->file; e->open_error = 0;
-        while (b->file && !file_open_ready(b->file)) {
+        while (b->file && (!file_prefix_ready(b->file) ||
+               (file_open_mode(b->file) == FILE_MODE_MMAP && !file_open_ready(b->file)))) {
             struct pollfd p = {work_pool_eventfd(&e->pool), POLLIN, 0};
             if (poll(&p, 1, 100) < 0 && errno != EINTR) { rc = EDITOR_ERR_IO; goto fail; }
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
@@ -111,6 +113,14 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
             }
         }
         e->opening = NULL;
+        if (b->file) {
+            b->watch_fd = file_watch_start(b->file);
+            struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};
+            if (b->watch_fd < 0 || epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, b->watch_fd, &event)) {
+                rc = EDITOR_ERR_IO; goto fail;
+            }
+            if (file_check(b->file, NULL)) { rc = EDITOR_ERR_IO; goto fail; }
+        }
     }
     size_t content = b->file ? (file_open_mode(b->file) == FILE_MODE_COPY ? (size_t)file_size(b->file) : 0) : len;
     size_t reserve = e->cfg.arena_bytes ? e->cfg.arena_bytes : 64u * 1024u * 1024u;
@@ -121,11 +131,19 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     b->piece_storage.ready = true;
     piece_allocator a = {&b->piece_storage, piece_alloc, piece_free};
     b->tree = piece_create(&a); if (!b->tree) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len); if (rc) goto fail;
+    b->pending_open = b->file && file_open_mode(b->file) == FILE_MODE_COPY && file_size(b->file) > FILE_PREFIX_MAX;
+    if (b->pending_open) {
+        size_t prefix_len = 0; const uint8_t *prefix = file_prefix(b->file, &prefix_len);
+        b->preview = piece_create(&a); if (!b->preview) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        rc = piece_init_copy(b->preview, prefix, prefix_len);
+    } else rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len);
+    if (rc) goto fail;
     if (e->journal && b->file && (!*b->base.path || journal_check_base(&b->base) || file_check(b->file, NULL))) {
         rc = EDITOR_ERR_IO; goto fail;
     }
-    editor_large_init(b);
+    if (b->pending_open) {
+        b->lines = piece_line_count(b->preview); b->lg.lines_exact = true; b->lg.warm_done = true;
+    } else editor_large_init(b);
     b->history_cap = e->cfg.history_keys ? e->cfg.history_keys : 32768;
     if (b->history_cap > (SIZE_MAX - 8) / (2 * sizeof(editor_delta))) { rc = EDITOR_ERR_ARG; goto fail; }
     rc = undo_init(&b->undo, b->tree, 2 * b->history_cap + 8); if (rc) goto fail;
@@ -135,28 +153,49 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     if (!b->history || !rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = minimap_init(&b->map, rows, e->max_rows); if (rc) goto fail;
     b->map_rows = rows;
-    piece_snapshot *snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    piece_snapshot *snap = piece_snapshot_take(b->pending_open ? b->preview : b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
     if (ir != INDENT_OK) { rc = EDITOR_ERR_ARG; goto fail; }
-    b->index = lineidx_create(piece_len(b->tree)); if (!b->index) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    rc = lineidx_bind_snapshot(b->index, snap); piece_snapshot_release(snap);
-    if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    if (piece_len(b->tree) <= MINIMAP_SMALL_BYTES) {
-        lineidx_src src = editor_source(b);
-        (void)lineidx_seek_line(b->index, &src, b->lines, MINIMAP_SMALL_BYTES);
-    } else {
+    b->index = lineidx_create(b->pending_open ? file_size(b->file) : piece_len(b->tree)); if (!b->index) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    if (!b->pending_open) {
         snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
-        lineidx_src src = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
-        if (lineidx_build_start(b->index, &e->pool, &src)) { piece_snapshot_release(snap); rc = EDITOR_ERR_MEMORY; goto fail; }
+        rc = lineidx_bind_snapshot(b->index, snap); piece_snapshot_release(snap);
+        if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        if (piece_len(b->tree) <= MINIMAP_SMALL_BYTES) {
+            lineidx_src src = editor_source(b);
+            (void)lineidx_seek_line(b->index, &src, b->lines, MINIMAP_SMALL_BYTES);
+        } else {
+            snap = piece_snapshot_take(b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
+            lineidx_src src = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
+            if (lineidx_build_start(b->index, &e->pool, &src)) { piece_snapshot_release(snap); rc = EDITOR_ERR_MEMORY; goto fail; }
+        }
+        editor_large_start(e, b);
     }
-    editor_large_start(e, b);
     b->initial = (view_state){.selection = {.preferred_col = VIEW_PREFERRED_UNSET},
         .wrap = e->cfg.wrap_mode ? e->cfg.wrap_mode > 0 : view_wrap_default(b->path)};
     *out = b; return 0;
 fail:
     e->opening = NULL;
     editor_buffer_destroy(b); return rc > 0 ? EDITOR_ERR_IO : rc;
+}
+int editor_adopt_open(editor *e, editor_buffer *b)
+{
+    if (b->source_stale || !b->pending_open || !file_open_ready(b->file)) return 0;
+    if (b == e->buffer && (e->dirty || e->backend->active || view_busy(&e->v))) return 0;
+    if (file_check(b->file, NULL) || (e->journal && journal_check_base(&b->base))) return EDITOR_ERR_IO;
+    int rc = file_attach(b->file, b->tree); if (rc) return EDITOR_ERR_IO;
+    b->pending_open = false;
+    editor_large_init(b);
+    piece_snapshot *snap = piece_snapshot_take(b->tree); if (!snap) return EDITOR_ERR_MEMORY;
+    rc = lineidx_bind_snapshot(b->index, snap); piece_snapshot_release(snap);
+    if (rc) return EDITOR_ERR_MEMORY;
+    snap = piece_snapshot_take(b->tree); if (!snap) return EDITOR_ERR_MEMORY;
+    lineidx_src src = {snap, piece_snapshot_len(snap), snapshot_span, snapshot_release};
+    if (lineidx_build_start(b->index, &e->pool, &src)) { piece_snapshot_release(snap); return EDITOR_ERR_MEMORY; }
+    editor_large_start(e, b);
+    if (b == e->buffer) { rc = editor_activate(e); if (rc) return rc; }
+    piece_destroy(b->preview); b->preview = NULL;
+    return 0;
 }
 static editor_buffer *find_buffer(editor *e, piece_tree *tree)
 {
@@ -171,7 +210,7 @@ int editor_activate(editor *e)
     if (!e->buffer->map.initialized) {
         int rc = minimap_init(&e->buffer->map, e->buffer->map_rows, e->max_rows); if (rc) return rc;
     }
-    e->tree = e->buffer->tree; e->undo = &e->buffer->undo;
+    e->tree = e->buffer->pending_open ? e->buffer->preview : e->buffer->tree; e->undo = &e->buffer->undo;
     view_config vc = {e->buffer->style.width, e->text_grid.dims.rows, 1, NULL, NULL};
     e->lay.row = e->lay.row_end; /* discard the outgoing layout continuation */
     e->lay.src = NULL; e->lay.cfg.tab_width = e->buffer->style.width; e->lay.tab = e->buffer->style.width;
@@ -276,12 +315,14 @@ void editor_modified(editor *e)
 }
 static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t col)
 {
+    if (b->pending_open && (line > 1 || col > 1)) return EDITOR_ERR_CAPACITY;
+    piece_tree *source = b->pending_open ? b->preview : b->tree;
     uint64_t ln = line ? (uint64_t)line - 1 : 0;
     if (ln >= b->lines) ln = b->lines - 1;
-    uint64_t start = piece_line_to_byte(b->tree, ln), end = piece_len(b->tree);
-    if (ln + 1 < b->lines) end = piece_line_to_byte(b->tree, ln + 1);
+    uint64_t start = piece_line_to_byte(source, ln), end = piece_len(source);
+    if (ln + 1 < b->lines) end = piece_line_to_byte(source, ln + 1);
     size_t n = end - start > VIEW_SCAN_BOUND ? VIEW_SCAN_BOUND : (size_t)(end - start);
-    int rc = piece_read(b->tree, start, e->indent_bytes, n); if (rc) return rc;
+    int rc = piece_read(source, start, e->indent_bytes, n); if (rc) return rc;
     size_t at = 0; uint64_t cells = 0, target = col ? (uint64_t)col - 1 : 0;
     while (at < n && cells < target && e->indent_bytes[at] != '\n' &&
            !(e->indent_bytes[at] == '\r' && at + 1 < n && e->indent_bytes[at + 1] == '\n')) {
@@ -350,12 +391,27 @@ static ipc_result open_request(const ipc_request *request, ipc_token token, void
 }
 int editor_poll_sources(editor *e)
 {
-    struct epoll_event events[2];
-    if (epoll_wait(e->poll_fd, events, 2, 0) < 0 && errno != EINTR) return EDITOR_ERR_IO;
-    (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+    struct epoll_event events[16];
+    int event_count = epoll_wait(e->poll_fd, events, 16, 0);
+    if (event_count < 0 && errno != EINTR) return EDITOR_ERR_IO;
+    for (int at = 0; at < event_count; at++) for (size_t i = 0; i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (b && b->file && b->watch_fd == events[at].data.fd) {
+            b->watch_pending = true; (void)file_watch_poll(b->file);
+        }
+    }
+    size_t messages = work_mailbox_drain(&e->pool, editor_route_work, e);
+    if (messages) for (size_t i = 0; i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (b && b->file && b->watch_pending && !b->source_stale) (void)file_watch_poll(b->file);
+    }
     int raster_rc = raster_poll_completions(e->backend);
     if (raster_rc) return raster_rc;
     editor_retire_buffers(e);
+    int source_rc = editor_check_sources(e); if (source_rc) return source_rc;
+    for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) {
+        int rc = editor_adopt_open(e, e->buffers[i]); if (rc) return rc;
+    }
     /* Opening can allocate. Finish queued input and submit its containing
      * frame before admitting setup work, even if the view itself is idle. */
     if (e->cfg.server && !e->queue_count && !view_busy(&e->v) &&
@@ -365,7 +421,7 @@ int editor_poll_sources(editor *e)
     }
     /* Index refresh is one existing bounded chunk query per UI turn, outside
      * minimap_fill. Pending revisions paint the module's stale tint. */
-    if (e->buffer && e->buffer->index) {
+    if (e->buffer && e->buffer->index && !e->buffer->pending_open && !e->buffer->source_stale) {
         editor_buffer *b = e->buffer; lineidx_src src = editor_source(b);
         (void)lineidx_poll(b->index);
         bool before = lineidx_complete(b->index) && !lineidx_building(b->index);
@@ -380,4 +436,45 @@ int editor_poll_sources(editor *e)
         }
     }
     return e->error;
+}
+
+int editor_source_resolve(editor *e, bool reload)
+{
+    if (!e || !e->buffer->source_stale) return EDITOR_ERR_ARG;
+    e->source_choice = reload ? 2u : 1u; return 0;
+}
+int editor_check_sources(editor *e)
+{
+    for (size_t i = 0; i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (!b || !b->file || b->source_stale) continue;
+        if (b->watch_pending) (void)file_watch_poll(b->file);
+        if (!file_changed(b->file)) continue;
+        b->source_stale = true; b->lg.find_running = false;
+        lineidx_build_cancel(b->index);
+        work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
+        if (b == e->buffer) {
+            if (e->action == EDITOR_ACTION_REPLAY_WORK) {
+                undo_clear(e->undo); b->history_count = b->history_cursor = b->history_head = 0;
+                b->saved_lost = true;
+            }
+            undo_break_burst(e->undo); e->action = EDITOR_ACTION_NONE; e->v.busy = false;
+            e->lay.row = e->lay.row_end; e->extra_rows = e->full_pending = false;
+            int rc = editor_begin_frame(e); if (rc) return rc;
+            e->paint_ready = true; rc = render_mark_full(&e->grid); if (rc) return rc;
+        }
+    }
+    if (!e->source_choice) return 0;
+    unsigned choice = e->source_choice; e->source_choice = 0;
+    editor_buffer *b = e->buffer;
+    if (!b->source_stale) return 0;
+    if (choice == 1) {
+        int rc = file_resolve_keep(b->file);
+        if (rc) return 0; /* Unsafe mapped keep retains the visible prompt. */
+        b->source_stale = false; return editor_full_layout(e);
+    }
+    size_t old_tab = tabs_active_index(&e->tabs); uint64_t id;
+    int rc = editor_add_buffer(e, b->path, NULL, 0, &id);
+    if (rc) return 0; /* Keep the old suspended generation available on failure. */
+    return editor_close_tab(e, old_tab);
 }

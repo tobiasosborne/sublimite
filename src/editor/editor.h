@@ -57,7 +57,7 @@ typedef struct editor_stats {
     uint64_t slices, longest_slice_ns;
     uint64_t unimplemented_actions, rejected_commands, minimap_fills, minimap_ns;
     size_t tabs, active_tab;
-    bool minimap_stale;
+    bool minimap_stale, source_stale, open_pending;
     bool focused, blinking, cursor_visible, render_active, pending;
     int journal_error, error_cause; /* underlying module code on stopped loop */
     int backend_init_error;           /* failed GPU init, 0 if no fallback */
@@ -67,7 +67,13 @@ typedef struct editor_stats {
  * outlives editor_close. Open reserves memory, starts workers, opens/maps the
  * file and initialises the backend on a worker. The loop routes native
  * completion callbacks and polls only an outstanding presented GPU frame.
+ * Copy-mode files larger than the bounded prefix publish a read-only preview
+ * while open_pending is true. Queued keys wait for whole-source adoption;
+ * pending remains the frame/input-work flag, so a preview can settle.
  * Close is quiescent, blocking and releases workers before their storage. */
+/* Queue a stale-source choice; processed off the typing path. Unsafe keep
+ * leaves the source suspended; reload opens the current generation. */
+int editor_source_resolve(editor *e, bool reload);
 int editor_open(editor **out, const editor_config *config, render_backend *backend);
 /* Setup only. NULL selects EGL; explicit gl/raster overrides for tests/benches.
  * Unknown names fail without changing the backend. Set raster_fallback at open

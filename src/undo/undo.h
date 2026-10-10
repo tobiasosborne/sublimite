@@ -75,6 +75,16 @@ typedef struct undo_change {
     int has_state;
     undo_state state;
 } undo_change;
+/* Constant-time boundary accounting. Counts retain the pre-group boundary
+ * during sliced replay. group_serial changes only when a new edit group starts;
+ * evicted_groups counts oldest groups removed by cap trimming (not redo).
+ * No record storage is read; suitable for editor typing admission/accounting. */
+typedef struct undo_history {
+    size_t undo_groups, redo_groups, evicted_groups;
+    uint64_t group_serial;
+} undo_history;
+struct undo_log;
+undo_history undo_get_history(const struct undo_log *u);
 typedef struct undo_stats {
     size_t records, undo_groups, redo_groups, live_bytes, reserved_bytes;
     size_t retired_records, committed_bytes;
@@ -88,6 +98,8 @@ typedef struct undo_log {
     piece_tree *tree;
     uint32_t head, tail, cursor;
     size_t count, cap, max_records, applied_count;
+    size_t total_groups, applied_groups, evicted_groups;
+    uint64_t group_serial;
     size_t retired_count, page_bytes, committed_bytes;
     uint32_t retired_head, retired_tail, replay_first;
     piece_snapshot *replay_view;
