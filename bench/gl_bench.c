@@ -1,9 +1,11 @@
 #include "gl/gl_driver.h"
+#include "gl_gate.h"
 #include "font/font.h"
 #include "harness.h"
 #include "render_pace.h"
 #include <elf.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <unistd.h>
 #define GL_BENCH_CHECK(c) do { if (!(c)) { fprintf(stderr,"gl_bench:%d: FAIL %s\n",__LINE__,#c); return 1; } } while (0)
@@ -33,6 +35,27 @@ static int gl_bench_report(const char *name,const bench_samples *samples,uint64_
         (unsigned long long)gate50,(unsigned long long)gate99,pass ? 1 : 0,bench_evidence_tag(),load,getenv("EDIT_GL_UPLOAD"));
     return pass ? 0 : 1;
 }
+/* Gated row: the verdict comes from gl_gate_judge, which enforces the limits
+ * under [AC], [bat] and [unknown] power alike (the tag is evidence, not a
+ * switch), refuses a verdict below the required sample count, and labels
+ * partial-operation rows. Experiments (EDIT_GL_UPLOAD) stay TRACK. */
+static int gl_bench_gate_row(const char *name,const char *scenario,bench_samples *samples,size_t required,
+                             const gl_gate_limit *lim,bool partial)
+{
+    if (getenv("EDIT_GL_UPLOAD")!=NULL) return gl_bench_report(name,samples,0,0);
+    uint64_t p50=bench_p50(samples),p99=bench_p99(samples),lo=0,hi=0;
+    bench_ci95(samples,0.50,&lo,&hi);
+    const char *tag=bench_evidence_tag();
+    gl_gate_verdict v=gl_gate_judge(tag,samples->n,samples->dropped,required,p50,p99,lim,partial);
+    char load[32]; gl_bench_load(load,sizeof load);
+    printf("BENCH name=%s scenario=%s n=%zu required_n=%zu p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=%llu gate_p99=%llu/%llu "
+           "status=%s pass=%d g_claim=%s evidence=(M) power=%s load1=%s\n",
+        name,scenario,samples->n,required,(unsigned long long)p50,(unsigned long long)p99,(unsigned long long)lo,(unsigned long long)hi,
+        (unsigned long long)lim->p50_ns,(unsigned long long)lim->p99_num,(unsigned long long)lim->p99_den,
+        gl_gate_name(v),v==GL_GATE_PASS||v==GL_GATE_PASS_PARTIAL ? 1 : 0,
+        v==GL_GATE_PASS ? "yes" : "no",tag,load);
+    return gl_gate_exit(v);
+}
 static uint32_t gl_bench_random(uint32_t *seed)
 { uint32_t x=*seed; x^=x<<13; x^=x>>17; x^=x<<5; *seed=x; return x; }
 static void gl_bench_fill(render_cell *cells,size_t count,uint32_t *seed)
@@ -46,22 +69,26 @@ static void gl_bench_fill(render_cell *cells,size_t count,uint32_t *seed)
 static int gl_bench_snapshot(gl_driver *d,render_grid *g,uint32_t id,bool full,uint64_t *ingress)
 {
     edit_malloc_guard_begin();
-    *ingress=bench_now_ns();
+    *ingress=bench_now_ns(); /* ingress: before lease, mutation, damage and strips (review gl-1 MAJOR 10) */
     const char *upload=getenv("EDIT_GL_UPLOAD");
     bool direct=upload!=NULL && strcmp(upload,"persistent")==0;
     int rc=direct ? gl_cells_acquire(d->backend,g,!full) : RENDER_OK;
     if (rc==RENDER_OK) rc=render_frame_begin(g,id);
-    /* Same synthetic layout workload in all experiments, written directly
-     * into the CPU grid or mapped lease. Start timing before lease/layout. */
-    if (rc==RENDER_OK && upload!=NULL) {
+    /* The mutation is part of the timed operation in every mode: a full
+     * frame is a one-row scroll (shift + new bottom row) or, in the upload
+     * experiments, a synthetic full fill; a typing frame touches one cell. */
+    if (rc==RENDER_OK) {
         uint32_t seed=UINT32_C(0x37216e9d)^id;
-        if (full) gl_bench_fill(g->cells,(size_t)g->dims.cols*g->dims.rows,&seed);
-        else g->cells[(size_t)(g->dims.rows/2)*g->dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
+        size_t n=(size_t)g->dims.cols*g->dims.rows;
+        if (full && upload!=NULL) gl_bench_fill(g->cells,n,&seed);
+        else if (full) {
+            memmove(g->cells,g->cells+g->dims.cols,(n-g->dims.cols)*sizeof *g->cells);
+            gl_bench_fill(g->cells+n-g->dims.cols,g->dims.cols,&seed);
+        } else g->cells[(size_t)(g->dims.rows/2)*g->dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
     }
     if (rc==RENDER_OK) rc=full ? render_mark_full(g) : render_mark_rows(g,g->dims.rows/2,1);
     render_strip strips[120]; size_t count=0;
     if (rc==RENDER_OK) rc=render_dirty_strips(g,strips,120,&count);
-    if (upload==NULL) *ingress=bench_now_ns(); /* preserve legacy timing */
     if (rc==RENDER_OK) rc=direct ? gl_cells_submit(d->backend,g,strips,count) : render_backend_submit(d->backend,g,strips,count);
     size_t allocations=edit_malloc_guard_end();
     return allocations==0 ? rc : RENDER_ERR_DEVICE;
@@ -82,7 +109,8 @@ static int gl_bench_frame(gl_driver *d,render_grid *g,gl_bench_hooks *hooks,uint
     return RENDER_OK;
 }
 /* Sum only the module object's .text sections; the path follows the Makefile's
- * build/bench -> build/rel/src/gl relation. ELF inspection is startup-only. */
+ * build/bench -> build/rel/src/gl relation. ELF inspection is startup-only and
+ * bounds-checked by gl_gate_elf_text_bytes (unit-tested). */
 static uint64_t gl_bench_text_bytes(const char *exe)
 {
     char path[4096]; size_t len=strlen(exe);
@@ -94,17 +122,73 @@ static uint64_t gl_bench_text_bytes(const char *exe)
     if (base+sizeof suffix>sizeof path) return 0;
     memcpy(path+base,suffix,sizeof suffix);
     FILE *f=fopen(path,"rb"); if (f==NULL) return 0;
-    Elf64_Ehdr eh; Elf64_Shdr sh[128]; char names[4096]; uint64_t bytes=0;
-    if (fread(&eh,sizeof eh,1,f)!=1 || memcmp(eh.e_ident,ELFMAG,SELFMAG)!=0 || eh.e_shnum>128 ||
-        eh.e_shstrndx>=eh.e_shnum || eh.e_shoff>LONG_MAX || eh.e_shentsize!=sizeof(Elf64_Shdr)) goto done;
-    if (fseek(f,(long)eh.e_shoff,SEEK_SET)!=0 || fread(sh,sizeof(Elf64_Shdr),eh.e_shnum,f)!=eh.e_shnum) goto done;
-    Elf64_Shdr table=sh[eh.e_shstrndx];
-    if (table.sh_size>sizeof names || table.sh_offset>LONG_MAX ||
-        fseek(f,(long)table.sh_offset,SEEK_SET)!=0 || fread(names,1,(size_t)table.sh_size,f)!=table.sh_size) goto done;
-    for (uint16_t i=0;i<eh.e_shnum;i++)
-        if (sh[i].sh_name+5u<table.sh_size && memcmp(names+sh[i].sh_name,".text",5)==0) bytes+=sh[i].sh_size;
-done:
+    uint64_t bytes=0;
+    if (!gl_gate_elf_text_bytes(f,&bytes)) bytes=0;
     fclose(f); return bytes;
+}
+/* Bulk-worker load (perf §0.2: G1/G3 are verified with index, find and save
+ * queued and one active). The work pool admits one bulk worker, so a running
+ * job holds it for the whole window (it loops in 256 KiB chunks, polling
+ * work_should_stop each chunk, far inside the 5 ms rule) and the other jobs
+ * stay queued behind it. Overlap is verified, not assumed. */
+#define GL_BULK_BYTES (32u<<20)
+#define GL_BULK_CHUNK (256u<<10)
+typedef struct gl_bulk_job { uint8_t *buf; int kind; _Atomic uint64_t chunks; } gl_bulk_job;
+typedef struct gl_bulk {
+    work_pool pool; bool live; uint8_t *mem; gl_bulk_job jobs[3]; work_handle h[3]; size_t njobs;
+    uint64_t chunks_at_start;
+} gl_bulk;
+static volatile uint64_t gl_bulk_sink;
+static void gl_bulk_run(work_ctx *c)
+{
+    gl_bulk_job *j=c->arg; size_t pos=0; uint64_t h=1469598103934665603ull;
+    while (!work_should_stop(c)) {
+        uint8_t *p=j->buf+pos;
+        if (j->kind==0) { for (size_t i=0;i<GL_BULK_CHUNK;i+=8) { uint64_t w; memcpy(&w,p+i,8); h=(h^w)*1099511628211ull; } } /* index: hash scan */
+        else if (j->kind==1) { const void *f=memchr(p,0xff,GL_BULK_CHUNK); h+=f!=NULL; }                                   /* find: byte scan */
+        else { memcpy(j->buf+((pos+(GL_BULK_BYTES-GL_BULK_CHUNK)/2)%(GL_BULK_BYTES-GL_BULK_CHUNK)),p,GL_BULK_CHUNK/2); h+=p[0]; }                          /* save: copy-out */
+        pos=(pos+GL_BULK_CHUNK)%(GL_BULK_BYTES-GL_BULK_CHUNK);
+        atomic_fetch_add_explicit(&j->chunks,1,memory_order_relaxed);
+    }
+    gl_bulk_sink=h;
+}
+static uint64_t gl_bulk_chunks(const gl_bulk *b)
+{ uint64_t t=0; for (size_t i=0;i<b->njobs;i++) t+=atomic_load_explicit(&b->jobs[i].chunks,memory_order_relaxed); return t; }
+static int gl_bulk_start(gl_bulk *b,size_t njobs)
+{
+    memset(b,0,sizeof *b);
+    b->mem=malloc(GL_BULK_BYTES);
+    if (b->mem==NULL) return -1;
+    memset(b->mem,0x41,GL_BULK_BYTES);
+    if (work_pool_init(&b->pool,1,0)!=0) { free(b->mem); b->mem=NULL; return -1; }
+    b->live=true; b->njobs=njobs;
+    for (size_t i=0;i<njobs;i++) {
+        b->jobs[i].buf=b->mem; b->jobs[i].kind=(int)i; atomic_init(&b->jobs[i].chunks,0);
+        b->h[i]=work_submit(&b->pool,(work_job){gl_bulk_run,&b->jobs[i],1,WORK_BULK});
+        if (b->h[i].epoch==0) return -1;
+    }
+    /* Wait until the active job demonstrably runs. */
+    uint64_t deadline=bench_now_ns()+UINT64_C(2000000000);
+    while (gl_bulk_chunks(b)==0) { if (bench_now_ns()>deadline) return -1; struct timespec ts={0,1000000}; nanosleep(&ts,NULL); }
+    b->chunks_at_start=gl_bulk_chunks(b);
+    return 0;
+}
+/* True when the background work progressed during the window, exactly one
+ * job ran, and every other job is still queued (not finished). */
+static bool gl_bulk_overlapped(const gl_bulk *b)
+{
+    if (gl_bulk_chunks(b)<=b->chunks_at_start+1) return false;
+    for (size_t i=0;i<b->njobs;i++) {
+        bool ran=atomic_load_explicit(&b->jobs[i].chunks,memory_order_relaxed)!=0;
+        if (work_handle_finished(&b->pool,b->h[i])) return false;
+        if (i!=0 && ran) return false;
+    }
+    return true;
+}
+static void gl_bulk_stop(gl_bulk *b)
+{
+    if (b->live) { for (size_t i=0;i<b->njobs;i++) work_cancel(&b->pool,b->h[i]); work_pool_shutdown(&b->pool); }
+    free(b->mem); memset(b,0,sizeof *b);
 }
 typedef struct gl_pace_rig {
     gl_driver *driver; render_grid *grid; gl_bench_hooks *hooks;
@@ -170,7 +254,39 @@ static void gl_scroll_track(gl_driver *driver, render_grid *grid, gl_bench_hooks
     gl_pace_rig r = {driver,grid,hooks,id,seed};
     render_pace_run(stdout,name,names,sizeof names / sizeof names[0],gl_pace_frame,&r);
 }
-static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only)
+/* One scenario: `n` frames of `full` (scroll-one-row full frame, G3) or typing
+ * (one cell, G1), collecting T5 (device fence) and T4 (submit+present return). */
+static int gl_bench_measure(gl_driver *d,render_grid *g,gl_bench_hooks *hooks,uint32_t *id,bool full,size_t n,
+                            bench_samples *t5,bench_samples *t4)
+{
+    uint64_t elapsed=0;
+    for (size_t i=0;i<n;i++) {
+        GL_BENCH_CHECK(gl_bench_frame(d,g,hooks,id,full,&elapsed)==RENDER_OK);
+        (void)bench_add(t5,elapsed);
+        (void)bench_add(t4,hooks->submit_ns+hooks->present_ns);
+    }
+    return 0;
+}
+/* Rows for the three operations of a scenario. G3 rows compare the renderer-only
+ * time with the budget minus the minimap allowance and never claim G3. */
+static int gl_bench_rows(const char *scenario,const char *suffix,bench_samples *t5,bench_samples *t4,bool full,size_t required)
+{
+    gl_gate_limit g3={GL_GATE_G3_P50_NS,GL_GATE_G3_P99_NUM,GL_GATE_G3_P99_DEN};
+    gl_gate_limit g3r=gl_gate_reduce_for_minimap(&g3);
+    gl_gate_limit g1={1000000u,2000000u,1u};
+    char name[96]; int failed=0;
+    if (full) {
+        (void)snprintf(name,sizeof name,"full_frame_T5_%s",suffix);
+        failed|=gl_bench_gate_row(name,scenario,t5,required,&g3r,true);
+    } else {
+        (void)snprintf(name,sizeof name,"typing_T4_%s",suffix);
+        failed|=gl_bench_gate_row(name,scenario,t4,required,&g1,true);
+        (void)snprintf(name,sizeof name,"typing_T5_%s",suffix);
+        failed|=gl_bench_report(name,t5,0,0); /* T5 is tracked, not a G1 endpoint */
+    }
+    return failed;
+}
+static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only,bool bulk_only)
 {
     char track_name[80]; snprintf(track_name,sizeof track_name,"A_egl_scroll_600_%upx",px);
     const char *skip_reason = render_pace_skip_reason(getenv("DISPLAY"));
@@ -198,13 +314,13 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     if (rc!=RENDER_OK) {
         if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"X11_unavailable");
         printf("BENCH name=egl_init_%upx status=SKIP reason=X11_unavailable result=%d power=%s\n",px,rc,bench_evidence_tag());
-        gl_driver_cleanup(&driver); edit_arena_free(&arena); return scroll_only ? 0 : 2;
+        gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
     rc=gl_driver_init(&driver);
     if (rc!=RENDER_OK) {
         if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"EGL_or_matching_Present_unsupported");
         printf("BENCH name=egl_init_%upx status=SKIP reason=EGL_or_matching_Present_unsupported result=%d power=%s\n",px,rc,bench_evidence_tag());
-        gl_driver_cleanup(&driver); edit_arena_free(&arena); return scroll_only ? 0 : 2;
+        gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
     uint32_t id=0; uint64_t elapsed=0;
     if (scroll_only) {
@@ -212,43 +328,73 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 0;
     }
     if (getenv("EDIT_GL_UPLOAD")!=NULL) puts("egl_bench: layout=synthetic_cell_fill G3=layout_to_T5 G1=layout_to_T4; editor ingress/mutation outside this microbench");
-    printf("egl_bench: px=%u VBO=%s surface=2880x1800 cells=%zu timing=T5_after_SwapBuffers minimap=absent allowance_ns=180000(E) indicative=concurrent_workers\n",
+    printf("egl_bench: px=%u VBO=%s surface=2880x1800 cells=%zu timing=T5_after_SwapBuffers minimap=absent allowance_ns=180000(E)_deducted_from_G3_budget rows=partial_operation_no_G3_claim\n",
            px,gl_buffer_mode(&backend),ncells);
     printf("egl_bench: renderer=%s native_window=%ux%u swap_interval=%s T6=Present_PIXMAP_Complete\n",gl_device_name(&backend),driver.platform.width,driver.platform.height,getenv("EDIT_GL_SWAP_INTERVAL"));
     puts("egl_bench: every frame asserts 0 counted allocations from begin/damage through submit; present/event outside law 2");
-    uint64_t sample_buf[10000]; bench_samples samples;
+    static uint64_t sample_buf[10000], sample_buf4[10000]; bench_samples samples, samples4;
     bench_samples_init(&samples,sample_buf,2000); (void)bench_add(&samples,driver.init_ns);
-    char name[80]; int failed=0;
+    int failed=0;
+    bool experiment=getenv("EDIT_GL_UPLOAD")!=NULL;
     if (px==15) failed=gl_bench_report("init_cost",&samples,0,0);
     else printf("egl_bench: init_cost_30px_ns=%llu TRACK (M)%s\n",(unsigned long long)driver.init_ns,bench_evidence_tag());
-    size_t warm=quick ? 20 : 200, n=quick ? 100 : 2000;
-    for (size_t i=0;i<warm;i++) GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
-    bench_samples_init(&samples,sample_buf,2000);
-    uint64_t submit_total=0,present_total=0,fence_total=0;
-    for (size_t i=0;i<n;i++) {
-        GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
-        submit_total+=hooks.submit_ns; present_total+=hooks.present_ns; fence_total+=hooks.fence_ns;
-        (void)bench_add(&samples,elapsed);
-    }
-    (void)snprintf(name,sizeof name,"full_frame_warm_%upx",px);
-    bool experiment=getenv("EDIT_GL_UPLOAD")!=NULL;
-    bool indicative=experiment || strcmp(bench_evidence_tag(),"[AC]")!=0;
-    printf("egl_bench: %s reference_gate_p50_ns=5000000 reference_gate_p99_ns=5560000(G) verdict=%s\n",
-        name,experiment ? "TRACK_shared_box" : (indicative ? "TRACK_battery" : "gate_pending_quiet_box"));
-    failed|=gl_bench_report(name,&samples,indicative ? 0 : 5000000,indicative ? 0 : 5560000);
-    printf("egl_bench: mean_submit_ns=%llu mean_present_ns=%llu mean_fence_poll_ns=%llu (M)%s\n",
-        (unsigned long long)(submit_total/n),(unsigned long long)(present_total/n),(unsigned long long)(fence_total/n),bench_evidence_tag());
-    if (px==15) {
-        bench_samples_init(&samples,sample_buf,2000);
-        for (size_t i=0;i<n;i++) {
-            if (!experiment) cells[(size_t)(dims.rows/2)*dims.cols].bg=gl_bench_random(&seed)&0xffffffu;
-            GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,false,&elapsed)==RENDER_OK);
-            /* G1 ends at T4. Full frame G3 continues to device fence T5. */
-            if (experiment) elapsed=hooks.submit_ns+hooks.present_ns;
-            (void)bench_add(&samples,elapsed);
+    /* Required sample count (perf §4): 10 000 per interaction scenario. Quick
+     * mode takes fewer, so its gate rows are REFUSED, never PASS. */
+    const size_t required=GL_GATE_SAMPLES_INTERACTION;
+    size_t warm=quick ? 20 : 200, n=quick ? 100 : required;
+    char name[96];
+    if (!bulk_only) {
+        for (size_t i=0;i<warm;i++) GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
+        bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
+        GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,true,n,&samples,&samples4)==0);
+        (void)snprintf(name,sizeof name,"full_frame_warm_%upx",px);
+        if (experiment) { puts("egl_bench: experiment rows are TRACK_shared_box"); failed|=gl_bench_report(name,&samples,0,0); }
+        else {
+            gl_gate_limit g3={GL_GATE_G3_P50_NS,GL_GATE_G3_P99_NUM,GL_GATE_G3_P99_DEN};
+            gl_gate_limit g3r=gl_gate_reduce_for_minimap(&g3);
+            printf("egl_bench: %s G3 p50<=%llu p99<=%llu/%llu ns exact; renderer-only budget (minimap allowance deducted) p50<=%llu p99<=%llu/%llu\n",
+                name,(unsigned long long)g3.p50_ns,(unsigned long long)g3.p99_num,(unsigned long long)g3.p99_den,
+                (unsigned long long)g3r.p50_ns,(unsigned long long)g3r.p99_num,(unsigned long long)g3r.p99_den);
+            failed|=gl_bench_gate_row(name,"warm_scroll_one_row",&samples,required,&g3r,true);
         }
-        if (experiment) puts("egl_bench: typing_row reference_gate_p50_ns=1000000 reference_gate_p99_ns=2000000(G) timing=layout_to_T4 verdict=TRACK_shared_box");
-        failed|=gl_bench_report("typing_row",&samples,0,0);
+        printf("egl_bench: %s T4_p50_ns=%llu T4_p99_ns=%llu (M)%s\n",name,
+            (unsigned long long)bench_p50(&samples4),(unsigned long long)bench_p99(&samples4),bench_evidence_tag());
+    }
+    if (px==15) {
+        if (!bulk_only) {
+            bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
+            GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,false,n,&samples,&samples4)==0);
+            if (experiment) { puts("egl_bench: typing_row reference_gate_p50_ns=1000000 reference_gate_p99_ns=2000000(G) timing=layout_to_T4 verdict=TRACK_shared_box");
+                bench_samples_init(&samples,sample_buf,required);
+                for (size_t i=0;i<samples4.n;i++) (void)bench_add(&samples,samples4.v[i]);
+                failed|=gl_bench_report("typing_row",&samples,0,0); }
+            else failed|=gl_bench_rows("typing","warm",&samples,&samples4,false,required);
+        }
+        if (!experiment) {
+            /* Bulk-worker scenarios: one active job, the rest queued behind it. */
+            static const struct { const char *name; size_t jobs; } bulks[]={{"bulk_active",1},{"bulk_queued3",3}};
+            for (size_t k=0;k<2;k++) {
+                gl_bulk bulk;
+                if (gl_bulk_start(&bulk,bulks[k].jobs)!=0) {
+                    printf("BENCH name=%s status=REFUSED reason=bulk_worker_did_not_start pass=0\n",bulks[k].name);
+                    gl_bulk_stop(&bulk); failed=1; continue;
+                }
+                for (int full=1;full>=0;full--) {
+                    bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
+                    uint64_t c0=gl_bulk_chunks(&bulk); bulk.chunks_at_start=c0;
+                    GL_BENCH_CHECK(gl_bench_measure(&driver,&grid,&hooks,&id,full!=0,n,&samples,&samples4)==0);
+                    if (!gl_bulk_overlapped(&bulk)) {
+                        printf("BENCH name=%s_%s status=REFUSED reason=bulk_overlap_not_verified pass=0\n",bulks[k].name,full ? "full" : "typing");
+                        failed=1; continue;
+                    }
+                    printf("egl_bench: %s bulk_chunks_during_window=%llu jobs=%zu active=1 queued=%zu\n",bulks[k].name,
+                        (unsigned long long)(gl_bulk_chunks(&bulk)-c0),bulks[k].jobs,bulks[k].jobs-1);
+                    failed|=gl_bench_rows(bulks[k].name,bulks[k].name,&samples,&samples4,full!=0,required);
+                }
+                gl_bulk_stop(&bulk);
+            }
+        }
+        if (bulk_only) { gl_driver_cleanup(&driver); edit_arena_free(&arena); return failed; }
         if (upload_only) { gl_driver_cleanup(&driver); edit_arena_free(&arena); return failed; }
         if (skip_reason == NULL) {
             const char *old_interval=getenv("EDIT_GL_SWAP_INTERVAL");
@@ -262,8 +408,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
             size_t scroll_n=quick ? 100 : 10000;
             bench_samples_init(&samples,sample_buf,10000);
             for (size_t i=0;i<scroll_n;i++) {
-                memmove(cells,cells+dims.cols,(ncells-dims.cols)*sizeof(render_cell));
-                gl_bench_fill(cells+ncells-dims.cols,dims.cols,&seed);
+                /* scroll mutation happens inside gl_bench_frame's timed region */
                 GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
                 uint64_t msc=gl_displayed_msc(&backend);
                 uint64_t gap=0;
@@ -273,15 +418,15 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
                 previous=msc;
             }
             printf("egl_bench: scroll_frames=%zu displayed_msc_misses=%llu (M)%s hard_max=0(G)\n",scroll_n,(unsigned long long)misses,bench_evidence_tag());
-            /* Per-frame gap percentiles use the shared harness. The aggregate
-             * zero-miss hard maximum also rejects rare gaps below p99 rank. */
             uint64_t lo=0,hi=0; bench_ci95(&samples,0.50,&lo,&hi);
-            printf("BENCH name=scroll_10k n=%zu p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 misses=%llu duplicate_msc=%llu gate_max=0 max_gap=%llu status=%s pass=%d power=%s\n",
-                samples.n,(unsigned long long)bench_p50(&samples),(unsigned long long)bench_p99(&samples),
+            gl_gate_verdict cv=gl_gate_cadence(bench_evidence_tag(),samples.n,GL_GATE_SAMPLES_INTERACTION,misses,duplicates,samples.dropped);
+            if (experiment && cv!=GL_GATE_MISS) cv=GL_GATE_UNKNOWN; /* experiments never qualify */
+            printf("BENCH name=scroll_10k n=%zu required_n=%u p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 misses=%llu duplicate_msc=%llu gate_max=0 max_gap=%llu status=%s pass=%d power=%s\n",
+                samples.n,GL_GATE_SAMPLES_INTERACTION,(unsigned long long)bench_p50(&samples),(unsigned long long)bench_p99(&samples),
                 (unsigned long long)lo,(unsigned long long)hi,(unsigned long long)misses,
-                (unsigned long long)duplicates,(unsigned long long)bench_p(&samples,1.0),indicative ? "TRACK" : "GATE",
-                indicative || (misses==0 && duplicates==0 && samples.n==scroll_n && samples.dropped==0) ? 1 : 0,bench_evidence_tag());
-            if (!indicative && (misses!=0 || duplicates!=0)) failed=1;
+                (unsigned long long)duplicates,(unsigned long long)bench_p(&samples,1.0),gl_gate_name(cv),
+                cv==GL_GATE_PASS ? 1 : 0,bench_evidence_tag());
+            failed|=gl_gate_exit(cv);
             gl_driver_cleanup(&driver);
             GL_BENCH_CHECK(setenv("EDIT_GL_SWAP_INTERVAL",saved_interval,1)==0);
             backend=(render_backend){0};
@@ -296,7 +441,10 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
                 GL_BENCH_CHECK(gl_bench_frame(&driver,&grid,&hooks,&id,true,&elapsed)==RENDER_OK);
                 (void)bench_add(&samples,elapsed);
             }
-            failed|=gl_bench_report("first_frame_after_idle",&samples,0,0);
+            /* G3i: T = 1e9/90 ns p99, 8 ms p50 (provisional GPU wake). */
+            gl_gate_limit gi={8000000u,1000000000u,90u};
+            gl_gate_limit gir=gl_gate_reduce_for_minimap(&gi);
+            failed|=gl_bench_gate_row("first_frame_after_idle","after_idle_15s",&samples,5,&gir,true);
         } else puts("BENCH name=first_frame_after_idle status=SKIP reason=quick_mode");
     }
     if (skip_reason == NULL) {
@@ -314,21 +462,55 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     gl_driver_cleanup(&driver); edit_arena_free(&arena);
     return failed;
 }
+/* GL-free check of the bulk-load scenarios: for 1 and 3 jobs the active job
+ * makes progress for 200 ms while the others stay queued. */
+static int gl_bulk_self_check(void)
+{
+    static const size_t counts[]={1,3};
+    for (size_t k=0;k<2;k++) {
+        gl_bulk b;
+        GL_BENCH_CHECK(gl_bulk_start(&b,counts[k])==0);
+        uint64_t c0=gl_bulk_chunks(&b); b.chunks_at_start=c0;
+        struct timespec ts={0,200000000}; nanosleep(&ts,NULL);
+        bool ok=gl_bulk_overlapped(&b);
+        printf("gl_bench: bulk_self_check jobs=%zu chunks_in_200ms=%llu overlapped=%d\n",counts[k],
+            (unsigned long long)(gl_bulk_chunks(&b)-c0),ok ? 1 : 0);
+        GL_BENCH_CHECK(ok);
+        gl_bulk_stop(&b);
+    }
+    return 0;
+}
 int main(int argc,char **argv)
 {
     (void)setvbuf(stdout,NULL,_IOLBF,0);
     if (argc == 2 && !strcmp(argv[1],"--pace-self-check")) return render_pace_self_check();
+    if (argc == 2 && !strcmp(argv[1],"--bulk-self-check")) return gl_bulk_self_check();
     const char *upload=getenv("EDIT_GL_UPLOAD");
-    bool quick=false, focus=false, valid=true;
+    bool quick=false, focus=false, valid=true, bulk_only=false, help=false;
     bool scroll_only = argc == 2 && strcmp(argv[1],"--scroll-track")==0;
     if (!scroll_only) for (int i=1;i<argc;i++) {
         if (!quick && strcmp(argv[i],"--quick")==0) quick=true;
         else if (!focus && strcmp(argv[i],"--upload-only")==0) focus=true;
+        else if (!bulk_only && strcmp(argv[i],"--bulk-only")==0) bulk_only=true;
+        else if (strcmp(argv[i],"--help")==0 || strcmp(argv[i],"-h")==0) help=true;
         else valid=false;
     }
-    if (!valid) {
-        fprintf(stderr,"usage: %s [--quick [--upload-only]|--upload-only [--quick]|--scroll-track|--pace-self-check]; EDIT_GL_VBO=orphan|persistent; EDIT_GL_UPLOAD=subdata|orphan|persistent\n",argv[0]);
-        return 1;
+    if (help || !valid) {
+        fprintf(help ? stdout : stderr,
+            "usage: %s [--quick] [--upload-only] [--bulk-only] [--scroll-track] [--pace-self-check] [--bulk-self-check] [--help]\n"
+            "  (default)        warm full frame, typing (G1 T4 + T5), bulk_active, bulk_queued3, G3z scroll_10k, G3i, paced scroll\n"
+            "  --quick          100-frame smoke run: gate rows print status=REFUSED (needs %u samples), never PASS\n"
+            "  --bulk-only      only bulk_active (1 background job) and bulk_queued3 (1 active + 2 queued) rows, 15px; the\n"
+            "                   background overlap is verified and a row without overlap is REFUSED\n"
+            "  --upload-only    EDIT_GL_UPLOAD experiments only (TRACK, never qualifying)\n"
+            "  --scroll-track / --pace-self-check  paced scroll track / its self check\n"
+            "  --bulk-self-check  GL-free check that bulk_active / bulk_queued3 load really overlaps\n"
+            "env: EDIT_GL_VBO=orphan|persistent; EDIT_GL_UPLOAD=subdata|orphan|persistent; DISPLAY must be Xvfb :99, never :0\n"
+            "status: PASS | PASS_PARTIAL (renderer-only, no G3 claim) | MISS | UNKNOWN (power unknown) | REFUSED (too few samples)\n"
+            "limits are enforced under [AC], [bat] and [unknown]; G3 p99 limit is the exact 1e9/180 ns (printed as num/den)\n"
+            "exit: 0 ok, 1 gate miss or error, 2 no GL context (printed as SKIP; no numbers are fabricated)\n",
+            argv[0],GL_GATE_SAMPLES_INTERACTION);
+        return help ? 0 : 1;
     }
     if (upload!=NULL && strcmp(upload,"subdata")!=0 && strcmp(upload,"orphan")!=0 && strcmp(upload,"persistent")!=0) {
         fprintf(stderr,"gl_bench: invalid EDIT_GL_UPLOAD=%s\n",upload); return 1;
@@ -343,15 +525,15 @@ int main(int argc,char **argv)
     char load[32]; gl_bench_load(load,sizeof load);
     printf("POWER status=%s evidence=(M)%s load1=%s upload=%s verdict=TRACK\n",power,bench_evidence_tag(),load,upload!=NULL ? upload : "legacy");
     if (scroll_only) {
-        int first = gl_bench_run(15,false,true,false);
-        int second = gl_bench_run(30,false,true,false);
+        int first = gl_bench_run(15,false,true,false,false);
+        int second = gl_bench_run(30,false,true,false,false);
         return first | second;
     }
     uint64_t text_bytes=gl_bench_text_bytes(argv[0]);
     printf("BENCH name=binary_size n=1 p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 text_bytes=%llu units=bytes status=TRACK pass=1 evidence=(M) power=%s load1=%s upload=%s\n",
         (unsigned long long)text_bytes,(unsigned long long)text_bytes,(unsigned long long)text_bytes,
         (unsigned long long)text_bytes,(unsigned long long)text_bytes,bench_evidence_tag(),load,upload!=NULL ? upload : "legacy");
-    int a=gl_bench_run(15,quick,false,upload_only); if (a==2 || upload_only) return a;
-    int b=gl_bench_run(30,quick,false,upload_only); if (b==2) return 2;
+    int a=gl_bench_run(15,quick,false,upload_only,bulk_only); if (a==2 || upload_only || bulk_only) return a;
+    int b=bulk_only ? 0 : gl_bench_run(30,quick,false,upload_only,false); if (b==2) return 2;
     return a|b;
 }
