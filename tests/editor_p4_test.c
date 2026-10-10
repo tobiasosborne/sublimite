@@ -383,11 +383,69 @@ static int ipc_positions(bool raster)
     T(editor_step(e, 0) >= 0); editor_close(e); unlink(path);
     printf("editor_p4_test: %s IPC columns visible/bounded at certified clusters passed\n", raster ? "raster" : "null"); return 0;
 }
+static size_t wait_count(const editor *e)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) if (e->waits[i].token) count++;
+    return count;
+}
+static int wait_client(editor *e, ipc_server *server, int *client, ipc_token *token)
+{
+    struct sockaddr_un address; socklen_t length = sizeof address;
+    T(getsockname(server->listener, (struct sockaddr *)&address, &length) == 0);
+    *client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); T(*client >= 0);
+    T(connect(*client, (struct sockaddr *)&address, length) == 0);
+    ipc_request request = {.cwd = "/tmp", .wait = true}; uint8_t wire[128]; size_t n = 0;
+    T(ipc_wire_encode(&request, wire, sizeof wire, &n) == IPC_OK);
+    T(write(*client, wire, n) == (ssize_t)n);
+    size_t before = editor_get_stats(e).tabs;
+    uint64_t deadline = trace_now_ns() + UINT64_C(10000000000);
+    while (editor_get_stats(e).tabs == before) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(settle(e) == 0);
+    uint8_t ack[8]; T(read(*client, ack, sizeof ack) == (ssize_t)sizeof ack);
+    T(!memcmp(ack, "EDIRA", 5) && ack[5] == IPC_OK);
+    *token = e->buffer->wait_token; T(*token && ipc_server_token_live(server, *token));
+    return 0;
+}
+static int ipc_wait_sweep(ipc_server *server)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.start_empty = true, .cols = 32, .rows = 4, .server = server,
+        .tab_capacity = IPC_MAX_CLIENTS + 4u, .closed_capacity = 2};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    int live_fd; ipc_token live_token; T(wait_client(e, server, &live_fd, &live_token) == 0);
+    /* Keep every disconnected client's buffer open. More requests than the
+     * association bound must still work, without disturbing the live wait. */
+    for (size_t cycle = 0; cycle < IPC_MAX_CLIENTS + 1u; cycle++) {
+        int fd; ipc_token token; T(wait_client(e, server, &fd, &token) == 0);
+        editor_buffer *member = e->buffer;
+        uint64_t drops = server->wait_drops; close(fd);
+        uint64_t deadline = trace_now_ns() + UINT64_C(10000000000);
+        edit_malloc_guard_begin();
+        while (server->wait_drops == drops) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+        size_t allocations = edit_malloc_guard_end();
+        if (edit_malloc_guard_active()) T(allocations == 0);
+        T(!ipc_server_token_live(server, token));
+        T(wait_count(e) == 1 && member->wait_token == 0);
+        T(ipc_server_token_live(server, live_token));
+        T(editor_get_stats(e).tabs == cycle + 2u);
+    }
+    /* A retained/reopened dead member cannot consume the surviving wait. */
+    T(editor_close_tab(e, 1) == 0); T(editor_reopen_tab(e) == 0); T(settle(e) == 0);
+    T(wait_count(e) == 1 && ipc_server_token_live(server, live_token));
+    T(editor_close_tab(e, 0) == 0); T(settle(e) == 0);
+    uint8_t reply[8]; T(read(live_fd, reply, sizeof reply) == (ssize_t)sizeof reply);
+    T(!memcmp(reply, "EDIRC", 5) && reply[5] == IPC_OK); close(live_fd);
+    T(wait_count(e) == 0); editor_close(e);
+    puts("editor_p4_test: null disconnected wait sweep, retained buffers, association reuse and allocation guard passed");
+    return 0;
+}
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
     char runtime[] = "/tmp/editor-p4-ipc-XXXXXX"; T(mkdtemp(runtime) != NULL);
     ipc_server server = {0}; T(ipc_server_init(&server, runtime) == IPC_OK);
+    T(ipc_wait_sweep(&server) == 0);
     T(ipc_pending_input(&server, runtime) == 0);
     for (unsigned i = 0; i < 2; i++) {
         bool raster = i != 0;

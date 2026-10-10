@@ -390,6 +390,26 @@ static ipc_result open_request(const ipc_request *request, ipc_token token, void
     int rc = editor_open_request(ctx, request, token);
     return !rc ? IPC_OK : rc == EDITOR_ERR_CAPACITY ? IPC_LIMIT : IPC_REJECTED;
 }
+static void sweep_waits(editor *e)
+{
+    ipc_token dropped[IPC_MAX_CLIENTS]; size_t count = 0;
+    for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+        ipc_token token = e->waits[i].token;
+        if (token && !ipc_server_token_live(e->cfg.server, token)) {
+            dropped[count++] = token;
+            e->waits[i] = (editor_wait){0};
+        }
+    }
+    /* Fixed reservations bound this pass. Clear the member side too, so
+     * closing/reopening a retained buffer cannot carry a dead association. */
+    for (size_t i = 0; count && i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (!b || !b->wait_token) continue;
+        for (size_t at = 0; at < count; at++) if (b->wait_token == dropped[at]) {
+            b->wait_token = 0; break;
+        }
+    }
+}
 int editor_poll_sources(editor *e)
 {
     struct epoll_event events[16];
@@ -417,7 +437,9 @@ int editor_poll_sources(editor *e)
      * frame before admitting setup work, even if the view itself is idle. */
     if (e->cfg.server && !e->queue_count && !view_busy(&e->v) &&
         !(e->dirty && e->frame.last_sequence)) {
+        uint64_t drops = e->cfg.server->wait_drops;
         ipc_result rc = ipc_server_drain(e->cfg.server, open_request, e);
+        if (e->cfg.server->wait_drops != drops) sweep_waits(e);
         if (rc != IPC_OK) return EDITOR_ERR_IO;
     }
     /* One eligible index per turn, including inactive tabs. Replay's checkpoint

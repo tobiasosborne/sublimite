@@ -12,10 +12,65 @@
 #include <time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <unistd.h>
+#include "editor/private.h"
+
+/* Exercise main's real startup/ownership code with a null renderer and a
+ * pipe-driven loop. All IPC, editor setup, membership and fork calls are real. */
+static int cli_null_backend(render_backend *backend, const char *name);
+static int cli_script_run(editor *e);
+#define main ipc_cli_main
+#define editor_backend_select cli_null_backend
+#define editor_run cli_script_run
+#include "../src/main.c"
+#undef editor_run
+#undef editor_backend_select
+#undef main
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
 #define CLIENT_TIMEOUT_MS 30000
+typedef struct cli_state {
+    pid_t ui_pid;
+    ipc_token token;
+    size_t tabs, remaining;
+    bool live, has_server, isolated, binary;
+    char socket_leaf[108];
+} cli_state;
+static int cli_null_backend(render_backend *backend, const char *name)
+{ (void)name; return render_null_backend(backend); }
+static int cli_pipe(const char *name)
+{
+    const char *value = getenv(name); CHECK(value != NULL);
+    return (int)strtol(value, NULL, 10);
+}
+static void cli_state_send(editor *e, ipc_token token)
+{
+    cli_state state = {.ui_pid = getpid(), .token = token, .tabs = editor_get_stats(e).tabs,
+        .has_server = e->cfg.server != NULL};
+    if (e->cfg.server) {
+        state.live = ipc_server_token_live(e->cfg.server, token);
+        state.isolated = e->cfg.server->listener < 0;
+        memcpy(state.socket_leaf, e->cfg.server->socket_path, sizeof state.socket_leaf);
+    }
+    for (size_t i = 0; i < IPC_MAX_CLIENTS; i++)
+        if (e->waits[i].token == token && token) state.remaining = e->waits[i].remaining;
+    uint8_t bytes[2]; state.binary = editor_length(e) == 2 && editor_read(e, 0, bytes, 2) == 0 &&
+        bytes[0] == 0 && bytes[1] == 'x';
+    CHECK(write(cli_pipe("IPC_TEST_EVENTS"), &state, sizeof state) == (ssize_t)sizeof state);
+}
+static int cli_script_run(editor *e)
+{
+    ipc_token token = e->buffer->wait_token;
+    cli_state_send(e, token);
+    for (;;) {
+        char command; CHECK(read(cli_pipe("IPC_TEST_COMMANDS"), &command, 1) == 1);
+        if (command == 'Q') return 0;
+        if (command == 'X') _exit(17); /* UI death must fail the launcher. */
+        CHECK(command == 'C'); CHECK(editor_close_tab(e, 0) == 0);
+        cli_state_send(e, token);
+    }
+}
 typedef struct capture { size_t calls; ipc_token token; bool stdin_seen; } capture;
 static ipc_result opened(const ipc_request *r, ipc_token token, void *ctx)
 {
@@ -587,6 +642,102 @@ static pid_t launcher_child(int fds[2], ipc_result expected)
         _exit(x==expected?0:2); }
     close(fds[1]); return ch;
 }
+static cli_state cli_state_read(int fd)
+{
+    struct pollfd ready_fd = {fd, POLLIN, 0}; CHECK(poll(&ready_fd, 1, CLIENT_TIMEOUT_MS) > 0);
+    cli_state state; CHECK(read(fd, &state, sizeof state) == (ssize_t)sizeof state); return state;
+}
+static void cli_command(int fd, char command) { CHECK(write(fd, &command, 1) == 1); }
+static void t_main_launcher(const char *dir, bool isolated)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir, isolated ? "main-isolated" : "main-primary", rt);
+    char input_path[IPC_PATH_CAP]; CHECK(snprintf(input_path, sizeof input_path, "%s/file", rt) > 0);
+    int file_fd = open(input_path, O_CREAT | O_WRONLY, 0600); CHECK(file_fd >= 0);
+    CHECK(write(file_fd, "file", 4) == 4); close(file_fd);
+    /* The isolated branch must leave an existing primary untouched. */
+    ipc_server incumbent = {0}; if (isolated) CHECK(ipc_server_init(&incumbent, rt) == IPC_OK);
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        bool waiting = mode != 2, dies = mode == 1;
+        int events[2], commands[2], input[2];
+        CHECK(pipe(events) == 0 && pipe(commands) == 0 && pipe(input) == 0);
+        CHECK(write(input[1], "\0x", 2) == 2); close(input[1]);
+        pid_t launcher = fork(); CHECK(launcher >= 0);
+        if (!launcher) {
+            CHECK(setsid() >= 0); close(events[0]); close(commands[1]);
+            CHECK(dup2(input[0], STDIN_FILENO) == STDIN_FILENO); close(input[0]);
+            char number[32]; CHECK(snprintf(number, sizeof number, "%d", events[1]) > 0);
+            CHECK(setenv("IPC_TEST_EVENTS", number, 1) == 0);
+            CHECK(snprintf(number, sizeof number, "%d", commands[0]) > 0);
+            CHECK(setenv("IPC_TEST_COMMANDS", number, 1) == 0);
+            CHECK(setenv("XDG_RUNTIME_DIR", rt, 1) == 0 && setenv("XDG_DATA_HOME", rt, 1) == 0);
+            CHECK(unsetenv("EDIT_TRACE_DUMP") == 0);
+            char *argv[6] = {"sublimite"}; int argc = 1;
+            if (waiting) argv[argc++] = "--wait";
+            if (isolated) argv[argc++] = "--new-instance";
+            argv[argc++] = input_path; argv[argc++] = "-"; argv[argc] = NULL;
+            _exit(ipc_cli_main(argc, argv));
+        }
+        close(events[1]); close(commands[0]); close(input[0]);
+        cli_state state = cli_state_read(events[0]);
+        bool split = state.ui_pid != launcher;
+        bool accepted = state.tabs == 2 && state.binary && split == waiting &&
+            (waiting ? state.token != 0 && state.live && state.remaining == 2 && state.has_server &&
+                state.isolated == isolated : state.token == 0 && !state.live);
+        if (!accepted) {
+            fprintf(stderr, "main launcher %s: split=%d token=%llu live=%d tabs=%zu remaining=%zu server=%d\n",
+                isolated ? "isolated" : "primary", split, (unsigned long long)state.token,
+                state.live, state.tabs, state.remaining, state.has_server);
+            CHECK(kill(-launcher, SIGKILL) == 0); int status; CHECK(waitpid(launcher, &status, 0) == launcher);
+        }
+        CHECK(accepted);
+        /* The launcher must not unlink the primary's inherited endpoint or
+         * retain its lifecycle lock when releasing its copy after fork. */
+        if (isolated) {
+            ipc_server probe = {0}; CHECK(ipc_server_init(&probe, rt) == IPC_EXISTS);
+        } else {
+            /* Inspect the UI's actual endpoint, including a future display
+             * suffix, rather than assuming main uses the legacy IPC name. */
+            CHECK(state.socket_leaf[0] && strchr(state.socket_leaf, '/') == NULL);
+            int directory = open(rt, O_RDONLY | O_DIRECTORY); CHECK(directory >= 0);
+            struct stat st; CHECK(fstatat(directory, state.socket_leaf, &st, 0) == 0 && S_ISSOCK(st.st_mode));
+            char lock_leaf[108]; strcpy(lock_leaf, state.socket_leaf);
+            size_t length = strlen(lock_leaf); CHECK(length >= 4 && !strcmp(lock_leaf + length - 4, "sock"));
+            memcpy(lock_leaf + length - 4, "lock", 4);
+            int lock = openat(directory, lock_leaf, O_RDWR); CHECK(lock >= 0);
+            CHECK(flock(lock, LOCK_EX | LOCK_NB) == 0); CHECK(flock(lock, LOCK_UN) == 0); close(lock);
+            struct sockaddr_un address = {.sun_family = AF_UNIX};
+            int n = snprintf(address.sun_path, sizeof address.sun_path, "%s/%s", rt, state.socket_leaf);
+            CHECK(n > 0 && (size_t)n < sizeof address.sun_path);
+            int peer = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); CHECK(peer >= 0);
+            CHECK(connect(peer, (struct sockaddr *)&address, sizeof address) == 0);
+            close(peer); close(directory);
+        }
+        if (waiting) {
+            int status; CHECK(waitpid(launcher, &status, WNOHANG) == 0);
+            if (dies) cli_command(commands[1], 'X');
+            else {
+                cli_command(commands[1], 'C'); state = cli_state_read(events[0]);
+                CHECK(state.tabs == 1 && state.live && state.remaining == 1);
+                CHECK(waitpid(launcher, &status, WNOHANG) == 0);
+                cli_command(commands[1], 'C'); state = cli_state_read(events[0]);
+                CHECK(state.tabs == 0 && !state.live && state.remaining == 0);
+            }
+            CHECK(waitpid(launcher, &status, 0) == launcher && WIFEXITED(status));
+            CHECK(WEXITSTATUS(status) == (dies ? 1 : 0));
+            if (!dies) cli_command(commands[1], 'Q');
+            CHECK(waitpid(state.ui_pid, &status, 0) == state.ui_pid && WIFEXITED(status));
+            CHECK(WEXITSTATUS(status) == (dies ? 17 : 0));
+        } else {
+            cli_command(commands[1], 'Q'); reap_ok(launcher);
+        }
+        close(events[0]); close(commands[1]);
+    }
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
+    if (isolated) ipc_server_fini(&incumbent);
+    rm_rf(rt);
+    printf("ipc_test: main %s launcher split/adopt/all-member wait/UI death/nonwait passed\n", isolated ? "isolated" : "primary");
+}
 static void t_launcher(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"launch",rt);
@@ -618,6 +769,7 @@ static int run_suite(const char *only, int ns_fd)
     if(ns_fd>=0) { size_t l=strlen(dir+5); CHECK(write(ns_fd,dir+5,l+1u)==(ssize_t)(l+1u)); close(ns_fd); } /* --parallel: report the namespace */
 #define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
     T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
+    T("main_launcher_primary",t_main_launcher(dir,false)); T("main_launcher_isolated",t_main_launcher(dir,true));
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));

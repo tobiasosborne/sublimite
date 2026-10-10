@@ -38,6 +38,35 @@ int main(int argc, char **argv)
     size_t n = strlen(journal_path);
     if (n > sizeof journal_path - sizeof suffix) goto startup_fail;
     memcpy(journal_path + n, suffix, sizeof suffix);
+    ipc_token initial_token = 0;
+    if (args.request.wait) {
+        if (!owns_server) {
+            ipc_result role = ipc_server_init_isolated(&server);
+            if (role != IPC_OK) goto startup_fail;
+            owns_server = true;
+        }
+        int channels[2];
+        if (ipc_launcher_pair(channels) != IPC_OK) goto startup_fail;
+        /* No workers, accepted peers or UI state exist at this fork. */
+        pid_t ui = fork();
+        if (ui < 0) { close(channels[0]); close(channels[1]); goto startup_fail; }
+        if (ui > 0) {
+            close(channels[0]);
+            /* The UI inherits the endpoint. Release only the launcher's copy:
+             * never unlink it or take its shared open-file-description lock. */
+            server.owns_path = false;
+            if (server.lock_fd >= 0) { close(server.lock_fd); server.lock_fd = -1; }
+            ipc_server_fini(&server);
+            ipc_args_fini(&args);
+            ipc_result waited = ipc_launcher_wait(channels[1]);
+            if (waited != IPC_OK) fprintf(stderr, "sublimite: wait error %d\n", waited);
+            return waited == IPC_OK ? 0 : 1;
+        }
+        close(channels[1]);
+        if (ipc_server_adopt_wait(&server, channels[0], &initial_token) != IPC_OK) {
+            close(channels[0]); goto startup_fail;
+        }
+    }
     int fd = mkstemp(journal_path);
     if (fd < 0) { perror("sublimite: journal"); goto startup_fail; }
     close(fd);
@@ -49,7 +78,7 @@ int main(int argc, char **argv)
     editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true,
         .server = owns_server ? &server : NULL};
     if (!rc) rc = editor_open(&e, &config, &backend);
-    if (!rc) rc = editor_open_request(e, &args.request, 0);
+    if (!rc) rc = editor_open_request(e, &args.request, initial_token);
     ipc_args_fini(&args);
     if (!rc) rc = editor_run(e);
     if (e) {
