@@ -3,6 +3,12 @@
 #include "../bench/editor_bench.c"
 #undef main
 
+#define main scan_bench_entry
+#define samples scan_bench_samples
+#include "../bench/scan_bench.c"
+#undef samples
+#undef main
+
 #include <stdlib.h>
 #include "../bench/interaction.h"
 
@@ -281,6 +287,78 @@ static void test_gate_verdict(void)
     }
 }
 
+/* Synthetic rows exercise the actual scan reporter without timing the box. */
+static void test_scan_row_load_stamp(void)
+{
+    double speeds[RUNS];
+    for (int r = 0; r < RUNS; r++) speeds[r] = 16.0;
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (!output) return;
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    CHECK(saved >= 0);
+    if (saved < 0) { fclose(output); return; }
+    CHECK(dup2(fileno(output), STDOUT_FILENO) >= 0);
+    CHECK(report_gate("scan_load_probe", speeds, 12.0, 12.0) == 0);
+    fflush(stdout);
+    CHECK(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+    rewind(output);
+    char line[512];
+    CHECK(fgets(line, sizeof line, output) != NULL);
+    CHECK(strstr(line, "load1_start=0.00 load1_end=0.00") != NULL);
+    CHECK(strstr(line, "verdict=PASS") != NULL);
+    fclose(output);
+}
+
+static void test_loaded_verdict(void)
+{
+    CHECK(bench_qualify_load(BENCH_PASS, 4.0, 4.0) == BENCH_PASS);
+    CHECK(bench_qualify_load(BENCH_MISS, 4.0, 4.0) == BENCH_MISS);
+    CHECK(bench_qualify_load(BENCH_PASS, 4.01, 0.0) == BENCH_LOADED);
+    CHECK(bench_qualify_load(BENCH_MISS, 0.0, 4.01) == BENCH_LOADED);
+    CHECK(bench_qualify_load(BENCH_REFUSED, 5.0, 5.0) == BENCH_LOADED);
+    CHECK(bench_qualify_load(BENCH_PASS, -1.0, 0.0) == BENCH_REFUSED);
+    CHECK(bench_qualify_load(BENCH_MISS, 0.0, NAN) == BENCH_REFUSED);
+    CHECK(bench_exit_code(BENCH_LOADED, 0) == 3);
+    CHECK(bench_exit_code(BENCH_LOADED, 1) == 0);
+    CHECK(bench_merge_exit(0, bench_exit_code(BENCH_LOADED, 0)) == 3);
+    CHECK(bench_merge_exit(3, bench_exit_code(BENCH_LOADED, 0)) == 3);
+
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (!output) return;
+    double speeds[RUNS];
+    for (int r = 0; r < RUNS; r++) speeds[r] = 1.0;
+    CHECK(report_gate_fp(output, "loaded_miss", speeds, 12.0, 12.0,
+                         0.0, 5.0, "Not charging") == 3);
+    for (int r = 0; r < RUNS; r++) speeds[r] = 20.0;
+    CHECK(report_gate_fp(output, "loaded_pass", speeds, 16.0, 12.0,
+                         5.0, 0.0, "Not charging") == 3);
+    CHECK(report_gate_fp(output, "quiet_pass", speeds, 16.0, 12.0,
+                         4.0, 4.0, "Not charging") == 0);
+    for (int r = 0; r < RUNS; r++) speeds[r] = 15.0;
+    CHECK(report_gate_fp(output, "quiet_basis_miss", speeds, 16.0, 12.0,
+                         1.0, 1.0, "Not charging") == 1);
+    speeds[0] = NAN;
+    CHECK(report_gate_fp(output, "invalid_loaded", speeds, 16.0, 12.0,
+                         5.0, 5.0, "Not charging") == 1);
+    rewind(output);
+    char line[512];
+    CHECK(fgets(line, sizeof line, output) != NULL);
+    CHECK(strstr(line, "load1_start=0.00 load1_end=5.00") != NULL);
+    CHECK(strstr(line, "(M)[AC]") != NULL);
+    CHECK(strstr(line, "verdict=LOADED") != NULL);
+    CHECK(strstr(line, "verdict=MISS") == NULL);
+    CHECK(fgets(line, sizeof line, output) != NULL);
+    CHECK(strstr(line, "load1_start=5.00 load1_end=0.00") != NULL);
+    CHECK(strstr(line, "verdict=LOADED") != NULL);
+    CHECK(strstr(line, "verdict=PASS") == NULL);
+    fclose(output);
+    puts("PROBE scan load: both endpoints, >4 boundary, pass/miss suppression, exit=3, invalid samples fatal");
+}
+
 static void test_interaction_population(void)
 {
     size_t n = 17;
@@ -479,6 +557,8 @@ int main(void)
     test_active_frame_samples();
     test_structural_counts();
     test_gate_verdict();
+    test_scan_row_load_stamp();
+    test_loaded_verdict();
     test_interaction_population();
     test_percentiles_small();
     test_counterexample();

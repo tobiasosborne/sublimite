@@ -292,7 +292,40 @@ static inline int bench_report(const char *name, const bench_samples *s,
  * REFUSED by default; only an explicit --track (track != 0) opts out. */
 #define BENCH_INTERACTION_MIN_N 10000u
 
-typedef enum bench_verdict_kind { BENCH_PASS = 0, BENCH_MISS = 1, BENCH_REFUSED = 2 } bench_verdict_kind;
+typedef enum bench_verdict_kind {
+    BENCH_PASS = 0, BENCH_MISS = 1, BENCH_REFUSED = 2, BENCH_LOADED = 3
+} bench_verdict_kind;
+
+/* Opt-in load qualification: legacy bench_judge callers retain their policy.
+ * The scan gate's loaded-box cutoff is strictly greater than 4 (G).
+ * Missing load evidence refuses a verdict. Callers keep structural failures
+ * separate: load qualification applies only to valid timing observations. */
+#define BENCH_LOAD1_LIMIT 4.0
+
+static inline double bench_load1(void)
+{
+    FILE *f = fopen("/proc/loadavg", "r");
+    double load = -1.0;
+    if (f != NULL) {
+        if (fscanf(f, "%lf", &load) != 1) load = -1.0;
+        fclose(f);
+    }
+    return load;
+}
+
+static inline bench_verdict_kind bench_qualify_load(bench_verdict_kind v,
+                                                   double start, double end)
+{
+    if (start > BENCH_LOAD1_LIMIT || end > BENCH_LOAD1_LIMIT) return BENCH_LOADED;
+    if (!(start >= 0.0) || !(end >= 0.0)) return BENCH_REFUSED;
+    return v;
+}
+
+static inline const char *bench_verdict_word(bench_verdict_kind v)
+{
+    return v == BENCH_PASS ? "PASS" : v == BENCH_MISS ? "MISS" :
+           v == BENCH_LOADED ? "LOADED" : "REFUSED";
+}
 
 static inline bench_verdict_kind bench_judge(const bench_samples *s, uint64_t gate_p50_ns,
                                              uint64_t gate_p99_ns, size_t required_n)
@@ -320,7 +353,7 @@ static inline int bench_gate_line(char *buf, size_t cap, const char *name, const
 {
     uint64_t l50, h50, l99, h99;
     bench_verdict_kind v = bench_judge(s, gate_p50_ns, gate_p99_ns, required_n);
-    const char *word = track ? "TRACK" : v == BENCH_PASS ? "PASS" : v == BENCH_MISS ? "MISS" : "REFUSED";
+    const char *word = track ? "TRACK" : bench_verdict_word(v);
     bench_ci95(s, 0.50, &l50, &h50);
     bench_ci95(s, 0.99, &l99, &h99);
     return snprintf(buf, cap,
@@ -345,7 +378,7 @@ static inline int bench_gate_report(const char *name, const bench_samples *s, ui
     return bench_exit_code(bench_judge(s, gate_p50_ns, gate_p99_ns, required_n), track);
 }
 
-/* Combine independently reported rows without turning REFUSED (3) into a
+/* Combine independently reported rows without turning REFUSED/LOADED (3) into a
  * boolean success/miss. Structural/timing failure (1) takes precedence. */
 static inline int bench_merge_exit(int left, int right)
 {

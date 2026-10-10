@@ -26,7 +26,9 @@ static int cmp_d(const void *a, const void *b)
 }
 
 /* Nearest-rank latency quantiles expressed as throughput (slow tail first). */
-static int report_gate(const char *name, double *gbps, double gate50, double gate99)
+static int report_gate_fp(FILE *fp, const char *name, double *gbps, double gate50,
+                          double gate99, double load_start, double load_end,
+                          const char *power)
 {
     int invalid = 0;
     for (int r = 0; r < RUNS; r++) {
@@ -35,10 +37,20 @@ static int report_gate(const char *name, double *gbps, double gate50, double gat
     qsort(gbps, RUNS, sizeof gbps[0], cmp_d);
     double p50 = gbps[RUNS / 2];              /* 10th fastest latency = 11th ascending speed */
     double p99 = gbps[0];                     /* slow tail: 1st percentile of speed = slowest of 20 */
-    int miss = invalid || p50 < gate50 || p99 < gate99;
-    printf("%-24s p50 %.2f GB/s  p99 %.2f GB/s  gates p50 >= %.1f / p99 >= %.1f (G)  %s\n",
-           name, p50, p99, gate50, gate99, miss ? "MISS" : "PASS");
-    return miss;
+    bench_verdict_kind v = p50 < gate50 || p99 < gate99 ? BENCH_MISS : BENCH_PASS;
+    v = invalid ? BENCH_MISS : bench_qualify_load(v, load_start, load_end);
+    fprintf(fp, "TRACK (M)%s load1_start=%.2f load1_end=%.2f "
+                "%-24s p50 %.2f GB/s  p99 %.2f GB/s  gates p50 >= %.1f / p99 >= %.1f (G) "
+                "load1_limit=%.1f (G) verdict=%s\n",
+            bench__tag_from_power(power), load_start, load_end,
+            name, p50, p99, gate50, gate99, BENCH_LOAD1_LIMIT, bench_verdict_word(v));
+    return bench_exit_code(v, 0);
+}
+
+/* Synthetic contract checks deliberately use fixed unloaded conditions. */
+static int report_gate(const char *name, double *gbps, double gate50, double gate99)
+{
+    return report_gate_fp(stdout, name, gbps, gate50, gate99, 0.0, 0.0, "unknown");
 }
 
 static int report(const char *name, double *gbps)
@@ -125,14 +137,11 @@ int main(int argc, char **argv)
     }
     printf("lines=%llu nonascii=%llu\n", (unsigned long long)wc.newlines, (unsigned long long)wc.nonascii);
 
-    char power[32];
-    bench_battery_status(power, sizeof power);
-    FILE *load_file = fopen("/proc/loadavg", "r");
-    double load = -1.0;
-    if (load_file) { if (fscanf(load_file, "%lf", &load) != 1) load = -1.0; fclose(load_file); }
-    printf("TRACK primitive cached anonymous buffer; (M)%s load1=%.2f power=%s; G6/G7 end-to-end unmeasured\n",
-           bench__tag_from_power(power), load, power);
+    printf("TRACK primitive cached anonymous buffer; G6/G7 end-to-end unmeasured\n");
     double t_count[RUNS], t_nth[RUNS];
+    char count_power[32], nth_power[32];
+    bench_battery_status(count_power, sizeof count_power);
+    double count_start = bench_load1();
     for (int r = 0; r < RUNS; r++) {
         double t0 = now_s();
         scan_counts c = scan_count(buf, SIZE);
@@ -143,6 +152,9 @@ int main(int argc, char **argv)
         sink += c.newlines + c.nonascii;
         t_count[r] = (double)SIZE / (t1 - t0) / 1e9;
     }
+    double count_end = bench_load1();
+    bench_battery_status(nth_power, sizeof nth_power);
+    double nth_start = bench_load1();
     for (int r = 0; r < RUNS; r++) {
         double t0 = now_s();
         const uint8_t *q = scan_find_nth_newline(buf, SIZE, expected.newlines - 1);
@@ -153,15 +165,18 @@ int main(int argc, char **argv)
         sink += (uint64_t)(uintptr_t)q;
         t_nth[r] = (double)SIZE / (t1 - t0) / 1e9;
     }
-    int miss = 0;
-    printf("TRACK (M)%s load1=%.2f ", bench__tag_from_power(power), load);
-    miss |= report("scan_count", t_count);
-    printf("TRACK (M)%s load1=%.2f ", bench__tag_from_power(power), load);
-    miss |= report("scan_find_nth_newline", t_nth);
-    printf("TRACK (M)%s load1=%.2f ", bench__tag_from_power(power), load);
-    miss |= report_gate("scan_count_G6_basis", t_count, G6_BASIS_GBPS, TAIL_GBPS);
+    double nth_end = bench_load1();
+    int result = report_gate_fp(stdout, "scan_count", t_count, GATE_GBPS, TAIL_GBPS,
+                                count_start, count_end, count_power);
+    result = bench_merge_exit(result,
+        report_gate_fp(stdout, "scan_find_nth_newline", t_nth, GATE_GBPS, TAIL_GBPS,
+                       nth_start, nth_end, nth_power));
+    result = bench_merge_exit(result,
+        report_gate_fp(stdout, "scan_count_G6_basis", t_count, G6_BASIS_GBPS, TAIL_GBPS,
+                       count_start, count_end, count_power));
     (void)sink;
     free(buf);
-    printf("%s\n", miss ? "TRACK: thresholds missed" : "TRACK: thresholds met");
-    return miss ? 1 : 0;
+    printf("%s\n", result == 3 ? "TRACK: load/sample conditions refused a verdict" :
+           result == 1 ? "TRACK: thresholds missed or invalid samples" : "TRACK: thresholds met");
+    return result;
 }
