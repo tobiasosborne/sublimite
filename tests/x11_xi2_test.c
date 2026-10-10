@@ -131,7 +131,7 @@ static void test_e6x20(void) {
         int dy = sum_dy(&x, 12, 0x08, &v, 1, NULL);
         CHECK(dy == 64, "#16 first scroll after query: dy %d want 64 (order %d)", dy, order);
         /* device changed + rescan seeds again */
-        memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1);
+        memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1); p16(buf + 18, 12);
         CHECK(xi2_decode(&x, buf, 32, false, &r) && r.device_changed, "#16 devchg");
         c[0].val = c[0].kind == 2 ? 20.0 : 0; if (c[1].kind == 2) c[1].val = 20.0;
         n = mk_query_cls(buf, c, 2, 4, 0);
@@ -211,6 +211,37 @@ static void test_e6x20(void) {
     }
 }
 
+static void test_rescan_interleavings(void) {
+    uint8_t q[512], ev[256];
+    cls classes[2] = { {2, 3, 0, 0, 2.0, 0}, {3, 3, 1, 0, 0, 1.0} };
+    xi2 x = { .opcode = 131 };
+    size_t n = mk_query_cls(q, classes, 2, 4, 0);
+    CHECK(xi2_parse_query_device(&x, q, n) == 1, "§25 initial snapshot");
+    double value = 3;
+    CHECK(sum_dy(&x, 12, 8, &value, 1, NULL) == 256, "§25 live motion after query snapshot");
+    CHECK(xi2_adopt_query_device(&x, q, n, 0) == 1, "§25 adopt queued snapshot");
+    value = 4;
+    CHECK(sum_dy(&x, 12, 8, &value, 1, NULL) == 256, "§25 adoption cannot replay already decoded motion");
+    /* Unrelated DeviceChanged must not invalidate source 12. */
+    memset(ev, 0, sizeof ev); ev[0] = 35; ev[1] = 131;
+    p16(ev + 8, 1); p16(ev + 18, 99);
+    xi2_result result;
+    CHECK(xi2_decode(&x, ev, 32, false, &result), "§25 unrelated DeviceChanged");
+    value = 5;
+    CHECK(sum_dy(&x, 12, 8, &value, 1, NULL) == 256, "§25 unrelated source preserves live baseline");
+    /* Changed source supplies classes/current value at the ordered boundary. */
+    n = mk_query_cls(q, classes, 2, 4, 0);
+    memset(ev, 0, sizeof ev); ev[0] = 35; ev[1] = 131;
+    p16(ev + 8, 1); p16(ev + 10, 2); p16(ev + 16, 2); p16(ev + 18, 12);
+    memcpy(ev + 32, q + 48, n - 48);
+    p32(ev + 4, (uint32_t)((n - 48) / 4));
+    CHECK(xi2_decode(&x, ev, 32 + n - 48, false, &result), "§25 seeded DeviceChanged classes");
+    value = 3;
+    CHECK(sum_dy(&x, 12, 8, &value, 1, NULL) == 256, "§25 intervening first motion uses class seed");
+    CHECK(xi2_adopt_query_device(&x, q, n, 0) == 1, "§25 changed-source reply adoption");
+    value = 4;
+    CHECK(sum_dy(&x, 12, 8, &value, 1, NULL) == 256, "§25 changed-source live history survives stale reply");
+}
 int main(void) {
     uint8_t buf[512], req[20];
     xi2 x;
@@ -219,7 +250,7 @@ int main(void) {
     /* request bytes */
     CHECK(xi2_build_query_version(131, req, 2, 1) == 8 && req[0] == 131 && req[1] == 47 && req[2] == 2 && req[4] == 2 && req[6] == 1, "QueryVersion");
     CHECK(xi2_build_query_device(131, req, 0) == 8 && req[1] == 48, "QueryDevice");
-    CHECK(xi2_build_select_events(131, req, 0x1234) == 20 && req[1] == 46 && req[2] == 5 && req[16] == 0x42, "SelectEvents");
+    CHECK(xi2_build_select_events(131, req, 0x1234) == 20 && req[1] == 46 && req[2] == 5 && req[16] == 0x72, "SelectEvents");
     /* parse */
     size_t n = mk_query(buf);
     CHECK(xi2_parse_query_device(&x, buf, n) == 2, "two scroll classes");
@@ -246,7 +277,7 @@ int main(void) {
     n = mk_motion(buf, 99, 0x0f, v3, 4, 1, 2);
     CHECK(xi2_decode(&x, buf, n, false, &r) && r.motion && !r.wheel, "unknown source");
     /* device changed resets history */
-    memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1);
+    memset(buf, 0, 32); buf[0] = 35; buf[1] = 131; p16(buf + 8, 1); p16(buf + 18, 12);
     CHECK(xi2_decode(&x, buf, 32, false, &r) && r.device_changed, "device changed");
     n = mk_motion(buf, 12, 0x0c, v2, 2, 51, 61);
     CHECK(xi2_decode(&x, buf, n, false, &r) && !r.wheel, "history reset: first sample after change gives no delta");
@@ -289,6 +320,7 @@ int main(void) {
     n = mk_query(buf);
     for (size_t l = 0; l < n; l++) { uint8_t *c = malloc(l ? l : 1); memcpy(c, buf, l); xi2 y; memset(&y, 0, sizeof y); xi2_parse_query_device(&y, c, l); free(c); }
     test_e6x20();
+    test_rescan_interleavings();
     if (g_fail) { puts("x11_xi2_test: FAILED"); return 1; }
     puts("x11_xi2_test: ok");
     return 0;

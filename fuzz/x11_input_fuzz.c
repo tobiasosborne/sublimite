@@ -79,8 +79,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     uint8_t *copy = malloc(size ? size : 1);            /* exact-size heap copy so ASan sees any over-read */
     if (!copy) return 0;
     memcpy(copy, data, size);
-    xi2_decode(&x, copy, size, false, &r);
-    xi2_decode(&x, copy, size, true, &r);
+    if (xi2_decode(&x, copy, size, false, &r)) {
+        plat_event events[2];
+        (void)x11_xi2_events(&g_in, &r, now, events);
+    }
+    if (xi2_decode(&x, copy, size, true, &r)) {
+        plat_event events[2];
+        (void)x11_xi2_events(&g_in, &r, now, events);
+    }
+    if (size >= 8) {
+        uint8_t button[88] = {0};
+        button[0] = 35; button[1] = x.opcode; button[8] = (data[1] & 1u) ? 4 : 5;
+        button[16] = (uint8_t)(1u + data[2] % 32u); button[48] = 2;
+        button[52] = data[3]; button[72] = data[4]; button[79] = (uint8_t)(data[5] & 3u);
+        memcpy(button + 80, data, 8);
+        xi2_result decoded;
+        if (!xi2_decode(&x, button, sizeof button, false, &decoded) ||
+            (decoded.mods & (3u << 13)) != ((uint32_t)(data[5] & 3u) << 13)) __builtin_trap();
+        plat_event events[2];
+        (void)x11_xi2_events(&g_in, &decoded, now, events);
+        if ((g_in.rep_state & (3u << 13)) != ((uint32_t)(data[5] & 3u) << 13)) __builtin_trap();
+    }
     /* edit-e6x.20 XI2 ops: a well-shaped QueryDevice reply (master pointer 12, scroll + valuator classes whose numbers,
      * flags and increments come from fuzz bytes) so the populated decoder is reachable; a rejected parse or decode must
      * leave the table untouched (all-or-nothing), an accepted one must keep every axis remainder within [-0.5, 0.5]. */
@@ -111,6 +130,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         int rc = xi2_parse_query_device(&w, q, cut);
         if (rc < 0 && memcmp(&w, &snap, sizeof w) != 0) __builtin_trap();
         if (rc >= 0) {
+            uint64_t query_boundary = w.sample_sequence;
             uint8_t ev[128];
             for (size_t ei = 0; ei < 4; ei++) {
                 memset(ev, 0, sizeof ev);
@@ -131,6 +151,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     for (uint32_t a = 0; a < w.dev[i].naxes; a++)
                         if (!(w.dev[i].axis[a].rem >= -0.5 && w.dev[i].axis[a].rem <= 0.5)) __builtin_trap();
             }
+            xi2 live = w;
+            if (xi2_adopt_query_device(&w, q, o, query_boundary) < 0) __builtin_trap();
+            for (uint32_t i = 0; i < live.ndev; i++)
+                for (uint32_t a = 0; a < live.dev[i].naxes; a++) {
+                    const xi2_axis *before = &live.dev[i].axis[a];
+                    const xi2_axis *after = &w.dev[i].axis[a];
+                    if (before->sample_sequence > query_boundary &&
+                        (before->last != after->last || before->last_ok != after->last_ok ||
+                         before->rem != after->rem)) __builtin_trap();
+                }
         }
     }
     x11_clip_property v;

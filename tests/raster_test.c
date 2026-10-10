@@ -537,6 +537,9 @@ static int raster_native_pixels(void *user, uint32_t *pixels, size_t capacity)
 }
 static int raster_native_resize_test(void)
 {
+    /* The preceding cancellation test leaves server-side Present work for its
+     * window. Give the resize contract its own native surface. */
+    if (g_up) { work_pool_shutdown(&g_pool); plat_shutdown(&g_plat); g_up=false; }
     render_backend b={0};
     render_config cfg={.dims={2,2,4,4},.max_width=16,.max_height=16,.max_cells=16};
     T(render_test_prepare(&b,&cfg)==RENDER_OK);

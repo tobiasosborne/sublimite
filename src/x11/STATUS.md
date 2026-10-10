@@ -193,3 +193,29 @@ Final full-suite acceptance remains unmet. No shared keys were forcibly released
 server restarted, or unrelated code changed. Leak detection was disabled; coordinator
 must rerun with leaks enabled. The report also records existing deferred-owner-free
 admission accounting that can temporarily exceed budget, outside this bead.
+
+## edit-q0g — P2-1 input review
+
+Implemented: aligned runtime/clipboard pool owners (§6); raw-input map boundary
+and prepared-state adoption for a single change (§21); repeat deferral behind
+queued native input (§22); separate XI2 buttons through button 32/group state
+(§23); source/emulation-based XI2 wheel handling (§24); sample-boundary query
+adoption and DeviceChanged class seeding (§25); failing CLI window deadlines
+and delayed-backend startup test (§36); main-entry startup T0 (§37); shared
+numeric display guard policy (§39). No new globals or per-key heap allocation.
+
+**§21 remains partial:** the worker snapshots current server state. Multiple
+server map generations already queued are not reconstructed. The explicit
+`x11_order_test map_generations_pending` reproduction still fails; it is not in
+the default suite. Do not close the whole bead based on the single-change test.
+
+Verification (M)[AC]: release build passed; first full ASan/UBSan make check
+passed all test binaries and shell contracts; final-tree repeat also passed.
+LeakSanitizer disabled (`ASAN_OPTIONS=detect_leaks=0`); coordinator must rerun
+with leaks on. Final X11 fuzz completed 2,423,547 runs in 61 seconds clean (M)[AC].
+All live runs used DISPLAY=:99 EDIT_DISPLAY=:99 and the shared display lock.
+Release x11_input_test and pure sanitizer alignment/XI2/display-policy checks
+passed. Final verification and full red/green evidence are maintained in
+[the worker report](../../docs/worker-reports/edit-q0g-s9.md); design choices are
+in [the decision](../../docs/decisions/edit-q0g.md). Existing hardware XI2 and
+real-window performance gaps are unchanged.

@@ -21,10 +21,11 @@ typedef struct xi2_axis {
     double last;                       /* last seen value (history) */
     double rem;                        /* sub-unit remainder not yet emitted, in [-0.5, 0.5] */
     bool last_ok;
+    uint64_t sample_sequence;          /* live history newer than an asynchronous query */
 } xi2_axis;
 
 typedef struct xi2_dev {
-    uint16_t source;                   /* master pointer id (scroll class sourceid) */
+    uint16_t source;                   /* sourceid reported by master-pointer classes/events */
     uint32_t naxes;
     xi2_axis axis[XI2_MAX_AXES];
 } xi2_dev;
@@ -32,6 +33,7 @@ typedef struct xi2_dev {
 typedef struct xi2 {
     uint8_t opcode;                    /* XInputExtension major opcode (= GE "extension" field) */
     bool active;
+    uint64_t sample_sequence;
     uint32_t ndev;
     xi2_dev dev[XI2_MAX_DEVS];
 } xi2;
@@ -39,16 +41,22 @@ typedef struct xi2 {
 /* Request builders. Return byte length. Buffers: 8 / 8 / 20 bytes. */
 size_t xi2_build_query_version(uint8_t opcode, uint8_t *out, uint16_t major, uint16_t minor);
 size_t xi2_build_query_device(uint8_t opcode, uint8_t *out, uint16_t deviceid /* 0 = all */);
-/* Select XI_DeviceChanged + XI_Motion on window for all master devices. */
+/* Select XI_DeviceChanged + XI_ButtonPress/Release + XI_Motion on window for all master devices. */
 size_t xi2_build_select_events(uint8_t opcode, uint8_t *out, uint32_t window);
 
 /* Parse a full QueryDevice reply (32-byte header + body); records scroll classes and seeds each axis's history
  * from the ValuatorClass current value. Returns scroll classes found (>=0) or -1 on malformed input. All-or-nothing:
  * on -1 the table in *x is untouched. Never reads out of bounds. */
 int xi2_parse_query_device(xi2 *x, const uint8_t *reply, size_t len);
+/* Runtime adoption: query_sequence is captured when QueryDevice is sent.
+ * Matching axes retain history decoded after that boundary. */
+int xi2_adopt_query_device(xi2 *x, const uint8_t *reply, size_t len, uint64_t query_sequence);
 
 typedef struct xi2_result {
-    bool device_changed;               /* rescan devices (QueryDevice), valuator history reset */
+    bool device_changed;               /* rescan; affected axes seeded or invalidated */
+    bool button, press, pointer_emulated;
+    uint16_t source;
+    uint32_t detail;
     bool motion;                       /* pointer position valid */
     bool wheel;                        /* dx/dy valid (PLAT_WHEEL_UNIT per notch) */
     int32_t x, y;                      /* window-relative, integer part */

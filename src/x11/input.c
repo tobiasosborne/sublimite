@@ -293,6 +293,26 @@ int x11_xi2_events(x11_input *in, const xi2_result *r, uint64_t now_ns, plat_eve
     if (r->device_changed) return 0;
     uint64_t t0 = x11_clock_map(&in->clock, r->time_ms, now_ns);
     uint16_t mods = x11_mods_from_state(in, r->mods);
+    in->held_buttons = r->buttons & ~0x1fu;
+    if (r->button) {
+        memset(&out[0], 0, sizeof out[0]);
+        out[0].kind = PLAT_EV_BUTTON; out[0].press = r->press; out[0].code = r->detail;
+        out[0].state = r->mods; out[0].mods = mods; out[0].buttons = r->buttons;
+        out[0].x = r->x; out[0].y = r->y; out[0].time_ms = r->time_ms; out[0].t0_ns = t0;
+        if (r->detail >= 4 && r->detail <= 7) {
+            if (!r->press) return 0;
+            out[0].kind = PLAT_EV_WHEEL;
+            if (r->detail == 4) out[0].dy = -PLAT_WHEEL_UNIT;
+            if (r->detail == 5) out[0].dy = PLAT_WHEEL_UNIT;
+            if (r->detail == 6) out[0].dx = -PLAT_WHEEL_UNIT;
+            if (r->detail == 7) out[0].dx = PLAT_WHEEL_UNIT;
+        } else {
+            uint32_t bit = UINT32_C(1) << (r->detail - 1);
+            if (r->press) out[0].buttons |= bit; else out[0].buttons &= ~bit;
+            in->held_buttons = out[0].buttons & ~0x1fu;
+        }
+        return 1;
+    }
     if (r->motion) {
         memset(&out[n], 0, sizeof out[n]);
         out[n].kind = PLAT_EV_MOTION; out[n].state = r->mods; out[n].x = r->x; out[n].y = r->y;

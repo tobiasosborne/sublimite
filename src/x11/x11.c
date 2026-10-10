@@ -144,8 +144,9 @@ typedef struct x11_runtime {
     work_pool pool;
     xcb_connection_t *keyboard_conn;
     keyboard_result result;
-    bool map_pending, map_dirty, xi_dirty;
+    bool map_pending, map_dirty, map_blocked, map_failed, xi_dirty;
     unsigned xi_cookie;
+    uint64_t xi_query_sequence;
     plat *owner;
 } x11_runtime;
 
@@ -175,8 +176,9 @@ static void rebuild_keyboard(work_ctx *job) {
 }
 
 static int setup_runtime(plat *p) {
-    x11_runtime *rt = calloc(1, sizeof *rt);
+    x11_runtime *rt = aligned_alloc(_Alignof(x11_runtime), sizeof *rt);
     if (!rt) return PLAT_ERR_FAIL;
+    memset(rt, 0, sizeof *rt);
     rt->owner = p;
     rt->keyboard_conn = xcb_connect(NULL, NULL);
     if (!rt->keyboard_conn || xcb_connection_has_error(rt->keyboard_conn) ||
@@ -192,7 +194,14 @@ static int setup_runtime(plat *p) {
 
 static void request_keymap(plat *p) {
     x11_runtime *rt = IN(p)->runtime;
-    if (rt) rt->map_dirty = true; /* coalesce mapping storms into one outstanding build */
+    if (rt) {
+        rt->map_dirty = true;
+        rt->map_blocked = true;
+        /* A synthetic repeat cannot cross the map generation boundary. */
+        x11_repeat_cancel(IN(p));
+        struct itimerspec stopped = {0};
+        timerfd_settime(p->repeat_fd, 0, &stopped, NULL);
+    }
 }
 
 static void rearm_repeat(plat *p);
@@ -203,7 +212,9 @@ static void keyboard_ready(const work_msg *msg, void *ud) {
     plat *p = rt->owner;
     keyboard_result *r = &rt->result;
     rt->map_pending = false;
+    if (!rt->map_dirty && !r->state) rt->map_failed = true;
     if (!rt->map_dirty && r->state) {
+        rt->map_blocked = false;
         x11_input_adopt_keymap(IN(p), r->keymap, r->state);
         if (IN(p)->ctx) xkb_context_unref(IN(p)->ctx);
         IN(p)->ctx = r->ctx;
@@ -239,7 +250,7 @@ static void poll_rescans(plat *p) {
             rt->xi_cookie = 0;
             if (reply && !err && !rt->xi_dirty) {
                 uint32_t length; memcpy(&length, (const uint8_t *)reply + 4, 4);
-                (void)xi2_parse_query_device(XI(p), reply, 32 + (size_t)length * 4);
+                (void)xi2_adopt_query_device(XI(p), reply, 32 + (size_t)length * 4, rt->xi_query_sequence);
                 p->core_wheel = !xi2_has_scroll(XI(p));
             }
             free(reply); free(err);
@@ -251,6 +262,7 @@ static void poll_rescans(plat *p) {
         struct iovec parts[4];
         parts[2].iov_base = b; parts[2].iov_len = sizeof b;
         xcb_protocol_request_t rq = { 1, NULL, b[0], 0 };
+        rt->xi_query_sequence = XI(p)->sample_sequence;
         rt->xi_cookie = xcb_send_request(C(p), 0, parts + 2, &rq);
         rt->xi_dirty = false;
         xcb_flush(C(p));
@@ -459,11 +471,10 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
     case XCB_BUTTON_PRESS: case XCB_BUTTON_RELEASE: {
         xcb_button_press_event_t *x = (xcb_button_press_event_t *)e;
         p->last_time = x->time;
-        bool core_wheel = p->core_wheel;
-        /* XI2 delivers the smooth scroll; its emulated core buttons share the timestamp: drop those */
-        if (!core_wheel && p->xi && x->detail >= 4 && x->detail <= 7 && x->time - p->xi_scroll_ms > 2u &&
-            p->xi_scroll_ms - x->time > 2u) core_wheel = true;   /* XI2 saw no scroll at this time: legacy device */
-        if (x11_input_button(IN(p), x, t == XCB_BUTTON_PRESS, trace_now_ns(), core_wheel, &ev)) x11_q_push(IN(p), &ev);
+        /* XI2 supplies native buttons with source/emulation identity. Core
+         * SendEvent packets are explicit synthetic input, not server emulation. */
+        if (p->xi && !(e->response_type & 0x80u)) break;
+        if (x11_input_button(IN(p), x, t == XCB_BUTTON_PRESS, trace_now_ns(), true, &ev)) x11_q_push(IN(p), &ev);
         break; }
     case XCB_MOTION_NOTIFY: {
         xcb_motion_notify_event_t *x = (xcb_motion_notify_event_t *)e;
@@ -487,7 +498,6 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
                 else if (r.time_ms) p->last_time = r.time_ms;
                 int ne = x11_xi2_events(IN(p), &r, trace_now_ns(), evs);
                 for (int i = 0; i < ne; i++) {
-                    if (evs[i].kind == PLAT_EV_WHEEL) p->xi_scroll_ms = r.time_ms;
                     x11_q_push(IN(p), &evs[i]);
                 }
             }
@@ -529,6 +539,14 @@ static bool drain(plat *p, const plat_callbacks *cb, uint64_t t_end) {
             if (cb->on_event) cb->on_event(cb->ud, &ev);
             continue;
         }
+        /* Retain later raw events in XCB, with their original timestamps.
+         * Backpressure avoids an allocating/unbounded staging queue. */
+        x11_runtime *rt = IN(p)->runtime;
+        if (rt && rt->map_blocked) {
+            poll_rescans(p);
+            if (rt->map_blocked) return false;
+            continue;
+        }
         xcb_generic_event_t *e = xcb_poll_for_queued_event(C(p));
         if (!e) e = xcb_poll_for_event(C(p));
         if (e) { dispatch(p, cb, e); free(e); continue; }
@@ -553,7 +571,8 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         poll_rescans(p);
         (void)x11_clip_poll(p);
         bool buffered = drain(p, cb, timeout_ms > 0 ? t_end : 0);
-        if (xcb_connection_has_error(C(p))) return PLAT_ERR_FAIL;
+        if (xcb_connection_has_error(C(p)) ||
+            (IN(p)->runtime && ((x11_runtime *)IN(p)->runtime)->map_failed)) return PLAT_ERR_FAIL;
         if (p->quit) break;
         int to = -1;
         if (timeout_ms >= 0) {
@@ -570,7 +589,8 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         }
         if (buffered) to = 0;
         nfds_t n = 0;
-        fds[n].fd = xcb_get_file_descriptor(C(p)); fds[n++].events = POLLIN;
+        fds[n].fd = xcb_get_file_descriptor(C(p));
+        fds[n++].events = IN(p)->runtime && ((x11_runtime *)IN(p)->runtime)->map_blocked ? 0 : POLLIN;
         fds[n].fd = p->timer_fd; fds[n++].events = POLLIN;
         fds[n].fd = p->repeat_fd; fds[n++].events = POLLIN;
         int work_i = -1;
@@ -594,7 +614,10 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
             cb->on_work(cb->ud);
             if (p->quit) break;
         }
-        if (fds[2].revents & POLLIN) {
+        /* Native input already buffered/readable owns the earlier ordering
+         * position. Keep repeat pending until that bounded drain completes. */
+        if ((fds[2].revents & POLLIN) && !buffered && !(fds[0].revents & POLLIN) &&
+            !(rt && rt->map_blocked)) {
             uint64_t x; ssize_t rr = read(p->repeat_fd, &x, sizeof x); (void)rr;
             plat_event rev;
             uint64_t now = trace_now_ns();

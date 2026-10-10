@@ -1,7 +1,12 @@
 /* Compile the production entry point here so make check covers it with ASan. */
+#include "editor/editor.h"
+#include "raster/raster.h"
+static int test_backend_select(render_backend *backend, const char *name);
+#define editor_backend_select test_backend_select
 #define main editor_cli_main
 #include "../src/main.c"
 #undef main
+#undef editor_backend_select
 #include "trace/trace_fmt.h"
 #include <dirent.h>
 #include "ipc_isolation.h"
@@ -9,6 +14,26 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <xcb/xcb.h>
+static int delayed_backend_init(render_backend *backend, const render_config *config)
+{
+    struct timespec remaining = {0, 250000000};
+    while (nanosleep(&remaining, &remaining) && errno == EINTR) {}
+    render_backend original = {0};
+    int rc = render_cpu_backend(&original);
+    if (rc) return rc;
+    /* Restore implementation identity before production runtime diagnostics. */
+    backend->ops.init = original.ops.init;
+    rc = original.ops.init(backend, config);
+    if (!rc) { (void)trace_thread_register(); trace_record(TRACE_T3_RENDER_DONE, 0); }
+    return rc;
+}
+static int test_backend_select(render_backend *backend, const char *name)
+{
+    if (!getenv("CLI_TEST_DELAY_BACKEND")) return editor_backend_select(backend, name);
+    int rc = render_cpu_backend(backend);
+    if (!rc) backend->ops.init = delayed_backend_init;
+    return rc;
+}
 #define T(c) do { if (!(c)) { fprintf(stderr, "cli_test:%d: FAIL %s\n", __LINE__, #c); goto cleanup; } } while (0)
 static xcb_atom_t intern(xcb_connection_t *c, const char *name)
 {
@@ -41,7 +66,6 @@ static void pause_poll(void)
 {
     struct timespec pause = {0, 10000000}; (void)nanosleep(&pause, NULL);
 }
-/* 0 = passed, 1 = failed, 2 = skipped. */
 static ipc_result decoy_open(const ipc_request *request, ipc_token token, void *ctx)
 {
     (void)request; (void)token;
@@ -67,6 +91,7 @@ static int same_display_handoff(const char *file, ipc_server *decoy)
     puts("cli_test: same-display launcher handoff preserved; child_exit=0 handoffs=1");
     return 0;
 }
+/* 0 = passed, 1 = failed. Display preflight is a required fixture. */
 static int session(const char *file, const char *dump, bool fail_dump, ipc_server *decoy)
 {
     int result = 1, status = 0;
@@ -113,10 +138,10 @@ static int session(const char *file, const char *dump, bool fail_dump, ipc_serve
         pid_t waited = child_wait(child, &status, WNOHANG | WUNTRACED);
         if (waited == child && (WIFEXITED(status) || WIFSIGNALED(status))) child = -1;
         T(waited == 0 && kill(child, 0) == 0 && !xcb_connection_has_error(c));
-        fprintf(stderr, "cli_test: SKIP: window not created within %u s (load1=%.2f)%s\n",
+        fprintf(stderr, "cli_test: FAIL: window not created within %u s (load1=%.2f)%s\n",
             getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT") ? 0u : wait_seconds, load1,
             getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT") ? " [forced test timeout]" : "");
-        result = 2; goto cleanup;
+        goto cleanup;
     }
     T(window != XCB_WINDOW_NONE);
     T(handed_off == 0);
@@ -142,6 +167,24 @@ static int session(const char *file, const char *dump, bool fail_dump, ipc_serve
         f = fopen(dump, "rb"); T(f != NULL); size_t count = 0;
         T(trace_fmt_load(f, &records, &count) == 0 && count > 0);
         int closed = fclose(f); f = NULL; T(closed == 0);
+        unsigned ingress = 0, connected = 0, mapped = 0;
+        uint64_t startup = 0, connection = 0, map = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (records[i].frame_id != 0) continue;
+            if (records[i].ev == TRACE_T0_INGRESS) { ingress++; startup = records[i].ns; }
+            if (records[i].ev == TRACE_T1_DEQUEUE) { connected++; connection = records[i].ns; }
+            if (records[i].ev == TRACE_T4_PRESENT_SUBMITTED) { mapped++; map = records[i].ns; }
+        }
+        T(ingress == 1 && connected == 1 && mapped == 1);
+        T(startup && startup <= connection && connection <= map);
+        if (getenv("CLI_TEST_DELAY_BACKEND")) {
+            unsigned delayed = 0;
+            for (size_t i = 0; i < count; i++)
+                if (records[i].frame_id == 0 && records[i].ev == TRACE_T3_RENDER_DONE && records[i].ns >= map) delayed++;
+            T(delayed == 1);
+            fputs("cli_test: §36 delayed production backend initialization completed\n", stderr);
+        }
+        fputs("cli_test: §37 production startup trace endpoints passed\n", stderr);
     }
     result = 0;
 cleanup:
@@ -151,7 +194,7 @@ cleanup:
     if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
     return result;
 }
-int main(void)
+static int run_cli_suite(void)
 {
     int result = 1;
     bool root_created = false, decoy_live = false;
@@ -180,17 +223,17 @@ int main(void)
         T(test_ipc_isolate() != NULL);
     }
     int ran = session(file, dump, false, &decoy);
-    if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
+    T(ran == 0);
     ipc_server_fini(&decoy); decoy_live = false;
     /* Always cover different displays in make check, on a shared runtime.
      * This decoy owns only an IPC socket; it never opens a window on :98. */
     T(ipc_server_init_display(&decoy, NULL, ":98") == IPC_OK); decoy_live = true;
     fputs("cli_test: different-display decoy, shared runtime regression\n", stderr);
     ran = session(file, dump, false, &decoy);
-    if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
+    T(ran == 0);
     ipc_server_fini(&decoy); decoy_live = false;
     ran = session(file, root, true, NULL);
-    if (ran == 2) { result = 0; goto cleanup; } T(ran == 0);
+    T(ran == 0);
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
         if (entry->d_name[0] == '.') continue;
@@ -225,7 +268,7 @@ cleanup:
                 if (!strncmp(remaining_endpoint->d_name, "sublimite-", 10)) (void)unlinkat(dirfd(d), remaining_endpoint->d_name, 0);
             (void)closedir(d); d = NULL;
         }
-        /* A skipped/failed session may have left partial journals. */
+        /* A failed session may have left partial journals. */
         d = opendir(dir);
         if (d) {
             struct dirent *leftover;
@@ -238,4 +281,28 @@ cleanup:
         (void)rmdir(dir); (void)unlink(file); (void)unlink(dump); (void)rmdir(root);
     }
     return result;
+}
+
+int main(void)
+{
+    if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite();
+    /* A live implementation that misses its window deadline must fail. */
+    pid_t control = fork();
+    if (control < 0) return 1;
+    if (!control) {
+        if (setenv("CLI_TEST_FORCE_WINDOW_TIMEOUT", "1", 1)) _exit(3);
+        _exit(run_cli_suite());
+    }
+    int status = 0;
+    if (child_wait(control, &status, 0) != control || !WIFEXITED(status) || WEXITSTATUS(status) != 1) {
+        fputs("cli_test: FAIL §36 forced startup timeout succeeded/skipped\n", stderr);
+        return 1;
+    }
+    fputs("cli_test: §36 forced startup timeout correctly failed\n", stderr);
+    int normal = run_cli_suite();
+    if (normal) return normal;
+    if (setenv("CLI_TEST_DELAY_BACKEND", "1", 1)) return 1;
+    int delayed = run_cli_suite();
+    (void)unsetenv("CLI_TEST_DELAY_BACKEND");
+    return delayed;
 }

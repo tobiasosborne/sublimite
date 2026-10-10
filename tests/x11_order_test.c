@@ -15,16 +15,14 @@
 #include <unistd.h>
 
 static struct {
-    bool input_alloc, compose_alloc, raw_stream;
+    bool input_alloc, compose_alloc, raw_stream, extended_alloc;
     unsigned table_unrefs, inject_poll;
     bool raw_focus;
-    unsigned flags;
+    unsigned flags, raw_count;
+    bool raw_release;
 } faults;
 
-static void *test_calloc(size_t n, size_t size) {
-    if (faults.input_alloc && n == 1 && size == sizeof(x11_input)) return NULL;
-    return calloc(n, size);
-}
+static void *test_calloc(size_t n, size_t size);
 static struct xkb_compose_state *test_compose_new(struct xkb_compose_table *t,
                                                  enum xkb_compose_state_flags flags) {
     return faults.compose_alloc ? NULL : xkb_compose_state_new(t, flags);
@@ -47,6 +45,17 @@ static xcb_xkb_per_client_flags_reply_t *test_flags_reply(xcb_connection_t *c,
     return r;
 }
 static xcb_generic_event_t *test_queued_event(xcb_connection_t *c) {
+    if (faults.raw_count || faults.raw_release) {
+        xcb_generic_event_t *e = calloc(1, sizeof *e);
+        if (!e) return NULL;
+        if (faults.raw_count) { faults.raw_count--; e->response_type = XCB_PROPERTY_NOTIFY; }
+        else {
+            faults.raw_release = false;
+            xcb_key_release_event_t release = { .response_type = XCB_KEY_RELEASE, .detail = 38 };
+            memcpy(e, &release, sizeof release);
+        }
+        return e;
+    }
     if (faults.raw_focus) {
         faults.raw_focus = false;
         xcb_focus_out_event_t f = { .response_type = XCB_FOCUS_OUT,
@@ -85,12 +94,20 @@ static bool test_clip_poll(plat *p) {
 #undef xkb_compose_table_unref
 #undef xcb_xkb_per_client_flags_reply
 
+static void *test_calloc(size_t n, size_t size) {
+    if (faults.input_alloc && n == 1 && size == sizeof(x11_input)) return NULL;
+    /* Fundamental-alignment allocators cannot own these extended types. */
+    if (faults.extended_alloc && size == sizeof(x11_runtime)) return NULL;
+    return calloc(n, size);
+}
 static int failed;
 #define CHECK(c, label) do { if (!(c)) { fprintf(stderr, "x11_order_test: FAIL %s\n", label); failed = 1; } } while (0)
 
 typedef struct sink {
     plat *p;
     unsigned keys, chars, clips, wheels, keymaps;
+    uint8_t last_text, text[16];
+    unsigned text_count;
     unsigned n;
     plat_ev_kind kinds[16];
     bool sustain;
@@ -99,7 +116,13 @@ typedef struct sink {
 } sink;
 static void on_event(void *ud, const plat_event *e) {
     sink *s = ud;
-    if (e->kind == PLAT_EV_KEY) { s->keys++; if (e->press && e->utf8_len) s->chars++; }
+    if (e->kind == PLAT_EV_KEY) {
+        s->keys++;
+        if (e->press && e->utf8_len) {
+            s->chars++; s->last_text = e->utf8[0];
+            if (s->text_count < 16) s->text[s->text_count++] = e->utf8[0];
+        }
+    }
     if (e->kind == PLAT_EV_CLIPBOARD) s->clips++;
     if (e->kind == PLAT_EV_WHEEL) s->wheels++;
     if (e->kind == PLAT_EV_KEYMAP) s->keymaps++;
@@ -289,6 +312,7 @@ static void test_rescans(void) {
             sink s = { .p = &p };
             plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
             if (mode == 0) {
+                (void)drain(&p, &cb, 0);
                 xcb_generic_event_t e = { .response_type = p.xkb_event };
                 ((uint8_t *)&e)[1] = XCB_XKB_MAP_NOTIFY;
                 dispatch(&p, &cb, &e);
@@ -330,17 +354,168 @@ static void test_rescan_publish(void) {
     xkb_keymap_unref(old);
     plat_shutdown(&p);
 }
-static void test_wheel_pending(void) {
+static void test_repeat_order(void) {
+    for (unsigned focus = 0; focus < 2; focus++) {
+        plat p;
+        if (!open_plat(&p)) return;
+        p.focused = true;
+        plat_set_repeat(&p, 0, 100);
+        xcb_key_press_event_t key = { .detail = 38 };
+        plat_event ev;
+        CHECK(x11_input_key(IN(&p), &key, true, trace_now_ns(), &ev), "§22 start repeat");
+        IN(&p)->rep_next_ns = trace_now_ns() - UINT64_C(1000000);
+        rearm_repeat(&p);
+        faults.raw_count = 256;
+        faults.raw_release = !focus;
+        faults.raw_focus = focus != 0;
+        sink s = { .p = &p };
+        plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+        plat_run_for(&p, &cb, 20);
+        CHECK(s.chars == 0 && !IN(&p)->rep_active,
+              "§22 queued release/focus beyond first slice precedes repeat");
+        plat_shutdown(&p);
+    }
+}
+static void test_map_boundary(void) {
     plat p;
     if (!open_plat(&p)) return;
-    p.core_wheel = false; p.xi_scroll_ms = 100;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
-    xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 5, .time = 101 };
-    dispatch(&p, &cb, (xcb_generic_event_t *)&b);
+    /* A pre-boundary key has already reached the translated queue. */
+    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
+    dispatch(&p, &cb, (xcb_generic_event_t *)&key);
+    xcb_generic_event_t notification = { .response_type = p.xkb_event };
+    ((uint8_t *)&notification)[1] = XCB_XKB_MAP_NOTIFY;
+    dispatch(&p, &cb, &notification);
+    /* Hold completion: retain the following raw release/press in XCB order. */
+    x11_runtime *rt = IN(&p)->runtime;
+    rt->map_pending = true;
+    key.response_type = XCB_KEY_RELEASE;
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    key.response_type = XCB_KEY_PRESS;
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    CHECK(barrier(p.conn), "§21 staged keys barrier");
     plat_run_for(&p, &cb, 5);
-    CHECK(s.wheels == 1, "§18 independent legacy notch near smooth timestamp survives");
+    CHECK(s.keys == 1, "§21 later raw keys wait for matching map publication");
+    struct xkb_rule_names names = { .layout = "de" };
+    rt->result.ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    rt->result.keymap = xkb_keymap_new_from_names(rt->result.ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    CHECK(rt->result.keymap != NULL, "§21 replacement German keymap");
+    rt->result.state = x11_input_prepare_state(rt->result.keymap);
+    rt->result.device = p.xkb_dev;
+    rt->map_dirty = false;
+    work_msg msg = {0}; keyboard_ready(&msg, rt);
+    /* Replay raw keys only after the map notification callback. */
+    plat_run_for(&p, &cb, 5);
+    CHECK(s.keys == 3 && s.keymaps == 1, "§21 staged transitions replay after KEYMAP");
+    CHECK(s.last_text == 'z', "§21 staged key uses published German map");
+    plat_event translated = {0};
+    x11_translate(IN(&p), 29, 0, &translated);
+    CHECK(translated.utf8_len == 1 && translated.utf8[0] == 'z', "§21 German Y position translates as z");
     plat_shutdown(&p);
+}
+static bool set_layout(const char *layout) {
+    pid_t child = fork();
+    if (child < 0) return false;
+    if (!child) {
+        execl("/usr/bin/setxkbmap", "setxkbmap", "-display", ":99", "-layout", layout, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+static void test_live_map_boundary(void) {
+    CHECK(set_layout("us"), "§21 live US map fixture");
+    plat p;
+    if (!open_plat(&p)) return;
+    sink s = { .p = &p };
+    plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    key.response_type = XCB_KEY_RELEASE;
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    CHECK(barrier(p.conn), "§21 live before-map keys queued");
+    CHECK(set_layout("de"), "§21 actual server map change");
+    /* The UI connection owns this test-only grab: only worker snapshot I/O
+     * stalls, while UI dispatch and its ordered raw queue remain runnable. */
+    xcb_grab_server(p.conn); CHECK(barrier(p.conn), "§21 delay snapshot worker");
+    key.response_type = XCB_KEY_PRESS;
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    key.response_type = XCB_KEY_RELEASE;
+    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    CHECK(barrier(p.conn), "§21 live after-map keys queued");
+    CHECK(plat_run_for(&p, &cb, 20) == PLAT_OK, "§21 delayed snapshot UI remains bounded");
+    CHECK(s.chars == 1 && s.last_text == 'y', "§21 only pre-change US key delivered while worker delayed");
+    xcb_ungrab_server(p.conn); xcb_flush(p.conn);
+    for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
+    CHECK(s.keys == 4 && s.last_text == 'z' && s.keymaps > 0,
+          "§21 immediate post-notification key uses actual German map");
+    plat_shutdown(&p);
+    CHECK(set_layout("us"), "§21 restore test server map");
+}
+/* Retained reproduction for the remaining exact server-generation gap. */
+static void test_map_generations_pending(void) {
+    CHECK(set_layout("us"), "§21 generation fixture US");
+    plat p;
+    if (!open_plat(&p)) return;
+    sink s = { .p = &p };
+    plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+    xcb_key_press_event_t key = { .detail = 29, .event = p.win };
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(set_layout(i ? "us" : "de"), "§21 consecutive server map change");
+        key.response_type = XCB_KEY_PRESS;
+        xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+        key.response_type = XCB_KEY_RELEASE;
+        xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+        CHECK(barrier(p.conn), "§21 generation keys queued");
+    }
+    for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
+    CHECK(s.text_count == 2 && s.text[0] == 'z' && s.text[1] == 'y',
+          "§21 exact snapshots retain both successive server mapping generations");
+    plat_shutdown(&p);
+    CHECK(set_layout("us"), "§21 restore generation fixture");
+}
+static void xi_wheel_button(plat *p, const plat_callbacks *cb, uint16_t source, bool emulated) {
+    uint8_t raw[84] = {0};
+    raw[0] = XCB_GE_GENERIC; raw[1] = XI(p)->opcode;
+    uint32_t length = 12, detail = 5, time = 101, flags = emulated ? (1u << 16) : 0;
+    uint16_t type = 4;
+    memcpy(raw + 4, &length, 4); memcpy(raw + 8, &type, 2);
+    memcpy(raw + 12, &time, 4); memcpy(raw + 16, &detail, 4);
+    memcpy(raw + 56, &source, 2); /* XCB shifts wire offset 52 by four */
+    memcpy(raw + 60, &flags, 4);
+    dispatch(p, cb, (xcb_generic_event_t *)raw);
+}
+static void test_wheel_pending(void) {
+    for (unsigned order = 0; order < 2; order++) {
+        plat p;
+        if (!open_plat(&p)) return;
+        xi2 *x = XI(&p);
+        CHECK(x != NULL, "§24 XI2 fixture");
+        if (!x) { plat_shutdown(&p); return; }
+        x->ndev = 1; x->dev[0].source = 12; x->dev[0].naxes = 1;
+        x->dev[0].axis[0] = (xi2_axis){ .num = 3, .inc = 1, .last_ok = true };
+        sink s = { .p = &p };
+        plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+        uint8_t motion[96] = {0};
+        motion[0] = XCB_GE_GENERIC; motion[1] = x->opcode;
+        uint16_t type = 6, words = 1, source = 12; uint32_t length = 15, time = 100, value = 1;
+        memcpy(motion + 4, &length, 4); memcpy(motion + 8, &type, 2); memcpy(motion + 12, &time, 4);
+        memcpy(motion + 54, &words, 2); memcpy(motion + 56, &source, 2);
+        motion[84] = 8; memcpy(motion + 88, &value, 4);
+        if (!order) xi_wheel_button(&p, &cb, 12, true);
+        dispatch(&p, &cb, (xcb_generic_event_t *)motion);
+        if (order) xi_wheel_button(&p, &cb, 12, true);
+        /* Distinct device at the same/near timestamp and a real discrete notch
+         * on the smooth source must both survive, regardless of event order. */
+        xi_wheel_button(&p, &cb, 99, false);
+        xi_wheel_button(&p, &cb, 12, false);
+        plat_run_for(&p, &cb, 5);
+        CHECK(s.wheels == 3, "§24 smooth + independent notches counted, own emulation suppressed in both orders");
+        uint8_t req[20]; xi2_build_select_events(x->opcode, req, p.win);
+        CHECK((req[16] & 0x30u) == 0x30u, "§24 XI button press/release selected");
+        plat_shutdown(&p);
+    }
 }
 static void test_xi_mask_pending(void) {
     xi2 x = { .opcode = 131 };
@@ -354,6 +529,36 @@ static void test_xi_mask_pending(void) {
     xi2_result r;
     CHECK(xi2_decode(&x, wire, sizeof wire, false, &r) && (r.buttons & (1u << 8)),
           "§19 XI motion preserves held button 9");
+}
+static void test_xi_group(void) {
+    plat p;
+    if (!open_plat(&p)) return;
+    x11_input *in = IN(&p);
+    struct xkb_rule_names names = { .layout = "us,de" };
+    struct xkb_keymap *km = xkb_keymap_new_from_names(in->ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    CHECK(km && x11_input_set_keymap(in, km) == 0, "§23 multigroup fixture");
+    uint8_t wire[96] = {0};
+    wire[0] = XCB_GE_GENERIC; wire[1] = 131;
+    uint16_t type = 6, words = 1;
+    memcpy(wire + 8, &type, 2);
+    memcpy(wire + 48, &words, 2); memcpy(wire + 50, &words, 2);
+    wire[84] = 1;
+    xi2 x = { .opcode = 131 }; xi2_result r;
+    for (unsigned button = 6; button <= 7; button++) {
+        wire[80] = (uint8_t)(1u << button);
+        CHECK(xi2_decode(&x, wire, sizeof wire, false, &r), "§23 decode extended button");
+        plat_event events[2];
+        (void)x11_xi2_events(in, &r, trace_now_ns(), events);
+        CHECK((in->rep_state & (3u << 13)) == 0, "§23 pointer buttons cannot change repeat group");
+        plat_event translated = {0}; x11_translate(in, 29, in->rep_state, &translated);
+        CHECK(translated.utf8_len == 1 && translated.utf8[0] == 'y', "§23 repeat remains in US group");
+    }
+    /* Button 32 requires a second XI mask word (XI bit zero is unused). */
+    uint8_t large[104] = {0}; memcpy(large, wire, 80);
+    words = 2; memcpy(large + 48, &words, 2); large[84] = 1; large[88] = 1;
+    CHECK(xi2_decode(&x, large, sizeof large, false, &r) && (r.buttons & (UINT32_C(1) << 31)),
+          "§23 XI motion preserves held button 32");
+    plat_shutdown(&p);
 }
 static void test_repeat_config(void) {
     plat p;
@@ -435,16 +640,30 @@ static void test_startup_trace(void) {
         x11_clip_set_limits(&p, 0, 0, UINT32_MAX); plat_shutdown(&p);
     }
 }
+static void test_alignment(void) {
+    plat p;
+    faults.extended_alloc = true;
+    if (open_plat(&p)) {
+        CHECK((uintptr_t)IN(&p)->runtime % _Alignof(x11_runtime) == 0,
+              "§6 runtime extended alignment");
+        plat_shutdown(&p);
+    }
+    faults.extended_alloc = false;
+}
 int main(int argc, char **argv) {
     if (!xvfb_start()) { fprintf(stderr, "x11_order_test: FAIL no private Xvfb\n"); return 1; }
     const char *which = argc > 1 ? argv[1] : "all";
+    if (!strcmp(which, "all") || !strcmp(which, "alignment")) test_alignment();
     if (!strcmp(which, "all") || !strcmp(which, "burst")) test_burst();
     if (!strcmp(which, "local_overflow")) test_local_overflow();
     if (!strcmp(which, "all") || !strcmp(which, "order")) { test_order(); test_poll_order(); }
     if (!strcmp(which, "all") || !strcmp(which, "slices")) test_slices();
     if (!strcmp(which, "all") || !strcmp(which, "rescans")) { test_rescans(); test_rescan_publish(); }
-    if (!strcmp(which, "wheel_pending")) test_wheel_pending();
-    if (!strcmp(which, "xi_mask_pending")) test_xi_mask_pending();
+    if (!strcmp(which, "all") || !strcmp(which, "repeat_order")) test_repeat_order();
+    if (!strcmp(which, "all") || !strcmp(which, "map_boundary")) { test_map_boundary(); test_live_map_boundary(); }
+    if (!strcmp(which, "map_generations_pending")) test_map_generations_pending();
+    if (!strcmp(which, "all") || !strcmp(which, "wheel_pending")) test_wheel_pending();
+    if (!strcmp(which, "all") || !strcmp(which, "xi_mask_pending")) { test_xi_mask_pending(); test_xi_group(); }
     if (!strcmp(which, "all") || !strcmp(which, "repeat_config")) test_repeat_config();
     if (!strcmp(which, "all") || !strcmp(which, "quit")) test_quit();
     if (!strcmp(which, "all") || !strcmp(which, "compose")) test_compose_failure();

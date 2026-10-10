@@ -10,14 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "editor/runtime.h"
+/* Use the production policy for both input and alternate-display validation.
+ * It normalizes the numeric display after the final colon, independent of
+ * host/transport spelling; zero and invalid/missing displays are refused. */
 static int edit_display_is_real(const char *d)
 {
-    const char *colon = strchr(d, ':');
-    if (colon == NULL) return 0;
-    size_t host = (size_t)(colon - d);
-    if (host != 0 && !(host == 4 && strncmp(d, "unix", 4) == 0) &&
-        !(host == 9 && strncmp(d, "localhost", 9) == 0)) return 0;
-    return colon[1] == '0' && (colon[2] == '\0' || colon[2] == '.');
+    return editor_runtime_display(d, NULL, NULL) != d;
 }
 
 __attribute__((constructor)) static void edit_display_guard(void)

@@ -77,7 +77,7 @@ bool x11_input_button(x11_input *in, const xcb_button_press_event_t *ev, bool pr
 bool x11_focus_relevant(uint8_t mode, uint8_t detail);
 /* Forget held keys, repeat and compose state (real focus change). */
 void x11_input_focus_reset(x11_input *in);
-/* Turn a decoded XI2 event into plat events (motion, then wheel); returns count (0..2). XI_DeviceChanged carries no
+/* Turn a decoded XI2 event into a button or motion-then-wheel; returns count (0..2). XI_DeviceChanged carries no
  * input modifiers and yields 0 events without touching the clock map or xkb state. */
 int x11_xi2_events(x11_input *in, const xi2_result *r, uint64_t now_ns, plat_event out[2]);
 
