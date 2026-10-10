@@ -49,6 +49,28 @@ static void ws_oracle(const uint8_t *p, size_t n, size_t lo, size_t hi,
     }
     CHECK(expected==count);
 }
+/* Independent omission oracle: construct the logical bytes, then query a
+ * separate ordinary tree. The input tree must remain byte-for-byte unchanged. */
+static void preview_oracle(piece_tree *t, const uint8_t *bytes, size_t n,
+                           size_t lo, size_t hi, uint8_t width, size_t cap)
+{
+    uint8_t logical[INDENT_TYPING_BYTES*2u+1u], original[sizeof logical];
+    uint8_t actual[sizeof logical+2u], expected[sizeof actual];
+    CHECK(n<=sizeof logical && lo<=hi && hi<=n && cap<=sizeof actual);
+    memcpy(logical,bytes,lo); memcpy(logical+lo,bytes+hi,n-hi);
+    piece_allocator a=piece_default_allocator(); piece_tree *oracle=piece_create(&a); CHECK(oracle);
+    CHECK(piece_init_copy(oracle,logical,n-(hi-lo))==PIECE_OK);
+    size_t an,en; memset(actual,0xa5,sizeof actual); memset(expected,0xa5,sizeof expected);
+    indent_code want=indent_on_enter(oracle,lo,expected,cap,&en);
+    CHECK(indent_on_enter_after_delete(t,lo,hi,actual,cap,&an)==want);
+    CHECK(an==en && !memcmp(actual,expected,sizeof actual));
+    indent_edit ae,ee; indent_style style={false,width};
+    want=indent_on_close_brace(oracle,lo,style,&ee);
+    CHECK(indent_on_close_brace_after_delete(t,lo,hi,style,&ae)==want);
+    CHECK(ae.lo==ee.lo && ae.hi==ee.hi && ae.length==ee.length && ae.bytes[0]==ee.bytes[0]);
+    CHECK(piece_len(t)==n && piece_read(t,0,original,n)==PIECE_OK && !memcmp(original,bytes,n));
+    piece_destroy(oracle);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size<8) return 0;
@@ -67,6 +89,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         size_t end=n;
         while (end) { size_t k=end>31?31:end; CHECK(piece_insert(t,0,bytes+end-k,k)==PIECE_OK); end-=k; }
     } else CHECK(piece_init_copy(t,bytes,n)==PIECE_OK);
+    preview_oracle(t,bytes,n,lo,hi,width,(data[0]&4u)?data[7]%16u:MAX_BYTES+2u);
     uint64_t match;
     CHECK(indent_bracket_match(t,cursor,lo,hi,&match)==INDENT_OK);
     CHECK(match==match_oracle(bytes,n,cursor,lo,hi));
@@ -126,6 +149,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         size_t long_cap=(data[2]&1u)?0:sizeof out;
         CHECK(indent_on_enter(t,long_cursor,out,long_cap,&length)==INDENT_ERR_LIMIT && length==0);
         CHECK(indent_on_close_brace(t,long_cursor,(indent_style){false,width},&edit)==INDENT_ERR_LIMIT && edit.length==0);
+        size_t cut_lo=((size_t)data[3]*256u+data[4])%(sizeof long_bytes+1u);
+        size_t cut_hi=((size_t)data[5]*256u+data[6])%(sizeof long_bytes+1u);
+        if (cut_lo>cut_hi) { size_t temp=cut_lo; cut_lo=cut_hi; cut_hi=temp; }
+        preview_oracle(t,long_bytes,sizeof long_bytes,cut_lo,cut_hi,width,sizeof out);
         piece_destroy(t);
     }
     return 0;

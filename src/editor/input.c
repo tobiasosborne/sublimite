@@ -203,13 +203,6 @@ static int prefix_error(editor *e, int cause)
     if (e->edit_delta.old || e->edit_delta.add) { remember(e, e->edit_delta); editor_modified(e); }
     e->action = EDITOR_ACTION_NONE; return cause;
 }
-static int reject_text(editor *e, const undo_state *before)
-{
-    e->stats.rejected_commands++;
-    if (e->edit_delta.old || e->edit_delta.add) return repair(e, e->edit_delta.off);
-    int rc = end_edit_group(e, before);
-    return rc ? rc : editor_refresh_cursor(e, e->old_cursor);
-}
 static int check_index_edit(editor *e, uint64_t off, uint64_t old, uint64_t add)
 {
     if (e->buffer->index && lineidx_edit_check(e->buffer->index, off, old, add)) {
@@ -239,6 +232,21 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
     if (tk == TEXT_BYTES) {
         int check = check_index_edit(e, lo, old, n); if (check) return check;
     }
+    /* Resolve indent against the post-selection logical source before opening
+     * an undo group or deleting/staging any bytes. LIMIT rejects one command;
+     * a later key retries the same unchanged buffer and selection. */
+    indent_edit edit={0};
+    indent_code ir=INDENT_OK;
+    if (tk == TEXT_ENTER) {
+        ir=indent_on_enter_after_delete(e->tree,lo,lo+old,e->indent_bytes,EDITOR_STAGE_BYTES,&n);
+        text=e->indent_bytes;
+    } else if (tk == TEXT_BRACE) {
+        ir=indent_on_close_brace_after_delete(e->tree,lo,lo+old,e->buffer->style,&edit);
+        e->indent_bytes[0]=edit.bytes[0]; text=e->indent_bytes; n=edit.length;
+    }
+    if (ir != INDENT_OK || (e->journal && n > EDITOR_STAGE_BYTES-e->stage_used)) {
+        e->stats.rejected_commands++; return editor_refresh_cursor(e,e->old_cursor);
+    }
     e->v.state.selection = e->old_selection;
     undo_state before = save_selection(&e->v), after = before;
     e->explicit_group = tk != TEXT_BYTES || (old && n) ||
@@ -246,17 +254,9 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
     int rc = e->explicit_group ? undo_group_begin(e->undo, &before) : 0; if (rc) return rc;
     e->edit_delta = (editor_delta){.off = lo, .before = before};
     rc = delete_part(e, lo, old, kind, &before); if (rc) return prefix_error(e, rc);
-    if (tk == TEXT_ENTER) {
-        indent_code ir = indent_on_enter(e->tree, lo, e->indent_bytes, EDITOR_STAGE_BYTES, &n);
-        if (ir != INDENT_OK || (e->journal && n > EDITOR_STAGE_BYTES - e->stage_used)) {
-            return reject_text(e, &before);
-        }
-        text = e->indent_bytes;
-    } else if (tk == TEXT_BRACE) {
-        indent_edit edit; indent_code ir = indent_on_close_brace(e->tree, lo, e->buffer->style, &edit);
-        if (ir != INDENT_OK) return reject_text(e, &before);
+    if (tk == TEXT_BRACE) {
         rc = delete_part(e, edit.lo, edit.hi - edit.lo, UNDO_DELETE, &before); if (rc) return prefix_error(e, rc);
-        lo = edit.lo; e->indent_bytes[0] = edit.bytes[0]; text = e->indent_bytes; n = edit.length;
+        lo = edit.lo;
     }
     if (n) {
         rc = check_index_edit(e, lo, 0, n); if (rc) return prefix_error(e, rc);

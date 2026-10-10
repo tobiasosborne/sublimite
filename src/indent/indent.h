@@ -49,6 +49,17 @@ indent_code indent_on_enter(const piece_tree *tree, uint64_t cursor_byte,
 indent_code indent_on_close_brace(const piece_tree *tree, uint64_t cursor_byte,
                                   indent_style style, indent_edit *edit);
 
+/* Pure selection previews: query the logical tree with [lo,hi) omitted at
+ * cursor lo, without modifying the input. lo<=hi<=piece_len(tree). Returned
+ * brace offsets are in that post-deletion tree. Apply the selection deletion
+ * only after OK, then apply the returned insertion/edit in the same undo group.
+ * Identical bounds, errors and allocation contract to the queries above;
+ * omitted bytes are never inspected or charged against the typing bound. */
+indent_code indent_on_enter_after_delete(const piece_tree *tree, uint64_t lo,
+    uint64_t hi, uint8_t *out, size_t cap, size_t *length);
+indent_code indent_on_close_brace_after_delete(const piece_tree *tree, uint64_t lo,
+    uint64_t hi, indent_style style, indent_edit *edit);
+
 /* Select bracket at cursor, else immediately before cursor, within [lo,hi).
  * Balance only its own type ()/[]/{}; other types, quotes and comments are
  * ordinary bytes. Return INDENT_NONE if no visible source/mate. Never reads

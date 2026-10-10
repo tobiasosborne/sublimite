@@ -175,6 +175,8 @@ static void test_no_malloc(void)
     for (unsigned i=0;i<10000;++i) {
         CHECK(indent_on_enter(t,5,out,sizeof out,&n)==INDENT_OK);
         CHECK(indent_on_close_brace(t,14,(indent_style){false,4},&e)==INDENT_OK);
+        CHECK(indent_on_enter_after_delete(t,4,6,out,sizeof out,&n)==INDENT_OK);
+        CHECK(indent_on_close_brace_after_delete(t,10,14,(indent_style){false,4},&e)==INDENT_OK);
         CHECK(indent_bracket_match(t,4,0,piece_len(t),&match)==INDENT_OK && match==19);
     }
     size_t allocations=edit_malloc_guard_end(); CHECK(allocations==0);
@@ -208,8 +210,71 @@ static void typing_work_bound(void)
     piece_destroy(t); CHECK(munmap(p,total)==0);
     puts("review 6: long-line typing/zero-capacity work bounded: ok");
 }
+static void selection_preview(void)
+{
+    const char *cases[]={"    XX\n", "  x\r\n\ty", "\rXX\n", " \t\n  x\n\t ", "abc", ""};
+    for (unsigned f=0;f<2;++f) for (size_t c=0;c<sizeof cases/sizeof cases[0];++c) {
+        size_t len=strlen(cases[c]);
+        piece_tree *t=tree_bytes((const uint8_t *)cases[c],len,f!=0);
+        for (size_t lo=0;lo<=len;++lo) for (size_t hi=lo;hi<=len;++hi) {
+            piece_tree *oracle=tree_text(cases[c]);
+            CHECK(piece_delete(oracle,lo,hi-lo,NULL)==PIECE_OK);
+            uint8_t actual[64], expected[64], original[64]; size_t an=99,en=99;
+            memset(actual,0xa5,sizeof actual); memset(expected,0xa5,sizeof expected);
+            indent_code want=indent_on_enter(oracle,lo,expected,sizeof expected,&en);
+            CHECK(indent_on_enter_after_delete(t,lo,hi,actual,sizeof actual,&an)==want);
+            CHECK(an==en && memcmp(actual,expected,sizeof actual)==0);
+            if (want==INDENT_OK) {
+                memset(actual,0xa5,sizeof actual);
+                CHECK(indent_on_enter_after_delete(t,lo,hi,actual,en-1,&an)==INDENT_ERR_CAPACITY);
+                CHECK(an==en && actual[0]==0xa5);
+            }
+            indent_edit ae,ee; indent_style style={false,4};
+            want=indent_on_close_brace(oracle,lo,style,&ee);
+            CHECK(indent_on_close_brace_after_delete(t,lo,hi,style,&ae)==want);
+            CHECK(ae.lo==ee.lo && ae.hi==ee.hi && ae.length==ee.length && ae.bytes[0]==ee.bytes[0]);
+            CHECK(piece_len(t)==len && piece_read(t,0,original,len)==PIECE_OK);
+            CHECK(memcmp(original,cases[c],len)==0); piece_destroy(oracle);
+        }
+        uint8_t out[8]; size_t n; indent_edit e;
+        CHECK(indent_on_enter_after_delete(t,len+1,len+1,out,sizeof out,&n)==INDENT_ERR_RANGE && n==0);
+        CHECK(indent_on_close_brace_after_delete(t,1,0,(indent_style){false,4},&e)==INDENT_ERR_RANGE && e.length==0);
+        piece_destroy(t);
+    }
+    /* A selection may discard a giant line without reading the omitted bytes.
+     * Shortening to the bound must succeed; retaining a long prefix/suffix must
+     * still reject and leave both the tree and output unchanged. */
+    uint8_t bytes[INDENT_TYPING_BYTES*3u+4u], out[INDENT_TYPING_BYTES+2u];
+    memset(bytes,' ',sizeof bytes); bytes[sizeof bytes-1]='\n';
+    piece_tree *t=tree_bytes(bytes,sizeof bytes,false); size_t n; indent_edit e;
+    for (unsigned i=0;i<2;++i) {
+        uint64_t lo=i?INDENT_TYPING_BYTES+1u:4u, hi=lo+1u;
+        memset(out,0xa5,sizeof out);
+        CHECK(indent_on_enter_after_delete(t,lo,hi,out,sizeof out,&n)==INDENT_ERR_LIMIT && n==0 && out[0]==0xa5);
+        CHECK(indent_on_enter_after_delete(t,lo,hi,NULL,0,&n)==INDENT_ERR_LIMIT && n==0);
+        CHECK(indent_on_close_brace_after_delete(t,lo,hi,(indent_style){false,4},&e)==INDENT_ERR_LIMIT && e.length==0);
+    }
+    CHECK(indent_on_enter_after_delete(t,4,sizeof bytes-2u,out,sizeof out,&n)==INDENT_OK);
+    CHECK(n==5 && memcmp(out,"\n    ",5)==0);
+    CHECK(indent_on_close_brace_after_delete(t,4,sizeof bytes-2u,(indent_style){false,4},&e)==INDENT_OK && e.lo==0 && e.hi==4);
+    CHECK(piece_len(t)==sizeof bytes); piece_destroy(t);
+    /* A mapped omitted range is inaccessible, including a giant selection. */
+    size_t page=4096u;
+    uint8_t *p=mmap(NULL,page*5u,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(p!=MAP_FAILED); memset(p,' ',page*5u); p[page*5u-1u]='\n';
+    piece_allocator a=piece_default_allocator(); t=piece_create(&a); CHECK(t);
+    CHECK(piece_init_mapped(t,p,page*5u,NULL)==PIECE_OK);
+    CHECK(mprotect(p+page,page*3u,PROT_NONE)==0);
+    edit_malloc_guard_begin();
+    CHECK(indent_on_enter_after_delete(t,page,page*4u,out,sizeof out,&n)==INDENT_OK && n==page+1u);
+    CHECK(indent_on_close_brace_after_delete(t,page,page*4u,(indent_style){false,4},&e)==INDENT_OK && e.lo==page-4u);
+    CHECK(edit_malloc_guard_end()==0);
+    piece_destroy(t); CHECK(munmap(p,page*5u)==0);
+    puts("indent_test: pure selection previews match actual deletion including fragmented/CRLF joins passed");
+}
 int main(void)
 {
+    selection_preview();
     typing_work_bound();
     test_enter(); test_close(); test_brackets(); test_whitespace(); test_detect(); test_long_lines_and_window_bound(); test_no_malloc();
     puts("indent_test: all cases passed"); return 0;

@@ -71,6 +71,94 @@ static int indentation(bool raster)
     editor_close(e);
     printf("editor_p4_test: %s Enter/brace/selection/CRLF atomic undo passed\n", raster ? "raster" : "null"); return 0;
 }
+static int indent_selection_limit_case(unsigned brace, unsigned scenario)
+{
+    uint8_t initial[INDENT_TYPING_BYTES + 32u], actual[sizeof initial];
+    memset(initial, ' ', sizeof initial); initial[0] = 'x'; initial[sizeof initial - 1] = '\n';
+    if (scenario == 2) initial[4] = '\n';
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = initial + 1, .initial_len = sizeof initial - 1,
+        .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    /* Keep both undo and redo history across a rejected selection command. */
+    T(press(e, key('x', 0, "x")) == 0);
+    undo_break_burst(e->undo);
+    T(press(e, key('y', 0, "y")) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    uint64_t start = scenario == 1 ? INDENT_TYPING_BYTES + 1u : 4u;
+    T(editor_set_cursor(e, start) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+    if (scenario == 1) { /* reverse the selection without changing its range */
+        uint64_t swap = e->v.state.selection.cursor;
+        e->v.state.selection.cursor = e->v.state.selection.anchor;
+        e->v.state.selection.anchor = swap;
+    }
+    view_selection selection = editor_view(e).selection;
+    undo_history history = undo_get_history(e->undo);
+    T(history.undo_groups == 1 && history.redo_groups == 1);
+    undo_stats stats = undo_get_stats(e->undo);
+    bool modified = editor_tab(e, 0)->modified;
+    uint64_t revision = e->buffer->revision;
+    size_t history_count = e->buffer->history_count, history_cursor = e->buffer->history_cursor;
+    uint64_t rejected = editor_get_stats(e).rejected_commands;
+    plat_event ev = brace ? key('}', 0, "}") : key(XKB_KEY_Return, 0, NULL);
+    size_t required; indent_edit edit;
+    T((brace ? indent_on_close_brace_after_delete(e->tree, start, start + 1u, e->buffer->style, &edit) :
+        indent_on_enter_after_delete(e->tree, start, start + 1u, actual, sizeof actual, &required)) == INDENT_ERR_LIMIT);
+    for (unsigned retry = 0; retry < 2; ++retry) {
+        T(press(e, ev) == 0); /* synchronous retry must see the same selection */
+        T(editor_length(e) == sizeof initial);
+        T(editor_read(e, 0, actual, sizeof actual) == 0);
+        T(!memcmp(actual, initial, sizeof actual));
+        view_selection now = editor_view(e).selection;
+        T(now.cursor == selection.cursor && now.anchor == selection.anchor && now.preferred_col == selection.preferred_col);
+        undo_history current = undo_get_history(e->undo);
+        T(current.undo_groups == history.undo_groups && current.redo_groups == history.redo_groups);
+        T(current.group_serial == history.group_serial && current.evicted_groups == history.evicted_groups);
+        T(undo_get_stats(e->undo).records == stats.records);
+        T(!e->undo->open && editor_tab(e, 0)->modified == modified);
+        T(e->buffer->revision == revision);
+        T(e->buffer->history_count == history_count && e->buffer->history_cursor == history_cursor);
+        T(editor_get_stats(e).rejected_commands == rejected + retry + 1u);
+    }
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_length(e) == sizeof initial + 1u);
+    editor_close(e);
+    printf("editor_p4_test: null %s selection LIMIT scenario=%u and synchronous retry preserve bytes/history/cursor passed\n", brace ? "brace" : "Enter", scenario);
+    return 0;
+}
+static int indent_selection_shortens(unsigned brace)
+{
+    uint8_t initial[INDENT_TYPING_BYTES + 32u], actual[sizeof initial];
+    memset(initial, ' ', sizeof initial); initial[sizeof initial - 1] = '\n';
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = initial, .initial_len = sizeof initial,
+        .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, 4) == 0); T(settle(e) == 0);
+    e->v.state.selection.anchor = sizeof initial - 2u;
+    plat_event ev = brace ? key('}', 0, "}") : key(XKB_KEY_Return, 0, NULL);
+    edit_malloc_guard_begin(); T(press(e, ev) == 0);
+    size_t allocations = edit_malloc_guard_end(); T(allocations == 0);
+    T(expect(e, brace ? "} \n" : "    \n     \n", brace ? 1u : 9u) == 0);
+    T(editor_get_stats(e).rejected_commands == 0);
+    T(undo_get_history(e->undo).undo_groups == 1);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_length(e) == sizeof initial && editor_read(e, 0, actual, sizeof actual) == 0);
+    T(!memcmp(actual, initial, sizeof actual));
+    T(editor_view(e).selection.cursor == 4 && editor_view(e).selection.anchor == sizeof initial - 2u);
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(expect(e, brace ? "} \n" : "    \n     \n", brace ? 1u : 9u) == 0);
+    editor_close(e);
+    printf("editor_p4_test: null %s giant selection shortening succeeds atomically mallocs=%zu guard=%s\n",
+        brace ? "brace" : "Enter", allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    return 0;
+}
+static int indent_selection_limit(unsigned brace)
+{
+    for (unsigned scenario = 0; scenario < 3; ++scenario) T(indent_selection_limit_case(brace, scenario) == 0);
+    T(indent_selection_shortens(brace) == 0); return 0;
+}
 static int queued_groups(bool raster)
 {
     char path[] = "/tmp/editor-p4-groups-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
@@ -441,9 +529,12 @@ static int ipc_wait_sweep(ipc_server *server)
     puts("editor_p4_test: null disconnected wait sweep, retained buffers, association reuse and allocation guard passed");
     return 0;
 }
-int main(void)
+int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    if (argc == 2 && !strcmp(argv[1], "--indent-limit-enter")) return indent_selection_limit(0);
+    if (argc == 2 && !strcmp(argv[1], "--indent-limit-brace")) return indent_selection_limit(1);
+    T(indent_selection_limit(0) == 0); T(indent_selection_limit(1) == 0);
     const char *runtime = test_ipc_isolate(); T(runtime != NULL);
     ipc_server server = {0}; T(ipc_server_init(&server, runtime) == IPC_OK);
     T(ipc_wait_sweep(&server) == 0);
