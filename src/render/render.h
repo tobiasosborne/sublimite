@@ -255,6 +255,9 @@ int render_backend_submit(render_backend *b, const render_grid *g,
                           const render_strip *strips, size_t count);
 int render_backend_present(render_backend *b, uint32_t frame_id);
 int render_backend_event(render_backend *b, const render_event *event);
+/* Trusted backend acknowledgement only, after backend-specific ownership
+ * checks. Platform clients route events through render_backend_event; raw
+ * device/present events are rejected for raster. */
 int render_backend_signal(render_backend *b, enum render_event_kind kind,
                          uint32_t frame_id, uint64_t ns);
 int render_backend_stats(const render_backend *b, render_stats *out);

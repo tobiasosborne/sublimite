@@ -179,3 +179,29 @@ Final clang 18 ASan/UBSan make check exits zero: 59 test binaries plus replay
 CLI, leaks disabled (M)[AC]. The unrelated transient view assertion, clock-skew
 handling, pasted red/green and complete limitations are in
 ../../docs/worker-reports/edit-zzj.12-s9.md. Design: ../../docs/decisions/edit-zzj.12.md.
+
+## edit-5o0 session 9 — P2-1 render-loop review
+
+Bounded nonblocking physical retirement, authoritative raster completion event
+routing, native pixmap initialization/resize margin clearing, and glyph/page/cell
+admission bounds implemented. Inline missing-completion expiry and remaining-wait
+API added; editor wait integration remains required. G11 bench carries CPU over
+completion turns and reports all-thread scheduling counters as TRACK; exact
+wakeup traces remain missing. Deterministic ownership-stream fuzzing added to the
+existing kernel fuzzer; pre-bead backend fails its mandatory delayed-return
+schedule, current backend completed 63327 runs in 61 seconds (M)[AC], leaks off.
+
+This bead is incomplete: G10 default/fallback memory, pending-T6 G1 acceptance,
+production deadline wait integration, qualifying G11 wakeup/sample evidence,
+and mapped GL lease resize/cancellation remain. Full validation outcome and
+pasted red/green: ../../docs/worker-reports/edit-5o0-s9.md.
+Design choices: ../../docs/decisions/edit-5o0.md. No binding gate exception.
+
+Final validation: make all exits 0; full clang ASan/UBSan make check exits 0
+(60 test binaries and replay CLI), ASAN_OPTIONS=detect_leaks=0. First full run
+stopped at unchanged refwin preflight; isolated and full rerun passed, no source
+change there. Full release raster: 10000 input-through-submit windows and zero
+allocations with active guard (M)[AC], original fence lifetime and native resize
+contract green. Final G11 TRACK row and its sanitizer self-check complete;
+qualifying wakeup/sample acceptance remains unmeasured, CPU timings are not a
+loaded-host gate verdict. See the report for terminal-frame accounting red/green.

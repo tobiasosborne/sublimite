@@ -17,6 +17,9 @@ int render_cpu_backend(render_backend *b);
 void raster_set_caret_only(render_backend *b, bool enabled);
 int raster_completion_fd(const render_backend *b);
 int raster_poll_completions(render_backend *b);
+/* Clamp an existing wait when damage needs retirement. No pending inline
+ * frame leaves requested unchanged; -1 means unbounded input wait. */
+int raster_completion_timeout(const render_backend *b, int requested);
 
 /* UST (us) and MSC of the latest matching-frame Present completion (UI only,
  * valid after that frame's PRESENT_COMPLETE event was routed). */
@@ -26,6 +29,8 @@ bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
 /* Per-frame descriptor budget; larger init storage does not enlarge UI work.
  * Layout must bind a compact table within this budget (unused slots count). */
 #define RASTER_FRAME_GLYPH_LIMIT 4096u
+#define RASTER_FRAME_PAGE_LIMIT 64u
+#define RASTER_FRAME_CELL_LIMIT 65536u
 
 /* UI-only diagnostic snapshot. Worker timings arrive through work messages.
  * Times are CLOCK_MONOTONIC ns, durations are explicit; no allocation. */

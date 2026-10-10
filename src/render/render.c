@@ -293,7 +293,9 @@ int render_backend_submit(render_backend *b, const render_grid *g, const render_
     /* CPU submissions have a fixed descriptor-work budget, checked before
      * dereferencing or scanning the table, including zero-damage frames. */
     if ((b->info.capabilities & RENDER_CAP_RASTER_POOL) &&
-        g->glyph_count > RASTER_FRAME_GLYPH_LIMIT) return RENDER_ERR_CAPACITY;
+        (g->glyph_count > RASTER_FRAME_GLYPH_LIMIT ||
+         g->page_count > RASTER_FRAME_PAGE_LIMIT ||
+         (size_t)g->dims.cols * g->dims.rows > RASTER_FRAME_CELL_LIMIT)) return RENDER_ERR_CAPACITY;
     size_t bytes;
     rc = render_atlas_validate(g, &bytes);
     if (rc != RENDER_OK) return rc;
@@ -371,8 +373,12 @@ int render_backend_event(render_backend *b, const render_event *event)
 {
     if (b == NULL || event == NULL) return RENDER_ERR_ARG;
     if (!b->initialized) return RENDER_ERR_STATE;
-    if (event->kind == RENDER_EVENT_DEVICE_DONE || event->kind == RENDER_EVENT_PRESENT_COMPLETE)
+    if (event->kind == RENDER_EVENT_DEVICE_DONE || event->kind == RENDER_EVENT_PRESENT_COMPLETE) {
+        /* Raster owns the typed native completion and pixmap idle check.
+         * A platform serial (including NotifyMSC) cannot retire its frame. */
+        if (b->info.capabilities & RENDER_CAP_RASTER_POOL) return RENDER_ERR_UNSUPPORTED;
         return render_backend_signal(b, event->kind, event->frame_id, event->ns);
+    }
     if (event->kind != RENDER_EVENT_WORK || event->work == NULL) return RENDER_ERR_ARG;
     if (!b->active || event->frame_id != b->active_frame) return RENDER_ERR_FRAME;
     return b->ops.event(b, event);

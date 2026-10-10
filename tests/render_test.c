@@ -459,6 +459,9 @@ static int render_native_resize_contract(render_backend *b,const render_native_l
             uint32_t expected=0;
             if (x<dims.cols*dims.cell_w && y<dims.rows*dims.cell_h)
                 expected=cells[(size_t)(y/dims.cell_h)*dims.cols+x/dims.cell_w].bg;
+            if (pixels[(size_t)y*width+x]!=expected)
+                fprintf(stderr,"native resize step=%zu pixel=%u,%u got=%08x expected=%08x\n",
+                    step,x,y,pixels[(size_t)y*width+x],expected);
             CHECK(pixels[(size_t)y*width+x]==expected);
         }
     }
@@ -484,8 +487,51 @@ static int render_native_close_contract(render_backend *b,const render_native_la
 }
 #endif
 
+#ifndef RENDER_TEST_EXTERNAL
+/* P2-1 section 38 diagnostic: the required product change belongs to GL,
+ * outside this worker's source edit set. Exercise the real lease and resize
+ * functions without a display/context or fabricated native completion. */
+#define render_gl_backend lease_review_factory
+#define gl_present_complete lease_review_present_complete
+#define gl_completion_status lease_review_completion_status
+#define gl_buffer_mode lease_review_buffer_mode
+#define gl_device_name lease_review_device_name
+#define gl_displayed_msc lease_review_displayed_msc
+#define gl_read_pixels lease_review_read_pixels
+#define gl_cells_acquire lease_review_cells_acquire
+#define gl_cells_submit lease_review_cells_submit
+#include "../src/gl/gl.c"
+#undef render_gl_backend
+#undef gl_present_complete
+#undef gl_completion_status
+#undef gl_buffer_mode
+#undef gl_device_name
+#undef gl_displayed_msc
+#undef gl_read_pixels
+#undef gl_cells_acquire
+#undef gl_cells_submit
+static int lease_resize_gate(void)
+{
+    render_cell slots[4], caller[4]; uint64_t dirty=0; render_grid grid;
+    gl_state state={.upload=GL_UPLOAD_PERSISTENT,.dims={2,2,4,4},.cell_bytes=sizeof slots};
+    state.ring[0].cells=slots;
+    render_backend b={0}; CHECK(lease_review_factory(&b)==RENDER_OK);
+    b.state=&state; b.initialized=true;
+    b.config=(render_config){.dims=state.dims,.max_cells=4,.max_width=16,.max_height=16};
+    CHECK(render_grid_init(&grid,state.dims,caller,4,&dirty,1)==RENDER_OK);
+    CHECK(lease_review_cells_acquire(&b,&grid,false)==RENDER_OK && state.leased);
+    int rc=render_backend_resize(&b,(render_dims){1,2,4,4});
+    printf("P2-1 section 38: resize during mapped lease=%d (BUSY=%d) leased=%d\n",rc,RENDER_ERR_BUSY,state.leased);
+    CHECK(rc==RENDER_ERR_BUSY && grid.cells==slots && state.dims.cols==2);
+    return 0;
+}
+int main(int argc,char **argv)
+{
+    if (argc>2 && !strcmp(argv[1],"--review") && !strcmp(argv[2],"P2-1-38-gate")) return lease_resize_gate();
+#else
 int main(void)
 {
+#endif
     trace_init(); CHECK(trace_thread_register() >= 0);
     CHECK(strips_test() == 0); CHECK(arguments_test() == 0); CHECK(cells_test() == 0);
     CHECK(backend_test() == 0); CHECK(async_test() == 0); CHECK(trace_test() == 0);

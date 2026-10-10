@@ -2,6 +2,8 @@
  * by this driver to count each ingress-through-submit window (P2.0 addendum).
  * Present/completion and libxcb reply allocations are outside that window. */
 #include "raster/raster.h"
+#include "editor/editor.h"
+#include "gl/gl.h"
 #include "base/base.h"
 #include "work/work.h"
 #include "x11/plat.h"
@@ -13,6 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <xcb/xcb.h>
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#include <sanitizer/allocator_interface.h>
+#define RASTER_CENSUS 1
+#endif
+#endif
 
 /* Interpose upload issuance so the live test can prove that only UI mailbox
  * handling stages pixels. Resolving the real function happens before init. */
@@ -92,6 +100,7 @@ static int scoped_submit(render_backend *b, const render_grid *g,
     }
     return rc;
 }
+#define RENDER_TEST_NATIVE 1
 #define RENDER_TEST_EXTERNAL 1
 #define main render_conformance_main
 #define edit_malloc_guard_begin scoped_guard_begin
@@ -416,7 +425,7 @@ static int live_pixel_test(void)
 
 
 /* edit-2vs: a fence job must not outlive the backend. The platform loop can
- * deliver PRESENT_COMPLETE to the adapter (bench pump_view's present_done) while
+ * attempt PRESENT_COMPLETE to the adapter (bench pump_view's present_done) while
  * the fence job is still queued or polling; the next submit used to forget its
  * handle, so shutdown could not join it and it read freed backend state. The
  * fence job is held QUEUED deterministically by occupying every raster worker. */
@@ -466,13 +475,15 @@ static int fence_outlives_test(void)
     int rc;
     while ((rc = render_backend_present(&b, 1)) == RENDER_ERR_BUSY) { render_test_pump(&b); T(trace_now_ns() < deadline); }
     T(rc == RENDER_OK);   /* fence job now sits in the queue behind the gate */
-    T(render_backend_signal(&b, RENDER_EVENT_DEVICE_DONE, 1, 0) == RENDER_OK);
-    T(render_backend_signal(&b, RENDER_EVENT_PRESENT_COMPLETE, 1, 0) == RENDER_OK);
-    T(!b.active);          /* frame 1 complete without its fence job */
+    render_event raw = {RENDER_EVENT_DEVICE_DONE, 1, 0, NULL};
+    T(render_backend_event(&b, &raw) == RENDER_ERR_UNSUPPORTED);
+    raw.kind = RENDER_EVENT_PRESENT_COMPLETE;
+    T(render_backend_event(&b, &raw) == RENDER_ERR_UNSUPPORTED);
+    T(b.active); /* queued authoritative job still owns server pixmap retirement */
     T(render_frame_begin(&g, 2) == RENDER_OK && render_mark_rows(&g, 2, 1) == RENDER_OK);
     render_strip one[3]; size_t count = 0;
     T(render_dirty_strips(&g, one, 3, &count) == RENDER_OK);
-    T(render_backend_submit(&b, &g, one, count) == RENDER_OK);
+    T(render_backend_submit(&b, &g, one, count) == RENDER_ERR_BUSY);
     render_backend_shutdown(&b);
     free(state);           /* the backend is gone; no job may touch it now */
     atomic_store(&gate.release, 1u);
@@ -485,17 +496,70 @@ static int fence_outlives_test(void)
         if (!busy) break;
         struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
     }
-    printf("raster fence: PASS (queued fence job joined before backend release)\n");
+    printf("raster fence: PASS (raw completion rejected, queued fence job joined before backend release)\n");
     return 0;
+}
+
+typedef struct raster_native_size { uint32_t width, height; } raster_native_size;
+static int raster_native_window(void *user, uint32_t width, uint32_t height)
+{
+    raster_native_size *size=user; *size=(raster_native_size){width,height};
+    uint32_t values[]={width,height};
+    xcb_configure_window(g_plat.conn,g_plat.win,XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
+    xcb_get_geometry_reply_t *reply=xcb_get_geometry_reply(g_plat.conn,xcb_get_geometry(g_plat.conn,g_plat.win),NULL);
+    T(reply && reply->width==width && reply->height==height); free(reply);
+    return 0;
+}
+static int raster_native_paint(void *user, render_backend *b, const render_grid *g, const render_strip *strip)
+{
+    (void)user;
+    T(render_backend_submit(b,g,strip,1)==RENDER_OK);
+    uint64_t deadline=trace_now_ns()+UINT64_C(3000000000);
+    while (b->active) {
+        if (!b->presented) {
+            int rc=render_backend_present(b,g->frame_id); T(rc==RENDER_OK || rc==RENDER_ERR_BUSY);
+        }
+        T(render_test_pump(b)==RENDER_OK && trace_now_ns()<deadline);
+    }
+    return 0;
+}
+static int raster_native_pixels(void *user, uint32_t *pixels, size_t capacity)
+{
+    raster_native_size *size=user;
+    T((size_t)size->width*size->height<=capacity);
+    xcb_get_image_reply_t *reply=xcb_get_image_reply(g_plat.conn,
+        xcb_get_image(g_plat.conn,XCB_IMAGE_FORMAT_Z_PIXMAP,g_plat.win,0,0,
+            (uint16_t)size->width,(uint16_t)size->height,~0u),NULL);
+    T(reply && (size_t)xcb_get_image_data_length(reply)>=(size_t)size->width*size->height*4u);
+    memcpy(pixels,xcb_get_image_data(reply),(size_t)size->width*size->height*4u); free(reply);
+    for (size_t i=0;i<(size_t)size->width*size->height;i++) pixels[i] &= 0xffffffu;
+    return 0;
+}
+static int raster_native_resize_test(void)
+{
+    render_backend b={0};
+    render_config cfg={.dims={2,2,4,4},.max_width=16,.max_height=16,.max_cells=16};
+    T(render_test_prepare(&b,&cfg)==RENDER_OK);
+    render_backend_info info; T(render_backend_query(&b,&info)==RENDER_OK);
+    void *state=aligned_alloc(64,(info.state_size+63u)&~(size_t)63u); T(state);
+    T(init_on_worker(&b,&cfg,state,info.state_size)==RENDER_OK);
+    raster_native_size size={0};
+    render_native_lane lane={.user=&size,.window_size=raster_native_window,
+        .paint=raster_native_paint,.pixels=raster_native_pixels};
+    (void)render_native_close_contract;
+    int rc=render_native_resize_contract(&b,&lane);
+    render_backend_shutdown(&b); free(state);
+    if (g_up) { work_pool_shutdown(&g_pool); plat_shutdown(&g_plat); g_up=false; }
+    return rc;
 }
 
 static int review_cases(const char *which);
 
 int main(int argc, char **argv)
 {
-    if (argc > 2 && !strcmp(argv[1], "--review")) return review_cases(argv[2]);
     *(void **)(&real_shm_put) = dlsym(RTLD_NEXT, "xcb_shm_put_image");
     T(real_shm_put != NULL);
+    if (argc > 2 && !strcmp(argv[1], "--review")) return review_cases(argv[2]);
     T(!edit_malloc_guard_active() || external_guard_enabled());
     if (review_cases("all") != 0) return 1;
     if (kernel_random_test() || blend_exact_test() || partition_test()) return 1;
@@ -510,6 +574,7 @@ int main(int argc, char **argv)
     if (!(argc > 1 && !strcmp(argv[1], "--live-only")) && render_conformance_main() != 0) return 1;
     if (live_pixel_test() != 0) return 1;
     if (fence_outlives_test() != 0) return 1;
+    if (raster_native_resize_test() != 0) return 1;
     if (g_up) { work_pool_shutdown(&g_pool); plat_shutdown(&g_plat); }
     printf("raster_test: PASS (requested conformance, upload ordering, typing allocations, live XShm)\n");
     return 0;
@@ -614,7 +679,7 @@ static int review_reply(xcb_connection_t *c, unsigned seq, void **reply, xcb_gen
 {
     if (!review_fake) return xcb_poll_for_reply(c, seq, reply, err);
     *err = NULL;
-    if (review_observation < 2) return 0;
+    if ((review_observation & 16u) || (review_observation & 15u) < 2) return 0;
     xcb_sync_query_fence_reply_t *r = calloc(1, sizeof *r);
     if (!r) return 0;
     r->triggered = 1; *reply = r; review_clock = 300;
@@ -623,7 +688,8 @@ static int review_reply(xcb_connection_t *c, unsigned seq, void **reply, xcb_gen
 static xcb_generic_event_t *review_special(xcb_connection_t *c, xcb_special_event_t *s)
 {
     if (!review_fake) return xcb_poll_for_special_event(c, s);
-    if (review_observation == 0) {
+    if ((review_observation & 15u) == 0 && (review_observation & 32u)) review_observation++;
+    if ((review_observation & 15u) == 0) {
         void *mem = calloc(1, sizeof(xcb_present_complete_notify_event_t));
         xcb_present_complete_notify_event_t *e = mem;
         if (!e) return NULL;
@@ -632,7 +698,8 @@ static xcb_generic_event_t *review_special(xcb_connection_t *c, xcb_special_even
         review_clock = 200; review_observation++;
         return mem;
     }
-    if (review_observation == 1) {
+    if ((review_observation & 15u) == 1 && (review_observation & 64u)) review_observation++;
+    if ((review_observation & 15u) == 1) {
         xcb_present_idle_notify_event_t *e = calloc(1, sizeof *e);
         if (!e) return NULL;
         e->event_type = XCB_PRESENT_IDLE_NOTIFY; e->serial = 7; e->pixmap = 42;
@@ -666,6 +733,7 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #define raster_frame_metrics raster_review_frame_metrics
 #define raster_completion_fd raster_review_completion_fd
 #define raster_poll_completions raster_review_poll_completions
+#define raster_completion_timeout raster_review_completion_timeout
 #define raster_set_caret_only raster_review_set_caret_only
 #define work_submit review_submit
 #define work_submit_batch review_submit_batch
@@ -691,6 +759,7 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #undef raster_frame_metrics
 #undef raster_completion_fd
 #undef raster_poll_completions
+#undef raster_completion_timeout
 #undef raster_set_caret_only
 #undef work_submit
 #undef work_submit_batch
@@ -785,7 +854,137 @@ static void *review_release_slot(void *u)
     work_pool *p = u;
     struct timespec pause = {0,100000000}; nanosleep(&pause,NULL);
     atomic_store_explicit(&p->slots[0].busy,0,memory_order_release);
+    atomic_store_explicit(&p->slots[0].finished_epoch,9,memory_order_release);
     return NULL;
+}
+/* P2-1 section 7: completion published, physical return held behind a gate.
+ * Count sleeps rather than treating this loaded host's timing as a gate. */
+/* Explicit G10 diagnostic: expected RED until default capacity policy is
+ * changed. It is outside the correctness suite and never conceals a gate miss. */
+static int review_default_memory_gate(void)
+{
+#ifdef RASTER_CENSUS
+    bool miss=false;
+    for (unsigned fallback=0; fallback<2; fallback++) {
+        render_backend b={0}; editor *e=NULL;
+        editor_config cfg={.raster_fallback=true};
+        if (fallback) {
+            T(setenv("EDIT_GL_EGL_LIBRARY","missing-edit-5o0-libEGL.so",1)==0);
+            T(render_gl_backend(&b)==RENDER_OK);
+        } else T(render_cpu_backend(&b)==RENDER_OK);
+        size_t before=__sanitizer_get_current_allocated_bytes();
+        T(editor_open(&e,&cfg,&b)==EDITOR_OK);
+        size_t private_bytes=__sanitizer_get_current_allocated_bytes()-before;
+        uint64_t surface=(uint64_t)b.config.max_width*b.config.max_height*4u;
+        uint64_t lower_bound=private_bytes+2u*surface;
+        printf("P2-1 section 10: %s heap_allocations=%zu SHM=%llu (M)[AC] native_pixmap_payload=%llu (E) "
+            "owned_peak_lower_bound=%llu gate=87000000 (G) %s\n",
+            fallback ? "failed-EGL-to-raster" : "default-raster",private_bytes,
+            (unsigned long long)surface,(unsigned long long)surface,
+            (unsigned long long)lower_bound,lower_bound>87000000u ? "RED" : "GREEN");
+        miss |= lower_bound>87000000u;
+        editor_close(e);
+        if (fallback) T(unsetenv("EDIT_GL_EGL_LIBRARY")==0);
+    }
+    T(!miss);
+#else
+    puts("P2-1 section 10: allocation census requires ASan build");
+    return 2;
+#endif
+    return 0;
+}
+static int review_nonblocking_retirement(void)
+{
+    review_reset_fixture();
+    work_pool pool = {.efd=42, .mu=PTHREAD_MUTEX_INITIALIZER};
+    atomic_store(&pool.slots[0].busy,1); atomic_store(&pool.slots[0].epoch,9);
+    render_cell cell={0,RENDER_NO_SLOT,0,0,0,0};
+    render_strip full={0,1}, copied;
+    cpu_state st={.up=true,.pool=&pool,.max_strips=1,.cells=&cell,.strips=&copied,
+        .nhandles=1,.fence_done=true,.present_done=true};
+    st.handles[0]=(work_handle){0,9};
+    render_grid g={.dims={1,1,1,1},.cells=&cell,.frame_id=8};
+    render_backend b=review_backend(&st);
+    pthread_t release; T(pthread_create(&release,NULL,review_release_slot,&pool)==0);
+    review_ui_thread=pthread_self(); review_watch_sleep=true;
+    int rc=cpu_submit(&b,&g,&full,1);
+    review_watch_sleep=false;
+    T(pthread_join(release,NULL)==0);
+    printf("P2-1 section 7: submit=%d UI_sleeps=%u\n",rc,review_rollback_waits);
+    T(rc==RENDER_OK && review_rollback_waits==0 && st.nretired==1);
+    cpu_join_jobs(&st); T(st.nretired==0 && st.nhandles==0);
+    /* Full bounded retirement storage refuses before changing the snapshot. */
+    atomic_store(&pool.slots[0].finished_epoch,0);
+    st.nhandles=1; st.handles[0]=(work_handle){0,9};
+    st.fence_done=st.present_done=true; st.have_frame=false;
+    st.nretired=sizeof st.retired/sizeof st.retired[0];
+    for (size_t i=0;i<st.nretired;i++) st.retired[i]=(work_handle){0,9};
+    T(cpu_submit(&b,&g,&full,1)==RENDER_ERR_BUSY && st.nhandles==1);
+    atomic_store(&pool.slots[0].finished_epoch,9);
+    T(cpu_retire_jobs(&st)==RENDER_OK && st.nretired==0 && st.nhandles==0);
+    pthread_mutex_destroy(&pool.mu);
+    return 0;
+}
+static int review_raw_completion(void)
+{
+    review_reset_fixture();
+    cpu_state st={.up=true,.frame_id=7,.metrics={.frame_id=7},.fence_done=true};
+    st.fence_handle=(work_handle){3,9};
+    render_backend b=review_backend(&st);
+    delivery seen={0}; b.config.hooks.user=&seen;
+    b.presented=true; b.device_seen=true; b.t5_sent=true;
+    render_event raw={RENDER_EVENT_PRESENT_COMPLETE,7,100,NULL};
+    int rc=render_backend_event(&b,&raw);
+    printf("P2-1 section 8: raw completion=%d active=%d\n",rc,b.active);
+    T(rc==RENDER_ERR_UNSUPPORTED && b.active && !b.complete_seen);
+    T(st.last_msc==0 && !st.present_done && seen.t6_count==0);
+    work_msg m={.kind=MSG_PRESENT,.generation=7,.slot_=3,.epoch_=9};
+    msg_payload payload={.ns=200,.ust=55,.msc=66}; memcpy(m.data,&payload,sizeof payload);
+    render_event owned={RENDER_EVENT_WORK,7,0,&m};
+    T(render_backend_event(&b,&owned)==RENDER_OK && !b.active);
+    T(st.last_msc==66 && st.present_done && seen.t6_count==1);
+    return 0;
+}
+static int review_page_cell_budget(void)
+{
+    review_reset_fixture();
+    render_cell cell={0,RENDER_NO_SLOT,0,0,0,0}; uint64_t dirty[4]={0};
+    uint8_t pixel=0; render_atlas_page pages[65], snapshot[65];
+    for (size_t i=0;i<65;i++) pages[i]=(render_atlas_page){&pixel,1,1,1,1};
+    cpu_state st={.up=true,.pages=snapshot}; render_backend b=review_backend(&st); b.active=false;
+    b.config=(render_config){.dims={1,1,1,1},.max_cells=65792,.max_pages=65,.max_width=257,
+        .max_height=256,.max_atlas_bytes=1000000};
+    render_grid g={.dims=b.config.dims,.cells=&cell,.cell_capacity=65792,.dirty=dirty,
+        .dirty_word_capacity=4,.begun=true,.frame_id=8,
+        .pages=pages,.page_count=65};
+    /* Count admission also applies to many aliases of one immutable byte. */
+    int page_rc=render_backend_submit(&b,&g,NULL,0);
+    printf("P2-1 section 11: excess pages=%d\n",page_rc);
+    b.active=false; st.have_frame=false; g.frame_id=9;
+    g.pages=NULL; g.page_count=0; g.dims=b.config.dims=(render_dims){257,256,1,1};
+    g.cells=calloc(65792,sizeof *g.cells); T(g.cells);
+    for (size_t i=0;i<65792;i++) g.cells[i].atlas_slot=RENDER_NO_SLOT;
+    int cell_rc=render_backend_submit(&b,&g,NULL,0);
+    free(g.cells);
+    printf("P2-1 section 11: excess cells=%d\n",cell_rc);
+    T(page_rc==RENDER_ERR_CAPACITY && cell_rc==RENDER_ERR_CAPACITY && review_submit_calls==0);
+    return 0;
+}
+/* Explicit acceptance diagnostic; the current single-slot contract remains
+ * RED. Xvfb cannot attest a refresh phase, so this is structural evidence. */
+static int review_pending_acceptance_gate(void)
+{
+    review_reset_fixture();
+    cpu_state st={.up=true,.frame_id=7,.metrics={.frame_id=7}};
+    render_backend b=review_backend(&st); b.presented=true; b.device_seen=true; b.t5_sent=true;
+    render_cell cell={0,RENDER_NO_SLOT,0,0,0,0}; uint64_t dirty=0;
+    render_grid g={.dims={1,1,1,1},.cells=&cell,.cell_capacity=1,.dirty=&dirty,
+        .dirty_word_capacity=1,.begun=true,.frame_id=8};
+    b.config.dims=g.dims;
+    int rc=render_backend_submit(&b,&g,NULL,0);
+    printf("P2-1 section 12: edited frame arrival while T6 pending submit=%d (BUSY=%d)\n",rc,RENDER_ERR_BUSY);
+    T(rc==RENDER_OK);
+    return 0;
 }
 static int review_capacity_proposal(void)
 {
@@ -1114,6 +1313,30 @@ static int review_inline_completion(void)
     puts("G11 UI completion: both event orders, delayed Present, no worker jobs or timer passed");
     return 0;
 }
+static int review_inline_deadline(void)
+{
+    const unsigned missing[]={16u,32u,64u}; /* query reply, PIXMAP, IdleNotify */
+    for (size_t i=0;i<3;i++) {
+        review_reset_fixture(); review_observation=missing[i];
+        cpu_state st={.up=true,.inline_frame=true,.present_issued=true,.frame_id=7,.pixmap=42,
+            .completion_deadline=UINT64_C(2000000100),.metrics={.frame_id=7,.fence_sequence=4}};
+        render_backend b=review_backend(&st); delivery seen={0};
+        b.config.hooks.user=&seen; b.presented=true;
+        T(raster_review_poll_completions(&b)==RENDER_OK && b.active);
+        T(raster_review_completion_timeout(&b,-1)==2000);
+        T(raster_review_completion_timeout(&b,20)==20);
+        review_clock=st.completion_deadline+1u;
+        T(raster_review_completion_timeout(&b,-1)==0);
+        int rc=raster_review_poll_completions(&b);
+        printf("P2-1 section 15: missing=%s expiry=%d\n",i==0 ? "fence" : i==1 ? "pixmap" : "idle",rc);
+        T(rc==RENDER_ERR_DEVICE && st.failed && b.active && seen.t6_count==0);
+        T(raster_review_poll_completions(&b)==RENDER_ERR_DEVICE);
+        T(cpu_present(&b,7)==RENDER_ERR_DEVICE);
+        st.have_frame=false;
+        render_grid g={0}; T(cpu_submit(&b,&g,NULL,0)==RENDER_ERR_DEVICE);
+    }
+    return 0;
+}
 /* Optional TRACK self-check for the descriptor cap on the Target-A viewport.
  * Only validation/snapshot/enqueue is timed: the fake scheduler retains jobs
  * without running them, then discards the synthetic frame between samples.
@@ -1123,35 +1346,37 @@ static int review_ns_compare(const void *left, const void *right)
     uint64_t a=*(const uint64_t *)left, b=*(const uint64_t *)right;
     return a < b ? -1 : a > b;
 }
-static int review_budget_track(void)
+static int review_budget_track(bool maximum)
 {
     review_reset_fixture();
-    const render_dims dims={360,120,8,15};
+    const render_dims dims=maximum ? (render_dims){256,256,8,15} : (render_dims){360,120,8,15};
+    size_t page_count=maximum ? 64u : 1u;
     const size_t ncells=(size_t)dims.cols*dims.rows;
     render_cell *cells=calloc(ncells,sizeof *cells);
     render_glyph *glyphs=calloc(RASTER_FRAME_GLYPH_LIMIT,sizeof *glyphs);
     cpu_state *st=calloc(1,sizeof *st); T(cells && glyphs && st);
     st->cells=calloc(ncells,sizeof *st->cells);
     st->glyphs=calloc(RASTER_FRAME_GLYPH_LIMIT,sizeof *st->glyphs);
-    st->pages=calloc(1,sizeof *st->pages); st->strips=calloc(1,sizeof *st->strips);
+    st->pages=calloc(page_count,sizeof *st->pages); st->strips=calloc(1,sizeof *st->strips);
     T(st->cells && st->glyphs && st->pages && st->strips);
     st->up=true; st->max_strips=1; st->max_cells=ncells;
-    st->max_glyphs=RASTER_FRAME_GLYPH_LIMIT; st->max_pages=1;
+    st->max_glyphs=RASTER_FRAME_GLYPH_LIMIT; st->max_pages=page_count;
     st->scene=(raster_scene){dims,st->cells,st->glyphs,0,st->pages,0,0};
     for (size_t i=0;i<ncells;i++) cells[i]=(render_cell){1,0,0xffffff,0x102030,0,0};
     for (size_t i=0;i<RASTER_FRAME_GLYPH_LIMIT;i++) glyphs[i]=(render_glyph){1,0,0,0,1,1};
-    uint8_t pixel=255; render_atlas_page page={&pixel,1,1,1,1};
-    uint64_t bits[2], samples[256];
-    render_grid g; T(render_grid_init(&g,dims,cells,ncells,bits,2)==RENDER_OK);
-    g.glyphs=glyphs; g.glyph_count=RASTER_FRAME_GLYPH_LIMIT; g.pages=&page; g.page_count=1;
+    uint8_t pixel=255; render_atlas_page pages[64];
+    for (size_t i=0;i<page_count;i++) pages[i]=(render_atlas_page){&pixel,1,1,1,1};
+    uint64_t bits[4], samples[256];
+    render_grid g; T(render_grid_init(&g,dims,cells,ncells,bits,4)==RENDER_OK);
+    g.glyphs=glyphs; g.glyph_count=RASTER_FRAME_GLYPH_LIMIT; g.pages=pages; g.page_count=page_count;
     render_backend backend={0}; T(raster_review_backend(&backend)==RENDER_OK);
     backend.state=st; backend.initialized=true; backend.full_required=true;
-    backend.config=(render_config){.dims=dims,.max_width=2880,.max_height=1800,
-        .max_cells=ncells,.max_glyphs=RASTER_FRAME_GLYPH_LIMIT,.max_pages=1,.max_atlas_bytes=1};
+    backend.config=(render_config){.dims=dims,.max_width=dims.cols*dims.cell_w,.max_height=dims.rows*dims.cell_h,
+        .max_cells=ncells,.max_glyphs=RASTER_FRAME_GLYPH_LIMIT,.max_pages=page_count,.max_atlas_bytes=page_count};
     size_t allocations=0;
     for (uint32_t i=0;i<257;i++) {
         review_submit_calls=0;
-        render_strip strip=i ? (render_strip){60,1} : (render_strip){0,120};
+        render_strip strip=i ? (render_strip){60,1} : (render_strip){0,dims.rows};
         uint64_t start=trace_now_ns();
         edit_malloc_guard_begin();
         cells[60u*dims.cols].bg ^= 1u;
@@ -1163,12 +1388,12 @@ static int review_budget_track(void)
         T(rc==RENDER_OK);
         if (i) samples[i-1u]=elapsed;
         /* Unit scheduler has no actual queued/running worker. */
-        backend.active=false; st->have_frame=false;
+        backend.active=false; st->have_frame=false; st->nhandles=0;
     }
     qsort(samples,256,sizeof samples[0],review_ns_compare);
     if (edit_malloc_guard_active()) T(allocations==0);
-    printf("TYPING_BUDGET_TRACK cells=%zu glyphs=%u samples=256 p50=%llu ns p99=%llu ns allocations=%zu guard=%d (M)\n",
-        ncells,RASTER_FRAME_GLYPH_LIMIT,(unsigned long long)samples[127],
+    printf("TYPING_BUDGET_TRACK cells=%zu glyphs=%u pages=%zu samples=256 p50=%llu ns p99=%llu ns allocations=%zu guard=%d (M)[AC]\n",
+        ncells,RASTER_FRAME_GLYPH_LIMIT,page_count,(unsigned long long)samples[127],
         (unsigned long long)samples[253],allocations,edit_malloc_guard_active()?1:0);
     free(cells); free(glyphs); free(st->cells); free(st->glyphs); free(st->pages); free(st->strips); free(st);
     review_fake=false;
@@ -1177,10 +1402,18 @@ static int review_budget_track(void)
 static int review_batch_rollback(void);
 static int review_cases(const char *which)
 {
-    if (!strcmp(which,"budget-track")) return review_budget_track();
+    if (!strcmp(which,"P2-1-15")) return review_inline_deadline();
+    if (!strcmp(which,"P2-1-12-gate")) return review_pending_acceptance_gate();
+    if (!strcmp(which,"P2-1-11")) return review_page_cell_budget();
+    if (!strcmp(which,"P2-1-10-gate")) return review_default_memory_gate();
+    if (!strcmp(which,"P2-1-9")) return raster_native_resize_test();
+    if (!strcmp(which,"budget-track")) return review_budget_track(false);
+    if (!strcmp(which,"budget-max-track")) return review_budget_track(true);
     if (!strcmp(which,"batch")) return review_batch_rollback();
+    if (!strcmp(which,"P2-1-7")) return review_nonblocking_retirement();
+    if (!strcmp(which,"P2-1-8")) return review_raw_completion();
     const struct {const char *id; int (*fn)(void);} cases[]={
-        {"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
+        {"P2-1-15",review_inline_deadline},{"P2-1-11",review_page_cell_budget},{"P2-1-8",review_raw_completion},{"P2-1-7",review_nonblocking_retirement},{"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
         {"5",review_delivery},{"6",review_glyph_budget},{"7",review_cancellation},
         {"8",review_handoff},{"15",review_origin},{"17",review_timestamp},{"G11",review_inline_completion}};
     for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {

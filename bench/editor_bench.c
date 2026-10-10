@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 #define G1_P50 UINT64_C(1000000)
 #define G1_P99 UINT64_C(2000000)
@@ -228,6 +229,65 @@ static void typing_trace(const char *label, const char *power)
     }
     free(recs);
 }
+/* G11 accounting policy isolated for delayed-completion regression. */
+typedef struct g11_cpu_window { bool pending; uint64_t cpu; } g11_cpu_window;
+static void g11_cpu_turn(g11_cpu_window *window, bench_samples *cpu,
+                         bool blink, bool retired, uint64_t elapsed)
+{
+    window->cpu += elapsed;
+    /* Natural turns may retire the old frame and submit the next blink in
+     * one call. Charge that boundary turn once, conservatively to the old
+     * window, then retain subsequent CPU for the new frame. */
+    if (blink && window->pending) {
+        (void)bench_add(cpu,window->cpu); window->cpu=0;
+    }
+    if (blink) window->pending=true;
+    if (retired && window->pending) {
+        (void)bench_add(cpu,window->cpu);
+        *window=(g11_cpu_window){0};
+    }
+}
+/* RUSAGE_SELF sums scheduling transitions across every application thread.
+ * Voluntary switches include timeout sleeps; involuntary switches overcount
+ * under load. These are a TRACK proxy, not an authenticated wakeup trace. */
+static int g11_scheduling_switches(uint64_t *total)
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF,&usage) || usage.ru_nvcsw<0 || usage.ru_nivcsw<0) return -1;
+    *total=(uint64_t)usage.ru_nvcsw+(uint64_t)usage.ru_nivcsw;
+    return 0;
+}
+static void *g11_sleeping_worker(void *arg)
+{
+    (void)arg;
+    for (unsigned i=0;i<4;i++) { struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL); }
+    return NULL;
+}
+static int g11_accounting_self_check(void)
+{
+    uint64_t values[4]; bench_samples cpu; bench_samples_init(&cpu,values,4);
+    g11_cpu_window window={0};
+    g11_cpu_turn(&window,&cpu,true,false,100);
+    g11_cpu_turn(&window,&cpu,false,false,200); /* worker/poll CPU on later turn */
+    g11_cpu_turn(&window,&cpu,false,true,300);  /* final retirement */
+    printf("P2-1 section 16: delayed completion samples=%zu total=%llu\n",cpu.n,
+        (unsigned long long)(cpu.n ? values[0] : 0));
+    REQUIRE(cpu.n==1 && values[0]==600 && !window.pending);
+    g11_cpu_turn(&window,&cpu,false,false,200); /* timeout-only turn */
+    g11_cpu_turn(&window,&cpu,true,true,100);
+    REQUIRE(cpu.n==2 && values[1]==300);
+    uint64_t before,after; struct rusage ui_before,ui_after;
+    REQUIRE(g11_scheduling_switches(&before)==0 && getrusage(RUSAGE_THREAD,&ui_before)==0);
+    pthread_t worker; REQUIRE(pthread_create(&worker,NULL,g11_sleeping_worker,NULL)==0);
+    REQUIRE(pthread_join(worker,NULL)==0);
+    REQUIRE(g11_scheduling_switches(&after)==0 && getrusage(RUSAGE_THREAD,&ui_after)==0);
+    uint64_t ui=(uint64_t)(ui_after.ru_nvcsw-ui_before.ru_nvcsw)+(uint64_t)(ui_after.ru_nivcsw-ui_before.ru_nivcsw);
+    REQUIRE(after-before>ui);
+    printf("G11 accounting: timeout CPU retained; process switches=%llu UI=%llu (M)[AC] worker sleeps visible\n",
+        (unsigned long long)(after-before),(unsigned long long)ui);
+    puts("G11 accounting: delayed completion CPU retained through retirement");
+    return 0;
+}
 static int idle_row(const char *requested, bool track, bool require_gl)
 {
     stamp tag = power_stamp();
@@ -250,9 +310,11 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     bench_samples_init(&cpu, values, BENCH_INTERACTION_MIN_N);
     uint64_t worker_jobs = 0, inline_frames = 0;
     uint64_t wake_start = editor_get_stats(e).poll_returns, wall = bench_now_ns();
+    uint64_t switches_start; REQUIRE(g11_scheduling_switches(&switches_start)==0);
+    g11_cpu_window window={0}; uint64_t cpu_marker=process_ns();
     bool measuring = !b.active;
     while (editor_get_stats(e).blinking) {
-        uint64_t blink_count = editor_get_stats(e).blinks, start = process_ns();
+        uint64_t blink_count = editor_get_stats(e).blinks;
         int rc = editor_step(e, -1); REQUIRE(rc == EDITOR_OK || rc == EDITOR_MORE);
         REQUIRE(settle(e) == 0);
         if (!measuring && !b.active && !editor_get_stats(e).pending && !editor_get_stats(e).blinks) {
@@ -262,24 +324,36 @@ static int idle_row(const char *requested, bool track, bool require_gl)
         }
         if (editor_get_stats(e).blinks > blink_count) {
             REQUIRE(measuring);
-            REQUIRE(bench_add(&cpu, process_ns() - start) == 0);
             raster_metrics m;
             if (raster_frame_metrics(&b, &m)) {
                 worker_jobs += m.jobs + m.completion_jobs;
                 inline_frames += m.inline_cells != 0;
             }
         }
+        uint64_t cpu_now=process_ns();
+        if (measuring) g11_cpu_turn(&window,&cpu,editor_get_stats(e).blinks>blink_count,!b.active,cpu_now-cpu_marker);
+        cpu_marker=cpu_now;
         REQUIRE(bench_now_ns() - wall < UINT64_C(15000000000));
     }
     editor_stats s = editor_get_stats(e);
     uint64_t wakes = s.poll_returns - wake_start;
     uint64_t elapsed = bench_now_ns() - wall;
     double rate = (double)wakes * 1e9 / (double)elapsed;
+    /* Keep the existing external quiet-observation turn. A clean final
+     * inline frame may retire only on that turn after blinking stops; drain
+     * its ready native acknowledgements without an extra wake or timer. */
+    uint64_t quiet; REQUIRE(observe_quiet(e, &quiet) == 0);
+    if (b.info.capabilities & RENDER_CAP_RASTER_POOL) REQUIRE(raster_poll_completions(&b)==RENDER_OK);
+    if (window.pending) {
+        g11_cpu_turn(&window,&cpu,false,!b.active,process_ns()-cpu_marker);
+        REQUIRE(!window.pending);
+    }
+    uint64_t switches_end; REQUIRE(g11_scheduling_switches(&switches_end)==0);
     /* Null CPU-per-blink gets an independent full interaction population.
      * Advance only this benchmark instance's private deadline to due-now:
      * the normal poll/blink/caret/submit path still runs once per sample.
-     * Keep the real ten-second window above for wakeup/idle policy, and keep
-     * raster/GL's existing CPU MISS rows untouched for edit-zzj.12. */
+     * Keep the real ten-second window above for wakeup/idle policy;
+     * raster/GL retain their real-cadence CPU sample schedules. */
     bool synthetic = !strcmp(requested, "null");
     if (synthetic) {
         bench_samples_init(&cpu, values, BENCH_INTERACTION_MIN_N);
@@ -299,9 +373,11 @@ static int idle_row(const char *requested, bool track, bool require_gl)
     char name[96]; (void)snprintf(name, sizeof name, "editor_%s_G11_process_cpu%s", label,
                                 synthetic ? "_synthetic_due_now" : "");
     int miss = gate_row(name, &cpu, G11_P50, G11_P99, track, &tag);
+    printf("G11_schedule_TRACK %s process_context_switches=%llu (M)%s wakeup trace unavailable; qualifying wakeup gate unmeasured\n",
+        label,(unsigned long long)(switches_end-switches_start),tag.power);
+    if (!track) miss=bench_merge_exit(miss,2);
     /* A bounded observation adds exactly one external test-deadline timeout.
      * Subtract that known timeout, retaining all earlier poll returns. */
-    uint64_t quiet; REQUIRE(observe_quiet(e, &quiet) == 0);
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
     REQUIRE(editor_inject(e, &focus) == 0); REQUIRE(settle(e) == 0);
     uint64_t unfocused; REQUIRE(observe_quiet(e, &unfocused) == 0);
@@ -635,6 +711,7 @@ int main(int argc, char **argv)
     const char *path = "/tmp/edit-corpus/log_1g.txt";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--self-check")) return settle_self_check();
+        if (!strcmp(argv[i], "--self-check-g11")) return g11_accounting_self_check();
         if (!strcmp(argv[i], "--track")) track = true;
         else if (!strcmp(argv[i], "--require-gl")) require_gl = true;
         else if (!strcmp(argv[i], "--partial-index")) partial = true;
