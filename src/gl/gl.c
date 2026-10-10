@@ -1,7 +1,5 @@
-/* P2.4b: mode selection only; the shared legacy/experimental renderer lives
- * with the candidates until the coordinator picks/promotes one. Keep the
- * shared include when force-adding variants/. Unset preserves the legacy path. */
-#include "../../variants/P2.4b/renderer.inc"
+/* Production EGL renderer, including the existing opt-in upload modes. */
+#include "renderer.inc"
 
 static int gl_select_upload(gl_state *s)
 {

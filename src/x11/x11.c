@@ -487,7 +487,6 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         }
         if (p->present_ok && g->extension == p->present_opcode && g->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
             xcb_present_complete_notify_event_t *x = (xcb_present_complete_notify_event_t *)e;
-            trace_record_at(trace_now_ns(), TRACE_T6_PRESENT_COMPLETE, x->serial);
             if (cb->on_present_complete) cb->on_present_complete(cb->ud, x->serial, x->ust, x->msc);
         }
         break; }

@@ -422,6 +422,68 @@ static int trace_test(void)
     return 0;
 }
 
+/* Native conformance uses an explicit output lane. It is separate from the
+ * frozen timing suite: a diagnostic lane must never fabricate Present T6. */
+#ifdef RENDER_TEST_NATIVE
+typedef struct render_native_lane {
+    void *user;
+    int (*window_size)(void *,uint32_t,uint32_t);
+    int (*paint)(void *,render_backend *,const render_grid *,const render_strip *);
+    int (*pixels)(void *,uint32_t *,size_t);
+    int (*close)(void *,bool);
+} render_native_lane;
+static int render_native_resize_contract(render_backend *b,const render_native_lane *lane)
+{
+    const render_dims shapes[]={{2,2,4,4},{3,3,4,4},{2,1,3,5},{3,2,3,5},
+        {3,3,4,4},{2,1,3,5},{3,3,4,4},{2,1,3,5}};
+    /* Last transitions reuse one native surface at the same dimensions:
+     * margins must erase previously painted cells in both swap buffers. */
+    const uint32_t margins[][2]={{0,0},{1,3},{2,2},{2,1},
+        {0,0},{6,7},{0,0},{6,7}};
+    render_cell cells[16]; uint64_t dirty[1]; uint32_t pixels[256];
+    for (size_t step=0;step<sizeof shapes/sizeof shapes[0];step++) {
+        render_dims dims=shapes[step];
+        uint32_t width=dims.cols*dims.cell_w+margins[step][0];
+        uint32_t height=dims.rows*dims.cell_h+margins[step][1];
+        CHECK(lane->window_size(lane->user,width,height)==0);
+        CHECK(render_backend_resize(b,dims)==RENDER_OK);
+        render_grid grid;
+        CHECK(render_grid_init(&grid,dims,cells,16,dirty,1)==RENDER_OK);
+        for (size_t i=0;i<(size_t)dims.cols*dims.rows;i++)
+            cells[i]=(render_cell){0,RENDER_NO_SLOT,0,0x234567u+(uint32_t)i*0x10101u,0,0};
+        CHECK(render_frame_begin(&grid,(uint32_t)step+1)==RENDER_OK && render_mark_full(&grid)==RENDER_OK);
+        render_strip strip={0,dims.rows};
+        CHECK(lane->paint(lane->user,b,&grid,&strip)==0);
+        CHECK(lane->pixels(lane->user,pixels,256)==0);
+        for (uint32_t y=0;y<height;y++) for (uint32_t x=0;x<width;x++) {
+            uint32_t expected=0;
+            if (x<dims.cols*dims.cell_w && y<dims.rows*dims.cell_h)
+                expected=cells[(size_t)(y/dims.cell_h)*dims.cols+x/dims.cell_w].bg;
+            CHECK(pixels[(size_t)y*width+x]==expected);
+        }
+    }
+    puts("render native resize: PASS (grow/shrink, changed cells, fractional margins, native window pixels)");
+    return 0;
+}
+static int render_native_close_contract(render_backend *b,const render_native_lane *lane)
+{
+    render_cell cells[16]; uint64_t dirty[1]; render_grid grid;
+    for (size_t i=0;i<16;i++) cells[i]=(render_cell){0,RENDER_NO_SLOT,0,0x345678,0,0};
+    CHECK(render_grid_init(&grid,b->config.dims,cells,16,dirty,1)==RENDER_OK);
+    CHECK(render_frame_begin(&grid,20)==RENDER_OK && render_mark_full(&grid)==RENDER_OK);
+    render_strip strip={0,grid.dims.rows};
+    CHECK(render_backend_submit(b,&grid,&strip,1)==RENDER_OK);
+    CHECK(render_backend_present(b,20)==RENDER_OK && b->active);
+    CHECK(render_backend_resize(b,b->config.dims)==RENDER_ERR_BUSY);
+    CHECK(lane->close(lane->user,false)==0 && b->active); /* WM close request */
+    CHECK(lane->close(lane->user,true)==0 && b->active);  /* native destroy */
+    render_backend_shutdown(b); render_backend_shutdown(b);
+    CHECK(!b->initialized && render_backend_present(b,20)==RENDER_ERR_STATE);
+    puts("render native close: PASS (WM close/destroy pending, quiescent cleanup, idempotence)");
+    return 0;
+}
+#endif
+
 int main(void)
 {
     trace_init(); CHECK(trace_thread_register() >= 0);

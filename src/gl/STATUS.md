@@ -1,3 +1,31 @@
+# GL — P2.4c review fixes (edit-e6x.26, session 8)
+
+Production uses `src/gl/renderer.inc` with all existing upload modes. Named
+review sections 1–6, 8, 12 and 13 are implemented and covered by targeted red
+baseline regressions and green unit/native diagnostics. This session adds the
+GL completion-state fuzzer, absent-EGL skip coverage, failed-swap retry coverage,
+and a red-before-green fix refusing writable leases after terminal device failure.
+
+Decision: `docs/decisions/edit-e6x.26.md`.
+Public evidence/limits: `docs/worker-reports/edit-e6x.26-s8.md`.
+
+Final `make all` and ASan/UBSan `make check` pass (48 test binaries plus replay
+CLI contracts, M [AC]). Release and sanitizer GL checks pass on Xvfb :99,
+including actual window pixels
+through grow/shrink, changed cell dimensions, fractional margins, close/destroy
+pending and fresh initialization. Startup worker draw concurrent with UI resize
+passes TSan. The release typing allocator guard counts zero allocations.
+GL and render fuzz runs are clean for at least 60 seconds (M) [AC].
+
+Xvfb's llvmpipe does not supply matching PIXMAP Present MSC for the production
+admission probe: production Present/timing conformance skips explicitly. Native
+pixel diagnostics remain executable and pass; missing EGL skips only native
+checks. LeakSanitizer is disabled in worker runs; coordinator must rerun with
+leaks enabled and validate on an authorized Present-capable test display.
+Benchmark honesty and the recorded performance misses remain outside this bead.
+
+## Historical P2.4b experiment status
+
 # GL — P2.4b cell upload experiment (edit-e6x.9)
 
 The EGL backend selected in P2.4 remains the default. Unset EDIT_GL_UPLOAD keeps

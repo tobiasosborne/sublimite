@@ -47,20 +47,16 @@ static void gl_driver_complete(void *u, uint32_t serial, uint64_t ust, uint64_t 
 static void gl_driver_event(void *u, const plat_event *ev) { (void)u; (void)ev; }
 static int gl_driver_pump(gl_driver *d)
 {
-    render_backend *b = d->backend;
-    if (b->active && b->presented && (!b->device_seen || !b->complete_seen)) {
-        work_msg msg = {.kind = GL_POLL_MESSAGE};
-        render_event ev = {RENDER_EVENT_WORK, b->active_frame, 0, &msg};
-        int rc = render_backend_event(b, &ev);
-        if (rc != RENDER_OK) return rc;
-    }
+    (void)work_mailbox_drain(&d->workers, gl_driver_init_message, d);
+    int status=gl_completion_status(d->backend);
+    if (status!=RENDER_OK) return status;
     plat_callbacks cb = {.ud = d, .on_event = gl_driver_event, .on_present_complete = gl_driver_complete};
     return plat_run_for(&d->platform, &cb, 0) == PLAT_OK ? RENDER_OK : RENDER_ERR_DEVICE;
 }
 static void gl_driver_cleanup(gl_driver *d)
 {
-    if (d->pool_live) work_pool_shutdown(&d->workers);
     if (d->backend != NULL) render_backend_shutdown(d->backend);
+    if (d->pool_live) work_pool_shutdown(&d->workers);
     if (d->plat_live) plat_shutdown(&d->platform);
     if (d->arena_live) edit_arena_free(&d->state_arena);
     memset(d, 0, sizeof *d);

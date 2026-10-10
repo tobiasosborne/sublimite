@@ -12,6 +12,14 @@ int render_gl_backend(render_backend *b);
 /* UI: route plat's PresentCompleteNotify callback; ignores stale swaps.
  * Uses observation CLOCK_MONOTONIC, never treats raw X UST as that clock. */
 int gl_present_complete(render_backend *b, uint32_t serial, uint64_t ust, uint64_t msc);
+/* UI: after draining the shared work mailbox, check for a latched device
+ * failure (Skip, reset, failed fence, missing completion). No further submits
+ * or presents succeed after failure; shut down and choose a fresh backend.
+ * Pending frames schedule bounded GL_POLL_MESSAGE work automatically; their
+ * per-job receiver routes them to event(), including with a shared dispatcher.
+ * Init requires a live work pool. Capacity admission bounds each frame to
+ * 4096 glyphs, 64 pages, 16 MiB atlas storage and 262144 referenced pixels. */
+int gl_completion_status(const render_backend *b);
 const char *gl_buffer_mode(const render_backend *b);
 const char *gl_device_name(const render_backend *b);
 uint64_t gl_displayed_msc(const render_backend *b);
