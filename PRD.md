@@ -92,8 +92,8 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 
 | | Scope | Exit criterion |
 |---|---|---|
-| **M0 glass** | X11 window, GL text, piece tree, typing, scrolling, one file | Tobias types in it on the real display for an hour and reports lag; G1 tracked |
-| **M1 editor** | tabs, minimap, find/replace, undo, wrap, auto-indent, save, hot exit, CLI, single instance, xdg integration, large-file path | a day of real use by Tobias; perf rows reported, none blocking |
+| **M0 glass** | X11 window, GL text, piece tree, typing, scrolling, one file | Tobias does his own work in it on the real display and declares M0 done or lists the blockers; no duration, no gate row |
+| **M1 editor** | tabs, minimap, find/replace, undo, wrap, auto-indent, save, hot exit, CLI, single instance, xdg integration, large-file path | Tobias declares it fit for the two-week trial or lists the blockers; perf rows reported, none blocking |
 | **M2 daily** | Wayland backend, tree-sitter highlighting (async), config, themes, polish | the two-week trial starts |
 | **v1 done** | | Sublime uninstalled |
 | **M3 Windows** | Win32 + D3D11/GL backend, B fixture measured | usable on the real B machine; B rows reported |
