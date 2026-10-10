@@ -1,3 +1,32 @@
+# Piece status — edit-4w1.59 / P1-1 §13, session 8
+
+Worker snapshot release now publishes a lock-free deferred retirement entry;
+with a live tree it acquires neither the pool nor ADD-view mutex. Owner calls
+service fixed graph batches; `piece_reclaim` exposes bounded physical cleanup.
+The final surviving core owner drains all work after tree destruction. A
+live-owner flag and integer identity token handle owning-thread exit/reuse
+without passing an expired handle to a thread API.
+Compact node/header/slab geometry is unchanged; no new globals or module threads.
+
+The parked-worker red regression is recorded in
+`docs/worker-reports/edit-4w1.59-s8.md`; green runs cover the large memory fixture,
+three simultaneous releases, bounded graph/slab work, destruction before
+publication, owning-thread exit, and the active zero-malloc typing guard.
+The worker memory gate waits for physical retirement with its original bound.
+The piece fuzzer includes worker release interleaved with edits and maintenance.
+Design and paired loaded-box TRACK comparisons:
+`docs/decisions/edit-4w1.59.md`. The original frozen competition bench is unchanged;
+`bench/piece_reclaim_bench.c` adds the reclamation row (`--quick`).
+
+Release `make all`, a complete sanitizer `make check` on Xvfb :99, the full quick
+piece benchmark, and both requested fuzz campaigns have passed. Final settled-source reruns also pass; pasted evidence is in the report.
+LeakSanitizer remains a coordinator rerun (`detect_leaks=0` in this sandbox).
+The Makefile has no TSan target. No windows were opened on :0.
+Periodic editor idle-service maintenance wiring and end-to-end G1 are integration
+work outside this piece-only change; automatic piece endpoints provide progress.
+
+---
+
 # Piece status — P1.4f / edit-4w1.38
 
 Review P1.4-1 §8–§10 are implemented: synchronized occupancy/partial/empty

@@ -7,6 +7,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <errno.h>
+#include <time.h>
 
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "piece_mt_test:%d: %s\n", __LINE__, #c); return 1; } } while (0)
 
@@ -37,6 +39,185 @@ static int kernel_threads_test(void) {
 #endif
 
 #ifdef PIECE_TESTING
+static void *arena_hook_alloc(void *p, size_t n);
+static void arena_hook_free(void *p, void *q, size_t n);
+static uint64_t reclaim_now_ns(void) {
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+typedef struct reclaim_gate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    unsigned entered, goal;
+    int typing_done, resume, blocked;
+} reclaim_gate;
+static void reclaim_park(void *ctx) {
+    reclaim_gate *g = ctx;
+    pthread_mutex_lock(&g->mu);
+    g->entered++; pthread_cond_broadcast(&g->cv);
+    while (!g->resume) pthread_cond_wait(&g->cv, &g->mu);
+    pthread_mutex_unlock(&g->mu);
+}
+static void *reclaim_release(void *ctx) { piece_snapshot_release(ctx); return NULL; }
+static void *reclaim_watchdog(void *ctx) {
+    reclaim_gate *g = ctx;
+    pthread_mutex_lock(&g->mu);
+    while (!g->entered) pthread_cond_wait(&g->cv, &g->mu);
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5; /* Deadlock watchdog, not a performance gate. */
+    int rc = 0;
+    while (!g->typing_done && rc != ETIMEDOUT)
+        rc = pthread_cond_timedwait(&g->cv, &g->mu, &deadline);
+    g->blocked = !g->typing_done;
+    g->resume = 1; pthread_cond_broadcast(&g->cv);
+    pthread_mutex_unlock(&g->mu); return NULL;
+}
+static int reclaim_typing_test(void) {
+    const size_t sizes[] = {20000, 200000};
+    for (size_t z = 0; z < sizeof sizes / sizeof sizes[0]; z++) {
+        for (unsigned jobs = 1; jobs <= 3; jobs += 2) {
+            edit_arena arena; REQUIRE(!edit_arena_init(&arena, 128u << 20));
+            piece_allocator a = { &arena, arena_hook_alloc, arena_hook_free };
+            piece_tree *t = piece_create(&a); REQUIRE(t);
+            for (size_t i = 0; i < sizes[z]; i++) {
+                uint8_t b = (uint8_t)(i % 251);
+                REQUIRE(!piece_insert(t, 0, &b, 1));
+            }
+            REQUIRE(piece_piece_count(t) == sizes[z]);
+            piece_snapshot *snapshots[3];
+            for (unsigned i = 0; i < jobs; i++) {
+                snapshots[i] = piece_snapshot_take(t); REQUIRE(snapshots[i]);
+                REQUIRE(!piece_insert(t, 0, (const uint8_t *)"+", 1));
+            }
+            REQUIRE(!piece_delete(t, 0, piece_len(t), NULL));
+            REQUIRE(!piece_insert(t, 0, (const uint8_t *)"x", 1));
+            reclaim_gate g = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .goal = jobs };
+            piece_test_reclaim_hook(t, reclaim_park, &g);
+            pthread_t workers[3], watchdog;
+            REQUIRE(!pthread_create(&watchdog, NULL, reclaim_watchdog, &g));
+            for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_create(&workers[i], NULL, reclaim_release, snapshots[i]));
+            pthread_mutex_lock(&g.mu);
+            while (g.entered < g.goal && !g.resume) pthread_cond_wait(&g.cv, &g.mu);
+            pthread_mutex_unlock(&g.mu);
+            uint64_t began = reclaim_now_ns();
+            edit_malloc_guard_begin();
+            int rc = piece_insert(t, 1, (const uint8_t *)"\n", 1);
+            rc |= piece_delete(t, 0, 1, NULL);
+            piece_snapshot *now = piece_snapshot_take(t); if (!now) rc = 1;
+            uint8_t b = 0;
+            rc |= piece_read(t, 0, &b, 1);
+            if (b != '\n' || piece_len(t) != 1 || piece_line_count(t) != 2) rc = 1;
+            if (now) piece_snapshot_release(now);
+            size_t malloc_calls = edit_malloc_guard_end();
+            uint64_t typing_ns = reclaim_now_ns() - began;
+            pthread_mutex_lock(&g.mu); g.typing_done = 1; pthread_cond_broadcast(&g.cv); pthread_mutex_unlock(&g.mu);
+            REQUIRE(!pthread_join(watchdog, NULL));
+            for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_join(workers[i], NULL));
+            piece_test_reclaim_hook(t, NULL, NULL);
+            printf("reclamation typing: pieces=%zu workers=%u typing_before_worker_resume=%s\n",
+                   sizes[z], jobs, g.blocked ? "FAIL" : "ok");
+            printf("reclamation typing latency (M)[AC]: %llu ns (TRACK, loaded box)\n",
+                   (unsigned long long)typing_ns);
+            printf("reclamation typing allocator: malloc_calls=%zu guard=%s\n", malloc_calls,
+                   edit_malloc_guard_active() ? "active" : "sanitizer-inert");
+            REQUIRE(!malloc_calls);
+            unsigned batches = 0;
+            uint64_t reclaimed = 0;
+            int more;
+            do {
+                piece_test_reset_stats(t);
+                more = piece_reclaim(t, 64);
+                piece_test_stats st = piece_test_get_stats(t);
+                REQUIRE(st.reclaim_steps <= 64 && st.slabs_scanned <= 64);
+                reclaimed += st.reclaim_steps;
+                REQUIRE(++batches < sizes[z]);
+            } while (more);
+            REQUIRE(reclaimed > sizes[z] / 16);
+            printf("reclamation maintenance: batches=%u bounded_steps=64 (G)\n", batches);
+            piece_destroy(t);
+            edit_arena_free(&arena);
+            REQUIRE(!pthread_cond_destroy(&g.cv) && !pthread_mutex_destroy(&g.mu));
+            REQUIRE(!g.blocked && !rc);
+        }
+    }
+    puts("reclamation typing: ok (parked retirement; insert/delete/snapshot/read; three queued owners)"); return 0;
+}
+typedef struct reclaim_allocator { atomic_size_t live; } reclaim_allocator;
+static void *reclaim_alloc(void *ctx, size_t n) {
+    reclaim_allocator *a = ctx;
+    void *p = malloc(n);
+    if (p) atomic_fetch_add_explicit(&a->live, n, memory_order_relaxed);
+    return p;
+}
+static void reclaim_free(void *ctx, void *p, size_t n) {
+    reclaim_allocator *a = ctx;
+    atomic_fetch_sub_explicit(&a->live, n, memory_order_relaxed); free(p);
+}
+typedef struct orphan_job {
+    piece_allocator allocator;
+    piece_snapshot *snapshot;
+    atomic_uint visits;
+} orphan_job;
+static void orphan_observe(void *ctx) {
+    orphan_job *j = ctx; atomic_fetch_add_explicit(&j->visits, 1, memory_order_relaxed);
+}
+static void *orphan_create(void *ctx) {
+    orphan_job *j = ctx; piece_tree *t = piece_create(&j->allocator);
+    if (!t) return NULL;
+    if (!piece_insert(t, 0, (const uint8_t *)"x", 1)) {
+        j->snapshot = piece_snapshot_take(t);
+        piece_test_reclaim_hook(t, orphan_observe, j);
+    }
+    piece_destroy(t); return NULL;
+}
+static int reclaim_lifetime_test(void) {
+    for (unsigned jobs = 1; jobs <= 3; jobs += 2) {
+        reclaim_allocator count; atomic_init(&count.live, 0);
+        piece_allocator a = { &count, reclaim_alloc, reclaim_free };
+        piece_tree *t = piece_create(&a); REQUIRE(t);
+        for (unsigned i = 0; i < 20000; i++) REQUIRE(!piece_insert(t, 0, (const uint8_t *)"x", 1));
+        piece_snapshot *s[3];
+        for (unsigned i = 0; i < jobs; i++) {
+            s[i] = piece_snapshot_take(t); REQUIRE(s[i]);
+            REQUIRE(!piece_insert(t, 0, (const uint8_t *)"+", 1));
+        }
+        reclaim_gate g = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .goal = jobs };
+        piece_test_reclaim_hook(t, reclaim_park, &g);
+        pthread_t workers[3], watchdog;
+        REQUIRE(!pthread_create(&watchdog, NULL, reclaim_watchdog, &g));
+        for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_create(&workers[i], NULL, reclaim_release, s[i]));
+        pthread_mutex_lock(&g.mu);
+        while (g.entered < g.goal && !g.resume) pthread_cond_wait(&g.cv, &g.mu);
+        pthread_mutex_unlock(&g.mu);
+        /* Producers still own their cores before queue publication. Destroy
+         * must return without waiting, then the final producer frees all. */
+        piece_destroy(t);
+        pthread_mutex_lock(&g.mu); g.typing_done = 1; pthread_cond_broadcast(&g.cv); pthread_mutex_unlock(&g.mu);
+        REQUIRE(!pthread_join(watchdog, NULL));
+        for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_join(workers[i], NULL));
+        REQUIRE(!pthread_cond_destroy(&g.cv) && !pthread_mutex_destroy(&g.mu));
+        printf("reclamation lifetime: workers=%u destroy_before_worker_resume=%s live_bytes=%zu\n",
+               jobs, g.blocked ? "FAIL" : "ok", atomic_load_explicit(&count.live, memory_order_relaxed));
+        REQUIRE(!g.blocked && !atomic_load_explicit(&count.live, memory_order_relaxed));
+    }
+    /* The original owning thread may exit before its last snapshot. Do not
+     * compare an expired pthread_t, even if a new worker reuses that ID. */
+    reclaim_allocator count; atomic_init(&count.live, 0);
+    orphan_job j = {.allocator={ &count, reclaim_alloc, reclaim_free }};
+    atomic_init(&j.visits, 0);
+    pthread_t creator, releaser;
+    REQUIRE(!pthread_create(&creator, NULL, orphan_create, &j));
+    REQUIRE(!pthread_join(creator, NULL) && j.snapshot);
+    uint8_t b; REQUIRE(!piece_snapshot_read(j.snapshot, 0, &b, 1) && b == 'x');
+    REQUIRE(!pthread_create(&releaser, NULL, reclaim_release, j.snapshot));
+    REQUIRE(!pthread_join(releaser, NULL));
+    REQUIRE(atomic_load_explicit(&j.visits, memory_order_relaxed) == 1);
+    REQUIRE(!atomic_load_explicit(&count.live, memory_order_relaxed));
+    puts("reclamation lifetime: owner thread exited; final worker release; live_bytes=0");
+    return 0;
+}
 typedef struct {
     pthread_barrier_t *barrier;
     piece_snapshot *snapshot, *retained;
@@ -438,6 +619,10 @@ static int typing_allocator_test(void) {
 }
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
+#ifdef PIECE_TESTING
+    if (argc == 2 && !strcmp(argv[1], "--reclaim-typing")) return reclaim_typing_test();
+    if (argc == 2 && !strcmp(argv[1], "--reclaim-lifetime")) return reclaim_lifetime_test();
+#endif
 #if defined(PIECE_TESTING) && defined(PIECE_GAP_TRIAL)
     /* Reproduce the rejected prototype's behavior independently of the
      * production-only lifetime and pool regressions added later. */
@@ -448,6 +633,8 @@ int main(int argc, char **argv) {
     bad |= kernel_threads_test();
 #endif
 #ifdef PIECE_TESTING
+    bad |= reclaim_typing_test();
+    bad |= reclaim_lifetime_test();
     bad |= owner_race_test(); bad |= cursor_test(); bad |= compact_test();
 #ifdef PIECE_GAP_TRIAL
     bad |= gap_test();

@@ -2,10 +2,14 @@
 #include "piece/piece.h"
 #include "piece/piece_test.h"
 #include "../tests/piece_model.h"
+#include <pthread.h>
 #include <stdio.h>
 
 #define NEED(k) do { if (i + (k) > size) goto done; } while (0)
 #define FAIL() __builtin_trap()
+static void *retire_snapshot(void *ctx) {
+    piece_snapshot_release(ctx); return NULL;
+}
 
 static uint64_t wide_decode(const uint8_t *p) {
     uint64_t v = 0;
@@ -116,7 +120,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     piece_ref saved[4] = {0}; uint8_t saved_bytes[4][256];
     size_t saved_len[4] = {0}; unsigned save_slot = 0;
     while (i < size) {
-        uint8_t op = data[i++] % 11;
+        uint8_t op = data[i++] % 12;
         if (op == 0 || op == 1) {            /* insert */
             NEED(3); uint64_t off = ((uint64_t)data[i] << 8 | data[i + 1]) % (m.n + 1); size_t l = data[i + 2] % 40; i += 3;
             NEED(l ? 1 : 0); uint8_t b[40];
@@ -177,6 +181,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 if (piece_insert_ref(t, off, &saved[slot])) FAIL();
                 pm_insert(&m, off, saved_bytes[slot], saved_len[slot]);
             }
+        } else if (op == 11) {                /* worker retirement / bounded owner drain */
+            NEED(1); size_t budget = data[i++] % 65u;
+            piece_snapshot *retire = piece_snapshot_take(t); if (!retire) FAIL();
+            if (piece_insert(t, 0, (const uint8_t *)"x", 1)) FAIL();
+            pm_insert(&m, 0, (const uint8_t *)"x", 1);
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, retire_snapshot, retire)) FAIL();
+            (void)piece_reclaim(t, budget);
+            if (pthread_join(worker, NULL)) FAIL();
+            (void)piece_reclaim(t, budget);
         } else {                             /* out-of-range must fail */
             uint8_t c; if (piece_read(t, m.n, &c, 1) == 0) FAIL();
             if (piece_delete(t, m.n, 1, NULL) == 0) FAIL();

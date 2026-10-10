@@ -142,6 +142,10 @@ static int final_release(int worker, int cached) {
     if (cached) { piece_snapshot *current = piece_snapshot_take(t); CHECK(current); piece_snapshot_release(current); }
     if (worker) {
         pthread_t th; CHECK(!pthread_create(&th, NULL, release_snapshots, snapshots)); CHECK(!pthread_join(th, NULL));
+        /* Worker return acknowledges logical release. Account physical
+         * retirement after bounded owner maintenance, before any query. */
+        unsigned batches = 0;
+        while (piece_reclaim(t, 64)) CHECK(++batches < 1000);
     } else (void)release_snapshots(snapshots);
     double limit = bound(0, 1, 33, 0);
     printf("final release (%s%s): live=%zu bound=%.2f\n", worker ? "worker" : "owner", cached ? ", current cache" : "", atomic_load(&m.live), limit);

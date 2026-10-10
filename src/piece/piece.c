@@ -41,6 +41,9 @@
 #define NL_BLOCKS (65536u / NL_BLOCK)
 #define REF_BATCH (FAN - 2u)
 #define TRIM_QUERY 3
+#define TRIM_MAINT 4
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2 && ATOMIC_INT_LOCK_FREE == 2,
+               "snapshot release queue and owner counts must be lock-free");
 
 typedef struct node node;
 struct node {
@@ -101,11 +104,18 @@ typedef struct core {
     piece_allocator a;
     piece_map_hooks mh; int has_mh;
     const uint8_t *orig; size_t orig_len; int orig_owned;
+    atomic_int owner_live; /* distinguish the live owner from a recycled ID */
     add_store *add; orig_store *original;
     pthread_mutex_t pool_mu;
     node_pool pool[3]; /* leaves, branches, compact snapshot headers */
+    uintptr_t owner; /* Linux pthread identity value, never an expired API handle */
+    _Atomic(piece_snapshot *) released;
+    piece_snapshot *pending; /* owner-only detached release queue */
+    node *retiring; /* owner-only zero-reference nodes, linked in add_high */
 #ifdef PIECE_TESTING
     piece_test_stats stats;
+    void (*reclaim_hook)(void *);
+    void *reclaim_ctx;
 #endif
 } core;
 
@@ -273,7 +283,7 @@ static void pool_trim_locked(core *c, int force) {
         atomic_load_explicit(&c->pool[1].returned, memory_order_relaxed) < 64) return;
     /* Queries/takes consume a fixed batch even if workers queued a large
      * retired version. Mutation/release cleanup follows its reclaimed work. */
-    size_t budget = force == TRIM_QUERY ? 64 : SIZE_MAX;
+    size_t budget = force == TRIM_QUERY || force == TRIM_MAINT ? 64 : SIZE_MAX;
     for (unsigned pi = 0; pi < 3; pi++) {
         node_pool *p = &c->pool[pi];
         size_t sz = 2 * slot_size(pi) + SLAB_OVERHEAD;
@@ -438,12 +448,12 @@ static int checkpoint_snapshot_storage(piece_tree *t) {
     add_chunk *old = tbl[i]; tbl[i] = ch; chunk_unref(c, old);
     cp->boundary_private = 1; return 0;
 }
+static void reclaim_drain(core *c, size_t budget);
 static void core_unref(core *c) {
-    pthread_mutex_lock(&c->pool_mu);
-    unsigned owners = atomic_fetch_sub_explicit(&c->rc, 1, memory_order_acq_rel);
-    if (owners == 2) pool_trim_locked(c, 1);
-    pthread_mutex_unlock(&c->pool_mu);
-    if (owners != 1) return;
+    if (atomic_fetch_sub_explicit(&c->rc, 1, memory_order_acq_rel) != 1) return;
+    /* Every producer publishes before dropping its core owner. At zero there
+     * is no UI or producer left, so the final thread owns all deferred work. */
+    reclaim_drain(c, SIZE_MAX);
     piece_allocator a = c->a;
     add_store_unref(c, c->add);
     orig_store_unref(c, c->original);
@@ -458,6 +468,49 @@ static void core_unref(core *c) {
     pthread_mutex_destroy(&c->pool_mu); a.free(a.ctx, c, sizeof *c);
 }
 
+/* A dead snapshot has no readers: its length becomes an intrusive release
+ * link, without growing the frozen compact header or allocating queue cells. */
+static piece_snapshot *released_next(const piece_snapshot *s) {
+    return (piece_snapshot *)(uintptr_t)s->len;
+}
+static void retire_node(core *c, node *n) {
+    if (atomic_fetch_sub_explicit(&n->rc, 1, memory_order_acq_rel) != 1) return;
+    n->nextfree = c->retiring; c->retiring = n;
+}
+static void reclaim_drain(core *c, size_t budget) {
+    while (budget) {
+        if (c->retiring) {
+            node *n = c->retiring; c->retiring = n->nextfree;
+            if (!n->leaf) for (unsigned i = 0; i < n->cnt; i++) retire_node(c, n->v.in.ch[i]);
+            pool_free(c, n, n->leaf ? 0u : 1u);
+#ifdef PIECE_TESTING
+            c->stats.reclaim_steps++;
+#endif
+        } else {
+            if (!c->pending) c->pending = atomic_exchange_explicit(&c->released, NULL, memory_order_acquire);
+            piece_snapshot *s = c->pending;
+            if (!s) break;
+            c->pending = released_next(s);
+            add_store *v = s->add;
+            /* Workers never touch the view list or its lock. The owner (or
+             * exclusive final-core thread) alone removes released headers. */
+            pthread_mutex_lock(&v->mu);
+            if (s->prev) s->prev->next = s->next; else v->snapshots = s->next;
+            if (s->next) s->next->prev = s->prev;
+            add_store_prune(c, v);
+            pthread_mutex_unlock(&v->mu);
+            retire_node(c, s->root);
+            orig_store_unref(c, s->original);
+            pool_free(c, (node *)(void *)s, 2);
+            add_store_unref(c, v);
+#ifdef PIECE_TESTING
+            c->stats.reclaim_steps++;
+#endif
+        }
+        budget--;
+    }
+}
+
 /* An unchanged tree shares one immutable snapshot header. Each public owner
  * still gets its own mapping acquire/release; the tree's cache is covered by
  * the tree's mapping owner. This bounds repeated takes without any edits. */
@@ -465,8 +518,22 @@ static void snapshot_drop(piece_snapshot *s, int external) {
     if (!s) return;
     core *c = s->c;
     if (external && s->has_mh) s->original->mh.release(s->original->mh.ctx);
-    pthread_mutex_lock(&c->pool_mu);
     int no_external = external && atomic_fetch_sub_explicit(&c->external, 1, memory_order_acq_rel) == 1;
+    if (!atomic_load_explicit(&c->owner_live, memory_order_acquire) ||
+        (uintptr_t)pthread_self() != c->owner) {
+        if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) return;
+#ifdef PIECE_TESTING
+        if (c->reclaim_hook) c->reclaim_hook(c->reclaim_ctx);
+#endif
+        piece_snapshot *head = atomic_load_explicit(&c->released, memory_order_relaxed);
+        do { s->len = (uint64_t)(uintptr_t)head; }
+        while (!atomic_compare_exchange_weak_explicit(&c->released, &head, s,
+                                                      memory_order_release, memory_order_relaxed));
+        /* Deferred storage now belongs to the core, whose tree or remaining
+         * snapshot owners keep it alive. The final core owner drains it. */
+        core_unref(c); return;
+    }
+    pthread_mutex_lock(&c->pool_mu);
     if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) {
         if (no_external) pool_trim_locked(c, 2);
         pthread_mutex_unlock(&c->pool_mu); return;
@@ -490,11 +557,20 @@ static void snapshot_uncache(piece_tree *t) {
 
 static void owner_trim(piece_tree *t, int force) {
     core *c = t->c;
+    reclaim_drain(c, 64);
     if (!force && atomic_load_explicit(&c->pool[0].returned, memory_order_relaxed) < 64 &&
         atomic_load_explicit(&c->pool[1].returned, memory_order_relaxed) < 64) return;
     if (t->cached_snapshot && atomic_load_explicit(&t->cached_snapshot->rc, memory_order_acquire) == 1)
         snapshot_uncache(t);
     pool_trim(c, TRIM_QUERY);
+}
+
+int piece_reclaim(piece_tree *t, size_t budget) {
+    core *c = t->c;
+    reclaim_drain(c, budget);
+    pool_trim(c, TRIM_MAINT);
+    return c->retiring || c->pending || atomic_load_explicit(&c->released, memory_order_acquire) ||
+           c->pool[0].empty || c->pool[1].empty || c->pool[2].empty;
 }
 
 static inline const uint8_t *view_data(const uint8_t *original, const add_store *v, uint64_t x) {
@@ -1025,6 +1101,8 @@ piece_tree *piece_create(const piece_allocator *a) {
     core *c = a->alloc(a->ctx, sizeof *c);
     if (!c) return NULL;
     memset(c, 0, sizeof *c); atomic_init(&c->rc, 1); atomic_init(&c->external, 0); c->a = *a;
+    c->owner = (uintptr_t)pthread_self(); atomic_init(&c->released, NULL);
+    atomic_init(&c->owner_live, 1);
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr)) { a->free(a->ctx, c, sizeof *c); return NULL; }
     int lock_error = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
@@ -1056,7 +1134,10 @@ void piece_destroy(piece_tree *t) {
     add_store *v = c->add; c->add = NULL;
     pthread_mutex_lock(&v->mu); v->sealed = 1; add_store_prune(c, v); pthread_mutex_unlock(&v->mu);
     add_store_unref(c, v);
+    reclaim_drain(c, SIZE_MAX);
+    pool_trim(c, 1);
     c->a.free(c->a.ctx, t, sizeof *t);
+    atomic_store_explicit(&c->owner_live, 0, memory_order_release);
     core_unref(c);
 }
 
@@ -1469,6 +1550,7 @@ piece_test_stats piece_test_get_stats(const piece_tree *t) {
     s.slabs_scanned = c->stats.slabs_scanned; s.pool_returns = c->stats.pool_returns;
     s.walk_nodes = __atomic_load_n(&c->stats.walk_nodes, __ATOMIC_RELAXED);
     s.ref_recount_bytes = c->stats.ref_recount_bytes;
+    s.reclaim_steps = c->stats.reclaim_steps;
     s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; s.snapshot_bytes = SNAPSHOT_SZ;
     s.slab_overhead = SLAB_OVERHEAD; s.height = (unsigned)t->height;
     pthread_mutex_unlock(&c->pool_mu); return s;
@@ -1492,6 +1574,9 @@ piece_test_memory piece_test_get_memory(const piece_tree *t) {
     pthread_mutex_unlock(&c->pool_mu); return m;
 }
 void piece_test_reset_stats(piece_tree *t) { memset(&t->c->stats, 0, sizeof t->c->stats); }
+void piece_test_reclaim_hook(piece_tree *t, void (*hook)(void *), void *ctx) {
+    t->c->reclaim_hook = hook; t->c->reclaim_ctx = ctx;
+}
 void piece_test_snapshot_set_owners(piece_snapshot *s, unsigned owners) {
     atomic_store_explicit(&s->rc, owners, memory_order_relaxed);
 }

@@ -99,6 +99,14 @@ typedef struct piece_map_hooks {
 piece_tree *piece_create(const piece_allocator *a);
 void piece_destroy(piece_tree *t);
 
+/* Owner-thread maintenance (P1-1 §13). Worker snapshot release transfers
+ * physical ownership to a deferred queue. Perform at most budget header/node
+ * retirement steps and trim at most 64 completed slabs; nonzero means more
+ * work remains. No allocation. Mutations, length/piece-count queries and
+ * snapshot takes also service fixed batches. Destroy/final snapshot release
+ * drain all remaining work. Call only on the tree's owning thread. */
+int piece_reclaim(piece_tree *t, size_t budget);
+
 /* Set initial content; only valid on an empty, never-edited tree.
  * init_copy: tree copies [data, data+len) (caller may free it after return).
  * init_mapped: tree references `mapped` without copying; caller guarantees it

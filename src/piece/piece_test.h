@@ -17,7 +17,7 @@ typedef struct piece_test_stats {
     uint64_t root_descents, cursor_hits, pathcopy_bytes, gap_deletes;
     /* Completed slabs consumed, returned slots, range/iterator node entries,
      * and ADD bytes scanned by prefix queries (including ADD entry splits). */
-    uint64_t slabs_scanned, pool_returns, walk_nodes, ref_recount_bytes;
+    uint64_t slabs_scanned, pool_returns, walk_nodes, ref_recount_bytes, reclaim_steps;
     size_t leaf_bytes, branch_bytes, snapshot_bytes;
     size_t slab_overhead;
     unsigned height;
@@ -30,6 +30,9 @@ typedef struct piece_test_memory {
 piece_test_memory piece_test_get_memory(const piece_tree *t);
 /* Reset only with snapshot readers/releasers quiescent. */
 void piece_test_reset_stats(piece_tree *t);
+/* Set while releasers are quiescent. A test may park final reclamation here
+ * until an independent watchdog releases the worker. */
+void piece_test_reclaim_hook(piece_tree *t, void (*hook)(void *), void *ctx);
 /* Quiescent snapshot only; fake owners do not invoke mapping hooks. Restore
  * the real count before releasing the test's owners. */
 void piece_test_snapshot_set_owners(piece_snapshot *s, unsigned owners);
