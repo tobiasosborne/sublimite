@@ -1,5 +1,26 @@
 # File module status
 
+P1.7e / edit-4w1.43 session-eight continuation: §§17–18, 20–23 have targeted
+red/main and green/WIP coverage. §19 private-original keep and intact mapped
+deletion/replacement work; damaged mapped keep remains refused under P1.7c §5.
+The explicit `FT_CASE=19mapped` requested-keep oracle remains red and is excluded
+from ordinary passing suites. Do not close full §19 without the coordinated
+stable-original/rebase design described in docs/decisions/edit-4w1.43.md.
+Session eight fixes acquisition state when canonicalization-to-open races lose
+the entry or replace it with a symlink, and covers fortified prefix reads in
+the syscall-injection harness. A red-first restored-mtime rewrite regression
+also makes keep conservatively refuse an unvalidated ctime/metadata generation
+on the still-named mapped inode; intact deletion/replacement keep still works.
+Final evidence is in
+docs/worker-reports/edit-4w1.43-s8.md. No unrelated module implementation changed.
+Final s8 verification: make all and make check exit 0 (M)[AC], 48 sanitizer
+binaries plus replay CLI passed with detect_leaks=0; final-production file fuzz
+completed 6077 runs in 61 seconds (M)[AC] under the requested 60-second budget
+(G). Full wrapped release/sanitizer file suites and active release typing/save
+allocation guards pass (M)[AC]. Only file_bus is mutable in the production file
+object. Leak-enabled verification remains coordinator work; §19mapped remains
+explicitly incomplete.
+
 P1.7/P1.7b and P1.7c safety fixes remain. P1.7d (edit-4w1.42) implements
 file-1 §§11–13, 24–25, 31–32 and copy/scan elimination in §16.
 See docs/decisions/P1.7d.md for each verdict and exact red/green lines.

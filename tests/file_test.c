@@ -18,6 +18,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1348,6 +1349,532 @@ static void t_latency_commit_invalidation(void)
     piece_destroy(t); file_close(f); work_cancel(&pool, h);
 }
 
+
+/* P1.7e: source generations, storage, metadata and watch regressions. */
+#ifdef FILE_SEMANTICS_WRAP
+typedef struct semantic_allocation { void *p; size_t n; } semantic_allocation;
+static semantic_allocation semantic_allocations[8192];
+static pthread_mutex_t semantic_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static int semantic_counting;
+static size_t semantic_live, semantic_peak;
+void *__real_malloc(size_t);
+void *__real_calloc(size_t, size_t);
+void __real_free(void *);
+static void semantic_alloc_record(void *p, size_t n)
+{
+    pthread_mutex_lock(&semantic_alloc_lock);
+    if (semantic_counting && p) {
+        size_t i;
+        for (i = 0; i < 8192; i++) if (!semantic_allocations[i].p) break;
+        EDIT_ASSERT(i < 8192);
+        semantic_allocations[i] = (semantic_allocation){p, n};
+        semantic_live += n;
+        if (semantic_live > semantic_peak) semantic_peak = semantic_live;
+    }
+    pthread_mutex_unlock(&semantic_alloc_lock);
+}
+void *__wrap_malloc(size_t n)
+{ void *p = __real_malloc(n); semantic_alloc_record(p, n); return p; }
+void *__wrap_calloc(size_t n, size_t size)
+{ void *p = __real_calloc(n, size); semantic_alloc_record(p, n * size); return p; }
+void __wrap_free(void *p)
+{
+    pthread_mutex_lock(&semantic_alloc_lock);
+    for (size_t i = 0; i < 8192; i++) if (p && semantic_allocations[i].p == p) {
+        semantic_live -= semantic_allocations[i].n;
+        semantic_allocations[i].p = NULL; break;
+    }
+    pthread_mutex_unlock(&semantic_alloc_lock);
+    __real_free(p);
+}
+#endif
+
+#ifdef FILE_SEMANTICS_WRAP
+static _Atomic int semantic_xattr_error, semantic_restore_stat;
+#ifndef FILE_REVIEW_WRAP
+static _Atomic int semantic_fstat_error, semantic_pread_mode;
+static off_t semantic_pread_offset;
+#endif
+static char semantic_source[512];
+static struct stat semantic_original_stat;
+int __real_fsetxattr(int, const char *, const void *, size_t, int);
+int __wrap_fsetxattr(int fd, const char *name, const void *value, size_t size, int flags)
+{
+    int en = atomic_load(&semantic_xattr_error);
+    if (en) { errno = en; return -1; }
+    return __real_fsetxattr(fd, name, value, size, flags);
+}
+int __real_lstat(const char *, struct stat *);
+int __wrap_lstat(const char *path, struct stat *st)
+{
+#ifdef FILE_REVIEW_WRAP
+    latency_note();
+#endif
+    if (atomic_load(&semantic_restore_stat) && strcmp(path, semantic_source) == 0) {
+        *st = semantic_original_stat; return 0;
+    }
+    return __real_lstat(path, st);
+}
+#ifndef FILE_REVIEW_WRAP
+int __real_open(const char *, int, ...);
+int __wrap_open(const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
+    }
+    if (strcmp(path, semantic_source) == 0) {
+        /* Reuse the injection state: 1/2 are read faults, 3/4 entry races. */
+        int action = atomic_load(&semantic_pread_mode);
+        if (action == 3 || action == 4) {
+            atomic_store(&semantic_pread_mode, 0);
+            EDIT_ASSERT(unlink(path) == 0);
+            if (action == 4) EDIT_ASSERT(symlink("acquire-name-hard", path) == 0);
+        }
+    }
+    return __real_open(path, flags, mode);
+}
+int __real_fstat(int, struct stat *);
+int __wrap_fstat(int fd, struct stat *st)
+{
+    if (atomic_load(&semantic_fstat_error)) { errno = EIO; return -1; }
+    return __real_fstat(fd, st);
+}
+ssize_t __real_pread(int, void *, size_t, off_t);
+ssize_t __wrap_pread(int fd, void *bytes, size_t size, off_t off)
+{
+    int mode = atomic_load(&semantic_pread_mode);
+    if (mode && off == semantic_pread_offset) {
+        atomic_store(&semantic_pread_mode, 0);
+        if (mode == 1) return 0; /* Premature EOF without a stat change. */
+        ssize_t n = __real_pread(fd, bytes, size, off);
+        int writer = open(semantic_source, O_WRONLY);
+        EDIT_ASSERT(writer >= 0 && pwrite(writer, "changed", 7, 0) == 7);
+        struct timespec times[2] = {{1200000000, 0}, {1200000000, 0}};
+        EDIT_ASSERT(futimens(writer, times) == 0); close(writer);
+        return n; /* Rewriting an already copied chunk must fail post-validation. */
+    }
+    return __real_pread(fd, bytes, size, off);
+}
+/* gcc's fortified prefix reads use this ABI instead of pread. Exercise the
+ * same injection oracle in both builds; keep the capacity check explicit. */
+ssize_t __wrap___pread_chk(int fd, void *bytes, size_t size, off_t off, size_t capacity)
+{
+    EDIT_ASSERT(size <= capacity);
+    return __wrap_pread(fd, bytes, size, off);
+}
+#endif
+#endif
+static void t_semantic_storage(void)
+{
+    const size_t sizes[] = {64, 4096, 65536, 1u << 20, 2u << 20, 3u << 20};
+    for (size_t sample = 0; sample < sizeof sizes / sizeof sizes[0]; sample++) {
+        size_t n = sizes[sample];
+        uint8_t *bytes = malloc(n); CHECK(bytes != NULL); memset(bytes, 'a', n);
+        write_file("storage", bytes, n); free(bytes);
+        char path[512]; path_of(path, sizeof path, "storage");
+#ifdef FILE_SEMANTICS_WRAP
+        pthread_mutex_lock(&semantic_alloc_lock);
+        semantic_counting = 1; semantic_peak = semantic_live = 0;
+        pthread_mutex_unlock(&semantic_alloc_lock);
+#endif
+        file *f = NULL; file_msg m;
+        CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK);
+        CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.status == FILE_OK);
+        piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+        piece_iter it; const uint8_t *first = NULL; size_t first_len = 0, prefix_len = 0;
+        piece_iter_begin(&it, tree, 0); CHECK(piece_iter_next(&it, &first, &first_len));
+        CHECK(file_prefix(f, &prefix_len) == first && prefix_len == (n < FILE_PREFIX_MAX ? n : FILE_PREFIX_MAX));
+#ifdef FILE_SEMANTICS_WRAP
+        size_t bound = n + n / 4u + 65536u + 4096u + 96u * (size_t)piece_piece_count(tree);
+#endif
+        piece_snapshot *snap = piece_snapshot_take(tree); CHECK(snap != NULL);
+        file_close(f); piece_destroy(tree);
+        uint8_t got = 0; CHECK(piece_snapshot_read(snap, n - 1, &got, 1) == PIECE_OK && got == 'a');
+        piece_snapshot_release(snap);
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+#ifdef FILE_SEMANTICS_WRAP
+        pthread_mutex_lock(&semantic_alloc_lock);
+        if (semantic_peak > bound) fprintf(stderr, "finding17 storage: size=%zu peak=%zu bound=%zu\n", n, semantic_peak, bound);
+        CHECK(semantic_peak <= bound);
+        CHECK(semantic_live == 0);
+        semantic_counting = 0;
+        pthread_mutex_unlock(&semantic_alloc_lock);
+#endif
+    }
+}
+static int semantic_open_terminal(file_msg *out)
+{
+    for (unsigned i = 0; i < 5000; i++) {
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+        for (size_t j = 0; j < c.n; j++) if (c.m[j].kind == FILE_MSG_OPEN_READY || c.m[j].kind == FILE_MSG_OPEN_FAILED) {
+            *out = c.m[j]; return 1;
+        }
+        sleep_ms(1);
+    }
+    return 0;
+}
+static void t_semantic_open_version(void)
+{
+    for (unsigned mapped = 0; mapped < 2; mapped++) for (unsigned change = 0; change < 3; change++) {
+        size_t n = 3u << 20; uint8_t *bytes = malloc(n); memset(bytes, 'a', n);
+        write_file("open-version", bytes, n); free(bytes);
+        char path[512], other[512]; path_of(path, sizeof path, "open-version"); path_of(other, sizeof other, "open-new");
+        (void)start_blocker();
+        file_open_opts opts = {mapped ? 1 : 4u << 20, 18};
+        file *f = NULL; file_msg m;
+        CHECK(file_open_begin(&pool, path, &opts, &f) == FILE_OK);
+        CHECK(wait_msg(FILE_MSG_PREFIX_READY, &m) && m.status == FILE_OK);
+        CHECK(!file_open_ready(f));
+        if (change == 0) CHECK(truncate(path, 8192) == 0);
+        else if (change == 1) {
+            struct stat original; CHECK(stat(path, &original) == 0);
+            int fd = open(path, O_WRONLY); CHECK(fd >= 0 && pwrite(fd, "b", 1, 0) == 1); close(fd);
+            struct timespec ts[2] = {original.st_atim, original.st_mtim};
+            CHECK(utimensat(AT_FDCWD, path, ts, 0) == 0);
+        } else {
+            write_file("open-new", (const uint8_t *)"replacement", 11); CHECK(rename(other, path) == 0);
+        }
+        atomic_store(&blocker_go, 1);
+        CHECK(semantic_open_terminal(&m) && m.kind == FILE_MSG_OPEN_FAILED && m.status == FILE_ERR_CHANGED);
+        CHECK(!file_open_ready(f) && !file_prefix_ready(f) && file_changed(f));
+        size_t len = 99; CHECK(file_prefix(f, &len) == NULL && len == 0);
+        piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_ERR_STATE);
+        piece_destroy(tree); file_close(f);
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+    }
+}
+static void t_semantic_keep_missing(void)
+{
+    char path[512]; path_of(path, sizeof path, "keep-missing");
+    write_file("keep-missing", (const uint8_t *)"original\n", 9);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_OPEN_READY, &m)); piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+    CHECK(unlink(path) == 0 && file_check(f, NULL) == 1);
+    CHECK(file_resolve_keep(f) == FILE_OK && !file_changed(f));
+    uint32_t reasons = 99;
+    CHECK(file_check(f, &reasons) == 0 && reasons == FILE_CHG_NONE);
+    CHECK(file_save_begin(f, tree, 0, 19) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK);
+    review_wait_save(f); uint8_t got[9]; CHECK(read_file("keep-missing", got, 9) == 9 && memcmp(got, "original\n", 9) == 0);
+    piece_destroy(tree); file_close(f);
+}
+static void t_semantic_keep_stat_error(void)
+{
+    char parent[512], moved[512], path[600];
+    path_of(parent, sizeof parent, "keep-parent"); path_of(moved, sizeof moved, "keep-moved");
+    CHECK(mkdir(parent, 0700) == 0); snprintf(path, sizeof path, "%s/source", parent);
+    int fd = open(path, O_WRONLY | O_CREAT, 0600); CHECK(fd >= 0 && write(fd, "old", 3) == 3); close(fd);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    CHECK(rename(parent, moved) == 0 && symlink("keep-parent", parent) == 0);
+    CHECK(file_resolve_keep(f) == FILE_ERR_IO && file_errno(f) == ELOOP);
+    CHECK(unlink(parent) == 0 && rename(moved, parent) == 0);
+    CHECK(file_check(f, NULL) == 0 && !file_changed(f));
+    file_close(f); CHECK(unlink(path) == 0 && rmdir(parent) == 0);
+}
+static void t_semantic_keep_generations(void)
+{
+    for (unsigned mapped = 0; mapped < 2; mapped++) for (unsigned change = 0; change < 3; change++) {
+        /* Private originals survive every disk change. A mapped original
+         * survives unlink/rename-over, but not in-place truncation. */
+        if (mapped && change == 2) continue;
+        char path[512], other[512];
+        path_of(path, sizeof path, "keep-generation"); path_of(other, sizeof other, "keep-replacement");
+        uint8_t original[16384]; memset(original, 'x', sizeof original); original[8192] = '\n';
+        write_file("keep-generation", original, sizeof original); CHECK(chmod(path, 0600) == 0);
+        file_open_opts opts = {mapped ? 1 : 1u << 20, 19};
+        file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, &opts, &f) == FILE_OK);
+        CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.status == FILE_OK);
+        piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+        piece_snapshot *snap = piece_snapshot_take(tree); CHECK(snap != NULL);
+        CHECK(piece_insert(tree, 0, (const uint8_t *)"edit\n", 5) == PIECE_OK);
+        if (change == 0) CHECK(unlink(path) == 0);
+        else if (change == 1) {
+            write_file("keep-replacement", (const uint8_t *)"other", 5); CHECK(rename(other, path) == 0);
+        } else CHECK(truncate(path, 4096) == 0);
+        CHECK(file_check(f, NULL) == 1 && file_resolve_keep(f) == FILE_OK);
+        CHECK(!file_changed(f) && file_check(f, NULL) == 0);
+        CHECK(file_save_begin(f, tree, 0, 19) == FILE_OK);
+        CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK); review_wait_save(f);
+        uint8_t saved[sizeof original + 5];
+        CHECK(read_file("keep-generation", saved, sizeof saved) == sizeof saved);
+        CHECK(memcmp(saved, "edit\n", 5) == 0 && memcmp(saved + 5, original, sizeof original) == 0);
+        if (change == 0) { struct stat st; CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0600); }
+        file_close(f); piece_destroy(tree);
+        uint8_t retained[sizeof original];
+        CHECK(piece_snapshot_read(snap, 0, retained, sizeof retained) == PIECE_OK && memcmp(retained, original, sizeof original) == 0);
+        CHECK(piece_snapshot_line_count(snap) == 2);
+        piece_snapshot_release(snap);
+    }
+}
+static void t_semantic_keep_backing_error(void)
+{
+#if defined(FILE_SEMANTICS_WRAP) && !defined(FILE_REVIEW_WRAP)
+    piece_tree *tree; file *f = review_map("keep-backing-error", &tree, 16384);
+    atomic_store(&semantic_fstat_error, 1);
+    CHECK(file_resolve_keep(f) == FILE_ERR_IO && file_errno(f) == EIO);
+    atomic_store(&semantic_fstat_error, 0);
+    CHECK(file_check(f, NULL) == 0 && !file_changed(f));
+    piece_destroy(tree); file_close(f);
+#endif
+}
+static void t_semantic_keep_restored_version(void)
+{
+    piece_tree *tree; file *f = review_map("keep-restored-version", &tree, 16384);
+    char path[512]; path_of(path, sizeof path, "keep-restored-version");
+    struct stat original; CHECK(stat(path, &original) == 0);
+    piece_snapshot *snap = piece_snapshot_take(tree); CHECK(snap != NULL);
+    CHECK(piece_line_count(tree) == 8193 && piece_snapshot_line_count(snap) == 8193);
+    uint8_t rewritten[64]; memset(rewritten, 'x', sizeof rewritten);
+    int fd = open(path, O_WRONLY); CHECK(fd >= 0);
+    struct timespec times[2] = {original.st_atim, original.st_mtim};
+    int advanced = 0;
+    /* Timestamp granularity can coalesce a fast rewrite with acquisition.
+     * Establish the changed-version premise, rather than timing the test. */
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        CHECK(pwrite(fd, rewritten, sizeof rewritten, 0) == (ssize_t)sizeof rewritten);
+        CHECK(futimens(fd, times) == 0);
+        struct stat observed; CHECK(fstat(fd, &observed) == 0);
+        if (observed.st_ctim.tv_sec != original.st_ctim.tv_sec ||
+            observed.st_ctim.tv_nsec != original.st_ctim.tv_nsec) { advanced = 1; break; }
+        sleep_ms(1);
+    }
+    CHECK(advanced); close(fd);
+    uint8_t got[64];
+    CHECK(piece_snapshot_read(snap, 0, got, sizeof got) == PIECE_OK && memcmp(got, rewritten, sizeof got) == 0);
+    CHECK(piece_snapshot_line_count(snap) == 8193); /* cached counts are now stale */
+    CHECK(file_check(f, NULL) == 1);
+    CHECK(file_resolve_keep(f) == FILE_ERR_CHANGED && file_changed(f));
+    CHECK(file_save_begin(f, tree, 0, 19) == FILE_ERR_CHANGED);
+    piece_snapshot_release(snap); piece_destroy(tree); file_close(f);
+}
+static void t_semantic_sticky(void)
+{
+    write_file("sticky-check", (const uint8_t *)"old", 3);
+    char path[512]; path_of(path, sizeof path, "sticky-check");
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    struct stat st; CHECK(stat(path, &st) == 0);
+    struct timespec ts[2] = {st.st_atim, {1200000000, 0}};
+    CHECK(utimensat(AT_FDCWD, path, ts, 0) == 0 && file_check(f, NULL) == 1);
+    ts[1] = st.st_mtim; CHECK(utimensat(AT_FDCWD, path, ts, 0) == 0);
+    CHECK(file_check(f, NULL) == 1 && file_changed(f));
+    CHECK(file_resolve_keep(f) == FILE_OK && file_check(f, NULL) == 0);
+    file_close(f);
+}
+static void semantic_watch_drain(file *f)
+{
+    for (unsigned i = 0; i < 30; i++) {
+        (void)file_watch_poll(f); coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c); sleep_ms(1);
+    }
+}
+static void t_semantic_watch_keep(void)
+{
+    char path[512], other[512]; path_of(path, sizeof path, "watch-keep"); path_of(other, sizeof other, "watch-new");
+    write_file("watch-keep", (const uint8_t *)"old", 3);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    int watch = file_watch_start(f); CHECK(watch >= 0);
+    write_file("watch-new", (const uint8_t *)"new", 3); CHECK(rename(other, path) == 0);
+    semantic_watch_drain(f); CHECK(file_changed(f));
+    CHECK(file_resolve_keep(f) == FILE_OK); semantic_watch_drain(f); CHECK(!file_changed(f));
+    int fd = open(path, O_WRONLY | O_APPEND); CHECK(fd >= 0 && write(fd, "!", 1) == 1); close(fd);
+    struct pollfd pf = {watch, POLLIN, 0}; CHECK(poll(&pf, 1, 1000) == 1);
+    semantic_watch_drain(f); CHECK(file_changed(f)); file_close(f);
+}
+static void t_semantic_metadata(void)
+{
+    char path[512]; path_of(path, sizeof path, "metadata");
+    write_file("metadata", (const uint8_t *)"old", 3); CHECK(chmod(path, 0644) == 0);
+    CHECK(setxattr(path, "user.p17e", "retained", 8, 0) == 0);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+    struct stat before; CHECK(stat(path, &before) == 0);
+    CHECK(chmod(path, 0600) == 0);
+    CHECK(file_save_begin(f, tree, 0, 22) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED); review_wait_save(f);
+    struct stat st; CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0600);
+    CHECK(file_resolve_keep(f) == FILE_OK);
+    CHECK(file_save_begin(f, tree, 0, 23) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK); review_wait_save(f);
+    char attr[16]; CHECK(getxattr(path, "user.p17e", attr, sizeof attr) == 8 && memcmp(attr, "retained", 8) == 0);
+    CHECK(stat(path, &st) == 0 && st.st_uid == before.st_uid && st.st_gid == before.st_gid && (st.st_mode & 07777) == 0600);
+    CHECK(chmod(path, 0) == 0 && file_resolve_keep(f) == FILE_OK);
+    CHECK(file_save_begin(f, tree, 0, 24) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_IO && m.err_no == EACCES); review_wait_save(f);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0);
+    piece_destroy(tree); file_close(f); CHECK(chmod(path, 0600) == 0);
+}
+static void t_semantic_symlink_swap(void)
+{
+    char path[512], other[512]; path_of(path, sizeof path, "entry"); path_of(other, sizeof other, "entry-hard");
+    write_file("entry", (const uint8_t *)"old", 3);
+    CHECK(link(path, other) == 0);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+    CHECK(unlink(path) == 0 && symlink("entry-hard", path) == 0);
+    CHECK(file_save_begin(f, tree, 0, 23) == FILE_OK);
+    CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_CHANGED); review_wait_save(f);
+    struct stat st; CHECK(lstat(path, &st) == 0 && S_ISLNK(st.st_mode));
+    CHECK(file_check(f, NULL) == 1);
+    piece_destroy(tree); file_close(f);
+}
+
+static void t_semantic_new_zero_mode(void)
+{
+    char path[512]; path_of(path, sizeof path, "zero-new");
+    piece_tree *tree = new_tree(); CHECK(piece_init_copy(tree, (const uint8_t *)"new", 3) == PIECE_OK);
+    piece_snapshot *snap = piece_snapshot_take(tree); CHECK(snap != NULL);
+    file_save_args args = {.path = path, .snap = snap, .mode = 0, .mode_valid = 1};
+    CHECK(file_save_write(&args) == FILE_OK);
+    struct stat st; CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0);
+    CHECK(chmod(path, 0600) == 0);
+    piece_snapshot_release(snap); piece_destroy(tree);
+}
+static void t_semantic_symlink_force(void)
+{
+    char path[512], other[512]; path_of(path, sizeof path, "entry-force"); path_of(other, sizeof other, "entry-force-hard");
+    write_file("entry-force", (const uint8_t *)"old", 3); CHECK(link(path, other) == 0);
+    CHECK(unlink(path) == 0 && symlink("entry-force-hard", path) == 0);
+    piece_tree *tree = new_tree(); CHECK(piece_init_copy(tree, (const uint8_t *)"new", 3) == PIECE_OK);
+    piece_snapshot *snap = piece_snapshot_take(tree);
+    file_save_args args = {.path = path, .snap = snap}; /* FORCE/no baseline still preserves links. */
+    CHECK(file_save_write(&args) == FILE_ERR_CHANGED);
+    struct stat st; CHECK(lstat(path, &st) == 0 && S_ISLNK(st.st_mode));
+    uint8_t got[3]; CHECK(read_file("entry-force-hard", got, 3) == 3 && memcmp(got, "old", 3) == 0);
+    piece_snapshot_release(snap); piece_destroy(tree);
+}
+static void t_semantic_mapped_keep_proposal(void)
+{
+    piece_tree *tree; file *f = review_map("keep-damaged", &tree, 16384);
+    char path[512]; path_of(path, sizeof path, "keep-damaged");
+    piece_snapshot *snap = piece_snapshot_take(tree);
+    CHECK(truncate(path, 4096) == 0);
+    uint8_t got; CHECK(piece_snapshot_read(snap, 8192, &got, 1) == PIECE_OK && got == 0);
+    CHECK(file_check(f, NULL) == 1);
+    CHECK(file_resolve_keep(f) == FILE_OK && !file_changed(f)); /* Proposed generation API oracle. */
+    piece_snapshot_release(snap); piece_destroy(tree); file_close(f);
+}
+
+
+static void t_semantic_watch_refresh_error(void)
+{
+    char parent[512], moved[512], path[600]; path_of(parent, sizeof parent, "watch-parent"); path_of(moved, sizeof moved, "watch-moved");
+    CHECK(mkdir(parent, 0700) == 0); snprintf(path, sizeof path, "%s/target", parent);
+    int fd = open(path, O_CREAT | O_WRONLY, 0600); CHECK(fd >= 0 && write(fd, "old", 3) == 3); close(fd);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    CHECK(file_watch_start(f) >= 0 && rename(parent, moved) == 0);
+    semantic_watch_drain(f);
+    CHECK(file_watch_start(f) == -1);
+    CHECK(file_watch_start(f) == -1); /* Existing fd must not imply active watch. */
+    CHECK(rename(moved, parent) == 0 && file_watch_start(f) >= 0);
+    CHECK(file_resolve_keep(f) == FILE_OK); semantic_watch_drain(f); CHECK(!file_changed(f));
+    fd = open(path, O_WRONLY | O_APPEND); CHECK(fd >= 0 && write(fd, "!", 1) == 1); close(fd);
+    semantic_watch_drain(f); CHECK(file_changed(f));
+    file_close(f); CHECK(unlink(path) == 0 && rmdir(parent) == 0);
+}
+static void t_semantic_acl(void)
+{
+    /* Linux POSIX ACL wire format: owner, named user, group, mask, other.
+     * Use a mapped uid even in a single-uid sandbox. The extended ACL and its
+     * mask must survive replacement exactly. */
+    uint8_t acl[] = {
+        2,0,0,0, 1,0,6,0,255,255,255,255, 2,0,4,0,254,255,0,0,
+        4,0,0,0,255,255,255,255, 16,0,4,0,255,255,255,255, 32,0,0,0,255,255,255,255
+    };
+    uint32_t uid = (uint32_t)getuid();
+    for (unsigned i = 0; i < 4; i++) acl[16u + i] = (uint8_t)(uid >> (8u * i));
+    char path[512]; path_of(path, sizeof path, "acl"); write_file("acl", (const uint8_t *)"old", 3);
+    CHECK(setxattr(path, "system.posix_acl_access", acl, sizeof acl, 0) == 0);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+    CHECK(file_save_begin(f, tree, 0, 22) == FILE_OK); CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_OK); review_wait_save(f);
+    uint8_t got[sizeof acl]; CHECK(getxattr(path, "system.posix_acl_access", got, sizeof got) == (ssize_t)sizeof acl && memcmp(got, acl, sizeof acl) == 0);
+    piece_destroy(tree); file_close(f);
+}
+static void t_semantic_wrapped_metadata_error(void)
+{
+#ifdef FILE_SEMANTICS_WRAP
+    char path[512]; path_of(path, sizeof path, "xattr-error"); write_file("xattr-error", (const uint8_t *)"old", 3);
+    CHECK(setxattr(path, "user.p17e", "retained", 8, 0) == 0);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, path, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    piece_tree *tree = new_tree(); CHECK(file_attach(f, tree) == FILE_OK);
+    struct stat before, after; CHECK(stat(path, &before) == 0);
+    atomic_store(&semantic_xattr_error, EPERM);
+    CHECK(file_save_begin(f, tree, 0, 22) == FILE_OK); CHECK(wait_msg(FILE_MSG_SAVE_DONE, &m) && m.status == FILE_ERR_IO && m.err_no == EPERM);
+    review_wait_save(f); atomic_store(&semantic_xattr_error, 0);
+    CHECK(file_errno(f) == EPERM && stat(path, &after) == 0 && after.st_ino == before.st_ino);
+    uint8_t got[3]; CHECK(read_file("xattr-error", got, 3) == 3 && memcmp(got, "old", 3) == 0);
+    CHECK(count_temps(".xattr-error.edit-") == 0);
+    piece_destroy(tree); file_close(f);
+#endif
+}
+static void t_semantic_wrapped_sticky(void)
+{
+#ifdef FILE_SEMANTICS_WRAP
+    path_of(semantic_source, sizeof semantic_source, "sticky-exact"); write_file("sticky-exact", (const uint8_t *)"old", 3);
+    file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, semantic_source, NULL, &f) == FILE_OK); CHECK(wait_msg(FILE_MSG_OPEN_READY, &m));
+    CHECK(stat(semantic_source, &semantic_original_stat) == 0);
+    struct timespec times[2] = {semantic_original_stat.st_atim, {1200000000, 0}};
+    CHECK(utimensat(AT_FDCWD, semantic_source, times, 0) == 0 && file_check(f, NULL) == 1);
+    atomic_store(&semantic_restore_stat, 1); uint32_t reasons = 99;
+    CHECK(file_check(f, &reasons) == 1 && reasons == FILE_CHG_NONE && file_changed(f));
+    atomic_store(&semantic_restore_stat, 0); file_close(f);
+#endif
+}
+static void t_semantic_wrapped_acquisition(void)
+{
+#if defined(FILE_SEMANTICS_WRAP) && !defined(FILE_REVIEW_WRAP)
+    path_of(semantic_source, sizeof semantic_source, "acquire-injected");
+    for (unsigned phase = 0; phase < 2; phase++) for (int action = 1; action <= 2; action++) {
+        size_t n = 3u << 20; uint8_t *data = malloc(n); memset(data, 'a', n); write_file("acquire-injected", data, n); free(data);
+        semantic_pread_offset = phase ? FILE_PREFIX_MAX : 65536;
+        atomic_store(&semantic_pread_mode, action);
+        file *f = NULL; file_msg m; CHECK(file_open_begin(&pool, semantic_source, NULL, &f) == FILE_OK);
+        CHECK(semantic_open_terminal(&m) && m.kind == FILE_MSG_OPEN_FAILED && m.status == FILE_ERR_CHANGED);
+        CHECK(atomic_load(&semantic_pread_mode) == 0);
+        CHECK(!file_open_ready(f) && !file_prefix_ready(f) && file_changed(f));
+        size_t len = 99; CHECK(file_prefix(f, &len) == NULL && len == 0);
+        atomic_store(&semantic_pread_mode, 0); file_close(f);
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+    }
+#endif
+}
+static void t_semantic_open_entry_race(void)
+{
+#if defined(FILE_SEMANTICS_WRAP) && !defined(FILE_REVIEW_WRAP)
+    char hard[512]; path_of(hard, sizeof hard, "acquire-name-hard");
+    path_of(semantic_source, sizeof semantic_source, "acquire-name");
+    for (int action = 1; action <= 2; action++) {
+        write_file("acquire-name", (const uint8_t *)"original", 8);
+        CHECK(link(semantic_source, hard) == 0);
+        atomic_store(&semantic_pread_mode, action + 2);
+        file *f = NULL; file_msg m;
+        CHECK(file_open_begin(&pool, semantic_source, NULL, &f) == FILE_OK);
+        CHECK(semantic_open_terminal(&m) && m.kind == FILE_MSG_OPEN_FAILED && m.status == FILE_ERR_CHANGED);
+        CHECK(atomic_load(&semantic_pread_mode) == 0);
+        CHECK(file_changed(f) && !file_open_ready(f) && !file_prefix_ready(f));
+        size_t n = 99; CHECK(file_prefix(f, &n) == NULL && n == 0);
+        struct stat st;
+        if (action == 2) CHECK(lstat(semantic_source, &st) == 0 && S_ISLNK(st.st_mode));
+        file_close(f); CHECK(unlink(hard) == 0);
+        if (action == 2) CHECK(unlink(semantic_source) == 0);
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+    }
+#endif
+}
+static int semantic_dispatch(const char *which)
+{
+    if (strcmp(which, "17") == 0) review_run("finding17", t_semantic_storage);
+    else if (strcmp(which, "18") == 0) { review_run("finding18", t_semantic_open_version); review_run("finding18 injected reads", t_semantic_wrapped_acquisition); review_run("finding18 entry race", t_semantic_open_entry_race); }
+    else if (strcmp(which, "19") == 0) { review_run("finding19 missing", t_semantic_keep_missing); review_run("finding19 I/O", t_semantic_keep_stat_error); review_run("finding19 intact generations", t_semantic_keep_generations); review_run("finding19 backing I/O", t_semantic_keep_backing_error); review_run("finding19 restored version", t_semantic_keep_restored_version); }
+    else if (strcmp(which, "20") == 0) { review_run("finding20", t_semantic_sticky); review_run("finding20 exact baseline", t_semantic_wrapped_sticky); }
+    else if (strcmp(which, "21") == 0) { review_run("finding21", t_semantic_watch_keep); review_run("finding21 refresh failure", t_semantic_watch_refresh_error); }
+    else if (strcmp(which, "22") == 0) { review_run("finding22", t_semantic_metadata); review_run("finding22 explicit 0000", t_semantic_new_zero_mode); review_run("finding22 ACL", t_semantic_acl); review_run("finding22 preservation error", t_semantic_wrapped_metadata_error); }
+    else if (strcmp(which, "23") == 0) { review_run("finding23", t_semantic_symlink_swap); review_run("finding23 FORCE", t_semantic_symlink_force); }
+    else if (strcmp(which, "19mapped") == 0) review_run("finding19 mapped proposal", t_semantic_mapped_keep_proposal);
+    else return 0;
+    return 1;
+}
+
 int main(void)
 {
     const char *base = getenv("TMPDIR");
@@ -1363,7 +1890,8 @@ int main(void)
 
     const char *review_case = getenv("FT_CASE");
     if (review_case) {
-        if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
+        if (semantic_dispatch(review_case)) {}
+        else if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
         else if (strcmp(review_case, "1") == 0) review_run("finding1", t_review_registry);
         else if (strcmp(review_case, "2") == 0) review_run("finding2", t_review_signal_chaining);
         else if (strcmp(review_case, "3") == 0) review_run("finding3", t_review_ui_publication);
@@ -1465,6 +1993,10 @@ int main(void)
     review_run("finding25", t_latency_writes);
     review_run("finding31", t_latency_errno);
     review_run("finding32", t_latency_watch);
+
+    for (unsigned section = 17; section <= 23; section++) {
+        char which[8]; snprintf(which, sizeof which, "%u", section); (void)semantic_dispatch(which);
+    }
 
 finish:
     work_pool_shutdown(&pool);

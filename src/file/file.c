@@ -14,6 +14,7 @@
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -294,7 +295,8 @@ static void map_release(void *ctx)
  * only after receiving SAVE_PREPARED; no descriptor operation is done by decode. */
 typedef struct save_transaction {
     file_save_args args;
-    int fd, dfd;
+    int fd, dfd, metadata_fd;
+    file_id metadata_id;
     char base[NAME_MAX + 1], tmp[NAME_MAX + 1];
     uint64_t done;
 } save_transaction;
@@ -318,8 +320,6 @@ struct file {
     uint64_t size;
 
     /* UI-owned content. Workers publish separate immutable result records. */
-    uint8_t *data;                /* copy mode buffer */
-    size_t data_len;
     file_map *map;                /* owned reference of the file object */
     _Atomic int ready;            /* 1 = content ready for attach */
     int attached;
@@ -340,8 +340,6 @@ struct file {
     int open_status;
     _Atomic int open_fin;         /* 1 when no open job is pending */
     struct {
-        uint8_t *data;
-        size_t data_len;
         file_map *map;
         int status, err_no;
     } open_result;
@@ -353,6 +351,7 @@ struct file {
     int changed;
     int ifd, iwd;
     int watch_refresh;
+    char watch_name[NAME_MAX + 1];
     uint64_t source_generation;
     void (*step)(void *, int);    /* UI-owned hooks, captured at submit */
     void *step_ctx;
@@ -360,7 +359,7 @@ struct file {
     work_handle check_h;
     _Atomic int check_fin, check_result_ready;
     int check_installed, check_requested;
-    struct { file_id observed; uint32_t map_reasons; uint64_t generation; } check_result;
+    struct { file_id observed; uint32_t map_reasons; uint64_t generation; int status, err_no; } check_result;
     struct { file_map *map; uint64_t generation; } check;
 
     struct {
@@ -402,6 +401,7 @@ static void save_commit_job(work_ctx *c);
 static void save_commit_pump(file *f);
 static void invalidate_save(file *f);
 static void save_abort_pump(file *f);
+static void split_path(const char *path, char *dir, size_t dn, char *base, size_t bn);
 
 uint64_t file_default_copy_threshold(void)
 {
@@ -506,23 +506,54 @@ static void id_from_stat(file_id *id, const struct stat *st)
     id->mtime_ns = mtime_ns(st);
     id->mode = (uint32_t)(st->st_mode & 07777);
     id->exists = 1;
+    id->ctime_ns = (uint64_t)st->st_ctim.tv_sec * 1000000000ull + (uint64_t)st->st_ctim.tv_nsec;
+    id->uid = (uint32_t)st->st_uid; id->gid = (uint32_t)st->st_gid;
+    id->metadata_valid = 1; id->type = (uint32_t)(st->st_mode & S_IFMT);
 }
 
 static uint32_t id_diff(const file_id *a, const file_id *b)
 {
     uint32_t r = 0;
-    if (!b->exists) return FILE_CHG_GONE;
+    if (!b->exists) return a->exists ? FILE_CHG_GONE : FILE_CHG_NONE;
+    if (!a->exists) return FILE_CHG_INODE;
     if (a->ino != b->ino || a->dev != b->dev) r |= FILE_CHG_INODE;
     if (a->size != b->size) r |= FILE_CHG_SIZE;
     if (a->mtime_ns != b->mtime_ns) r |= FILE_CHG_MTIME;
+    if (a->metadata_valid && b->metadata_valid && a->type != b->type) r |= FILE_CHG_TYPE;
+    if (a->mode != b->mode || (a->metadata_valid && b->metadata_valid &&
+        (a->uid != b->uid || a->gid != b->gid || a->ctime_ns != b->ctime_ns))) r |= FILE_CHG_METADATA;
     return r;
 }
 
-static void id_stat_path(const char *path, file_id *id)
+static int id_stat_path(const char *path, file_id *id)
 {
     struct stat st;
-    memset(id, 0, sizeof *id);
-    if (stat(path, &st) == 0) id_from_stat(id, &st);
+    if (lstat(path, &st) == 0) { id_from_stat(id, &st); return FILE_OK; }
+    if (errno == ENOENT || errno == ENOTDIR) {
+        memset(id, 0, sizeof *id); return FILE_OK;
+    }
+    return FILE_ERR_IO; /* Never turn EACCES/EIO/ELOOP into an accepted absence. */
+}
+
+/* Acquisition is optimistic: validate descriptor AND name around every phase.
+ * ctime catches rewrites even if a writer restores mtime. No filesystem offers
+ * an atomic stat/read transaction; the final-validation-to-publication race
+ * remains, and mapped originals remain externally mutable (P1.7c s5). */
+static int acquisition_validate(int fd, const char *path, const file_id *expected, int *en)
+{
+    struct stat st;
+    file_id now;
+    if (fstat(fd, &st) != 0) { *en = errno; return FILE_ERR_IO; }
+    id_from_stat(&now, &st);
+    if (id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns) return FILE_ERR_CHANGED;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return FILE_ERR_CHANGED;
+        *en = errno; return FILE_ERR_IO;
+    }
+    id_from_stat(&now, &st);
+    if (!S_ISREG(st.st_mode) || id_diff(expected, &now) || expected->ctime_ns != now.ctime_ns)
+        return FILE_ERR_CHANGED;
+    return FILE_OK;
 }
 
 /* ---------------- open ---------------- */
@@ -537,16 +568,28 @@ static void prefix_job(work_ctx *c)
         en = errno; rc = FILE_ERR_IO; goto done;
     }
     /* NONBLOCK is required before fstat: FIFOs must not await a writer. */
-    fd = open(f->prefix_result.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0 || fstat(fd, &st) != 0) { en = errno; rc = FILE_ERR_IO; goto done; }
+    fd = open(f->prefix_result.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        en = errno;
+        /* realpath just established this canonical entry. Disappearance or a
+         * new symlink invalidates that acquisition, including before reads. */
+        rc = en == ENOENT || en == ENOTDIR || en == ELOOP ? FILE_ERR_CHANGED : FILE_ERR_IO;
+        goto done;
+    }
+    if (fstat(fd, &st) != 0) { en = errno; rc = FILE_ERR_IO; goto done; }
     if (!S_ISREG(st.st_mode)) { rc = FILE_ERR_NOTREG; goto done; }
     if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX) { en = EFBIG; rc = FILE_ERR_IO; goto done; }
     id_from_stat(&f->prefix_result.id, &st);
     uint64_t threshold = f->threshold ? f->threshold : file_default_copy_threshold();
     f->prefix_result.mode = ((uint64_t)st.st_size < threshold || st.st_size == 0)
                            ? FILE_MODE_COPY : FILE_MODE_MMAP;
+    rc = acquisition_validate(fd, f->prefix_result.path, &f->prefix_result.id, &en);
+    if (rc != FILE_OK) goto done;
     size_t want = (uint64_t)st.st_size < FILE_PREFIX_MAX ? (size_t)st.st_size : FILE_PREFIX_MAX;
-    bytes = malloc(want ? want : 1);
+    /* COPY owns one allocation from acquisition through tree/snapshot release.
+     * The published prefix aliases its head; BULK fills only the suffix. */
+    size_t capacity = f->prefix_result.mode == FILE_MODE_COPY ? (size_t)st.st_size : want;
+    bytes = malloc(capacity ? capacity : 1);
     if (!bytes) { rc = FILE_ERR_NOMEM; goto done; }
     size_t off = 0;
     while (off < want) {
@@ -557,7 +600,7 @@ static void prefix_job(work_ctx *c)
         if (n > 65536u) n = 65536u;
         ssize_t got = pread(fd, bytes + off, n, (off_t)off);
         if (got < 0) { if (errno == EINTR) continue; en = errno; rc = FILE_ERR_IO; goto done; }
-        if (got == 0) break;
+        if (got == 0) { rc = FILE_ERR_CHANGED; goto done; }
         off += (size_t)got;
     }
     f->prefix_result.len = off;
@@ -577,10 +620,12 @@ static void prefix_job(work_ctx *c)
     info.dominant = info.crlf > info.lf ? FILE_EOL_CRLF : FILE_EOL_LF;
     info.has_bom = off >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
     f->prefix_result.info = info;
+    rc = acquisition_validate(fd, f->prefix_result.path, &f->prefix_result.id, &en);
 done:
     if (rc != FILE_OK) {
         if (fd >= 0) close(fd);
         fd = -1; free(bytes); bytes = NULL;
+        f->prefix_result.len = 0;
     }
     f->prefix_result.fd = fd;
     f->prefix_result.bytes = bytes;
@@ -602,6 +647,8 @@ static void open_job(work_ctx *c)
     file *f = c->arg;
     int status = 0, en = 0;
     uint64_t avail = f->size;
+    status = acquisition_validate(f->fd, f->path, &f->open_identity, &en);
+    if (status != FILE_OK) goto done;
 
     if (f->mode == FILE_MODE_MMAP) {
         file_map *m = calloc(1, sizeof *m);
@@ -626,24 +673,25 @@ static void open_job(work_ctx *c)
         size_t pf = m->len < FILE_PREFETCH_MAX ? m->len : (size_t)FILE_PREFETCH_MAX;
         (void)madvise(m->addr, pf, MADV_WILLNEED);
     } else {
-        uint8_t *buf = malloc(f->size ? (size_t)f->size : 1);
-        size_t off = 0;
-        if (buf == NULL) { status = FILE_ERR_NOMEM; goto done; }
+        uint8_t *buf = f->prefix;
+        size_t off = f->prefix_len;
         while (off < f->size) {
             size_t want = (size_t)f->size - off;
             if (want > FILE_READ_CHUNK) want = FILE_READ_CHUNK;
-            if (work_should_stop(c)) { free(buf); status = FILE_ERR_CANCELLED; goto done; }
+            if (work_should_stop(c)) { status = FILE_ERR_CANCELLED; goto done; }
             ssize_t r = pread(f->fd, buf + off, want, (off_t)off);
             if (r < 0) { if (errno == EINTR) continue; en = errno; status = FILE_ERR_IO; break; }
-            if (r == 0) break;                    /* file shrank while reading */
+            if (r == 0) { status = FILE_ERR_CHANGED; break; }
             off += (size_t)r;
         }
-        if (status != 0) { free(buf); goto done; }
-        f->open_result.data = buf;
-        f->open_result.data_len = off;
+        if (status != 0) goto done;
         avail = off;
     }
+    status = acquisition_validate(f->fd, f->path, &f->open_identity, &en);
 done:
+    if (status != FILE_OK && f->open_result.map) {
+        map_release(f->open_result.map); f->open_result.map = NULL;
+    }
     f->open_result.err_no = en;
     f->open_result.status = status;
     atomic_store_explicit(&f->open_result_ready, 1, memory_order_release);
@@ -669,7 +717,7 @@ int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opt
     f->ifd = -1; f->iwd = -1;
     f->generation = opts ? opts->generation : 0;
     f->threshold = opts ? opts->copy_threshold : 0;
-    f->transaction.fd = -1; f->transaction.dfd = -1;
+    f->transaction.fd = -1; f->transaction.dfd = -1; f->transaction.metadata_fd = -1;
     atomic_init(&f->ready, 0);
     atomic_init(&f->open_fin, 1);
     atomic_init(&f->prefix_fin, 0);
@@ -735,9 +783,7 @@ void file_close(file *f)
     if (f->map) map_release(f->map);
     if (!f->open_installed && atomic_load_explicit(&f->open_result_ready, memory_order_acquire)) {
         if (f->open_result.map) map_release(f->open_result.map);
-        free(f->open_result.data);
     }
-    free(f->data);
     if (f->prefix_owned) free(f->prefix);
     if (!f->prefix_installed && atomic_load_explicit(&f->prefix_result_ready, memory_order_acquire)) {
         if (f->prefix_result.fd >= 0) close(f->prefix_result.fd);
@@ -766,34 +812,30 @@ int file_attach(file *f, piece_tree *t)
         file_map *m = calloc(1, sizeof *m);
         if (!m) return FILE_ERR_NOMEM;
         atomic_init(&m->refs, 1); m->fd = -1; m->slot = -1; m->private_copy = 1;
-        if (f->data) {
-            m->addr = f->data; m->len = f->data_len; f->data = NULL;
-        } else {
-            m->addr = f->prefix; m->len = f->prefix_len; f->prefix_owned = 0;
-        }
+        m->addr = f->prefix; m->len = (size_t)f->size; f->prefix_owned = 0;
         f->map = m;
     }
     piece_map_hooks h = { f->map, map_acquire, map_release };
     rc = piece_init_mapped(t, (const uint8_t *)f->map->addr, f->map->len, &h);
     if (rc != 0) return FILE_ERR_NOMEM;
     f->attached = 1;
-    free(f->data);
-    f->data = NULL;
     /* Source fd is released at off-path close; attachment performs no I/O. */
     return FILE_OK;
 }
 
 /* ---------------- change detection ---------------- */
-static uint32_t map_change(file_map *m)
+static uint32_t map_change(file_map *m, int *err_no, file_id *version)
 {
     uint32_t r = 0;
+    if (version) memset(version, 0, sizeof *version);
     if (m && m->fd >= 0) {
         struct stat st;
         if (fstat(m->fd, &st) == 0) {
             file_id now; id_from_stat(&now, &st);
-            r = id_diff(&m->identity, &now);
+            if (version) *version = now;
+            r = id_diff(&m->identity, &now) & ~FILE_CHG_METADATA;
             if ((uint64_t)st.st_size < (uint64_t)m->len) r |= FILE_CHG_TRUNCATED;
-        }
+        } else *err_no = errno;
     }
     if (m && guard_faulted(m->slot)) r |= FILE_CHG_TRUNCATED;
     return r;
@@ -803,9 +845,13 @@ static uint32_t check_now(file *f)
 {
     file_id now;
     uint32_t r;
-    id_stat_path(f->path, &now);
+    int en = 0;
+    if (id_stat_path(f->path, &now) != FILE_OK) {
+        f->err_no = errno; return FILE_CHG_NONE;
+    }
     r = id_diff(&f->id, &now);
-    r |= map_change(f->map);
+    r |= map_change(f->map, &en, NULL);
+    if (en) f->err_no = en;
     if (r && !f->changed) {
         f->changed = 1; f->source_generation++; invalidate_save(f);
     }
@@ -817,11 +863,11 @@ int file_check(file *f, uint32_t *reasons)
     uint32_t r;
     if (!f->prefix_installed || f->open_status != FILE_OK) {
         if (reasons) *reasons = 0;
-        return 0;
+        return file_changed(f);
     }
     r = check_now(f);
     if (reasons) *reasons = r;
-    return r != 0;
+    return file_changed(f);
 }
 
 int file_changed(const file *f)
@@ -834,43 +880,68 @@ int file_changed(const file *f)
 
 int file_resolve_keep(file *f)
 {
-    if (map_change(f->map)) {
+    file_id now;
+    int en = 0;
+    if (!file_prefix_ready(f)) return FILE_ERR_STATE;
+    if (id_stat_path(f->path, &now) != FILE_OK) { f->err_no = errno; return FILE_ERR_IO; }
+    if (now.exists && now.type != S_IFREG) return FILE_ERR_CHANGED;
+    file_id backing;
+    uint32_t backing_reasons = map_change(f->map, &en, &backing);
+    if (en) { f->err_no = en; return FILE_ERR_IO; }
+    /* A writer can restore mtime after changing bytes/newline counts. When
+     * the accepted pathname still names the mapped inode, ctime/metadata is
+     * an unvalidated backing version, even if size and mtime compare equal.
+     * Retired inodes acquire a new ctime from unlink/rename-over; those may
+     * still be kept while their actual bytes and fault epoch remain intact. */
+    if (f->map && backing.exists && now.exists && now.dev == backing.dev && now.ino == backing.ino)
+        backing_reasons |= id_diff(&f->map->identity, &backing) & FILE_CHG_METADATA;
+    if (backing_reasons) {
         if (!f->changed) { f->source_generation++; invalidate_save(f); }
         f->changed = 1;
         return FILE_ERR_CHANGED;
     }
-    id_stat_path(f->path, &f->id);
+    if (f->ifd >= 0) {
+        f->watch_refresh = 1;
+        if (file_watch_start(f) < 0) { f->err_no = errno; return FILE_ERR_IO; }
+    }
+    if (!now.exists) now.mode = f->id.mode; /* recreation retains last accepted mode */
+    f->id = now;
     f->source_generation++;
     f->changed = 0;
     invalidate_save(f);
     return FILE_OK;
 }
 
-static const uint32_t WATCH_MASK = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF;
+/* Watch the parent/name, which survives target deletion and rename-over.
+ * IN_IGNORED and moved/deleted parents make setup explicitly refreshable. */
+static const uint32_t WATCH_MASK = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE |
+    IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF;
 
 int file_watch_start(file *f)
 {
-    if (!file_prefix_ready(f)) return -1;
-    if (f->ifd >= 0) {
-        if (f->watch_refresh) {
-            if (f->iwd >= 0) (void)inotify_rm_watch(f->ifd, f->iwd);
-            f->iwd = inotify_add_watch(f->ifd, f->path, WATCH_MASK);
-            f->watch_refresh = f->iwd < 0;
-        }
-        return f->ifd;
+    if (!file_prefix_ready(f)) { errno = EINVAL; return -1; }
+    if (f->ifd >= 0 && f->iwd >= 0 && !f->watch_refresh) return f->ifd;
+    char dir[PATH_MAX];
+    split_path(f->path, dir, sizeof dir, f->watch_name, sizeof f->watch_name);
+    if (f->ifd < 0) {
+        f->ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (f->ifd < 0) return -1;
     }
-    f->ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (f->ifd < 0) return -1;
-    f->iwd = inotify_add_watch(f->ifd, f->path, WATCH_MASK);
-    if (f->iwd < 0) { close(f->ifd); f->ifd = -1; return -1; }
-    return f->ifd;
+    if (f->iwd >= 0) { (void)inotify_rm_watch(f->ifd, f->iwd); f->iwd = -1; }
+    f->iwd = inotify_add_watch(f->ifd, dir, WATCH_MASK | IN_ONLYDIR);
+    f->watch_refresh = f->iwd < 0;
+    /* Keep the fd for a later retry, but never claim an absent watch is active. */
+    return f->iwd < 0 ? -1 : f->ifd;
 }
 
 static void check_job(work_ctx *c)
 {
     file *f = c->arg;
-    id_stat_path(f->path, &f->check_result.observed);
-    f->check_result.map_reasons = map_change(f->check.map);
+    f->check_result.status = id_stat_path(f->path, &f->check_result.observed);
+    f->check_result.err_no = f->check_result.status == FILE_OK ? 0 : errno;
+    int en = 0;
+    f->check_result.map_reasons = map_change(f->check.map, &en, NULL);
+    if (en && !f->check_result.err_no) f->check_result.err_no = en;
     f->check_result.generation = f->check.generation;
     atomic_store_explicit(&f->check_result_ready, 1, memory_order_release);
     (void)post(c, FILE_MSG_CHECK_DONE, f, FILE_OK, 0, 0, 0, f->generation);
@@ -885,7 +956,22 @@ int file_watch_poll(file *f)
         /* One nonblocking buffer per call. Repeated EINTR and a continuous
          * alternating producer both return to the event loop. */
         ssize_t r = read(f->ifd, buf, sizeof buf);
-        got = r > 0;
+        size_t off = 0, count = r > 0 ? (size_t)r : 0;
+        while (count - off >= sizeof(struct inotify_event)) {
+            const struct inotify_event *event = (const struct inotify_event *)(const void *)(buf + off);
+            size_t length = sizeof *event + (size_t)event->len;
+            if (length > count - off) break;
+            if (event->mask & IN_Q_OVERFLOW) got = 1;
+            if (event->wd == f->iwd) {
+                if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                    if (event->mask & IN_IGNORED) f->iwd = -1;
+                    f->watch_refresh = 1; got = 1;
+                }
+                if (event->len == 0 || (strnlen(event->name, event->len) < event->len &&
+                    strcmp(event->name, f->watch_name) == 0)) got = 1;
+            }
+            off += length;
+        }
     }
     if (got) f->check_requested = 1;
     if (f->check_requested && f->check_installed &&
@@ -940,11 +1026,18 @@ static void file_sync(file *f, uint32_t kind)
     if ((kind == FILE_MSG_OPEN_READY || kind == FILE_MSG_OPEN_FAILED) &&
         !f->open_installed && atomic_load_explicit(&f->open_result_ready, memory_order_acquire)) {
         f->map = f->open_result.map;
-        f->data = f->open_result.data;
-        f->data_len = f->open_result.data_len;
         f->err_no = f->open_result.err_no;
         f->open_installed = 1;
-        if (f->open_result.status == FILE_OK) atomic_store(&f->ready, 1);
+        f->open_status = f->open_result.status;
+        if (f->open_status == FILE_OK) atomic_store(&f->ready, 1);
+        else {
+            if (f->prefix_owned) free(f->prefix);
+            f->prefix = NULL; f->prefix_len = 0;
+        }
+    }
+    if (kind == FILE_MSG_OPEN_FAILED && f->open_status == FILE_ERR_CHANGED) {
+        if (!f->changed) f->source_generation++;
+        f->changed = 1;
     }
     if ((kind == FILE_MSG_SAVE_DONE || kind == FILE_MSG_REPLACED) &&
         ((!f->save_installed && kind == FILE_MSG_SAVE_DONE && atomic_load_explicit(&f->save_result_ready, memory_order_acquire)) ||
@@ -964,7 +1057,9 @@ static void file_sync(file *f, uint32_t kind)
         }
     }
     if (kind == FILE_MSG_CHECK_DONE && !f->check_installed && atomic_load_explicit(&f->check_result_ready, memory_order_acquire)) {
-        uint32_t r = id_diff(&f->id, &f->check_result.observed) | f->check_result.map_reasons;
+        uint32_t r = f->check_result.map_reasons;
+        if (f->check_result.status == FILE_OK) r |= id_diff(&f->id, &f->check_result.observed);
+        if (f->check_result.err_no) f->err_no = f->check_result.err_no;
         if (r && f->source_generation == f->check_result.generation) {
             if (!f->changed) { f->source_generation++; invalidate_save(f); }
             f->changed = 1;
@@ -1018,11 +1113,130 @@ static void split_path(const char *path, char *dir, size_t dn, char *base, size_
 
 static void transaction_discard(save_transaction *tx)
 {
+    if (tx->metadata_fd >= 0) { close(tx->metadata_fd); tx->metadata_fd = -1; }
     if (tx->fd >= 0) { close(tx->fd); tx->fd = -1; }
     if (tx->dfd >= 0) {
         if (tx->tmp[0]) (void)unlinkat(tx->dfd, tx->tmp, 0);
         close(tx->dfd); tx->dfd = -1;
     }
+}
+
+/* Copy all supported xattrs, including ACLs and security labels, rather than
+ * guessing a namespace allowlist. Inherited attributes absent on the source
+ * are removed. Unsupported xattrs on both descriptors imply no xattr state;
+ * every other read/set/remove failure refuses the replacement. */
+static int xattr_list(int fd, char **names, size_t *length)
+{
+    *names = NULL; *length = 0;
+    ssize_t n = flistxattr(fd, NULL, 0);
+    if (n < 0) return -1;
+    if (n == 0) return 0;
+    char *p = malloc((size_t)n);
+    if (!p) { errno = ENOMEM; return -1; }
+    ssize_t got = flistxattr(fd, p, (size_t)n);
+    if (got < 0) { int en = errno; free(p); errno = en; return -1; }
+    *names = p; *length = (size_t)got;
+    return 0;
+}
+static int xattr_has(const char *list, size_t length, const char *name)
+{
+    size_t off = 0;
+    while (off < length) {
+        size_t n = strnlen(list + off, length - off);
+        if (n == length - off) return 0;
+        if (strcmp(list + off, name) == 0) return 1;
+        off += n + 1;
+    }
+    return 0;
+}
+static int metadata_xattrs(int source, int target)
+{
+    char *names = NULL, *inherited = NULL;
+    size_t length = 0, inherited_length = 0;
+    int rc = -1, en = 0;
+    if (xattr_list(source, &names, &length) != 0) {
+        en = errno;
+        if (en == ENOTSUP) {
+            ssize_t n = flistxattr(target, NULL, 0);
+            if (n < 0 && errno == ENOTSUP) return 0;
+        }
+        errno = en; return -1;
+    }
+    if (xattr_list(target, &inherited, &inherited_length) != 0) { en = errno; goto done; }
+    for (size_t off = 0; off < inherited_length;) {
+        const char *name = inherited + off;
+        size_t n = strnlen(name, inherited_length - off);
+        if (n == inherited_length - off) { en = EIO; goto done; }
+        if (!xattr_has(names, length, name) && fremovexattr(target, name) != 0) { en = errno; goto done; }
+        off += n + 1;
+    }
+    for (size_t off = 0; off < length;) {
+        const char *name = names + off;
+        size_t key_length = strnlen(name, length - off);
+        if (key_length == length - off) { en = EIO; goto done; }
+        ssize_t n = fgetxattr(source, name, NULL, 0);
+        if (n < 0) { en = errno; goto done; }
+        void *value = malloc(n ? (size_t)n : 1);
+        if (!value) { en = ENOMEM; goto done; }
+        ssize_t got = fgetxattr(source, name, value, (size_t)n);
+        if (got != n) { en = got < 0 ? errno : EIO; free(value); goto done; }
+        if (fsetxattr(target, name, value, (size_t)n, 0) != 0) {
+            /* Some labels are immutable to this process but already match the
+             * temp's inherited label. That preserves them without a write. */
+            en = errno;
+            void *current = malloc(n ? (size_t)n : 1);
+            if (!current) { en = ENOMEM; free(value); goto done; }
+            ssize_t existing = fgetxattr(target, name, current, (size_t)n);
+            int equal = existing == n && memcmp(value, current, (size_t)n) == 0;
+            free(current); free(value);
+            if (!equal) goto done;
+        } else free(value);
+        off += key_length + 1;
+    }
+    rc = 0;
+done:
+    free(names); free(inherited);
+    if (rc != 0) errno = en;
+    return rc;
+}
+static int metadata_capture(save_transaction *tx)
+{
+    file_save_args *a = &tx->args;
+    struct stat st;
+    memset(&tx->metadata_id, 0, sizeof tx->metadata_id);
+    if (fstatat(tx->dfd, tx->base, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno != ENOENT) { a->err_no = errno; return FILE_ERR_IO; }
+    } else id_from_stat(&tx->metadata_id, &st);
+    if (tx->metadata_id.exists && S_ISLNK(st.st_mode)) return FILE_ERR_CHANGED;
+    if (a->expect && id_diff(a->expect, &tx->metadata_id)) return FILE_ERR_CHANGED;
+    if (!tx->metadata_id.exists || !S_ISREG(st.st_mode)) return FILE_OK;
+    tx->metadata_fd = openat(tx->dfd, tx->base, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (tx->metadata_fd < 0) { a->err_no = errno; return FILE_ERR_IO; }
+    if (fstat(tx->metadata_fd, &st) != 0) { a->err_no = errno; return FILE_ERR_IO; }
+    file_id observed; id_from_stat(&observed, &st);
+    if (id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
+    return FILE_OK;
+}
+static int metadata_apply(save_transaction *tx)
+{
+    file_save_args *a = &tx->args;
+    uint32_t mode = tx->metadata_id.exists ? tx->metadata_id.mode
+                  : (a->mode_valid || a->mode ? a->mode : 0644u);
+    if (tx->metadata_fd >= 0) {
+        struct stat st;
+        if (fstat(tx->fd, &st) != 0) { a->err_no = errno; return FILE_ERR_IO; }
+        if (((uint32_t)st.st_uid != tx->metadata_id.uid || (uint32_t)st.st_gid != tx->metadata_id.gid) &&
+            fchown(tx->fd, (uid_t)tx->metadata_id.uid, (gid_t)tx->metadata_id.gid) != 0) {
+            a->err_no = errno; return FILE_ERR_IO;
+        }
+        if (metadata_xattrs(tx->metadata_fd, tx->fd) != 0) { a->err_no = errno; return FILE_ERR_IO; }
+        if (fstat(tx->metadata_fd, &st) != 0) { a->err_no = errno; return FILE_ERR_IO; }
+        file_id observed; id_from_stat(&observed, &st);
+        if (id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
+    }
+    /* chown and ACL installation can change permission bits; mode comes last. */
+    if (fchmod(tx->fd, (mode_t)mode) != 0) { a->err_no = errno; return FILE_ERR_IO; }
+    return FILE_OK;
 }
 
 static int transaction_prepare(save_transaction *tx)
@@ -1032,11 +1246,13 @@ static int transaction_prepare(save_transaction *tx)
     uint64_t total = piece_snapshot_len(a->snap);
     int mid_fired = 0;
     a->written = 0; a->err_no = 0; tx->done = 0;
-    tx->fd = -1; tx->dfd = -1; tx->tmp[0] = '\0';
+    tx->fd = -1; tx->dfd = -1; tx->metadata_fd = -1; tx->tmp[0] = '\0';
     if (a->stop && a->stop(a->stop_ctx)) return FILE_ERR_CANCELLED;
     split_path(a->path, dir, sizeof dir, tx->base, sizeof tx->base);
     tx->dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (tx->dfd < 0) { a->err_no = errno; return FILE_ERR_IO; }
+    int rc = metadata_capture(tx);
+    if (rc != FILE_OK) { transaction_discard(tx); return rc; }
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(tx->tmp, sizeof tx->tmp, ".%.*s.edit-%ld-%llu.tmp", FILE_NAME_MAX_KEEP,
              tx->base, (long)getpid(), (unsigned long long)ts.tv_sec * 1000000000ull +
@@ -1049,7 +1265,7 @@ static int transaction_prepare(save_transaction *tx)
     step_call(a, FILE_STEP_TEMP_CREATED);
     piece_iter it; const uint8_t *bytes; size_t n;
     piece_iter_begin_snapshot(&it, a->snap, 0);
-    int rc = FILE_ERR_IO;
+    rc = FILE_ERR_IO;
     while (piece_iter_next(&it, &bytes, &n)) {
         while (n) {
             size_t k = n < FILE_WRITE_CHUNK ? n : FILE_WRITE_CHUNK;
@@ -1063,7 +1279,9 @@ static int transaction_prepare(save_transaction *tx)
     }
     rc = FILE_ERR_IO;
     if (!mid_fired) step_call(a, FILE_STEP_MID_WRITE);
-    if (fchmod(tx->fd, (mode_t)(a->mode ? a->mode : 0644)) != 0) { a->err_no = errno; goto fail; }
+    rc = metadata_apply(tx);
+    if (rc != FILE_OK) goto fail;
+    rc = FILE_ERR_IO;
     step_call(a, FILE_STEP_TEMP_WRITTEN);
     if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
     if (fsync(tx->fd) != 0) { a->err_no = errno; goto fail; }
@@ -1079,11 +1297,14 @@ static int transaction_commit(save_transaction *tx)
     int rc = FILE_ERR_IO, locked = 0;
     if (a->lock) { pthread_mutex_lock(a->lock); locked = 1; }
     if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
-    if (a->expect) {
+    {
         file_id now; struct stat st;
         memset(&now, 0, sizeof now);
-        if (fstatat(tx->dfd, tx->base, &st, 0) == 0) id_from_stat(&now, &st);
-        if (id_diff(a->expect, &now)) { rc = FILE_ERR_CHANGED; goto fail; }
+        if (fstatat(tx->dfd, tx->base, &st, AT_SYMLINK_NOFOLLOW) == 0) id_from_stat(&now, &st);
+        else if (errno != ENOENT && errno != ENOTDIR) { a->err_no = errno; goto fail; }
+        if ((now.exists && S_ISLNK(st.st_mode)) || id_diff(&tx->metadata_id, &now) || (a->expect && id_diff(a->expect, &now))) {
+            rc = FILE_ERR_CHANGED; goto fail;
+        }
     }
     struct stat st;
     if (fstat(tx->fd, &st) != 0) { a->err_no = errno; goto fail; }
@@ -1091,7 +1312,14 @@ static int transaction_commit(save_transaction *tx)
     rc = FILE_ERR_IO;
     if (renameat(tx->dfd, tx->tmp, tx->dfd, tx->base) != 0) { a->err_no = errno; goto fail; }
     tx->tmp[0] = '\0';
-    if (a->out_id) id_from_stat(a->out_id, &st);
+    int identity_error = 0;
+    struct stat renamed;
+    if (fstat(tx->fd, &renamed) != 0) identity_error = errno;
+    else st = renamed;
+    if (a->out_id) {
+        id_from_stat(a->out_id, &st);
+        if (identity_error) a->out_id->metadata_valid = 0;
+    }
     if (a->replaced) a->replaced(a->replaced_ctx);
     if (locked) { pthread_mutex_unlock(a->lock); locked = 0; }
     close(tx->fd); tx->fd = -1;
@@ -1102,6 +1330,7 @@ static int transaction_commit(save_transaction *tx)
     }
     transaction_discard(tx);
     step_call(a, FILE_STEP_DIR_SYNCED);
+    if (identity_error) { a->err_no = identity_error; return FILE_ERR_IO; }
     return FILE_OK;
 fail:
     if (locked) pthread_mutex_unlock(a->lock);
@@ -1110,7 +1339,7 @@ fail:
 
 int file_save_write(file_save_args *a)
 {
-    save_transaction tx = { .args = *a, .fd = -1, .dfd = -1 };
+    save_transaction tx = { .args = *a, .fd = -1, .dfd = -1, .metadata_fd = -1 };
     int rc = transaction_prepare(&tx);
     if (rc == FILE_OK) rc = transaction_commit(&tx);
     a->written = tx.args.written; a->err_no = tx.args.err_no;
@@ -1131,7 +1360,7 @@ static int source_validate(void *ctx)
         file_id now;
         if (fstat(m->fd, &st) != 0) return FILE_ERR_CHANGED;
         id_from_stat(&now, &st);
-        if (id_diff(&f->save.source_id, &now)) return FILE_ERR_CHANGED;
+        if (id_diff(&f->save.source_id, &now) & ~FILE_CHG_METADATA) return FILE_ERR_CHANGED;
     }
     return f->save.authorized ? FILE_OK : FILE_ERR_CHANGED;
 }
@@ -1149,7 +1378,7 @@ static void save_job(work_ctx *c)
     file *f = c->arg;
     file_save_args a;
     memset(&a, 0, sizeof a);
-    a.mode = f->save.mode;
+    a.mode = f->save.mode; a.mode_valid = 1;
     a.path = f->path;
     a.snap = f->save.snap;
     a.expect = (f->save.flags & FILE_SAVE_FORCE) ? NULL : &f->save.expect;
