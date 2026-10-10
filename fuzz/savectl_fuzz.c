@@ -148,9 +148,16 @@ static void journal_session(const uint8_t *data, size_t size)
     settle(s, pool); savectl_model model = savectl_get_model(s);
     REQUIRE(!model.journal_leased && model.modified);
     if (scenario == 1 || scenario == 2 || scenario == 4) {
-        REQUIRE(model.state == SAVECTL_FAILED);
+        REQUIRE(model.state == (scenario == 2 ? SAVECTL_EXTERNAL_MODIFIED : SAVECTL_FAILED));
         REQUIRE(model.journal_error == (scenario == 1 ? JOURNAL_INVALID :
                                        scenario == 2 ? JOURNAL_BASE_CHANGED : JOURNAL_IO));
+        if (scenario == 2) {
+            /* Prepare can detect an external conflict before file work. */
+            REQUIRE(model.banner && model.can_reload && model.can_keep);
+            REQUIRE(model.file_error == FILE_OK && !model.needs_finish);
+            const journal_save *token = savectl_save_token(s);
+            REQUIRE(token && !token->prepared && !token->previous_path[0]);
+        }
         disk_is(path, (const uint8_t *)(scenario == 2 ? "other" : "base"), scenario == 2 ? 5u : 4u);
     } else if (scenario == 3) {
         REQUIRE(model.banner && (model.file_error == FILE_ERR_CHANGED ||
@@ -251,9 +258,20 @@ static void acquisition_session(const uint8_t *data, size_t size)
         piece_tree *replacement = NULL; savectl_view view = {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
         int code = savectl_take_reload(s, &replacement, &view);
         if (code == SAVECTL_NOMEM) {
-            REQUIRE(!replacement && view.cursor == UINT64_MAX && piece_len(tree) == 4);
+            REQUIRE(!replacement && view.cursor == UINT64_MAX && view.anchor == UINT64_MAX &&
+                    view.scroll_byte == UINT64_MAX && view.scroll_x == UINT64_MAX);
+            REQUIRE(piece_len(tree) == 4); disk_is(path, (const uint8_t *)"base", 4);
+            savectl_model model = savectl_get_model(s);
+            REQUIRE(model.state == SAVECTL_FAILED && model.file_error == FILE_ERR_NOMEM);
+            REQUIRE(model.modified && model.banner);
             fault.fail_at = 0;
-            REQUIRE(savectl_take_reload(s, &replacement, &view) == 0);
+            /* A failed installation retires its private backing. Clearing the
+             * allocator fault cannot revive it; explicitly acquire a new copy. */
+            REQUIRE(savectl_take_reload(s, &replacement, &view) == SAVECTL_BUSY);
+            settle(s, pool); model = savectl_get_model(s);
+            REQUIRE(model.can_reload && model.can_keep);
+            REQUIRE(savectl_reload(s) == SAVECTL_OK); settle(s, pool);
+            REQUIRE(savectl_take_reload(s, &replacement, &view) == SAVECTL_OK);
         } else REQUIRE(code == 0);
         uint8_t text[4]; REQUIRE(replacement && piece_read(replacement, 0, text, 4) == 0);
         REQUIRE(memcmp(text, "base", 4) == 0); piece_destroy(tree); tree = replacement;
