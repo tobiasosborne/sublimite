@@ -100,6 +100,14 @@ void file_backing_acquire(file_backing *backing);
 void file_backing_release(file_backing *backing);
 int file_backing_faulted(const file_backing *backing);
 int file_snapshot_faulted(const piece_snapshot *snapshot);
+/* Borrow the complete original only if every snapshot span still represents
+ * exactly that original, in order. Retain snapshot throughout use. CPU-only,
+ * no allocation/content scan; 0 for edited/non-file/faulted snapshots, 1 on
+ * success. Optional worker control is polled between spans; cancellation
+ * refuses the range. A consumer must continue polling file_snapshot_faulted while using
+ * the bytes and before accepting its result. Outputs are cleared on refusal. */
+int file_snapshot_bytes(const piece_snapshot *snapshot, const work_ctx *control,
+                        const uint8_t **bytes, size_t *length);
 
 typedef enum file_mode { FILE_MODE_COPY = 1, FILE_MODE_MMAP = 2 } file_mode;
 

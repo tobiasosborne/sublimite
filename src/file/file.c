@@ -307,6 +307,24 @@ int file_backing_faulted(const file_backing *backing)
 { return backing && guard_faulted(backing->slot); }
 int file_snapshot_faulted(const piece_snapshot *snapshot)
 { return file_backing_faulted(file_snapshot_backing(snapshot)); }
+int file_snapshot_bytes(const piece_snapshot *snapshot, const work_ctx *control,
+                        const uint8_t **bytes, size_t *length)
+{
+    if (bytes) *bytes = NULL;
+    if (length) *length = 0;
+    if (!bytes || !length || (control && work_should_stop(control))) return 0;
+    file_backing *backing = file_snapshot_backing(snapshot);
+    if (!backing || file_backing_faulted(backing) || piece_snapshot_len(snapshot) != backing->len) return 0;
+    piece_iter it; piece_iter_begin_snapshot(&it, snapshot, 0);
+    const uint8_t *p; size_t n, off = 0;
+    while (piece_iter_next(&it, &p, &n)) {
+        if (control && work_should_stop(control)) return 0;
+        if (n > backing->len - off || p != (const uint8_t *)backing->addr + off) return 0;
+        off += n;
+    }
+    if (off != backing->len || file_backing_faulted(backing) || (control && work_should_stop(control))) return 0;
+    *bytes = backing->addr; *length = backing->len; return 1;
+}
 struct file_source {
     _Atomic size_t refs;
     file_map *map;

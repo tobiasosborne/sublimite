@@ -9,6 +9,7 @@
 #include "raster/raster.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "file/file_test.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,8 +32,23 @@ typedef struct hooks {
     uint32_t estimated_fg, first_exact_frame;
     size_t estimated_frames, exact_frames;
     bool gutter_error;
+    bool complete_on_ingress;
+    _Atomic bool *index_release;
 } hooks;
-static void ingress(void *c, uint64_t s, uint64_t n) { hooks *h = c; (void)s; (void)n; if (!h->active) { edit_malloc_guard_begin(); h->active = true; } }
+static void ingress(void *c, uint64_t s, uint64_t n)
+{
+    hooks *h = c; (void)s; (void)n;
+    if (h->complete_on_ingress) {
+        h->complete_on_ingress = false;
+        atomic_store(h->index_release, true);
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (!lineidx_complete(h->observe->buffer->index) && trace_now_ns() < deadline) {
+            (void)lineidx_poll(h->observe->buffer->index);
+            nanosleep(&(struct timespec){0, 100000}, NULL);
+        }
+    }
+    if (!h->active) { edit_malloc_guard_begin(); h->active = true; }
+}
 static void submitted(void *c, const editor_frame *f)
 {
     hooks *h = c;
@@ -110,6 +126,43 @@ static size_t gutter_snapshot_span(void *ctx, uint64_t off, const uint8_t **p)
     return piece_iter_next(&it, p, &n) ? n : 0;
 }
 static void gutter_snapshot_release(void *ctx) { piece_snapshot_release(ctx); }
+/* A final index batch can be adopted while a frame is already in progress
+ * (for example by minimap's bounded poll). Its submit must publish the exact
+ * gutter in that same frame, without a content rescan or stale submission. */
+static int index_arrives_during_frame(const char *path)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    hooks h = {.estimated_fg = 0x4c525d};
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
+        .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
+        .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(held.epoch);
+    lineidx_src source = {snap, editor_length(e), gutter_snapshot_span, gutter_snapshot_release};
+    T(lineidx_build_start(e->buffer->index, &e->pool, &source) == 0);
+    h.observe = e;
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    uint32_t previous = editor_grid(e)->frame_id;
+    h.index_release = &release; h.complete_on_ingress = true;
+    plat_event arrow = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Right};
+    T(editor_inject(e, &arrow) == 0);
+    int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+    T(editor_index_complete(e));
+    T(editor_large_status_get(e).lines_exact);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_index_complete(e));
+    T(!h.gutter_error);
+    T(h.first_exact_frame == previous + 1u);
+    T(h.allocations == 0);
+    editor_close(e);
+    puts("edit-dnc G7: mid-frame index arrival publishes exact gutter in the same frame; zero typing allocations");
+    return 0;
+}
 static int gutter_estimates(void)
 {
     render_backend b = {0}; T(render_null_backend(&b) == 0);
@@ -235,12 +288,63 @@ static int prepared_completion(editor *e)
     return 0;
 }
 
+static int mapped_find_boundaries(void)
+{
+    char path[] = "build/editor-dnc-find-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    size_t length = 2u * FILE_PREFIX_MAX + 17u;
+    uint8_t *bytes = malloc(length); T(bytes); memset(bytes, 'x', length);
+    memcpy(bytes + LINEIDX_CHUNK - 3u, "abababababab", 12);
+    memcpy(bytes + 2u * LINEIDX_CHUNK - 3u, "abababababab", 12);
+    T(write(fd, bytes, length) == (ssize_t)length); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1, .copy_threshold = 4096};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    /* Leave a bound, unbuilt index with no worker. Find must finish anyway. */
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(length); T(e->buffer->index);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    uint8_t dense[256]; memset(dense, 'x', sizeof dense);
+    const uint8_t *needles[] = {(const uint8_t *)"abab", (const uint8_t *)"x", dense};
+    const size_t sizes[] = {4, 1, sizeof dense};
+    for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+        find_source source = {.bytes = bytes, .length = length}; find_result expected;
+        T(find_literal(&source, needles[k], sizes[k], NULL, &expected) == FIND_OK);
+        T(editor_large_find_begin(e, needles[k], sizes[k]) == 0);
+        T(step_until(e, find_done, UINT64_C(5000000000)) == 0);
+        editor_large_status status = editor_large_status_get(e);
+        T(status.find_rc == FIND_OK); T(status.find_total == expected.total);
+        T(status.find_stored == expected.stored);
+        T(memcmp(e->buffer->lg.find->result.offsets, expected.offsets, expected.stored * sizeof expected.offsets[0]) == 0);
+        T(!editor_index_complete(e)); T(!status.lines_exact);
+    }
+    const uint8_t *fault_bytes = NULL; size_t fault_length = 0;
+    T(file_snapshot_bytes(snap, NULL, &fault_bytes, &fault_length) == 1);
+    T(fault_length == length);
+    T(file_test_recover(fault_bytes + 4096u) == 1);
+    T(file_snapshot_bytes(snap, NULL, &fault_bytes, &fault_length) == 0);
+    T(!fault_bytes && !fault_length);
+    T(editor_large_find_begin(e, needles[0], sizes[0]) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!work_handle_finished(&e->pool, e->buffer->lg.find_h)) {
+        T(trace_now_ns() < deadline); nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    T(e->buffer->lg.find->rc == FIND_CANCELLED);
+    T(e->buffer->lg.find->result.total == 0 && e->buffer->lg.find->result.stored == 0);
+    piece_snapshot_release(snap); editor_close(e); free(bytes); unlink(path);
+    puts("edit-dnc G6: mapped find before index, window crossings/nonoverlap, dense saturation, bounded offsets and fault refusal passed");
+    return 0;
+}
+
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    T(mapped_find_boundaries() == 0);
     T(gutter_estimates() == 0);
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
+    T(index_arrives_during_frame(path) == 0);
     struct stat st; T(stat(path, &st) == 0); uint64_t size = (uint64_t)st.st_size;
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     hooks h = {0};
@@ -254,6 +358,22 @@ int main(void)
     T(!editor_index_complete(e));
     /* Cooperative indexing must publish before warming can monopolize bulk. */
     T(e->buffer->lg.warm); T(!e->buffer->lg.warm_h.epoch);
+    /* The mapped find source is usable without exact newline metadata. */
+    piece_snapshot *original = piece_snapshot_take(e->tree); T(original);
+    const uint8_t *mapped_bytes = NULL; size_t mapped_length = 0;
+    T(file_snapshot_bytes(original, NULL, &mapped_bytes, &mapped_length) == 1);
+    T(mapped_bytes && mapped_length == size);
+    T(memcmp(mapped_bytes, "l000000\n", 8) == 0);
+    T(memcmp(mapped_bytes + mapped_length - 3u, "end", 3) == 0);
+    T(!editor_large_status_get(e).lines_exact);
+    /* Certification also needs bounded cancellation on larger originals. */
+    _Atomic bool blocked; atomic_init(&blocked, false);
+    work_handle cancelled_handle = work_submit(&e->pool, (work_job){hold_index, &blocked, 0, WORK_BULK}); T(cancelled_handle.epoch);
+    work_ctx cancelled_control = {.pool = &e->pool, .slot = &e->pool.slots[cancelled_handle.slot], .epoch = cancelled_handle.epoch};
+    work_cancel(&e->pool, cancelled_handle);
+    T(file_snapshot_bytes(original, &cancelled_control, &mapped_bytes, &mapped_length) == 0);
+    T(!mapped_bytes && !mapped_length);
+    while (!work_handle_finished(&e->pool, cancelled_handle)) nanosleep(&(struct timespec){0, 1000000}, NULL);
     /* 2. Jump by byte before the index: line shown is an estimate. */
     uint64_t target = (uint64_t)A_LINES * 8u + 1000u * B_LEN + 10u;   /* inside exact line 21000 */
     T(editor_large_goto_byte(e, target) == 0);
@@ -287,6 +407,14 @@ int main(void)
     T(editor_inject(e, &ev) == 0); T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     T(h.allocations == 0);
     T(editor_length(e) == size + 1);
+    piece_snapshot *edited = piece_snapshot_take(e->tree); T(edited);
+    T(file_snapshot_bytes(edited, NULL, &mapped_bytes, &mapped_length) == 0);
+    T(!mapped_bytes && !mapped_length);
+    piece_snapshot_release(edited);
+    /* A live old snapshot still certifies its immutable original after edit. */
+    T(file_snapshot_bytes(original, NULL, &mapped_bytes, &mapped_length) == 1);
+    T(mapped_length == size);
+    piece_snapshot_release(original);
     /* 5. Save completes while the loop keeps stepping; the file has the edit. */
     T(editor_large_save_begin(e) == 0);
     T(editor_large_save_begin(e) == EDITOR_ERR_ARG);                   /* one at a time */

@@ -204,6 +204,10 @@ void editor_route_work(const work_msg *msg, void *ctx)
     if (editor_large_receive(e, msg)) return;
     file_msg fm;
     if (file_msg_decode(msg, &fm) == 0) {
+        if (fm.kind == FILE_MSG_PREFIX_READY)
+            trace_record(TRACE_T1_DEQUEUE, editor_large_trace_frame(fm.f));
+        else if (fm.kind == FILE_MSG_OPEN_READY)
+            trace_record(TRACE_T2_MUTATION_DONE, editor_large_trace_frame(fm.f));
         editor_large_file_msg(e, &fm);
         if (fm.f == e->opening) e->open_error = fm.status;
         else if (fm.status && !e->error) e->error = fm.status;
@@ -302,9 +306,14 @@ static int present(editor *e)
 }
 static int submit(editor *e)
 {
+    /* A bounded consumer (including minimap) may adopt the final index range
+     * after this turn's pump. Publish before this frame can leave the editor. */
+    editor_large_index_progress(e);
     if (e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
+    editor_large_index_progress(e);
+    if (e->full_pending) return 0;
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
     if (e->caret_only && !count) {
         e->dirty = false; /* Visibility changed outside the viewport: no pixels to submit. */

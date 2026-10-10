@@ -25,6 +25,7 @@ static void publish_completion(work_ctx *c, uint32_t kind)
 /* --- open ------------------------------------------------------------- */
 void editor_large_init(editor_buffer *b)
 {
+    if (b->file) trace_record(TRACE_T3_RENDER_DONE, editor_large_trace_frame(b->file));
     editor_large *lg = &b->lg;
     lg->mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP;
     lg->lazy = lg->mapped || (b->file && file_size(b->file) > FILE_PREFIX_MAX);
@@ -63,6 +64,7 @@ static void queue_warm(editor *e, editor_buffer *b)
 }
 void editor_large_start(editor *e, editor_buffer *b)
 {
+    if (b->file) trace_record(TRACE_T5_DEVICE_DONE, editor_large_trace_frame(b->file));
     editor_large_warm_job *j = b->lg.lazy && !b->lg.warm_done ? calloc(1, sizeof *j) : NULL;
     if (!j) return;
     j->snap = piece_snapshot_take(b->tree); if (!j->snap) { free(j); return; }
@@ -100,6 +102,7 @@ static void index_progress(editor *e, editor_buffer *b)
         lineidx_result total = lineidx_line_count(b->index);
         if (!total.exact) return;
         b->lines = total.value; lg->lines_exact = true;
+        if (b->file) trace_record(TRACE_T6_PRESENT_COMPLETE, editor_large_trace_frame(b->file));
     }
     /* The active viewport is the sole live view. Retained tabs are corrected
      * when activated; never apply an inactive buffer's index to this view. */
@@ -138,6 +141,7 @@ static void buffer_receive(const work_msg *msg, void *ctx)
     if (msg->kind == EDITOR_LARGE_MSG_WARM && matches(msg, lg->warm_h)) lg->warm_done = true;
     if (msg->kind == EDITOR_LARGE_MSG_FIND && matches(msg, lg->find_h) && msg->generation == lg->find_gen && lg->find_running) {
         lg->find_running = false; lg->find_done = true;
+        trace_record(TRACE_T4_PRESENT_SUBMITTED, editor_large_trace_frame(lg->find));
     }
 }
 bool editor_large_receive(editor *e, const work_msg *msg)
@@ -206,12 +210,55 @@ uint64_t editor_large_line_to_byte(editor *e, uint64_t line, bool *exact)
     if (exact) *exact = r.exact;
     return r.value;
 }
+static find_code find_mapped(work_ctx *c, editor_large_find_job *j)
+{
+    const uint8_t *bytes = NULL; size_t length = 0;
+    find_control control = {.work = c};
+    find_source snapshot = {.snapshot = j->snap};
+    if (!file_snapshot_bytes(j->snap, c, &bytes, &length))
+        return find_literal(&snapshot, j->needle, j->needle_len, &control, &j->result);
+    size_t off = 0;
+    j->result.total = 0; j->result.stored = 0;
+    while (off < length) {
+        if (work_should_stop(c) || file_snapshot_faulted(j->snap)) goto cancelled;
+        size_t step = length - off;
+        if (step > LINEIDX_CHUNK) step = LINEIDX_CHUNK;
+        size_t end = off + step, window = step;
+        size_t overlap = j->needle_len - 1u;
+        if (overlap > length - end) overlap = length - end;
+        window += overlap;
+        find_source source = {.bytes = bytes + off, .length = window};
+        find_result batch;
+        find_code rc = find_literal(&source, j->needle, j->needle_len, &control, &batch);
+        if (rc != FIND_OK || file_snapshot_faulted(j->snap)) goto cancelled;
+        /* Need the last match end to preserve nonoverlap at the next boundary.
+         * A saturated window uses the original streaming snapshot kernel. */
+        if (batch.total > FIND_MAX_OFFSETS)
+            return find_literal(&snapshot, j->needle, j->needle_len, &control, &j->result);
+        size_t next = end;
+        for (size_t i = 0; i < batch.stored; i++) {
+            uint64_t at = (uint64_t)off + batch.offsets[i];
+            if (at >= end) break;
+            j->result.total++;
+            if (j->result.stored < FIND_MAX_OFFSETS) j->result.offsets[j->result.stored++] = at;
+            size_t match_end = (size_t)at + j->needle_len;
+            if (match_end > next) next = match_end;
+        }
+        off = next;
+    }
+    if (work_should_stop(c) || file_snapshot_faulted(j->snap)) goto cancelled;
+    return FIND_OK;
+cancelled:
+    j->result.total = 0; j->result.stored = 0; return FIND_CANCELLED;
+}
 static void find_fn(work_ctx *c)
 {
     editor_large_find_job *j = c->arg;
-    find_source src = {.snapshot = j->snap}; find_control ctl = {.work = c};
-    j->rc = find_literal(&src, j->needle, j->needle_len, &ctl, &j->result);
+    trace_record(TRACE_T1_DEQUEUE, editor_large_trace_frame(j));
+    j->rc = find_mapped(c, j);
+    trace_record(TRACE_T2_MUTATION_DONE, editor_large_trace_frame(j));
     if (!atomic_exchange(&j->released, true)) piece_snapshot_release(j->snap);
+    trace_record(TRACE_T3_RENDER_DONE, editor_large_trace_frame(j));
     publish_completion(c, EDITOR_LARGE_MSG_FIND);
 }
 int editor_large_find_begin(editor *e, const uint8_t *needle, size_t len)
@@ -227,6 +274,7 @@ int editor_large_find_begin(editor *e, const uint8_t *needle, size_t len)
     j->snap = piece_snapshot_take(b->tree); if (!j->snap) { free(j); return EDITOR_ERR_MEMORY; }
     atomic_init(&j->released, false);
     memcpy(j->needle, needle, len); j->needle_len = len;
+    trace_record(TRACE_T0_INGRESS, editor_large_trace_frame(j));
     lg->find_gen++; lg->find_done = false;
     work_job job = {.fn = find_fn, .arg = j, .generation = lg->find_gen, .cls = WORK_BULK};
     lg->find_h = work_submit(&e->pool, job);

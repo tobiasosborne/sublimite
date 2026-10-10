@@ -22,6 +22,14 @@
 #define EDITOR_LARGE_WARM_STRIDE (64u * 1024u * 1024u)
 #define EDITOR_LARGE_NEEDLE_MAX 256u
 
+/* Diagnostic trace frames occupy the high half of the ID space. Open uses
+ * the file owner; find uses its job owner. These are phase markers, not input
+ * frames: T0 request, T1 prefix/worker start, T2 mapping/search done, T3
+ * attachment/snapshot release, T5 index submitted, T4 viewport/find adopted,
+ * T6 exact index published. Capture one owner lifetime per dump. */
+static inline uint32_t editor_large_trace_frame(const void *owner)
+{ return UINT32_C(0x80000000) | (uint32_t)(((uintptr_t)owner >> 4) & UINT32_C(0x7fffffff)); }
+
 typedef struct editor_large_status {
     bool mapped;         /* file is mmap-backed: estimate-then-exact applies */
     bool lines_exact;    /* line total and top line come from the published index */
