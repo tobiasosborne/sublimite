@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 static struct {
     bool input_alloc, compose_alloc, raw_stream, extended_alloc;
@@ -445,20 +446,124 @@ static void test_map_boundary(void) {
     CHECK(translated.utf8_len == 1 && translated.utf8[0] == 'z', "§21 German Y position translates as z");
     plat_shutdown(&p);
 }
-static bool set_layout(const char *layout) {
+/* edit-riu: snapshot the actual server map, including custom mappings. Rules
+ * names alone (setxkbmap -query) cannot reconstruct an xmodmap/xkbcomp edit. */
+static struct {
+    char *display;
+    char path[sizeof "/tmp/edit-riu-keymap-XXXXXX.xkm"];
+    xcb_connection_t *conn;
+    xcb_window_t root;
+    xcb_atom_t rules_atom;
+    xcb_get_property_reply_t *rules;
+    bool file_created, dirty;
+} saved_map;
+
+static bool run_x_tool(const char *const args[]) {
     pid_t child = fork();
     if (child < 0) return false;
     if (!child) {
-        execl("/usr/bin/setxkbmap", "setxkbmap", "-display", ":99", "-layout", layout, (char *)NULL);
-        _exit(127);
+        execv(args[0], (char *const *)args);
+        _exit(EXIT_FAILURE);
     }
     int status = 0;
-    return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    pid_t done;
+    do { done = waitpid(child, &status, 0); } while (done < 0 && errno == EINTR);
+    return done == child && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+}
+static void discard_saved_map(void) {
+    if (saved_map.conn) xcb_disconnect(saved_map.conn);
+    if (saved_map.file_created) unlink(saved_map.path);
+    free(saved_map.rules);
+    free(saved_map.display);
+    memset(&saved_map, 0, sizeof saved_map);
+}
+static void restore_saved_map(void) {
+    if (saved_map.dirty) {
+        const char *const args[] = { "/usr/bin/xkbcomp", "-w", "0", saved_map.path,
+                                    saved_map.display, NULL }; /* -w 0 disables warnings. */
+        CHECK(run_x_tool(args), "§21 restore original server keymap");
+        /* xkbcomp restores the map, but not setxkbmap's root-window metadata.
+         * Preserve even an absent property so later clients see the old rules. */
+        xcb_void_cookie_t cookie;
+        if (saved_map.rules->type == XCB_ATOM_NONE) {
+            cookie = xcb_delete_property_checked(saved_map.conn, saved_map.root, saved_map.rules_atom);
+        } else {
+            uint32_t units = (uint32_t)xcb_get_property_value_length(saved_map.rules) /
+                             (saved_map.rules->format / CHAR_BIT);
+            cookie = xcb_change_property_checked(saved_map.conn, XCB_PROP_MODE_REPLACE, saved_map.root,
+                saved_map.rules_atom, saved_map.rules->type, saved_map.rules->format, units,
+                xcb_get_property_value(saved_map.rules));
+        }
+        CHECK(init_request_ok(saved_map.conn, cookie), "§21 restore original keymap rules property");
+    }
+    discard_saved_map();
+}
+static bool save_server_map(void) {
+    /* xvfb_start() has already selected DISPLAY; plat_init() and its keyboard
+     * worker both use xcb_connect(NULL, ...), hence this exact environment. */
+    const char *display = getenv("DISPLAY");
+    CHECK(display && *display, "§21 selected display exists");
+    if (!display || !*display) return false;
+    saved_map.display = strdup(display);
+    CHECK(saved_map.display != NULL, "§21 save selected display");
+    if (!saved_map.display) return false;
+    const char *const query[] = { "/usr/bin/setxkbmap", "-display", saved_map.display, "-query", NULL };
+    if (!run_x_tool(query)) {
+        printf("x11_order_test: SKIP §21 live server maps (setxkbmap unavailable on %s)\n", display);
+        goto unavailable;
+    }
+    int screen_number = 0;
+    saved_map.conn = xcb_connect(saved_map.display, &screen_number);
+    CHECK(!xcb_connection_has_error(saved_map.conn), "§21 snapshot display connection");
+    if (xcb_connection_has_error(saved_map.conn)) goto unavailable;
+    xcb_screen_iterator_t screens = xcb_setup_roots_iterator(xcb_get_setup(saved_map.conn));
+    while (screen_number-- > 0 && screens.rem) xcb_screen_next(&screens);
+    CHECK(screens.rem != 0, "§21 snapshot screen exists");
+    if (!screens.rem) goto unavailable;
+    saved_map.root = screens.data->root;
+    saved_map.rules_atom = atom(saved_map.conn, "_XKB_RULES_NAMES");
+    CHECK(saved_map.rules_atom != XCB_ATOM_NONE, "§21 keymap rules atom");
+    if (!saved_map.rules_atom) goto unavailable;
+    saved_map.rules = xcb_get_property_reply(saved_map.conn, xcb_get_property(saved_map.conn, 0,
+        saved_map.root, saved_map.rules_atom, XCB_GET_PROPERTY_TYPE_ANY, 0, UINT32_MAX), NULL);
+    CHECK(saved_map.rules && !saved_map.rules->bytes_after &&
+          (saved_map.rules->type == XCB_ATOM_NONE || saved_map.rules->format == CHAR_BIT),
+          "§21 snapshot complete keymap rules property");
+    if (!saved_map.rules || saved_map.rules->bytes_after ||
+        (saved_map.rules->type != XCB_ATOM_NONE && saved_map.rules->format != CHAR_BIT)) goto unavailable;
+    memcpy(saved_map.path, "/tmp/edit-riu-keymap-XXXXXX.xkm", sizeof saved_map.path);
+    /* The suffix length comes from the compiled-keymap extension. */
+    int fd = mkstemps(saved_map.path, (int)(sizeof ".xkm" - 1));
+    CHECK(fd >= 0, "§21 snapshot temporary file");
+    if (fd < 0) goto unavailable;
+    saved_map.file_created = true;
+    close(fd);
+    const char *const snapshot[] = { "/usr/bin/xkbcomp", "-w", "0", "-xkm", saved_map.display,
+                                    saved_map.path, NULL };
+    if (!run_x_tool(snapshot)) {
+        printf("x11_order_test: SKIP §21 live server maps (cannot save original map on %s)\n", display);
+        goto unavailable;
+    }
+    /* Mark before the first change: a failed command can partially update XKB. */
+    saved_map.dirty = true;
+    return true;
+unavailable:
+    discard_saved_map();
+    return false;
+}
+static bool set_layout(const char *layout) {
+    const char *const args[] = { "/usr/bin/setxkbmap", "-display", saved_map.display,
+                                "-layout", layout, "-variant", "", "-option", "", NULL };
+    return run_x_tool(args);
 }
 static void test_live_map_boundary(void) {
-    CHECK(set_layout("us"), "§21 live US map fixture");
+    if (!save_server_map()) return;
+    if (!set_layout("us")) {
+        printf("x11_order_test: SKIP §21 live server maps (setxkbmap cannot set US on %s)\n", saved_map.display);
+        goto restore;
+    }
     plat p;
-    if (!open_plat(&p)) return;
+    if (!open_plat(&p)) goto restore;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
@@ -466,7 +571,9 @@ static void test_live_map_boundary(void) {
     key.response_type = XCB_KEY_RELEASE;
     xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
     CHECK(barrier(p.conn), "§21 live before-map keys queued");
-    CHECK(set_layout("de"), "§21 actual server map change");
+    bool changed = set_layout("de");
+    CHECK(changed, "§21 actual server map change");
+    if (!changed) goto shutdown;
     /* The UI connection owns this test-only grab: only worker snapshot I/O
      * stalls, while UI dispatch and its ordered raw queue remain runnable. */
     xcb_grab_server(p.conn); CHECK(barrier(p.conn), "§21 delay snapshot worker");
@@ -481,19 +588,27 @@ static void test_live_map_boundary(void) {
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 4 && s.last_text == 'z' && s.keymaps > 0,
           "§21 immediate post-notification key uses actual German map");
+shutdown:
     plat_shutdown(&p);
-    CHECK(set_layout("us"), "§21 restore test server map");
+restore:
+    restore_saved_map();
 }
 /* Retained reproduction for the remaining exact server-generation gap. */
 static void test_map_generations_pending(void) {
-    CHECK(set_layout("us"), "§21 generation fixture US");
+    if (!save_server_map()) return;
+    if (!set_layout("us")) {
+        printf("x11_order_test: SKIP §21 live server maps (setxkbmap cannot set US on %s)\n", saved_map.display);
+        goto restore;
+    }
     plat p;
-    if (!open_plat(&p)) return;
+    if (!open_plat(&p)) goto restore;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     xcb_key_press_event_t key = { .detail = 29, .event = p.win };
     for (unsigned i = 0; i < 2; i++) {
-        CHECK(set_layout(i ? "us" : "de"), "§21 consecutive server map change");
+        bool changed = set_layout(i ? "us" : "de");
+        CHECK(changed, "§21 consecutive server map change");
+        if (!changed) goto shutdown;
         key.response_type = XCB_KEY_PRESS;
         xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
         key.response_type = XCB_KEY_RELEASE;
@@ -503,8 +618,10 @@ static void test_map_generations_pending(void) {
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
     CHECK(s.text_count == 2 && s.text[0] == 'z' && s.text[1] == 'y',
           "§21 exact snapshots retain both successive server mapping generations");
+shutdown:
     plat_shutdown(&p);
-    CHECK(set_layout("us"), "§21 restore generation fixture");
+restore:
+    restore_saved_map();
 }
 static void xi_wheel_button(plat *p, const plat_callbacks *cb, uint16_t source, bool emulated) {
     uint8_t raw[84] = {0};
@@ -683,6 +800,9 @@ static void test_alignment(void) {
 }
 int main(int argc, char **argv) {
     if (!xvfb_start()) { fprintf(stderr, "x11_order_test: FAIL no private Xvfb\n"); return 1; }
+    /* Registered after xvfb_stop: the original map is restored before Xvfb
+     * exits. Normal/failure paths restore explicitly so failure affects main. */
+    if (atexit(restore_saved_map) != 0) { CHECK(false, "keymap cleanup registration"); return failed; }
     const char *which = argc > 1 ? argv[1] : "all";
     if (!strcmp(which, "all") || !strcmp(which, "alignment")) test_alignment();
     if (!strcmp(which, "all") || !strcmp(which, "burst")) test_burst();

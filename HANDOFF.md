@@ -1,5 +1,10 @@
 # HANDOFF — sublimité, end of session 10 (2026-10-11 ~15:45)
 
+Worker update, edit-riu: the order test's external X clients now use its selected
+display, and live keymap fixtures restore the saved map and rules metadata on
+success/failure. `make all` and the sanitizer test build passed; display runs are
+for the coordinator outside the sandbox. See `docs/worker-reports/edit-riu.md`.
+
 ## Read first
 **Main (pushed) has, all landed today after serial targeted runs on :99:** process reset + golden-master rule; Astra drive 1 report (VERDICT no) + Opus design research; flash fix; minimap composed from pixels (8m3 + d5o); shared inotify service (er2); wrap input-window fix; findui s3 (lez); Ctrl+Y + panel-chord guard (whl/2gx); clipboard (cde); Ctrl+S + startup restore (ck4); 1 GiB near-end stall (2ty); handoff limit (jmn); scroll s3 (ovu); **GL init 10 s timeout bug** (40t); Unicode glyphs (08z); tree-sitter runtime + src/hl (v0o.2); benches exit 0 on timing (lwq); startup stages (2ts); DPI-derived font size + zoom (m3g). Last main-level sanity (font, trace, editor, p4, cli) green at 0381fed; later commits are docs/reports only.
 
