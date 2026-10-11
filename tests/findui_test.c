@@ -1,6 +1,9 @@
 #include "findui/findui.h"
 #include "findui/private.h"
+#include "editor/private.h"
+#include "trace/trace.h"
 #include "journal/journal.h"
+#include <xkbcommon/xkbcommon-keysyms.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -962,8 +965,115 @@ static void search_stage_yields(void)
     free(bytes);
 }
 
+/* edit-m15: use the null editor host to check dispatch and clipboard routing,
+ * not only the standalone query API. Geometry and settle bound reuse the
+ * editor mouse/panel fixtures; byte expectations derive from these strings. */
+static void panel_settle(editor *e)
+{
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000);
+    do {
+        int rc=editor_step(e,0); CHECK(rc==EDITOR_OK || rc==EDITOR_MORE);
+        editor_stats stats=editor_get_stats(e);
+        if (!stats.pending && !stats.render_active) return;
+        pause_worker();
+    } while (trace_now_ns()<deadline);
+    CHECK(false);
+}
+static void panel_key(editor *e, uint32_t symbol, uint16_t mods)
+{
+    plat_event ev={.kind=PLAT_EV_KEY,.press=true,.keysym=symbol,.mods=mods};
+    CHECK(editor_inject(e,&ev)==EDITOR_OK); panel_settle(e);
+}
+static void panel_query(editor *e, const char *text, size_t cursor)
+{
+    findui_state state=findui_get_state(&e->find);
+    CHECK(state.query_length==strlen(text) && state.query_cursor==cursor);
+    CHECK(!memcmp(state.query,text,state.query_length));
+}
+static void panel_editing_chords(void)
+{
+    const char text[]="alpha beta";
+    render_backend backend={0}; CHECK(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,
+        .cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; CHECK(editor_open(&e,&cfg,&backend)==0); panel_settle(e);
+    panel_key(e,'a',PLAT_MOD_CTRL); panel_key(e,'c',PLAT_MOD_CTRL);
+    panel_key(e,XKB_KEY_End,PLAT_MOD_CTRL);
+    view_selection selected=editor_view(e).selection;
+    uint64_t revision=e->buffer->revision;
+    panel_key(e,'f',PLAT_MOD_CTRL);
+    edit_malloc_guard_begin();
+    panel_key(e,'v',PLAT_MOD_CTRL);
+    CHECK(edit_malloc_guard_end()==0);
+    same(e->tree,(const uint8_t *)text,sizeof text-1);
+    panel_query(e,text,sizeof text-1);
+    edit_malloc_guard_begin();
+    panel_key(e,XKB_KEY_Left,PLAT_MOD_CTRL);
+    panel_query(e,text,sizeof "alpha "-1);
+    panel_key(e,XKB_KEY_Left,PLAT_MOD_CTRL); panel_query(e,text,0);
+    panel_key(e,XKB_KEY_Right,PLAT_MOD_CTRL); panel_query(e,text,sizeof "alpha"-1);
+    panel_key(e,XKB_KEY_End,0); panel_key(e,XKB_KEY_BackSpace,PLAT_MOD_CTRL);
+    panel_query(e,"alpha ",sizeof "alpha "-1);
+    panel_key(e,'a',PLAT_MOD_CTRL); CHECK(e->find_field_all);
+    panel_key(e,'v',PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
+    /* Ctrl+X is deliberately consumed as a field no-op; other global chords
+     * must leave both the selected document and the panel state untouched. */
+    const uint32_t consumed[]={'x','z','y','s','w','n','t',XKB_KEY_Delete,XKB_KEY_Up,XKB_KEY_Down};
+    for (size_t i=0;i<sizeof consumed/sizeof *consumed;i++) {
+        panel_key(e,consumed[i],PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
+        same(e->tree,(const uint8_t *)text,sizeof text-1);
+        CHECK(tabs_count(&e->tabs)==1 && e->buffer->revision==revision);
+        CHECK(e->v.state.selection.cursor==selected.cursor && e->v.state.selection.anchor==selected.anchor);
+    }
+    const struct { uint32_t sym; uint16_t mods; } other_chords[]={
+        {'v',PLAT_MOD_CTRL|PLAT_MOD_ALT}, {'a',PLAT_MOD_SUPER},
+        {XKB_KEY_Return,PLAT_MOD_ALT}, {XKB_KEY_Tab,PLAT_MOD_ALT},
+        {'F',PLAT_MOD_CTRL|PLAT_MOD_SHIFT}
+    };
+    for (size_t i=0;i<sizeof other_chords/sizeof *other_chords;i++) {
+        panel_key(e,other_chords[i].sym,other_chords[i].mods); panel_query(e,text,sizeof text-1);
+        CHECK(e->buffer->revision==revision && e->v.state.selection.cursor==selected.cursor &&
+            e->v.state.selection.anchor==selected.anchor);
+    }
+    const uint32_t toggles[]={'r','c','w'};
+    findui_options options=findui_get_state(&e->find).options;
+    for (size_t i=0;i<sizeof toggles/sizeof *toggles;i++) {
+        panel_key(e,toggles[i],PLAT_MOD_ALT); panel_key(e,toggles[i],PLAT_MOD_ALT);
+    }
+    findui_options restored=findui_get_state(&e->find).options;
+    CHECK(options.regex==restored.regex && options.match_case==restored.match_case &&
+        options.whole_word==restored.whole_word);
+    const char unicode[]="é 中"; /* combining cluster, NBSP, CJK word */
+    CHECK(findui_set_query(&e->find,(const uint8_t *)unicode,sizeof unicode-1)==FINDUI_OK);
+    e->find_field_all=false;
+    panel_key(e,XKB_KEY_Left,PLAT_MOD_CTRL); panel_query(e,unicode,sizeof "é "-1);
+    panel_key(e,XKB_KEY_BackSpace,PLAT_MOD_CTRL); panel_query(e,"中",0);
+    panel_key(e,'a',PLAT_MOD_CTRL); panel_key(e,XKB_KEY_BackSpace,PLAT_MOD_CTRL); panel_query(e,"",0);
+    panel_key(e,'h',PLAT_MOD_CTRL); panel_key(e,XKB_KEY_Tab,0);
+    panel_key(e,'v',PLAT_MOD_CTRL);
+    findui_state state=findui_get_state(&e->find);
+    CHECK(state.replacement_focus && state.replacement_length==sizeof text-1);
+    CHECK(!memcmp(state.replacement,text,sizeof text-1)); panel_query(e,"",0);
+    panel_key(e,XKB_KEY_BackSpace,PLAT_MOD_CTRL);
+    state=findui_get_state(&e->find); CHECK(state.replacement_length==sizeof "alpha "-1);
+    panel_key(e,XKB_KEY_Tab,0);
+    uint8_t full[FINDUI_QUERY_BYTES]; memset(full,'q',sizeof full);
+    CHECK(findui_set_query(&e->find,full,sizeof full)==FINDUI_OK); e->find_field_all=false;
+    panel_key(e,'v',PLAT_MOD_CTRL); state=findui_get_state(&e->find);
+    CHECK(state.query_length==sizeof full && !memcmp(state.query,full,sizeof full));
+    same(e->tree,(const uint8_t *)text,sizeof text-1); CHECK(e->buffer->revision==revision);
+    CHECK(edit_malloc_guard_end()==0);
+    panel_key(e,XKB_KEY_Escape,0); CHECK(!e->find_visible);
+    panel_key(e,'v',PLAT_MOD_CTRL);
+    same(e->tree,(const uint8_t *)"alpha betaalpha beta",2u*(sizeof text-1));
+    editor_close(e);
+    puts("edit-m15 find panel: clipboard/query chords isolated from document passed");
+}
+
 int main(void)
 {
+    if (getenv("EDIT_M15_PANEL")) { panel_editing_chords(); return 0; }
+    panel_editing_chords();
     if (getenv("EDIT_LEZ_REGEX_WORD")) { whole_word_regex_worker(); return 0; }
     if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
     if (getenv("P4_SPARSE_PAGES")) { sparse_page_work(); return 0; }

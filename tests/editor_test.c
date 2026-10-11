@@ -3461,6 +3461,111 @@ static plat_event pointer_event(editor *e, plat_ev_kind kind, uint32_t row,
         .y=(int32_t)((row+e->tab_rows)*e->grid.dims.cell_h)};
     return ev;
 }
+/* edit-m15: geometry reuses mouse_contract. Grow from a short source to a
+ * full visible viewport, then exercise stale hits independently of layout. */
+static int gutter_click_contract(void)
+{
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    const char initial[]="old";
+    editor_config cfg={.initial=(const uint8_t *)initial,.initial_len=sizeof initial-1,
+        .cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    uint64_t old_eof=editor_length(e);
+    T(e->row_byte[1]==LAYOUT_VOID_ROW);
+    T(editor_set_cursor(e,old_eof)==0); T(settle(e)==0);
+    edit_malloc_guard_begin();
+    for (uint32_t r=1;r<e->v.config.rows;r++) {
+        T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+        T(press(e,key('n',0,"new"))==0);
+    }
+    T(edit_malloc_guard_end()==0);
+    T(settle_map(e)==0);
+    const uint32_t row=1;
+    uint64_t start=e->row_byte[row]; T(start!=LAYOUT_VOID_ROW && start!=old_eof);
+    for (uint32_t c=0;c<e->lay.gw;c++) {
+        const editor_hit *hit=&e->hits[(size_t)row*e->max_cols+c];
+        T(hit->width && hit->before==start && hit->after==start);
+    }
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,row,0,true,trace_now_ns()); click.x=0;
+    T(press(e,click)==0); T(editor_view(e).selection.cursor==start);
+    click.press=false; T(press(e,click)==0);
+    /* A stale old-EOF hit must never be consulted, even if its width is zero.
+     * Reset the click chain to test an ordinary caret-placement click. */
+    e->click_ns=0;
+    e->hits[(size_t)row*e->max_cols]=(editor_hit){old_eof,old_eof,0,1};
+    edit_malloc_guard_begin();
+    click.press=true; T(press(e,click)==0);
+    T(edit_malloc_guard_end()==0);
+    T(editor_view(e).selection.cursor==start && editor_view(e).selection.anchor==start);
+    editor_close(e); puts("edit-m15 gutter: filled viewport ignores stale old EOF passed"); return 0;
+}
+static int find_follow_before_top_contract(void)
+{
+    const char text[]="before\nafter\nlast";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,
+        .cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    /* Inject 3kk's adopted approximate top, after the find anchor. This
+     * isolates the large-file/inexact-count state without a worker race. */
+    e->buffer->scroll.first_byte=sizeof "before\n"-1;
+    e->buffer->scroll.first_line=e->buffer->scroll.anchor_line=1;
+    e->buffer->scroll.approximate=true;
+    e->buffer->scroll_display=e->buffer->scroll;
+    editor_scroll_mirror(e);
+    e->v.state.selection.anchor=0; e->v.state.selection.cursor=sizeof "before"-1;
+    e->v.state.hscroll=sizeof "before"-1;
+    e->wheel_pending=true; e->find_scroll=true;
+    T(e->v.state.selection.anchor<e->v.state.first_byte);
+    T(editor_step(e,0)==EDITOR_OK); T(e->error==0);
+    T(!e->wheel_pending && !e->find_scroll);
+    T(e->v.state.hscroll==sizeof "before"-1);
+    T(editor_scroll_seek(e,0)==0); T(settle(e)==0);
+    T(editor_view(e).first_byte==0 && e->error==0);
+    editor_close(e); puts("edit-m15 find: anchor before approximate top is nonfatal passed"); return 0;
+}
+static int gutter_growth_contract(void)
+{
+    /* G: the supplied decimal-width transition, 99 -> 100 logical lines.
+     * One line's bytes come from the literal; LF separates all but the last. */
+    enum { lines=99 };
+    const char line[]="text\n";
+    uint8_t text[lines*(sizeof line-1)];
+    for (size_t i=0;i<lines;i++) memcpy(text+i*(sizeof line-1),line,sizeof line-1);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=text,.initial_len=sizeof text-1,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    uint32_t old_gw=e->lay.gw;
+    T(press(e,key(XKB_KEY_End,PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0); T(settle_map(e)==0);
+    T(e->lay.gw==old_gw+1);
+    uint64_t start=e->row_byte[0]; T(start!=LAYOUT_VOID_ROW);
+    for (uint32_t c=0;c<e->lay.gw;c++) {
+        const editor_hit *hit=&e->hits[c]; T(hit->width && hit->before==start && hit->after==start);
+    }
+    /* Model an old text-cluster hit in the newly claimed gutter column. */
+    e->hits[old_gw]=(editor_hit){start+1,start+2,0,1};
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,0,0,true,trace_now_ns());
+    click.x=(int32_t)(old_gw*e->grid.dims.cell_w);
+    T(press(e,click)==0); T(editor_view(e).selection.cursor==start);
+    editor_close(e); puts("edit-m15 gutter: decimal widening ignores old text hit passed"); return 0;
+}
+static int gutter_wrap_contract(void)
+{
+    /* E: two surface widths of text guarantee a continuation with the
+     * minimap/gutter reducing usable text columns. No source byte lookup. */
+    uint8_t text[2u*40u]; memset(text,'x',sizeof text);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=text,.initial_len=sizeof text,.cols=40,.rows=8,.wrap_mode=1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    T(e->lay.wrap_rows[1].continuation && e->row_byte[1]>0);
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,1,0,true,trace_now_ns()); click.x=0;
+    T(press(e,click)==0); T(editor_view(e).selection.cursor==0);
+    for (uint32_t c=0;c<e->lay.gw;c++) {
+        const editor_hit *hit=&e->hits[e->max_cols+c]; T(hit->width && hit->before==0 && hit->after==0);
+    }
+    editor_close(e); puts("edit-m15 gutter: wrapped continuation uses logical line start passed"); return 0;
+}
 static int mouse_contract(void)
 {
     const char text[]="alpha beta\n\tA界é z\nlast";
@@ -3746,6 +3851,10 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
+        if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
+        if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
+        if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
+        if (!strcmp(argv[1], "--m15-follow")) return find_follow_before_top_contract();
         if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
         if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
@@ -3815,6 +3924,8 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(minimap_compose_pixels(NULL) == 0);
+    T(gutter_click_contract()==0); T(gutter_growth_contract()==0); T(gutter_wrap_contract()==0);
+    T(find_follow_before_top_contract()==0);
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
     T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);
     T(minimap_typing_flash() == 0);

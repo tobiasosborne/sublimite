@@ -345,6 +345,8 @@ int layout_run(layout *l)
         if (l->phase == 0) {
             uint64_t start = l->row_byte[l->row];
             l->hit_cr=false;
+            /* Initialize the entire row, including the current gutter. This
+             * replaces old EOF/text hits when a row fills or gw widens. */
             if (l->cfg.hit) l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->grid->dims.cols,0,1,
                 start==LAYOUT_VOID_ROW ? l->total : start,start==LAYOUT_VOID_ROW ? l->total : start);
             if (start == LAYOUT_VOID_ROW) {

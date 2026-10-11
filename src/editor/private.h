@@ -316,6 +316,7 @@ void editor_clip_stop(editor *e);
 void editor_clip_close(editor *e);
 void editor_clip_selection(editor *e);
 int editor_clip_action(editor *e, keys_action action, const plat_event *ev);
+int editor_clip_find_paste(editor *e);
 int editor_clip_event(editor *e, const plat_event *ev);
 int editor_clip_poll(editor *e);
 bool editor_clip_busy(const editor *e);
@@ -401,6 +402,7 @@ int editor_find_init(editor *e);
 void editor_find_close(editor *e);
 int editor_find_service(editor *e);
 bool editor_find_key(editor *e, const plat_event *ev);
+int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement);
 int editor_find_paint(editor *e);
 int editor_find_replace_continue(editor *e);
 findui_mutation_result editor_find_delete(void *ctx, undo_log *undo, uint64_t off, uint64_t len,

@@ -101,8 +101,12 @@ static void start_row(layout *l,render_cell *cells)
     if(!l->wrap_sink && !l->wrap_planning && l->row+1u==l->grid->dims.rows)
         l->wrap_plan[l->row].next=r->start;
     gutter(l,cells,r);
-    if(!l->wrap_sink && !l->wrap_planning && l->cfg.hit)
+    if(!l->wrap_sink && !l->wrap_planning && l->cfg.hit) {
         l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->grid->dims.cols,0,1,r->start,r->start);
+        /* A continuation's text starts at r->start; its gutter still names
+         * the logical line. Refresh it on every drawn row/geometry change. */
+        l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->gw,0,1,r->line_start,r->line_start);
+    }
     if(!l->wrap_sink && !l->wrap_planning) for(uint32_t c=0;c<l->vis;c++) cells[l->gw+c]=blank(l);
 }
 static void clear_row(layout *l,render_cell *cells,uint32_t written)

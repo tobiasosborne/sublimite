@@ -1066,6 +1066,14 @@ int editor_handle_wheel(editor *e, const plat_event *ev)
 /* Source-free hit testing from the exact cluster/cell metadata layout drew. */
 static bool pointer_byte(editor *e, uint32_t row, uint32_t cell, uint32_t pixel, uint64_t *out)
 {
+    /* Gutters identify logical lines, independently of text hit storage,
+     * horizontal clipping and wrapped continuation columns. */
+    if (cell<e->lay.gw) {
+        uint64_t start=e->row_byte[row];
+        if (start!=LAYOUT_VOID_ROW && e->v.state.wrap) start=e->lay.wrap_rows[row].line_start;
+        *out=start==LAYOUT_VOID_ROW ? piece_len(e->tree) : start;
+        return true;
+    }
     const editor_hit *hit=&e->hits[(size_t)row*e->max_cols+cell];
     if (!hit->width) return false;
     uint64_t position=(uint64_t)hit->within*e->grid.dims.cell_w+pixel;
@@ -1108,7 +1116,7 @@ int editor_pointer(editor *e, const plat_event *ev)
         uint64_t now=ev->t0_ns ? ev->t0_ns : trace_now_ns();
         /* E: reuse the existing blink interval as the click-chain interval;
          * no delay is imposed on handling any click. Same cell and buffer only. */
-        bool chain=e->click_ns && now>=e->click_ns && now-e->click_ns<=EDITOR_BLINK_NS &&
+        bool chain=col>=e->lay.gw && e->click_ns && now>=e->click_ns && now-e->click_ns<=EDITOR_BLINK_NS &&
             e->click_row==(uint32_t)row && e->click_col==(uint32_t)col;
         e->click_count=chain ? e->click_count%3u+1u : 1u;
         e->text_drag_mode=(ev->mods&PLAT_MOD_SHIFT) ? 1u : e->click_count;
@@ -1138,7 +1146,10 @@ int editor_pointer(editor *e, const plat_event *ev)
 static int find_horizontal_follow(editor *e)
 {
     uint64_t start=e->v.state.first_byte, target=e->v.state.selection.anchor;
-    if (target<start) return EDITOR_ERR_ARG;
+    /* An inexact-count seek may adopt an approximate top beyond the match.
+     * There is no horizontal column to derive from that row; keep hscroll
+     * and let subsequent navigation repair the vertical position. */
+    if (target<start) return 0;
     uint64_t offset=target-start, available=piece_len(e->tree)-start;
     size_t n=(size_t)(available<LAYOUT_BYTE_BUDGET ? available : LAYOUT_BYTE_BUDGET);
     uint64_t column=offset;

@@ -29,6 +29,7 @@ struct editor_clip {
     bool ready, waiting, cutting, hitting, cluster_live, primary_waiting;
     bool cut_line;
     uint64_t cut_off, cut_len;
+    bool find_paste, find_replacement;
     uint64_t hit_byte, hit_column, hit_target, cluster_start, pointer_ns;
     uint8_t cluster_first;
     utf8_cseg segment;
@@ -302,6 +303,10 @@ int editor_clip_continue(editor *e)
 static int receive_text(editor *e, const uint8_t *raw, size_t len)
 {
     editor_clip *c = e->clipboard;
+    if (c->find_paste) {
+        c->waiting=false; c->find_paste=false;
+        return editor_find_paste(e,raw,len,c->find_replacement);
+    }
     if (len > X11_CLIP_DATA_MAX || (len && !raw)) { c->waiting = false; e->stats.rejected_commands++; return 0; }
     if (!raw) { c->waiting = false; return 0; }
     uint8_t *text = len ? clip_alloc(c, len) : NULL;
@@ -317,9 +322,11 @@ static int receive_text(editor *e, const uint8_t *raw, size_t len)
     size_t normalized = j->written; j->text = NULL; memset(j, 0, sizeof *j);
     return start_replace(e, text, normalized, len);
 }
-static int request_paste(editor *e, int which)
+static int request_paste(editor *e, int which, bool find_field)
 {
     editor_clip *c = e->clipboard;
+    c->find_paste=find_field;
+    if (find_field) c->find_replacement=findui_get_state(&e->find).replacement_focus;
     c->which = which; c->waiting = true;
     if (which == PLAT_CLIP_PRIMARY && (c->desired || c->primary.handle.epoch)) {
         c->primary_waiting = true; return 0;
@@ -337,13 +344,18 @@ static int request_paste(editor *e, int which)
      * blobs; the pure buffer accessor is shared with the native transport. */
     return receive_text(e, b ? x11_clip_buf_data(b) : NULL, b ? x11_clip_buf_len(b) : 0);
 }
+int editor_clip_find_paste(editor *e)
+{
+    if (editor_clip_busy(e)) return 0;
+    return request_paste(e,PLAT_CLIP_CLIPBOARD,true);
+}
 int editor_clip_action(editor *e, keys_action action, const plat_event *ev)
 {
     if (!tabs_count(&e->tabs) || editor_clip_busy(e)) return 0;
     int rc = begin_command(e, ev->t0_ns); if (rc) return rc;
     trace_input_key(e->edit_time_ns, TRACE_IN_KEY_DOWN, ev->keysym, ev->mods,
         ev->repeat, (const char *)ev->utf8, ev->utf8_len);
-    if (action == KEYS_ACTION_PASTE) { e->clipboard->cut_line = false; return request_paste(e, PLAT_CLIP_CLIPBOARD); }
+    if (action == KEYS_ACTION_PASTE) { e->clipboard->cut_line = false; return request_paste(e, PLAT_CLIP_CLIPBOARD, false); }
     uint64_t off = lesser(e->old_selection.cursor, e->old_selection.anchor);
     uint64_t length = greater(e->old_selection.cursor, e->old_selection.anchor) - off;
     bool whole_line = !length;
@@ -386,7 +398,7 @@ static int finish_hit(editor *e, uint64_t byte)
     undo_break_burst(e->undo);
     int rc = editor_refresh_cursor(e, e->old_cursor); if (rc) return rc;
     rc = begin_command(e, c->pointer_ns); if (rc) return rc;
-    return request_paste(e, PLAT_CLIP_PRIMARY);
+    return request_paste(e, PLAT_CLIP_PRIMARY, false);
 }
 static int middle_continue(editor *e)
 {
@@ -456,7 +468,7 @@ int editor_clip_event(editor *e, const plat_event *ev)
         bool accepted; int rc = middle_target(e, ev, &accepted); if (rc || !accepted) return rc;
         if (c->hitting) return editor_clip_continue(e);
         rc = begin_command(e, ev->t0_ns); if (rc) return rc;
-        return request_paste(e, PLAT_CLIP_PRIMARY);
+        return request_paste(e, PLAT_CLIP_PRIMARY, false);
     }
     if (e->buffer->source_stale || e->buffer->pending_open) { c->waiting = false; return 0; }
     if (!c->waiting || ev->clip_which != c->which || ev->code == 2) return 0;
@@ -490,7 +502,7 @@ int editor_clip_poll(editor *e)
         }
     }
     if (c->primary_waiting && !c->desired && !p->handle.epoch)
-        return request_paste(e, PLAT_CLIP_PRIMARY);
+        return request_paste(e, PLAT_CLIP_PRIMARY, false);
     if (j->handle.epoch && j->received && work_handle_finished(&e->pool, j->handle)) {
         int rc = j->status;
         if (j->paste) {

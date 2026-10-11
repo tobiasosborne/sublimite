@@ -213,6 +213,77 @@ static void field_select_all(editor *e)
     } else (void)findui_set_query_cursor(&e->find,state.query_length);
     e->find_field_all=true;
 }
+/* Field word motion uses the view's whitespace/word/separator policy on
+ * grapheme boundaries. The query's fixed capacity bounds the scan. */
+static int field_class(const uint8_t *bytes, size_t length)
+{
+    utf8_step scalar=utf8_decode(bytes,length); uint32_t cp=scalar.cp;
+    if (!scalar.valid) return 0;
+    if (cp==' ' || cp=='\t' || cp=='\r' || cp=='\n' || cp=='\v' || cp=='\f' ||
+        cp==0x85 || cp==0xa0 || cp==0x1680 || (cp>=0x2000 && cp<=0x200a) ||
+        cp==0x2028 || cp==0x2029 || cp==0x202f || cp==0x205f || cp==0x3000) return 2;
+    if (cp && cp<128 && strchr("./\\()\"'-:,.;<>~!@#$%^&*|+=[]{}`~?",(int)cp)) return 1;
+    return 0;
+}
+static size_t field_word_left(const uint8_t *bytes, size_t cursor)
+{
+    size_t at=0, run=0, result=0; int kind=-1;
+    while (at<cursor) {
+        size_t step=utf8_grapheme_next(bytes+at,cursor-at);
+        int next=field_class(bytes+at,step);
+        if (next!=kind) { run=at; kind=next; }
+        if (next!=2) result=run;
+        at+=step;
+    }
+    return result;
+}
+static size_t field_word_right(const uint8_t *bytes, size_t length, size_t cursor)
+{
+    size_t at=cursor; int kind=-1;
+    while (at<length) {
+        size_t step=utf8_grapheme_next(bytes+at,length-at);
+        int next=field_class(bytes+at,step);
+        if (kind<0 && next!=2) kind=next;
+        else if (kind>=0 && next!=kind) break;
+        at+=step;
+    }
+    return at;
+}
+static void field_edit(editor *e, findui_state state, size_t at, size_t erase,
+                       const uint8_t *insert, size_t add)
+{
+    size_t length=state.replacement_focus ? state.replacement_length : state.query_length;
+    if (add>sizeof e->find_edit-(length-erase)) { e->stats.rejected_commands++; return; }
+    if (state.replacement_focus) {
+        memcpy(e->find_edit,state.replacement,at);
+        if (add) memcpy(e->find_edit+at,insert,add);
+        memcpy(e->find_edit+at+add,state.replacement+at+erase,length-at-erase);
+        e->find_error=(int)findui_set_replacement(&e->find,e->find_edit,length-erase+add,at+add);
+    } else if (erase || add) {
+        e->find_error=(int)findui_edit_query(&e->find,at,erase,insert,add); e->find_navigated=false;
+    } else e->find_error=(int)findui_set_query_cursor(&e->find,at);
+}
+int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement)
+{
+    if (!e->find_visible || e->find_replace_active || !bytes) return 0;
+    /* Field paste stays bounded by its setup-reserved query capacity; native
+     * replies retain their field destination and never enter document undo.
+     * Normalize CRLF like document paste, without clipboard heap staging. */
+    if (length>FINDUI_QUERY_BYTES) { e->stats.rejected_commands++; return 0; }
+    uint8_t normalized[FINDUI_QUERY_BYTES]; size_t count=0;
+    for (size_t i=0;i<length;i++) {
+        if (bytes[i]=='\r' && i+1u<length && bytes[i+1u]=='\n') continue;
+        normalized[count++]=bytes[i];
+    }
+    findui_state state=findui_get_state(&e->find);
+    if (state.replacement_focus!=replacement) return 0;
+    size_t cursor=replacement ? state.replacement_cursor : state.query_cursor;
+    size_t old=replacement ? state.replacement_length : state.query_length;
+    size_t erase=e->find_field_all ? old : 0;
+    field_edit(e,state,e->find_field_all ? 0 : cursor,erase,normalized,count);
+    e->find_field_all=false;
+    return editor_begin_frame(e);
+}
 bool editor_find_key(editor *e, const plat_event *ev)
 {
     if (!e->find.private_ || !ev->press) return false;
@@ -239,22 +310,35 @@ bool editor_find_key(editor *e, const plat_event *ev)
         e->find_error=geometry(e); return true;
     }
     if (e->find_replace_active) return true;
+    bool alt=(ev->mods&PLAT_MOD_ALT)!=0, super=(ev->mods&PLAT_MOD_SUPER)!=0;
+    bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
+    /* Focus owns editing chords. Keep the existing find/replace shortcuts
+     * above and Ctrl(+Alt)+Enter below; everything else stays in the panel. */
+    if (super || (ctrl && alt && !enter)) return true;
     if (ctrl && (ev->keysym=='a' || ev->keysym=='A')) {
         field_select_all(e); (void)editor_begin_frame(e); return true;
     }
-    if (ctrl && ev->keysym!=XKB_KEY_Return && ev->keysym!=XKB_KEY_KP_Enter) return false;
+    if (ctrl && (ev->keysym=='v' || ev->keysym=='V')) {
+        e->find_error=editor_clip_find_paste(e); return true;
+    }
+    /* Ctrl+X (and unsupported global chords) is a consumed no-op. */
+    if (ctrl && !enter && ev->keysym!=XKB_KEY_Left && ev->keysym!=XKB_KEY_Right &&
+        ev->keysym!=XKB_KEY_BackSpace) return true;
+    if (alt && !ctrl) {
+        findui_options options=state.options;
+        if (ev->keysym=='r' || ev->keysym=='R') options.regex=!options.regex;
+        else if (ev->keysym=='c' || ev->keysym=='C') options.match_case=!options.match_case;
+        else if (ev->keysym=='w' || ev->keysym=='W') options.whole_word=!options.whole_word;
+        else return true;
+        (void)findui_set_options(&e->find,options); e->find_navigated=false;
+        (void)editor_begin_frame(e); return true;
+    }
     if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
         if (ctrl && state.replace_mode) replace_begin(e,(ev->mods&PLAT_MOD_ALT)!=0);
         else navigate(e,shift ? -1 : 1);
     } else if (ev->keysym==XKB_KEY_Tab && state.replace_mode) {
         (void)findui_focus_replacement(&e->find,!state.replacement_focus);
         field_select_all(e);
-    } else if ((ev->mods&PLAT_MOD_ALT) && !(ev->mods&PLAT_MOD_CTRL)) {
-        findui_options options=state.options;
-        if (ev->keysym=='r' || ev->keysym=='R') options.regex=!options.regex;
-        if (ev->keysym=='c' || ev->keysym=='C') options.match_case=!options.match_case;
-        if (ev->keysym=='w' || ev->keysym=='W') options.whole_word=!options.whole_word;
-        (void)findui_set_options(&e->find,options); e->find_navigated=false;
     } else {
         const uint8_t *bytes=state.replacement_focus ? state.replacement : state.query;
         size_t length=state.replacement_focus ? state.replacement_length : state.query_length;
@@ -265,23 +349,20 @@ bool editor_find_key(editor *e, const plat_event *ev)
             at=0; erase=length;
             if (ev->keysym!=XKB_KEY_BackSpace && ev->keysym!=XKB_KEY_Delete) add=ev->utf8_len;
             e->find_field_all=false;
-        } else if (ev->keysym==XKB_KEY_Left) { at=e->find_field_all ? 0 : cursor ? utf8_grapheme_prev(bytes,cursor) : 0; e->find_field_all=false; }
-        else if (ev->keysym==XKB_KEY_Right) { at=e->find_field_all ? length : cursor<length ? cursor+utf8_grapheme_next(bytes+cursor,length-cursor) : length; e->find_field_all=false; }
-        else if (ev->keysym==XKB_KEY_Home) { at=0; e->find_field_all=false; }
+        } else if (ev->keysym==XKB_KEY_Left) {
+            at=e->find_field_all ? 0 : ctrl ? field_word_left(bytes,cursor) : cursor ? utf8_grapheme_prev(bytes,cursor) : 0;
+            e->find_field_all=false;
+        } else if (ev->keysym==XKB_KEY_Right) {
+            at=e->find_field_all ? length : ctrl ? field_word_right(bytes,length,cursor) :
+                cursor<length ? cursor+utf8_grapheme_next(bytes+cursor,length-cursor) : length;
+            e->find_field_all=false;
+        } else if (ev->keysym==XKB_KEY_Home) { at=0; e->find_field_all=false; }
         else if (ev->keysym==XKB_KEY_End) { at=length; e->find_field_all=false; }
         else if (ev->keysym==XKB_KEY_BackSpace && cursor) {
-            at=utf8_grapheme_prev(bytes,cursor); erase=cursor-at;
+            at=ctrl ? field_word_left(bytes,cursor) : utf8_grapheme_prev(bytes,cursor); erase=cursor-at;
         } else if (ev->keysym==XKB_KEY_Delete && cursor<length) erase=utf8_grapheme_next(bytes+cursor,length-cursor);
         else if (ev->utf8_len && !(ev->mods&(PLAT_MOD_CTRL|PLAT_MOD_SUPER))) add=ev->utf8_len;
-        if (length-erase+add<=sizeof e->find_edit) {
-            memcpy(e->find_edit,bytes,at);
-            if (add) memcpy(e->find_edit+at,ev->utf8,add);
-            memcpy(e->find_edit+at+add,bytes+at+erase,length-at-erase);
-            if (state.replacement_focus) (void)findui_set_replacement(&e->find,e->find_edit,length-erase+add,at+add);
-            else if (erase || add) {
-                (void)findui_edit_query(&e->find,at,erase,ev->utf8,add); e->find_navigated=false;
-            } else (void)findui_set_query_cursor(&e->find,at);
-        }
+        field_edit(e,state,at,erase,ev->utf8,add);
     }
     (void)editor_begin_frame(e); return true;
 }
