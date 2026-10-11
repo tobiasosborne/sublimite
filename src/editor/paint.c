@@ -153,7 +153,7 @@ static int compose(editor *e)
         int rc = compose_chrome(e);
         return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
     }
-    if (e->caret_only) {
+    if (e->caret_only || e->glyph_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
         for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
             if (!(e->text_grid.dirty[r / 64] & (UINT64_C(1) << (r % 64)))) continue;

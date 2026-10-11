@@ -207,3 +207,111 @@ the held index job finished. It is explicitly excluded from the text-row damage
 assertion and was not fixed. Some inherited test diagnostics hardcode an AC tag;
 this session's power probe reports battery, so those printed tags should not be
 used to infer the power source. No unrelated test/performance code was changed.
+
+## Rebase continuation: glyph completion and minimap fills (2026-10-11)
+
+Cause: `editor_font_event()` damaged visible users of an adopted slot by calling
+`editor_begin_frame()`. That helper clears `caret_only`, including when it reuses
+an already dirty caret frame. `editor_compose()` then took its ordinary path,
+which calls `minimap_fill()` unconditionally. Glyph pixels and atlas descriptors
+changed, but neither the text revision nor the minimap input changed. A glyph
+completion during the explicit drain between the two G11 blink submissions could
+therefore advance `minimap_fills` after the test captured its baseline. Runtime
+atlas rebinding itself does not invalidate the map; the frame's composition scope
+was the cause.
+
+Fix: add a separate `glyph_only` composition flag. Adoption retains this scope
+for a clean frame, an existing glyph frame, or a caret frame. Ordinary frame
+requests clear it, so text edits, layout changes and index publication still get
+normal composition. Blink/focus refresh preserves an existing glyph-only frame.
+The limited compose path copies changed text rows while retaining minimap and
+chrome cells; the font handler already damages rows containing the adopted slot,
+including Unicode tab titles. Pixel-only damage does not set the raster
+cursor-only hint: unchanged cell metadata must still redraw the new artwork.
+No layout restart, minimap invalidation or heap allocation was added.
+
+Added a deterministic null-backend regression to `unicode_render_test`: hold the
+bulk worker while the placeholder frame and map settle, wait for actual mailbox
+publication, then adopt alongside idle, pending caret, blink, text input, focus,
+and Unicode-title cases. It checks the exact dirty-row union, unchanged retained
+cells, unchanged minimap cells/revision/staleness and zero additional fills when
+the text did not change. The input case checks that normal map filling remains
+enabled. Existing Unicode bitmap, width, combining, scalar/SIMD, mailbox and
+allocation checks remain present.
+
+The regression was run red with the original font event handler restored, then
+the production fix was restored and rebuilt. Assertions were not relaxed:
+
+```text
+ASAN_OPTIONS=detect_leaks=0 build/san/tests/unicode_render_test
+unicode_render_test:222: FAIL e->stats.minimap_fills == fills
+unicode_render_test:307: FAIL glyph_minimap_repaint() == 0
+```
+
+Final sanitizer and release Unicode runs both exit 0:
+
+```text
+unicode_render_test: minimap completion mode=0 fills=0 damage=4
+unicode_render_test: minimap completion mode=1 fills=0 damage=4
+unicode_render_test: minimap completion mode=2 fills=0 damage=6
+unicode_render_test: minimap completion mode=3 fills=2 damage=7
+unicode_render_test: minimap completion mode=4 fills=0 damage=6
+unicode_render_test: minimap completion mode=5 fills=0 damage=5
+unicode_render_test: initial and injected é α 日 🙂; widths, combining overlay, atlas pixels and allocation guard passed
+```
+
+Here damage is the union of submitted dirty-row bits in hexadecimal. Row 2 holds
+the glyphs, row 1 holds the caret, and row 0 holds the title. Mode 3 includes a
+real text edit; its two fills cover the input and ready-map publication.
+
+Other final outputs:
+
+```text
+ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test --minimap-flash
+edit-g11 null typing: keys=95 frames=96 orange_frames=0 stale_frames=95 changed_pending=0 chrome_markers=0 mallocs=0 fill_max_ns=18972
+
+EDITOR_ALLOC_ONLY=null ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test
+editor_test: null 10000 keys mallocs=0 guard=ASan-inert
+EDITOR_ALLOC_ONLY=null build/tests/editor_test
+editor_test: null 10000 keys mallocs=0 guard=active
+
+font_test: all passed
+minimap_test: density, hit round trip, stale, malloc guard: ok
+GraphemeBreakTest: 1187 cases, 0 mismatches, 0 chunked mismatches
+utf8_test: all passed
+utf8 tables test: ok (Unicode 15.1.0, table bytes 16720)
+layout_test: all passed
+wrap_test: all passed
+```
+
+`make -j4 all build/san/tests/editor_test build/san/tests/unicode_render_test`
+exited 0 after the final edits. Compilation uses the unchanged Makefile's
+`-std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion` flags. The release Unicode
+and 10,000-key runs exercise the active malloc guard.
+
+The exact requested full command,
+`ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test`, was run before and after
+the fix. Both exit 1 at IPC/display-dependent review fixtures, before reaching
+the reported line-259 assertion. Final failure output:
+
+```text
+reload launcher result=4
+editor_test:1031: FAIL waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0
+editor_test:422: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:448: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:730: FAIL editor_open(&e, &cfg, &backend) == 0
+editor_test:1386: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:2000: FAIL review_suite(NULL) == 0
+```
+
+`ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test --raster-blink` exits 1
+at `editor_test:229: FAIL editor_open(&e, &cfg, &b) == 0`. Direct AF_UNIX probes
+for `/tmp/.X11-unix/X99` connect and temporary IPC bind both return
+`[Errno 1] Operation not permitted`. The full suite and native G11 raster blink
+case therefore still need an environment with socket/display access; they are
+not claimed green here. The null-backend regression, all Unicode tests,
+`--minimap-flash` and build are green. No git or bd commands were run.
+
+Logs: `build/edit-08z/minimap-rebase/` contains the red/green Unicode, release
+Unicode, flash, malloc guard, module checks, full editor, raster blink and final
+build outputs.

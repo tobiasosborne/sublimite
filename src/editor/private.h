@@ -143,6 +143,7 @@ struct editor {
     size_t drag_tab;
     uint64_t drag_id, map_drag_id, map_drag_generation;
     bool map_drag, paint_ready, caret_only;
+    bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     int raster_poll_fd;
     uint8_t *indent_bytes;
     indent_range *ws_ranges;

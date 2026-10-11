@@ -40,8 +40,12 @@ bool editor_font_event(editor *e, const work_msg *msg)
                 render_cell *cell = &g->cells[(size_t)row * g->dims.cols + col];
                 if (cell->atlas_slot != slot) continue;
                 if (!begun) {
+                    /* Preserve a limited frame only when no ordinary input,
+                     * layout or index publication also needs composition. */
+                    bool glyphs = !e->dirty || e->glyph_only || e->caret_only;
                     int rc = editor_begin_frame(e);
                     if (rc) { e->error = rc; return true; }
+                    e->glyph_only = glyphs;
                     begun = true;
                 }
                 if (!g->glyphs[slot].w) { cell->atlas_slot = RENDER_NO_SLOT; cell->glyph_index = 0; }

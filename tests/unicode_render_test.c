@@ -180,6 +180,77 @@ static int render_unicode(bool inject)
     return 0;
 }
 
+static int glyph_minimap_repaint(void)
+{
+    for (unsigned mode = 0; mode < 6; mode++) {
+        glyph_gate gate = {0};
+        render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
+        editor_config cfg = {.cols = 40, .rows = 6,
+            .initial = (const uint8_t *)"\naé日\nz\n", .initial_len = sizeof "\naé日\nz\n" - 1u,
+            .hook_ctx = &gate, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK); gate.editor = e;
+        work_handle blocker = work_submit(&e->pool, (work_job){block_bulk, &gate, 0, WORK_BULK});
+        T(blocker.epoch);
+        while (!atomic_load(&gate.started)) sched_yield();
+        if (mode == 5) T(tabs_rename(&e->tabs, tabs_active_index(&e->tabs), "é", sizeof "é" - 1u, "", 0) == TABS_OK);
+        /* Prepare the placeholder frame and index, keeping glyph work held. */
+        do {
+            int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+        } while (editor_get_stats(e).pending || e->buffer->map.stale);
+        T(font_async_pending(e->fonts));
+        render_cell before[40 * 6], map[8 * 5];
+        memcpy(before, e->grid.cells, sizeof before);
+        memcpy(map, e->map_grid.cells, sizeof map);
+        uint64_t fills = e->stats.minimap_fills, revision = e->buffer->map.revision;
+        uint64_t expected = UINT64_C(1) << (e->tab_rows + 1u);
+        if (mode == 5) expected |= UINT64_C(1); /* same pending image in the title */
+        gate.watch_damage = true;
+        atomic_store(&gate.release, true);
+        /* Wait for publication without adopting it: force the completion to
+         * meet a clean frame, a pending caret frame, a blink, or real input. */
+        while (!work_mailbox_pending(&e->pool)) sched_yield();
+        if (mode == 1) { T(editor_begin_frame(e) == EDITOR_OK); e->caret_only = true; }
+        if (mode == 2) e->next_blink = trace_now_ns();
+        if (mode == 3) {
+            plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .utf8_len = 1, .utf8 = {'x'}};
+            T(editor_inject(e, &ev) == EDITOR_OK);
+        }
+        if (mode == 4) {
+            plat_event ev = {.kind = PLAT_EV_FOCUS, .focused = false};
+            T(editor_inject(e, &ev) == EDITOR_OK);
+        }
+        T(settle(e) == 0);
+        T(gate.repaints > 0);
+        if (mode == 3) {
+            T(e->stats.minimap_fills > fills); /* input still takes normal composition */
+            T(e->buffer->revision != revision);
+        } else {
+            if (e->stats.minimap_fills != fills)
+                fprintf(stderr, "Unicode completion mode=%u extra minimap fills=%llu\n", mode,
+                    (unsigned long long)(e->stats.minimap_fills - fills));
+            T(e->stats.minimap_fills == fills);
+            T(!e->buffer->map.stale && e->buffer->map.revision == revision);
+            T(!memcmp(map, e->map_grid.cells, sizeof map));
+            if (mode == 2 || mode == 4) expected |= UINT64_C(1) << e->tab_rows;
+            T(gate.damage == expected);
+            for (uint32_t r = 0; r < e->grid.dims.rows; r++) {
+                if ((mode == 2 || mode == 4) && r == e->tab_rows) continue; /* caret visibility */
+                T(!memcmp(before + (size_t)r * e->grid.dims.cols,
+                    e->grid.cells + (size_t)r * e->grid.dims.cols,
+                    (size_t)e->grid.dims.cols * sizeof(render_cell)));
+            }
+        }
+        printf("unicode_render_test: minimap completion mode=%u fills=%llu damage=%llx\n",
+            mode, (unsigned long long)(e->stats.minimap_fills - fills), (unsigned long long)gate.damage);
+        if (mode != 3) {
+            e->next_blink = trace_now_ns(); T(editor_step(e, 0) >= 0);
+            T(e->stats.minimap_fills == fills);
+        }
+        editor_close(e);
+    }
+    return 0;
+}
+
 typedef struct owner_receiver { font_async *owner; render_grid *grid; bool duplicate; } owner_receiver;
 static void adopt(const work_msg *msg, void *ctx)
 {
@@ -244,6 +315,7 @@ int main(void)
     trace_init(); T(trace_thread_register() >= 0);
     T(render_unicode(false) == 0);
     T(render_unicode(true) == 0);
+    T(glyph_minimap_repaint() == 0);
     T(owner_mailbox() == 0);
     puts("unicode_render_test: initial and injected é α 日 🙂; widths, combining overlay, atlas pixels and allocation guard passed");
     return 0;

@@ -120,6 +120,7 @@ static int fail(editor *e, int cause)
 int editor_begin_frame(editor *e)
 {
     e->caret_only = false;
+    e->glyph_only = false;
     if (e->dirty) return 0;
     if (e->grid.frame_id == UINT32_MAX) return RENDER_ERR_FRAME;
     int rc = render_frame_begin(&e->grid, e->grid.frame_id + 1u);
@@ -415,9 +416,14 @@ static int refresh_caret(editor *e)
     /* Retain decorations and minimize composition only if this turn started
      * from a fully prepared grid. Concurrent input/layout takes the full path. */
     if (e->buffer->source_stale) return 0;
+    bool glyphs = e->dirty && e->glyph_only;
     bool caret = !e->dirty && e->paint_ready && !layout_busy(&e->lay) &&
                  !view_busy(&e->v) && !e->queue_count && !e->resize_pending;
     int rc = refresh_cursor(e, e->v.state.selection.cursor, caret);
+    /* A blink sharing a glyph repaint still changes no minimap input. Keep
+     * its text-only composition, but never give pixel damage the raster
+     * cursor-only hint (cell metadata may be unchanged on glyph arrival). */
+    if (glyphs && !rc && !e->grid.full_frame && !e->full_pending) e->glyph_only = true;
     if (caret && !rc && !e->grid.full_frame && !e->full_pending) { e->caret_only = true; e->paint_ready = true; }
     return rc;
 }
