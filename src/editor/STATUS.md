@@ -1,3 +1,21 @@
+# edit-a6v — initial painted surface follows launch geometry
+
+Explicit launch window pixels now take precedence over historical journal
+geometry after session recovery. Startup drops an equivalent queued resize;
+the created window, initial grid and submitted frames keep the same size.
+Native creation and raster reservations already honored launch geometry and
+needed no changes. Later native resize still uses the existing path.
+
+The headless null/CPU-capacity regression covers fresh startup, recovery from
+the legacy default geometry, retained document bytes and subsequent resize.
+Focused sanitizer/release red/green and the existing release typing allocation
+guard pass; GCC make all passes. Full check stops at sandbox-denied IPC setup.
+Individual headless suites pass except denied IPC and the mixed editor suite's
+pre-existing reload/wait failure. Native setup failures, the x11 order fixture's
+post-failure sanitizer crash and coordinator screenshot acceptance are recorded
+in the [worker report](../../docs/worker-reports/edit-a6v.md).
+Design: [edit-a6v](../../docs/decisions/edit-a6v.md).
+
 # edit-gdj — separate Shift chord regression
 
 The checked-in Astra review withdrew the original anchor-loss finding. Existing input/view code already retains the anchor across separate Shift chords. Added exact-range editor regressions for word, vertical, Home/End, document and page movement, reversal, modifier releases, and movement/mutation reset in wrapped and unwrapped views. The release allocation guard remains green. No production behavior changed.

@@ -232,6 +232,15 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         e->recovering = true; /* failed startup teardown must preserve its source */
         rc = editor_session_restore(e); if (rc) goto fail;
         e->recovering = false;
+        /* Recovery can queue the previous session's pixel geometry. Explicit
+         * launch extents already size the native window, grid and backend;
+         * do not shrink only the painted surface to that historical size. */
+        if (e->resize_pending) {
+            if (config->window_width) e->resize_w = e->font.window_width;
+            if (config->window_height) e->resize_h = e->font.window_height;
+            if (e->resize_w == e->font.window_width && e->resize_h == e->font.window_height)
+                e->resize_pending = false;
+        }
     }
     if (!config->start_empty && !tabs_count(&e->tabs)) {
         uint64_t id; rc = editor_add_buffer(e, config->path, config->initial, config->initial_len, &id);

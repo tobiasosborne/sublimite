@@ -5,6 +5,8 @@
 
 **Known visible defect on main:** at 243 DPI the window opens at 1728x1260 but the raster surface still paints 960x600 (build/design/main-dpi243-half.png) → **edit-a6v (P0)**, Codex worker was running at the cut (.wt/edit-a6v). Nothing goes to Tobias before a6v lands and Astra drive 2 says yes.
 
+**edit-a6v LANDED (evening):** the whole 1728x1260 window paints on :98 (build/design/a6v-dpi243.png); only the sub-cell remainder strip (8 px right, 20 px bottom) stays black.
+
 **Verified or resolved, not landed (worktrees .wt/<bead>, WIP-snapshotted):**
 - edit-3kk scroll wiring: all suites GREEN in its worktree (scroll, render, raster, minimap, editor, p4, cli) but the cherry-pick onto main conflicts with the config landing: rebase once more, resolve, land.
 - edit-v0o.7 config: LANDED after the wind-down note (all suites green, cherry-picked clean).
