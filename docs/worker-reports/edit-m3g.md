@@ -235,3 +235,91 @@ Its workload count comes from `allocation_test` in `tests/editor_test.c`; the
 required allocation count is law 2's zero (G). Existing editor review diagnostics
 print hardcoded AC tags even though the worker observed `Discharging`; this
 labeling discrepancy is reported without editing the unrelated diagnostics.
+
+## Post-rebase continuation — 2026-10-11
+
+Reproduced the requested whole-suite invocation:
+
+```sh
+ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test
+```
+
+Its first failure here was the sandbox-denied launcher IPC at line 1031,
+followed by native-open failures at lines 422 and 448. The requested null
+regression also reproduced, before the review aggregate returned failure:
+
+```text
+editor_test:64: FAIL false
+editor_test:770: FAIL settle(e) == 0
+editor_test:2000: FAIL review_suite(NULL) == 0
+```
+
+The actual timeout was inside `review_replay_slices`' four batches of 1024
+typed characters, rather than its initial empty frame. Temporary diagnostics
+showed queued input still making progress, dirty/incomplete layout, and font
+state `requested_px=applied_px=15`, `handle.epoch=0`, `received=false`.
+There was no outstanding atlas job or font completion to drain. CPU stack
+sampling located the repeated work in `layout_visual_row_fresh`,
+`layout_wrap_run`, `layout_refill` and `piece_read`.
+
+**Cause:** `scan_row` in `src/layout/wrap.c` called `reset_work` between every
+soft-wrapped query row. That reset discarded the query's source window.
+Each row then recopied the following source bytes into another window,
+although the tree is immutable for the duration of this UI-owned query.
+Repeated fresh cursor queries during typing multiplied those overlapping
+reads. The five-second settle deadline expired with hundreds of input events
+still queued; this was excessive work rather than a lost worker notification.
+
+**Fix:** reset the local query's row/phase/cluster continuation while preserving
+its input window between adjacent rows. `position` already retains or refills
+that window according to the next row's byte position, including word-wrap
+rewinds. Each new query still starts with an empty window and reads the current
+tree; fresh queries still ignore stale published row/checkpoint descriptors.
+No deadline, font policy, worker/epoll protocol, public API, allocation or typing
+reservation changed. Temporary test diagnostics were removed.
+
+The same four-batch diagnostic, using the existing five-second deadline,
+previously timed out in batch four at length 3478 with 618 events queued.
+After the fix it reached length 4096 and settled batch four in 1079525123 ns.
+These are loaded-host correctness diagnostics, not benchmark acceptance
+measurements. Raw before/after outputs are
+[before](../../build/edit-m3g/probe-batches.log) and
+[after](../../build/edit-m3g/probe-batches-green.log).
+
+Final verification:
+
+| Command / result | Evidence |
+|---|---|
+| `make all`: exit 0; C11 `-Wall -Wextra -Werror -Wshadow -Wconversion` | [build](../../build/edit-m3g/make-all-rebase.log) |
+| Whole `ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test`: completed, exit 1 solely from launcher/native-open failures; all headless review cases passed and no line-64/770 failure | [whole suite](../../build/edit-m3g/editor-whole-rebase.log) |
+| Sanitizer `EDITOR_REVIEW_ONLY=11-replay`: exit 0 | [focused replay](../../build/edit-m3g/replay-final.log) |
+| Sanitizer and release `font_size_test`: exit 0 | [sanitizer](../../build/edit-m3g/font-size-final.log), [release](../../build/edit-m3g/font-size-release.log) |
+| Sanitizer `font_test`: exit 0 | [font](../../build/edit-m3g/font-san.log) |
+| Sanitizer and release `wrap_test`: exit 0, including cursor, CRLF, Unicode/wide navigation, word-wrap, resize and allocation checks | [sanitizer](../../build/edit-m3g/wrap-san.log), [release](../../build/edit-m3g/wrap-release.log) |
+| Release `EDITOR_ALLOC_ONLY=null build/tests/editor_test`: exit 0, 10000 keys, mallocs=0, guard active | [typing allocation](../../build/edit-m3g/typing-alloc-release.log) |
+| Sanitizer `editor_p4_test`: exit 1 at line 540, IPC endpoint initialization denied before the raster scenario | [P4](../../build/edit-m3g/editor-p4-rebase.log) |
+| Sanitizer `x11_font_size_test`: exit 1 at display initialization | [native font](../../build/edit-m3g/x11-font-rebase.log) |
+
+Whole-suite remaining failure output:
+
+```text
+reload launcher result=4
+editor_test:1031: FAIL waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0
+editor_test:422: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:448: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:730: FAIL editor_open(&e, &cfg, &backend) == 0
+editor_test:1386: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:2000: FAIL review_suite(NULL) == 0
+```
+
+The same whole run prints successful multi-record replay, zero-growth replay
+recycling, mapped watch/focus/source recovery, sleeping journal workers, and
+all 22 injected allocation-failure rollback cases. Its 2000 aggregate failure
+therefore remains a sandbox/native result, rather than the reproduced settle
+regression. This checkout has standalone `font_size_test`/`font_test` and
+`x11_font_size_test`; its editor test defines no `--font-*` modes.
+
+The coordinator must rerun the raster/display `editor_p4_test` line-432
+scenario and native font sizing on its authorized display. This sandbox cannot
+reach that scenario, so the P4 timeout's cause or resolution is not claimed.
+No `git` or `bd` command was run during this continuation.
