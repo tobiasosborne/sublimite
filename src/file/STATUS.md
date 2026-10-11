@@ -1,3 +1,22 @@
+# edit-er2 — shared inotify service (src:astra)
+
+The file module now installs a process-wide inotify service and routes
+directory/name events through each file's existing CHECK_DONE mailbox.
+Closing or refreshing a shared parent-watch member preserves its peers.
+The borrowed shared fd forces the epoll caller adaptation in
+`src/editor/buffers.c`. The Source changed prompt literal is preserved.
+
+GCC `make all` and full release/sanitizer file suites pass. The local editor
+open regression, shared-fd retirement check and active typing allocation guard
+pass. Full socket/display/LSan acceptance needs the coordinator outside the
+sandbox; the real CLI regression and next Astra drive remain unverified.
+
+Red/green evidence, build results, sandbox limitations and remaining
+coordinator verification are in
+[the worker report](../../docs/worker-reports/edit-er2.md). Registry and
+lifetime decisions are in
+[the decision](../../docs/decisions/edit-er2.md).
+
 # edit-4w1.55 — P1-1 §§2–3, session 9
 
 Detected SIGBUS recovery now invalidates derived find/index results through a

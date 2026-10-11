@@ -790,6 +790,69 @@ static void t_display(const char *dir)
     }
     puts("ipc_test: exact display routing, same-display handoff, distinct primaries and bounds passed");
 }
+/* src:astra edit-er2: 200 (G) is the bead's required unique-file CLI handoff
+ * fixture; tab reservation is exactly the fixture count, not a new default. */
+#define ASTRA_OPEN_FILES 200u
+static void t_astra_many_open(const char *dir, bool handoff)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir, "astra-open", rt);
+    const char *display = getenv("DISPLAY"); CHECK(display != NULL);
+    ipc_server server = {0};
+    if (handoff) CHECK(ipc_server_init_display(&server, rt, display) == IPC_OK);
+    render_backend backend; CHECK(render_null_backend(&backend) == 0);
+    editor *e = NULL;
+    /* One retained slot (P): closing its successor forces retirement of the
+     * prior member, exercising shared epoll registration teardown. */
+    editor_config config = {.start_empty = true, .tab_capacity = ASTRA_OPEN_FILES, .closed_capacity = 1,
+        .server = handoff ? &server : NULL};
+    CHECK(editor_open(&e, &config, &backend) == 0);
+    size_t accepted = 0;
+    for (size_t i = 0; i < ASTRA_OPEN_FILES; i++) {
+        char path[IPC_PATH_CAP];
+        CHECK(snprintf(path, sizeof path, "%s/file-%zu", rt, i) > 0);
+        int fd = open(path, O_CREAT | O_WRONLY, 0600); CHECK(fd >= 0);
+        CHECK(write(fd, "text\n", sizeof "text\n" - 1u) == (ssize_t)(sizeof "text\n" - 1u)); close(fd);
+        if (!handoff) {
+            ipc_request r = {.count = 1}; r.paths[0] = (ipc_path){path, 1, 1};
+            if (editor_open_request(e, &r, 0) != 0) break;
+            accepted++; CHECK(editor_get_stats(e).tabs == accepted); continue;
+        }
+        pid_t client = fork(); CHECK(client >= 0);
+        if (!client) {
+            CHECK(setenv("XDG_RUNTIME_DIR", rt, 1) == 0);
+            char *args[] = {"sublimite", path, NULL};
+            _exit(ipc_cli_main((int)(sizeof args / sizeof args[0] - 1u), args));
+        }
+        int status = 0;
+        for (;;) {
+            pid_t done = waitpid(client, &status, WNOHANG); CHECK(done >= 0);
+            if (done == client) break;
+            CHECK(editor_poll_sources(e) == 0);
+            struct pollfd ready = {ipc_server_fd(&server), POLLIN, 0};
+            (void)poll(&ready, 1, 1); /* existing file-suite mailbox cadence */
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) break;
+        accepted++;
+        CHECK(editor_get_stats(e).tabs == accepted);
+    }
+    fprintf(stderr, "astra_many_open: mode=%s requested=%u accepted=%zu tabs=%zu\n",
+            handoff ? "cli" : "local", ASTRA_OPEN_FILES, accepted, editor_get_stats(e).tabs);
+    CHECK(accepted == ASTRA_OPEN_FILES);
+    CHECK(editor_close_tab(e, 0) == 0);
+    CHECK(editor_close_tab(e, 0) == 0); /* retained slot + successor => eviction */
+    CHECK(editor_poll_sources(e) == 0);
+    int changed_fd = open(e->buffer->path, O_WRONLY | O_APPEND); CHECK(changed_fd >= 0);
+    CHECK(write(changed_fd, "changed\n", sizeof "changed\n" - 1u) == (ssize_t)(sizeof "changed\n" - 1u));
+    close(changed_fd);
+    /* Reuse the file-suite's existing watchdog/cadence, not a latency budget. */
+    for (unsigned retry = 0; retry < 5000 && !editor_get_stats(e).source_stale; retry++) {
+        CHECK(editor_poll_sources(e) == 0);
+        struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
+    }
+    CHECK(editor_get_stats(e).source_stale);
+    puts("astra_many_open: shared epoll survives retirement; Source changed state delivered");
+    editor_close(e); if (handoff) ipc_server_fini(&server); rm_rf(rt);
+}
 static int run_suite(const char *only, int ns_fd)
 {
     alarm(120); const char *dir=test_ipc_isolate(); CHECK(dir!=NULL);
@@ -800,6 +863,8 @@ static int run_suite(const char *only, int ns_fd)
 #define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
     T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
     T("main_launcher_primary",t_main_launcher(dir,false)); T("main_launcher_isolated",t_main_launcher(dir,true));
+    T("astra_many_open",t_astra_many_open(dir,true));
+    T("astra_many_open_local",t_astra_many_open(dir,false));
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));

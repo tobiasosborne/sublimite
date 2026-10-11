@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -234,6 +235,84 @@ static void t_mmap_threshold(void)
 }
 
 /* ---- change detection ---- */
+/* src:astra edit-er2: fixture count (G) is the bead's requested 200 opens;
+ * expected instance count (G) is the single process service, independent of
+ * the host's remaining per-user instance allowance. */
+#define ASTRA_WATCH_FILES 200u
+static size_t inotify_instances(void)
+{
+    DIR *fds = opendir("/proc/self/fd"); CHECK(fds != NULL);
+    if (!fds) return 0;
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(fds)) != NULL) {
+        const char expected[] = "anon_inode:inotify";
+        char target[sizeof expected]; /* exact name plus space to reject a longer link */
+        ssize_t n = readlinkat(dirfd(fds), entry->d_name, target, sizeof target);
+        if (n == (ssize_t)(sizeof expected - 1u) && !memcmp(target, expected, sizeof expected - 1u)) count++;
+    }
+    closedir(fds);
+    return count;
+}
+static void t_astra_watch_many(void)
+{
+    file *files[ASTRA_WATCH_FILES] = {0};
+    size_t watching = 0;
+    int first_fd = -1;
+    char other[sizeof dir + sizeof "/watch-other"]; path_of(other, sizeof other, "watch-other");
+    CHECK(mkdir(other, 0700) == 0);
+    for (size_t i = 0; i < ASTRA_WATCH_FILES; i++) {
+        /* A character per index bit bounds its decimal digits (P); include
+         * the longest literal prefix and its terminator, then the base dir. */
+        char name[sizeof "watch-other/watch-" + sizeof(size_t) * CHAR_BIT];
+        char path[sizeof dir + sizeof name];
+        snprintf(name, sizeof name, "%swatch-%zu", i + 1u == ASTRA_WATCH_FILES ? "watch-other/" : "", i);
+        write_file(name, (const uint8_t *)"original\n", sizeof "original\n" - 1u);
+        path_of(path, sizeof path, name);
+        CHECK(file_open_begin(&pool, path, NULL, &files[i]) == FILE_OK);
+        file_msg m; CHECK(wait_msg(FILE_MSG_OPEN_READY, &m) && m.f == files[i] && m.status == FILE_OK);
+        int fd = file_watch_start(files[i]);
+        if (fd >= 0) { watching++; if (first_fd < 0) first_fd = fd; }
+    }
+    size_t instances = inotify_instances();
+    fprintf(stderr, "astra_watch_many: requested=%u watching=%zu inotify_instances=%zu\n",
+            ASTRA_WATCH_FILES, watching, instances);
+    CHECK(watching == ASTRA_WATCH_FILES);
+    CHECK(instances == 1u); /* (G): one shared service, counted via readlinkat. */
+    if (watching != ASTRA_WATCH_FILES || instances != 1u) goto cleanup;
+
+    struct pollfd ready = {first_fd, POLLIN, 0};
+    while (poll(&ready, 1, 0) > 0) {
+        (void)file_watch_poll(files[1]);
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+    }
+
+    /* Closing and refreshing one member must preserve a shared parent watch.
+     * Drain through an unchanged member: both same-parent and other-parent
+     * changes must reach their own CHECK_DONE mailbox, never a status getter. */
+    file_close(files[0]); files[0] = NULL;
+    CHECK(file_resolve_keep(files[1]) == FILE_OK);
+    size_t targets[] = {2u, ASTRA_WATCH_FILES - 1u}; /* first surviving peer and other parent */
+    for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
+        int fd = open(file_path(files[targets[i]]), O_WRONLY | O_APPEND); CHECK(fd >= 0);
+        CHECK(write(fd, "changed\n", sizeof "changed\n" - 1u) == (ssize_t)(sizeof "changed\n" - 1u)); close(fd);
+    }
+    CHECK(poll(&ready, 1, 2000) == 1); /* reuse t_change's existing watchdog */
+    (void)file_watch_poll(files[1]);
+    CHECK(!file_changed(files[targets[0]]) && !file_changed(files[targets[1]]));
+    /* Reuse wait_msg's existing watchdog and polling cadence. */
+    for (unsigned retry = 0; retry < 5000 &&
+         (!file_changed(files[targets[0]]) || !file_changed(files[targets[1]])); retry++) {
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c); sleep_ms(1);
+    }
+    CHECK(file_changed(files[targets[0]]) && file_changed(files[targets[1]]));
+    CHECK(!file_changed(files[1]));
+cleanup:
+    for (size_t i = 0; i < ASTRA_WATCH_FILES; i++) file_close(files[i]);
+    if (watching == ASTRA_WATCH_FILES && instances == 1u)
+        CHECK(inotify_instances() == 1u); /* (G): installed service outlives its last member */
+}
+
 static void t_change(void)
 {
     uint8_t d[5000]; fill(d, sizeof d, 4);
@@ -2104,6 +2183,7 @@ int main(void)
         else if (strcmp(review_case, "25") == 0) review_run("finding25", t_latency_writes);
         else if (strcmp(review_case, "31") == 0) review_run("finding31", t_latency_errno);
         else if (strcmp(review_case, "32") == 0) review_run("finding32", t_latency_watch);
+        else if (strcmp(review_case, "astra-watch") == 0) t_astra_watch_many();
         else CHECK(0);
         goto finish;
     }
@@ -2128,6 +2208,7 @@ int main(void)
         fprintf(stderr, "run change\n");
     }
     t_change();
+    t_astra_watch_many();
     if (getenv("FT_V")) {
         fprintf(stderr, "run save_roundtrip\n");
     }

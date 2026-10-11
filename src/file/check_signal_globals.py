@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the proposed single process SIGBUS-service exception in a file object."""
+"""Check the sanctioned SIGBUS and inotify process services in a file object."""
 import subprocess
 import sys
 
@@ -11,7 +11,7 @@ mutable = [
     for line in symbols
     if len(fields := line.split()) == 3 and fields[1] in ("b", "B", "d", "D")
 ]
-ok = len(mutable) <= 1
+ok = set(mutable) <= {"file_bus", "file_watches"}
 print(f"finding10: {'ok' if ok else 'FAIL'} mutable globals={len(mutable)} "
       + ",".join(mutable))
 sys.exit(0 if ok else 1)

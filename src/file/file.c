@@ -419,6 +419,7 @@ struct file {
     file_id id;
     int changed;
     int ifd, iwd;
+    size_t watch_slot;            /* index in the UI-owned process registry */
     int watch_refresh;
     char watch_name[NAME_MAX + 1];
     uint64_t source_generation;
@@ -462,6 +463,51 @@ struct file {
     _Atomic int save_replaced_ready;
     int save_replaced_installed;
 };
+
+/* src:astra edit-er2: one sanctioned process-wide inotify service. Registry
+ * bound (P) = editor_open's existing maximum live + retained reservations,
+ * 4096 + 4096. Setup/dispatch/close belong to the single UI owner, as do the
+ * per-file check_requested fields; workers only publish CHECK_DONE. No locks
+ * or allocation are needed for dispatch. The installed fd lives until exit. */
+#define FILE_WATCH_SLOTS (4096u + 4096u)
+typedef struct file_watch_service {
+    pthread_once_t once;
+    int fd, err_no;
+    size_t count;
+    file *files[FILE_WATCH_SLOTS];
+} file_watch_service;
+static file_watch_service file_watches = { .once = PTHREAD_ONCE_INIT, .fd = -1 };
+
+static void watch_install(void)
+{
+    file_watches.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (file_watches.fd < 0) file_watches.err_no = errno;
+}
+
+/* Linux shares a parent watch across all members. Release it only after the
+ * last member leaves; refreshing a member must not enqueue IN_IGNORED for its
+ * peers. Descriptors are borrowed from the service, never closed per file. */
+static void watch_release(file *f, int wd)
+{
+    if (wd < 0) return;
+    for (size_t i = 0; i < file_watches.count; i++)
+        if (file_watches.files[i] != f && file_watches.files[i]->iwd == wd) return;
+    (void)inotify_rm_watch(file_watches.fd, wd);
+}
+
+static void watch_detach(file *f)
+{
+    if (f->watch_slot == SIZE_MAX) return;
+    watch_release(f, f->iwd);
+    size_t last = --file_watches.count;
+    if (f->watch_slot != last) {
+        file *moved = file_watches.files[last];
+        file_watches.files[f->watch_slot] = moved;
+        moved->watch_slot = f->watch_slot;
+    }
+    file_watches.files[last] = NULL;
+    f->watch_slot = SIZE_MAX; f->ifd = -1; f->iwd = -1;
+}
 
 static void file_sync(file *f, uint32_t kind);
 static void install_replaced(file *f);
@@ -791,7 +837,7 @@ int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opt
     memcpy(f->requested_path, path, len + 1);
     f->fd = -1; f->prefix_result.fd = -1;
     f->prefix_owned = 1;
-    f->ifd = -1; f->iwd = -1;
+    f->ifd = -1; f->iwd = -1; f->watch_slot = SIZE_MAX;
     f->generation = opts ? opts->generation : 0;
     f->threshold = opts ? opts->copy_threshold : 0;
     f->transaction.fd = -1; f->transaction.dfd = -1; f->transaction.metadata_fd = -1;
@@ -856,7 +902,7 @@ void file_close(file *f)
     if (f->save.snap) piece_snapshot_release(f->save.snap);
     transaction_discard(&f->transaction);
     if (f->fd >= 0) close(f->fd);
-    if (f->ifd >= 0) close(f->ifd);
+    watch_detach(f);
     if (f->map) map_release(f->map);
     if (!f->open_installed && atomic_load_explicit(&f->open_result_ready, memory_order_acquire)) {
         if (f->open_result.map) map_release(f->open_result.map);
@@ -1023,15 +1069,22 @@ int file_watch_start(file *f)
     if (f->ifd >= 0 && f->iwd >= 0 && !f->watch_refresh) return f->ifd;
     char dir[PATH_MAX];
     split_path(f->path, dir, sizeof dir, f->watch_name, sizeof f->watch_name);
-    if (f->ifd < 0) {
-        f->ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-        if (f->ifd < 0) return -1;
+    if (f->watch_slot == SIZE_MAX && file_watches.count == FILE_WATCH_SLOTS) {
+        errno = ENOSPC; return -1;
     }
-    if (f->iwd >= 0) { (void)inotify_rm_watch(f->ifd, f->iwd); f->iwd = -1; }
-    f->iwd = inotify_add_watch(f->ifd, dir, WATCH_MASK | IN_ONLYDIR);
-    f->watch_refresh = f->iwd < 0;
-    /* Keep the fd for a later retry, but never claim an absent watch is active. */
-    return f->iwd < 0 ? -1 : f->ifd;
+    pthread_once(&file_watches.once, watch_install);
+    if (file_watches.fd < 0) { errno = file_watches.err_no; return -1; }
+    f->ifd = file_watches.fd;
+    int wd = inotify_add_watch(f->ifd, dir, WATCH_MASK | IN_ONLYDIR);
+    f->watch_refresh = wd < 0;
+    if (wd < 0) return -1;
+    if (f->iwd != wd) watch_release(f, f->iwd);
+    f->iwd = wd;
+    if (f->watch_slot == SIZE_MAX) {
+        f->watch_slot = file_watches.count;
+        file_watches.files[file_watches.count++] = f;
+    }
+    return f->ifd;
 }
 
 static void check_job(work_ctx *c)
@@ -1048,32 +1101,8 @@ static void check_job(work_ctx *c)
     atomic_store_explicit(&f->check_fin, 1, memory_order_release);
 }
 
-int file_watch_poll(file *f)
+static void watch_check_pump(file *f)
 {
-    int got = 0;
-    if (f->ifd >= 0) {
-        char buf[4096] __attribute__((aligned(8)));
-        /* One nonblocking buffer per call. Repeated EINTR and a continuous
-         * alternating producer both return to the event loop. */
-        ssize_t r = read(f->ifd, buf, sizeof buf);
-        size_t off = 0, count = r > 0 ? (size_t)r : 0;
-        while (count - off >= sizeof(struct inotify_event)) {
-            const struct inotify_event *event = (const struct inotify_event *)(const void *)(buf + off);
-            size_t length = sizeof *event + (size_t)event->len;
-            if (length > count - off) break;
-            if (event->mask & IN_Q_OVERFLOW) got = 1;
-            if (event->wd == f->iwd) {
-                if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
-                    if (event->mask & IN_IGNORED) f->iwd = -1;
-                    f->watch_refresh = 1; got = 1;
-                }
-                if (event->len == 0 || (strnlen(event->name, event->len) < event->len &&
-                    strcmp(event->name, f->watch_name) == 0)) got = 1;
-            }
-            off += length;
-        }
-    }
-    if (got) f->check_requested = 1;
     if (f->check_requested && f->check_installed &&
         atomic_load_explicit(&f->check_fin, memory_order_acquire) && file_prefix_ready(f)) {
         f->check.map = f->map;
@@ -1087,6 +1116,39 @@ int file_watch_poll(file *f)
             f->check_requested = 0;
         } else { atomic_store(&f->check_fin, 1); f->check_installed = 1; }
     }
+}
+
+int file_watch_poll(file *f)
+{
+    if (f->ifd >= 0) {
+        char buf[4096] __attribute__((aligned(8)));
+        /* One nonblocking buffer per call. Repeated EINTR and a continuous
+         * alternating producer both return to the event loop. */
+        ssize_t r = read(f->ifd, buf, sizeof buf);
+        size_t off = 0, count = r > 0 ? (size_t)r : 0;
+        while (count - off >= sizeof(struct inotify_event)) {
+            const struct inotify_event *event = (const struct inotify_event *)(const void *)(buf + off);
+            size_t length = sizeof *event + (size_t)event->len;
+            if (length > count - off) break;
+            for (size_t i = 0; i < file_watches.count; i++) {
+                file *member = file_watches.files[i];
+                if (event->mask & IN_Q_OVERFLOW) member->check_requested = 1;
+                if (event->wd != member->iwd) continue;
+                if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                    if (event->mask & IN_IGNORED) member->iwd = -1;
+                    member->watch_refresh = 1; member->check_requested = 1;
+                }
+                if (event->len == 0 || (strnlen(event->name, event->len) < event->len &&
+                    strcmp(event->name, member->watch_name) == 0)) member->check_requested = 1;
+            }
+            off += length;
+        }
+        /* Enqueue affected peers in this turn, even when the caller polled an
+         * unchanged member. Installation still requires their own mailbox. */
+        if (count) for (size_t i = 0; i < file_watches.count; i++)
+            watch_check_pump(file_watches.files[i]);
+    }
+    watch_check_pump(f);
     return file_changed(f);
 }
 

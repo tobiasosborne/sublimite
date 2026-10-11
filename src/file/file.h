@@ -246,10 +246,17 @@ int file_changed(const file *f);
  * metadata/ctime change on the still-named mapped inode conservatively requires
  * reload, since restored mtime cannot prove its original bytes are intact. */
 int file_resolve_keep(file *f);
-/* Optional inotify. start is explicit off-path setup/refresh (may do I/O).
+/* Optional inotify. All calls, including close, belong to the single UI owner.
+ * start returns a borrowed shared process fd; never close it per file. epoll
+ * callers register it once and retain registration while any member uses it.
+ * Setup uses a fixed registry bounded by the existing editor reservation caps
+ * (4096 live + 4096 retained); exhaustion returns ENOSPC. The fd is installed
+ * once and lives until process exit. start is off-path setup/refresh (may do I/O).
  * After a save call start again to refresh the watch on the replacement.
  * poll reads at most one 4096-byte nonblocking buffer, coalesces a BULK identity
- * check, and returns cached changed state. Route CHECK_DONE through decode;
+ * check for every affected member, and returns this file's cached changed
+ * state. Parent watches are shared and filtered by each member's filename.
+ * Route CHECK_DONE through decode;
  * detection is asynchronous. Saturated submission is retried on a later poll. */
 int file_watch_start(file *f);
 int file_watch_poll(file *f);

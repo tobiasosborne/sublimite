@@ -85,6 +85,17 @@ void editor_buffer_destroy(editor_buffer *b)
     if (b->piece_storage.ready) pthread_mutex_destroy(&b->piece_storage.mutex);
     edit_arena_free(&b->arena); free(b);
 }
+/* file_watch_start now lends one process fd. epoll owns one registration per
+ * editor; retiring, reloading or failing one buffer must preserve its peers. */
+static void unpoll_source(editor *e, editor_buffer *b)
+{
+    int fd = b->watch_fd;
+    b->watch_fd = -1;
+    if (fd < 0) return;
+    for (size_t i = 0; i < e->buffer_capacity; i++)
+        if (e->buffers[i] && e->buffers[i] != b && e->buffers[i]->watch_fd == fd) return;
+    (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, fd, NULL);
+}
 void editor_retire_buffers(editor *e)
 {
     if (e->op_count) return; /* staged tree ranges still borrow buffer arenas */
@@ -96,9 +107,7 @@ void editor_retire_buffers(editor *e)
         work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
         work_cancel(&e->pool, b->lg.find_retiring_h);
         if (b->index) { lineidx_build_cancel(b->index); (void)lineidx_poll(b->index); }
-        if (b->watch_fd >= 0) {
-            (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, b->watch_fd, NULL); b->watch_fd = -1;
-        }
+        unpoll_source(e, b);
         /* file_close has no public logical-retirement/physical-ready split.
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
@@ -151,7 +160,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
             }
             b->watch_fd = file_watch_start(b->file);
             struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};
-            if (b->watch_fd < 0 || epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, b->watch_fd, &event)) {
+            if (b->watch_fd < 0 || (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, b->watch_fd, &event) && errno != EEXIST)) {
                 rc = EDITOR_ERR_IO; goto fail;
             }
             if (file_check(b->file, NULL)) { rc = EDITOR_ERR_IO; goto fail; }
@@ -217,6 +226,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     *out = b; return 0;
 fail:
     e->opening = NULL;
+    unpoll_source(e, b);
     editor_buffer_destroy(b); return rc > 0 ? EDITOR_ERR_IO : rc;
 }
 int editor_adopt_open(editor *e, editor_buffer *b)
@@ -358,7 +368,7 @@ int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t 
         if (!rc) rc = editor_adopt_open(e, b);
         e->opening = NULL;
     }
-    if (rc && b && !b->id) editor_buffer_destroy(b);
+    if (rc && b && !b->id) { unpoll_source(e, b); editor_buffer_destroy(b); }
     return rc;
 }
 int editor_select_tab(editor *e, size_t index)
@@ -519,7 +529,12 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         if (path) { rc = position_buffer(e, prepared[i], request->paths[i].line, request->paths[i].col); if (rc) break; }
     }
     for (size_t i = 0; !rc && i < count; i++) rc = editor_register_journal(e, prepared[i], e->tabs.next_id + i);
-    if (rc) { for (size_t i = 0; i < count; i++) editor_buffer_destroy(prepared[i]); return rc; }
+    if (rc) {
+        for (size_t i = 0; i < count; i++) if (prepared[i]) {
+            unpoll_source(e, prepared[i]); editor_buffer_destroy(prepared[i]);
+        }
+        return rc;
+    }
     /* All fallible file/memory work precedes tab publication. The reserved tab
      * and buffer slots make this commit allocation-free. */
     for (size_t i = 0; i < count; i++) {
@@ -690,7 +705,7 @@ int editor_check_sources(editor *e)
         if (!rc) rc = editor_adopt_open(e, replacement);
         e->opening = NULL;
     }
-    if (rc) { editor_buffer_destroy(replacement); return 0; }
+    if (rc) { unpoll_source(e, replacement); editor_buffer_destroy(replacement); return 0; }
     view_state previous = e->v.state, state = previous;
     uint64_t len = piece_len(replacement->tree);
     if (state.selection.cursor > len) state.selection.cursor = len;
@@ -709,14 +724,13 @@ int editor_check_sources(editor *e)
     if (rc) {
         e->buffers[slot] = NULL; b->retired = false;
         e->buffer = b; e->v.state = previous;
+        unpoll_source(e, replacement);
         editor_buffer_destroy(replacement); return 0;
     }
     rc = tabs_replace(&e->tabs, tabs_active_index(&e->tabs), replacement->tree,
                       &replacement->undo, &state, &e->v.state);
     EDIT_ASSERT(rc == 0); /* active tab and replacement leases were validated */
     b->wait_token = 0;
-    if (b->watch_fd >= 0) {
-        (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, b->watch_fd, NULL); b->watch_fd = -1;
-    }
+    unpoll_source(e, b);
     return editor_activate(e);
 }
