@@ -200,7 +200,7 @@ static int decorations(bool raster)
     T(press(e, key('x', 0, "x")) == 0); T(editor_length(e) == 10); /* mismatched chord is consumed */
     uint64_t count = editor_get_stats(e).unimplemented_actions;
     T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 1);
-    T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 2);
+    T(press(e, key('t', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 2); /* Ctrl+T transpose: still unimplemented; Ctrl+Y became redo (edit-whl) */
     T(press(e, key('k', PLAT_MOD_CTRL, NULL)) == 0);
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
     T(press(e, key('a', 0, "a")) == 0); T(editor_length(e) == 11);

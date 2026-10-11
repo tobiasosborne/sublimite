@@ -122,6 +122,24 @@ static int compose_chrome(editor *e)
 }
 int editor_compose(editor *e)
 {
+    /* The bottom row doubles as a transient status line until panel chrome
+     * exists. A later generation restores it even on a caret-only frame.
+     * Source suspension bypasses text composition, so restore its cached row
+     * here before drawing the higher-priority source-change prompt. */
+    if (e->unimplemented_frame && e->unimplemented_frame != e->grid.frame_id) {
+        e->caret_only = false;
+        e->unimplemented_frame = 0;
+        if (e->buffer->source_stale) {
+            uint32_t full = e->grid.dims.cols, tc = e->text_grid.dims.cols;
+            uint32_t row = e->grid.dims.rows - 1u, text_row = e->text_grid.dims.rows - 1u;
+            render_cell *dst = e->grid.cells + (size_t)row * full;
+            memcpy(dst, e->text_grid.cells + (size_t)text_row * tc, (size_t)tc * sizeof *dst);
+            if (e->map_cols) memcpy(dst + tc,
+                e->map_grid.cells + (size_t)text_row * e->map_grid.dims.cols,
+                (size_t)e->map_cols * sizeof *dst);
+            int rc = render_mark_rows(&e->grid, row, 1); if (rc) return rc;
+        }
+    }
     if (e->buffer->source_stale) {
         const char status[] = "Source changed: R reload / K keep";
         uint32_t cols = e->grid.dims.cols;
@@ -131,13 +149,6 @@ int editor_compose(editor *e)
         }
         int rc = compose_chrome(e);
         return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
-    }
-    /* The bottom row doubles as a transient status line until panel chrome
-     * exists. A later generation must restore it even on a caret-only frame.
-     * Keep the marker throughout retries of the notice's own generation. */
-    if (e->unimplemented_frame && e->unimplemented_frame != e->grid.frame_id) {
-        e->caret_only = false;
-        e->unimplemented_frame = 0;
     }
     if (e->caret_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;

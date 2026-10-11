@@ -140,6 +140,7 @@ static int minimap_typing_flash(void)
     T(!e->buffer->map.stale && e->buffer->map.revision == e->buffer->revision);
     T(editor_length(e) == cfg.initial_len + keys);
     editor_close(e); return 0;
+}
 /* (G) Exact byte offsets derive from the ASCII fixture's literal prefixes.
  * The viewport has two text rows to exercise page movement across that pair;
  * its width derives from the whole fixture, so these lines cannot soft-wrap. */
@@ -329,6 +330,14 @@ static int panel_shortcuts(bool notice)
         after = editor_view(e).selection;
         T(after.cursor == before.cursor && after.anchor == before.anchor);
         T(expect(e, typed, before.cursor) == 0);
+        if (notice) {
+            /* A source-change prompt can start the next generation before
+             * ordinary text composition. It must retire the old notice too. */
+            e->buffer->source_stale = true;
+            T(editor_begin_frame(e) == 0); T(editor_compose(e) == 0);
+            T(memcmp(e->grid.cells + bottom, bottom_before, sizeof bottom_before) == 0);
+            T(e->grid.cells[(size_t)e->tab_rows * e->grid.dims.cols].glyph_index == (uint8_t)'S');
+        }
         editor_close(e);
     }
     puts(notice ? "editor_test: panel shortcuts show a generation-only status and restore the bottom row" :
@@ -1822,6 +1831,16 @@ static int index_capacity_typing(void)
         if (rc) fprintf(stderr, "capacity typing: key=%u rc=%d tree=%llu index=%llu\n", i + 1u, rc,
             (unsigned long long)editor_length(e), (unsigned long long)lineidx_len(e->buffer->index));
         T(lineidx_len(e->buffer->index) == editor_length(e)); T(rc == 0);
+        /* Like editor_step, finish cooperative cursor repair before the next
+         * key. Do not settle: index maintenance would rebuild the table and
+         * stop this fixture from exercising successive reserved-capacity edits.
+         * The completion deadline is the existing settle() bound. */
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (view_busy(&e->v) && trace_now_ns() < deadline)
+            T(editor_continue_action(e) == 0);
+        T(!view_busy(&e->v)); T(e->action == EDITOR_ACTION_NONE);
+        T(editor_view(e).selection.cursor == (uint64_t)i + 1u);
+        T(lineidx_len(e->buffer->index) == editor_length(e));
     }
     T(lineidx_chunk_count(e->buffer->index) <= 3u);
     T(settle(e) == 0); editor_close(e); unlink(path);
