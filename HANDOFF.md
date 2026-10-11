@@ -1,4 +1,16 @@
-# HANDOFF — sublimité, session 10 cut short by a network interruption (2026-10-11 ~10:40)
+# HANDOFF — sublimité, session 10 (updated 2026-10-11 ~14:20; improvement loop running)
+
+## State now (read first)
+**Landed on main today (all verified by serial targeted runs on :99: editor, p4, module suites, cli):** process reset + golden-master rule (PRD §3/§9, CLAUDE.md laws 1/4/8, PLAN §1 loop); Astra drive 1 report (VERDICT no) and the Opus design research; edit-g11 flash fix (+P4 test correction); edit-8m3 + edit-d5o minimap (per-character pixels composed into the frame, translucent viewport band); edit-er2 shared inotify service (200 opens accepted); the wrap input-window fix; edit-lez s3; edit-whl/2gx (Ctrl+Y redo, panel chords consumed with a notice); edit-cde clipboard (all paths); edit-ck4 (durable async Ctrl+S, startup restores unsaved session); edit-2ty (1 GiB near-end stall); edit-jmn (tab reservation, readable IPC errors); edit-ovu s3; edit-40t (**GL init completion message had generation 0 since de7fb22: every GL init waited 10 s then failed**; fixed); edit-08z (Unicode glyphs via the runtime font owner); edit-v0o.2 (tree-sitter v0.27.1 vendored + src/hl parser). Pushed through f9de9b2; later landings (08z, hl) await the sanity run then push.
+
+**Verified, waiting to land (editor-file conflicts, one resolver each):** edit-m3g (DPI font size + zoom; resolver 4 after 08z), edit-2ts (startup stages; fixer for the EGL-fallback test after 40t), edit-v0o.7 (config module; re-resolve after m3g). **In flight (Codex, wave 3/4):** edit-73j mouse/wheel/find panel, edit-3kk scroll wiring, edit-v0o.1 Wayland, edit-457.8 hot exit (+9ma), edit-5ih font selection, edit-a2g large-file remainder, edit-d50 Sublime keymap parity. Codex weekly quota reset at ~14:00; Tobias: scale back as things land, no new waves.
+
+**Astra:** drive 2 brief ready at build/astra/brief2.md (same 14 tasks + fixed/still-present column); launch after m3g + 2ts land and a rebuild, with the same launch line as drive 1 (Tobias runs it; the sandbox denies the display). Sublime golden-master catalogue brief at build/astra/brief-sublime-catalogue.md (not yet launched).
+
+**Lessons today (binding):** (1) every editor bead conflicts with the previous landing in editor.c/open.c/private.h/main.c/editor_test.c: land editor beads one at a time, rebase the next immediately, use a Codex resolver for semantic hunks and keep-both only for test dispatch lines and STATUS.md; (2) verify serially, never >2 full checks in parallel: at load > 30 the 5 s settle() deadline, the find/savectl fixture deadlines and cli_test's load-scaled window deadline all fail spuriously; (3) pre-er2 bases exhaust inotify instances under parallel runs (editor_open/editor_add_buffer EMFILE); (4) `git cherry-pick` has no -q; a `cd` inside a compound command moves the session cwd.
+
+---
+
 
 ## Read first: state at the cut
 **Landed on main today:** process reset (0eeb4a4, f02934c), Astra-before-Tobias rule + flashscan (2baf8c5), Astra drive 1 report (51d840a, VERDICT no), PRD golden-master rule + PLAN loop (5160ea8), Opus design research docs/design/state-of-design-2026.md (56d7319), **edit-g11 flash fix 691ceb1** (verified: full `make check` in its worktree green except cli_test under load; cli_test re-run serially green, exit 0). **Main has NOT had a main-level clean check since 691ceb1 and was pushed as-is at the cut: run `make all && make check` on main first.**
