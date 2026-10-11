@@ -27,10 +27,12 @@ static void init_worker(work_ctx *job)
 {
     editor_backend_init *a = job->arg;
     bool gpu = (a->backend.info.capabilities & RENDER_CAP_GPU) != 0;
-    if (gpu) trace_record(TRACE_STARTUP_EGL_PROBE_START, 0);
-    int result = work_should_stop(job) ? RENDER_ERR_INIT :
+    if (gpu && !a->finishing) trace_record(TRACE_STARTUP_EGL_PROBE_START, 0);
+    int result = work_should_stop(job) ? RENDER_ERR_INIT : a->finishing ?
+        a->backend.finish_init(&a->backend) :
         render_backend_init(&a->backend, &a->config, a->state, a->backend.info.state_size);
-    if (gpu) trace_record(TRACE_STARTUP_EGL_PROBE_END, 0);
+    bool needs_finish = a->pending && a->backend.finish_init != NULL && !a->finishing && !result;
+    if (gpu && !needs_finish) trace_record(TRACE_STARTUP_EGL_PROBE_END, 0);
     if (gpu && a->pending && result) log_probe_failure(result);
     work_msg msg = {.kind = EDITOR_INIT_MSG};
     memcpy(msg.data, &result, sizeof result);
@@ -93,6 +95,14 @@ int editor_backend_poll_probe(editor *e)
     /* No descriptor/state access before the worker physically returns. Never
      * join it, or the raster jobs, on a turn that may be serving input. */
     if (!work_handle_finished(&e->startup_pool, a->handle) || !e->startup_presented || e->backend->active) return 0;
+    if (a->backend.finish_init != NULL && !a->finishing) {
+        /* The first raster serial has retired before GL subscribes. Later
+         * raster serials cannot collide with GL's first swap serial. Keep
+         * native subscription/round trips on the discovery worker as well. */
+        a->finishing = true; a->received = false; a->result = RENDER_ERR_INIT;
+        a->handle = work_submit(&e->startup_pool, (work_job){init_worker, a, 0, WORK_BULK});
+        return a->handle.epoch ? 0 : EDITOR_ERR_MEMORY;
+    }
     int rc = render_backend_resize(&a->backend, e->grid.dims);
     if (rc) return rc;
     if (e->raster_poll_fd >= 0) {

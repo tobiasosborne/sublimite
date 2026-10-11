@@ -25,6 +25,12 @@ The supplied review's startup, blink and paired-identity integration findings
 remain outside the permitted editor/tool edit boundary. The optional red lanes
 and production behavior were not weakened. Native display, leak checks and
 the next Astra comparison remain coordinator work. No typing-path change.
+# edit-2ts — background startup
+
+Background GL rejects absent DRI3 before loading libraries and warms draw state without swaps. A worker finishing phase subscribes to Present after bootstrap retirement; the first actual GL swap uses the existing fence/PIXMAP completion guard. Strict initialization retains its warm-swap proof. Native behavior cannot be verified in the socket-restricted sandbox.
+
+Evidence, exact validation outcomes and remaining acceptance: [worker report](../../docs/worker-reports/edit-2ts.md).
+Design: [decision record](../../docs/decisions/edit-2ts.md).
 
 # GL — edit-40t (session 9)
 

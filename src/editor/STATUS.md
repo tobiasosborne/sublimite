@@ -61,6 +61,12 @@ socket/display failures and remaining limitations are recorded in
 
 No edits to the other workers' x11/font/minimap/paint/large implementations.
 Native display suites and the next Astra comparison remain coordinator work.
+# edit-2ts — startup tracing and asynchronous GPU discovery
+
+Raster bootstrap paints while a separate worker discovers EGL. Headless regressions cover held failing initialization, held worker finishing, successful adoption, typing allocation guards, and late eventfd notification drainage. The requested GPU is never joined by the painting loop. Native startup measurements and the next Astra drive remain coordinator work. Full check is blocked by display/Unix listeners and an unrelated reload/wait failure, recorded without an outside-scope repair.
+
+Evidence, exact validation outcomes and remaining acceptance: [worker report](../../docs/worker-reports/edit-2ts.md).
+Design: [decision record](../../docs/decisions/edit-2ts.md).
 
 # edit-ck4 — session 9
 

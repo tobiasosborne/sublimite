@@ -71,7 +71,7 @@ typedef struct editor_backend_init {
     void *state;
     work_handle handle;
     int result;
-    bool received, pending;
+    bool received, pending, finishing;
 } editor_backend_init;
 struct editor {
     editor_clip *clipboard;

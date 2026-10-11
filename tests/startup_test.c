@@ -22,8 +22,9 @@ _Static_assert(TRACE_T6_PRESENT_COMPLETE == 6 && TRACE_COMPOSE_BEGIN == 7 &&
                "startup stages append after main's stable timing event IDs");
 typedef struct probe {
     char name[sizeof "held EGL probe"];
-    sem_t painted;
-    atomic_bool entered, finished, timed_out;
+    sem_t painted, attach_gate;
+    atomic_bool entered, finished, timed_out, attached, attach_entered;
+    pthread_t ui;
     size_t submits;
     bool succeed, first_submit_while_held;
     int (*null_init)(render_backend *, const render_config *);
@@ -41,6 +42,19 @@ static int held_probe(render_backend *b, const render_config *cfg)
     int result = p->succeed && !rc ? p->null_init(b, cfg) : RENDER_ERR_UNSUPPORTED;
     atomic_store(&p->finished, true);
     return result;
+}
+static int finish_probe(render_backend *b)
+{
+    probe *p = (void *)b->info.name;
+    if (!trace_startup_get(TRACE_STARTUP_FIRST_PRESENT) || pthread_equal(pthread_self(), p->ui)) return RENDER_ERR_STATE;
+    atomic_store(&p->attach_entered, true);
+    struct timespec until; (void)clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += (time_t)(WATCHDOG_NS / UINT64_C(1000000000));
+    int rc;
+    do { rc = sem_timedwait(&p->attach_gate, &until); } while (rc && errno == EINTR);
+    if (rc) return RENDER_ERR_INIT;
+    atomic_store(&p->attached, true);
+    return RENDER_OK;
 }
 static void submitted(void *ctx, const editor_frame *frame)
 {
@@ -66,11 +80,13 @@ static int held_case(bool succeed)
      * exec. The actual executable records its process origin at main entry. */
     trace_record(TRACE_STARTUP_PROCESS_START, 0);
     probe p = {.name = "held EGL probe", .succeed = succeed};
-    atomic_init(&p.entered, false); atomic_init(&p.finished, false); atomic_init(&p.timed_out, false);
-    T(sem_init(&p.painted, 0, 0) == 0);
+    atomic_init(&p.entered, false); atomic_init(&p.finished, false); atomic_init(&p.timed_out, false); atomic_init(&p.attached, false);
+    atomic_init(&p.attach_entered, false); p.ui = pthread_self();
+    T(sem_init(&p.painted, 0, 0) == 0); T(sem_init(&p.attach_gate, 0, 0) == 0);
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     p.null_init = b.ops.init;
     b.info.name = p.name; b.info.capabilities |= RENDER_CAP_GPU; b.ops.init = held_probe;
+    if (succeed) b.finish_init = finish_probe;
     const uint8_t text[] = "first painted text\n";
     char path[] = "build/startup-source-XXXXXX";
     int fd = mkstemp(path); T(fd >= 0);
@@ -90,9 +106,14 @@ static int held_case(bool succeed)
     T(b.info.capabilities & RENDER_CAP_HEADLESS); T(!(b.info.capabilities & RENDER_CAP_GPU));
     uint8_t readback[sizeof text]; T(editor_read(e, 0, readback, sizeof text - 1) == 0);
     T(memcmp(text, readback, sizeof text - 1) == 0);
-    const render_grid *grid = editor_grid(e); bool ink = false;
-    for (size_t i = 0; i < (size_t)grid->dims.cols * grid->dims.rows; i++)
-        if (grid->cells[i].glyph_index == 'f' && grid->cells[i].atlas_slot != RENDER_NO_SLOT) ink = true;
+    const render_grid *grid = &e->text_grid; bool ink = false;
+    size_t prefix = sizeof "first" - 1; /* actual leading word of the file fixture */
+    for (size_t col = 0; col + prefix <= grid->dims.cols; col++) {
+        bool match = true;
+        for (size_t i = 0; i < prefix; i++)
+            if (grid->cells[col + i].glyph_index != text[i] || grid->cells[col + i].atlas_slot == RENDER_NO_SLOT) match = false;
+        ink |= match;
+    }
     T(ink);
     /* Typing still settles before the held probe is released. The release
      * build has an active process-wide allocation guard; sanitizer is inert. */
@@ -103,11 +124,21 @@ static int held_case(bool succeed)
     T(editor_length(e) == sizeof text); T(!atomic_load(&p.finished));
     uint32_t bootstrap_last = b.last_frame;
     T(sem_post(&p.painted) == 0);
+    if (succeed) {
+        deadline = trace_now_ns() + WATCHDOG_NS;
+        while (!atomic_load(&p.attach_entered)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+        T(!(b.info.capabilities & RENDER_CAP_GPU));
+        key.keysym = 'y'; key.utf8[0] = 'y';
+        edit_malloc_guard_begin(); T(editor_inject(e, &key) == 0); T(settle(e) == 0);
+        allocations += edit_malloc_guard_end(); T(allocations == 0);
+        T(!atomic_load(&p.attached)); T(sem_post(&p.attach_gate) == 0);
+    }
     deadline = trace_now_ns() + WATCHDOG_NS;
     while (e->startup.pending) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
     T(atomic_load(&p.finished)); T(!atomic_load(&p.timed_out));
     T(settle(e) == 0);
     if (succeed) {
+        T(atomic_load(&p.attached));
         T(b.info.capabilities & RENDER_CAP_GPU); T(b.last_frame > bootstrap_last);
         T(e->retired_backend.initialized); T(editor_get_stats(e).backend_init_error == 0);
     } else {
@@ -124,7 +155,7 @@ static int held_case(bool succeed)
     T(editor_step(e, 0) >= 0);
     struct pollfd ready = {wake_fd, POLLIN, 0};
     T(poll(&ready, 1, 0) == 0);
-    editor_close(e); T(!b.initialized); T(unlink(path) == 0); T(sem_destroy(&p.painted) == 0);
+    editor_close(e); T(!b.initialized); T(unlink(path) == 0); T(sem_destroy(&p.painted) == 0); T(sem_destroy(&p.attach_gate) == 0);
     const enum trace_ev required[] = {TRACE_STARTUP_PROCESS_START, TRACE_STARTUP_EGL_PROBE_START,
         TRACE_STARTUP_EGL_PROBE_END, TRACE_STARTUP_RASTER_FALLBACK, TRACE_STARTUP_FONT_ATLAS_READY,
         TRACE_STARTUP_FILE_PREFIX_READ, TRACE_STARTUP_FIRST_LAYOUT, TRACE_STARTUP_FIRST_SUBMIT, TRACE_STARTUP_FIRST_PRESENT};
@@ -136,6 +167,7 @@ static int held_case(bool succeed)
     dump = fopen("build/startup.trace", "rb"); T(dump != NULL);
     trace_loaded loaded; T(trace_fmt_load_dump(dump, &loaded) == 0); T(fclose(dump) == 0);
     trace_fmt_startup_report(stdout, loaded.recs, loaded.nrecs); trace_fmt_dump_free(&loaded);
+    if (succeed) puts("startup_test: finish-init runs on worker after bootstrap; typing progresses while finish held; late wake drained");
     printf("startup_test: %s probe: text and typing submitted/presented while held; allocations=%zu guard=%s\n",
         succeed ? "successful" : "failing", allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
     return 0;

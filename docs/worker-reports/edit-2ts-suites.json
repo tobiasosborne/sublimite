@@ -217,7 +217,7 @@
     },
     {
       "name": "startup_test",
-      "status": 1,
+      "status": 0,
       "source": "continued sanitizer run"
     },
     {
@@ -364,6 +364,7 @@
     "savectl_test",
     "scan_test",
     "scroll_test",
+    "startup_test",
     "tabs_test",
     "trace_test",
     "undo_test",
@@ -393,7 +394,6 @@
     "refproto_test",
     "refwin_test",
     "refwin_timeout_test",
-    "startup_test",
     "x11_clip_review_test",
     "x11_clip_test",
     "x11_identity_test",

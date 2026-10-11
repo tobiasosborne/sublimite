@@ -221,6 +221,12 @@ typedef struct render_backend {
     uint64_t submitted_ns, device_ns, complete_ns;
     bool initialized, active, presented, device_seen, complete_seen, t5_sent, t6_sent;
     bool full_required;
+    /* Optional second INIT phase, worker-only with exclusive descriptor/state.
+     * For background_init, call after the bootstrap's first presentation has
+     * retired, before UI adoption. It must not present diagnostic frames.
+     * NULL means initial INIT is sufficient. Storage remains owned through
+     * both physical worker completions. */
+    int (*finish_init)(struct render_backend *b);
 } render_backend;
 
 /* Factory/query may run on UI or init worker, on exclusive storage. Factory

@@ -845,7 +845,7 @@ static int gl_init_mode(render_backend *b,const render_config *cfg,bool startup)
      * gl_event's existing private-event completion guard. Strict diagnostics
      * keep the warm-swap proof. Drawing/JIT work without a swap is invisible. */
     if (startup) { gl_draw(s); s->gFinish(); }
-    if (startup ? !gl_arm_present(s) : !gl_probe_present(s)) goto fail;
+    if (!startup && !gl_probe_present(s)) goto fail;
     s->strip_count=0;
     if (gl_ring_poll(s)!=RENDER_OK) goto fail;
     if (!s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) goto fail;
@@ -859,6 +859,14 @@ fail:
 static int gl_init(render_backend *b,const render_config *cfg)
 {
     return gl_init_mode(b,cfg,cfg->background_init);
+}
+static int gl_finish_init(render_backend *b)
+{
+    gl_state *s=b->state;
+    if (!s->startup || s->complete_selected) return RENDER_OK;
+    /* Editor calls this on an exclusive worker after bootstrap retirement:
+     * a raster serial cannot masquerade as our first EGL swap serial. */
+    return gl_arm_present(s) ? RENDER_OK : RENDER_ERR_UNSUPPORTED;
 }
 static int gl_resize(render_backend *b,render_dims dims)
 {
@@ -1086,6 +1094,7 @@ static int gl_present(render_backend *b,uint32_t id)
     }
     rc=gl_wake_arm(b); /* Reserve continuation before the irreversible swap. */
     if (rc!=RENDER_OK) { s->gDeleteSync(s->fence); s->fence=NULL; return rc; }
+    if (s->startup && !s->complete_selected) return gl_fail(s);
     s->completion_deadline=trace_now_ns()+GL_COMPLETION_TIMEOUT_NS;
     if (!s->eSwapBuffers(s->display,s->surface)) return gl_fail(s);
     s->swapped=true; s->swapped_id=id;
@@ -1155,7 +1164,8 @@ int render_gl_backend(render_backend *b)
     if (b->initialized) return RENDER_ERR_STATE;
     *b=(render_backend){.info={"egl",sizeof(gl_state),_Alignof(gl_state),
         RENDER_CAP_GPU|RENDER_CAP_DEVICE_TIMING|RENDER_CAP_PRESENT_TIMING},
-        .ops={gl_init,gl_resize,gl_submit,gl_present,gl_event,gl_shutdown}};
+        .ops={gl_init,gl_resize,gl_submit,gl_present,gl_event,gl_shutdown},
+        .finish_init=gl_finish_init};
     return RENDER_OK;
 }
 /* Authenticate the implementation before interpreting opaque backend storage. */
