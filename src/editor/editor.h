@@ -6,6 +6,8 @@
 #include "ipc/ipc.h"
 #include "tabs/tabs.h"
 #include "config/config.h"
+#include "scroll/scroll.h"
+#include "layout/layout.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -25,7 +27,19 @@ typedef struct editor_frame {
     uint32_t id;
     uint64_t first_sequence, last_sequence;
     uint64_t ingress_ns, submit_ns, present_ns;
+    scroll_frame_plan scroll; /* logical plan when !wrapped; wrap_seed otherwise */
+    view_selection selection;
+    layout_wrap_row wrap_seed;
+    uint64_t source_id, source_generation, source_revision, geometry_generation;
+    uint64_t sidebar_revision, sidebar_identity;
+    bool wrapped;
 } editor_frame;
+typedef struct editor_refresh {
+    uint32_t displayed_frame_id;
+    uint64_t refresh_sequence, completion_ns;
+    bool synthetic, opportunity_stream, metadata_valid;
+    editor_frame frame; /* immutable submission, not the current viewport */
+} editor_refresh;
 typedef struct editor_config {
     const char *path;                 /* existing file; NULL uses initial bytes */
     const uint8_t *initial;
@@ -44,6 +58,10 @@ typedef struct editor_config {
     void (*on_ingress)(void *, uint64_t sequence, uint64_t ns);
     void (*on_submit)(void *, const editor_frame *);
     void (*on_present)(void *, const editor_frame *);
+    /* UI only. Null completion is synthetic. Native completion alone has
+     * opportunity_stream=false: repeats/drops need a display opportunity
+     * producer calling editor_on_refresh, not a submit-derived timer. */
+    void (*on_refresh)(void *, const editor_refresh *);
     /* Instrumentation boundary for platform/present/completion IO, outside
      * our mutation/layout/submit slices. true enters IO, false leaves it.
      * Allows a process-wide guard to exclude XCB packets when a key spans
@@ -112,6 +130,12 @@ int editor_inject(editor *e, const plat_event *event);
  * successful prefix, with no automatic rollback or partial replay retry. */
 int editor_step(editor *e, int timeout_ms);
 int editor_run(editor *e);
+/* UI-only opportunity producer, including repeats and missing IDs (id=0).
+ * Sequences strictly increase; timestamps are CLOCK_MONOTONIC and nondecreasing.
+ * Reject stale/duplicate opportunities without changing backend ownership.
+ * Unknown/retired IDs report metadata_valid=false. Hooks must not re-enter. */
+int editor_on_refresh(editor *e, uint32_t displayed_frame_id,
+                      uint64_t refresh_sequence, uint64_t completion_ns, bool synthetic);
 /* Setup/test navigation; byte must be a grapheme boundary. */
 int editor_set_cursor(editor *e, uint64_t byte);
 /* An incomplete resident copy build is prioritized on the foreground worker;

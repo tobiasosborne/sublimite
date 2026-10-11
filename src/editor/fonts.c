@@ -2,7 +2,7 @@
 
 void editor_font_track(editor *e, uint32_t slot, uint32_t row)
 {
-    if (slot == RENDER_NO_SLOT || row >= e->grid.dims.rows) return;
+    if (slot == RENDER_NO_SLOT || row > e->grid.dims.rows) return;
     e->font_rows[(size_t)slot * e->font_row_words + row / 64u] |= UINT64_C(1) << (row % 64u);
 }
 

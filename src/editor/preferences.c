@@ -30,6 +30,7 @@ int editor_preferences_apply(editor *e)
 {
     if (!e->preferences_runtime || e->preferences_generation == config_runtime_generation(e->preferences_runtime)) return 0;
     bool was_wrap_set = e->preferences.wrap_set;
+    bool old_wrap = e->v.state.wrap; uint32_t old_tab = e->lay.tab;
     e->preferences = *config_runtime_current(e->preferences_runtime);
     e->preferences_generation = config_runtime_generation(e->preferences_runtime);
     keys_reset(&e->keys);
@@ -63,5 +64,14 @@ int editor_preferences_apply(editor *e)
         e->cfg.wrap_mode ? e->cfg.wrap_mode > 0 : view_wrap_default(e->buffer->path) : e->v.state.wrap;
     rc = layout_set_wrap(&e->lay, wrap); if (rc) return rc;
     rc = view_set_wrap(&e->v, wrap, &e->lay); if (rc) return EDITOR_ERR_ARG;
+    if (wrap != old_wrap || e->lay.tab != old_tab) {
+        e->geometry_generation++; /* reloaded wrap/tab-width geometry, as at activation */
+        if (!wrap) { /* the resident scroll window was not maintained while wrapped */
+            rc = editor_scroll_resize(e); if (rc) return rc;
+            if (e->v.state.first_byte != e->buffer->scroll.first_byte) {
+                rc = editor_scroll_seek(e, e->v.state.first_byte); if (rc) return rc;
+            }
+        }
+    }
     return editor_full_layout(e);
 }

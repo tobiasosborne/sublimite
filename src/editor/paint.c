@@ -21,7 +21,7 @@ static bool byte_visible(editor *e, uint64_t byte)
 {
     if (byte >= piece_len(e->tree)) return false;
     if (e->lay.wrap) {
-        for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+        for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
             const layout_wrap_row *row = &e->lay.wrap_rows[r];
             if (row->start != LAYOUT_VOID_ROW && byte >= row->start && byte < row->end) return true;
         }
@@ -54,7 +54,7 @@ int editor_paint_prepare(editor *e)
     if (e->paint_ready) return 0;
     uint64_t lo = e->v.state.wrap ? e->v.state.visual_byte : e->v.state.first_byte;
     uint64_t hi = e->lay.wrap ? lo : e->lay.pos;
-    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
+    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t end;
         if (e->lay.wrap) end = e->lay.wrap_rows[r].next == LAYOUT_VOID_ROW ? e->lay.wrap_rows[r].end : e->lay.wrap_rows[r].next;
         else end = hi;
@@ -120,6 +120,8 @@ static int compose_chrome(editor *e)
         uint64_t dirty = 0; render_grid scratch = e->grid;
         scratch.dims.rows = 1; scratch.cells = cells; scratch.cell_capacity = full;
         scratch.dirty = &dirty; scratch.dirty_word_capacity = 1; scratch.full_frame = false;
+        scratch.scroll = (render_scroll){0};
+        scratch.region = (render_pixels){0};
         rc = tabs_strip_render(&e->tabs, &scratch, &e->strip); if (rc) return rc;
         if (memcmp(e->grid.cells, cells, (size_t)full * sizeof *cells)) {
             memcpy(e->grid.cells, cells, (size_t)full * sizeof *cells);
@@ -127,6 +129,18 @@ static int compose_chrome(editor *e)
         }
     }
     return 0;
+}
+static int compose_scroll(editor *e)
+{
+    e->grid.scroll = (render_scroll){0};
+    if (e->v.state.wrap) return 0;
+    uint32_t full = e->grid.dims.cols, tc = e->text_grid.dims.cols;
+    uint32_t visible_rows = e->grid.dims.rows - e->tab_rows;
+    render_cell *extra = e->grid.cells + (size_t)e->grid.dims.rows * full;
+    memcpy(extra, e->text_grid.cells + (size_t)visible_rows * tc, (size_t)tc * sizeof *extra);
+    for (uint32_t c = tc; c < full; c++) extra[c] = (render_cell){.atlas_slot = RENDER_NO_SLOT};
+    e->grid.scroll = (render_scroll){e->scroll_plan.origin_y_q8, e->tab_rows, visible_rows, tc};
+    return e->scroll_plan.origin_y_q8 ? render_mark_full(&e->grid) : 0;
 }
 static int compose(editor *e)
 {
@@ -139,17 +153,23 @@ static int compose(editor *e)
         e->unimplemented_frame = 0;
         if (e->buffer->source_stale) {
             uint32_t full = e->grid.dims.cols, tc = e->text_grid.dims.cols;
-            uint32_t row = e->grid.dims.rows - 1u, text_row = e->text_grid.dims.rows - 1u;
+            uint32_t row = e->grid.dims.rows - 1u, text_row = row - e->tab_rows;
             render_cell *dst = e->grid.cells + (size_t)row * full;
             memcpy(dst, e->text_grid.cells + (size_t)text_row * tc, (size_t)tc * sizeof *dst);
-            if (e->map_cols) memcpy(dst + tc,
-                e->map_grid.cells + (size_t)text_row * e->map_grid.dims.cols,
-                (size_t)e->map_cols * sizeof *dst);
+            for (uint32_t c = tc; c < full; c++)
+                dst[c] = (render_cell){.atlas_slot = RENDER_NO_SLOT, .bg = e->layout_cfg.bg};
             int rc = render_mark_rows(&e->grid, row, 1); if (rc) return rc;
         }
     }
+    /* Fractional caret damage can touch the overscan row too. Use ordinary
+     * composition and transformed full damage for that geometry. */
+    if (e->caret_only && e->scroll_plan.origin_y_q8) e->caret_only = false;
     if (e->buffer->source_stale) {
         e->grid.region = (render_pixels){0};
+        if (e->grid.scroll.origin_y_q8) {
+            int rc = render_mark_full(&e->grid); if (rc) return rc;
+        }
+        e->grid.scroll = (render_scroll){0};
         const char status[] = "Source changed: R reload / K keep";
         uint32_t cols = e->grid.dims.cols;
         for (uint32_t c = 0; c < cols; c++) {
@@ -163,7 +183,7 @@ static int compose(editor *e)
     }
     if (e->caret_only || e->glyph_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
-        for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+        for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
             if (!(e->text_grid.dirty[r / 64] & (UINT64_C(1) << (r % 64)))) continue;
             render_cell *dst = e->grid.cells + (size_t)(r + e->tab_rows) * full;
             const render_cell *src = e->text_grid.cells + (size_t)r * tc;
@@ -173,7 +193,7 @@ static int compose(editor *e)
                 if (rc) return rc;
             }
         }
-        return 0;
+        return compose_scroll(e);
     }
     minimap_input input = editor_map_input(e->buffer);
     config_theme theme = e->preferences.theme;
@@ -181,7 +201,7 @@ static int compose(editor *e)
         config_theme_color(theme, "gutter.foreground"), config_theme_color(theme, "caret.background"),
         editor_theme_estimated_gutter(config_theme_color(theme, "minimap.foreground"), config_theme_color(theme, "chrome.background"))};
     uint64_t first = e->v.state.first_line, visible = 0;
-    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
+    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;
         if (line >= first && line - first + 1 > visible) visible = line - first + 1;
     }
@@ -190,7 +210,7 @@ static int compose(editor *e)
     e->stats.minimap_ns = trace_now_ns() - start; e->stats.minimap_fills++;
     if (rc) return rc;
     uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
-    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
         render_cell *dst = e->grid.cells + (size_t)(r + e->tab_rows) * full;
         const render_cell *src = e->text_grid.cells + (size_t)r * tc;
         bool different = memcmp(dst, src, (size_t)tc * sizeof *dst) != 0;
@@ -206,7 +226,7 @@ static int compose(editor *e)
     }
     if (e->map_cols) {
         uint32_t width = e->map_cols * e->grid.dims.cell_w;
-        uint32_t height = e->text_grid.dims.rows * e->grid.dims.cell_h;
+        uint32_t height = (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h;
         minimap *map = &e->buffer->map;
         bool retained = map->filled && map->height == e->map_grid.dims.rows &&
             map->identity.ctx == input.source.ctx && map->identity.span == input.source.span;
@@ -233,6 +253,7 @@ static int compose(editor *e)
             .stride = width, .x = tc * e->grid.dims.cell_w, .y = e->tab_rows * e->grid.dims.cell_h,
             .width = width, .height = height, .dirty = region->dirty || changed};
     } else e->grid.region = (render_pixels){0};
+    rc = compose_scroll(e); if (rc) return rc;
     rc = compose_chrome(e); if (rc) return rc;
     if (e->unimplemented_frame == e->grid.frame_id) {
         const char status[] = "not implemented";
@@ -291,6 +312,7 @@ int editor_pointer(editor *e, const plat_event *ev)
         if (rc) return rc;
         e->v.state.first_line = target.line; e->v.state.first_byte = e->v.state.visual_byte = target.byte;
         e->v.state.approximate = !target.exact; e->v.state.hscroll = 0;
+        rc = editor_scroll_seek(e, target.byte); if (rc) return rc;
         return editor_full_layout(e);
     }
     return 0;

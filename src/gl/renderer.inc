@@ -61,7 +61,8 @@ typedef struct gl_state {
     work_handle region_job;
     uint32_t region_generation;
     bool region_pending;
-    GLint surface_uniform, atlas_uniform, shift_uniform;
+    GLint surface_uniform, atlas_uniform, shift_uniform, scroll_clip_uniform, scroll_motion_uniform;
+    render_scroll scroll;
     GLsync fence;
     void *mapped;
     uint32_t swap_serial, pending_serial;
@@ -299,34 +300,36 @@ static bool gl_program_init(gl_state *s)
         "layout(location=0) in uvec4 position;\n"
         "layout(location=1) in uvec4 glyph;\n"
         "layout(location=2) in uvec4 colors;\n"
-        "uniform vec2 surface_size; out vec2 local;\n"
+        "uniform vec2 surface_size; uniform vec2 scroll_clip; uniform vec2 scroll_motion; out vec2 local; flat out int scroll_text;\n"
         "flat out uvec4 image; flat out uint attrs; flat out uvec2 extent; flat out ivec3 delta; flat out ivec3 base;\n"
         "ivec3 rgb(uint c){return ivec3(c>>16,(c>>8)&255u,c&255u); }\n"
         "void main(){ vec2 q=vec2(gl_VertexID&1,gl_VertexID>>1);\n"
         "local=q*vec2(position.zw); vec2 p=vec2(position.xy)+local;\n"
+        "scroll_text=int(p.x-local.x<scroll_clip.x && p.y-local.y>=scroll_clip.y); if(scroll_text!=0)p.y+=scroll_motion.x;\n"
         "gl_Position=vec4(p.x*2.0/surface_size.x-1.0,1.0-p.y*2.0/surface_size.y,0,1);\n"
         "image=glyph; attrs=colors.z; extent=position.zw; ivec3 fg=rgb(colors.x),bg=rgb(colors.y); if((attrs&8u)!=0u){ivec3 t=fg;fg=bg;bg=t;} delta=fg-bg; base=bg*255+127; }\n";
     if (s->upload!=GL_UPLOAD_LEGACY) vertex=
         "#version 330 core\n"
         "layout(location=0) in uvec4 cell; layout(location=1) in uint bits;\n"
         "uniform usamplerBuffer images; uniform uint first_cell; uniform uint cols; uniform uvec2 cell_size;\n"
-        "uniform vec2 surface_size; out vec2 local;\n"
+        "uniform vec2 surface_size; uniform vec2 scroll_clip; uniform vec2 scroll_motion; out vec2 local; flat out int scroll_text;\n"
         "flat out uvec4 image; flat out uint attrs; flat out uvec2 extent; flat out ivec3 delta; flat out ivec3 base;\n"
         "ivec3 rgb(uint c){return ivec3(c>>16,(c>>8)&255u,c&255u); }\n"
         "void main(){uint i=first_cell+uint(gl_InstanceID); attrs=bits&65535u;\n"
         "extent=cell_size; if((attrs&16u)!=0u)extent.x*=2u;\n"
         "vec2 q=vec2(gl_VertexID&1,gl_VertexID>>1); local=q*vec2(extent);\n"
         "vec2 p=vec2(uvec2(i%cols,i/cols)*cell_size)+local;\n"
+        "scroll_text=int(p.x-local.x<scroll_clip.x && p.y-local.y>=scroll_clip.y); if(scroll_text!=0)p.y+=scroll_motion.x;\n"
         "gl_Position=vec4(p.x*2.0/surface_size.x-1.0,1.0-p.y*2.0/surface_size.y,0,1);\n"
         "image=cell.y==0xffffffffu ? uvec4(0) : texelFetch(images,int(cell.y));\n"
         "ivec3 fg=rgb(cell.z),bg=rgb(cell.w); if((attrs&8u)!=0u){ivec3 t=fg;fg=bg;bg=t;}\n"
         "delta=fg-bg; base=bg*255+127; }\n";
     const char *fragment =
         "#version 330 core\n"
-        "uniform usampler2D atlas; uniform int atlas_mask; uniform int atlas_shift;\n"
+        "uniform usampler2D atlas; uniform int atlas_mask; uniform int atlas_shift; uniform vec2 surface_size; uniform vec2 scroll_clip; uniform vec2 scroll_motion; flat in int scroll_text;\n"
         "in vec2 local; flat in uvec4 image; flat in uint attrs; flat in uvec2 extent; flat in ivec3 delta; flat in ivec3 base;\n"
         "out vec4 output_color;\n"
-        "void main(){ if((attrs&32u)!=0u)discard; uvec2 p=uvec2(local); uint a=0u;\n"
+        "void main(){ if((attrs&32u)!=0u)discard; float y=surface_size.y-gl_FragCoord.y; if(scroll_text!=0 && (y<scroll_clip.y || y>=scroll_motion.y))discard; uvec2 p=uvec2(local); uint a=0u;\n"
         "if(p.x<image.z && p.y<image.w){uint i=image.x+p.y*image.y+p.x;\n"
         "a=texelFetch(atlas,ivec2(i&uint(atlas_mask),i>>uint(atlas_shift)),0).r;}\n"
         "if((attrs&4u)!=0u && p.y==extent.y-1u)a=255u;\n"
@@ -339,6 +342,8 @@ static bool gl_program_init(gl_state *s)
     s->gDeleteShader(vs); s->gDeleteShader(fs);
     GLint ok = 0; s->gGetProgramiv(s->program, GL_LINK_STATUS, &ok); if (!ok) return false;
     s->surface_uniform = s->gGetUniformLocation(s->program, "surface_size");
+    s->scroll_clip_uniform = s->gGetUniformLocation(s->program, "scroll_clip");
+    s->scroll_motion_uniform = s->gGetUniformLocation(s->program, "scroll_motion");
     s->atlas_uniform = s->gGetUniformLocation(s->program, "atlas_mask");
     s->shift_uniform = s->gGetUniformLocation(s->program, "atlas_shift");
     s->gUseProgram(s->program); s->gUniform1i(s->gGetUniformLocation(s->program, "atlas"), 0);
@@ -623,12 +628,32 @@ static int gl_ring_poll(gl_state *s)
     }
     return s->ring_poisoned ? RENDER_ERR_DEVICE : RENDER_OK;
 }
+static void gl_blit_region(gl_state *s, uint32_t surface_height)
+{
+    if (!s->region.pixels) return;
+    if (s->region_fence) {
+        s->gWaitSync(s->region_fence, 0, GL_TIMEOUT_IGNORED);
+        s->gDeleteSync(s->region_fence); s->region_fence = NULL;
+    }
+    /* A surface-space blit follows the scrolled text draw. Only convert the
+     * fixed top-left region to GL's bottom-left convention; omit text origin. */
+    const render_pixels *p = &s->region;
+    GLint x = (GLint)p->x, y = (GLint)(surface_height - p->y - p->height);
+    s->gBindFramebuffer(GL_READ_FRAMEBUFFER, s->region_fbo);
+    s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
+    s->gBlitFramebuffer(0, 0, (GLint)p->width, (GLint)p->height,
+        x, y, x + (GLint)p->width, y + (GLint)p->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
 static void gl_draw(gl_state *s)
 {
     uint32_t w=s->dims.cols*s->dims.cell_w, h=s->dims.rows*s->dims.cell_h;
     s->gBindFramebuffer(GL_FRAMEBUFFER,s->fbo);
     s->gViewport(0,0,(GLsizei)w,(GLsizei)h);
     s->gUseProgram(s->program); s->gUniform2f(s->surface_uniform,(GLfloat)w,(GLfloat)h);
+    s->gUniform2f(s->scroll_clip_uniform,(GLfloat)(s->scroll.cols*s->dims.cell_w),
+        (GLfloat)(s->scroll.first_row*s->dims.cell_h));
+    s->gUniform2f(s->scroll_motion_uniform,(GLfloat)s->scroll.origin_y_q8/256.0f,
+        (GLfloat)((s->scroll.first_row+s->scroll.rows)*s->dims.cell_h));
     s->gActiveTexture(GL_TEXTURE0); s->gBindTexture(GL_TEXTURE_2D,s->atlas_texture);
     s->gBindVertexArray(s->vao); s->gBindBuffer(GL_ARRAY_BUFFER,s->vbo);
     if (s->upload!=GL_UPLOAD_LEGACY) {
@@ -639,8 +664,10 @@ static void gl_draw(gl_state *s)
     s->gEnable(GL_SCISSOR_TEST);
     for (size_t i=0;i<s->strip_count;i++) {
         gl_strip *strip=&s->strips[i];
-        uint32_t sh=strip->rows.row_count*s->dims.cell_h;
-        uint32_t sy=h-(strip->rows.first_row+strip->rows.row_count)*s->dims.cell_h;
+        uint32_t bottom=strip->rows.first_row+strip->rows.row_count;
+        if(bottom>s->dims.rows)bottom=s->dims.rows;
+        uint32_t sh=(bottom-strip->rows.first_row)*s->dims.cell_h;
+        uint32_t sy=h-bottom*s->dims.cell_h;
         s->gScissor(0,(GLint)sy,(GLsizei)w,(GLsizei)sh);
         gl_attributes(s,strip->first);
         if (s->upload!=GL_UPLOAD_LEGACY) s->gUniform1ui(s->first_uniform,(GLuint)strip->first);
@@ -654,18 +681,7 @@ static void gl_draw(gl_state *s)
         s->gFlush();
     }
     s->gDisable(GL_SCISSOR_TEST);
-    if (s->region.pixels) {
-        if (s->region_fence) {
-            s->gWaitSync(s->region_fence, 0, GL_TIMEOUT_IGNORED);
-            s->gDeleteSync(s->region_fence); s->region_fence = NULL;
-        }
-        const render_pixels *p = &s->region;
-        GLint x = (GLint)p->x, y = (GLint)(h - p->y - p->height);
-        s->gBindFramebuffer(GL_READ_FRAMEBUFFER, s->region_fbo);
-        s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
-        s->gBlitFramebuffer(0, 0, (GLint)p->width, (GLint)p->height,
-            x, y, x + (GLint)p->width, y + (GLint)p->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    }
+    gl_blit_region(s, h);
     s->gBindFramebuffer(GL_READ_FRAMEBUFFER,s->fbo); s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);
     /* Resizing only the grid can expose cells from an earlier, larger grid
      * in either native swap buffer. Erase the fractional-cell margins too. */
@@ -957,13 +973,21 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
     if (s->region_job.epoch && !work_handle_finished(s->workers, s->region_job))
         return RENDER_ERR_BUSY;
     if (g->glyph_count>GL_FRAME_GLYPH_LIMIT || g->page_count>GL_FRAME_PAGE_LIMIT) return RENDER_ERR_CAPACITY;
+    /* Fractional frames damage the whole viewport. Add the reserved source
+     * row to the immutable upload while leaving the surface/scissor fixed. */
+    render_strip expanded={0,g->dims.rows+1u};
+    const render_strip *draw_strips=strips;
+    if(g->scroll.origin_y_q8) {
+        if(!g->full_frame) return RENDER_ERR_STRIPS;
+        draw_strips=&expanded; count=1;
+    }
     /* Bound unique referenced coverage before changing any snapshot/lease.
      * Overlapping atlas rectangles still consume their full copy-work cost. */
     memset(s->glyph_seen,0,g->glyph_count);
     uint64_t pixel_work=0;
     for (size_t i=0;i<count;i++) {
-        size_t first=(size_t)strips[i].first_row*g->dims.cols;
-        size_t end=first+(size_t)strips[i].row_count*g->dims.cols;
+        size_t first=(size_t)draw_strips[i].first_row*g->dims.cols;
+        size_t end=first+(size_t)draw_strips[i].row_count*g->dims.cols;
         for (size_t cell=first;cell<end;cell++) {
             uint32_t slot=g->cells[cell].atlas_slot;
             if (slot==RENDER_NO_SLOT || s->glyph_seen[slot]) continue;
@@ -981,7 +1005,7 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
             s->ring_current=s->ring_next;
         } else if (g->cells!=s->ring[s->ring_current].cells) return RENDER_ERR_STATE;
         if (g->cells!=s->ring[s->ring_current].cells)
-            memcpy(s->ring[s->ring_current].cells,g->cells,(size_t)g->dims.cols*g->dims.rows*sizeof(render_cell));
+            memcpy(s->ring[s->ring_current].cells,g->cells,(size_t)g->dims.cols*(g->dims.rows+(g->scroll.origin_y_q8 ? 1u : 0u))*sizeof(render_cell));
     }
     size_t total=0;
     for (size_t i=0;i<g->page_count;i++) { s->page_offsets[i]=total; total+=(size_t)g->pages[i].width*g->pages[i].height; }
@@ -997,14 +1021,14 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
     memset(s->glyph_seen,0,g->glyph_count);
     size_t n=0;
     for (size_t i=0;i<count;i++) {
-        s->strips[i]=(gl_strip){strips[i],n,(size_t)strips[i].row_count*g->dims.cols};
+        s->strips[i]=(gl_strip){draw_strips[i],n,(size_t)draw_strips[i].row_count*g->dims.cols};
         if (s->upload!=GL_UPLOAD_LEGACY) {
-            s->strips[i].first=(size_t)strips[i].first_row*g->dims.cols;
+            s->strips[i].first=(size_t)draw_strips[i].first_row*g->dims.cols;
             if (s->upload!=GL_UPLOAD_PERSISTENT)
                 memcpy(s->cells+s->strips[i].first,g->cells+s->strips[i].first,s->strips[i].count*sizeof(render_cell));
         }
-        uint32_t end=strips[i].first_row+strips[i].row_count;
-        for (uint32_t row=strips[i].first_row;row<end;row++) for (uint32_t col=0;col<g->dims.cols;col++) {
+        uint32_t end=draw_strips[i].first_row+draw_strips[i].row_count;
+        for (uint32_t row=draw_strips[i].first_row;row<end;row++) for (uint32_t col=0;col<g->dims.cols;col++) {
             const render_cell *c=&g->cells[(size_t)row*g->dims.cols+col];
             uint32_t image[4]={0};
             if (c->atlas_slot!=RENDER_NO_SLOT) {
@@ -1067,6 +1091,7 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
         s->ring_last=s->ring_current; s->ring_has_last=true;
         s->ring_next=(s->ring_current+1u)%GL_CELL_RING; s->leased=false;
     }
+    s->scroll=g->scroll;
     s->swapped=false;
     return RENDER_OK;
 }

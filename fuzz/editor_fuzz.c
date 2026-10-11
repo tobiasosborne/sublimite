@@ -90,7 +90,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
          * default burst contracts exercise same-time automatic grouping. */
         plat_event ev = {.kind = PLAT_EV_KEY, .press = true,
             .t0_ns = (i / 4u + 1u) * (UNDO_BURST_NS + 1u)};
-        switch (data[i] % 16u) {
+        switch (data[i] % 17u) {
         case 0: case 1: case 2: {
             const char *texts[] = {"a", "x", "中", "e\xcc\x81", "\xcc\x81", "👩", "\xe2\x80\x8d", "\xff"};
             const char *text = texts[data[i + 2] % 8u]; size_t n = strlen(text);
@@ -102,14 +102,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             replace(&m, lo(&m), hi(&m) - lo(&m), &ch, 1); mutation = true; break;
         }
         case 4: case 5: {
-            bool back = data[i] % 16u == 4; ev.keysym = back ? XKB_KEY_BackSpace : XKB_KEY_Delete;
+            bool back = data[i] % 17u == 4; ev.keysym = back ? XKB_KEY_BackSpace : XKB_KEY_Delete;
             size_t a = lo(&m), z = hi(&m);
             if (a == z) { if (back && a) a = previous(&m, a); else if (!back && z < m.len) z = next(&m, z); }
             if (z > a) { replace(&m, a, z - a, NULL, 0); mutation = true; }
             break;
         }
         case 6: case 7: {
-            bool left = data[i] % 16u == 6; ev.keysym = left ? XKB_KEY_Left : XKB_KEY_Right;
+            bool left = data[i] % 17u == 6; ev.keysym = left ? XKB_KEY_Left : XKB_KEY_Right;
             ev.mods = shift ? PLAT_MOD_SHIFT : 0;
             if (!shift && m.cursor != m.anchor) m.cursor = left ? lo(&m) : hi(&m);
             else if (left && m.cursor) m.cursor = previous(&m, m.cursor);
@@ -117,7 +117,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (!shift) m.anchor = m.cursor; m.preferred = SIZE_MAX; break;
         }
         case 8: case 9: {
-            bool up = data[i] % 16u == 8; ev.keysym = up ? XKB_KEY_Up : XKB_KEY_Down;
+            bool up = data[i] % 17u == 8; ev.keysym = up ? XKB_KEY_Up : XKB_KEY_Down;
             ev.mods = shift ? PLAT_MOD_SHIFT : 0;
             if (m.preferred == SIZE_MAX) m.preferred = column_at(&m, m.cursor);
             size_t start = line_start(&m, m.cursor), end = line_end(&m, m.cursor);
@@ -126,7 +126,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (!shift) m.anchor = m.cursor; break;
         }
         case 10: case 11: {
-            bool redo = data[i] % 16u == 11;
+            bool redo = data[i] % 17u == 11;
             ev.keysym = redo ? XKB_KEY_Z : XKB_KEY_z;
             ev.mods = (uint16_t)(PLAT_MOD_CTRL | (redo ? PLAT_MOD_SHIFT : 0));
             if (redo && applied < nh) { m = hist[applied++].after; m.preferred = SIZE_MAX; }
@@ -136,6 +136,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         case 12: ev.kind = PLAT_EV_FOCUS; ev.focused = shift; break;
         case 13: ev.kind = PLAT_EV_RESIZE; ev.w = 160u + data[i + 2]; ev.h = 64u + data[i + 3]; break;
         case 14: ev.kind = PLAT_EV_EXPOSE; break;
+        case 16: ev.kind = PLAT_EV_WHEEL; ev.dy = data[i + 2] & 1u ? -(int32_t)SCROLL_WHEEL_UNIT : (int32_t)SCROLL_WHEEL_UNIT; break;
         default: ev.press = false; ev.keysym = 'x'; ev.utf8_len = 1; ev.utf8[0] = 'x'; break;
         }
         if (mutation) { nh = applied; hist[nh++] = (history){before, m}; applied = nh; }
@@ -144,7 +145,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         EDIT_ASSERT(editor_read(e, 0, actual, m.len) == 0 && !memcmp(actual, m.bytes, m.len));
         view_selection s = editor_view(e).selection;
         if (s.cursor != m.cursor || s.anchor != m.anchor) {
-            fprintf(stderr, "editor_fuzz step=%zu op=%u sym=%u got=%llu/%llu model=%zu/%zu len=%zu\n", i / 4, data[i] % 16u, ev.keysym,
+            fprintf(stderr, "editor_fuzz step=%zu op=%u sym=%u got=%llu/%llu model=%zu/%zu len=%zu\n", i / 4, data[i] % 17u, ev.keysym,
                 (unsigned long long)s.cursor, (unsigned long long)s.anchor, m.cursor, m.anchor, m.len);
             for (size_t j = 0; j < m.len; j++) fprintf(stderr, "%02x", m.bytes[j]);
             fprintf(stderr, " before=%zu/%zu preferred=%zu actual_preferred=%llu\n", before.cursor, before.anchor, before.preferred,

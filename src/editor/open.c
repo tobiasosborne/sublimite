@@ -116,7 +116,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         rc = add_poll_fd(e, config_runtime_eventfd(e->preferences_runtime)); if (rc) goto fail;
     }
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
-    size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
+    /* P3.4 reservation: maximum visible rows plus the bottom overscan row. */
+    size_t reserved_rows = (size_t)e->max_rows + 1u;
+    size_t cells = (size_t)e->max_cols * reserved_rows, words = (reserved_rows + 63) / 64;
     uint32_t font_pages; size_t font_glyphs, font_pixels;
     font_async_atlas_limits(&font_pages, &font_glyphs, &font_pixels, e->font.capacity);
     /* (G) strip reservation = existing eight text columns at the largest
@@ -131,7 +133,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         (size_t)e->map_capacity * 8u * sizeof(render_cell) +
         ((size_t)e->map_capacity + 63u) / 64u * sizeof(uint64_t) +
         2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
-        (size_t)e->max_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
+        reserved_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) +
         font_glyphs * words * sizeof(uint64_t) + 2u * 1024u * 1024u;
@@ -154,8 +156,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     memset(e->font_rows, 0, font_glyphs * words * sizeof *e->font_rows);
     e->strip_cap = ((size_t)e->max_rows + 1) / 2;
     e->strips = edit_arena_alloc(&e->arena, e->strip_cap * sizeof *e->strips, 8);
-    e->row_byte = edit_arena_alloc(&e->arena, e->max_rows * sizeof *e->row_byte, 8);
-    e->row_used = edit_arena_alloc(&e->arena, e->max_rows * sizeof *e->row_used, 8);
+    e->row_byte = edit_arena_alloc(&e->arena, reserved_rows * sizeof *e->row_byte, 8);
+    e->row_used = edit_arena_alloc(&e->arena, reserved_rows * sizeof *e->row_used, 8);
     render_cell *full = edit_arena_alloc(&e->arena, cells * sizeof *full, 16);
     render_cell *text = edit_arena_alloc(&e->arena, cells * sizeof *text, 16);
     /* Minimap is painted in a compact grid with independent row stride. */
@@ -182,8 +184,12 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         .fg = 0xd8dee9, .bg = 0x20242c, .gutter_fg = 0x78808e, .gutter_bg = 0x20242c,
         .cursor_fg = 0x20242c, .cursor_bg = 0xe5e9f0, .sel_fg = 0xffffff, .sel_bg = 0x425471};
     e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
-    rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) goto fail;
-    e->text_grid.dims.rows = e->max_rows;
+    /* Initialize the reserved row even when the first tab wraps. Later
+     * wrap-off activation must never expose uninitialized tail cells. */
+    e->text_grid.dims.rows = td.rows + 1u;
+    rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used);
+    e->text_grid.dims.rows = td.rows; if (rc) goto fail;
+    e->text_grid.dims.rows = (uint32_t)reserved_rows;
     rc = layout_wrap_init(&e->lay, &e->arena); e->text_grid.dims.rows = td.rows; if (rc) goto fail;
     rc = editor_buffer_prepare(e, NULL, NULL, 0, &e->empty); if (rc) goto fail;
     e->buffer = e->empty; e->tree = e->empty->tree; e->undo = &e->empty->undo;
@@ -198,7 +204,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     render_config render = {.dims = dims, .max_width = e->font.max_width, .max_height = e->font.max_height,
         .max_cells = cells, .max_glyphs = font_glyphs, .max_pages = font_pages, .max_atlas_bytes = font_pixels,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
-        .max_region_width = map_width, .max_region_height = map_height};
+        .max_region_width = map_width, .max_region_height = map_height,
+        .hooks = {.present_complete = editor_refresh_complete, .user = e}};
     if (may_fallback) {
         render_backend requested = *backend;
         void *gpu_state = state;

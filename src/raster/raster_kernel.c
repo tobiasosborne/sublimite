@@ -4,6 +4,7 @@
 #include <emmintrin.h>
 #include <string.h>
 
+
 static uint32_t blend_px(uint32_t fg, uint32_t bg, uint32_t a)
 {
     uint32_t out = 0;
@@ -40,6 +41,43 @@ static bool cell_setup(const raster_scene *s, uint32_t col, const render_cell *c
             g->gh = gl->h < ch ? gl->h : ch;
             g->cov = pg->pixels + (size_t)gl->y * pg->stride + gl->x;
             g->cov_stride = pg->stride;
+        }
+    }
+    return true;
+}
+static uint32_t sample(const raster_scene *s, uint32_t x, uint32_t y)
+{
+    uint32_t row = y / s->dims.cell_h, col = x / s->dims.cell_w;
+    const render_cell *c = &s->cells[(size_t)row * s->dims.cols + col];
+    if (c->attrs & RENDER_ATTR_WIDE_RIGHT) { col--; c--; }
+    cell_geom g;
+    (void)cell_setup(s, col, c, &g);
+    uint32_t local_x = x - g.x0, local_y = y % s->dims.cell_h;
+    if (g.underline && local_y == s->dims.cell_h - 1u) return g.fg;
+    if (g.cov && local_x < g.gw && local_y < g.gh)
+        return blend_px(g.fg, g.bg, g.cov[(size_t)local_y * g.cov_stride + local_x]);
+    return g.bg;
+}
+bool raster_row_scrolled(const raster_scene *s, const render_scroll *plan,
+    uint32_t *dst, size_t stride_px, uint32_t row, raster_palette *palette,
+    raster_stop_fn stop, void *user)
+{
+    if (!raster_row_cached_cancellable(s, dst, stride_px, row, palette, stop, user)) return false;
+    if (!plan->cols || !plan->origin_y_q8 || row < plan->first_row || row - plan->first_row >= plan->rows)
+        return true;
+    uint32_t shift = (uint32_t)(-plan->origin_y_q8);
+    uint32_t whole = shift / 256u, fraction = shift % 256u;
+    for (uint32_t y = 0; y < s->dims.cell_h; y++) {
+        uint32_t sy = row * s->dims.cell_h + y + whole;
+        for (uint32_t x = 0; x < plan->cols * s->dims.cell_w; x++) {
+            if (x % s->dims.cell_w == 0 && stop && stop(user)) return false;
+            uint32_t a = sample(s, x, sy), b = fraction ? sample(s, x, sy + 1u) : a, pixel = 0;
+            /* Exact Q8 box coverage, rounded once per output colour channel. */
+            for (unsigned bit = 0; bit < 24u; bit += 8u) {
+                uint32_t ac = (a >> bit) & 255u, bc = (b >> bit) & 255u;
+                pixel |= ((ac * (256u - fraction) + bc * fraction + 128u) / 256u) << bit;
+            }
+            dst[(size_t)y * stride_px + x] = pixel | s->alpha_or;
         }
     }
     return true;

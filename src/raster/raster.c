@@ -66,6 +66,7 @@ typedef struct cpu_state {
     uint32_t total_rows, frame_id;
     bool have_frame;
     bool snapshot_valid, inline_frame, caret_hint;
+    render_scroll scroll;
     uint32_t inline_at[2], inline_count;
     bool inline_fence, inline_present, inline_idle;
     uint64_t inline_t6, completion_deadline;
@@ -110,6 +111,8 @@ typedef struct row_ctx { cpu_state *st; work_ctx *work; raster_palette *palette;
 static bool row_should_stop(void *u) { return work_should_stop(u); }
 static void blit_row(cpu_state *st, uint32_t row)
 {
+    /* Composite after the text transform. Region x/y and row clipping use
+     * surface coordinates, so fractional text motion cannot move the map. */
     const render_pixels *p = &st->region;
     uint32_t top = row * st->scene.dims.cell_h, end = top + st->scene.dims.cell_h;
     if (!p->pixels || end <= p->y || top >= p->y + p->height) return;
@@ -122,7 +125,7 @@ static void do_row(void *u, uint32_t row)
     row_ctx *ctx = u;
     if (work_should_stop(ctx->work)) return;
     cpu_state *st = ctx->st;
-    (void)raster_row_cached_cancellable(&st->scene,
+    (void)raster_row_scrolled(&st->scene, &st->scroll,
         st->pix + (size_t)row * st->scene.dims.cell_h * st->stride_px,
         st->stride_px, row, ctx->palette, row_should_stop, ctx->work);
     if (!work_should_stop(ctx->work)) blit_row(st, row);
@@ -521,7 +524,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     int retire_rc = cpu_retire_jobs(st);
     if (retire_rc != RENDER_OK) return retire_rc;
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
-    st->inline_frame = inline_cursor_damage(st, g, strips, count);
+    st->inline_frame = !g->scroll.origin_y_q8 && inline_cursor_damage(st, g, strips, count);
     if (g->region.pixels) {
         bool copy = g->region.dirty || g->full_frame || !st->region.pixels ||
             g->region.width != st->region.width || g->region.height != st->region.height;
@@ -545,6 +548,9 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     if (g->glyph_count) memcpy(st->glyphs, g->glyphs, g->glyph_count * sizeof *g->glyphs);
     if (g->page_count) memcpy(st->pages, g->pages, g->page_count * sizeof *g->pages);
     st->scene.dims = g->dims;
+    st->scroll = g->scroll;
+    if (g->scroll.cols) memcpy(st->cells + (size_t)g->dims.rows * cols,
+        g->cells + (size_t)g->dims.rows * cols, (size_t)cols * sizeof *st->cells);
     st->scene.glyph_count = g->glyph_count; st->scene.page_count = g->page_count;
     st->nstrips = count; st->total_rows = total; st->frame_id = g->frame_id;
     uint32_t njobs = st->inline_frame ? 0 : (total < RASTER_JOBS ? total : RASTER_JOBS);

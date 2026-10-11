@@ -75,6 +75,7 @@ minimap_input editor_map_input(editor_buffer *b)
 void editor_buffer_destroy(editor_buffer *b)
 {
     if (!b) return;
+    editor_scroll_close(b);
     editor_large_close(b);
     minimap_fini(&b->map);
     if (b->index) lineidx_destroy(b->index);
@@ -109,6 +110,7 @@ void editor_retire_buffers(editor *e)
         work_cancel(&e->pool, b->lg.find_retiring_h);
         if (b->index) { lineidx_build_cancel(b->index); (void)lineidx_poll(b->index); }
         unpoll_source(e, b);
+        if (editor_scroll_retire(b) == EDITOR_MORE) continue;
         /* file_close has no public logical-retirement/physical-ready split.
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
@@ -229,6 +231,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     }
     b->initial = (view_state){.selection = {.preferred_col = VIEW_PREFERRED_UNSET},
         .wrap = e->cfg.wrap_mode ? e->cfg.wrap_mode > 0 : view_wrap_default(b->path)};
+    rc = editor_scroll_init(e, b); if (rc) goto fail;
     *out = b; return 0;
 fail:
     e->opening = NULL;
@@ -246,6 +249,7 @@ int editor_adopt_open(editor *e, editor_buffer *b)
     }
     int rc = file_attach(b->file, b->tree); if (rc) return EDITOR_ERR_IO;
     b->pending_open = false;
+    b->revision++; /* invalidate the preview's resident scroll source */
     editor_large_init(b);
     if (file_open_mode(b->file) == FILE_MODE_MMAP) {
         lineidx_destroy(b->index);
@@ -300,8 +304,17 @@ int editor_activate(editor *e)
      * retained state, including an explicit caller wrap override, afterward. */
     rc = layout_set_wrap(&e->lay, live.wrap); if (rc) return rc;
     e->v.state = live;
+    e->geometry_generation++; /* wrap/tab-width geometry belongs to this activation */
+    e->text_grid.dims.rows = e->grid.dims.rows - e->tab_rows + (live.wrap ? 0u : 1u);
+    e->v.config.rows = e->grid.dims.rows - e->tab_rows;
     keys_reset(&e->keys); e->action = EDITOR_ACTION_NONE;
     e->old_selection = live.selection; editor_restart_blink(e, trace_now_ns());
+    if (!live.wrap) {
+        rc = editor_scroll_resize(e); if (rc) return rc;
+        if (live.first_byte != e->buffer->scroll.first_byte) {
+            rc = editor_scroll_seek(e, live.first_byte); if (rc) return rc;
+        }
+    }
     return editor_full_layout(e);
 }
 static int protected_record(editor *e, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
@@ -518,6 +531,14 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
     b->initial.selection.cursor = b->initial.selection.anchor = start + at;
     b->initial.first_byte = start; b->initial.first_line = ln;
     b->initial.visual_byte = b->initial.wrap ? start + at : start;
+    if (!b->initial.wrap) {
+        /* Owned seek already certified this byte/line pair. Preserve its
+         * ordinal while the global index is partial; a density label must
+         * not replace an explicit launch coordinate. */
+        b->scroll.first_byte = start; b->scroll.first_line = b->scroll.anchor_line = ln;
+        b->scroll.request = SCROLL_READY; b->scroll.pending_rows = 0;
+        b->scroll_display = b->scroll;
+    }
     return 0;
 }
 int editor_open_request(editor *e, const ipc_request *request, ipc_token token)

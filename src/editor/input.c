@@ -49,6 +49,7 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
         if (lineidx_edit(e->buffer->index, off, old, add)) return EDITOR_ERR_HISTORY;
         e->buffer->index_dirty = true;
     }
+    int sr = editor_scroll_edit(e, off, old, add); if (sr) return sr;
     int rc = editor_begin_frame(e); if (rc) return rc;
     if (!e->lay.src || e->full_pending) { e->full_pending = true; return 0; }
     rc = layout_edit(&e->lay, off, old, add, old_nl, new_nl);
@@ -378,6 +379,7 @@ int editor_continue_action(editor *e)
     if (e->action == EDITOR_ACTION_CLIP) return editor_clip_continue(e);
     if (e->action == EDITOR_ACTION_REPLAY_WORK) return replay_slice(e);
     view_change c; int rc = view_continue(&e->v, &c);
+    if (rc == VIEW_MORE) editor_scroll_mirror(e);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;
     if (rc) return rc;
@@ -510,11 +512,45 @@ int editor_handle_key(editor *e, const plat_event *ev)
                       (action == KEYS_ACTION_WORD_DELETE ? VIEW_WORD_RIGHT : VIEW_RIGHT);
         e->action = EDITOR_ACTION_DELETE;
     } else e->action = EDITOR_ACTION_MOVE;
+    if (moving && !e->v.state.wrap) {
+        scroll_key scroll_key_value;
+        bool scroll_motion = true;
+        if (move == VIEW_PAGE_UP) scroll_key_value = SCROLL_PAGE_UP;
+        else if (move == VIEW_PAGE_DOWN) scroll_key_value = SCROLL_PAGE_DOWN;
+        else if (move == VIEW_DOC_HOME) scroll_key_value = SCROLL_HOME;
+        else if (move == VIEW_DOC_END) scroll_key_value = SCROLL_END;
+        else scroll_motion = false;
+        if (scroll_motion) {
+            rc = scroll_key_motion(&e->buffer->scroll, scroll_key_value, &move); if (rc) return rc;
+            e->buffer->scroll_following = false; e->buffer->scroll_pending = true;
+        }
+    }
     view_change c;
     editor_seed_view_lines(e);
     rc = view_command(&e->v, move, moving && binding && (binding->args.flags & KEYS_ARG_EXTEND), NULL, 0, &c);
+    if (rc == VIEW_MORE) editor_scroll_mirror(e);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;
     if (rc) return rc;
     return editor_continue_action(e);
+}
+int editor_handle_wheel(editor *e, const plat_event *ev)
+{
+    if (e->buffer->source_stale || e->buffer->pending_open || !tabs_count(&e->tabs)) return 0;
+    /* Wrapped visual metadata is owned by the wrap integration, not the
+     * logical line-index adapter. Never reinterpret logical rows as visual. */
+    if (e->v.state.wrap) return 0;
+    editor_buffer *b = e->buffer;
+    b->scroll_following = false;
+    int rc = scroll_wheel(&b->scroll, ev->dy); if (rc) return rc;
+    b->scroll_pending = true;
+    undo_break_burst(e->undo);
+    uint64_t now = trace_now_ns(), seq = ++e->stats.input_sequence;
+    if (e->cfg.on_ingress) e->cfg.on_ingress(e->cfg.hook_ctx, seq, now);
+    rc = editor_begin_frame(e); if (rc) return rc;
+    if (!e->frame.first_sequence) { e->frame.first_sequence = seq; e->frame.ingress_ns = now; }
+    e->frame.last_sequence = seq;
+    trace_record_at(ev->t0_ns ? ev->t0_ns : now, TRACE_T0_INGRESS, e->grid.frame_id);
+    trace_record_at(now, TRACE_T1_DEQUEUE, e->grid.frame_id);
+    return editor_scroll_slice(e);
 }

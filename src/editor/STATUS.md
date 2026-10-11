@@ -100,6 +100,41 @@ Raster bootstrap paints while a separate worker discovers EGL. Headless regressi
 
 Evidence, exact validation outcomes and remaining acceptance: [worker report](../../docs/worker-reports/edit-2ts.md).
 Design: [decision record](../../docs/decisions/edit-2ts.md).
+# edit-3kk — resident scroll and refresh host wiring
+
+Logical wheel/page/document/follow/resize/source adoption is owned by scrollctl;
+input.c retains wheel dispatch. Each buffer retains immutable backing until
+resident workers physically retire. Warm wheel/typing follows certified layout
+rows, avoiding a redundant source copy. Overscan is reserved and initialized
+separately from the visible surface, including preview and resize transitions.
+The renderer snapshots Q8 origin/clip/overscan. Null refresh observations retain
+input/source/geometry/scroll/wrap/sidebar identity and expose repeat/missing/stale
+opportunities without releasing a newer backend slot.
+
+The null displayed probe passes and rejects the deliberately repeated stream.
+Physical cadence remains unsupported with completion-only native observations;
+exact wrapped metadata remains a separate host requirement. Native raster/GL
+pixels and the comparison drive require the coordinator's Xvfb run outside the
+sandbox. Unix IPC binding is denied here as well as the X socket. Full measured
+red/green, sanitizer/build results and limitations are in
+[the worker report](../../docs/worker-reports/edit-3kk.md).
+
+Validation commands: `make all`; `ASAN_OPTIONS=detect_leaks=0 make check`;
+`build/tests/editor_scroll_test`; `build/tests/raster_scroll_test`;
+`build/tests/gl_scroll_test`; `build/tests/scroll_test --require-editor-scroll`;
+`build/bench/scroll_bench --displayed-probe`. The release counting guard supplies
+allocation evidence; ASan's guard is inert. The earlier module history follows.
+
+Final validation: GCC `make all` passes; Clang ASan/UBSan builds all suites.
+The required `make check` stops at denied CLI IPC. Individually, every suite
+without display or restricted IPC passes; the exact manifest and hybrid-suite
+failures are in the report. Focused scroll, raster pixels, GL snapshots, resize,
+held-source cancellation, EOF typing, deep typing and index repair are green.
+The active release typing guard passes. Native GL is explicitly skipped here.
+Final model fuzzing stops at an unchanged pure-view/oracle preferred-column
+policy disagreement after Right at EOF, reproduced without editor/scroll calls;
+no out-of-scope view/oracle fix was made. Physical cadence and wrapped metadata
+remain the stated integration limits. No comparison-drive hand-over is claimed.
 
 # edit-ck4 — session 9
 

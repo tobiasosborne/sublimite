@@ -140,6 +140,20 @@ int editor_full_layout(editor *e)
     rc = render_mark_full(&e->grid); if (rc) return rc;
     e->paint_ready = false;
     view_state s = e->v.state;
+    if (!s.wrap) {
+        scroll_state planned = e->buffer->scroll_display;
+        planned.config = e->buffer->scroll.config;
+        rc = scroll_plan_frame(&planned, e->text_grid.dims.cols * e->grid.dims.cell_w,
+            (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h,
+            e->submitted_plan_valid ? &e->submitted_plan : NULL, &e->scroll_plan);
+        if (rc) return rc;
+    } else {
+        e->scroll_plan = (scroll_frame_plan){.first_byte = s.visual_byte,
+            .clip_width = e->text_grid.dims.cols * e->grid.dims.cell_w,
+            .clip_height = (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h,
+            .row_height = e->grid.dims.cell_h, .layout_rows = e->text_grid.dims.rows,
+            .full_damage = true};
+    }
     uint32_t hs = s.hscroll > UINT32_MAX ? UINT32_MAX : (uint32_t)s.hscroll;
     layout_viewport vp = {s.first_byte, s.first_line, hs, e->buffer->lines};
     layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
@@ -194,6 +208,7 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 {
     e->caret_only = false;
     editor_clip_selection(e);
+    int rc = editor_scroll_follow(e); if (rc) return rc;
     return refresh_cursor(e, old_cursor, false);
 }
 void editor_route_work(const work_msg *msg, void *ctx)
@@ -212,6 +227,7 @@ void editor_route_work(const work_msg *msg, void *ctx)
             if (e->buffers[i] && e->buffers[i]->save && savectl_receive(e->buffers[i]->save, msg)) return;
     }
     if (editor_large_receive(e, msg)) return;
+    if (msg->kind == SCROLL_RESIDENT_MSG) return; /* bridge's bound receiver owns adoption */
     file_msg fm;
     if (file_msg_decode(msg, &fm) == 0) {
         if (fm.kind == FILE_MSG_PREFIX_READY) {
@@ -323,9 +339,12 @@ static int present(editor *e)
     if (rc) return rc;
     trace_record(TRACE_STARTUP_FIRST_PRESENT, 0);
     e->startup_presented = true;
-    e->active_frame.present_ns = trace_now_ns();
+    e->active_frame.present_ns = b->submitted_ns; /* the adapter's actual T4 */
+    for (size_t i = 0; i < sizeof e->refresh_frames / sizeof e->refresh_frames[0]; i++)
+        if (e->refresh_frames[i].id == e->active_frame.id) e->refresh_frames[i] = e->active_frame;
     if (e->active_frame.last_sequence) e->stats.presented_sequence = e->active_frame.last_sequence;
     if (e->cfg.on_present) e->cfg.on_present(e->cfg.hook_ctx, &e->active_frame);
+    editor_refresh_flush(e);
     return 0;
 }
 static int submit(editor *e)
@@ -333,7 +352,7 @@ static int submit(editor *e)
     /* A bounded consumer (including minimap) may adopt the final index range
      * after this turn's pump. Publish before this frame can leave the editor. */
     editor_large_index_progress(e);
-    if (e->op_count || editor_clip_busy(e) || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (e->op_count || editor_clip_busy(e) || editor_scroll_waiting(e) || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     int metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
@@ -355,6 +374,32 @@ static int submit(editor *e)
     trace_record(TRACE_STARTUP_FIRST_SUBMIT, 0);
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
     editor_save_submitted(e, e->frame.submit_ns);
+    e->active_frame.scroll = e->scroll_plan;
+    e->active_frame.selection = e->v.state.selection;
+    e->active_frame.wrapped = e->v.state.wrap;
+    if (e->v.state.wrap) e->active_frame.wrap_seed = e->lay.wrap_rows[0];
+    e->active_frame.source_id = e->buffer->id;
+    e->active_frame.source_generation = e->buffer->source_generation;
+    e->active_frame.source_revision = e->buffer->revision;
+    e->active_frame.geometry_generation = e->geometry_generation;
+    e->active_frame.sidebar_revision = e->buffer->map.revision;
+    uint64_t identity = 0; /* rolling identity from the exact submitted sidebar pixels/cells */
+    for (uint32_t r = e->tab_rows; r < e->grid.dims.rows; r++)
+        for (uint32_t c = e->text_grid.dims.cols; c < e->grid.dims.cols; c++) {
+            const render_cell *cell = &e->grid.cells[(size_t)r * e->grid.dims.cols + c];
+            identity = (identity << 1) | (identity >> 63);
+            identity ^= (uint64_t)cell->glyph_index ^ ((uint64_t)cell->bg << 32) ^ cell->fg;
+        }
+    const render_pixels *region = &e->grid.region;
+    if (region->pixels) for (uint32_t y = 0; y < region->height; y++)
+        for (uint32_t x = 0; x < region->width; x++) {
+            identity = (identity << 1) | (identity >> 63);
+            identity ^= region->pixels[(size_t)y * region->stride + x];
+        }
+    e->active_frame.sidebar_identity = identity;
+    e->frame = e->active_frame;
+    e->refresh_frames[e->refresh_next] = e->active_frame;
+    e->refresh_next = (e->refresh_next + 1u) % (sizeof e->refresh_frames / sizeof e->refresh_frames[0]);
     if (e->buffer->source_stale && !e->buffer->prompt_ns) {
         e->buffer->prompt_ns = e->frame.submit_ns;
         e->buffer->prompt_serial = e->event_serial;
@@ -363,6 +408,7 @@ static int submit(editor *e)
     if (e->frame.last_sequence) e->stats.submitted_sequence = e->frame.last_sequence;
     e->dirty = false;
     if (e->cfg.on_submit) e->cfg.on_submit(e->cfg.hook_ctx, &e->frame);
+    e->submitted_plan = e->scroll_plan; e->submitted_plan_valid = true;
     return 0;
 }
 static int resize(editor *e)
@@ -389,18 +435,25 @@ int editor_resize_grid(editor *e, render_dims dims)
         dims.rows = RASTER_FRAME_CELL_LIMIT / dims.cols;
     int rc = render_backend_resize(e->backend, dims); if (rc) return rc;
     e->grid.dims = dims;
+    e->grid.scroll = (render_scroll){0}; /* the old rectangle belongs to the old surface */
     e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
     e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
     rc = font_async_bind(e->fonts, &e->grid); if (rc) return rc;
     rc = font_async_bind(e->fonts, &e->text_grid); if (rc) return rc;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
     e->v.config.rows = e->text_grid.dims.rows;
+    if (!e->v.state.wrap) e->text_grid.dims.rows++;
     /* Reinit clears cells for a changed compact stride; retain open-time wrap storage. */
     layout_wrap_row *rows = e->lay.wrap_rows, *plan = e->lay.wrap_plan; uint32_t cap = e->lay.wrap_capacity;
-    rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) return rc;
+    uint32_t active_rows = e->text_grid.dims.rows;
+    if (e->v.state.wrap) e->text_grid.dims.rows++;
+    rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used);
+    e->text_grid.dims.rows = active_rows; if (rc) return rc;
     e->lay.wrap_rows = rows; e->lay.wrap_plan = plan; e->lay.wrap_capacity = cap;
     e->lay.cfg.tab_width = e->buffer->style.width; e->lay.tab = e->buffer->style.width;
     rc = layout_set_wrap(&e->lay, e->v.state.wrap); if (rc) return rc;
+    e->geometry_generation++;
+    rc = editor_scroll_resize(e); if (rc) return rc;
     return editor_full_layout(e);
 }
 static int nonkey(editor *e, const plat_event *ev)
@@ -426,6 +479,7 @@ static int nonkey(editor *e, const plat_event *ev)
         return refresh_caret(e);
     }
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
+    if (ev->kind == PLAT_EV_WHEEL) return editor_handle_wheel(e, ev);
     if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
         return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);
     return 0;
@@ -511,7 +565,8 @@ static bool runnable(const editor *e)
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
-    return (e->font.requested_px != e->font.applied_px && !e->font.handle.epoch) ||
+    return (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
+           (e->font.requested_px != e->font.applied_px && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
@@ -569,12 +624,14 @@ int editor_step(editor *e, int timeout_ms)
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
+    editor_refresh_flush(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
     editor_journal_staged(e);
     editor_large_index_progress(e);
     rc = editor_clip_poll(e); if (rc) return fail(e, rc);
+    rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
     rc = e->action == EDITOR_ACTION_REPLAY_WORK ? 0 : blink(e, start);
@@ -618,6 +675,7 @@ int editor_step(editor *e, int timeout_ms)
         rc = editor_flush(e);
         return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
     }
+    rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
     uint64_t submit_start = trace_now_ns(); rc = submit(e);
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
@@ -656,7 +714,8 @@ int editor_set_cursor(editor *e, uint64_t byte)
     e->v.state.first_byte = piece_line_to_byte(e->tree, e->v.state.first_line);
     e->v.state.visual_byte = e->v.state.first_byte; e->v.state.visual_end = false;
     e->v.state.hscroll = 0; undo_break_burst(e->undo);
-    return editor_refresh_cursor(e, old);
+    int rc = editor_scroll_seek(e, e->v.state.first_byte); if (rc) return rc;
+    return refresh_cursor(e, old, false);
 }
 int editor_jump_line(editor *e, uint64_t line)
 {
@@ -694,7 +753,7 @@ editor_stats editor_get_stats(const editor *e)
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }

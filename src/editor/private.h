@@ -14,6 +14,7 @@
 #include "minimap/minimap.h"
 #include "editor/large_private.h"
 #include "editor/runtime.h"
+#include "scroll/scroll.h"
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
 #define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
@@ -62,6 +63,15 @@ typedef struct editor_buffer {
     minimap map;
     minimap_row *map_rows;
     view_state initial;
+    scroll_state scroll;
+    scroll_state scroll_display;
+    scroll_resolver scroll_resolver;
+    scroll_resolver scroll_follow_resolver;
+    scroll_resident scroll_resident;
+    piece_snapshot *scroll_snapshot;
+    uint64_t scroll_revision, scroll_cursor;
+    size_t scroll_prefix;
+    bool scroll_ready, scroll_pending, scroll_following;
     char path[IPC_PATH_CAP], save_path[IPC_PATH_CAP];
     ipc_token wait_token;
 } editor_buffer;
@@ -173,6 +183,14 @@ struct editor {
     uint64_t repair_line_byte, repair_line_number;
     editor_frame frame, active_frame;
     uint32_t unimplemented_frame; /* Notice belongs to this frame generation. */
+    scroll_frame_plan scroll_plan, submitted_plan;
+    bool submitted_plan_valid;
+    uint64_t geometry_generation;
+    /* One backend slot plus the preceding submission for repeat observation. */
+    editor_frame refresh_frames[2];
+    size_t refresh_next;
+    uint64_t refresh_sequence, refresh_ns, completion_ns;
+    uint32_t completion_id;
     uint32_t extra_first, extra_end, resize_w, resize_h;
     bool dirty, extra_rows, resize_pending, full_pending;
     bool repair_line_valid;
@@ -247,6 +265,19 @@ int editor_checkpoint(editor *e);
 int editor_journal_metadata(editor *e);
 bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);
+int editor_handle_wheel(editor *e, const plat_event *ev);
+int editor_scroll_init(editor *e, editor_buffer *b);
+int editor_scroll_retire(editor_buffer *b);
+void editor_scroll_close(editor_buffer *b);
+int editor_scroll_slice(editor *e);
+int editor_scroll_follow(editor *e);
+int editor_scroll_seek(editor *e, uint64_t byte);
+int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add);
+int editor_scroll_resize(editor *e);
+void editor_scroll_mirror(editor *e);
+bool editor_scroll_waiting(const editor *e);
+void editor_refresh_complete(void *ctx, uint32_t id, uint64_t ns);
+void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,

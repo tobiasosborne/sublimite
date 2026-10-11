@@ -69,8 +69,17 @@ typedef struct render_glyph {
 typedef struct render_strip {
     uint32_t first_row, row_count; /* full-width, half-open row run */
 } render_strip;
+/* Optional text transform; zero cols disables it. One overscan row follows
+ * the visible cells at dims.rows*cols. Chrome/sidebar stay fixed. Origin is
+ * exact Q8, in (-cell_h*256,0]; clip covers the indicated visible text rows. */
+typedef struct render_scroll {
+    int64_t origin_y_q8;
+    uint32_t first_row, rows, cols;
+} render_scroll;
 
-/* Optional opaque RGB region, composited over cells at pixel coordinates.
+/* Optional opaque RGB region, composited over cells at surface pixel coordinates.
+ * Coordinates are independent of scroll: a cell-positioned sidebar uses
+ * x=first_col*cell_w, y=first_row*cell_h and never inherits the text origin.
  * Caller storage is mutable again after submit: backends copy into init
  * storage. Damage is independent of cell strips; full frames redraw both.
  * Zero pixels disables the region. Stride/capacity are uint32_t elements. */
@@ -83,7 +92,7 @@ typedef struct render_pixels {
 
 typedef struct render_grid {
     render_dims dims;
-    render_cell *cells;          /* exactly cols*rows active cells, row-major */
+    render_cell *cells;          /* cols*rows, plus one row when scroll.cols!=0 */
     size_t cell_capacity;
     uint64_t *dirty;             /* bit r%64 in dirty[r/64]; padding ignored */
     size_t dirty_word_capacity;
@@ -94,6 +103,7 @@ typedef struct render_grid {
     uint32_t frame_id;           /* trace's uint32_t; 0 reserved for startup */
     bool full_frame, begun;
     render_pixels region;
+    render_scroll scroll;
 } render_grid;
 
 /* UI thread only (pure read-only helpers may also operate on an exclusively

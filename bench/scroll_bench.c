@@ -3,6 +3,7 @@
  * observations without issuing a gate verdict. Never opens a display. */
 #include "scroll/scroll.h"
 #include "layout/layout.h"
+#include "editor/editor.h"
 #include "../bench/harness.h"
 #include "scroll_display.h"
 #include <fcntl.h>
@@ -17,6 +18,10 @@
 #define JUMPS BENCH_INTERACTION_MIN_N
 _Static_assert(JUMPS >= BENCH_INTERACTION_MIN_N, "G7j needs qualified samples");
 #define STEPS 10000u
+/* (G) Public-editor probe geometry/storage from scroll_test.c:editor_observability. */
+#define DISPLAYED_PROBE_BYTES 400u
+#define DISPLAYED_PROBE_COLS 32u
+#define DISPLAYED_PROBE_ROWS 8u
 #define HALF_PERIOD_NS UINT64_C(4166666)
 typedef struct source { const uint8_t *bytes; uint64_t size; } source;
 static size_t span(void *ctx, uint64_t off, const uint8_t **out)
@@ -172,25 +177,111 @@ static int jump_fixture(char *path, size_t capacity)
     if (fsync(out)) { close(out); (void)unlink(path); return -1; }
     return out;
 }
+/* Uses the public editor hooks rather than deriving display identity from
+ * submit counters. Null supplies synthetic opportunities only. The injected
+ * stream repeats the previous submission on alternate opportunities, as
+ * required by P3.4; no physical cadence verdict follows from this fixture. */
+typedef struct displayed_probe {
+    editor_frame expected;
+    uint64_t sequence, completion_ns;
+    size_t observed, misses, injected_misses;
+    bool injected;
+} displayed_probe;
+static void displayed_submit(void *ctx, const editor_frame *frame)
+{ ((displayed_probe *)ctx)->expected = *frame; }
+static void displayed_refresh(void *ctx, const editor_refresh *r)
+{
+    displayed_probe *p = ctx;
+    p->sequence = r->refresh_sequence; p->completion_ns = r->completion_ns;
+    bool correct = r->synthetic && r->opportunity_stream && r->metadata_valid &&
+        r->displayed_frame_id == p->expected.id &&
+        r->frame.first_sequence == p->expected.first_sequence &&
+        r->frame.last_sequence == p->expected.last_sequence &&
+        r->frame.source_id == p->expected.source_id &&
+        r->frame.source_generation == p->expected.source_generation &&
+        r->frame.source_revision == p->expected.source_revision &&
+        r->frame.geometry_generation == p->expected.geometry_generation &&
+        r->frame.sidebar_revision == p->expected.sidebar_revision &&
+        r->frame.sidebar_identity == p->expected.sidebar_identity &&
+        !r->frame.wrapped && r->frame.selection.cursor == 0 && r->frame.selection.anchor == 0 &&
+        r->frame.scroll.first_byte == p->expected.scroll.first_byte &&
+        r->frame.scroll.first_row == p->expected.scroll.first_row &&
+        r->frame.scroll.origin_y_q8 == p->expected.scroll.origin_y_q8 &&
+        r->frame.scroll.clip_width == p->expected.scroll.clip_width &&
+        r->frame.scroll.clip_height == p->expected.scroll.clip_height &&
+        r->frame.scroll.row_height == p->expected.scroll.row_height &&
+        r->frame.scroll.layout_rows == p->expected.scroll.layout_rows &&
+        r->frame.scroll.full_damage == p->expected.scroll.full_damage;
+    if (p->injected) p->injected_misses += correct ? 0u : 1u;
+    else { p->observed++; p->misses += correct ? 0u : 1u; }
+}
+static int displayed_settle(editor *e)
+{
+    /* Reuse the existing public scroll probe's completion bound. */
+    for (unsigned retry = 0; retry < STEPS; retry++) {
+        int rc = editor_step(e, 0);
+        if (rc != EDITOR_OK && rc != EDITOR_MORE) return -1;
+        editor_stats stats = editor_get_stats(e);
+        if (!stats.pending && !stats.render_active) return 0;
+    }
+    return -1;
+}
+static int displayed_cadence(void)
+{
+    stamp power = read_stamp(); displayed_probe probe = {0};
+    /* Same public-editor fixture as scroll_test: enough logical rows for
+     * reversing wheel motion without reaching an endpoint. */
+    uint8_t bytes[DISPLAYED_PROBE_BYTES];
+    for (size_t i = 0; i < sizeof bytes; i++) bytes[i] = i % 2u ? '\n' : (uint8_t)'a';
+    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes,
+        .cols = DISPLAYED_PROBE_COLS, .rows = DISPLAYED_PROBE_ROWS, .wrap_mode = -1, .hook_ctx = &probe,
+        .on_submit = displayed_submit, .on_refresh = displayed_refresh};
+    render_backend backend = {0}; editor *e = NULL; int rc = -1;
+    if (render_null_backend(&backend) || editor_open(&e, &cfg, &backend) || displayed_settle(e)) goto done;
+    uint32_t previous = probe.expected.id;
+    size_t baseline = probe.observed;
+    for (unsigned step = 0; step < STEPS; step++) {
+        /* Equal positive/negative sub-notch intents reverse exactly. */
+        plat_event event = {.kind = PLAT_EV_WHEEL, .dy = step % 2u ? -1 : 1, .smooth = true};
+        if (editor_inject(e, &event) || displayed_settle(e)) goto done;
+        probe.injected = true;
+        uint32_t id = step % 2u ? previous : probe.expected.id;
+        if (editor_on_refresh(e, id, probe.sequence + 1u, probe.completion_ns, true)) goto done;
+        probe.injected = false; previous = probe.expected.id;
+    }
+    if (probe.observed - baseline != STEPS || probe.misses || probe.injected_misses != STEPS / 2u) goto done;
+    printf("G3z displayed_verdict=SYNTHETIC_PASS physical_verdict=UNSUPPORTED "
+        "(M)%s load1=%s power=%s opportunities=%u misses=%zu repeated_stream_misses=%zu "
+        "derivation=public_null_refresh_callbacks;alternate_previous_ID_injection=%u/2 "
+        "physical_reason=native_completion_is_not_every_refresh_opportunity\n",
+        bench__tag_from_power(power.power), power.load, power.power, STEPS, probe.misses,
+        probe.injected_misses, STEPS);
+    rc = 0;
+done:
+    editor_close(e); return rc;
+}
 int main(int argc, char **argv)
 {
     /* Display capability can be inspected independently of the log fixture.
-     * edit-3kk must supply the real observer/capture driver before this can
-     * produce a physical verdict. NULL explicitly records unsupported. */
+     * Physical cadence still requires a refresh-opportunity capture driver.
+     * NULL explicitly records unsupported. */
     if (argc == 2 && !strcmp(argv[1], "--display-check")) {
         scroll_display_history displayed = scroll_display_run(NULL, NULL);
         scroll_display_report(stdout, &displayed);
-        puts("scroll_bench: editor refresh/completion/immutable-plan/sidebar capture driver required; see docs/decisions/edit-ovu-display.md");
+        puts("scroll_bench: physical refresh-opportunity capture driver required; synthetic editor on_refresh probe is available via --displayed-probe; see docs/decisions/edit-ovu-display.md");
         return 0;
     }
-    bool track=false, probe=false, cold=false, indexed_guard=false;
+    bool track=false, probe=false, cold=false, indexed_guard=false, displayed_only=false;
     for (int arg=1;arg<argc;arg++) {
         if (!strcmp(argv[arg],"--track")) track=true;
         else if (!strcmp(argv[arg],"--probe")) probe=true;
         else if (!strcmp(argv[arg],"--cold")) cold=true;
         else if (!strcmp(argv[arg],"--indexed-guard")) indexed_guard=true;
+        else if (!strcmp(argv[arg],"--displayed-probe")) displayed_only=true;
         else return 2;
     }
+    if (displayed_cadence()) return 2;
+    if (displayed_only) return 0;
     size_t population=probe ? 1u : JUMPS;
     setvbuf(stdout, NULL, _IOLBF, 0);
     char private_path[128]; int fd=jump_fixture(private_path,sizeof private_path); struct stat statbuf;
@@ -288,7 +379,7 @@ int main(int argc, char **argv)
                                     BENCH_INTERACTION_MIN_N, track, cadence_stamp.power, cadence_stamp.load);
     scroll_display_history displayed = scroll_display_run(NULL, NULL);
     scroll_display_report(stdout, &displayed);
-    puts("G3z work_proxy=CPU_only completion=synthetic_null; requires editor refresh/completion/immutable-plan/sidebar capture driver; see docs/decisions/edit-ovu-display.md");
+    puts("G3z work_proxy=CPU_REGRESSION_ONLY; displayed identity is checked separately through editor on_refresh; physical cadence requires an opportunity stream.");
     lineidx_destroy(index);
     /* A cancelled seek must never become adoptable, including a fast worker
      * completion racing cancellation. Outside the descriptive sample timer. */

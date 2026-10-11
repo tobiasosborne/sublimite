@@ -27,6 +27,13 @@ static int render_grid_storage(const render_grid *g)
     int rc = render_dimensions(g->dims, &cells, &words);
     if (rc != RENDER_OK) return rc;
     if (g->cell_capacity < cells || g->dirty_word_capacity < words) return RENDER_ERR_CAPACITY;
+    if (g->scroll.cols) {
+        if (g->scroll.cols > g->dims.cols || !g->scroll.rows ||
+            g->scroll.first_row > g->dims.rows || g->scroll.rows != g->dims.rows - g->scroll.first_row ||
+            g->scroll.origin_y_q8 > 0 || g->scroll.origin_y_q8 <= -(int64_t)g->dims.cell_h * 256)
+            return RENDER_ERR_BOUNDS;
+        if (g->cell_capacity - cells < g->dims.cols) return RENDER_ERR_CAPACITY;
+    }
     return RENDER_OK;
 }
 
@@ -155,7 +162,7 @@ static int render_cells_validate(const render_grid *g)
         if (p->capacity < (size_t)(p->height - 1u) * p->stride + p->width)
             return RENDER_ERR_CAPACITY;
     }
-    size_t count = (size_t)g->dims.cols * g->dims.rows;
+    size_t count = (size_t)g->dims.cols * (g->dims.rows + (g->scroll.cols ? 1u : 0u));
     for (size_t i = 0; i < count; i++) {
         const render_cell *c = &g->cells[i];
         uint16_t width = c->attrs & (RENDER_ATTR_WIDE_LEFT | RENDER_ATTR_WIDE_RIGHT);
@@ -300,6 +307,8 @@ int render_backend_submit(render_backend *b, const render_grid *g, const render_
     if (!g->begun) return RENDER_ERR_STATE;
     if (!g->frame_id || g->frame_id <= b->last_frame) return RENDER_ERR_FRAME;
     if (!render_dims_equal(g->dims, b->config.dims)) return RENDER_ERR_BOUNDS;
+    if ((size_t)g->dims.cols * (g->dims.rows + (g->scroll.cols ? 1u : 0u)) > b->config.max_cells)
+        return RENDER_ERR_CAPACITY;
     if (b->full_required && !g->full_frame) return RENDER_ERR_STRIPS;
     if (g->glyph_count > b->config.max_glyphs || g->page_count > b->config.max_pages)
         return RENDER_ERR_CAPACITY;

@@ -276,7 +276,9 @@ static void index_progress(editor *e, editor_buffer *b)
     if (lg->warm_repaint) {
         lg->warm_repaint = false; e->paint_ready = false; changed = true;
     }
-    if (lg->top_estimated) {
+    /* Logical viewport labels now belong to scrollctl's resident adoption.
+     * Keep the legacy wrapped path until exact visual metadata is wired. */
+    if (lg->top_estimated && e->v.state.wrap) {
         lineidx_src cur = editor_source(b);
         lineidx_result r = lineidx_byte_to_line(b->index, &cur, e->v.state.first_byte);
         if (r.exact) { e->v.state.first_line = r.value; lg->top_estimated = false; changed = true; }

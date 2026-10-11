@@ -827,6 +827,9 @@ cleanup:
 typedef struct frame_observer {
     uint32_t submitted_id, presented_id;
     size_t submissions, presentations;
+    uint32_t displayed_id;
+    size_t refreshes;
+    bool refresh_valid;
 } frame_observer;
 static void observe_submit(void *ctx, const editor_frame *frame)
 {
@@ -838,6 +841,14 @@ static void observe_present(void *ctx, const editor_frame *frame)
     frame_observer *o = ctx;
     o->presented_id = frame->id; o->presentations++;
 }
+static void observe_refresh(void *ctx, const editor_refresh *refresh)
+{
+    frame_observer *o = ctx;
+    o->displayed_id = refresh->displayed_frame_id; o->refreshes++;
+    o->refresh_valid = refresh->synthetic && refresh->metadata_valid && refresh->opportunity_stream &&
+        refresh->frame.id == refresh->displayed_frame_id && refresh->frame.present_ns &&
+        refresh->completion_ns >= refresh->frame.present_ns;
+}
 static int settle_editor(editor *e)
 {
     for (unsigned i = 0; i < 10000; i++) {
@@ -848,8 +859,8 @@ static int settle_editor(editor *e)
     }
     return EDITOR_MORE;
 }
-/* Capability probe, not a displayed-cadence verdict. --require-editor-scroll
- * preserves the failing integration check for the editor owner's follow-up. */
+/* Null refresh identity probe; synthetic completion cannot certify a physical
+ * cadence verdict. The retained integration flag now exercises the same path. */
 static int editor_observability(bool require_scroll)
 {
     int result = 1;
@@ -860,7 +871,7 @@ static int editor_observability(bool require_scroll)
     for (size_t i = 0; i < sizeof bytes; i++) bytes[i] = i % 10 == 9 ? '\n' : (uint8_t)'a';
     editor_config config = {.initial = bytes, .initial_len = sizeof bytes,
         .cols = 32, .rows = 8, .wrap_mode = -1, .hook_ctx = &observer,
-        .on_submit = observe_submit, .on_present = observe_present};
+        .on_submit = observe_submit, .on_present = observe_present, .on_refresh = observe_refresh};
     CHECK(render_null_backend(&backend) == 0);
     CHECK(editor_open(&e, &config, &backend) == 0 && settle_editor(e) == 0);
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
@@ -872,14 +883,11 @@ static int editor_observability(bool require_scroll)
     CHECK(editor_inject(e, &wheel) == 0 && settle_editor(e) == 0);
     wheel.dy = 256;
     CHECK(editor_inject(e, &wheel) == 0 && settle_editor(e) == 0);
-    if (require_scroll) CHECK(observer.submissions > baseline);
-    else {
-        /* The absence is explicit and must not be mistaken for a G3z pass. */
-        CHECK(observer.submissions == observer.presentations);
-        CHECK(observer.submitted_id == observer.presented_id);
-        printf("scroll_test: public editor/null frame IDs correlate at submit/present; wheel frames=%s; displayed G3z UNAVAILABLE (hook required) PASS\n",
-            observer.submissions > baseline ? "available" : "absent");
-    }
+    (void)require_scroll;
+    CHECK(observer.submissions > baseline && observer.submissions == observer.presentations);
+    CHECK(observer.refreshes == observer.submissions && observer.refresh_valid);
+    CHECK(observer.displayed_id == observer.submitted_id && observer.displayed_id == observer.presented_id);
+    puts("scroll_test: public editor/null wheel IDs correlate at submit/present/refresh; synthetic completion, physical opportunity stream unsupported PASS");
     result = 0;
 cleanup:
     editor_close(e);

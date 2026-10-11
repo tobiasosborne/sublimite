@@ -93,6 +93,9 @@ typedef bool (*raster_stop_fn)(void *user);
 bool raster_row_cached_cancellable(const raster_scene *s, uint32_t *dst,
     size_t stride_px, uint32_t row, raster_palette *palette,
     raster_stop_fn stop, void *user);
+bool raster_row_scrolled(const raster_scene *s, const render_scroll *plan,
+    uint32_t *dst, size_t stride_px, uint32_t row, raster_palette *palette,
+    raster_stop_fn stop, void *user);
 
 /* Visit dirty-row ordinals [lo,hi) of the strip list, in order. */
 typedef void (*raster_row_fn)(void *user, uint32_t row);

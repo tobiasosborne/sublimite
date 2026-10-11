@@ -1920,7 +1920,11 @@ static int partial_line_start(void)
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 8, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
-    const uint64_t starts[] = {0, (uint64_t)(len / 128u * 9u / 10u) * 128u, len - 128u};
+    /* P3.4 clips EOF to the last full viewport. The fixture has one final
+     * empty line after its LF-terminated rows; chrome consumes one row. */
+    uint64_t visible_rows = cfg.rows - 1u;
+    const uint64_t starts[] = {0, (uint64_t)(len / 128u * 9u / 10u) * 128u,
+        ((uint64_t)len / 128u + 1u - visible_rows) * 128u};
     for (size_t at = 0; at < sizeof starts / sizeof starts[0]; at++) {
         uint64_t start = starts[at];
         T(editor_set_cursor(e, start + 10u) == 0); T(settle(e) == 0);
