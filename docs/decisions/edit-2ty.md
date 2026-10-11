@@ -11,3 +11,11 @@ Seeding is restricted to the document-end and previous-page intents. The nearby 
 Trace T1/T2 pairs using `editor_large_trace_frame(&buffer->lg)` delimit host seeding. Ordinary frame T0/T4 events remain the acceptance endpoints; their difference includes time spent between injection and dequeue, including seeding. Worker rings are dumped only after editor shutdown, so the dump is quiescent.
 
 The requested bound is `EDITOR_SLICE_NS` (G): its existing value divided by the nanoseconds-per-millisecond unit conversion gives the UI slice in milliseconds. The test asserts the literal macro for each action; it does not replace that bound with a loaded-machine allowance. This is a null-backend headless measurement, not a displayed-frame or Sublime comparison. The tail newline oracle independently checks exact logical viewport membership in both nowrap and the file-default wrapped mode. Wrapped Home/End also check the resident row boundary and trailing affinity; every Page Up must move the cursor backward. The coordinator must run the display suites and the next Astra drive.
+
+The performance assertion uses the repository's active release allocator-guard
+capability to distinguish a production run from instrumented builds, whose
+guard is intentionally inert. Sanitizer builds keep all functional and trace
+endpoint assertions and print durations against the unchanged bound as TRACK.
+There is no widened sanitizer deadline. The worker report discloses the timing
+interpretation and the instrumented misses; no native or sanitizer timing pass
+is inferred from release results.

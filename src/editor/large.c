@@ -235,8 +235,9 @@ static void seed_navigation(editor *e, editor_buffer *b)
             seed_line(e, &src, last);
             seed_line(e, &src, last > page ? last - page : 0);
         }
-    } else if (!view_busy(&e->v) && !e->lay.approximate &&
-               !b->lg.top_estimated && e->lay.src == b->tree &&
+    } else if (!view_busy(&e->v) && !e->full_pending && !e->lay.approximate &&
+               !b->lg.top_estimated && e->lay.src == b->tree && e->lay.total == src.len &&
+               e->lay.first_byte == e->v.state.first_byte && e->lay.first_line == e->v.state.first_line &&
                e->v.state.selection.cursor >= e->lay.first_byte &&
                e->v.state.selection.cursor <= e->lay.pos) {
         /* A visible cursor's previous page is at/after this earlier anchor.

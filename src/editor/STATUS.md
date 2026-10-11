@@ -20,6 +20,27 @@ active malloc guard. The release tree builds. Full-check restrictions and exact
 red/green evidence are recorded in [the worker report](../../docs/worker-reports/edit-cde.md).
 Display/native transport, IPC-dependent suites and the next Astra comparison
 must be rerun by the coordinator. No paint.c, large.c or save-path edits.
+# edit-2ty — loaded large-file prefix replay
+
+Implemented in this worktree: certified EOF/previous-page anchors in large.c,
+nearby backward scans with exact index fallback, matching viewport/tree guards,
+and pending-query cache completion for queued navigation. No input/paint/save
+change, allocation on typing, new global or worker wait.
+
+The release Astra sequence passes the existing EDITOR_SLICE_NS assertion in
+nowrap and file-default wrap, with active allocation counting and byte/viewport
+oracles. Sanitizer functional/trace cases pass; instrumented timings are TRACK,
+not asserted as production performance. Full gcc make all passes. Full check
+and mixed suites are blocked by X connections and AF_UNIX binds in the sandbox;
+the worker report lists every failure and the independent successful suites.
+
+Remaining: coordinator's leak-enabled sanitizer/display/IPC rerun outside the
+sandbox on Xvfb :99, then Astra vs Sublime verification before handover. Early
+unindexed input and arbitrary long-line fallback timing are not certified here.
+Private view query tags are coupled to the pending-result bridge.
+
+Evidence: [worker report](../../docs/worker-reports/edit-2ty.md).
+Design: [decision](../../docs/decisions/edit-2ty.md).
 
 # edit-ck4 save and startup continuation
 
