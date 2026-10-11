@@ -310,7 +310,8 @@ static void map_submitted(void *ctx, const editor_frame *frame)
     const render_grid *g = editor_grid(f->e);
     bool stale = editor_get_stats(f->e).minimap_stale;
     if (stale) f->stale++;
-    if ((g->cells[g->dims.cols - 1].glyph_index == '!') != stale) f->coherent = false;
+    /* edit-g11: the stale tab '!' is gone; a pending map must never draw it. */
+    if (g->cells[g->dims.cols - 1].glyph_index == '!') f->coherent = false;
 }
 static int index_recovery(bool raster)
 {
