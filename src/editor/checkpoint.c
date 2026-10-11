@@ -84,7 +84,9 @@ done:
  * durability fence returns credit; never publish a newer containing frame. */
 int editor_journal_metadata(editor *e)
 {
+    editor_session_metadata(e);
     if (!e->journal) return 0;
+    if (editor_save_leased(e)) return 0;
     e->journal_metadata_pending = true;
     for (size_t closed = 0; closed < 2; closed++) {
         size_t count = closed ? tabs_closed_count(&e->tabs) : tabs_count(&e->tabs);

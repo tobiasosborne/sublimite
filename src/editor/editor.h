@@ -29,7 +29,7 @@ typedef struct editor_config {
     const char *path;                 /* existing file; NULL uses initial bytes */
     const uint8_t *initial;
     size_t initial_len;
-    const char *journal_path;         /* new/empty file; NULL disables journaling */
+    const char *journal_path;         /* existing replays; session-* discovers orphans; NULL disables */
     uint32_t cols, rows, font_px;      /* defaults: 120, 40, 15 */
     uint32_t max_cols, max_rows;       /* defaults: at least 360, 300 */
     size_t arena_bytes, history_keys; /* open-time bounds; zero selects defaults */

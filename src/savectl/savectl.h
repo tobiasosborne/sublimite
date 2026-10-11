@@ -59,6 +59,8 @@ typedef struct savectl_options {
     bool create_mode_valid;
 } savectl_options;
 int savectl_create(savectl **out, const savectl_options *options, bool modified);
+/* Test-only, idle controller: apply the file durability-step seam to requests. */
+int savectl_set_step_hook(savectl *s, void (*step)(void *, int), void *ctx);
 /* Nonblocking; BUSY until job, result, and staged reload are retired. Does not
  * close the borrowed journal/pool/file/tree. Call tick before retrying. */
 int savectl_destroy(savectl *s);
@@ -126,6 +128,9 @@ typedef struct savectl_request {
     uint64_t request_ns;
 } savectl_request;
 int savectl_save_request(savectl *s, const savectl_request *request);
+/* CURRENT session counterpart: prepare/retirement also run on the worker.
+ * Transfers snapshot/context only on OK; same quiescent journal contract. */
+int savectl_finish_request(savectl *s, const savectl_request *request);
 /* Frame hook: while saving_frame_pending, render model.status ("saving") with
  * request_id even if worker completion arrived first. Call ONLY after backend
  * submission of that exact status frame succeeds, with its monotonic timestamp.
@@ -154,6 +159,11 @@ int savectl_recover_finish(savectl *s, const journal_record *checkpoint, size_t 
  * Saved; kept content remains modified. Failure preserves the recovery token. */
 int savectl_recover_cancel(savectl *s, const journal_record *checkpoint, size_t count);
 const journal_base *savectl_saved_base(const savectl *s);
+/* Shared-target reconciliation on UI after a known replacement. The borrowed
+ * identity is immutable until the next controller operation. Rebase is CPU
+ * only and refuses active/recovery-token ownership; it preserves dirty state. */
+const file_id *savectl_target_identity(const savectl *s);
+int savectl_rebase_target(savectl *s, const file_id *identity);
 /* Borrowed UI token, available once prepare hands back journal ownership,
  * including during file work. NULL while journal_leased. Copy before close. */
 const journal_save *savectl_save_token(const savectl *s);

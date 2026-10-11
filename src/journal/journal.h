@@ -108,6 +108,12 @@ typedef struct journal_save {
 } journal_save;
 int journal_open_with_io(journal **out, const char *path, work_pool *pool,
                          const journal_options *options, const journal_io *io);
+/* Startup recovery: retain an existing regular journal unchanged, refusing
+ * append/pump until a complete journal_rotate atomically publishes CURRENT.
+ * Caller exclusively owns the path and validates/replays it before rotation.
+ * Close on replay/publication failure preserves the previous file. */
+int journal_open_checkpoint(journal **out, const char *path, work_pool *pool,
+                            const journal_options *options);
 int journal_set_io(journal *j, const journal_io *io);
 /* Off-path, after receive returns worker ownership. Clear sticky UI/partial-write
  * IO, retaining exact progress and both buffers; pump/flush retries the failed

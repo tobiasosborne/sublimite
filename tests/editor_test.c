@@ -2100,6 +2100,12 @@ static int ck4_recovery(unsigned choice)
                 sched_yield();
             } while (trace_now_ns() < deadline);
             T(!memcmp(saved, "xa", 2));
+            uint8_t actual[sizeof saved]; T(editor_read(e, 0, actual, sizeof actual) == 0);
+            T(!memcmp(actual, saved, sizeof saved));
+            while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+            T(!editor_tab(e, 0)->modified);
+            savectl_model completed = savectl_get_model(e->buffer->save);
+            T(completed.saving_submitted_ns >= completed.request_ns && !completed.saving_frame_pending);
         } else {
             if(choice>=3) {
                 char next[128]; T(snprintf(next,sizeof next,"%s.new",source)>0);
@@ -2132,49 +2138,44 @@ static int ck4_recovery(unsigned choice)
         choice ? "4" : "3", choice>=3?"mapped":"COPY", choice==2 || choice==4?"Reload":"Keep");
     return 0;
 }
+/* Headless process-crash oracle: same discovery entry point used by main.
+ * Paths/capacities derive from IPC_PATH_CAP; launch count is crash + recovery. */
 static int ck4_startup(void)
 {
-    char root[4097]; T(getcwd(root,sizeof root));
-    size_t n=strlen(root); const char suffix[]="/build/ck4-startup-XXXXXX";
-    T(n+sizeof suffix<sizeof root); memcpy(root+n,suffix,sizeof suffix); T(mkdtemp(root));
-    char directory[4097]; int len=snprintf(directory,sizeof directory,"%s/sublimite",root);
-    T(len>0 && (size_t)len<sizeof directory);
-    char previous[4097]="", current[4097]="";
-    for(unsigned launch=0;launch<2;launch++) {
-        int input[2]; T(pipe(input)==0); pid_t child=fork(); T(child>=0);
-        if(!child) {
-            close(input[1]); T(dup2(input[0],STDIN_FILENO)>=0); close(input[0]);
-            T(setenv("XDG_DATA_HOME",root,1)==0); T(setenv("EDIT_BACKEND","raster",1)==0);
-            T(setenv("DISPLAY",":99",1)==0); T(setenv("EDIT_DISPLAY",":99",1)==0);
-            int output=open("build/ck4-startup-child.log",O_WRONLY|O_CREAT|O_APPEND,0600);
-            T(output>=0); T(dup2(output,STDERR_FILENO)>=0); close(output);
-            if(!launch) execl("build/sublimite","sublimite","--new-instance","-",(char *)NULL);
-            else execl("build/sublimite","sublimite","--new-instance",(char *)NULL);
-            _exit(99);
-        }
-        close(input[0]); if(!launch) T(write(input[1],"unsaved",7)==7); close(input[1]);
-        uint64_t deadline=trace_now_ns()+UINT64_C(5000000000); bool ready=false;
-        do {
-            DIR *dir=opendir(directory);
-            if(dir) {
-                struct dirent *entry;
-                while((entry=readdir(dir))) if(!strncmp(entry->d_name,"session-",8)) {
-                    len=snprintf(current,sizeof current,"%s/%s",directory,entry->d_name);
-                    T(len>0 && (size_t)len<sizeof current);
-                    struct stat info;
-                    if(strcmp(previous,current) && stat(current,&info)==0 && info.st_size>0) { ready=true; break; }
-                }
-                closedir(dir);
+    char root[] = "build/ck4-startup-XXXXXX"; T(mkdtemp(root));
+    char source[IPC_PATH_CAP], logs[2][IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    int fd = open(source, O_RDWR | O_CREAT | O_EXCL, 0600);
+    T(fd >= 0 && write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    for (size_t launch = 0; launch < sizeof logs / sizeof logs[0]; launch++) {
+        T(snprintf(logs[launch], sizeof logs[launch], "%s/session-XXXXXX", root) > 0);
+        fd = mkstemp(logs[launch]); T(fd >= 0); close(fd);
+        pid_t child = fork(); T(child >= 0);
+        if (!child) {
+            render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+            editor_config cfg = {.journal_path = logs[launch], .start_empty = true, .cols = 32, .rows = 4};
+            editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+            ipc_path path = {.path = source, .line = 1, .col = 1};
+            ipc_request request = {.count = 1}; request.paths[0] = path;
+            T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);
+            if (!launch) T(press(e, key('x', 0, "x")) == 0);
+            else {
+                uint8_t bytes[sizeof "xbase" - 1];
+                T(tabs_count(&e->tabs) == 1);
+                T(editor_read(e, 0, bytes, sizeof bytes) == 0);
+                T(!memcmp(bytes, "xbase", sizeof bytes));
+                T(editor_tab(e, 0)->modified);
             }
-            if(!ready) { struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL); }
-        } while(!ready && trace_now_ns()<deadline);
-        T(kill(child,SIGKILL)==0); int status; T(waitpid(child,&status,0)==child); T(ready);
-        if(!launch) strcpy(previous,current);
+            _exit(0); /* deliberately skips editor_flush/editor_close */
+        }
+        int status; T(waitpid(child, &status, 0) == child);
+        T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
-    replay_model model={0}; journal_replay_result result;
-    int rc=journal_replay_file(current,ck4_restore,&model,&result);
-    T(rc==0 && model.len==7 && !memcmp(model.bytes,"unsaved",7));
-    unlink(previous); unlink(current); rmdir(directory);
+    replay_model model = {0}; journal_replay_result result;
+    T(journal_replay_file(logs[1], ck4_restore, &model, &result) == 0);
+    T(model.len == strlen("xbase") && !memcmp(model.bytes, "xbase", model.len));
+    unlink(source); unlink(logs[0]); unlink(logs[1]); rmdir(root);
+    puts("ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed");
     return 0;
 }
 typedef struct ck4_power { uint8_t image[256u*1024u]; size_t len; } ck4_power;
@@ -2534,8 +2535,8 @@ int main(int argc, char **argv)
     T(minimap_typing_flash() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
-    T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
+    T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);

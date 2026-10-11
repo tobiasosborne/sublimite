@@ -1,3 +1,13 @@
+# edit-ck4 save integration continuation
+
+Added worker-prepared CURRENT finish requests, CPU-only shared-target baseline
+reconciliation, and an idle controller durability-step test hook. The editor now
+uses save_request and acknowledges the submitted Saving frame. Request context,
+records and snapshot retirement remain worker-owned; journal leases exclude the
+UI durability consumer. Retained failure tokens preserve recovery state.
+
+Evidence and limitations: [worker report](../../docs/worker-reports/edit-ck4.md).
+
 # edit-ck4 — session 9
 
 Replacement callback preserves ambiguous outcomes. Known post-rename barrier failures can finish; failed PREPARE/pre-rename/unknown-identity outcomes can recover_cancel through complete CURRENT publication. Reload falls back to setup-reserved writable cache backing and secure unlinked temporary files.

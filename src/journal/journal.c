@@ -48,7 +48,7 @@ struct journal {
     char *path, *name;
     int directory_fd;
     unsigned current, active_index;
-    bool active, failed, directory_pending;
+    bool active, failed, directory_pending, recovery_pending;
     bool append_failed, append_pending;
     uint64_t pending_sequence;
     int append_error;
@@ -455,6 +455,19 @@ int journal_open_with_io(journal **out, const char *path, work_pool *pool, const
 }
 int journal_open(journal **out, const char *path, work_pool *pool, const journal_options *options)
 { return journal_open_with_io(out,path,pool,options,NULL); }
+int journal_open_checkpoint(journal **out, const char *path, work_pool *pool, const journal_options *options)
+{
+    if(!out || !path || !pool || !options_valid(options)) return JOURNAL_INVALID;
+    *out=NULL;
+    char canonical[4097]; size_t name_offset=0; int dfd=-1;
+    int rc=journal_path(path,canonical,&name_offset,&dfd); if(rc) return rc;
+    int fd=openat(dfd,canonical+name_offset,O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK); struct stat sb;
+    if(fd<0 || fstat(fd,&sb) || !S_ISREG(sb.st_mode) || sb.st_size<=0) rc=fd<0?JOURNAL_IO:JOURNAL_INVALID;
+    else rc=journal_create(out,canonical,name_offset,fd,dfd,pool,options,NULL);
+    if(rc) { if(fd>=0) close(fd); close(dfd); }
+    else (*out)->recovery_pending=true;
+    return rc;
+}
 int journal_set_io(journal *j, const journal_io *io)
 { if(!j) return JOURNAL_INVALID; if(j->active || j->retention) return JOURNAL_BUSY; j->io=io?*io:(journal_io){0}; return 0; }
 int journal_retry(journal *j)
@@ -477,6 +490,7 @@ int journal_retry(journal *j)
 static int reserve_record(journal *j, size_t payload, uint8_t **p)
 {
     if(!j || payload>JOURNAL_MAX_RECORD-32) return JOURNAL_INVALID;
+    if(j->recovery_pending) return JOURNAL_BUSY;
     if(j->stats.error) return j->stats.error;
     if(j->append_pending) return JOURNAL_BUSY; /* retry must first close the wire gap */
     journal_batch *b=&j->batches[j->current]; size_t n=payload+32;
@@ -520,6 +534,7 @@ int journal_append(journal *j, uint32_t type, uint64_t id, const uint8_t *data, 
 int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, size_t size)
 {
     if(!j || (!bytes && size) || off>UINT64_MAX-size) return JOURNAL_INVALID;
+    if(j->recovery_pending) return JOURNAL_BUSY;
     if(j->stats.error) return j->stats.error;
     if(j->append_pending) return JOURNAL_BUSY;
     size_t chunk=j->capacity-72; if(chunk>JOURNAL_MAX_RECORD-40) chunk=JOURNAL_MAX_RECORD-40;
@@ -615,6 +630,7 @@ int journal_set_window(journal *j, uint32_t width, uint32_t height)
 { uint8_t data[8]; put32(data,width); put32(data+4,height); return journal_append(j,JOURNAL_WINDOW,0,data,8); }
 int journal_pump(journal *j, uint64_t now, bool force)
 {
+    if(j && j->recovery_pending) return JOURNAL_BUSY;
     if(!j) return JOURNAL_INVALID;
     if(j->stats.error && j->stats.error!=JOURNAL_FULL && (!j->append_failed || j->failed || j->directory_pending)) return j->stats.error;
     if(j->active) return JOURNAL_BUSY;
@@ -774,6 +790,7 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
         }
     }
     if(renamed) {
+        j->recovery_pending=false;
         int oldfd=j->disk.fd;
         j->disk=next->disk; next->disk.fd=-1; j->stats=next->stats; j->reserved=next->reserved;
         for(unsigned i=0;i<2;i++) {

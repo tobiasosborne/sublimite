@@ -9,6 +9,7 @@
 #include "journal/journal.h"
 #include "work/work.h"
 #include "keys/keys.h"
+#include "savectl/savectl.h"
 #include "indent/indent.h"
 #include "minimap/minimap.h"
 #include "editor/large_private.h"
@@ -25,6 +26,7 @@ typedef struct editor_piece_storage {
 } editor_piece_storage;
 typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; } editor_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
+typedef struct editor_session editor_session;
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
@@ -34,10 +36,15 @@ typedef struct editor_buffer {
     bool pending_open, source_stale, watch_pending;
     int watch_fd;
     uint64_t prompt_ns, prompt_serial, prompt_generation;
-    int operation_error, operation_errno;
+    int operation_error, operation_errno, save_error, save_errno;
     uint32_t operation_kind, operation_generation;
     undo_log undo;
     file *file;
+    savectl *save;
+    size_t session_slot;
+    uint64_t save_revision;
+    size_t save_cursor;
+    bool save_tracking;
     journal_base base;
     journal_view journal_view_state;
     bool journal_view_valid;
@@ -52,7 +59,7 @@ typedef struct editor_buffer {
     minimap map;
     minimap_row *map_rows;
     view_state initial;
-    char path[IPC_PATH_CAP];
+    char path[IPC_PATH_CAP], save_path[IPC_PATH_CAP];
     ipc_token wait_token;
 } editor_buffer;
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
@@ -76,6 +83,9 @@ struct editor {
     int open_error;
     view v;
     journal *journal;
+    editor_session *session;
+    int session_lock;
+    bool recovering, startup_restored, save_flushing, recover_existing;
     work_pool pool, journal_pool;
     bool journal_pool_ready;
     uint8_t journal_scratch[JOURNAL_INSERT_SLICE_BYTES];
@@ -139,6 +149,20 @@ struct editor {
     uint64_t bracket_source, bracket_mate;
     int error;
 };
+/* Session publication uses prepaid persistent metadata; worker requests pin it. */
+int editor_session_init(editor *e);
+void editor_session_close(editor *e);
+void editor_session_publish(editor *e, editor_buffer *b);
+void editor_session_metadata(editor *e);
+void editor_session_forget(editor *e, editor_buffer *b);
+int editor_save_setup(editor *e, editor_buffer *b);
+int editor_save_request(editor *e, uint64_t request_ns);
+void editor_save_tick(editor *e);
+bool editor_save_leased(const editor *e);
+bool editor_save_active(const editor *e);
+void editor_save_overlay(editor *e);
+void editor_save_submitted(editor *e, uint64_t submitted_ns);
+int editor_session_restore(editor *e);
 /* Internal cross-file helpers; UI only. */
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);

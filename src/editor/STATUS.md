@@ -5,6 +5,7 @@ The checked-in Astra review withdrew the original anchor-loss finding. Existing 
 Focused gcc and clang ASan/UBSan regressions pass; the deliberately injected anchor reset fails the new assertion, and input.c was restored byte-for-byte. GCC `make all` passes. Broader sandbox validation and coordinator reruns are recorded in the [worker report](../../docs/worker-reports/edit-gdj.md). The other keyboard beads were left for separate workers under the binding scope rule.
 
 [Decision record](../../docs/decisions/edit-gdj.md).
+
 # edit-cde — clipboard integration
 
 Copy/cut/paste actions, alternate key bindings, selection-driven PRIMARY,
@@ -19,6 +20,26 @@ active malloc guard. The release tree builds. Full-check restrictions and exact
 red/green evidence are recorded in [the worker report](../../docs/worker-reports/edit-cde.md).
 Display/native transport, IPC-dependent suites and the next Astra comparison
 must be rerun by the coordinator. No paint.c, large.c or save-path edits.
+
+# edit-ck4 save and startup continuation
+
+Ctrl+S now captures a published immutable session root and enqueues savectl on
+the bulk worker. Saving is composed on the UI thread and acknowledged only after
+backend submission. Completion reconciles the journal and selected saved-history
+boundary; post-cutoff edits stay dirty. Failures belong to the owning buffer.
+Startup discovers unlocked session journals or replays an explicitly supplied
+existing journal before the first text frame, then durably publishes recovered
+state before retiring prior recovery artifacts.
+
+The default save/startup probes and the headless editor_session_test cover disk
+bytes, dirty state, repeated/new-target saves, concurrent edits, shared targets,
+inactive failure, busy-backend Saving acknowledgement, and interrupted save
+recovery before/after replacement. Red/green, required build results, sandbox
+socket/display failures and remaining limitations are recorded in
+[the worker report](../../docs/worker-reports/edit-ck4.md).
+
+No edits to the other workers' x11/font/minimap/paint/large implementations.
+Native display suites and the next Astra comparison remain coordinator work.
 
 # edit-ck4 — session 9
 

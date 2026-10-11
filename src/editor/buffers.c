@@ -98,7 +98,7 @@ static void unpoll_source(editor *e, editor_buffer *b)
 }
 void editor_retire_buffers(editor *e)
 {
-    if (e->op_count) return; /* staged tree ranges still borrow buffer arenas */
+    if (editor_save_active(e) || e->op_count) return; /* staged tree ranges still borrow buffer arenas */
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i] && e->buffers[i]->retired) {
         editor_buffer *b = e->buffers[i];
         b->source_stale = true;
@@ -111,9 +111,12 @@ void editor_retire_buffers(editor *e)
         /* file_close has no public logical-retirement/physical-ready split.
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
-        if (editor_clip_holds(e, b) || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
+        if (editor_clip_holds(e, b) || (b->save && savectl_get_model(b->save).can_recover_cancel) ||
+            b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
+        editor_session_forget(e, b);
+        if (b->save) { savectl_close_begin(b->save); if (savectl_destroy(b->save) != SAVECTL_OK) continue; b->save = NULL; }
         editor_buffer_destroy(b); e->buffers[i] = NULL;
         break; /* at most one physically ready buffer per maintenance turn */
     }
@@ -133,7 +136,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         if (rc) goto fail;
         e->opening = b->file; e->open_error = 0;
         while (b->file && (!file_prefix_ready(b->file) ||
-               (file_open_mode(b->file) == FILE_MODE_MMAP && file_size(b->file) <= FILE_PREFIX_MAX && !file_open_ready(b->file)))) {
+               (file_size(b->file) <= FILE_PREFIX_MAX && !file_open_ready(b->file)))) {
             struct pollfd p = {work_pool_eventfd(&e->pool), POLLIN, 0};
             if (poll(&p, 1, 100) < 0 && errno != EINTR) { rc = EDITOR_ERR_IO; goto fail; }
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
@@ -257,6 +260,8 @@ int editor_adopt_open(editor *e, editor_buffer *b)
     editor_large_start(e, b);
     if (b == e->buffer) { rc = editor_activate(e); if (rc) return rc; }
     piece_destroy(b->preview); b->preview = NULL;
+    rc = editor_save_setup(e, b); if (rc) { b->save_error = b->operation_error = rc; b->save_errno = errno; }
+    editor_session_publish(e, b);
     return 0;
 }
 static editor_buffer *find_buffer(editor *e, piece_tree *tree)
@@ -265,7 +270,7 @@ static editor_buffer *find_buffer(editor *e, piece_tree *tree)
     return e->empty;
 }
 bool editor_activation_busy(const editor *e)
-{ return editor_clip_busy(e) || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
+{ return editor_clip_busy(e) || editor_save_leased(e) || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
 int editor_activate(editor *e)
 {
     if (editor_activation_busy(e)) return EDITOR_ERR_ARG;
@@ -338,7 +343,7 @@ static int install(editor *e, editor_buffer *b, uint64_t *id)
     while (end < tn) { size_t n = utf8_grapheme_next((const uint8_t *)title + end, strlen(title) - end); if (n > tn - end) break; end += n; }
     tabs_desc d = {b->tree, &b->undo, b->initial, title, b->path, end, strlen(b->path), false};
     int rc = tabs_open(&e->tabs, &d, &e->v.state, id); if (rc) return EDITOR_ERR_CAPACITY;
-    b->id = *id; b->source_generation = 1; e->buffers[slot] = b;
+    b->id = *id; b->source_generation = 1; b->session_slot = slot; e->buffers[slot] = b;
     return 0;
 }
 int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id)
@@ -367,6 +372,11 @@ int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t 
         if (!rc && b->pending_open) rc = wait_open_ready(e, b);
         if (!rc) rc = editor_adopt_open(e, b);
         e->opening = NULL;
+    }
+    if (!rc) {
+        int save_rc = editor_save_setup(e, b);
+        if (save_rc) { b->save_error = b->operation_error = save_rc; b->save_errno = errno; }
+        editor_session_metadata(e);
     }
     if (rc && b && !b->id) { unpoll_source(e, b); editor_buffer_destroy(b); }
     return rc;
@@ -418,6 +428,8 @@ const render_grid *editor_grid(const editor *e) { return e ? &e->grid : NULL; }
 void editor_modified(editor *e)
 {
     editor_buffer *b = e->buffer;
+    if (b->save) savectl_modified(b->save);
+    editor_session_publish(e, b);
     if (tabs_count(&e->tabs)) (void)tabs_set_modified(&e->tabs, tabs_active_index(&e->tabs), b->saved_lost || b->history_cursor != b->saved_cursor);
 }
 static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t col)
@@ -507,6 +519,28 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         (request->stdin_size && !request->stdin_data)) return EDITOR_ERR_ARG;
     if (e->error || e->stats.journal_error) return EDITOR_ERR_IO;
     size_t count = request->count + (request->has_stdin ? 1u : 0u);
+    /* Startup already recovered the requested associations. Reuse them before
+     * opening new requests; an argument-free launch keeps the restored session. */
+    if (e->startup_restored && !request->has_stdin && tabs_count(&e->tabs)) {
+        e->startup_restored = false;
+        bool restored = !request->count;
+        size_t selected = tabs_active_index(&e->tabs);
+        if (request->count) {
+            restored = true;
+            for (size_t i = 0; i < request->count; i++) {
+                bool found = false;
+                char canonical[IPC_PATH_CAP];
+                const char *path = realpath(request->paths[i].path, canonical) ? canonical : request->paths[i].path;
+                for (size_t j = 0; j < tabs_count(&e->tabs); j++) {
+                    const tabs_tab *tab = tabs_at(&e->tabs, j);
+                    char other[IPC_PATH_CAP]; const char *target = realpath(tab->path, other) ? other : tab->path;
+                    if (!strcmp(path, target)) { found = true; selected = j; break; }
+                }
+                if (!found) { restored = false; break; }
+            }
+        }
+        if (restored && !request->wait) return editor_select_tab(e, selected);
+    }
     if (!count) count = 1;
     if (count > e->tabs.capacity - tabs_count(&e->tabs) || count > UINT64_MAX - e->tabs.next_id) return EDITOR_ERR_CAPACITY;
     size_t wait_slot = IPC_MAX_CLIENTS;
@@ -542,6 +576,7 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         if (rc) return rc; /* defensive: all slot/name/id bounds were checked */
         if (wait_slot < IPC_MAX_CLIENTS) prepared[i]->wait_token = token;
     }
+    for (size_t i = 0; i < count; i++) { rc = editor_save_setup(e, prepared[i]); if (rc) { prepared[i]->save_error = prepared[i]->operation_error = rc; prepared[i]->save_errno = errno; } }
     if (wait_slot < IPC_MAX_CLIENTS) e->waits[wait_slot] = (editor_wait){token, count};
     return editor_activate(e);
 }
@@ -582,7 +617,7 @@ int editor_poll_sources(editor *e)
         }
     }
     size_t messages = work_mailbox_drain(&e->pool, editor_route_work, e);
-    if (e->journal_pool_ready) messages += work_mailbox_drain(&e->journal_pool, editor_route_work, e);
+    if (e->journal_pool_ready && !editor_save_leased(e)) messages += work_mailbox_drain(&e->journal_pool, editor_route_work, e);
     if (messages) for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         if (b && !b->retired && b->file && b->watch_pending && !b->source_stale) (void)file_watch_poll(b->file);
@@ -590,6 +625,7 @@ int editor_poll_sources(editor *e)
     int raster_rc = raster_poll_completions(e->backend);
     if (raster_rc) return raster_rc;
     editor_retire_buffers(e);
+    editor_save_tick(e);
     int source_rc = editor_check_sources(e); if (source_rc) return source_rc;
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) {
         int rc = editor_adopt_open(e, e->buffers[i]); if (rc) return rc;
@@ -652,7 +688,7 @@ int editor_check_sources(editor *e)
 {
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
-        if (!b || b->retired || !b->file || b->source_stale) continue;
+        if (!b || b->retired || !b->file || b->source_stale || editor_save_active(e)) continue;
         if (b->watch_pending) (void)file_watch_poll(b->file);
         if (!file_changed(b->file) && b->operation_kind != FILE_MSG_OPEN_FAILED) continue;
         b->source_stale = true; b->prompt_ns = 0; b->lg.find_running = false;
@@ -669,7 +705,7 @@ int editor_check_sources(editor *e)
             e->paint_ready = true; rc = render_mark_full(&e->grid); if (rc) return rc;
         }
     }
-    if (!e->source_choice) return 0;
+    if (!e->source_choice || editor_save_active(e)) return 0;
     unsigned choice = e->source_choice; e->source_choice = 0;
     editor_buffer *b = e->buffer;
     if (!b->source_stale || b->id != e->source_choice_id || b->source_generation != e->source_choice_generation) return 0;
@@ -687,6 +723,11 @@ int editor_check_sources(editor *e)
                 b->base.path = *previous.path ? b->base.captured_path : "";
                 return 0;
             }
+        }
+        if (b->save) {
+            file_id identity;
+            if (file_id_stat_path(b->save_path, &identity) == FILE_OK)
+                (void)savectl_rebase_target(b->save, &identity);
         }
         b->saved_lost = true;
         b->source_stale = false; b->prompt_ns = 0; editor_modified(e);
@@ -714,6 +755,7 @@ int editor_check_sources(editor *e)
     state.first_line = piece_byte_to_line(replacement->tree, state.first_byte);
     state.first_byte = piece_line_to_byte(replacement->tree, state.first_line);
     if (state.visual_byte > len) state.visual_byte = state.first_byte;
+    replacement->session_slot = slot;
     replacement->id = b->id; replacement->source_generation = b->source_generation + 1;
     replacement->wait_token = b->wait_token; replacement->initial = state;
     /* Reconcile the complete session before replacing the tab's borrowed
@@ -731,6 +773,8 @@ int editor_check_sources(editor *e)
                       &replacement->undo, &state, &e->v.state);
     EDIT_ASSERT(rc == 0); /* active tab and replacement leases were validated */
     b->wait_token = 0;
+    editor_session_forget(e, b);
+    rc = editor_save_setup(e, replacement); if (rc) replacement->operation_error = rc;
     unpoll_source(e, b);
     return editor_activate(e);
 }

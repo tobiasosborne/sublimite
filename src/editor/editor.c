@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 
 static bool runnable(const editor *e);
 static int refresh_caret(editor *e);
@@ -196,11 +197,15 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
-    if (e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
+    if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
         for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers && e->buffers[i] && e->buffers[i]->index)
             (void)lineidx_poll(e->buffers[i]->index);
         return;
+    }
+    if (msg->kind == SAVECTL_MESSAGE) {
+        for (size_t i = 0; i < e->buffer_capacity; i++)
+            if (e->buffers[i] && e->buffers[i]->save && savectl_receive(e->buffers[i]->save, msg)) return;
     }
     if (editor_large_receive(e, msg)) return;
     file_msg fm;
@@ -323,6 +328,7 @@ static int submit(editor *e)
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
+    editor_save_overlay(e);
     editor_large_index_progress(e);
     if (e->full_pending) return 0;
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
@@ -336,6 +342,7 @@ static int submit(editor *e)
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
+    editor_save_submitted(e, e->frame.submit_ns);
     if (e->buffer->source_stale && !e->buffer->prompt_ns) {
         e->buffer->prompt_ns = e->frame.submit_ns;
         e->buffer->prompt_serial = e->event_serial;
@@ -440,7 +447,7 @@ static bool queued_owner_live(const editor *e, size_t at)
 static size_t queue_pick(const editor *e)
 {
     /* Journal replay ranges borrow tree storage until every staged record drains. */
-    if (e->journal && e->op_count) return SIZE_MAX;
+    if (editor_save_leased(e) || (e->journal && e->op_count)) return SIZE_MAX;
     if (editor_clip_busy(e)) {
         for (size_t n = 0; n < e->queue_count; n++)
             if (e->queue[(e->queue_head + n) % EDITOR_INPUT_CAP].kind == PLAT_EV_CLIPBOARD) return n;
@@ -484,10 +491,10 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
      * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
     uint64_t deadline = e->blinking ? e->next_blink : UINT64_MAX;
-    if (e->journal) {
+    if (e->journal && !editor_save_leased(e)) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;
-        if (!e->journal_waiting && s.accepted_sequence > s.durable_sequence) {
+        if (!editor_save_leased(e) && !e->journal_waiting && s.accepted_sequence > s.durable_sequence) {
             uint64_t next = s.last_sync_ns + UINT64_C(1000000000);
             if (next <= now) next = now + UINT64_C(5000000);
             if (next < deadline) deadline = next;
@@ -559,6 +566,7 @@ int editor_step(editor *e, int timeout_ms)
         else break;
         /* Protect every mutation before yielding to layout or publishing a
          * frame. Successful journal calls establish the page-cache cutoff. */
+        editor_session_publish(e, e->buffer);
         editor_journal_staged(e);
         record_slice(e, slice);
         if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
@@ -573,7 +581,7 @@ int editor_step(editor *e, int timeout_ms)
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     rc = present(e);
-    if (!rc && e->journal && !e->journal_waiting) {
+    if (!rc && e->journal && !editor_save_leased(e) && !e->journal_waiting) {
         journal_stats s = journal_get_stats(e->journal); uint64_t now = trace_now_ns();
         /* Pump only when the default batch/deadline admission is due. A
          * successful pump has scheduled a job; its mailbox advances sync.
@@ -654,6 +662,17 @@ uint64_t editor_line_count(const editor *e) { return e ? e->buffer->lines : 0; }
 int editor_flush(editor *e)
 {
     if (!e) return EDITOR_ERR_ARG;
+    /* Explicit flush/close is off-path. Finish all admitted save leases before
+     * touching the borrowed journal or releasing buffer arenas. */
+    e->save_flushing = true;
+    while (editor_save_active(e)) {
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+        if (e->journal_pool_ready && !editor_save_leased(e)) (void)work_mailbox_drain(&e->journal_pool, editor_route_work, e);
+        editor_save_tick(e);
+        if (!editor_save_leased(e)) editor_journal_staged(e);
+        sched_yield();
+    }
+    e->save_flushing = false;
     if (!e->journal) return 0;
     while (e->op_count && !e->stats.journal_error) {
         size_t before = e->op_count;

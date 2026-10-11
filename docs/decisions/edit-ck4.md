@@ -2,7 +2,7 @@
 
 Scope: P4-3 §§3,4,5,6,8,7,10,32,33, in that order. Current result is partial;
 [the worker report](../worker-reports/edit-ck4-s9.md) is the acceptance record.
-The session-root save path and startup session discovery remain open.
+The initial session-root/startup gaps are addressed by the continuation below.
 
 ## BASE generation schema
 
@@ -115,3 +115,69 @@ No new globals. No change to Enter/brace indentation or large-file routing.
 Release and sanitizer validation, red/green transcripts, partial requirements and
 LeakSanitizer limitations are recorded in the worker report. No whole-editor
 performance gate or unqualified power-loss time bound is claimed.
+
+
+## Ctrl+S and startup continuation
+
+Maintain a prepaid persistent binary session graph, publishing changed buffer
+snapshots and view/topology metadata during ordinary bookkeeping. A save pins
+the root and selected published snapshot; it performs no buffer enumeration,
+content copy, heap allocation or filesystem work on the command path. The node
+reservation is `3 * (2 * width - 1)` (G, structural): `width` is the smallest
+power of two covering buffer capacity; a complete binary graph has
+`2 * width - 1` nodes, and the live graph, pinned graph and transient update path
+fit within three complete graphs. This is a ownership bound, not an invented
+memory or latency budget. Snapshot creation uses the buffer's existing arena
+allocator. Failed publication preserves committed edits and refuses a stale
+save cutoff rather than saving obsolete bytes.
+
+One editor save owns the session journal at a time. Save preparation and CURRENT
+finish serialization run on the bulk worker. Neither UI append/pump nor the UI
+private-pool consumer may touch the journal during the controller lease. After
+PREPARE handoff, edits and ordinary journal pumping resume during file writing.
+Finish reacquires a quiescent journal and rebases every association sharing the
+canonical target, retaining each buffer's own current content. The selected
+cutoff supplies the saved history boundary; branching/eviction invalidates an
+unretained cutoff conservatively. Other target buffers remain conservatively
+dirty after another buffer replaces their shared disk file.
+
+Compose Saving after the existing paint composition, keeping paint.c untouched.
+Backend BUSY does not acknowledge it. If journal admission is pending, the
+submitted Saving frame timestamp belongs to that queued request and transfers
+to its controller when admission completes. Controller completion cannot erase
+an unsubmitted Saving frame. The busy-backend regression verifies a single
+admitted frame (G, derived from render_frame_begin's successor identity).
+Explicit close is quiescent and may settle saves without claiming a new frame
+submission after the window is closing.
+
+Failures remain per buffer. A retained ambiguous token prevents another save
+until recovery resolves it; unrelated buffers remain editable. No new error is
+promoted to the global stopped-loop state. Existing controller recovery APIs
+remain available, but a dedicated retry/cancel UI is outside this continuation.
+
+Use stable sidecar flock leases for session discovery, because atomic journal
+rotation changes the journal inode. Select the newest nonempty unlocked session
+artifact. Restore named associations, untitled content, live tab order/active
+selection, retained buffers and views before any text submission. Ordinary
+startup requests reuse recovered matching files instead of opening duplicates.
+The existing WINDOW record enters the resize queue. Recovery uses private COPY
+acquisition so a mapped prefix frame cannot expose unreplayed bytes.
+
+An explicitly supplied existing journal enters journal_open_checkpoint: no
+append or pump can overwrite the recovery inode before complete rotation.
+Validation/replay failure preserves it, including failed-startup teardown.
+Recovered CURRENT state is durably checkpointed before an orphan journal is
+retired. Interrupted PREPARED saves remain dirty even when replacement bytes
+already match disk; their private originals retire only after the recovered
+checkpoint no longer depends on them. There is no new on-disk record schema.
+
+The small-file editor open path now waits for acquisition readiness for COPY
+as well as MMAP before attachment. PREFIX_READY alone does not satisfy
+file_attach, and the new process/repeated-open tests exposed that race. Large
+COPY prefix preview behavior and large.c remain unchanged.
+
+Native display comparison, recovery conflict UI, merged recovery across multiple
+orphan sessions, precise closed-stack history and recovery memory/first-paint
+performance for giant sessions are not certified here. The journal schema has
+live tab order but no explicit closed-stack ordering record. Existing module
+benchmark memory census does not yet include the new prepaid session graph.

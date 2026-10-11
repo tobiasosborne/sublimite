@@ -1,3 +1,12 @@
+# edit-ck4 explicit startup recovery continuation
+
+journal_open_checkpoint retains an existing journal without writing it, refuses
+append/pump until complete CURRENT rotation, and preserves the prior inode on
+replay/publication failure. Legacy journal_open still requires an empty file.
+The editor validates and replays into buffers before that atomic rotation.
+
+Evidence and limitations: [worker report](../../docs/worker-reports/edit-ck4.md).
+
 # edit-ck4 — session 9
 
 BASE v2 persists ctime; protected append/delete complement insert credit. Failed-token cancellation publishes a validated complete CURRENT checkpoint before artifact retirement. TARGET persists intended association separately from BASE.

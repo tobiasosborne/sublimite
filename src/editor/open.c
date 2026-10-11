@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <time.h>
+#include <sys/stat.h>
 
 typedef struct backend_init { editor *e; render_config config; void *state; int result; bool received; } backend_init;
 static void init_worker(work_ctx *job)
@@ -46,7 +47,10 @@ static int init_backend(editor *e, render_config config, void *state)
 void editor_close(editor *e)
 {
     if (!e) return;
-    if (e->journal) { (void)editor_flush(e); journal_close(e->journal); e->journal = NULL; }
+    if (e->journal && !e->recovering) (void)editor_flush(e);
+    editor_session_close(e);
+    if (e->journal) { journal_close(e->journal); e->journal = NULL; }
+    if (e->session_lock >= 0) close(e->session_lock);
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);
     if (e->backend) render_backend_shutdown(e->backend);
@@ -75,7 +79,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (may_fallback && render_cpu_backend(&fallback)) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->raster_poll_fd = -1; e->drag_tab = SIZE_MAX;
+    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->drag_tab = SIZE_MAX;
     e->cfg = *config; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;
@@ -91,6 +95,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->buffer_capacity = live + closed;
     rc = tabs_init(&e->tabs, live, closed); if (rc) goto fail;
     e->tabs_ready = true;
+    rc = editor_session_init(e); if (rc) goto fail;
     uint32_t nraster = (may_fallback || (info.capabilities & RENDER_CAP_RASTER_POOL)) ? 4u : 0u;
     if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
@@ -196,10 +201,23 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
         e->journal_pool_ready = true;
         rc = add_poll_fd(e, work_pool_eventfd(&e->journal_pool)); if (rc) goto fail;
-        rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL); if (rc) goto fail;
+        rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL);
+        if (rc == JOURNAL_INVALID) {
+            struct stat st;
+            if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0) {
+                rc = journal_open_checkpoint(&e->journal, config->journal_path, &e->journal_pool, NULL);
+                if (!rc) e->recover_existing = true;
+            }
+        }
+        if (rc) goto fail;
         journal_set_message_handler(e->journal, editor_route_work, e);
     }
-    if (!config->start_empty) {
+    if (config->journal_path) {
+        e->recovering = true; /* failed startup teardown must preserve its source */
+        rc = editor_session_restore(e); if (rc) goto fail;
+        e->recovering = false;
+    }
+    if (!config->start_empty && !tabs_count(&e->tabs)) {
         uint64_t id; rc = editor_add_buffer(e, config->path, config->initial, config->initial_len, &id);
     } else rc = editor_activate(e);
     if (rc) goto fail;

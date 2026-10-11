@@ -84,6 +84,7 @@ static int stage_tree(editor *e, uint64_t off, uint64_t n)
 }
 void editor_journal_staged(editor *e)
 {
+    if (editor_save_leased(e)) return;
     size_t consumed = 0;
     while (consumed < e->op_count) {
         editor_jop *op = &e->ops[consumed];
@@ -120,6 +121,7 @@ static void remember(editor *e, editor_delta d)
 {
     editor_buffer *b = e->buffer;
     undo_history h = undo_get_history(e->undo);
+    if (b->save_tracking && b->history_cursor < b->save_cursor) b->save_tracking = false;
     b->history_count = b->history_cursor;
     if (b->history_cursor && b->history_serial == h.group_serial) {
         editor_delta *last = delta_at(e, b->history_cursor - 1);
@@ -128,10 +130,12 @@ static void remember(editor *e, editor_delta d)
         last->after = d.after;
         /* A saved boundary extended by this burst no longer names saved bytes. */
         if (b->saved_cursor == b->history_cursor) b->saved_lost = true;
+        if (b->save_tracking && b->save_cursor == b->history_cursor) b->save_tracking = false;
     } else {
         if (b->history_count == b->history_cap) {
             b->history_head = (b->history_head + 1) % b->history_cap; b->history_count--; b->history_cursor--;
             if (b->saved_cursor) b->saved_cursor--; else b->saved_lost = true;
+            if (b->save_tracking) { if (b->save_cursor) b->save_cursor--; else b->save_tracking = false; }
         }
         *delta_at(e, b->history_count++) = d; b->history_cursor = b->history_count;
     }
@@ -140,6 +144,7 @@ static void remember(editor *e, editor_delta d)
         size_t drop = b->history_count - h.undo_groups;
         b->history_head = (b->history_head + drop) % b->history_cap;
         b->history_count -= drop; b->history_cursor -= drop;
+        if (b->save_tracking) { if (b->save_cursor >= drop) b->save_cursor -= drop; else b->save_tracking = false; }
         if (b->saved_cursor >= drop) b->saved_cursor -= drop;
         else { b->saved_cursor = 0; b->saved_lost = true; }
     }
@@ -427,6 +432,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (result == KEYS_PREFIX || result == KEYS_CANCELLED) { tabs_mru_release(&e->tabs); return 0; }
     if (result == KEYS_ERR_ARG) return EDITOR_ERR_ARG;
     keys_action action = binding ? binding->action : KEYS_ACTION_NONE;
+    if (action == KEYS_ACTION_SAVE) return editor_save_request(e, ev->t0_ns);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;
     bool del = action == KEYS_ACTION_DELETE || action == KEYS_ACTION_WORD_DELETE;
