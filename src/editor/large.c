@@ -461,6 +461,7 @@ int editor_large_goto_byte(editor *e, uint64_t byte)
     e->v.state.first_byte = e->v.state.visual_byte = seek.start;
     e->v.state.visual_end = false; e->v.state.hscroll = 0;
     b->lg.top_estimated = !exact; undo_break_burst(e->undo);
+    if (editor_scroll_place(e, seek.start, seek.line, !exact)) return editor_refresh_placed(e, old);
     return editor_refresh_cursor(e, old);
 }
 uint64_t editor_large_line_to_byte(editor *e, uint64_t line, bool *exact)

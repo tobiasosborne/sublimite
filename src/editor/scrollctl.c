@@ -89,6 +89,29 @@ int editor_scroll_seek(editor *e, uint64_t byte)
     if (!rc) b->scroll_pending = true;
     return rc;
 }
+bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approximate)
+{
+    /* An owned seek (large.c byte jump) already proved this line start and
+     * its ordinal (exact, or a density estimate the index relabels later).
+     * Adopt it as position_buffer does instead of re-deriving the cursor's
+     * line through resident windows: those are acquired on the bulk lane,
+     * which an unindexed large file's index build, warm or find jobs occupy.
+     * Only when scroll's pure seek policy keeps the same top row; an exact
+     * EOF clip still takes the resident follow path. */
+    if (e->v.state.wrap || !e->buffer->scroll_ready) return false;
+    editor_buffer *b = e->buffer;
+    scroll_state placed = b->scroll; /* current config and extent */
+    placed.approximate = approximate;
+    if (scroll_seek_line(&placed, line) || placed.first_line != line) return false;
+    placed.first_byte = byte; placed.anchor_line = line;
+    placed.request = SCROLL_READY; placed.pending_rows = 0;
+    b->scroll = b->scroll_display = placed;
+    b->scroll_resolver = b->scroll_follow_resolver = (scroll_resolver){0};
+    b->scroll_following = b->scroll_pending = false;
+    b->scroll_prefix = lineidx_built_prefix(b->index);
+    editor_scroll_mirror(e);
+    return true;
+}
 int editor_scroll_follow(editor *e)
 {
     if (e->v.state.wrap) return 0;
@@ -165,7 +188,13 @@ int editor_scroll_slice(editor *e)
         e->action == EDITOR_ACTION_REPLAY_WORK) return 0;
     lineidx_result count = lineidx_line_count(b->index);
     size_t prefix = lineidx_built_prefix(b->index);
-    if (!b->scroll_pending && b->scroll_prefix == prefix && b->scroll.extent.exact == count.exact && b->scroll.extent.bytes == piece_len(e->tree)) {
+    /* A lazy large file publishes its logical labels with the complete index
+     * (large.c index_progress, the edit-9yd contract): the frame after the
+     * last estimated frame is the exact one. Prefix growth alone must not
+     * relabel the top early and submit an exact-numbered, dim-gutter frame
+     * in between; count.exact flipping below triggers the relabel. */
+    bool labels_held = b->lg.lazy && !b->lg.lines_exact;
+    if (!b->scroll_pending && (b->scroll_prefix == prefix || labels_held) && b->scroll.extent.exact == count.exact && b->scroll.extent.bytes == piece_len(e->tree)) {
         /* Keep the source lease until physical retirement, but do not ask a
          * typing frame to wait for replacement windows it does not need. */
         if (b->scroll_revision != b->revision) (void)editor_scroll_retire(b);
@@ -200,7 +229,11 @@ int editor_scroll_slice(editor *e)
     scroll_extent current = extent(b, b->scroll_resident.snapshot.len);
     if (current.bytes != b->scroll.extent.bytes || current.lines != b->scroll.extent.lines ||
         current.exact != b->scroll.extent.exact) {
-        int rc = scroll_set_extent(&b->scroll, current); if (rc) return rc;
+        /* A density-estimated top label is not a position: clamping it to
+         * the new count would seek to a guessed line (an overestimate lands
+         * at EOF). Keep the certified byte anchor; resolution relabels it. */
+        if (b->scroll.approximate && b->scroll.request == SCROLL_READY) b->scroll.extent = current;
+        else { int rc = scroll_set_extent(&b->scroll, current); if (rc) return rc; }
     }
     /* One resident continuation per call, with the scroll module's shared
      * byte/callback/deadline bound. The caller checks input between slices;

@@ -211,6 +211,13 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
     int rc = editor_scroll_follow(e); if (rc) return rc;
     return refresh_cursor(e, old_cursor, false);
 }
+/* The caller already adopted a certified viewport (editor_scroll_place). */
+int editor_refresh_placed(editor *e, uint64_t old_cursor)
+{
+    e->caret_only = false;
+    editor_clip_selection(e);
+    return refresh_cursor(e, old_cursor, false);
+}
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
