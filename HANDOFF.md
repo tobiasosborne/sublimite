@@ -1,37 +1,46 @@
-# HANDOFF — sublimité, end of session 10 (2026-10-11 ~15:45)
+# HANDOFF — sublimité, end of session 11 (2026-10-12 ~01:30)
 
-Worker update, edit-riu: the order test's external X clients now use its selected
-display, and live keymap fixtures restore the saved map and rules metadata on
-success/failure. `make all` and the sanitizer test build passed; display runs are
-for the coordinator outside the sandbox. See `docs/worker-reports/edit-riu.md`.
+## Read first (session 12)
+**Main is 11baa63, pushed** (the wind-down docs commit sits on top). Session 11 (2026-10-11 19:40 → 2026-10-12 ~01:30) landed 17 code beads one at a time, each after a serial targeted sanitizer run on :99 with a BAT0 stamp; the per-landing lines are in docs/worklog/2026-10-11.md ("Evening landings" and "Session 11"). On main now, in landing order: a6v full-window paint at 243 DPI; 3kk scroll wiring; 457.8 hot exit (WINDOW record v2: explicit launch size > journalled chosen size > DPI default; legacy 8-byte records keep the DPI default); v0o.1 Wayland backend; agh 3kk large-file regression (byte jump keeps its own placement); cx8 per-thread malloc-guard exemption for libxcb/libxkbcommon on worker threads (not a law 2 violation; editor_bench prints foreign_input=; make bench runs under the display lock); riu; 4jf; btj (a changed-base journal never blocks launch; the journal is set aside); 73j (mouse caret/drag/double-click, wheel on the 3kk path, find/replace panel, minimap summary on the foreground lane for in-memory snapshots, synchronous first fill for file-backed, Unicode runtime adoption); a2g (large-file/find continuation; probes in the default dispatch); 5ih (EDIT_FONT_FAMILY / EDIT_FONT_FILE); 6di (Unicode tab titles); ret (clean buffers reload silently); r8e (ZWJ sequences: first emoji, joiners zero-width); d50 (Sublime keymap parity, go-to-line scrolling, displayed top follows edits above the viewport); m15 (gutter click caret, find panel consumes editing chords, find follow no longer fatal).
 
-## Read first
-**Main (pushed) has, all landed today after serial targeted runs on :99:** process reset + golden-master rule; Astra drive 1 report (VERDICT no) + Opus design research; flash fix; minimap composed from pixels (8m3 + d5o); shared inotify service (er2); wrap input-window fix; findui s3 (lez); Ctrl+Y + panel-chord guard (whl/2gx); clipboard (cde); Ctrl+S + startup restore (ck4); 1 GiB near-end stall (2ty); handoff limit (jmn); scroll s3 (ovu); **GL init 10 s timeout bug** (40t); Unicode glyphs (08z); tree-sitter runtime + src/hl (v0o.2); benches exit 0 on timing (lwq); startup stages (2ts); DPI-derived font size + zoom (m3g). Last main-level sanity (font, trace, editor, p4, cli) green at 0381fed; later commits are docs/reports only.
+**Astra drive 2** (21:18–22:02, :98, binary from dfeef7e; docs/reviews/astra-vs-sublime-2.md): **VERDICT no**; blockers mouse/wheel, find/replace, launch -103 on a changed base file, ZWJ emoji. 11 drive-1 blockers confirmed fixed on video; 0 orange flashes in 84 detector runs (M) (edit-g11 closed). Every drive-2 blocker has a landing since (73j/m15/d50, btj, r8e); the colour-emoji font gap remains (below).
 
-**Known visible defect on main:** at 243 DPI the window opens at 1728x1260 but the raster surface still paints 960x600 (build/design/main-dpi243-half.png) → **edit-a6v (P0)**, Codex worker was running at the cut (.wt/edit-a6v). Nothing goes to Tobias before a6v lands and Astra drive 2 says yes.
+**First action: Astra drive 3. Nothing goes to Tobias before a yes.** The rebuild is done at 11baa63 (build/astra3/BUILD: built 2026-10-12T00:07:46+10:00, BAT0 Not charging). Brief build/astra/brief3.md; outputs build/astra3/ and docs/reviews/astra-vs-sublime-3.md (the report is written by Astra's own file writes; `-o` only catches the final chat message). Tobias runs it from the repo root (the sandbox denies the display):
 
-**edit-457.8 LANDED (evening):** hot exit restores view/tabs and the last chosen window size (WINDOW v2); legacy journals keep the DPI default size.
+    env DISPLAY=:98 EDIT_DISPLAY=:98 codex exec -m gpt-6-astra -c model_reasoning_effort=high --approve-for-me --skip-git-repo-check -o build/astra3/final-message.md "$(cat build/astra/brief3.md)"
 
-**edit-a6v LANDED (evening):** the whole 1728x1260 window paints on :98 (build/design/a6v-dpi243.png); only the sub-cell remainder strip (8 px right, 20 px bottom) stays black.
+Before launch confirm Xvfb :98 and Sublime on :98 are up (both were running at the cut). After the report: file each deviation as a bead with a repro (law 8 triage), fix, rebuild, repeat. On a yes, edit-pi6 (Tobias on the real display) unblocks.
 
-**Verified or resolved, not landed (worktrees .wt/<bead>, WIP-snapshotted):**
-- edit-3kk scroll wiring: all suites GREEN in its worktree (scroll, render, raster, minimap, editor, p4, cli) but the cherry-pick onto main conflicts with the config landing: rebase once more, resolve, land.
-- edit-v0o.7 config: LANDED after the wind-down note (all suites green, cherry-picked clean).
-- edit-457.8 hot exit (+9ma): I renamed its window fields to e->font.window_*; its new editor_hot_exit_test:174 then fails at editor_open → needs a look (probably my rename changed the restored-size semantics, or EMFILE); journal_test green.
-- edit-5ih font selection: 8-hunk conflicts with m3g/08z; Codex resolver was running at the cut.
-- edit-q0g partial (x11; fix unimplemented; headless red test only) — low value, leave.
-**Codex workers still running at the cut (reports land in docs/worker-reports/<bead>-s*-final.md):** edit-a6v, edit-73j (mouse/wheel/find panel), edit-v0o.1 (Wayland), edit-a2g (large-file remainder), edit-d50 (Sublime keymap parity), edit-5ih resolver. Land each the same way: snapshot, rebase onto main (resolver for semantic hunks, keep-both only for tests/STATUS/docs), serial targeted run with a private XDG_RUNTIME_DIR on :99, cherry-pick, close bead.
+**Next queue (after or alongside drive 3, one editor bead at a time):**
+1. edit-o20 P1: common Sublime commands unbound (Ctrl+N, Ctrl+O, Save As Ctrl+Shift+S, Ctrl+Q, Escape cancel/clear selection, Ctrl+Up/Down scroll lines).
+2. edit-x8i P2: find panel hard-codes its keys ahead of the v0o.7 keymap lookup.
+3. edit-91c P2: large-file follows outside laid-out rows wait on the bulk lane behind index/warm/find jobs (no foreground lane in src/scroll/resident.c).
+4. edit-rfq P2: session journals never retired (32 session-* files in Tobias's profile (M)); set-aside journals and base copies kept indefinitely.
+5. edit-r8e P2, decision for Tobias: 👩 is only in NotoColorEmoji on this box and the glyph runtime has no CBDT support, so `👩‍💻` still shows one missing-glyph box. Options: add CBDT colour bitmaps, or accept monochrome-only emoji.
+6. edit-b0j P0 design spec: still awaits Tobias's per-section decision (docs/design/visual-spec.md vs the Opus report docs/design/state-of-design-2026.md). No chrome work before that.
 
-**Astra next:** drive 2 brief at build/astra/brief2.md targets **:98** (Xvfb 2880x1800 **-dpi 243**, running; Sublime launched there) so the DPI path is exercised; run it after a6v lands and a rebuild, Tobias launches it (sandbox denies the display); then the Sublime golden-master catalogue (build/astra/brief-sublime-catalogue.md). Nothing to Tobias before a yes.
+**Also open:** edit-5ih (config `font.family` key has no consumer); edit-v0o.1 (Wayland; open behind the w34.4 gate); edit-pi6 blocked on w34.4 yes. Backlog filed today, pulled only when a user, fuzzer or trace points at it: edit-1nm, edit-1zm, edit-48u, edit-cuh, edit-djg, edit-rsw, edit-tn2, edit-unf, edit-1t2, edit-1um, edit-u82, edit-vak (titles: `bd list --status=open -n 60`). `bd list --status=in_progress` still shows older beads (edit-tkw P0, og2, 457.10, 5o0, 9lf, 9yd, dnc, ovu, q0g, zzj.12) from earlier sessions: triage whether they are still in progress. 37 worktrees remain under .wt/. Untracked worker reports from today not yet committed: docs/worker-reports/edit-{a2g-resolve2,d50-preverify,m15,r8e,ret,riu}-final.md (left for the coordinator to judge; d50-preverify may also have tested an empty branch, see lesson 2).
 
-**Beads filed today still open:** edit-cx8 (P1: editor_bench raster typing path reports allocations: law 2 check), edit-2cs (P3: stale zygote variant; long benches), edit-b0j design spec (sent to Tobias with mocks; Opus report docs/design/state-of-design-2026.md disagrees on typeface/minimap; Tobias decides per section), edit-pi6 (Tobias's real-display use, blocked on edit-w34.4 yes).
+**Lessons (binding):**
+1. `codex exec` launched from a background shell gets `< /dev/null`, or it hangs on "Reading additional input from stdin" and does nothing.
+2. A squash-rebase (`git checkout -B wt/<bead>-rb main && git merge --squash wt/<bead>`) can silently produce an empty branch (leftover rebase-merge state; grep-filtered output hides it). Always run `git diff main...<branch> --stat` before trusting or pre-verifying a branch. Today 5ih, d50 and a2g were empty, and two Codex pre-verifications tested plain main.
+3. The Astra launch never uses `-o` for the report path (drive 2's final message overwrote its report; recovered from the Codex rollout).
+4. Land editor beads one at a time with an Opus lander that owns main; verifiers run in worktrees only; never more than one display-suite runner besides the lander.
+5. Every landing checks `/sys/class/power_supply/BAT0/status` ("Not charging" = AC) and stamps its worklog line.
+6. Kept from session 10: verify serially (load breaks the display-suite deadlines); `git cherry-pick` has no -q; a `cd` in a compound command moves the session cwd; `git status` a worktree before building (a half-finished rebase leaves conflict markers).
 
-**Lessons (binding; see also the earlier list below):** land editor beads one at a time and rebase the next immediately; verify serially; `git cherry-pick` has no -q; a `cd` in a compound command moves the session cwd; a worker's branch snapshot can contain conflict markers if a rebase was left mid-way, always `git status` before building; two Xvfb now: :99 (96 dpi) and :98 (243 dpi).
+**Displays:** :99 is Xvfb 2880x1800 reporting 100 dpi (M, xdpyinfo; the editor opens 1728x1260 there); :98 is Xvfb 2880x1800 at 243 dpi (M, drive 2's xdpyinfo), used for Astra and DPI checks. Nothing opens on :0.
+
+**Pace** at 22:30 (M, `quota`): Claude weekly 64 % used at about 70 % of the week elapsed; Fable 68 %. Check `quota` before each dispatch wave (law 11).
 
 ---
 
+## Session 10 (superseded)
+End state 2026-10-11 ~15:45: 24 landings that day (process reset, Astra drive 1 VERDICT no, g11 flash fix, minimap 8m3+d5o, er2 inotify, findui lez, whl/2gx, cde clipboard, ck4 Ctrl+S, 2ty, jmn, ovu, 40t GL init, 08z Unicode, v0o.2 tree-sitter, lwq, 2ts, m3g, v0o.7 config). Known defect then: 243 DPI window painted 960x600 (fixed by a6v in session 11). Six Codex workers were left running (a6v, 73j, v0o.1, a2g, d50, 5ih resolver); all landed in session 11. Drive 2 brief build/astra/brief2.md ran in session 11. edit-riu worker note: its report is docs/worker-reports/edit-riu.md (landed aa0a0d2). The fuller session 10 sections follow.
 
-## State now (read first)
+---
+
+## Session 10 afternoon state (superseded)
 **Landed on main today (all verified by serial targeted runs on :99: editor, p4, module suites, cli):** process reset + golden-master rule (PRD §3/§9, CLAUDE.md laws 1/4/8, PLAN §1 loop); Astra drive 1 report (VERDICT no) and the Opus design research; edit-g11 flash fix (+P4 test correction); edit-8m3 + edit-d5o minimap (per-character pixels composed into the frame, translucent viewport band); edit-er2 shared inotify service (200 opens accepted); the wrap input-window fix; edit-lez s3; edit-whl/2gx (Ctrl+Y redo, panel chords consumed with a notice); edit-cde clipboard (all paths); edit-ck4 (durable async Ctrl+S, startup restores unsaved session); edit-2ty (1 GiB near-end stall); edit-jmn (tab reservation, readable IPC errors); edit-ovu s3; edit-40t (**GL init completion message had generation 0 since de7fb22: every GL init waited 10 s then failed**; fixed); edit-08z (Unicode glyphs via the runtime font owner); edit-v0o.2 (tree-sitter v0.27.1 vendored + src/hl parser). Pushed through f9de9b2; later landings (08z, hl) await the sanity run then push.
 
 **Verified, waiting to land (editor-file conflicts, one resolver each):** edit-m3g (DPI font size + zoom; resolver 4 after 08z), edit-2ts (startup stages; fixer for the EGL-fallback test after 40t), edit-v0o.7 (config module; re-resolve after m3g). **In flight (Codex, wave 3/4):** edit-73j mouse/wheel/find panel, edit-3kk scroll wiring, edit-v0o.1 Wayland, edit-457.8 hot exit (+9ma), edit-5ih font selection, edit-a2g large-file remainder, edit-d50 Sublime keymap parity. Codex weekly quota reset at ~14:00; Tobias: scale back as things land, no new waves.
@@ -43,7 +52,7 @@ for the coordinator outside the sandbox. See `docs/worker-reports/edit-riu.md`.
 ---
 
 
-## Read first: state at the cut
+## Session 10 morning cut (superseded)
 **Landed on main today:** process reset (0eeb4a4, f02934c), Astra-before-Tobias rule + flashscan (2baf8c5), Astra drive 1 report (51d840a, VERDICT no), PRD golden-master rule + PLAN loop (5160ea8), Opus design research docs/design/state-of-design-2026.md (56d7319), **edit-g11 flash fix 691ceb1** (verified: full `make check` in its worktree green except cli_test under load; cli_test re-run serially green, exit 0). **Main has NOT had a main-level clean check since 691ceb1 and was pushed as-is at the cut: run `make all && make check` on main first.**
 
 **Wave 2 worktrees (`.wt/<bead>`, branches `wt/<bead>-s2`), each snapshotted as a WIP commit at the cut; Codex workers may still have been running (reports land in docs/worker-reports/<bead>-s2-final.md in main and <bead>.md in the worktree):**
@@ -61,7 +70,7 @@ for the coordinator outside the sandbox. See `docs/worker-reports/edit-riu.md`.
 ---
 
 
-## Session 10 (read first; supersedes every "gate", "bench run" and "review slice" instruction below)
+## Session 10 policy (binding; supersedes every "gate", "bench run" and "review slice" instruction below)
 Tobias, 2026-10-11: **"Perf is a goal, not a progress blocker. Milestones are the priority. If landing milestones is slowed by perf then the process is a failure."** Decision doc: `docs/decisions/2026-10-11-perf-is-a-goal.md`. CLAUDE.md laws 1 and 8 are rewritten, PRD §9 milestones now exit by use, PLAN §1.4 amended, `perf/01-perf-target.md` is a reference goal sheet. No code changed.
 
 **Astra drive 1 (09:00–09:45, docs/reviews/astra-vs-sublime-1.md, 52 videos under build/astra/video, trace dumps under build/astra/traces): VERDICT no.** Ranked blockers: (1) Ctrl+S inert (edit-ck4, P0); (2) clipboard inert in every path (Tobias bead, P0); (3) mouse caret/drag/wheel inert, minimap click works (edit-73j, P1); (4) Ctrl+F types the query into the document (edit-2gx, P0); (5) non-ASCII renders as '?' (edit-08z / tkw §29, P0) and 10 px ink on 2880x1800 (Tobias bead, P0); (6) selection anchor lost across Shift chords (edit-gdj, P0), Ctrl+Y not redo (edit-whl, P1); (7) 1 GiB log stalls after Ctrl+End + Page Up (edit-2ty, P0); (8) orange flash = minimap stale overlay '!' in 0xbf853d painted for 1–2 frames per keystroke, 88/95 keys (Tobias bead, cause attached) and the blocky minimap (Tobias bead); (9) CLI handoff error 8 after 64 opens (edit-jmn, P1), hot exit does not replay (edit-9ma / 457.8, P1), 2.3 s to first text on raster (edit-2ts, P1). Working: ASCII typing (G1 1.2 ms p50 / 45 ms p99 (M)[bat] on raster), keyboard navigation, undo, tabs, CLI handoff to 64, external-change prompt, idle quiet. Limits: raster backend only (EGL fails on Xvfb), no WM on :99, 60 fps capture.
