@@ -116,3 +116,24 @@ CFF-seeded font fuzz ran the requested 60 s clean, with UBSan halt enabled.
 Leak-enabled rerun remains with the coordinator. Earlier shared-display
 clipboard interference and the namespace-root permission-fixture failure
 are recorded in the report; neither prompted out-of-scope source changes.
+
+## edit-5ih: primary font selection
+
+Worker-only Fontconfig resolution, file/TTC loading and raw ASCII advance
+validation feed the editor's shared DPI/zoom atlas lifecycle. The selection
+module owns primary file bytes for each retired/current version; it has no
+separate atlas or mailbox path. The async Unicode owner borrows the prepared
+primary descriptor and uses its size mode, with existing worker fallback for
+missing scalars. Resolved paths are retained for zoom and bytes load directly
+into an arena without stdio heap allocations. Oversized or unsupported faces
+use embedded DejaVu within main's prepaid atlas/glyph/minimap caps.
+
+The focused release and ASan/UBSan tests cover proportional widths hidden by
+pixel rounding, installed family and file precedence, fallback, TTC geometry,
+held frames, selected Unicode pixels at 96/243 DPI, zoom/reset, pending glyph
+retirement, input allocation guards and outstanding-job teardown. Evidence and
+native display/launcher exceptions are in
+[the resolver report](../../docs/worker-reports/edit-5ih-resolve.md).
+
+P6.4 is absent here: environment startup selection and editor_font_request
+remain the interim source and loader hook.

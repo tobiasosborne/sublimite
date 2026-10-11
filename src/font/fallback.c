@@ -7,6 +7,8 @@
  * allocation inside fontconfig is acceptable here. */
 #include "font/font.h"
 #include "font/file.h"
+#include "font/selection.h"
+#include <strings.h>
 #include "font/discovery.h"
 #include <dlfcn.h>
 #include <stdio.h>
@@ -26,6 +28,7 @@ enum { FC_MATCH_PATTERN = 0, FC_RESULT_MATCH = 0 };
 typedef struct fc_api {
     FcConfig  *(*InitLoadConfigAndFonts)(void);
     FcPattern *(*PatternCreate)(void);
+    FcPattern *(*NameParse)(const FcChar8 *);
     void       (*PatternDestroy)(FcPattern *);
     FcCharSet *(*CharSetCreate)(void);
     void       (*CharSetDestroy)(FcCharSet *);
@@ -57,6 +60,7 @@ static int fc_bind(fc_api *a, void *h)
 #define BIND(field, sym) do { *(void **)(&a->field) = dlsym(h, sym); if (!a->field) return 0; } while (0)
     BIND(InitLoadConfigAndFonts, "FcInitLoadConfigAndFonts");
     BIND(PatternCreate, "FcPatternCreate");
+    BIND(NameParse, "FcNameParse");
     BIND(PatternDestroy, "FcPatternDestroy");
     BIND(CharSetCreate, "FcCharSetCreate");
     BIND(CharSetDestroy, "FcCharSetDestroy");
@@ -216,4 +220,49 @@ unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len)
     unsigned char *buf = font_load_stream(fp, arena, len);
     fclose(fp);
     return buf;
+}
+
+/* Worker-only primary selection; use the same runtime Fontconfig API. */
+int font_selection_resolve(const char *pattern, char *file, size_t cap, uint32_t *index)
+{
+    if (!pattern || !file || !cap || !index) return FONT_ERR_ARG;
+    file[0] = 0; *index = 0;
+    void *h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
+    fc_api api;
+    if (!h || !fc_bind(&api, h)) return FONT_ERR_MISSING;
+    FcConfig *cfg = api.InitLoadConfigAndFonts();
+    FcPattern *requested = api.NameParse((const FcChar8 *)pattern);
+    FcPattern *query = api.NameParse((const FcChar8 *)pattern);
+    FcPattern *match = NULL;
+    int result = FONT_ERR_MISSING;
+    if (!cfg || !requested || !query) goto done;
+    if (!api.ConfigSubstitute(cfg, query, FC_MATCH_PATTERN)) goto done;
+    api.DefaultSubstitute(query);
+    FcResult status = FC_RESULT_MATCH;
+    match = api.FontMatch(cfg, query, &status);
+    if (!match || status != FC_RESULT_MATCH) goto done;
+    int family_ok = 0;
+    for (int i = 0;; i++) {
+        FcChar8 *want = NULL;
+        if (api.PatternGetString(requested, "family", i, &want) != FC_RESULT_MATCH) break;
+        if (!strcasecmp((const char *)want, "monospace")) family_ok = 1;
+        for (int j = 0;; j++) {
+            FcChar8 *got = NULL;
+            if (api.PatternGetString(match, "family", j, &got) != FC_RESULT_MATCH) break;
+            if (!strcasecmp((const char *)want, (const char *)got)) family_ok = 1;
+        }
+    }
+    FcChar8 *path = NULL; int face = 0;
+    if (family_ok && api.PatternGetString(match, "file", 0, &path) == FC_RESULT_MATCH && path &&
+        api.PatternGetInteger(match, "index", 0, &face) == FC_RESULT_MATCH && face >= 0 && face <= UINT16_MAX &&
+        strlen((const char *)path) < cap) {
+        memcpy(file, path, strlen((const char *)path) + 1u); *index = (uint32_t)face; result = FONT_OK;
+    }
+done:
+    if (match) api.PatternDestroy(match);
+    if (query) api.PatternDestroy(query);
+    if (requested) api.PatternDestroy(requested);
+    if (cfg) api.ConfigDestroy(cfg);
+    api.Fini();
+    return result;
 }

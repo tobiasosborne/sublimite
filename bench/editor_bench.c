@@ -509,8 +509,29 @@ static int typing_checkpoint_self_check(void)
     return 0;
 }
 #define TYPING_REQUIRE(c) do { if (!(c)) { fprintf(stderr, "editor_bench:%d failed: %s\n", __LINE__, #c); goto cleanup; } } while (0)
+
+/* Bead-specific NEW baseline: reuse the existing sample counts/workloads,
+ * request exactly one post-startup swap, then measure its new cell grid. */
+static int font_baseline_swap(editor *e, const char *pattern, const stamp *tag)
+{
+    if (!pattern) return 0;
+    REQUIRE(settle_ready(e) == 0);
+    REQUIRE(editor_font_request(e, pattern, NULL) == EDITOR_OK);
+    while (editor_get_stats(e).font_pending) REQUIRE(editor_step(e, 0) >= 0);
+    REQUIRE(settle_ready(e) == 0);
+    REQUIRE(editor_get_stats(e).font_error == FONT_OK);
+    const render_grid *grid = editor_grid(e);
+    printf("NEW_FONT_BASELINE family=%s cell=%ux%u grid=%ux%u pixels=%ux%u swaps=%" PRIu64 " (M)%s derivation=worker_atlas_cell,viewport_div_cell,adopted_generations\n",
+           pattern, grid->dims.cell_w, grid->dims.cell_h, grid->dims.cols, grid->dims.rows,
+           grid->dims.cols * grid->dims.cell_w, grid->dims.rows * grid->dims.cell_h,
+           editor_get_stats(e).font_changes, tag->power);
+    const font_selection *selection = &e->font.atlas[e->font.current].selection;
+    printf("FONT_RASTER atlas_ns=%" PRIu64 " glyph_max_ns=%" PRIu64 " glyphs=%u (M)%s derivation=monotonic_end_minus_start,maximum_per_glyph,ASCII_last_minus_first_plus_one\n",
+           selection->atlas_raster_ns, selection->glyph_max_ns, FONT_SELECTION_GLYPHS, tag->power);
+    return 0;
+}
 static int typing_row(const char *requested, size_t count, bool track, bool require_gl,
-                      unsigned scenario, uint64_t ingress_delay, const char *path, bool partial)
+                      unsigned scenario, uint64_t ingress_delay, const char *path, bool partial, const char *font_pattern)
 {
     trace_reset();
     const char *workload = scenario == 0 ? "serial" : scenario == 1 ? "queued_active_frame" :
@@ -541,6 +562,7 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
            requested, b.info.name, editor_get_stats(e).backend_init_error,
            b.config.dims.cols * b.config.dims.cell_w, b.config.dims.rows * b.config.dims.cell_h, cfg.font_px, tag.power);
     TYPING_REQUIRE(settle(e) == 0);
+    TYPING_REQUIRE(font_baseline_swap(e, font_pattern, &tag) == 0);
     /* No indexing warmup barrier: the contention fixtures retain background
      * work and a byte-positioned viewport through the public editor API. */
     TYPING_REQUIRE(editor_set_cursor(e, editor_length(e) * 9 / 10) == 0); TYPING_REQUIRE(settle(e) == 0);
@@ -651,7 +673,7 @@ cleanup:
     return result;
 }
 #undef TYPING_REQUIRE
-static int tab_row(bool raster, bool track)
+static int tab_row_font(bool raster, bool track, const char *font_pattern)
 {
     stamp tag = power_stamp();
     render_backend b = {0}; REQUIRE((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
@@ -678,6 +700,7 @@ static int tab_row(bool raster, bool track)
     }
     REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
     REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
+    REQUIRE(font_baseline_swap(e, font_pattern, &tag) == 0);
     uint64_t frame_values[BENCH_INTERACTION_MIN_N], map_values[BENCH_INTERACTION_MIN_N];
     bench_samples frames, maps;
     bench_samples_init(&frames, frame_values, BENCH_INTERACTION_MIN_N);
@@ -709,6 +732,7 @@ static int tab_row(bool raster, bool track)
         editor_get_stats(e).minimap_fills, editor_get_stats(e).minimap_stale, track ? "TRACK" : "GATE");
     bool structural = measured.allocations != 0; editor_close(e); return row_result(miss, structural, track);
 }
+static int tab_row(bool raster, bool track) { return tab_row_font(raster, track, NULL); }
 static int ipc_row(bool track)
 {
     stamp tag = power_stamp(); const char *runtime = test_ipc_isolate();
@@ -752,6 +776,7 @@ int main(int argc, char **argv)
     bool track = false, idle = true, typing = true, p4 = true, ipc_only = false, require_gl = false, partial = false, idle_guard = false; size_t count = 10000;
     uint64_t ingress_delay = 0; unsigned scenarios = 4;
     const char *path = "/tmp/edit-corpus/log_1g.txt";
+    const char *font_pattern = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--self-check")) return settle_self_check();
         if (!strcmp(argv[i], "--self-check-g11")) return g11_accounting_self_check();
@@ -765,6 +790,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--p4-only")) { typing = false; idle = false; }
         else if (!strcmp(argv[i], "--no-p4")) p4 = false;
         else if (!strcmp(argv[i], "--ipc-only")) { typing = false; idle = false; p4 = false; ipc_only = true; }
+        else if (!strncmp(argv[i], "--font-baseline=", sizeof "--font-baseline=" - 1u)) font_pattern = argv[i] + sizeof "--font-baseline=" - 1u;
         else if (!strncmp(argv[i], "--file=", 7)) path = argv[i] + 7;
         else if (!strcmp(argv[i], "--serial-only")) scenarios = 1;
         else if (!strncmp(argv[i], "--ingress-delay-ms=", 19)) {
@@ -774,7 +800,7 @@ int main(int argc, char **argv)
             ingress_delay = (uint64_t)ms * UINT64_C(1000000);
         }
         else if (!strncmp(argv[i], "--keys=", 7)) count = (size_t)strtoull(argv[i] + 7, NULL, 10);
-        else { fprintf(stderr, "usage: editor_bench [--track] [--require-gl] [--partial-index] [--no-idle|--idle-only|--p4-only|--ipc-only] [--no-p4] [--keys=N] [--serial-only] [--ingress-delay-ms=N] [--file=PATH]\n"); return 2; }
+        else { fprintf(stderr, "usage: editor_bench [--track] [--require-gl] [--partial-index] [--no-idle|--idle-only|--p4-only|--ipc-only] [--no-p4] [--keys=N] [--serial-only] [--ingress-delay-ms=N] [--file=PATH] [--font-baseline=PATTERN]\n"); return 2; }
     }
     const char *override = getenv("EDIT_BACKEND");
     if (override && strcmp(override, "gl") && strcmp(override, "raster")) return 2;
@@ -782,13 +808,19 @@ int main(int argc, char **argv)
     if (!count || count > 100000 || ingress_delay > UINT64_C(1000000000)) return 2;
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
     trace_init(); (void)trace_thread_register();
+    if (font_pattern) {
+        int a = typing_row("null", count, true, false, 0, ingress_delay, path, partial, font_pattern);
+        if (a < 0) return 1;
+        int c = tab_row_font(false, true, font_pattern);
+        return c < 0 ? 1 : bench_merge_exit(a, c);
+    }
     int rows = 0;
     const char *names[] = {"null", "raster", "gl"};
     if (typing) for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         const char *name = names[i];
         if (override && strcmp(name, "null") && strcmp(name, override)) continue;
         for (unsigned scenario = 0; scenario < scenarios; scenario++) {
-            int rc = typing_row(name, count, track, require_gl, scenario, ingress_delay, path, partial);
+            int rc = typing_row(name, count, track, require_gl, scenario, ingress_delay, path, partial, NULL);
             if (rc < 0) return 1;
             rows = bench_merge_exit(rows, rc);
         }

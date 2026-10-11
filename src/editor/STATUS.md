@@ -736,3 +736,20 @@ imports remain intact; release allocation/latency checks pass. Fully deferred
 explicit coordinates/byte jumps and nonresident wrap queries remain as described
 in the worker report; native verification and the next Astra drive are pending.
 Evidence: ../../docs/worker-reports/edit-a2g.md.
+
+## edit-5ih: font adoption at the frame boundary
+
+Startup reads EDIT_FONT_FAMILY / EDIT_FONT_FILE while the P6.4 loader is absent.
+Family/file selection and DPI/zoom now use one lifecycle in editor_font_size:
+current plus detached worker replacement, each with an async Unicode owner.
+Preparation resolves and validates the primary, builds ASCII in prepaid storage,
+and passes that same face to the runtime glyph cache. Mailbox delivery plus
+physical completion permit adoption only after backend/frame/input retirement.
+Detached glyph jobs must complete and drain before their version can be reused.
+Grid/view/minimap geometry and the retained pixel viewport follow main's zoom
+path. Resolved paths survive zoom; direct arena reads avoid stdio heap activity.
+Selection failure restores embedded DejaVu and emits one worker diagnostic.
+
+Strict builds, combined selection/Unicode/zoom tests, active allocation-guard
+results and native display/launcher exceptions are recorded in
+[the resolver report](../../docs/worker-reports/edit-5ih-resolve.md).

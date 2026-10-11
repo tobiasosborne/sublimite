@@ -3,22 +3,29 @@
 #include <poll.h>
 #include <string.h>
 #include <time.h>
+#include <stdio.h>
+#include "trace/trace.h"
 
 #define FONT_SIZE_MSG UINT32_C(0x4653495a) /* message tag 'FSIZ' */
 static int build_atlas(editor_font_size *f)
 {
-    int rc = f->legacy ? font_set_px(&f->face, f->prepared_px) : font_set_em_px(&f->face, f->prepared_px);
-    if (rc) return rc;
     editor_font_atlas *out = &f->atlas[f->preparing];
-    font_cell cell = f->face.cell;
+    font_t *face = &out->selection.face;
+    int rc = f->legacy ? font_set_px(face, f->prepared_px) : font_set_em_px(face, f->prepared_px);
+    if (rc) return rc;
+    font_cell cell = face->cell;
     size_t stride = (size_t)LAYOUT_ASCII_GLYPHS * cell.cell_w;
     size_t bytes = stride * cell.cell_h;
-    if (!cell.cell_w || !cell.cell_h || bytes > f->capacity) return FONT_ERR_NOMEM;
+    if (!cell.cell_w || !cell.cell_h || cell.cell_w > f->max_cell.cell_w ||
+        cell.cell_h > f->max_cell.cell_h || bytes > f->capacity) return FONT_ERR_NOMEM;
     memset(out->pixels, 0, bytes);
+    uint64_t start = trace_now_ns();
+    out->selection.glyph_max_ns = 0;
     for (uint32_t i = 0; i < LAYOUT_ASCII_GLYPHS; i++) {
+        uint64_t glyph_start = trace_now_ns();
         edit_arena_reset(&f->scratch);
         font_bitmap bitmap;
-        rc = font_raster_glyph(&f->face, 0x20u + i, &f->scratch, &bitmap);
+        rc = font_raster_glyph(face, 0x20u + i, &f->scratch, &bitmap);
         if (rc) return rc;
         out->metrics[i] = bitmap.m;
         /* Pack directly into a row of cells, matching the baked atlas layout. */
@@ -31,44 +38,69 @@ static int build_atlas(editor_font_size *f)
                     out->pixels[(size_t)cy * stride + (size_t)i * cell.cell_w + (size_t)cx] = bitmap.pixels[(size_t)y * bitmap.w + x];
             }
         }
+        uint64_t elapsed = trace_now_ns() - glyph_start;
+        if (elapsed > out->selection.glyph_max_ns) out->selection.glyph_max_ns = elapsed;
     }
+    out->selection.atlas_raster_ns = trace_now_ns() - start;
     out->atlas = (font_ascii_atlas){f->prepared_px, cell, out->metrics, out->pixels, bytes};
     return FONT_OK;
+}
+static int embedded_face(font_t *face)
+{
+    size_t len; const unsigned char *bytes = font_embedded_data(&len);
+    return font_init(face, bytes, len);
 }
 static void font_worker(work_ctx *ctx)
 {
     editor_font_size *f = ctx->arg;
+    editor_font_atlas *a = &f->atlas[f->preparing];
+    font_selection *selection = &a->selection;
     f->worker = pthread_self();
     int rc = FONT_OK;
     if (!f->face.data) {
-        size_t len; const unsigned char *bytes = font_embedded_data(&len);
-        rc = font_init(&f->face, bytes, len);
+        rc = embedded_face(&f->face);
         if (!rc) rc = font_set_em_px(&f->face, EDITOR_FONT_MAX_PX);
         if (!rc) {
-            /* Exact INIT resource derivation: two immutable atlas versions,
-             * each ASCII-count * maximum cell advance * maximum line height.
-             * Scratch inherits tools/atlasbake.c's one-MiB raster arena. */
+            /* Main's maximum-size bounds prepay both ASCII versions, Unicode
+             * cache scratch and minimap pixels. Selection uses these same caps. */
             f->max_cell = f->face.cell;
             f->capacity = (size_t)LAYOUT_ASCII_GLYPHS * f->max_cell.cell_w * f->max_cell.cell_h;
             if (edit_arena_init(&f->storage, 2u * f->capacity) ||
                 edit_arena_init(&f->scratch, 1u << 20)) rc = FONT_ERR_NOMEM;
-            if (!rc) for (unsigned i = 0; i < 2; i++)
+            if (!rc) for (unsigned i = 0; i < 2; i++) {
                 f->atlas[i].pixels = edit_arena_alloc(&f->storage, f->capacity, 1);
+                if (!f->atlas[i].pixels) rc = FONT_ERR_NOMEM;
+            }
         }
     }
-    if (!rc && !work_should_stop(ctx)) rc = build_atlas(f);
+    bool custom = selection->family[0] || selection->file[0];
+    selection->result = FONT_OK;
     if (!rc && !work_should_stop(ctx)) {
-        editor_font_atlas *a = &f->atlas[f->preparing];
-        const font_ascii_atlas *baked = f->legacy ? font_ascii_atlas_for_px(f->prepared_px) : NULL;
-        if (baked) a->atlas = *baked;
+        selection->result = font_selection_load(selection, f->prepared_px, !f->legacy, f->max_cell, ctx);
+        if (!selection->result && !custom) rc = embedded_face(&selection->face);
+        if (!rc && !selection->result) selection->result = build_atlas(f);
+        if (selection->result) {
+            font_selection_free(selection);
+            rc = embedded_face(&selection->face);
+            if (!rc) rc = build_atlas(f);
+        }
+        if (!rc && f->legacy && (!custom || selection->result)) {
+            const font_ascii_atlas *baked = font_ascii_atlas_for_px(f->prepared_px);
+            if (baked) a->atlas = *baked;
+        }
+    }
+    if (!rc && !work_should_stop(ctx)) {
         if (!a->fonts) {
-            /* Both runtime owners are prepaid at INIT, along with both ASCII
-             * bands. Zoom reuses the detached version after physical work and
-             * backend retirement, while the current owner remains UI-readable. */
             for (unsigned i = 0; i < 2 && !rc; i++)
                 rc = font_async_open_atlas(&f->atlas[i].fonts, &a->atlas,
                                            !f->legacy, f->max_cell, ctx->pool);
         } else rc = font_async_reset_atlas(a->fonts, &a->atlas, !f->legacy);
+        if (!rc) rc = font_async_set_primary(a->fonts, &selection->face);
+    }
+    if (selection->result != FONT_OK && selection->result != FONT_MORE &&
+        selection->face.data && !work_should_stop(ctx)) {
+        if (!atomic_exchange(f->logged, true))
+            fprintf(stderr, "sublimite: font selection failed; using embedded DejaVu Sans Mono\n");
     }
     f->result = rc;
     work_msg msg = {.kind = FONT_SIZE_MSG};
@@ -88,6 +120,7 @@ static void init_receive(const work_msg *msg, void *ctx) { (void)editor_font_rec
 int editor_font_init(editor *e, const font_ascii_atlas **atlas)
 {
     editor_font_size *f = &e->font;
+    f->logged = &e->font_logged;
     f->legacy = e->cfg.font_dpi == 0.0;
     f->dpi = f->legacy ? 96.0 : e->cfg.font_dpi; /* (E) Xft fallback, explicit test pixels */
     f->default_px = f->legacy ? (e->cfg.font_px ? e->cfg.font_px : 15u) :
@@ -113,7 +146,8 @@ int editor_font_init(editor *e, const font_ascii_atlas **atlas)
 }
 bool editor_font_pending(const editor *e)
 {
-    return e->font.handle.epoch || e->font.requested_px != e->font.applied_px;
+    return e->font.handle.epoch || e->font.requested_px != e->font.applied_px ||
+        e->font.requested_generation != e->font.applied_generation;
 }
 int editor_font_zoom(editor *e, int value)
 {
@@ -137,8 +171,10 @@ int editor_font_poll(editor *e)
     if (f->handle.epoch) {
         if (!f->received || !work_handle_finished(&e->pool, f->handle)) return 0;
         if (f->result) return f->result;
-        if (f->prepared_px == f->requested_px && f->prepared_px != f->applied_px) {
-            if (e->backend->active || view_busy(&e->v) || e->action != EDITOR_ACTION_NONE || e->op_count) return 0;
+        if (f->prepared_px == f->requested_px && f->prepared_generation == f->requested_generation &&
+            (f->prepared_px != f->applied_px || f->prepared_generation != f->applied_generation)) {
+            if (e->backend->active || e->dirty || view_busy(&e->v) || layout_busy(&e->lay) ||
+                editor_clip_busy(e) || e->action != EDITOR_ACTION_NONE || e->op_count) return 0;
             const font_ascii_atlas *a = &f->atlas[f->preparing].atlas;
             render_dims dims = e->grid.dims;
             dims.cell_w = a->cell.cell_w; dims.cell_h = a->cell.cell_h;
@@ -150,14 +186,34 @@ int editor_font_poll(editor *e)
             e->fonts = f->atlas[f->preparing].fonts;
             memset(e->font_rows, 0, e->font_row_slots * e->font_row_words * sizeof *e->font_rows);
             int rc = editor_resize_grid(e, dims); if (rc) return rc;
+            if (f->prepared_generation != f->applied_generation) {
+                e->stats.font_changes++;
+                e->stats.font_error = f->atlas[f->preparing].selection.result;
+            }
             f->current = f->preparing; f->applied_px = f->prepared_px;
+            f->applied_generation = f->prepared_generation;
         }
         f->handle = (work_handle){0}; f->received = false;
     }
-    if (f->requested_px != f->applied_px) {
+    if (f->requested_px != f->applied_px || f->requested_generation != f->applied_generation) {
+        const font_selection *request = &f->selection;
+        if (f->requested_generation == f->applied_generation)
+            request = &f->atlas[f->current].selection;
+        else if (f->prepared_generation == f->requested_generation &&
+                 f->atlas[f->preparing].selection.face.data)
+            request = &f->atlas[f->preparing].selection;
         f->preparing = 1u - f->current;
         if (!font_async_idle(f->atlas[f->preparing].fonts)) return 0;
         f->prepared_px = f->requested_px;
+        f->prepared_generation = f->requested_generation;
+        font_selection *selection = &f->atlas[f->preparing].selection;
+        /* Reuse a resolved path even when zoom supersedes a prepared family
+         * before adoption. The worker still owns the actual file/face load. */
+        if (selection != request) {
+            memcpy(selection->family, request->family, sizeof selection->family);
+            memcpy(selection->file, request->file, sizeof selection->file);
+            selection->index = request->index;
+        }
         f->handle = work_submit(&e->pool, (work_job){font_worker, f, 0, WORK_FOREGROUND});
         /* A temporarily full queue is retried on an existing editor turn. */
     }

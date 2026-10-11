@@ -7,6 +7,7 @@
  *     (ASCII, Latin-1, CJK, symbols, input-derived) return clean codes;
  *   - a successful raster has pixels iff w*h > 0 and the arena is rewound. */
 #include "font/font.h"
+#include "font/selection.h"
 #include "utf8/utf8.h"
 #include "font_cffseed.h"
 #include <stdio.h>
@@ -140,6 +141,8 @@ static int exercise_face(const uint8_t *data, size_t size, uint32_t index)
     if (r != FONT_OK) return 0;
     uint32_t px = 10u + (data[size / 2] % 3u) * 11u;
     REQUIRE(font_set_px(&f, px) == FONT_OK);
+    int mono = font_monospace(&f);
+    REQUIRE(mono == FONT_OK || mono == FONT_ERR_INIT || mono == FONT_ERR_MISSING);
     uint32_t cps[16] = { 'A', 'B', '@', 'W', 0xE9u, 0x20ACu, 0x4E2Du, 0x3042u, 0x2588u, 0x1F600u };
     for (size_t i = 10; i < 16; i++) {
         size_t at = (size_t)(i * 2654435761u) % (size - 3u);
@@ -165,6 +168,15 @@ static int exercise_face(const uint8_t *data, size_t size, uint32_t index)
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    /* Selection syntax exercises embedded NUL, overlong strings, decimal TTC
+     * overflow and malformed suffixes, without I/O/discovery in the fuzzer. */
+    char pattern[FONT_FALLBACK_PATH_MAX + 1u];
+    size_t n = size < sizeof pattern - 1u ? size : sizeof pattern - 1u;
+    memcpy(pattern, data, n); pattern[n] = 0;
+    font_selection selection = {0};
+    int parsed = font_selection_parse(&selection, pattern, pattern);
+    REQUIRE(parsed == FONT_OK || parsed == FONT_ERR_ARG);
+    if (parsed == FONT_OK) REQUIRE(selection.index <= UINT16_MAX);
     if (getenv("FONT_FUZZ_UNICODE")) return unicode_clusters(data, size);
     (void)exercise_face(data, size, 0);
     /* Optional 0xff + four-byte face control prefix, independent of font

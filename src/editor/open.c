@@ -34,7 +34,10 @@ void editor_close(editor *e)
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
-    for (unsigned i = 0; i < 2; i++) font_async_close(e->font.atlas[i].fonts);
+    for (unsigned i = 0; i < 2; i++) {
+        font_async_close(e->font.atlas[i].fonts);
+        font_selection_free(&e->font.atlas[i].selection);
+    }
     edit_arena_free(&e->font.storage); edit_arena_free(&e->font.scratch);
     if (e->has_platform) plat_shutdown(&e->platform);
     editor_clip_close(e);
@@ -62,6 +65,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     memset(e, 0, sizeof *e);
     e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
+    atomic_init(&e->font_logged, false);
     e->cfg = *config; e->preferences_font_override = config->font_points; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;
@@ -251,6 +255,13 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         uint64_t id; rc = editor_add_buffer(e, config->path, config->initial, config->initial_len, &id);
     } else rc = editor_activate(e);
     if (rc) goto fail;
+    /* Interim source while P6.4 is absent from this snapshot. Read once at
+     * setup; its future inotify callback calls editor_font_request. */
+    const char *family = getenv("EDIT_FONT_FAMILY"), *font_file = getenv("EDIT_FONT_FILE");
+    if ((family && *family) || (font_file && *font_file)) {
+        int font_rc = editor_font_request(e, family, font_file);
+        if (font_rc == EDITOR_ERR_ARG) editor_font_bad_config(e);
+    }
     *out = e; return 0;
 fail:
     if (retry && e->recovery_retry) { *retry = true; strcpy(aside, e->recovery_aside); }

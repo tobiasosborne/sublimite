@@ -94,6 +94,9 @@ typedef struct editor_stats {
     bool minimap_stale, source_stale, open_pending;
     bool focused, blinking, cursor_visible, render_active, pending;
     int journal_error, error_cause; /* underlying module code on stopped loop */
+    uint64_t font_changes; /* adopted atlas generations, including failure fallback */
+    int font_error;
+    bool font_pending;
     int backend_init_error;           /* failed GPU init, 0 if no fallback */
 } editor_stats;
 
@@ -117,6 +120,12 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
  * No runtime retries. Strict no-fallback selection retains synchronous init. */
 int editor_backend_select(render_backend *backend, const char *name);
 void editor_close(editor *e);
+/* Config-loader hook, UI-only copied request, allocation-free. file wins over
+ * family; file#decimal selects a TTC face. Empty restores embedded DejaVu.
+ * MORE means a previous family request is still pending: retry after stepping.
+ * Selection and zoom share worker preparation and the frame-boundary swap;
+ * an accepted request waits for retired Unicode jobs before version reuse. */
+int editor_font_request(editor *e, const char *family, const char *file);
 /* Fixed queue; stamp ingress when drained by step, not when injected. Native
  * events and injected events take the same command/layout/submit path.
  * CLOSE requests an immediate stop, even when command storage is full.

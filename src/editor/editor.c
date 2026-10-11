@@ -610,7 +610,7 @@ static bool runnable(const editor *e)
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
     return (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
-           (e->font.requested_px != e->font.applied_px && !e->font.handle.epoch) ||
+           (editor_font_pending(e) && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
@@ -819,6 +819,7 @@ editor_stats editor_get_stats(const editor *e)
     editor_stats s = e->stats;
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
+    s.font_pending = e->font.requested_generation != e->font.applied_generation;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
     s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||

@@ -164,6 +164,17 @@ int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *a, bool em
     return FONT_OK;
 }
 
+int font_async_set_primary(font_async *owner, const font_t *primary)
+{
+    if (!owner || !primary || !primary->data || !font_async_idle(owner) ||
+        owner->init_result != FONT_MORE || primary->px != owner->px ||
+        primary->cell.cell_w != owner->ascii.cell.cell_w ||
+        primary->cell.cell_h != owner->ascii.cell.cell_h) return FONT_ERR_ARG;
+    owner->family.faces[0] = *primary;
+    owner->family.faces[0].atlas = &owner->ascii;
+    return FONT_OK;
+}
+
 void font_async_close(font_async *owner)
 {
     if (!owner) return;
@@ -231,7 +242,7 @@ static void glyph_job(work_ctx *ctx)
     if (owner->init_result == FONT_MORE) {
         size_t len; const unsigned char *bytes = font_embedded_data(&len);
         font_t *primary = &owner->family.faces[0];
-        int result = font_init(primary, bytes, len);
+        int result = primary->data ? FONT_OK : font_init(primary, bytes, len);
         if (result == FONT_OK) result = owner->em ?
             font_set_em_px(primary, owner->px) : font_set_px(primary, owner->px);
         if (result == FONT_OK && (primary->cell.cell_w != owner->ascii.cell.cell_w ||

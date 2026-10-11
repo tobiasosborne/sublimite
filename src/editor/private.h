@@ -1,6 +1,7 @@
 #ifndef EDIT_EDITOR_PRIVATE_H
 #define EDIT_EDITOR_PRIVATE_H
 #include "editor/editor.h"
+#include "font/selection.h"
 #include "base/base.h"
 #include "file/file.h"
 #include "layout/layout.h"
@@ -102,6 +103,7 @@ typedef struct editor_font_atlas {
     font_metric metrics[LAYOUT_ASCII_GLYPHS];
     uint8_t *pixels;
     font_async *fonts;
+    font_selection selection; /* primary bytes live as long as this version */
 } editor_font_atlas;
 typedef struct editor_font_size {
     font_t face;
@@ -111,9 +113,12 @@ typedef struct editor_font_size {
     size_t capacity;
     double dpi, points, default_points;
     uint32_t requested_px, prepared_px, applied_px, default_px;
+    font_selection selection; /* copied UI request; workers use a version snapshot */
+    uint32_t requested_generation, prepared_generation, applied_generation;
     uint32_t window_width, window_height, max_width, max_height;
     unsigned current, preparing;
     bool legacy, received;
+    _Atomic bool *logged;
     int result;
     work_handle handle;
     pthread_t worker;
@@ -184,6 +189,7 @@ struct editor {
     uint64_t *font_rows;
     size_t font_row_words, font_row_slots;
     editor_font_size font;
+    _Atomic bool font_logged;
     render_strip *strips;
     editor_hit *hits;
     uint64_t *row_byte;
@@ -289,6 +295,7 @@ int editor_backend_start_probe(editor *e, render_backend backend, render_config 
 int editor_backend_poll_probe(editor *e);
 void editor_backend_close_probe(editor *e);
 bool editor_activation_busy(const editor *e);
+void editor_font_bad_config(editor *e);
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);
 int editor_refresh_cursor(editor *e, uint64_t old_cursor);

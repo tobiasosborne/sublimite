@@ -321,6 +321,9 @@ int font_async_open_atlas(font_async **out, const font_ascii_atlas *atlas, bool 
  * Reuses INIT reservations; no owner/storage allocations during zoom. */
 bool font_async_idle(const font_async *owner);
 int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *atlas, bool em);
+/* Worker-only, detached idle version: copy a primary descriptor whose font
+ * bytes remain borrowed until reset/shutdown and backend retirement. */
+int font_async_set_primary(font_async *owner, const font_t *primary);
 int font_async_bind(font_async *owner, render_grid *grid);
 int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len,
                      uint32_t width, uint32_t *slot);

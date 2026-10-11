@@ -666,6 +666,21 @@ static int set_size(font_t *f, uint32_t px, int em)
 
 int font_set_px(font_t *f, uint32_t px) { return set_size(f, px, 0); }
 int font_set_em_px(font_t *f, uint32_t px) { return set_size(f, px, 1); }
+/* Compare unrounded design advances: pixel rounding can hide proportional
+ * differences at small sizes. Printable ASCII must have every glyph. */
+int font_monospace(const font_t *f)
+{
+    if (!f || !f->data) return FONT_ERR_ARG;
+    int advance = 0;
+    for (uint32_t cp = FONT_ASCII_FIRST; cp <= FONT_ASCII_LAST; cp++) {
+        int glyph = 0, width = 0, bearing = 0;
+        if (glyph_of(f, cp, &glyph) != FONT_OK) return FONT_ERR_MISSING;
+        stbtt_GetGlyphHMetrics(cinfo_of(f), glyph, &width, &bearing);
+        if (width <= 0 || (cp != FONT_ASCII_FIRST && width != advance)) return FONT_ERR_INIT;
+        advance = width;
+    }
+    return FONT_OK;
+}
 
 int font_cell_metrics(const font_t *f, font_cell *out)
 {

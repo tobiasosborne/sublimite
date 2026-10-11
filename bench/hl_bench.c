@@ -82,9 +82,9 @@ int main(int argc, char **argv)
     uint64_t before = atomic_load_explicit(&load.slices, memory_order_relaxed);
     /* Sample count follows the existing G1/G3 harness's p99 sample contract.
      * TRACK prints misses; setup/structural failures remain visible. */
-    int type_null = typing_row("null", BENCH_INTERACTION_MIN_N, true, false, 0, 0, NULL, false);
+    int type_null = typing_row("null", BENCH_INTERACTION_MIN_N, true, false, 0, 0, NULL, false, NULL);
     int tabs_null = tab_row(false, true);
-    int type_raster = typing_row("raster", BENCH_INTERACTION_MIN_N, true, false, 0, 0, NULL, false);
+    int type_raster = typing_row("raster", BENCH_INTERACTION_MIN_N, true, false, 0, 0, NULL, false, NULL);
     int tabs_raster = tab_row(true, true);
     uint64_t after = atomic_load_explicit(&load.slices, memory_order_relaxed);
     work_cancel(&pool, handle);
