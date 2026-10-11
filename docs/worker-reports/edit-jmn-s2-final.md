@@ -1,0 +1,3 @@
+Partial: tab reservation and readable IPC errors are implemented. Existing-file opens still exhaust per-file inotify instances in the excluded file module, so edit-jmn remains incomplete.
+
+`make all` passed. `make check` failed on sandbox-denied IPC access. Red/green runs, memory derivation, display failures and remaining work are in [the worker report](/home/tobias/Projects/sublimite/.wt/edit-jmn/docs/worker-reports/edit-jmn.md).

@@ -1,4 +1,22 @@
-# HANDOFF — sublimité, session 10: process reset (updated 2026-10-11)
+# HANDOFF — sublimité, session 10 cut short by a network interruption (2026-10-11 ~10:40)
+
+## Read first: state at the cut
+**Landed on main today:** process reset (0eeb4a4, f02934c), Astra-before-Tobias rule + flashscan (2baf8c5), Astra drive 1 report (51d840a, VERDICT no), PRD golden-master rule + PLAN loop (5160ea8), Opus design research docs/design/state-of-design-2026.md (56d7319), **edit-g11 flash fix 691ceb1** (verified: full `make check` in its worktree green except cli_test under load; cli_test re-run serially green, exit 0). **Main has NOT had a main-level clean check since 691ceb1 and was pushed as-is at the cut: run `make all && make check` on main first.**
+
+**Wave 2 worktrees (`.wt/<bead>`, branches `wt/<bead>-s2`), each snapshotted as a WIP commit at the cut; Codex workers may still have been running (reports land in docs/worker-reports/<bead>-s2-final.md in main and <bead>.md in the worktree):**
+- edit-8m3 minimap slice 1: DONE, verified (editor_test + cli_test green on serial rerun; the parallel make check failed only from inotify exhaustion and load). **Conflicts with g11 in src/minimap/minimap.c minimap_fill**: rebase wt/edit-8m3-s2 onto main, resolve, re-run minimap_test + editor_test, land. Follow-up edit-d5o (compose pixel minimap into the frame) filed P0.
+- edit-gdj: Astra withdrew the anchor finding; worker added selection-chord regression tests only. A Codex continuation (edit-whl Ctrl+Y + edit-2gx Ctrl+F) was running in the same worktree: land tests + whatever it finished after `make check`.
+- edit-b0j design spec: DONE (docs/design/visual-spec.md + 16 SVG mocks). Sent to Tobias with 3 PNG renders (build/design/). Conservative (keeps DejaVu Sans Mono); the Opus report disagrees on typeface (Geist Mono / JetBrains Mono) and minimap. **Tobias decides per section**; do not start chrome work before that.
+- edit-jmn: partial (tab reservation + readable IPC errors). Root cause is per-file inotify_init1 in src/file (file.c:1027) exhausting max_user_instances=128 → new bead **edit-er2** (P0) dispatched to Codex in .wt/edit-er2. Land jmn after er2.
+- edit-ck4 (Ctrl+S + startup restore), edit-cde (clipboard), edit-08z (Unicode glyphs), edit-m3g (DPI size + zoom), edit-2ty (1 GiB stall), edit-2ts (startup stages): in flight at the cut; check their -s2-final.md reports, verify each worktree (`rm -rf build && make all && make check` with a private XDG_RUNTIME_DIR, DISPLAY=:99), land in blocker order: ck4, cde, 08z, m3g, 2ty, 2ts.
+- edit-lwq (benches exit 0): Sonnet did the harness + most benches; a Sonnet continuation was auditing the remaining 7 benches and running make bench; the session's subagents died at the cut. Finish by hand or one more Sonnet: see docs/worker-reports/edit-lwq.md in .wt/edit-lwq.
+
+**Verification gotchas found today:** (1) 16 concurrent worker builds/tests exhaust the per-user inotify instance limit (128) because the file module opens one instance per file → editor_test:809 / editor_add_buffer EMFILE and cli_test:165/233 failures that are NOT the worktree's fault; re-run the failing suite serially. (2) cli_test prints two FAIL lines from its own forced-timeout child (§36) on every run; only the exit code counts. (3) Under load1 > 10 the display suites are slow; the Makefile's per-test display lock serializes them.
+
+**Then:** rebuild, Tobias launches the Astra drive again (same brief build/astra/brief.md, launch line in docs/worklog/2026-10-11.md), file deviations, repeat. Nothing goes to Tobias before a yes.
+
+---
+
 
 ## Session 10 (read first; supersedes every "gate", "bench run" and "review slice" instruction below)
 Tobias, 2026-10-11: **"Perf is a goal, not a progress blocker. Milestones are the priority. If landing milestones is slowed by perf then the process is a failure."** Decision doc: `docs/decisions/2026-10-11-perf-is-a-goal.md`. CLAUDE.md laws 1 and 8 are rewritten, PRD §9 milestones now exit by use, PLAN §1.4 amended, `perf/01-perf-target.md` is a reference goal sheet. No code changed.
