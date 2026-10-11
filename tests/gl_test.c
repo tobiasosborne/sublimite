@@ -553,6 +553,21 @@ static int gl_review_native_available(bool *available)
     if (!*available) printf("gl_review: native diagnostics SKIP: Xvfb/EGL context unavailable (result=%d; :99 has no DRI3)\n",rc);
     return 0;
 }
+/* The readback init override skips the Present probe, so Xvfb (software EGL,
+ * no DRI3/MSC clock) is "available" above yet never shows window pixels. The
+ * window-pixel contracts need the production init, which includes that probe. */
+static int gl_review_present_available(bool *available)
+{
+    gl_driver d; render_backend b={0};
+    render_config cfg={.dims={2,2,4,4},.max_width=8,.max_height=8,.max_cells=4};
+    int rc=gl_driver_prepare(&d,&b,&cfg);
+    if (rc==RENDER_OK) rc=gl_driver_init(&d);
+    gl_driver_cleanup(&d);
+    GL_CHECK(rc==RENDER_OK || rc==RENDER_ERR_UNSUPPORTED);
+    *available=rc==RENDER_OK;
+    if (!*available) printf("gl_review: native window-pixel contracts SKIP: Present unavailable (result=%d)\n",rc);
+    return 0;
+}
 static int gl_review_fill(render_backend *b, uint32_t color)
 {
     gl_state *s=b->state;
@@ -1503,8 +1518,12 @@ int main(int argc, char **argv)
         if (strcmp(argv[2],"6")==0) return gl_review_continuation_test();
         if (strcmp(argv[2],"8")==0) return gl_review_budget_test();
         if (strcmp(argv[2],"12")==0) return gl_review_trace_test();
-        if (strcmp(argv[2],"13")==0) return gl_review_native_test(false);
-        if (strcmp(argv[2],"13-noop")==0) return gl_review_native_test(true);
+        if (strcmp(argv[2],"13")==0 || strcmp(argv[2],"13-noop")==0) {
+            bool present=false;
+            GL_CHECK(gl_review_present_available(&present)==0);
+            if (!present) return 0;
+            return gl_review_native_test(strcmp(argv[2],"13-noop")==0);
+        }
         return 1;
     }
     bool pixels_only=argc==2 && strcmp(argv[1],"--pixels-only")==0;
@@ -1556,7 +1575,9 @@ int main(int argc, char **argv)
     GL_CHECK(gl_review_budget_test()==0);
     GL_CHECK(gl_review_continuation_test()==0);
     GL_CHECK(gl_review_trace_test()==0);
-    GL_CHECK(gl_review_native_test(false)==0);
+    bool present_available=false;
+    GL_CHECK(gl_review_present_available(&present_available)==0);
+    if (present_available) GL_CHECK(gl_review_native_test(false)==0);
     GL_CHECK(gl_failure_test()==0);
     const char *selected=getenv("EDIT_GL_UPLOAD");
     if (selected!=NULL) GL_CHECK(gl_readback_unit_test()==0);

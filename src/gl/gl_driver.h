@@ -28,7 +28,7 @@ static void gl_driver_init_job(work_ctx *c)
     uint64_t start = trace_now_ns();
     int result = render_backend_init(d->backend, &d->config, d->state, d->state_bytes);
     uint64_t elapsed = trace_now_ns() - start;
-    work_msg msg = {.kind = GL_POLL_MESSAGE};
+    work_msg msg = {.kind = GL_POLL_MESSAGE, .generation = c->generation};
     memcpy(msg.data, &result, sizeof result);
     memcpy(msg.data + sizeof result, &elapsed, sizeof elapsed);
     (void)work_publish(c, &msg);
