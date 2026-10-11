@@ -1,17 +1,17 @@
 startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
-  process_start        ns=69079253904468 elapsed_ms=0.000000
+  process_start        ns=70979387378906 elapsed_ms=0.000000
   display_connect      not recorded
-  egl_probe_start      ns=69079263066603 elapsed_ms=9.162135
-  egl_probe_end        ns=69079265491393 elapsed_ms=11.586925
-  raster_fallback      ns=69079258863076 elapsed_ms=4.958608
-  font_atlas_ready     ns=69079255366962 elapsed_ms=1.462494
-  file_prefix_read     ns=69079261848213 elapsed_ms=7.943745
-  first_layout         ns=69079262417715 elapsed_ms=8.513247
-  first_submit         ns=69079265357759 elapsed_ms=11.453291
-  first_present        ns=69079265359042 elapsed_ms=11.454574
+  egl_probe_start      ns=70979388754066 elapsed_ms=1.375160
+  egl_probe_end        ns=70979389131078 elapsed_ms=1.752172
+  raster_fallback      ns=70979388654283 elapsed_ms=1.275377
+  font_atlas_ready     ns=70979387868464 elapsed_ms=0.489558
+  file_prefix_read     ns=70979388833969 elapsed_ms=1.455063
+  first_layout         ns=70979388745665 elapsed_ms=1.366759
+  first_submit         ns=70979388963375 elapsed_ms=1.584469
+  first_present        ns=70979388964236 elapsed_ms=1.585330
   egl_load_start       not recorded
   egl_load_end         not recorded
-G1 T4-T0     n=1 p50=0.074 ms p99=0.074 ms
-G3 T5-T0     n=1 p50=0.074 ms p99=0.074 ms
-T6-T0        n=1 p50=0.074 ms p99=0.074 ms
-battery: Discharging
+G1 T4-T0     n=2 p50=0.017 ms p99=0.043 ms
+G3 T5-T0     n=2 p50=0.017 ms p99=0.043 ms
+T6-T0        n=2 p50=0.017 ms p99=0.043 ms
+battery: Charging

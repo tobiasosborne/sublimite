@@ -8,9 +8,16 @@ editor_close_test: injected close in one turn; full input/view continuation/held
 SUITE editor_close_test exit=1
 
 == editor_large_test
-editor_large_test:759: FAIL trace_now_ns() < deadline
-editor_large_test:784: FAIL cooperative_large_jobs() == 0
+editor_large_test:210: FAIL ipc_server_init(&server, runtime) == IPC_OK
+editor_large_test:800: FAIL mapped_startup_ipc() == 0
 P4-3 section 28: sealed find publication yields behind a saturated mailbox passed
+P4-3 section 28: production find/warm yield bulk lane before completion passed
+P4-3 section 21: warm completion requests an idle correcting frame passed
+P4-3 section 20: cold deep bracket paint minor faults=2 (M)[AC], loose bound=128 (G)
+P4-3 section 18: long-line start and UTF-8/combining/CRLF byte boundaries passed
+P4-3 section 17: COPY coordinates and misleading mapped prefix resolve exactly passed
+P4-3 section 15: Keep restarts incomplete index and cancelled warm lease passed
+P4-3 section 1: held cancelled find survives Keep and restart passed
 SUITE editor_large_test exit=1
 
 == editor_p4_test
@@ -26,18 +33,57 @@ editor_p4_test: null brace giant selection shortening succeeds atomically malloc
 SUITE editor_p4_test exit=1
 
 == editor_test
-editor_test:1698: FAIL editor_open(&e, &cfg, &backend) == 0
-editor_test:1940: FAIL ck4_recovery(1) == 0
+reload launcher result=4
+editor_test:964: FAIL waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0
+editor_test:355: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:381: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:663: FAIL editor_open(&e, &cfg, &backend) == 0
+editor_test:1319: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:1941: FAIL review_suite(NULL) == 0
 P4-3 section 8: complete-record credit bounded; independent durable image exact with dirty frames and occupied bulk worker
 P4-3 section 7: healthy flush survives abrupt child exit with exact selection/tab order/active/window metadata
 P4-3 section 7: missing named target association persisted independently of empty content BASE
 P4-3 section 10: journal-enabled editor rejects FIFO without a writer; child completes before alarm
-editor_test:1735: FAIL WIFEXITED(status) && WEXITSTATUS(status) == 0
-editor_test:1940: FAIL ck4_recovery(1) == 0
-P4-3 section 8: complete-record credit bounded; independent durable image exact with dirty frames and occupied bulk worker
-P4-3 section 7: healthy flush survives abrupt child exit with exact selection/tab order/active/window metadata
-P4-3 section 7: missing named target association persisted independently of empty content BASE
-P4-3 section 10: journal-enabled editor rejects FIFO without a writer; child completes before alarm
+P4-3 section 4: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=COPY choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 40: cursor/text frames omit unchanged final tab chrome passed
+P4-3 41: closed drag owner and switched minimap capture cancel safely passed
+P4-3 22: evicted buffer retains held save lease during unrelated typing passed
+P4-3 14: pre-prompt, modified, repeated and aged recovery keys ignored passed
+P4-3 13: suspended source preserves tab keys and tab pointer controls passed
+P4-3 12: pending COPY admits controls and retains edit owner passed
+P4-3 11: failed full-source identity adoption stays owner-local passed
+P4-3 11: deferred COPY and inactive ENOSPC errors preserve unrelated editing passed
+review 3/P1.9-2.2: SIGKILL point=0 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=1 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=2 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=3 recovery=x passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=0 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=1 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=2 restores current tree passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 5/P1.9-2.3: source changed between attachment and BASE registration rejected passed
+review 6: submitted mid-row caret/selection/blink/focus cells passed
+review 7: multiple long clipped lines preserve subsequent rows in first frame and edit/undo passed
+review 8: first viewport precedes stalled remainder work passed
+review 10: 10 GiB beginning edits metadata visits max=618 (M)[AC], bound=4096 (G)
+review 10: mutation cancels completed backlog without adopting it passed
+review 11: indivisible submit observed=2069735 reported=2145906 ns (M)[AC]
+review 11: first undo turn longest_slice_ns=85918 (M)[AC], slice limit=500000 ns (G)
+review 11: multi-record burst undo/redo yields across turns passed
+review 12: journaled large deletion and undo passed
+review 15: replay arena growth=0 bytes (M)[AC], bound=65536 bytes (G)
+review 13: typing/repeat bursts, movement/focus/timeout boundaries passed
+review 16: mapped watch overwrite, focus truncate, edit suspension and reload/keep passed
+review 17: active job idle polls=2 (M)[AC], requested-timeout bound=4 (G)
+review 17: queued job idle polls=3 (M)[AC], requested-timeout bound=4 (G)
+review 22: allocator positions=22 failures=22; tree/view/history/journal rollback passed (M)[AC]
+review 23: backend init success/failure executes on work pool and adopts mailbox result passed
 SUITE editor_test exit=1
 
 == file_kill_test
@@ -200,7 +246,7 @@ font_test: hostile font data rejected without out-of-bounds reads
 font_test: TTC face index honoured
 P2-1 §4 GREEN: extreme coordinates and small-ascent bitmap rejected
 P2-1 §30 GREEN: CFF errors rejected, empty glyph preserved, fallback recovers
-P2-1 §31 slices (M)[AC], shared loaded box, paired rejection/normal max: 62276/65859 ns; TRACK only
+P2-1 §31 slices (M)[AC], shared loaded box, paired rejection/normal max: 33154/37639 ns; TRACK only
 P2-1 §31 GREEN: tiny-bitmap high-outline workload refused on UI
 font_test: hostile CFF (byte flips, truncations, offsets, subr bomb) handled cleanly
 font_test: Noto CJK CFF faces load; truncated copies rejected cleanly
@@ -234,21 +280,21 @@ gl_test: P2-1 section 35 PASS (renderer and contention share workers)
 gl_test: P2-1 section 19 PASS (bulk-only refused; raster/foreground completion with blocked shared bulk)
 gl_test: P2-1 section 18 PASS (timeout followed by late success/failure)
 gl_test: P2-1 section 17 PASS (final and repeated failed-init display teardown)
-gl_bench: bulk_self_check jobs=1 active_kind=0 shared_pool=1 chunks_in_200ms=754 overlapped=1 evidence=(M) power=[bat]
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
+gl_bench: bulk_self_check jobs=1 active_kind=0 shared_pool=1 chunks_in_200ms=1376 overlapped=1 evidence=(M) power=[bat]
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
 BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]
 gl_test: section 5 stage=prepare SKIP: EGL/Present context unavailable on :99
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
 BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]
 gl_test: section 5 stage=init SKIP: EGL/Present context unavailable on :99
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
 BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]
 gl_test: section 5 stage=bulk SKIP: EGL/Present context unavailable on :99
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
 BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]
 gl_test: section 5 stage=frame SKIP: EGL/Present context unavailable on :99
-TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.67
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=6.70
 BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]
 gl_test: section 5 stage=integrated SKIP: EGL/Present context unavailable on :99
 gl_test: P2-1 section 5 PASS (arena/driver acquisition, active contention failure cleanup; native stages conditional)
@@ -267,27 +313,27 @@ savectl fixture FAIL: harness missing retirement deadline; terminating fixture (
 savectl fixture FAIL: harness missing retirement signal=9
 PROBE fixture phase and retirement deadlines preserve structural failure
 PROBE logical_padding slices=513 result=0 first_byte=2048 expected=2048 (G)
-STAMP (M)[bat] BAT0=Discharging load1=28.67 shared box
+STAMP (M)[bat] BAT0=Discharging load1=6.70 shared box
 PROBE A runtime=2880x1800 requested=2880x1800 (G)
-PROBE G1 injected_wait=20000000 (G) reported=21145256 injection_to_T4=21145256 (M)[bat]
+PROBE G1 injected_wait=20000000 (G) reported=21031181 injection_to_T4=21031181 (M)[bat]
 PROBE queued_keys first=2 last=3 dequeue_sequence=3 (M)[bat]
 PROBE structural_failure TRACK exit=1 expected=1 (G)
-BENCH name=editor_probe_insufficient n=1 required_n=10000 p50=1 p99=1 ci95_p50=[1,1] ci95_p99=[1,1] gate_p50=100 gate_p99=100 dropped=0 (M)[bat] power=Discharging load1=28.67 verdict=REFUSED (insufficient samples; no verdict)
+BENCH name=editor_probe_insufficient n=1 required_n=10000 p50=1 p99=1 ci95_p50=[1,1] ci95_p99=[1,1] gate_p50=100 gate_p99=100 dropped=0 (M)[bat] power=Discharging load1=6.70 verdict=REFUSED (insufficient samples; no verdict)
 PROBE insufficient_samples exit=3 expected=3 (G)
 PROBE active_frame keys=4 completed=4 coalesced=3 (M)[bat]
 PROBE structural counts, allocation, missing/duplicate frame failures remain fatal in TRACK
 PROBE scan load: both endpoints, >4 boundary, pass/miss suppression, exit=3, invalid samples fatal
-STAMP (M)[bat] BAT0=Discharging load1=28.67 shared box
-BENCH name=editor_null_100tabs_ingress_T5_G3 n=10000 required_n=10000 p50=2217876 p99=6774789 ci95_p50=[2211869,2223593] ci95_p99=[6466891,7756573] gate_p50=5000000 gate_p99=5560000 dropped=0 (M)[bat] power=Discharging load1=28.67 verdict=MISS
-BENCH name=editor_null_100tabs_minimap_inside_frame n=10000 required_n=10000 p50=55060 p99=70636 ci95_p50=[54958,55152] ci95_p99=[69631,71916] gate_p50=0 gate_p99=500000 dropped=0 (M)[bat] power=Discharging load1=28.67 verdict=PASS
-G3 null (M)[bat] load1=28.67 tabs=100 A=2880x1800 switches=10000 allocations=0 minimap_fills=10001 stale=0 mode=GATE
-STAMP (M)[bat] BAT0=Discharging load1=24.53 shared box
+STAMP (M)[bat] BAT0=Discharging load1=6.70 shared box
+BENCH name=editor_null_100tabs_ingress_T5_G3 n=10000 required_n=10000 p50=1087346 p99=1977173 ci95_p50=[1087236,1087451] ci95_p99=[1842615,2072649] gate_p50=5000000 gate_p99=5560000 dropped=0 (M)[bat] power=Discharging load1=6.70 verdict=PASS
+BENCH name=editor_null_100tabs_minimap_inside_frame n=10000 required_n=10000 p50=18715 p99=49498 ci95_p50=[18711,18719] ci95_p99=[38294,52054] gate_p50=0 gate_p99=500000 dropped=0 (M)[bat] power=Discharging load1=6.70 verdict=PASS
+G3 null (M)[bat] load1=6.70 tabs=100 A=2880x1800 switches=10000 allocations=0 minimap_fills=10001 stale=0 mode=GATE
+STAMP (M)[bat] BAT0=Discharging load1=6.03 shared box
 TARGET A=2880x1800 font_px=30 (M)[bat]
 BACKEND requested=null actual=null init_error=0
 G11 real_cadence_cpu verdict=REFUSED n=19 required_n=10000 (G); separate due-now guard follows
-BENCH name=editor_null_blink_cpu_regression_due_now n=10000 required_n=10000 p50=265836 p99=368915 ci95_p50=[265640,266082] ci95_p99=[364677,375185] gate_p50=1000000 gate_p99=2000000 dropped=0 (M)[bat] power=Discharging load1=24.53 verdict=PASS
-G11_schedule_TRACK null process_context_switches=23 (M)[bat] wakeup trace unavailable; qualifying wakeup gate unmeasured
-G11 null (M)[bat] load1=24.53 blinks=19 poll_returns=20 wakeups/s=1.996 idle=0 unfocused=0 (G)<=2/s,0,0 mode=GATE structural=OK
+BENCH name=editor_null_blink_cpu_regression_due_now n=10000 required_n=10000 p50=217872 p99=262196 ci95_p50=[217765,217955] ci95_p99=[256086,264727] gate_p50=1000000 gate_p99=2000000 dropped=0 (M)[bat] power=Discharging load1=6.03 verdict=PASS
+G11_schedule_TRACK null process_context_switches=21 (M)[bat] wakeup trace unavailable; qualifying wakeup gate unmeasured
+G11 null (M)[bat] load1=6.03 blinks=19 poll_returns=20 wakeups/s=1.997 idle=0 unfocused=0 (G)<=2/s,0,0 mode=GATE structural=OK
 G11 null structural worker_jobs=0 inline_frames=0
 harness_test: 20253 checks, 0 failures
 SUITE harness_test exit=0
@@ -305,7 +351,7 @@ FAIL tests/ipc_test.c:130: init_rc==IPC_OK
 SUITE ipc_test exit=1
 
 == journal_kill_test
-journal_kill_test: ok trials=50 script_edits=100000 issued=2662783 page_cache=2662735 replayed=2662755 acknowledged=2605333 (page_cache<=replayed<=issued; piece_tree==independent_byte_model_at_replayed; session_values_verified=1; trial0=kill_before_pump)
+journal_kill_test: ok trials=50 script_edits=100000 issued=2661032 page_cache=2660985 replayed=2661012 acknowledged=2606769 (page_cache<=replayed<=issued; piece_tree==independent_byte_model_at_replayed; session_values_verified=1; trial0=kill_before_pump)
 SUITE journal_kill_test exit=0
 
 == journal_test
@@ -525,19 +571,19 @@ SUITE piece_mem_test exit=0
 
 == piece_mt_test
 reclamation typing: pieces=20000 workers=1 typing_before_worker_resume=ok
-reclamation typing latency (M)[AC]: 36095 ns (TRACK, loaded box)
+reclamation typing latency (M)[AC]: 17834 ns (TRACK, loaded box)
 reclamation typing allocator: malloc_calls=0 guard=sanitizer-inert
 reclamation maintenance: batches=45 bounded_steps=64 (G)
 reclamation typing: pieces=20000 workers=3 typing_before_worker_resume=ok
-reclamation typing latency (M)[AC]: 28952 ns (TRACK, loaded box)
+reclamation typing latency (M)[AC]: 18134 ns (TRACK, loaded box)
 reclamation typing allocator: malloc_calls=0 guard=sanitizer-inert
 reclamation maintenance: batches=45 bounded_steps=64 (G)
 reclamation typing: pieces=200000 workers=1 typing_before_worker_resume=ok
-reclamation typing latency (M)[AC]: 17241 ns (TRACK, loaded box)
+reclamation typing latency (M)[AC]: 19755 ns (TRACK, loaded box)
 reclamation typing allocator: malloc_calls=0 guard=sanitizer-inert
 reclamation maintenance: batches=447 bounded_steps=64 (G)
 reclamation typing: pieces=200000 workers=3 typing_before_worker_resume=ok
-reclamation typing latency (M)[AC]: 91204 ns (TRACK, loaded box)
+reclamation typing latency (M)[AC]: 21891 ns (TRACK, loaded box)
 reclamation typing allocator: malloc_calls=0 guard=sanitizer-inert
 reclamation maintenance: batches=447 bounded_steps=64 (G)
 reclamation typing: ok (parked retirement; insert/delete/snapshot/read; three queued owners)
@@ -619,10 +665,10 @@ render_test: PASS (strips, bounds, cells, lifecycle, ownership, hooks, allocator
 SUITE render_test exit=0
 
 == replay_test
-1x event 1: 2162 us (deadline 2000 us)
-1x event 2: 4080 us (deadline 4000 us)
-2x event 1: 1240 us (deadline 1000 us)
-2x event 2: 2061 us (deadline 2000 us)
+1x event 1: 2068 us (deadline 2000 us)
+1x event 2: 4097 us (deadline 4000 us)
+2x event 1: 1074 us (deadline 1000 us)
+2x event 2: 2076 us (deadline 2000 us)
 replay_test: PASS
 SUITE replay_test exit=0
 
@@ -649,10 +695,10 @@ savectl bounded session request/worker preparation/submitted-status hook: ok
 savectl bounded session request/worker preparation/submitted-status hook: ok
 savectl terminal completion requires mailbox and yields on saturation: ok
 savectl every reload construction allocation: rollback/retry: ok
-reload first UI slice=103307 ns (M)[AC], allocations=12 (M)[AC]
-reload UI slices=16, max=103307 ns (M)[AC]
+reload first UI slice=94068 ns (M)[AC], allocations=12 (M)[AC]
+reload UI slices=16, max=94068 ns (M)[AC]
 savectl reload UI construction yields bounded slices: ok
-reload anonymous ownership delta=1290240 bytes (M)[AC], bound=2097152 bytes (G)
+reload anonymous ownership delta=1294336 bytes (M)[AC], bound=2097152 bytes (G)
 savectl reload mapping budget/overlapping snapshots: ok
 savectl destroy ignores unrelated reused work slot: ok
 savectl undo clean identity/branch/eviction/save cutoff: ok
@@ -700,12 +746,40 @@ SUITE scroll_test exit=0
 == startup_test
 startup measurement stamp (M)[bat]: BAT0=Discharging; origin=headless open harness; ms=ns/1000000 (SI)
 sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
-startup_test: FAIL poll(&ready, 1, 0) == 0
-startup_test: FAIL held_case(false) == 0
-SUITE startup_test exit=1
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=70969873323881 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=70969877098777 elapsed_ms=3.774896
+  egl_probe_end        ns=70969878308157 elapsed_ms=4.984276
+  raster_fallback      ns=70969876533054 elapsed_ms=3.209173
+  font_atlas_ready     ns=70969874094743 elapsed_ms=0.770862
+  file_prefix_read     ns=70969877256424 elapsed_ms=3.932543
+  first_layout         ns=70969877636324 elapsed_ms=4.312443
+  first_submit         ns=70969877926752 elapsed_ms=4.602871
+  first_present        ns=70969877932940 elapsed_ms=4.609059
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=ASan-inert
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=70969884230063 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=70969886910411 elapsed_ms=2.680348
+  egl_probe_end        ns=70969888152062 elapsed_ms=3.921999
+  raster_fallback      ns=70969886524933 elapsed_ms=2.294870
+  font_atlas_ready     ns=70969884885183 elapsed_ms=0.655120
+  file_prefix_read     ns=70969886953161 elapsed_ms=2.723098
+  first_layout         ns=70969886724671 elapsed_ms=2.494608
+  first_submit         ns=70969887553273 elapsed_ms=3.323210
+  first_present        ns=70969887556911 elapsed_ms=3.326848
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: finish-init runs on worker after bootstrap; typing progresses while finish held; late wake drained
+startup_test: successful probe: text and typing submitted/presented while held; allocations=0 guard=ASan-inert
+startup_test: startup stamps survive frame-ring wrap and round-trip; reset clears them
+SUITE startup_test exit=0
 
 == tabs_test
-tabs_test: census (M)[bat] power=Discharging load1=11.75 tab_control=128 tab_arena=561152 undo_control=42400 history_reserve=819200 replay_reserve=409600 undo_committed=0 combined_reserve=1832480 combined_committed=603680 gate_bytes=1000000(G) reserve=MISS
+tabs_test: census (M)[bat] power=Discharging load1=3.80 tab_control=128 tab_arena=561152 undo_control=42400 history_reserve=819200 replay_reserve=409600 undo_committed=0 combined_reserve=1832480 combined_committed=603680 gate_bytes=1000000(G) reserve=MISS
 tabs_test: sequences vs independent model passed
 tabs_test: UTF-8 strip, clipping, damage and hit testing passed
 tabs_test: errors, bounded eviction and full-capacity reopen passed
@@ -817,14 +891,14 @@ view_test: all passed
 SUITE view_test exit=0
 
 == work_foreground_test
-work_foreground_test: active=index real_bulk_jobs=1 exact_jump=1 elapsed_ns=343983 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=find real_bulk_jobs=1 exact_jump=1 elapsed_ns=3511607 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=save real_bulk_jobs=1 exact_jump=1 elapsed_ns=2658350 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=discovery real_bulk_jobs=1 exact_jump=1 elapsed_ns=400749 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=index real_bulk_jobs=3 exact_jump=1 elapsed_ns=390542 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=find real_bulk_jobs=3 exact_jump=1 elapsed_ns=2490925 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=save real_bulk_jobs=3 exact_jump=1 elapsed_ns=351171 (M)[AC] watchdog_ns=2000000000 (G)
-work_foreground_test: active=discovery real_bulk_jobs=3 exact_jump=1 elapsed_ns=317345 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=index real_bulk_jobs=1 exact_jump=1 elapsed_ns=351785 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=find real_bulk_jobs=1 exact_jump=1 elapsed_ns=329100 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=save real_bulk_jobs=1 exact_jump=1 elapsed_ns=325064 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=discovery real_bulk_jobs=1 exact_jump=1 elapsed_ns=387010 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=index real_bulk_jobs=3 exact_jump=1 elapsed_ns=348475 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=find real_bulk_jobs=3 exact_jump=1 elapsed_ns=324984 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=save real_bulk_jobs=3 exact_jump=1 elapsed_ns=342771 (M)[AC] watchdog_ns=2000000000 (G)
+work_foreground_test: active=discovery real_bulk_jobs=3 exact_jump=1 elapsed_ns=350412 (M)[AC] watchdog_ns=2000000000 (G)
 work_foreground_test: fragmented worker seeks zero/partial/EOF + cancellation suppression checked
 work_foreground_test: running_index_yields fragment_spans_before_reply=64 bound=64 (G) lease_released=1
 work_foreground_test: editor_resident_jump_before_bulk_release checked
@@ -875,12 +949,12 @@ work_test: batch_pending_invalid_full_publication_shutdown ok
 work_test: batch_retired_identities ok
 work_test: batch_mixed_foreground_reserve_cancellation ok
 work_test: dormant_receive_cursor_wrap_order ok
-work_test: P1-1 section4 active=index bulk_jobs=1 foreground_delivered=1 latency_ns=1095542 (M)[AC] watchdog_ns=2000000000 (G)
-work_test: P1-1 section4 active=find bulk_jobs=1 foreground_delivered=1 latency_ns=1096673 (M)[AC] watchdog_ns=2000000000 (G)
-work_test: P1-1 section4 active=save bulk_jobs=1 foreground_delivered=1 latency_ns=22786 (M)[AC] watchdog_ns=2000000000 (G)
-work_test: P1-1 section4 active=index bulk_jobs=3 foreground_delivered=1 latency_ns=1128236 (M)[AC] watchdog_ns=2000000000 (G)
-work_test: P1-1 section4 active=find bulk_jobs=3 foreground_delivered=1 latency_ns=1125571 (M)[AC] watchdog_ns=2000000000 (G)
-work_test: P1-1 section4 active=save bulk_jobs=3 foreground_delivered=1 latency_ns=1119633 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=index bulk_jobs=1 foreground_delivered=1 latency_ns=1074235 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=find bulk_jobs=1 foreground_delivered=1 latency_ns=1067641 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=save bulk_jobs=1 foreground_delivered=1 latency_ns=1071360 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=index bulk_jobs=3 foreground_delivered=1 latency_ns=1063702 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=find bulk_jobs=3 foreground_delivered=1 latency_ns=1068541 (M)[AC] watchdog_ns=2000000000 (G)
+work_test: P1-1 section4 active=save bulk_jobs=3 foreground_delivered=1 latency_ns=1063994 (M)[AC] watchdog_ns=2000000000 (G)
 work_test: P1-1_section4_foreground_latency ok
 work_test: foreground independent_reserves ui_allocations=0 guard_active=0
 work_test: foreground_capacity_batch_lease_allocation ok
@@ -969,22 +1043,22 @@ x11_order_test: FAIL §11 negotiation refusal rejects init
 x11_order_test: FAIL trace init
 AddressSanitizer:DEADLYSIGNAL
 =================================================================
-==717==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x7efb505659db bp 0x7ffc6c951b60 sp 0x7ffc6c951ac0 T0)
-==717==The signal is caused by a READ memory access.
-==717==Hint: address points to the zero page.
-    #0 0x7efb505659db in xcb_send_request_with_fds64 (/lib/x86_64-linux-gnu/libxcb.so.1+0x139db) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
-    #1 0x7efb505662dc in xcb_send_request (/lib/x86_64-linux-gnu/libxcb.so.1+0x142dc) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
-    #2 0x7efb50566ed3 in xcb_map_window (/lib/x86_64-linux-gnu/libxcb.so.1+0x14ed3) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
-    #3 0x6527e31da252 in plat_map /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/../src/x11/x11.c:403:5
-    #4 0x6527e31e3d78 in test_startup_trace /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/x11_order_test.c:627:9
-    #5 0x6527e31e3d78 in main /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/x11_order_test.c:671:59
-    #6 0x7efb5022a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
-    #7 0x7efb5022a28a in __libc_start_main csu/../csu/libc-start.c:360:3
-    #8 0x6527e30f19f4 in _start (/home/tobias/Projects/sublimite/.wt/edit-2ts/build/san/tests/x11_order_test+0x6d9f4) (BuildId: 39c6a1f668d599df71dc1d3d41b7275df73db05f)
+==1246==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x7171fa7139db bp 0x7ffcab6e86a0 sp 0x7ffcab6e8600 T0)
+==1246==The signal is caused by a READ memory access.
+==1246==Hint: address points to the zero page.
+    #0 0x7171fa7139db in xcb_send_request_with_fds64 (/lib/x86_64-linux-gnu/libxcb.so.1+0x139db) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
+    #1 0x7171fa7142dc in xcb_send_request (/lib/x86_64-linux-gnu/libxcb.so.1+0x142dc) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
+    #2 0x7171fa714ed3 in xcb_map_window (/lib/x86_64-linux-gnu/libxcb.so.1+0x14ed3) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040)
+    #3 0x56f01c92a252 in plat_map /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/../src/x11/x11.c:403:5
+    #4 0x56f01c933d78 in test_startup_trace /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/x11_order_test.c:627:9
+    #5 0x56f01c933d78 in main /home/tobias/Projects/sublimite/.wt/edit-2ts/tests/x11_order_test.c:671:59
+    #6 0x7171fa42a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+    #7 0x7171fa42a28a in __libc_start_main csu/../csu/libc-start.c:360:3
+    #8 0x56f01c8419f4 in _start (/home/tobias/Projects/sublimite/.wt/edit-2ts/build/san/tests/x11_order_test+0x6d9f4) (BuildId: 39c6a1f668d599df71dc1d3d41b7275df73db05f)
 
 AddressSanitizer can not provide additional info.
 SUMMARY: AddressSanitizer: SEGV (/lib/x86_64-linux-gnu/libxcb.so.1+0x139db) (BuildId: 16796503bce879b4d9697eb4fada10eeb6af4040) in xcb_send_request_with_fds64
-==717==ABORTING
+==1246==ABORTING
 SUITE x11_order_test exit=1
 
 == x11_stall_test
@@ -1009,21 +1083,21 @@ ok:   --speed=2 rc=0
 test_replay_cli: all passed
 
 == display_lock_contract
-waiting for display :99 (held by 748)
-true: display lock timeout: display :99 (held by 748)
+waiting for display :99 (held by 1277)
+true: display lock timeout: display :99 (held by 1277)
 keyinject: --pairs must be nonzero
-waiting for display :99 (held by 748)
-refwin_test: display lock timeout: display :99 (held by 748)
+waiting for display :99 (held by 1277)
+refwin_test: display lock timeout: display :99 (held by 1277)
 == build/san/tests/x11_identity_test
-waiting for display :99 (held by 748)
-x11_identity_test: display lock timeout: display :99 (held by 748)
+waiting for display :99 (held by 1277)
+x11_identity_test: display lock timeout: display :99 (held by 1277)
 make: *** [Makefile:105: check] Error 1
-waiting for display :99 (held by 748)
-sh: display lock timeout: display :99 (held by 748)
-waiting for display :99 (held by 748)
-sh: display lock timeout: display :99 (held by 748)
-waiting for display :99 (held by 748)
-sh: display lock timeout: display :99 (held by 748)
-waiting for display :99 (held by 748)
-sh: display lock timeout: display :99 (held by 748)
+waiting for display :99 (held by 1277)
+sh: display lock timeout: display :99 (held by 1277)
+waiting for display :99 (held by 1277)
+sh: display lock timeout: display :99 (held by 1277)
+waiting for display :99 (held by 1277)
+sh: display lock timeout: display :99 (held by 1277)
+waiting for display :99 (held by 1277)
+sh: display lock timeout: display :99 (held by 1277)
 display lock contract: owner PID, alias/timeout, make/scripts, nested inheritance, exit status PASS

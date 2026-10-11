@@ -1,31 +1,32 @@
 startup measurement stamp (M)[bat]: BAT0=Discharging; origin=headless open harness; ms=ns/1000000 (SI)
 sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
 startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
-  process_start        ns=69115809687972 elapsed_ms=0.000000
+  process_start        ns=70979384096520 elapsed_ms=0.000000
   display_connect      not recorded
-  egl_probe_start      ns=69115814093743 elapsed_ms=4.405771
-  egl_probe_end        ns=69115817250229 elapsed_ms=7.562257
-  raster_fallback      ns=69115812409319 elapsed_ms=2.721347
-  font_atlas_ready     ns=69115810418957 elapsed_ms=0.730985
-  file_prefix_read     ns=69115813319464 elapsed_ms=3.631492
-  first_layout         ns=69115813445015 elapsed_ms=3.757043
-  first_submit         ns=69115817139179 elapsed_ms=7.451207
-  first_present        ns=69115817140465 elapsed_ms=7.452493
+  egl_probe_start      ns=70979385867656 elapsed_ms=1.771136
+  egl_probe_end        ns=70979386378509 elapsed_ms=2.281989
+  raster_fallback      ns=70979385725350 elapsed_ms=1.628830
+  font_atlas_ready     ns=70979384737464 elapsed_ms=0.640944
+  file_prefix_read     ns=70979386089875 elapsed_ms=1.993355
+  first_layout         ns=70979386216633 elapsed_ms=2.120113
+  first_submit         ns=70979386281951 elapsed_ms=2.185431
+  first_present        ns=70979386282990 elapsed_ms=2.186470
   egl_load_start       not recorded
   egl_load_end         not recorded
 startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=active
 startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
-  process_start        ns=69115827236905 elapsed_ms=0.000000
+  process_start        ns=70979387378906 elapsed_ms=0.000000
   display_connect      not recorded
-  egl_probe_start      ns=69115833770810 elapsed_ms=6.533905
-  egl_probe_end        ns=69115835821421 elapsed_ms=8.584516
-  raster_fallback      ns=69115829222298 elapsed_ms=1.985393
-  font_atlas_ready     ns=69115827981819 elapsed_ms=0.744914
-  file_prefix_read     ns=69115833569374 elapsed_ms=6.332469
-  first_layout         ns=69115833702262 elapsed_ms=6.465357
-  first_submit         ns=69115835222114 elapsed_ms=7.985209
-  first_present        ns=69115835223417 elapsed_ms=7.986512
+  egl_probe_start      ns=70979388754066 elapsed_ms=1.375160
+  egl_probe_end        ns=70979389131078 elapsed_ms=1.752172
+  raster_fallback      ns=70979388654283 elapsed_ms=1.275377
+  font_atlas_ready     ns=70979387868464 elapsed_ms=0.489558
+  file_prefix_read     ns=70979388833969 elapsed_ms=1.455063
+  first_layout         ns=70979388745665 elapsed_ms=1.366759
+  first_submit         ns=70979388963375 elapsed_ms=1.584469
+  first_present        ns=70979388964236 elapsed_ms=1.585330
   egl_load_start       not recorded
   egl_load_end         not recorded
+startup_test: finish-init runs on worker after bootstrap; typing progresses while finish held; late wake drained
 startup_test: successful probe: text and typing submitted/presented while held; allocations=0 guard=active
 startup_test: startup stamps survive frame-ring wrap and round-trip; reset clears them

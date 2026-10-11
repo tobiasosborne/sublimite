@@ -1,0 +1,18 @@
+startup measurement stamp (M)[bat]: BAT0=Discharging; origin=headless open harness; ms=ns/1000000 (SI)
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup_test: FAIL atomic_load(&p.attached)
+startup_test: FAIL held_case(true) == 0
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=70511215088525 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=70511218190166 elapsed_ms=3.101641
+  egl_probe_end        ns=70511219071791 elapsed_ms=3.983266
+  raster_fallback      ns=70511217664220 elapsed_ms=2.575695
+  font_atlas_ready     ns=70511215759706 elapsed_ms=0.671181
+  file_prefix_read     ns=70511218249283 elapsed_ms=3.160758
+  first_layout         ns=70511218524885 elapsed_ms=3.436360
+  first_submit         ns=70511218778569 elapsed_ms=3.690044
+  first_present        ns=70511218783196 elapsed_ms=3.694671
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=ASan-inert
