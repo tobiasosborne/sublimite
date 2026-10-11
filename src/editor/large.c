@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 /* --- helpers ---------------------------------------------------------- */
 static uint64_t estimate_line(const editor_buffer *b, uint64_t byte)
@@ -134,6 +135,123 @@ static void restart_warm(editor_buffer *b)
 }
 
 /* --- estimate -> exact swap ------------------------------------------- */
+/* The view's bounded scanner cannot discover a deep earlier page from the
+ * current viewport seed: that anchor is AFTER its target. Import certified
+ * index anchors before commands instead of replaying the original prefix.
+ * Each exact lookup reads at most LINEIDX_CHUNK; storage was scanned by the
+ * index worker. The fixed view cache owns the results, with no allocation. */
+static void cache_line(editor *e, uint64_t line, uint64_t byte)
+{
+    view *v = &e->v;
+    size_t capacity = sizeof v->lines / sizeof v->lines[0];
+    for (size_t i = 0; i < capacity; i++)
+        if (v->lines[i].valid && v->lines[i].line == line) return;
+    unsigned slot = v->line_next++ % (unsigned)capacity;
+    v->lines[slot].byte = byte; v->lines[slot].line = line; v->lines[slot].valid = true;
+}
+static void seed_line(editor *e, const lineidx_src *src, uint64_t line)
+{
+    view *v = &e->v;
+    size_t capacity = sizeof v->lines / sizeof v->lines[0];
+    for (size_t i = 0; i < capacity; i++)
+        if (v->lines[i].valid && v->lines[i].line == line) return;
+    lineidx_result r = lineidx_line_to_byte(e->buffer->index, src, line);
+    if (r.exact) cache_line(e, line, r.value);
+}
+/* From EOF include its preceding delimiter; from a certified line start
+ * exclude that line's preceding delimiter. Count only the requested rows,
+ * sharing the view scanner's existing byte cap, and fall back to the index
+ * if a long line/page cannot be certified locally. */
+static bool previous_start(editor *e, uint64_t end, uint64_t rows, bool line_start, uint64_t *out)
+{
+    uint8_t bytes[VIEW_WINDOW]; uint64_t left = VIEW_SCAN_BOUND;
+    if (line_start && end) end--;
+    while (end && left) {
+        uint64_t take = end < left ? end : left;
+        if (take > sizeof bytes) take = sizeof bytes;
+        end -= take; left -= take;
+        if (piece_read(e->tree, end, bytes, (size_t)take) ||
+            !lineidx_complete(e->buffer->index)) return false;
+        size_t n = (size_t)take;
+        const uint8_t *nl;
+        while ((nl = memrchr(bytes, '\n', n))) {
+            if (--rows == 0) { *out = end + (uint64_t)(nl - bytes) + 1u; return true; }
+            n = (size_t)(nl - bytes);
+        }
+    }
+    return false;
+}
+static void seed_previous(editor *e, const lineidx_src *src, uint64_t byte, uint64_t line, uint64_t page)
+{
+    uint64_t target = line > page ? line - page : 0, start;
+    if (!target) cache_line(e, 0, 0);
+    else if (previous_start(e, byte, page, true, &start)) cache_line(e, target, start);
+    else seed_line(e, src, target);
+}
+/* Query tags are the view's private Q_BYTE/Q_LINE enum (view/view.c):
+ * Q_BYTE starts at one; Q_LINE is its successor. Preserve the tag itself in
+ * the existing result cache so a pending command resumes its original phase. */
+static void seed_pending_query(editor *e, const lineidx_src *src)
+{
+    view *v = &e->v;
+    enum { BYTE_QUERY = 1, LINE_QUERY = BYTE_QUERY + 1 };
+    if (!view_busy(v) || (v->query_kind != BYTE_QUERY && v->query_kind != LINE_QUERY)) return;
+    lineidx_result r = v->query_kind == BYTE_QUERY ?
+        lineidx_byte_to_line(e->buffer->index, src, v->query_target) :
+        lineidx_line_to_byte(e->buffer->index, src, v->query_target);
+    if (!r.exact) return;
+    size_t capacity = sizeof v->queries / sizeof v->queries[0];
+    unsigned slot = v->query_next++ % (unsigned)capacity;
+    v->queries[slot].kind = v->query_kind;
+    v->queries[slot].target = v->query_target; v->queries[slot].result = r.value;
+    v->query_kind = 0;
+}
+static void seed_navigation(editor *e, editor_buffer *b)
+{
+    if (e->tree != b->tree) return;
+    bool bottom = view_busy(&e->v) && e->v.key == VIEW_DOC_END;
+    bool previous = view_busy(&e->v) && e->v.key == VIEW_PAGE_UP;
+    if (!view_busy(&e->v) && e->queue_count) {
+        const plat_event *ev = &e->queue[e->queue_head];
+        if (ev->kind == PLAT_EV_KEY && ev->press) {
+            bottom = ev->keysym == XKB_KEY_End && (ev->mods & PLAT_MOD_CTRL);
+            previous = ev->keysym == XKB_KEY_Page_Up;
+        }
+    }
+    if (!bottom && !previous) return;
+    lineidx_src src = editor_source(b);
+    uint32_t frame = editor_large_trace_frame(&b->lg);
+    trace_record(TRACE_T1_DEQUEUE, frame);
+    seed_pending_query(e, &src);
+    uint64_t page = e->v.config.rows;
+    if (bottom) {
+        /* The exact total certifies EOF's line number. Find its nearby start
+         * without scanning the remainder of the last sparse-index chunk. */
+        uint64_t last = b->lines - 1u, start = 0;
+        if (!last || previous_start(e, src.len, 1, false, &start)) {
+            cache_line(e, last, start);
+            seed_previous(e, &src, start, last, page);
+        } else {
+            seed_line(e, &src, last);
+            seed_line(e, &src, last > page ? last - page : 0);
+        }
+    } else if (!view_busy(&e->v) && !e->lay.approximate &&
+               !b->lg.top_estimated && e->lay.src == b->tree &&
+               e->v.state.selection.cursor >= e->lay.first_byte &&
+               e->v.state.selection.cursor <= e->lay.pos) {
+        /* A visible cursor's previous page is at/after this earlier anchor.
+         * A visual page crosses no more logical lines than visual rows.
+         * Layout's certified start survives the view's small cache eviction. */
+        seed_previous(e, &src, e->lay.first_byte, e->lay.first_line, page);
+    } else {
+        lineidx_result cursor = lineidx_byte_to_line(b->index, &src, e->v.state.selection.cursor);
+        if (cursor.exact) seed_line(e, &src, cursor.value > page ? cursor.value - page : 0);
+        uint64_t top = e->v.state.first_line;
+        if (!b->lg.top_estimated) seed_line(e, &src, top > page ? top - page : 0);
+    }
+    trace_record(TRACE_T2_MUTATION_DONE, frame);
+}
+
 static void index_progress(editor *e, editor_buffer *b)
 {
     editor_large *lg = &b->lg;
@@ -152,6 +270,7 @@ static void index_progress(editor *e, editor_buffer *b)
      * when activated; never apply an inactive buffer's index to this view. */
     if (b != e->buffer) return;
     if (changed || lg->warm_repaint) e->full_pending = true;
+    seed_navigation(e, b);
     if (view_busy(&e->v)) return;
     if (lg->warm_repaint) {
         lg->warm_repaint = false; e->paint_ready = false; changed = true;

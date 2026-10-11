@@ -2,13 +2,15 @@
  * A ~1.6 MB generated fixture is forced into mmap mode (copy_threshold 4 KiB),
  * so the estimate -> exact swap, find, save and background-worker paths run in
  * `make check`. edit-9yd also reads the 1 GiB log corpus for gutter publication;
- * the large-file timing rows live in bench/editor_large_bench.c. */
+ * edit-2ty additionally asserts trace input-to-submit for the Astra near-end
+ * navigation/typing sequence; broader rows live in bench/editor_large_bench.c. */
 #include "editor/editor.h"
 #include "editor/large.h"
 #include "editor/private.h"
 #include "raster/raster.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "trace/trace_fmt.h"
 #include "file/file_test.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <fcntl.h>
@@ -37,6 +39,8 @@ typedef struct hooks {
     uint32_t estimated_fg, first_exact_frame;
     size_t estimated_frames, exact_frames;
     bool gutter_error;
+    uint32_t submitted_id;
+    uint64_t submit_ns;
     bool complete_on_ingress;
     _Atomic bool *index_release;
 } hooks;
@@ -59,6 +63,7 @@ static void submitted(void *c, const editor_frame *f)
     hooks *h = c;
     if (h->active) { h->allocations += edit_malloc_guard_end(); h->active = false; }
     h->frames++;
+    h->submitted_id = f->id; h->submit_ns = f->submit_ns;
     if (!h->observe) return;
     editor *e = h->observe;
     editor_large_status s = editor_large_status_get(e);
@@ -775,9 +780,170 @@ static int mailbox_yield(void)
     puts("P4-3 section 28: sealed find publication yields behind a saturated mailbox passed"); return 0;
 }
 
+/* edit-2ty: sequence/count from the Astra large-file repro in the bead.
+ * Geometry and setup watchdog reuse mapped_startup_ipc's headless viewport
+ * and step_until's existing watchdog; latency uses EDITOR_SLICE_NS, not a
+ * newly invented timing allowance. Durations are T4 - T0 from the trace ring. */
+static int near_end_repro(bool wrapped)
+{
+    /* The repository's release allocation guard is intentionally inert in
+     * sanitizer builds. Performance is asserted on the production build;
+     * instrumented builds retain byte/state/trace checks and print timings
+     * against the same bound, with no invented sanitizer timing allowance. */
+    bool enforce_latency = edit_malloc_guard_active();
+    trace_reset(); /* no editors/workers are alive at this setup boundary */
+    const char *path = "/tmp/edit-corpus/log_1g.txt";
+    struct stat st; T(stat(path, &st) == 0);
+    T((uint64_t)st.st_size == UINT64_C(1024) * 1024u * 1024u); /* bead fixture: GiB = 1024 cubed */
+    char power[64] = "unavailable";
+    FILE *battery = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (battery) { T(fgets(power, sizeof power, battery)); T(fclose(battery) == 0); }
+    power[strcspn(power, "\n")] = 0;
+    const char *tag = !strcmp(power, "Discharging") ? "[bat]" :
+        !strcmp(power, "unavailable") ? "[unknown]" : "[AC]";
+    printf("edit-2ty mode=%s power=%s (M)%s\n", wrapped ? "file-default-wrap" : "nowrap", power, tag);
+    /* Independent tail oracle: newline bytes read with pread, outside the
+     * timed/guarded action. A single index chunk contains the repro's pages;
+     * assert this property instead of assuming a corpus line width/count. */
+    uint8_t tail[LINEIDX_CHUNK]; uint64_t starts[LINEIDX_CHUNK]; size_t nstarts = 0;
+    T(st.st_size >= (off_t)sizeof tail);
+    uint64_t tail_at = (uint64_t)st.st_size - sizeof tail;
+    int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+    T(pread(fd, tail, sizeof tail, (off_t)tail_at) == (ssize_t)sizeof tail); T(close(fd) == 0);
+    for (size_t i = 0; i < sizeof tail; i++)
+        if (tail[i] == '\n') starts[nstarts++] = tail_at + i + 1u;
+    T(nstarts);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    hooks h = {0};
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = wrapped ? 0 : -1,
+        .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!editor_large_status_get(e).warm_done) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+    }
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    enum { PAGES = 20, ACTIONS = 1 + PAGES + 3 }; /* Ctrl+End + repro pages + Home/End/Z */
+    uint32_t frames[ACTIONS]; size_t count = 0; bool completed = true, timely = true;
+    uint64_t inserted = 0;
+    size_t page = e->v.config.rows;
+    T(nstarts > PAGES * page);
+    uint64_t preferred = (uint64_t)st.st_size - starts[nstarts - 1u];
+    T(editor_view(e).wrap == wrapped);
+    for (unsigned action = 0; action < ACTIONS; action++) {
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true};
+        ev.keysym = action == 0 || action == PAGES + 2 ? XKB_KEY_End :
+            action <= PAGES ? XKB_KEY_Page_Up : action == PAGES + 1 ? XKB_KEY_Home : XKB_KEY_Z;
+        if (!action) ev.mods = PLAT_MOD_CTRL;
+        if (action == ACTIONS - 1) { ev.utf8_len = 1; ev.utf8[0] = 'Z'; inserted = editor_view(e).selection.cursor; }
+        uint64_t before_cursor = editor_view(e).selection.cursor, visual_expected = before_cursor;
+        if (wrapped && action > PAGES && action < ACTIONS - 1u) {
+            layout_wrap_row row; bool approximate = false;
+            T(layout_visual_row(&e->lay, e->tree, before_cursor, 0, &row, &approximate) == LAYOUT_DONE);
+            if (e->v.state.visual_end && row.start == before_cursor && before_cursor)
+                T(layout_visual_row(&e->lay, e->tree, before_cursor, -1, &row, &approximate) == LAYOUT_DONE);
+            T(!approximate);
+            visual_expected = action == PAGES + 1u ? row.start : row.end;
+        }
+        uint64_t sequence = editor_get_stats(e).input_sequence + 1u;
+        ev.t0_ns = trace_now_ns(); T(editor_inject(e, &ev) == 0);
+        deadline = ev.t0_ns + UINT64_C(5000000000); /* existing setup/settle watchdog */
+        while (editor_get_stats(e).submitted_sequence < sequence && trace_now_ns() < deadline)
+            T(editor_step(e, 0) >= 0);
+        if (editor_get_stats(e).submitted_sequence < sequence) {
+            fprintf(stderr, "edit-2ty stalled: action=%u query_pos=%llu query_target=%llu phase=%u (M)%s\n",
+                action, (unsigned long long)e->v.query_pos, (unsigned long long)e->v.query_target, e->v.phase, tag);
+            completed = false; break;
+        }
+        frames[count++] = h.submitted_id;
+        if (h.submit_ns - ev.t0_ns >= EDITOR_SLICE_NS) timely = false;
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        size_t pages = action <= PAGES ? action : PAGES;
+        size_t line = nstarts - 1u - pages * page;
+        uint64_t start = starts[line];
+        uint64_t end = line + 1u < nstarts ? starts[line + 1u] - 1u : (uint64_t)st.st_size;
+        if (end > start && tail[(size_t)(end - tail_at - 1u)] == '\r') end--;
+        uint64_t expected = start + (preferred < end - start ? preferred : end - start);
+        if (!action) expected = (uint64_t)st.st_size;
+        if (action == PAGES + 1u) expected = start;
+        if (action == PAGES + 2u) expected = end;
+        if (action == ACTIONS - 1u) expected = end + 1u;
+        if (wrapped) {
+            if (!action) expected = (uint64_t)st.st_size;
+            else if (action <= PAGES) {
+                T(editor_view(e).selection.cursor < before_cursor);
+                expected = editor_view(e).selection.cursor;
+            } else expected = action == ACTIONS - 1u ? before_cursor + 1u : visual_expected;
+            /* Certify the submitted logical viewport with the independent
+             * tail newline oracle even though the page counts visual rows. */
+            size_t first = 0;
+            while (first < nstarts && starts[first] != editor_view(e).first_byte) first++;
+            T(first < nstarts);
+            T(editor_view(e).first_line == editor_line_count(e) - nstarts + first);
+        }
+        T(editor_view(e).selection.cursor == expected);
+        T(editor_view(e).selection.anchor == expected);
+    }
+    if (completed) {
+        uint8_t ch = 0; T(editor_read(e, inserted, &ch, sizeof ch) == 0 && ch == 'Z');
+        T(editor_length(e) == (uint64_t)st.st_size + sizeof ch);
+    }
+    if (completed && !wrapped) {
+        /* Native event bursts may queue the next page before the current
+         * frame finishes. Verify those commands resume from index anchors. */
+        deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (!editor_index_complete(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_End, .mods = PLAT_MOD_CTRL};
+        uint64_t sequence = editor_get_stats(e).input_sequence + 1u + PAGES;
+        T(editor_inject(e, &ev) == 0);
+        ev.keysym = XKB_KEY_Page_Up; ev.mods = 0;
+        for (unsigned i = 0; i < PAGES; i++) T(editor_inject(e, &ev) == 0);
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+        T(editor_get_stats(e).submitted_sequence == sequence);
+        size_t line = nstarts - 1u - PAGES * page;
+        uint64_t end = starts[line + 1u] - 1u;
+        uint64_t expected = starts[line] + (preferred < end - starts[line] ? preferred : end - starts[line]);
+        T(editor_view(e).selection.cursor == expected);
+    }
+    if (h.active) { h.allocations += edit_malloc_guard_end(); h.active = false; }
+    editor_close(e); /* quiesce workers before dumping their rings */
+    const char *trace_path = wrapped ? "build/edit-2ty-wrap.trace" : "build/edit-2ty.trace";
+    FILE *dump = fopen(trace_path, "wb"); T(dump);
+    T(trace_dump(dump) == 0); T(fclose(dump) == 0);
+    dump = fopen(trace_path, "rb"); T(dump);
+    trace_loaded loaded; T(trace_fmt_load_dump(dump, &loaded) == 0); T(fclose(dump) == 0);
+    bool bounded = completed && timely;
+    for (size_t action = 0; action < count; action++) {
+        uint64_t t0 = UINT64_MAX, t4 = UINT64_MAX;
+        for (size_t i = 0; i < loaded.nrecs; i++) {
+            trace_rec r = loaded.recs[i];
+            if (r.frame_id != frames[action]) continue;
+            if (r.ev == TRACE_T0_INGRESS && r.ns < t0) t0 = r.ns;
+            if (r.ev == TRACE_T4_PRESENT_SUBMITTED && r.ns < t4) t4 = r.ns;
+        }
+        T(t0 != UINT64_MAX && t4 != UINT64_MAX && t4 >= t0);
+        uint64_t ns = t4 - t0;
+        printf("edit-2ty action=%zu %s input_submit_ns=%llu (M)%s=T4-T0 bound_ns=%llu (G)=EDITOR_SLICE_NS gate=%s\n",
+            action, action == 0 ? "Ctrl+End" : action <= PAGES ? "PageUp" :
+            action == PAGES + 1 ? "Home" : action == PAGES + 2 ? "End" : "Z",
+            (unsigned long long)ns, tag, (unsigned long long)EDITOR_SLICE_NS, enforce_latency ? "release" : "TRACK-sanitized");
+        if (ns >= EDITOR_SLICE_NS) bounded = false;
+    }
+    trace_fmt_dump_free(&loaded);
+    printf("edit-2ty typing_path_allocations=%zu (M)%s=counting allocator; required=0 (G)=CLAUDE law 2 guard=%s\n",
+        h.allocations, tag, enforce_latency ? "active" : "ASan-inert (release required)");
+    T(h.allocations == 0); T(completed); T(count == ACTIONS);
+    if (enforce_latency) T(bounded);
+    puts("edit-2ty near-end input/submit: ok"); return 0;
+}
+
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("EDIT_2TY_REPRO")) return near_end_repro(getenv("EDIT_2TY_WRAP") != NULL);
+    T(near_end_repro(false) == 0);
+    T(near_end_repro(true) == 0);
     if (getenv("P4_MAILBOX_YIELD")) return mailbox_yield();
     T(mailbox_yield() == 0);
     if (getenv("P4_COOPERATIVE_JOBS")) return cooperative_large_jobs();
