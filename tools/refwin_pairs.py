@@ -9,11 +9,42 @@ import argparse
 import bisect
 import csv
 import math
+import re
 import struct
 import sys
 from pathlib import Path
 
 FIELDS = "pair_id,target,inject_ns,msc,t4_ns,t5_ns,t6_ns,frame_id,phase_ns,period_ns,actual_phase_ns".split(",")
+TRACE_HEADER = Path(__file__).resolve().parents[1] / "src/trace/trace.h"
+
+
+def read_event_ids(path):
+    # src/trace/trace.h's enum trace_ev is the source of dump event IDs.
+    # Parse implicit increments and explicit C integer literals so appended
+    # events (including sparse IDs) need no matching change in this tool.
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(encoding="ascii"), flags=re.S)
+    enum = re.search(r"\benum\s+trace_ev\s*\{([^}]*)\}", source, re.S)
+    if not enum:
+        raise ValueError(f"{path}: missing enum trace_ev")
+    events, value = {}, -1
+    for entry in enum[1].split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        item = re.fullmatch(r"(TRACE_\w+)(?:\s*=\s*(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[uUlL]*)?", entry)
+        if not item:
+            raise ValueError(f"{path}: unsupported trace event declaration: {entry}")
+        if item[2] is None:
+            value += 1
+        else:
+            literal = item[2]
+            base = 16 if literal.lower().startswith("0x") else (8 if literal.startswith("0") else 10)
+            value = int(literal, base)
+        events[item[1]] = value
+    if "TRACE_EV_COUNT" not in events:
+        raise ValueError(f"{path}: missing TRACE_EV_COUNT")
+    del events["TRACE_EV_COUNT"]  # Sentinel, never a valid recorded event.
+    return events
 
 
 def read_rows(path):
@@ -37,6 +68,10 @@ def read_rows(path):
 def read_trace(path):
     # The repository's native little-endian x86 EDTRACE1 contract, timing rings
     # only. Ignore the optional INPT tail; it does not supply frame identity.
+    events = read_event_ids(TRACE_HEADER)
+    valid_events = set(events.values())
+    paired_events = {events[name] for name in ("TRACE_T1_DEQUEUE", "TRACE_T4_PRESENT_SUBMITTED",
+                                              "TRACE_T5_DEVICE_DONE", "TRACE_T6_PRESENT_COMPLETE")}
     with open(path, "rb") as source:
         def take(size):
             data = source.read(size)
@@ -55,9 +90,9 @@ def read_trace(path):
             seen.add(ring)
             for _ in range(count):
                 ns, frame, event, thread = struct.unpack("<QIHH", take(16))
-                if thread != ring or event > 6 or not ns:
+                if thread != ring or event not in valid_events or not ns:
                     raise ValueError(f"{path}: invalid trace record")
-                if frame:
+                if frame and event in paired_events:
                     frames.setdefault(frame, {}).setdefault(event, []).append(ns)
     return frames
 
