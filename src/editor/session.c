@@ -43,8 +43,6 @@ struct editor_session {
 };
 static void put64(uint8_t *p, uint64_t value)
 { for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(value >> (8u * i)); }
-static void put32(uint8_t *p, uint32_t value)
-{ for (unsigned i = 0; i < 4; i++) p[i] = (uint8_t)(value >> (8u * i)); }
 static void base_copy(journal_base *dst, const journal_base *src)
 {
     *dst = *src;
@@ -199,9 +197,8 @@ static int encode_leaf(session_capture *c, session_node *n)
             off += take; bytes += take; len -= take;
         }
     }
-    data = record(c, JOURNAL_VIEW, b->id, 32); if (!data) return JOURNAL_NOMEM;
-    put64(data, n->view.selection.cursor); put64(data + 8, n->view.selection.anchor);
-    put64(data + 16, n->view.first_byte); put64(data + 24, n->view.hscroll);
+    data = record(c, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!data) return JOURNAL_NOMEM;
+    editor_encode_view(n->view, data);
     return 0;
 }
 static int encode_tree(session_capture *c, session_node *n, uint64_t *ids, size_t *count, size_t *active)
@@ -237,9 +234,10 @@ static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint
     }
     free(ids);
     if (!rc) {
-        uint8_t *data = record(c, JOURNAL_WINDOW, 0, 8);
+        uint8_t *data = record(c, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES);
+        journal_window w = {c->width, c->height, JOURNAL_WINDOW_CHOSEN};
         if (!data) rc = JOURNAL_NOMEM;
-        else { put32(data, c->width); put32(data + 4, c->height); }
+        else journal_encode_window(&w, data);
     }
     if (!rc) {
         /* Selected previous identity is frozen in the pinned graph. */
@@ -298,8 +296,8 @@ static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finis
     editor_session *s = e->session; session_capture *c = &s->capture;
     *c = (session_capture){.owner = s, .root = s->root, .selected = b,
         .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
-        .request_ns = request_ns, .width = e->grid.dims.cols * e->grid.dims.cell_w,
-        .height = e->grid.dims.rows * e->grid.dims.cell_h, .finish = finish};
+        .request_ns = request_ns, .width = e->font.window_width,
+        .height = e->font.window_height, .finish = finish};
     pthread_mutex_lock(&s->mutex); c->root->refs++;
     c->snapshot = piece_snapshot_retain(leaf_at(s, b->session_slot)->snapshot);
     pthread_mutex_unlock(&s->mutex);

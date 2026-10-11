@@ -48,7 +48,7 @@ typedef struct editor_buffer {
     size_t save_cursor;
     bool save_tracking;
     journal_base base;
-    journal_view journal_view_state;
+    journal_view_state journal_view_state;
     bool journal_view_valid;
     lineidx *index;
     editor_delta *history;
@@ -263,6 +263,10 @@ int editor_resize_grid(editor *e, render_dims dims);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
 int editor_journal_metadata(editor *e);
+/* Journal an applied action without waiting for a frame or durability credit. */
+int editor_journal_changed(editor *e);
+void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES]);
+int editor_resize_now(editor *e, uint32_t width, uint32_t height);
 bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);
 int editor_handle_wheel(editor *e, const plat_event *ev);

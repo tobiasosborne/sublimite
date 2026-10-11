@@ -1121,7 +1121,8 @@ static int schema_test(bool parser)
         CHECK(journal_set_window(j,1,1)==0 && journal_set_tabs(j,NULL,0,0)==0 && journal_flush(j)==0);
         uint8_t bytes[4096]; int fd=open(path,O_RDONLY); CHECK(fd>=0 && read(fd,bytes,sizeof bytes)==sizeof bytes); close(fd);
         for(unsigned which=0;which<2;which++) {
-            uint8_t copy[4096]; memcpy(copy,bytes,sizeof copy); size_t start=which?40:0, len=which?48:40;
+            uint8_t copy[4096]; memcpy(copy,bytes,sizeof copy); /* header 32 + WINDOW v2 payload, then TABS 32 + 16 */
+            size_t window_len=JOURNAL_HEADER+JOURNAL_WINDOW_BYTES, start=which?window_len:0, len=which?48:window_len;
             copy[start+24]=99; repair_crc(copy+start,len);
             model m={0}; journal_replay_result rr;
             CHECK(journal_replay_bytes(copy,sizeof copy,apply,&m,&rr)==0);
@@ -1861,8 +1862,80 @@ static int empty_placeholder_test(void)
     puts("journal_test: empty placeholder cleanup preserves nonempty/replacement inodes; mode 0600 and legacy empty close passed");
     return 0;
 }
+/* VIEW wire widths derive from the public schema's uint64_t fields. Field
+ * values are distinct consecutive ordinals so offset mix-ups cannot alias. */
+static int full_view_visit(void *ctx, const journal_record *r)
+{ return journal_decode_view_state(r, ctx); }
+static int full_view_schema(void)
+{
+    uint64_t ordinal = 0;
+    journal_view_state expected = {.position = {++ordinal, 0, 0, 0}};
+    expected.position.anchor = ++ordinal; expected.position.scroll_byte = ++ordinal;
+    expected.position.scroll_x = ++ordinal; expected.preferred_col = ++ordinal;
+    expected.first_line = ++ordinal; expected.visual_byte = ++ordinal;
+    expected.flags = JOURNAL_VIEW_WRAP | JOURNAL_VIEW_APPROXIMATE | JOURNAL_VIEW_VISUAL_END;
+    uint8_t bytes[JOURNAL_VIEW_STATE_BYTES]; journal_encode_view_state(&expected, bytes);
+    journal_record r = {JOURNAL_VIEW, expected.position.cursor, 0, bytes, sizeof bytes};
+    journal_view_state actual;
+    CHECK(journal_decode_view_state(&r, &actual) == JOURNAL_OK && !memcmp(&expected, &actual, sizeof expected));
+    r.size = sizeof(journal_view);
+    CHECK(journal_decode_view_state(&r, &actual) == JOURNAL_OK);
+    CHECK(!memcmp(&actual.position, &expected.position, sizeof actual.position));
+    CHECK(actual.preferred_col == UINT64_MAX && actual.visual_byte == expected.position.scroll_byte && !actual.flags);
+    r.size = sizeof bytes - 1u; CHECK(journal_decode_view_state(&r, &actual) == JOURNAL_INVALID);
+    r.size = sizeof bytes; bytes[sizeof bytes - 1u] = UINT8_MAX;
+    CHECK(journal_decode_view_state(&r, &actual) == JOURNAL_INVALID);
+    char path[] = "/tmp/journal-full-view-XXXXXX"; int fd = mkstemp(path); CHECK(fd >= 0); close(fd);
+    work_pool pool; CHECK(work_pool_init(&pool, 1, 0) == 0); journal *j = NULL;
+    CHECK(journal_open(&j, path, &pool, NULL) == JOURNAL_OK);
+    CHECK(journal_append(j, r.type, r.buffer_id, bytes, sizeof bytes) == JOURNAL_INVALID);
+    journal_encode_view_state(&expected, bytes);
+    CHECK(journal_append(j, r.type, r.buffer_id, bytes, sizeof bytes) == JOURNAL_OK);
+    CHECK(journal_flush(j) == JOURNAL_OK);
+    journal_replay_result replayed;
+    CHECK(journal_replay_file(path, full_view_visit, &actual, &replayed) == JOURNAL_OK && !replayed.corrupt);
+    CHECK(!memcmp(&expected, &actual, sizeof expected));
+    CHECK(journal_rotate(j, &r, 1) == JOURNAL_OK);
+    CHECK(journal_replay_file(path, full_view_visit, &actual, &replayed) == JOURNAL_OK && !replayed.corrupt);
+    CHECK(!memcmp(&expected, &actual, sizeof expected));
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: full VIEW roundtrip/rotation, legacy defaults, invalid lengths/flags passed"); return 0;
+}
+/* edit-457.8 WINDOW v2 (G, wire schema): width32 height32 flags32. An
+ * 8-byte legacy record decodes with no chosen size; set_window writes v2. */
+static int window_visit(void *ctx, const journal_record *r)
+{ return r->type == JOURNAL_WINDOW ? journal_decode_window(r, ctx) : 0; }
+static int window_schema(void)
+{
+    journal_window expected = {1373, 911, JOURNAL_WINDOW_CHOSEN}, actual;
+    uint8_t bytes[JOURNAL_WINDOW_BYTES]; journal_encode_window(&expected, bytes);
+    journal_record r = {JOURNAL_WINDOW, 0, 0, bytes, sizeof bytes};
+    CHECK(journal_decode_window(&r, &actual) == JOURNAL_OK && !memcmp(&expected, &actual, sizeof expected));
+    r.size = JOURNAL_WINDOW_LEGACY_BYTES;
+    CHECK(journal_decode_window(&r, &actual) == JOURNAL_OK);
+    CHECK(actual.width == expected.width && actual.height == expected.height && !(actual.flags & JOURNAL_WINDOW_CHOSEN));
+    r.size = sizeof bytes - 1u; CHECK(journal_decode_window(&r, &actual) == JOURNAL_INVALID);
+    r.size = sizeof bytes; bytes[8] = 2u; /* unknown flag bit */
+    CHECK(journal_decode_window(&r, &actual) == JOURNAL_INVALID);
+    char path[] = "/tmp/journal-window-XXXXXX"; int fd = mkstemp(path); CHECK(fd >= 0); close(fd);
+    work_pool pool; CHECK(work_pool_init(&pool, 1, 0) == 0); journal *j = NULL;
+    CHECK(journal_open(&j, path, &pool, NULL) == JOURNAL_OK);
+    CHECK(journal_append(j, JOURNAL_WINDOW, 0, bytes, sizeof bytes) == JOURNAL_INVALID);
+    CHECK(journal_append(j, JOURNAL_WINDOW, 0, bytes, JOURNAL_WINDOW_LEGACY_BYTES) == JOURNAL_OK);
+    CHECK(journal_flush(j) == JOURNAL_OK);
+    journal_replay_result replayed;
+    CHECK(journal_replay_file(path, window_visit, &actual, &replayed) == JOURNAL_OK && !replayed.corrupt);
+    CHECK(actual.width == expected.width && !(actual.flags & JOURNAL_WINDOW_CHOSEN));
+    CHECK(journal_set_window(j, expected.width, expected.height) == JOURNAL_OK && journal_flush(j) == JOURNAL_OK);
+    CHECK(journal_replay_file(path, window_visit, &actual, &replayed) == JOURNAL_OK && !replayed.corrupt);
+    CHECK(!memcmp(&expected, &actual, sizeof expected));
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    return 0;
+}
 int main(int argc, char **argv)
 {
+    CHECK(full_view_schema() == 0);
+    CHECK(window_schema() == 0);
     if(argc==1) CHECK(empty_placeholder_test()==0);
     if(argc==1) CHECK(ck4_generation_test()==0);
     if(argc==2) {

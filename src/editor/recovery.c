@@ -18,7 +18,8 @@ typedef struct recovered_buffer {
     uint8_t *bytes;
     size_t len;
     char target[IPC_PATH_CAP];
-    journal_view view;
+    journal_view_state view;
+    bool full_view;
     editor_buffer *installed;
     bool save_pending;
     char retained[IPC_PATH_CAP];
@@ -29,6 +30,7 @@ typedef struct recovered_session {
     size_t count, active;
     bool tabs_valid;
     uint32_t width, height;
+    bool window_chosen; /* WINDOW v2 with JOURNAL_WINDOW_CHOSEN */
 } recovered_session;
 static uint64_t get64(const uint8_t *p)
 {
@@ -62,7 +64,11 @@ static int restore_record(void *ctx, const journal_record *r)
         for (size_t i = 0; i < count; i++) tabs[i] = get64(p + 16 + i * 8);
         free(s->tabs); s->tabs = tabs; s->count = count; s->active = (size_t)get64(p + 8); s->tabs_valid = true; return 0;
     }
-    if (r->type == JOURNAL_WINDOW) { s->width = get32(p); s->height = get32(p + 4); return 0; }
+    if (r->type == JOURNAL_WINDOW) {
+        journal_window w; int rc = journal_decode_window(r, &w); if (rc) return rc;
+        s->width = w.width; s->height = w.height; s->window_chosen = (w.flags & JOURNAL_WINDOW_CHOSEN) != 0;
+        return 0;
+    }
     if (r->type == JOURNAL_SAVE) {
         recovered_buffer *owner = find(s, r->buffer_id);
         if (owner) owner->save_pending = get32(p + 8) == 1; /* journal's PREPARED wire phase */
@@ -97,7 +103,8 @@ static int restore_record(void *ctx, const journal_record *r)
     if (!b) return JOURNAL_INVALID;
     if (r->type == JOURNAL_TARGET) { strcpy(b->target, (const char *)p); return 0; }
     if (r->type == JOURNAL_VIEW) {
-        b->view = (journal_view){get64(p), get64(p + 8), get64(p + 16), get64(p + 24)}; return 0;
+        b->full_view = r->size == JOURNAL_VIEW_STATE_BYTES;
+        return journal_decode_view_state(r, &b->view);
     }
     uint64_t off = get64(p);
     if (off > b->len) return JOURNAL_INVALID;
@@ -158,11 +165,19 @@ static int install_buffer(editor *e, recovered_buffer *r)
     if (rc) return EDITOR_ERR_MEMORY;
     b->index_dirty = true;
     view_state state = b->initial;
-    state.selection.cursor = r->view.cursor > r->len ? r->len : r->view.cursor;
-    state.selection.anchor = r->view.anchor > r->len ? r->len : r->view.anchor;
-    state.first_byte = r->view.scroll_byte > r->len ? r->len : r->view.scroll_byte;
+    state.selection.cursor = r->view.position.cursor > r->len ? r->len : r->view.position.cursor;
+    state.selection.anchor = r->view.position.anchor > r->len ? r->len : r->view.position.anchor;
+    state.first_byte = r->view.position.scroll_byte > r->len ? r->len : r->view.position.scroll_byte;
     state.first_line = piece_byte_to_line(b->tree, state.first_byte);
-    state.visual_byte = state.first_byte; state.hscroll = r->view.scroll_x;
+    state.visual_byte = state.first_byte; state.hscroll = r->view.position.scroll_x;
+    if (r->full_view) {
+        state.selection.preferred_col = r->view.preferred_col;
+        state.first_line = r->view.first_line;
+        state.visual_byte = r->view.visual_byte; /* unused unwrapped value may outlive a deletion */
+        state.wrap = (r->view.flags & JOURNAL_VIEW_WRAP) != 0;
+        state.approximate = (r->view.flags & JOURNAL_VIEW_APPROXIMATE) != 0;
+        state.visual_end = (r->view.flags & JOURNAL_VIEW_VISUAL_END) != 0;
+    }
     b->initial = state; e->v.state = state;
     e->tabs.slots[e->tabs.active].state = state;
     (void)tabs_set_modified(&e->tabs, tabs_active_index(&e->tabs), !clean);
@@ -173,7 +188,16 @@ static int install_session(editor *e, recovered_session *s)
     uint64_t threshold = e->cfg.copy_threshold;
     e->cfg.copy_threshold = UINT64_MAX; e->recovering = true;
     journal *log = e->journal; e->journal = NULL;
-    int rc = 0;
+    /* Policy (edit-a6v + edit-457.8): explicit launch size > journalled chosen
+     * size (WINDOW v2) > the DPI default already in font.window_*. Legacy
+     * 8-byte records carry older builds' grid pixels, not a chosen size.
+     * The native window is created after this from font.window_*. */
+    bool launch = !e->cfg.window_size_default;
+    uint32_t width = launch && e->cfg.window_width ? e->cfg.window_width :
+        s->window_chosen ? s->width : e->font.window_width;
+    uint32_t height = launch && e->cfg.window_height ? e->cfg.window_height :
+        s->window_chosen ? s->height : e->font.window_height;
+    int rc = s->width && s->height ? editor_resize_now(e, width, height) : 0;
     /* Live order is authoritative. Keep other journalled buffers as retained
      * closed tabs so unrelated recovery content survives the new checkpoint. */
     for (size_t i = 0; !rc && i < s->count; i++) {
@@ -186,9 +210,6 @@ static int install_session(editor *e, recovered_session *s)
         if (!rc && s->tabs_valid) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
     if (!rc && s->count) rc = editor_select_tab(e, s->active);
-    if (!rc && s->width && s->height) {
-        e->resize_w = s->width; e->resize_h = s->height; e->resize_pending = true;
-    }
     e->cfg.copy_threshold = threshold; e->journal = log; e->recovering = false;
     /* BASE was acquired while journal temporarily disabled. Derive it from the
      * opened generation off-path before publishing the recovered checkpoint. */

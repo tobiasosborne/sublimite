@@ -194,6 +194,27 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = editor_buffer_prepare(e, NULL, NULL, 0, &e->empty); if (rc) goto fail;
     e->buffer = e->empty; e->tree = e->empty->tree; e->undo = &e->empty->undo;
     view_config vc = {4, td.rows, td.cols > 2 ? td.cols - 2 : 1, NULL, NULL}; view_init(&e->v, e->tree, &vc);
+    if (config->journal_path) {
+        if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        e->journal_pool_ready = true;
+        rc = add_poll_fd(e, work_pool_eventfd(&e->journal_pool)); if (rc) goto fail;
+        rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL);
+        if (rc == JOURNAL_INVALID) {
+            struct stat st;
+            if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0) {
+                rc = journal_open_checkpoint(&e->journal, config->journal_path, &e->journal_pool, NULL);
+                if (!rc) e->recover_existing = true;
+            }
+        }
+        if (rc) goto fail;
+        journal_set_message_handler(e->journal, editor_route_work, e);
+    }
+    if (config->journal_path) {
+        e->recovering = true; /* failed startup teardown must preserve its source */
+        rc = editor_session_restore(e); if (rc) goto fail;
+        e->recovering = false;
+    }
+    dims = e->grid.dims;
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
         plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, e->poll_fd, 0};
         rc = plat_init(&e->platform, &pc); if (rc) goto fail;
@@ -219,35 +240,6 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (rc) goto fail;
     if (e->has_platform && (backend->info.capabilities & RENDER_CAP_RASTER_POOL)) {
         rc = plat_set_present_events(&e->platform, false); if (rc) goto fail;
-    }
-    if (config->journal_path) {
-        if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
-        e->journal_pool_ready = true;
-        rc = add_poll_fd(e, work_pool_eventfd(&e->journal_pool)); if (rc) goto fail;
-        rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL);
-        if (rc == JOURNAL_INVALID) {
-            struct stat st;
-            if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0) {
-                rc = journal_open_checkpoint(&e->journal, config->journal_path, &e->journal_pool, NULL);
-                if (!rc) e->recover_existing = true;
-            }
-        }
-        if (rc) goto fail;
-        journal_set_message_handler(e->journal, editor_route_work, e);
-    }
-    if (config->journal_path) {
-        e->recovering = true; /* failed startup teardown must preserve its source */
-        rc = editor_session_restore(e); if (rc) goto fail;
-        e->recovering = false;
-        /* Recovery can queue the previous session's pixel geometry. Explicit
-         * launch extents already size the native window, grid and backend;
-         * do not shrink only the painted surface to that historical size. */
-        if (e->resize_pending) {
-            if (config->window_width) e->resize_w = e->font.window_width;
-            if (config->window_height) e->resize_h = e->font.window_height;
-            if (e->resize_w == e->font.window_width && e->resize_h == e->font.window_height)
-                e->resize_pending = false;
-        }
     }
     if (!config->start_empty && !tabs_count(&e->tabs)) {
         uint64_t id; rc = editor_add_buffer(e, config->path, config->initial, config->initial_len, &id);

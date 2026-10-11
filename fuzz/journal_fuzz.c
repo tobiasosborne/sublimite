@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 typedef struct fuzz_model { uint8_t bytes[4096]; size_t size, edits; piece_tree *tree;
-    journal_view views[2]; uint64_t view_ids[2], tab_ids[3], active, tab_count;
+    journal_view views[2]; journal_view_state full_views[2]; uint64_t view_ids[2], tab_ids[3], active, tab_count;
     uint32_t width, height; unsigned view_count, tabs, windows;
 } fuzz_model;
 static uint64_t read64(const uint8_t *p)
@@ -17,6 +17,7 @@ static int apply(void *ctx, const journal_record *r)
         if(m->view_count>=2) return 1;
         size_t i=m->view_count++;
         m->views[i]=(journal_view){read64(r->data),read64(r->data+8),read64(r->data+16),read64(r->data+24)};
+        EDIT_ASSERT(journal_decode_view_state(r,&m->full_views[i])==JOURNAL_OK);
         m->view_ids[i]=r->buffer_id; return 0;
     }
     if(r->type==JOURNAL_TABS) {
@@ -48,7 +49,8 @@ static int apply(void *ctx, const journal_record *r)
 static bool session_equal(const fuzz_model *a, const fuzz_model *b)
 {
     return a->view_count==b->view_count && a->tabs==b->tabs && a->windows==b->windows &&
-        !memcmp(a->views,b->views,sizeof a->views) && !memcmp(a->view_ids,b->view_ids,sizeof a->view_ids) &&
+        !memcmp(a->views,b->views,sizeof a->views) &&
+        !memcmp(a->full_views,b->full_views,sizeof a->full_views) && !memcmp(a->view_ids,b->view_ids,sizeof a->view_ids) &&
         !memcmp(a->tab_ids,b->tab_ids,sizeof a->tab_ids) && a->active==b->active && a->tab_count==b->tab_count &&
         a->width==b->width && a->height==b->height;
 }
@@ -115,8 +117,6 @@ static int fuzz_sync(void *ctx, int fd, bool directory)
 
 static void write64(uint8_t *p, uint64_t value)
 { for(unsigned k=0;k<8;k++) p[k]=(uint8_t)(value>>(k*8)); }
-static void write32(uint8_t *p, uint32_t value)
-{ for(unsigned k=0;k<4;k++) p[k]=(uint8_t)(value>>(k*8)); }
 static void fuzz_sessions(const uint8_t *data, size_t size)
 {
     if(size<5 || (data[0]&15u)!=7u) return;
@@ -129,21 +129,38 @@ static void fuzz_sessions(const uint8_t *data, size_t size)
         {3,(uint64_t)data[3]+619,(uint64_t)data[4]*4096+9,41}},
         .view_ids={101,503},.tab_ids={101,503,909},.active=1u+data[4]%2u,.tab_count=3,
         .width=701u+data[1],.height=503u+data[2],.view_count=2,.tabs=1,.windows=1};
-    EDIT_ASSERT(journal_set_view(j,101,&expected.views[0])==0 && journal_set_view(j,503,&expected.views[1])==0);
+    /* (G, wire schema) full VIEW uses eight uint64_t fields; fuzz both lengths
+     * and every extended field, including all combinations of defined flags. */
+    uint8_t views[2][JOURNAL_VIEW_STATE_BYTES], tabs[40], window[JOURNAL_WINDOW_BYTES];
+    size_t view_size=(data[1]&1u)?JOURNAL_VIEW_STATE_BYTES:sizeof(journal_view);
+    for(unsigned i=0;i<2;i++) {
+        expected.full_views[i]=(journal_view_state){.position=expected.views[i],
+            .preferred_col=UINT64_MAX,.visual_byte=expected.views[i].scroll_byte};
+        if(view_size==JOURNAL_VIEW_STATE_BYTES) {
+            expected.full_views[i].preferred_col=data[i+1];
+            expected.full_views[i].first_line=data[i+2];
+            expected.full_views[i].visual_byte=data[i+3];
+            expected.full_views[i].flags=data[(i+4u)%size] &
+                (JOURNAL_VIEW_WRAP | JOURNAL_VIEW_APPROXIMATE | JOURNAL_VIEW_VISUAL_END);
+        }
+        journal_encode_view_state(&expected.full_views[i],views[i]);
+        EDIT_ASSERT(journal_append(j,JOURNAL_VIEW,expected.view_ids[i],views[i],view_size)==0);
+    }
     EDIT_ASSERT(journal_set_tabs(j,expected.tab_ids,3,expected.active)==0 && journal_set_window(j,expected.width,expected.height)==0);
     EDIT_ASSERT(journal_flush(j)==0);
     fuzz_model actual={0}; journal_replay_result rr;
     EDIT_ASSERT(journal_replay_file(path,apply,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));
-    uint8_t views[2][32], tabs[40], window[8];
-    for(unsigned i=0;i<2;i++) {
-        write64(views[i],expected.views[i].cursor); write64(views[i]+8,expected.views[i].anchor);
-        write64(views[i]+16,expected.views[i].scroll_byte); write64(views[i]+24,expected.views[i].scroll_x);
-    }
     write64(tabs,3); write64(tabs+8,expected.active);
     for(unsigned i=0;i<3;i++) write64(tabs+16+8*i,expected.tab_ids[i]);
-    write32(window,expected.width); write32(window+4,expected.height);
-    journal_record cp[]={{JOURNAL_VIEW,101,0,views[0],32},{JOURNAL_VIEW,503,0,views[1],32},
-        {JOURNAL_TABS,0,0,tabs,40},{JOURNAL_WINDOW,0,0,window,8}};
+    /* WINDOW v2 (12 bytes, chosen flag) and legacy (8 bytes) both replay. */
+    journal_window w={expected.width,expected.height,JOURNAL_WINDOW_CHOSEN}, decoded;
+    journal_encode_window(&w,window);
+    size_t window_size=(data[1]&2u)?JOURNAL_WINDOW_BYTES:JOURNAL_WINDOW_LEGACY_BYTES;
+    journal_record window_record={JOURNAL_WINDOW,0,0,window,window_size};
+    EDIT_ASSERT(journal_decode_window(&window_record,&decoded)==0 && decoded.width==w.width && decoded.height==w.height &&
+        decoded.flags==(window_size==JOURNAL_WINDOW_BYTES?JOURNAL_WINDOW_CHOSEN:0u));
+    journal_record cp[]={{JOURNAL_VIEW,101,0,views[0],view_size},{JOURNAL_VIEW,503,0,views[1],view_size},
+        {JOURNAL_TABS,0,0,tabs,40},window_record};
     EDIT_ASSERT(journal_rotate(j,cp,4)==0); journal_close(j);
     actual=(fuzz_model){0};
     EDIT_ASSERT(journal_replay_file(path,apply,&actual,&rr)==0 && !rr.corrupt && session_equal(&actual,&expected));

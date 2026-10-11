@@ -94,6 +94,7 @@ int main(int argc, char **argv)
         config.max_window_height = display_size.work_height;
         editor_runtime_window(display_size.work_width, display_size.work_height,
                               &config.window_width, &config.window_height);
+        config.window_size_default = true; /* hot exit restores the last window size */
         const char *point_size = getenv("EDIT_FONT_SIZE_PT");
         if (point_size) {
             char *tail = NULL; double points = strtod(point_size, &tail);

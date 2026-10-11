@@ -895,7 +895,7 @@ static int checkpoint_replay(void *ctx, const journal_record *r)
         return 0;
     }
     if (r->type == JOURNAL_VIEW) {
-        if (r->size != 32 || le64(r->data) != 1 || le64(r->data + 8) != 1 ||
+        if (r->size != JOURNAL_VIEW_STATE_BYTES || le64(r->data) != 1 || le64(r->data + 8) != 1 ||
             le64(r->data + 16) != 0 || le64(r->data + 24) != 0) return 1;
         m->views++; return 0;
     }
@@ -1715,18 +1715,25 @@ static int review_close_flush(void)
 }
 static int review_suite(const char *only)
 {
+    bool headless = only && !strcmp(only, "headless");
     struct { const char *name; int (*fn)(void); } cases[] = {
         {"p4-40", review_chrome_damage}, {"p4-41", review_capture_identity}, {"p4-27", review_replace_accounting}, {"p4-22", review_retired_save}, {"p4-16", review_reload_identity}, {"p4-14", review_prompt_choices}, {"p4-13", review_stale_controls}, {"p4-12", review_pending_controls}, {"p4-11-adopt", review_adoption_error}, {"p4-11", review_local_errors}, {"1", review_native_order}, {"2", review_native_burst}, {"3", review_crash}, {"4", review_suffix}, {"4-exit", review_journal_exit}, {"4-session", review_checkpoint_session}, {"5", review_base_race},
         {"6", review_style}, {"7", review_long_line}, {"8", review_prefix_open}, {"10", review_index_backlog}, {"11-accounting", review_slice_accounting}, {"11-replay", review_replay_slices}, {"12", review_large_undo}, {"15", review_piece_recycling},
         {"13", review_bursts}, {"16", review_source_change}, {"21", review_native_allocations}, {"14", review_fairness}, {"17", review_journal_idle}, {"22", review_replay_atomic}, {"23", review_init}, {"close", review_close_flush}
     };
     int failed = 0;
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
-        if ((!only && strcmp(cases[i].name, "p4-27") && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "8") || !strcmp(cases[i].name, "10") ||
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        /* The regular suite still requires native X and launcher sockets.
+         * Select its remaining cases explicitly for sandbox verification. */
+        if (headless && (!strcmp(cases[i].name, "1") || !strcmp(cases[i].name, "2") ||
+            !strcmp(cases[i].name, "21") || !strcmp(cases[i].name, "close") ||
+            !strcmp(cases[i].name, "p4-16"))) continue;
+        if (((!only || headless) && strcmp(cases[i].name, "p4-27") && (atoi(cases[i].name) <= 7 || !strcmp(cases[i].name, "8") || !strcmp(cases[i].name, "10") ||
             !strcmp(cases[i].name, "11-accounting") || !strcmp(cases[i].name, "11-replay") || !strcmp(cases[i].name, "12") ||
             !strcmp(cases[i].name, "13") || !strcmp(cases[i].name, "16") || !strcmp(cases[i].name, "15") || !strcmp(cases[i].name, "17") ||
             !strcmp(cases[i].name, "21") || !strcmp(cases[i].name, "22") || !strcmp(cases[i].name, "23") || !strcmp(cases[i].name, "close"))) ||
             (only && (!strcmp(only, "all") || !strcmp(only, cases[i].name)))) failed |= cases[i].fn();
+    }
     return failed;
 }
 static int backend_selection(void)
@@ -2537,6 +2544,7 @@ static int clipboard_no_tabs_test(void)
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
         if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
@@ -2573,7 +2581,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
         if (!strcmp(argv[1], "--backend-only")) return selected_backend_test(getenv("EDIT_BACKEND"), false);
         if (!strcmp(argv[1], "--require-gl")) return selected_backend_test("gl", true);
-        return 2;
+        if (!headless) return 2;
     }
     const char *allocation = getenv("EDITOR_ALLOC_ONLY");
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
@@ -2587,20 +2595,26 @@ int main(int argc, char **argv)
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
-    T(review_suite(NULL) == 0);
+    T(review_suite(headless ? "headless" : NULL) == 0);
     T(index_capacity_typing() == 0); T(index_capacity_refusal() == 0); T(index_eventual_repair() == 0);
     T(partial_line_start() == 0);
-    T(backend_selection() == 0); T(backend_fallback() == 0); T(backend_gpu_completion() == 0);
+    T(backend_selection() == 0);
+    T((headless ? backend_fallback_headless() : backend_fallback()) == 0);
+    T(backend_gpu_completion() == 0);
     const char *name = getenv("EDIT_BACKEND");
-    if (name) T(selected_backend_test(name, false) == 0);
-    else { T(selected_backend_test("gl", false) == 0); T(selected_backend_test("raster", false) == 0); }
+    if (!headless) {
+        if (name) T(selected_backend_test(name, false) == 0);
+        else { T(selected_backend_test("gl", false) == 0); T(selected_backend_test("raster", false) == 0); }
+    }
     T(scrolled_undo() == 0);
     T(stopped_error() == 0);
     T(script(false) == 0); T(allocation_test(false) == 0);
-    T(script(true) == 0); T(allocation_test(true) == 0);
-    T(raster_blink_damage() == 0);
+    if (!headless) {
+        T(script(true) == 0); T(allocation_test(true) == 0);
+        T(raster_blink_damage() == 0);
+    }
     T(idle_policy() == 0);
     T(queue_depth() == 0);
-    T(native_input() == 0);
-    puts("editor_test: all passed"); return 0;
+    if (!headless) T(native_input() == 0);
+    puts(headless ? "editor_test: headless passed" : "editor_test: all passed"); return 0;
 }

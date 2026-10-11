@@ -1,19 +1,46 @@
 /* Compile the production entry point here so make check covers it with ASan. */
-#include "editor/editor.h"
+#include "editor/private.h"
 #include "raster/raster.h"
 static int test_backend_select(render_backend *backend, const char *name);
+static int test_editor_open(editor **out, const editor_config *config, render_backend *backend);
 #define editor_backend_select test_backend_select
+#define editor_open test_editor_open
 #define main editor_cli_main
 #include "../src/main.c"
 #undef main
 #undef editor_backend_select
+#undef editor_open
 #include "trace/trace_fmt.h"
 #include <dirent.h>
 #include "ipc_isolation.h"
 #include <signal.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <xcb/xcb.h>
+/* (G, fixture) capture capacity = sizeof the typed marker + original text. */
+typedef struct hot_snapshot {
+    size_t count, active, len;
+    view_state view;
+    uint32_t width, height;
+    uint8_t text[sizeof "xhello\n"];
+} hot_snapshot;
+static int test_editor_open(editor **out, const editor_config *config, render_backend *backend)
+{
+    int rc = editor_open(out, config, backend);
+    const char *descriptor = getenv("CLI_TEST_HOT_SNAPSHOT_FD");
+    if (!rc && descriptor) {
+        editor *e = *out;
+        hot_snapshot s = {.count = editor_get_stats(e).tabs, .active = editor_get_stats(e).active_tab,
+            .len = (size_t)editor_length(e), .view = editor_view(e),
+            .width = e->font.window_width, .height = e->font.window_height};
+        int fd = atoi(descriptor);
+        if (s.len > sizeof s.text || editor_read(e, 0, s.text, s.len) ||
+            write(fd, &s, sizeof s) != (ssize_t)sizeof s) rc = EDITOR_ERR_IO;
+        close(fd);
+    }
+    return rc;
+}
 static int delayed_backend_init(render_backend *backend, const render_config *config)
 {
     struct timespec remaining = {0, 250000000};
@@ -72,11 +99,11 @@ static ipc_result decoy_open(const ipc_request *request, ipc_token token, void *
     unsigned *calls = ctx; ++*calls;
     return IPC_OK;
 }
-static int same_display_handoff(const char *file, ipc_server *decoy)
+static int same_display_handoff(const char *source_path, ipc_server *decoy)
 {
     pid_t child = fork(); if (child < 0) return 1;
     if (!child) {
-        char *args[] = {"sublimite", (char *)file, NULL};
+        char *args[] = {"sublimite", (char *)source_path, NULL};
         _exit(editor_cli_main(2, args));
     }
     unsigned calls = 0; int status = 0; pid_t waited = 0;
@@ -92,7 +119,7 @@ static int same_display_handoff(const char *file, ipc_server *decoy)
     return 0;
 }
 /* 0 = passed, 1 = failed. Display preflight is a required fixture. */
-static int session(const char *file, const char *dump, bool fail_dump, ipc_server *decoy)
+static int session(const char *source_path, const char *dump, bool fail_dump, ipc_server *decoy)
 {
     int result = 1, status = 0;
     unsigned handed_off = 0;
@@ -107,7 +134,7 @@ static int session(const char *file, const char *dump, bool fail_dump, ipc_serve
         /* Deterministic unhealthy-child regression probe. */
         if (getenv("CLI_TEST_CHILD_EXIT")) _exit(23);
         if (getenv("CLI_TEST_CHILD_STOP")) (void)raise(SIGSTOP);
-        char *args[] = {"sublimite", (char *)file, NULL};
+        char *args[] = {"sublimite", (char *)source_path, NULL};
         _exit(editor_cli_main(2, args));
     }
     c = xcb_connect(":99", NULL); T(c && !xcb_connection_has_error(c));
@@ -194,6 +221,155 @@ cleanup:
     if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
     return result;
 }
+/* Replay a live read-only byte image; journal_replay_file may repair its tail
+ * and must never be used while the child is still appending. */
+static uint64_t hot_u64(const uint8_t *p)
+{ uint64_t v = 0; for (unsigned i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8u * i); return v; }
+static int hot_record(void *ctx, const journal_record *r)
+{
+    hot_snapshot *s = ctx; const uint8_t *p = r->data;
+    if (r->type == JOURNAL_BASE) {
+        journal_base base; char path[IPC_PATH_CAP];
+        if (journal_decode_base(r, &base, path, sizeof path) || base.size > sizeof s->text) return 1;
+        s->len = (size_t)base.size;
+        if (s->len) {
+            int fd = open(path, O_RDONLY); if (fd < 0) return 1;
+            ssize_t n = read(fd, s->text, s->len); close(fd);
+            if (n != (ssize_t)s->len) return 1;
+        }
+    } else if (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE) {
+        uint64_t off = hot_u64(p); if (off > s->len) return 1;
+        if (r->type == JOURNAL_INSERT) {
+            size_t n = r->size - sizeof(uint64_t); if (n > sizeof s->text - s->len) return 1;
+            memmove(s->text + off + n, s->text + off, s->len - (size_t)off);
+            memcpy(s->text + off, p + sizeof(uint64_t), n); s->len += n;
+        } else {
+            uint64_t n = hot_u64(p + sizeof(uint64_t)); if (n > s->len - off) return 1;
+            memmove(s->text + off, s->text + off + n, s->len - (size_t)(off + n)); s->len -= (size_t)n;
+        }
+    } else if (r->type == JOURNAL_VIEW) {
+        journal_view_state v; if (journal_decode_view_state(r, &v)) return 1;
+        s->view = (view_state){.selection = {v.position.cursor, v.position.anchor, v.preferred_col},
+            .first_byte = v.position.scroll_byte, .first_line = v.first_line,
+            .hscroll = v.position.scroll_x, .visual_byte = v.visual_byte,
+            .wrap = (v.flags & JOURNAL_VIEW_WRAP) != 0,
+            .approximate = (v.flags & JOURNAL_VIEW_APPROXIMATE) != 0,
+            .visual_end = (v.flags & JOURNAL_VIEW_VISUAL_END) != 0};
+    } else if (r->type == JOURNAL_TABS) {
+        s->count = (size_t)hot_u64(p); s->active = (size_t)hot_u64(p + sizeof(uint64_t));
+    } else if (r->type == JOURNAL_WINDOW) {
+        uint64_t dims = hot_u64(p); s->width = (uint32_t)dims; s->height = (uint32_t)(dims >> 32);
+    }
+    return 0;
+}
+static int hot_image(const char *directory, hot_snapshot *s)
+{
+    DIR *dir = opendir(directory); if (!dir) return 1;
+    struct dirent *entry; int result = 1;
+    while ((entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "session-", strlen("session-")) || strchr(entry->d_name, '.')) continue;
+        int fd = openat(dirfd(dir), entry->d_name, O_RDONLY); if (fd < 0) continue;
+        struct stat st;
+        if (!fstat(fd, &st) && st.st_size > 0 && (uint64_t)st.st_size <= SIZE_MAX) {
+            size_t len = (size_t)st.st_size; uint8_t *bytes = malloc(len);
+            if (bytes) {
+                ssize_t n = read(fd, bytes, len); journal_replay_result rr;
+                *s = (hot_snapshot){0};
+                if (n == (ssize_t)len && !journal_replay_bytes(bytes, len, hot_record, s, &rr)) result = 0;
+                free(bytes);
+            }
+        }
+        close(fd); if (!result) break;
+    }
+    closedir(dir); return result;
+}
+static int hot_exit_cli(const char *source_path, const char *directory)
+{
+    int result = 1, status = 0, pipes[2] = {-1, -1}; pid_t child = -1;
+    xcb_connection_t *c = NULL; xcb_get_geometry_reply_t *geometry = NULL;
+    xcb_get_keyboard_mapping_reply_t *mapping = NULL;
+    T(unsetenv("EDIT_TRACE_DUMP") == 0);
+    c = xcb_connect(":99", NULL); T(c && !xcb_connection_has_error(c));
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data; T(screen);
+    xcb_atom_t pid_atom = intern(c, "_NET_WM_PID");
+    child = fork(); T(child >= 0);
+    if (!child) { char *args[] = {"sublimite", (char *)source_path, NULL}; _exit(editor_cli_main(2, args)); }
+    uint64_t until = trace_now_ns() + EDITOR_IDLE_NS; /* G: existing editor idle watchdog */
+    xcb_window_t window = XCB_WINDOW_NONE;
+    while (!window && trace_now_ns() < until) { window = find_window(c, screen->root, pid_atom, child); if (!window) pause_poll(); }
+    T(window);
+    geometry = xcb_get_geometry_reply(c, xcb_get_geometry(c, window), NULL); T(geometry);
+    /* (G, fixture) shrink to half the existing window plus its rounding pixel. */
+    uint32_t width = geometry->width / 2u + 1u, height = geometry->height / 2u + 1u;
+    free(geometry); geometry = NULL;
+    const uint32_t sizes[] = {width, height};
+    (void)xcb_configure_window(c, window, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, sizes);
+    const xcb_setup_t *setup = xcb_get_setup(c);
+    uint8_t codes = (uint8_t)(setup->max_keycode - setup->min_keycode + 1u);
+    mapping = xcb_get_keyboard_mapping_reply(c, xcb_get_keyboard_mapping(c, setup->min_keycode, codes), NULL); T(mapping);
+    xcb_keysym_t *symbols = xcb_get_keyboard_mapping_keysyms(mapping); uint8_t code = 0;
+    for (unsigned i = 0; i < codes; i++)
+        if (symbols[i * mapping->keysyms_per_keycode] == 'x') { code = (uint8_t)(setup->min_keycode + i); break; }
+    T(code); free(mapping); mapping = NULL;
+    xcb_key_press_event_t typed = {.response_type = XCB_KEY_PRESS, .detail = code,
+        .root = screen->root, .event = window, .same_screen = 1};
+    (void)xcb_send_event(c, 0, window, XCB_EVENT_MASK_KEY_PRESS, (const char *)&typed);
+    typed.response_type = XCB_KEY_RELEASE;
+    (void)xcb_send_event(c, 0, window, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&typed); (void)xcb_flush(c);
+    hot_snapshot before = {0}; bool ready = false;
+    until = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!ready && trace_now_ns() < until) {
+        ready = !hot_image(directory, &before) && before.len == strlen("xhello\n") &&
+            !memcmp(before.text, "xhello\n", before.len) && before.view.selection.cursor == strlen("x") &&
+            before.view.selection.anchor == strlen("x") && before.width == width && before.height == height;
+        if (!ready) pause_poll();
+    }
+    T(ready); T(kill(child, SIGKILL) == 0); T(child_wait(child, &status, 0) == child); child = -1;
+    T(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    T(pipe(pipes) == 0); child = fork(); T(child >= 0);
+    if (!child) {
+        close(pipes[0]); char descriptor[sizeof(int) * 3u + 1u]; /* decimal digits <= bytes * 3 plus NUL */
+        if (snprintf(descriptor, sizeof descriptor, "%d", pipes[1]) <= 0 || setenv("CLI_TEST_HOT_SNAPSHOT_FD", descriptor, 1)) _exit(1);
+        char *args[] = {"sublimite", (char *)source_path, NULL}; _exit(editor_cli_main(2, args));
+    }
+    close(pipes[1]); pipes[1] = -1;
+    struct pollfd snapshot_ready = {.fd = pipes[0], .events = POLLIN};
+    until = trace_now_ns() + EDITOR_IDLE_NS;
+    ready = false;
+    while (!ready && trace_now_ns() < until) {
+        int polled = poll(&snapshot_ready, 1, 0);
+        T(polled >= 0 || errno == EINTR);
+        if (polled > 0) { ready = (snapshot_ready.revents & POLLIN) != 0; break; }
+        pause_poll();
+    }
+    T(ready);
+    hot_snapshot after = {0}; T(read(pipes[0], &after, sizeof after) == (ssize_t)sizeof after);
+    close(pipes[0]); pipes[0] = -1;
+    T(after.count == before.count && after.active == before.active && after.len == before.len);
+    T(!memcmp(after.text, before.text, before.len));
+    T(after.view.selection.cursor == before.view.selection.cursor && after.view.selection.anchor == before.view.selection.anchor);
+    T(after.view.first_byte == before.view.first_byte && after.view.visual_byte == before.view.visual_byte && after.view.hscroll == before.view.hscroll);
+    T(after.width == before.width && after.height == before.height);
+    window = XCB_WINDOW_NONE; until = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!window && trace_now_ns() < until) { window = find_window(c, screen->root, pid_atom, child); if (!window) pause_poll(); }
+    T(window); geometry = xcb_get_geometry_reply(c, xcb_get_geometry(c, window), NULL); T(geometry);
+    T(geometry->width == width && geometry->height == height); free(geometry); geometry = NULL;
+    xcb_client_message_event_t close_event = {.response_type = XCB_CLIENT_MESSAGE, .format = 32,
+        .window = window, .type = intern(c, "WM_PROTOCOLS"), .data.data32 = {intern(c, "WM_DELETE_WINDOW")}};
+    (void)xcb_send_event(c, 0, window, 0, (const char *)&close_event); (void)xcb_flush(c);
+    until = trace_now_ns() + EDITOR_IDLE_NS; pid_t waited;
+    do { waited = child_wait(child, &status, WNOHANG); if (!waited) pause_poll(); } while (!waited && trace_now_ns() < until);
+    T(waited == child); child = -1; T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    puts("cli_test: SIGKILL after native typing; production relaunch restores marker/cursor/selection/scroll and actual X window geometry (G: bead display trial)");
+    result = 0;
+cleanup:
+    free(geometry); free(mapping);
+    if (pipes[0] >= 0) close(pipes[0]);
+    if (pipes[1] >= 0) close(pipes[1]);
+    if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
+    if (c) xcb_disconnect(c);
+    return result;
+}
 static int run_cli_suite(void)
 {
     int result = 1;
@@ -201,13 +377,13 @@ static int run_cli_suite(void)
     ipc_server decoy = {0};
     FILE *f = NULL;
     DIR *d = NULL;
-    char root[] = "/tmp/sublimite-cli-XXXXXX", file[4097] = "", dump[4097] = "", dir[4097] = "";
+    char root[] = "/tmp/sublimite-cli-XXXXXX", source_path[4097] = "", dump[4097] = "", dir[4097] = "";
     T(getenv("DISPLAY") && strcmp(getenv("DISPLAY"), ":99") == 0);
     T(mkdtemp(root) != NULL); root_created = true; T(setenv("XDG_DATA_HOME", root, 1) == 0);
-    T(snprintf(file, sizeof file, "%s/file.txt", root) > 0);
+    T(snprintf(source_path, sizeof source_path, "%s/file.txt", root) > 0);
     T(snprintf(dump, sizeof dump, "%s/session.trace", root) > 0);
     T(snprintf(dir, sizeof dir, "%s/sublimite", root) > 0);
-    f = fopen(file, "wb"); T(f && fputs("hello\n", f) >= 0);
+    f = fopen(source_path, "wb"); T(f && fputs("hello\n", f) >= 0);
     int closed = fclose(f); f = NULL; T(closed == 0);
     T(setenv("XDG_RUNTIME_DIR", root, 1) == 0);
     const char *decoy_display = getenv("CLI_TEST_DECOY_DISPLAY");
@@ -219,21 +395,22 @@ static int run_cli_suite(void)
     /* The mismatch case deliberately keeps the shared runtime: production
      * must reject cross-display routing independently of test isolation. */
     if (!decoy_display) {
-        T(same_display_handoff(file, &decoy) == 0);
+        T(same_display_handoff(source_path, &decoy) == 0);
         T(test_ipc_isolate() != NULL);
     }
-    int ran = session(file, dump, false, &decoy);
+    int ran = session(source_path, dump, false, &decoy);
     T(ran == 0);
     ipc_server_fini(&decoy); decoy_live = false;
     /* Always cover different displays in make check, on a shared runtime.
      * This decoy owns only an IPC socket; it never opens a window on :98. */
     T(ipc_server_init_display(&decoy, NULL, ":98") == IPC_OK); decoy_live = true;
     fputs("cli_test: different-display decoy, shared runtime regression\n", stderr);
-    ran = session(file, dump, false, &decoy);
+    ran = session(source_path, dump, false, &decoy);
     T(ran == 0);
     ipc_server_fini(&decoy); decoy_live = false;
-    ran = session(file, root, true, NULL);
+    ran = session(source_path, root, true, NULL);
     T(ran == 0);
+    if (!getenv("CLI_TEST_DELAY_BACKEND")) T(hot_exit_cli(source_path, dir) == 0);
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
         if (!strncmp(entry->d_name, ".session-", 9)) {
@@ -247,7 +424,7 @@ static int run_cli_suite(void)
         journals++; T(unlink(path) == 0);
     }
     /* Each later launch restores and durably replaces the previous session;
-     * the three launches must leave one journal, not duplicate recovery state. */
+     * normal exits and the killed/restarted launch leave one owned journal. */
     T(journals == 1); closed = closedir(d); d = NULL; T(closed == 0 && rmdir(dir) == 0);
     char decoy_lock[4097]; (void)snprintf(decoy_lock, sizeof decoy_lock, "%s/sublimite-%lu.lock", root, (unsigned long)getuid());
     (void)unlink(decoy_lock);
@@ -257,7 +434,7 @@ static int run_cli_suite(void)
         if (!strncmp(endpoint->d_name, "sublimite-", 10)) T(unlinkat(dirfd(d), endpoint->d_name, 0) == 0);
     }
     T(closedir(d) == 0); d = NULL;
-    T(unlink(file) == 0 && unlink(dump) == 0 && rmdir(root) == 0);
+    T(unlink(source_path) == 0 && unlink(dump) == 0 && rmdir(root) == 0);
     puts("cli_test: file window identity, XDG session journals, quiescent trace dump and dump error passed");
     result = 0;
 cleanup:
@@ -284,7 +461,7 @@ cleanup:
             }
             (void)closedir(d);
         }
-        (void)rmdir(dir); (void)unlink(file); (void)unlink(dump); (void)rmdir(root);
+        (void)rmdir(dir); (void)unlink(source_path); (void)unlink(dump); (void)rmdir(root);
     }
     return result;
 }

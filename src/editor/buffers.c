@@ -315,7 +315,9 @@ int editor_activate(editor *e)
             rc = editor_scroll_seek(e, live.first_byte); if (rc) return rc;
         }
     }
-    return editor_full_layout(e);
+    rc = editor_full_layout(e);
+    if (!rc && !e->journal) editor_session_metadata(e);
+    return rc ? rc : editor_journal_changed(e);
 }
 static int protected_record(editor *e, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
 {

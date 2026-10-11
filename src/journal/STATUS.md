@@ -1,3 +1,13 @@
+# edit-457.8 — full session VIEW schema
+
+Added allocation-free full VIEW encoding/decoding with validated wrap,
+approximation and affinity flags; legacy VIEW decoding remains supported.
+Wire sizes derive from the field schema, documented in journal.h and the
+[decision](../../docs/decisions/edit-457.8.md). Unit roundtrip/rotation, malformed
+payload checks, legacy/full fuzz seed oracles and release append allocation
+guard pass. Editor crash integration and environment-limited full-suite audit:
+[worker report](../../docs/worker-reports/edit-457.8.md).
+
 # edit-ck4 explicit startup recovery continuation
 
 journal_open_checkpoint retains an existing journal without writing it, refuses

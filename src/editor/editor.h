@@ -75,6 +75,9 @@ typedef struct editor_config {
      * Pixel extents are optional. */
     double font_dpi, font_points;
     uint32_t window_width, window_height;
+    /* Pixel extents above are a launch default (native startup's DPI policy):
+     * a journalled WINDOW record restores over them. False = explicit size wins. */
+    bool window_size_default;
     /* Reserve the display's pixel extents for resize/zoom, independent of
      * font size. Zero retains explicit-grid callers' existing reservation. */
     uint32_t max_window_width, max_window_height;

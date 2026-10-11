@@ -46,6 +46,27 @@ typedef struct journal_base {
 typedef struct journal_view {
     uint64_t cursor, anchor, scroll_byte, scroll_x;
 } journal_view;
+/* Full VIEW retains the legacy prefix. (G, wire schema): eight uint64_t
+ * fields * eight bytes = 64. Payload length discriminates legacy/full state.
+ * Flags are individual bits for wrap, approximation and soft-end affinity. */
+#define JOURNAL_VIEW_STATE_BYTES (8u * 8u)
+#define JOURNAL_VIEW_WRAP UINT64_C(1)
+#define JOURNAL_VIEW_APPROXIMATE UINT64_C(2)
+#define JOURNAL_VIEW_VISUAL_END UINT64_C(4)
+/* WINDOW v2 (G, wire schema, edit-457.8): width32 height32 flags32 = 12 bytes.
+ * The legacy 8-byte record has no flags. CHOSEN marks a size written by a
+ * build that journals the live window, so restart may restore it; legacy
+ * records (grid pixels of older builds) are decoded with flags clear. */
+#define JOURNAL_WINDOW_BYTES 12u
+#define JOURNAL_WINDOW_LEGACY_BYTES 8u
+#define JOURNAL_WINDOW_CHOSEN UINT32_C(1)
+typedef struct journal_window {
+    uint32_t width, height, flags;
+} journal_window;
+typedef struct journal_view_state {
+    journal_view position;
+    uint64_t preferred_col, first_line, visual_byte, flags;
+} journal_view_state;
 typedef struct journal_record {
     uint32_t type;
     uint64_t buffer_id, sequence;
@@ -230,8 +251,17 @@ int journal_delete_protected(journal *j, uint64_t id, uint64_t off, uint64_t len
 int journal_delete(journal *j, uint64_t id, uint64_t off, uint64_t len);
 int journal_set_base(journal *j, uint64_t id, const journal_base *base);
 int journal_set_view(journal *j, uint64_t id, const journal_view *view);
+/* Fixed-buffer, allocation-free encoding; decode accepts both VIEW schemas.
+ * Legacy defaults: preferred column unset, visual byte = scroll byte, flags
+ * clear. Caller may retain its own legacy wrap default. */
+void journal_encode_view_state(const journal_view_state *state,
+                               uint8_t out[JOURNAL_VIEW_STATE_BYTES]);
+int journal_decode_view_state(const journal_record *record, journal_view_state *out);
 int journal_set_tabs(journal *j, const uint64_t *ids, size_t count, uint64_t active);
+/* Writes a v2 record with JOURNAL_WINDOW_CHOSEN. Decode accepts both sizes. */
 int journal_set_window(journal *j, uint32_t width, uint32_t height);
+void journal_encode_window(const journal_window *window, uint8_t out[JOURNAL_WINDOW_BYTES]);
+int journal_decode_window(const journal_record *record, journal_window *out);
 /* Event-loop timer (<=5 ms recommended), outside the typing path. now_ns is
  * CLOCK_MONOTONIC; force requests a sync even if no new records exist.
  * Caches the batch's PAD before transferring it (so later appends have no

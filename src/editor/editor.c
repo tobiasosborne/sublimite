@@ -411,16 +411,18 @@ static int submit(editor *e)
     e->submitted_plan = e->scroll_plan; e->submitted_plan_valid = true;
     return 0;
 }
-static int resize(editor *e)
+int editor_resize_now(editor *e, uint32_t width, uint32_t height)
 {
-    if (!e->resize_pending || e->backend->active || e->dirty) return 0;
+    /* A journal from a larger display must not exceed the reserved surface. */
+    if (width > e->font.max_width) width = e->font.max_width;
+    if (height > e->font.max_height) height = e->font.max_height;
+    e->font.window_width = width; e->font.window_height = height;
     render_dims dims = e->grid.dims;
-    dims.cols = e->resize_w / dims.cell_w; dims.rows = e->resize_h / dims.cell_h;
+    dims.cols = width / dims.cell_w; dims.rows = height / dims.cell_h;
     if (!dims.cols) dims.cols = 1;
     if (!dims.rows) dims.rows = 1;
     if (dims.cols > e->max_cols) dims.cols = e->max_cols;
     if (dims.rows > e->max_rows) dims.rows = e->max_rows;
-    e->resize_pending = false;
     if (dims.cols == e->grid.dims.cols && dims.rows == e->grid.dims.rows) return 0;
     return editor_resize_grid(e, dims);
 }
@@ -433,7 +435,10 @@ int editor_resize_grid(editor *e, render_dims dims)
     if ((e->backend->info.capabilities & RENDER_CAP_RASTER_POOL) &&
         (size_t)dims.cols * dims.rows > RASTER_FRAME_CELL_LIMIT)
         dims.rows = RASTER_FRAME_CELL_LIMIT / dims.cols;
-    int rc = render_backend_resize(e->backend, dims); if (rc) return rc;
+    /* Recovery resizes the prepaid grids before platform/backend creation.
+     * Backend init receives those final dimensions from editor_open. */
+    int rc = e->backend->initialized ? render_backend_resize(e->backend, dims) : 0;
+    if (rc) return rc;
     e->grid.dims = dims;
     e->grid.scroll = (render_scroll){0}; /* the old rectangle belongs to the old surface */
     e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
@@ -455,6 +460,12 @@ int editor_resize_grid(editor *e, render_dims dims)
     e->geometry_generation++;
     rc = editor_scroll_resize(e); if (rc) return rc;
     return editor_full_layout(e);
+}
+static int resize(editor *e)
+{
+    if (!e->resize_pending || e->backend->active || e->dirty) return 0;
+    e->resize_pending = false;
+    return editor_resize_now(e, e->resize_w, e->resize_h);
 }
 static int nonkey(editor *e, const plat_event *ev)
 {
@@ -532,7 +543,7 @@ static bool queued_owner_live(const editor *e, size_t at)
 static size_t queue_pick(const editor *e)
 {
     /* Journal replay ranges borrow tree storage until every staged record drains. */
-    if (editor_save_leased(e) || (e->journal && e->op_count)) return SIZE_MAX;
+    if (editor_save_leased(e) || (e->journal && (e->op_count || e->journal_metadata_pending))) return SIZE_MAX;
     if (editor_clip_busy(e)) {
         for (size_t n = 0; n < e->queue_count; n++)
             if (e->queue[(e->queue_head + n) % EDITOR_INPUT_CAP].kind == PLAT_EV_CLIPBOARD) return n;
@@ -629,6 +640,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
     editor_journal_staged(e);
+    if (e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
     editor_large_index_progress(e);
     rc = editor_clip_poll(e); if (rc) return fail(e, rc);
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
@@ -644,6 +656,8 @@ int editor_step(editor *e, int timeout_ms)
         if (!view_busy(&e->v) && e->action != EDITOR_ACTION_REPLAY_WORK) {
             rc = editor_preferences_apply(e); if (rc) return fail(e, rc);
         }
+        bool applied = e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK ||
+            view_busy(&e->v) || queue_pick(e) != SIZE_MAX;
         if (e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
         else if (queue_pick(e) != SIZE_MAX) {
             size_t picked = queue_pick(e), at = (e->queue_head + picked) % EDITOR_INPUT_CAP;
@@ -666,6 +680,7 @@ int editor_step(editor *e, int timeout_ms)
          * frame. Successful journal calls establish the page-cache cutoff. */
         editor_session_publish(e, e->buffer);
         editor_journal_staged(e);
+        if (!rc && applied) rc = editor_journal_changed(e);
         record_slice(e, slice);
         if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
         if (rc) return fail(e, rc);
@@ -676,6 +691,7 @@ int editor_step(editor *e, int timeout_ms)
         return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
     }
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
+    if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
     uint64_t submit_start = trace_now_ns(); rc = submit(e);
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
@@ -715,7 +731,8 @@ int editor_set_cursor(editor *e, uint64_t byte)
     e->v.state.visual_byte = e->v.state.first_byte; e->v.state.visual_end = false;
     e->v.state.hscroll = 0; undo_break_burst(e->undo);
     int rc = editor_scroll_seek(e, e->v.state.first_byte); if (rc) return rc;
-    return refresh_cursor(e, old, false);
+    rc = refresh_cursor(e, old, false);
+    return rc ? rc : editor_journal_changed(e);
 }
 int editor_jump_line(editor *e, uint64_t line)
 {

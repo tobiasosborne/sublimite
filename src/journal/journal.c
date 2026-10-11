@@ -141,9 +141,11 @@ static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
     case JOURNAL_INSERT: return n>=8;
     case JOURNAL_DELETE: return n==16 && u64(p)<=UINT64_MAX-u64(p+8);
     case JOURNAL_TARGET: return n>=1 && n<=4097 && p[n-1]==0 && memchr(p,0,n-1)==NULL;
-    case JOURNAL_VIEW: return n==32;
+    case JOURNAL_VIEW: return n==32 || (n==JOURNAL_VIEW_STATE_BYTES &&
+        !(u64(p+56) & ~(JOURNAL_VIEW_WRAP | JOURNAL_VIEW_APPROXIMATE | JOURNAL_VIEW_VISUAL_END)));
     case JOURNAL_TABS: return n>=16 && (n-16)%8==0 && u64(p)==(n-16)/8 && (u64(p)==0 ? u64(p+8)==0 : u64(p+8)<u64(p));
-    case JOURNAL_WINDOW: return n==8;
+    case JOURNAL_WINDOW: return n==JOURNAL_WINDOW_LEGACY_BYTES ||
+        (n==JOURNAL_WINDOW_BYTES && !(u32(p+8) & ~JOURNAL_WINDOW_CHOSEN));
     default: return false;
     }
 }
@@ -621,14 +623,44 @@ int journal_set_base(journal *j, uint64_t id, const journal_base *base)
 }
 int journal_set_view(journal *j, uint64_t id, const journal_view *v)
 { if(!v) return JOURNAL_INVALID; uint8_t data[32]; put64(data,v->cursor); put64(data+8,v->anchor); put64(data+16,v->scroll_byte); put64(data+24,v->scroll_x); return journal_append(j,JOURNAL_VIEW,id,data,32); }
+void journal_encode_view_state(const journal_view_state *s, uint8_t out[JOURNAL_VIEW_STATE_BYTES])
+{
+    put64(out,s->position.cursor); put64(out+8,s->position.anchor);
+    put64(out+16,s->position.scroll_byte); put64(out+24,s->position.scroll_x);
+    put64(out+32,s->preferred_col); put64(out+40,s->first_line);
+    put64(out+48,s->visual_byte); put64(out+56,s->flags);
+}
+int journal_decode_view_state(const journal_record *r, journal_view_state *out)
+{
+    if(!r || !out || r->type!=JOURNAL_VIEW || !r->data || !payload_valid(r->type,r->data,r->size)) return JOURNAL_INVALID;
+    const uint8_t *p=r->data;
+    *out=(journal_view_state){.position={u64(p),u64(p+8),u64(p+16),u64(p+24)},
+        .preferred_col=UINT64_MAX,.visual_byte=u64(p+16)};
+    if(r->size==JOURNAL_VIEW_STATE_BYTES) {
+        out->preferred_col=u64(p+32); out->first_line=u64(p+40);
+        out->visual_byte=u64(p+48); out->flags=u64(p+56);
+    }
+    return JOURNAL_OK;
+}
 int journal_set_tabs(journal *j, const uint64_t *ids, size_t count, uint64_t active)
 {
     if((!ids && count) || count>(JOURNAL_MAX_RECORD-48)/8 || (count?active>=count:active!=0)) return JOURNAL_INVALID;
     uint8_t *p; int rc=reserve_record(j,16+count*8,&p); if(rc) return rc;
     put64(p+32,count); put64(p+40,active); for(size_t i=0;i<count;i++) put64(p+48+i*8,ids[i]); return finish_record(j,p,JOURNAL_TABS,0,16+count*8);
 }
+void journal_encode_window(const journal_window *w, uint8_t out[JOURNAL_WINDOW_BYTES])
+{ put32(out,w->width); put32(out+4,w->height); put32(out+8,w->flags); }
+int journal_decode_window(const journal_record *r, journal_window *out)
+{
+    if(!r || !out || r->type!=JOURNAL_WINDOW || !r->data || !payload_valid(r->type,r->data,r->size)) return JOURNAL_INVALID;
+    *out=(journal_window){u32(r->data),u32(r->data+4),r->size==JOURNAL_WINDOW_BYTES?u32(r->data+8):0};
+    return JOURNAL_OK;
+}
 int journal_set_window(journal *j, uint32_t width, uint32_t height)
-{ uint8_t data[8]; put32(data,width); put32(data+4,height); return journal_append(j,JOURNAL_WINDOW,0,data,8); }
+{
+    uint8_t data[JOURNAL_WINDOW_BYTES]; journal_window w={width,height,JOURNAL_WINDOW_CHOSEN};
+    journal_encode_window(&w,data); return journal_append(j,JOURNAL_WINDOW,0,data,sizeof data);
+}
 int journal_pump(journal *j, uint64_t now, bool force)
 {
     if(j && j->recovery_pending) return JOURNAL_BUSY;

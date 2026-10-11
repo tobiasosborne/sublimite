@@ -1,8 +1,33 @@
+# edit-457.8 — hot exit session integration
+
+Full VIEW records preserve selection, preferred column, logical/visual scroll,
+wrap and cursor affinity while legacy VIEW records remain readable. Applied
+input and cursor/tab changes journal before submission; raw window dimensions
+restore before window/backend creation and replacement checkpoint publication.
+Window size at restart: explicit launch size > journalled chosen size (WINDOW
+v2, 12 bytes, chosen flag) > DPI default; legacy 8-byte records keep the default.
+Save captures and failure checkpoints share the full encoding. Metadata uses
+reserved storage and existing durability credit, with no typing allocation.
+
+The requested crash trials pass (G: bead acceptance count; M[AC]: successful
+completed loop count) with null rendering, seeded kill boundaries and held
+Present, plus schema/save checks and the active release allocation guard.
+GCC `make all` passes. Complete sanitizer suite audit, native/IPC sandbox
+failures, LeakSanitizer restriction and stamped benchmark observations are in
+[the worker report](../../docs/worker-reports/edit-457.8.md). The coordinator must
+rerun permitted display/IPC/leak checks and the new native CLI crash trial;
+Astra verification remains required before handoff.
+
+[Decision record](../../docs/decisions/edit-457.8.md).
+
 # edit-a6v — initial painted surface follows launch geometry
 
-Explicit launch window pixels now take precedence over historical journal
-geometry after session recovery. Startup drops an equivalent queued resize;
-the created window, initial grid and submitted frames keep the same size.
+Explicit launch window pixels take precedence, per axis, over the journal's
+WINDOW record. Since edit-457.8, recovery applies the window size directly
+(install_session, before window/backend creation) instead of queueing a resize;
+it uses the launch size where configured and clamps a journalled size to the
+reserved surface maximum, so the created window, initial grid and submitted
+frames keep the same size.
 Native creation and raster reservations already honored launch geometry and
 needed no changes. Later native resize still uses the existing path.
 
