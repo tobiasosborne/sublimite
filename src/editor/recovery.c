@@ -195,7 +195,10 @@ static int install_session(editor *e, recovered_session *s)
     for (size_t i = 0; !rc && i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i]; if (!b) continue;
         if (b->file) rc = journal_capture_base(file_path(b->file), &b->base);
-        if (!rc) rc = editor_save_setup(e, b);
+        if (!rc) {
+            int save_rc = editor_save_setup(e, b);
+            if (save_rc) { b->save_error = b->operation_error = save_rc; b->save_errno = errno; }
+        }
     }
     if (!rc) rc = editor_checkpoint(e);
     if (!rc) editor_session_metadata(e);

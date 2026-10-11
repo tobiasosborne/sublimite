@@ -126,7 +126,7 @@ content copy, heap allocation or filesystem work on the command path. The node
 reservation is `3 * (2 * width - 1)` (G, structural): `width` is the smallest
 power of two covering buffer capacity; a complete binary graph has
 `2 * width - 1` nodes, and the live graph, pinned graph and transient update path
-fit within three complete graphs. This is a ownership bound, not an invented
+fit within three complete graphs. This is an ownership bound, not an invented
 memory or latency budget. Snapshot creation uses the buffer's existing arena
 allocator. Failed publication preserves committed edits and refuses a stale
 save cutoff rather than saving obsolete bytes.
@@ -160,7 +160,8 @@ rotation changes the journal inode. Select the newest nonempty unlocked session
 artifact. Restore named associations, untitled content, live tab order/active
 selection, retained buffers and views before any text submission. Ordinary
 startup requests reuse recovered matching files instead of opening duplicates.
-The existing WINDOW record enters the resize queue. Recovery uses private COPY
+The existing WINDOW record enters the resize queue. Save setup failure remains
+per buffer even while restoring an association whose parent is unavailable. Recovery uses private COPY
 acquisition so a mapped prefix frame cannot expose unreplayed bytes.
 
 An explicitly supplied existing journal enters journal_open_checkpoint: no
