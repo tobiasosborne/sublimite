@@ -4,6 +4,7 @@
 #include "scroll/scroll.h"
 #include "layout/layout.h"
 #include "../bench/harness.h"
+#include "scroll_display.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -173,6 +174,15 @@ static int jump_fixture(char *path, size_t capacity)
 }
 int main(int argc, char **argv)
 {
+    /* Display capability can be inspected independently of the log fixture.
+     * edit-3kk must supply the real observer/capture driver before this can
+     * produce a physical verdict. NULL explicitly records unsupported. */
+    if (argc == 2 && !strcmp(argv[1], "--display-check")) {
+        scroll_display_history displayed = scroll_display_run(NULL, NULL);
+        scroll_display_report(stdout, &displayed);
+        puts("scroll_bench: editor refresh/completion/immutable-plan/sidebar capture driver required; see docs/decisions/edit-ovu-display.md");
+        return 0;
+    }
     bool track=false, probe=false, cold=false, indexed_guard=false;
     for (int arg=1;arg<argc;arg++) {
         if (!strcmp(argv[arg],"--track")) track=true;
@@ -276,7 +286,9 @@ int main(int argc, char **argv)
         bench_p50(&work), bench_p99(&work), maximum_ns, slow, HALF_PERIOD_NS, track);
     int work_rc = bench_gate_report("G3z_null_work_proxy", &work, HALF_PERIOD_NS, HALF_PERIOD_NS,
                                     BENCH_INTERACTION_MIN_N, track, cadence_stamp.power, cadence_stamp.load);
-    puts("G3z displayed_verdict=UNAVAILABLE: work_proxy is a CPU regression comparison plus synthetic null completion, not displayed cadence. Requires editor on_refresh(displayed frame ID, refresh sequence, completion time, immutable scroll plan and sidebar identity); see docs/decisions/P3.4.md. Renderer origin/clip wiring remains external.");
+    scroll_display_history displayed = scroll_display_run(NULL, NULL);
+    scroll_display_report(stdout, &displayed);
+    puts("G3z work_proxy=CPU_only completion=synthetic_null; requires editor refresh/completion/immutable-plan/sidebar capture driver; see docs/decisions/edit-ovu-display.md");
     lineidx_destroy(index);
     /* A cancelled seek must never become adoptable, including a fast worker
      * completion racing cancellation. Outside the descriptive sample timer. */

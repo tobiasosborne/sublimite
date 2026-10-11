@@ -1,5 +1,40 @@
 # Scroll — P4.3b review fixes (edit-ovu)
 
+## Current edit-ovu displayed-observer continuation
+
+`bench/scroll_display.h` supplies a fixed-storage refresh consumer/driver
+interface, and `tests/scroll_display_test.c` rejects the review's every-second
+displayed repeat while submit/present counts stay unchanged. It checks actual
+completion ordering, missing opportunities, immutable input/source/geometry,
+the full Q8 plan and wrap seed, sidebar identity, and independent captured
+text/sidebar correctness. Subpixel coverage is required; whole-pixel origin
+changes cannot qualify it. Synthetic or unsupported clean streams explicitly
+report displayed evidence as UNAVAILABLE.
+
+`scroll_bench --display-check` runs the capability report without a corpus;
+the existing proxy stays labelled CPU work with synthetic null completion.
+No runtime scroll/editor implementation, allocation path or frame scheduling
+changed. Red/green and final build/test evidence are in
+`docs/worker-reports/edit-ovu.md`.
+
+Current verification: GCC `make all` passes; ordinary Clang ASan/UBSan
+`scroll_display_test` and `scroll_test` pass with leak detection disabled.
+The full serial suite matrix passes all other runnable headless cases; private
+Unix socket creation is also sandbox-denied, blocking IPC and the editor/CLI
+socket-dependent cases in addition to native display suites. The report lists
+each failure and the X11 failed-fixture ASan diagnostic, without claiming full
+headless acceptance. Replay CLI and display-lock shell contracts pass.
+
+The editor/backend producer and captured-output driver are still required,
+so the displayed finding is **not closed**. Coordinate edit-3kk through
+`docs/decisions/edit-ovu-display.md`. The prior fractional backend/overscan
+wiring and exact resident wrap-metadata integration also remain external.
+Sanitizer execution here needs leak detection disabled because LeakSanitizer
+reports its ptrace fatal error; display sockets are sandbox-denied. The
+coordinator must rerun leak-enabled checks and display suites on Xvfb :99,
+with private Unix sockets allowed, then run the Astra comparison drive on the
+integrated build.
+
 Implemented in this worktree: source failures preserve the viewport; bounded,
 caller-owned resolve/follow continuations share the byte/callback/wall deadline
 across all stages; a resident-source bridge copies immutable snapshot windows
