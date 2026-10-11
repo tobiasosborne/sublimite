@@ -771,7 +771,7 @@ int main(int argc, char **argv)
     if (idle) for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         const char *name = names[i];
         if (override && strcmp(name, "null") && strcmp(name, override)) continue;
-        int rc = idle_row(name, track, require_gl, !idle_guard); if (rc < 0) return 1; rows = bench_merge_exit(rows, rc);
+        int rc = idle_row(name, track, require_gl, !idle_guard && !track) /* --track skips the 10000-blink real-cadence repeat (G11 is TRACK) */; if (rc < 0) return 1; rows = bench_merge_exit(rows, rc);
     }
     int f = 0, g = 0, h = 0;
     if (p4) { f = tab_row(false, track); if (f < 0) return 1; g = tab_row(true, track); if (g < 0) return 1; h = ipc_row(track); if (h < 0) return 1; }

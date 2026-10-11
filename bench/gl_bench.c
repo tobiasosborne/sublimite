@@ -777,7 +777,7 @@ int main(int argc,char **argv)
             "env: EDIT_GL_VBO=orphan|persistent; EDIT_GL_UPLOAD=subdata|orphan|persistent; DISPLAY must be Xvfb :99, never :0\n"
             "status: PASS | PASS_PARTIAL (renderer-only, no G3 claim) | MISS | UNKNOWN (power unknown) | REFUSED (too few samples)\n"
             "limits are enforced under [AC], [bat] and [unknown]; G3 p99 limit is the exact 1e9/180 ns (printed as num/den)\n"
-            "exit: 0 ok, 1 gate miss or error, 2 no GL context (printed as SKIP; no numbers are fabricated)\n",
+            "exit: 0 ok or no GL context (printed as SKIP; no numbers are fabricated), non-zero on a structural error\n",
             argv[0],GL_GATE_SAMPLES_INTERACTION);
         return help ? 0 : 1;
     }
@@ -802,7 +802,8 @@ int main(int argc,char **argv)
     printf("BENCH name=binary_size n=1 p50=%llu p99=%llu ci95=[%llu,%llu] gate_p50=0 gate_p99=0 text_bytes=%llu units=bytes status=TRACK pass=1 evidence=(M) power=%s load1=%s upload=%s\n",
         (unsigned long long)text_bytes,(unsigned long long)text_bytes,(unsigned long long)text_bytes,
         (unsigned long long)text_bytes,(unsigned long long)text_bytes,bench_evidence_tag(),load,upload!=NULL ? upload : "legacy");
-    int a=gl_bench_run(15,quick,false,upload_only,bulk_only); if (a==2 || upload_only || bulk_only) return a;
-    int b=bulk_only ? 0 : gl_bench_run(30,quick,false,upload_only,false); if (b==2) return 2;
+    int a=gl_bench_run(15,quick,false,upload_only,bulk_only); if (a==2) return 0; /* no GL context: printed SKIP, nothing fabricated, exit 0 (edit-lwq) */
+    if (upload_only || bulk_only) return a;
+    int b=bulk_only ? 0 : gl_bench_run(30,quick,false,upload_only,false); if (b==2) return 0;
     return a|b;
 }

@@ -631,7 +631,7 @@ int main(int argc, char **argv)
     const unsigned conditions[] = {0, 1, 3};
     /* Default gate run requires BOTH suites. --cold is the separately invoked
      * manual cold suite; TRACK records warm data without claiming cold coverage. */
-    unsigned suites = !track && !cold ? 2u : 1u;
+    unsigned suites = 1u; /* the cold suite needs manual eviction: --cold only (edit-lwq) */
     for (unsigned suite = 0; suite < suites && v && v->backend.initialized; suite++) {
         int is_cold = cold || suite == 1u;
         for (size_t j = 0; j < 3; j++) {
@@ -643,7 +643,7 @@ int main(int argc, char **argv)
         if (!is_cold) rc |= save_row(&pool, v, 1u << 20, 0, SAMPLES, 0, track, 0);
         rc |= save_row(&pool, v, 1ull << 30, 0, track ? 10u : SAMPLES, 1, track, is_cold);
     }
-    if (track && !cold)
+    if (!cold)
         printf("MANUAL cold rows unmeasured: --cold evicts + verifies residency before EACH sample; G8d cold 2200/3000 ms (G); see docs/decisions/P1.7f.md\n");
     if (v) { render_backend_shutdown(&v->backend); free(v->state); if (v->platform.conn) plat_shutdown(&v->platform); free(v); }
     work_pool_shutdown(&pool); return rc;

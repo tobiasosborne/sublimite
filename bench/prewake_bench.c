@@ -188,6 +188,7 @@ static int prewake_idle(prewake_fixture *f)
 int main(int argc,char **argv)
 {
     (void)setvbuf(stdout,NULL,_IOLBF,0);
+    if (argc==1) { puts("prewake_bench: protocol tool driven by its supervising script (--protocol|--display-check); nothing to run standalone"); return 0; }
     bool real=argc==3 && strcmp(argv[2],"--real-display")==0;
     const char *display=getenv("DISPLAY"),*edit_display=getenv("EDIT_DISPLAY");
     REQUIRE(display!=NULL && edit_display!=NULL && strcmp(display,edit_display)==0);
