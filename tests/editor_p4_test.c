@@ -199,8 +199,9 @@ static int decorations(bool raster)
     T(press(e, key('k', PLAT_MOD_CTRL, NULL)) == 0);
     T(press(e, key('x', 0, "x")) == 0); T(editor_length(e) == 10); /* mismatched chord is consumed */
     uint64_t count = editor_get_stats(e).unimplemented_actions;
-    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 1);
-    T(press(e, key('t', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 2); /* Ctrl+T transpose: still unimplemented; Ctrl+Y became redo (edit-whl) */
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count); /* edit-73j: Ctrl+F opens find */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(press(e, key('t', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 1); /* Ctrl+T transpose: still unimplemented; Ctrl+Y became redo (edit-whl) */
     T(press(e, key('k', PLAT_MOD_CTRL, NULL)) == 0);
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
     T(press(e, key('a', 0, "a")) == 0); T(editor_length(e) == 11);
@@ -288,12 +289,22 @@ static int wrap_geometry(bool raster)
     T(cell(e, 1, 2)->glyph_index == text[0]);
     editor_close(e); printf("editor_p4_test: %s wrapped tab gutter/resize geometry passed\n", raster ? "raster" : "null"); return 0;
 }
+/* G: reuse this suite's settle phase bound for worker publication, outside
+ * any input-to-submit timing. A clean text frame can precede map readiness. */
+static int settle_map(editor *e)
+{
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000);
+    while (editor_get_stats(e).minimap_stale || editor_get_stats(e).pending) {
+        T(editor_step(e,0)>=0); T(trace_now_ns()<deadline);
+    }
+    return 0;
+}
 static int minimap_script(bool raster)
 {
     char text[400]; size_t used = 0;
     for (unsigned i = 0; i < 40; i++) { text[used++] = 'a'; text[used++] = '\n'; } text[used] = 0;
     editor *e = NULL; render_backend b = {0}; T(new_editor(&e, &b, raster, text) == 0);
-    T(!editor_get_stats(e).minimap_stale); T(editor_get_stats(e).minimap_fills > 0);
+    T(settle_map(e)==0); T(!editor_get_stats(e).minimap_stale); T(editor_get_stats(e).minimap_fills > 0);
     const render_grid *g = editor_grid(e);
     plat_event pointer = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
         .x = (int32_t)((g->dims.cols - 2) * g->dims.cell_w), .y = (int32_t)(5 * g->dims.cell_h)};
@@ -327,7 +338,7 @@ static int index_recovery(bool raster)
     lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index != NULL);
     T(!editor_index_complete(e)); T(press(e, key('x', 0, "x")) == 0);
     for (unsigned i = 0; i < 128; i++) T(editor_step(e, 0) >= 0);
-    T(editor_index_complete(e)); T(settle(e) == 0); T(!editor_get_stats(e).minimap_stale && frames.coherent);
+    T(editor_index_complete(e)); T(settle(e) == 0); T(settle_map(e)==0); T(!editor_get_stats(e).minimap_stale && frames.coherent);
     editor_close(e); printf("editor_p4_test: %s interrupted index recovery/stale indicator passed (stale frames=%zu)\n", raster ? "raster" : "null", frames.stale); return 0;
 }
 typedef struct counted { bool active, suspended; size_t allocations; } counted;
@@ -533,6 +544,9 @@ static int ipc_wait_sweep(ipc_server *server)
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    if (argc==2 && !strcmp(argv[1],"--73j-null")) return indentation(false) || queued_groups(false) ||
+        decorations(false) || tabs_script(false) || wrap_navigation(false) || wrap_geometry(false) ||
+        minimap_script(false) || index_recovery(false);
     if (argc == 2 && !strcmp(argv[1], "--indent-limit-enter")) return indent_selection_limit(0);
     if (argc == 2 && !strcmp(argv[1], "--indent-limit-brace")) return indent_selection_limit(1);
     T(indent_selection_limit(0) == 0); T(indent_selection_limit(1) == 0);

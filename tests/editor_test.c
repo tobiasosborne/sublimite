@@ -138,7 +138,10 @@ static int minimap_typing_flash(void)
     }
     /* Settle excludes index maintenance: explicitly run its next turn so the
      * last typed frame is followed by the ready map's publication. */
-    T(editor_step(e, 0) >= 0); T(settle(e) == 0);
+    uint64_t ready_deadline=trace_now_ns()+UINT64_C(5000000000); /* existing settle bound */
+    while (e->buffer->map.stale || e->buffer->map.revision!=e->buffer->revision || e->dirty) {
+        T(editor_step(e,0)>=0); T(trace_now_ns()<ready_deadline); sched_yield();
+    }
     printf("edit-g11 null typing: keys=%zu frames=%zu orange_frames=%zu stale_frames=%zu "
         "changed_pending=%zu chrome_markers=%zu mallocs=%zu fill_max_ns=%llu\n",
         keys, probe.frames, probe.orange_frames, probe.stale_frames, probe.changed_pending,
@@ -153,6 +156,21 @@ static int minimap_typing_flash(void)
 /* edit-d5o: geometry derives from the existing allocation fixture. The
  * reference prepares ceil(map pixel height / PRD's two pixels per line)
  * summaries independently, so a text-cell-height adapter cannot pass. */
+/* edit-73j: summaries publish from a worker; wait for the published map and
+ * its frame (existing settle bound) before reading pixels. */
+static int settle_map(editor *e)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
+    for (;;) {
+        /* Mirrors editor_map_service: a job is in flight, or one is due. */
+        minimap_input input = editor_map_input(e->buffer);
+        bool due = e->map_cols && !e->buffer->pending_open && !e->buffer->source_stale && input.index_ready &&
+            (minimap_stale(&e->buffer->map, &input) || e->buffer->map.height != e->map_grid.dims.rows);
+        if (!e->buffer->map_snapshot && !due && !e->dirty) break;
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
+    }
+    return settle(e);
+}
 static int minimap_compose_pixels(const char *backend_name)
 {
     render_backend backend = {0};
@@ -160,7 +178,7 @@ static int minimap_compose_pixels(const char *backend_name)
     const char fixture[] = "a b\n  cd\n\txyz\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz\n";
     editor_config cfg = {.initial = (const uint8_t *)fixture, .initial_len = sizeof fixture - 1,
         .cols = 40, .rows = 8};
-    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0); T(settle_map(e) == 0);
     uint32_t w = e->grid.dims.cols * e->grid.dims.cell_w;
     uint32_t h = e->grid.dims.rows * e->grid.dims.cell_h;
     uint32_t mw = e->map_cols * e->grid.dims.cell_w;
@@ -374,9 +392,9 @@ static int panel_shortcuts(bool notice)
     static const char typed[] = "leftalpha right\nnext";
     static const char status[] = "not implemented";
     const struct { uint32_t sym; uint16_t mods; } shortcuts[] = {
-        {'f', PLAT_MOD_CTRL}, {'h', PLAT_MOD_CTRL}, {XKB_KEY_F3, 0},
         {'F', PLAT_MOD_CTRL | PLAT_MOD_SHIFT}, {'p', PLAT_MOD_CTRL}, {'g', PLAT_MOD_CTRL}
-    }; /* Each entry derives from the brief's requested shortcut set. */
+    }; /* Each entry derives from the brief's requested shortcut set, less
+        * Ctrl+F, Ctrl+H and F3, which open/drive the find panel (edit-73j). */
     for (size_t i = 0; i < sizeof shortcuts / sizeof shortcuts[0]; i++) {
         render_backend b = {0}; T(render_null_backend(&b) == 0);
         counted count = {0};
@@ -548,6 +566,7 @@ static int raster_blink_damage(void)
         T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
         if (mode) { T(editor_set_cursor(e, mode == 3 ? 200u : 1u) == 0); T(settle(e) == 0); }
         if (mode == 1) T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+        T(settle_map(e) == 0); /* edit-73j: no minimap job may straddle the blink */
         uint64_t fills = e->stats.minimap_fills;
         for (unsigned toggle = 0; toggle < 2; toggle++) {
             uint32_t epochs[WORK_MAX_JOBS];
@@ -2541,6 +2560,297 @@ static int clipboard_no_tabs_test(void)
     T(press(e, middle) == 0); T(editor_length(e) == before);
     editor_close(e); puts("clipboard middle click: no active tab preserves placeholder"); return 0;
 }
+/* edit-73j: coordinates derive from the live cell/gutter geometry. Expected
+ * offsets derive from literal fixture byte positions; wheel rows from
+ * SCROLL_CORE_ROWS (Sublime default requested in the bead). */
+static plat_event pointer_event(editor *e, plat_ev_kind kind, uint32_t row,
+                                uint32_t column, bool down, uint64_t when)
+{
+    plat_event ev = {.kind=kind, .code=1, .press=down, .t0_ns=when,
+        .x=(int32_t)((column+e->lay.gw)*e->grid.dims.cell_w),
+        .y=(int32_t)((row+e->tab_rows)*e->grid.dims.cell_h)};
+    return ev;
+}
+static int mouse_contract(void)
+{
+    const char text[]="alpha beta\n\tA界é z\nlast";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,
+        .cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    uint64_t when=trace_now_ns();
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,2,true,when))==0);
+    T(editor_view(e).selection.cursor==2 && editor_view(e).selection.anchor==2);
+    T(press(e,pointer_event(e,PLAT_EV_MOTION,0,8,false,when))==0);
+    T(editor_view(e).selection.cursor==8 && editor_view(e).selection.anchor==2);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,8,false,when))==0);
+    /* A distinct location resets the click chain. */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,true,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,true,when))==0);
+    T(editor_view(e).selection.anchor==6 && editor_view(e).selection.cursor==10);
+    T(press(e,pointer_event(e,PLAT_EV_MOTION,0,2,false,when))==0);
+    T(editor_view(e).selection.anchor==10 && editor_view(e).selection.cursor==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,true,when))==0);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==11);
+    T(press(e,pointer_event(e,PLAT_EV_MOTION,1,5,false,when))==0);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==22);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,7,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,2,true,when))==0);
+    T(editor_view(e).selection.cursor==12); /* midpoint of HT snaps after HT */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,2,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,5,true,when))==0);
+    T(editor_view(e).selection.cursor==13); /* leading CJK cell */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,5,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,6,true,when))==0);
+    T(editor_view(e).selection.cursor==16); /* trailing CJK cell snaps after */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,6,false,when))==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,8,true,when))==0);
+    T(editor_view(e).selection.cursor==19); /* combining cluster stays intact */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,8,false,when))==0);
+    e->v.state.hscroll=sizeof "alpha "-1; T(editor_full_layout(e)==0); T(settle(e)==0);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,0,true,when))==0);
+    T(editor_view(e).selection.cursor==sizeof "alpha "-1);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,0,0,false,when))==0);
+    plat_event shifted=pointer_event(e,PLAT_EV_BUTTON,0,3,true,when); shifted.mods=PLAT_MOD_SHIFT;
+    T(press(e,shifted)==0);
+    T(editor_view(e).selection.anchor==sizeof "alpha "-1 && editor_view(e).selection.cursor==sizeof "alpha bet"-1);
+    editor_close(e); puts("edit-73j mouse contract passed"); return 0;
+}
+static int wheel_contract(void)
+{
+    const char text[]="a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    view_selection before=editor_view(e).selection;
+    plat_event ev={.kind=PLAT_EV_WHEEL,.dy=PLAT_WHEEL_UNIT};
+    T(press(e,ev)==0); T(editor_view(e).first_line==3 && editor_view(e).first_byte==6);
+    T(editor_view(e).selection.cursor==before.cursor && editor_view(e).selection.anchor==before.anchor);
+    ev.dy=-PLAT_WHEEL_UNIT; T(press(e,ev)==0); T(editor_view(e).first_line==0);
+    ev.dy=PLAT_WHEEL_UNIT/2; ev.smooth=true;
+    T(press(e,ev)==0); T(editor_view(e).first_line==1);
+    T(press(e,ev)==0); T(editor_view(e).first_line==3);
+    size_t length=(size_t)e->text_grid.dims.cols*e->text_grid.dims.rows*2u; /* two viewport areas */
+    editor_close(e); memset(&backend,0,sizeof backend); T(render_null_backend(&backend)==0);
+    uint8_t *wrapped=malloc(length); T(wrapped); memset(wrapped,'x',length);
+    cfg.initial=wrapped; cfg.initial_len=length; cfg.wrap_mode=1;
+    T(editor_open(&e,&cfg,&backend)==0); free(wrapped); T(settle(e)==0);
+    uint64_t target=e->lay.wrap_rows[SCROLL_CORE_ROWS].start;
+    ev.dy=PLAT_WHEEL_UNIT; ev.smooth=false;
+    T(press(e,ev)==0); T(editor_view(e).first_line==0 && editor_view(e).visual_byte==target);
+    T(editor_view(e).selection.cursor==0 && editor_view(e).selection.anchor==0);
+    ev.dy=-PLAT_WHEEL_UNIT; T(press(e,ev)==0); T(editor_view(e).visual_byte==0);
+    editor_close(e); puts("edit-73j wheel contract passed"); return 0;
+}
+static int findpanel_contract(void)
+{
+    const char text[]="cat dog cat";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,.cols=40,.rows=8};
+    char log[]="build/73j-find-XXXXXX"; int fd=mkstemp(log); T(fd>=0); close(fd); cfg.journal_path=log;
+    counted counts={0}; cfg.hook_ctx=&counts; cfg.on_ingress=ingress; cfg.on_submit=submitted; cfg.on_io=io_boundary;
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0);
+    const render_grid *grid=editor_grid(e);
+    T(grid->cells[(size_t)(grid->dims.rows-1)*grid->dims.cols].glyph_index=='F');
+    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,0)==0);
+    T(press(e,key('a',PLAT_MOD_CTRL,NULL))==0); T(e->find_field_all);
+    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,0)==0);
+    T(findui_get_state(&e->find).query_length==sizeof "cat"-1);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==3);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+    T(editor_view(e).selection.anchor==8 && editor_view(e).selection.cursor==11);
+    T(press(e,key(XKB_KEY_Return,PLAT_MOD_SHIFT,NULL))==0);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==3);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(press(e,key(XKB_KEY_F3,0,NULL))==0);
+    T(editor_view(e).selection.anchor==8 && editor_view(e).selection.cursor==11);
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key(XKB_KEY_Tab,0,NULL))==0);
+    T(press(e,key('x',0,"fox"))==0);
+    T(press(e,key(XKB_KEY_Return,PLAT_MOD_CTRL,NULL))==0);
+    T(editor_length(e)==sizeof text-1);
+    uint8_t bytes[sizeof text]; T(editor_read(e,0,bytes,sizeof text-1)==0);
+    T(!memcmp(bytes,"cat dog fox",sizeof text-1));
+    T(press(e,key(XKB_KEY_Return,PLAT_MOD_CTRL|PLAT_MOD_ALT,NULL))==0);
+    T(editor_read(e,0,bytes,sizeof text-1)==0); T(!memcmp(bytes,"fox dog fox",sizeof text-1));
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0);
+    T(editor_read(e,0,bytes,sizeof text-1)==0); T(!memcmp(bytes,"cat dog fox",sizeof text-1));
+    T(press(e,key('Z',PLAT_MOD_CTRL|PLAT_MOD_SHIFT,NULL))==0);
+    T(editor_read(e,0,bytes,sizeof text-1)==0); T(!memcmp(bytes,"fox dog fox",sizeof text-1));
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0);
+    T(editor_read(e,0,bytes,sizeof text-1)==0); T(!memcmp(bytes,text,sizeof text-1));
+    /* Replace all in one group across disjoint offsets, with a shorter value. */
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    (void)findui_set_replacement(&e->find,(const uint8_t *)"x",sizeof "x"-1,sizeof "x"-1);
+    T(press(e,key(XKB_KEY_Return,PLAT_MOD_CTRL|PLAT_MOD_ALT,NULL))==0);
+    T(editor_length(e)==sizeof "x dog x"-1);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0);
+    T(editor_read(e,0,bytes,sizeof text-1)==0); T(!memcmp(bytes,text,sizeof text-1));
+    T(counts.allocations==0 && !counts.active); T(editor_flush(e)==0); editor_close(e);
+    replay_model model={0}; journal_replay_result result;
+    T(journal_replay_file(log,replay,&model,&result)==0); unlink(log);
+    T(model.len==sizeof text-1 && !memcmp(model.bytes,text,sizeof text-1));
+    puts("edit-73j find/replace, disjoint undo/redo and journal recovery passed"); return 0;
+}
+static int findpanel_cancel_error_contract(void)
+{
+    /* G: fits the reserved match cache; the cancellation step deliberately
+     * applies one API budget unit before Escape, so the prefix is deterministic. */
+    const size_t matches=LAYOUT_CLUSTER_CACHE/2u, length=matches*2u;
+    uint8_t *text=malloc(length); T(text);
+    for (size_t i=0;i<length;i++) text[i]=i%2u ? ' ' : 'a';
+    char log[]="build/73j-cancel-XXXXXX"; int fd=mkstemp(log); T(fd>=0); close(fd);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=text,.initial_len=length,.cols=40,.rows=8,.journal_path=log};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0); T(press(e,key('a',0,"a"))==0);
+    T(findui_get_state(&e->find).match_count==matches);
+    T(findui_set_replacement(&e->find,(const uint8_t *)"b",sizeof "b"-1,sizeof "b"-1)==FINDUI_OK);
+    plat_event all=key(XKB_KEY_Return,PLAT_MOD_CTRL|PLAT_MOD_ALT,NULL);
+    T(editor_find_key(e,&all)); T(e->find_replace_active);
+    size_t replaced=0;
+    T(findui_replace_step(&e->find,1,0,&replaced)==FINDUI_MORE && replaced==1);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(!e->find_replace_active); T(undo_get_history(e->undo).undo_groups==1);
+    uint8_t *actual=malloc(length); T(actual); T(editor_read(e,0,actual,length)==0);
+    T(actual[length-2u]=='b'); actual[length-2u]='a'; T(!memcmp(actual,text,length));
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0); T(editor_read(e,0,actual,length)==0);
+    T(!memcmp(actual,text,length));
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    uint64_t mutations=e->stats.mutations;
+    /* G: the next allocator request, irrespective of size/free-list class. */
+    e->buffer->piece_storage.fail_request=e->buffer->piece_storage.requests+1u;
+    T(press(e,all)==0);
+    e->buffer->piece_storage.fail_request=0;
+    T(!e->find_replace_active && e->find_error==FINDUI_ERR_UNDO);
+    /* This injected failure occurs after the successful delete prefix; the
+     * host must retain that prefix as an undoable/recoverable group. */
+    T(e->stats.mutations>mutations && editor_length(e)==length-1u);
+    T(undo_get_history(e->undo).undo_groups==1);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(press(e,key('z',PLAT_MOD_CTRL,NULL))==0);
+    T(editor_read(e,0,actual,length)==0); T(!memcmp(actual,text,length));
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key('r',PLAT_MOD_ALT,NULL))==0);
+    T(press(e,key(XKB_KEY_Home,0,NULL))==0); T(press(e,key(XKB_KEY_Delete,0,NULL))==0);
+    T(press(e,key('[',0,"["))==0);
+    T(findui_get_state(&e->find).search_error!=FIND_OK);
+    T(press(e,all)==0); T(e->find_replace_request==0 && !e->find_replace_active);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(editor_flush(e)==0); editor_close(e);
+    review_bytes replayed={actual,0,length}; journal_replay_result result;
+    T(journal_replay_file(log,review_replay_bytes,&replayed,&result)==0);
+    T(replayed.len==length && !memcmp(actual,text,length));
+    unlink(log); free(actual); free(text);
+    puts("edit-73j replacement Escape/error prefixes, undo and recovery passed"); return 0;
+}
+static int findpanel_far_wrap_contract(void)
+{
+    editor_config cfg={.cols=40,.rows=8,.wrap_mode=1};
+    /* G: two configured viewport cell areas, subtracting the existing minimap
+     * and tab-strip geometry; the unique match lies beyond the first screen. */
+    size_t length=(size_t)(cfg.cols-8u)*(cfg.rows-1u)*2u;
+    uint8_t *text=malloc(length); T(text); memset(text,'x',length);
+    const char needle[]="token"; size_t at=length-(sizeof needle-1u);
+    memcpy(text+at,needle,sizeof needle-1u);
+    cfg.initial=text; cfg.initial_len=length;
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0); T(press(e,key('t',0,needle))==0);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+    T(editor_view(e).selection.anchor==at && editor_view(e).selection.cursor==length);
+    T(editor_view(e).visual_byte>0);
+    T(e->lay.wrap_rows[0].start<=at && e->lay.wrap_rows[0].end>=length);
+    editor_close(e); memset(&backend,0,sizeof backend); T(render_null_backend(&backend)==0);
+    cfg.wrap_mode=-1;
+    T(editor_open(&e,&cfg,&backend)==0); free(text); T(settle(e)==0);
+    T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0); T(press(e,key('t',0,needle))==0);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+    T(editor_view(e).selection.anchor==at && editor_view(e).selection.cursor==length);
+    T(editor_view(e).hscroll>0);
+    editor_close(e); puts("edit-73j distant wrapped/clipped find results are visible passed"); return 0;
+}
+static int unicode_editor_contract(void)
+{
+    const char text[]="é é 界";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,.cols=40,.rows=8};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    const render_cell *cell=&e->text_grid.cells[e->lay.gw];
+    T(cell->atlas_slot>=LAYOUT_ASCII_GLYPHS && cell->atlas_slot!=RENDER_NO_SLOT);
+    T(e->grid.glyphs==e->text_grid.glyphs && e->grid.pages==e->text_grid.pages);
+    const render_glyph *image=&e->grid.glyphs[cell->atlas_slot];
+    T(e->grid.page_count>image->page); /* page placement belongs to the edit-08z owner */
+    const render_atlas_page *page=&e->grid.pages[image->page]; bool ink=false;
+    for (uint32_t y=0;y<image->h;y++) for (uint32_t x=0;x<image->w;x++)
+        ink |= page->pixels[(image->y+y)*page->stride+image->x+x]!=0;
+    T(ink);
+    const render_cell *combined=&e->text_grid.cells[e->lay.gw+2u]; /* é, space, e+mark */
+    T(combined->atlas_slot>=LAYOUT_ASCII_GLYPHS && combined->atlas_slot!=RENDER_NO_SLOT);
+    const render_cell *wide=&e->text_grid.cells[e->lay.gw+4u]; /* preceding clusters occupy four cells */
+    T((wide->attrs&RENDER_ATTR_WIDE_LEFT)!=0);
+    /* The wide glyph's image depends on an installed CJK fallback (edit-08z owner). */
+    /* Unicode tab titles: owned by edit-08z chrome lookup; a path title such as
+     * "73j-å文" currently renders blank after its ASCII prefix on main too. */
+    editor_close(e); puts("edit-73j production Unicode body atlas contract passed"); return 0;
+}
+static int minimap_protected_contract(void)
+{
+    /* G: reuse two index chunks; the viewport occupies the first, and the
+     * second supplies a dispersed minimap sample. Protect one OS page only. */
+    size_t length=2u*LINEIDX_CHUNK;
+    uint8_t *text=malloc(length); T(text);
+    for (size_t i=0;i<length;i++) text[i]=i%MINIMAP_LINE_CAP==MINIMAP_LINE_CAP-1u ? '\n' : 'x';
+    char path[]="build/73j-map-XXXXXX"; int fd=mkstemp(path); T(fd>=0);
+    T(write(fd,text,length)==(ssize_t)length); close(fd); free(text);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.path=path,.copy_threshold=1,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0);
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000); /* existing settle bound */
+    while (e->buffer->pending_open || !editor_index_complete(e) ||
+        !e->buffer->map.filled || e->buffer->map.stale || e->dirty || e->buffer->map_snapshot) {
+        T(editor_step(e,0)>=0); T(trace_now_ns()<deadline); sched_yield();
+    }
+    review_hold hold={0}; work_handle handle=work_submit(&e->pool,(work_job){review_hold_job,&hold,0,WORK_BULK}); T(handle.epoch);
+    while (!atomic_load(&hold.entered)) { T(trace_now_ns()<deadline); sched_yield(); }
+    piece_snapshot *snapshot=piece_snapshot_take(e->tree); T(snapshot);
+    const uint8_t *bytes=NULL; size_t size=0;
+    T(file_snapshot_bytes(snapshot,NULL,&bytes,&size)==1 && size==length);
+    long page=sysconf(_SC_PAGESIZE); T(page>0);
+    uint8_t *protected_page=(uint8_t *)(uintptr_t)(bytes+LINEIDX_CHUNK);
+    T((uintptr_t)protected_page%(uintptr_t)page==0);
+    T(mprotect(protected_page,(size_t)page,PROT_NONE)==0);
+    T(editor_begin_frame(e)==0); e->buffer->map.revision++;
+    /* Calling compose directly excludes the deliberately blocked worker and
+     * isolates the UI cached-publication contract from text layout. */
+    int rc=editor_compose(e);
+    T(mprotect(protected_page,(size_t)page,PROT_READ)==0);
+    T(rc==0); atomic_store(&hold.release,true);
+    piece_snapshot_release(snapshot); editor_close(e); unlink(path);
+    puts("edit-73j protected remote minimap sample: UI compose passed"); return 0;
+}
+static int minimap_pending_contract(void)
+{
+    const char text[]="a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    /* A pending index must still navigate; no exact cache/index query needed. */
+    lineidx_destroy(e->buffer->index); e->buffer->index=lineidx_create(editor_length(e)); T(e->buffer->index);
+    e->buffer->lg.lines_exact=false;
+    plat_event ev={.kind=PLAT_EV_BUTTON,.code=1,.press=true,
+        .x=(int32_t)(e->text_grid.dims.cols*e->grid.dims.cell_w),
+        .y=(int32_t)((e->grid.dims.rows-1)*e->grid.dims.cell_h)};
+    T(press(e,ev)==0); T(editor_view(e).first_byte>0);
+    editor_close(e); puts("edit-73j pending minimap navigation passed"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -2550,6 +2860,14 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
         if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
         if (!strcmp(argv[1], "--minimap-pixels")) return minimap_compose_pixels(NULL);
+        if (!strcmp(argv[1], "--73j-headless")) return mouse_contract() || wheel_contract() ||
+            findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract() || unicode_editor_contract() || minimap_pending_contract() || minimap_protected_contract() ||
+            minimap_typing_flash() || script(false) || allocation_test(false);
+        if (!strcmp(argv[1], "--73j-find")) return findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract();
+        if (!strcmp(argv[1], "--73j-font")) return unicode_editor_contract();
+        if (!strcmp(argv[1], "--73j-minimap")) return minimap_pending_contract() || minimap_protected_contract();
+        if (!strcmp(argv[1], "--73j-mouse")) return mouse_contract();
+        if (!strcmp(argv[1], "--73j-wheel")) return wheel_contract();
         if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
         if (!strcmp(argv[1], "--selection-chords")) return selection_chords();
         if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
@@ -2588,6 +2906,8 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(minimap_compose_pixels(NULL) == 0);
+    T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
+    T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);
     T(minimap_typing_flash() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);

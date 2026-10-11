@@ -41,6 +41,8 @@ static void joined_line_anchor(editor *e, uint64_t off, uint64_t line)
 static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t old_nl, uint64_t new_nl)
 {
     e->repair_line_valid = false;
+    e->wheel_pending=false; e->wrap_wheel_rows=0;
+    e->find_range_count=0;
     e->paint_ready = false; e->buffer->revision++;
     e->stats.mutations++; e->buffer->lines = e->buffer->lines - old_nl + new_nl;
     if (e->buffer->index) {
@@ -374,6 +376,19 @@ static bool move_key(keys_action action, view_key *out)
     }
     return true;
 }
+static void pointer_unit_finish(editor *e)
+{
+    if (!e->pointer_unit_pending) return;
+    e->pointer_unit_pending=false;
+    uint64_t lo=min64(e->v.state.selection.anchor,e->v.state.selection.cursor);
+    uint64_t hi=max64(e->v.state.selection.anchor,e->v.state.selection.cursor);
+    if (e->pointer_unit_initial) { e->text_drag_lo=lo; e->text_drag_hi=hi; }
+    else if (lo<e->text_drag_lo) {
+        e->v.state.selection.anchor=e->text_drag_hi; e->v.state.selection.cursor=lo;
+    } else {
+        e->v.state.selection.anchor=e->text_drag_lo; e->v.state.selection.cursor=hi>e->text_drag_hi ? hi : e->text_drag_hi;
+    }
+}
 int editor_continue_action(editor *e)
 {
     if (e->action == EDITOR_ACTION_CLIP) return editor_clip_continue(e);
@@ -390,6 +405,7 @@ int editor_continue_action(editor *e)
     if (e->action == EDITOR_ACTION_REPAIR) return finish_edit(e);
     if (e->action == EDITOR_ACTION_REPLAY) return finish_replay_follow(e);
     e->action = EDITOR_ACTION_NONE;
+    pointer_unit_finish(e);
     return editor_refresh_cursor(e, e->old_cursor);
 }
 bool editor_event_control(const editor *e, const plat_event *ev)
@@ -413,6 +429,9 @@ bool editor_event_control(const editor *e, const plat_event *ev)
 }
 int editor_handle_key(editor *e, const plat_event *ev)
 {
+    if (ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
+        (void)editor_find_key(e,ev); return 0;
+    }
     if (e->buffer->source_stale && !editor_event_control(e, ev)) {
         if (!e->buffer->prompt_ns || e->buffer->prompt_generation != e->buffer->source_generation ||
             e->dispatch_serial <= e->buffer->prompt_serial || ev->mods || ev->repeat ||
@@ -425,6 +444,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R) tabs_mru_release(&e->tabs);
         return 0;
     }
+    if (editor_find_key(e, ev)) return 0;
     const keys_binding *binding = NULL;
     keys_result result = config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
@@ -534,12 +554,40 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (rc) return rc;
     return editor_continue_action(e);
 }
+/* edit-73j: wrapped wheel input only. 3kk's scroll path owns unwrapped
+ * wheel motion (editor_handle_wheel); while wrapped it maintains no state, so
+ * displacement accumulates here and steps prepared visual rows. */
+static int wrap_wheel(editor *e, const plat_event *ev)
+{
+    if (!ev->dy) return 0;
+    if (e->wheel.request==SCROLL_BYTE) { e->find_scroll=false; e->wheel_pending=false; e->wheel_resolver=(scroll_resolver){0}; }
+    if (!e->wheel_pending) {
+        uint64_t sub=e->wheel.subrow_q8;
+        int rc=scroll_init(&e->wheel,(scroll_config){e->text_grid.dims.rows,1,0},
+            (scroll_extent){piece_len(e->tree),e->buffer->lines,e->buffer->lg.lines_exact});
+        if (rc) return rc;
+        e->wheel.first_line=e->v.state.first_line; e->wheel.first_byte=e->v.state.first_byte;
+        e->wheel.subrow_q8=sub; e->wheel_resolver=(scroll_resolver){0};
+    }
+    /* Relative wheel accumulation has no logical-line clamp. The anchor
+     * is an internal displacement accumulator; row boundaries come only
+     * from layout_visual_row, including its EOF result. */
+    e->wheel.extent.lines=e->wheel.extent.bytes+1u; e->wheel.extent.exact=false;
+    e->wheel.first_line=e->wheel.extent.bytes/2u;
+    uint64_t before=e->wheel.first_line;
+    int rc=scroll_wheel(&e->wheel,ev->dy); if (rc) return rc;
+    e->wrap_wheel_rows+=e->wheel.first_line>=before ? (int64_t)(e->wheel.first_line-before) : -(int64_t)(before-e->wheel.first_line);
+    e->wheel_pending=e->wrap_wheel_rows!=0;
+    return editor_wheel_continue(e);
+}
 int editor_handle_wheel(editor *e, const plat_event *ev)
 {
     if (e->buffer->source_stale || e->buffer->pending_open || !tabs_count(&e->tabs)) return 0;
     /* Wrapped visual metadata is owned by the wrap integration, not the
-     * logical line-index adapter. Never reinterpret logical rows as visual. */
-    if (e->v.state.wrap) return 0;
+     * logical line-index adapter. Never reinterpret logical rows as visual:
+     * wrapped input steps prepared visual rows (edit-73j, wrap_wheel). */
+    if (e->v.state.wrap) return wrap_wheel(e, ev);
+    e->wheel_pending = false; e->find_scroll = false; /* wheel cancels a pending jump */
     editor_buffer *b = e->buffer;
     b->scroll_following = false;
     int rc = scroll_wheel(&b->scroll, ev->dy); if (rc) return rc;
@@ -553,4 +601,205 @@ int editor_handle_wheel(editor *e, const plat_event *ev)
     trace_record_at(ev->t0_ns ? ev->t0_ns : now, TRACE_T0_INGRESS, e->grid.frame_id);
     trace_record_at(now, TRACE_T1_DEQUEUE, e->grid.frame_id);
     return editor_scroll_slice(e);
+}
+
+/* Source-free hit testing from the exact cluster/cell metadata layout drew. */
+static bool pointer_byte(editor *e, uint32_t row, uint32_t cell, uint32_t pixel, uint64_t *out)
+{
+    const editor_hit *hit=&e->hits[(size_t)row*e->max_cols+cell];
+    if (!hit->width) return false;
+    uint64_t position=(uint64_t)hit->within*e->grid.dims.cell_w+pixel;
+    *out=position*2u>=(uint64_t)hit->width*e->grid.dims.cell_w ? hit->after : hit->before;
+    return true;
+}
+int editor_pointer(editor *e, const plat_event *ev)
+{
+    if (ev->kind==PLAT_EV_BUTTON && ev->code==1 && !ev->press) e->text_drag=false;
+    int64_t row=ev->y<0 ? -1 : (int64_t)ev->y/e->grid.dims.cell_h-e->tab_rows;
+    int64_t col=ev->x<0 ? -1 : (int64_t)ev->x/e->grid.dims.cell_w;
+    if (!e->v.state.wrap && !e->panel_rows && row>=0) {
+        /* edit-3kk: invert the frame's Q8 origin/overscan transform. */
+        uint32_t ordinal; uint64_t within;
+        int64_t local=((int64_t)ev->y-(int64_t)e->tab_rows*e->grid.dims.cell_h)*SCROLL_PIXEL_UNIT;
+        if (scroll_frame_hit(&e->scroll_plan,local,&ordinal,&within)==SCROLL_OK) row=ordinal;
+    }
+    uint32_t text_rows=e->v.config.rows; /* visible rows: no overscan, no find panel */
+    bool down=ev->kind==PLAT_EV_BUTTON && ev->code==1 && ev->press;
+    if (e->text_drag && (e->text_drag_id!=e->buffer->id ||
+        e->text_drag_generation!=e->buffer->source_generation)) e->text_drag=false;
+    bool motion=ev->kind==PLAT_EV_MOTION && e->text_drag;
+    if (e->buffer->pending_open || e->buffer->source_stale ||
+        (!down && !motion) || (down && (row<0 || row>=text_rows ||
+        col<0 || col>=e->text_grid.dims.cols))) return editor_chrome_pointer(e,ev);
+    if (row<0) row=0;
+    if (row>=text_rows) row=text_rows-1;
+    if (col<0) col=0;
+    if (col>=e->text_grid.dims.cols) col=e->text_grid.dims.cols-1;
+    uint64_t byte;
+    if (layout_busy(&e->lay) || !pointer_byte(e,(uint32_t)row,(uint32_t)col,ev->x<0 ? 0u : (uint32_t)ev->x%e->grid.dims.cell_w,&byte)) return 0;
+    e->old_selection=e->v.state.selection; e->old_cursor=e->old_selection.cursor;
+    undo_break_burst(e->undo); editor_restart_blink(e,trace_now_ns());
+    e->v.state.selection.cursor=byte; e->v.state.visual_end=false;
+    e->v.state.selection.preferred_col=VIEW_PREFERRED_UNSET;
+    if (down) {
+        e->wheel_pending=false; e->find_scroll=false;
+        e->text_drag=true; e->text_drag_id=e->buffer->id;
+        e->text_drag_generation=e->buffer->source_generation;
+        uint64_t now=ev->t0_ns ? ev->t0_ns : trace_now_ns();
+        /* E: reuse the existing blink interval as the click-chain interval;
+         * no delay is imposed on handling any click. Same cell and buffer only. */
+        bool chain=e->click_ns && now>=e->click_ns && now-e->click_ns<=EDITOR_BLINK_NS &&
+            e->click_row==(uint32_t)row && e->click_col==(uint32_t)col;
+        e->click_count=chain ? e->click_count%3u+1u : 1u;
+        e->text_drag_mode=(ev->mods&PLAT_MOD_SHIFT) ? 1u : e->click_count;
+        e->click_ns=now; e->click_row=(uint32_t)row; e->click_col=(uint32_t)col; e->click_byte=byte;
+        if (!(ev->mods&PLAT_MOD_SHIFT)) e->v.state.selection.anchor=byte;
+        if (e->click_count>1 && !(ev->mods&PLAT_MOD_SHIFT)) {
+            e->pointer_unit_pending=true; e->pointer_unit_initial=true;
+            editor_seed_view_lines(e); e->action=EDITOR_ACTION_MOVE;
+            view_change change;
+            int rc=view_command(&e->v,e->click_count==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE,false,NULL,0,&change);
+            if (rc==VIEW_MORE) return 0;
+            if (rc) return rc;
+            e->action=EDITOR_ACTION_NONE; pointer_unit_finish(e);
+        }
+    } else if (e->text_drag_mode>1) {
+        e->v.state.selection.anchor=byte;
+        e->pointer_unit_pending=true; e->pointer_unit_initial=false;
+        e->action=EDITOR_ACTION_MOVE; editor_seed_view_lines(e);
+        view_change change;
+        int rc=view_command(&e->v,e->text_drag_mode==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE,false,NULL,0,&change);
+        if (rc==VIEW_MORE) return 0;
+        if (rc) return rc;
+        e->action=EDITOR_ACTION_NONE; pointer_unit_finish(e);
+    }
+    return editor_refresh_cursor(e,e->old_cursor);
+}
+static int find_horizontal_follow(editor *e)
+{
+    uint64_t start=e->v.state.first_byte, target=e->v.state.selection.anchor;
+    if (target<start) return EDITOR_ERR_ARG;
+    uint64_t offset=target-start, available=piece_len(e->tree)-start;
+    size_t n=(size_t)(available<LAYOUT_BYTE_BUDGET ? available : LAYOUT_BYTE_BUDGET);
+    uint64_t column=offset;
+    if (offset<=n) {
+        if (piece_read(e->tree,start,e->indent_bytes,n)) return LAYOUT_ERR_SOURCE;
+        size_t at=0; column=0;
+        while (at<offset) {
+            size_t step=utf8_grapheme_next(e->indent_bytes+at,n-at);
+            if (!step || step>offset-at) break;
+            column+=e->indent_bytes[at]=='\t' ? e->lay.tab-column%e->lay.tab :
+                (uint64_t)utf8_cluster_width(e->indent_bytes+at,step);
+            at+=step;
+        }
+    } else e->v.state.approximate=true;
+    uint64_t left=column>e->lay.text_cols ? column-e->lay.text_cols/2u : 0;
+    e->v.state.hscroll=left<LAYOUT_MAX_HSCROLL ? left : LAYOUT_MAX_HSCROLL;
+    return 0;
+}
+bool editor_wheel_ready(const editor *e)
+{
+    if (!e->wheel_pending) return false;
+    const editor_buffer *b=e->buffer;
+    /* Waiting on 3kk's scroll slice or on its resident window is not work. */
+    if (e->find_scroll && !e->v.state.wrap) return !b->scroll_pending;
+    if (e->v.state.wrap && e->wheel.request==SCROLL_BYTE) return !b->scroll_resident.pending;
+    return true;
+}
+int editor_wheel_continue(editor *e)
+{
+    if (!e->wheel_pending) return 0;
+    editor_buffer *b=e->buffer;
+    if (b->source_stale || b->pending_open || !tabs_count(&e->tabs)) {
+        e->wheel_pending=false; e->find_scroll=false; e->wrap_wheel_rows=0; return 0;
+    }
+    if (e->find_scroll && !e->v.state.wrap) {
+        /* The seek went through editor_scroll_seek; once 3kk adopted the
+         * target line, follow horizontally (hscroll is not scroll state). */
+        if (b->scroll_pending) return 0;
+        e->wheel_pending=false; e->find_scroll=false;
+        int rc=find_horizontal_follow(e); if (rc) return rc;
+        return editor_full_layout(e);
+    }
+    if (e->v.state.wrap && e->wheel.request!=SCROLL_BYTE) {
+        layout_wrap_row next; bool approximate;
+        int direction=e->wrap_wheel_rows<0 ? -1 : 1;
+        int rc=layout_visual_row(&e->lay,e->tree,e->v.state.visual_byte,direction,&next,&approximate);
+        if (rc) { e->wheel_pending=false; e->wrap_wheel_rows=0; return rc; }
+        if (next.start==e->v.state.visual_byte) e->wrap_wheel_rows=0;
+        else {
+            e->v.state.visual_byte=next.start; e->v.state.first_line=next.line;
+            e->v.state.first_byte=next.line_start; e->v.state.approximate=approximate;
+            e->wrap_wheel_rows-=direction;
+        }
+        e->wheel_pending=e->wrap_wheel_rows!=0;
+        return editor_full_layout(e);
+    }
+    if (!e->v.state.wrap) { e->wheel_pending=false; e->find_scroll=false; return 0; }
+    /* Wrapped byte seek (far find result, pending minimap target): resolve
+     * the logical line through the buffer's one resident window, then
+     * anchor the visual row. */
+    int rc=editor_scroll_resolve(e,&e->wheel,&e->wheel_resolver);
+    if (rc==SCROLL_MORE) return 0;
+    e->wheel_pending=false;
+    if (rc) { e->find_scroll=false; return rc; }
+    e->v.state.first_line=e->wheel.first_line;
+    e->v.state.first_byte=e->v.state.visual_byte=e->wheel.first_byte;
+    b->lg.top_estimated=e->wheel.approximate;
+    e->v.state.approximate=e->wheel.approximate;
+    if (e->find_scroll) {
+        bool approximate;
+        rc=layout_visual_row_anchored(&e->lay,e->tree,e->v.state.selection.anchor,
+            e->wheel.first_byte,e->wheel.first_line,&e->visual_seed,&approximate);
+        if (rc) { e->find_scroll=false; return rc; }
+        e->visual_seed_valid=true; e->v.state.visual_byte=e->visual_seed.start;
+        e->v.state.approximate|=approximate;
+    }
+    e->find_scroll=false;
+    return editor_full_layout(e);
+}
+
+/* findui owns the explicit undo group; these callbacks own every successful
+ * mutation's editor index/layout/history/journal accounting. */
+findui_mutation_result editor_find_delete(void *ctx, undo_log *undo, uint64_t off, uint64_t len,
+    uint64_t when, const undo_state *before, const undo_state *after)
+{
+    editor *e=ctx; uint64_t nl=newlines(e,off,len);
+    int rc=undo_delete(undo,off,len,UNDO_DELETE,when,before,after);
+    if (rc) return (findui_mutation_result){rc,false};
+    if (off<e->edit_delta.off) e->edit_delta.off=off;
+    if (off+len>e->find_replace_end) e->find_replace_end=off+len;
+    e->edit_delta.old+=len;
+    rc=stage_delete(e,off,len); if (!rc) rc=changed(e,off,len,0,nl,0);
+    return (findui_mutation_result){rc,true};
+}
+findui_mutation_result editor_find_insert(void *ctx, undo_log *undo, uint64_t off, const uint8_t *bytes,
+    size_t len, uint64_t when, const undo_state *before, const undo_state *after)
+{
+    editor *e=ctx; uint64_t nl=0;
+    for (size_t i=0;i<len;i++) nl+=bytes[i]=='\n' ? 1u : 0u;
+    int rc=undo_insert(undo,off,bytes,len,when,before,after);
+    if (rc) return (findui_mutation_result){rc,false};
+    if (off<e->edit_delta.off) e->edit_delta.off=off;
+    if (off>e->find_replace_end) e->find_replace_end=off;
+    e->edit_delta.add+=len;
+    rc=stage_insert(e,off,bytes,len); if (!rc) rc=changed(e,off,0,len,0,nl);
+    return (findui_mutation_result){rc,true};
+}
+void editor_find_replace_finish(editor *e)
+{
+    if (e->v.state.selection.cursor>piece_len(e->tree)) e->v.state.selection.cursor=piece_len(e->tree);
+    if (e->v.state.selection.anchor>piece_len(e->tree)) e->v.state.selection.anchor=piece_len(e->tree);
+    if (e->edit_delta.old || e->edit_delta.add) {
+        /* Replay represents the coalesced interval between the leftmost and
+         * rightmost mutation, including unchanged gaps between replacements.
+         * A single replacement must never journal/scan the untouched suffix. */
+        uint64_t deleted=e->edit_delta.old, inserted=e->edit_delta.add;
+        e->edit_delta.old=e->find_replace_end-e->edit_delta.off;
+        e->edit_delta.add=e->edit_delta.old-deleted+inserted;
+        e->edit_delta.after=save_selection(&e->v);
+        remember(e,e->edit_delta); editor_modified(e);
+    }
+    e->find_replace_active=false; e->find_id=0;
+    e->full_pending=true; e->paint_ready=false;
 }

@@ -327,6 +327,9 @@ int layout_run(layout *l)
         render_cell *row = row_ptr(l);
         if (l->phase == 0) {
             uint64_t start = l->row_byte[l->row];
+            l->hit_cr=false;
+            if (l->cfg.hit) l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->grid->dims.cols,0,1,
+                start==LAYOUT_VOID_ROW ? l->total : start,start==LAYOUT_VOID_ROW ? l->total : start);
             if (start == LAYOUT_VOID_ROW) {
                 write_gutter(l, row, 0, false);
                 if (l->row + 1 < nrows) l->row_byte[l->row + 1] = LAYOUT_VOID_ROW;
@@ -367,6 +370,7 @@ int layout_run(layout *l)
                 uint64_t at = l->pos;
                 if (!l->cluster_active && b >= 0x20 && b < 0x7f && (avail >= 2 ? p[1] < 0x80 : l->win_eof)) {      /* ASCII fast path */
                     if (l->col >= hscroll) {
+                        if (l->cfg.hit) l->cfg.hit(l->cfg.hit_ctx,l->row,gw+l->vis,1,0,1,at,at+1u);
                         render_cell *c = &tx[l->vis++];
                         c->fg = l->cfg.fg; c->bg = l->cfg.bg; c->attrs = 0; c->reserved = 0;
                         if (b == ' ') { c->glyph_index = 0; c->atlas_slot = RENDER_NO_SLOT; }
@@ -376,9 +380,13 @@ int layout_run(layout *l)
                     l->col++; layout_consume(l, 1); units++;
                     continue;
                 }
-                if (!l->cluster_active && b == '\r' && avail >= 2 && p[1] == '\n') { layout_consume(l, 1); continue; }
+                if (!l->cluster_active && b == '\r' && avail >= 2 && p[1] == '\n') { l->hit_cr=true; layout_consume(l, 1); continue; }
                 if (!l->cluster_active && b == '\t') {
                     uint32_t w = tab - (uint32_t)(l->col % tab);
+                    uint32_t skip=l->col<hscroll ? (uint32_t)(hscroll-l->col<w ? hscroll-l->col : w) : 0;
+                    uint32_t visible=w-skip;
+                    if (visible>text_cols-l->vis) visible=text_cols-l->vis;
+                    if (l->cfg.hit && visible) l->cfg.hit(l->cfg.hit_ctx,l->row,gw+l->vis,visible,skip,w,at,at+1u);
                     for (uint32_t k = 0; k < w && l->vis < text_cols; k++) {
                         if (l->col + k < hscroll) continue;
                         render_cell *c = &tx[l->vis++];
@@ -435,6 +443,10 @@ int layout_run(layout *l)
                 }
                 uint64_t c0 = l->col, c1 = l->col + (uint32_t)w;
                 if (c1 > hscroll) {
+                    uint32_t skip=c0<hscroll ? (uint32_t)(hscroll-c0) : 0;
+                    uint32_t visible=(uint32_t)w-skip;
+                    if (visible>text_cols-l->vis) visible=text_cols-l->vis;
+                    if (l->cfg.hit && visible) l->cfg.hit(l->cfg.hit_ctx,l->row,gw+l->vis,visible,skip,(uint32_t)w,at,l->pos);
                     uint32_t fg = l->cfg.fg, bg = l->cfg.bg;
                     if (l->marks) style_at(l, at, &fg, &bg, &attrs);
                     if (w == 1) {
@@ -493,6 +505,10 @@ int layout_run(layout *l)
         }
         if (!ended) break;
         /* row complete: cursor sitting on the newline / EOF draws a blank cursor cell */
+        if (l->cfg.hit && l->vis<text_cols) {
+            uint64_t end=l->pos-(nl && l->hit_cr ? 1u : 0u);
+            l->cfg.hit(l->cfg.hit_ctx,l->row,gw+l->vis,text_cols-l->vis,0,1,end,end);
+        }
         uint32_t written = gw + l->vis;
         if (l->marks && l->vis < text_cols && l->col >= hscroll && row_cursor_end(l, nl)) {
             render_cell *c = &tx[l->vis];

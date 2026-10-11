@@ -8,6 +8,15 @@ remains with its existing bead and must consistently use the true em scale.
 
 Evidence: [worker report](../../docs/worker-reports/edit-m3g.md).
 Derivation and resource choices: [decision](../../docs/decisions/edit-m3g.md).
+# edit-73j editor runtime integration
+
+The editor now prepares/adopts the runtime owner through the worker mailbox,
+reserves the existing runtime/GL descriptor cap and atlas limits, binds body
+and title lookup, and keeps owner storage through backend shutdown. The
+existing descriptor cap is exported as `FONT_RUNTIME_MAX_GLYPHS` with unchanged
+validation. Actual-editor Unicode body/title cell/pixel regressions pass;
+native display acceptance remains with the coordinator. Evidence and limits:
+[worker report](../../docs/worker-reports/edit-73j.md).
 
 # Font status — P4.11b / edit-457.19
 

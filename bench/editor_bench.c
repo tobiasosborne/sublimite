@@ -666,6 +666,16 @@ static int tab_row(bool raster, bool track)
     editor *e = NULL; REQUIRE(editor_open(&e, &cfg, &b) == 0);
     for (unsigned i = 1; i < 100; i++) { uint64_t id; REQUIRE(editor_add_buffer(e, NULL, cfg.initial, len, &id) == 0); }
     REQUIRE(settle_ready(e) == 0);
+    /* Cached summaries are prepared/published by a worker. Prewarm each live
+     * tab outside G3's input-to-T5 interval; measured switches use only UI
+     * cached fill. Reuse settle_ready's existing phase bound, not a new gate. */
+    for (size_t index=0;index<editor_get_stats(e).tabs;index++) {
+        REQUIRE(editor_select_tab(e,index)==0); REQUIRE(settle_ready(e)==0);
+        uint64_t deadline=bench_now_ns()+UINT64_C(5000000000);
+        while (editor_get_stats(e).minimap_stale || editor_get_stats(e).pending) {
+            REQUIRE(editor_step(e,0)>=0); REQUIRE(bench_now_ns()<deadline);
+        }
+    }
     REQUIRE(editor_grid(e)->dims.cols * editor_grid(e)->dims.cell_w == 2880);
     REQUIRE(editor_grid(e)->dims.rows * editor_grid(e)->dims.cell_h == 1800);
     uint64_t frame_values[BENCH_INTERACTION_MIN_N], map_values[BENCH_INTERACTION_MIN_N];

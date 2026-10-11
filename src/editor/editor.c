@@ -2,6 +2,7 @@
 #include "trace/trace.h"
 #include "gl/gl.h"
 #include "raster/raster.h"
+#include <xkbcommon/xkbcommon-keysyms.h>
 #include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>
@@ -144,13 +145,13 @@ int editor_full_layout(editor *e)
         scroll_state planned = e->buffer->scroll_display;
         planned.config = e->buffer->scroll.config;
         rc = scroll_plan_frame(&planned, e->text_grid.dims.cols * e->grid.dims.cell_w,
-            (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h,
+            e->v.config.rows * e->grid.dims.cell_h, /* visible text rows: no find panel (edit-73j) */
             e->submitted_plan_valid ? &e->submitted_plan : NULL, &e->scroll_plan);
         if (rc) return rc;
     } else {
         e->scroll_plan = (scroll_frame_plan){.first_byte = s.visual_byte,
             .clip_width = e->text_grid.dims.cols * e->grid.dims.cell_w,
-            .clip_height = (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h,
+            .clip_height = e->v.config.rows * e->grid.dims.cell_h,
             .row_height = e->grid.dims.cell_h, .layout_rows = e->text_grid.dims.rows,
             .full_damage = true};
     }
@@ -164,14 +165,17 @@ int editor_full_layout(editor *e)
     trace_record(TRACE_STARTUP_FIRST_LAYOUT, 0);
     rc = layout_begin(&e->lay, e->tree, vp); if (rc) return rc;
     if (s.wrap && s.visual_byte != s.first_byte) {
-        layout_wrap_row first; bool approximate;
-        rc = layout_visual_row(&e->lay, e->tree, s.visual_byte, 0, &first, &approximate);
+        layout_wrap_row first; bool approximate=false;
+        if (e->visual_seed_valid && e->visual_seed.start==s.visual_byte && e->visual_seed.line_start==s.first_byte) {
+            first=e->visual_seed; approximate=first.approximate; rc=0;
+        } else rc = layout_visual_row(&e->lay, e->tree, s.visual_byte, 0, &first, &approximate);
         if (!rc) {
             rc = layout_begin_visual(&e->lay, e->tree, vp, &first);
             e->v.state.visual_byte = first.start;
             e->v.state.approximate |= approximate;
         }
     }
+    e->visual_seed_valid=false;
     e->v.config.cols = e->lay.text_cols ? e->lay.text_cols : 1;
     return rc;
 }
@@ -222,6 +226,11 @@ void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
     if (editor_font_receive(e, msg)) return;
+    if (editor_map_receive(e, msg)) return;
+    if (e->find.private_ && findui_accept(&e->find, msg)) {
+        if (editor_begin_frame(e)) e->error=EDITOR_ERR_HISTORY;
+        e->paint_ready=false; return;
+    }
     if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
     if (editor_font_event(e, msg)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
@@ -452,6 +461,17 @@ int editor_resize_grid(editor *e, render_dims dims)
     e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
     rc = font_async_bind(e->fonts, &e->grid); if (rc) return rc;
     rc = font_async_bind(e->fonts, &e->text_grid); if (rc) return rc;
+    return editor_text_geometry(e);
+}
+/* Text rows below the tab strip, less the find panel (edit-73j), plus the
+ * P3.4 overscan row; shared by surface resizes and panel open/close. */
+int editor_text_geometry(editor *e)
+{
+    render_dims dims = e->grid.dims; int rc;
+    e->text_grid.dims.rows = dims.rows - e->tab_rows;
+    uint32_t available=e->text_grid.dims.rows;
+    if (e->panel_rows>=available) e->panel_rows=available>1 ? available-1 : 0;
+    e->text_grid.dims.rows-=e->panel_rows;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
     e->v.config.rows = e->text_grid.dims.rows;
     if (!e->v.state.wrap) e->text_grid.dims.rows++;
@@ -481,7 +501,7 @@ static int nonkey(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
     if (ev->kind == PLAT_EV_EXPOSE) return editor_full_layout(e);
     if (ev->kind == PLAT_EV_RESIZE) {
-        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
+        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; e->text_drag=false;
         e->font.window_width = ev->w; e->font.window_height = ev->h;
         e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
     }
@@ -492,7 +512,7 @@ static int nonkey(editor *e, const plat_event *ev)
             int rc = editor_check_sources(e); if (rc) return rc;
         }
         keys_reset(&e->keys); tabs_mru_release(&e->tabs);
-        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
+        e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; e->text_drag=false;
         editor_restart_blink(e, trace_now_ns());
         return refresh_caret(e);
     }
@@ -558,7 +578,11 @@ static size_t queue_pick(const editor *e)
     }
     for (size_t n = 0; n < e->queue_count; n++) {
         size_t at = (e->queue_head + n) % EDITOR_INPUT_CAP;
-        if (!queued_owner_live(e, at) || editor_event_control(e, &e->queue[at])) return n;
+        const plat_event *event=&e->queue[at];
+        if (!e->buffer->source_stale && !editor_event_control(e,event) &&
+            (event->kind==PLAT_EV_BUTTON || event->kind==PLAT_EV_MOTION) &&
+            (layout_busy(&e->lay) || e->full_pending || !e->paint_ready)) return SIZE_MAX;
+        if (!queued_owner_live(e, at) || editor_event_control(e, event)) return n;
         if (e->queue_owner[at] && e->queue_owner[at] != e->buffer->id) continue;
         if (!e->buffer->pending_open || e->buffer->source_stale) return n;
     }
@@ -588,6 +612,7 @@ static bool runnable(const editor *e)
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
+           e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
@@ -643,6 +668,9 @@ int editor_step(editor *e, int timeout_ms)
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
     editor_refresh_flush(e);
+    if (!rc && e->find.private_) (void)findui_maintain(&e->find);
+    if (!rc) rc = editor_find_service(e);
+    if (!rc) rc = editor_map_service(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
@@ -651,6 +679,9 @@ int editor_step(editor *e, int timeout_ms)
     editor_large_index_progress(e);
     rc = editor_clip_poll(e); if (rc) return fail(e, rc);
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
+    /* Like the scroll slice: one attempt per turn; readiness only decides
+     * whether the input loop may spin on it or the pump may block. */
+    if (e->wheel_pending) { rc = editor_wheel_continue(e); if (rc) return fail(e, rc); }
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
     rc = e->action == EDITOR_ACTION_REPLAY_WORK ? 0 : blink(e, start);
@@ -660,19 +691,29 @@ int editor_step(editor *e, int timeout_ms)
     for (;;) {
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
-        if (!view_busy(&e->v) && e->action != EDITOR_ACTION_REPLAY_WORK) {
+        if (!view_busy(&e->v) && e->action != EDITOR_ACTION_REPLAY_WORK && !e->find_replace_active) {
             rc = editor_preferences_apply(e); if (rc) return fail(e, rc);
         }
-        bool applied = e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK ||
+        bool applied = e->find_replace_active || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK ||
             view_busy(&e->v) || queue_pick(e) != SIZE_MAX;
-        if (e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
+        if (e->find_replace_active) {
+            if (queue_pick(e) != SIZE_MAX) {
+                size_t picked=queue_pick(e), at=(e->queue_head+picked)%EDITOR_INPUT_CAP;
+                plat_event ev=e->queue[at];
+                if (ev.kind==PLAT_EV_KEY && ev.keysym==XKB_KEY_Escape) {
+                    queue_remove(e,picked); (void)editor_find_key(e,&ev);
+                } else if (ev.kind==PLAT_EV_CLOSE) { queue_remove(e,picked); e->quit=true; }
+            }
+            rc=editor_find_replace_continue(e);
+        } else if (e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
         else if (queue_pick(e) != SIZE_MAX) {
             size_t picked = queue_pick(e), at = (e->queue_head + picked) % EDITOR_INPUT_CAP;
             plat_event ev = e->queue[at]; bool live = queued_owner_live(e, at);
             e->dispatch_serial = e->queue_serial[at];
             queue_remove(e, picked);
             rc = !live ? 0 : ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
-        } else if (layout_busy(&e->lay)) {
+        } else if (editor_wheel_ready(e)) rc = editor_wheel_continue(e);
+        else if (layout_busy(&e->lay)) {
             rc = layout_slice(e);
             if (rc >= 0) rc = 0;
         } else if (e->full_pending) {
@@ -777,7 +818,9 @@ editor_stats editor_get_stats(const editor *e)
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
+        e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||
+        e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }

@@ -181,7 +181,7 @@ static void p4_ops(const uint8_t *data, size_t size)
          * default burst contracts exercise same-time automatic grouping. */
         plat_event ev = {.kind = PLAT_EV_KEY, .press = true,
             .t0_ns = (i / 4u + 1u) * (UNDO_BURST_NS + 1u)}; bool inject = true;
-        unsigned op = data[i] % 12u;
+        unsigned op = data[i] % 14u; /* existing cases plus pointer and wheel */
         if (!m && op < 7) op = 8;
         switch (op) {
         case 0: {
@@ -234,7 +234,28 @@ static void p4_ops(const uint8_t *data, size_t size)
             inject = false;
             if (editor_get_stats(e).tabs) EDIT_ASSERT(editor_select_tab(e, data[i + 1] % editor_get_stats(e).tabs) == 0);
             break;
-        default: ev.keysym = 'f'; ev.mods = PLAT_MOD_CTRL; break;
+        case 11: {
+            ev.keysym='f'; ev.mods=PLAT_MOD_CTRL;
+            EDIT_ASSERT(editor_inject(e,&ev)==0); settle(e);
+            plat_event query={.kind=PLAT_EV_KEY,.press=true,.keysym='x',.utf8_len=1,
+                .utf8={(uint8_t)('a'+data[i+1]%26u)}}; /* ASCII alphabet */
+            EDIT_ASSERT(editor_inject(e,&query)==0); settle(e);
+            ev.keysym=XKB_KEY_Escape; ev.mods=0; break;
+        }
+        case 12: {
+            if (!m) { inject=false; break; }
+            const render_grid *grid=editor_grid(e);
+            view_state state=editor_view(e);
+            m->cursor=m->anchor=(size_t)state.first_byte; m->preferred=SIZE_MAX;
+            ev=(plat_event){.kind=PLAT_EV_BUTTON,.code=1,.press=true,
+                .y=(int32_t)grid->dims.cell_h,
+                .t0_ns=(i/4u+1u)*(2u*UNDO_BURST_NS+1u)}; /* separate click chains */
+            EDIT_ASSERT(editor_inject(e,&ev)==0); settle(e);
+            ev.press=false; break;
+        }
+        default:
+            ev=(plat_event){.kind=PLAT_EV_WHEEL,.dy=(data[i+1]&1u) ? PLAT_WHEEL_UNIT : -PLAT_WHEEL_UNIT};
+            break;
         }
         if (inject) EDIT_ASSERT(editor_inject(e, &ev) == 0);
         settle(e);

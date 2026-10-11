@@ -32,6 +32,23 @@ static int settle(editor *e)
     }
     return EDITOR_MORE;
 }
+/* edit-73j: minimap summaries publish from a worker and start their own
+ * frame. Await that publication before fixtures that count frames or hold a
+ * present; same retry bound as settle. */
+static int settle_map(editor *e)
+{
+    for (unsigned i = 0; i < PROBE_RETRIES; i++) {
+        const editor_buffer *b = e->buffer;
+        /* Mirrors editor_map_service: a job is in flight, or one is due. */
+        minimap_input input = editor_map_input(e->buffer);
+        bool due = e->map_cols && !b->pending_open && !b->source_stale && input.index_ready &&
+            (minimap_stale(&b->map, &input) || b->map.height != e->map_grid.dims.rows);
+        if (!b->map_snapshot && !due) return settle(e);
+        int rc = editor_step(e, 1);
+        if (rc != EDITOR_OK && rc != EDITOR_MORE) return rc;
+    }
+    return EDITOR_MORE;
+}
 typedef struct held_source { piece_snapshot *snap; _Atomic bool entered, release; } held_source;
 static size_t held_span(void *ctx, uint64_t off, const uint8_t **out)
 {
@@ -143,7 +160,7 @@ int main(void)
         .cols = PROBE_COLS, .rows = PROBE_ROWS, .wrap_mode = -1, .hook_ctx = &o,
         .on_submit = submitted, .on_refresh = refreshed};
     CHECK(render_null_backend(&backend) == 0);
-    CHECK(editor_open(&e, &cfg, &backend) == 0 && settle(e) == 0);
+    CHECK(editor_open(&e, &cfg, &backend) == 0 && settle(e) == 0 && settle_map(e) == 0);
     view_selection selection = editor_view(e).selection;
     size_t baseline = o.frames;
     plat_event wheel = {.kind = PLAT_EV_WHEEL, .dy = 1, .smooth = true};

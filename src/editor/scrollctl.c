@@ -13,7 +13,7 @@ static size_t snapshot_span(void *ctx, uint64_t off, const uint8_t **out)
 }
 static scroll_config config(const editor *e)
 {
-    uint32_t rows = e->grid.dims.rows - e->tab_rows;
+    uint32_t rows = e->grid.dims.rows - e->tab_rows - e->panel_rows; /* edit-73j find panel rows are not text */
     /* Preserve view's existing policy: follow only a clipped cursor. */
     return (scroll_config){rows, e->grid.dims.cell_h, 0};
 }
@@ -51,6 +51,21 @@ static int install(editor_buffer *b)
     if (rc) { piece_snapshot_release(snap); return rc; }
     b->scroll_snapshot = snap; b->scroll_revision = b->revision;
     return 0;
+}
+/* edit-73j: a caller-owned byte seek (wrapped find/minimap navigation)
+ * resolved against the buffer's single resident window. Wrapped views do not
+ * use b->scroll, so this shares the window without a second source lease. */
+int editor_scroll_resolve(editor *e, scroll_state *s, scroll_resolver *r)
+{
+    editor_buffer *b = e->buffer;
+    if (!b->scroll_snapshot || b->scroll_revision != b->revision || b->scroll_resident.closing) {
+        int rc = editor_scroll_retire(b);
+        if (rc == EDITOR_MORE) return SCROLL_MORE;
+        if (rc) return rc;
+        rc = install(b); if (rc) return rc;
+        *r = (scroll_resolver){0};
+    }
+    return scroll_resolve_resident(s, r, b->index, &b->scroll_resident, 0, trace_now_ns() + EDITOR_SLICE_NS);
 }
 int editor_scroll_init(editor *e, editor_buffer *b)
 {

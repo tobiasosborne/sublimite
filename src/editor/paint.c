@@ -7,6 +7,12 @@ static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t
 {
     editor *e = ctx;
     if (!e->paint_ready) return;
+    size_t first=0, after=e->find_range_count;
+    while (first<after) {
+        size_t middle=first+(after-first)/2u;
+        if (e->find_ranges[middle].end<=byte) first=middle+1u; else after=middle;
+    }
+    if (first<e->find_range_count && e->find_ranges[first].start<=byte) *bg=0x53667e;
     if (byte == e->bracket_source || byte == e->bracket_mate) {
         *bg = config_theme_color(e->preferences.theme, "bracket.background"); *attrs |= RENDER_ATTR_UNDERLINE;
     }
@@ -21,7 +27,7 @@ static bool byte_visible(editor *e, uint64_t byte)
 {
     if (byte >= piece_len(e->tree)) return false;
     if (e->lay.wrap) {
-        for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
+        for (uint32_t r = 0; r < e->v.config.rows; r++) {
             const layout_wrap_row *row = &e->lay.wrap_rows[r];
             if (row->start != LAYOUT_VOID_ROW && byte >= row->start && byte < row->end) return true;
         }
@@ -54,7 +60,7 @@ int editor_paint_prepare(editor *e)
     if (e->paint_ready) return 0;
     uint64_t lo = e->v.state.wrap ? e->v.state.visual_byte : e->v.state.first_byte;
     uint64_t hi = e->lay.wrap ? lo : e->lay.pos;
-    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
+    for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t end;
         if (e->lay.wrap) end = e->lay.wrap_rows[r].next == LAYOUT_VOID_ROW ? e->lay.wrap_rows[r].end : e->lay.wrap_rows[r].next;
         else end = hi;
@@ -133,9 +139,11 @@ static int compose_chrome(editor *e)
 static int compose_scroll(editor *e)
 {
     e->grid.scroll = (render_scroll){0};
-    if (e->v.state.wrap) return 0;
+    /* The renderer's scroll region runs to the surface bottom (edit-3kk).
+     * With the find panel below the text (edit-73j), draw unshifted rows. */
+    if (e->v.state.wrap || e->panel_rows) return 0;
     uint32_t full = e->grid.dims.cols, tc = e->text_grid.dims.cols;
-    uint32_t visible_rows = e->grid.dims.rows - e->tab_rows;
+    uint32_t visible_rows = e->v.config.rows;
     render_cell *extra = e->grid.cells + (size_t)e->grid.dims.rows * full;
     memcpy(extra, e->text_grid.cells + (size_t)visible_rows * tc, (size_t)tc * sizeof *extra);
     for (uint32_t c = tc; c < full; c++) extra[c] = (render_cell){.atlas_slot = RENDER_NO_SLOT};
@@ -189,7 +197,7 @@ static int compose(editor *e)
     }
     if (e->caret_only || e->glyph_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
-        for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
+        for (uint32_t r = 0; r < e->v.config.rows; r++) {
             if (!(e->text_grid.dirty[r / 64] & (UINT64_C(1) << (r % 64)))) continue;
             render_cell *dst = e->grid.cells + (size_t)(r + e->tab_rows) * full;
             const render_cell *src = e->text_grid.cells + (size_t)r * tc;
@@ -207,16 +215,21 @@ static int compose(editor *e)
         config_theme_color(theme, "gutter.foreground"), config_theme_color(theme, "caret.background"),
         editor_theme_estimated_gutter(config_theme_color(theme, "minimap.foreground"), config_theme_color(theme, "chrome.background"))};
     uint64_t first = e->v.state.first_line, visible = 0;
-    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
+    for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;
         if (line >= first && line - first + 1 > visible) visible = line - first + 1;
     }
     uint64_t start = trace_now_ns();
-    int rc = minimap_fill(&e->buffer->map, &input, &e->map_grid, 0, 8, first, visible, &colors);
+    /* A file-backed first map is prepared here, synchronously (main's path
+     * before edit-73j); every other summary comes from the worker job. */
+    bool sync = e->buffer->map_sync_fill;
+    int rc = sync ? minimap_fill(&e->buffer->map, &input, &e->map_grid, 0, 8, first, visible, &colors) :
+        minimap_fill_cached(&e->buffer->map, &input, &e->map_grid, 0, 8, first, visible, &colors);
+    if (!rc && sync && e->buffer->map.filled) e->buffer->map_sync_fill = false;
     e->stats.minimap_ns = trace_now_ns() - start; e->stats.minimap_fills++;
     if (rc) return rc;
     uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
-    for (uint32_t r = 0; r < e->grid.dims.rows - e->tab_rows; r++) {
+    for (uint32_t r = 0; r < e->v.config.rows; r++) {
         render_cell *dst = e->grid.cells + (size_t)(r + e->tab_rows) * full;
         const render_cell *src = e->text_grid.cells + (size_t)r * tc;
         bool different = memcmp(dst, src, (size_t)tc * sizeof *dst) != 0;
@@ -232,7 +245,7 @@ static int compose(editor *e)
     }
     if (e->map_cols) {
         uint32_t width = e->map_cols * e->grid.dims.cell_w;
-        uint32_t height = (e->grid.dims.rows - e->tab_rows) * e->grid.dims.cell_h;
+        uint32_t height = e->v.config.rows * e->grid.dims.cell_h; /* stops above the find panel (edit-73j) */
         minimap *map = &e->buffer->map;
         bool retained = map->filled && map->height == e->map_grid.dims.rows &&
             map->identity.ctx == input.source.ctx && map->identity.span == input.source.span;
@@ -261,6 +274,7 @@ static int compose(editor *e)
     } else e->grid.region = (render_pixels){0};
     rc = compose_scroll(e); if (rc) return rc;
     rc = compose_chrome(e); if (rc) return rc;
+    rc = editor_find_paint(e); if (rc) return rc;
     if (e->unimplemented_frame == e->grid.frame_id) {
         const char status[] = "not implemented";
         uint32_t row = e->grid.dims.rows - 1u;
@@ -279,7 +293,7 @@ int editor_compose(editor *e)
     trace_record(TRACE_COMPOSE_END, e->grid.frame_id);
     return rc;
 }
-int editor_pointer(editor *e, const plat_event *ev)
+int editor_chrome_pointer(editor *e, const plat_event *ev)
 {
     int64_t col = ev->x < 0 ? -1 : (int64_t)ev->x / e->grid.dims.cell_w;
     int64_t row = ev->y < 0 ? -1 : (int64_t)ev->y / e->grid.dims.cell_h;
@@ -312,8 +326,25 @@ int editor_pointer(editor *e, const plat_event *ev)
     if (e->map_drag && (e->buffer->source_stale || e->buffer->pending_open ||
         e->map_drag_id != e->buffer->id || e->map_drag_generation != e->buffer->source_generation)) e->map_drag = false;
     if (e->map_drag) {
+        e->find_scroll=false; e->wheel_pending=false;
         minimap_input input = editor_map_input(e->buffer); minimap_target target;
-        int rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, ((int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h) / 2, &target);
+        int64_t map_y = ((int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h) / 2;
+        int rc;
+        if (e->buffer->map.sampled || minimap_stale(&e->buffer->map, &input)) {
+            /* edit-73j: a pending/sampled summary still navigates, to an
+             * approximate byte resolved on the scroll path (3kk) when
+             * unwrapped, or through the resident window when wrapped. */
+            rc = minimap_hit_approx(&input, e->map_grid.dims.rows, map_y, &target); if (rc) return rc;
+            e->v.state.hscroll = 0;
+            if (!e->v.state.wrap) { rc = editor_scroll_seek(e, target.byte); return rc ? rc : editor_begin_frame(e); }
+            rc = scroll_init(&e->wheel, (scroll_config){e->v.config.rows, 1, 0},
+                (scroll_extent){input.source.len, input.lines, input.index_ready}); if (rc) return rc;
+            e->wheel.first_byte = e->v.state.first_byte; e->wheel.first_line = e->v.state.first_line;
+            rc = scroll_seek_byte(&e->wheel, target.byte); if (rc) return rc;
+            e->wheel_resolver = (scroll_resolver){0}; e->wheel_pending = true;
+            return editor_wheel_continue(e);
+        }
+        rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, map_y, &target);
         if (rc == MINIMAP_ERR_STALE) return editor_begin_frame(e);
         if (rc) return rc;
         e->v.state.first_line = target.line; e->v.state.first_byte = e->v.state.visual_byte = target.byte;
@@ -322,4 +353,12 @@ int editor_pointer(editor *e, const plat_event *ev)
         return editor_full_layout(e);
     }
     return 0;
+}
+
+void editor_hit_record(void *ctx, uint32_t row, uint32_t column, uint32_t count,
+    uint32_t skip, uint32_t width, uint64_t before, uint64_t after)
+{
+    editor *e=ctx;
+    for (uint32_t c=0;c<count;c++) e->hits[(size_t)row*e->max_cols+column+c]=
+        (editor_hit){before,after,skip+c,width};
 }

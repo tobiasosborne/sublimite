@@ -14,6 +14,7 @@ void editor_close(editor *e)
 {
     if (!e) return;
     config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
+    editor_find_close(e);
     if (e->journal && !e->recovering) (void)editor_flush(e);
     editor_session_close(e);
     if (e->journal) {
@@ -133,7 +134,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     size_t reserve = 2 * e->map_pixel_capacity * sizeof(uint32_t) +
         (size_t)e->map_capacity * 8u * sizeof(render_cell) +
         ((size_t)e->map_capacity + 63u) / 64u * sizeof(uint64_t) +
-        2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
+        cells * sizeof(editor_hit) + 2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         reserved_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) +
@@ -157,6 +158,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     memset(e->font_rows, 0, font_glyphs * words * sizeof *e->font_rows);
     e->strip_cap = ((size_t)e->max_rows + 1) / 2;
     e->strips = edit_arena_alloc(&e->arena, e->strip_cap * sizeof *e->strips, 8);
+    e->hits = edit_arena_alloc(&e->arena, cells * sizeof *e->hits, _Alignof(editor_hit));
     e->row_byte = edit_arena_alloc(&e->arena, reserved_rows * sizeof *e->row_byte, 8);
     e->row_used = edit_arena_alloc(&e->arena, reserved_rows * sizeof *e->row_used, 8);
     render_cell *full = edit_arena_alloc(&e->arena, cells * sizeof *full, 16);
@@ -169,7 +171,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     uint64_t *map_bits = edit_arena_alloc(&e->arena, map_words * sizeof *map_bits, 8);
     e->map_pixels = edit_arena_alloc(&e->arena, e->map_pixel_capacity * sizeof(uint32_t), 16);
     e->map_scratch = edit_arena_alloc(&e->arena, e->map_pixel_capacity * sizeof(uint32_t), 16);
-    if (!e->ops || !e->stage || !e->indent_bytes || !e->ws_ranges || !e->strips || !e->row_byte || !e->row_used ||
+    if (!e->ops || !e->stage || !e->indent_bytes || !e->ws_ranges || !e->strips || !e->hits || !e->row_byte || !e->row_used ||
         !e->map_pixels || !e->map_scratch || !full || !text || !map || !full_bits || !text_bits || !map_bits) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_dims dims = {cols, rows, atlas->cell.cell_w, atlas->cell.cell_h};
     e->tab_rows = rows > 1 ? 1u : 0u; e->map_cols = cols >= 24 ? 8u : 0u;
@@ -181,7 +183,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     e->fonts = e->font.atlas[e->font.current].fonts;
     (void)font_async_bind(e->fonts, &e->grid);
     (void)font_async_bind(e->fonts, &e->text_grid);
-    e->layout_cfg = (layout_config){.tab_width = 4, .gutter = true, .slice_clusters = 256,
+    e->layout_cfg = (layout_config){.hit = editor_hit_record, .hit_ctx = e, .tab_width = 4, .gutter = true, .slice_clusters = 256,
         .fg = 0xd8dee9, .bg = 0x20242c, .gutter_fg = 0x78808e, .gutter_bg = 0x20242c,
         .cursor_fg = 0x20242c, .cursor_bg = 0xe5e9f0, .sel_fg = 0xffffff, .sel_bg = 0x425471};
     e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
@@ -192,6 +194,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     e->text_grid.dims.rows = td.rows; if (rc) goto fail;
     e->text_grid.dims.rows = (uint32_t)reserved_rows;
     rc = layout_wrap_init(&e->lay, &e->arena); e->text_grid.dims.rows = td.rows; if (rc) goto fail;
+    rc = editor_find_init(e); if (rc) goto fail;
     rc = editor_buffer_prepare(e, NULL, NULL, 0, &e->empty); if (rc) goto fail;
     e->buffer = e->empty; e->tree = e->empty->tree; e->undo = &e->empty->undo;
     view_config vc = {4, td.rows, td.cols > 2 ? td.cols - 2 : 1, NULL, NULL}; view_init(&e->v, e->tree, &vc);

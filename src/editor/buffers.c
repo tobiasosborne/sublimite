@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <time.h>
 #include <sys/epoll.h>
 
@@ -75,6 +76,12 @@ minimap_input editor_map_input(editor_buffer *b)
 void editor_buffer_destroy(editor_buffer *b)
 {
     if (!b) return;
+    if (b->map_snapshot) {
+        work_cancel(b->pool,b->map_handle);
+        while (!work_handle_finished(b->pool,b->map_handle)) sched_yield();
+        (void)work_mailbox_bind(b->pool,b->map_handle,0,NULL,NULL);
+        piece_snapshot_release(b->map_snapshot);
+    }
     editor_scroll_close(b);
     editor_large_close(b);
     minimap_fini(&b->map);
@@ -115,7 +122,7 @@ void editor_retire_buffers(editor *e)
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
         if (editor_clip_holds(e, b) || (b->save && savectl_get_model(b->save).can_recover_cancel) ||
-            b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
+            b->find_leases || b->map_snapshot || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
         editor_session_forget(e, b);
@@ -204,6 +211,11 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     if (!b->history || !rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = minimap_init(&b->map, rows, e->map_capacity); if (rc) goto fail;
     b->map_rows = rows;
+    /* Worker summaries match the published map: pixel-row capacity (edit-d5o). */
+    b->map_worker_rows=edit_arena_alloc(&b->arena,e->map_capacity*sizeof *b->map_worker_rows,8);
+    if (!b->map_worker_rows || minimap_init(&b->map_worker,b->map_worker_rows,e->map_capacity)) {
+        rc=EDITOR_ERR_MEMORY; goto fail;
+    }
     piece_snapshot *snap = piece_snapshot_take(b->pending_open ? b->preview : b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
     b->detected_style = b->style;
@@ -277,12 +289,14 @@ static editor_buffer *find_buffer(editor *e, piece_tree *tree)
     return e->empty;
 }
 bool editor_activation_busy(const editor *e)
-{ return editor_clip_busy(e) || editor_save_leased(e) || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
+{ return editor_clip_busy(e) || editor_save_leased(e) || e->find_replace_active || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
 int editor_activate(editor *e)
 {
     if (editor_activation_busy(e)) return EDITOR_ERR_ARG;
     e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
     e->map_drag_id = e->map_drag_generation = 0;
+    e->find_scroll=e->visual_seed_valid=false;
+    e->text_drag = e->wheel_pending = false; e->click_ns = 0; e->wheel.subrow_q8 = 0; e->wrap_wheel_rows = 0;
     const tabs_tab *tab = tabs_active(&e->tabs);
     view_state live = e->v.state;
     e->buffer = tab ? find_buffer(e, tab->buffer) : e->empty;
@@ -305,8 +319,9 @@ int editor_activate(editor *e)
     rc = layout_set_wrap(&e->lay, live.wrap); if (rc) return rc;
     e->v.state = live;
     e->geometry_generation++; /* wrap/tab-width geometry belongs to this activation */
-    e->text_grid.dims.rows = e->grid.dims.rows - e->tab_rows + (live.wrap ? 0u : 1u);
-    e->v.config.rows = e->grid.dims.rows - e->tab_rows;
+    /* Text rows exclude the find panel's rows (edit-73j). */
+    e->text_grid.dims.rows = e->grid.dims.rows - e->tab_rows - e->panel_rows + (live.wrap ? 0u : 1u);
+    e->v.config.rows = e->grid.dims.rows - e->tab_rows - e->panel_rows;
     keys_reset(&e->keys); e->action = EDITOR_ACTION_NONE;
     e->old_selection = live.selection; editor_restart_blink(e, trace_now_ns());
     if (!live.wrap) {

@@ -986,7 +986,7 @@ int main(int argc, char **argv)
     if (renderer_origin()) return 1;
     if (wrapped_navigation()) return 1;
     if (wrapped_integer_limits()) return 1;
-    if (editor_observability(false)) return 1;
+    if (editor_observability(true)) return 1;
     if (resident_failure_and_retirement() || resident_navigation() || complete_operation_budget() || follow_operation_budget() || delegated_source_errors() || accumulation() || keys_and_follow() || correction() || unindexed_ends() || follow_proof() || bounded_and_allocations()) return 1;
     puts("scroll_test: PASS");
     return 0;

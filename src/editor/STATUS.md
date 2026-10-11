@@ -160,6 +160,25 @@ Final model fuzzing stops at an unchanged pure-view/oracle preferred-column
 policy disagreement after Right at EOF, reproduced without editor/scroll calls;
 no out-of-scope view/oracle fix was made. Physical cadence and wrapped metadata
 remain the stated integration limits. No comparison-drive hand-over is claimed.
+# edit-73j — editor wiring
+
+Mouse caret/drag/word/line selection, wheel per-line fallback with resident
+logical navigation, find/replace controller and leases, cached worker minimap
+publication, and adopted font runtime body/title lookup are implemented.
+Distant wrapped/clipped matches have integrated visibility regressions.
+Reservations are derived beside the code; typing uses no malloc.
+
+Final gcc `make all`, release/ASan headless regression partitions, active
+release allocator guard, unchanged-chrome regression and benchmark-harness
+contracts pass. `make check` stops at denied Unix socket initialization;
+X-dependent defaults also fail in the sandbox. The coordinator must rerun
+native/leaks-on verification and the Astra drive before acceptance/closure.
+Pixel origin/overscan/refresh certification and existing module limits are
+not claimed. Adjacent findui history/page scan issues are reported, not fixed.
+
+[Worker report](../../docs/worker-reports/edit-73j.md) contains the red/green
+runs, all-suite attempt, bench observations, limitations and changed files.
+[Decisions](../../docs/decisions/edit-73j.md).
 
 # edit-ck4 — session 9
 

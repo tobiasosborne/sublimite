@@ -12,6 +12,7 @@
 #include "savectl/savectl.h"
 #include "indent/indent.h"
 #include "minimap/minimap.h"
+#include "findui/findui.h"
 #include "editor/large_private.h"
 #include "editor/runtime.h"
 #include "scroll/scroll.h"
@@ -57,11 +58,20 @@ typedef struct editor_buffer {
     bool last_repeat;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
+    size_t find_leases;
     indent_style style;
     indent_style detected_style;
     bool config_wrap;
     minimap map;
-    minimap_row *map_rows;
+    minimap_row *map_rows, *map_worker_rows;
+    minimap map_worker;
+    minimap_input map_job_input;
+    piece_snapshot *map_snapshot;
+    work_handle map_handle;
+    uint32_t map_job_height;
+    int map_job_error;
+    bool map_job_sealed, map_received;
+    bool map_sync_fill; /* file-backed source: compose prepares the first map (edit-73j landing) */
     view_state initial;
     scroll_state scroll;
     scroll_state scroll_display;
@@ -75,6 +85,7 @@ typedef struct editor_buffer {
     char path[IPC_PATH_CAP], save_path[IPC_PATH_CAP];
     ipc_token wait_token;
 } editor_buffer;
+typedef struct editor_hit { uint64_t before, after; uint32_t within, width; } editor_hit;
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
 typedef struct editor_clip editor_clip;
 typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
@@ -124,6 +135,17 @@ struct editor {
     uint64_t preferences_generation;
     double preferences_font_override; /* explicit startup points (native env) win over file */
     int preferences_watchfd;
+    findui_panel find;
+    uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
+    uint32_t panel_rows;
+    int find_direction, find_error, find_replace_request;
+    bool find_select_pending, find_replace_active, find_visible, find_navigated, find_field_all;
+    uint8_t find_edit[FINDUI_QUERY_BYTES];
+    uint32_t find_ascii[LAYOUT_ASCII_GLYPHS];
+    findui_range *find_ranges;
+    size_t find_range_count;
+    uint64_t find_window_start, find_window_end;
+    edit_arena find_arena;
     editor_wait waits[IPC_MAX_CLIENTS];
     int poll_fd;
     file *opening;
@@ -163,6 +185,7 @@ struct editor {
     size_t font_row_words, font_row_slots;
     editor_font_size font;
     render_strip *strips;
+    editor_hit *hits;
     uint64_t *row_byte;
     uint32_t *row_used;
     size_t strip_cap;
@@ -209,6 +232,16 @@ struct editor {
     uint64_t drag_id, map_drag_id, map_drag_generation;
     bool map_drag, paint_ready, caret_only;
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
+    bool text_drag;
+    uint64_t text_drag_id, text_drag_generation, click_ns, click_byte;
+    uint32_t click_row, click_col, click_count, text_drag_mode;
+    uint64_t text_drag_lo, text_drag_hi;
+    bool pointer_unit_pending, pointer_unit_initial;
+    scroll_state wheel;
+    scroll_resolver wheel_resolver;
+    bool wheel_pending, find_scroll, visual_seed_valid;
+    layout_wrap_row visual_seed;
+    int64_t wrap_wheel_rows;
     int raster_poll_fd;
     uint8_t *indent_bytes;
     indent_range *ws_ranges;
@@ -308,6 +341,26 @@ int editor_font_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t widt
 bool editor_font_event(editor *e, const work_msg *msg);
 void editor_font_track(editor *e, uint32_t slot, uint32_t row);
 int editor_pointer(editor *e, const plat_event *ev);
+int editor_map_service(editor *e);
+bool editor_map_receive(editor *e, const work_msg *msg);
+int editor_chrome_pointer(editor *e, const plat_event *ev);
+int editor_wheel_continue(editor *e);
+int editor_text_geometry(editor *e);
+bool editor_wheel_ready(const editor *e);
+int editor_scroll_resolve(editor *e, scroll_state *s, scroll_resolver *r);
+void editor_hit_record(void *ctx, uint32_t row, uint32_t column, uint32_t count,
+    uint32_t skip, uint32_t width, uint64_t before, uint64_t after);
+int editor_find_init(editor *e);
+void editor_find_close(editor *e);
+int editor_find_service(editor *e);
+bool editor_find_key(editor *e, const plat_event *ev);
+int editor_find_paint(editor *e);
+int editor_find_replace_continue(editor *e);
+findui_mutation_result editor_find_delete(void *ctx, undo_log *undo, uint64_t off, uint64_t len,
+    uint64_t when, const undo_state *before, const undo_state *after);
+findui_mutation_result editor_find_insert(void *ctx, undo_log *undo, uint64_t off, const uint8_t *bytes,
+    size_t len, uint64_t when, const undo_state *before, const undo_state *after);
+void editor_find_replace_finish(editor *e);
 int editor_poll_sources(editor *e);
 int editor_preferences_poll(editor *e);
 int editor_preferences_apply(editor *e);

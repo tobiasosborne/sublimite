@@ -66,6 +66,12 @@ typedef int (*layout_glyph_fn)(void *ctx, const uint8_t *cluster, size_t len,
 typedef void (*layout_paint_fn)(void *ctx, uint64_t byte, uint32_t *fg,
                                uint32_t *bg, uint16_t *attrs);
 
+/* Optional prepared hit metadata. Called only for rendered rows, bounded by
+ * viewport cells. Cluster columns [column,column+count) have immutable byte
+ * boundaries; skip/width locate a clipped cell within its cluster. Empty
+ * cells/gutter use equal boundaries. Never reads source in the consumer. */
+typedef void (*layout_hit_fn)(void *ctx, uint32_t row, uint32_t column,
+    uint32_t count, uint32_t skip, uint32_t width, uint64_t before, uint64_t after);
 typedef struct layout_config {
     uint32_t tab_width;          /* 0 -> 4 */
     bool gutter;
@@ -73,6 +79,8 @@ typedef struct layout_config {
     uint32_t slice_clusters;     /* 0 = unlimited */
     layout_glyph_fn glyph;       /* may be NULL */
     void *glyph_ctx;
+    layout_hit_fn hit;
+    void *hit_ctx;
 } layout_config;
 
 typedef struct layout_viewport {
@@ -155,7 +163,7 @@ typedef struct layout {
     uint64_t total, line_count, first_byte, first_line, cursor, sel_lo, sel_hi;
     uint64_t hscroll;
     uint32_t gw, text_cols, tab;
-    bool approximate, marks;
+    bool approximate, marks, hit_cr;
     layout_paint_fn paint;
     void *paint_ctx;
     uint32_t row, row_end;       /* work range [row, row_end) */
@@ -243,4 +251,9 @@ int layout_visual_row(const layout *l, const piece_tree *t, uint64_t byte,
 /* Query after a mutation before layout_edit: ignore stale row/checkpoint data. */
 int layout_visual_row_fresh(const layout *l, const piece_tree *t, uint64_t byte,
                             layout_wrap_row *out, bool *approximate);
+/* Same bounded visual query using a caller-certified logical line start and
+ * ordinal (which may be estimated). Avoids whole-source piece line queries;
+ * deep unindexed wrap phase retains the existing explicit approximation. */
+int layout_visual_row_anchored(const layout *l, const piece_tree *t, uint64_t byte,
+    uint64_t line_start, uint64_t line, layout_wrap_row *out, bool *approximate);
 #endif

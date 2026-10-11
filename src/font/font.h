@@ -264,6 +264,7 @@ int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
  * physical work completion/message drain. Rebuild in a separate owner, then
  * switch at a safe backend boundary with full relayout; reclaim at quiescence.
  * No teardown API can prove the editor's backend retirement on its behalf. */
+#define FONT_RUNTIME_MAX_GLYPHS 4096u /* G: existing GL frame cap, gl/gl.h */
 #define FONT_RUNTIME_MSG_KIND 0xF002u
 typedef struct font_runtime_config {
     /* Must identify the baked embedded primary; sizes supported by its atlas. */

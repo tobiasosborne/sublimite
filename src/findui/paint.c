@@ -129,8 +129,8 @@ findui_code findui_render(const findui_panel *panel, render_grid *grid, uint32_t
     }
     if (row_count >= 3) {
         paint.row++;
-        (void)text(&paint, 0, impl->state.replace_mode ? "Next / Previous   Replace one / all   Close"
-                                                    : "Next / Previous   Close", false);
+        (void)text(&paint, 0, impl->state.replace_mode ? "Ctrl+Enter: Replace  Ctrl+Alt+Enter: All  Tab: field  Esc: close"
+                                                    : "Enter: next  Shift+Enter: previous  Esc: close", false);
     }
     return FINDUI_OK;
 }

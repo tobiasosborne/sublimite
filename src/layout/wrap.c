@@ -101,6 +101,8 @@ static void start_row(layout *l,render_cell *cells)
     if(!l->wrap_sink && !l->wrap_planning && l->row+1u==l->grid->dims.rows)
         l->wrap_plan[l->row].next=r->start;
     gutter(l,cells,r);
+    if(!l->wrap_sink && !l->wrap_planning && l->cfg.hit)
+        l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->grid->dims.cols,0,1,r->start,r->start);
     if(!l->wrap_sink && !l->wrap_planning) for(uint32_t c=0;c<l->vis;c++) cells[l->gw+c]=blank(l);
 }
 static void clear_row(layout *l,render_cell *cells,uint32_t written)
@@ -164,6 +166,8 @@ static int end_row(layout *l,render_cell *cells,bool newline,bool eof)
     r->end=l->pos-(newline && l->wrap_cr?1u:0u); r->end_column=l->col; r->last=l->wrap_last;
     r->indent=l->wrap_indent; r->newline=newline; r->approximate=l->approximate;
     r->next=newline?l->pos+1:eof?LAYOUT_VOID_ROW:l->pos;
+    if(!l->wrap_sink && !l->wrap_planning && l->cfg.hit && l->vis<l->text_cols)
+        l->cfg.hit(l->cfg.hit_ctx,l->row,l->gw+l->vis,l->text_cols-l->vis,0,1,r->end,r->end);
     uint32_t written=l->gw+l->vis;
     if(!l->wrap_sink && !l->wrap_planning && (newline || eof) && r->end==l->cursor && l->vis<l->text_cols) {
         cells[written]=blank(l); style(l,r->end,&cells[written]); written++;
@@ -274,6 +278,8 @@ int layout_wrap_run(layout *l)
             if(r->start==LAYOUT_VOID_ROW) {
                 r->end=r->next=LAYOUT_VOID_ROW;
                 gutter(l,cells,r); clear_row(l,cells,l->gw);
+                if(!l->wrap_sink && !l->wrap_planning && l->cfg.hit)
+                    l->cfg.hit(l->cfg.hit_ctx,l->row,0,l->grid->dims.cols,0,1,l->total,l->total);
                 ++l->row;
                 if(l->row<l->row_end) { descriptor(l,l->row)->start=LAYOUT_VOID_ROW; if(!l->wrap_planning) l->row_byte[l->row]=LAYOUT_VOID_ROW; }
                 continue;
@@ -365,6 +371,7 @@ int layout_wrap_run(layout *l)
         uint32_t draw=w;
         if(draw>l->text_cols-l->vis) { draw=l->text_cols-l->vis; if(b!='\t') l->approximate=true; }
         if(!l->wrap_sink && !l->wrap_planning) {
+            if(l->cfg.hit && draw) l->cfg.hit(l->cfg.hit_ctx,l->row,l->gw+l->vis,draw,0,w,at,l->pos);
             uint32_t slot=RENDER_NO_SLOT,glyph=0;
             if(b!='\t') {
                 slot='?'-0x20u; glyph='?';
@@ -487,7 +494,8 @@ static bool contains(const layout_wrap_row *r,uint64_t byte)
  * A deep uncached query uses it as a local visual-row seed and flags the phase
  * estimate. Cached visual descriptors (including scroll seeds) are exact. */
 static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int direction,
-                    layout_wrap_row *out,bool *approximate,bool indexed,const layout_wrap_row *visual_seed)
+                    layout_wrap_row *out,bool *approximate,bool indexed,const layout_wrap_row *visual_seed,
+                    const layout_wrap_row *logical_seed)
 {
     layout q; memset(&q,0,offsetof(layout,win));
     render_grid grid={0}; grid.dims=context->grid->dims; grid.dims.rows=1;
@@ -496,8 +504,8 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
     q.tab=context->tab; q.text_cols=context->text_cols; q.gw=context->gw;
     q.wrap_rows=row; q.wrap_plan=plan; q.row_byte=rb; q.row_used=ru; q.wrap=true; q.wrap_sink=true;
     q.cursor=UINT64_MAX;
-    uint64_t line=visual_seed?visual_seed->line:piece_byte_to_line(t,byte);
-    uint64_t start=visual_seed?visual_seed->start:piece_line_to_byte(t,line), col=visual_seed?visual_seed->column:0;
+    uint64_t line=visual_seed?visual_seed->line:logical_seed?logical_seed->line:piece_byte_to_line(t,byte);
+    uint64_t start=visual_seed?visual_seed->start:logical_seed?logical_seed->line_start:piece_line_to_byte(t,line), col=visual_seed?visual_seed->column:0;
     if(direction<0 && byte==start && line) { --line; start=piece_line_to_byte(t,line); byte=start==byte?byte:piece_line_to_byte(t,line+1)-1; direction=0; }
     uint64_t logical=visual_seed?visual_seed->line_start:start; bool seeded=false;
     const layout_checkpoint_store *s=indexed?context->checkpoints:NULL;
@@ -579,13 +587,13 @@ int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int dire
             else {
                 layout_wrap_row seed; next_seed(&seed,&l->wrap_rows[i]);
                 *approximate=l->wrap_rows[i].approximate;
-                return scan_row(l,t,seed.start,0,out,approximate,true,&seed);
+                return scan_row(l,t,seed.start,0,out,approximate,true,&seed,NULL);
             }
             if(r) { *out=*r; *approximate=r->approximate; return LAYOUT_DONE; }
             break;
         }
     }
-    int rc=scan_row(l,t,byte,direction,out,approximate,true,NULL);
+    int rc=scan_row(l,t,byte,direction,out,approximate,true,NULL,NULL);
     if(rc==LAYOUT_DONE) out->approximate|=*approximate;
     return rc;
 }
@@ -595,7 +603,19 @@ int layout_visual_row_fresh(const layout *l,const piece_tree *t,uint64_t byte,
 {
     if(!l || !l->grid || !l->wrap || !t || !out || !approximate || byte>piece_len(t)) return LAYOUT_ERR_ARG;
     *approximate=false;
-    int rc=scan_row(l,t,byte,0,out,approximate,false,NULL);
+    int rc=scan_row(l,t,byte,0,out,approximate,false,NULL,NULL);
+    if(rc==LAYOUT_DONE) out->approximate|=*approximate;
+    return rc;
+}
+
+int layout_visual_row_anchored(const layout *l,const piece_tree *t,uint64_t byte,
+    uint64_t line_start,uint64_t line,layout_wrap_row *out,bool *approximate)
+{
+    if(!l || !l->grid || !l->wrap || !t || !out || !approximate ||
+        line_start>byte || byte>piece_len(t) || line==LAYOUT_LINE_UNKNOWN) return LAYOUT_ERR_ARG;
+    layout_wrap_row anchor={.line_start=line_start,.line=line};
+    *approximate=false;
+    int rc=scan_row(l,t,byte,0,out,approximate,true,NULL,&anchor);
     if(rc==LAYOUT_DONE) out->approximate|=*approximate;
     return rc;
 }

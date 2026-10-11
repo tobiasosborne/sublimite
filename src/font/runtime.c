@@ -8,7 +8,7 @@ int font_runtime_limits(const font_runtime_config *config, uint32_t *pages,
 {
     if (!config || !pages || !glyphs || !pixel_bytes || !config->primary_path ||
         !config->max_pages || config->max_pages > FONT_ATLAS_MAX_PAGES ||
-        !config->entries || config->entries > 4096u - 95u ||
+        !config->entries || config->entries > FONT_RUNTIME_MAX_GLYPHS - 95u ||
         !config->key_bytes || !config->scratch_bytes) return FONT_ERR_ARG;
     const font_ascii_atlas *ascii = font_ascii_atlas_for_px(config->px);
     if (!ascii) return FONT_ERR_ARG;
