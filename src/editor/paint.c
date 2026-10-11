@@ -132,6 +132,13 @@ int editor_compose(editor *e)
         int rc = compose_chrome(e);
         return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
     }
+    /* The bottom row doubles as a transient status line until panel chrome
+     * exists. A later generation must restore it even on a caret-only frame.
+     * Keep the marker throughout retries of the notice's own generation. */
+    if (e->unimplemented_frame && e->unimplemented_frame != e->grid.frame_id) {
+        e->caret_only = false;
+        e->unimplemented_frame = 0;
+    }
     if (e->caret_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;
         for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
@@ -172,7 +179,17 @@ int editor_compose(editor *e)
         }
         if (different) { rc = render_mark_rows(&e->grid, r + e->tab_rows, 1); if (rc) return rc; }
     }
-    return compose_chrome(e);
+    rc = compose_chrome(e); if (rc) return rc;
+    if (e->unimplemented_frame == e->grid.frame_id) {
+        const char status[] = "not implemented";
+        uint32_t row = e->grid.dims.rows - 1u;
+        for (uint32_t c = 0; c < full; c++) {
+            uint32_t ch = c < sizeof status - 1u ? (uint8_t)status[c] : (uint32_t)' ';
+            e->grid.cells[(size_t)row * full + c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+        }
+        return render_mark_rows(&e->grid, row, 1);
+    }
+    return 0;
 }
 int editor_pointer(editor *e, const plat_event *ev)
 {

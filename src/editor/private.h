@@ -115,6 +115,7 @@ struct editor {
     uint64_t old_cursor, key_ns, edit_time_ns, last_input, next_blink;
     uint64_t repair_line_byte, repair_line_number;
     editor_frame frame, active_frame;
+    uint32_t unimplemented_frame; /* Notice belongs to this frame generation. */
     uint32_t extra_first, extra_end, resize_w, resize_h;
     bool dirty, extra_rows, resize_pending, full_pending;
     bool repair_line_valid;

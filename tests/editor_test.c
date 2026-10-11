@@ -140,6 +140,200 @@ static int minimap_typing_flash(void)
     T(!e->buffer->map.stale && e->buffer->map.revision == e->buffer->revision);
     T(editor_length(e) == cfg.initial_len + keys);
     editor_close(e); return 0;
+/* (G) Exact byte offsets derive from the ASCII fixture's literal prefixes.
+ * The viewport has two text rows to exercise page movement across that pair;
+ * its width derives from the whole fixture, so these lines cannot soft-wrap. */
+static int selection_chord(editor *e, uint32_t sym, uint16_t mods,
+                           uint64_t cursor, uint64_t anchor)
+{
+    plat_event shift = key(XKB_KEY_Shift_L, PLAT_MOD_SHIFT, NULL);
+    T(press(e, shift) == 0);
+    if (mods & PLAT_MOD_CTRL) T(press(e, key(XKB_KEY_Control_L, mods, NULL)) == 0);
+    T(press(e, key(sym, mods, NULL)) == 0);
+    plat_event release = key(sym, mods, NULL); release.press = false;
+    T(press(e, release) == 0);
+    if (mods & PLAT_MOD_CTRL) {
+        release = key(XKB_KEY_Control_L, PLAT_MOD_SHIFT, NULL); release.press = false;
+        T(press(e, release) == 0);
+    }
+    shift.press = false; shift.mods = 0; T(press(e, shift) == 0);
+    view_selection s = editor_view(e).selection;
+    if (s.cursor != cursor || s.anchor != anchor)
+        fprintf(stderr, "selection chord: got cursor=%llu anchor=%llu expected cursor=%llu anchor=%llu\n",
+            (unsigned long long)s.cursor, (unsigned long long)s.anchor,
+            (unsigned long long)cursor, (unsigned long long)anchor);
+    T(s.cursor == cursor); T(s.anchor == anchor);
+    return 0;
+}
+static int selection_chords(void)
+{
+    static const char text[] = "alpha beta gamma delta!\n"
+        "epsilon zeta eta theta!!\n" "epsilon zeta eta theta!!\n"
+        "epsilon zeta eta theta!!\n" "epsilon zeta eta theta!!";
+    const uint64_t start = 0; /* (G) File start is the empty prefix's length. */
+    const uint64_t one = sizeof "a" - 1u, word = sizeof "alpha" - 1u;
+    const uint64_t next = sizeof "alpha beta gamma delta!\n" - 1u;
+    const uint64_t row = sizeof "epsilon zeta eta theta!!\n" - 1u;
+    const uint64_t end = sizeof text - 1u;
+    const uint16_t shift = PLAT_MOD_SHIFT, ctrl_shift = PLAT_MOD_CTRL | PLAT_MOD_SHIFT;
+    const int modes[] = {-1, 1}; /* Existing config encoding: unwrapped, wrapped. */
+    for (size_t mode = 0; mode < sizeof modes / sizeof modes[0]; mode++) {
+        render_backend b = {0}; T(render_null_backend(&b) == 0);
+        counted count = {0};
+        editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+            .cols = sizeof text, .rows = 2u + 1u, /* text-row pair + tab row */ .wrap_mode = modes[mode],
+            .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+        T(selection_chord(e, XKB_KEY_Right, shift, one, start) == 0);
+        T(selection_chord(e, XKB_KEY_Right, ctrl_shift, word, start) == 0);
+        T(selection_chord(e, XKB_KEY_Down, shift, next + word, start) == 0);
+        T(selection_chord(e, XKB_KEY_Up, shift, word, start) == 0);
+        T(selection_chord(e, XKB_KEY_End, shift, next - one, start) == 0);
+        T(selection_chord(e, XKB_KEY_Home, shift, start, start) == 0);
+        T(selection_chord(e, XKB_KEY_Right, shift, one, start) == 0);
+        T(selection_chord(e, XKB_KEY_Next, shift, next + row + one, start) == 0);
+        T(selection_chord(e, XKB_KEY_Prior, shift, one, start) == 0);
+        T(selection_chord(e, XKB_KEY_End, ctrl_shift, end, start) == 0);
+        T(selection_chord(e, XKB_KEY_Home, ctrl_shift, start, start) == 0);
+        /* A plain move fixes a new anchor; reversal crosses that anchor. */
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_CTRL, NULL)) == 0);
+        T(selection_chord(e, XKB_KEY_Left, ctrl_shift, start, word) == 0);
+        T(selection_chord(e, XKB_KEY_Down, shift, next, word) == 0);
+        T(selection_chord(e, XKB_KEY_Up, shift, start, word) == 0);
+        T(expect(e, text, start) == 0);
+        T(editor_get_stats(e).mutations == 0); /* (G) Movement does not edit bytes. */
+        /* Mutation replaces the selection and fixes its new insertion caret. */
+        T(press(e, key('X', 0, "X")) == 0);
+        T(editor_view(e).selection.cursor == one && editor_view(e).selection.anchor == one);
+        T(selection_chord(e, XKB_KEY_Right, shift, one + one, one) == 0);
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+        T(editor_view(e).selection.cursor == one + one && editor_view(e).selection.anchor == one + one);
+        T(selection_chord(e, XKB_KEY_Left, shift, one, one + one) == 0);
+        T(!count.active && count.allocations == 0); /* (G) Law 2: no typing-path allocation. */
+        editor_close(e);
+    }
+    puts("editor_test: separate Shift chords preserve exact ranges, reset after movement/mutation, and allocate nothing");
+    return 0;
+}
+/* (G) Dimensions derive from the longest status/fixture literal plus the tab
+ * row and a pair of text rows. Offsets are ASCII prefix lengths; zero edits
+ * and allocations are required for consumed shortcuts (CLAUDE.md Law 2). */
+static int redo_or_repeat(void)
+{
+    static const char text[] = "a\nbeta";
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    counted count = {0};
+    editor_config cfg = {.cols = sizeof "not implemented", .rows = 1u + 2u,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    T(press(e, key('a', 0, text)) == 0); T(expect(e, text, sizeof text - 1u) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "", 0) == 0);
+    uint64_t unimplemented = editor_get_stats(e).unimplemented_actions;
+    T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
+    T(editor_get_stats(e).unimplemented_actions == unimplemented);
+    uint64_t mutations = editor_get_stats(e).mutations;
+    T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
+    T(editor_get_stats(e).mutations == mutations); /* No repeat record exists. */
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
+    /* Astra repro: line selection, deletion, undo, Ctrl+Y. */
+    T(press(e, key('l', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    T(expect(e, "a\n", sizeof "a\n" - 1u) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
+    T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "a\n", sizeof "a\n" - 1u) == 0);
+    T(!count.active && count.allocations == 0);
+    editor_close(e); puts("editor_test: Ctrl+Y redoes inserts/deletes, empty redo is inert, Ctrl+Shift+Z still redoes");
+    return 0;
+}
+static int panel_shortcuts(bool notice)
+{
+    static const char initial[] = "left right\nnext";
+    static const char typed[] = "leftalpha right\nnext";
+    static const char status[] = "not implemented";
+    const struct { uint32_t sym; uint16_t mods; } shortcuts[] = {
+        {'f', PLAT_MOD_CTRL}, {'h', PLAT_MOD_CTRL}, {XKB_KEY_F3, 0},
+        {'F', PLAT_MOD_CTRL | PLAT_MOD_SHIFT}, {'p', PLAT_MOD_CTRL}, {'g', PLAT_MOD_CTRL}
+    }; /* Each entry derives from the brief's requested shortcut set. */
+    for (size_t i = 0; i < sizeof shortcuts / sizeof shortcuts[0]; i++) {
+        render_backend b = {0}; T(render_null_backend(&b) == 0);
+        counted count = {0};
+        editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
+            .cols = sizeof typed, .rows = 1u + 2u, .wrap_mode = -1,
+            .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_CTRL, NULL)) == 0);
+        size_t bottom = (size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols;
+        render_cell bottom_before[sizeof typed]; /* Configured width derives from this literal. */
+        memcpy(bottom_before, e->grid.cells + bottom, sizeof bottom_before);
+        view_selection before = editor_view(e).selection;
+        T(before.cursor == sizeof "left" - 1u && before.anchor == before.cursor);
+        uint64_t mutations = editor_get_stats(e).mutations;
+        uint64_t unimplemented = editor_get_stats(e).unimplemented_actions;
+        uint16_t mods = shortcuts[i].mods;
+        if (mods & PLAT_MOD_CTRL) T(press(e, key(XKB_KEY_Control_L, PLAT_MOD_CTRL, NULL)) == 0);
+        if (mods & PLAT_MOD_SHIFT) T(press(e, key(XKB_KEY_Shift_L, mods, NULL)) == 0);
+        /* Unsupported actions have no ingress hook; guard their status submit
+         * explicitly, and end it ourselves if the baseline submits nothing. */
+        edit_malloc_guard_begin(); count.active = true;
+        T(press(e, key(shortcuts[i].sym, mods, NULL)) == 0);
+        if (count.active) { count.allocations += edit_malloc_guard_end(); count.active = false; }
+        T(count.allocations == 0);
+        plat_event release = key(shortcuts[i].sym, mods, NULL); release.press = false;
+        T(press(e, release) == 0);
+        if (mods & PLAT_MOD_SHIFT) {
+            release = key(XKB_KEY_Shift_L, PLAT_MOD_CTRL, NULL); release.press = false;
+            T(press(e, release) == 0);
+        }
+        if (mods & PLAT_MOD_CTRL) {
+            release = key(XKB_KEY_Control_L, 0, NULL); release.press = false;
+            T(press(e, release) == 0);
+        }
+        view_selection after = editor_view(e).selection;
+        T(after.cursor == before.cursor && after.anchor == before.anchor);
+        T(after.preferred_col == before.preferred_col);
+        T(expect(e, initial, before.cursor) == 0);
+        T(editor_get_stats(e).mutations == mutations);
+        T(editor_get_stats(e).unimplemented_actions == unimplemented + 1u); /* One consumed chord. */
+        T(e->keys.chord == KEYS_CHORD_NONE);
+        if (notice) {
+            size_t row = (size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols; /* Bottom status line. */
+            for (size_t c = 0; c < sizeof status - 1u; c++) T(e->grid.cells[row + c].glyph_index == (uint8_t)status[c]);
+            /* No timer: the same generation retains the notice. */
+            T(editor_compose(e) == 0);
+            T(e->grid.cells[row].glyph_index == (uint8_t)status[0]);
+            /* A caret-only generation must restore the overwritten text row. */
+            T(editor_begin_frame(e) == 0); e->caret_only = true;
+            T(editor_compose(e) == 0);
+            T(memcmp(e->grid.cells + row, bottom_before, sizeof bottom_before) == 0);
+            T(settle(e) == 0);
+        }
+        static const char query[] = "alpha";
+        for (size_t c = 0; c < sizeof query - 1u; c++) {
+            char ch[] = {query[c], '\0'};
+            T(press(e, key((uint8_t)query[c], 0, ch)) == 0);
+        }
+        T(expect(e, typed, sizeof "leftalpha" - 1u) == 0);
+        T(editor_view(e).selection.anchor == sizeof "leftalpha" - 1u);
+        T(editor_get_stats(e).unimplemented_actions == unimplemented + 1u);
+        T(!count.active && count.allocations == 0);
+        /* A nonempty selection is also preserved by the unsupported chord. */
+        T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == 0);
+        before = editor_view(e).selection;
+        T(press(e, key(shortcuts[i].sym, mods, NULL)) == 0);
+        after = editor_view(e).selection;
+        T(after.cursor == before.cursor && after.anchor == before.anchor);
+        T(expect(e, typed, before.cursor) == 0);
+        editor_close(e);
+    }
+    puts(notice ? "editor_test: panel shortcuts show a generation-only status and restore the bottom row" :
+        "editor_test: panel shortcuts are consumed, preserve selection/prefix state, and subsequent alpha types normally");
+    return 0;
 }
 typedef struct replay_model { uint8_t bytes[256]; size_t len, records; } replay_model;
 static uint64_t le64(const uint8_t *p)
@@ -1968,6 +2162,10 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
         if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
+        if (!strcmp(argv[1], "--selection-chords")) return selection_chords();
+        if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
+        if (!strcmp(argv[1], "--panel-state")) return panel_shortcuts(false);
+        if (!strcmp(argv[1], "--panel-notice")) return panel_shortcuts(true);
         if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
         if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
         if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
@@ -1995,6 +2193,8 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(minimap_typing_flash() == 0);
+    T(selection_chords() == 0);
+    T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);

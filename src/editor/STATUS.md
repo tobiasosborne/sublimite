@@ -1,3 +1,11 @@
+# edit-gdj — separate Shift chord regression
+
+The checked-in Astra review withdrew the original anchor-loss finding. Existing input/view code already retains the anchor across separate Shift chords. Added exact-range editor regressions for word, vertical, Home/End, document and page movement, reversal, modifier releases, and movement/mutation reset in wrapped and unwrapped views. The release allocation guard remains green. No production behavior changed.
+
+Focused gcc and clang ASan/UBSan regressions pass; the deliberately injected anchor reset fails the new assertion, and input.c was restored byte-for-byte. GCC `make all` passes. Broader sandbox validation and coordinator reruns are recorded in the [worker report](../../docs/worker-reports/edit-gdj.md). The other keyboard beads were left for separate workers under the binding scope rule.
+
+[Decision record](../../docs/decisions/edit-gdj.md).
+
 # edit-ck4 — session 9
 
 Partial P4-3 recovery integration: source-choice checkpoints, healthy metadata/target records, protected journal slices and a private durability worker. Save/session-root wiring and startup recovery remain open; pending COPY reload and asynchronous request preparation remain incomplete.

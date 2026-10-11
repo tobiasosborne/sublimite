@@ -396,7 +396,10 @@ int editor_handle_key(editor *e, const plat_event *ev)
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;
     bool del = action == KEYS_ACTION_DELETE || action == KEYS_ACTION_WORD_DELETE;
-    bool undo = action == KEYS_ACTION_UNDO, redo = action == KEYS_ACTION_REDO;
+    /* Repeat needs a command record; the existing history only records deltas.
+     * With no redo entry replay_history deliberately leaves the buffer alone. */
+    bool undo = action == KEYS_ACTION_UNDO;
+    bool redo = action == KEYS_ACTION_REDO || action == KEYS_ACTION_REDO_OR_REPEAT;
     bool stack = action == KEYS_ACTION_NEXT_VIEW_STACK || action == KEYS_ACTION_PREVIOUS_VIEW_STACK;
     bool adjacent = action == KEYS_ACTION_NEXT_VIEW || action == KEYS_ACTION_PREVIOUS_VIEW;
     bool close = action == KEYS_ACTION_CLOSE || action == KEYS_ACTION_CLOSE_FILE;
@@ -408,6 +411,15 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (!moving && !back && !del && !undo && !redo && !tab && !text) {
         if (binding) e->stats.unimplemented_actions++;
         if (action == KEYS_ACTION_CANCEL || e->tabs.cycling) tabs_mru_release(&e->tabs);
+        switch (action) {
+        case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE: case KEYS_ACTION_FIND_NEXT:
+        case KEYS_ACTION_FIND_IN_FILES: case KEYS_ACTION_GOTO_FILE: case KEYS_ACTION_GOTO_LINE: {
+            int rc = editor_begin_frame(e); if (rc) return rc;
+            e->unimplemented_frame = e->grid.frame_id;
+            break;
+        }
+        default: break;
+        }
         return 0;
     }
     if (!stack && e->tabs.cycling) tabs_mru_release(&e->tabs);
