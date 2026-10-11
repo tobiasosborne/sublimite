@@ -71,9 +71,20 @@ static void small_case(const uint8_t *p, size_t n, uint32_t h, size_t frag)
     CHECK(minimap_hit(&m, &in, NULL, 1000, &hit) == 0 && hit.line < lines);
     in.revision++; CHECK(minimap_stale(&m, &in));
     CHECK(minimap_hit(&m, &in, NULL, 0, &hit) == MINIMAP_ERR_STALE);
+    render_cell previous[64 * 7]; memcpy(previous, cells, sizeof previous);
     in.index_ready = false; size_t calls = f.calls;
+    CHECK(render_frame_begin(&g, g.frame_id + 1u) == 0);
     CHECK(minimap_fill(&m, &in, &g, 3, 4, 0, 1, &style) == 0 && m.stale);
     CHECK(f.calls == calls);
+    /* edit-g11: pending edits retain every prior cell, including viewport;
+     * zero changed cells entails zero extra dirty rows. Geometry is inherited
+     * from this fixture; no frame-count or timing threshold is introduced. */
+    CHECK(memcmp(previous, cells, sizeof previous) == 0 && dirty[0] == 0);
+    /* A shared grid can contain another tab's image. The pending map must
+     * reconstruct this buffer's ready image rather than keep foreign cells. */
+    for (uint32_t r = 0; r < h; r++) memset(&cells[r*7+3], 0, 4 * sizeof(render_cell));
+    CHECK(minimap_fill(&m, &in, &g, 3, 4, 0, 1, &style) == 0 && f.calls == calls);
+    CHECK(memcmp(previous, cells, sizeof previous) == 0);
     in.index_ready = true; CHECK(minimap_stale(&m, &in));
     CHECK(minimap_fill(&m, &in, &g, 3, 4, 0, 1, &style) == 0 && !minimap_stale(&m, &in));
     minimap_fini(&m); minimap_fini(&m);
@@ -202,7 +213,10 @@ static void sample_cap_and_resize(void)
     CHECK(render_frame_begin(&g,3) == 0);
     calls = f.calls;
     CHECK(minimap_fill(&m,&in,&g,0,2,0,0,&style) == 0 && m.stale && f.calls == calls);
-    CHECK(cells[0].bg == model_blend(model_blend(style.background,style.density,64),style.stale,128));
+    /* Pending resize cannot retain a differently shaped map. The existing
+     * fallback density remains, with only the last strip column as its bar. */
+    CHECK(cells[0].bg == model_blend(style.background,style.density,64));
+    CHECK(cells[1].bg == style.stale);
     minimap_fini(&m);
 }
 static void no_hook(void *user, uint32_t frame, uint64_t ns)
@@ -298,6 +312,13 @@ static void deferred_samples(void)
     in = old;
     CHECK(minimap_publish(&m,&in,&prepared) == 0 && m.rows == rows);
     CHECK(minimap_fill_cached(&m,&in,&g,1,1,0,1,&style) == 0 && !m.stale && f.calls == 0);
+    render_cell previous[20]; memcpy(previous,cells,sizeof previous);
+    in.revision++;
+    CHECK(render_frame_begin(&g,g.frame_id + 1u) == 0);
+    CHECK(minimap_fill_cached(&m,&in,&g,1,1,0,1,&style) == 0 && m.stale && f.calls == 0);
+    CHECK(memcmp(previous,cells,sizeof previous) == 0 && dirty[0] == 0);
+    in = old;
+    CHECK(minimap_publish(&m,&in,&prepared) == 0);
     g.dims.rows = 9;
     CHECK(minimap_fill_cached(&m,&in,&g,1,1,0,1,&style) == 0 && m.stale && f.calls == 0);
     /* Read-protected sample pages prove UI fill cannot dereference them after

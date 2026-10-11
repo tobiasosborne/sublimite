@@ -105,7 +105,7 @@ static int compose_chrome(editor *e)
         size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
         e->strip = (tabs_strip){0, 0, full, 16, first_tab, 0x8d98a9, 0x171b22, 0xe5e9f0, 0x384356, glyph, e};
         /* Decoration preparation is complete; reuse its aligned reserved
-         * scratch for the final chrome, including the stale overlay. */
+         * scratch for the final chrome. */
         if ((size_t)full * sizeof(render_cell) > EDITOR_STAGE_BYTES) return EDITOR_ERR_CAPACITY;
         render_cell *cells = (render_cell *)e->indent_bytes;
         memset(cells, 0, (size_t)full * sizeof *cells);
@@ -113,10 +113,6 @@ static int compose_chrome(editor *e)
         scratch.dims.rows = 1; scratch.cells = cells; scratch.cell_capacity = full;
         scratch.dirty = &dirty; scratch.dirty_word_capacity = 1; scratch.full_frame = false;
         rc = tabs_strip_render(&e->tabs, &scratch, &e->strip); if (rc) return rc;
-        if (e->buffer->map.stale) {
-            render_cell *cell = &cells[full - 1];
-            *cell = (render_cell){'!', '!' - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
-        }
         if (memcmp(e->grid.cells, cells, (size_t)full * sizeof *cells)) {
             memcpy(e->grid.cells, cells, (size_t)full * sizeof *cells);
             return render_mark_rows(&e->grid, 0, 1);
@@ -151,7 +147,8 @@ int editor_compose(editor *e)
         return 0;
     }
     minimap_input input = editor_map_input(e->buffer);
-    minimap_style colors = {0x171b22, 0x8091a8, 0x687d98, 0xbf853d};
+    minimap_style colors = {0x171b22, 0x8091a8, 0x687d98,
+        editor_theme_estimated_gutter(0x8091a8, 0x171b22)};
     uint64_t first = e->v.state.first_line, visible = 0;
     for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;

@@ -42,13 +42,14 @@ typedef struct minimap_row {
 } minimap_row;
 
 typedef struct minimap_style {
-    uint32_t background, density, viewport, stale; /* opaque 0x00RRGGBB */
+    uint32_t background, density, viewport, stale; /* opaque 0x00RRGGBB; stale is the pending edge bar */
 } minimap_style;
 
 typedef struct minimap {
     minimap_row *rows;
     size_t capacity;
     uint64_t revision, bytes, lines, lines_per_row;
+    uint64_t painted_first, painted_end; /* retain the ready map's viewport during edits */
     uint32_t height, active_rows;
     bool initialized, filled, stale, sampled;
     const void *buffer_identity; /* optional stable token set by bind */
@@ -85,7 +86,8 @@ int minimap_prepare_source(minimap *m, const minimap_input *input,
  * rows immutable during publication. Row storage must not overlap. */
 int minimap_publish(minimap *m, const minimap_input *input, const minimap *prepared);
 /* UI: zero source reads, even on cache miss, edits, resize or index progress.
- * Fresh published summaries render normally; otherwise display pending map.
+ * Fresh published summaries render normally; otherwise retain same-buffer,
+ * same-height summaries and viewport, or display a pending scrollbar.
  * m->stale requests a worker preparation; use hit_approx while stale. */
 int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *grid,
                         uint32_t first_col, uint32_t width,
@@ -101,7 +103,9 @@ int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *gri
  * fill_cached on UI for a source-read-free path.
  * Pending index: paint same-buffer retained density (if height matches),
  * or a current approximate scrollbar,
- * with stale tint/viewport band; return OK with m->stale=true, and NEVER read source.
+ * keeping its ready viewport and colours. Without retained density, draw a
+ * current approximate scrollbar and a last-column pending bar in style.stale.
+ * Return OK with m->stale=true, and NEVER read source.
  * Invalid args leave grid/state unchanged. Invalid span reports SOURCE,
  * leaves grid unchanged and invalidates summaries (stale=true).
  * Caller sets index_ready only for the same revision/bytes as source.

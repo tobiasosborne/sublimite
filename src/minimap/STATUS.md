@@ -1,5 +1,14 @@
 # P4.5 / P4.5b minimap status
 
+edit-g11 supersedes the pending tint treatment below: same-buffer pending
+fills retain ready summaries and their viewport without recolouring or source
+reads. Cached fills preserve those summaries until fresh publication. Without
+a usable cache, pending maps use an edge bar rather than a whole-strip tint.
+Recomposition restores the correct buffer image on a shared grid; internal
+stale/navigation semantics remain unchanged. Decision and validation:
+[edit-g11](../../docs/decisions/edit-g11.md),
+[worker report](../../docs/worker-reports/edit-g11.md).
+
 Standalone density and navigation module; review §§5–9 addressed within the
 permitted module scope. Decisions and red/green evidence:
 [original contract](../../docs/decisions/P4.5.md) and

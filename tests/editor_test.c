@@ -74,6 +74,73 @@ static int expect(editor *e, const char *text, uint64_t cursor)
     T(memcmp(bytes, text, n) == 0); T(editor_view(e).selection.cursor == cursor);
     return 0;
 }
+/* edit-g11: use the drive's keystroke count (G: the supplied typing repro),
+ * and the allocation fixture's grid geometry. Storage covers cfg.rows times
+ * the editor's existing eight-column minimap, including the chrome row. */
+typedef struct flash_probe {
+    editor *e;
+    counted allocations;
+    render_cell previous[8 * 8];
+    size_t frames, orange_frames, stale_frames, changed_pending, chrome_markers;
+    uint64_t fill_max_ns;
+} flash_probe;
+static void flash_ingress(void *ctx, uint64_t seq, uint64_t ns)
+{
+    flash_probe *p = ctx; ingress(&p->allocations, seq, ns);
+}
+static void flash_submit(void *ctx, const editor_frame *frame)
+{
+    flash_probe *p = ctx; submitted(&p->allocations, frame);
+    if (!p->e) return;
+    editor *e = p->e; bool orange = false;
+    for (uint32_t r = e->tab_rows; r < e->grid.dims.rows; r++) {
+        for (uint32_t c = e->text_grid.dims.cols; c < e->grid.dims.cols; c++) {
+            const render_cell *cell = &e->grid.cells[(size_t)r * e->grid.dims.cols + c];
+            /* Raw stale paint and its actual background blend:
+             * (0x171b22 + 0xbf853d) / two, rounded per channel by minimap. */
+            if (cell->fg == 0xbf853d || cell->bg == 0xbf853d || cell->bg == 0x6b5030)
+                orange = true;
+        }
+    }
+    p->frames++; p->orange_frames += orange;
+    if (e->buffer->map.stale) {
+        p->stale_frames++;
+        p->changed_pending += memcmp(p->previous, e->map_grid.cells,
+            (size_t)e->map_grid.dims.rows * e->map_grid.dims.cols * sizeof(render_cell)) != 0;
+    }
+    if (e->tab_rows && e->grid.cells[e->grid.dims.cols - 1u].glyph_index == '!')
+        p->chrome_markers++;
+    if (e->stats.minimap_ns > p->fill_max_ns) p->fill_max_ns = e->stats.minimap_ns;
+}
+static int minimap_typing_flash(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    flash_probe probe = {0};
+    editor_config cfg = {.initial = (const uint8_t *)"abc\n", .initial_len = sizeof "abc\n" - 1,
+        .cols = 40, .rows = 8, .hook_ctx = &probe,
+        .on_ingress = flash_ingress, .on_submit = flash_submit};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0); probe.e = e;
+    /* N comes from the supplied Astra repro: 95 keystrokes, not a timing bound. */
+    const size_t keys = 95;
+    for (size_t i = 0; i < keys; i++) {
+        memcpy(probe.previous, e->map_grid.cells,
+            (size_t)e->map_grid.dims.rows * e->map_grid.dims.cols * sizeof(render_cell));
+        T(press(e, key('x', 0, "x")) == 0);
+    }
+    /* Settle excludes index maintenance: explicitly run its next turn so the
+     * last typed frame is followed by the ready map's publication. */
+    T(editor_step(e, 0) >= 0); T(settle(e) == 0);
+    printf("edit-g11 null typing: keys=%zu frames=%zu orange_frames=%zu stale_frames=%zu "
+        "changed_pending=%zu chrome_markers=%zu mallocs=%zu fill_max_ns=%llu\n",
+        keys, probe.frames, probe.orange_frames, probe.stale_frames, probe.changed_pending,
+        probe.chrome_markers, probe.allocations.allocations, (unsigned long long)probe.fill_max_ns);
+    T(probe.frames >= keys && probe.stale_frames > 0); T(probe.orange_frames == 0);
+    T(probe.changed_pending == 0 && probe.chrome_markers == 0);
+    T(!probe.allocations.active && probe.allocations.allocations == 0);
+    T(!e->buffer->map.stale && e->buffer->map.revision == e->buffer->revision);
+    T(editor_length(e) == cfg.initial_len + keys);
+    editor_close(e); return 0;
+}
 typedef struct replay_model { uint8_t bytes[256]; size_t len, records; } replay_model;
 static uint64_t le64(const uint8_t *p)
 {
@@ -1900,6 +1967,7 @@ int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
+        if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
         if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
         if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
         if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
@@ -1926,6 +1994,7 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(minimap_typing_flash() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);

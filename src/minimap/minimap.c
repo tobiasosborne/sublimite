@@ -249,12 +249,20 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
         uint64_t remaining = input->lines - first_line;
         end += visible_lines < remaining ? visible_lines : remaining;
     }
+    if (!m->stale) {
+        m->painted_first = first_line; m->painted_end = end;
+    } else if (retained) {
+        /* Keep the last ready image, including its viewport, while the index
+         * catches up. Recompose from per-buffer summaries so a tab switch
+         * cannot retain another buffer's cells in a shared render grid. */
+        first_line = m->painted_first; end = m->painted_end;
+    }
     for (uint32_t r = 0; r < grid->dims.rows; r++) {
         const minimap_row *v = retained ? &m->rows[r] : NULL;
         uint32_t density = v ? v->density : m->stale ? 64u : 0;
         uint32_t occupied = (uint32_t)(((uint64_t)density * width + 254) / 255);
         uint32_t ink = blend(style->background, style->density, density);
-        bool viewport = !m->stale && v && v->line_count && first_line < end
+        bool viewport = v && v->line_count && first_line < end
                      && v->first_line < end && first_line < v->first_line + v->line_count;
         if (m->stale && !retained) {
             uint64_t row_line = scale(input->lines, r, grid->dims.rows);
@@ -267,15 +275,14 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
             ink = blend(ink, style->viewport, 128);
             background = blend(background, style->viewport, 128);
         }
-        if (m->stale) {
-            ink = blend(ink, style->stale, 128);
-            background = blend(background, style->stale, 128);
-        }
         render_cell *dst = &grid->cells[(size_t)r * grid->dims.cols + first_col];
         bool changed = false;
         for (uint32_t c = 0; c < width; c++) {
             render_cell next = { .atlas_slot = RENDER_NO_SLOT, .fg = style->density,
                                  .bg = c < occupied ? ink : background };
+            /* One existing strip column is the narrowest cell treatment;
+             * pending edits with retained summaries get no indicator. */
+            if (m->stale && !retained && c == width - 1u) next.bg = style->stale;
             if (memcmp(&dst[c], &next, sizeof next) != 0) {
                 dst[c] = next; changed = true;
             }
@@ -332,9 +339,6 @@ int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *gri
     minimap_input pending = *input;
     if (m->height != grid->dims.rows || minimap_stale(m, input)) {
         pending.index_ready = false;
-        /* Show a current byte scrollbar, never old source density in this UI
-         * path. Legacy fill retains its historical pending-density contract. */
-        m->filled = false;
     }
     return minimap_fill(m, &pending, grid, first_col, width,
                         first_line, visible_lines, style);

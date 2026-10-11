@@ -517,3 +517,14 @@ Editor and lineidx fuzz each complete 61 seconds clean against 60 seconds (G).
 The release editor suite and focused prepaid repair guard record zero allocations.
 Paired TRACK benchmark timing/structural limits and the coordinator leak-on rerun
 are fully recorded in docs/worker-reports/edit-zzj.16-s9.md.
+
+# edit-g11: edit-time minimap flash
+
+The stale-map tab exclamation mark is removed. Pending indexing keeps the
+previous ready minimap until its replacement can be filled, with a desaturated
+edge bar when no ready image is usable. Submit scheduling and glyph lookup
+are unchanged. The submitted-frame null-backend regression checks amber
+paint, retained cells, chrome markers, final revision and typing allocations.
+Paint audit, red/green, builds, sandbox restrictions and comparison-drive
+handoff are in [the worker report](../../docs/worker-reports/edit-g11.md).
+
