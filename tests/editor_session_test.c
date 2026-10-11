@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct fixture {
     char directory[IPC_PATH_CAP], path[IPC_PATH_CAP], log[IPC_PATH_CAP];
@@ -288,19 +289,131 @@ static int session_artifacts(void)
     fd = mkstemp(failed); T(fd >= 0); close(fd);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config config = {.journal_path = failed, .start_empty = true, .cols = 32, .rows = 3};
-    editor *e = NULL; T(editor_open(&e, &config, &backend) == EDITOR_ERR_IO && !e);
-    T(access(failed, F_OK) < 0 && access(previous, F_OK) == 0);
+    /* edit-btj: a changed base never blocks launch. The source is renamed
+     * aside (never deleted) and this launch's journal becomes CURRENT. */
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0 && e);
+    T(access(previous, F_OK) < 0 && *e->recovery_aside && access(e->recovery_aside, F_OK) == 0);
+    editor_close(e);
     DIR *dir = opendir(root); T(dir); struct dirent *entry;
     while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
         T(unlinkat(dirfd(dir), entry->d_name, 0) == 0);
     T(closedir(dir) == 0 && rmdir(root) == 0);
-    puts("editor_session_test: three launches leave one nonempty 0600 journal; failed restore removes empty destination and preserves source");
+    puts("editor_session_test: three launches leave one nonempty 0600 journal; changed base opens and sets the source aside");
+    return 0;
+}
+/* edit-btj (Astra drive 2 task 12 and its ordinary profile): unsaved typing,
+ * kill, then the base file is replaced (changed bytes) or rewritten with the
+ * same bytes (new mtime/ctime, as the drive's fixture rewrite did). Launch must
+ * succeed showing the disk text; the unchanged second buffer keeps its edits;
+ * the journal holding the typed text survives under a set-aside name. */
+static bool file_contains(const char *path, const char *needle)
+{
+    int fd = open(path, O_RDONLY); if (fd < 0) return false;
+    struct stat st; if (fstat(fd, &st) || st.st_size <= 0) { close(fd); return false; }
+    char *bytes = malloc((size_t)st.st_size); bool found = false;
+    if (bytes && read(fd, bytes, (size_t)st.st_size) == st.st_size)
+        for (size_t i = 0; !found && i + strlen(needle) <= (size_t)st.st_size; i++) found = !memcmp(bytes + i, needle, strlen(needle));
+    free(bytes); close(fd); return found;
+}
+static int changed_base(bool same_bytes)
+{
+    char root[] = "build/editor-changed-XXXXXX"; T(mkdtemp(root));
+    char source[IPC_PATH_CAP], other[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP], third[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    T(snprintf(other, sizeof other, "%s/other", root) > 0);
+    T(snprintf(first, sizeof first, "%s/session-XXXXXX", root) > 0);
+    T(snprintf(next, sizeof next, "%s/session-XXXXXX", root) > 0);
+    T(snprintf(third, sizeof third, "%s/session-XXXXXX", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    fd = open(other, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, "keep", strlen("keep")) == (ssize_t)strlen("keep")); close(fd);
+    fd = mkstemp(first); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config config = {.path = source, .journal_path = first, .cols = 32, .rows = 3};
+        editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
+        T(press(e, 'M', 0, "MK") == 0); /* one INSERT record carries both bytes */
+        uint64_t id; T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(press(e, 'x', 0, "x") == 0); _exit(0); /* no close: a crash leaves the journal */
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    fd = open(source, O_WRONLY | O_TRUNC); T(fd >= 0);
+    const char *disk = same_bytes ? "base" : "changed on disk";
+    T(write(fd, disk, strlen(disk)) == (ssize_t)strlen(disk));
+    /* A distinct mtime even on coarse clocks: one second back from now. */
+    struct timespec when[2]; T(clock_gettime(CLOCK_REALTIME, &when[0]) == 0); when[0].tv_sec -= 1; when[1] = when[0];
+    T(futimens(fd, when) == 0); close(fd);
+    fd = mkstemp(next); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = next, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0 && e);
+    T(tabs_count(&e->tabs) == 2);
+    uint8_t bytes[32] = {0};
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    T(editor_length(e) == strlen(disk) && editor_read(e, 0, bytes, strlen(disk)) == 0 && !memcmp(bytes, disk, strlen(disk)));
+    T(!editor_tab(e, 0)->modified);
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+    T(editor_length(e) == strlen("xkeep") && editor_read(e, 0, bytes, strlen("xkeep")) == 0 && !memcmp(bytes, "xkeep", strlen("xkeep")));
+    T(editor_tab(e, 1)->modified);
+    T(e->recovery_notice && access(first, F_OK) < 0);
+    T(*e->recovery_aside && file_contains(e->recovery_aside, "MK"));
+    char aside[IPC_PATH_CAP]; strcpy(aside, e->recovery_aside);
+    editor_close(e);
+    /* The next launch restores the replacement session normally. */
+    fd = mkstemp(third); T(fd >= 0); close(fd);
+    backend = (render_backend){0}; T(render_null_backend(&backend) == 0);
+    config.journal_path = third; e = NULL;
+    T(editor_open(&e, &config, &backend) == 0 && e && !e->recovery_notice && tabs_count(&e->tabs) == 2);
+    T(editor_tab(e, 1)->modified && !editor_tab(e, 0)->modified && access(aside, F_OK) == 0);
+    editor_close(e);
+    DIR *dir = opendir(root); T(dir); struct dirent *entry;
+    while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+        T(unlinkat(dirfd(dir), entry->d_name, 0) == 0);
+    T(closedir(dir) == 0 && rmdir(root) == 0);
+    return 0;
+}
+/* edit-btj: an install failure after partial installation (here more
+ * journalled tabs than this launch's capacity) sets the source aside and
+ * opens again without discovery. */
+static int install_failure(void)
+{
+    char root[] = "build/editor-install-XXXXXX"; T(mkdtemp(root));
+    char source[IPC_PATH_CAP], other[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    T(snprintf(other, sizeof other, "%s/other", root) > 0);
+    T(snprintf(first, sizeof first, "%s/session-XXXXXX", root) > 0);
+    T(snprintf(next, sizeof next, "%s/session-XXXXXX", root) > 0);
+    int fd = mkstemp(first); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config config = {.path = source, .journal_path = first, .cols = 32, .rows = 3};
+        editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
+        T(press(e, 'M', 0, "MK") == 0);
+        uint64_t id; T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(press(e, 'x', 0, "x") == 0); _exit(0);
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    fd = mkstemp(next); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = next, .start_empty = true, .tab_capacity = 1, .closed_capacity = 1, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0 && e);
+    T(e->recovery_notice && tabs_count(&e->tabs) == 0 && access(first, F_OK) < 0);
+    T(*e->recovery_aside && file_contains(e->recovery_aside, "MK"));
+    editor_close(e);
+    DIR *dir = opendir(root); T(dir); struct dirent *entry;
+    while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+        T(unlinkat(dirfd(dir), entry->d_name, 0) == 0);
+    T(closedir(dir) == 0 && rmdir(root) == 0);
     return 0;
 }
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
-    T(session_artifacts() == 0); T(unavailable_target_parent() == 0); T(existing_journal() == 0);
+    T(session_artifacts() == 0); T(changed_base(false) == 0); T(changed_base(true) == 0); T(install_failure() == 0);
+    T(unavailable_target_parent() == 0); T(existing_journal() == 0);
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);

@@ -133,6 +133,12 @@ struct editor {
     editor_session *session;
     int session_lock;
     bool recovering, startup_restored, save_flushing, recover_existing, session_lock_owned;
+    /* edit-btj: startup recovery notice, shown on the status row until the
+     * first mutation; recovery_aside names the set-aside source journal. */
+    const char *recovery_notice;
+    uint64_t recovery_notice_mutations;
+    bool recovery_notice_shown, recovery_retry, recovery_skip;
+    char recovery_aside[IPC_PATH_CAP];
     work_pool pool, journal_pool, startup_pool;
     editor_backend_init startup;
     render_backend retired_backend;
@@ -224,6 +230,9 @@ bool editor_save_active(const editor *e);
 void editor_save_overlay(editor *e);
 void editor_save_submitted(editor *e, uint64_t submitted_ns);
 int editor_session_restore(editor *e);
+/* edit-btj: rename a recovery journal to "<path>.set-aside-<ns>" without
+ * replacing anything; out receives the new name ("" on failure). Startup only. */
+int editor_set_aside(const char *path, char *out, size_t cap);
 /* Internal cross-file helpers; UI only. */
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);

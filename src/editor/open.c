@@ -46,7 +46,8 @@ static int add_poll_fd(editor *e, int fd)
     struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
     return epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &ev) ? EDITOR_ERR_IO : 0;
 }
-int editor_open(editor **out, const editor_config *config, render_backend *backend)
+static int open_editor(editor **out, const editor_config *config, render_backend *backend,
+                       bool skip_recovery, bool *retry, char *aside)
 {
     if (!out || !config || !backend || (!config->initial && config->initial_len) || backend->initialized) return EDITOR_ERR_ARG;
     *out = NULL;
@@ -58,7 +59,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         render_null_backend(&fallback) : render_cpu_backend(&fallback))) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1;
+    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     e->cfg = *config; e->preferences_font_override = config->font_points; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
@@ -249,5 +250,25 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (rc) goto fail;
     *out = e; return 0;
 fail:
+    if (retry && e->recovery_retry) { *retry = true; strcpy(aside, e->recovery_aside); }
     editor_close(e); return rc > 0 ? EDITOR_ERR_IO : rc;
+}
+int editor_open(editor **out, const editor_config *config, render_backend *backend)
+{
+    bool retry = false; char aside[IPC_PATH_CAP] = "";
+    int rc = open_editor(out, config, backend, false, &retry, aside);
+    if (!retry) return rc;
+    /* edit-btj: installing a discovered session failed after its source was
+     * set aside. A partial checkpoint in this launch's destination is set
+     * aside too (journal_open requires it empty); then open without discovery. */
+    struct stat st; char partial[IPC_PATH_CAP];
+    if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0)
+        (void)editor_set_aside(config->journal_path, partial, sizeof partial);
+    rc = open_editor(out, config, backend, true, NULL, NULL);
+    if (!rc) {
+        strcpy((*out)->recovery_aside, aside);
+        (*out)->recovery_notice = "session recovery failed; its journal was set aside";
+        (*out)->recovery_notice_mutations = (*out)->stats.mutations;
+    }
+    return rc;
 }

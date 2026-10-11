@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct recovered_buffer {
@@ -22,6 +23,7 @@ typedef struct recovered_buffer {
     bool full_view;
     editor_buffer *installed;
     bool save_pending;
+    bool conflict; /* edit-btj: BASE no longer matches disk; edits are not replayed */
     char retained[IPC_PATH_CAP];
 } recovered_buffer;
 typedef struct recovered_session {
@@ -31,6 +33,8 @@ typedef struct recovered_session {
     bool tabs_valid;
     uint32_t width, height;
     bool window_chosen; /* WINDOW v2 with JOURNAL_WINDOW_CHOSEN */
+    bool tolerant;      /* edit-btj second pass: a changed BASE marks its buffer */
+    bool conflicts;     /* some buffer was marked */
 } recovered_session;
 static uint64_t get64(const uint8_t *p)
 {
@@ -82,6 +86,19 @@ static int restore_record(void *ctx, const journal_record *r)
             b = calloc(1, sizeof *b); if (!b) return JOURNAL_NOMEM;
             b->id = r->buffer_id; b->next = s->buffers; s->buffers = b;
         }
+        b->conflict = false;
+        if (s->tolerant && *path) {
+            /* edit-btj: the first pass stopped at a changed BASE. Its edits
+             * cannot be replayed onto other bytes: open the disk text and keep
+             * the edits in the set-aside source journal. */
+            int check = journal_check_base(&base);
+            if (check && check != JOURNAL_BASE_CHANGED) return check;
+            if (check) {
+                free(b->bytes); b->bytes = NULL; b->len = 0;
+                b->conflict = s->conflicts = true; strcpy(b->target, path);
+                return 0;
+            }
+        }
         free(b->bytes); b->len = (size_t)base.size; b->bytes = b->len ? malloc(b->len) : NULL;
         if (b->len && !b->bytes) return JOURNAL_NOMEM;
         strcpy(b->target, path);
@@ -106,6 +123,7 @@ static int restore_record(void *ctx, const journal_record *r)
         b->full_view = r->size == JOURNAL_VIEW_STATE_BYTES;
         return journal_decode_view_state(r, &b->view);
     }
+    if (b->conflict && (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE)) return 0;
     uint64_t off = get64(p);
     if (off > b->len) return JOURNAL_INVALID;
     if (r->type == JOURNAL_INSERT) {
@@ -150,6 +168,10 @@ static int install_buffer(editor *e, recovered_buffer *r)
     if (b->pending_open) {
         e->dirty = false;
         rc = editor_adopt_open(e, b); if (rc) return rc;
+    }
+    if (r->conflict) { /* edit-btj: disk text, clean, view from the start */
+        (void)tabs_set_modified(&e->tabs, tabs_active_index(&e->tabs), false);
+        r->installed = b; return editor_activate(e);
     }
     bool clean = !r->save_pending && same_bytes(b, r);
     undo_clear(&b->undo);
@@ -234,6 +256,36 @@ static int lock_name(char *out, size_t cap, const char *path)
     int n = snprintf(out, cap, "%.*s.%s.lock", (int)parent, path, path + parent);
     return n < 0 || (size_t)n >= cap ? EDITOR_ERR_ARG : 0;
 }
+/* edit-btj: second, tolerant pass over the unchanged source bytes. The
+ * streaming replay stops at the first changed BASE without truncating. */
+static int replay_tolerant(const char *path, recovered_session *s)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return JOURNAL_IO;
+    struct stat st; uint8_t *bytes = NULL; size_t size = 0, done = 0; int rc = 0;
+    if (fstat(fd, &st) || st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX) rc = JOURNAL_IO;
+    else { size = (size_t)st.st_size; bytes = size ? malloc(size) : NULL; if (size && !bytes) rc = JOURNAL_NOMEM; }
+    while (!rc && done < size) {
+        ssize_t n = read(fd, bytes + done, size - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { rc = JOURNAL_IO; break; }
+        done += (size_t)n;
+    }
+    close(fd);
+    journal_replay_result result;
+    s->tolerant = true;
+    if (!rc) rc = journal_replay_bytes(bytes, size, restore_record, s, &result);
+    free(bytes); return rc;
+}
+/* edit-btj: never delete a recovery source. Rename it beside itself under a
+ * dotted name, which session discovery skips; never replace an existing name. */
+int editor_set_aside(const char *path, char *out, size_t cap)
+{
+    struct timespec now; if (clock_gettime(CLOCK_REALTIME, &now)) return EDITOR_ERR_IO;
+    int n = snprintf(out, cap, "%s.set-aside-%lld%09ld", path, (long long)now.tv_sec, now.tv_nsec);
+    if (n < 0 || (size_t)n >= cap) { *out = 0; return EDITOR_ERR_ARG; }
+    if (renameat2(AT_FDCWD, path, AT_FDCWD, out, RENAME_NOREPLACE)) { *out = 0; return EDITOR_ERR_IO; }
+    return 0;
+}
 int editor_session_restore(editor *e)
 {
     const char *path = e->cfg.journal_path;
@@ -244,6 +296,7 @@ int editor_session_restore(editor *e)
     e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
     e->session_lock_owned = true;
+    if (e->recovery_skip) return 0; /* edit-btj retry: own lease only, no discovery */
     char directory[IPC_PATH_CAP]; strcpy(directory, path);
     char *slash = strrchr(directory, '/');
     if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
@@ -283,8 +336,38 @@ int editor_session_restore(editor *e)
     if (previous_fd < 0) return 0;
     recovered_session session = {0}; journal_replay_result result;
     int rc = journal_replay_file(previous, restore_record, &session, &result);
+    /* edit-btj: a discovered journal never blocks launch. A changed BASE gets
+     * a tolerant pass; any other failure sets the source aside and opens empty.
+     * An explicitly named existing journal keeps the strict contract. */
+    bool aside = false;
+    if (rc && !e->recover_existing) {
+        fini(&session);
+        rc = replay_tolerant(previous, &session);
+        if (rc) { fini(&session); aside = true; rc = 0; }
+    }
     if (!rc && e->recover_existing && !session.buffers) rc = EDITOR_ERR_IO;
-    if (!rc && session.buffers) { rc = install_session(e, &session); if (!rc) e->startup_restored = true; }
+    if (!rc && session.buffers) {
+        rc = install_session(e, &session);
+        if (!rc) e->startup_restored = true;
+        else if (!e->recover_existing) {
+            /* Partly installed state cannot be unwound here: set the source
+             * aside and let editor_open start again without discovery. */
+            (void)editor_set_aside(previous, e->recovery_aside, sizeof e->recovery_aside);
+            e->recovery_retry = true; e->recovering = true;
+            fini(&session); close(previous_fd); return EDITOR_ERR_IO;
+        }
+    }
+    if (!rc && (aside || session.conflicts)) {
+        e->recovery_notice = session.conflicts && !aside ?
+            "file changed on disk since this session; its unsaved edits were set aside" :
+            "session recovery failed; its journal was set aside";
+        e->recovery_notice_mutations = e->stats.mutations;
+        (void)editor_set_aside(previous, e->recovery_aside, sizeof e->recovery_aside);
+        if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
+        int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0) { (void)fsync(fd); close(fd); }
+        fini(&session); close(previous_fd); return 0;
+    }
     /* Failure never retires the recovery source. Corrupt/torn tails are replay's
      * validated prefix, so the durable replacement checkpoint contains exactly
      * the accepted session. */

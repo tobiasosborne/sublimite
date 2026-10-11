@@ -148,6 +148,12 @@ static int compose(editor *e)
      * exists. A later generation restores it even on a caret-only frame.
      * Source suspension bypasses text composition, so restore its cached row
      * here before drawing the higher-priority source-change prompt. */
+    /* edit-btj: the recovery notice ends at the first mutation; recompose
+     * every row once so the status row returns to text. */
+    if (e->recovery_notice_shown && e->stats.mutations != e->recovery_notice_mutations) {
+        e->recovery_notice = NULL; e->recovery_notice_shown = false;
+        e->caret_only = e->glyph_only = false;
+    }
     if (e->unimplemented_frame && e->unimplemented_frame != e->grid.frame_id) {
         e->caret_only = false;
         e->unimplemented_frame = 0;

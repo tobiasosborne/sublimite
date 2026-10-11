@@ -410,6 +410,9 @@ void editor_save_overlay(editor *e)
         if (e->session->pending) status = "saving";
         else status = savectl_get_model(e->session->saving->save).status;
     } else if (b->save_error && !b->source_stale) status = "save failed";
+    else if (e->recovery_notice && e->stats.mutations == e->recovery_notice_mutations) {
+        status = e->recovery_notice; e->recovery_notice_shown = true; /* edit-btj */
+    }
     if (!status || !*status || !e->grid.dims.rows) return;
     size_t len = strlen(status); uint32_t row = e->grid.dims.rows - 1;
     for (uint32_t col = 0; col < e->grid.dims.cols; col++) {
