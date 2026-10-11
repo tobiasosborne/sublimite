@@ -20,4 +20,5 @@ int layout_wrap_relayout(layout *l, uint32_t first, uint32_t count);
 void layout_refill(layout *l);
 void layout_consume(layout *l, size_t n);
 int layout_decode_cluster(layout *l, const uint8_t **bytes, size_t *len, int *width, size_t budget);
+int layout_cluster_glyph(layout *l, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot);
 #endif

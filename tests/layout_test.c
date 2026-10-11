@@ -106,6 +106,129 @@ static bool same_grid(const fx *a, const fx *b)
 static layout_config nogutter(void) { layout_config c = cfg_default(); c.gutter = false; return c; }
 static layout_config gutter(void) { layout_config c = cfg_default(); c.gutter = true; return c; }
 
+typedef struct artwork_request {
+    const char *bytes;
+    uint32_t width, slot;
+    size_t calls;
+} artwork_request;
+
+static int artwork_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot)
+{
+    artwork_request *request = ctx;
+    size_t expected = strlen(request->bytes);
+    CHECK(len == expected && !memcmp(bytes, request->bytes, len < expected ? len : expected));
+    CHECK(width == request->width);
+    request->calls++;
+    *slot = request->slot;
+    return FONT_OK;
+}
+
+/* (G) Unshaped emoji use one grapheme's cells and the first emoji's artwork.
+ * A deterministic covering callback avoids relying on installed colour fonts.
+ * Invisible presentation scalars must never reach this callback, even alone. */
+static void test_emoji_artwork(void)
+{
+    static const struct { const char *text, *artwork, *row; uint32_t width; } cases[] = {
+        {"👩‍💻x", "👩", "@_x", 2},
+        {"👩🏻‍💻x", "👩", "@_x", 2},
+        {"👩🏼‍💻x", "👩", "@_x", 2},
+        {"👩🏽‍💻x", "👩", "@_x", 2},
+        {"👩🏾‍💻x", "👩", "@_x", 2},
+        {"👩🏿‍💻x", "👩", "@_x", 2},
+        {"👩‍💻‍😀x", "👩", "@_x", 2},
+        {"😀x", "😀", "@_x", 2},
+        {"😀︎x", "😀", "@_x", 2},
+        {"😀️x", "😀", "@_x", 2},
+        {"❤︎x", "❤", "@x", 1},
+        {"❤️x", "❤", "@_x", 2},
+        {"❤‍🔥x", "❤", "@_x", 2},
+        {"e️́x", "é", "@x", 1}, /* retain ordinary combining ink */
+        {"क्‍कx", "क्क", "@x", 1}, /* ZWJ is not an emoji base */
+        {"‍x", "", "x", 0},
+        {"︎x", "", "x", 0},
+        {"️x", "", "x", 0},
+        {"🏻x", "", "x", 0},
+        {"🏼x", "", "x", 0},
+        {"🏽x", "", "x", 0},
+        {"🏾x", "", "x", 0},
+        {"🏿x", "", "x", 0},
+        {"‍︎️🏻🏼🏽🏾🏿x", "", "x", 0},
+        {"\xcd\xb8x", "\xcd\xb8", "#x", 1}, /* U+0378: missing stays visible */
+    };
+    for (unsigned wrapping = 0; wrapping < 2; wrapping++) {
+        for (unsigned sliced = 0; sliced < 2; sliced++) {
+            for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+                artwork_request request = {cases[i].artwork, cases[i].width,
+                    cases[i].row[0] == '#' ? REPL : '@' - ' ', 0};
+                layout_config cfg = nogutter(); cfg.glyph = artwork_glyph; cfg.glyph_ctx = &request;
+                cfg.slice_clusters = sliced;
+                fx f;
+                /* Cells/rows derive from the widest cluster, following x, and an EOF row. */
+                fx_make(&f, 2u + 1u, 1u + 1u, cfg, cases[i].text, strlen(cases[i].text));
+                edit_arena arena;
+                CHECK(edit_arena_init(&arena, 2u * f.g.dims.rows * sizeof(layout_wrap_row)) == 0);
+                CHECK(layout_wrap_init(&f.l, &arena) == LAYOUT_DONE);
+                CHECK(layout_set_wrap(&f.l, wrapping != 0) == LAYOUT_DONE);
+                show(&f, 0, 0);
+                ROW_IS(&f, 0, 0, cases[i].row);
+                CHECK(request.calls == (cases[i].width ? 1u : 0u));
+                if (cases[i].width == 2) {
+                    CHECK(cell(&f, 0, 0)->attrs & RENDER_ATTR_WIDE_LEFT);
+                    CHECK(cell(&f, 0, 1)->attrs & RENDER_ATTR_WIDE_RIGHT);
+                }
+                /* Revisit the cluster through the segmentation cache. */
+                request.calls = 0;
+                if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+                show(&f, 0, 0);
+                if (edit_malloc_guard_active()) CHECK(edit_malloc_guard_end() == 0);
+                ROW_IS(&f, 0, 0, cases[i].row);
+                CHECK(request.calls == (cases[i].width ? 1u : 0u));
+                fx_free(&f); edit_arena_free(&arena);
+            }
+        }
+    }
+}
+
+/* Force the artwork source into layout's saved-byte buffer across a decode
+ * slice. Filtering must work in place and FONT_MORE must replay source bytes. */
+typedef struct deferred_artwork { artwork_request request; bool defer; } deferred_artwork;
+static int deferred_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot)
+{
+    deferred_artwork *state = ctx;
+    int rc = artwork_glyph(&state->request, bytes, len, width, slot);
+    if (state->defer) { state->defer = false; return FONT_MORE; }
+    return rc;
+}
+static void test_emoji_saved_artwork(void)
+{
+    const char *base = "👩", *mark = "́", *tail = "️🏽‍💻x";
+    size_t marks = UTF8_GRAPHEME_BUDGET / strlen(mark) + 1u;
+    size_t prefix = strlen(base) + marks * strlen(mark);
+    char *text = malloc(prefix + strlen(tail) + 1u), *artwork = malloc(prefix + 1u);
+    CHECK(text && artwork);
+    if (!text || !artwork) { free(text); free(artwork); return; }
+    memcpy(text, base, strlen(base));
+    for (size_t i = 0; i < marks; i++) memcpy(text + strlen(base) + i * strlen(mark), mark, strlen(mark));
+    memcpy(artwork, text, prefix); artwork[prefix] = 0;
+    memcpy(text + prefix, tail, strlen(tail) + 1u);
+    for (unsigned wrapping = 0; wrapping < 2; wrapping++) {
+        deferred_artwork request = {{artwork, 2, '@' - ' ', 0}, true};
+        layout_config cfg = nogutter(); cfg.glyph = deferred_glyph; cfg.glyph_ctx = &request; cfg.slice_clusters = 1;
+        fx f; fx_make(&f, 2u + 1u, 1u + 1u, cfg, text, strlen(text));
+        edit_arena arena; CHECK(edit_arena_init(&arena, 2u * f.g.dims.rows * sizeof(layout_wrap_row)) == 0);
+        CHECK(layout_wrap_init(&f.l, &arena) == LAYOUT_DONE);
+        CHECK(layout_set_wrap(&f.l, wrapping != 0) == LAYOUT_DONE);
+        if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+        show(&f, 0, 0);
+        if (edit_malloc_guard_active()) CHECK(edit_malloc_guard_end() == 0);
+        ROW_IS(&f, 0, 0, "@_x");
+        CHECK(request.request.calls == 2u); /* one deferred request, then its retry */
+        CHECK(f.l.pos == strlen(text));
+        fx_free(&f); edit_arena_free(&arena);
+    }
+    free(text); free(artwork);
+}
+
 static void test_basic(void)
 {
     fx f; const char *s = "a\tb\n\tx\nabc\tz\n";
@@ -636,6 +759,8 @@ static void test_resize(void)
 
 int main(void)
 {
+    test_emoji_artwork();
+    test_emoji_saved_artwork();
     test_crlf_cursor_indexed(); test_resize(); test_basic(); test_crlf(); test_clusters(); test_wide_edges(); test_invalid();
     test_gutter(); test_hscroll_eof(); test_slices(); test_dirty(); test_cursor(); test_long_line_bounded(); test_checkpoints(); test_budgeted_cluster(); test_no_allocations(); test_cluster_window_boundary(); test_short_line_before_long(); test_cache_invalid_right_context();
     if (fails) { printf("layout_test: %d FAILED\n", fails); return 1; }

@@ -65,6 +65,8 @@ static int in_tab(const utf8_range *t, size_t n, uint32_t cp)
 }
 static int ref_width(uint32_t cp)
 {
+    /* (G) Editor presentation policy: skin-tone modifiers have no own cell. */
+    if (cp >= 0x1f3fbu && cp <= 0x1f3ffu) return 0;
     if (in_tab(UCD_ZERO_WIDTH, NELEM(UCD_ZERO_WIDTH), cp)) return 0;
     if (in_tab(UCD_WIDE, NELEM(UCD_WIDE), cp)) return 2;
     return 1;
@@ -312,7 +314,7 @@ static void t_width(void)
     CHECK(utf8_cell_width(0xFF21) == 2);
     CHECK(utf8_cell_width(0x1AFF4) == 1);    /* unassigned gap in Kana Ext-B: variants said 2 */
     CHECK(utf8_cell_width(0x1F1E6) == 2);    /* regional indicator: Emoji_Presentation; v3 asserted 1 */
-    CHECK(utf8_cell_width(0x1F3FB) == 2);
+    for (uint32_t cp = 0x1F3FB; cp <= 0x1F3FF; cp++) CHECK(utf8_cell_width(cp) == 0);
     CHECK(utf8_cell_width(0x1F600) == 2);
     CHECK(utf8_cell_width(0x20000) == 2);
     CHECK(utf8_cell_width(0x2FFFE) == 1);
@@ -782,6 +784,15 @@ static int cw(const char *s, size_t n)
 
 static void t_cluster_width(void)
 {
+    CHECK(CWS("👩‍💻") == 2); /* (G) one unshaped grapheme, base's wide cell pair */
+    CHECK(CWS("‍") == 0);
+    CHECK(CWS("︎") == 0);
+    CHECK(CWS("️") == 0);
+    CHECK(CWS("🏻") == 0);
+    CHECK(CWS("🏼") == 0);
+    CHECK(CWS("🏽") == 0);
+    CHECK(CWS("🏾") == 0);
+    CHECK(CWS("🏿") == 0);
     CHECK(cw("", 0) == 0);
     CHECK(CWS("a") == 1);
     CHECK(CWS("e\xCC\x81") == 1);                          /* base + mark */

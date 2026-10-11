@@ -313,6 +313,22 @@ int layout_decode_cluster(layout *l, const uint8_t **bytes, size_t *clen, int *w
     return rc;
 }
 
+int layout_cluster_glyph(layout *l, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot)
+{
+    /* Decode has finished; its saved-byte scratch is free until the next
+     * cluster. Reuse it even when bytes already points at that scratch. The
+     * original length/width remain with the caller for replay and cell layout. */
+    if (len > LAYOUT_WIN) return FONT_ERR_NOMEM;
+    size_t artwork = utf8_cluster_artwork(bytes, len, l->cluster_bytes);
+    if (!artwork) { *slot = RENDER_NO_SLOT; return FONT_OK; }
+    uint8_t first = l->cluster_bytes[0];
+    if (artwork == 1 && first >= ' ' && first <= '~' && width == 1) {
+        *slot = first == ' ' ? RENDER_NO_SLOT : (uint32_t)(first - ' ');
+        return FONT_OK;
+    }
+    return l->cfg.glyph ? l->cfg.glyph(l->cfg.glyph_ctx, l->cluster_bytes, artwork, width, slot) : FONT_ERR_MISSING;
+}
+
 int layout_run(layout *l)
 {
     if (!l || !l->grid) return LAYOUT_ERR_ARG;
@@ -421,8 +437,8 @@ int layout_run(layout *l)
                     } else if (l->col + (uint32_t)w > hscroll) {
                         uint32_t s2 = 0;
                         if (clen > LAYOUT_WIN) l->approximate = true; /* exact width; composition exceeds scratch */
-                        else if (l->cfg.glyph) {
-                            int glyph_rc = l->cfg.glyph(l->cfg.glyph_ctx, p, clen, (uint32_t)w, &s2);
+                        else {
+                            int glyph_rc = layout_cluster_glyph(l, p, clen, (uint32_t)w, &s2);
                             if (glyph_rc == FONT_MORE) {
                                 /* Segmentation consumed the cluster. Replay it
                                  * on the next slice before visiting another key,

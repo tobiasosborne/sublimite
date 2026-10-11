@@ -244,7 +244,8 @@ int font_cache_bind(font_cache *cache, render_grid *grid);
  * key plus width identifies a precomposed image. Invalid bytes return ARG;
  * layout draws one inverse '?' per invalid byte without calling this API.
  * Zero-width marks merge at the base pen, all faces use the primary baseline.
- * ZWJ sequences use overlaid monochrome scalar outlines, not shaped ligatures.
+ * Scalar outlines are overlaid, not shaped. Layout projects ZWJ emoji and
+ * invisible presentation modifiers with utf8_cluster_artwork before lookup.
  * Cold composition performs at most FONT_COMPOSE_MAX_GLYPHS raster calls and
  * checks a 250 us cooperative deadline between scalars. FONT_MORE leaves slot
  * unchanged: retry the exact key after checking input. One pending image per

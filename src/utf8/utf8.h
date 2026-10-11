@@ -82,7 +82,7 @@ size_t utf8_encode(uint32_t cp, uint8_t out[4]);
 int utf8_cell_width_table(uint32_t cp);
 
 /* Terminal cells for one scalar: 0 for Mn/Me/Mc/Cf, Default_Ignorable and
- * variation selectors; 2 for East Asian Wide/Fullwidth and
+ * variation selectors and emoji skin-tone modifiers; 2 for East Asian Wide/Fullwidth and
  * Emoji_Presentation (zero wins where both apply); 1 otherwise, including
  * controls and anything > U+10FFFF (the renderer draws controls as
  * placeholders). Below U+0300 the only table entry is U+00AD (Cf);
@@ -193,6 +193,16 @@ size_t utf8_cluster(const uint8_t *p, size_t n, int *width);
 
 /* Width part of utf8_cluster for the cluster at p[0..n). */
 int utf8_cluster_width(const uint8_t *p, size_t n);
+
+/* Unshaped artwork key for one already segmented cluster (edit-r8e). Copy to
+ * out, omitting U+200D, U+FE0E/U+FE0F and U+1F3FB..U+1F3FF. If the first
+ * nonzero-width scalar is Extended_Pictographic, stop at its first ZWJ so
+ * later joined emoji cannot overlay or replace the first emoji's artwork.
+ * Other combining marks remain. Return bytes written, at most len; out must
+ * hold len bytes and may equal p (otherwise the spans must be disjoint).
+ * Does not change the source cluster, segmentation or cell width. Linear in
+ * len, no allocation: UI callers must bound len by their existing scratch. */
+size_t utf8_cluster_artwork(const uint8_t *p, size_t len, uint8_t *out);
 
 /* ---- Budgeted cluster + width (P1.1e) ----
  * utf8_cluster / utf8_cluster_width are unbounded (they run utf8_grapheme_next

@@ -86,6 +86,100 @@ static int combining(const render_grid *g, const render_cell *cell)
     return 0;
 }
 
+static int same_bitmap(const render_grid *g, uint32_t a, uint32_t b)
+{
+    T(a != RENDER_NO_SLOT && b != RENDER_NO_SLOT && a < g->glyph_count && b < g->glyph_count);
+    const render_glyph *left = &g->glyphs[a], *right = &g->glyphs[b];
+    T(left->w == right->w && left->h == right->h);
+    const render_atlas_page *lp = &g->pages[left->page], *rp = &g->pages[right->page];
+    for (uint32_t y = 0; y < left->h; y++)
+        T(!memcmp(lp->pixels + (size_t)(left->y + y) * lp->stride + left->x,
+                  rp->pixels + (size_t)(right->y + y) * rp->stride + right->x, left->w));
+    return 0;
+}
+
+static int emoji_fallback(bool inject, bool wrapping)
+{
+    static const char text[] = "\n👩‍💻x\n😀x\n😀‍💻x\n😀︎x\n😀️x\n😀🏻x\n😀🏼x\n😀🏽x\n😀🏾x\n😀🏿x\n‍︎️🏻🏼🏽🏾🏿x\n\xcd\xb8x";
+    static const struct { const char *base; uint32_t width; } expected[] = {
+        {"👩", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2},
+        {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2},
+        {"", 0}, {"\xcd\xb8", 1}, /* U+0378: no covering face in the test environment */
+    };
+    glyph_gate gate = {0};
+    render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
+    /* (G) Byte extent bounds the text columns; each expected item has its own
+     * row, plus the leading blank line and tab strip. */
+    editor_config cfg = {.cols = (uint32_t)sizeof text,
+        .rows = (uint32_t)(sizeof expected / sizeof expected[0]) + 1u + 1u,
+        .initial = (const uint8_t *)(inject ? "\n" : text),
+        .initial_len = inject ? sizeof "\n" - 1u : sizeof text - 1u,
+        .hook_ctx = &gate, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK); gate.editor = e;
+    T(settle(e) == 0);
+    if (wrapping) {
+        T(layout_set_wrap(&e->lay, true) == LAYOUT_DONE);
+        T(editor_begin_frame(e) == EDITOR_OK); T(settle(e) == 0);
+    }
+    if (inject) {
+        T(editor_set_cursor(e, sizeof "\n" - 1u) == EDITOR_OK); T(settle(e) == 0);
+        work_handle blocker = work_submit(&e->pool, (work_job){block_bulk, &gate, 0, WORK_BULK});
+        T(blocker.epoch); while (!atomic_load(&gate.started)) sched_yield();
+        /* Input events contain scalars, so the cluster changes while typing
+         * its ZWJ, modifiers and final emoji. Submission cannot wait for ink. */
+        for (size_t off = sizeof "\n" - 1u; off < sizeof text - 1u;) {
+            utf8_step step = utf8_decode((const uint8_t *)text + off, sizeof text - 1u - off);
+            T(step.valid && step.len <= PLAT_UTF8_MAX);
+            plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .utf8_len = step.len};
+            memcpy(ev.utf8, text + off, step.len); off += step.len;
+            gate.armed = true; gate.submitted = false;
+            if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+            T(editor_inject(e, &ev) == EDITOR_OK); gate.sequence = e->event_serial;
+            while (!gate.submitted) T(editor_step(e, 0) >= 0);
+            T(gate.allocations == 0); /* (G) law 2: input through submit */
+        }
+        atomic_store(&gate.release, true); T(settle(e) == 0);
+    }
+    /* Typing follows the final caret; inspect the fixture from its start. */
+    T(editor_set_cursor(e, 0) == EDITOR_OK); T(settle(e) == 0);
+    T(editor_length(e) == sizeof text - 1u);
+    uint8_t saved[sizeof text - 1u];
+    T(editor_read(e, 0, saved, sizeof saved) == EDITOR_OK);
+    T(!memcmp(saved, text, sizeof saved)); /* complete ZWJ/modifier bytes survive */
+    const render_grid *g = editor_grid(e);
+    uint32_t col = layout_gutter_width(&e->lay);
+    for (size_t i = 0; i < sizeof expected / sizeof expected[0]; i++) {
+        uint32_t row = e->tab_rows + 1u + (uint32_t)i;
+        const render_cell *cell = &g->cells[(size_t)row * g->dims.cols + col];
+        if (expected[i].width) {
+            uint32_t base;
+            T(editor_font_glyph(e, (const uint8_t *)expected[i].base, strlen(expected[i].base), expected[i].width, &base) == FONT_OK);
+            T(settle(e) == 0);
+            /* Exact same key/slot as the first scalar: no request for the
+             * joined laptop, selector or skin modifier can replace its ink. */
+            if (cell->atlas_slot != base)
+                fprintf(stderr, "emoji input=%u wrap=%u item=%zu row=%u col=%u slot=%u base=%u byte=%llu\n",
+                    inject, wrapping, i, row, col, cell->atlas_slot, base,
+                    (unsigned long long)e->row_byte[row - e->tab_rows]);
+            T(cell->atlas_slot == base);
+            T(bitmap(g, cell) == 0);
+            if (expected[i].width == 2) {
+                T(cell->attrs & RENDER_ATTR_WIDE_LEFT);
+                T(g->cells[(size_t)row * g->dims.cols + col + 1u].attrs & RENDER_ATTR_WIDE_RIGHT);
+            } else {
+                uint32_t missing;
+                T(editor_font_glyph(e, (const uint8_t *)"�", sizeof "�" - 1u, 1, &missing) == FONT_OK);
+                T(settle(e) == 0); T(same_bitmap(g, base, missing) == 0);
+            }
+        }
+        T(g->cells[(size_t)row * g->dims.cols + col + expected[i].width].glyph_index == 'x');
+    }
+    T(render_grid_validate(g) == RENDER_OK);
+    editor_close(e);
+    printf("unicode_render_test: emoji first-scalar fallback, invisibles and true missing glyph; input=%u wrap=%u passed\n", inject, wrapping);
+    return 0;
+}
+
 static int render_unicode(bool inject)
 {
     static const char text[] = "\néα日🙂é";
@@ -459,6 +553,10 @@ int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
     T(tab_title_unicode() == 0);
+    T(emoji_fallback(false, false) == 0);
+    T(emoji_fallback(true, false) == 0);
+    T(emoji_fallback(false, true) == 0);
+    T(emoji_fallback(true, true) == 0);
     T(render_unicode(false) == 0);
     T(render_unicode(true) == 0);
     T(glyph_minimap_repaint() == 0);

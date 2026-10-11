@@ -188,6 +188,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         REQUIRE(g >= 1 && g <= size - off && unit[off + g]);
         int w;
         REQUIRE(utf8_cluster(data + off, size - off, &w) == g && w >= 0 && w <= 2);
+        /* Exercise bounded artwork projection on an exact input span and its
+         * in-place form. Every retained unit must still have valid boundaries,
+         * and invisible presentation scalars must never reach a glyph key. */
+        uint8_t *source = exact_copy(data + off, g), *artwork = malloc(g);
+        REQUIRE(source && artwork);
+        size_t drawn = utf8_cluster_artwork(source, g, artwork);
+        REQUIRE(drawn <= g);
+        REQUIRE(utf8_cluster_artwork(source, g, source) == drawn && !memcmp(source, artwork, drawn));
+        for (size_t at = 0; at < drawn;) {
+            utf8_step step = utf8_decode(artwork + at, drawn - at);
+            REQUIRE(!step.valid || (step.cp != 0x200du && step.cp != 0xfe0eu && step.cp != 0xfe0fu &&
+                (step.cp < 0x1f3fbu || step.cp > 0x1f3ffu)));
+            at += step.len;
+        }
+        free(source); free(artwork);
         off += g;
     }
     {   /* oracle over the first 512 units; the view is cut exactly after them */

@@ -116,6 +116,10 @@ int utf8_cell_width_table(uint32_t cp)
 {
     if (cp < 0x300)                 /* direct callers: keep the contract */
         return cp != 0xAD;
+    /* Unshaped editor presentation: a skin tone modifies a base and never
+     * owns a cell, including when typed without a base (edit-r8e). */
+    if (cp >= 0x1f3fbu && cp <= 0x1f3ffu)
+        return 0;
     if (IN_TREE(UCD_ZERO_WIDTH, cp)) /* zero wins: U+115F, 302A..302F, 3099.. are in both */
         return 0;
     if (IN_TREE(UCD_WIDE, cp))
@@ -454,6 +458,32 @@ int utf8_cluster_width(const uint8_t *p, size_t n)
     int w;
     (void)utf8_cluster(p, n, &w);
     return w;
+}
+
+size_t utf8_cluster_artwork(const uint8_t *p, size_t len, uint8_t *out)
+{
+    size_t written = 0;
+    int base = 0, pict = 0;
+    for (size_t off = 0; off < len;) {
+        utf8_step step = utf8_decode(p + off, len - off);
+        if (step.valid) {
+            if (!base && utf8_cell_width(step.cp)) {
+                base = 1; pict = gcb_of(step.cp) == G_PICT;
+            }
+            /* Without shaping a joined emoji is represented by its first
+             * emoji. Segmentation/width still use the complete grapheme. */
+            if (pict && step.cp == 0x200du) break;
+            if (step.cp == 0x200du || step.cp == 0xfe0eu || step.cp == 0xfe0fu ||
+                (step.cp >= 0x1f3fbu && step.cp <= 0x1f3ffu)) {
+                off += step.len;
+                continue;
+            }
+        }
+        /* out may be p: filtering only moves bytes towards the beginning. */
+        memmove(out + written, p + off, step.len);
+        written += step.len; off += step.len;
+    }
+    return written;
 }
 
 /* ------------------------------------------------- budgeted cluster width */

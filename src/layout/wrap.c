@@ -380,8 +380,8 @@ int layout_wrap_run(layout *l)
                 else if(!attrs) {
                     uint32_t candidate;
                     if(len>LAYOUT_WIN) l->approximate=true;
-                    else if(l->cfg.glyph) {
-                        int glyph_rc=l->cfg.glyph(l->cfg.glyph_ctx,p,len,w,&candidate);
+                    else {
+                        int glyph_rc=layout_cluster_glyph(l,p,len,w,&candidate);
                         if(glyph_rc==FONT_MORE) {
                             position(l,at); l->row_scanned-=len;
                             l->cluster_active=false;
