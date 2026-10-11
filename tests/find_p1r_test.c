@@ -8,7 +8,7 @@
 #include <stdlib.h>
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#c); return 1; } } while (0)
-typedef struct find_p1r_probe { size_t polls, popcounts, enumerated, cancel_at; } find_p1r_probe;
+typedef struct find_p1r_probe { size_t polls, popcounts, enumerated, cancel_at, regex_plans; } find_p1r_probe;
 static bool find_p1r_stop(const work_ctx *context)
 {
     find_p1r_probe *probe=context->arg;
@@ -49,7 +49,16 @@ static int find_p1r_ctz(uint64_t bits,meter *m)
 #undef find_literal_next
 #undef find_literal_visit
 
-#define find_lit_init find_p1r_lit_init
+static bool find_p1r_regex_lit_init(find_lit *lit, const uint8_t *needle, size_t length,
+                                  meter *m, bool two_way)
+{
+    if (m->control && m->control->work) {
+        find_p1r_probe *probe = m->control->work->arg;
+        probe->regex_plans++;
+    }
+    return find_p1r_lit_init(lit, needle, length, m, two_way);
+}
+#define find_lit_init find_p1r_regex_lit_init
 #define find_lit_seek find_p1r_lit_seek
 #define find_regex_bytes find_p1r_regex_bytes
 #define find_regex_compile find_p1r_regex_compile
@@ -60,6 +69,7 @@ static int find_p1r_ctz(uint64_t bits,meter *m)
 #define find_regex_next find_p1r_regex_next
 #define find_regex_search find_p1r_regex_search
 #define find_regex_visit find_p1r_regex_visit
+#define find_regex_word_visit find_p1r_regex_word_visit
 #define find_regex_work_budget find_p1r_regex_work_budget
 #define find_regex_next_budget find_p1r_regex_next_budget
 #include "../src/find/find.c"
@@ -74,6 +84,7 @@ static int find_p1r_ctz(uint64_t bits,meter *m)
 #undef find_regex_next
 #undef find_regex_search
 #undef find_regex_visit
+#undef find_regex_word_visit
 #undef find_regex_work_budget
 #undef find_regex_next_budget
 
@@ -124,9 +135,41 @@ static int regex_retry_bound(void)
     puts("P1R9: PASS linear retry budget, limit clearing, cancellation");
     return 0;
 }
+static bool ignore_range(void *user, uint64_t ordinal, find_capture range)
+{ (void)user; (void)ordinal; (void)range; return true; }
+static int regex_persistent_plan(void)
+{
+    _Alignas(max_align_t) uint8_t program[FIND_MAX_PROGRAM_BYTES], memory[FIND_MAX_SCRATCH_BYTES];
+    /* One 'a ' pair per required offset; no output storage is needed to count. */
+    uint8_t text[2 * FIND_MAX_OFFSETS];
+    for (size_t i = 0; i < sizeof text; i++) text[i] = i % 2 ? (uint8_t)' ' : (uint8_t)'a';
+    find_regex *regex = NULL;
+    const uint8_t pattern[] = "a+";
+    CHECK(find_p1r_regex_compile(program, sizeof program, pattern, sizeof pattern - 1, &regex, NULL) == FIND_OK);
+    find_p1r_probe probe = {0}; work_ctx context = {.arg=&probe};
+    find_control control = {.work=&context}; find_source source = {text, sizeof text, NULL};
+    find_visit visit = {.wanted=FIND_UNSET, .emit=ignore_range};
+    CHECK(find_p1r_regex_visit(&source, regex, memory, sizeof memory, &control, &visit) == FIND_OK);
+    printf("S22 regex prefix trace: count=%llu plans=%zu\n", (unsigned long long)visit.total, probe.regex_plans);
+    CHECK(visit.total == sizeof text / 2);
+    CHECK(probe.regex_plans == 1); /* one plan per request, independent of candidates */
+    probe = (find_p1r_probe){0};
+    CHECK(find_p1r_regex_word_visit(&source, regex, memory, sizeof memory, &control, &visit) == FIND_OK);
+    CHECK(visit.total == sizeof text / 2 && probe.regex_plans == 1);
+    size_t polls = probe.polls;
+    /* Sweep every measured cancellation checkpoint of the successful visitor. */
+    for (size_t at = 1; at <= polls; at++) {
+        probe = (find_p1r_probe){.cancel_at=at};
+        CHECK(find_p1r_regex_word_visit(&source, regex, memory, sizeof memory, &control, &visit) == FIND_CANCELLED);
+        CHECK(!visit.total && !visit.visible);
+    }
+    return 0;
+}
 int main(void)
 {
+    if (getenv("EDIT_LEZ_REGEX_WORD")) return regex_persistent_plan();
     CHECK(dense_count()==0);
     CHECK(regex_retry_bound()==0);
+    CHECK(regex_persistent_plan()==0);
     puts("find_p1r_test: ok"); return 0;
 }

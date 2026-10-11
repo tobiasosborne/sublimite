@@ -1,3 +1,23 @@
+# edit-lez — persistent filtered regex visitor
+
+The additive internal `find_regex_word_visit` shares request-wide matching,
+ASCII word boundaries, accepted-result ordinals and bounded publication.
+Prefix preprocessing persists across candidates in ordinary and filtered
+visitors. Rejected overlaps, empty matches, cancellation and the existing
+request-wide limit policy remain covered. The frozen public find header and
+all old entry points remain unchanged; no allocations or mutable globals added.
+
+Active worker and counted-core red/green tests, independent flat/fragmented
+regex-word fuzz coverage, build results and sandbox verification exceptions:
+[worker report](../../docs/worker-reports/edit-lez.md);
+[decision](../../docs/decisions/edit-lez.md). The restarted NFA and core literal
+snapshot seeks retain their documented performance limits. Editor integration
+and late-window checkpointing remain with the bead's outstanding scope.
+
+Historical status follows.
+
+---
+
 # edit-4w1.58 — P1-1 §§7–11, session 8
 
 Completed bounded dense popcount counting, core visitor integration for the

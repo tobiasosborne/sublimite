@@ -736,6 +736,48 @@ static void whole_word_count_worker(void)
     finish(&f);
     puts("S22: PASS bounded literal whole-word visitor and rejected overlap");
 }
+static void whole_word_regex_worker(void)
+{
+    /* Derivation: each cached-offset slot contributes an 'a ' pair; this
+     * exercises discarded candidates after the deliberately minimal caches. */
+    uint8_t text[2 * FIND_MAX_OFFSETS];
+    for (size_t i = 0; i < sizeof text; i++) text[i] = i % 2 ? (uint8_t)' ' : (uint8_t)'a';
+    const char *patterns[] = {"a+", "[a]"}; /* mandatory prefix, then no prefix */
+    for (size_t p = 0; p < sizeof patterns / sizeof *patterns; p++) {
+        fixture f; start(&f, text, sizeof text, 1, 1); /* one slot per independent cache */
+        CHECK(findui_set_options(&f.panel, (findui_options){true, true, true}) == FINDUI_OK);
+        query(&f, patterns[p]);
+        findui_state state = findui_get_state(&f.panel);
+        printf("S22 regex word trace: pattern=%s count=%llu stages=%u ranges=%zu\n", patterns[p],
+               (unsigned long long)state.match_count, atomic_load(&f.hook.scans), f.published_ranges);
+        fflush(stdout);
+        CHECK(state.complete && state.match_count == sizeof text / 2);
+        CHECK(state.visible_matches == state.match_count && state.visible_overflow);
+        /* A single persistent worker visitor owns matching and boundaries;
+         * publication is bounded by prefix + visible + requested ordinal. */
+        CHECK(atomic_load(&f.hook.scans) == 1);
+        CHECK(f.published_ranges <= 1 + 1 + 1);
+        finish(&f);
+    }
+    struct { const char *text, *pattern; uint64_t count, start, end; } cases[] = {
+        {"xa a a", "a a", 1, 3, 6}, /* reject overlap, retry at start + one byte */
+        {"a", "a?", 1, 0, 1}, /* rejected empty match at the word's end */
+        {" ", "a?", 2, 0, 0}, /* accepted empty matches at both boundaries */
+        {"A_ a", "[aA]", 1, 3, 4}, /* ASCII underscore is a word byte */
+        {"a\na", "^a$", 2, 0, 1}, /* anchors inspect the complete source */
+        {"\xff" "a", "a", 1, 1, 2} /* high bytes preserve ASCII boundaries */
+    }; /* Expected ranges derive directly from the indexed bytes of each text. */
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        fixture f; start(&f, (const uint8_t *)cases[i].text, strlen(cases[i].text), 1, 1);
+        CHECK(findui_set_options(&f.panel, (findui_options){true, true, true}) == FINDUI_OK);
+        query(&f, cases[i].pattern);
+        findui_state state = findui_get_state(&f.panel);
+        CHECK(state.complete && state.match_count == cases[i].count);
+        CHECK(state.selected.start == cases[i].start && state.selected.end == cases[i].end);
+        finish(&f);
+    }
+    puts("S22: PASS persistent regex whole-word visitor, boundaries, empty matches and rejected overlap");
+}
 static void maximum_literals(void)
 {
     uint8_t needle[FINDUI_QUERY_BYTES], text[2 * FINDUI_QUERY_BYTES];
@@ -789,6 +831,7 @@ static void sparse_window_work(void)
 
 int main(void)
 {
+    if (getenv("EDIT_LEZ_REGEX_WORD")) { whole_word_regex_worker(); return 0; }
     if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
     replacement_paged_noop();
     full_source_lifetime();
@@ -800,6 +843,7 @@ int main(void)
     backpressure_yields();
     whole_word_publication();
     whole_word_count_worker();
+    whole_word_regex_worker();
     maximum_literals();
     if (getenv("EDIT_YQU_KNOWN_FAILURES")) known_default_long_query();
     filtered_regex_budget();

@@ -59,6 +59,11 @@ find_code find_literal_visit(const find_source *source,const uint8_t *needle,siz
                              const find_control *control,find_visit *visit);
 find_code find_regex_visit(const find_source *source,const find_regex *regex,void *scratch,
                            size_t size,const find_control *control,find_visit *visit);
+/* ASCII word boundaries share the request's readers, prefix plan and retry
+ * budget. Rejecting a candidate retries at start + one byte; accepting one
+ * retains the ordinary leftmost non-overlap policy, including empty matches. */
+find_code find_regex_word_visit(const find_source *source,const find_regex *regex,void *scratch,
+                                size_t size,const find_control *control,find_visit *visit);
 /* Filtered consumers share a request budget across overlapping retries,
  * including successful but rejected candidates. */
 uint64_t find_regex_work_budget(const find_regex *regex,uint64_t length);

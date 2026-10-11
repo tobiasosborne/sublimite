@@ -1,7 +1,9 @@
 # edit-lez — findui review fixes
 
-Scope: P4-modules-2 §§21–30. The frozen find header, find core, editor internals,
-work implementation, Makefile, HANDOFF and worklog were not edited.
+Scope: P4-modules-2 §§21–30 (review section identifiers). The historical session
+below left find core and editor internals untouched. The continuation described
+at the end changes the internal find visitor; its frozen public header, editor
+internals, work implementation and Makefile remain unchanged.
 
 ## Literal and whole-word counting
 
@@ -11,8 +13,9 @@ and retrying overlapping candidates after word-boundary rejection. One-byte
 literals use SSE2 candidate/word masks and rank/select/popcount through the
 existing bounded visitor helpers. Scratch and pattern storage are reserved at
 initialization; no new globals or typing allocation. Case-sensitive ordinary
-literals retain the existing core kernel. Whole-word regex still uses the
-shared-budget next API: a persistent filtered regex visitor remains outstanding.
+literals retain the existing core kernel. The historical implementation left
+whole-word regex on the shared-budget next API; the continuation below replaces
+that path with a persistent visitor.
 
 ## Publication and independent caches
 
@@ -85,3 +88,36 @@ The count bench checks initial, late and empty windows. --word compares ordinary
 and whole-word endpoints over an anonymous (G)1 GiB a-space source. All measurements
 and red/green output are in the worker report. No loaded single timing is a gate
 pass/fail. LeakSanitizer is disabled in this sandbox; coordinator reruns it enabled.
+
+## Trace-driven regex whole-word continuation
+
+The worker regression traces repeated matcher entry and boundary reads after
+its independent caches fill. The counted production copy also traces repeated
+prefix-plan creation. Their runtime red transcripts justify pulling the regex
+portion of review §22 under the triage rule; see
+[continuation report](../worker-reports/edit-lez.md) for evidence and derivations.
+
+`find_regex_word_visit` is additive in the internal `find/visit.h` integration
+header. The frozen `find/find.h` and all previous entry points remain. Matching,
+ASCII word-boundary filtering, accepted-result ordinals and publication now
+share a request-wide traversal. A separate cached boundary reader avoids
+interfering with anchored regex matching. Prefix preprocessing is retained
+across candidates, together with its verifier/fallback accounting. Boundary
+reads and rejected candidates consume the existing request-wide meter; no
+budget is enlarged, no allocation or global state is added.
+
+Accepted matches keep the leftmost non-overlap policy. Rejected matches retry
+from their start advanced by a byte, preserving valid overlaps. Empty matches
+advance in the same way, including source-end termination. Only accepted
+matches reach bounded prefix/visible/selected publication, while exact visible
+cardinality remains independent of cache capacity. Cancellation, source faults,
+callback refusal and request exhaustion keep the existing cleared-result policy.
+The panel's scan hook now marks matcher traversals; internal boundary reads are
+metered by find, rather than invoking the panel hook separately.
+
+The existing restarted anchored NFA remains; this change makes no general regex
+linearity or displayed-latency claim. Prefix snapshot seeks still use the core
+literal kernel. Late-window checkpointing and immediate window priority remain
+incomplete under review §25. Editor mutation binding (§29) and buffer/save lease
+integration (§30) remain with the dedicated editor worker. Its existing findui
+host and lease interfaces are preserved for edit-73j.

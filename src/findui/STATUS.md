@@ -1,3 +1,26 @@
+# edit-lez — trace-driven regex whole-word continuation
+
+Review §22's remaining regex path now uses a persistent filtered core visitor:
+request-wide readers, prefix plan and retry/cancellation meter, bounded range
+publication and exact visible cardinality. All legacy findui entry points and
+host/lease interfaces remain. No typing allocation, editor-internal or Makefile
+changes. The regression is active in the default suite; its worker/core runtime
+red and green transcripts and derivations are in the
+[required report](../../docs/worker-reports/edit-lez.md).
+
+GCC release build, targeted sanitizer regressions, module fuzz campaigns and
+the release editor allocation guard passed. Full sanitizer verification and its
+sandbox display/socket exceptions are recorded in that report; the coordinator
+must rerun outside the sandbox with leaks enabled before closure and the next
+Astra comparison drive. This is an incomplete bead: review §25 still needs
+bounded multibyte/regex viewport work and priority; §29 and §30 still need actual
+editor mutation and buffer/save lease integration. Review section numbers refer
+to P4-modules-2 finding identifiers, not new measurements.
+
+Historical status follows.
+
+---
+
 # edit-lez — P4-modules-2 §§21–30, session 9
 
 Incomplete bead. Implemented literal ASCII folding, persistent/SIMD literal

@@ -292,13 +292,13 @@ static void anchored(reader *r,const find_regex *re,uint64_t off,scratch *s,rege
 }
 /* Candidate starts come from the literal kernel (rare-byte filter + verify,
  * Two-Way fallback) when the program has a mandatory literal prefix. */
-static bool regex_seek(reader *r,const find_regex *re,uint64_t off,scratch *s,regex_meter *m,find_match *hit)
+static bool regex_seek(reader *r,const find_regex *re,uint64_t off,scratch *s,regex_meter *m,
+                       find_lit *lit,find_match *hit)
 {
     if (re->prefix_len) {
-        find_lit lit; uint64_t at=0;
-        if (!find_lit_init(&lit,re->prefix,re->prefix_len,&m->poll,false)) return false;
+        uint64_t at=0;
         for (uint64_t i=off;;) {
-            if (find_lit_seek(&lit,r->source,r->len,i,&at)<=0) return false;
+            if (find_lit_seek(lit,r->source,r->len,i,&at)<=0) return false;
             anchored(r,re,at,s,m,hit);
             if (hit->matched) return true;
             if (regex_stopped(m) || at==r->len) return false;
@@ -333,7 +333,11 @@ static find_code regex_one(const find_source *source,const find_regex *re,uint64
     m.poll.snapshot=source->snapshot;
     if (budget) m.remaining=*budget;
     if (!poll_stop(&m.poll)) {
-        if (scan) (void)regex_seek(&r,re,off,memory,&m,match);
+        if (scan) {
+            find_lit lit;
+            if (!re->prefix_len || find_lit_init(&lit,re->prefix,re->prefix_len,&m.poll,false))
+                (void)regex_seek(&r,re,off,memory,&m,&lit,match);
+        }
         else anchored(&r,re,off,memory,&m,match);
     }
     if (budget) *budget=m.remaining;
@@ -354,24 +358,50 @@ find_code find_regex_next_budget(const find_source *source,const find_regex *re,
     if (!budget) { if (match) clear_match(match); return FIND_ERR_ARGUMENT; }
     return regex_one(source,re,off,memory,size,control,match,true,budget);
 }
+static bool regex_word_byte(uint8_t byte)
+{
+    return (byte>='a' && byte<='z') || (byte>='A' && byte<='Z') ||
+           (byte>='0' && byte<='9') || byte=='_';
+}
+static bool regex_word_boundary(reader *r,find_capture range,regex_meter *m)
+{
+    bool accepted=true;
+    if (range.start) {
+        if (regex_step(m)) return false;
+        if (regex_word_byte(get_byte(r,range.start-1))) accepted=false;
+    }
+    if (range.end<r->len) {
+        if (regex_step(m)) return false;
+        if (regex_word_byte(get_byte(r,range.end))) accepted=false;
+    }
+    return accepted;
+}
 static find_code regex_search_run(const find_source *source,const find_regex *re,void *memory,size_t size,
-                            const find_control *control,find_result *result,find_visit *visit)
+                            const find_control *control,find_result *result,find_visit *visit,bool whole_word)
 {
     if (!result) return FIND_ERR_ARGUMENT;
     result->total=0; result->stored=0;
     find_code code=regex_arguments(source,re,memory,size);
     if (code!=FIND_OK) return code;
-    reader r=reader_init(source); regex_meter m=regex_meter_init(control,r.len,re->count); uint64_t off=0;
+    reader r=reader_init(source), boundaries=reader_init(source);
+    regex_meter m=regex_meter_init(control,r.len,re->count); uint64_t off=0;
     m.poll.snapshot=source->snapshot;
-    if (!poll_stop(&m.poll)) for (;;) {
+    find_lit lit;
+    bool ready=!poll_stop(&m.poll);
+    if (ready && re->prefix_len) ready=find_lit_init(&lit,re->prefix,re->prefix_len,&m.poll,false);
+    if (ready) for (;;) {
         find_match hit; clear_match(&hit); hit.groups=re->groups;
-        if (!regex_seek(&r,re,off,memory,&m,&hit)) break;
-        if (!find_visit_add(visit,result->total,hit.whole)) { code=FIND_CANCELLED; break; }
-        code=add_result(result,hit.whole.start);
-        if (code!=FIND_OK) break;
+        if (!regex_seek(&r,re,off,memory,&m,&lit,&hit)) break;
+        bool accepted=!whole_word || regex_word_boundary(&boundaries,hit.whole,&m);
+        if (regex_stopped(&m)) break;
+        if (accepted) {
+            if (!find_visit_add(visit,result->total,hit.whole)) { code=FIND_CANCELLED; break; }
+            code=add_result(result,hit.whole.start);
+            if (code!=FIND_OK) break;
+        }
         if (regex_step(&m)) break;
-        off=hit.whole.end;
-        if (off==hit.whole.start) { if (off==r.len) break; off++; }
+        off=accepted ? hit.whole.end : hit.whole.start;
+        if (!accepted || off==hit.whole.start) { if (off==r.len) break; off++; }
     }
     if (m.limited) code=FIND_ERR_LIMIT;
     if (poll_stop(&m.poll)) code=FIND_CANCELLED;
@@ -381,15 +411,21 @@ static find_code regex_search_run(const find_source *source,const find_regex *re
 
 find_code find_regex_search(const find_source *source,const find_regex *re,void *memory,size_t size,
                             const find_control *control,find_result *result)
-{ return regex_search_run(source,re,memory,size,control,result,NULL); }
-find_code find_regex_visit(const find_source *source,const find_regex *re,void *memory,size_t size,
-                           const find_control *control,find_visit *visit)
+{ return regex_search_run(source,re,memory,size,control,result,NULL,false); }
+static find_code regex_visit_run(const find_source *source,const find_regex *re,void *memory,size_t size,
+                                 const find_control *control,find_visit *visit,bool whole_word)
 {
     if (!visit || !visit->emit) return FIND_ERR_ARGUMENT;
     visit->total=0; visit->visible=0;
     find_result result;
-    find_code code=regex_search_run(source,re,memory,size,control,&result,visit);
+    find_code code=regex_search_run(source,re,memory,size,control,&result,visit,whole_word);
     if (code==FIND_OK) visit->total=result.total;
     else visit->visible=0;
     return code;
 }
+find_code find_regex_visit(const find_source *source,const find_regex *re,void *memory,size_t size,
+                           const find_control *control,find_visit *visit)
+{ return regex_visit_run(source,re,memory,size,control,visit,false); }
+find_code find_regex_word_visit(const find_source *source,const find_regex *re,void *memory,size_t size,
+                                const find_control *control,find_visit *visit)
+{ return regex_visit_run(source,re,memory,size,control,visit,true); }

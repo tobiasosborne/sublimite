@@ -2,6 +2,7 @@
  * Generated grammar plus arbitrary compile inputs, binary literal differential,
  * snapshot parity and pagination. Keep subjects small for exhaustive closure. */
 #include "find/find.h"
+#include "find/visit.h"
 #include "base/base.h"
 #include <string.h>
 #include <stdlib.h>
@@ -104,6 +105,55 @@ static bool model_next(model *m,size_t off,size_t *start,size_t *end)
         }
     }
     return false;
+}
+typedef struct word_results {
+    /* Same boundary domain as model.memo: subject bytes plus its end. */
+    find_capture ranges[33];
+    bool seen[33];
+    size_t count;
+} word_results;
+static bool model_word_byte(uint8_t byte)
+{
+    return (byte>='a' && byte<='z') || (byte>='A' && byte<='Z') ||
+           (byte>='0' && byte<='9') || byte=='_';
+}
+static bool word_emit(void *user,uint64_t ordinal,find_capture range)
+{
+    word_results *expected=user;
+    EDIT_ASSERT(ordinal<expected->count && !expected->seen[ordinal]);
+    EDIT_ASSERT(range.start==expected->ranges[ordinal].start && range.end==expected->ranges[ordinal].end);
+    expected->seen[ordinal]=true;
+    return true;
+}
+static void word_visit_model(model *m,const find_source *source,const find_regex *re,
+                             void *scratch,size_t scratch_size)
+{
+    word_results expected={0};
+    for (size_t off=0;;) {
+        size_t start=0,end=0;
+        if (!model_next(m,off,&start,&end)) break;
+        bool accepted=(!start || !model_word_byte(m->text[start-1])) &&
+                      (end==m->tn || !model_word_byte(m->text[end]));
+        if (accepted) expected.ranges[expected.count++]=(find_capture){start,end};
+        off=accepted ? end : start;
+        if (!accepted || start==end) { if (off==m->tn) break; off++; }
+    }
+    /* Minimal independent caches; request the middle ordinal and the subject's
+     * latter half so bounded output is checked against discarded matches. */
+    find_visit visit={.prefix_capacity=1,.visible_capacity=1,.wanted=expected.count/2,
+                      .window_start=m->tn/2,.window_end=m->tn,.emit=word_emit,.user=&expected};
+    EDIT_ASSERT(find_regex_word_visit(source,re,scratch,scratch_size,NULL,&visit)==FIND_OK);
+    EDIT_ASSERT(visit.total==expected.count);
+    uint64_t visible=0;
+    for (size_t i=0;i<expected.count;i++) {
+        find_capture range=expected.ranges[i];
+        bool shown=range.start==range.end ? range.start>=visit.window_start && range.start<=visit.window_end
+                    : visit.window_start<visit.window_end && range.start<visit.window_end && range.end>visit.window_start;
+        bool wanted=i<visit.prefix_capacity || i==visit.wanted || (shown && visible<visit.visible_capacity);
+        EDIT_ASSERT(expected.seen[i]==wanted);
+        if (shown) visible++;
+    }
+    EDIT_ASSERT(visit.visible==visible);
 }
 /* P1.10b gap: the small endpoint-set subjects cannot enter the long-needle
  * snapshot verifier. Generate bounded periodic/critical-prefix subjects and
@@ -208,6 +258,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
             if(start==end) { if(off==hn) break; off++; }
         }
         EDIT_ASSERT(r.total==count && r.stored==count);
+        word_visit_model(&m,&source,re,scratch,sn);
         /* Same bytes in many pieces: matches/anchors may cross every boundary. */
         if((data[0]&15u)==0) {
             piece_allocator allocator=piece_default_allocator(); piece_tree *t=piece_create(&allocator); EDIT_ASSERT(t);
@@ -216,6 +267,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
             find_source ss={NULL,0,snap}; find_result other;
             EDIT_ASSERT(find_regex_search(&ss,re,scratch,sn,NULL,&other)==FIND_OK && other.total==r.total && other.stored==r.stored);
             for(size_t i=0;i<r.stored;i++) EDIT_ASSERT(other.offsets[i]==r.offsets[i]);
+            word_visit_model(&m,&ss,re,scratch,sn);
             EDIT_ASSERT(find_literal(&ss,needle,nn,NULL,&other)==FIND_OK);
             find_result bytes_result; EDIT_ASSERT(find_literal(&source,needle,nn,NULL,&bytes_result)==FIND_OK);
             EDIT_ASSERT(other.total==bytes_result.total && other.stored==bytes_result.stored);

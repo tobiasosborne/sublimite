@@ -17,6 +17,7 @@
 #define find_regex_next find_bench_regex_next
 #define find_regex_search find_bench_regex_search
 #define find_regex_visit find_bench_regex_visit
+#define find_regex_word_visit find_bench_regex_word_visit
 #define find_regex_work_budget find_bench_regex_work_budget
 #define find_regex_next_budget find_bench_regex_next_budget
 #include "../src/find/literal.c"
@@ -38,5 +39,6 @@
 #undef find_regex_next
 #undef find_regex_search
 #undef find_regex_visit
+#undef find_regex_word_visit
 #undef find_regex_work_budget
 #undef find_regex_next_budget

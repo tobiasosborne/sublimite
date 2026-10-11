@@ -23,8 +23,8 @@ typedef struct findui_options { bool regex, match_case, whole_word; } findui_opt
 typedef struct findui_range { uint64_t start, end; } findui_range;
 typedef struct findui_panel { void *private_; } findui_panel;
 
-/* Invoked only by the bulk worker, immediately before every find call and
- * boundary-byte read. Optional tracing/test hook; must not mutate UI state,
+/* Invoked only by the bulk worker, immediately before each matcher traversal.
+ * Traversals meter their own boundary reads. Optional tracing/test hook; must not mutate UI state,
  * allocate, or block. generation identifies the query/source/window request. */
 typedef void (*findui_scan_hook)(void *user, uint32_t generation);
 typedef struct findui_config {

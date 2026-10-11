@@ -37,17 +37,10 @@ static bool flush(work_ctx *context, findui_batch *batch, size_t *count)
     *count = 0;
     return publish(context, &message);
 }
-static bool intersects(findui_range range, uint64_t start, uint64_t end)
-{
-    return range.start == range.end ? range.start >= start && range.start <= end
-                                   : start < end && range.start < end && range.end > start;
-}
 static bool letter(uint8_t byte)
 { return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z'); }
 static uint8_t other_case(uint8_t byte)
 { return (uint8_t)(byte >= 'a' && byte <= 'z' ? byte - ('a' - 'A') : byte + ('a' - 'A')); }
-static bool word(uint8_t byte)
-{ return letter(byte) || (byte >= '0' && byte <= '9') || byte == '_'; }
 
 /* The frozen core owns syntax validation. This transformer only rewrites
  * successfully validated expressions; escaped letters remain literal atoms,
@@ -154,26 +147,6 @@ static find_code program(findui_slot *slot, work_ctx *context, find_regex **rege
     if (code != FIND_OK) *error_offset = slot->query_length;
     return code;
 }
-static find_code whole_word(const findui_slot *slot, work_ctx *context,
-                            findui_range range, uint64_t length, bool *accepted)
-{
-    *accepted = true;
-    if (!slot->options.whole_word) return FIND_OK;
-    uint8_t byte;
-    if (range.start) {
-        if (work_should_stop(context)) return FIND_CANCELLED;
-        scan_trace(slot, context->generation);
-        if (piece_snapshot_read(slot->snapshot, range.start - 1, &byte, 1)) return FIND_ERR_ARGUMENT;
-        if (word(byte)) *accepted = false;
-    }
-    if (range.end < length) {
-        if (work_should_stop(context)) return FIND_CANCELLED;
-        scan_trace(slot, context->generation);
-        if (piece_snapshot_read(slot->snapshot, range.end, &byte, 1)) return FIND_ERR_ARGUMENT;
-        if (word(byte)) *accepted = false;
-    }
-    return FIND_OK;
-}
 typedef struct visitor_output {
     work_ctx *context;
     findui_batch *batch;
@@ -200,55 +173,23 @@ void findui_worker_run(work_ctx *context)
     find_code code = program(slot, context, &regex, &error_offset);
     find_source source = {.snapshot = slot->snapshot};
     find_control control = {.work = context};
-    uint64_t offset = 0, total = 0, length = piece_snapshot_len(slot->snapshot);
-    uint64_t regex_budget=find_regex_work_budget(regex,length);
+    uint64_t total = 0;
     findui_batch batch = {.owner = slot->owner};
     size_t batched = 0;
-    uint64_t visible=FIND_UNSET;
-    if (code==FIND_OK && (!slot->options.whole_word || !slot->options.regex)) {
+    uint64_t visible=0;
+    if (code==FIND_OK) {
         visitor_output output={context,&batch,&batched,slot};
         find_visit visit={.prefix_capacity=slot->cache_capacity,
                           .visible_capacity=slot->visible_capacity,
                           .wanted=slot->desired_index,.window_start=slot->window_start,
                           .window_end=slot->window_end,.emit=emit_range,.user=&output};
         scan_trace(slot,context->generation);
-        code=regex ? find_regex_visit(&source,regex,slot->scratch,FIND_MAX_SCRATCH_BYTES,&control,&visit)
+        code=regex ? (slot->options.whole_word
+                      ? find_regex_word_visit(&source,regex,slot->scratch,FIND_MAX_SCRATCH_BYTES,&control,&visit)
+                      : find_regex_visit(&source,regex,slot->scratch,FIND_MAX_SCRATCH_BYTES,&control,&visit))
                    : slot->options.match_case && !slot->options.whole_word && !(slot->window_request && slot->query_length == 1) ? find_literal_visit(&source,slot->query,slot->query_length,&control,&visit)
                    : findui_literal_visit(slot,context,&visit);
         total=visit.total; visible=visit.visible;
-    }
-    if (slot->options.regex && slot->options.whole_word) visible = 0;
-    while (slot->options.regex && slot->options.whole_word && code == FIND_OK && !work_should_stop(context)) {
-        find_match match;
-        scan_trace(slot, context->generation);
-        code = regex ? find_regex_next_budget(&source, regex, offset, slot->scratch,
-                                              FIND_MAX_SCRATCH_BYTES, &control, &regex_budget, &match)
-                     : find_literal_next(&source, slot->query, slot->query_length,
-                                         offset, &control, &match);
-        if (code != FIND_OK || !match.matched) break;
-        findui_range range = {match.whole.start, match.whole.end};
-        bool accepted;
-        code = whole_word(slot, context, range, length, &accepted);
-        if (code != FIND_OK) break;
-        if (accepted) {
-            if (total == UINT64_MAX) { code = FIND_ERR_LIMIT; break; }
-            bool shown = intersects(range, slot->window_start, slot->window_end);
-            bool wanted = total < slot->cache_capacity || total == slot->desired_index ||
-                          (shown && visible < slot->visible_capacity);
-            if (shown) visible++;
-            if (wanted) {
-                visitor_output output = {context, &batch, &batched, slot};
-                if (!emit_range(&output, total, (find_capture){range.start, range.end})) return;
-            }
-            total++;
-        }
-        /* Rejected candidates must not hide a later overlapping, valid word.
-         * Accepted results retain the frozen leftmost/non-overlap policy. */
-        offset = accepted ? range.end : range.start;
-        if (!accepted || range.start == range.end) {
-            if (offset == length) break;
-            offset++;
-        }
     }
     if (work_should_stop(context)) return;
     if (!flush(context, &batch, &batched)) return;
