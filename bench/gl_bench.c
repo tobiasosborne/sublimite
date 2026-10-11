@@ -66,7 +66,7 @@ static int gl_bench_gate_row(const char *name,const char *scenario,bench_samples
         (unsigned long long)lim->p50_ns,(unsigned long long)lim->p99_num,(unsigned long long)lim->p99_den,
         gl_gate_name(v),v==GL_GATE_PASS||v==GL_GATE_PASS_PARTIAL ? 1 : 0,
         v==GL_GATE_PASS ? "yes" : "no",tag,load);
-    return gl_gate_exit(v);
+    return gl_gate_exit(v) || samples->dropped!=0;
 }
 static uint32_t gl_bench_random(uint32_t *seed)
 { uint32_t x=*seed; x^=x<<13; x^=x>>17; x^=x<<5; *seed=x; return x; }

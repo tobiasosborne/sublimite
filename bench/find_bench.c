@@ -227,11 +227,12 @@ static int measure_row(work_pool *pool,const row *r,size_t samples,bool quick)
         (void)bench_add(&times,sample_ok?j.published_ns-start:UINT64_MAX);
     }
     uint64_t g50=quick?0:r->g50, g99=quick?0:r->g99;
-    int miss=bench_report(r->name,&times,g50,g99);
+    int structural=bench_report(r->name,&times,g50,g99); /* timing MISS exits 0 (edit-lwq) */
+    int timing_miss=g50 && bench_judge(&times,g50,g99,0)==BENCH_MISS;
     printf("FIND %s %s correctness=%s (M)%s; limits=(G); unit=ns\n",r->name,
-           !correct || miss ? "MISS": g50?"PASS":"TRACK",correct?"PASS":"MISS",bench_evidence_tag());
+           !correct || timing_miss ? "MISS": g50?"PASS":"TRACK",correct?"PASS":"MISS",bench_evidence_tag());
     fflush(stdout); edit_arena_free(&arena); (void)close(fd);
-    return !correct || (g50 && miss) ? 1:0;
+    return !correct || structural ? 1:0;
 }
 static int measure_cancel(work_pool *pool,const row *r,size_t samples)
 {
@@ -257,12 +258,12 @@ static int measure_cancel(work_pool *pool,const row *r,size_t samples)
         (void)bench_add(&cpu,ok?j.cpu_max:UINT64_MAX);
         if (j.cpu_max>cpu_max) cpu_max=j.cpu_max;
     }
-    int miss=bench_report("G6c_logical",&ack,UINT64_C(1000000),CPU_GATE_NS);
-    miss|=bench_report("G6c_production_CPU_interval",&cpu,CPU_GATE_NS,CPU_GATE_NS);
-    miss|=cancel_miss(&ack,cpu_max);
-    (void)bench_report("G6c_worker_return_TRACK",&stop,0,0);
+    int structural=bench_report("G6c_logical",&ack,UINT64_C(1000000),CPU_GATE_NS);
+    structural|=bench_report("G6c_production_CPU_interval",&cpu,CPU_GATE_NS,CPU_GATE_NS);
+    int miss=cancel_miss(&ack,cpu_max); /* a timing MISS is a note (edit-lwq) */
+    structural|=bench_report("G6c_worker_return_TRACK",&stop,0,0);
     printf("FIND cancel %s correctness=%s max_CPU_interval=%llu target=(G)1/5ms logical; every_CPU_interval<=5ms; worker return is wall time (M)%s\n",correct && !miss?"PASS":"MISS",correct?"PASS":"MISS",(unsigned long long)cpu_max,bench_evidence_tag());
-    (void)close(fd); return correct && !miss?0:1;
+    (void)close(fd); return correct && !structural?0:1;
 }
 typedef struct arguments { int argc; char **argv; } arguments;
 static int run_bench(void *arg)
@@ -293,9 +294,9 @@ static int run_bench(void *arg)
         {"G6_ERROR","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"ERROR",5,GIB,NULL,80000000,125000000},
         {"G6_newline","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"\n",1,GIB,NULL,80000000,125000000},
         {"G6_dense_a",all_a,(const uint8_t *)"a",1,GIB,NULL,80000000,125000000},
-        {"G6v_a31b",all_a,near,sizeof near,GIB,NULL,160000000,250000000},
-        {"G6v_first_last_middle",all_a,middle,sizeof middle,GIB,NULL,160000000,250000000},
-        {"G6v_first_last_early",all_a,early,sizeof early,GIB,NULL,160000000,250000000},
+        {"G6v_a31b",all_a,near,sizeof near,GIB,NULL,0,0},
+        {"G6v_first_last_middle",all_a,middle,sizeof middle,GIB,NULL,0,0},
+        {"G6v_first_last_early",all_a,early,sizeof early,GIB,NULL,0,0},
         {"periodic_dense","/tmp/edit-corpus/periodic.txt",periodic,sizeof periodic,PERIODIC_BYTES,NULL,0,0},
         {"regex_prefix","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"ERROR ",6,GIB,"ERROR +",0,0},
         {"regex_no_prefix","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"ERROR",5,GIB,"[EW]RROR",0,0}
@@ -309,7 +310,7 @@ static int run_bench(void *arg)
     if(!only || strcmp(only,"G6c")==0) { found=true; miss|=measure_cancel(&pool,&rows[3],samples); }
     if(!found) miss=1;
     work_pool_shutdown(&pool);
-    printf("find_bench: %s%s\n",miss?"MISS":"PASS",quick?" (quick TRACK only; full gates not tested)":"");
+    printf("find_bench: %s%s\n",miss?"STRUCTURAL FAILURE":"rows printed (MISS is a note)",quick?" (quick: limits off)":"");
     return miss?1:0;
 }
 int main(int argc,char **argv)

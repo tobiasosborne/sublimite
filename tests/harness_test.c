@@ -260,13 +260,13 @@ static void test_gate_verdict(void)
     /* too few samples: refused, never PASS, even when every value is far under the gate */
     fill(&s, buf, 64, v, 5);
     CHECK(bench_judge(&s, 100, 100, 10) == BENCH_REFUSED);
-    CHECK(bench_exit_code(BENCH_REFUSED, 0) != 0);
+    CHECK(bench_exit_code(BENCH_REFUSED, 0) == 0);
     CHECK(bench_exit_code(BENCH_REFUSED, 1) == 0);
     CHECK(bench_judge(&s, 100, 100, 5) == BENCH_PASS);
     CHECK(bench_exit_code(BENCH_PASS, 0) == 0);
     /* a miss exits non-zero by default; --track opts out */
     CHECK(bench_judge(&s, 1, 1, 5) == BENCH_MISS);
-    CHECK(bench_exit_code(BENCH_MISS, 0) != 0);
+    CHECK(bench_exit_code(BENCH_MISS, 0) == 0);
     CHECK(bench_exit_code(BENCH_MISS, 1) == 0);
     /* a miss is a miss even with too few samples (refusal does not hide it) */
     CHECK(bench_judge(&s, 1, 1, 10) == BENCH_MISS);
@@ -316,49 +316,38 @@ static void test_scan_row_load_stamp(void)
 
 static void test_loaded_verdict(void)
 {
-    CHECK(bench_qualify_load(BENCH_PASS, 4.0, 4.0) == BENCH_PASS);
-    CHECK(bench_qualify_load(BENCH_MISS, 4.0, 4.0) == BENCH_MISS);
-    CHECK(bench_qualify_load(BENCH_PASS, 4.01, 0.0) == BENCH_LOADED);
-    CHECK(bench_qualify_load(BENCH_MISS, 0.0, 4.01) == BENCH_LOADED);
-    CHECK(bench_qualify_load(BENCH_REFUSED, 5.0, 5.0) == BENCH_LOADED);
-    CHECK(bench_qualify_load(BENCH_PASS, -1.0, 0.0) == BENCH_REFUSED);
-    CHECK(bench_qualify_load(BENCH_MISS, 0.0, NAN) == BENCH_REFUSED);
-    CHECK(bench_exit_code(BENCH_LOADED, 0) == 3);
-    CHECK(bench_exit_code(BENCH_LOADED, 1) == 0);
-    CHECK(bench_merge_exit(0, bench_exit_code(BENCH_LOADED, 0)) == 3);
-    CHECK(bench_merge_exit(3, bench_exit_code(BENCH_LOADED, 0)) == 3);
 
     FILE *output = tmpfile();
     CHECK(output != NULL);
     if (!output) return;
     double speeds[RUNS];
     for (int r = 0; r < RUNS; r++) speeds[r] = 1.0;
+    int missed = 0;
+    /* a timing MISS prints verdict=MISS and exits 0 whatever the load (edit-lwq) */
     CHECK(report_gate_fp(output, "loaded_miss", speeds, 12.0, 12.0,
-                         0.0, 5.0, "Not charging") == 3);
+                         0.0, 5.0, "Not charging", &missed) == 0 && missed == 1);
     for (int r = 0; r < RUNS; r++) speeds[r] = 20.0;
     CHECK(report_gate_fp(output, "loaded_pass", speeds, 16.0, 12.0,
-                         5.0, 0.0, "Not charging") == 3);
+                         5.0, 0.0, "Not charging", &missed) == 0 && missed == 0);
     CHECK(report_gate_fp(output, "quiet_pass", speeds, 16.0, 12.0,
-                         4.0, 4.0, "Not charging") == 0);
+                         4.0, 4.0, "Not charging", &missed) == 0 && missed == 0);
     for (int r = 0; r < RUNS; r++) speeds[r] = 15.0;
     CHECK(report_gate_fp(output, "quiet_basis_miss", speeds, 16.0, 12.0,
-                         1.0, 1.0, "Not charging") == 1);
+                         1.0, 1.0, "Not charging", &missed) == 0 && missed == 1);
     speeds[0] = NAN;
     CHECK(report_gate_fp(output, "invalid_loaded", speeds, 16.0, 12.0,
-                         5.0, 5.0, "Not charging") == 1);
+                         5.0, 5.0, "Not charging", &missed) == 1);
     rewind(output);
     char line[512];
     CHECK(fgets(line, sizeof line, output) != NULL);
     CHECK(strstr(line, "load1_start=0.00 load1_end=5.00") != NULL);
     CHECK(strstr(line, "(M)[AC]") != NULL);
-    CHECK(strstr(line, "verdict=LOADED") != NULL);
-    CHECK(strstr(line, "verdict=MISS") == NULL);
+    CHECK(strstr(line, "verdict=MISS") != NULL);
     CHECK(fgets(line, sizeof line, output) != NULL);
     CHECK(strstr(line, "load1_start=5.00 load1_end=0.00") != NULL);
-    CHECK(strstr(line, "verdict=LOADED") != NULL);
-    CHECK(strstr(line, "verdict=PASS") == NULL);
+    CHECK(strstr(line, "verdict=PASS") != NULL);
     fclose(output);
-    puts("PROBE scan load: both endpoints, >4 boundary, pass/miss suppression, exit=3, invalid samples fatal");
+    puts("PROBE scan load: both endpoints stamped, miss prints MISS exit 0, invalid samples fatal");
 }
 
 static void test_interaction_population(void)
@@ -426,13 +415,11 @@ static void test_editor_bench_honesty(void)
     uint64_t value = 1; bench_samples tiny;
     bench_samples_init(&tiny, &value, 1); CHECK(bench_add(&tiny, 1) == 0);
     int refused = gate_row("editor_probe_insufficient", &tiny, 100, 100, false, &tag);
-    printf("PROBE insufficient_samples exit=%d expected=3 (G)\n", refused);
-    CHECK(refused == 3);
-    CHECK(bench_merge_exit(0, 3) == 3);
-    CHECK(bench_merge_exit(3, 0) == 3);
-    CHECK(bench_merge_exit(3, 3) == 3);
-    CHECK(bench_merge_exit(3, 1) == 1);
-    CHECK(bench_merge_exit(1, 3) == 1);
+    printf("PROBE insufficient_samples exit=%d expected=0 (a REFUSED row is a note) (G)\n", refused);
+    CHECK(refused == 0);
+    CHECK(bench_merge_exit(0, 0) == 0);
+    CHECK(bench_merge_exit(0, 1) != 0);
+    CHECK(bench_merge_exit(1, 0) != 0);
 }
 
 typedef struct bench_delayed { bool ready; } bench_delayed;

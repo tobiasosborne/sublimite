@@ -75,7 +75,7 @@ static void undo_bench_checkpoint_abort(piece_checkpoint *cp) {
 static int replay_verdict(bench_samples *real,bench_samples *mock) {
     int tree_miss=bench_report("undo_10k_in_tree_TRACK",real,58000000,78000000);
     int mock_miss=bench_report("undo_10k_bookkeeping_mock_G",mock,6300000,6300000);
-    return tree_miss || mock_miss;
+    return tree_miss || mock_miss; /* structural only; a timing MISS prints and exits 0 (edit-lwq) */
 }
 static int accepts_backend_label(const char *arg) { (void)arg;return 0; }
 typedef struct memory_meter { piece_allocator backing; size_t live,peak; } memory_meter;
@@ -98,8 +98,9 @@ static int memory_gate(const undo_log *u,const memory_meter *m,size_t typed,size
         (5*(uint64_t)(typed+original)+3)/4+(uint64_t)snapshots;
     uint64_t owned=(uint64_t)m->live+(uint64_t)st.committed_bytes;
     if(owned>bound) {
-        fprintf(stderr,"G10f MISS: owned=%llu bound=%llu active=%zu retired=%zu\n",
-            (unsigned long long)owned,(unsigned long long)bound,st.records,st.retired_records);return 1;
+        /* G10f's planning bound is (E) only: TRACK, a note not a failure (edit-lwq). */
+        fprintf(stderr,"G10f MISS (TRACK): owned=%llu bound=%llu active=%zu retired=%zu\n",
+            (unsigned long long)owned,(unsigned long long)bound,st.records,st.retired_records);return 0;
     }
     return 0;
 }
@@ -121,7 +122,8 @@ static int memory_reclamation_fixture(void) {
 int main(int argc,char **argv) {
     if(argc==2 && strcmp(argv[1],"--review-gate-check")==0) {
         uint64_t ra[1]={85000000},ma[1]={1000000};bench_samples real={ra,1,1,0},mock={ma,1,1,0};
-        CHECK(replay_verdict(&real,&mock)==1);puts("review 6: real miss rejected");return 0;
+        CHECK(replay_verdict(&real,&mock)==0 && bench_judge(&real,58000000,78000000,0)==BENCH_MISS);
+        puts("review 6: real miss printed MISS, exit 0");return 0;
     }
     if(argc==2 && strcmp(argv[1],"--review-label-check")==0) {
         CHECK(!accepts_backend_label("--bptree-indicative"));puts("review 7: label-only option rejected");return 0;

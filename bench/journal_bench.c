@@ -328,7 +328,8 @@ static int idle(work_pool *pool, bool zero_data)
 /* This policy function is also used by the real benchmark's final return. */
 static int finish_bench(int correctness, bool track, unsigned misses)
 {
-    return correctness?correctness:(!track && misses?3:0);
+    (void)track; (void)misses; /* timing misses are notes, never an exit status (edit-lwq) */
+    return correctness;
 }
 static int gate_self_check(void)
 {
@@ -336,19 +337,19 @@ static int gate_self_check(void)
     uint64_t delay[100]; for(unsigned i=0;i<100;i++) delay[i]=20001;
     bench_samples samples; bench_samples_init(&samples,delay,100); samples.n=100;
     unsigned misses=append_misses(&samples);
-    REQUIRE(finish_bench(0,false,misses)!=0);
+    REQUIRE(misses!=0 && finish_bench(0,false,misses)==0);
     REQUIRE(finish_bench(0,true,misses)==0 && finish_bench(1,true,misses)==1);
     REQUIRE(finish_bench(0,false,0)==0);
     for(unsigned i=0;i<100;i++) delay[i]=20000;
     REQUIRE(append_misses(&samples)==0);
     samples.dropped=1; REQUIRE(append_misses(&samples)==1); samples.dropped=0;
     for(unsigned i=0;i<100;i++) delay[i]=5000001;
-    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==3);
+    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==0);
     for(unsigned i=0;i<100;i++) delay[i]=15000001;
-    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==3);
+    REQUIRE(paste_misses(&samples)==1 && finish_bench(0,false,paste_misses(&samples))==0);
     for(unsigned i=0;i<100;i++) delay[i]=5000000;
     REQUIRE(paste_misses(&samples)==0);
-    puts("journal_bench: gate self-check ok (injected delay fails GATE; TRACK preserves correctness failures)");
+    puts("journal_bench: gate self-check ok (injected delay counts a MISS, exit 0; correctness failures still exit non-zero)");
     return 0;
 }
 int main(int argc, char **argv)

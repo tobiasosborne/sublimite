@@ -570,5 +570,5 @@ int main(int argc, char **argv)
     rc=row_open(SPARSE,"sparse_10g",false,BENCH_INTERACTION_MIN_N,track); if (rc<0) return 1; result=bench_merge_exit(result,rc);
     rc=row_newline_free(track,TYPE_KEYS); if (rc<0) return 1; result=bench_merge_exit(result,rc);
     (void)b_first; (void)b_save;
-    return !track && result==0 ? 3 : result; /* editor G6 new mapping remains unavailable */
+    return result; /* a timing MISS exits 0 (edit-lwq); G6 new mapping unavailable is a note */
 }

@@ -49,7 +49,7 @@ static int run(tabs_set *s, view_state *live, render_grid *g, uint32_t cols,
            "module_share=%s verdict=TRACK\n",name,tag,load,power,cols,times.n,
            (unsigned long long)p50,(unsigned long long)p99,(unsigned long long)lo,
            (unsigned long long)hi,pass?"PASS":"MISS");
-    return pass?0:1;
+    return times.n==SAMPLES && times.dropped==0 ? 0 : 1; /* a MISS is a note (edit-lwq) */
 }
 int main(void)
 {
@@ -71,11 +71,11 @@ int main(void)
     }
     char power[32], load[64]; bench_battery_status(power,sizeof power); load_stamp(load,sizeof load);
     size_t own=tabs_owned_bytes(&s), total=own+undo_bytes;
-    int miss=total>1000000u;
+    int miss=0; /* structural only; the 1 MB limit was brief-invented: TRACK, no limit (edit-lwq) */
     printf("tabs_bench: memory (M)%s load1=%s power=%s tabs=100 closed_capacity=16 "
            "tab_set_bytes=%zu caller_undo_bytes=%zu own_plus_undo_bytes=%zu "
-           "gate_bytes=1000000(G) excluding_buffers=1 memory=%s verdict=TRACK\n",
-           bench__tag_from_power(power),load,power,own,undo_bytes,total,miss?"MISS":"PASS");
+           "excluding_buffers=1 memory=%s verdict=TRACK\n",
+           bench__tag_from_power(power),load,power,own,undo_bytes,total,"TRACK");
     render_cell cells[2400]; uint64_t dirty[1]; render_grid g;
     render_glyph glyphs[97]; uint8_t pixels[194]={0};
     for(uint32_t i=0;i<97;++i) glyphs[i]=(render_glyph){.glyph_index=i<95?i+32:i==95?0x4e2d:0x1f469,

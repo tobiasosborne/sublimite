@@ -1,6 +1,6 @@
 /* bench/font_bench.c - P2.3 / P2.3b: runtime rasterisation of one glyph at 30 px.
- * Raster regression budget: p50/p99 <= 50 us; cold/cached lookup slices
- * p50/p99 <= 0.5 ms. Timing misses fail even though shared-box runs are TRACK.
+ * Raster 50 us is TRACK (no derivation); cold/cached lookup slices
+ * p50/p99 <= 0.5 ms. A timing miss prints MISS and exits 0 (edit-lwq).
  * Discovery time is TRACK only. CJK is SKIP if unavailable. Pure --self-check
  * paths exercise failure predicates without running a timing campaign. */
 #include "base/base.h"
@@ -75,10 +75,9 @@ static int self_check(const char *which)
 
 static int print_row(const char *name, const bench_samples *s, unsigned row)
 {
-    uint64_t gate = row == 0 ? GATE_P50 : UINT64_C(500000);
+    uint64_t gate = row == 0 ? 0 : UINT64_C(500000); /* 50 us raster: no derivation, TRACK */
     int result = bench_report(name, s, gate, gate);
-    if (!timing_pass(bench_p50(s), bench_p99(s), row)) result = 1;
-    return result;
+    return result; /* a timing MISS prints and exits 0 (edit-lwq) */
 }
 
 int main(int argc, char **argv)
@@ -123,7 +122,7 @@ int main(int argc, char **argv)
     }
     size_t mallocs = 0;
     if (edit_malloc_guard_active()) mallocs = edit_malloc_guard_end();
-    uint64_t p50 = bench_p50(&s), p99 = bench_p99(&s);
+    (void)bench_p50(&s);
     printf("BENCH name=font_raster_mallocs n=%u value=%zu gate=0 guard=%d tag=(G)(M)%s TRACK\n",
            N_OPS, mallocs, edit_malloc_guard_active() ? 1 : 0, bench_evidence_tag());
     failed |= print_row("font_raster_TRACK", &s, 0);
@@ -246,6 +245,6 @@ int main(int argc, char **argv)
     edit_arena_free(&storage); edit_arena_free(&u.files);
     edit_arena_free(&a);
     free(ttf);
-    if (s.dropped || !timing_pass(p50, p99, 0) || !edit_malloc_guard_active() || cache_mallocs) failed = 1;
+    if (s.dropped || !edit_malloc_guard_active() || cache_mallocs) failed = 1;
     return failed;
 }

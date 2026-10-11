@@ -28,7 +28,7 @@ static int cmp_d(const void *a, const void *b)
 /* Nearest-rank latency quantiles expressed as throughput (slow tail first). */
 static int report_gate_fp(FILE *fp, const char *name, double *gbps, double gate50,
                           double gate99, double load_start, double load_end,
-                          const char *power)
+                          const char *power, int *missed)
 {
     int invalid = 0;
     for (int r = 0; r < RUNS; r++) {
@@ -38,19 +38,21 @@ static int report_gate_fp(FILE *fp, const char *name, double *gbps, double gate5
     double p50 = gbps[RUNS / 2];              /* 10th fastest latency = 11th ascending speed */
     double p99 = gbps[0];                     /* slow tail: 1st percentile of speed = slowest of 20 */
     bench_verdict_kind v = p50 < gate50 || p99 < gate99 ? BENCH_MISS : BENCH_PASS;
-    v = invalid ? BENCH_MISS : bench_qualify_load(v, load_start, load_end);
     fprintf(fp, "TRACK (M)%s load1_start=%.2f load1_end=%.2f "
                 "%-24s p50 %.2f GB/s  p99 %.2f GB/s  gates p50 >= %.1f / p99 >= %.1f (G) "
-                "load1_limit=%.1f (G) verdict=%s\n",
+                "verdict=%s\n",
             bench__tag_from_power(power), load_start, load_end,
-            name, p50, p99, gate50, gate99, BENCH_LOAD1_LIMIT, bench_verdict_word(v));
-    return bench_exit_code(v, 0);
+            name, p50, p99, gate50, gate99, bench_verdict_word(v));
+    if (missed) *missed = v == BENCH_MISS || invalid;
+    return invalid ? 1 : 0; /* a timing MISS is a note (edit-lwq) */
 }
 
 /* Synthetic contract checks deliberately use fixed unloaded conditions. */
 static int report_gate(const char *name, double *gbps, double gate50, double gate99)
 {
-    return report_gate_fp(stdout, name, gbps, gate50, gate99, 0.0, 0.0, "unknown");
+    int missed = 0; /* the self-checks test the judgement, not the exit code */
+    (void)report_gate_fp(stdout, name, gbps, gate50, gate99, 0.0, 0.0, "unknown", &missed);
+    return missed;
 }
 
 static int report(const char *name, double *gbps)
@@ -167,16 +169,15 @@ int main(int argc, char **argv)
     }
     double nth_end = bench_load1();
     int result = report_gate_fp(stdout, "scan_count", t_count, GATE_GBPS, TAIL_GBPS,
-                                count_start, count_end, count_power);
+                                count_start, count_end, count_power, NULL);
     result = bench_merge_exit(result,
         report_gate_fp(stdout, "scan_find_nth_newline", t_nth, GATE_GBPS, TAIL_GBPS,
-                       nth_start, nth_end, nth_power));
+                       nth_start, nth_end, nth_power, NULL));
     result = bench_merge_exit(result,
         report_gate_fp(stdout, "scan_count_G6_basis", t_count, G6_BASIS_GBPS, TAIL_GBPS,
-                       count_start, count_end, count_power));
+                       count_start, count_end, count_power, NULL));
     (void)sink;
     free(buf);
-    printf("%s\n", result == 3 ? "TRACK: load/sample conditions refused a verdict" :
-           result == 1 ? "TRACK: thresholds missed or invalid samples" : "TRACK: thresholds met");
+    printf("%s\n", result == 1 ? "TRACK: invalid samples" : "TRACK: rows printed (MISS is a note)");
     return result;
 }

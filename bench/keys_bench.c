@@ -4,7 +4,6 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 #define EVENTS 1000000u
-#define GATE_NS UINT64_C(1000)
 
 static uint32_t random_next(uint32_t *seed)
 {
@@ -61,9 +60,9 @@ int main(void)
     size_t mallocs=edit_malloc_guard_end();
     bench_samples samples; bench_samples_init(&samples,times,EVENTS); samples.n=EVENTS;
     uint64_t p50=bench_p50(&samples), p99=bench_p99(&samples);
-    int fail=p99>GATE_NS || mallocs!=0 || !edit_malloc_guard_active();
+    int fail=mallocs!=0 || !edit_malloc_guard_active();
     printf("BENCH keys_lookup TRACK n=%u p50=%.3f us p99=%.3f us (M)%s load1=%s "
-           "gate_p99<=1.000 us(G) pass=%d\n",EVENTS,(double)p50/1000.0,(double)p99/1000.0,tag,load,fail?0:1);
+           "no limit (no derivation for 1 us)\n",EVENTS,(double)p50/1000.0,(double)p99/1000.0,tag,load);
     printf("STREAM (M)%s load1=%s matches=%zu prefixes=%zu cancelled=%zu misses=%zu "
            "mallocs=%zu guard=%s gate_mallocs=0(G)\n",tag,load,results[KEYS_MATCH],results[KEYS_PREFIX],
            results[KEYS_CANCELLED],results[KEYS_NONE],mallocs,edit_malloc_guard_active()?"active":"inactive");

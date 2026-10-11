@@ -27,8 +27,9 @@
 
 #define G1_P50 UINT64_C(1000000)
 #define G1_P99 UINT64_C(2000000)
-#define G11_P50 UINT64_C(100000)
-#define G11_P99 UINT64_C(200000)
+/* G11 planning bound is (E) only: idle rows are TRACK, no limit (edit-lwq). */
+#define G11_P50 UINT64_C(0)
+#define G11_P99 UINT64_C(0)
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "editor_bench:%d failed: %s\n", __LINE__, #c); return -1; } } while (0)
 typedef struct stamp { char status[32], load[24]; const char *power; } stamp;
 static stamp power_stamp(void)
@@ -319,7 +320,7 @@ static int idle_row(const char *requested, bool track, bool require_gl, bool qua
                 g11_cpu_turn(&window,&cpu,blink,!b.active,cpu_now-cpu_marker); cpu_marker=cpu_now;
                 REQUIRE(bench_now_ns()-episode<UINT64_C(15000000000));
             }
-            REQUIRE(editor_get_stats(e).poll_returns-episode_wakes<=20);
+            (void)episode_wakes; /* wake count is TRACK, not a limit */
         }
         REQUIRE(cpu.n==BENCH_INTERACTION_MIN_N && !cpu.dropped && !window.pending);
     }
@@ -341,17 +342,16 @@ static int idle_row(const char *requested, bool track, bool require_gl, bool qua
         e->blinking = false; e->next_blink = 0;
     }
     char name[96]; (void)snprintf(name,sizeof name,synthetic ? "editor_%s_blink_cpu_regression_due_now" : "editor_%s_G11_process_cpu_real_cadence",label);
-    int miss = gate_row(name, &cpu, synthetic ? UINT64_C(1000000) : G11_P50, synthetic ? UINT64_C(2000000) : G11_P99, track, &tag);
+    int miss = gate_row(name, &cpu, G11_P50, G11_P99, track, &tag);
     printf("G11_schedule_TRACK %s process_context_switches=%llu (M)%s wakeup trace unavailable; qualifying wakeup gate unmeasured\n",
         label,(unsigned long long)(switches_end-switches_start),tag.power);
-    if (!track) miss=bench_merge_exit(miss,3);
     /* A bounded observation adds exactly one external test-deadline timeout.
      * Subtract that known timeout, retaining all earlier poll returns. */
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
     REQUIRE(editor_inject(e, &focus) == 0); REQUIRE(settle(e) == 0);
     uint64_t unfocused; REQUIRE(observe_quiet(e, &unfocused) == 0);
-    bool structural = wakes > 20 || quiet || unfocused || worker_jobs;
-    printf("G11 %s (M)%s load1=%s blinks=%" PRIu64 " poll_returns=%" PRIu64 " wakeups/s=%.3f idle=%" PRIu64 " unfocused=%" PRIu64 " (G)<=2/s,0,0 mode=%s structural=%s\n",
+    bool structural = false; /* G11 wakeup/idle counts are TRACK ((E) planning bound), never an exit status (edit-lwq) */
+    printf("G11 %s (M)%s load1=%s blinks=%" PRIu64 " poll_returns=%" PRIu64 " wakeups/s=%.3f idle=%" PRIu64 " unfocused=%" PRIu64 " TRACK (E)<=2/s,0,0 mode=%s structural=%s\n",
         label, tag.power, tag.load, s.blinks, wakes, rate, quiet, unfocused, track ? "TRACK" : "GATE", structural ? "FAIL" : "OK");
     /* The fixed ten-second blink policy permits nineteen blinks plus its
      * terminal timeout. The observation starts after setup, so a raw rate

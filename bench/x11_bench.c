@@ -1,5 +1,5 @@
 /* x11_bench.c - key translation cost (P2.2). TRACKED, no gate invented: G1 is end-to-end and measured later.
- * Startup is a gated platform subset (not a full G4a verdict); misses fail even in TRACK. */
+ * Startup prints PASS/MISS against the G4a subset; a MISS exits 0 (edit-lwq). */
 #include "x11/input.h"
 #include "base/base.h"
 #include "x11/clip.h"
@@ -10,10 +10,13 @@
 
 #define N 200000u
 
-/* One exit-status decision for startup and the allocation guard. */
+/* Timing against the G4a subset budget: a note, never an exit status (edit-lwq). */
+static int startup_miss(const bench_samples *samples) {
+    return bench_p50(samples) > UINT64_C(25000000) || bench_p99(samples) > UINT64_C(40000000) ? 1 : 0;
+}
+/* One exit-status decision for startup and the allocation guard: structural only. */
 static int startup_result(int init_rc, const bench_samples *samples, size_t allocs) {
     return init_rc != PLAT_OK || !samples->n || samples->dropped ||
-           bench_p50(samples) > UINT64_C(25000000) || bench_p99(samples) > UINT64_C(40000000) ||
            (edit_malloc_guard_active() && allocs) ? 1 : 0;
 }
 
@@ -31,12 +34,15 @@ static int startup_self_check(void) {
     EXPECT_STATUS(1, "supplied-display init failure", PLAT_ERR_FAIL);
     EXPECT_STATUS(1, "supplied-display connection failure", PLAT_ERR_NO_DISPLAY);
     for (size_t i = 0; i < s.n; i++) values[i] = UINT64_C(100000000);
-    EXPECT_STATUS(1, "100 ms subset exceeds G4a", PLAT_OK);
+    EXPECT_STATUS(0, "100 ms subset exceeds G4a: a note, exit 0", PLAT_OK);
+    if (!startup_miss(&s)) { fprintf(stderr, "§23 FAIL 100 ms subset not flagged MISS\n"); failed = 1; }
     for (size_t i = 0; i < s.n; i++) values[i] = UINT64_C(25000000);
     values[98] = values[99] = UINT64_C(40000001);
-    EXPECT_STATUS(1, "p99 miss with passing p50", PLAT_OK);
+    EXPECT_STATUS(0, "p99 miss with passing p50: a note, exit 0", PLAT_OK);
+    if (!startup_miss(&s)) { fprintf(stderr, "§23 FAIL p99 miss not flagged\n"); failed = 1; }
     values[98] = values[99] = UINT64_C(40000000);
     EXPECT_STATUS(0, "inclusive budget boundaries", PLAT_OK);
+    if (startup_miss(&s)) { fprintf(stderr, "§23 FAIL boundary flagged MISS\n"); failed = 1; }
     s.dropped = 1; EXPECT_STATUS(1, "dropped sample", PLAT_OK);
     s.dropped = 0; s.n = 0; EXPECT_STATUS(1, "empty samples", PLAT_OK);
 #undef EXPECT_STATUS
@@ -63,8 +69,8 @@ static int startup_bench(double load) {
     }
     int failed = startup_result(PLAT_OK, &samples, 0);
     printf("TRACK x11 startup main->plat_init done->map requested: n=%zu p50=%.3f ms p99=%.3f ms (M)%s; "
-           "G4a full startup p50<=25 ms p99<=40 ms (G); subset budget %s; excludes exec, first-frame raster and input acceptance; load=%.2f\n",
-           samples.n, (double)bench_p50(&samples) / 1e6, (double)bench_p99(&samples) / 1e6, bench_evidence_tag(), failed ? "MISS" : "PASS", load);
+           "G4a full startup p50<=25 ms p99<=40 ms (G); subset budget %s (a note); excludes exec, first-frame raster and input acceptance; load=%.2f\n",
+           samples.n, (double)bench_p50(&samples) / 1e6, (double)bench_p99(&samples) / 1e6, bench_evidence_tag(), failed ? "STRUCTURAL-FAIL" : startup_miss(&samples) ? "MISS" : "PASS", load);
     return failed;
 }
 

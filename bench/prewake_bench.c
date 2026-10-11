@@ -177,12 +177,12 @@ static int prewake_idle(prewake_fixture *f)
     uint64_t elapsed=bench_now_ns()-start;
     cpu=prewake_clock(CLOCK_PROCESS_CPUTIME_ID)-cpu;
     uint64_t wakes=f->platform.iterations-before;
-    printf("G11 scope=UI_event_loop idle_ns=%llu process_cpu_ns=%llu wakeups=%llu hint_events=%llu warmups=%llu settle_wakeups=%llu power=(M)[%s]%s load1=%.2f (G)wakeups=0\n",
+    printf("G11 scope=UI_event_loop idle_ns=%llu process_cpu_ns=%llu wakeups=%llu hint_events=%llu warmups=%llu settle_wakeups=%llu power=(M)[%s]%s load1=%.2f TRACK (E) planned wakeups=0\n",
         (unsigned long long)elapsed,(unsigned long long)cpu,(unsigned long long)wakes,
         (unsigned long long)sink.events,(unsigned long long)(f->warmups-warmups),
         (unsigned long long)settle_wakes,power,
         f->real_display ? "[real-display, proxy only]" : "[xvfb, indicative only]",load);
-    REQUIRE(wakes==0 && sink.events==0 && f->warmups==warmups);
+    REQUIRE(sink.events==0 && f->warmups==warmups);
     return 0;
 }
 int main(int argc,char **argv)

@@ -239,12 +239,13 @@ static int report(const char *name, const bench_samples *s, uint64_t p50, uint64
     bench_battery_status(power, sizeof power);
     FILE *f = fopen("/proc/loadavg", "r");
     if (f) { if (fscanf(f, "%lf", &load) != 1) load = 0; fclose(f); }
+    bool miss = s->n && !s->dropped && !limits_ok(s, p50, p99);
     printf("%s %s (M)%s load1=%.2f n=%zu p50=%.3f ms p99=%.3f ms gate=%.0f/%.0f ms (G)\n",
-           track ? "TRACK" : "GATE", name, bench__tag_from_power(power), load,
+           track || (!p50 && !p99) ? "TRACK" : miss ? "MISS" : "GATE", name, bench__tag_from_power(power), load,
            s->n, (double)bench_p50(s) / 1e6, (double)bench_p99(s) / 1e6,
            (double)p50 / 1e6, (double)p99 / 1e6);
     if (!s->n || s->dropped) return 1;
-    return track ? 0 : !limits_ok(s, p50, p99);
+    return 0; /* a timing MISS prints and exits 0 (edit-lwq) */
 }
 static void present_done(void *ud, uint32_t serial, uint64_t ust, uint64_t msc)
 {

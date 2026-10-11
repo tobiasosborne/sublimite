@@ -114,5 +114,5 @@ static int count_worker(void *argument)
     }
     printf("findui_count: exact %zu-byte total/first 4096 checked; initial/late/empty windows; mapping=NEW; (M)%s\n",length,bench__tag_from_power(power));
     free(values);
-    return args->samples<BENCH_INTERACTION_MIN_N ? 3 : rc;
+    return rc; /* a short population is a note, not a failure (edit-lwq) */
 }

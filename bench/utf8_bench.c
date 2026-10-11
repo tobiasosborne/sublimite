@@ -128,9 +128,9 @@ static int run_mix(const char *name, const char *gname, const char *cname, int i
         int w = i % WINDOWS;
         BENCH_TIME(&s, sink += decode_width(text + start[w], start[w + 1] - start[w]));
     }
-    int miss = bench_report(name, &s, gated ? 5000 : 0, gated ? 10000 : 0);
-    printf("  -> p50 %.1f ns/scalar, p99 %llu ns vs 5000/10000 (%s)\n", (double)bench_p50(&s) / SCALARS,
-           (unsigned long long)bench_p99(&s), gated ? "gated" : "not gated");
+    int miss = bench_report(name, &s, 0, 0); /* 5 us / 10 us were brief-invented: TRACK, no limit (edit-lwq) */
+    printf("  -> p50 %.1f ns/scalar, p99 %llu ns (%s)\n", (double)bench_p50(&s) / SCALARS,
+           (unsigned long long)bench_p99(&s), gated ? "TRACK, no limit" : "not gated");
     print_ci(&s);
 
     bench_samples_init(&s, v, SAMPLES);
@@ -264,7 +264,7 @@ int main(void)
         free(b);
     }
 
-    printf("%s\n", miss ? "BENCH GATE MISSED" : "BENCH GATE PASSED");
+    printf("%s\n", miss ? "BENCH STRUCTURAL FAILURE" : "BENCH rows printed (a MISS is a note)");
     free(v); free(ascii); free(start); free(text);
     return miss;
 }

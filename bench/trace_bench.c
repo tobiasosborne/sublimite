@@ -1,7 +1,7 @@
-/* trace_bench.c - cost of trace_record(). Gate: p50 < 50 ns (G), see docs/decisions/P0.3.md.
+/* trace_bench.c - cost of trace_record(). TRACK, no limit (the 50 ns was brief-invented; edit-lwq), see docs/decisions/P0.3.md.
  * 10^6 calls in 1000 batches of 1000; each batch is timed with CLOCK_MONOTONIC
  * and divided by 1000, so the timer read is amortised out. Also reports the
- * cost of a bare clock_gettime for context. Exit 1 on gate miss. */
+ * cost of a bare clock_gettime for context. Exits 0; non-zero only if the ring cannot be set up. */
 #include "../src/trace/trace.h"
 #include "harness.h"
 
@@ -12,7 +12,6 @@
 
 #define BATCHES 1000u
 #define BATCH 1000u
-#define GATE_P50_NS 50u
 
 static int cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -85,8 +84,8 @@ int main(void) {
     qsort(clk, BATCHES, sizeof clk[0], cmp_u64);
     {
         uint64_t p50 = pct(per_call, BATCHES, 50), p99 = pct(per_call, BATCHES, 99);
-        printf("trace_record   n=10^6 batches=%u x %u: p50=%llu ns p99=%llu ns (gate p50 < %u)\n",
-               BATCHES, BATCH, (unsigned long long)p50, (unsigned long long)p99, GATE_P50_NS);
+        printf("trace_record   n=10^6 batches=%u x %u: p50=%llu ns p99=%llu ns (TRACK, no limit)\n",
+               BATCHES, BATCH, (unsigned long long)p50, (unsigned long long)p99);
         printf("clock_gettime  (reference, same method): p50=%llu ns p99=%llu ns\n",
                (unsigned long long)pct(clk, BATCHES, 50), (unsigned long long)pct(clk, BATCHES, 99));
         uint64_t ip50 = pct(in_call, BATCHES, 50), ip99 = pct(in_call, BATCHES, 99);
@@ -97,18 +96,9 @@ int main(void) {
             bat[strcspn(bat, "\n")] = '\0';
             fclose(bf);
         }
-        printf("trace_input    n=10^6 batches=%u x %u: p50=%llu ns p99=%llu ns (gate p50 < %u) (M)[%s]\n",
-               BATCHES, BATCH, (unsigned long long)ip50, (unsigned long long)ip99, GATE_P50_NS, bat);
-        if (ip50 >= GATE_P50_NS) {
-            printf("trace_bench: INPUT GATE MISS\n");
-            rc = 1;
-        }
-        if (p50 >= GATE_P50_NS) {
-            printf("trace_bench: GATE MISS\n");
-            rc = 1;
-        } else {
-            printf("trace_bench: PASS\n");
-        }
+        printf("trace_input    n=10^6 batches=%u x %u: p50=%llu ns p99=%llu ns (TRACK, no limit) (M)[%s]\n",
+               BATCHES, BATCH, (unsigned long long)ip50, (unsigned long long)ip99, bat);
+        printf("trace_bench: rows printed (TRACK)\n");
     }
     return rc;
 }

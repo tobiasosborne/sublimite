@@ -254,8 +254,9 @@ static inline const char *bench_evidence_tag(void)
 
 /* ---- report ---- */
 
-/* Prints one BENCH line to fp. Returns 0 on pass, 1 on miss. A gate of 0
- * means not gated. Any dropped sample or empty set is a miss. */
+/* Prints one BENCH line to fp. Returns 0 on pass, 1 on miss (the caller
+ * decides; bench_report maps a timing miss to exit 0). A gate of 0 means not
+ * gated. Any dropped sample or empty set is a miss (structural). */
 static inline int bench_report_fp(FILE *fp, const char *name, const bench_samples *s,
                                   uint64_t gate_p50_ns, uint64_t gate_p99_ns)
 {
@@ -268,40 +269,43 @@ static inline int bench_report_fp(FILE *fp, const char *name, const bench_sample
         && (gate_p50_ns == 0 || p50 <= gate_p50_ns)
         && (gate_p99_ns == 0 || p99 <= gate_p99_ns);
     fprintf(fp, "BENCH name=%s n=%zu p50=%llu p99=%llu ci95=[%llu,%llu] "
-                "gate_p50=%llu gate_p99=%llu pass=%d power=%s\n",
+                "gate_p50=%llu gate_p99=%llu pass=%d%s power=%s\n",
             name, s->n,
             (unsigned long long)p50, (unsigned long long)p99,
             (unsigned long long)lo, (unsigned long long)hi,
             (unsigned long long)gate_p50_ns, (unsigned long long)gate_p99_ns,
-            pass ? 1 : 0, bench_evidence_tag());
+            pass ? 1 : 0, pass ? "" : " MISS", bench_evidence_tag());
     return pass ? 0 : 1;
+}
+
+/* Process exit contribution of a printed row (edit-lwq, CLAUDE.md law 1,
+ * 2026-10-11): a timing MISS is a note, not a failure. Only a structural
+ * failure (no samples, or samples that did not fit) is non-zero. */
+static inline int bench_structural_exit(const bench_samples *s)
+{
+    return s->n == 0 || s->dropped != 0 ? 1 : 0;
 }
 
 static inline int bench_report(const char *name, const bench_samples *s,
                                uint64_t gate_p50_ns, uint64_t gate_p99_ns)
 {
-    return bench_report_fp(stdout, name, s, gate_p50_ns, gate_p99_ns);
+    (void)bench_report_fp(stdout, name, s, gate_p50_ns, gate_p99_ns);
+    return bench_structural_exit(s);
 }
 
-/* ---- qualified gate verdicts (edit-yqu, review P4-modules-2 s31/s32) ----
- * A gate verdict needs enough samples: perf/01-perf-target.md 4 requires
- * >= BENCH_INTERACTION_MIN_N (10 000) samples per interaction scenario. With
- * fewer, the verdict is REFUSED (never PASS) and the line still prints the
- * descriptive p50/p99 and their order-statistic 95 % intervals. A miss is a
- * miss regardless of sample count. The exit code is non-zero for MISS and
- * REFUSED by default; only an explicit --track (track != 0) opts out. */
+/* ---- verdicts (edit-yqu; reworked edit-lwq) ----
+ * A timing MISS prints MISS and contributes exit 0 (CLAUDE.md law 1,
+ * 2026-10-11: perf is a goal, not a progress blocker). Only structural
+ * failures (empty or dropped samples) exit non-zero. REFUSED still marks a
+ * population below BENCH_INTERACTION_MIN_N (10 000, perf/01-perf-target.md 4)
+ * but is a note too. */
 #define BENCH_INTERACTION_MIN_N 10000u
 
 typedef enum bench_verdict_kind {
-    BENCH_PASS = 0, BENCH_MISS = 1, BENCH_REFUSED = 2, BENCH_LOADED = 3
+    BENCH_PASS = 0, BENCH_MISS = 1, BENCH_REFUSED = 2
 } bench_verdict_kind;
 
-/* Opt-in load qualification: legacy bench_judge callers retain their policy.
- * The scan gate's loaded-box cutoff is strictly greater than 4 (G).
- * Missing load evidence refuses a verdict. Callers keep structural failures
- * separate: load qualification applies only to valid timing observations. */
-#define BENCH_LOAD1_LIMIT 4.0
-
+/* Load stamp (1-minute loadavg); -1.0 when unreadable. Evidence only. */
 static inline double bench_load1(void)
 {
     FILE *f = fopen("/proc/loadavg", "r");
@@ -313,18 +317,9 @@ static inline double bench_load1(void)
     return load;
 }
 
-static inline bench_verdict_kind bench_qualify_load(bench_verdict_kind v,
-                                                   double start, double end)
-{
-    if (start > BENCH_LOAD1_LIMIT || end > BENCH_LOAD1_LIMIT) return BENCH_LOADED;
-    if (!(start >= 0.0) || !(end >= 0.0)) return BENCH_REFUSED;
-    return v;
-}
-
 static inline const char *bench_verdict_word(bench_verdict_kind v)
 {
-    return v == BENCH_PASS ? "PASS" : v == BENCH_MISS ? "MISS" :
-           v == BENCH_LOADED ? "LOADED" : "REFUSED";
+    return v == BENCH_PASS ? "PASS" : v == BENCH_MISS ? "MISS" : "REFUSED";
 }
 
 static inline bench_verdict_kind bench_judge(const bench_samples *s, uint64_t gate_p50_ns,
@@ -337,11 +332,13 @@ static inline bench_verdict_kind bench_judge(const bench_samples *s, uint64_t ga
     return s->n < required_n ? BENCH_REFUSED : BENCH_PASS;
 }
 
+/* Exit contribution of a verdict: always 0 (timing is a note). Structural
+ * failures are reported by the caller (bench_structural_exit). */
 static inline int bench_exit_code(bench_verdict_kind v, int track)
 {
-    if (track || v == BENCH_PASS)
-        return 0;
-    return v == BENCH_MISS ? 1 : 3;
+    (void)v;
+    (void)track;
+    return 0;
 }
 
 /* Formats one verdict line into buf; returns the snprintf length. power is
@@ -353,7 +350,8 @@ static inline int bench_gate_line(char *buf, size_t cap, const char *name, const
 {
     uint64_t l50, h50, l99, h99;
     bench_verdict_kind v = bench_judge(s, gate_p50_ns, gate_p99_ns, required_n);
-    const char *word = track ? "TRACK" : bench_verdict_word(v);
+    const char *word = (track || (gate_p50_ns == 0 && gate_p99_ns == 0)) ? "TRACK"
+                                                                     : bench_verdict_word(v);
     bench_ci95(s, 0.50, &l50, &h50);
     bench_ci95(s, 0.99, &l99, &h99);
     return snprintf(buf, cap,
@@ -375,15 +373,13 @@ static inline int bench_gate_report(const char *name, const bench_samples *s, ui
     (void)bench_gate_line(line, sizeof line, name, s, gate_p50_ns, gate_p99_ns, required_n, track,
                           power, load);
     puts(line);
-    return bench_exit_code(bench_judge(s, gate_p50_ns, gate_p99_ns, required_n), track);
+    return bench_structural_exit(s);
 }
 
-/* Combine independently reported rows without turning REFUSED/LOADED (3) into a
- * boolean success/miss. Structural/timing failure (1) takes precedence. */
+/* Combine independently reported rows: any non-zero (structural) wins. */
 static inline int bench_merge_exit(int left, int right)
 {
-    if (left == 1 || right == 1) return 1;
-    return left == 3 || right == 3 ? 3 : 0;
+    return left != 0 || right != 0 ? 1 : 0;
 }
 
 /* Cold runs are manual. Procedure (Linux):
