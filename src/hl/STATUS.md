@@ -1,26 +1,27 @@
-# hl — edit-v0o.2 partial, blocked on upstream source acquisition
+# hl — edit-v0o.2 runtime continuation
 
-Implemented only the refresh-derived budget and highlight mailbox protocol in
-`hl.h` / `hl.c`, with unit tests and a protocol fuzzer. The existing worker
-transport supplies generation/lease filtering; readiness also checks the byte
-range and viewport phase. These helpers allocate nothing and do not change
-editor rendering. Plain text remains the only editor output.
+The official tree-sitter v0.27.1 runtime is vendored verbatim and built into the
+release, sanitizer and fuzzer static archives. `hl.h` / `parse.c` implement a
+snapshot parse worker with refresh-derived resumable slices, viewport-first
+publication, full-document continuation and incremental `ts_tree_edit` on a
+copy of the prior completed tree. The original mailbox/readiness helpers stay
+in place. Request setup and mailbox/readiness operations allocate nothing.
+Tree-sitter initialization and worker parsing use upstream allocation.
 
-The mailbox contract passed direct Clang ASan/UBSan and GCC release runs;
-the release allocator guard is active. The protocol fuzzer passed its seed
-corpus. These are helper checks, not parsing or editor latency acceptance.
+Results are pointer-free mailbox values. Snapshots and edit arrays remain
+caller-owned through physical lease completion. Deadline checks are
+cooperative; upstream callback/lexer/tree-operation granularity can overshoot
+a refresh interval. Source fault detection fails closed. No paint/query/theme
+or production grammar wiring was added; the editor remains plain text.
 
-Full GCC `make all` passed. Sanitizer suite results are in the worker report:
-headless suites passed except the sandbox-denied IPC socket setup; the failing
-file-kill sections also require X. Other display suites were blocked by the
-shared lock or X connection denial. The coordinator must rerun unrestricted
-with the assigned Xvfb display and leaks enabled.
+Real parse, slice, cancellation, edit-chain, snapshot, mapped-fault and pool
+ordering tests pass in release and ASan/UBSan builds. The edit fuzzer compares
+incremental trees against fresh trees; the mailbox fuzzer remains. The
+busy-parser G1/G3 endpoint harness is available as `build/bench/hl_bench
+--refresh-ns=INTERVAL`, using the caller's measured display interval.
 
-The runtime is **not vendored**, no parsing worker exists, and this bead is
-**not complete**. Shell networking is disabled; the available web transport
-cannot deliver a complete, faithful upstream source tree. Details and intended
-continuation are in `docs/decisions/edit-v0o.2.md` and the worker report.
-
-Budget derivation (P): one frame times the supplied refresh interval equals
-that interval in nanoseconds. An unknown interval is refused. No hardware rate
-or arena capacity is invented.
+`make all` passed. Full `make check` and busy-parser endpoint validation are
+blocked by the occupied display lock in this environment; IPC socket setup is
+also sandbox-denied. The coordinator must rerun display/leak checks and the
+comparison drive. Details and provenance hash are in
+`docs/decisions/edit-v0o.2.md` and the appended worker report. No git/bd ran.

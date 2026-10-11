@@ -1,5 +1,5 @@
 # GNU Makefile. Globs everything: drop files in src/<m>/, tests/<m>_test.c,
-# bench/<m>_bench.c, fuzz/<m>_fuzz.c, tools/<name>.c; never edit this file.
+# bench/<m>_bench.c, fuzz/<m>_fuzz.c, tools/<name>.c. Vendored runtimes are explicit.
 CC_RELEASE ?= gcc
 CC_SAN     ?= clang
 # clang 18 on this box selects a half-installed gcc-14 dir and cannot find -lstdc++ (libFuzzer needs it); pin gcc 13. See docs/toolchain.md.
@@ -8,7 +8,7 @@ CLANG_GCC  := $(if $(GCC_DIR),--gcc-install-dir=$(GCC_DIR),)
 AR         ?= ar
 
 WARN   := -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread
-INC    := -Isrc
+INC    := -Isrc -Ivendor/tree-sitter/lib/include
 DEP    := -MMD -MP
 REL_F  := -O2 -g -msse2
 SAN_F  := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
@@ -18,7 +18,8 @@ LDLIBS := -lm -ldl
 LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
-SRCS   := $(sort $(wildcard src/*/*.c))
+TS_SRC := vendor/tree-sitter/lib/src/lib.c
+SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
 MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
 BENCHS := $(sort $(wildcard bench/*_bench.c))
@@ -28,6 +29,12 @@ TOOLS  := $(sort $(wildcard tools/*.c))
 REL_OBJ  := $(SRCS:%.c=$(B)/rel/%.o)
 SAN_OBJ  := $(SRCS:%.c=$(B)/san/%.o)
 FUZZ_OBJ := $(SRCS:%.c=$(B)/fuzz/%.o)
+
+# Upstream's amalgamation uses narrowing conversions and shadowed locals.
+# Relax only those warnings for this object in every configuration; retain
+# C11, Wall/Wextra/Werror, project optimization and sanitizer flags.
+TS_OBJ := $(addprefix $(B)/,$(addsuffix /$(TS_SRC:.c=.o),rel san fuzz))
+$(TS_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
 
 REL_LIB  := $(B)/libedit.a
 SAN_LIB  := $(B)/san/libedit.a

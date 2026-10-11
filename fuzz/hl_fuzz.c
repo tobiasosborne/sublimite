@@ -1,4 +1,4 @@
-/* Fuzz only the landed mailbox protocol, not the unavailable runtime. */
+/* Fuzz the mailbox protocol; snapshot edit parsing is in hl_edit_fuzz.c. */
 #include "hl/hl.h"
 #include "base/base.h"
 #include <string.h>
