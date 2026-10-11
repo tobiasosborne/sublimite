@@ -73,6 +73,8 @@ int main(int argc, char **argv)
     }
     int fd = mkstemp(journal_path);
     if (fd < 0) { perror("sublimite: journal"); goto startup_fail; }
+    struct stat placeholder;
+    if (fstat(fd, &placeholder)) { close(fd); (void)unlink(journal_path); goto startup_fail; }
     close(fd);
     render_backend backend = {0};
     /* The only application backend selection site; init may fall back once. */
@@ -90,6 +92,12 @@ int main(int argc, char **argv)
         editor_close(e);
     }
     if (owns_server) ipc_server_fini(&server);
+    /* Backend/platform setup can fail before editor_open owns the placeholder.
+     * Retire only this launch's still-empty inode, never a recovery checkpoint. */
+    struct stat remaining;
+    if (!lstat(journal_path, &remaining) && S_ISREG(remaining.st_mode) && !remaining.st_size &&
+        remaining.st_dev == placeholder.st_dev && remaining.st_ino == placeholder.st_ino)
+        (void)unlink(journal_path);
     /* editor_close joins workers: the trace rings are quiescent here. */
     const char *dump_path = getenv("EDIT_TRACE_DUMP");
     if (dump_path) {

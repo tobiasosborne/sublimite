@@ -54,7 +54,10 @@ static int open_fixture(fixture *f, bool journalling, bool missing)
 }
 static void close_fixture(fixture *f)
 {
-    editor_close(f->e); unlink(f->path); unlink(f->log); (void)rmdir(f->directory);
+    editor_close(f->e); unlink(f->path); unlink(f->log);
+    char lock[IPC_PATH_CAP];
+    if (snprintf(lock, sizeof lock, "%s/.journal.lock", f->directory) > 0) (void)unlink(lock);
+    (void)rmdir(f->directory);
 }
 static int disk_is(const char *path, const char *expected)
 {
@@ -199,7 +202,6 @@ static int interrupted_save(int phase)
     T(settle(e) == 0); T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
     T(disk_is(source, "xbase") == 0 && !editor_tab(e, 0)->modified);
     editor_close(e); unlink(source); unlink(next);
-    char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s.lock", next) > 0); unlink(lock);
     /* A killed file-write worker can leave its unpublished temp. This fixture
      * owns the directory and cleans those entries without changing file.c. */
     DIR *dir = opendir(root); T(dir); struct dirent *entry;
@@ -249,13 +251,56 @@ static int existing_journal(void)
     T(editor_tab(e, 0)->modified); T(settle(e) == 0);
     T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0); T(disk_is(source, "xbase") == 0);
     editor_close(e); unlink(source); unlink(log);
-    char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s.lock", log) > 0); unlink(lock);
+    char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s/.journal.lock", root) > 0); unlink(lock);
     T(rmdir(root) == 0); return 0;
+}
+static int session_artifacts(void)
+{
+    char root[] = "build/editor-artifacts-XXXXXX"; T(mkdtemp(root));
+    char source[IPC_PATH_CAP], previous[IPC_PATH_CAP] = "";
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    for (unsigned launch = 0; launch < 3; launch++) {
+        char log[IPC_PATH_CAP]; T(snprintf(log, sizeof log, "%s/session-XXXXXX", root) > 0);
+        fd = mkstemp(log); T(fd >= 0); T(fchmod(fd, 0644) == 0); close(fd);
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config config = {.journal_path = log, .start_empty = true, .cols = 32, .rows = 3};
+        editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+        ipc_request request = {.count = 1}; request.paths[0] = (ipc_path){source, 1, 1};
+        T(editor_open_request(e, &request, 0) == 0); T(tabs_count(&e->tabs) == 1);
+        T(settle(e) == 0); editor_close(e);
+        if (*previous) T(access(previous, F_OK) < 0);
+        strcpy(previous, log);
+        DIR *dir = opendir(root); T(dir); struct dirent *entry; unsigned journals = 0;
+        while ((entry = readdir(dir))) if (!strncmp(entry->d_name, "session-", 8)) {
+            struct stat st; T(fstatat(dirfd(dir), entry->d_name, &st, 0) == 0);
+            T(S_ISREG(st.st_mode) && st.st_size > 0 && (st.st_mode & 0777) == 0600);
+            journals++;
+        }
+        T(closedir(dir) == 0 && journals == 1);
+    }
+    /* Conflict during discovery must preserve the previous recovery source
+     * without leaving this launch's empty destination behind. */
+    fd = open(source, O_WRONLY | O_TRUNC); T(fd >= 0);
+    T(write(fd, "changed", strlen("changed")) == (ssize_t)strlen("changed")); close(fd);
+    char failed[IPC_PATH_CAP]; T(snprintf(failed, sizeof failed, "%s/session-XXXXXX", root) > 0);
+    fd = mkstemp(failed); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = failed, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == EDITOR_ERR_IO && !e);
+    T(access(failed, F_OK) < 0 && access(previous, F_OK) == 0);
+    DIR *dir = opendir(root); T(dir); struct dirent *entry;
+    while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+        T(unlinkat(dirfd(dir), entry->d_name, 0) == 0);
+    T(closedir(dir) == 0 && rmdir(root) == 0);
+    puts("editor_session_test: three launches leave one nonempty 0600 journal; failed restore removes empty destination and preserves source");
+    return 0;
 }
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
-    T(unavailable_target_parent() == 0); T(existing_journal() == 0);
+    T(session_artifacts() == 0); T(unavailable_target_parent() == 0); T(existing_journal() == 0);
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);

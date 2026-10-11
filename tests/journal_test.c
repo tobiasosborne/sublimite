@@ -1837,8 +1837,33 @@ static int ck4_generation_test(void)
     puts("P4-3 section 5: abrupt child exit, beyond-prefix rewrite/restored mtime rejected before callbacks");
     return 0;
 }
+static int empty_placeholder_test(void)
+{
+    char path[] = "/tmp/journal-placeholder-XXXXXX"; CHECK(temp(path) >= 0);
+    CHECK(chmod(path, 0644) == 0);
+    work_pool pool; CHECK(work_pool_init(&pool, 1, 0) == 0);
+    journal *j; struct stat st;
+    CHECK(journal_open(&j, path, &pool, NULL) == 0);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+    journal_close_discard_empty(j); CHECK(access(path, F_OK) < 0 && errno == ENOENT);
+    /* The legacy API still permits a caller to retain an empty log. */
+    CHECK(journal_open(&j, path, &pool, NULL) == 0); journal_close(j);
+    CHECK(stat(path, &st) == 0 && st.st_size == 0);
+    CHECK(journal_open(&j, path, &pool, NULL) == 0);
+    CHECK(journal_insert(j, 1, 0, (const uint8_t *)"x", 1) == 0);
+    journal_close_discard_empty(j); CHECK(stat(path, &st) == 0 && st.st_size > 0);
+    CHECK(unlink(path) == 0 && journal_open(&j, path, &pool, NULL) == 0);
+    CHECK(unlink(path) == 0);
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600); CHECK(fd >= 0); close(fd);
+    /* Cleanup must not unlink a different inode installed at the same name. */
+    journal_close_discard_empty(j); CHECK(stat(path, &st) == 0 && st.st_size == 0);
+    CHECK(unlink(path) == 0); work_pool_shutdown(&pool);
+    puts("journal_test: empty placeholder cleanup preserves nonempty/replacement inodes; mode 0600 and legacy empty close passed");
+    return 0;
+}
 int main(int argc, char **argv)
 {
+    if(argc==1) CHECK(empty_placeholder_test()==0);
     if(argc==1) CHECK(ck4_generation_test()==0);
     if(argc==2) {
         if(!strcmp(argv[1],"--ck4-generation")) return ck4_generation_test();

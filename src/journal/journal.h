@@ -177,6 +177,9 @@ int journal_save_finish(journal *j, journal_save *save, const journal_base *save
 int journal_open(journal **out, const char *path, work_pool *pool,
                  const journal_options *options);
 void journal_close(journal *j);
+/* Editor teardown: close normally, then retire an empty owned placeholder.
+ * Nonempty recovery sources and unrelated replacement inodes are preserved. */
+void journal_close_discard_empty(journal *j);
 /* Typing path: no malloc, locks, sync, or worker submission. Encode+CRC and one
  * bounded pwrite per record on this calling thread; OK means the complete
  * record is in the kernel page cache, so process crash loses no successful

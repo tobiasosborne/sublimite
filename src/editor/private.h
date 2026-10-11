@@ -85,7 +85,7 @@ struct editor {
     journal *journal;
     editor_session *session;
     int session_lock;
-    bool recovering, startup_restored, save_flushing, recover_existing;
+    bool recovering, startup_restored, save_flushing, recover_existing, session_lock_owned;
     work_pool pool, journal_pool;
     bool journal_pool_ready;
     uint8_t journal_scratch[JOURNAL_INSERT_SLICE_BYTES];

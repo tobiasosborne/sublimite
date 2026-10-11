@@ -224,3 +224,121 @@ Gate values are existing G1 constants, not new bounds.
   here. The corrected leaks-disabled replay CLI contract passed.
 
 The worker stops after this assigned bead. No other backlog items were fixed.
+
+## 2026-10-11 — CLI journal artifact regression continuation
+
+No git or bd commands were run. Production and test compilation used the
+unchanged Makefile's C11 `-Wall -Wextra -Werror -Wshadow -Wconversion` flags.
+Logs and the standalone headless reproduction are in `build/ck4-journal-fix/`.
+
+### Cause and reproduction
+
+The reported assertion encountered a **lock sidecar**, not an empty replayable
+journal or a journal with incorrect permissions. `editor_session_restore`
+created `session-<random>.lock` with size zero and mode 0600. CLI enumeration
+counted every non-hidden entry as a journal. A null-backend reproduction of
+three startup/clean-close cycles confirmed the following before the fix:
+
+```
+launch 1: session-rFKDOj size=4096 mode=600; session-rFKDOj.lock size=0 mode=600
+launch 2: session-XyrEO7 size=8192 mode=600; session-XyrEO7.lock size=0 mode=600
+launch 3: session-RqlQtQ size=8192 mode=600; session-RqlQtQ.lock size=0 mode=600
+```
+
+The original `journals == 3` expectation is also genuinely obsolete: later
+launches restore the same session and publish a durable replacement checkpoint
+before retiring the previous journal. Retaining three copies of that session
+would contradict the requested absence of duplicate restored-session journals.
+`tests/cli_test.c` now expects exactly **one** journal after these three
+sequential launches. Its nonempty/mode-0600 assertion is unchanged; fixture
+cleanup also removes the hidden leases. This is not an allowance for empty or
+extra journals.
+
+### Fix
+
+- Stable leases are named `.session-<random>.lock` (or `.journal.lock` for an
+  explicit journal), outside the discoverable `session-*` artifact namespace.
+  They remain stable across atomic rotation and clean close; retaining their
+  inode preserves exclusion between live instances.
+- New `journal_close_discard_empty` settles workers and removes only an empty
+  file whose inode/device still match the journal's owned descriptor. It uses
+  the retained directory descriptor and syncs successful removal. Nonempty
+  sources, including failed recovery sources, and unrelated replacement inodes
+  survive. The legacy `journal_close` empty-file behavior remains intact.
+  Editor teardown uses this cleanup only when it owns the session lease (or
+  when the explicit journal does not require one).
+- `main` removes its own still-empty mkstemp inode when backend/platform setup
+  fails before the editor takes ownership. Recovery checkpoints are preserved.
+- Opening an empty journal enforces 0600, including existing placeholders with
+  broader permissions. Replacement checkpoint temporaries also enforce 0600.
+- Headless regressions cover three clean sessions leaving exactly one nonempty
+  0600 journal, restored tab reuse, conflict teardown removing the empty new
+  destination while preserving the old source, and cleanup preserving nonempty
+  and replacement inodes. Existing legacy-empty close behavior is verified.
+  Recovery fixtures clean up their hidden sidecars.
+
+Final standalone reproduction (`lifecycle-after.log`):
+
+```
+launch 1: session-dGKqMV size=4096 mode=600; .session-dGKqMV.lock size=0 mode=600
+launch 2: session-GkR73K size=8192 mode=600; .session-GkR73K.lock size=0 mode=600
+launch 3: session-CNSsNf size=8192 mode=600; .session-CNSsNf.lock size=0 mode=600
+```
+
+The zero-byte hidden entries are flock leases, not journal data. Each launch
+leaves one replayable journal; successful recovery retires the prior one.
+A production `sublimite --new-instance` launch with an invalid backend and an
+isolated XDG_DATA_HOME exited 1 as expected and left **no files** in that root
+(`backend-failure.log`).
+
+### Final-source outputs
+
+All sanitizer invocations below used `ASAN_OPTIONS=detect_leaks=0`:
+
+```
+$ build/san/tests/journal_test
+journal_test: empty placeholder cleanup preserves nonempty/replacement inodes; mode 0600 and legacy empty close passed
+journal_test: ok (roundtrip, corruption, torn pages, straddles, base conflict, rotation, allocator, back-pressure)
+exit=0
+$ build/san/tests/savectl_test
+savectl_test: ok
+exit=0
+$ build/san/tests/editor_session_test
+editor_session_test: three launches leave one nonempty 0600 journal; failed restore removes empty destination and preserves source
+editor_session_test: headless save/repeated/new-target, cutoff edits, shared targets, inactive failure, interrupted-save startup, Saving acknowledgement, allocation guard passed
+exit=0
+$ build/san/tests/editor_test --ck4-startup
+ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed
+exit=0
+$ build/san/tests/editor_test --ck4-save
+P4-3 section 3: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+exit=0
+$ make -j4 all
+exit=0
+```
+
+The requested full `editor_test` was run directly on safe `DISPLAY=:99` and
+exited 1. Its new startup/save probes passed; existing IPC/native checks failed:
+
+```
+reload launcher result=4
+editor_test:964: FAIL waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0
+editor_test:355: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:381: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:663: FAIL editor_open(&e, &cfg, &backend) == 0
+editor_test:1319: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:1936: FAIL review_suite(NULL) == 0
+```
+
+The display-lock wrapper separately refused to launch it because :99 was held
+externally (`editor.log`). No lock owner was disturbed. Direct syscall probes
+confirmed this sandbox's additional restrictions (`socket-probe.log`):
+
+```
+AF_UNIX bind: errno=1 Operation not permitted
+Xvfb :99 connect: errno=1 Operation not permitted
+```
+
+The sanitized CLI test was rebuilt successfully; its native execution remains
+for the coordinator, as requested. No full editor/native acceptance is claimed
+from this restricted environment.

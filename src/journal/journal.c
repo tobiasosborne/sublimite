@@ -450,6 +450,7 @@ int journal_open_with_io(journal **out, const char *path, work_pool *pool, const
     int rc=journal_path(path,canonical,&name_offset,&dfd); if(rc) return rc;
     int fd=openat(dfd,canonical+name_offset,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600); struct stat sb;
     if(fd<0 || fstat(fd,&sb) || !S_ISREG(sb.st_mode) || sb.st_size!=0) rc=fd<0?JOURNAL_IO:JOURNAL_INVALID;
+    else if(fchmod(fd,0600)) rc=JOURNAL_IO;
     else rc=journal_create(out,canonical,name_offset,fd,dfd,pool,options,io);
     if(rc) { if(fd>=0) close(fd); close(dfd); } return rc;
 }
@@ -718,13 +719,22 @@ int journal_flush(journal *j)
         delay();
     }
 }
-void journal_close(journal *j)
+static void close_journal(journal *j, bool discard_empty)
 {
     if(!j) return;
     (void)journal_flush(j);
     if(j->active) { work_cancel(j->pool,j->handle); while(atomic_load_explicit(&j->pool->slots[j->handle.slot].busy,memory_order_acquire)) delay(); }
+    if(discard_empty) {
+        struct stat owned,named;
+        if(!fstat(j->disk.fd,&owned) && S_ISREG(owned.st_mode) && !owned.st_size &&
+           !fstatat(j->directory_fd,j->name,&named,AT_SYMLINK_NOFOLLOW) &&
+           owned.st_dev==named.st_dev && owned.st_ino==named.st_ino &&
+           !unlinkat(j->directory_fd,j->name,0)) (void)io_sync(&j->io,j->directory_fd,true);
+    }
     close(j->disk.fd); close(j->directory_fd); edit_arena a=j->arena; edit_arena_free(&a);
 }
+void journal_close(journal *j) { close_journal(j,false); }
+void journal_close_discard_empty(journal *j) { close_journal(j,true); }
 /* Exact transport size, with the same batch packing/PAD strategy as build.
  * Validate the entire checkpoint before creating anything or growing a limit. */
 static int checkpoint_size(const journal *j, const journal_record *records, size_t count, uint64_t *bytes)
@@ -750,6 +760,9 @@ static int checkpoint_temp(const journal *j, char *name, size_t cap)
         int n=snprintf(name,cap,".sublimite-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
         if(n<0 || (size_t)n>=cap) return -1;
         int fd=openat(j->directory_fd,name,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+        if(fd>=0 && fchmod(fd,0600)) {
+            close(fd); (void)unlinkat(j->directory_fd,name,0); return -1;
+        }
         if(fd>=0 || errno!=EEXIST) return fd;
     }
     return -1;

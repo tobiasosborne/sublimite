@@ -49,7 +49,14 @@ void editor_close(editor *e)
     if (!e) return;
     if (e->journal && !e->recovering) (void)editor_flush(e);
     editor_session_close(e);
-    if (e->journal) { journal_close(e->journal); e->journal = NULL; }
+    if (e->journal) {
+        /* A failed startup can close before any BASE/metadata was admitted.
+         * Such a placeholder carries no recovery state. Nonempty sources,
+         * including failed restores, must survive teardown. */
+        if (e->session_lock < 0 || e->session_lock_owned) journal_close_discard_empty(e->journal);
+        else journal_close(e->journal); /* another editor owns the session */
+        e->journal = NULL;
+    }
     if (e->session_lock >= 0) close(e->session_lock);
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);

@@ -2174,7 +2174,10 @@ static int ck4_startup(void)
     replay_model model = {0}; journal_replay_result result;
     T(journal_replay_file(logs[1], ck4_restore, &model, &result) == 0);
     T(model.len == strlen("xbase") && !memcmp(model.bytes, "xbase", model.len));
-    unlink(source); unlink(logs[0]); unlink(logs[1]); rmdir(root);
+    char lock[IPC_PATH_CAP];
+    T(snprintf(lock, sizeof lock, "%s/.%s.lock", root, strrchr(logs[1], '/') + 1) > 0);
+    T(unlink(lock) == 0);
+    unlink(source); unlink(logs[0]); unlink(logs[1]); T(rmdir(root) == 0);
     puts("ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed");
     return 0;
 }

@@ -236,13 +236,19 @@ static int run_cli_suite(void)
     T(ran == 0);
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
+        if (!strncmp(entry->d_name, ".session-", 9)) {
+            T(unlinkat(dirfd(d), entry->d_name, 0) == 0);
+            continue;
+        }
         if (entry->d_name[0] == '.') continue;
         T(strncmp(entry->d_name, "session-", 8) == 0);
         char path[4097]; T(snprintf(path, sizeof path, "%s/%s", dir, entry->d_name) > 0);
         struct stat st; T(stat(path, &st) == 0 && st.st_size > 0 && (st.st_mode & 0777) == 0600);
         journals++; T(unlink(path) == 0);
     }
-    T(journals == 3); closed = closedir(d); d = NULL; T(closed == 0 && rmdir(dir) == 0);
+    /* Each later launch restores and durably replaces the previous session;
+     * the three launches must leave one journal, not duplicate recovery state. */
+    T(journals == 1); closed = closedir(d); d = NULL; T(closed == 0 && rmdir(dir) == 0);
     char decoy_lock[4097]; (void)snprintf(decoy_lock, sizeof decoy_lock, "%s/sublimite-%lu.lock", root, (unsigned long)getuid());
     (void)unlink(decoy_lock);
     d = opendir(root); T(d != NULL);
@@ -273,7 +279,7 @@ cleanup:
         if (d) {
             struct dirent *leftover;
             while ((leftover = readdir(d))) {
-                if (leftover->d_name[0] == '.') continue;
+                if (!strcmp(leftover->d_name, ".") || !strcmp(leftover->d_name, "..")) continue;
                 (void)unlinkat(dirfd(d), leftover->d_name, 0);
             }
             (void)closedir(d);

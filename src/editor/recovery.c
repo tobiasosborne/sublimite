@@ -204,16 +204,25 @@ static int install_session(editor *e, recovered_session *s)
     if (!rc) editor_session_metadata(e);
     return rc;
 }
+/* A lease is infrastructure, not a replayable session artifact. Keep its
+ * stable inode across checkpoint rotations and clean closes. */
+static int lock_name(char *out, size_t cap, const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    size_t parent = slash ? (size_t)(slash - path) + 1 : 0;
+    int n = snprintf(out, cap, "%.*s.%s.lock", (int)parent, path, path + parent);
+    return n < 0 || (size_t)n >= cap ? EDITOR_ERR_ARG : 0;
+}
 int editor_session_restore(editor *e)
 {
     const char *path = e->cfg.journal_path;
     const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
     if (!e->recover_existing && strncmp(name, "session-", strlen("session-"))) return 0;
     char lock_path[IPC_PATH_CAP];
-    int lock_size = snprintf(lock_path, sizeof lock_path, "%s.lock", path);
-    if (lock_size < 0 || (size_t)lock_size >= sizeof lock_path) return EDITOR_ERR_ARG;
+    if (lock_name(lock_path, sizeof lock_path, path)) return EDITOR_ERR_ARG;
     e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
+    e->session_lock_owned = true;
     char directory[IPC_PATH_CAP]; strcpy(directory, path);
     char *slash = strrchr(directory, '/');
     if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
@@ -238,8 +247,7 @@ int editor_session_restore(editor *e)
             if (fd < 0) continue;
             struct stat st;
             if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_size) { close(fd); continue; }
-            int lock_n = snprintf(lock_path, sizeof lock_path, "%s.lock", candidate);
-            if (lock_n < 0 || (size_t)lock_n >= sizeof lock_path) { close(fd); continue; }
+            if (lock_name(lock_path, sizeof lock_path, candidate)) { close(fd); continue; }
             int lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
             close(fd); fd = lock;
             if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) { if (fd >= 0) close(fd); continue; }
@@ -262,8 +270,7 @@ int editor_session_restore(editor *e)
     if (!rc && session.buffers) {
         if (!e->recover_existing && unlink(previous)) rc = EDITOR_ERR_IO;
         else if (!e->recover_existing) {
-            int n = snprintf(lock_path, sizeof lock_path, "%s.lock", previous);
-            if (n > 0 && (size_t)n < sizeof lock_path) (void)unlink(lock_path);
+            if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
         }
         int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0 || fsync(fd)) rc = EDITOR_ERR_IO;
