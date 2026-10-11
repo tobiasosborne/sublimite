@@ -5,6 +5,19 @@ The checked-in Astra review withdrew the original anchor-loss finding. Existing 
 Focused gcc and clang ASan/UBSan regressions pass; the deliberately injected anchor reset fails the new assertion, and input.c was restored byte-for-byte. GCC `make all` passes. Broader sandbox validation and coordinator reruns are recorded in the [worker report](../../docs/worker-reports/edit-gdj.md). The other keyboard beads were left for separate workers under the binding scope rule.
 
 [Decision record](../../docs/decisions/edit-gdj.md).
+# edit-cde — clipboard integration
+
+Copy/cut/paste actions, alternate key bindings, selection-driven PRIMARY,
+positioned middle-click paste, arena-backed native/null ownership and worker
+normalization/capture are implemented. Replacement/cut share an explicit undo
+group and bounded mutation/journal helpers. Native allocator callbacks preserve
+borrowed and deferred ownership lifetimes; buffer retirement pins snapshots.
+
+Clipboard acceptance is green under clang ASan/UBSan and gcc release with the
+active malloc guard. The release tree builds. Full-check restrictions and exact
+red/green evidence are recorded in [the worker report](../../docs/worker-reports/edit-cde.md).
+Display/native transport, IPC-dependent suites and the next Astra comparison
+must be rerun by the coordinator. No paint.c, large.c or save-path edits.
 
 # edit-ck4 — session 9
 

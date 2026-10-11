@@ -2,6 +2,7 @@
  * real X transport. Including the implementation avoids production test hooks. */
 #include "../src/x11/clip.c"
 #include <stdio.h>
+#include "base/base.h"
 
 #define REQUIRE(x, message) do { if (!(x)) { fprintf(stderr, "FAIL: %s\n", message); return false; } } while (0)
 typedef struct fixture { plat p; x11_input in; } fixture;
@@ -214,9 +215,56 @@ static bool eager_aligned_pool(void) {
     REQUIRE((uintptr_t)CL(&f.p)->pool % _Alignof(work_pool) == 0, "clipboard pool has required alignment");
     fixture_destroy(&f); return true;
 }
+typedef struct clip_allocator_probe {
+    edit_arena arena;
+    size_t bytes, released;
+    bool exact;
+} clip_allocator_probe;
+static void *probe_alloc(void *ctx, size_t bytes) {
+    clip_allocator_probe *probe = ctx; probe->bytes = bytes;
+    return edit_arena_alloc(&probe->arena, bytes, _Alignof(clip_blob));
+}
+static void probe_free(void *ctx, void *ptr, size_t bytes) {
+    clip_allocator_probe *probe = ctx;
+    probe->exact = ptr == probe->arena.base && bytes == probe->bytes;
+    probe->released++;
+}
+static bool allocator_buffers(bool display) {
+    const char text[] = "arena clipboard";
+    clip_allocator_probe probe = {0};
+    /* Exact reservation = opaque header (visible in this white-box suite)
+     * plus fixture bytes. Release count derives from this sole allocation. */
+    REQUIRE(edit_arena_init(&probe.arena, sizeof(clip_blob) + sizeof text) == 0, "arena init");
+    x11_clip_buf *b = x11_clip_buf_new_alloc(sizeof text - 1, probe_alloc, probe_free, &probe);
+    REQUIRE(b && x11_clip_buf_len(b) == sizeof text - 1, "allocator blob length");
+    memcpy(x11_clip_buf_data(b), text, sizeof text - 1);
+    if (display) {
+        fixture f; REQUIRE(fixture_init(&f), "fixture");
+        REQUIRE(x11_clip_set_buf(&f.p, PLAT_CLIP_CLIPBOARD, b) == PLAT_OK, "arena adoption");
+        REQUIRE(probe.released == 0, "adoption retains arena bytes");
+        CL(&f.p)->claiming[0] = 0; CL(&f.p)->owner_deadline[0] = 0; CL(&f.p)->confirmed[0] = true;
+        REQUIRE(plat_clip_request(&f.p, 0) == PLAT_OK && x11_clip_poll(&f.p), "arena local paste");
+        plat_event ev; REQUIRE(x11_q_pop(&f.in, &ev) && ev.clip_ok, "arena paste event");
+        size_t len; const uint8_t *got = plat_clip_data(&f.p, &len);
+        REQUIRE(len == sizeof text - 1 && !memcmp(got, text, len), "arena paste exact");
+        REQUIRE(local_set(&f, 0, "next", sizeof "next" - 1), "replace arena owner");
+        REQUIRE(probe.released == 0 && !memcmp(got, text, len), "borrow pins replaced owner");
+        fixture_destroy(&f);
+    } else x11_clip_buf_free(b);
+    REQUIRE(probe.released == 1 && probe.exact, "allocator release exact and once");
+    edit_arena_free(&probe.arena); return true;
+}
 int main(int argc, char **argv) {
     bool all = argc == 1;
     trace_init(); trace_thread_register();
+    if (!all && !strcmp(argv[1], "--allocator-only")) {
+        if (!allocator_buffers(false)) return 1;
+        puts("clipboard arena allocator: PASS"); return 0;
+    }
+    if (all || !strcmp(argv[1], "--allocator")) {
+        if (!allocator_buffers(true)) return 1;
+        puts("clipboard arena adoption/borrow/release: PASS");
+    }
     if (all || !strcmp(argv[1], "1")) { if (!borrowed_paste()) return 1; puts("clipboard review §1: PASS"); }
     if (all || !strcmp(argv[1], "26")) { if (!completion_batches() || !deferred_failures() || !remote_partial_batch()) return 1; puts("clipboard review §26: PASS"); }
     if (all || !strcmp(argv[1], "27")) { if (!saturated_multiple()) return 1; puts("clipboard review §27: PASS"); }

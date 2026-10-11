@@ -56,8 +56,10 @@ typedef struct editor_buffer {
     ipc_token wait_token;
 } editor_buffer;
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
-typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK } editor_action;
+typedef struct editor_clip editor_clip;
+typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
 struct editor {
+    editor_clip *clipboard;
     editor_config cfg;
     editor_stats stats;
     edit_arena arena;
@@ -135,6 +137,23 @@ struct editor {
     int error;
 };
 /* Internal cross-file helpers; UI only. */
+int editor_clip_init(editor *e);
+void editor_clip_stop(editor *e);
+void editor_clip_close(editor *e);
+void editor_clip_selection(editor *e);
+int editor_clip_action(editor *e, keys_action action, const plat_event *ev);
+int editor_clip_event(editor *e, const plat_event *ev);
+int editor_clip_poll(editor *e);
+bool editor_clip_busy(const editor *e);
+bool editor_clip_pending(const editor *e);
+bool editor_clip_runnable(const editor *e);
+bool editor_clip_holds(const editor *e, const editor_buffer *b);
+int editor_clip_continue(editor *e);
+int editor_replace_begin(editor *e, size_t len);
+int editor_replace_delete(editor *e, uint64_t off, uint64_t len);
+int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t len);
+int editor_replace_end(editor *e, uint64_t target);
+
 bool editor_activation_busy(const editor *e);
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);

@@ -111,7 +111,7 @@ void editor_retire_buffers(editor *e)
         /* file_close has no public logical-retirement/physical-ready split.
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
-        if (b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
+        if (editor_clip_holds(e, b) || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
         editor_buffer_destroy(b); e->buffers[i] = NULL;
@@ -265,7 +265,7 @@ static editor_buffer *find_buffer(editor *e, piece_tree *tree)
     return e->empty;
 }
 bool editor_activation_busy(const editor *e)
-{ return view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
+{ return editor_clip_busy(e) || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
 int editor_activate(editor *e)
 {
     if (editor_activation_busy(e)) return EDITOR_ERR_ARG;

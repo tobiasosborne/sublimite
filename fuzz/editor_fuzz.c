@@ -73,6 +73,7 @@ static size_t at_column(const model *m, size_t start, size_t col)
     return pos;
 }
 static void p4_ops(const uint8_t *data, size_t size);
+static void clipboard_ops(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size > MODEL_STEPS * 4u) size = MODEL_STEPS * 4u;
@@ -151,7 +152,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         EDIT_ASSERT(s.cursor == m.cursor && s.anchor == m.anchor);
     }
-    editor_close(e); p4_ops(data, size); return 0;
+    editor_close(e); p4_ops(data, size); clipboard_ops(data, size); return 0;
 }
 
 /* Independent ASCII oracle for the integrated tab/IPC/indent path. The legacy
@@ -243,6 +244,60 @@ static void p4_ops(const uint8_t *data, size_t size)
             uint8_t actual[MODEL_BYTES]; EDIT_ASSERT(editor_read(e, 0, actual, m->len) == 0 && !memcmp(actual, m->bytes, m->len));
             EDIT_ASSERT(editor_view(e).selection.cursor == m->cursor);
         } else EDIT_ASSERT(editor_length(e) == 0);
+    }
+    editor_close(e);
+}
+
+/* Clipboard oracle derives storage/steps from the existing bounded model.
+ * ASCII fixture keeps arbitrary selected byte positions grapheme boundaries. */
+static void clipboard_ops(const uint8_t *data, size_t size)
+{
+    const char initial[] = "clipboard\r\ntext";
+    render_backend backend = {0}; EDIT_ASSERT(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1,
+        .cols = 32, .rows = 8, .wrap_mode = -1, .history_keys = MODEL_STEPS};
+    editor *e = NULL; EDIT_ASSERT(editor_open(&e, &cfg, &backend) == 0); settle(e);
+    model m = {.len = sizeof initial - 1}; memcpy(m.bytes, initial, m.len);
+    uint8_t clipboard[MODEL_BYTES]; size_t clipboard_len = 0;
+    for (size_t i = 0; i + 3 < size; i += 4) {
+        size_t anchor = data[i + 1] % (m.len + 1), cursor = data[i + 2] % (m.len + 1);
+        /* CRLF is one grapheme; keep selection endpoints outside its interior. */
+        if (anchor && anchor < m.len && m.bytes[anchor - 1] == '\r' && m.bytes[anchor] == '\n') anchor++;
+        if (cursor && cursor < m.len && m.bytes[cursor - 1] == '\r' && m.bytes[cursor] == '\n') cursor++;
+        EDIT_ASSERT(editor_set_cursor(e, anchor) == 0); settle(e);
+        while (editor_view(e).selection.cursor != cursor) {
+            bool right = editor_view(e).selection.cursor < cursor;
+            plat_event move = {.kind = PLAT_EV_KEY, .press = true, .mods = PLAT_MOD_SHIFT,
+                .keysym = right ? XKB_KEY_Right : XKB_KEY_Left};
+            EDIT_ASSERT(editor_inject(e, &move) == 0); settle(e);
+        }
+        m.cursor = cursor; m.anchor = anchor; model before = m;
+        size_t at = lo(&m), selected = hi(&m) - at;
+        unsigned op = data[i] % 3u; /* copy, cut, paste */
+        bool mutation = false;
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .mods = PLAT_MOD_CTRL,
+            .keysym = op == 0 ? 'c' : op == 1 ? 'x' : 'v'};
+        if (op != 2 && selected) {
+            memcpy(clipboard, m.bytes + at, selected); clipboard_len = selected;
+            if (op == 1) { replace(&m, at, selected, NULL, 0); mutation = true; }
+        } else if (op == 2 && clipboard_len) {
+            uint8_t normalized[MODEL_BYTES]; size_t n = 0;
+            for (size_t j = 0; j < clipboard_len; j++) {
+                if (clipboard[j] == '\r' && j + 1 < clipboard_len && clipboard[j + 1] == '\n') continue;
+                normalized[n++] = clipboard[j];
+            }
+            if (n > MODEL_BYTES - (m.len - selected)) continue;
+            replace(&m, at, selected, normalized, n); mutation = true;
+        }
+        EDIT_ASSERT(editor_inject(e, &ev) == 0); settle(e);
+        uint8_t got[MODEL_BYTES]; EDIT_ASSERT(editor_length(e) == m.len);
+        EDIT_ASSERT(editor_read(e, 0, got, m.len) == 0 && !memcmp(got, m.bytes, m.len));
+        if (mutation && (data[i + 3] & 1u)) {
+            ev.keysym = 'z'; EDIT_ASSERT(editor_inject(e, &ev) == 0); settle(e); m = before;
+            EDIT_ASSERT(editor_length(e) == m.len);
+            EDIT_ASSERT(editor_read(e, 0, got, m.len) == 0 && !memcmp(got, m.bytes, m.len));
+            EDIT_ASSERT(editor_view(e).selection.cursor == m.cursor && editor_view(e).selection.anchor == m.anchor);
+        }
     }
     editor_close(e);
 }

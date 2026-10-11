@@ -280,6 +280,39 @@ static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text
 }
 static int mutate(editor *e, uint64_t lo, uint64_t old, const uint8_t *text, size_t n, undo_kind kind)
 { return mutate_text(e, lo, old, text, n, kind, TEXT_BYTES); }
+int editor_replace_begin(editor *e, size_t len)
+{
+    uint64_t lo = min64(e->old_selection.cursor, e->old_selection.anchor);
+    uint64_t old = max64(e->old_selection.cursor, e->old_selection.anchor) - lo;
+    int rc = check_index_edit(e, lo, old, len); if (rc) return rc;
+    undo_state before = save_selection(&e->v);
+    undo_break_burst(e->undo);
+    rc = undo_group_begin(e->undo, &before); if (rc) return rc;
+    e->explicit_group = true;
+    e->edit_delta = (editor_delta){.off = lo, .before = before};
+    return 0;
+}
+int editor_replace_delete(editor *e, uint64_t off, uint64_t len)
+{
+    int rc = delete_part(e, off, len, UNDO_DELETE, &e->edit_delta.before);
+    return rc ? prefix_error(e, rc) : 0;
+}
+int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t len)
+{
+    undo_state after = e->edit_delta.before;
+    uint64_t target = off + len, nl = 0;
+    memcpy(after.bytes, &target, sizeof target);
+    memcpy(after.bytes + sizeof target, &target, sizeof target);
+    for (size_t i = 0; i < len; i++) nl += bytes[i] == '\n' ? 1u : 0u;
+    int rc = undo_insert(e->undo, off, bytes, len, e->edit_time_ns, &e->edit_delta.before, &after);
+    if (rc) return prefix_error(e, rc);
+    e->edit_delta.add += len;
+    e->v.state.selection.cursor = e->v.state.selection.anchor = target;
+    rc = stage_insert(e, off, bytes, len);
+    if (!rc) rc = changed(e, off, 0, len, 0, nl);
+    return rc ? prefix_error(e, rc) : 0;
+}
+int editor_replace_end(editor *e, uint64_t target) { return repair(e, target); }
 static int replay_slice(editor *e)
 {
     editor_delta d = e->replay_delta; bool redo = e->replay_redo;
@@ -337,6 +370,7 @@ static bool move_key(keys_action action, view_key *out)
 }
 int editor_continue_action(editor *e)
 {
+    if (e->action == EDITOR_ACTION_CLIP) return editor_clip_continue(e);
     if (e->action == EDITOR_ACTION_REPLAY_WORK) return replay_slice(e);
     view_change c; int rc = view_continue(&e->v, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
@@ -408,6 +442,8 @@ int editor_handle_key(editor *e, const plat_event *ev)
     bool text = action == KEYS_ACTION_INSERT || (result == KEYS_NONE && ev->utf8_len &&
         !(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER)) &&
         (!(ev->mods & PLAT_MOD_ALT) || (ev->mods & PLAT_MOD_ALTGR)));
+    if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT || action == KEYS_ACTION_PASTE)
+        return editor_clip_action(e, action, ev);
     if (!moving && !back && !del && !undo && !redo && !tab && !text) {
         if (binding) e->stats.unimplemented_actions++;
         if (action == KEYS_ACTION_CANCEL || e->tabs.cycling) tabs_mru_release(&e->tabs);

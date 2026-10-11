@@ -2176,6 +2176,172 @@ static int ck4_target(void)
     T(journal_replay_file(log,ck4_target_visit,&found,&result)==0); unlink(log); T(found);
     puts("P4-3 section 7: missing named target association persisted independently of empty content BASE"); return 0;
 }
+/* edit-cde fixtures derive byte offsets from the strings themselves; window
+ * dimensions reuse the existing script fixture. No timing threshold added. */
+static int clipboard_test(bool native)
+{
+    const char original[] = "a\r\n中";
+    const char normal[] = "a\n中";
+    render_backend backend = {0};
+    T((native ? render_cpu_backend(&backend) : render_null_backend(&backend)) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)original,
+        .initial_len = sizeof original - 1, .cols = 32, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    edit_malloc_guard_begin();
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    plat_event copy = key('c', PLAT_MOD_CTRL, NULL); copy.t0_ns = trace_now_ns();
+    T(press(e, copy) == 0); T(e->edit_time_ns == copy.t0_ns);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('v', PLAT_MOD_CTRL, NULL)) == 0);
+    const char doubled[] = "a\r\n中a\n中";
+    T(expect(e, doubled, sizeof doubled - 1) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('x', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "", 0) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1) == 0);
+    T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_Insert, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(expect(e, normal, sizeof normal - 1) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1) == 0);
+    T(press(e, key(XKB_KEY_Insert, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Delete, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(expect(e, "", 0) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
+        .x = -1, .y = -1}; /* Synthetic request at the current cursor. */
+    T(press(e, middle) == 0); T(expect(e, doubled, sizeof doubled - 1) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1) == 0);
+    T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == 0); /* select final UTF-8 cluster */
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    middle.x = (int32_t)((e->lay.gw + 1) * e->grid.dims.cell_w); /* after fixture's 'a' */
+    middle.y = (int32_t)(e->tab_rows * e->grid.dims.cell_h);
+    T(press(e, middle) == 0);
+    const char inserted_primary[] = "a中\r\n中";
+    T(expect(e, inserted_primary, sizeof "a中" - 1) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('v', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, doubled, sizeof doubled - 1) == 0); /* PRIMARY change leaves CLIPBOARD intact */
+    T(editor_get_stats(e).unimplemented_actions == 0);
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) T(allocations == 0);
+    printf("clipboard malloc guard: %zu allocations (%s); expected zero by law\n", allocations,
+        edit_malloc_guard_active() ? "active" : "ASan-inert");
+    editor_close(e); puts("clipboard: null round trip, UTF-8/CRLF, replacement, cut/undo, alternate keys, PRIMARY passed");
+    return 0;
+}
+static int clipboard_middle_long_test(void)
+{
+    /* Beyond one existing view window: the click must use the actual visible
+     * column, and selecting a tab uses its absolute logical-line column. */
+    size_t len = 2u * VIEW_WINDOW;
+    uint8_t *bytes = malloc(len), *got = malloc(len + 1); T(bytes && got);
+    memset(bytes, 'a', len); bytes[len - 1] = 'p';
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, len) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    uint64_t target = editor_view(e).hscroll; T(target > VIEW_WINDOW);
+    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
+        .x = (int32_t)(e->lay.gw * e->grid.dims.cell_w),
+        .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h)};
+    T(press(e, middle) == 0);
+    T(editor_view(e).selection.cursor == target + 1);
+    T(editor_length(e) == len + 1); T(editor_read(e, 0, got, len + 1) == 0);
+    T(!memcmp(got, bytes, (size_t)target)); T(got[target] == 'p');
+    T(!memcmp(got + target + 1, bytes + target, len - (size_t)target));
+    editor_close(e);
+    len = (VIEW_WINDOW - 1) + sizeof "\r\np" - 1;
+    memset(bytes, 'a', len); bytes[VIEW_WINDOW - 1] = '\r'; bytes[VIEW_WINDOW] = '\n'; bytes[VIEW_WINDOW + 1] = 'p';
+    cfg.initial_len = len; memset(&backend, 0, sizeof backend); T(render_null_backend(&backend) == 0);
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, len) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_set_cursor(e, VIEW_WINDOW - 1) == 0); T(settle(e) == 0);
+    e->v.state.hscroll = VIEW_WINDOW - 1; T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    middle.x = (int32_t)((e->lay.gw + 1) * e->grid.dims.cell_w);
+    T(press(e, middle) == 0); T(editor_view(e).selection.cursor == VIEW_WINDOW);
+    T(editor_read(e, VIEW_WINDOW - 1, got, sizeof "p\r\np" - 1) == 0);
+    T(!memcmp(got, "p\r\np", sizeof "p\r\np" - 1));
+    editor_close(e); free(got); free(bytes);
+    puts("clipboard middle click: deep horizontal position exact"); return 0;
+}
+static int clipboard_large_test(void)
+{
+    /* MiB crossover comes from the bead; an additional existing view window
+     * exercises continuation and a CRLF spanning adjacent worker slices. */
+    size_t len = 1024u * 1024u + VIEW_SCAN_BOUND;
+    uint8_t *bytes = malloc(len), *got = malloc(len); T(bytes && got);
+    memset(bytes, 'a', len); bytes[VIEW_SCAN_BOUND - 1] = '\r'; bytes[VIEW_SCAN_BOUND] = '\n';
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    char log[] = "build/cde-clipboard-XXXXXX"; int fd = mkstemp(log); T(fd >= 0); close(fd);
+    editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 8,
+        .wrap_mode = -1, .journal_path = log};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('c', PLAT_MOD_CTRL, NULL)) == 0);
+    uint64_t target; T(editor_add_buffer(e, NULL, (const uint8_t *)"target", sizeof "target" - 1, &target) == 0);
+    T(settle(e) == 0); T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    review_hold hold = {0}; work_handle held = work_submit(&e->pool,
+        (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(held.epoch);
+    while (!atomic_load(&hold.entered)) sched_yield();
+    edit_malloc_guard_begin();
+    T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY, .press = true,
+        .keysym = 'v', .mods = PLAT_MOD_CTRL}) == 0);
+    T(editor_step(e, 0) >= 0);
+    T(editor_get_stats(e).pending); T(editor_length(e) == sizeof "target" - 1);
+    T(e->stats.submitted_sequence < e->stats.input_sequence); /* no unchanged paste acknowledgement */
+    /* UI returns while normalization is queued behind unrelated bulk work. */
+    atomic_store(&hold.release, true); T(settle(e) == 0);
+    T(editor_length(e) == len - 1); T(editor_read(e, 0, got, len - 1) == 0);
+    T(!memcmp(got, bytes, VIEW_SCAN_BOUND - 1));
+    T(!memcmp(got + VIEW_SCAN_BOUND - 1, bytes + VIEW_SCAN_BOUND, len - VIEW_SCAN_BOUND));
+    T(undo_get_history(e->undo).undo_groups == 1); /* one paste command */
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "target", sizeof "target" - 1) == 0);
+    T(editor_view(e).selection.anchor == 0);
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) T(allocations == 0);
+    T(editor_flush(e) == 0);
+    editor_close(e); unlink(log); free(got); free(bytes);
+    printf("clipboard bulk: worker queue, cross-slice CRLF, replacement/undo, journal, mallocs=%zu passed\n", allocations);
+    return 0;
+}
+static int clipboard_pending_primary_test(void)
+{
+    /* Cross the existing scan bound so selection capture must use a worker. */
+    size_t len = VIEW_SCAN_BOUND + 1;
+    uint8_t *bytes = malloc(len), *got = malloc(2u * len); T(bytes && got); memset(bytes, 'p', len);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    review_hold hold = {0}; work_handle held = work_submit(&e->pool,
+        (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(held.epoch);
+    while (!atomic_load(&hold.entered)) sched_yield();
+    plat_event select = key('a', PLAT_MOD_CTRL, NULL), move = key(XKB_KEY_End, PLAT_MOD_CTRL, NULL);
+    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2, .x = -1, .y = -1};
+    edit_malloc_guard_begin();
+    T(editor_inject(e, &select) == 0); T(editor_inject(e, &move) == 0); T(editor_inject(e, &middle) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle guard */
+    while (e->queue_count || view_busy(&e->v)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(editor_length(e) == len); atomic_store(&hold.release, true); T(settle(e) == 0);
+    T(editor_length(e) == 2u * len); T(editor_read(e, 0, got, 2u * len) == 0);
+    T(!memcmp(got, bytes, len) && !memcmp(got + len, bytes, len));
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(editor_length(e) == len);
+    size_t allocations = edit_malloc_guard_end(); if (edit_malloc_guard_active()) T(allocations == 0);
+    editor_close(e); free(got); free(bytes);
+    printf("clipboard PRIMARY: queued selection/collapse/middle paste waits for latest capture, mallocs=%zu passed\n", allocations);
+    return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -2185,6 +2351,10 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
         if (!strcmp(argv[1], "--panel-state")) return panel_shortcuts(false);
         if (!strcmp(argv[1], "--panel-notice")) return panel_shortcuts(true);
+        if (!strcmp(argv[1], "--clipboard-primary")) return clipboard_pending_primary_test();
+        if (!strcmp(argv[1], "--clipboard-bulk")) return clipboard_large_test();
+        if (!strcmp(argv[1], "--clipboard-native")) return clipboard_test(true);
+        if (!strcmp(argv[1], "--clipboard")) return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test();
         if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
         if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
         if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
@@ -2214,6 +2384,7 @@ int main(int argc, char **argv)
     T(minimap_typing_flash() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
+    T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);

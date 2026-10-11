@@ -16,13 +16,23 @@
 #define NJOB 8u
 #define MAX_PAIRS 64u
 #define CHUNK_MAX (256u * 1024u)
-#define DATA_MAX (64u * 1024u * 1024u)
-#define OWN_BUDGET (128u * 1024u * 1024u)
+#define DATA_MAX X11_CLIP_DATA_MAX
+#define OWN_BUDGET X11_CLIP_OWN_BUDGET
 #define MAX_WAITERS 256u
 #define NCHUNK 8u                         /* receive chunks in flight to the worker, all selections (P2.2h) */
 
 #define SLICE_BYTES (1024u * 1024u)       /* (E) about 0.2 ms of memcpy plus socket write per UI slice */
-typedef struct clip_blob { size_t refs, len, cap; uint8_t data[]; } clip_blob;
+typedef struct clip_blob {
+    size_t refs, len, cap;
+    x11_clip_free_fn release;
+    void *allocator;
+    uint8_t data[];
+} clip_blob;
+static void blob_free(clip_blob *b) {
+    if (!b) return;
+    if (b->release) b->release(b->allocator, b, sizeof *b + b->cap);
+    else free(b);
+}
 /* P2.2h: receive buffers are built by a src/work worker. A sink belongs to the worker while jobs are in flight
  * (infl > 0); the UI thread reads it only after the completion message of its last job. */
 typedef struct clip_sink { clip_blob *buf; size_t len; bool failed; } clip_sink;
@@ -128,7 +138,7 @@ static bool defer_free(x11_clip *c, clip_blob *b);
 static void blob_unref(x11_clip *c, clip_blob *b) {
     if (!b || --b->refs) return;
     if (b->cap >= SLICE_BYTES && defer_free(c, b)) return;      /* freeing tens of MiB is page-table work: not on the UI thread */
-    c->mem -= b->cap; free(b);
+    c->mem -= b->cap; blob_free(b);
 }
 static bool mem_fits(const x11_clip *c, size_t extra) { return extra <= c->budget && c->mem <= c->budget - extra; }
 static bool slice_room(const x11_clip *c, size_t n) { return c->slice == 0 || c->slice + n <= SLICE_BYTES; }
@@ -193,7 +203,7 @@ void x11_clip_destroy(plat *p) {
     x11_clip *c = CL(p);
     if (!c) return;
     if (c->pool) { work_pool_shutdown(c->pool); free(c->pool); c->pool = NULL; }     /* joins: nothing touches a sink after this */
-    for (unsigned i = 0; i < NCHUNK + NSEL; i++) { free(c->wjob[i].reply); c->wjob[i].reply = NULL; free(c->wjob[i].ptr); c->wjob[i].ptr = NULL; }
+    for (unsigned i = 0; i < NCHUNK + NSEL; i++) { free(c->wjob[i].reply); c->wjob[i].reply = NULL; blob_free(c->wjob[i].ptr); c->wjob[i].ptr = NULL; }
     for (unsigned i = 0; i < NJOB; i++) job_free(p, &c->jobs[i]);
     for (unsigned i = 0; i < NSERVE; i++) tx_free(p, &c->tx[i]);
     for (int w = 0; w < NSEL; w++) {
@@ -336,15 +346,23 @@ static void install(plat *p, int which, clip_blob *b) {
 x11_clip_buf *x11_clip_buf_new(size_t len) {
     if (len > DATA_MAX) return NULL;
     clip_blob *b = malloc(sizeof *b + len);
-    if (b) { b->refs = 1; b->len = len; b->cap = len; }
+    if (b) { b->refs = 1; b->len = len; b->cap = len; b->release = NULL; b->allocator = NULL; }
     return b;
 }
+size_t x11_clip_buf_len(const x11_clip_buf *b) { return b ? b->len : 0; }
 uint8_t *x11_clip_buf_data(x11_clip_buf *b) { return b->data; }
-void x11_clip_buf_free(x11_clip_buf *b) { free(b); }
+x11_clip_buf *x11_clip_buf_new_alloc(size_t len, x11_clip_alloc_fn alloc,
+                                    x11_clip_free_fn release, void *ctx) {
+    if (len > DATA_MAX || !alloc || !release) return NULL;
+    clip_blob *b = alloc(ctx, sizeof *b + len);
+    if (b) { b->refs = 1; b->len = b->cap = len; b->release = release; b->allocator = ctx; }
+    return b;
+}
+void x11_clip_buf_free(x11_clip_buf *b) { blob_free(b); }
 int x11_clip_set_buf(plat *p, int which, x11_clip_buf *b) {
     x11_clip *c = CL(p);
     if (!b) return PLAT_ERR_FAIL;
-    if (!c || which < 0 || which >= NSEL || b->len > DATA_MAX || !make_room(p, which, b->len)) { free(b); return PLAT_ERR_FAIL; }
+    if (!c || which < 0 || which >= NSEL || b->len > DATA_MAX || !make_room(p, which, b->len)) { blob_free(b); return PLAT_ERR_FAIL; }
     install(p, which, b);
     return PLAT_OK;
 }
@@ -369,7 +387,7 @@ static void chunk_job(work_ctx *ctx) {
     clip_chunk *k = ctx->arg; clip_sink *s = k->sink;
     uint8_t flags = 0; size_t cap = 0;
     if (k->freeing) {
-        free(k->ptr); k->ptr = NULL;
+        blob_free(k->ptr); k->ptr = NULL;
         work_msg m = { .kind = MSG_FREE, .generation = ctx->generation };
         (void)work_publish(ctx, &m); return;
     }
@@ -377,7 +395,7 @@ static void chunk_job(work_ctx *ctx) {
         if (!s->failed && !k->discard) {
             if (!s->buf) {                                    /* nothing arrived: an empty blob */
                 s->buf = malloc(sizeof *s->buf);
-                if (s->buf) { s->buf->refs = 1; s->buf->len = s->buf->cap = 0; } else s->failed = true;
+                if (s->buf) { s->buf->refs = 1; s->buf->len = s->buf->cap = 0; s->buf->release = NULL; s->buf->allocator = NULL; } else s->failed = true;
             }
             if (s->buf) {
                 clip_blob *b = s->buf; b->len = s->len;
@@ -395,7 +413,7 @@ static void chunk_job(work_ctx *ctx) {
             if (!s->buf || s->buf->cap < k->cap) {
                 clip_blob *b = realloc(s->buf, sizeof *b + k->cap);
                 if (!b) s->failed = true;
-                else { if (!s->buf) { b->refs = 1; b->len = 0; } b->cap = k->cap; s->buf = b; }
+                else { if (!s->buf) { b->refs = 1; b->len = 0; b->release = NULL; b->allocator = NULL; } b->cap = k->cap; s->buf = b; }
             }
             if (!s->failed && s->len + n > s->buf->cap) s->failed = true;
             if (!s->failed) {
@@ -533,7 +551,7 @@ static void rx_complete(plat *p, int w) {
     bool ok = r->fin_ok && !r->wfail;
     if (ok && !r->sink.buf) {                                    /* an empty transfer never reached the worker */
         clip_blob *e = malloc(sizeof *e);
-        if (e) { e->refs = 1; e->len = e->cap = 0; r->sink.buf = e; } else ok = false;
+        if (e) { e->refs = 1; e->len = e->cap = 0; e->release = NULL; e->allocator = NULL; r->sink.buf = e; } else ok = false;
     }
     /* Keep the receive and its blob until all accepted waiters have room.
      * No later selection may replace got while these events are queued. */

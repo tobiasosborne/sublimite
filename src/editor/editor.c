@@ -190,6 +190,7 @@ static int refresh_cursor(editor *e, uint64_t old_cursor, bool caret)
 int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 {
     e->caret_only = false;
+    editor_clip_selection(e);
     return refresh_cursor(e, old_cursor, false);
 }
 void editor_route_work(const work_msg *msg, void *ctx)
@@ -316,7 +317,7 @@ static int submit(editor *e)
     /* A bounded consumer (including minimap) may adopt the final index range
      * after this turn's pump. Publish before this frame can leave the editor. */
     editor_large_index_progress(e);
-    if (e->op_count || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (e->op_count || editor_clip_busy(e) || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     int metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
@@ -372,6 +373,8 @@ static int resize(editor *e)
 }
 static int nonkey(editor *e, const plat_event *ev)
 {
+    if (ev->kind == PLAT_EV_CLIPBOARD || (ev->kind == PLAT_EV_BUTTON && ev->code == 2))
+        return editor_clip_event(e, ev);
     if (ev->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
     if (ev->kind == PLAT_EV_EXPOSE) return editor_full_layout(e);
     if (ev->kind == PLAT_EV_RESIZE) {
@@ -438,6 +441,11 @@ static size_t queue_pick(const editor *e)
 {
     /* Journal replay ranges borrow tree storage until every staged record drains. */
     if (e->journal && e->op_count) return SIZE_MAX;
+    if (editor_clip_busy(e)) {
+        for (size_t n = 0; n < e->queue_count; n++)
+            if (e->queue[(e->queue_head + n) % EDITOR_INPUT_CAP].kind == PLAT_EV_CLIPBOARD) return n;
+        return SIZE_MAX;
+    }
     for (size_t n = 0; n < e->queue_count; n++) {
         size_t at = (e->queue_head + n) % EDITOR_INPUT_CAP;
         if (!queued_owner_live(e, at) || editor_event_control(e, &e->queue[at])) return n;
@@ -465,8 +473,8 @@ static bool runnable(const editor *e)
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
-    return e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice || (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
-           (e->dirty && !e->backend->active) || (e->resize_pending && !e->backend->active && !e->dirty);
+    return editor_clip_runnable(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice || (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
+           (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
@@ -522,6 +530,7 @@ int editor_step(editor *e, int timeout_ms)
     if (rc) return fail(e, rc);
     editor_journal_staged(e);
     editor_large_index_progress(e);
+    rc = editor_clip_poll(e); if (rc) return fail(e, rc);
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
     rc = e->action == EDITOR_ACTION_REPLAY_WORK ? 0 : blink(e, start);
@@ -530,7 +539,7 @@ int editor_step(editor *e, int timeout_ms)
     for (;;) {
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
-        if (e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
+        if (e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
         else if (queue_pick(e) != SIZE_MAX) {
             size_t picked = queue_pick(e), at = (e->queue_head + picked) % EDITOR_INPUT_CAP;
             plat_event ev = e->queue[at]; bool live = queued_owner_live(e, at);
@@ -636,7 +645,7 @@ editor_stats editor_get_stats(const editor *e)
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.pending = editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }

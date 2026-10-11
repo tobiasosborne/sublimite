@@ -31,7 +31,17 @@ uint64_t x11_clip_max_poll_ns(plat *p, bool reset, uint64_t *cpu_ns_out);
  * after x11_clip_poll reclaims their budget, a caller may retry with a fresh buffer. The last paste's borrowed
  * bytes stay charged and valid until a later paste completion. The buffer is immutable once adopted. */
 typedef struct clip_blob x11_clip_buf;
+/* Owned-buffer allocator hook: callbacks must be thread-safe and remain alive
+ * through plat_shutdown. release receives the exact allocation size. This
+ * lets the editor use its arena recycler instead of libc on input paths. */
+typedef void *(*x11_clip_alloc_fn)(void *ctx, size_t bytes);
+typedef void (*x11_clip_free_fn)(void *ctx, void *ptr, size_t bytes);
+x11_clip_buf *x11_clip_buf_new_alloc(size_t len, x11_clip_alloc_fn alloc,
+                                    x11_clip_free_fn release, void *ctx);
+#define X11_CLIP_DATA_MAX (64u * 1024u * 1024u) /* existing protocol DATA_MAX */
+#define X11_CLIP_OWN_BUDGET (2u * X11_CLIP_DATA_MAX) /* existing OWN_BUDGET */
 x11_clip_buf *x11_clip_buf_new(size_t len);          /* NULL above 64 MiB or on OOM; len bytes uninitialised */
+size_t        x11_clip_buf_len(const x11_clip_buf *b);
 uint8_t      *x11_clip_buf_data(x11_clip_buf *b);
 void          x11_clip_buf_free(x11_clip_buf *b);    /* only for a buffer that was not adopted */
 int           x11_clip_set_buf(plat *p, int which, x11_clip_buf *b);

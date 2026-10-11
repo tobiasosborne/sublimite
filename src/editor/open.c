@@ -48,11 +48,13 @@ void editor_close(editor *e)
     if (!e) return;
     if (e->journal) { (void)editor_flush(e); journal_close(e->journal); e->journal = NULL; }
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
+    editor_clip_stop(e);
     if (e->backend) render_backend_shutdown(e->backend);
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
     if (e->has_platform) plat_shutdown(&e->platform);
+    editor_clip_close(e);
     if (e->poll_fd >= 0) close(e->poll_fd);
     if (e->tabs_ready) tabs_fini(&e->tabs);
     edit_arena_free(&e->arena); free(e);
@@ -101,6 +103,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) + 2u * 1024u * 1024u;
     rc = edit_arena_init(&e->arena, reserve); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    rc = editor_clip_init(e); if (rc) goto fail;
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);
     if (!e->buffers) { rc = EDITOR_ERR_MEMORY; goto fail; }
     memset(e->buffers, 0, e->buffer_capacity * sizeof *e->buffers);
