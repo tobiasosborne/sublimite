@@ -1,0 +1,2 @@
+editor_test:1780: FAIL editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED)
+editor_test:1816: FAIL backend_fallback_case(true, true) == 0

@@ -1,0 +1,32 @@
+startup measurement stamp (M)[AC]: BAT0=Charging; origin=headless open harness; ms=ns/1000000 (SI)
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=77065129463167 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=77065143175453 elapsed_ms=13.712286
+  egl_probe_end        ns=77065148070606 elapsed_ms=18.607439
+  raster_fallback      ns=77065141242713 elapsed_ms=11.779546
+  font_atlas_ready     ns=77065130282043 elapsed_ms=0.818876
+  file_prefix_read     ns=77065142042955 elapsed_ms=12.579788
+  first_layout         ns=77065142531077 elapsed_ms=13.067910
+  first_submit         ns=77065145179164 elapsed_ms=15.715997
+  first_present        ns=77065145194704 elapsed_ms=15.731537
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=ASan-inert
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=77065168431735 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=77065178983513 elapsed_ms=10.551778
+  egl_probe_end        ns=77065180991250 elapsed_ms=12.559515
+  raster_fallback      ns=77065178662446 elapsed_ms=10.230711
+  font_atlas_ready     ns=77065169527234 elapsed_ms=1.095499
+  file_prefix_read     ns=77065179026939 elapsed_ms=10.595204
+  first_layout         ns=77065178831431 elapsed_ms=10.399696
+  first_submit         ns=77065179960990 elapsed_ms=11.529255
+  first_present        ns=77065179966430 elapsed_ms=11.534695
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: finish-init runs on worker after bootstrap; typing progresses while finish held; late wake drained
+startup_test: successful probe: text and typing submitted/presented while held; allocations=0 guard=ASan-inert
+startup_test: startup stamps survive frame-ring wrap and round-trip; reset clears them

@@ -110,3 +110,78 @@ startup_test: startup stamps survive frame-ring wrap and round-trip; reset clear
 The coordinator must rerun full checks with permitted Unix sockets, Xvfb :99 and leaks enabled; triage the unrelated reload/wait result; measure raster startup and native GL adoption on the requested displays; and run the next Astra comparison on the same build. Background GL's first-real-swap serial/MSC/mode validation needs native verification. Existing terminal device-failure behavior is unchanged. Raster/discovery resources remain owned through shutdown; an external driver call may still delay **close**, but it cannot gate first paint. Legacy frame-zero gate aggregation is unchanged; use the explicit startup section for startup analysis.
 
 No other bead was implemented or repaired. This worker stops with the tree building and module status/report documentation in place.
+
+## Post-rebase fallback follow-up — 2026-10-11
+
+The cause is the **test injection**, not production backend selection or an
+expectation that discovery takes the old 10 s timeout. The fallback fixture's
+`injected_gpu_init_failure` delegated to `worker_failed_init`, which returns
+`RENDER_ERR_INIT` (-9) only on `cfg->workers->threads[0]` and otherwise returns
+`RENDER_ERR_ARG` (-1). `cfg->workers` is the ordinary rendering/file-work pool;
+fallback-capable GPU discovery deliberately runs on `e->startup_pool`. The
+injection therefore supplied the wrong error, and production correctly retained
+that error in `backend_init_error`. Strict initialization still uses the ordinary
+pool, which explains why that half of the fixture had a different result.
+
+Ran the requested red command,
+`ASAN_OPTIONS=detect_leaks=0 build/san/tests/editor_test`. In this sandbox it
+stopped before fallback at the previously reported reload/launcher result 4 and
+native-display setup failures: [full red output](edit-2ts-rebase-editor-red.log).
+The original `--fallback` also failed at native `opened == 0`:
+[native red output](edit-2ts-rebase-native-fallback-red.log). To reproduce the
+reported error-code assertion here, added null-backed GPU variants to the same
+fallback fixture and ran `--fallback-headless` **before fixing the injection**:
+[headless red output](edit-2ts-rebase-fallback-red.log).
+
+```text
+editor_test:1780: FAIL editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED)
+editor_test:1816: FAIL backend_fallback_case(true, true) == 0
+```
+
+Fixed `tests/editor_test.c`: the injected init failure now returns
+`RENDER_ERR_INIT` independently of which initializer pool calls it. Worker
+ownership remains covered by review 23 and the held startup probes. The new
+`--fallback-headless` cases exercise immediate INIT and UNSUPPORTED failures
+without X11, stable final selection/error through typing, exactly one diagnostic
+through close, cleanup, and exact synchronous error propagation with fallback
+disabled. `--fallback` includes these cases and retains both native fixtures,
+including the loader fault. No production code or timeout changed; no test error
+expectation was weakened. No `git` or `bd` command was run.
+
+Final validation used `ASAN_OPTIONS=detect_leaks=0` for every sanitizer run.
+`make -j"$(nproc)" all` plus the requested sanitizer binaries exited 0 under
+C11 `-Wall -Wextra -Werror -Wshadow -Wconversion`:
+[build output](edit-2ts-rebase-build.log).
+
+| Check | Exit | Output |
+| --- | --- | --- |
+| Sanitizer `editor_test --fallback-headless` | 0 | [Both errors, one log through typing/close](edit-2ts-rebase-fallback-headless.log) |
+| Release `editor_test --fallback-headless` | 0 | [Both errors, one log through typing/close](edit-2ts-rebase-fallback-release.log) |
+| Sanitizer `startup_test` | 0 | [Held failing/successful probe, held finish, adoption, late wake drain, retained stamps and composition round trip](edit-2ts-rebase-startup-san.log) |
+| Release `startup_test` | 0 | [Same probes; active allocation guard, zero typing allocations](edit-2ts-rebase-startup-release.log) |
+| Sanitizer `editor_test --minimap-flash` | 0 | [95 keys; zero orange frames, pending pixel changes and allocations](edit-2ts-rebase-minimap-flash.log) |
+| Sanitizer `editor_test --clipboard` | 0 | [Round trip, bulk/journal, undo, PRIMARY, deep horizontal position and no-tab cases](edit-2ts-rebase-clipboard.log) |
+| Sanitizer `editor_test --ck4-save` | 0 | [Abrupt exit and exact selected/unrelated/closed recovery](edit-2ts-rebase-ck4-save.log) |
+| Sanitizer review 23 | 0 | [Synchronous init success/failure worker ownership](edit-2ts-rebase-init.log) |
+| Sanitizer `editor_test --gpu-completion` | 0 | [GPU completion and idle polling](edit-2ts-rebase-gpu-completion.log) |
+| Sanitizer `trace_test` / `render_test` | 0 / 0 | [Trace](edit-2ts-rebase-trace.log), [render](edit-2ts-rebase-render.log) |
+| `tracedump build/startup.trace` | 0 | [Retained startup stages and elapsed-time arithmetic](edit-2ts-rebase-tracedump.log) |
+| Sanitizer `gl_test` | 0 | [Pure completion/trace checks pass; native diagnostics explicitly skip](edit-2ts-rebase-gl.log) |
+
+The held startup probes still prove that file-prefix text and typing present
+before discovery completes, and that typing continues while worker finishing is
+held. The immediate-failure fixtures impose no ordering between failure
+selection and first paint; they wait for final selection only in harness setup.
+
+The final no-argument sanitizer editor run exits 1 at the same unrelated
+reload/launcher result 4 and native setup assertions, then `review_suite(NULL)`:
+[final full output](edit-2ts-rebase-editor-green.log). Native `--fallback` exits 1
+at `opened == 0` after both headless cases pass:
+[output](edit-2ts-rebase-native-fallback.log). `--require-gl` exits 1 at
+`editor_open`, before its final-selection check:
+[output](edit-2ts-rebase-require-gl.log). These native runs used
+`DISPLAY=:99 sh tools/with_display_lock.sh`. A fresh direct X99 socket connection
+returns errno 1, `Operation not permitted`:
+[environment output](edit-2ts-rebase-environment.log). Native discovery timing
+and the native `--require-gl` result remain unverified here; no native pass is
+claimed. No ASan/UBSan diagnostic appeared in these runs.

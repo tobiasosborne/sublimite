@@ -1,0 +1,10 @@
+gcc -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -O2 -g -msse2 -Isrc -include tests/display_guard.h -MMD -MP -c tests/editor_test.c -o build/rel/tests/editor_test.o
+make: 'build/san/tests/trace_test' is up to date.
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -Isrc -include tests/display_guard.h -MMD -MP -c tests/editor_test.c -o build/san/tests/editor_test.o
+make: 'build/san/tests/gl_test' is up to date.
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -Isrc -include tests/display_guard.h -MMD -MP -c tests/startup_test.c -o build/san/tests/startup_test.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -Isrc -include tests/display_guard.h -MMD -MP -c tests/render_test.c -o build/san/tests/render_test.o
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -pthread build/san/tests/startup_test.o build/san/libedit.a -lm -ldl -lxcb -lxcb-present -lxcb-sync -lxcb-xfixes -lxcb -lxcb-shm -lxcb-present -lxcb-xkb -lxkbcommon -lxkbcommon-x11 -o build/san/tests/startup_test
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -pthread build/san/tests/render_test.o build/san/libedit.a -lm -ldl -lxcb -lxcb-present -lxcb-sync -lxcb-xfixes -lxcb -lxcb-shm -lxcb-present -lxcb-xkb -lxkbcommon -lxkbcommon-x11 -o build/san/tests/render_test
+gcc -O2 -g -msse2 -pthread build/rel/tests/editor_test.o build/libedit.a -lm -ldl -lxcb -lxcb-present -lxcb-sync -lxcb-xfixes -lxcb -lxcb-shm -lxcb-present -lxcb-xkb -lxkbcommon -lxkbcommon-x11 -o build/tests/editor_test
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -pthread build/san/tests/editor_test.o build/san/libedit.a -lm -ldl -lxcb -lxcb-present -lxcb-sync -lxcb-xfixes -lxcb -lxcb-shm -lxcb-present -lxcb-xkb -lxkbcommon -lxkbcommon-x11 -o build/san/tests/editor_test

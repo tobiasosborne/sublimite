@@ -1,0 +1,64 @@
+reload launcher result=4
+editor_test:1350: FAIL waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0
+editor_test:741: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:767: FAIL editor_open(&e, &cfg, &b) == 0
+edit-d5o compose: minimap pixel rows match independent minimap_pixels reference
+edit-g11 null typing: keys=95 frames=96 orange_frames=0 stale_frames=95 changed_pending=0 chrome_markers=0 mallocs=0 fill_max_ns=34010
+editor_test: separate Shift chords preserve exact ranges, reset after movement/mutation, and allocate nothing
+editor_test: Ctrl+Y redoes inserts/deletes, empty redo is inert, Ctrl+Shift+Z still redoes
+editor_test: panel shortcuts show a generation-only status and restore the bottom row
+clipboard malloc guard: 0 allocations (ASan-inert); expected zero by law
+clipboard: null round trip, UTF-8/CRLF, replacement, cut/undo, alternate keys, PRIMARY passed
+clipboard bulk: worker queue, cross-slice CRLF, replacement/undo, journal, mallocs=0 passed
+clipboard middle click: deep horizontal position exact
+clipboard PRIMARY: queued selection/collapse/middle paste waits for latest capture, mallocs=0 passed
+clipboard middle click: no active tab preserves placeholder
+P4-3 section 3: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed
+P4-3 section 8: complete-record credit bounded; independent durable image exact with dirty frames and occupied bulk worker
+P4-3 section 7: healthy flush survives abrupt child exit with exact selection/tab order/active/window metadata
+P4-3 section 7: missing named target association persisted independently of empty content BASE
+P4-3 section 10: journal-enabled editor rejects FIFO without a writer; child completes before alarm
+P4-3 section 4: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=COPY choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 40: cursor/text frames omit unchanged final tab chrome passed
+P4-3 41: closed drag owner and switched minimap capture cancel safely passed
+P4-3 22: evicted buffer retains held save lease during unrelated typing passed
+P4-3 14: pre-prompt, modified, repeated and aged recovery keys ignored passed
+P4-3 13: suspended source preserves tab keys and tab pointer controls passed
+P4-3 12: pending COPY admits controls and retains edit owner passed
+P4-3 11: failed full-source identity adoption stays owner-local passed
+P4-3 11: deferred COPY and inactive ENOSPC errors preserve unrelated editing passed
+review 3/P1.9-2.2: SIGKILL point=0 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=1 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=2 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=3 recovery=x passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=0 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=1 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=2 restores current tree passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 5/P1.9-2.3: source changed between attachment and BASE registration rejected passed
+review 6: submitted mid-row caret/selection/blink/focus cells passed
+review 7: multiple long clipped lines preserve subsequent rows in first frame and edit/undo passed
+review 8: first viewport precedes stalled remainder work passed
+review 10: 10 GiB beginning edits metadata visits max=618 (M)[AC], bound=4096 (G)
+review 10: mutation cancels completed backlog without adopting it passed
+review 11: indivisible submit observed=2194790 reported=2273941 ns (M)[AC]
+review 11: first undo turn longest_slice_ns=139268 (M)[AC], slice limieditor_test:1049: FAIL editor_open(&e, &cfg, &backend) == 0
+editor_test:1705: FAIL editor_open(&e, &cfg, &b) == 0
+editor_test:2555: FAIL review_suite(NULL) == 0
+t=500000 ns (G)
+review 11: multi-record burst undo/redo yields across turns passed
+review 12: journaled large deletion and undo passed
+review 15: replay arena growth=0 bytes (M)[AC], bound=65536 bytes (G)
+review 13: typing/repeat bursts, movement/focus/timeout boundaries passed
+review 16: mapped watch overwrite, focus truncate, edit suspension and reload/keep passed
+review 17: active job idle polls=2 (M)[AC], requested-timeout bound=4 (G)
+review 17: queued job idle polls=3 (M)[AC], requested-timeout bound=4 (G)
+review 22: allocator positions=21 failures=20; tree/view/history/journal rollback passed (M)[AC]
+review 23: backend init success/failure executes on work pool and adopts mailbox result passed

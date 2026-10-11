@@ -1,0 +1,32 @@
+startup measurement stamp (M)[AC]: BAT0=Not charging; origin=headless open harness; ms=ns/1000000 (SI)
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=77078676031892 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=77078681933127 elapsed_ms=5.901235
+  egl_probe_end        ns=77078682278301 elapsed_ms=6.246409
+  raster_fallback      ns=77078681813457 elapsed_ms=5.781565
+  font_atlas_ready     ns=77078676451453 elapsed_ms=0.419561
+  file_prefix_read     ns=77078682024631 elapsed_ms=5.992739
+  first_layout         ns=77078682087417 elapsed_ms=6.055525
+  first_submit         ns=77078682210407 elapsed_ms=6.178515
+  first_present        ns=77078682211086 elapsed_ms=6.179194
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=active
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=77078689307624 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=77078694392254 elapsed_ms=5.084630
+  egl_probe_end        ns=77078694775496 elapsed_ms=5.467872
+  raster_fallback      ns=77078694155835 elapsed_ms=4.848211
+  font_atlas_ready     ns=77078689650199 elapsed_ms=0.342575
+  file_prefix_read     ns=77078694457808 elapsed_ms=5.150184
+  first_layout         ns=77078694356674 elapsed_ms=5.049050
+  first_submit         ns=77078694648310 elapsed_ms=5.340686
+  first_present        ns=77078694648871 elapsed_ms=5.341247
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: finish-init runs on worker after bootstrap; typing progresses while finish held; late wake drained
+startup_test: successful probe: text and typing submitted/presented while held; allocations=0 guard=active
+startup_test: startup stamps survive frame-ring wrap and round-trip; reset clears them

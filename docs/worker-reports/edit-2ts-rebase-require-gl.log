@@ -1,0 +1,2 @@
+waiting for display :99 (held by unknown)
+editor_test:1872: FAIL editor_open(&e, &cfg, &b) == 0

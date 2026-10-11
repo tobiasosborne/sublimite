@@ -1,0 +1,2 @@
+editor_test:1772: FAIL opened == 0
+editor_test:1800: FAIL backend_fallback_case(true) == 0

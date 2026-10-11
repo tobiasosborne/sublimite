@@ -1,0 +1,5 @@
+waiting for display :99 (held by unknown)
+editor_test:1784: FAIL opened == 0
+editor_test:1830: FAIL backend_fallback_case(true, false) == 0
+editor_test: headless EGL injected init failure -> null, one log through typing/close passed
+editor_test: headless EGL injected unsupported failure -> null, one log through typing/close passed

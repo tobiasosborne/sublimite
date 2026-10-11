@@ -1744,23 +1744,35 @@ static int backend_selection(void)
     puts("editor_test: default EGL and gl/raster override passed"); return 0;
 }
 static int injected_gpu_init_failure(render_backend *b, const render_config *cfg)
-{ return worker_failed_init(b, cfg); }
+{
+    /* cfg->workers owns rendering jobs, not background discovery. Worker
+     * ownership is covered by review_init and the held startup probes; this
+     * seam must return the same injected error on either initializer pool. */
+    (void)b; (void)cfg; return RENDER_ERR_INIT;
+}
+static int injected_gpu_unsupported(render_backend *b, const render_config *cfg)
+{ (void)b; (void)cfg; return RENDER_ERR_UNSUPPORTED; }
 /* Discovery has no first-paint deadline. This helper only reuses the existing
  * settle watchdog (5 s = 5000000000 ns / 1000000000 ns/s) to observe the final
- * selection before diagnostic/allocator assertions in these native fixtures. */
+ * selection before diagnostic/allocator assertions in these fixtures. */
 static int settle_backend_probe(editor *e)
 {
     uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
     while (e->startup.pending) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
     return settle(e);
 }
-static int backend_fallback_case(bool injected)
+static int backend_fallback_case(bool injected, bool headless)
 {
     render_backend b = {0}; T(editor_backend_select(&b, NULL) == 0);
+    if (headless) {
+        T(render_null_backend(&b) == 0);
+        b.info.capabilities |= RENDER_CAP_GPU;
+    }
     editor_config cfg = {.cols = 32, .rows = 8, .raster_fallback = true};
-    /* A deterministic init return tests the selected default independently
-     * of native capabilities; the loader seam also exercises real cleanup. */
+    /* Null-backed GPU descriptors exercise quick failure without a display.
+     * Native descriptors retain the selected-default and loader coverage. */
     if (injected) b.ops.init = injected_gpu_init_failure;
+    else if (headless) b.ops.init = injected_gpu_unsupported;
     else T(setenv("EDIT_GL_EGL_LIBRARY", "/tmp/edit-zzj.15-no-such-EGL.so", 1) == 0);
     editor *e = NULL;
     FILE *log = tmpfile(); T(log != NULL);
@@ -1771,14 +1783,19 @@ static int backend_fallback_case(bool injected)
     T(dup2(saved_stderr, STDERR_FILENO) >= 0);
     T(opened == 0);
     T(editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
-    T((b.info.capabilities & RENDER_CAP_RASTER_POOL) != 0);
-    if (!injected) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
+    uint32_t fallback_cap = headless ? RENDER_CAP_HEADLESS : RENDER_CAP_RASTER_POOL;
+    T((b.info.capabilities & fallback_cap) != 0);
+    T((b.info.capabilities & RENDER_CAP_GPU) == 0);
+    if (!injected && !headless) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
     /* Capture through typing/close too: a later retry/log must fail the
      * one-line assertion, even after the loader fault has been removed. */
     T(dup2(fileno(log), STDERR_FILENO) >= 0);
     T(settle(e) == 0); T(press(e, key('x', 0, "x")) == 0);
     T(expect(e, "x", 1) == 0);
-    T((b.info.capabilities & RENDER_CAP_RASTER_POOL) != 0);
+    T(!e->startup.pending);
+    T(editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
+    T((b.info.capabilities & fallback_cap) != 0);
+    T((b.info.capabilities & RENDER_CAP_GPU) == 0);
     editor_close(e);
     T(dup2(saved_stderr, STDERR_FILENO) >= 0); close(saved_stderr);
     rewind(log); char line[256]; T(fgets(line, sizeof line, log) != NULL);
@@ -1787,18 +1804,31 @@ static int backend_fallback_case(bool injected)
     T(!b.initialized && b.state == NULL);
     /* With fallback disabled a GPU init error remains an error. */
     T(editor_backend_select(&b, NULL) == 0); cfg.raster_fallback = false;
+    if (headless) {
+        T(render_null_backend(&b) == 0);
+        b.info.capabilities |= RENDER_CAP_GPU;
+    }
     if (injected) b.ops.init = injected_gpu_init_failure;
+    else if (headless) b.ops.init = injected_gpu_unsupported;
     else T(setenv("EDIT_GL_EGL_LIBRARY", "/tmp/edit-zzj.15-no-such-EGL.so", 1) == 0);
     T(editor_open(&e, &cfg, &b) == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
     T(e == NULL && !b.initialized);
-    if (!injected) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
-    printf("editor_test: default EGL %s failure -> raster, one log through typing/close passed\n",
-        injected ? "injected init" : "dlopen"); return 0;
+    if (!injected && !headless) T(unsetenv("EDIT_GL_EGL_LIBRARY") == 0);
+    printf("editor_test: %s EGL %s failure -> %s, one log through typing/close passed\n",
+        headless ? "headless" : "default", injected ? "injected init" : headless ? "injected unsupported" : "dlopen",
+        headless ? "null" : "raster"); return 0;
+}
+static int backend_fallback_headless(void)
+{
+    T(backend_fallback_case(true, true) == 0);
+    T(backend_fallback_case(false, true) == 0);
+    return 0;
 }
 static int backend_fallback(void)
 {
-    T(backend_fallback_case(true) == 0);
-    T(backend_fallback_case(false) == 0);
+    T(backend_fallback_headless() == 0);
+    T(backend_fallback_case(true, false) == 0);
+    T(backend_fallback_case(false, false) == 0);
     puts("editor_test: failed EGL init falls back once and stays raster passed"); return 0;
 }
 static int gpu_polled_event(render_backend *b, const render_event *ev)
@@ -2535,6 +2565,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--line-start-only")) return partial_line_start();
         if (!strcmp(argv[1], "--selection")) return backend_selection();
         if (!strcmp(argv[1], "--fallback")) return backend_fallback();
+        if (!strcmp(argv[1], "--fallback-headless")) return backend_fallback_headless();
         if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
         if (!strcmp(argv[1], "--backend-only")) return selected_backend_test(getenv("EDIT_BACKEND"), false);
         if (!strcmp(argv[1], "--require-gl")) return selected_backend_test("gl", true);

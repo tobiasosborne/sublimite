@@ -1,0 +1,2 @@
+editor_test: headless EGL injected init failure -> null, one log through typing/close passed
+editor_test: headless EGL injected unsupported failure -> null, one log through typing/close passed
