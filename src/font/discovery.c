@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -151,4 +152,17 @@ int font_fallback_isolated(font_fallback *owner, font_fallback_result *out, work
                      out->emoji, &out->emoji_index, &out->have_fontconfig)) return 0;
     out->elapsed_ns = discovery_time() - start;
     return 1;
+}
+
+int font_fallback_codepoint(font_fallback *owner, work_ctx *ctx, uint32_t cp,
+                            char *path, uint32_t *index)
+{
+    /* Pattern buffer derives from the literal prefix/suffix plus the maximum
+     * hexadecimal scalar representation (sizeof uint32_t * two digits). */
+    char pattern[sizeof ":charset=:color=false" + sizeof cp * 2u];
+    int n = snprintf(pattern, sizeof pattern, ":charset=%x:color=false", cp);
+    if (n < 0 || (size_t)n >= sizeof pattern) return 0;
+    path[0] = 0; *index = 0;
+    int available = 0;
+    return query_child(owner, ctx, cp, pattern, 1, path, index, &available);
 }

@@ -219,6 +219,10 @@ typedef struct font_cache {
     render_grid *grid;
     uint64_t hits, misses;
     uint64_t probes, rasterizations; /* work counters, including failed calls */
+    /* Optional worker-only scalar resolver. With this set, composition uses
+     * general rasterisation; never call this cache on the UI thread. */
+    int (*resolve)(void *ctx, uint32_t cp, font_t **face);
+    void *resolve_ctx;
 } font_cache;
 /* INIT only: reserve all pages, exact keys, glyphs, cell image and scratch.
  * Append-only cache, no eviction: rectangles remain immutable through T5.
@@ -286,5 +290,28 @@ int font_runtime_bind(font_runtime *owner, render_grid *grid);
 /* layout callback; MORE until mailbox adoption, then bounded cache lookup. */
 int font_runtime_glyph(void *ctx, const uint8_t *bytes, size_t len,
                        uint32_t width, uint32_t *slot);
+
+/* Production asynchronous owner. INIT reserves UI keys/descriptors and worker
+ * atlas storage. Cold glyph lookup enqueues immutable requests without waiting
+ * or allocating; FONT_OK can denote a pending placeholder slot. Slots/identity
+ * remain stable when mailbox adoption replaces its descriptor. Rasterisation,
+ * fontconfig discovery and face file reads happen exclusively on WORK_BULK.
+ * Backend descriptor copies permit UI adoption during an older frame; only
+ * disjoint atlas rectangles are ever appended. Close after backend shutdown
+ * and work_pool_shutdown/message drain, never from a mailbox callback. */
+typedef struct font_async font_async;
+#define FONT_ASYNC_MSG_KIND UINT32_C(0x46474c59) /* FGLY */
+int font_async_open(font_async **out, uint32_t px, work_pool *pool);
+void font_async_close(font_async *owner);
+void font_async_limits(uint32_t *pages, size_t *glyphs, size_t *pixels, uint32_t px);
+int font_async_bind(font_async *owner, render_grid *grid);
+int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len,
+                     uint32_t width, uint32_t *slot);
+/* UI: retry queued requests after checking input/pumping the shared pool. */
+void font_async_pump(font_async *owner);
+bool font_async_pending(const font_async *owner);
+/* Live mailbox callback only; returns adopted slot, or RENDER_NO_SLOT. The
+ * caller damages cells using that slot, including pixels-only changes. */
+uint32_t font_async_event(font_async *owner, const work_msg *msg);
 
 #endif

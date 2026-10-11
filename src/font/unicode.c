@@ -156,7 +156,15 @@ static int compose_cluster(font_cache *cache, const uint8_t *bytes, size_t len, 
         if (font_cluster_ignorable(step.cp)) { cache->pending_off += step.len; continue; }
         font_bitmap b;
         int rc = FONT_ERR_MISSING;
-        for (uint32_t i = 0; i < cache->family->count; i++) {
+        if (cache->resolve) {
+            font_t *face = NULL;
+            rc = cache->resolve(cache->resolve_ctx, step.cp, &face);
+            if (rc == FONT_OK) {
+                edit_arena_reset(&cache->scratch);
+                cache->rasterizations++;
+                rc = font_raster_glyph(face, step.cp, &cache->scratch, &b);
+            }
+        } else for (uint32_t i = 0; i < cache->family->count; i++) {
             font_metric metric;
             int attempt = font_glyph_ui_metrics(&cache->family->faces[i], step.cp, &metric);
             if (attempt == FONT_OK) {

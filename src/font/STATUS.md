@@ -1,5 +1,29 @@
 # Font status — P4.11b / edit-457.19
 
+edit-08z production integration: the editor now owns font_async, using an
+embedded copy of the primary face, worker-only exact-scalar fallback discovery,
+cached face ownership and general cluster rasterisation. Cold UI requests use
+reserved keys/descriptors and work mailboxes; stable pending slots adopt
+append-only atlas rectangles and repaint only affected visible text rows.
+Raster/GL INIT limits now include runtime pages/descriptors. No typing-path
+allocation or font wait is added. Completed missing/resource refusals have
+settled missing artwork; runtime question-mark placeholders indicate pending
+rasterisation.
+
+Headless initial/injected é, α, 日, 🙂 bitmap/width tests pass in release and
+ASan/UBSan; combining marks preserve base ink and add ink in the same cell.
+The release guard holds the bulk lane through matching input submission and
+observes no heap calls, then verifies completion damage. Validation details,
+sandbox display/IPC restrictions and fallback faces are in
+docs/worker-reports/edit-08z.md; ownership/reservation derivations are in
+docs/decisions/edit-08z.md. The existing font benchmark passes (TRACK, battery).
+Native X/EGL, leak-enabled tests and Astra re-verification remain coordinator
+work. Cache eviction/retirement and shaping/colour emoji remain unimplemented.
+
+The historical missing-integration statements below describe the earlier tree;
+edit-08z supersedes its baked-only editor path without changing the legacy
+font_runtime API.
+
 Review fixes: baked ASCII requires INIT SHA-256/face identity; full-advance
 Mono marks stay cell-relative; zero-advance proportional marks use the base
 pen; Unicode 15.1 default-ignorable controls preserve covered bases; full-span

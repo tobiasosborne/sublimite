@@ -64,6 +64,7 @@ void editor_close(editor *e)
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
+    font_async_close(e->fonts);
     if (e->has_platform) plat_shutdown(&e->platform);
     editor_clip_close(e);
     if (e->poll_fd >= 0) close(e->poll_fd);
@@ -110,6 +111,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
     size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
+    uint32_t font_pages; size_t font_glyphs, font_pixels;
+    font_async_limits(&font_pages, &font_glyphs, &font_pixels, atlas->px);
     /* (G) strip reservation = existing eight text columns; summary spacing
      * = PRD's two pixels. Both image buffers are reserved before input. */
     uint32_t map_width = (e->max_cols < 8u ? e->max_cols : 8u) * atlas->cell.cell_w;
@@ -122,7 +125,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         (size_t)e->max_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
-        (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) + 2u * 1024u * 1024u;
+        (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) +
+        font_glyphs * words * sizeof(uint64_t) + 2u * 1024u * 1024u;
     rc = edit_arena_init(&e->arena, reserve); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = editor_clip_init(e); if (rc) goto fail;
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);
@@ -135,6 +139,10 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->stage = edit_arena_alloc(&e->arena, EDITOR_STAGE_BYTES, 16);
     e->indent_bytes = edit_arena_alloc(&e->arena, EDITOR_STAGE_BYTES, 16);
     e->ws_ranges = edit_arena_alloc(&e->arena, e->max_rows * sizeof *e->ws_ranges, 8);
+    e->font_row_words = words;
+    e->font_rows = edit_arena_alloc(&e->arena, font_glyphs * words * sizeof *e->font_rows, _Alignof(uint64_t));
+    if (!e->font_rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    memset(e->font_rows, 0, font_glyphs * words * sizeof *e->font_rows);
     e->strip_cap = ((size_t)e->max_rows + 1) / 2;
     e->strips = edit_arena_alloc(&e->arena, e->strip_cap * sizeof *e->strips, 8);
     e->row_byte = edit_arena_alloc(&e->arena, e->max_rows * sizeof *e->row_byte, 8);
@@ -158,13 +166,13 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = render_grid_init(&e->grid, dims, full, cells, full_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->text_grid, td, text, cells, text_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->map_grid, md, map, (size_t)e->map_capacity * 8, map_bits, map_words); if (rc) goto fail;
-    e->page = (render_atlas_page){atlas->pixels, atlas->pixels_len, (size_t)95 * dims.cell_w, 95 * dims.cell_w, dims.cell_h};
-    layout_ascii_glyphs(atlas, e->glyphs);
-    e->grid.pages = &e->page; e->grid.page_count = 1; e->grid.glyphs = e->glyphs; e->grid.glyph_count = LAYOUT_ASCII_GLYPHS;
-    e->text_grid.pages = &e->page; e->text_grid.page_count = 1; e->text_grid.glyphs = e->glyphs; e->text_grid.glyph_count = LAYOUT_ASCII_GLYPHS;
+    rc = font_async_open(&e->fonts, atlas->px, &e->pool); if (rc) goto fail;
+    (void)font_async_bind(e->fonts, &e->grid);
+    (void)font_async_bind(e->fonts, &e->text_grid);
     e->layout_cfg = (layout_config){.tab_width = 4, .gutter = true, .slice_clusters = 256,
         .fg = 0xd8dee9, .bg = 0x20242c, .gutter_fg = 0x78808e, .gutter_bg = 0x20242c,
         .cursor_fg = 0x20242c, .cursor_bg = 0xe5e9f0, .sel_fg = 0xffffff, .sel_bg = 0x425471};
+    e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
     rc = layout_init(&e->lay, &e->text_grid, &e->layout_cfg, e->row_byte, e->row_used); if (rc) goto fail;
     e->text_grid.dims.rows = e->max_rows;
     rc = layout_wrap_init(&e->lay, &e->arena); e->text_grid.dims.rows = td.rows; if (rc) goto fail;
@@ -180,7 +188,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
     if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_config render = {.dims = dims, .max_width = e->max_cols * dims.cell_w, .max_height = e->max_rows * dims.cell_h,
-        .max_cells = cells, .max_glyphs = LAYOUT_ASCII_GLYPHS, .max_pages = 1, .max_atlas_bytes = atlas->pixels_len,
+        .max_cells = cells, .max_glyphs = font_glyphs, .max_pages = font_pages, .max_atlas_bytes = font_pixels,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
         .max_region_width = map_width, .max_region_height = map_height};
     rc = init_backend(e, render, state);

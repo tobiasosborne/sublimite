@@ -90,11 +90,13 @@ int editor_paint_prepare(editor *e)
 }
 static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_t *identity, uint32_t *slot)
 {
-    (void)ctx;
-    if (width != 1) return false; /* no resident wide atlas image */
-    uint32_t ch = len == 1 && text[0] >= 0x20 && text[0] <= 0x7e ? text[0] : '?';
-    if (len == 3 && !memcmp(text, "\xe2\x80\xa6", 3)) ch = '.';
-    *identity = ch; *slot = ch - 0x20u; return true;
+    editor *e = ctx;
+    if (width < 1 || width > 2 || editor_font_glyph(e, text, len, (uint32_t)width, slot) != FONT_OK) return false;
+    /* Chrome requires a resident image, including an empty space image. */
+    if (*slot == RENDER_NO_SLOT) *slot = 0; /* baked space: ' ' - ' ' */
+    *identity = e->grid.glyphs[*slot].glyph_index;
+    editor_font_track(e, *slot, 0); /* chrome uses the tab-strip row */
+    return true;
 }
 static int compose_chrome(editor *e)
 {

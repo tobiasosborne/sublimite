@@ -198,6 +198,7 @@ void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
     if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
+    if (editor_font_event(e, msg)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
         for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers && e->buffers[i] && e->buffers[i]->index)
             (void)lineidx_poll(e->buffers[i]->index);
@@ -529,6 +530,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->quit) return close_result(e);
     if (e->error) return e->error;
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
+    font_async_pump(e->fonts);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
