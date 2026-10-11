@@ -7,7 +7,7 @@
 
 **Verified or resolved, not landed (worktrees .wt/<bead>, WIP-snapshotted):**
 - edit-3kk scroll wiring: 20-hunk resolve done + my hand merge of the readiness clauses; targeted run was mid-way (scroll/render green so far; editor/p4/cli pending). Rebase onto main, finish the run, land.
-- edit-v0o.7 config: resolver 2 done (file font.size → DPI path; env overrides file); run mid-way (config/font green; editor/p4/cli pending).
+- edit-v0o.7 config: LANDED after the wind-down note (all suites green, cherry-picked clean).
 - edit-457.8 hot exit (+9ma): I renamed its window fields to e->font.window_*; its new editor_hot_exit_test:174 then fails at editor_open → needs a look (probably my rename changed the restored-size semantics, or EMFILE); journal_test green.
 - edit-5ih font selection: 8-hunk conflicts with m3g/08z; Codex resolver was running at the cut.
 - edit-q0g partial (x11; fix unimplemented; headless red test only) — low value, leave.
