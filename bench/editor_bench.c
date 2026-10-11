@@ -456,9 +456,9 @@ static int typing_checkpoint(FILE *out, const char *label, const char *workload,
     if (!measured->invalid && !incomplete && !measured->guard && !measured->suspended) return 0;
     fprintf(out, "STRUCTURAL name=editor_%s_%s_injection_T4_G1 structural=FAIL"
             " invalid=%d incomplete=%d completed=%zu expected=%zu guard=%d suspended=%d"
-            " allocations=%zu allocation_site=unavailable_count_only_guard (M)%s load1=%s\n",
+            " foreign_input=%zu allocations=%zu allocation_site=unavailable_count_only_guard (M)%s load1=%s\n",
             label, workload, measured->invalid, incomplete, measured->completed, expected,
-            measured->guard, measured->suspended, measured->allocations, tag->power, tag->load);
+            measured->guard, measured->suspended, measured->foreign, measured->allocations, tag->power, tag->load);
     return 1;
 }
 static int typing_checkpoint_self_check(void)
@@ -484,6 +484,21 @@ static int typing_checkpoint_self_check(void)
                 strstr(line, "guard=") && strstr(line, "suspended="));
         REQUIRE(strstr(line, "allocation_site=") && strstr(line, "structural=FAIL"));
         REQUIRE(bench_merge_exit(rc, 0) == 1 && bench_merge_exit(rc, 3) == 1);
+    }
+    /* edit-cx8: an input the bench never injected (another client typing
+     * into the window on a shared display) shifts every later sequence; the
+     * row must name it rather than report a bare off-by-one completion. */
+    {
+        key_sample probe_keys[2] = {{.injected = 1}};
+        samples foreign = {.keys = probe_keys, .count = 2, .first_sequence = 10, .completed = 1};
+        ingress(&foreign, 11, 2); /* sequence 11 = keys[1], never injected */
+        ingress(&foreign, 12, 3); /* beyond the measured range */
+        char fline[1024] = {0};
+        FILE *fout = fmemopen(fline, sizeof fline, "w"); REQUIRE(fout != NULL);
+        int frc = typing_checkpoint(fout, "raster", "serial", &foreign, 1, &tag);
+        REQUIRE(fflush(fout) == 0); fclose(fout);
+        printf("PROBE typing checkpoint foreign input: %s", fline);
+        REQUIRE(frc == 1 && foreign.invalid && strstr(fline, "foreign_input=2") != NULL);
     }
     samples measured = {.completed = 8};
     char line[1024] = {0};
@@ -619,9 +634,9 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
     (void)gate_row(name, &dequeue, 0, 0, true, &tag);
     (void)snprintf(name, sizeof name, "editor_%s_%s_injection_T4_G1", label, workload);
     int timing = gate_row(name, &t4, G1_P50, G1_P99, track, &tag);
-    printf("G1 %s workload=%s keys=%zu completed=%zu arrivals_active=%zu coalesced=%zu allocations=%zu mutations=%" PRIu64
+    printf("G1 %s workload=%s keys=%zu completed=%zu arrivals_active=%zu coalesced=%zu foreign_input=%zu allocations=%zu mutations=%" PRIu64
            " journal=%" PRIu64 " structural=%s mode=%s (M)%s\n", label, workload, count, measured.completed,
-           arrivals_active, coalesced, measured.allocations, after.mutations - before.mutations,
+           arrivals_active, coalesced, measured.foreign, measured.allocations, after.mutations - before.mutations,
            after.journal_records - before.journal_records, structural ? "FAIL" : "OK", track ? "TRACK" : "GATE", tag.power);
     TYPING_REQUIRE(editor_flush(e) == 0);
     result = row_result(timing, structural, track);

@@ -24,9 +24,15 @@ extern void *__libc_realloc(void *, size_t);
 
 static int guard_on;               /* set between begin/end */
 static size_t guard_count;         /* calls counted while guard_on */
+/* Per-thread exemption depth (edit-cx8): library code that law 2 exempts
+ * (P2.0 addendum: libxcb reply/event packets in the raster fence worker's
+ * post-submit completion handling; libxkbcommon/libxcb keymap construction
+ * on the x11 keymap worker) runs concurrently with a UI typing window.
+ * Thread-local, so it never hides another thread's allocation. */
+static _Thread_local unsigned guard_exempt;
 
 static void count_call(void) {
-    if (__atomic_load_n(&guard_on, __ATOMIC_RELAXED))
+    if (__atomic_load_n(&guard_on, __ATOMIC_RELAXED) && !guard_exempt)
         __atomic_fetch_add(&guard_count, 1, __ATOMIC_RELAXED);
 }
 
@@ -57,9 +63,14 @@ size_t edit_malloc_guard_end(void) {
     return __atomic_load_n(&guard_count, __ATOMIC_RELAXED);
 }
 
+void edit_malloc_guard_exempt_begin(void) { guard_exempt++; }
+void edit_malloc_guard_exempt_end(void) { if (guard_exempt) guard_exempt--; }
+
 #else
 
 bool edit_malloc_guard_active(void) { return false; }
 void edit_malloc_guard_begin(void) {}
 size_t edit_malloc_guard_end(void) { return 0; }
+void edit_malloc_guard_exempt_begin(void) {}
+void edit_malloc_guard_exempt_end(void) {}
 #endif

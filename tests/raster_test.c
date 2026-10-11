@@ -501,6 +501,62 @@ static int fence_outlives_test(void)
     return 0;
 }
 
+/* edit-cx8: the counting guard is process-wide. While a typing window is
+ * open on the UI thread, the previous frame's fence job polls XCB on a raster
+ * worker and libxcb mallocs each reply/event packet. P2.0 addendum item 3
+ * exempts that completion handling; the guard must not count it, or a real
+ * backend's typing rows report allocations our code never made. Keep the
+ * guard open across present -> fence/PresentComplete/Idle retirement only
+ * (submit already has its own 0-allocation check above). */
+static int fence_completion_guard_test(void)
+{
+    render_backend b = {0};
+    render_cell cells[24]; uint64_t bits[1]; render_grid g;
+    uint8_t pixels[8 * 16] = {0};
+    render_atlas_page page = {pixels, sizeof pixels, 8, 8, 16};
+    render_glyph glyph = {65, 0, 0, 0, 8, 16};
+    render_config cfg = {.dims = {4, 6, 8, 16}, .max_width = 32, .max_height = 128, .max_cells = 24,
+        .max_glyphs = 1, .max_pages = 1, .max_atlas_bytes = 128};
+    T(render_test_prepare(&b, &cfg) == RENDER_OK);
+    render_backend_info info; T(render_backend_query(&b, &info) == RENDER_OK);
+    void *state = aligned_alloc(info.state_align > 16 ? info.state_align : 16,
+                                (info.state_size + 63) & ~(size_t)63);
+    T(state != NULL);
+    T(init_on_worker(&b, &cfg, state, info.state_size) == RENDER_OK);
+    T(render_grid_init(&g, cfg.dims, cells, 24, bits, 1) == RENDER_OK);
+    g.pages = &page; g.page_count = 1; g.glyphs = &glyph; g.glyph_count = 1;
+    for (uint32_t i = 0; i < 24; i++) cells[i] = (render_cell){0, RENDER_NO_SLOT, 0x112233u, 0x445566u, 0, 0};
+    /* 16 full frames (E, enough that each retires through its own fence job;
+     * one would already show >=1 reply packet). */
+    size_t allocs = 0, completion_jobs = 0;
+    for (uint32_t id = 1; id <= 16; id++) {
+        uint64_t deadline = trace_now_ns() + UINT64_C(3000000000);
+        cells[id % 24].bg = id * 0x010203u;
+        T(render_frame_begin(&g, id) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
+        render_strip full = {0, 6};
+        T(render_backend_submit(&b, &g, &full, 1) == RENDER_OK);
+        int rc;
+        while ((rc = render_backend_present(&b, id)) == RENDER_ERR_BUSY) { render_test_pump(&b); T(trace_now_ns() < deadline); }
+        T(rc == RENDER_OK);
+        raster_metrics metrics; T(raster_frame_metrics(&b, &metrics));
+        completion_jobs += metrics.completion_jobs;
+        /* The UI side only drains the work mailbox here: full frames hand
+         * every XCB read to the fence worker (raster_completion_fd < 0). */
+        T(raster_completion_fd(&b) < 0);
+        edit_malloc_guard_begin();
+        while (b.active) { render_test_pump(&b); T(trace_now_ns() < deadline); }
+        allocs += edit_malloc_guard_end();
+    }
+    T(completion_jobs == 16);
+    printf("raster fence completion: frames=16 worker_fence_jobs=%zu counted_allocations=%zu guard=%d\n",
+        completion_jobs, allocs, edit_malloc_guard_active());
+    if (edit_malloc_guard_active()) T(allocs == 0);
+    render_backend_shutdown(&b);
+    free(state);
+    printf("raster fence completion: PASS (worker libxcb completion packets outside the law-2 count)\n");
+    return 0;
+}
+
 typedef struct raster_native_size { uint32_t width, height; } raster_native_size;
 static int raster_native_window(void *user, uint32_t width, uint32_t height)
 {
@@ -581,6 +637,7 @@ int main(int argc, char **argv)
     if (!(argc > 1 && !strcmp(argv[1], "--live-only")) && render_conformance_main() != 0) return 1;
     if (live_pixel_test() != 0) return 1;
     if (fence_outlives_test() != 0) return 1;
+    if (fence_completion_guard_test() != 0) return 1;
     if (raster_native_resize_test() != 0) return 1;
     if (g_up) { work_pool_shutdown(&g_pool); plat_shutdown(&g_plat); }
     printf("raster_test: PASS (requested conformance, upload ordering, typing allocations, live XShm)\n");

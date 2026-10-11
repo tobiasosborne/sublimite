@@ -60,6 +60,10 @@ TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
 # automatically. All callers share tools/with_display_lock.sh.
 DISPLAY_TEST_SAN := $(filter $(B)/san/tests/cli_test $(B)/san/tests/editor% $(B)/san/tests/x11% $(B)/san/tests/ref% $(B)/san/tests/gl% $(B)/san/tests/raster_test,$(TEST_SAN))
 BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
+# edit-cx8: display benches take the same lock. On a shared Xvfb another
+# worktree's suite (XTEST keys, setxkbmap) otherwise types into the bench
+# window mid-row: foreign input sequences, keymap-worker allocations.
+DISPLAY_BENCH := $(filter $(B)/bench/editor% $(B)/bench/x11% $(B)/bench/gl% $(B)/bench/raster% $(B)/bench/prewake% $(B)/bench/zygote% $(B)/bench/file_bench,$(BENCH_BIN))
 FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
 EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
@@ -137,7 +141,7 @@ check-sh: $(B)/tools/replay $(B)/bench/piece_bench
 # Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;
 # the full piece matrix is run by tools/bench_variant.sh on an idle box).
 bench: $(BENCH_BIN)
-	@set -e; $(SAFE_DISPLAY); for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; DISPLAY=$$d $$b $$args; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
+	@set -e; $(SAFE_DISPLAY); for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; case " $(DISPLAY_BENCH) " in *" $$b "*) DISPLAY=$$d sh tools/with_display_lock.sh $$b $$args;; *) DISPLAY=$$d $$b $$args;; esac; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
 
 fuzz: $(FUZZ_BIN)
 	@echo "fuzz: $(words $(FUZZ_BIN)) fuzzers built"

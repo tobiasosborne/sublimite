@@ -1,5 +1,9 @@
 #include "base/base.h"
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 static void test_version(void) {
     const char *v = edit_version();
@@ -90,6 +94,51 @@ static void test_pool(void) {
     puts("pool: ok");
 }
 
+/* edit-cx8: the exemption covers only the calling thread's bracketed calls.
+ * Threads are created and joined outside the guard window (pthread
+ * bookkeeping allocates); only the worker body runs inside it. */
+typedef struct exempt_arg { bool exempt; _Atomic int go, done; } exempt_arg;
+static void *exempt_alloc(void *arg) {
+    exempt_arg *a = arg;
+    void *(*volatile allocate)(size_t) = malloc;
+    while (!atomic_load(&a->go)) { }
+    if (a->exempt) edit_malloc_guard_exempt_begin();
+    void *p = allocate(24);
+    if (a->exempt) edit_malloc_guard_exempt_end();
+    free(p);
+    atomic_store(&a->done, 1);
+    return NULL;
+}
+
+static size_t guarded_worker(bool exempt) {
+    exempt_arg a = {.exempt = exempt};
+    pthread_t t;
+    EDIT_ASSERT(pthread_create(&t, NULL, exempt_alloc, &a) == 0);
+    edit_malloc_guard_begin();
+    atomic_store(&a.go, 1);
+    while (!atomic_load(&a.done)) { }
+    size_t n = edit_malloc_guard_end();
+    EDIT_ASSERT(pthread_join(t, NULL) == 0);
+    return n;
+}
+
+static void test_guard_exempt(void) {
+    void *(*volatile allocate)(size_t) = malloc;
+    size_t exempt = guarded_worker(true), counted = guarded_worker(false);
+    edit_malloc_guard_begin();
+    edit_malloc_guard_exempt_begin();
+    edit_malloc_guard_exempt_end();
+    void *p = allocate(24); free(p);      /* exemption closed: counted */
+    size_t after = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) {
+        printf("malloc guard exempt: worker exempt=%zu worker counted=%zu after_close=%zu\n",
+               exempt, counted, after);
+        EDIT_ASSERT(exempt == 0 && counted == 1 && after == 1);
+    } else {
+        puts("malloc guard exempt: SKIP (sanitizer owns malloc)");
+    }
+}
+
 static void test_cpu(void) {
     printf("cpu: avx2=%d popcnt=%d\n", (int)edit_cpu_has_avx2(),
            (int)edit_cpu_has_popcnt());
@@ -100,6 +149,7 @@ int main(void) {
     test_version();
     test_arena();
     test_pool();
+    test_guard_exempt();
     test_cpu();
     puts("base_test: PASS");
     return 0;

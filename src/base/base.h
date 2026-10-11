@@ -78,5 +78,10 @@ bool   edit_malloc_guard_active(void);
 void   edit_malloc_guard_begin(void);
 /* Returns the number of malloc/calloc/realloc calls since begin. */
 size_t edit_malloc_guard_end(void);
+/* Calling-thread-only exemption (nests). Bracket only exempt library calls
+ * (libxcb packet allocation in post-submit completion, P2.0 addendum), never
+ * our own code. Other threads keep counting. */
+void   edit_malloc_guard_exempt_begin(void);
+void   edit_malloc_guard_exempt_end(void);
 
 #endif

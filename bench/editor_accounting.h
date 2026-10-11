@@ -14,6 +14,7 @@ typedef struct samples {
     size_t allocations;
     key_sample *keys;
     size_t count, completed;
+    size_t foreign; /* ingress sequences the bench never injected (edit-cx8) */
     uint64_t first_sequence;
     bool invalid;
 } samples;
@@ -21,9 +22,13 @@ static void ingress(void *ctx, uint64_t sequence, uint64_t ns)
 {
     samples *s = ctx; s->ingress = ns; s->sequence = sequence;
     if (s->keys) {
-        if (sequence < s->first_sequence || sequence - s->first_sequence >= s->count) s->invalid = true;
-        else {
+        if (sequence < s->first_sequence || sequence - s->first_sequence >= s->count) {
+            s->invalid = true; s->foreign++;
+        } else {
             key_sample *k = &s->keys[sequence - s->first_sequence];
+            /* A sequence with no injected key came from outside the bench,
+             * e.g. another client's key on a shared display. */
+            if (!k->injected) s->foreign++;
             if (!k->injected || k->dequeued || ns < k->injected) s->invalid = true;
             k->dequeued = ns;
         }

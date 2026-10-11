@@ -196,6 +196,33 @@ static void upload_region(cpu_state *st)
     xcb_flush(st->conn);
 }
 
+/* edit-cx8: libxcb mallocs every reply/event packet it reads. On this
+ * worker that is post-submit completion handling, which law 2 exempts (P2.0
+ * addendum item 3), yet it runs while the UI thread's process-wide counting
+ * window for the next key is open. Exempt exactly these library calls on
+ * this thread; our own code here (post, publish) stays counted. */
+static int fence_poll_reply(xcb_connection_t *conn, unsigned int seq, void **reply, xcb_generic_error_t **err)
+{
+    edit_malloc_guard_exempt_begin();
+    int got = xcb_poll_for_reply(conn, seq, reply, err);
+    edit_malloc_guard_exempt_end();
+    return got;
+}
+static xcb_generic_event_t *fence_poll_special(xcb_connection_t *conn, xcb_special_event_t *special)
+{
+    edit_malloc_guard_exempt_begin();
+    xcb_generic_event_t *e = xcb_poll_for_special_event(conn, special);
+    edit_malloc_guard_exempt_end();
+    return e;
+}
+static xcb_generic_event_t *fence_poll_event(xcb_connection_t *conn)
+{
+    edit_malloc_guard_exempt_begin();
+    xcb_generic_event_t *e = xcb_poll_for_event(conn);
+    edit_malloc_guard_exempt_end();
+    return e;
+}
+
 static void fence_job_fn(work_ctx *c)
 {
     const fence_job *job = c->arg;
@@ -212,7 +239,7 @@ static void fence_job_fn(work_ctx *c)
         bool progressed = false;
         if (!got_fence) {
             void *reply = NULL; xcb_generic_error_t *err = NULL;
-            if (xcb_poll_for_reply(job->conn, seq, &reply, &err)) {
+            if (fence_poll_reply(job->conn, seq, &reply, &err)) {
                 t5 = trace_now_ns(); got_fence = true; progressed = true;
                 if (err || !reply || !((xcb_sync_query_fence_reply_t *)reply)->triggered) status = -1;
                 free(reply); free(err);
@@ -220,7 +247,7 @@ static void fence_job_fn(work_ctx *c)
             }
         }
         xcb_generic_event_t *e;
-        while ((e = xcb_poll_for_special_event(job->conn, job->special)) != NULL) {
+        while ((e = fence_poll_special(job->conn, job->special)) != NULL) {
             progressed = true;
             const xcb_present_generic_event_t *ge = (const xcb_present_generic_event_t *)e;
             if (ge->evtype == XCB_PRESENT_COMPLETE_NOTIFY) {
@@ -236,7 +263,7 @@ static void fence_job_fn(work_ctx *c)
             }
             free(e);
         }
-        while ((e = xcb_poll_for_event(job->conn)) != NULL) {
+        while ((e = fence_poll_event(job->conn)) != NULL) {
             progressed = true;
             if (e->response_type == 0) status = -1;
             free(e);

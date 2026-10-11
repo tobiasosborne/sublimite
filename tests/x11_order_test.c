@@ -1,5 +1,6 @@
 /* P2.2e regressions. Include the implementation only to inject setup failures
  * and inspect ordered dispatch without adding production test hooks. */
+#include "base/base.h"
 #include "x11/input.h"
 #include "x11/clip.h"
 #include "x11_xvfb.h"
@@ -354,6 +355,36 @@ static void test_rescan_publish(void) {
     xkb_keymap_unref(old);
     plat_shutdown(&p);
 }
+/* edit-cx8: a server keymap change (setxkbmap from any client on a shared
+ * display) rebuilds the keymap on this worker while the UI thread may have a
+ * law-2 typing window open. The process-wide guard must not count that
+ * library construction. Only the worker job runs inside the window: it is
+ * submitted directly, awaited on the pool eventfd, adopted afterwards. */
+static void test_rebuild_guard(void) {
+    plat p;
+    if (!open_plat(&p)) return;
+    sink s = { .p = &p };
+    plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+    x11_runtime *rt = IN(&p)->runtime;
+    struct xkb_keymap *old = xkb_keymap_ref(IN(&p)->keymap);
+    edit_malloc_guard_begin();
+    work_handle h = work_submit(&rt->pool, (work_job){ rebuild_keyboard, rt, 0, WORK_BULK });
+    if (h.epoch) rt->map_pending = true;
+    struct pollfd pfd = { work_pool_eventfd(&rt->pool), POLLIN, 0 };
+    int ready = 0;
+    /* 200 x 10 ms = 2 s (G, liveness only) for one local Xvfb keymap fetch. */
+    for (unsigned i = 0; h.epoch && i < 200 && ready <= 0; i++) ready = poll(&pfd, 1, 10);
+    size_t allocs = edit_malloc_guard_end();
+    for (unsigned i = 0; i < 100 && !s.keymaps; i++) plat_run_for(&p, &cb, 5);
+    printf("x11 keymap rebuild: worker_job=%d ready=%d counted_allocations=%zu guard=%d\n",
+           h.epoch != 0, ready, allocs, edit_malloc_guard_active());
+    CHECK(h.epoch && ready > 0 && s.keymaps == 1 && IN(&p)->keymap != old,
+          "edit-cx8 worker rebuild published a replacement keymap");
+    CHECK(!edit_malloc_guard_active() || allocs == 0,
+          "edit-cx8 keymap worker library allocations outside the law-2 count");
+    xkb_keymap_unref(old);
+    plat_shutdown(&p);
+}
 static void test_repeat_order(void) {
     for (unsigned focus = 0; focus < 2; focus++) {
         plat p;
@@ -658,7 +689,7 @@ int main(int argc, char **argv) {
     if (!strcmp(which, "local_overflow")) test_local_overflow();
     if (!strcmp(which, "all") || !strcmp(which, "order")) { test_order(); test_poll_order(); }
     if (!strcmp(which, "all") || !strcmp(which, "slices")) test_slices();
-    if (!strcmp(which, "all") || !strcmp(which, "rescans")) { test_rescans(); test_rescan_publish(); }
+    if (!strcmp(which, "all") || !strcmp(which, "rescans")) { test_rescans(); test_rescan_publish(); test_rebuild_guard(); }
     if (!strcmp(which, "all") || !strcmp(which, "repeat_order")) test_repeat_order();
     if (!strcmp(which, "all") || !strcmp(which, "map_boundary")) { test_map_boundary(); test_live_map_boundary(); }
     if (!strcmp(which, "map_generations_pending")) test_map_generations_pending();
