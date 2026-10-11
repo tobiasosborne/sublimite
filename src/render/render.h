@@ -70,6 +70,17 @@ typedef struct render_strip {
     uint32_t first_row, row_count; /* full-width, half-open row run */
 } render_strip;
 
+/* Optional opaque RGB region, composited over cells at pixel coordinates.
+ * Caller storage is mutable again after submit: backends copy into init
+ * storage. Damage is independent of cell strips; full frames redraw both.
+ * Zero pixels disables the region. Stride/capacity are uint32_t elements. */
+typedef struct render_pixels {
+    const uint32_t *pixels;
+    size_t capacity, stride;
+    uint32_t x, y, width, height;
+    bool dirty;
+} render_pixels;
+
 typedef struct render_grid {
     render_dims dims;
     render_cell *cells;          /* exactly cols*rows active cells, row-major */
@@ -82,6 +93,7 @@ typedef struct render_grid {
     size_t glyph_count;
     uint32_t frame_id;           /* trace's uint32_t; 0 reserved for startup */
     bool full_frame, begun;
+    render_pixels region;
 } render_grid;
 
 /* UI thread only (pure read-only helpers may also operate on an exclusively
@@ -155,6 +167,7 @@ typedef struct render_config {
     struct plat *platform;      /* borrowed; NULL only for headless backend */
     struct work_pool *workers;  /* borrowed; CPU MT4 jobs use WORK_RASTER */
     render_hooks hooks;          /* NULL functions use trace defaults */
+    uint32_t max_region_width, max_region_height; /* init-only pixel reserve */
 } render_config;
 
 enum render_event_kind {

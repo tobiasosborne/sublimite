@@ -558,12 +558,15 @@ static int raster_native_resize_test(void)
 }
 
 static int review_cases(const char *which);
+static int minimap_region_test(void);
 
 int main(int argc, char **argv)
 {
     *(void **)(&real_shm_put) = dlsym(RTLD_NEXT, "xcb_shm_put_image");
     T(real_shm_put != NULL);
     if (argc > 2 && !strcmp(argv[1], "--review")) return review_cases(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--pixels-only")) return minimap_region_test();
+    T(minimap_region_test() == 0);
     T(!edit_malloc_guard_active() || external_guard_enabled());
     if (review_cases("all") != 0) return 1;
     if (kernel_random_test() || blend_exact_test() || partition_test()) return 1;
@@ -595,6 +598,7 @@ int main(int argc, char **argv)
 
 static bool review_fake, review_real_mailbox;
 static uint32_t review_uploads, review_presents, review_submit_calls;
+static uint16_t review_upload_width, review_upload_height;
 static uint32_t review_stop_calls, review_stop_at;
 static _Atomic uint32_t review_publish_calls;
 static uint32_t review_publish_failures;
@@ -674,7 +678,7 @@ static xcb_void_cookie_t review_put(xcb_connection_t *c, xcb_drawable_t d,
     uint8_t format, uint8_t send, xcb_shm_seg_t seg, uint32_t offset)
 {
     if (!review_fake) return xcb_shm_put_image(c,d,gc,tw,th,sx,sy,sw,sh,dx,dy,depth,format,send,seg,offset);
-    review_uploads++;
+    review_uploads++; review_upload_width = sw; review_upload_height = sh;
     return (xcb_void_cookie_t){1};
 }
 static int review_fd(xcb_connection_t *c) { return review_fake ? 42 : xcb_get_file_descriptor(c); }
@@ -801,6 +805,57 @@ static render_backend review_backend(cpu_state *st)
     b.state = st; b.initialized = true; b.active = true; b.active_frame = 7;
     b.config.hooks = (render_hooks){done_hook, complete_hook, NULL};
     return b;
+}
+/* edit-d5o: fixture uses two cell rows, two pixels per cell side; the
+ * region is the right-hand column below its top margin. Sentinel pixels
+ * prove map-only work leaves text and margins untouched. */
+static int minimap_region_test(void)
+{
+    review_reset_fixture();
+    enum { COLS = 2, ROWS = 2, CELL = 2, WIDTH = COLS * CELL, HEIGHT = ROWS * CELL,
+           MAP_WIDTH = CELL, MAP_HEIGHT = HEIGHT - 1 };
+    render_cell cells[COLS * ROWS] = {{0}}, copied[COLS * ROWS];
+    for (size_t i = 0; i < COLS * ROWS; i++)
+        cells[i] = (render_cell){.atlas_slot = RENDER_NO_SLOT, .bg = 0x171b22}; /* tab theme background */
+    uint32_t pixels[WIDTH * HEIGHT], source[MAP_WIDTH * MAP_HEIGHT], owned[MAP_WIDTH * MAP_HEIGHT];
+    for (size_t i = 0; i < WIDTH * HEIGHT; i++) pixels[i] = UINT32_MAX;
+    for (size_t i = 0; i < MAP_WIDTH * MAP_HEIGHT; i++) source[i] = i % 2 ? 0x20242c : 0x78808e;
+    render_strip copied_strip; work_pool pool = {.efd = -1};
+    cpu_state st = {.up = true, .pool = &pool, .max_strips = 1, .cells = copied,
+        .strips = &copied_strip, .pix = pixels, .stride_px = WIDTH,
+        .max_w = WIDTH, .max_h = HEIGHT, .region_pixels = owned};
+    render_backend backend = review_backend(&st);
+    render_grid grid = {.dims = {COLS, ROWS, CELL, CELL}, .cells = cells, .frame_id = backend.active_frame,
+        .region = {.pixels = source, .capacity = MAP_WIDTH * MAP_HEIGHT, .stride = MAP_WIDTH,
+            .x = CELL, .y = 1, .width = MAP_WIDTH, .height = MAP_HEIGHT, .dirty = true}};
+    edit_malloc_guard_begin(); T(cpu_submit(&backend, &grid, NULL, 0) == 0);
+    T(edit_malloc_guard_end() == 0);
+    T(st.nstrips == 0 && st.metrics.jobs == 1 && st.pending == 1);
+    T(owned[0] == 0x78808e && owned[1] == 0x20242c); /* existing minimap ink/background */
+    memset(source, 0, sizeof source); /* Caller storage is reusable after submit. */
+    work_ctx ctx = {.arg = review_queued[0].arg, .generation = grid.frame_id};
+    review_queued[0].fn(&ctx);
+    for (uint32_t y = 0; y < HEIGHT; y++) for (uint32_t x = 0; x < WIDTH; x++)
+        T(pixels[y * WIDTH + x] == (x >= CELL && y >= 1 ?
+            owned[(y - 1u) * MAP_WIDTH + x - CELL] : UINT32_MAX));
+    T(review_uploads == 0 && review_message_count == 1);
+    work_msg msg = review_messages[0]; msg.slot_ = st.handles[0].slot; msg.epoch_ = st.handles[0].epoch;
+    render_event event = {RENDER_EVENT_WORK, grid.frame_id, 0, &msg};
+    T(cpu_event(&backend, &event) == 0 && st.pending == 0 && review_uploads == 1);
+    T(review_upload_width == MAP_WIDTH && review_upload_height == MAP_HEIGHT);
+    /* A later damaged text row must reapply the retained region; the upper
+     * region scanline and undamaged text stay untouched. */
+    memcpy(copied, cells, sizeof cells);
+    st.scene.cells = copied;
+    work_ctx work = {0}; raster_palette palette = {0}; row_ctx row = {&st, &work, &palette};
+    do_row(&row, ROWS - 1u);
+    for (uint32_t y = CELL; y < HEIGHT; y++) for (uint32_t x = 0; x < WIDTH; x++)
+        T(pixels[y * WIDTH + x] == (x >= CELL ? owned[(y - 1u) * MAP_WIDTH + x - CELL] : 0x171b22));
+    T(pixels[CELL] == UINT32_MAX && pixels[WIDTH + CELL] == owned[0]);
+
+    review_fake = false;
+    puts("edit-d5o raster: owned region snapshot, map-only worker blit, UI upload, untouched text/margins passed");
+    return 0;
 }
 static int review_ownership(void)
 {

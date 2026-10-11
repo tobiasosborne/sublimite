@@ -87,6 +87,9 @@ struct editor {
     render_backend *backend;
     render_grid grid;
     render_grid text_grid, map_grid;
+    uint32_t *map_pixels, *map_scratch;
+    size_t map_pixel_capacity;
+    uint32_t map_capacity;
     layout lay;
     layout_config layout_cfg;
     render_atlas_page page;

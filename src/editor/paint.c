@@ -120,7 +120,7 @@ static int compose_chrome(editor *e)
     }
     return 0;
 }
-int editor_compose(editor *e)
+static int compose(editor *e)
 {
     /* The bottom row doubles as a transient status line until panel chrome
      * exists. A later generation restores it even on a caret-only frame.
@@ -141,6 +141,7 @@ int editor_compose(editor *e)
         }
     }
     if (e->buffer->source_stale) {
+        e->grid.region = (render_pixels){0};
         const char status[] = "Source changed: R reload / K keep";
         uint32_t cols = e->grid.dims.cols;
         for (uint32_t c = 0; c < cols; c++) {
@@ -182,14 +183,44 @@ int editor_compose(editor *e)
         const render_cell *src = e->text_grid.cells + (size_t)r * tc;
         bool different = memcmp(dst, src, (size_t)tc * sizeof *dst) != 0;
         if (different) memcpy(dst, src, (size_t)tc * sizeof *dst);
-        if (e->map_cols) {
-            src = e->map_grid.cells + (size_t)r * 8;
-            if (memcmp(dst + tc, src, (size_t)e->map_cols * sizeof *dst)) {
-                different = true; memcpy(dst + tc, src, (size_t)e->map_cols * sizeof *dst);
+        /* Background cells only; miniature ink lives in the pixel region. */
+        for (uint32_t c = 0; c < e->map_cols; c++) {
+            render_cell blank = {.atlas_slot = RENDER_NO_SLOT, .bg = colors.background};
+            if (memcmp(dst + tc + c, &blank, sizeof blank)) {
+                different = true; dst[tc + c] = blank;
             }
         }
         if (different) { rc = render_mark_rows(&e->grid, r + e->tab_rows, 1); if (rc) return rc; }
     }
+    if (e->map_cols) {
+        uint32_t width = e->map_cols * e->grid.dims.cell_w;
+        uint32_t height = e->text_grid.dims.rows * e->grid.dims.cell_h;
+        minimap *map = &e->buffer->map;
+        bool retained = map->filled && map->height == e->map_grid.dims.rows &&
+            map->identity.ctx == input.source.ctx && map->identity.span == input.source.span;
+        if (retained) {
+            rc = minimap_pixels(map, e->map_scratch, e->map_pixel_capacity,
+                width, height, width, first, visible, &colors);
+            if (rc) return rc;
+        } else {
+            /* Existing pending scrollbar at summary-row geometry, with the
+             * narrowest physical edge bar (one pixel, from edit-g11). */
+            for (uint32_t y = 0; y < height; y++) for (uint32_t x = 0; x < width; x++) {
+                uint32_t col = (uint32_t)((uint64_t)x * e->map_grid.dims.cols / width);
+                if (col + 1u == e->map_grid.dims.cols) col--; /* pending bar belongs only to the last pixel */
+                e->map_scratch[(size_t)y * width + x] = x + 1u == width ? colors.stale :
+                    e->map_grid.cells[(size_t)(y / 2u) * e->map_grid.dims.cols + col].bg;
+            }
+        }
+        render_pixels *region = &e->grid.region;
+        bool changed = !region->pixels || region->width != width || region->height != height ||
+            region->x != tc * e->grid.dims.cell_w || region->y != e->tab_rows * e->grid.dims.cell_h ||
+            memcmp(e->map_pixels, e->map_scratch, (size_t)width * height * sizeof(uint32_t));
+        if (changed) memcpy(e->map_pixels, e->map_scratch, (size_t)width * height * sizeof(uint32_t));
+        *region = (render_pixels){.pixels = e->map_pixels, .capacity = e->map_pixel_capacity,
+            .stride = width, .x = tc * e->grid.dims.cell_w, .y = e->tab_rows * e->grid.dims.cell_h,
+            .width = width, .height = height, .dirty = region->dirty || changed};
+    } else e->grid.region = (render_pixels){0};
     rc = compose_chrome(e); if (rc) return rc;
     if (e->unimplemented_frame == e->grid.frame_id) {
         const char status[] = "not implemented";
@@ -201,6 +232,13 @@ int editor_compose(editor *e)
         return render_mark_rows(&e->grid, row, 1);
     }
     return 0;
+}
+int editor_compose(editor *e)
+{
+    trace_record(TRACE_COMPOSE_BEGIN, e->grid.frame_id);
+    int rc = compose(e);
+    trace_record(TRACE_COMPOSE_END, e->grid.frame_id);
+    return rc;
 }
 int editor_pointer(editor *e, const plat_event *ev)
 {
@@ -236,7 +274,7 @@ int editor_pointer(editor *e, const plat_event *ev)
         e->map_drag_id != e->buffer->id || e->map_drag_generation != e->buffer->source_generation)) e->map_drag = false;
     if (e->map_drag) {
         minimap_input input = editor_map_input(e->buffer); minimap_target target;
-        int rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, row - e->tab_rows, &target);
+        int rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, ((int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h) / 2, &target);
         if (rc == MINIMAP_ERR_STALE) return editor_begin_frame(e);
         if (rc) return rc;
         e->v.state.first_line = target.line; e->v.state.first_byte = e->v.state.visual_byte = target.byte;

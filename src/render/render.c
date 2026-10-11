@@ -49,6 +49,7 @@ int render_frame_begin(render_grid *g, uint32_t frame_id)
     size_t words = (size_t)(g->dims.rows / 64u) + (g->dims.rows % 64u != 0u ? 1u : 0u);
     memset(g->dirty, 0, words * sizeof *g->dirty);
     g->frame_id = frame_id; g->begun = true; g->full_frame = false;
+    g->region.dirty = false;
     return RENDER_OK;
 }
 
@@ -144,6 +145,16 @@ static int render_atlas_validate(const render_grid *g, size_t *bytes)
 
 static int render_cells_validate(const render_grid *g)
 {
+    const render_pixels *p = &g->region;
+    if (p->pixels) {
+        uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;
+        if (!p->width || !p->height || p->stride < p->width ||
+            p->x > w || p->width > w - p->x || p->y > h || p->height > h - p->y ||
+            (size_t)(p->height - 1u) > (SIZE_MAX - p->width) / p->stride)
+            return RENDER_ERR_BOUNDS;
+        if (p->capacity < (size_t)(p->height - 1u) * p->stride + p->width)
+            return RENDER_ERR_CAPACITY;
+    }
     size_t count = (size_t)g->dims.cols * g->dims.rows;
     for (size_t i = 0; i < count; i++) {
         const render_cell *c = &g->cells[i];
@@ -227,6 +238,8 @@ int render_backend_init(render_backend *b, const render_config *config, void *st
     if (config->max_cells > SIZE_MAX / sizeof(render_cell) || config->max_glyphs > UINT32_MAX ||
         config->max_pages > UINT32_MAX || config->max_glyphs > SIZE_MAX / sizeof(render_glyph) ||
         config->max_pages > SIZE_MAX / sizeof(render_atlas_page)) return RENDER_ERR_BOUNDS;
+    if (config->max_region_width > config->max_width || config->max_region_height > config->max_height)
+        return RENDER_ERR_BOUNDS;
     b->state = state; b->config = *config;
     if (b->config.hooks.device_done == NULL) b->config.hooks.device_done = render_trace_device_done;
     if (b->config.hooks.present_complete == NULL) b->config.hooks.present_complete = render_trace_present_complete;
@@ -304,6 +317,8 @@ int render_backend_submit(render_backend *b, const render_grid *g, const render_
     if (rc != RENDER_OK) return rc;
     rc = render_cells_validate(g);
     if (rc != RENDER_OK) return rc;
+    if (g->region.pixels && (g->region.width > b->config.max_region_width ||
+        g->region.height > b->config.max_region_height)) return RENDER_ERR_CAPACITY;
     /* Implementations must not signal inside submit: adapter activates only
      * after success. Completion mailboxes are dispatched by UI after return. */
     rc = b->ops.submit(b, g, strips, count);

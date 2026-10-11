@@ -361,7 +361,7 @@ static int resize(editor *e)
     e->grid.dims = dims;
     e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
     e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
-    e->map_grid.dims.rows = e->text_grid.dims.rows;
+    e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
     e->v.config.rows = e->text_grid.dims.rows;
     /* Reinit clears cells for a changed compact stride; retain open-time wrap storage. */
     layout_wrap_row *rows = e->lay.wrap_rows, *plan = e->lay.wrap_plan; uint32_t cap = e->lay.wrap_capacity;

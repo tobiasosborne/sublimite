@@ -22,6 +22,8 @@ enum trace_ev {
     TRACE_T4_PRESENT_SUBMITTED,
     TRACE_T5_DEVICE_DONE,
     TRACE_T6_PRESENT_COMPLETE,
+    TRACE_COMPOSE_BEGIN, /* editor composition only, preserves pipeline IDs */
+    TRACE_COMPOSE_END,
     TRACE_EV_COUNT
 };
 

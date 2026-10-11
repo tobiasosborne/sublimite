@@ -194,9 +194,9 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     rc = undo_init(&b->undo, b->tree, 2 * b->history_cap + 8); if (rc) goto fail;
     b->undo_ready = true;
     b->history = edit_arena_alloc(&b->arena, b->history_cap * sizeof *b->history, 16);
-    minimap_row *rows = edit_arena_alloc(&b->arena, e->max_rows * sizeof *rows, 8);
+    minimap_row *rows = edit_arena_alloc(&b->arena, e->map_capacity * sizeof *rows, 8);
     if (!b->history || !rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    rc = minimap_init(&b->map, rows, e->max_rows); if (rc) goto fail;
+    rc = minimap_init(&b->map, rows, e->map_capacity); if (rc) goto fail;
     b->map_rows = rows;
     piece_snapshot *snap = piece_snapshot_take(b->pending_open ? b->preview : b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
@@ -276,7 +276,7 @@ int editor_activate(editor *e)
     e->buffer = tab ? find_buffer(e, tab->buffer) : e->empty;
     if (e->buffer->source_stale) e->buffer->prompt_ns = 0;
     if (!e->buffer->map.initialized) {
-        int rc = minimap_init(&e->buffer->map, e->buffer->map_rows, e->max_rows); if (rc) return rc;
+        int rc = minimap_init(&e->buffer->map, e->buffer->map_rows, e->map_capacity); if (rc) return rc;
     }
     e->tree = e->buffer->pending_open ? e->buffer->preview : e->buffer->tree; e->undo = &e->buffer->undo;
     view_config vc = {e->buffer->style.width, e->text_grid.dims.rows, 1, NULL, NULL};

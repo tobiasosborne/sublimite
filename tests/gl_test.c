@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <sched.h>
 #define GL_CHECK(c) do { if (!(c)) { fprintf(stderr,"gl_test:%d: FAIL %s\n",__LINE__,#c); return 1; } } while (0)
 /* Private unit access: compile the renderer with renamed exports. This tests
  * the real snapshot code with a native dispatch that rejects context binding;
@@ -82,6 +83,75 @@ void gl_review_plat_shutdown(plat *p);
 static EGLBoolean gl_reject_bind(EGLDisplay display, EGLSurface draw,
                                  EGLSurface read, EGLContext context)
 { (void)display; (void)draw; (void)read; (void)context; return EGL_FALSE; }
+/* edit-d5o: a right-hand cell-width region below the top pixel margin,
+ * matching the raster fixture. Mock dispatch records the real worker thread. */
+enum { GL_MAP_WIDTH = 2, GL_MAP_HEIGHT = 3, GL_MAP_PIXELS = GL_MAP_WIDTH * GL_MAP_HEIGHT };
+static pthread_t gl_pixels_ui;
+static _Atomic bool gl_pixels_on_ui, gl_pixels_bad;
+static _Atomic uint32_t gl_pixels_calls;
+static uint32_t gl_pixels_uploaded[GL_MAP_PIXELS];
+static void gl_pixels_note(void)
+{
+    if (pthread_equal(pthread_self(), gl_pixels_ui)) atomic_store(&gl_pixels_on_ui, true);
+    atomic_fetch_add(&gl_pixels_calls, 1);
+}
+static EGLBoolean gl_pixels_current(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext c)
+{ (void)d; (void)draw; (void)read; (void)c; gl_pixels_note(); return EGL_TRUE; }
+static EGLBoolean gl_pixels_release(void) { gl_pixels_note(); return EGL_TRUE; }
+static void gl_pixels_active(GLenum texture) { (void)texture; gl_pixels_note(); }
+static void gl_pixels_bind(GLenum target, GLuint texture) { (void)target; (void)texture; gl_pixels_note(); }
+static void gl_pixels_store(GLenum name, GLint value) { (void)name; (void)value; gl_pixels_note(); }
+static void gl_pixels_upload(GLenum target, GLint level, GLint x, GLint y,
+    GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
+{
+    (void)target; (void)level; gl_pixels_note();
+    if (x || y || width != GL_MAP_WIDTH || height != GL_MAP_HEIGHT ||
+        format != GL_BGRA || type != GL_UNSIGNED_BYTE) { atomic_store(&gl_pixels_bad, true); return; }
+    memcpy(gl_pixels_uploaded, pixels, sizeof gl_pixels_uploaded);
+}
+static GLsync gl_pixels_fence(GLenum condition, GLbitfield flags)
+{ (void)condition; (void)flags; gl_pixels_note(); return (GLsync)(uintptr_t)1; /* scripted fence identity */ }
+static void gl_pixels_flush(void) { gl_pixels_note(); }
+static GLenum gl_pixels_error(void) { gl_pixels_note(); return GL_NO_ERROR; }
+static int gl_pixels_worker_test(void)
+{
+    work_pool pool; GL_CHECK(work_pool_init_foreground(&pool, 1, 0) == 0);
+    gl_pixels_ui = pthread_self(); atomic_store(&gl_pixels_on_ui, false);
+    atomic_store(&gl_pixels_bad, false); atomic_store(&gl_pixels_calls, 0);
+    uint32_t source[GL_MAP_PIXELS], owned[GL_MAP_PIXELS];
+    for (size_t i = 0; i < GL_MAP_PIXELS; i++) source[i] = i < GL_MAP_WIDTH ? 0x78808e : 0x20242c;
+    render_cell cells[4] = {{0}}; /* fixture's two columns times two cell rows */
+    for (size_t i = 0; i < sizeof cells / sizeof cells[0]; i++) cells[i].atlas_slot = RENDER_NO_SLOT;
+    uint8_t seen[1]; gl_instance instances[4]; gl_strip strips[2];
+    gl_state state = {.workers = &pool, .region_pixels = owned, .instances = instances,
+        .strips = strips, .glyph_seen = seen, .upload_context = (EGLContext)(uintptr_t)1,
+        .eMakeCurrent = gl_pixels_current, .eReleaseThread = gl_pixels_release,
+        .gActiveTexture = gl_pixels_active, .gBindTexture = gl_pixels_bind,
+        .gPixelStorei = gl_pixels_store, .gTexSubImage2D = gl_pixels_upload,
+        .gFenceSync = gl_pixels_fence, .gFlush = gl_pixels_flush, .gGetError = gl_pixels_error};
+    render_backend backend = {.state = &state, .initialized = true, .active = true,
+        .active_frame = 1, .ops = {.event = gl_event}};
+    render_grid grid = {.dims = {2, 2, 2, 2}, .cells = cells, .frame_id = backend.active_frame,
+        .region = {.pixels = source, .capacity = GL_MAP_PIXELS, .stride = GL_MAP_WIDTH,
+            .x = GL_MAP_WIDTH, .y = 1, .width = GL_MAP_WIDTH, .height = GL_MAP_HEIGHT, .dirty = true}};
+    edit_malloc_guard_begin(); GL_CHECK(gl_submit(&backend, &grid, NULL, 0) == 0);
+    GL_CHECK(edit_malloc_guard_end() == 0 && state.region_pending && state.instance_count == 0);
+    memset(source, 0, sizeof source);
+    uint64_t deadline = trace_now_ns() + GL_COMPLETION_TIMEOUT_NS; /* existing backend completion horizon */
+    while (!work_handle_finished(&pool, state.region_job)) { GL_CHECK(trace_now_ns() < deadline); sched_yield(); }
+    GL_CHECK(state.region_pending && !atomic_load(&gl_pixels_on_ui) && !atomic_load(&gl_pixels_bad));
+    GL_CHECK(atomic_load(&gl_pixels_calls) > 0 && state.region_fence);
+    for (size_t i = 0; i < GL_MAP_PIXELS; i++)
+        GL_CHECK(gl_pixels_uploaded[i] == ((i < GL_MAP_PIXELS - GL_MAP_WIDTH ? 0x20242c : 0x78808e) | UINT32_C(0xff000000)));
+    while (state.region_pending) {
+        (void)work_mailbox_drain(&pool, gl_region_receive, &backend);
+        GL_CHECK(trace_now_ns() < deadline);
+    }
+    GL_CHECK(!state.region_pending);
+    work_pool_shutdown(&pool);
+    puts("edit-d5o GL: map-only owned snapshot, texture upload off UI, opaque BGRA, mailbox completion passed");
+    return 0;
+}
 static int gl_snapshot_test(void)
 {
     render_cell cells[12]; uint64_t dirty[1]; render_grid grid;
@@ -1374,6 +1444,9 @@ static int gl_foreign_diagnostics_test(void)
 }
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--pixel-region")) {
+        trace_init(); GL_CHECK(trace_thread_register() >= 0); return gl_pixels_worker_test();
+    }
     if (argc==3 && strcmp(argv[1],"--review")==0) {
         trace_init(); GL_CHECK(trace_thread_register()>=0);
         if (strcmp(argv[2],"p2-2")==0) return gl_foreign_diagnostics_test();
@@ -1411,6 +1484,7 @@ int main(int argc, char **argv)
     bool pixels_only=argc==2 && strcmp(argv[1],"--pixels-only")==0;
     GL_CHECK(argc==1 || pixels_only);
     trace_init(); GL_CHECK(trace_thread_register()>=0);
+    GL_CHECK(gl_pixels_worker_test() == 0);
     GL_CHECK(gl_snapshot_test()==0);
     GL_CHECK(gl_trace_unit_test()==0);
     GL_CHECK(gl_ring_unit_test()==0);

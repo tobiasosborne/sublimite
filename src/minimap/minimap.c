@@ -337,13 +337,17 @@ int minimap_pixels(const minimap *m, uint32_t *pixels, size_t capacity,
                    uint64_t first_line, uint64_t visible_lines,
                    const minimap_style *style)
 {
-    if (!m || !m->initialized || !m->filled || m->stale || !pixels || !style
+    if (!m || !m->initialized || !m->filled || !pixels || !style
         || !width || !height || stride < width || height > (uint64_t)m->height * 2
         || ((style->background | style->density | style->viewport | style->stale) & 0xff000000u))
         return MINIMAP_ERR_ARG;
     if ((size_t)(height - 1) > (SIZE_MAX - width) / stride
         || capacity < (size_t)(height - 1) * stride + width)
         return MINIMAP_ERR_CAPACITY;
+    if (m->stale) {
+        first_line = m->painted_first;
+        visible_lines = m->painted_end - m->painted_first;
+    }
     uint64_t end = first_line;
     if (first_line < m->lines) {
         uint64_t remaining = m->lines - first_line;

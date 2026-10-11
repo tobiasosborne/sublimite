@@ -4,6 +4,7 @@
 #include "gl/gl.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "trace/trace_fmt.h"
 #include "journal/journal.h"
 #include "x11/input.h"
 #include "findui/findui.h"
@@ -80,7 +81,8 @@ static int expect(editor *e, const char *text, uint64_t cursor)
 typedef struct flash_probe {
     editor *e;
     counted allocations;
-    render_cell previous[8 * 8];
+    render_cell *previous;
+    uint32_t *previous_pixels;
     size_t frames, orange_frames, stale_frames, changed_pending, chrome_markers;
     uint64_t fill_max_ns;
 } flash_probe;
@@ -107,6 +109,8 @@ static void flash_submit(void *ctx, const editor_frame *frame)
         p->stale_frames++;
         p->changed_pending += memcmp(p->previous, e->map_grid.cells,
             (size_t)e->map_grid.dims.rows * e->map_grid.dims.cols * sizeof(render_cell)) != 0;
+        p->changed_pending += memcmp(p->previous_pixels, e->grid.region.pixels,
+            (size_t)e->grid.region.width * e->grid.region.height * sizeof(uint32_t)) != 0;
     }
     if (e->tab_rows && e->grid.cells[e->grid.dims.cols - 1u].glyph_index == '!')
         p->chrome_markers++;
@@ -120,11 +124,16 @@ static int minimap_typing_flash(void)
         .cols = 40, .rows = 8, .hook_ctx = &probe,
         .on_ingress = flash_ingress, .on_submit = flash_submit};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0); probe.e = e;
+    probe.previous = calloc((size_t)e->map_grid.dims.rows * e->map_grid.dims.cols, sizeof *probe.previous);
+    probe.previous_pixels = calloc(e->map_pixel_capacity, sizeof *probe.previous_pixels);
+    T(probe.previous && probe.previous_pixels);
     /* N comes from the supplied Astra repro: 95 keystrokes, not a timing bound. */
     const size_t keys = 95;
     for (size_t i = 0; i < keys; i++) {
         memcpy(probe.previous, e->map_grid.cells,
             (size_t)e->map_grid.dims.rows * e->map_grid.dims.cols * sizeof(render_cell));
+        memcpy(probe.previous_pixels, e->grid.region.pixels,
+            (size_t)e->grid.region.width * e->grid.region.height * sizeof(uint32_t));
         T(press(e, key('x', 0, "x")) == 0);
     }
     /* Settle excludes index maintenance: explicitly run its next turn so the
@@ -139,7 +148,114 @@ static int minimap_typing_flash(void)
     T(!probe.allocations.active && probe.allocations.allocations == 0);
     T(!e->buffer->map.stale && e->buffer->map.revision == e->buffer->revision);
     T(editor_length(e) == cfg.initial_len + keys);
-    editor_close(e); return 0;
+    free(probe.previous_pixels); free(probe.previous); editor_close(e); return 0;
+}
+/* edit-d5o: geometry derives from the existing allocation fixture. The
+ * reference prepares ceil(map pixel height / PRD's two pixels per line)
+ * summaries independently, so a text-cell-height adapter cannot pass. */
+static int minimap_compose_pixels(const char *backend_name)
+{
+    render_backend backend = {0};
+    T((backend_name ? editor_backend_select(&backend, backend_name) : render_null_backend(&backend)) == 0);
+    const char fixture[] = "a b\n  cd\n\txyz\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz\n";
+    editor_config cfg = {.initial = (const uint8_t *)fixture, .initial_len = sizeof fixture - 1,
+        .cols = 40, .rows = 8};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint32_t w = e->grid.dims.cols * e->grid.dims.cell_w;
+    uint32_t h = e->grid.dims.rows * e->grid.dims.cell_h;
+    uint32_t mw = e->map_cols * e->grid.dims.cell_w;
+    uint32_t mh = e->text_grid.dims.rows * e->grid.dims.cell_h;
+    uint32_t summaries = (mh + 1u) / 2u; /* (G) PRD: two pixels per line. */
+    minimap_row *rows = calloc(summaries, sizeof *rows);
+    uint32_t *expected = calloc((size_t)mw * mh, sizeof *expected);
+    uint32_t *frame = calloc((size_t)w * h, sizeof *frame); T(rows && expected && frame);
+    minimap reference; minimap_input input = editor_map_input(e->buffer);
+    minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0, 0}; /* existing paint theme */
+    T(minimap_init(&reference, rows, summaries) == 0);
+    T(minimap_prepare(&reference, &input, summaries) == 0);
+    uint64_t visible = e->buffer->lines < e->text_grid.dims.rows ? e->buffer->lines : e->text_grid.dims.rows;
+    T(minimap_pixels(&reference, expected, (size_t)mw * mh, mw, mh, mw, 0, visible, &colors) == 0);
+    raster_scene scene = {e->grid.dims, e->grid.cells, e->grid.glyphs,
+        e->grid.glyph_count, e->grid.pages, e->grid.page_count, 0};
+    for (uint32_t r = 0; r < e->grid.dims.rows; r++)
+        raster_row_scalar(&scene, frame + (size_t)r * e->grid.dims.cell_h * w, w, r);
+    raster_blit_pixels(&e->grid.region, frame, w, 0, e->grid.region.height, 0);
+    for (uint32_t y = 0; y < mh; y++)
+        T(!memcmp(frame + (size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + w - mw,
+            expected + (size_t)y * mw, (size_t)mw * sizeof *expected));
+    if (backend_name && !strcmp(backend_name, "gl")) {
+        uint8_t *rgba = calloc((size_t)w * h, 4); T(rgba);
+        T(gl_read_pixels(&backend, rgba, (size_t)w * h * 4u) == 0);
+        for (uint32_t y = 0; y < mh; y++) for (uint32_t x = 0; x < mw; x++) {
+            size_t at = ((size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + w - mw + x) * 4u;
+            uint32_t color = ((uint32_t)rgba[at] << 16) | ((uint32_t)rgba[at + 1u] << 8) | rgba[at + 2u];
+            T(color == expected[(size_t)y * mw + x] && rgba[at + 3u] == UINT8_MAX);
+        }
+        free(rgba);
+    } else if (backend_name) {
+        plat *platform = backend.config.platform;
+        xcb_get_image_reply_t *reply = xcb_get_image_reply(platform->conn,
+            xcb_get_image(platform->conn, XCB_IMAGE_FORMAT_Z_PIXMAP, platform->win,
+                (int16_t)(w - mw), (int16_t)(e->tab_rows * e->grid.dims.cell_h),
+                (uint16_t)mw, (uint16_t)mh, UINT32_MAX), NULL);
+        T(reply && xcb_get_image_data_length(reply) >= (int)((size_t)mw * mh * sizeof(uint32_t)));
+        const uint32_t *actual = (const uint32_t *)xcb_get_image_data(reply);
+        for (size_t at = 0; at < (size_t)mw * mh; at++) T((actual[at] & UINT32_C(0xffffff)) == expected[at]);
+        free(reply);
+    }
+    T(e->grid.region.pixels && e->buffer->map.height == summaries);
+    /* Map-only colour/viewport changes must leave the cell damage empty. */
+    e->dirty = false; T(editor_begin_frame(e) == 0);
+    e->buffer->map.rows[0].marks[0] ^= UINT64_C(1); /* toggle the first fixture character */
+    edit_malloc_guard_begin(); T(editor_compose(e) == 0);
+    size_t allocations = edit_malloc_guard_end(); T(allocations == 0);
+    size_t count = 0; T(render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count) == 0);
+    T(count == 0 && e->grid.region.dirty);
+    uint64_t submitted_cells = backend.stats.submitted_cells;
+    T(settle(e) == 0 && backend.stats.submitted_cells == submitted_cells);
+    /* Same pixels are retained on a subsequent unchanged compose. */
+    e->dirty = false; T(editor_begin_frame(e) == 0); T(editor_compose(e) == 0);
+    T(!e->grid.region.dirty);
+    /* Pointer coordinates come from the fixture's second summary scanline;
+     * dragging above/below the region retains the existing endpoint clamps. */
+    uint32_t summary_row = e->buffer->map.active_rows / 2u;
+    minimap_target target; T(minimap_hit(&e->buffer->map, &input, e->buffer->index, summary_row, &target) == 0);
+    plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)(w - 1u), .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h + summary_row * 2u + 1u)};
+    T(editor_pointer(e, &click) == 0 && e->map_drag);
+    T(e->v.state.first_line == target.line && e->v.state.first_byte == target.byte);
+    click.kind = PLAT_EV_MOTION; click.y = -1; T(editor_pointer(e, &click) == 0);
+    T(e->v.state.first_line == 0);
+    click.y = (int32_t)h; T(editor_pointer(e, &click) == 0);
+    T(e->v.state.first_line == input.lines - 1u);
+    click.kind = PLAT_EV_BUTTON; click.press = false; T(editor_pointer(e, &click) == 0 && !e->map_drag);
+    free(frame); free(expected); free(rows); editor_close(e);
+    puts("edit-d5o compose: minimap pixel rows match independent minimap_pixels reference"); return 0;
+}
+static int minimap_compose_cost(void)
+{
+    /* Stamp buffers follow bench/editor_bench.c's existing power stamp. */
+    char power[32] = "unknown", load[24] = "unknown";
+    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fgets(power, sizeof power, f)) power[strcspn(power, "\n")] = 0; fclose(f); }
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fgets(load, sizeof load, f)) load[strcspn(load, " \n")] = 0; fclose(f); }
+    const char *stamp = !strcmp(power, "Discharging") ? "[bat]" :
+        !strcmp(power, "Charging") || !strcmp(power, "Full") || !strcmp(power, "Not charging") ? "[AC]" : "[unknown]";
+    printf("edit-d5o STAMP (M)%s BAT0=%s load1=%s shared box\n", stamp, power, load);
+    trace_reset(); T(minimap_typing_flash() == 0); /* supplied drive's keystroke fixture */
+    const char *path = getenv("EDITOR_COMPOSE_TRACE");
+    f = path ? fopen(path, "w+b") : tmpfile(); T(f);
+    T(trace_dump(f) == 0); rewind(f);
+    trace_loaded dump; T(trace_fmt_load_dump(f, &dump) == 0); fclose(f);
+    uint64_t *cost = NULL; size_t count = 0;
+    T(trace_fmt_latencies(dump.recs, dump.nrecs, TRACE_COMPOSE_BEGIN, TRACE_COMPOSE_END, &cost, &count) == 0);
+    T(count > 0);
+    uint64_t p50 = trace_fmt_pct(cost, count, 50), p99 = trace_fmt_pct(cost, count, 99);
+    printf("edit-d5o compose (M)%s samples=%zu p50_ns=%llu p99_ns=%llu max_ns=%llu "
+        "derivation=COMPOSE_END-COMPOSE_BEGIN; nearest-rank=ceil(samples*pct/100)\n",
+        stamp, count, (unsigned long long)p50, (unsigned long long)p99, (unsigned long long)cost[count - 1u]);
+    free(cost); trace_fmt_dump_free(&dump); return 0;
 }
 /* (G) Exact byte offsets derive from the ASCII fixture's literal prefixes.
  * The viewport has two text rows to exercise page movement across that pair;
@@ -2374,6 +2490,10 @@ int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     if (argc == 2) {
+        if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
+        if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
+        if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
+        if (!strcmp(argv[1], "--minimap-pixels")) return minimap_compose_pixels(NULL);
         if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
         if (!strcmp(argv[1], "--selection-chords")) return selection_chords();
         if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
@@ -2410,6 +2530,7 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(minimap_compose_pixels(NULL) == 0);
     T(minimap_typing_flash() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);

@@ -27,11 +27,14 @@ enum gl_upload { GL_UPLOAD_LEGACY, GL_UPLOAD_SUBDATA, GL_UPLOAD_ORPHAN, GL_UPLOA
 #define GL_FRAME_ATLAS_LIMIT (16u * 1024u * 1024u)
 #define GL_FRAME_PIXEL_LIMIT UINT64_C(262144)
 #define GL_COMPLETION_TIMEOUT_NS UINT64_C(3000000000)
+/* Private mailbox kind, ASCII 'GLPX', separate from existing poll wakes. */
+#define GL_PIXELS_MESSAGE UINT32_C(0x474c5058)
 typedef struct gl_cell_slot { render_cell *cells; GLsync fence; } gl_cell_slot;
 typedef struct gl_state {
     void *egl_lib, *gl_lib;
     EGLDisplay display;
     EGLContext context;
+    EGLContext upload_context;
     EGLSurface surface;
     bool egl_live, own_native_conn, own_arena, persistent, requested_persistent;
     edit_arena arena;
@@ -51,6 +54,13 @@ typedef struct gl_state {
     size_t *page_offsets;
     uint32_t atlas_width, atlas_height;
     GLuint vao, vbo, program, atlas_texture, target_texture, fbo;
+    GLuint region_texture, region_fbo;
+    uint32_t *region_pixels;
+    render_pixels region;
+    GLsync region_fence;
+    work_handle region_job;
+    uint32_t region_generation;
+    bool region_pending;
     GLint surface_uniform, atlas_uniform, shift_uniform;
     GLsync fence;
     void *mapped;
@@ -142,6 +152,7 @@ typedef struct gl_state {
     PFNGLBLITFRAMEBUFFERPROC gBlitFramebuffer;
     PFNGLFENCESYNCPROC gFenceSync;
     PFNGLCLIENTWAITSYNCPROC gClientWaitSync;
+    PFNGLWAITSYNCPROC gWaitSync;
     PFNGLDELETESYNCPROC gDeleteSync;
     PFNGLFLUSHPROC gFlush;
     PFNGLFINISHPROC gFinish;
@@ -259,6 +270,7 @@ static bool gl_load_api(gl_state *s)
     if (!gl_proc(s,"glBlitFramebuffer",&s->gBlitFramebuffer,sizeof s->gBlitFramebuffer)) return false;
     if (!gl_proc(s,"glFenceSync",&s->gFenceSync,sizeof s->gFenceSync)) return false;
     if (!gl_proc(s,"glClientWaitSync",&s->gClientWaitSync,sizeof s->gClientWaitSync)) return false;
+    if (!gl_proc(s,"glWaitSync",&s->gWaitSync,sizeof s->gWaitSync)) return false;
     if (!gl_proc(s,"glDeleteSync",&s->gDeleteSync,sizeof s->gDeleteSync)) return false;
     if (!gl_proc(s,"glFlush",&s->gFlush,sizeof s->gFlush)) return false;
     if (!gl_proc(s,"glFinish",&s->gFinish,sizeof s->gFinish)) return false;
@@ -397,6 +409,10 @@ static bool gl_resources(gl_state *s, const render_config *cfg)
     reserve += cfg->max_glyphs + 256;
     if (s->image_bytes>SIZE_MAX-reserve || s->cell_bytes>SIZE_MAX-reserve-s->image_bytes) return false;
     if (s->upload!=GL_UPLOAD_LEGACY) reserve+=s->image_bytes+s->cell_bytes;
+    size_t region_bytes = (size_t)cfg->max_region_width * cfg->max_region_height * sizeof(uint32_t);
+    if (reserve > SIZE_MAX - _Alignof(uint32_t) ||
+        region_bytes > SIZE_MAX - reserve - _Alignof(uint32_t)) return false;
+    reserve += region_bytes + _Alignof(uint32_t);
     edit_arena *arena = cfg->arena;
     if (arena == NULL) { if (edit_arena_init(&s->arena, reserve) != 0) return false; s->own_arena = true; arena = &s->arena; }
     if (s->upload==GL_UPLOAD_LEGACY) s->instances = edit_arena_alloc(arena, s->vbo_bytes, _Alignof(gl_instance));
@@ -405,6 +421,21 @@ static bool gl_resources(gl_state *s, const render_config *cfg)
     s->atlas_dirty = edit_arena_alloc(arena, height, 1);
     s->page_offsets = edit_arena_alloc(arena, page_bytes != 0 ? page_bytes : 1, _Alignof(size_t));
     s->glyph_seen = edit_arena_alloc(arena, cfg->max_glyphs != 0 ? cfg->max_glyphs : 1, 1);
+    if (region_bytes) {
+        s->region_pixels = edit_arena_alloc(arena, region_bytes, _Alignof(uint32_t));
+        if (!s->region_pixels) return false;
+        s->gGenTextures(1, &s->region_texture);
+        s->gBindTexture(GL_TEXTURE_2D, s->region_texture);
+        s->gTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        s->gTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        s->gTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)cfg->max_region_width,
+            (GLsizei)cfg->max_region_height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+        s->gGenFramebuffers(1, &s->region_fbo);
+        s->gBindFramebuffer(GL_FRAMEBUFFER, s->region_fbo);
+        s->gFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, s->region_texture, 0);
+        if (s->gCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    }
     if ((s->upload==GL_UPLOAD_LEGACY && !s->instances) || !s->strips || !s->atlas_cache || !s->atlas_dirty || !s->page_offsets || !s->glyph_seen) return false;
     if (s->upload!=GL_UPLOAD_LEGACY) {
         s->images=edit_arena_alloc(arena,s->image_bytes,_Alignof(uint32_t));
@@ -524,6 +555,13 @@ static int gl_check_error(gl_state *s)
 }
 static void gl_release(gl_state *s)
 {
+    if (s->workers && s->region_job.epoch) {
+        (void)work_mailbox_bind(s->workers, s->region_job, s->region_generation, NULL, NULL);
+        work_cancel(s->workers, s->region_job);
+        while (!work_handle_finished(s->workers, s->region_job)) {
+            struct timespec pause={0,1000000}; (void)nanosleep(&pause,NULL);
+        }
+    }
     gl_wake_cancel(s);
     if (s->workers!=NULL && s->wake.epoch!=0) {
         while (!work_handle_finished(s->workers,s->wake)) {
@@ -543,6 +581,9 @@ static void gl_release(gl_state *s)
         if (s->image_vbo && s->gDeleteBuffers) s->gDeleteBuffers(1,&s->image_vbo);
         if (s->image_texture && s->gDeleteTextures) s->gDeleteTextures(1,&s->image_texture);
         if (s->fence != NULL && s->gDeleteSync != NULL) s->gDeleteSync(s->fence);
+        if (s->region_fence && s->gDeleteSync) s->gDeleteSync(s->region_fence);
+        if (s->region_fbo && s->gDeleteFramebuffers) s->gDeleteFramebuffers(1, &s->region_fbo);
+        if (s->region_texture && s->gDeleteTextures) s->gDeleteTextures(1, &s->region_texture);
         if (s->mapped != NULL && s->gUnmapBuffer != NULL) { s->gBindBuffer(GL_ARRAY_BUFFER,s->vbo); (void)s->gUnmapBuffer(GL_ARRAY_BUFFER); }
         if (s->gDeleteProgram != NULL && s->program) s->gDeleteProgram(s->program);
         if (s->gDeleteFramebuffers != NULL && s->fbo) s->gDeleteFramebuffers(1,&s->fbo);
@@ -555,6 +596,8 @@ static void gl_release(gl_state *s)
         (void)s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
     }
     if (s->context != EGL_NO_CONTEXT && s->eDestroyContext != NULL) (void)s->eDestroyContext(s->display,s->context);
+    if (s->upload_context != EGL_NO_CONTEXT && s->eDestroyContext != NULL)
+        (void)s->eDestroyContext(s->display,s->upload_context);
     if (s->surface != EGL_NO_SURFACE && s->eDestroySurface != NULL) (void)s->eDestroySurface(s->display,s->surface);
     /* Each backend owns its EGL native connection/display. Termination cannot
      * invalidate a neighbour, and precedes disconnect of the native identity. */
@@ -609,6 +652,18 @@ static void gl_draw(gl_state *s)
         s->gFlush();
     }
     s->gDisable(GL_SCISSOR_TEST);
+    if (s->region.pixels) {
+        if (s->region_fence) {
+            s->gWaitSync(s->region_fence, 0, GL_TIMEOUT_IGNORED);
+            s->gDeleteSync(s->region_fence); s->region_fence = NULL;
+        }
+        const render_pixels *p = &s->region;
+        GLint x = (GLint)p->x, y = (GLint)(h - p->y - p->height);
+        s->gBindFramebuffer(GL_READ_FRAMEBUFFER, s->region_fbo);
+        s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
+        s->gBlitFramebuffer(0, 0, (GLint)p->width, (GLint)p->height,
+            x, y, x + (GLint)p->width, y + (GLint)p->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
     s->gBindFramebuffer(GL_READ_FRAMEBUFFER,s->fbo); s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);
     /* Resizing only the grid can expose cells from an earlier, larger grid
      * in either native swap buffer. Erase the fractional-cell margins too. */
@@ -699,6 +754,11 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
         EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,EGL_NONE};
     s->context=s->eCreateContext(s->display,chosen,EGL_NO_CONTEXT,ca);
     if (s->context==EGL_NO_CONTEXT) goto fail;
+    if (cfg->max_region_width && cfg->max_region_height) {
+        if (!gl_extension(extensions, "EGL_KHR_surfaceless_context")) goto fail;
+        s->upload_context = s->eCreateContext(s->display, chosen, s->context, ca);
+        if (s->upload_context == EGL_NO_CONTEXT) goto fail;
+    }
     s->surface=s->eCreatePlatformWindowSurface(s->display,chosen,&s->native_win,NULL);
     if (s->surface==EGL_NO_SURFACE || !gl_bind(s)) goto fail;
     if (!s->eSwapInterval(s->display,swap_interval) || !gl_load_api(s)) goto fail;
@@ -815,10 +875,51 @@ static int gl_upload_pending(gl_state *s)
     }
     return gl_check_error(s);
 }
+/* Exclusive snapshot and shared context. Native upload/driver work stays
+ * outside input->submit; GPU ordering crosses the mailbox via region_fence. */
+static void gl_region_upload(work_ctx *ctx)
+{
+    gl_state *s = ctx->arg;
+    int32_t status = RENDER_ERR_DEVICE;
+    if (work_should_stop(ctx)) return;
+    if (s->eMakeCurrent(s->display, EGL_NO_SURFACE, EGL_NO_SURFACE, s->upload_context)) {
+        size_t count = (size_t)s->region.width * s->region.height;
+        /* (P) BGRA8's alpha byte must be opaque: R8 maximum = 255. */
+        for (size_t i = 0; i < count; i++) s->region_pixels[i] |= UINT32_C(0xff000000);
+        s->gActiveTexture(GL_TEXTURE0);
+        s->gBindTexture(GL_TEXTURE_2D, s->region_texture);
+        s->gPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        s->gTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+            (GLsizei)s->region.width, (GLsizei)s->region.height,
+            GL_BGRA, GL_UNSIGNED_BYTE, s->region_pixels);
+        s->region_fence = s->gFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        s->gFlush();
+        if (s->region_fence && s->gGetError() == GL_NO_ERROR) status = RENDER_OK;
+        if (!s->eMakeCurrent(s->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
+            status = RENDER_ERR_DEVICE;
+        if (!s->eReleaseThread()) status = RENDER_ERR_DEVICE;
+    }
+    work_msg msg = {.kind = GL_PIXELS_MESSAGE, .generation = ctx->generation};
+    memcpy(msg.data, &status, sizeof status);
+    /* Publication is the final access to backend-owned state. */
+    while (!work_should_stop(ctx)) {
+        if (work_publish(ctx, &msg)) return;
+        struct timespec pause = {0, 50000}; nanosleep(&pause, NULL);
+    }
+}
+static void gl_region_receive(const work_msg *msg, void *user)
+{
+    render_backend *b = user;
+    if (!b->initialized || !b->active || msg->generation != b->active_frame) return;
+    render_event event = {RENDER_EVENT_WORK, msg->generation, 0, msg};
+    (void)render_backend_event(b, &event);
+}
 static int gl_submit(render_backend *b,const render_grid *g,const render_strip *strips,size_t count)
 {
     gl_state *s=b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->region_job.epoch && !work_handle_finished(s->workers, s->region_job))
+        return RENDER_ERR_BUSY;
     if (g->glyph_count>GL_FRAME_GLYPH_LIMIT || g->page_count>GL_FRAME_PAGE_LIMIT) return RENDER_ERR_CAPACITY;
     /* Bound unique referenced coverage before changing any snapshot/lease.
      * Overlapping atlas rectangles still consume their full copy-work cost. */
@@ -901,6 +1002,31 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
     }
     s->strip_count=count; s->instance_count=n;
     if (n!=0 && s->persistent) memcpy(s->mapped,s->instances,n*sizeof(gl_instance));
+    bool upload_region = g->region.pixels && (g->region.dirty || g->full_frame ||
+        !s->region.pixels || s->region.width != g->region.width || s->region.height != g->region.height);
+    s->region = g->region;
+    s->region_pending = false;
+    if (g->region.pixels) {
+        s->region.pixels = s->region_pixels;
+        s->region.stride = g->region.width;
+        s->region.capacity = (size_t)g->region.width * g->region.height;
+    }
+    if (upload_region) {
+        /* Texture scanlines run bottom-to-top; reverse into owned storage. */
+        for (uint32_t y = 0; y < g->region.height; y++)
+            memcpy(s->region_pixels + (size_t)(g->region.height - 1u - y) * g->region.width,
+                g->region.pixels + (size_t)y * g->region.stride,
+                (size_t)g->region.width * sizeof(uint32_t));
+        s->region_generation = g->frame_id;
+        s->region_job = work_submit(s->workers, (work_job){gl_region_upload, s, g->frame_id,
+            s->workers->foreground_enabled ? WORK_FOREGROUND : WORK_RASTER});
+        if (!s->region_job.epoch) { s->region.pixels = NULL; return RENDER_ERR_BUSY; }
+        if (work_mailbox_bind(s->workers, s->region_job, g->frame_id, gl_region_receive, b)) {
+            work_cancel(s->workers, s->region_job); s->region.pixels = NULL;
+            return RENDER_ERR_DEVICE;
+        }
+        s->region_pending = true;
+    }
     if (s->upload==GL_UPLOAD_PERSISTENT) {
         s->ring_last=s->ring_current; s->ring_has_last=true;
         s->ring_next=(s->ring_current+1u)%GL_CELL_RING; s->leased=false;
@@ -912,6 +1038,7 @@ static int gl_present(render_backend *b,uint32_t id)
 {
     gl_state *s=b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->region_pending) return RENDER_ERR_BUSY;
     if (s->swapped) return id==s->swapped_id ? RENDER_OK : RENDER_ERR_FRAME;
     if (!gl_bind(s)) return gl_fail(s);
     if (s->fence!=NULL) { s->gDeleteSync(s->fence); s->fence=NULL; }
@@ -942,6 +1069,15 @@ static int gl_present(render_backend *b,uint32_t id)
 static int gl_event(render_backend *b,const render_event *event)
 {
     gl_state *s=b->state;
+    if (event->work && event->work->kind == GL_PIXELS_MESSAGE) {
+        const work_msg *msg = event->work;
+        if (!s->region_pending || msg->generation != s->region_generation ||
+            msg->slot_ != s->region_job.slot || msg->epoch_ != s->region_job.epoch)
+            return RENDER_ERR_UNSUPPORTED;
+        int32_t status; memcpy(&status, msg->data, sizeof status);
+        s->region_pending = false;
+        return status == RENDER_OK ? RENDER_OK : gl_fail(s);
+    }
     if (event->work==NULL || event->work->kind!=GL_POLL_MESSAGE) return RENDER_ERR_UNSUPPORTED;
     if (s->failed) return RENDER_ERR_DEVICE;
     if (!b->active || !b->presented) return RENDER_OK;

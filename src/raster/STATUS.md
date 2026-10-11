@@ -205,3 +205,11 @@ allocations with active guard (M)[AC], original fence lifetime and native resize
 contract green. Final G11 TRACK row and its sanitizer self-check complete;
 qualifying wakeup/sample acceptance remains unmeasured, CPU timings are not a
 loaded-host gate verdict. See the report for terminal-frame accounting red/green.
+
+# edit-d5o: pixel region
+
+Raster snapshots an optional frame pixel region into init-owned storage.
+Workers blit it into the retained back buffer and restore it where damaged
+cell rows overlap. Map-only frames upload and present only the region, with
+no text row rasterization. See [the report](../../docs/worker-reports/edit-d5o.md)
+for headless ownership/damage checks and required native reruns.

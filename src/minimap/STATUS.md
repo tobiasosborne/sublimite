@@ -91,3 +91,10 @@ Full stamped bench lines and each finding's red/green are in P4.5b.
 LeakSanitizer is disabled in this sandbox; coordinator reruns with leaks on.
 X11 tests require socket access to Xvfb :99 (sandbox-only make check cannot
 connect; the required check is retried with X socket access).
+
+# edit-d5o: retained pixel rendering
+
+The pixel renderer accepts stale prepared summaries and uses their retained
+ready viewport. The editor checks source identity and pixel-derived summary
+height before using them. The regression checks exact retained pixels with
+source-read and allocation guards. See [the report](../../docs/worker-reports/edit-d5o.md).

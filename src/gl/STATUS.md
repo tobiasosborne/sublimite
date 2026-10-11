@@ -116,3 +116,13 @@ Missing/coordinator work:
   are documented for a future bead; render.h remains frozen and untouched.
 - The synthetic layout bench excludes document mutation/input ingress/minimap;
   it cannot establish the editor's end-to-end G1 verdict.
+
+# edit-d5o: miniature texture upload
+
+An optional frame pixel region uses an init-reserved texture, snapshot and
+shared surfaceless EGL upload context. A work job performs native upload;
+authenticated mailbox completion and a shared GPU fence order the region
+blit before presentation. No allocation/native upload is added to submit.
+EGL without the surfaceless-context extension takes the established raster
+fallback. Headless dispatch checks and pending native readback verification
+are in [the report](../../docs/worker-reports/edit-d5o.md).

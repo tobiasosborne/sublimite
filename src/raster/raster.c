@@ -58,6 +58,8 @@ typedef struct cpu_state {
     render_glyph *glyphs;
     render_atlas_page *pages;
     render_strip *strips;
+    uint32_t *region_pixels;
+    render_pixels region;
     size_t max_cells, max_glyphs, max_pages, max_strips;
     raster_scene scene;
     size_t nstrips;
@@ -106,6 +108,15 @@ static void post(work_ctx *c, uint32_t kind, uint64_t ns, int32_t status, uint64
 
 typedef struct row_ctx { cpu_state *st; work_ctx *work; raster_palette *palette; } row_ctx;
 static bool row_should_stop(void *u) { return work_should_stop(u); }
+static void blit_row(cpu_state *st, uint32_t row)
+{
+    const render_pixels *p = &st->region;
+    uint32_t top = row * st->scene.dims.cell_h, end = top + st->scene.dims.cell_h;
+    if (!p->pixels || end <= p->y || top >= p->y + p->height) return;
+    uint32_t first = top > p->y ? top - p->y : 0;
+    uint32_t last = end < p->y + p->height ? end - p->y : p->height;
+    raster_blit_pixels(p, st->pix, st->stride_px, first, last, st->alpha_or);
+}
 static void do_row(void *u, uint32_t row)
 {
     row_ctx *ctx = u;
@@ -114,6 +125,7 @@ static void do_row(void *u, uint32_t row)
     (void)raster_row_cached_cancellable(&st->scene,
         st->pix + (size_t)row * st->scene.dims.cell_h * st->stride_px,
         st->stride_px, row, ctx->palette, row_should_stop, ctx->work);
+    if (!work_should_stop(ctx->work)) blit_row(st, row);
 }
 
 static void strip_job_fn(work_ctx *c)
@@ -126,6 +138,18 @@ static void strip_job_fn(work_ctx *c)
     j->palette.rebuilds = 0;
     row_ctx rows = {st, c, &j->palette};
     raster_for_rows(st->strips, st->nstrips, lo, hi, do_row, &rows);
+    /* Cell jobs own their dirty rows. Changed region rows outside those
+     * strips are distributed separately, so no two jobs write a scanline. */
+    if (st->region.pixels && st->region.dirty) {
+        raster_partition(st->scene.dims.rows, j->njobs, j->index, &lo, &hi);
+        for (uint32_t row = lo; row < hi && !work_should_stop(c); row++) {
+            bool dirty = false;
+            for (size_t i = 0; i < st->nstrips; i++)
+                if (row >= st->strips[i].first_row &&
+                    row - st->strips[i].first_row < st->strips[i].row_count) { dirty = true; break; }
+            if (!dirty) blit_row(st, row);
+        }
+    }
     uint64_t end = trace_now_ns();
     if (work_should_stop(c)) return;
     work_msg m = {.kind = MSG_STRIPS, .generation = c->generation};
@@ -156,6 +180,16 @@ static void upload_strip(cpu_state *st, uint32_t index)
         }
         ord = next;
     }
+    xcb_flush(st->conn);
+}
+static void upload_region(cpu_state *st)
+{
+    const render_pixels *p = &st->region;
+    if (!p->pixels || !p->dirty) return;
+    xcb_shm_put_image(st->conn, st->pixmap, st->gc,
+        (uint16_t)st->max_w, (uint16_t)st->max_h, (uint16_t)p->x, (uint16_t)p->y,
+        (uint16_t)p->width, (uint16_t)p->height, (int16_t)p->x, (int16_t)p->y,
+        st->depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, st->seg, 0);
     xcb_flush(st->conn);
 }
 
@@ -236,6 +270,7 @@ static void cpu_release(cpu_state *st)
     if (st->pix) shmdt(st->pix);
     if (st->shmid >= 0) shmctl(st->shmid, IPC_RMID, NULL);
     free(st->cells); free(st->glyphs); free(st->pages); free(st->strips);
+    free(st->region_pixels);
     memset(st, 0, sizeof *st);
     st->shmid = -1;
 }
@@ -358,6 +393,11 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     st->glyphs = calloc(st->max_glyphs ? st->max_glyphs : 1, sizeof *st->glyphs);
     st->pages = calloc(st->max_pages ? st->max_pages : 1, sizeof *st->pages);
     st->strips = calloc(st->max_strips, sizeof *st->strips);
+    size_t region_capacity = (size_t)cfg->max_region_width * cfg->max_region_height;
+    if (region_capacity) {
+        st->region_pixels = calloc(region_capacity, sizeof *st->region_pixels);
+        if (!st->region_pixels) { rc = RENDER_ERR_INIT; goto fail; }
+    }
     if (!st->cells || !st->glyphs || !st->pages || !st->strips) { rc = RENDER_ERR_INIT; goto fail; }
     st->scene = (raster_scene){cfg->dims, st->cells, st->glyphs, 0, st->pages, 0, st->alpha_or};
     st->up = true;
@@ -427,7 +467,7 @@ static bool inline_cursor_damage(cpu_state *st, const render_grid *g,
                                  const render_strip *strips, size_t count)
 {
     st->inline_count = 0;
-    if (!st->caret_hint || !st->snapshot_valid ||
+    if (g->region.dirty || !st->caret_hint || !st->snapshot_valid ||
         (uint64_t)g->dims.cell_w * g->dims.cell_h > 4096u || count != 1 || strips[0].row_count != 1 ||
         memcmp(&st->scene.dims, &g->dims, sizeof g->dims) ||
         st->scene.glyph_count != g->glyph_count || st->scene.page_count != g->page_count ||
@@ -473,6 +513,8 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     if (!st->up) return RENDER_ERR_STATE;
     if (st->failed) return RENDER_ERR_DEVICE;
     if (st->have_frame) return RENDER_ERR_BUSY; /* previous frame not yet fully presented */
+    if (g->region.pixels && (g->region.x > INT16_MAX || g->region.y > INT16_MAX))
+        return RENDER_ERR_UNSUPPORTED;
     if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT ||
         g->page_count > RASTER_FRAME_PAGE_LIMIT ||
         (size_t)g->dims.cols * g->dims.rows > RASTER_FRAME_CELL_LIMIT) return RENDER_ERR_CAPACITY;
@@ -480,6 +522,19 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     if (retire_rc != RENDER_OK) return retire_rc;
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
     st->inline_frame = inline_cursor_damage(st, g, strips, count);
+    if (g->region.pixels) {
+        bool copy = g->region.dirty || g->full_frame || !st->region.pixels ||
+            g->region.width != st->region.width || g->region.height != st->region.height;
+        st->region = g->region;
+        st->region.pixels = st->region_pixels;
+        st->region.stride = g->region.width;
+        st->region.capacity = (size_t)g->region.width * g->region.height;
+        st->region.dirty = copy;
+        if (copy) for (uint32_t y = 0; y < g->region.height; y++)
+            memcpy(st->region_pixels + (size_t)y * g->region.width,
+                g->region.pixels + (size_t)y * g->region.stride,
+                (size_t)g->region.width * sizeof(uint32_t));
+    } else st->region = (render_pixels){0};
     uint32_t cols = g->dims.cols, total = 0;
     for (size_t i = 0; i < count; i++) {
         memcpy(&st->cells[(size_t)strips[i].first_row * cols], &g->cells[(size_t)strips[i].first_row * cols],
@@ -493,6 +548,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     st->scene.glyph_count = g->glyph_count; st->scene.page_count = g->page_count;
     st->nstrips = count; st->total_rows = total; st->frame_id = g->frame_id;
     uint32_t njobs = st->inline_frame ? 0 : (total < RASTER_JOBS ? total : RASTER_JOBS);
+    if (st->region.dirty && !njobs) njobs = 1; /* map-only frame owns one region job */
     st->metrics.jobs = njobs;
     if (!njobs) st->metrics.ready_ns = trace_now_ns();
     memset(st->strip_done, 0, sizeof st->strip_done);
@@ -539,7 +595,13 @@ static int cpu_present(render_backend *b, uint32_t frame_id)
         xcb_sync_query_fence_cookie_t ck = xcb_sync_query_fence(st->conn, st->device_fence);
         st->metrics.fence_sequence = ck.sequence;
         xcb_xfixes_region_t update = 0;
-        if (st->inline_frame) {
+        if (!st->nstrips && st->region.pixels && st->region.dirty) {
+            const render_pixels *p = &st->region;
+            xcb_rectangle_t rect = {(int16_t)p->x, (int16_t)p->y,
+                (uint16_t)p->width, (uint16_t)p->height};
+            update = xcb_generate_id(st->conn);
+            xcb_xfixes_create_region(st->conn, update, 1, &rect);
+        } else if (st->inline_frame) {
             xcb_rectangle_t rects[2];
             for (uint32_t i = 0; i < st->inline_count; i++) {
                 uint32_t at = st->inline_at[i];
@@ -599,9 +661,10 @@ static int cpu_event(render_backend *b, const render_event *event)
         if (!st->pending || st->strip_done[p.msc]) return RENDER_ERR_STATE;
         uint64_t upload_start = trace_now_ns();
         upload_strip(st, (uint32_t)p.msc);
-        uint64_t queued = trace_now_ns();
         st->strip_done[p.msc] = true;
         st->pending--;
+        if (!st->pending) upload_region(st);
+        uint64_t queued = trace_now_ns();
         st->metrics.strip_ns[p.msc] = p.ns - p.ust;
         st->metrics.queue_ns[p.msc] = p.ust - st->metrics.submit_ns;
         st->metrics.upload_issue_ns[p.msc] = queued - upload_start;

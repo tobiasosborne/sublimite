@@ -98,7 +98,16 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
     size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
-    size_t reserve = 2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
+    /* (G) strip reservation = existing eight text columns; summary spacing
+     * = PRD's two pixels. Both image buffers are reserved before input. */
+    uint32_t map_width = (e->max_cols < 8u ? e->max_cols : 8u) * atlas->cell.cell_w;
+    uint32_t map_height = e->max_rows * atlas->cell.cell_h;
+    e->map_capacity = (map_height + 1u) / 2u;
+    e->map_pixel_capacity = (size_t)map_width * map_height;
+    size_t reserve = 2 * e->map_pixel_capacity * sizeof(uint32_t) +
+        (size_t)e->map_capacity * 8u * sizeof(render_cell) +
+        ((size_t)e->map_capacity + 63u) / 64u * sizeof(uint64_t) +
+        2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         (size_t)e->max_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) + 2u * 1024u * 1024u;
@@ -121,19 +130,22 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     render_cell *full = edit_arena_alloc(&e->arena, cells * sizeof *full, 16);
     render_cell *text = edit_arena_alloc(&e->arena, cells * sizeof *text, 16);
     /* Minimap is painted in a compact grid with independent row stride. */
-    render_cell *map = edit_arena_alloc(&e->arena, (size_t)e->max_rows * 8 * sizeof *map, 16);
+    render_cell *map = edit_arena_alloc(&e->arena, (size_t)e->map_capacity * 8 * sizeof *map, 16);
     uint64_t *full_bits = edit_arena_alloc(&e->arena, words * sizeof *full_bits, 8);
     uint64_t *text_bits = edit_arena_alloc(&e->arena, words * sizeof *text_bits, 8);
-    uint64_t *map_bits = edit_arena_alloc(&e->arena, words * sizeof *map_bits, 8);
+    size_t map_words = ((size_t)e->map_capacity + 63u) / 64u;
+    uint64_t *map_bits = edit_arena_alloc(&e->arena, map_words * sizeof *map_bits, 8);
+    e->map_pixels = edit_arena_alloc(&e->arena, e->map_pixel_capacity * sizeof(uint32_t), 16);
+    e->map_scratch = edit_arena_alloc(&e->arena, e->map_pixel_capacity * sizeof(uint32_t), 16);
     if (!e->ops || !e->stage || !e->indent_bytes || !e->ws_ranges || !e->strips || !e->row_byte || !e->row_used ||
-        !full || !text || !map || !full_bits || !text_bits || !map_bits) { rc = EDITOR_ERR_MEMORY; goto fail; }
+        !e->map_pixels || !e->map_scratch || !full || !text || !map || !full_bits || !text_bits || !map_bits) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_dims dims = {cols, rows, atlas->cell.cell_w, atlas->cell.cell_h};
     e->tab_rows = rows > 1 ? 1u : 0u; e->map_cols = cols >= 24 ? 8u : 0u;
     render_dims td = dims; td.cols -= e->map_cols; td.rows -= e->tab_rows;
-    render_dims md = td; md.cols = 8;
+    render_dims md = {8, (td.rows * dims.cell_h + 1u) / 2u, 1, 2};
     rc = render_grid_init(&e->grid, dims, full, cells, full_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->text_grid, td, text, cells, text_bits, words); if (rc) goto fail;
-    rc = render_grid_init(&e->map_grid, md, map, (size_t)e->max_rows * 8, map_bits, words); if (rc) goto fail;
+    rc = render_grid_init(&e->map_grid, md, map, (size_t)e->map_capacity * 8, map_bits, map_words); if (rc) goto fail;
     e->page = (render_atlas_page){atlas->pixels, atlas->pixels_len, (size_t)95 * dims.cell_w, 95 * dims.cell_w, dims.cell_h};
     layout_ascii_glyphs(atlas, e->glyphs);
     e->grid.pages = &e->page; e->grid.page_count = 1; e->grid.glyphs = e->glyphs; e->grid.glyph_count = LAYOUT_ASCII_GLYPHS;
@@ -157,7 +169,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_config render = {.dims = dims, .max_width = e->max_cols * dims.cell_w, .max_height = e->max_rows * dims.cell_h,
         .max_cells = cells, .max_glyphs = LAYOUT_ASCII_GLYPHS, .max_pages = 1, .max_atlas_bytes = atlas->pixels_len,
-        .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool};
+        .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
+        .max_region_width = map_width, .max_region_height = map_height};
     rc = init_backend(e, render, state);
     if (rc && may_fallback) {
         e->stats.backend_init_error = rc;

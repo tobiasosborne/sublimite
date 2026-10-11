@@ -550,3 +550,19 @@ paint, retained cells, chrome markers, final revision and typing allocations.
 Paint audit, red/green, builds, sandbox restrictions and comparison-drive
 handoff are in [the worker report](../../docs/worker-reports/edit-g11.md).
 
+
+# edit-d5o: pixel minimap composition
+
+Compose now attaches the miniature as an independent frame pixel region.
+Summary geometry and pointer navigation derive from the PRD line spacing,
+and open-time arenas reserve all pixel/scratch/summary storage. Pending
+indexing retains the ready image and viewport. Backend snapshots permit
+continued UI composition without borrowing mutable pixels. Validation,
+trace-derived compose cost and remaining display/drive verification are in
+[the worker report](../../docs/worker-reports/edit-d5o.md).
+
+Final outcome: strict GCC release build and the focused sanitizer/release
+region checks pass; the release typing allocation guard is active and reports
+no allocations. The full sanitizer driver stops at blocked IPC setup; every
+suite was run separately, with native X/IPC restrictions and isolated reruns
+itemized in the report. Display readback and the Astra drive remain pending.

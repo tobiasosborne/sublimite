@@ -63,6 +63,11 @@ typedef struct raster_scene {
  * Scalar is the reference; SSE2 must be pixel-exact equal. */
 void raster_row_scalar(const raster_scene *s, uint32_t *dst, size_t stride_px, uint32_t row);
 void raster_row_sse2(const raster_scene *s, uint32_t *dst, size_t stride_px, uint32_t row);
+/* Blit validated region scanlines [first,end) (relative to the region) into
+ * the full back buffer. Disjoint scanlines can run on separate workers. */
+void raster_blit_pixels(const render_pixels *region, uint32_t *dst,
+                        size_t stride, uint32_t first, uint32_t end,
+                        uint32_t alpha_or);
 #define RASTER_PALETTE_SLOTS 64u
 typedef struct raster_palette_entry {
     uint32_t fg, bg;

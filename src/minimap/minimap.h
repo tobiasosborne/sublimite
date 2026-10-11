@@ -126,7 +126,9 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
  * Small hits use exact cached line starts. Large hits resolve via index on
  * demand (one existing line_to_byte query, may scan one chunk); idx must model
  * input.source. Stale hits fail; output unchanged on failure. */
-/* Source-read-free pixel dump of prepared summaries. (G) perf target §2:
+/* Source-read-free pixel dump of prepared summaries. Stale summaries retain
+ * their painted viewport, as in fill; caller verifies source/height identity.
+ * (G) perf target §2:
  * two logical pixels per summary line, a one-pixel-wide non-space mark on
  * the first scanline and a blank second scanline. Grouped/sampled summaries
  * retain their existing approximate navigation. height <= m->height*2.

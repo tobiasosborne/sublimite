@@ -186,6 +186,19 @@ static void pixel_geometry(void)
     CHECK(minimap_pixels(&m, pixels, HEIGHT * STRIDE, WIDTH, HEIGHT, STRIDE,
                          UINT64_MAX, UINT64_MAX, &style) == 0);
     CHECK(pixels[3 * STRIDE + 3] == style.background);
+    /* edit-d5o: pending compose must reproduce the ready viewport, even
+     * if navigation changed while indexing. No reads or allocations. */
+    uint32_t retained[HEIGHT * STRIDE];
+    CHECK(minimap_pixels(&m, retained, HEIGHT * STRIDE, WIDTH, HEIGHT, STRIDE,
+                         1, 2, &style) == 0);
+    m.painted_first = 1; m.painted_end = 3; /* fixture's viewport [1,1+2). */
+    m.stale = true;
+    calls = f.calls; edit_malloc_guard_begin();
+    CHECK(minimap_pixels(&m, pixels, HEIGHT * STRIDE, WIDTH, HEIGHT, STRIDE,
+                         0, 0, &style) == 0);
+    CHECK(edit_malloc_guard_end() == 0 && f.calls == calls);
+    for (uint32_t y = 0; y < HEIGHT; y++)
+        CHECK(!memcmp(pixels + y * STRIDE, retained + y * STRIDE, WIDTH * sizeof *pixels));
     puts("edit-8m3: pixel marks, line spacing, viewport wash/edge, stride, source/allocation guards: ok");
 }
 /* Optional review artifact: rendered by the real minimap pixel API.
