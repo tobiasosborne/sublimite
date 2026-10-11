@@ -1,0 +1,3 @@
+Resolved every conflict marker, preserving clipboard/panel and save/restore/journal behavior. No `git` or `bd` commands ran.
+
+`make all` and all requested focused ASan tests passed without sanitizer diagnostics. The full editor suite exited 1 on native-display and launcher assertions; details are in the [resolver report](/home/tobias/Projects/sublimite/.wt/edit-ck4/docs/worker-reports/edit-ck4-resolve2.md).

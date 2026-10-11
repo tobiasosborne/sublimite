@@ -1,4 +1,26 @@
-# HANDOFF — sublimité, session 10 (updated 2026-10-11 ~14:20; improvement loop running)
+# HANDOFF — sublimité, end of session 10 (2026-10-11 ~15:45)
+
+## Read first
+**Main (pushed) has, all landed today after serial targeted runs on :99:** process reset + golden-master rule; Astra drive 1 report (VERDICT no) + Opus design research; flash fix; minimap composed from pixels (8m3 + d5o); shared inotify service (er2); wrap input-window fix; findui s3 (lez); Ctrl+Y + panel-chord guard (whl/2gx); clipboard (cde); Ctrl+S + startup restore (ck4); 1 GiB near-end stall (2ty); handoff limit (jmn); scroll s3 (ovu); **GL init 10 s timeout bug** (40t); Unicode glyphs (08z); tree-sitter runtime + src/hl (v0o.2); benches exit 0 on timing (lwq); startup stages (2ts); DPI-derived font size + zoom (m3g). Last main-level sanity (font, trace, editor, p4, cli) green at 0381fed; later commits are docs/reports only.
+
+**Known visible defect on main:** at 243 DPI the window opens at 1728x1260 but the raster surface still paints 960x600 (build/design/main-dpi243-half.png) → **edit-a6v (P0)**, Codex worker was running at the cut (.wt/edit-a6v). Nothing goes to Tobias before a6v lands and Astra drive 2 says yes.
+
+**Verified or resolved, not landed (worktrees .wt/<bead>, WIP-snapshotted):**
+- edit-3kk scroll wiring: 20-hunk resolve done + my hand merge of the readiness clauses; targeted run was mid-way (scroll/render green so far; editor/p4/cli pending). Rebase onto main, finish the run, land.
+- edit-v0o.7 config: resolver 2 done (file font.size → DPI path; env overrides file); run mid-way (config/font green; editor/p4/cli pending).
+- edit-457.8 hot exit (+9ma): I renamed its window fields to e->font.window_*; its new editor_hot_exit_test:174 then fails at editor_open → needs a look (probably my rename changed the restored-size semantics, or EMFILE); journal_test green.
+- edit-5ih font selection: 8-hunk conflicts with m3g/08z; Codex resolver was running at the cut.
+- edit-q0g partial (x11; fix unimplemented; headless red test only) — low value, leave.
+**Codex workers still running at the cut (reports land in docs/worker-reports/<bead>-s*-final.md):** edit-a6v, edit-73j (mouse/wheel/find panel), edit-v0o.1 (Wayland), edit-a2g (large-file remainder), edit-d50 (Sublime keymap parity), edit-5ih resolver. Land each the same way: snapshot, rebase onto main (resolver for semantic hunks, keep-both only for tests/STATUS/docs), serial targeted run with a private XDG_RUNTIME_DIR on :99, cherry-pick, close bead.
+
+**Astra next:** drive 2 brief at build/astra/brief2.md targets **:98** (Xvfb 2880x1800 **-dpi 243**, running; Sublime launched there) so the DPI path is exercised; run it after a6v lands and a rebuild, Tobias launches it (sandbox denies the display); then the Sublime golden-master catalogue (build/astra/brief-sublime-catalogue.md). Nothing to Tobias before a yes.
+
+**Beads filed today still open:** edit-cx8 (P1: editor_bench raster typing path reports allocations: law 2 check), edit-2cs (P3: stale zygote variant; long benches), edit-b0j design spec (sent to Tobias with mocks; Opus report docs/design/state-of-design-2026.md disagrees on typeface/minimap; Tobias decides per section), edit-pi6 (Tobias's real-display use, blocked on edit-w34.4 yes).
+
+**Lessons (binding; see also the earlier list below):** land editor beads one at a time and rebase the next immediately; verify serially; `git cherry-pick` has no -q; a `cd` in a compound command moves the session cwd; a worker's branch snapshot can contain conflict markers if a rebase was left mid-way, always `git status` before building; two Xvfb now: :99 (96 dpi) and :98 (243 dpi).
+
+---
+
 
 ## State now (read first)
 **Landed on main today (all verified by serial targeted runs on :99: editor, p4, module suites, cli):** process reset + golden-master rule (PRD §3/§9, CLAUDE.md laws 1/4/8, PLAN §1 loop); Astra drive 1 report (VERDICT no) and the Opus design research; edit-g11 flash fix (+P4 test correction); edit-8m3 + edit-d5o minimap (per-character pixels composed into the frame, translucent viewport band); edit-er2 shared inotify service (200 opens accepted); the wrap input-window fix; edit-lez s3; edit-whl/2gx (Ctrl+Y redo, panel chords consumed with a notice); edit-cde clipboard (all paths); edit-ck4 (durable async Ctrl+S, startup restores unsaved session); edit-2ty (1 GiB near-end stall); edit-jmn (tab reservation, readable IPC errors); edit-ovu s3; edit-40t (**GL init completion message had generation 0 since de7fb22: every GL init waited 10 s then failed**; fixed); edit-08z (Unicode glyphs via the runtime font owner); edit-v0o.2 (tree-sitter v0.27.1 vendored + src/hl parser). Pushed through f9de9b2; later landings (08z, hl) await the sanity run then push.
