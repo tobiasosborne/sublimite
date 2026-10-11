@@ -131,8 +131,8 @@ make: *** [Makefile:105: check] Error 1
 The process failed; full `make check` is **not green** in this sandbox. Every
 sanitizer test executable was additionally invoked individually, with logs in
 `build/edit-08z/` and outcomes in `suites.tsv`. Final targeted reruns are recorded
-in `work_test-final.log`, `editor_test-final.log`, `editor-pending-controls.log`
-and the Unicode green logs above.
+in `work_test-final.log`, `editor_test-final.log`, `editor-pending-controls.log`,
+`harness-final.log` and the Unicode green logs above.
 
 Direct socket probes demonstrate the restriction:
 
