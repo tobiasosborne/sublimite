@@ -56,6 +56,22 @@ static uint64_t count_ink(const uint8_t *p, size_t n, uint64_t ink)
     return ink < MINIMAP_LINE_CAP ? ink : MINIMAP_LINE_CAP;
 }
 
+/* (G) default tab width from editor/open.c, matching layout's stops.
+ * Columns saturate at the existing MINIMAP_LINE_CAP: clipped tails cost no
+ * character work. Each non-space column contributes a one-pixel mark. */
+static void mark_chars(minimap_row *row, const uint8_t *p, size_t n,
+                       uint32_t *column)
+{
+    for (size_t j = 0; j < n && *column < MINIMAP_LINE_CAP; j++) {
+        uint8_t c = p[j];
+        if (c == '\t') *column += 4u - *column % 4u;
+        else {
+            if (!is_space(c)) row->marks[*column / 64u] |= UINT64_C(1) << (*column % 64u);
+            (*column)++;
+        }
+    }
+}
+
 static void finish_line(minimap *m, uint64_t line, uint64_t start, uint64_t ink)
 {
     minimap_row *r = &m->rows[line / m->lines_per_row];
@@ -67,6 +83,7 @@ static void finish_line(minimap *m, uint64_t line, uint64_t start, uint64_t ink)
 static int small_rows(minimap *m, const minimap_input *input)
 {
     uint64_t off = 0, line = 0, ink = 0, start = 0;
+    uint32_t column = 0;
     while (off < input->source.len) {
         const uint8_t *p = NULL;
         size_t n = input->source.span(input->source.ctx, off, &p);
@@ -76,11 +93,13 @@ static int small_rows(minimap *m, const minimap_input *input)
         while (j < n) {
             const uint8_t *nl = memchr(p + j, '\n', n - j);
             size_t end = nl ? (size_t)(nl - p) : n;
+            if (line < input->lines && line % m->lines_per_row == 0)
+                mark_chars(&m->rows[line / m->lines_per_row], p + j, end - j, &column);
             ink = count_ink(p + j, end - j, ink);
             if (!nl) break;
             if (line >= input->lines) return MINIMAP_ERR_SOURCE;
             finish_line(m, line++, start, ink);
-            start = off + end + 1; ink = 0; j = end + 1;
+            start = off + end + 1; ink = 0; column = 0; j = end + 1;
         }
         off += n;
     }
@@ -99,7 +118,7 @@ static uint64_t scale(uint64_t a, uint32_t b, uint32_t d)
     return (a / d) * b + (a % d) * b / d;
 }
 
-static int sample_ink(const lineidx_src *s, uint64_t off, uint64_t *out)
+static int sample_ink(const lineidx_src *s, uint64_t off, minimap_row *out)
 {
     uint8_t scratch[MINIMAP_SAMPLE_BYTES];
     const uint8_t *sample = scratch;
@@ -133,7 +152,9 @@ static int sample_ink(const lineidx_src *s, uint64_t off, uint64_t *out)
     }
     const uint8_t *nl = memchr(sample + begin, '\n', have - begin);
     size_t end = nl ? (size_t)(nl - sample) : have;
-    *out = count_ink(sample + begin, end - begin, 0);
+    out->ink = count_ink(sample + begin, end - begin, 0);
+    uint32_t column = 0;
+    mark_chars(out, sample + begin, end - begin, &column);
     return MINIMAP_OK;
 }
 
@@ -144,7 +165,7 @@ static int large_rows(minimap *m, const minimap_input *input)
     uint32_t samples = m->active_rows < MINIMAP_MAX_SAMPLES ? m->active_rows : MINIMAP_MAX_SAMPLES;
     if (chunks && chunks < samples) samples = (uint32_t)chunks;
     uint32_t previous = UINT32_MAX;
-    uint64_t ink = 0, boundary = 0;
+    uint64_t boundary = 0; minimap_row sample = {0};
     for (uint32_t r = 0; r < m->active_rows; r++) {
         minimap_row *v = &m->rows[r];
         v->first_line = (uint64_t)r * m->lines_per_row;
@@ -153,12 +174,14 @@ static int large_rows(minimap *m, const minimap_input *input)
         uint32_t group = (uint32_t)((uint64_t)samples * r / m->active_rows);
         if (group != previous) {
             boundary = scale(chunks, group, samples) * LINEIDX_CHUNK;
-            int rc = sample_ink(&input->source, boundary, &ink);
+            memset(&sample, 0, sizeof sample);
+            int rc = sample_ink(&input->source, boundary, &sample);
             if (rc != MINIMAP_OK) return rc;
             previous = group;
         }
-        v->first_byte = boundary; v->ink = ink;
-        v->density = (uint8_t)(ink * 255 / MINIMAP_LINE_CAP);
+        v->first_byte = boundary; v->ink = sample.ink;
+        memcpy(v->marks, sample.marks, sizeof v->marks);
+        v->density = (uint8_t)(sample.ink * 255 / MINIMAP_LINE_CAP);
     }
     return MINIMAP_OK;
 }
@@ -257,29 +280,46 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
          * cannot retain another buffer's cells in a shared render grid. */
         first_line = m->painted_first; end = m->painted_end;
     }
+    uint32_t background = style->background, ink = style->density;
+    /* Without compatible ready summaries, retain the quiet approximate
+     * scrollbar density. Ready and retained rows use character marks. */
+    uint32_t occupied = 0;
+    if (m->stale && !retained) {
+        ink = blend(background, ink, 64);
+        occupied = (uint32_t)(((uint64_t)64 * width + 254) / 255);
+    }
+    /* (E) wash = existing 128/4 = 32 coverage; edge = 3*32 = 96. Both
+     * below half opacity. Pixel-exact perimeter is in minimap_pixels;
+     * this legacy adapter can resolve only whole render cells. */
+    uint32_t wash_bg = blend(background, style->viewport, 32);
+    uint32_t wash_ink = blend(ink, style->viewport, 32);
+    uint32_t edge_bg = blend(background, style->viewport, 96);
+    uint32_t edge_ink = blend(ink, style->viewport, 96);
     for (uint32_t r = 0; r < grid->dims.rows; r++) {
         const minimap_row *v = retained ? &m->rows[r] : NULL;
-        uint32_t density = v ? v->density : m->stale ? 64u : 0;
-        uint32_t occupied = (uint32_t)(((uint64_t)density * width + 254) / 255);
-        uint32_t ink = blend(style->background, style->density, density);
         bool viewport = v && v->line_count && first_line < end
                      && v->first_line < end && first_line < v->first_line + v->line_count;
+        bool top = viewport && (r == 0 || m->rows[r - 1].first_line
+                         + m->rows[r - 1].line_count <= first_line);
+        bool bottom = viewport && (r + 1 == m->active_rows
+                                  || m->rows[r + 1].first_line >= end);
         if (m->stale && !retained) {
             uint64_t row_line = scale(input->lines, r, grid->dims.rows);
             uint64_t next_line = scale(input->lines, r + 1, grid->dims.rows);
             viewport = first_line < end && row_line < end
                 && first_line <= next_line;
         }
-        uint32_t background = style->background;
-        if (viewport) {
-            ink = blend(ink, style->viewport, 128);
-            background = blend(background, style->viewport, 128);
-        }
         render_cell *dst = &grid->cells[(size_t)r * grid->dims.cols + first_col];
         bool changed = false;
         for (uint32_t c = 0; c < width; c++) {
+            bool marked = v ? c < MINIMAP_LINE_CAP
+                && (v->marks[c / 64u] & (UINT64_C(1) << (c % 64u)))
+                : c < occupied;
+            bool edge = viewport && (top || bottom || c == 0 || c + 1 == width);
             render_cell next = { .atlas_slot = RENDER_NO_SLOT, .fg = style->density,
-                                 .bg = c < occupied ? ink : background };
+                                 .bg = edge ? (marked ? edge_ink : edge_bg)
+                                            : viewport ? (marked ? wash_ink : wash_bg)
+                                                       : (marked ? ink : background) };
             /* One existing strip column is the narrowest cell treatment;
              * pending edits with retained summaries get no indicator. */
             if (m->stale && !retained && c == width - 1u) next.bg = style->stale;
@@ -288,6 +328,51 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
             }
         }
         if (changed) (void)render_mark_rows(grid, r, 1);
+    }
+    return MINIMAP_OK;
+}
+
+int minimap_pixels(const minimap *m, uint32_t *pixels, size_t capacity,
+                   uint32_t width, uint32_t height, size_t stride,
+                   uint64_t first_line, uint64_t visible_lines,
+                   const minimap_style *style)
+{
+    if (!m || !m->initialized || !m->filled || m->stale || !pixels || !style
+        || !width || !height || stride < width || height > (uint64_t)m->height * 2
+        || ((style->background | style->density | style->viewport | style->stale) & 0xff000000u))
+        return MINIMAP_ERR_ARG;
+    if ((size_t)(height - 1) > (SIZE_MAX - width) / stride
+        || capacity < (size_t)(height - 1) * stride + width)
+        return MINIMAP_ERR_CAPACITY;
+    uint64_t end = first_line;
+    if (first_line < m->lines) {
+        uint64_t remaining = m->lines - first_line;
+        end += visible_lines < remaining ? visible_lines : remaining;
+    }
+    /* (G) two pixel scanlines per summary, derived from perf §2.11.
+     * The viewport uses the same grouped lines as hit/row_for_line. */
+    uint32_t top = height, bottom = 0;
+    for (uint32_t r = 0; r < m->active_rows && (uint64_t)r * 2 < height; r++) {
+        const minimap_row *v = &m->rows[r];
+        if (first_line < end && v->first_line < end && first_line < v->first_line + v->line_count) {
+            if (top == height) top = r * 2;
+            bottom = (uint32_t)((uint64_t)(r + 1) * 2 < height ? (uint64_t)(r + 1) * 2 : height);
+        }
+    }
+    uint32_t wash_bg = blend(style->background, style->viewport, 32);
+    uint32_t wash_ink = blend(style->density, style->viewport, 32);
+    uint32_t edge_bg = blend(style->background, style->viewport, 96);
+    uint32_t edge_ink = blend(style->density, style->viewport, 96);
+    for (uint32_t y = 0; y < height; y++) {
+        const minimap_row *v = &m->rows[y / 2];
+        bool band = y >= top && y < bottom;
+        for (uint32_t x = 0; x < width; x++) {
+            bool mark = y % 2 == 0 && x < MINIMAP_LINE_CAP
+                && (v->marks[x / 64u] & (UINT64_C(1) << (x % 64u)));
+            bool edge = band && (y == top || y + 1 == bottom || x == 0 || x + 1 == width);
+            pixels[(size_t)y * stride + x] = edge ? (mark ? edge_ink : edge_bg)
+                : band ? (mark ? wash_ink : wash_bg) : mark ? style->density : style->background;
+        }
     }
     return MINIMAP_OK;
 }

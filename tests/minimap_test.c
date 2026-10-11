@@ -98,6 +98,145 @@ static uint32_t model_blend(uint32_t a, uint32_t b, uint32_t t)
     }
     return out;
 }
+/* (G) positions come directly from "ab   cd": its non-space columns.
+ * The pixel-cell fixture uses the requested one-pixel marks/edge. Tab stops
+ * use the editor default (G) four columns, from editor/open.c. */
+static void character_marks(void)
+{
+    static const uint8_t text[] = "ab   cd\na\tb\nabcdefghijklmnop";
+    enum { COLS = sizeof "abcdefghijklmnop" - 1, ROWS = 3 };
+    render_cell cells[ROWS * COLS] = {0}; uint64_t dirty[1];
+    minimap_row rows[ROWS]; minimap m; render_grid g;
+    flat f = {text, sizeof text - 1, 1, 0};
+    minimap_input in = {{&f, f.n, span, NULL}, ROWS, 1, true};
+    CHECK(minimap_init(&m, rows, ROWS) == 0);
+    CHECK(render_grid_init(&g, (render_dims){COLS, ROWS, 1, 1},
+                           cells, ROWS * COLS, dirty, 1) == 0);
+    CHECK(render_frame_begin(&g, 1) == 0);
+    edit_malloc_guard_begin();
+    CHECK(minimap_fill(&m, &in, &g, 0, COLS, 0, 0, &style) == 0);
+    CHECK(edit_malloc_guard_end() == 0);
+    for (uint32_t c = 0; c < COLS; c++) {
+        bool marked = c == 0 || c == 1 || c == 5 || c == 6;
+        CHECK((cells[c].bg != style.background) == marked);
+        CHECK((cells[COLS + c].bg != style.background) == (c == 0 || c == 4));
+    }
+    CHECK(render_frame_begin(&g, 2) == 0);
+    CHECK(minimap_fill(&m, &in, &g, 0, 7, 0, 0, &style) == 0);
+    CHECK(cells[2 * COLS + 6].bg != style.background);
+    puts("edit-8m3: character positions, spaces, tab stops, clipping, malloc guard: ok");
+}
+/* (G) four summary rows, each covering one fixture line. Viewport is the
+ * middle pair; its perimeter is one pixel, with translucent interior. */
+static void viewport_geometry(void)
+{
+    static const uint8_t text[] = "ab   cd\nab   cd\nab   cd\nab   cd";
+    enum { COLS = sizeof "ab   cd" - 1, ROWS = 4 };
+    render_cell cells[ROWS * COLS] = {0}; uint64_t dirty[1];
+    minimap_row rows[ROWS]; minimap m; render_grid g;
+    flat f = {text, sizeof text - 1, 0, 0};
+    minimap_input in = {{&f, f.n, span, NULL}, ROWS, 1, true};
+    CHECK(minimap_init(&m, rows, ROWS) == 0);
+    CHECK(render_grid_init(&g, (render_dims){COLS, ROWS, 1, 1},
+                           cells, ROWS * COLS, dirty, 1) == 0);
+    CHECK(render_frame_begin(&g, 1) == 0);
+    CHECK(minimap_fill(&m, &in, &g, 0, COLS, 1, 2, &style) == 0);
+    /* (E) interior coverage = existing 128/4 = 32; edge = 3*32 = 96,
+     * each normalised by the R8 maximum 255. The edge is three times
+     * the wash, both below half opacity so document ink remains visible. */
+    CHECK(cells[COLS + 3].bg == model_blend(style.background, style.viewport, 96));
+    CHECK(cells[3].bg == style.background && cells[3 * COLS + 3].bg == style.background);
+    CHECK(cells[COLS].bg != cells[COLS + 3].bg);
+    puts("edit-8m3: translucent viewport perimeter and half-open geometry: ok");
+}
+/* (G) logical line spacing from perf/01-perf-target.md: two pixels.
+ * Physical geometry is inspected separately from legacy cell backgrounds. */
+static void pixel_geometry(void)
+{
+    static const uint8_t text[] = "ab   cd\nab   cd\nab   cd\nab   cd";
+    enum { WIDTH = sizeof "ab   cd" - 1, LINES = 4, HEIGHT = LINES * 2,
+           STRIDE = WIDTH + 1 };
+    uint32_t pixels[HEIGHT * STRIDE];
+    for (size_t i = 0; i < HEIGHT * STRIDE; i++) pixels[i] = UINT32_MAX;
+    minimap_row rows[LINES]; minimap m;
+    flat f = {text, sizeof text - 1, 1, 0};
+    minimap_input in = {{&f, f.n, span, NULL}, LINES, 1, true};
+    CHECK(minimap_init(&m, rows, LINES) == 0);
+    CHECK(minimap_prepare(&m, &in, LINES) == 0);
+    size_t calls = f.calls;
+    edit_malloc_guard_begin();
+    CHECK(minimap_pixels(&m, pixels, HEIGHT * STRIDE, WIDTH, HEIGHT, STRIDE,
+                         1, 2, &style) == 0);
+    CHECK(edit_malloc_guard_end() == 0 && f.calls == calls);
+    /* The middle pair of lines occupies scanlines [2,6). */
+    CHECK(pixels[2 * STRIDE + 3] == model_blend(style.background, style.viewport, 96));
+    CHECK(pixels[3 * STRIDE + 3] == model_blend(style.background, style.viewport, 32));
+    CHECK(pixels[4 * STRIDE + 1] == model_blend(style.density, style.viewport, 32));
+    CHECK(pixels[3 * STRIDE] == model_blend(style.background, style.viewport, 96));
+    CHECK(pixels[5 * STRIDE + 3] == model_blend(style.background, style.viewport, 96));
+    CHECK(pixels[6 * STRIDE + 3] == style.background);
+    for (uint32_t x = 0; x < WIDTH; x++) {
+        CHECK(pixels[x] == (x == 0 || x == 1 || x == 5 || x == 6
+                           ? style.density : style.background));
+        CHECK(pixels[STRIDE + x] == style.background);
+    }
+    for (uint32_t y = 0; y < HEIGHT; y++) CHECK(pixels[y * STRIDE + WIDTH] == UINT32_MAX);
+    CHECK(minimap_pixels(&m, pixels, WIDTH - 1, WIDTH, HEIGHT, STRIDE,
+                         0, 0, &style) == MINIMAP_ERR_CAPACITY);
+    CHECK(minimap_pixels(&m, pixels, HEIGHT * STRIDE, WIDTH, HEIGHT, STRIDE,
+                         UINT64_MAX, UINT64_MAX, &style) == 0);
+    CHECK(pixels[3 * STRIDE + 3] == style.background);
+    puts("edit-8m3: pixel marks, line spacing, viewport wash/edge, stride, source/allocation guards: ok");
+}
+/* Optional review artifact: rendered by the real minimap pixel API.
+ * Width (G) comes from perf §2.11; height derives from fixture line count. */
+static void dump_map(void)
+{
+    const char *path = getenv("MINIMAP_DUMP_PPM");
+    if (!path) return;
+    static const uint8_t text[] =
+        "/* miniature document: whitespace and indentation survive */\n"
+        "#include <stdint.h>\n\n"
+        "static uint64_t sum(const uint8_t *bytes, size_t length)\n"
+        "{\n"
+        "    uint64_t result = 0;\n"
+        "    for (size_t index = 0; index < length; index++) {\n"
+        "        if (bytes[index] != ' ') {\n"
+        "            result += bytes[index];\n"
+        "        }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n\n"
+        "int main(void)\n"
+        "{\n"
+        "    const uint8_t message[] = \"ab   cd\";\n"
+        "    return (int)sum(message, sizeof message);\n"
+        "}\n";
+    enum { WIDTH = 120, MAX_LINES = sizeof text, MAX_HEIGHT = MAX_LINES * 2 };
+    minimap_row rows[MAX_LINES]; uint32_t pixels[WIDTH * MAX_HEIGHT]; minimap m;
+    flat f = {text, sizeof text - 1, 0, 0}; uint32_t lines = 1;
+    for (size_t i = 0; i < f.n; i++) lines += text[i] == '\n';
+    minimap_input in = {{&f, f.n, span, NULL}, lines, 1, true};
+    const minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0, 0xbf853d};
+    CHECK(minimap_init(&m, rows, MAX_LINES) == 0);
+    CHECK(minimap_prepare(&m, &in, lines) == 0);
+    /* Viewport is the loop body: derive its extent from fixture substrings. */
+    uint64_t first = 0, visible = 0;
+    const uint8_t *begin = (const uint8_t *)strstr((const char *)text, "    for");
+    const uint8_t *end = (const uint8_t *)strstr((const char *)text, "    return");
+    CHECK(begin && end);
+    for (const uint8_t *p = text; p < begin; p++) first += *p == '\n';
+    for (const uint8_t *p = begin; p < end; p++) visible += *p == '\n';
+    CHECK(minimap_pixels(&m, pixels, WIDTH * MAX_HEIGHT, WIDTH, lines * 2,
+                         WIDTH, first, visible, &colors) == 0);
+    FILE *out = fopen(path, "wb"); CHECK(out);
+    CHECK(fprintf(out, "P6\n%u %u\n255\n", WIDTH, lines * 2) > 0);
+    for (size_t i = 0; i < (size_t)WIDTH * lines * 2; i++) {
+        uint8_t rgb[] = {(uint8_t)(pixels[i] >> 16), (uint8_t)(pixels[i] >> 8), (uint8_t)pixels[i]};
+        CHECK(fwrite(rgb, sizeof rgb, 1, out) == 1);
+    }
+    CHECK(fclose(out) == 0);
+}
 static void large_and_errors(void)
 {
     size_t n = 131089; uint8_t *bytes = malloc(n); CHECK(bytes);
@@ -135,8 +274,9 @@ static void large_and_errors(void)
         for (size_t i = 0; i < target.byte; i++) want += bytes[i] == '\n';
         CHECK(want == target.line);
         CHECK(minimap_row_for_line(&m,target.line,&back) == 0 && back == r);
-        uint32_t bg = model_blend(style.background,style.density,rows[r].density);
-        if (r == 0) bg = model_blend(bg,style.viewport,128);
+        uint32_t bg = first < end && bytes[first] != '\n' && !space(bytes[first])
+                    ? style.density : style.background;
+        if (r == 0) bg = model_blend(bg,style.viewport,96);
         CHECK(cells[r*9+6].bg == bg);
     }
     memcpy(saved,cells,sizeof cells); minimap before = m;
@@ -341,6 +481,7 @@ static void deferred_samples(void)
 }
 int main(void)
 {
+    character_marks(); viewport_geometry(); pixel_geometry(); dump_map();
     deferred_samples();
     pending_navigation();
     cache_identity();

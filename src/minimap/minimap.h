@@ -10,7 +10,9 @@
  * buffer for its lifetime. Reinitialise or bind when recycling a context.
  * Small means <=64 KiB AND <=20000 lines. Space bytes are ASCII HT, LF, VT,
  * FF, CR and space; all other bytes (including UTF-8 bytes) count. Each line's
- * count saturates at 80. A row covers K=ceil(lines/height) consecutive lines;
+ * count saturates at 80 (the existing clipped line bound). Character columns
+ * of the first line in each group are retained separately for miniature ink.
+ * A row covers K=ceil(lines/height) consecutive lines;
  * density=floor(255*sum(clipped counts)/(80*row line count)). Extra rows blank.
  * Large files share <=256 representative nominal LINEIDX_CHUNK samples across
  * adjacent rows (also bounded by the chunk/active-row counts). Each sample
@@ -39,6 +41,10 @@ typedef struct minimap_row {
     uint64_t first_byte;      /* small: line start; large: representative sample */
     uint64_t ink;             /* small: sum of clipped counts; large: sample */
     uint8_t density;
+    /* (G) existing clipped line bound: ceil(MINIMAP_LINE_CAP / 64)
+     * machine words. Representative character columns; tabs expand to the
+     * editor default four-column stops. Spaces retain their positions. */
+    uint64_t marks[(MINIMAP_LINE_CAP + 63) / 64];
 } minimap_row;
 
 typedef struct minimap_style {
@@ -95,7 +101,9 @@ int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *gri
                         const minimap_style *style);
 /* Fill [first_col, first_col+width) across all grid rows in a begun frame;
  * damages only rows whose strip cells change. viewport [first_line, first_line+visible_lines) is
- * clamped to the file, drawn as a band across the full strip width.
+ * clamped to the file, drawn as a translucent band with a one-cell perimeter.
+ * Each column represents one character; marks are pixel-scale only when grid
+ * cells are pixel-scale. Use minimap_pixels for an exact logical-pixel dump.
  * Matching revision/height reuses density summaries; every edit invalidates
  * them. Viewport/cell colours are checked on every fill. Legacy synchronous
  * fill may fault on dispersed mapped pages during regeneration: use only
@@ -118,6 +126,15 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
  * Small hits use exact cached line starts. Large hits resolve via index on
  * demand (one existing line_to_byte query, may scan one chunk); idx must model
  * input.source. Stale hits fail; output unchanged on failure. */
+/* Source-read-free pixel dump of prepared summaries. (G) perf target §2:
+ * two logical pixels per summary line, a one-pixel-wide non-space mark on
+ * the first scanline and a blank second scanline. Grouped/sampled summaries
+ * retain their existing approximate navigation. height <= m->height*2.
+ * Caller owns pixels; stride/capacity are in uint32_t elements. */
+int minimap_pixels(const minimap *m, uint32_t *pixels, size_t capacity,
+                   uint32_t width, uint32_t height, size_t stride,
+                   uint64_t first_line, uint64_t visible_lines,
+                   const minimap_style *style);
 int minimap_hit(const minimap *m, const minimap_input *input, lineidx *idx,
                 int64_t y, minimap_target *out);
 /* Current byte-based navigation without index/cache/source reads. Row endpoints

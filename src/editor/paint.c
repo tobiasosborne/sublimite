@@ -147,7 +147,7 @@ int editor_compose(editor *e)
         return 0;
     }
     minimap_input input = editor_map_input(e->buffer);
-    minimap_style colors = {0x171b22, 0x8091a8, 0x687d98,
+    minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0,
         editor_theme_estimated_gutter(0x8091a8, 0x171b22)};
     uint64_t first = e->v.state.first_line, visible = 0;
     for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {

@@ -1,3 +1,27 @@
+# edit-8m3 scoped character rendering
+
+Character-position masks, tab expansion, clipped marks, and a source-read-free
+pixel renderer are implemented. The pixel renderer uses the requested logical
+line spacing and translucent viewport with a pixel perimeter. Navigation,
+source identity, worker publication, retained damage, and allocation guards
+remain covered by `tests/minimap_test.c`.
+
+The running editor still copies the map into full font-size cells. Its pixel
+atlas/composition integration cannot be completed under the restriction to
+only the colour struct in `editor/paint.c`. This bead remains incomplete for
+visual acceptance; the standalone dump is not an editor screenshot.
+
+Verification: gcc `make all` and sanitizer/release minimap regressions pass;
+seed replay passes. The direct line-index suite passes. Aggregate checks retain
+sandbox display/IPC restrictions and an outside-scope headless view assertion.
+Current red/green logs, benchmarks, complete suite outcomes, and limitations:
+[worker report](../../docs/worker-reports/edit-8m3.md).
+[design and scope limitation](../../docs/decisions/edit-8m3.md).
+
+---
+
+Historical status before edit-8m3 follows; its verification is not current evidence.
+
 # P4.5 / P4.5b minimap status
 
 edit-g11 supersedes the pending tint treatment below: same-buffer pending
