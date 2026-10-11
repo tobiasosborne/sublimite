@@ -1,9 +1,9 @@
-/* EGL/Mesa DRI3 renderer: loaded only in init's worker. */
+/* EGL renderer: Mesa DRI3 on X11, native Wayland; loader runs on init worker. */
 #include "gl/gl.h"
 #include "base/base.h"
 #include "trace/trace.h"
 #include "work/work.h"
-#include "x11/plat.h"
+#include "wayland/plat.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GL/glcorearb.h>
@@ -581,6 +581,7 @@ static void gl_release(gl_state *s)
         xcb_unregister_for_special_event(conn,s->present_special);
         (void)xcb_flush(conn);
     }
+    if (s->platform!=NULL && s->platform->backend==PLAT_BACKEND_WAYLAND) wayland_frame_cancel(s->platform);
     if (s->context != EGL_NO_CONTEXT && s->eMakeCurrent != NULL && gl_bind(s)) {
         if (s->gFinish != NULL) s->gFinish();
         for (uint32_t i=0;i<GL_CELL_RING;i++)
@@ -744,6 +745,10 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
      * Geometry comes from X, never from UI-owned mutable plat fields. */
     /* plat uses the default DISPLAY too. A separate protocol connection gives
      * this backend an independently terminable EGLDisplay, without globals. */
+    bool wayland=cfg->platform->backend==PLAT_BACKEND_WAYLAND;
+    if (wayland) {
+        s->native_height=cfg->platform->height;
+    } else {
     s->native_conn=xcb_connect(NULL,NULL); s->own_native_conn=true;
     if (s->native_conn==NULL || xcb_connection_has_error(s->native_conn)) return RENDER_ERR_UNSUPPORTED;
     /* The production contract uses Mesa DRI3 Present serials. An unavailable
@@ -763,17 +768,23 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
         xcb_get_geometry(s->native_conn,s->native_win),NULL);
     if (geometry==NULL) return RENDER_ERR_UNSUPPORTED;
     s->native_height=geometry->height; free(geometry);
+    }
     int rc=RENDER_ERR_UNSUPPORTED;
     if (!gl_load(s)) goto fail;
     const char *client=s->eQueryString(EGL_NO_DISPLAY,EGL_EXTENSIONS);
-    if (!gl_extension(client,"EGL_EXT_platform_xcb") && !gl_extension(client,"EGL_MESA_platform_xcb")) goto fail;
-    (void)xcb_flush(s->native_conn);
-    s->display=s->eGetPlatformDisplay(EGL_PLATFORM_XCB_EXT,s->native_conn,NULL);
+    if (wayland) {
+        if (!gl_extension(client,"EGL_EXT_platform_wayland") && !gl_extension(client,"EGL_KHR_platform_wayland")) goto fail;
+        s->display=s->eGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,cfg->platform->conn,NULL);
+    } else {
+        if (!gl_extension(client,"EGL_EXT_platform_xcb") && !gl_extension(client,"EGL_MESA_platform_xcb")) goto fail;
+        (void)xcb_flush(s->native_conn);
+        s->display=s->eGetPlatformDisplay(EGL_PLATFORM_XCB_EXT,s->native_conn,NULL);
+    }
     if (s->display==EGL_NO_DISPLAY || !s->eInitialize(s->display,NULL,NULL)) goto fail;
     s->egl_live=true;
     const char *extensions=s->eQueryString(s->display,EGL_EXTENSIONS);
     const char *vendor=s->eQueryString(s->display,EGL_VENDOR);
-    if (!gl_extension(extensions,"EGL_KHR_create_context") || vendor==NULL || strstr(vendor,"Mesa")==NULL) goto fail;
+    if (!gl_extension(extensions,"EGL_KHR_create_context") || (!wayland && (vendor==NULL || strstr(vendor,"Mesa")==NULL))) goto fail;
     if (!s->eBindAPI(EGL_OPENGL_API)) goto fail;
     EGLConfig configs[256]; EGLint count=0;
     const EGLint attrs[]={EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_BIT,
@@ -782,7 +793,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
     EGLConfig chosen=NULL;
     for (EGLint i=0;i<count;i++) {
         EGLint visual=0;
-        if (s->eGetConfigAttrib(s->display,configs[i],EGL_NATIVE_VISUAL_ID,&visual) && (uint32_t)visual==s->native_visual) { chosen=configs[i]; break; }
+        if (wayland || (s->eGetConfigAttrib(s->display,configs[i],EGL_NATIVE_VISUAL_ID,&visual) && (uint32_t)visual==s->native_visual)) { chosen=configs[i]; break; }
     }
     if (chosen==NULL) goto fail;
     const EGLint ca[]={EGL_CONTEXT_MAJOR_VERSION_KHR,3,EGL_CONTEXT_MINOR_VERSION_KHR,3,
@@ -794,7 +805,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
         s->upload_context = s->eCreateContext(s->display, chosen, s->context, ca);
         if (s->upload_context == EGL_NO_CONTEXT) goto fail;
     }
-    s->surface=s->eCreatePlatformWindowSurface(s->display,chosen,&s->native_win,NULL);
+    s->surface=s->eCreatePlatformWindowSurface(s->display,chosen,wayland ? wayland_egl_window(cfg->platform) : (void *)&s->native_win,NULL);
     if (s->surface==EGL_NO_SURFACE || !gl_bind(s)) goto fail;
     if (!s->eSwapInterval(s->display,swap_interval) || !gl_load_api(s)) goto fail;
     const char *renderer=(const char *)s->gGetString(GL_RENDERER);
@@ -856,12 +867,19 @@ static int gl_init_mode(render_backend *b,const render_config *cfg,bool startup)
     if (s->persistent) memcpy(s->mapped,s->instances,sizeof(gl_instance));
     else if (s->upload==GL_UPLOAD_LEGACY) s->gBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)sizeof(gl_instance),s->instances);
     rc=RENDER_ERR_UNSUPPORTED;
-    /* Background initialization must not swap black probe frames over the
-     * raster bootstrap. The first real swap proves serial/MSC/mode through
-     * gl_event's existing private-event completion guard. Strict diagnostics
-     * keep the warm-swap proof. Drawing/JIT work without a swap is invisible. */
-    if (startup) { gl_draw(s); s->gFinish(); }
-    if (!startup && !gl_probe_present(s)) goto fail;
+    if (cfg->platform->backend==PLAT_BACKEND_WAYLAND) {
+        /* Reuse the prepared init draw to warm shaders/fences on the worker.
+         * No swap: the first traced UI frame owns the first buffer commit. */
+        gl_draw(s); s->gFinish();
+        if (s->ring_poisoned || gl_check_error(s)!=RENDER_OK) goto fail;
+    } else {
+        /* Background initialization must not swap black probe frames over the
+         * raster bootstrap. The first real swap proves serial/MSC/mode through
+         * gl_event's existing private-event completion guard. Strict diagnostics
+         * keep the warm-swap proof. Drawing/JIT work without a swap is invisible. */
+        if (startup) { gl_draw(s); s->gFinish(); }
+        if (!startup && !gl_probe_present(s)) goto fail;
+    }
     s->strip_count=0;
     if (gl_ring_poll(s)!=RENDER_OK) goto fail;
     if (!s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) goto fail;
@@ -1121,9 +1139,14 @@ static int gl_present(render_backend *b,uint32_t id)
     if (rc!=RENDER_OK) { s->gDeleteSync(s->fence); s->fence=NULL; return rc; }
     if (s->startup && !s->complete_selected) return gl_fail(s);
     s->completion_deadline=trace_now_ns()+GL_COMPLETION_TIMEOUT_NS;
-    if (!s->eSwapBuffers(s->display,s->surface)) return gl_fail(s);
+    bool wayland=s->platform->backend==PLAT_BACKEND_WAYLAND;
+    if (wayland && wayland_frame_arm(s->platform,id)!=PLAT_OK) return gl_fail(s);
+    if (!s->eSwapBuffers(s->display,s->surface)) {
+        if (wayland) wayland_frame_cancel(s->platform);
+        return gl_fail(s);
+    }
     s->swapped=true; s->swapped_id=id;
-    s->pending_serial=++s->swap_serial;
+    s->pending_serial=wayland ? id : ++s->swap_serial;
     s->present_verified=false; s->verified_ns=0;
     /* Nothing after the committed swap may turn this attempt into a retry. */
     return RENDER_OK;
@@ -1150,7 +1173,11 @@ static int gl_event(render_backend *b,const render_event *event)
     if (gl_ring_poll(s)!=RENDER_OK) return gl_fail(s);
     /* The typed private PIXMAP event alone owns MSC and observation time.
      * Every bounded slice is continued by a validated worker-mailbox wake. */
-    for (unsigned i=0;i<8 && !s->present_verified;i++) {
+    if (s->platform!=NULL && s->platform->backend==PLAT_BACKEND_WAYLAND) {
+        if (wayland_frame_result(s->platform,s->pending_serial,&s->present_verified,&s->verified_ns,&s->msc)!=PLAT_OK)
+            return gl_fail(s);
+    }
+    for (unsigned i=0;(s->platform==NULL || s->platform->backend!=PLAT_BACKEND_WAYLAND) && i<8 && !s->present_verified;i++) {
         xcb_generic_event_t *native=xcb_poll_for_special_event(s->native_conn,s->present_special);
         if (native==NULL) break;
         const xcb_present_complete_notify_event_t *ce=(const void *)native;

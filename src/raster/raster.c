@@ -315,6 +315,7 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     if (cfg->max_width > UINT16_MAX || cfg->max_height > INT16_MAX ||
         cfg->workers->n_workers <= cfg->workers->n_bulk) return RENDER_ERR_UNSUPPORTED;
     const plat *pl = cfg->platform;
+    if (pl->backend == PLAT_BACKEND_WAYLAND) return RENDER_ERR_UNSUPPORTED;
     st->win = pl->win; st->depth = pl->depth; st->pool = cfg->workers;
     st->alpha_or = pl->depth == 32 ? 0xff000000u : 0u;
     st->max_w = cfg->max_width; st->max_h = cfg->max_height;

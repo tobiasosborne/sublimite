@@ -9,8 +9,10 @@
  * No GL/EGL libraries are linked. */
 #define GL_POLL_MESSAGE UINT32_C(0x474c504c)
 int render_gl_backend(render_backend *b);
-/* UI: route plat's PresentCompleteNotify callback; ignores stale swaps.
- * Uses observation CLOCK_MONOTONIC, never treats raw X UST as that clock. */
+/* UI: route platform completion (X Present serial / Wayland frame identity).
+ * Stale notices cannot acknowledge a newer swap. X completion uses observation
+ * CLOCK_MONOTONIC; Wayland checks stored matching wp_presentation feedback.
+ * Raw X UST is never treated as the monotonic clock. */
 int gl_present_complete(render_backend *b, uint32_t serial, uint64_t ust, uint64_t msc);
 /* UI: after draining the shared work mailbox, check for a latched device
  * failure (Skip, reset, failed fence, missing completion). No further submits

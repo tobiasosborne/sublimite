@@ -1,3 +1,13 @@
+# Wayland integration — edit-v0o.1
+
+The EGL worker loader also accepts the Wayland native display/window. GL fences
+retain T5 ownership; matching wp_presentation feedback supplies T6. Initialization
+warms the prepared draw without a Wayland swap, and frame callbacks add no new
+admission gate. Headless mocked-fence/protocol coverage passes; actual Wayland
+EGL, pixels and latency remain unmeasured. See
+[the worker report](../../docs/worker-reports/edit-v0o.1.md) and
+[the decision](../../docs/decisions/edit-v0o.1.md). Historical status follows.
+
 # GL — edit-40t worker continuation
 
 Benchmark acquisition faults now identify their actual stage and enter owner

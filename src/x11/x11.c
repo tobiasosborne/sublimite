@@ -1,5 +1,6 @@
 /* x11.c - X11 window + event loop (P2.1). */
 #include "plat.h"
+#include "wayland/private.h"
 #include "input.h"
 #include "xi2.h"
 #include "clip.h"
@@ -293,13 +294,13 @@ static void rearm_repeat(plat *p) {
     timerfd_settime(p->repeat_fd, TFD_TIMER_ABSTIME, &it, NULL);
 }
 
-void plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz) {
+void x11_plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz) {
     if (!p->in) return;
     x11_repeat_configure(IN(p), delay_ms, rate_hz, trace_now_ns());
     rearm_repeat(p);
 }
 
-bool plat_poll_event(plat *p, plat_event *out) { return p->in && x11_q_pop(IN(p), out); }
+bool x11_plat_poll_event(plat *p, plat_event *out) { return p->in && x11_q_pop(IN(p), out); }
 
 /* Startup may wait for checked requests; runtime dispatch stays nonblocking. */
 static bool init_request_ok(xcb_connection_t *c, xcb_void_cookie_t cookie) {
@@ -309,7 +310,7 @@ static bool init_request_ok(xcb_connection_t *c, xcb_void_cookie_t cookie) {
     return ok;
 }
 
-int plat_init(plat *p, const plat_config *cfg) {
+int x11_plat_init(plat *p, const plat_config *cfg) {
     memset(p, 0, sizeof *p);
     p->timer_fd = p->work_fd = p->repeat_fd = -1;
     if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
@@ -399,13 +400,13 @@ found:
     return PLAT_OK;
 }
 
-void plat_map(plat *p) {
+void x11_plat_map(plat *p) {
     xcb_map_window(C(p), p->win);
     xcb_flush(C(p));
     trace_record_at(trace_now_ns(), TRACE_T4_PRESENT_SUBMITTED, 0);
 }
 
-void plat_set_blink(plat *p, uint32_t ms) {
+void x11_plat_set_blink(plat *p, uint32_t ms) {
     struct itimerspec it;
     memset(&it, 0, sizeof it);
     if (ms && p->focused) {
@@ -415,7 +416,7 @@ void plat_set_blink(plat *p, uint32_t ms) {
     timerfd_settime(p->timer_fd, 0, &it, NULL);
 }
 
-int plat_set_present_events(plat *p, bool enabled) {
+int x11_plat_set_present_events(plat *p, bool enabled) {
     if (!p || !p->conn) return PLAT_ERR_FAIL;
     if (!p->present_ok) return PLAT_OK;
     return init_request_ok(C(p), xcb_present_select_input_checked(C(p), p->present_eid, p->win,
@@ -562,7 +563,7 @@ static bool drain(plat *p, const plat_callbacks *cb, uint64_t t_end) {
     return true;
 }
 
-int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
+int x11_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
     struct pollfd fds[5];
     uint64_t t_end = trace_now_ns() + (timeout_ms > 0 ? (uint64_t)timeout_ms * UINT64_C(1000000) : 0);
     while (!p->quit) {
@@ -635,9 +636,9 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
     return PLAT_OK;
 }
 
-int plat_run(plat *p, const plat_callbacks *cb) { return plat_run_for(p, cb, -1); }
+int x11_plat_run(plat *p, const plat_callbacks *cb) { return plat_run_for(p, cb, -1); }
 
-void plat_shutdown(plat *p) {
+void x11_plat_shutdown(plat *p) {
     if (p->in) shutdown_runtime(p);
     x11_clip_save_on_exit(p);
     if (p->timer_fd >= 0) close(p->timer_fd);

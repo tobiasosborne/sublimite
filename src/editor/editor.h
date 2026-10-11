@@ -50,6 +50,7 @@ typedef struct editor_config {
     size_t arena_bytes, history_keys; /* open-time bounds; zero selects defaults */
     size_t tab_capacity, closed_capacity; /* defaults: 128 live, 16 retained */
     bool start_empty;                 /* startup request supplies initial tabs */
+    plat_backend platform_backend;      /* default X11; main selects from environment */
     bool raster_fallback;             /* raster paints while GPU init runs; no retry */
     int wrap_mode;                    /* 0=file default, -1=off, +1=on */
     ipc_server *server;               /* borrowed; UI-owned, fini after close */

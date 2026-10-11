@@ -1,5 +1,5 @@
-/* plat.h - platform window/event-loop interface (P2.1). X11 implements it now,
- * Wayland later. Startup stamps reuse trace ids with frame_id 0:
+/* plat.h - shared platform window/event-loop interface. X11 and Wayland
+ * implement it through runtime dispatch. Startup stamps reuse trace ids with frame_id 0:
  * T0=process exec (plat_config.exec_ns), T1=connect done, T2=window created,
  * T3=(unused), T4=map requested. */
 #ifndef EDITOR_X11_PLAT_H
@@ -46,7 +46,7 @@ typedef struct plat_event {
     uint32_t code;          /* raw keycode or button */
     uint32_t state;         /* modifier/button mask */
     int32_t x, y;
-    uint32_t time_ms;       /* raw X server time (ms), informational */
+    uint32_t time_ms;       /* raw native server time (ms), informational */
     /* ---- P2.2 ---- */
     uint32_t keysym;        /* KEY: xkb keysym with the event's modifiers applied */
     uint8_t  utf8[PLAT_UTF8_MAX]; /* KEY: text to insert, printable only, else len 0 (see decisions/P2.2.md) */
@@ -77,8 +77,15 @@ typedef struct plat_config {
     uint64_t exec_ns;       /* CLOCK_MONOTONIC at process start (0 = unknown) */
 } plat_config;
 
+typedef enum plat_backend { PLAT_BACKEND_X11, PLAT_BACKEND_WAYLAND } plat_backend;
+
+/* Runtime policy: X11 wins when both environment variables are nonempty. */
+plat_backend plat_backend_select(const char *display, const char *wayland_display);
+
 typedef struct plat {
-    void *conn;             /* xcb_connection_t* */
+    plat_backend backend;
+    void *wayland;          /* private Wayland state, NULL on X11 */
+    void *conn;             /* X11: xcb_connection_t*; Wayland: wl_display* */
     uint32_t win, colormap, visual;
     uint8_t depth;
     bool argb, present_ok, focused, quit;
@@ -101,6 +108,7 @@ typedef struct plat {
 } plat;
 
 int  plat_init(plat *p, const plat_config *cfg);
+int  plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend);
 void plat_map(plat *p);
 void plat_set_blink(plat *p, uint32_t ms);  /* 0 disarms; ignored while unfocused */
 /* Raster owns completion on its private connection; avoid duplicate UI wakes. */

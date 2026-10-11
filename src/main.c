@@ -21,9 +21,11 @@ int main(int argc, char **argv)
     if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }
     ipc_server server = {0}; bool owns_server = false;
     const char *display = getenv("DISPLAY");
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
+    plat_backend platform_backend = plat_backend_select(display, wayland_display);
     const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
-    if (selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
-    display = getenv("DISPLAY");
+    if (platform_backend == PLAT_BACKEND_X11 && selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
+    display = platform_backend == PLAT_BACKEND_WAYLAND ? wayland_display : getenv("DISPLAY");
     if (!args.request.new_instance) {
         ipc_result role = ipc_server_init_display(&server, NULL, display);
         if (role == IPC_EXISTS) {
@@ -85,10 +87,13 @@ int main(int argc, char **argv)
     editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true, .load_preferences = true,
         /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
          * pointers are reserved during startup, never on the typing path. */
-        .tab_capacity = 1000u, .server = owns_server ? &server : NULL};
+        .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend};
     editor_display_size display_size;
-    if (!rc) rc = editor_runtime_display_size(&display_size);
-    if (!rc) {
+    /* X11 query only: Wayland has no DISPLAY to ask and keeps the legacy
+     * 96-dpi/grid defaults until output scale lands (edit-v0o.1 rebase). */
+    bool x11_size = platform_backend == PLAT_BACKEND_X11;
+    if (!rc && x11_size) rc = editor_runtime_display_size(&display_size);
+    if (!rc && x11_size) {
         config.font_dpi = display_size.dpi;
         config.max_window_width = display_size.work_width;
         config.max_window_height = display_size.work_height;

@@ -217,7 +217,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     dims = e->grid.dims;
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
         plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, e->poll_fd, 0};
-        rc = plat_init(&e->platform, &pc); if (rc) goto fail;
+        rc = plat_init_backend(&e->platform, &pc, config->platform_backend); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
     }
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
@@ -227,7 +227,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
         .max_region_width = map_width, .max_region_height = map_height,
         .hooks = {.present_complete = editor_refresh_complete, .user = e}};
-    if (may_fallback) {
+    /* Raster rejects Wayland (edit-v0o.1): no raster bootstrap/fallback there;
+     * Wayland GL initializes synchronously (strict path). */
+    if (may_fallback && e->platform.backend != PLAT_BACKEND_WAYLAND) {
         render_backend requested = *backend;
         void *gpu_state = state;
         *backend = fallback;

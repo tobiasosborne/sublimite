@@ -9,11 +9,24 @@ AR         ?= ar
 
 WARN   := -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread
 INC    := -Isrc -Ivendor/tree-sitter/lib/include
+# P6.1: optional raw Wayland client; generated protocol glue is vendored.
+# Override WAYLAND_AVAILABLE= for a dependency-free build check.
+WAYLAND_AVAILABLE ?= $(shell printf '\043include <wayland-client.h>\n\043include <wayland-egl.h>\n\043include <xkbcommon/xkbcommon.h>\n' | $(CC_RELEASE) -x c -E - >/dev/null 2>&1 && echo yes)
+ifneq ($(WAYLAND_AVAILABLE),)
+INC += -DEDIT_HAVE_WAYLAND
+WAYLAND_LIBS := -lwayland-client -lwayland-egl
+# The mock protocol test is optional independently of the client.
+WAYLAND_SERVER_AVAILABLE := $(shell printf '\043include <wayland-server.h>\n' | $(CC_RELEASE) -x c -E - >/dev/null 2>&1 && echo yes)
+ifneq ($(WAYLAND_SERVER_AVAILABLE),)
+INC += -DEDIT_HAVE_WAYLAND_SERVER
+WAYLAND_TEST_LIBS := -lwayland-server
+endif
+endif
 DEP    := -MMD -MP
 REL_F  := -O2 -g -msse2
 SAN_F  := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
 FUZZ_F := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -O1 -g
-LDLIBS := -lm -ldl
+LDLIBS := -lm -ldl $(WAYLAND_LIBS)
 # Per-module extra libraries: a one-line file src/<m>/LDLIBS (e.g. "-lxcb -lxkbcommon") is appended to every link.
 LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
@@ -50,6 +63,8 @@ BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
 FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
 EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
+
+$(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
 .PHONY: all lib check check-sh bench fuzz clean
 .SECONDARY:

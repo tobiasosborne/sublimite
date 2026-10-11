@@ -50,15 +50,24 @@ static xcb_generic_event_t *gl_review_poll(xcb_connection_t *conn, xcb_special_e
 /* Private compile of the actual platform dispatcher; production exports stay distinct. */
 void gl_review_plat_shutdown(plat *p);
 #define plat_init gl_review_plat_init
+#define x11_plat_init gl_review_plat_init
 #define plat_map gl_review_plat_map
+#define x11_plat_map gl_review_plat_map
 #define plat_set_present_events gl_review_plat_set_present_events
+#define x11_plat_set_present_events gl_review_plat_set_present_events
 #define plat_set_blink gl_review_plat_set_blink
+#define x11_plat_set_blink gl_review_plat_set_blink
 #define plat_quit gl_review_plat_quit
 #define plat_run gl_review_plat_run
+#define x11_plat_run gl_review_plat_run
 #define plat_run_for gl_review_plat_run_for
+#define x11_plat_run_for gl_review_plat_run_for
 #define plat_shutdown gl_review_plat_shutdown
+#define x11_plat_shutdown gl_review_plat_shutdown
 #define plat_set_repeat gl_review_plat_set_repeat
+#define x11_plat_set_repeat gl_review_plat_set_repeat
 #define plat_poll_event gl_review_plat_poll_event
+#define x11_plat_poll_event gl_review_plat_poll_event
 #define plat_clip_set gl_review_plat_clip_set
 #define plat_clip_request gl_review_plat_clip_request
 #define plat_clip_data gl_review_plat_clip_data
@@ -68,15 +77,24 @@ void gl_review_plat_shutdown(plat *p);
 #undef x11_push_event
 #undef dispatch
 #undef plat_init
+#undef x11_plat_init
 #undef plat_map
+#undef x11_plat_map
 #undef plat_set_present_events
+#undef x11_plat_set_present_events
 #undef plat_set_blink
+#undef x11_plat_set_blink
 #undef plat_quit
 #undef plat_run
+#undef x11_plat_run
 #undef plat_run_for
+#undef x11_plat_run_for
 #undef plat_shutdown
+#undef x11_plat_shutdown
 #undef plat_set_repeat
+#undef x11_plat_set_repeat
 #undef plat_poll_event
+#undef x11_plat_poll_event
 #undef plat_clip_set
 #undef plat_clip_request
 #undef plat_clip_data

@@ -1,5 +1,6 @@
 /* X selections: bounded, asynchronous ICCCM INCR and MULTIPLE (P2.2b). */
 #include "clip.h"
+#include "wayland/private.h"
 #include "input.h"
 #include "trace/trace.h"
 #include "work/work.h"
@@ -366,7 +367,7 @@ int x11_clip_set_buf(plat *p, int which, x11_clip_buf *b) {
     install(p, which, b);
     return PLAT_OK;
 }
-int plat_clip_set(plat *p, int which, const void *utf8, size_t len) {
+int x11_plat_clip_set(plat *p, int which, const void *utf8, size_t len) {
     x11_clip *c = CL(p);
     if (!c || which < 0 || which >= NSEL || (len && !utf8) || len > DATA_MAX) return PLAT_ERR_FAIL;
     if (!make_room(p, which, len)) return PLAT_ERR_FAIL;
@@ -513,7 +514,7 @@ static void rx_convert(plat *p, int w, xcb_atom_t target) {
 static void redispatch(plat *p, int w, unsigned n) {
     for (unsigned i = 0; i < n; i++) if (plat_clip_request(p, w) != PLAT_OK) result(p, w, false, 1);
 }
-int plat_clip_request(plat *p, int which) {
+int x11_plat_clip_request(plat *p, int which) {
     x11_clip *c = CL(p);
     if (!c || which < 0 || which >= NSEL) return PLAT_ERR_FAIL;
     if (c->local_requests[which] + c->local_ready[which] + c->rx[which].waiters + c->failed[which] >= MAX_WAITERS)
@@ -542,7 +543,7 @@ int plat_clip_request(plat *p, int which) {
     r->deadline = deadline_after(c->timeout_ms);
     rx_convert(p, which, c->utf8); return PLAT_OK;
 }
-const uint8_t *plat_clip_data(const plat *p, size_t *len) {
+const uint8_t *x11_plat_clip_data(const plat *p, size_t *len) {
     const x11_clip *c = CL(p); *len = c && c->got ? c->got->len : 0; return c && c->got ? c->got->data : NULL;
 }
 /* Complete a receive whose worker jobs have all reported back. */
