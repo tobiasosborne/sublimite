@@ -1,0 +1,3 @@
+Implemented persistent regex whole-word traversal while preserving findui’s API. GCC release, find/findui sanitizer suites, fuzzing, and the active allocation guard pass.
+
+Full `make check` remains incomplete; sandbox exceptions and unresolved initialization failures are documented with the red/green runs in [edit-lez.md](/home/tobias/Projects/sublimite/.wt/edit-lez/docs/worker-reports/edit-lez.md). Viewport and editor integration remain open. STATUS and handoff updated; stopping here.
