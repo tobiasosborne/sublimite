@@ -541,7 +541,10 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
     if(visual_seed) { row[0]=*visual_seed; q.approximate=visual_seed->approximate; }
     layout_wrap_row previous=row[0]; bool have_previous=false, found=false;
     for(;;) {
-        rb[0]=row[0].start; reset_work(&q,0,1);
+        /* Adjacent query rows share this immutable source window. Resetting
+         * it here rereads the remaining logical line at every soft wrap. */
+        rb[0]=row[0].start;
+        q.row=0; q.row_end=1; q.phase=0; q.cluster_active=false;
         uint64_t before=q.bytes_scanned;
         int rc=layout_wrap_run(&q);
         if(rc<0) return rc;
