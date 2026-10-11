@@ -363,7 +363,12 @@ static int finish_hit(editor *e, uint64_t byte)
 {
     editor_clip *c = e->clipboard;
     c->hitting = false; e->action = EDITOR_ACTION_NONE;
-    int rc = editor_set_cursor(e, byte); if (rc) return rc;
+    e->old_selection = e->v.state.selection; e->old_cursor = e->old_selection.cursor;
+    e->v.state.selection.cursor = e->v.state.selection.anchor = byte;
+    e->v.state.selection.preferred_col = VIEW_PREFERRED_UNSET;
+    e->v.state.visual_end = false;
+    undo_break_burst(e->undo);
+    int rc = editor_refresh_cursor(e, e->old_cursor); if (rc) return rc;
     rc = begin_command(e, c->pointer_ns); if (rc) return rc;
     return request_paste(e, PLAT_CLIP_PRIMARY);
 }
@@ -406,7 +411,7 @@ static int middle_continue(editor *e)
 static int middle_target(editor *e, const plat_event *ev, bool *accepted)
 {
     *accepted = false;
-    if (ev->x < 0 || ev->y < 0) { *accepted = true; return 0; } /* injected current-cursor request */
+    if (ev->x < 0 || ev->y < 0) return 0;
     uint32_t row = (uint32_t)ev->y / e->grid.dims.cell_h;
     uint32_t col = (uint32_t)ev->x / e->grid.dims.cell_w;
     if (row < e->tab_rows || row - e->tab_rows >= e->text_grid.dims.rows ||

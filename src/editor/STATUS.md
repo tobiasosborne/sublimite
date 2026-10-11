@@ -10,8 +10,9 @@ Focused gcc and clang ASan/UBSan regressions pass; the deliberately injected anc
 Copy/cut/paste actions, alternate key bindings, selection-driven PRIMARY,
 positioned middle-click paste, arena-backed native/null ownership and worker
 normalization/capture are implemented. Replacement/cut share an explicit undo
-group and bounded mutation/journal helpers. Native allocator callbacks preserve
-borrowed and deferred ownership lifetimes; buffer retirement pins snapshots.
+group and bounded mutation/journal helpers. Physical ingress and paste frame
+acknowledgement are preserved; queued PRIMARY and click viewport regressions
+pass. Native allocator callbacks preserve borrowed and deferred ownership lifetimes; buffer retirement pins snapshots.
 
 Clipboard acceptance is green under clang ASan/UBSan and gcc release with the
 active malloc guard. The release tree builds. Full-check restrictions and exact

@@ -442,7 +442,8 @@ int editor_handle_key(editor *e, const plat_event *ev)
     bool text = action == KEYS_ACTION_INSERT || (result == KEYS_NONE && ev->utf8_len &&
         !(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER)) &&
         (!(ev->mods & PLAT_MOD_ALT) || (ev->mods & PLAT_MOD_ALTGR)));
-    if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT || action == KEYS_ACTION_PASTE)
+    if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT ||
+        action == KEYS_ACTION_PASTE)
         return editor_clip_action(e, action, ev);
     if (!moving && !back && !del && !undo && !redo && !tab && !text) {
         if (binding) e->stats.unimplemented_actions++;

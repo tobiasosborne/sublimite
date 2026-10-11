@@ -2182,12 +2182,14 @@ static int clipboard_test(bool native)
 {
     const char original[] = "a\r\n中";
     const char normal[] = "a\n中";
+    counted io_count = {0};
     render_backend backend = {0};
     T((native ? render_cpu_backend(&backend) : render_null_backend(&backend)) == 0);
     editor_config cfg = {.initial = (const uint8_t *)original,
-        .initial_len = sizeof original - 1, .cols = 32, .rows = 8, .wrap_mode = -1};
+        .initial_len = sizeof original - 1, .cols = 32, .rows = 8, .wrap_mode = -1,
+        .hook_ctx = &io_count, .on_io = native ? io_boundary : NULL};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
-    edit_malloc_guard_begin();
+    edit_malloc_guard_begin(); io_count.active = native;
     T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
     plat_event copy = key('c', PLAT_MOD_CTRL, NULL); copy.t0_ns = trace_now_ns();
     T(press(e, copy) == 0); T(e->edit_time_ns == copy.t0_ns);
@@ -2214,8 +2216,12 @@ static int clipboard_test(bool native)
     T(expect(e, original, sizeof original - 1) == 0);
     T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
     plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
-        .x = -1, .y = -1}; /* Synthetic request at the current cursor. */
+        .x = (int32_t)((e->lay.gw + 2) * e->grid.dims.cell_w), /* after the fixture's wide cluster */
+        .y = (int32_t)((e->tab_rows + 1) * e->grid.dims.cell_h)}; /* second logical row */
+    view_state click_view = editor_view(e);
     T(press(e, middle) == 0); T(expect(e, doubled, sizeof doubled - 1) == 0);
+    T(editor_view(e).first_line == click_view.first_line); /* all fixture rows fit the viewport */
+    T(editor_view(e).hscroll == click_view.hscroll);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
     T(expect(e, original, sizeof original - 1) == 0);
     T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == 0); /* select final UTF-8 cluster */
@@ -2229,8 +2235,10 @@ static int clipboard_test(bool native)
     T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
     T(press(e, key('v', PLAT_MOD_CTRL, NULL)) == 0);
     T(expect(e, doubled, sizeof doubled - 1) == 0); /* PRIMARY change leaves CLIPBOARD intact */
+    plat_event outside = middle; outside.x = outside.y = -1; outside.t0_ns = trace_now_ns();
+    T(press(e, outside) == 0); T(expect(e, doubled, sizeof doubled - 1) == 0);
     T(editor_get_stats(e).unimplemented_actions == 0);
-    size_t allocations = edit_malloc_guard_end();
+    size_t allocations = edit_malloc_guard_end() + io_count.allocations; io_count.active = false;
     if (edit_malloc_guard_active()) T(allocations == 0);
     printf("clipboard malloc guard: %zu allocations (%s); expected zero by law\n", allocations,
         edit_malloc_guard_active() ? "active" : "ASan-inert");
@@ -2255,7 +2263,7 @@ static int clipboard_middle_long_test(void)
         .x = (int32_t)(e->lay.gw * e->grid.dims.cell_w),
         .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h)};
     T(press(e, middle) == 0);
-    T(editor_view(e).selection.cursor == target + 1);
+    T(editor_view(e).selection.cursor == target + 1); T(editor_view(e).hscroll == target);
     T(editor_length(e) == len + 1); T(editor_read(e, 0, got, len + 1) == 0);
     T(!memcmp(got, bytes, (size_t)target)); T(got[target] == 'p');
     T(!memcmp(got + target + 1, bytes + target, len - (size_t)target));
@@ -2328,11 +2336,15 @@ static int clipboard_pending_primary_test(void)
         (work_job){review_hold_job, &hold, 0, WORK_BULK}); T(held.epoch);
     while (!atomic_load(&hold.entered)) sched_yield();
     plat_event select = key('a', PLAT_MOD_CTRL, NULL), move = key(XKB_KEY_End, PLAT_MOD_CTRL, NULL);
-    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2, .x = -1, .y = -1};
+    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
+        .x = (int32_t)(e->lay.gw * e->grid.dims.cell_w),
+        .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h)};
     edit_malloc_guard_begin();
     T(editor_inject(e, &select) == 0); T(editor_inject(e, &move) == 0); T(editor_inject(e, &middle) == 0);
     uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle guard */
-    while (e->queue_count || view_busy(&e->v)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    while (e->queue_count || view_busy(&e->v) || e->action == EDITOR_ACTION_CLIP) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+    }
     T(editor_length(e) == len); atomic_store(&hold.release, true); T(settle(e) == 0);
     T(editor_length(e) == 2u * len); T(editor_read(e, 0, got, 2u * len) == 0);
     T(!memcmp(got, bytes, len) && !memcmp(got + len, bytes, len));
@@ -2341,6 +2353,22 @@ static int clipboard_pending_primary_test(void)
     editor_close(e); free(got); free(bytes);
     printf("clipboard PRIMARY: queued selection/collapse/middle paste waits for latest capture, mallocs=%zu passed\n", allocations);
     return 0;
+}
+static int clipboard_no_tabs_test(void)
+{
+    const char text[] = "p";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1,
+        .cols = 32, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('c', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(tabs_count(&e->tabs) == 0);
+    uint64_t before = editor_length(e); T(before == 0); /* empty placeholder, no active document */
+    plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
+        .x = (int32_t)(e->lay.gw * e->grid.dims.cell_w),
+        .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h)};
+    T(press(e, middle) == 0); T(editor_length(e) == before);
+    editor_close(e); puts("clipboard middle click: no active tab preserves placeholder"); return 0;
 }
 int main(int argc, char **argv)
 {
@@ -2351,10 +2379,11 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
         if (!strcmp(argv[1], "--panel-state")) return panel_shortcuts(false);
         if (!strcmp(argv[1], "--panel-notice")) return panel_shortcuts(true);
+        if (!strcmp(argv[1], "--clipboard-no-tabs")) return clipboard_no_tabs_test();
         if (!strcmp(argv[1], "--clipboard-primary")) return clipboard_pending_primary_test();
         if (!strcmp(argv[1], "--clipboard-bulk")) return clipboard_large_test();
         if (!strcmp(argv[1], "--clipboard-native")) return clipboard_test(true);
-        if (!strcmp(argv[1], "--clipboard")) return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test();
+        if (!strcmp(argv[1], "--clipboard")) return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test() || clipboard_no_tabs_test();
         if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
         if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
         if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
@@ -2385,6 +2414,7 @@ int main(int argc, char **argv)
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0);
+    T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(NULL) == 0);
