@@ -72,6 +72,8 @@ static bool find_p1r_regex_lit_init(find_lit *lit, const uint8_t *needle, size_t
 #define find_regex_word_visit find_p1r_regex_word_visit
 #define find_regex_work_budget find_p1r_regex_work_budget
 #define find_regex_next_budget find_p1r_regex_next_budget
+#define find_regex_stream_begin find_p1r_regex_stream_begin
+#define find_regex_stream_step find_p1r_regex_stream_step
 #include "../src/find/find.c"
 #undef find_lit_init
 #undef find_lit_seek
@@ -87,6 +89,8 @@ static bool find_p1r_regex_lit_init(find_lit *lit, const uint8_t *needle, size_t
 #undef find_regex_word_visit
 #undef find_regex_work_budget
 #undef find_regex_next_budget
+#undef find_regex_stream_begin
+#undef find_regex_stream_step
 
 static int dense_count(void)
 {

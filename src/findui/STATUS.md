@@ -125,3 +125,13 @@ DISPLAY=:99 EDIT_DISPLAY=:99 build/bench/findui_bench --track
 
 The coordinator reruns sanitizer checks with leaks enabled and owns gate verdicts.
 Do not regenerate `/tmp/edit-corpus` or repeatedly run benches to chase low load.
+
+## edit-a2g continuation
+
+Count work retains a compressed worker-owned match plan in setup-reserved
+unlinked descriptors. Windows, uncached ordinals and replacement pages retrieve
+that plan without rescanning source bytes. Persistent literal/regex search and
+sealed publication yield the bulk lane. Producer slots stay reserved through
+cancelled borrowing jobs' physical retirement. Default protected-source tests,
+independent fuzzer replay and release allocation guards pass. Full verification
+evidence and platform/navigation limitations: ../../docs/worker-reports/edit-a2g.md.

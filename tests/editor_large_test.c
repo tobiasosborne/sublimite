@@ -631,7 +631,7 @@ static int byte_jump_boundaries(void)
 }
 
 /* Only the paint operation is inside the fault census; workers are retired. */
-static int cold_bracket_paint(void)
+static int cold_bracket_paint(bool wrapped_edit)
 {
     char path[] = "build/editor-cold-paint-XXXXXX";
     int fd = mkstemp(path); T(fd >= 0);
@@ -641,7 +641,8 @@ static int cold_bracket_paint(void)
     for (size_t i = 0; i < length; i += sizeof block) T(write(fd, block, sizeof block) == (ssize_t)sizeof block);
     close(fd);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
+    editor_config cfg = {.path = path, .cols = 40, .rows = 4,
+        .wrap_mode = wrapped_edit ? 1 : -1, .copy_threshold = 1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
     editor_large_close(e->buffer); lineidx_build_cancel(e->buffer->index);
     lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(length); T(e->buffer->index);
@@ -658,22 +659,30 @@ static int cold_bracket_paint(void)
     T(file_snapshot_bytes(snap, NULL, &mapped, &n) == 1 && n == length);
     T(madvise((void *)mapped, n, MADV_DONTNEED) == 0);
     struct rusage before, after; T(getrusage(RUSAGE_THREAD, &before) == 0);
-    e->paint_ready = false; T(editor_paint_prepare(e) == 0);
+    if (wrapped_edit) {
+        plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_z, .utf8_len = 1, .utf8 = {'z'}};
+        T(editor_handle_key(e, &key) == 0);
+        while (e->action != EDITOR_ACTION_NONE || view_busy(&e->v)) T(editor_continue_action(e) == 0);
+    } else { e->paint_ready = false; T(editor_paint_prepare(e) == 0); }
     T(getrusage(RUSAGE_THREAD, &after) == 0);
     long faults = after.ru_minflt - before.ru_minflt;
     printf("P4-3 section 20: cold deep bracket paint minor faults=%ld (M)[AC], loose bound=128 (G)\n", faults);
-    T(faults < 128); T(e->bracket_mate == start + 1u);
+    T(faults < 128);
+    if (wrapped_edit) T(editor_view(e).selection.cursor == start + 1u);
+    else T(e->bracket_mate == start + 1u);
     piece_snapshot_release(snap); editor_close(e); unlink(path);
     return 0;
 }
 
-/* This requires input/layout accounting changes outside the supplied files.
- * Keep an explicit red reproducer without making the ordinary suite fail. */
-static int estimated_newline_delete(void)
+/* Underestimate from the review fixture: a newline-free prefix followed by
+ * an equally sized all-newline suffix. Minimum lines = empty-file sentinel;
+ * maximum lines = one newline per remaining byte plus the sentinel. */
+static int estimated_newline_delete(bool wrapped)
 {
     uint8_t bytes[200]; memset(bytes, 'a', 100); memset(bytes + 100, '\n', 100);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes, .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes, .cols = 40, .rows = 4,
+        .wrap_mode = wrapped ? 1 : -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     e->buffer->lg.lines_exact = false; e->buffer->lg.lazy = true;
@@ -685,6 +694,20 @@ static int estimated_newline_delete(void)
         (unsigned long long)editor_line_count(e), (unsigned long long)editor_length(e));
     T(editor_line_count(e) >= 1 && editor_line_count(e) <= editor_length(e) + 1u);
     T(e->lay.line_count >= 1 && e->lay.line_count <= editor_length(e) + 1u);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    ev.keysym = XKB_KEY_z; ev.mods = PLAT_MOD_CTRL;
+    T(editor_handle_key(e, &ev) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_length(e) == sizeof bytes);
+    T(editor_line_count(e) >= 1 && editor_line_count(e) <= sizeof bytes + 1u);
+    T(e->lay.line_count >= 1 && e->lay.line_count <= sizeof bytes + 1u);
+    ev.keysym = XKB_KEY_y;
+    T(editor_handle_key(e, &ev) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_length(e) == sizeof bytes / 2u);
+    T(editor_line_count(e) >= 1 && editor_line_count(e) <= editor_length(e) + 1u);
+    T(e->lay.line_count >= 1 && e->lay.line_count <= editor_length(e) + 1u);
+    puts("P4-3 estimated newline delete/undo/redo: passed");
     editor_close(e); return 0;
 }
 
@@ -721,6 +744,7 @@ static int lazy_long_line_rows(void)
     T(editor_full_layout(e) == 0);
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     T(e->row_byte[1] == n + 1u);
+    puts("P4-3 lazy first viewport following row: passed");
     editor_close(e); unlink(path); return 0;
 }
 
@@ -941,6 +965,9 @@ static int near_end_repro(bool wrapped)
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete(getenv("P4_ESTIMATED_WRAP") != NULL);
+    if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
+    if (getenv("P4_COLD_WRAP")) return cold_bracket_paint(true);
     if (getenv("EDIT_2TY_REPRO")) return near_end_repro(getenv("EDIT_2TY_WRAP") != NULL);
     T(near_end_repro(false) == 0);
     T(near_end_repro(true) == 0);
@@ -948,12 +975,14 @@ int main(void)
     T(mailbox_yield() == 0);
     if (getenv("P4_COOPERATIVE_JOBS")) return cooperative_large_jobs();
     T(cooperative_large_jobs() == 0);
-    if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
+    T(lazy_long_line_rows() == 0);
     if (getenv("P4_WARM_REPAINT")) return warm_repaint();
     T(warm_repaint() == 0);
-    if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete();
-    if (getenv("P4_COLD_PAINT")) return cold_bracket_paint();
-    T(cold_bracket_paint() == 0);
+    T(estimated_newline_delete(false) == 0);
+    T(estimated_newline_delete(true) == 0);
+    if (getenv("P4_COLD_PAINT")) return cold_bracket_paint(false);
+    T(cold_bracket_paint(false) == 0);
+    T(cold_bracket_paint(true) == 0);
     if (getenv("P4_BYTE_JUMP")) return byte_jump_boundaries();
     T(byte_jump_boundaries() == 0);
     if (getenv("P4_COORDINATES")) return explicit_coordinates();

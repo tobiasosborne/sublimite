@@ -115,3 +115,11 @@ campaign flags and an existing seed corpus; and one
 Full X11 tests need socket access outside the sandbox; all commands target :99,
 with existing X11 tests using private virtual servers. LSan is disabled only for
 this sandbox; the coordinator reruns with leaks enabled.
+
+## edit-a2g continuation
+
+Estimated totals use checked mutation accounting in both wrap modes. Logical
+anchors survive bounded resident wrap queries; edits crossing the anchor
+invalidate it. The editor applies bounded row repair before warming and adopts
+exact totals through full layout. Layout/wrap/view suites and seed replays pass;
+nonresident query redesign remains documented in ../../docs/worker-reports/edit-a2g.md.

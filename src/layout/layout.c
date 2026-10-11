@@ -75,6 +75,7 @@ static int begin_common(layout *l, layout_viewport vp)
     }
     l->first_byte = vp.first_byte;
     l->first_line = vp.first_line;
+    l->first_line_valid = true;
     l->approximate = false;
     l->hscroll = vp.hscroll;
     l->bytes_scanned = l->bytes_read = l->cache_hits = l->cache_misses = 0;
@@ -571,12 +572,15 @@ int layout_edit(layout *l, uint64_t off, uint64_t old_len, uint64_t new_len,
     l->total = piece_len(t);
     l->win_len = l->wi = 0; l->win_eof = false;
     uint32_t rows = l->grid->dims.rows;
-    uint64_t lc = l->line_count + new_nl - old_nl;
+    uint64_t lc = l->line_count_estimated ? layout_estimated_lines(l->line_count, l->total, old_nl, new_nl)
+                                         : l->line_count - old_nl + new_nl;
     l->line_count = lc;
 
     if (off < l->first_byte) {
-        if (off + old_len > l->first_byte || (off + old_len == l->first_byte && old_nl))
+        if (off + old_len > l->first_byte || (off + old_len == l->first_byte && old_nl)) {
+            l->first_line_valid = false;
             return LAYOUT_RESET;
+        }
         l->first_byte = (uint64_t)((int64_t)l->first_byte + delta);
         shift_rows(l, 0, delta);
         if (old_nl == new_nl && !was_busy) return LAYOUT_DONE;

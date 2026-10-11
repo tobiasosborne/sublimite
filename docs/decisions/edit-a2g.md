@@ -15,3 +15,50 @@ Warm and find retain progress in their explicit-admission job objects. Each invo
 Resident bridges can bind a file-backed validation snapshot before admission. The bridge retains its sticky backing token through physical close, checks it around span acquisition/copy/sealing, and masks failed adoption/use while preserving the viewport. The generic unbound initialization contract is restricted to nonfaultable sources. Source callback/context lifetime remains caller-owned. This is detected backing-fault validation, not new worker identity polling; hosts still own source-change detection and must bind faultable snapshots.
 
 No input.c, editor.c, layout, save/journal/startup, tab lifecycle or eviction hunks were changed. Exact estimated-total mutation accounting, lazy first-frame row repair, wrapped follow, fully deferred coordinates and findui match-plan paging remain open. Evidence and verification are in ../worker-reports/edit-a2g-s9.md.
+
+## Continuation: default remaining probes
+
+This continuation supersedes the earlier supplied-file exclusion for the
+mutation/layout seams required by the assigned probes. The existing near-end
+index/navigation imports in large.c remain intact.
+
+Editor mutations retain the large buffer's exactness flag. Exact totals receive
+exact newline deltas; density totals use checked subtraction/addition and the
+empty-file sentinel / newline-per-byte ceiling. Layout carries an explicit
+estimated-total flag in both wrap modes. Exact index adoption still requests
+full layout, which imports the replacement total and clears its estimate flag.
+
+Lazy unwrapped layout now runs the existing bounded following-row repair before
+piece warming. Only certified index results become logical row starts. Wrapped
+queries near the viewport can reuse its rebased logical anchor within the
+existing layout byte budget; deletion across that anchor invalidates it. Edit
+completion keeps the followed view's metadata or takes line/start metadata from
+the returned visual row, avoiding another global piece-prefix query. This does
+not redesign nonresident navigation or giant-line wrap queries.
+
+Findui reserves unlinked, owner-readable/writable O_TMPFILE descriptors in /tmp
+at panel setup. A worker builds a compressed ordinal/byte-ordered match plan;
+equal-length, fixed-stride matches share a record, and irregular runs spill
+through a prepaid buffer sized from FIND_POLL_UNITS and the record type. Window
+requests binary-search byte endpoints; uncached navigation and replacement
+pages binary-search ordinals. All retrieval is on workers and reads the plan,
+without another source traversal. Generation changes invalidate the active plan;
+a cancelled borrowing job prevents its producer slot from being reused until
+physical completion. Disposal closes descriptors after all borrows retire.
+Descriptor admission failure returns the existing memory-admission error.
+
+Literal work preserves SIMD masks for single bytes, the core SIMD/Two-Way
+matcher for case-sensitive non-word windows, and persistent folding/word KMP
+otherwise. Bulk masks enter the compressed plan without enumerating discarded
+dense matches. Regex work retains NFA lists, candidate/best endpoint, prefix KMP
+and the shared retry meter in prepaid scratch. It yields at byte boundaries
+while preserving the synchronous closure/tag ordering and whole-word/empty-match
+policy. Search stages and sealed publication use work_continue; no new globals
+or typing-path heap allocation were introduced.
+
+The default tests include the former estimated-delete, lazy-row and sparse-window
+probes, plus history replay, protected immutable-source replacement paging,
+irregular folded literal/regex plans, and a bulk marker before matcher completion.
+The protected source is unreadable after counting, providing a read-work oracle
+independent of the scan hook. Evidence and remaining navigation/verification
+limits: ../worker-reports/edit-a2g.md.

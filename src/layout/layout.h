@@ -164,6 +164,11 @@ typedef struct layout {
     uint64_t hscroll;
     uint32_t gw, text_cols, tab;
     bool approximate, marks, hit_cr;
+    /* Host-supplied density totals remain estimates through mutation. Default
+     * false preserves exact standalone layout accounting; the editor sets
+     * this before begin/edit and clears it on exact index publication. */
+    bool line_count_estimated;
+    bool first_line_valid;       /* logical byte anchor survives edits */
     layout_paint_fn paint;
     void *paint_ctx;
     uint32_t row, row_end;       /* work range [row, row_end) */

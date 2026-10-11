@@ -71,14 +71,14 @@ void editor_seed_view_lines(editor *e)
 static int layout_slice(editor *e)
 {
     layout *l = &e->lay;
-    if (l->wrap || !e->buffer->lg.warm_done) return layout_run(l);
+    if (l->wrap) return layout_run(l);
     /* Ordinary rows carry their starts forward from the bounded layout scan.
      * Only a clipped long tail needs a query; the partial index bounds that
      * query to a chunk and may supply an approximate start. */
     uint32_t end = l->row_end;
     if (l->phase == 0 && l->row < end) {
         uint64_t line = l->first_line + l->row;
-        if (line >= e->buffer->lines) e->row_byte[l->row] = LAYOUT_VOID_ROW;
+        if (e->buffer->lg.lines_exact && line >= e->buffer->lines) e->row_byte[l->row] = LAYOUT_VOID_ROW;
         else if (e->row_byte[l->row] == LAYOUT_VOID_ROW && e->buffer->index) {
             /* Preserve following rows for a clipped tail close to its newline.
              * Never search farther than one chunk, even with no index. */
@@ -102,7 +102,8 @@ static int layout_slice(editor *e)
             if (!found) {
                 lineidx_src src = editor_source(e->buffer);
                 lineidx_result start = lineidx_line_to_byte(e->buffer->index, &src, line);
-                e->row_byte[l->row] = start.value;
+                /* Approximate byte density does not certify a logical row. */
+                if (start.exact) e->row_byte[l->row] = start.value;
                 l->approximate |= !start.exact;
             }
         }
@@ -163,6 +164,7 @@ int editor_full_layout(editor *e)
     /* Establish the incoming gutter/text width before asking for a visual
      * seed; a preceding tab or resize can have different query geometry. */
     trace_record(TRACE_STARTUP_FIRST_LAYOUT, 0);
+    e->lay.line_count_estimated = !e->buffer->lg.lines_exact;
     rc = layout_begin(&e->lay, e->tree, vp); if (rc) return rc;
     if (s.wrap && s.visual_byte != s.first_byte) {
         layout_wrap_row first; bool approximate=false;

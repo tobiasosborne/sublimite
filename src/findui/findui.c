@@ -2,6 +2,8 @@
 #include "file/file.h"
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static findui_impl *implementation(const findui_panel *panel)
 { return panel ? panel->private_ : NULL; }
@@ -28,6 +30,7 @@ static void reap(findui_impl *impl, bool maintenance)
             piece_snapshot_release(slot->snapshot); slot->snapshot = NULL;
             if (slot->lease.release) slot->lease.release(slot->lease.user);
             slot->lease = (findui_source_lease){0};
+            slot->plan_source = NULL;
         }
     }
 }
@@ -73,6 +76,7 @@ static void cancel_jobs(findui_impl *impl)
 }
 static void clear_results(findui_impl *impl)
 {
+    impl->plan = NULL;
     impl->state.match_count = 0; impl->state.match_index = FINDUI_NO_INDEX;
     impl->state.selected = unset_range();
     impl->state.cached_matches = 0; impl->state.visible_matches = 0;
@@ -101,6 +105,7 @@ static void restart(findui_impl *impl, uint64_t desired)
     impl->state.generation++;
     clear_results(impl); impl->desired_index = desired;
     impl->window_request = false; impl->window_dirty = false; impl->page_request = false;
+    impl->selection_request = false;
     if (impl->source && impl->state.open) {
         if (!impl->state.query_length) impl->state.complete = true;
         else {
@@ -122,6 +127,7 @@ findui_code findui_init(findui_panel *panel, const findui_config *config)
     findui_impl *impl = edit_arena_alloc(config->arena, sizeof *impl, _Alignof(findui_impl));
     if (!impl) return FINDUI_ERR_MEMORY;
     memset(impl, 0, sizeof *impl); impl->config = *config;
+    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) impl->slots[i].plan.fd = -1;
     impl->cache = edit_arena_alloc(config->arena, config->match_capacity * sizeof *impl->cache,
                                    _Alignof(findui_range));
     impl->visible = edit_arena_alloc(config->arena, config->visible_capacity * sizeof *impl->visible,
@@ -137,9 +143,16 @@ findui_code findui_init(findui_panel *panel, const findui_config *config)
         slot->outbox_capacity = config->match_capacity + config->visible_capacity + 2;
         slot->outbox = edit_arena_alloc(config->arena, slot->outbox_capacity * sizeof *slot->outbox,
                                         _Alignof(work_msg));
-        memory_ok = slot->program && slot->scratch && slot->pattern && slot->outbox;
+        /* Setup only: unlinked, private, close-on-exec spool. Queries and
+         * retrieval reuse this descriptor without allocating on input. */
+        /* Owner read/write permission bits; no dependency on a writable cwd. */
+        slot->plan.fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+        memory_ok = slot->program && slot->scratch && slot->pattern && slot->outbox && slot->plan.fd >= 0;
     }
-    if (!memory_ok) { edit_arena_reset_to_mark(config->arena, mark); return FINDUI_ERR_MEMORY; }
+    if (!memory_ok) {
+        for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) if (impl->slots[i].plan.fd >= 0) close(impl->slots[i].plan.fd);
+        edit_arena_reset_to_mark(config->arena, mark); return FINDUI_ERR_MEMORY;
+    }
     impl->state.query = impl->query; impl->state.replacement = impl->replacement;
     impl->state.generation = 1;
     clear_results(impl); panel->private_ = impl;
@@ -155,23 +168,32 @@ findui_code findui_service(findui_panel *panel)
     if (work_pool_eventfd(impl->config.workers) < 0) return FINDUI_ERR_BUSY;
     for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) {
         findui_slot *slot = &impl->slots[i];
-        if (slot->snapshot) continue;
+        if (slot->snapshot || slot == impl->plan) continue;
+        bool borrowed = false;
+        for (size_t j = 0; j < FINDUI_SLOT_COUNT; j++)
+            if (impl->slots[j].snapshot && impl->slots[j].plan_source == slot) borrowed = true;
+        if (borrowed) continue;
         slot->snapshot = piece_snapshot_retain(impl->source);
         slot->lease = impl->source_lease;
         if (slot->lease.retain) slot->lease.retain(slot->lease.user);
         slot->owner = (uint64_t)(uintptr_t)impl;
         slot->window_start = impl->window_start; slot->window_end = impl->window_end;
         slot->window_request = impl->window_request;
+        slot->selection_request = impl->selection_request;
+        slot->plan_source = impl->window_request || impl->page_request || impl->selection_request ? impl->plan : NULL;
         slot->page_request = impl->page_request;
         slot->page_first = impl->page_first; slot->page_count = impl->page_count;
         slot->desired_index = impl->window_request ? FIND_UNSET : impl->desired_index;
-        slot->cache_capacity = impl->window_request ? 0 : impl->config.match_capacity;
+        slot->cache_capacity = impl->window_request || impl->selection_request ? 0 : impl->config.match_capacity;
         slot->visible_capacity = impl->page_request ? 0 : impl->config.visible_capacity;
         if (impl->page_request) {
-            slot->cache_capacity = impl->page_first + impl->page_count;
+            slot->cache_capacity = 0;
             slot->desired_index = FIND_UNSET; slot->window_start = 0; slot->window_end = 0;
         }
         slot->publishing = false; slot->outbox_count = 0; slot->outbox_next = 0;
+        slot->started = slot->scan_done = slot->pending = slot->run_active = false;
+        slot->total = slot->visible = slot->offset = slot->plan_record = 0;
+        slot->matched = slot->visible_emitted = 0; slot->regex = NULL;
         slot->query_length = impl->state.query_length;
         memcpy(slot->query, impl->query, slot->query_length);
         slot->options = impl->state.options; slot->hook = impl->config.scan_hook;
@@ -182,6 +204,7 @@ findui_code findui_service(findui_panel *panel)
             piece_snapshot_release(slot->snapshot); slot->snapshot = NULL;
             if (slot->lease.release) slot->lease.release(slot->lease.user);
             slot->lease = (findui_source_lease){0};
+            slot->plan_source = NULL;
             return FINDUI_MORE;
         }
         impl->pending_submit = false; return FINDUI_OK;
@@ -198,6 +221,7 @@ findui_code findui_dispose(findui_panel *panel)
     for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) if (impl->slots[i].snapshot) return FINDUI_MORE;
     if (impl->source) piece_snapshot_release(impl->source);
     if (impl->source_lease.release) impl->source_lease.release(impl->source_lease.user);
+    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) close(impl->slots[i].plan.fd);
     panel->private_ = NULL;
     return FINDUI_OK;
 }
@@ -213,6 +237,7 @@ static void window_request(findui_impl *impl)
     cancel_jobs(impl); impl->state.generation++;
     impl->state.visible_matches = 0; impl->state.visible_overflow = false;
     impl->window_request = true; impl->window_dirty = false;
+    impl->selection_request = false;
     if (impl->source && impl->state.open && impl->state.query_length) {
         impl->pending_submit = true; impl->request_active = true; impl->state.searching = true;
     }
@@ -260,6 +285,13 @@ bool findui_accept(findui_panel *panel, const work_msg *message)
             if (!impl->window_request) {
                 impl->state.match_count = done.count;
                 impl->state.cache_overflow = done.count > impl->config.match_capacity;
+                if (!impl->selection_request && message->slot_ < WORK_MAX_JOBS) {
+                    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) {
+                        findui_slot *slot = &impl->slots[i];
+                        if (slot->handle.slot == message->slot_ && slot->handle.epoch == message->epoch_ && slot->plan.ready)
+                            impl->plan = slot;
+                    }
+                }
             }
             if (done.visible != FIND_UNSET) {
                 impl->state.visible_matches = done.visible>SIZE_MAX ? SIZE_MAX : (size_t)done.visible;
@@ -402,7 +434,12 @@ findui_code findui_next(findui_panel *panel, int direction, findui_range *select
         impl->state.match_index = index; impl->state.selected = impl->cache[(size_t)index];
         *selected = impl->state.selected; return FINDUI_OK;
     }
-    *selected = unset_range(); restart(impl, index); return FINDUI_MORE;
+    /* An uncached ordinal belongs to the already counted immutable plan. */
+    *selected = unset_range(); cancel_jobs(impl); impl->state.generation++;
+    impl->desired_index = index; impl->window_request = false; impl->selection_request = true;
+    impl->state.complete = false; impl->state.searching = true;
+    impl->pending_submit = impl->request_active = true;
+    (void)findui_service(panel); return FINDUI_MORE;
 }
 findui_code findui_highlights(const findui_panel *panel, uint64_t start, uint64_t end,
                              findui_range *ranges, size_t capacity, size_t *count)
@@ -444,6 +481,7 @@ static findui_code replacement_page(findui_impl *impl)
     impl->page_request = true; impl->page_ready = false; impl->page_error = FIND_OK;
     impl->pending_submit = true; impl->request_active = true;
     impl->window_request = false;
+    impl->selection_request = false;
     findui_panel panel = {impl}; (void)findui_service(&panel);
     return FINDUI_OK;
 }

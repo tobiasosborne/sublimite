@@ -448,9 +448,12 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
     bool busy=layout_busy(l); uint32_t rows=l->grid->dims.rows;
     layout_checkpoint_invalidate(l->checkpoints,off,old_len,new_len,old_nl,new_nl);
     l->total=piece_len((const piece_tree *)l->src);
-    l->line_count=l->line_count-old_nl+new_nl;
+    l->line_count=l->line_count_estimated ? layout_estimated_lines(l->line_count,l->total,old_nl,new_nl)
+                                        : l->line_count-old_nl+new_nl;
     if(off<l->first_byte) {
-        if(off+old_len>l->first_byte || (off+old_len==l->first_byte && old_nl)) return LAYOUT_RESET;
+        if(off+old_len>l->first_byte || (off+old_len==l->first_byte && old_nl)) {
+            l->first_line_valid=false; return LAYOUT_RESET;
+        }
         l->first_byte=l->first_byte-old_len+new_len; l->first_line=l->first_line-old_nl+new_nl;
         shift_bytes(l,0,off,old_len,new_len);
         if(!busy && old_nl==new_nl) return LAYOUT_DONE;
@@ -571,6 +574,17 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
         previous=row[0]; have_previous=true; next_seed(&row[0],&previous);
     }
 }
+static const layout_wrap_row *resident_seed(const layout *l,const piece_tree *t,uint64_t byte,
+                                             layout_wrap_row *seed)
+{
+    /* A rebased logical start does not depend on lazy piece newline totals.
+     * Stay within the existing wrap byte budget; outside it the caller needs
+     * another certified anchor. Never reuse an anchor cut by a newline join. */
+    if(l->src!=t || l->total!=piece_len(t) || !l->first_line_valid ||
+       byte<l->first_byte || byte-l->first_byte>LAYOUT_BYTE_BUDGET) return NULL;
+    *seed=(layout_wrap_row){.start=l->first_byte,.line_start=l->first_byte,.line=l->first_line};
+    return seed;
+}
 int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int direction,
                       layout_wrap_row *out,bool *approximate)
 {
@@ -593,7 +607,10 @@ int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int dire
             break;
         }
     }
-    int rc=scan_row(l,t,byte,direction,out,approximate,true,NULL,NULL);
+    layout_wrap_row seed;
+    const layout_wrap_row *anchor=resident_seed(l,t,byte,&seed);
+    if(direction<0 && byte==l->first_byte) anchor=NULL;
+    int rc=scan_row(l,t,byte,direction,out,approximate,true,anchor,NULL);
     if(rc==LAYOUT_DONE) out->approximate|=*approximate;
     return rc;
 }
@@ -603,7 +620,8 @@ int layout_visual_row_fresh(const layout *l,const piece_tree *t,uint64_t byte,
 {
     if(!l || !l->grid || !l->wrap || !t || !out || !approximate || byte>piece_len(t)) return LAYOUT_ERR_ARG;
     *approximate=false;
-    int rc=scan_row(l,t,byte,0,out,approximate,false,NULL,NULL);
+    layout_wrap_row seed;
+    int rc=scan_row(l,t,byte,0,out,approximate,false,resident_seed(l,t,byte,&seed),NULL);
     if(rc==LAYOUT_DONE) out->approximate|=*approximate;
     return rc;
 }

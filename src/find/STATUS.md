@@ -113,3 +113,11 @@ The benchmark command is `DISPLAY=:99 EDIT_DISPLAY=:99
 the one-run benchmark policy. The best-of test contains a counted production
 source copy for deterministic probes and checks normal linked entry points
 against its independent models as well.
+
+## edit-a2g continuation
+
+The private visitor API now supports prepaid resumable regex state and an
+optional bulk mask sink. The frozen public search API and its synchronous
+behavior remain intact. Findui retains candidate lists, prefix KMP, endpoints
+and retry accounting across worker continuations. Existing core suites and
+independent panel oracle replay pass; evidence: ../../docs/worker-reports/edit-a2g.md.

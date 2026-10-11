@@ -20,6 +20,8 @@
 #define find_regex_word_visit find_bench_regex_word_visit
 #define find_regex_work_budget find_bench_regex_work_budget
 #define find_regex_next_budget find_bench_regex_next_budget
+#define find_regex_stream_begin find_bench_regex_stream_begin
+#define find_regex_stream_step find_bench_regex_stream_step
 #include "../src/find/literal.c"
 #include "../src/find/find.c"
 #undef work_should_stop
@@ -42,3 +44,5 @@
 #undef find_regex_word_visit
 #undef find_regex_work_budget
 #undef find_regex_next_budget
+#undef find_regex_stream_begin
+#undef find_regex_stream_step

@@ -429,3 +429,111 @@ find_code find_regex_visit(const find_source *source,const find_regex *re,void *
 find_code find_regex_word_visit(const find_source *source,const find_regex *re,void *memory,size_t size,
                                 const find_control *control,find_visit *visit)
 { return regex_visit_run(source,re,memory,size,control,visit,true); }
+
+/* Keep an anchored candidate's lists, best endpoint and prefix matcher across
+ * continuations. The shared closure/tag ordering is the synchronous oracle;
+ * no candidate is restarted merely because a worker quantum ended. */
+typedef struct regex_stream {
+    scratch nfa;
+    find_source source;
+    const find_regex *re;
+    reader bytes, prefix, boundaries;
+    regex_meter m;
+    find_match hit;
+    uint64_t candidate, pos, prefix_pos;
+    size_t count, prefix_matched, failure[FIND_MAX_PATTERN];
+    unsigned current;
+    bool whole_word, anchored, done;
+} regex_stream;
+_Static_assert(sizeof(regex_stream) <= FIND_MAX_SCRATCH_BYTES, "prepaid regex continuation");
+find_code find_regex_stream_begin(const find_source *source,const find_regex *re,
+                                  void *memory,size_t size,bool whole_word)
+{
+    find_code code=regex_arguments(source,re,memory,size);
+    if(code!=FIND_OK) return code;
+    if(size<sizeof(regex_stream)) return FIND_ERR_MEMORY;
+    regex_stream *s=memory; memset(s,0,sizeof *s);
+    s->source=*source; s->re=re; s->whole_word=whole_word;
+    s->bytes=reader_init(&s->source); s->prefix=reader_init(&s->source);
+    s->boundaries=reader_init(&s->source);
+    s->m=regex_meter_init(NULL,s->bytes.len,re->count);
+    s->m.poll.snapshot=source->snapshot;
+    for(size_t i=1;i<re->prefix_len;i++) {
+        size_t k=s->failure[i-1u];
+        while(k && re->prefix[k]!=re->prefix[i]) k=s->failure[k-1u];
+        s->failure[i]=k+(re->prefix[k]==re->prefix[i]?1u:0u);
+    }
+    return FIND_OK;
+}
+find_code find_regex_stream_step(void *memory,const find_control *control,find_visit *visit,bool *done)
+{
+    if(!memory || !visit || !visit->emit || !done) return FIND_ERR_ARGUMENT;
+    regex_stream *s=memory; const find_regex *re=s->re;
+    s->m.poll.control=control; *done=false;
+    if(poll_stop(&s->m.poll)) return FIND_CANCELLED;
+    uint64_t initial=s->m.remaining; size_t prefix_units=0;
+    while(!s->done && !regex_stopped(&s->m)) {
+        if(initial-s->m.remaining+prefix_units>=FIND_POLL_UNITS) return FIND_OK;
+        if(!s->anchored) {
+            if(re->prefix_len) {
+                bool found=false;
+                while(s->prefix_pos<s->bytes.len) {
+                    if(step(&s->m.poll)) return FIND_CANCELLED;
+                    uint8_t byte=get_byte(&s->prefix,s->prefix_pos++); prefix_units++;
+                    while(s->prefix_matched && re->prefix[s->prefix_matched]!=byte) {
+                        if(step(&s->m.poll)) return FIND_CANCELLED;
+                        s->prefix_matched=s->failure[s->prefix_matched-1u]; prefix_units++;
+                    }
+                    if(re->prefix[s->prefix_matched]==byte) s->prefix_matched++;
+                    if(s->prefix_matched==re->prefix_len) {
+                        s->candidate=s->prefix_pos-re->prefix_len;
+                        s->prefix_matched=s->failure[s->prefix_matched-1u]; found=true; break;
+                    }
+                    if(prefix_units>=FIND_POLL_UNITS) return FIND_OK;
+                }
+                if(!found) { s->done=true; break; }
+            }
+            if(regex_step(&s->m)) break;
+            thread seed={0}; seed.state=re->start;
+            for(size_t i=0;i<2*FIND_MAX_GROUPS;i++) seed.tags[i]=FIND_UNSET;
+            clear_match(&s->hit); s->hit.groups=re->groups;
+            memset(s->nfa.seen,0,sizeof s->nfa.seen);
+            s->count=closure(&s->bytes,re,&s->nfa,seed,s->candidate,s->nfa.lists[0],0,&s->m,&s->hit);
+            s->current=0; s->pos=s->candidate; s->anchored=true;
+        } else if(s->count && s->pos<s->bytes.len) {
+            uint8_t byte=get_byte(&s->bytes,s->pos); size_t next_count=0;
+            memset(s->nfa.seen,0,sizeof s->nfa.seen);
+            for(size_t i=0;i<s->count && !regex_stopped(&s->m);i++) {
+                thread t=s->nfa.lists[s->current][i]; const state *st=&re->states[t.state];
+                if(regex_step(&s->m)) break;
+                if(class_has(st->cls,byte)) {
+                    t.state=st->out;
+                    next_count=closure(&s->bytes,re,&s->nfa,t,s->pos+1u,
+                                       s->nfa.lists[1u-s->current],next_count,&s->m,&s->hit);
+                }
+            }
+            s->count=next_count; s->current=1u-s->current; s->pos++;
+        } else {
+            s->anchored=false;
+            s->hit.whole.start=s->candidate;
+            bool accepted=s->hit.matched && (!s->whole_word ||
+                regex_word_boundary(&s->boundaries,s->hit.whole,&s->m));
+            if(regex_stopped(&s->m)) break;
+            if(accepted) {
+                if(!find_visit_add(visit,visit->total,s->hit.whole)) return FIND_CANCELLED;
+                if(visit->total==UINT64_MAX) return FIND_ERR_LIMIT;
+                visit->total++;
+            }
+            uint64_t next=accepted?s->hit.whole.end:s->candidate;
+            if(!accepted || next==s->candidate) {
+                if(next==s->bytes.len) { s->done=true; break; }
+                next++;
+            }
+            s->candidate=next;
+            if(accepted) { s->prefix_pos=next; s->prefix_matched=0; }
+        }
+    }
+    if(poll_stop(&s->m.poll)) return FIND_CANCELLED;
+    if(s->m.limited) return FIND_ERR_LIMIT;
+    *done=s->done; return FIND_OK;
+}

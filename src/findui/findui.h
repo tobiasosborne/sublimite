@@ -64,7 +64,9 @@ findui_state findui_get_state(const findui_panel *panel);
  * document identity/version. Window is half-open; results keep absolute byte
  * offsets. Window requests retain count, selection and first-cache identity.
  * A running count finishes without restart; a separate worker request refreshes
- * highlights. Single-byte literal windows scan only their requested range. Empty query means no matches, also regex. */
+ * highlights from a compressed, worker-owned match plan. Window, uncached
+ * ordinal and replacement-page retrieval never traverse source bytes again.
+ * Empty query means no matches, also regex. */
 /* Full source storage lease: retain covers snapshot headers/nodes, allocator
  * context, arena and original mapping, through final snapshot release. Hooks
  * run on the UI owner. Final release is only in explicit maintenance/disposal,

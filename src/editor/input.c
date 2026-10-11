@@ -1,4 +1,5 @@
 #include "editor/private.h"
+#include "layout/wrap.h"
 #include "trace/trace.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <string.h>
@@ -44,7 +45,10 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
     e->wheel_pending=false; e->wrap_wheel_rows=0;
     e->find_range_count=0;
     e->paint_ready = false; e->buffer->revision++;
-    e->stats.mutations++; e->buffer->lines = e->buffer->lines - old_nl + new_nl;
+    e->stats.mutations++;
+    e->buffer->lines = e->buffer->lg.lines_exact ? e->buffer->lines - old_nl + new_nl :
+        layout_estimated_lines(e->buffer->lines, piece_len(e->tree), old_nl, new_nl);
+    e->lay.line_count_estimated = !e->buffer->lg.lines_exact;
     if (e->buffer->index) {
         /* A mutation invalidates outstanding results. Adoption and source
          * retirement belong to the maintenance turn, before input checks. */
@@ -170,10 +174,11 @@ static int finish_edit(editor *e)
         /* Undo mutates outside view_command. Its empty TYPE repairs cluster
          * boundaries, but cached EOF cannot describe newly appended rows. */
         if (cursor.start < e->v.state.visual_byte ||
-            (bottom->start != LAYOUT_VOID_ROW && cursor.start > bottom->start))
+            (bottom->start != LAYOUT_VOID_ROW && cursor.start > bottom->start)) {
             e->v.state.visual_byte = cursor.start;
-        e->v.state.first_line = piece_byte_to_line(e->tree, e->v.state.visual_byte);
-        e->v.state.first_byte = piece_line_to_byte(e->tree, e->v.state.first_line);
+            e->v.state.first_line = cursor.line;
+            e->v.state.first_byte = cursor.line_start;
+        }
         e->v.state.approximate |= approximate;
     }
     undo_state after = save_selection(&e->v);

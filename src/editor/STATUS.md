@@ -726,3 +726,13 @@ region checks pass; the release typing allocation guard is active and reports
 no allocations. The full sanitizer driver stops at blocked IPC setup; every
 suite was run separately, with native X/IPC restrictions and isolated reruns
 itemized in the report. Display readback and the Astra drive remain pending.
+
+## edit-a2g continuation
+
+The former remaining probes now run by default: estimated deletion/history
+replay stays bounded, lazy first layout repairs following logical rows, and
+cold wrapped edits follow certified resident metadata. The edit-2ty near-end
+imports remain intact; release allocation/latency checks pass. Fully deferred
+explicit coordinates/byte jumps and nonresident wrap queries remain as described
+in the worker report; native verification and the next Astra drive are pending.
+Evidence: ../../docs/worker-reports/edit-a2g.md.

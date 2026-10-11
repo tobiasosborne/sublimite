@@ -11,6 +11,9 @@ typedef struct find_visit {
     bool (*emit)(void *user,uint64_t ordinal,find_capture range);
     void *user;
     uint64_t total, visible;
+    /* Optional bulk sink for a compressed match plan. The sink owns filtering
+     * and visible counts; total remains the enumerator's responsibility. */
+    bool (*emit_mask)(void *user,uint64_t mask,uint64_t base,uint64_t ordinal);
 } find_visit;
 static inline bool find_visit_intersects(const find_visit *v,find_capture range)
 {
@@ -39,6 +42,7 @@ static inline uint64_t find_visit_first_bits(uint64_t mask,uint64_t n)
 static inline bool find_visit_mask(find_visit *v,uint64_t mask,uint64_t base,uint64_t ordinal)
 {
     if (!v) return true;
+    if (v->emit_mask) return v->emit_mask(v->user,mask,base,ordinal);
     uint64_t selected=ordinal<v->prefix_capacity ? find_visit_first_bits(mask,v->prefix_capacity-ordinal) : 0;
     if (v->wanted>=ordinal && v->wanted-ordinal<64)
         selected|=find_visit_first_bits(mask,v->wanted-ordinal+1) & ~find_visit_first_bits(mask,v->wanted-ordinal);
@@ -64,6 +68,15 @@ find_code find_regex_visit(const find_source *source,const find_regex *regex,voi
  * retains the ordinary leftmost non-overlap policy, including empty matches. */
 find_code find_regex_word_visit(const find_source *source,const find_regex *regex,void *scratch,
                                 size_t size,const find_control *control,find_visit *visit);
+/* Worker-owned continuation in prepaid scratch. Begin copies the source
+ * descriptor; caller retains its bytes/snapshot/program. Step yields at NFA
+ * byte boundaries after FIND_POLL_UNITS metered operations (one boundary can
+ * visit the fixed state table). Counts/ranges remain private until done.
+ * Exact leftmost-longest/word/empty-match policy matches the synchronous API. */
+find_code find_regex_stream_begin(const find_source *source,const find_regex *regex,
+                                  void *scratch,size_t size,bool whole_word);
+find_code find_regex_stream_step(void *scratch,const find_control *control,
+                                 find_visit *visit,bool *done);
 /* Filtered consumers share a request budget across overlapping retries,
  * including successful but rejected candidates. */
 uint64_t find_regex_work_budget(const find_regex *regex,uint64_t length);

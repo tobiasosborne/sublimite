@@ -1,8 +1,10 @@
 #include "findui/findui.h"
+#include "findui/private.h"
 #include "journal/journal.h"
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -813,26 +815,161 @@ static void known_default_long_query(void)
     finish(&f);
 }
 /* Sparse source exposes repeated window scans after a complete global count.
- * Opt-in until a bounded/spooled matcher plan is implemented. */
+ * Inherited review fixture: each match occupies a byte pair at stride 800;
+ * 5000 * 800 fits within the original four-MiB source. Window endpoints are
+ * a late fixture offset and a span shorter than the match stride. */
+static uint8_t *immutable_source(fixture *f, const uint8_t *bytes, size_t length)
+{
+    uint8_t *mapping = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED); memcpy(mapping, bytes, length);
+    piece_allocator allocator = {f, test_alloc, test_free};
+    piece_tree *tree = piece_create(&allocator); CHECK(tree);
+    CHECK(piece_init_mapped(tree, mapping, length, NULL) == PIECE_OK);
+    piece_snapshot *snapshot = piece_snapshot_take(tree); CHECK(snapshot);
+    CHECK(findui_set_source(&f->panel, snapshot, 1) == FINDUI_OK);
+    piece_snapshot_release(snapshot); piece_destroy(tree);
+    return mapping;
+}
 static void sparse_window_work(void)
 {
     size_t length = 4u * 1024u * 1024u;
     uint8_t *bytes = malloc(length); CHECK(bytes); memset(bytes, 'x', length);
     for (size_t i = 0; i < 5000u; i++) memcpy(bytes + i * 800u, "ab", 2);
-    fixture f; start(&f, bytes, length, 64, 64); free(bytes);
+    fixture f; start(&f, bytes, length, 64, 64);
+    uint8_t *mapping = immutable_source(&f, bytes, length); free(bytes);
     query(&f, "ab"); CHECK(findui_get_state(&f.panel).match_count == 5000);
+    /* Source-read work oracle: any repeated source traversal now faults.
+     * Snapshot metadata and the independent live mutation tree remain valid. */
+    CHECK(mprotect(mapping, length, PROT_NONE) == 0);
     unsigned before = atomic_load(&f.hook.scans);
     CHECK(findui_set_window(&f.panel, 3000000u, 3000100u) == FINDUI_OK); wait_result(&f);
     unsigned after = atomic_load(&f.hook.scans);
     printf("P4-3 section 29: sparse window new source-search stages=%u (M)[AC]\n", after - before); fflush(stdout);
     CHECK(after == before); /* plan retrieval must avoid another source scan */
-    finish(&f);
+    finish(&f); CHECK(munmap(mapping, length) == 0);
+}
+
+/* Paging reuses the immutable original ranges even while replacement changes
+ * the live tree. Fixture geometry derives from sparse_window_work above;
+ * history reservation reuses replacement_beyond_cache's admission. */
+static void sparse_page_work(void)
+{
+    size_t length = 4u * 1024u * 1024u;
+    uint8_t *bytes = malloc(length); CHECK(bytes); memset(bytes, 'x', length);
+    for (size_t i = 0; i < 5000u; i++) memcpy(bytes + i * 800u, "ab", 2);
+    fixture f; start(&f, bytes, length, 64, 1);
+    uint8_t *mapping = immutable_source(&f, bytes, length); free(bytes);
+    query(&f, "ab");
+    CHECK(mprotect(mapping, length, PROT_NONE) == 0);
+    unsigned before = atomic_load(&f.hook.scans);
+    CHECK(findui_set_replacement(&f.panel, (const uint8_t *)"ab", 2, 2) == FINDUI_OK);
+    undo_log undo; CHECK(undo_init(&undo, f.tree, 65536) == 0);
+    undo_state state = {{0}}; size_t replaced, total = 0;
+    CHECK(findui_replace_all(&f.panel, &undo, 1, 65536, 0, &state, &state) == FINDUI_OK);
+    findui_code code;
+    do {
+        pump(&f); code = findui_replace_step(&f.panel, 64, 0, &replaced); total += replaced;
+        if (code == FINDUI_MORE) pause_worker();
+    } while (code == FINDUI_MORE);
+    CHECK(code == FINDUI_OK && total == 5000u);
+    unsigned after = atomic_load(&f.hook.scans);
+    printf("P4-3 sparse replacement new source-search stages=%u (M)=scan-hook delta\n", after - before);
+    fflush(stdout); CHECK(after == before);
+    for (size_t i = 0; i < total; i++) {
+        uint8_t pair[2]; CHECK(piece_read(f.tree, i * 800u, pair, sizeof pair) == PIECE_OK);
+        CHECK(memcmp(pair, "ab", sizeof pair) == 0);
+    }
+    undo_destroy(&undo); finish(&f); CHECK(munmap(mapping, length) == 0);
+}
+static void irregular_sparse_plan(void)
+{
+    /* Alternating inherited sparse strides (800, then 800 + one byte) force
+     * record boundaries beyond the prepaid spool block. Case alternation
+     * exercises folded literals and folded regex through the same plan. */
+    size_t length = 4u * 1024u * 1024u;
+    uint8_t *bytes = malloc(length); CHECK(bytes); memset(bytes, 'x', length);
+    uint64_t offsets[5000];
+    for (size_t i = 0; i < sizeof offsets / sizeof *offsets; i++) {
+        offsets[i] = i * 800u + i / 2u;
+        memcpy(bytes + offsets[i], i % 2u ? "AB" : "ab", 2);
+    }
+    for (unsigned regex = 0; regex < 2; regex++) {
+        fixture f; start(&f, bytes, length, 64, 64);
+        uint8_t *mapping = immutable_source(&f, bytes, length);
+        CHECK(findui_set_options(&f.panel, (findui_options){regex != 0, false, false}) == FINDUI_OK);
+        query(&f, regex ? "[a]b" : "ab");
+        CHECK(findui_get_state(&f.panel).match_count == sizeof offsets / sizeof *offsets);
+        findui_impl *impl = f.panel.private_;
+        CHECK(impl->plan && impl->plan->plan.records > FINDUI_PLAN_RUNS);
+        unsigned before = atomic_load(&f.hook.scans);
+        CHECK(mprotect(mapping, length, PROT_NONE) == 0);
+        /* A late window and neighbouring matches derive from the final cache
+         * page's start, rather than a fabricated byte/ordinal target. */
+        size_t count = impl->config.visible_capacity;
+        size_t first = sizeof offsets / sizeof *offsets - count;
+        CHECK(findui_set_window(&f.panel, offsets[first], offsets[first + count - 1u] + 2u) == FINDUI_OK);
+        wait_result(&f);
+        findui_range ranges[64]; size_t got = 0;
+        CHECK(findui_highlights(&f.panel, offsets[first], offsets[first + count - 1u] + 2u,
+                               ranges, sizeof ranges / sizeof *ranges, &got) == FINDUI_OK);
+        CHECK(got == count);
+        for (size_t i = 0; i < got; i++) CHECK(ranges[i].start == offsets[first + i] && ranges[i].end == offsets[first + i] + 2u);
+        findui_range selected; CHECK(findui_next(&f.panel, -1, &selected) == FINDUI_MORE); wait_result(&f);
+        CHECK(findui_get_state(&f.panel).selected.start == offsets[sizeof offsets / sizeof *offsets - 1u]);
+        CHECK(atomic_load(&f.hook.scans) == before);
+        finish(&f); CHECK(munmap(mapping, length) == 0);
+    }
+    free(bytes);
+    puts("P4-3 irregular folded literal/regex plan: protected source window and ordinal passed");
+}
+typedef struct search_lane_probe { findui_slot *slot; atomic_bool ran, unfinished; } search_lane_probe;
+static void observe_search_lane(work_ctx *context)
+{
+    search_lane_probe *p = context->arg;
+    /* Both callbacks run on the sole bulk worker: this reads worker-owned
+     * state without a race or reliance on UI mailbox delivery. */
+    atomic_store(&p->unfinished, !p->slot->publishing);
+    atomic_store(&p->ran, true);
+}
+static void search_stage_yields(void)
+{
+    /* Reuse the sparse source and minimal caches; no mailbox saturation can
+     * explain yielding. The final expression holds one match across a source
+     * longer than a scan slice, exercising an in-flight regex candidate. */
+    size_t length = 4u * 1024u * 1024u;
+    uint8_t *bytes = malloc(length); CHECK(bytes); memset(bytes, 'x', length);
+    const char *patterns[] = {"ab", "[a]b", "x+"};
+    for (size_t i = 0; i < sizeof patterns / sizeof *patterns; i++) {
+        fixture f; start(&f, bytes, length, 1, 1);
+        CHECK(findui_set_options(&f.panel, (findui_options){i != 0, true, false}) == FINDUI_OK);
+        atomic_store(&f.hook.park, true);
+        CHECK(findui_set_query(&f.panel, (const uint8_t *)patterns[i], strlen(patterns[i])) == FINDUI_OK);
+        while (!atomic_load(&f.hook.entered)) pause_worker();
+        findui_impl *impl = f.panel.private_;
+        findui_slot *slot = impl->slots[0].snapshot ? &impl->slots[0] : &impl->slots[1];
+        search_lane_probe p = {.slot = slot}; atomic_init(&p.ran, false); atomic_init(&p.unfinished, false);
+        CHECK(work_submit(f.pool, (work_job){observe_search_lane, &p, 0, WORK_BULK}).epoch);
+        atomic_store(&f.hook.release, true);
+        while (!atomic_load(&p.ran)) pause_worker();
+        printf("P4-3 matcher yields before completion: pattern=%s unfinished=%d (M)=bulk marker\n",
+               patterns[i], atomic_load(&p.unfinished)); fflush(stdout);
+        CHECK(atomic_load(&p.unfinished));
+        wait_result(&f);
+        CHECK(findui_get_state(&f.panel).complete);
+        CHECK(findui_get_state(&f.panel).match_count == (i == 2 ? 1u : 0u));
+        finish(&f);
+    }
+    free(bytes);
 }
 
 int main(void)
 {
     if (getenv("EDIT_LEZ_REGEX_WORD")) { whole_word_regex_worker(); return 0; }
     if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
+    if (getenv("P4_SPARSE_PAGES")) { sparse_page_work(); return 0; }
+    if (getenv("P4_SEARCH_YIELD")) { search_stage_yields(); return 0; }
+    sparse_window_work();
+    sparse_page_work(); irregular_sparse_plan(); search_stage_yields();
     replacement_paged_noop();
     full_source_lifetime();
     replacement_host_bookkeeping();
