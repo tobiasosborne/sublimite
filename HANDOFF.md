@@ -6,7 +6,7 @@
 **Known visible defect on main:** at 243 DPI the window opens at 1728x1260 but the raster surface still paints 960x600 (build/design/main-dpi243-half.png) → **edit-a6v (P0)**, Codex worker was running at the cut (.wt/edit-a6v). Nothing goes to Tobias before a6v lands and Astra drive 2 says yes.
 
 **Verified or resolved, not landed (worktrees .wt/<bead>, WIP-snapshotted):**
-- edit-3kk scroll wiring: 20-hunk resolve done + my hand merge of the readiness clauses; targeted run was mid-way (scroll/render green so far; editor/p4/cli pending). Rebase onto main, finish the run, land.
+- edit-3kk scroll wiring: all suites GREEN in its worktree (scroll, render, raster, minimap, editor, p4, cli) but the cherry-pick onto main conflicts with the config landing: rebase once more, resolve, land.
 - edit-v0o.7 config: LANDED after the wind-down note (all suites green, cherry-picked clean).
 - edit-457.8 hot exit (+9ma): I renamed its window fields to e->font.window_*; its new editor_hot_exit_test:174 then fails at editor_open → needs a look (probably my rename changed the restored-size semantics, or EMFILE); journal_test green.
 - edit-5ih font selection: 8-hunk conflicts with m3g/08z; Codex resolver was running at the cut.
