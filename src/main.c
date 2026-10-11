@@ -82,7 +82,7 @@ int main(int argc, char **argv)
     /* The only application backend selection site; init may fall back once. */
     int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
     editor *e = NULL;
-    editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true,
+    editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true, .load_preferences = true,
         /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
          * pointers are reserved during startup, never on the typing path. */
         .tab_capacity = 1000u, .server = owns_server ? &server : NULL};

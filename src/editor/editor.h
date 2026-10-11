@@ -5,6 +5,7 @@
 #include "view/view.h"
 #include "ipc/ipc.h"
 #include "tabs/tabs.h"
+#include "config/config.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -52,12 +53,15 @@ typedef struct editor_config {
     uint64_t copy_threshold;           /* 0 = file default; off-path test override */
     /* Display-derived startup: points use a true em. Zero dpi keeps the
      * legacy explicit pixel/baked test configuration; main queries X first.
-     * Zero points selects EDITOR_FONT_DEFAULT_PT; pixel extents are optional. */
+     * Explicit points override file font.size; zero uses file/default points.
+     * Pixel extents are optional. */
     double font_dpi, font_points;
     uint32_t window_width, window_height;
     /* Reserve the display's pixel extents for resize/zoom, independent of
      * font size. Zero retains explicit-grid callers' existing reservation. */
     uint32_t max_window_width, max_window_height;
+    bool load_preferences;            /* native startup enables XDG config */
+    const char *preferences_path;     /* optional absolute setup/test override */
 } editor_config;
 typedef struct editor_stats {
     uint64_t input_sequence, submitted_sequence, presented_sequence;
@@ -135,4 +139,9 @@ int editor_reopen_tab(editor *e);
 const tabs_tab *editor_tab(const editor *e, size_t index);
 /* Borrowed composed grid, inspect only after the loop settles. */
 const render_grid *editor_grid(const editor *e);
+/* Applied config, including font points/family for the DPI/font consumer.
+ * Borrowed until the next UI turn; generation advances with the containing
+ * frame, never by a delayed timer. NULL for a NULL editor. */
+const config_settings *editor_preferences(const editor *e);
+uint64_t editor_preferences_generation(const editor *e);
 #endif

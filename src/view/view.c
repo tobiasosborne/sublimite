@@ -496,6 +496,16 @@ int view_set_wrap(view *v,bool enabled,struct layout *context)
     v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
     return VIEW_OK;
 }
+int view_set_tab_width(view *v, uint32_t width)
+{
+    if (!v || !width) return VIEW_ERR_ARG;
+    if (v->busy) return VIEW_ERR_BUSY;
+    v->config.tab_width = width;
+    for (size_t i = 0; i < sizeof v->seeds / sizeof v->seeds[0]; i++) v->seeds[i].valid = false;
+    v->state.selection.preferred_col = VIEW_PREFERRED_UNSET;
+    v->completed_state = v->state;
+    return VIEW_OK;
+}
 int view_wrap_file(view *v,struct layout *context,const char *path)
 {
     if(!v || !context || v->busy) return VIEW_ERR_ARG;

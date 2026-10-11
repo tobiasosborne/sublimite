@@ -92,6 +92,7 @@ static void unpoll_source(editor *e, editor_buffer *b)
     int fd = b->watch_fd;
     b->watch_fd = -1;
     if (fd < 0) return;
+    if (fd == e->preferences_watchfd) return;
     for (size_t i = 0; i < e->buffer_capacity; i++)
         if (e->buffers[i] && e->buffers[i] != b && e->buffers[i]->watch_fd == fd) return;
     (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -203,6 +204,8 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     b->map_rows = rows;
     piece_snapshot *snap = piece_snapshot_take(b->pending_open ? b->preview : b->tree); if (!snap) { rc = EDITOR_ERR_MEMORY; goto fail; }
     indent_code ir = indent_detect(snap, &b->style); piece_snapshot_release(snap);
+    b->detected_style = b->style;
+    editor_preferences_buffer(e, b);
     if (ir != INDENT_OK) { rc = EDITOR_ERR_ARG; goto fail; }
     /* Mapped startup's full-size index belongs after prefix submission too.
      * Keep a bounded unbuilt index for preview consumers in the meantime. */
@@ -279,6 +282,10 @@ int editor_activate(editor *e)
     const tabs_tab *tab = tabs_active(&e->tabs);
     view_state live = e->v.state;
     e->buffer = tab ? find_buffer(e, tab->buffer) : e->empty;
+    bool config_wrap = e->buffer->config_wrap;
+    editor_preferences_buffer(e, e->buffer);
+    if (e->preferences.wrap_set) live.wrap = e->preferences.wrap;
+    else if (config_wrap) live.wrap = e->buffer->initial.wrap;
     if (e->buffer->source_stale) e->buffer->prompt_ns = 0;
     if (!e->buffer->map.initialized) {
         int rc = minimap_init(&e->buffer->map, e->buffer->map_rows, e->map_capacity); if (rc) return rc;
@@ -607,6 +614,7 @@ static void sweep_waits(editor *e)
 }
 int editor_poll_sources(editor *e)
 {
+    int preferences_rc = editor_preferences_poll(e); if (preferences_rc) return preferences_rc;
     struct epoll_event events[16];
     int event_count = epoll_wait(e->poll_fd, events, 16, 0);
     if (event_count < 0 && errno != EINTR) return EDITOR_ERR_IO;

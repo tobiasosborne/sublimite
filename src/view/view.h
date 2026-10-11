@@ -155,4 +155,7 @@ int view_wrap_file(view *v, struct layout *context, const char *path);
 /* Bind caller-owned layout query context; configured text width must match
  * layout's text area. Toggle resets preferred column and horizontal scroll. */
 int view_set_wrap(view *v, bool enabled, struct layout *context);
+/* Idle-only config change. Invalidates cached visual columns and preferred
+ * column. Caller updates its layout/checkpoints before the next command. */
+int view_set_tab_width(view *v, uint32_t width);
 #endif

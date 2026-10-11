@@ -8,11 +8,14 @@ static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t
     editor *e = ctx;
     if (!e->paint_ready) return;
     if (byte == e->bracket_source || byte == e->bracket_mate) {
-        *bg = 0x53667e; *attrs |= RENDER_ATTR_UNDERLINE;
+        *bg = config_theme_color(e->preferences.theme, "bracket.background"); *attrs |= RENDER_ATTR_UNDERLINE;
     }
     size_t lo = 0, hi = e->ws_count;
     while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (e->ws_ranges[mid].hi <= byte) lo = mid + 1; else hi = mid; }
-    if (lo < e->ws_count && e->ws_ranges[lo].lo <= byte) { *fg = 0xbf616a; *bg = 0x493038; *attrs |= RENDER_ATTR_UNDERLINE; }
+    if (lo < e->ws_count && e->ws_ranges[lo].lo <= byte) {
+        *fg = config_theme_color(e->preferences.theme, "error.foreground");
+        *bg = config_theme_color(e->preferences.theme, "error.background"); *attrs |= RENDER_ATTR_UNDERLINE;
+    }
 }
 static bool byte_visible(editor *e, uint64_t byte)
 {
@@ -105,7 +108,10 @@ static int compose_chrome(editor *e)
         size_t active = tabs_active_index(&e->tabs);
         uint32_t slots = full / 16; if (!slots) slots = 1;
         size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
-        e->strip = (tabs_strip){0, 0, full, 16, first_tab, 0x8d98a9, 0x171b22, 0xe5e9f0, 0x384356, glyph, e};
+        config_theme theme = e->preferences.theme;
+        e->strip = (tabs_strip){0, 0, full, 16, first_tab,
+            config_theme_color(theme, "chrome.foreground"), config_theme_color(theme, "chrome.background"),
+            config_theme_color(theme, "tab.active.foreground"), config_theme_color(theme, "tab.active.background"), glyph, e};
         /* Decoration preparation is complete; reuse its aligned reserved
          * scratch for the final chrome. */
         if ((size_t)full * sizeof(render_cell) > EDITOR_STAGE_BYTES) return EDITOR_ERR_CAPACITY;
@@ -148,7 +154,9 @@ static int compose(editor *e)
         uint32_t cols = e->grid.dims.cols;
         for (uint32_t c = 0; c < cols; c++) {
             uint32_t ch = c < sizeof status - 1 ? (uint8_t)status[c] : (uint32_t)' ';
-            e->grid.cells[(size_t)e->tab_rows * cols + c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+            e->grid.cells[(size_t)e->tab_rows * cols + c] = (render_cell){ch, ch - 0x20u,
+                config_theme_color(e->preferences.theme, "warning.foreground"),
+                config_theme_color(e->preferences.theme, "chrome.background"), 0, 0};
         }
         int rc = compose_chrome(e);
         return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
@@ -168,8 +176,10 @@ static int compose(editor *e)
         return 0;
     }
     minimap_input input = editor_map_input(e->buffer);
-    minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0,
-        editor_theme_estimated_gutter(0x8091a8, 0x171b22)};
+    config_theme theme = e->preferences.theme;
+    minimap_style colors = {config_theme_color(theme, "editor.background"),
+        config_theme_color(theme, "gutter.foreground"), config_theme_color(theme, "caret.background"),
+        editor_theme_estimated_gutter(config_theme_color(theme, "minimap.foreground"), config_theme_color(theme, "chrome.background"))};
     uint64_t first = e->v.state.first_line, visible = 0;
     for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
         uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;

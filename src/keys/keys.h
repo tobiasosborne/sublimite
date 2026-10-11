@@ -142,5 +142,12 @@ const keys_binding *keys_defaults(size_t *count);
  * UNIMPLEMENTED, in which case the caller must consume without editing. */
 keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
                         const keys_binding **out);
+/* Config overrides: standalone strokes only, caller-owned immutable table.
+ * Matching override wins; default bindings for overridden actions are removed.
+ * Uses the same canonicalization/lock/AltGr/chord rules as keys_lookup. */
+keys_result keys_lookup_overrides(keys_state *, uint32_t, uint16_t,
+    const keys_binding *, size_t, const keys_binding **);
+/* Normalize a config stroke using the input lookup's exact rules. */
+bool keys_binding_normalize(keys_binding *);
 
 #endif

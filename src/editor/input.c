@@ -399,7 +399,7 @@ bool editor_event_control(const editor *e, const plat_event *ev)
     }
     if (!ev->press) return true;
     keys_state state = e->keys; const keys_binding *binding = NULL;
-    if (keys_lookup(&state, ev->keysym, ev->mods, &binding) != KEYS_MATCH || !binding) return false;
+    if (config_keys_lookup(&e->preferences, &state, ev->keysym, ev->mods, &binding) != KEYS_MATCH || !binding) return false;
     switch (binding->action) {
     case KEYS_ACTION_NEXT_VIEW_STACK: case KEYS_ACTION_PREVIOUS_VIEW_STACK:
     case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
@@ -424,7 +424,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         return 0;
     }
     const keys_binding *binding = NULL;
-    keys_result result = keys_lookup(&e->keys, ev->keysym, ev->mods, &binding);
+    keys_result result = config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
         ev->keysym == XKB_KEY_Shift_L || ev->keysym == XKB_KEY_Shift_R ||
         ev->keysym == XKB_KEY_Alt_L || ev->keysym == XKB_KEY_Alt_R ||

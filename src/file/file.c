@@ -475,6 +475,8 @@ typedef struct file_watch_service {
     int fd, err_no;
     size_t count;
     file *files[FILE_WATCH_SLOTS];
+    size_t path_count;
+    file_path_watch *paths[FILE_WATCH_SLOTS];
 } file_watch_service;
 static file_watch_service file_watches = { .once = PTHREAD_ONCE_INIT, .fd = -1 };
 
@@ -492,6 +494,8 @@ static void watch_release(file *f, int wd)
     if (wd < 0) return;
     for (size_t i = 0; i < file_watches.count; i++)
         if (file_watches.files[i] != f && file_watches.files[i]->iwd == wd) return;
+    for (size_t i = 0; i < file_watches.path_count; i++)
+        if (file_watches.paths[i]->wd == wd) return;
     (void)inotify_rm_watch(file_watches.fd, wd);
 }
 
@@ -1069,7 +1073,7 @@ int file_watch_start(file *f)
     if (f->ifd >= 0 && f->iwd >= 0 && !f->watch_refresh) return f->ifd;
     char dir[PATH_MAX];
     split_path(f->path, dir, sizeof dir, f->watch_name, sizeof f->watch_name);
-    if (f->watch_slot == SIZE_MAX && file_watches.count == FILE_WATCH_SLOTS) {
+    if (f->watch_slot == SIZE_MAX && file_watches.count + file_watches.path_count == FILE_WATCH_SLOTS) {
         errno = ENOSPC; return -1;
     }
     pthread_once(&file_watches.once, watch_install);
@@ -1118,13 +1122,13 @@ static void watch_check_pump(file *f)
     }
 }
 
-int file_watch_poll(file *f)
+void file_watch_dispatch(void)
 {
-    if (f->ifd >= 0) {
+    if (file_watches.fd >= 0) {
         char buf[4096] __attribute__((aligned(8)));
         /* One nonblocking buffer per call. Repeated EINTR and a continuous
          * alternating producer both return to the event loop. */
-        ssize_t r = read(f->ifd, buf, sizeof buf);
+        ssize_t r = read(file_watches.fd, buf, sizeof buf);
         size_t off = 0, count = r > 0 ? (size_t)r : 0;
         while (count - off >= sizeof(struct inotify_event)) {
             const struct inotify_event *event = (const struct inotify_event *)(const void *)(buf + off);
@@ -1141,6 +1145,18 @@ int file_watch_poll(file *f)
                 if (event->len == 0 || (strnlen(event->name, event->len) < event->len &&
                     strcmp(event->name, member->watch_name) == 0)) member->check_requested = 1;
             }
+            for (size_t i = 0; i < file_watches.path_count; i++) {
+                file_path_watch *member = file_watches.paths[i];
+                if (event->mask & IN_Q_OVERFLOW) member->pending = true;
+                if (event->wd != member->wd) continue;
+                if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                    if (event->mask & IN_IGNORED) member->wd = -1;
+                    member->pending = true;
+                }
+                const char *name = strrchr(member->path, '/');
+                if (event->len == 0 || (name && strnlen(event->name, event->len) < event->len &&
+                    !strcmp(event->name, name + 1))) member->pending = true;
+            }
             off += length;
         }
         /* Enqueue affected peers in this turn, even when the caller polled an
@@ -1148,8 +1164,53 @@ int file_watch_poll(file *f)
         if (count) for (size_t i = 0; i < file_watches.count; i++)
             watch_check_pump(file_watches.files[i]);
     }
+}
+int file_watch_poll(file *f)
+{
+    file_watch_dispatch();
     watch_check_pump(f);
     return file_changed(f);
+}
+
+int file_watch_path_start(file_path_watch *member, const char *path)
+{
+    if (!member || !path || path[0] != '/' || strlen(path) >= PATH_MAX) { errno = EINVAL; return -1; }
+    if (member->registered && member->path != path) { errno = EINVAL; return -1; }
+    if (member->registered && member->wd >= 0) return file_watches.fd;
+    if (!member->registered && file_watches.count + file_watches.path_count == FILE_WATCH_SLOTS) {
+        errno = ENOSPC; return -1;
+    }
+    char dir[PATH_MAX], name[NAME_MAX + 1]; split_path(path, dir, sizeof dir, name, sizeof name);
+    if (!*name || strlen(strrchr(path, '/') + 1) > NAME_MAX) { errno = EINVAL; return -1; }
+    pthread_once(&file_watches.once, watch_install);
+    if (file_watches.fd < 0) { errno = file_watches.err_no; return -1; }
+    int wd = inotify_add_watch(file_watches.fd, dir, WATCH_MASK | IN_ONLYDIR);
+    if (wd < 0) return -1;
+    member->wd = wd; member->path = path;
+    if (!member->registered) {
+        member->slot = file_watches.path_count;
+        file_watches.paths[file_watches.path_count++] = member; member->registered = true;
+    }
+    return file_watches.fd;
+}
+void file_watch_path_stop(file_path_watch *member)
+{
+    if (!member || !member->registered) return;
+    int wd = member->wd;
+    size_t last = --file_watches.path_count;
+    if (member->slot != last) {
+        file_path_watch *moved = file_watches.paths[last];
+        file_watches.paths[member->slot] = moved; moved->slot = member->slot;
+    }
+    file_watches.paths[last] = NULL;
+    memset(member, 0, sizeof *member); member->wd = -1;
+    /* watch_release checks both kinds of remaining member. */
+    watch_release(NULL, wd);
+}
+bool file_watch_path_take(file_path_watch *member)
+{
+    if (!member || !member->registered) return false;
+    bool pending = member->pending; member->pending = false; return pending;
 }
 
 /* UI-only installation reached exclusively through mailbox decode. Readiness

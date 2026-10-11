@@ -57,6 +57,8 @@ typedef struct editor_buffer {
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
     indent_style style;
+    indent_style detected_style;
+    bool config_wrap;
     minimap map;
     minimap_row *map_rows;
     view_state initial;
@@ -107,6 +109,11 @@ struct editor {
     size_t buffer_capacity;
     tabs_set tabs;
     keys_state keys;
+    config_runtime *preferences_runtime;
+    config_settings preferences;
+    uint64_t preferences_generation;
+    double preferences_font_override; /* explicit startup points (native env) win over file */
+    int preferences_watchfd;
     editor_wait waits[IPC_MAX_CLIENTS];
     int poll_fd;
     file *opening;
@@ -256,6 +263,9 @@ bool editor_font_event(editor *e, const work_msg *msg);
 void editor_font_track(editor *e, uint32_t slot, uint32_t row);
 int editor_pointer(editor *e, const plat_event *ev);
 int editor_poll_sources(editor *e);
+int editor_preferences_poll(editor *e);
+int editor_preferences_apply(editor *e);
+void editor_preferences_buffer(editor *e, editor_buffer *b);
 void editor_retire_buffers(editor *e);
 lineidx_src editor_source(editor_buffer *b);
 minimap_input editor_map_input(editor_buffer *b);

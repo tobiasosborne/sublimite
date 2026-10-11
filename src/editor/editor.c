@@ -584,6 +584,9 @@ int editor_step(editor *e, int timeout_ms)
     for (;;) {
         e->stats.input_checks++;
         uint64_t slice = trace_now_ns();
+        if (!view_busy(&e->v) && e->action != EDITOR_ACTION_REPLAY_WORK) {
+            rc = editor_preferences_apply(e); if (rc) return fail(e, rc);
+        }
         if (e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || view_busy(&e->v)) rc = editor_continue_action(e);
         else if (queue_pick(e) != SIZE_MAX) {
             size_t picked = queue_pick(e), at = (e->queue_head + picked) % EDITOR_INPUT_CAP;

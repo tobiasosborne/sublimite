@@ -13,6 +13,7 @@
 void editor_close(editor *e)
 {
     if (!e) return;
+    config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
     if (e->journal && !e->recovering) (void)editor_flush(e);
     editor_session_close(e);
     if (e->journal) {
@@ -57,8 +58,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
         render_null_backend(&fallback) : render_cpu_backend(&fallback))) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->drag_tab = SIZE_MAX;
-    e->cfg = *config; e->backend = backend; e->focused = e->visible = true;
+    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1;
+    e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
+    e->cfg = *config; e->preferences_font_override = config->font_points; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;
     uint32_t cols = config->cols ? config->cols : 120, rows = config->rows ? config->rows : 40;
@@ -77,6 +79,20 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     uint32_t nraster = (may_fallback || (info.capabilities & RENDER_CAP_RASTER_POOL)) ? 4u : 0u;
     if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
+    if (config->load_preferences || config->preferences_path) {
+        /* Read and parse on the config worker before the DPI atlas is built.
+         * Invalid/absent preferences leave the default startup usable. */
+        if (config_runtime_open(&e->preferences_runtime, config->preferences_path) == CONFIG_OK) {
+            do {
+                (void)config_runtime_tick(e->preferences_runtime);
+                if (!config_runtime_busy(e->preferences_runtime)) break;
+                struct pollfd fd = {config_runtime_eventfd(e->preferences_runtime), POLLIN, 0};
+                (void)poll(&fd, 1, 1);
+            } while (true);
+            if (e->preferences_font_override == 0.0)
+                e->cfg.font_points = config_runtime_current(e->preferences_runtime)->font_points;
+        }
+    }
     rc = editor_font_init(e, &atlas); if (rc) goto fail;
     trace_record(TRACE_STARTUP_FONT_ATLAS_READY, 0); /* edit-2ts startup stage; atlas readied by edit-m3g's DPI path */
     e->font.window_width = config->window_width ? config->window_width : cols * atlas->cell.cell_w;
@@ -96,6 +112,9 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (e->font.max_height < e->font.window_height) e->font.max_height = e->font.window_height;
     e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
+    if (e->preferences_runtime) {
+        rc = add_poll_fd(e, config_runtime_eventfd(e->preferences_runtime)); if (rc) goto fail;
+    }
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
     size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
     uint32_t font_pages; size_t font_glyphs, font_pixels;

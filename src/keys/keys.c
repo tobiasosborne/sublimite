@@ -343,11 +343,18 @@ static const keys_binding *find_binding(uint8_t chord, uint16_t mods, uint32_t s
     }
     return NULL;
 }
-keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
-                        const keys_binding **out)
+bool keys_binding_normalize(keys_binding *binding)
+{
+    if (!binding || modifier_key(binding->keysym) || !binding->keysym ||
+        (binding->modifiers & (uint16_t)~(PLAT_MOD_SHIFT|PLAT_MOD_CTRL|PLAT_MOD_ALT|PLAT_MOD_SUPER))) return false;
+    binding->keysym = canonical(binding->keysym, &binding->modifiers);
+    return true;
+}
+keys_result keys_lookup_overrides(keys_state *state, uint32_t keysym, uint16_t modifiers,
+                        const keys_binding *overrides, size_t count, const keys_binding **out)
 {
     if (out) *out=NULL;
-    if (!state || !out) return KEYS_ERR_ARG;
+    if (!state || !out || (!overrides && count)) return KEYS_ERR_ARG;
     if (state->chord>=KEYS_CHORD_COUNT) keys_reset(state);
     if (modifier_key(keysym)) return KEYS_NONE;
     uint8_t chord=state->chord;
@@ -356,7 +363,17 @@ keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
     if (modifiers & (uint16_t)~(PLAT_MOD_SHIFT|PLAT_MOD_CTRL|PLAT_MOD_ALT|PLAT_MOD_SUPER))
         return chord?KEYS_CANCELLED:KEYS_NONE;
     keysym=canonical(keysym,&modifiers);
-    const keys_binding *b=find_binding(chord,modifiers,keysym);
+    const keys_binding *b=NULL;
+    if (!chord) for (size_t i=0; i<count; i++)
+        if (overrides[i].keysym==keysym && overrides[i].modifiers==modifiers) {
+            b=&overrides[i]; break;
+        }
+    if (!b) {
+        b=find_binding(chord,modifiers,keysym);
+        if (b) for (size_t i=0; i<count; i++) if (overrides[i].action==b->action) {
+            b=NULL; break;
+        }
+    }
     if (!b) return chord?KEYS_CANCELLED:KEYS_NONE;
     *out=b;
     if (b->action==KEYS_ACTION_CHORD) {
@@ -364,4 +381,9 @@ keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
         return KEYS_PREFIX;
     }
     return KEYS_MATCH;
+}
+keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
+                        const keys_binding **out)
+{
+    return keys_lookup_overrides(state,keysym,modifiers,NULL,0,out);
 }

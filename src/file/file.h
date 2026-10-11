@@ -260,6 +260,21 @@ int file_resolve_keep(file *f);
  * detection is asynchronous. Saturated submission is retried on a later poll. */
 int file_watch_start(file *f);
 int file_watch_poll(file *f);
+/* Path-only member of the SAME service, for untrusted config files. Setup
+ * takes an absolute path whose parent exists, including an absent target.
+ * Caller retains path/member until stop; single UI owner, setup off typing.
+ * Dispatch also schedules file identity jobs. Path notices coalesce; workers
+ * perform consumers' reads. No target acquisition, allocation or new fd. */
+typedef struct file_path_watch {
+    const char *path;
+    int wd;
+    size_t slot;
+    bool registered, pending;
+} file_path_watch;
+int file_watch_path_start(file_path_watch *, const char *);
+void file_watch_path_stop(file_path_watch *);
+void file_watch_dispatch(void);
+bool file_watch_path_take(file_path_watch *);
 
 /* ---- save ---- */
 #define FILE_SAVE_FORCE 1u   /* overwrite even if the source changed */
