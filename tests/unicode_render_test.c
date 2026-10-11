@@ -378,9 +378,87 @@ static int dpi_zoom_unicode(double dpi)
     return 0;
 }
 
+/* edit-6di: a file named "build/73j-å文" painted "73j-" then blank cells in
+ * its tab. The title path must reach the same async lookup and adoption as
+ * text: once glyphs settle, each title cell holds real ink (not the pending
+ * '?' artwork, not blank) and widths are counted per cluster in cells. */
+static int tab_title_unicode(void)
+{
+    static const char path[] = "build/73j-\xc3\xa5\xe6\x96\x87"; /* build/73j-å文 */
+    static const char title[] = "73j-\xc3\xa5\xe6\x96\x87";
+    render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
+    /* (G) 40 columns hold two 16-column tab slots: the initial buffer and this file. */
+    glyph_gate gate = {0};
+    editor_config cfg = {.cols = 40, .rows = 4,
+        .initial = (const uint8_t *)"x\n", .initial_len = sizeof "x\n" - 1u,
+        .hook_ctx = &gate, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK);
+    gate.editor = e;
+    T(settle(e) == 0);
+    uint64_t id = 0;
+    T(editor_add_buffer(e, path, (const uint8_t *)"y\n", sizeof "y\n" - 1u, &id) == EDITOR_OK);
+    T(settle(e) == 0);
+    const tabs_tab *t = tabs_active(&e->tabs);
+    T(t && t->title_len == sizeof title - 1u && !memcmp(t->title, title, sizeof title - 1u));
+    /* (P) 7 cells = "73j-" 4 narrow + å 1 narrow + 文 2 wide (UAX #11); bytes are 9. */
+    T(t->title_cells == 7u && t->title_clusters == 6u);
+    const render_grid *g = editor_grid(e);
+    size_t active = tabs_active_index(&e->tabs);
+    uint32_t col = e->strip.first_col + (uint32_t)(active - e->strip.first_tab) * e->strip.tab_cols + 1u;
+    for (const char *p = title; *p;) {
+        size_t len = utf8_grapheme_next((const uint8_t *)p, strlen(p));
+        int width = utf8_cluster_width((const uint8_t *)p, len);
+        const render_cell *cell = &g->cells[col];
+        if (cell->atlas_slot == RENDER_NO_SLOT || cell->atlas_slot >= g->glyph_count)
+            fprintf(stderr, "unicode_render_test: tab title col %u for '%.*s' is blank (slot %u)\n",
+                col, (int)len, p, cell->atlas_slot);
+        T(cell->atlas_slot != RENDER_NO_SLOT && cell->atlas_slot < g->glyph_count);
+        if ((uint8_t)*p >= 0x80u) {
+            T(bitmap(g, cell) == 0); /* real ink, not blank and not the pending '?' */
+            T(g->glyphs[cell->atlas_slot].w == g->dims.cell_w * (uint32_t)width);
+        } else {
+            T(cell->atlas_slot == (uint32_t)(*p - ' '));
+        }
+        T((cell->attrs & RENDER_ATTR_WIDE_LEFT) != 0 ? width == 2 : width == 1);
+        if (width == 2) T(g->cells[col + 1u].attrs & RENDER_ATTR_WIDE_RIGHT);
+        col += (uint32_t)width; p += len;
+    }
+    T(render_grid_validate(g) == RENDER_OK);
+    /* Adoption: with the bulk lane held, a fresh title's first frame already
+     * carries the pending slots (the '?' artwork), and completion repaints
+     * the tab row through the same slot/row registration as text. */
+    static const char fresh[] = "\xc3\xb8\xe8\xaa\x9e"; /* ø語, never requested above */
+    work_handle blocker = work_submit(&e->pool, (work_job){block_bulk, &gate, 0, WORK_BULK});
+    T(blocker.epoch);
+    while (!atomic_load(&gate.started)) sched_yield();
+    T(tabs_rename(&e->tabs, active, fresh, sizeof fresh - 1u, path, sizeof path - 1u) == TABS_OK);
+    T(editor_begin_frame(e) == EDITOR_OK);
+    do { int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE); } while (editor_get_stats(e).pending);
+    T(font_async_pending(e->fonts));
+    col = e->strip.first_col + (uint32_t)(active - e->strip.first_tab) * e->strip.tab_cols + 1u;
+    uint32_t held[2] = {g->cells[col].atlas_slot, g->cells[col + 1u].atlas_slot};
+    for (size_t i = 0; i < 2; i++) {
+        if (held[i] == RENDER_NO_SLOT || held[i] < LAYOUT_ASCII_GLYPHS)
+            fprintf(stderr, "unicode_render_test: held tab title cell %zu has no pending slot (%u)\n", i, held[i]);
+        T(held[i] != RENDER_NO_SLOT && held[i] < g->glyph_count && held[i] >= LAYOUT_ASCII_GLYPHS);
+    }
+    T(g->cells[col + 1u].attrs & RENDER_ATTR_WIDE_LEFT);
+    gate.watch_damage = true;
+    atomic_store(&gate.release, true);
+    T(settle(e) == 0);
+    T(gate.damage & UINT64_C(1)); /* tab row repainted on adoption */
+    T(g->cells[col].atlas_slot == held[0] && g->cells[col + 1u].atlas_slot == held[1]); /* stable slots */
+    T(bitmap(g, &g->cells[col]) == 0); T(bitmap(g, &g->cells[col + 1u]) == 0);
+    T(g->glyphs[held[1]].w == 2u * g->dims.cell_w);
+    editor_close(e);
+    puts("unicode_render_test: tab title 73j-å文 holds adopted glyphs, 7 cells for 9 bytes");
+    return 0;
+}
+
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(tab_title_unicode() == 0);
     T(render_unicode(false) == 0);
     T(render_unicode(true) == 0);
     T(glyph_minimap_repaint() == 0);

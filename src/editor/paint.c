@@ -97,10 +97,16 @@ int editor_paint_prepare(editor *e)
     int lr = layout_relayout_rows(&e->lay, 0, e->text_grid.dims.rows);
     return lr < 0 ? lr : 0;
 }
+/* The strip renders into a by-value copy of the grid. A cold lookup appends
+ * a descriptor and rebinds only the editor's grids, so rebind the copy too;
+ * otherwise its stale glyph_count rejects the new slot as non-resident, the
+ * title cell paints blank and adoption finds no cell to repaint (edit-6di). */
+typedef struct chrome_glyphs { editor *e; render_grid *scratch; } chrome_glyphs;
 static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_t *identity, uint32_t *slot)
 {
-    editor *e = ctx;
+    chrome_glyphs *c = ctx; editor *e = c->e;
     if (width < 1 || width > 2 || editor_font_glyph(e, text, len, (uint32_t)width, slot) != FONT_OK) return false;
+    (void)font_async_bind(e->fonts, c->scratch);
     /* Chrome requires a resident image, including an empty space image. */
     if (*slot == RENDER_NO_SLOT) *slot = 0; /* baked space: ' ' - ' ' */
     *identity = e->grid.glyphs[*slot].glyph_index;
@@ -117,7 +123,7 @@ static int compose_chrome(editor *e)
         config_theme theme = e->preferences.theme;
         e->strip = (tabs_strip){0, 0, full, 16, first_tab,
             config_theme_color(theme, "chrome.foreground"), config_theme_color(theme, "chrome.background"),
-            config_theme_color(theme, "tab.active.foreground"), config_theme_color(theme, "tab.active.background"), glyph, e};
+            config_theme_color(theme, "tab.active.foreground"), config_theme_color(theme, "tab.active.background"), NULL, NULL};
         /* Decoration preparation is complete; reuse its aligned reserved
          * scratch for the final chrome. */
         if ((size_t)full * sizeof(render_cell) > EDITOR_STAGE_BYTES) return EDITOR_ERR_CAPACITY;
@@ -128,7 +134,9 @@ static int compose_chrome(editor *e)
         scratch.dirty = &dirty; scratch.dirty_word_capacity = 1; scratch.full_frame = false;
         scratch.scroll = (render_scroll){0};
         scratch.region = (render_pixels){0};
-        rc = tabs_strip_render(&e->tabs, &scratch, &e->strip); if (rc) return rc;
+        chrome_glyphs ctx = {e, &scratch};
+        tabs_strip strip = e->strip; strip.glyph = glyph; strip.glyph_ctx = &ctx;
+        rc = tabs_strip_render(&e->tabs, &scratch, &strip); if (rc) return rc;
         if (memcmp(e->grid.cells, cells, (size_t)full * sizeof *cells)) {
             memcpy(e->grid.cells, cells, (size_t)full * sizeof *cells);
             return render_mark_rows(&e->grid, 0, 1);
