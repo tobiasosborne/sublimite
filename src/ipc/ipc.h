@@ -25,6 +25,8 @@ typedef enum ipc_result {
     IPC_OK = 0, IPC_EXISTS, IPC_INVALID, IPC_LIMIT, IPC_IO,
     IPC_PROTOCOL, IPC_TIMEOUT, IPC_BUSY, IPC_REJECTED
 } ipc_result;
+/* Static descriptive text for command-line diagnostics; no allocation. */
+const char *ipc_result_string(ipc_result result);
 typedef struct ipc_path { const char *path; uint32_t line, col; } ipc_path;
 typedef struct ipc_request {
     ipc_path paths[IPC_MAX_PATHS];

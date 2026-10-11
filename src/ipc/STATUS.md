@@ -1,3 +1,21 @@
+# edit-jmn — partial; existing-file handoff still blocked
+
+Main now reserves the bead's 1000 live-tab target (G: supplied brief), and IPC
+errors have static descriptive text. Listener-free capacity, new-path tab
+admission, result descriptions and the existing null typing allocator check
+pass. The existing-file probe fails with EMFILE because src/file allocates an
+inotify instance per file; that excluded module was left unchanged. The real
+CLI regression is retained for the coordinator. Unix listener binding and X
+access are denied in this sandbox; full acceptance is not claimed.
+Gcc release `make all` passes. Clang ASan/UBSan `make check` stops in the CLI
+suite at listener setup; the individual suite sweep and display failures are
+recorded in the report. LeakSanitizer requires the coordinator's enabled rerun.
+
+Evidence, red/green transcripts, memory arithmetic, suite failures and remaining
+work: [worker report](../../docs/worker-reports/edit-jmn.md).
+Design: [decision](../../docs/decisions/edit-jmn.md). Do not close the bead until
+watcher admission and the coordinator's complete rerun are green.
+
 # ipc — P4.9 / edit-457.9
 
 Implemented: public caller-owned API, CLI canonicalization/positions/options,

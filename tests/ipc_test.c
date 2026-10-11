@@ -34,7 +34,7 @@ static int cli_script_run(editor *e);
 typedef struct cli_state {
     pid_t ui_pid;
     ipc_token token;
-    size_t tabs, remaining;
+    size_t tabs, remaining, tab_capacity;
     bool live, has_server, isolated, binary;
     char socket_leaf[108];
 } cli_state;
@@ -48,7 +48,7 @@ static int cli_pipe(const char *name)
 static void cli_state_send(editor *e, ipc_token token)
 {
     cli_state state = {.ui_pid = getpid(), .token = token, .tabs = editor_get_stats(e).tabs,
-        .has_server = e->cfg.server != NULL};
+        .has_server = e->cfg.server != NULL, .tab_capacity = e->tabs.capacity};
     if (e->cfg.server) {
         state.live = ipc_server_token_live(e->cfg.server, token);
         state.isolated = e->cfg.server->listener < 0;
@@ -340,6 +340,64 @@ static pid_t spawn_client(const char *runtime, bool wait, ipc_result expected)
 static void reap_ok(pid_t child)
 {
     int status; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+}
+/* Listener-free coverage for the application's 1000 new-path target.
+ * Existing-file and CLI handoff coverage lives in t_astra_many_open. */
+static void t_editor_tabs(const char *dir)
+{
+    const size_t count = 1000u; /* (G): edit-jmn application target. */
+    char rt[IPC_PATH_CAP], path[IPC_PATH_CAP]; subdir(dir, "editor-tabs", rt);
+    render_backend backend = {0}; CHECK(render_null_backend(&backend) == 0);
+    /* (E) Same existing editor_test viewport: 40 columns * 4 rows. */
+    editor_config config = {.cols = 40, .rows = 4, .max_cols = 40, .max_rows = 4,
+        .start_empty = true, .tab_capacity = count};
+    editor *e = NULL; CHECK(editor_open(&e, &config, &backend) == 0);
+    for (size_t i = 0; i < count; i++) {
+        CHECK(snprintf(path, sizeof path, "%s/tab-%zu", rt, i) > 0);
+        ipc_request r = {.count = 1, .cwd = rt}; r.paths[0] = (ipc_path){path, 1, 1};
+        errno = 0; int rc = editor_open_request(e, &r, 0); int saved_errno = errno;
+        if (rc) fprintf(stderr, "edit-jmn editor admission: accepted=%zu attempted=%zu result=%d errno=%d (%s)\n",
+            i, i + 1u, rc, saved_errno, strerror(saved_errno));
+        CHECK(rc == 0 && editor_get_stats(e).tabs == i + 1u);
+    }
+    for (size_t i = 0; i < count; i++) {
+        CHECK(snprintf(path, sizeof path, "%s/tab-%zu", rt, i) > 0);
+        CHECK(editor_tab(e, i) && strcmp(editor_tab(e, i)->path, path) == 0);
+        CHECK(editor_select_tab(e, i) == 0 && editor_length(e) == 0);
+    }
+    editor_close(e); rm_rf(rt);
+    printf("ipc_test: edit-jmn %zu unique new paths accepted, all tabs selectable\n", count);
+}
+static void t_cli_capacity(const char *dir)
+{
+    char rt[IPC_PATH_CAP]; subdir(dir, "cli-capacity", rt);
+    int events[2], commands[2]; CHECK(pipe(events) == 0 && pipe(commands) == 0);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        close(events[0]); close(commands[1]);
+        char number[32]; CHECK(snprintf(number, sizeof number, "%d", events[1]) > 0);
+        CHECK(setenv("IPC_TEST_EVENTS", number, 1) == 0);
+        CHECK(snprintf(number, sizeof number, "%d", commands[0]) > 0);
+        CHECK(setenv("IPC_TEST_COMMANDS", number, 1) == 0);
+        CHECK(setenv("XDG_DATA_HOME", rt, 1) == 0 && unsetenv("EDIT_TRACE_DUMP") == 0);
+        char *argv[] = {"sublimite", "--new-instance"};
+        _exit(ipc_cli_main((int)(sizeof argv / sizeof argv[0]), argv));
+    }
+    close(events[1]); close(commands[0]);
+    cli_state state; CHECK(read(events[0], &state, sizeof state) == (ssize_t)sizeof state);
+    CHECK(write(commands[1], "Q", 1) == 1); reap_ok(child);
+    close(events[0]); close(commands[1]); rm_rf(rt);
+    printf("ipc_test: CLI tab capacity=%zu; expected>=1000 (G: edit-jmn target)\n", state.tab_capacity);
+    CHECK(state.tab_capacity >= 1000u);
+}
+static void t_result_text(void)
+{
+    CHECK(strcmp(ipc_result_string(IPC_REJECTED), "running instance rejected the open request") == 0);
+    CHECK(strcmp(ipc_result_string(IPC_LIMIT), "request or editor capacity limit exceeded") == 0);
+    CHECK(strcmp(ipc_result_string(IPC_BUSY), "running instance is busy") == 0);
+    for (ipc_result rc = IPC_OK; rc <= IPC_REJECTED; rc++) CHECK(*ipc_result_string(rc));
+    CHECK(strcmp(ipc_result_string((ipc_result)-1), "unknown IPC error") == 0);
+    puts("ipc_test: descriptive IPC result text passed");
 }
 static void serve_one(ipc_server *s, capture *c)
 {
@@ -814,8 +872,16 @@ static void t_astra_many_open(const char *dir, bool handoff)
         CHECK(write(fd, "text\n", sizeof "text\n" - 1u) == (ssize_t)(sizeof "text\n" - 1u)); close(fd);
         if (!handoff) {
             ipc_request r = {.count = 1}; r.paths[0] = (ipc_path){path, 1, 1};
-            if (editor_open_request(e, &r, 0) != 0) break;
-            accepted++; CHECK(editor_get_stats(e).tabs == accepted); continue;
+            int rc = editor_open_request(e, &r, 0);
+            if (rc) {
+                fprintf(stderr, "astra_many_open: local open %zu failed: result=%d last_errno=%d (%s)\n",
+                        i + 1u, rc, errno, strerror(errno));
+                break;
+            }
+            accepted++; CHECK(editor_get_stats(e).tabs == accepted);
+            /* Service shared-watch events and worker completions between
+             * local opens, just as the CLI branch does while awaiting ACK. */
+            CHECK(editor_poll_sources(e) == 0); continue;
         }
         pid_t client = fork(); CHECK(client >= 0);
         if (!client) {
@@ -865,6 +931,9 @@ static int run_suite(const char *only, int ns_fd)
     T("main_launcher_primary",t_main_launcher(dir,false)); T("main_launcher_isolated",t_main_launcher(dir,true));
     T("astra_many_open",t_astra_many_open(dir,true));
     T("astra_many_open_local",t_astra_many_open(dir,false));
+    T("cli_capacity",t_cli_capacity(dir));
+    T("result_text",t_result_text());
+    T("editor_tabs",t_editor_tabs(dir));
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));

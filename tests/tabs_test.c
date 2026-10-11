@@ -353,6 +353,16 @@ static int memory_census(bool enforce_reserve)
         tag,power,load,sizeof set,set.arena.size,
         control,history,replay,committed,reserve,own+control+committed,
         reserve<=1000000u?"PASS":"MISS");
+    /* edit-jmn (G): 1000 live is the bead's Sublime-comparable target; keep
+     * the census's retained-closed allowance and derive bytes from the ABI. */
+    tabs_set target; CHECK(tabs_init(&target,1000u,set.closed_capacity)==0);
+    printf("tabs_test: edit-jmn fixed state (M)[%s] tab_record=%zu indices=%zu per_slot=%zu "
+        "live=%zu retained=%zu slots=%zu arena=%zu control=%zu owned=%zu; "
+        "per_slot=sizeof(tabs_tab)+2*sizeof(uint32_t), arena=page_round(slots*per_slot)\n",
+        tag,sizeof(tabs_tab),2u*sizeof(uint32_t),sizeof(tabs_tab)+2u*sizeof(uint32_t),
+        target.capacity,target.closed_capacity,target.capacity+target.closed_capacity,
+        target.arena.size,sizeof target,tabs_owned_bytes(&target));
+    tabs_fini(&target);
     for(size_t i=0;i<100;++i) undo_destroy(&logs[i]);
     piece_destroy(tree); tabs_fini(&set);
     if(enforce_reserve && reserve>1000000u) {

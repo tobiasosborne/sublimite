@@ -27,10 +27,10 @@ int main(int argc, char **argv)
         if (role == IPC_EXISTS) {
             ipc_result sent = ipc_client_send_display(NULL, display, &args.request, 2000);
             ipc_args_fini(&args);
-            if (sent != IPC_OK) fprintf(stderr, "sublimite: handoff error %d\n", sent);
+            if (sent != IPC_OK) fprintf(stderr, "sublimite: handoff failed: %s\n", ipc_result_string(sent));
             return sent == IPC_OK ? 0 : 2;
         }
-        if (role != IPC_OK) { fprintf(stderr, "sublimite: IPC startup error %d\n", role); ipc_args_fini(&args); return 2; }
+        if (role != IPC_OK) { fprintf(stderr, "sublimite: IPC startup failed: %s\n", ipc_result_string(role)); ipc_args_fini(&args); return 2; }
         owns_server = true;
     }
     char journal_path[4097];
@@ -63,7 +63,7 @@ int main(int argc, char **argv)
             ipc_server_fini(&server);
             ipc_args_fini(&args);
             ipc_result waited = ipc_launcher_wait(channels[1]);
-            if (waited != IPC_OK) fprintf(stderr, "sublimite: wait error %d\n", waited);
+            if (waited != IPC_OK) fprintf(stderr, "sublimite: wait failed: %s\n", ipc_result_string(waited));
             return waited == IPC_OK ? 0 : 1;
         }
         close(channels[1]);
@@ -81,7 +81,9 @@ int main(int argc, char **argv)
     int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
     editor *e = NULL;
     editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true,
-        .server = owns_server ? &server : NULL};
+        /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
+         * pointers are reserved during startup, never on the typing path. */
+        .tab_capacity = 1000u, .server = owns_server ? &server : NULL};
     if (!rc) rc = editor_open(&e, &config, &backend);
     if (!rc) rc = editor_open_request(e, &args.request, initial_token);
     ipc_args_fini(&args);
