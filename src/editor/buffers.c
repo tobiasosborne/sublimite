@@ -724,6 +724,67 @@ int editor_poll_sources(editor *e)
     return e->error;
 }
 
+/* Explicit Reload and clean-source refresh share replacement, view clamping,
+ * empty undo history, journal reconciliation and logical tab identity. */
+static int reload_source(editor *e, editor_buffer *b, size_t tab_index)
+{
+    size_t slot = 0;
+    while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
+    if (slot == e->buffer_capacity || file_save_busy(b->file) || e->op_count) return 0;
+    editor_buffer *replacement = NULL;
+    int rc = editor_buffer_prepare(e, b->path, NULL, 0, &replacement);
+    if (rc) return 0;
+    if (replacement->pending_open) {
+        e->opening = replacement->file; e->open_error = 0;
+        rc = wait_open_ready(e, replacement);
+        if (!rc) rc = editor_adopt_open(e, replacement);
+        e->opening = NULL;
+    }
+    if (rc) { unpoll_source(e, replacement); editor_buffer_destroy(replacement); return 0; }
+    bool active = b == e->buffer;
+    editor_buffer *previous_buffer = e->buffer;
+    view_state previous = e->v.state;
+    const tabs_tab *tab = tabs_at(&e->tabs, tab_index);
+    view_state previous_tab = tab->state, state = active ? previous : previous_tab;
+    bool modified = tab->modified;
+    uint64_t len = piece_len(replacement->tree);
+    if (state.selection.cursor > len) state.selection.cursor = len;
+    if (state.selection.anchor > len) state.selection.anchor = len;
+    if (state.first_byte > len) state.first_byte = len;
+    state.first_line = piece_byte_to_line(replacement->tree, state.first_byte);
+    state.first_byte = piece_line_to_byte(replacement->tree, state.first_line);
+    if (state.visual_byte > len) state.visual_byte = state.first_byte;
+    replacement->session_slot = slot;
+    replacement->id = b->id; replacement->source_generation = b->source_generation + 1;
+    replacement->wait_token = b->wait_token; replacement->initial = state;
+    /* Stage the replacement tab/state for the complete checkpoint, rolling it
+     * back on failure. Retired generations retain leases, but are not recovery
+     * state. Inactive tabs must checkpoint their clamped replacement view too. */
+    e->buffers[slot] = replacement; b->retired = true;
+    if (active) e->buffer = replacement;
+    rc = tabs_replace(&e->tabs, tab_index, replacement->tree, &replacement->undo, &state, &e->v.state);
+    EDIT_ASSERT(rc == 0); /* replacement keeps the existing logical tab */
+    if (e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    if (rc) {
+        e->buffers[slot] = NULL; b->retired = false;
+        (void)tabs_replace(&e->tabs, tab_index, b->tree, &b->undo, &previous_tab, &e->v.state);
+        (void)tabs_set_modified(&e->tabs, tab_index, modified);
+        e->buffer = previous_buffer; e->v.state = previous;
+        unpoll_source(e, replacement);
+        editor_buffer_destroy(replacement); return 0;
+    }
+    lineidx_build_cancel(b->index);
+    work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
+    b->lg.find_running = false;
+    b->wait_token = 0;
+    editor_session_forget(e, b);
+    rc = editor_save_setup(e, replacement); if (rc) replacement->operation_error = rc;
+    unpoll_source(e, b);
+    if (active) return editor_activate(e);
+    editor_session_metadata(e);
+    return editor_journal_changed(e);
+}
+
 int editor_source_resolve(editor *e, bool reload)
 {
     if (!e || !e->buffer->source_stale) return EDITOR_ERR_ARG;
@@ -734,9 +795,25 @@ int editor_check_sources(editor *e)
 {
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
-        if (!b || b->retired || !b->file || b->source_stale || editor_save_active(e)) continue;
+        if (!b || b->retired || !b->file || editor_save_active(e)) continue;
+        bool clean = !b->saved_lost && b->history_cursor == b->saved_cursor;
+        if (b->source_stale && !clean) continue;
         if (b->watch_pending) (void)file_watch_poll(b->file);
-        if (!file_changed(b->file) && b->operation_kind != FILE_MSG_OPEN_FAILED) continue;
+        if (!b->source_stale && !file_changed(b->file) && b->operation_kind != FILE_MSG_OPEN_FAILED) continue;
+        if (clean && !b->pending_open && b->operation_kind != FILE_MSG_OPEN_FAILED) {
+            /* Setup can allocate. Finish input through its containing frame,
+             * and release active view/save/clipboard leases before replacing. */
+            if (editor_activation_busy(e) || e->backend->active || e->queue_count ||
+                (e->dirty && e->frame.last_sequence) || e->op_count) continue;
+            size_t tab_index = 0;
+            while (tab_index < tabs_count(&e->tabs) && tabs_at(&e->tabs, tab_index)->id != b->id) tab_index++;
+            if (tab_index == tabs_count(&e->tabs)) continue; /* refresh retained closed tabs when reopened */
+            int rc = reload_source(e, b, tab_index);
+            if (rc || b->retired) return rc; /* at most one replacement in a maintenance turn */
+            /* Failed acquisition/reconciliation retains the old resources and
+             * exposes the existing recovery choices rather than losing text. */
+        }
+        if (b->source_stale) continue;
         b->source_stale = true; b->prompt_ns = 0; b->lg.find_running = false;
         lineidx_build_cancel(b->index);
         work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
@@ -780,47 +857,5 @@ int editor_check_sources(editor *e)
         editor_large_keep(b);
         return editor_full_layout(e);
     }
-    size_t slot = 0;
-    while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
-    if (slot == e->buffer_capacity || file_save_busy(b->file) || e->op_count) return 0;
-    editor_buffer *replacement = NULL;
-    int rc = editor_buffer_prepare(e, b->path, NULL, 0, &replacement);
-    if (rc) return 0;
-    if (replacement->pending_open) {
-        e->opening = replacement->file; e->open_error = 0;
-        rc = wait_open_ready(e, replacement);
-        if (!rc) rc = editor_adopt_open(e, replacement);
-        e->opening = NULL;
-    }
-    if (rc) { unpoll_source(e, replacement); editor_buffer_destroy(replacement); return 0; }
-    view_state previous = e->v.state, state = previous;
-    uint64_t len = piece_len(replacement->tree);
-    if (state.selection.cursor > len) state.selection.cursor = len;
-    if (state.selection.anchor > len) state.selection.anchor = len;
-    if (state.first_byte > len) state.first_byte = len;
-    state.first_line = piece_byte_to_line(replacement->tree, state.first_byte);
-    state.first_byte = piece_line_to_byte(replacement->tree, state.first_line);
-    if (state.visual_byte > len) state.visual_byte = state.first_byte;
-    replacement->session_slot = slot;
-    replacement->id = b->id; replacement->source_generation = b->source_generation + 1;
-    replacement->wait_token = b->wait_token; replacement->initial = state;
-    /* Reconcile the complete session before replacing the tab's borrowed
-     * resources. Retired generations retain leases, but are not recovery state. */
-    e->buffers[slot] = replacement; b->retired = true;
-    e->buffer = replacement; e->v.state = state;
-    if (e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
-    if (rc) {
-        e->buffers[slot] = NULL; b->retired = false;
-        e->buffer = b; e->v.state = previous;
-        unpoll_source(e, replacement);
-        editor_buffer_destroy(replacement); return 0;
-    }
-    rc = tabs_replace(&e->tabs, tabs_active_index(&e->tabs), replacement->tree,
-                      &replacement->undo, &state, &e->v.state);
-    EDIT_ASSERT(rc == 0); /* active tab and replacement leases were validated */
-    b->wait_token = 0;
-    editor_session_forget(e, b);
-    rc = editor_save_setup(e, replacement); if (rc) replacement->operation_error = rc;
-    unpoll_source(e, b);
-    return editor_activate(e);
+    return reload_source(e, b, tabs_active_index(&e->tabs));
 }

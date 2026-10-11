@@ -547,6 +547,7 @@ int main(int argc, char **argv)
     if (argc==2 && !strcmp(argv[1],"--73j-null")) return indentation(false) || queued_groups(false) ||
         decorations(false) || tabs_script(false) || wrap_navigation(false) || wrap_geometry(false) ||
         minimap_script(false) || index_recovery(false);
+    bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2 && !strcmp(argv[1], "--indent-limit-enter")) return indent_selection_limit(0);
     if (argc == 2 && !strcmp(argv[1], "--indent-limit-brace")) return indent_selection_limit(1);
     T(indent_selection_limit(0) == 0); T(indent_selection_limit(1) == 0);
@@ -556,6 +557,7 @@ int main(int argc, char **argv)
     T(ipc_pending_input(&server, runtime) == 0);
     for (unsigned i = 0; i < 2; i++) {
         bool raster = i != 0;
+        if (headless && raster) continue;
         T(indentation(raster) == 0); T(queued_groups(raster) == 0); T(decorations(raster) == 0); T(tabs_script(raster) == 0);
         T(wrap_navigation(raster) == 0); T(wrap_geometry(raster) == 0); T(minimap_script(raster) == 0); T(ipc_script(raster, &server, runtime) == 0);
         T(ipc_positions(raster) == 0);

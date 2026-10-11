@@ -72,6 +72,7 @@ static int close_case(bool native)
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    if (argc == 2 && !strcmp(argv[1],"--headless")) return close_case(false);
     if (argc == 2 && !strcmp(argv[1],"--native")) return close_case(true);
     T(close_case(false) == 0); T(close_case(true) == 0); return 0;
 }

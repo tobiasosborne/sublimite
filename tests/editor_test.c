@@ -1133,6 +1133,108 @@ static int review_replay_slices(void)
     T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(editor_length(e) == 4096);
     editor_close(e); T(unlink(journal_path) == 0); puts("review 11: multi-record burst undo/redo yields across turns passed"); return 0;
 }
+typedef struct source_prompt_probe { editor *owner; bool shown; } source_prompt_probe;
+static void source_watch_barrier(work_ctx *ctx) { (void)ctx; }
+static void source_prompt_submit(void *ctx, const editor_frame *frame)
+{
+    source_prompt_probe *probe = ctx; (void)frame;
+    if (!probe->owner) return;
+    editor *e = probe->owner;
+    const char prompt[] = "Source changed: R reload / K keep";
+    bool matches = e->grid.dims.cols >= sizeof prompt - 1;
+    for (size_t i = 0; matches && i < sizeof prompt - 1; i++)
+        matches = e->grid.cells[(size_t)e->tab_rows * e->grid.dims.cols + i].glyph_index == (uint8_t)prompt[i];
+    probe->shown |= matches;
+}
+static int clean_source_change(void)
+{
+    /* Cross open/save cleanliness with copied/mapped originals and live/hidden
+     * tabs. Offsets below come from this two-byte-per-line fixture. */
+    const char initial[] = "a\nb\nc\nd\ne\n", append[] = "EXTERNAL_APPEND\n";
+    for (unsigned saved = 2; saved-- > 0;) for (unsigned mapped = 0; mapped < 2; mapped++)
+    for (unsigned hidden = 0; hidden < 2; hidden++) {
+        char path[] = "build/edit-ret-source-XXXXXX", log[] = "build/edit-ret-log-XXXXXX";
+        int fd = mkstemp(path); T(fd >= 0);
+        T(write(fd, initial, sizeof initial - 1) == (ssize_t)(sizeof initial - 1)); close(fd);
+        fd = mkstemp(log); T(fd >= 0); close(fd);
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        source_prompt_probe probe = {0};
+        editor_config cfg = {.path = path, .journal_path = log, .copy_threshold = mapped ? 1 : 0,
+            .cols = sizeof "Source changed: R reload / K keep" - 1, .rows = 4, .wrap_mode = -1,
+            .hook_ctx = &probe, .on_submit = source_prompt_submit};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); probe.owner = e; T(settle(e) == 0);
+        if (saved) {
+            editor_buffer *saved_buffer = e->buffer;
+            T(press(e, key('x', 0, "x")) == 0); T(editor_tab(e, 0)->modified);
+            T(press(e, key('s', PLAT_MOD_CTRL, NULL)) == 0);
+            /* Reuse settle's watchdog: 5 s = 5000000000 ns / 10^9 ns/s. */
+            uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+            while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+            T(settle(e) == 0); T(!editor_tab(e, 0)->modified);
+            /* Drain our save's parent-watch events, then let a bulk barrier
+             * certify the queued identity checks have returned. A self-save
+             * must neither prompt nor replace the buffer/reset its undo. */
+            (void)file_watch_poll(e->buffer->file);
+            work_handle checked = work_submit(&e->pool, (work_job){source_watch_barrier, NULL, 0, WORK_BULK});
+            T(checked.epoch);
+            while (!work_handle_finished(&e->pool, checked) || work_mailbox_pending(&e->pool)) {
+                T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
+            }
+            T(editor_step(e, 0) >= 0); T(settle(e) == 0);
+            T(e->buffer == saved_buffer && !e->buffer->source_stale && !probe.shown);
+            T(undo_get_history(e->undo).undo_groups != 0);
+        }
+        T(!e->buffer->source_stale && !probe.shown);
+        uint64_t id = e->buffer->id;
+        uint64_t shift = saved ? 1u : 0u; /* saved 'x' prefixes the fixture */
+        T(editor_set_cursor(e, sizeof initial - 3 + shift) == 0); T(settle(e) == 0);
+        e->v.state.selection.anchor = sizeof initial - 5 + shift;
+        e->v.state.first_byte = e->v.state.visual_byte = sizeof "a\nb\n" - 1 + shift;
+        e->v.state.first_line = 2; /* two fixture lines precede the viewport */
+        e->v.state.hscroll = 1; /* one-column horizontal offset */
+        T(editor_full_layout(e) == 0); T(settle(e) == 0);
+        view_state state = editor_view(e);
+        editor_buffer *old = e->buffer;
+        if (hidden) { uint64_t other; T(editor_add_buffer(e, NULL, (const uint8_t *)"other", sizeof "other" - 1, &other) == 0); T(settle(e) == 0); }
+        fd = open(path, O_WRONLY | O_APPEND); T(fd >= 0);
+        T(write(fd, append, sizeof append - 1) == (ssize_t)(sizeof append - 1)); close(fd);
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (editor_tab(e, 0)->buffer == old->tree) {
+            T(editor_step(e, 0) >= 0); T(!e->buffer->source_stale && !probe.shown);
+            T(trace_now_ns() < deadline); sched_yield();
+        }
+        if (hidden) { T(expect(e, "other", 0) == 0); T(editor_select_tab(e, 0) == 0); }
+        T(settle(e) == 0); T(!probe.shown && !e->buffer->source_stale);
+        char expected[sizeof initial + sizeof append];
+        T(snprintf(expected, sizeof expected, "%s%s%s", saved ? "x" : "", initial, append) > 0);
+        T(expect(e, expected, state.selection.cursor) == 0);
+        T(e->buffer->id == id && !editor_tab(e, 0)->modified);
+        T(editor_view(e).selection.anchor == state.selection.anchor);
+        T(editor_view(e).first_byte == state.first_byte && editor_view(e).first_line == state.first_line);
+        T(editor_view(e).hscroll == state.hscroll);
+        T(undo_get_history(e->undo).undo_groups == 0 && undo_get_history(e->undo).redo_groups == 0);
+        T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+        bool visible = false;
+        for (size_t i = 0; i < (size_t)e->text_grid.dims.cols * e->text_grid.dims.rows; i++)
+            visible |= e->text_grid.cells[i].glyph_index == 'X'; /* appended line reaches the rendered viewport */
+        T(visible && !probe.shown);
+        /* Shrinking below the old selection/scroll must clamp to real text. */
+        fd = open(path, O_WRONLY | O_TRUNC); T(fd >= 0);
+        T(write(fd, "z", sizeof "z" - 1) == (ssize_t)(sizeof "z" - 1)); close(fd);
+        deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (editor_length(e) != sizeof "z" - 1) {
+            T(editor_step(e, 0) >= 0); T(!e->buffer->source_stale && !probe.shown);
+            T(trace_now_ns() < deadline); sched_yield();
+        }
+        T(settle(e) == 0); T(expect(e, "z", sizeof "z" - 1) == 0);
+        T(editor_view(e).selection.anchor <= editor_length(e));
+        T(editor_view(e).first_byte == 0 && editor_view(e).first_line == 0);
+        T(editor_view(e).visual_byte <= editor_length(e) && !editor_tab(e, 0)->modified && !probe.shown);
+        editor_close(e); T(unlink(path) == 0); T(unlink(log) == 0);
+    }
+    puts("edit-ret: clean open/save append reload, copied/mapped and inactive tabs, view preservation/clamping, undo reset and no submitted prompt passed");
+    return 0;
+}
 static int review_source_change(void)
 {
     for (unsigned mode = 0; mode < 2; mode++) {
@@ -1144,6 +1246,9 @@ static int review_source_change(void)
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         editor_config cfg = {.path = path, .copy_threshold = 1, .cols = 40, .rows = 4}; editor *e = NULL;
         T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        /* This case exercises the dirty-buffer prompt; clean sources reload. */
+        T(press(e, key('x', 0, "x")) == 0); T(editor_tab(e, 0)->modified);
+        T(editor_set_cursor(e, 0) == 0); T(settle(e) == 0);
         struct stat original; T(stat(path, &original) == 0);
         fd = open(path, O_WRONLY | (mode ? O_TRUNC : 0)); T(fd >= 0);
         T(write(fd, "change\n", 7) == 7);
@@ -1354,6 +1459,7 @@ static int review_reload_identity(void)
     ipc_request request = {.count = 1, .wait = true};
     request.paths[0] = (ipc_path){.path = path, .line = 1, .col = 1};
     T(editor_open_request(e, &request, token) == 0); T(settle(e) == 0);
+    T(press(e, key('x', 0, "x")) == 0); T(editor_tab(e, 1)->modified);
     uint64_t id = e->buffer->id; T(editor_set_cursor(e, 5) == 0); T(settle(e) == 0);
     e->v.state.first_byte = e->v.state.visual_byte = 2; e->v.state.first_line = 1; e->v.state.hscroll = 3;
     e->v.state.selection.anchor = 3; e->v.state.selection.preferred_col = 9;
@@ -2884,6 +2990,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--ck4-credit")) return ck4_credit();
         if (!strcmp(argv[1], "--ck4-startup")) return ck4_startup();
         if (!strcmp(argv[1], "--ck4-save")) return ck4_recovery(0);
+        if (!strcmp(argv[1], "--clean-source-change")) return clean_source_change();
         if (!strcmp(argv[1], "--ck4-keep")) return ck4_recovery(1);
         if (!strcmp(argv[1], "--ck4-reload")) return ck4_recovery(2);
         if (!strcmp(argv[1], "--ck4-mapped-keep")) return ck4_recovery(3);
@@ -2913,6 +3020,7 @@ int main(int argc, char **argv)
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
+    T(clean_source_change() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(headless ? "headless" : NULL) == 0);

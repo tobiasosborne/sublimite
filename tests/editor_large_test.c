@@ -489,7 +489,7 @@ static void held_find_argument(work_ctx *ctx)
     while (!atomic_load(&p->release))
         nanosleep(&(struct timespec){0, 100000}, NULL);
     /* Deliberately finish an indivisible read after logical cancellation. */
-    atomic_store(&p->valid, piece_snapshot_len(p->job->snap) == 7);
+    atomic_store(&p->valid, piece_snapshot_len(p->job->snap) == sizeof "xsource\n" - 1);
     p->job->rc = FIND_CANCELLED;
 }
 static int cancelled_find_restart(void)
@@ -501,6 +501,9 @@ static int cancelled_find_restart(void)
     editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    plat_event edit = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
+    T(editor_inject(e, &edit) == 0); T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_tab(e, 0)->modified); /* Keep requires an unsaved buffer. */
     editor_large *lg = &e->buffer->lg;
     restart_probe probe = {0};
     probe.job = calloc(1, sizeof *probe.job); T(probe.job);
@@ -540,17 +543,24 @@ static int keep_restarts_background(void)
     editor_config cfg = {.path = path, .cols = 40, .rows = 4, .wrap_mode = -1, .copy_threshold = 1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    plat_event edit = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
+    T(editor_inject(e, &edit) == 0); T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_tab(e, 0)->modified); /* Keep requires an unsaved buffer. */
+    /* Typing invalidates the index; restore the original fixture's completed
+     * index before expecting editor_large_start to enqueue its warm job. */
+    uint64_t indexed = trace_now_ns() + UINT64_C(5000000000); /* existing settle watchdog */
+    while (!editor_index_complete(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < indexed); }
     editor_large_close(e->buffer);
     e->buffer->lg.warm_h = (work_handle){0}; e->buffer->lg.warm_done = false;
     _Atomic bool release; atomic_init(&release, false);
     work_handle hold = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(hold.epoch);
     editor_large_start(e, e->buffer); T(e->buffer->lg.warm_h.epoch);
     lineidx_destroy(e->buffer->index);
-    e->buffer->index = lineidx_create(sizeof bytes); T(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
     T(lineidx_build_reserve(e->buffer->index) == 0);
     piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
     T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
-    lineidx_src src = {snap, sizeof bytes, gutter_snapshot_span, gutter_snapshot_release};
+    lineidx_src src = {snap, piece_snapshot_len(snap), gutter_snapshot_span, gutter_snapshot_release};
     T(lineidx_build_start_prepaid(e->buffer->index, &e->pool, &src) == 0);
     e->buffer->lg.lines_exact = false; e->buffer->index_dirty = false;
     char replacement[] = "build/editor-keep-new-XXXXXX";
