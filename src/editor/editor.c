@@ -147,6 +147,7 @@ int editor_full_layout(editor *e)
     e->extra_rows = false; e->full_pending = false;
     /* Establish the incoming gutter/text width before asking for a visual
      * seed; a preceding tab or resize can have different query geometry. */
+    trace_record(TRACE_STARTUP_FIRST_LAYOUT, 0);
     rc = layout_begin(&e->lay, e->tree, vp); if (rc) return rc;
     if (s.wrap && s.visual_byte != s.first_byte) {
         layout_wrap_row first; bool approximate;
@@ -212,8 +213,11 @@ void editor_route_work(const work_msg *msg, void *ctx)
     if (editor_large_receive(e, msg)) return;
     file_msg fm;
     if (file_msg_decode(msg, &fm) == 0) {
-        if (fm.kind == FILE_MSG_PREFIX_READY)
+        if (fm.kind == FILE_MSG_PREFIX_READY) {
+            /* UI observation of the worker's completed prefix read. */
+            trace_record(TRACE_STARTUP_FILE_PREFIX_READ, 0);
             trace_record(TRACE_T1_DEQUEUE, editor_large_trace_frame(fm.f));
+        }
         else if (fm.kind == FILE_MSG_OPEN_READY)
             trace_record(TRACE_T2_MUTATION_DONE, editor_large_trace_frame(fm.f));
         editor_large_file_msg(e, &fm);
@@ -276,6 +280,7 @@ static int raster_poll_set(editor *e)
 }
 static int pump(editor *e, int timeout)
 {
+    int probe_rc = editor_backend_poll_probe(e); if (probe_rc) return probe_rc;
     bool active = e->backend->active;
     int raster_rc = raster_poll_completions(e->backend);
     if (raster_rc) return fail(e, raster_rc);
@@ -304,6 +309,7 @@ static int pump(editor *e, int timeout)
         if (rc >= 0) e->stats.poll_returns++;
         else if (errno != EINTR) return EDITOR_ERR_IO;
     }
+    probe_rc = editor_backend_poll_probe(e); if (probe_rc) return probe_rc;
     if (e->pool_ready) return editor_poll_sources(e);
     return e->error;
 }
@@ -314,6 +320,8 @@ static int present(editor *e)
     int rc = render_backend_present(b, b->active_frame);
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
+    trace_record(TRACE_STARTUP_FIRST_PRESENT, 0);
+    e->startup_presented = true;
     e->active_frame.present_ns = trace_now_ns();
     if (e->active_frame.last_sequence) e->stats.presented_sequence = e->active_frame.last_sequence;
     if (e->cfg.on_present) e->cfg.on_present(e->cfg.hook_ctx, &e->active_frame);
@@ -343,6 +351,7 @@ static int submit(editor *e)
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
+    trace_record(TRACE_STARTUP_FIRST_SUBMIT, 0);
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
     editor_save_submitted(e, e->frame.submit_ns);
     if (e->buffer->source_stale && !e->buffer->prompt_ns) {

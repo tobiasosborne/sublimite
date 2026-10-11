@@ -4,6 +4,10 @@
  *   char     magic[8] = "EDTRACE1"
  *   uint32_t version (1), nrings, rec_size (16), ring_cap (65536)
  *   per ring: uint32_t ring_index, uint32_t count, count x trace_rec (oldest first)
+ * Startup stamps use appended TRACE_STARTUP_* event IDs, frame_id=0, and are
+ * retained outside wrapping rings. Dumping prepends them to ring zero, reducing
+ * its retained frame-record count by the startup-stamp count if necessary.
+ * Record size, ring cap, header version and legacy event IDs are unchanged.
  * Optional tagged section after the rings (P0.6; header version stays 1, old
  * loaders ignore trailing bytes):
  *   uint32_t tag 'INPT' (0x54504e49), version (1), rec_size (48), count (<= 16384)
@@ -133,6 +137,31 @@ static inline uint64_t trace_fmt_pct(uint64_t *v, size_t n, unsigned pct) {
     rank = (n * pct + 99u) / 100u;   /* ceil(n * pct / 100) */
     if (rank < 1) rank = 1;
     return v[rank - 1];
+}
+
+/* Off-path startup report. ms = ns / 1000000 (SI); no timing budget is implied.
+ * Absolute monotonic ns are printed too, so overlapping worker stages can be
+ * subtracted directly rather than mistaken for sequential UI costs. */
+static inline void trace_fmt_startup_report(FILE *out, const trace_rec *r, size_t n) {
+    const char *names[] = {"process_start", "display_connect", "egl_probe_start", "egl_probe_end",
+        "raster_fallback", "font_atlas_ready", "file_prefix_read", "first_layout",
+        "first_submit", "first_present", "egl_load_start", "egl_load_end"};
+    _Static_assert(sizeof names / sizeof names[0] == TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START,
+                   "startup names match stages");
+    uint64_t ns[TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START] = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (r[i].ev < TRACE_STARTUP_PROCESS_START || r[i].ev >= TRACE_EV_COUNT) continue;
+        size_t stage = r[i].ev - TRACE_STARTUP_PROCESS_START;
+        if (!ns[stage] || r[i].ns < ns[stage]) ns[stage] = r[i].ns;
+    }
+    fprintf(out, "startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)\n");
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (!ns[i]) fprintf(out, "  %-20s not recorded\n", names[i]);
+        else if (!ns[0] || ns[i] < ns[0]) fprintf(out, "  %-20s ns=%llu elapsed unavailable\n",
+            names[i], (unsigned long long)ns[i]);
+        else fprintf(out, "  %-20s ns=%llu elapsed_ms=%.6f\n", names[i],
+            (unsigned long long)ns[i], (double)(ns[i] - ns[0]) / 1000000.0);
+    }
 }
 
 #endif

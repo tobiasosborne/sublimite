@@ -14,6 +14,7 @@ int main(int argc, char **argv)
     uint64_t startup_ns = trace_now_ns();
     trace_init(); (void)trace_thread_register();
     trace_record_at(startup_ns, TRACE_T0_INGRESS, 0);
+    trace_record_at(startup_ns, TRACE_STARTUP_PROCESS_START, 0);
     ipc_args args = {0}; ipc_result parsed = ipc_parse_args(argc, argv, &args);
     if (parsed == IPC_OK && args.request.has_stdin) parsed = ipc_args_read_stdin(&args, STDIN_FILENO);
     if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }

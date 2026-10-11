@@ -48,6 +48,8 @@ int main(int argc, char **argv) {
     }
     fclose(f);
 
+    trace_fmt_startup_report(stdout, recs, n);
+
     report(recs, n, TRACE_T0_INGRESS, TRACE_T4_PRESENT_SUBMITTED, "G1 T4-T0");
     report(recs, n, TRACE_T0_INGRESS, TRACE_T5_DEVICE_DONE, "G3 T5-T0");
     report(recs, n, TRACE_T0_INGRESS, TRACE_T6_PRESENT_COMPLETE, "T6-T0");

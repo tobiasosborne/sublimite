@@ -168,6 +168,10 @@ typedef struct render_config {
     struct work_pool *workers;  /* borrowed; CPU MT4 jobs use WORK_RASTER */
     render_hooks hooks;          /* NULL functions use trace defaults */
     uint32_t max_region_width, max_region_height; /* init-only pixel reserve */
+    /* INIT runs concurrently with a visible bootstrap backend. It must not
+     * present diagnostic frames to that window. GL arms its private Present
+     * subscription and validates the first real frame after UI adoption. */
+    bool background_init;
 } render_config;
 
 enum render_event_kind {
@@ -230,6 +234,9 @@ int render_backend_query(const render_backend *b, render_backend_info *out);
  * caller can select CPU factory + fresh state after any GL init error or --cpu.
  * Backends unable to deliver fence and matching-frame completion must fail init
  * with UNSUPPORTED rather than leave the one-frame slot permanently busy.
+ * Background INIT does not swap diagnostic frames over the visible bootstrap:
+ * its first real frame uses the backend's existing completion/error guard. A
+ * failed capability observation is terminal, never an indefinitely busy slot.
  * Initialisation is the only allocation opportunity. GL transfers/detaches its
  * context before init returns, and binds it to UI for submit/present.
  * QUIESCENT SHUTDOWN: UI only, after input has stopped; may block. It can

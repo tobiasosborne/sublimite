@@ -1,0 +1,4 @@
+POWER status=Discharging evidence=(M)[bat] load1=28.37 upload=legacy verdict=TRACK
+BENCH name=binary_size n=1 p50=17334 p99=17334 ci95=[17334,17334] gate_p50=0 gate_p99=0 text_bytes=17334 units=bytes status=TRACK pass=1 evidence=(M) power=[bat] load1=28.37 upload=legacy
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[bat] power_status="Discharging" load1=28.37
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[bat]

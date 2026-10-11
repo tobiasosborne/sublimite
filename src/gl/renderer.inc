@@ -67,7 +67,7 @@ typedef struct gl_state {
     uint32_t swap_serial, pending_serial;
     uint64_t msc;
     bool present_verified, complete_selected;
-    bool swapped, failed;
+    bool swapped, failed, startup;
     uint32_t swapped_id;
     uint64_t verified_ns, completion_deadline;
     work_pool *workers;
@@ -193,8 +193,10 @@ static bool gl_load(gl_state *s)
     const char *egl_name=getenv("EDIT_GL_EGL_LIBRARY"), *gl_name=getenv("EDIT_GL_GL_LIBRARY");
     /* EGLDisplay handles are process-lifetime identities even after terminate.
      * Keep the loader/vendor cache rooted; still close both acquired handles. */
+    trace_record(TRACE_STARTUP_EGL_LOAD_START, 0);
     s->egl_lib = dlopen(egl_name!=NULL ? egl_name : "libEGL.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
     s->gl_lib = dlopen(gl_name!=NULL ? gl_name : "libGL.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    trace_record(TRACE_STARTUP_EGL_LOAD_END, 0);
     if (s->egl_lib == NULL || s->gl_lib == NULL) return false;
     if (!gl_symbol(s->egl_lib,"eglReleaseThread",&s->eReleaseThread,sizeof s->eReleaseThread)) return false;
     if (!gl_symbol(s->egl_lib,"eglGetProcAddress",&s->eGetProcAddress,sizeof s->eGetProcAddress)) return false;
@@ -681,7 +683,7 @@ static bool gl_display_mode(uint8_t mode)
     return mode==XCB_PRESENT_COMPLETE_MODE_COPY || mode==XCB_PRESENT_COMPLETE_MODE_FLIP ||
            mode==XCB_PRESENT_COMPLETE_MODE_SUBOPTIMAL_COPY;
 }
-static bool gl_probe_present(gl_state *s)
+static bool gl_arm_present(gl_state *s)
 {
     xcb_connection_t *conn=s->native_conn;
     s->present_eid=xcb_generate_id(conn);
@@ -691,6 +693,12 @@ static bool gl_probe_present(gl_state *s)
     xcb_generic_error_t *err=xcb_request_check(conn,select);
     if (err!=NULL) { free(err); return false; }
     s->complete_selected=true;
+    return true;
+}
+static bool gl_probe_present(gl_state *s)
+{
+    if (!gl_arm_present(s)) return false;
+    xcb_connection_t *conn=s->native_conn;
     bool ok=true;
     for (uint32_t n=0;n<3 && ok;n++) {
         gl_draw(s);
@@ -722,6 +730,17 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
      * this backend an independently terminable EGLDisplay, without globals. */
     s->native_conn=xcb_connect(NULL,NULL); s->own_native_conn=true;
     if (s->native_conn==NULL || xcb_connection_has_error(s->native_conn)) return RENDER_ERR_UNSUPPORTED;
+    /* The production contract uses Mesa DRI3 Present serials. An unavailable
+     * server cannot satisfy it: reject before driver/library discovery. This
+     * request uses the worker-owned connection, never the UI's connection. */
+    if (s->startup) {
+        const char extension[]="DRI3";
+        xcb_query_extension_reply_t *dri3=xcb_query_extension_reply(s->native_conn,
+            xcb_query_extension(s->native_conn, sizeof extension-1, extension), NULL);
+        bool available=dri3!=NULL && dri3->present;
+        free(dri3);
+        if (!available) return RENDER_ERR_UNSUPPORTED;
+    }
     s->native_win=cfg->platform->win;
     s->native_visual=cfg->platform->visual;
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(s->native_conn,
@@ -785,9 +804,9 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
 fail:
     return rc;
 }
-static int gl_init(render_backend *b,const render_config *cfg)
+static int gl_init_mode(render_backend *b,const render_config *cfg,bool startup)
 {
-    gl_state *s=b->state; memset(s,0,sizeof *s);
+    gl_state *s=b->state; memset(s,0,sizeof *s); s->startup=startup;
     /* The common adapter validates descriptors before ops.submit, so cap
      * accepted init capacities here, before any adapter table can be scanned. */
     if (cfg->max_glyphs>GL_FRAME_GLYPH_LIMIT || cfg->max_pages>GL_FRAME_PAGE_LIMIT ||
@@ -821,7 +840,12 @@ static int gl_init(render_backend *b,const render_config *cfg)
     if (s->persistent) memcpy(s->mapped,s->instances,sizeof(gl_instance));
     else if (s->upload==GL_UPLOAD_LEGACY) s->gBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)sizeof(gl_instance),s->instances);
     rc=RENDER_ERR_UNSUPPORTED;
-    if (!gl_probe_present(s)) goto fail;
+    /* Background initialization must not swap black probe frames over the
+     * raster bootstrap. The first real swap proves serial/MSC/mode through
+     * gl_event's existing private-event completion guard. Strict diagnostics
+     * keep the warm-swap proof. Drawing/JIT work without a swap is invisible. */
+    if (startup) { gl_draw(s); s->gFinish(); }
+    if (startup ? !gl_arm_present(s) : !gl_probe_present(s)) goto fail;
     s->strip_count=0;
     if (gl_ring_poll(s)!=RENDER_OK) goto fail;
     if (!s->eMakeCurrent(s->display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) goto fail;
@@ -831,6 +855,10 @@ fail:
     gl_release(s);
     if (cfg->arena!=NULL) edit_arena_reset_to_mark(cfg->arena,mark);
     return rc;
+}
+static int gl_init(render_backend *b,const render_config *cfg)
+{
+    return gl_init_mode(b,cfg,cfg->background_init);
 }
 static int gl_resize(render_backend *b,render_dims dims)
 {

@@ -1,0 +1,3 @@
+startup measurement stamp: BAT0=Discharging
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup_test: FAIL editor_open=-9; probe timed_out=1; first submits=0

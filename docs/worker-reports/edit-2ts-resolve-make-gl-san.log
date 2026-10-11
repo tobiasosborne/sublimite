@@ -1,0 +1,2 @@
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -D_GNU_SOURCE -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -Isrc -include tests/display_guard.h -MMD -MP -c tests/gl_test.c -o build/san/tests/gl_test.o
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -pthread build/san/tests/gl_test.o build/san/libedit.a -lm -ldl -lxcb -lxcb-present -lxcb-sync -lxcb-xfixes -lxcb -lxcb-shm -lxcb-present -lxcb-xkb -lxkbcommon -lxkbcommon-x11 -o build/san/tests/gl_test

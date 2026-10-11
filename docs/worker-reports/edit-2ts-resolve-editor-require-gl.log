@@ -1,0 +1,1 @@
+editor_test:1842: FAIL editor_open(&e, &cfg, &b) == 0

@@ -24,6 +24,20 @@ enum trace_ev {
     TRACE_T6_PRESENT_COMPLETE,
     TRACE_COMPOSE_BEGIN, /* editor composition only, preserves pipeline IDs */
     TRACE_COMPOSE_END,
+    /* Startup stamps are retained separately from the wrapping frame rings.
+     * Append only: existing dump event IDs remain unchanged. */
+    TRACE_STARTUP_PROCESS_START,
+    TRACE_STARTUP_DISPLAY_CONNECT,
+    TRACE_STARTUP_EGL_PROBE_START,
+    TRACE_STARTUP_EGL_PROBE_END,
+    TRACE_STARTUP_RASTER_FALLBACK,
+    TRACE_STARTUP_FONT_ATLAS_READY,
+    TRACE_STARTUP_FILE_PREFIX_READ,
+    TRACE_STARTUP_FIRST_LAYOUT,
+    TRACE_STARTUP_FIRST_SUBMIT,
+    TRACE_STARTUP_FIRST_PRESENT,
+    TRACE_STARTUP_EGL_LOAD_START,
+    TRACE_STARTUP_EGL_LOAD_END,
     TRACE_EV_COUNT
 };
 
@@ -47,6 +61,11 @@ void trace_record(enum trace_ev ev, uint32_t frame_id);
 
 /* Records an event with an explicit timestamp (for replay and tests). */
 void trace_record_at(uint64_t ns, enum trace_ev ev, uint32_t frame_id);
+
+/* First startup timestamp, or zero if absent. Startup record calls retain the
+ * first stamp per event using atomics, including from unregistered workers.
+ * These stamps survive frame-ring wrap; init/reset clear them when quiescent. */
+uint64_t trace_startup_get(enum trace_ev ev);
 
 /* CLOCK_MONOTONIC in nanoseconds. */
 uint64_t trace_now_ns(void);

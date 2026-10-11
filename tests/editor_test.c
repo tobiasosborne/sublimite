@@ -1745,6 +1745,15 @@ static int backend_selection(void)
 }
 static int injected_gpu_init_failure(render_backend *b, const render_config *cfg)
 { return worker_failed_init(b, cfg); }
+/* Discovery has no first-paint deadline. This helper only reuses the existing
+ * settle watchdog (5 s = 5000000000 ns / 1000000000 ns/s) to observe the final
+ * selection before diagnostic/allocator assertions in these native fixtures. */
+static int settle_backend_probe(editor *e)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (e->startup.pending) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    return settle(e);
+}
 static int backend_fallback_case(bool injected)
 {
     render_backend b = {0}; T(editor_backend_select(&b, NULL) == 0);
@@ -1758,6 +1767,7 @@ static int backend_fallback_case(bool injected)
     int saved_stderr = dup(STDERR_FILENO); T(saved_stderr >= 0);
     T(dup2(fileno(log), STDERR_FILENO) >= 0);
     int opened = editor_open(&e, &cfg, &b);
+    if (!opened) T(settle_backend_probe(e) == 0);
     T(dup2(saved_stderr, STDERR_FILENO) >= 0);
     T(opened == 0);
     T(editor_get_stats(e).backend_init_error == (injected ? RENDER_ERR_INIT : RENDER_ERR_UNSUPPORTED));
@@ -1829,7 +1839,7 @@ static int selected_backend_test(const char *name, bool require_gl)
     int fd = mkstemp(path); SELECT_T(fd >= 0); path_created = true; close(fd);
     editor_config cfg = {.cols = 40, .rows = 8, .journal_path = path, .raster_fallback = true,
         .hook_ctx = &c, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
-    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle(e) == 0);
+    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle_backend_probe(e) == 0);
     SELECT_T(!require_gl || (b.info.capabilities & RENDER_CAP_GPU));
     for (unsigned i = 0; i < 10000; i += 100) {
         for (unsigned j = 0; j < 100; j++) {
@@ -1847,7 +1857,7 @@ static int selected_backend_test(const char *name, bool require_gl)
     /* Same idle fixture as idle_policy, without a journal deadline. Test both
      * natural Xvfb EGL failure and the explicit raster override. */
     SELECT_T(editor_backend_select(&b, name) == 0); cfg.journal_path = NULL;
-    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle(e) == 0);
+    SELECT_T(editor_open(&e, &cfg, &b) == 0); SELECT_T(settle_backend_probe(e) == 0);
     SELECT_T(!require_gl || (b.info.capabilities & RENDER_CAP_GPU));
     uint64_t deadline = trace_now_ns() + UINT64_C(15000000000);
     while (editor_get_stats(e).blinking && trace_now_ns() < deadline) SELECT_T(editor_step(e, -1) >= 0);

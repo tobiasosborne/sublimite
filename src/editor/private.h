@@ -65,6 +65,14 @@ typedef struct editor_buffer {
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
 typedef struct editor_clip editor_clip;
 typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
+typedef struct editor_backend_init {
+    render_backend backend;
+    render_config config;
+    void *state;
+    work_handle handle;
+    int result;
+    bool received, pending;
+} editor_backend_init;
 struct editor {
     editor_clip *clipboard;
     editor_config cfg;
@@ -86,7 +94,10 @@ struct editor {
     editor_session *session;
     int session_lock;
     bool recovering, startup_restored, save_flushing, recover_existing, session_lock_owned;
-    work_pool pool, journal_pool;
+    work_pool pool, journal_pool, startup_pool;
+    editor_backend_init startup;
+    render_backend retired_backend;
+    bool startup_pool_ready, startup_presented;
     bool journal_pool_ready;
     uint8_t journal_scratch[JOURNAL_INSERT_SLICE_BYTES];
     uint8_t *journal_tabs, *journal_tabs_cached;
@@ -183,6 +194,10 @@ int editor_replace_delete(editor *e, uint64_t off, uint64_t len);
 int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t len);
 int editor_replace_end(editor *e, uint64_t target);
 
+int editor_backend_init_sync(editor *e, render_config config, void *state);
+int editor_backend_start_probe(editor *e, render_backend backend, render_config config, void *state);
+int editor_backend_poll_probe(editor *e);
+void editor_backend_close_probe(editor *e);
 bool editor_activation_busy(const editor *e);
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);

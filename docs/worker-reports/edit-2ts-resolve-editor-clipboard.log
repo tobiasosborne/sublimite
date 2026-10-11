@@ -1,0 +1,7 @@
+waiting for display :99 (held by unknown)
+clipboard malloc guard: 0 allocations (ASan-inert); expected zero by law
+clipboard: null round trip, UTF-8/CRLF, replacement, cut/undo, alternate keys, PRIMARY passed
+clipboard bulk: worker queue, cross-slice CRLF, replacement/undo, journal, mallocs=0 passed
+clipboard middle click: deep horizontal position exact
+clipboard PRIMARY: queued selection/collapse/middle paste waits for latest capture, mallocs=0 passed
+clipboard middle click: no active tab preserves placeholder

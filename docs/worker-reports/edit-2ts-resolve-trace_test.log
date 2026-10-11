@@ -1,0 +1,5 @@
+G1 T4-T0       n=100 p50=50000 ns p99=99000 ns
+G3 T5-T0       n=100 p50=100000 ns p99=198000 ns
+T6-T0          n=100 p50=150000 ns p99=297000 ns
+input append: malloc guard inactive (ASan build), count check skipped
+trace_test: PASS

@@ -1,0 +1,405 @@
+{
+  "results": [
+    {
+      "name": "base_test",
+      "status": 0,
+      "source": "make check"
+    },
+    {
+      "name": "cli_test",
+      "status": 1,
+      "source": "make check"
+    },
+    {
+      "name": "editor_close_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "editor_large_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "editor_p4_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "editor_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "file_kill_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "file_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_bench_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_bestof_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_p1r_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_simd_filter_verify_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "find_timeout_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "findui_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "font_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "gl_gate_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "gl_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "harness_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "indent_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "ipc_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "journal_kill_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "journal_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "keys_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "layout_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "lineidx_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "minimap_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "piece_bounds_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "piece_mem_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "piece_mt_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "piece_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "prewake_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "raster_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "refproto_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "refwin_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "refwin_timeout_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "render_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "replay_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "runtime_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "savectl_reload_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "savectl_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "scan_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "scroll_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "startup_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "tabs_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "trace_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "undo_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "unicode_render_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "utf8_tables_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "utf8_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "view_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "work_foreground_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "work_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "wrap_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_alignment_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_clip_review_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_clip_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_display_guard_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_identity_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_input_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_live_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_order_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_stall_test",
+      "status": 1,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "x11_xi2_test",
+      "status": 0,
+      "source": "continued sanitizer run"
+    },
+    {
+      "name": "replay_cli",
+      "status": 0,
+      "source": "shell contract"
+    },
+    {
+      "name": "display_lock_contract",
+      "status": 0,
+      "source": "shell contract"
+    }
+  ],
+  "passed": [
+    "base_test",
+    "file_test",
+    "find_bench_test",
+    "find_bestof_test",
+    "find_p1r_test",
+    "find_simd_filter_verify_test",
+    "find_test",
+    "find_timeout_test",
+    "findui_test",
+    "font_test",
+    "gl_gate_test",
+    "gl_test",
+    "harness_test",
+    "indent_test",
+    "journal_kill_test",
+    "journal_test",
+    "keys_test",
+    "layout_test",
+    "lineidx_test",
+    "minimap_test",
+    "piece_bounds_test",
+    "piece_mem_test",
+    "piece_mt_test",
+    "piece_test",
+    "prewake_test",
+    "render_test",
+    "replay_test",
+    "runtime_test",
+    "savectl_reload_test",
+    "savectl_test",
+    "scan_test",
+    "scroll_test",
+    "tabs_test",
+    "trace_test",
+    "undo_test",
+    "unicode_render_test",
+    "utf8_tables_test",
+    "utf8_test",
+    "view_test",
+    "work_foreground_test",
+    "work_test",
+    "wrap_test",
+    "x11_alignment_test",
+    "x11_display_guard_test",
+    "x11_input_test",
+    "x11_xi2_test",
+    "replay_cli",
+    "display_lock_contract"
+  ],
+  "failed": [
+    "cli_test",
+    "editor_close_test",
+    "editor_large_test",
+    "editor_p4_test",
+    "editor_test",
+    "file_kill_test",
+    "ipc_test",
+    "raster_test",
+    "refproto_test",
+    "refwin_test",
+    "refwin_timeout_test",
+    "startup_test",
+    "x11_clip_review_test",
+    "x11_clip_test",
+    "x11_identity_test",
+    "x11_live_test",
+    "x11_order_test",
+    "x11_stall_test"
+  ],
+  "count_derivation": "count is len(results); each row is one named suite or shell contract"
+}

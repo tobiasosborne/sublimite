@@ -1,0 +1,26 @@
+[
+  {
+    "name": "trace_test",
+    "command": [
+      "build/san/tests/trace_test"
+    ],
+    "status": 0,
+    "seconds": 0.075
+  },
+  {
+    "name": "render_test",
+    "command": [
+      "build/san/tests/render_test"
+    ],
+    "status": 0,
+    "seconds": 0.119
+  },
+  {
+    "name": "startup_test",
+    "command": [
+      "build/san/tests/startup_test"
+    ],
+    "status": 0,
+    "seconds": 0.22
+  }
+]

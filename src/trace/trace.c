@@ -2,6 +2,7 @@
 #include "trace_fmt.h"
 
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <string.h>
 #include <time.h>
 
@@ -17,6 +18,20 @@ static atomic_uint g_next_ring;
 static trace_input_rec g_in[TRACE_INPUT_CAP];
 static uint64_t g_in_total;
 static _Thread_local trace_ring *tl_ring;
+/* Derived capacity: one retained stamp for each startup enum member. */
+#define TRACE_STARTUP_COUNT (TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START)
+static _Atomic uint64_t g_startup[TRACE_STARTUP_COUNT];
+
+static bool startup_event(enum trace_ev ev) {
+    return ev >= TRACE_STARTUP_PROCESS_START && ev < TRACE_EV_COUNT;
+}
+uint64_t trace_startup_get(enum trace_ev ev) {
+    return startup_event(ev) ? atomic_load(&g_startup[ev - TRACE_STARTUP_PROCESS_START]) : 0;
+}
+static void startup_put(uint64_t ns, enum trace_ev ev) {
+    uint64_t absent = 0;
+    (void)atomic_compare_exchange_strong(&g_startup[ev - TRACE_STARTUP_PROCESS_START], &absent, ns);
+}
 
 void trace_init(void) {
     for (uint32_t i = 0; i < TRACE_MAX_THREADS; i++) {
@@ -25,6 +40,7 @@ void trace_init(void) {
     }
     atomic_store(&g_next_ring, 0u);
     g_in_total = 0;
+    for (size_t i = 0; i < TRACE_STARTUP_COUNT; i++) atomic_store(&g_startup[i], 0);
 }
 
 int trace_thread_register(void) {
@@ -55,19 +71,17 @@ uint64_t trace_now_ns(void) {
 }
 
 void trace_record(enum trace_ev ev, uint32_t frame_id) {
-    trace_ring *r = tl_ring;
-    if (r == NULL) {
-        return;
-    }
-    ring_put(r, trace_now_ns(), ev, frame_id);
+    if (startup_event(ev) && trace_startup_get(ev)) return;
+    trace_record_at(trace_now_ns(), ev, frame_id);
 }
 
 void trace_record_at(uint64_t ns, enum trace_ev ev, uint32_t frame_id) {
+    if (startup_event(ev)) { startup_put(ns, ev); return; }
+    /* plat_init already emits its exact display-connect timestamp with this
+     * legacy marker. Retain it without changing the native protocol module. */
+    if (ev == TRACE_T1_DEQUEUE && frame_id == 0) startup_put(ns, TRACE_STARTUP_DISPLAY_CONNECT);
     trace_ring *r = tl_ring;
-    if (r == NULL) {
-        return;
-    }
-    ring_put(r, ns, ev, frame_id);
+    if (r != NULL) ring_put(r, ns, ev, frame_id);
 }
 
 void trace_reset(void) {
@@ -75,6 +89,7 @@ void trace_reset(void) {
         g_rings[i].total = 0;
     }
     g_in_total = 0;
+    for (size_t i = 0; i < TRACE_STARTUP_COUNT; i++) atomic_store(&g_startup[i], 0);
 }
 
 int trace_dump(FILE *f) {
@@ -82,6 +97,9 @@ int trace_dump(FILE *f) {
     if (used > TRACE_MAX_THREADS) {
         used = TRACE_MAX_THREADS;
     }
+    size_t startup_count = 0;
+    for (size_t i = 0; i < TRACE_STARTUP_COUNT; i++) if (atomic_load(&g_startup[i])) startup_count++;
+    if (!used && startup_count) used = 1;
     /* Header and per-ring blocks: layout is defined in trace_fmt.h. */
     char magic[8] = { 'E', 'D', 'T', 'R', 'A', 'C', 'E', '1' };
     uint32_t hdr[4];
@@ -94,10 +112,18 @@ int trace_dump(FILE *f) {
 
     for (unsigned i = 0; i < used; i++) {
         const trace_ring *r = &g_rings[i];
-        uint64_t count = r->total < TRACE_RING_CAP ? r->total : TRACE_RING_CAP;
+        size_t retained = i == 0 ? startup_count : 0;
+        uint64_t room = TRACE_RING_CAP - retained;
+        uint64_t count = r->total < room ? r->total : room;
         uint64_t start = r->total - count;
-        uint32_t blk[2] = { r->index, (uint32_t)count };
+        uint32_t blk[2] = { r->index, (uint32_t)(count + retained) };
         if (fwrite(blk, sizeof blk[0], 2, f) != 2) return -1;
+        if (i == 0) for (size_t stage = 0; stage < TRACE_STARTUP_COUNT; stage++) {
+            uint64_t ns = atomic_load(&g_startup[stage]);
+            if (!ns) continue;
+            trace_rec rec = {ns, 0, (uint16_t)(TRACE_STARTUP_PROCESS_START + stage), 0};
+            if (fwrite(&rec, sizeof rec, 1, f) != 1) return -1;
+        }
         for (uint64_t k = 0; k < count; k++) {
             const trace_rec *rec = &r->recs[(start + k) & (TRACE_RING_CAP - 1u)];
             if (fwrite(rec, sizeof *rec, 1, f) != 1) return -1;

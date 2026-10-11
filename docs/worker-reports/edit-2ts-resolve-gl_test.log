@@ -1,0 +1,50 @@
+gl_bench: INJECTED stage=integrated-bytes
+gl_bench: INJECTED stage=integrated-tree
+gl_bench: INJECTED stage=integrated-snapshot
+gl_bench: INJECTED stage=integrated-index
+gl_bench: INJECTED stage=integrated-find
+gl_bench: INJECTED stage=integrated-save
+gl_bench: INJECTED stage=self-overlap
+gl_bench: INJECTED stage=arena
+edit-d5o GL: map-only owned snapshot, texture upload off UI, opaque BGRA, mailbox completion passed
+gl_test: snapshot input->submit: 10000 frames per VBO mode incl. changing atlas, 0 allocations, no native calls
+gl_test: trace dispatch unit PASS (bounded fence poll, original frame T5/T6, stale/duplicate rejection; scripted native dispatch)
+gl_test: cell ring PASS (triple wrap, timeout/failed fences, lease revocation, retained cells, retry, copy fallback, terminal failed lease, 0 allocations)
+gl_test: paced persistent scroll PASS (merged callback, lease reacquire/revoke, retained rows, ring wrap, 0 allocations; scripted completion)
+gl_test: section 5 integrated acquisition faults PASS (bytes/tree/snapshot/index/find/save)
+gl_bench: index_fixture progress=1048576 lines=16385 exact=1 expected=16385 building=0 failed=0
+gl_bench: integrated_self_check kind=0 module=lineidx same_pool=1 correct=1
+gl_bench: integrated_self_check kind=1 module=find_literal same_pool=1 correct=1
+gl_bench: integrated_self_check kind=2 module=file_save_write same_pool=1 correct=1
+gl_bench: integrated_self_check kind=3 module=queued3 same_pool=1 correct=1
+gl_test: renderer pool shared=1
+gl_test: P2-1 section 35 PASS (renderer and contention share workers)
+gl_test: P2-1 section 19 PASS (bulk-only refused; raster/foreground completion with blocked shared bulk)
+gl_test: P2-1 section 18 PASS (timeout followed by late success/failure)
+gl_test: P2-1 section 17 PASS (final and repeated failed-init display teardown)
+gl_bench: bulk_self_check jobs=1 active_kind=0 shared_pool=1 chunks_in_200ms=399 overlapped=1 evidence=(M) power=[AC]
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+gl_test: section 5 stage=arena injected cleanup PASS
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[AC]
+gl_test: section 5 stage=prepare SKIP: native prerequisite unavailable; fault not reached
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[AC]
+gl_test: section 5 stage=init SKIP: native prerequisite unavailable; fault not reached
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[AC]
+gl_test: section 5 stage=bulk SKIP: native prerequisite unavailable; fault not reached
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[AC]
+gl_test: section 5 stage=frame SKIP: native prerequisite unavailable; fault not reached
+TRACK name=A_egl_scroll_600_15px status=SKIP verdict=TRACK reason=Xvfb_:99_has_no_real_vblank frames=0 requested_frames=600 evidence=(M)[AC] power_status="Charging" load1=28.38
+BENCH name=egl_init_15px status=SKIP reason=X11_unavailable result=-10 power=[AC]
+gl_test: section 5 stage=integrated SKIP: native prerequisite unavailable; fault not reached
+gl_test: P2-1 section 5 PASS (arena/driver acquisition, active contention failure cleanup; native stages conditional)
+gl_test: P2-1 section 2 PASS (null/raster diagnostics, missing GL state)
+gl_review: native diagnostics SKIP: Xvfb/EGL context unavailable (result=-10; :99 has no DRI3)
+gl_review: section=4 PASS (Skip fails without T6; Copy, Flip, SuboptimalCopy displayed)
+gl_review: section=5 PASS (untyped MSC notices before/after PIXMAP cannot poison completion)
+gl_review: section=8 PASS (early descriptor cap, bounded unused table, zero damage, runtime pixel budget, no allocation)
+gl_review: section=12 PASS (actual platform dispatch, startup serials, exactly one original-frame T6)
+gl_test: PASS (pure snapshot/completion/trace checks; native diagnostics SKIP)

@@ -1,0 +1,2 @@
+render no-malloc: ASan guard inactive; release run required
+render_test: PASS (strips, bounds, cells, lifecycle, ownership, hooks, allocator)

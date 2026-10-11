@@ -1,0 +1,4 @@
+startup measurement stamp (M)[bat]: BAT0=Discharging; origin=headless open harness; ms=ns/1000000 (SI)
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup_test: FAIL poll(&ready, 1, 0) == 0
+startup_test: FAIL held_case(false) == 0

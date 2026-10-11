@@ -1,0 +1,78 @@
+[
+  {
+    "name": "all",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test"
+    ],
+    "status": 1,
+    "seconds": 133.87
+  },
+  {
+    "name": "minimap-flash",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--minimap-flash"
+    ],
+    "status": 0,
+    "seconds": 0.221
+  },
+  {
+    "name": "clipboard",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--clipboard"
+    ],
+    "status": 0,
+    "seconds": 1.881
+  },
+  {
+    "name": "ck4-save",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--ck4-save"
+    ],
+    "status": 0,
+    "seconds": 0.271
+  },
+  {
+    "name": "fallback",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--fallback"
+    ],
+    "status": 1,
+    "seconds": 0.174
+  },
+  {
+    "name": "gpu-completion",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--gpu-completion"
+    ],
+    "status": 0,
+    "seconds": 0.219
+  },
+  {
+    "name": "require-gl",
+    "command": [
+      "sh",
+      "tools/with_display_lock.sh",
+      "build/san/tests/editor_test",
+      "--require-gl"
+    ],
+    "status": 1,
+    "seconds": 0.175
+  }
+]

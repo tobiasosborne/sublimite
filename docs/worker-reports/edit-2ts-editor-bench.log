@@ -1,0 +1,9 @@
+STAMP (M)[bat] BAT0=Discharging load1=28.37 shared box
+BACKEND requested=null actual=null init_error=0 TARGET A=2880x1800 font_px=30 (M)[bat]
+POSITION null byte=17 index=published workload=serial edits=alternating_insert_backspace
+BENCH name=editor_null_serial_injection_submit n=10000 required_n=10000 p50=145101 p99=3492681 ci95_p50=[142026,148435] ci95_p99=[3441377,3639498] gate_p50=0 gate_p99=0 dropped=0 (M)[bat] power=Discharging load1=28.37 verdict=TRACK
+BENCH name=editor_null_serial_dequeue_submit n=10000 required_n=10000 p50=129082 p99=1437245 ci95_p50=[126491,132027] ci95_p99=[1142793,2236548] gate_p50=0 gate_p99=0 dropped=0 (M)[bat] power=Discharging load1=28.37 verdict=TRACK
+BENCH name=editor_null_serial_injection_T4_G1 n=10000 required_n=10000 p50=146012 p99=3495194 ci95_p50=[143084,149215] ci95_p99=[3444756,3693215] gate_p50=1000000 gate_p99=2000000 dropped=0 (M)[bat] power=Discharging load1=28.37 verdict=TRACK
+G1 null workload=serial keys=10000 completed=10000 arrivals_active=0 coalesced=0 allocations=0 mutations=10000 journal=10000 structural=OK mode=TRACK (M)[bat]
+STAMP (M)[bat] BAT0=Discharging load1=28.58 shared box
+editor_bench:519 failed: editor_open(&e, &cfg, &b) == 0

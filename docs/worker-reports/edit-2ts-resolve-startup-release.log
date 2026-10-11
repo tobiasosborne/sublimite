@@ -1,0 +1,31 @@
+startup measurement stamp (M)[AC]: BAT0=Charging; origin=headless open harness; ms=ns/1000000 (SI)
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=76426762272104 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=76426773236385 elapsed_ms=10.964281
+  egl_probe_end        ns=76426773951150 elapsed_ms=11.679046
+  raster_fallback      ns=76426771315424 elapsed_ms=9.043320
+  font_atlas_ready     ns=76426762992264 elapsed_ms=0.720160
+  file_prefix_read     ns=76426773440419 elapsed_ms=11.168315
+  first_layout         ns=76426773566579 elapsed_ms=11.294475
+  first_submit         ns=76426773776480 elapsed_ms=11.504376
+  first_present        ns=76426773777502 elapsed_ms=11.505398
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: failing probe: text and typing submitted/presented while held; allocations=0 guard=active
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=76426778635838 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=76426788146610 elapsed_ms=9.510772
+  egl_probe_end        ns=76426788593999 elapsed_ms=9.958161
+  raster_fallback      ns=76426787943488 elapsed_ms=9.307650
+  font_atlas_ready     ns=76426779262063 elapsed_ms=0.626225
+  file_prefix_read     ns=76426788237052 elapsed_ms=9.601214
+  first_layout         ns=76426788105675 elapsed_ms=9.469837
+  first_submit         ns=76426788485727 elapsed_ms=9.849889
+  first_present        ns=76426788486971 elapsed_ms=9.851133
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+startup_test: successful probe: text and typing submitted/presented while held; allocations=0 guard=active
+startup_test: startup stamps survive frame-ring wrap and round-trip; reset clears them

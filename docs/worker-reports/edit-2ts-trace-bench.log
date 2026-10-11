@@ -1,0 +1,5 @@
+POWER status=Discharging (M)[bat] load1=18.41
+trace_record   n=10^6 batches=1000 x 1000: p50=33 ns p99=3047 ns (gate p50 < 50)
+clock_gettime  (reference, same method): p50=28 ns p99=40 ns
+trace_input    n=10^6 batches=1000 x 1000: p50=7 ns p99=37 ns (gate p50 < 50) (M)[Discharging]
+trace_bench: PASS

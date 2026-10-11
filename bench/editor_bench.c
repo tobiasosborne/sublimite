@@ -92,6 +92,18 @@ static int settle_ready(editor *e)
         }
     } while (true);
 }
+/* Backend rows name the final selection, not the raster bootstrap. Reuse
+ * this harness's existing settle watchdog: 5000000000 ns / 1000000000 ns/s
+ * = 5 s (G, harness liveness only); no production startup deadline is added. */
+static int settle_backend_probe(editor *e)
+{
+    uint64_t deadline = bench_now_ns() + UINT64_C(5000000000);
+    while (e->startup.pending) {
+        REQUIRE(editor_step(e, 20) >= 0); /* existing settle polling cadence */
+        REQUIRE(bench_now_ns() < deadline);
+    }
+    return settle(e);
+}
 static plat_event event(bool back)
 {
     plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = back ? XKB_KEY_BackSpace : XKB_KEY_x};
@@ -229,6 +241,7 @@ static int idle_row(const char *requested, bool track, bool require_gl, bool qua
      * worker and is an upper bound on summed per-thread running time. */
     editor_config cfg = target_a_config(); cfg.raster_fallback = true;
     editor *e = NULL; REQUIRE(editor_open(&e, &cfg, &b) == 0);
+    REQUIRE(settle_backend_probe(e) == 0);
     REQUIRE(!require_gl || strcmp(requested, "gl") || (b.info.capabilities & RENDER_CAP_GPU));
     REQUIRE(b.config.dims.cols * b.config.dims.cell_w == 2880);
     REQUIRE(b.config.dims.rows * b.config.dims.cell_h == 1800);
@@ -504,6 +517,7 @@ static int typing_row(const char *requested, size_t count, bool track, bool requ
     cfg.hook_ctx = &measured; cfg.on_ingress = ingress; cfg.on_submit = submitted;
     cfg.on_present = presented; cfg.on_io = io_boundary; cfg.raster_fallback = true;
     TYPING_REQUIRE(editor_open(&e, &cfg, &b) == 0);
+    TYPING_REQUIRE(settle_backend_probe(e) == 0);
     TYPING_REQUIRE(!require_gl || strcmp(requested, "gl") || (b.info.capabilities & RENDER_CAP_GPU));
     TYPING_REQUIRE(b.config.dims.cols * b.config.dims.cell_w == 2880);
     TYPING_REQUIRE(b.config.dims.rows * b.config.dims.cell_h == 1800);

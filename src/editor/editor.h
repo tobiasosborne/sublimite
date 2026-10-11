@@ -35,7 +35,7 @@ typedef struct editor_config {
     size_t arena_bytes, history_keys; /* open-time bounds; zero selects defaults */
     size_t tab_capacity, closed_capacity; /* defaults: 128 live, 16 retained */
     bool start_empty;                 /* startup request supplies initial tabs */
-    bool raster_fallback;             /* GPU init failure: one CPU init attempt */
+    bool raster_fallback;             /* raster paints while GPU init runs; no retry */
     int wrap_mode;                    /* 0=file default, -1=off, +1=on */
     ipc_server *server;               /* borrowed; UI-owned, fini after close */
     bool (*allow_close)(void *, uint64_t id, bool modified);
@@ -65,7 +65,9 @@ typedef struct editor_stats {
 
 /* UI-owned, no copies. The factory-filled backend is borrowed exclusively and
  * outlives editor_close. Open reserves memory, starts workers, opens/maps the
- * file and initialises the backend on a worker. The loop routes native
+ * file and initialises the backend on a worker. With raster_fallback, raster
+ * (null for headless descriptors) paints while an independent GPU worker runs;
+ * successful GPU adoption waits for bootstrap presentation/retirement. The loop routes native
  * completion callbacks and polls only an outstanding presented GPU frame.
  * Copy-mode files larger than the bounded prefix publish a read-only preview
  * while open_pending is true. Queued keys wait for whole-source adoption;
@@ -77,7 +79,8 @@ int editor_source_resolve(editor *e, bool reload);
 int editor_open(editor **out, const editor_config *config, render_backend *backend);
 /* Setup only. NULL selects EGL; explicit gl/raster overrides for tests/benches.
  * Unknown names fail without changing the backend. Set raster_fallback at open
- * to retain an editor after EGL/GL/Present init fails. No runtime retries. */
+ * to paint on raster during EGL discovery and retain it after init failure.
+ * No runtime retries. Strict no-fallback selection retains synchronous init. */
 int editor_backend_select(render_backend *backend, const char *name);
 void editor_close(editor *e);
 /* Fixed queue; stamp ingress when drained by step, not when injected. Native

@@ -1,0 +1,17 @@
+startup (M): elapsed_ms=(stage_ns-process_start_ns)/1000000 (SI)
+  process_start        ns=76308246584058 elapsed_ms=0.000000
+  display_connect      not recorded
+  egl_probe_start      ns=76308265661749 elapsed_ms=19.077691
+  egl_probe_end        ns=76308268213066 elapsed_ms=21.629008
+  raster_fallback      ns=76308262875123 elapsed_ms=16.291065
+  font_atlas_ready     ns=76308247513522 elapsed_ms=0.929464
+  file_prefix_read     ns=76308266501000 elapsed_ms=19.916942
+  first_layout         ns=76308263799722 elapsed_ms=17.215664
+  first_submit         ns=76308267636150 elapsed_ms=21.052092
+  first_present        ns=76308267640704 elapsed_ms=21.056646
+  egl_load_start       not recorded
+  egl_load_end         not recorded
+G1 T4-T0     n=1 p50=0.459 ms p99=0.459 ms
+G3 T5-T0     n=1 p50=0.459 ms p99=0.459 ms
+T6-T0        n=1 p50=0.459 ms p99=0.459 ms
+battery: Charging
