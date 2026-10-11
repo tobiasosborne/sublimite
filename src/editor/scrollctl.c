@@ -72,7 +72,7 @@ int editor_scroll_init(editor *e, editor_buffer *b)
     int rc = editor_scroll_retire(b); if (rc) return rc;
     rc = install(b); if (rc) return rc;
     rc = scroll_init(&b->scroll, config(e), extent(b, b->scroll_resident.snapshot.len));
-    if (!rc) { b->scroll_ready = true; b->scroll_display = b->scroll; b->scroll_prefix = lineidx_built_prefix(b->index); }
+    if (!rc) { b->scroll_ready = true; b->scroll_display = b->scroll; b->scroll_display_stale = false; b->scroll_prefix = lineidx_built_prefix(b->index); }
     return rc;
 }
 void editor_scroll_mirror(editor *e)
@@ -120,7 +120,7 @@ bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approxima
     if (scroll_seek_line(&placed, line) || placed.first_line != line) return false;
     placed.first_byte = byte; placed.anchor_line = line;
     placed.request = SCROLL_READY; placed.pending_rows = 0;
-    b->scroll = b->scroll_display = placed;
+    b->scroll = b->scroll_display = placed; b->scroll_display_stale = false;
     b->scroll_resolver = b->scroll_follow_resolver = (scroll_resolver){0};
     b->scroll_following = b->scroll_pending = false;
     b->scroll_prefix = lineidx_built_prefix(b->index);
@@ -139,7 +139,7 @@ int editor_scroll_follow(editor *e)
         b->scroll.first_byte = e->repair_line_byte; b->scroll.first_line = e->repair_line_number;
         b->scroll.anchor_line = b->scroll.first_line; b->scroll.pending_rows = 0;
         b->scroll.request = SCROLL_READY;
-        b->scroll_display = b->scroll; b->scroll_following = b->scroll_pending = false;
+        b->scroll_display = b->scroll; b->scroll_display_stale = false; b->scroll_following = b->scroll_pending = false;
     }
     /* The prepared row starts are already resident and certified by layout.
      * An ordinary edit/motion inside them needs no new raw-source window and
@@ -159,7 +159,7 @@ int editor_scroll_follow(editor *e)
             if (rc) return rc;
             if (followed.first_line == b->scroll.first_line) {
                 b->scroll = followed; b->scroll_following = b->scroll_pending = false;
-                b->scroll_display = b->scroll;
+                b->scroll_display = b->scroll; b->scroll_display_stale = false;
                 break;
             }
         }
@@ -175,22 +175,50 @@ int editor_scroll_follow(editor *e)
         if (followed.first_line == e->v.state.first_line) {
             followed.first_byte = e->v.state.first_byte;
             followed.anchor_line = followed.first_line; followed.approximate = false;
-            b->scroll = b->scroll_display = followed;
+            b->scroll = b->scroll_display = followed; b->scroll_display_stale = false;
             b->scroll_following = b->scroll_pending = false;
         }
+    }
+    if (b->scroll_display_stale && !view_busy(&e->v) && e->v.state.first_byte <= piece_len(e->tree)) {
+        /* A completed view restore/repair has normalized the transformed top
+         * to a line start and labelled it (view.c P_NORMAL_SETUP). Display
+         * that until the pending seek/follow resolves the scroll policy's top;
+         * never the pre-edit byte (edit-d50 fix). */
+        scroll_state *d = &b->scroll_display;
+        d->first_byte = e->v.state.first_byte; d->first_line = d->anchor_line = e->v.state.first_line;
+        d->approximate = e->v.state.approximate; d->subrow_q8 = 0;
+        b->scroll_display_stale = false;
     }
     editor_scroll_mirror(e);
     if (!b->scroll_pending) b->scroll_prefix = lineidx_built_prefix(b->index);
     return 0;
 }
-int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add)
+int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t old_nl, uint64_t new_nl)
 {
     if (e->v.state.wrap) return 0;
     editor_buffer *b = e->buffer;
-    b->scroll = b->scroll_display; /* a mutation cancels unpublished navigation */
-    uint64_t anchor = b->scroll.first_byte;
+    /* The displayed top is a position in the pre-edit text. Transform it
+     * with the edit rather than leave it for the resolver: an undo that
+     * removes text above it would otherwise lay out a stale byte, past EOF
+     * or mid-line under the old label (edit-d50 fix). Wholly above the top
+     * is an exact shift. An edit at the top byte leaves it a labelled line
+     * start. One that replaces the byte before it loses the label. */
+    scroll_state *d = &b->scroll_display;
+    uint64_t top = d->first_byte, anchor = top;
     if (anchor >= off + old) anchor = anchor - old + add;
     else if (anchor >= off) anchor = off;
+    if (top > off + old) {
+        d->first_line = d->first_line - old_nl + new_nl; d->anchor_line = d->first_line;
+        d->first_byte = anchor;
+    } else if (top > off) {
+        d->first_byte = anchor; b->scroll_display_stale = true;
+    }
+    if (d->first_byte != top) {
+        /* The view normalizes this byte to a line start and labels it. */
+        e->v.state.first_byte = e->v.state.visual_byte = d->first_byte;
+        if (!b->scroll_display_stale) e->v.state.first_line = d->first_line;
+    }
+    b->scroll = b->scroll_display; /* a mutation cancels unpublished navigation */
     b->scroll_resolver = (scroll_resolver){0}; b->scroll_following = false;
     int rc = scroll_set_extent(&b->scroll, extent(b, piece_len(e->tree)));
     if (!rc) rc = editor_scroll_seek(e, anchor);
@@ -270,7 +298,7 @@ adopted:
         e->v.state.first_line != b->scroll.first_line ||
         e->v.state.approximate != b->scroll.approximate ||
         before.subrow_q8 != b->scroll.subrow_q8;
-    b->scroll_display = b->scroll;
+    b->scroll_display = b->scroll; b->scroll_display_stale = false;
     editor_scroll_mirror(e);
     scroll_frame_plan plan;
     int planned = scroll_plan_frame(&b->scroll, e->text_grid.dims.cols * e->grid.dims.cell_w,

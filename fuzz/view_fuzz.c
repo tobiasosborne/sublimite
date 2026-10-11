@@ -187,6 +187,42 @@ static int structured_checkpoint(void *ctx, const piece_tree *tree, uint64_t lin
     else { *byte=end+1; *col=0; }
     return 1;
 }
+/* edit-d50: pure command plans must preserve their source and fit every
+ * successful replacement/selection in the resulting buffer. Output reserve
+ * and canary derive from VIEW_WINDOW plus one sentinel byte. */
+static void default_plan_probe(view *v, const uint8_t *model, size_t n, uint8_t choice)
+{
+    typedef int (*prepare)(const view *, uint8_t *, size_t, view_edit_plan *);
+    const prepare commands[] = {view_duplicate_line, view_delete_line,
+        view_move_line_up, view_move_line_down, view_join_lines,
+        view_insert_line_after, view_insert_line_before, view_delete_to_bol,
+        view_delete_to_eol, view_delete_to_soft_bol, view_delete_to_soft_eol,
+        view_unindent, view_transpose, view_upper_case, view_lower_case};
+    uint8_t output[VIEW_WINDOW + 1u], original[CAP];
+    size_t cap = (size_t)choice * (VIEW_WINDOW / (UINT8_MAX + 1u));
+    memset(output, 0xa5, sizeof output); /* sentinel, not a size/budget */
+    view_state saved = v->state; view_edit_plan plan;
+    int rc;
+    if (choice & 0x80u) {
+        const char *paths[] = {"fixture.c", "fixture.py", "fixture.css", "fixture.html", "fixture.lua", "fixture.sql", "fixture.sh", "fixture.txt"};
+        rc = view_toggle_comment(v, paths[choice % (sizeof paths / sizeof paths[0])],
+            (choice & 1u) != 0, output, cap, &plan);
+    } else if (choice & 0x10u) {
+        if (choice & 1u) rc = view_skip_next_occurrence(v, &plan);
+        else if (v->state.selection.cursor == v->state.selection.anchor) rc = view_select_word(v, &plan);
+        else rc = VIEW_ERR_ARG;
+    } else if (choice & 0x40u) rc = view_sort_lines(v, (choice & 1u) != 0, output, cap, &plan);
+    else if (choice & 0x20u) rc = view_indent(v, (choice & 1u) != 0, output, cap, &plan);
+    else rc = commands[choice % (sizeof commands / sizeof commands[0])](v, output, cap, &plan);
+    EDIT_ASSERT(output[cap] == 0xa5);
+    EDIT_ASSERT(memcmp(&saved, &v->state, sizeof saved) == 0);
+    EDIT_ASSERT(piece_len(v->tree) == n && piece_read(v->tree, 0, original, n) == 0 && memcmp(original, model, n) == 0);
+    if (!rc) {
+        EDIT_ASSERT(plan.offset <= n && plan.old_len <= n - plan.offset && plan.length <= cap);
+        size_t result = n - (size_t)plan.old_len + plan.length;
+        EDIT_ASSERT(plan.selection.cursor <= result && plan.selection.anchor <= result);
+    }
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if(size<2) return 0;
@@ -267,5 +303,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         EDIT_ASSERT(motion_matches(&v,&expected,model,n));
     }
+    default_plan_probe(&v, model, n, data[size - 1u]);
     piece_destroy(tree); edit_arena_free(&arena); return 0;
 }

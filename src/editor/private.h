@@ -17,6 +17,7 @@
 #include "editor/large_private.h"
 #include "editor/runtime.h"
 #include "scroll/scroll.h"
+#include <limits.h>
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
 #define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
@@ -29,6 +30,7 @@ typedef struct editor_piece_storage {
     bool ready;
 } editor_piece_storage;
 typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; } editor_delta;
+typedef struct editor_soft_delta { view_selection before, after; uint64_t serial; bool text; } editor_soft_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
 typedef struct editor_session editor_session;
 typedef struct editor_buffer {
@@ -54,9 +56,17 @@ typedef struct editor_buffer {
     bool journal_view_valid;
     lineidx *index;
     editor_delta *history;
+    editor_soft_delta *soft_history;
+    size_t soft_head, soft_count, soft_cursor;
+    size_t soft_base_redo; /* completed text undos preceding retained selection records */
     size_t history_head, history_count, history_cursor, history_cap;
     uint64_t id, lines, revision, history_serial, source_generation;
     bool last_repeat;
+    bool overwrite, mark_valid;
+    bool last_key_valid;
+    plat_event last_key;
+    const keys_binding *last_binding;
+    view_selection mark;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
     size_t find_leases;
@@ -76,6 +86,10 @@ typedef struct editor_buffer {
     view_state initial;
     scroll_state scroll;
     scroll_state scroll_display;
+    /* edit-d50 fix: an edit straddled the displayed top. Its byte was moved
+     * onto the edit but its line label is unknown until view normalization
+     * or the resident resolver certifies one (editor_scroll_follow). */
+    bool scroll_display_stale;
     scroll_resolver scroll_resolver;
     scroll_resolver scroll_follow_resolver;
     scroll_resident scroll_resident;
@@ -89,7 +103,17 @@ typedef struct editor_buffer {
 typedef struct editor_hit { uint64_t before, after; uint32_t within, width; } editor_hit;
 typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
 typedef struct editor_clip editor_clip;
-typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
+/* A decimal digit carries at least one bit. The uint64_t bit width is a
+ * conservative bound on decimal input length, plus a NUL for rendering. */
+typedef struct editor_goto {
+    char digits[sizeof(uint64_t) * CHAR_BIT + 1u];
+    size_t length, cursor;
+    uint64_t line, owner, generation;
+    view_state original;
+    scroll_state original_scroll; /* displayed 3kk top before the prompt */
+    bool active, selected, valid, accept;
+} editor_goto;
+typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_GOTO, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
 typedef struct editor_backend_init {
     render_backend backend;
     render_config config;
@@ -151,6 +175,7 @@ struct editor {
     size_t find_range_count;
     uint64_t find_window_start, find_window_end;
     edit_arena find_arena;
+    editor_goto go;
     editor_wait waits[IPC_MAX_CLIENTS];
     int poll_fd;
     file *opening;
@@ -204,6 +229,14 @@ struct editor {
     uint64_t replay_old_nl, replay_before_len;
     bool replay_redo;
     bool explicit_group;
+    bool edit_selection_valid;
+    bool selection_command, soft_replaying;
+    bool replay_anchor_trusted;
+    plat_event command_key;
+    const keys_binding *command_binding;
+    uint64_t command_sequence;
+    size_t soft_target;
+    view_selection edit_selection;
     unsigned source_choice;
     uint64_t source_choice_id, source_choice_generation;
     uint64_t event_serial, dispatch_serial, queue_serial[EDITOR_INPUT_CAP];
@@ -250,6 +283,11 @@ struct editor {
     int64_t wrap_wheel_rows;
     int raster_poll_fd;
     uint8_t *indent_bytes;
+    /* Kill top derives its reserve from the existing synchronous view window.
+     * Sublime's yank reads only the top entry; history cycling needs a panel. */
+    uint8_t kill_bytes[VIEW_WINDOW];
+    size_t kill_len;
+    uint64_t kill_at, kill_buffer;
     indent_range *ws_ranges;
     size_t ws_count;
     uint64_t bracket_source, bracket_mate;
@@ -327,13 +365,15 @@ int editor_scroll_slice(editor *e);
 int editor_scroll_follow(editor *e);
 bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approximate);
 int editor_scroll_seek(editor *e, uint64_t byte);
-int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add);
+int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t old_nl, uint64_t new_nl);
 int editor_scroll_resize(editor *e);
 void editor_scroll_mirror(editor *e);
 bool editor_scroll_waiting(const editor *e);
 void editor_refresh_complete(void *ctx, uint32_t id, uint64_t ns);
 void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);
+void editor_goto_overlay(editor *e);
+int editor_goto_cancel(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
                           size_t len, editor_buffer **out);

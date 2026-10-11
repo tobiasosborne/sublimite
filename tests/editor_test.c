@@ -72,6 +72,7 @@ static int expect(editor *e, const char *text, uint64_t cursor)
 {
     uint8_t bytes[256]; size_t n = strlen(text);
     T(editor_length(e) == n); T(editor_read(e, 0, bytes, n) == 0);
+    if (memcmp(bytes, text, n)) fprintf(stderr, "expected text: [%s]\nactual text: [%.*s]\n", text, (int)n, bytes);
     T(memcmp(bytes, text, n) == 0); T(editor_view(e).selection.cursor == cursor);
     return 0;
 }
@@ -300,6 +301,785 @@ static int selection_chord(editor *e, uint32_t sym, uint16_t mods,
     T(s.cursor == cursor); T(s.anchor == anchor);
     return 0;
 }
+/* edit-d50: every byte offset is (G), derived from the literal prefix.
+ * Grid and undo assertions reuse the selection-chord fixture and one-command
+ * contract. Run all cases on red so each action has independent evidence. */
+typedef struct default_edit_case {
+    const char *name, *before, *cursor_prefix, *anchor_prefix, *after;
+    const char *after_cursor_prefix, *after_anchor_prefix;
+    uint32_t sym;
+    uint16_t mods;
+    bool chord;
+} default_edit_case;
+#define D50_CS (PLAT_MOD_CTRL | PLAT_MOD_SHIFT)
+static int default_edit_case_path(const default_edit_case *test, int wrap_mode, const char *path)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)test->before,
+        .initial_len = strlen(test->before), .cols = sizeof "alpha beta gamma delta!",
+        .rows = 2u + 1u, /* text-row pair plus tab row, as selection_chords */
+        .wrap_mode = wrap_mode, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    if (path) {
+        snprintf(e->buffer->path, sizeof e->buffer->path, "%s", path);
+        /* (G) Four spaces are the installed default tab_size, as used by
+         * min_indent_lines; pin it rather than depending on auto-detection. */
+        e->buffer->style.width = sizeof "    " - 1u;
+        e->v.config.tab_width = e->buffer->style.width;
+        e->lay.tab = e->lay.cfg.tab_width = e->buffer->style.width;
+    }
+    e->v.state.selection.cursor = strlen(test->cursor_prefix);
+    e->v.state.selection.anchor = strlen(test->anchor_prefix);
+    view_selection before = e->v.state.selection;
+    undo_history history = undo_get_history(e->undo);
+    if (test->chord) T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(test->sym, test->mods, NULL)) == 0);
+    T(expect(e, test->after, strlen(test->after_cursor_prefix)) == 0);
+    T(editor_view(e).selection.anchor == strlen(test->after_anchor_prefix));
+    T(editor_get_stats(e).unimplemented_actions == 0);
+    T(undo_get_history(e->undo).undo_groups == history.undo_groups + 1u); /* one command */
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, test->before, before.cursor) == 0);
+    T(editor_view(e).selection.anchor == before.anchor);
+    T(press(e, key(XKB_KEY_z, D50_CS, NULL)) == 0);
+    T(expect(e, test->after, strlen(test->after_cursor_prefix)) == 0);
+    T(editor_view(e).selection.anchor == strlen(test->after_anchor_prefix));
+    T(count.allocations == 0); /* law: no input-path malloc */
+    editor_close(e); return 0;
+}
+static int default_edit_case_run(const default_edit_case *test, int wrap_mode)
+{ return default_edit_case_path(test, wrap_mode, NULL); }
+/* (G) Comment tokens come from the installed C++ Comments.tmPreferences.
+ * Prefix lengths derive byte positions; newline endpoints exclude the next
+ * line exactly as the existing line-command fixtures do. */
+static int default_comments(void)
+{
+    const default_edit_case cases[] = {
+        {"comment caret", "  abc\ndef", "  a", "  a", "  // abc\ndef", "  // a", "  // a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"uncomment caret", "  // abc", "  // a", "  // a", "  abc", "  a", "  a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"uncomment compact", "  //abc", "  //a", "  //a", "  abc", "  a", "  a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"comment backward lines", "  abc\n    def\nghi", "  a", "  abc\n    def\n", "  // abc\n  //   def\nghi", "  // a", "  // abc\n  //   def\n", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"comment ignores blank", "  abc\n\n    def", "  abc\n\n    def", "", "  // abc\n\n  //   def", "  // abc\n\n  //   def", "", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"comment CRLF", "abc\r\ndef", "a", "a", "// abc\r\ndef", "// a", "// a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"uncomment mixed lines", "// abc\n  //def", "// abc\n  //def", "", "abc\n  def", "abc\n  def", "", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"comment mixed lines", "// abc\ndef", "// abc\ndef", "", "// // abc\n// def", "// // abc\n// def", "", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"block selection", "abc def", "abc", "", "/*abc*/ def", "/*abc*/", "", XKB_KEY_slash, D50_CS, false},
+        {"block backward selection", "abc def", "", "abc", "/*abc*/ def", "", "/*abc*/", XKB_KEY_slash, D50_CS, false},
+        {"block caret", "abc", "a", "a", "a/**/bc", "a/*", "a/*", XKB_KEY_slash, D50_CS, false},
+        {"unblock selection", "/*abc*/ def", "/*abc*/", "", "abc def", "abc", "", XKB_KEY_slash, D50_CS, false},
+        {"unblock inner caret", "/*abc*/ def", "/*a", "/*a", "abc def", "a", "a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"block shortcut removes line comment", "// abc", "// a", "// a", "abc", "a", "a", XKB_KEY_slash, D50_CS, false},
+        {"comment mixed tabs aligns columns", "\tabc\n  def", "\tabc\n  def", "", "// \tabc\n  // def", "// \tabc\n  // def", "", XKB_KEY_slash, PLAT_MOD_CTRL, false}
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int rc = default_edit_case_path(&cases[i], -1, "fixture.c");
+        if (!rc) rc = default_edit_case_path(&cases[i], 1, "fixture.c");
+        printf("default comment: %s: %s\n", cases[i].name, rc ? "FAIL" : "PASS");
+        failures |= rc;
+    }
+    const default_edit_case language[] = {
+        {"Python line", "  abc", "  a", "  a", "  # abc", "  # a", "  # a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"Python block fallback", "  abc", "  a", "  a", "  # abc", "  # a", "  # a", XKB_KEY_slash, D50_CS, false},
+        {"CSS line fallback", "  abc", "  a", "  a", "  /*abc*/", "  /*a", "  /*a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"HTML line fallback", "  abc", "  a", "  a", "  <!-- abc -->", "  <!-- a", "  <!-- a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"HTML compact removal", "<!--abc-->", "<!--a", "<!--a", "abc", "a", "a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"HTML shared space removal", "<!-- -->", "<!-- ", "<!-- ", " ", " ", " ", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"C quoted delimiter", "char *s = \"/*abc*/\";", "char *s = \"/*a", "char *s = \"/*a", "// char *s = \"/*abc*/\";", "// char *s = \"/*a", "// char *s = \"/*a", XKB_KEY_slash, PLAT_MOD_CTRL, false},
+        {"C all blank lines", "  \n\n", "  \n\n", "", "//   \n// \n", "//   \n// \n", "", XKB_KEY_slash, PLAT_MOD_CTRL, false}
+    };
+    const char *paths[] = {"fixture.py", "fixture.py", "fixture.css", "fixture.html", "fixture.html", "fixture.html", "fixture.c", "fixture.c"};
+    for (size_t i = 0; i < sizeof language / sizeof language[0]; i++) {
+        int rc = default_edit_case_path(&language[i], -1, paths[i]);
+        if (!rc) rc = default_edit_case_path(&language[i], 1, paths[i]);
+        printf("default comment: %s: %s\n", language[i].name, rc ? "FAIL" : "PASS");
+        failures |= rc;
+    }
+    return failures;
+}
+
+/* edit-d50 fix: an undo that removes text at or above an unwrapped
+ * viewport's top must never lay out the pre-edit top byte. Every submitted
+ * frame's top is checked against the live tree: within the text, a line start,
+ * and labelled with that line. (G) Forty "lineNN\n" lines of seven bytes, the
+ * "// " C token from default_comments, five text rows plus the tab row. */
+typedef struct top_probe { counted count; editor *e; size_t frames, bad; } top_probe;
+static void top_ingress(void *ctx, uint64_t seq, uint64_t ns) { ingress(&((top_probe *)ctx)->count, seq, ns); }
+static void top_submit(void *ctx, const editor_frame *frame)
+{
+    top_probe *p = ctx; submitted(&p->count, frame);
+    if (!p->e || p->e->v.state.wrap) return;
+    editor *e = p->e; uint64_t top = e->lay.first_byte, total = piece_len(e->tree);
+    uint8_t before = '\n';
+    bool ok = top <= total && (!top || (piece_read(e->tree, top - 1u, &before, 1) == 0 && before == '\n')) &&
+        (top > total || e->lay.first_line == piece_byte_to_line(e->tree, top));
+    if (!ok) fprintf(stderr, "undo_shrink_top: frame top byte %llu line %llu, total %llu\n",
+                     (unsigned long long)top, (unsigned long long)e->lay.first_line, (unsigned long long)total);
+    p->frames++; p->bad += !ok;
+}
+static int undo_shrink_case(int variant)
+{
+    enum { LINES = 40, LINE = sizeof "lineNN\n" - 1u };
+    char text[LINES * LINE + 1u];
+    for (unsigned i = 0; i < LINES; i++) snprintf(text + i * LINE, LINE + 1u, "line%02u\n", i);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    top_probe probe = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = LINES * LINE,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 5u + 1u, .wrap_mode = -1,
+        .hook_ctx = &probe, .on_ingress = top_ingress, .on_submit = top_submit};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    snprintf(e->buffer->path, sizeof e->buffer->path, "%s", "fixture.c");
+    probe.e = e;
+    if (variant == 2) {
+        /* Comment only the first ten lines; the top is then scrolled to EOF. */
+        e->v.state.selection.anchor = 0; e->v.state.selection.cursor = 10u * LINE;
+    } else T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_slash, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_length(e) > LINES * LINE);
+    if (variant) {
+        /* (G) Wheel notches of SCROLL_CORE_ROWS rows: up fifteen rows from
+         * the EOF page (top line 36 to 21, inside the commented text), or
+         * down LINES notches so the top clips to the last page. */
+        plat_event wheel = {.kind = PLAT_EV_WHEEL,
+            .dy = variant == 1 ? -(int32_t)(SCROLL_WHEEL_UNIT * (15u / SCROLL_CORE_ROWS)) : (int32_t)(SCROLL_WHEEL_UNIT * LINES)};
+        T(press(e, wheel) == 0);
+    }
+    uint64_t top = editor_view(e).first_byte;
+    T(top > 0);
+    size_t bad = probe.bad, frames = probe.frames;
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    uint8_t now[LINES * LINE];
+    T(editor_length(e) == LINES * LINE && editor_read(e, 0, now, LINES * LINE) == 0);
+    T(memcmp(now, text, LINES * LINE) == 0);
+    T(editor_view(e).selection.cursor == (variant == 2 ? 10u * LINE : LINES * LINE));
+    T(probe.frames > frames && probe.bad == bad);
+    view_state v = editor_view(e);
+    T(v.first_byte <= editor_length(e) && v.first_line == piece_byte_to_line(e->tree, v.first_byte));
+    T(probe.count.allocations == 0); /* law: no input-path malloc */
+    editor_close(e); return 0;
+}
+static int undo_shrink_top(void)
+{
+    static const char *names[] = {"follow at EOF", "scrolled into the edit", "edit above a scrolled top"};
+    int failures = 0;
+    for (int i = 0; i < 3; i++) {
+        int rc = undo_shrink_case(i);
+        printf("undo shrink top: %s: %s\n", names[i], rc ? "FAIL" : "PASS");
+        failures |= rc;
+    }
+    return failures;
+}
+/* edit-d50: go-to-line drives the unwrapped 3kk scroll state. (G) 400
+ * "lineNNN\n" rows of eight bytes, five text rows plus the tab row; the
+ * target "300" is 0-based line 299; ten wheel notches of SCROLL_CORE_ROWS
+ * put the pre-prompt top at line 30, away from both the caret and line 0. */
+static int goto_scroll_case(bool accept)
+{
+    enum { LINES = 400, LINE = sizeof "lineNNN\n" - 1u, TARGET = 299 };
+    static char text[LINES * LINE + 1u];
+    for (unsigned i = 0; i < LINES; i++) snprintf(text + i * LINE, LINE + 1u, "line%03u\n", i);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    top_probe probe = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = LINES * LINE,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 5u + 1u, .wrap_mode = -1,
+        .hook_ctx = &probe, .on_ingress = top_ingress, .on_submit = top_submit};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    probe.e = e;
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .dy = (int32_t)(SCROLL_WHEEL_UNIT * 10u)};
+    T(press(e, wheel) == 0);
+    uint64_t top = e->lay.first_line, top_byte = e->lay.first_byte;
+    T(top == 10u * SCROLL_CORE_ROWS && editor_view(e).selection.cursor == 0);
+    uint32_t rows = e->v.config.rows;
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_3, 0, "3")) == 0); T(press(e, key(XKB_KEY_0, 0, "0")) == 0);
+    T(press(e, key(XKB_KEY_0, 0, "0")) == 0);
+    /* Preview: the submitted frame shows the target line. */
+    T(editor_view(e).selection.cursor == TARGET * LINE);
+    T(e->lay.first_line <= TARGET && TARGET < e->lay.first_line + rows);
+    T(editor_view(e).first_line == e->lay.first_line);
+    if (accept) {
+        T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+        T(editor_view(e).selection.cursor == TARGET * LINE);
+        T(e->lay.first_line <= TARGET && TARGET < e->lay.first_line + rows);
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0); /* the next motion keeps it there */
+        T(e->lay.first_line <= TARGET && TARGET < e->lay.first_line + rows);
+    } else {
+        T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+        T(editor_view(e).selection.cursor == 0);
+        T(e->lay.first_line == top && e->lay.first_byte == top_byte);
+        T(editor_view(e).first_line == top);
+    }
+    T(probe.bad == 0 && probe.count.allocations == 0);
+    editor_close(e); return 0;
+}
+static int goto_scroll(void)
+{
+    int a = goto_scroll_case(true), c = goto_scroll_case(false);
+    printf("default goto: unwrapped preview/accept scrolls to the target: %s\n", a ? "FAIL" : "PASS");
+    printf("default goto: Escape restores the pre-prompt top: %s\n", c ? "FAIL" : "PASS");
+    return a | c;
+}
+/* (G) Line numbers count the literal newline-separated lines from one;
+ * byte positions are sizeof literal prefixes minus the NUL terminator. */
+static int default_goto(void)
+{
+    static const char text[] = "alpha\r\nbeta\ngamma\n";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 1u,
+        .wrap_mode = -1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, sizeof "al" - 1u) == 0); T(settle(e) == 0);
+    view_state original = editor_view(e); uint64_t revision = e->buffer->revision;
+    undo_history history = undo_get_history(e->undo);
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    const char prompt[] = "Go to line: :";
+    for (size_t i = 0; i < sizeof prompt - 1u; i++)
+        T(e->grid.cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols + i].glyph_index == (uint8_t)prompt[i]);
+    T(press(e, key(XKB_KEY_2, 0, "2")) == 0);
+    T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0); /* preview */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(expect(e, text, original.selection.cursor) == 0);
+    T(editor_view(e).selection.anchor == original.selection.anchor);
+    T(editor_view(e).first_byte == original.first_byte);
+    T(e->buffer->soft_count == 0); /* a cancelled preview is no selection command */
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_2, 0, "2")) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_x, 0, "x")) == 0);
+    T(expect(e, "alpha\r\nxbeta\ngamma\n", sizeof "alpha\r\nx" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_9, 0, "9")) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0); /* empty query restores origin */
+    T(press(e, key(XKB_KEY_3, 0, "3")) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(expect(e, text, sizeof "alpha\r\nbeta\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_9, 0, "99")) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0); /* clamp past last line */
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_0, 0, "0")) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(expect(e, text, 0) == 0);
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    /* (G) UINT64_MAX + one in decimal is outside the parser range.
+     * Type one byte per event to honor PLAT_UTF8_MAX. */
+    const char overflow[] = "18446744073709551616";
+    for (size_t i = 0; i < sizeof overflow - 1u; i++) {
+        char digit[] = {overflow[i], 0};
+        T(press(e, key((uint32_t)(uint8_t)overflow[i], 0, digit)) == 0);
+    }
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0); /* overflow stays in prompt */
+    T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_3, 0, "3")) == 0);
+    T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Delete, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_2, 0, "2")) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, 0) == 0); /* accept creates one soft selection step */
+    T(e->buffer->revision > revision); /* only the explicit x edit and its undo */
+    T(undo_get_history(e->undo).undo_groups == history.undo_groups);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); puts("default goto: prompt/preview/cancel/accept/edit/overflow/soft undo: PASS"); return 0;
+}
+
+/* (G) A chunk pair ensures the query crosses the index's own chunk boundary;
+ * line count and target offset derive by repeating the literal row. Replacing
+ * the fixture's index before input makes every answer initially inexact. */
+static int default_goto_cold(void)
+{
+    const char row[] = "aa\n";
+    static uint8_t text[2u * LINEIDX_CHUNK];
+    size_t lines = sizeof text / (sizeof row - 1u), length = lines * (sizeof row - 1u);
+    for (size_t i = 0; i < lines; i++) memcpy(text + i * (sizeof row - 1u), row, sizeof row - 1u);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0}; editor_config cfg = {.initial = text, .initial_len = length,
+        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(length); T(e->buffer->index);
+    T(lineidx_build_reserve(e->buffer->index) == 0); e->buffer->index_dirty = false;
+    T(!lineidx_complete(e->buffer->index));
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    char number[sizeof "18446744073709551615"];
+    int n = snprintf(number, sizeof number, "%zu", lines); T(n > 0 && (size_t)n < sizeof number);
+    for (size_t i = 0; i < (size_t)n; i++) {
+        char digit[] = {number[i], 0}; T(press(e, key((uint8_t)number[i], 0, digit)) == 0);
+    }
+    T(editor_view(e).selection.cursor == (lines - 1u) * (sizeof row - 1u));
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0); T(editor_view(e).selection.cursor == 0);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(undo_get_history(e->undo).undo_groups == 0);
+    T(editor_length(e) == length); T(count.allocations == 0);
+    editor_close(e); puts("default goto: cold index seek across chunk boundary: PASS"); return 0;
+}
+
+/* (G) Selected word boundaries are the literal prefixes, including UTF-8
+ * byte lengths. Ctrl+D's first expansion does not create text history. */
+static int default_word(void)
+{
+    const char *texts[] = {"alpha beta", "fooBar_baz", "naïve café", "abc"};
+    const char *positions[] = {"al", "fooB", "naïve ca", "abc"};
+    const char *anchors[] = {"", "", "naïve ", ""};
+    const char *cursors[] = {"alpha", "fooBar_baz", "naïve café", "abc"};
+    int failures = 0;
+    for (size_t i = 0; i < sizeof texts / sizeof texts[0]; i++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)texts[i],
+            .initial_len = strlen(texts[i]), .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u,
+            .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        e->v.state.selection.cursor = e->v.state.selection.anchor = strlen(positions[i]);
+        uint64_t revision = e->buffer->revision;
+        T(press(e, key(XKB_KEY_d, PLAT_MOD_CTRL, NULL)) == 0);
+        int rc = editor_view(e).selection.cursor != strlen(cursors[i]) ||
+            editor_view(e).selection.anchor != strlen(anchors[i]);
+        printf("default word: %s: %s\n", texts[i], rc ? "FAIL" : "PASS");
+        failures |= rc;
+        if (!rc) {
+            T(editor_get_stats(e).unimplemented_actions == 0);
+            T(expect(e, texts[i], strlen(cursors[i])) == 0);
+            T(e->buffer->revision == revision); T(undo_get_history(e->undo).undo_groups == 0);
+            T(press(e, key(XKB_KEY_d, PLAT_MOD_CTRL, NULL)) == 0);
+            T(expect(e, texts[i], strlen(cursors[i])) == 0);
+            T(editor_view(e).selection.anchor == strlen(anchors[i]));
+            T(editor_get_stats(e).unimplemented_actions == 1u); /* unavailable multicaret expansion */
+            T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+            T(expect(e, texts[i], strlen(positions[i])) == 0);
+            T(editor_view(e).selection.anchor == strlen(positions[i]));
+            T(count.allocations == 0);
+        }
+        editor_close(e);
+    }
+    return failures;
+}
+
+/* (G) Center row = floor(text rows / two), from the meaning of center.
+ * Fixture offsets are literal prefixes. No viewport command edits history. */
+static int default_center(void)
+{
+    const char *texts[] = {"a\nb\nc\nd\ne\nf\ng", "abc def ghi jkl mno pqr stu vwx"};
+    const char *positions[] = {"a\nb\nc\nd\ne", "abc def ghi jkl mno pqr st"};
+    const char *firsts[] = {"a\nb\nc\n", "abc def ghi jkl "};
+    int failures = 0;
+    for (size_t i = 0; i < sizeof texts / sizeof texts[0]; i++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)texts[i], .initial_len = strlen(texts[i]),
+            .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u),
+            .rows = (sizeof "abc" - 1u) + 1u, /* text row trio + tab row */
+            .wrap_mode = i ? 1 : -1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        T(editor_set_cursor(e, strlen(positions[i])) == 0); T(settle(e) == 0);
+        view_selection selection = editor_view(e).selection;
+        uint64_t revision = e->buffer->revision;
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+        int rc = (i ? editor_view(e).visual_byte : editor_view(e).first_byte) != strlen(firsts[i]);
+        printf("default center: %s: %s\n", i ? "wrapped rows" : "hard lines", rc ? "FAIL" : "PASS");
+        failures |= rc;
+        if (!rc) {
+            T(expect(e, texts[i], selection.cursor) == 0); T(editor_view(e).selection.anchor == selection.anchor);
+            T(e->buffer->revision == revision); T(undo_get_history(e->undo).undo_groups == 0);
+            T(e->buffer->soft_count == 0); T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+        }
+        editor_close(e);
+    }
+    return failures;
+}
+static int default_skip(void)
+{
+    const char text[] = "abc xx abc yy abc";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->v.state.selection = (view_selection){sizeof "abc" - 1u, 0, VIEW_PREFERRED_UNSET};
+    uint64_t revision = e->buffer->revision;
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key(XKB_KEY_d, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "abc xx abc" - 1u) == 0);
+    T(editor_view(e).selection.anchor == sizeof "abc xx " - 1u);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "abc" - 1u) == 0); T(editor_view(e).selection.anchor == 0);
+    e->v.state.selection = (view_selection){sizeof "abc xx abc yy " - 1u, sizeof text - 1u, VIEW_PREFERRED_UNSET};
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key(XKB_KEY_d, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, 0) == 0); T(editor_view(e).selection.anchor == sizeof "abc" - 1u); /* wrap, preserve direction */
+    e->v.state.selection.cursor = e->v.state.selection.anchor = sizeof "abc x" - 1u;
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key(XKB_KEY_d, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "abc xx" - 1u) == 0); T(editor_view(e).selection.anchor == sizeof "abc " - 1u);
+    T(e->buffer->revision == revision); T(undo_get_history(e->undo).undo_groups == 0);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); puts("default skip: next/wrap/direction/empty selection/soft undo: PASS"); return 0;
+}
+
+static int default_edits(void)
+{
+    const default_edit_case cases[] = {
+        {"duplicate line", "abc\ndef", "a", "a", "abc\nabc\ndef", "abc\na", "abc\na", XKB_KEY_d, D50_CS, false},
+        {"duplicate backward selection", "abcd", "a", "abc", "abcbcd", "abc", "abcbc", XKB_KEY_d, D50_CS, false},
+        {"delete line", "abc\ndef", "a", "a", "def", "", "", XKB_KEY_k, D50_CS, false},
+        {"delete selected lines", "abc\ndef\nghi", "abc\ndef\n", "a", "ghi", "", "", XKB_KEY_k, D50_CS, false},
+        {"move line up", "abc\ndef\nghi", "abc\nd", "abc\nd", "def\nabc\nghi", "d", "d", XKB_KEY_Up, D50_CS, false},
+        {"move line down", "abc\ndef\nghi", "a", "a", "def\nabc\nghi", "def\na", "def\na", XKB_KEY_Down, D50_CS, false},
+        {"move final line up", "abc\ndef", "abc\nd", "abc\nd", "def\nabc", "d", "d", XKB_KEY_Up, D50_CS, false},
+        {"join lines", "abc\n  def", "a", "a", "abc def", "abc ", "abc ", XKB_KEY_j, D50_CS, false},
+        {"join selection whitespace endpoint", "a\n  bc", "a\n ", "", "a bc", "a ", "", XKB_KEY_j, D50_CS, false},
+        {"insert line after", "  abc\ndef", "  a", "  a", "  abc\n  \ndef", "  abc\n  ", "  abc\n  ", XKB_KEY_Return, PLAT_MOD_CTRL, false},
+        {"insert line before", "  abc\ndef", "  a", "  a", "  \n  abc\ndef", "  ", "  ", XKB_KEY_Return, D50_CS, false},
+        {"delete hard BOL", "abc\ndef", "ab", "ab", "c\ndef", "", "", XKB_KEY_BackSpace, D50_CS, false},
+        {"delete hard EOL", "abc\ndef", "a", "a", "a\ndef", "a", "a", XKB_KEY_Delete, D50_CS, false},
+        {"delete EOL chord", "abc\ndef", "a", "a", "a\ndef", "a", "a", XKB_KEY_k, PLAT_MOD_CTRL, true},
+        {"indent selected lines", "abc\ndef\nghi", "abc\ndef\n", "a", "    abc\n    def\nghi", "    abc\n    def\n", "    a", XKB_KEY_bracketright, PLAT_MOD_CTRL, false},
+        {"unindent selected lines", "    abc\n\tdef\nghi", "    abc\n\tdef\n", "    a", "abc\ndef\nghi", "abc\ndef\n", "a", XKB_KEY_bracketleft, PLAT_MOD_CTRL, false},
+        {"shift tab", "    abc", "    a", "    a", "abc", "a", "a", XKB_KEY_Tab, PLAT_MOD_SHIFT, false},
+        {"unindent mixed space/tab", " \tabc", " \ta", " \ta", "abc", "a", "a", XKB_KEY_bracketleft, PLAT_MOD_CTRL, false},
+        {"transpose", "abcd", "ab", "ab", "acbd", "acb", "acb", XKB_KEY_t, PLAT_MOD_CTRL, false},
+        {"transpose newline", "ab\ncd", "ab\n", "ab\n", "abc\nd", "abc\n", "abc\n", XKB_KEY_t, PLAT_MOD_CTRL, false},
+        {"uppercase selection", "aBc", "aBc", "", "ABC", "ABC", "", XKB_KEY_u, PLAT_MOD_CTRL, true},
+        {"lowercase word", "ABC def", "A", "A", "abc def", "a", "a", XKB_KEY_l, PLAT_MOD_CTRL, true},
+        {"uppercase Unicode word boundary", "abcé，def", "abcé，d", "abcé，d", "abcé，DEF", "abcé，D", "abcé，D", XKB_KEY_u, PLAT_MOD_CTRL, true},
+        {"sort insensitive", "b\nA\nc\n", "", "", "A\nb\nc\n", "A\nb\nc", "", XKB_KEY_F9, 0, false},
+        {"sort sensitive", "b\na\nC", "", "", "C\na\nb", "C\na\nb", "", XKB_KEY_F9, PLAT_MOD_CTRL, false},
+        {"uppercase expansion", "Straße", "Straße", "", "STRASSE", "STRASSE", "", XKB_KEY_u, PLAT_MOD_CTRL, true},
+        {"lowercase final sigma", "ΟΣ", "ΟΣ", "", "ος", "ος", "", XKB_KEY_l, PLAT_MOD_CTRL, true},
+        {"duplicate CRLF EOF", "abc\r\ndef", "abc\r\nd", "abc\r\nd", "abc\r\ndef\r\ndef", "abc\r\ndef\r\nd", "abc\r\ndef\r\nd", XKB_KEY_d, D50_CS, false},
+        {"insert CRLF EOF", "abc\r\ndef", "abc\r\nd", "abc\r\nd", "abc\r\ndef\r\n", "abc\r\ndef\r\n", "abc\r\ndef\r\n", XKB_KEY_Return, PLAT_MOD_CTRL, false}
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int rc = default_edit_case_run(&cases[i], -1);
+        if (!rc) rc = default_edit_case_run(&cases[i], 1); /* existing wrap config encodings */
+        printf("default editing: %s: %s\n", cases[i].name, rc ? "FAIL" : "PASS");
+        failures |= rc;
+    }
+    return failures;
+}
+
+static int default_state_case(unsigned which)
+{
+    static const char text[] = "fooBar_baz (abc)\ndef";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof text, .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    if (which == 0) {
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_ALT, NULL)) == 0);
+        T(expect(e, text, sizeof "foo" - 1u) == 0);
+        T(editor_view(e).selection.anchor == sizeof "foo" - 1u);
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_ALT | PLAT_MOD_SHIFT, NULL)) == 0);
+        T(expect(e, text, sizeof "fooBar" - 1u) == 0);
+        T(editor_view(e).selection.anchor == sizeof "foo" - 1u);
+        T(press(e, key(XKB_KEY_Left, PLAT_MOD_ALT | PLAT_MOD_SHIFT, NULL)) == 0);
+        T(expect(e, text, sizeof "foo" - 1u) == 0);
+        T(press(e, key(XKB_KEY_Left, PLAT_MOD_ALT, NULL)) == 0);
+        T(expect(e, text, 0) == 0); T(editor_view(e).selection.anchor == 0);
+    } else if (which == 1) {
+        T(press(e, key(XKB_KEY_Insert, 0, NULL)) == 0);
+        T(press(e, key('x', 0, "x")) == 0);
+        T(expect(e, "xooBar_baz (abc)\ndef", sizeof "x" - 1u) == 0);
+        T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, 0) == 0);
+        T(press(e, key(XKB_KEY_Insert, 0, NULL)) == 0);
+        T(press(e, key('x', 0, "x")) == 0);
+        T(expect(e, "xfooBar_baz (abc)\ndef", sizeof "x" - 1u) == 0);
+    } else if (which == 2) {
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_space, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, sizeof "f" - 1u) == 0);
+        T(editor_view(e).selection.anchor == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, 0) == 0); T(editor_view(e).selection.anchor == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, sizeof "f" - 1u) == 0); T(editor_view(e).selection.anchor == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0); /* collapse to selection end */
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0); /* advance by the next character */
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, sizeof "fo" - 1u) == 0); T(editor_view(e).selection.anchor == sizeof "fo" - 1u);
+    } else if (which == 3) {
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_space, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_w, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, "ooBar_baz (abc)\ndef", 0) == 0);
+        T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_y, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, sizeof "f" - 1u) == 0);
+        T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, "ooBar_baz (abc)\ndef", 0) == 0);
+        T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, text, sizeof "f" - 1u) == 0);
+    } else {
+        e->v.state.selection.cursor = e->v.state.selection.anchor = sizeof "fooBar_baz " - 1u;
+        if (which == 4) {
+            T(press(e, key(XKB_KEY_m, PLAT_MOD_CTRL, NULL)) == 0);
+            T(expect(e, text, sizeof "fooBar_baz (abc)" - 1u) == 0);
+            T(editor_view(e).selection.anchor == sizeof "fooBar_baz (abc)" - 1u);
+        } else {
+            T(press(e, key(XKB_KEY_m, D50_CS, NULL)) == 0);
+            T(expect(e, text, sizeof "fooBar_baz (abc" - 1u) == 0);
+            T(editor_view(e).selection.anchor == sizeof "fooBar_baz (" - 1u);
+        }
+    }
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); return 0;
+}
+static int default_soft_capacity(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .history_keys = sizeof "x" - 1u, /* retain the single edit in this fixture */
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "xabc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", 0) == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xabc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xabc", sizeof "xa" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", 0) == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xabc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xabc", sizeof "xa" - 1u) == 0);
+    T(count.allocations == 0); T(editor_get_stats(e).unimplemented_actions == 0);
+    editor_close(e); puts("default state: evicted text markers redo before their selection records: PASS"); return 0;
+}
+static int default_history_anchor(void)
+{
+    static const uint8_t mark[] = "\xcc\x81";
+    uint8_t text[sizeof "a" - 1u + VIEW_SCAN_BOUND + sizeof "x" - 1u];
+    text[0] = 'a';
+    for (size_t at = sizeof "a" - 1u; at < sizeof text - (sizeof "x" - 1u); at += sizeof mark - 1u)
+        memcpy(text + at, mark, sizeof mark - 1u);
+    text[sizeof text - 1u] = 'x';
+    const uint64_t anchor = sizeof text - (sizeof "x" - 1u); /* base + existing scan-bound combining bytes */
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = text, .initial_len = sizeof text,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->v.state.selection.cursor = 0; e->v.state.selection.anchor = anchor;
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0); T(expect(e, "x", 0) == 0);
+    plat_event undo_event = key(XKB_KEY_z, PLAT_MOD_CTRL, NULL);
+    T(editor_handle_key(e, &undo_event) == 0);
+    while (e->action == EDITOR_ACTION_REPLAY_WORK) T(editor_continue_action(e) == 0);
+    T(e->action == EDITOR_ACTION_NONE); /* trusted anchor must not add a normalization continuation */
+    T(editor_view(e).selection.cursor == 0 && editor_view(e).selection.anchor == anchor);
+    uint8_t actual[sizeof text]; T(editor_length(e) == sizeof text);
+    T(editor_read(e, 0, actual, sizeof actual) == 0 && memcmp(actual, text, sizeof text) == 0);
+    T(settle(e) == 0); T(count.allocations == 0);
+    editor_close(e); puts("default editing: undo preserves a trusted far anchor without a view continuation: PASS"); return 0;
+}
+static int default_notices(void)
+{
+    static uint8_t long_line[VIEW_SCAN_BOUND + sizeof "x" - 1u];
+    memset(long_line, 'a', sizeof long_line);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = long_line, .initial_len = sizeof long_line,
+        .cols = sizeof "not implemented", .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t revision = e->buffer->revision;
+    T(press(e, key(XKB_KEY_d, D50_CS, NULL)) == 0);
+    T(editor_length(e) == sizeof long_line); T(e->buffer->revision == revision);
+    T(editor_view(e).selection.cursor == 0 && editor_view(e).selection.anchor == 0);
+    T(undo_get_history(e->undo).undo_groups == 0);
+    T(editor_get_stats(e).unimplemented_actions == 1u); /* one refused command */
+    T(e->unimplemented_frame != 0); /* notice has a frame generation */
+    size_t binding_count; const keys_binding *bindings = keys_defaults(&binding_count);
+    for (size_t i = 0; i < binding_count; i++) if (bindings[i].args.flags & KEYS_ARG_UNIMPLEMENTED) {
+        /* edit-73j: the editor's find panel takes Ctrl+F, Ctrl+H and F3/Shift+F3
+         * before keymap lookup (findpanel.c editor_find_key); they are not notices. */
+        uint32_t sym = bindings[i].keysym; uint16_t mods = bindings[i].modifiers;
+        if (bindings[i].args.chord == KEYS_CHORD_NONE &&
+            ((mods == PLAT_MOD_CTRL && (sym == XKB_KEY_f || sym == XKB_KEY_h)) ||
+             (sym == XKB_KEY_F3 && !(mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER))))) continue;
+        uint64_t before = editor_get_stats(e).unimplemented_actions;
+        e->keys.chord = bindings[i].args.chord;
+        T(press(e, key(bindings[i].keysym, bindings[i].modifiers, "q")) == 0);
+        T(editor_get_stats(e).unimplemented_actions == before + 1u); /* one consumed binding */
+        T(editor_length(e) == sizeof long_line && e->buffer->revision == revision);
+        T(editor_view(e).selection.cursor == 0 && editor_view(e).selection.anchor == 0);
+        T(undo_get_history(e->undo).undo_groups == 0);
+    }
+    T(press(e, key('x', 0, "x")) == 0);
+    T(editor_length(e) == sizeof long_line + sizeof "x" - 1u);
+    uint8_t first; T(editor_read(e, 0, &first, sizeof first) == 0 && first == 'x');
+    T(editor_view(e).selection.cursor == sizeof "x" - 1u && editor_view(e).selection.anchor == sizeof "x" - 1u);
+    T(count.allocations == 0);
+    editor_close(e); puts("default editing: oversized command and every retained capability notice preserve text/selection/history: PASS"); return 0;
+}
+static int default_soft_lines(void)
+{
+    static const char text[] = "abc def ghi jkl";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u),
+        /* Gutter digit/space + row including its break space; minimap is disabled at this width. */
+        .rows = 2u + 1u, .wrap_mode = 1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(e->lay.text_cols == sizeof "abc def " - 1u);
+    T(e->lay.wrap_rows[0].end == sizeof "abc def " - 1u);
+    e->v.state.selection.cursor = e->v.state.selection.anchor = sizeof "ab" - 1u;
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abghi jkl", sizeof "ab" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "ab" - 1u) == 0);
+    T(press(e, key(XKB_KEY_Delete, D50_CS, NULL)) == 0);
+    T(expect(e, "ab", sizeof "ab" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    e->v.state.selection.cursor = e->v.state.selection.anchor = sizeof "abc def gh" - 1u;
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc def i jkl", sizeof "abc def " - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "abc def gh" - 1u) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, D50_CS, NULL)) == 0);
+    T(expect(e, "i jkl", 0) == 0);
+    T(count.allocations == 0); T(editor_get_stats(e).unimplemented_actions == 0);
+    editor_close(e); puts("default editing: soft-row and hard-line kill macros have distinct boundaries: PASS"); return 0;
+}
+static int default_chord_repeat(void)
+{
+    static const char text[] = "abc\ndef";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->v.state.selection.cursor = sizeof "abc" - 1u; e->v.state.selection.anchor = 0;
+    T(press(e, key(XKB_KEY_k, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "ABC\ndef", sizeof "ABC" - 1u) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Left, D50_CS, NULL)) == 0);
+    uint64_t sequence = editor_get_stats(e).input_sequence;
+    size_t frames = count.frames;
+    T(press(e, key(XKB_KEY_y, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "ABC\nDEF", sizeof "ABC\n" - 1u) == 0);
+    T(editor_view(e).selection.anchor == sizeof "ABC\nDEF" - 1u); /* retain backward selection */
+    T(editor_get_stats(e).input_sequence == sequence + 1u); /* one physical input */
+    T(count.frames == frames + 1u); /* one command's mutation-to-submit contract */
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "ABC\ndef", sizeof "ABC\n" - 1u) == 0);
+    T(editor_view(e).selection.anchor == sizeof "ABC\ndef" - 1u);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); puts("default editing: repeat retains chord arguments and groups undo: PASS"); return 0;
+}
+static int default_clipboard_line(void)
+{
+    static const char text[] = "alpha\nbeta";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "a" - 1u) == 0); T(editor_view(e).selection.anchor == sizeof "a" - 1u);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "alpha\nbetaalpha\n", sizeof "alpha\nbetaalpha\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "beta", 0) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof "a" - 1u) == 0); T(editor_view(e).selection.anchor == sizeof "a" - 1u);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); puts("default editing: copy/cut current line retains caret and undo selection: PASS"); return 0;
+}
+static int default_soft_history(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", 0) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "abc", sizeof "a" - 1u) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    T(expect(e, "xbc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "xbc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", sizeof "a" - 1u) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_u, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", 0) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "abc", sizeof "a" - 1u) == 0); T(editor_view(e).selection.anchor == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xbc", sizeof "x" - 1u) == 0);
+    T(press(e, key(XKB_KEY_u, D50_CS, NULL)) == 0);
+    T(expect(e, "xbc", sizeof "xb" - 1u) == 0);
+    T(editor_get_stats(e).unimplemented_actions == 0); T(count.allocations == 0);
+    editor_close(e); puts("default state: soft undo/redo interleaves selection and text: PASS"); return 0;
+}
+static int default_noop(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
+        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t revision = e->buffer->revision;
+    T(press(e, key(XKB_KEY_bracketleft, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "abc", 0) == 0); T(editor_view(e).selection.anchor == 0);
+    T(e->buffer->revision == revision);
+    T(undo_get_history(e->undo).undo_groups == 0);
+    editor_close(e); puts("default editing: unchanged unindent retains revision/history: PASS"); return 0;
+}
+static int default_states(void)
+{
+    const char *names[] = {"subword selection", "overwrite", "set/select/swap/clear mark", "delete mark/yank", "goto bracket", "select brackets"};
+    int failures = 0;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        int rc = default_state_case((unsigned)i);
+        printf("default state: %s: %s\n", names[i], rc ? "FAIL" : "PASS"); failures |= rc;
+    }
+    return failures;
+}
+#undef D50_CS
 static int selection_chords(void)
 {
     static const char text[] = "alpha beta gamma delta!\n"
@@ -369,10 +1149,13 @@ static int redo_or_repeat(void)
     T(editor_get_stats(e).unimplemented_actions == unimplemented);
     uint64_t mutations = editor_get_stats(e).mutations;
     T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0);
-    T(expect(e, text, sizeof text - 1u) == 0);
-    T(editor_get_stats(e).mutations == mutations); /* No repeat record exists. */
+    T(expect(e, "a\nbetaa\nbeta", 2u * (sizeof text - 1u)) == 0); /* repeated input */
+    T(editor_get_stats(e).mutations > mutations);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, text, sizeof text - 1u) == 0);
     T(press(e, key('Z', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(expect(e, "a\nbetaa\nbeta", 2u * (sizeof text - 1u)) == 0);
+    T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
     T(expect(e, text, sizeof text - 1u) == 0);
     /* Astra repro: line selection, deletion, undo, Ctrl+Y. */
     T(press(e, key('l', PLAT_MOD_CTRL, NULL)) == 0);
@@ -383,7 +1166,7 @@ static int redo_or_repeat(void)
     T(press(e, key('y', PLAT_MOD_CTRL, NULL)) == 0);
     T(expect(e, "a\n", sizeof "a\n" - 1u) == 0);
     T(!count.active && count.allocations == 0);
-    editor_close(e); puts("editor_test: Ctrl+Y redoes inserts/deletes, empty redo is inert, Ctrl+Shift+Z still redoes");
+    editor_close(e); puts("editor_test: Ctrl+Y redoes inserts/deletes, empty redo repeats the previous edit, Ctrl+Shift+Z still redoes");
     return 0;
 }
 static int panel_shortcuts(bool notice)
@@ -392,9 +1175,10 @@ static int panel_shortcuts(bool notice)
     static const char typed[] = "leftalpha right\nnext";
     static const char status[] = "not implemented";
     const struct { uint32_t sym; uint16_t mods; } shortcuts[] = {
-        {'F', PLAT_MOD_CTRL | PLAT_MOD_SHIFT}, {'p', PLAT_MOD_CTRL}, {'g', PLAT_MOD_CTRL}
+        {'F', PLAT_MOD_CTRL | PLAT_MOD_SHIFT}, {'p', PLAT_MOD_CTRL}
     }; /* Each entry derives from the brief's requested shortcut set, less
-        * Ctrl+F, Ctrl+H and F3, which open/drive the find panel (edit-73j). */
+        * Ctrl+F, Ctrl+H and F3, which open/drive the find panel (edit-73j),
+        * and Ctrl+G, which has its own executable prompt suite (edit-d50). */
     for (size_t i = 0; i < sizeof shortcuts / sizeof shortcuts[0]; i++) {
         render_backend b = {0}; T(render_null_backend(&b) == 0);
         counted count = {0};
@@ -2975,6 +3759,24 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--73j-mouse")) return mouse_contract();
         if (!strcmp(argv[1], "--73j-wheel")) return wheel_contract();
         if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
+        if (!strcmp(argv[1], "--default-soft-capacity")) return default_soft_capacity();
+        if (!strcmp(argv[1], "--default-history-anchor")) return default_history_anchor();
+        if (!strcmp(argv[1], "--default-notices")) return default_notices();
+        if (!strcmp(argv[1], "--default-soft-lines")) return default_soft_lines();
+        if (!strcmp(argv[1], "--default-repeat")) return default_chord_repeat();
+        if (!strcmp(argv[1], "--default-clipboard-line")) return default_clipboard_line();
+        if (!strcmp(argv[1], "--default-soft")) return default_soft_history();
+        if (!strcmp(argv[1], "--default-noop")) return default_noop();
+        if (!strcmp(argv[1], "--default-states")) return default_states();
+        if (!strcmp(argv[1], "--default-center")) return default_center();
+        if (!strcmp(argv[1], "--default-skip")) return default_skip();
+        if (!strcmp(argv[1], "--default-word")) return default_word();
+        if (!strcmp(argv[1], "--default-goto-cold")) return default_goto_cold();
+        if (!strcmp(argv[1], "--default-goto")) return default_goto();
+        if (!strcmp(argv[1], "--default-comments")) return default_comments();
+        if (!strcmp(argv[1], "--undo-shrink-top")) return undo_shrink_top();
+        if (!strcmp(argv[1], "--goto-scroll")) return goto_scroll();
+        if (!strcmp(argv[1], "--default-edits")) return default_edits();
         if (!strcmp(argv[1], "--selection-chords")) return selection_chords();
         if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
         if (!strcmp(argv[1], "--panel-state")) return panel_shortcuts(false);
@@ -3016,6 +3818,7 @@ int main(int argc, char **argv)
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
     T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);
     T(minimap_typing_flash() == 0);
+    T(default_center() == 0); T(default_skip() == 0); T(default_word() == 0); T(default_goto() == 0); T(default_goto_cold() == 0); T(default_comments() == 0); T(undo_shrink_top() == 0); T(goto_scroll() == 0); T(default_edits() == 0); T(default_states() == 0); T(default_noop() == 0); T(default_soft_history() == 0); T(default_clipboard_line() == 0); T(default_chord_repeat() == 0); T(default_soft_lines() == 0); T(default_notices() == 0); T(default_history_anchor() == 0); T(default_soft_capacity() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);

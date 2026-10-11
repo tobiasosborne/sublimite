@@ -370,3 +370,23 @@ void editor_hit_record(void *ctx, uint32_t row, uint32_t column, uint32_t count,
     for (uint32_t c=0;c<count;c++) e->hits[(size_t)row*e->max_cols+column+c]=
         (editor_hit){before,after,skip+c,width};
 }
+
+/* The prompt uses the existing status row and atlas. Its storage is embedded
+ * in the editor before input; editing it never touches the document/undo log. */
+void editor_goto_overlay(editor *e)
+{
+    const editor_goto *go = &e->go;
+    if (!go->active || go->owner != e->buffer->id || go->generation != e->buffer->source_generation ||
+        e->buffer->source_stale || !e->grid.dims.rows) return;
+    const char label[] = "Go to line: :";
+    size_t prefix = sizeof label - 1u;
+    uint32_t row = e->grid.dims.rows - 1u;
+    for (uint32_t col = 0; col < e->grid.dims.cols; col++) {
+        uint32_t ch = col < prefix ? (uint8_t)label[col] :
+            col - prefix < go->length ? (uint8_t)go->digits[col - prefix] : (uint32_t)' ';
+        uint16_t attrs = col == prefix + go->cursor ? RENDER_ATTR_UNDERLINE : 0;
+        uint32_t bg = go->selected && col >= prefix && col - prefix < go->length ? 0x53667e : 0x171b22;
+        e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){ch, ch - ' ', 0xe5e9f0, bg, attrs, 0};
+    }
+    (void)render_mark_rows(&e->grid, row, 1);
+}

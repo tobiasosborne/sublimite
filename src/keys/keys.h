@@ -6,8 +6,9 @@
 #include "x11/plat.h"
 
 /* Sublime Text Linux, installed build 4200, normal editor defaults.
- * IDs describe intent, not an executor. UNIMPLEMENTED means view.h cannot
- * execute the complete command (even if some other module offers primitives).
+ * IDs describe intent, not an executor. UNIMPLEMENTED marks a missing editor
+ * capability, including commands whose complete behaviour needs UI/state.
+ * SINGLE_SELECTION explicitly exposes the single-selection subset of a command.
  * Ordinary printable input is not a binding: insert plat_event.utf8 on NONE.
  * Release/non-key events must not be passed to keys_lookup. */
 typedef enum keys_action {
@@ -100,6 +101,10 @@ typedef enum keys_action {
 #define KEYS_ARG_PREFER_HIDE   UINT16_C(128)
 #define KEYS_ARG_NO_MOVE       UINT16_C(256)
 #define KEYS_ARG_SINGLE_LINE   UINT16_C(512)
+/* Next free capability bit: SINGLE_LINE << one. Ctrl+D selects at a caret;
+ * occurrence expansion with an existing selection remains unavailable.
+ * Ctrl+K Ctrl+D replaces the sole selection; no multiple-selection executor. */
+#define KEYS_ARG_SINGLE_SELECTION    (KEYS_ARG_SINGLE_LINE << 1)
 
 typedef enum keys_chord {
     KEYS_CHORD_NONE, KEYS_CHORD_K, KEYS_CHORD_J, KEYS_CHORD_COUNT

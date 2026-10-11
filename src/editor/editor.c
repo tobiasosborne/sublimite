@@ -156,6 +156,15 @@ int editor_full_layout(editor *e)
             .row_height = e->grid.dims.cell_h, .layout_rows = e->text_grid.dims.rows,
             .full_damage = true};
     }
+    uint64_t total = piece_len(e->tree);
+    if (s.first_byte > total) {
+        /* Defensive: never feed layout a top past EOF; editor_scroll_edit
+         * transforms the displayed top with every edit (edit-d50 fix). */
+        s.first_line = piece_byte_to_line(e->tree, total);
+        s.first_byte = piece_line_to_byte(e->tree, s.first_line);
+        e->v.state.first_byte = s.first_byte; e->v.state.first_line = s.first_line;
+    }
+    if (s.visual_byte > total) s.visual_byte = e->v.state.visual_byte = s.first_byte;
     uint32_t hs = s.hscroll > UINT32_MAX ? UINT32_MAX : (uint32_t)s.hscroll;
     layout_viewport vp = {s.first_byte, s.first_line, hs, e->buffer->lines};
     layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
@@ -370,13 +379,14 @@ static int submit(editor *e)
     /* A bounded consumer (including minimap) may adopt the final index range
      * after this turn's pump. Publish before this frame can leave the editor. */
     editor_large_index_progress(e);
-    if (e->op_count || editor_clip_busy(e) || editor_scroll_waiting(e) || e->action == EDITOR_ACTION_REPLAY_WORK || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
+    if (e->op_count || editor_clip_busy(e) || editor_scroll_waiting(e) || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     int metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     editor_save_overlay(e);
+    editor_goto_overlay(e);
     editor_large_index_progress(e);
     if (e->full_pending) return 0;
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
@@ -520,8 +530,11 @@ static int nonkey(editor *e, const plat_event *ev)
     }
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
     if (ev->kind == PLAT_EV_WHEEL) return editor_handle_wheel(e, ev);
-    if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
+    if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) {
+        if (e->go.active && (ev->kind == PLAT_EV_MOTION || !ev->press)) return 0;
+        if (e->go.active) { int cancel = editor_goto_cancel(e); if (cancel) return cancel; }
         return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);
+    }
     return 0;
 }
 void editor_restart_blink(editor *e, uint64_t now)
@@ -612,7 +625,7 @@ static bool runnable(const editor *e)
     return (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
            (editor_font_pending(e) && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
-           e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice ||
+           e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
@@ -714,6 +727,8 @@ int editor_step(editor *e, int timeout_ms)
             e->dispatch_serial = e->queue_serial[at];
             queue_remove(e, picked);
             rc = !live ? 0 : ev.kind == PLAT_EV_KEY ? editor_handle_key(e, &ev) : nonkey(e, &ev);
+        } else if (e->action == EDITOR_ACTION_GOTO) {
+            rc = editor_continue_action(e);
         } else if (editor_wheel_ready(e)) rc = editor_wheel_continue(e);
         else if (layout_busy(&e->lay)) {
             rc = layout_slice(e);
@@ -823,7 +838,7 @@ editor_stats editor_get_stats(const editor *e)
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
     s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||
-        e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+        e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }

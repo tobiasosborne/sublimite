@@ -147,6 +147,51 @@ int view_notify_edit(view *v, const view_change *edit, view_affinity cursor_affi
  * cluster boundaries, reset preferred column and validate/follow the viewport.
  * Restored byte offsets refer to the CURRENT tree (no rebasing). */
 int view_restore(view *v, const view_state *state, view_change *change);
+/* Default edit preparation: no mutation, allocation, or retained pointers.
+ * Each plan replaces one contiguous range, then installs the exact selection.
+ * Scratch/source and boundary searches use the existing VIEW_WINDOW/SCAN_BOUND;
+ * PIECE_ERR_NOMEM means the command needs more than this prepaid fast path.
+ * Errors leave the tree/selection unchanged. Caller applies through its undo
+ * log as one explicit group. cap must describe non-aliasing caller storage. */
+typedef struct view_edit_plan {
+    uint64_t offset, old_len;
+    size_t length;
+    view_selection selection;
+} view_edit_plan;
+int view_duplicate_line(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_delete_line(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_move_line_up(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_move_line_down(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_join_lines(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_insert_line_after(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_insert_line_before(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_delete_to_bol(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_delete_to_eol(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_delete_to_soft_bol(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_delete_to_soft_eol(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_indent(const view *v, bool tabs, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_unindent(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+/* Ordinary file-language comments; unsupported/plain text is a no-op.
+ * Local block detection is lexical, without embedded/custom syntax scopes. */
+int view_toggle_comment(const view *v, const char *path, bool block, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_transpose(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_sort_lines(const view *v, bool sensitive, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_upper_case(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_lower_case(const view *v, uint8_t *out, size_t cap, view_edit_plan *plan);
+/* Single-selection literal replacement, wrapping once at EOF. */
+int view_skip_next_occurrence(const view *v, view_edit_plan *plan);
+int view_select_word(const view *v, view_edit_plan *plan);
+int view_subword_left(const view *v, bool extend, view_edit_plan *plan);
+int view_subword_right(const view *v, bool extend, view_edit_plan *plan);
+int view_goto_bracket(const view *v, view_edit_plan *plan);
+int view_select_brackets(const view *v, view_edit_plan *plan);
+void view_set_mark(const view *v, view_selection *mark, bool *valid);
+void view_clear_mark(bool *valid);
+int view_select_to_mark(const view *v, const view_selection *mark, bool valid, view_edit_plan *plan);
+int view_swap_mark(const view *v, view_selection *mark, bool *valid, view_edit_plan *plan);
+int view_delete_to_mark(const view *v, const view_selection *mark, bool valid, view_edit_plan *plan);
+int view_yank(const view *v, const uint8_t *text, size_t len, uint8_t *out, size_t cap, view_edit_plan *plan);
+int view_overwrite_range(const view *v, const uint8_t *text, size_t len, uint64_t *old_len);
 /* Tiny P4.1 defaults; NULL/empty = untitled. Config overrides are P6.4. */
 bool view_wrap_default(const char *path);
 /* Apply open-time defaults to both the buffer flag and its layout. Reserve

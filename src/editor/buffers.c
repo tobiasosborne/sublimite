@@ -207,8 +207,11 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     rc = undo_init(&b->undo, b->tree, 2 * b->history_cap + 8); if (rc) goto fail;
     b->undo_ready = true;
     b->history = edit_arena_alloc(&b->arena, b->history_cap * sizeof *b->history, 16);
+    /* Soft undo uses the same configured command capacity as text history;
+     * reserve before input, never allocate when a selection changes. */
+    b->soft_history = edit_arena_alloc(&b->arena, b->history_cap * sizeof *b->soft_history, _Alignof(editor_soft_delta));
     minimap_row *rows = edit_arena_alloc(&b->arena, e->map_capacity * sizeof *rows, 8);
-    if (!b->history || !rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    if (!b->history || !b->soft_history || !rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = minimap_init(&b->map, rows, e->map_capacity); if (rc) goto fail;
     b->map_rows = rows;
     /* Worker summaries match the published map: pixel-row capacity (edit-d5o). */
@@ -289,7 +292,7 @@ static editor_buffer *find_buffer(editor *e, piece_tree *tree)
     return e->empty;
 }
 bool editor_activation_busy(const editor *e)
-{ return editor_clip_busy(e) || editor_save_leased(e) || e->find_replace_active || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK; }
+{ return editor_clip_busy(e) || editor_save_leased(e) || e->find_replace_active || view_busy(&e->v) || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO; }
 int editor_activate(editor *e)
 {
     if (editor_activation_busy(e)) return EDITOR_ERR_ARG;
@@ -322,6 +325,7 @@ int editor_activate(editor *e)
     /* Text rows exclude the find panel's rows (edit-73j). */
     e->text_grid.dims.rows = e->grid.dims.rows - e->tab_rows - e->panel_rows + (live.wrap ? 0u : 1u);
     e->v.config.rows = e->grid.dims.rows - e->tab_rows - e->panel_rows;
+    e->go.active = false;
     keys_reset(&e->keys); e->action = EDITOR_ACTION_NONE;
     e->old_selection = live.selection; editor_restart_blink(e, trace_now_ns());
     if (!live.wrap) {
@@ -554,7 +558,7 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
          * not replace an explicit launch coordinate. */
         b->scroll.first_byte = start; b->scroll.first_line = b->scroll.anchor_line = ln;
         b->scroll.request = SCROLL_READY; b->scroll.pending_rows = 0;
-        b->scroll_display = b->scroll;
+        b->scroll_display = b->scroll; b->scroll_display_stale = false;
     }
     return 0;
 }
@@ -820,6 +824,10 @@ int editor_check_sources(editor *e)
         if (b == e->buffer) {
             if (e->action == EDITOR_ACTION_REPLAY_WORK) {
                 undo_clear(e->undo); b->history_count = b->history_cursor = b->history_head = 0;
+                b->soft_count = b->soft_cursor = b->soft_head = 0;
+                b->soft_base_redo = 0;
+                b->mark_valid = false;
+                b->last_key_valid = false;
                 b->saved_lost = true;
             }
             undo_break_burst(e->undo); e->action = EDITOR_ACTION_NONE; e->v.busy = false;

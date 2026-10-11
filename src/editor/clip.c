@@ -27,6 +27,8 @@ struct editor_clip {
     edit_arena arena;
     pthread_mutex_t mutex;
     bool ready, waiting, cutting, hitting, cluster_live, primary_waiting;
+    bool cut_line;
+    uint64_t cut_off, cut_len;
     uint64_t hit_byte, hit_column, hit_target, cluster_start, pointer_ns;
     uint8_t cluster_first;
     utf8_cseg segment;
@@ -258,6 +260,7 @@ static int start_replace(editor *e, uint8_t *text, size_t len, size_t capacity)
     editor_clip *c = e->clipboard;
     uint64_t off = lesser(e->old_selection.cursor, e->old_selection.anchor);
     uint64_t old = greater(e->old_selection.cursor, e->old_selection.anchor) - off;
+    if (c->cut_line && c->cutting) { off = c->cut_off; old = c->cut_len; }
     c->waiting = false;
     if (e->buffer->source_stale || e->buffer->pending_open) {
         clip_free(c, text, capacity); e->stats.rejected_commands++; return 0;
@@ -267,6 +270,7 @@ static int start_replace(editor *e, uint8_t *text, size_t len, size_t capacity)
     if (rc) { clip_free(c, text, capacity); return rc; }
     c->text = text; c->capacity = capacity; c->len = len; c->inserted = 0;
     c->off = off; c->deleting = old; e->action = EDITOR_ACTION_CLIP;
+    c->cut_line = false;
     return editor_clip_continue(e);
 }
 static int middle_continue(editor *e);
@@ -339,13 +343,25 @@ int editor_clip_action(editor *e, keys_action action, const plat_event *ev)
     int rc = begin_command(e, ev->t0_ns); if (rc) return rc;
     trace_input_key(e->edit_time_ns, TRACE_IN_KEY_DOWN, ev->keysym, ev->mods,
         ev->repeat, (const char *)ev->utf8, ev->utf8_len);
-    if (action == KEYS_ACTION_PASTE) return request_paste(e, PLAT_CLIP_CLIPBOARD);
+    if (action == KEYS_ACTION_PASTE) { e->clipboard->cut_line = false; return request_paste(e, PLAT_CLIP_CLIPBOARD); }
     uint64_t off = lesser(e->old_selection.cursor, e->old_selection.anchor);
     uint64_t length = greater(e->old_selection.cursor, e->old_selection.anchor) - off;
+    bool whole_line = !length;
+    if (whole_line) {
+        view_edit_plan line;
+        rc = view_delete_line(&e->v, NULL, 0, &line);
+        if (rc == PIECE_ERR_NOMEM) {
+            e->stats.unimplemented_actions++; e->unimplemented_frame = e->grid.frame_id; return 0;
+        }
+        if (rc) return rc;
+        off = line.offset; length = line.old_len;
+    }
     if (!length) return 0;
     if (length > X11_CLIP_DATA_MAX) { e->stats.rejected_commands++; return 0; }
     editor_clip *c = e->clipboard;
     c->cutting = action == KEYS_ACTION_CUT;
+    c->cut_line = whole_line && c->cutting;
+    c->cut_off = off; c->cut_len = length;
     c->token++; /* A prior selection worker cannot overwrite explicit copy. */
     piece_snapshot_release(c->desired); c->desired = NULL;
     if (length <= VIEW_SCAN_BOUND) {

@@ -41,6 +41,54 @@ post-failure sanitizer crash and coordinator screenshot acceptance are recorded
 in the [worker report](../../docs/worker-reports/edit-a6v.md).
 Design: [edit-a6v](../../docs/decisions/edit-a6v.md).
 
+# edit-d50 continuation — daily-use keys
+
+The remaining daily-use executors now include file-language toggle comment,
+go-to-line preview/accept/cancel, Ctrl+D first-word selection, Ctrl+K Ctrl+C
+centering and Ctrl+K Ctrl+D single-selection literal skipping. The existing
+indent/unindent, duplicate/delete/move/join, case, transpose and mark/kill/yank
+fixtures still pass. New action and independent key-capability fixtures were
+run red before implementation, then green in release and ASan/UBSan builds.
+
+No typing-path malloc: plans reuse prepaid staging and bounded stack windows;
+the editor owns prompt storage before input, and exact index seeks continue
+through existing bounded calls. `KEYS_ARG_SINGLE_SELECTION` identifies partial
+occurrence capabilities explicitly. Further Ctrl+D expansion, syntax reindent,
+clipboard history UI, embedded/custom comment scopes, folding/diff/panes and
+oversized edit/skip plans remain unsupported. Unknown/plain text has no comment
+syntax. The full bead is still incomplete for complete Sublime parity.
+
+`make all`, the focused release/sanitizer checks, the headless module sweep
+and the view fuzzer corpus replay passed. Release guarded typing and command
+fixtures allocate no libc storage. See the
+[worker report](../../docs/worker-reports/edit-d50.md) and
+[decision audit](../../docs/decisions/edit-d50.md) for exact evidence and limits.
+Standalone IPC still fails with sandbox EPERM at socket initialization.
+The coordinator must rerun native display/IPC/leak checks and the comparison
+drive; no display suites were executed in this continuation.
+
+---
+
+# edit-d50 — default Linux keys (src:tobias)
+
+Worker changes are buildable but **this bead is incomplete**. The decision
+[audit](../../docs/decisions/edit-d50.md) records implemented fast paths,
+remaining text/syntax/multi-selection capabilities and retained UI notices.
+The [worker report](../../docs/worker-reports/edit-d50.md) contains the red/green
+runs, release/sanitizer verification and sandbox socket failures. The coordinator
+must rerun the display/IPC suites and compare native behavior with Sublime on
+its safe display before closing or handing over this bead.
+
+Typing-path storage is prepaid. New view plans use existing view scan/window
+limits; oversized or approximate commands refuse without changing text,
+selection or history. Accepted edits are explicit undo groups; undo preserves
+trusted distant anchors, and soft-history eviction keeps text/selection ordering.
+
+The older module status follows; the capability-flag audit above supersedes
+older descriptions of `KEYS_ARG_UNIMPLEMENTED`.
+
+---
+
 # edit-gdj — separate Shift chord regression
 
 The checked-in Astra review withdrew the original anchor-loss finding. Existing input/view code already retains the anchor across separate Shift chords. Added exact-range editor regressions for word, vertical, Home/End, document and page movement, reversal, modifier releases, and movement/mutation reset in wrapped and unwrapped views. The release allocation guard remains green. No production behavior changed.

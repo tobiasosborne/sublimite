@@ -180,6 +180,10 @@ static int install_buffer(editor *e, recovered_buffer *r)
     if (rc) return EDITOR_ERR_MEMORY;
     b->revision++; b->saved_lost = !clean; b->lines = piece_line_count(b->tree);
     b->history_count = b->history_cursor = b->history_head = b->saved_cursor = 0;
+    b->soft_count = b->soft_cursor = b->soft_head = 0;
+    b->soft_base_redo = 0;
+    b->mark_valid = false;
+    b->last_key_valid = false;
     lineidx_destroy(b->index); b->index = lineidx_create(r->len);
     if (!b->index || lineidx_build_reserve(b->index)) return EDITOR_ERR_MEMORY;
     piece_snapshot *snapshot = piece_snapshot_take(b->tree); if (!snapshot) return EDITOR_ERR_MEMORY;

@@ -41,6 +41,14 @@ static void joined_line_anchor(editor *e, uint64_t off, uint64_t line)
 }
 static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t old_nl, uint64_t new_nl)
 {
+    if (e->buffer->mark_valid) {
+        uint64_t *points[] = {&e->buffer->mark.cursor, &e->buffer->mark.anchor};
+        for (size_t i = 0; i < sizeof points / sizeof points[0]; i++) {
+            uint64_t at = *points[i];
+            if (at > off + old) *points[i] = at - old + add;
+            else if (at >= off) *points[i] = off + add;
+        }
+    }
     e->repair_line_valid = false;
     e->wheel_pending=false; e->wrap_wheel_rows=0;
     e->find_range_count=0;
@@ -55,7 +63,7 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
         if (lineidx_edit(e->buffer->index, off, old, add)) return EDITOR_ERR_HISTORY;
         e->buffer->index_dirty = true;
     }
-    int sr = editor_scroll_edit(e, off, old, add); if (sr) return sr;
+    int sr = editor_scroll_edit(e, off, old, add, old_nl, new_nl); if (sr) return sr;
     int rc = editor_begin_frame(e); if (rc) return rc;
     if (!e->lay.src || e->full_pending) { e->full_pending = true; return 0; }
     rc = layout_edit(&e->lay, off, old, add, old_nl, new_nl);
@@ -124,6 +132,45 @@ void editor_journal_staged(editor *e)
     else e->stage_used = 0;
 }
 static editor_delta *delta_at(editor *e, size_t i) { return &e->buffer->history[(e->buffer->history_head + i) % e->buffer->history_cap]; }
+static editor_soft_delta *soft_at(editor_buffer *b, size_t i)
+{ return &b->soft_history[(b->soft_head + i) % b->history_cap]; }
+static void soft_record(editor *e, bool text)
+{
+    view_selection after = e->v.state.selection;
+    e->selection_command = false;
+    if (!text && after.cursor == e->old_selection.cursor && after.anchor == e->old_selection.anchor) return;
+    editor_buffer *b = e->buffer;
+    b->soft_base_redo = 0;
+    uint64_t serial = undo_get_history(e->undo).group_serial;
+    if (text && b->soft_cursor == b->soft_count && b->soft_count) {
+        editor_soft_delta *last = soft_at(b, b->soft_count - 1u);
+        if (last->text && last->serial == serial) { last->after = after; return; }
+    }
+    b->soft_count = b->soft_cursor;
+    if (b->soft_count == b->history_cap) {
+        b->soft_head = (b->soft_head + 1u) % b->history_cap;
+        b->soft_count--; b->soft_cursor--;
+    }
+    *soft_at(b, b->soft_count++) = (editor_soft_delta){.before = e->old_selection,
+        .after = after, .serial = serial, .text = text};
+    b->soft_cursor = b->soft_count;
+}
+static void soft_replayed(editor *e, bool redo)
+{
+    editor_buffer *b = e->buffer;
+    if (e->soft_replaying) { b->soft_cursor = e->soft_target; e->soft_replaying = false; return; }
+    size_t at = b->soft_cursor;
+    if (redo) {
+        if (b->soft_base_redo) { b->soft_base_redo--; return; }
+        while (at < b->soft_count && !soft_at(b, at)->text) at++;
+        if (at < b->soft_count) b->soft_cursor = at + 1u;
+        else b->soft_head = b->soft_count = b->soft_cursor = 0;
+    } else {
+        while (at && !soft_at(b, at - 1u)->text) at--;
+        if (at) b->soft_cursor = at - 1u;
+        else { b->soft_cursor = 0; b->soft_base_redo++; }
+    }
+}
 static void remember(editor *e, editor_delta d)
 {
     editor_buffer *b = e->buffer;
@@ -163,6 +210,15 @@ static int end_edit_group(editor *e, const undo_state *after)
     e->explicit_group = false;
     return undo_group_end(e->undo, after);
 }
+static void remember_key(editor *e)
+{
+    if (e->command_sequence == e->stats.input_sequence &&
+        e->command_key.kind == PLAT_EV_KEY && e->command_key.press) {
+        e->buffer->last_key = e->command_key;
+        e->buffer->last_binding = e->command_binding;
+        e->buffer->last_key_valid = true;
+    }
+}
 static int finish_edit(editor *e)
 {
     if (e->v.state.wrap) {
@@ -183,7 +239,8 @@ static int finish_edit(editor *e)
     }
     undo_state after = save_selection(&e->v);
     int rc = end_edit_group(e, &after); if (rc) return rc;
-    remember(e, e->edit_delta); editor_modified(e); e->action = EDITOR_ACTION_NONE;
+    remember(e, e->edit_delta); soft_record(e, true); editor_modified(e); e->action = EDITOR_ACTION_NONE;
+    remember_key(e);
     trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
     return editor_refresh_cursor(e, e->old_cursor);
 }
@@ -191,8 +248,18 @@ static int finish_edit(editor *e)
  * insert is a no-op. Every actual text mutation goes through undo. */
 static int repair(editor *e, uint64_t target)
 {
-    e->v.state.selection.cursor = e->v.state.selection.anchor = target;
-    view_change c; int rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
+    view_change c; int rc;
+    if (e->edit_selection_valid) {
+        e->v.state.selection = e->edit_selection;
+        e->edit_selection_valid = false;
+        /* Equal-length transforms also invalidate grapheme boundaries. Repair
+         * both endpoints explicitly; legacy empty TYPE only detects length or
+         * collapsed-caret changes. */
+        rc = view_restore(&e->v, &e->v.state, &c);
+    } else {
+        e->v.state.selection.cursor = e->v.state.selection.anchor = target;
+        rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
+    }
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPAIR; return 0; }
     if (rc) return rc;
@@ -200,16 +267,30 @@ static int repair(editor *e, uint64_t target)
 }
 static int finish_replay_follow(editor *e)
 {
-    e->v.state.selection.anchor = e->replay_selection.anchor;
+    if (e->replay_anchor_trusted) {
+        e->v.state.selection.anchor = e->replay_selection.anchor == e->replay_selection.cursor ?
+            e->v.state.selection.cursor : e->replay_selection.anchor;
+        e->replay_anchor_trusted = false;
+    }
     e->v.state.selection.preferred_col = VIEW_PREFERRED_UNSET;
     e->action = EDITOR_ACTION_NONE;
+    if (e->selection_command) soft_record(e, false);
     return editor_refresh_cursor(e, e->old_cursor);
 }
-static int replay_follow(editor *e)
+static int replay_follow(editor *e, bool trust_anchor)
 {
-    e->replay_selection = e->v.state.selection;
-    e->v.state.selection.anchor = e->v.state.selection.cursor;
-    view_change c; int rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
+    e->replay_anchor_trusted = trust_anchor;
+    if (trust_anchor) {
+        /* Undo/soft-history endpoints already came from completed selections.
+         * Follow the cursor without re-scanning a distant, unchanged anchor;
+         * new edit plans still normalize both endpoints in repair(). */
+        e->replay_selection = e->v.state.selection;
+        e->v.state.selection.anchor = e->v.state.selection.cursor;
+    }
+    /* Trusted history follows the cursor as main's replay did (empty TYPE on
+     * a collapsed selection); a new plan's two endpoints need a restore. */
+    view_change c;
+    int rc = trust_anchor ? view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c) : view_restore(&e->v, &e->v.state, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPLAY; return 0; }
     if (rc) return rc;
@@ -218,9 +299,10 @@ static int replay_follow(editor *e)
 typedef enum text_kind { TEXT_BYTES, TEXT_ENTER, TEXT_BRACE } text_kind;
 static int prefix_error(editor *e, int cause)
 {
+    e->edit_selection_valid = false;
     undo_state after = save_selection(&e->v);
     (void)end_edit_group(e, &after);
-    if (e->edit_delta.old || e->edit_delta.add) { remember(e, e->edit_delta); editor_modified(e); }
+    if (e->edit_delta.old || e->edit_delta.add) { remember(e, e->edit_delta); soft_record(e, true); editor_modified(e); }
     e->action = EDITOR_ACTION_NONE; return cause;
 }
 static int check_index_edit(editor *e, uint64_t off, uint64_t old, uint64_t add)
@@ -326,6 +408,195 @@ int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t 
     return rc ? prefix_error(e, rc) : 0;
 }
 int editor_replace_end(editor *e, uint64_t target) { return repair(e, target); }
+static bool default_edit_key(keys_action action)
+{
+    switch (action) {
+    case KEYS_ACTION_DUPLICATE_LINE: case KEYS_ACTION_DELETE_LINE:
+    case KEYS_ACTION_MOVE_LINE_UP: case KEYS_ACTION_MOVE_LINE_DOWN:
+    case KEYS_ACTION_JOIN_LINES: case KEYS_ACTION_INSERT_LINE_AFTER:
+    case KEYS_ACTION_INSERT_LINE_BEFORE: case KEYS_ACTION_DELETE_TO_BOL:
+    case KEYS_ACTION_DELETE_TO_EOL: case KEYS_ACTION_INDENT:
+    case KEYS_ACTION_TOGGLE_COMMENT:
+    case KEYS_ACTION_UNINDENT: case KEYS_ACTION_TRANSPOSE:
+    case KEYS_ACTION_SORT_LINES: case KEYS_ACTION_UPPER_CASE:
+    case KEYS_ACTION_LOWER_CASE: return true;
+    case KEYS_ACTION_SHOW_AT_CENTER: case KEYS_ACTION_SKIP_NEXT_OCCURRENCE:
+    case KEYS_ACTION_ADD_NEXT_OCCURRENCE:
+    case KEYS_ACTION_SUBWORD_LEFT: case KEYS_ACTION_SUBWORD_RIGHT:
+    case KEYS_ACTION_GOTO_BRACKET: case KEYS_ACTION_SELECT_BRACKETS:
+    case KEYS_ACTION_SET_MARK: case KEYS_ACTION_SELECT_TO_MARK:
+    case KEYS_ACTION_SWAP_MARK: case KEYS_ACTION_CLEAR_MARK:
+    case KEYS_ACTION_DELETE_TO_MARK: case KEYS_ACTION_YANK:
+    case KEYS_ACTION_TOGGLE_OVERWRITE: return true;
+    default: return false;
+    }
+}
+static int default_edit_notice(editor *e)
+{
+    e->stats.unimplemented_actions++;
+    e->unimplemented_frame = e->grid.frame_id;
+    return editor_refresh_cursor(e, e->old_cursor);
+}
+static bool same_replacement(const editor *e, const view_edit_plan *plan, const uint8_t *out)
+{
+    if (plan->old_len != plan->length) return false;
+    piece_iter it; piece_iter_begin(&it, e->tree, plan->offset);
+    size_t at = 0, n; const uint8_t *bytes;
+    while (at < plan->length && piece_iter_next(&it, &bytes, &n)) {
+        if (n > plan->length - at) n = plan->length - at;
+        if (memcmp(out + at, bytes, n)) return false;
+        at += n;
+    }
+    return at == plan->length;
+}
+static int show_at_center(editor *e)
+{
+    lineidx_src source = editor_source(e->buffer);
+    lineidx_result cursor = lineidx_byte_to_line(e->buffer->index, &source, e->v.state.selection.cursor);
+    if (!cursor.exact) return default_edit_notice(e);
+    uint64_t half = e->v.config.rows / 2u; /* midpoint of the visible text rows (3kk adds an overscan text_grid row when unwrapped) */
+    uint64_t line = cursor.value > half ? cursor.value - half : 0;
+    lineidx_result start;
+    uint64_t visual;
+    if (e->v.state.wrap) {
+        layout_wrap_row row; bool approximate;
+        int rc = layout_visual_row(&e->lay, e->tree, e->v.state.selection.cursor, 0, &row, &approximate);
+        if (rc || approximate) return default_edit_notice(e);
+        if (e->v.state.visual_end && row.start == e->v.state.selection.cursor && row.start) {
+            rc = layout_visual_row(&e->lay, e->tree, row.start, -1, &row, &approximate);
+            if (rc || approximate) return default_edit_notice(e);
+        }
+        uint64_t origin = row.start;
+        for (uint64_t i = 0; i < half && row.start; i++) {
+            rc = layout_visual_row(&e->lay, e->tree, row.start, -1, &row, &approximate);
+            if (rc || approximate || origin - row.start > VIEW_SCAN_BOUND) return default_edit_notice(e);
+        }
+        visual = row.start;
+        lineidx_result logical = lineidx_byte_to_line(e->buffer->index, &source, visual);
+        if (!logical.exact) return default_edit_notice(e);
+        line = logical.value;
+        start = lineidx_line_to_byte(e->buffer->index, &source, line);
+    } else {
+        start = lineidx_line_to_byte(e->buffer->index, &source, line);
+        visual = start.value;
+    }
+    if (!start.exact) return default_edit_notice(e);
+    e->v.state.first_line = line; e->v.state.first_byte = start.value;
+    e->v.state.visual_byte = visual; e->v.state.approximate = false;
+    undo_break_burst(e->undo); e->selection_command = false;
+    /* Unwrapped viewports are owned by the scroll state since 3kk. */
+    int seek = editor_scroll_seek(e, start.value); if (seek) return seek;
+    return editor_full_layout(e);
+}
+static int default_edit(editor *e, const keys_binding *binding)
+{
+    view_edit_plan plan;
+    uint8_t *out = e->indent_bytes;
+    /* The synchronous fast path inherits view's certified scan window; the
+     * existing larger staging buffer is shared with indentation and painting. */
+    size_t cap = VIEW_WINDOW;
+    int rc;
+    switch (binding->action) {
+    case KEYS_ACTION_DUPLICATE_LINE: rc = view_duplicate_line(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_DELETE_LINE: rc = view_delete_line(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_MOVE_LINE_UP: rc = view_move_line_up(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_MOVE_LINE_DOWN: rc = view_move_line_down(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_JOIN_LINES: rc = view_join_lines(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_INSERT_LINE_AFTER: rc = view_insert_line_after(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_INSERT_LINE_BEFORE: rc = view_insert_line_before(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_DELETE_TO_BOL:
+        rc = binding->args.chord == KEYS_CHORD_K ? view_delete_to_soft_bol(&e->v, out, cap, &plan) : view_delete_to_bol(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_DELETE_TO_EOL:
+        rc = binding->args.chord == KEYS_CHORD_K ? view_delete_to_soft_eol(&e->v, out, cap, &plan) : view_delete_to_eol(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_INDENT: rc = view_indent(&e->v, e->buffer->style.uses_tabs, out, cap, &plan); break;
+    case KEYS_ACTION_UNINDENT: rc = view_unindent(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_TOGGLE_COMMENT: rc = view_toggle_comment(&e->v, e->buffer->path, (binding->args.flags & KEYS_ARG_BLOCK) != 0, out, cap, &plan); break;
+    case KEYS_ACTION_TRANSPOSE: rc = view_transpose(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_SORT_LINES: rc = view_sort_lines(&e->v, (binding->args.flags & KEYS_ARG_CASE_SENSITIVE) != 0, out, cap, &plan); break;
+    case KEYS_ACTION_UPPER_CASE: rc = view_upper_case(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_LOWER_CASE: rc = view_lower_case(&e->v, out, cap, &plan); break;
+    case KEYS_ACTION_SHOW_AT_CENTER: return show_at_center(e);
+    case KEYS_ACTION_SKIP_NEXT_OCCURRENCE: rc = view_skip_next_occurrence(&e->v, &plan); break;
+    case KEYS_ACTION_ADD_NEXT_OCCURRENCE:
+        if (e->v.state.selection.cursor != e->v.state.selection.anchor) return default_edit_notice(e);
+        rc = view_select_word(&e->v, &plan); break;
+    case KEYS_ACTION_SUBWORD_LEFT: rc = view_subword_left(&e->v, (binding->args.flags & KEYS_ARG_EXTEND) != 0, &plan); break;
+    case KEYS_ACTION_SUBWORD_RIGHT: rc = view_subword_right(&e->v, (binding->args.flags & KEYS_ARG_EXTEND) != 0, &plan); break;
+    case KEYS_ACTION_GOTO_BRACKET: rc = view_goto_bracket(&e->v, &plan); break;
+    case KEYS_ACTION_SELECT_BRACKETS: rc = view_select_brackets(&e->v, &plan); break;
+    case KEYS_ACTION_SET_MARK:
+        view_set_mark(&e->v, &e->buffer->mark, &e->buffer->mark_valid);
+        return editor_refresh_cursor(e, e->old_cursor);
+    case KEYS_ACTION_CLEAR_MARK:
+        view_clear_mark(&e->buffer->mark_valid);
+        return editor_refresh_cursor(e, e->old_cursor);
+    case KEYS_ACTION_TOGGLE_OVERWRITE:
+        e->buffer->overwrite = !e->buffer->overwrite;
+        undo_break_burst(e->undo);
+        return editor_refresh_cursor(e, e->old_cursor);
+    case KEYS_ACTION_SELECT_TO_MARK: rc = view_select_to_mark(&e->v, &e->buffer->mark, e->buffer->mark_valid, &plan); break;
+    case KEYS_ACTION_SWAP_MARK: rc = view_swap_mark(&e->v, &e->buffer->mark, &e->buffer->mark_valid, &plan); break;
+    case KEYS_ACTION_DELETE_TO_MARK: rc = view_delete_to_mark(&e->v, &e->buffer->mark, e->buffer->mark_valid, &plan); break;
+    case KEYS_ACTION_YANK:
+        if (!e->kill_len) return editor_refresh_cursor(e, e->old_cursor);
+        rc = view_yank(&e->v, e->kill_bytes, e->kill_len, out, cap, &plan); break;
+    default: return EDITOR_ERR_ARG;
+    }
+    if (rc == PIECE_ERR_NOMEM) return default_edit_notice(e);
+    if (rc) return rc;
+    undo_break_burst(e->undo);
+    if (same_replacement(e, &plan, out)) {
+        switch (binding->action) {
+        case KEYS_ACTION_DUPLICATE_LINE: case KEYS_ACTION_DELETE_LINE:
+        case KEYS_ACTION_MOVE_LINE_UP: case KEYS_ACTION_MOVE_LINE_DOWN:
+        case KEYS_ACTION_JOIN_LINES: case KEYS_ACTION_INSERT_LINE_AFTER:
+        case KEYS_ACTION_INSERT_LINE_BEFORE: case KEYS_ACTION_DELETE_TO_BOL:
+        case KEYS_ACTION_DELETE_TO_EOL: case KEYS_ACTION_INDENT:
+        case KEYS_ACTION_TOGGLE_COMMENT:
+    case KEYS_ACTION_UNINDENT: case KEYS_ACTION_TRANSPOSE:
+        case KEYS_ACTION_SORT_LINES: case KEYS_ACTION_UPPER_CASE:
+        case KEYS_ACTION_LOWER_CASE: case KEYS_ACTION_DELETE_TO_MARK:
+        case KEYS_ACTION_YANK: remember_key(e); break;
+        default: break;
+        }
+        e->v.state.selection = plan.selection;
+        e->selection_command = true;
+        return replay_follow(e, false);
+    }
+    if (e->journal && (e->op_count + 2u > EDITOR_STAGE_OPS ||
+        plan.length > EDITOR_STAGE_BYTES - e->stage_used)) return default_edit_notice(e);
+    rc = check_index_edit(e, plan.offset, plan.old_len, plan.length); if (rc) return rc;
+    bool killing = binding->action == KEYS_ACTION_DELETE_LINE ||
+        binding->action == KEYS_ACTION_DELETE_TO_BOL || binding->action == KEYS_ACTION_DELETE_TO_EOL ||
+        binding->action == KEYS_ACTION_DELETE_TO_MARK;
+    bool forward = binding->action == KEYS_ACTION_DELETE_LINE || binding->action == KEYS_ACTION_DELETE_TO_EOL;
+    bool merge = killing && e->kill_len && e->kill_buffer == e->buffer->id &&
+        (forward ? plan.offset : plan.offset + plan.old_len) == e->kill_at;
+    uint8_t killed[VIEW_WINDOW];
+    if (killing) {
+        if (plan.old_len > sizeof killed - (merge ? e->kill_len : 0)) return default_edit_notice(e);
+        rc = piece_read(e->tree, plan.offset, killed, (size_t)plan.old_len); if (rc) return rc;
+    }
+    undo_state before = save_selection(&e->v);
+    rc = undo_group_begin(e->undo, &before); if (rc) return rc;
+    e->explicit_group = true;
+    e->edit_delta = (editor_delta){.off = plan.offset, .before = before};
+    rc = delete_part(e, plan.offset, plan.old_len, UNDO_DELETE, &before);
+    if (rc) return prefix_error(e, rc);
+    if (killing) {
+        size_t len = (size_t)plan.old_len;
+        if (!merge) e->kill_len = 0;
+        if (forward) memcpy(e->kill_bytes + e->kill_len, killed, len);
+        else { memmove(e->kill_bytes + len, e->kill_bytes, e->kill_len); memcpy(e->kill_bytes, killed, len); }
+        e->kill_len += len; e->kill_at = plan.offset; e->kill_buffer = e->buffer->id;
+    }
+    if (binding->action == KEYS_ACTION_YANK) e->kill_buffer = 0; /* seal the top */
+    if (plan.length) {
+        rc = editor_replace_insert(e, plan.offset, out, plan.length); if (rc) return rc;
+    }
+    e->edit_selection = plan.selection; e->edit_selection_valid = true;
+    return repair(e, plan.selection.cursor);
+}
 static int replay_slice(editor *e)
 {
     editor_delta d = e->replay_delta; bool redo = e->replay_redo;
@@ -343,8 +614,9 @@ static int replay_slice(editor *e)
         int er = changed(e, d.off, old, add, e->replay_old_nl, newlines(e, d.off, add)); if (er) return er;
         restore_selection(&e->v, redo ? &d.after : &d.before);
         if (redo) e->buffer->history_cursor++; else e->buffer->history_cursor--;
+        soft_replayed(e, redo);
         editor_modified(e); trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
-        er = replay_follow(e); if (er) return er;
+        er = replay_follow(e, true); if (er) return er;
     }
     return rc;
 }
@@ -359,6 +631,27 @@ static int replay_history(editor *e, bool redo)
     e->replay_old_nl = newlines(e, d.off, redo ? d.old : d.add);
     e->replay_before_len = piece_len(e->tree);
     return replay_slice(e);
+}
+static int soft_history(editor *e, bool redo)
+{
+    editor_buffer *b = e->buffer;
+    undo_break_burst(e->undo);
+    if (redo && b->soft_base_redo) return replay_history(e, true);
+    if ((!redo && !b->soft_cursor) || (redo && b->soft_cursor == b->soft_count))
+        return replay_history(e, redo);
+    size_t at = redo ? b->soft_cursor : b->soft_cursor - 1u;
+    editor_soft_delta d = *soft_at(b, at);
+    if (d.text) {
+        if ((!redo && !b->history_cursor) || (redo && b->history_cursor == b->history_count))
+            return editor_refresh_cursor(e, e->old_cursor);
+        e->soft_target = redo ? at + 1u : at; e->soft_replaying = true;
+        int rc = replay_history(e, redo);
+        if (rc) e->soft_replaying = false;
+        return rc;
+    }
+    b->soft_cursor = redo ? at + 1u : at;
+    e->v.state.selection = redo ? d.after : d.before;
+    return replay_follow(e, true);
 }
 static bool move_key(keys_action action, view_key *out)
 {
@@ -394,8 +687,138 @@ static void pointer_unit_finish(editor *e)
         e->v.state.selection.anchor=e->text_drag_lo; e->v.state.selection.cursor=hi>e->text_drag_hi ? hi : e->text_drag_hi;
     }
 }
+/* Go-to-line owns a prompt, never document text. Preview state is transient;
+ * Enter records one selection command, Escape restores the original viewport.
+ * Seek continuations use the index's existing bounded foreground query. */
+/* Unwrapped viewports are owned by the 3kk scroll state: a top written only
+ * into the view is mirrored back to the displayed one on the next refresh.
+ * Adopt a certified line start there, or seek to it when the scroll policy
+ * clips it (EOF), as show_at_center does. */
+static int goto_scroll_to(editor *e, uint64_t byte, uint64_t line, bool approximate)
+{
+    if (e->v.state.wrap || editor_scroll_place(e, byte, line, approximate)) return 0;
+    return editor_scroll_seek(e, byte);
+}
+static int goto_restore(editor *e)
+{
+    e->v.state = e->go.original;
+    const scroll_state *s = &e->go.original_scroll;
+    if (e->v.state.wrap || !e->buffer->scroll_ready) return 0;
+    return goto_scroll_to(e, s->first_byte, s->first_line, s->approximate);
+}
+int editor_goto_cancel(editor *e)
+{
+    if (!e->go.active) return 0;
+    if (e->go.owner == e->buffer->id && e->go.generation == e->buffer->source_generation &&
+        !e->buffer->source_stale) { int rc = goto_restore(e); if (rc) return rc; }
+    e->go.active = false; e->go.accept = false;
+    if (e->action == EDITOR_ACTION_GOTO) e->action = EDITOR_ACTION_NONE;
+    keys_reset(&e->keys);
+    return editor_full_layout(e);
+}
+static int goto_continue(editor *e)
+{
+    editor_goto *go = &e->go;
+    if (!go->active) { e->action = EDITOR_ACTION_NONE; return 0; }
+    if (go->owner != e->buffer->id || go->generation != e->buffer->source_generation ||
+        e->buffer->source_stale) return editor_goto_cancel(e);
+    lineidx_src source = editor_source(e->buffer);
+    lineidx_result count = lineidx_line_count(e->buffer->index);
+    uint64_t line = go->line;
+    if (count.exact && line >= count.value) line = count.value - 1u;
+    lineidx_result pos = lineidx_seek_line(e->buffer->index, &source, line, VIEW_SCAN_BOUND);
+    if (!pos.exact) return 0;
+    count = lineidx_line_count(e->buffer->index);
+    if (count.exact && line >= count.value) { go->line = count.value - 1u; return 0; }
+    e->action = EDITOR_ACTION_NONE;
+    e->v.state.selection = (view_selection){pos.value, pos.value, VIEW_PREFERRED_UNSET};
+    e->v.state.first_line = line;
+    e->v.state.first_byte = e->v.state.visual_byte = pos.value;
+    e->v.state.visual_end = false; e->v.state.approximate = false; e->v.state.hscroll = 0;
+    editor_seed_view_lines(e);
+    int rc = goto_scroll_to(e, pos.value, line, false); if (rc) return rc;
+    if (go->accept) {
+        e->old_selection = go->original.selection;
+        soft_record(e, false);
+        go->active = false; keys_reset(&e->keys);
+    }
+    return editor_full_layout(e);
+}
+static int goto_query(editor *e)
+{
+    editor_goto *go = &e->go;
+    go->valid = go->length != 0; go->line = 0;
+    /* Decimal positional notation: next = previous * base + digit;
+     * rearrange against UINT64_MAX before multiplying to avoid overflow. */
+    const uint64_t base = '9' - '0' + 1u;
+    for (size_t i = 0; i < go->length; i++) {
+        uint64_t digit = (uint8_t)go->digits[i] - (uint8_t)'0';
+        if (digit >= base || go->line > (UINT64_MAX - digit) / base) { go->valid = false; break; }
+        go->line = go->line * base + digit;
+    }
+    if (go->valid) {
+        if (go->line) go->line--; /* UI line numbers begin at one. */
+        e->action = EDITOR_ACTION_GOTO;
+        return goto_continue(e);
+    }
+    e->action = EDITOR_ACTION_NONE;
+    int rc = goto_restore(e); if (rc) return rc;
+    return editor_full_layout(e);
+}
+static int goto_key(editor *e, const plat_event *ev)
+{
+    editor_goto *go = &e->go;
+    undo_break_burst(e->undo);
+    if (!go->active) {
+        *go = (editor_goto){.active = true, .original = e->v.state, .original_scroll = e->buffer->scroll_display,
+            .owner = e->buffer->id, .generation = e->buffer->source_generation};
+        keys_reset(&e->keys);
+        return editor_full_layout(e);
+    }
+    if (ev->keysym == XKB_KEY_Escape) return editor_goto_cancel(e);
+    if (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter) {
+        if (!go->length) return editor_goto_cancel(e);
+        if (!go->valid) return editor_full_layout(e);
+        go->accept = true; e->action = EDITOR_ACTION_GOTO;
+        return goto_continue(e);
+    }
+    if ((ev->mods & PLAT_MOD_CTRL) && (ev->keysym == XKB_KEY_a || ev->keysym == XKB_KEY_A)) {
+        go->selected = true; return editor_full_layout(e);
+    }
+    if (ev->keysym == XKB_KEY_Left || ev->keysym == XKB_KEY_Home) {
+        go->cursor = ev->keysym == XKB_KEY_Home || go->selected ? 0 : go->cursor ? go->cursor - 1u : 0;
+        go->selected = false; return editor_full_layout(e);
+    }
+    if (ev->keysym == XKB_KEY_Right || ev->keysym == XKB_KEY_End) {
+        if (ev->keysym == XKB_KEY_End || go->selected) go->cursor = go->length;
+        else if (go->cursor < go->length) go->cursor++;
+        go->selected = false; return editor_full_layout(e);
+    }
+    if (ev->keysym == XKB_KEY_BackSpace || ev->keysym == XKB_KEY_Delete) {
+        if (go->selected) { go->length = go->cursor = 0; go->selected = false; }
+        else if (ev->keysym == XKB_KEY_BackSpace && go->cursor) {
+            go->cursor--; memmove(go->digits + go->cursor, go->digits + go->cursor + 1u, go->length - go->cursor - 1u); go->length--;
+        } else if (ev->keysym == XKB_KEY_Delete && go->cursor < go->length) {
+            memmove(go->digits + go->cursor, go->digits + go->cursor + 1u, go->length - go->cursor - 1u); go->length--;
+        }
+        go->digits[go->length] = 0; return goto_query(e);
+    }
+    if (!(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER)) && ev->utf8_len) {
+        for (size_t i = 0; i < ev->utf8_len; i++) if (ev->utf8[i] < '0' || ev->utf8[i] > '9') return editor_full_layout(e);
+        size_t length = go->selected ? 0 : go->length;
+        if (ev->utf8_len > sizeof go->digits - 1u - length) return editor_full_layout(e);
+        if (go->selected) { go->length = go->cursor = 0; go->selected = false; }
+        memmove(go->digits + go->cursor + ev->utf8_len, go->digits + go->cursor, go->length - go->cursor);
+        memcpy(go->digits + go->cursor, ev->utf8, ev->utf8_len);
+        go->length += ev->utf8_len; go->cursor += ev->utf8_len; go->digits[go->length] = 0;
+        return goto_query(e);
+    }
+    return editor_full_layout(e);
+}
+
 int editor_continue_action(editor *e)
 {
+    if (e->action == EDITOR_ACTION_GOTO) return goto_continue(e);
     if (e->action == EDITOR_ACTION_CLIP) return editor_clip_continue(e);
     if (e->action == EDITOR_ACTION_REPLAY_WORK) return replay_slice(e);
     view_change c; int rc = view_continue(&e->v, &c);
@@ -409,6 +832,7 @@ int editor_continue_action(editor *e)
     }
     if (e->action == EDITOR_ACTION_REPAIR) return finish_edit(e);
     if (e->action == EDITOR_ACTION_REPLAY) return finish_replay_follow(e);
+    if (e->selection_command) soft_record(e, false);
     e->action = EDITOR_ACTION_NONE;
     pointer_unit_finish(e);
     return editor_refresh_cursor(e, e->old_cursor);
@@ -434,8 +858,14 @@ bool editor_event_control(const editor *e, const plat_event *ev)
 }
 int editor_handle_key(editor *e, const plat_event *ev)
 {
-    if (ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
+    /* An open go-to-line prompt owns Escape and digits over the find panel. */
+    if (!e->go.active && ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
         (void)editor_find_key(e,ev); return 0;
+    }
+    if (e->go.active && (e->buffer->source_stale || e->go.owner != e->buffer->id ||
+        e->go.generation != e->buffer->source_generation)) {
+        e->go.active = false;
+        if (e->action == EDITOR_ACTION_GOTO) e->action = EDITOR_ACTION_NONE;
     }
     if (e->buffer->source_stale && !editor_event_control(e, ev)) {
         if (!e->buffer->prompt_ns || e->buffer->prompt_generation != e->buffer->source_generation ||
@@ -449,9 +879,9 @@ int editor_handle_key(editor *e, const plat_event *ev)
         if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R) tabs_mru_release(&e->tabs);
         return 0;
     }
-    if (editor_find_key(e, ev)) return 0;
+    if (!e->go.active && editor_find_key(e, ev)) return 0;
     const keys_binding *binding = NULL;
-    keys_result result = config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
         ev->keysym == XKB_KEY_Shift_L || ev->keysym == XKB_KEY_Shift_R ||
         ev->keysym == XKB_KEY_Alt_L || ev->keysym == XKB_KEY_Alt_R ||
@@ -460,43 +890,60 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (result == KEYS_PREFIX || result == KEYS_CANCELLED) { tabs_mru_release(&e->tabs); return 0; }
     if (result == KEYS_ERR_ARG) return EDITOR_ERR_ARG;
     keys_action action = binding ? binding->action : KEYS_ACTION_NONE;
+    /* Redo has priority. With no redo entry, replay the previous successful
+     * editing command at the current selection, preserving chord arguments.
+     * Resolve before ingress so Ctrl+Y remains one input and one frame. */
+    plat_event repeated;
+    const plat_event *command = ev;
+    bool repeating = action == KEYS_ACTION_REDO_OR_REPEAT &&
+        e->buffer->history_cursor == e->buffer->history_count && e->buffer->last_key_valid;
+    if (repeating) {
+        repeated = e->buffer->last_key; repeated.t0_ns = ev->t0_ns; repeated.repeat = ev->repeat;
+        command = &repeated; binding = e->buffer->last_binding;
+        action = binding ? binding->action : KEYS_ACTION_NONE;
+        result = binding ? KEYS_MATCH : KEYS_NONE;
+        undo_break_burst(e->undo);
+    }
     if (action == KEYS_ACTION_SAVE) return editor_save_request(e, ev->t0_ns);
     if (action == KEYS_ACTION_FONT_SIZE) return editor_font_zoom(e, binding->args.value);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;
     bool del = action == KEYS_ACTION_DELETE || action == KEYS_ACTION_WORD_DELETE;
-    /* Repeat needs a command record; the existing history only records deltas.
-     * With no redo entry replay_history deliberately leaves the buffer alone. */
     bool undo = action == KEYS_ACTION_UNDO;
     bool redo = action == KEYS_ACTION_REDO || action == KEYS_ACTION_REDO_OR_REPEAT;
+    bool soft = action == KEYS_ACTION_SOFT_UNDO || action == KEYS_ACTION_SOFT_REDO;
     bool stack = action == KEYS_ACTION_NEXT_VIEW_STACK || action == KEYS_ACTION_PREVIOUS_VIEW_STACK;
-    bool adjacent = action == KEYS_ACTION_NEXT_VIEW || action == KEYS_ACTION_PREVIOUS_VIEW;
+    bool adjacent = (action == KEYS_ACTION_NEXT_VIEW || action == KEYS_ACTION_PREVIOUS_VIEW) &&
+        !(binding && (binding->args.flags & KEYS_ARG_EXTEND));
     bool close = action == KEYS_ACTION_CLOSE || action == KEYS_ACTION_CLOSE_FILE;
     bool reopen = action == KEYS_ACTION_REOPEN_FILE;
     bool tab = stack || adjacent || close || reopen || action == KEYS_ACTION_SELECT_TAB || action == KEYS_ACTION_SELECT_LAST_TAB;
-    bool text = action == KEYS_ACTION_INSERT || (result == KEYS_NONE && ev->utf8_len &&
-        !(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER)) &&
-        (!(ev->mods & PLAT_MOD_ALT) || (ev->mods & PLAT_MOD_ALTGR)));
+    bool text = action == KEYS_ACTION_INSERT || (result == KEYS_NONE && command->utf8_len &&
+        !(command->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER)) &&
+        (!(command->mods & PLAT_MOD_ALT) || (command->mods & PLAT_MOD_ALTGR)));
+    bool editing = default_edit_key(action);
+    bool go = e->go.active || action == KEYS_ACTION_GOTO_LINE;
     if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT ||
-        action == KEYS_ACTION_PASTE)
+        action == KEYS_ACTION_PASTE) {
+        e->command_key = *command; e->command_binding = binding;
+        e->command_sequence = e->stats.input_sequence + 1u;
         return editor_clip_action(e, action, ev);
-    if (!moving && !back && !del && !undo && !redo && !tab && !text) {
+    }
+    if (!moving && !back && !del && !undo && !redo && !soft && !tab && !text && !editing && !go) {
         if (binding) e->stats.unimplemented_actions++;
         if (action == KEYS_ACTION_CANCEL || e->tabs.cycling) tabs_mru_release(&e->tabs);
-        switch (action) {
-        case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE: case KEYS_ACTION_FIND_NEXT:
-        case KEYS_ACTION_FIND_IN_FILES: case KEYS_ACTION_GOTO_FILE: case KEYS_ACTION_GOTO_LINE: {
+        if (binding) {
             int rc = editor_begin_frame(e); if (rc) return rc;
             e->unimplemented_frame = e->grid.frame_id;
-            break;
-        }
-        default: break;
         }
         return 0;
     }
     if (!stack && e->tabs.cycling) tabs_mru_release(&e->tabs);
     if (!tabs_count(&e->tabs) && !reopen) return 0;
+    e->command_key = *command; e->command_binding = binding;
+    e->command_sequence = e->stats.input_sequence + 1u;
     e->old_selection = e->v.state.selection; e->old_cursor = e->old_selection.cursor;
+    e->selection_command = moving;
     e->key_ns = trace_now_ns(); e->edit_time_ns = ev->t0_ns ? ev->t0_ns : e->key_ns;
     editor_restart_blink(e, e->key_ns);
     if (e->buffer->last_repeat && !ev->repeat) undo_break_burst(e->undo);
@@ -510,6 +957,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
     trace_record_at(e->key_ns, TRACE_T1_DEQUEUE, e->grid.frame_id);
     trace_input_key(ev->t0_ns ? ev->t0_ns : e->key_ns, TRACE_IN_KEY_DOWN, ev->keysym, ev->mods,
                     ev->repeat, (const char *)ev->utf8, ev->utf8_len);
+    if (go) return goto_key(e, ev);
     if (tab) {
         undo_break_burst(e->undo);
         if (stack) return editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);
@@ -521,12 +969,19 @@ int editor_handle_key(editor *e, const plat_event *ev)
         return index < count ? editor_select_tab(e, index) : 0;
     }
     if (undo || redo) return replay_history(e, redo);
+    if (soft) return soft_history(e, action == KEYS_ACTION_SOFT_REDO);
+    if (editing) return default_edit(e, binding);
     uint64_t lo = min64(e->old_selection.cursor, e->old_selection.anchor);
     uint64_t old = max64(e->old_selection.cursor, e->old_selection.anchor) - lo;
     if (text) {
         uint8_t ch = binding ? (uint8_t)binding->args.value : 0;
-        const uint8_t *p = binding ? &ch : ev->utf8; size_t n = binding ? 1 : ev->utf8_len;
+        const uint8_t *p = binding ? &ch : command->utf8; size_t n = binding ? 1 : command->utf8_len;
         text_kind tk = ch == '\n' ? TEXT_ENTER : n == 1 && *p == '}' ? TEXT_BRACE : TEXT_BYTES;
+        if (e->buffer->overwrite && !old && tk != TEXT_ENTER) {
+            rc = view_overwrite_range(&e->v, p, n, &old);
+            if (rc == PIECE_ERR_NOMEM) return default_edit_notice(e);
+            if (rc) return rc;
+        }
         return mutate_text(e, lo, old, p, n, UNDO_DELETE, tk);
     }
     if (moving) undo_break_burst(e->undo);

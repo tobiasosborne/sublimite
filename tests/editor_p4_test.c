@@ -201,7 +201,7 @@ static int decorations(bool raster)
     uint64_t count = editor_get_stats(e).unimplemented_actions;
     T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count); /* edit-73j: Ctrl+F opens find */
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
-    T(press(e, key('t', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 1); /* Ctrl+T transpose: still unimplemented; Ctrl+Y became redo (edit-whl) */
+    T(press(e, key('r', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).unimplemented_actions == count + 1); /* Ctrl+R goto symbol: still unimplemented (Ctrl+T transpose is edit-d50; Ctrl+Y redo is edit-whl) */
     T(press(e, key('k', PLAT_MOD_CTRL, NULL)) == 0);
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false}; T(press(e, focus) == 0);
     T(press(e, key('a', 0, "a")) == 0); T(editor_length(e) == 11);
