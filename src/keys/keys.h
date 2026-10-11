@@ -109,7 +109,7 @@ typedef struct keys_args {
     uint16_t flags;
     int16_t value; /* INSERT: Unicode ASCII; column +/-1; scroll +/-1;
                    * group/tab: zero-based; layout: Linux digit preset;
-                   * fold: level; font: +/-1; CHORD: next keys_chord. */
+                   * fold: level; font: +/-1 point, 0 reset; CHORD: next keys_chord. */
     uint8_t chord; /* namespace of this stroke; NONE = standalone/prefix */
 } keys_args;
 

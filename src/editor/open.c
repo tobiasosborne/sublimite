@@ -32,7 +32,8 @@ void editor_close(editor *e)
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
-    font_async_close(e->fonts);
+    for (unsigned i = 0; i < 2; i++) font_async_close(e->font.atlas[i].fonts);
+    edit_arena_free(&e->font.storage); edit_arena_free(&e->font.scratch);
     if (e->has_platform) plat_shutdown(&e->platform);
     editor_clip_close(e);
     if (e->poll_fd >= 0) close(e->poll_fd);
@@ -64,9 +65,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     if (cols > e->max_cols) e->max_cols = cols;
     if (rows > e->max_rows) e->max_rows = rows;
     int rc = EDITOR_ERR_MEMORY;
-    const font_ascii_atlas *atlas = font_ascii_atlas_for_px(config->font_px ? config->font_px : 15);
-    if (atlas) trace_record(TRACE_STARTUP_FONT_ATLAS_READY, 0);
-    if (!atlas || e->max_cols > 8192 || e->max_rows > 8192) { rc = EDITOR_ERR_ARG; goto fail; }
+    const font_ascii_atlas *atlas = NULL;
+    if (e->max_cols > 8192 || e->max_rows > 8192) { rc = EDITOR_ERR_ARG; goto fail; }
     size_t live = config->tab_capacity ? config->tab_capacity : 128;
     size_t closed = config->closed_capacity ? config->closed_capacity : 16;
     if (live > 4096 || closed > 4096) { rc = EDITOR_ERR_ARG; goto fail; }
@@ -77,16 +77,35 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     uint32_t nraster = (may_fallback || (info.capabilities & RENDER_CAP_RASTER_POOL)) ? 4u : 0u;
     if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
+    rc = editor_font_init(e, &atlas); if (rc) goto fail;
+    trace_record(TRACE_STARTUP_FONT_ATLAS_READY, 0); /* edit-2ts startup stage; atlas readied by edit-m3g's DPI path */
+    e->font.window_width = config->window_width ? config->window_width : cols * atlas->cell.cell_w;
+    e->font.window_height = config->window_height ? config->window_height : rows * atlas->cell.cell_h;
+    if (config->window_width) cols = config->window_width / atlas->cell.cell_w;
+    if (config->window_height) rows = config->window_height / atlas->cell.cell_h;
+    if (!cols) cols = 1;
+    if (!rows) rows = 1;
+    if (cols > e->max_cols) e->max_cols = cols;
+    if (rows > e->max_rows) e->max_rows = rows;
+    if (e->max_cols > 8192 || e->max_rows > 8192) { rc = EDITOR_ERR_ARG; goto fail; }
+    e->font.max_width = e->max_cols * atlas->cell.cell_w;
+    e->font.max_height = e->max_rows * atlas->cell.cell_h;
+    if (config->max_window_width) e->font.max_width = config->max_window_width;
+    if (config->max_window_height) e->font.max_height = config->max_window_height;
+    if (e->font.max_width < e->font.window_width) e->font.max_width = e->font.window_width;
+    if (e->font.max_height < e->font.window_height) e->font.max_height = e->font.window_height;
     e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
     size_t cells = (size_t)e->max_cols * e->max_rows, words = ((size_t)e->max_rows + 63) / 64;
     uint32_t font_pages; size_t font_glyphs, font_pixels;
-    font_async_limits(&font_pages, &font_glyphs, &font_pixels, atlas->px);
-    /* (G) strip reservation = existing eight text columns; summary spacing
-     * = PRD's two pixels. Both image buffers are reserved before input. */
-    uint32_t map_width = (e->max_cols < 8u ? e->max_cols : 8u) * atlas->cell.cell_w;
-    uint32_t map_height = e->max_rows * atlas->cell.cell_h;
+    font_async_atlas_limits(&font_pages, &font_glyphs, &font_pixels, e->font.capacity);
+    /* (G) strip reservation = existing eight text columns at the largest
+     * prepaid font; summary spacing = PRD's two pixels. Height follows the
+     * font-independent surface reserve so resize and zoom need no allocation. */
+    uint32_t map_width = (e->max_cols < 8u ? e->max_cols : 8u) * e->font.max_cell.cell_w;
+    if (map_width > e->font.max_width) map_width = e->font.max_width;
+    uint32_t map_height = e->font.max_height;
     e->map_capacity = (map_height + 1u) / 2u;
     e->map_pixel_capacity = (size_t)map_width * map_height;
     size_t reserve = 2 * e->map_pixel_capacity * sizeof(uint32_t) +
@@ -110,6 +129,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->indent_bytes = edit_arena_alloc(&e->arena, EDITOR_STAGE_BYTES, 16);
     e->ws_ranges = edit_arena_alloc(&e->arena, e->max_rows * sizeof *e->ws_ranges, 8);
     e->font_row_words = words;
+    e->font_row_slots = font_glyphs;
     e->font_rows = edit_arena_alloc(&e->arena, font_glyphs * words * sizeof *e->font_rows, _Alignof(uint64_t));
     if (!e->font_rows) { rc = EDITOR_ERR_MEMORY; goto fail; }
     memset(e->font_rows, 0, font_glyphs * words * sizeof *e->font_rows);
@@ -136,7 +156,7 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     rc = render_grid_init(&e->grid, dims, full, cells, full_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->text_grid, td, text, cells, text_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->map_grid, md, map, (size_t)e->map_capacity * 8, map_bits, map_words); if (rc) goto fail;
-    rc = font_async_open(&e->fonts, atlas->px, &e->pool); if (rc) goto fail;
+    e->fonts = e->font.atlas[e->font.current].fonts;
     (void)font_async_bind(e->fonts, &e->grid);
     (void)font_async_bind(e->fonts, &e->text_grid);
     e->layout_cfg = (layout_config){.tab_width = 4, .gutter = true, .slice_clusters = 256,
@@ -150,13 +170,13 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     e->buffer = e->empty; e->tree = e->empty->tree; e->undo = &e->empty->undo;
     view_config vc = {4, td.rows, td.cols > 2 ? td.cols - 2 : 1, NULL, NULL}; view_init(&e->v, e->tree, &vc);
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
-        plat_config pc = {"sublimité", cols * dims.cell_w, rows * dims.cell_h, false, e->poll_fd, 0};
+        plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, e->poll_fd, 0};
         rc = plat_init(&e->platform, &pc); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
     }
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
     if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
-    render_config render = {.dims = dims, .max_width = e->max_cols * dims.cell_w, .max_height = e->max_rows * dims.cell_h,
+    render_config render = {.dims = dims, .max_width = e->font.max_width, .max_height = e->font.max_height,
         .max_cells = cells, .max_glyphs = font_glyphs, .max_pages = font_pages, .max_atlas_bytes = font_pixels,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
         .max_region_width = map_width, .max_region_height = map_height};

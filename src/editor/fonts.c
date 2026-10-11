@@ -21,7 +21,15 @@ bool editor_font_event(editor *e, const work_msg *msg)
 {
     if (msg->kind != FONT_ASYNC_MSG_KIND) return false;
     uint32_t slot = font_async_event(e->fonts, msg);
-    if (slot == RENDER_NO_SLOT) return true;
+    if (slot == RENDER_NO_SLOT) {
+        /* A size switch may retire an owner while its glyphs are pending.
+         * Drain its authenticated completions without damaging the new grid.
+         * It may be reused only after this adoption and physical completion.
+         * During preparation it is detached and exclusively worker-owned. */
+        if (!e->font.handle.epoch)
+            (void)font_async_event(e->font.atlas[1u - e->font.current].fonts, msg);
+        return true;
+    }
     (void)font_async_bind(e->fonts, &e->text_grid);
     (void)font_async_bind(e->fonts, &e->grid);
     /* Pixel-only changes need damage even when cell metadata is unchanged.

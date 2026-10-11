@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "unicode_render_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 
@@ -310,6 +311,73 @@ static int owner_mailbox(void)
     return 0;
 }
 
+static int sized_primary(editor *e)
+{
+    const render_grid *g = editor_grid(e);
+    uint32_t col = layout_gutter_width(&e->lay), row = e->tab_rows;
+    uint32_t cps[] = {0xe9u, 0x3b1u};
+    size_t len; const unsigned char *bytes = font_embedded_data(&len);
+    font_t primary; T(font_init(&primary, bytes, len) == FONT_OK);
+    T(font_set_em_px(&primary, e->font.applied_px) == FONT_OK);
+    T(primary.cell.cell_w == g->dims.cell_w && primary.cell.cell_h == g->dims.cell_h);
+    edit_arena scratch; T(edit_arena_init(&scratch, 1u << 20) == 0);
+    uint8_t *reference = calloc((size_t)g->dims.cell_w * g->dims.cell_h, 1); T(reference);
+    for (size_t i = 0; i < sizeof cps / sizeof cps[0]; i++, col++) {
+        const render_cell *cell = &g->cells[(size_t)row * g->dims.cols + col];
+        T(bitmap(g, cell) == 0);
+        const render_glyph *glyph = &g->glyphs[cell->atlas_slot];
+        const render_atlas_page *page = &g->pages[glyph->page];
+        T(glyph->w == g->dims.cell_w && glyph->h == g->dims.cell_h);
+        edit_arena_reset(&scratch); font_bitmap image;
+        T(font_raster_glyph(&primary, cps[i], &scratch, &image) == FONT_OK);
+        memset(reference, 0, (size_t)g->dims.cell_w * g->dims.cell_h);
+        T(font_place_in_cell(&primary, &image, reference, g->dims.cell_w, g->dims.cell_h) == FONT_OK);
+        for (uint32_t y = 0; y < glyph->h; y++)
+            T(!memcmp(reference + (size_t)y * glyph->w,
+                      page->pixels + (size_t)(glyph->y + y) * page->stride + glyph->x, glyph->w));
+    }
+    T(combining(g, &g->cells[(size_t)row * g->dims.cols + col]) == 0);
+    T(render_grid_validate(g) == RENDER_OK);
+    free(reference); edit_arena_free(&scratch);
+    return 0;
+}
+
+static int dpi_zoom_unicode(double dpi)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
+    editor_config cfg = {.font_dpi = dpi, .cols = 40, .rows = 8,
+        .initial = (const uint8_t *)"éαé", .initial_len = sizeof "éαé" - 1u};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK);
+    T(settle(e) == 0); T(sized_primary(e) == 0);
+    font_async *original = e->fonts;
+    glyph_gate gate = {0};
+    work_handle blocker = work_submit(&e->pool, (work_job){block_bulk, &gate, 0, WORK_BULK});
+    T(blocker.epoch); while (!atomic_load(&gate.started)) sched_yield();
+    /* Two switches leave glyphs pending in both versions. A third request
+     * must wait for the detached owner to finish, while input keeps draining. */
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_equal, .mods = PLAT_MOD_CTRL};
+    for (unsigned i = 0; i < 2; i++) {
+        T(editor_inject(e, &key) == EDITOR_OK);
+        do { T(editor_step(e, 0) >= 0); } while (editor_get_stats(e).pending);
+        T(font_async_pending(e->fonts));
+    }
+    T(e->fonts == original);
+    key.keysym = XKB_KEY_0; T(editor_inject(e, &key) == EDITOR_OK);
+    while (e->queue_count) T(editor_step(e, 0) >= 0);
+    T(e->font.requested_px == e->font.default_px && e->font.applied_px != e->font.default_px);
+    T(!e->font.handle.epoch); /* still-borrowed worker version cannot be reset */
+    atomic_store(&gate.release, true);
+    T(settle(e) == 0); T(e->font.applied_px == e->font.default_px); T(sized_primary(e) == 0);
+    key.keysym = XKB_KEY_equal; T(editor_inject(e, &key) == EDITOR_OK);
+    T(settle(e) == 0); T(sized_primary(e) == 0);
+    key.keysym = XKB_KEY_0; T(editor_inject(e, &key) == EDITOR_OK);
+    T(settle(e) == 0); T(sized_primary(e) == 0);
+    T(editor_length(e) == cfg.initial_len);
+    editor_close(e);
+    printf("unicode_render_test: DPI %.0f zoom/reset matches true-em primary pixels; pending owner retirement passed\n", dpi);
+    return 0;
+}
+
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -317,6 +385,8 @@ int main(void)
     T(render_unicode(true) == 0);
     T(glyph_minimap_repaint() == 0);
     T(owner_mailbox() == 0);
+    T(dpi_zoom_unicode(96.0) == 0);
+    T(dpi_zoom_unicode(243.0) == 0);
     puts("unicode_render_test: initial and injected é α 日 🙂; widths, combining overlay, atlas pixels and allocation guard passed");
     return 0;
 }

@@ -5,6 +5,21 @@ The checked-in Astra review withdrew the original anchor-loss finding. Existing 
 Focused gcc and clang ASan/UBSan regressions pass; the deliberately injected anchor reset fails the new assertion, and input.c was restored byte-for-byte. GCC `make all` passes. Broader sandbox validation and coordinator reruns are recorded in the [worker report](../../docs/worker-reports/edit-gdj.md). The other keyboard beads were left for separate workers under the binding scope rule.
 
 [Decision record](../../docs/decisions/edit-gdj.md).
+# edit-m3g — display sizing and worker zoom
+
+Startup selects Xft DPI or RANDR physical DPI, derives point-sized em pixels and
+work-area window geometry, and honors EDIT_FONT_SIZE_PT. Ctrl+= / Ctrl+- / Ctrl+0
+use coalesced foreground atlas jobs with INIT-reserved storage and backend frame
+retirement before adoption. Explicit legacy pixel configurations retain their
+existing font-height semantics. Font and native surface capacities follow the
+existing renderer bounds.
+
+Focused red/green and allocation/lifetime checks pass. Native verification and
+the next Astra screenshot/latency drive remain with the coordinator because the
+sandbox denies X listening/connection sockets. Full check and individual suite
+outcomes, including independent IPC restrictions, are recorded in
+[the worker report](../../docs/worker-reports/edit-m3g.md).
+Design and numeric derivations: [edit-m3g](../../docs/decisions/edit-m3g.md).
 
 # edit-cde — clipboard integration
 

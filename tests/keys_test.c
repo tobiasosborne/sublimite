@@ -17,7 +17,8 @@ typedef struct expectation {
 } expectation;
 /* Independently transcribed semantic expectations from the installed Linux
  * defaults, in source/command order, not keys.c order. No table-generated
- * fixtures or shared binding macros. Later duplicate defaults win. UI and
+ * fixtures or shared binding macros. edit-m3g overrides Ctrl+0 with font reset
+ * and implements the font-size actions. Later duplicate defaults win. UI and
  * grammar contexts are outside the event-only interface; ordinary editor
  * Ctrl+Enter and default Shift+Tab unindent are explicitly included. */
 static const expectation expected[] = {
@@ -213,7 +214,7 @@ static const expectation expected[] = {
     T("ctrl+shift+7", MOVE_TO_GROUP,U,6),
     T("ctrl+shift+8", MOVE_TO_GROUP,U,7),
     T("ctrl+shift+9", MOVE_TO_GROUP,U,8),
-    T("ctrl+0", FOCUS_SIDEBAR,U,0),
+    T("ctrl+0", FONT_SIZE,0,0),
     T("ctrl+k ctrl+Up", NEW_PANE,U,0),
     T("ctrl+k ctrl+shift+Up", NEW_PANE,U|KEYS_ARG_NO_MOVE,0),
     T("ctrl+k ctrl+Down", CLOSE_PANE,U,0),
@@ -255,9 +256,9 @@ static const expectation expected[] = {
     T("ctrl+k ctrl+BackSpace", DELETE_TO_BOL,U,0),
     T("ctrl+k ctrl+g", CLEAR_MARK,U,0),
     T("ctrl+k ctrl+c", SHOW_AT_CENTER,U,0),
-    T("ctrl+plus", FONT_SIZE,U,1),
-    T("ctrl+equal", FONT_SIZE,U,1),
-    T("ctrl+minus", FONT_SIZE,U,-1),
+    T("ctrl+plus", FONT_SIZE,0,1),
+    T("ctrl+equal", FONT_SIZE,0,1),
+    T("ctrl+minus", FONT_SIZE,0,-1),
     T("alt+shift+w", XML_TAG_SNIPPET,U,0),
     T("ctrl+shift+bracketleft", FOLD,U,0),
     T("ctrl+shift+bracketright", UNFOLD,U,0),

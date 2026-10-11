@@ -1,7 +1,6 @@
 /* edit-08z: UI requests, worker-only faces/cache, mailbox-only atlas adoption. */
 #include "font/font.h"
 #include "font/discovery.h"
-#include "font/embedded.h"
 #include "utf8/utf8.h"
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +36,7 @@ _Static_assert(sizeof(async_result) <= WORK_MSG_DATA, "glyph result fits work ma
 struct font_async {
     work_pool *pool;
     work_handle active;
+    work_handle retired;
     edit_arena ui, storage;
     font_family family;
     font_cache cache;
@@ -54,24 +54,43 @@ struct font_async {
     size_t face_count, scalar_count;
     work_ctx *worker_ctx;
     uint32_t px;
+    font_ascii_atlas ascii;
+    font_cell max_cell;
+    bool em;
     int init_result;
 };
 
 void font_async_limits(uint32_t *pages, size_t *glyphs, size_t *pixels, uint32_t px)
 {
     const font_ascii_atlas *a = font_ascii_atlas_for_px(px);
+    font_async_atlas_limits(pages, glyphs, pixels, a ? a->pixels_len : 0);
+}
+
+void font_async_atlas_limits(uint32_t *pages, size_t *glyphs, size_t *pixels, size_t ascii_bytes)
+{
     *pages = FONT_ATLAS_MAX_PAGES + 1u;
     *glyphs = ASYNC_ASCII + ASYNC_ENTRIES;
-    *pixels = a->pixels_len + FONT_ATLAS_MAX_PAGES * ASYNC_SCRATCH;
+    *pixels = ascii_bytes + FONT_ATLAS_MAX_PAGES * ASYNC_SCRATCH;
 }
 
 int font_async_open(font_async **out, uint32_t px, work_pool *pool)
 {
-    if (!out || !pool || !font_ascii_atlas_for_px(px)) return FONT_ERR_ARG;
+    const font_ascii_atlas *a = font_ascii_atlas_for_px(px);
+    if (!a) return FONT_ERR_ARG;
+    return font_async_open_atlas(out, a, false, a->cell, pool);
+}
+
+int font_async_open_atlas(font_async **out, const font_ascii_atlas *a, bool em,
+                          font_cell max_cell, work_pool *pool)
+{
+    if (!out || !pool || !a || !a->pixels || !a->px || !a->cell.cell_w || !a->cell.cell_h ||
+        a->cell.cell_w > max_cell.cell_w || a->cell.cell_h > max_cell.cell_h ||
+        max_cell.cell_w > FONT_ATLAS_PAGE_DIM / 2u || max_cell.cell_h > FONT_ATLAS_PAGE_DIM)
+        return FONT_ERR_ARG;
     *out = NULL;
     font_async *owner = calloc(1, sizeof *owner);
     if (!owner) return FONT_ERR_NOMEM;
-    owner->pool = pool; owner->px = px; owner->init_result = FONT_MORE;
+    owner->pool = pool; owner->max_cell = max_cell;
     font_fallback_reset(&owner->discovery);
     /* Worst-case exact UTF-8 keys, one per renderer-admissible request.
      * Virtual arena reservation; only requested keys are touched. */
@@ -81,7 +100,6 @@ int font_async_open(font_async **out, uint32_t px, work_pool *pool)
      * into the smaller renderer table only after mailbox completion. */
     size_t cache_entries = ASYNC_CACHE_ENTRIES;
     size_t negative = cache_entries < 64u ? cache_entries : 64u; /* inherited negative cache ceiling */
-    const font_ascii_atlas *a = font_ascii_atlas_for_px(px);
     size_t ui_sizes[] = {ASYNC_ENTRIES * sizeof(async_request), ASYNC_ENTRIES * sizeof(async_face),
         ASYNC_ENTRIES * sizeof(async_scalar), ASYNC_ENTRIES * sizeof(uint32_t), keys,
         (ASYNC_ASCII + ASYNC_ENTRIES) * sizeof(render_glyph)};
@@ -91,7 +109,7 @@ int font_async_open(font_async **out, uint32_t px, work_pool *pool)
     size_t storage_sizes[] = {cache_entries * sizeof(font_cache_entry),
         (cache_entries + ASYNC_ASCII) * sizeof(render_glyph), keys + ASYNC_WIDTHS * sizeof "\xef\xbf\xbd",
         negative * sizeof(font_cache_entry), negative * 256u, /* inherited per-negative key bound */
-        FONT_CLUSTER_MAX_BYTES, (size_t)a->cell.cell_w * 2u * a->cell.cell_h, ASYNC_SCRATCH};
+        FONT_CLUSTER_MAX_BYTES, (size_t)max_cell.cell_w * 2u * max_cell.cell_h, ASYNC_SCRATCH};
     size_t storage_bytes = FONT_ATLAS_MAX_PAGES * (ASYNC_SCRATCH + _Alignof(max_align_t));
     for (size_t i = 0; i < sizeof storage_sizes / sizeof storage_sizes[0]; i++)
         storage_bytes += storage_sizes[i] + _Alignof(max_align_t);
@@ -108,14 +126,42 @@ int font_async_open(font_async **out, uint32_t px, work_pool *pool)
         font_async_close(owner); return FONT_ERR_NOMEM;
     }
     memset(owner->faces, 0, ui_sizes[1]);
-    memset(owner->table, 0, ui_sizes[3]);
+    int rc = font_async_reset_atlas(owner, a, em);
+    if (rc) { font_async_close(owner); return rc; }
+    *out = owner; return FONT_OK;
+}
+
+bool font_async_idle(const font_async *owner)
+{
+    return !owner || (!owner->pending && !owner->active.epoch &&
+        (!owner->retired.epoch || work_handle_finished(owner->pool, owner->retired)));
+}
+
+int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *a, bool em)
+{
+    if (!owner || !a || !a->pixels || !a->px || !a->cell.cell_w || !a->cell.cell_h ||
+        a->cell.cell_w > owner->max_cell.cell_w || a->cell.cell_h > owner->max_cell.cell_h ||
+        !font_async_idle(owner)) return FONT_ERR_ARG;
+    for (size_t i = 0; i < owner->face_count; i++) edit_arena_free(&owner->faces[i].arena);
+    memset(owner->faces, 0, owner->face_count * sizeof *owner->faces);
+    owner->face_count = owner->scalar_count = 0;
+    owner->count = owner->next = owner->pending = owner->key_used = 0;
+    owner->retired = (work_handle){0};
+    owner->px = a->px; owner->ascii = *a; owner->em = em; owner->init_result = FONT_MORE;
+    memset(&owner->family, 0, sizeof owner->family);
+    memset(&owner->cache, 0, sizeof owner->cache);
+    memset(owner->missing, 0, sizeof owner->missing);
+    memset(owner->pages, 0, sizeof owner->pages);
+    edit_arena_reset(&owner->storage);
+    font_fallback_reset(&owner->discovery);
+    memset(owner->table, 0, ASYNC_ENTRIES * sizeof *owner->table);
     for (size_t i = 0; i < ASYNC_ASCII; i++)
         owner->glyphs[i] = (render_glyph){(uint32_t)i + ' ', 0, (uint32_t)i * a->cell.cell_w,
             0, a->cell.cell_w, a->cell.cell_h};
     owner->pages[0] = (render_atlas_page){a->pixels, a->pixels_len,
         ASYNC_ASCII * a->cell.cell_w, (uint32_t)ASYNC_ASCII * a->cell.cell_w, a->cell.cell_h};
     owner->page_count = 1;
-    *out = owner; return FONT_OK;
+    return FONT_OK;
 }
 
 void font_async_close(font_async *owner)
@@ -162,7 +208,8 @@ static int resolve_scalar(void *ctx, uint32_t cp, font_t **out)
                     !edit_arena_init(&face->arena, (size_t)st.st_size)) {
                     size_t len; unsigned char *bytes = font_load_file(path, &face->arena, &len);
                     if (bytes) face->result = font_init_index(&face->font, bytes, len, index);
-                    if (face->result == FONT_OK) face->result = font_set_px(&face->font, owner->px);
+                    if (face->result == FONT_OK) face->result = owner->em ?
+                        font_set_em_px(&face->font, owner->px) : font_set_px(&face->font, owner->px);
                 }
             }
             async_face *face = &owner->faces[face_at];
@@ -182,8 +229,14 @@ static void glyph_job(work_ctx *ctx)
     if (work_should_stop(ctx)) return;
     owner->worker_ctx = ctx;
     if (owner->init_result == FONT_MORE) {
-        int result = font_init(&owner->family.faces[0], font_embedded, sizeof font_embedded - 1u);
-        if (result == FONT_OK) result = font_set_px(&owner->family.faces[0], owner->px);
+        size_t len; const unsigned char *bytes = font_embedded_data(&len);
+        font_t *primary = &owner->family.faces[0];
+        int result = font_init(primary, bytes, len);
+        if (result == FONT_OK) result = owner->em ?
+            font_set_em_px(primary, owner->px) : font_set_px(primary, owner->px);
+        if (result == FONT_OK && (primary->cell.cell_w != owner->ascii.cell.cell_w ||
+                                 primary->cell.cell_h != owner->ascii.cell.cell_h)) result = FONT_ERR_ARG;
+        if (result == FONT_OK) primary->atlas = &owner->ascii;
         owner->family.count = result == FONT_OK ? 1u : 0u;
         if (result == FONT_OK)
             result = font_cache_init(&owner->cache, &owner->family, &owner->storage,
@@ -234,7 +287,7 @@ void font_async_pump(font_async *owner)
 int font_async_bind(font_async *owner, render_grid *grid)
 {
     if (!owner || !grid) return FONT_ERR_ARG;
-    const font_ascii_atlas *a = font_ascii_atlas_for_px(owner->px);
+    const font_ascii_atlas *a = &owner->ascii;
     if (grid->dims.cell_w != a->cell.cell_w || grid->dims.cell_h != a->cell.cell_h) return FONT_ERR_ARG;
     grid->glyphs = owner->glyphs; grid->glyph_count = ASYNC_ASCII + owner->count;
     grid->pages = owner->pages; grid->page_count = owner->page_count;
@@ -310,7 +363,7 @@ uint32_t font_async_event(font_async *owner, const work_msg *msg)
         owner->glyphs[slot].glyph_index = slot + 1u;
     }
     owner->requests[output.request].result = output.result;
-    owner->pending--; owner->active = (work_handle){0};
+    owner->pending--; owner->retired = owner->active; owner->active = (work_handle){0};
     font_async_pump(owner);
     return slot;
 }

@@ -50,6 +50,14 @@ typedef struct editor_config {
      * it. IPC open/setup and bounded index maintenance also run there. */
     void (*on_io)(void *, bool entering);
     uint64_t copy_threshold;           /* 0 = file default; off-path test override */
+    /* Display-derived startup: points use a true em. Zero dpi keeps the
+     * legacy explicit pixel/baked test configuration; main queries X first.
+     * Zero points selects EDITOR_FONT_DEFAULT_PT; pixel extents are optional. */
+    double font_dpi, font_points;
+    uint32_t window_width, window_height;
+    /* Reserve the display's pixel extents for resize/zoom, independent of
+     * font size. Zero retains explicit-grid callers' existing reservation. */
+    uint32_t max_window_width, max_window_height;
 } editor_config;
 typedef struct editor_stats {
     uint64_t input_sequence, submitted_sequence, presented_sequence;

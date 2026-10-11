@@ -13,6 +13,7 @@
 #include "indent/indent.h"
 #include "minimap/minimap.h"
 #include "editor/large_private.h"
+#include "editor/runtime.h"
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
 #define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
@@ -73,6 +74,27 @@ typedef struct editor_backend_init {
     int result;
     bool received, pending, finishing;
 } editor_backend_init;
+typedef struct editor_font_atlas {
+    font_ascii_atlas atlas;
+    font_metric metrics[LAYOUT_ASCII_GLYPHS];
+    uint8_t *pixels;
+    font_async *fonts;
+} editor_font_atlas;
+typedef struct editor_font_size {
+    font_t face;
+    font_cell max_cell;
+    edit_arena storage, scratch;
+    editor_font_atlas atlas[2]; /* current frame + worker replacement */
+    size_t capacity;
+    double dpi, points, default_points;
+    uint32_t requested_px, prepared_px, applied_px, default_px;
+    uint32_t window_width, window_height, max_width, max_height;
+    unsigned current, preparing;
+    bool legacy, received;
+    int result;
+    work_handle handle;
+    pthread_t worker;
+} editor_font_size;
 struct editor {
     editor_clip *clipboard;
     editor_config cfg;
@@ -113,9 +135,10 @@ struct editor {
     uint32_t map_capacity;
     layout lay;
     layout_config layout_cfg;
-    font_async *fonts;
+    font_async *fonts; /* alias of the adopted font-size version */
     uint64_t *font_rows;
-    size_t font_row_words;
+    size_t font_row_words, font_row_slots;
+    editor_font_size font;
     render_strip *strips;
     uint64_t *row_byte;
     uint32_t *row_used;
@@ -206,6 +229,12 @@ void editor_seed_view_lines(editor *e);
 bool editor_line_start_before(editor *e, uint64_t end, uint64_t *start);
 void editor_restart_blink(editor *e, uint64_t now);
 void editor_route_work(const work_msg *msg, void *ctx);
+int editor_font_init(editor *e, const font_ascii_atlas **atlas);
+int editor_font_zoom(editor *e, int value);
+bool editor_font_receive(editor *e, const work_msg *msg);
+int editor_font_poll(editor *e);
+bool editor_font_pending(const editor *e);
+int editor_resize_grid(editor *e, render_dims dims);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
 int editor_journal_metadata(editor *e);

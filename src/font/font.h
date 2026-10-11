@@ -89,6 +89,10 @@ int  font_init(font_t *f, const unsigned char *ttf, size_t len);
 int  font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t index);
 /* Sets the pixel height and recomputes scale and cell metrics. */
 int  font_set_px(font_t *f, uint32_t px);
+/* True em size: points * display DPI / points-per-inch, rather than hhea height. */
+int font_set_em_px(font_t *f, uint32_t px);
+/* Immutable vendored primary, independent of process working directory. */
+const unsigned char *font_embedded_data(size_t *len);
 int  font_cell_metrics(const font_t *f, font_cell *out);
 /* Metrics of a codepoint without rasterising. */
 int  font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out);
@@ -304,6 +308,18 @@ typedef struct font_async font_async;
 int font_async_open(font_async **out, uint32_t px, work_pool *pool);
 void font_async_close(font_async *owner);
 void font_async_limits(uint32_t *pages, size_t *glyphs, size_t *pixels, uint32_t px);
+/* Dynamic ASCII atlas borrowed from the editor's worker-prepared version.
+ * Reserve the maximum cell at INIT; em selects true-em primary/fallback sizing.
+ * Atlas bytes and descriptors survive backend retirement and work completion. */
+void font_async_atlas_limits(uint32_t *pages, size_t *glyphs, size_t *pixels,
+                             size_t ascii_bytes);
+int font_async_open_atlas(font_async **out, const font_ascii_atlas *atlas, bool em,
+                          font_cell max_cell, work_pool *pool);
+/* UI quiescence check includes mailbox adoption AND physical job completion.
+ * Reset on a worker only while idle, detached from UI and retired by backend.
+ * Reuses INIT reservations; no owner/storage allocations during zoom. */
+bool font_async_idle(const font_async *owner);
+int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *atlas, bool em);
 int font_async_bind(font_async *owner, render_grid *grid);
 int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len,
                      uint32_t width, uint32_t *slot);

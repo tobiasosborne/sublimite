@@ -404,7 +404,8 @@ bool editor_event_control(const editor *e, const plat_event *ev)
     case KEYS_ACTION_NEXT_VIEW_STACK: case KEYS_ACTION_PREVIOUS_VIEW_STACK:
     case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
     case KEYS_ACTION_CLOSE: case KEYS_ACTION_CLOSE_FILE: case KEYS_ACTION_REOPEN_FILE:
-    case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB: return true;
+    case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB:
+    case KEYS_ACTION_FONT_SIZE: return true;
     default: return false;
     }
 }
@@ -433,6 +434,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (result == KEYS_ERR_ARG) return EDITOR_ERR_ARG;
     keys_action action = binding ? binding->action : KEYS_ACTION_NONE;
     if (action == KEYS_ACTION_SAVE) return editor_save_request(e, ev->t0_ns);
+    if (action == KEYS_ACTION_FONT_SIZE) return editor_font_zoom(e, binding->args.value);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;
     bool del = action == KEYS_ACTION_DELETE || action == KEYS_ACTION_WORD_DELETE;

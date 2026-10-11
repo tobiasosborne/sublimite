@@ -638,12 +638,13 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
 
 static const font_ascii_atlas *atlas_matching(const font_t *f);
 
-int font_set_px(font_t *f, uint32_t px)
+static int set_size(font_t *f, uint32_t px, int em)
 {
     if (!f || !f->data || px == 0 || px > 4096u) return FONT_ERR_ARG;
     int a = 0, d = 0, gap = 0;
     f->px = px;
-    f->scale = stbtt_ScaleForPixelHeight(cinfo_of(f), (float)px);
+    f->scale = em ? stbtt_ScaleForMappingEmToPixels(cinfo_of(f), (float)px) :
+                   stbtt_ScaleForPixelHeight(cinfo_of(f), (float)px);
     stbtt_GetFontVMetrics(cinfo_of(f), &a, &d, &gap);
     int32_t asc = round_f((float)a * f->scale);
     int32_t dsc = round_f((float)(-d) * f->scale);
@@ -659,9 +660,12 @@ int font_set_px(font_t *f, uint32_t px)
         if (m.advance > 0 && (uint32_t)m.advance > maxadv) maxadv = (uint32_t)m.advance;
     }
     f->cell.cell_w = maxadv;
-    f->atlas = atlas_matching(f);
+    f->atlas = em ? NULL : atlas_matching(f);
     return FONT_OK;
 }
+
+int font_set_px(font_t *f, uint32_t px) { return set_size(f, px, 0); }
+int font_set_em_px(font_t *f, uint32_t px) { return set_size(f, px, 1); }
 
 int font_cell_metrics(const font_t *f, font_cell *out)
 {

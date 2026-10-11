@@ -1,3 +1,14 @@
+# edit-m3g — true em scaling and embedded primary
+
+Added font_set_em_px alongside the retained pixel-height API, and embedded the
+vendored immutable DejaVu outlines for editor worker atlas preparation. The
+editor now supports dynamic ASCII sizes; its reserved atlas versions and frame
+lifetime are owned in the editor module. Unicode primary/fallback integration
+remains with its existing bead and must consistently use the true em scale.
+
+Evidence: [worker report](../../docs/worker-reports/edit-m3g.md).
+Derivation and resource choices: [decision](../../docs/decisions/edit-m3g.md).
+
 # Font status — P4.11b / edit-457.19
 
 edit-08z production integration: the editor now owns font_async, using an

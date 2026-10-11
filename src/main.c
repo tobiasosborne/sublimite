@@ -3,6 +3,7 @@
 #include "journal/journal.h"
 #include "trace/trace.h"
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +86,21 @@ int main(int argc, char **argv)
         /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
          * pointers are reserved during startup, never on the typing path. */
         .tab_capacity = 1000u, .server = owns_server ? &server : NULL};
+    editor_display_size display_size;
+    if (!rc) rc = editor_runtime_display_size(&display_size);
+    if (!rc) {
+        config.font_dpi = display_size.dpi;
+        config.max_window_width = display_size.work_width;
+        config.max_window_height = display_size.work_height;
+        editor_runtime_window(display_size.work_width, display_size.work_height,
+                              &config.window_width, &config.window_height);
+        const char *point_size = getenv("EDIT_FONT_SIZE_PT");
+        if (point_size) {
+            char *tail = NULL; double points = strtod(point_size, &tail);
+            if (tail == point_size || *tail || !isfinite(points) || points <= 0) rc = EDITOR_ERR_ARG;
+            else config.font_points = points;
+        }
+    }
     if (!rc) rc = editor_open(&e, &config, &backend);
     if (!rc) rc = editor_open_request(e, &args.request, initial_token);
     ipc_args_fini(&args);

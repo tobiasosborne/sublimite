@@ -199,6 +199,7 @@ int editor_refresh_cursor(editor *e, uint64_t old_cursor)
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
+    if (editor_font_receive(e, msg)) return;
     if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
     if (editor_font_event(e, msg)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
@@ -375,10 +376,23 @@ static int resize(editor *e)
     if (dims.rows > e->max_rows) dims.rows = e->max_rows;
     e->resize_pending = false;
     if (dims.cols == e->grid.dims.cols && dims.rows == e->grid.dims.rows) return 0;
+    return editor_resize_grid(e, dims);
+}
+int editor_resize_grid(editor *e, render_dims dims)
+{
+    uint32_t cols = e->font.max_width / dims.cell_w, rows_limit = e->font.max_height / dims.cell_h;
+    if (!cols || !rows_limit) return EDITOR_ERR_CAPACITY;
+    if (dims.cols > cols) dims.cols = cols;
+    if (dims.rows > rows_limit) dims.rows = rows_limit;
+    if ((e->backend->info.capabilities & RENDER_CAP_RASTER_POOL) &&
+        (size_t)dims.cols * dims.rows > RASTER_FRAME_CELL_LIMIT)
+        dims.rows = RASTER_FRAME_CELL_LIMIT / dims.cols;
     int rc = render_backend_resize(e->backend, dims); if (rc) return rc;
     e->grid.dims = dims;
     e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
     e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
+    rc = font_async_bind(e->fonts, &e->grid); if (rc) return rc;
+    rc = font_async_bind(e->fonts, &e->text_grid); if (rc) return rc;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
     e->v.config.rows = e->text_grid.dims.rows;
     /* Reinit clears cells for a changed compact stride; retain open-time wrap storage. */
@@ -397,6 +411,7 @@ static int nonkey(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_EXPOSE) return editor_full_layout(e);
     if (ev->kind == PLAT_EV_RESIZE) {
         e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false;
+        e->font.window_width = ev->w; e->font.window_height = ev->h;
         e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
     }
     if (ev->kind == PLAT_EV_FOCUS) {
@@ -496,7 +511,10 @@ static bool runnable(const editor *e)
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
-    return editor_clip_runnable(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice || (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
+    return (e->font.requested_px != e->font.applied_px && !e->font.handle.epoch) ||
+           (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
+           e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->source_choice ||
+           (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
@@ -546,6 +564,8 @@ int editor_step(editor *e, int timeout_ms)
     if (e->error) return e->error;
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
     font_async_pump(e->fonts);
+    if (!e->font.handle.epoch)
+        font_async_pump(e->font.atlas[1u - e->font.current].fonts);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     int rc = present(e);
     if (!rc) rc = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
@@ -558,6 +578,7 @@ int editor_step(editor *e, int timeout_ms)
     uint64_t start = trace_now_ns();
     if (e->queue_count) e->caret_only = false;
     rc = e->action == EDITOR_ACTION_REPLAY_WORK ? 0 : blink(e, start);
+    if (!rc) rc = editor_font_poll(e);
     if (!rc && e->action != EDITOR_ACTION_REPLAY_WORK) rc = resize(e);
     record_slice(e, start); if (rc) return rc;
     for (;;) {
@@ -670,7 +691,7 @@ editor_stats editor_get_stats(const editor *e)
     s.focused = e->focused; s.blinking = e->blinking; s.cursor_visible = e->visible;
     s.render_active = e->backend->active;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+    s.pending = editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }
