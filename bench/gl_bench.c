@@ -16,7 +16,9 @@
 static bool gl_bench_fault(const char *stage)
 {
     const char *selected=getenv("EDIT_GL_BENCH_FAIL");
-    return selected!=NULL && strcmp(selected,stage)==0;
+    bool injected=selected!=NULL && strcmp(selected,stage)==0;
+    if (injected) fprintf(stderr,"gl_bench: INJECTED stage=%s\n",stage);
+    return injected;
 }
 #define GL_BENCH_OWNER_CHECK(c) do { if (!(c)) { fprintf(stderr,"gl_bench:%d: FAIL %s\n",__LINE__,#c); goto fail; } } while (0)
 typedef struct gl_bench_hooks { uint64_t device_ns, complete_ns, submit_ns, present_ns, fence_ns; uint32_t frame; } gl_bench_hooks;
@@ -460,7 +462,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
     size_t ncells=(size_t)dims.cols*dims.rows;
     GL_BENCH_OWNER_CHECK(edit_arena_init(&arena,ncells*sizeof(render_cell)+4096)==0);
     arena_live=true;
-    GL_BENCH_OWNER_CHECK(!gl_bench_fault("arena"));
+    if (gl_bench_fault("arena")) goto fail;
     render_cell *cells=edit_arena_alloc(&arena,ncells*sizeof(render_cell),_Alignof(render_cell));
     uint64_t dirty[2]={0}; render_grid grid;
     GL_BENCH_OWNER_CHECK(render_grid_init(&grid,dims,cells,ncells,dirty,2)==RENDER_OK);
@@ -475,18 +477,26 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
         .hooks={gl_bench_device,gl_bench_complete,&hooks}};
     int rc=gl_driver_prepare(&driver,&backend,&cfg);
     if (rc!=RENDER_OK) {
+        if (rc!=RENDER_ERR_UNSUPPORTED) {
+            fprintf(stderr,"gl_bench: FAIL driver_prepare result=%d\n",rc);
+            goto fail;
+        }
         if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"X11_unavailable");
         printf("BENCH name=egl_init_%upx status=SKIP reason=X11_unavailable result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
-    GL_BENCH_OWNER_CHECK(!gl_bench_fault("prepare"));
+    if (gl_bench_fault("prepare")) goto fail;
     rc=gl_driver_init(&driver);
     if (rc!=RENDER_OK) {
+        if (rc!=RENDER_ERR_UNSUPPORTED) {
+            fprintf(stderr,"gl_bench: FAIL driver_init result=%d\n",rc);
+            goto fail;
+        }
         if (!skip_reason && !upload_only) render_pace_skip(stdout,track_name,"EGL_or_matching_Present_unsupported");
         printf("BENCH name=egl_init_%upx status=SKIP reason=EGL_or_matching_Present_unsupported result=%d power=%s\n",px,rc,bench_evidence_tag());
         gl_driver_cleanup(&driver); edit_arena_free(&arena); return 2;
     }
-    GL_BENCH_OWNER_CHECK(!gl_bench_fault("init"));
+    if (gl_bench_fault("init")) goto fail;
     uint32_t id=0; uint64_t elapsed=0;
     if (scroll_only) {
         gl_scroll_track(&driver,&grid,&hooks,&id,&seed,track_name);
@@ -544,7 +554,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
                     printf("BENCH name=%s status=REFUSED reason=bulk_worker_did_not_start pass=0\n",bulks[k].name);
                     gl_bulk_stop(&bulk); failed=1; continue;
                 }
-                GL_BENCH_OWNER_CHECK(!gl_bench_fault("bulk"));
+                if (gl_bench_fault("bulk")) goto fail;
                 for (int full=1;full>=0;full--) {
                     bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
                     uint64_t c0=gl_bulk_chunks(&bulk); bulk.chunks_at_start=c0;
@@ -565,7 +575,7 @@ static int gl_bench_run(uint32_t px,bool quick,bool scroll_only,bool upload_only
                 "integrated_save_active","integrated_queued3"};
             for (unsigned kind=0;kind<4;kind++) {
                 GL_BENCH_OWNER_CHECK(gl_integrated_start(&integrated,&driver.workers,kind,GL_BULK_BYTES)==0);
-                GL_BENCH_OWNER_CHECK(!gl_bench_fault("integrated"));
+                if (gl_bench_fault("integrated")) goto fail;
                 for (int full=1;full>=0;full--) {
                     bench_samples_init(&samples,sample_buf,required); bench_samples_init(&samples4,sample_buf4,required);
                     uint64_t before=gl_integrated_progress(&integrated);

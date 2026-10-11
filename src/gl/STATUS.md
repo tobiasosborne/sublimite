@@ -1,3 +1,31 @@
+# GL — edit-40t worker continuation
+
+Benchmark acquisition faults now identify their actual stage and enter owner
+cleanup without assertion-failure diagnostics. Driver resource/init errors
+fail; only explicit unsupported native admission is a skip. The cleanup test
+requires stage evidence, refuses skipping the arena fault and checks workers
+on native skips. A headless benchmark test covers driver error classification
+and prepared-worker cleanup using real worker pools.
+
+GCC `make all`, release/sanitizer targeted GL regression lanes, and GL-free
+surrogate/production workload self-checks pass (M)[AC]: command exit status in
+`build/edit-40t-evidence/`, power status `Charging` from BAT0. ASan/UBSan remain
+enabled; LeakSanitizer cannot run under this sandbox's ptrace instrumentation.
+`make check` was run and stops at CLI IPC socket admission; local UNIX binding
+is denied as well as X access. Per-suite evidence and remaining verification
+limits are in `docs/worker-reports/edit-40t.md`.
+
+The complete individual sanitizer run confirms all default GL suites pass;
+native GL checks explicitly skip. Other failures include denied display/socket
+fixtures and an unresolved editor launcher-wait assertion. Serial editor reruns
+passed the initially failing cooperative-job and recovery cases. Those editor
+and IPC files were not changed. Full check acceptance remains incomplete.
+
+The supplied review's startup, blink and paired-identity integration findings
+remain outside the permitted editor/tool edit boundary. The optional red lanes
+and production behavior were not weakened. Native display, leak checks and
+the next Astra comparison remain coordinator work. No typing-path change.
+
 # GL — edit-40t (session 9)
 
 P2-1 sections 2, 5, 17, 18, 19 and 35 are implemented: authenticated diagnostics,

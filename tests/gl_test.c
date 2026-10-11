@@ -1391,16 +1391,42 @@ static int gl_bench_cleanup_test(void)
     GL_CHECK(unsetenv("EDIT_GL_BENCH_FAIL")==0);
     const char *stages[]={"arena","prepare","init","bulk","frame","integrated"};
     for (size_t stage=0;stage<sizeof stages/sizeof stages[0];stage++) {
+        /* Capture the actual fault site: an unrelated benchmark error must
+         * not pass this negative control merely by returning failure. */
+        FILE *diagnostics=tmpfile(); GL_CHECK(diagnostics!=NULL);
+        int saved_stderr=dup(STDERR_FILENO); GL_CHECK(saved_stderr>=0);
+        GL_CHECK(fflush(stderr)==0 && dup2(fileno(diagnostics),STDERR_FILENO)>=0);
         GL_CHECK(setenv("EDIT_GL_BENCH_FAIL",stages[stage],1)==0);
         int rc=gl_bench_run(15,true,false,false,true);
         GL_CHECK(unsetenv("EDIT_GL_BENCH_FAIL")==0);
-        if (rc==2) {
-            printf("gl_test: section 5 stage=%s SKIP: EGL/Present context unavailable on :99\n",stages[stage]);
-            continue;
+        GL_CHECK(fflush(stderr)==0 && dup2(saved_stderr,STDERR_FILENO)>=0);
+        GL_CHECK(close(saved_stderr)==0);
+        rewind(diagnostics);
+        const char prefix[]="gl_bench: INJECTED stage=";
+        /* Capacity derives from the longest acquisition fault name, plus
+         * the diagnostic prefix, newline and terminating byte. */
+        char line[sizeof prefix+sizeof "integrated-snapshot\n"];
+        bool injected=false, assertion_failed=false;
+        while (fgets(line,sizeof line,diagnostics)!=NULL) {
+            fputs(line,stderr);
+            if (strncmp(line,prefix,sizeof prefix-1)==0 &&
+                strncmp(line+sizeof prefix-1,stages[stage],strlen(stages[stage]))==0 &&
+                line[sizeof prefix-1+strlen(stages[stage])]=='\n') injected=true;
+            if (strstr(line,"FAIL")!=NULL) assertion_failed=true;
         }
-        GL_CHECK(rc==1);
+        GL_CHECK(!ferror(diagnostics)); GL_CHECK(fclose(diagnostics)==0);
         (void)nanosleep(&pause,NULL);
         GL_CHECK(gl_live_threads()==before);
+        if (rc==2) {
+            /* The arena fault precedes all native dependencies. */
+            GL_CHECK(strcmp(stages[stage],"arena")!=0 && !injected && !assertion_failed);
+            printf("gl_test: section 5 stage=%s SKIP: native prerequisite unavailable; fault not reached\n",stages[stage]);
+            continue;
+        }
+        GL_CHECK(rc==1 && injected);
+        if (strcmp(stages[stage],"arena")==0 || strcmp(stages[stage],"prepare")==0)
+            GL_CHECK(!assertion_failed);
+        printf("gl_test: section 5 stage=%s injected cleanup PASS\n",stages[stage]);
     }
     puts("gl_test: P2-1 section 5 PASS (arena/driver acquisition, active contention failure cleanup; native stages conditional)");
     return 0;

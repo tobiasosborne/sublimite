@@ -1,5 +1,24 @@
 # edit-40t — GL review ownership decisions
 
+## Worker continuation: benchmark fault and skip evidence
+
+Benchmark fault injection now identifies the stage actually reached. An
+injected acquisition fault enters the owner cleanup directly, without printing
+an assertion failure. Tests require the stage marker; a generic failure return
+cannot prove that the negative control ran. The arena fault has no native
+prerequisite and cannot be skipped. Native faults explicitly distinguish an
+unreached injection from exercised cleanup, including thread checks on skips.
+
+Only `RENDER_ERR_UNSUPPORTED` is an infrastructure skip in initial benchmark
+driver preparation/initialization. Resource/init errors and observation timeouts
+are benchmark failures. A headless test scripts native admission while keeping
+the real worker pool and benchmark owner cleanup, so this classification and
+prepared-worker cleanup remain testable with the X socket denied.
+
+This changes cold benchmark/test diagnostics and error handling only. The
+renderer, editor factory selection, and typing path are unchanged. The existing
+startup/blink/paired-tool scope boundaries below still apply.
+
 GL diagnostics authenticate the implementation by its submit operation and require initialized, non-null opaque state before casting. Diagnostics on other backends return neutral values/errors.
 
 Each GL backend opens its own native XCB connection using the platform’s default DISPLAY, then owns the resulting EGLDisplay. The platform window remains borrowed and must outlive the backend. DISPLAY must stay the same between platform creation and backend initialization. This avoids a process-global display registry and lets every successful/failed backend terminate its initialized display before disconnecting its native identity. Backends using windows from a shared platform connection therefore have distinct EGLDisplays; terminating one cannot invalidate another.
