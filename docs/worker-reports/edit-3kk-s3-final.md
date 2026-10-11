@@ -1,0 +1,3 @@
+Resident scrolling, fractional rendering, and refresh hooks are wired. The null benchmark reports `SYNTHETIC_PASS`.
+
+`make all` and focused sanitizer checks pass. Display/IPC suites need an unsandboxed rerun. Native cadence, wrapped integration, and the pre-existing view/oracle fuzz disagreement remain documented in the [worker report](/home/tobias/Projects/sublimite/.wt/edit-3kk/docs/worker-reports/edit-3kk.md).
