@@ -3,7 +3,10 @@
  * (Tobias, 2026-10-09). Before main(): if DISPLAY names display 0 (":0", ":0.N",
  * "unix:0", "localhost:0") and EDIT_ALLOW_REAL_DISPLAY is unset, DISPLAY is redirected
  * to EDIT_DISPLAY (default ":99", the session's private Xvfb). Set
- * EDIT_ALLOW_REAL_DISPLAY=1 only for an explicit real-display bench pass. */
+ * EDIT_ALLOW_REAL_DISPLAY=1 only for an explicit real-display bench pass.
+ * Wayland names have no private-number convention: inherited WAYLAND_DISPLAY
+ * and WAYLAND_SOCKET are cleared unless allowed; EDIT_WAYLAND_DISPLAY names
+ * an explicitly selected private compositor. */
 #ifndef EDIT_DISPLAY_GUARD_H
 #define EDIT_DISPLAY_GUARD_H
 #include <stdio.h>
@@ -11,6 +14,7 @@
 #include <string.h>
 
 #include "editor/runtime.h"
+#include "wayland/plat.h"
 /* Use the production policy for both input and alternate-display validation.
  * It normalizes the numeric display after the final colon, independent of
  * host/transport spelling; zero and invalid/missing displays are refused. */
@@ -21,6 +25,16 @@ static int edit_display_is_real(const char *d)
 
 __attribute__((constructor)) static void edit_display_guard(void)
 {
+    const char *wayland = getenv("WAYLAND_DISPLAY");
+    const char *allow = getenv("EDIT_ALLOW_REAL_DISPLAY");
+    if (!allow) {
+        const char *safe = wayland_display_select(wayland, getenv("EDIT_WAYLAND_DISPLAY"), NULL);
+        if (safe) (void)setenv("WAYLAND_DISPLAY", safe, 1);
+        else (void)unsetenv("WAYLAND_DISPLAY");
+        /* Inherited descriptor bypasses WAYLAND_DISPLAY, so clear it too.
+         * Headless mocks install their private socketpair after this guard. */
+        (void)unsetenv("WAYLAND_SOCKET");
+    }
     const char *d = getenv("DISPLAY");
     if (d == NULL || getenv("EDIT_ALLOW_REAL_DISPLAY") != NULL) return;
     if (!edit_display_is_real(d)) return;

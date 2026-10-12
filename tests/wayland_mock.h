@@ -41,6 +41,7 @@ struct mock_wayland {
     struct wl_display *display;
     struct wl_resource *surface, *xdg, *top, *keyboard, *pointer, *frame, *feedback;
     bool configured, acked, discard, defer, holding;
+    int32_t output_scale; bool no_presentation;
     const uint8_t *payload; size_t payload_len;
     mock_tx tx[2]; /* parallel requests for the two advertised UTF-8 MIME names */
     size_t tx_done; unsigned rx_requests; struct wl_resource *source;
@@ -244,18 +245,29 @@ static void mock_bind_presentation(struct wl_client *client, void *data, uint32_
 { struct wl_resource *r = wl_resource_create(client, &wp_presentation_interface, (int)version, id); wl_resource_set_implementation(r, &mock_presentation_ops, data, NULL); wp_presentation_send_clock_id(r, (uint32_t)CLOCK_MONOTONIC); }
 static void mock_bind_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wl_data_device_manager_interface, (int)version, id); wl_resource_set_implementation(r, &mock_manager_ops, data, NULL); }
+/* (P) Unit logical output = minimum nonzero dimensions; scale is the
+ * smallest integer above unity. Thus mode is scale * unit on both axes. */
+static void mock_bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    mock_wayland *m = data;
+    struct wl_resource *r = wl_resource_create(client, &wl_output_interface, (int)version, id);
+    wl_output_send_geometry(r, 0, 0, 0, 0, WL_OUTPUT_SUBPIXEL_UNKNOWN, "mock", "scaled", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT, m->output_scale, m->output_scale, 0);
+    wl_output_send_scale(r, m->output_scale); wl_output_send_done(r);
+}
 static void mock_client_gone(struct wl_listener *listener, void *data)
 { (void)data; mock_wayland *m = *(mock_wayland **)(listener + 1); wl_display_terminate(m->display); }
-static pid_t mock_start_ex(bool shell, bool defer, const uint8_t *payload, size_t len)
+static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, size_t len, int32_t scale, bool no_presentation)
 {
     int sockets[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets));
     pid_t child = fork(); assert(child >= 0);
     if (!child) {
-        close(sockets[0]); mock_wayland m = {.payload = payload, .payload_len = len, .defer = defer}; m.display = wl_display_create(); assert(m.display);
+        close(sockets[0]); mock_wayland m = {.payload = payload, .payload_len = len, .defer = defer, .output_scale = scale, .no_presentation = no_presentation}; m.display = wl_display_create(); assert(m.display);
         assert(wl_global_create(m.display, &wl_compositor_interface, 4, &m, mock_bind_compositor));
         if (shell) assert(wl_global_create(m.display, &xdg_wm_base_interface, 1, &m, mock_bind_shell));
         assert(wl_global_create(m.display, &wl_seat_interface, WL_POINTER_AXIS_VALUE120_SINCE_VERSION, &m, mock_bind_seat));
-        assert(wl_global_create(m.display, &wp_presentation_interface, 1, &m, mock_bind_presentation));
+        if (!m.no_presentation) assert(wl_global_create(m.display, &wp_presentation_interface, 1, &m, mock_bind_presentation));
+        if (m.output_scale) assert(wl_global_create(m.display, &wl_output_interface, WL_OUTPUT_SCALE_SINCE_VERSION, &m, mock_bind_output));
         assert(wl_global_create(m.display, &wl_data_device_manager_interface, 1, &m, mock_bind_manager));
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};
@@ -266,6 +278,8 @@ static pid_t mock_start_ex(bool shell, bool defer, const uint8_t *payload, size_
     assert(snprintf(number, sizeof number, "%d", sockets[0]) > 0); assert(!setenv("WAYLAND_SOCKET", number, 1));
     return child;
 }
+static inline pid_t mock_start_ex(bool shell, bool defer, const uint8_t *payload, size_t len)
+{ return mock_start_options(shell, defer, payload, len, 0, false); }
 static inline pid_t mock_start_payload(bool shell, const uint8_t *payload, size_t len) { return mock_start_ex(shell, false, payload, len); }
 static inline pid_t mock_start(bool shell) { return mock_start_payload(shell, NULL, 0); }
 static void mock_join(pid_t child)

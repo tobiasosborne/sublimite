@@ -1,21 +1,36 @@
-# Wayland — edit-v0o.1
+# Wayland — edit-1zm disposition
 
-Implemented: optional raw client backend, compositor/xdg-shell configure/ack,
-xkbcommon keyboard/compose/repeat, pointer/framed scroll, asynchronous UTF-8
-clipboard, frame callbacks and matching presentation feedback. Main chooses
-Wayland only without a nonempty X display; legacy plat initialization is X11.
-GL uses its existing worker loader and fences, with no extra frame-callback gate.
+Implemented in this worktree: input overflow drops/counts rather than poisoning
+the connection; readable startup diagnostics; descriptor-based connection paths
+for long runtime directories; explicit Wayland display guard; startup output
+DPI, EGL buffer scale, configure conversion and pointer coordinate conversion.
+The headless protocol mock and the null-editor allocation test cover these paths.
 
-Headless protocol, mocked-fence integration and benchmark endpoint tests pass
-under ASan/UBSan and gcc release. The release decoder allocator guard passes.
-The dependency-disabled application/stub build and fixed fuzzer seeds pass.
-make all passes. make check was attempted; individual runnable suites pass,
-while X and IPC socket restrictions block the host-dependent suites.
+The release allocator test separately counts native transport before decoded
+ingress and one-shot frame/proxy creation after submit. The enforced bracket
+covers decoded input, mutation, layout and null backend submit. Calibration
+proves that the release interposer is active; sanitizer counts remain inert.
+Actual EGL-driver submit allocation and physical input latency need a compositor.
 
-Acceptance is pending actual Wayland EGL/pixels, recorded G1/G3, the host full
-check with LeakSanitizer and the next Astra comparison. Primary selection is
-unsupported by wl_data_device; output scaling/cursor/decorations are not added.
-The application clipboard wiring is outside this bead.
+Missing: a Wayland CPU raster renderer. The XShm/Present CPU backend rejects
+Wayland, so GL still requires wp_presentation and no CPU fallback is available
+without it. The opt-in headless acceptance probe remains red:
+`build/tests/wayland_test --require-presentation-fallback`.
+This needs wl_shm buffer ownership/release and a decision about completion when
+matching presentation timestamps are unavailable; it is larger than a local
+backend guard correction. The bead remains incomplete.
 
-[Worker evidence](../../docs/worker-reports/edit-v0o.1.md).
-[Design/provenance](../../docs/decisions/edit-v0o.1.md).
+Startup output selection is the highest-scale advertised output. Surface-enter
+selection, output moves, runtime DPI/font changes, old compositor versions
+without buffer scaling, and font-DPI startup on inherited WAYLAND_SOCKET are
+not complete. The inherited descriptor is preserved for platform initialization;
+main cannot consume that existing protocol connection in a preliminary query.
+
+No compositor exists in this sandbox. Real Wayland EGL pixels, compositor
+buffer-scale negotiation and mixed-output movement need a host compositor.
+X display suites must be re-run by the coordinator on the private Xvfb display
+specified in the worker brief. Full check also encounters sandbox LeakSanitizer
+and IPC restrictions, detailed in the worker report.
+
+[Worker report](../../docs/worker-reports/edit-1zm-s6.md).
+[Decisions](../../docs/decisions/edit-1zm.md).

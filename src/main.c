@@ -1,5 +1,6 @@
 #include "editor/editor.h"
 #include "editor/runtime.h"
+#include "wayland/plat.h"
 #include "journal/journal.h"
 #include "trace/trace.h"
 #include <errno.h>
@@ -25,6 +26,17 @@ int main(int argc, char **argv)
     plat_backend platform_backend = plat_backend_select(display, wayland_display);
     const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
     if (platform_backend == PLAT_BACKEND_X11 && selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
+    if (platform_backend == PLAT_BACKEND_WAYLAND) {
+        const char *safe = wayland_display_select(wayland_display, getenv("EDIT_WAYLAND_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
+        if (!getenv("EDIT_ALLOW_REAL_DISPLAY")) {
+            /* A descriptor overrides the socket name: only explicit opt-in
+             * can inherit one. Private alternate names use XDG_RUNTIME_DIR. */
+            if (unsetenv("WAYLAND_SOCKET")) goto startup_fail;
+            if (!safe) { fprintf(stderr, "sublimite: Wayland display guard refused compositor; set EDIT_WAYLAND_DISPLAY for a private compositor or EDIT_ALLOW_REAL_DISPLAY to opt in\n"); goto startup_fail; }
+        }
+        if (safe != wayland_display && safe && setenv("WAYLAND_DISPLAY", safe, 1)) goto startup_fail;
+        wayland_display = getenv("WAYLAND_DISPLAY");
+    }
     display = platform_backend == PLAT_BACKEND_WAYLAND ? wayland_display : getenv("DISPLAY");
     if (!args.request.new_instance) {
         ipc_result role = ipc_server_init_display(&server, NULL, display);
@@ -83,6 +95,7 @@ int main(int argc, char **argv)
     render_backend backend = {0};
     /* The only application backend selection site; init may fall back once. */
     int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
+    const char *platform_error = NULL;
     editor *e = NULL;
     editor_config config = {.journal_path = journal_path, .start_empty = true, .raster_fallback = true, .load_preferences = true,
         .font_family = args.font_family, .font_file = args.font_file,
@@ -90,17 +103,29 @@ int main(int argc, char **argv)
          * pointers are reserved during startup, never on the typing path. */
         .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend};
     editor_display_size display_size;
-    /* X11 query only: Wayland has no DISPLAY to ask and keeps the legacy
-     * 96-dpi/grid defaults until output scale lands (edit-v0o.1 rebase). */
-    bool x11_size = platform_backend == PLAT_BACKEND_X11;
-    if (!rc && x11_size) rc = editor_runtime_display_size(&display_size);
-    if (!rc && x11_size) {
+    /* A supplied Wayland fd is an existing protocol connection, not a socket
+     * name from which another connection can be opened. Preserve it for
+     * platform init rather than consume it in the preliminary output query. */
+    bool native_size = platform_backend == PLAT_BACKEND_X11 ||
+        (!(backend.info.capabilities & RENDER_CAP_HEADLESS) && !getenv("WAYLAND_SOCKET"));
+    if (!rc && native_size) {
+        if (platform_backend == PLAT_BACKEND_X11) rc = editor_runtime_display_size(&display_size);
+        else {
+            wayland_display_info output;
+            rc = wayland_display_size(&output);
+            if (rc) platform_error = wayland_error_string(rc);
+            if (!rc) display_size = (editor_display_size){output.dpi, output.width, output.height};
+        }
+    }
+    if (!rc && native_size) {
         config.font_dpi = display_size.dpi;
-        config.max_window_width = display_size.work_width;
-        config.max_window_height = display_size.work_height;
-        editor_runtime_window(display_size.work_width, display_size.work_height,
-                              &config.window_width, &config.window_height);
-        config.window_size_default = true; /* hot exit restores the last window size */
+        if (display_size.work_width && display_size.work_height) {
+            config.max_window_width = display_size.work_width;
+            config.max_window_height = display_size.work_height;
+            editor_runtime_window(display_size.work_width, display_size.work_height,
+                                  &config.window_width, &config.window_height);
+            config.window_size_default = true;
+        }
         const char *point_size = getenv("EDIT_FONT_SIZE_PT");
         if (point_size) {
             char *tail = NULL; double points = strtod(point_size, &tail);
@@ -135,7 +160,8 @@ int main(int argc, char **argv)
             if (!rc) rc = EDITOR_ERR_IO;
         }
     }
-    if (rc) fprintf(stderr, "sublimite: error %d; journal: %s\n", rc, journal_path);
+    if (rc && platform_error) fprintf(stderr, "sublimite: %s; journal: %s\n", platform_error, journal_path);
+    else if (rc) fprintf(stderr, "sublimite: error %d; journal: %s\n", rc, journal_path);
     else fprintf(stderr, "sublimite: unsaved session journal: %s\n", journal_path);
     return rc ? 1 : 0;
 startup_fail:

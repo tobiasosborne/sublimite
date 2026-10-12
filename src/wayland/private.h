@@ -13,6 +13,9 @@ void x11_plat_shutdown(plat *p);
 int x11_plat_clip_set(plat *p, int which, const void *utf8, size_t len);
 int x11_plat_clip_request(plat *p, int which);
 const uint8_t * x11_plat_clip_data(const plat *p, size_t *len);
+/* INIT-only connection; supports long runtime directories through a dirfd. */
+int wayland_display_size_on(void *display, wayland_display_info *info);
+int wayland_connect(void **display);
 int wayland_plat_init(plat *p, const plat_config *cfg);
 void wayland_plat_map(plat *p);
 void wayland_plat_set_blink(plat *p, uint32_t ms);

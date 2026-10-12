@@ -58,7 +58,7 @@ typedef struct wayland_state {
     struct wp_presentation_feedback *feedback;
     struct wl_callback *frame;
     uint32_t compositor_name, shell_name, seat_name, presentation_name;
-    uint32_t pending_width, pending_height;
+    uint32_t pending_width, pending_height, scale;
     uint32_t frame_id, serial, buttons, repeat_key, delay_ms, rate_hz;
     int32_t x, y;
     bool configured, failed, frame_ready, displayed, discarded, notify;
@@ -76,6 +76,7 @@ typedef struct wayland_state {
     bool clock_valid; uint32_t clock_ms; uint64_t clock_ns;
     plat_event events[WL_EVENT_CAP];
     size_t head, count;
+    uint64_t dropped;
     wayland_blob *owned; uint8_t *received, *incoming;
     size_t received_len, received_cap, incoming_len, incoming_cap, clip_bytes;
     bool local_receive;
@@ -86,7 +87,7 @@ static wayland_state *W(const plat *p) { return p ? p->wayland : NULL; }
 static struct wl_display *D(const plat *p) { return p->conn; }
 static void push(wayland_state *s, plat_event ev)
 {
-    if (s->count == WL_EVENT_CAP) { s->failed = true; return; }
+    if (s->count == WL_EVENT_CAP) { s->dropped++; return; }
     if (!ev.t0_ns) ev.t0_ns = trace_now_ns();
     s->events[(s->head + s->count) % WL_EVENT_CAP] = ev;
     s->count++;
@@ -98,6 +99,7 @@ bool wayland_plat_poll_event(plat *p, plat_event *out)
     *out = s->events[s->head]; s->head = (s->head + 1) % WL_EVENT_CAP; s->count--;
     return true;
 }
+uint64_t wayland_input_dropped(const plat *p) { return W(p) ? W(p)->dropped : 0; }
 static void timer_arm(int fd, uint32_t delay, uint32_t rate)
 {
     struct itimerspec it = {0};
@@ -166,8 +168,10 @@ static void top_configure(void *data, struct xdg_toplevel *top, int32_t width, i
 {
     (void)top; (void)states; wayland_state *s = data;
     /* xdg-shell zero means client chooses, independently for each dimension. */
-    s->pending_width = width > 0 ? (uint32_t)width : s->p->width;
-    s->pending_height = height > 0 ? (uint32_t)height : s->p->height;
+    if ((width > 0 && (uint32_t)width > (uint32_t)INT32_MAX / s->scale) ||
+        (height > 0 && (uint32_t)height > (uint32_t)INT32_MAX / s->scale)) { s->failed = true; return; }
+    s->pending_width = width > 0 ? (uint32_t)width * s->scale : s->p->width;
+    s->pending_height = height > 0 ? (uint32_t)height * s->scale : s->p->height;
 }
 static void top_close(void *data, struct xdg_toplevel *top)
 { (void)top; push(data, (plat_event){.kind = PLAT_EV_CLOSE}); }
@@ -264,13 +268,18 @@ static void keyboard_repeat(void *data, struct wl_keyboard *keyboard, int32_t ra
 { (void)keyboard; wayland_state *s = data; wayland_plat_set_repeat(s->p, delay > 0 ? (uint32_t)delay : 0, rate > 0 ? (uint32_t)rate : 0); }
 static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard_keymap, .enter = keyboard_enter,
     .leave = keyboard_leave, .key = keyboard_key, .modifiers = keyboard_modifiers, .repeat_info = keyboard_repeat};
+static int32_t pointer_pixel(wl_fixed_t value, uint32_t scale)
+{
+    int64_t pixel = (int64_t)wl_fixed_to_int(value) * scale;
+    return pixel > INT32_MAX ? INT32_MAX : pixel < INT32_MIN ? INT32_MIN : (int32_t)pixel;
+}
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
-{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; s->x = wl_fixed_to_int(x); s->y = wl_fixed_to_int(y); }
+{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale); }
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
 { (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; }
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
-    (void)pointer; wayland_state *s = data; s->x = wl_fixed_to_int(x); s->y = wl_fixed_to_int(y);
+    (void)pointer; wayland_state *s = data; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale);
     push(s, (plat_event){.kind = PLAT_EV_MOTION, .x = s->x, .y = s->y, .buttons = s->buttons, .mods = s->mods, .time_ms = time, .t0_ns = input_stamp(s, time)});
 }
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
@@ -427,12 +436,14 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
     if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
     if (cfg->headless) return PLAT_ERR_NO_DISPLAY;
     if (!cfg->width || !cfg->height || cfg->width > INT32_MAX || cfg->height > INT32_MAX) return PLAT_ERR_FAIL;
-    struct wl_display *display = wl_display_connect(NULL);
-    if (!display) return PLAT_ERR_NO_DISPLAY;
+    void *connection = NULL;
+    int connected = wayland_connect(&connection);
+    if (connected != PLAT_OK) return connected;
+    struct wl_display *display = connection;
     p->conn = display; p->width = cfg->width; p->height = cfg->height;
     wayland_state *s = calloc(1, sizeof *s); p->wayland = s;
     if (!s) goto fail;
-    s->p = p; s->rx_fd = -1;
+    s->p = p; s->rx_fd = -1; s->scale = 1; /* (P) initial buffer scale is unity */
     for (size_t i = 0; i < WL_CLIP_SENDS; i++) s->tx[i].fd = -1;
     s->clock_id = UINT32_MAX;
     p->work_fd = cfg->work_eventfd;
@@ -451,7 +462,17 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
         wl_data_device_add_listener(s->device, &device_listener, s);
     }
     if (wl_display_roundtrip(display) < 0 || s->failed) goto fail;
+    wayland_display_info output;
+    if (wayland_display_size_on(display, &output) != PLAT_OK) goto fail;
+    if (wl_proxy_get_version((struct wl_proxy *)s->compositor) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+        s->scale = output.scale;
+    /* (P) buffer pixel extents must be divisible by the integer scale. Round
+     * down within the caller's reserve; the minimum surface is one logical pixel. */
+    p->width = (p->width / s->scale ? p->width / s->scale : 1) * s->scale;
+    p->height = (p->height / s->scale ? p->height / s->scale : 1) * s->scale;
     s->surface = wl_compositor_create_surface(s->compositor);
+    if (wl_proxy_get_version((struct wl_proxy *)s->surface) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+        wl_surface_set_buffer_scale(s->surface, (int32_t)s->scale);
     s->xdg = xdg_wm_base_get_xdg_surface(s->shell, s->surface); xdg_surface_add_listener(s->xdg, &xdg_listener, s);
     s->top = xdg_surface_get_toplevel(s->xdg); xdg_toplevel_add_listener(s->top, &top_listener, s);
     xdg_toplevel_set_title(s->top, cfg->title ? cfg->title : "sublimité"); xdg_toplevel_set_app_id(s->top, "sublimite");
@@ -740,6 +761,7 @@ void wayland_plat_shutdown(plat *p)
     p->timer_fd = p->repeat_fd = p->work_fd = -1;
 }
 #else
+uint64_t wayland_input_dropped(const plat *p) { (void)p; return 0; }
 bool wayland_input_key(plat *p, uint32_t key, uint32_t time, bool press, bool repeat)
 { (void)p; (void)key; (void)time; (void)press; (void)repeat; return false; }
 int wayland_plat_init(plat *p, const plat_config *cfg)

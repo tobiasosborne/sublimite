@@ -1,6 +1,21 @@
 #include "wayland/private.h"
 #include <string.h>
 
+const char *wayland_display_select(const char *display, const char *safe, const char *allow)
+{
+    if (allow) return display;
+    return safe && *safe ? safe : NULL;
+}
+const char *wayland_error_string(int code)
+{
+    switch (code) {
+    case PLAT_ERR_SOCKET_PATH: return "Wayland socket path is too long for the Unix socket ABI (shorten WAYLAND_DISPLAY)";
+    case PLAT_ERR_NO_DISPLAY: return "cannot connect to Wayland compositor (check WAYLAND_DISPLAY, WAYLAND_SOCKET and XDG_RUNTIME_DIR)";
+    case PLAT_ERR_FAIL: return "Wayland setup or protocol failed (requires wl_compositor, xdg_wm_base and wl_seat)";
+    default: return NULL;
+    }
+}
+
 plat_backend plat_backend_select(const char *display, const char *wayland_display)
 { return display && *display ? PLAT_BACKEND_X11 : wayland_display && *wayland_display ? PLAT_BACKEND_WAYLAND : PLAT_BACKEND_X11; }
 
