@@ -72,6 +72,9 @@ typedef struct gl_state {
     bool swapped, failed, startup;
     uint32_t swapped_id;
     uint64_t verified_ns, completion_deadline;
+    /* edit-848: liveness round trip sent when the completion window expires. */
+    unsigned int probe_seq;
+    bool probe_pending, probe_answered;
     work_pool *workers;
     work_handle wake;
     uint32_t wake_generation;
@@ -1158,6 +1161,8 @@ static int gl_present(render_backend *b,uint32_t id)
     if (rc!=RENDER_OK) { s->gDeleteSync(s->fence); s->fence=NULL; return rc; }
     if (s->startup && !s->complete_selected) return gl_fail(s);
     s->completion_deadline=trace_now_ns()+GL_COMPLETION_TIMEOUT_NS;
+    if (s->probe_pending) xcb_discard_reply(s->native_conn,s->probe_seq); /* never left queued */
+    s->probe_pending=s->probe_answered=false;
     bool wayland=s->platform->backend==PLAT_BACKEND_WAYLAND;
     if (wayland && wayland_frame_arm(s->platform,id)!=PLAT_OK) return gl_fail(s);
     if (!s->eSwapBuffers(s->display,s->surface)) {
@@ -1168,6 +1173,36 @@ static int gl_present(render_backend *b,uint32_t id)
     s->pending_serial=wayland ? id : ++s->swap_serial;
     s->present_verified=false; s->verified_ns=0;
     /* Nothing after the committed swap may turn this attempt into a retry. */
+    return RENDER_OK;
+}
+/* edit-848 (edit-cee's policy for GL): the completion window counts only time
+ * in which the X server is known to run. When it expires, a round trip goes
+ * out on the connection that carried the swap's PresentPixmap (Mesa issues it
+ * on native_conn), so its answer orders after that request. Until the server
+ * answers it is stalled (load, root screenshots, a stopped Xvfb), not lost: the
+ * window re-arms. After the answer a PIXMAP missing for a full window fails as
+ * before. The probe is sent only after an expiry, never per frame, so the
+ * typing path is unchanged. Without an X connection (Wayland) expiry fails. */
+static int gl_completion_window(gl_state *s)
+{
+    if (s->completion_deadline==0) return RENDER_OK;
+    uint64_t now=trace_now_ns();
+    if (s->probe_pending) {
+        void *reply=NULL; xcb_generic_error_t *err=NULL;
+        if (xcb_poll_for_reply(s->native_conn,s->probe_seq,&reply,&err)) {
+            free(reply); free(err); /* any answer proves the server ran past the swap */
+            s->probe_pending=false; s->probe_answered=true;
+            s->completion_deadline=now+GL_COMPLETION_TIMEOUT_NS;
+        }
+    }
+    if (now<s->completion_deadline) return RENDER_OK;
+    if (s->native_conn==NULL || s->probe_answered) return RENDER_ERR_DEVICE;
+    if (!s->probe_pending) {
+        s->probe_seq=xcb_get_input_focus(s->native_conn).sequence;
+        if (xcb_flush(s->native_conn)<=0) return RENDER_ERR_DEVICE;
+        s->probe_pending=true;
+    }
+    s->completion_deadline=now+GL_COMPLETION_TIMEOUT_NS;
     return RENDER_OK;
 }
 static int gl_event(render_backend *b,const render_event *event)
@@ -1185,8 +1220,8 @@ static int gl_event(render_backend *b,const render_event *event)
     if (event->work==NULL || event->work->kind!=GL_POLL_MESSAGE) return RENDER_ERR_UNSUPPORTED;
     if (s->failed) return RENDER_ERR_DEVICE;
     if (!b->active || !b->presented) return RENDER_OK;
-    if ((s->completion_deadline!=0 && trace_now_ns()>=s->completion_deadline) ||
-        (s->native_conn!=NULL && xcb_connection_has_error(s->native_conn))) return gl_fail(s);
+    if ((s->native_conn!=NULL && xcb_connection_has_error(s->native_conn)) ||
+        gl_completion_window(s)!=RENDER_OK) return gl_fail(s);
     if (!gl_bind(s)) return gl_fail(s);
     if (s->gGetGraphicsResetStatus!=NULL && s->gGetGraphicsResetStatus()!=GL_NO_ERROR) return gl_fail(s);
     if (gl_ring_poll(s)!=RENDER_OK) return gl_fail(s);

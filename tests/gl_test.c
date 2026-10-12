@@ -16,9 +16,33 @@ typedef struct gl_review_queue {
     xcb_present_complete_notify_event_t events[16];
     size_t next, count;
 } gl_review_queue;
+/* edit-848: a scripted X connection for the stalled-server probe. Its
+ * address is the sentinel; every other connection reaches real libxcb. */
+typedef struct gl_review_conn { unsigned probes, discards; bool answer; } gl_review_conn;
+static gl_review_conn gl_review_stalled;
+#define GL_REVIEW_FAKE(c) ((const void *)(c)==(const void *)&gl_review_stalled)
+static int gl_review_has_error(xcb_connection_t *c)
+{ return GL_REVIEW_FAKE(c) ? 0 : xcb_connection_has_error(c); }
+static int gl_review_flush(xcb_connection_t *c) { return GL_REVIEW_FAKE(c) ? 1 : xcb_flush(c); }
+static xcb_get_input_focus_cookie_t gl_review_focus(xcb_connection_t *c)
+{
+    if (!GL_REVIEW_FAKE(c)) return xcb_get_input_focus(c);
+    gl_review_stalled.probes++;
+    return (xcb_get_input_focus_cookie_t){1000u+gl_review_stalled.probes};
+}
+static int gl_review_reply(xcb_connection_t *c, unsigned seq, void **reply, xcb_generic_error_t **err)
+{
+    if (!GL_REVIEW_FAKE(c)) return xcb_poll_for_reply(c,seq,reply,err);
+    *reply=NULL; *err=NULL;
+    if (!gl_review_stalled.answer || seq!=1000u+gl_review_stalled.probes) return 0;
+    *reply=calloc(1,sizeof(xcb_get_input_focus_reply_t));
+    return *reply!=NULL;
+}
+static void gl_review_discard(xcb_connection_t *c, unsigned seq)
+{ if (GL_REVIEW_FAKE(c)) gl_review_stalled.discards++; else xcb_discard_reply(c,seq); }
 static xcb_generic_event_t *gl_review_poll(xcb_connection_t *conn, xcb_special_event_t *special)
 {
-    if (conn!=NULL) return xcb_poll_for_special_event(conn,special);
+    if (conn!=NULL && !GL_REVIEW_FAKE(conn)) return xcb_poll_for_special_event(conn,special);
     if (special==NULL) return NULL;
     gl_review_queue *q=(void *)special;
     if (q->next==q->count) return NULL;
@@ -27,6 +51,11 @@ static xcb_generic_event_t *gl_review_poll(xcb_connection_t *conn, xcb_special_e
     return ev;
 }
 #define xcb_poll_for_special_event gl_review_poll
+#define xcb_connection_has_error gl_review_has_error
+#define xcb_flush gl_review_flush
+#define xcb_get_input_focus gl_review_focus
+#define xcb_poll_for_reply gl_review_reply
+#define xcb_discard_reply gl_review_discard
 #define render_gl_backend gl_test_factory
 #define gl_present_complete gl_test_present_complete
 #define gl_completion_status gl_test_completion_status
@@ -38,6 +67,11 @@ static xcb_generic_event_t *gl_review_poll(xcb_connection_t *conn, xcb_special_e
 #define gl_cells_submit gl_test_cells_submit
 #include "../src/gl/gl.c"
 #undef xcb_poll_for_special_event
+#undef xcb_connection_has_error
+#undef xcb_flush
+#undef xcb_get_input_focus
+#undef xcb_poll_for_reply
+#undef xcb_discard_reply
 #undef render_gl_backend
 #undef gl_present_complete
 #undef gl_completion_status
@@ -833,6 +867,51 @@ static int gl_review_completion_faults(void)
     }
     return 0;
 }
+/* edit-848 (edit-cee for GL): a PIXMAP missing for the whole window on a
+ * healthy connection is first asked about. A round trip goes out on the
+ * connection that carried the swap; while the X server has not answered it is
+ * stalled (load, root screenshots, a stopped Xvfb), not lost, and the window
+ * re-arms. A server that answers and then withholds PIXMAP for a full window
+ * still fails, as does a missing PIXMAP with no X connection to ask. */
+static int gl_review_stalled_server(void)
+{
+    const xcb_present_complete_notify_event_t pixmap={.event_type=XCB_PRESENT_COMPLETE_NOTIFY,
+        .kind=XCB_PRESENT_COMPLETE_KIND_PIXMAP,.mode=XCB_PRESENT_COMPLETE_MODE_COPY,
+        .serial=17,.window=44,.msc=123};
+    for (unsigned lost=0;lost<2;lost++) {
+        gl_state s; render_backend b; plat p; gl_review_queue q={0};
+        gl_review_pending(&b,&s,&p,&q);
+        gl_review_stalled=(gl_review_conn){0};
+        s.native_conn=(xcb_connection_t *)(void *)&gl_review_stalled;
+        s.completion_deadline=trace_now_ns()-1; /* the swap's window has run out */
+        int rc=gl_test_present_complete(&b,17,0,123);
+        printf("edit-848 gl: lost=%u first expiry=%d probes=%u\n",lost,rc,gl_review_stalled.probes);
+        GL_CHECK(rc==RENDER_OK && !s.failed && b.active && !b.t6_sent);
+        GL_CHECK(gl_review_stalled.probes==1 && s.completion_deadline>trace_now_ns());
+        /* Still stalled at the next expiry: no second probe, no failure. */
+        s.completion_deadline=trace_now_ns()-1;
+        GL_CHECK(gl_test_present_complete(&b,17,0,123)==RENDER_OK && !s.failed && b.active);
+        GL_CHECK(gl_review_stalled.probes==1);
+        gl_review_stalled.answer=true; /* SIGCONT: the server answers */
+        if (!lost) {
+            q.events[0]=pixmap; q.count=1; /* and delivers the swap's PIXMAP */
+            GL_CHECK(gl_test_present_complete(&b,17,0,123)==RENDER_OK);
+            GL_CHECK(!s.failed && !b.active && b.t6_sent && s.msc==123);
+            continue;
+        }
+        /* Answered: the window restarts at the answer; a PIXMAP still missing
+         * for that full window on a running server is a lost completion. */
+        GL_CHECK(gl_test_present_complete(&b,17,0,123)==RENDER_OK && b.active);
+        GL_CHECK(s.completion_deadline>trace_now_ns());
+        s.completion_deadline=trace_now_ns()-1;
+        rc=gl_test_present_complete(&b,17,0,123);
+        printf("edit-848 gl: answered, PIXMAP missing a window later: %d\n",rc);
+        GL_CHECK(rc==RENDER_ERR_DEVICE && s.failed && !b.t6_sent && gl_review_stalled.probes==1);
+        GL_CHECK(gl_test_completion_status(&b)==RENDER_ERR_DEVICE);
+    }
+    puts("gl_review: edit-848 PASS (stalled server re-arms; answered server without PIXMAP still fails)");
+    return 0;
+}
 static int gl_review_continuation_test(void)
 {
     gl_driver d; render_backend b={0};
@@ -866,7 +945,7 @@ static int gl_review_continuation_test(void)
     s->native_conn=conn; s->present_special=NULL;
     s->display=display; s->eMakeCurrent=bind; s->eSwapBuffers=swap;
     gl_driver_cleanup(&d);
-    GL_CHECK(gl_review_completion_faults()==0);
+    GL_CHECK(gl_review_completion_faults()==0 && gl_review_stalled_server()==0);
     puts("gl_review: section=6 PASS (eventfd/mailbox continuation, delayed fence, deadline/reset/wait failure; no busy pump)");
     return 0;
 }
@@ -1519,6 +1598,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[2],"p2-35")==0) return gl_contention_pool_test();
         if (strcmp(argv[2],"p2-35-integrated")==0) return gl_integrated_self_check();
         if (strcmp(argv[2],"p2-5-integrated")==0) return gl_integrated_cleanup_test();
+        if (strcmp(argv[2],"edit-848")==0) return gl_review_stalled_server();
         bool native=strcmp(argv[2],"1")==0 || strcmp(argv[2],"2")==0 ||
             strcmp(argv[2],"2-concurrent")==0 || strcmp(argv[2],"3")==0 ||
             strcmp(argv[2],"6")==0 || strcmp(argv[2],"13")==0 || strcmp(argv[2],"13-noop")==0;
@@ -1580,7 +1660,7 @@ int main(int argc, char **argv)
     if (!native_available) {
         GL_CHECK(gl_review_modes_test()==0 && gl_review_notify_test()==0);
         GL_CHECK(gl_review_budget_test()==0 && gl_review_completion_faults()==0);
-        GL_CHECK(gl_review_trace_test()==0);
+        GL_CHECK(gl_review_stalled_server()==0 && gl_review_trace_test()==0);
         puts("gl_test: PASS (pure snapshot/completion/trace checks; native diagnostics SKIP)");
         return 0;
     }
