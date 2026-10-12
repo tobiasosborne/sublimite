@@ -888,8 +888,9 @@ int editor_continue_action(editor *e)
     if (e->action == EDITOR_ACTION_REPLAY) return finish_replay_follow(e);
     if (e->selection_command) soft_record(e, false);
     e->action = EDITOR_ACTION_NONE;
+    bool pointer=e->pointer_unit_pending;
     pointer_unit_finish(e);
-    return editor_refresh_cursor(e, e->old_cursor);
+    return pointer ? editor_refresh_placed(e,e->old_cursor) : editor_refresh_cursor(e,e->old_cursor);
 }
 bool editor_event_control(const editor *e, const plat_event *ev)
 {
@@ -1225,28 +1226,37 @@ static bool pointer_byte(editor *e, uint32_t row, uint32_t cell, uint32_t pixel,
 int editor_pointer(editor *e, const plat_event *ev)
 {
     if (ev->kind==PLAT_EV_BUTTON && ev->code==1 && !ev->press) e->text_drag=false;
-    int64_t row=ev->y<0 ? -1 : (int64_t)ev->y/e->grid.dims.cell_h-e->tab_rows;
     int64_t col=ev->x<0 ? -1 : (int64_t)ev->x/e->grid.dims.cell_w;
-    if (!e->v.state.wrap && !e->panel_rows && row>=0) {
-        /* edit-3kk: invert the frame's Q8 origin/overscan transform. */
-        uint32_t ordinal; uint64_t within;
-        int64_t local=((int64_t)ev->y-(int64_t)e->tab_rows*e->grid.dims.cell_h)*SCROLL_PIXEL_UNIT;
-        if (scroll_frame_hit(&e->scroll_plan,local,&ordinal,&within)==SCROLL_OK) row=ordinal;
+    uint32_t text_rows=e->v.config.rows;
+    /* P: empty geometry has no last row/column to clamp to. */
+    if (!text_rows || !e->text_grid.dims.cols) {
+        e->text_drag=false; return editor_chrome_pointer(e,ev);
     }
-    uint32_t text_rows=e->v.config.rows; /* visible rows: no overscan, no find panel */
     bool down=ev->kind==PLAT_EV_BUTTON && ev->code==1 && ev->press;
     if (e->text_drag && (e->text_drag_id!=e->buffer->id ||
         e->text_drag_generation!=e->buffer->source_generation)) e->text_drag=false;
     bool motion=ev->kind==PLAT_EV_MOTION && e->text_drag;
+    int64_t local=(int64_t)ev->y-(int64_t)e->tab_rows*e->grid.dims.cell_h;
+    int64_t height=(int64_t)text_rows*e->grid.dims.cell_h;
     if (e->buffer->pending_open || e->buffer->source_stale ||
-        (!down && !motion) || (down && (row<0 || row>=text_rows ||
+        (!down && !motion) || (down && (local<0 || local>=height ||
         col<0 || col>=e->text_grid.dims.cols))) return editor_chrome_pointer(e,ev);
-    if (row<0) row=0;
-    if (row>=text_rows) row=text_rows-1;
+    e->text_pointer=*ev; e->text_pointer.kind=PLAT_EV_MOTION;
+    /* P: the bottom clip is half-open; its first outside pixel is distance
+     * one. Clamp surface pixels BEFORE the inverse transform so the bottom
+     * overscan row remains hittable at fractional origins. */
+    if (local<0) local=0;
+    if (local>=height) local=height-1;
+    uint32_t row=(uint32_t)(local/e->grid.dims.cell_h);
+    if (!e->v.state.wrap && !e->panel_rows) {
+        uint64_t within;
+        if (scroll_frame_hit(&e->scroll_plan,local*SCROLL_PIXEL_UNIT,&row,&within)!=SCROLL_OK) return 0;
+    }
+    if (row>=e->text_grid.dims.rows) return 0;
     if (col<0) col=0;
     if (col>=e->text_grid.dims.cols) col=e->text_grid.dims.cols-1;
     uint64_t byte;
-    if (layout_busy(&e->lay) || !pointer_byte(e,(uint32_t)row,(uint32_t)col,ev->x<0 ? 0u : (uint32_t)ev->x%e->grid.dims.cell_w,&byte)) return 0;
+    if (layout_busy(&e->lay) || !pointer_byte(e,row,(uint32_t)col,ev->x<0 ? 0u : (uint32_t)ev->x%e->grid.dims.cell_w,&byte)) return 0;
     e->old_selection=e->v.state.selection; e->old_cursor=e->old_selection.cursor;
     undo_break_burst(e->undo); editor_restart_blink(e,trace_now_ns());
     e->v.state.selection.cursor=byte; e->v.state.visual_end=false;
@@ -1255,11 +1265,14 @@ int editor_pointer(editor *e, const plat_event *ev)
         e->wheel_pending=false; e->find_scroll=false;
         e->text_drag=true; e->text_drag_id=e->buffer->id;
         e->text_drag_generation=e->buffer->source_generation;
+        e->text_drag_pixels=0; e->text_drag_rehit=false;
         uint64_t now=ev->t0_ns ? ev->t0_ns : trace_now_ns();
         /* E: reuse the existing blink interval as the click-chain interval;
          * no delay is imposed on handling any click. Same cell and buffer only. */
         bool chain=col>=e->lay.gw && e->click_ns && now>=e->click_ns && now-e->click_ns<=EDITOR_BLINK_NS &&
-            e->click_row==(uint32_t)row && e->click_col==(uint32_t)col;
+            e->click_row==row && e->click_col==(uint32_t)col && e->click_button==ev->code &&
+            e->click_id==e->buffer->id && e->click_generation==e->buffer->source_generation;
+        e->click_id=e->buffer->id; e->click_generation=e->buffer->source_generation; e->click_button=ev->code;
         e->click_count=chain ? e->click_count%3u+1u : 1u;
         e->text_drag_mode=(ev->mods&PLAT_MOD_SHIFT) ? 1u : e->click_count;
         e->click_ns=now; e->click_row=(uint32_t)row; e->click_col=(uint32_t)col; e->click_byte=byte;
@@ -1283,7 +1296,50 @@ int editor_pointer(editor *e, const plat_event *ev)
         if (rc) return rc;
         e->action=EDITOR_ACTION_NONE; pointer_unit_finish(e);
     }
-    return editor_refresh_cursor(e,e->old_cursor);
+    return editor_refresh_placed(e,e->old_cursor);
+}
+static int64_t pointer_edge_distance(const editor *e)
+{
+    int64_t local=(int64_t)e->text_pointer.y-(int64_t)e->tab_rows*e->grid.dims.cell_h;
+    int64_t height=(int64_t)e->v.config.rows*e->grid.dims.cell_h;
+    return local<0 ? local : local>=height ? local-height+1 : 0; /* P: half-open clip */
+}
+bool editor_pointer_scrolling(const editor *e)
+{
+    return e->text_drag && e->text_drag_id==e->buffer->id &&
+        e->text_drag_generation==e->buffer->source_generation &&
+        !e->buffer->pending_open && !e->buffer->source_stale && e->v.config.rows &&
+        pointer_edge_distance(e)!=0;
+}
+int editor_pointer_tick(editor *e)
+{
+    if (!editor_pointer_scrolling(e)) { e->text_drag_rehit=false; return 0; }
+    if (e->queue_count || e->backend->active || view_busy(&e->v) || e->action!=EDITOR_ACTION_NONE ||
+        layout_busy(&e->lay) || e->full_pending || editor_scroll_waiting(e) || e->wheel_pending || editor_clip_busy(e)) return 0;
+    if (e->text_drag_rehit) {
+        e->text_drag_rehit=false;
+        plat_event motion=e->text_pointer;
+        return editor_pointer(e,&motion);
+    }
+    if (e->dirty) return 0;
+    /* E: distance d pixels per completed frame = d/h rows per frame,
+     * or d/(h*dt) rows per time for row height h and frame interval dt (P).
+     * No new time interval, timer, source scan or reservation. */
+    int64_t pixels=pointer_edge_distance(e); int rc;
+    if (e->v.state.wrap) {
+        e->text_drag_pixels+=pixels;
+        int64_t rows=e->text_drag_pixels/e->grid.dims.cell_h;
+        e->text_drag_pixels%=e->grid.dims.cell_h;
+        e->wrap_wheel_rows+=rows; e->wheel_pending=e->wrap_wheel_rows!=0;
+        rc=editor_wheel_continue(e);
+    } else {
+        e->buffer->scroll_following=false;
+        rc=scroll_pixels(&e->buffer->scroll,pixels*SCROLL_PIXEL_UNIT);
+        if (!rc) e->buffer->scroll_pending=true;
+    }
+    if (rc) return rc;
+    e->text_drag_rehit=true;
+    return editor_begin_frame(e);
 }
 static int find_horizontal_follow(editor *e)
 {

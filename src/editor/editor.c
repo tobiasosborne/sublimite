@@ -482,6 +482,9 @@ int editor_text_geometry(editor *e)
     render_dims dims = e->grid.dims; int rc;
     e->text_grid.dims.rows = dims.rows - e->tab_rows;
     uint32_t available=e->text_grid.dims.rows;
+    /* P: query row; replacement mode adds its field and hints row. Recompute
+     * the desired size, since the last surface may have clipped the panel. */
+    e->panel_rows=e->find_visible ? (findui_get_state(&e->find).replace_mode ? 3u : 1u) : 0u;
     if (e->panel_rows>=available) e->panel_rows=available>1 ? available-1 : 0;
     e->text_grid.dims.rows-=e->panel_rows;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
@@ -508,6 +511,8 @@ static int resize(editor *e)
 }
 static int nonkey(editor *e, const plat_event *ev)
 {
+    /* P: button identity belongs to the chain even on clipboard dispatch. */
+    if (ev->kind == PLAT_EV_BUTTON && ev->press && ev->code != e->click_button) e->click_ns = 0;
     if (ev->kind == PLAT_EV_CLIPBOARD || (ev->kind == PLAT_EV_BUTTON && ev->code == 2))
         return editor_clip_event(e, ev);
     if (ev->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
@@ -624,6 +629,7 @@ static bool runnable(const editor *e)
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
     return (e->file_command != KEYS_ACTION_NONE && !e->dirty && !e->backend->active) ||
+           (editor_pointer_scrolling(e) && !e->backend->active && !editor_scroll_waiting(e) && !e->wheel_pending && !editor_clip_busy(e)) ||
            (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
            (editor_font_pending(e) && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
@@ -758,6 +764,7 @@ int editor_step(editor *e, int timeout_ms)
         return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
     }
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
+    rc = editor_pointer_tick(e); if (rc) return fail(e, rc);
     if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
     uint64_t submit_start = trace_now_ns(); rc = submit(e);
     record_slice(e, submit_start); if (rc) return rc;
@@ -838,7 +845,7 @@ editor_stats editor_get_stats(const editor *e)
     s.render_active = e->backend->active;
     s.font_pending = e->font.requested_generation != e->font.applied_generation;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = e->file_command != KEYS_ACTION_NONE || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
+    s.pending = e->file_command != KEYS_ACTION_NONE || editor_pointer_scrolling(e) || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||
         e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;

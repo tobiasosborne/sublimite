@@ -291,6 +291,11 @@ struct editor {
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     bool text_drag;
     uint64_t text_drag_id, text_drag_generation, click_ns, click_byte;
+    uint64_t click_id, click_generation;
+    uint32_t click_button;
+    plat_event text_pointer;
+    int64_t text_drag_pixels;
+    bool text_drag_rehit;
     uint32_t click_row, click_col, click_count, text_drag_mode;
     uint64_t text_drag_lo, text_drag_hi;
     bool pointer_unit_pending, pointer_unit_initial;
@@ -413,6 +418,8 @@ int editor_font_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t widt
 bool editor_font_event(editor *e, const work_msg *msg);
 void editor_font_track(editor *e, uint32_t slot, uint32_t row);
 int editor_pointer(editor *e, const plat_event *ev);
+bool editor_pointer_scrolling(const editor *e);
+int editor_pointer_tick(editor *e);
 int editor_map_service(editor *e);
 bool editor_map_receive(editor *e, const work_msg *msg);
 int editor_chrome_pointer(editor *e, const plat_event *ev);

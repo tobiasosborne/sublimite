@@ -55,10 +55,6 @@ void editor_find_close(editor *e)
 }
 static int geometry(editor *e)
 {
-    uint32_t available=e->grid.dims.rows-e->tab_rows;
-    uint32_t wanted=e->find_visible ? (findui_get_state(&e->find).replace_mode ? 3u : 1u) : 0u;
-    if (wanted>=available) wanted=available>1u ? available-1u : 0u;
-    e->panel_rows=wanted;
     return editor_text_geometry(e);
 }
 static bool visible_byte(const editor *e, uint64_t byte)

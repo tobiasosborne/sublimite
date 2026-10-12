@@ -3587,6 +3587,132 @@ static plat_event pointer_event(editor *e, plat_ev_kind kind, uint32_t row,
         .y=(int32_t)((row+e->tab_rows)*e->grid.dims.cell_h)};
     return ev;
 }
+/* edit-48u fixtures (E): geometry reuses mouse_contract's columns/rows.
+ * (P) zeros are empty state/first row, ones are adjacent rows/buttons;
+ * halves bisect a cell, offsets derive from the literal fixture bytes. */
+static int pointer_review_open(editor **out, render_backend *backend, bool wrap)
+{
+    static const char text[]="alpha beta\nalpha beta\nalpha beta\nalpha beta\n"
+        "alpha beta\nalpha beta\nalpha beta\nalpha beta\nalpha beta\nalpha beta\n";
+    T(render_null_backend(backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,
+        .cols=40,.rows=8,.wrap_mode=wrap ? 1 : -1};
+    T(editor_open(out,&cfg,backend)==0); T(settle_map(*out)==0); return 0;
+}
+static int pointer_overscan_contract(void)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    plat_event wheel={.kind=PLAT_EV_WHEEL,.smooth=true,
+        .dy=PLAT_WHEEL_UNIT/(int32_t)(SCROLL_CORE_ROWS*2u)}; /* P: half row per notch fraction */
+    T(press(e,wheel)==0); T(e->scroll_plan.origin_y_q8<0);
+    uint64_t byte=e->row_byte[e->v.config.rows];
+    T(byte!=LAYOUT_VOID_ROW);
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,e->v.config.rows-1u,0,true,trace_now_ns());
+    click.y+=(int32_t)e->grid.dims.cell_h-1;
+    T(press(e,click)==0); T(e->v.state.selection.cursor==byte);
+    click.press=false; T(press(e,click)==0);
+    editor_close(e); puts("edit-48u overscan passed"); return 0;
+}
+static int pointer_chain_contract(bool other_button)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,0,0,true,trace_now_ns());
+    T(press(e,click)==0); click.press=false; T(press(e,click)==0);
+    if (other_button) {
+        click.code++; click.press=true; T(press(e,click)==0);
+        click.press=false; T(press(e,click)==0); click.code--;
+    } else {
+        uint64_t id;
+        T(editor_add_buffer(e,NULL,(const uint8_t *)"alpha beta\n",sizeof "alpha beta\n"-1,&id)==0);
+        T(settle_map(e)==0);
+        /* Normal switching already clears time; isolate the missing identity
+         * predicate by retaining the prior chain's timestamp. */
+        e->click_ns=click.t0_ns;
+    }
+    click.press=true; T(press(e,click)==0);
+    T(e->v.state.selection.cursor==e->v.state.selection.anchor);
+    click.press=false; T(press(e,click)==0);
+    editor_close(e); puts("edit-48u chain identity passed"); return 0;
+}
+static int pointer_empty_rows_contract(void)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,0,0,true,trace_now_ns());
+    T(press(e,click)==0);
+    uint32_t rows=e->v.config.rows; e->v.config.rows=0;
+    click.kind=PLAT_EV_MOTION;
+    T(editor_inject(e,&click)==0); T(editor_step(e,0)>=0);
+    T(!e->text_drag); e->v.config.rows=rows;
+    editor_close(e); puts("edit-48u empty rows passed"); return 0;
+}
+static int findpanel_resize_contract(void)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    uint32_t wanted=e->panel_rows;
+    plat_event size={.kind=PLAT_EV_RESIZE,.w=e->grid.dims.cols*e->grid.dims.cell_w,
+        .h=(e->tab_rows+1u)*e->grid.dims.cell_h}; /* P: strip plus sole text row */
+    uint32_t original=e->grid.dims.rows*e->grid.dims.cell_h;
+    T(press(e,size)==0); T(e->panel_rows<wanted);
+    size.h=original; T(press(e,size)==0); T(e->panel_rows==wanted);
+    T(e->v.config.rows==e->grid.dims.rows-e->tab_rows-wanted);
+    editor_close(e); puts("edit-48u panel resize passed"); return 0;
+}
+static int pointer_autoscroll_contract(bool wrap)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,wrap)==0);
+    edit_malloc_guard_begin();
+    plat_event click=pointer_event(e,PLAT_EV_BUTTON,0,0,true,trace_now_ns());
+    T(press(e,click)==0);
+    uint64_t anchor=e->v.state.selection.anchor, top=e->v.state.first_byte;
+    click.kind=PLAT_EV_MOTION;
+    click.y=(int32_t)((e->tab_rows+e->v.config.rows+1u)*e->grid.dims.cell_h)-1;
+    T(editor_inject(e,&click)==0);
+    /* E: reuse settle's existing deadline; this is readiness, not a rate budget. */
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000);
+    do { T(editor_step(e,0)>=0); T(trace_now_ns()<deadline); }
+    while (e->v.state.first_byte==top || e->v.state.selection.cursor!=e->row_byte[e->v.config.rows-1u]);
+    T(e->v.state.first_byte>top);
+    T(e->v.state.selection.anchor==anchor && e->v.state.selection.cursor>anchor);
+    uint64_t line=e->v.state.first_line;
+    T(line==1); /* P: one row-height outside advances one row in the frame. */
+    top=e->v.state.first_byte;
+    /* No new motion event: the held pointer must keep scrolling. */
+    do { T(editor_step(e,0)>=0); T(trace_now_ns()<deadline); }
+    while (e->v.state.first_byte==top || e->v.state.selection.cursor!=e->row_byte[e->v.config.rows-1u]);
+    T(e->v.state.first_line==line+1u);
+    /* P: twice the outside row height reverses twice the displacement. */
+    click.y=(int32_t)((int64_t)e->tab_rows*e->grid.dims.cell_h-2*(int64_t)e->grid.dims.cell_h);
+    top=e->v.state.first_byte;
+    T(editor_inject(e,&click)==0);
+    do { T(editor_step(e,0)>=0); T(trace_now_ns()<deadline); }
+    while (e->v.state.first_byte==top || e->v.state.selection.cursor!=e->row_byte[0]);
+    T(e->v.state.first_line==line-1u);
+    T(e->v.state.selection.anchor==anchor);
+    click.kind=PLAT_EV_BUTTON; click.press=false;
+    T(press(e,click)==0); top=e->v.state.first_byte;
+    T(settle(e)==0); T(e->v.state.first_byte==top);
+    T(edit_malloc_guard_end()==0);
+    editor_close(e); puts("edit-48u drag autoscroll passed"); return 0;
+}
+static int findpanel_escape_contract(void)
+{
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key('a',0,"alpha"))==0);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
+    view_selection match=e->v.state.selection;
+    T(match.cursor!=match.anchor);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0); T(!e->find_visible);
+    T(e->v.state.selection.cursor==match.cursor && e->v.state.selection.anchor==match.anchor);
+    editor_close(e); puts("edit-48u Escape retains match passed"); return 0;
+}
 /* edit-m15: geometry reuses mouse_contract. Grow from a short source to a
  * full visible viewport, then exercise stale hits independently of layout. */
 static int gutter_click_contract(void)
@@ -4135,6 +4261,14 @@ int main(int argc, char **argv)
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
+        if (!strcmp(argv[1], "--48u-overscan")) return pointer_overscan_contract();
+        if (!strcmp(argv[1], "--48u-buffer")) return pointer_chain_contract(false);
+        if (!strcmp(argv[1], "--48u-button")) return pointer_chain_contract(true);
+        if (!strcmp(argv[1], "--48u-empty")) return pointer_empty_rows_contract();
+        if (!strcmp(argv[1], "--48u-resize")) return findpanel_resize_contract();
+        if (!strcmp(argv[1], "--48u-drag")) return pointer_autoscroll_contract(false);
+        if (!strcmp(argv[1], "--48u-drag-wrap")) return pointer_autoscroll_contract(true);
+        if (!strcmp(argv[1], "--48u-escape")) return findpanel_escape_contract();
         if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
         if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
         if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
@@ -4210,6 +4344,9 @@ int main(int argc, char **argv)
     if (only) return review_suite(only);
     T(o20_all() == 0);
     T(minimap_compose_pixels(NULL) == 0);
+    T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
+    T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);
+    T(pointer_autoscroll_contract(false)==0); T(pointer_autoscroll_contract(true)==0); T(findpanel_escape_contract()==0);
     T(gutter_click_contract()==0); T(gutter_growth_contract()==0); T(gutter_wrap_contract()==0);
     T(find_follow_before_top_contract()==0);
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
