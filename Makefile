@@ -60,6 +60,8 @@ TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
 # automatically. All callers share tools/with_display_lock.sh.
 DISPLAY_TEST_SAN := $(filter $(B)/san/tests/cli_test $(B)/san/tests/editor% $(B)/san/tests/x11% $(B)/san/tests/ref% $(B)/san/tests/gl% $(B)/san/tests/raster_test,$(TEST_SAN))
 BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
+# P4.14 copies stale editor internals; retain its driver build in all.
+DEFAULT_BENCH_BIN := $(filter-out $(B)/bench/zygote_bench,$(BENCH_BIN))
 # edit-cx8: display benches take the same lock. On a shared Xvfb another
 # worktree's suite (XTEST keys, setxkbmap) otherwise types into the bench
 # window mid-row: foreign input sequences, keymap-worker allocations.
@@ -70,7 +72,7 @@ EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
 $(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
-.PHONY: all lib check check-sh bench fuzz clean
+.PHONY: all lib check check-sh bench bench-zygote fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)
 lib: $(REL_LIB)
@@ -140,8 +142,13 @@ check-sh: $(B)/tools/replay $(B)/bench/piece_bench
 # Benches: release build, each must exit 0 (gate met).
 # Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;
 # the full piece matrix is run by tools/bench_variant.sh on an idle box).
-bench: $(BENCH_BIN)
-	@set -e; $(SAFE_DISPLAY); for b in $(BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; case " $(DISPLAY_BENCH) " in *" $$b "*) DISPLAY=$$d sh tools/with_display_lock.sh $$b $$args;; *) DISPLAY=$$d $$b $$args;; esac; done; echo "bench: $(words $(BENCH_BIN)) benches passed"
+bench: $(DEFAULT_BENCH_BIN)
+	@set -e; $(SAFE_DISPLAY); for b in $(DEFAULT_BENCH_BIN); do a=bench/$$(basename $$b).args; args=$$(cat $$a 2>/dev/null || true); echo "== $$b $$args"; case " $(DISPLAY_BENCH) " in *" $$b "*) DISPLAY=$$d sh tools/with_display_lock.sh $$b $$args;; *) DISPLAY=$$d $$b $$args;; esac; done; echo "bench: $(words $(DEFAULT_BENCH_BIN)) benches passed"
+
+# Explicit experiment only: compile failures remain visible until it is ported.
+bench-zygote: $(REL_LIB)
+	@echo "P4.14 zygote experiment is stale: variants/P4.14/editor.c and */open.c copy an older src/editor API (editor.lines); see docs/decisions/P4.14.md"
+	@$(SAFE_DISPLAY); DISPLAY=$$d sh tools/zygote_bench.sh --run
 
 fuzz: $(FUZZ_BIN)
 	@echo "fuzz: $(words $(FUZZ_BIN)) fuzzers built"
