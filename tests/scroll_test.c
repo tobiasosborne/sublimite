@@ -103,6 +103,58 @@ static int keys_and_follow(void)
 cleanup:
     return 1;
 }
+static int estimated_extent(void)
+{
+    /* (P) Fixture geometry: each "x\n" contributes a logical line. The
+     * initial empty document/row is one; the estimate uses bytes as rows,
+     * deliberately above the true line count. No timing/count budget. */
+    const uint8_t bytes[] = "x\nx\nx\nx\n";
+    flat f = {bytes, sizeof bytes - 1u};
+    lineidx_src src = {&f, f.size, span, NULL};
+    lineidx *index = lineidx_create(f.size);
+    CHECK(index);
+    scroll_state s;
+    CHECK(scroll_init(&s, (scroll_config){1, 1, 0}, (scroll_extent){f.size, f.size, false}) == SCROLL_OK);
+    s.first_byte = sizeof "x\nx\n" - 1u;
+    s.first_line = s.anchor_line = f.size;
+    s.subrow_q8 = 1u; /* (P) one Q8 unit of a partially clipped row */
+    scroll_state before = s;
+    /* Even an inexact extent with fewer bytes must not reinterpret a label. */
+    CHECK(scroll_set_extent(&s, (scroll_extent){s.first_byte, 1, false}) == SCROLL_OK);
+    CHECK(s.first_line == before.first_line && s.request == SCROLL_READY);
+    CHECK(s.first_byte == before.first_byte && s.subrow_q8 == before.subrow_q8);
+    /* An exact label still cannot be bounded by an inexact count. (P) The
+     * same byte-derived label exceeds the shrunken extent's row bound. */
+    s = before; s.approximate = false;
+    CHECK(scroll_set_extent(&s, (scroll_extent){s.first_byte, 1, false}) == SCROLL_OK);
+    CHECK(s.first_line == before.first_line && s.request == SCROLL_READY);
+    CHECK(s.first_byte == before.first_byte && s.subrow_q8 == before.subrow_q8);
+    s = before;
+    CHECK(lineidx_seek_line(index, &src, UINT64_MAX, f.size).exact);
+    lineidx_result count = lineidx_line_count(index);
+    CHECK(count.exact);
+    CHECK(scroll_set_extent(&s, (scroll_extent){f.size, count.value, count.exact}) == SCROLL_OK);
+    CHECK(s.first_line == before.first_line && s.anchor_line == before.anchor_line);
+    CHECK(s.first_byte == before.first_byte && s.request == SCROLL_READY && s.approximate);
+    CHECK(s.subrow_q8 == before.subrow_q8);
+    CHECK(settle_resolve(&s, index, &src, 0) == SCROLL_OK);
+    CHECK(s.first_byte == before.first_byte && !s.approximate);
+    CHECK(s.first_line == (sizeof "x\nx\n" - 1u) / (sizeof "x\n" - 1u));
+    /* An estimated relative request must retain its byte displacement too. */
+    s = before; s.request = SCROLL_RELATIVE; s.pending_rows = 1u;
+    CHECK(scroll_set_extent(&s, (scroll_extent){f.size, count.value, true}) == SCROLL_OK);
+    CHECK(s.request == SCROLL_RELATIVE && s.pending_rows == 1u && s.first_line == before.first_line);
+    /* Exact labels still obey the existing EOF clamp. */
+    s = before; s.approximate = false;
+    CHECK(scroll_set_extent(&s, (scroll_extent){f.size, count.value, true}) == SCROLL_OK);
+    CHECK(s.first_line == count.value - s.config.rows && s.request == SCROLL_LINE && !s.subrow_q8);
+    lineidx_destroy(index);
+    puts("scroll_test: estimated extent retains byte anchor until exact relabel PASS");
+    return 0;
+cleanup:
+    lineidx_destroy(index);
+    return 1;
+}
 static int correction(void)
 {
     int result = 1;
@@ -1089,6 +1141,8 @@ cleanup:
 }
 int main(int argc, char **argv)
 {
+    if (estimated_extent()) return 1;
+    if (getenv("EDIT_TN2_EXTENT")) return 0;
     if (getenv("P4_RESIDENT_FAULT")) return mapped_resident_faults(false) || mapped_resident_faults(true);
     if (mapped_resident_faults(false) || mapped_resident_faults(true)) return 1;
     if (argc == 2 && strcmp(argv[1], "--require-editor-scroll") == 0)

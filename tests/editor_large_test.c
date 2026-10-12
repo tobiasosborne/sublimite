@@ -666,6 +666,80 @@ static int explicit_coordinates(void)
     return 0;
 }
 
+static int wrapped_placement(void)
+{
+    /* (P) Certified logical start after "a\n". Its density label is
+     * deliberately the byte length, above its actual zero-based line.
+     * The wrapped viewport owns visual bytes, never logical scroll rows. */
+    const uint8_t prefix[] = "a\n";
+    editor_buffer buffer = {0};
+    editor e = {.buffer = &buffer};
+    e.v.state.wrap = true;
+    e.v.state.visual_end = true;
+    e.v.state.hscroll = sizeof prefix - 1u;
+    scroll_state before = buffer.scroll;
+    T(editor_scroll_place(&e, sizeof prefix - 1u, sizeof prefix - 1u, true));
+    T(e.v.state.first_byte == sizeof prefix - 1u);
+    T(e.v.state.visual_byte == e.v.state.first_byte);
+    T(e.v.state.first_line == sizeof prefix - 1u && e.v.state.approximate);
+    T(!e.v.state.visual_end && !e.v.state.hscroll);
+    T(memcmp(&buffer.scroll, &before, sizeof before) == 0);
+    T(editor_scroll_place(&e, sizeof prefix - 1u, 1u, false));
+    T(e.v.state.first_line == 1u && !e.v.state.approximate);
+    T(e.v.state.first_byte == sizeof prefix - 1u && e.v.state.visual_byte == e.v.state.first_byte);
+    T(memcmp(&buffer.scroll, &before, sizeof before) == 0);
+    puts("editor_large_test: wrapped certified placement preserves estimated/exact label PASS");
+    return 0;
+}
+static bool wrapped_index_done(editor *e)
+{ return editor_large_status_get(e).lines_exact; }
+static int wrapped_byte_jump(void)
+{
+    /* (E) Reuse gutter_estimates' viewport and watchdog, and write_fixture's
+     * mixed-density bytes. (P) Jump at the next B-line start: A_LINES times
+     * sizeof "l000000\n" minus its C terminator, plus B_LEN. B_LEN exceeds
+     * the viewport columns, so this is a wrapped logical-line fixture.
+     * (P) The smallest nonempty copy threshold forces mapped acquisition
+     * to finish before the bulk hold, as gutter_estimates requires. */
+    char path[] = "build/editor-tn2-wrap-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0); close(fd);
+    T(write_fixture(path) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 60, .rows = 8, .wrap_mode = 1, .copy_threshold = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    uint64_t id = 0;
+    T(editor_add_buffer(e, path, NULL, 0, &id) == 0);
+    T(!e->buffer->pending_open && editor_large_status_get(e).mapped);
+    T(!editor_large_status_get(e).lines_exact);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(held.epoch);
+    lineidx_src src = {snap, editor_length(e), gutter_snapshot_span, gutter_snapshot_release};
+    T(lineidx_build_start(e->buffer->index, &e->pool, &src) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    uint64_t target = (uint64_t)A_LINES * (sizeof "l000000\n" - 1u) + B_LEN;
+    T(editor_large_goto_byte(e, target) == 0);
+    T(editor_view(e).wrap && editor_view(e).approximate);
+    T(editor_large_status_get(e).top_estimated);
+    T(editor_view(e).first_byte == target && editor_view(e).visual_byte == target);
+    T(editor_view(e).selection.cursor == target && !view_busy(&e->v));
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(e->row_byte[0] == target && e->lay.wrap);
+    T(e->lay.wrap_rows[0].line_start == target && e->lay.wrap_rows[0].next < target + B_LEN);
+    atomic_store(&release, true);
+    T(step_until(e, wrapped_index_done, UINT64_C(5000000000)) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_view(e).first_byte == target && editor_view(e).visual_byte == target);
+    T(editor_view(e).first_line == A_LINES + 1u && !editor_large_status_get(e).top_estimated);
+    T(!editor_view(e).approximate);
+    editor_close(e); unlink(path);
+    puts("editor_large_test: wrapped byte jump keeps certified anchor through index publication PASS");
+    return 0;
+}
 static int byte_jump_boundaries(void)
 {
     uint8_t *bytes = malloc(200000u); T(bytes); memset(bytes, 'a', 200000u);
@@ -1364,6 +1438,10 @@ int main(void)
     /* edit-xzw: isolate the existing null-backend fixture from IPC/display
      * prerequisites denied by the worker sandbox. */
     if (getenv("EDIT_XZW_REPRO")) goto xzw_fixture;
+    if (getenv("EDIT_TN2_WRAPPED_JUMP")) return wrapped_byte_jump();
+    T(wrapped_placement() == 0);
+    if (getenv("EDIT_TN2_PLACEMENT")) return 0;
+    T(wrapped_byte_jump() == 0);
     if (getenv("EDIT_91C_STARVED"))
         return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
     T(starved_follows(true, false) == 0);

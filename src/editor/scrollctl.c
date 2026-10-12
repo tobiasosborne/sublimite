@@ -162,6 +162,16 @@ int editor_scroll_seek(editor *e, uint64_t byte)
 }
 bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approximate)
 {
+    if (e->v.state.wrap) {
+        /* A certified logical start is also a leading visual boundary.
+         * Wrapped view owns that byte; b->scroll ordinals are logical, so
+         * its EOF policy cannot place or clamp visual rows. Layout derives
+         * the rows from this seed; large.c relabels it at index completion. */
+        e->v.state.first_byte = e->v.state.visual_byte = byte;
+        e->v.state.first_line = line; e->v.state.approximate = approximate;
+        e->v.state.visual_end = false; e->v.state.hscroll = 0;
+        return true;
+    }
     /* An owned seek (large.c byte jump) already proved this line start and
      * its ordinal (exact, or a density estimate the index relabels later).
      * Adopt it as position_buffer does instead of re-deriving the cursor's
@@ -169,7 +179,7 @@ bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approxima
      * which an unindexed large file's index build, warm or find jobs occupy.
      * Only when scroll's pure seek policy keeps the same top row; an exact
      * EOF clip still takes the resident follow path. */
-    if (e->v.state.wrap || !e->buffer->scroll_ready) return false;
+    if (!e->buffer->scroll_ready) return false;
     editor_buffer *b = e->buffer;
     scroll_state placed = b->scroll; /* current config and extent */
     placed.approximate = approximate;

@@ -281,7 +281,10 @@ static void index_progress(editor *e, editor_buffer *b)
     if (lg->top_estimated && e->v.state.wrap) {
         lineidx_src cur = editor_source(b);
         lineidx_result r = lineidx_byte_to_line(b->index, &cur, e->v.state.first_byte);
-        if (r.exact) { e->v.state.first_line = r.value; lg->top_estimated = false; changed = true; }
+        if (r.exact) {
+            e->v.state.first_line = r.value; e->v.state.approximate = false;
+            lg->top_estimated = false; changed = true;
+        }
     }
     if (changed) e->full_pending = true;
 }

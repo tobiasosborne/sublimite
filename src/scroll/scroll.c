@@ -86,7 +86,10 @@ int scroll_set_extent(scroll_state *s, scroll_extent extent)
 {
     if (!valid(s) || !extent_valid(extent)) return SCROLL_ERR_ARG;
     s->extent = extent;
-    clamp(s);
+    /* An estimated label is not a position. Retain its certified byte
+     * anchor and pending motion until resolution relabels it; an inexact
+     * count likewise cannot certify an EOF clamp. */
+    if (!s->approximate && extent.exact) clamp(s);
     return SCROLL_OK;
 }
 int scroll_pixels(scroll_state *s, int64_t delta_q8)
