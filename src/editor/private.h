@@ -75,6 +75,7 @@ typedef struct editor_buffer {
     size_t find_leases;
     indent_style style;
     indent_style detected_style;
+    file_eol paste_eol; /* edit-bml: detected in-memory ending survives edits */
     bool config_wrap;
     minimap map;
     minimap_row *map_rows, *map_worker_rows;

@@ -197,6 +197,14 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         rc = piece_init_copy(b->preview, prefix, prefix_len);
     } else rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len);
     if (rc) goto fail;
+    if (!b->file) {
+        /* edit-bml (P): use the file detector and its existing prefix bound;
+         * retain the dominant ending even after all original text is cut. */
+        file_prefix_info info;
+        file_prefix_scan(bytes ? bytes : (const uint8_t *)"",
+            len < FILE_PREFIX_MAX ? len : FILE_PREFIX_MAX, &info);
+        b->paste_eol = info.dominant;
+    }
     if (e->journal && b->file && (!*b->base.path || file_check(b->file, NULL))) {
         rc = EDITOR_ERR_IO; goto fail;
     }

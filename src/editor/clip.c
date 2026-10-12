@@ -16,12 +16,12 @@ typedef struct clip_job {
     work_handle handle;
     piece_snapshot *snapshot;
     uint64_t off, token;
-    size_t len, at, written;
+    size_t len, capacity, at, written;
     const uint8_t *raw;
     uint8_t *text;
     x11_clip_buf *owned[2]; /* CLIPBOARD and PRIMARY, per plat.h */
     int status;
-    bool primary, paste, received;
+    bool primary, paste, received, crlf;
 } clip_job;
 struct editor_clip {
     edit_arena arena;
@@ -83,9 +83,11 @@ int editor_clip_init(editor *e)
     if (pthread_mutex_init(&c->mutex, NULL)) return EDITOR_ERR_MEMORY;
     c->ready = true;
     /* Reservation derives from the platform's existing live-byte admission
-     * bound: owned transport + editor receive staging. Power-of-two recycling
+     * bound: owned transport + editor receive staging. (P) Each received LF
+     * may expand to the CR and LF bytes of CRLF. Power-of-two recycling
      * needs at most double each request, including its block/blob headers. */
-    return edit_arena_init(&c->arena, 2u * (X11_CLIP_OWN_BUDGET + X11_CLIP_DATA_MAX +
+    return edit_arena_init(&c->arena, 2u * (X11_CLIP_OWN_BUDGET +
+        X11_CLIP_DATA_MAX * (sizeof "\r\n" - 1u) +
         sizeof(clip_block) + sizeof *c)) ? EDITOR_ERR_MEMORY : 0;
 }
 static x11_clip_buf *new_owned(editor_clip *c, size_t len)
@@ -107,8 +109,11 @@ static void normalize_part(clip_job *j, size_t end)
 {
     while (j->at < end) {
         size_t at = j->at++;
-        /* Preserve UTF-8 (including invalid bytes); only CRLF is rewritten. */
+        /* Preserve UTF-8, invalid bytes and lone CR. (P) Strip the CR of a
+         * CRLF pair, then emit every LF in the captured destination style.
+         * Lookahead uses the whole input, including across worker slices. */
         if (j->raw[at] == '\r' && at + 1 < j->len && j->raw[at + 1] == '\n') continue;
+        if (j->crlf && j->raw[at] == '\n') j->text[j->written++] = '\r';
         j->text[j->written++] = j->raw[at];
     }
 }
@@ -157,7 +162,7 @@ static void clear_job(editor *e, clip_job *j)
     piece_snapshot_release(j->snapshot);
     x11_clip_buf_free(j->owned[PLAT_CLIP_CLIPBOARD]);
     x11_clip_buf_free(j->owned[PLAT_CLIP_PRIMARY]);
-    if (j->text) clip_free(e->clipboard, j->text, j->len);
+    if (j->text) clip_free(e->clipboard, j->text, j->capacity);
     memset(j, 0, sizeof *j);
 }
 void editor_clip_stop(editor *e)
@@ -309,10 +314,19 @@ static int receive_text(editor *e, const uint8_t *raw, size_t len)
     }
     if (len > X11_CLIP_DATA_MAX || (len && !raw)) { c->waiting = false; e->stats.rejected_commands++; return 0; }
     if (!raw) { c->waiting = false; return 0; }
-    uint8_t *text = len ? clip_alloc(c, len) : NULL;
+    file_eol ending = e->buffer->file ?
+        file_prefix_info_of(e->buffer->file)->dominant : e->buffer->paste_eol;
+    bool crlf = ending == FILE_EOL_CRLF;
+    /* (P) Worst case: each LF becomes CRLF. Capture style/capacity on the
+     * UI thread so the worker never reads the mutable destination tree. */
+    size_t expansion = crlf ? sizeof "\r\n" - 1u : sizeof "\n" - 1u;
+    if (len > SIZE_MAX / expansion) { c->waiting = false; e->stats.rejected_commands++; return 0; }
+    size_t capacity = len * expansion;
+    uint8_t *text = len ? clip_alloc(c, capacity) : NULL;
     if (len && !text) { c->waiting = false; e->stats.rejected_commands++; return 0; }
     clip_job *j = &c->command;
-    *j = (clip_job){.paste = true, .raw = raw, .text = text, .len = len};
+    *j = (clip_job){.paste = true, .raw = raw, .text = text, .len = len,
+        .capacity = capacity, .crlf = crlf};
     if (len > VIEW_SCAN_BOUND) { /* includes all required bulk pastes */
         int rc = submit_job(e, j);
         if (!rc) return 0;
@@ -320,7 +334,7 @@ static int receive_text(editor *e, const uint8_t *raw, size_t len)
     }
     normalize_part(j, len);
     size_t normalized = j->written; j->text = NULL; memset(j, 0, sizeof *j);
-    return start_replace(e, text, normalized, len);
+    return start_replace(e, text, normalized, capacity);
 }
 static int request_paste(editor *e, int which, bool find_field)
 {
@@ -506,7 +520,7 @@ int editor_clip_poll(editor *e)
     if (j->handle.epoch && j->received && work_handle_finished(&e->pool, j->handle)) {
         int rc = j->status;
         if (j->paste) {
-            uint8_t *text = j->text; size_t len = j->written, capacity = j->len; j->text = NULL;
+            uint8_t *text = j->text; size_t len = j->written, capacity = j->capacity; j->text = NULL;
             clear_job(e, j);
             if (rc) { clip_free(c, text, capacity); c->waiting = false; return rc; }
             return start_replace(e, text, len, capacity);

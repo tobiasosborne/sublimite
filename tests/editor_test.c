@@ -3255,10 +3255,139 @@ static int ck4_target(void)
 }
 /* edit-cde fixtures derive byte offsets from the strings themselves; window
  * dimensions reuse the existing script fixture. No timing threshold added. */
+/* edit-bml (P): lengths/offsets come from the literal byte sequences; the
+ * viewport covers the fixture's logical rows plus editor chrome. */
+static int clipboard_crlf_line_test(void)
+{
+    const char original[] = "alpha\r\nbeta\r\n";
+    const char pasted[] = "alpha\r\nbeta\r\nalpha\r\n";
+    char path[] = "build/bml-crlf-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, original, sizeof original - 1u) == (ssize_t)(sizeof original - 1u));
+    T(close(fd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.path = path, .cols = sizeof pasted,
+        .rows = sizeof "\n\n\n" + 1u, /* (P) pasted rows, EOF row, chrome */
+        .wrap_mode = -1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(file_prefix_info_of(e->buffer->file)->dominant == FILE_EOL_CRLF);
+    T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, pasted, sizeof pasted - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1u) == 0);
+    T(press(e, key(XKB_KEY_y, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, pasted, sizeof pasted - 1u) == 0);
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "beta\r\nalpha\r\n", 0) == 0);
+    T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, pasted, sizeof "alpha\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "beta\r\nalpha\r\n", 0) == 0);
+    T(press(e, key(XKB_KEY_y, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, pasted, sizeof "alpha\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL, NULL)) == 0);
+    /* (E) reuse settle()'s existing scheduling bound, no new duration. */
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    T(!editor_tab(e, tabs_active_index(&e->tabs))->modified);
+    char saved[sizeof pasted]; fd = open(path, O_RDONLY); T(fd >= 0);
+    T(read(fd, saved, sizeof saved) == (ssize_t)(sizeof pasted - 1u)); T(close(fd) == 0);
+    T(!memcmp(saved, pasted, sizeof pasted - 1u));
+    T(!count.active && count.allocations == 0); /* (P) no typing-path allocations */
+    editor_close(e); T(unlink(path) == 0);
+    puts("edit-bml: CRLF current-line copy/cut/paste, undo/redo, byte-exact save passed"); return 0;
+}
+/* edit-bml (P): each output is the source literal with LF/CRLF converted to
+ * the dominant separator in the target literal. Lone CR is ordinary data. */
+static int clipboard_endings_test(void)
+{
+    const struct { const char *source, *target, *expected; } cases[] = {
+        {"a\nb\r\nc\rd", "target\r\n", "a\r\nb\r\nc\rd"},
+        {"a\nb\r\nc\rd", "target\n", "a\nb\nc\rd"},
+        {"a\nb\r\nc\rd", "target", "a\nb\nc\rd"},
+        {"a\nb\r\nc\rd", "a\r\nb\nc\r\n", "a\r\nb\r\nc\rd"},
+        {"a\nb\r\nc\rd", "a\r\nb\n", "a\nb\nc\rd"}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.initial = (const uint8_t *)cases[i].source,
+            .initial_len = strlen(cases[i].source), .cols = sizeof "alpha beta gamma delta!",
+            .rows = sizeof "\n\n\n" + 1u, .wrap_mode = -1};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+        uint64_t target;
+        T(editor_add_buffer(e, NULL, (const uint8_t *)cases[i].target, strlen(cases[i].target), &target) == 0);
+        T(settle(e) == 0); T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+        T(expect(e, cases[i].expected, strlen(cases[i].expected)) == 0);
+        editor_close(e);
+    }
+    puts("edit-bml: small mixed paste follows CRLF/LF, no-ending fallback, majority/tie passed"); return 0;
+}
+/* edit-bml (P): cutting the sole CRLF line must retain the buffer's detected
+ * ending even while its current text has no separators. */
+static int clipboard_crlf_empty_test(void)
+{
+    const char original[] = "alpha\r\n";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)original,
+        .initial_len = sizeof original - 1u, .cols = sizeof "alpha beta gamma delta!",
+        .rows = sizeof "\n" + 1u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "", 0) == 0);
+    T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, original, sizeof original - 1u) == 0);
+    editor_close(e);
+    puts("edit-bml: in-memory CRLF style survives cutting all text passed"); return 0;
+}
+/* edit-bml (P): cross VIEW_SCAN_BOUND with CRLF split at its boundary;
+ * LF-only input is the maximum CRLF expansion (sizeof CRLF / sizeof LF). */
+static int clipboard_crlf_bulk_test(void)
+{
+    size_t len = VIEW_SCAN_BOUND + sizeof "\n\r\xff" - 1u;
+    size_t capacity = len * (sizeof "\r\n" - 1u);
+    uint8_t *raw = malloc(len), *expected = malloc(capacity), *got = malloc(capacity);
+    T(raw && expected && got); memset(raw, '\n', len);
+    raw[VIEW_SCAN_BOUND - 1u] = '\r'; raw[VIEW_SCAN_BOUND] = '\n';
+    raw[len - (sizeof "\r\xff" - 1u)] = '\r'; raw[len - 1u] = 0xff; /* (P) lone CR and invalid UTF-8 survive */
+    size_t written = 0;
+    for (size_t at = 0; at < len; at++) {
+        if (raw[at] == '\r' && at + 1u < len && raw[at + 1u] == '\n') continue;
+        if (raw[at] == '\n') expected[written++] = '\r';
+        expected[written++] = raw[at];
+    }
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = raw, .initial_len = len,
+        .cols = sizeof "alpha beta gamma delta!", .rows = sizeof "\n\n" + 1u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+    uint64_t target;
+    T(editor_add_buffer(e, NULL, (const uint8_t *)"target\r\n", sizeof "target\r\n" - 1u, &target) == 0);
+    T(settle(e) == 0); T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    edit_malloc_guard_begin();
+    T(press(e, key(XKB_KEY_v, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_length(e) == written); T(editor_read(e, 0, got, written) == 0);
+    T(!memcmp(got, expected, written));
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(expect(e, "target\r\n", sizeof "target\r\n" - 1u) == 0);
+    T(press(e, key(XKB_KEY_y, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_length(e) == written); T(editor_read(e, 0, got, written) == 0);
+    T(!memcmp(got, expected, written));
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) T(allocations == 0); /* (P) typing-path law */
+    editor_close(e); free(got); free(expected); free(raw);
+    puts("edit-bml: bulk LF expansion, split CRLF, lone CR/invalid UTF-8, undo/redo passed"); return 0;
+}
 static int clipboard_test(bool native)
 {
     const char original[] = "a\r\n中";
-    const char normal[] = "a\n中";
+    const char normal[] = "a\r\n中"; /* edit-bml (P): target's detected CRLF */
     counted io_count = {0};
     render_backend backend = {0};
     T((native ? render_cpu_backend(&backend) : render_null_backend(&backend)) == 0);
@@ -3272,7 +3401,7 @@ static int clipboard_test(bool native)
     T(press(e, copy) == 0); T(e->edit_time_ns == copy.t0_ns);
     T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
     T(press(e, key('v', PLAT_MOD_CTRL, NULL)) == 0);
-    const char doubled[] = "a\r\n中a\n中";
+    const char doubled[] = "a\r\n中a\r\n中"; /* edit-bml (P): preserve target ending */
     T(expect(e, doubled, sizeof doubled - 1) == 0);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
     T(expect(e, original, sizeof original - 1) == 0);
@@ -4049,6 +4178,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--clipboard-primary")) return clipboard_pending_primary_test();
         if (!strcmp(argv[1], "--clipboard-bulk")) return clipboard_large_test();
         if (!strcmp(argv[1], "--clipboard-native")) return clipboard_test(true);
+        if (!strcmp(argv[1], "--clipboard-crlf")) return clipboard_crlf_line_test() || clipboard_endings_test() || clipboard_crlf_empty_test() || clipboard_crlf_bulk_test();
         if (!strcmp(argv[1], "--clipboard")) return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test() || clipboard_no_tabs_test();
         if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
         if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
@@ -4088,6 +4218,10 @@ int main(int argc, char **argv)
     T(default_center() == 0); T(default_skip() == 0); T(default_word() == 0); T(default_goto() == 0); T(default_goto_cold() == 0); T(default_comments() == 0); T(undo_shrink_top() == 0); T(goto_scroll() == 0); T(default_edits() == 0); T(default_states() == 0); T(default_noop() == 0); T(default_soft_history() == 0); T(default_clipboard_line() == 0); T(default_chord_repeat() == 0); T(default_soft_lines() == 0); T(default_notices() == 0); T(default_history_anchor() == 0); T(default_soft_capacity() == 0);
     T(selection_chords() == 0);
     T(redo_or_repeat() == 0); T(panel_shortcuts(true) == 0);
+    T(clipboard_crlf_line_test() == 0);
+    T(clipboard_endings_test() == 0);
+    T(clipboard_crlf_empty_test() == 0);
+    T(clipboard_crlf_bulk_test() == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(clean_source_change() == 0);
