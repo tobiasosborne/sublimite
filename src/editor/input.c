@@ -919,7 +919,7 @@ bool editor_event_control(const editor *e, const plat_event *ev)
  * sanitizer build, docs/worker-reports/edit-91c-s6.md). Place the cursor as
  * the byte jump does (large.c editor_large_goto_byte) and let scrollctl
  * resolve the EOF viewport through resident windows with an estimated label;
- * the index relabels it on completion. Page motions keep view's exact query. */
+ * the index relabels it on completion. Relative motions use the byte path below. */
 static int large_doc_end(editor *e, bool extend)
 {
     view_state *s = &e->v.state;
@@ -1138,7 +1138,12 @@ int editor_handle_key(editor *e, const plat_event *ev)
     }
     view_change c;
     editor_seed_view_lines(e);
-    rc = view_command(&e->v, move, moving && binding && (binding->args.flags & KEYS_ARG_EXTEND), NULL, 0, &c);
+    bool extend = moving && binding && (binding->args.flags & KEYS_ARG_EXTEND);
+    bool relative = moving && !e->v.state.wrap && e->buffer->lg.lazy && !e->buffer->lg.lines_exact &&
+        (move == VIEW_LEFT || move == VIEW_RIGHT || move == VIEW_UP || move == VIEW_DOWN ||
+         move == VIEW_PAGE_UP || move == VIEW_PAGE_DOWN);
+    rc = relative ? view_relative_command(&e->v, move, extend, &c) :
+        view_command(&e->v, move, extend, NULL, 0, &c);
     if (rc == VIEW_MORE) editor_scroll_mirror(e);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) return 0;

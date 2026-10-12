@@ -224,7 +224,7 @@ int editor_scroll_follow(editor *e)
             }
         }
     }
-    if (b->scroll_pending && b->lg.lines_exact && !b->lg.top_estimated && !view_busy(&e->v)) {
+    if (b->scroll_pending && b->lg.lines_exact && !b->lg.top_estimated && !e->v.relative && !view_busy(&e->v)) {
         /* A completed view motion/repair also certifies a resident logical
          * line and its viewport anchor, including EOF without a following
          * row start. Adopt that byte only when scroll's pure policy selects

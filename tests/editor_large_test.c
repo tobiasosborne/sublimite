@@ -1045,9 +1045,9 @@ static int starved_follows(bool hold, bool after_index)
     uint64_t preferred = (uint64_t)st.st_size - starts[nstarts - 1u];
     uint64_t end_ns = 0, worst_page_ns = 0;
     size_t pages = 0;
-    /* During the build only Ctrl+End is in scope: page motions keep view's
-     * exact cursor-line query, which waits for the index (reported). */
-    size_t actions = hold && !after_index ? 1u : 1u + 2u * pages_up;
+    /* edit-jf9: page motions must submit without exact index publication.
+     * Count (P): an outbound traversal and its return, plus Ctrl+End. */
+    size_t actions = 1u + 2u * pages_up;
     for (size_t action = 0; action < actions; action++) {
         plat_event ev = {.kind = PLAT_EV_KEY, .press = true};
         if (!action) { ev.keysym = XKB_KEY_End; ev.mods = PLAT_MOD_CTRL; }
@@ -1055,7 +1055,10 @@ static int starved_follows(bool hold, bool after_index)
         else { ev.keysym = XKB_KEY_Page_Down; pages--; }
         uint64_t sequence = editor_get_stats(e).input_sequence + 1u;
         ev.t0_ns = trace_now_ns(); T(editor_inject(e, &ev) == 0);
-        deadline = ev.t0_ns + UINT64_C(5000000000); /* existing setup/settle watchdog */
+        /* edit-jf9 first held-build PageUp: G5 warm A p99 from edit-91c,
+         * same resident read + frame. Other motions keep the setup watchdog. */
+        deadline = ev.t0_ns + (hold && !after_index && action == 1u ?
+            EDIT_91C_G5_P99_NS : UINT64_C(5000000000));
         uint64_t next_report = ev.t0_ns + UINT64_C(100000000);
         while (editor_get_stats(e).submitted_sequence < sequence && trace_now_ns() < deadline) {
             T(editor_step(e, 0) >= 0);
@@ -1079,6 +1082,9 @@ static int starved_follows(bool hold, bool after_index)
             T(editor_get_stats(e).submitted_sequence >= sequence);
         }
         uint64_t ns = h.submit_ns - ev.t0_ns;
+        if (hold && !after_index && action == 1u) T(ns <= EDIT_91C_G5_P99_NS);
+        if (action == 1u) printf("edit-jf9 first_page_submit_ns=%llu (M)%s=submit-t0 bound_ns=%llu (G)=G5 warm A p99\n",
+            (unsigned long long)ns, tag, (unsigned long long)EDIT_91C_G5_P99_NS);
         if (!action) end_ns = ns; else if (ns > worst_page_ns) worst_page_ns = ns;
         if (hold) T(!work_handle_finished(&e->pool, held)); /* never through the bulk lane */
         size_t line = nstarts - 1u - pages * page;
@@ -1109,14 +1115,200 @@ static int starved_follows(bool hold, bool after_index)
         !hold ? "index-building" : after_index ? "bulk-held after index" : "bulk-held during build");
     return 0;
 }
+/* lander 6b: edit-pd6 x edit-jf9 composition. Ctrl+End and PageUp arrive in
+ * one burst while the bulk/index lane is held, so the PageUp is handled with
+ * the EOF byte jump unresolved (pd6 queues its viewport page) and with an
+ * inexact count (jf9 moves the cursor byte-relatively). Result must equal the
+ * unraced order: cursor one page (config rows, P) above EOF's line at EOF's
+ * column, inside a viewport whose top is a certified line start.
+ * Oracle and fixture as starved_follows; existing 5 s setup watchdog. */
+static int jump_then_page(void)
+{
+    const char *path = "/tmp/edit-corpus/log_1g.txt";
+    struct stat st; T(stat(path, &st) == 0);
+    enum { ORACLE = 2u * SCROLL_SCAN_BUDGET };
+    static uint8_t tail[ORACLE]; static uint64_t starts[ORACLE]; size_t nstarts = 0;
+    uint64_t tail_at = (uint64_t)st.st_size - ORACLE;
+    int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+    T(pread(fd, tail, ORACLE, (off_t)tail_at) == (ssize_t)ORACLE); T(close(fd) == 0);
+    for (size_t i = 0; i < ORACLE; i++) if (tail[i] == '\n') starts[nstarts++] = tail_at + i + 1u;
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    hooks h = {0};
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
+        .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!h.frames) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK}); T(held.epoch);
+    while (!atomic_load(&lane.running)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    T(!editor_index_complete(e));
+    size_t page = e->v.config.rows;
+    T(page < nstarts);
+    plat_event end = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_End, .mods = PLAT_MOD_CTRL};
+    plat_event up = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Page_Up};
+    uint64_t sequence = editor_get_stats(e).input_sequence + 2u;
+    end.t0_ns = up.t0_ns = trace_now_ns();
+    T(editor_inject(e, &end) == 0); T(editor_inject(e, &up) == 0);
+    bool queued_seen = false;
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (editor_get_stats(e).submitted_sequence < sequence || e->buffer->scroll_pending) {
+        T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline);
+        if (e->buffer->scroll_queued_pages) queued_seen = true;
+    }
+    T(!work_handle_finished(&e->pool, held));
+    uint64_t preferred = (uint64_t)st.st_size - starts[nstarts - 1u];
+    size_t line = nstarts - 1u - page;
+    uint64_t start = starts[line], stop = starts[line + 1u] - 1u;
+    if (stop > start && tail[(size_t)(stop - tail_at - 1u)] == '\r') stop--;
+    uint64_t expected = start + (preferred < stop - start ? preferred : stop - start);
+    view_state v = editor_view(e);
+    T(v.selection.cursor == expected && v.selection.anchor == expected);
+    size_t first = 0;
+    while (first < nstarts && starts[first] != v.first_byte) first++;
+    T(first < nstarts && first <= line && line < first + page);
+    printf("lander-6b pd6 x jf9 Ctrl+End then PageUp during held build: queued_seen=%d ok\n", queued_seen);
+    atomic_store(&lane.release, true);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    if (h.active) { h.allocations += edit_malloc_guard_end(); h.active = false; }
+    editor_close(e);
+    return 0;
+}
+/* edit-jf9: headless counterpart to the held-index editor regression.
+ * Fixture (P): repeat a tab/ASCII/CRLF line until its prefix exceeds view's
+ * per-call scan bound. Local page motion reads only rows, never that prefix.
+ * Geometry reuses the starved_follows fixture; no new timing allowance. */
+static int relative_complete(view *v, view_key key, bool shift)
+{
+    view_change change;
+    edit_malloc_guard_begin();
+    int rc = view_relative_command(v, key, shift, &change);
+    T(!change.changed); T(v->scanned <= VIEW_SCAN_BOUND);
+    while (rc == VIEW_MORE) {
+        rc = view_continue(v, &change);
+        T(!change.changed); T(v->scanned <= VIEW_SCAN_BOUND);
+    }
+    T(edit_malloc_guard_end() == 0); /* (P) motion reserves all scratch in view */
+    return rc;
+}
+static int relative_motion(void)
+{
+    const uint8_t line[] = "a\tb\r\n";
+    uint8_t text[VIEW_SCAN_BOUND + sizeof line * VIEW_SCAN_BOUND];
+    size_t n = sizeof text / (sizeof line - 1u) * (sizeof line - 1u);
+    for (size_t at = 0; at < n; at += sizeof line - 1u)
+        memcpy(text + at, line, sizeof line - 1u);
+    piece_allocator a = piece_default_allocator();
+    piece_tree *tree = piece_create(&a); T(tree);
+    T(piece_init_copy(tree, text, n) == 0);
+    view v; view_config cfg = {.rows = 8, .cols = 60};
+    view_init(&v, tree, &cfg);
+    v.state.selection.cursor = v.state.selection.anchor = n;
+    v.state.approximate = true;
+    view_change change;
+    int rc = view_relative_command(&v, VIEW_PAGE_UP, false, &change);
+    uint64_t scanned = v.scanned;
+    while (rc == VIEW_MORE) {
+        rc = view_continue(&v, &change); scanned += v.scanned;
+    }
+    printf("edit-jf9 relative PageUp: rc=%d scanned=%llu bound=%u (P)=VIEW_SCAN_BOUND\n",
+        rc, (unsigned long long)scanned, VIEW_SCAN_BOUND);
+    T(rc == VIEW_OK);
+    T(scanned <= VIEW_SCAN_BOUND); /* local rows fit the existing scan bound */
+    T(v.state.selection.cursor == n - cfg.rows * (sizeof line - 1u));
+    T(v.state.approximate);
+    /* (P) each supported motion, with both selection affinities, against
+     * ordinary view's exact implementation. Tabs and CRLF are in the fixture. */
+    const view_key motions[] = {VIEW_LEFT, VIEW_RIGHT, VIEW_UP, VIEW_DOWN,
+        VIEW_PAGE_UP, VIEW_PAGE_DOWN};
+    const uint64_t positions[] = {0, sizeof line - 1u, n,
+        n - cfg.rows * (sizeof line - 1u),
+        n - cfg.rows * (sizeof line - 1u) + 1u}; /* (P) boundaries/tab */
+    for (size_t position = 0; position < sizeof positions / sizeof positions[0]; position++) {
+        for (size_t motion = 0; motion < sizeof motions / sizeof motions[0]; motion++) {
+            for (unsigned extend = 0; extend <= (unsigned)true; extend++) {
+                view exact;
+                view_init(&v, tree, &cfg); view_init(&exact, tree, &cfg);
+                v.state.selection.cursor = v.state.selection.anchor = positions[position];
+                exact.state = v.state;
+                T(relative_complete(&v, motions[motion], extend != 0) == VIEW_OK);
+                rc = view_command(&exact, motions[motion], extend != 0, NULL, 0, &change);
+                while (rc == VIEW_MORE) rc = view_continue(&exact, &change);
+                T(rc == VIEW_OK);
+                T(v.state.selection.cursor == exact.state.selection.cursor);
+                T(v.state.selection.anchor == exact.state.selection.anchor);
+                T(v.state.selection.preferred_col == exact.state.selection.preferred_col);
+                T(!v.line_next && !v.query_next && !v.query_kind);
+            }
+        }
+    }
+    /* Boundary no-ops retain a previously chosen visual column (P: reuse
+     * the configured viewport width as that column, beyond the short line). */
+    for (size_t motion = 0; motion < sizeof motions / sizeof motions[0]; motion++) {
+        view exact;
+        view_init(&v, tree, &cfg); view_init(&exact, tree, &cfg);
+        v.state.selection.cursor = v.state.selection.anchor =
+            motions[motion] == VIEW_LEFT || motions[motion] == VIEW_UP || motions[motion] == VIEW_PAGE_UP ? 0 : n;
+        v.state.selection.preferred_col = cfg.cols; exact.state = v.state;
+        T(relative_complete(&v, motions[motion], false) == VIEW_OK);
+        rc = view_command(&exact, motions[motion], false, NULL, 0, &change);
+        while (rc == VIEW_MORE) rc = view_continue(&exact, &change);
+        T(rc == VIEW_OK);
+        T(v.state.selection.cursor == exact.state.selection.cursor);
+        T(v.state.selection.preferred_col == exact.state.selection.preferred_col);
+    }
+    const uint8_t unicode[] = "a\t👩‍💻\r\nshort\n";
+    T(piece_delete(tree, 0, n, NULL) == 0);
+    T(piece_insert(tree, 0, unicode, sizeof unicode - 1u) == 0);
+    for (size_t motion = 0; motion < sizeof motions / sizeof motions[0]; motion++) {
+        view exact;
+        view_init(&v, tree, &cfg); view_init(&exact, tree, &cfg);
+        /* (P) the complete ASCII/tab/ZWJ cluster precedes the CRLF. */
+        v.state.selection.cursor = sizeof "a\t👩‍💻" - 1u;
+        exact.state = v.state;
+        T(relative_complete(&v, motions[motion], true) == VIEW_OK);
+        rc = view_command(&exact, motions[motion], true, NULL, 0, &change);
+        while (rc == VIEW_MORE) rc = view_continue(&exact, &change);
+        T(rc == VIEW_OK);
+        T(v.state.selection.cursor == exact.state.selection.cursor);
+        T(v.state.selection.anchor == exact.state.selection.anchor);
+        T(v.state.selection.preferred_col == exact.state.selection.preferred_col);
+    }
+    /* The backward line proof over a newline-free prefix must yield. Cancel
+     * restores the completed state without publishing guessed line metadata. */
+    T(piece_delete(tree, 0, piece_len(tree), NULL) == 0);
+    memset(text, 'a', sizeof text); T(piece_insert(tree, 0, text, sizeof text) == 0);
+    view_init(&v, tree, &cfg);
+    v.state.selection.cursor = v.state.selection.anchor = sizeof text;
+    view_state before = v.state;
+    rc = view_relative_command(&v, VIEW_UP, true, &change);
+    T(rc == VIEW_MORE); T(v.scanned <= VIEW_SCAN_BOUND);
+    view_cancel(&v);
+    T(v.state.selection.cursor == before.selection.cursor);
+    T(v.state.selection.anchor == before.selection.anchor);
+    T(!v.relative && !view_busy(&v));
+    T(relative_complete(&v, VIEW_UP, false) == VIEW_OK);
+    T(v.state.selection.cursor == 0);
+    T(v.state.selection.preferred_col == sizeof text);
+    rc = view_restore(&v, &before, &change);
+    while (rc == VIEW_MORE) rc = view_continue(&v, &change);
+    T(rc == VIEW_OK); T(!v.relative);
+    T(v.state.selection.cursor == before.selection.cursor);
+    piece_destroy(tree);
+    puts("edit-jf9 headless relative motion: ok");
+    return 0;
+}
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("EDIT_JF9_VIEW")) return relative_motion();
+    T(relative_motion() == 0);
     if (getenv("EDIT_91C_STARVED"))
         return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
     T(starved_follows(true, false) == 0);
     T(starved_follows(true, true) == 0);
     T(starved_follows(false, false) == 0);
+    T(jump_then_page() == 0);
     if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete(getenv("P4_ESTIMATED_WRAP") != NULL);
     if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
     if (getenv("P4_COLD_WRAP")) return cold_bracket_paint(true);

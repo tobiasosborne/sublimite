@@ -68,7 +68,8 @@ enum { S_NEXT=1, S_PREV, S_CEIL, S_BYTE_COL, S_COL_BYTE, S_HOME,
        S_WORD_LEFT, S_WORD_RIGHT, S_WORD_SELECT };
 enum { P_MOVE=1, P_VERTICAL_COL, P_VERTICAL_DEST, P_APPLY,
        P_FOLLOW, P_REPAIR, P_VERTICAL_BOUNDARY, P_NORMAL_CURSOR, P_NORMAL_ANCHOR, P_SETUP, P_FINISH, P_NORMAL_SETUP,
-       P_VISUAL_COL, P_VISUAL_SETUP, P_BULK, P_BULK_PREPARE, P_BULK_COLUMN };
+       P_VISUAL_COL, P_VISUAL_SETUP, P_BULK, P_BULK_PREPARE, P_BULK_COLUMN,
+       P_REL_START, P_REL_LEFT_START, P_REL_COL, P_REL_ROWS, P_REL_DEST, P_REL_FOLLOW };
 enum { C_WORD=0, C_SEPARATOR=1, C_SPACE=2, C_NEWLINE=3 };
 
 static uint64_t min_u64(uint64_t a, uint64_t b) { return a<b?a:b; }
@@ -387,6 +388,62 @@ static void set_cursor(view *v, uint64_t target)
     v->state.selection.cursor=target;
     if(!v->shift) v->state.selection.anchor=target;
 }
+/* (P) reuse line_query's byte quantum: exhausted reserves this read plus
+ * grapheme lookahead inside VIEW_SCAN_BOUND. No estimated ordinal is stored. */
+static int relative_start(view *v, uint64_t *start)
+{
+    uint8_t bytes[256];
+    while(v->relative_pos) {
+        if(exhausted(v)) return VIEW_MORE;
+        size_t n=(size_t)min_u64(sizeof bytes,v->relative_pos);
+        uint64_t from=v->relative_pos-n;
+        int rc=piece_read(v->tree,from,bytes,n); if(rc) return rc;
+        v->scanned+=n;
+        for(size_t i=n;i;i--) if(bytes[i-1u]=='\n') {
+            *start=from+i; return VIEW_OK;
+        }
+        v->relative_pos=from;
+    }
+    *start=0; return VIEW_OK;
+}
+static int relative_rows(view *v)
+{
+    bool up=v->key==VIEW_UP || v->key==VIEW_PAGE_UP;
+    uint64_t total=piece_len(v->tree);
+    uint8_t bytes[256]; /* (P) same query quantum as relative_start */
+    while(v->relative_rows) {
+        if(up) {
+            if(!v->relative_start) { v->relative_rows=0; break; }
+            uint64_t start;
+            int rc=relative_start(v,&start); if(rc) return rc;
+            v->relative_start=start;
+            v->relative_pos=start?start-1u:0; /* exclude this line's LF */
+        } else {
+            bool found=false;
+            while(v->relative_pos<total && !found) {
+                if(exhausted(v)) return VIEW_MORE;
+                size_t n=(size_t)min_u64(sizeof bytes,total-v->relative_pos);
+                int rc=piece_read(v->tree,v->relative_pos,bytes,n); if(rc) return rc;
+                v->scanned+=n;
+                for(size_t i=0;i<n;i++) if(bytes[i]=='\n') {
+                    v->relative_start=v->relative_pos+i+1u;
+                    v->relative_pos=v->relative_start; found=true; break;
+                }
+                if(!found) v->relative_pos+=n;
+            }
+            if(!found) { v->relative_rows=0; break; }
+        }
+        v->relative_boundary=false; --v->relative_rows;
+    }
+    if(v->relative_boundary) {
+        v->result=up?0:total; v->phase=P_APPLY;
+    } else {
+        v->column_start=v->relative_start;
+        scan_begin(v,S_COL_BYTE,v->relative_start,total,v->state.selection.preferred_col,0);
+        v->phase=P_REL_DEST;
+    }
+    return VIEW_OK;
+}
 static int follow_line(view *v)
 {
     uint64_t line, first; int rc=line_at(v,v->state.selection.cursor,&line); if(rc!=VIEW_OK) return rc;
@@ -425,6 +482,10 @@ static int finish_move(view *v)
             v->state.approximate|=approx;
         }
         v->busy=false; return 0;
+    }
+    if(v->relative) {
+        v->relative_pos=v->state.selection.cursor; v->phase=P_REL_FOLLOW;
+        return VIEW_OK;
     }
     int rc=follow_line(v); if(rc!=VIEW_OK) return rc;
     rc=column_begin(v,S_BYTE_COL,v->line,v->state.selection.cursor); if(rc!=VIEW_OK) return rc;
@@ -649,6 +710,37 @@ static int setup_command(view *v, view_change *change)
 static int advance(view *v, view_change *change)
 {
     for(;;) {
+        if(v->phase==P_REL_START || v->phase==P_REL_LEFT_START || v->phase==P_REL_FOLLOW) {
+            uint64_t start;
+            int rc=relative_start(v,&start); if(rc) return rc;
+            v->column_start=start;
+            if(v->phase==P_REL_FOLLOW) {
+                scan_begin(v,S_BYTE_COL,start,v->state.selection.cursor,v->state.selection.cursor,0);
+                v->phase=P_FOLLOW;
+            } else if(vertical(v->key)) {
+                v->relative_start=start; v->relative_boundary=true;
+                if(v->state.selection.preferred_col==VIEW_PREFERRED_UNSET) {
+                    scan_begin(v,S_BYTE_COL,start,v->origin,v->origin,0); v->phase=P_REL_COL;
+                } else {
+                    v->relative_pos=(v->key==VIEW_UP || v->key==VIEW_PAGE_UP)?(start?start-1u:0):start;
+                    v->phase=P_REL_ROWS;
+                }
+            } else if(v->origin!=v->before_state.selection.anchor && !v->shift) {
+                v->result=v->key==VIEW_LEFT?v->lo:v->hi; v->phase=P_APPLY;
+            } else {
+                if(v->phase==P_REL_START && v->key==VIEW_LEFT && v->origin==start && start) {
+                    v->relative_pos=start-1u; v->phase=P_REL_LEFT_START; continue;
+                }
+                scan_begin(v,v->key==VIEW_LEFT?S_PREV:S_NEXT,
+                    v->key==VIEW_LEFT?start:v->origin,piece_len(v->tree),v->origin,0);
+                v->phase=P_MOVE;
+            }
+            continue;
+        }
+        if(v->phase==P_REL_ROWS) {
+            int rc=relative_rows(v); if(rc) return rc;
+            continue;
+        }
         if(v->phase==P_BULK_PREPARE) {
             uint64_t lo=v->bulk_offset-v->pending_len;
             int rc=line_at(v,lo,&v->line); if(rc!=VIEW_OK) return rc;
@@ -686,7 +778,14 @@ static int advance(view *v, view_change *change)
             set_cursor(v,v->result); v->phase=P_FINISH; continue;
         }
         int rc=scan_run(v); if(rc!=0) return rc;
-        if(v->phase==P_BULK_COLUMN) {
+        if(v->phase==P_REL_COL) {
+            v->state.selection.preferred_col=v->column;
+            uint64_t start=v->relative_start;
+            v->relative_pos=(v->key==VIEW_UP || v->key==VIEW_PAGE_UP)?(start?start-1u:0):start;
+            v->phase=P_REL_ROWS;
+        } else if(v->phase==P_REL_DEST) {
+            v->phase=P_APPLY;
+        } else if(v->phase==P_BULK_COLUMN) {
             seed_store(v,v->bulk_offset-v->pending_len,v->column); v->phase=P_BULK;
         } else if(v->phase==P_VISUAL_COL) {
             uint64_t col=v->column-v->visual_column+v->visual_indent;
@@ -748,7 +847,7 @@ static int complete_call(view *v, int rc)
 }
 static int normalize(view *v, view_state saved, bool cursor_before, bool anchor_before, view_change *change)
 {
-    slice_begin(v); v->before_state=v->state; v->restore_state=saved;
+    slice_begin(v); v->relative=false; v->before_state=v->state; v->restore_state=saved;
     uint64_t total=piece_len(v->tree);
     v->restore_state.selection.cursor=min_u64(saved.selection.cursor,total);
     v->restore_state.selection.anchor=min_u64(saved.selection.anchor,total);
@@ -817,7 +916,7 @@ int view_set_undo(view *v, undo_log *log)
 void view_cancel(view *v)
 {
     if(v->busy) { if(v->edited) fallback(v); else v->state=v->before_state; }
-    v->busy=false;
+    v->busy=false; v->relative=false;
     for(unsigned i=0;i<16;++i) v->seeds[i].valid=false;
     queries_invalidate(v,0);
     (void)mutation_end(v,VIEW_OK);
@@ -831,6 +930,30 @@ int view_continue(view *v, view_change *change)
     if(!v->busy) return VIEW_OK;
     return complete_call(v,advance(v,change));
 }
+int view_relative_command(view *v, view_key key, bool shift, view_change *change)
+{
+    if(change) *change=(view_change){0};
+    if(!v || !v->tree || !change || v->state.wrap ||
+       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT)) return VIEW_ERR_ARG;
+    if(v->busy) return VIEW_ERR_BUSY;
+    uint64_t cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
+    if(cursor>piece_len(v->tree) || anchor>piece_len(v->tree)) return VIEW_ERR_ARG;
+    if(cursor==anchor && ((key==VIEW_LEFT && cursor==0) ||
+       (key==VIEW_RIGHT && cursor==piece_len(v->tree)))) {
+        v->scanned=0; v->relative=true; return VIEW_OK;
+    }
+    slice_begin(v); v->before_state=v->state;
+    v->busy=true; v->shift=shift; v->key=key; v->origin=cursor; v->edited=false;
+    v->lo=min_u64(cursor,anchor); v->hi=max_u64(cursor,anchor);
+    v->relative=true; v->relative_pos=cursor; v->query_kind=0;
+    /* (P) page displacement is exactly the configured visible row count;
+     * an arrow advances its adjacent row. No estimated total limits motion. */
+    v->relative_rows=(key==VIEW_PAGE_UP || key==VIEW_PAGE_DOWN)?v->config.rows:1u;
+    v->state.visual_end=false;
+    if(!vertical(key)) v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
+    v->phase=P_REL_START;
+    return complete_call(v,advance(v,change));
+}
 int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t len, view_change *change)
 {
     if(change) *change=(view_change){0};
@@ -838,7 +961,7 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t 
     if(v->busy) return VIEW_ERR_BUSY;
     uint64_t total=piece_len(v->tree), cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
     if(cursor>total || anchor>total) return VIEW_ERR_ARG;
-    v->scanned=0;
+    v->scanned=0; v->relative=false;
     /* Older editor callers use empty TYPE to repair a target they installed
      * after an external mutation. An unchanged completed state is a true no-op.
      * Explicit notify/restore remains required for arbitrary external edits. */

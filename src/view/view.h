@@ -92,6 +92,9 @@ typedef struct view {
     size_t pending_len;
     uint64_t bulk_offset, bulk_remaining, bulk_target;
     bool bulk_insert;
+    /* Byte-relative motion owns no logical ordinal; exact caches stay exact. */
+    bool relative, relative_boundary;
+    uint64_t relative_pos, relative_start, relative_rows;
 } view;
 
 void view_init(view *v, piece_tree *tree, const view_config *config);
@@ -117,6 +120,12 @@ void view_init(view *v, piece_tree *tree, const view_config *config);
 /* All APIs with a change output clear a nonnull output even on argument errors. */
 int view_command(view *v, view_key key, bool shift, const uint8_t *text,
                  size_t len, view_change *change);
+/* Unwrapped arrows/pages with an inexact external line count. Walk certified
+ * LF boundaries locally, preserving exact grapheme columns and selection.
+ * Leaves viewport ordinals/bytes to the host's resident scroll resolver.
+ * Same scan/deadline/continuation contract; never writes exact line caches.
+ * relative remains set on completion so the host cannot adopt v->line. */
+int view_relative_command(view *v, view_key key, bool shift, view_change *change);
 int view_continue(view *v, view_change *change);
 void view_cancel(view *v);
 bool view_busy(const view *v);
