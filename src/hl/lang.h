@@ -12,5 +12,9 @@ const TSLanguage *hl_language_typescript(void);
 const TSLanguage *hl_language_json(void);
 const TSLanguage *hl_language_toml(void);
 const TSLanguage *hl_language_yaml(void);
+const TSLanguage *hl_language_markdown(void);
+const TSLanguage *hl_language_markdown_inline(void);
+const TSLanguage *hl_language_latex(void);
+const TSLanguage *hl_language_bash(void);
 
 #endif

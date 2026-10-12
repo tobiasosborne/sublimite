@@ -399,6 +399,57 @@ static int yaml_probe(void)
                          "vendor/tree-sitter-yaml/queries/highlights.scm");
 }
 
+static int markdown_probe(void)
+{
+    const char fixture[] =
+        "# Heading\n\n"
+        "A *small* document with **strong** emphasis.\n\n"
+        "```bash\n"
+        "echo hello\n"
+        "```\n";
+    REQUIRE(grammar_probe("markdown", hl_language_markdown(), fixture,
+        sizeof fixture - 1u,
+        "vendor/tree-sitter-markdown/tree-sitter-markdown/queries/highlights.scm") == 0);
+    return grammar_probe("markdown_inline", hl_language_markdown_inline(), fixture,
+        sizeof fixture - 1u,
+        "vendor/tree-sitter-markdown/tree-sitter-markdown-inline/queries/highlights.scm");
+}
+
+static int latex_probe(void)
+{
+    const char fixture[] =
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        "\\section{Greeting}\n"
+        "% scanner must handle verbatim content\n"
+        "Hello \\textbf{world}, $x + y$.\n"
+        "\\begin{verbatim}\n"
+        "raw { text } % literal\n"
+        "\\end{verbatim}\n"
+        "\\end{document}\n";
+    return grammar_probe("latex", hl_language_latex(), fixture,
+        sizeof fixture - 1u,
+        "vendor/tree-sitter-latex/queries/highlights.scm");
+}
+
+static int bash_probe(void)
+{
+    const char fixture[] =
+        "#!/bin/bash\n"
+        "greet() {\n"
+        "    local name=\"$USER\"\n"
+        "    if [[ -n \"$name\" ]]; then\n"
+        "        cat <<EOF\n"
+        "hello ${name}\n"
+        "EOF\n"
+        "    fi\n"
+        "}\n"
+        "greet | cat\n";
+    return grammar_probe("bash", hl_language_bash(), fixture,
+        sizeof fixture - 1u,
+        "vendor/tree-sitter-bash/queries/highlights.scm");
+}
+
 int main(void)
 {
     REQUIRE(query_test() == 0);
@@ -410,6 +461,10 @@ int main(void)
     const TSLanguage *json = hl_language_json();
     const TSLanguage *toml = hl_language_toml();
     const TSLanguage *yaml = hl_language_yaml();
+    const TSLanguage *markdown = hl_language_markdown();
+    const TSLanguage *markdown_inline = hl_language_markdown_inline();
+    const TSLanguage *latex = hl_language_latex();
+    const TSLanguage *bash = hl_language_bash();
     const size_t language_allocations = edit_malloc_guard_end();
     REQUIRE(language_allocations == 0); /* (P) typing-path allocation law */
     REQUIRE(python != NULL && julia != NULL);
@@ -425,6 +480,10 @@ int main(void)
     REQUIRE(toml_probe() == 0);
     REQUIRE(yaml != NULL);
     REQUIRE(yaml_probe() == 0);
+    REQUIRE(markdown != NULL && markdown_inline != NULL && latex != NULL && bash != NULL);
+    REQUIRE(markdown_probe() == 0);
+    REQUIRE(latex_probe() == 0);
+    REQUIRE(bash_probe() == 0);
     const char text[] = "prefix\nviewport\nsuffix\n";
     const uint64_t first = sizeof "prefix\n" - 1u;
     const uint64_t end = first + sizeof "viewport\n" - 1u;

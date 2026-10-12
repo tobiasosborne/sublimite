@@ -1,0 +1,4 @@
+tree-sitter-markdown v0.5.3 from GitHub release/archive tarball tree-sitter-markdown-v0.5.3.tar.gz
+sha256 df845b1ab7c7c163ec57d7fa17170c92b04be199bddab02523636efec5224ab6
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+local ABI normalization: vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/scanner.c changes tree_sitter_markdown_inline_external_scanner_create() to tree_sitter_markdown_inline_external_scanner_create(void), matching the generated callback prototype (Clang function sanitizer).

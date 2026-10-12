@@ -1,0 +1,4 @@
+tree-sitter-bash v0.25.1 from GitHub release/archive tarball tree-sitter-bash-v0.25.1.tar.gz
+sha256 2e785a761225b6c433410ef9c7b63cfb0a4e83a35a19e0f2aec140b42c06b52d
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+local ABI normalization: vendor/tree-sitter-bash/src/scanner.c changes tree_sitter_bash_external_scanner_create() to tree_sitter_bash_external_scanner_create(void), matching the generated callback prototype (Clang function sanitizer).

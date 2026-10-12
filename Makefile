@@ -43,6 +43,10 @@ SRCS += vendor/tree-sitter-typescript/typescript/src/parser.c vendor/tree-sitter
 SRCS += vendor/tree-sitter-json/src/parser.c
 SRCS += vendor/tree-sitter-toml/src/parser.c vendor/tree-sitter-toml/src/scanner.c
 SRCS += vendor/tree-sitter-yaml/src/parser.c vendor/tree-sitter-yaml/src/scanner.c
+SRCS += vendor/tree-sitter-markdown/tree-sitter-markdown/src/parser.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/scanner.c
+SRCS += vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/parser.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/scanner.c
+SRCS += vendor/tree-sitter-latex/src/parser.c vendor/tree-sitter-latex/src/scanner.c
+SRCS += vendor/tree-sitter-bash/src/parser.c vendor/tree-sitter-bash/src/scanner.c
 MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
 BENCHS := $(sort $(wildcard bench/*_bench.c))
@@ -90,6 +94,20 @@ $(TS_TOML_OBJ): INC := -Ivendor/tree-sitter-toml/src $(INC)
 TS_YAML_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-yaml/src/,parser.o scanner.o))
 $(TS_YAML_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value -Wno-unused-but-set-variable -Wno-implicit-fallthrough
 $(TS_YAML_OBJ): INC := -Ivendor/tree-sitter-yaml/src $(INC)
+
+# Generated grammar/scanner warnings are relaxed only for vendored objects.
+TS_MARKDOWN_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-markdown/tree-sitter-markdown/src/,parser.o scanner.o))
+$(TS_MARKDOWN_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+$(TS_MARKDOWN_OBJ): INC := -Ivendor/tree-sitter-markdown/tree-sitter-markdown/src $(INC)
+TS_MARKDOWN_INLINE_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/,parser.o scanner.o))
+$(TS_MARKDOWN_INLINE_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+$(TS_MARKDOWN_INLINE_OBJ): INC := -Ivendor/tree-sitter-markdown/tree-sitter-markdown-inline/src $(INC)
+TS_LATEX_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-latex/src/,parser.o scanner.o))
+$(TS_LATEX_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter -Wno-unused-label -Wno-unused-but-set-variable
+$(TS_LATEX_OBJ): INC := -Ivendor/tree-sitter-latex/src $(INC)
+TS_BASH_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-bash/src/,parser.o scanner.o))
+$(TS_BASH_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value
+$(TS_BASH_OBJ): INC := -Ivendor/tree-sitter-bash/src $(INC)
 
 REL_LIB  := $(B)/libedit.a
 SAN_LIB  := $(B)/san/libedit.a
@@ -157,6 +175,15 @@ $(B)/sublimite-julia: $(B)/rel/src/main.o $(REL_LIB)
 # TypeScript exceeds the assigned total binary goal when linked; archive extraction is opt-in.
 $(B)/sublimite-typescript: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_typescript $(REL_LIB) $(LDLIBS) -o $@
+# Explicit grammar extraction follows the sibling worker; large grammars stay opt-in.
+$(B)/sublimite-markdown: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_markdown $(REL_LIB) $(LDLIBS) -o $@
+$(B)/sublimite-markdown_inline: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_markdown_inline $(REL_LIB) $(LDLIBS) -o $@
+$(B)/sublimite-latex: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_latex $(REL_LIB) $(LDLIBS) -o $@
+$(B)/sublimite-bash: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_bash $(REL_LIB) $(LDLIBS) -o $@
 $(B)/sublimite: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_LIB) $(LDLIBS) -o $@
 $(B)/tools/%: $(B)/rel/tools/%.o $(REL_LIB)

@@ -1,0 +1,9 @@
+tree-sitter-latex v0.6.0 from GitHub release/archive tarball tree-sitter-latex-v0.6.0.tar.gz
+sha256 90d2085c9a46f5da0918ead2fa9b764defd57c34d493f06160f796014d2fd16a
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+local ABI normalization: vendor/tree-sitter-latex/src/scanner.c changes tree_sitter_latex_external_scanner_create() to tree_sitter_latex_external_scanner_create(void), matching the generated callback prototype (Clang function sanitizer).
+local generation: the supplied archive lacks parser.c and src/tree_sitter/*.h; generated from its grammar.js with official tree-sitter CLI v0.27.1 (default ABI identity 15), command: tree-sitter generate.
+generator URL: https://github.com/tree-sitter/tree-sitter/releases/download/v0.27.1/tree-sitter-linux-x64.gz
+generator gzip sha256 d01042f94ba3d6827ddc9788e235f75d8366431be42bdf90ade534d960c98b7d
+local query: the supplied archive lacks queries/highlights.scm; added a query against generated node names for comments, commands, environments, math, sections, verbatim, labels and URIs; compiled by hl_test.
+generation input grammar.js sha256 e603628bf632f1b455fd920aae2938e634edc72e6a3343157cbf274c7e92b5cd
