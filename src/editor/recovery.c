@@ -154,7 +154,7 @@ static bool same_bytes(editor_buffer *b, const recovered_buffer *r)
 static int install_buffer(editor *e, recovered_buffer *r)
 {
     uint64_t id;
-    int rc = editor_add_buffer(e, *r->target ? r->target : NULL, NULL, 0, &id);
+    int rc = editor_add_recovered_buffer(e, *r->target ? r->target : NULL, &id);
     if (rc) return rc;
     editor_buffer *b = e->buffer;
     /* Recovery uses private COPY acquisition. Its remainder must be installed

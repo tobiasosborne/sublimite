@@ -417,12 +417,12 @@ static size_t path_tab(editor *e, const char *path)
         if (same_path(path, tabs_at(&e->tabs, i)->path)) return i;
     return SIZE_MAX;
 }
-int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id)
+static int add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id, bool reuse)
 {
     if (!e || !id || editor_activation_busy(e) || (!bytes && len) ||
         (path && strlen(path) >= IPC_PATH_CAP)) return EDITOR_ERR_ARG;
     if (e->error || e->stats.journal_error) return EDITOR_ERR_IO;
-    size_t existing = path_tab(e, path);
+    size_t existing = reuse ? path_tab(e, path) : SIZE_MAX;
     if (existing != SIZE_MAX) {
         int selected = editor_select_tab(e, existing);
         if (!selected) *id = tabs_at(&e->tabs, existing)->id;
@@ -459,6 +459,17 @@ int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t 
     }
     if (rc && b && !b->id) { unpoll_source(e, b); editor_buffer_destroy(b); }
     return rc;
+}
+int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id)
+{
+    return add_buffer(e, path, bytes, len, id, true);
+}
+/* edit-dlfix: recovered journals are independent edit histories, not open
+ * requests. Two sessions may hold unsaved edits to one target; each keeps its
+ * own tab, so neither replays over the other. */
+int editor_add_recovered_buffer(editor *e, const char *path, uint64_t *id)
+{
+    return add_buffer(e, path, NULL, 0, id, false);
 }
 int editor_select_tab(editor *e, size_t index)
 {

@@ -412,6 +412,8 @@ void editor_goto_overlay(editor *e);
 int editor_goto_cancel(editor *e);
 int editor_file_command_service(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
+/* editor_add_buffer without path reuse: journal recovery only (edit-dlfix). */
+int editor_add_recovered_buffer(editor *e, const char *path, uint64_t *id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
                           size_t len, editor_buffer **out);
 void editor_buffer_destroy(editor_buffer *b);
