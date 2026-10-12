@@ -918,12 +918,6 @@ static int default_notices(void)
     T(e->unimplemented_frame != 0); /* notice has a frame generation */
     size_t binding_count; const keys_binding *bindings = keys_defaults(&binding_count);
     for (size_t i = 0; i < binding_count; i++) if (bindings[i].args.flags & KEYS_ARG_UNIMPLEMENTED) {
-        /* edit-73j: the editor's find panel takes Ctrl+F, Ctrl+H and F3/Shift+F3
-         * before keymap lookup (findpanel.c editor_find_key); they are not notices. */
-        uint32_t sym = bindings[i].keysym; uint16_t mods = bindings[i].modifiers;
-        if (bindings[i].args.chord == KEYS_CHORD_NONE &&
-            ((mods == PLAT_MOD_CTRL && (sym == XKB_KEY_f || sym == XKB_KEY_h)) ||
-             (sym == XKB_KEY_F3 && !(mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER))))) continue;
         uint64_t before = editor_get_stats(e).unimplemented_actions;
         e->keys.chord = bindings[i].args.chord;
         T(press(e, key(bindings[i].keysym, bindings[i].modifiers, "q")) == 0);

@@ -954,13 +954,13 @@ int editor_handle_key(editor *e, const plat_event *ev)
         if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R) tabs_mru_release(&e->tabs);
         return 0;
     }
-    keys_state probe = e->keys; const keys_binding *global = NULL;
-    (void)config_keys_lookup(&e->preferences, &probe, ev->keysym, ev->mods, &global);
-    bool common = global && (global->action == KEYS_ACTION_NEW_FILE || global->action == KEYS_ACTION_OPEN_FILE ||
-        global->action == KEYS_ACTION_SAVE_AS || global->action == KEYS_ACTION_EXIT || global->action == KEYS_ACTION_SCROLL_LINES);
-    if (!e->go.active && !common && editor_find_key(e, ev)) return 0;
     const keys_binding *binding = NULL;
     keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    /* edit-o20: file/exit/scroll commands bypass find-field consumption;
+     * edit-x8i: configured find actions dispatch from the same lookup. */
+    bool common = binding && (binding->action == KEYS_ACTION_NEW_FILE || binding->action == KEYS_ACTION_OPEN_FILE ||
+        binding->action == KEYS_ACTION_SAVE_AS || binding->action == KEYS_ACTION_EXIT || binding->action == KEYS_ACTION_SCROLL_LINES);
+    if (!e->go.active && (editor_find_action(e, ev, binding) || (!common && editor_find_key(e, ev)))) return 0;
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
         ev->keysym == XKB_KEY_Shift_L || ev->keysym == XKB_KEY_Shift_R ||
         ev->keysym == XKB_KEY_Alt_L || ev->keysym == XKB_KEY_Alt_R ||

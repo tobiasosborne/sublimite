@@ -284,25 +284,53 @@ int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool repla
     e->find_field_all=false;
     return editor_begin_frame(e);
 }
+bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding)
+{
+    if (!e->find.private_ || !ev->press || !binding) return false;
+    /* Focus keeps its physical field-editing keys even when their global
+     * actions are rebound. Other strokes dispatch the configured find action. */
+    bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0;
+    bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
+    if (e->find_visible && !(ev->mods&PLAT_MOD_SUPER) &&
+        (!(ev->mods&PLAT_MOD_ALT) || (ctrl && enter)) &&
+        (ev->keysym==XKB_KEY_Escape || ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter ||
+         ev->keysym==XKB_KEY_Tab || ev->keysym==XKB_KEY_Left || ev->keysym==XKB_KEY_Right ||
+         ev->keysym==XKB_KEY_Home || ev->keysym==XKB_KEY_End || ev->keysym==XKB_KEY_BackSpace ||
+         ev->keysym==XKB_KEY_Delete ||
+         (ctrl && (ev->keysym=='a' || ev->keysym=='A' || ev->keysym=='v' || ev->keysym=='V'))))
+        return false;
+    switch (binding->action) {
+    case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE:
+        (void)editor_find_service(e);
+        e->find_visible=true;
+        (void)findui_show(&e->find,true,binding->action==KEYS_ACTION_REPLACE);
+        field_select_all(e); keys_reset(&e->keys);
+        e->find_error=geometry(e); return true;
+    case KEYS_ACTION_FIND_NEXT: case KEYS_ACTION_FIND_PREVIOUS:
+        if (!findui_get_state(&e->find).open) (void)findui_show(&e->find,true,false);
+        /* (P) findui_next's direction contract is negative/positive one. */
+        navigate(e,binding->action==KEYS_ACTION_FIND_PREVIOUS ? -1 : 1); return true;
+    case KEYS_ACTION_TOGGLE_REGEX: case KEYS_ACTION_TOGGLE_CASE_SENSITIVE:
+    case KEYS_ACTION_TOGGLE_WHOLE_WORD: {
+        if (!e->find_visible || e->find_replace_active) return true;
+        findui_options options=findui_get_state(&e->find).options;
+        if (binding->action==KEYS_ACTION_TOGGLE_REGEX) options.regex=!options.regex;
+        else if (binding->action==KEYS_ACTION_TOGGLE_CASE_SENSITIVE) options.match_case=!options.match_case;
+        else options.whole_word=!options.whole_word;
+        (void)findui_set_options(&e->find,options); e->find_navigated=false;
+        (void)editor_begin_frame(e); return true;
+    }
+    default: return false;
+    }
+}
 bool editor_find_key(editor *e, const plat_event *ev)
 {
     if (!e->find.private_ || !ev->press) return false;
+    if (!e->find_visible && !e->find_replace_active) return false;
+    /* A consumed panel chord must not seed the global keymap's next stroke. */
+    keys_reset(&e->keys);
     bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0;
     bool shift=(ev->mods&PLAT_MOD_SHIFT)!=0;
-    /* Ctrl+Shift+F is Find in Files, not this panel. */
-    if (ctrl && !(ev->mods&(PLAT_MOD_ALT|PLAT_MOD_SUPER|PLAT_MOD_SHIFT)) &&
-        (ev->keysym=='f' || ev->keysym=='F' || ev->keysym=='h' || ev->keysym=='H')) {
-        bool replace=ev->keysym=='h' || ev->keysym=='H';
-        (void)editor_find_service(e);
-        e->find_visible=true;
-        (void)findui_show(&e->find,true,replace); field_select_all(e); keys_reset(&e->keys);
-        e->find_error=geometry(e); return true;
-    }
-    if (ev->keysym==XKB_KEY_F3 && !(ev->mods&(PLAT_MOD_CTRL|PLAT_MOD_ALT|PLAT_MOD_SUPER))) {
-        if (!findui_get_state(&e->find).open) (void)findui_show(&e->find,true,false);
-        navigate(e,shift ? -1 : 1); return true;
-    }
-    if (!e->find_visible && !e->find_replace_active) return false;
     findui_state state=findui_get_state(&e->find);
     if (ev->keysym==XKB_KEY_Escape) {
         if (e->find_replace_active) { (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e); }
@@ -312,8 +340,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (e->find_replace_active) return true;
     bool alt=(ev->mods&PLAT_MOD_ALT)!=0, super=(ev->mods&PLAT_MOD_SUPER)!=0;
     bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
-    /* Focus owns editing chords. Keep the existing find/replace shortcuts
-     * above and Ctrl(+Alt)+Enter below; everything else stays in the panel. */
+    /* Focus owns editing chords, including Ctrl(+Alt)+Enter below. */
     if (super || (ctrl && alt && !enter)) return true;
     if (ctrl && (ev->keysym=='a' || ev->keysym=='A')) {
         field_select_all(e); (void)editor_begin_frame(e); return true;
@@ -324,15 +351,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     /* Ctrl+X (and unsupported global chords) is a consumed no-op. */
     if (ctrl && !enter && ev->keysym!=XKB_KEY_Left && ev->keysym!=XKB_KEY_Right &&
         ev->keysym!=XKB_KEY_BackSpace) return true;
-    if (alt && !ctrl) {
-        findui_options options=state.options;
-        if (ev->keysym=='r' || ev->keysym=='R') options.regex=!options.regex;
-        else if (ev->keysym=='c' || ev->keysym=='C') options.match_case=!options.match_case;
-        else if (ev->keysym=='w' || ev->keysym=='W') options.whole_word=!options.whole_word;
-        else return true;
-        (void)findui_set_options(&e->find,options); e->find_navigated=false;
-        (void)editor_begin_frame(e); return true;
-    }
+    if (alt && !ctrl) return true;
     if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
         if (ctrl && state.replace_mode) replace_begin(e,(ev->mods&PLAT_MOD_ALT)!=0);
         else navigate(e,shift ? -1 : 1);

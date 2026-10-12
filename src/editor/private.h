@@ -411,6 +411,7 @@ int editor_find_init(editor *e);
 void editor_find_close(editor *e);
 int editor_find_service(editor *e);
 bool editor_find_key(editor *e, const plat_event *ev);
+bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding);
 int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement);
 int editor_find_paint(editor *e);
 int editor_find_replace_continue(editor *e);
