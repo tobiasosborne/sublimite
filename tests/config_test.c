@@ -150,7 +150,7 @@ int main(void)
 {
     T(parser_test() == 0);
     const char source[] = "theme = 'light'\nwrap = true\ntabs = 8\n"
-        "[font]\nsize = 12.5\nfamily = \"DejaVu Sans Mono\"\n"
+        "[font]\nsize = 12.5\nfamily = \"DejaVu Sans Mono\"\nfile='vendor/DejaVuSansMono.ttf#0'\n"
         "[keymap]\nredo = \"Ctrl+Y\"\n";
     /* (P) fixture: fractional points, tab width supplied by the user; literals
      * are parser inputs, never a latency/memory planning budget. */
@@ -159,6 +159,7 @@ int main(void)
     T(settings.font_points == 12.5 && settings.tab_width == 8u);
     T(settings.theme == CONFIG_LIGHT && settings.wrap_set && settings.wrap);
     T(!strcmp(settings.font_family, "DejaVu Sans Mono"));
+    T(!strcmp(settings.font_file, "vendor/DejaVuSansMono.ttf#0")); /* (P) fixture path/face */
     keys_state state = {0}; const keys_binding *binding;
     T(config_keys_lookup(&settings, &state, 'Y', PLAT_MOD_CTRL, &binding) == KEYS_MATCH);
     T(binding->action == KEYS_ACTION_REDO);

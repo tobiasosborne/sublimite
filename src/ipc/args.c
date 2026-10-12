@@ -100,6 +100,26 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
         if(options && strcmp(arg,"--")==0) { options=false; continue; }
         if(options && strcmp(arg,"--wait")==0) { out->request.wait=true; continue; }
         if(options && strcmp(arg,"--new-instance")==0) { out->request.new_instance=true; continue; }
+        if(options) {
+            const char *family_flag="--font-family", *file_flag="--font-file";
+            size_t family_len=strlen(family_flag), file_len=strlen(file_flag);
+            bool family=!strncmp(arg,family_flag,family_len) && (arg[family_len]=='=' || !arg[family_len]);
+            bool file=!strncmp(arg,file_flag,file_len) && (arg[file_len]=='=' || !arg[file_len]);
+            if(family || file) {
+                size_t flag_len=family?family_len:file_len;
+                const char *value=arg+flag_len;
+                if(*value=='=') value++;
+                else {
+                    if(i+1>=argc || !argv[i+1] || !strncmp(argv[i+1],"--",strlen("--"))) { rc=IPC_INVALID; goto fail; }
+                    value=argv[++i];
+                }
+                if(strlen(value)>=IPC_PATH_CAP) { rc=IPC_LIMIT; goto fail; }
+                const char *stored=copy_string(&out->arena,value);
+                if(!stored) { rc=IPC_LIMIT; goto fail; }
+                if(family) out->font_family=stored; else out->font_file=stored;
+                continue;
+            }
+        }
         if(strcmp(arg,"-")==0) {
             if(out->request.has_stdin) { rc=IPC_INVALID; goto fail; }
             out->request.has_stdin=true; continue;

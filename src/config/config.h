@@ -5,12 +5,12 @@
 
 /* (P) PATH_MAX on the supported Linux target; keys/families share this
  * decoded text bound. Entry/array limits derive from all actions plus the
- * scalar settings: font size/family, theme, tabs width/spaces, wrap. */
+ * scalar settings: font size/family/file, theme, tabs width/spaces, wrap. */
 #define CONFIG_TEXT_CAP 4096u
 /* (P) longest supported action path plus its NUL. Generic keys use the same
  * explicit subset limit; adding a longer action extends this bound. */
 #define CONFIG_NAME_CAP sizeof("keymap.split_selection_lines")
-#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 6u)
+#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 7u) /* (P) named scalars above */
 #define CONFIG_BINDING_CAP ((size_t)KEYS_ACTION_COUNT)
 /* (P) maximum serialized settings: each entry can contain a path bounded by
  * CONFIG_NAME_CAP and a value bounded by CONFIG_TEXT_CAP; escape expansion is
@@ -43,6 +43,7 @@ typedef enum config_theme { CONFIG_DARK, CONFIG_LIGHT } config_theme;
 typedef struct config_settings {
     double font_points; /* zero = use DPI consumer's default; never pixels */
     char font_family[CONFIG_TEXT_CAP]; /* empty = font consumer default */
+    char font_file[CONFIG_TEXT_CAP];   /* optional path with trailing #TTC-index */
     config_theme theme;
     uint32_t tab_width; /* zero = per-buffer detected/default indentation */
     bool tab_spaces, tabs_set, wrap, wrap_set;

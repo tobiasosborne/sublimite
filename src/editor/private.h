@@ -175,6 +175,9 @@ struct editor {
     config_settings preferences;
     uint64_t preferences_generation;
     double preferences_font_override; /* explicit startup points (native env) win over file */
+    char preferences_font_family[FONT_FALLBACK_PATH_MAX];
+    char preferences_font_file[FONT_FALLBACK_PATH_MAX];
+    bool preferences_font_selection_override, preferences_font_selection_pending;
     int preferences_watchfd;
     findui_panel find;
     uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
@@ -435,6 +438,7 @@ void editor_find_replace_finish(editor *e);
 int editor_poll_sources(editor *e);
 int editor_preferences_poll(editor *e);
 int editor_preferences_apply(editor *e);
+int editor_preferences_font_init(editor *e);
 void editor_preferences_buffer(editor *e, editor_buffer *b);
 void editor_retire_buffers(editor *e);
 lineidx_src editor_source(editor_buffer *b);

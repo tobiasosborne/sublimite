@@ -255,13 +255,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         uint64_t id; rc = editor_add_buffer(e, config->path, config->initial, config->initial_len, &id);
     } else rc = editor_activate(e);
     if (rc) goto fail;
-    /* Interim source while P6.4 is absent from this snapshot. Read once at
-     * setup; its future inotify callback calls editor_font_request. */
-    const char *family = getenv("EDIT_FONT_FAMILY"), *font_file = getenv("EDIT_FONT_FILE");
-    if ((family && *family) || (font_file && *font_file)) {
-        int font_rc = editor_font_request(e, family, font_file);
-        if (font_rc == EDITOR_ERR_ARG) editor_font_bad_config(e);
-    }
+    rc = editor_preferences_font_init(e); if (rc) goto fail;
     *out = e; return 0;
 fail:
     if (retry && e->recovery_retry) { *retry = true; strcpy(aside, e->recovery_aside); }

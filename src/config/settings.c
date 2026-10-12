@@ -62,9 +62,9 @@ static int setting(void *ctx, const char *path, const config_value *v)
         if ((v->type != CONFIG_INTEGER && v->type != CONFIG_FLOAT) || !isfinite(points) || points <= 0)
             return CONFIG_ERR_VALUE;
         s->font_points = points;
-    } else if (!strcmp(path, "font.family")) {
+    } else if (!strcmp(path, "font.family") || !strcmp(path, "font.file")) {
         if (v->type != CONFIG_STRING || !*v->string || strpbrk(v->string, "\n\r\t")) return CONFIG_ERR_VALUE;
-        strcpy(s->font_family, v->string);
+        strcpy(!strcmp(path, "font.file") ? s->font_file : s->font_family, v->string);
     } else if (!strcmp(path, "theme")) {
         if (v->type != CONFIG_STRING) return CONFIG_ERR_VALUE;
         if (!strcmp(v->string, "dark")) s->theme = CONFIG_DARK;

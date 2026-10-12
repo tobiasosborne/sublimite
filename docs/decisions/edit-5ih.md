@@ -1,12 +1,11 @@
 # edit-5ih: worker-prepared primary font selection
 
 DejaVu Sans Mono remains the embedded default and the guaranteed fallback.
-This worktree has no P6.4 config loader (`edit-v0o.7`) and no landed zoom
-rebuild implementation. The interim startup sources are `EDIT_FONT_FAMILY`
-and `EDIT_FONT_FILE`. `editor_font_request` is the allocation-free UI hook for
-P6.4's future `font.family` / `font.file` parser and inotify callback. The
-loader must retain/retry a request returning `EDITOR_MORE`; no request is
-silently replaced while its predecessor prepares.
+The config loader (`edit-v0o.7`) now consumes `font.family` and `font.file`
+at startup and through its existing inotify reload path. Native launch flags
+`--font-family` / `--font-file` and the environment use the same
+`editor_font_request` hook. Preferences retain/retry `EDITOR_MORE`; no request
+is silently lost while its predecessor prepares.
 
 `font.file` wins when present. A trailing `#decimal` selects the physical TTC
 face; named variation instances are unsupported, matching the existing font
@@ -128,3 +127,114 @@ these particular measured spans fit the brief's estimate. That estimate is
 not enforced as a typing gate. The trace is the retained G1 ring; its event
 sample counts are lower than the full run because the fixed ring overwrites
 old records. Pairing counts come from trace_fmt, not a proposed budget.
+
+## Config and CLI completion (s6)
+
+Selection precedence is source-wide, rather than independent precedence for
+family and file. This lets a CLI family override an environment file, and an
+environment family override a config file. The native main maps parsed flags
+into `editor_config`; `editor_open` snapshots the winning source into fixed
+storage before the launch arguments are freed. Environment values are read
+only at startup. Inotify continues to update other preferences under an
+explicit font override, without resolving or rebuilding the overridden font.
+
+| Winning source, highest first | Admission | Family/file rule | Config reload effect |
+| --- | --- | --- | --- |
+| CLI (`--font-family`, `--font-file`) | Either flag supplied, including an empty value | Nonempty file wins over family; both empty means embedded | Selection remains the CLI pair |
+| Environment (`EDIT_FONT_FAMILY`, `EDIT_FONT_FILE`) | Either value nonempty, and no CLI selection | Nonempty file wins over family | Selection remains the startup environment pair |
+| Config (`font.family`, `font.file`, dotted keys or `[font]`) | No CLI/environment selection | Nonempty file wins over family; absent pair means embedded | Changed pair requests preparation; unchanged pair does nothing |
+| Embedded DejaVu Sans Mono | No supplied selection, or winning selection fails | Guaranteed fallback | Removing config selection requests embedded |
+
+Flags accept `--font-family PATTERN`, `--font-family=PATTERN`,
+`--font-file PATH[#INDEX]` and `--font-file=PATH[#INDEX]`. Repeated flags keep
+the last value of each kind; a file wins regardless of flag order. A missing
+argument is an argument error. Empty CLI values deliberately select embedded
+rather than exposing a lower-priority source. Config string values must be
+nonempty; remove the keys to restore default. Paths are interpreted relative
+to the launch working directory, as in the landed environment runtime.
+These are launch settings, not new IPC protocol fields: when handing files to
+an existing primary, its selection remains in force. `--new-instance` applies
+the flags to an independent launch.
+
+The preferences consumer compares the desired original request with its last
+value and retains it in fixed editor-owned arrays, bounded by the existing
+font selection path capacity. It normalizes TTC syntax before comparing with
+the original UI request, never a worker-resolved path. A newer config reload
+can replace a deferred request while the previous request is preparing; it
+cannot replace the worker-owned snapshot. If the newer value returns to the
+in-flight original request, the deferred duplicate is canceled. Otherwise it
+is retried after adoption. This uses the existing editor turns and mailbox
+wakeups, without a new timer, allocation or resolution on the UI thread.
+
+Malformed file selection syntax schedules the existing worker diagnostic and
+requests embedded fallback; resolution/file/advance failures use the landed
+worker fallback. Failure at a winning source never tries a lower source.
+Font-size precedence remains its separate existing policy. The parser's entry
+capacity now includes font file: (P) font size/family/file, theme, tab
+width/spaces and wrap derive the scalar count used beside the named actions.
+
+The config regression uses installed Go Mono, compares the submitted atlas
+bytes with the embedded bake, restores embedded on removal, and tests the
+same value through dotted and table syntax without another adoption. It holds
+a submitted typing frame through mailbox readiness, then reloads again while
+the selection is outstanding and verifies the retained default is adopted.
+Typing before/after these changes uses the existing allocator interposition;
+(P) its required allocation count is zero, from CLAUDE Law 2. Sanitizers own
+malloc and label this guard inert; the release run is the allocation evidence.
+
+## NEW Go Mono baseline for config/CLI completion
+
+Command on this worktree's final release implementation:
+
+```sh
+env -u EDIT_FONT_FAMILY -u EDIT_FONT_FILE build/bench/editor_bench '--font-baseline=Go Mono'
+```
+
+Each existing row requests a post-startup swap before its unchanged workload.
+These are NEW baselines, not a regression comparison to the old cell geometry.
+The null backend measures scheduling, layout and submit; native display
+measurements remain with the coordinator. All measurements are (M)[AC],
+`BAT0=Not charging`. Load is sampled from `/proc/loadavg` by each row. Sample
+counts and tab populations are inherited from the existing harness, not newly
+chosen budgets. Timings derive from monotonic endpoint subtraction, with the
+harness's nearest-rank percentiles and order-statistic confidence intervals.
+Cells derive from the prepared face; grids from viewport division and reserved
+cell caps; pixel extents from grid times cell size. Glyph count derives from
+the inclusive printable ASCII range, and raster maxima from measured per-glyph
+endpoint differences. Input, mutation, journal and allocation counts derive
+from the existing instrumentation. The inherited gate columns remain tracked
+aspirations. G1 exceeds its inherited goal on this shared box; that is a note,
+not a claim of regression or a new budget.
+
+```text
+STAMP (M)[AC] BAT0=Not charging load1=6.85 shared box
+BACKEND requested=null actual=null init_error=0 TARGET A=2880x1800 font_px=30 (M)[AC]
+NEW_FONT_BASELINE family=Go Mono cell=16x30 grid=180x60 pixels=2880x1800 swaps=1 (M)[AC] derivation=worker_atlas_cell,viewport_div_cell,adopted_generations
+FONT_RASTER atlas_ns=408363 glyph_max_ns=10502 glyphs=95 (M)[AC] derivation=monotonic_end_minus_start,maximum_per_glyph,ASCII_last_minus_first_plus_one
+POSITION null byte=966367641 index=progressing workload=serial edits=alternating_insert_backspace
+BENCH name=editor_null_serial_injection_submit n=10000 required_n=10000 p50=1807948 p99=5838314 ci95_p50=[1784320,1855013] ci95_p99=[5793307,5994059] gate_p50=0 gate_p99=0 dropped=0 (M)[AC] power=Not charging load1=6.85 verdict=TRACK
+BENCH name=editor_null_serial_dequeue_submit n=10000 required_n=10000 p50=1744982 p99=5702217 ci95_p50=[1724732,1787928] ci95_p99=[5672887,5849390] gate_p50=0 gate_p99=0 dropped=0 (M)[AC] power=Not charging load1=6.85 verdict=TRACK
+BENCH name=editor_null_serial_injection_T4_G1 n=10000 required_n=10000 p50=2113759 p99=6342946 ci95_p50=[2089422,2165677] ci95_p99=[6260533,6566395] gate_p50=1000000 gate_p99=2000000 dropped=0 (M)[AC] power=Not charging load1=6.85 verdict=TRACK
+G1 null workload=serial keys=10000 completed=10000 arrivals_active=0 coalesced=0 foreign_input=0 allocations=0 mutations=10000 journal=10000 structural=OK mode=TRACK (M)[AC]
+STAMP (M)[AC] BAT0=Not charging load1=8.41 shared box
+NEW_FONT_BASELINE family=Go Mono cell=8x15 grid=360x120 pixels=2880x1800 swaps=1 (M)[AC] derivation=worker_atlas_cell,viewport_div_cell,adopted_generations
+FONT_RASTER atlas_ns=599879 glyph_max_ns=15652 glyphs=95 (M)[AC] derivation=monotonic_end_minus_start,maximum_per_glyph,ASCII_last_minus_first_plus_one
+BENCH name=editor_null_100tabs_ingress_T5_G3 n=10000 required_n=10000 p50=909638 p99=1704871 ci95_p50=[908681,910554] ci95_p99=[1694163,1719431] gate_p50=5000000 gate_p99=5560000 dropped=0 (M)[AC] power=Not charging load1=8.41 verdict=TRACK
+BENCH name=editor_null_100tabs_minimap_inside_frame n=10000 required_n=10000 p50=63888 p99=85633 ci95_p50=[63874,63901] ci95_p99=[85356,85904] gate_p50=0 gate_p99=500000 dropped=0 (M)[AC] power=Not charging load1=8.41 verdict=TRACK
+G3 null (M)[AC] load1=8.41 tabs=100 A=2880x1800 switches=10000 allocations=0 minimap_fills=10202 stale=0 mode=TRACK
+```
+
+The config and IPC module benches also succeeded. Config sample count derives
+from the literal fixture byte length. IPC samples use its existing handoff
+fixture; memory rows report the existing pool/arena reservations, not a new
+limit. Pool bytes derive from `IPC_RX_SMALL_COUNT * IPC_RX_SMALL_SIZE +
+IPC_RX_BIG_COUNT * IPC_MAX_WIRE`; arena bytes are the opened server's observed
+`arena.size`, including peer metadata. Timing rows are (M)[AC], with endpoint
+timing and load/power stamps from their respective harnesses.
+
+```text
+config_bench: parse (M)[AC] power=Not charging load1=6.82 n=77 derivation=one_sample_per_fixture_byte fixture_bytes=77 p50_ns=5017 p99_ns=34991 verdict=TRACK
+ipc_bench memory TRACK (E): rx_pool=3145728 arena=3154088 bytes, no limit; as planned
+ipc_bench TRACK (M)[AC] load1=6.82 status=Not charging; no limit (no derivation); includes callback, ACK, client exit/reap
+BENCH name=ipc_handoff n=200 p50=177768 p99=296229 ci95=[171294,180596] gate_p50=0 gate_p99=0 pass=1 power=[AC]
+```

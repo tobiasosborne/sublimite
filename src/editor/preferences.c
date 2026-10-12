@@ -1,6 +1,61 @@
 #include "editor/private.h"
 #include <sys/epoll.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void font_selection_set(editor *e, const char *family, const char *font_file)
+{
+    if (!family) family = "";
+    if (!font_file) font_file = "";
+    font_selection parsed = {0};
+    if (font_selection_parse(&parsed, family, font_file)) {
+        /* Invalid selection syntax still restores the guaranteed fallback;
+         * its diagnostic is scheduled on a worker, once per editor lifetime. */
+        editor_font_bad_config(e); family = font_file = "";
+    }
+    if (!strcmp(e->preferences_font_family, family) &&
+        !strcmp(e->preferences_font_file, font_file)) return;
+    strcpy(e->preferences_font_family, family);
+    strcpy(e->preferences_font_file, font_file);
+    e->preferences_font_selection_pending = true;
+}
+static int font_selection_poll(editor *e)
+{
+    if (!e->preferences_font_selection_pending) return 0;
+    font_selection parsed = {0};
+    if (font_selection_parse(&parsed, e->preferences_font_family, e->preferences_font_file))
+        return EDITOR_ERR_ARG;
+    const font_selection *requested = &e->font.selection;
+    /* A reload can return to the in-flight selection before it is adopted.
+     * Compare original UI requests, never worker-resolved file paths. */
+    if (!strcmp(parsed.family, requested->family) && !strcmp(parsed.file, requested->file) &&
+        parsed.index == requested->index) {
+        e->preferences_font_selection_pending = false; return 0;
+    }
+    int rc = editor_font_request(e, e->preferences_font_family, e->preferences_font_file);
+    if (rc == EDITOR_MORE) return 0; /* retained and retried on the next turn */
+    if (!rc) e->preferences_font_selection_pending = false;
+    return rc;
+}
+int editor_preferences_font_init(editor *e)
+{
+    const char *family = e->cfg.font_family, *font_file = e->cfg.font_file;
+    e->preferences_font_selection_override = family || font_file;
+    if (!e->preferences_font_selection_override) {
+        family = getenv("EDIT_FONT_FAMILY"); font_file = getenv("EDIT_FONT_FILE");
+        e->preferences_font_selection_override = (family && *family) || (font_file && *font_file);
+    }
+    if (!e->preferences_font_selection_override) {
+        const config_settings *settings = config_runtime_current(e->preferences_runtime);
+        family = settings ? settings->font_family : NULL;
+        font_file = settings ? settings->font_file : NULL;
+    }
+    font_selection_set(e, family, font_file);
+    /* args/env storage may be released as soon as open returns. */
+    e->cfg.font_family = e->cfg.font_file = NULL;
+    return font_selection_poll(e);
+}
 
 const config_settings *editor_preferences(const editor *e) { return e ? &e->preferences : NULL; }
 uint64_t editor_preferences_generation(const editor *e) { return e ? e->preferences_generation : 0; }
@@ -28,7 +83,8 @@ int editor_preferences_poll(editor *e)
 }
 int editor_preferences_apply(editor *e)
 {
-    if (!e->preferences_runtime || e->preferences_generation == config_runtime_generation(e->preferences_runtime)) return 0;
+    if (!e->preferences_runtime || e->preferences_generation == config_runtime_generation(e->preferences_runtime))
+        return font_selection_poll(e);
     bool was_wrap_set = e->preferences.wrap_set;
     bool old_wrap = e->v.state.wrap; uint32_t old_tab = e->lay.tab;
     e->preferences = *config_runtime_current(e->preferences_runtime);
@@ -37,6 +93,8 @@ int editor_preferences_apply(editor *e)
     editor_preferences_buffer(e, e->buffer);
     e->lay.row = e->lay.row_end; /* discard old settings' layout continuation */
     const config_settings *s = &e->preferences;
+    if (!e->preferences_font_selection_override)
+        font_selection_set(e, s->font_family, s->font_file);
     e->cfg.font_points = e->preferences_font_override != 0.0 ? e->preferences_font_override : s->font_points;
     if (!e->font.legacy) {
         double points = e->cfg.font_points != 0.0 ? e->cfg.font_points : EDITOR_FONT_DEFAULT_PT;
@@ -73,5 +131,6 @@ int editor_preferences_apply(editor *e)
             }
         }
     }
-    return editor_full_layout(e);
+    rc = editor_full_layout(e); if (rc) return rc;
+    return font_selection_poll(e);
 }

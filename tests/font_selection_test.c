@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <sched.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #define T(c) do { if (!(c)) { fprintf(stderr, "font_selection_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct guard { bool active; size_t allocations, submits; } guard;
@@ -50,6 +51,125 @@ static int type(editor *e, guard *g)
     T(g->submits > submits && !g->active && g->allocations == 0);
     T(editor_length(e) == n + sizeof ev.utf8[0]);
     T(editor_get_stats(e).submitted_sequence == editor_get_stats(e).input_sequence);
+    return 0;
+}
+static int write_preferences(const char *path, const char *source)
+{
+    int fd = open(path, O_WRONLY | O_TRUNC | O_CLOEXEC); T(fd >= 0);
+    T(write(fd, source, strlen(source)) == (ssize_t)strlen(source));
+    T(close(fd) == 0); return 0;
+}
+static int publish_preferences(editor *e, const char *path, const char *source)
+{
+    uint64_t generation = editor_preferences_generation(e);
+    T(write_preferences(path, source) == 0);
+    while (editor_preferences_generation(e) == generation) {
+        T(editor_step(e, 0) >= 0); sched_yield();
+    }
+    return 0;
+}
+static int reload_preferences(editor *e, const char *path, const char *source)
+{
+    T(publish_preferences(e, path, source) == 0);
+    return adopted(e);
+}
+static int hold_present(render_backend *backend, uint32_t frame);
+static int config_selection(void)
+{
+    char path[] = "/tmp/edit-5ih-config-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0 && close(fd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    guard g = {0};
+    /* (P) reuse the font selection typing fixture's reserved grid. */
+    editor_config cfg = {.cols=32, .rows=8, .max_cols=64, .max_rows=16,
+        .preferences_path=path, .hook_ctx=&g, .on_ingress=ingress, .on_submit=submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    const font_ascii_atlas *embedded = font_ascii_atlas_for_px(e->font.applied_px);
+    T(e->grid.pages[0].pixels == embedded->pixels); T(type(e, &g) == 0);
+    uint64_t changes = e->stats.font_changes;
+    size_t submits = g.submits;
+    T(reload_preferences(e, path, "font.family = \"Go Mono\"\n") == 0);
+    T(e->stats.font_changes == changes + 1u); /* (P) one changed selection */
+    T(e->stats.font_error == FONT_OK && g.submits > submits);
+    T(!pthread_equal(e->font.worker, pthread_self()));
+    const render_atlas_page *page = &e->grid.pages[0];
+    T(page->pixels_len != embedded->pixels_len ||
+        memcmp(page->pixels, embedded->pixels, page->pixels_len));
+    T(type(e, &g) == 0);
+    changes = e->stats.font_changes;
+    T(reload_preferences(e, path, "theme='light'\n[font]\nfamily='Go Mono'\n") == 0);
+    T(e->stats.font_changes == changes); /* identical effective family */
+    T(reload_preferences(e, path, "theme='dark'\n") == 0);
+    T(e->stats.font_changes == changes + 1u && e->grid.pages[0].pixels == embedded->pixels);
+    T(type(e, &g) == 0);
+
+    /* Hold the old typing frame: config publication and mailbox readiness
+     * cannot replace its borrowed atlas. A later reload is retained until
+     * the outstanding selection can be adopted at the next frame boundary. */
+    int (*old_present)(render_backend *, uint32_t) = backend.ops.present;
+    backend.ops.present = hold_present;
+    plat_event key = {.kind=PLAT_EV_KEY, .press=true, .keysym=XKB_KEY_a, .utf8_len=1, .utf8={'a'}};
+    T(editor_inject(e, &key) == 0);
+    while (!backend.active) T(editor_step(e, 0) >= 0);
+    changes = e->stats.font_changes;
+    T(publish_preferences(e, path, "[font]\nfamily='Go Mono'\n") == 0);
+    T(prepared(e) == 0 && e->grid.pages[0].pixels == embedded->pixels);
+    uint32_t requested = e->font.requested_generation;
+    T(publish_preferences(e, path, "theme='light'\n") == 0);
+    T(e->font.requested_generation == requested && e->grid.pages[0].pixels == embedded->pixels);
+    uint32_t frame = backend.active_frame;
+    T(render_backend_signal(&backend, RENDER_EVENT_DEVICE_DONE, frame, trace_now_ns()) == 0);
+    T(render_backend_signal(&backend, RENDER_EVENT_PRESENT_COMPLETE, frame, trace_now_ns()) == 0);
+    backend.ops.present = old_present;
+    T(adopted(e) == 0 && e->grid.pages[0].pixels == embedded->pixels);
+    /* (P) Go Mono adoption plus the retained reset to embedded. */
+    T(e->stats.font_changes == changes + 2u); T(type(e, &g) == 0);
+    T(reload_preferences(e, path, "[font]\nfamily='absent'\nfile='vendor/DejaVuSansMono.ttf#0'\n") == 0);
+    T(e->stats.font_error == FONT_OK && e->grid.pages[0].pixels != embedded->pixels);
+    T(!memcmp(e->grid.pages[0].pixels, embedded->pixels, embedded->pixels_len));
+    T(type(e, &g) == 0);
+    T(reload_preferences(e, path, "[font]\nfile='vendor/DejaVuSansMono.ttf#bad'\n") == 0);
+    T(adopted(e) == 0 && e->grid.pages[0].pixels == embedded->pixels);
+    /* The diagnostic uses the bulk lane, independently of atlas readiness. */
+    while (!atomic_load(&e->font_logged)) { T(editor_step(e, 0) >= 0); sched_yield(); }
+    T(atomic_load(&e->font_logged));
+    editor_close(e);
+    T(write_preferences(path, "[font]\nfamily='Go Mono'\n") == 0);
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && e->stats.font_error == FONT_OK);
+    T(e->grid.pages[0].pixels != embedded->pixels); T(type(e, &g) == 0);
+    editor_close(e);
+
+    /* Higher source wins as a whole pair: a family must override a file
+     * from a lower source. Failure at the winning source uses embedded. */
+    T(write_preferences(path, "[font]\nfile='vendor/DejaVuSansMono.ttf#0'\n") == 0);
+    T(setenv("EDIT_FONT_FAMILY", "Go Mono", 1) == 0);
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && !strcmp(e->font.selection.family, "Go Mono") && !e->font.selection.file[0]);
+    changes = e->stats.font_changes;
+    T(reload_preferences(e, path, "[font]\nfamily='DejaVu Sans Mono:style=Bold'\n") == 0);
+    T(e->stats.font_changes == changes); T(type(e, &g) == 0); editor_close(e);
+    T(setenv("EDIT_FONT_FILE", "vendor/DejaVuSansMono.ttf#0", 1) == 0);
+    cfg.font_family = "Go Mono";
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && !strcmp(e->font.selection.family, "Go Mono") && !e->font.selection.file[0]);
+    changes = e->stats.font_changes;
+    T(reload_preferences(e, path, "theme='light'\n") == 0);
+    T(e->stats.font_changes == changes); T(type(e, &g) == 0); editor_close(e);
+    cfg.font_family = "absent"; cfg.font_file = "vendor/DejaVuSansMono.ttf#0";
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && e->stats.font_error == FONT_OK && e->font.selection.file[0]); editor_close(e);
+    cfg.font_file = NULL;
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && e->stats.font_error == FONT_ERR_MISSING && e->grid.pages[0].pixels == embedded->pixels);
+    T(type(e, &g) == 0); editor_close(e);
+    cfg.font_family = ""; /* explicit CLI empty overrides env/config with embedded */
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0);
+    T(adopted(e) == 0 && e->stats.font_changes == 0 && e->grid.pages[0].pixels == embedded->pixels);
+    editor_close(e);
+    T(unsetenv("EDIT_FONT_FAMILY") == 0 && unsetenv("EDIT_FONT_FILE") == 0);
+    T(unlink(path) == 0);
+    puts("font_selection_test: config startup/reload changes submitted glyph pixels, unchanged family skips rebuild, removal restores default, typing mallocs=0");
     return 0;
 }
 static int parsing(void)
@@ -252,6 +372,7 @@ int main(void)
 {
     trace_init(); (void)trace_thread_register(); T(parsing() == 0); T(rounded_proportional() == 0);
     T(unsetenv("EDIT_FONT_FAMILY") == 0 && unsetenv("EDIT_FONT_FILE") == 0);
+    T(config_selection() == 0);
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     guard g = {0};
     editor_config cfg = {.cols=32, .rows=8, .max_cols=64, .max_rows=16,

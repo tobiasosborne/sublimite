@@ -84,6 +84,10 @@ typedef struct editor_config {
     uint32_t max_window_width, max_window_height;
     bool load_preferences;            /* native startup enables XDG config */
     const char *preferences_path;     /* optional absolute setup/test override */
+    /* Startup selection (native CLI): either non-NULL pointer overrides the
+     * environment pair and config pair. Empty explicitly selects embedded.
+     * Copied during open; file wins within the selected source. */
+    const char *font_family, *font_file;
 } editor_config;
 typedef struct editor_stats {
     uint64_t input_sequence, submitted_sequence, presented_sequence;
