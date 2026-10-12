@@ -329,6 +329,9 @@ void editor_session_close(editor *e);
 void editor_session_publish(editor *e, editor_buffer *b);
 void editor_session_metadata(editor *e);
 void editor_session_forget(editor *e, editor_buffer *b);
+/* edit-5u2: true iff b is the buffer whose save is in flight (edit-9u3 keeps
+ * its leaf after eviction). state, if non-NULL, receives its published view. */
+bool editor_session_retains(const editor *e, const editor_buffer *b, view_state *state);
 int editor_save_setup(editor *e, editor_buffer *b);
 int editor_save_request(editor *e, uint64_t request_ns);
 void editor_save_tick(editor *e);

@@ -123,7 +123,9 @@ void editor_retire_buffers(editor *e)
         /* file_close has no public logical-retirement/physical-ready split.
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
-        if (editor_clip_holds(e, b) || (b->save && savectl_get_model(b->save).can_recover_cancel) ||
+        /* edit-5u2: the in-flight save still owns this buffer's leaf and tree. */
+        if (editor_session_retains(e, b, NULL) || editor_clip_holds(e, b) ||
+            (b->save && savectl_get_model(b->save).can_recover_cancel) ||
             b->find_leases || b->hl_leases || b->map_snapshot || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;

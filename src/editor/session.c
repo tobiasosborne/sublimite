@@ -143,6 +143,18 @@ void editor_session_forget(editor *e, editor_buffer *b)
     node_release(s, s->root); s->root = root;
     pthread_mutex_unlock(&s->mutex);
 }
+bool editor_session_retains(const editor *e, const editor_buffer *b, view_state *state)
+{
+    editor_session *s = e->session;
+    if (!s || !b || s->saving != b) return false;
+    if (state) {
+        pthread_mutex_lock(&s->mutex);
+        session_node *leaf = leaf_at(s, b->session_slot);
+        *state = leaf && leaf->buffer == b ? leaf->view : b->initial;
+        pthread_mutex_unlock(&s->mutex);
+    }
+    return true;
+}
 void editor_session_metadata(editor *e)
 {
     if (!e->session || e->recovering) return;

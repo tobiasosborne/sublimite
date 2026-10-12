@@ -318,6 +318,41 @@ static int evicted_saving_tab(void)
     T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
     close_fixture(&f); return 0;
 }
+/* edit-5u2: as evicted_saving_tab, but a complete checkpoint (the one a
+ * reload of another tab or a journal-repair flush takes) runs while the
+ * evicted tab's write is still held. It must keep the saving buffer, so the
+ * later finish succeeds, the file holds the Ctrl+S bytes, and recovery from
+ * the resulting journal sees the evicted buffer only as a closed tab. */
+static int checkpoint_during_evicted_save(void)
+{
+    fixture f = {0};
+    strcpy(f.directory, "build/editor-session-XXXXXX"); T(mkdtemp(f.directory));
+    T(snprintf(f.path, sizeof f.path, "%s/source", f.directory) > 0);
+    T(snprintf(f.log, sizeof f.log, "%s/journal", f.directory) > 0);
+    int fd = open(f.path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+    T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    T(render_null_backend(&f.backend) == 0);
+    editor_config config = {.path = f.path, .journal_path = f.log, .closed_capacity = 1,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* tab + text + status */
+    T(editor_open(&f.e, &config, &f.backend) == 0); T(settle(f.e) == 0);
+    uint64_t first, second;
+    T(editor_add_buffer(f.e, NULL, NULL, 0, &first) == 0); T(settle(f.e) == 0);
+    T(editor_add_buffer(f.e, NULL, NULL, 0, &second) == 0); T(settle(f.e) == 0);
+    T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(press(f.e, 'x', 0, "x") == 0); editor_buffer *owner = f.e->buffer;
+    held_save held = {.phase = FILE_STEP_TEMP_WRITTEN}; T(savectl_set_step_hook(owner->save, hold, &held) == 0);
+    T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
+    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(owner->retired && tabs_closed_at(&f.e->tabs, 0)->id != owner->id);
+    T(journal_flush(f.e->journal) == 0); T(editor_checkpoint(f.e) == 0);
+    atomic_store(&held.release, true); T(saved(f.e) == 0);
+    T(disk_is(f.path, "xbase") == 0);
+    T(!owner->save_error && !f.e->error && !f.e->stats.journal_error);
+    T(!editor_save_active(f.e) && !savectl_get_model(owner->save).needs_finish);
+    T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
+    close_fixture(&f); return 0;
+}
 static void crash_at_step(void *ctx, int phase)
 { if (phase == *(const int *)ctx) _exit(0); }
 static int interrupted_save(int phase)
@@ -354,6 +389,62 @@ static int interrupted_save(int phase)
     editor_close(e); unlink(source); unlink(next);
     /* A killed file-write worker can leave its unpublished temp. This fixture
      * owns the directory and cleans those entries without changing file.c. */
+    DIR *dir = opendir(root); T(dir); struct dirent *entry;
+    while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
+        char path[IPC_PATH_CAP]; T(snprintf(path, sizeof path, "%s/%s", root, entry->d_name) > 0); unlink(path);
+    }
+    closedir(dir); T(rmdir(root) == 0); return 0;
+}
+/* edit-5u2: a process crash right after that complete checkpoint, while the
+ * write is still held before rename. The Ctrl+S text of the evicted tab must
+ * survive as a closed tab (edit-9u3's retained leaf); the disk still holds the
+ * old bytes, so the recovered tab is modified. */
+static int crash_after_evicted_checkpoint(void)
+{
+    char root[] = "build/editor-crash-XXXXXX"; T(mkdtemp(root));
+    char source[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    T(snprintf(first, sizeof first, "%s/session-XXXXXX", root) > 0);
+    T(snprintf(next, sizeof next, "%s/session-XXXXXX", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    fd = mkstemp(first); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config config = {.path = source, .journal_path = first, .closed_capacity = 1,
+            .cols = 32, .rows = 3}; /* status width + chrome; capacity 1 as in evicted_saving_tab */
+        editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
+        uint64_t id;
+        T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+        T(press(e, 'x', 0, "x") == 0); editor_buffer *owner = e->buffer;
+        static held_save held = {.phase = FILE_STEP_TEMP_WRITTEN};
+        T(savectl_set_step_hook(owner->save, hold, &held) == 0);
+        T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(e, &held) == 0);
+        T(editor_close_tab(e, 0) == 0); T(settle(e) == 0);
+        T(editor_close_tab(e, 0) == 0); T(settle(e) == 0); T(owner->retired);
+        T(journal_flush(e->journal) == 0); T(editor_checkpoint(e) == 0);
+        _exit(0); /* crash: the held write never renames */
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    T(disk_is(source, "base") == 0);
+    fd = mkstemp(next); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = next, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
+    bool found = false;
+    for (size_t i = 0; i < tabs_closed_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_closed_at(&e->tabs, i);
+        editor_buffer *b = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        uint8_t bytes[sizeof "xbase" - 1];
+        if (strcmp(b->path, source) || piece_len(b->tree) != sizeof bytes) continue;
+        T(piece_read(b->tree, 0, bytes, sizeof bytes) == 0);
+        if (!memcmp(bytes, "xbase", sizeof bytes) && tab->modified) found = true;
+    }
+    T(found);
+    editor_close(e); unlink(source); unlink(next);
     DIR *dir = opendir(root); T(dir); struct dirent *entry;
     while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
         char path[IPC_PATH_CAP]; T(snprintf(path, sizeof path, "%s/%s", root, entry->d_name) > 0); unlink(path);
@@ -578,7 +669,8 @@ int main(void)
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
-    T(evicted_saving_tab() == 0);
-    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, interrupted-save startup, Saving acknowledgement, allocation guard passed");
+    T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
+    T(crash_after_evicted_checkpoint() == 0);
+    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, checkpoint during evicted save and crash after it, interrupted-save startup, Saving acknowledgement, allocation guard passed");
     return 0;
 }

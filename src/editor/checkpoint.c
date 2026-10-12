@@ -25,7 +25,8 @@ int editor_checkpoint(editor *e)
 {
     size_t capacity = 2;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i]; if (!b || b->retired) continue;
+        editor_buffer *b = e->buffers[i];
+        if (!b || (b->retired && !editor_session_retains(e, b, NULL))) continue;
         uint64_t len = piece_len(b->tree), chunks = len / 4096u + (len % 4096u != 0 ? 1u : 0u);
         if (chunks > SIZE_MAX - capacity - 4u) return JOURNAL_NOMEM;
         capacity += (size_t)chunks + 4u;
@@ -35,14 +36,23 @@ int editor_checkpoint(editor *e)
     if (!records) return JOURNAL_NOMEM;
     size_t count = 0; int rc = JOURNAL_NOMEM;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i]; if (!b || b->retired) continue;
+        editor_buffer *b = e->buffers[i];
+        /* edit-5u2: an evicted buffer whose save is in flight is still
+         * recovery state (edit-9u3). Its target may be replaced at any moment
+         * and its retained generation belongs to the save token, so it is kept
+         * as a closed tab with an empty BASE and its full text, as CURRENT
+         * cancellation encodes it: recovery compares that text with the disk. */
+        bool kept = b && b->retired;
+        if (!b || (kept && !editor_session_retains(e, b, NULL))) continue;
+        const journal_base *base = &b->base, empty = {.path = ""};
+        if (kept) base = &empty;
         /* Preserve named BASE association. A source conflict must preserve the
          * preceding recovery file, rather than silently relabel the new tree. */
-        if (*b->base.path && journal_check_base(&b->base)) { rc = JOURNAL_BASE_CHANGED; goto done; }
-        size_t path_len = strlen(b->base.path) + 1;
-        size_t base_size = 40 + path_len + (*b->base.path ? 8u : 0u);
+        if (*base->path && journal_check_base(base)) { rc = JOURNAL_BASE_CHANGED; goto done; }
+        size_t path_len = strlen(base->path) + 1;
+        size_t base_size = 40 + path_len + (*base->path ? 8u : 0u);
         uint8_t *p = record(records, &count, JOURNAL_BASE, b->id, base_size); if (!p) goto done;
-        rc = journal_encode_base(&b->base, p, base_size, &base_size); if (rc) goto done;
+        rc = journal_encode_base(base, p, base_size, &base_size); if (rc) goto done;
         rc = JOURNAL_NOMEM;
         if (*b->path) {
             p = record(records, &count, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!p) goto done;
@@ -52,9 +62,9 @@ int editor_checkpoint(editor *e)
          * BASE already describes the intact file; preserve it without content
          * replacement. An adopted empty tree still represents a deletion. */
         if (!b->pending_open) {
-            if (b->base.size) {
+            if (base->size) {
                 p = record(records, &count, JOURNAL_DELETE, b->id, 16); if (!p) goto done;
-                put64(p + 8, b->base.size);
+                put64(p + 8, base->size);
             }
             uint64_t len = piece_len(b->tree);
             for (uint64_t off = 0; off < len;) {
@@ -65,6 +75,7 @@ int editor_checkpoint(editor *e)
             }
         }
         view_state state = b == e->buffer ? e->v.state : b->initial;
+        if (kept) (void)editor_session_retains(e, b, &state);
         for (size_t j = 0; j < tabs_count(&e->tabs); j++) {
             const tabs_tab *tab = tabs_at(&e->tabs, j);
             if (tab->id == b->id && b != e->buffer) state = tab->state;
