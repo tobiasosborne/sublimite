@@ -211,6 +211,9 @@ static int install_buffer(editor *e, recovered_buffer *r)
 }
 static int install_session(editor *e, recovered_session *s)
 {
+    /* edit-rzj: appended sessions keep the newest session's active tab and
+     * geometry. Source-local IDs are mapped by install_buffer to fresh IDs. */
+    size_t live = tabs_count(&e->tabs), active = tabs_active_index(&e->tabs);
     uint64_t threshold = e->cfg.copy_threshold;
     e->cfg.copy_threshold = UINT64_MAX; e->recovering = true;
     journal *log = e->journal; e->journal = NULL;
@@ -223,7 +226,7 @@ static int install_session(editor *e, recovered_session *s)
         s->window_chosen ? s->width : e->font.window_width;
     uint32_t height = launch && e->cfg.window_height ? e->cfg.window_height :
         s->window_chosen ? s->height : e->font.window_height;
-    int rc = s->width && s->height ? editor_resize_now(e, width, height) : 0;
+    int rc = !e->startup_restored && s->width && s->height ? editor_resize_now(e, width, height) : 0;
     /* Live order is authoritative. Keep other journalled buffers as retained
      * closed tabs so unrelated recovery content survives the new checkpoint. */
     for (size_t i = 0; !rc && i < s->count; i++) {
@@ -235,12 +238,13 @@ static int install_session(editor *e, recovered_session *s)
         rc = install_buffer(e, b);
         if (!rc && s->tabs_valid) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
-    if (!rc && s->count) rc = editor_select_tab(e, s->active);
+    if (!rc && live) rc = editor_select_tab(e, active);
+    else if (!rc && s->count) rc = editor_select_tab(e, s->active);
     e->cfg.copy_threshold = threshold; e->journal = log; e->recovering = false;
     /* BASE was acquired while journal temporarily disabled. Derive it from the
      * opened generation off-path before publishing the recovered checkpoint. */
-    for (size_t i = 0; !rc && i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i]; if (!b) continue;
+    for (recovered_buffer *r = s->buffers; !rc && r; r = r->next) {
+        editor_buffer *b = r->installed; if (!b) continue;
         if (b->file) rc = journal_capture_base(file_path(b->file), &b->base);
         if (!rc) {
             int save_rc = editor_save_setup(e, b);
@@ -290,57 +294,25 @@ int editor_set_aside(const char *path, char *out, size_t cap)
     if (renameat2(AT_FDCWD, path, AT_FDCWD, out, RENAME_NOREPLACE)) { *out = 0; return EDITOR_ERR_IO; }
     return 0;
 }
-int editor_session_restore(editor *e)
+/* edit-rzj: capacity comes from the configured live/closed tab pools, not a
+ * recovery budget. (P) Structural zero/one denote empty/single; a closed
+ * buffer needs one temporary live slot before editor_close_tab retains it. */
+static bool session_fits(const editor *e, const recovered_session *s)
 {
-    const char *path = e->cfg.journal_path;
-    const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
-    if (!e->recover_existing && strncmp(name, "session-", strlen("session-"))) return 0;
+    size_t buffers = 0, used = 0;
+    for (const recovered_buffer *b = s->buffers; b; b = b->next) buffers++;
+    for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) used++;
+    size_t live = s->tabs_valid ? s->count : buffers;
+    if (live > buffers) return false;
+    size_t closed = buffers - live;
+    size_t available = e->tabs.capacity - tabs_count(&e->tabs);
+    return buffers <= e->buffer_capacity - used && live <= available &&
+        (!closed || live < available) &&
+        closed <= e->tabs.closed_capacity - tabs_closed_count(&e->tabs);
+}
+static int restore_source(editor *e, const char *directory, const char *previous)
+{
     char lock_path[IPC_PATH_CAP];
-    if (lock_name(lock_path, sizeof lock_path, path)) return EDITOR_ERR_ARG;
-    e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
-    e->session_lock_owned = true;
-    if (e->recovery_skip) return 0; /* edit-btj retry: own lease only, no discovery */
-    char directory[IPC_PATH_CAP]; strcpy(directory, path);
-    char *slash = strrchr(directory, '/');
-    if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
-    /* Housekeeping is best effort: a failed barrier leaves safe retired bytes,
-     * and a busy lease preserves the source. Never block session recovery. */
-    (void)journal_retire_directory(directory, path);
-    char previous[IPC_PATH_CAP] = ""; int previous_fd = -1;
-    if (e->recover_existing) {
-        strcpy(previous, path); previous_fd = dup(e->session_lock);
-        if (previous_fd < 0) return EDITOR_ERR_IO;
-    }
-    else {
-        struct timespec newest = {0};
-        DIR *dir = opendir(directory); if (!dir) return EDITOR_ERR_IO;
-        struct dirent *entry;
-        while ((entry = readdir(dir))) {
-            if (strncmp(entry->d_name, "session-", strlen("session-"))) continue;
-            /* mkstemp names have no suffix. Ignore retained SAVE originals and
-             * checkpoint temporaries, which share the prefix but contain a dot. */
-            if (strchr(entry->d_name, '.')) continue;
-            char candidate[IPC_PATH_CAP];
-            int n = snprintf(candidate, sizeof candidate, "%s/%s", directory, entry->d_name);
-            if (n < 0 || (size_t)n >= sizeof candidate || !strcmp(candidate, path)) continue;
-            int fd = open(candidate, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-            if (fd < 0) continue;
-            struct stat st;
-            if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_size) { close(fd); continue; }
-            if (lock_name(lock_path, sizeof lock_path, candidate)) { close(fd); continue; }
-            int lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-            close(fd); fd = lock;
-            if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) { if (fd >= 0) close(fd); continue; }
-            if (previous_fd < 0 || st.st_mtim.tv_sec > newest.tv_sec ||
-                (st.st_mtim.tv_sec == newest.tv_sec && st.st_mtim.tv_nsec > newest.tv_nsec)) {
-                if (previous_fd >= 0) close(previous_fd);
-                previous_fd = fd; newest = st.st_mtim; strcpy(previous, candidate);
-            } else close(fd);
-        }
-        closedir(dir);
-    }
-    if (previous_fd < 0) return 0;
     recovered_session session = {0}; journal_replay_result result;
     int rc = journal_replay_file(previous, restore_record, &session, &result);
     /* edit-btj: a discovered journal never blocks launch. A changed BASE gets
@@ -354,6 +326,13 @@ int editor_session_restore(editor *e)
     }
     if (!rc && e->recover_existing && !session.buffers) rc = EDITOR_ERR_IO;
     if (!rc && session.buffers) {
+        if (!e->recover_existing && !session_fits(e, &session)) {
+            /* Do not partially install or evict a dirty closed tab. Every
+             * skipped source stays discoverable on subsequent launches. */
+            e->recovery_notice = "additional session recovery deferred; journal retained (tab capacity)";
+            e->recovery_notice_mutations = e->stats.mutations;
+            fini(&session); return 0;
+        }
         rc = install_session(e, &session);
         if (!rc) e->startup_restored = true;
         else if (!e->recover_existing) {
@@ -361,7 +340,7 @@ int editor_session_restore(editor *e)
              * aside and let editor_open start again without discovery. */
             (void)editor_set_aside(previous, e->recovery_aside, sizeof e->recovery_aside);
             e->recovery_retry = true; e->recovering = true;
-            fini(&session); close(previous_fd); return EDITOR_ERR_IO;
+            fini(&session); return EDITOR_ERR_IO;
         }
     }
     if (!rc && (aside || session.conflicts)) {
@@ -373,7 +352,7 @@ int editor_session_restore(editor *e)
         if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
         int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd >= 0) { (void)fsync(fd); close(fd); }
-        fini(&session); close(previous_fd); return 0;
+        fini(&session); return 0;
     }
     /* Failure never retires the recovery source. Corrupt/torn tails are replay's
      * validated prefix, so the durable replacement checkpoint contains exactly
@@ -399,6 +378,76 @@ int editor_session_restore(editor *e)
         }
     }
     if (rc) e->recovering = true; /* failed startup close must not mask the prior artifact */
-    fini(&session); close(previous_fd);
+    fini(&session);
     return rc ? EDITOR_ERR_IO : 0;
+}
+
+/* Descending mtime with a pathname tie breaker gives a stable cursor even
+ * when a source is empty or retained because capacity is exhausted.
+ * (P) Zero is empty/equality/success; negative descriptors mean no lease.
+ * POSIX 0600 grants only the owner read/write on the existing lease file. */
+static bool newer_source(struct timespec a, const char *a_path, struct timespec b, const char *b_path)
+{
+    return a.tv_sec > b.tv_sec || (a.tv_sec == b.tv_sec &&
+        (a.tv_nsec > b.tv_nsec || (a.tv_nsec == b.tv_nsec && strcmp(a_path, b_path) > 0)));
+}
+static int discover_source(editor *e, const char *directory, const char *before,
+    struct timespec cutoff, char *previous, struct timespec *newest, int *previous_fd)
+{
+    DIR *dir = opendir(directory); if (!dir) return EDITOR_ERR_IO;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "session-", strlen("session-"))) continue;
+        /* mkstemp names have no suffix. Ignore retained SAVE originals and
+         * checkpoint temporaries, which share the prefix but contain a dot. */
+        if (strchr(entry->d_name, '.')) continue;
+        char candidate[IPC_PATH_CAP], lock_path[IPC_PATH_CAP];
+        int n = snprintf(candidate, sizeof candidate, "%s/%s", directory, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof candidate || !strcmp(candidate, e->cfg.journal_path)) continue;
+        int fd = open(candidate, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_size) { close(fd); continue; }
+        if (*before && !newer_source(cutoff, before, st.st_mtim, candidate)) { close(fd); continue; }
+        if (lock_name(lock_path, sizeof lock_path, candidate)) { close(fd); continue; }
+        int lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        close(fd); fd = lock;
+        if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) { if (fd >= 0) close(fd); continue; }
+        if (*previous_fd < 0 || newer_source(st.st_mtim, candidate, *newest, previous)) {
+            if (*previous_fd >= 0) close(*previous_fd);
+            *previous_fd = fd; *newest = st.st_mtim; strcpy(previous, candidate);
+        } else close(fd);
+    }
+    closedir(dir); return 0;
+}
+int editor_session_restore(editor *e)
+{
+    const char *path = e->cfg.journal_path;
+    const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
+    if (!e->recover_existing && strncmp(name, "session-", strlen("session-"))) return 0;
+    char lock_path[IPC_PATH_CAP];
+    if (lock_name(lock_path, sizeof lock_path, path)) return EDITOR_ERR_ARG;
+    e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
+    e->session_lock_owned = true;
+    if (e->recovery_skip) return 0; /* edit-btj retry: own lease only, no discovery */
+    char directory[IPC_PATH_CAP]; strcpy(directory, path);
+    char *slash = strrchr(directory, '/');
+    if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
+    /* Housekeeping is best effort: a failed barrier leaves safe retired bytes,
+     * and a busy lease preserves the source. Never block session recovery. */
+    (void)journal_retire_directory(directory, path);
+    if (e->recover_existing) return restore_source(e, directory, path);
+    char before[IPC_PATH_CAP] = "";
+    struct timespec cutoff = {0};
+    for (;;) {
+        char previous[IPC_PATH_CAP] = ""; int previous_fd = -1;
+        struct timespec newest = {0};
+        int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_fd);
+        if (rc || previous_fd < 0) return rc;
+        strcpy(before, previous); cutoff = newest;
+        rc = restore_source(e, directory, previous);
+        close(previous_fd);
+        if (rc) return rc;
+    }
 }

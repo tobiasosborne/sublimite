@@ -543,49 +543,76 @@ static int two_process_save(void)
 /* (10b) Two instances share the journal directory (main.c's layout). One
  * crashes with unsaved edits while the other keeps running and later closes
  * cleanly. The next launches must surface the crashed instance's edits. */
-static int orphan_child(const char *source, const char *jpath, int go, bool crash)
+static int orphan_child(const char *source, const char *jpath, int go, int ready, bool crash)
 {
     render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
     T(press(e, crash ? 'x' : 'y', 0, crash ? "x" : "y") == 0);
-    uint8_t byte; ssize_t n; do n = read(go, &byte, 1); while (n < 0 && errno == EINTR); T(n == 1);
+    /* (P) One ready byte proves this instance has published its edit. */
+    T(write(ready, "r", sizeof(char)) == (ssize_t)sizeof(char)); close(ready);
+    uint8_t byte; ssize_t n; do n = read(go, &byte, sizeof byte); while (n < 0 && errno == EINTR); T(n == (ssize_t)sizeof byte);
     if (crash) _exit(0);
     T(settle(e) == 0); editor_close(e); _exit(0);
 }
-static int stranded_orphan(void)
+static int stranded_orphan(bool limited, bool shared_target)
 {
-    char root[64], a[128], b[128], first[128], second[128]; T(make_root(root, sizeof root) == 0);
+    char root[IPC_PATH_CAP], a[IPC_PATH_CAP], b[IPC_PATH_CAP], first[IPC_PATH_CAP], second[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
     T(snprintf(a, sizeof a, "%s/a", root) > 0); T(write_file(a, "base") == 0);
-    T(snprintf(b, sizeof b, "%s/b", root) > 0); T(write_file(b, "base") == 0);
+    if (shared_target) strcpy(b, a);
+    else { T(snprintf(b, sizeof b, "%s/b", root) > 0); T(write_file(b, "base") == 0); }
+    enum { ORPHAN_INSTANCES = 2 }; /* (P) Crashed instance + surviving instance. */
     T(make_session(root, first, sizeof first) == 0); T(make_session(root, second, sizeof second) == 0);
-    int go1[2], go2[2]; T(pipe(go1) == 0); T(pipe(go2) == 0);
+    /* (P) POSIX pipes have a read end and a write end. */
+    int go1[2], go2[2], ready[2]; T(pipe(go1) == 0); T(pipe(go2) == 0); T(pipe(ready) == 0);
     pid_t crasher = fork(); T(crasher >= 0);
-    if (!crasher) { close(go1[1]); close(go2[0]); close(go2[1]); _exit(orphan_child(a, first, go1[0], true)); }
+    if (!crasher) { close(go1[1]); close(go2[0]); close(go2[1]); close(ready[0]); _exit(orphan_child(a, first, go1[0], ready[1], true)); }
+    /* (P) Serial startup isolates recovery from the sibling discovery race. */
+    char ready_byte; T(read(ready[0], &ready_byte, sizeof ready_byte) == (ssize_t)sizeof ready_byte);
     pid_t survivor = fork(); T(survivor >= 0);
-    if (!survivor) { close(go2[1]); close(go1[0]); close(go1[1]); _exit(orphan_child(b, second, go2[0], false)); }
-    close(go1[0]); close(go2[0]);
+    if (!survivor) { close(go2[1]); close(go1[0]); close(go1[1]); close(ready[0]); _exit(orphan_child(b, second, go2[0], ready[1], false)); }
+    close(go1[0]); close(go2[0]); close(ready[1]);
+    /* (P) The remaining ready byte comes from the surviving instance. */
+    T(read(ready[0], &ready_byte, sizeof ready_byte) == (ssize_t)sizeof ready_byte);
+    close(ready[0]);
     T(write(go1[1], "g", 1) == 1); close(go1[1]); T(exited_with(crasher, 0) == 0);
-    struct timespec gap = {0, 20000000}; nanosleep(&gap, NULL); /* survivor's close is newer */
+    /* (P) Epoch mtime sorts before the survivor's real checkpoint; this is
+     * ordering evidence, not an invented delay between closes. */
+    const struct timespec oldest[2] = {{0, 0}, {0, 0}};
+    T(utimensat(AT_FDCWD, first, oldest, 0) == 0);
     T(write(go2[1], "g", 1) == 1); close(go2[1]); T(exited_with(survivor, 0) == 0);
-    bool seen_a = false, seen_b = false;
-    for (unsigned launch = 0; launch < 3 && !(seen_a && seen_b); launch++) {
-        char next[128]; T(make_session(root, next, sizeof next) == 0);
-        render_backend backend; editor *e; T(open_editor(&e, &backend, NULL, next) == 0);
+    /* (P) Generations cover initial recovery, its replacement checkpoint and
+     * that checkpoint's replacement: the campaign's three-launch reproducer. */
+    for (unsigned launch = 0; launch < 3; launch++) {
+        bool seen_a = false, seen_b = false;
+        char next[IPC_PATH_CAP]; T(make_session(root, next, sizeof next) == 0);
+        render_backend backend = {0}; editor *e = NULL; T(render_null_backend(&backend) == 0);
+        bool full = !limited || launch != 0;
+        editor_config cfg = {.journal_path = next, .start_empty = true, .cols = COLS, .rows = ROWS,
+            .tab_capacity = full ? 0 : 1}; /* (P) Single live slot forces deferred recovery. */
+        T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
         for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
-            const tabs_tab *tab = editor_tab(e, i); uint8_t bytes[8];
-            if (piece_len(tab->buffer) != 5 || piece_read(tab->buffer, 0, bytes, 5)) continue;
-            if (!memcmp(bytes, "xbase", 5) && tab->modified) seen_a = true;
-            if (!memcmp(bytes, "ybase", 5) && tab->modified) seen_b = true;
+            const tabs_tab *tab = editor_tab(e, i);
+            uint8_t bytes[sizeof "xbase" - 1]; /* (P) Marker bytes exclude NUL. */
+            if (piece_len(tab->buffer) != sizeof bytes || piece_read(tab->buffer, 0, bytes, sizeof bytes)) continue;
+            if (!memcmp(bytes, "xbase", sizeof bytes) && tab->modified) seen_a = true;
+            if (!memcmp(bytes, "ybase", sizeof bytes) && tab->modified) seen_b = true;
         }
         fprintf(stderr, "dataloss_test: stranded_orphan launch %u: tabs=%zu seen_crashed=%d seen_survivor=%d\n", launch, tabs_count(&e->tabs), seen_a, seen_b);
+        T(seen_b);
+        if (full) {
+            T(seen_a); T(tabs_count(&e->tabs) == ORPHAN_INSTANCES);
+            T(editor_tab(e, tabs_active_index(&e->tabs))->path_len == strlen(b));
+            T(!memcmp(editor_tab(e, tabs_active_index(&e->tabs))->path, b, strlen(b)));
+            T(access(first, F_OK) < 0 && access(second, F_OK) < 0);
+        } else { T(!seen_a && e->recovery_notice && access(first, F_OK) == 0); }
         editor_close(e);
     }
     DIR *dir = opendir(root); T(dir); struct dirent *entry;
-    while ((entry = readdir(dir))) if (!strncmp(entry->d_name, "session-", 8)) {
+    while ((entry = readdir(dir))) if (!strncmp(entry->d_name, "session-", strlen("session-"))) {
         struct stat st; if (fstatat(dirfd(dir), entry->d_name, &st, 0)) continue;
         fprintf(stderr, "dataloss_test: stranded_orphan leftover %s %lld bytes\n", entry->d_name, (long long)st.st_size);
     }
     closedir(dir);
-    T(seen_b); T(seen_a);
     remove_tree(root); return 0;
 }
 
@@ -593,6 +620,10 @@ int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
     trace_init(); T(trace_thread_register() >= 0);
+    /* (P) argc includes the program name and its single selector argument. */
+    if (argc == 2 && !strcmp(argv[1], "--stranded-orphan")) {
+        T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
+    }
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
@@ -601,15 +632,15 @@ int main(int argc, char **argv)
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
     T(two_process_save() == 0);
-    if (!probe) T(torn_undo_group() == 0);
+    if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */
-        int deleted = changed_base(BASE_DELETED), torn = torn_undo_group(), stranded = stranded_orphan();
+        int deleted = changed_base(BASE_DELETED), torn = torn_undo_group(), stranded = stranded_orphan(false, false);
         fprintf(stderr, "dataloss_test --probe: changed_base(deleted)=%s torn_undo_group=%s stranded_orphan=%s\n",
             deleted ? "FAIL" : "ok", torn ? "FAIL" : "ok", stranded ? "FAIL" : "ok");
         T(!deleted && !torn && !stranded);
     }
     puts("dataloss_test: kill-after-append, kill at every save step, shorter base, reload/keep during held save, "
-         "Ctrl+S under prompt, mixed hot exit with closed tab, reload vs keystroke, two-process save passed");
+         "Ctrl+S under prompt, mixed hot exit with closed tab, reload vs keystroke, two-process save and orphan recovery passed");
     return 0;
 }

@@ -513,9 +513,8 @@ static int changed_base(bool same_bytes)
     T(closedir(dir) == 0 && rmdir(root) == 0);
     return 0;
 }
-/* edit-btj: an install failure after partial installation (here more
- * journalled tabs than this launch's capacity) sets the source aside and
- * opens again without discovery. */
+/* edit-rzj: an oversized discovered session stays discoverable without
+ * partial installation; normal capacity on the next launch recovers it. */
 static int install_failure(void)
 {
     char root[] = "build/editor-install-XXXXXX"; T(mkdtemp(root));
@@ -539,8 +538,19 @@ static int install_failure(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config config = {.journal_path = next, .start_empty = true, .tab_capacity = 1, .closed_capacity = 1, .cols = 32, .rows = 3};
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0 && e);
-    T(e->recovery_notice && tabs_count(&e->tabs) == 0 && access(first, F_OK) < 0);
-    T(*e->recovery_aside && file_contains(e->recovery_aside, "MK"));
+    T(e->recovery_notice && tabs_count(&e->tabs) == 0 && access(first, F_OK) == 0);
+    T(!*e->recovery_aside && file_contains(first, "MK"));
+    editor_close(e);
+    /* (P) Zero selects the existing default capacity, which can fit both
+     * fixture buffers; one slot above deliberately cannot fit them. */
+    config.tab_capacity = 0; config.closed_capacity = 0;
+    backend = (render_backend){0}; T(render_null_backend(&backend) == 0);
+    T(editor_open(&e, &config, &backend) == 0 && e);
+    T(!e->recovery_notice && tabs_count(&e->tabs) == 2); /* (P) source + other */
+    T(access(first, F_OK) < 0);
+    uint8_t bytes[sizeof "MK" - 1]; /* (P) Marker excludes its NUL. */
+    T(editor_select_tab(e, 0) == 0);
+    T(editor_read(e, 0, bytes, sizeof bytes) == 0 && !memcmp(bytes, "MK", sizeof bytes));
     editor_close(e);
     DIR *dir = opendir(root); T(dir); struct dirent *entry;
     while ((entry = readdir(dir))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
