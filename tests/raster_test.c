@@ -687,6 +687,7 @@ static xcb_void_cookie_t review_fill(xcb_connection_t *c, xcb_drawable_t d,
 }
 static uint16_t review_upload_width, review_upload_height;
 static uint32_t review_stop_calls, review_stop_at;
+static uint64_t review_clock_step; /* edit-cee: fake time per worker loop turn */
 static _Atomic uint32_t review_publish_calls;
 static uint32_t review_publish_failures;
 static uint64_t review_clock;
@@ -708,6 +709,7 @@ static int review_sleep(const struct timespec *pause, struct timespec *remaining
 
 static bool review_should_stop(const work_ctx *c)
 {
+    review_clock += review_clock_step;
     if (review_stop_at) return ++review_stop_calls >= review_stop_at;
     return review_fake && !review_real_mailbox ? false : work_should_stop(c);
 }
@@ -889,7 +891,7 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 static void review_reset_fixture(void)
 {
     review_fake = true; review_real_mailbox = false; review_uploads = 0; review_presents = 0; review_submit_calls = 0;
-    review_stop_calls = 0; review_stop_at = 0; review_publish_calls = 0;
+    review_stop_calls = 0; review_stop_at = 0; review_publish_calls = 0; review_clock_step = 0;
     review_publish_failures = 0; review_clock = 100; review_observation = 0;
     review_message_count = 0; review_enqueue_full = false; review_partial_capacity = false; review_run_at_submit = false;
     review_fail_at = 2; review_watch_sleep = false; review_rollback_waits = 0;
@@ -1508,6 +1510,11 @@ static int review_inline_completion(void)
     puts("G11 UI completion: both event orders, delayed Present, no worker jobs or timer passed");
     return 0;
 }
+/* edit-cee: the deadline measures a missing PIXMAP/idle from the moment the
+ * server answered the fence query sent in the same flush as the Present. A
+ * server that has not answered yet is slow (load, screenshots, a stopped X
+ * server), not a lost completion: re-arm instead of latching device failure.
+ * Astra drive 3 lost an editor with error -11 to a 2 s server stall. */
 static int review_inline_deadline(void)
 {
     const unsigned missing[]={16u,32u,64u}; /* query reply, PIXMAP, IdleNotify */
@@ -1520,15 +1527,52 @@ static int review_inline_deadline(void)
         T(raster_review_poll_completions(&b)==RENDER_OK && b.active);
         T(raster_review_completion_timeout(&b,-1)==2000);
         T(raster_review_completion_timeout(&b,20)==20);
-        review_clock=st.completion_deadline+1u;
-        T(raster_review_completion_timeout(&b,-1)==0);
+        review_clock=UINT64_C(2000000101); /* one past the issue-time window */
+        T(raster_review_completion_timeout(&b,-1)==(i==0 ? 0 : 1));
         int rc=raster_review_poll_completions(&b);
-        printf("P2-1 section 15: missing=%s expiry=%d\n",i==0 ? "fence" : i==1 ? "pixmap" : "idle",rc);
+        printf("P2-1 section 15 / edit-cee: missing=%s expiry=%d\n",i==0 ? "fence" : i==1 ? "pixmap" : "idle",rc);
+        if (i==0) {
+            /* No server answer yet: re-armed, frame still owned, no failure. */
+            T(rc==RENDER_OK && !st.failed && b.active && seen.t6_count==0);
+            T(raster_review_completion_timeout(&b,-1)==2000);
+            review_observation=0; /* the stalled server catches up */
+            T(raster_review_poll_completions(&b)==RENDER_OK);
+            T(!b.active && !st.failed && seen.t5_count==1 && seen.t6_count==1);
+            continue;
+        }
+        /* The server answered at the first poll, so the window restarted there. */
+        T(rc==RENDER_OK && !st.failed && b.active);
+        review_clock=st.completion_deadline;
+        rc=raster_review_poll_completions(&b);
         T(rc==RENDER_ERR_DEVICE && st.failed && b.active && seen.t6_count==0);
         T(raster_review_poll_completions(&b)==RENDER_ERR_DEVICE);
         T(cpu_present(&b,7)==RENDER_ERR_DEVICE);
         st.have_frame=false;
         render_grid g={0}; T(cpu_submit(&b,&g,NULL,0)==RENDER_ERR_DEVICE);
+    }
+    return 0;
+}
+/* edit-cee: the full-frame worker fence job applies the same rule as the
+ * inline path: while the server has not answered the fence query it is slow,
+ * not lost (re-arm); after the answer a missing PIXMAP still fails in 2 s. */
+static int review_fence_job_deadline(void)
+{
+    const unsigned missing[]={16u,32u}; /* query reply, PIXMAP */
+    for (size_t i=0;i<2;i++) {
+        review_reset_fixture();
+        cpu_state st={.up=true,.have_frame=true,.frame_id=7,.pixmap=42};
+        render_backend b=review_backend(&st);
+        T(cpu_present(&b,7)==RENDER_OK && review_queued[0].fn);
+        review_observation=missing[i];
+        review_clock_step=UINT64_C(1000000000); /* 1 s of server stall per turn */
+        review_stop_at=10; /* (P) 10 turns = 10 s, five times the 2 s window */
+        work_ctx c={.generation=7,.arg=review_queued[0].arg};
+        review_queued[0].fn(&c);
+        bool failed=false;
+        for (size_t m=0;m<review_message_count;m++) failed |= review_messages[m].kind==MSG_FAIL;
+        printf("edit-cee fence job: missing=%s messages=%zu fail=%d\n",i==0 ? "fence" : "pixmap",review_message_count,(int)failed);
+        if (i==0) T(!failed && review_message_count==0);
+        else T(failed);
     }
     return 0;
 }
@@ -1662,6 +1706,7 @@ static int review_cases(const char *which)
 {
     if (!strcmp(which,"edit-u82")) return remainder_background_test();
     if (!strcmp(which,"P2-1-15")) return review_inline_deadline();
+    if (!strcmp(which,"edit-cee")) return review_fence_job_deadline();
     if (!strcmp(which,"P2-1-12-gate")) return review_pending_acceptance_gate();
     if (!strcmp(which,"P2-1-11")) return review_page_cell_budget();
     if (!strcmp(which,"P4-3-9-gate") || !strcmp(which,"P2-1-10-gate")) return review_default_memory_gate(false);
@@ -1673,7 +1718,7 @@ static int review_cases(const char *which)
     if (!strcmp(which,"P2-1-7")) return review_nonblocking_retirement();
     if (!strcmp(which,"P2-1-8")) return review_raw_completion();
     const struct {const char *id; int (*fn)(void);} cases[]={
-        {"P2-1-15",review_inline_deadline},{"P2-1-11",review_page_cell_budget},{"P2-1-8",review_raw_completion},{"P2-1-7",review_nonblocking_retirement},{"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
+        {"P2-1-15",review_inline_deadline},{"edit-cee",review_fence_job_deadline},{"P2-1-11",review_page_cell_budget},{"P2-1-8",review_raw_completion},{"P2-1-7",review_nonblocking_retirement},{"1",review_ownership},{"4",review_capacity_proposal},{"4",review_batch_rollback},{"2",review_diagnostics},{"3",review_visual},
         {"5",review_delivery},{"6",review_glyph_budget},{"7",review_cancellation},
         {"8",review_handoff},{"15",review_origin},{"17",review_timestamp},{"G11",review_inline_completion}};
     for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {

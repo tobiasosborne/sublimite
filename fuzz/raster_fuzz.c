@@ -427,7 +427,15 @@ static void ownership_fuzz(const uint8_t *data,size_t size)
                     t->native_ready=(unsigned)data[i]>>4u & 7u;
                     st.completion_deadline=1; /* deterministic clock advance */
                     rc=ownership_poll_completions(&b);
-                    EDIT_ASSERT(t->native_ready==7 ? rc==RENDER_OK && !b.active : rc==RENDER_ERR_DEVICE && b.active);
+                    if (t->native_ready==7) EDIT_ASSERT(rc==RENDER_OK && !b.active);
+                    else {
+                        /* edit-cee: a fence answer re-bases the window, no answer re-arms it. */
+                        EDIT_ASSERT(rc==RENDER_OK && b.active && !st.failed);
+                        st.completion_deadline=1; /* expire the re-based or re-armed window */
+                        rc=ownership_poll_completions(&b);
+                        EDIT_ASSERT((t->native_ready&1u) ? rc==RENDER_ERR_DEVICE && b.active
+                                                         : rc==RENDER_OK && b.active && !st.failed);
+                    }
                 }
                 ownership_set_caret_only(&b,false);
             }

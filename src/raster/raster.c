@@ -22,6 +22,10 @@
 #include <xcb/xcbext.h>
 #include <xcb/xfixes.h>
 
+/* edit-5o0 §15 window for a missing completion (inline and fence job), 2 s (G,
+ * planning value from edit-5o0, not derived). edit-cee re-bases it at the
+ * fence answer and re-arms while the server has not answered. */
+#define RASTER_COMPLETION_NS UINT64_C(2000000000)
 enum { MSG_STRIPS = 1, MSG_FENCE = 2, MSG_PRESENT = 3, MSG_FAIL = 4 };
 typedef struct msg_payload { uint64_t ns, ust, msc; int32_t status; } msg_payload;
 _Static_assert(sizeof(msg_payload) <= WORK_MSG_DATA, "raster message fits mailbox");
@@ -229,7 +233,7 @@ static void fence_job_fn(work_ctx *c)
 {
     const fence_job *job = c->arg;
     int fd = xcb_get_file_descriptor(job->conn);
-    uint64_t deadline = trace_now_ns() + UINT64_C(2000000000);
+    uint64_t deadline = trace_now_ns() + RASTER_COMPLETION_NS;
     const uint32_t frame = job->frame;
     const unsigned int seq = job->sequence;
     int32_t status = 0;
@@ -243,6 +247,7 @@ static void fence_job_fn(work_ctx *c)
             void *reply = NULL; xcb_generic_error_t *err = NULL;
             if (fence_poll_reply(job->conn, seq, &reply, &err)) {
                 t5 = trace_now_ns(); got_fence = true; progressed = true;
+                deadline = t5 + RASTER_COMPLETION_NS; /* edit-cee: window starts at the answer */
                 if (err || !reply || !((xcb_sync_query_fence_reply_t *)reply)->triggered) status = -1;
                 free(reply); free(err);
                 post(c, MSG_FENCE, t5, status, 0, 0);
@@ -270,7 +275,11 @@ static void fence_job_fn(work_ctx *c)
             if (e->response_type == 0) status = -1;
             free(e);
         }
-        if (status != 0 || xcb_connection_has_error(job->conn) || trace_now_ns() > deadline) {
+        uint64_t now = trace_now_ns();
+        /* edit-cee: an unanswered fence on a healthy connection is a slow
+         * server, not a lost completion; keep waiting (shutdown still stops). */
+        if (!got_fence && now > deadline) deadline = now + RASTER_COMPLETION_NS;
+        if (status != 0 || xcb_connection_has_error(job->conn) || now > deadline) {
             post(c, MSG_FAIL, 0, -1, 0, 0); return;
         }
         if (got_fence && got_present && got_idle) {
@@ -638,7 +647,7 @@ static int cpu_present(render_backend *b, uint32_t frame_id)
     if (st->pending != 0) return RENDER_ERR_BUSY;
     if (!st->present_issued) {
         st->metrics.present_ns = trace_now_ns();
-        st->completion_deadline = st->metrics.present_ns + UINT64_C(2000000000);
+        st->completion_deadline = st->metrics.present_ns + RASTER_COMPLETION_NS;
         xcb_sync_reset_fence(st->conn, st->device_fence);
         xcb_sync_trigger_fence(st->conn, st->device_fence);
         xcb_sync_await_fence(st->conn, 1, &st->device_fence);
@@ -789,6 +798,9 @@ int raster_poll_completions(render_backend *b)
                 if (!ok) { st->failed = true; return RENDER_ERR_DEVICE; }
                 st->inline_fence = true; progressed = true;
                 st->metrics.server_ns = trace_now_ns();
+                /* edit-cee: the server reached this flush; the missing-PIXMAP/idle
+                 * window starts here, not at issue, so a stalled server is not lost. */
+                if (st->completion_deadline) st->completion_deadline = st->metrics.server_ns + RASTER_COMPLETION_NS;
                 int rc = render_backend_signal(b, RENDER_EVENT_DEVICE_DONE, st->frame_id, st->metrics.server_ns);
                 if (rc) return rc;
             }
@@ -820,7 +832,13 @@ int raster_poll_completions(render_backend *b)
         st->present_done = true;
         return render_backend_signal(b, RENDER_EVENT_PRESENT_COMPLETE, st->frame_id, st->inline_t6);
     }
-    if (st->completion_deadline && trace_now_ns() >= st->completion_deadline) {
+    uint64_t now = trace_now_ns();
+    if (st->completion_deadline && now >= st->completion_deadline) {
+        /* edit-cee: no fence answer on a healthy connection means the server
+         * has not processed this flush yet (load, screenshots, a stopped
+         * server): slow, not lost. Re-arm; only a server that answered and
+         * then withheld PIXMAP/idle for the full window latches failure. */
+        if (!st->inline_fence) { st->completion_deadline = now + RASTER_COMPLETION_NS; return RENDER_OK; }
         st->failed = true;
         return RENDER_ERR_DEVICE;
     }
