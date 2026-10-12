@@ -31,7 +31,7 @@ typedef struct editor_piece_storage {
 } editor_piece_storage;
 typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; } editor_delta;
 typedef struct editor_soft_delta { view_selection before, after; uint64_t serial; bool text; } editor_soft_delta;
-typedef struct editor_jop { uint64_t off, len; size_t at; bool insert; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
+typedef struct editor_jop { uint64_t off, len; size_t at; bool insert, commit; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
 typedef struct editor_session editor_session;
 typedef struct editor_buffer {
     edit_arena arena;
@@ -200,7 +200,7 @@ struct editor {
     uint8_t *journal_tabs, *journal_tabs_cached;
     size_t journal_tabs_size;
     uint32_t journal_width, journal_height;
-    bool journal_metadata_pending;
+    bool journal_metadata_pending, journal_group_open;
     plat platform;
     render_backend *backend;
     render_grid grid;

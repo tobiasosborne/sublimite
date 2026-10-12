@@ -1632,11 +1632,13 @@ static int review_suffix_at(unsigned mode)
         e->ops[1] = (editor_jop){.off=1, .len=1, .at=1, .insert=true, .id=e->buffer->id};
         uint64_t accepted = journal_get_stats(e->journal).accepted_sequence;
         editor_journal_staged(e); T(e->stats.journal_error == (mode ? JOURNAL_IO : JOURNAL_FULL));
-        /* IO accepted the first record into the journal's retained batch;
-         * FULL accepted nothing. Preserve only the unaccepted editor suffix. */
-        T(e->op_count == (mode ? 1u : 2u)); T(e->stage_used == 2);
+        /* edit-pgr (P): the staged pair requires BEGIN before either data
+         * record. IO retains that marker; FULL accepts nothing. Both original
+         * ops and both stage bytes remain unaccepted in the editor queue. */
+        T(e->op_count == 2u); T(e->stage_used == 2);
+        T(e->journal_group_open == (mode != 0));
         if (mode) {
-            T(e->ops[0].off == 1 && journal_get_stats(e->journal).accepted_sequence == accepted + 1);
+            T(e->ops[0].off == 0 && journal_get_stats(e->journal).accepted_sequence == accepted + 1);
             T(journal_set_io(e->journal, NULL) == 0);
         }
         editor_close(e); unlink(path);

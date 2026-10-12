@@ -80,6 +80,7 @@ int editor_checkpoint(editor *e)
     rc = journal_rotate(e->journal, records, count);
     if (!rc) {
         e->op_count = e->stage_used = 0; e->stats.journal_error = 0;
+        e->journal_group_open = false;
     }
 done:
     for (size_t i = 0; i < count; i++) free((void *)records[i].data);

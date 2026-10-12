@@ -26,8 +26,14 @@ int journal_default_dir(char *out, size_t cap);
 
 typedef enum journal_type {
     JOURNAL_BASE = 1, JOURNAL_INSERT, JOURNAL_DELETE, JOURNAL_VIEW,
-    JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE, JOURNAL_TARGET
+    JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE, JOURNAL_TARGET,
+    JOURNAL_GROUP_BEGIN, JOURNAL_GROUP_COMMIT
 } journal_type;
+/* edit-pgr (P): each empty group marker costs JOURNAL_HEADER bytes; begin +
+ * commit cost JOURNAL_HEADER + JOURNAL_HEADER = 64 bytes per multi-record
+ * action. Single-record actions emit neither marker: zero added bytes.
+ * Markers use buffer_id zero. Groups do not nest, may cross PADs/batches,
+ * and commit is appended only after the final data record. */
 #define JOURNAL_BASE_V2 UINT32_C(0x80000000)
 #define JOURNAL_BASE_MAX 4145u
 /* BASE v2: prefix_len bit 31 selects an eight-byte ctime suffix after the
@@ -296,8 +302,12 @@ int journal_flush(journal *j); /* blocking; setup/save/exit only */
  * is preflighted; its durable bytes plus the original configured log budget
  * bound the new file. Large untitled checkpoints may exceed the old log limit. */
 int journal_rotate(journal *j, const journal_record *records, size_t count);
-/* Parser: visits only structurally valid, CRC-checked records. Callback must
- * apply atomically; nonzero stops WITHOUT truncating that record. */
+/* Parser: visits only structurally valid, CRC-checked records. A group's
+ * complete span is validated through COMMIT before its data is delivered;
+ * markers are counted but never delivered. An uncommitted/corrupt trailing
+ * group ends the accepted prefix before BEGIN. Legacy ungrouped records keep
+ * their original replay semantics. Callback must apply each record atomically;
+ * nonzero stops WITHOUT truncation; caller discards partial restored state. */
 int journal_replay_bytes(const uint8_t *bytes, size_t size, journal_visit visit,
                          void *ctx, journal_replay_result *result);
 /* Streaming, bounded memory; truncate first bad/short record and fdatasync.

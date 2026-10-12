@@ -107,7 +107,8 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
 {
     editor_session *s = e->session;
     if (!s || !b->id || b->pending_open || e->recovering ||
-        (b == e->buffer && e->action == EDITOR_ACTION_REPLAY_WORK)) return;
+        (b == e->buffer && (e->action == EDITOR_ACTION_REPLAY_WORK ||
+         e->action == EDITOR_ACTION_CLIP || e->find_replace_active || e->journal_group_open))) return;
     pthread_mutex_lock(&s->mutex);
     session_node *old = leaf_at(s, b->session_slot);
     bool content = !old || old->buffer != b || old->revision != b->revision;
@@ -319,7 +320,7 @@ int editor_save_request(editor *e, uint64_t request_ns)
     s->saving = b; s->pending = true; s->finishing = s->blocked = false; s->pending_submit_ns = 0;
     b->save_revision = b->revision; b->save_cursor = b->history_cursor; b->save_tracking = true;
     undo_break_burst(&b->undo);
-    if (!e->journal_waiting && !e->op_count) {
+    if (!e->journal_waiting && !e->op_count && !e->journal_group_open) {
         s->pending = false;
         int rc = start(e, false);
         if (rc) { b->save_error = b->operation_error = rc; b->save_tracking = false; s->saving = NULL; }
@@ -341,7 +342,7 @@ void editor_save_tick(editor *e)
     if (!s || !s->saving || s->blocked) return;
     editor_buffer *b = s->saving;
     savectl_tick(b->save); savectl_model model = savectl_get_model(b->save);
-    if (s->pending && !e->journal_waiting && !e->op_count && !model.busy) {
+    if (s->pending && !e->journal_waiting && !e->op_count && !e->journal_group_open && !model.busy) {
         s->pending = false;
         int rc = start(e, false);
         if (rc) { b->save_error = b->operation_error = rc; b->save_tracking = false; s->saving = NULL; }
@@ -361,7 +362,7 @@ void editor_save_tick(editor *e)
         if (!s->blocked) s->saving = NULL;
         (void)editor_begin_frame(e); e->paint_ready = false; return;
     }
-    if (model.needs_finish && !model.busy && !s->finishing && !e->journal_waiting && !e->op_count) {
+    if (model.needs_finish && !model.busy && !s->finishing && !e->journal_waiting && !e->op_count && !e->journal_group_open) {
         editor_session_metadata(e);
         capture(e, b, trace_now_ns(), true);
         int rc = start(e, true);

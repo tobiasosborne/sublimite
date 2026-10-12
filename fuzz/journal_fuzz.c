@@ -60,6 +60,10 @@ static void no_visit(const uint8_t *data, size_t size)
     int rc=journal_replay_bytes(data,size,apply,&m,&rr);
     EDIT_ASSERT(rc==0 || rc==JOURNAL_CALLBACK);
     EDIT_ASSERT(rr.valid_bytes<=size && m.size<=sizeof m.bytes);
+    /* A callback failure inside a committed group is a fatal restore error:
+     * the caller discards partial callback state, as the replay API requires.
+     * Only successful replay can be compared to its accepted wire prefix. */
+    if(rc==JOURNAL_CALLBACK) return;
     /* Deterministic replay of accepted prefix has identical contents. */
     fuzz_model prefix={0}; journal_replay_result pr;
     EDIT_ASSERT(journal_replay_bytes(data,(size_t)rr.valid_bytes,apply,&prefix,&pr)==0);
@@ -73,8 +77,9 @@ static void structured_bytes(const uint8_t *data, size_t size)
     uint8_t wire[16416]={0}; size_t n=size-1, total=n+32;
     wire[0]='J'; wire[1]='N'; wire[2]='L'; wire[3]='1';
     for(unsigned k=0;k<4;k++) wire[4+k]=(uint8_t)((uint32_t)total>>(8*k));
-    wire[8]=data[0]%8; wire[16]=1;
-    wire[24]=(data[0]&16u)?99:(wire[8]==JOURNAL_TABS || wire[8]==JOURNAL_WINDOW?0:1);
+    /* (P) modulo the last wire enum plus the PAD value exercises every type. */
+    wire[8]=(uint8_t)(data[0]%(JOURNAL_GROUP_COMMIT+1u)); wire[16]=1;
+    wire[24]=(data[0]&16u)?99:(wire[8]==JOURNAL_TABS || wire[8]==JOURNAL_WINDOW || wire[8]==JOURNAL_GROUP_BEGIN || wire[8]==JOURNAL_GROUP_COMMIT?0:1);
     memcpy(wire+32,data+1,n);
     uint32_t crc=UINT32_MAX;
     for(size_t k=0;k<total;k++) {
@@ -203,8 +208,44 @@ static void fuzz_slices(const uint8_t *data, size_t size)
     EDIT_ASSERT(journal_flush(j)==0 && journal_get_stats(j).unprotected_bytes==0);
     journal_close(j); work_pool_shutdown(&pool); unlink(path);
 }
+/* edit-pgr: the input chooses a valid group's payload and torn-byte cutoff.
+ * (P) Two pages cover the existing model's one-page payload, record headers
+ * and final PAD; expected bytes come from the input, never the parser. */
+static void fuzz_groups(const uint8_t *data, size_t size)
+{
+    if(!size) return;
+    char path[]="/tmp/journal-fuzz-group-XXXXXX"; int fd=mkstemp(path); if(fd<0) return; close(fd);
+    work_pool pool; if(work_pool_init(&pool,1,0)) { unlink(path); return; }
+    journal *j; if(journal_open(&j,path,&pool,NULL)) { work_pool_shutdown(&pool); unlink(path); return; }
+    size_t len=size<sizeof((fuzz_model *)0)->bytes?size:sizeof((fuzz_model *)0)->bytes;
+    EDIT_ASSERT(journal_insert(j,1,0,(const uint8_t *)"x",strlen("x"))==0);
+    size_t legacy=(size_t)journal_get_stats(j).file_bytes;
+    EDIT_ASSERT(journal_append(j,JOURNAL_GROUP_BEGIN,0,NULL,0)==0);
+    EDIT_ASSERT(journal_delete(j,1,0,strlen("x"))==0);
+    EDIT_ASSERT(journal_insert(j,1,0,data,len)==0);
+    size_t commit=(size_t)journal_get_stats(j).file_bytes;
+    EDIT_ASSERT(journal_append(j,JOURNAL_GROUP_COMMIT,0,NULL,0)==0);
+    size_t committed=(size_t)journal_get_stats(j).file_bytes;
+    journal_close(j);
+    uint8_t bytes[JOURNAL_PAGE+JOURNAL_PAGE]; fd=open(path,O_RDONLY); EDIT_ASSERT(fd>=0);
+    ssize_t got=read(fd,bytes,sizeof bytes); close(fd); EDIT_ASSERT(got>0);
+    size_t cut=((size_t)data[0]*len+data[size-1])%((size_t)got+1u);
+    fuzz_model actual={0}; journal_replay_result rr;
+    EDIT_ASSERT(journal_replay_bytes(bytes,cut,apply,&actual,&rr)==0);
+    size_t want=cut<legacy?0:cut<committed?strlen("x"):len;
+    const uint8_t *expected=cut<committed?(const uint8_t *)"x":data;
+    EDIT_ASSERT(actual.size==want && !memcmp(actual.bytes,expected,want));
+    EDIT_ASSERT(rr.valid_bytes<=cut);
+    /* Corrupt a byte inside the committed group's COMMIT header. */
+    bytes[commit+data[0]%JOURNAL_HEADER]^=1u;
+    actual=(fuzz_model){0};
+    EDIT_ASSERT(journal_replay_bytes(bytes,(size_t)got,apply,&actual,&rr)==0);
+    EDIT_ASSERT(rr.corrupt && rr.valid_bytes==legacy && actual.size==strlen("x") && actual.bytes[0]=='x');
+    work_pool_shutdown(&pool); unlink(path);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    fuzz_groups(data,size);
     no_visit(data,size);
     structured_bytes(data,size);
     fuzz_sessions(data,size);

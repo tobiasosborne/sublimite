@@ -601,6 +601,7 @@ int main(int argc, char **argv)
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
     T(two_process_save() == 0);
+    if (!probe) T(torn_undo_group() == 0);
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */
         int deleted = changed_base(BASE_DELETED), torn = torn_undo_group(), stranded = stranded_orphan();

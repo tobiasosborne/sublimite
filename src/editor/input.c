@@ -99,14 +99,32 @@ static int stage_tree(editor *e, uint64_t off, uint64_t n)
 }
 void editor_journal_staged(editor *e)
 {
-    if (editor_save_leased(e)) return;
+    if (editor_save_leased(e) || e->stats.journal_error) return;
+    /* Queue dispatch already parks behind staged ranges. A clipboard/find
+     * action can stage more mutations across turns; keep its group open until
+     * that action finishes. Single-record input has no marker or extra syscall. */
+    bool continuing = e->action == EDITOR_ACTION_CLIP || e->find_replace_active;
+    if (!e->journal_group_open && e->op_count) {
+        bool grouped = continuing || e->op_count > 1u;
+        for (size_t i = 0; !grouped && i < e->op_count; i++)
+            grouped = e->ops[i].insert && e->ops[i].len > JOURNAL_INSERT_SLICE_BYTES;
+        if (grouped) {
+            uint64_t before = journal_get_stats(e->journal).accepted_sequence;
+            int rc = journal_append_protected(e->journal, JOURNAL_GROUP_BEGIN, 0, NULL, 0);
+            if (journal_get_stats(e->journal).accepted_sequence != before) e->journal_group_open = true;
+            if (rc) { if (rc != JOURNAL_BUSY) e->stats.journal_error = rc; return; }
+        }
+    }
+drain:
+    ;
     size_t consumed = 0;
     while (consumed < e->op_count) {
         editor_jop *op = &e->ops[consumed];
         if (e->stats.journal_error) break;
         uint64_t before = journal_get_stats(e->journal).accepted_sequence;
         int rc;
-        if (!op->insert) rc = journal_delete_protected(e->journal, op->id, op->off, op->len);
+        if (op->commit) rc = journal_append_protected(e->journal, JOURNAL_GROUP_COMMIT, 0, NULL, 0);
+        else if (!op->insert) rc = journal_delete_protected(e->journal, op->id, op->off, op->len);
         else if (op->tree) {
             size_t n = op->len - op->progress < sizeof e->journal_scratch ?
                 (size_t)(op->len - op->progress) : sizeof e->journal_scratch;
@@ -122,14 +140,25 @@ void editor_journal_staged(editor *e)
             e->stage + op->at, (size_t)op->len, &op->progress);
         bool accepted = journal_get_stats(e->journal).accepted_sequence != before;
         if (accepted && (!op->insert || op->progress == op->len)) {
-            consumed++; e->stats.journal_records++;
+            if (op->commit) e->journal_group_open = false;
+            /* journal_records counts data records (== mutations for the
+             * accounting harness); group markers are framing, not records. */
+            consumed++; if (!op->commit) e->stats.journal_records++;
         }
         if (rc == JOURNAL_BUSY) break;
         if (rc) { e->stats.journal_error = rc; break; }
     }
     e->op_count -= consumed;
     if (e->op_count) memmove(e->ops, e->ops + consumed, e->op_count * sizeof *e->ops);
-    else e->stage_used = 0;
+    else {
+        e->stage_used = 0;
+        if (e->journal_group_open && !continuing && !e->stats.journal_error) {
+            /* Reuse the now-empty reserved op queue for a pending commit.
+             * BUSY therefore retains the existing input/save/submit fences. */
+            e->ops[0] = (editor_jop){.commit=true}; e->op_count = 1;
+            goto drain;
+        }
+    }
 }
 static editor_delta *delta_at(editor *e, size_t i) { return &e->buffer->history[(e->buffer->history_head + i) % e->buffer->history_cap]; }
 static editor_soft_delta *soft_at(editor_buffer *b, size_t i)

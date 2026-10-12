@@ -138,6 +138,7 @@ static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
         return true;
     }
     case JOURNAL_SAVE: return n>=57 && (u32(p+8)==1 || u32(p+8)==2) && u32(p+12)==0 && payload_valid(JOURNAL_BASE,p+16,n-16);
+    case JOURNAL_GROUP_BEGIN: case JOURNAL_GROUP_COMMIT: return n==0;
     case JOURNAL_INSERT: return n>=8;
     case JOURNAL_DELETE: return n==16 && u64(p)<=UINT64_MAX-u64(p+8);
     case JOURNAL_TARGET: return n>=1 && n<=4097 && p[n-1]==0 && memchr(p,0,n-1)==NULL;
@@ -158,29 +159,17 @@ static bool valid_record(const uint8_t *p, size_t n, uint64_t offset, uint64_t s
         for(size_t i=32;i<n;i++) if(p[i]) return false;
         return true;
     }
-    return (!(type==JOURNAL_TABS || type==JOURNAL_WINDOW) || u64(p+24)==0) &&
+    return (!(type==JOURNAL_TABS || type==JOURNAL_WINDOW || type==JOURNAL_GROUP_BEGIN || type==JOURNAL_GROUP_COMMIT) || u64(p+24)==0) &&
         seq!=UINT64_MAX && u64(p+16)==seq+1 && payload_valid(type,p+32,n-32);
 }
 static int visit_record(const uint8_t *p, size_t n, journal_visit visit, void *ctx, journal_replay_result *r)
 {
     if(u32(p+8)!=PAD) {
         journal_record rec={u32(p+8),u64(p+24),u64(p+16),p+32,n-32};
-        if(visit && visit(ctx,&rec)) return JOURNAL_CALLBACK;
+        if(visit && rec.type!=JOURNAL_GROUP_BEGIN && rec.type!=JOURNAL_GROUP_COMMIT && visit(ctx,&rec)) return JOURNAL_CALLBACK;
         r->records++; r->last_sequence=rec.sequence;
     }
     r->valid_bytes+=n; return 0;
-}
-int journal_replay_bytes(const uint8_t *bytes, size_t size, journal_visit visit, void *ctx, journal_replay_result *result)
-{
-    if(!result || (!bytes && size)) return JOURNAL_INVALID;
-    *result=(journal_replay_result){0}; journal_crc table; crc_init(&table); size_t off=0;
-    while(off<size) {
-        if(size-off<32) { result->corrupt=true; break; }
-        size_t n=u32(bytes+off+4);
-        if(n<32 || n>JOURNAL_MAX_RECORD || n>size-off || !valid_record(bytes+off,n,off,result->last_sequence,&table)) { result->corrupt=true; break; }
-        int rc=visit_record(bytes+off,n,visit,ctx,result); if(rc) return rc; off+=n;
-    }
-    return 0;
 }
 static int read_at(int fd, uint8_t *p, size_t n, uint64_t off, size_t *got)
 {
@@ -222,28 +211,99 @@ static int metadata_sync(const journal_io *io, int fd)
     return rc<0?JOURNAL_IO:0;
 }
 static int check_base_io(const journal_base *base, const journal_io *io);
+/* Replay is off the typing path. Validate ahead to COMMIT, then reread that
+ * span for delivery: streaming memory remains one existing record arena,
+ * independent of group length. Byte-image replay borrows the caller's bytes. */
+typedef struct replay_source {
+    const uint8_t *bytes;
+    size_t size;
+    int fd;
+    uint8_t *scratch;
+    const journal_io *io;
+} replay_source;
+static int replay_read(replay_source *source, uint64_t off, uint64_t seq,
+                       const journal_crc *table, const uint8_t **out, size_t *size)
+{
+    const uint8_t *p;
+    size_t n;
+    *size=0;
+    if(source->bytes || source->fd<0) {
+        if(off==source->size) return 0;
+        if(off>source->size || source->size-(size_t)off<JOURNAL_HEADER) return JOURNAL_INVALID;
+        p=source->bytes+(size_t)off; n=u32(p+4);
+        if(n>source->size-(size_t)off) return JOURNAL_INVALID;
+    } else {
+        size_t got;
+        int rc=read_at(source->fd,source->scratch,JOURNAL_HEADER,off,&got);
+        if(rc || !got) return rc;
+        if(got!=JOURNAL_HEADER) return JOURNAL_INVALID;
+        p=source->scratch; n=u32(p+4);
+        if(n<JOURNAL_HEADER || n>JOURNAL_MAX_RECORD) return JOURNAL_INVALID;
+        rc=read_at(source->fd,source->scratch+JOURNAL_HEADER,n-JOURNAL_HEADER,off+JOURNAL_HEADER,&got);
+        if(rc) return rc;
+        if(got!=n-JOURNAL_HEADER) return JOURNAL_INVALID;
+    }
+    if(n<JOURNAL_HEADER || n>JOURNAL_MAX_RECORD || !valid_record(p,n,off,seq,table)) return JOURNAL_INVALID;
+    *out=p; *size=n; return 0;
+}
+static int replay_deliver(replay_source *source, const uint8_t *p, size_t n,
+                          journal_visit visit, void *ctx, journal_replay_result *result)
+{
+    if(source->fd>=0 && u32(p+8)==JOURNAL_BASE) {
+        journal_record rec={JOURNAL_BASE,u64(p+24),u64(p+16),p+JOURNAL_HEADER,n-JOURNAL_HEADER};
+        journal_base base; char path[sizeof base.captured_path];
+        int rc=journal_decode_base(&rec,&base,path,sizeof path);
+        if(!rc) rc=check_base_io(&base,source->io);
+        if(rc) return rc;
+    }
+    return visit_record(p,n,visit,ctx,result);
+}
+static int replay_source_records(replay_source *source, journal_visit visit, void *ctx,
+                                  journal_replay_result *result)
+{
+    *result=(journal_replay_result){0};
+    journal_replay_result scan={0}; journal_crc table; crc_init(&table);
+    bool group=false;
+    for(;;) {
+        const uint8_t *p=NULL; size_t n;
+        int rc=replay_read(source,scan.valid_bytes,scan.last_sequence,&table,&p,&n);
+        if(rc==JOURNAL_INVALID || (!rc && !n && group)) { result->corrupt=true; break; }
+        if(rc || !n) return rc;
+        uint32_t type=u32(p+8);
+        if((type==JOURNAL_GROUP_BEGIN && group) || (type==JOURNAL_GROUP_COMMIT && !group)) {
+            result->corrupt=true; break;
+        }
+        if(type==JOURNAL_GROUP_BEGIN) group=true;
+        (void)visit_record(p,n,NULL,NULL,&scan);
+        if(!group) {
+            rc=replay_deliver(source,p,n,visit,ctx,result); if(rc) return rc;
+        } else if(type==JOURNAL_GROUP_COMMIT) {
+            /* No callback has seen any byte in this span before validation of
+             * its final commit. Revalidate rereads before delivering them. */
+            while(result->valid_bytes<scan.valid_bytes) {
+                rc=replay_read(source,result->valid_bytes,result->last_sequence,&table,&p,&n);
+                if(rc || !n) return rc?rc:JOURNAL_IO;
+                rc=replay_deliver(source,p,n,visit,ctx,result); if(rc) return rc;
+            }
+            group=false;
+        }
+    }
+    return 0;
+}
+int journal_replay_bytes(const uint8_t *bytes, size_t size, journal_visit visit, void *ctx, journal_replay_result *result)
+{
+    if(!result || (!bytes && size)) return JOURNAL_INVALID;
+    replay_source source={.bytes=bytes,.size=size,.fd=-1};
+    return replay_source_records(&source,visit,ctx,result);
+}
 int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx, journal_replay_result *result, const journal_io *io)
 {
     if(!path || !result) return JOURNAL_INVALID;
     *result=(journal_replay_result){0}; int fd=open(path,O_RDWR|O_CLOEXEC|O_NOFOLLOW);
     if(fd<0) return JOURNAL_IO;
     edit_arena a; if(edit_arena_init(&a,JOURNAL_MAX_RECORD)) { close(fd); return JOURNAL_NOMEM; }
-    uint8_t *p=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16); journal_crc table; crc_init(&table); int rc=0;
-    for(;;) {
-        size_t got=0; rc=read_at(fd,p,32,result->valid_bytes,&got); if(rc || !got) break;
-        size_t n=got==32?u32(p+4):0;
-        if(got!=32 || n<32 || n>JOURNAL_MAX_RECORD) { result->corrupt=true; break; }
-        rc=read_at(fd,p+32,n-32,result->valid_bytes+32,&got); if(rc) break;
-        if(got!=n-32 || !valid_record(p,n,result->valid_bytes,result->last_sequence,&table)) { result->corrupt=true; break; }
-        if(u32(p+8)==JOURNAL_BASE) {
-            journal_record rec={JOURNAL_BASE,u64(p+24),u64(p+16),p+32,n-32};
-            journal_base base; char basepath[4097];
-            rc=journal_decode_base(&rec,&base,basepath,sizeof basepath);
-            if(!rc) rc=check_base_io(&base,io);
-            if(rc) break;
-        }
-        rc=visit_record(p,n,visit,ctx,result); if(rc) break;
-    }
+    replay_source source={.fd=fd,.scratch=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16),.io=io};
+    int rc=replay_source_records(&source,visit,ctx,result);
     if(!rc && result->corrupt) { if(ftruncate(fd,(off_t)result->valid_bytes)) rc=JOURNAL_IO; else rc=data_sync(fd); }
     edit_arena_free(&a); close(fd); return rc;
 }
@@ -530,9 +590,10 @@ static int finish_record(journal *j, uint8_t *p, uint32_t type, uint64_t id, siz
 }
 int journal_append(journal *j, uint32_t type, uint64_t id, const uint8_t *data, size_t size)
 {
-    if((!data && size) || ((type==JOURNAL_TABS || type==JOURNAL_WINDOW) && id) || !payload_valid(type,data,size)) return JOURNAL_INVALID;
+    if((!data && size) || ((type==JOURNAL_TABS || type==JOURNAL_WINDOW || type==JOURNAL_GROUP_BEGIN || type==JOURNAL_GROUP_COMMIT) && id) || !payload_valid(type,data,size)) return JOURNAL_INVALID;
     uint8_t *p; int rc=reserve_record(j,size,&p); if(rc) return rc;
-    memcpy(p+32,data,size); return finish_record(j,p,type,id,size);
+    if(size) memcpy(p+32,data,size);
+    return finish_record(j,p,type,id,size);
 }
 int journal_insert(journal *j, uint64_t id, uint64_t off, const uint8_t *bytes, size_t size)
 {
@@ -775,7 +836,7 @@ static int checkpoint_size(const journal *j, const journal_record *records, size
     for(size_t i=0;i<count;i++) {
         const journal_record *r=&records[i];
         if(!r->data || r->size>JOURNAL_MAX_RECORD-32 || r->size+32>j->capacity-32 ||
-           ((r->type==JOURNAL_TABS || r->type==JOURNAL_WINDOW) && r->buffer_id) ||
+           ((r->type==JOURNAL_TABS || r->type==JOURNAL_WINDOW || r->type==JOURNAL_GROUP_BEGIN || r->type==JOURNAL_GROUP_COMMIT) && r->buffer_id) ||
            !payload_valid(r->type,r->data,r->size)) return JOURNAL_INVALID;
         if(used>j->capacity-64-r->size) { total+=sealed_size(used); used=0; }
         used+=r->size+32;
