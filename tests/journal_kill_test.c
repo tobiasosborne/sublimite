@@ -1,5 +1,6 @@
 #include "journal/journal.h"
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +18,10 @@ static uint64_t random_next(kill_model *m)
 { uint64_t x=m->rng; x^=x<<13; x^=x>>7; x^=x<<17; m->rng=x; return x; }
 static uint64_t read64(const uint8_t *p)
 { uint64_t v=0; for(unsigned i=0;i<8;i++) v|=(uint64_t)p[i]<<(8*i); return v; }
+/* (P) little-endian uint32_t fields contain sizeof(uint32_t) octets;
+ * CHAR_BIT bits per octet. Zero initializes the accumulator. */
+static uint32_t read32(const uint8_t *p)
+{ uint32_t v=0; for(size_t i=0;i<sizeof v;i++) v|=(uint32_t)p[i]<<(CHAR_BIT*i); return v; }
 static uint64_t now_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
 static void nap(void) { struct timespec t={0,50000}; nanosleep(&t,NULL); }
@@ -49,7 +54,13 @@ static int replay(void *ctx, const journal_record *r)
         c->tabs=true; return 0;
     }
     if(r->type==JOURNAL_WINDOW) {
-        if(c->window || r->sequence!=3 || r->size!=8 || read64(r->data)!=1373ull+(911ull<<32)) return 1;
+        /* (P) WINDOW follows VIEW and TABS; session records use buffer id
+         * zero. Payload sizes derive from the legacy/v2 wire schemas. The
+         * campaign dimensions are existing (E) discriminating fixtures. */
+        if(c->window || r->sequence!=3 || r->buffer_id!=0 ||
+           (r->size!=JOURNAL_WINDOW_LEGACY_BYTES && r->size!=JOURNAL_WINDOW_BYTES) ||
+           read32(r->data)!=1373 || read32(r->data+sizeof(uint32_t))!=911 ||
+           (r->size==JOURNAL_WINDOW_BYTES && read32(r->data+JOURNAL_WINDOW_LEGACY_BYTES)!=JOURNAL_WINDOW_CHOSEN)) return 1;
         c->window=true; return 0;
     }
     if(r->sequence<=3) return 1;
@@ -112,8 +123,94 @@ static void child_run(const char *path, progress *p, uint64_t seed, bool before_
     /* Stay available to be killed even when parent scheduling is slow. */
     for(;;) nap();
 }
+/* (P) Exercise the legacy WINDOW payload directly through this test's record
+ * visitor. The fixture reuses the campaign dimensions; each wire byte comes
+ * from width32 followed by height32, little-endian. */
+#define T(c) do { if(!(c)) { fprintf(stderr,"journal_kill_test:%d FAIL %s\n",__LINE__,#c); return 1; } } while(0)
+static int legacy_window_case(void)
+{
+    uint8_t bytes[JOURNAL_WINDOW_LEGACY_BYTES];
+    uint64_t packed=1373ull+(911ull<<(sizeof(uint32_t)*CHAR_BIT)); /* (E) reused campaign dimensions; (P) width32 + height32 */
+    for(size_t i=0;i<sizeof bytes;i++) bytes[i]=(uint8_t)(packed>>(CHAR_BIT*i));
+    journal_record r={.type=JOURNAL_WINDOW,.sequence=3,.data=bytes,.size=sizeof bytes};
+    /* (P) sequence follows the existing VIEW and TABS metadata records. */
+    recovery c={0}; T(replay(&c,&r)==0 && c.window);
+    puts("journal_kill_test: legacy WINDOW parser passed"); return 0;
+}
+/* (P) IDs, boolean/return sentinels and empty payloads below follow the
+ * journal/POSIX APIs. Buffer id one names the fixture's sole buffer;
+ * buffer id zero names session/group records.
+ * (P) These boundaries come from the replacement action's wire records:
+ * BEGIN, DELETE, INSERT, COMMIT. No random target or new timing budget. */
+typedef enum group_boundary { AFTER_BEGIN, AFTER_DELETE, BEFORE_COMMIT, AFTER_COMMIT } group_boundary;
+typedef struct group_hook { group_boundary at; _Atomic uint32_t reached; } group_hook;
+static ssize_t group_append(void *ctx, int fd, const uint8_t *bytes, size_t size, uint64_t off)
+{
+    group_hook *h=ctx;
+    /* (P) type32 follows magic32 and length32 in the wire header. */
+    uint32_t type=read32(bytes+sizeof(uint32_t)*2u);
+    if(h->at==BEFORE_COMMIT && type==JOURNAL_GROUP_COMMIT) {
+        atomic_store(&h->reached,type); (void)kill(getpid(),SIGKILL);
+        return -1; /* (P) POSIX write error if the kill unexpectedly returns. */
+    }
+    ssize_t written=pwrite(fd,bytes,size,(off_t)off);
+    if(written==(ssize_t)size &&
+       ((h->at==AFTER_BEGIN && type==JOURNAL_GROUP_BEGIN) ||
+        (h->at==AFTER_DELETE && type==JOURNAL_DELETE) ||
+        (h->at==AFTER_COMMIT && type==JOURNAL_GROUP_COMMIT))) {
+        atomic_store(&h->reached,type); (void)kill(getpid(),SIGKILL);
+    }
+    return written;
+}
+static int grouped_child(const char *path, group_hook *h)
+{
+    work_pool pool; journal *j;
+    T(work_pool_init(&pool,1,0)==0); /* (P) one journal worker */
+    T(journal_open(&j,path,&pool,NULL)==0);
+    T(journal_insert(j,1,0,(const uint8_t *)"before",strlen("before"))==0);
+    T(journal_flush(j)==0); /* baseline is complete before arming crash seam */
+    journal_io io={.ctx=h,.append_write=group_append}; T(journal_set_io(j,&io)==0);
+    T(journal_append(j,JOURNAL_GROUP_BEGIN,0,NULL,0)==0);
+    T(journal_delete(j,1,0,strlen("before"))==0);
+    T(journal_flush(j)==0); /* PAD and batch transition inside the group */
+    T(journal_insert(j,1,0,(const uint8_t *)"after",strlen("after"))==0);
+    T(journal_append(j,JOURNAL_GROUP_COMMIT,0,NULL,0)==0);
+    return 1; /* (P) every requested boundary must kill, never exit normally */
+}
+static int apply_group(void *ctx, const journal_record *r)
+{ return journal_apply_piece(ctx,r); } /* markers must not reach the visitor */
+static int group_kill_cases(void)
+{
+    group_hook *h=mmap(NULL,sizeof *h,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    T(h!=MAP_FAILED);
+    const uint32_t reached[]={JOURNAL_GROUP_BEGIN,JOURNAL_DELETE,JOURNAL_GROUP_COMMIT,JOURNAL_GROUP_COMMIT};
+    /* (P) expected record counts derive from the baseline INSERT plus each
+     * action record. PADs do not count; markers count but are not delivered. */
+    const uint32_t committed[]={JOURNAL_INSERT,JOURNAL_GROUP_BEGIN,JOURNAL_DELETE,JOURNAL_INSERT,JOURNAL_GROUP_COMMIT};
+    for(group_boundary at=AFTER_BEGIN;at<=AFTER_COMMIT;at++) {
+        h->at=at; atomic_init(&h->reached,0);
+        char path[]="build/journal-group-kill-XXXXXX"; int fd=mkstemp(path); T(fd>=0); T(close(fd)==0);
+        pid_t child=fork(); T(child>=0); if(child==0) _exit(grouped_child(path,h));
+        int status;
+        while(waitpid(child,&status,0)<0) T(errno==EINTR);
+        T(WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL); T(atomic_load(&h->reached)==reached[at]);
+        piece_allocator a=piece_default_allocator(); piece_tree *tree=piece_create(&a); T(tree);
+        journal_replay_result rr; T(journal_replay_file(path,apply_group,tree,&rr)==0);
+        const char *want=at==AFTER_COMMIT ? "after" : "before";
+        uint8_t bytes[sizeof "before"]; T(piece_len(tree)==strlen(want));
+        T(piece_read(tree,0,bytes,strlen(want))==0 && !memcmp(bytes,want,strlen(want)));
+        uint64_t records=at==AFTER_COMMIT ? sizeof committed/sizeof committed[0] : 1u;
+        /* (P) uncommitted replay keeps only the baseline INSERT. */
+        T(rr.records==records && rr.last_sequence==records);
+        T(rr.corrupt==(at!=AFTER_COMMIT));
+        piece_destroy(tree); T(unlink(path)==0);
+    }
+    T(munmap(h,sizeof *h)==0);
+    puts("journal_kill_test: BEGIN/DELETE/pre-COMMIT/post-COMMIT kills with PAD passed"); return 0;
+}
 int main(int argc, char **argv)
 {
+    T(legacy_window_case()==0); T(group_kill_cases()==0);
     unsigned trials=50;
     if(argc==2 && sscanf(argv[1],"--trials=%u",&trials)!=1) return 2;
     if(!trials || trials>10000) return 2;
