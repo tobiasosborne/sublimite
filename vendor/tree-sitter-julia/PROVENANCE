@@ -1,0 +1,4 @@
+tree-sitter-julia v0.25.0 from https://github.com/tree-sitter/tree-sitter-julia/archive/refs/tags/v0.25.0.tar.gz
+sha256 5ab5fefc1459cff08efa28aeacf028c6e812d9f7552a758fda8c0d65c2abae54
+extracted: src/, queries/, LICENSE only (2026-10-12)
+local change (edit-v0o.4): scanner.c tree_sitter_julia_external_scanner_create() -> create(void), matching parser.c and the runtime callback prototype for C11/UBSan. Release tarball hash above remains upstream provenance.

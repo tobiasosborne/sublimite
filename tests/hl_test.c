@@ -7,6 +7,7 @@
 #include "base/base.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sched.h>
 
@@ -231,9 +232,111 @@ static int query_test(void)
     return 0;
 }
 
+/* (P) Numeric identities here follow C/API contracts: zero is success,
+ * an empty count or the first byte; one is failure or one byte/element.
+ * Source and query lengths come from sizeof/ftell, never guessed capacities.
+ * Parser/query allocations occur only in this standalone worker-side probe. */
+static int grammar_probe(const char *name, const TSLanguage *language,
+                         const char *fixture, size_t fixture_length,
+                         const char *query_path)
+{
+    REQUIRE(language != NULL);
+    const uint32_t abi = ts_language_abi_version(language);
+    REQUIRE(abi >= TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION);
+    REQUIRE(abi <= TREE_SITTER_LANGUAGE_VERSION);
+    REQUIRE(fixture_length <= UINT32_MAX);
+    TSParser *parser = ts_parser_new();
+    REQUIRE(parser != NULL);
+    REQUIRE(ts_parser_set_language(parser, language));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, fixture,
+                                        (uint32_t)fixture_length);
+    REQUIRE(tree != NULL);
+    const bool has_error = ts_node_has_error(ts_tree_root_node(tree));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    REQUIRE(!has_error); /* rejects ERROR and missing nodes in any descendant */
+
+    FILE *file = fopen(query_path, "rb");
+    REQUIRE(file != NULL);
+    REQUIRE(fseek(file, 0, SEEK_END) == 0);
+    const long query_length = ftell(file);
+    REQUIRE(query_length > 0 && (unsigned long)query_length <= UINT32_MAX);
+    REQUIRE(fseek(file, 0, SEEK_SET) == 0);
+    char *source = malloc((size_t)query_length);
+    REQUIRE(source != NULL);
+    const size_t read_length = fread(source, 1u, (size_t)query_length, file);
+    const int close_status = fclose(file);
+    if (read_length != (size_t)query_length || close_status != 0) {
+        free(source);
+        return 1;
+    }
+    uint32_t error_offset = 0;
+    TSQueryError error_type = TSQueryErrorNone;
+    TSQuery *query = ts_query_new(language, source, (uint32_t)query_length,
+                                 &error_offset, &error_type);
+    free(source);
+    if (query == NULL) {
+        fprintf(stderr, "%s query: error=%d byte=%u\n", name,
+                (int)error_type, error_offset);
+        return 1;
+    }
+    REQUIRE(error_type == TSQueryErrorNone);
+    printf("hl_test: %s ABI=%u; fixture without ERROR; highlights query compiled\n",
+           name, abi);
+    const uint32_t capture_count = ts_query_capture_count(query);
+    for (uint32_t capture = 0; capture < capture_count; ++capture) {
+        uint32_t length = 0;
+        const char *capture_name = ts_query_capture_name_for_id(query, capture,
+                                                               &length);
+        printf("  @%.*s\n", (int)length, capture_name);
+    }
+    ts_query_delete(query);
+    return 0;
+}
+
+static int python_probe(void)
+{
+    /* (P) Fixture constants spell language syntax, not work/time budgets. */
+    const char fixture[] =
+        "@decorate\n"
+        "def greet(name: str):\n"
+        "    # scanner must handle indentation and interpolation\n"
+        "    message = f\"hello {name}\"\n"
+        "    if name is not None:\n"
+        "        print(message)\n"
+        "    return message\n";
+    return grammar_probe("python", hl_language_python(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-python/queries/highlights.scm");
+}
+
+static int julia_probe(void)
+{
+    const char fixture[] =
+        "module Greetings\n"
+        "#= scanner must handle nested #= comments =# too =#\n"
+        "function greet(name::String)\n"
+        "    message = \"hello $name\"\n"
+        "    println(message)\n"
+        "    return message\n"
+        "end\n"
+        "end\n";
+    return grammar_probe("julia", hl_language_julia(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-julia/queries/highlights.scm");
+}
+
 int main(void)
 {
     REQUIRE(query_test() == 0);
+    edit_malloc_guard_begin();
+    const TSLanguage *python = hl_language_python();
+    const TSLanguage *julia = hl_language_julia();
+    const size_t language_allocations = edit_malloc_guard_end();
+    REQUIRE(language_allocations == 0); /* (P) typing-path allocation law */
+    REQUIRE(python != NULL && julia != NULL);
+    REQUIRE(python_probe() == 0);
+    REQUIRE(julia_probe() == 0);
     const char text[] = "prefix\nviewport\nsuffix\n";
     const uint64_t first = sizeof "prefix\n" - 1u;
     const uint64_t end = first + sizeof "viewport\n" - 1u;

@@ -36,6 +36,8 @@ TS_SRC := vendor/tree-sitter/lib/src/lib.c
 TS_SRC += vendor/tree-sitter-c/src/parser.c
 TS_SRC += vendor/tree-sitter-rust/src/parser.c vendor/tree-sitter-rust/src/scanner.c
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
+SRCS += vendor/tree-sitter-python/src/parser.c vendor/tree-sitter-python/src/scanner.c
+SRCS += vendor/tree-sitter-julia/src/parser.c vendor/tree-sitter-julia/src/scanner.c
 MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
 BENCHS := $(sort $(wildcard bench/*_bench.c))
@@ -55,6 +57,14 @@ $(TS_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
 # use the same vendored-only flags. Keep project src/ warnings unchanged.
 GRAMMAR_OBJ := $(filter %/parser.o %/scanner.o,$(TS_OBJ))
 $(GRAMMAR_OBJ): WARN := -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-label -D_GNU_SOURCE -pthread
+# Python upstream scanner narrows array sizes and discards array_pop values.
+TS_PYTHON_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-python/src/,parser.o scanner.o))
+$(TS_PYTHON_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value
+$(TS_PYTHON_OBJ): INC := -Ivendor/tree-sitter-python/src $(INC)
+# Julia scanner callbacks leave unused ABI parameters; use its own parser ABI.
+TS_JULIA_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-julia/src/,parser.o scanner.o))
+$(TS_JULIA_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter
+$(TS_JULIA_OBJ): INC := -Ivendor/tree-sitter-julia/src $(INC)
 
 REL_LIB  := $(B)/libedit.a
 SAN_LIB  := $(B)/san/libedit.a
@@ -116,6 +126,9 @@ $(FUZZ_LIB): $(FUZZ_OBJ)
 	rm -f $@; $(AR) rcs $@ $^
 
 # ---- binaries ----
+# Julia exceeds the assigned grammar size goal; archive extraction is opt-in.
+$(B)/sublimite-julia: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_julia $(REL_LIB) $(LDLIBS) -o $@
 $(B)/sublimite: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_LIB) $(LDLIBS) -o $@
 $(B)/tools/%: $(B)/rel/tools/%.o $(REL_LIB)
