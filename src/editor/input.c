@@ -1058,7 +1058,11 @@ int editor_handle_key(editor *e, const plat_event *ev)
     if (go) return goto_key(e, ev, action);
     if (scroll) {
         undo_break_burst(e->undo);
-        e->find_scroll = false; e->buffer->scroll_following = false;
+        /* edit-pd6: an unresolved byte jump keeps its target and the find
+         * host's follow flags; the rows are queued for the landed top. */
+        bool jumping = editor_scroll_jumping(e);
+        if (!jumping) e->find_scroll = false;
+        e->buffer->scroll_following = false;
         if (e->v.state.wrap) {
             e->wheel_pending = true; e->wheel.request = SCROLL_RELATIVE;
             e->wrap_wheel_rows -= binding->args.value;
@@ -1066,8 +1070,12 @@ int editor_handle_key(editor *e, const plat_event *ev)
         }
         /* (P) amount's sign is Sublime's; a row is row_height Q8 pixels. */
         int64_t pixels = -(int64_t)binding->args.value * SCROLL_PIXEL_UNIT * e->buffer->scroll.config.row_height;
-        rc = scroll_pixels(&e->buffer->scroll, pixels); if (rc) return rc;
-        e->wheel_pending = false; e->buffer->scroll_pending = true;
+        if (jumping) editor_scroll_queue_pixels(e, pixels);
+        else {
+            rc = scroll_pixels(&e->buffer->scroll, pixels); if (rc) return rc;
+            e->wheel_pending = false;
+        }
+        e->buffer->scroll_pending = true;
         return editor_scroll_slice(e);
     }
     if (tab) {
@@ -1113,7 +1121,14 @@ int editor_handle_key(editor *e, const plat_event *ev)
         else if (move == VIEW_DOC_END) scroll_key_value = SCROLL_END;
         else scroll_motion = false;
         if (scroll_motion) {
-            rc = scroll_key_motion(&e->buffer->scroll, scroll_key_value, &move); if (rc) return rc;
+            /* edit-pd6: during an unresolved byte jump a page is queued
+             * for the landed top; document Home/End supersede the jump. */
+            bool page = scroll_key_value == SCROLL_PAGE_UP || scroll_key_value == SCROLL_PAGE_DOWN;
+            if (page && editor_scroll_jumping(e)) editor_scroll_queue(e, scroll_key_value == SCROLL_PAGE_DOWN ? 1 : -1, 0);
+            else {
+                if (editor_scroll_jumping(e)) editor_scroll_cancel_jump(e);
+                rc = scroll_key_motion(&e->buffer->scroll, scroll_key_value, &move); if (rc) return rc;
+            }
             e->buffer->scroll_following = false; e->buffer->scroll_pending = true;
             if (move == VIEW_DOC_END && e->buffer->lg.lazy && !e->buffer->lg.lines_exact)
                 return large_doc_end(e, binding && (binding->args.flags & KEYS_ARG_EXTEND));
@@ -1161,10 +1176,16 @@ int editor_handle_wheel(editor *e, const plat_event *ev)
      * logical line-index adapter. Never reinterpret logical rows as visual:
      * wrapped input steps prepared visual rows (edit-73j, wrap_wheel). */
     if (e->v.state.wrap) return wrap_wheel(e, ev);
-    e->wheel_pending = false; e->find_scroll = false; /* wheel cancels a pending jump */
     editor_buffer *b = e->buffer;
+    /* edit-pd6: an unresolved byte jump keeps its target (and the find
+     * host's horizontal follow); the notch is queued for the landed top. */
+    bool jumping = editor_scroll_jumping(e);
+    if (!jumping) { e->wheel_pending = false; e->find_scroll = false; }
     b->scroll_following = false;
-    int rc = scroll_wheel(&b->scroll, ev->dy); if (rc) return rc;
+    int rc = 0;
+    if (jumping) editor_scroll_queue(e, 0, ev->dy);
+    else rc = scroll_wheel(&b->scroll, ev->dy);
+    if (rc) return rc;
     b->scroll_pending = true;
     undo_break_burst(e->undo);
     uint64_t now = trace_now_ns(), seq = ++e->stats.input_sequence;

@@ -24,6 +24,8 @@ static scroll_extent extent(editor_buffer *b, uint64_t len)
     if (count.value > len + 1u) count.value = len + 1u;
     return (scroll_extent){len, count.value, count.exact && lineidx_len(b->index) == len};
 }
+/* edit-pd6: drop navigation queued behind an unresolved byte jump. */
+static void unqueue(editor_buffer *b) { b->scroll_queued_pages = 0; b->scroll_queued_wheel = 0; b->scroll_queued_pixels = 0; }
 int editor_scroll_retire(editor_buffer *b)
 {
     if (!b->scroll_snapshot) return 0;
@@ -72,6 +74,7 @@ int editor_scroll_init(editor *e, editor_buffer *b)
     int rc = editor_scroll_retire(b); if (rc) return rc;
     rc = install(b); if (rc) return rc;
     rc = scroll_init(&b->scroll, config(e), extent(b, b->scroll_resident.snapshot.len));
+    unqueue(b);
     if (!rc) { b->scroll_ready = true; b->scroll_display = b->scroll; b->scroll_display_stale = false; b->scroll_prefix = lineidx_built_prefix(b->index); }
     return rc;
 }
@@ -82,6 +85,58 @@ void editor_scroll_mirror(editor *e)
     e->v.state.first_byte = s->first_byte; e->v.state.first_line = s->first_line;
     e->v.state.visual_byte = s->first_byte; e->v.state.approximate = s->approximate;
 }
+/* edit-pd6: a far byte jump (find, minimap, Ctrl+End, goto) is unresolved
+ * until the resident resolver lands it; scroll's relative motions reject
+ * that state (scroll.c SCROLL_ERR_ARG). Page keys and wheel notches arriving
+ * meanwhile are queued here and applied, in that order, to the landed top,
+ * before any cursor follow, as if they had arrived after it. */
+bool editor_scroll_jumping(const editor *e)
+{ return !e->v.state.wrap && e->buffer->scroll_ready && e->buffer->scroll.request == SCROLL_BYTE; }
+void editor_scroll_queue(editor *e, int64_t pages, int32_t wheel)
+{
+    editor_buffer *b = e->buffer;
+    b->scroll_queued_pages += pages; /* one per key event: bounded by input */
+    int64_t sum = (int64_t)b->scroll_queued_wheel + wheel;
+    b->scroll_queued_wheel = sum > INT32_MAX ? INT32_MAX : sum < INT32_MIN ? INT32_MIN : (int32_t)sum;
+    b->scroll_pending = true;
+}
+void editor_scroll_queue_pixels(editor *e, int64_t pixels_q8)
+{
+    /* edit-o20's scroll_lines chord (scroll_pixels) during a jump. */
+    editor_buffer *b = e->buffer;
+    int64_t q = b->scroll_queued_pixels;
+    b->scroll_queued_pixels = pixels_q8 > 0 && q > INT64_MAX - pixels_q8 ? INT64_MAX :
+        pixels_q8 < 0 && q < INT64_MIN - pixels_q8 ? INT64_MIN : q + pixels_q8;
+    b->scroll_pending = true;
+}
+void editor_scroll_cancel_jump(editor *e)
+{
+    /* An absolute motion (document Home/End) supersedes the jump: return
+     * to the displayed READY top, as a mutation does (editor_scroll_edit). */
+    editor_buffer *b = e->buffer;
+    const scroll_state *d = &b->scroll_display;
+    b->scroll.first_line = d->first_line; b->scroll.first_byte = d->first_byte;
+    b->scroll.anchor_line = d->anchor_line; b->scroll.subrow_q8 = 0;
+    b->scroll.approximate = d->approximate;
+    b->scroll.request = SCROLL_READY; b->scroll.pending_rows = 0;
+    b->scroll_resolver = b->scroll_follow_resolver = (scroll_resolver){0};
+    unqueue(b);
+    if (e->find_scroll) { e->find_scroll = false; e->wheel_pending = false; }
+}
+static int apply_queued(editor_buffer *b)
+{
+    view_key ignored; int rc = 0;
+    for (; !rc && b->scroll_queued_pages > 0; b->scroll_queued_pages--)
+        rc = scroll_key_motion(&b->scroll, SCROLL_PAGE_DOWN, &ignored);
+    for (; !rc && b->scroll_queued_pages < 0; b->scroll_queued_pages++)
+        rc = scroll_key_motion(&b->scroll, SCROLL_PAGE_UP, &ignored);
+    if (!rc && b->scroll_queued_wheel) rc = scroll_wheel(&b->scroll, b->scroll_queued_wheel);
+    if (!rc && b->scroll_queued_pixels) rc = scroll_pixels(&b->scroll, b->scroll_queued_pixels);
+    unqueue(b);
+    if (!rc) b->scroll_pending = true;
+    return rc;
+}
+static bool queued(const editor_buffer *b) { return b->scroll_queued_pages || b->scroll_queued_wheel || b->scroll_queued_pixels; }
 bool editor_scroll_waiting(const editor *e)
 { return !e->v.state.wrap && e->buffer->scroll_pending && !e->buffer->source_stale && !e->buffer->pending_open; }
 int editor_scroll_resize(editor *e)
@@ -100,6 +155,7 @@ int editor_scroll_seek(editor *e, uint64_t byte)
     if (e->v.state.wrap) return 0;
     editor_buffer *b = e->buffer;
     b->scroll_following = false; b->scroll_resolver = (scroll_resolver){0};
+    unqueue(b); /* edit-pd6: a new absolute target supersedes queued motion */
     int rc = scroll_seek_byte(&b->scroll, byte);
     if (!rc) b->scroll_pending = true;
     return rc;
@@ -120,7 +176,7 @@ bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approxima
     if (scroll_seek_line(&placed, line) || placed.first_line != line) return false;
     placed.first_byte = byte; placed.anchor_line = line;
     placed.request = SCROLL_READY; placed.pending_rows = 0;
-    b->scroll = b->scroll_display = placed; b->scroll_display_stale = false;
+    b->scroll = b->scroll_display = placed; b->scroll_display_stale = false; unqueue(b);
     b->scroll_resolver = b->scroll_follow_resolver = (scroll_resolver){0};
     b->scroll_following = b->scroll_pending = false;
     b->scroll_prefix = lineidx_built_prefix(b->index);
@@ -133,6 +189,10 @@ int editor_scroll_follow(editor *e)
     editor_buffer *b = e->buffer;
     b->scroll_cursor = e->v.state.selection.cursor;
     b->scroll_following = true; b->scroll_pending = true;
+    /* edit-pd6: motion queued behind an unresolved jump applies to the
+     * landed top first; follow after it, never adopt a top derived from the
+     * pre-jump scroll state. Edits unqueue (seek), so typing is unaffected. */
+    if (b->scroll.request == SCROLL_BYTE && queued(b)) { editor_scroll_mirror(e); return 0; }
     if (e->repair_line_valid && b->scroll_cursor == e->edit_delta.off) {
         /* The deleted preceding LF and bounded backward proof certify the
          * joined cursor line before the replacement layout is available. */
@@ -229,6 +289,7 @@ int editor_scroll_slice(editor *e)
     editor_buffer *b = e->buffer;
     if (e->v.state.wrap || b->source_stale || !b->scroll_ready || b->pending_open || view_busy(&e->v) ||
         e->action == EDITOR_ACTION_REPLAY_WORK) return 0;
+    if (queued(b) && b->scroll.request != SCROLL_BYTE) { int rc = apply_queued(b); if (rc) return rc; }
     lineidx_result count = lineidx_line_count(b->index);
     size_t prefix = lineidx_built_prefix(b->index);
     /* A lazy large file publishes its logical labels with the complete index
@@ -284,6 +345,12 @@ int editor_scroll_slice(editor *e)
     uint64_t deadline = trace_now_ns() + EDITOR_SLICE_NS;
     int rc = scroll_resolve_resident(&b->scroll, &b->scroll_resolver,
                                     b->index, &b->scroll_resident, 0, deadline);
+    if (!rc && queued(b)) {
+        /* edit-pd6: the jump landed; queued motion moves from its top, then
+         * resolves (and follows the cursor) on the next slice. */
+        rc = apply_queued(b); if (rc) return rc;
+        return 0;
+    }
     if (!rc && b->scroll_following) {
         rc = scroll_follow_cursor_resident(&b->scroll, &b->scroll_follow_resolver,
             b->index, &b->scroll_resident, b->scroll_cursor, 0, deadline);

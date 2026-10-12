@@ -100,6 +100,12 @@ typedef struct editor_buffer {
     uint64_t scroll_revision, scroll_cursor;
     size_t scroll_prefix;
     bool scroll_ready, scroll_pending, scroll_following;
+    /* edit-pd6: page keys (signed count) and wheel delta (plat_event.dy
+     * units, saturated to its int32 range) that arrived while a byte jump
+     * was unresolved; scrollctl applies them once it resolves. */
+    int64_t scroll_queued_pages;
+    int32_t scroll_queued_wheel;
+    int64_t scroll_queued_pixels; /* edit-o20 scroll_lines, Q8 pixels, saturated */
     char path[IPC_PATH_CAP], save_path[IPC_PATH_CAP];
     ipc_token wait_token;
 } editor_buffer;
@@ -378,6 +384,11 @@ int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add, uint
 int editor_scroll_resize(editor *e);
 void editor_scroll_mirror(editor *e);
 bool editor_scroll_waiting(const editor *e);
+/* edit-pd6: navigation arriving during an unresolved byte jump. */
+bool editor_scroll_jumping(const editor *e);
+void editor_scroll_queue(editor *e, int64_t pages, int32_t wheel);
+void editor_scroll_queue_pixels(editor *e, int64_t pixels_q8);
+void editor_scroll_cancel_jump(editor *e);
 void editor_refresh_complete(void *ctx, uint32_t id, uint64_t ns);
 void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);

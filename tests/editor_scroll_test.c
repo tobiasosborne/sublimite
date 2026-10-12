@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 /* (G) Reuse the public editor fixture and retry bound in
  * scroll_test.c:editor_observability/settle_editor; these are fixture controls,
@@ -152,8 +153,114 @@ static int resized(void)
 done:
     editor_close(e); return result;
 }
-int main(void)
+/* edit-pd6 (editor-2 finding 13): wheel or page input while a far byte jump
+ * (find, minimap, Ctrl+End) is still resolving must not stop the loop. The
+ * jump is held deterministically by blocking its resident window (held_span,
+ * as cancellation() does). Expected: the input is queued and applied once the
+ * jump lands, so the final state equals the unraced reference where the same
+ * input arrives after the jump resolved. Fixture reuses PROBE_* above. */
+typedef struct jump_result { uint64_t first_byte, first_line, cursor, anchor; } jump_result;
+static int jump_then(plat_event event, bool race, jump_result *out)
 {
+    int result = 0; editor *e = NULL; render_backend backend = {0}; held_source hold = {0};
+    /* (P) Line width is sizeof("a\n") minus its terminating NUL. */
+    const size_t line_bytes = sizeof "a\n" - 1u;
+    uint8_t bytes[PROBE_BYTES];
+    for (size_t i = 0; i < sizeof bytes; i++) bytes[i] = (uint8_t)"a\n"[i % line_bytes];
+    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes,
+        .cols = PROBE_COLS, .rows = PROBE_ROWS, .wrap_mode = -1};
+    CHECK(render_null_backend(&backend) == 0 && editor_open(&e, &cfg, &backend) == 0 && settle(e) == 0);
+    editor_buffer *b = e->buffer;
+    if (race) {
+        hold.snap = b->scroll_snapshot; hold.ui = pthread_self();
+        b->scroll_resident.snapshot.ctx = &hold; b->scroll_resident.snapshot.span = held_span;
+    }
+    /* (P) The middle line: PROBE_BYTES/2 bytes = PROBE_BYTES/(2*line_bytes)
+     * = 400/(2*2) = 100 lines from either end: beyond the PROBE_ROWS (8)
+     * prepared rows, and farther than one page (< PROBE_ROWS rows) or one
+     * notch (SCROLL_CORE_ROWS) from either clamp, so neither the jump nor
+     * the queued motion is clipped. */
+    uint64_t target = PROBE_BYTES / 2u;
+    uint64_t frames = backend.stats.submitted_frames;
+    /* As a far find result does (findpanel.c): select the match, seek its
+     * byte on the scroll path and set the host's follow flags. */
+    e->v.state.selection.cursor = e->v.state.selection.anchor = target;
+    e->v.state.selection.preferred_col = VIEW_PREFERRED_UNSET;
+    CHECK(editor_scroll_seek(e, target) == 0);
+    e->wheel_pending = true; e->find_scroll = true;
+    if (race) {
+        for (unsigned retry = 0; retry < PROBE_RETRIES && !atomic_load(&hold.entered); retry++) {
+            CHECK(editor_step(e, 0) >= 0); sched_yield();
+        }
+        CHECK(atomic_load(&hold.entered) && b->scroll_pending && b->scroll.request == SCROLL_BYTE);
+        CHECK(editor_view(e).first_byte == 0 && backend.stats.submitted_frames == frames);
+    } else CHECK(settle(e) == 0 && editor_view(e).first_byte == target);
+    edit_malloc_guard_begin();
+    int rc = editor_inject(e, &event); if (!rc) rc = editor_step(e, 0);
+    size_t allocations = edit_malloc_guard_end();
+    if (rc < 0) fprintf(stderr, "editor_scroll_test: %s motion returned %d, sticky error %d\n",
+        race ? "pending-jump" : "reference", rc, e->error);
+    CHECK(rc >= 0 && !e->error && (!edit_malloc_guard_active() || allocations == 0));
+    if (race) {
+        /* The jump's window is still held: the loop keeps running. */
+        CHECK(editor_step(e, 0) >= 0 && !e->error);
+        /* A wheel notch or page is queued behind the retained jump; document
+         * Home/End supersede it and may land at once. */
+        if (event.kind == PLAT_EV_WHEEL || event.keysym == XKB_KEY_Page_Down || event.keysym == XKB_KEY_Page_Up ||
+            event.keysym == XKB_KEY_Down || event.keysym == XKB_KEY_Up)
+            CHECK(b->scroll_pending && b->scroll.request == SCROLL_BYTE &&
+                editor_view(e).first_byte == 0 && backend.stats.submitted_frames == frames);
+        atomic_store(&hold.release, true);
+    }
+    /* Not READY: editor_scroll_follow may adopt a followed state whose
+     * request scroll_follow marked RELATIVE (pre-existing, reported). */
+    CHECK(settle(e) == 0 && !e->error && !b->scroll_pending && b->scroll.request != SCROLL_BYTE);
+    CHECK(backend.stats.submitted_frames > frames);
+    view_state v = editor_view(e);
+    *out = (jump_result){v.first_byte, v.first_line, v.selection.cursor, v.selection.anchor};
+done:
+    atomic_store(&hold.release, true); editor_close(e); return result;
+}
+static int pending_jump_motion(plat_event event)
+{
+    int result = 0; jump_result reference = {0}, raced = {0};
+    CHECK(jump_then(event, false, &reference) == 0);
+    CHECK(jump_then(event, true, &raced) == 0);
+    if (memcmp(&reference, &raced, sizeof reference))
+        fprintf(stderr, "editor_scroll_test: reference top %llu line %llu cursor %llu anchor %llu, raced top %llu line %llu cursor %llu anchor %llu\n",
+            (unsigned long long)reference.first_byte, (unsigned long long)reference.first_line,
+            (unsigned long long)reference.cursor, (unsigned long long)reference.anchor,
+            (unsigned long long)raced.first_byte, (unsigned long long)raced.first_line,
+            (unsigned long long)raced.cursor, (unsigned long long)raced.anchor);
+    CHECK(!memcmp(&reference, &raced, sizeof reference));
+    /* The queued notch/page moved the viewport off the jump target. */
+    if (event.kind == PLAT_EV_WHEEL || event.keysym == XKB_KEY_Page_Down || event.keysym == XKB_KEY_Down)
+        CHECK(raced.first_byte > PROBE_BYTES / 2u);
+    printf("editor_scroll_test: %s keysym=%u during a pending byte jump matches the unraced result, loop continues, top=%llu PASS\n",
+        event.kind == PLAT_EV_WHEEL ? "wheel" : "key", event.keysym, (unsigned long long)raced.first_byte);
+done:
+    return result;
+}
+static int pending_jump_keys(void)
+{
+    /* Page and document motions share scroll_key_motion's dispatch; CTRL
+     * selects document Home/End rather than line Home/End. Ctrl+Up/Down is
+     * edit-o20's scroll_lines chord (scroll_pixels), queued the same way. */
+    const uint32_t keys[] = {XKB_KEY_Page_Down, XKB_KEY_Page_Up, XKB_KEY_Home, XKB_KEY_End,
+        XKB_KEY_Down, XKB_KEY_Up};
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        plat_event event = {.kind = PLAT_EV_KEY, .press = true, .keysym = keys[i],
+            .mods = keys[i] == XKB_KEY_Page_Down || keys[i] == XKB_KEY_Page_Up ? 0 : PLAT_MOD_CTRL};
+        if (pending_jump_motion(event)) return 1;
+    }
+    return 0;
+}
+int main(int argc, char **argv)
+{
+    /* (P) argv's first entry is the executable; the next is the selector. */
+    if (argc > 1 && !strcmp(argv[1], "--pending-jump-wheel"))
+        return pending_jump_motion((plat_event){.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT});
+    if (argc > 1 && !strcmp(argv[1], "--pending-jump-keys")) return pending_jump_keys();
     int result = 0;
     editor *e = NULL; render_backend backend = {0}; observer o = {0};
     /* Fixture: one ASCII character plus LF per line; enough rows for wheel
@@ -212,5 +319,7 @@ done:
     if (!result) result = cancellation();
     if (!result) result = resized();
     if (!result) result = eof_typing();
+    if (!result) result = pending_jump_motion((plat_event){.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT});
+    if (!result) result = pending_jump_keys();
     return result;
 }
