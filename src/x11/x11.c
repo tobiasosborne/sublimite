@@ -162,21 +162,22 @@ static void keyboard_result_destroy(keyboard_result *r) {
 static void rebuild_keyboard(work_ctx *job) {
     x11_runtime *rt = job->arg;
     keyboard_result r = {0};
-    /* edit-cx8: a server keymap change (any client may cause one) rebuilds
-     * here, on the keymap worker, off the input -> submit path. Every
-     * allocation below is libxkbcommon/libxcb constructing the new keymap,
-     * exempt under the P2.0 library rule; do not let a concurrent UI typing
-     * window's process-wide guard count it. Thread-local, nothing else hidden. */
-    edit_malloc_guard_exempt_begin();
+    /* edit-cuh: exempt only library construction on this off-path worker.
+     * Cancellation checks, our state preparation and publication stay counted;
+     * preparation brackets its individual XKB calls internally. */
     if (!work_should_stop(job)) {
+        edit_malloc_guard_exempt_begin();
         r.ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
         r.device = xkb_x11_get_core_keyboard_device_id(rt->keyboard_conn);
-        if (r.ctx && r.device >= 0 && !work_should_stop(job))
+        edit_malloc_guard_exempt_end();
+        if (r.ctx && r.device >= 0 && !work_should_stop(job)) {
+            edit_malloc_guard_exempt_begin();
             r.keymap = xkb_x11_keymap_new_from_device(r.ctx, rt->keyboard_conn, r.device,
                                                     XKB_KEYMAP_COMPILE_NO_FLAGS);
+            edit_malloc_guard_exempt_end();
+        }
         if (r.keymap && !work_should_stop(job)) r.state = x11_input_prepare_state(r.keymap);
     }
-    edit_malloc_guard_exempt_end();
     /* One worker/job at a time; publish provides the synchronization. Shutdown
      * joins before reclaiming this result, even if cancellation drops the message. */
     rt->result = r;

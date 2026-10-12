@@ -1,5 +1,6 @@
 /* input.c - key/button translation, time mapping, repeat, queue (P2.2). Pure: no X connection. */
 #include "input.h"
+#include "base/base.h"
 #include <string.h>
 
 #define NS_PER_MS UINT64_C(1000000)
@@ -43,17 +44,30 @@ int x11_input_init(x11_input *in, struct xkb_keymap *keymap, struct xkb_compose_
 }
 
 struct xkb_state *x11_input_prepare_state(struct xkb_keymap *keymap) {
+    /* edit-cuh: setup/keymap-worker construction is off the typing path.
+     * Exempt individual library calls, leaving our control flow counted. */
+    edit_malloc_guard_exempt_begin();
     struct xkb_state *st = xkb_state_new(keymap);
+    edit_malloc_guard_exempt_end();
     if (!st) return NULL;
     /* XKB lazily grows its action-filter array. Prime simultaneous core keys
      * during setup/on the worker, then release them and discard the warm-up
-     * modifier/group state before this state reaches the input path. */
+     * modifier/group state before this state reaches the input path.
+     * (P) X11 core keycodes occupy [8, 256); zero masks mean no modifiers. */
     for (uint32_t k = 8; k < 256; k++) {
+        edit_malloc_guard_exempt_begin();
         xkb_state_update_mask(st, 0, 0, 0, 0, 0, 0);
         xkb_state_update_key(st, k, XKB_KEY_DOWN);
+        edit_malloc_guard_exempt_end();
     }
-    for (uint32_t k = 8; k < 256; k++) xkb_state_update_key(st, k, XKB_KEY_UP);
+    for (uint32_t k = 8; k < 256; k++) {
+        edit_malloc_guard_exempt_begin();
+        xkb_state_update_key(st, k, XKB_KEY_UP);
+        edit_malloc_guard_exempt_end();
+    }
+    edit_malloc_guard_exempt_begin();
     xkb_state_update_mask(st, 0, 0, 0, 0, 0, 0);
+    edit_malloc_guard_exempt_end();
     return st;
 }
 
