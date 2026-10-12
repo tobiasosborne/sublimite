@@ -17,6 +17,7 @@
 #include "editor/large_private.h"
 #include "editor/runtime.h"
 #include "scroll/scroll.h"
+#include "editor/highlight.h"
 #include <limits.h>
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
@@ -72,7 +73,7 @@ typedef struct editor_buffer {
     view_selection mark;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
-    size_t find_leases;
+    size_t find_leases, hl_leases;
     indent_style style;
     indent_style detected_style;
     file_eol paste_eol; /* edit-bml: detected in-memory ending survives edits */
@@ -167,6 +168,7 @@ typedef struct editor_font_size {
 struct editor {
     editor_clip *clipboard;
     editor_config cfg;
+    editor_highlight hl;
     editor_stats stats;
     edit_arena arena;
     piece_tree *tree;
@@ -425,6 +427,11 @@ void editor_font_track(editor *e, uint32_t slot, uint32_t row);
 int editor_pointer(editor *e, const plat_event *ev);
 bool editor_pointer_scrolling(const editor *e);
 int editor_pointer_tick(editor *e);
+int editor_hl_init(editor *e, size_t cells);
+void editor_hl_close(editor *e);
+void editor_hl_service(editor *e);
+void editor_hl_request(editor *e);
+void editor_hl_paint(editor *e, uint64_t byte, uint32_t *fg);
 int editor_map_service(editor *e);
 bool editor_map_receive(editor *e, const work_msg *msg);
 int editor_chrome_pointer(editor *e, const plat_event *ev);

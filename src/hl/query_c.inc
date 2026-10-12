@@ -3,7 +3,7 @@ static const char highlights_c[] =
 "(identifier) @variable\n"
 "\n"
 "((identifier) @constant\n"
-" (#match? @constant \"^[A-Z][A-Z\\\\d_]*$\"))\n"
+" (#match\? @constant \"^[A-Z][A-Z\\\\d_]*$\"))\n"
 "\n"
 "\"break\" @keyword\n"
 "\"case\" @keyword\n"

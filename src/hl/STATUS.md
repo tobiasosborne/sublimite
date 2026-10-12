@@ -1,3 +1,26 @@
+# hl — edit-11v editor paint integration
+
+The editor now submits immutable active-buffer snapshot leases after completed
+open/edit/scroll layout, queries the viewport-first and completed document trees,
+and publishes pointer-free per-cell scope ranges through the existing mailbox.
+Paint maps scopes to the current dark/light theme; new buffers start plain,
+stale batches keep the previous colours, and partial/failed batches never land.
+Prepaid arrays derive from reserved frame cells; parser/query allocations stay
+on the bulk worker. The highlighting-enabled counting-allocator case remains
+zero on the UI typing path. Physical refresh is required by the parse contract;
+X11 mode timing supplies it at startup, or physical observations supply cadence.
+Unknown cadence keeps plain text until available (including Wayland startup
+whose advertised interval is not exposed by the existing platform interface).
+
+Default extension dispatch links C/Rust/Python/JavaScript/JSON/TOML/YAML.
+Julia/TypeScript/Markdown/Markdown inline/LaTeX/Bash remain HL_OPTIN links.
+All vendored highlights queries are embedded and their predicates/scopes run
+through the production layer. Minimap syntax, injected languages and full
+Sublime selectors/styles remain outside this bead. Decisions and validation:
+docs/decisions/edit-11v.md and docs/worker-reports/edit-11v-s6.md.
+
+The following sections describe the preceding grammar/runtime landings.
+
 # hl — grammars landed (edit-v0o.3/.4/.5/.6, 2026-10-13)
 
 Thirteen vendored grammars build into the release, sanitizer and fuzzer

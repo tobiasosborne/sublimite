@@ -17,4 +17,8 @@ const TSLanguage *hl_language_markdown_inline(void);
 const TSLanguage *hl_language_latex(void);
 const TSLanguage *hl_language_bash(void);
 
+/* Allocation-free extension dispatch; optional languages only when linked. */
+const TSLanguage *hl_language_path(const char *path);
+const char *hl_language_name(const TSLanguage *language);
+
 #endif

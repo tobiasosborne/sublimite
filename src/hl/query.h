@@ -27,8 +27,9 @@ typedef struct hl_query {
 } hl_query;
 /* Worker-only initialization: compiles embedded vendored highlights, or a
  * caller-supplied query. TSQuery/cursor allocation stays off the UI thread.
- * Only the match? expressions present in the vendored C/Rust queries are
- * supported; unsupported predicates fail closed. Initialize inactive storage;
+ * Exact vendored text predicates, any-of/ancestor and highlights-only local
+ * metadata are supported; unsupported predicates fail closed. Initialize inactive
+ * storage;
  * failure leaves it destroyable. Lifetime/serialization match hl_worker. */
 int hl_query_init(hl_query *query, const TSLanguage *language, hl_query_error *error);
 int hl_query_init_source(hl_query *query, const TSLanguage *language,
@@ -53,7 +54,7 @@ int hl_span_decode(const work_msg *message, hl_span *span);
  * bytes/phase with the same generation as the spans; that closes the batch.
  * Callback can encode/publish using work_publish; on backpressure STOP, discard
  * staged output and rerun (no partial completion is reported). Callback error
- * is propagated; cursor match-limit overflow fails closed. No paint wiring. */
+ * is propagated; cursor match-limit overflow fails closed. */
 typedef int (*hl_span_fn)(void *payload, const hl_span *span);
 int hl_query_run(hl_query *query, const TSTree *tree, const piece_snapshot *snapshot,
                  uint32_t first_row, uint32_t end_row, hl_span_fn emit, void *payload);

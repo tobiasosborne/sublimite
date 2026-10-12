@@ -694,6 +694,7 @@ int editor_step(editor *e, int timeout_ms)
     if (!rc && e->find.private_) (void)findui_maintain(&e->find);
     if (!rc) rc = editor_find_service(e);
     if (!rc) rc = editor_map_service(e);
+    if (!rc) editor_hl_service(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);
@@ -766,6 +767,7 @@ int editor_step(editor *e, int timeout_ms)
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
     rc = editor_pointer_tick(e); if (rc) return fail(e, rc);
     if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
+    editor_hl_request(e);
     uint64_t submit_start = trace_now_ns(); rc = submit(e);
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);

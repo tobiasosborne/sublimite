@@ -252,8 +252,6 @@ static int grammar_probe(const char *name, const TSLanguage *language,
                                         (uint32_t)fixture_length);
     REQUIRE(tree != NULL);
     const bool has_error = ts_node_has_error(ts_tree_root_node(tree));
-    ts_tree_delete(tree);
-    ts_parser_delete(parser);
     REQUIRE(!has_error); /* rejects ERROR and missing nodes in any descendant */
 
     FILE *file = fopen(query_path, "rb");
@@ -291,6 +289,22 @@ static int grammar_probe(const char *name, const TSLanguage *language,
         printf("  @%.*s\n", (int)length, capture_name);
     }
     ts_query_delete(query);
+    hl_query production;
+    REQUIRE(hl_query_init(&production,language,NULL)==HL_QUERY_OK);
+    piece_allocator allocator=piece_default_allocator();
+    piece_tree *piece=piece_create(&allocator); REQUIRE(piece);
+    REQUIRE(piece_init_copy(piece,(const uint8_t *)fixture,fixture_length)==PIECE_OK);
+    piece_snapshot *snapshot=piece_snapshot_take(piece); REQUIRE(snapshot);
+    /* (P) Oracle is exactly one scope/priority per fixture byte. */
+    hl_scope scopes[fixture_length]; uint32_t priorities[fixture_length];
+    memset(scopes,0,sizeof scopes); memset(priorities,0,sizeof priorities);
+    scope_oracle oracle={scopes,priorities,fixture_length,0,(uint32_t)fixture_length};
+    REQUIRE(hl_query_run(&production,tree,snapshot,0,UINT32_MAX,capture,&oracle)==HL_QUERY_OK);
+    REQUIRE(oracle.captures);
+    printf("hl_test: %s embedded production query ran, captures=%zu (P fixture-derived)\n",name,oracle.captures);
+    hl_query_destroy(&production);
+    piece_snapshot_release(snapshot); piece_destroy(piece);
+    ts_tree_delete(tree); ts_parser_delete(parser);
     return 0;
 }
 

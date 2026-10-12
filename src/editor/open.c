@@ -14,6 +14,7 @@ void editor_close(editor *e)
 {
     if (!e) return;
     config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
+    editor_hl_close(e);
     editor_find_close(e);
     if (e->journal && !e->recovering) (void)editor_flush(e);
     editor_session_close(e);
@@ -138,12 +139,15 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     size_t reserve = 2 * e->map_pixel_capacity * sizeof(uint32_t) +
         (size_t)e->map_capacity * 8u * sizeof(render_cell) +
         ((size_t)e->map_capacity + 63u) / 64u * sizeof(uint64_t) +
+        /* (P) worker, staged and published: each bounded by reserved cells. */
+        3u * cells * sizeof(hl_span) +
         cells * sizeof(editor_hit) + 2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         reserved_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) +
         font_glyphs * words * sizeof(uint64_t) + 2u * 1024u * 1024u;
     rc = edit_arena_init(&e->arena, reserve); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    rc = editor_hl_init(e, cells); if (rc) goto fail;
     rc = editor_clip_init(e); if (rc) goto fail;
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);
     if (!e->buffers) { rc = EDITOR_ERR_MEMORY; goto fail; }

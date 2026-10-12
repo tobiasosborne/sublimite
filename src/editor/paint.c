@@ -6,6 +6,7 @@
 static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t *attrs)
 {
     editor *e = ctx;
+    editor_hl_paint(e, byte, fg);
     if (!e->paint_ready) return;
     size_t first=0, after=e->find_range_count;
     while (first<after) {

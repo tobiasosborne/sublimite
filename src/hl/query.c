@@ -1,17 +1,33 @@
 #include "hl/query.h"
+#include "hl/hl.h"
 #include "hl/lang.h"
 #include <limits.h>
 #include <string.h>
 #include "query_c.inc"
 #include "query_rust.inc"
+#include "query_python.inc"
+#include "query_javascript.inc"
+#include "query_json.inc"
+#include "query_toml.inc"
+#include "query_yaml.inc"
+#include "query_julia.inc"
+#include "query_typescript.inc"
+#include "query_markdown.inc"
+#include "query_markdown_inline.inc"
+#include "query_latex.inc"
+#include "query_bash.inc"
 
 /* (P) Zero denotes empty/default/success; one advances a byte/ordinal or
  * removes the string terminator. All sizes/counts come from the query ABI.
  * Predicate modes encode the exact expressions in the vendored queries.
  * Rust's all-caps expression ends in $' (end assertion then apostrophe), so
  * it can never match. Preserve that upstream behavior instead of fixing it. */
-enum predicate_mode { PRED_NONE, PRED_UPPER, PRED_CAPS, PRED_NEVER };
-struct hl_predicate { enum predicate_mode mode; uint32_t capture; };
+/* (P) Predicate shapes derive from operator + capture + string arguments;
+ * is-not-local has operator + property. Regex delimiters ^( and )$ each
+ * occupy two bytes, plus at least one literal alternative byte. */
+/* (P) Predicate steps are borrowed from TSQuery for its whole lifetime.
+ * Validate each upstream predicate before running; counts derive from ABI. */
+struct hl_predicate { const TSQueryPredicateStep *steps; uint32_t count; };
 
 const char *hl_scope_key(hl_scope scope)
 {
@@ -41,6 +57,23 @@ static hl_scope capture_scope(const char *name, uint32_t length)
     };
     for (size_t i = 0; i < sizeof map / sizeof map[0]; ++i)
         if (strlen(map[i].name) == length && !memcmp(map[i].name, name, length)) return map[i].scope;
+    /* Dotted captures inherit the common theme family; private predicate
+     * captures and unknown names retain default. */
+    static const struct { const char *name; hl_scope scope; } families[] = {
+        {"comment",HL_SCOPE_COMMENT}, {"keyword.operator",HL_SCOPE_OPERATOR},
+        {"keyword",HL_SCOPE_KEYWORD}, {"string",HL_SCOPE_STRING},
+        {"number",HL_SCOPE_NUMBER}, {"constant",HL_SCOPE_CONSTANT},
+        {"function",HL_SCOPE_FUNCTION}, {"type",HL_SCOPE_TYPE},
+        {"variable",HL_SCOPE_VARIABLE}, {"punctuation",HL_SCOPE_PUNCTUATION},
+        {"boolean",HL_SCOPE_CONSTANT}, {"character",HL_SCOPE_STRING},
+        {"text.literal",HL_SCOPE_STRING}, {"text.title",HL_SCOPE_TYPE},
+        {"text.uri",HL_SCOPE_STRING}, {"text.reference",HL_SCOPE_VARIABLE}
+    };
+    for (size_t i=0;i<sizeof families/sizeof families[0];i++) {
+        size_t n=strlen(families[i].name);
+        if (length>=n && !memcmp(name,families[i].name,n) &&
+            (length==n || name[n]=='.')) return families[i].scope;
+    }
     return HL_SCOPE_DEFAULT;
 }
 static bool query_string_is(const TSQuery *query, uint32_t id, const char *text)
@@ -48,6 +81,21 @@ static bool query_string_is(const TSQuery *query, uint32_t id, const char *text)
     uint32_t length;
     const char *value = ts_query_string_value_for_id(query, id, &length);
     return strlen(text) == length && !memcmp(value, text, length);
+}
+static bool literal_alternatives(const char *regex, size_t length)
+{
+    if (length<5u || memcmp(regex,"^(",2u) || memcmp(regex+length-2u,")$",2u)) return false;
+    bool empty=true;
+    for (size_t at=2u;at<length-2u;at++) {
+        char ch=regex[at];
+        if (ch=='|') { if (empty) return false; empty=true; }
+        else {
+            if (!(ch>='A' && ch<='Z') && !(ch>='a' && ch<='z') &&
+                !(ch>='0' && ch<='9') && ch!='_') return false;
+            empty=false;
+        }
+    }
+    return !empty;
 }
 void hl_query_destroy(hl_query *query)
 {
@@ -92,19 +140,40 @@ int hl_query_init_source(hl_query *query, const TSLanguage *language,
         uint32_t count;
         const TSQueryPredicateStep *steps = ts_query_predicates_for_pattern(query->query, i, &count);
         struct hl_predicate *predicate = &query->predicates[i];
-        *predicate = (struct hl_predicate){0};
-        if (!count) continue;
-        /* (P) match? + capture + regex + Done = four upstream steps. */
-        if (count != 4u || steps[0].type != TSQueryPredicateStepTypeString ||
-            !query_string_is(query->query, steps[0].value_id, "match?") ||
-            steps[1].type != TSQueryPredicateStepTypeCapture ||
-            steps[2].type != TSQueryPredicateStepTypeString ||
-            steps[3].type != TSQueryPredicateStepTypeDone) goto unsupported;
-        predicate->capture = steps[1].value_id;
-        if (query_string_is(query->query, steps[2].value_id, "^[A-Z]")) predicate->mode = PRED_UPPER;
-        else if (query_string_is(query->query, steps[2].value_id, "^[A-Z][A-Z\\d_]*$")) predicate->mode = PRED_CAPS;
-        else if (query_string_is(query->query, steps[2].value_id, "^[A-Z][A-Z\\d_]+$'")) predicate->mode = PRED_NEVER;
-        else goto unsupported;
+        *predicate = (struct hl_predicate){steps,count};
+        for (uint32_t at=0;at<count;) {
+            uint32_t end=at;
+            while (end<count && steps[end].type!=TSQueryPredicateStepTypeDone) end++;
+            if (end==count || steps[at].type!=TSQueryPredicateStepTypeString) goto unsupported;
+            uint32_t n=end-at;
+            if (query_string_is(query->query,steps[at].value_id,"is-not?")) {
+                /* Highlights-only has no locals query, so no local bindings. */
+                if (n!=2u || steps[at+1u].type!=TSQueryPredicateStepTypeString ||
+                    !query_string_is(query->query,steps[at+1u].value_id,"local")) goto unsupported;
+            } else {
+                if (n<3u || steps[at+1u].type!=TSQueryPredicateStepTypeCapture) goto unsupported;
+                for (uint32_t j=at+2u;j<end;j++)
+                    if (steps[j].type!=TSQueryPredicateStepTypeString) goto unsupported;
+                if (query_string_is(query->query,steps[at].value_id,"match?")) {
+                    if (n!=3u) goto unsupported;
+                    uint32_t regex_length;
+                    const char *regex=ts_query_string_value_for_id(query->query,steps[at+2u].value_id,&regex_length);
+                    /* Exact expressions in vendored queries: uppercase classes,
+                     * anchored alternatives, or a leading dash. */
+                    if (!(query_string_is(query->query,steps[at+2u].value_id,"^[A-Z]") ||
+                          query_string_is(query->query,steps[at+2u].value_id,"^[A-Z][A-Z\\d_]*$") ||
+                          query_string_is(query->query,steps[at+2u].value_id,"^[A-Z][A-Z\\d_]+$'") ||
+                          query_string_is(query->query,steps[at+2u].value_id,"^[A-Z][A-Z_]*$") ||
+                          query_string_is(query->query,steps[at+2u].value_id,"^[A-Z_][A-Z\\d_]+$") ||
+                          query_string_is(query->query,steps[at+2u].value_id,"^-") ||
+                          literal_alternatives(regex,regex_length))) goto unsupported;
+                } else if (query_string_is(query->query,steps[at].value_id,"eq?") && n!=3u) goto unsupported;
+                else if (!query_string_is(query->query,steps[at].value_id,"eq?") &&
+                           !query_string_is(query->query,steps[at].value_id,"any-of?") &&
+                           !query_string_is(query->query,steps[at].value_id,"has-ancestor?")) goto unsupported;
+            }
+            at=end+1u;
+        }
     }
     return HL_QUERY_OK;
 unsupported:
@@ -112,39 +181,99 @@ unsupported:
 }
 int hl_query_init(hl_query *query, const TSLanguage *language, hl_query_error *error)
 {
-    if (language == hl_language_c())
-        return hl_query_init_source(query, language, highlights_c, sizeof highlights_c - 1u, error);
-    if (language == hl_language_rust())
-        return hl_query_init_source(query, language, highlights_rust, sizeof highlights_rust - 1u, error);
-    return hl_query_init_source(query, language, NULL, 0, error);
+    const char *name=hl_language_name(language);
+    if (name) {
+#define QUERY(lang) if (!strcmp(name,#lang)) return hl_query_init_source(query,language,highlights_##lang,sizeof highlights_##lang-1u,error)
+        QUERY(c); QUERY(rust); QUERY(python); QUERY(javascript); QUERY(json);
+        QUERY(toml); QUERY(yaml); QUERY(julia); QUERY(typescript); QUERY(markdown);
+        QUERY(markdown_inline); QUERY(latex); QUERY(bash);
+#undef QUERY
+    }
+    return hl_query_init_source(query,language,NULL,0,error);
 }
-static int match_predicate(const struct hl_predicate *predicate, const TSQueryMatch *match,
-                           const piece_snapshot *snapshot, bool *accepted)
+static int node_equals(TSNode node, const piece_snapshot *snapshot,
+                       const char *text, size_t length, bool *equal)
 {
-    *accepted = predicate->mode == PRED_NONE;
-    if (predicate->mode == PRED_NONE || predicate->mode == PRED_NEVER) return HL_QUERY_OK;
-    for (uint16_t i = 0; i < match->capture_count; ++i) {
-        if (match->captures[i].index != predicate->capture) continue;
-        TSNode node = match->captures[i].node;
-        uint64_t first = ts_node_start_byte(node), end = ts_node_end_byte(node);
-        uint8_t byte;
-        if (first == end) return HL_QUERY_OK;
-        if (piece_snapshot_read(snapshot, first, &byte, sizeof byte) != PIECE_OK) return HL_QUERY_READ;
-        if (byte < 'A' || byte > 'Z') return HL_QUERY_OK;
-        if (predicate->mode == PRED_CAPS) {
-            /* (P) Worker scratch is the same Linux page-sized chunk as hl input;
-             * no identifier/source bound. Scan all bytes in successive chunks. */
-            uint8_t buffer[4096];
-            for (uint64_t at = first + 1u; at < end;) {
-                size_t length = end - at < sizeof buffer ? (size_t)(end - at) : sizeof buffer;
-                if (piece_snapshot_read(snapshot, at, buffer, length) != PIECE_OK) return HL_QUERY_READ;
-                for (size_t j = 0; j < length; ++j)
-                    if (!((buffer[j] >= 'A' && buffer[j] <= 'Z') ||
-                          (buffer[j] >= '0' && buffer[j] <= '9') || buffer[j] == '_')) return HL_QUERY_OK;
-                at += length;
-            }
+    uint64_t first=ts_node_start_byte(node), end=ts_node_end_byte(node);
+    *equal=false;
+    if (end-first!=length) return HL_QUERY_OK;
+    /* (P) page scratch matches hl_request input; unbounded chunk comparison. */
+    uint8_t bytes[sizeof ((hl_request *)0)->input];
+    for (size_t at=0;at<length;) {
+        size_t n=length-at<sizeof bytes ? length-at : sizeof bytes;
+        if (piece_snapshot_read(snapshot,first+at,bytes,n)!=PIECE_OK) return HL_QUERY_READ;
+        if (memcmp(bytes,text+at,n)) return HL_QUERY_OK;
+        at+=n;
+    }
+    *equal=true; return HL_QUERY_OK;
+}
+static int regex_match(TSNode node, const piece_snapshot *snapshot,
+                       const char *regex, size_t length, bool *accepted)
+{
+    *accepted=false;
+    uint64_t first=ts_node_start_byte(node), end=ts_node_end_byte(node);
+    if (first==end) return HL_QUERY_OK;
+    if (length>=5u && !memcmp(regex,"^(",2u)) {
+        for (size_t start=2u;start<length-2u;) {
+            size_t stop=start;
+            while (stop<length-2u && regex[stop]!='|') stop++;
+            int rc=node_equals(node,snapshot,regex+start,stop-start,accepted);
+            if (rc || *accepted) return rc;
+            start=stop+1u;
         }
-        *accepted = true;
+        return HL_QUERY_OK;
+    }
+    uint8_t byte;
+    if (piece_snapshot_read(snapshot,first,&byte,sizeof byte)!=PIECE_OK) return HL_QUERY_READ;
+    if (!strcmp(regex,"^-")) { *accepted=byte=='-'; return HL_QUERY_OK; }
+    if (regex[length-1u]=='\'') return HL_QUERY_OK; /* preserved Rust end-assertion quirk */
+    bool js=!strcmp(regex,"^[A-Z_][A-Z\\d_]+$");
+    if (!(byte>='A' && byte<='Z') && !(js && byte=='_')) return HL_QUERY_OK;
+    if (!strcmp(regex,"^[A-Z]")) { *accepted=true; return HL_QUERY_OK; }
+    if (js && end-first<2u) return HL_QUERY_OK; /* '+' requires following byte */
+    bool digits=strcmp(regex,"^[A-Z][A-Z_]*$")!=0;
+    uint8_t bytes[sizeof ((hl_request *)0)->input];
+    for (uint64_t at=first+1u;at<end;) {
+        size_t n=end-at<sizeof bytes ? (size_t)(end-at) : sizeof bytes;
+        if (piece_snapshot_read(snapshot,at,bytes,n)!=PIECE_OK) return HL_QUERY_READ;
+        for (size_t i=0;i<n;i++) if (!(bytes[i]>='A' && bytes[i]<='Z') &&
+            bytes[i]!='_' && !(digits && bytes[i]>='0' && bytes[i]<='9')) return HL_QUERY_OK;
+        at+=n;
+    }
+    *accepted=true; return HL_QUERY_OK;
+}
+static int match_predicate(const hl_query *query, const struct hl_predicate *predicate,
+                           const TSQueryMatch *match, const piece_snapshot *snapshot, bool *accepted)
+{
+    *accepted=true;
+    const TSQueryPredicateStep *steps=predicate->steps;
+    for (uint32_t at=0;at<predicate->count;) {
+        uint32_t end=at;
+        while (steps[end].type!=TSQueryPredicateStepTypeDone) end++;
+        if (query_string_is(query->query,steps[at].value_id,"is-not?")) { at=end+1u; continue; }
+        bool found=false;
+        for (uint16_t i=0;i<match->capture_count;i++) {
+            if (match->captures[i].index!=steps[at+1u].value_id) continue;
+            TSNode node=match->captures[i].node;
+            bool pass=false;
+            for (uint32_t j=at+2u;j<end;j++) {
+                uint32_t length;
+                const char *value=ts_query_string_value_for_id(query->query,steps[j].value_id,&length);
+                int rc=HL_QUERY_OK;
+                if (query_string_is(query->query,steps[at].value_id,"match?"))
+                    rc=regex_match(node,snapshot,value,length,&pass);
+                else if (query_string_is(query->query,steps[at].value_id,"has-ancestor?")) {
+                    for (TSNode parent=ts_node_parent(node);!ts_node_is_null(parent);parent=ts_node_parent(parent))
+                        if (strlen(ts_node_type(parent))==length && !memcmp(ts_node_type(parent),value,length)) { pass=true; break; }
+                } else rc=node_equals(node,snapshot,value,length,&pass);
+                if (rc) return rc;
+                if (pass) break;
+            }
+            if (!pass) { *accepted=false; return HL_QUERY_OK; }
+            found=true;
+        }
+        if (!found) { *accepted=false; return HL_QUERY_OK; }
+        at=end+1u;
     }
     return HL_QUERY_OK;
 }
@@ -163,11 +292,14 @@ int hl_query_run(hl_query *query, const TSTree *tree, const piece_snapshot *snap
     TSQueryMatch match;
     while (ts_query_cursor_next_match(query->cursor, &match)) {
         bool accepted;
-        int rc = match_predicate(&query->predicates[match.pattern_index], &match, snapshot, &accepted);
+        int rc = match_predicate(query, &query->predicates[match.pattern_index], &match, snapshot, &accepted);
         if (rc != HL_QUERY_OK) return rc;
         if (!accepted) continue;
         for (uint16_t i = 0; i < match.capture_count; ++i) {
             const TSQueryCapture *capture = &match.captures[i];
+            uint32_t capture_length;
+            const char *capture_name=ts_query_capture_name_for_id(query->query,capture->index,&capture_length);
+            if (capture_length && capture_name[0]=='_') continue;
             hl_span span = {ts_node_start_byte(capture->node), ts_node_end_byte(capture->node),
                            query->scopes[capture->index], match.pattern_index};
             if (span.first_byte < first) span.first_byte = first;

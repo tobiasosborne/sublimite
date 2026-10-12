@@ -124,7 +124,7 @@ void editor_retire_buffers(editor *e)
          * Retain its complete storage until explicit quiescent shutdown; never
          * guess at the private open/save/check handles or wait in this pump. */
         if (editor_clip_holds(e, b) || (b->save && savectl_get_model(b->save).can_recover_cancel) ||
-            b->find_leases || b->map_snapshot || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
+            b->find_leases || b->hl_leases || b->map_snapshot || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
         editor_session_forget(e, b);

@@ -1312,13 +1312,28 @@ static int script(bool raster)
     printf("editor_test: %s script and journal byte model passed\n", raster ? "raster" : "null");
     return 0;
 }
-static int allocation_test(bool raster)
+static int allocation_case(bool raster, bool highlight)
 {
     render_backend b = {0}; T((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
+    /* edit-11v: (P) C source keeps the existing insert/backspace oracle;
+     * suffix length comes from its spelling. Refresh is ns/second / panel Hz
+     * from perf/00-hardware-profile.md (M)[bat], supplied through the API. */
+    char source[]="build/editor-alloc-XXXXXX.c";
+    const char syntax_source[]="int main(void) { return 0; }\n"; /* P: C syntax fixture */
+    int source_fd=mkstemps(source,(int)(sizeof ".c"-1u)); T(source_fd>=0);
+    if (highlight) T(write(source_fd,syntax_source,sizeof syntax_source-1u)==(ssize_t)(sizeof syntax_source-1u));
+    close(source_fd);
     counted c = {0}; char path[] = "/tmp/editor-alloc-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
-    editor_config cfg = {.cols = 40, .rows = 8, .journal_path = path,
+    editor_config cfg = {.cols = 40, .rows = 8, .journal_path = path, .path=highlight ? source : NULL,
         .hook_ctx = &c, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    if (highlight) {
+        uint64_t interval=UINT64_C(1000000000)/90u;
+        /* Existing null submit timestamps are synthetic. Set a fresh physical
+         * stream identity above them, with monotonic fixture timestamps. */
+        T(editor_on_refresh(e,0,e->refresh_sequence+1u,e->refresh_ns+interval,false)==0);
+        T(editor_on_refresh(e,0,e->refresh_sequence+1u,e->refresh_ns+interval,false)==0);
+    }
     for (unsigned i = 0; i < 10000; i += 100) {
         for (unsigned j = 0; j < 100; j++) {
             plat_event ev = j % 2 ? key(XKB_KEY_BackSpace, 0, NULL) : key('x', 0, "x");
@@ -1328,13 +1343,17 @@ static int allocation_test(bool raster)
     }
     T(!c.active && !c.suspended);
     if (c.allocations) fprintf(stderr, "editor allocation diagnostic: backend=%s allocations=%zu\n", raster ? "raster" : "null", c.allocations);
-    T(c.allocations == 0); T(editor_length(e) == 0);
+    T(c.allocations == 0); T(editor_length(e) == (highlight ? sizeof syntax_source-1u : 0u));
     editor_stats s = editor_get_stats(e); T(s.mutations == 10000 && s.journal_records == 10000 && !s.journal_error);
-    T(editor_flush(e) == 0); editor_close(e); unlink(path);
-    printf("editor_test: %s 10000 keys mallocs=%zu guard=%s\n", raster ? "raster" : "null", c.allocations,
+    T(editor_flush(e) == 0);
+    if (highlight) T(e->hl.generation && e->hl.language);
+    editor_close(e); unlink(path); unlink(source);
+    printf("editor_test: %s%s 10000 keys mallocs=%zu guard=%s\n", raster ? "raster" : "null", highlight ? " hl-on" : "", c.allocations,
         edit_malloc_guard_active() ? "active" : "ASan-inert");
     return 0;
 }
+static int allocation_test(bool raster) { return allocation_case(raster,false); }
+
 /* G11: one blink must leave the strip/fence pool asleep. Force its deadline
  * rather than wait for a noisy wall-clock interval. */
 static int raster_blink_damage(void)
@@ -4468,6 +4487,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--48u-drag")) return pointer_autoscroll_contract(false);
         if (!strcmp(argv[1], "--48u-drag-wrap")) return pointer_autoscroll_contract(true);
         if (!strcmp(argv[1], "--48u-escape")) return findpanel_escape_contract();
+        if (!strcmp(argv[1], "--hl-allocation")) return allocation_case(false,true);
         if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
         if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
         if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
@@ -4581,7 +4601,7 @@ int main(int argc, char **argv)
     }
     T(scrolled_undo() == 0);
     T(stopped_error() == 0);
-    T(script(false) == 0); T(allocation_test(false) == 0);
+    T(script(false) == 0); T(allocation_test(false) == 0); T(allocation_case(false,true) == 0);
     if (!headless) {
         T(script(true) == 0); T(allocation_test(true) == 0);
         T(raster_blink_damage() == 0);

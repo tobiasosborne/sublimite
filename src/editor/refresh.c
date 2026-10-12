@@ -14,6 +14,10 @@ static int observe(editor *e, uint32_t id, uint64_t seq, uint64_t ns,
         const editor_frame *frame = &e->refresh_frames[i];
         if (id && frame->id == id) { observation.frame = *frame; observation.metadata_valid = true; break; }
     }
+    /* (P) elapsed time / elapsed physical refresh opportunities. Synthetic
+     * submit completions cannot measure a display interval. */
+    if (!synthetic && e->refresh_sequence && ns > e->refresh_ns)
+        e->hl.refresh_interval_ns = (ns-e->refresh_ns)/(seq-e->refresh_sequence);
     e->refresh_sequence = seq; e->refresh_ns = ns;
     if (e->cfg.on_refresh) e->cfg.on_refresh(e->cfg.hook_ctx, &observation);
     return 0;
