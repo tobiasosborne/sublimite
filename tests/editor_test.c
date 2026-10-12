@@ -3807,17 +3807,20 @@ static int gutter_click_contract(void)
         const editor_hit *hit=&e->hits[(size_t)row*e->max_cols+c];
         T(hit->width && hit->before==start && hit->after==start);
     }
+    /* edit-dr3: a gutter click selects the line through its newline (P:
+     * the next row's start, every fixture line being one row wide). */
+    uint64_t next=e->row_byte[row+1]; T(next!=LAYOUT_VOID_ROW && next>start);
     plat_event click=pointer_event(e,PLAT_EV_BUTTON,row,0,true,trace_now_ns()); click.x=0;
-    T(press(e,click)==0); T(editor_view(e).selection.cursor==start);
+    T(press(e,click)==0); T(editor_view(e).selection.anchor==start && editor_view(e).selection.cursor==next);
     click.press=false; T(press(e,click)==0);
     /* A stale old-EOF hit must never be consulted, even if its width is zero.
-     * Reset the click chain to test an ordinary caret-placement click. */
+     * Reset the click chain to test an ordinary single gutter click. */
     e->click_ns=0;
     e->hits[(size_t)row*e->max_cols]=(editor_hit){old_eof,old_eof,0,1};
     edit_malloc_guard_begin();
     click.press=true; T(press(e,click)==0);
     T(edit_malloc_guard_end()==0);
-    T(editor_view(e).selection.cursor==start && editor_view(e).selection.anchor==start);
+    T(editor_view(e).selection.anchor==start && editor_view(e).selection.cursor==next);
     editor_close(e); puts("edit-m15 gutter: filled viewport ignores stale old EOF passed"); return 0;
 }
 static int find_follow_before_top_contract(void)
@@ -3868,7 +3871,9 @@ static int gutter_growth_contract(void)
     e->hits[old_gw]=(editor_hit){start+1,start+2,0,1};
     plat_event click=pointer_event(e,PLAT_EV_BUTTON,0,0,true,trace_now_ns());
     click.x=(int32_t)(old_gw*e->grid.dims.cell_w);
-    T(press(e,click)==0); T(editor_view(e).selection.cursor==start);
+    /* edit-dr3: whole-line selection; one line is the literal's bytes (P). */
+    T(press(e,click)==0);
+    T(editor_view(e).selection.anchor==start && editor_view(e).selection.cursor==start+sizeof line-1);
     editor_close(e); puts("edit-m15 gutter: decimal widening ignores old text hit passed"); return 0;
 }
 static int gutter_wrap_contract(void)
@@ -3881,11 +3886,59 @@ static int gutter_wrap_contract(void)
     editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
     T(e->lay.wrap_rows[1].continuation && e->row_byte[1]>0);
     plat_event click=pointer_event(e,PLAT_EV_BUTTON,1,0,true,trace_now_ns()); click.x=0;
-    T(press(e,click)==0); T(editor_view(e).selection.cursor==0);
+    /* edit-dr3: the sole logical line has no newline, so it selects to EOF (P). */
+    T(press(e,click)==0); T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==sizeof text);
     for (uint32_t c=0;c<e->lay.gw;c++) {
         const editor_hit *hit=&e->hits[e->max_cols+c]; T(hit->width && hit->before==0 && hit->after==0);
     }
     editor_close(e); puts("edit-m15 gutter: wrapped continuation uses logical line start passed"); return 0;
+}
+/* edit-dr3: Sublime's gutter rule (docs/reviews/astra-vs-sublime-3.md §15).
+ * Geometry reuses pointer_review_open; x=0 is the gutter's first cell (P).
+ * L is one fixture line's bytes from the literal; row r starts at r*L (P). */
+static plat_event gutter_event(editor *e, plat_ev_kind kind, uint32_t row, bool down, uint16_t mods)
+{
+    plat_event ev=pointer_event(e,kind,row,0,down,trace_now_ns());
+    ev.x=0; ev.mods=mods; return ev;
+}
+static int gutter_line_contract(void)
+{
+    const uint64_t L=sizeof "alpha beta\n"-1;
+    render_backend backend={0}; editor *e=NULL;
+    T(pointer_review_open(&e,&backend,false)==0);
+    T(e->row_byte[1]==L && e->row_byte[4]==4u*L);
+    edit_malloc_guard_begin();
+    /* Click selects the clicked line, newline included. */
+    plat_event ev=gutter_event(e,PLAT_EV_BUTTON,1,true,0);
+    T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==L && e->v.state.selection.cursor==2u*L);
+    /* Drag extends by whole lines, in the gutter and over text. */
+    ev=gutter_event(e,PLAT_EV_MOTION,3,false,0); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==L && e->v.state.selection.cursor==4u*L);
+    ev=pointer_event(e,PLAT_EV_MOTION,3,2,false,trace_now_ns()); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==L && e->v.state.selection.cursor==4u*L);
+    ev=gutter_event(e,PLAT_EV_MOTION,0,false,0); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==2u*L && e->v.state.selection.cursor==0);
+    ev=gutter_event(e,PLAT_EV_BUTTON,0,false,0); T(press(e,ev)==0);
+    /* Shift+click extends from the anchor to the clicked line's far edge. */
+    ev=gutter_event(e,PLAT_EV_BUTTON,1,true,0); T(press(e,ev)==0);
+    ev.press=false; T(press(e,ev)==0);
+    ev=gutter_event(e,PLAT_EV_BUTTON,4,true,PLAT_MOD_SHIFT); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==L && e->v.state.selection.cursor==5u*L);
+    ev.press=false; T(press(e,ev)==0);
+    ev=gutter_event(e,PLAT_EV_BUTTON,0,true,PLAT_MOD_SHIFT); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==L && e->v.state.selection.cursor==0);
+    ev.press=false; T(press(e,ev)==0);
+    T(edit_malloc_guard_end()==0);
+    editor_close(e);
+    /* The last line without a trailing newline selects to EOF. */
+    static const char tail[]="one\ntwo";
+    T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)tail,.initial_len=sizeof tail-1,.cols=40,.rows=8,.wrap_mode=-1};
+    T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    ev=gutter_event(e,PLAT_EV_BUTTON,1,true,0); T(press(e,ev)==0);
+    T(e->v.state.selection.anchor==sizeof "one\n"-1 && e->v.state.selection.cursor==sizeof tail-1);
+    editor_close(e); puts("edit-dr3 gutter: click/drag/Shift+click select whole lines passed"); return 0;
 }
 static int mouse_contract(void)
 {
@@ -4492,6 +4545,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
         if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
         if (!strcmp(argv[1], "--m15-follow")) return find_follow_before_top_contract();
+        if (!strcmp(argv[1], "--dr3-gutter")) return gutter_line_contract();
         if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
         if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
@@ -4571,6 +4625,7 @@ int main(int argc, char **argv)
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);
     T(pointer_autoscroll_contract(false)==0); T(pointer_autoscroll_contract(true)==0); T(findpanel_escape_contract()==0);
     T(gutter_click_contract()==0); T(gutter_growth_contract()==0); T(gutter_wrap_contract()==0);
+    T(gutter_line_contract()==0);
     T(find_follow_before_top_contract()==0);
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
     T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);

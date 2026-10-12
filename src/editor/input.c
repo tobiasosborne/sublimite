@@ -1274,11 +1274,16 @@ int editor_pointer(editor *e, const plat_event *ev)
             e->click_id==e->buffer->id && e->click_generation==e->buffer->source_generation;
         e->click_id=e->buffer->id; e->click_generation=e->buffer->source_generation; e->click_button=ev->code;
         e->click_count=chain ? e->click_count%3u+1u : 1u;
-        e->text_drag_mode=(ev->mods&PLAT_MOD_SHIFT) ? 1u : e->click_count;
+        /* edit-dr3: a gutter press is Sublime's line selection: it selects the
+         * clicked line, drags by whole lines (mode 3, the triple-click unit)
+         * and with Shift extends from the retained anchor to that line. */
+        bool shift=(ev->mods&PLAT_MOD_SHIFT)!=0, gutter=(uint32_t)col<e->lay.gw;
+        e->text_drag_mode=gutter ? 3u : shift ? 1u : e->click_count;
         e->click_ns=now; e->click_row=(uint32_t)row; e->click_col=(uint32_t)col; e->click_byte=byte;
-        if (!(ev->mods&PLAT_MOD_SHIFT)) e->v.state.selection.anchor=byte;
-        if (e->click_count>1 && !(ev->mods&PLAT_MOD_SHIFT)) {
-            e->pointer_unit_pending=true; e->pointer_unit_initial=true;
+        if (gutter && shift) e->text_drag_lo=e->text_drag_hi=e->v.state.selection.anchor;
+        if (!shift || gutter) e->v.state.selection.anchor=byte;
+        if (gutter || (e->click_count>1 && !shift)) {
+            e->pointer_unit_pending=true; e->pointer_unit_initial=!shift;
             editor_seed_view_lines(e); e->action=EDITOR_ACTION_MOVE;
             view_change change;
             int rc=view_command(&e->v,e->click_count==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE,false,NULL,0,&change);
