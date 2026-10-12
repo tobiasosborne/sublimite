@@ -337,4 +337,22 @@ int journal_check_base(const journal_base *base);
 /* Apply INSERT/DELETE to a supplied tree; BASE and session records handled by
  * caller (check/load base before edits); SAVE is metadata. Range failure returns INVALID. */
 int journal_apply_piece(piece_tree *tree, const journal_record *record);
+/* Startup/manual tooling: CRC-checked read-only scan, no truncation or BASE
+ * validation. Caller must reject corrupt results before destructive actions. */
+int journal_scan_file(const char *path, journal_visit visit, void *ctx,
+                      journal_replay_result *result);
+/* Startup housekeeping; current is the leased destination, excluded from
+ * discovery. Edits, conflicts, corruption and live leases always pin artifacts.
+ * Oldest eligible artifacts are removed to the measured byte cap. */
+#define JOURNAL_ARTIFACT_BYTES (32u * (JOURNAL_PAGE + sizeof "base" - 1u))
+/* (M)[AC]: edit-rfq fixture: observed profile count 32 * (4096-byte sealed
+ * empty journal + strlen("base")=4-byte retained original) = 131200 bytes.
+ * (E): reuse that observed footprint as the eligible-artifact retention cap. */
+int journal_retire_directory(const char *directory, const char *current);
+/* Manual recovery onto explicitly supplied bytes. id=0 selects only when
+ * unambiguous. Dry run validates and prints; apply durably replaces the file.
+ * Never modifies the source journal. Conflicting BASE identity is printed;
+ * the supplied file, selected by the operator, is the replay starting point. */
+int journal_manual_replay(const char *source, const char *target, uint64_t id,
+                          bool apply, FILE *output);
 #endif

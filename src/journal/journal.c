@@ -220,6 +220,7 @@ typedef struct replay_source {
     int fd;
     uint8_t *scratch;
     const journal_io *io;
+    bool readonly; /* edit-rfq scan: no BASE validation, no truncation */
 } replay_source;
 static int replay_read(replay_source *source, uint64_t off, uint64_t seq,
                        const journal_crc *table, const uint8_t **out, size_t *size)
@@ -249,7 +250,7 @@ static int replay_read(replay_source *source, uint64_t off, uint64_t seq,
 static int replay_deliver(replay_source *source, const uint8_t *p, size_t n,
                           journal_visit visit, void *ctx, journal_replay_result *result)
 {
-    if(source->fd>=0 && u32(p+8)==JOURNAL_BASE) {
+    if(source->fd>=0 && !source->readonly && u32(p+8)==JOURNAL_BASE) {
         journal_record rec={JOURNAL_BASE,u64(p+24),u64(p+16),p+JOURNAL_HEADER,n-JOURNAL_HEADER};
         journal_base base; char path[sizeof base.captured_path];
         int rc=journal_decode_base(&rec,&base,path,sizeof path);
@@ -296,17 +297,21 @@ int journal_replay_bytes(const uint8_t *bytes, size_t size, journal_visit visit,
     replay_source source={.bytes=bytes,.size=size,.fd=-1};
     return replay_source_records(&source,visit,ctx,result);
 }
-int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx, journal_replay_result *result, const journal_io *io)
+static int replay_file_mode(const char *path, journal_visit visit, void *ctx, journal_replay_result *result, const journal_io *io, bool readonly)
 {
     if(!path || !result) return JOURNAL_INVALID;
-    *result=(journal_replay_result){0}; int fd=open(path,O_RDWR|O_CLOEXEC|O_NOFOLLOW);
+    *result=(journal_replay_result){0}; int fd=open(path,(readonly?O_RDONLY:O_RDWR)|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
     if(fd<0) return JOURNAL_IO;
     edit_arena a; if(edit_arena_init(&a,JOURNAL_MAX_RECORD)) { close(fd); return JOURNAL_NOMEM; }
-    replay_source source={.fd=fd,.scratch=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16),.io=io};
+    replay_source source={.fd=fd,.scratch=edit_arena_alloc(&a,JOURNAL_MAX_RECORD,16),.io=io,.readonly=readonly};
     int rc=replay_source_records(&source,visit,ctx,result);
-    if(!rc && result->corrupt) { if(ftruncate(fd,(off_t)result->valid_bytes)) rc=JOURNAL_IO; else rc=data_sync(fd); }
+    if(!readonly && !rc && result->corrupt) { if(ftruncate(fd,(off_t)result->valid_bytes)) rc=JOURNAL_IO; else rc=data_sync(fd); }
     edit_arena_free(&a); close(fd); return rc;
 }
+int journal_scan_file(const char *path, journal_visit visit, void *ctx, journal_replay_result *result)
+{ return replay_file_mode(path,visit,ctx,result,NULL,true); }
+int journal_replay_file_with_io(const char *path, journal_visit visit, void *ctx, journal_replay_result *result, const journal_io *io)
+{ return replay_file_mode(path,visit,ctx,result,io,false); }
 int journal_replay_file(const char *path, journal_visit visit, void *ctx, journal_replay_result *result)
 { return journal_replay_file_with_io(path,visit,ctx,result,NULL); }
 static bool stat_equal(const struct stat *a, const struct stat *b)

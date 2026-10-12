@@ -304,6 +304,9 @@ int editor_session_restore(editor *e)
     char directory[IPC_PATH_CAP]; strcpy(directory, path);
     char *slash = strrchr(directory, '/');
     if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
+    /* Housekeeping is best effort: a failed barrier leaves safe retired bytes,
+     * and a busy lease preserves the source. Never block session recovery. */
+    (void)journal_retire_directory(directory, path);
     char previous[IPC_PATH_CAP] = ""; int previous_fd = -1;
     if (e->recover_existing) {
         strcpy(previous, path); previous_fd = dup(e->session_lock);
