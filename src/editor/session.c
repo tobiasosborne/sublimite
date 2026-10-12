@@ -28,7 +28,7 @@ typedef struct session_capture {
     uint64_t active_id, request_ns;
     uint32_t width, height;
     journal_base replacement;
-    bool finish;
+    bool finish, cancelling;
     journal_record *records;
     size_t count, capacity;
 } session_capture;
@@ -38,8 +38,9 @@ struct editor_session {
     size_t width;
     session_capture capture;
     editor_buffer *saving;
-    bool pending, finishing, blocked;
+    bool pending, finishing, blocked, reconciling;
     uint64_t pending_submit_ns;
+    uint64_t retry_id, retry_ns;
 };
 static void put64(uint8_t *p, uint64_t value)
 { for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(value >> (8u * i)); }
@@ -175,7 +176,7 @@ static int encode_leaf(session_capture *c, session_node *n)
     const journal_base *base = &n->base;
     /* All buffers associated with the replaced target must have a valid new
      * BASE. Full snapshot deltas preserve their own (possibly different) text. */
-    if (c->finish && !strcmp(b->save_path, c->selected->save_path)) base = &c->replacement;
+    if ((c->finish || c->cancelling) && !strcmp(b->save_path, c->selected->save_path)) base = &c->replacement;
     size_t base_size = 40 + strlen(base->path) + 1 + (*base->path ? 8u : 0u);
     uint8_t *data = record(c, JOURNAL_BASE, b->id, base_size); if (!data) return JOURNAL_NOMEM;
     int rc = journal_encode_base(base, data, base_size, &base_size); if (rc) return rc;
@@ -298,20 +299,42 @@ static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finis
     *c = (session_capture){.owner = s, .root = s->root, .selected = b,
         .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
         .request_ns = request_ns, .width = e->font.window_width,
-        .height = e->font.window_height, .finish = finish};
+        .height = e->font.window_height, .finish = finish, .cancelling = s->reconciling && !finish};
     pthread_mutex_lock(&s->mutex); c->root->refs++;
     c->snapshot = piece_snapshot_retain(leaf_at(s, b->session_slot)->snapshot);
     pthread_mutex_unlock(&s->mutex);
     if (finish) base_copy(&c->replacement, savectl_saved_base(b->save));
+    else if (s->reconciling) c->replacement.path = "";
 }
 static int start(editor *e, bool finish);
-int editor_save_request(editor *e, uint64_t request_ns)
+/* (P) Zero in retry bookkeeping denotes no pending identity/timestamp/error,
+ * following the existing session/controller return-code contract. */
+static void start_failed(editor_session *s, editor_buffer *b, int rc)
 {
-    editor_session *s = e->session; editor_buffer *b = e->buffer;
-    if (!s || !b->save || s->saving || b->source_stale || b->pending_open) {
+    b->save_error = b->operation_error = rc; b->save_tracking = false;
+    if (s->reconciling) { s->blocked = true; s->reconciling = false; s->retry_id = 0; }
+    else s->saving = NULL;
+}
+static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
+{
+    editor_session *s = e->session;
+    if (!s || !b->save || b->pending_open) {
         if (!b->save) b->save_error = b->operation_error = FILE_ERR_STATE;
         return 0;
     }
+    if (s->saving) {
+        if (!s->blocked) return 0;
+        savectl_model model = savectl_get_model(s->saving->save);
+        /* Resolve the old slot even when Ctrl+S belongs to another tab.
+         * Keep its identity rather than a potentially evicted buffer pointer. */
+        s->retry_id = b->id; s->retry_ns = request_ns;
+        s->reconciling = true; s->blocked = false; s->pending = true;
+        s->pending_submit_ns = 0;
+        s->finishing = model.needs_finish;
+        capture(e, s->saving, request_ns ? request_ns : trace_now_ns(), model.needs_finish);
+        return editor_begin_frame(e);
+    }
+    if (b->source_stale) return 0;
     session_node *leaf = leaf_at(s, b->session_slot);
     if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != tabs_count(&e->tabs)) {
         b->save_error = b->operation_error = FILE_ERR_NOMEM; return 0;
@@ -323,15 +346,18 @@ int editor_save_request(editor *e, uint64_t request_ns)
     if (!e->journal_waiting && !e->op_count && !e->journal_group_open) {
         s->pending = false;
         int rc = start(e, false);
-        if (rc) { b->save_error = b->operation_error = rc; b->save_tracking = false; s->saving = NULL; }
+        if (rc) start_failed(s, b, rc);
     }
     return editor_begin_frame(e);
 }
+int editor_save_request(editor *e, uint64_t request_ns)
+{ return request_buffer(e, e->buffer, request_ns); }
 static int start(editor *e, bool finish)
 {
     session_capture *c = &e->session->capture;
     savectl_request request = {c->snapshot, c, prepare, release, c->request_ns};
-    int rc = finish ? savectl_finish_request(c->selected->save, &request) :
+    int rc = e->session->reconciling ? savectl_recover_request(c->selected->save, &request, finish) :
+             finish ? savectl_finish_request(c->selected->save, &request) :
                       savectl_save_request(c->selected->save, &request);
     if (rc) { piece_snapshot_release(c->snapshot); release(c); }
     return rc;
@@ -344,21 +370,47 @@ void editor_save_tick(editor *e)
     savectl_tick(b->save); savectl_model model = savectl_get_model(b->save);
     if (s->pending && !e->journal_waiting && !e->op_count && !e->journal_group_open && !model.busy) {
         s->pending = false;
-        int rc = start(e, false);
-        if (rc) { b->save_error = b->operation_error = rc; b->save_tracking = false; s->saving = NULL; }
+        int rc = start(e, s->capture.finish);
+        if (rc) start_failed(s, b, rc);
         else if (s->pending_submit_ns) {
             savectl_model started = savectl_get_model(b->save);
             (void)savectl_status_frame_submitted(b->save, started.request_id, s->pending_submit_ns);
         } else (void)editor_begin_frame(e);
         return;
     }
+    if (s->reconciling && !s->pending && !model.busy && !model.needs_finish && !model.can_recover_cancel) {
+        /* CURRENT cancellation uses an empty BASE plus full snapshot deltas;
+         * verified finish uses the replacement BASE. Neither marks later
+         * edits clean. The queued fresh save establishes its own cutoff. */
+        for (size_t i = 0; i < e->buffer_capacity; i++) {
+            editor_buffer *other = e->buffers[i];
+            if (!other || strcmp(other->save_path, b->save_path)) continue;
+            base_copy(&other->base, &s->capture.replacement);
+            if (s->finishing) {
+                if (other->file) (void)file_resolve_keep(other->file);
+                other->source_stale = false; other->watch_pending = false;
+            }
+            editor_session_publish(e, other);
+        }
+        uint64_t retry_id = s->retry_id, retry_ns = s->retry_ns;
+        s->saving = NULL; s->reconciling = false; s->retry_id = 0;
+        for (size_t i = 0; i < e->buffer_capacity; i++) {
+            editor_buffer *retry = e->buffers[i];
+            if (retry && !retry->retired && retry->id == retry_id) {
+                int rc = request_buffer(e, retry, retry_ns);
+                if (rc) retry->save_error = retry->operation_error = rc;
+                break;
+            }
+        }
+        (void)editor_begin_frame(e); e->paint_ready = false; return;
+    }
     if (!model.busy && !s->pending && (model.state == SAVECTL_FAILED ||
         model.state == SAVECTL_EXTERNAL_MODIFIED || model.state == SAVECTL_EXTERNAL_UNMODIFIED)) {
         b->save_error = b->operation_error = model.file_error ? model.file_error : model.journal_error;
         b->save_errno = b->operation_errno = model.err_no; b->save_tracking = false;
-        /* A retained token is still recovery state. Keep its controller and
-         * forbid a fresh save; unrelated buffers continue editing. */
+        /* Retain recovery ownership until a later Ctrl+S reconciles CURRENT. */
         s->blocked = model.can_recover_cancel || model.needs_finish;
+        s->reconciling = false; s->retry_id = 0;
         if (!s->blocked) s->saving = NULL;
         (void)editor_begin_frame(e); e->paint_ready = false; return;
     }

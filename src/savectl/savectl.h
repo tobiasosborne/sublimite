@@ -158,6 +158,10 @@ int savectl_recover_finish(savectl *s, const journal_record *checkpoint, size_t 
  * target namespace, publish checkpoint, then retire retention. Never installs
  * Saved; kept content remains modified. Failure preserves the recovery token. */
 int savectl_recover_cancel(savectl *s, const journal_record *checkpoint, size_t count);
+/* Recovery counterpart of finish_request: worker-prepared complete CURRENT,
+ * with the same snapshot/context ownership contract. finish selects verified
+ * replacement reconciliation; otherwise cancel the retained failed token. */
+int savectl_recover_request(savectl *s, const savectl_request *request, bool finish);
 const journal_base *savectl_saved_base(const savectl *s);
 /* Shared-target reconciliation on UI after a known replacement. The borrowed
  * identity is immutable until the next controller operation. Rebase is CPU

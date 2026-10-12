@@ -289,15 +289,29 @@ static void worker(work_ctx *ctx)
             piece_snapshot_release(s->task.snapshot);
             if (s->task.request_mode) s->task.request.release(s->task.request.ctx);
         } else if (op==OP_CANCEL) {
+            savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
+            if (s->task.request_mode)
+                r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
             r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
-            if(!r->file_error) r->journal_error=journal_save_cancel(s->options.journal,&lease->token,s->task.checkpoint,s->task.count);
+            if(!r->file_error && !r->journal_error)
+                r->journal_error=journal_save_cancel(s->options.journal,&lease->token,checkpoint.records,checkpoint.count);
+            if (s->task.request_mode) {
+                piece_snapshot_release(s->task.snapshot);
+                s->task.request.release(s->task.request.ctx);
+            }
         } else if (op==OP_FINISH || op==OP_RECOVER_FINISH) {
             savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
             if (s->task.request_mode)
                 r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
             r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
-            if (!r->file_error && op==OP_RECOVER_FINISH)
-                r->journal_error=journal_rotate(s->options.journal,checkpoint.records,checkpoint.count);
+            if (!r->file_error && !r->journal_error && op==OP_RECOVER_FINISH) {
+                /* CURRENT may include newly appended edits. Drain their
+                 * batch before rotation; damaged/full logs are precisely
+                 * why recovery publishes a fresh complete generation. */
+                int rc=journal_flush(s->options.journal);
+                if (rc && rc!=JOURNAL_IO && rc!=JOURNAL_FULL) r->journal_error=rc;
+                else r->journal_error=journal_rotate(s->options.journal,checkpoint.records,checkpoint.count);
+            }
             if (!r->file_error && !r->journal_error)
                 r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
                     checkpoint.records,checkpoint.count);
@@ -531,6 +545,18 @@ int savectl_recover_cancel(savectl *s, const journal_record *checkpoint, size_t 
     s->task.request_mode=false;
     s->task.checkpoint=checkpoint; s->task.count=count;
     int rc=submit(s,OP_CANCEL); if(!rc) s->state=SAVECTL_SAVING;
+    return rc;
+}
+int savectl_recover_request(savectl *s, const savectl_request *request, bool finish)
+{
+    /* (P) Index zero denotes the first byte/empty retained-path sentinel. */
+    if (!s || !s->options.journal || !request || !request->snapshot ||
+        !request->prepare || !request->release) return SAVECTL_INVALID;
+    if (s->closing || s->active || (finish ? !s->needs_finish :
+        (!s->token.prepared && !s->token.previous_path[0]))) return SAVECTL_BUSY;
+    s->task.snapshot=request->snapshot; s->task.request=*request; s->task.request_mode=true;
+    int rc=submit(s,finish ? OP_RECOVER_FINISH : OP_CANCEL);
+    if (!rc) s->state=SAVECTL_SAVING;
     return rc;
 }
 const file_id *savectl_target_identity(const savectl *s) { return &s->baseline; }

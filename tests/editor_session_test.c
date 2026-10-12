@@ -5,6 +5,7 @@
 #include "trace/trace.h"
 #include <fcntl.h>
 #include <dirent.h>
+#include <limits.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -41,10 +42,14 @@ static int saved(editor *e)
     while (editor_save_active(e)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
     return settle(e);
 }
-static int open_fixture(fixture *f, bool journalling, bool missing)
+static int open_fixture_at(fixture *f, bool journalling, bool missing, bool nested_target)
 {
     strcpy(f->directory, "build/editor-session-XXXXXX"); T(mkdtemp(f->directory));
-    T(snprintf(f->path, sizeof f->path, "%s/source", f->directory) > 0);
+    if (nested_target) {
+        T(snprintf(f->path, sizeof f->path, "%s/target", f->directory) > 0);
+        T(mkdir(f->path, 0700) == 0); /* (P) owner read/write/search Unix bits */
+    }
+    T(snprintf(f->path, sizeof f->path, "%s/%ssource", f->directory, nested_target ? "target/" : "") > 0);
     T(snprintf(f->log, sizeof f->log, "%s/journal", f->directory) > 0);
     int fd;
     if (!missing) { fd = open(f->path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0); T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd); }
@@ -53,6 +58,8 @@ static int open_fixture(fixture *f, bool journalling, bool missing)
         .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* tab + text + status */
     T(editor_open(&f->e, &config, &f->backend) == 0); return settle(f->e);
 }
+static int open_fixture(fixture *f, bool journalling, bool missing)
+{ return open_fixture_at(f, journalling, missing, false); }
 static void close_fixture(fixture *f)
 {
     editor_close(f->e); unlink(f->path); unlink(f->log);
@@ -168,6 +175,102 @@ static int failed_inactive(void)
     T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
     T(disk_is(f.path, "external") == 0);
     close_fixture(&f); return 0;
+}
+/* (E) Fault shapes: remove the temporary name after data sync, or close the
+ * target directory after rename. Both fail after PREPARED. (P) Zero below
+ * denotes C initialization, the first byte, or Unix success/absence. */
+typedef struct retry_fault {
+    const char *directory;
+    struct stat identity;
+    bool after_rename;
+    atomic_bool removed;
+} retry_fault;
+static void remove_save_temp(void *ctx, int phase)
+{
+    retry_fault *fault = ctx;
+    if (atomic_load(&fault->removed)) return;
+    if (fault->after_rename) {
+        if (phase != FILE_STEP_RENAMED) return;
+        /* (E) Enumerate actual open descriptors, with no guessed scan bound.
+         * Closing the writer's target directory injects its fsync failure. */
+        DIR *descriptors = opendir("/proc/self/fd");
+        if (!descriptors) return;
+        struct dirent *entry;
+        while ((entry = readdir(descriptors))) {
+            char *end;
+            long value = strtol(entry->d_name, &end, 10); /* (P) decimal procfs descriptor names */
+            if (*end || value < 0 || value > INT_MAX) continue;
+            int fd = (int)value;
+            struct stat identity;
+            if (!fstat(fd, &identity) && S_ISDIR(identity.st_mode) &&
+                identity.st_dev == fault->identity.st_dev && identity.st_ino == fault->identity.st_ino &&
+                close(fd) == 0) atomic_store(&fault->removed, true);
+        }
+        (void)closedir(descriptors); return;
+    }
+    if (phase != FILE_STEP_FSYNCED) return;
+    DIR *directory = opendir(fault->directory);
+    if (!directory) return;
+    struct dirent *entry;
+    while ((entry = readdir(directory)))
+        if (!strncmp(entry->d_name, ".source.edit-", strlen(".source.edit-")) &&
+            unlinkat(dirfd(directory), entry->d_name, 0) == 0)
+            atomic_store(&fault->removed, true);
+    (void)closedir(directory);
+}
+static int recoverable_save_retry(bool other_tab, bool after_rename)
+{
+    fixture f = {0}; T(open_fixture_at(&f, true, false, after_rename) == 0);
+    editor_buffer *owner = f.e->buffer;
+    char target_directory[IPC_PATH_CAP];
+    T(snprintf(target_directory, sizeof target_directory, "%s%s", f.directory, after_rename ? "/target" : "") > 0);
+    retry_fault fault = {.directory = target_directory, .after_rename = after_rename};
+    T(stat(target_directory, &fault.identity) == 0);
+    T(savectl_set_step_hook(owner->save, remove_save_temp, &fault) == 0);
+    T(press(f.e, 'x', 0, "x") == 0);
+    T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+    savectl_model model = savectl_get_model(owner->save);
+    T(atomic_load(&fault.removed) && model.state == SAVECTL_FAILED && model.can_recover_cancel);
+    T(model.needs_finish == after_rename);
+    T(savectl_save_token(owner->save)->prepared && owner->save_error && !f.e->error);
+    T(disk_is(f.path, after_rename ? "xbase" : "base") == 0);
+    char retained[IPC_PATH_CAP]; strcpy(retained, savectl_save_token(owner->save)->previous_path);
+    T(access(retained, F_OK) == 0);
+    char other[IPC_PATH_CAP];
+    if (other_tab) {
+        T(snprintf(other, sizeof other, "%s/other", f.directory) > 0);
+        uint64_t id; T(editor_add_buffer(f.e, other, NULL, 0, &id) == 0); T(settle(f.e) == 0);
+    }
+    if (!after_rename || other_tab) T(press(f.e, 'y', 0, "y") == 0);
+    /* Park the bulk lane so checkpoint allocations cannot be counted as UI
+     * allocations. (P) Zero allocations is the binding typing-path contract;
+     * the zero job generation is unused by this fixture, as in repeated_save. */
+    held_bulk bulk = {0};
+    work_handle handle = work_submit(&f.e->pool, (work_job){hold_bulk, &bulk, 0, WORK_BULK}); T(handle.epoch);
+    uint64_t limit = deadline();
+    while (!atomic_load(&bulk.entered)) { T(trace_now_ns() < limit); sched_yield(); }
+    edit_malloc_guard_begin(); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0);
+    size_t allocations = edit_malloc_guard_end(); if (edit_malloc_guard_active()) T(!allocations);
+    atomic_store(&bulk.release, true); T(saved(f.e) == 0);
+    T(disk_is(other_tab ? other : f.path, other_tab ? "y" : after_rename ? "xbase" : "xybase") == 0);
+    T(!savectl_get_model(owner->save).can_recover_cancel && access(retained, F_OK) < 0);
+    T(!f.e->buffer->save_error && !f.e->buffer->operation_error && !f.e->error);
+    T(!tabs_active(&f.e->tabs)->modified);
+    if (after_rename && !other_tab) {
+        T(press(f.e, 'y', 0, "y") == 0);
+        T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+        T(disk_is(f.path, "xybase") == 0); T(!tabs_active(&f.e->tabs)->modified);
+    }
+    if (other_tab) {
+        /* (E) Index zero names the original tab by fixture construction. */
+        T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+        T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+        T(disk_is(f.path, "xbase") == 0); T(!tabs_active(&f.e->tabs)->modified);
+        T(unlink(other) == 0);
+    }
+    close_fixture(&f);
+    if (after_rename) T(rmdir(target_directory) == 0 && rmdir(f.directory) == 0);
+    return 0;
 }
 static void crash_at_step(void *ctx, int phase)
 { if (phase == *(const int *)ctx) _exit(0); }
@@ -412,11 +515,13 @@ static int install_failure(void)
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);
+    T(recoverable_save_retry(false, true) == 0); T(recoverable_save_retry(true, true) == 0);
     T(session_artifacts() == 0); T(changed_base(false) == 0); T(changed_base(true) == 0); T(install_failure() == 0);
     T(unavailable_target_parent() == 0); T(existing_journal() == 0);
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
-    puts("editor_session_test: headless save/repeated/new-target, cutoff edits, shared targets, inactive failure, interrupted-save startup, Saving acknowledgement, allocation guard passed");
+    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, interrupted-save startup, Saving acknowledgement, allocation guard passed");
     return 0;
 }

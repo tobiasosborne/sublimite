@@ -906,7 +906,7 @@ bool editor_event_control(const editor *e, const plat_event *ev)
     case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
     case KEYS_ACTION_CLOSE: case KEYS_ACTION_CLOSE_FILE: case KEYS_ACTION_REOPEN_FILE:
     case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB:
-    case KEYS_ACTION_FONT_SIZE: case KEYS_ACTION_EXIT:
+    case KEYS_ACTION_FONT_SIZE: case KEYS_ACTION_EXIT: case KEYS_ACTION_SAVE:
     case KEYS_ACTION_NEW_FILE: case KEYS_ACTION_OPEN_FILE: return true;
     default: return false;
     }
