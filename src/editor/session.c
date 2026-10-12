@@ -154,9 +154,15 @@ void editor_session_metadata(editor *e)
             publish(e, b, !closed, i, b == e->buffer ? e->v.state : tab->state);
         }
     }
+    /* The saving buffer keeps its leaf after eviction until its token retires
+     * (edit-9u3): journal_save_finish requires the finish checkpoint to carry
+     * the saving buffer's BASE. Retirement defers its destruction and slot. */
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
-        if (b && b->retired && leaf_at(e->session, b->session_slot)) editor_session_forget(e, b);
+        session_node *leaf = b && b->retired ? leaf_at(e->session, b->session_slot) : NULL;
+        if (!leaf) continue;
+        if (b != e->session->saving) editor_session_forget(e, b);
+        else if (leaf->buffer == b && leaf->live) publish(e, b, false, 0, leaf->view);
     }
 }
 static uint8_t *record(session_capture *c, uint32_t type, uint64_t id, size_t size)
@@ -301,7 +307,9 @@ static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finis
         .request_ns = request_ns, .width = e->font.window_width,
         .height = e->font.window_height, .finish = finish, .cancelling = s->reconciling && !finish};
     pthread_mutex_lock(&s->mutex); c->root->refs++;
-    c->snapshot = piece_snapshot_retain(leaf_at(s, b->session_slot)->snapshot);
+    session_node *leaf = leaf_at(s, b->session_slot);
+    /* No leaf: start() refuses the NULL snapshot instead of dereferencing. */
+    c->snapshot = leaf && leaf->buffer == b ? piece_snapshot_retain(leaf->snapshot) : NULL;
     pthread_mutex_unlock(&s->mutex);
     if (finish) base_copy(&c->replacement, savectl_saved_base(b->save));
     else if (s->reconciling) c->replacement.path = "";

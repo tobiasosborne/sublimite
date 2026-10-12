@@ -272,6 +272,42 @@ static int recoverable_save_retry(bool other_tab, bool after_rename)
     if (after_rename) T(rmdir(target_directory) == 0 && rmdir(f.directory) == 0);
     return 0;
 }
+/* edit-9u3: after the PREPARE hand-off tab controls run while the file write
+ * continues. Closing the saving tab and then one more tab evicts it from a
+ * closed history of capacity 1 (the smallest nonzero retention, so exactly one
+ * further close evicts), the session metadata forgets its leaf, and save
+ * completion must still finish with the bytes captured at Ctrl+S. */
+static int evicted_saving_tab(void)
+{
+    fixture f = {0};
+    strcpy(f.directory, "build/editor-session-XXXXXX"); T(mkdtemp(f.directory));
+    T(snprintf(f.path, sizeof f.path, "%s/source", f.directory) > 0);
+    T(snprintf(f.log, sizeof f.log, "%s/journal", f.directory) > 0);
+    int fd = open(f.path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+    T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+    T(render_null_backend(&f.backend) == 0);
+    editor_config config = {.path = f.path, .journal_path = f.log, .closed_capacity = 1,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* tab + text + status */
+    T(editor_open(&f.e, &config, &f.backend) == 0); T(settle(f.e) == 0);
+    uint64_t first, second;
+    T(editor_add_buffer(f.e, NULL, NULL, 0, &first) == 0); T(settle(f.e) == 0);
+    T(editor_add_buffer(f.e, NULL, NULL, 0, &second) == 0); T(settle(f.e) == 0);
+    T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(press(f.e, 'x', 0, "x") == 0); editor_buffer *owner = f.e->buffer;
+    held_save held = {.phase = FILE_STEP_TEMP_WRITTEN}; T(savectl_set_step_hook(owner->save, hold, &held) == 0);
+    T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
+    T(!savectl_get_model(owner->save).journal_leased);
+    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id == owner->id);
+    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id != owner->id);
+    T(owner->retired);
+    atomic_store(&held.release, true); T(saved(f.e) == 0);
+    T(disk_is(f.path, "xbase") == 0);
+    T(!owner->save_error && !f.e->error && !f.e->stats.journal_error);
+    T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
+    close_fixture(&f); return 0;
+}
 static void crash_at_step(void *ctx, int phase)
 { if (phase == *(const int *)ctx) _exit(0); }
 static int interrupted_save(int phase)
@@ -522,6 +558,7 @@ int main(void)
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
-    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, interrupted-save startup, Saving acknowledgement, allocation guard passed");
+    T(evicted_saving_tab() == 0);
+    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, interrupted-save startup, Saving acknowledgement, allocation guard passed");
     return 0;
 }
