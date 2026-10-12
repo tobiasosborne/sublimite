@@ -116,11 +116,59 @@ static int other_overrides(void)
     puts("config_find_test: open/replace/previous/toggle overrides and local editing passed");
     return 0;
 }
+static int replace_next_shortcuts(bool remapped)
+{
+    static const char text[]="cat cat cat", query[]="cat", replacement[]="fox";
+    static const char preferences[]="[keymap]\nreplace_next='Ctrl+J'\n";
+    render_backend backend={0}; T(render_null_backend(&backend)==RENDER_OK);
+    /* (P) reuse the minimap/tab columns and tab/document/replace-panel rows
+     * from other_overrides. Offsets and read sizes derive from the strings. */
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1u,
+        .cols=8u+16u,.max_cols=8u+16u,.rows=1u+1u+3u,.max_rows=1u+1u+3u,
+        .preferences_path="build/edit-g02-absent-config.toml"};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==EDITOR_OK); T(settle(e)==0);
+    if (remapped) T(config_parse((const uint8_t *)preferences,sizeof preferences-1u,
+                                &e->preferences,NULL)==CONFIG_OK);
+    uint32_t sym=remapped ? XKB_KEY_j : XKB_KEY_H;
+    uint16_t mods=remapped ? PLAT_MOD_CTRL : PLAT_MOD_CTRL|PLAT_MOD_SHIFT|PLAT_MOD_CAPS;
+    /* Replace-next is harmless until the replacement panel owns the fields. */
+    T(press(e,sym,mods)==0); T(!e->find_visible);
+    T(press(e,XKB_KEY_f,PLAT_MOD_CTRL)==0);
+    T(findui_set_query(&e->find,(const uint8_t *)query,sizeof query-1u)==FINDUI_OK);
+    T(settle(e)==0); T(press(e,sym,mods)==0);
+    T(editor_length(e)==sizeof text-1u);
+    T(press(e,XKB_KEY_h,PLAT_MOD_CTRL)==0);
+    T(findui_set_replacement(&e->find,(const uint8_t *)replacement,sizeof replacement-1u,
+                             sizeof replacement-1u)==FINDUI_OK);
+    uint8_t bytes[sizeof text-1u];
+    if (remapped) {
+        T(press(e,XKB_KEY_h,PLAT_MOD_CTRL|PLAT_MOD_SHIFT)==0);
+        T(editor_read(e,0,bytes,sizeof bytes)==EDITOR_OK); T(!memcmp(bytes,text,sizeof bytes));
+    }
+    T(press(e,sym,mods)==0); T(e->find_visible && findui_get_state(&e->find).replace_mode);
+    T(editor_read(e,0,bytes,sizeof bytes)==EDITOR_OK); T(!memcmp(bytes,"fox cat cat",sizeof bytes));
+    T(press(e,XKB_KEY_Return,PLAT_MOD_CTRL)==0); T(e->find_visible);
+    T(editor_read(e,0,bytes,sizeof bytes)==EDITOR_OK); T(!memcmp(bytes,"fox fox cat",sizeof bytes));
+    T(press(e,XKB_KEY_Return,PLAT_MOD_CTRL|PLAT_MOD_ALT)==0); T(e->find_visible);
+    T(editor_read(e,0,bytes,sizeof bytes)==EDITOR_OK); T(!memcmp(bytes,"fox fox fox",sizeof bytes));
+    T(press(e,XKB_KEY_Escape,0)==0); T(!e->find_visible);
+    T(press(e,XKB_KEY_z,PLAT_MOD_CTRL)==0);
+    T(editor_read(e,0,bytes,sizeof bytes)==EDITOR_OK); T(!memcmp(bytes,"fox fox cat",sizeof bytes));
+    T(editor_get_stats(e).unimplemented_actions==0);
+    editor_close(e);
+    puts(remapped ? "config_find_test: remapped replace-next and retained Enter shortcuts passed" :
+                    "config_find_test: default replace-next and retained Enter shortcuts passed");
+    return 0;
+}
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--g02-default")) return replace_next_shortcuts(false);
+    if (argc > 1 && !strcmp(argv[1], "--g02-remapped")) return replace_next_shortcuts(true);
     if (argc > 1 && !strcmp(argv[1], "--closed")) return find_next_override(false);
     T(find_next_override(true) == 0);
     T(find_next_override(false) == 0);
     T(other_overrides() == 0);
+    T(replace_next_shortcuts(false) == 0);
+    T(replace_next_shortcuts(true) == 0);
     return 0;
 }

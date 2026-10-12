@@ -148,7 +148,8 @@ static const expectation expected[] = {
     T("Find", FIND,0,0),
     T("ctrl+f", FIND,0,0),
     T("ctrl+h", REPLACE,0,0),
-    T("ctrl+shift+h", REPLACE_NEXT,U,0),
+    /* (P) implemented replace-next takes no flags or numeric argument. */
+    T("ctrl+shift+h", REPLACE_NEXT,0,0),
     /* (P) zero flags/value: implemented boolean toggles have no arguments. */
     T("alt+r", TOGGLE_REGEX,0,0),
     T("alt+c", TOGGLE_CASE_SENSITIVE,0,0),

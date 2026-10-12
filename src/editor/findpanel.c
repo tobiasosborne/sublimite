@@ -142,9 +142,14 @@ int editor_find_service(editor *e)
         if (state.complete && state.match_count) {
             findui_range selected=state.selected;
             findui_code code=FINDUI_OK;
-            if (e->find_navigated || e->find_direction<0)
+            if (e->find_direction && (e->find_navigated || e->find_direction<0))
                 code=findui_next(&e->find,e->find_direction,&selected);
-            if (code==FINDUI_MORE) { e->find_select_pending=true; e->find_navigated=false; }
+            if (code==FINDUI_MORE) {
+                e->find_select_pending=true; e->find_navigated=false;
+                /* (P) zero means the ordinal request already advanced;
+                 * its completion only needs to select the resolved range. */
+                e->find_direction=0;
+            }
             else if (code==FINDUI_OK) {
                 e->find_navigated=true;
                 int rc=select_result(e,selected); if (rc) return rc;
@@ -306,6 +311,10 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         if (!findui_get_state(&e->find).open) (void)findui_show(&e->find,true,false);
         /* (P) findui_next's direction contract is negative/positive one. */
         navigate(e,binding->action==KEYS_ACTION_FIND_PREVIOUS ? -1 : 1); return true;
+    case KEYS_ACTION_REPLACE_NEXT:
+        if (e->find_visible && findui_get_state(&e->find).replace_mode && !e->find_replace_active)
+            replace_begin(e,false);
+        return true;
     case KEYS_ACTION_TOGGLE_REGEX: case KEYS_ACTION_TOGGLE_CASE_SENSITIVE:
     case KEYS_ACTION_TOGGLE_WHOLE_WORD: {
         if (!e->find_visible || e->find_replace_active) return true;
@@ -350,7 +359,13 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (alt && !ctrl) return true;
     if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
         if (ctrl && state.replace_mode) replace_begin(e,(ev->mods&PLAT_MOD_ALT)!=0);
-        else navigate(e,shift ? -1 : 1);
+        else {
+            /* Return advances from the query's initial preview as well as
+             * subsequent selections. Keep keymap/hidden navigation unchanged.
+             * (P) direction magnitude follows findui_next's one-step contract. */
+            e->find_navigated=true;
+            navigate(e,shift ? -1 : 1);
+        }
     } else if (ev->keysym==XKB_KEY_Tab && state.replace_mode) {
         (void)findui_focus_replacement(&e->find,!state.replacement_focus);
         field_select_all(e);

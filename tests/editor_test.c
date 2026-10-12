@@ -3941,6 +3941,66 @@ static int wheel_contract(void)
     ev.dy=-PLAT_WHEEL_UNIT; T(press(e,ev)==0); T(editor_view(e).visual_byte==0);
     editor_close(e); puts("edit-73j wheel contract passed"); return 0;
 }
+/* (P) fixture offsets are prefix string lengths. Geometry is the existing
+ * minimap plus tab slot, and tab/document/query/replacement/status rows.
+ * Zero is success/empty/first byte; one is a C terminator or API direction.
+ * No timing or allocation budget is introduced. */
+static int g02_find_return(void)
+{
+    static const char text[]="cat cat cat", query[]="cat";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    counted counts={0};
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1u,
+        .cols=8u+16u,.rows=1u+1u+3u,
+        .hook_ctx=&counts,.on_ingress=ingress,.on_submit=submitted};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    T(press(e,key(XKB_KEY_f,PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key(XKB_KEY_c,0,query))==0);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==sizeof "cat "-1u &&
+      editor_view(e).selection.cursor==sizeof "cat cat"-1u);
+    T(press(e,key(XKB_KEY_KP_Enter,0,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==sizeof "cat cat "-1u &&
+      editor_view(e).selection.cursor==sizeof text-1u);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==sizeof query-1u);
+    T(press(e,key(XKB_KEY_Return,PLAT_MOD_SHIFT,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==sizeof "cat cat "-1u &&
+      editor_view(e).selection.cursor==sizeof text-1u);
+    /* A fresh query has an internal preview even before search completes;
+     * Return must still advance when its selection is serviced later. */
+    T(findui_set_query(&e->find,(const uint8_t *)"dog",sizeof "dog"-1u)==FINDUI_OK);
+    T(settle(e)==0);
+    view_selection before=editor_view(e).selection;
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==before.anchor && editor_view(e).selection.cursor==before.cursor);
+    T(findui_set_query(&e->find,(const uint8_t *)query,sizeof query-1u)==FINDUI_OK);
+    T(findui_get_state(&e->find).searching);
+    plat_event enter=key(XKB_KEY_Return,0,NULL);
+    T(editor_find_key(e,&enter)); T(settle(e)==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==sizeof "cat "-1u &&
+      editor_view(e).selection.cursor==sizeof "cat cat"-1u);
+    T(press(e,key(XKB_KEY_Escape,0,NULL))==0); T(!e->find_visible);
+    T(counts.allocations==0 && !counts.active);
+    editor_close(e); puts("edit-g02 Return/keypad/previous/wrap/pending/empty/Escape passed"); return 0;
+}
+static int g02_find_previous_uncached(void)
+{
+    /* (P) one literal-byte match per byte; cache capacity plus the query's
+     * byte length puts the previous wrapped match just beyond the cache.
+     * Geometry and scalar sentinels follow g02_find_return above. */
+    uint8_t text[LAYOUT_CLUSTER_CACHE+sizeof "a"-1u]; memset(text,'a',sizeof text);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=text,.initial_len=sizeof text,.cols=8u+16u,.rows=1u+1u+3u};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
+    T(press(e,key(XKB_KEY_f,PLAT_MOD_CTRL,NULL))==0);
+    T(press(e,key(XKB_KEY_a,0,"a"))==0);
+    T(findui_get_state(&e->find).cache_overflow);
+    T(press(e,key(XKB_KEY_KP_Enter,PLAT_MOD_SHIFT,NULL))==0); T(e->find_visible);
+    T(editor_view(e).selection.anchor==sizeof text-(sizeof "a"-1u) &&
+      editor_view(e).selection.cursor==sizeof text);
+    editor_close(e); puts("edit-g02 uncached Shift+keypad Enter selects previous exactly once passed"); return 0;
+}
 static int findpanel_contract(void)
 {
     const char text[]="cat dog cat";
@@ -3956,13 +4016,17 @@ static int findpanel_contract(void)
     T(press(e,key('a',PLAT_MOD_CTRL,NULL))==0); T(e->find_field_all);
     T(press(e,key('c',0,"cat"))==0); T(expect(e,text,0)==0);
     T(findui_get_state(&e->find).query_length==sizeof "cat"-1);
+    /* (P) match offsets derive from the fixture prefixes. Return advances
+     * past the initial preview; keymap navigation retains its own contract. */
     T(press(e,key(XKB_KEY_Return,0,NULL))==0);
-    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==3);
+    T(editor_view(e).selection.anchor==sizeof "cat dog "-1u && editor_view(e).selection.cursor==sizeof text-1u);
     T(press(e,key(XKB_KEY_Return,0,NULL))==0);
-    T(editor_view(e).selection.anchor==8 && editor_view(e).selection.cursor==11);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==sizeof "cat"-1u);
     T(press(e,key(XKB_KEY_Return,PLAT_MOD_SHIFT,NULL))==0);
-    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==3);
+    T(editor_view(e).selection.anchor==sizeof "cat dog "-1u && editor_view(e).selection.cursor==sizeof text-1u);
     T(press(e,key(XKB_KEY_Escape,0,NULL))==0);
+    T(press(e,key(XKB_KEY_F3,0,NULL))==0);
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==sizeof "cat"-1u);
     T(press(e,key(XKB_KEY_F3,0,NULL))==0);
     T(editor_view(e).selection.anchor==8 && editor_view(e).selection.cursor==11);
     T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
@@ -4310,6 +4374,8 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
+        if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
+        if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
         if (!strcmp(argv[1], "--48u-overscan")) return pointer_overscan_contract();
         if (!strcmp(argv[1], "--48u-buffer")) return pointer_chain_contract(false);
@@ -4394,6 +4460,8 @@ int main(int argc, char **argv)
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
     T(o20_all() == 0);
+    T(g02_find_return() == 0);
+    T(g02_find_previous_uncached() == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);
