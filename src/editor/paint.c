@@ -194,14 +194,18 @@ static int compose(editor *e)
         e->grid.scroll = (render_scroll){0};
         const char status[] = "Source changed: R reload / K keep";
         uint32_t cols = e->grid.dims.cols;
-        for (uint32_t c = 0; c < cols; c++) {
+        /* (E) Use the existing bottom status row: zero-based last index is
+         * row count minus one. The later save overlay retains precedence
+         * for its required saving acknowledgement (docs/decisions/edit-1um.md). */
+        uint32_t row = e->grid.dims.rows ? e->grid.dims.rows - 1u : 0u;
+        for (uint32_t c = 0; e->grid.dims.rows && c < cols; c++) { /* no row: nothing to draw */
             uint32_t ch = c < sizeof status - 1 ? (uint8_t)status[c] : (uint32_t)' ';
-            e->grid.cells[(size_t)e->tab_rows * cols + c] = (render_cell){ch, ch - 0x20u,
+            e->grid.cells[(size_t)row * cols + c] = (render_cell){ch, ch - ' ',
                 config_theme_color(e->preferences.theme, "warning.foreground"),
                 config_theme_color(e->preferences.theme, "chrome.background"), 0, 0};
         }
         int rc = compose_chrome(e);
-        return rc ? rc : render_mark_rows(&e->grid, e->tab_rows, 1);
+        return rc || !e->grid.dims.rows ? rc : render_mark_rows(&e->grid, row, 1); /* (E) Only the status row changed. */
     }
     if (e->caret_only || e->glyph_only) {
         uint32_t tc = e->text_grid.dims.cols, full = e->grid.dims.cols;

@@ -1248,8 +1248,13 @@ static int panel_shortcuts(bool notice)
              * ordinary text composition. It must retire the old notice too. */
             e->buffer->source_stale = true;
             T(editor_begin_frame(e) == 0); T(editor_compose(e) == 0);
-            T(memcmp(e->grid.cells + bottom, bottom_before, sizeof bottom_before) == 0);
-            T(e->grid.cells[(size_t)e->tab_rows * e->grid.dims.cols].glyph_index == (uint8_t)'S');
+            const char source_status[] = "Source changed: R reload / K keep";
+            /* (E) Source status now owns the bottom row; literal length
+             * excludes the C terminator. The cached first row stays intact. */
+            for (size_t c = 0; c < e->grid.dims.cols && c < sizeof source_status - 1u; c++)
+                T(e->grid.cells[bottom + c].glyph_index == (uint8_t)source_status[c]);
+            T(!memcmp(e->grid.cells + (size_t)e->tab_rows * e->grid.dims.cols,
+                e->text_grid.cells, (size_t)e->text_grid.dims.cols * sizeof(render_cell)));
         }
         editor_close(e);
     }
@@ -1924,8 +1929,53 @@ static void source_prompt_submit(void *ctx, const editor_frame *frame)
     const char prompt[] = "Source changed: R reload / K keep";
     bool matches = e->grid.dims.cols >= sizeof prompt - 1;
     for (size_t i = 0; matches && i < sizeof prompt - 1; i++)
-        matches = e->grid.cells[(size_t)e->tab_rows * e->grid.dims.cols + i].glyph_index == (uint8_t)prompt[i];
+        /* (E) Last zero-based row = total rows minus one; prompt length
+         * excludes its C terminator. Inspect the actual submitted status. */
+        matches = e->grid.cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols + i].glyph_index == (uint8_t)prompt[i];
     probe->shown |= matches;
+}
+/* (E) Fixture geometry: columns = prompt literal length; rows = tab row +
+ * each newline-terminated fixture line + bottom status row. Unit offsets
+ * subtract the C terminator or select a single row; zero is the first index
+ * or success/no-allocation result. No timing/count budget is introduced. */
+static int source_prompt_placement(void)
+{
+    const char first[] = "line_one", text[] = "line_one\nline_two\n";
+    const char prompt[] = "Source changed: R reload / K keep";
+    uint32_t rows = 1u + 1u; /* (E) tab chrome + bottom status. */
+    for (size_t i = 0; i < sizeof text - 1u; i++) if (text[i] == '\n') rows++;
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = sizeof prompt - 1u, .rows = rows, .wrap_mode = -1}; /* (E) unwrapped fixture. */
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_jump_line(e, 0) == 0); T(settle(e) == 0); /* (E) fixture starts at the first line. */
+    size_t first_row = (size_t)e->tab_rows * e->grid.dims.cols;
+    size_t status_row = (size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols;
+    for (size_t c = 0; c < sizeof first - 1u; c++)
+        T(e->grid.cells[first_row + e->lay.gw + c].glyph_index == (uint8_t)first[c]);
+    /* Isolate notice composition from the already-tested source watcher. */
+    e->buffer->source_stale = true;
+    edit_malloc_guard_begin();
+    int rc = editor_full_layout(e);
+    if (!rc) rc = settle(e);
+    size_t allocations = edit_malloc_guard_end();
+    T(rc == 0 && allocations == 0);
+    for (size_t c = 0; c < sizeof first - 1u; c++)
+        T(e->grid.cells[first_row + e->lay.gw + c].glyph_index == (uint8_t)first[c]);
+    for (size_t c = 0; c < sizeof prompt - 1u; c++)
+        T(e->grid.cells[status_row + c].glyph_index == (uint8_t)prompt[c]);
+    /* Retained notice frames must also leave the cached document visible. */
+    T(editor_begin_frame(e) == 0); T(settle(e) == 0);
+    T(!memcmp(e->grid.cells + first_row, e->text_grid.cells,
+        (size_t)e->text_grid.dims.cols * sizeof(render_cell)));
+    e->buffer->source_stale = false;
+    T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    T(!memcmp(e->grid.cells + status_row,
+        e->text_grid.cells + (size_t)(e->grid.dims.rows - e->tab_rows - 1u) * e->text_grid.dims.cols,
+        (size_t)e->text_grid.dims.cols * sizeof(render_cell)));
+    editor_close(e);
+    puts("edit-1um: null source prompt preserves first-line glyphs, uses bottom status, restores row and allocates nothing: PASS");
+    return 0;
 }
 static int clean_source_change(void)
 {
@@ -4321,6 +4371,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--ck4-startup")) return ck4_startup();
         if (!strcmp(argv[1], "--ck4-save")) return ck4_recovery(0);
         if (!strcmp(argv[1], "--clean-source-change")) return clean_source_change();
+        if (!strcmp(argv[1], "--source-prompt-placement")) return source_prompt_placement();
         if (!strcmp(argv[1], "--ck4-keep")) return ck4_recovery(1);
         if (!strcmp(argv[1], "--ck4-reload")) return ck4_recovery(2);
         if (!strcmp(argv[1], "--ck4-mapped-keep")) return ck4_recovery(3);
@@ -4362,6 +4413,7 @@ int main(int argc, char **argv)
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(clean_source_change() == 0);
+    T(source_prompt_placement() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(headless ? "headless" : NULL) == 0);
