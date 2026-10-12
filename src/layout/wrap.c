@@ -560,9 +560,11 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
          * it here rereads the remaining logical line at every soft wrap. */
         rb[0]=row[0].start;
         q.row=0; q.row_end=1; q.phase=0; q.cluster_active=false;
-        uint64_t before=q.bytes_scanned;
         int rc=layout_wrap_run(&q);
         if(rc<0) return rc;
+        /* (P) The LF byte advances a newline row without a text cluster;
+         * charge it to the existing scan bound, including empty lines. */
+        q.bytes_scanned+=row[0].newline;
         if(rc==LAYOUT_MORE || q.bytes_scanned>=LAYOUT_BYTE_BUDGET) {
             *approximate=true; *out=have_previous?previous:row[0];
             if(!have_previous) { out->end=out->start; out->next=out->start; out->end_column=out->column; }
@@ -574,7 +576,10 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
             if(direction<=0 || row[0].next==LAYOUT_VOID_ROW) { *out=row[0]; return LAYOUT_DONE; }
             found=true;
         }
-        if(row[0].next==LAYOUT_VOID_ROW || q.bytes_scanned==before) { *out=row[0]; return LAYOUT_DONE; }
+        /* An empty line advances past LF without scanning a text cluster.
+         * Row boundaries, rather than the cluster scan counter, certify
+         * progress for adjacent queries in either direction. */
+        if(row[0].next==LAYOUT_VOID_ROW || row[0].next<=row[0].start) { *out=row[0]; return LAYOUT_DONE; }
         previous=row[0]; have_previous=true; next_seed(&row[0],&previous);
     }
 }

@@ -255,6 +255,89 @@ static int pending_jump_keys(void)
     }
     return 0;
 }
+static int wrapped_wheel(void)
+{
+    /* (M)[AC] edit-zw9's Astra repro: down 3, down 30, up 30, up 3.
+     * (P) Expected travel = notches * SCROLL_CORE_ROWS; provision a paragraph
+     * per travelled row plus the existing viewport, with each paragraph
+     * wider than PROBE_COLS so every line wraps even without the sidebar. */
+    enum { NEAR_NOTCHES = 3, FAR_NOTCHES = 30,
+        TRAVEL_ROWS = (NEAR_NOTCHES + FAR_NOTCHES) * SCROLL_CORE_ROWS,
+        LINE_BYTES = PROBE_COLS * 2u,
+        FIXTURE_BYTES = (TRAVEL_ROWS + PROBE_ROWS) * LINE_BYTES };
+    int result = 0; editor *e = NULL, *reference = NULL;
+    render_backend backend = {0}, reference_backend = {0}; observer o = {0};
+    uint8_t bytes[FIXTURE_BYTES];
+    const char prose[] = "Every editor tried is slower than word processors were, and each one carries features that are never used. "
+        "What remains is quick, frequent editing of small files, occasional huge logs, and a lot of prose. ";
+    for (size_t i = 0; i < sizeof bytes; i++)
+        /* (P) Paragraph separator = its LF plus an empty line's LF. */
+        bytes[i] = i % LINE_BYTES < LINE_BYTES - 2u ? (uint8_t)prose[(i % LINE_BYTES) % (sizeof prose - 1u)] : (uint8_t)'\n';
+    editor_config cfg = {.initial = bytes, .initial_len = sizeof bytes,
+        .cols = PROBE_COLS, .rows = PROBE_ROWS, .wrap_mode = 1,
+        .hook_ctx = &o, .on_submit = submitted};
+    CHECK(render_null_backend(&backend) == 0 && editor_open(&e, &cfg, &backend) == 0 && settle_map(e) == 0);
+    CHECK(editor_view(e).wrap && e->lay.wrap_rows[0].next < LINE_BYTES);
+    /* (P) A tall null viewport lays out every travelled row independently
+     * of adjacent-row queries, with identical width and document geometry. */
+    editor_config reference_cfg = cfg;
+    reference_cfg.rows = TRAVEL_ROWS + PROBE_ROWS;
+    reference_cfg.hook_ctx = NULL; reference_cfg.on_submit = NULL;
+    CHECK(render_null_backend(&reference_backend) == 0 &&
+        editor_open(&reference, &reference_cfg, &reference_backend) == 0 && settle_map(reference) == 0);
+    CHECK(reference->lay.text_cols == e->lay.text_cols);
+    uint64_t tops[TRAVEL_ROWS + 1u];
+    memcpy(tops, reference->row_byte, sizeof tops);
+    CHECK(tops[TRAVEL_ROWS] != LAYOUT_VOID_ROW);
+    /* (P) Capture the text cells in the existing viewport's cell capacity.
+     * Unfocused text has no blink changes during the reversal comparison. */
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+    CHECK(editor_inject(e, &focus) == 0 && settle(e) == 0);
+    render_cell initial_cells[PROBE_COLS * PROBE_ROWS], near_cells[PROBE_COLS * PROBE_ROWS];
+    size_t cell_bytes = (size_t)e->text_grid.dims.cols * e->text_grid.dims.rows * sizeof(render_cell);
+    memcpy(initial_cells, e->text_grid.cells, cell_bytes);
+    view_selection selection = editor_view(e).selection;
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT};
+    for (size_t notch = 0; notch < NEAR_NOTCHES; notch++) {
+        CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+        fprintf(stderr, "editor_scroll_test: wrapped notch=%zu top=%llu expected=%llu\n",
+            notch + 1u, (unsigned long long)e->row_byte[0],
+            (unsigned long long)tops[(notch + 1u) * SCROLL_CORE_ROWS]);
+        CHECK(e->row_byte[0] == tops[(notch + 1u) * SCROLL_CORE_ROWS]);
+    }
+    fprintf(stderr, "editor_scroll_test: wrapped near top=%llu expected=%llu\n",
+        (unsigned long long)e->row_byte[0], (unsigned long long)tops[NEAR_NOTCHES * SCROLL_CORE_ROWS]);
+    CHECK(e->row_byte[0] == tops[NEAR_NOTCHES * SCROLL_CORE_ROWS]);
+    CHECK(o.last.scroll.first_byte == e->row_byte[0]);
+    memcpy(near_cells, e->text_grid.cells, cell_bytes);
+    wheel.dy = FAR_NOTCHES * SCROLL_WHEEL_UNIT;
+    CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+    CHECK(e->row_byte[0] == tops[TRAVEL_ROWS] && o.last.scroll.first_byte == tops[TRAVEL_ROWS]);
+    wheel.dy = -(int32_t)(FAR_NOTCHES * SCROLL_WHEEL_UNIT);
+    CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+    CHECK(e->row_byte[0] == tops[NEAR_NOTCHES * SCROLL_CORE_ROWS]);
+    CHECK(memcmp(near_cells, e->text_grid.cells, cell_bytes) == 0);
+    wheel.dy = -(int32_t)(NEAR_NOTCHES * SCROLL_WHEEL_UNIT);
+    CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+    CHECK(e->row_byte[0] == tops[0] && o.last.scroll.first_byte == tops[0]);
+    CHECK(memcmp(initial_cells, e->text_grid.cells, cell_bytes) == 0);
+    /* (P) Also verify individually dispatched upward notches, as in the
+     * bead's single-notch repro; each removes exactly SCROLL_CORE_ROWS. */
+    wheel.dy = NEAR_NOTCHES * SCROLL_WHEEL_UNIT;
+    CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+    CHECK(e->row_byte[0] == tops[NEAR_NOTCHES * SCROLL_CORE_ROWS]);
+    wheel.dy = -(int32_t)SCROLL_WHEEL_UNIT;
+    for (size_t notch = NEAR_NOTCHES; notch; notch--) {
+        CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
+        CHECK(e->row_byte[0] == tops[(notch - 1u) * SCROLL_CORE_ROWS]);
+    }
+    CHECK(editor_view(e).visual_byte == tops[0] && o.last.scroll.first_byte == tops[0]);
+    CHECK(memcmp(initial_cells, e->text_grid.cells, cell_bytes) == 0);
+    CHECK(editor_view(e).selection.cursor == selection.cursor && editor_view(e).selection.anchor == selection.anchor);
+    puts("editor_scroll_test: wrapped exact visual-row wheel and reversal PASS");
+done:
+    editor_close(reference); editor_close(e); return result;
+}
 int main(int argc, char **argv)
 {
     /* (P) argv's first entry is the executable; the next is the selector. */
@@ -321,5 +404,6 @@ done:
     if (!result) result = eof_typing();
     if (!result) result = pending_jump_motion((plat_event){.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT});
     if (!result) result = pending_jump_keys();
+    if (!result) result = wrapped_wheel();
     return result;
 }
