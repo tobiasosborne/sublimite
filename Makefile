@@ -32,6 +32,9 @@ LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
 TS_SRC := vendor/tree-sitter/lib/src/lib.c
+# Generated grammar sources share the runtime archives; one line per language.
+TS_SRC += vendor/tree-sitter-c/src/parser.c
+TS_SRC += vendor/tree-sitter-rust/src/parser.c vendor/tree-sitter-rust/src/scanner.c
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
 MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
@@ -46,8 +49,12 @@ FUZZ_OBJ := $(SRCS:%.c=$(B)/fuzz/%.o)
 # Upstream's amalgamation uses narrowing conversions and shadowed locals.
 # Relax only those warnings for this object in every configuration; retain
 # C11, Wall/Wextra/Werror, project optimization and sanitizer flags.
-TS_OBJ := $(addprefix $(B)/,$(addsuffix /$(TS_SRC:.c=.o),rel san fuzz))
+TS_OBJ := $(foreach config,rel san fuzz,$(addprefix $(B)/$(config)/,$(TS_SRC:.c=.o)))
 $(TS_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+# Generated parsers also have unused labels/parameters; handwritten scanners
+# use the same vendored-only flags. Keep project src/ warnings unchanged.
+GRAMMAR_OBJ := $(filter %/parser.o %/scanner.o,$(TS_OBJ))
+$(GRAMMAR_OBJ): WARN := -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-label -D_GNU_SOURCE -pthread
 
 REL_LIB  := $(B)/libedit.a
 SAN_LIB  := $(B)/san/libedit.a

@@ -1,15 +1,239 @@
 /* edit-v0o.2 mailbox contract. Ranges are derived from the fixture bytes;
  * refresh comes from the caller, never from a guessed display rate. */
 #include "hl/hl.h"
+#include "hl/lang.h"
+#include "hl/query.h"
+#include "config/config.h"
 #include "base/base.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <sched.h>
 
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", #c); return 1; } } while (0)
 
+
+/* (P) Fixture byte lengths bound these byte-indexed oracles; zero is the
+ * default/unassigned scope and return success; one is the next row/identity. */
+typedef struct scope_oracle {
+    hl_scope *scopes;
+    uint32_t *priorities;
+    size_t length, captures;
+    uint32_t generation;
+} scope_oracle;
+static int capture(void *payload, const hl_span *span)
+{
+    scope_oracle *o = payload;
+    work_msg message;
+    hl_span decoded;
+    edit_malloc_guard_begin();
+    int encoded = hl_span_encode(&message, o->generation, span);
+    int read = hl_span_decode(&message, &decoded);
+    size_t allocations = edit_malloc_guard_end();
+    REQUIRE(encoded == HL_QUERY_OK && read == HL_QUERY_OK && !allocations);
+    REQUIRE(message.generation == o->generation);
+    REQUIRE(decoded.first_byte == span->first_byte && decoded.end_byte == span->end_byte);
+    REQUIRE(decoded.scope == span->scope && decoded.priority == span->priority);
+    REQUIRE(span->first_byte < span->end_byte && span->end_byte <= o->length);
+    for (uint64_t i = span->first_byte; i < span->end_byte; ++i) {
+        if (span->priority >= o->priorities[i]) {
+            o->scopes[i] = span->scope; o->priorities[i] = span->priority;
+        }
+    }
+    ++o->captures;
+    return HL_QUERY_OK;
+}
+static int refused_capture(void *payload, const hl_span *span)
+{
+    (void)payload; (void)span;
+    return HL_QUERY_STOP;
+}
+static int token(const char *text, const char *name, const scope_oracle *o, hl_scope expected)
+{
+    const char *at = strstr(text, name);
+    REQUIRE(at);
+    for (size_t i = (size_t)(at - text); i < (size_t)(at - text) + strlen(name); ++i)
+        REQUIRE(o->scopes[i] == expected);
+    return 0;
+}
+static int language_test(const TSLanguage *language, const char *text, bool rust)
+{
+    size_t length = strlen(text);
+    /* (P) C11 VLAs: one entry per fixture byte, no arbitrary capture capacity. */
+    hl_scope scopes[length]; uint32_t priorities[length];
+    memset(scopes, 0, sizeof scopes); memset(priorities, 0, sizeof priorities);
+    scope_oracle o = {scopes, priorities, length, 0, (uint32_t)length};
+    TSParser *parser = ts_parser_new(); REQUIRE(parser);
+    REQUIRE(ts_parser_set_language(parser, language));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, text, (uint32_t)length);
+    REQUIRE(tree && !ts_node_has_error(ts_tree_root_node(tree)));
+    piece_allocator allocator = piece_default_allocator();
+    piece_tree *source = piece_create(&allocator); REQUIRE(source);
+    REQUIRE(piece_init_copy(source, (const uint8_t *)text, length) == PIECE_OK);
+    piece_snapshot *snapshot = piece_snapshot_take(source); REQUIRE(snapshot);
+    hl_query query; hl_query_error error;
+    REQUIRE(hl_query_init(&query, language, &error) == HL_QUERY_OK);
+    for (uint32_t i = 0; i < ts_query_capture_count(query.query); ++i)
+        REQUIRE(query.scopes[i] != HL_SCOPE_DEFAULT);
+    REQUIRE(hl_query_run(&query, tree, snapshot, 0, UINT32_MAX, capture, &o) == HL_QUERY_OK);
+    REQUIRE(o.captures && token(text, "// comment", &o, HL_SCOPE_COMMENT) == 0);
+    REQUIRE(token(text, "return", &o, HL_SCOPE_KEYWORD) == 0);
+    REQUIRE(token(text, "greet", &o, HL_SCOPE_FUNCTION) == 0);
+    REQUIRE(token(text, "\"hello\"", &o, HL_SCOPE_STRING) == 0);
+    REQUIRE(token(text, "value", &o, HL_SCOPE_VARIABLE) == 0);
+    REQUIRE(token(text, rust ? "i32" : "int", &o, HL_SCOPE_TYPE) == 0);
+    /* (P) Upstream Rust groups integer/float/bool under constant.builtin. */
+    REQUIRE(token(text, "42", &o, rust ? HL_SCOPE_CONSTANT : HL_SCOPE_NUMBER) == 0);
+    if (rust) {
+        REQUIRE(token(text, "#[inline]", &o, HL_SCOPE_ATTRIBUTE) == 0);
+        REQUIRE(token(text, "Some", &o, HL_SCOPE_TYPE) == 0);
+    } else REQUIRE(token(text, "LIMIT", &o, HL_SCOPE_CONSTANT) == 0);
+    REQUIRE(token(text, ";", &o, HL_SCOPE_PUNCTUATION) == 0);
+    REQUIRE(hl_query_run(&query, tree, snapshot, 0, UINT32_MAX, refused_capture, NULL) == HL_QUERY_STOP);
+    /* (P) first row is exactly the comment fixture; next row excludes it. */
+    memset(scopes, 0, sizeof scopes); o.captures = 0;
+    REQUIRE(hl_query_run(&query, tree, snapshot, 1u, UINT32_MAX, capture, &o) == HL_QUERY_OK);
+    REQUIRE(token(text, "// comment", &o, HL_SCOPE_DEFAULT) == 0);
+    REQUIRE(hl_query_run(&query, tree, snapshot, 1u, 0, capture, &o) == HL_QUERY_ARG);
+    hl_query_destroy(&query);
+    const char unknown[] = "(identifier) @future.capture";
+    REQUIRE(hl_query_init_source(&query, language, unknown, sizeof unknown - 1u, &error) == HL_QUERY_OK);
+    memset(scopes, 0, sizeof scopes);
+    REQUIRE(hl_query_run(&query, tree, snapshot, 0, UINT32_MAX, capture, &o) == HL_QUERY_OK);
+    REQUIRE(token(text, "greet", &o, HL_SCOPE_DEFAULT) == 0);
+    hl_query_destroy(&query);
+    const char invalid[] = "(no_such_node) @comment";
+    REQUIRE(hl_query_init_source(&query, language, invalid, sizeof invalid - 1u, &error) == HL_QUERY_COMPILE);
+    REQUIRE(error.type == TSQueryErrorNodeType); hl_query_destroy(&query);
+    const char unsupported[] = "((identifier) @variable (#unknown? @variable))";
+    REQUIRE(hl_query_init_source(&query, language, unsupported, sizeof unsupported - 1u, &error) == HL_QUERY_PREDICATE);
+    hl_query_destroy(&query);
+    ts_tree_delete(tree); ts_parser_delete(parser);
+    piece_snapshot_release(snapshot); piece_destroy(source);
+    return 0;
+}
+
+typedef struct query_job {
+    const TSLanguage *language;
+    const char *text;
+    const piece_snapshot *snapshot;
+    int status;
+} query_job;
+static int publish_span(void *payload, const hl_span *span)
+{
+    work_ctx *context = payload;
+    work_msg message;
+    int rc = hl_span_encode(&message, context->generation, span);
+    if (rc) return rc;
+    return work_publish(context, &message) ? HL_QUERY_OK : HL_QUERY_STOP;
+}
+static void query_worker_job(work_ctx *context)
+{
+    query_job *job = context->arg;
+    hl_query query;
+    /* Initialize allocating query/parser state on the real worker thread. */
+    job->status = hl_query_init(&query, job->language, NULL);
+    if (job->status) return;
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (!parser || !ts_parser_set_language(parser, job->language)) job->status = HL_QUERY_ARG;
+    else {
+        tree = ts_parser_parse_string(parser, NULL, job->text, (uint32_t)strlen(job->text));
+        job->status = tree ? hl_query_run(&query, tree, job->snapshot, 0, UINT32_MAX,
+                                         publish_span, context) : HL_QUERY_READ;
+    }
+    ts_tree_delete(tree);
+    if (parser) ts_parser_delete(parser);
+    hl_query_destroy(&query);
+    if (!job->status) {
+        work_msg message;
+        hl_result complete = {0, strlen(job->text), HL_DOCUMENT_READY};
+        if (!hl_result_encode(&message, context->generation, &complete) ||
+            !work_publish(context, &message)) job->status = HL_QUERY_STOP;
+    }
+}
+typedef struct received_scopes {
+    uint32_t generation;
+    size_t length, spans;
+    bool completed, failed, saw_function;
+} received_scopes;
+static void receive_scopes(const work_msg *message, void *payload)
+{
+    received_scopes *received = payload;
+    if (message->generation != received->generation || received->completed) { received->failed = true; return; }
+    if (message->kind == HL_SPAN_KIND) {
+        hl_span span;
+        if (hl_span_decode(message, &span) || span.end_byte > received->length) received->failed = true;
+        else if (span.scope == HL_SCOPE_FUNCTION) received->saw_function = true;
+        ++received->spans;
+    } else {
+        hl_result complete;
+        if (!hl_result_decode(message, &complete) || complete.phase != HL_DOCUMENT_READY ||
+            complete.first_byte != 0 || complete.end_byte != received->length) received->failed = true;
+        received->completed = true;
+    }
+}
+static int mailbox_query_test(const TSLanguage *language, const char *text)
+{
+    piece_allocator allocator = piece_default_allocator();
+    piece_tree *source = piece_create(&allocator); REQUIRE(source);
+    REQUIRE(piece_init_copy(source, (const uint8_t *)text, strlen(text)) == PIECE_OK);
+    piece_snapshot *snapshot = piece_snapshot_take(source); REQUIRE(snapshot);
+    edit_arena arena;
+    /* (P) One pool plus its alignment padding, backed by src/base. */
+    REQUIRE(edit_arena_init(&arena, sizeof(work_pool) + _Alignof(work_pool)) == 0);
+    work_pool *pool = edit_arena_alloc(&arena, sizeof(work_pool), _Alignof(work_pool)); REQUIRE(pool);
+    REQUIRE(work_pool_init(pool, 1u, 0) == 0); /* (P) one bulk worker, no raster worker */
+    query_job job = {language, text, snapshot, HL_QUERY_ARG};
+    uint32_t generation = (uint32_t)strlen(text); /* (P) fixture-derived identity */
+    work_handle handle = work_submit(pool, (work_job){query_worker_job, &job, generation, WORK_BULK});
+    REQUIRE(handle.epoch);
+    received_scopes received = {generation, strlen(text), 0, false, false, false};
+    while (!work_handle_finished(pool, handle) || work_mailbox_pending(pool)) {
+        (void)work_mailbox_receive(pool, handle, generation, receive_scopes, &received);
+        sched_yield();
+    }
+    REQUIRE(job.status == HL_QUERY_OK && received.completed && !received.failed);
+    REQUIRE(received.spans && received.saw_function);
+    work_pool_shutdown(pool); edit_arena_free(&arena);
+    piece_snapshot_release(snapshot); piece_destroy(source);
+    return 0;
+}
+
+static int query_test(void)
+{
+    /* (P) Numeric literals here are syntax fixtures, not timing/count budgets. */
+    const char c[] = "// comment\nint greet(int value) { const char *s = \"hello\"; return value + 42 + LIMIT; }\n";
+    const char rust[] = "// comment\n#[inline]\nfn greet(value: i32) -> i32 { let s = \"hello\"; let x = Some; return 42; }\n";
+    REQUIRE(language_test(hl_language_c(), c, false) == 0);
+    REQUIRE(language_test(hl_language_rust(), rust, true) == 0);
+    REQUIRE(mailbox_query_test(hl_language_c(), c) == 0);
+    REQUIRE(mailbox_query_test(hl_language_rust(), rust) == 0);
+    for (hl_scope scope = HL_SCOPE_COMMENT; scope < HL_SCOPE_COUNT; scope++) {
+        const char *key = hl_scope_key(scope); REQUIRE(key);
+        REQUIRE(config_theme_color(CONFIG_DARK, key));
+        REQUIRE(config_theme_color(CONFIG_LIGHT, key));
+    }
+    REQUIRE(!strcmp(hl_scope_key(HL_SCOPE_DEFAULT), "editor.foreground"));
+    work_msg message = {0}; hl_span span = {0};
+    REQUIRE(hl_span_decode(&message, &span) == HL_QUERY_ARG);
+    span = (hl_span){0, sizeof "x" - 1u, HL_SCOPE_KEYWORD, 0};
+    REQUIRE(hl_span_encode(&message, 0, &span) == HL_QUERY_OK);
+    uint32_t invalid_scope = HL_SCOPE_COUNT;
+    /* (P) Scope follows the two fixed-width byte endpoints on the wire. */
+    memcpy(message.data + sizeof(uint64_t) + sizeof(uint64_t), &invalid_scope, sizeof invalid_scope);
+    REQUIRE(hl_span_decode(&message, &span) == HL_QUERY_ARG);
+    span.scope = HL_SCOPE_COUNT;
+    REQUIRE(hl_span_encode(&message, 0, &span) == HL_QUERY_ARG);
+    span = (hl_span){0, 0, HL_SCOPE_DEFAULT, 0}; /* (P) empty ranges carry no capture */
+    REQUIRE(hl_span_encode(&message, 0, &span) == HL_QUERY_ARG);
+    puts("hl_test: PASS C/Rust parse, queries, predicates, scopes, row range, pointer-free spans, worker publication/completion, themes");
+    return 0;
+}
+
 int main(void)
 {
+    REQUIRE(query_test() == 0);
     const char text[] = "prefix\nviewport\nsuffix\n";
     const uint64_t first = sizeof "prefix\n" - 1u;
     const uint64_t end = first + sizeof "viewport\n" - 1u;

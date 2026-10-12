@@ -1,0 +1,3 @@
+tree-sitter-rust v0.24.2 from https://github.com/tree-sitter/tree-sitter-rust/archive/refs/tags/v0.24.2.tar.gz
+sha256 061e90a539a55a6aa65dceb0ad6425c50ab1a6e3e6d4ba430e2795ed4550f10e
+extracted: src/, queries/, LICENSE only (2026-10-12)
