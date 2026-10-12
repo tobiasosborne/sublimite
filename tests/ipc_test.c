@@ -721,6 +721,14 @@ static void t_main_launcher(const char *dir, bool isolated)
         int events[2], commands[2], input[2];
         CHECK(pipe(events) == 0 && pipe(commands) == 0 && pipe(input) == 0);
         CHECK(write(input[1], "\0x", 2) == 2); close(input[1]);
+        /* edit-379: one journal directory per mode. Mode 1 kills its UI with
+         * both tabs open; since edit-457.8 hot exit, the next launch in the
+         * same XDG_DATA_HOME adopts that unlocked session journal and restores
+         * its tabs (product behaviour, editor_hot_exit_test), so a shared
+         * directory made mode 2 see 2 restored + 2 requested = 4 tabs. */
+        char data_home[IPC_PATH_CAP];
+        CHECK(snprintf(data_home, sizeof data_home, "%s/data-%u", rt, mode) < (int)sizeof data_home);
+        CHECK(mkdir(data_home, 0700) == 0);
         pid_t launcher = fork(); CHECK(launcher >= 0);
         if (!launcher) {
             CHECK(setsid() >= 0); close(events[0]); close(commands[1]);
@@ -729,7 +737,7 @@ static void t_main_launcher(const char *dir, bool isolated)
             CHECK(setenv("IPC_TEST_EVENTS", number, 1) == 0);
             CHECK(snprintf(number, sizeof number, "%d", commands[0]) > 0);
             CHECK(setenv("IPC_TEST_COMMANDS", number, 1) == 0);
-            CHECK(setenv("XDG_RUNTIME_DIR", rt, 1) == 0 && setenv("XDG_DATA_HOME", rt, 1) == 0);
+            CHECK(setenv("XDG_RUNTIME_DIR", rt, 1) == 0 && setenv("XDG_DATA_HOME", data_home, 1) == 0);
             CHECK(unsetenv("EDIT_TRACE_DUMP") == 0);
             char *argv[6] = {"sublimite"}; int argc = 1;
             if (waiting) argv[argc++] = "--wait";
@@ -910,13 +918,17 @@ static void t_astra_many_open(const char *dir, bool handoff)
     int changed_fd = open(e->buffer->path, O_WRONLY | O_APPEND); CHECK(changed_fd >= 0);
     CHECK(write(changed_fd, "changed\n", sizeof "changed\n" - 1u) == (ssize_t)(sizeof "changed\n" - 1u));
     close(changed_fd);
-    /* Reuse the file-suite's existing watchdog/cadence, not a latency budget. */
-    for (unsigned retry = 0; retry < 5000 && !editor_get_stats(e).source_stale; retry++) {
-        CHECK(editor_poll_sources(e) == 0);
+    /* edit-379: since edit-ret a clean buffer reloads silently on an external
+     * change instead of raising source_stale, so delivery through the shared
+     * epoll is observed as the reload: "text\n" (5 B) + "changed\n" (8 B) = 13 B.
+     * Reuse the file-suite's existing watchdog/cadence, not a latency budget. */
+    const uint64_t reloaded = (sizeof "text\n" - 1u) + (sizeof "changed\n" - 1u);
+    for (unsigned retry = 0; retry < 5000 && editor_length(e) != reloaded; retry++) {
+        CHECK(editor_poll_sources(e) == 0); CHECK(editor_step(e, 0) >= 0);
         struct timespec pause = {0, 1000000}; (void)nanosleep(&pause, NULL);
     }
-    CHECK(editor_get_stats(e).source_stale);
-    puts("astra_many_open: shared epoll survives retirement; Source changed state delivered");
+    CHECK(editor_length(e) == reloaded && !editor_get_stats(e).source_stale);
+    puts("astra_many_open: shared epoll survives retirement; clean source change reloaded");
     editor_close(e); if (handoff) ipc_server_fini(&server); rm_rf(rt);
 }
 static int run_suite(const char *only, int ns_fd)
