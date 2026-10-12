@@ -1,6 +1,7 @@
 #include "editor/editor.h"
 #include "base/base.h"
 #include "editor/private.h"
+#include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -49,12 +50,16 @@ static int settle_map(editor *e)
     }
     return EDITOR_MORE;
 }
-typedef struct held_source { piece_snapshot *snap; _Atomic bool entered, release; } held_source;
+typedef struct held_source { piece_snapshot *snap; pthread_t ui; _Atomic bool entered, release; } held_source;
+/* edit-91c: resident.c's lane probe derives window addresses through the
+ * source on the UI thread (no byte access); only the worker copy is held. */
 static size_t held_span(void *ctx, uint64_t off, const uint8_t **out)
 {
     held_source *h = ctx;
-    atomic_store(&h->entered, true);
-    while (!atomic_load(&h->release)) sched_yield();
+    if (!pthread_equal(pthread_self(), h->ui)) {
+        atomic_store(&h->entered, true);
+        while (!atomic_load(&h->release)) sched_yield();
+    }
     piece_iter it; size_t n = 0; piece_iter_begin_snapshot(&it, h->snap, off);
     return piece_iter_next(&it, out, &n) ? n : 0;
 }
@@ -93,7 +98,7 @@ static int cancellation(void)
     CHECK(render_null_backend(&backend) == 0 && editor_open(&e, &cfg, &backend) == 0 && settle(e) == 0);
     editor_buffer *b = e->buffer;
     CHECK(!b->scroll_resident.generation);
-    hold.snap = b->scroll_snapshot;
+    hold.snap = b->scroll_snapshot; hold.ui = pthread_self();
     b->scroll_resident.snapshot.ctx = &hold; b->scroll_resident.snapshot.span = held_span;
     uint64_t submitted_frames = backend.stats.submitted_frames;
     /* Travel past the prepared rows so this test requires a worker window. */

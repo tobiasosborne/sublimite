@@ -157,8 +157,10 @@ int scroll_resolve(scroll_state *s, lineidx *index, const lineidx_src *source,
                    uint64_t budget);
 int scroll_follow_cursor(scroll_state *s, lineidx *index,
                          const lineidx_src *source, uint64_t cursor_byte);
-/* Resident source bridge: immutable snapshot bytes are copied on WORK_BULK
- * into two fixed caller-owned windows and adopted ONLY through work mailboxes.
+/* Resident source bridge: immutable snapshot bytes are copied on a worker
+ * (WORK_FOREGROUND when the pool has that lane and every page of the window
+ * is in core, else WORK_BULK; edit-91c) into two fixed caller-owned windows
+ * and adopted ONLY through work mailboxes.
  * Init/close are setup/maintenance operations. Keep source.ctx/backing alive
  * until close returns OK; release ownership remains with the caller. Never
  * use a raw mapped source with the foreground slice API. A missing window

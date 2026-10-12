@@ -976,6 +976,117 @@ cleanup:
     return result;
 }
 
+/* edit-91c: a window whose pages are in core is acquired on the foreground
+ * lane when the pool has one, so a follow outside the laid-out rows does not
+ * wait behind bulk index/warm/find jobs; pages not in core (blocking I/O)
+ * keep the bulk lane, and a pool without the lane keeps bulk for everything.
+ * The bulk lane is held by a blocking job for the whole in-core resolution. */
+static void hold_bulk(work_ctx *c)
+{
+    _Atomic bool *release = c->arg;
+    while (!atomic_load(release) && !work_should_stop(c))
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+}
+static size_t whole_span(void *ctx, uint64_t off, const uint8_t **out)
+{
+    flat *f = ctx;
+    if (off >= f->size) return 0;
+    *out = f->bytes + off;
+    return f->size - (size_t)off;
+}
+static int resident_lane_choice(void)
+{
+    int result = 1, fd = -1;
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    scroll_resident resident, evicted_resident;
+    bool initialized = false, resident_initialized = false, evicted_initialized = false;
+    lineidx *index = NULL;
+    void *mapping = MAP_FAILED;
+    static uint8_t bytes[2u * SCROLL_SCAN_BUDGET];
+    char path[] = "build/scroll-lane-XXXXXX";
+    memset(bytes, 'x', sizeof bytes);
+    for (size_t i = 9; i < sizeof bytes; i += 10) bytes[i] = '\n';
+    flat data = {bytes, sizeof bytes};
+    lineidx_src src = {&data, sizeof bytes, whole_span, NULL};
+    CHECK(pool && work_pool_init_foreground(pool, 1, 0) == 0);
+    initialized = true;
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle held = work_submit(pool, (work_job){hold_bulk, &release, 0, WORK_BULK});
+    CHECK(held.epoch);
+    CHECK(scroll_resident_init(&resident, pool, &src) == 0); resident_initialized = true;
+    index = lineidx_create(sizeof bytes); CHECK(index);
+    scroll_state s;
+    CHECK(scroll_init(&s, (scroll_config){4, 17, 1}, (scroll_extent){sizeof bytes, 1, false}) == 0);
+    CHECK(scroll_seek_byte(&s, 100005) == 0);
+    scroll_resolver resolver = {0};
+    /* Watchdog: the editor suites' existing 5 s setup/settle deadline. */
+    struct timespec ts; CHECK(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    uint64_t t0 = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec, now = t0;
+    int rc = SCROLL_MORE;
+    while (rc == SCROLL_MORE && now - t0 < UINT64_C(5000000000)) {
+        (void)nanosleep(&(struct timespec){0, 100000}, NULL);
+        rc = scroll_resolve_resident(&s, &resolver, index, &resident, 0, 0);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+        now = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    }
+    printf("scroll_test: edit-91c in-core window while bulk held: rc=%d wait_ns=%llu (M)\n",
+           rc, (unsigned long long)(now - t0));
+    CHECK(rc == SCROLL_OK);
+    CHECK(s.first_byte == 100000);
+    CHECK(!work_handle_finished(pool, held)); /* the bulk lane never ran it */
+    /* A window whose pages are not in core must not take the foreground
+     * lane: it stays pending while bulk is held and completes after release.
+     * Eviction: drop the PTEs, then the clean page cache; verify with mincore
+     * and skip the fallback half when the kernel kept the pages. */
+    fd = mkstemp(path); CHECK(fd >= 0);
+    CHECK(write(fd, bytes, sizeof bytes) == (ssize_t)sizeof bytes && fsync(fd) == 0);
+    mapping = mmap(NULL, sizeof bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(mapping != MAP_FAILED);
+    CHECK(madvise(mapping, sizeof bytes, MADV_DONTNEED) == 0);
+    CHECK(posix_fadvise(fd, 0, (off_t)sizeof bytes, POSIX_FADV_DONTNEED) == 0);
+    unsigned char vec[2u * SCROLL_SCAN_BUDGET / 4096u];
+    CHECK(mincore(mapping, sizeof bytes, vec) == 0);
+    bool in_core = false;
+    for (size_t i = 0; i < sizeof vec; i++) if (vec[i] & 1u) in_core = true;
+    if (in_core) puts("scroll_test: edit-91c page cache eviction unavailable here, fallback half SKIPPED");
+    else {
+        flat evicted = {mapping, sizeof bytes};
+        lineidx_src evicted_src = {&evicted, sizeof bytes, whole_span, NULL};
+        CHECK(scroll_resident_init(&evicted_resident, pool, &evicted_src) == 0); evicted_initialized = true;
+        scroll_state t; scroll_resolver evicted_resolver = {0};
+        CHECK(scroll_init(&t, (scroll_config){4, 17, 1}, (scroll_extent){sizeof bytes, 1, false}) == 0);
+        CHECK(scroll_seek_byte(&t, 100005) == 0);
+        /* 100 polls x 0.1 ms = 10 ms: a foreground copy of 64 KiB would have
+         * published long before (resident_navigation completes the same
+         * window in one poll loop); a bulk copy cannot start while held. */
+        rc = SCROLL_MORE;
+        for (unsigned i = 0; i < 100 && rc == SCROLL_MORE; i++) {
+            (void)nanosleep(&(struct timespec){0, 100000}, NULL);
+            rc = scroll_resolve_resident(&t, &evicted_resolver, index, &evicted_resident, 0, 0);
+        }
+        CHECK(rc == SCROLL_MORE);
+        atomic_store(&release, true);
+        for (unsigned i = 0; i < 100000 && rc == SCROLL_MORE; i++) {
+            (void)nanosleep(&(struct timespec){0, 100000}, NULL);
+            rc = scroll_resolve_resident(&t, &evicted_resolver, index, &evicted_resident, 0, 0);
+        }
+        CHECK(rc == SCROLL_OK && t.first_byte == 100000);
+        puts("scroll_test: edit-91c evicted window kept the bulk lane PASS");
+    }
+    atomic_store(&release, true);
+    puts("scroll_test: edit-91c resident lane choice PASS");
+    result = 0;
+cleanup:
+    atomic_store(&release, true);
+    lineidx_destroy(index);
+    if (evicted_initialized) { while (scroll_resident_close(&evicted_resident) == SCROLL_MORE) (void)nanosleep(&(struct timespec){0, 100000}, NULL); }
+    if (resident_initialized) { while (scroll_resident_close(&resident) == SCROLL_MORE) (void)nanosleep(&(struct timespec){0, 100000}, NULL); }
+    if (initialized) work_pool_shutdown(pool);
+    free(pool);
+    if (mapping != MAP_FAILED) (void)munmap(mapping, sizeof bytes);
+    if (fd >= 0) { (void)close(fd); (void)unlink(path); }
+    return result;
+}
 int main(int argc, char **argv)
 {
     if (getenv("P4_RESIDENT_FAULT")) return mapped_resident_faults(false) || mapped_resident_faults(true);
@@ -987,6 +1098,8 @@ int main(int argc, char **argv)
     if (wrapped_navigation()) return 1;
     if (wrapped_integer_limits()) return 1;
     if (editor_observability(true)) return 1;
+    if (getenv("P4_RESIDENT_LANE")) return resident_lane_choice();
+    if (resident_lane_choice()) return 1;
     if (resident_failure_and_retirement() || resident_navigation() || complete_operation_budget() || follow_operation_budget() || delegated_source_errors() || accumulation() || keys_and_follow() || correction() || unindexed_ends() || follow_proof() || bounded_and_allocations()) return 1;
     puts("scroll_test: PASS");
     return 0;

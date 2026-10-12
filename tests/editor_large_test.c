@@ -972,9 +972,151 @@ static int near_end_repro(bool wrapped)
     puts("edit-2ty near-end input/submit: ok"); return 0;
 }
 
+/* edit-91c: Ctrl+End and PageUp/PageDown into rows that are not laid out
+ * resolve through resident windows. While the bulk lane is occupied (held
+ * here by a blocking job, modelling the 1 GiB index build, warm and find jobs
+ * that occupy it after open) an in-core window must still arrive, on the
+ * foreground lane, so each follow submits its frame while bulk stays held.
+ * hold=false runs the same keys during the real index build and only
+ * measures. Budget for Ctrl+End -> first frame at the end: G5 warm, A column
+ * (perf/01-perf-target.md section 0.2): open request -> correct first
+ * viewport = one 64 KiB read + one full frame, PB 1.025 ms (E), gate
+ * 6 / 9 ms p50/p99 (G). A resident window is SCROLL_SCAN_BUDGET = 64 KiB,
+ * the same read, followed by the same full frame, so the row transfers.
+ * Tracked (law 1), not enforced; the only enforced bound is the suites'
+ * existing 5 s watchdog. */
+typedef struct lane_hold { _Atomic bool release, running; } lane_hold;
+static void hold_lane(work_ctx *c)
+{
+    lane_hold *l = c->arg; atomic_store(&l->running, true);
+    while (!atomic_load(&l->release) && !work_should_stop(c))
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+}
+#define EDIT_91C_G5_P50_NS UINT64_C(6000000)
+#define EDIT_91C_G5_P99_NS UINT64_C(9000000)
+static int starved_follows(bool hold, bool after_index)
+{
+    const char *path = "/tmp/edit-corpus/log_1g.txt";
+    struct stat st; T(stat(path, &st) == 0);
+    T((uint64_t)st.st_size == UINT64_C(1024) * 1024u * 1024u);
+    char power[64] = "unavailable";
+    FILE *battery = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (battery) { T(fgets(power, sizeof power, battery)); T(fclose(battery) == 0); }
+    power[strcspn(power, "\n")] = 0;
+    const char *tag = !strcmp(power, "Discharging") ? "[bat]" :
+        !strcmp(power, "unavailable") ? "[unknown]" : "[AC]";
+    /* Independent tail oracle over the last two resident windows: the EOF
+     * window is [size - 64 KiB, size) because size is a multiple of 64 KiB,
+     * so paging up out of it requests a second window while bulk is held. */
+    enum { ORACLE = 2u * SCROLL_SCAN_BUDGET };
+    static uint8_t tail[ORACLE]; static uint64_t starts[ORACLE]; size_t nstarts = 0;
+    uint64_t tail_at = (uint64_t)st.st_size - ORACLE;
+    int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+    T(pread(fd, tail, ORACLE, (off_t)tail_at) == (ssize_t)ORACLE); T(close(fd) == 0);
+    for (size_t i = 0; i < ORACLE; i++) if (tail[i] == '\n') starts[nstarts++] = tail_at + i + 1u;
+    size_t window_lines = 0; /* line starts inside the EOF window */
+    for (size_t i = 0; i < nstarts; i++) if (starts[i] >= tail_at + SCROLL_SCAN_BUDGET) window_lines++;
+    T(window_lines && window_lines < nstarts);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    hooks h = {0};
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
+        .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!h.frames) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    if (after_index) {
+        /* The agh family: index complete, warm/find still own the bulk lane. */
+        while (!editor_index_complete(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+        T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    }
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = {0, 0};
+    if (hold) {
+        held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK}); T(held.epoch);
+        /* The index/warm invocations queued ahead run to their slice end;
+         * then the hold owns the lane for the whole key sequence. */
+        deadline = trace_now_ns() + UINT64_C(5000000000);
+        while (!atomic_load(&lane.running)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    }
+    bool index_before = editor_index_complete(e);
+    size_t page = e->v.config.rows;
+    size_t pages_up = window_lines / page + 2u; /* leaves the EOF window */
+    T(pages_up * page < nstarts);
+    uint64_t preferred = (uint64_t)st.st_size - starts[nstarts - 1u];
+    uint64_t end_ns = 0, worst_page_ns = 0;
+    size_t pages = 0;
+    /* During the build only Ctrl+End is in scope: page motions keep view's
+     * exact cursor-line query, which waits for the index (reported). */
+    size_t actions = hold && !after_index ? 1u : 1u + 2u * pages_up;
+    for (size_t action = 0; action < actions; action++) {
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true};
+        if (!action) { ev.keysym = XKB_KEY_End; ev.mods = PLAT_MOD_CTRL; }
+        else if (action <= pages_up) { ev.keysym = XKB_KEY_Page_Up; pages++; }
+        else { ev.keysym = XKB_KEY_Page_Down; pages--; }
+        uint64_t sequence = editor_get_stats(e).input_sequence + 1u;
+        ev.t0_ns = trace_now_ns(); T(editor_inject(e, &ev) == 0);
+        deadline = ev.t0_ns + UINT64_C(5000000000); /* existing setup/settle watchdog */
+        uint64_t next_report = ev.t0_ns + UINT64_C(100000000);
+        while (editor_get_stats(e).submitted_sequence < sequence && trace_now_ns() < deadline) {
+            T(editor_step(e, 0) >= 0);
+            if (getenv("EDIT_91C_TRACE") && trace_now_ns() >= next_report) {
+                next_report += UINT64_C(100000000);
+                fprintf(stderr, "edit-91c t=%llu ms scroll_pending=%d resident_pending=%d windows=%u/%u view_busy=%d phase=%u query_pos=%llu index_complete=%d prefix=%zu first_byte=%llu\n",
+                    (unsigned long long)((trace_now_ns() - ev.t0_ns) / 1000000u), e->buffer->scroll_pending, e->buffer->scroll_resident.pending,
+                    e->buffer->scroll_resident.windows[0].state, e->buffer->scroll_resident.windows[1].state,
+                    view_busy(&e->v), e->v.phase, (unsigned long long)e->v.query_pos, editor_index_complete(e),
+                    lineidx_built_prefix(e->buffer->index), (unsigned long long)editor_view(e).first_byte);
+            }
+        }
+        if (editor_get_stats(e).submitted_sequence < sequence) {
+            fprintf(stderr, "edit-91c stalled: hold=%d action=%zu scroll_pending=%d resident_pending=%d windows=%u/%u "
+                "view_busy=%d phase=%u query_pos=%llu query_target=%llu index_complete=%d (M)%s\n",
+                hold, action, e->buffer->scroll_pending, e->buffer->scroll_resident.pending,
+                e->buffer->scroll_resident.windows[0].state, e->buffer->scroll_resident.windows[1].state,
+                view_busy(&e->v), e->v.phase, (unsigned long long)e->v.query_pos, (unsigned long long)e->v.query_target,
+                editor_index_complete(e), tag);
+            atomic_store(&lane.release, true);
+            T(editor_get_stats(e).submitted_sequence >= sequence);
+        }
+        uint64_t ns = h.submit_ns - ev.t0_ns;
+        if (!action) end_ns = ns; else if (ns > worst_page_ns) worst_page_ns = ns;
+        if (hold) T(!work_handle_finished(&e->pool, held)); /* never through the bulk lane */
+        size_t line = nstarts - 1u - pages * page;
+        uint64_t start = starts[line];
+        uint64_t end = line + 1u < nstarts ? starts[line + 1u] - 1u : (uint64_t)st.st_size;
+        if (end > start && tail[(size_t)(end - tail_at - 1u)] == '\r') end--;
+        uint64_t expected = !action ? (uint64_t)st.st_size : start + (preferred < end - start ? preferred : end - start);
+        T(editor_view(e).selection.cursor == expected);
+        T(editor_view(e).selection.anchor == expected);
+        /* The submitted top is a certified line start from the oracle. */
+        size_t first = 0;
+        while (first < nstarts && starts[first] != editor_view(e).first_byte) first++;
+        T(first < nstarts);
+        T(editor_view(e).first_byte <= expected);
+    }
+    bool index_after = editor_index_complete(e);
+    printf("edit-91c hold=%d after_index=%d ctrl_end_submit_ns=%llu worst_page_submit_ns=%llu (M)%s=submit-t0 "
+           "budget_ns=%llu/%llu (G)=G5 warm A p50/p99, 64 KiB read + full frame, PB 1.025 ms (E) "
+           "index_complete=%d->%d pages=%zu gate=TRACK\n",
+        hold, after_index, (unsigned long long)end_ns, (unsigned long long)worst_page_ns, tag,
+        (unsigned long long)EDIT_91C_G5_P50_NS, (unsigned long long)EDIT_91C_G5_P99_NS,
+        index_before, index_after, pages_up);
+    atomic_store(&lane.release, true);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    if (h.active) { h.allocations += edit_malloc_guard_end(); h.active = false; }
+    editor_close(e);
+    printf("edit-91c %s follows outside laid-out rows: ok\n",
+        !hold ? "index-building" : after_index ? "bulk-held after index" : "bulk-held during build");
+    return 0;
+}
 int main(void)
 {
     trace_init(); (void)trace_thread_register();
+    if (getenv("EDIT_91C_STARVED"))
+        return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
+    T(starved_follows(true, false) == 0);
+    T(starved_follows(true, true) == 0);
+    T(starved_follows(false, false) == 0);
     if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete(getenv("P4_ESTIMATED_WRAP") != NULL);
     if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
     if (getenv("P4_COLD_WRAP")) return cold_bracket_paint(true);

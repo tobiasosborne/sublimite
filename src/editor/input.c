@@ -856,6 +856,28 @@ bool editor_event_control(const editor *e, const plat_event *ev)
     default: return false;
     }
 }
+/* edit-91c: Ctrl+End on a lazy large file whose line count is not exact.
+ * view's VIEW_DOC_END finishes with an exact line query for EOF; with no
+ * index anchor near EOF that is a UI-thread scan of the whole file, seeded
+ * only when the index completes (large.c seed_navigation), so the frame at
+ * the end waited for the index build (1.39 s (M) on the 1 GiB log corpus,
+ * sanitizer build, docs/worker-reports/edit-91c-s6.md). Place the cursor as
+ * the byte jump does (large.c editor_large_goto_byte) and let scrollctl
+ * resolve the EOF viewport through resident windows with an estimated label;
+ * the index relabels it on completion. Page motions keep view's exact query. */
+static int large_doc_end(editor *e, bool extend)
+{
+    view_state *s = &e->v.state;
+    uint64_t total = piece_len(e->tree);
+    s->selection.cursor = total;
+    if (!extend) s->selection.anchor = total;
+    s->selection.preferred_col = VIEW_PREFERRED_UNSET;
+    s->visual_end = false; s->hscroll = 0;
+    if (e->selection_command) soft_record(e, false);
+    e->action = EDITOR_ACTION_NONE;
+    pointer_unit_finish(e);
+    return editor_refresh_cursor(e, e->old_cursor);
+}
 int editor_handle_key(editor *e, const plat_event *ev)
 {
     /* An open go-to-line prompt owns Escape and digits over the find panel. */
@@ -1003,6 +1025,8 @@ int editor_handle_key(editor *e, const plat_event *ev)
         if (scroll_motion) {
             rc = scroll_key_motion(&e->buffer->scroll, scroll_key_value, &move); if (rc) return rc;
             e->buffer->scroll_following = false; e->buffer->scroll_pending = true;
+            if (move == VIEW_DOC_END && e->buffer->lg.lazy && !e->buffer->lg.lines_exact)
+                return large_doc_end(e, binding && (binding->args.flags & KEYS_ARG_EXTEND));
         }
     }
     view_change c;

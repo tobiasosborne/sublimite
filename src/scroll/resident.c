@@ -2,6 +2,8 @@
 #include "file/file.h"
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /* Window state belongs to UI; filled/error and byte storage belong to the
  * worker until the terminal message seals them. UI never polls worker fields. */
@@ -28,7 +30,8 @@ static void acquire_window(work_ctx *ctx)
         if (n > w->length - w->filled) n = w->length - w->filled;
         if (n > 4096u) n = 4096u;
         /* This is the only raw snapshot dereference: storage faults happen
-         * on the bulk worker before the resident window is published. */
+         * on a worker (bulk, or foreground for an in-core window, edit-91c)
+         * before the resident window is published. */
         memcpy(w->bytes + w->filled, p, n);
         if (file_backing_faulted(w->owner->backing)) { w->error = SCROLL_ERR_SOURCE; break; }
         w->filled += n;
@@ -92,6 +95,54 @@ int scroll_resident_close(scroll_resident *r)
     file_backing_release(r->backing); r->backing = NULL;
     return SCROLL_OK;
 }
+/* edit-91c: lane choice for one window copy (docs/decisions/edit-91c.md).
+ * The bulk lane is occupied by a large file's index build, warm and find
+ * jobs, each a continuation that re-queues behind the others, so a follow
+ * outside the laid-out rows waited a whole round of their slices (or, when a
+ * test holds the lane, forever). The foreground lane's contract (work.h,
+ * work_pool_init_foreground) admits bounded CPU work that polls cancellation
+ * every 5 ms CPU and never blocks on I/O. acquire_window copies at most
+ * SCROLL_SCAN_BUDGET = 64 KiB in 4 KiB pieces with work_should_stop between
+ * them: 65536 B / 6.3e9 B/s (naive scalar rate, perf/00-hardware-profile.md
+ * (M)[bat]) = about 10 us (E) per window, far inside that bound. What could
+ * block is a major page fault on a file-backed snapshot, so the copy takes
+ * the foreground lane only when every page of the window is in core now:
+ * mincore over the window's spans, addresses only (piece_iter_next derives
+ * pointers without touching bytes), no dereference on the UI thread. A page
+ * cached but not yet in this process's page table costs a minor fault,
+ * about 1 us (E, perf/01-perf-target.md section 2.4 fault-around estimate):
+ * 65536 / 4096 = 16 pages (G, existing constants) x 1 us = 16 us (E). The
+ * probe is bounded by the same count: at most 16 spans, one mincore each;
+ * a window fragmented into more spans, a page not in core, a failed probe,
+ * a page size below 4 KiB or a pool without the lane keep WORK_BULK. The
+ * check-to-copy race (eviction under memory pressure between the probe and
+ * the copy) is the contract's own stated softness: "OS scheduling and
+ * memory-bandwidth contention are not hard wall-time guarantees". */
+#define RESIDENT_PROBE_PAGES (SCROLL_SCAN_BUDGET / 4096u)
+static work_class window_class(const scroll_resident *r, uint64_t start, size_t length)
+{
+    if (!r->pool->foreground_enabled) return WORK_BULK;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size < 4096) return WORK_BULK;
+    uintptr_t page = (uintptr_t)page_size, mask = ~(page - 1u);
+    const lineidx_src *src = &r->snapshot;
+    uint64_t off = start, end = start + length;
+    unsigned char vec[RESIDENT_PROBE_PAGES + 1u];
+    for (unsigned spans = 0; off < end; spans++) {
+        if (spans >= RESIDENT_PROBE_PAGES) return WORK_BULK;
+        const uint8_t *p = NULL;
+        size_t n = src->span(src->ctx, off, &p);
+        if (!n || !p) return WORK_BULK;
+        if (n > end - off) n = (size_t)(end - off);
+        uintptr_t lo = (uintptr_t)p & mask, hi = ((uintptr_t)p + n + page - 1u) & mask;
+        size_t pages = (size_t)((hi - lo) / page);
+        if (pages > sizeof vec) return WORK_BULK;
+        if (mincore((void *)lo, (size_t)(hi - lo), vec)) return WORK_BULK;
+        for (size_t i = 0; i < pages; i++) if (!(vec[i] & 1u)) return WORK_BULK;
+        off += n;
+    }
+    return WORK_FOREGROUND;
+}
 static size_t resident_span(void *ctx, uint64_t off, const uint8_t **out)
 {
     scroll_resident *r = ctx; *out = NULL;
@@ -116,7 +167,10 @@ static size_t resident_span(void *ctx, uint64_t off, const uint8_t **out)
         w->start = start; w->length = (size_t)(r->snapshot.len - start);
         if (w->length > SCROLL_SCAN_BUDGET) w->length = SCROLL_SCAN_BUDGET;
         w->filled = 0; w->error = 0; w->generation = ++r->generation;
-        w->handle = work_submit(r->pool, (work_job){acquire_window, w, w->generation, WORK_BULK});
+        work_class cls = window_class(r, w->start, w->length);
+        w->handle = work_submit(r->pool, (work_job){acquire_window, w, w->generation, cls});
+        if (!w->handle.epoch && cls == WORK_FOREGROUND) /* lane reserve exhausted */
+            w->handle = work_submit(r->pool, (work_job){acquire_window, w, w->generation, WORK_BULK});
         if (!w->handle.epoch) { w->state = WINDOW_FREE; r->pending = true; return 0; }
         w->state = WINDOW_PENDING;
         (void)work_mailbox_bind(r->pool, w->handle, w->generation, receive_window, w);
