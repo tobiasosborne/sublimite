@@ -48,16 +48,21 @@ int editor_checkpoint(editor *e)
             p = record(records, &count, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!p) goto done;
             memcpy(p, b->path, strlen(b->path) + 1);
         }
-        if (b->base.size) {
-            p = record(records, &count, JOURNAL_DELETE, b->id, 16); if (!p) goto done;
-            put64(p + 8, b->base.size);
-        }
-        uint64_t len = piece_len(b->tree);
-        for (uint64_t off = 0; off < len;) {
-            size_t n = len - off < 4096u ? (size_t)(len - off) : 4096u;
-            p = record(records, &count, JOURNAL_INSERT, b->id, n + 8); if (!p) goto done;
-            put64(p, off); rc = piece_read(b->tree, off, p + 8, n); if (rc) goto done;
-            rc = JOURNAL_NOMEM; off += n;
+        /* Before adoption the tree is empty and preview is only a prefix.
+         * BASE already describes the intact file; preserve it without content
+         * replacement. An adopted empty tree still represents a deletion. */
+        if (!b->pending_open) {
+            if (b->base.size) {
+                p = record(records, &count, JOURNAL_DELETE, b->id, 16); if (!p) goto done;
+                put64(p + 8, b->base.size);
+            }
+            uint64_t len = piece_len(b->tree);
+            for (uint64_t off = 0; off < len;) {
+                size_t n = len - off < 4096u ? (size_t)(len - off) : 4096u;
+                p = record(records, &count, JOURNAL_INSERT, b->id, n + 8); if (!p) goto done;
+                put64(p, off); rc = piece_read(b->tree, off, p + 8, n); if (rc) goto done;
+                rc = JOURNAL_NOMEM; off += n;
+            }
         }
         view_state state = b == e->buffer ? e->v.state : b->initial;
         for (size_t j = 0; j < tabs_count(&e->tabs); j++) {
