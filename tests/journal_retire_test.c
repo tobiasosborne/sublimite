@@ -284,8 +284,39 @@ static int measurement(void)
         !strcmp(power,"Discharging")?"bat":"AC",power,FIXTURE_SESSIONS,(long long)st.st_size,strlen("base"),(unsigned long long)before,(unsigned long long)after,load1);
     T(cleanup(root)==0); return 0;
 }
+/* edit-cxo: a second instance's startup housekeeping runs in the window
+ * between the first instance creating its session journal and its editor
+ * starting. The placeholder must survive, its lease must already be held, and
+ * the owner's editor must start on it. */
+static int startup_window(void)
+{
+    char root[]="build/window-XXXXXX"; T(mkdtemp(root));
+    char path[sizeof ((journal_base *)0)->captured_path], lock[sizeof path]; int lease=-1;
+    T(journal_session_create(root,path,sizeof path,&lease)==0);
+    const char *leaf=strrchr(path,'/'); T(leaf && !strncmp(leaf+1,"session-",strlen("session-")) && !strchr(leaf+1,'.'));
+    T(journal_retire_directory(root,NULL)==0);
+    T(access(path,F_OK)==0); /* red: retired as an empty clean placeholder */
+    T(snprintf(lock,sizeof lock,"%s/.%s.lock",root,leaf+1)>0);
+    int other=open(lock,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600); T(other>=0);
+    T(flock(other,LOCK_EX|LOCK_NB)!=0); close(other); /* red: lease free for others */
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config config={.journal_path=path,.start_empty=true,.session_lease=&lease}; editor *e=NULL;
+    T(editor_open(&e,&config,&backend)==0);
+    T(close(lease)==0); /* the editor holds its own duplicate of the lease */
+    other=open(lock,O_RDWR|O_CLOEXEC|O_NOFOLLOW); T(other>=0);
+    T(flock(other,LOCK_EX|LOCK_NB)!=0);
+    editor_close(e); T(flock(other,LOCK_EX|LOCK_NB)==0); close(other);
+    /* A lease that does not guard this journal is refused. */
+    char stray[sizeof path]; int wrong=-1;
+    T(journal_session_create(root,stray,sizeof stray,&wrong)==0);
+    char second[sizeof path]; int held=-1; T(journal_session_create(root,second,sizeof second,&held)==0);
+    config.journal_path=second; config.session_lease=&wrong; e=NULL;
+    int rc=editor_open(&e,&config,&backend); if(e) editor_close(e); T(rc!=0);
+    T(close(wrong)==0); T(close(held)==0);
+    T(cleanup(root)==0); return 0;
+}
 int main(void)
 {
-    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(measurement()==0);
+    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }

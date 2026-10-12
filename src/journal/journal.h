@@ -349,6 +349,13 @@ int journal_scan_file(const char *path, journal_visit visit, void *ctx,
  * empty journal + strlen("base")=4-byte retained original) = 131200 bytes.
  * (E): reuse that observed footprint as the eligible-artifact retention cap. */
 int journal_retire_directory(const char *directory, const char *current);
+/* Startup: create an empty generated session journal DIRECTORY/session-XXXXXX
+ * whose lease (DIRECTORY/.session-XXXXXX.lock, the name editor recovery and
+ * retirement use) is already held when the journal name becomes visible.
+ * Writes the journal path to path; *lease receives the held flock descriptor
+ * (O_CLOEXEC). Pass it to editor_config.session_lease; close it after the
+ * editor has closed (the editor holds its own duplicate). */
+int journal_session_create(const char *directory, char *path, size_t cap, int *lease);
 /* Manual recovery onto explicitly supplied bytes. id=0 selects only when
  * unambiguous. Dry run validates and prints; apply durably replaces the file.
  * Never modifies the source journal. Conflicting BASE identity is printed;

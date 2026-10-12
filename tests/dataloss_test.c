@@ -101,14 +101,20 @@ static void remove_tree(const char *root)
         (void)unlinkat(dirfd(dir), entry->d_name, 0);
     closedir(dir); (void)rmdir(root);
 }
-static int open_editor(editor **e, render_backend *backend, const char *path, const char *jpath)
+/* edit-cxo: concurrently starting instances need the creator-held lease, as
+ * src/main.c does; a bare mkstemp placeholder is retirable by the other. */
+static int make_leased_session(const char *root, char *out, size_t cap, int *lease)
+{ T(journal_session_create(root, out, cap, lease) == JOURNAL_OK); return 0; }
+static int open_editor_leased(editor **e, render_backend *backend, const char *path, const char *jpath, const int *lease)
 {
     *backend = (render_backend){0}; T(render_null_backend(backend) == 0);
-    editor_config cfg = {.path = path, .journal_path = jpath, .start_empty = !path, .cols = COLS, .rows = ROWS};
+    editor_config cfg = {.path = path, .journal_path = jpath, .session_lease = lease, .start_empty = !path, .cols = COLS, .rows = ROWS};
     *e = NULL; int rc = editor_open(e, &cfg, backend);
     if (rc) fprintf(stderr, "dataloss_test: editor_open returned %d\n", rc);
     T(rc == 0); return settle(*e);
 }
+static int open_editor(editor **e, render_backend *backend, const char *path, const char *jpath)
+{ return open_editor_leased(e, backend, path, jpath, NULL); }
 static int capture(editor *e, oracle *o)
 {
     o->len = editor_length(e); T(o->len <= sizeof o->text);
@@ -496,9 +502,9 @@ static int reload_vs_keystroke(unsigned turns_between)
  * must know: a dirty buffer with a stale prompt or a save error, never a
  * clean tab over foreign bytes. */
 typedef struct race_oracle { int save_error; bool modified, stale; oracle text; } race_oracle;
-static int two_process_child(const char *source, const char *jpath, int go, int fd)
+static int two_process_child(const char *source, const char *jpath, const int *lease, int go, int fd)
 {
-    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    render_backend backend; editor *e; T(open_editor_leased(&e, &backend, source, jpath, lease) == 0);
     T(press(e, 'B', 0, "B") == 0);
     uint8_t byte; ssize_t n; do n = read(go, &byte, 1); while (n < 0 && errno == EINTR); T(n == 1);
     /* No turn between the parent's save and our Ctrl+S: the change notification
@@ -511,12 +517,15 @@ static int two_process_save(void)
 {
     char root[64], source[128], first[128], second[128]; T(make_root(root, sizeof root) == 0);
     T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
-    T(make_session(root, first, sizeof first) == 0); T(make_session(root, second, sizeof second) == 0);
+    int first_lease = -1, second_lease = -1;
+    T(make_leased_session(root, first, sizeof first, &first_lease) == 0);
+    T(make_leased_session(root, second, sizeof second, &second_lease) == 0);
     int go[2], report[2]; T(pipe(go) == 0); T(pipe(report) == 0);
     pid_t child = fork(); T(child >= 0);
-    if (!child) { close(go[1]); close(report[0]); _exit(two_process_child(source, second, go[0], report[1])); }
-    close(go[0]); close(report[1]);
-    render_backend backend; editor *e; T(open_editor(&e, &backend, source, first) == 0);
+    if (!child) { close(first_lease); close(go[1]); close(report[0]); _exit(two_process_child(source, second, &second_lease, go[0], report[1])); }
+    close(second_lease); close(go[0]); close(report[1]);
+    render_backend backend; editor *e; T(open_editor_leased(&e, &backend, source, first, &first_lease) == 0);
+    close(first_lease); /* the editor holds its own duplicate */
     T(press(e, 'A', 0, "A") == 0); T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
     T(!e->buffer->save_error); T(disk_is(source, "Abase") == 0);
     T(write(go[1], "g", 1) == 1); close(go[1]);

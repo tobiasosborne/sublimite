@@ -45,6 +45,10 @@ typedef struct editor_config {
     const uint8_t *initial;
     size_t initial_len;
     const char *journal_path;         /* existing replays; session-* discovers orphans; NULL disables */
+    /* Optional: the session lease journal_session_create already holds for
+     * journal_path. Borrowed; open duplicates it, so the caller may close its
+     * descriptor at any time after editor_open returns. */
+    const int *session_lease;
     uint32_t cols, rows, font_px;      /* defaults: 120, 40, 15 */
     uint32_t max_cols, max_rows;       /* defaults: at least 360, 300 */
     size_t arena_bytes, history_keys; /* open-time bounds; zero selects defaults */

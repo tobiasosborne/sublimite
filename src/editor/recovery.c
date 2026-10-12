@@ -427,8 +427,19 @@ int editor_session_restore(editor *e)
     if (!e->recover_existing && strncmp(name, "session-", strlen("session-"))) return 0;
     char lock_path[IPC_PATH_CAP];
     if (lock_name(lock_path, sizeof lock_path, path)) return EDITOR_ERR_ARG;
-    e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
+    if (e->cfg.session_lease) {
+        /* edit-cxo: the creator took this lease before the journal name was
+         * visible (journal_session_create). Share its open file description:
+         * a second flock on a new description would conflict with it. Refuse
+         * a descriptor that does not guard this journal's lock name. */
+        struct stat held, named;
+        e->session_lock = fcntl(*e->cfg.session_lease, F_DUPFD_CLOEXEC, 0);
+        if (e->session_lock < 0 || fstat(e->session_lock, &held) || stat(lock_path, &named) ||
+            held.st_dev != named.st_dev || held.st_ino != named.st_ino) return EDITOR_ERR_IO;
+    } else {
+        e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
+    }
     e->session_lock_owned = true;
     if (e->recovery_skip) return 0; /* edit-btj retry: own lease only, no discovery */
     char directory[IPC_PATH_CAP]; strcpy(directory, path);
