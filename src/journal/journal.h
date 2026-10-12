@@ -356,6 +356,12 @@ int journal_retire_directory(const char *directory, const char *current);
  * (O_CLOEXEC). Pass it to editor_config.session_lease; close it after the
  * editor has closed (the editor holds its own duplicate). */
 int journal_session_create(const char *directory, char *path, size_t cap, int *lease);
+/* After the owner removed its empty journal at path: unlink the lease file
+ * that lease (still held) names. JOURNAL_BUSY if the journal still exists or
+ * the name is not this lease. Startup/shutdown only. */
+int journal_session_release(const char *path, int lease);
+/* JOURNAL_OK if directory dfd has no entry named leaf or leaf.<suffix>. */
+int journal_session_absent(int dfd, const char *leaf);
 /* Manual recovery onto explicitly supplied bytes. id=0 selects only when
  * unambiguous. Dry run validates and prints; apply durably replaces the file.
  * Never modifies the source journal. Conflicting BASE identity is printed;

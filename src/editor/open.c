@@ -26,6 +26,9 @@ void editor_close(editor *e)
         else journal_close(e->journal); /* another editor owns the session */
         e->journal = NULL;
     }
+    /* edit-cxo: a discarded empty session leaves no lease file behind. */
+    if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path)
+        (void)journal_session_release(e->cfg.journal_path, e->session_lock);
     if (e->session_lock >= 0) close(e->session_lock);
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);

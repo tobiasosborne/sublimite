@@ -92,7 +92,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "sublimite: cannot create session journal in %s\n", journal_dir); goto startup_fail;
     }
     struct stat placeholder;
-    if (lstat(journal_path, &placeholder)) { (void)unlink(journal_path); close(session_lease); goto startup_fail; }
+    if (lstat(journal_path, &placeholder)) {
+        (void)unlink(journal_path); (void)journal_session_release(journal_path, session_lease);
+        close(session_lease); goto startup_fail;
+    }
     render_backend backend = {0};
     /* The only application backend selection site; init may fall back once. */
     int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
@@ -150,6 +153,7 @@ int main(int argc, char **argv)
     if (!lstat(journal_path, &remaining) && S_ISREG(remaining.st_mode) && !remaining.st_size &&
         remaining.st_dev == placeholder.st_dev && remaining.st_ino == placeholder.st_ino)
         (void)unlink(journal_path);
+    (void)journal_session_release(journal_path, session_lease); /* no-op if the journal remains */
     close(session_lease); /* after the placeholder check: still ours throughout */
     /* editor_close joins workers: the trace rings are quiescent here. */
     const char *dump_path = getenv("EDIT_TRACE_DUMP");

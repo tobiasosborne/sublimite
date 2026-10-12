@@ -315,8 +315,36 @@ static int startup_window(void)
     T(close(wrong)==0); T(close(held)==0);
     T(cleanup(root)==0); return 0;
 }
+/* edit-cxo/oo3: lease files whose journal is gone are swept; a lease that
+ * still guards a journal (or a dotted variant) or is held stays. A failed
+ * launch through main leaves nothing (wayland_startup_test's rmdir). */
+static int orphan_leases(void)
+{
+    char root[]="build/leases-XXXXXX"; T(mkdtemp(root));
+    char orphan[sizeof ((journal_base *)0)->captured_path], guarded[sizeof orphan], aside[sizeof orphan], held[sizeof orphan], jpath[sizeof orphan];
+    T(snprintf(orphan,sizeof orphan,"%s/.session-gone.lock",root)>0);
+    T(snprintf(guarded,sizeof guarded,"%s/.session-live.lock",root)>0);
+    T(snprintf(aside,sizeof aside,"%s/.session-aside.lock",root)>0);
+    T(snprintf(held,sizeof held,"%s/.session-held.lock",root)>0);
+    const char *locks[]={orphan,guarded,aside,held};
+    for(size_t i=0;i<sizeof locks/sizeof *locks;i++) { int fd=open(locks[i],O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0); close(fd); }
+    /* Corrupt (non-JNL1) bytes: retirement must preserve this journal. */
+    T(snprintf(jpath,sizeof jpath,"%s/session-live",root)>0); int fd=open(jpath,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0);
+    T(write(fd,"x",strlen("x"))==(ssize_t)strlen("x")); close(fd);
+    T(snprintf(jpath,sizeof jpath,"%s/session-aside.set-aside-fixture",root)>0); fd=open(jpath,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0); close(fd);
+    int lease=open(held,O_RDWR|O_CLOEXEC); T(lease>=0); T(flock(lease,LOCK_EX|LOCK_NB)==0);
+    (void)journal_retire_directory(root,NULL);
+    T(access(orphan,F_OK)<0); /* red: lease files were never removed */
+    T(access(guarded,F_OK)==0 && access(aside,F_OK)==0 && access(held,F_OK)==0);
+    close(lease);
+    /* The owner releases its own lease file once its empty journal is gone. */
+    char path[sizeof orphan]; T(journal_session_create(root,path,sizeof path,&lease)==0);
+    T(journal_session_release(path,lease)==JOURNAL_BUSY); T(unlink(path)==0);
+    T(journal_session_release(path,lease)==JOURNAL_OK); close(lease);
+    T(cleanup(root)==0); return 0;
+}
 int main(void)
 {
-    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(measurement()==0);
+    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }

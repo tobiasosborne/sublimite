@@ -38,6 +38,34 @@ Each iteration consumes a new lock name that is never removed, so the
 iterations are bounded by the number of such leftovers (P). On any other error
 the unused lock is unlinked while still held, so no instance can adopt it.
 
+## Lease files are removed with their journal (follow-up after b699bba)
+
+Creating the lease first means a launch that fails before `editor_open`
+(wayland_startup_test) leaves `.session-XXXXXX.lock`. Before b699bba, no lease
+file existed in that case. Three removal points, each unlinking only while the
+lease is held and only when no `session-XXXXXX` or `session-XXXXXX.*` entry
+remains (`journal_session_absent`; the dotted variants share the lease):
+
+- `journal_session_release(path, lease)`: main.c after its empty-placeholder
+  cleanup, and `editor_close` after `journal_close_discard_empty` for an
+  owned lease. A clean launch whose journal was discarded leaves nothing. A
+  nonempty journal keeps its stable lease file, as edit-rfq requires.
+- `journal_retire_directory` ends with a sweep of `.session-*.lock` files
+  whose journal is gone (also bead edit-oo3), after this call's own leases
+  are closed and still under the directory guard: flock LOCK_NB, recheck
+  absence, check that the name is still the locked inode, then unlink. Held
+  leases are skipped. Only generated `.session-` names are swept.
+- Race with creation: `journal_session_create` creates the lock before its
+  journal, so the sweep can see it as orphaned. After its flock, the creator
+  checks that the lock name still refers to its inode and otherwise picks a
+  new name. Either the sweep's LOCK_NB fails (creator holds it), or the
+  creator detects the unlinked inode. Two holders of one name cannot result.
+
+The sweep scans the namespace once per `.session-*.lock` file (startup only,
+under the existing directory guard). No perf budget covers startup
+housekeeping (perf/01-perf-target.md states none); after the first sweep the
+lease files left are those whose journals remain.
+
 ## Rejected: directory lock across create + lock
 
 Retirement already flocks the directory inode with `LOCK_NB`. Holding that

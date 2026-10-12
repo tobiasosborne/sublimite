@@ -88,3 +88,48 @@ lease across both attempts; before, it was released between them.
   second instance) and were left alone.
 
 Usage at end: 5-hour 8.0 %, weekly 86.0 % (`claude-usage`).
+
+## Follow-up after b699bba: lease files left behind
+
+Coordinator report: main-level `make check` aborted at
+tests/wayland_startup_test.c:40 `Assertion !rmdir(directory) failed`. The
+launch fails before `editor_open`, and the lease file created up front by
+`journal_session_create` remained after main removed the empty journal.
+
+Fix (decision appended to docs/decisions/edit-cxo.md):
+- `journal_session_release(path, lease)` (src/journal/session.c) unlinks the
+  lease file while it is held, but only if no `session-X` or `session-X.*` entry
+  remains (`journal_session_absent`). It is called from main.c's
+  empty-placeholder cleanup and from `editor_close` after
+  `journal_close_discard_empty` for an owned lease.
+- `journal_retire_directory` now ends with a sweep of `.session-*.lock` files
+  whose journal is gone, done under the lease and rechecked after flock. This
+  covers bead edit-oo3, which can be closed.
+- `journal_session_create` checks after its flock that the lock name is still
+  its inode; otherwise it picks a new name (race with the sweep).
+- New test `orphan_leases` in tests/journal_retire_test.c.
+
+Red: release and sweep disabled with a temporary `-DEDIT_CXO_RED` guard (removed afterwards; rebuilt and journal_retire_test re-passed), which is b699bba's
+behaviour. Sanitizer build, :99 via tools/with_display_lock.sh, private
+XDG_RUNTIME_DIR. BAT0 "Not charging".
+```
+journal_retire_test exit=1
+journal_retire_test:335 FAIL access(orphan,F_OK)<0
+journal_retire_test:346 FAIL orphan_leases()==0
+wayland_startup_test exit=134
+wayland_startup_test: tests/wayland_startup_test.c:40: void startup_case(_Bool): Assertion `!rmdir(directory)' failed.
+```
+
+Green: same setup, load1 1.80 before and 1.27 after. Every suite here has an
+`rmdir(` cleanup in tests/ that could meet a session directory, plus the
+suites the coordinator named:
+```
+editor_large_test exit=0      editor_session_test exit=0   editor_p4_test exit=0
+editor_hot_exit_test exit=0   editor_checkpoint_test exit=0 cli_test exit=0
+startup_test exit=0           wayland_startup_test exit=0  wayland_test exit=0
+window_size_test exit=0       config_editor_test exit=0    editor_hl_test exit=0
+refwin_test exit=0            journal_test exit=0          journal_retire_test exit=0
+dataloss_test exit=0 (3 of 3 runs, 0 occurrences of "returned -103")
+```
+`make -j12 all` exit 0.
+Usage at end of follow-up: 5-hour 9.0 %, weekly 87.0 %.

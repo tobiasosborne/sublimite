@@ -110,6 +110,33 @@ static int oldest(const void *left, const void *right)
     if(a->identity.st_mtim.tv_nsec!=b->identity.st_mtim.tv_nsec) return a->identity.st_mtim.tv_nsec<b->identity.st_mtim.tv_nsec?-1:1;
     return strcmp(a->path,b->path);
 }
+/* edit-cxo/oo3: a generated lease file whose journal (and every dotted
+ * variant sharing its lease) is gone is litter. Runs after this call's own
+ * leases are closed, still under the directory guard. Unlink only while
+ * holding the lease, after rechecking absence and that the name is still the
+ * locked inode; journal_session_create picks a new name if it lost that race.
+ * One namespace scan per lease file: startup only. */
+static void sweep_leases(DIR *dir)
+{
+    static const char prefix[]=".session-", suffix[]=".lock";
+    rewinddir(dir); struct dirent *entry;
+    while((entry=readdir(dir))) {
+        size_t len=strlen(entry->d_name);
+        if(len<=sizeof prefix-1u+sizeof suffix-1u || strncmp(entry->d_name,prefix,sizeof prefix-1u) ||
+           strcmp(entry->d_name+len-(sizeof suffix-1u),suffix)) continue;
+        char leaf[sizeof entry->d_name];
+        memcpy(leaf,entry->d_name+1,len-1u-(sizeof suffix-1u)); leaf[len-1u-(sizeof suffix-1u)]=0;
+        if(journal_session_absent(dirfd(dir),leaf)) continue;
+        int fd=openat(dirfd(dir),entry->d_name,O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+        if(fd<0) continue;
+        struct stat held,named;
+        if(!flock(fd,LOCK_EX|LOCK_NB) && !journal_session_absent(dirfd(dir),leaf) &&
+           !fstat(fd,&held) && !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) &&
+           S_ISREG(named.st_mode) && held.st_dev==named.st_dev && held.st_ino==named.st_ino)
+            (void)unlinkat(dirfd(dir),entry->d_name,0);
+        close(fd);
+    }
+}
 int journal_retire_directory(const char *directory, const char *current)
 {
     char canonical[sizeof ((journal_base *)0)->captured_path];
@@ -197,5 +224,7 @@ int journal_retire_directory(const char *directory, const char *current)
         else if(removed && removed!=JOURNAL_BUSY) rc=removed;
     }
     for(size_t i=0;i<inv.count;i++) if(items[i].lease>=0) close(items[i].lease);
-    edit_arena_free(&arena); close(guard); closedir(dir); return rc;
+    edit_arena_free(&arena);
+    sweep_leases(dir);
+    close(guard); closedir(dir); return rc;
 }
