@@ -294,6 +294,64 @@ static int index_arrives_during_frame(const char *path)
     puts("edit-dnc G7: mid-frame index arrival publishes exact gutter in the same frame; zero typing allocations");
     return 0;
 }
+/* edit-xzw: complete the index between scroll turns, after a foreground
+ * resident window has already certified the byte anchor. (E) Geometry,
+ * mmap threshold, colour and watchdog reuse index_arrives_during_frame;
+ * no new duration/count bound. (P) Zero initializers are empty state and
+ * return-code checks use the API's success value. */
+static int index_completes_between_steps(const char *path)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    hooks h = {.estimated_fg = 0x4c525d};
+    editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
+        .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
+        .on_submit = submitted, .on_io = io_boundary};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    /* The replacement index is incomplete even if open's index won its race. */
+    e->buffer->lg.lines_exact = false;
+    piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
+    T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
+    _Atomic bool release; atomic_init(&release, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_index, &release, 0, WORK_BULK}); T(held.epoch);
+    lineidx_src source = {snap, editor_length(e), gutter_snapshot_span, gutter_snapshot_release};
+    T(lineidx_build_start(e->buffer->index, &e->pool, &source) == 0);
+    h.observe = e;
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    /* (P) Last B row starts after A_LINES fixed-width "l%06u\n" rows
+     * (one l + six digits + LF = eight bytes) and B_LINES minus one B rows. */
+    uint64_t top_byte = (uint64_t)A_LINES * 8u + (B_LINES - 1u) * B_LEN;
+    T(editor_large_goto_byte(e, top_byte) == 0);
+    T(editor_scroll_seek(e, top_byte) == 0);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(editor_large_status_get(e).top_estimated);
+    top_byte = editor_view(e).first_byte;
+    /* EOF clipping can move the anchor back by the visible text rows. */
+    lineidx_src cur = editor_source(e->buffer);
+    uint64_t top_line = piece_byte_to_line(e->tree, top_byte);
+    atomic_store(&release, true);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!lineidx_complete(e->buffer->index)) {
+        (void)lineidx_poll(e->buffer->index);
+        T(trace_now_ns() < deadline);
+    }
+    T(lineidx_byte_to_line(e->buffer->index, &cur, top_byte).value == top_line);
+    editor_large_index_progress(e);
+    T(editor_large_status_get(e).lines_exact);
+    /* (P) Publication follows the last scroll slice in submit(); the next
+     * editor turn adopts the resident relabel before its frame is submitted.
+     * A zero timeout pumps this already resident work without waiting. */
+    int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+    T(!editor_large_status_get(e).top_estimated);
+    T(editor_view(e).first_byte == top_byte);
+    T(editor_view(e).first_line == top_line);
+    T(step_until(e, settled, UINT64_C(5000000000)) == 0);
+    T(h.exact_frames); T(!h.gutter_error); T(!h.allocations);
+    editor_close(e);
+    puts("edit-xzw: index completed between steps; exact gutter retains byte anchor");
+    return 0;
+}
 static int gutter_estimates(void)
 {
     render_backend b = {0}; T(render_null_backend(&b) == 0);
@@ -1303,6 +1361,9 @@ int main(void)
     trace_init(); (void)trace_thread_register();
     if (getenv("EDIT_JF9_VIEW")) return relative_motion();
     T(relative_motion() == 0);
+    /* edit-xzw: isolate the existing null-backend fixture from IPC/display
+     * prerequisites denied by the worker sandbox. */
+    if (getenv("EDIT_XZW_REPRO")) goto xzw_fixture;
     if (getenv("EDIT_91C_STARVED"))
         return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
     T(starved_follows(true, false) == 0);
@@ -1340,8 +1401,10 @@ int main(void)
     T(mapped_preview_first() == 0);
     T(mapped_find_boundaries() == 0);
     T(gutter_estimates() == 0);
+xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
+    T(index_completes_between_steps(path) == 0);
     T(index_arrives_during_frame(path) == 0);
     struct stat st; T(stat(path, &st) == 0); uint64_t size = (uint64_t)st.st_size;
     render_backend b = {0}; T(render_null_backend(&b) == 0);
@@ -1384,6 +1447,25 @@ int main(void)
     T(editor_large_find_begin(e, needle, 6) == EDITOR_ERR_ARG);        /* one at a time */
     if (step_until(e, all_done, UINT64_C(3000000000))) { editor_large_status d = editor_large_status_get(e); fprintf(stderr, "exact=%d find=%d warm=%d idx=%d\n", d.lines_exact, d.find_done, d.warm_done, editor_index_complete(e)); return 1; }
     s = editor_large_status_get(e);
+    if (s.top_estimated) {
+        fprintf(stderr, "edit-xzw completion: estimated=%d pending=%d resident=%d exact_extent=%d approximate=%d view_busy=%d full_pending=%d\n",
+            s.top_estimated, e->buffer->scroll_pending, e->buffer->scroll_resident.pending,
+            e->buffer->scroll.extent.exact, e->buffer->scroll.approximate, view_busy(&e->v), e->full_pending);
+        /* (P) all_done observes jobs, whereas submit can publish the index
+         * after this turn's final scroll slice. The next turn can still
+         * yield awaiting the foreground window. (E) Reuse the suite's
+         * existing settle watchdog, rather than bound worker scheduling
+         * by an invented number of editor turns. */
+        int rc = step_until(e, settled, UINT64_C(5000000000));
+        s = editor_large_status_get(e);
+        if (rc || s.top_estimated) {
+            /* Quiesce workers before reading their trace rings. */
+            editor_close(e);
+            FILE *dump = fopen("build/edit-xzw-stale.trace", "wb"); T(dump);
+            T(trace_dump(dump) == 0); T(fclose(dump) == 0);
+        }
+        T(rc == 0);
+    }
     T(s.lines_exact); T(!s.top_estimated); T(editor_line_count(e) == TOTAL_LINES);
     T(editor_view(e).first_line == A_LINES + 1000u);                    /* swapped to the exact number */
     T(s.find_rc == 0); T(s.find_total == 3);
