@@ -585,6 +585,7 @@ static bool queued_owner_live(const editor *e, size_t at)
 static size_t queue_pick(const editor *e)
 {
     /* Journal replay ranges borrow tree storage until every staged record drains. */
+    if (e->file_command != KEYS_ACTION_NONE) return SIZE_MAX;
     if (editor_save_leased(e) || (e->journal && (e->op_count || e->journal_metadata_pending))) return SIZE_MAX;
     if (editor_clip_busy(e)) {
         for (size_t n = 0; n < e->queue_count; n++)
@@ -622,7 +623,8 @@ static bool runnable(const editor *e)
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
-    return (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
+    return (e->file_command != KEYS_ACTION_NONE && !e->dirty && !e->backend->active) ||
+           (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
            (editor_font_pending(e) && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->source_choice ||
@@ -836,7 +838,7 @@ editor_stats editor_get_stats(const editor *e)
     s.render_active = e->backend->active;
     s.font_pending = e->font.requested_generation != e->font.applied_generation;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
-    s.pending = editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
+    s.pending = e->file_command != KEYS_ACTION_NONE || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||
         e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;

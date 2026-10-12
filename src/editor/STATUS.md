@@ -801,3 +801,19 @@ Selection failure restores embedded DejaVu and emits one worker diagnostic.
 Strict builds, combined selection/Unicode/zoom tests, active allocation-guard
 results and native display/launcher exceptions are recorded in
 [the resolver report](../../docs/worker-reports/edit-5ih-resolve.md).
+
+## edit-o20
+
+The requested New/Open/Save As/Exit/Cancel/Scroll commands execute through the
+existing tab, prompt, close and scroll paths. Null-backend release and sanitizer
+regressions cover text/find focus, UTF-8 paths, clean/dirty target watches,
+COPY/MMAP sources and shared-target base reconciliation. Successful Save As
+rebinds title, path, watch, savectl and journal BASE without replacing text/undo.
+
+Remaining deeper work: Save As to a different path uses the durable file core
+and then a complete checkpoint; it does not retain the overwritten target via
+the journal PREPARE transaction before writing. A crash before checkpoint
+rotation can leave a peer tab's preceding BASE conflicting and cause recovery
+to set the journal aside. Its edits are not guaranteed replayable in that case.
+Same-path Save As delegates to the existing Ctrl+S transaction. Evidence and
+sandbox/unrelated suite failures: docs/worker-reports/edit-o20-s6.md.

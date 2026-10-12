@@ -776,6 +776,7 @@ static int goto_continue(editor *e)
 static int goto_query(editor *e)
 {
     editor_goto *go = &e->go;
+    if (go->kind != KEYS_ACTION_GOTO_LINE) return editor_full_layout(e);
     go->valid = go->length != 0; go->line = 0;
     /* Decimal positional notation: next = previous * base + digit;
      * rearrange against UINT64_MAX before multiplying to avoid overflow. */
@@ -794,18 +795,29 @@ static int goto_query(editor *e)
     int rc = goto_restore(e); if (rc) return rc;
     return editor_full_layout(e);
 }
-static int goto_key(editor *e, const plat_event *ev)
+static int goto_key(editor *e, const plat_event *ev, keys_action kind)
 {
     editor_goto *go = &e->go;
     undo_break_burst(e->undo);
     if (!go->active) {
         *go = (editor_goto){.active = true, .original = e->v.state, .original_scroll = e->buffer->scroll_display,
-            .owner = e->buffer->id, .generation = e->buffer->source_generation};
+            .owner = e->buffer->id, .generation = e->buffer->source_generation, .kind = kind};
+        if (kind == KEYS_ACTION_SAVE_AS && *e->buffer->path) {
+            go->length = go->cursor = strlen(e->buffer->path);
+            memcpy(go->digits, e->buffer->path, go->length + 1u); go->selected = true;
+        }
         keys_reset(&e->keys);
         return editor_full_layout(e);
     }
     if (ev->keysym == XKB_KEY_Escape) return editor_goto_cancel(e);
     if (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter) {
+        if (go->length && go->kind != KEYS_ACTION_GOTO_LINE) {
+            e->file_command = go->kind;
+            memcpy(e->file_command_path, go->digits, go->length + 1u);
+            e->file_command_owner = go->owner; e->file_command_generation = go->generation;
+            go->active = false; keys_reset(&e->keys);
+            return editor_full_layout(e);
+        }
         if (!go->length) return editor_goto_cancel(e);
         if (!go->valid) return editor_full_layout(e);
         go->accept = true; e->action = EDITOR_ACTION_GOTO;
@@ -815,27 +827,38 @@ static int goto_key(editor *e, const plat_event *ev)
         go->selected = true; return editor_full_layout(e);
     }
     if (ev->keysym == XKB_KEY_Left || ev->keysym == XKB_KEY_Home) {
-        go->cursor = ev->keysym == XKB_KEY_Home || go->selected ? 0 : go->cursor ? go->cursor - 1u : 0;
+        go->cursor = ev->keysym == XKB_KEY_Home || go->selected ? 0 : go->cursor ? (go->kind == KEYS_ACTION_GOTO_LINE ? go->cursor - 1u : utf8_grapheme_prev((const uint8_t *)go->digits, go->cursor)) : 0;
         go->selected = false; return editor_full_layout(e);
     }
     if (ev->keysym == XKB_KEY_Right || ev->keysym == XKB_KEY_End) {
         if (ev->keysym == XKB_KEY_End || go->selected) go->cursor = go->length;
-        else if (go->cursor < go->length) go->cursor++;
+        else if (go->cursor < go->length) go->cursor += go->kind == KEYS_ACTION_GOTO_LINE ? 1u : utf8_grapheme_next((const uint8_t *)go->digits + go->cursor, go->length - go->cursor);
         go->selected = false; return editor_full_layout(e);
     }
     if (ev->keysym == XKB_KEY_BackSpace || ev->keysym == XKB_KEY_Delete) {
         if (go->selected) { go->length = go->cursor = 0; go->selected = false; }
         else if (ev->keysym == XKB_KEY_BackSpace && go->cursor) {
-            go->cursor--; memmove(go->digits + go->cursor, go->digits + go->cursor + 1u, go->length - go->cursor - 1u); go->length--;
+            size_t previous = go->kind == KEYS_ACTION_GOTO_LINE ? go->cursor - 1u : utf8_grapheme_prev((const uint8_t *)go->digits, go->cursor);
+            size_t removed = go->cursor - previous;
+            memmove(go->digits + previous, go->digits + go->cursor, go->length - go->cursor);
+            go->cursor = previous; go->length -= removed;
         } else if (ev->keysym == XKB_KEY_Delete && go->cursor < go->length) {
-            memmove(go->digits + go->cursor, go->digits + go->cursor + 1u, go->length - go->cursor - 1u); go->length--;
+            size_t removed = go->kind == KEYS_ACTION_GOTO_LINE ? 1u : utf8_grapheme_next((const uint8_t *)go->digits + go->cursor, go->length - go->cursor);
+            memmove(go->digits + go->cursor, go->digits + go->cursor + removed, go->length - go->cursor - removed);
+            go->length -= removed;
         }
         go->digits[go->length] = 0; return goto_query(e);
     }
     if (!(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER)) && ev->utf8_len) {
-        for (size_t i = 0; i < ev->utf8_len; i++) if (ev->utf8[i] < '0' || ev->utf8[i] > '9') return editor_full_layout(e);
+        for (size_t i = 0; i < ev->utf8_len; i++) {
+            if (go->kind == KEYS_ACTION_GOTO_LINE) {
+                if (ev->utf8[i] < '0' || ev->utf8[i] > '9') return editor_full_layout(e);
+            } else if (!ev->utf8[i] || ev->utf8[i] == '\n' || ev->utf8[i] == '\r') return editor_full_layout(e);
+        }
         size_t length = go->selected ? 0 : go->length;
-        if (ev->utf8_len > sizeof go->digits - 1u - length) return editor_full_layout(e);
+        /* (P) retain the preceding decimal-width limit for go-to-line. */
+        size_t cap = go->kind == KEYS_ACTION_GOTO_LINE ? sizeof(uint64_t) * CHAR_BIT : sizeof go->digits - 1u;
+        if (ev->utf8_len > cap - length) return editor_full_layout(e);
         if (go->selected) { go->length = go->cursor = 0; go->selected = false; }
         memmove(go->digits + go->cursor + ev->utf8_len, go->digits + go->cursor, go->length - go->cursor);
         memcpy(go->digits + go->cursor, ev->utf8, ev->utf8_len);
@@ -881,7 +904,8 @@ bool editor_event_control(const editor *e, const plat_event *ev)
     case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
     case KEYS_ACTION_CLOSE: case KEYS_ACTION_CLOSE_FILE: case KEYS_ACTION_REOPEN_FILE:
     case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB:
-    case KEYS_ACTION_FONT_SIZE: return true;
+    case KEYS_ACTION_FONT_SIZE: case KEYS_ACTION_EXIT:
+    case KEYS_ACTION_NEW_FILE: case KEYS_ACTION_OPEN_FILE: return true;
     default: return false;
     }
 }
@@ -930,7 +954,11 @@ int editor_handle_key(editor *e, const plat_event *ev)
         if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R) tabs_mru_release(&e->tabs);
         return 0;
     }
-    if (!e->go.active && editor_find_key(e, ev)) return 0;
+    keys_state probe = e->keys; const keys_binding *global = NULL;
+    (void)config_keys_lookup(&e->preferences, &probe, ev->keysym, ev->mods, &global);
+    bool common = global && (global->action == KEYS_ACTION_NEW_FILE || global->action == KEYS_ACTION_OPEN_FILE ||
+        global->action == KEYS_ACTION_SAVE_AS || global->action == KEYS_ACTION_EXIT || global->action == KEYS_ACTION_SCROLL_LINES);
+    if (!e->go.active && !common && editor_find_key(e, ev)) return 0;
     const keys_binding *binding = NULL;
     keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
@@ -955,6 +983,24 @@ int editor_handle_key(editor *e, const plat_event *ev)
         result = binding ? KEYS_MATCH : KEYS_NONE;
         undo_break_burst(e->undo);
     }
+    if (action == KEYS_ACTION_EXIT) {
+        plat_event close_event = {.kind = PLAT_EV_CLOSE};
+        return editor_inject(e, &close_event);
+    }
+    if (action == KEYS_ACTION_NEW_FILE) {
+        e->file_command = action; e->file_command_path[0] = '\0';
+        e->file_command_owner = e->buffer->id; e->file_command_generation = e->buffer->source_generation;
+        undo_break_burst(e->undo);
+        return editor_full_layout(e);
+    }
+    if (action == KEYS_ACTION_CANCEL) {
+        tabs_mru_release(&e->tabs);
+        if (e->v.state.selection.anchor == e->v.state.selection.cursor) return 0;
+        e->old_selection = e->v.state.selection;
+        e->v.state.selection.anchor = e->v.state.selection.cursor;
+        undo_break_burst(e->undo); soft_record(e, false);
+        return editor_full_layout(e);
+    }
     if (action == KEYS_ACTION_SAVE) return editor_save_request(e, ev->t0_ns);
     if (action == KEYS_ACTION_FONT_SIZE) return editor_font_zoom(e, binding->args.value);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
@@ -973,14 +1019,15 @@ int editor_handle_key(editor *e, const plat_event *ev)
         !(command->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER)) &&
         (!(command->mods & PLAT_MOD_ALT) || (command->mods & PLAT_MOD_ALTGR)));
     bool editing = default_edit_key(action);
-    bool go = e->go.active || action == KEYS_ACTION_GOTO_LINE;
+    bool go = e->go.active || action == KEYS_ACTION_GOTO_LINE || action == KEYS_ACTION_OPEN_FILE || action == KEYS_ACTION_SAVE_AS;
+    bool scroll = action == KEYS_ACTION_SCROLL_LINES;
     if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT ||
         action == KEYS_ACTION_PASTE) {
         e->command_key = *command; e->command_binding = binding;
         e->command_sequence = e->stats.input_sequence + 1u;
         return editor_clip_action(e, action, ev);
     }
-    if (!moving && !back && !del && !undo && !redo && !soft && !tab && !text && !editing && !go) {
+    if (!moving && !back && !del && !undo && !redo && !soft && !tab && !text && !editing && !go && !scroll) {
         if (binding) e->stats.unimplemented_actions++;
         if (action == KEYS_ACTION_CANCEL || e->tabs.cycling) tabs_mru_release(&e->tabs);
         if (binding) {
@@ -990,7 +1037,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         return 0;
     }
     if (!stack && e->tabs.cycling) tabs_mru_release(&e->tabs);
-    if (!tabs_count(&e->tabs) && !reopen) return 0;
+    if (!tabs_count(&e->tabs) && !reopen && action != KEYS_ACTION_OPEN_FILE && !e->go.active) return 0;
     e->command_key = *command; e->command_binding = binding;
     e->command_sequence = e->stats.input_sequence + 1u;
     e->old_selection = e->v.state.selection; e->old_cursor = e->old_selection.cursor;
@@ -1008,7 +1055,21 @@ int editor_handle_key(editor *e, const plat_event *ev)
     trace_record_at(e->key_ns, TRACE_T1_DEQUEUE, e->grid.frame_id);
     trace_input_key(ev->t0_ns ? ev->t0_ns : e->key_ns, TRACE_IN_KEY_DOWN, ev->keysym, ev->mods,
                     ev->repeat, (const char *)ev->utf8, ev->utf8_len);
-    if (go) return goto_key(e, ev);
+    if (go) return goto_key(e, ev, action);
+    if (scroll) {
+        undo_break_burst(e->undo);
+        e->find_scroll = false; e->buffer->scroll_following = false;
+        if (e->v.state.wrap) {
+            e->wheel_pending = true; e->wheel.request = SCROLL_RELATIVE;
+            e->wrap_wheel_rows -= binding->args.value;
+            return editor_wheel_continue(e);
+        }
+        /* (P) amount's sign is Sublime's; a row is row_height Q8 pixels. */
+        int64_t pixels = -(int64_t)binding->args.value * SCROLL_PIXEL_UNIT * e->buffer->scroll.config.row_height;
+        rc = scroll_pixels(&e->buffer->scroll, pixels); if (rc) return rc;
+        e->wheel_pending = false; e->buffer->scroll_pending = true;
+        return editor_scroll_slice(e);
+    }
     if (tab) {
         undo_break_burst(e->undo);
         if (stack) return editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);

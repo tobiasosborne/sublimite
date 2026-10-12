@@ -47,6 +47,9 @@ typedef struct editor_buffer {
     undo_log undo;
     file *file;
     savectl *save;
+    file_path_watch target_watch;
+    file_source *target_source;
+    bool target_rebound;
     size_t session_slot;
     uint64_t save_revision;
     size_t save_cursor;
@@ -106,7 +109,9 @@ typedef struct editor_clip editor_clip;
 /* A decimal digit carries at least one bit. The uint64_t bit width is a
  * conservative bound on decimal input length, plus a NUL for rendering. */
 typedef struct editor_goto {
-    char digits[sizeof(uint64_t) * CHAR_BIT + 1u];
+    /* (P) path capacity includes NUL and matches buffer/IPC storage. */
+    char digits[IPC_PATH_CAP];
+    keys_action kind;
     size_t length, cursor;
     uint64_t line, owner, generation;
     view_state original;
@@ -176,6 +181,9 @@ struct editor {
     uint64_t find_window_start, find_window_end;
     edit_arena find_arena;
     editor_goto go;
+    keys_action file_command;
+    char file_command_path[IPC_PATH_CAP];
+    uint64_t file_command_owner, file_command_generation;
     editor_wait waits[IPC_MAX_CLIENTS];
     int poll_fd;
     file *opening;
@@ -375,6 +383,7 @@ void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);
 void editor_goto_overlay(editor *e);
 int editor_goto_cancel(editor *e);
+int editor_file_command_service(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
                           size_t len, editor_buffer **out);

@@ -1017,8 +1017,10 @@ static void panel_editing_chords(void)
     panel_key(e,'a',PLAT_MOD_CTRL); CHECK(e->find_field_all);
     panel_key(e,'v',PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
     /* Ctrl+X is deliberately consumed as a field no-op; other global chords
-     * must leave both the selected document and the panel state untouched. */
-    const uint32_t consumed[]={'x','z','y','s','w','n','t',XKB_KEY_Delete,XKB_KEY_Up,XKB_KEY_Down};
+     * must leave both the selected document and the panel state untouched.
+     * edit-o20: Ctrl+N and Ctrl+Up/Down are file/viewport commands that bypass
+     * the focused field (docs/decisions/edit-o20.md), so they are not listed. */
+    const uint32_t consumed[]={'x','z','y','s','w','t',XKB_KEY_Delete};
     for (size_t i=0;i<sizeof consumed/sizeof *consumed;i++) {
         panel_key(e,consumed[i],PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
         same(e->tree,(const uint8_t *)text,sizeof text-1);

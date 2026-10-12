@@ -82,6 +82,8 @@ void editor_buffer_destroy(editor_buffer *b)
         (void)work_mailbox_bind(b->pool,b->map_handle,0,NULL,NULL);
         piece_snapshot_release(b->map_snapshot);
     }
+    file_watch_path_stop(&b->target_watch);
+    file_source_release(b->target_source);
     editor_scroll_close(b);
     editor_large_close(b);
     minimap_fini(&b->map);
@@ -676,6 +678,19 @@ int editor_poll_sources(editor *e)
     if (raster_rc) return raster_rc;
     editor_retire_buffers(e);
     editor_save_tick(e);
+    int command_rc = editor_file_command_service(e); if (command_rc) return command_rc;
+    file_watch_dispatch();
+    for (size_t i = 0; i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (b && !b->retired && b->target_rebound && file_watch_path_take(&b->target_watch)) {
+            file_id identity;
+            if (file_id_stat_path(b->path, &identity) || !b->save ||
+                file_id_diff(&identity, savectl_target_identity(b->save))) {
+                b->operation_kind = FILE_MSG_OPEN_FAILED;
+                b->operation_error = FILE_ERR_CHANGED;
+            }
+        }
+    }
     int source_rc = editor_check_sources(e); if (source_rc) return source_rc;
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) {
         int rc = editor_adopt_open(e, e->buffers[i]); if (rc) return rc;
@@ -734,7 +749,7 @@ static int reload_source(editor *e, editor_buffer *b, size_t tab_index)
 {
     size_t slot = 0;
     while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
-    if (slot == e->buffer_capacity || file_save_busy(b->file) || e->op_count) return 0;
+    if (slot == e->buffer_capacity || (b->file && file_save_busy(b->file)) || e->op_count) return 0;
     editor_buffer *replacement = NULL;
     int rc = editor_buffer_prepare(e, b->path, NULL, 0, &replacement);
     if (rc) return 0;
@@ -799,12 +814,13 @@ int editor_check_sources(editor *e)
 {
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
-        if (!b || b->retired || !b->file || editor_save_active(e)) continue;
+        if (!b || b->retired || (!b->file && !b->target_rebound) || editor_save_active(e)) continue;
         bool clean = !b->saved_lost && b->history_cursor == b->saved_cursor;
         if (b->source_stale && !clean) continue;
-        if (b->watch_pending) (void)file_watch_poll(b->file);
-        if (!b->source_stale && !file_changed(b->file) && b->operation_kind != FILE_MSG_OPEN_FAILED) continue;
-        if (clean && !b->pending_open && b->operation_kind != FILE_MSG_OPEN_FAILED) {
+        if (b->watch_pending && b->file) (void)file_watch_poll(b->file);
+        bool original_changed = b->file && (!b->target_rebound || file_open_mode(b->file) == FILE_MODE_MMAP) && file_changed(b->file);
+        if (!b->source_stale && !original_changed && b->operation_kind != FILE_MSG_OPEN_FAILED) continue;
+        if (clean && !b->pending_open && (b->operation_kind != FILE_MSG_OPEN_FAILED || b->target_rebound)) {
             /* Setup can allocate. Finish input through its containing frame,
              * and release active view/save/clipboard leases before replacing. */
             if (editor_activation_busy(e) || e->backend->active || e->queue_count ||
@@ -842,7 +858,7 @@ int editor_check_sources(editor *e)
     if (!b->source_stale || b->id != e->source_choice_id || b->source_generation != e->source_choice_generation) return 0;
     if (choice == 1) {
         if (b->pending_open) return 0; /* failed acquisition cannot become editable */
-        int rc = file_resolve_keep(b->file);
+        int rc = b->target_rebound && (!b->file || file_open_mode(b->file) == FILE_MODE_COPY) ? 0 : file_resolve_keep(b->file);
         if (rc) return 0; /* Unsafe mapped keep retains the visible prompt. */
         journal_base previous = b->base;
         if (e->journal) {
@@ -861,6 +877,7 @@ int editor_check_sources(editor *e)
                 (void)savectl_rebase_target(b->save, &identity);
         }
         b->saved_lost = true;
+        if (b->target_rebound) { b->operation_kind = 0; b->operation_error = 0; }
         b->source_stale = false; b->prompt_ns = 0; editor_modified(e);
         editor_large_keep(b);
         return editor_full_layout(e);

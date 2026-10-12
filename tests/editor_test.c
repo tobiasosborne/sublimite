@@ -3849,11 +3849,169 @@ static int minimap_pending_contract(void)
     T(press(e,ev)==0); T(editor_view(e).first_byte>0);
     editor_close(e); puts("edit-73j pending minimap navigation passed"); return 0;
 }
+
+/* edit-o20: (P) offsets/counts derive from fixture bytes, tab count before
+ * the command, and viewport rows. Geometry reuses default_goto's chrome
+ * plus text rows, expanded for the existing find panel. No timing budget. */
+static int o20_path(editor *e, const char *path)
+{
+    for (size_t i = 0; path[i]; i++) {
+        char ch[] = {path[i], '\0'};
+        T(press(e, key((uint8_t)path[i], 0, ch)) == 0);
+    }
+    return press(e, key(XKB_KEY_Return, 0, NULL));
+}
+static int o20_case(const char *command)
+{
+    for (bool panel = false;; panel = true) {
+        char dir[] = "/tmp/edit-o20-XXXXXX"; T(mkdtemp(dir) != NULL);
+        char path[IPC_PATH_CAP], target[IPC_PATH_CAP], log[IPC_PATH_CAP];
+        T(snprintf(path, sizeof path, "%s/open.txt", dir) > 0);
+        T(snprintf(target, sizeof target, "%s/save.txt", dir) > 0);
+        T(snprintf(log, sizeof log, "%s/journal", dir) > 0);
+        static const char text[] = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n";
+        int fd = open(path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR); T(fd >= 0);
+        T(write(fd, text, sizeof text - 1u) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+        if (!strcmp(command, "save-shared")) {
+            fd = open(target, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR); T(fd >= 0);
+            T(write(fd, text, sizeof text - 1u) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+        }
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        counted count = {0};
+        editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+            .cols = sizeof "Go to line: :18446744073709551615" + 1u,
+            .rows = sizeof "text" + 1u, .wrap_mode = -1, .journal_path = log,
+            .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+        if (!strcmp(command, "save-source") || !strcmp(command, "save-mapped")) cfg.path = path;
+        /* (P) force MMAP with a threshold below this fixture's byte length. */
+        if (!strcmp(command, "save-mapped")) cfg.copy_threshold = sizeof text - sizeof "a";
+        if (!strcmp(command, "scroll-wrap")) cfg.wrap_mode = 1;
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        if (!strcmp(command, "save-shared")) {
+            uint64_t id; T(editor_add_buffer(e, target, NULL, 0, &id) == 0); T(settle(e) == 0);
+            T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+        }
+        if (panel) { T(press(e, key(XKB_KEY_f, PLAT_MOD_CTRL, NULL)) == 0); T(e->find_visible); }
+        size_t tabs = tabs_count(&e->tabs), history = e->buffer->history_cursor;
+        uint64_t unsupported = editor_get_stats(e).unimplemented_actions;
+        if (!strcmp(command, "new")) {
+            T(press(e, key(XKB_KEY_n, PLAT_MOD_CTRL, NULL)) == 0);
+            T(tabs_count(&e->tabs) == tabs + 1u); T(tabs_active_index(&e->tabs) == tabs);
+            T(!strcmp(tabs_active(&e->tabs)->title, "untitled")); T(!*e->buffer->path);
+            T(expect(e, "", 0) == 0);
+            T(editor_select_tab(e, tabs - 1u) == 0); T(settle(e) == 0); T(expect(e, text, 0) == 0);
+        } else if (!strcmp(command, "open-empty")) {
+            if (panel) T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+            T(editor_close_tab(e, tabs_active_index(&e->tabs)) == 0); T(settle(e) == 0);
+            T(!tabs_count(&e->tabs));
+            T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(e->go.active);
+            T(o20_path(e, path) == 0); T(tabs_count(&e->tabs) == tabs); T(expect(e, text, 0) == 0);
+        } else if (!strcmp(command, "path-edit")) {
+            T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(e->go.active);
+            static const char unicode[] = "é";
+            T(press(e, key(XKB_KEY_eacute, 0, unicode)) == 0);
+            T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0); T(e->go.length == 0);
+            T(press(e, key(XKB_KEY_eacute, 0, unicode)) == 0);
+            T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(e->go.cursor == 0);
+            T(press(e, key(XKB_KEY_Delete, 0, NULL)) == 0); T(e->go.length == 0);
+            T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(expect(e, text, 0) == 0);
+        } else if (!strcmp(command, "open")) {
+            T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(e->go.active);
+            T(o20_path(e, path) == 0); T(!e->go.active);
+            T(tabs_count(&e->tabs) == tabs + 1u); T(!strcmp(e->buffer->path, path)); T(expect(e, text, 0) == 0);
+            T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(o20_path(e, target) == 0);
+            T(tabs_count(&e->tabs) == tabs + 1u); T(!strcmp(e->buffer->path, path)); T(e->recovery_notice != NULL);
+            T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(o20_path(e, dir) == 0);
+            T(tabs_count(&e->tabs) == tabs + 1u); T(expect(e, text, 0) == 0);
+        } else if (!strcmp(command, "save-as") || !strcmp(command, "save-source") || !strcmp(command, "save-watch") || !strcmp(command, "save-clean-watch") || !strcmp(command, "save-mapped") || !strcmp(command, "save-shared")) {
+            T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(e->go.active);
+            T(o20_path(e, target) == 0); T(!e->go.active);
+            if (!strcmp(command, "save-shared")) {
+                T(e->recovery_notice == NULL);
+                for (size_t i = 0; i < e->buffer_capacity; i++)
+                    if (e->buffers[i] && !e->buffers[i]->retired) T(journal_check_base(&e->buffers[i]->base) == 0);
+            }
+            T(tabs_count(&e->tabs) == tabs); T(!strcmp(e->buffer->path, target));
+            T(!strcmp(tabs_active(&e->tabs)->title, "save.txt")); T(!strcmp(e->buffer->save_path, target));
+            T(e->buffer->history_cursor == history); T(expect(e, text, 0) == 0);
+            fd = open(target, O_RDONLY); T(fd >= 0); char bytes[sizeof text];
+            T(read(fd, bytes, sizeof bytes) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+            T(!memcmp(bytes, text, sizeof text - 1u));
+            if (panel) { T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); }
+            T(press(e, key(XKB_KEY_x, 0, "x")) == 0); T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL, NULL)) == 0);
+            T(editor_flush(e) == 0); T(settle(e) == 0);
+            fd = open(target, O_RDONLY); T(fd >= 0); T(read(fd, bytes, sizeof bytes) == (ssize_t)sizeof text);
+            T(close(fd) == 0); T(bytes[0] == 'x'); T(!memcmp(bytes + 1u, text, sizeof text - 1u));
+            T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, text, 0) == 0);
+            T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+            T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0); T(o20_path(e, dir) == 0);
+            T(!strcmp(e->buffer->path, target)); T(expect(e, text, 0) == 0);
+            if (!strcmp(command, "save-source") || !strcmp(command, "save-mapped")) {
+                fd = open(path, O_RDONLY); T(fd >= 0);
+                T(read(fd, bytes, sizeof bytes) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+                T(!memcmp(bytes, text, sizeof text - 1u));
+            }
+            if (!strcmp(command, "save-clean-watch")) {
+                T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL, NULL)) == 0); T(editor_flush(e) == 0); T(settle(e) == 0);
+                fd = open(target, O_WRONLY | O_TRUNC); T(fd >= 0);
+                static const char external[] = "external";
+                T(write(fd, external, sizeof external - 1u) == (ssize_t)(sizeof external - 1u)); T(close(fd) == 0);
+                file_watch_dispatch(); T(settle(e) == 0); T(!e->buffer->source_stale); T(expect(e, external, 0) == 0);
+            }
+            if (!strcmp(command, "save-watch")) {
+                fd = open(target, O_WRONLY | O_TRUNC); T(fd >= 0);
+                static const char external[] = "external";
+                T(write(fd, external, sizeof external - 1u) == (ssize_t)(sizeof external - 1u)); T(close(fd) == 0);
+                file_watch_dispatch(); T(settle(e) == 0); T(e->buffer->source_stale);
+                T(editor_source_resolve(e, false) == 0); T(settle(e) == 0); T(!e->buffer->source_stale);
+                T(expect(e, text, 0) == 0);
+            }
+        } else if (!strcmp(command, "exit")) {
+            plat_event ev = key(XKB_KEY_q, PLAT_MOD_CTRL, NULL); T(editor_inject(e, &ev) == 0);
+            int rc = editor_step(e, 0);
+            T(rc == EDITOR_CLOSED); T(e->quit);
+            journal_stats st = journal_get_stats(e->journal); T(st.accepted_sequence == st.durable_sequence);
+        } else if (!strcmp(command, "cancel")) {
+            e->v.state.selection.anchor = sizeof "alpha" - 1u;
+            T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+            if (panel) { T(!e->find_visible); T(e->v.state.selection.anchor == sizeof "alpha" - 1u);
+                T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); }
+            T(e->v.state.selection.anchor == e->v.state.selection.cursor);
+            T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(expect(e, text, 0) == 0);
+            T(e->buffer->history_cursor == history);
+            T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+            T(press(e, key(XKB_KEY_2, 0, "2")) == 0); T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+            T(!e->go.active); T(expect(e, text, 0) == 0);
+        } else {
+            view_selection sel = e->v.state.selection; uint64_t top = e->v.state.first_line;
+            T(press(e, key(XKB_KEY_Down, PLAT_MOD_CTRL, NULL)) == 0);
+            T(e->v.state.first_line == top + 1u); T(!memcmp(&sel, &e->v.state.selection, sizeof sel));
+            T(press(e, key(XKB_KEY_Up, PLAT_MOD_CTRL, NULL)) == 0);
+            T(e->v.state.first_line == top); T(!memcmp(&sel, &e->v.state.selection, sizeof sel));
+            T(press(e, key(XKB_KEY_Up, PLAT_MOD_CTRL, NULL)) == 0); T(e->v.state.first_line == top);
+            T(e->buffer->history_cursor == history); T(expect(e, text, 0) == 0);
+        }
+        T(editor_get_stats(e).unimplemented_actions == unsupported); T(count.allocations == 0);
+        editor_close(e); unlink(path); unlink(target); unlink(log);
+        /* Existing journal lock is retained by the session contract. */
+        char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s/.journal.lock", dir) > 0); unlink(lock);
+        T(rmdir(dir) == 0);
+        if (panel) break;
+    }
+    printf("edit-o20 %s: text and find focus PASS\n", command); return 0;
+}
+static int o20_all(void)
+{
+    const char *commands[] = {"new", "open", "save-as", "exit", "cancel", "scroll", "open-empty", "path-edit", "save-source", "save-watch", "scroll-wrap", "save-clean-watch", "save-mapped", "save-shared"};
+    for (size_t i = 0; i < sizeof commands / sizeof *commands; i++) T(o20_case(commands[i]) == 0);
+    return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
+        if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
         if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
         if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
         if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
@@ -3926,6 +4084,7 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(o20_all() == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(gutter_click_contract()==0); T(gutter_growth_contract()==0); T(gutter_wrap_contract()==0);
     T(find_follow_before_top_contract()==0);
