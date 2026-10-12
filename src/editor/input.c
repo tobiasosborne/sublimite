@@ -205,6 +205,8 @@ static void remember(editor *e, editor_delta d)
     editor_buffer *b = e->buffer;
     undo_history h = undo_get_history(e->undo);
     if (b->save_tracking && b->history_cursor < b->save_cursor) b->save_tracking = false;
+    /* A saved state in the discarded redo branch cannot name the new branch. */
+    if (b->history_cursor < b->saved_cursor) b->saved_lost = true;
     b->history_count = b->history_cursor;
     if (b->history_cursor && b->history_serial == h.group_serial) {
         editor_delta *last = delta_at(e, b->history_cursor - 1);
