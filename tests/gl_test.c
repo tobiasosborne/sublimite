@@ -932,7 +932,7 @@ static int gl_review_native_paint(void *user,render_backend *b,const render_grid
 {
     gl_driver *d=user; gl_state *s=b->state;
     GL_CHECK(gl_submit(b,g,strip,1)==RENDER_OK && gl_bind(s));
-    gl_upload_pending(s); s->native_height=d->platform.height; gl_draw(s);
+    gl_upload_pending(s); s->native_width=d->platform.width; s->native_height=d->platform.height; gl_draw(s);
     GL_CHECK(s->gGetError()==GL_NO_ERROR && s->eSwapBuffers(s->display,s->surface));
     s->gFinish();
     return 0; /* pixel diagnostic only, no fabricated T5/T6 */

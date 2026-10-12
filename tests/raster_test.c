@@ -565,6 +565,9 @@ static int raster_native_window(void *user, uint32_t width, uint32_t height)
     xcb_configure_window(g_plat.conn,g_plat.win,XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
     xcb_get_geometry_reply_t *reply=xcb_get_geometry_reply(g_plat.conn,xcb_get_geometry(g_plat.conn,g_plat.win),NULL);
     T(reply && reply->width==width && reply->height==height); free(reply);
+    /* edit-u82: mirror the confirmed native geometry before submit, as the
+     * production ConfigureNotify dispatcher does. */
+    g_plat.width=width; g_plat.height=height;
     return 0;
 }
 static int raster_native_paint(void *user, render_backend *b, const render_grid *g, const render_strip *strip)
@@ -622,6 +625,7 @@ int main(int argc, char **argv)
     T(real_shm_put != NULL);
     if (argc > 2 && !strcmp(argv[1], "--review")) return review_cases(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--pixels-only")) return minimap_region_test();
+    T(review_cases("edit-u82") == 0);
     T(minimap_region_test() == 0);
     T(!edit_malloc_guard_active() || external_guard_enabled());
     if (review_cases("all") != 0) return 1;
@@ -655,6 +659,32 @@ int main(int argc, char **argv)
 
 static bool review_fake, review_real_mailbox;
 static uint32_t review_uploads, review_presents, review_submit_calls;
+/* edit-u82: optional native pixmap model; zero disables observation (P). */
+static uint32_t *review_surface;
+static size_t review_surface_stride;
+static uint32_t review_surface_color;
+static size_t review_surface_clears;
+static xcb_void_cookie_t review_gc(xcb_connection_t *c, xcb_gcontext_t gc,
+    uint32_t mask, const void *values)
+{
+    if (!review_fake) return xcb_change_gc(c, gc, mask, values);
+    if (mask & XCB_GC_FOREGROUND) memcpy(&review_surface_color, values, sizeof review_surface_color);
+    return (xcb_void_cookie_t){0}; /* (P) fake request has no native sequence. */
+}
+static xcb_void_cookie_t review_fill(xcb_connection_t *c, xcb_drawable_t d,
+    xcb_gcontext_t gc, uint32_t count, const xcb_rectangle_t *rects)
+{
+    if (!review_fake) return xcb_poly_fill_rectangle(c, d, gc, count, rects);
+    if (review_surface) {
+        review_surface_clears++;
+        for (uint32_t i = 0; i < count; i++)
+            for (uint32_t y = 0; y < rects[i].height; y++)
+                for (uint32_t x = 0; x < rects[i].width; x++)
+                    review_surface[((size_t)rects[i].y + y) * review_surface_stride +
+                        (size_t)rects[i].x + x] = review_surface_color;
+    }
+    return (xcb_void_cookie_t){0}; /* (P) fake request has no native sequence. */
+}
 static uint16_t review_upload_width, review_upload_height;
 static uint32_t review_stop_calls, review_stop_at;
 static _Atomic uint32_t review_publish_calls;
@@ -736,6 +766,13 @@ static xcb_void_cookie_t review_put(xcb_connection_t *c, xcb_drawable_t d,
 {
     if (!review_fake) return xcb_shm_put_image(c,d,gc,tw,th,sx,sy,sw,sh,dx,dy,depth,format,send,seg,offset);
     review_uploads++; review_upload_width = sw; review_upload_height = sh;
+    /* The remainder fixture uses its SHM address as the otherwise opaque segment. */
+    if (review_surface) {
+        const uint32_t *pixels = (const uint32_t *)c;
+        for (uint32_t y = 0; y < sh; y++)
+            memcpy(review_surface + ((size_t)dy + y) * review_surface_stride + (size_t)dx,
+                pixels + ((size_t)sy + y) * tw + sx, (size_t)sw * sizeof *pixels);
+    }
     return (xcb_void_cookie_t){1};
 }
 static int review_fd(xcb_connection_t *c) { return review_fake ? 42 : xcb_get_file_descriptor(c); }
@@ -806,6 +843,8 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #define work_should_stop review_should_stop
 #define nanosleep review_sleep
 #define trace_now_ns review_now
+#define xcb_change_gc review_gc
+#define xcb_poly_fill_rectangle review_fill
 #define xcb_shm_put_image review_put
 #define xcb_flush review_flush
 #define xcb_get_file_descriptor review_fd
@@ -832,6 +871,8 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #undef work_should_stop
 #undef nanosleep
 #undef trace_now_ns
+#undef xcb_change_gc
+#undef xcb_poly_fill_rectangle
 #undef xcb_shm_put_image
 #undef xcb_flush
 #undef xcb_get_file_descriptor
@@ -1554,8 +1595,72 @@ static int review_budget_track(bool maximum)
     return 0;
 }
 static int review_batch_rollback(void);
+/* (P) Minimal nonempty grid: one cell in each axis; two pixels per cell
+ * allow one leftover pixel (< cell size) in each axis. Surface = cell + one.
+ * Theme RGB comes from config; UINT32_MAX is outside opaque RGB (P sentinel).
+ * Each scenario exercises one state transition, with no timing/count budget. */
+static int remainder_background_test(void)
+{
+    review_reset_fixture();
+    enum { CELLS = 1, CELL = 2, REMAINDER = 1,
+           WIDTH = CELLS * CELL + REMAINDER, HEIGHT = WIDTH };
+    uint32_t pixels[WIDTH * HEIGHT] = {0}, surface[WIDTH * HEIGHT];
+    render_cell cells[CELLS] = {{.atlas_slot = RENDER_NO_SLOT}}, copied[CELLS];
+    render_strip full = {0, CELLS}, owned_strip;
+    uint64_t dirty;
+    render_grid grid;
+    T(render_grid_init(&grid, (render_dims){CELLS, CELLS, CELL, CELL},
+        cells, CELLS, &dirty, CELLS) == RENDER_OK);
+    grid.surface_background = config_theme_color(CONFIG_DARK, "editor.background");
+    cells[0].bg = config_theme_color(CONFIG_DARK, "chrome.background"); /* (P) sole cell index */
+    for (size_t i = 0; i < WIDTH * HEIGHT; i++) surface[i] = UINT32_MAX;
+    work_pool pool = {.efd = -1}; /* (P) no real scheduler fd. */
+    cpu_state st = {.up = true, .pool = &pool, .max_strips = CELLS,
+        .cells = copied, .strips = &owned_strip, .pix = pixels,
+        .conn = (xcb_connection_t *)pixels, .stride_px = WIDTH,
+        .max_w = WIDTH, .max_h = HEIGHT};
+    st.scene.cells = copied;
+    render_backend backend = review_backend(&st);
+    review_surface = surface; review_surface_stride = WIDTH;
+    uint32_t black = 0; /* (P) initially black native GC. */
+    (void)review_gc(st.conn, st.gc, XCB_GC_FOREGROUND, &black);
+    review_surface_clears = 0; /* (P) native GC starts black; no clears yet. */
+    T(render_frame_begin(&grid, CELLS) == RENDER_OK && render_mark_full(&grid) == RENDER_OK);
+    edit_malloc_guard_begin();
+    int rc = cpu_submit(&backend, &grid, &full, CELLS);
+    size_t allocations = edit_malloc_guard_end();
+    T(rc == RENDER_OK && allocations == 0); /* (P) typing-path allocation law. */
+    work_ctx ctx = {.arg = review_queued[0].arg, .generation = grid.frame_id}; /* (P) first job index. */
+    review_queued[0].fn(&ctx);
+    upload_strip(&st, 0); /* (P) sole partition index. */
+    for (uint32_t y = 0; y < HEIGHT; y++) for (uint32_t x = 0; x < WIDTH; x++)
+        T(surface[y * WIDTH + x] == (x < CELL && y < CELL ? cells[0].bg : grid.surface_background));
+    T(review_surface_clears == CELLS); /* (P) one request fills both axis margins. */
+    st.have_frame = false; st.nhandles = 0; /* (P) model completed work without native presentation. */
+    review_submit_calls = 0;
+    grid.frame_id++;
+    T(cpu_submit(&backend, &grid, NULL, 0) == RENDER_OK); /* (P) stable no-damage frame. */
+    T(review_surface_clears == CELLS + CELLS); /* (P) initial and stable frames each fill the margin rectangles. */
+    st.have_frame = false;
+    grid.surface_background = config_theme_color(CONFIG_LIGHT, "editor.background");
+    T(cpu_submit(&backend, &grid, NULL, 0) == RENDER_OK);
+    T(surface[WIDTH * HEIGHT - 1u] == grid.surface_background); /* (P) bottom-right pixel. */
+    T(surface[0] == cells[0].bg); /* (P) theme change with no cell damage preserves cell content. */
+    st.have_frame = false;
+    T(cpu_resize(&backend, (render_dims){CELLS, CELLS, CELLS, CELLS}) == RENDER_OK);
+    grid.dims = st.scene.dims;
+    review_submit_calls = 0;
+    T(cpu_submit(&backend, &grid, &full, CELLS) == RENDER_OK);
+    ctx.arg = review_queued[0].arg;
+    review_queued[0].fn(&ctx); upload_strip(&st, 0);
+    T(surface[CELLS] == grid.surface_background); /* (P) pixel exposed by cell shrink. */
+    review_surface = NULL;
+    puts("edit-u82: fractional strips, stable frame, theme change, geometry shrink, no allocations passed");
+    return 0;
+}
 static int review_cases(const char *which)
 {
+    if (!strcmp(which,"edit-u82")) return remainder_background_test();
     if (!strcmp(which,"P2-1-15")) return review_inline_deadline();
     if (!strcmp(which,"P2-1-12-gate")) return review_pending_acceptance_gate();
     if (!strcmp(which,"P2-1-11")) return review_page_cell_budget();

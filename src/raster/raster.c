@@ -66,6 +66,8 @@ typedef struct cpu_state {
     uint32_t total_rows, frame_id;
     bool have_frame;
     bool snapshot_valid, inline_frame, caret_hint;
+    bool margin_damage;
+    uint32_t surface_background;
     render_scroll scroll;
     uint32_t inline_at[2], inline_count;
     bool inline_fence, inline_present, inline_idle;
@@ -322,13 +324,28 @@ static bool cpu_visual_rgb888(const xcb_setup_t *setup, uint32_t visual, uint8_t
     return false;
 }
 
-/* Present may copy fractional-cell margins and retained pixels after shrink.
- * Clear the whole admitted native surface, including pixels never uploaded
- * from SHM. One asynchronous native request keeps resize off a UI pixel scan. */
-static void cpu_clear_pixmap(cpu_state *st)
+/* edit-u82: paint the disjoint right/bottom margins each frame. The native
+ * pixmap retains grid pixels; no full-surface clear or SHM pixel scan on keys.
+ * (P) two axes yield at most two rectangles; bottom excludes the right corner. */
+static void cpu_paint_margins(cpu_state *st, const render_backend *b, const render_grid *g)
 {
-    xcb_rectangle_t extent={0,0,(uint16_t)st->max_w,(uint16_t)st->max_h};
-    xcb_poly_fill_rectangle(st->conn,st->pixmap,st->gc,1,&extent);
+    uint32_t width = b->config.platform ? b->config.platform->width : st->max_w;
+    uint32_t height = b->config.platform ? b->config.platform->height : st->max_h;
+    if (width > st->max_w) width = st->max_w;
+    if (height > st->max_h) height = st->max_h;
+    uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;
+    xcb_rectangle_t rects[2]; /* (P) one possible margin per surface axis. */
+    uint32_t count = 0; /* (P) empty rectangle list. */
+    if (width > w && height) rects[count++] = (xcb_rectangle_t){(int16_t)w, 0,
+        (uint16_t)(width - w), (uint16_t)height}; /* (P) top of right strip. */
+    if (height > h && width) rects[count++] = (xcb_rectangle_t){0, (int16_t)h,
+        (uint16_t)(width < w ? width : w), (uint16_t)(height - h)}; /* (P) left of bottom strip. */
+    st->margin_damage = count && (!st->snapshot_valid || st->surface_background != g->surface_background);
+    st->surface_background = g->surface_background;
+    if (!count) return;
+    uint32_t color = g->surface_background | st->alpha_or;
+    xcb_change_gc(st->conn, st->gc, XCB_GC_FOREGROUND, &color);
+    xcb_poly_fill_rectangle(st->conn, st->pixmap, st->gc, count, rects);
     xcb_flush(st->conn);
 }
 
@@ -399,7 +416,6 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     err = xcb_request_check(st->conn, xcb_create_gc_checked(st->conn, st->gc, st->pixmap,
         XCB_GC_FOREGROUND | XCB_GC_GRAPHICS_EXPOSURES, values));
     if (err) { free(err); st->gc = 0; goto fail; }
-    cpu_clear_pixmap(st);
     st->device_fence = xcb_generate_id(st->conn);
     err = xcb_request_check(st->conn, xcb_sync_create_fence_checked(st->conn, st->pixmap, st->device_fence, 1));
     if (err) { free(err); st->device_fence = 0; goto fail; }
@@ -445,7 +461,6 @@ static int cpu_resize(render_backend *b, render_dims dims)
     if (st->failed) return RENDER_ERR_DEVICE;
     if ((uint64_t)dims.cols*dims.cell_w > st->max_w ||
         (uint64_t)dims.rows*dims.cell_h > st->max_h) return RENDER_ERR_CAPACITY;
-    cpu_clear_pixmap(st);
     st->scene.dims = dims;
     st->snapshot_valid = false;
     return RENDER_OK;
@@ -551,6 +566,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
         (size_t)g->dims.cols * g->dims.rows > RASTER_FRAME_CELL_LIMIT) return RENDER_ERR_CAPACITY;
     int retire_rc = cpu_retire_jobs(st);
     if (retire_rc != RENDER_OK) return retire_rc;
+    cpu_paint_margins(st, b, g);
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
     st->inline_frame = !g->scroll.origin_y_q8 && inline_cursor_damage(st, g, strips, count);
     if (g->region.pixels) {
@@ -629,13 +645,13 @@ static int cpu_present(render_backend *b, uint32_t frame_id)
         xcb_sync_query_fence_cookie_t ck = xcb_sync_query_fence(st->conn, st->device_fence);
         st->metrics.fence_sequence = ck.sequence;
         xcb_xfixes_region_t update = 0;
-        if (!st->nstrips && st->region.pixels && st->region.dirty) {
+        if (!st->margin_damage && !st->nstrips && st->region.pixels && st->region.dirty) {
             const render_pixels *p = &st->region;
             xcb_rectangle_t rect = {(int16_t)p->x, (int16_t)p->y,
                 (uint16_t)p->width, (uint16_t)p->height};
             update = xcb_generate_id(st->conn);
             xcb_xfixes_create_region(st->conn, update, 1, &rect);
-        } else if (st->inline_frame) {
+        } else if (!st->margin_damage && st->inline_frame) {
             xcb_rectangle_t rects[2];
             for (uint32_t i = 0; i < st->inline_count; i++) {
                 uint32_t at = st->inline_at[i];

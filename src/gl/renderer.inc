@@ -63,6 +63,7 @@ typedef struct gl_state {
     bool region_pending;
     GLint surface_uniform, atlas_uniform, shift_uniform, scroll_clip_uniform, scroll_motion_uniform;
     render_scroll scroll;
+    uint32_t surface_background;
     GLsync fence;
     void *mapped;
     uint32_t swap_serial, pending_serial;
@@ -81,7 +82,7 @@ typedef struct gl_state {
     uint32_t max_width, max_height;
     struct plat *platform;
     xcb_connection_t *native_conn;
-    uint32_t native_win, native_visual, native_height;
+    uint32_t native_win, native_visual, native_width, native_height;
     PFNEGLRELEASETHREADPROC eReleaseThread;
     PFNEGLGETPROCADDRESSPROC eGetProcAddress;
     PFNEGLQUERYSTRINGPROC eQueryString;
@@ -684,9 +685,24 @@ static void gl_draw(gl_state *s)
     s->gDisable(GL_SCISSOR_TEST);
     gl_blit_region(s, h);
     s->gBindFramebuffer(GL_READ_FRAMEBUFFER,s->fbo); s->gBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);
-    /* Resizing only the grid can expose cells from an earlier, larger grid
-     * in either native swap buffer. Erase the fractional-cell margins too. */
-    s->gClearColor(0,0,0,1); s->gClear(GL_COLOR_BUFFER_BIT);
+    /* edit-u82: swap buffers have no assumed age. Clear only the disjoint
+     * margins every frame; the retained FBO supplies all grid pixels below.
+     * (P) RGB channels have eight bits: shift by 16/8, mask/divide by 255;
+     * opaque alpha is one. Zero is the left/bottom surface origin. */
+    uint32_t width = s->native_width, height = s->native_height;
+    s->gClearColor((GLfloat)((s->surface_background >> 16) & 255u) / 255.0f,
+        (GLfloat)((s->surface_background >> 8) & 255u) / 255.0f,
+        (GLfloat)(s->surface_background & 255u) / 255.0f, 1.0f);
+    s->gEnable(GL_SCISSOR_TEST);
+    if (width > w && height) {
+        s->gScissor((GLint)w, 0, (GLsizei)(width - w), (GLsizei)height);
+        s->gClear(GL_COLOR_BUFFER_BIT);
+    }
+    if (height > h && width) {
+        s->gScissor(0, 0, (GLsizei)(width < w ? width : w), (GLsizei)(height - h));
+        s->gClear(GL_COLOR_BUFFER_BIT);
+    }
+    s->gDisable(GL_SCISSOR_TEST);
     /* A grid can leave a fractional-cell margin at the window's bottom.
      * Align its destination to native top-left, just like the cell contract. */
     GLint native_h=(GLint)s->native_height;
@@ -747,6 +763,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
      * this backend an independently terminable EGLDisplay, without globals. */
     bool wayland=cfg->platform->backend==PLAT_BACKEND_WAYLAND;
     if (wayland) {
+        s->native_width=cfg->platform->width;
         s->native_height=cfg->platform->height;
     } else {
     s->native_conn=xcb_connect(NULL,NULL); s->own_native_conn=true;
@@ -767,7 +784,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(s->native_conn,
         xcb_get_geometry(s->native_conn,s->native_win),NULL);
     if (geometry==NULL) return RENDER_ERR_UNSUPPORTED;
-    s->native_height=geometry->height; free(geometry);
+    s->native_width=geometry->width; s->native_height=geometry->height; free(geometry);
     }
     int rc=RENDER_ERR_UNSUPPORTED;
     if (!gl_load(s)) goto fail;
@@ -1109,6 +1126,7 @@ static int gl_submit(render_backend *b,const render_grid *g,const render_strip *
         s->ring_last=s->ring_current; s->ring_has_last=true;
         s->ring_next=(s->ring_current+1u)%GL_CELL_RING; s->leased=false;
     }
+    s->surface_background=g->surface_background;
     s->scroll=g->scroll;
     s->swapped=false;
     return RENDER_OK;
@@ -1123,6 +1141,7 @@ static int gl_present(render_backend *b,uint32_t id)
     if (s->fence!=NULL) { s->gDeleteSync(s->fence); s->fence=NULL; }
     int rc=gl_upload_pending(s);
     if (rc!=RENDER_OK) return rc;
+    s->native_width=s->platform->width;
     s->native_height=s->platform->height; /* UI only, after init handoff. */
     gl_draw(s);
     if (s->ring_poisoned) return gl_fail(s);

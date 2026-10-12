@@ -228,6 +228,7 @@ static int minimap_compose_pixels(const char *backend_name)
     e->buffer->map.rows[0].marks[0] ^= UINT64_C(1); /* toggle the first fixture character */
     edit_malloc_guard_begin(); T(editor_compose(e) == 0);
     size_t allocations = edit_malloc_guard_end(); T(allocations == 0);
+    T(e->grid.surface_background == config_theme_color(e->preferences.theme, "editor.background"));
     size_t count = 0; T(render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count) == 0);
     T(count == 0 && e->grid.region.dirty);
     uint64_t submitted_cells = backend.stats.submitted_cells;

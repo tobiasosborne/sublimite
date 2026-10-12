@@ -104,6 +104,8 @@ typedef struct render_grid {
     bool full_frame, begun;
     render_pixels region;
     render_scroll scroll;
+    /* Opaque RGB base below cells, including fractional-cell surface margins. */
+    uint32_t surface_background;
 } render_grid;
 
 /* UI thread only (pure read-only helpers may also operate on an exclusively

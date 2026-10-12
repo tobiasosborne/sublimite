@@ -152,6 +152,8 @@ static int render_atlas_validate(const render_grid *g, size_t *bytes)
 
 static int render_cells_validate(const render_grid *g)
 {
+    /* (P) opaque RGB permits only the low three eight-bit channels. */
+    if (g->surface_background & UINT32_C(0xff000000)) return RENDER_ERR_CELL;
     const render_pixels *p = &g->region;
     if (p->pixels) {
         uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;

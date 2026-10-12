@@ -296,6 +296,7 @@ static int compose(editor *e)
 }
 int editor_compose(editor *e)
 {
+    e->grid.surface_background = config_theme_color(e->preferences.theme, "editor.background");
     trace_record(TRACE_COMPOSE_BEGIN, e->grid.frame_id);
     int rc = compose(e);
     trace_record(TRACE_COMPOSE_END, e->grid.frame_id);

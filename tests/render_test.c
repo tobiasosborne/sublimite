@@ -6,6 +6,7 @@
  * Null is the default. Hardware drivers must not fake T5/T6.
  */
 #include "render/render.h"
+#include "config/config.h"
 #include "base/base.h"
 #include "font/font.h"
 #include "trace/trace_fmt.h"
@@ -452,11 +453,15 @@ static int render_native_resize_contract(render_backend *b,const render_native_l
         for (size_t i=0;i<(size_t)dims.cols*dims.rows;i++)
             cells[i]=(render_cell){0,RENDER_NO_SLOT,0,0x234567u+(uint32_t)i*0x10101u,0,0};
         CHECK(render_frame_begin(&grid,(uint32_t)step+1)==RENDER_OK && render_mark_full(&grid)==RENDER_OK);
+        /* edit-u82: RGB is the existing theme token, rather than the native
+         * GC/default framebuffer's black; no invented fixture colour (P). */
+        grid.surface_background=config_theme_color(step % 2u ? CONFIG_LIGHT : CONFIG_DARK,
+            "editor.background"); /* (P) alternate the two existing themes. */
         render_strip strip={0,dims.rows};
         CHECK(lane->paint(lane->user,b,&grid,&strip)==0);
         CHECK(lane->pixels(lane->user,pixels,256)==0);
         for (uint32_t y=0;y<height;y++) for (uint32_t x=0;x<width;x++) {
-            uint32_t expected=0;
+            uint32_t expected=grid.surface_background;
             if (x<dims.cols*dims.cell_w && y<dims.rows*dims.cell_h)
                 expected=cells[(size_t)(y/dims.cell_h)*dims.cols+x/dims.cell_w].bg;
             if (pixels[(size_t)y*width+x]!=expected)
