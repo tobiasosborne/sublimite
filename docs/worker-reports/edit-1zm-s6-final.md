@@ -1,0 +1,3 @@
+Implemented overflow, startup diagnostics, scaling, socket-path handling, display guard, and allocator coverage. `make all` and targeted Wayland release/ASan/UBSan tests pass.
+
+The bead remains incomplete: CPU fallback without `wp_presentation` needs larger renderer work. Full-check restrictions, unrelated failures, and compositor-dependent checks are recorded in the [report](/home/tobias/Projects/sublimite/.wt/edit-1zm-s6/docs/worker-reports/edit-1zm-s6.md) and module status.
