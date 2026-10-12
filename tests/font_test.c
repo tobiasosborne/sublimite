@@ -1134,12 +1134,19 @@ static void test_fallback(void)
     CHECK(work_pool_init(&pool, 1, 0) == 0);
     work_job j = { font_fallback_job, &fb, 7u, WORK_BULK };
     pthread_t me = pthread_self();
+    /* (P) Law 2: first worker discovery may overlap a UI typing window;
+     * only its opaque library calls are exempt, not submission/adoption. */
+    edit_malloc_guard_begin();
     CHECK(work_submit(&pool, j).epoch != 0);
     struct pollfd pfd = { work_pool_eventfd(&pool), POLLIN, 0 };
     fallback_adoption adoption = {&fb, 0};
     for (int i = 0; i < 300 && !adoption.got; i++) {   /* up to 30 s */
         if (poll(&pfd, 1, 100) > 0) work_mailbox_drain(&pool, adopt_fallback, &adoption);
     }
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) CHECK(allocations == 0); /* (P) law 2 */
+    printf("font_test: worker discovery malloc guard: %zu allocations (%s)\n",
+           allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
     CHECK(adoption.got == 1);
     CHECK(atomic_load(&fb.done) == 1u);
     CHECK(!pthread_equal(fb.worker, me));

@@ -7,18 +7,26 @@
 #include <sys/stat.h>
 #include <time.h>
 
-/* (G) Inherited raster/GL descriptor ceiling, less baked printable ASCII.
+/* (P) Inherited raster/GL descriptor ceiling, less baked printable ASCII.
  * These are storage ceilings, not invented latency or memory targets. */
 #define ASYNC_ASCII ((size_t)('~' - ' ' + 1))
-#define ASYNC_ENTRIES (4096u - ASYNC_ASCII)
+#define ASYNC_ENTRIES (FONT_RUNTIME_MAX_GLYPHS - ASYNC_ASCII)
 #define ASYNC_SCRATCH ((size_t)FONT_ATLAS_PAGE_DIM * FONT_ATLAS_PAGE_DIM)
-#define ASYNC_WIDTHS 2u /* utf8's supported narrow/wide cluster images */
+#define ASYNC_WIDTHS 2u /* (P) utf8's narrow/wide cluster images */
+/* (P) ceil((requests + widths) / inherited three-quarter table occupancy). */
 #define ASYNC_CACHE_ENTRIES (((ASYNC_ENTRIES + ASYNC_WIDTHS) * 4u + 2u) / 3u)
+/* (P) Separate bits for prior-frame borrows and this frame's lookups. */
+#define ASYNC_PRIOR_PIN 1u
+#define ASYNC_CURRENT_PIN 2u
+/* (P) Wide requests consume two narrow tiles; an odd-width row can waste
+ * at most one trailing tile per request. Bound occupancy by that sum. */
+#define ASYNC_TILES (ASYNC_ENTRIES * (ASYNC_WIDTHS + 1u))
 
 typedef struct async_request {
     struct font_async *owner;
     uint64_t hash;
-    size_t key, len;
+    size_t key, len, tile;
+    size_t previous, following;
     uint32_t width, index;
     int result;
 } async_request;
@@ -46,10 +54,14 @@ struct font_async {
     async_scalar *scalars;
     uint32_t *table;
     uint8_t *keys;
+    uint8_t *retained;
+    uint8_t *occupied;
     render_glyph *glyphs;
     render_atlas_page pages[FONT_ATLAS_MAX_PAGES + 1u];
-    render_glyph missing[ASYNC_WIDTHS]; /* completed replacement images, never pending '?' */
-    size_t count, next, pending, key_used, page_count;
+    edit_arena pixels;
+    size_t count, next, pending, page_count, tiles, per_page, tile_cursor;
+    size_t oldest, newest, vacant;
+    bool retaining;
     /* Exclusively worker-owned until shutdown. */
     size_t face_count, scalar_count;
     work_ctx *worker_ctx;
@@ -95,25 +107,27 @@ int font_async_open_atlas(font_async **out, const font_ascii_atlas *a, bool em,
     /* Worst-case exact UTF-8 keys, one per renderer-admissible request.
      * Virtual arena reservation; only requested keys are touched. */
     size_t keys = ASYNC_ENTRIES * FONT_CLUSTER_MAX_BYTES;
-    /* Cache admission keeps a quarter of its hash table empty. Round up so
-     * every UI request can be admitted; its private descriptors are copied
-     * into the smaller renderer table only after mailbox completion. */
-    size_t cache_entries = ASYNC_CACHE_ENTRIES;
+    /* (P) Worker composes a single image without cache admission. The UI
+     * hash table reserves empty buckets at the inherited occupancy ratio. */
+    size_t cache_entries = 1;
     size_t negative = cache_entries < 64u ? cache_entries : 64u; /* inherited negative cache ceiling */
     size_t ui_sizes[] = {ASYNC_ENTRIES * sizeof(async_request), ASYNC_ENTRIES * sizeof(async_face),
-        ASYNC_ENTRIES * sizeof(async_scalar), ASYNC_ENTRIES * sizeof(uint32_t), keys,
-        (ASYNC_ASCII + ASYNC_ENTRIES) * sizeof(render_glyph)};
+        ASYNC_ENTRIES * sizeof(async_scalar), ASYNC_CACHE_ENTRIES * sizeof(uint32_t), keys,
+        (ASYNC_ASCII + ASYNC_ENTRIES) * sizeof(render_glyph), ASYNC_ENTRIES, ASYNC_TILES};
     size_t ui_bytes = 0;
     for (size_t i = 0; i < sizeof ui_sizes / sizeof ui_sizes[0]; i++)
         ui_bytes += ui_sizes[i] + _Alignof(max_align_t); /* one alignment allowance per allocation */
     size_t storage_sizes[] = {cache_entries * sizeof(font_cache_entry),
-        (cache_entries + ASYNC_ASCII) * sizeof(render_glyph), keys + ASYNC_WIDTHS * sizeof "\xef\xbf\xbd",
+        (cache_entries + ASYNC_ASCII) * sizeof(render_glyph), FONT_CLUSTER_MAX_BYTES,
         negative * sizeof(font_cache_entry), negative * 256u, /* inherited per-negative key bound */
         FONT_CLUSTER_MAX_BYTES, (size_t)max_cell.cell_w * 2u * max_cell.cell_h, ASYNC_SCRATCH};
-    size_t storage_bytes = FONT_ATLAS_MAX_PAGES * (ASYNC_SCRATCH + _Alignof(max_align_t));
+    /* (P) One private atlas page satisfies font_cache_init; published pixels
+     * live in separate, pre-touched pages with reusable per-request tiles. */
+    size_t storage_bytes = ASYNC_SCRATCH + _Alignof(max_align_t);
     for (size_t i = 0; i < sizeof storage_sizes / sizeof storage_sizes[0]; i++)
         storage_bytes += storage_sizes[i] + _Alignof(max_align_t);
-    if (edit_arena_init(&owner->ui, ui_bytes) || edit_arena_init(&owner->storage, storage_bytes)) {
+    if (edit_arena_init(&owner->ui, ui_bytes) || edit_arena_init(&owner->storage, storage_bytes) ||
+        edit_arena_init(&owner->pixels, FONT_ATLAS_MAX_PAGES * ASYNC_SCRATCH)) {
         font_async_close(owner); return FONT_ERR_NOMEM;
     }
     owner->requests = edit_arena_alloc(&owner->ui, ui_sizes[0], _Alignof(async_request));
@@ -122,10 +136,13 @@ int font_async_open_atlas(font_async **out, const font_ascii_atlas *a, bool em,
     owner->table = edit_arena_alloc(&owner->ui, ui_sizes[3], _Alignof(uint32_t));
     owner->keys = edit_arena_alloc(&owner->ui, ui_sizes[4], 1);
     owner->glyphs = edit_arena_alloc(&owner->ui, ui_sizes[5], _Alignof(render_glyph));
-    if (!owner->requests || !owner->faces || !owner->scalars || !owner->table || !owner->keys || !owner->glyphs) {
+    owner->retained = edit_arena_alloc(&owner->ui, ui_sizes[6], 1);
+    owner->occupied = edit_arena_alloc(&owner->ui, ui_sizes[7], 1);
+    if (!owner->requests || !owner->faces || !owner->scalars || !owner->table || !owner->keys || !owner->glyphs || !owner->retained || !owner->occupied) {
         font_async_close(owner); return FONT_ERR_NOMEM;
     }
     memset(owner->faces, 0, ui_sizes[1]);
+    memset(owner->pixels.base, 0, owner->pixels.size); /* INIT pre-touch */
     int rc = font_async_reset_atlas(owner, a, em);
     if (rc) { font_async_close(owner); return rc; }
     *out = owner; return FONT_OK;
@@ -145,22 +162,36 @@ int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *a, bool em
     for (size_t i = 0; i < owner->face_count; i++) edit_arena_free(&owner->faces[i].arena);
     memset(owner->faces, 0, owner->face_count * sizeof *owner->faces);
     owner->face_count = owner->scalar_count = 0;
-    owner->count = owner->next = owner->pending = owner->key_used = 0;
+    owner->count = owner->next = owner->pending = 0;
+    owner->oldest = owner->newest = owner->vacant = SIZE_MAX;
+    owner->retaining = false;
+    memset(owner->retained, 0, ASYNC_ENTRIES);
+    /* (P) Rectangles occupy one narrow tile or two adjacent tiles in a row.
+     * Both descriptor and physical pixel capacities remain bounded. */
+    owner->per_page = (FONT_ATLAS_PAGE_DIM / a->cell.cell_w) *
+                      (FONT_ATLAS_PAGE_DIM / a->cell.cell_h);
+    owner->tiles = owner->per_page * FONT_ATLAS_MAX_PAGES;
+    if (owner->tiles > ASYNC_TILES) owner->tiles = ASYNC_TILES;
+    owner->tile_cursor = 0;
+    memset(owner->occupied, 0, ASYNC_TILES);
+    memset(owner->requests, 0, ASYNC_ENTRIES * sizeof *owner->requests);
     owner->retired = (work_handle){0};
     owner->px = a->px; owner->ascii = *a; owner->em = em; owner->init_result = FONT_MORE;
     memset(&owner->family, 0, sizeof owner->family);
     memset(&owner->cache, 0, sizeof owner->cache);
-    memset(owner->missing, 0, sizeof owner->missing);
     memset(owner->pages, 0, sizeof owner->pages);
     edit_arena_reset(&owner->storage);
     font_fallback_reset(&owner->discovery);
-    memset(owner->table, 0, ASYNC_ENTRIES * sizeof *owner->table);
+    memset(owner->table, 0, ASYNC_CACHE_ENTRIES * sizeof *owner->table);
     for (size_t i = 0; i < ASYNC_ASCII; i++)
         owner->glyphs[i] = (render_glyph){(uint32_t)i + ' ', 0, (uint32_t)i * a->cell.cell_w,
             0, a->cell.cell_w, a->cell.cell_h};
     owner->pages[0] = (render_atlas_page){a->pixels, a->pixels_len,
         ASYNC_ASCII * a->cell.cell_w, (uint32_t)ASYNC_ASCII * a->cell.cell_w, a->cell.cell_h};
-    owner->page_count = 1;
+    for (size_t i = 0; i < FONT_ATLAS_MAX_PAGES; i++)
+        owner->pages[i + 1u] = (render_atlas_page){owner->pixels.base + i * ASYNC_SCRATCH,
+            ASYNC_SCRATCH, FONT_ATLAS_PAGE_DIM, FONT_ATLAS_PAGE_DIM, FONT_ATLAS_PAGE_DIM};
+    owner->page_count = FONT_ATLAS_MAX_PAGES + 1u;
     return FONT_OK;
 }
 
@@ -180,7 +211,7 @@ void font_async_close(font_async *owner)
     if (!owner) return;
     /* Caller has joined the pool and retired all backend pixel borrows. */
     if (owner->faces) for (size_t i = 0; i < owner->face_count; i++) edit_arena_free(&owner->faces[i].arena);
-    edit_arena_free(&owner->storage); edit_arena_free(&owner->ui); free(owner);
+    edit_arena_free(&owner->pixels); edit_arena_free(&owner->storage); edit_arena_free(&owner->ui); free(owner);
 }
 
 static int resolve_scalar(void *ctx, uint32_t cp, font_t **out)
@@ -251,32 +282,45 @@ static void glyph_job(work_ctx *ctx)
         owner->family.count = result == FONT_OK ? 1u : 0u;
         if (result == FONT_OK)
             result = font_cache_init(&owner->cache, &owner->family, &owner->storage,
-                FONT_ATLAS_MAX_PAGES, ASYNC_CACHE_ENTRIES,
-                ASYNC_ENTRIES * FONT_CLUSTER_MAX_BYTES + ASYNC_WIDTHS * sizeof "\xef\xbf\xbd", ASYNC_SCRATCH);
+                1, 1, FONT_CLUSTER_MAX_BYTES, ASYNC_SCRATCH); /* (P) private single-image scratch */
         owner->cache.resolve = resolve_scalar; owner->cache.resolve_ctx = owner;
-        /* Reserve completed replacement artwork before the append-only cache
-         * can fill. An unsupported face or exhausted cache ends in a missing
-         * image, while '?' is reserved exclusively for a pending request. */
-        if (result == FONT_OK) for (uint32_t width = 1; width <= ASYNC_WIDTHS; width++) {
-            uint32_t replacement = RENDER_NO_SLOT; int rc;
-            do { rc = font_cache_glyph(&owner->cache, (const uint8_t *)"\xef\xbf\xbd",
-                                      sizeof "\xef\xbf\xbd" - 1u, width, &replacement); }
-            while (rc == FONT_MORE && !work_should_stop(ctx));
-            if (rc != FONT_OK || replacement == RENDER_NO_SLOT) { result = rc == FONT_OK ? FONT_ERR_INIT : rc; break; }
-            owner->missing[width - 1u] = owner->cache.glyphs[replacement];
-        }
         owner->init_result = result;
     }
     async_result output = {.request = request->index, .result = owner->init_result};
-    uint32_t slot = RENDER_NO_SLOT;
     if (output.result == FONT_OK) do {
-        output.result = font_cache_glyph(&owner->cache, owner->keys + request->key,
-                                        request->len, request->width, &slot);
+        output.result = font_cache_render(&owner->cache, owner->keys + request->key,
+                                         request->len, request->width);
         if (work_should_stop(ctx)) return;
     } while (output.result == FONT_MORE);
-    if (output.result == FONT_OK && slot != RENDER_NO_SLOT) output.glyph = owner->cache.glyphs[slot];
-    else if (output.result != FONT_OK && owner->init_result == FONT_OK)
-        output.glyph = owner->missing[request->width - 1u];
+    int image_result = output.result;
+    if (image_result != FONT_OK && owner->init_result == FONT_OK) {
+        /* Unsupported glyphs retain replacement artwork. Capacity cannot
+         * cause replacement: composition does not consume cache entries. */
+        owner->cache.pending_len = 0;
+        do {
+            image_result = font_cache_render(&owner->cache, (const uint8_t *)"\xef\xbf\xbd",
+                                             sizeof "\xef\xbf\xbd" - 1u, request->width);
+            if (work_should_stop(ctx)) return;
+        } while (image_result == FONT_MORE);
+    }
+    owner->cache.pending_len = 0;
+    if (image_result == FONT_OK) {
+        font_cell cell = owner->ascii.cell;
+        uint32_t w = cell.cell_w * request->width, h = cell.cell_h;
+        size_t tile = request->tile % owner->per_page;
+        uint32_t columns = FONT_ATLAS_PAGE_DIM / cell.cell_w;
+        uint32_t x = (uint32_t)(tile % columns) * cell.cell_w;
+        uint32_t y = (uint32_t)(tile / columns) * h;
+        uint32_t page = (uint32_t)(request->tile / owner->per_page) + 1u;
+        uint8_t *pixels = (uint8_t *)(void *)owner->pages[page].pixels;
+        uint8_t ink = 0;
+        for (uint32_t row = 0; row < h; row++) {
+            const uint8_t *source = owner->cache.image + (size_t)row * w;
+            for (uint32_t col = 0; col < w; col++) ink |= source[col];
+            memcpy(pixels + (size_t)(y + row) * FONT_ATLAS_PAGE_DIM + x, source, w);
+        }
+        if (ink) output.glyph = (render_glyph){0, page, x, y, w, h};
+    }
     work_msg msg = {.kind = FONT_ASYNC_MSG_KIND, .generation = ctx->generation};
     memcpy(msg.data, &output, sizeof output);
     while (!work_should_stop(ctx)) {
@@ -288,11 +332,16 @@ static void glyph_job(work_ctx *ctx)
 
 void font_async_pump(font_async *owner)
 {
-    if (!owner || owner->active.epoch || owner->next == owner->count) return;
-    async_request *request = &owner->requests[owner->next];
-    work_handle handle = work_submit(owner->pool,
-        (work_job){glyph_job, request, request->index + 1u, WORK_BULK});
-    if (handle.epoch) { owner->active = handle; owner->next++; }
+    if (!owner || owner->active.epoch || !owner->pending) return;
+    for (size_t i = 0; i < owner->count; i++) {
+        size_t at = (owner->next + i) % owner->count;
+        async_request *request = &owner->requests[at];
+        if (request->result != FONT_MORE) continue;
+        work_handle handle = work_submit(owner->pool,
+            (work_job){glyph_job, request, request->index + 1u, WORK_BULK});
+        if (handle.epoch) { owner->active = handle; owner->next = at; }
+        return;
+    }
 }
 
 int font_async_bind(font_async *owner, render_grid *grid)
@@ -303,6 +352,99 @@ int font_async_bind(font_async *owner, render_grid *grid)
     grid->glyphs = owner->glyphs; grid->glyph_count = ASYNC_ASCII + owner->count;
     grid->pages = owner->pages; grid->page_count = owner->page_count;
     return FONT_OK;
+}
+
+void font_async_frame(font_async *owner, const render_grid *grid,
+                      const render_grid *text, bool active)
+{
+    if (!owner) return;
+    owner->retaining = true;
+    /* (P) No slots exist beyond count, so ASCII-only frames need no pin
+     * work and clearing scales with admitted descriptors, not capacity. */
+    if (!owner->count) return;
+    if (!active) memset(owner->retained, 0, owner->count);
+    else for (size_t i = 0; i < owner->count; i++)
+        if (owner->retained[i]) owner->retained[i] = ASYNC_PRIOR_PIN;
+    const render_grid *grids[] = {grid, text};
+    for (size_t i = 0; i < sizeof grids / sizeof grids[0]; i++) {
+        const render_grid *g = grids[i];
+        if (!g) continue;
+        for (size_t cell = 0; cell < (size_t)g->dims.cols * g->dims.rows; cell++) {
+            uint32_t slot = g->cells[cell].atlas_slot;
+            if (slot >= ASYNC_ASCII && slot < ASYNC_ASCII + owner->count)
+                owner->retained[slot - ASYNC_ASCII] = ASYNC_PRIOR_PIN;
+        }
+    }
+}
+
+void font_async_reclaim(font_async *owner)
+{
+    if (!owner) return;
+    /* Full replacement after backend retirement may reuse outgoing cells,
+     * while every lookup already made for the incoming frame stays pinned. */
+    for (size_t i = 0; i < owner->count; i++) owner->retained[i] &= ASYNC_CURRENT_PIN;
+}
+
+static void unlink_request(font_async *owner, size_t index)
+{
+    async_request *request = &owner->requests[index];
+    if (request->previous == SIZE_MAX) owner->oldest = request->following;
+    else owner->requests[request->previous].following = request->following;
+    if (request->following == SIZE_MAX) owner->newest = request->previous;
+    else owner->requests[request->following].previous = request->previous;
+}
+
+static void append_request(font_async *owner, size_t index)
+{
+    async_request *request = &owner->requests[index];
+    request->previous = owner->newest; request->following = SIZE_MAX;
+    if (owner->newest == SIZE_MAX) owner->oldest = index;
+    else owner->requests[owner->newest].following = index;
+    owner->newest = index;
+}
+
+static void touch(font_async *owner, size_t index)
+{
+    unlink_request(owner, index); append_request(owner, index);
+    if (owner->retaining) owner->retained[index] |= ASYNC_CURRENT_PIN;
+}
+
+static void remove_key(font_async *owner, const async_request *request)
+{
+    size_t hole = (size_t)(request->hash % ASYNC_CACHE_ENTRIES);
+    while (owner->table[hole] != request->index + 1u)
+        hole = (hole + 1u) % ASYNC_CACHE_ENTRIES;
+    size_t scan = (hole + 1u) % ASYNC_CACHE_ENTRIES;
+    while (owner->table[scan]) {
+        size_t home = (size_t)(owner->requests[owner->table[scan] - 1u].hash % ASYNC_CACHE_ENTRIES);
+        /* (P) Modular probe distances: shift only keys whose search crosses
+         * the hole, including clusters wrapping around the table end. */
+        if ((scan + ASYNC_CACHE_ENTRIES - home) % ASYNC_CACHE_ENTRIES >=
+            (scan + ASYNC_CACHE_ENTRIES - hole) % ASYNC_CACHE_ENTRIES) {
+            owner->table[hole] = owner->table[scan]; hole = scan;
+        }
+        scan = (scan + 1u) % ASYNC_CACHE_ENTRIES;
+    }
+    owner->table[hole] = 0;
+}
+
+static size_t free_tile(const font_async *owner, uint32_t width)
+{
+    size_t columns = FONT_ATLAS_PAGE_DIM / owner->ascii.cell.cell_w;
+    for (size_t i = 0; i < owner->tiles; i++) {
+        size_t tile = (owner->tile_cursor + i) % owner->tiles;
+        if (tile + width > owner->tiles || tile % columns + width > columns) continue;
+        bool free = true;
+        for (uint32_t part = 0; part < width; part++) free &= !owner->occupied[tile + part];
+        if (free) return tile;
+    }
+    return SIZE_MAX;
+}
+
+static size_t free_request(const font_async *owner)
+{
+    if (owner->vacant != SIZE_MAX) return owner->vacant;
+    return owner->count < ASYNC_ENTRIES ? owner->count : SIZE_MAX;
 }
 
 int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width, uint32_t *slot)
@@ -320,34 +462,55 @@ int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width
     uint64_t hash = UINT64_C(14695981039346656037); /* FNV-1a offset basis */
     for (size_t i = 0; i < len; i++) hash = (hash ^ bytes[i]) * UINT64_C(1099511628211); /* FNV-1a prime */
     hash = (hash ^ width) * UINT64_C(1099511628211);
-    size_t at = (size_t)(hash % ASYNC_ENTRIES);
-    for (size_t probe = 0; probe < FONT_CACHE_MAX_PROBES; probe++) {
+    size_t at = (size_t)(hash % ASYNC_CACHE_ENTRIES);
+    for (size_t probe = 0; probe < ASYNC_CACHE_ENTRIES; probe++) {
         uint32_t entry = owner->table[at];
-        if (entry) {
-            async_request *request = &owner->requests[entry - 1u];
-            if (request->hash == hash && request->len == len && request->width == width &&
-                !memcmp(owner->keys + request->key, bytes, len)) {
-                *slot = owner->glyphs[ASYNC_ASCII + request->index].w ? (uint32_t)ASYNC_ASCII + request->index : RENDER_NO_SLOT;
-                /* Missing/error glyphs are a settled missing-image cell, not
-                 * a retry/spin. Cache exhaustion is reported in the status. */
-                return FONT_OK;
-            }
-        } else {
-            if (owner->count == ASYNC_ENTRIES) {
-                *slot = '#' - ' '; return FONT_OK; /* settled resource refusal, never a pending '?' */
-            }
-            async_request *request = &owner->requests[owner->count];
-            *request = (async_request){owner, hash, owner->key_used, len, width, (uint32_t)owner->count, FONT_MORE};
-            memcpy(owner->keys + owner->key_used, bytes, len); owner->key_used += len;
-            *slot = (uint32_t)(ASYNC_ASCII + owner->count);
-            owner->glyphs[*slot] = owner->glyphs['?' - ' '];
-            owner->glyphs[*slot].glyph_index = *slot + 1u;
-            owner->table[at] = (uint32_t)++owner->count; owner->pending++;
-            font_async_pump(owner); return FONT_OK;
+        if (!entry) break;
+        async_request *request = &owner->requests[entry - 1u];
+        if (request->hash == hash && request->len == len && request->width == width &&
+            !memcmp(owner->keys + request->key, bytes, len)) {
+            touch(owner, request->index);
+            *slot = owner->glyphs[ASYNC_ASCII + request->index].w ? (uint32_t)ASYNC_ASCII + request->index : RENDER_NO_SLOT;
+            return FONT_OK;
         }
-        if (++at == ASYNC_ENTRIES) at = 0;
+        at = (at + 1u) % ASYNC_CACHE_ENTRIES;
     }
-    *slot = '#' - ' '; return FONT_OK; /* bounded probe refusal: completed missing marker */
+    size_t index = free_request(owner), tile = free_tile(owner, width);
+    while (index == SIZE_MAX || tile == SIZE_MAX) {
+        size_t victim = owner->oldest;
+        while (victim != SIZE_MAX && (owner->retained[victim] || owner->requests[victim].result == FONT_MORE))
+            victim = owner->requests[victim].following;
+        if (victim == SIZE_MAX) return FONT_MORE; /* retry after frame/job retirement */
+        async_request *old = &owner->requests[victim];
+        remove_key(owner, old); unlink_request(owner, victim);
+        memset(owner->occupied + old->tile, 0, old->width);
+        old->len = 0; old->result = FONT_ERR_ARG;
+        old->following = owner->vacant; owner->vacant = victim;
+        owner->glyphs[ASYNC_ASCII + victim] = (render_glyph){0};
+        index = free_request(owner); tile = free_tile(owner, width);
+    }
+    /* Deletion can shift buckets: find the current insertion hole. */
+    at = (size_t)(hash % ASYNC_CACHE_ENTRIES);
+    while (owner->table[at]) at = (at + 1u) % ASYNC_CACHE_ENTRIES;
+    if (index == owner->count) owner->count++;
+    else owner->vacant = owner->requests[index].following;
+    async_request *request = &owner->requests[index];
+    *request = (async_request){.owner = owner, .hash = hash,
+        .key = index * FONT_CLUSTER_MAX_BYTES, .len = len, .tile = tile, .width = width,
+        .index = (uint32_t)index, .result = FONT_MORE,
+        .previous = SIZE_MAX, .following = SIZE_MAX};
+    memcpy(owner->keys + request->key, bytes, len);
+    memset(owner->occupied + tile, 1, width); /* (P) one occupancy byte per narrow tile */
+    owner->tile_cursor = (tile + width) % owner->tiles;
+    *slot = (uint32_t)(ASYNC_ASCII + index);
+    owner->glyphs[*slot] = owner->glyphs['?' - ' '];
+    owner->glyphs[*slot].glyph_index = *slot + 1u;
+    owner->table[at] = (uint32_t)index + 1u;
+    append_request(owner, index);
+    owner->retained[index] = owner->retaining ? ASYNC_CURRENT_PIN : 0;
+    owner->pending++;
+    font_async_pump(owner);
+    return FONT_OK;
 }
 
 bool font_async_pending(const font_async *owner) { return owner && owner->pending != 0; }
@@ -358,13 +521,11 @@ uint32_t font_async_event(font_async *owner, const work_msg *msg)
         msg->slot_ != owner->active.slot || msg->epoch_ != owner->active.epoch) return RENDER_NO_SLOT;
     async_result output; memcpy(&output, msg->data, sizeof output);
     if (output.request >= owner->count || msg->generation != output.request + 1u ||
-        output.request + 1u != owner->next || owner->requests[output.request].result != FONT_MORE) return RENDER_NO_SLOT;
+        output.request != owner->next || owner->requests[output.request].result != FONT_MORE) return RENDER_NO_SLOT;
     uint32_t slot = (uint32_t)ASYNC_ASCII + output.request;
     if (owner->init_result == FONT_OK) {
-        /* Pages are immutable descriptors after cache initialisation; pixels
-         * and glyphs append only. No worker reads the UI descriptor table. */
-        memcpy(owner->pages, owner->cache.pages, sizeof owner->pages);
-        owner->page_count = FONT_ATLAS_MAX_PAGES + 1u;
+        /* The worker writes only this unretained request's tile. Descriptors
+         * change on authenticated adoption; retained frame pixels are intact. */
         output.glyph.glyph_index = slot + 1u;
         owner->glyphs[slot] = output.glyph;
     } else {

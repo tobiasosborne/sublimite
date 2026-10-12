@@ -135,8 +135,15 @@ static uint64_t compose_time(void)
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
-static int compose_cluster(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width)
+int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width)
 {
+    if (!cache || !cache->family || !bytes || !len || len > FONT_CLUSTER_MAX_BYTES ||
+        width < 1u || width > 2u) return FONT_ERR_ARG;
+    for (size_t off = 0; off < len;) {
+        utf8_step step = utf8_decode(bytes + off, len - off);
+        if (!step.valid || step.cp < ' ' || step.cp == 0x7fu) return FONT_ERR_ARG;
+        off += step.len;
+    }
     if (cache->pending_len != len || cache->pending_width != width ||
         memcmp(cache->pending_key, bytes, len) != 0) {
         memcpy(cache->pending_key, bytes, len);
@@ -235,7 +242,7 @@ int font_cache_glyph(void *ctx, const uint8_t *cluster, size_t len,
         return hit->result;
     }
     cache->misses++;
-    int rc = compose_cluster(cache, cluster, len, width);
+    int rc = font_cache_render(cache, cluster, len, width);
     edit_arena_reset(&cache->scratch);
     if (rc == FONT_MORE) return rc;
     cache->pending_len = 0;

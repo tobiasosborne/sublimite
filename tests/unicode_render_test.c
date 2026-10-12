@@ -2,6 +2,7 @@
 #include "editor/private.h"
 #include "raster/raster.h"
 #include "trace/trace.h"
+#include <limits.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -405,6 +406,154 @@ static int owner_mailbox(void)
     return 0;
 }
 
+static size_t exhaustion_key(uint8_t *key, size_t value, size_t digits)
+{
+    /* (P) Binary digits select Unicode default-ignorables U+034F / U+FE0F.
+     * Their UTF-8 extents come from the literals; all keys retain é's ink. */
+    static const uint8_t base[] = "é", zero[] = "\xcd\x8f", one[] = "\xef\xb8\x8f";
+    size_t len = sizeof base - 1u;
+    memcpy(key, base, len);
+    for (size_t digit = 0; digit < digits; digit++) {
+        const uint8_t *bytes = value & 1u ? one : zero;
+        size_t n = value & 1u ? sizeof one - 1u : sizeof zero - 1u;
+        memcpy(key + len, bytes, n); len += n; value >>= 1u;
+    }
+    return len;
+}
+
+static int cache_exhaustion(bool large)
+{
+    /* (P) One bulk worker serializes the owner; one cell models a scrolling
+     * viewport. The request count is the renderer's capacity plus one, so it
+     * necessarily exceeds the cache without an invented fixture count. */
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    T(pool && work_pool_init(pool, 1, 0) == 0);
+    font_async *owner = NULL;
+    font_cell cell = font_ascii_cell();
+    font_t primary; font_ascii_atlas ascii = {0}; uint8_t *ascii_pixels = NULL;
+    if (large) {
+        /* (P) Use the editor's existing maximum em, not an invented size.
+         * Blank ASCII storage suffices: the regression inspects runtime ink. */
+        size_t len; const unsigned char *bytes = font_embedded_data(&len);
+        T(font_init(&primary, bytes, len) == FONT_OK);
+        T(font_set_em_px(&primary, EDITOR_FONT_MAX_PX) == FONT_OK);
+        cell = primary.cell;
+        size_t bytes_len = (size_t)LAYOUT_ASCII_GLYPHS * cell.cell_w * cell.cell_h;
+        ascii_pixels = calloc(bytes_len, 1); T(ascii_pixels);
+        ascii = (font_ascii_atlas){primary.px, cell, NULL, ascii_pixels, bytes_len};
+        T(font_async_open_atlas(&owner, &ascii, true, cell, pool) == FONT_OK);
+        T(font_async_set_primary(owner, &primary) == FONT_OK);
+    } else T(font_async_open(&owner, font_ascii_px(), pool) == FONT_OK);
+    uint32_t pages; size_t glyphs, pixels;
+    font_async_limits(&pages, &glyphs, &pixels, font_ascii_px());
+    size_t capacity = glyphs - LAYOUT_ASCII_GLYPHS;
+    /* (P) Large cells can exhaust physical narrow rectangles before the
+     * descriptor ceiling: pages * columns per page * rows per page. */
+    size_t physical = (size_t)FONT_ATLAS_MAX_PAGES * (FONT_ATLAS_PAGE_DIM / cell.cell_w) *
+                      (FONT_ATLAS_PAGE_DIM / cell.cell_h);
+    if (physical < capacity) capacity = physical;
+    render_cell cells[1] = {{.atlas_slot = RENDER_NO_SLOT}}; uint64_t dirty = 0;
+    render_grid grid;
+    T(render_grid_init(&grid, (render_dims){1, 1, cell.cell_w, cell.cell_h},
+                       cells, 1, &dirty, 1) == RENDER_OK);
+    T(font_async_bind(owner, &grid) == FONT_OK);
+    owner_receiver receiver = {owner, &grid, false};
+    uint32_t retained_slot;
+    T(font_async_glyph(owner, (const uint8_t *)"α", sizeof "α" - 1u, 1, &retained_slot) == FONT_OK);
+    complete(pool, &receiver);
+    cells[0] = (render_cell){.atlas_slot = retained_slot,
+        .glyph_index = grid.glyphs[retained_slot].glyph_index};
+    render_glyph retained_image = grid.glyphs[retained_slot];
+    const render_atlas_page *retained_page = &grid.pages[retained_image.page];
+    uint8_t *retained_pixels = malloc((size_t)cell.cell_w * cell.cell_h); T(retained_pixels);
+    for (uint32_t y = 0; y < cell.cell_h; y++)
+        memcpy(retained_pixels + (size_t)y * cell.cell_w,
+            retained_page->pixels + (size_t)(retained_image.y + y) * retained_page->stride + retained_image.x, cell.cell_w);
+    /* (P) The capacity determines the binary key's digit count. Storage is
+     * bounded by size_t's bit width times the longest ignorable UTF-8 span. */
+    size_t digits = 0;
+    for (size_t value = capacity; value; value >>= 1u) digits++;
+    uint8_t key[sizeof "é" - 1u + sizeof(size_t) * CHAR_BIT * (sizeof "\xef\xb8\x8f" - 1u)];
+    T(sizeof key <= FONT_CLUSTER_MAX_BYTES);
+    uint8_t *reference = malloc((size_t)cell.cell_w * cell.cell_h); T(reference);
+    for (size_t visit = 0; visit <= capacity; visit++) {
+        font_async_frame(owner, &grid, NULL, false);
+        size_t len = exhaustion_key(key, visit, digits);
+        uint32_t slot;
+        if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+        T(font_async_glyph(owner, key, len, 1, &slot) == FONT_OK);
+        if (edit_malloc_guard_active()) T(edit_malloc_guard_end() == 0);
+        complete(pool, &receiver);
+        if (slot < LAYOUT_ASCII_GLYPHS)
+            fprintf(stderr, "unicode_render_test: exhaustion visit=%zu capacity=%zu returned ASCII slot=%u\n", visit, capacity, slot);
+        T(slot >= LAYOUT_ASCII_GLYPHS && slot < grid.glyph_count);
+        const render_glyph *image = &grid.glyphs[slot];
+        const render_atlas_page *page = &grid.pages[image->page];
+        T(image->w == cell.cell_w && image->h == cell.cell_h);
+        for (uint32_t y = 0; y < image->h; y++) {
+            const uint8_t *row = page->pixels + (size_t)(image->y + y) * page->stride + image->x;
+            if (!visit) memcpy(reference + (size_t)y * image->w, row, image->w);
+            else T(!memcmp(reference + (size_t)y * image->w, row, image->w));
+            T(!memcmp(retained_pixels + (size_t)y * cell.cell_w,
+                retained_page->pixels + (size_t)(retained_image.y + y) * retained_page->stride + retained_image.x, cell.cell_w));
+        }
+    }
+    /* Scrolling back must recover an evicted key's exact pixels too. */
+    uint32_t slot;
+    font_async_frame(owner, &grid, NULL, false);
+    size_t first_len = exhaustion_key(key, 0, digits);
+    T(font_async_glyph(owner, key, first_len, 1, &slot) == FONT_OK);
+    T(font_async_pending(owner)); /* oldest unretained key was evicted */
+    complete(pool, &receiver);
+    T(slot >= LAYOUT_ASCII_GLYPHS);
+    const render_glyph *image = &grid.glyphs[slot];
+    const render_atlas_page *page = &grid.pages[image->page];
+    for (uint32_t y = 0; y < image->h; y++)
+        T(!memcmp(reference + (size_t)y * image->w,
+                  page->pixels + (size_t)(image->y + y) * page->stride + image->x, image->w));
+    T(font_async_glyph(owner, (const uint8_t *)"α", sizeof "α" - 1u, 1, &slot) == FONT_OK);
+    T(slot == retained_slot && !font_async_pending(owner));
+    /* (P) A synthetic outgoing frame references every resident slot. No
+     * eviction is legal until it retires; reclamation keeps incoming hits. */
+    render_cell *borrowed_cells = calloc(capacity, sizeof *borrowed_cells); T(borrowed_cells);
+    for (size_t i = 0; i < capacity; i++) {
+        uint32_t borrowed_slot = (uint32_t)(LAYOUT_ASCII_GLYPHS + i);
+        borrowed_cells[i] = (render_cell){.atlas_slot = borrowed_slot,
+            .glyph_index = grid.glyphs[borrowed_slot].glyph_index};
+    }
+    render_grid borrowed = grid;
+    borrowed.dims.cols = (uint32_t)capacity; borrowed.cells = borrowed_cells;
+    borrowed.cell_capacity = capacity;
+    font_async_frame(owner, &borrowed, NULL, true);
+    /* (P) A wide image consumes adjacent narrow tiles; reuse changes width. */
+    T(font_async_glyph(owner, (const uint8_t *)"β", sizeof "β" - 1u, 2, &slot) == FONT_MORE);
+    T(!font_async_pending(owner));
+    T(font_async_glyph(owner, (const uint8_t *)"α", sizeof "α" - 1u, 1, &slot) == FONT_OK);
+    font_async_reclaim(owner); /* outgoing synthetic frame has retired */
+    T(font_async_glyph(owner, (const uint8_t *)"β", sizeof "β" - 1u, 2, &slot) == FONT_OK);
+    T(slot != retained_slot); complete(pool, &receiver);
+    T(grid.glyphs[slot].w == cell.cell_w * 2u);
+    for (uint32_t y = 0; y < cell.cell_h; y++)
+        T(!memcmp(retained_pixels + (size_t)y * cell.cell_w,
+            retained_page->pixels + (size_t)(retained_image.y + y) * retained_page->stride + retained_image.x, cell.cell_w));
+    free(borrowed_cells);
+    /* Reverse navigation repeatedly deletes collision-chain entries. */
+    for (size_t visit = capacity; visit > 0; visit--) {
+        font_async_frame(owner, &grid, NULL, false);
+        size_t len = exhaustion_key(key, visit - 1u, digits);
+        T(font_async_glyph(owner, key, len, 1, &slot) == FONT_OK);
+        complete(pool, &receiver);
+        T(slot >= LAYOUT_ASCII_GLYPHS && slot != retained_slot);
+        T(bitmap(&grid, &(render_cell){.atlas_slot = slot}) == 0);
+    }
+    T(!receiver.duplicate);
+    T(render_grid_validate(&grid) == RENDER_OK);
+    free(retained_pixels); free(reference); work_pool_shutdown(pool); font_async_close(owner); free(pool); free(ascii_pixels);
+    printf("unicode_render_test: supported clusters beyond %s cache capacity recover exact ink on return\n",
+           large ? "maximum-em" : "descriptor");
+    return 0;
+}
+
 static int sized_primary(editor *e)
 {
     const render_grid *g = editor_grid(e);
@@ -552,6 +701,8 @@ static int tab_title_unicode(void)
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(cache_exhaustion(false) == 0);
+    T(cache_exhaustion(true) == 0);
     T(tab_title_unicode() == 0);
     T(emoji_fallback(false, false) == 0);
     T(emoji_fallback(true, false) == 0);

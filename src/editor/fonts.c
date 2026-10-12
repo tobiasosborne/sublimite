@@ -10,6 +10,10 @@ int editor_font_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t widt
 {
     editor *e = ctx;
     int rc = font_async_glyph(e->fonts, bytes, len, width, slot);
+    if (rc == FONT_MORE && e->grid.full_frame && !e->backend->active) {
+        font_async_reclaim(e->fonts);
+        rc = font_async_glyph(e->fonts, bytes, len, width, slot);
+    }
     (void)font_async_bind(e->fonts, &e->text_grid);
     (void)font_async_bind(e->fonts, &e->grid);
     if (rc == FONT_OK && e->lay.row < e->text_grid.dims.rows)

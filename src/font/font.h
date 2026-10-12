@@ -228,6 +228,9 @@ typedef struct font_cache {
     int (*resolve)(void *ctx, uint32_t cp, font_t **face);
     void *resolve_ctx;
 } font_cache;
+/* Compose into cache->image without admitting a key or atlas rectangle.
+ * Worker-owned scratch; FONT_MORE resumes the exact key. */
+int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width);
 /* INIT only: reserve all pages, exact keys, glyphs, cell image and scratch.
  * Append-only cache, no eviction: rectangles remain immutable through T5.
  * Exhaustion returns NOMEM; existing entries stay usable. init failure rolls
@@ -302,8 +305,8 @@ int font_runtime_glyph(void *ctx, const uint8_t *bytes, size_t len,
  * or allocating; FONT_OK can denote a pending placeholder slot. Slots/identity
  * remain stable when mailbox adoption replaces its descriptor. Rasterisation,
  * fontconfig discovery and face file reads happen exclusively on WORK_BULK.
- * Backend descriptor copies permit UI adoption during an older frame; only
- * disjoint atlas rectangles are ever appended. Close after backend shutdown
+ * Backend descriptor copies permit UI adoption during an older frame. LRU
+ * reuse excludes retained cells and pending requests. Close after backend shutdown
  * and work_pool_shutdown/message drain, never from a mailbox callback. */
 typedef struct font_async font_async;
 #define FONT_ASYNC_MSG_KIND UINT32_C(0x46474c59) /* FGLY */
@@ -326,6 +329,15 @@ int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *atlas, boo
  * bytes remain borrowed until reset/shutdown and backend retirement. */
 int font_async_set_primary(font_async *owner, const font_t *primary);
 int font_async_bind(font_async *owner, render_grid *grid);
+/* UI, at frame begin: retain both existing grids and all subsequent lookups.
+ * active preserves the preceding frame's pins until backend retirement.
+ * Grids are inspected during this call only. Standalone users without frame
+ * borrows may omit it. Slots stay stable while retained or pending. */
+void font_async_frame(font_async *owner, const render_grid *grid,
+                      const render_grid *text, bool active);
+/* UI: only for a full replacement, after backend retirement. Drop outgoing
+ * frame pins, retaining all lookups made for the incoming frame. */
+void font_async_reclaim(font_async *owner);
 int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len,
                      uint32_t width, uint32_t *slot);
 /* UI: retry queued requests after checking input/pumping the shared pool. */

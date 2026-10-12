@@ -82,7 +82,14 @@ static int query_child(font_fallback *owner, work_ctx *ctx, uint32_t cp,
     if (fds[0] < 0 || fds[1] < 0) { if (fds[0] >= 0) close(fds[0]); if (fds[1] >= 0) close(fds[1]); return 1; }
     if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0) { close(fds[0]); close(fds[1]); return 1; }
     posix_spawn_file_actions_t actions;
-    if (posix_spawn_file_actions_init(&actions) != 0) { close(fds[0]); close(fds[1]); return 1; }
+    /* edit-r1l / edit-cx8: libc's opaque spawn actions allocate on this
+     * worker, concurrently with the process-wide UI typing guard. Exempt
+     * only library spawn setup/cleanup, not our query parsing or glyph work. */
+    edit_malloc_guard_exempt_begin();
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        edit_malloc_guard_exempt_end();
+        close(fds[0]); close(fds[1]); return 1;
+    }
     int error = posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
     if (!error) error = posix_spawn_file_actions_addclose(&actions, fds[0]);
     if (!error) error = posix_spawn_file_actions_addclose(&actions, fds[1]);
@@ -97,7 +104,9 @@ static int query_child(font_fallback *owner, work_ctx *ctx, uint32_t cp,
     pid_t pid = 0;
     if (!error) error = posix_spawn(&pid, program, &actions, &attrs, args, environ);
     if (have_attrs) (void)posix_spawnattr_destroy(&attrs);
-    (void)posix_spawn_file_actions_destroy(&actions); close(fds[1]);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    edit_malloc_guard_exempt_end();
+    close(fds[1]);
     if (error) { close(fds[0]); return 1; }
     atomic_store_explicit(&owner->child_pid, (uint32_t)pid, memory_order_release);
     query_output output = {0}; output.cp = cp;

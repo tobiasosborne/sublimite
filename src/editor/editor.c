@@ -124,6 +124,7 @@ int editor_begin_frame(editor *e)
     e->caret_only = false;
     e->glyph_only = false;
     if (e->dirty) return 0;
+    font_async_frame(e->fonts, &e->grid, &e->text_grid, e->backend->active);
     if (e->grid.frame_id == UINT32_MAX) return RENDER_ERR_FRAME;
     int rc = render_frame_begin(&e->grid, e->grid.frame_id + 1u);
     if (!rc) rc = render_frame_begin(&e->text_grid, e->grid.frame_id);
