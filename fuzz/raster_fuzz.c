@@ -126,7 +126,7 @@ typedef struct ownership_transport {
     size_t messages_count, capacity;
     unsigned checks, attempts, native_ready, native_seen;
     uint32_t native_frame;
-    bool shutdown, destroyed, server_owned;
+    bool shutdown, destroyed, server_owned, margin_foreground_set;
 } ownership_transport;
 static ownership_transport *transport_pool(work_pool *p) { return (ownership_transport *)p; }
 static ownership_transport *transport_conn(xcb_connection_t *p) { return (ownership_transport *)p; }
@@ -254,10 +254,20 @@ static void transport_disconnect(xcb_connection_t *conn)
 static xcb_void_cookie_t transport_free(xcb_connection_t *conn,uint32_t id)
 { transport_live(transport_conn(conn)); (void)id; return (xcb_void_cookie_t){1}; }
 static int transport_detach(const void *mem) { free((void *)(uintptr_t)mem); return 0; }
+static xcb_void_cookie_t transport_gc(xcb_connection_t *conn,xcb_gcontext_t gc,
+    uint32_t mask,const void *values)
+{
+    ownership_transport *t=transport_conn(conn); transport_live(t); (void)gc;
+    EDIT_ASSERT(mask==XCB_GC_FOREGROUND && values);
+    t->margin_foreground_set=true;
+    return (xcb_void_cookie_t){1}; /* (P) nonzero dummy request sequence, as in transport_clear. */
+}
 static xcb_void_cookie_t transport_clear(xcb_connection_t *conn,xcb_drawable_t drawable,
     xcb_gcontext_t gc,uint32_t count,const xcb_rectangle_t *rectangles)
 {
     ownership_transport *t=transport_conn(conn); transport_live(t); EDIT_ASSERT(!t->server_owned);
+    /* edit-9n7: every native margin fill needs its own foreground update. */
+    EDIT_ASSERT(t->margin_foreground_set); t->margin_foreground_set=false;
     (void)drawable; (void)gc; (void)count; (void)rectangles; return (xcb_void_cookie_t){1};
 }
 static uint32_t transport_id(xcb_connection_t *conn)
@@ -299,6 +309,7 @@ static xcb_void_cookie_t transport_region(xcb_connection_t *conn,xcb_xfixes_regi
 #define xcb_free_gc transport_free
 #define xcb_free_pixmap transport_free
 #define shmdt transport_detach
+#define xcb_change_gc transport_gc
 #define xcb_poly_fill_rectangle transport_clear
 #define xcb_generate_id transport_id
 #define xcb_xfixes_create_region transport_region
