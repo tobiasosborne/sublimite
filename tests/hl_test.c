@@ -326,17 +326,105 @@ static int julia_probe(void)
                          "vendor/tree-sitter-julia/queries/highlights.scm");
 }
 
+static int javascript_probe(void)
+{
+    /* (P) Fixture literals spell syntax, not budgets. Length excludes the C terminator. */
+    const char fixture[] =
+        "/* template substitution, regex and automatic semicolon insertion */\n"
+        "export function greet(name) {\n"
+        "  const pattern = /hello+/u;\n"
+        "  const message = `hello ${name}`\n"
+        "  return pattern.test(message) ? message : null;\n"
+        "}\n";
+    return grammar_probe("javascript", hl_language_javascript(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-javascript/queries/highlights.scm");
+}
+
+static int typescript_probe(void)
+{
+    /* (P) Fixture literals spell syntax, not budgets. Length excludes the C terminator. */
+    const char fixture[] =
+        "interface Greeting { name: string; }\n"
+        "export function greet<T extends Greeting>(value: T): string {\n"
+        "  const message: string = `hello ${value.name}`;\n"
+        "  return message;\n"
+        "}\n";
+    return grammar_probe("typescript", hl_language_typescript(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-typescript/queries/highlights.scm");
+}
+
+static int json_probe(void)
+{
+    /* (P) Fixture literals spell syntax, not budgets. Length excludes the C terminator. */
+    const char fixture[] =
+        "{\"greeting\": \"hello\\nworld\", \"enabled\": true, \"missing\": null, \"names\": [\"reader\"]}\n";
+    return grammar_probe("json", hl_language_json(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-json/queries/highlights.scm");
+}
+
+static int toml_probe(void)
+{
+    /* (P) Fixture literals spell syntax, not budgets. Length excludes the C terminator. */
+    const char fixture[] =
+        "# tables, arrays and multiline strings exercise the scanner\n"
+        "[greeting]\n"
+        "name = \"reader\"\n"
+        "enabled = true\n"
+        "names = [\"reader\", \"writer\"]\n"
+        "message = \"\"\"hello\n"
+        "world\"\"\"\n";
+    return grammar_probe("toml", hl_language_toml(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-toml/queries/highlights.scm");
+}
+
+static int yaml_probe(void)
+{
+    /* (P) Fixture literals spell syntax, not budgets. Length excludes the C terminator. */
+    const char fixture[] =
+        "# indentation, aliases, block and flow collections\n"
+        "greeting: &message\n"
+        "  name: reader\n"
+        "  enabled: true\n"
+        "  names: [reader, writer]\n"
+        "  text: |\n"
+        "    hello\n"
+        "    world\n"
+        "copy: *message\n";
+    return grammar_probe("yaml", hl_language_yaml(), fixture,
+                         sizeof fixture - 1u,
+                         "vendor/tree-sitter-yaml/queries/highlights.scm");
+}
+
 int main(void)
 {
     REQUIRE(query_test() == 0);
     edit_malloc_guard_begin();
     const TSLanguage *python = hl_language_python();
     const TSLanguage *julia = hl_language_julia();
+    const TSLanguage *javascript = hl_language_javascript();
+    const TSLanguage *typescript = hl_language_typescript();
+    const TSLanguage *json = hl_language_json();
+    const TSLanguage *toml = hl_language_toml();
+    const TSLanguage *yaml = hl_language_yaml();
     const size_t language_allocations = edit_malloc_guard_end();
     REQUIRE(language_allocations == 0); /* (P) typing-path allocation law */
     REQUIRE(python != NULL && julia != NULL);
     REQUIRE(python_probe() == 0);
     REQUIRE(julia_probe() == 0);
+    REQUIRE(javascript != NULL);
+    REQUIRE(javascript_probe() == 0);
+    REQUIRE(typescript != NULL);
+    REQUIRE(typescript_probe() == 0);
+    REQUIRE(json != NULL);
+    REQUIRE(json_probe() == 0);
+    REQUIRE(toml != NULL);
+    REQUIRE(toml_probe() == 0);
+    REQUIRE(yaml != NULL);
+    REQUIRE(yaml_probe() == 0);
     const char text[] = "prefix\nviewport\nsuffix\n";
     const uint64_t first = sizeof "prefix\n" - 1u;
     const uint64_t end = first + sizeof "viewport\n" - 1u;

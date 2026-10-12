@@ -7,5 +7,10 @@ const TSLanguage *hl_language_c(void);
 const TSLanguage *hl_language_rust(void);
 const TSLanguage *hl_language_python(void);
 const TSLanguage *hl_language_julia(void);
+const TSLanguage *hl_language_javascript(void);
+const TSLanguage *hl_language_typescript(void);
+const TSLanguage *hl_language_json(void);
+const TSLanguage *hl_language_toml(void);
+const TSLanguage *hl_language_yaml(void);
 
 #endif

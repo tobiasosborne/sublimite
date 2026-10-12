@@ -38,6 +38,11 @@ TS_SRC += vendor/tree-sitter-rust/src/parser.c vendor/tree-sitter-rust/src/scann
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
 SRCS += vendor/tree-sitter-python/src/parser.c vendor/tree-sitter-python/src/scanner.c
 SRCS += vendor/tree-sitter-julia/src/parser.c vendor/tree-sitter-julia/src/scanner.c
+SRCS += vendor/tree-sitter-javascript/src/parser.c vendor/tree-sitter-javascript/src/scanner.c
+SRCS += vendor/tree-sitter-typescript/typescript/src/parser.c vendor/tree-sitter-typescript/typescript/src/scanner.c
+SRCS += vendor/tree-sitter-json/src/parser.c
+SRCS += vendor/tree-sitter-toml/src/parser.c vendor/tree-sitter-toml/src/scanner.c
+SRCS += vendor/tree-sitter-yaml/src/parser.c vendor/tree-sitter-yaml/src/scanner.c
 MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
 BENCHS := $(sort $(wildcard bench/*_bench.c))
@@ -65,6 +70,26 @@ $(TS_PYTHON_OBJ): INC := -Ivendor/tree-sitter-python/src $(INC)
 TS_JULIA_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-julia/src/,parser.o scanner.o))
 $(TS_JULIA_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter
 $(TS_JULIA_OBJ): INC := -Ivendor/tree-sitter-julia/src $(INC)
+# Javascript uses its own parser ABI headers and upstream scanner warnings.
+TS_JAVASCRIPT_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-javascript/src/,parser.o scanner.o))
+$(TS_JAVASCRIPT_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter
+$(TS_JAVASCRIPT_OBJ): INC := -Ivendor/tree-sitter-javascript/src $(INC)
+# Typescript uses its own parser ABI headers and upstream scanner warnings.
+TS_TYPESCRIPT_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-typescript/typescript/src/,parser.o scanner.o))
+$(TS_TYPESCRIPT_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter
+$(TS_TYPESCRIPT_OBJ): INC := -Ivendor/tree-sitter-typescript/typescript/src $(INC)
+# Json uses its own parser ABI headers and upstream scanner warnings.
+TS_JSON_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-json/src/,parser.o))
+$(TS_JSON_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+$(TS_JSON_OBJ): INC := -Ivendor/tree-sitter-json/src $(INC)
+# Toml uses its own parser ABI headers and upstream scanner warnings.
+TS_TOML_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-toml/src/,parser.o scanner.o))
+$(TS_TOML_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter
+$(TS_TOML_OBJ): INC := -Ivendor/tree-sitter-toml/src $(INC)
+# Yaml uses its own parser ABI headers and upstream scanner warnings.
+TS_YAML_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-yaml/src/,parser.o scanner.o))
+$(TS_YAML_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value -Wno-unused-but-set-variable -Wno-implicit-fallthrough
+$(TS_YAML_OBJ): INC := -Ivendor/tree-sitter-yaml/src $(INC)
 
 REL_LIB  := $(B)/libedit.a
 SAN_LIB  := $(B)/san/libedit.a
@@ -129,6 +154,9 @@ $(FUZZ_LIB): $(FUZZ_OBJ)
 # Julia exceeds the assigned grammar size goal; archive extraction is opt-in.
 $(B)/sublimite-julia: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_julia $(REL_LIB) $(LDLIBS) -o $@
+# TypeScript exceeds the assigned total binary goal when linked; archive extraction is opt-in.
+$(B)/sublimite-typescript: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_typescript $(REL_LIB) $(LDLIBS) -o $@
 $(B)/sublimite: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_LIB) $(LDLIBS) -o $@
 $(B)/tools/%: $(B)/rel/tools/%.o $(REL_LIB)

@@ -1,0 +1,6 @@
+tree-sitter-javascript v0.25.0 from GitHub release/archive tarball tree-sitter-javascript-v0.25.0.tar.gz
+sha256 9712fc283d3dc01d996d20b6392143445d05867a7aad76fdd723824468428b86
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+
+Local integration: normalized external_scanner_create(void) to match the generated parser/runtime callback prototype (UBSan function type).
+Local integration: pruned generator/build/package metadata and non-highlight queries; retained parser/scanner ABI headers, highlights.scm, LICENSE and this provenance.

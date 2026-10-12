@@ -1,0 +1,4 @@
+tree-sitter-json v0.24.8 from GitHub release/archive tarball tree-sitter-json-v0.24.8.tar.gz
+sha256 acf6e8362457e819ed8b613f2ad9a0e1b621a77556c296f3abea58f7880a9213
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+Local integration: pruned generator/build/package metadata and non-highlight queries; retained parser/scanner ABI headers, highlights.scm, LICENSE and this provenance.
