@@ -32,10 +32,10 @@ LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
 TS_SRC := vendor/tree-sitter/lib/src/lib.c
-# Generated grammar sources share the runtime archives; one line per language.
-TS_SRC += vendor/tree-sitter-c/src/parser.c
-TS_SRC += vendor/tree-sitter-rust/src/parser.c vendor/tree-sitter-rust/src/scanner.c
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
+# Vendored grammars share the runtime archives; one line per language.
+SRCS += vendor/tree-sitter-c/src/parser.c
+SRCS += vendor/tree-sitter-rust/src/parser.c vendor/tree-sitter-rust/src/scanner.c
 SRCS += vendor/tree-sitter-python/src/parser.c vendor/tree-sitter-python/src/scanner.c
 SRCS += vendor/tree-sitter-julia/src/parser.c vendor/tree-sitter-julia/src/scanner.c
 SRCS += vendor/tree-sitter-javascript/src/parser.c vendor/tree-sitter-javascript/src/scanner.c
@@ -60,12 +60,17 @@ FUZZ_OBJ := $(SRCS:%.c=$(B)/fuzz/%.o)
 # Upstream's amalgamation uses narrowing conversions and shadowed locals.
 # Relax only those warnings for this object in every configuration; retain
 # C11, Wall/Wextra/Werror, project optimization and sanitizer flags.
-TS_OBJ := $(foreach config,rel san fuzz,$(addprefix $(B)/$(config)/,$(TS_SRC:.c=.o)))
+TS_OBJ := $(addprefix $(B)/,$(addsuffix /$(TS_SRC:.c=.o),rel san fuzz))
 $(TS_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
-# Generated parsers also have unused labels/parameters; handwritten scanners
-# use the same vendored-only flags. Keep project src/ warnings unchanged.
-GRAMMAR_OBJ := $(filter %/parser.o %/scanner.o,$(TS_OBJ))
-$(GRAMMAR_OBJ): WARN := -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-label -D_GNU_SOURCE -pthread
+# Grammars: per language, the runtime's relaxation plus only the warnings that
+# language's generated parser/scanner trips, and its own parser ABI headers.
+# C and Rust need nothing beyond the runtime's relaxation.
+TS_C_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-c/src/,parser.o))
+$(TS_C_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+$(TS_C_OBJ): INC := -Ivendor/tree-sitter-c/src $(INC)
+TS_RUST_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-rust/src/,parser.o scanner.o))
+$(TS_RUST_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
+$(TS_RUST_OBJ): INC := -Ivendor/tree-sitter-rust/src $(INC)
 # Python upstream scanner narrows array sizes and discards array_pop values.
 TS_PYTHON_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-python/src/,parser.o scanner.o))
 $(TS_PYTHON_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value
@@ -94,17 +99,18 @@ $(TS_TOML_OBJ): INC := -Ivendor/tree-sitter-toml/src $(INC)
 TS_YAML_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-yaml/src/,parser.o scanner.o))
 $(TS_YAML_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value -Wno-unused-but-set-variable -Wno-implicit-fallthrough
 $(TS_YAML_OBJ): INC := -Ivendor/tree-sitter-yaml/src $(INC)
-
-# Generated grammar/scanner warnings are relaxed only for vendored objects.
+# Markdown block and inline grammars keep upstream's nested layout.
 TS_MARKDOWN_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-markdown/tree-sitter-markdown/src/,parser.o scanner.o))
 $(TS_MARKDOWN_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
 $(TS_MARKDOWN_OBJ): INC := -Ivendor/tree-sitter-markdown/tree-sitter-markdown/src $(INC)
 TS_MARKDOWN_INLINE_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/,parser.o scanner.o))
 $(TS_MARKDOWN_INLINE_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN))
 $(TS_MARKDOWN_INLINE_OBJ): INC := -Ivendor/tree-sitter-markdown/tree-sitter-markdown-inline/src $(INC)
+# LaTeX scanner callbacks are stateless; its generated keyword lexer is empty.
 TS_LATEX_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-latex/src/,parser.o scanner.o))
 $(TS_LATEX_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-parameter -Wno-unused-label -Wno-unused-but-set-variable
 $(TS_LATEX_OBJ): INC := -Ivendor/tree-sitter-latex/src $(INC)
+# Bash scanner discards array_pop values.
 TS_BASH_OBJ := $(foreach c,rel san fuzz,$(addprefix $(B)/$(c)/vendor/tree-sitter-bash/src/,parser.o scanner.o))
 $(TS_BASH_OBJ): WARN := $(filter-out -Wconversion -Wshadow,$(WARN)) -Wno-unused-value
 $(TS_BASH_OBJ): INC := -Ivendor/tree-sitter-bash/src $(INC)
@@ -169,21 +175,13 @@ $(FUZZ_LIB): $(FUZZ_OBJ)
 	rm -f $@; $(AR) rcs $@ $^
 
 # ---- binaries ----
-# Julia exceeds the assigned grammar size goal; archive extraction is opt-in.
-$(B)/sublimite-julia: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_julia $(REL_LIB) $(LDLIBS) -o $@
-# TypeScript exceeds the assigned total binary goal when linked; archive extraction is opt-in.
-$(B)/sublimite-typescript: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_typescript $(REL_LIB) $(LDLIBS) -o $@
-# Explicit grammar extraction follows the sibling worker; large grammars stay opt-in.
-$(B)/sublimite-markdown: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_markdown $(REL_LIB) $(LDLIBS) -o $@
-$(B)/sublimite-markdown_inline: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_markdown_inline $(REL_LIB) $(LDLIBS) -o $@
-$(B)/sublimite-latex: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_latex $(REL_LIB) $(LDLIBS) -o $@
-$(B)/sublimite-bash: $(B)/rel/src/main.o $(REL_LIB)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_bash $(REL_LIB) $(LDLIBS) -o $@
+# Grammar archive members link only when referenced; no dispatch references
+# them yet, so the default editor carries none. HL_OPTIN grammars are the ones
+# whose measured size keeps them out of any future default set (docs/decisions/
+# edit-v0o.3.md, Landing): `make build/sublimite-<lang>` forces one wrapper in.
+HL_OPTIN := julia typescript markdown markdown_inline latex bash
+$(addprefix $(B)/sublimite-,$(HL_OPTIN)): $(B)/sublimite-%: $(B)/rel/src/main.o $(REL_LIB)
+	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_$* $(REL_LIB) $(LDLIBS) -o $@
 $(B)/sublimite: $(B)/rel/src/main.o $(REL_LIB)
 	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_LIB) $(LDLIBS) -o $@
 $(B)/tools/%: $(B)/rel/tools/%.o $(REL_LIB)

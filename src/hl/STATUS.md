@@ -1,3 +1,15 @@
+# hl — grammars landed (edit-v0o.3/.4/.5/.6, 2026-10-13)
+
+Thirteen vendored grammars build into the release, sanitizer and fuzzer
+archives: C, Rust, Python, Julia, JavaScript, TypeScript, JSON, TOML, YAML,
+Markdown, Markdown inline, LaTeX, Bash (TSX omitted). Each has a `lang.h`
+wrapper and an `hl_test` probe (ABI, ERROR-free fixture, highlights query
+compiles). The query layer and embedded queries cover C and Rust only. No
+editor code references a wrapper yet, so the default binary links none;
+`HL_OPTIN` in the Makefile lists the grammars a future dispatch keeps
+optional (`make build/sublimite-<lang>`). Sizes and the P6.3 miss are in
+`docs/decisions/edit-v0o.3.md`, Landing.
+
 # hl — edit-v0o.3 C/Rust grammar and query layer
 
 C/Rust language wrappers, embedded highlight queries, capture-to-theme scopes,

@@ -224,3 +224,69 @@ conformance. GNU `nm --size-sort` shows parse tables dominate these objects;
 removing debug information does not remove those runtime-required tables.
 No tables were discarded, no grammar silently excluded from the archives,
 and no target was redefined in this bead.
+
+## Landing (edit-v0o.3/.4/.5/.6 merged series, 2026-10-13)
+
+The four grammar beads were cherry-picked in order v0o.3, .4, .5, .6 onto
+`wt/edit-hl-merge-s6`. Conflicts and their resolution:
+
+- `src/hl/lang.h` (add/add in every pick): one guard/include, declarations
+  grouped in bead order (c, rust, python, julia, javascript, typescript, json,
+  toml, yaml, markdown, markdown_inline, latex, bash).
+- `tests/hl_test.c`: v0o.4/.5/.6 carried byte-identical `grammar_probe`; kept
+  once. All per-language probes kept in bead order after `query_test`. `main`
+  now takes every wrapper inside one counting-allocator window (all thirteen
+  wrappers must allocate zero) and then runs every probe.
+- `Makefile`, build scheme unified: v0o.3 appended C/Rust to `TS_SRC` and gave
+  every `parser.o`/`scanner.o` a hand-written flag set without `-Werror`;
+  v0o.4/.5/.6 appended to `SRCS` with a per-language `TS_<LANG>_OBJ` block
+  (runtime relaxation `-Wconversion -Wshadow` filtered out, `-Werror` kept, own
+  `src/` include first, plus only the `-Wno-*` that language trips). C and Rust
+  now use the second scheme; `TS_SRC`/`TS_OBJ` are back to main's single-runtime
+  form. With that scheme C and Rust compile clean under gcc and clang with no
+  extra `-Wno-*` (checked with `-Werror` before dropping v0o.3's
+  `-Wno-unused-parameter -Wno-unused-label`).
+- Opt-in, unified: v0o.4 (Julia) and v0o.5 (TypeScript) chose the same
+  mechanism (archive extraction forced by `-Wl,--undefined=hl_language_<lang>`
+  on an extra editor link); v0o.6 copied it for its four grammars. The six
+  explicit rules became one static pattern rule over
+  `HL_OPTIN := julia typescript markdown markdown_inline latex bash`
+  (`make build/sublimite-<lang>`). Nothing in the editor references a wrapper
+  yet, so the default `build/sublimite` links **no** grammar (nm: zero
+  `hl_language_*`/`tree_sitter_*` symbols); `HL_OPTIN` names the grammars a
+  future dispatch must keep optional. The would-be default set is c, rust,
+  python, javascript, json, toml, yaml.
+
+### Sizes at landing (M)[AC] BAT0 `Not charging`, gcc 13 `-O2 -g`
+
+GNU `size` text+data+bss of the release objects (parser + scanner):
+C 605624; Rust 1112473 + 1911; Python 461061 + 3672; Julia 2623800 + 1443;
+JavaScript 410314 + 2452; TypeScript 1410098 + 2353; JSON 5743; TOML 25269 +
+649; YAML 168312 + 21188; Markdown 333039 + 12601; Markdown inline 334527 +
+2561; LaTeX 3554648 + 1003; Bash 1311472 + 10774. Runtime `lib.o` 181915; query
+layer 9270; each wrapper 89. Default-set objects sum to 2818668; `HL_OPTIN`
+objects to 9598319; all thirteen to 12416987 (sums of the listed rows).
+
+Linked editors (`wc -c` raw / after `strip --strip-debug` / `size` text+data):
+
+| Link | raw | stripped | text+data |
+| --- | ---: | ---: | ---: |
+| main 88d0ef3 `build/sublimite` | 5131640 | 1584984 | 1491241 |
+| landed `build/sublimite` | 5131664 | 1584984 | 1491817 |
+| default set forced (c rust python javascript json toml yaml) | 8412576 | 4462624 | 4355282 |
+| all thirteen forced | 18702000 | 14131704 | 14004104 |
+| `sublimite-julia` | 7839320 | 4224240 | 4123793 |
+| `sublimite-typescript` | 6637512 | 3008752 | 2914790 |
+| `sublimite-markdown` | 5603576 | 1941216 | 1845142 |
+| `sublimite-markdown_inline` | 5562576 | 1928600 | 1833157 |
+| `sublimite-latex` | 8858912 | 5160328 | 5064169 |
+| `sublimite-bash` | 6603712 | 2921416 | 2822597 |
+
+The landed default grows by 1491817 - 1491241 = 576 text+data bytes (the
+syntax.* theme tables). Against P6.3 "binary <= 2 MB total (grammars +
+runtime)", itself (E): the default set alone adds 4355282 - 1491817 = 2863465
+text+data bytes, so the accept line is **missed** as soon as dispatch links
+the default set, under either 2000000 or 2097152 bytes. Parse tables dominate
+(`size -A`: `.rodata`); `-Os` cannot remove them. Decision left to the
+coordinator/Tobias: revise P6.3 against these measurements, or shrink the
+default set.
