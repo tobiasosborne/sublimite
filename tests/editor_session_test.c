@@ -153,7 +153,17 @@ static int saving_frame_busy(void)
 static int shared_target(void)
 {
     fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    /* edit-97i: seed the legacy shared-target state directly in this save
+     * fixture. Ordinary opens now select their existing tab. Temporarily
+     * hide only the tab association, preserving the original buffer/controller
+     * and journal base, then restore it before any editing or save assertion.
+     * (P) origin index and empty path length are zero; existing path length
+     * derives from the preserved buffer target. No production bypass exists. */
+    const tabs_tab *original = editor_tab(f.e, 0);
+    editor_buffer *owner = f.e->buffer;
+    T(tabs_rename(&f.e->tabs, 0, original->title, original->title_len, "", 0) == 0);
     uint64_t id; T(editor_add_buffer(f.e, f.path, NULL, 0, &id) == 0); T(settle(f.e) == 0);
+    T(tabs_rename(&f.e->tabs, 0, original->title, original->title_len, owner->path, strlen(owner->path)) == 0);
     T(press(f.e, 'z', 0, "z") == 0); T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
     T(press(f.e, 'x', 0, "x") == 0); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
     T(!editor_tab(f.e, 0)->modified && editor_tab(f.e, 1)->modified);

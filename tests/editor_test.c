@@ -4369,6 +4369,88 @@ static int o20_all(void)
     for (size_t i = 0; i < sizeof commands / sizeof *commands; i++) T(o20_case(commands[i]) == 0);
     return 0;
 }
+/* edit-97i: (P) geometry comes from o20_case; tab capacity is exactly the
+ * Unicode file plus its peer. Offsets/lengths derive from the literal text;
+ * zero denotes origin/success and one denotes the next byte or peer index. */
+static int duplicate_path_contract(void)
+{
+    char dir[] = "/tmp/edit-97i-editor-XXXXXX"; T(mkdtemp(dir));
+    char path[IPC_PATH_CAP], alias[IPC_PATH_CAP], hard[IPC_PATH_CAP], relative[IPC_PATH_CAP];
+    T(snprintf(path, sizeof path, "%s/é文.txt", dir) > 0);
+    T(snprintf(alias, sizeof alias, "%s/alias.txt", dir) > 0);
+    T(snprintf(hard, sizeof hard, "%s/hard.txt", dir) > 0);
+    T(snprintf(relative, sizeof relative, "%s/./é文.txt", dir) > 0);
+    static const char text[] = "alpha\nbeta\ngamma\ndelta\n";
+    int fd = open(path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR); T(fd >= 0);
+    T(write(fd, text, sizeof text - 1u) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+    T(symlink(path, alias) == 0); T(link(path, hard) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .cols = sizeof "Go to line: :18446744073709551615" + 1u,
+        .rows = sizeof "text" + 1u, .tab_capacity = sizeof "ab" - 1u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t original = tabs_active(&e->tabs)->id, peer, reused;
+    T(press(e, key('x', 0, "x")) == 0); T(editor_set_cursor(e, sizeof "alpha\n" - 1u) == 0); T(settle(e) == 0);
+    view_state retained = editor_view(e); piece_tree *tree = e->tree;
+    T(editor_add_buffer(e, NULL, (const uint8_t *)"peer", sizeof "peer" - 1u, &peer) == 0); T(settle(e) == 0);
+    size_t tabs = tabs_count(&e->tabs); uint64_t next = e->tabs.next_id;
+    const char *paths[] = {path, relative, alias, hard};
+    for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+        T(editor_add_buffer(e, paths[i], NULL, 0, &reused) == 0); T(settle(e) == 0);
+        T(reused == original && e->tree == tree && tabs_count(&e->tabs) == tabs && e->tabs.next_id == next);
+        T(expect(e, "xalpha\nbeta\ngamma\ndelta\n", retained.selection.cursor) == 0);
+        T(editor_view(e).selection.anchor == retained.selection.anchor);
+        T(editor_view(e).first_byte == retained.first_byte && tabs_active(&e->tabs)->modified);
+        T(editor_select_tab(e, 1u) == 0); T(settle(e) == 0);
+    }
+    /* Ctrl+O takes the same path after its containing input frame retires. */
+    T(press(e, key(XKB_KEY_o, PLAT_MOD_CTRL, NULL)) == 0); T(o20_path(e, alias) == 0);
+    T(tabs_count(&e->tabs) == tabs && tabs_active(&e->tabs)->id == original && e->tree == tree);
+    T(expect(e, "xalpha\nbeta\ngamma\ndelta\n", retained.selection.cursor) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, text, 0) == 0);
+    T(editor_select_tab(e, 1u) == 0); T(settle(e) == 0);
+    ipc_request request = {.paths = {{path, 1u, 1u}, {alias, 1u, 1u}, {hard, 1u, 1u}},
+        .count = sizeof "abc" - 1u}; /* (P) one entry per named alias above. */
+    T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == tabs && tabs_active(&e->tabs)->id == original);
+    request.count = sizeof "a" - 1u;
+    request.paths[0].line = sizeof "ab" - 1u; /* (P) second LF-delimited line. */
+    T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);
+    T(editor_view(e).selection.cursor == sizeof "alpha\n" - 1u);
+    editor_close(e);
+    /* (P) append a line longer than the resident coordinate scan bound by
+     * one byte, so an out-of-bound column deterministically rejects. */
+    FILE *long_file = fopen(path, "a"); T(long_file);
+    for (size_t at = 0; at < VIEW_SCAN_BOUND + sizeof "a" - 1u; at++) T(fputc('a', long_file) != EOF);
+    T(fclose(long_file) == 0);
+    uint32_t long_line = 1u;
+    for (size_t at = 0; at < sizeof text - 1u; at++) long_line += text[at] == '\n' ? 1u : 0u;
+    cfg.path = NULL; cfg.start_empty = true;
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    request = (ipc_request){.paths = {{path, 1u, 1u}, {alias, 1u, 1u}, {hard, 1u, 1u}},
+        .count = sizeof "abc" - 1u}; /* (P) repeated aliases require only the source tab. */
+    T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == sizeof "a" - 1u);
+    /* (P) reject the oversized column on the appended line after an earlier
+     * new path: failed requests publish neither target. The line ordinal is
+     * the original fixture's LF count plus the appended line above. */
+    editor_buffer *owner = e->buffer; original = tabs_active(&e->tabs)->id;
+    next = e->tabs.next_id; tabs = tabs_count(&e->tabs);
+    T(snprintf(relative, sizeof relative, "%s/missing.txt", dir) > 0);
+    request = (ipc_request){.paths = {{relative, 1u, 1u}, {path, long_line, UINT32_MAX}},
+        .count = sizeof "ab" - 1u};
+    T(editor_open_request(e, &request, 0) == EDITOR_ERR_CAPACITY);
+    T(tabs_count(&e->tabs) == tabs && e->tabs.next_id == next);
+    T(e->buffer == owner && tabs_active(&e->tabs)->id == original);
+    T(editor_add_buffer(e, NULL, NULL, 0, &peer) == 0); T(settle(e) == 0);
+    next = e->tabs.next_id;
+    request = (ipc_request){.paths = {{path, 1u, 1u}, {dir, 1u, 1u}}, .count = sizeof "ab" - 1u};
+    T(editor_open_request(e, &request, 0) != 0);
+    T(tabs_active(&e->tabs)->id == peer && e->tabs.next_id == next);
+    editor_close(e); T(unlink(hard) == 0 && unlink(alias) == 0 && unlink(path) == 0 && rmdir(dir) == 0);
+    puts("edit-97i: resolved-path reuse, full capacity, Ctrl+O, retained text/view/undo and CLI coordinates passed");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -4376,6 +4458,7 @@ int main(int argc, char **argv)
     if (argc == 2) {
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
+        if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
         if (!strcmp(argv[1], "--48u-overscan")) return pointer_overscan_contract();
         if (!strcmp(argv[1], "--48u-buffer")) return pointer_chain_contract(false);
@@ -4459,6 +4542,7 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(duplicate_path_contract() == 0);
     T(o20_all() == 0);
     T(g02_find_return() == 0);
     T(g02_find_previous_uncached() == 0);

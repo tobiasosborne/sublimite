@@ -397,10 +397,38 @@ static int install(editor *e, editor_buffer *b, uint64_t *id)
     b->id = *id; b->source_generation = 1; b->session_slot = slot; e->buffers[slot] = b;
     return 0;
 }
+/* Path resolution belongs to allocating open maintenance, never typing.
+ * Match current targets, not original snapshot inodes: Save As retains its
+ * original source while rebinding the tab to a different pathname. */
+static bool same_path(const char *path, const char *other)
+{
+    if (!path || !other || !*path || !*other) return false;
+    char canonical[IPC_PATH_CAP], target[IPC_PATH_CAP];
+    const char *a = realpath(path, canonical) ? canonical : path;
+    const char *b = realpath(other, target) ? target : other;
+    if (!strcmp(a, b)) return true;
+    file_id left, right;
+    return !file_id_stat_path(a, &left) && !file_id_stat_path(b, &right) &&
+        left.exists && right.exists && left.dev == right.dev && left.ino == right.ino;
+}
+static size_t path_tab(editor *e, const char *path)
+{
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++)
+        if (same_path(path, tabs_at(&e->tabs, i)->path)) return i;
+    return SIZE_MAX;
+}
 int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id)
 {
-    if (!e || !id || editor_activation_busy(e) || tabs_count(&e->tabs) == e->tabs.capacity) return EDITOR_ERR_ARG;
+    if (!e || !id || editor_activation_busy(e) || (!bytes && len) ||
+        (path && strlen(path) >= IPC_PATH_CAP)) return EDITOR_ERR_ARG;
     if (e->error || e->stats.journal_error) return EDITOR_ERR_IO;
+    size_t existing = path_tab(e, path);
+    if (existing != SIZE_MAX) {
+        int selected = editor_select_tab(e, existing);
+        if (!selected) *id = tabs_at(&e->tabs, existing)->id;
+        return selected;
+    }
+    if (tabs_count(&e->tabs) == e->tabs.capacity) return EDITOR_ERR_ARG;
     editor_retire_buffers(e);
     size_t free_slot = 0;
     while (free_slot < e->buffer_capacity && e->buffers[free_slot]) free_slot++;
@@ -445,13 +473,19 @@ int editor_cycle_tab(editor *e, bool reverse)
 }
 static void closed_wait(editor *e, editor_buffer *b)
 {
-    if (!b->wait_token) return;
-    for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) if (e->waits[i].token == b->wait_token) {
-        if (--e->waits[i].remaining == 0) {
-            if (e->cfg.server) (void)ipc_server_report_closed(e->cfg.server, b->wait_token);
-            e->waits[i] = (editor_wait){0};
+    /* (P) each wait owns distinct tab IDs, so repeated aliases decrement once;
+     * every independent client of this tab receives its own close reply. */
+    for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+        editor_wait *wait = &e->waits[i];
+        if (!wait->token) continue;
+        for (size_t at = 0; at < IPC_MAX_PATHS + 1u; at++) if (wait->ids[at] == b->id) {
+            wait->ids[at] = 0;
+            if (--wait->remaining == 0) {
+                if (e->cfg.server) (void)ipc_server_report_closed(e->cfg.server, wait->token);
+                *wait = (editor_wait){0};
+            }
+            break;
         }
-        break;
     }
     b->wait_token = 0;
 }
@@ -572,36 +606,40 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
     }
     return 0;
 }
+typedef struct path_position {
+    view_state view;
+    scroll_state scroll;
+    bool valid;
+} path_position;
+static int prepare_position(editor *e, editor_buffer *b, const view_state *incoming,
+                            uint32_t line, uint32_t col, path_position *out)
+{
+    /* Stage fallible positioning before any tab publication. Its index work
+     * can improve source knowledge, but retained view/scroll must not change
+     * if another path in the request subsequently fails. */
+    view_state initial = b->initial;
+    scroll_state scroll = b->scroll, display = b->scroll_display;
+    bool stale = b->scroll_display_stale;
+    b->initial = *incoming;
+    int rc = position_buffer(e, b, line, col);
+    if (!rc) *out = (path_position){b->initial, b->scroll, true};
+    b->initial = initial; b->scroll = scroll; b->scroll_display = display;
+    b->scroll_display_stale = stale;
+    return rc;
+}
 int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
 {
     if (!e || !request || request->count > IPC_MAX_PATHS || editor_activation_busy(e) ||
         (request->stdin_size && !request->stdin_data)) return EDITOR_ERR_ARG;
     if (e->error || e->stats.journal_error) return EDITOR_ERR_IO;
     size_t count = request->count + (request->has_stdin ? 1u : 0u);
-    /* Startup already recovered the requested associations. Reuse them before
-     * opening new requests; an argument-free launch keeps the restored session. */
-    if (e->startup_restored && !request->has_stdin && tabs_count(&e->tabs)) {
+    /* An argument-free launch keeps the recovered session. Named paths use
+     * ordinary identity matching for restored and newly opened tabs alike. */
+    if (e->startup_restored) {
         e->startup_restored = false;
-        bool restored = !request->count;
-        size_t selected = tabs_active_index(&e->tabs);
-        if (request->count) {
-            restored = true;
-            for (size_t i = 0; i < request->count; i++) {
-                bool found = false;
-                char canonical[IPC_PATH_CAP];
-                const char *path = realpath(request->paths[i].path, canonical) ? canonical : request->paths[i].path;
-                for (size_t j = 0; j < tabs_count(&e->tabs); j++) {
-                    const tabs_tab *tab = tabs_at(&e->tabs, j);
-                    char other[IPC_PATH_CAP]; const char *target = realpath(tab->path, other) ? other : tab->path;
-                    if (!strcmp(path, target)) { found = true; selected = j; break; }
-                }
-                if (!found) { restored = false; break; }
-            }
-        }
-        if (restored && !request->wait) return editor_select_tab(e, selected);
+        if (!count && !request->wait && tabs_count(&e->tabs)) return 0;
     }
-    if (!count) count = 1;
-    if (count > e->tabs.capacity - tabs_count(&e->tabs) || count > UINT64_MAX - e->tabs.next_id) return EDITOR_ERR_CAPACITY;
+    if (!count) count = 1; /* (P) an argument-free launch creates an untitled tab. */
     size_t wait_slot = IPC_MAX_CLIENTS;
     if (request->wait && token) {
         for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) if (!e->waits[i].token) { wait_slot = i; break; }
@@ -610,33 +648,80 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
     editor_retire_buffers(e);
     size_t available = 0;
     for (size_t i = 0; i < e->buffer_capacity; i++) available += e->buffers[i] == NULL;
-    if (count > available) return EDITOR_ERR_CAPACITY;
-    editor_buffer *prepared[IPC_MAX_PATHS + 1] = {0}; int rc = 0;
+    /* (P) IPC's maximum paths plus its optional stdin buffer bound these
+     * stack arrays and the prepaid wait membership. Only unique new targets
+     * consume buffer slots, tab records and journal IDs. */
+    editor_buffer *prepared[IPC_MAX_PATHS + 1] = {0};
+    editor_buffer *members[IPC_MAX_PATHS + 1] = {0};
+    path_position positions[IPC_MAX_PATHS + 1] = {0};
+    size_t created = 0; int rc = 0;
     for (size_t i = 0; i < count; i++) {
         const char *path = i < request->count ? request->paths[i].path : NULL;
-        if (i < request->count && (!path || !request->paths[i].line || !request->paths[i].col)) { rc = EDITOR_ERR_ARG; break; }
+        if (i < request->count && (!path || strlen(path) >= IPC_PATH_CAP ||
+            !request->paths[i].line || !request->paths[i].col)) { rc = EDITOR_ERR_ARG; break; }
+        size_t existing = path_tab(e, path);
+        if (existing != SIZE_MAX) members[i] = find_buffer(e, tabs_at(&e->tabs, existing)->buffer);
+        for (size_t at = 0; !members[i] && at < i; at++)
+            if (same_path(path, members[at]->path)) members[i] = members[at];
+        if (members[i]) {
+            /* (P) IPC origin coordinates preserve a retained view; coordinates
+             * beyond origin explicitly reposition it. Repeated paths inherit
+             * the last staged view for the same logical buffer. */
+            if (request->paths[i].line > 1u || request->paths[i].col > 1u) {
+                view_state incoming = existing == SIZE_MAX ? members[i]->initial :
+                    existing == tabs_active_index(&e->tabs) ? e->v.state : tabs_at(&e->tabs, existing)->state;
+                for (size_t at = 0; at < i; at++)
+                    if (members[at] == members[i] && positions[at].valid) incoming = positions[at].view;
+                rc = prepare_position(e, members[i], &incoming,
+                    request->paths[i].line, request->paths[i].col, &positions[i]);
+                if (rc) break;
+            }
+            continue;
+        }
+        if (created == available || created == e->tabs.capacity - tabs_count(&e->tabs) ||
+            created == UINT64_MAX - e->tabs.next_id) { rc = EDITOR_ERR_CAPACITY; break; }
         bool stdin_buffer = request->has_stdin && i == request->count;
         rc = editor_buffer_prepare(e, path, stdin_buffer ? request->stdin_data : NULL,
                                    stdin_buffer ? request->stdin_size : 0, &prepared[i]);
         if (rc) break;
+        members[i] = prepared[i]; created++;
         if (path) { rc = position_buffer(e, prepared[i], request->paths[i].line, request->paths[i].col); if (rc) break; }
     }
-    for (size_t i = 0; !rc && i < count; i++) rc = editor_register_journal(e, prepared[i], e->tabs.next_id + i);
+    uint64_t next = e->tabs.next_id;
+    for (size_t i = 0; !rc && i < count; i++) if (prepared[i])
+        rc = editor_register_journal(e, prepared[i], next++);
     if (rc) {
         for (size_t i = 0; i < count; i++) if (prepared[i]) {
             unpoll_source(e, prepared[i]); editor_buffer_destroy(prepared[i]);
         }
         return rc;
     }
-    /* All fallible file/memory work precedes tab publication. The reserved tab
-     * and buffer slots make this commit allocation-free. */
+    editor_wait wait = {.token = token};
     for (size_t i = 0; i < count; i++) {
-        uint64_t id; rc = install(e, prepared[i], &id);
-        if (rc) return rc; /* defensive: all slot/name/id bounds were checked */
-        if (wait_slot < IPC_MAX_CLIENTS) prepared[i]->wait_token = token;
+        editor_buffer *b = members[i];
+        if (prepared[i]) {
+            uint64_t id; rc = install(e, b, &id);
+            if (rc) return rc; /* defensive: all slot/name/id bounds were checked */
+            int save_rc = editor_save_setup(e, b);
+            if (save_rc) { b->save_error = b->operation_error = save_rc; b->save_errno = errno; }
+        } else {
+            size_t index = 0;
+            while (index < tabs_count(&e->tabs) && tabs_at(&e->tabs, index)->id != b->id) index++;
+            rc = tabs_select(&e->tabs, index, &e->v.state); if (rc) return rc;
+        }
+        if (positions[i].valid) {
+            e->v.state = positions[i].view;
+            b->scroll = positions[i].scroll; b->scroll_display = b->scroll;
+            b->scroll_display_stale = false;
+        }
+        if (wait_slot < IPC_MAX_CLIENTS) {
+            bool duplicate = false;
+            for (size_t at = 0; at < wait.remaining; at++) duplicate |= wait.ids[at] == b->id;
+            if (!duplicate) wait.ids[wait.remaining++] = b->id;
+            if (!b->wait_token) b->wait_token = token;
+        }
     }
-    for (size_t i = 0; i < count; i++) { rc = editor_save_setup(e, prepared[i]); if (rc) { prepared[i]->save_error = prepared[i]->operation_error = rc; prepared[i]->save_errno = errno; } }
-    if (wait_slot < IPC_MAX_CLIENTS) e->waits[wait_slot] = (editor_wait){token, count};
+    if (wait_slot < IPC_MAX_CLIENTS) e->waits[wait_slot] = wait;
     return editor_activate(e);
 }
 static ipc_result open_request(const ipc_request *request, ipc_token token, void *ctx)

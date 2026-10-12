@@ -466,8 +466,73 @@ cleanup:
     return result;
 }
 
-int main(void)
+/* edit-97i: real production launcher hand-off to a null-backend editor.
+ * (P) fixture tab capacity = Unicode source + peer; argv counts derive from
+ * arrays, coordinates use IPC's origin, wait client count derives from pair. */
+static int duplicate_cli_handoff(void)
 {
+    int result = 1, status = 0; editor *e = NULL; ipc_server server = {0}; bool live = false;
+    pid_t child = -1, waiters[] = {-1, -1}; /* (P) pair of independent wait clients. */
+    const char *root = test_ipc_isolate(); T(root);
+    char path[IPC_PATH_CAP], alias[IPC_PATH_CAP];
+    T(snprintf(path, sizeof path, "%s/é文.txt", root) > 0);
+    T(snprintf(alias, sizeof alias, "%s/alias.txt", root) > 0);
+    FILE *f = fopen(path, "w"); T(f); T(fputs("hello\n", f) >= 0); T(fclose(f) == 0);
+    T(symlink(path, alias) == 0);
+    T(setenv("DISPLAY", ":99", 1) == 0); /* (P) repository's designated test display identity; no X connection. */
+    T(unsetenv("WAYLAND_DISPLAY") == 0);
+    T(ipc_server_init_display(&server, NULL, getenv("DISPLAY")) == IPC_OK); live = true;
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .server = &server, .tab_capacity = sizeof "ab" - 1u};
+    T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t original = tabs_active(&e->tabs)->id, peer;
+    T(editor_add_buffer(e, NULL, (const uint8_t *)"peer", sizeof "peer" - 1u, &peer) == 0);
+    size_t tabs = tabs_count(&e->tabs);
+    child = fork(); T(child >= 0);
+    if (!child) {
+        char *args[] = {"sublimite", path, alias};
+        _exit(editor_cli_main((int)(sizeof args / sizeof *args), args));
+    }
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS; /* (P) reuse the existing editor idle watchdog. */
+    pid_t waited = 0;
+    while (!waited && trace_now_ns() < deadline) { T(editor_step(e, 0) >= 0); waited = child_wait(child, &status, WNOHANG); }
+    T(waited == child); child = -1; T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    T(tabs_count(&e->tabs) == tabs && tabs_active(&e->tabs)->id == original);
+    for (size_t at = 0; at < sizeof waiters / sizeof *waiters; at++) {
+        waiters[at] = fork(); T(waiters[at] >= 0);
+        if (!waiters[at]) {
+            char *args[] = {"sublimite", "--wait", path, alias};
+            _exit(editor_cli_main((int)(sizeof args / sizeof *args), args));
+        }
+        size_t accepted = 0; deadline = trace_now_ns() + EDITOR_IDLE_NS;
+        while (accepted <= at && trace_now_ns() < deadline) {
+            T(editor_step(e, 0) >= 0); accepted = 0;
+            for (size_t i = 0; i < IPC_MAX_CLIENTS; i++) accepted += e->waits[i].token != 0;
+        }
+        T(accepted == at + 1u); /* (P) current client plus previously admitted clients. */
+        T(child_wait(waiters[at], &status, WNOHANG) == 0);
+        T(tabs_count(&e->tabs) == tabs && tabs_active(&e->tabs)->id == original);
+    }
+    T(editor_close_tab(e, tabs_active_index(&e->tabs)) == 0);
+    for (size_t at = 0; at < sizeof waiters / sizeof *waiters; at++) {
+        deadline = trace_now_ns() + EDITOR_IDLE_NS; waited = 0;
+        while (!waited && trace_now_ns() < deadline) { T(editor_step(e, 0) >= 0); waited = child_wait(waiters[at], &status, WNOHANG); }
+        T(waited == waiters[at]); waiters[at] = -1; T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    puts("edit-97i: production CLI Unicode/alias hand-off reuses tab; independent --wait clients finish on its close");
+    result = 0;
+cleanup:
+    if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
+    for (size_t at = 0; at < sizeof waiters / sizeof *waiters; at++)
+        if (waiters[at] > 0) { (void)kill(waiters[at], SIGKILL); (void)child_wait(waiters[at], NULL, 0); }
+    editor_close(e); if (live) ipc_server_fini(&server);
+    return result;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--duplicate-path")) return duplicate_cli_handoff();
+    if (duplicate_cli_handoff()) return 1;
     if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite();
     /* A live implementation that misses its window deadline must fail. */
     pid_t control = fork();

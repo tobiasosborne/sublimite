@@ -170,8 +170,12 @@ uint64_t editor_line_count(const editor *e);
 int editor_flush(editor *e);
 /* Allocating open path, UI thread; synchronous acceptance/partial-open rollback.
  * Requests and payloads are copied before return. token=0 for local startup.
+ * Resolved paths already open activate their retained tab; origin coordinates
+ * preserve its view. Non-origin coordinates reposition it. Independent wait
+ * requests share that tab and finish when it closes.
  * Closed tabs retain their resources for reopen, but release wait membership. */
 int editor_open_request(editor *e, const ipc_request *request, ipc_token token);
+/* Existing resolved paths select their tab and return its retained ID. */
 int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len,
                       uint64_t *id);
 int editor_select_tab(editor *e, size_t index);

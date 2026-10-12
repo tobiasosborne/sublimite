@@ -111,7 +111,12 @@ typedef struct editor_buffer {
     ipc_token wait_token;
 } editor_buffer;
 typedef struct editor_hit { uint64_t before, after; uint32_t within, width; } editor_hit;
-typedef struct editor_wait { ipc_token token; size_t remaining; } editor_wait;
+typedef struct editor_wait {
+    ipc_token token;
+    size_t remaining;
+    /* (P) distinct tabs per request: IPC paths plus optional stdin/untitled. */
+    uint64_t ids[IPC_MAX_PATHS + 1u];
+} editor_wait;
 typedef struct editor_clip editor_clip;
 /* A decimal digit carries at least one bit. The uint64_t bit width is a
  * conservative bound on decimal input length, plus a NUL for rendering. */

@@ -761,7 +761,9 @@ static int ipc_row(bool track)
         }
         uint64_t elapsed = bench_now_ns() - start;
         REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-        REQUIRE(editor_get_stats(e).tabs == (size_t)i + 1 && editor_view(e).selection.cursor == 5);
+        /* edit-97i: (P) every invocation names the same path, hence one tab;
+         * its requested coordinate is the byte after the literal "abc\nd". */
+        REQUIRE(editor_get_stats(e).tabs == 1u && editor_view(e).selection.cursor == sizeof "abc\nd" - 1u);
         (void)bench_add(&handoff, elapsed); REQUIRE(settle(e) == 0);
     }
     int miss = gate_row("editor_second_invocation_exec_open_ACK_exit", &handoff, 0, UINT64_C(10000000), track, &tag);
