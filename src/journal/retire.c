@@ -49,6 +49,13 @@ static int record(void *ctx, const journal_record *r)
         return 0;
     }
     if(r->type==JOURNAL_INSERT || r->type==JOURNAL_DELETE) a->clean=false;
+    /* edit-28u: a BASE names a tab-set buffer. Checkpoints of text equal to
+     * BASE carry no INSERT/DELETE, so a BASE alone is a clean tab set, which
+     * is hot-exit state (PRD): discovery adopts it and retires the journal
+     * after its own checkpoint. Only BASE-free, edit-free session journals
+     * are empty. Dotted names (set-aside, .retired) are never discovered,
+     * hold no restorable tab set, and keep the edit-rfq rule. */
+    if(r->type==JOURNAL_BASE && a->generated && !a->aside && !a->retired) a->clean=false;
     /* (P) wire PREPARED phase = 1 at sequence64's following phase32.
      * FINISHED is metadata for a saved identity, not an unsaved edit. */
     if(r->type==JOURNAL_SAVE && r->data[sizeof(uint64_t)]==1) a->clean=false;

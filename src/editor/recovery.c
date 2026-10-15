@@ -16,8 +16,12 @@
 typedef struct recovered_buffer {
     struct recovered_buffer *next;
     uint64_t id;
+    /* edit-28u: gap buffer. Text = bytes[0, gap) + bytes[gap + gap_len,
+     * len + gap_len). Checkpoint ops arrive at nondecreasing offsets, so
+     * replaying them moves each byte a bounded number of times (linear), not
+     * once per op as a flat memmove would (O(ops * len)). */
     uint8_t *bytes;
-    size_t len;
+    size_t len, gap, gap_len;
     char target[IPC_PATH_CAP];
     journal_view_state view;
     bool full_view;
@@ -48,6 +52,32 @@ static recovered_buffer *find(recovered_session *s, uint64_t id)
 {
     for (recovered_buffer *b = s->buffers; b; b = b->next) if (b->id == id) return b;
     return NULL;
+}
+static void gap_move(recovered_buffer *b, size_t at)
+{
+    if (at < b->gap) memmove(b->bytes + at + b->gap_len, b->bytes + at, b->gap - at);
+    else if (at > b->gap) memmove(b->bytes + b->gap, b->bytes + b->gap + b->gap_len, at - b->gap);
+    b->gap = at;
+}
+/* Close the gap: bytes[0, len) is the text, as install expects. */
+static void gap_close(recovered_buffer *b) { gap_move(b, b->len); }
+static int gap_insert(recovered_buffer *b, size_t at, const uint8_t *data, size_t n)
+{
+    if (n > SIZE_MAX - b->len) return JOURNAL_NOMEM;
+    gap_move(b, at);
+    if (b->gap_len < n) {
+        /* Grow by a quarter of the text beyond the request: a geometric
+         * factor keeps the total suffix moves of an append run linear. */
+        size_t extra = b->len / 4u, cap = b->len + b->gap_len;
+        if (extra > SIZE_MAX - b->len - n) extra = 0;
+        size_t want = b->len + n + extra;
+        uint8_t *bytes = realloc(b->bytes, want ? want : 1); if (!bytes) return JOURNAL_NOMEM;
+        size_t tail = cap - b->gap - b->gap_len, gap_len = want - b->len;
+        memmove(bytes + b->gap + gap_len, bytes + b->gap + b->gap_len, tail);
+        b->bytes = bytes; b->gap_len = gap_len;
+    }
+    memcpy(b->bytes + b->gap, data, n);
+    b->gap += n; b->gap_len -= n; b->len += n; return 0;
 }
 static void fini(recovered_session *s)
 {
@@ -94,13 +124,14 @@ static int restore_record(void *ctx, const journal_record *r)
             int check = journal_check_base(&base);
             if (check && check != JOURNAL_BASE_CHANGED) return check;
             if (check) {
-                free(b->bytes); b->bytes = NULL; b->len = 0;
+                free(b->bytes); b->bytes = NULL; b->len = b->gap = b->gap_len = 0;
                 b->conflict = s->conflicts = true; strcpy(b->target, path);
                 return 0;
             }
         }
-        free(b->bytes); b->len = (size_t)base.size; b->bytes = b->len ? malloc(b->len) : NULL;
-        if (b->len && !b->bytes) return JOURNAL_NOMEM;
+        free(b->bytes); b->len = b->gap = (size_t)base.size; b->gap_len = 0;
+        b->bytes = b->len ? malloc(b->len) : NULL;
+        if (b->len && !b->bytes) { b->len = b->gap = 0; return JOURNAL_NOMEM; }
         strcpy(b->target, path);
         const char *leaf = strrchr(path, '/');
         if (leaf && !strncmp(leaf + 1, ".sublimite-base-", strlen(".sublimite-base-"))) strcpy(b->retained, path);
@@ -126,17 +157,10 @@ static int restore_record(void *ctx, const journal_record *r)
     if (b->conflict && (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE)) return 0;
     uint64_t off = get64(p);
     if (off > b->len) return JOURNAL_INVALID;
-    if (r->type == JOURNAL_INSERT) {
-        size_t n = r->size - 8;
-        if (n > SIZE_MAX - b->len) return JOURNAL_NOMEM;
-        uint8_t *bytes = realloc(b->bytes, b->len + n); if (!bytes) return JOURNAL_NOMEM;
-        b->bytes = bytes; memmove(bytes + (size_t)off + n, bytes + (size_t)off, b->len - (size_t)off);
-        memcpy(bytes + (size_t)off, p + 8, n); b->len += n; return 0;
-    }
+    if (r->type == JOURNAL_INSERT) return gap_insert(b, (size_t)off, p + 8, r->size - 8);
     if (r->type == JOURNAL_DELETE) {
         uint64_t n = get64(p + 8); if (n > b->len - off) return JOURNAL_INVALID;
-        memmove(b->bytes + (size_t)off, b->bytes + (size_t)(off + n), b->len - (size_t)(off + n));
-        b->len -= (size_t)n; return 0;
+        gap_move(b, (size_t)off); b->gap_len += (size_t)n; b->len -= (size_t)n; return 0;
     }
     return JOURNAL_INVALID;
 }
@@ -153,6 +177,7 @@ static bool same_bytes(editor_buffer *b, const recovered_buffer *r)
 }
 static int install_buffer(editor *e, recovered_buffer *r)
 {
+    gap_close(r);
     uint64_t id;
     int rc = editor_add_recovered_buffer(e, *r->target ? r->target : NULL, &id);
     if (rc) return rc;

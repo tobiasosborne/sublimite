@@ -68,6 +68,13 @@ static int save_as(editor *e, const char *input)
     file_watch_path_stop(&b->target_watch);
     strcpy(b->path, path); strcpy(b->save_path, path); b->target_rebound = true;
     b->base = base; b->base.path = *base.path ? b->base.captured_path : "";
+    /* edit-28u: the captured BASE is the file this revision's snapshot was
+     * written to only if it is the very generation the write reported. */
+    if (*b->base.path && saved.exists && saved.dev == b->base.device && saved.ino == b->base.inode &&
+        saved.size == b->base.size && saved.mtime_ns == b->base.mtime_ns &&
+        saved.size == piece_len(b->tree) && (!saved.metadata_valid || saved.ctime_ns == b->base.ctime_ns)) {
+        b->saved_text = editor_base_id_of(&b->base); b->saved_text_revision = b->revision;
+    }
     const char *title = strrchr(path, '/'); title = title ? title + 1 : path;
     /* (P) retain the tab module's grapheme-safe title capacity. */
     size_t end = 0, length = strlen(title);

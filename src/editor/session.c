@@ -188,6 +188,17 @@ static uint8_t *record(session_capture *c, uint32_t type, uint64_t id, size_t si
     uint8_t *data = calloc(1, size); if (!data) return NULL;
     c->records[c->count++] = (journal_record){type, id, 0, data, size}; return data;
 }
+typedef struct session_text { session_capture *capture; uint64_t id; } session_text;
+static int session_text_record(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes)
+{
+    session_text *t = ctx;
+    uint8_t *data = record(t->capture, type, t->id, type == JOURNAL_DELETE ? 16u : (size_t)len + 8u);
+    if (!data) return JOURNAL_NOMEM;
+    put64(data, off);
+    if (type == JOURNAL_DELETE) put64(data + 8, len);
+    else memcpy(data + 8, bytes, (size_t)len);
+    return 0;
+}
 static int encode_leaf(session_capture *c, session_node *n)
 {
     editor_buffer *b = n->buffer;
@@ -202,20 +213,17 @@ static int encode_leaf(session_capture *c, session_node *n)
         data = record(c, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!data) return JOURNAL_NOMEM;
         strcpy((char *)data, b->path);
     }
-    if (base->size) {
-        data = record(c, JOURNAL_DELETE, b->id, 16); if (!data) return JOURNAL_NOMEM;
-        put64(data + 8, base->size);
-    }
-    piece_iter it; piece_iter_begin_snapshot(&it, n->snapshot, 0);
-    const uint8_t *bytes; size_t len; uint64_t off = 0;
-    while (piece_iter_next(&it, &bytes, &len)) {
-        /* Payload sizing follows journal's existing insert-slice wire bound. */
-        while (len) {
-            size_t take = len < JOURNAL_INSERT_SLICE_BYTES ? len : JOURNAL_INSERT_SLICE_BYTES;
-            data = record(c, JOURNAL_INSERT, b->id, take + 8); if (!data) return JOURNAL_NOMEM;
-            put64(data, off); memcpy(data + 8, bytes, take);
-            off += take; bytes += take; len -= take;
-        }
+    /* edit-28u: the same text encoding as editor_checkpoint. The finish
+     * checkpoint of the saved revision is the replacement BASE itself; the
+     * prepare checkpoint references the previous BASE when it is the
+     * original (save_prepare substitutes a retained copy of those bytes). */
+    bool identical = c->finish && b == c->selected && n->revision == b->save_revision &&
+        *base->path && piece_snapshot_len(n->snapshot) == base->size;
+    if (!identical) {
+        piece_iter it; piece_iter_begin_snapshot(&it, n->snapshot, 0);
+        session_text sink = {c, b->id};
+        rc = editor_text_ops(&it, base->size, editor_checkpoint_references(&b->origin, base), session_text_record, &sink);
+        if (rc) return rc;
     }
     data = record(c, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!data) return JOURNAL_NOMEM;
     editor_encode_view(n->view, data);
@@ -462,6 +470,11 @@ void editor_save_tick(editor *e)
             }
             if (b->save_tracking) { b->saved_cursor = b->save_cursor; b->saved_lost = false; }
             else b->saved_lost = true;
+            /* edit-28u: the replacement BASE holds exactly the saved
+             * revision's snapshot; checkpoints of that revision write BASE only. */
+            if (s->finishing && b->save_tracking) {
+                b->saved_text = editor_base_id_of(&b->base); b->saved_text_revision = b->save_revision;
+            }
             for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
                 const tabs_tab *tab = tabs_at(&e->tabs, i);
                 if (tab->id == b->id) (void)tabs_set_modified(&e->tabs, i,

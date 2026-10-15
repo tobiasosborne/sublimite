@@ -662,7 +662,7 @@ static int install_failure(void)
 /* edit-fm4 (Tobias's M0 profile, 2026-10-13): GB-scale orphan journals must
  * never be replayed, copied or set aside on the startup path. The fixture is a
  * private XDG_DATA_HOME holding one orphan session journal that is a real
- * checkpoint of a 1 GiB buffer (the brief's size, (P) 2^30 bytes; its source
+ * whole-text (pre-edit-28u shape) checkpoint of a 1 GiB buffer (the brief's size, (P) 2^30 bytes; its source
  * is a sparse file, but every byte of it is read into the checkpoint, so the
  * journal itself is 1 GiB of written records) whose /tmp-corpus-like BASE has
  * since changed, plus a 1 GiB set-aside copy of it. Launch must reach input
@@ -718,7 +718,13 @@ static int fm4_orphan(const char *dir, const char *source, char *journal_path)
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         uint64_t limit = deadline();
         while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
-        if (press(e, 'x', 0, "x") || journal_flush(e->journal) || editor_checkpoint(e)) _exit(6);
+        if (press(e, 'x', 0, "x")) _exit(6);
+        /* edit-28u: checkpoints now reference an original BASE instead of
+         * copying it. Unbinding the original reproduces the pre-28u whole-text
+         * checkpoint (DELETE all + every byte as INSERT), the GB-scale orphan
+         * shape Tobias's profile holds and older builds still leave behind. */
+        e->buffer->origin.valid = false;
+        if (journal_flush(e->journal) || editor_checkpoint(e)) _exit(6);
         _exit(0); /* crash: the 1 GiB checkpoint is an orphan */
     }
     int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -805,6 +811,90 @@ static int large_orphans_body(const char *root)
     }
     return 0;
 }
+/* edit-28u: a checkpointed clean session is hot-exit state (PRD: the tab set
+ * comes back). Launch 1 opens a file, edits, saves (the save's finish
+ * checkpoint and an explicit one leave BASE-only buffers), quits cleanly.
+ * Launches 2 and 3 must each restore the tab; each adopts the previous journal
+ * and retires it after the recovered checkpoint is durable, so the profile
+ * holds only the latest launch's journal. */
+static int clean_launch(const char *dir, const char *source, bool expect_tab, char *journal_path)
+{
+    int lease = -1;
+    T(journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease) == JOURNAL_OK);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease,
+        .start_empty = source == NULL, .cols = 32, .rows = 3};
+    editor *e = NULL; int rc = editor_open(&e, &config, &backend);
+    if (!rc) rc = settle(e);
+    if (!rc && source) {
+        uint64_t limit = deadline();
+        while (!rc && e->buffer->pending_open) { rc = turn(e); if (trace_now_ns() >= limit) rc = 1; sched_yield(); }
+        if (!rc) rc = press(e, 'x', 0, "x");
+        if (!rc) rc = press(e, 's', PLAT_MOD_CTRL, NULL);
+        if (!rc) rc = saved(e);
+        if (!rc && (e->buffer->save_error || editor_tab(e, 0)->modified)) rc = 1;
+        if (!rc) rc = journal_flush(e->journal) || editor_checkpoint(e) ? 1 : 0;
+    }
+    size_t tabs = rc ? 0 : tabs_count(&e->tabs);
+    char title[TABS_TITLE_BYTES + 1] = "";
+    if (tabs) snprintf(title, sizeof title, "%s", editor_tab(e, 0)->title);
+    bool clean = tabs && !editor_tab(e, 0)->modified;
+    if (e) editor_close(e);
+    struct stat st;
+    if (!lstat(journal_path, &st) && !st.st_size) (void)unlink(journal_path);
+    (void)journal_session_release(journal_path, lease); close(lease);
+    printf("clean_tab_set: launch tabs=%zu title=%s clean=%s\n", tabs, title, clean ? "yes" : "no");
+    T(rc == 0);
+    if (expect_tab) { T(tabs == 1 && !strcmp(title, "source") && clean); }
+    return 0;
+}
+static size_t session_journals(const char *dir, char *names, size_t cap)
+{
+    DIR *d = opendir(dir); if (!d) return SIZE_MAX;
+    size_t count = 0, used = 0; struct dirent *entry; *names = 0;
+    while ((entry = readdir(d))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        int n = snprintf(names + used, cap - used, "%s ", entry->d_name);
+        if (n > 0 && (size_t)n < cap - used) used += (size_t)n;
+        if (!strncmp(entry->d_name, "session-", 8) && !strchr(entry->d_name, '.')) count++;
+    }
+    closedir(d); return count;
+}
+static int clean_tab_set_body(const char *root)
+{
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], journal_path[IPC_PATH_CAP], names[4096];
+    T(setenv("XDG_DATA_HOME", root, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root))); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, "base\n", 5) == 5); T(close(fd) == 0);
+    T(clean_launch(dir, source, false, journal_path) == 0);
+    size_t count = session_journals(dir, names, sizeof names);
+    printf("clean_tab_set: after launch 1 session journals=%zu [%s]\n", count, names);
+    for (int launch = 2; launch <= 3; launch++) {
+        T(clean_launch(dir, NULL, true, journal_path) == 0);
+        count = session_journals(dir, names, sizeof names);
+        printf("clean_tab_set: after launch %d session journals=%zu [%s]\n", launch, count, names);
+        /* (P) one: the closed launch's own nonempty journal; the journal it
+         * adopted was retired after its recovered checkpoint was durable. */
+        T(count == 1);
+    }
+    return 0;
+}
+static int clean_tab_set(void)
+{
+    char made[] = "build/editor-28u-tabs-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved_env = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved_env != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved_env) > 0);
+    int rc = clean_tab_set_body(root);
+    fm4_remove_tree(root); /* every path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    if (!rc) puts("clean_tab_set: saved clean tab set restored on two relaunches; one session journal");
+    return rc;
+}
 static int large_orphans(void)
 {
     char made[] = "build/editor-fm4-XXXXXX"; T(mkdtemp(made));
@@ -819,6 +909,7 @@ static int large_orphans(void)
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(clean_tab_set() == 0);
     T(large_orphans() == 0);
     T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);
     T(recoverable_save_retry(false, true) == 0); T(recoverable_save_retry(true, true) == 0);

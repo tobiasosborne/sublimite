@@ -203,6 +203,14 @@ void piece_iter_begin(piece_iter *it, const piece_tree *t, uint64_t off);
 void piece_iter_begin_snapshot(piece_iter *it, const piece_snapshot *s, uint64_t off);
 /* Returns 1 and sets *p,*n for the next span, or 0 at end. */
 int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n);
+/* edit-28u amendment: as piece_iter_next, and *original receives the ORIGINAL
+ * offset of the span's first byte, or PIECE_ADD when the span lives in the add
+ * buffer. Original spans of one tree or snapshot come in strictly increasing,
+ * non-overlapping order: original bytes are placed only by init, and a delete
+ * copies the original bytes it removes into the add buffer (undo reinserts
+ * them from there), so no original range ever reappears out of order. */
+#define PIECE_ADD UINT64_MAX
+int piece_iter_next_source(piece_iter *it, const uint8_t **p, size_t *n, uint64_t *original);
 
 /* ---- P1.3c amendment: atomic edit checkpoint (frozen contract) ----
  *

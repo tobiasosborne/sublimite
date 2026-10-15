@@ -1622,7 +1622,7 @@ static void iter_begin(piece_iter *it, const void *src, int snap, uint64_t off, 
 }
 void piece_iter_begin(piece_iter *it, const piece_tree *t, uint64_t off) { iter_begin(it, t, 0, off, node_total(t->root)); }
 void piece_iter_begin_snapshot(piece_iter *it, const piece_snapshot *s, uint64_t off) { iter_begin(it, s, 1, off, s->len); }
-int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
+static int iter_step(piece_iter *it, const uint8_t **p, size_t *n, uint64_t *source) {
     const core *c; const uint8_t *original; const add_store *v; const node *root; uint64_t total;
     if (it->is_snap) { const piece_snapshot *s = it->src; c = s->c; original = s->original->data; v = s->add; root = s->root; total = s->len; }
     else { const piece_tree *t = it->src; c = t->c; original = t->c->orig; v = t->c->add; root = t->root; total = node_total(t->root); }
@@ -1631,7 +1631,14 @@ int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
     if (!walk_next(c, &w, root, total, &it->pos, &x, &skip, &len)) return 0;
     it->priv[0] = (uint64_t)(uintptr_t)w.leaf; it->priv[1] = w.leaf_start; it->priv[2] = w.k; it->priv[3] = w.k_start;
     *p = view_data(original, v, x) + skip; *n = (size_t)len;
+    *source = x & TOP ? PIECE_ADD : x + skip;
     return 1;
+}
+int piece_iter_next(piece_iter *it, const uint8_t **p, size_t *n) {
+    uint64_t source; return iter_step(it, p, n, &source);
+}
+int piece_iter_next_source(piece_iter *it, const uint8_t **p, size_t *n, uint64_t *original) {
+    return iter_step(it, p, n, original);
 }
 
 #ifdef PIECE_TESTING

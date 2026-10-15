@@ -34,6 +34,13 @@ typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; 
 typedef struct editor_soft_delta { view_selection before, after; uint64_t serial; bool text; } editor_soft_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert, commit; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
 typedef struct editor_session editor_session;
+/* edit-28u: identity of one on-disk file generation, as journal_check_base
+ * compares it (journal_base without its path). valid=false binds nothing. */
+typedef struct editor_base_id {
+    uint64_t size, mtime_ns, inode, device, ctime_ns;
+    uint32_t prefix_crc, prefix_len;
+    bool valid;
+} editor_base_id;
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
@@ -56,6 +63,15 @@ typedef struct editor_buffer {
     size_t save_cursor;
     bool save_tracking;
     journal_base base;
+    /* edit-28u: the tree's ORIGINAL holds exactly the bytes of this file
+     * generation. Set once in editor_buffer_prepare, before the buffer is
+     * published; save workers read it. A checkpoint references base bytes
+     * instead of copying them only while BASE is this same generation. */
+    editor_base_id origin;
+    /* edit-28u: at revision saved_text_revision the whole text equals the
+     * bytes of this generation (a completed save of that revision). */
+    editor_base_id saved_text;
+    uint64_t saved_text_revision;
     journal_view_state journal_view_state;
     bool journal_view_valid;
     lineidx *index;
@@ -389,6 +405,20 @@ int editor_journal_metadata(editor *e);
 /* Journal an applied action without waiting for a frame or durability credit. */
 int editor_journal_changed(editor *e);
 void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES]);
+/* edit-28u: checkpoint text encoding against BASE (docs/decisions/edit-28u.md). */
+editor_base_id editor_base_id_of(const journal_base *base);
+bool editor_base_id_matches(const editor_base_id *id, const journal_base *base);
+/* Emit the INSERT/DELETE records that turn BASE's base_size bytes into the
+ * iterated text. With original_is_base, ORIGINAL spans are BASE bytes at the
+ * same offsets and are kept in place (no bytes written); every other span is
+ * written as INSERT slices of at most JOURNAL_INSERT_SLICE_BYTES. op receives
+ * (JOURNAL_DELETE, off, len, NULL) or (JOURNAL_INSERT, off, len, bytes). */
+/* True when a checkpoint of a modified text may reference BASE bytes instead
+ * of writing the whole text: the tree's original is BASE's generation and
+ * BASE is larger than FILE_PREFIX_MAX (smaller texts stay self-contained). */
+bool editor_checkpoint_references(const editor_base_id *origin, const journal_base *base);
+typedef int (*editor_text_op)(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes);
+int editor_text_ops(piece_iter *it, uint64_t base_size, bool original_is_base, editor_text_op op, void *ctx);
 int editor_resize_now(editor *e, uint32_t width, uint32_t height);
 bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);

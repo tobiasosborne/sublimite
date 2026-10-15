@@ -174,6 +174,11 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
                 rc = journal_base_from_prefix(file_path(b->file), file_prefix_identity(b->file),
                     prefix, prefix_size, &b->base);
                 if (rc) goto fail;
+                /* edit-28u: file_attach installs this same validated
+                 * generation as the tree's ORIGINAL (COPY or mapped), so
+                 * ORIGINAL offsets are BASE offsets for as long as BASE
+                 * keeps this identity. */
+                b->origin = editor_base_id_of(&b->base);
             }
             b->watch_fd = file_watch_start(b->file);
             struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};

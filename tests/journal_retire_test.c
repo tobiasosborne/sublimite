@@ -26,6 +26,14 @@ static int fixture(const char *path, const char *basepath, bool edits)
     if(edits) T(journal_insert(j,1,0,(const uint8_t *)"unsaved",strlen("unsaved"))==0);
     T(journal_flush(j)==0); journal_close(j); work_pool_shutdown(&pool); return 0;
 }
+/* edit-28u: an empty session (no BASE, no edits): only the closed tab order. */
+static int empty_fixture(const char *path)
+{
+    work_pool pool; T(work_pool_init(&pool,1,0)==0);
+    journal *j; T(journal_open(&j,path,&pool,NULL)==0);
+    T(journal_set_tabs(j,NULL,0,0)==0);
+    T(journal_flush(j)==0); journal_close(j); work_pool_shutdown(&pool); return 0;
+}
 static int discovery(const char *root, size_t *count, uint64_t *ns)
 {
     struct timespec begin,end; T(clock_gettime(CLOCK_MONOTONIC,&begin)==0);
@@ -99,6 +107,20 @@ static int protection(void)
     T(journal_retire_directory(root,NULL)==0 && access(clean,F_OK)==0);
     T(cleanup(root)==0); return 0;
 }
+/* edit-28u: a discoverable session holding only a BASE (a checkpointed
+ * clean tab set) is hot-exit state and stays; a BASE-free one is retired. */
+static int clean_tab_set(void)
+{
+    char root[]="build/tabset-XXXXXX"; T(mkdtemp(root));
+    char base[sizeof ((journal_base *)0)->captured_path], tabset[sizeof base], empty[sizeof base];
+    T(snprintf(base,sizeof base,"%s/base",root)>0); int fd=open(base,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0); close(fd);
+    T(snprintf(tabset,sizeof tabset,"%s/session-tabset",root)>0); T(fixture(tabset,base,false)==0);
+    T(snprintf(empty,sizeof empty,"%s/session-empty",root)>0); T(empty_fixture(empty)==0);
+    T(journal_retire_directory(root,NULL)==0);
+    T(access(tabset,F_OK)==0); /* red: retired as clean, losing the tab set */
+    T(access(empty,F_OK)<0);
+    T(cleanup(root)==0); return 0;
+}
 static int artifacts(void)
 {
     char root[]="build/artifacts-XXXXXX"; T(mkdtemp(root));
@@ -163,8 +185,10 @@ static int save_metadata(void)
     char root[]="build/save-marker-XXXXXX"; T(mkdtemp(root));
     char basepath[sizeof ((journal_base *)0)->captured_path], finished[sizeof basepath], pending[sizeof basepath];
     T(snprintf(basepath,sizeof basepath,"%s/base",root)>0); int fd=open(basepath,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0); close(fd);
-    T(snprintf(finished,sizeof finished,"%s/session-finished",root)>0);
-    T(snprintf(pending,sizeof pending,"%s/session-pending",root)>0);
+    /* edit-28u: discoverable BASE journals are clean tab sets and stay;
+     * dotted .retired names (never discovered, not capped) keep checking that FINISHED alone is not an edit. */
+    T(snprintf(finished,sizeof finished,"%s/session-finished.retired",root)>0);
+    T(snprintf(pending,sizeof pending,"%s/session-pending.retired",root)>0);
     /* (P) wire SAVE phases: PREPARED=1, FINISHED=2 (journal_save_finish).
      * SAVE prefix is sequence64 + phase32 + reserved32; all start zero. */
     for(unsigned phase=1;phase<=2;phase++) {
@@ -192,7 +216,7 @@ static int targets(void)
     /* (P) cases derive from matching target, differing target, edited log. */
     enum { MATCHING, DIFFERING, EDITED, TARGET_CASES };
     for(unsigned which=MATCHING;which<TARGET_CASES;which++) {
-        T(snprintf(path,sizeof path,"%s/session-%u",root,which)>0);
+        T(snprintf(path,sizeof path,"%s/session-%u.retired",root,which)>0); /* edit-28u, as save_metadata */
         work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
         T(journal_open(&j,path,&pool,NULL)==0); journal_base base;
         T(journal_capture_base(basepath,&base)==0); T(journal_set_base(j,1,&base)==0);
@@ -203,7 +227,7 @@ static int targets(void)
     }
     T(journal_retire_directory(root,NULL)==0);
     for(unsigned which=MATCHING;which<TARGET_CASES;which++) {
-        T(snprintf(path,sizeof path,"%s/session-%u",root,which)>0);
+        T(snprintf(path,sizeof path,"%s/session-%u.retired",root,which)>0);
         T((access(path,F_OK)==0)==(which!=MATCHING));
     }
     T(cleanup(root)==0); return 0;
@@ -275,7 +299,7 @@ static int measurement(void)
     char root[]="build/discovery-XXXXXX"; T(mkdtemp(root)); char base[sizeof ((journal_base *)0)->captured_path], path[sizeof base];
     T(snprintf(base,sizeof base,"%s/base",root)>0); int fd=open(base,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0);
     T(write(fd,"base",strlen("base"))==(ssize_t)strlen("base")); close(fd);
-    for(unsigned i=0;i<FIXTURE_SESSIONS;i++) { T(snprintf(path,sizeof path,"%s/session-%u",root,i)>0); T(fixture(path,base,false)==0); }
+    for(unsigned i=0;i<FIXTURE_SESSIONS;i++) { T(snprintf(path,sizeof path,"%s/session-%u",root,i)>0); T(empty_fixture(path)==0); }
     size_t count; uint64_t before,after; T(discovery(root,&count,&before)==0 && count==FIXTURE_SESSIONS);
     struct stat st; T(stat(path,&st)==0);
     T(journal_retire_directory(root,NULL)==0);
@@ -345,6 +369,6 @@ static int orphan_leases(void)
 }
 int main(void)
 {
-    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
+    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(clean_tab_set()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }

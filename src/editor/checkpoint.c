@@ -15,26 +15,88 @@ void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES])
                  (state.visual_end ? JOURNAL_VIEW_VISUAL_END : 0)};
     journal_encode_view_state(&v, out);
 }
-static uint8_t *record(journal_record *records, size_t *count, uint32_t type, uint64_t id, size_t size)
+editor_base_id editor_base_id_of(const journal_base *base)
 {
-    uint8_t *bytes = calloc(1, size);
-    if (bytes) records[(*count)++] = (journal_record){type, id, 0, bytes, size};
+    return (editor_base_id){base->size, base->mtime_ns, base->inode, base->device, base->ctime_ns,
+        base->prefix_crc, base->prefix_len, *base->path != 0};
+}
+bool editor_base_id_matches(const editor_base_id *id, const journal_base *base)
+{
+    return id->valid && *base->path && id->size == base->size && id->mtime_ns == base->mtime_ns &&
+        id->inode == base->inode && id->device == base->device && id->ctime_ns == base->ctime_ns &&
+        id->prefix_crc == base->prefix_crc && id->prefix_len == base->prefix_len;
+}
+/* edit-28u: a modified text whose BASE fits the file module's synchronous
+ * prefix (FILE_PREFIX_MAX) keeps the self-contained legacy shape, so a journal
+ * set aside after its BASE changed still holds the whole text for manual
+ * replay; larger texts reference the original BASE bytes (decision doc). */
+bool editor_checkpoint_references(const editor_base_id *origin, const journal_base *base)
+{ return editor_base_id_matches(origin, base) && base->size > FILE_PREFIX_MAX; }
+/* edit-28u: replay's text before these records is BASE's bytes. The text so
+ * far is always out[0, dst) followed by base[src, base_size): a DELETE at dst
+ * drops the base gap before the next kept ORIGINAL span, an INSERT at dst adds
+ * bytes before it, and the trailing DELETE drops the unkept base tail. Without
+ * a usable original the legacy shape results: DELETE all, then INSERT all. */
+int editor_text_ops(piece_iter *it, uint64_t base_size, bool original_is_base, editor_text_op op, void *ctx)
+{
+    uint64_t dst = 0, src = 0, original; const uint8_t *p; size_t n; int rc;
+    if (!original_is_base && base_size) {
+        rc = op(ctx, JOURNAL_DELETE, 0, base_size, NULL); if (rc) return rc;
+        src = base_size;
+    }
+    while (piece_iter_next_source(it, &p, &n, &original)) {
+        /* Original spans arrive in increasing order (piece.h); any other
+         * shape is written out as bytes, which is always correct. */
+        if (original_is_base && original != PIECE_ADD && original >= src &&
+            original <= base_size && n <= base_size - original) {
+            if (original > src) { rc = op(ctx, JOURNAL_DELETE, dst, original - src, NULL); if (rc) return rc; }
+            src = original + n; dst += n; continue;
+        }
+        while (n) {
+            size_t take = n < JOURNAL_INSERT_SLICE_BYTES ? n : JOURNAL_INSERT_SLICE_BYTES;
+            rc = op(ctx, JOURNAL_INSERT, dst, take, p); if (rc) return rc;
+            dst += take; p += take; n -= take;
+        }
+    }
+    return src < base_size ? op(ctx, JOURNAL_DELETE, dst, base_size - src, NULL) : 0;
+}
+/* edit-28u: two passes over the same unmutated state. The sizing pass writes
+ * each record into one scratch record (the wire maximum) and counts; the fill
+ * pass writes into one record array and one payload arena of exactly that
+ * size. No per-record allocation. */
+typedef struct checkpoint_build {
+    journal_record *records;
+    size_t count, capacity;
+    uint8_t *payload, *scratch;
+    size_t used, bytes;
+    int error;
+} checkpoint_build;
+static uint8_t *record(checkpoint_build *c, uint32_t type, uint64_t id, size_t size)
+{
+    if (size > JOURNAL_MAX_RECORD - JOURNAL_HEADER) { c->error = JOURNAL_INVALID; return NULL; }
+    if (!c->records) {
+        if (c->bytes > SIZE_MAX - size) { c->error = JOURNAL_NOMEM; return NULL; }
+        c->count++; c->bytes += size;
+        memset(c->scratch, 0, size); return c->scratch;
+    }
+    if (c->count == c->capacity || size > c->bytes - c->used) { c->error = JOURNAL_INVALID; return NULL; }
+    uint8_t *bytes = c->payload + c->used; c->used += size;
+    c->records[c->count++] = (journal_record){type, id, 0, bytes, size};
     return bytes;
 }
-int editor_checkpoint(editor *e)
+typedef struct text_sink { checkpoint_build *build; uint64_t id; } text_sink;
+static int text_record(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes)
 {
-    size_t capacity = 2;
-    for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i];
-        if (!b || (b->retired && !editor_session_retains(e, b, NULL))) continue;
-        uint64_t len = piece_len(b->tree), chunks = len / 4096u + (len % 4096u != 0 ? 1u : 0u);
-        if (chunks > SIZE_MAX - capacity - 4u) return JOURNAL_NOMEM;
-        capacity += (size_t)chunks + 4u;
-    }
-    if (capacity > SIZE_MAX / sizeof(journal_record)) return JOURNAL_NOMEM;
-    journal_record *records = calloc(capacity, sizeof *records);
-    if (!records) return JOURNAL_NOMEM;
-    size_t count = 0; int rc = JOURNAL_NOMEM;
+    text_sink *t = ctx;
+    uint8_t *p = record(t->build, type, t->id, type == JOURNAL_DELETE ? 16u : (size_t)len + 8u);
+    if (!p) return t->build->error;
+    put64(p, off);
+    if (type == JOURNAL_DELETE) put64(p + 8, len);
+    else memcpy(p + 8, bytes, (size_t)len);
+    return 0;
+}
+static int build_checkpoint(editor *e, checkpoint_build *c)
+{
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         /* edit-5u2: an evicted buffer whose save is in flight is still
@@ -48,31 +110,28 @@ int editor_checkpoint(editor *e)
         if (kept) base = &empty;
         /* Preserve named BASE association. A source conflict must preserve the
          * preceding recovery file, rather than silently relabel the new tree. */
-        if (*base->path && journal_check_base(base)) { rc = JOURNAL_BASE_CHANGED; goto done; }
+        if (*base->path && journal_check_base(base)) return JOURNAL_BASE_CHANGED;
         size_t path_len = strlen(base->path) + 1;
         size_t base_size = 40 + path_len + (*base->path ? 8u : 0u);
-        uint8_t *p = record(records, &count, JOURNAL_BASE, b->id, base_size); if (!p) goto done;
-        rc = journal_encode_base(base, p, base_size, &base_size); if (rc) goto done;
-        rc = JOURNAL_NOMEM;
+        uint8_t *p = record(c, JOURNAL_BASE, b->id, base_size); if (!p) return c->error;
+        int rc = journal_encode_base(base, p, base_size, &base_size); if (rc) return rc;
         if (*b->path) {
-            p = record(records, &count, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!p) goto done;
+            p = record(c, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!p) return c->error;
             memcpy(p, b->path, strlen(b->path) + 1);
         }
         /* Before adoption the tree is empty and preview is only a prefix.
          * BASE already describes the intact file; preserve it without content
-         * replacement. An adopted empty tree still represents a deletion. */
-        if (!b->pending_open) {
-            if (base->size) {
-                p = record(records, &count, JOURNAL_DELETE, b->id, 16); if (!p) goto done;
-                put64(p + 8, base->size);
-            }
-            uint64_t len = piece_len(b->tree);
-            for (uint64_t off = 0; off < len;) {
-                size_t n = len - off < 4096u ? (size_t)(len - off) : 4096u;
-                p = record(records, &count, JOURNAL_INSERT, b->id, n + 8); if (!p) goto done;
-                put64(p, off); rc = piece_read(b->tree, off, p + 8, n); if (rc) goto done;
-                rc = JOURNAL_NOMEM; off += n;
-            }
+         * replacement. An adopted empty tree still represents a deletion.
+         * edit-28u: a text equal to BASE (a completed save of this revision,
+         * or an untouched original) needs no text records; otherwise only the
+         * differences from BASE are written when the original is BASE. */
+        bool identical = !kept && b->revision == b->saved_text_revision &&
+            editor_base_id_matches(&b->saved_text, base) && piece_len(b->tree) == base->size;
+        if (!b->pending_open && !identical) {
+            piece_iter it; piece_iter_begin(&it, b->tree, 0);
+            text_sink sink = {c, b->id};
+            rc = editor_text_ops(&it, base->size, !kept && editor_checkpoint_references(&b->origin, base), text_record, &sink);
+            if (rc) return rc;
         }
         view_state state = b == e->buffer ? e->v.state : b->initial;
         if (kept) (void)editor_session_retains(e, b, &state);
@@ -84,23 +143,43 @@ int editor_checkpoint(editor *e)
             const tabs_tab *tab = tabs_closed_at(&e->tabs, j);
             if (tab->id == b->id) state = tab->state;
         }
-        p = record(records, &count, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!p) goto done;
+        p = record(c, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!p) return c->error;
         editor_encode_view(state, p);
     }
     size_t tabs = tabs_count(&e->tabs);
-    uint8_t *p = record(records, &count, JOURNAL_TABS, 0, 16 + tabs * 8); if (!p) goto done;
+    if (tabs > (JOURNAL_MAX_RECORD - 16) / 8) return JOURNAL_INVALID;
+    uint8_t *p = record(c, JOURNAL_TABS, 0, 16 + tabs * 8); if (!p) return c->error;
     put64(p, tabs); put64(p + 8, tabs ? tabs_active_index(&e->tabs) : 0);
     for (size_t i = 0; i < tabs; i++) put64(p + 16 + i * 8, tabs_at(&e->tabs, i)->id);
-    p = record(records, &count, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES); if (!p) goto done;
+    p = record(c, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES); if (!p) return c->error;
     journal_encode_window(&(journal_window){e->font.window_width, e->font.window_height, JOURNAL_WINDOW_CHOSEN}, p);
-    rc = journal_rotate(e->journal, records, count);
+    return 0;
+}
+int editor_checkpoint(editor *e)
+{
+    checkpoint_build c = {0};
+    c.scratch = malloc(JOURNAL_MAX_RECORD); if (!c.scratch) return JOURNAL_NOMEM;
+    int rc = build_checkpoint(e, &c);
+    free(c.scratch); c.scratch = NULL;
+    if (rc) return rc;
+    if (c.count > SIZE_MAX / sizeof(journal_record)) return JOURNAL_NOMEM;
+    edit_arena payload = {0};
+    if (c.bytes && edit_arena_init(&payload, c.bytes)) return JOURNAL_NOMEM;
+    c.payload = c.bytes ? edit_arena_alloc(&payload, c.bytes, 1) : NULL;
+    c.records = calloc(c.count ? c.count : 1, sizeof *c.records);
+    c.capacity = c.count; c.count = 0;
+    if (!c.records || (c.bytes && !c.payload)) rc = JOURNAL_NOMEM;
+    if (!rc) rc = build_checkpoint(e, &c);
+    /* (P) the fill pass revisits the sizing pass's unmutated state. */
+    if (!rc && (c.count != c.capacity || c.used != c.bytes)) rc = JOURNAL_INVALID;
+    if (!rc) rc = journal_rotate(e->journal, c.records, c.count);
     if (!rc) {
         e->op_count = e->stage_used = 0; e->stats.journal_error = 0;
         e->journal_group_open = false;
     }
-done:
-    for (size_t i = 0; i < count; i++) free((void *)records[i].data);
-    free(records); return rc;
+    free(c.records);
+    if (c.bytes) edit_arena_free(&payload);
+    return rc;
 }
 
 /* Coalesce metadata against the last accepted record. Reserved encoding storage
