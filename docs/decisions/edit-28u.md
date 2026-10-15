@@ -116,6 +116,10 @@ The save path's checkpoint builder (`session.c encode_leaf`) did the same.
 
 ## Not addressed (remaining)
 
+(edit-f3i, 2026-10-16, addresses the first two items: post-save and
+save-in-flight checkpoints diff against the saved revision, and the startup
+recovery install keeps ORIGINAL spans; see docs/decisions/edit-f3i.md.)
+
 - After a save, further edits of a large file checkpoint the whole text again
   (the tree's ORIGINAL is the pre-save generation, BASE is the saved file).
   Fix options: rebase the tree onto the saved generation after a save, or

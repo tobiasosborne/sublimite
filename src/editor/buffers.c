@@ -91,6 +91,9 @@ void editor_buffer_destroy(editor_buffer *b)
     if (b->index) lineidx_destroy(b->index);
     if (b->file) file_close(b->file);
     if (b->undo_ready) undo_destroy(&b->undo);
+    /* edit-f3i: snapshot storage lives in b->arena; release before it goes. */
+    if (b->save_snapshot) piece_snapshot_release(b->save_snapshot);
+    editor_saved_reference(b, NULL);
     if (b->tree) piece_destroy(b->tree);
     if (b->preview) piece_destroy(b->preview);
     if (b->piece_storage.ready) pthread_mutex_destroy(&b->piece_storage.mutex);
@@ -181,6 +184,16 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
                  * ORIGINAL offsets are BASE offsets for as long as BASE
                  * keeps this identity. */
                 b->origin = editor_base_id_of(&b->base);
+            } else if (e->recovering) {
+                /* edit-f3i: startup recovery installs with the journal
+                 * detached and captures BASE afterwards; the opened
+                 * generation is still the tree's ORIGINAL. */
+                size_t prefix_size = 0; const uint8_t *prefix = file_prefix(b->file, &prefix_size);
+                journal_base opened;
+                rc = journal_base_from_prefix(file_path(b->file), file_prefix_identity(b->file),
+                    prefix, prefix_size, &opened);
+                if (rc) goto fail;
+                b->origin = editor_base_id_of(&opened);
             }
             b->watch_fd = file_watch_start(b->file);
             struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};

@@ -42,6 +42,13 @@ typedef struct editor_base_id {
     uint32_t prefix_crc, prefix_len;
     bool valid;
 } editor_base_id;
+/* edit-f3i: a reference text (the saved revision's snapshot) indexed by the
+ * address of its bytes. Piece spans point into immutable original/mapping or
+ * add-buffer memory that the retained snapshot keeps alive, so equal
+ * addresses are equal bytes; off is the span's offset in the reference text.
+ * Sorted by at; adjacent spans contiguous in memory and text are merged. */
+typedef struct editor_ref_span { uintptr_t at; uint64_t len, off; } editor_ref_span;
+typedef struct editor_ref_map { editor_ref_span *spans; size_t count; } editor_ref_map;
 typedef struct editor_buffer {
     edit_arena arena;
     editor_piece_storage piece_storage;
@@ -73,6 +80,14 @@ typedef struct editor_buffer {
      * bytes of this generation (a completed save of that revision). */
     editor_base_id saved_text;
     uint64_t saved_text_revision;
+    /* edit-f3i: saved_snapshot is the snapshot whose bytes the saved_text
+     * generation holds (the text written by that save), retained so later
+     * checkpoints encode against it; saved_map indexes it (built lazily by
+     * the UI checkpoint). save_snapshot is the in-flight save's snapshot,
+     * from request until the save ends; a completed save moves it to
+     * saved_snapshot. Both are replaced together with saved_text. */
+    piece_snapshot *save_snapshot, *saved_snapshot;
+    editor_ref_map saved_map;
     journal_view_state journal_view_state;
     bool journal_view_valid;
     lineidx *index;
@@ -477,7 +492,39 @@ bool editor_base_id_matches(const editor_base_id *id, const journal_base *base);
  * BASE is larger than FILE_PREFIX_MAX (smaller texts stay self-contained). */
 bool editor_checkpoint_references(const editor_base_id *origin, const journal_base *base);
 typedef int (*editor_text_op)(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes);
-int editor_text_ops(piece_iter *it, uint64_t base_size, bool original_is_base, editor_text_op op, void *ctx);
+/* edit-f3i: with ref (and !original_is_base), spans found in the reference
+ * map are BASE bytes at the mapped offsets: BASE is the generation holding
+ * exactly the reference text (a completed save of that snapshot). */
+int editor_text_ops(piece_iter *it, uint64_t base_size, bool original_is_base, const editor_ref_map *ref,
+                    editor_text_op op, void *ctx);
+int editor_ref_map_build(editor_ref_map *m, const piece_snapshot *s);
+void editor_ref_map_free(editor_ref_map *m);
+/* edit-f3i: install s (retained by the caller, may be NULL) as b's saved
+ * reference, releasing the previous one and its map. */
+void editor_saved_reference(editor_buffer *b, piece_snapshot *s);
+/* edit-28u/f3i: checkpoint record builder shared by editor_checkpoint and the
+ * save worker. Two passes over the same unmutated state: the sizing pass
+ * (records == NULL) writes each record into one scratch record and counts;
+ * editor_records_fill then allocates one record array and one payload arena
+ * of exactly that size for the fill pass. No per-record allocation. */
+typedef struct editor_records {
+    journal_record *records;
+    size_t count, capacity;
+    uint8_t *payload, *scratch;
+    size_t used, bytes;
+    int error;
+    edit_arena arena;
+    bool arena_ready;
+} editor_records;
+typedef struct editor_records_sink { editor_records *records; uint64_t id; } editor_records_sink;
+int editor_records_begin(editor_records *c);
+uint8_t *editor_records_add(editor_records *c, uint32_t type, uint64_t id, size_t size);
+/* editor_text_op over an editor_records_sink. */
+int editor_records_text(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes);
+int editor_records_fill(editor_records *c);
+/* (P) the fill pass revisits the sizing pass's state: equal counts. */
+int editor_records_check(const editor_records *c);
+void editor_records_free(editor_records *c);
 int editor_resize_now(editor *e, uint32_t width, uint32_t height);
 bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);

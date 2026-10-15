@@ -28,9 +28,8 @@ static void hold_bulk(work_ctx *ctx)
     atomic_store(&held->entered, true);
     while (!work_should_stop(ctx) && trace_now_ns() < limit) sched_yield();
 }
-static int settle(editor *e)
+static int settle_until(editor *e, uint64_t limit)
 {
-    uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
     do {
         int rc = editor_step(e, 0);
         if (rc != EDITOR_OK && rc != EDITOR_MORE)
@@ -41,6 +40,7 @@ static int settle(editor *e)
     } while (editor_get_stats(e).pending || editor_get_stats(e).render_active || editor_save_active(e));
     return 0;
 }
+static int settle(editor *e) { return settle_until(e, trace_now_ns() + EDITOR_IDLE_NS); }
 static int cleanup(const char *root)
 {
     DIR *directory = opendir(root); T(directory); struct dirent *entry;
@@ -229,14 +229,19 @@ static int shape_of(const char *log, uint64_t id, shape28 *out)
  * JOURNAL_HEADER + payload: BASE v2 = 40 + path + NUL + ctime 8; TARGET =
  * path + NUL; VIEW = JOURNAL_VIEW_STATE_BYTES; TABS = 16 + 8 per tab; WINDOW =
  * JOURNAL_WINDOW_BYTES. The file seals with a PAD to a JOURNAL_PAGE multiple. */
-static uint64_t metadata_bound(const char *path, size_t tabs)
+static uint64_t metadata_bound_with(const char *path, size_t tabs, uint64_t extra)
 {
-    uint64_t n = strlen(path) + 1, bytes = 0;
+    uint64_t n = strlen(path) + 1, bytes = extra;
     bytes += JOURNAL_HEADER + 40 + n + 8; bytes += JOURNAL_HEADER + n;
     bytes += JOURNAL_HEADER + JOURNAL_VIEW_STATE_BYTES; bytes += JOURNAL_HEADER + 16 + 8 * tabs;
     bytes += JOURNAL_HEADER + JOURNAL_WINDOW_BYTES;
     return (bytes + JOURNAL_HEADER + JOURNAL_PAGE - 1) / JOURNAL_PAGE * JOURNAL_PAGE;
 }
+static uint64_t metadata_bound(const char *path, size_t tabs) { return metadata_bound_with(path, tabs, 0); }
+/* edit-f3i (P) text record sizes: INSERT = JOURNAL_HEADER + 8 (offset) +
+ * bytes; DELETE = JOURNAL_HEADER + 16 (offset, length). */
+#define INSERT_RECORD(n) ((uint64_t)JOURNAL_HEADER + 8u + (uint64_t)(n))
+#define DELETE_RECORD ((uint64_t)JOURNAL_HEADER + 16u)
 static int wait_adopted(editor *e)
 {
     uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
@@ -437,13 +442,31 @@ static int small_recovery_body(const char *root, uint8_t *base, uint8_t *want, u
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config config = {.journal_path = log, .start_empty = true, .cols = 32, .rows = 3};
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    /* edit-f3i (c): editor_open's startup install wrote its checkpoint;
+     * later turns append metadata records after it. */
+    struct stat st_after; T(stat(log, &st_after) == 0);
     int rc = settle(e);
     size_t got_len = 0;
     if (!rc) rc = tabs_count(&e->tabs) == 1 ? read_all(e, got, SMALL + 8u, &got_len) : 1;
     bool modified = !rc && editor_tab(e, 0)->modified;
+    /* edit-f3i (c): the startup install's checkpoint (rotated into the same
+     * journal) is differences-only too, the same records as the crashed one. */
+    uint64_t installed_id = rc ? 0 : editor_tab(e, 0)->id;
     editor_close(e);
     T(rc == 0); T(got_len == want_len && !memcmp(got, want, want_len)); T(modified);
     puts("editor_checkpoint_test: (b2) referencing checkpoint of an edited COPY file recovers the edited text");
+    shape28 after; T(shape_of(log, installed_id, &after) == 0);
+    char canonical[IPC_PATH_CAP]; T(realpath(source, canonical));
+    /* (P) checkpoint: metadata + one DELETE + two 2-byte INSERTs; then the
+     * install's first metadata turn appends one VIEW, TABS (one tab) and
+     * WINDOW record (the checkpoint does not seed the metadata caches). */
+    uint64_t appended = (JOURNAL_HEADER + JOURNAL_VIEW_STATE_BYTES) + (JOURNAL_HEADER + 16u + 8u) + (JOURNAL_HEADER + JOURNAL_WINDOW_BYTES);
+    uint64_t bound = metadata_bound_with(canonical, 1, DELETE_RECORD + 2u * INSERT_RECORD(2)) + appended;
+    printf("editor_checkpoint_test: f3i (c) recovered 2 MiB buffer, install checkpoint: journal before=%llu B after=%llu B bound=%llu B (P) deletes=%llu deleted=%llu inserts=%llu inserted=%llu B\n",
+        (unsigned long long)st.st_size, (unsigned long long)st_after.st_size, (unsigned long long)bound,
+        (unsigned long long)after.deletes, (unsigned long long)after.deleted,
+        (unsigned long long)after.inserts, (unsigned long long)after.inserted);
+    T(after.bases == 1 && after.deletes == 1 && after.deleted == 3 && after.inserted == 4 && (uint64_t)st_after.st_size <= bound);
     return 0;
 }
 /* (c) The source changes after the referencing checkpoint: replay refuses
@@ -594,6 +617,183 @@ static int saved_body(const char *root, uint8_t *base, uint8_t *want, uint8_t *g
     puts("editor_checkpoint_test: (e) saved revision checkpoints as BASE only and recovers the saved text clean");
     return 0;
 }
+/* ---- edit-f3i: after a save, checkpoints diff against the saved revision --
+ * (P) record sizes: INSERT = JOURNAL_HEADER + 8 (offset) + bytes; DELETE =
+ * JOURNAL_HEADER + 16 (offset, length). Typed literals are the edits. */
+static int press_save(editor *e)
+{
+    plat_event save = {.kind = PLAT_EV_KEY, .press = true, .keysym = 's', .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &save) == 0); return 0;
+}
+/* (a) 1 GiB sparse file: type one byte at the middle, Ctrl+S (complete),
+ * type one more byte, checkpoint. The journal holds metadata plus one INSERT
+ * of the one byte typed after the save, not the 2^30-byte text. */
+static int saved_gib_body(const char *root)
+{
+    char source[IPC_PATH_CAP], log[IPC_PATH_CAP], power[32], load[32];
+    T(snprintf(source, sizeof source, "%s/big", root) > 0);
+    T(snprintf(log, sizeof log, "%s/session", root) > 0);
+    T(gib_fixture(source) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = source, .journal_path = log, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    int rc = wait_adopted(e);
+    char canonical[IPC_PATH_CAP]; if (!realpath(source, canonical)) { editor_close(e); return 1; }
+    if (!rc) rc = editor_set_cursor(e, MID) ? 1 : settle(e);
+    if (!rc) rc = type_text(e, "x");
+    uint64_t t0 = trace_now_ns();
+    if (!rc) rc = press_save(e);
+    /* (E) watchdog only: the save writes 2^30 + 1 bytes and the journal
+     * retains the previous generation; six idle periods, not a budget. */
+    if (!rc) rc = settle_until(e, trace_now_ns() + 6u * EDITOR_IDLE_NS);
+    uint64_t save_ns = trace_now_ns() - t0;
+    if (!rc && (e->buffer->save_error || editor_tab(e, 0)->modified)) rc = 1;
+    if (!rc) rc = type_text(e, "y");
+    uint64_t pieces = rc ? 0 : piece_piece_count(e->buffer->tree);
+    timed_checkpoint cp = {0}; shape28 shape = {0};
+    if (!rc) rc = checkpoint_once(e, log, &cp);
+    if (!rc) rc = shape_of(log, e->buffer->id, &shape);
+    uint64_t bound = metadata_bound_with(canonical, 1, INSERT_RECORD(1));
+    stamp(power, load);
+    printf("editor_checkpoint_test: f3i (a) 1 GiB, save, +1 B checkpoint: journal=%llu B bound=%llu B (P) pieces=%llu deletes=%llu deleted=%llu inserts=%llu inserted=%llu B save=%.3f ms checkpoint=%.3f ms (M) allocations=%s%zu power=%s load1=%s\n",
+        (unsigned long long)cp.size, (unsigned long long)bound, (unsigned long long)pieces,
+        (unsigned long long)shape.deletes, (unsigned long long)shape.deleted, (unsigned long long)shape.inserts,
+        (unsigned long long)shape.inserted, (double)save_ns / 1e6, (double)cp.ns / 1e6,
+        cp.counted ? "" : "uncounted:", cp.allocations, power, load);
+    if (!rc && (cp.size > bound || shape.deletes || shape.inserted != 1 || shape.bases != 1)) rc = 1;
+    uint64_t id = e->buffer->id;
+    editor_close(e);
+    if (rc) return rc;
+    /* Replay onto the saved file (2^30 + 1 bytes, 'x' at MID): 'y' after it. */
+    int fd = open(source, O_RDONLY); T(fd >= 0);
+    struct stat st; T(fstat(fd, &st) == 0); T((uint64_t)st.st_size == GIB + 1u);
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0); T(close(fd) == 0); T(map != MAP_FAILED);
+    piece_allocator allocator = piece_default_allocator();
+    piece_replay replay = {piece_create(&allocator), id, 0}; journal_replay_result result;
+    bool ok = replay.tree && piece_init_mapped(replay.tree, map, (size_t)st.st_size, NULL) == 0 &&
+        journal_replay_file(log, replay_piece, &replay, &result) == 0 && !result.corrupt && !replay.error &&
+        piece_len(replay.tree) == GIB + 2u;
+    uint8_t got[16];
+    if (ok) ok = piece_read(replay.tree, 0, got, sizeof head_mark - 1) == 0 && !memcmp(got, head_mark, sizeof head_mark - 1);
+    if (ok) ok = piece_read(replay.tree, MID - 1u, got, 3) == 0 && !memcmp(got, "\nxy", 3);
+    if (ok) ok = piece_read(replay.tree, MID + 2u, got, 1) == 0 && got[0] == 0;
+    if (ok) ok = piece_read(replay.tree, GIB + 2u - (sizeof tail_mark - 1), got, sizeof tail_mark - 1) == 0 &&
+        !memcmp(got, tail_mark, sizeof tail_mark - 1);
+    if (replay.tree) piece_destroy(replay.tree);
+    munmap(map, (size_t)st.st_size);
+    printf("editor_checkpoint_test: f3i (a) replay onto saved file: %s\n", ok ? "xy at middle, head/tail intact" : "MISMATCH");
+    T(ok);
+    return 0;
+}
+static int saved_gib(void)
+{
+    char root[] = "build/editor-f3i-gib-XXXXXX"; T(mkdtemp(root));
+    int rc = saved_gib_body(root);
+    remove_tree(root); /* every path, success or failure */
+    return rc;
+}
+/* (b) Save in flight. step 1: a checkpoint while the write is held encodes
+ * against the pre-save BASE; step 2: the finish checkpoint after the save
+ * completes references the saved file (only bytes typed after the save
+ * request); step 3: a later checkpoint references the saved file too. Each
+ * step ends in a crash and the text is recovered. */
+typedef struct held_save { atomic_bool entered, release; int phase; } held_save;
+static void hold(void *ctx, int phase)
+{
+    held_save *h = ctx; if (phase != h->phase) return;
+    atomic_store(&h->entered, true);
+    uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!atomic_load(&h->release) && trace_now_ns() < limit) sched_yield();
+}
+/* Typing while the save is held: settle() would wait for the save. */
+static int type_held(editor *e, const char *text)
+{
+    for (const char *c = text; *c; c++) {
+        plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = (uint8_t)*c, .utf8_len = 1, .t0_ns = trace_now_ns()};
+        key.utf8[0] = (uint8_t)*c;
+        T(editor_inject(e, &key) == 0);
+        uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
+        do {
+            int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+            T(trace_now_ns() < limit); sched_yield();
+        } while (editor_get_stats(e).pending || editor_get_stats(e).render_active);
+    }
+    return 0;
+}
+static int inflight_child(const char *source, const char *log, int step)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = source, .journal_path = log, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(wait_adopted(e) == 0);
+    T(editor_set_cursor(e, P1) == 0); T(type_text(e, "AB") == 0);
+    static held_save held = {.phase = FILE_STEP_TEMP_WRITTEN};
+    T(savectl_set_step_hook(e->buffer->save, hold, &held) == 0);
+    T(press_save(e) == 0);
+    uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!atomic_load(&held.entered)) {
+        int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+        T(trace_now_ns() < limit); sched_yield();
+    }
+    T(editor_set_cursor(e, P2) == 0); T(type_held(e, "CD") == 0);
+    if (step == 1) { T(journal_flush(e->journal) == 0); T(editor_checkpoint(e) == 0); _exit(0); }
+    atomic_store(&held.release, true); T(settle(e) == 0);
+    T(!e->buffer->save_error && editor_tab(e, 0)->modified);
+    if (step == 2) _exit(0); /* the finish checkpoint is the journal */
+    T(editor_set_cursor(e, editor_length(e)) == 0); T(type_text(e, "EF") == 0);
+    T(journal_flush(e->journal) == 0); T(editor_checkpoint(e) == 0);
+    _exit(0);
+}
+static int inflight_step(const char *root, uint8_t *base, uint8_t *want, uint8_t *got, int step)
+{
+    char source[IPC_PATH_CAP], log[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source-%d", root, step) > 0);
+    T(snprintf(log, sizeof log, "%s/journal-%d", root, step) > 0);
+    T(small_fixture(source, base) == 0);
+    /* (P) "AB" at P1, then "CD" at P2 of that text, then (step 3) "EF" at the end. */
+    size_t n = 0;
+    memcpy(want, base, P1); n += P1; memcpy(want + n, "AB", 2); n += 2;
+    memcpy(want + n, base + P1, P2 - 2u - P1); n += P2 - 2u - P1; memcpy(want + n, "CD", 2); n += 2;
+    memcpy(want + n, base + P2 - 2u, SMALL - (P2 - 2u)); n += SMALL - (P2 - 2u);
+    if (step == 3) { memcpy(want + n, "EF", 2); n += 2; }
+    pid_t child = fork(); T(child >= 0);
+    if (!child) _exit(inflight_child(source, log, step));
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    shape28 shape; T(shape_of(log, 1, &shape) == 0);
+    struct stat st; T(stat(log, &st) == 0);
+    char canonical[IPC_PATH_CAP]; T(realpath(source, canonical));
+    /* (P) expected text records per step: 1 = "AB" and "CD" against the
+     * pre-save BASE; 2 = "CD" against the saved file; 3 = "CD" and "EF". */
+    uint64_t inserted = step == 2 ? 2u : 4u;
+    uint64_t bound = metadata_bound_with(canonical, 1, INSERT_RECORD(2) * (inserted / 2u));
+    printf("editor_checkpoint_test: f3i (b) step %d: journal=%llu B bound=%llu B (P) bases=%llu deletes=%llu deleted=%llu inserts=%llu inserted=%llu B\n",
+        step, (unsigned long long)st.st_size, (unsigned long long)bound, (unsigned long long)shape.bases,
+        (unsigned long long)shape.deletes, (unsigned long long)shape.deleted,
+        (unsigned long long)shape.inserts, (unsigned long long)shape.inserted);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = log, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    int rc = settle(e);
+    size_t got_len = 0;
+    if (!rc) rc = tabs_count(&e->tabs) == 1 ? read_all(e, got, SMALL + 8u, &got_len) : 1;
+    bool modified = !rc && editor_tab(e, 0)->modified;
+    editor_close(e);
+    if (got_len != n || memcmp(got, want, n)) {
+        size_t at = 0; while (at < n && at < got_len && got[at] == want[at]) at++;
+        fprintf(stderr, "editor_checkpoint_test: f3i (b) step %d text got_len=%zu want=%zu first difference at %zu: got \"%.8s\" want \"%.8s\"\n",
+            step, got_len, n, at, at < got_len ? (const char *)got + at : "", at < n ? (const char *)want + at : "");
+    }
+    T(rc == 0); T(got_len == n && !memcmp(got, want, n)); T(modified);
+    T(shape.bases == 1 && !shape.deletes && shape.inserted == inserted && (uint64_t)st.st_size <= bound);
+    return 0;
+}
+static int inflight_body(const char *root, uint8_t *base, uint8_t *want, uint8_t *got)
+{
+    int failed = 0;
+    for (int step = 1; step <= 3; step++) if (inflight_step(root, base, want, got, step)) failed++;
+    T(!failed);
+    puts("editor_checkpoint_test: f3i (b) save in flight: pre-save BASE while held, saved file after; recovered at each step");
+    return 0;
+}
 typedef int (*small_case)(const char *root, uint8_t *base, uint8_t *want, uint8_t *got);
 static int changed_case(const char *root, uint8_t *base, uint8_t *want, uint8_t *got)
 { (void)want; return changed_base_body(root, base, got); }
@@ -610,23 +810,34 @@ static int run_small(const char *pattern, small_case body)
     if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
     return rc;
 }
-int main(void)
+/* Optional arguments select cases by name (all when none is given). */
+static int only_argc; static char **only_argv;
+static bool wanted(const char *name)
 {
+    if (only_argc < 2) return true;
+    for (int i = 1; i < only_argc; i++) if (!strcmp(only_argv[i], name)) return true;
+    return false;
+}
+int main(int argc, char **argv)
+{
+    only_argc = argc; only_argv = argv;
     trace_init(); T(trace_thread_register() >= 0);
     /* Never touch a real profile: every case runs under a private root. */
     char made[] = "build/editor-28u-xdg-XXXXXX"; T(mkdtemp(made));
     char xdg[IPC_PATH_CAP]; T(realpath(made, xdg)); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
     int failed = 0;
-    if (pending_checkpoint(false)) failed++;
-    if (pending_checkpoint(true)) failed++;
-    if (adopted_empty_checkpoint()) failed++;
-    if (gib_checkpoints()) { failed++; puts("editor_checkpoint_test: FAIL (a)/(b) 1 GiB checkpoints"); }
-    if (run_small("build/editor-28u-b2-XXXXXX", small_recovery_body)) { failed++; puts("editor_checkpoint_test: FAIL (b2)"); }
-    if (run_small("build/editor-28u-c-XXXXXX", changed_case)) { failed++; puts("editor_checkpoint_test: FAIL (c)"); }
-    if (run_small("build/editor-28u-d-XXXXXX", legacy_body)) { failed++; puts("editor_checkpoint_test: FAIL (d)"); }
-    if (run_small("build/editor-28u-e-XXXXXX", saved_body)) { failed++; puts("editor_checkpoint_test: FAIL (e)"); }
+    if (wanted("pending") && pending_checkpoint(false)) failed++;
+    if (wanted("pending") && pending_checkpoint(true)) failed++;
+    if (wanted("empty") && adopted_empty_checkpoint()) failed++;
+    if (wanted("gib") && gib_checkpoints()) { failed++; puts("editor_checkpoint_test: FAIL (a)/(b) 1 GiB checkpoints"); }
+    if (wanted("b2") && run_small("build/editor-28u-b2-XXXXXX", small_recovery_body)) { failed++; puts("editor_checkpoint_test: FAIL (b2) / f3i (c)"); }
+    if (wanted("c") && run_small("build/editor-28u-c-XXXXXX", changed_case)) { failed++; puts("editor_checkpoint_test: FAIL (c)"); }
+    if (wanted("d") && run_small("build/editor-28u-d-XXXXXX", legacy_body)) { failed++; puts("editor_checkpoint_test: FAIL (d)"); }
+    if (wanted("e") && run_small("build/editor-28u-e-XXXXXX", saved_body)) { failed++; puts("editor_checkpoint_test: FAIL (e)"); }
+    if (wanted("f3i-a") && saved_gib()) { failed++; puts("editor_checkpoint_test: FAIL f3i (a) 1 GiB checkpoint after save"); }
+    if (wanted("f3i-b") && run_small("build/editor-f3i-b-XXXXXX", inflight_body)) { failed++; puts("editor_checkpoint_test: FAIL f3i (b)"); }
     remove_tree(xdg);
     if (failed) { printf("editor_checkpoint_test: %d case(s) failed\n", failed); return 1; }
-    puts("editor_checkpoint_test: pending COPY checkpoint/crash/recovery/save, edit-28u referencing checkpoints passed");
+    puts("editor_checkpoint_test: pending COPY checkpoint/crash/recovery/save, edit-28u referencing checkpoints, edit-f3i post-save checkpoints passed");
     return 0;
 }

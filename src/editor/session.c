@@ -19,6 +19,10 @@ typedef struct session_node {
     view_state view;
     uint64_t revision;
     bool live;
+    /* edit-f3i: the buffer's saved reference at publication (retained) and
+     * the generation holding its bytes; encode_leaf diffs against it. */
+    piece_snapshot *reference;
+    editor_base_id reference_id;
 } session_node;
 typedef struct session_capture {
     struct editor_session *owner;
@@ -29,8 +33,11 @@ typedef struct session_capture {
     uint32_t width, height;
     journal_base replacement;
     bool finish, cancelling;
-    journal_record *records;
-    size_t count, capacity;
+    /* edit-f3i: finish only: the snapshot the save wrote (retained), whose
+     * bytes the replacement BASE holds; maps index references per slot. */
+    piece_snapshot *reference;
+    editor_ref_map *maps;
+    editor_records records;
 } session_capture;
 struct editor_session {
     pthread_mutex_t mutex;
@@ -57,6 +64,7 @@ static void node_release(editor_session *s, session_node *n)
     if (!n || --n->refs) return;
     node_release(s, n->child[0]); node_release(s, n->child[1]);
     if (n->snapshot) piece_snapshot_release(n->snapshot);
+    if (n->reference) piece_snapshot_release(n->reference);
     n->next = s->free; s->free = n;
 }
 static session_node *node_alloc(editor_session *s)
@@ -116,7 +124,7 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     if (!content && old->live == live && old->rank == rank &&
         !memcmp(&old->view, &state, sizeof state) &&
         old->base.inode == b->base.inode && old->base.ctime_ns == b->base.ctime_ns &&
-        !strcmp(old->base.path, b->base.path)) { pthread_mutex_unlock(&s->mutex); return; }
+        !strcmp(old->base.path, b->base.path) && old->reference == b->saved_snapshot) { pthread_mutex_unlock(&s->mutex); return; }
     piece_snapshot *snapshot = content ? piece_snapshot_take(b->tree) : piece_snapshot_retain(old->snapshot);
     /* Publication failure never changes a committed mutation. A later turn
      * retries; save refuses stale publication rather than saving old bytes. */
@@ -124,6 +132,8 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     session_node *leaf = node_alloc(s); EDIT_ASSERT(leaf);
     leaf->buffer = b; leaf->snapshot = snapshot; leaf->revision = b->revision;
     leaf->view = state; leaf->live = live; leaf->live_count = live ? 1u : 0u; leaf->rank = rank; base_copy(&leaf->base, &b->base);
+    leaf->reference = b->saved_snapshot ? piece_snapshot_retain(b->saved_snapshot) : NULL; /* edit-f3i */
+    leaf->reference_id = b->saved_text;
     session_node *root = replace(s, s->root, s->width, b->session_slot, leaf);
     node_release(s, s->root); s->root = root;
     pthread_mutex_unlock(&s->mutex);
@@ -177,40 +187,31 @@ void editor_session_metadata(editor *e)
         else if (leaf->buffer == b && leaf->live) publish(e, b, false, 0, leaf->view);
     }
 }
-static uint8_t *record(session_capture *c, uint32_t type, uint64_t id, size_t size)
+/* edit-f3i: the reference a leaf's text is encoded against, if any. */
+static const piece_snapshot *leaf_reference(const session_capture *c, const session_node *n,
+                                            const journal_base *base, bool replaced)
 {
-    if (c->count == c->capacity) {
-        size_t capacity = c->capacity ? c->capacity * 2 : 1;
-        journal_record *records = realloc(c->records, capacity * sizeof *records);
-        if (!records) return NULL;
-        c->records = records; c->capacity = capacity;
-    }
-    uint8_t *data = calloc(1, size); if (!data) return NULL;
-    c->records[c->count++] = (journal_record){type, id, 0, data, size}; return data;
-}
-typedef struct session_text { session_capture *capture; uint64_t id; } session_text;
-static int session_text_record(void *ctx, uint32_t type, uint64_t off, uint64_t len, const uint8_t *bytes)
-{
-    session_text *t = ctx;
-    uint8_t *data = record(t->capture, type, t->id, type == JOURNAL_DELETE ? 16u : (size_t)len + 8u);
-    if (!data) return JOURNAL_NOMEM;
-    put64(data, off);
-    if (type == JOURNAL_DELETE) put64(data + 8, len);
-    else memcpy(data + 8, bytes, (size_t)len);
-    return 0;
+    const editor_buffer *b = n->buffer;
+    if (editor_checkpoint_references(&b->origin, base) || base->size <= FILE_PREFIX_MAX) return NULL;
+    /* The replacement BASE holds exactly the bytes of the snapshot the save
+     * wrote; other buffers of that target have unrelated trees. */
+    if (replaced) return c->finish && b == c->selected ? c->reference : NULL;
+    return n->reference && editor_checkpoint_references(&n->reference_id, base) ? n->reference : NULL;
 }
 static int encode_leaf(session_capture *c, session_node *n)
 {
     editor_buffer *b = n->buffer;
+    editor_records *r = &c->records;
     const journal_base *base = &n->base;
     /* All buffers associated with the replaced target must have a valid new
      * BASE. Full snapshot deltas preserve their own (possibly different) text. */
-    if ((c->finish || c->cancelling) && !strcmp(b->save_path, c->selected->save_path)) base = &c->replacement;
+    bool replaced = (c->finish || c->cancelling) && !strcmp(b->save_path, c->selected->save_path);
+    if (replaced) base = &c->replacement;
     size_t base_size = 40 + strlen(base->path) + 1 + (*base->path ? 8u : 0u);
-    uint8_t *data = record(c, JOURNAL_BASE, b->id, base_size); if (!data) return JOURNAL_NOMEM;
+    uint8_t *data = editor_records_add(r, JOURNAL_BASE, b->id, base_size); if (!data) return r->error;
     int rc = journal_encode_base(base, data, base_size, &base_size); if (rc) return rc;
     if (*b->path) {
-        data = record(c, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!data) return JOURNAL_NOMEM;
+        data = editor_records_add(r, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!data) return r->error;
         strcpy((char *)data, b->path);
     }
     /* edit-28u: the same text encoding as editor_checkpoint. The finish
@@ -220,12 +221,22 @@ static int encode_leaf(session_capture *c, session_node *n)
     bool identical = c->finish && b == c->selected && n->revision == b->save_revision &&
         *base->path && piece_snapshot_len(n->snapshot) == base->size;
     if (!identical) {
+        /* edit-f3i: a text after a save (or saved while this one was in
+         * flight) is encoded against the saved revision. */
+        const piece_snapshot *reference = leaf_reference(c, n, base, replaced);
+        const editor_ref_map *map = NULL;
+        if (reference) {
+            if (!c->maps && !(c->maps = calloc(c->owner->width, sizeof *c->maps))) return JOURNAL_NOMEM;
+            editor_ref_map *slot = &c->maps[b->session_slot];
+            if (!slot->spans) { rc = editor_ref_map_build(slot, reference); if (rc) return rc; }
+            map = slot;
+        }
         piece_iter it; piece_iter_begin_snapshot(&it, n->snapshot, 0);
-        session_text sink = {c, b->id};
-        rc = editor_text_ops(&it, base->size, editor_checkpoint_references(&b->origin, base), session_text_record, &sink);
+        editor_records_sink sink = {r, b->id};
+        rc = editor_text_ops(&it, base->size, editor_checkpoint_references(&b->origin, base), map, editor_records_text, &sink);
         if (rc) return rc;
     }
-    data = record(c, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!data) return JOURNAL_NOMEM;
+    data = editor_records_add(r, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!data) return r->error;
     editor_encode_view(n->view, data);
     return 0;
 }
@@ -243,15 +254,14 @@ static int encode_tree(session_capture *c, session_node *n, uint64_t *ids, size_
     }
     return 0;
 }
-static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint *out)
+static int encode_all(session_capture *c, uint64_t *ids)
 {
-    session_capture *c = ctx; (void)snapshot;
-    uint64_t *ids = calloc(c->owner->width, sizeof *ids); if (!ids) return JOURNAL_NOMEM;
+    editor_records *r = &c->records;
     size_t count = 0, active = 0;
     int rc = encode_tree(c, c->root, ids, &count, &active);
     if (!rc) {
-        uint8_t *data = record(c, JOURNAL_TABS, 0, 16 + count * 8);
-        if (!data) rc = JOURNAL_NOMEM;
+        uint8_t *data = editor_records_add(r, JOURNAL_TABS, 0, 16 + count * 8);
+        if (!data) rc = r->error;
         else {
             put64(data, count); put64(data + 8, active);
             for (size_t i = 0; i < count; i++) {
@@ -260,13 +270,28 @@ static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint
             }
         }
     }
-    free(ids);
     if (!rc) {
-        uint8_t *data = record(c, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES);
+        uint8_t *data = editor_records_add(r, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES);
         journal_window w = {c->width, c->height, JOURNAL_WINDOW_CHOSEN};
-        if (!data) rc = JOURNAL_NOMEM;
+        if (!data) rc = r->error;
         else journal_encode_window(&w, data);
     }
+    return rc;
+}
+/* edit-f3i: the same two-pass builder as editor_checkpoint (one record array
+ * and one payload arena, no per-record allocation); both passes walk the
+ * pinned, immutable graph. */
+static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint *out)
+{
+    session_capture *c = ctx; (void)snapshot;
+    uint64_t *ids = calloc(c->owner->width, sizeof *ids); if (!ids) return JOURNAL_NOMEM;
+    editor_records_free(&c->records); /* defensive: one prepare per capture */
+    int rc = editor_records_begin(&c->records);
+    if (!rc) rc = encode_all(c, ids);
+    if (!rc) rc = editor_records_fill(&c->records);
+    if (!rc) { memset(ids, 0, c->owner->width * sizeof *ids); rc = encode_all(c, ids); }
+    if (!rc) rc = editor_records_check(&c->records);
+    free(ids);
     if (!rc) {
         /* Selected previous identity is frozen in the pinned graph. */
         session_node *n = c->root; size_t slot = c->selected->session_slot;
@@ -274,15 +299,18 @@ static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint
             size_t half = span / 2; bool right = slot >= half;
             n = n->child[right ? 1 : 0]; if (right) slot -= half;
         }
-        out->previous = n->base; out->records = c->records; out->count = c->count;
+        out->previous = n->base; out->records = c->records.records; out->count = c->records.count;
     }
     return rc;
 }
 static void release(void *ctx)
 {
     session_capture *c = ctx;
-    for (size_t i = 0; i < c->count; i++) free((void *)c->records[i].data);
-    free(c->records); c->records = NULL; c->count = c->capacity = 0;
+    editor_records_free(&c->records);
+    if (c->maps) for (size_t i = 0; i < c->owner->width; i++) editor_ref_map_free(&c->maps[i]);
+    free(c->maps); c->maps = NULL;
+    if (c->reference) piece_snapshot_release(c->reference);
+    c->reference = NULL;
     pthread_mutex_lock(&c->owner->mutex); node_release(c->owner, c->root);
     c->root = NULL; pthread_mutex_unlock(&c->owner->mutex);
 }
@@ -331,8 +359,20 @@ static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finis
     /* No leaf: start() refuses the NULL snapshot instead of dereferencing. */
     c->snapshot = leaf && leaf->buffer == b ? piece_snapshot_retain(leaf->snapshot) : NULL;
     pthread_mutex_unlock(&s->mutex);
-    if (finish) base_copy(&c->replacement, savectl_saved_base(b->save));
+    if (finish) {
+        base_copy(&c->replacement, savectl_saved_base(b->save));
+        /* edit-f3i: the replacement holds the bytes of the snapshot that
+         * save request wrote (request_buffer retained it). */
+        c->reference = b->save_snapshot ? piece_snapshot_retain(b->save_snapshot) : NULL;
+    }
     else if (s->reconciling) c->replacement.path = "";
+}
+/* edit-f3i: the in-flight save's snapshot lives from request until the save
+ * ends; a completed save of a tracked revision moves it to saved_snapshot. */
+static void save_snapshot_drop(editor_buffer *b)
+{
+    if (b->save_snapshot) piece_snapshot_release(b->save_snapshot);
+    b->save_snapshot = NULL;
 }
 static int start(editor *e, bool finish);
 /* (P) Zero in retry bookkeeping denotes no pending identity/timestamp/error,
@@ -341,7 +381,7 @@ static void start_failed(editor_session *s, editor_buffer *b, int rc)
 {
     b->save_error = b->operation_error = rc; b->save_tracking = false;
     if (s->reconciling) { s->blocked = true; s->reconciling = false; s->retry_id = 0; }
-    else s->saving = NULL;
+    else { s->saving = NULL; save_snapshot_drop(b); }
 }
 static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
 {
@@ -368,6 +408,8 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
         b->save_error = b->operation_error = FILE_ERR_NOMEM; return 0;
     }
     capture(e, b, request_ns ? request_ns : trace_now_ns(), false);
+    save_snapshot_drop(b);
+    b->save_snapshot = s->capture.snapshot ? piece_snapshot_retain(s->capture.snapshot) : NULL; /* edit-f3i */
     s->saving = b; s->pending = true; s->finishing = s->blocked = false; s->pending_submit_ns = 0;
     b->save_revision = b->revision; b->save_cursor = b->history_cursor; b->save_tracking = true;
     undo_break_burst(&b->undo);
@@ -421,7 +463,7 @@ void editor_save_tick(editor *e)
             editor_session_publish(e, other);
         }
         uint64_t retry_id = s->retry_id, retry_ns = s->retry_ns;
-        s->saving = NULL; s->reconciling = false; s->retry_id = 0;
+        s->saving = NULL; s->reconciling = false; s->retry_id = 0; save_snapshot_drop(b);
         for (size_t i = 0; i < e->buffer_capacity; i++) {
             editor_buffer *retry = e->buffers[i];
             if (retry && !retry->retired && retry->id == retry_id) {
@@ -439,7 +481,7 @@ void editor_save_tick(editor *e)
         /* Retain recovery ownership until a later Ctrl+S reconciles CURRENT. */
         s->blocked = model.can_recover_cancel || model.needs_finish;
         s->reconciling = false; s->retry_id = 0;
-        if (!s->blocked) s->saving = NULL;
+        if (!s->blocked) { s->saving = NULL; save_snapshot_drop(b); }
         (void)editor_begin_frame(e); e->paint_ready = false; return;
     }
     if (model.needs_finish && !model.busy && !s->finishing && !e->journal_waiting && !e->op_count && !e->journal_group_open) {
@@ -474,6 +516,9 @@ void editor_save_tick(editor *e)
              * revision's snapshot; checkpoints of that revision write BASE only. */
             if (s->finishing && b->save_tracking) {
                 b->saved_text = editor_base_id_of(&b->base); b->saved_text_revision = b->save_revision;
+                /* edit-f3i: later checkpoints diff against the saved text. */
+                editor_saved_reference(b, b->save_snapshot); b->save_snapshot = NULL;
+                editor_session_publish(e, b);
             }
             for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
                 const tabs_tab *tab = tabs_at(&e->tabs, i);
@@ -482,7 +527,7 @@ void editor_save_tick(editor *e)
             }
             b->save_error = b->operation_error = 0; b->save_errno = 0;
         } else { b->save_error = b->operation_error = model.file_error ? model.file_error : model.journal_error; b->save_errno = b->operation_errno = model.err_no; }
-        b->save_tracking = false; s->saving = NULL;
+        b->save_tracking = false; s->saving = NULL; save_snapshot_drop(b);
         (void)editor_begin_frame(e); e->paint_ready = false;
     }
 }

@@ -29,7 +29,19 @@ typedef struct recovered_buffer {
     bool save_pending;
     bool conflict; /* edit-btj: BASE no longer matches disk; edits are not replayed */
     char retained[IPC_PATH_CAP];
+    /* edit-f3i: the INSERT/DELETE records since the last BASE, in order, so
+     * install can apply them to the opened BASE generation (the tree keeps
+     * ORIGINAL spans and its checkpoints stay differences from BASE). Each
+     * op is OP_HEADER bytes (type, offset, length) plus the inserted bytes.
+     * ops_valid is false when the log could not be kept (whole-text install,
+     * as before). */
+    editor_base_id base_id;
+    uint8_t *ops;
+    size_t ops_len, ops_cap;
+    bool ops_valid;
 } recovered_buffer;
+/* (P) op header: 1 type byte + 8-byte offset + 8-byte length. */
+#define OP_HEADER 17u
 typedef struct recovered_session {
     recovered_buffer *buffers;
     uint64_t *tabs;
@@ -79,11 +91,30 @@ static int gap_insert(recovered_buffer *b, size_t at, const uint8_t *data, size_
     memcpy(b->bytes + b->gap, data, n);
     b->gap += n; b->gap_len -= n; b->len += n; return 0;
 }
+static void op_log(recovered_buffer *b, uint32_t type, uint64_t off, uint64_t len, const uint8_t *data)
+{
+    if (!b->ops_valid) return;
+    size_t extra = type == JOURNAL_INSERT ? (size_t)len : 0u;
+    if (extra > SIZE_MAX - OP_HEADER - b->ops_len) { b->ops_valid = false; return; }
+    size_t need = b->ops_len + OP_HEADER + extra;
+    if (need > b->ops_cap) {
+        /* (P) doubling: amortised O(1) copies per logged byte. */
+        size_t cap = b->ops_cap > SIZE_MAX / 2 ? need : b->ops_cap * 2;
+        if (cap < need) cap = need;
+        uint8_t *ops = realloc(b->ops, cap);
+        if (!ops) { b->ops_valid = false; free(b->ops); b->ops = NULL; b->ops_len = b->ops_cap = 0; return; }
+        b->ops = ops; b->ops_cap = cap;
+    }
+    uint8_t *p = b->ops + b->ops_len;
+    p[0] = (uint8_t)type; memcpy(p + 1, &off, 8); memcpy(p + 9, &len, 8);
+    if (extra) memcpy(p + OP_HEADER, data, extra);
+    b->ops_len = need;
+}
 static void fini(recovered_session *s)
 {
     while (s->buffers) {
         recovered_buffer *b = s->buffers; s->buffers = b->next;
-        free(b->bytes); free(b);
+        free(b->bytes); free(b->ops); free(b);
     }
     free(s->tabs); *s = (recovered_session){0};
 }
@@ -129,6 +160,8 @@ static int restore_record(void *ctx, const journal_record *r)
                 return 0;
             }
         }
+        /* edit-f3i: a BASE restarts the text, so the op log restarts too. */
+        b->base_id = editor_base_id_of(&base); b->ops_len = 0; b->ops_valid = true;
         free(b->bytes); b->len = b->gap = (size_t)base.size; b->gap_len = 0;
         b->bytes = b->len ? malloc(b->len) : NULL;
         if (b->len && !b->bytes) { b->len = b->gap = 0; return JOURNAL_NOMEM; }
@@ -157,10 +190,15 @@ static int restore_record(void *ctx, const journal_record *r)
     if (b->conflict && (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE)) return 0;
     uint64_t off = get64(p);
     if (off > b->len) return JOURNAL_INVALID;
-    if (r->type == JOURNAL_INSERT) return gap_insert(b, (size_t)off, p + 8, r->size - 8);
+    if (r->type == JOURNAL_INSERT) {
+        int rc = gap_insert(b, (size_t)off, p + 8, r->size - 8);
+        if (!rc) op_log(b, JOURNAL_INSERT, off, r->size - 8, p + 8);
+        return rc;
+    }
     if (r->type == JOURNAL_DELETE) {
         uint64_t n = get64(p + 8); if (n > b->len - off) return JOURNAL_INVALID;
-        gap_move(b, (size_t)off); b->gap_len += (size_t)n; b->len -= (size_t)n; return 0;
+        gap_move(b, (size_t)off); b->gap_len += (size_t)n; b->len -= (size_t)n;
+        op_log(b, JOURNAL_DELETE, off, n, NULL); return 0;
     }
     return JOURNAL_INVALID;
 }
@@ -174,6 +212,27 @@ static bool same_bytes(editor_buffer *b, const recovered_buffer *r)
         off += n;
     }
     return true;
+}
+static bool base_id_equal(const editor_base_id *a, const editor_base_id *b)
+{
+    return a->valid && b->valid && a->size == b->size && a->mtime_ns == b->mtime_ns && a->inode == b->inode &&
+        a->device == b->device && a->ctime_ns == b->ctime_ns && a->prefix_crc == b->prefix_crc &&
+        a->prefix_len == b->prefix_len;
+}
+/* Ops were validated against the replayed length when logged; a failing
+ * piece op leaves its own call's content unchanged and the caller then
+ * replaces the whole text. */
+static int apply_ops(piece_tree *tree, const recovered_buffer *r)
+{
+    for (size_t at = 0; at < r->ops_len;) {
+        const uint8_t *p = r->ops + at; uint64_t off, len;
+        memcpy(&off, p + 1, 8); memcpy(&len, p + 9, 8);
+        int rc = p[0] == JOURNAL_INSERT ? piece_insert(tree, off, p + OP_HEADER, (size_t)len) :
+            piece_delete(tree, off, len, NULL);
+        if (rc) return rc;
+        at += OP_HEADER + (p[0] == JOURNAL_INSERT ? (size_t)len : 0u);
+    }
+    return 0;
 }
 static int install_buffer(editor *e, recovered_buffer *r)
 {
@@ -200,8 +259,20 @@ static int install_buffer(editor *e, recovered_buffer *r)
     }
     bool clean = !r->save_pending && same_bytes(b, r);
     undo_clear(&b->undo);
-    rc = piece_delete(b->tree, 0, piece_len(b->tree), NULL);
-    if (!rc) rc = piece_insert(b->tree, 0, r->bytes, r->len);
+    /* edit-f3i: when the opened generation is the journalled BASE, replay
+     * the logged ops onto it, so the tree keeps ORIGINAL spans and its
+     * checkpoints are differences from BASE (edit-28u). Otherwise, or if
+     * an op fails, the whole recovered text replaces the tree as before. */
+    rc = 1;
+    if (r->ops_valid && *r->target && base_id_equal(&b->origin, &r->base_id) &&
+        piece_len(b->tree) == r->base_id.size) {
+        rc = apply_ops(b->tree, r);
+        if (!rc && piece_len(b->tree) != r->len) rc = 1;
+    }
+    if (rc) {
+        rc = piece_delete(b->tree, 0, piece_len(b->tree), NULL);
+        if (!rc) rc = piece_insert(b->tree, 0, r->bytes, r->len);
+    }
     if (rc) return EDITOR_ERR_MEMORY;
     b->revision++; b->saved_lost = !clean; b->lines = piece_line_count(b->tree);
     b->history_count = b->history_cursor = b->history_head = b->saved_cursor = 0;

@@ -53,15 +53,17 @@ static int save_as(editor *e, const char *input)
     file_save_args args = {.path = path, .snap = snapshot, .expect = &baseline, .out_id = &saved,
         .validate = source ? file_source_validate : NULL, .validate_ctx = source};
     rc = snapshot ? file_save_write(&args) : FILE_ERR_NOMEM;
-    if (snapshot) piece_snapshot_release(snapshot);
     journal_base base = {0}; base.path = "";
     if (!rc && e->journal) rc = journal_capture_base(path, &base);
-    if (rc) { savectl_close_begin(replacement); (void)savectl_destroy(replacement); file_source_release(source); return EDITOR_ERR_IO; }
+    if (rc) {
+        if (snapshot) piece_snapshot_release(snapshot);
+        savectl_close_begin(replacement); (void)savectl_destroy(replacement); file_source_release(source); return EDITOR_ERR_IO;
+    }
     (void)savectl_rebase_target(replacement, &saved);
     if (b->save) {
         savectl_close_begin(b->save);
         rc = savectl_destroy(b->save);
-        if (rc) { savectl_close_begin(replacement); (void)savectl_destroy(replacement); file_source_release(source); return EDITOR_ERR_IO; }
+        if (rc) { piece_snapshot_release(snapshot); savectl_close_begin(replacement); (void)savectl_destroy(replacement); file_source_release(source); return EDITOR_ERR_IO; }
     }
     b->save = replacement;
     file_source_release(b->target_source); b->target_source = source;
@@ -74,7 +76,10 @@ static int save_as(editor *e, const char *input)
         saved.size == b->base.size && saved.mtime_ns == b->base.mtime_ns &&
         saved.size == piece_len(b->tree) && (!saved.metadata_valid || saved.ctime_ns == b->base.ctime_ns)) {
         b->saved_text = editor_base_id_of(&b->base); b->saved_text_revision = b->revision;
+        /* edit-f3i: the written snapshot is the saved text's reference. */
+        editor_saved_reference(b, snapshot); snapshot = NULL;
     }
+    if (snapshot) piece_snapshot_release(snapshot);
     const char *title = strrchr(path, '/'); title = title ? title + 1 : path;
     /* (P) retain the tab module's grapheme-safe title capacity. */
     size_t end = 0, length = strlen(title);
