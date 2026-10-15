@@ -135,6 +135,48 @@ static uint64_t compose_time(void)
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
+
+enum { RENDER_SCALARS = 0, RENDER_PROJECTED = 1, RENDER_GLYPHS = 2 };
+
+/* edit-v16: offer an emoji key to the face that resolves its base scalar.
+ * Worker resolver path only; the face validates its GSUB on first use. */
+static void render_try_gsub(font_cache *cache, const uint8_t *bytes, size_t len)
+{
+    for (size_t off = 0; off < len;) {
+        utf8_step step = utf8_decode(bytes + off, len - off);
+        off += step.len;
+        if (!utf8_cell_width(step.cp)) continue;
+        font_t *face = NULL;
+        if (cache->resolve(cache->resolve_ctx, step.cp, &face) != FONT_OK || !face) return;
+        size_t n = 0;
+        if (font_gsub_cluster(face, bytes, len, cache->gsub_glyphs, &n) != FONT_OK) return;
+        cache->gsub_face = face; cache->gsub_count = n;
+        cache->pending_mode = RENDER_GLYPHS;
+        return;
+    }
+}
+
+/* Ligature glyph ids: the first at the pen origin, the rest overlaid (a
+ * zero-advance glyph at the first's advance, as zero-width marks are). */
+static int render_glyphs(font_cache *cache, uint32_t width, uint64_t start, uint32_t work)
+{
+    while (cache->pending_off < cache->gsub_count) {
+        if (work == FONT_COMPOSE_MAX_GLYPHS || (work && compose_time() - start >= 250000u)) return FONT_MORE;
+        work++;
+        font_bitmap b;
+        edit_arena_reset(&cache->scratch);
+        cache->rasterizations++;
+        int rc = font_raster_glyph_id(cache->gsub_face, cache->gsub_glyphs[cache->pending_off],
+                                      &cache->scratch, &b);
+        if (rc != FONT_OK) return rc;
+        int32_t pen = cache->pending_off && b.m.advance == 0 ? cache->pending_advance : 0;
+        if (b.pixels) composite(cache, &b, width, pen);
+        if (!cache->pending_off) cache->pending_advance = b.m.advance;
+        cache->pending_off++;
+        edit_arena_reset(&cache->scratch);
+    }
+    return FONT_OK;
+}
 int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width)
 {
     if (!cache || !cache->family || !bytes || !len || len > FONT_CLUSTER_MAX_BYTES ||
@@ -150,8 +192,21 @@ int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint3
         cache->pending_len = len; cache->pending_width = width;
         cache->pending_off = 0; cache->pending_advance = 0;
         memset(cache->image, 0, (size_t)cache->cell.cell_w * width * cache->cell.cell_h);
+        cache->pending_mode = RENDER_SCALARS;
+        cache->pending_art = (utf8_artwork_state){0, 0};
+        cache->gsub_count = 0; cache->gsub_face = NULL;
+        if (utf8_cluster_emoji(bytes, len)) {
+            cache->pending_mode = RENDER_PROJECTED;
+            if (cache->resolve) render_try_gsub(cache, bytes, len);
+        }
     }
     uint64_t start = compose_time(); uint32_t work = 0;
+    if (cache->pending_mode == RENDER_GLYPHS) {
+        int rc = render_glyphs(cache, width, start, work);
+        if (rc == FONT_OK || rc == FONT_MORE || cache->pending_off) return rc;
+        /* The first ligature glyph cannot be drawn: keep the r8e projection. */
+        cache->pending_mode = RENDER_PROJECTED;
+    }
     while (cache->pending_off < len) {
         if (work == FONT_COMPOSE_MAX_GLYPHS || (work && compose_time() - start >= 250000u)) return FONT_MORE;
         utf8_step step = utf8_decode(cache->pending_key + cache->pending_off, len - cache->pending_off);
@@ -159,6 +214,18 @@ int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint3
          * too, so an invisible-only sequence also has a bounded continuation. */
         if (!font_cluster_ignorable(step.cp) && work &&
             work + cache->family->count > FONT_COMPOSE_MAX_GLYPHS) return FONT_MORE;
+        if (cache->pending_mode == RENDER_PROJECTED) {
+            /* edit-r8e projection, committed only when this scalar is consumed. */
+            utf8_artwork_state art = cache->pending_art;
+            int keep = utf8_artwork_step(&art, step.cp);
+            if (keep < 0) { cache->pending_art = art; cache->pending_off = len; break; }
+            cache->pending_art = art; /* a failed raster below abandons the key */
+            if (!keep) {
+                work++;
+                cache->pending_off += step.len;
+                continue;
+            }
+        }
         work += font_cluster_ignorable(step.cp) ? 1u : cache->family->count;
         if (font_cluster_ignorable(step.cp)) { cache->pending_off += step.len; continue; }
         font_bitmap b;

@@ -460,21 +460,45 @@ int utf8_cluster_width(const uint8_t *p, size_t n)
     return w;
 }
 
+int utf8_emoji_class(uint32_t cp)
+{
+    enum gcb g = gcb_of(cp);
+    return g == G_PICT ? UTF8_EMOJI_PICT : g == G_RI ? UTF8_EMOJI_RI : 0;
+}
+
+int utf8_artwork_step(utf8_artwork_state *st, uint32_t cp)
+{
+    if (!st->base && utf8_cell_width(cp)) {
+        st->base = 1; st->pict = gcb_of(cp) == G_PICT;
+    }
+    /* Without shaping a joined emoji is represented by its first
+     * emoji. Segmentation/width still use the complete grapheme. */
+    if (st->pict && cp == 0x200du) return -1;
+    if (cp == 0x200du || cp == 0xfe0eu || cp == 0xfe0fu || (cp >= 0x1f3fbu && cp <= 0x1f3ffu))
+        return 0;
+    return 1;
+}
+
+int utf8_cluster_emoji(const uint8_t *p, size_t len)
+{
+    for (size_t off = 0; off < len;) {
+        utf8_step step = utf8_decode(p + off, len - off);
+        if (step.valid && utf8_cell_width(step.cp)) return utf8_emoji_class(step.cp);
+        off += step.len;
+    }
+    return 0;
+}
+
 size_t utf8_cluster_artwork(const uint8_t *p, size_t len, uint8_t *out)
 {
     size_t written = 0;
-    int base = 0, pict = 0;
+    utf8_artwork_state st = {0, 0};
     for (size_t off = 0; off < len;) {
         utf8_step step = utf8_decode(p + off, len - off);
         if (step.valid) {
-            if (!base && utf8_cell_width(step.cp)) {
-                base = 1; pict = gcb_of(step.cp) == G_PICT;
-            }
-            /* Without shaping a joined emoji is represented by its first
-             * emoji. Segmentation/width still use the complete grapheme. */
-            if (pict && step.cp == 0x200du) break;
-            if (step.cp == 0x200du || step.cp == 0xfe0eu || step.cp == 0xfe0fu ||
-                (step.cp >= 0x1f3fbu && step.cp <= 0x1f3ffu)) {
+            int keep = utf8_artwork_step(&st, step.cp);
+            if (keep < 0) break;
+            if (!keep) {
                 off += step.len;
                 continue;
             }

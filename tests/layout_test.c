@@ -123,25 +123,30 @@ static int artwork_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t w
     return FONT_OK;
 }
 
-/* (G) Unshaped emoji use one grapheme's cells and the first emoji's artwork.
- * A deterministic covering callback avoids relying on installed colour fonts.
- * Invisible presentation scalars must never reach this callback, even alone. */
+/* (G) Emoji use one grapheme's cells. edit-v16: an emoji cluster (first
+ * nonzero-width scalar Extended_Pictographic or Regional_Indicator) reaches
+ * the glyph callback whole, so the font can pick a GSUB ligature or draw the
+ * first emoji (the r8e projection, now applied in font_cache_render). Other
+ * clusters keep the projected key; invisible presentation scalars alone
+ * never reach this callback. A deterministic covering callback avoids
+ * relying on installed fonts. */
 static void test_emoji_artwork(void)
 {
     static const struct { const char *text, *artwork, *row; uint32_t width; } cases[] = {
-        {"👩‍💻x", "👩", "@_x", 2},
-        {"👩🏻‍💻x", "👩", "@_x", 2},
-        {"👩🏼‍💻x", "👩", "@_x", 2},
-        {"👩🏽‍💻x", "👩", "@_x", 2},
-        {"👩🏾‍💻x", "👩", "@_x", 2},
-        {"👩🏿‍💻x", "👩", "@_x", 2},
-        {"👩‍💻‍😀x", "👩", "@_x", 2},
+        {"👩‍💻x", "👩‍💻", "@_x", 2},
+        {"👩🏻‍💻x", "👩🏻‍💻", "@_x", 2},
+        {"👩🏼‍💻x", "👩🏼‍💻", "@_x", 2},
+        {"👩🏽‍💻x", "👩🏽‍💻", "@_x", 2},
+        {"👩🏾‍💻x", "👩🏾‍💻", "@_x", 2},
+        {"👩🏿‍💻x", "👩🏿‍💻", "@_x", 2},
+        {"👩‍💻‍😀x", "👩‍💻‍😀", "@_x", 2},
         {"😀x", "😀", "@_x", 2},
-        {"😀︎x", "😀", "@_x", 2},
-        {"😀️x", "😀", "@_x", 2},
-        {"❤︎x", "❤", "@x", 1},
-        {"❤️x", "❤", "@_x", 2},
-        {"❤‍🔥x", "❤", "@_x", 2},
+        {"😀︎x", "😀︎", "@_x", 2},
+        {"😀️x", "😀️", "@_x", 2},
+        {"❤︎x", "❤︎", "@x", 1},
+        {"❤️x", "❤️", "@_x", 2},
+        {"❤‍🔥x", "❤‍🔥", "@_x", 2},
+        {"🇦🇺x", "🇦🇺", "@_x", 2},
         {"e️́x", "é", "@x", 1}, /* retain ordinary combining ink */
         {"क्‍कx", "क्क", "@x", 1}, /* ZWJ is not an emoji base */
         {"‍x", "", "x", 0},
@@ -201,32 +206,41 @@ static int deferred_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t 
 }
 static void test_emoji_saved_artwork(void)
 {
-    const char *base = "👩", *mark = "́", *tail = "️🏽‍💻x";
-    size_t marks = UTF8_GRAPHEME_BUDGET / strlen(mark) + 1u;
-    size_t prefix = strlen(base) + marks * strlen(mark);
-    char *text = malloc(prefix + strlen(tail) + 1u), *artwork = malloc(prefix + 1u);
-    CHECK(text && artwork);
-    if (!text || !artwork) { free(text); free(artwork); return; }
-    memcpy(text, base, strlen(base));
-    for (size_t i = 0; i < marks; i++) memcpy(text + strlen(base) + i * strlen(mark), mark, strlen(mark));
-    memcpy(artwork, text, prefix); artwork[prefix] = 0;
-    memcpy(text + prefix, tail, strlen(tail) + 1u);
-    for (unsigned wrapping = 0; wrapping < 2; wrapping++) {
-        deferred_artwork request = {{artwork, 2, '@' - ' ', 0}, true};
-        layout_config cfg = nogutter(); cfg.glyph = deferred_glyph; cfg.glyph_ctx = &request; cfg.slice_clusters = 1;
-        fx f; fx_make(&f, 2u + 1u, 1u + 1u, cfg, text, strlen(text));
-        edit_arena arena; CHECK(edit_arena_init(&arena, 2u * f.g.dims.rows * sizeof(layout_wrap_row)) == 0);
-        CHECK(layout_wrap_init(&f.l, &arena) == LAYOUT_DONE);
-        CHECK(layout_set_wrap(&f.l, wrapping != 0) == LAYOUT_DONE);
-        if (edit_malloc_guard_active()) edit_malloc_guard_begin();
-        show(&f, 0, 0);
-        if (edit_malloc_guard_active()) CHECK(edit_malloc_guard_end() == 0);
-        ROW_IS(&f, 0, 0, "@_x");
-        CHECK(request.request.calls == 2u); /* one deferred request, then its retry */
-        CHECK(f.l.pos == strlen(text));
-        fx_free(&f); edit_arena_free(&arena);
+    /* edit-v16: an emoji base passes the whole saved cluster (minus the
+     * final x); a non-emoji base is still filtered in place (tail scalars
+     * omitted, no ZWJ stop), so both saved-buffer paths stay covered. */
+    static const char *bases[] = {"👩", "e"}, *tails[] = {"️🏽‍💻x", "️🏽‍x"};
+    const char *mark = "́";
+    for (size_t which = 0; which < 2; which++) {
+        const char *base = bases[which], *tail = tails[which];
+        size_t marks = UTF8_GRAPHEME_BUDGET / strlen(mark) + 1u;
+        size_t prefix = strlen(base) + marks * strlen(mark);
+        size_t total = prefix + strlen(tail);
+        char *text = malloc(total + 1u), *artwork = malloc(total + 1u);
+        CHECK(text && artwork);
+        if (!text || !artwork) { free(text); free(artwork); return; }
+        memcpy(text, base, strlen(base));
+        for (size_t i = 0; i < marks; i++) memcpy(text + strlen(base) + i * strlen(mark), mark, strlen(mark));
+        memcpy(text + prefix, tail, strlen(tail) + 1u);
+        if (which == 0) { memcpy(artwork, text, total - 1u); artwork[total - 1u] = 0; }
+        else { memcpy(artwork, text, prefix); artwork[prefix] = 0; }
+        for (unsigned wrapping = 0; wrapping < 2; wrapping++) {
+            deferred_artwork request = {{artwork, which ? 1u : 2u, '@' - ' ', 0}, true};
+            layout_config cfg = nogutter(); cfg.glyph = deferred_glyph; cfg.glyph_ctx = &request; cfg.slice_clusters = 1;
+            fx f; fx_make(&f, 2u + 1u, 1u + 1u, cfg, text, strlen(text));
+            edit_arena arena; CHECK(edit_arena_init(&arena, 2u * f.g.dims.rows * sizeof(layout_wrap_row)) == 0);
+            CHECK(layout_wrap_init(&f.l, &arena) == LAYOUT_DONE);
+            CHECK(layout_set_wrap(&f.l, wrapping != 0) == LAYOUT_DONE);
+            if (edit_malloc_guard_active()) edit_malloc_guard_begin();
+            show(&f, 0, 0);
+            if (edit_malloc_guard_active()) CHECK(edit_malloc_guard_end() == 0);
+            ROW_IS(&f, 0, 0, which ? "@x" : "@_x");
+            CHECK(request.request.calls == 2u); /* one deferred request, then its retry */
+            CHECK(f.l.pos == strlen(text));
+            fx_free(&f); edit_arena_free(&arena);
+        }
+        free(text); free(artwork);
     }
-    free(text); free(artwork);
 }
 
 static void test_basic(void)

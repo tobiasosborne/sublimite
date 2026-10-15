@@ -264,10 +264,17 @@ static int shape_ok(const font_t *f, uint32_t g, int depth, int *budget, int *po
     return 1;
 }
 
+static int glyph_checked(const font_t *f, uint32_t id, int *g);
 static int glyph_of(const font_t *f, uint32_t cp, int *g)
 {
     if (!cp_valid(cp)) return FONT_ERR_MISSING;
-    uint32_t id = cmap_lookup(f, cp);
+    return glyph_checked(f, cmap_lookup(f, cp), g);
+}
+
+/* edit-v16: a glyph id (cmap or GSUB output) gets the same proof as a mapped
+ * codepoint before stb reads its outline box. */
+static int glyph_checked(const font_t *f, uint32_t id, int *g)
+{
     if (id == 0) return FONT_ERR_MISSING;
     if (id >= f->num_glyphs) return FONT_ERR_MISSING;
     if (f->glyf_len) {                  /* TrueType outlines: stb reads a 10-byte header for the box */
@@ -633,6 +640,15 @@ int font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t in
     f->glyf_len = (uint32_t)glyf_n;
     f->num_glyphs = ng;
     f->bake_identity = (uint32_t)font_identity_matches(ttf, len, index);
+    /* edit-v16: record the GSUB extent only; validation is deferred to the
+     * first emoji cluster on a worker (font_gsub_cluster). */
+    uint64_t gsub = 0, gsub_n = 0;
+    if (find_table(ttf, len, base, "GSUB", &gsub, &gsub_n) && gsub_n <= UINT32_MAX) {
+        f->gsub.table = ttf + gsub;
+        f->gsub.len = (uint32_t)gsub_n;
+    } else {
+        f->gsub.state = FONT_GSUB_NONE;
+    }
     return FONT_OK;
 }
 
@@ -730,15 +746,16 @@ int font_glyph_ui_metrics(const font_t *f, uint32_t cp, font_metric *out)
     return FONT_OK;
 }
 
-static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int ui)
+/* by_id: cp is a glyph id (worker path only, never with ui). */
+static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int ui, int by_id)
 {
     int g = 0;
-    if (!f || !arena || !out || !f->data || f->px == 0) return FONT_ERR_ARG;
+    if (!f || !arena || !out || !f->data || f->px == 0 || (ui && by_id)) return FONT_ERR_ARG;
     out->pixels = NULL;
     out->w = 0;
     out->h = 0;
     memset(&out->m, 0, sizeof out->m);
-    int r = glyph_of(f, cp, &g);
+    int r = by_id ? glyph_checked(f, cp, &g) : glyph_of(f, cp, &g);
     if (r != FONT_OK) return r;
     if (f->glyf_len && !ui) { /* UI admission below performs the bounded proof. */
         int budget = FONT_COMPOSITE_BUDGET;
@@ -819,11 +836,21 @@ static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *
 
 int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
 {
-    return raster_glyph(f, cp, arena, out, 0);
+    return raster_glyph(f, cp, arena, out, 0, 0);
 }
 int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
 {
-    return raster_glyph(f, cp, arena, out, 1);
+    return raster_glyph(f, cp, arena, out, 1, 0);
+}
+int font_raster_glyph_id(font_t *f, uint32_t gid, edit_arena *arena, font_bitmap *out)
+{
+    return raster_glyph(f, gid, arena, out, 0, 1);
+}
+uint32_t font_glyph_id(const font_t *f, uint32_t cp)
+{
+    if (!f || !f->data || !cp_valid(cp)) return 0;
+    uint32_t id = cmap_lookup(f, cp);
+    return id < f->num_glyphs ? id : 0;
 }
 
 int font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,

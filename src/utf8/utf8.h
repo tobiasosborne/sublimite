@@ -204,6 +204,20 @@ int utf8_cluster_width(const uint8_t *p, size_t n);
  * len, no allocation: UI callers must bound len by their existing scratch. */
 size_t utf8_cluster_artwork(const uint8_t *p, size_t len, uint8_t *out);
 
+/* edit-v16: the projection above as a scalar step, for consumers that walk
+ * a cluster themselves (the font's fallback path). Zero-initialise st per
+ * cluster; feed valid scalars in order. Returns 1 keep, 0 omit, -1 stop
+ * (this scalar and the rest of the cluster are omitted). */
+typedef struct utf8_artwork_state { uint8_t base, pict; } utf8_artwork_state;
+int utf8_artwork_step(utf8_artwork_state *st, uint32_t cp);
+/* edit-v16: UAX #29 emoji properties used by segmentation. */
+enum { UTF8_EMOJI_PICT = 1, UTF8_EMOJI_RI = 2 };
+int utf8_emoji_class(uint32_t cp);   /* PICT, RI or 0 */
+/* Emoji class of the cluster's first nonzero-width scalar (0 if none, or not
+ * an emoji). Such clusters reach the glyph lookup whole (layout.h), so the
+ * font can try a GSUB ligature before applying utf8_artwork_step itself. */
+int utf8_cluster_emoji(const uint8_t *p, size_t len);
+
 /* ---- Budgeted cluster + width (P1.1e) ----
  * utf8_cluster / utf8_cluster_width are unbounded (they run utf8_grapheme_next
  * and then a linear width scan), so layout on a 0.5 ms slice uses this: the

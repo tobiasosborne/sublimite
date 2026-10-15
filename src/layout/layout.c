@@ -319,6 +319,10 @@ int layout_cluster_glyph(layout *l, const uint8_t *bytes, size_t len, uint32_t w
      * cluster. Reuse it even when bytes already points at that scratch. The
      * original length/width remain with the caller for replay and cell layout. */
     if (len > LAYOUT_WIN) return FONT_ERR_NOMEM;
+    /* edit-v16: an emoji cluster reaches the font whole; the font tries the
+     * face's GSUB ligature and otherwise draws this same projection. */
+    if (utf8_cluster_emoji(bytes, len))
+        return l->cfg.glyph ? l->cfg.glyph(l->cfg.glyph_ctx, bytes, len, width, slot) : FONT_ERR_MISSING;
     size_t artwork = utf8_cluster_artwork(bytes, len, l->cluster_bytes);
     if (!artwork) { *slot = RENDER_NO_SLOT; return FONT_OK; }
     uint8_t first = l->cluster_bytes[0];

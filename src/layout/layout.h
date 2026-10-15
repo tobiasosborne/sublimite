@@ -57,9 +57,11 @@ enum {
 #define LAYOUT_LINE_UNKNOWN UINT64_MAX
 #define LAYOUT_VOID_ROW UINT64_MAX
 
-/* Map a cluster's unshaped artwork key (utf8_cluster_artwork; display width
- * 1 or 2 from the complete source cluster) to a grid.glyphs slot, or
- * RENDER_NO_SLOT for a blank cell. Return 0 on success, nonzero to get '?'. */
+/* Map a cluster's artwork key (display width 1 or 2 from the complete source
+ * cluster) to a grid.glyphs slot, or RENDER_NO_SLOT for a blank cell. The key
+ * is utf8_cluster_artwork's projection, except that an emoji cluster
+ * (utf8_cluster_emoji) is passed whole so the font can select a GSUB
+ * ligature (edit-v16). Return 0 on success, nonzero to get '?'. */
 typedef int (*layout_glyph_fn)(void *ctx, const uint8_t *cluster, size_t len,
                                uint32_t width, uint32_t *slot);
 /* Optional viewport decorations, before cursor/selection colours. UI-owned

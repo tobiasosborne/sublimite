@@ -10,6 +10,8 @@
 #include "base/base.h"
 #include "work/work.h"
 #include "render/render.h"
+#include "font/gsub.h"
+#include "utf8/utf8.h"
 
 #define FONT_ATLAS_PAGE_DIM   1024u
 #define FONT_ATLAS_MAX_PAGES  8u
@@ -59,6 +61,7 @@ typedef struct font {
     float    scale;
     font_cell cell;
     const font_ascii_atlas *atlas; /* baked atlas matching this font at px, or NULL */
+    font_gsub gsub;       /* edit-v16: GSUB extent at init, validated lazily on a worker */
 } font_t;
 
 typedef struct font_bitmap {
@@ -109,6 +112,13 @@ int font_glyph_ui_metrics(const font_t *f, uint32_t cp, font_metric *out);
  * Scratch is rolled back on refusal; only this bounded raster API is UI-safe. */
 int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out);
 int  font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out);
+/* edit-v16: glyph id of cp in the face's cmap (0 when absent or invalid). */
+uint32_t font_glyph_id(const font_t *f, uint32_t cp);
+/* edit-v16, worker only: rasterise a glyph id (a GSUB ligature has no
+ * codepoint). Same contract as font_raster_glyph; gid 0 or >= numGlyphs is
+ * FONT_ERR_MISSING. A variable font renders at its default instance: stb
+ * ignores fvar/gvar. */
+int  font_raster_glyph_id(font_t *f, uint32_t gid, edit_arena *arena, font_bitmap *out);
 /* Composites a bitmap into a cell_w x cell_h R8 cell (caller zeroes it). */
 int  font_place_in_cell(const font_t *f, const font_bitmap *b, uint8_t *cell,
                         uint32_t cell_w, uint32_t cell_h);
@@ -227,9 +237,23 @@ typedef struct font_cache {
      * general rasterisation; never call this cache on the UI thread. */
     int (*resolve)(void *ctx, uint32_t cp, font_t **face);
     void *resolve_ctx;
+    /* edit-v16 pending composition of an emoji cluster: mode SCALARS (key as
+     * given), PROJECTED (utf8_artwork_step filter, the r8e fallback) or
+     * GLYPHS (gsub_glyphs of gsub_face; pending_off counts glyphs). */
+    uint8_t pending_mode;
+    utf8_artwork_state pending_art;
+    uint16_t gsub_glyphs[FONT_GSUB_MAX_GLYPHS];
+    size_t gsub_count;
+    font_t *gsub_face;
 } font_cache;
 /* Compose into cache->image without admitting a key or atlas rectangle.
- * Worker-owned scratch; FONT_MORE resumes the exact key. */
+ * Worker-owned scratch; FONT_MORE resumes the exact key. edit-v16: a key
+ * whose first nonzero-width scalar is Extended_Pictographic or a Regional
+ * Indicator is first offered to the resolved face's GSUB (resolver path
+ * only: worker); one or more ligature glyph ids are painted (the first, the
+ * rest overlaid). Otherwise it is composed through the edit-r8e projection
+ * (utf8_artwork_step), so a whole emoji cluster renders as its first emoji.
+ * Every other key composes exactly as before. */
 int font_cache_render(font_cache *cache, const uint8_t *bytes, size_t len, uint32_t width);
 /* INIT only: reserve all pages, exact keys, glyphs, cell image and scratch.
  * Append-only cache, no eviction: rectangles remain immutable through T5.
@@ -247,8 +271,10 @@ int font_cache_bind(font_cache *cache, render_grid *grid);
  * key plus width identifies a precomposed image. Invalid bytes return ARG;
  * layout draws one inverse '?' per invalid byte without calling this API.
  * Zero-width marks merge at the base pen, all faces use the primary baseline.
- * Scalar outlines are overlaid, not shaped. Layout projects ZWJ emoji and
- * invisible presentation modifiers with utf8_cluster_artwork before lookup.
+ * Scalar outlines are overlaid, not shaped. Layout projects non-emoji
+ * clusters with utf8_cluster_artwork before lookup and hands emoji clusters
+ * over whole (edit-v16): font_cache_render tries a GSUB ligature, else
+ * applies the same projection, so the image matches the projected key.
  * Cold composition performs at most FONT_COMPOSE_MAX_GLYPHS raster calls and
  * checks a 250 us cooperative deadline between scalars. FONT_MORE leaves slot
  * unchanged: retry the exact key after checking input. One pending image per

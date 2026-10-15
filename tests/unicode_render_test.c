@@ -102,10 +102,15 @@ static int same_bitmap(const render_grid *g, uint32_t a, uint32_t b)
 static int emoji_fallback(bool inject, bool wrapping)
 {
     static const char text[] = "\n👩‍💻x\n😀x\n😀‍💻x\n😀︎x\n😀️x\n😀🏻x\n😀🏼x\n😀🏽x\n😀🏾x\n😀🏿x\n‍︎️🏻🏼🏽🏾🏿x\n\xcd\xb8x";
-    static const struct { const char *base; uint32_t width; } expected[] = {
-        {"👩", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2},
-        {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2}, {"😀", 2},
-        {"", 0}, {"\xcd\xb8", 1}, /* U+0378: no covering face in the test environment */
+    /* edit-v16: key is the whole emoji cluster layout now requests; only
+     * 👩‍💻 is an RGI ligature, so every other row must still draw exactly
+     * its first emoji (the r8e projection inside font_cache_render). */
+    static const struct { const char *key, *base; uint32_t width; bool ligature; } expected[] = {
+        {"👩‍💻", "👩", 2, true}, {"😀", "😀", 2, false}, {"😀‍💻", "😀", 2, false},
+        {"😀︎", "😀", 2, false}, {"😀️", "😀", 2, false},
+        {"😀🏻", "😀", 2, false}, {"😀🏼", "😀", 2, false}, {"😀🏽", "😀", 2, false},
+        {"😀🏾", "😀", 2, false}, {"😀🏿", "😀", 2, false},
+        {"", "", 0, false}, {"\xcd\xb8", "\xcd\xb8", 1, false}, /* U+0378: no covering face in the test environment */
     };
     glyph_gate gate = {0};
     render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
@@ -153,17 +158,31 @@ static int emoji_fallback(bool inject, bool wrapping)
         uint32_t row = e->tab_rows + 1u + (uint32_t)i;
         const render_cell *cell = &g->cells[(size_t)row * g->dims.cols + col];
         if (expected[i].width) {
-            uint32_t base;
+            uint32_t base, key;
             T(editor_font_glyph(e, (const uint8_t *)expected[i].base, strlen(expected[i].base), expected[i].width, &base) == FONT_OK);
             T(settle(e) == 0);
-            /* Exact same key/slot as the first scalar: no request for the
-             * joined laptop, selector or skin modifier can replace its ink. */
-            if (cell->atlas_slot != base)
-                fprintf(stderr, "emoji input=%u wrap=%u item=%zu row=%u col=%u slot=%u base=%u byte=%llu\n",
-                    inject, wrapping, i, row, col, cell->atlas_slot, base,
+            T(editor_font_glyph(e, (const uint8_t *)expected[i].key, strlen(expected[i].key), expected[i].width, &key) == FONT_OK);
+            T(settle(e) == 0);
+            /* The cell holds the whole cluster's image. Without a ligature it
+             * is exactly the first emoji's ink: no joined laptop, selector or
+             * skin modifier can overlay or replace it. */
+            if (cell->atlas_slot != key)
+                fprintf(stderr, "emoji input=%u wrap=%u item=%zu row=%u col=%u slot=%u key=%u byte=%llu\n",
+                    inject, wrapping, i, row, col, cell->atlas_slot, key,
                     (unsigned long long)e->row_byte[row - e->tab_rows]);
-            T(cell->atlas_slot == base);
+            T(cell->atlas_slot == key);
             T(bitmap(g, cell) == 0);
+            if (!expected[i].ligature) T(same_bitmap(g, cell->atlas_slot, base) == 0);
+            else if (!inject && !wrapping) {
+                /* Informational: depends on the installed emoji face. */
+                const render_glyph *l = &g->glyphs[cell->atlas_slot], *r = &g->glyphs[base];
+                bool same = l->w == r->w && l->h == r->h;
+                for (uint32_t y = 0; same && y < l->h; y++)
+                    same = !memcmp(g->pages[l->page].pixels + (size_t)(l->y + y) * g->pages[l->page].stride + l->x,
+                                   g->pages[r->page].pixels + (size_t)(r->y + y) * g->pages[r->page].stride + r->x, l->w);
+                printf("unicode_render_test: %s drawn as %s\n", expected[i].key,
+                       same ? "its first emoji (no GSUB ligature in the resolved face)" : "a distinct ligature image");
+            }
             if (expected[i].width == 2) {
                 T(cell->attrs & RENDER_ATTR_WIDE_LEFT);
                 T(g->cells[(size_t)row * g->dims.cols + col + 1u].attrs & RENDER_ATTR_WIDE_RIGHT);
