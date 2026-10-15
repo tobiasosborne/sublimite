@@ -139,15 +139,47 @@ static int runtime_test(void)
     T(config_runtime_error(r).code == CONFIG_OK && config_runtime_current(r)->theme == CONFIG_DARK);
     T(config_runtime_current(r)->wrap_set && !config_runtime_current(r)->wrap);
     T(config_runtime_generation(r) == generation + 1u); /* (P) one valid replacement publication */
+    T(write_config(path, "whitespace.trailing='all'\n") == 0);
+    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(config_runtime_current(r)->trailing == CONFIG_TRAILING_ALL);
+    T(config_runtime_error(r).code == CONFIG_OK);
+    T(write_config(path, "theme='light'\nwhitespace.trailing='invalid'\n") == 0);
+    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(config_runtime_error(r).code == CONFIG_ERR_VALUE);
+    T(config_runtime_current(r)->trailing == CONFIG_TRAILING_NONE);
+    T(config_runtime_current(r)->theme == CONFIG_LIGHT);
     T(unlink(path) == 0); T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
     T(!config_runtime_current(r)->wrap_set); /* absent file restores defaults */
+    T(!config_runtime_current(r)->trailing_warning && config_runtime_error(r).code == CONFIG_OK);
     config_runtime_close(r);
     T(snprintf(path, sizeof path, "%s/sublimite", root) > 0); T(rmdir(path) == 0); T(rmdir(root) == 0);
     puts("config_test: absent file, inotify create/rename/delete, invalid reload and shared watch lifetime passed");
     return 0;
 }
+static int trailing_test(void)
+{
+    /* (P) Cases enumerate the bead's supported spellings, an unknown value,
+     * and a wrong TOML type. Zero denotes absence, one removes the NUL. */
+    const struct { const char *source; config_trailing mode; bool warning; } cases[] = {
+        {"", CONFIG_TRAILING_NONE, false},
+        {"whitespace.trailing='none'", CONFIG_TRAILING_NONE, false},
+        {"whitespace.trailing='all'", CONFIG_TRAILING_ALL, false},
+        {"[whitespace]\ntrailing='selection'", CONFIG_TRAILING_SELECTION, false},
+        {"whitespace.trailing='invalid'", CONFIG_TRAILING_NONE, true},
+        {"whitespace.trailing=true", CONFIG_TRAILING_NONE, true}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        config_settings settings; config_defaults(&settings); config_error error;
+        T(settings.trailing == CONFIG_TRAILING_NONE && !settings.trailing_warning);
+        T(config_parse((const uint8_t *)cases[i].source, strlen(cases[i].source), &settings, &error) == CONFIG_OK);
+        T(settings.trailing == cases[i].mode && settings.trailing_warning == cases[i].warning);
+    }
+    puts("config_test: trailing whitespace defaults, values and invalid fallback passed");
+    return 0;
+}
 int main(void)
 {
+    T(trailing_test() == 0);
     T(parser_test() == 0);
     const char source[] = "theme = 'light'\nwrap = true\ntabs = 8\n"
         "[font]\nsize = 12.5\nfamily = \"DejaVu Sans Mono\"\nfile='vendor/DejaVuSansMono.ttf#0'\n"

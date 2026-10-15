@@ -179,19 +179,25 @@ static int queued_groups(bool raster)
 }
 static const render_cell *cell(editor *e, uint32_t row, uint32_t col)
 { const render_grid *g = editor_grid(e); return &g->cells[(size_t)row * g->dims.cols + col]; }
+static int decorated_editor(editor **e, render_backend *b, bool raster, const char *text)
+{
+    T(new_editor(e, b, raster, text) == 0);
+    (*e)->preferences.trailing = CONFIG_TRAILING_ALL; /* explicit marker fixture */
+    T(editor_full_layout(*e) == 0); return settle(*e);
+}
 static int decorations(bool raster)
 {
-    editor *e = NULL; render_backend b = {0}; T(new_editor(&e, &b, raster, "(x)  ") == 0);
+    editor *e = NULL; render_backend b = {0}; T(decorated_editor(&e, &b, raster, "(x)  ") == 0);
     T(cell(e, 1, 4)->attrs & RENDER_ATTR_UNDERLINE);
     T(cell(e, 1, 5)->bg == 0x493038);
     editor_close(e); memset(&b, 0, sizeof b);
-    T(new_editor(&e, &b, raster, "x\t\n") == 0);
+    T(decorated_editor(&e, &b, raster, "x\t\n") == 0);
     T(editor_set_cursor(e, 1) == 0); T(settle(e) == 0);
     T(cell(e, 1, 3)->attrs & RENDER_ATTR_CURSOR);
     T(cell(e, 1, 4)->bg == 0x493038); /* remaining cells of the cursor tab still paint */
     T(cell(e, 1, 5)->attrs & RENDER_ATTR_UNDERLINE);
     editor_close(e); memset(&b, 0, sizeof b);
-    T(new_editor(&e, &b, raster, "(x)  \nabc\n") == 0);
+    T(decorated_editor(&e, &b, raster, "(x)  \nabc\n") == 0);
     T(cell(e, 1, 2)->attrs & RENDER_ATTR_UNDERLINE); T(cell(e, 1, 4)->attrs & RENDER_ATTR_UNDERLINE);
     T(cell(e, 1, 5)->bg == 0x493038); T(cell(e, 1, 6)->bg == 0x493038);
     T(editor_set_cursor(e, 7) == 0); T(settle(e) == 0); /* start abc: old bracket decorations vanish */

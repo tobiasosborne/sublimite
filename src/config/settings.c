@@ -70,6 +70,13 @@ static int setting(void *ctx, const char *path, const config_value *v)
         if (!strcmp(v->string, "dark")) s->theme = CONFIG_DARK;
         else if (!strcmp(v->string, "light")) s->theme = CONFIG_LIGHT;
         else return CONFIG_ERR_VALUE;
+    } else if (!strcmp(path, "whitespace.trailing")) {
+        if (v->type == CONFIG_STRING && !strcmp(v->string, "all")) s->trailing = CONFIG_TRAILING_ALL;
+        else if (v->type == CONFIG_STRING && !strcmp(v->string, "selection")) s->trailing = CONFIG_TRAILING_SELECTION;
+        else {
+            s->trailing = CONFIG_TRAILING_NONE;
+            s->trailing_warning = v->type != CONFIG_STRING || strcmp(v->string, "none") != 0;
+        }
     } else if (!strcmp(path, "wrap")) {
         if (v->type != CONFIG_BOOLEAN) return CONFIG_ERR_VALUE;
         s->wrap_set = true; s->wrap = v->boolean;

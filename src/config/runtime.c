@@ -103,6 +103,9 @@ static void receive(const work_msg *msg, void *ctx)
         if (r->generation == UINT64_MAX) { r->error.code = CONFIG_ERR_LIMIT; return; }
         r->current = r->staged; r->generation++;
     }
+    /* Accepted field fallback uses the existing diagnostic without blocking
+     * publication of none or the other valid settings in this generation. */
+    if (!r->error.code && r->staged.trailing_warning) r->error.code = CONFIG_ERR_VALUE;
 }
 static void request(config_runtime *r)
 {

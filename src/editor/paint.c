@@ -17,6 +17,9 @@ static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t
     if (byte == e->bracket_source || byte == e->bracket_mate) {
         *bg = config_theme_color(e->preferences.theme, "bracket.background"); *attrs |= RENDER_ATTR_UNDERLINE;
     }
+    /* (P) The byte before a nonzero caret is cursor minus one. A trailing
+     * tab shares its source byte across its expanded cells. */
+    if (!e->ws_count || (e->v.state.selection.cursor && byte == e->v.state.selection.cursor - 1u)) return;
     size_t lo = 0, hi = e->ws_count;
     while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (e->ws_ranges[mid].hi <= byte) lo = mid + 1; else hi = mid; }
     if (lo < e->ws_count && e->ws_ranges[lo].lo <= byte) {
@@ -82,10 +85,26 @@ int editor_paint_prepare(editor *e)
         if (byte_visible(e, source) && byte_visible(e, e->bracket_mate)) e->bracket_source = source;
         else e->bracket_mate = INDENT_NONE;
     }
-    size_t count = 0;
-    rc = indent_trailing_ws_ranges(e->tree, lo, hi, e->ws_ranges, e->max_rows, &count);
-    if (rc != INDENT_OK && rc != INDENT_ERR_CAPACITY) return EDITOR_ERR_ARG;
-    e->ws_count = count < e->max_rows ? count : e->max_rows;
+    if (e->preferences.trailing != CONFIG_TRAILING_NONE) {
+        size_t count = 0;
+        rc = indent_trailing_ws_ranges(e->tree, lo, hi, e->ws_ranges, e->max_rows, &count);
+        if (rc != INDENT_OK && rc != INDENT_ERR_CAPACITY) return EDITOR_ERR_ARG;
+        if (count > e->max_rows) count = e->max_rows;
+        view_selection selection = e->v.state.selection;
+        uint64_t sel_lo = selection.cursor < selection.anchor ? selection.cursor : selection.anchor;
+        uint64_t sel_hi = selection.cursor > selection.anchor ? selection.cursor : selection.anchor;
+        for (size_t i = 0; i < count; i++) {
+            indent_range range = e->ws_ranges[i];
+            /* Keep an unfinished typing run plain until the caret leaves its
+             * end. Other completed lines keep their decorations. */
+            if (range.hi == selection.cursor) continue;
+            if (e->preferences.trailing == CONFIG_TRAILING_SELECTION) {
+                if (range.lo < sel_lo) range.lo = sel_lo;
+                if (range.hi > sel_hi) range.hi = sel_hi;
+            }
+            if (range.lo < range.hi) e->ws_ranges[e->ws_count++] = range;
+        }
+    }
     /* The existing decoration relayout writes the gutter too: choose its
      * theme colour once, with no extra row pass or allocation. Publication
      * already requests full layout before this frame reaches submit. */

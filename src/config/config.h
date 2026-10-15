@@ -5,12 +5,13 @@
 
 /* (P) PATH_MAX on the supported Linux target; keys/families share this
  * decoded text bound. Entry/array limits derive from all actions plus the
- * scalar settings: font size/family/file, theme, tabs width/spaces, wrap. */
+ * scalar settings: font size/family/file, theme, tabs width/spaces, wrap,
+ * trailing whitespace. */
 #define CONFIG_TEXT_CAP 4096u
 /* (P) longest supported action path plus its NUL. Generic keys use the same
  * explicit subset limit; adding a longer action extends this bound. */
 #define CONFIG_NAME_CAP sizeof("keymap.split_selection_lines")
-#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 7u) /* (P) named scalars above */
+#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 8u) /* (P) named scalars above */
 #define CONFIG_BINDING_CAP ((size_t)KEYS_ACTION_COUNT)
 /* (P) maximum serialized settings: each entry can contain a path bounded by
  * CONFIG_NAME_CAP and a value bounded by CONFIG_TEXT_CAP; escape expansion is
@@ -40,17 +41,23 @@ typedef struct config_error { int code; size_t offset; } config_error;
 typedef int (*config_visit_fn)(void *, const char *, const config_value *);
 int config_toml_parse(const uint8_t *, size_t, config_visit_fn, void *, config_error *);
 typedef enum config_theme { CONFIG_DARK, CONFIG_LIGHT } config_theme;
+typedef enum config_trailing { CONFIG_TRAILING_NONE, CONFIG_TRAILING_ALL,
+                               CONFIG_TRAILING_SELECTION } config_trailing;
 typedef struct config_settings {
     double font_points; /* zero = use DPI consumer's default; never pixels */
     char font_family[CONFIG_TEXT_CAP]; /* empty = font consumer default */
     char font_file[CONFIG_TEXT_CAP];   /* optional path with trailing #TTC-index */
     config_theme theme;
+    config_trailing trailing;
+    bool trailing_warning; /* invalid value accepted as none; runtime reports it */
     uint32_t tab_width; /* zero = per-buffer detected/default indentation */
     bool tab_spaces, tabs_set, wrap, wrap_set;
     keys_binding bindings[CONFIG_BINDING_CAP];
     size_t binding_count;
 } config_settings;
 void config_defaults(config_settings *);
+/* Invalid whitespace.trailing accepts none and sets trailing_warning.
+ * Syntax/other value errors remain transactional failures. */
 int config_parse(const uint8_t *, size_t, config_settings *, config_error *);
 int config_path(char *, size_t);
 keys_result config_keys_lookup(const config_settings *, keys_state *, uint32_t,
@@ -77,6 +84,7 @@ int config_runtime_watchfd(const config_runtime *);
 bool config_runtime_tick(config_runtime *);
 const config_settings *config_runtime_current(const config_runtime *);
 uint64_t config_runtime_generation(const config_runtime *);
+/* Includes CONFIG_ERR_VALUE for an accepted trailing-whitespace fallback. */
 config_error config_runtime_error(const config_runtime *);
 bool config_runtime_busy(const config_runtime *);
 #endif

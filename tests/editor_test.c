@@ -76,6 +76,118 @@ static int expect(editor *e, const char *text, uint64_t cursor)
     T(memcmp(bytes, text, n) == 0); T(editor_view(e).selection.cursor == cursor);
     return 0;
 }
+/* edit-hgd (P): reuse editor_p4_test's composed-cell indexing, adding the
+ * live chrome/gutter offsets. Zero is the first row/column or absence, one
+ * removes a string NUL or advances a cell. Geometry: sixteen columns for the
+ * existing tab slot plus eight for the minimap; a chrome row plus the longest
+ * fixture's newline count plus its final empty line. Minus one is the existing
+ * no-wrap option. No time budget. */
+static const render_cell *trailing_cell(editor *e, uint32_t row, size_t column)
+{
+    const render_grid *g = editor_grid(e);
+    return &g->cells[(size_t)(row + e->tab_rows) * g->dims.cols + e->lay.gw + column];
+}
+static int trailing_open(editor **out, render_backend *backend, const char *text,
+                         const char *preferences, counted *count)
+{
+    T(render_null_backend(backend) == RENDER_OK);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = strlen(text),
+        .cols = 16u + 8u, .rows = 1u + 3u, .wrap_mode = -1,
+        .preferences_path = preferences, .hook_ctx = count,
+        .on_ingress = ingress, .on_submit = submitted};
+    T(editor_open(out, &cfg, backend) == EDITOR_OK);
+    return settle(*out);
+}
+static int trailing_typing(const char *preferences)
+{
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    T(trailing_open(&e, &backend, "", preferences, &count) == 0);
+    const char typed[] = "word ";
+    for (size_t i = 0; i < sizeof typed - 1u; i++) {
+        char text[] = {typed[i], '\0'};
+        T(press(e, key((uint32_t)(uint8_t)typed[i], 0, text)) == EDITOR_OK);
+    }
+    T(expect(e, typed, sizeof typed - 1u) == 0);
+    const render_cell *cell = trailing_cell(e, 0, sizeof "word" - 1u);
+    printf("trailing typing %s: space bg=%#x plain=%#x marker=%#x\n",
+        preferences ? "all" : "default", cell->bg, e->layout_cfg.bg,
+        config_theme_color(e->preferences.theme, "error.background"));
+    bool plain = cell->bg == e->layout_cfg.bg && !(cell->attrs & RENDER_ATTR_UNDERLINE);
+    T(!count.active && !count.allocations);
+    editor_close(e);
+    T(plain);
+    return 0;
+}
+static int trailing_config_file(char *path, const char *source)
+{
+    /* (P) mkstemp's owner-only temporary file is outside the typing guard. */
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, source, strlen(source)) == (ssize_t)strlen(source));
+    T(close(fd) == 0); return 0;
+}
+static int trailing_all(void)
+{
+    char path[] = "/tmp/editor-trailing-all-XXXXXX";
+    T(trailing_config_file(path, "whitespace.trailing = 'all'\n") == 0);
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    const char text[] = "word   \n";
+    T(trailing_open(&e, &backend, text, path, &count) == 0);
+    T(editor_set_cursor(e, sizeof text - 1u) == EDITOR_OK); T(settle(e) == 0);
+    for (size_t column = sizeof "word" - 1u; column < sizeof "word   " - 1u; column++) {
+        const render_cell *cell = trailing_cell(e, 0, column);
+        T(cell->bg == config_theme_color(e->preferences.theme, "error.background"));
+        T(cell->attrs & RENDER_ATTR_UNDERLINE);
+    }
+    editor_close(e);
+    int result = trailing_typing(path);
+    T(unlink(path) == 0); T(result == 0);
+    puts("trailing all: completed line marked, typing cell plain passed");
+    return 0;
+}
+static int trailing_selection(void)
+{
+    char path[] = "/tmp/editor-trailing-selection-XXXXXX";
+    T(trailing_config_file(path, "[whitespace]\ntrailing='selection'\n") == 0);
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    T(trailing_open(&e, &backend, "word   \nother  \n", path, &count) == 0);
+    T(!(trailing_cell(e, 0, sizeof "word" - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    T(editor_set_cursor(e, sizeof "word" - 1u) == EDITOR_OK); T(settle(e) == 0);
+    for (size_t i = 0; i < sizeof "  " - 1u; i++)
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == EDITOR_OK);
+    const render_cell *selected = trailing_cell(e, 0, sizeof "word" - 1u);
+    T(selected->bg == e->layout_cfg.sel_bg && (selected->attrs & RENDER_ATTR_UNDERLINE));
+    T(!(trailing_cell(e, 0, sizeof "word " - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    T(!(trailing_cell(e, 0, sizeof "word  " - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    T(!(trailing_cell(e, 1, sizeof "other" - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    /* (P) Reverse the same half-open selection; its lower endpoint becomes
+     * the caret, so both selected spaces are now away from the typing cell. */
+    T(editor_set_cursor(e, sizeof "word  " - 1u) == EDITOR_OK); T(settle(e) == 0);
+    for (size_t i = 0; i < sizeof "  " - 1u; i++)
+        T(press(e, key(XKB_KEY_Left, PLAT_MOD_SHIFT, NULL)) == EDITOR_OK);
+    T(trailing_cell(e, 0, sizeof "word" - 1u)->attrs & RENDER_ATTR_UNDERLINE);
+    T(trailing_cell(e, 0, sizeof "word " - 1u)->attrs & RENDER_ATTR_UNDERLINE);
+    T(!(trailing_cell(e, 0, sizeof "word  " - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    T(press(e, key(XKB_KEY_Left, 0, NULL)) == EDITOR_OK);
+    T(!(trailing_cell(e, 0, sizeof "word" - 1u)->attrs & RENDER_ATTR_UNDERLINE));
+    T(!count.active && !count.allocations);
+    editor_close(e); T(unlink(path) == 0);
+    puts("trailing selection: empty, partial, reverse and cleared selection passed");
+    return 0;
+}
+static int trailing_disabled_scan(void)
+{
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    T(trailing_open(&e, &backend, "word   \n", NULL, &count) == 0);
+    /* (P) A nonzero capacity with NULL output is rejected by indent's range
+     * function. Successful prepare proves none bypasses that function. */
+    indent_range *saved = e->ws_ranges; e->ws_ranges = NULL;
+    T(editor_full_layout(e) == EDITOR_OK); T(settle(e) == 0);
+    T(e->ws_count == 0); e->ws_ranges = saved;
+    T(trailing_cell(e, 0, sizeof "word" - 1u)->bg == e->layout_cfg.bg);
+    editor_close(e);
+    puts("trailing none: range computation bypassed passed");
+    return 0;
+}
 /* edit-g11: use the drive's keystroke count (G: the supplied typing repro),
  * and the allocation fixture's grid geometry. Storage covers cfg.rows times
  * the editor's existing eight-column minimap, including the chrome row. */
@@ -4528,6 +4640,10 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
+        if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
+        if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
+        if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
+        if (!strcmp(argv[1], "--trailing-disabled-scan")) return trailing_disabled_scan();
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
@@ -4616,6 +4732,8 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(trailing_typing(NULL) == 0); T(trailing_all() == 0);
+    T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
     T(duplicate_path_contract() == 0);
     T(o20_all() == 0);
     T(g02_find_return() == 0);
