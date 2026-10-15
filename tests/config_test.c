@@ -130,6 +130,17 @@ static int runtime_test(void)
     T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_ERR_VALUE);
     T(config_runtime_generation(r) == generation && config_runtime_current(r)->theme == CONFIG_LIGHT);
+    /* edit-6e2: a non-array font.fallbacks is the usual runtime warning
+     * (config_runtime_error), keeping the last valid chain current. */
+    T(write_config(path, "theme='light'\nfont.fallbacks=['Noto Emoji']\n") == 0);
+    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(config_runtime_error(r).code == CONFIG_OK);
+    T(!strcmp(config_runtime_current(r)->font_fallbacks, "Noto Emoji"));
+    generation = config_runtime_generation(r);
+    T(write_config(path, "theme='light'\nfont.fallbacks='Noto Emoji'\n") == 0);
+    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(config_runtime_error(r).code == CONFIG_ERR_VALUE && config_runtime_generation(r) == generation);
+    T(!strcmp(config_runtime_current(r)->font_fallbacks, "Noto Emoji"));
     T(snprintf(other, sizeof other, "%s/sublimite/other.toml", root) > 0);
     config_runtime *peer = NULL; T(config_runtime_open(&peer, other) == CONFIG_OK); wait_runtime(peer);
     T(config_runtime_watchfd(peer) == config_runtime_watchfd(r));
@@ -211,6 +222,22 @@ int main(void)
     T(binding->action == KEYS_ACTION_UNDO);
     T(config_keys_lookup(&alternatives_settings, &state, '+', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, &binding) == KEYS_MATCH);
     T(binding->action == KEYS_ACTION_REDO);
+    /* edit-6e2: font.fallbacks is an ordered string array, stored as the
+     * entries joined by newlines (no entry may contain one). */
+    const char chain[] = "[font]\nfallbacks = [\n 'Noto Emoji',\n \"file:/abs/x.ttf#1\",\n]\n";
+    config_settings chain_settings;
+    T(config_parse((const uint8_t *)chain, sizeof chain - 1u, &chain_settings, &error) == CONFIG_OK);
+    T(!strcmp(chain_settings.font_fallbacks, "Noto Emoji\nfile:/abs/x.ttf#1"));
+    const char no_chain[] = "font.fallbacks = []\n";
+    T(config_parse((const uint8_t *)no_chain, sizeof no_chain - 1u, &chain_settings, &error) == CONFIG_OK);
+    T(!chain_settings.font_fallbacks[0]);
+    const char *bad_chains[] = {"font.fallbacks = 'Noto Emoji'\n", "font.fallbacks = 1\n",
+        "font.fallbacks = ['a', '']\n", "font.fallbacks = [\"a\\tb\"]\n", "font.fallbacks = true\n"};
+    for (size_t i = 0; i < sizeof bad_chains / sizeof bad_chains[0]; i++) {
+        config_settings kept = chain_settings;
+        T(config_parse((const uint8_t *)bad_chains[i], strlen(bad_chains[i]), &chain_settings, &error) == CONFIG_ERR_VALUE);
+        T(!memcmp(&kept, &chain_settings, sizeof kept));
+    }
     const char duplicate[] = "[keymap]\nredo='Ctrl+Y'\nundo='Ctrl+Y'\n";
     T(config_parse((const uint8_t *)duplicate, sizeof duplicate - 1u, &settings, &error) == CONFIG_ERR_VALUE);
     size_t dark_count, light_count;

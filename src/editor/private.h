@@ -162,6 +162,8 @@ typedef struct editor_font_atlas {
     uint8_t *pixels;
     font_async *fonts;
     font_selection selection; /* primary bytes live as long as this version */
+    char fallbacks[FONT_CHAIN_TEXT_MAX]; /* edit-6e2: chain snapshot for this version */
+    uint32_t fallback_skipped;           /* worker-written, read at adoption */
 } editor_font_atlas;
 typedef struct editor_font_size {
     font_t face;
@@ -172,6 +174,8 @@ typedef struct editor_font_size {
     double dpi, points, default_points;
     uint32_t requested_px, prepared_px, applied_px, default_px;
     font_selection selection; /* copied UI request; workers use a version snapshot */
+    char fallbacks[FONT_CHAIN_TEXT_MAX]; /* edit-6e2: UI chain request, '\n'-joined */
+    uint32_t chain_logged_generation;    /* worker-only: last generation whose skips were logged */
     uint32_t requested_generation, prepared_generation, applied_generation;
     uint32_t window_width, window_height, max_width, max_height;
     unsigned current, preparing;
@@ -201,6 +205,8 @@ struct editor {
     char preferences_font_family[FONT_FALLBACK_PATH_MAX];
     char preferences_font_file[FONT_FALLBACK_PATH_MAX];
     bool preferences_font_selection_override, preferences_font_selection_pending;
+    char preferences_font_fallbacks[FONT_CHAIN_TEXT_MAX]; /* edit-6e2: effective chain */
+    bool preferences_font_fallbacks_override; /* CLI or env chain wins over the config key */
     int preferences_watchfd;
     findui_panel find;
     uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
@@ -385,6 +391,8 @@ int editor_backend_poll_probe(editor *e);
 void editor_backend_close_probe(editor *e);
 bool editor_activation_busy(const editor *e);
 void editor_font_bad_config(editor *e);
+/* edit-6e2: editor_font_request plus the '\n'-joined fallback chain (NULL keeps it). */
+int editor_font_request_chain(editor *e, const char *family, const char *file, const char *fallbacks);
 int editor_begin_frame(editor *e);
 int editor_full_layout(editor *e);
 int editor_refresh_cursor(editor *e, uint64_t old_cursor);

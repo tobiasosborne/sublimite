@@ -368,10 +368,115 @@ static int selected_zoom_unicode(double dpi)
     printf("font_selection_test: DPI %.0f selected Unicode pixels, zoom/reset, glyph retirement, runnable input and outstanding selection shutdown passed\n", dpi);
     return 0;
 }
+/* edit-6e2: configured fallback chain. The fixture font is used only from
+ * here through a file: entry (tests/fixtures/fonts/PROVENANCE.md). Scalars:
+ * U+1F469 WOMAN is absent from the embedded DejaVu Sans Mono and present in
+ * Noto Emoji; U+1F600 is also present in DejaVu Sans (fc-query charset). */
+static const char emoji_fixture[] = "tests/fixtures/fonts/NotoEmoji-wght.ttf";
+static int chain_source(editor *e, uint32_t cp, const char *want)
+{
+    T(settle_glyphs(e) == 0);
+    while (!font_async_idle(e->fonts)) { T(editor_step(e, 0) >= 0); sched_yield(); }
+    char path[FONT_FALLBACK_PATH_MAX]; uint32_t index = 0;
+    int rc = font_async_scalar_source(e->fonts, cp, path, sizeof path, &index);
+    if (want) T(rc == FONT_OK && !strcmp(path, want));
+    else T(rc != FONT_OK || strcmp(path, emoji_fixture)); /* fontconfig's pick, or none */
+    return 0;
+}
+static int chain_inked(editor *e)
+{
+    const render_grid *grid = editor_grid(e);
+    const render_cell *cell = &grid->cells[(size_t)e->tab_rows * grid->dims.cols + layout_gutter_width(&e->lay)];
+    T(cell->atlas_slot >= LAYOUT_ASCII_GLYPHS && cell->atlas_slot < grid->glyph_count);
+    T(grid->glyphs[cell->atlas_slot].w == 2u * grid->dims.cell_w); /* (P) emoji are wide clusters */
+    return 0;
+}
+static int fallback_chain(void)
+{
+    char resolved[FONT_FALLBACK_PATH_MAX]; uint32_t index = 7u;
+    T(font_chain_resolve("file:tests/fixtures/fonts/NotoEmoji-wght.ttf#0", resolved, sizeof resolved, &index) == FONT_OK);
+    T(!strcmp(resolved, emoji_fixture) && index == 0u);
+    T(font_chain_resolve("file:/missing/edit-6e2.ttf", resolved, sizeof resolved, &index) != FONT_OK);
+    T(font_chain_resolve("file:", resolved, sizeof resolved, &index) == FONT_ERR_ARG);
+    T(font_chain_resolve("file:x.ttf#bad", resolved, sizeof resolved, &index) == FONT_ERR_ARG);
+    T(font_chain_resolve("absent-family", resolved, sizeof resolved, &index) == FONT_ERR_MISSING);
+    /* Colour emoji (CBDT) cannot be rasterised by stb: a family entry resolves
+     * monochrome-only, so "Noto Emoji" never becomes Noto Color Emoji. */
+    if (font_chain_resolve("Noto Emoji", resolved, sizeof resolved, &index) == FONT_OK)
+        T(!strstr(resolved, "Color"));
+
+    char path[] = "/tmp/edit-6e2-config-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0 && close(fd) == 0);
+    T(write_preferences(path, "font.fallbacks = ['absent-family', 'file:tests/fixtures/fonts/NotoEmoji-wght.ttf']\n") == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    guard g = {0};
+    const char text[] = "\xf0\x9f\x91\xa9\xf0\x9f\x98\x80"; /* U+1F469 U+1F600 */
+    /* (P) reuse the font selection typing fixture's reserved grid. */
+    editor_config cfg = {.cols=32, .rows=8, .max_cols=64, .max_rows=16,
+        .preferences_path=path, .hook_ctx=&g, .on_ingress=ingress, .on_submit=submitted,
+        .initial=(const uint8_t *)text, .initial_len=sizeof text - 1u};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(adopted(e) == 0);
+    /* (a) the absent family is skipped with a notice, the second entry wins. */
+    T(e->stats.font_error == FONT_OK && e->stats.font_fallback_skipped == 1u);
+    T(chain_source(e, 0x1f469u, emoji_fixture) == 0); T(chain_inked(e) == 0);
+    T(!pthread_equal(e->font.worker, pthread_self())); T(type(e, &g) == 0);
+    /* (b) a file: entry naming a missing file is skipped, not an error. */
+    T(reload_preferences(e, path, "font.fallbacks = ['file:/missing/edit-6e2.ttf']\n") == 0);
+    T(e->stats.font_error == FONT_OK && e->stats.font_fallback_skipped == 1u);
+    T(chain_source(e, 0x1f469u, NULL) == 0); T(type(e, &g) == 0);
+    /* Order: the first listed face covering the scalar wins. Needs fontconfig
+     * to know DejaVu Sans; skipped (not failed) on a box without it. */
+    char dejavu[FONT_FALLBACK_PATH_MAX];
+    if (font_chain_resolve("DejaVu Sans", dejavu, sizeof dejavu, &index) == FONT_OK) {
+        T(reload_preferences(e, path, "font.fallbacks = ['DejaVu Sans', 'file:tests/fixtures/fonts/NotoEmoji-wght.ttf']\n") == 0);
+        T(e->stats.font_fallback_skipped == 0u && chain_source(e, 0x1f600u, dejavu) == 0);
+        T(chain_source(e, 0x1f469u, emoji_fixture) == 0);
+        T(reload_preferences(e, path, "font.fallbacks = ['file:tests/fixtures/fonts/NotoEmoji-wght.ttf', 'DejaVu Sans']\n") == 0);
+        T(chain_source(e, 0x1f600u, emoji_fixture) == 0);
+        /* Zoom rebuilds the other version: the chain survives at the new size. */
+        plat_event zoom = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_equal, .mods = PLAT_MOD_CTRL};
+        T(editor_inject(e, &zoom) == 0); T(adopted(e) == 0);
+        T(chain_source(e, 0x1f600u, emoji_fixture) == 0);
+        zoom.keysym = XKB_KEY_0; T(editor_inject(e, &zoom) == 0); T(adopted(e) == 0);
+        T(chain_source(e, 0x1f600u, emoji_fixture) == 0);
+    } else puts("font_selection_test: fontconfig lacks DejaVu Sans; chain order case skipped");
+    /* Removing the key restores today's behaviour (per-scalar fontconfig). */
+    uint64_t changes = e->stats.font_changes;
+    T(reload_preferences(e, path, "theme='dark'\n") == 0);
+    T(e->stats.font_changes == changes + 1u && e->stats.font_fallback_skipped == 0u);
+    T(chain_source(e, 0x1f469u, NULL) == 0); T(type(e, &g) == 0);
+    editor_close(e);
+
+    /* (c) precedence mirrors edit-5ih: CLI (even empty) > env (non-empty) > config. */
+    T(write_preferences(path, "font.fallbacks = ['file:/missing/edit-6e2.ttf']\n") == 0);
+    T(setenv("EDIT_FONT_FALLBACKS", "absent-family, file:tests/fixtures/fonts/NotoEmoji-wght.ttf", 1) == 0);
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0); T(adopted(e) == 0);
+    T(e->stats.font_fallback_skipped == 1u && chain_source(e, 0x1f469u, emoji_fixture) == 0);
+    changes = e->stats.font_changes;
+    T(reload_preferences(e, path, "theme='light'\nfont.fallbacks = []\n") == 0);
+    T(e->stats.font_changes == changes && chain_source(e, 0x1f469u, emoji_fixture) == 0);
+    T(type(e, &g) == 0); editor_close(e);
+    cfg.font_fallbacks = "file:/missing/edit-6e2.ttf";
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0); T(adopted(e) == 0);
+    T(e->stats.font_fallback_skipped == 1u && chain_source(e, 0x1f469u, NULL) == 0); editor_close(e);
+    cfg.font_fallbacks = ""; /* explicit empty CLI chain beats env and config */
+    T(write_preferences(path, "font.fallbacks = ['file:tests/fixtures/fonts/NotoEmoji-wght.ttf']\n") == 0);
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0); T(adopted(e) == 0);
+    T(e->stats.font_changes == 0u && e->stats.font_fallback_skipped == 0u);
+    T(chain_source(e, 0x1f469u, NULL) == 0); editor_close(e);
+    cfg.font_fallbacks = NULL; T(unsetenv("EDIT_FONT_FALLBACKS") == 0);
+    T(render_null_backend(&backend) == 0); T(editor_open(&e, &cfg, &backend) == 0); T(adopted(e) == 0);
+    T(e->stats.font_fallback_skipped == 0u && chain_source(e, 0x1f469u, emoji_fixture) == 0); editor_close(e);
+    T(unlink(path) == 0);
+    printf("font_selection_test: font.fallbacks chain order, skipped entries, CLI/env/config precedence, typing mallocs=%zu\n", g.allocations);
+    return 0;
+}
 int main(void)
 {
     trace_init(); (void)trace_thread_register(); T(parsing() == 0); T(rounded_proportional() == 0);
     T(unsetenv("EDIT_FONT_FAMILY") == 0 && unsetenv("EDIT_FONT_FILE") == 0);
+    T(unsetenv("EDIT_FONT_FALLBACKS") == 0);
+    T(fallback_chain() == 0);
     T(config_selection() == 0);
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     guard g = {0};

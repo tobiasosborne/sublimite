@@ -19,6 +19,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (rc) EDIT_ASSERT(!memcmp(&s, &before, sizeof s));
     else {
         EDIT_ASSERT(s.binding_count <= CONFIG_BINDING_CAP);
+        /* edit-6e2: the chain is NUL-terminated and '\n'-joined non-empty
+         * entries free of other control separators. */
+        size_t chain = strnlen(s.font_fallbacks, sizeof s.font_fallbacks);
+        EDIT_ASSERT(chain < sizeof s.font_fallbacks && !strpbrk(s.font_fallbacks, "\r\t"));
+        EDIT_ASSERT(!chain || (s.font_fallbacks[0] != '\n' && s.font_fallbacks[chain - 1u] != '\n' &&
+                               !strstr(s.font_fallbacks, "\n\n")));
         keys_state state = {0}; const keys_binding *binding;
         (void)config_keys_lookup(&s, &state, size ? data[0] : 0, 0, &binding);
     }

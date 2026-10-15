@@ -101,12 +101,13 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
         if(options && strcmp(arg,"--wait")==0) { out->request.wait=true; continue; }
         if(options && strcmp(arg,"--new-instance")==0) { out->request.new_instance=true; continue; }
         if(options) {
-            const char *family_flag="--font-family", *file_flag="--font-file";
-            size_t family_len=strlen(family_flag), file_len=strlen(file_flag);
+            const char *family_flag="--font-family", *file_flag="--font-file", *chain_flag="--font-fallbacks";
+            size_t family_len=strlen(family_flag), file_len=strlen(file_flag), chain_len=strlen(chain_flag);
             bool family=!strncmp(arg,family_flag,family_len) && (arg[family_len]=='=' || !arg[family_len]);
             bool file=!strncmp(arg,file_flag,file_len) && (arg[file_len]=='=' || !arg[file_len]);
-            if(family || file) {
-                size_t flag_len=family?family_len:file_len;
+            bool chain=!strncmp(arg,chain_flag,chain_len) && (arg[chain_len]=='=' || !arg[chain_len]);
+            if(family || file || chain) {
+                size_t flag_len=family?family_len:file?file_len:chain_len;
                 const char *value=arg+flag_len;
                 if(*value=='=') value++;
                 else {
@@ -116,7 +117,7 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
                 if(strlen(value)>=IPC_PATH_CAP) { rc=IPC_LIMIT; goto fail; }
                 const char *stored=copy_string(&out->arena,value);
                 if(!stored) { rc=IPC_LIMIT; goto fail; }
-                if(family) out->font_family=stored; else out->font_file=stored;
+                if(family) out->font_family=stored; else if(file) out->font_file=stored; else out->font_fallbacks=stored;
                 continue;
             }
         }

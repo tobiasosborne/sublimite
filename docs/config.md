@@ -13,6 +13,7 @@ wrap = true    # otherwise use the existing per-file default
 [font]
 size = 12.5    # points: fractional fixture value from config_test
 family = "DejaVu Sans Mono"
+fallbacks = ["Noto Emoji", "Noto Sans CJK SC"] # tried in order after the primary
 
 [tabs]
 width = 8      # tab-stop fixture from config_test; bounded by INDENT_MAX_WIDTH
@@ -47,6 +48,20 @@ config. A failed selection uses embedded DejaVu and logs once per editor.
 Use Iosevka Fixed or Term: the cell grid has no HarfBuzz, ligatures or contextual
 alternates, and proportional advances are rejected. The exact precedence and
 ownership decisions are in [edit-5ih](decisions/edit-5ih.md).
+
+`fallbacks` is an ordered array of font families (Fontconfig patterns) or
+`file:PATH[#INDEX]` entries. For a character that the primary font does not
+have, each listed font is tried in turn, and the first one that has the
+character is used. If none of them has it, the editor asks Fontconfig, as it
+did before. An empty or missing list uses Fontconfig alone. Families are
+resolved without colour fonts (`:color=false`): the rasteriser cannot draw
+colour bitmap emoji, so `"Noto Emoji"` selects the monochrome Noto Emoji, never
+Noto Color Emoji. If an entry cannot be found, or names a missing file, it is
+skipped. The editor logs one line about it, and it is not an error. The
+precedence works like font selection: `--font-fallbacks A,B` (an empty value
+also counts), then a nonempty `EDIT_FONT_FALLBACKS=A,B`, then
+`[font] fallbacks`. Spaces around commas are ignored. Families are resolved on
+a worker; see [edit-6e2](decisions/edit-6e2.md).
 
 Theme token names and RGB values are provisional until the visual spec is
 present and approved.

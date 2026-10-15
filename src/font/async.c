@@ -64,6 +64,11 @@ struct font_async {
     bool retaining;
     /* Exclusively worker-owned until shutdown. */
     size_t face_count, scalar_count;
+    /* edit-6e2: faces[0..chain_count) are the resolved font.fallbacks chain,
+     * in order; chain is the text they were resolved from. */
+    size_t chain_count;
+    uint32_t chain_skipped;
+    char chain[FONT_CHAIN_TEXT_MAX];
     work_ctx *worker_ctx;
     uint32_t px;
     font_ascii_atlas ascii;
@@ -159,9 +164,15 @@ int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *a, bool em
     if (!owner || !a || !a->pixels || !a->px || !a->cell.cell_w || !a->cell.cell_h ||
         a->cell.cell_w > owner->max_cell.cell_w || a->cell.cell_h > owner->max_cell.cell_h ||
         !font_async_idle(owner)) return FONT_ERR_ARG;
-    for (size_t i = 0; i < owner->face_count; i++) edit_arena_free(&owner->faces[i].arena);
-    memset(owner->faces, 0, owner->face_count * sizeof *owner->faces);
-    owner->face_count = owner->scalar_count = 0;
+    /* edit-6e2: resolved chain entries survive a size change; their faces
+     * reload lazily at the new size. Discovery faces are dropped. */
+    for (size_t i = 0; i < owner->face_count; i++) {
+        async_face *face = &owner->faces[i];
+        edit_arena_free(&face->arena);
+        if (i < owner->chain_count) { memset(&face->font, 0, sizeof face->font); face->result = FONT_MORE; }
+        else memset(face, 0, sizeof *face);
+    }
+    owner->face_count = owner->chain_count; owner->scalar_count = 0;
     owner->count = owner->next = owner->pending = 0;
     owner->oldest = owner->newest = owner->vacant = SIZE_MAX;
     owner->retaining = false;
@@ -214,6 +225,71 @@ void font_async_close(font_async *owner)
     edit_arena_free(&owner->pixels); edit_arena_free(&owner->storage); edit_arena_free(&owner->ui); free(owner);
 }
 
+/* Worker-only: read and size one face file into its own arena. */
+static int load_face(font_async *owner, async_face *face)
+{
+    struct stat st;
+    face->result = FONT_ERR_INIT;
+    if (!stat(face->path, &st) && st.st_size > 0 && (uintmax_t)st.st_size <= SIZE_MAX &&
+        !edit_arena_init(&face->arena, (size_t)st.st_size)) {
+        size_t len; unsigned char *bytes = font_load_file(face->path, &face->arena, &len);
+        if (bytes) face->result = font_init_index(&face->font, bytes, len, face->index);
+        if (face->result == FONT_OK) face->result = owner->em ?
+            font_set_em_px(&face->font, owner->px) : font_set_px(&face->font, owner->px);
+    }
+    return face->result;
+}
+
+int font_async_set_fallbacks(font_async *owner, const char *chain, uint32_t *skipped, work_ctx *ctx)
+{
+    if (!owner || !chain || !skipped || !font_async_idle(owner) ||
+        owner->face_count != owner->chain_count || strlen(chain) >= FONT_CHAIN_TEXT_MAX) return FONT_ERR_ARG;
+    if (!strcmp(chain, owner->chain)) { *skipped = owner->chain_skipped; return FONT_OK; }
+    for (size_t i = 0; i < owner->face_count; i++) {
+        edit_arena_free(&owner->faces[i].arena); memset(&owner->faces[i], 0, sizeof owner->faces[i]);
+    }
+    owner->face_count = owner->chain_count = owner->scalar_count = 0;
+    owner->chain[0] = 0; owner->chain_skipped = 0; /* a cancelled resolution retries next time */
+    uint32_t missed = 0;
+    for (const char *at = chain; *at;) {
+        const char *end = strchr(at, '\n');
+        size_t n = end ? (size_t)(end - at) : strlen(at);
+        if (work_should_stop(ctx)) break; /* stop is sticky: handled below */
+        char entry[FONT_CHAIN_TEXT_MAX], path[FONT_FALLBACK_PATH_MAX]; uint32_t index = 0;
+        memcpy(entry, at, n); entry[n] = 0;
+        /* (P) one face slot per entry: the chain shares the owner's face table. */
+        if (!n || owner->chain_count == ASYNC_ENTRIES ||
+            font_chain_resolve(entry, path, sizeof path, &index) != FONT_OK) missed++;
+        else {
+            async_face *face = &owner->faces[owner->chain_count++];
+            memcpy(face->path, path, strlen(path) + 1u); face->index = index; face->result = FONT_MORE;
+        }
+        at += n; if (*at == '\n') at++;
+    }
+    if (work_should_stop(ctx)) { /* resolved faces hold no bytes yet */
+        memset(owner->faces, 0, owner->chain_count * sizeof *owner->faces);
+        owner->chain_count = 0; return FONT_MORE;
+    }
+    owner->face_count = owner->chain_count;
+    memcpy(owner->chain, chain, strlen(chain) + 1u);
+    owner->chain_skipped = *skipped = missed;
+    return FONT_OK;
+}
+
+int font_async_scalar_source(const font_async *owner, uint32_t cp, char *path,
+                             size_t cap, uint32_t *index)
+{
+    if (!owner || !path || !cap || !index || !font_async_idle(owner)) return FONT_ERR_ARG;
+    for (size_t i = 0; i < owner->scalar_count; i++) if (owner->scalars[i].cp == cp) {
+        if (owner->scalars[i].result != FONT_OK) return owner->scalars[i].result;
+        const async_face *face = &owner->faces[owner->scalars[i].face];
+        if (strlen(face->path) >= cap) return FONT_ERR_ARG;
+        memcpy(path, face->path, strlen(face->path) + 1u); *index = face->index;
+        return FONT_OK;
+    }
+    return FONT_ERR_MISSING;
+}
+
 static int resolve_scalar(void *ctx, uint32_t cp, font_t **out)
 {
     font_async *owner = ctx;
@@ -227,8 +303,17 @@ static int resolve_scalar(void *ctx, uint32_t cp, font_t **out)
         return scalar.result;
     }
     int result = FONT_ERR_MISSING; size_t face_at = 0;
+    /* edit-6e2: the configured chain, in order, before any fontconfig pick.
+     * The per-codepoint scalar cache above makes this once per scalar. */
+    for (; face_at < owner->chain_count; face_at++) {
+        async_face *face = &owner->faces[face_at];
+        if (face->result == FONT_MORE) (void)load_face(owner, face);
+        if (face->result == FONT_OK && font_glyph_metrics(&face->font, cp, &metric) == FONT_OK) {
+            result = FONT_OK; break;
+        }
+    }
     /* Reuse already loaded faces before asking fontconfig for the script. */
-    for (; face_at < owner->face_count; face_at++) {
+    if (result != FONT_OK) for (face_at = owner->chain_count; face_at < owner->face_count; face_at++) {
         async_face *face = &owner->faces[face_at];
         if (face->result == FONT_OK && font_glyph_metrics(&face->font, cp, &metric) == FONT_OK) {
             result = FONT_OK; break;
@@ -244,15 +329,7 @@ static int resolve_scalar(void *ctx, uint32_t cp, font_t **out)
                 if (owner->face_count == ASYNC_ENTRIES) return FONT_ERR_NOMEM;
                 async_face *face = &owner->faces[owner->face_count++];
                 memcpy(face->path, path, strlen(path) + 1u); face->index = index;
-                struct stat st;
-                face->result = FONT_ERR_INIT;
-                if (!stat(path, &st) && st.st_size > 0 && (uintmax_t)st.st_size <= SIZE_MAX &&
-                    !edit_arena_init(&face->arena, (size_t)st.st_size)) {
-                    size_t len; unsigned char *bytes = font_load_file(path, &face->arena, &len);
-                    if (bytes) face->result = font_init_index(&face->font, bytes, len, index);
-                    if (face->result == FONT_OK) face->result = owner->em ?
-                        font_set_em_px(&face->font, owner->px) : font_set_px(&face->font, owner->px);
-                }
+                (void)load_face(owner, face);
             }
             async_face *face = &owner->faces[face_at];
             result = face->result;

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 /* Local fontconfig declarations (checked against fontconfig/fontconfig.h). */
 typedef struct FcPattern FcPattern;
@@ -265,4 +266,29 @@ done:
     if (cfg) api.ConfigDestroy(cfg);
     api.Fini();
     return result;
+}
+/* edit-6e2: one font.fallbacks entry to a file + face. Worker-only. */
+int font_chain_resolve(const char *entry, char *path, size_t cap, uint32_t *index)
+{
+    if (!entry || !path || !cap || !index) return FONT_ERR_ARG;
+    path[0] = 0; *index = 0;
+    static const char file_prefix[] = "file:";
+    if (!strncmp(entry, file_prefix, sizeof file_prefix - 1u)) {
+        /* Same PATH[#INDEX] grammar as font.file; only the path is kept. */
+        font_selection parsed = {0};
+        const char *file = entry + sizeof file_prefix - 1u;
+        if (!*file || font_selection_parse(&parsed, NULL, file) || !parsed.file[0] ||
+            strlen(parsed.file) >= cap) return FONT_ERR_ARG;
+        struct stat st;
+        if (stat(parsed.file, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) return FONT_ERR_INIT;
+        memcpy(path, parsed.file, strlen(parsed.file) + 1u); *index = parsed.index;
+        return FONT_OK;
+    }
+    /* (P) pattern = entry + the colour exclusion suffix + NUL. */
+    static const char mono[] = ":color=false";
+    char pattern[FONT_FALLBACK_PATH_MAX + sizeof mono];
+    size_t n = strlen(entry);
+    if (!n || n >= FONT_FALLBACK_PATH_MAX) return FONT_ERR_ARG;
+    memcpy(pattern, entry, n); memcpy(pattern + n, mono, sizeof mono);
+    return font_selection_resolve(pattern, path, cap, index);
 }

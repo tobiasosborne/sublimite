@@ -373,4 +373,29 @@ bool font_async_pending(const font_async *owner);
  * caller damages cells using that slot, including pixels-only changes. */
 uint32_t font_async_event(font_async *owner, const work_msg *msg);
 
+/* edit-6e2: configured fallback chain (font.fallbacks). Text is the ordered
+ * entries joined by '\n'. (P) Its bound is the config parser's decoded text
+ * bound for one array (CONFIG_TEXT_CAP, PATH_MAX on Linux); the editor
+ * static-asserts the two are equal. */
+#define FONT_CHAIN_TEXT_MAX 4096u
+/* Worker-only. "file:PATH[#INDEX]" names a font file (a non-empty regular
+ * file; relative paths use the cwd); anything else is a fontconfig pattern
+ * resolved monochrome-only (":color=false", stb cannot draw colour bitmaps)
+ * with font_selection_resolve's exact-family rule. ARG for malformed entries,
+ * MISSING/INIT when nothing suitable exists. path holds the file, index the
+ * TTC face. */
+int font_chain_resolve(const char *entry, char *path, size_t cap, uint32_t *index);
+/* Worker-only, on a detached idle owner after open/reset_atlas: install the
+ * chain consulted after the primary and before per-scalar fontconfig
+ * discovery. Entries are resolved only when the text differs from the
+ * owner's previous chain (a zoom re-arms the resolved faces at the new size);
+ * faces load lazily on their first scalar miss. Unresolvable entries are
+ * skipped and counted in *skipped, never an error. MORE when cancelled. */
+int font_async_set_fallbacks(font_async *owner, const char *chain, uint32_t *skipped,
+                             work_ctx *ctx);
+/* Diagnostic, UI only while font_async_idle: the face file that served cp
+ * (primary excluded: MISSING when cp is in the primary or never resolved). */
+int font_async_scalar_source(const font_async *owner, uint32_t cp, char *path,
+                             size_t cap, uint32_t *index);
+
 #endif

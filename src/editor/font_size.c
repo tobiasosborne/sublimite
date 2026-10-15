@@ -96,6 +96,23 @@ static void font_worker(work_ctx *ctx)
                                            !f->legacy, f->max_cell, ctx->pool);
         } else rc = font_async_reset_atlas(a->fonts, &a->atlas, !f->legacy);
         if (!rc) rc = font_async_set_primary(a->fonts, &selection->face);
+        if (!rc) {
+            /* edit-6e2: resolve the configured chain here, on the worker. An
+             * unresolvable entry is a counted notice, never a failed version. */
+            uint32_t skipped = 0;
+            int chain = font_async_set_fallbacks(a->fonts, a->fallbacks, &skipped, ctx);
+            if (chain != FONT_OK && chain != FONT_MORE) {
+                skipped = a->fallbacks[0] ? 1u : 0u; /* one per '\n'-separated entry */
+                for (const char *p = a->fallbacks; *p; p++) skipped += *p == '\n';
+            }
+            a->fallback_skipped = skipped;
+            if (skipped && f->chain_logged_generation != f->prepared_generation &&
+                !work_should_stop(ctx)) {
+                f->chain_logged_generation = f->prepared_generation;
+                fprintf(stderr, "sublimite: %u font.fallbacks entr%s skipped (not found)\n",
+                        skipped, skipped == 1u ? "y" : "ies");
+            }
+        }
     }
     if (selection->result != FONT_OK && selection->result != FONT_MORE &&
         selection->face.data && !work_should_stop(ctx)) {
@@ -190,6 +207,7 @@ int editor_font_poll(editor *e)
                 e->stats.font_changes++;
                 e->stats.font_error = f->atlas[f->preparing].selection.result;
             }
+            e->stats.font_fallback_skipped = f->atlas[f->preparing].fallback_skipped;
             f->current = f->preparing; f->applied_px = f->prepared_px;
             f->applied_generation = f->prepared_generation;
         }
@@ -214,6 +232,8 @@ int editor_font_poll(editor *e)
             memcpy(selection->file, request->file, sizeof selection->file);
             selection->index = request->index;
         }
+        /* The UI chain request always equals the newest generation's chain. */
+        memcpy(f->atlas[f->preparing].fallbacks, f->fallbacks, sizeof f->fallbacks);
         f->handle = work_submit(&e->pool, (work_job){font_worker, f, 0, WORK_FOREGROUND});
         /* A temporarily full queue is retried on an existing editor turn. */
     }

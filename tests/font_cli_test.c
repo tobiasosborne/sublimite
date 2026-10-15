@@ -29,6 +29,17 @@ int main(void)
     T(PARSE(terminated, &args) == IPC_OK && args.request.count);
     T(!args.font_family && !args.font_file);
     ipc_args_fini(&args);
-    puts("font_cli_test: family/file options, required values and option terminator passed");
+    /* edit-6e2: --font-fallbacks takes a comma-separated chain, repeats keep
+     * the last value, empty is an explicit empty chain. */
+    char *chain[] = {"sublimite", "--font-fallbacks", "Noto Emoji,file:/x.ttf", "--font-fallbacks=Noto Emoji"};
+    T(PARSE(chain, &args) == IPC_OK && !args.request.count);
+    T(!strcmp(args.font_fallbacks, "Noto Emoji") && !args.font_family && !args.font_file);
+    ipc_args_fini(&args); T(!args.font_fallbacks);
+    char *empty_chain[] = {"sublimite", "--font-fallbacks="};
+    T(PARSE(empty_chain, &args) == IPC_OK && args.font_fallbacks && !*args.font_fallbacks);
+    ipc_args_fini(&args);
+    char *missing_chain[] = {"sublimite", "--font-fallbacks"};
+    T(PARSE(missing_chain, &args) == IPC_INVALID);
+    puts("font_cli_test: family/file/fallbacks options, required values and option terminator passed");
     return 0;
 }

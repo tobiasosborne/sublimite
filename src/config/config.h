@@ -6,12 +6,12 @@
 /* (P) PATH_MAX on the supported Linux target; keys/families share this
  * decoded text bound. Entry/array limits derive from all actions plus the
  * scalar settings: font size/family/file, theme, tabs width/spaces, wrap,
- * trailing whitespace. */
+ * trailing whitespace (edit-hgd), plus the font.fallbacks array (edit-6e2). */
 #define CONFIG_TEXT_CAP 4096u
 /* (P) longest supported action path plus its NUL. Generic keys use the same
  * explicit subset limit; adding a longer action extends this bound. */
 #define CONFIG_NAME_CAP sizeof("keymap.split_selection_lines")
-#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 8u) /* (P) named scalars above */
+#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 9u) /* (P) named scalars above (8 incl. whitespace.trailing) + font.fallbacks */
 #define CONFIG_BINDING_CAP ((size_t)KEYS_ACTION_COUNT)
 /* (P) maximum serialized settings: each entry can contain a path bounded by
  * CONFIG_NAME_CAP and a value bounded by CONFIG_TEXT_CAP; escape expansion is
@@ -47,6 +47,11 @@ typedef struct config_settings {
     double font_points; /* zero = use DPI consumer's default; never pixels */
     char font_family[CONFIG_TEXT_CAP]; /* empty = font consumer default */
     char font_file[CONFIG_TEXT_CAP];   /* optional path with trailing #TTC-index */
+    /* edit-6e2: ordered fallback entries joined by '\n' (no entry contains
+     * one). (P) The parser decodes every string of one array into a single
+     * CONFIG_TEXT_CAP buffer with a NUL per entry, so the joined form fits.
+     * Empty = per-scalar fontconfig discovery only. */
+    char font_fallbacks[CONFIG_TEXT_CAP];
     config_theme theme;
     config_trailing trailing;
     bool trailing_warning; /* invalid value accepted as none; runtime reports it */

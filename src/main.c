@@ -19,7 +19,7 @@ int main(int argc, char **argv)
     trace_record_at(startup_ns, TRACE_STARTUP_PROCESS_START, 0);
     ipc_args args = {0}; ipc_result parsed = ipc_parse_args(argc, argv, &args);
     if (parsed == IPC_OK && args.request.has_stdin) parsed = ipc_args_read_stdin(&args, STDIN_FILENO);
-    if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--font-family PATTERN] [--font-file PATH[#INDEX]] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }
+    if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--font-family PATTERN] [--font-file PATH[#INDEX]] [--font-fallbacks A,B] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }
     ipc_server server = {0}; bool owns_server = false;
     const char *display = getenv("DISPLAY");
     const char *wayland_display = getenv("WAYLAND_DISPLAY");
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
     const char *platform_error = NULL;
     editor *e = NULL;
     editor_config config = {.journal_path = journal_path, .session_lease = &session_lease, .start_empty = true, .raster_fallback = true, .load_preferences = true,
-        .font_family = args.font_family, .font_file = args.font_file,
+        .font_family = args.font_family, .font_file = args.font_file, .font_fallbacks = args.font_fallbacks,
         /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
          * pointers are reserved during startup, never on the typing path. */
         .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend};

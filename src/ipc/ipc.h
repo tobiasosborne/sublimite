@@ -41,12 +41,15 @@ typedef struct ipc_args {
     edit_arena arena;
     /* Launch-local CLI settings, owned by arena, never serialized to a peer. */
     const char *font_family, *font_file;
+    const char *font_fallbacks; /* edit-6e2: comma-separated chain, verbatim */
 } ipc_args;
 /* Parse argv[1..], snapshot cwd; owns output until fini. Zero-init out.
  * An existing whole filename wins over suffix parsing. Coordinates are 1-based.
  * Failing parse frees output. '-' is unique; '--' ends option recognition.
  * --font-family / --font-file accept a following value or =VALUE; repeats
- * keep the last value of each flag. Empty values request the embedded face. */
+ * keep the last value of each flag. Empty values request the embedded face.
+ * --font-fallbacks (edit-6e2) takes a comma-separated chain the same way;
+ * empty explicitly requests an empty chain. */
 ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out);
 ipc_result ipc_args_read_stdin(ipc_args *args, int fd);
 void ipc_args_fini(ipc_args *args);

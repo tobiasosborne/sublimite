@@ -65,6 +65,19 @@ static int setting(void *ctx, const char *path, const config_value *v)
     } else if (!strcmp(path, "font.family") || !strcmp(path, "font.file")) {
         if (v->type != CONFIG_STRING || !*v->string || strpbrk(v->string, "\n\r\t")) return CONFIG_ERR_VALUE;
         strcpy(!strcmp(path, "font.file") ? s->font_file : s->font_family, v->string);
+    } else if (!strcmp(path, "font.fallbacks")) {
+        /* edit-6e2: ordered array only; entries obey font.family's rules. */
+        if (v->type != CONFIG_STRINGS) return CONFIG_ERR_VALUE;
+        size_t used = 0;
+        for (size_t i = 0; i < v->count; i++) {
+            size_t n = strlen(v->strings[i]);
+            if (!n || strpbrk(v->strings[i], "\n\r\t")) return CONFIG_ERR_VALUE;
+            /* (P) entry + separator/NUL never exceeds the parser's shared bound */
+            if (used + n + 1u > sizeof s->font_fallbacks) return CONFIG_ERR_LIMIT;
+            if (used) s->font_fallbacks[used - 1u] = '\n';
+            memcpy(s->font_fallbacks + used, v->strings[i], n + 1u); used += n + 1u;
+        }
+        if (!v->count) s->font_fallbacks[0] = 0;
     } else if (!strcmp(path, "theme")) {
         if (v->type != CONFIG_STRING) return CONFIG_ERR_VALUE;
         if (!strcmp(v->string, "dark")) s->theme = CONFIG_DARK;

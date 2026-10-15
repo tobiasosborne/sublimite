@@ -92,6 +92,9 @@ typedef struct editor_config {
      * environment pair and config pair. Empty explicitly selects embedded.
      * Copied during open; file wins within the selected source. */
     const char *font_family, *font_file;
+    /* edit-6e2: comma-separated font.fallbacks chain from the CLI. Non-NULL
+     * (even empty) overrides EDIT_FONT_FALLBACKS and the config key. */
+    const char *font_fallbacks;
 } editor_config;
 typedef struct editor_stats {
     uint64_t input_sequence, submitted_sequence, presented_sequence;
@@ -104,6 +107,7 @@ typedef struct editor_stats {
     int journal_error, error_cause; /* underlying module code on stopped loop */
     uint64_t font_changes; /* adopted atlas generations, including failure fallback */
     int font_error;
+    uint32_t font_fallback_skipped; /* edit-6e2: unresolvable chain entries, adopted version */
     bool font_pending;
     int backend_init_error;           /* failed GPU init, 0 if no fallback */
 } editor_stats;

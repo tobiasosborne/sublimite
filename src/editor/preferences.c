@@ -20,6 +20,36 @@ static void font_selection_set(editor *e, const char *family, const char *font_f
     strcpy(e->preferences_font_file, font_file);
     e->preferences_font_selection_pending = true;
 }
+/* edit-6e2: the chain text crosses config -> editor -> font unchanged. */
+_Static_assert(FONT_CHAIN_TEXT_MAX == CONFIG_TEXT_CAP, "font.fallbacks text bound is the config bound");
+/* CLI/env form: comma-separated, surrounding spaces trimmed, empty entries
+ * dropped, joined by '\n' like the config key. Output never exceeds input. */
+static int chain_from_list(char *out, size_t cap, const char *list)
+{
+    size_t used = 0;
+    if (strlen(list) >= cap || strpbrk(list, "\n\r\t")) return -1;
+    for (const char *at = list;;) {
+        const char *end = strchr(at, ',');
+        if (!end) end = at + strlen(at);
+        const char *first = at, *last = end;
+        while (first < last && *first == ' ') first++;
+        while (last > first && last[-1] == ' ') last--;
+        if (last > first) {
+            if (used) out[used++] = '\n';
+            memcpy(out + used, first, (size_t)(last - first)); used += (size_t)(last - first);
+        }
+        if (!*end) break;
+        at = end + 1;
+    }
+    out[used] = 0;
+    return 0;
+}
+static void font_fallbacks_set(editor *e, const char *chain)
+{
+    if (!strcmp(e->preferences_font_fallbacks, chain)) return;
+    memcpy(e->preferences_font_fallbacks, chain, strlen(chain) + 1u);
+    e->preferences_font_selection_pending = true;
+}
 static int font_selection_poll(editor *e)
 {
     if (!e->preferences_font_selection_pending) return 0;
@@ -30,10 +60,12 @@ static int font_selection_poll(editor *e)
     /* A reload can return to the in-flight selection before it is adopted.
      * Compare original UI requests, never worker-resolved file paths. */
     if (!strcmp(parsed.family, requested->family) && !strcmp(parsed.file, requested->file) &&
-        parsed.index == requested->index) {
+        parsed.index == requested->index &&
+        !strcmp(e->preferences_font_fallbacks, e->font.fallbacks)) {
         e->preferences_font_selection_pending = false; return 0;
     }
-    int rc = editor_font_request(e, e->preferences_font_family, e->preferences_font_file);
+    int rc = editor_font_request_chain(e, e->preferences_font_family, e->preferences_font_file,
+                                       e->preferences_font_fallbacks);
     if (rc == EDITOR_MORE) return 0; /* retained and retried on the next turn */
     if (!rc) e->preferences_font_selection_pending = false;
     return rc;
@@ -52,8 +84,24 @@ int editor_preferences_font_init(editor *e)
         font_file = settings ? settings->font_file : NULL;
     }
     font_selection_set(e, family, font_file);
+    /* edit-6e2: the chain has its own edit-5ih precedence: CLI (even empty)
+     * > EDIT_FONT_FALLBACKS (non-empty) > config font.fallbacks. */
+    const char *list = e->cfg.font_fallbacks;
+    e->preferences_font_fallbacks_override = list != NULL;
+    if (!list) {
+        list = getenv("EDIT_FONT_FALLBACKS");
+        e->preferences_font_fallbacks_override = list && *list;
+    }
+    char chain[FONT_CHAIN_TEXT_MAX] = "";
+    if (e->preferences_font_fallbacks_override) {
+        if (chain_from_list(chain, sizeof chain, list)) { editor_font_bad_config(e); chain[0] = 0; }
+    } else {
+        const config_settings *settings = config_runtime_current(e->preferences_runtime);
+        if (settings) memcpy(chain, settings->font_fallbacks, sizeof chain);
+    }
+    font_fallbacks_set(e, chain);
     /* args/env storage may be released as soon as open returns. */
-    e->cfg.font_family = e->cfg.font_file = NULL;
+    e->cfg.font_family = e->cfg.font_file = e->cfg.font_fallbacks = NULL;
     return font_selection_poll(e);
 }
 
@@ -95,6 +143,7 @@ int editor_preferences_apply(editor *e)
     const config_settings *s = &e->preferences;
     if (!e->preferences_font_selection_override)
         font_selection_set(e, s->font_family, s->font_file);
+    if (!e->preferences_font_fallbacks_override) font_fallbacks_set(e, s->font_fallbacks);
     e->cfg.font_points = e->preferences_font_override != 0.0 ? e->preferences_font_override : s->font_points;
     if (!e->font.legacy) {
         double points = e->cfg.font_points != 0.0 ? e->cfg.font_points : EDITOR_FONT_DEFAULT_PT;
