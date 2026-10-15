@@ -13,6 +13,7 @@
 #include "trace/trace_fmt.h"
 #include "file/file_test.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1430,8 +1431,191 @@ static int relative_motion(void)
     puts("edit-jf9 headless relative motion: ok");
     return 0;
 }
+/* edit-mmp: keys typed right after open, while the background line index is
+ * still building, are applied and never fail editor_step. Fixture (P): a
+ * 2 MiB COPY file (2^21 bytes, LF every 64th byte; above FILE_PREFIX_MAX, so
+ * the COPY is asynchronous and the buffer lazy: edit-28u case (c)'s file).
+ * The edit script is edit-28u's small_child: "EF" at the end, three forward
+ * deletes 5 bytes past the prefix, "AB" at byte 100. A bulk hold (below)
+ * makes every burst precede index completion; reindex instead edits after
+ * the first index and continues while the rebuild runs. MMP_RUNS = 40 opens
+ * per case: (M) edit-28u saw the failure in 3 of 40 unheld runs. Counts runs
+ * whose editor_step failed and settles that outlived EDITOR_IDLE_NS (E: the
+ * existing editor watchdog); settle times are tracked prints, not asserts.
+ * EDIT_MMP_REPRO=1 [EDIT_MMP_MIB=n] [EDIT_MMP_REINDEX=1] runs one case alone;
+ * sizes above FILE_PREFIX_MAX + 64 KiB stay sparse: the first MiB of rows,
+ * the last 64 KiB of rows, one LF per MiB between. GiB sizes run without a
+ * journal (this tree's checkpoint copies the whole text). */
+#define MMP_RUNS 40u
+#define MMP_SMALL ((uint64_t)1 << 21)
+#define MMP_GIB ((uint64_t)1 << 30)
+#define MMP_ROWS (64u * 1024u)
+typedef struct mmp_tally { unsigned failed, overdue, unheld; int first_rc; uint64_t max_settle_ns, max_key_ns; bool keys; int mode; } mmp_tally;
+static int mmp_settle(editor *e, mmp_tally *t, bool *bad)
+{
+    uint64_t start = trace_now_ns(), limit = start + EDITOR_IDLE_NS;
+    for (;;) {
+        int rc = editor_step(e, 0);
+        if (rc != EDITOR_OK && rc != EDITOR_MORE) { if (!t->first_rc) t->first_rc = rc; *bad = true; return rc; }
+        editor_stats s = editor_get_stats(e);
+        if (!s.pending && !s.render_active && !s.open_pending) break;
+        if (trace_now_ns() >= limit) { t->overdue++; return 1; }
+    }
+    uint64_t d = trace_now_ns() - start; if (d > t->max_settle_ns) t->max_settle_ns = d;
+    if (t->keys && d > t->max_key_ns) t->max_key_ns = d;
+    return 0;
+}
+static int mmp_type(editor *e, const char *text, uint32_t sym, mmp_tally *t, bool *bad)
+{
+    for (const char *c = text; *c; c++) {
+        plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = sym ? sym : (uint8_t)*c,
+            .utf8_len = (uint8_t)(sym ? 0u : 1u), .t0_ns = trace_now_ns()};
+        if (!sym) key.utf8[0] = (uint8_t)*c;
+        T(editor_inject(e, &key) == 0);
+        t->keys = true; int rc = mmp_settle(e, t, bad); t->keys = false; if (rc) return rc;
+    }
+    return 0;
+}
+static int mmp_fixture(const char *path, uint64_t size)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+    bool ok = ftruncate(fd, (off_t)size) == 0;
+    static uint8_t rows[MMP_ROWS];
+    for (size_t i = 0; i < sizeof rows; i++) rows[i] = i % 64u == 63u ? '\n' : (uint8_t)('a' + i % 26u);
+    if (size == MMP_SMALL) {
+        for (uint64_t at = 0; ok && at < size; at += sizeof rows) ok = pwrite(fd, rows, sizeof rows, (off_t)at) == (ssize_t)sizeof rows;
+    } else {
+        for (uint64_t at = 0; ok && at < FILE_PREFIX_MAX; at += sizeof rows) ok = pwrite(fd, rows, sizeof rows, (off_t)at) == (ssize_t)sizeof rows;
+        ok = ok && pwrite(fd, rows, sizeof rows, (off_t)(size - sizeof rows)) == (ssize_t)sizeof rows;
+        /* One LF per MiB keeps the sparse middle a file of 1 MiB lines (one
+         * 4 KiB block per MiB on disk) instead of one ~1 GiB line. */
+        for (uint64_t at = FILE_PREFIX_MAX; ok && at + FILE_PREFIX_MAX <= size - sizeof rows; at += FILE_PREFIX_MAX)
+            ok = pwrite(fd, "\n", 1, (off_t)(at + FILE_PREFIX_MAX - 1u)) == 1;
+    }
+    T(close(fd) == 0); T(ok); return 0;
+}
+/* Deterministic race: a bulk job that yields its lane (work_continue: back
+ * of the bulk FIFO) until the asynchronous COPY is ready, then holds the
+ * single bulk lane, so the index build that adoption submits queues behind
+ * it and every key of the burst lands before the index can complete.
+ * (E) The hold is bounded by EDITOR_IDLE_NS, the existing editor watchdog. */
+typedef struct mmp_hold { const file *f; _Atomic bool holding, release; } mmp_hold;
+static void mmp_hold_fn(work_ctx *c)
+{
+    mmp_hold *h = c->arg;
+    if (!file_open_ready(h->f)) { if (!work_should_stop(c)) (void)work_continue(c); return; }
+    atomic_store(&h->holding, true);
+    uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!atomic_load(&h->release) && !work_should_stop(c) && trace_now_ns() < limit)
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+}
+/* reindex: wait for the first index, then type near the head (the edit
+ * reopens the index) and continue at EOF while the rebuild runs. */
+static int mmp_run(const char *path, const char *log, uint64_t size, bool reindex, mmp_tally *t)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = path, .journal_path = log, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    bool bad = false;
+    mmp_hold hold = {.f = e->buffer->file}; atomic_init(&hold.holding, false); atomic_init(&hold.release, false);
+    work_handle held = {0};
+    if (!reindex && e->buffer->file && e->buffer->pending_open) {
+        held = work_submit(&e->pool, (work_job){mmp_hold_fn, &hold, 0, WORK_BULK}); T(held.epoch);
+    }
+    /* (P) Positions: end of file, 5 bytes past the 1 MiB prefix, byte 100. */
+    uint64_t p2 = FILE_PREFIX_MAX + 5u, p1 = 100u;
+    int rc = mmp_settle(e, t, &bad);
+    if (reindex) {
+        uint64_t limit = trace_now_ns() + EDITOR_IDLE_NS;
+        while (!rc && !editor_index_complete(e)) {
+            rc = editor_step(e, 0);
+            if (rc == EDITOR_MORE) rc = 0;
+            if (!rc && trace_now_ns() >= limit) { t->overdue++; rc = 1; }
+        }
+        if (!rc) rc = mmp_settle(e, t, &bad);
+        if (!rc) rc = editor_set_cursor(e, p1);
+        if (!rc) rc = mmp_type(e, "A", 0, t, &bad);
+        if (!rc) rc = editor_set_cursor(e, size + 1u);
+        if (!rc) rc = mmp_type(e, "B", 0, t, &bad);
+    }
+    bool indexing = !editor_index_complete(e);
+    t->mode = e->buffer->file ? (int)file_open_mode(e->buffer->file) : -1;
+    uint64_t base = editor_length(e);
+    if (!rc) rc = editor_set_cursor(e, base);
+    if (!rc) rc = mmp_type(e, "EF", 0, t, &bad);
+    if (!rc) rc = editor_set_cursor(e, p2);
+    if (!rc) rc = mmp_type(e, "ddd", XKB_KEY_Delete, t, &bad);
+    if (!rc) rc = editor_set_cursor(e, p1);
+    if (!rc) rc = mmp_type(e, "AB", 0, t, &bad);
+    if (held.epoch) {
+        if (!atomic_load(&hold.holding)) t->unheld++;
+        atomic_store(&hold.release, true);
+        while (!work_handle_finished(&e->pool, held)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    uint64_t len = editor_length(e);
+    /* (P) +2 typed, -3 deleted, +2 typed. */
+    if (!rc && len != base + 1u) rc = 1;
+    if (rc && !bad && !t->first_rc) t->first_rc = rc;
+    if (rc) t->failed++;
+    if (rc) fprintf(stderr, "editor_large_test: edit-mmp size=%llu reindex=%d rc=%d error_cause=%d indexing_at_burst=%d len=%llu\n",
+        (unsigned long long)size, reindex, rc, e->stats.error_cause, indexing, (unsigned long long)len);
+    editor_close(e);
+    return 0;
+}
+static int mmp_remove_tree(const char *root)
+{
+    DIR *d = opendir(root); if (!d) return 0;
+    struct dirent *ent; int rc = 0;
+    while ((ent = readdir(d))) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        char sub[512]; if (snprintf(sub, sizeof sub, "%s/%s", root, ent->d_name) >= (int)sizeof sub) { rc = 1; continue; }
+        struct stat st;
+        if (lstat(sub, &st) == 0 && S_ISDIR(st.st_mode)) rc |= mmp_remove_tree(sub);
+        else if (unlink(sub)) rc = 1;
+    }
+    closedir(d);
+    return rmdir(root) ? 1 : rc;
+}
+/* Each iteration owns a private XDG_DATA_HOME under the fixture root and
+ * removes it before the next open, on every path. The 1 GiB mapped case runs
+ * without a journal: this tree's checkpoints write the whole text (the
+ * pre-edit-28u journal), which a 40-open loop must never do. */
+static int mmp_body(const char *root, uint64_t size, bool reindex, mmp_tally *t)
+{
+    char path[256], log[256], xdg[256];
+    T(snprintf(path, sizeof path, "%s/source", root) > 0); T(snprintf(log, sizeof log, "%s/session", root) > 0);
+    T(snprintf(xdg, sizeof xdg, "%s/xdg", root) > 0);
+    T(mmp_fixture(path, size) == 0);
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[256] = "";
+    if (saved) (void)snprintf(keep, sizeof keep, "%s", saved);
+    int rc = 0;
+    for (unsigned run = 0; !rc && run < MMP_RUNS; run++) {
+        T(mkdir(xdg, 0700) == 0); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+        rc = mmp_run(path, size < MMP_GIB ? log : NULL, size, reindex, t);
+        (void)unlink(log);
+        if (mmp_remove_tree(xdg)) rc = 1;
+    }
+    if (saved) (void)setenv("XDG_DATA_HOME", keep, 1); else (void)unsetenv("XDG_DATA_HOME");
+    return rc;
+}
+static int typing_while_indexing(uint64_t size, bool reindex)
+{
+    char root[] = "build/editor-large-mmp-XXXXXX"; T(mkdtemp(root));
+    mmp_tally t = {0};
+    int rc = mmp_body(root, size, reindex, &t);
+    T(mmp_remove_tree(root) == 0);
+    char power[16] = "?"; FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fscanf(f, "%15s", power) != 1) power[0] = '?'; fclose(f); }
+    double load1 = 0; f = fopen("/proc/loadavg", "r"); if (f) { if (fscanf(f, "%lf", &load1) != 1) load1 = 0; fclose(f); }
+    printf("editor_large_test: edit-mmp typing while indexing size=%llu reindex=%d runs=%u failed=%u overdue=%u unheld=%u first_rc=%d max_settle=%.3f ms max_key_settle=%.3f ms (M) mode=%s power=%s load1=%.2f\n",
+        (unsigned long long)size, reindex, MMP_RUNS, t.failed, t.overdue, t.unheld, t.first_rc, (double)t.max_settle_ns / 1e6, (double)t.max_key_ns / 1e6, t.mode == (int)FILE_MODE_COPY ? "copy" : t.mode == (int)FILE_MODE_MMAP ? "mmap" : "?", power, load1);
+    T(fflush(stdout) == 0);
+    T(rc == 0); T(t.failed == 0); T(t.overdue == 0);
+    return 0;
+}
 int main(void)
 {
+    if (getenv("EDIT_MMP_REPRO")) { trace_init(); (void)trace_thread_register(); return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL); }
     trace_init(); (void)trace_thread_register();
     if (getenv("EDIT_JF9_VIEW")) return relative_motion();
     T(relative_motion() == 0);
@@ -1479,6 +1663,8 @@ int main(void)
     T(mapped_preview_first() == 0);
     T(mapped_find_boundaries() == 0);
     T(gutter_estimates() == 0);
+    T(typing_while_indexing(MMP_SMALL, false) == 0);
+    T(typing_while_indexing(MMP_SMALL, true) == 0);
 xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);

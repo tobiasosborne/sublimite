@@ -49,8 +49,14 @@ void editor_large_init(editor_buffer *b)
     (void)file_prefix(b->file, &plen);
     lg->prefix_lines = pi->lf + pi->crlf; lg->prefix_bytes = plen;
     uint64_t size = b->pending_open ? file_size(b->file) : piece_len(b->tree);
-    if (plen >= size) { b->lines = lg->prefix_lines + 1; lg->lines_exact = true; }
-    else b->lines = estimate_line(b, size) + 1;
+    /* edit-mmp: a pending COPY preview set lines_exact for the preview's own
+     * count (buffers.c prepare). Adoption re-enters here with the whole
+     * source: the total is exact only if the prefix covered it, else it is a
+     * density estimate until index_progress publishes the index. A stale
+     * true here let scroll adopt a density label as exact and layout clip
+     * every row as past EOF while typing raced the index build. */
+    lg->lines_exact = plen >= size;
+    b->lines = lg->lines_exact ? lg->prefix_lines + 1 : estimate_line(b, size) + 1;
 }
 static void warm_fn(work_ctx *c)
 {
