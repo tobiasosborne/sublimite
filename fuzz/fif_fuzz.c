@@ -32,6 +32,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * are excluded here because malformed-pattern recovery is unspecified. */
     if (!strpbrk(include, "[\\") && !strstr(include, "**"))
         MUST(fif_glob_match(include, path) == (fnmatch(include, path, FNM_PATHNAME) == 0));
+    /* edit-n95: context cuts keep whole lines, never exceed the cap, back off
+     * at most three bytes (P: four-byte UTF-8 maximum) and stop on the first
+     * byte that is not a continuation byte. */
+    size_t cap = size ? data[0] : 0, cut = fif_context_cut(data, size, cap);
+    if (size <= cap) MUST(cut == size);
+    else {
+        MUST(cut <= cap && cap - cut <= 3u);
+        if (cut < cap) MUST((data[cut + 1u] & 0xc0u) == 0x80u); /* stepped back over it */
+        if (cut && cap - cut < 3u) MUST((data[cut] & 0xc0u) != 0x80u); /* stopped on a boundary */
+    }
     MUST(fif_glob_match("**", path));
     MUST(!fif_glob_match(NULL, path));
     return 0;

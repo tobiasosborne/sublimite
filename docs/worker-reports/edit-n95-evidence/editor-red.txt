@@ -1,0 +1,3 @@
+display guard: real display :0 refused, using :99
+editor_test:4692: FAIL e->find_visible && e->fif.mode
+EXIT 1

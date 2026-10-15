@@ -369,6 +369,11 @@ static int delete_part(editor *e, uint64_t lo, uint64_t old, undo_kind kind,
 static int mutate_text(editor *e, uint64_t lo, uint64_t old, const uint8_t *text,
                        size_t n, undo_kind kind, text_kind tk)
 {
+    /* edit-n95: a read-only buffer refuses the edit without an error. */
+    if (editor_read_only(e)) {
+        e->v.state.selection = e->old_selection; e->action = EDITOR_ACTION_NONE;
+        e->stats.rejected_commands++; return editor_refresh_cursor(e, e->old_cursor);
+    }
     if (!old && !n && tk == TEXT_BYTES) { e->v.state.selection = e->old_selection; e->action = EDITOR_ACTION_NONE; return editor_refresh_cursor(e, e->old_cursor); }
     if (e->journal && (e->op_count + 3 > EDITOR_STAGE_OPS || n > EDITOR_STAGE_BYTES - e->stage_used)) {
         e->stats.rejected_commands++; return editor_refresh_cursor(e, e->old_cursor);
@@ -419,6 +424,7 @@ static int mutate(editor *e, uint64_t lo, uint64_t old, const uint8_t *text, siz
 { return mutate_text(e, lo, old, text, n, kind, TEXT_BYTES); }
 int editor_replace_begin(editor *e, size_t len)
 {
+    if (editor_read_only(e)) return EDITOR_ERR_ARG; /* callers check read-only first */
     uint64_t lo = min64(e->old_selection.cursor, e->old_selection.anchor);
     uint64_t old = max64(e->old_selection.cursor, e->old_selection.anchor) - lo;
     int rc = check_index_edit(e, lo, old, len); if (rc) return rc;
@@ -450,6 +456,20 @@ int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t 
     return rc ? prefix_error(e, rc) : 0;
 }
 int editor_replace_end(editor *e, uint64_t target) { return repair(e, target); }
+/* edit-n95: the results owner appends through the piece tree's ordinary
+ * insert and the shared change bookkeeping; the read-only refusal applies
+ * to user edits only. No undo record and no journal staging: the buffer is
+ * derived and does not survive hot exit. */
+int editor_results_append(editor *e, const uint8_t *bytes, size_t length)
+{
+    if (!e->buffer->read_only || !e->buffer->derived || (!bytes && length)) return EDITOR_ERR_ARG;
+    if (!length) return 0;
+    uint64_t off = piece_len(e->tree), nl = 0;
+    if (e->buffer->index && lineidx_edit_check(e->buffer->index, off, 0, length)) return EDITOR_ERR_CAPACITY;
+    for (size_t i = 0; i < length; i++) nl += bytes[i] == '\n' ? 1u : 0u;
+    int rc = piece_insert(e->tree, off, bytes, length); if (rc) return rc;
+    return changed(e, off, 0, length, 0, nl);
+}
 static bool default_edit_key(keys_action action)
 {
     switch (action) {
@@ -605,6 +625,7 @@ static int default_edit(editor *e, const keys_binding *binding)
         e->selection_command = true;
         return replay_follow(e, false);
     }
+    if (editor_read_only(e)) { e->stats.rejected_commands++; return editor_refresh_cursor(e, e->old_cursor); }
     if (e->journal && (e->op_count + 2u > EDITOR_STAGE_OPS ||
         plan.length > EDITOR_STAGE_BYTES - e->stage_used)) return default_edit_notice(e);
     rc = check_index_edit(e, plan.offset, plan.old_len, plan.length); if (rc) return rc;
@@ -664,6 +685,7 @@ static int replay_slice(editor *e)
 }
 static int replay_history(editor *e, bool redo)
 {
+    if (editor_read_only(e)) { e->stats.rejected_commands++; return editor_refresh_cursor(e, e->old_cursor); }
     if ((!redo && !e->buffer->history_cursor) || (redo && e->buffer->history_cursor == e->buffer->history_count)) return editor_refresh_cursor(e, e->old_cursor);
     editor_delta d = *delta_at(e, redo ? e->buffer->history_cursor : e->buffer->history_cursor - 1);
     if (e->journal && e->op_count + 2 > EDITOR_STAGE_OPS) return EDITOR_ERR_MEMORY;
@@ -947,6 +969,9 @@ static int large_doc_end(editor *e, bool extend)
 }
 int editor_handle_key(editor *e, const plat_event *ev)
 {
+    /* edit-n95: Escape cancels a running find in files first; the partial
+     * results stay. With no search running Escape keeps its panel meaning. */
+    if (!e->go.active && ev->press && ev->keysym == XKB_KEY_Escape && editor_fif_cancel(e)) return 0;
     /* An open go-to-line prompt owns Escape and digits over the find panel. */
     if (!e->go.active && ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
         (void)editor_find_key(e,ev); return 0;
@@ -975,6 +1000,9 @@ int editor_handle_key(editor *e, const plat_event *ev)
     bool common = binding && (binding->action == KEYS_ACTION_NEW_FILE || binding->action == KEYS_ACTION_OPEN_FILE ||
         binding->action == KEYS_ACTION_SAVE_AS || binding->action == KEYS_ACTION_EXIT || binding->action == KEYS_ACTION_SCROLL_LINES);
     if (!e->go.active && (editor_find_action(e, ev, binding) || (!common && editor_find_key(e, ev)))) return 0;
+    /* edit-n95: Enter on a Find Results line opens its hit (or file). */
+    if (!e->go.active && editor_fif_results_active(e) && !(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER)) &&
+        (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter)) return editor_fif_open_at_caret(e);
     if (ev->keysym == XKB_KEY_Control_L || ev->keysym == XKB_KEY_Control_R ||
         ev->keysym == XKB_KEY_Shift_L || ev->keysym == XKB_KEY_Shift_R ||
         ev->keysym == XKB_KEY_Alt_L || ev->keysym == XKB_KEY_Alt_R ||
@@ -1015,7 +1043,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         undo_break_burst(e->undo); soft_record(e, false);
         return editor_full_layout(e);
     }
-    if (action == KEYS_ACTION_SAVE) return e->buffer->placeholder ? 0 : editor_save_request(e, ev->t0_ns); /* edit-qct: inert */
+    if (action == KEYS_ACTION_SAVE) return e->buffer->placeholder || e->buffer->derived ? 0 : editor_save_request(e, ev->t0_ns); /* edit-qct: inert; edit-n95: derived */
     if (action == KEYS_ACTION_FONT_SIZE) return editor_font_zoom(e, binding->args.value);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;
@@ -1035,6 +1063,10 @@ int editor_handle_key(editor *e, const plat_event *ev)
     bool editing = default_edit_key(action);
     bool go = e->go.active || action == KEYS_ACTION_GOTO_LINE || action == KEYS_ACTION_OPEN_FILE || action == KEYS_ACTION_SAVE_AS;
     bool scroll = action == KEYS_ACTION_SCROLL_LINES;
+    /* edit-n95: cut and paste would edit a read-only buffer; copy is fine. */
+    if ((action == KEYS_ACTION_CUT || action == KEYS_ACTION_PASTE) && editor_read_only(e)) {
+        e->stats.rejected_commands++; return 0;
+    }
     if (action == KEYS_ACTION_COPY || action == KEYS_ACTION_CUT ||
         action == KEYS_ACTION_PASTE) {
         e->command_key = *command; e->command_binding = binding;
@@ -1291,6 +1323,11 @@ int editor_pointer(editor *e, const plat_event *ev)
         bool shift=(ev->mods&PLAT_MOD_SHIFT)!=0, gutter=(uint32_t)col<e->lay.gw;
         e->text_drag_mode=gutter ? 3u : shift ? 1u : e->click_count;
         e->click_ns=now; e->click_row=(uint32_t)row; e->click_col=(uint32_t)col; e->click_byte=byte;
+        /* edit-n95: a double-click on a Find Results line opens its hit. */
+        if (e->click_count==2 && !shift && !gutter && editor_fif_results_active(e)) {
+            e->v.state.selection.anchor=byte; e->text_drag=false;
+            return editor_fif_open_at_caret(e);
+        }
         if (gutter && shift) e->text_drag_lo=e->text_drag_hi=e->v.state.selection.anchor;
         if (!shift || gutter) e->v.state.selection.anchor=byte;
         if (gutter || (e->click_count>1 && !shift)) {

@@ -237,6 +237,7 @@ int editor_refresh_placed(editor *e, uint64_t old_cursor)
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
+    if (editor_fif_receive(e, msg)) return; /* edit-n95: counts only; assembly is a UI service */
     if (editor_font_receive(e, msg)) return;
     if (editor_map_receive(e, msg)) return;
     if (e->find.private_ && findui_accept(&e->find, msg)) {
@@ -486,7 +487,8 @@ int editor_text_geometry(editor *e)
     uint32_t available=e->text_grid.dims.rows;
     /* P: query row; replacement mode adds its field and hints row. Recompute
      * the desired size, since the last surface may have clipped the panel. */
-    e->panel_rows=e->find_visible ? (findui_get_state(&e->find).replace_mode ? 3u : 1u) : 0u;
+    /* edit-n95: find in files adds the Where field and its hints row. */
+    e->panel_rows=e->find_visible ? (findui_get_state(&e->find).replace_mode || e->fif.mode ? 3u : 1u) : 0u;
     if (e->panel_rows>=available) e->panel_rows=available>1 ? available-1 : 0;
     e->text_grid.dims.rows-=e->panel_rows;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
@@ -638,7 +640,7 @@ static bool runnable(const editor *e)
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
-           e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) ||
+           e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) || editor_fif_runnable(e) ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
@@ -696,6 +698,7 @@ int editor_step(editor *e, int timeout_ms)
     editor_refresh_flush(e);
     if (!rc && e->find.private_) (void)findui_maintain(&e->find);
     if (!rc) rc = editor_find_service(e);
+    if (!rc) rc = editor_fif_service(e);
     if (!rc) rc = editor_map_service(e);
     if (!rc) editor_hl_service(e);
     if (!rc) rc = editor_restore_service(e);
@@ -852,7 +855,7 @@ editor_stats editor_get_stats(const editor *e)
     s.font_pending = e->font.requested_generation != e->font.applied_generation;
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
     s.pending = e->file_command != KEYS_ACTION_NONE || editor_pointer_scrolling(e) || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
-        e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending ||
+        e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending || editor_fif_pending(e) ||
         e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;

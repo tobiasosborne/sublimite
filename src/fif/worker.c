@@ -11,8 +11,11 @@ static bool stopped(fif_impl *impl, const work_ctx *context)
     if (!work_should_stop(context)) return false;
     impl->done.cancelled = true; impl->done.code = FIF_CANCELLED; return true;
 }
-static void io_error(fif_impl *impl)
-{ impl->done.errors++; impl->done.code = FIF_ERR_IO; }
+/* edit-n95: an unreadable entry below the root is counted (DONE.errors) and
+ * the walk continues; the job's code stays OK. FIF_ERR_IO is reserved for a
+ * walk that never started: the root itself is missing or unreadable. */
+static void io_error(fif_impl *impl) { impl->done.errors++; }
+static void root_error(fif_impl *impl) { impl->done.errors++; impl->done.code = FIF_ERR_IO; }
 /* In-place heapsort avoids libc qsort's optional heap allocation. (P) Binary
  * heap children are 2*i+1 and 2*i+2, from breadth-first array indexing. */
 static void sift(fif_node *nodes, size_t root, size_t count)
@@ -193,7 +196,7 @@ static bool search_next(fif_impl *impl, const work_ctx *context)
         size_t length = impl->line_end - impl->line_start;
         if (length && impl->bytes[impl->line_start + length - 1u] == '\r') length--;
         hit->truncated = length > impl->limits.context_columns;
-        hit->length = hit->truncated ? impl->limits.context_columns : length;
+        hit->length = fif_context_cut(impl->bytes + impl->line_start, length, impl->limits.context_columns);
         uint8_t *text = impl->contexts + (size_t)index * (impl->limits.context_columns + 1u);
         /* Copy in metered chunks even when a caller raises the context cap. */
         for (size_t i = 0; i < hit->length;) {
@@ -229,11 +232,16 @@ void fif_worker(work_ctx *context)
                 impl->search_complete = true; return;
             }
         }
+        /* edit-n95: the root itself may be a symlink (~/proj -> /data/proj);
+         * stat follows it. Entries below the root keep the lstat skip rule. */
         struct stat st;
-        if (lstat(impl->root, &st) || !S_ISDIR(st.st_mode)) {
-            io_error(impl); impl->search_complete = true; return;
+        if (stat(impl->root, &st) || !S_ISDIR(st.st_mode)) {
+            root_error(impl); impl->search_complete = true; return;
         }
-        if (!directory(impl, impl->root, context)) { impl->search_complete = true; return; }
+        bool walking = directory(impl, impl->root, context);
+        /* No root frame without cancellation/exhaustion: opendir/fstat failed. */
+        if (walking && !impl->frames_count) { impl->done.errors--; root_error(impl); }
+        if (!walking || !impl->frames_count) { impl->search_complete = true; return; }
     }
     for (;;) {
         if (stopped(impl, context)) break;

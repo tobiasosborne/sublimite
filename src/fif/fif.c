@@ -140,3 +140,12 @@ const char *fif_results_path(const fif_job *job, uint32_t index)
         !atomic_load_explicit(&job->impl->files[index].ready, memory_order_acquire)) return NULL;
     return job->impl->files[index].path;
 }
+size_t fif_context_cut(const uint8_t *line, size_t length, size_t cap)
+{
+    if (!line || length <= cap) return length;
+    /* (P) A UTF-8 scalar is at most four bytes: at most three continuation
+     * bytes (10xxxxxx) follow its lead. Longer malformed runs cut in place. */
+    size_t cut = cap;
+    for (unsigned back = 0; cut && back < 3u && (line[cut] & 0xc0u) == 0x80u; back++) cut--;
+    return cut;
+}

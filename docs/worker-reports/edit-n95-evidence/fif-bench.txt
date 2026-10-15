@@ -1,0 +1,6 @@
+BAT0=Not charging load1=4.34
+fif_bench: (M)[AC] power=Not charging load1=4.34 fixture=/tmp/edit-corpus
+fif_bench: bytes=339738656 files=7 truncated=1 errors=0 code=0 targets=(E)G6_scaled_by_read_bytes
+BENCH name=G6f_walk_search_tracked n=100 p50=413106241 p99=663115121 ci95=[395666122,420132615] gate_p50=27179092 gate_p99=42467332 pass=0 MISS power=[AC]
+EXIT 0
+after load1=3.39

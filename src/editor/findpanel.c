@@ -37,10 +37,12 @@ int editor_find_init(editor *e)
     if (!e->find_ranges) return EDITOR_ERR_MEMORY;
     for (uint32_t i=0;i<LAYOUT_ASCII_GLYPHS;i++) e->find_ascii[i]=i;
     findui_mutation_host host={e,preflight,editor_find_delete,editor_find_insert};
-    return findui_set_mutation_host(&e->find,&host)==FINDUI_OK ? 0 : EDITOR_ERR_ARG;
+    if (findui_set_mutation_host(&e->find,&host)!=FINDUI_OK) return EDITOR_ERR_ARG;
+    return editor_fif_init(e);
 }
 void editor_find_close(editor *e)
 {
+    editor_fif_close(e); /* drains its jobs on the still-live pool */
     if (e->find.private_) {
         if (e->find_replace_active) {
             (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e);
@@ -178,6 +180,7 @@ static void navigate(editor *e, int direction)
 }
 static void replace_begin(editor *e, bool all)
 {
+    if (editor_read_only(e)) { e->stats.rejected_commands++; e->find_replace_request=0; return; } /* edit-n95 */
     findui_state state=findui_get_state(&e->find);
     if (state.searching) { e->find_replace_request=all ? 2 : 1; return; }
     if (!state.complete) { e->find_error=FINDUI_ERR_FIND; e->find_replace_request=0; return; }
@@ -276,6 +279,7 @@ int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool repla
         if (bytes[i]=='\r' && i+1u<length && bytes[i+1u]=='\n') continue;
         normalized[count++]=bytes[i];
     }
+    if (e->fif.mode && e->fif.where_focus) return editor_fif_paste(e,normalized,count); /* edit-n95 */
     findui_state state=findui_get_state(&e->find);
     if (state.replacement_focus!=replacement) return 0;
     size_t cursor=replacement ? state.replacement_cursor : state.query_cursor;
@@ -301,8 +305,21 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
          (ctrl && (ev->keysym=='a' || ev->keysym=='A' || ev->keysym=='v' || ev->keysym=='V'))))
         return false;
     switch (binding->action) {
+    case KEYS_ACTION_FIND_IN_FILES: /* edit-n95: Where field mode; cancels a running search */
+        (void)editor_find_service(e);
+        e->find_visible=true;
+        (void)findui_show(&e->find,true,false);
+        editor_fif_show(e);
+        field_select_all(e); keys_reset(&e->keys);
+        e->find_error=geometry(e); return true;
+    case KEYS_ACTION_NEXT_RESULT: case KEYS_ACTION_PREVIOUS_RESULT: {
+        int rc=editor_fif_step(e,binding->action==KEYS_ACTION_NEXT_RESULT ? 1 : -1);
+        if (rc && !e->error) e->error=rc;
+        keys_reset(&e->keys); return true;
+    }
     case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE:
         (void)editor_find_service(e);
+        e->fif.mode=false;
         e->find_visible=true;
         (void)findui_show(&e->find,true,binding->action==KEYS_ACTION_REPLACE);
         field_select_all(e); keys_reset(&e->keys);
@@ -340,6 +357,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (ev->keysym==XKB_KEY_Escape) {
         if (e->find_replace_active) { (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e); }
         e->find_visible=false; e->find_select_pending=false; e->find_replace_request=0;
+        e->fif.mode=false;
         e->find_error=geometry(e); return true;
     }
     if (e->find_replace_active) return true;
@@ -348,7 +366,9 @@ bool editor_find_key(editor *e, const plat_event *ev)
     /* Focus owns editing chords, including Ctrl(+Alt)+Enter below. */
     if (super || (ctrl && alt && !enter)) return true;
     if (ctrl && (ev->keysym=='a' || ev->keysym=='A')) {
-        field_select_all(e); (void)editor_begin_frame(e); return true;
+        if (e->fif.mode && e->fif.where_focus) (void)editor_fif_key(e,ev); /* edit-n95 */
+        else field_select_all(e);
+        (void)editor_begin_frame(e); return true;
     }
     if (ctrl && (ev->keysym=='v' || ev->keysym=='V')) {
         e->find_error=editor_clip_find_paste(e); return true;
@@ -357,7 +377,16 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (ctrl && !enter && ev->keysym!=XKB_KEY_Left && ev->keysym!=XKB_KEY_Right &&
         ev->keysym!=XKB_KEY_BackSpace) return true;
     if (alt && !ctrl) return true;
-    if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
+    if (e->fif.mode && (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter)) {
+        int rc=editor_fif_start(e); /* edit-n95: refusals are counted, not errors */
+        if (rc && !e->error) e->error=rc;
+    } else if (e->fif.mode && ev->keysym==XKB_KEY_Tab) {
+        e->fif.where_focus=!e->fif.where_focus;
+        if (e->fif.where_focus) { e->fif.where_all=true; e->fif.where_cursor=e->fif.where_length; e->find_field_all=false; }
+        else field_select_all(e);
+    } else if (e->fif.mode && e->fif.where_focus) {
+        (void)editor_fif_key(e,ev);
+    } else if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
         if (ctrl && state.replace_mode) replace_begin(e,(ev->mods&PLAT_MOD_ALT)!=0);
         else {
             /* Return advances from the query's initial preview as well as
@@ -402,7 +431,8 @@ int editor_find_paint(editor *e)
     findui_style style={0xd8dee9,0x171b22,0x8d98a9,0x20242c,0xe5e9f0,e->find_ascii,LAYOUT_ASCII_GLYPHS};
     if (findui_render(&e->find,&e->grid,e->grid.dims.rows-e->panel_rows,e->panel_rows,&style)!=FINDUI_OK)
         return EDITOR_ERR_ARG;
-    if (e->find_field_all) {
+    editor_fif_paint(e,e->grid.dims.rows-e->panel_rows,e->panel_rows); /* edit-n95 */
+    if (e->find_field_all && !(e->fif.mode && e->fif.where_focus)) {
         findui_state state=findui_get_state(&e->find);
         uint32_t row=e->grid.dims.rows-e->panel_rows;
         uint32_t column=(uint32_t)(sizeof "Find: "-1u);

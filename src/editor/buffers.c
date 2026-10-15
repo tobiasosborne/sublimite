@@ -543,6 +543,41 @@ int editor_reopen_tab(editor *e)
     if (!rc && e->buffer->placeholder) rc = editor_restore_start(e, e->buffer);
     return rc;
 }
+/* edit-n95: Find Results. A new search gets a fresh empty buffer: swapped
+ * into the existing results tab (tabs_replace keeps ID/order; the outgoing
+ * buffer retires like an evicted closed tab) or opened as a new tab. Derived:
+ * no journal BASE, no save controller, no session leaf. */
+int editor_results_open(editor *e, uint64_t *id)
+{
+    if (!e || !id || editor_activation_busy(e)) return EDITOR_ERR_ARG;
+    size_t index = SIZE_MAX;
+    for (size_t i = 0; *id && i < tabs_count(&e->tabs); i++) if (tabs_at(&e->tabs, i)->id == *id) index = i;
+    if (index == SIZE_MAX && tabs_count(&e->tabs) == e->tabs.capacity) return EDITOR_ERR_CAPACITY;
+    editor_retire_buffers(e);
+    size_t slot = 0; while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
+    if (slot == e->buffer_capacity) return EDITOR_ERR_CAPACITY;
+    if (index != SIZE_MAX && index != tabs_active_index(&e->tabs)) {
+        int rc = editor_select_tab(e, index); if (rc) return rc;
+    }
+    editor_buffer *b = NULL;
+    int rc = editor_buffer_prepare(e, NULL, NULL, 0, &b); if (rc) return rc;
+    b->read_only = b->derived = true;
+    static const char title[] = "Find Results";
+    if (index == SIZE_MAX) {
+        rc = install(e, b, id);
+        if (rc) { editor_buffer_destroy(b); return rc; }
+        index = tabs_active_index(&e->tabs);
+    } else {
+        editor_buffer *old = find_buffer(e, tabs_at(&e->tabs, index)->buffer);
+        b->id = old->id; b->source_generation = old->source_generation + 1u;
+        b->session_slot = slot; e->buffers[slot] = b;
+        rc = tabs_replace(&e->tabs, index, b->tree, &b->undo, &b->initial, &e->v.state);
+        if (rc) { e->buffers[slot] = NULL; editor_buffer_destroy(b); return EDITOR_ERR_ARG; }
+        minimap_fini(&old->map); old->retired = true;
+    }
+    (void)tabs_rename(&e->tabs, index, title, sizeof title - 1u, "", 0);
+    return editor_activate(e);
+}
 const tabs_tab *editor_tab(const editor *e, size_t index) { return e ? tabs_at(&e->tabs, index) : NULL; }
 const render_grid *editor_grid(const editor *e) { return e ? &e->grid : NULL; }
 void editor_modified(editor *e)
@@ -608,18 +643,23 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
     uint64_t proven_lines = ln + 1u;
     for (size_t i = 0; i < n; i++) proven_lines += e->indent_bytes[i] == '\n' ? 1u : 0u;
     if (b->lines < proven_lines) b->lines = proven_lines;
+    /* edit-n95: col is a one-based display cell (tab stops at the buffer's
+     * indent width, cluster widths) for IPC; find-in-files sets
+     * open_byte_column and col is then a one-based byte column: the caret
+     * lands on the cluster holding that byte. */
+    bool bytes = e->open_byte_column;
     size_t at = 0; uint64_t cells = 0, target = col ? (uint64_t)col - 1 : 0;
-    while (at < n && cells < target && e->indent_bytes[at] != '\n' &&
+    while (at < n && (bytes ? at < target : cells < target) && e->indent_bytes[at] != '\n' &&
            !(e->indent_bytes[at] == '\r' && at + 1 < n && e->indent_bytes[at + 1] == '\n')) {
         utf8_cseg seg; utf8_cseg_init(&seg); size_t step = 0; int width = 0;
         rc = utf8_cluster_step(&seg, e->indent_bytes + at, n - at, n - at,
                               end - start == n, &step, &width);
         if (rc != UTF8_G_END) return EDITOR_ERR_CAPACITY;
         uint64_t w = e->indent_bytes[at] == '\t' ? b->style.width - cells % b->style.width : (uint64_t)width;
-        if (w > target - cells) break;
+        if (bytes ? at + step > target : w > target - cells) break;
         at += step; cells += w;
     }
-    if (at == n && end - start > n && cells < target) return EDITOR_ERR_CAPACITY;
+    if (!bytes && at == n && end - start > n && cells < target) return EDITOR_ERR_CAPACITY;
     uint32_t gutter = 0;
     if (e->layout_cfg.gutter) {
         gutter = 2; for (uint64_t value = b->lines; value >= 10; value /= 10) gutter++;
@@ -702,7 +742,7 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
             /* (P) IPC origin coordinates preserve a retained view; coordinates
              * beyond origin explicitly reposition it. Repeated paths inherit
              * the last staged view for the same logical buffer. */
-            if (request->paths[i].line > 1u || request->paths[i].col > 1u) {
+            if (request->paths[i].line > 1u || request->paths[i].col > 1u || e->open_byte_column) {
                 view_state incoming = existing == SIZE_MAX ? members[i]->initial :
                     existing == tabs_active_index(&e->tabs) ? e->v.state : tabs_at(&e->tabs, existing)->state;
                 for (size_t at = 0; at < i; at++)

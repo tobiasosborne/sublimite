@@ -268,7 +268,7 @@ static int start_replace(editor *e, uint8_t *text, size_t len, size_t capacity)
     uint64_t old = greater(e->old_selection.cursor, e->old_selection.anchor) - off;
     if (c->cut_line && c->cutting) { off = c->cut_off; old = c->cut_len; }
     c->waiting = false;
-    if (e->buffer->source_stale || e->buffer->pending_open) {
+    if (e->buffer->source_stale || e->buffer->pending_open || editor_read_only(e)) { /* edit-n95 */
         clip_free(c, text, capacity); e->stats.rejected_commands++; return 0;
     }
     if (!old && !len) { clip_free(c, text, capacity); return 0; }

@@ -80,6 +80,9 @@ typedef struct fif_hit {
     uint32_t file_index, index;
 } fif_hit;
 typedef struct fif_file_msg { uint64_t bytes; uint32_t file_index; } fif_file_msg;
+/* errors counts unreadable entries below the root; the walk continues and
+ * code stays OK. code == FIF_ERR_IO only when the root itself could not be
+ * walked (missing, not a directory, unreadable): no usable result. */
 typedef struct fif_done {
     uint64_t hits, bytes;
     uint32_t files, binary, symlinks, errors;
@@ -119,4 +122,9 @@ fif_code fif_job_dispose(fif_job *job);
  * context_columns is a byte cap, not a Unicode display width. */
 fif_code fif_results(const fif_job *job, uint32_t hit_index, fif_result_view *view);
 const char *fif_results_path(const fif_job *job, uint32_t file_index);
+/* edit-n95: byte length of a line's display context under cap. Lines no longer
+ * than cap are kept whole; a longer line is cut at cap, moved back to the
+ * preceding UTF-8 scalar boundary (at most three bytes). The engine stores
+ * contexts cut this way; context_truncated marks the cut. */
+size_t fif_context_cut(const uint8_t *line, size_t length, size_t cap);
 #endif

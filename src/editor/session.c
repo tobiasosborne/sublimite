@@ -107,7 +107,7 @@ int editor_session_init(editor *e)
 static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_state state)
 {
     editor_session *s = e->session;
-    if (!s || !b->id || b->pending_open || b->placeholder || e->recovering || /* edit-qct */
+    if (!s || !b->id || b->pending_open || b->placeholder || b->derived || e->recovering || /* edit-qct; edit-n95 */
         (b == e->buffer && (e->action == EDITOR_ACTION_REPLAY_WORK ||
          e->action == EDITOR_ACTION_CLIP || e->find_replace_active || e->journal_group_open))) return;
     pthread_mutex_lock(&s->mutex);

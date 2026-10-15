@@ -106,7 +106,7 @@ static int build_checkpoint(editor *e, checkpoint_build *c)
          * as a closed tab with an empty BASE and its full text, as CURRENT
          * cancellation encodes it: recovery compares that text with the disk. */
         bool kept = b && b->retired;
-        if (!b || b->placeholder || (kept && !editor_session_retains(e, b, NULL))) continue; /* edit-qct */
+        if (!b || b->placeholder || b->derived || (kept && !editor_session_retains(e, b, NULL))) continue; /* edit-qct; edit-n95 */
         const journal_base *base = &b->base, empty = {.path = ""};
         if (kept) base = &empty;
         /* Preserve named BASE association. A source conflict must preserve the
@@ -164,7 +164,7 @@ static size_t recorded_tabs(const editor *e, uint8_t *out)
     for (size_t i = 0; i < live; i++) {
         const tabs_tab *tab = tabs_at(&e->tabs, i);
         const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
-        if (b->placeholder) continue;
+        if (b->placeholder || b->derived) continue; /* edit-n95: Find Results is derived */
         if (i == current) active = count;
         if (out) put64(out + 16 + count * 8, tab->id);
         count++;
@@ -225,7 +225,7 @@ int editor_journal_metadata(editor *e)
             if (!tab->undo) return JOURNAL_INVALID;
             editor_buffer *b = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
             if (b->id != tab->id) return JOURNAL_INVALID;
-            if (b->placeholder) continue; /* edit-qct */
+            if (b->placeholder || b->derived) continue; /* edit-qct; edit-n95 */
             view_state state = b == e->buffer ? e->v.state : tab->state;
             uint8_t data[JOURNAL_VIEW_STATE_BYTES]; editor_encode_view(state, data);
             journal_record record_view = {JOURNAL_VIEW, b->id, 0, data, sizeof data};

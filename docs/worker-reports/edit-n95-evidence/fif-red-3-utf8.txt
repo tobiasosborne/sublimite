@@ -1,0 +1,4 @@
+display guard: real display :0 refused, using :99
+tests/fif_test.c:227: assertion failed: view.context_truncated && view.context_length == 1024u - 1u
+/bin/bash: line 69: 1041689 Aborted                 (core dumped) ./build/tests/fif_test
+EXIT 134

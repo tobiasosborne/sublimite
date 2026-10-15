@@ -1,0 +1,3 @@
+display guard: real display :0 refused, using :99
+edit-n95 find in files: panel, results format, open at hit, F4 cycle, cancel, read-only passed
+EXIT 0

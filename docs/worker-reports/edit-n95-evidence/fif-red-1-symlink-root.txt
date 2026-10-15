@@ -1,0 +1,4 @@
+display guard: real display :0 refused, using :99
+tests/fif_test.c:43: assertion failed: got->done.code == FIF_OK && !got->done.cancelled
+/bin/bash: line 1: 1041049 Aborted                 (core dumped) ./build/tests/fif_test
+EXIT 134

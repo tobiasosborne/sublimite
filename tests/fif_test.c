@@ -185,13 +185,58 @@ static void backpressure_cancel_and_guard(work_pool *pool, tree_fixture *tree)
     CHECK(got.done.cancelled && got.done.files == 1 && got.done.hits > 0);
     CHECK(fif_job_dispose(&job) == FIF_OK);
 }
+/* edit-n95 engine fixes. (E) Witness sizes come from the fixture literals and
+ * the production context cap; zero/one keep their count/index meanings. */
+static void n95_fixes(work_pool *pool, tree_fixture *tree)
+{
+    fif_request r = {.root = tree->root, .query = (const uint8_t *)"cat",
+                     .query_length = sizeof "cat" - 1u, .options = {.match_case = true}};
+    capture got;
+    /* 1. A symlinked project root is followed; entries below keep the skip rule. */
+    char link[PATH_MAX]; strcpy(link, tree->root); strcat(link, "-link");
+    CHECK(symlink(tree->root, link) == 0);
+    r.root = link; run(pool, &r, &got);
+    CHECK(got.count == 8 && got.done.symlinks == 1); /* (E) the eight sensitive hits, loop skipped. */
+    CHECK(unlink(link) == 0); r.root = tree->root;
+    /* 2. An unreadable subdirectory counts an error but keeps the walk OK. */
+    if (geteuid() != 0) {
+        CHECK(tree_fixture_dir(tree, "locked") == 0);
+        CHECK(tree_fixture_file(tree, "locked/x", "cat", sizeof "cat" - 1u) == 0);
+        char locked[PATH_MAX]; CHECK(tree_fixture_path(tree, "locked", locked) == 0);
+        CHECK(chmod(locked, 0) == 0);
+        run(pool, &r, &got); /* run() requires code OK */
+        CHECK(got.count == 8 && got.done.errors >= 1);
+        CHECK(chmod(locked, S_IRWXU) == 0); CHECK(tree_fixture_remove(locked) == 0);
+    }
+    /* A missing root is still a whole-job I/O failure. */
+    char missing[PATH_MAX]; CHECK(tree_fixture_path(tree, "no-such-dir", missing) == 0);
+    r.root = missing; fif_job job = {0}; CHECK(fif_job_init(&job, &r) == FIF_OK);
+    got = (capture){.job = &job}; CHECK(fif_submit(pool, &job, 0).epoch); settle(pool, &job, &got);
+    CHECK(got.done.code == FIF_ERR_IO && got.count == 0);
+    CHECK(fif_job_dispose(&job) == FIF_OK); r.root = tree->root;
+    /* 3. A context cut by the column cap ends on a UTF-8 boundary: "cat",
+     * filler up to one byte before the cap, then a two-byte scalar. */
+    static uint8_t line[FIF_DEFAULT_CONTEXT + 16u];
+    size_t n = 0; memcpy(line, "cat", 3); n = 3;
+    while (n < FIF_DEFAULT_CONTEXT - 1u) line[n++] = 'x';
+    line[n++] = 0xc3; line[n++] = 0xa9; memcpy(line + n, "tail", 4); n += 4;
+    CHECK(tree_fixture_file(tree, "wide.txt", line, n) == 0);
+    r.include = "wide.txt"; CHECK(fif_job_init(&job, &r) == FIF_OK);
+    got = (capture){.job = &job}; CHECK(fif_submit(pool, &job, 0).epoch); settle(pool, &job, &got);
+    fif_result_view view; CHECK(got.count == 1 && fif_results(&job, 0, &view) == FIF_OK);
+    CHECK(view.context_truncated && view.context_length == FIF_DEFAULT_CONTEXT - 1u);
+    CHECK(view.context[view.context_length - 1u] == 'x');
+    CHECK(fif_job_dispose(&job) == FIF_OK);
+    char wide[PATH_MAX]; CHECK(tree_fixture_path(tree, "wide.txt", wide) == 0); CHECK(unlink(wide) == 0);
+    r.include = NULL;
+}
 int main(void)
 {
     filters(); tree_fixture tree; CHECK(tree_fixture_init(&tree) == 0);
     edit_arena arena; CHECK(edit_arena_init(&arena, sizeof(work_pool) + _Alignof(work_pool)) == 0);
     work_pool *pool = edit_arena_alloc(&arena, sizeof *pool, _Alignof(work_pool)); CHECK(pool);
     CHECK(work_pool_init(pool, 1, 0) == 0);
-    searches(pool, &tree); limits_and_errors(pool, &tree); backpressure_cancel_and_guard(pool, &tree);
+    n95_fixes(pool, &tree); searches(pool, &tree); limits_and_errors(pool, &tree); backpressure_cancel_and_guard(pool, &tree);
     work_pool_shutdown(pool); edit_arena_free(&arena); CHECK(tree_fixture_remove(tree.root) == 0);
     puts("fif_test: filters, search, walker, cancellation, truncation, retry and allocation guard passed");
     return 0;

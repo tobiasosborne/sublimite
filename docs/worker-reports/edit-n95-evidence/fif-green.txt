@@ -1,0 +1,3 @@
+display guard: real display :0 refused, using :99
+fif_test: filters, search, walker, cancellation, truncation, retry and allocation guard passed
+EXIT 0

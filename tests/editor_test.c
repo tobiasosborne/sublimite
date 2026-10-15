@@ -8,6 +8,8 @@
 #include "journal/journal.h"
 #include "x11/input.h"
 #include "findui/findui.h"
+#include "fif/fif.h"
+#include "tree_fixture.h"
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <stdio.h>
@@ -1282,10 +1284,11 @@ static int panel_shortcuts(bool notice)
     static const char typed[] = "leftalpha right\nnext";
     static const char status[] = "not implemented";
     const struct { uint32_t sym; uint16_t mods; } shortcuts[] = {
-        {'F', PLAT_MOD_CTRL | PLAT_MOD_SHIFT}, {'p', PLAT_MOD_CTRL}
+        {'p', PLAT_MOD_CTRL}
     }; /* Each entry derives from the brief's requested shortcut set, less
         * Ctrl+F, Ctrl+H and F3, which open/drive the find panel (edit-73j),
-        * and Ctrl+G, which has its own executable prompt suite (edit-d50). */
+        * Ctrl+G, which has its own executable prompt suite (edit-d50), and
+        * Ctrl+Shift+F, find in files since edit-n95 (n95_find_in_files). */
     for (size_t i = 0; i < sizeof shortcuts / sizeof shortcuts[0]; i++) {
         render_backend b = {0}; T(render_null_backend(&b) == 0);
         counted count = {0};
@@ -4635,6 +4638,170 @@ static int duplicate_path_contract(void)
     return 0;
 }
 
+/* edit-n95: find in files UI on the tree_fixture.h witness tree. (E) Every
+ * expected line, column, byte and count below is counted in the fixture's
+ * literals (tests/tree_fixture.h); zero/one keep their index/count meanings.
+ * Geometry: one tab row, a three-row find panel and text rows for the longest
+ * expectation fit without wrapping at the fixture's path widths. */
+static char n95_text[2u * FIF_DEFAULT_CONTEXT * 8u];
+static size_t n95_read(editor *e)
+{
+    size_t n = (size_t)editor_length(e);
+    if (n >= sizeof n95_text || editor_read(e, 0, (uint8_t *)n95_text, n)) return SIZE_MAX;
+    n95_text[n] = 0; return n;
+}
+static int n95_type(editor *e, const char *text)
+{
+    for (const char *p = text; *p; p++) {
+        char one[2] = {*p, 0};
+        T(press(e, key((uint32_t)(uint8_t)*p, 0, one)) == 0);
+    }
+    return 0;
+}
+static const char *n95_active_path(editor *e)
+{
+    const tabs_tab *tab = tabs_active(&e->tabs);
+    return tab ? tab->path : "";
+}
+static bool n95_ends(const char *path, const char *suffix)
+{
+    size_t a = strlen(path), b = strlen(suffix);
+    return a >= b && !strcmp(path + a - b, suffix);
+}
+static size_t n95_results_tab(editor *e)
+{
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++)
+        if (!strcmp(editor_tab(e, i)->title, "Find Results")) return i;
+    return SIZE_MAX;
+}
+#define N95_CS (PLAT_MOD_CTRL | PLAT_MOD_SHIFT)
+static int n95_find_in_files(void)
+{
+    tree_fixture tree; T(tree_fixture_init(&tree) == 0);
+    /* (E) Twice the mailbox capacity of one-hit lines: more than the mailbox
+     * plus the engine's single outbox, so a cancelled search is partial. */
+    static char dense[2u * WORK_MAILBOX_CAP * 2u];
+    for (size_t i = 0; i < sizeof dense; i += 2u) { dense[i] = 'x'; dense[i + 1u] = '\n'; }
+    T(tree_fixture_file(&tree, "dense", dense, sizeof dense) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    /* (a) Ctrl+Shift+F, query, Tab, Where, Return -> a Find Results tab. */
+    T(press(e, key(XKB_KEY_f, N95_CS, NULL)) == 0);
+    T(e->find_visible && e->fif.mode);
+    T(n95_type(e, "cat") == 0);
+    T(press(e, key(XKB_KEY_Tab, 0, NULL)) == 0); T(e->fif.where_focus);
+    T(n95_type(e, tree.root) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(settle(e) == 0);
+    T(n95_results_tab(e) == tabs_active_index(&e->tabs));
+    char expected[4096];
+    int length = snprintf(expected, sizeof expected,
+        "%s/a.txt:\n    1: Alpha cat\n    2: catapult CAT cat\n    3: last cat\n\n"
+        "%s/nested/b.c:\n    1: cat\n    2: scatter\n    3: cat!\n\n"
+        "%s/nested/skip.txt:\n    1: cat\n\n"
+        "9 matches across 3 files\n", tree.root, tree.root, tree.root);
+    T(length > 0 && (size_t)length < sizeof expected);
+    size_t n = n95_read(e);
+    if (n == SIZE_MAX || strcmp(n95_text, expected))
+        fprintf(stderr, "n95 expected:\n[%s]\nactual:\n[%s]\n", expected, n == SIZE_MAX ? "" : n95_text);
+    T(n != SIZE_MAX && !strcmp(n95_text, expected));
+    /* Match ranges carry the find-match highlight: "Alpha cat" marks "cat". */
+    size_t first = sizeof "/a.txt:\n    1: Alpha " - 1u + strlen(tree.root);
+    T(e->find_range_count >= 1u && e->find_ranges[0].start == first &&
+      e->find_ranges[0].end == first + sizeof "cat" - 1u);
+    /* (e) Typing, deleting, undo and line edits change nothing, latch nothing. */
+    uint64_t revision = e->buffer->revision;
+    T(press(e, key('q', 0, "q")) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Delete, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_z, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_d, N95_CS, NULL)) == 0);
+    T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0);
+    T(e->buffer->revision == revision && !e->error && !editor_get_stats(e).journal_error);
+    T(n95_read(e) == n && !strcmp(n95_text, expected));
+    /* (b) Enter on the "scatter" hit (results line 7, zero-based) opens
+     * nested/b.c at line 2, caret on the hit's byte column 2: byte 4 + 1. */
+    for (int i = 0; i < 7; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/b.c"));
+    T(editor_view(e).selection.cursor == sizeof "cat\ns" - 1u);
+    /* (c) F4 / Shift+F4 continue from the last visited hit and wrap. */
+    T(press(e, key(XKB_KEY_F4, 0, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/b.c") && editor_view(e).selection.cursor == sizeof "cat\nscatter\n" - 1u);
+    T(press(e, key(XKB_KEY_F4, 0, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/skip.txt") && editor_view(e).selection.cursor == 0);
+    T(press(e, key(XKB_KEY_F4, 0, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/a.txt") && editor_view(e).selection.cursor == sizeof "Alpha " - 1u);
+    T(press(e, key(XKB_KEY_F4, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/skip.txt"));
+    T(press(e, key(XKB_KEY_F4, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/b.c") && editor_view(e).selection.cursor == sizeof "cat\nscatter\n" - 1u);
+    /* Double-click on results row 1 ("    1: Alpha cat", inside "Alpha")
+     * opens a.txt at its hit: column 7, byte 6. */
+    T(editor_select_tab(e, n95_results_tab(e)) == 0); T(settle(e) == 0);
+    plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)((e->lay.gw + sizeof "    1: Al" - 1u) * e->grid.dims.cell_w + 1u),
+        .y = (int32_t)((e->tab_rows + 1u) * e->grid.dims.cell_h + 1u)};
+    plat_event lift = click; lift.press = false;
+    T(press(e, click) == 0); T(press(e, lift) == 0);
+    T(n95_results_tab(e) == tabs_active_index(&e->tabs));
+    T(press(e, click) == 0); T(press(e, lift) == 0);
+    T(n95_ends(n95_active_path(e), "/a.txt") && editor_view(e).selection.cursor == sizeof "Alpha " - 1u);
+    /* (d) Escape mid-search: the engine blocks on a full mailbox (the
+     * dropped_full handshake of tests/fif_test.c), the cancel arrives before
+     * any further drain, the partial buffer stays with a cancelled summary. */
+    T(press(e, key(XKB_KEY_f, N95_CS, NULL)) == 0); T(e->fif.mode && !e->fif.where_focus);
+    T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    T(n95_type(e, "x") == 0);
+    T(press(e, key(XKB_KEY_Tab, 0, NULL)) == 0);
+    char where[PATH_MAX + 16]; T(snprintf(where, sizeof where, "%s, dense", tree.root) > 0);
+    T(n95_type(e, where) == 0);
+    uint64_t full = atomic_load(&e->pool.dropped_full);
+    plat_event enter = key(XKB_KEY_Return, 0, NULL);
+    T(editor_inject(e, &enter) == 0);
+    for (int i = 0; i < 64 && e->queue_count; i++) {
+        int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE);
+    }
+    T(!e->queue_count && e->fif.running);
+    while (atomic_load(&e->pool.dropped_full) == full) sched_yield();
+    plat_event escape = key(XKB_KEY_Escape, 0, NULL);
+    T(editor_handle_key(e, &escape) == 0);
+    T(settle(e) == 0);
+    T(e->fif.done_received && e->fif.done.cancelled && !e->fif.running);
+    uint64_t stored = e->fif.done.hits;
+    T(stored > 0 && stored < sizeof dense / 2u);
+    n = n95_read(e); T(n != SIZE_MAX);
+    char tail[128];
+    T(snprintf(tail, sizeof tail, "\n\n%llu %s in 1 file\nSearch cancelled\n",
+        (unsigned long long)stored, stored == 1u ? "match" : "matches") > 0);
+    T(n95_ends(n95_text, tail));
+    char head[PATH_MAX + 32]; T(snprintf(head, sizeof head, "%s/dense:\n    1: x\n", tree.root) > 0);
+    T(!strncmp(n95_text, head, strlen(head)));
+    /* Replacing a live search: the old job retires (cancelled, its mail and
+     * companion DONE ignored by generation) and is disposed once finished;
+     * the new search's results replace the tab's content. */
+    full = atomic_load(&e->pool.dropped_full);
+    T(editor_fif_start(e) == 0); T(e->fif.running);
+    uint32_t first_generation = e->fif.current.generation;
+    while (atomic_load(&e->pool.dropped_full) == full) sched_yield();
+    T(editor_fif_start(e) == 0);
+    T(e->fif.retiring.live && e->fif.retiring.generation == first_generation);
+    T(e->fif.current.generation != first_generation);
+    T(settle(e) == 0);
+    T(!e->fif.retiring.live && e->fif.done_received && !e->fif.done.cancelled);
+    n = n95_read(e); T(n != SIZE_MAX);
+    T(snprintf(tail, sizeof tail, "\n\n%zu matches in 1 file\n", sizeof dense / 2u) > 0);
+    T(n95_ends(n95_text, tail) && !strncmp(n95_text, head, strlen(head)));
+    /* (f) Results assembly frames and refused typing allocate nothing. */
+    T(!count.active && count.allocations == 0);
+    editor_close(e); T(tree_fixture_remove(tree.root) == 0);
+    puts("edit-n95 find in files: panel, results format, open at hit, F4 cycle, cancel, read-only passed");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -4645,6 +4812,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
         if (!strcmp(argv[1], "--trailing-disabled-scan")) return trailing_disabled_scan();
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
+        if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
@@ -4737,6 +4905,7 @@ int main(int argc, char **argv)
     T(duplicate_path_contract() == 0);
     T(o20_all() == 0);
     T(g02_find_return() == 0);
+    T(n95_find_in_files() == 0);
     T(g02_find_previous_uncached() == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);

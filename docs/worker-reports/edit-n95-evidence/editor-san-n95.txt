@@ -1,0 +1,2 @@
+edit-n95 find in files: panel, results format, open at hit, F4 cycle, cancel, read-only passed
+EXIT 0

@@ -14,6 +14,7 @@
 #include "indent/indent.h"
 #include "minimap/minimap.h"
 #include "findui/findui.h"
+#include "fif/fif.h"
 #include "editor/large_private.h"
 #include "editor/runtime.h"
 #include "scroll/scroll.h"
@@ -95,6 +96,11 @@ typedef struct editor_buffer {
     struct editor_restore *restore;                   /* placeholder's source, lease and program */
     struct editor_restore_buffer *restore_apply;      /* journalled edits to apply once attached */
     size_t find_leases, hl_leases;
+    /* edit-n95: read_only refuses every user edit (input.c checks; a refused
+     * edit is a no-op, never an error). derived marks a buffer rebuilt from
+     * other state (Find Results): no journal BASE, no checkpoint/TABS/VIEW
+     * record, no session leaf, no save; it does not survive hot exit. */
+    bool read_only, derived;
     indent_style style;
     indent_style detected_style;
     file_eol paste_eol; /* edit-bml: detected in-memory ending survives edits */
@@ -133,6 +139,26 @@ typedef struct editor_buffer {
     ipc_token wait_token;
 } editor_buffer;
 typedef struct editor_hit { uint64_t before, after; uint32_t within, width; } editor_hit;
+/* edit-n95: find in files (src/editor/fif.c). One job is current; a replaced
+ * job retires (search cancelled, mail still drained, stale generations
+ * ignored) until fif_job_finished and fif_job_dispose succeed. */
+typedef struct editor_fif_slot { fif_job job; work_handle search; uint32_t generation; bool live; } editor_fif_slot;
+typedef struct editor_fif {
+    edit_arena arena;
+    editor_fif_slot current, retiring;
+    uint32_t generation, received, assembled, last_file, files, visited;
+    uint64_t results_id, last_line;
+    /* Per assembled hit (capacity FIF_DEFAULT_HITS, the engine's default):
+     * results-buffer byte of its line start/end (the LF), of its marked match
+     * and the mark length, and the header line start when it opens a file. */
+    uint64_t *line_start, *line_end, *mark, *header;
+    uint32_t *mark_length;
+    fif_done done;
+    char where[PATH_MAX];
+    size_t where_length, where_cursor;
+    bool mode, where_focus, where_all, running, done_received, summary_written;
+    bool ranges_owned; /* e->find_ranges currently hold results marks */
+} editor_fif;
 typedef struct editor_wait {
     ipc_token token;
     size_t remaining;
@@ -224,6 +250,8 @@ struct editor {
     size_t find_range_count;
     uint64_t find_window_start, find_window_end;
     edit_arena find_arena;
+    editor_fif fif;
+    bool open_byte_column; /* edit-n95: position_buffer reads col as a one-based byte column */
     editor_goto go;
     keys_action file_command;
     char file_command_path[IPC_PATH_CAP];
@@ -516,6 +544,28 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
 int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement);
 int editor_find_paint(editor *e);
 int editor_find_replace_continue(editor *e);
+/* edit-n95 (fif.c): find in files panel mode, job lifecycle, results tab. */
+int editor_fif_init(editor *e);
+void editor_fif_close(editor *e);
+bool editor_fif_receive(editor *e, const work_msg *msg);
+int editor_fif_service(editor *e);
+bool editor_fif_runnable(const editor *e);
+bool editor_fif_pending(const editor *e);
+void editor_fif_show(editor *e);
+int editor_fif_start(editor *e);
+bool editor_fif_cancel(editor *e);
+bool editor_fif_key(editor *e, const plat_event *ev);
+void editor_fif_paint(editor *e, uint32_t first_row, uint32_t rows);
+int editor_fif_paste(editor *e, const uint8_t *bytes, size_t length);
+int editor_fif_open_at_caret(editor *e);
+int editor_fif_step(editor *e, int direction);
+bool editor_fif_results_active(const editor *e);
+/* buffers.c: replace the Find Results tab's buffer with an empty derived
+ * read-only one (or open the tab), and activate it. */
+int editor_results_open(editor *e, uint64_t *id);
+/* input.c: the owner's append into the active read-only results buffer. */
+int editor_results_append(editor *e, const uint8_t *bytes, size_t length);
+static inline bool editor_read_only(const editor *e) { return e->buffer && e->buffer->read_only; }
 findui_mutation_result editor_find_delete(void *ctx, undo_log *undo, uint64_t off, uint64_t len,
     uint64_t when, const undo_state *before, const undo_state *after);
 findui_mutation_result editor_find_insert(void *ctx, undo_log *undo, uint64_t off, const uint8_t *bytes,
