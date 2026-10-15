@@ -1,3 +1,16 @@
+# HANDOFF — sublimité, session 14 in progress (2026-10-16 ~00:30, Fable coordinator, Tobias away)
+
+## Read first (session 14, live)
+**Tobias's orchestration rules for this period are in docs/decisions/orchestration-2026-10-15.md** (10-20 % over pace allowed on Claude and Codex via `quota`; Opus codes, Sonnet does busywork, Codex sol xhigh codes/reviews; 2-3 lanes; peers adelefeld-1f and initech-os-c7 share the box and the account: aggregate stop line +12 % ahead on either weekly window, announce-only Codex windows, announce bursts above load1 8). Worker suffix `-s7`; briefs in build/briefs/*-s7.md; launcher build/briefs/launch7.sh <bead>.
+
+**Landed so far (main, pushed):** 49ec4e3 edit-hgd (whitespace.trailing = none|all|selection, default none; the amber space is gone), c98734c edit-fm4 (startup never replays/copies/renames a GB orphan; launch on the debris profile reaches input in 25-44 ms (M)). **In flight:** edit-34l (Codex sol xhigh, src/fif find-in-files engine, .wt/edit-34l-s7), edit-28u P1 (Opus, checkpoints must stop rewriting unchanged text, .wt/edit-28u-s7). **Queued, briefs written:** edit-6e2 (Opus), edit-v16 (Codex; fixture font staged in .wt/edit-v16-s7/tests/fixtures/fonts with PROVENANCE.md), edit-n95 (find-in-files UI, after 34l), edit-qct (fm4 part 2), edit-52o. Backlog beads from reviews: edit-een, edit-oz0.
+
+**Trial build:** Tobias still runs build/astra4/sublimite (617fa43). Per law 1 a new build goes to him only after an Astra drive on it; plan: stage build/astra5 after edit-28u lands, drive only if Codex Weekly is under about +9 % ahead at that time, else next session. The monochrome Noto Emoji stopgap is now really installed (~/.fonts/NotoEmoji-wght.ttf; it was missing).
+
+Worklog: docs/worklog/2026-10-16.md. Everything below is the session-13 handoff, still valid where not superseded above.
+
+---
+
 # HANDOFF — sublimité, end of session 12 (2026-10-13, after Astra drive 4)
 
 ## Read first (session 13)
