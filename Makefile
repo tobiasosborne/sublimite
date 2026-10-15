@@ -32,6 +32,7 @@ LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
 TS_SRC := vendor/tree-sitter/lib/src/lib.c
+# fif is discovered with the same module/test/fuzz/bench globs as findui.
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
 # Vendored grammars share the runtime archives; one line per language.
 SRCS += vendor/tree-sitter-c/src/parser.c
