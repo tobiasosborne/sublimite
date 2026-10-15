@@ -1076,12 +1076,243 @@ static int large_restore(void)
     if (!rc) puts("large_restore: deferred orphan listed as a closed tab, survives a clean exit, restored lazily on reopen");
     return rc;
 }
+/* edit-c26 begin: Astra drive 5, task 37 (docs/reviews/astra-vs-sublime-5.md
+ * "## 37."). A 64 MiB file opened in place, one typed byte, a checkpoint, one
+ * more byte, clean close (hot exit), no-argument relaunch: build 2c48f9c
+ * exited 1 with error -103 and set the session aside. Mechanism
+ * (docs/decisions/edit-c26.md): the startup install COPY-acquired the BASE
+ * into an arena of 64 MiB reserve + file size, then replaced the whole tree
+ * (piece_delete of every ORIGINAL byte, which copies them into the add
+ * buffer, then piece_insert of the whole recovered text), needing about twice
+ * the file size of add space: PIECE_ERR_NOMEM -> EDITOR_ERR_MEMORY; the
+ * edit-btj retry then failed its lease check because the failed attempt's
+ * teardown had released the launch's own lease file -> -103. Fixed by edit-f3i
+ * (9b5ee41), which replays the logged ops onto the opened BASE instead. Size:
+ * (M) the drive's corpus file, /tmp/edit-corpus/dense_short.txt st_size =
+ * 67,108,864 = 2^26 (build/fixtures/37-restart-fixture.json); content
+ * follows tools/mkcorpus gen_dense (lines of 0-3 chars). The bytes are real,
+ * not sparse: dense short lines are the drive's shape. */
+#define C26_BYTES (UINT64_C(1) << 26)
+#define C26_FIXTURE "tests/fixtures/drive5-task37-session.jnl"
+/* (M) the drive's journal names this BASE (tools/journal_replay dump). */
+#define C26_DRIVE_BASE "/tmp/edit-corpus/dense_short.txt"
+static int c26_make_source(const char *path)
+{
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    enum { CHUNK = 1 << 20 }; /* (P) 1 MiB write unit; 2^26 / 2^20 = 64 writes */
+    char *chunk = malloc(CHUNK); if (!chunk) { close(fd); T(chunk); }
+    uint32_t state = UINT32_C(12345); size_t fill = 0; uint64_t written = 0; int rc = 0;
+    while (!rc && written < C26_BYTES) {
+        /* POSIX rand example LCG; a line is 0-3 chars of space or a-z, then
+         * LF, as gen_dense. The last chunk is cut at exactly C26_BYTES. */
+        state = state * UINT32_C(1103515245) + UINT32_C(12345);
+        unsigned len = (state >> 16) % 4u;
+        for (unsigned i = 0; i <= len && fill < CHUNK; i++) {
+            state = state * UINT32_C(1103515245) + UINT32_C(12345);
+            unsigned r = (state >> 16) % 27u;
+            chunk[fill++] = i == len ? '\n' : r == 26u ? ' ' : (char)('a' + (int)r);
+        }
+        if (fill == CHUNK || written + fill == C26_BYTES) {
+            size_t n = written + fill > C26_BYTES ? (size_t)(C26_BYTES - written) : fill;
+            if (write(fd, chunk, n) != (ssize_t)n) rc = 1;
+            written += n; fill = 0;
+        }
+    }
+    free(chunk); if (close(fd)) rc = 1;
+    T(rc == 0); return 0;
+}
+static int c26_one_journal(const char *dir, char *journal_path)
+{
+    DIR *d = opendir(dir); T(d); struct dirent *entry; int found = 0, aside = 0;
+    while ((entry = readdir(d))) {
+        if (strstr(entry->d_name, ".set-aside-")) { fprintf(stderr, "editor_session_test: c26 set-aside %s\n", entry->d_name); aside++; }
+        if (!strncmp(entry->d_name, "session-", 8) && !strchr(entry->d_name, '.')) {
+            T(snprintf(journal_path, IPC_PATH_CAP, "%s/%s", dir, entry->d_name) > 0); found++;
+        }
+    }
+    closedir(d); T(aside == 0); T(found == 1); return 0;
+}
+/* Launch 1 as main.c does (leased session) with the file argument: wait for
+ * the mapped open, type, checkpoint, type, then a clean close. */
+static int c26_first_launch(const char *dir, const char *source, char *journal_path)
+{
+    fflush(stdout); /* the child's flush must not repeat the parent's buffered lines */
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
+        uint64_t limit = deadline();
+        while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
+        /* Opened in place by path: above FILE_PREFIX_MAX the open is async
+         * (pending_open). Mode is COPY below file_default_copy_threshold()
+         * (min(256 MiB, RAM/32), file.c), so COPY on the drive's box. */
+        if (!e->buffer->file || file_size(e->buffer->file) <= FILE_PREFIX_MAX) _exit(6);
+        printf("c26: first launch mode=%s\n", file_open_mode(e->buffer->file) == FILE_MODE_COPY ? "copy" : "mmap");
+        fflush(stdout);
+        if (press(e, 'x', 0, "x")) _exit(7);
+        if (journal_flush(e->journal) || editor_checkpoint(e)) _exit(8); /* the drive's idle checkpoint */
+        if (press(e, 'y', 0, "y")) _exit(9);                              /* the drive's extra character */
+        editor_close(e); /* clean close: hot exit keeps the dirty session */
+        (void)journal_session_release(journal_path, lease); close(lease);
+        _exit(0);
+    }
+    int status; T(waitpid(child, &status, 0) == child);
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) fprintf(stderr, "editor_session_test: c26 first launch status=%d\n", status);
+    T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return c26_one_journal(dir, journal_path);
+}
+/* No-argument relaunch as main.c: the dirty tab comes back, nothing is set
+ * aside, the adopted journal is retired and the launch's own one remains. */
+static int c26_relaunch(const char *dir, char *orphan, const char *head, const char *title)
+{
+    char journal_path[IPC_PATH_CAP]; int lease = -1;
+    T(journal_session_create(dir, journal_path, sizeof journal_path, &lease) == JOURNAL_OK);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; uint64_t t0 = trace_now_ns();
+    int rc = editor_open(&e, &config, &backend);
+    int opened = rc;
+    if (!rc) rc = settle(e);
+    double ms = (double)(trace_now_ns() - t0) / 1e6;
+    size_t n = strlen(head); uint8_t got[8] = {0}; T(n <= sizeof got);
+    bool tab = !rc && tabs_count(&e->tabs) == 1;
+    bool text = tab && piece_len(e->buffer->tree) == C26_BYTES + n &&
+        !piece_read(e->buffer->tree, 0, got, n) && !memcmp(got, head, n);
+    bool dirty = tab && editor_tab(e, 0)->modified && !strcmp(editor_tab(e, 0)->title, title);
+    bool quiet = !rc && !e->recovery_notice && !*e->recovery_aside && !e->recovery_deferred;
+    char power[32] = "unknown", load1[32] = "unknown";
+    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (!fgets(power, sizeof power, f)) strcpy(power, "unknown"); fclose(f); }
+    power[strcspn(power, "\n")] = 0; /* "Not charging" holds a space */
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%31s", load1) != 1) strcpy(load1, "unknown"); fclose(f); }
+    printf("c26: relaunch editor_open=%d tabs=%zu text=%s dirty=%s notice=%s restore_ms=%.3f (M) bound=tracked power=%s load1=%s\n",
+        opened, rc ? (size_t)0 : tabs_count(&e->tabs), text ? "yes" : "no", dirty ? "yes" : "no",
+        !rc && e->recovery_notice ? e->recovery_notice : "none", ms, power, load1);
+    if (e) editor_close(e);
+    struct stat st;
+    if (!lstat(journal_path, &st) && !st.st_size) (void)unlink(journal_path);
+    (void)journal_session_release(journal_path, lease); close(lease);
+    T(opened == 0); T(rc == 0 && text && dirty && quiet);
+    T(access(orphan, F_OK) != 0); /* adopted and retired, never set aside */
+    return c26_one_journal(dir, orphan);
+}
+static int c26_dense_hot_exit_body(const char *root, const char *source)
+{
+    char dir[IPC_PATH_CAP], orphan[IPC_PATH_CAP], xdg[IPC_PATH_CAP];
+    T(snprintf(xdg, sizeof xdg, "%s/live", root) > 0); T(mkdir(xdg, 0700) == 0); /* (P) owner rwx bits */
+    T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root))); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(c26_first_launch(dir, source, orphan) == 0);
+    struct stat st; T(stat(orphan, &st) == 0);
+    printf("c26: hot-exit journal bytes=%lld (M) base_bytes=%llu\n", (long long)st.st_size, (unsigned long long)C26_BYTES);
+    /* edit-28u shape: BASE referenced, not copied; journal + BASE within the
+     * fm4 startup bound, so startup replays it (no deferral). */
+    T((uint64_t)st.st_size < C26_BYTES && (uint64_t)st.st_size + C26_BYTES <= JOURNAL_STARTUP_SCAN_BYTES);
+    /* Two relaunches: the restored session must itself restore again. */
+    for (int launch = 2; launch <= 3; launch++) T(c26_relaunch(dir, orphan, "xy", "dense_short.txt") == 0);
+    fm4_remove_tree(xdg);
+    return 0;
+}
+typedef struct c26_records { journal_record *rec; uint8_t *data; size_t count, cap, used, size; } c26_records;
+static int c26_collect(void *ctx, const journal_record *r)
+{
+    c26_records *s = ctx;
+    if (s->count == s->cap || r->size > s->size - s->used) return JOURNAL_FULL;
+    memcpy(s->data + s->used, r->data, r->size);
+    s->rec[s->count] = *r; s->rec[s->count].data = s->data + s->used;
+    s->used += r->size; s->count++; return 0;
+}
+/* The drive's own journal, with its BASE identity record rewritten to the
+ * regenerated 2^26-byte file (inode 6437225 of the drive's corpus cannot be
+ * reproduced). Every other record is the drive's, byte for byte. */
+static int c26_drive_journal_body(const char *root, const char *source)
+{
+    char dir[IPC_PATH_CAP], orphan[IPC_PATH_CAP], xdg[IPC_PATH_CAP];
+    T(snprintf(xdg, sizeof xdg, "%s/fixture", root) > 0); T(mkdir(xdg, 0700) == 0); /* (P) owner rwx bits */
+    T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root)));
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    struct stat st; T(stat(C26_FIXTURE, &st) == 0 && st.st_size > 0);
+    /* (P) every record carries at least a JOURNAL_HEADER, and payloads are
+     * part of the file, so the file size bounds both. */
+    c26_records s = {.cap = (size_t)st.st_size / JOURNAL_HEADER, .size = (size_t)st.st_size};
+    s.rec = calloc(s.cap, sizeof *s.rec); s.data = malloc(s.size);
+    uint8_t base_data[JOURNAL_BASE_MAX]; size_t base_size = 0; char path[IPC_PATH_CAP] = "";
+    char head[8] = ""; size_t inserted = 0, bases = 0, targets = 0; int rc = s.rec && s.data ? 0 : 1;
+    journal_replay_result result;
+    if (!rc) rc = journal_scan_file(C26_FIXTURE, c26_collect, &s, &result) || result.corrupt;
+    journal_base fresh; if (!rc) rc = journal_capture_base(source, &fresh);
+    if (!rc) rc = journal_encode_base(&fresh, base_data, sizeof base_data, &base_size);
+    for (size_t i = 0; !rc && i < s.count; i++) {
+        journal_record *r = &s.rec[i];
+        if (r->type == JOURNAL_BASE) {
+            journal_base old;
+            rc = journal_decode_base(r, &old, path, sizeof path);
+            if (!rc && (old.size != C26_BYTES || strcmp(path, C26_DRIVE_BASE))) rc = 1;
+            r->data = base_data; r->size = base_size; bases++;
+        } else if (r->type == JOURNAL_TARGET) {
+            /* The checkpoint names the open path too; recovery opens TARGET,
+             * so it must name the regenerated file, or the install would open
+             * the drive's corpus (a different generation than this BASE). */
+            if (strcmp((const char *)r->data, C26_DRIVE_BASE)) rc = 1;
+            r->data = (const uint8_t *)source; r->size = strlen(source) + 1; targets++;
+        } else if (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE) {
+            uint64_t off = 0; for (int b = 7; b >= 0; b--) off = off << 8 | r->data[b]; /* LE wire */
+            printf("c26: fixture record %s offset=%llu size=%zu\n", r->type == JOURNAL_INSERT ? "INSERT" : "DELETE",
+                (unsigned long long)off, r->size);
+            /* (M) the drive's journal: two one-byte INSERTs at 0 and 1, no DELETE. */
+            if (r->type != JOURNAL_INSERT || off != inserted || r->size != sizeof off + 1 || inserted + 1 >= sizeof head) rc = 1;
+            else head[inserted++] = (char)r->data[sizeof off];
+        }
+    }
+    printf("c26: fixture records=%zu bases=%zu targets=%zu inserted=%zu base=%s head=%s\n", s.count, bases, targets, inserted, path, head);
+    /* (M) one BASE, one TARGET, two INSERTs (this test's dump of the fixture). */
+    if (!rc && (bases != 1 || targets != 1 || inserted != 2)) rc = 1;
+    T(snprintf(orphan, sizeof orphan, "%s/session-C26DRV", dir) > 0);
+    work_pool pool; bool pooled = !rc && !work_pool_init(&pool, 1, 0);
+    journal *j = NULL;
+    if (!rc) rc = !pooled || journal_open(&j, orphan, &pool, NULL) || journal_rotate(j, s.rec, s.count);
+    if (j) journal_close(j);
+    if (pooled) work_pool_shutdown(&pool);
+    free(s.rec); free(s.data);
+    T(rc == 0);
+    T(c26_relaunch(dir, orphan, head, "dense_short.txt") == 0);
+    fm4_remove_tree(xdg);
+    return 0;
+}
+static int c26_dense_hot_exit(void)
+{
+    char made[] = "build/editor-c26-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    char source[IPC_PATH_CAP]; T(snprintf(source, sizeof source, "%s/dense_short.txt", root) > 0);
+    const char *saved_env = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved_env != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved_env) > 0);
+    int rc = c26_make_source(source);
+    if (!rc) rc = c26_dense_hot_exit_body(root, source);
+    if (!rc) rc = c26_drive_journal_body(root, source);
+    char sub[IPC_PATH_CAP];
+    if (snprintf(sub, sizeof sub, "%s/live", root) > 0) fm4_remove_tree(sub);
+    if (snprintf(sub, sizeof sub, "%s/fixture", root) > 0) fm4_remove_tree(sub);
+    fm4_remove_tree(root); /* the 64 MiB source too, on success and on every failure path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    if (!rc) puts("c26: dense64 hot-exit session and the drive-5 task-37 journal relaunch with the dirty tab restored");
+    return rc;
+}
+/* edit-c26 end */
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
     T(clean_tab_set() == 0);
     T(large_restore() == 0);
     T(large_orphans() == 0);
+    T(c26_dense_hot_exit() == 0);
     T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);
     T(recoverable_save_retry(false, true) == 0); T(recoverable_save_retry(true, true) == 0);
     T(session_artifacts() == 0); T(changed_base(false) == 0); T(changed_base(true) == 0); T(install_failure() == 0);
