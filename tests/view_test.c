@@ -749,6 +749,58 @@ static void wrap_port(void)
     CHECK(f.v.state.selection.cursor==0 && f.v.state.selection.anchor==0);
     destroy(&f); free(p); puts("wrap_port: long visual-column continuation, anchored soft-end motion and cancellation passed");
 }
+/* edit-dz0: view_relative_restore against view_restore on twin trees.
+ * Fixture (P): a prefix of 8-byte rows sixteen times VIEW_SCAN_BOUND long, so
+ * an exact repair's top/cursor queries must count it in many calls, then a
+ * short tail whose top line starts mid-row and whose cursor splits a
+ * combining cluster. The relative repair keeps the host's label (deliberately
+ * wrong here), proves the top line start locally, and counts no LF prefix. */
+static int finish_restore(fixture *f, int rc)
+{
+    view_change c={0};
+    CHECK(f->v.scanned<=VIEW_SCAN_BOUND);
+    unsigned calls=0;
+    while(rc==VIEW_MORE) { CHECK(++calls<100000); rc=view_continue(&f->v,&c); CHECK(!c.changed && f->v.scanned<=VIEW_SCAN_BOUND); }
+    return rc;
+}
+static void relative_restore(void)
+{
+    const char tail[]="tail one\nmid e\xcc\x81 two\nlast";
+    size_t prefix=16u*VIEW_SCAN_BOUND, n=prefix+sizeof tail-1u;
+    uint8_t *p=malloc(n); CHECK(p);
+    for(size_t i=0;i<prefix;++i) p[i]=i%8u==7u?'\n':(uint8_t)('a'+i%8u);
+    memcpy(p+prefix,tail,sizeof tail-1u);
+    uint64_t top=prefix+9u+2u;          /* inside "mid ..." (P: tail spelling) */
+    uint64_t split=prefix+9u+5u;        /* between 'e' and U+0301 */
+    fixture exact, rel; init(&exact,p,n,4,80); init(&rel,p,n,4,80);
+    view_state s=exact.v.state; s.selection=(view_selection){split,split,VIEW_PREFERRED_UNSET};
+    s.first_byte=top; s.first_line=777; /* host label, not the true ordinal */
+    view_change c={0};
+    CHECK(finish_restore(&exact,view_restore(&exact.v,&s,&c))==VIEW_OK);
+    uint64_t before=rel.v.line_scanned;
+    edit_malloc_guard_begin();
+    int rc=finish_restore(&rel,view_relative_restore(&rel.v,&s,&c));
+    CHECK(edit_malloc_guard_end()==0);
+    CHECK(rc==VIEW_OK && !view_busy(&rel.v));
+    CHECK(rel.v.line_scanned==before);                       /* no line_query counting */
+    CHECK(exact.v.line_scanned>=prefix);                      /* the exact path counts the prefix */
+    CHECK(rel.v.relative && rel.v.state.approximate);
+    CHECK(rel.v.state.first_line==777);
+    CHECK(rel.v.state.first_byte==prefix+9u && exact.v.state.first_byte==prefix+9u);
+    CHECK(rel.v.state.selection.cursor==exact.v.state.selection.cursor);
+    CHECK(rel.v.state.selection.anchor==exact.v.state.selection.anchor);
+    CHECK(rel.v.state.selection.cursor==prefix+9u+7u);       /* after U+0301 (CEIL) */
+    CHECK(rel.v.state.hscroll==exact.v.state.hscroll);
+    /* An ordinary command clears relative; wrapped and busy calls refuse. */
+    view_state w=s; w.wrap=true; c=(view_change){1,2,3,true};
+    CHECK(view_relative_restore(&rel.v,&w,&c)==VIEW_ERR_ARG && !c.changed);
+    CHECK(view_restore(&rel.v,&s,&c)==VIEW_MORE && view_busy(&rel.v));
+    c=(view_change){1,2,3,true};
+    CHECK(view_relative_restore(&rel.v,&s,&c)==VIEW_ERR_BUSY && !c.changed);
+    view_cancel(&rel.v); CHECK(!rel.v.relative);
+    destroy(&exact); destroy(&rel); free(p);
+    puts("edit-dz0: relative restore matches restore without counting the prefix");
+}
 int main(int argc, char **argv)
 {
     if(argc==2 && strcmp(argv[1],"wrap-port")==0) { wrap_port(); return 0; }
@@ -761,6 +813,7 @@ int main(int argc, char **argv)
     };
     for(size_t i=0;i<sizeof reviews/sizeof reviews[0];++i)
         if(argc==1 || strcmp(argv[1],reviews[i].name)==0) reviews[i].run();
-    if(argc==1) { scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
+    if(argc==2 && strcmp(argv[1],"dz0")==0) { relative_restore(); return 0; }
+    if(argc==1) { relative_restore(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
     puts("view_test: all passed"); return 0;
 }

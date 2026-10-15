@@ -275,6 +275,14 @@ static int finish_edit(editor *e)
     trace_record(TRACE_T2_MUTATION_DONE, e->grid.frame_id);
     return editor_refresh_cursor(e, e->old_cursor);
 }
+/* edit-dz0: a lazy file whose line count is not exact has no certified
+ * ordinal near a far cursor; the exact repair would count LFs from byte 0
+ * (0.92 s at a 1 GiB offset, (M) in docs/decisions/edit-dz0.md). Repair
+ * byte-relatively; the top keeps its estimated label until publication. */
+static bool relative_repair(const editor *e)
+{
+    return !e->v.state.wrap && e->buffer->lg.lazy && !e->buffer->lg.lines_exact;
+}
 /* Empty TYPE is the view's boundary repair/follow; its zero-length piece
  * insert is a no-op. Every actual text mutation goes through undo. */
 static int repair(editor *e, uint64_t target)
@@ -286,10 +294,12 @@ static int repair(editor *e, uint64_t target)
         /* Equal-length transforms also invalidate grapheme boundaries. Repair
          * both endpoints explicitly; legacy empty TYPE only detects length or
          * collapsed-caret changes. */
-        rc = view_restore(&e->v, &e->v.state, &c);
+        rc = relative_repair(e) ? view_relative_restore(&e->v, &e->v.state, &c) :
+            view_restore(&e->v, &e->v.state, &c);
     } else {
         e->v.state.selection.cursor = e->v.state.selection.anchor = target;
-        rc = view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
+        rc = relative_repair(e) ? view_relative_restore(&e->v, &e->v.state, &c) :
+            view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c);
     }
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPAIR; return 0; }
@@ -321,7 +331,8 @@ static int replay_follow(editor *e, bool trust_anchor)
     /* Trusted history follows the cursor as main's replay did (empty TYPE on
      * a collapsed selection); a new plan's two endpoints need a restore. */
     view_change c;
-    int rc = trust_anchor ? view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c) : view_restore(&e->v, &e->v.state, &c);
+    int rc = relative_repair(e) ? view_relative_restore(&e->v, &e->v.state, &c) :
+        trust_anchor ? view_command(&e->v, VIEW_TYPE, false, NULL, 0, &c) : view_restore(&e->v, &e->v.state, &c);
     if (c.changed) return EDITOR_ERR_HISTORY;
     if (rc == VIEW_MORE) { editor_seed_view_lines(e); e->action = EDITOR_ACTION_REPLAY; return 0; }
     if (rc) return rc;

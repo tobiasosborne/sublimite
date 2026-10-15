@@ -223,6 +223,33 @@ static void default_plan_probe(view *v, const uint8_t *model, size_t n, uint8_t 
         EDIT_ASSERT(plan.selection.cursor <= result && plan.selection.anchor <= result);
     }
 }
+/* edit-dz0: the inexact-count restore keeps the host label, proves only the
+ * top's line start (no LF between it and the requested byte), counts no
+ * line_query bytes, and repairs selection/hscroll exactly as view_restore. */
+static void relative_restore_probe(view *v, const uint8_t *model, size_t n, uint8_t choice)
+{
+    if (v->state.wrap || view_busy(v)) return;
+    view_state s = v->state;
+    s.first_byte = (uint64_t)choice * n / UINT8_MAX; /* spread over [0, n] (P) */
+    s.first_line = choice;                           /* arbitrary label */
+    view_change c; uint64_t counted = v->line_scanned; unsigned resumes = 0;
+    int rc = view_relative_restore(v, &s, &c);
+    while (rc == VIEW_MORE) {
+        EDIT_ASSERT(!c.changed && v->scanned <= VIEW_SCAN_BOUND && ++resumes < 10000);
+        rc = view_continue(v, &c);
+    }
+    EDIT_ASSERT(rc == VIEW_OK && !c.changed && v->scanned <= VIEW_SCAN_BOUND);
+    EDIT_ASSERT(v->line_scanned == counted && v->relative);
+    view_state rel = v->state;
+    EDIT_ASSERT(rel.first_line == s.first_line && rel.approximate);
+    EDIT_ASSERT(rel.first_byte <= s.first_byte && (rel.first_byte == 0 || model[rel.first_byte - 1u] == '\n'));
+    for (uint64_t i = rel.first_byte; i < s.first_byte; i++) EDIT_ASSERT(model[i] != '\n');
+    resumes = 0; rc = view_restore(v, &s, &c);
+    while (rc == VIEW_MORE) { EDIT_ASSERT(++resumes < 10000); rc = view_continue(v, &c); }
+    EDIT_ASSERT(rc == VIEW_OK && !v->relative);
+    EDIT_ASSERT(rel.selection.cursor == v->state.selection.cursor && rel.selection.anchor == v->state.selection.anchor);
+    EDIT_ASSERT(rel.hscroll == v->state.hscroll);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if(size<2) return 0;
@@ -304,5 +331,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         EDIT_ASSERT(motion_matches(&v,&expected,model,n));
     }
     default_plan_probe(&v, model, n, data[size - 1u]);
+    relative_restore_probe(&v, model, n, data[size - 2u]);
     piece_destroy(tree); edit_arena_free(&arena); return 0;
 }

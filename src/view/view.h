@@ -58,6 +58,7 @@ typedef struct view {
     view_config config;
     piece_tree *tree;
     uint64_t scanned; /* bytes consumed/examined in most recent call <= bound */
+    uint64_t line_scanned; /* cumulative bytes line_query counted; test probe, never reset */
     bool busy, shift, edited, word_found;
     view_key key;
     unsigned phase, scan_mode;
@@ -126,6 +127,13 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text,
  * Same scan/deadline/continuation contract; never writes exact line caches.
  * relative remains set on completion so the host cannot adopt v->line. */
 int view_relative_command(view *v, view_key key, bool shift, view_change *change);
+/* view_restore for an unwrapped buffer whose external line count is inexact
+ * (edit-dz0). state->first_line is the host's label, kept and marked
+ * approximate; only first_byte's line start is proven, by walking back to LF.
+ * Endpoints repair as view_restore; following is byte-relative as above, so
+ * no line query counts from byte 0 and no estimate enters the exact caches.
+ * relative remains set on completion. Wrapped state is VIEW_ERR_ARG. */
+int view_relative_restore(view *v, const view_state *state, view_change *change);
 int view_continue(view *v, view_change *change);
 void view_cancel(view *v);
 bool view_busy(const view *v);

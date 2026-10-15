@@ -130,7 +130,7 @@ static int line_query(view *v, unsigned kind, uint64_t target, uint64_t *result)
             v->queries[i].target-target<=256u) {
             uint8_t tail[256]; size_t n=(size_t)(v->queries[i].target-target);
             int rc=piece_read(v->tree,target,tail,n); if(rc!=PIECE_OK) return rc;
-            uint64_t line=v->queries[i].result; v->scanned+=n;
+            uint64_t line=v->queries[i].result; v->scanned+=n; v->line_scanned+=n;
             for(size_t j=0;j<n;++j) if(tail[j]=='\n') --line;
             unsigned j=v->query_next++%16u;
             v->queries[j].kind=kind; v->queries[j].target=target; v->queries[j].result=line;
@@ -168,7 +168,7 @@ static int line_query(view *v, unsigned kind, uint64_t target, uint64_t *result)
         uint64_t stop=kind==Q_BYTE?target:total;
         size_t n=(size_t)min_u64(sizeof bytes,stop-v->query_pos);
         int rc=piece_read(v->tree,v->query_pos,bytes,n); if(rc!=PIECE_OK) return rc;
-        v->scanned+=n;
+        v->scanned+=n; v->line_scanned+=n;
         for(size_t i=0;i<n;++i) {
             ++v->query_pos;
             if(bytes[i]=='\n') {
@@ -762,6 +762,16 @@ static int advance(view *v, view_change *change)
             if(!v->busy) return VIEW_OK;
             continue;
         }
+        if(v->phase==P_NORMAL_SETUP && v->relative) {
+            /* edit-dz0: the host's first_line is a label, not a certified
+             * ordinal (inexact external count). Prove only the top's line
+             * start by walking back to LF; never count from byte 0. */
+            uint64_t start;
+            int rc=relative_start(v,&start); if(rc!=VIEW_OK) return rc;
+            v->restore_state.first_byte=start; v->restore_state.approximate=true;
+            repair_begin(v,v->restore_state.selection.cursor,v->cursor_before); v->phase=P_NORMAL_CURSOR;
+            continue;
+        }
         if(v->phase==P_NORMAL_SETUP) {
             int rc=line_at(v,min_u64(v->restore_state.first_byte,piece_len(v->tree)),&v->restore_state.first_line);
             if(rc!=VIEW_OK) return rc;
@@ -845,10 +855,12 @@ static int complete_call(view *v, int rc)
     v->completed_state=v->state; v->completed_len=piece_len(v->tree);
     return done;
 }
-static int normalize(view *v, view_state saved, bool cursor_before, bool anchor_before, view_change *change)
+static int normalize(view *v, view_state saved, bool cursor_before, bool anchor_before, bool relative,
+                     view_change *change)
 {
-    slice_begin(v); v->relative=false; v->before_state=v->state; v->restore_state=saved;
+    slice_begin(v); v->relative=relative; v->before_state=v->state; v->restore_state=saved;
     uint64_t total=piece_len(v->tree);
+    v->relative_pos=min_u64(saved.first_byte,total);
     v->restore_state.selection.cursor=min_u64(saved.selection.cursor,total);
     v->restore_state.selection.anchor=min_u64(saved.selection.anchor,total);
     v->restore_state.selection.preferred_col=VIEW_PREFERRED_UNSET;
@@ -865,7 +877,14 @@ int view_restore(view *v, const view_state *state, view_change *change)
     if(change) *change=(view_change){0};
     if(!v || !v->tree || !state || !change) return VIEW_ERR_ARG;
     if(v->busy) return VIEW_ERR_BUSY;
-    return normalize(v,*state,false,false,change);
+    return normalize(v,*state,false,false,false,change);
+}
+int view_relative_restore(view *v, const view_state *state, view_change *change)
+{
+    if(change) *change=(view_change){0};
+    if(!v || !v->tree || !state || !change || state->wrap || v->state.wrap) return VIEW_ERR_ARG;
+    if(v->busy) return VIEW_ERR_BUSY;
+    return normalize(v,*state,false,false,true,change);
 }
 static uint64_t rebase(uint64_t pos, view_change edit, bool before)
 {
@@ -893,7 +912,7 @@ int view_notify_edit(view *v, const view_change *edit, view_affinity cursor_affi
     saved.selection.cursor=rebase(saved.selection.cursor,tuple,cursor_affinity==VIEW_AFFINITY_BEFORE);
     saved.selection.anchor=rebase(saved.selection.anchor,tuple,anchor_affinity==VIEW_AFFINITY_BEFORE);
     saved.first_byte=rebase(min_u64(saved.first_byte,old_total),tuple,true);
-    return normalize(v,saved,cursor_affinity==VIEW_AFFINITY_BEFORE,anchor_affinity==VIEW_AFFINITY_BEFORE,change);
+    return normalize(v,saved,cursor_affinity==VIEW_AFFINITY_BEFORE,anchor_affinity==VIEW_AFFINITY_BEFORE,false,change);
 }
 void view_init(view *v, piece_tree *tree, const view_config *config)
 {

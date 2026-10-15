@@ -14,6 +14,10 @@
 
 #define EDITOR_SLICE_NS UINT64_C(500000)
 #define EDITOR_BLINK_NS UINT64_C(500000000)
+/* (G) caret blink stops after 10 s idle: PRD.md section 6 ("Cursor blink stops
+ * after 10 s idle") and gate G11, perf/01-perf-target.md section 0.2 (0 wakeups/s
+ * after 10 s). Tests also reuse it as a settle watchdog: (E) for that use, no
+ * gate bounds a settle (edit-dz0). */
 #define EDITOR_IDLE_NS UINT64_C(10000000000)
 #define EDITOR_INPUT_CAP 1024u
 enum {

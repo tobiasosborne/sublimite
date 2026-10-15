@@ -1613,10 +1613,97 @@ static int typing_while_indexing(uint64_t size, bool reindex)
     T(rc == 0); T(t.failed == 0); T(t.overdue == 0);
     return 0;
 }
+/* edit-dz0: Ctrl+End on a 1 GiB lazy file, then one typed key before the
+ * line index publishes. Fixture (P): mmp_fixture's sparse GiB layout (first
+ * MiB and last 64 KiB of 64-byte rows, one LF per MiB between), mapped, no
+ * journal, private XDG_DATA_HOME, removed with its root on every exit path.
+ * The bulk lane is held from open (hold_lane) so the index cannot complete.
+ * Structural assert: the key's view repair asks line_query to count at most
+ * VIEW_SCAN_BOUND bytes (P: one view call's charged scan work), never the
+ * file prefix (about the file size before the fix). The settle is a tracked
+ * print (law 1); EDITOR_IDLE_NS is only the existing settle watchdog (E).
+ * wrap: the same key with wrapping on (a .txt log's default). It keeps the
+ * exact repair: one call counts from byte 0 (3840 B (M) = one call's
+ * line_query budget, docs/decisions/edit-dz0.md), then editor_seed_view_lines installs
+ * the laid-out top and the query restarts there; within the same bound. */
+typedef struct dz0_result { uint64_t line_bytes, settle_ns, size; mmp_tally t; } dz0_result;
+static int dz0_keys(editor *e, lane_hold *lane, dz0_result *r)
+{
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!atomic_load(&lane->running)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); }
+    bool bad = false;
+    T(mmp_settle(e, &r->t, &bad) == 0);
+    T(!editor_index_complete(e)); T(!e->buffer->lg.lines_exact);
+    plat_event end = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_End, .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &end) == 0);
+    T(mmp_settle(e, &r->t, &bad) == 0);
+    T(editor_view(e).selection.cursor == r->size);
+    T(!editor_index_complete(e));
+    uint64_t before = e->v.line_scanned;
+    T(mmp_type(e, "x", 0, &r->t, &bad) == 0);
+    r->line_bytes = e->v.line_scanned - before; r->settle_ns = r->t.max_key_ns;
+    T(!bad);
+    T(!editor_index_complete(e));
+    T(editor_length(e) == r->size + 1u);
+    T(editor_view(e).selection.cursor == r->size + 1u);
+    uint8_t got = 0; T(editor_read(e, r->size, &got, 1) == 0); T(got == 'x');
+    return 0;
+}
+static int dz0_body(const char *root, bool wrap, dz0_result *r)
+{
+    char path[256], xdg[256];
+    T(snprintf(path, sizeof path, "%s/source", root) > 0); T(snprintf(xdg, sizeof xdg, "%s/xdg", root) > 0);
+    r->size = MMP_GIB;
+    T(mmp_fixture(path, r->size) == 0);
+    {
+        /* Warm page cache for the tail, as for a log just written: the last
+         * two 1 MiB lines (P: mmp_fixture's layout, hole line + tail rows).
+         * scroll's resident follow takes the foreground lane only for
+         * windows in core (edit-91c); a cold hole would queue it on the held
+         * bulk lane forever. The pre-fix repair warmed them by scanning. */
+        static uint8_t warm[64u * 1024u];
+        int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+        bool ok = true;
+        for (uint64_t at = r->size - 2u * FILE_PREFIX_MAX; ok && at < r->size; at += sizeof warm)
+            ok = pread(fd, warm, sizeof warm, (off_t)at) == (ssize_t)sizeof warm;
+        T(close(fd) == 0); T(ok);
+    }
+    T(mkdir(xdg, 0700) == 0); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = path, .cols = 32, .rows = 3, .wrap_mode = wrap ? 1 : -1};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK});
+    int rc = held.epoch ? dz0_keys(e, &lane, r) : 1;
+    atomic_store(&lane.release, true);
+    while (held.epoch && !work_handle_finished(&e->pool, held)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    editor_close(e);
+    return rc;
+}
+static int dz0_key_at_end(bool wrap)
+{
+    char root[] = "build/editor-large-dz0-XXXXXX"; T(mkdtemp(root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[256] = "";
+    if (saved) (void)snprintf(keep, sizeof keep, "%s", saved);
+    dz0_result r = {0};
+    int rc = dz0_body(root, wrap, &r);
+    if (saved) (void)setenv("XDG_DATA_HOME", keep, 1); else (void)unsetenv("XDG_DATA_HOME");
+    int removed = mmp_remove_tree(root);
+    char power[32] = "?"; FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fgets(power, sizeof power, f)) power[strcspn(power, "\n")] = 0; fclose(f); }
+    double load1 = 0; f = fopen("/proc/loadavg", "r"); if (f) { if (fscanf(f, "%lf", &load1) != 1) load1 = 0; fclose(f); }
+    printf("editor_large_test: edit-dz0 key at EOF before index wrap=%d size=%llu line_query_bytes=%llu bound=%u (P: VIEW_SCAN_BOUND) key_settle=%.3f ms (M) overdue=%u power=\"%s\" load1=%.2f\n",
+        wrap, (unsigned long long)r.size, (unsigned long long)r.line_bytes, VIEW_SCAN_BOUND, (double)r.settle_ns / 1e6, r.t.overdue, power, load1);
+    T(fflush(stdout) == 0);
+    T(removed == 0); T(rc == 0); T(r.t.overdue == 0);
+    T(r.line_bytes <= VIEW_SCAN_BOUND);
+    return 0;
+}
 int main(void)
 {
     if (getenv("EDIT_MMP_REPRO")) { trace_init(); (void)trace_thread_register(); return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL); }
     trace_init(); (void)trace_thread_register();
+    if (getenv("EDIT_DZ0_REPRO")) return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
     if (getenv("EDIT_JF9_VIEW")) return relative_motion();
     T(relative_motion() == 0);
     /* edit-xzw: isolate the existing null-backend fixture from IPC/display
@@ -1665,6 +1752,8 @@ int main(void)
     T(gutter_estimates() == 0);
     T(typing_while_indexing(MMP_SMALL, false) == 0);
     T(typing_while_indexing(MMP_SMALL, true) == 0);
+    T(dz0_key_at_end(false) == 0);
+    T(dz0_key_at_end(true) == 0);
 xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
