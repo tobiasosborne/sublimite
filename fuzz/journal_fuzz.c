@@ -2,6 +2,10 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <dirent.h>
+#include <inttypes.h>
+#include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 typedef struct fuzz_model { uint8_t bytes[4096]; size_t size, edits; piece_tree *tree;
@@ -243,8 +247,70 @@ static void fuzz_groups(const uint8_t *data, size_t size)
     EDIT_ASSERT(rr.corrupt && rr.valid_bytes==legacy && actual.size==strlen("x") && actual.bytes[0]=='x');
     work_pool_shutdown(&pool); unlink(path);
 }
+/* edit-52o: directory-state oracles for rotation names, with arbitrary small
+ * content. (P) Cases come from the protocol: surviving/missing/reused source,
+ * legacy, malformed, already set aside, live. No content parser is the oracle.
+ * Dispatch reuses a wire operation tag, rather than adding a fuzz budget. */
+static void fuzz_retirement(const uint8_t *data, size_t size)
+{
+    if(!size || data[0]!=(uint8_t)JOURNAL_TARGET) return;
+    enum { SURVIVING, MISSING, REUSED, LEGACY, MALFORMED, ASIDE, LIVE, OTHER_NAME, CASES };
+    unsigned which=size>1?data[1]%CASES:SURVIVING;
+    char root[]="build/journal-fuzz-retire-XXXXXX"; if(!mkdtemp(root)) return;
+    DIR *dir=opendir(root); EDIT_ASSERT(dir); int dfd=dirfd(dir);
+    int source=openat(dfd,"original",O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0600); EDIT_ASSERT(source>=0);
+    struct stat st; EDIT_ASSERT(fstat(source,&st)==0); close(source);
+    char temp[sizeof ((struct dirent *)0)->d_name];
+    /* (P) ASCII basenames in hex: original=6f726967696e616c, other=6f74686572. */
+    int n=snprintf(temp,sizeof temp,".sublimite-journal-from-%jx-%jx-%jx-%jx-%jx-%zx-0-%s%s",
+        (uintmax_t)st.st_dev,(uintmax_t)st.st_ino,
+        (uintmax_t)st.st_ctim.tv_sec^(which==REUSED?UINTMAX_C(1):UINTMAX_C(0)),
+        (uintmax_t)st.st_ctim.tv_nsec,(uintmax_t)getpid(),size,
+        which==OTHER_NAME?"6f74686572":"6f726967696e616c",which==ASIDE?".set-aside-0":"");
+    EDIT_ASSERT(n>0 && (size_t)n<sizeof temp);
+    if(which==LEGACY) strcpy(temp,".sublimite-journal-a-b-c");
+    if(which==MALFORMED) {
+        /* (P) Each spelling violates a distinct grammar rule: empty field,
+         * overflow, missing component, extra component, trailing suffix,
+         * signed field, or invalid set-aside stamp. uintmax_t is uint64_t
+         * on the supported Linux target; the overflow literal has an extra
+         * hex digit beyond that type's all-ones representation. */
+        static const char *bad[]={".sublimite-journal--b-c", ".sublimite-journal-fffffffffffffffff-b-c",
+            ".sublimite-journal-a-b", ".sublimite-journal-a-b-c-d", ".sublimite-journal-a-b-c!",
+            ".sublimite-journal-+a-b-c", ".sublimite-journal-a-b-c.set-aside-x",
+            /* (P) Invalid owner bytes: NUL=00, slash=2f, dot=2e; odd hex,
+             * empty and uppercase spellings violate the encoder grammar. */
+            ".sublimite-journal-from-0-0-0-0-0-0-0-00", ".sublimite-journal-from-0-0-0-0-0-0-0-2f",
+            ".sublimite-journal-from-0-0-0-0-0-0-0-2e", ".sublimite-journal-from-0-0-0-0-0-0-0-2e2e",
+            ".sublimite-journal-from-0-0-0-0-0-0-0-f", ".sublimite-journal-from-0-0-0-0-0-0-0-",
+            ".sublimite-journal-from-0-0-0-0-0-0-0-6F"};
+        strcpy(temp,bad[size>2?data[2]%(sizeof bad/sizeof *bad):0]);
+    }
+    if(which==MISSING) EDIT_ASSERT(unlinkat(dfd,"original",0)==0);
+    int fd=openat(dfd,temp,O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0600); EDIT_ASSERT(fd>=0);
+    EDIT_ASSERT(write(fd,data,size)==(ssize_t)size); struct stat before; EDIT_ASSERT(fstat(fd,&before)==0);
+    if(which==LIVE) EDIT_ASSERT(flock(fd,LOCK_EX|LOCK_NB)==0);
+    EDIT_ASSERT(journal_retire_directory(root,NULL)==0);
+    bool keep=which==MALFORMED || which==ASIDE || which==LIVE;
+    EDIT_ASSERT((fstatat(dfd,temp,&st,AT_SYMLINK_NOFOLLOW)==0)==keep);
+    close(fd);
+    bool preserve=which==MISSING || which==REUSED || which==LEGACY || which==OTHER_NAME || keep;
+    size_t copies=0; struct dirent *entry; rewinddir(dir);
+    while((entry=readdir(dir))) {
+        EDIT_ASSERT(strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-"))!=0);
+        if(!strncmp(entry->d_name,".sublimite-journal-",strlen(".sublimite-journal-"))) {
+            EDIT_ASSERT(fstatat(dfd,entry->d_name,&st,AT_SYMLINK_NOFOLLOW)==0);
+            EDIT_ASSERT(st.st_ino==before.st_ino && st.st_size==before.st_size); copies++;
+        }
+    }
+    EDIT_ASSERT(copies==(preserve?1u:0u));
+    rewinddir(dir);
+    while((entry=readdir(dir))) if(strcmp(entry->d_name,".") && strcmp(entry->d_name,"..")) EDIT_ASSERT(unlinkat(dfd,entry->d_name,0)==0);
+    closedir(dir); EDIT_ASSERT(rmdir(root)==0);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    fuzz_retirement(data,size);
     fuzz_groups(data,size);
     no_visit(data,size);
     structured_bytes(data,size);

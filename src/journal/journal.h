@@ -342,15 +342,21 @@ int journal_apply_piece(piece_tree *tree, const journal_record *record);
 int journal_scan_file(const char *path, journal_visit visit, void *ctx,
                       journal_replay_result *result);
 /* Startup housekeeping; current is the leased destination, excluded from
- * discovery. Edits, conflicts, corruption and live leases always pin artifacts.
- * Oldest eligible artifacts are removed to the measured byte cap. */
+ * discovery. Edits, conflicts, corruption and live leases pin session artifacts.
+ * Oldest eligible artifacts are removed to the measured byte cap. Rotation
+ * temps are handled before inventory, without reading content or applying a
+ * size limit: dead owners' temps are removed if the named original generation
+ * survives; missing/unknown originals are set aside once. Rotation holds a
+ * shared directory-inode lease before publishing a temp through final cleanup;
+ * housekeeping takes the exclusive nonblocking lease. No temp lock files. */
 #define JOURNAL_ARTIFACT_BYTES (32u * (JOURNAL_PAGE + sizeof "base" - 1u))
 /* (M)[AC]: edit-rfq fixture: observed profile count 32 * (4096-byte sealed
  * empty journal + strlen("base")=4-byte retained original) = 131200 bytes.
  * (E): reuse that observed footprint as the eligible-artifact retention cap. */
 int journal_retire_directory(const char *directory, const char *current);
 /* edit-fm4: startup reads at most this many bytes of one journal artifact
- * synchronously (retirement scan; for a discovered session, the journal plus
+ * synchronously (retirement session scan; rotation temps need no scan;
+ * for a discovered session, the journal plus
  * its BASE files). Larger artifacts are pinned unscanned; larger sessions are
  * left pending and untouched (never replayed, copied or renamed at startup).
  * (G) G4a warm p50 25 ms (perf/01-perf-target.md 0.2) x (M)[AC] page-cache

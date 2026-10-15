@@ -3,9 +3,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <linux/fs.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -853,10 +855,37 @@ static int checkpoint_size(const journal *j, const journal_record *records, size
 }
 static int checkpoint_temp(const journal *j, char *name, size_t cap)
 {
+    struct stat source; if(fstat(j->disk.fd,&source)) return -1;
     uint64_t nonce=clock_ns();
     for(unsigned i=0;i<64;i++) {
-        int n=snprintf(name,cap,".sublimite-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
+        /* edit-52o (P): original device/inode/ctime identify a surviving copy using
+         * directory metadata alone; PID/nonce/attempt retain name uniqueness.
+         * The inherited collision ceiling above is unchanged. */
+        int n=snprintf(name,cap,".sublimite-journal-from-%jx-%jx-%jx-%jx-%lx-%llx-%x-",
+            (uintmax_t)source.st_dev,(uintmax_t)source.st_ino,
+            (uintmax_t)source.st_ctim.tv_sec,(uintmax_t)source.st_ctim.tv_nsec,
+            (unsigned long)getpid(),(unsigned long long)nonce,i);
         if(n<0 || (size_t)n>=cap) return -1;
+        /* (P) Each original-basename byte takes two hex digits. Exact names
+         * prevent a temp/new session reusing the old inode within a timestamp
+         * tick from proving its own redundant copy. Very long names retain
+         * the independent legacy spelling, conservatively set aside if killed. */
+        size_t length=strlen(j->name), prefix=(size_t)n;
+        /* (P) Reserve the set-aside literal, a time_t bit count (a safe
+         * upper bound on decimal seconds including sign), and nine decimal
+         * nanosecond digits. A killed temp must still fit its aside name. */
+        size_t aside=sizeof ".set-aside-"-1u+sizeof(time_t)*CHAR_BIT+sizeof "999999999"-1u;
+        if(cap<=aside || prefix>=cap-aside || length>(cap-aside-prefix-1u)/2u) {
+            n=snprintf(name,cap,".sublimite-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
+            if(n<0 || (size_t)n>=cap) return -1;
+        } else {
+            static const char hex[]="0123456789abcdef";
+            for(size_t k=0;k<length;k++) {
+                unsigned byte=(unsigned char)j->name[k];
+                name[prefix+2u*k]=hex[byte/16u]; name[prefix+2u*k+1u]=hex[byte%16u];
+            }
+            name[prefix+2u*length]=0;
+        }
         int fd=openat(j->directory_fd,name,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
         if(fd>=0 && fchmod(fd,0600)) {
             close(fd); (void)unlinkat(j->directory_fd,name,0); return -1;
@@ -870,9 +899,20 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
     if(!j || (!records && count)) return JOURNAL_INVALID;
     if(j->active || (!j->failed && !j->append_failed && (j->batches[j->current].used || j->stats.accepted_sequence!=j->stats.durable_sequence))) return JOURNAL_BUSY;
     uint64_t checkpoint_bytes=0; int rc=checkpoint_size(j,records,count,&checkpoint_bytes); if(rc) return rc;
-    char tmpname[80]; int tfd=checkpoint_temp(j,tmpname,sizeof tmpname); if(tfd<0) return JOURNAL_IO;
+    /* edit-52o: the directory inode is the rotation owner's lease. Take it
+     * before publishing any temp name, keep it through rename/sync/cleanup.
+     * Retirement's existing exclusive nonblocking flock proves owner death
+     * without PID reuse, timers, extra files, or a create-before-lock window.
+     * A separate open description avoids changing the retained fd's locks.
+     * Rotation is off path and can wait for an inventory already in flight. */
+    int guard=openat(j->directory_fd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(guard<0) return JOURNAL_IO;
+    if(flock(guard,LOCK_SH)) { close(guard); return JOURNAL_IO; }
+    /* (P) NAME_MAX is the filesystem basename capacity, plus its NUL. */
+    char tmpname[NAME_MAX+1u]; int tfd=checkpoint_temp(j,tmpname,sizeof tmpname);
+    if(tfd<0) { close(guard); return JOURNAL_IO; }
     int dfd=fcntl(j->directory_fd,F_DUPFD_CLOEXEC,0);
-    if(dfd<0) { close(tfd); unlinkat(j->directory_fd,tmpname,0); return JOURNAL_IO; }
+    if(dfd<0) { unlinkat(j->directory_fd,tmpname,0); close(tfd); close(guard); return JOURNAL_IO; }
     journal *next=NULL; journal_options opt={.batch_bytes=j->capacity,.max_file_bytes=checkpoint_bytes+j->log_budget,
         .sync_bytes=j->sync_bytes,.sync_interval_ns=j->sync_interval_ns};
     rc=journal_create(&next,j->path,(size_t)(j->name-j->path),tfd,dfd,j->pool,&opt,&j->io);
@@ -888,7 +928,8 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
     if(!rc) rc=journal_flush(next);
     bool renamed=false;
     if(!rc) {
-        char tmppath[4177]; size_t parent=(size_t)(j->name-j->path);
+        /* (P) Existing full-path capacity plus an independent temp basename. */
+        char tmppath[sizeof ((journal_base *)0)->captured_path+sizeof tmpname]; size_t parent=(size_t)(j->name-j->path);
         memcpy(tmppath,j->path,parent); strcpy(tmppath+parent,tmpname);
         if(!(j->io.rename?j->io.rename(j->io.ctx,tmppath,j->path):renameat(j->directory_fd,tmpname,j->directory_fd,j->name))) renamed=true;
         else {
@@ -918,7 +959,7 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
         close(oldfd);
     }
     if(next) journal_close(next);
-    unlinkat(j->directory_fd,tmpname,0); return rc;
+    unlinkat(j->directory_fd,tmpname,0); close(guard); return rc;
 }
 
 

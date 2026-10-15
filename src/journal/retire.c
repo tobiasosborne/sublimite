@@ -4,10 +4,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct artifact {
@@ -33,6 +35,160 @@ static bool same(const struct stat *a, const struct stat *b)
     return a->st_dev==b->st_dev && a->st_ino==b->st_ino && a->st_size==b->st_size &&
         a->st_mtim.tv_sec==b->st_mtim.tv_sec && a->st_mtim.tv_nsec==b->st_mtim.tv_nsec &&
         a->st_ctim.tv_sec==b->st_ctim.tv_sec && a->st_ctim.tv_nsec==b->st_ctim.tv_nsec;
+}
+typedef struct rotation_name {
+    uintmax_t device, inode, ctime_sec, ctime_nsec;
+    char owner[sizeof ((struct dirent *)0)->d_name];
+    bool source, aside;
+} rotation_name;
+/* (P) Hexadecimal names use radix sixteen; overflow is bounded by uintmax_t,
+ * not by a guessed pathname component length. Accept lowercase components. */
+static bool hex_component(const char **text, uintmax_t *out, bool separator)
+{
+    const char *p=*text; uintmax_t value=0; bool any=false;
+    for(;;p++) {
+        unsigned digit;
+        if(*p>='0' && *p<='9') digit=(unsigned)(*p-'0');
+        else if(*p>='a' && *p<='f') digit=(unsigned)(*p-'a')+10u;
+        else break;
+        if(value>(UINTMAX_MAX-digit)/16u) return false;
+        value=value*16u+digit; any=true;
+    }
+    if(!any || (separator && *p++!='-')) return false;
+    *text=p; *out=value; return true;
+}
+static bool rotation_parse(const char *name, rotation_name *out)
+{
+    static const char prefix[]=".sublimite-journal-", source[]="from-", aside[]=".set-aside-";
+    if(strncmp(name,prefix,sizeof prefix-1u)) return false;
+    const char *p=name+sizeof prefix-1u; *out=(rotation_name){0}; uintmax_t ignored;
+    if(!strncmp(p,source,sizeof source-1u)) {
+        p+=sizeof source-1u; out->source=true;
+        if(!hex_component(&p,&out->device,true) || !hex_component(&p,&out->inode,true) ||
+           !hex_component(&p,&out->ctime_sec,true) || !hex_component(&p,&out->ctime_nsec,true)) return false;
+    }
+    /* (P) Historical names have PID/nonce/attempt; new names prefix the
+     * original device/inode/ctime, preserving independent long-basename rotation. */
+    if(!hex_component(&p,&ignored,true) || !hex_component(&p,&ignored,true) ||
+       !hex_component(&p,&ignored,out->source)) return false;
+    if(out->source) {
+        static const char hex[]="0123456789abcdef"; size_t size=0;
+        while(*p && strchr(hex,*p)) {
+            const char *high=strchr(hex,p[0]), *low=p[1]?strchr(hex,p[1]):NULL;
+            if(!low || size+1u>=sizeof out->owner) return false;
+            char byte=(char)((high-hex)*16+(low-hex));
+            if(!byte || byte=='/') return false;
+            out->owner[size++]=byte; p+=2;
+        }
+        if(!size || !strcmp(out->owner,".") || !strcmp(out->owner,"..") ||
+           !strncmp(out->owner,".sublimite-journal-",strlen(".sublimite-journal-")) ||
+           !strncmp(out->owner,"..sublimite-journal-",strlen("..sublimite-journal-"))) return false;
+    }
+    if(!*p) return true;
+    if(strncmp(p,aside,sizeof aside-1u)) return false;
+    p+=sizeof aside-1u; if(!*p) return false;
+    while(*p>='0' && *p<='9') p++;
+    out->aside=true; return !*p;
+}
+static DIR *rescan(DIR *dir)
+{
+    int fd=openat(dirfd(dir),".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(fd<0) return NULL;
+    DIR *scan=fdopendir(fd); if(!scan) close(fd); return scan;
+}
+/* Legacy names cannot identify their owner. A busy existing session lease
+ * therefore protects all of them, except this launch's fresh destination.
+ * Do not create any lease just to perform this liveness check. */
+static bool legacy_owner_live(DIR *dir, const char *current)
+{
+    DIR *scan=rescan(dir); if(!scan) return true;
+    char own[sizeof ((struct dirent *)0)->d_name]="";
+    const char *leaf=strrchr(current,'/');
+    if(*current) {
+        int n=snprintf(own,sizeof own,".%s.lock",leaf?leaf+1:current);
+        if(n<0 || (size_t)n>=sizeof own) *own=0;
+    }
+    bool live=false; struct dirent *entry;
+    for(;;) {
+        errno=0; entry=readdir(scan); if(!entry) { live=errno!=0; break; }
+        size_t len=strlen(entry->d_name);
+        if(len<sizeof ".lock" || strcmp(entry->d_name+len-(sizeof ".lock"-1u),".lock") ||
+           !strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-")) ||
+           !strcmp(entry->d_name,own)) continue;
+        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+        if(fd<0) { live=true; break; }
+        live=flock(fd,LOCK_EX|LOCK_NB)!=0; close(fd); if(live) break;
+    }
+    closedir(scan); return live;
+}
+static bool rotation_source_exists(DIR *dir, const rotation_name *name)
+{
+    struct stat st;
+    return !fstatat(dirfd(dir),name->owner,&st,AT_SYMLINK_NOFOLLOW) && S_ISREG(st.st_mode) &&
+        (uintmax_t)st.st_dev==name->device && (uintmax_t)st.st_ino==name->inode &&
+        (uintmax_t)st.st_ctim.tv_sec==name->ctime_sec && (uintmax_t)st.st_ctim.tv_nsec==name->ctime_nsec;
+}
+/* Existing stray lock files are litter only. Never O_CREAT for temp leases;
+ * verify that the locked inode still has this name before removing it. */
+static bool remove_rotation_lock(DIR *dir, const char *name)
+{
+    int fd=openat(dirfd(dir),name,O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+    if(fd<0) return false;
+    struct stat held,named; bool removed=false;
+    if(!flock(fd,LOCK_EX|LOCK_NB) && !fstat(fd,&held) &&
+       !fstatat(dirfd(dir),name,&named,AT_SYMLINK_NOFOLLOW) && S_ISREG(named.st_mode) &&
+       held.st_dev==named.st_dev && held.st_ino==named.st_ino) removed=unlinkat(dirfd(dir),name,0)==0;
+    close(fd); return removed;
+}
+static int sweep_rotations(DIR *dir, const char *current)
+{
+    bool legacy_live=legacy_owner_live(dir,current), changed=false; int rc=0;
+    rewinddir(dir); struct dirent *entry;
+    while((entry=readdir(dir))) {
+        rotation_name name;
+        if(!rotation_parse(entry->d_name,&name) || name.aside || (!name.source && legacy_live)) continue;
+        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+        if(fd<0) continue;
+        struct stat held,named;
+        bool valid=!flock(fd,LOCK_EX|LOCK_NB) && !fstat(fd,&held) && S_ISREG(held.st_mode) &&
+            !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) && same(&held,&named);
+        if(valid) {
+            if(name.source && rotation_source_exists(dir,&name)) {
+                if(unlinkat(dirfd(dir),entry->d_name,0)) rc=JOURNAL_IO; else changed=true;
+            } else {
+                /* Missing original, or legacy's unknown original: possible
+                 * sole copy. Same set-aside convention as recovery; no copy,
+                 * content read, age test, size limit, or replacement. */
+                struct timespec now; char aside[sizeof entry->d_name];
+                if(clock_gettime(CLOCK_REALTIME,&now)) rc=JOURNAL_IO;
+                else {
+                    /* (P) timespec nanoseconds occupy nine decimal digits,
+                     * matching editor_set_aside's existing naming convention. */
+                    int n=snprintf(aside,sizeof aside,"%s.set-aside-%lld%09ld",entry->d_name,(long long)now.tv_sec,now.tv_nsec);
+                    if(n<0 || (size_t)n>=sizeof aside) rc=JOURNAL_INVALID;
+                    else if(renameat2(dirfd(dir),entry->d_name,dirfd(dir),aside,RENAME_NOREPLACE)) rc=JOURNAL_IO;
+                    else changed=true;
+                }
+            }
+        }
+        close(fd);
+    }
+    /* This separate pass also removes lock litter whose temp disappeared
+     * before this launch. Live/malformed names are preserved. */
+    rewinddir(dir);
+    while((entry=readdir(dir))) {
+        size_t len=strlen(entry->d_name); static const char suffix[]=".lock";
+        if(strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-")) ||
+           len<=sizeof suffix || strcmp(entry->d_name+len-(sizeof suffix-1u),suffix)) continue;
+        char temp[sizeof entry->d_name]; size_t size=len-1u-(sizeof suffix-1u);
+        memcpy(temp,entry->d_name+1,size); temp[size]=0; rotation_name name;
+        if(!rotation_parse(temp,&name) || (!name.source && legacy_live)) continue;
+        struct stat st;
+        if(fstatat(dirfd(dir),temp,&st,AT_SYMLINK_NOFOLLOW) && errno==ENOENT)
+            changed=remove_rotation_lock(dir,entry->d_name) || changed;
+    }
+    if(changed && fsync(dirfd(dir))) rc=JOURNAL_IO;
+    return rc;
 }
 static int record(void *ctx, const journal_record *r)
 {
@@ -153,16 +309,24 @@ int journal_retire_directory(const char *directory, const char *current)
      * persistent artifact and no replaceable lock-file name. */
     int guard=fcntl(dirfd(dir),F_DUPFD_CLOEXEC,0);
     if(guard<0 || flock(guard,LOCK_EX|LOCK_NB)) { if(guard>=0) close(guard); closedir(dir); return JOURNAL_BUSY; }
+    char current_path[sizeof canonical]=""; if(current && !realpath(current,current_path)) current_path[0]=0;
+    /* Sweep before inventory/scanning/retirement can remove an original.
+     * The exclusive directory lease excludes every live new rotation. */
+    int rotation_rc=sweep_rotations(dir,current_path);
+    rewinddir(dir);
     size_t count=0; struct dirent *entry;
     while((entry=readdir(dir))) count++;
     if(count>SIZE_MAX/sizeof(artifact)) { close(guard); closedir(dir); return JOURNAL_NOMEM; }
     edit_arena arena;
     if(edit_arena_init(&arena,(count?count:1)*sizeof(artifact))) { close(guard); closedir(dir); return JOURNAL_NOMEM; }
     artifact *items=edit_arena_alloc(&arena,count*sizeof *items,_Alignof(artifact));
-    inventory inv={.items=items}; int rc=0; uint64_t total=0;
-    char current_path[sizeof canonical]=""; if(current && !realpath(current,current_path)) current_path[0]=0;
+    inventory inv={.items=items}; int rc=rotation_rc; uint64_t total=0;
     rewinddir(dir);
     while((entry=readdir(dir))) {
+        /* Never content-probe or lease a rotation temp, including its pinned
+         * set-aside. Unknown reserved names also cannot prove orphan BASEs. */
+        if(!strncmp(entry->d_name,".sublimite-journal-",strlen(".sublimite-journal-"))) { inv.uncertain=true; continue; }
+        if(!strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-"))) continue;
         bool base=!strncmp(entry->d_name,".sublimite-base-",strlen(".sublimite-base-"));
         bool named=!strncmp(entry->d_name,"session-",strlen("session-"));
         bool session=named;

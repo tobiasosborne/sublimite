@@ -367,8 +367,124 @@ static int orphan_leases(void)
     T(journal_session_release(path,lease)==JOURNAL_OK); close(lease);
     T(cleanup(root)==0); return 0;
 }
+/* edit-52o: pause at the actual rename seam, with a complete page-sized
+ * checkpoint. (P) Pipe endpoints are read/write; SIGKILL drops every lease.
+ * No guessed duration: the pipe establishes that the temp is visible. */
+static int rotation_pause(void *ctx, const char *from, const char *to)
+{
+    (void)to; int fd=*(int *)ctx; size_t size=strlen(from)+1u;
+    if(write(fd,from,size)!=(ssize_t)size) return -1;
+    for(;;) pause();
+}
+static int rotation_names(const char *root, size_t *asides, bool *locks)
+{
+    DIR *dir=opendir(root); T(dir); struct dirent *entry; *asides=0; *locks=false;
+    while((entry=readdir(dir))) {
+        if(!strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-"))) *locks=true;
+        if(!strncmp(entry->d_name,".sublimite-journal-",strlen(".sublimite-journal-")) &&
+           strstr(entry->d_name,".set-aside-")) (*asides)++;
+    }
+    T(closedir(dir)==0); return 0;
+}
+static int rotation_temps(bool missing_source)
+{
+    char root[]="build/rotation-XXXXXX"; T(mkdtemp(root));
+    char path[sizeof ((journal_base *)0)->captured_path], temp[sizeof path]={0}, stray[sizeof path];
+    int result=0, channel[2]={-1,-1}; pid_t child=-1; bool locks=false; size_t asides=0;
+#define R(x) do { if(!(x)) { fprintf(stderr,"journal_retire_test:%d FAIL %s\n",__LINE__,#x); result=1; goto done; } } while(0)
+    R(snprintf(path,sizeof path,"%s/session-owner",root)>0); R(pipe(channel)==0);
+    child=fork(); R(child>=0);
+    if(!child) {
+        close(channel[0]); work_pool pool;
+        if(work_pool_init(&pool,1,0)) _exit(EXIT_FAILURE);
+        journal_io io={.ctx=&channel[1],.rename=rotation_pause}; journal *j=NULL;
+        if(journal_open_with_io(&j,path,&pool,NULL,&io)) _exit(EXIT_FAILURE);
+        /* (P) INSERT = offset64 followed by the literal checkpoint bytes. */
+        uint8_t payload[sizeof(uint64_t)+sizeof "checkpoint"-1u]={0};
+        memcpy(payload+sizeof(uint64_t),"checkpoint",strlen("checkpoint"));
+        journal_record cp={JOURNAL_INSERT,1,0,payload,sizeof payload};
+        (void)journal_rotate(j,&cp,1); _exit(EXIT_FAILURE);
+    }
+    close(channel[1]); channel[1]=-1;
+    size_t got=0;
+    while(got<sizeof temp) {
+        ssize_t n=read(channel[0],temp+got,sizeof temp-got); R(n>0); got+=(size_t)n;
+        if(temp[got-1u]==0) break;
+    }
+    R(got && got<sizeof temp && temp[got-1u]==0);
+    struct stat before,after; R(stat(temp,&before)==0 && before.st_size==(off_t)JOURNAL_PAGE);
+    /* The journal API itself must protect its temp, even without an editor's
+     * outer session lease. Housekeeping may skip the leased directory. */
+    int retired=journal_retire_directory(root,NULL); R(retired==0 || retired==JOURNAL_BUSY);
+    R(stat(temp,&after)==0 && before.st_ino==after.st_ino && before.st_size==after.st_size);
+    R(access(path,F_OK)==0);
+    R(rotation_names(root,&asides,&locks)==0);
+    if(locks || asides) { fprintf(stderr,"rotation_temps: live temp gained a lock or set-aside\n"); result=1; }
+    R(kill(child,SIGKILL)==0); int status;
+    R(waitpid(child,&status,0)==child); child=-1; R(WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    const char *leaf=strrchr(temp,'/'); R(leaf);
+    R(snprintf(stray,sizeof stray,"%s/.%s.lock",root,leaf+1)>0);
+    int fd=open(stray,O_CREAT|O_WRONLY|O_CLOEXEC,0600); R(fd>=0); close(fd);
+    if(missing_source) R(unlink(path)==0);
+    /* A launch runs housekeeping before recovery. An absent original makes
+     * the temp the possible sole copy; preserve its inode under set-aside. */
+    R(journal_retire_directory(root,NULL)==0 && access(temp,F_OK)<0 && access(stray,F_OK)<0);
+    R(rotation_names(root,&asides,&locks)==0 && !locks && asides==(missing_source?1u:0u));
+    if(missing_source) {
+        DIR *dir=opendir(root); R(dir); struct dirent *entry; bool found=false;
+        while((entry=readdir(dir))) if(strstr(entry->d_name,".set-aside-")) {
+            if(fstatat(dirfd(dir),entry->d_name,&after,AT_SYMLINK_NOFOLLOW)==0 &&
+               before.st_ino==after.st_ino && before.st_size==after.st_size) found=true;
+        }
+        closedir(dir); R(found);
+        R(journal_retire_directory(root,NULL)==0);
+        R(rotation_names(root,&asides,&locks)==0 && !locks && asides==1);
+    }
+done:
+    if(child>0) { (void)kill(child,SIGKILL); (void)waitpid(child,NULL,0); }
+    for(size_t i=0;i<sizeof channel/sizeof *channel;i++) if(channel[i]>=0) close(channel[i]);
+    if(cleanup(root)) result=1;
+#undef R
+    return result;
+}
+/* Historical names contain no original-journal identity. From directory
+ * state alone these are possible sole copies, so keep them once, without
+ * scanning even the deliberately incomplete JNL1 content. */
+static int legacy_rotation_temp(void)
+{
+    char root[]="build/legacy-rotation-XXXXXX"; T(mkdtemp(root));
+    char temp[sizeof ((journal_base *)0)->captured_path]; int result=0;
+    T(snprintf(temp,sizeof temp,"%s/.sublimite-journal-a-b-c",root)>0);
+    int fd=open(temp,O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC,0600); T(fd>=0);
+    uint8_t bytes[JOURNAL_PAGE]={0}; memcpy(bytes,"JNL1",strlen("JNL1"));
+    bool written=write(fd,bytes,sizeof bytes)==(ssize_t)sizeof bytes; close(fd);
+    bool locks=false; size_t asides=0;
+    char lock[sizeof temp]; T(snprintf(lock,sizeof lock,"%s/.session-previous.lock",root)>0);
+    int owner=open(lock,O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0600); T(owner>=0 && flock(owner,LOCK_EX|LOCK_NB)==0);
+    if(journal_retire_directory(root,NULL) || access(temp,F_OK) ||
+       rotation_names(root,&asides,&locks) || locks || asides) {
+        fprintf(stderr,"legacy_rotation_temp: live owner's temp changed\n"); result=1;
+    }
+    close(owner);
+    /* A fresh launch already holds its destination lease; it must not pin a
+     * prior writer's temp merely by being the launch doing the sweep. */
+    char current[sizeof temp]; int destination=-1;
+    T(journal_session_create(root,current,sizeof current,&destination)==0);
+    if(!written || journal_retire_directory(root,current) || access(temp,F_OK)==0 ||
+       rotation_names(root,&asides,&locks) || locks || asides!=1) {
+        fprintf(stderr,"legacy_rotation_temp: not set aside without a temp lock\n"); result=1;
+    }
+    if(!result && (journal_retire_directory(root,NULL) || rotation_names(root,&asides,&locks) || locks || asides!=1)) {
+        fprintf(stderr,"legacy_rotation_temp: set-aside changed on next launch\n"); result=1;
+    }
+    close(destination);
+    if(cleanup(root)) result=1;
+    return result;
+}
 int main(void)
 {
-    trace_init(); T(trace_thread_register()>=0); T(retirement()==0); T(protection()==0); T(clean_tab_set()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
+    trace_init(); T(trace_thread_register()>=0);
+    int rotations=rotation_temps(false); rotations|=rotation_temps(true); rotations|=legacy_rotation_temp(); T(rotations==0);
+    T(retirement()==0); T(protection()==0); T(clean_tab_set()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }
