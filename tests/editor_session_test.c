@@ -659,9 +659,167 @@ static int install_failure(void)
     T(closedir(dir) == 0 && rmdir(root) == 0);
     return 0;
 }
+/* edit-fm4 (Tobias's M0 profile, 2026-10-13): GB-scale orphan journals must
+ * never be replayed, copied or set aside on the startup path. The fixture is a
+ * private XDG_DATA_HOME holding one orphan session journal that is a real
+ * checkpoint of a 1 GiB buffer (the brief's size, (P) 2^30 bytes; its source
+ * is a sparse file, but every byte of it is read into the checkpoint, so the
+ * journal itself is 1 GiB of written records) whose /tmp-corpus-like BASE has
+ * since changed, plus a 1 GiB set-aside copy of it. Launch must reach input
+ * accepted and leave every pre-existing profile file as it was (no replay, no
+ * new set-aside); its time is printed against the G4a warm p99 (tracked). (G) G4a, perf/01-perf-target.md
+ * §0.2: "Startup, software, warm | exec -> CPU back buffer complete + map
+ * requested + input accepted | 25 / 40" ms p50/p99 (A panel). */
+#define FM4_GIB (UINT64_C(1) << 30)          /* (P) the brief's 1 GiB fixture */
+#define FM4_G4A_P99_NS UINT64_C(40000000)    /* (G) G4a warm p99 = 40 ms; tracked, not enforced */
+typedef struct fm4_entry { char name[256]; struct stat st; } fm4_entry;
+static size_t fm4_list(const char *dir, fm4_entry *out, size_t cap)
+{
+    DIR *d = opendir(dir); if (!d) return SIZE_MAX;
+    size_t n = 0; struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (n == cap) { closedir(d); return SIZE_MAX; }
+        strcpy(out[n].name, entry->d_name);
+        if (fstatat(dirfd(d), entry->d_name, &out[n].st, AT_SYMLINK_NOFOLLOW)) { closedir(d); return SIZE_MAX; }
+        n++;
+    }
+    closedir(d); return n;
+}
+static void fm4_remove_tree(const char *root)
+{
+    char dir[IPC_PATH_CAP];
+    if (snprintf(dir, sizeof dir, "%s/sublimite", root) > 0) {
+        DIR *d = opendir(dir); struct dirent *entry;
+        if (d) {
+            while ((entry = readdir(d))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+                (void)unlinkat(dirfd(d), entry->d_name, 0);
+            closedir(d);
+        }
+        (void)rmdir(dir);
+    }
+    DIR *d = opendir(root); struct dirent *entry;
+    if (d) {
+        while ((entry = readdir(d))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+            (void)unlinkat(dirfd(d), entry->d_name, 0);
+        closedir(d);
+    }
+    (void)rmdir(root);
+}
+/* Child: open the corpus file, type one byte, checkpoint, crash. */
+static int fm4_orphan(const char *dir, const char *source, char *journal_path)
+{
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
+        uint64_t limit = deadline();
+        while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
+        if (press(e, 'x', 0, "x") || journal_flush(e->journal) || editor_checkpoint(e)) _exit(6);
+        _exit(0); /* crash: the 1 GiB checkpoint is an orphan */
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* The child's name is mkstemp's: find the one session-* without a dot. */
+    DIR *d = opendir(dir); T(d); struct dirent *entry; int found = 0;
+    while ((entry = readdir(d))) if (!strncmp(entry->d_name, "session-", 8) && !strchr(entry->d_name, '.')) {
+        T(snprintf(journal_path, IPC_PATH_CAP, "%s/%s", dir, entry->d_name) > 0); found++;
+    }
+    closedir(d); T(found == 1); return 0;
+}
+static int large_orphans_body(const char *root)
+{
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP], aside[IPC_PATH_CAP];
+    T(setenv("XDG_DATA_HOME", root, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root)) && !strcmp(dir + strlen(root), "/sublimite")); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(snprintf(source, sizeof source, "%s/corpus", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(ftruncate(fd, (off_t)FM4_GIB) == 0); close(fd);
+    T(fm4_orphan(dir, source, orphan) == 0);
+    struct stat st; T(stat(orphan, &st) == 0 && (uint64_t)st.st_size > FM4_GIB);
+    /* The set-aside copy: same bytes under editor_set_aside's naming. */
+    int in = open(orphan, O_RDONLY); T(in >= 0);
+    T(snprintf(aside, sizeof aside, "%s.set-aside-1", orphan) > 0);
+    int out = open(aside, O_CREAT | O_EXCL | O_WRONLY, 0600); T(out >= 0);
+    for (off_t done = 0; done < st.st_size;) {
+        ssize_t n = copy_file_range(in, NULL, out, NULL, (size_t)(st.st_size - done), 0);
+        T(n > 0); done += n;
+    }
+    close(in); close(out);
+    char renamed[IPC_PATH_CAP]; strcpy(renamed, orphan);
+    memcpy(strrchr(renamed, '/') + 1, "session-OLDSET", strlen("session-OLDSET"));
+    T(snprintf(aside, sizeof aside, "%s.set-aside-1", renamed) > 0);
+    char copied[IPC_PATH_CAP]; T(snprintf(copied, sizeof copied, "%s.set-aside-1", orphan) > 0);
+    T(rename(copied, aside) == 0);
+    /* The corpus file changed since the orphan was written (BASE mismatch). */
+    fd = open(source, O_WRONLY); T(fd >= 0); T(pwrite(fd, "changed", strlen("changed"), 0) == (ssize_t)strlen("changed"));
+    close(fd);
+    fm4_entry before[64], after[64]; /* (P) fixture holds 6 names; headroom for the launch's own */
+    size_t nbefore = fm4_list(dir, before, 64); T(nbefore != SIZE_MAX);
+    /* Launch exactly as main.c does: leased session, start_empty. */
+    char journal_path[IPC_PATH_CAP]; int lease = -1;
+    T(journal_session_create(dir, journal_path, sizeof journal_path, &lease) == JOURNAL_OK);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL;
+    uint64_t t0 = trace_now_ns();
+    int rc = editor_open(&e, &config, &backend);
+    if (!rc) rc = settle(e);
+    uint64_t elapsed = trace_now_ns() - t0;
+    T(rc == 0 && e);
+    /* (P) one orphan session in the fixture; the set-aside is not discoverable. */
+    T(e->recovery_notice != NULL && e->recovery_deferred == 1 && tabs_count(&e->tabs) == 0);
+    T(press(e, 'y', 0, "y") == 0); /* input accepted */
+    /* Law 1: G1 is the single enforced perf guard; G4a is a tracked number. */
+    char power[32] = "unknown", load1[32] = "unknown";
+    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fscanf(f, "%31s", power) != 1) strcpy(power, "unknown"); fclose(f); }
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%31s", load1) != 1) strcpy(load1, "unknown"); fclose(f); }
+    printf("large_orphans: launch_ms=%.3f (M) G4a_p99=%.0f bound=tracked power=%s load1=%s\n",
+        (double)elapsed / 1e6, (double)FM4_G4A_P99_NS / 1e6, power, load1);
+    editor_close(e);
+    if (!lstat(journal_path, &st) && !st.st_size) (void)unlink(journal_path);
+    (void)journal_session_release(journal_path, lease); close(lease);
+    size_t nafter = fm4_list(dir, after, 64); T(nafter != SIZE_MAX);
+    /* Every pre-existing file is still there, same inode, size and mtime; no
+     * new set-aside appeared. The launch's own journal may remain. */
+    for (size_t i = 0; i < nbefore; i++) {
+        if (S_ISREG(before[i].st.st_mode) && !before[i].st.st_size && strstr(before[i].name, ".lock")) continue;
+        bool kept = false;
+        for (size_t j = 0; j < nafter; j++) if (!strcmp(before[i].name, after[j].name))
+            kept = after[j].st.st_ino == before[i].st.st_ino && after[j].st.st_size == before[i].st.st_size &&
+                   after[j].st.st_mtim.tv_sec == before[i].st.st_mtim.tv_sec && after[j].st.st_mtim.tv_nsec == before[i].st.st_mtim.tv_nsec;
+        if (!kept) fprintf(stderr, "editor_session_test: fm4 profile changed: %s\n", before[i].name);
+        T(kept);
+    }
+    for (size_t j = 0; j < nafter; j++) {
+        bool old = false;
+        for (size_t i = 0; i < nbefore; i++) old = old || !strcmp(before[i].name, after[j].name);
+        if (!old && strstr(after[j].name, ".set-aside-")) fprintf(stderr, "editor_session_test: fm4 new set-aside %s\n", after[j].name);
+        T(old || !strstr(after[j].name, ".set-aside-"));
+    }
+    return 0;
+}
+static int large_orphans(void)
+{
+    char made[] = "build/editor-fm4-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved) > 0);
+    int rc = large_orphans_body(root);
+    fm4_remove_tree(root); /* on success and on every failure path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    return rc;
+}
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(large_orphans() == 0);
     T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);
     T(recoverable_save_retry(false, true) == 0); T(recoverable_save_retry(true, true) == 0);
     T(session_artifacts() == 0); T(changed_base(false) == 0); T(changed_base(true) == 0); T(install_failure() == 0);
@@ -671,6 +829,6 @@ int main(void)
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
     T(crash_after_evicted_checkpoint() == 0);
-    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, checkpoint during evicted save and crash after it, interrupted-save startup, Saving acknowledgement, allocation guard passed");
+    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, checkpoint during evicted save and crash after it, interrupted-save startup, GB-scale orphan launch, Saving acknowledgement, allocation guard passed");
     return 0;
 }

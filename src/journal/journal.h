@@ -349,6 +349,17 @@ int journal_scan_file(const char *path, journal_visit visit, void *ctx,
  * empty journal + strlen("base")=4-byte retained original) = 131200 bytes.
  * (E): reuse that observed footprint as the eligible-artifact retention cap. */
 int journal_retire_directory(const char *directory, const char *current);
+/* edit-fm4: startup reads at most this many bytes of one journal artifact
+ * synchronously (retirement scan; for a discovered session, the journal plus
+ * its BASE files). Larger artifacts are pinned unscanned; larger sessions are
+ * left pending and untouched (never replayed, copied or renamed at startup).
+ * (G) G4a warm p50 25 ms (perf/01-perf-target.md 0.2) x (M)[AC] page-cache
+ * sequential read 4.2 GB/s (perf/00-hardware-profile.md, dd 1 GiB, 1 MiB
+ * blocks) = 0.025 s x 4.2e9 B/s = 105,000,000 bytes: one read pass this size
+ * alone spends the whole warm-startup p50. Tracked aspiration: the restore
+ * cost model (read + install + checkpoint passes) is (E). */
+#define JOURNAL_STARTUP_SCAN_BYTES UINT64_C(105000000)
+
 /* Startup: create an empty generated session journal DIRECTORY/session-XXXXXX
  * whose lease (DIRECTORY/.session-XXXXXX.lock, the name editor recovery and
  * retirement use) is already held when the journal name becomes visible.

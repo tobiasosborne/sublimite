@@ -391,8 +391,29 @@ static bool newer_source(struct timespec a, const char *a_path, struct timespec 
     return a.tv_sec > b.tv_sec || (a.tv_sec == b.tv_sec &&
         (a.tv_nsec > b.tv_nsec || (a.tv_nsec == b.tv_nsec && strcmp(a_path, b_path) > 0)));
 }
+/* edit-fm4: restoring a discovered session reads its journal and every BASE
+ * it names, installs that text and checkpoints it, all before the first frame.
+ * Sum the bytes of one such read pass; the scan itself stays within the bound
+ * because the journal size is checked first. Undecodable BASE records are
+ * replay's to reject, so they add nothing here. */
+static int cost_record(void *ctx, const journal_record *r)
+{
+    uint64_t *total = ctx;
+    if (r->type != JOURNAL_BASE) return 0;
+    journal_base base; char path[IPC_PATH_CAP];
+    if (journal_decode_base(r, &base, path, sizeof path)) return 0;
+    if (base.size > JOURNAL_STARTUP_SCAN_BYTES - *total) { *total = UINT64_MAX; return JOURNAL_FULL; }
+    *total += base.size; return 0;
+}
+static bool restore_deferred(const char *path, uint64_t size)
+{
+    if (size > JOURNAL_STARTUP_SCAN_BYTES) return true;
+    uint64_t total = size; journal_replay_result result;
+    (void)journal_scan_file(path, cost_record, &total, &result);
+    return total > JOURNAL_STARTUP_SCAN_BYTES;
+}
 static int discover_source(editor *e, const char *directory, const char *before,
-    struct timespec cutoff, char *previous, struct timespec *newest, int *previous_fd)
+    struct timespec cutoff, char *previous, struct timespec *newest, int *previous_fd, uint64_t *size)
 {
     DIR *dir = opendir(directory); if (!dir) return EDITOR_ERR_IO;
     struct dirent *entry;
@@ -415,7 +436,7 @@ static int discover_source(editor *e, const char *directory, const char *before,
         if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) { if (fd >= 0) close(fd); continue; }
         if (*previous_fd < 0 || newer_source(st.st_mtim, candidate, *newest, previous)) {
             if (*previous_fd >= 0) close(*previous_fd);
-            *previous_fd = fd; *newest = st.st_mtim; strcpy(previous, candidate);
+            *previous_fd = fd; *newest = st.st_mtim; strcpy(previous, candidate); *size = (uint64_t)st.st_size;
         } else close(fd);
     }
     closedir(dir); return 0;
@@ -453,10 +474,19 @@ int editor_session_restore(editor *e)
     struct timespec cutoff = {0};
     for (;;) {
         char previous[IPC_PATH_CAP] = ""; int previous_fd = -1;
-        struct timespec newest = {0};
-        int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_fd);
+        struct timespec newest = {0}; uint64_t size = 0;
+        int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_fd, &size);
         if (rc || previous_fd < 0) return rc;
         strcpy(before, previous); cutoff = newest;
+        if (restore_deferred(previous, size)) {
+            /* edit-fm4: a GB-scale orphan is not replayed, copied or renamed
+             * before the first frame. It stays discoverable under its own
+             * name, byte for byte, and the lease is released for later. */
+            e->recovery_notice = "large session journal kept for recovery; not replayed at startup";
+            e->recovery_notice_mutations = e->stats.mutations;
+            e->recovery_deferred++;
+            close(previous_fd); continue;
+        }
         rc = restore_source(e, directory, previous);
         close(previous_fd);
         if (rc) return rc;

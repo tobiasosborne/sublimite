@@ -216,6 +216,7 @@ struct editor {
     uint64_t recovery_notice_mutations;
     bool recovery_notice_shown, recovery_retry, recovery_skip;
     char recovery_aside[IPC_PATH_CAP];
+    size_t recovery_deferred; /* edit-fm4: discovered sessions left pending (too large to replay at startup) */
     work_pool pool, journal_pool, startup_pool;
     editor_backend_init startup;
     render_backend retired_backend;

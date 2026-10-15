@@ -1,3 +1,17 @@
+# edit-fm4 — GB-scale orphan journals at startup (partial: points 1, 3, 4 done)
+
+Startup never reads more than JOURNAL_STARTUP_SCAN_BYTES (journal.h; derivation
+there and in docs/decisions/edit-fm4.md) of one journal artifact: retirement
+pins larger artifacts unscanned; discovery defers sessions whose journal + BASE
+bytes exceed it, leaving them untouched and discoverable, with a status notice
+and `e->recovery_deferred`. tests/editor_session_test.c `large_orphans`.
+
+Missing (point 2): deferred orphans are not yet shown as recoverable closed
+tabs nor restored lazily. Needs a placeholder closed tab excluded from
+checkpoint/metadata, restore on reopen or on the work pool without forced COPY
+acquisition, and a checkpoint that does not rewrite an unmodified buffer's full
+text. Until then: `tools/journal_replay` recovers them manually.
+
 # edit-457.8 — hot exit session integration
 
 Full VIEW records preserve selection, preferred column, logical/visual scroll,

@@ -197,6 +197,9 @@ int journal_retire_directory(const char *directory, const char *current)
         bool own=*current_path && !strcmp(current_path,a->path);
         if(!own && lease(a)) { inv.uncertain=true; continue; }
         a->clean=!own && (a->generated || a->aside || a->retired); inv.scanning=a;
+        /* edit-fm4: never read a GB-scale artifact on the startup path. An
+         * unscanned artifact is pinned, and its BASE references are unknown. */
+        if((uint64_t)a->identity.st_size>JOURNAL_STARTUP_SCAN_BYTES) { a->clean=false; inv.uncertain=true; continue; }
         /* (P) every BASE consumes at least JOURNAL_HEADER wire bytes. The
          * file-size/header quotient bounds identity nodes without a guessed
          * buffer count. Pool pages commit only for actual BASE records. */
