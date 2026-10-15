@@ -1004,7 +1004,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
         undo_break_burst(e->undo); soft_record(e, false);
         return editor_full_layout(e);
     }
-    if (action == KEYS_ACTION_SAVE) return editor_save_request(e, ev->t0_ns);
+    if (action == KEYS_ACTION_SAVE) return e->buffer->placeholder ? 0 : editor_save_request(e, ev->t0_ns); /* edit-qct: inert */
     if (action == KEYS_ACTION_FONT_SIZE) return editor_font_zoom(e, binding->args.value);
     view_key move = VIEW_LEFT; bool moving = move_key(action, &move);
     bool back = action == KEYS_ACTION_BACKSPACE || action == KEYS_ACTION_WORD_BACKSPACE;

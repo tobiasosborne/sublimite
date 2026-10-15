@@ -1,16 +1,22 @@
-# edit-fm4 — GB-scale orphan journals at startup (partial: points 1, 3, 4 done)
+# edit-qct — deferred session journals as recoverable closed tabs (fm4 part 2)
+
+A source that discovery defers (journal + BASE bytes over JOURNAL_STARTUP_SCAN_BYTES)
+becomes a placeholder closed tab (restore.c). It holds the lease, is never
+journalled, and survives a clean exit with the journal untouched. Reopening it
+scans the journal on WORK_BULK into a BASE-relative program. The BASE is opened
+with the configured acquisition (mapped for GB files), the program is applied
+at attach/adoption, and the result is swapped into the tab and checkpointed as
+28u differences. The source is then unlinked (or set aside on a changed BASE).
+tests/editor_session_test.c `large_restore`, `large_orphans` (conflict reopen).
+Limits: [decision record](../../docs/decisions/edit-qct.md) "Known limits".
+
+# edit-fm4 — GB-scale orphan journals at startup (points 1, 3, 4; point 2 is edit-qct)
 
 Startup never reads more than JOURNAL_STARTUP_SCAN_BYTES (journal.h; derivation
 there and in docs/decisions/edit-fm4.md) of one journal artifact: retirement
 pins larger artifacts unscanned; discovery defers sessions whose journal + BASE
 bytes exceed it, leaving them untouched and discoverable, with a status notice
 and `e->recovery_deferred`. tests/editor_session_test.c `large_orphans`.
-
-Missing (point 2): deferred orphans are not yet shown as recoverable closed
-tabs nor restored lazily. Needs a placeholder closed tab excluded from
-checkpoint/metadata, restore on reopen or on the work pool without forced COPY
-acquisition, and a checkpoint that does not rewrite an unmodified buffer's full
-text. Until then: `tools/journal_replay` recovers them manually.
 
 # edit-457.8 — hot exit session integration
 

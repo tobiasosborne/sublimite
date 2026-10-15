@@ -89,6 +89,11 @@ typedef struct editor_buffer {
     view_selection mark;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
+    /* edit-qct: closed-tab stand-in for a deferred session journal (restore.c):
+     * inert, never recorded in this launch's journal or session tree. */
+    bool placeholder;
+    struct editor_restore *restore;                   /* placeholder's source, lease and program */
+    struct editor_restore_buffer *restore_apply;      /* journalled edits to apply once attached */
     size_t find_leases, hl_leases;
     indent_style style;
     indent_style detected_style;
@@ -239,6 +244,11 @@ struct editor {
     bool recovery_notice_shown, recovery_retry, recovery_skip;
     char recovery_aside[IPC_PATH_CAP];
     size_t recovery_deferred; /* edit-fm4: discovered sessions left pending (too large to replay at startup) */
+    /* edit-qct: placeholders hold tab IDs that never reach the journal;
+     * restore_active counts placeholders with a scan or open in flight;
+     * restore_prepare is the program editor_buffer_prepare applies. */
+    size_t recovery_placeholder_ids, restore_active;
+    struct editor_restore_buffer *restore_prepare;
     work_pool pool, journal_pool, startup_pool;
     editor_backend_init startup;
     render_backend retired_backend;
@@ -366,6 +376,19 @@ int editor_session_restore(editor *e);
 /* edit-btj: rename a recovery journal to "<path>.set-aside-<ns>" without
  * replacing anything; out receives the new name ("" on failure). Startup only. */
 int editor_set_aside(const char *path, char *out, size_t cap);
+/* edit-qct (restore.c): lazy restore of deferred session journals. */
+#define EDITOR_RESTORE_MSG UINT32_C(0x45524301) /* message kind tag, like EDITOR_LARGE_MSG_* */
+typedef struct editor_restore editor_restore;
+typedef struct editor_restore_buffer editor_restore_buffer;
+int editor_restore_defer(editor *e, const char *directory, const char *source, int lease);
+int editor_restore_start(editor *e, editor_buffer *b);
+bool editor_restore_receive(editor *e, const work_msg *msg);
+int editor_restore_service(editor *e);
+int editor_restore_apply(editor_buffer *b);
+void editor_restore_free(editor_restore *r);
+int editor_install_buffer(editor *e, editor_buffer *b, uint64_t *id);
+void editor_unpoll_buffer(editor *e, editor_buffer *b);
+size_t editor_tab_title(const char *path, const char **title);
 /* Internal cross-file helpers; UI only. */
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);

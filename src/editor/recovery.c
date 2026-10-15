@@ -507,10 +507,16 @@ int editor_session_restore(editor *e)
             /* edit-fm4: a GB-scale orphan is not replayed, copied or renamed
              * before the first frame. It stays discoverable under its own
              * name, byte for byte, and the lease is released for later. */
-            e->recovery_notice = "large session journal kept for recovery; not replayed at startup";
-            e->recovery_notice_mutations = e->stats.mutations;
             e->recovery_deferred++;
-            close(previous_fd); continue;
+            /* edit-qct: listed as a recoverable closed tab holding the lease,
+             * restored lazily on reopen (restore.c). A full closed-tab pool
+             * leaves the remainder counted only, as fm4 did. */
+            bool listed = editor_restore_defer(e, directory, previous, previous_fd) == 0;
+            e->recovery_notice = listed ? "large session journal kept as a closed tab; reopen it to restore" :
+                "large session journal kept for recovery; not replayed at startup (closed-tab pool full)";
+            e->recovery_notice_mutations = e->stats.mutations;
+            if (!listed) close(previous_fd);
+            continue;
         }
         rc = restore_source(e, directory, previous);
         close(previous_fd);

@@ -76,6 +76,7 @@ minimap_input editor_map_input(editor_buffer *b)
 void editor_buffer_destroy(editor_buffer *b)
 {
     if (!b) return;
+    editor_restore_free(b->restore); b->restore = NULL; /* edit-qct: quiesces its scan job first */
     if (b->map_snapshot) {
         work_cancel(b->pool,b->map_handle);
         while (!work_handle_finished(b->pool,b->map_handle)) sched_yield();
@@ -107,6 +108,7 @@ static void unpoll_source(editor *e, editor_buffer *b)
         if (e->buffers[i] && e->buffers[i] != b && e->buffers[i]->watch_fd == fd) return;
     (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
+void editor_unpoll_buffer(editor *e, editor_buffer *b) { unpoll_source(e, b); }
 void editor_retire_buffers(editor *e)
 {
     if (editor_save_active(e) || e->op_count) return; /* staged tree ranges still borrow buffer arenas */
@@ -204,6 +206,11 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         rc = piece_init_copy(b->preview, prefix, prefix_len);
     } else rc = b->file ? file_attach(b->file, b->tree) : piece_init_copy(b->tree, bytes, len);
     if (rc) goto fail;
+    /* edit-qct: a lazily restored journal's edits apply to the attached
+     * original before any index, layout or snapshot sees the tree; a pending
+     * (large) open applies them at adoption instead. */
+    b->restore_apply = e->restore_prepare;
+    if (!b->pending_open && b->restore_apply) { rc = editor_restore_apply(b); if (rc) goto fail; }
     if (!b->file) {
         /* edit-bml (P): use the file detector and its existing prefix bound;
          * retain the dominant ending even after all original text is cut. */
@@ -280,6 +287,7 @@ int editor_adopt_open(editor *e, editor_buffer *b)
         return editor_check_sources(e);
     }
     int rc = file_attach(b->file, b->tree); if (rc) return EDITOR_ERR_IO;
+    if (b->restore_apply) { rc = editor_restore_apply(b); if (rc) return rc; } /* edit-qct */
     b->pending_open = false;
     b->revision++; /* invalidate the preview's resident scroll source */
     editor_large_init(b);
@@ -389,16 +397,21 @@ int editor_register_journal(editor *e, editor_buffer *b, uint64_t id)
     return rc ? EDITOR_ERR_IO : 0;
 }
 
-static int install(editor *e, editor_buffer *b, uint64_t *id)
+size_t editor_tab_title(const char *path, const char **out)
 {
-    size_t slot = 0; while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
-    if (slot == e->buffer_capacity) return EDITOR_ERR_CAPACITY;
-    const char *title = strrchr(b->path, '/'); title = title ? title + 1 : b->path;
+    const char *title = strrchr(path, '/'); title = title ? title + 1 : path;
     if (!*title) title = "untitled";
     size_t tn = strlen(title); if (tn >= TABS_TITLE_BYTES) tn = TABS_TITLE_BYTES - 1;
     /* Truncation at a grapheme boundary is performed at open, never on switch. */
     size_t end = 0;
     while (end < tn) { size_t n = utf8_grapheme_next((const uint8_t *)title + end, strlen(title) - end); if (n > tn - end) break; end += n; }
+    *out = title; return end;
+}
+static int install(editor *e, editor_buffer *b, uint64_t *id)
+{
+    size_t slot = 0; while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
+    if (slot == e->buffer_capacity) return EDITOR_ERR_CAPACITY;
+    const char *title; size_t end = editor_tab_title(b->path, &title);
     tabs_desc d = {b->tree, &b->undo, b->initial, title, b->path, end, strlen(b->path), false};
     int rc = tabs_open(&e->tabs, &d, &e->v.state, id); if (rc) return EDITOR_ERR_CAPACITY;
     b->id = *id; b->source_generation = 1; b->session_slot = slot; e->buffers[slot] = b;
@@ -467,6 +480,7 @@ static int add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t 
     if (rc && b && !b->id) { unpoll_source(e, b); editor_buffer_destroy(b); }
     return rc;
 }
+int editor_install_buffer(editor *e, editor_buffer *b, uint64_t *id) { return install(e, b, id); }
 int editor_add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id)
 {
     return add_buffer(e, path, bytes, len, id, true);
@@ -524,7 +538,10 @@ int editor_reopen_tab(editor *e)
     if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
     uint64_t id; int rc = tabs_reopen(&e->tabs, &e->v.state, &id);
     if (rc == TABS_ERR_EMPTY || rc == TABS_ERR_CAPACITY) return 0;
-    return rc ? rc : editor_activate(e);
+    if (!rc) rc = editor_activate(e);
+    /* edit-qct: reopening a deferred journal's placeholder starts its restore. */
+    if (!rc && e->buffer->placeholder) rc = editor_restore_start(e, e->buffer);
+    return rc;
 }
 const tabs_tab *editor_tab(const editor *e, size_t index) { return e ? tabs_at(&e->tabs, index) : NULL; }
 const render_grid *editor_grid(const editor *e) { return e ? &e->grid : NULL; }

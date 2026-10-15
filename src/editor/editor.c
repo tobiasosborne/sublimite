@@ -244,6 +244,7 @@ void editor_route_work(const work_msg *msg, void *ctx)
         e->paint_ready=false; return;
     }
     if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
+    if (editor_restore_receive(e, msg)) return; /* edit-qct: completion only wakes the loop */
     if (editor_font_event(e, msg)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
         for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers && e->buffers[i] && e->buffers[i]->index)
@@ -606,7 +607,8 @@ static size_t queue_pick(const editor *e)
             (layout_busy(&e->lay) || e->full_pending || !e->paint_ready)) return SIZE_MAX;
         if (!queued_owner_live(e, at) || editor_event_control(e, event)) return n;
         if (e->queue_owner[at] && e->queue_owner[at] != e->buffer->id) continue;
-        if (!e->buffer->pending_open || e->buffer->source_stale) return n;
+        /* edit-qct: a placeholder is inert; its keys wait for the restore. */
+        if ((!e->buffer->pending_open && !e->buffer->placeholder) || e->buffer->source_stale) return n;
     }
     return SIZE_MAX;
 }
@@ -669,7 +671,7 @@ int editor_inject(editor *e, const plat_event *event)
     if (e->queue_count == EDITOR_INPUT_CAP) return EDITOR_ERR_INPUT_FULL;
     size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
     e->queue[at] = *event; e->queue_serial[at] = ++e->event_serial;
-    bool parked = e->buffer->pending_open && !editor_event_control(e, event);
+    bool parked = (e->buffer->pending_open || e->buffer->placeholder) && !editor_event_control(e, event);
     e->queue_owner[at] = parked ? e->buffer->id : 0;
     e->queue_generation[at] = parked ? e->buffer->source_generation : 0;
     e->queue_count++; return 0;
@@ -696,6 +698,7 @@ int editor_step(editor *e, int timeout_ms)
     if (!rc) rc = editor_find_service(e);
     if (!rc) rc = editor_map_service(e);
     if (!rc) editor_hl_service(e);
+    if (!rc) rc = editor_restore_service(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e);
     if (rc) return fail(e, rc);

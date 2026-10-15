@@ -735,6 +735,7 @@ static int fm4_orphan(const char *dir, const char *source, char *journal_path)
     }
     closedir(d); T(found == 1); return 0;
 }
+static int qct_conflict(const char *dir, const char *orphan);
 static int large_orphans_body(const char *root)
 {
     char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP], aside[IPC_PATH_CAP];
@@ -779,6 +780,8 @@ static int large_orphans_body(const char *root)
     T(rc == 0 && e);
     /* (P) one orphan session in the fixture; the set-aside is not discoverable. */
     T(e->recovery_notice != NULL && e->recovery_deferred == 1 && tabs_count(&e->tabs) == 0);
+    /* edit-qct: listed as one recoverable closed tab naming the source. */
+    T(tabs_closed_count(&e->tabs) == 1 && !strcmp(tabs_closed_at(&e->tabs, 0)->title, "corpus"));
     T(press(e, 'y', 0, "y") == 0); /* input accepted */
     /* Law 1: G1 is the single enforced perf guard; G4a is a tracked number. */
     char power[32] = "unknown", load1[32] = "unknown";
@@ -809,7 +812,7 @@ static int large_orphans_body(const char *root)
         if (!old && strstr(after[j].name, ".set-aside-")) fprintf(stderr, "editor_session_test: fm4 new set-aside %s\n", after[j].name);
         T(old || !strstr(after[j].name, ".set-aside-"));
     }
-    return 0;
+    return qct_conflict(dir, orphan);
 }
 /* edit-28u: a checkpointed clean session is hot-exit state (PRD: the tab set
  * comes back). Launch 1 opens a file, edits, saves (the save's finish
@@ -906,10 +909,178 @@ static int large_orphans(void)
     if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
     return rc;
 }
+/* edit-qct: a deferred orphan (fm4) is a recoverable closed tab, restored
+ * lazily on reopen. The orphan is the post-edit-28u shape: a 1 GiB BASE ((P)
+ * 2^30, the fm4 fixture size) plus one typed byte, so the journal is small but
+ * journal + BASE exceed JOURNAL_STARTUP_SCAN_BYTES and startup defers it. */
+static int qct_orphan(const char *dir, const char *source, char *journal_path)
+{
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
+        uint64_t limit = deadline();
+        while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
+        if (press(e, 'x', 0, "x")) _exit(6);
+        if (journal_flush(e->journal) || editor_checkpoint(e)) _exit(7);
+        _exit(0); /* crash: the checkpoint is an orphan */
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    DIR *d = opendir(dir); T(d); struct dirent *entry; int found = 0;
+    while ((entry = readdir(d))) if (!strncmp(entry->d_name, "session-", 8) && !strchr(entry->d_name, '.')) {
+        T(snprintf(journal_path, IPC_PATH_CAP, "%s/%s", dir, entry->d_name) > 0); found++;
+    }
+    closedir(d); T(found == 1); return 0;
+}
+static int qct_count_base(void *ctx, const journal_record *r)
+{ if (r->type == JOURNAL_BASE) ++*(size_t *)ctx; return 0; }
+typedef struct qct_launch { char journal[IPC_PATH_CAP]; int lease; render_backend backend; editor *e; } qct_launch;
+static int qct_start(const char *dir, qct_launch *l)
+{
+    l->lease = -1; l->e = NULL;
+    T(journal_session_create(dir, l->journal, sizeof l->journal, &l->lease) == JOURNAL_OK);
+    T(render_null_backend(&l->backend) == 0);
+    editor_config config = {.journal_path = l->journal, .session_lease = &l->lease, .start_empty = true, .cols = 32, .rows = 3};
+    T(editor_open(&l->e, &config, &l->backend) == 0); return settle(l->e);
+}
+static void qct_stop(qct_launch *l)
+{
+    struct stat st;
+    if (l->e) editor_close(l->e);
+    l->e = NULL;
+    if (!lstat(l->journal, &st) && !st.st_size) (void)unlink(l->journal);
+    (void)journal_session_release(l->journal, l->lease); close(l->lease);
+}
+/* Exactly one recoverable closed tab naming the source; nothing recorded. */
+static int qct_listed(qct_launch *l)
+{
+    editor *e = l->e;
+    T(e->recovery_deferred == 1 && e->recovery_notice != NULL);
+    T(tabs_count(&e->tabs) == 0 && tabs_closed_count(&e->tabs) == 1);
+    const tabs_tab *tab = tabs_closed_at(&e->tabs, 0);
+    printf("large_restore: closed tab title=%s path=%s\n", tab->title, tab->path);
+    T(!strcmp(tab->title, "corpus"));
+    T(strlen(tab->path) > strlen("/corpus") && !strcmp(tab->path + strlen(tab->path) - strlen("/corpus"), "/corpus"));
+    /* The placeholder is not recovery state: a checkpoint holds no BASE. */
+    T(journal_flush(e->journal) == 0 && editor_checkpoint(e) == 0);
+    size_t bases = 0; journal_replay_result result;
+    T(journal_scan_file(l->journal, qct_count_base, &bases, &result) == 0); T(bases == 0);
+    return 0;
+}
+static int large_restore_body(const char *root)
+{
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP], lock[IPC_PATH_CAP];
+    T(setenv("XDG_DATA_HOME", root, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root)) && !strcmp(dir + strlen(root), "/sublimite")); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(snprintf(source, sizeof source, "%s/corpus", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(ftruncate(fd, (off_t)FM4_GIB) == 0); close(fd);
+    T(qct_orphan(dir, source, orphan) == 0);
+    struct stat before, st; T(stat(orphan, &before) == 0);
+    printf("large_restore: orphan journal bytes=%lld (M)\n", (long long)before.st_size);
+    T((uint64_t)before.st_size < JOURNAL_STARTUP_SCAN_BYTES); /* the post-28u shape: BASE referenced, not copied */
+    /* Launch 1: listed, then a clean exit leaves the orphan byte for byte. */
+    qct_launch l = {0};
+    int rc = qct_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    qct_stop(&l); T(rc == 0);
+    T(stat(orphan, &st) == 0 && st.st_ino == before.st_ino && st.st_size == before.st_size &&
+      st.st_mtim.tv_sec == before.st_mtim.tv_sec && st.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
+    /* Launch 2: listed again; reopen restores it lazily. */
+    rc = qct_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    editor *e = l.e;
+    uint64_t worst = 0, steps = 0, t0 = trace_now_ns(), limit = deadline();
+    if (!rc) rc = editor_reopen_tab(e);
+    while (!rc && (e->buffer->placeholder || e->buffer->pending_open || !tabs_count(&e->tabs))) {
+        uint64_t a = trace_now_ns(); rc = turn(e); uint64_t b = trace_now_ns();
+        if (b - a > worst) worst = b - a;
+        steps++;
+        if (b >= limit) { fprintf(stderr, "editor_session_test: restore did not finish\n"); rc = 1; }
+        sched_yield();
+    }
+    if (!rc) rc = settle(e);
+    char power[32] = "unknown", load1[32] = "unknown";
+    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fscanf(f, "%31s", power) != 1) strcpy(power, "unknown"); fclose(f); }
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%31s", load1) != 1) strcpy(load1, "unknown"); fclose(f); }
+    /* Tracked, never asserted (Law 1): the longest UI step against the settle
+     * watchdog EDITOR_IDLE_NS. */
+    printf("large_restore: restore_ms=%.3f steps=%llu worst_step_ms=%.3f (M) idle_watchdog_ms=%.0f bound=tracked power=%s load1=%s\n",
+        (double)(trace_now_ns() - t0) / 1e6, (unsigned long long)steps, (double)worst / 1e6,
+        (double)EDITOR_IDLE_NS / 1e6, power, load1);
+    if (rc) { qct_stop(&l); T(rc == 0); }
+    editor_buffer *b = e->buffer;
+    uint8_t head[2] = {0, 1};
+    bool text = tabs_count(&e->tabs) == 1 && piece_len(b->tree) == FM4_GIB + 1 &&
+        piece_read(b->tree, 0, head, 2) == 0 && head[0] == 'x' && head[1] == 0;
+    bool named = text && !strcmp(editor_tab(e, 0)->title, "corpus") && editor_tab(e, 0)->modified;
+    /* No copy of BASE size: the restored tree maps BASE; COPY acquisition
+     * would size the buffer arena by the file (buffers.c prepare). */
+    bool mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP && b->arena.size < FM4_GIB;
+    printf("large_restore: text=%s named=%s mapped=%s arena_bytes=%zu\n", text ? "yes" : "no",
+        named ? "yes" : "no", mapped ? "yes" : "no", b->arena.size);
+    /* The recovered edit is durable in this launch's journal as a difference
+     * from BASE (edit-28u), and the orphan is retired. */
+    rc = journal_flush(e->journal) || editor_checkpoint(e) ? 1 : 0;
+    bool small = !rc && !stat(l.journal, &st) && (uint64_t)st.st_size < JOURNAL_STARTUP_SCAN_BYTES;
+    bool retired = access(orphan, F_OK) != 0;
+    printf("large_restore: launch journal bytes=%lld small=%s orphan_retired=%s\n", (long long)st.st_size,
+        small ? "yes" : "no", retired ? "yes" : "no");
+    qct_stop(&l);
+    T(text && named && mapped && small && retired);
+    T(snprintf(lock, sizeof lock, "%s/.%s.lock", dir, strrchr(orphan, '/') + 1) > 0);
+    T(access(lock, F_OK) != 0);
+    return 0;
+}
+/* edit-qct: reopening the placeholder of an orphan whose BASE changed never
+ * replays onto it (edit-btj): the disk text opens clean and the journal is
+ * set aside under its dotted name. */
+static int qct_conflict(const char *dir, const char *orphan)
+{
+    qct_launch l = {0};
+    T(qct_start(dir, &l) == 0);
+    editor *e = l.e; uint64_t t0 = trace_now_ns(), limit = deadline();
+    int rc = tabs_closed_count(&e->tabs) == 1 ? editor_reopen_tab(e) : 1;
+    while (!rc && (e->buffer->placeholder || e->buffer->pending_open || !tabs_count(&e->tabs))) {
+        rc = turn(e); if (trace_now_ns() >= limit) rc = 1;
+        sched_yield();
+    }
+    if (!rc) rc = settle(e);
+    uint8_t head[7] = {0};
+    bool disk = !rc && tabs_count(&e->tabs) == 1 && piece_len(e->buffer->tree) == FM4_GIB &&
+        !piece_read(e->buffer->tree, 0, head, sizeof head) && !memcmp(head, "changed", sizeof head) && !editor_tab(e, 0)->modified;
+    bool notice = e->recovery_notice && strstr(e->recovery_notice, "set aside");
+    printf("large_orphans: conflict reopen rc=%d disk_text=%s notice=%s restore_ms=%.3f (M)\n", rc, disk ? "yes" : "no",
+        notice ? "yes" : "no", (double)(trace_now_ns() - t0) / 1e6);
+    qct_stop(&l);
+    T(rc == 0 && disk && notice);
+    T(access(orphan, F_OK) != 0); /* renamed aside, never deleted */
+    return 0;
+}
+static int large_restore(void)
+{
+    char made[] = "build/editor-qct-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved) > 0);
+    int rc = large_restore_body(root);
+    fm4_remove_tree(root); /* on success and on every failure path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    if (!rc) puts("large_restore: deferred orphan listed as a closed tab, survives a clean exit, restored lazily on reopen");
+    return rc;
+}
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
     T(clean_tab_set() == 0);
+    T(large_restore() == 0);
     T(large_orphans() == 0);
     T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);
     T(recoverable_save_retry(false, true) == 0); T(recoverable_save_retry(true, true) == 0);

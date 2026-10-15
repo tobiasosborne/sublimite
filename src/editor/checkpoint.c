@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+static size_t recorded_tabs(const editor *e, uint8_t *out);
 static void put64(uint8_t *p, uint64_t value)
 { for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(value >> (8u * i)); }
 void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES])
@@ -105,7 +106,7 @@ static int build_checkpoint(editor *e, checkpoint_build *c)
          * as a closed tab with an empty BASE and its full text, as CURRENT
          * cancellation encodes it: recovery compares that text with the disk. */
         bool kept = b && b->retired;
-        if (!b || (kept && !editor_session_retains(e, b, NULL))) continue;
+        if (!b || b->placeholder || (kept && !editor_session_retains(e, b, NULL))) continue; /* edit-qct */
         const journal_base *base = &b->base, empty = {.path = ""};
         if (kept) base = &empty;
         /* Preserve named BASE association. A source conflict must preserve the
@@ -148,12 +149,28 @@ static int build_checkpoint(editor *e, checkpoint_build *c)
     }
     size_t tabs = tabs_count(&e->tabs);
     if (tabs > (JOURNAL_MAX_RECORD - 16) / 8) return JOURNAL_INVALID;
-    uint8_t *p = record(c, JOURNAL_TABS, 0, 16 + tabs * 8); if (!p) return c->error;
-    put64(p, tabs); put64(p + 8, tabs ? tabs_active_index(&e->tabs) : 0);
-    for (size_t i = 0; i < tabs; i++) put64(p + 16 + i * 8, tabs_at(&e->tabs, i)->id);
+    uint8_t *p = record(c, JOURNAL_TABS, 0, 16 + recorded_tabs(e, NULL) * 8); if (!p) return c->error;
+    (void)recorded_tabs(e, p);
     p = record(c, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES); if (!p) return c->error;
     journal_encode_window(&(journal_window){e->font.window_width, e->font.window_height, JOURNAL_WINDOW_CHOSEN}, p);
     return 0;
+}
+/* edit-qct: TABS lists every live tab except placeholders, whose IDs have no
+ * BASE in this journal (recovery would reject the session). With out, write
+ * the record payload; returns the recorded count. */
+static size_t recorded_tabs(const editor *e, uint8_t *out)
+{
+    size_t count = 0, active = 0, live = tabs_count(&e->tabs), current = tabs_active_index(&e->tabs);
+    for (size_t i = 0; i < live; i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (b->placeholder) continue;
+        if (i == current) active = count;
+        if (out) put64(out + 16 + count * 8, tab->id);
+        count++;
+    }
+    if (out) { put64(out, count); put64(out + 8, active); }
+    return count;
 }
 int editor_checkpoint(editor *e)
 {
@@ -192,7 +209,7 @@ int editor_journal_metadata(editor *e)
     /* No BASE has been installed before tabs' first ID is consumed. Preserve
      * the empty-placeholder contract on failed startup; a last-tab close has
      * consumed an ID and must still publish the empty live order. */
-    if (e->tabs.next_id == 1 && !tabs_count(&e->tabs)) return 0;
+    if (e->tabs.next_id == 1 + e->recovery_placeholder_ids && !recorded_tabs(e, NULL)) return 0; /* edit-qct: placeholder IDs are not tabs */
     if (editor_save_leased(e)) return 0; /* save checkpoint owns the journal fence */
     if (e->op_count) {
         e->journal_metadata_pending = true; return JOURNAL_BUSY;
@@ -208,6 +225,7 @@ int editor_journal_metadata(editor *e)
             if (!tab->undo) return JOURNAL_INVALID;
             editor_buffer *b = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
             if (b->id != tab->id) return JOURNAL_INVALID;
+            if (b->placeholder) continue; /* edit-qct */
             view_state state = b == e->buffer ? e->v.state : tab->state;
             uint8_t data[JOURNAL_VIEW_STATE_BYTES]; editor_encode_view(state, data);
             journal_record record_view = {JOURNAL_VIEW, b->id, 0, data, sizeof data};
@@ -220,10 +238,8 @@ int editor_journal_metadata(editor *e)
             }
         }
     }
-    size_t count = tabs_count(&e->tabs), size = 16 + count * 8;
     uint8_t *data = e->journal_tabs;
-    put64(data, count); put64(data + 8, count ? tabs_active_index(&e->tabs) : 0);
-    for (size_t i = 0; i < count; i++) put64(data + 16 + i * 8, tabs_at(&e->tabs, i)->id);
+    size_t count = recorded_tabs(e, data), size = 16 + count * 8;
     if (size != e->journal_tabs_size || memcmp(data, e->journal_tabs_cached, size)) {
         int rc = journal_append_protected(e->journal, JOURNAL_TABS, 0, data, size); if (rc) return rc;
         memcpy(e->journal_tabs_cached, data, size); e->journal_tabs_size = size;
