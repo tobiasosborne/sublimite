@@ -1,3 +1,26 @@
+# HANDOFF — sublimité, end of session 16 (2026-10-16 ~21:50 box clock; Fable coordinator, Tobias present; stopped on Tobias's order "once the next work lands update handoff commit and push and stop all work")
+
+## Read first (session 17)
+**Astra drive 6 ran on build/astra6 (main 9b5ee41 code; main is fd3db33 + docs): VERDICT usable instead of Sublime for Tobias's daily edits: yes; blockers: none observed in the core set.** Report docs/reviews/astra-vs-sublime-6.md (1258 lines), notes docs/worker-reports/edit-w34.4-drive6.md, brief build/astra/brief6.md. Core set: task 37 (the drive-5 blocker) reproduced on build/astra5 (-103) and FIXED on astra6, also after a save; task 38 find in files NEW passing (same matching text as Sublime after normalisation, Enter/F4/Shift+F4, read-only tab, Escape cancel, source unchanged); task 39 (dz0) near-caret typing before the index lands in a few 60 Hz intervals, Ctrl+End then a key still waits visibly (edit-ptn's case, noted there); task 40 (f3i) journal growth after a save 4096 B per checkpoint, 0 B on the save itself; task 41 (52o) no rotation temporaries left; task 36 (qct) the deferred 1 GiB session is a closed tab, Ctrl+Shift+T restores the edit, an untouched placeholder keeps its journal byte for byte. Appendix: only tasks 1 (font12) and 2 (paired Z) re-run; Astra ended by itself at 21:38 after 39 min (Codex 32 % -> 36 %, +16.2 -> +19.8; the brief's "core set, VERDICT, then appendix; the owner may stop after the VERDICT" ordering is what made it cheap: keep it). Full `make check` on main passed first (8f8a21e, exit 0, 100 binaries, 667 s (M)[AC], build/check16/make-check.log).
+
+**Law 1 is satisfied for build/astra6/sublimite: hand it to Tobias (edit-pi6, now unblocked; edit-w34.4 closed with the drive-6 verdict).** Launch line for his own work on the real display, private profile as in session 13:
+
+    XDG_DATA_HOME=$HOME/.local/share/sublimite-trial EDIT_ALLOW_REAL_DISPLAY=1 ./build/astra6/sublimite path/to/file
+
+His default profile ~/.local/share/sublimite (5.2 GB debris, the edit-fm4 fixture) stays untouched; with astra6 it would launch and list the large orphans as closed tabs. Every lag or wrong-text report from the trial becomes a bead with a repro.
+
+**Filed from drive 6 (law 8):** P3 edit-4da (qct: a restored large session is deferred again on every launch because recovery.c:501 counts base.size against JOURNAL_STARTUP_SCAN_BYTES; a dirty file above 105 MB is a closed tab on every start); P4 edit-b2s (drive-6 backlog: font12 adoption 1077.6 ms, task-39 Ctrl+End wait, root-still capture artefact, Sublime comparator stalls and dialogs, appendix groups not re-run). Note added to edit-ptn.
+
+**Still open from session 15, unchanged, next in order:** the five P2 review bugs edit-y5x (btj retry: any install failure at a leased launch exits -103 because the failed attempt removed the launch journal and lock), edit-601, edit-5vz, edit-dr9, edit-ptn, one lane each (Opus, or Codex sol when Codex is under pace), Sonnet hunt per landing; then the Codex deep review of src/editor checkpoint/recovery/restore (epic end). Not started this session on Tobias's stop order (orchestration items 25-26).
+
+**Quota at the stop (21:45):** Codex Weekly 36 % / +19.8 % ahead (under Tobias's 20 % line, over the +12 % peer line: no Codex until it drifts down, or Tobias says otherwise). Claude Weekly read +7.7 % at 20:58; the quota app returned HTTP 429 for Claude at 21:45 (re-read next session). Peers: adelefeld stopped for the night (20:50); initech had two Opus lanes with QEMU up at 21:38.
+
+**Box:** Xvfb :98 (pid 917702) and :99 up; no Sublime, codex or watcher processes left; build/astra6 holds the drive state (videos, logs, state copies deleted by Astra), keep it until Tobias has looked at the report. Clock looked sane this session (no jump seen).
+
+Worklog: docs/worklog/2026-10-16.md (session 16 section). Everything below is the session-15 handoff, still valid where not superseded above.
+
+---
+
 # HANDOFF — sublimité, end of session 15 (2026-10-16 ~10:40 box clock; the box clock jumped during the Astra drive, so file mtimes under docs/reviews and build/astra5 carry 10-17 dates: `touch` sources or `rm -rf build` before trusting make; Fable coordinator, Tobias back at the keyboard from ~08:00)
 
 ## Read first (session 16)
