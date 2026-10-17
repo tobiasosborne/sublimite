@@ -23,9 +23,9 @@ void editor_runtime_window(uint32_t work_width, uint32_t work_height,
 /* INIT only: X resources, active RANDR output physical size, EWMH work area.
  * Returns EDITOR_ERR_IO when the display cannot be opened. */
 int editor_runtime_display_size(editor_display_size *size);
-/* Pure selection: any non-NULL allow opts in, matching the test guard.
- * NULL display stays NULL when allowed. Caller applies the returned setting. */
-const char *editor_runtime_display(const char *display, const char *safe, const char *allow);
+/* Pure selection: preserve display by default; any non-NULL refuse selects
+ * a private alternate for unsafe displays. Caller applies or refuses it. */
+const char *editor_runtime_display(const char *display, const char *safe, const char *refuse);
 /* Resolve without creating: absolute XDG_CONFIG_HOME or HOME/.config.
  * Setup only; returns EDITOR_OK / EDITOR_ERR_ARG. */
 int editor_config_dir(char *out, size_t cap);

@@ -16,9 +16,9 @@ static bool real_display(const char *s)
     while (*p >= '0' && *p <= '9') { if (*p != '0') nonzero = true; p++; }
     return !nonzero || (*p && *p != '.');
 }
-const char *editor_runtime_display(const char *display, const char *safe, const char *allow)
+const char *editor_runtime_display(const char *display, const char *safe, const char *refuse)
 {
-    if (allow || !real_display(display)) return display;
+    if (!refuse || !real_display(display)) return display;
     return safe && !real_display(safe) ? safe : ":99";
 }
 int editor_config_dir(char *out, size_t cap)

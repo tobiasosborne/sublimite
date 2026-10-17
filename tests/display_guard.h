@@ -6,7 +6,8 @@
  * EDIT_ALLOW_REAL_DISPLAY=1 only for an explicit real-display bench pass.
  * Wayland names have no private-number convention: inherited WAYLAND_DISPLAY
  * and WAYLAND_SOCKET are cleared unless allowed; EDIT_WAYLAND_DISPLAY names
- * an explicitly selected private compositor. */
+ * an explicitly selected private compositor. Always export
+ * EDIT_REFUSE_REAL_DISPLAY for spawned production launchers. */
 #ifndef EDIT_DISPLAY_GUARD_H
 #define EDIT_DISPLAY_GUARD_H
 #include <stdio.h>
@@ -20,11 +21,14 @@
  * host/transport spelling; zero and invalid/missing displays are refused. */
 static int edit_display_is_real(const char *d)
 {
-    return editor_runtime_display(d, NULL, NULL) != d;
+    return editor_runtime_display(d, NULL, "") != d;
 }
 
 __attribute__((constructor)) static void edit_display_guard(void)
 {
+    /* (P) Presence enables refusal in production children, independently of
+     * this constructor's retained explicit real-display bench opt-in. */
+    (void)setenv("EDIT_REFUSE_REAL_DISPLAY", "1", 1);
     const char *wayland = getenv("WAYLAND_DISPLAY");
     const char *allow = getenv("EDIT_ALLOW_REAL_DISPLAY");
     if (!allow) {

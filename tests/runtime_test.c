@@ -39,15 +39,22 @@ int main(void)
     T(directory_test() == 0);
     const char *real[] = {NULL, "", ":0", ":0.0", "unix:0", "localhost:0.1", ":00", "bad"};
     for (size_t i = 0; i < sizeof real / sizeof real[0]; i++) {
-        T(strcmp(editor_runtime_display(real[i], ":99", NULL), ":99") == 0);
-        T(strcmp(editor_runtime_display(real[i], ":0", NULL), ":99") == 0);
-        T(editor_runtime_display(real[i], ":99", "1") == real[i]);
-        T(editor_runtime_display(real[i], ":99", "") == real[i]);
+        /* (P) NULL refusal preserves DISPLAY; any present refusal value,
+         * including empty, selects the existing private-display fallback. */
+        T(editor_runtime_display(real[i], ":99", NULL) == real[i]);
+        T(strcmp(editor_runtime_display(real[i], ":99", "1"), ":99") == 0);
+        T(strcmp(editor_runtime_display(real[i], ":0", "1"), ":99") == 0);
+        T(strcmp(editor_runtime_display(real[i], ":99", ""), ":99") == 0);
     }
     T(strcmp(editor_runtime_display(":98.1", ":99", NULL), ":98.1") == 0);
-    T(strcmp(editor_runtime_display(":0", "", NULL), ":99") == 0);
-    T(strcmp(editor_runtime_display(":0", NULL, NULL), ":99") == 0);
-    puts("runtime_test: pure display decision honours explicit allow (no environment opt-in)");
+    T(strcmp(editor_runtime_display(":98.1", ":99", "1"), ":98.1") == 0);
+    T(strcmp(editor_runtime_display(":0", "", "1"), ":99") == 0);
+    T(strcmp(editor_runtime_display(":0", NULL, "1"), ":99") == 0);
+    const char *compositor = "wayland-0"; /* (P) conventional compositor name from bead. */
+    T(wayland_display_select(compositor, NULL, "") == compositor);
+    T(wayland_display_select(compositor, NULL, NULL) == NULL);
+    T(strcmp(wayland_display_select(compositor, "private-compositor", NULL), "private-compositor") == 0);
+    puts("runtime_test: default display preserved; explicit refusal selects private fallback; Wayland caller policy passed");
     char root[] = "/tmp/sublimite-paths-XXXXXX", path[4097], want[4097];
     T(mkdtemp(root) != NULL);
     T(setenv("HOME", root, 1) == 0);

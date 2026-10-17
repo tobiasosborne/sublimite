@@ -110,6 +110,87 @@ static void pause_poll(void)
 {
     struct timespec pause = {0, 10000000}; (void)nanosleep(&pause, NULL);
 }
+/* (P) DISPLAY comes from the locked private Xvfb fixture, never EDIT_DISPLAY.
+ * Refusal probes name the real display but the old launcher redirects them to
+ * that private fixture. No probe may connect to the user's display. Statuses
+ * are the CLI contract: EXIT_SUCCESS on close, EXIT_FAILURE on refusal; flags
+ * and descriptor indexes use the POSIX boolean/pipe conventions. The watchdog
+ * is the existing EDITOR_IDLE_NS, not an additional timing budget. */
+static int display_policy_child(const char *display, bool refuse, bool legacy_allow)
+{
+    int result = EXIT_FAILURE, status = 0;
+    pid_t child = -1;
+    xcb_connection_t *c = NULL;
+    FILE *errors = NULL;
+    char *line = NULL; size_t capacity = 0;
+    const char *private_display = getenv("DISPLAY");
+    const char *root = test_ipc_isolate(); T(root);
+    T(private_display && !edit_display_is_real(private_display));
+    c = xcb_connect(private_display, NULL); T(c && !xcb_connection_has_error(c));
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data; T(screen);
+    xcb_atom_t pid_atom = intern(c, "_NET_WM_PID");
+    errors = tmpfile(); T(errors);
+    child = fork(); T(child >= 0);
+    if (!child) {
+        if (dup2(fileno(errors), STDERR_FILENO) < 0 ||
+            setenv("XDG_DATA_HOME", root, 1) || setenv("XDG_CONFIG_HOME", root, 1) ||
+            setenv("DISPLAY", display ? display : private_display, 1) ||
+            setenv("EDIT_DISPLAY", private_display, 1) ||
+            setenv("EDIT_BACKEND", "raster", 1) || unsetenv("WAYLAND_DISPLAY") ||
+            unsetenv("WAYLAND_SOCKET") || unsetenv("EDIT_TRACE_DUMP") ||
+            (refuse ? setenv("EDIT_REFUSE_REAL_DISPLAY", "1", 1) : unsetenv("EDIT_REFUSE_REAL_DISPLAY")) ||
+            (legacy_allow ? setenv("EDIT_ALLOW_REAL_DISPLAY", "1", 1) : unsetenv("EDIT_ALLOW_REAL_DISPLAY")))
+            _exit(EXIT_FAILURE);
+        /* Poisoning the alternate demonstrates that DISPLAY itself suffices. */
+        if (!refuse && setenv("EDIT_DISPLAY", "invalid-private-alternate", 1)) _exit(EXIT_FAILURE);
+        execl("build/sublimite", "sublimite", "--new-instance", (char *)NULL);
+        _exit(EXIT_FAILURE);
+    }
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS;
+    xcb_window_t window = XCB_WINDOW_NONE; pid_t waited = 0;
+    while (!waited && !window && trace_now_ns() < deadline) {
+        window = find_window(c, screen->root, pid_atom, child);
+        waited = child_wait(child, &status, WNOHANG);
+        if (!waited && !window) pause_poll();
+    }
+    if (window) {
+        xcb_client_message_event_t close_event = {.response_type = XCB_CLIENT_MESSAGE, .format = 32,
+            .window = window, .type = intern(c, "WM_PROTOCOLS"),
+            .data.data32 = {intern(c, "WM_DELETE_WINDOW")}}; /* (P) X11 ClientMessage format is bits per item. */
+        (void)xcb_send_event(c, 0, window, 0, (const char *)&close_event); (void)xcb_flush(c);
+    }
+    while (!waited && trace_now_ns() < deadline) {
+        waited = child_wait(child, &status, WNOHANG);
+        if (!waited) pause_poll();
+    }
+    T(waited == child); child = -1;
+    bool guarded = false;
+    rewind(errors);
+    while (getline(&line, &capacity, errors) >= 0)
+        if (strstr(line, "display guard: real display") && strstr(line, "refused")) guarded = true;
+    if (refuse) {
+        T(!window && guarded && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE);
+        puts("cli_test: explicit real-display refusal exits with guard diagnostic");
+    } else {
+        T(window && !guarded && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+        puts(legacy_allow ? "cli_test: legacy display opt-in remains compatible" :
+            "cli_test: default production launch uses DISPLAY without an opt-in or alternate");
+    }
+    result = EXIT_SUCCESS;
+cleanup:
+    if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
+    if (errors) (void)fclose(errors);
+    free(line);
+    if (c) xcb_disconnect(c);
+    return result;
+}
+static int display_policy(void)
+{
+    if (display_policy_child(NULL, false, false)) return EXIT_FAILURE;
+    if (display_policy_child(NULL, false, true)) return EXIT_FAILURE;
+    if (display_policy_child(":0", true, false)) return EXIT_FAILURE;
+    return EXIT_SUCCESS;
+}
 static ipc_result decoy_open(const ipc_request *request, ipc_token token, void *ctx)
 {
     (void)request; (void)token;
@@ -606,7 +687,9 @@ int main(int argc, char **argv)
     /* edit-djg (P): executable plus the named focused-test option. */
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigterm")) return run_cli_suite(SIGTERM);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigint")) return run_cli_suite(SIGINT);
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--display-policy")) return display_policy();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--duplicate-path")) return duplicate_cli_handoff();
+    if (display_policy()) return EXIT_FAILURE;
     if (duplicate_cli_handoff()) return 1;
     if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite(SIGKILL);
     /* A live implementation that misses its window deadline must fail. */

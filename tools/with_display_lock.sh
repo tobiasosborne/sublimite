@@ -34,6 +34,7 @@ def main():
         print("display lock: invalid EDIT_DISPLAY_LOCK_TIMEOUT", file=sys.stderr)
         return 2
     os.environ["DISPLAY"] = display
+    os.environ["EDIT_REFUSE_REAL_DISPLAY"] = "1"  # Presence opts production children into the guard.
     # An environment marker alone is insufficient: check the inherited inode
     # and acquire on that same open-file description (flock is reentrant there).
     inherited = os.environ.get("EDIT_DISPLAY_LOCK_FD", "")

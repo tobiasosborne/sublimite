@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- (E) Normalized square, path coordinates and near-black fill chosen for
+       a simple italic s; drawing values, not performance or resource budgets. -->
+  <title>sublimité</title>
+  <path fill="#202020" d="M50 12H29c-9 0-15 6-17 14-2 8 3 12 11 12h10c4 0 5 2 4 5s-4 5-8 5H10L7 58h21c10 0 17-6 20-15 2-8-2-13-11-13H26c-3 0-5-2-4-4s3-4 7-4h18z"/>
+</svg>

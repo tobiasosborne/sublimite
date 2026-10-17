@@ -31,6 +31,7 @@ LDLIBS := -lm -ldl $(WAYLAND_LIBS)
 LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 
 B := build
+PREFIX ?= $(HOME)/.local
 TS_SRC := vendor/tree-sitter/lib/src/lib.c
 # fif is discovered with the same module/test/fuzz/bench globs as findui.
 SRCS   := $(sort $(wildcard src/*/*.c)) $(TS_SRC)
@@ -139,10 +140,28 @@ EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
 $(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
-.PHONY: all lib check check-sh bench bench-zygote fuzz clean
+.PHONY: all lib install uninstall check check-sh bench bench-zygote fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)
 lib: $(REL_LIB)
+
+# Install only the release artifacts; all also builds tests and benches.
+# (P) install modes are POSIX executable/data permission conventions.
+install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/sublimite.svg
+	install -d "$(PREFIX)/bin" "$(PREFIX)/share/applications" "$(PREFIX)/share/icons/hicolor/scalable/apps"
+	install -m 755 $(B)/sublimite "$(PREFIX)/bin/sublimite"
+	install -m 755 $(B)/tools/tracedump "$(PREFIX)/bin/tracedump"
+	install -m 644 tools/sublimite.desktop "$(PREFIX)/share/applications/sublimite.desktop"
+	install -m 644 tools/sublimite.svg "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+	@if command -v update-desktop-database >/dev/null; then update-desktop-database "$(PREFIX)/share/applications"; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
+	@if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
+	@if command -v xdg-mime >/dev/null; then xdg-mime default sublimite.desktop text/plain; else printf '%s\n' 'Run: xdg-mime default sublimite.desktop text/plain'; fi
+	@printf '%s\n' 'Installed:' "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+
+uninstall:
+	rm -f "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+	@if command -v update-desktop-database >/dev/null; then if test -d "$(PREFIX)/share/applications"; then update-desktop-database "$(PREFIX)/share/applications"; fi; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
+	@if command -v gtk-update-icon-cache >/dev/null; then if test -d "$(PREFIX)/share/icons/hicolor"; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; fi; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
 
 # ---- objects (one tree per configuration) ----
 $(B)/rel/%.o: %.c
@@ -156,7 +175,7 @@ $(B)/san/%.o: %.c
 # tests/display_guard.h (DISPLAY :0 -> $EDIT_DISPLAY or :99 unless EDIT_ALLOW_REAL_DISPLAY),
 # and check/bench run binaries on a safe display: a private Xvfb from xvfb-run is kept,
 # anything that names the real display 0 (or no DISPLAY) becomes $${EDIT_DISPLAY:-:99}.
-SAFE_DISPLAY = d=$${DISPLAY:-}; if [ -z "$${EDIT_ALLOW_REAL_DISPLAY:-}" ]; then case "$$d" in ""|:0|:0.*|unix:0|unix:0.*|localhost:0|localhost:0.*) d=$${EDIT_DISPLAY:-:99};; esac; fi
+SAFE_DISPLAY = export EDIT_REFUSE_REAL_DISPLAY=1; d=$${DISPLAY:-}; if [ -z "$${EDIT_ALLOW_REAL_DISPLAY:-}" ]; then case "$$d" in ""|:0|:0.*|unix:0|unix:0.*|localhost:0|localhost:0.*) d=$${EDIT_DISPLAY:-:99};; esac; fi
 GUARD_OBJ := $(TESTS:%.c=$(B)/rel/%.o) $(TESTS:%.c=$(B)/san/%.o) $(BENCHS:%.c=$(B)/rel/%.o)
 $(GUARD_OBJ): GUARD := -include tests/display_guard.h
 $(GUARD_OBJ): tests/display_guard.h
@@ -197,6 +216,8 @@ $(B)/bench/%: $(B)/rel/bench/%.o $(REL_LIB)
 $(B)/san/tests/%: $(B)/san/tests/%.o $(SAN_LIB)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(SAN_F) -pthread $< $(SAN_LIB) $(LDLIBS) -o $@
+# cli_test execs the actual launcher as well as its sanitizer entry-point copy.
+$(B)/tests/cli_test $(B)/san/tests/cli_test: $(B)/sublimite
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(FUZZ_LIB) $(LDLIBS) -o $@
@@ -212,6 +233,7 @@ check: $(TEST_SAN) $(B)/tools/replay
 check-sh: $(B)/tools/replay $(B)/bench/piece_bench
 	sh tools/test_replay_cli.sh $(B)
 	sh tools/test_bench_variant.sh
+	sh tools/test_install.sh
 
 # Benches: release build, each must exit 0 (gate met).
 # Per-bench default args: optional one-line file bench/<name>.args (e.g. piece_bench.args = --quick;

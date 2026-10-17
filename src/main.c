@@ -15,24 +15,36 @@
 
 int main(int argc, char **argv)
 {
+    const char *usage = "usage: sublimite [--wait] [--new-instance] [--font-family PATTERN] [--font-file PATH[#INDEX]] [--font-fallbacks A,B] [--] [path[:line[:col]] ...] [-]";
+    if (argc == 2 && !strcmp(argv[1], "--help")) { /* (P) executable plus help option. */
+        puts(usage); return EXIT_SUCCESS;
+    }
     uint64_t startup_ns = trace_now_ns();
     trace_init(); (void)trace_thread_register();
     trace_record_at(startup_ns, TRACE_T0_INGRESS, 0);
     trace_record_at(startup_ns, TRACE_STARTUP_PROCESS_START, 0);
     ipc_args args = {0}; ipc_result parsed = ipc_parse_args(argc, argv, &args);
     if (parsed == IPC_OK && args.request.has_stdin) parsed = ipc_args_read_stdin(&args, STDIN_FILENO);
-    if (parsed != IPC_OK) { fprintf(stderr, "usage: sublimite [--wait] [--new-instance] [--font-family PATTERN] [--font-file PATH[#INDEX]] [--font-fallbacks A,B] [--] [path[:line[:col]] ...] [-]\n"); ipc_args_fini(&args); return 2; }
+    if (parsed != IPC_OK) { fprintf(stderr, "%s\n", usage); ipc_args_fini(&args); return 2; }
     ipc_server server = {0}; bool owns_server = false;
     const char *display = getenv("DISPLAY");
     const char *wayland_display = getenv("WAYLAND_DISPLAY");
     plat_backend platform_backend = plat_backend_select(display, wayland_display);
-    const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
-    if (platform_backend == PLAT_BACKEND_X11 && selected != display && setenv("DISPLAY", selected, 1)) goto startup_fail;
+    /* Legacy EDIT_ALLOW_REAL_DISPLAY is accepted as a no-op. Refusal wins. */
+    const char *refuse = getenv("EDIT_REFUSE_REAL_DISPLAY");
+    const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), refuse);
+    if (platform_backend == PLAT_BACKEND_X11 && selected != display) {
+        if (display && *display) {
+            fprintf(stderr, "sublimite: display guard: real display %s refused\n", display);
+            goto startup_fail;
+        }
+        if (setenv("DISPLAY", selected, 1)) goto startup_fail;
+    }
     if (platform_backend == PLAT_BACKEND_WAYLAND) {
-        const char *safe = wayland_display_select(wayland_display, getenv("EDIT_WAYLAND_DISPLAY"), getenv("EDIT_ALLOW_REAL_DISPLAY"));
-        if (!getenv("EDIT_ALLOW_REAL_DISPLAY")) {
-            /* A descriptor overrides the socket name: only explicit opt-in
-             * can inherit one. Private alternate names use XDG_RUNTIME_DIR. */
+        const char *safe = wayland_display_select(wayland_display, getenv("EDIT_WAYLAND_DISPLAY"), refuse ? NULL : "");
+        if (refuse) {
+            /* A descriptor overrides the socket name: refusal clears it.
+             * Private alternate names use XDG_RUNTIME_DIR. */
             if (unsetenv("WAYLAND_SOCKET")) goto startup_fail;
             if (!safe) { fprintf(stderr, "sublimite: Wayland display guard refused compositor; set EDIT_WAYLAND_DISPLAY for a private compositor or EDIT_ALLOW_REAL_DISPLAY to opt in\n"); goto startup_fail; }
         }

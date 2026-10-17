@@ -3,6 +3,7 @@
 # Benches are tracked numbers, not gates (CLAUDE.md law 1): `make bench` is run
 # on demand, never here.
 set -e
+export EDIT_REFUSE_REAL_DISPLAY=1
 cd "$(dirname "$0")/.."
 printf 'battery: %s\n' "$(cat /sys/class/power_supply/BAT0/status 2>/dev/null || echo unknown)"
 make clean

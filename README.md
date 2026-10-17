@@ -18,6 +18,23 @@ recorded under `docs/decisions/`. Expect churn.
 
 Requirements: `PRD.md`. Plan and workflow: `PLAN.md`. Current state: `HANDOFF.md`.
 
+## Install and run
+
+```sh
+make -j3 # (P) shared-box parallelism specified by the install bead.
+make install
+sublimite file.txt
+```
+
+Installs the release editor, `tracedump`, desktop entry and icon under
+`~/.local`, and makes sublimité the default for plain text files in the file
+manager. Keep `~/.local/bin` on your shell's `PATH` (start a new login session
+if your desktop has not picked it up yet). No display or profile variables are
+needed. Use `make install PREFIX=/path/to/prefix` for another destination.
+
+Remove the installed files with `make uninstall`, using the same `PREFIX` if
+overridden. Your journals and preferences stay in their existing user folders.
+
 ## Licence
 
 AGPL-3.0-or-later, see `LICENSE`. Vendored third-party code and data keep their

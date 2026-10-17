@@ -9,7 +9,7 @@ int main(void) {
         if (!edit_display_is_real(unsafe[i])) {
             fprintf(stderr, "display_guard_test: FAIL §39 alias %s\n", unsafe[i]); failed = 1;
         }
-        if (strcmp(editor_runtime_display(unsafe[i], unsafe[i], NULL), ":99")) {
+        if (strcmp(editor_runtime_display(unsafe[i], unsafe[i], ""), ":99")) {
             fprintf(stderr, "display_guard_test: FAIL §39 runtime alternate %s\n", unsafe[i]); failed = 1;
         }
     }
@@ -23,6 +23,7 @@ int main(void) {
     if (setenv("DISPLAY", "hostname/unix:0", 1) || setenv("EDIT_DISPLAY", ":00", 1) ||
         unsetenv("EDIT_ALLOW_REAL_DISPLAY")) return 1;
     edit_display_guard();
+    if (!getenv("EDIT_REFUSE_REAL_DISPLAY")) failed = 1; /* (P) presence enables child refusal. */
     if (strcmp(getenv("DISPLAY"), ":99")) {
         fputs("display_guard_test: FAIL §39 unsafe alternate refused\n", stderr); failed = 1;
     }
