@@ -38,6 +38,7 @@ struct editor_restore {
     size_t *active;              /* editor.restore_active while SCANNING or OPENING */
     char journal[IPC_PATH_CAP], directory[IPC_PATH_CAP];
     int lease, state, scan_rc;
+    int fault;                   /* edit-601 test seam (editor.restore_fault), consumed by one scan */
     work_handle job;
     uint32_t generation;
     _Atomic bool scan_finished;
@@ -223,6 +224,7 @@ static int trim(restore_scan *s, editor_restore_buffer *b)
 static int scan(editor_restore *r, work_ctx *c)
 {
     struct stat st;
+    if (r->fault) return r->fault;
     if (stat(r->journal, &st) || st.st_size < 0) return JOURNAL_IO;
     /* (P) every journalled insert byte is a byte of the journal file. */
     if (edit_arena_init(&r->payload, (size_t)st.st_size + 1u)) return JOURNAL_NOMEM;
@@ -241,6 +243,17 @@ static int scan(editor_restore *r, work_ctx *c)
     for (size_t k = 0; k < r->op_count; k++) if (r->ops[k].buffer != SIZE_MAX) r->buffers[r->ops[k].buffer]->edits++;
     if (!rc && !r->count) rc = JOURNAL_INVALID;
     if (!rc && r->tabs_valid) for (size_t i = 0; i < r->tab_count; i++) if (!find(r, r->tabs[i])) r->tabs_valid = false;
+    if (!rc && r->tabs_valid) {
+        /* edit-601: a repeated TABS id names one tab, so the live order never
+         * holds more entries than there are buffers. */
+        size_t kept = 0;
+        for (size_t i = 0; i < r->tab_count; i++) {
+            bool seen = false;
+            for (size_t j = 0; j < kept && !seen; j++) seen = r->tabs[j] == r->tabs[i];
+            if (!seen) r->tabs[kept++] = r->tabs[i];
+        }
+        r->tab_count = kept;
+    }
     return rc;
 }
 static void restore_job(work_ctx *c)
@@ -339,6 +352,7 @@ int editor_restore_start(editor *e, editor_buffer *b)
     if (!b->placeholder || !r || r->state != RESTORE_IDLE) return 0;
     program_free(r);
     atomic_store(&r->scan_finished, false); r->scan_rc = 0;
+    r->fault = e->restore_fault; e->restore_fault = 0;
     r->generation++;
     r->job = work_submit(&e->pool, (work_job){restore_job, r, r->generation, WORK_BULK});
     if (!r->job.epoch) return 0; /* pool full: the placeholder stays; reopen again */
@@ -376,16 +390,22 @@ static size_t live_index(const editor *e, uint64_t id)
     for (size_t i = 0; i < tabs_count(&e->tabs); i++) if (tabs_at(&e->tabs, i)->id == id) return i;
     return SIZE_MAX;
 }
-/* Failure keeps the source: an unreadable or invalid journal is set aside
- * (edit-btj naming), any other failure leaves it discoverable. The
- * placeholder becomes an ordinary empty untitled buffer. */
-static int restore_fail(editor *e, editor_buffer *p, int rc)
+static void drop_replacements(editor *e, editor_restore *r)
 {
-    editor_restore *r = p->restore;
     for (size_t i = 0; i < r->count; i++) if (r->buffers[i]->replacement) {
         editor_unpoll_buffer(e, r->buffers[i]->replacement);
         editor_buffer_destroy(r->buffers[i]->replacement); r->buffers[i]->replacement = NULL;
     }
+}
+/* Failure keeps the source: an unreadable or invalid journal is set aside
+ * (edit-btj naming), any other failure leaves it discoverable. The
+ * placeholder becomes an ordinary empty untitled buffer. edit-601: a restore
+ * failure is a notice, never an editor error; a journal append that fails
+ * here is recorded in stats.journal_error like any other journal write. */
+static int restore_fail(editor *e, editor_buffer *p, int rc)
+{
+    editor_restore *r = p->restore;
+    drop_replacements(e, r);
     char aside[IPC_PATH_CAP];
     if (rc == JOURNAL_INVALID && !editor_set_aside(r->journal, aside, sizeof aside)) {
         strcpy(e->recovery_aside, aside);
@@ -398,28 +418,38 @@ static int restore_fail(editor *e, editor_buffer *p, int rc)
     if (e->recovery_placeholder_ids) e->recovery_placeholder_ids--;
     size_t index = live_index(e, p->id);
     if (index != SIZE_MAX) (void)tabs_rename(&e->tabs, index, "untitled", strlen("untitled"), "", 0);
-    int reg = editor_register_journal(e, p, p->id);
-    if (!reg) reg = editor_journal_changed(e);
-    return reg ? EDITOR_ERR_IO : 0;
+    if (!editor_register_journal(e, p, p->id)) (void)editor_journal_changed(e);
+    return 0;
+}
+/* Pools for the whole program. (P) the placeholder's tab becomes the first;
+ * a closed buffer needs one transient live slot before editor_close_tab
+ * retains it (recovery.c). */
+static size_t live_count(const editor_restore *r)
+{
+    size_t live = r->tabs_valid && r->tab_count ? r->tab_count : r->tabs_valid ? 1 : r->count;
+    return live > r->count ? r->count : live;
+}
+static bool fits(const editor *e, const editor_restore *r)
+{
+    size_t free_slots = 0;
+    for (size_t i = 0; i < e->buffer_capacity; i++) if (!e->buffers[i]) free_slots++;
+    size_t live = live_count(r), closed = r->count - live;
+    size_t extra = live - 1 + (closed ? 1u : 0u);
+    return free_slots >= r->count && tabs_count(&e->tabs) + extra <= e->tabs.capacity &&
+        tabs_closed_count(&e->tabs) + closed <= e->tabs.closed_capacity;
+}
+static int defer(editor *e, editor_restore *r)
+{
+    drop_replacements(e, r);
+    program_free(r); r->state = RESTORE_IDLE; e->restore_active--;
+    e->recovery_notice = "large session restore deferred; journal retained (tab capacity)";
+    e->recovery_notice_mutations = e->stats.mutations;
+    return 0;
 }
 static int prepare_all(editor *e, editor_buffer *p)
 {
     editor_restore *r = p->restore;
-    size_t free_slots = 0;
-    for (size_t i = 0; i < e->buffer_capacity; i++) if (!e->buffers[i]) free_slots++;
-    size_t live = r->tabs_valid && r->tab_count ? r->tab_count : r->tabs_valid ? 1 : r->count;
-    if (live > r->count) live = r->count;
-    size_t closed = r->count - live;
-    /* (P) the placeholder's tab becomes the first; a closed buffer needs one
-     * transient live slot before editor_close_tab retains it (recovery.c). */
-    size_t extra = live - 1 + (closed ? 1u : 0u);
-    if (free_slots < r->count || tabs_count(&e->tabs) + extra > e->tabs.capacity ||
-        tabs_closed_count(&e->tabs) + closed > e->tabs.closed_capacity) {
-        program_free(r); r->state = RESTORE_IDLE; e->restore_active--;
-        e->recovery_notice = "large session restore deferred; journal retained (tab capacity)";
-        e->recovery_notice_mutations = e->stats.mutations;
-        return 0;
-    }
+    if (!fits(e, r)) return defer(e, r);
     for (size_t i = 0; i < r->count; i++) {
         editor_restore_buffer *b = r->buffers[i];
         const char *path = *b->target ? b->target : NULL;
@@ -459,6 +489,42 @@ static void mark(editor *e, size_t index, editor_buffer *b, const editor_restore
     b->saved_lost = !clean; b->revision++;
     (void)tabs_set_modified(&e->tabs, index, !clean);
 }
+/* What install changed, so a failure before the source is retired can put the
+ * placeholder back (edit-601). installed[0] is the swapped first buffer. */
+typedef struct restore_undo {
+    size_t index;                /* the placeholder's tab */
+    uint64_t active_id;          /* the tab that was active */
+    view_state tab_state;        /* the placeholder tab's state */
+    bool modified;
+    editor_buffer **installed;
+    size_t done;
+} restore_undo;
+/* Drop every installed tab, give the placeholder its tab back and reactivate.
+ * The restored buffers retire as reload_source's outgoing generation does:
+ * editor_retire_buffers releases them once frames and workers are done. */
+static int rollback(editor *e, editor_buffer *p, const restore_undo *u)
+{
+    e->recovering = true; /* no metadata names a dropped buffer */
+    for (size_t k = u->done; k-- > 1;) {
+        editor_buffer *b = u->installed[k];
+        size_t at = live_index(e, b->id);
+        uint64_t id;
+        /* A closed one is the newest closed record (install closes in order). */
+        if (at == SIZE_MAX && tabs_closed_count(&e->tabs) && tabs_closed_at(&e->tabs, 0)->id == b->id &&
+            !tabs_reopen(&e->tabs, &e->v.state, &id)) at = tabs_active_index(&e->tabs);
+        if (at != SIZE_MAX) (void)tabs_drop(&e->tabs, at, &e->v.state);
+        b->retired = true;
+    }
+    if (u->done) {
+        (void)tabs_replace(&e->tabs, u->index, p->tree, &p->undo, &u->tab_state, &e->v.state);
+        (void)tabs_set_modified(&e->tabs, u->index, u->modified);
+        u->installed[0]->retired = true;
+    }
+    size_t active = live_index(e, u->active_id);
+    if (active != SIZE_MAX) (void)tabs_select(&e->tabs, active, &e->v.state);
+    e->recovering = false;
+    return editor_activate(e);
+}
 static int install_all(editor *e, editor_buffer *p)
 {
     editor_restore *r = p->restore;
@@ -472,52 +538,88 @@ static int install_all(editor *e, editor_buffer *p)
             if (b->pending_open) return 0;
         }
     }
-    /* Order: journalled live tabs first (their TABS order), then the rest. */
-    editor_restore_buffer **order = calloc(r->count, sizeof *order); size_t n = 0;
-    if (!order) return EDITOR_ERR_MEMORY;
-    if (r->tabs_valid) for (size_t i = 0; i < r->tab_count; i++) order[n++] = find(r, r->tabs[i]);
+    /* Other tabs may have opened while the originals attached. */
+    if (!fits(e, r)) return defer(e, r);
+    /* Order: journalled live tabs first (their TABS order), then the rest;
+     * each buffer once (edit-601: scan dedupes TABS, n stays <= count). */
+    editor_restore_buffer **order = calloc(r->count, sizeof *order);
+    editor_buffer **installed = calloc(r->count, sizeof *installed);
+    if (!order || !installed) { free(order); free(installed); return restore_fail(e, p, JOURNAL_NOMEM); }
+    size_t n = 0;
+    for (size_t i = 0; r->tabs_valid && i < r->tab_count && n < r->count; i++) {
+        editor_restore_buffer *b = find(r, r->tabs[i]);
+        bool listed = !b;
+        for (size_t j = 0; j < n && !listed; j++) listed = order[j] == b;
+        if (!listed) order[n++] = b;
+    }
     for (size_t i = 0; i < r->count; i++) {
         bool listed = false;
-        for (size_t j = 0; j < n; j++) listed = listed || order[j] == r->buffers[i];
+        for (size_t j = 0; j < n && !listed; j++) listed = order[j] == r->buffers[i];
         if (!listed) order[n++] = r->buffers[i];
     }
-    size_t live = r->tabs_valid && r->tab_count ? r->tab_count : r->tabs_valid ? 1 : r->count;
+    size_t live = live_count(r);
     if (live > n) live = n;
+    const tabs_tab *tab = tabs_at(&e->tabs, index);
+    restore_undo u = {.index = index, .active_id = tabs_active(&e->tabs)->id,
+        .tab_state = index == tabs_active_index(&e->tabs) ? e->v.state : tab->state,
+        .modified = tab->modified, .installed = installed};
+    /* edit-601: until the checkpoint is durable nothing reaches the journal or
+     * the session tree, so no record names a buffer whose BASE is not there. */
+    e->recovering = true;
     /* First: replace the placeholder in its own tab (reload_source's swap). */
     editor_buffer *first = order[0]->replacement;
     size_t slot = 0; while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
     view_state state = restored_state(order[0], first);
     first->id = p->id; first->source_generation = p->source_generation; /* parked keys carry over */
     first->session_slot = slot; first->initial = state;
-    e->buffers[slot] = first; order[0]->replacement = NULL; p->retired = true;
+    e->buffers[slot] = first; order[0]->replacement = NULL; installed[u.done++] = first;
     if (e->buffer == p) e->buffer = first;
     int rc = tabs_replace(&e->tabs, index, first->tree, &first->undo, &state, &e->v.state);
     EDIT_ASSERT(rc == 0);
     const char *title; size_t title_len = editor_tab_title(first->path, &title);
     (void)tabs_rename(&e->tabs, index, title, title_len, first->path, strlen(first->path));
     mark(e, index, first, order[0]);
-    if (e->recovery_placeholder_ids) e->recovery_placeholder_ids--;
     for (size_t k = 1; !rc && k < n; k++) {
         editor_buffer *b = order[k]->replacement; uint64_t id;
         b->initial = restored_state(order[k], b);
         rc = editor_install_buffer(e, b, &id);
         if (rc) break;
-        order[k]->replacement = NULL;
+        order[k]->replacement = NULL; installed[u.done++] = b;
         mark(e, tabs_active_index(&e->tabs), b, order[k]);
         if (k >= live) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
     free(order);
     if (!rc) { rc = tabs_select(&e->tabs, live_index(e, first->id), &e->v.state); rc = rc ? EDITOR_ERR_ARG : editor_activate(e); }
-    for (size_t i = 0; !rc && i < e->buffer_capacity; i++) {
+    e->recovering = false;
+    /* The recovered text is durable here before the source is retired. */
+    if (!rc && e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    if (rc) {
+        int back = rollback(e, p, &u);
+        free(installed);
+        (void)restore_fail(e, p, rc);
+        return back; /* only a failed reactivation is an editor error */
+    }
+    free(installed);
+    /* Irreversible from here: the placeholder retires, then the source. */
+    p->retired = true;
+    if (e->recovery_placeholder_ids) e->recovery_placeholder_ids--;
+    for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         if (!b || b->retired || b->save || !*b->path) continue;
         int save_rc = editor_save_setup(e, b);
         if (save_rc) { b->save_error = b->operation_error = save_rc; b->save_errno = errno; }
     }
-    /* The recovered text is durable here before the source is retired. */
-    if (!rc && e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); if (rc) e->stats.journal_error = rc; }
-    if (rc) return rc > 0 ? EDITOR_ERR_IO : rc;
+    (void)editor_journal_changed(e); /* session tree and metadata, suppressed above */
     char aside[IPC_PATH_CAP], lock[IPC_PATH_CAP];
+    if (!e->journal) {
+        /* edit-601: no checkpoint ran, so the source is the only durable copy
+         * of these edits: never unlink or set it aside. */
+        e->recovery_notice = "large session restored; its journal is kept (this launch has no session journal)";
+        e->recovery_notice_mutations = e->stats.mutations;
+        if (r->lease >= 0) { close(r->lease); r->lease = -1; }
+        program_free(r); r->state = RESTORE_DONE; e->restore_active--;
+        return 0;
+    }
     if (r->conflicts) {
         e->recovery_notice = "file changed on disk since this session; its unsaved edits were set aside";
         if (!editor_set_aside(r->journal, aside, sizeof aside)) strcpy(e->recovery_aside, aside);

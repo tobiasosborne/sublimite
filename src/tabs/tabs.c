@@ -159,6 +159,21 @@ int tabs_close(tabs_set *s, size_t index, view_state *live, tabs_tab *evicted)
     }
     return TABS_OK;
 }
+int tabs_drop(tabs_set *s, size_t index, view_state *live)
+{
+    if(!ready(s) || !live) return TABS_ERR_ARG;
+    if(index>=s->count) return TABS_ERR_RANGE;
+    tabs_mru_release(s); save(s,live); uint32_t slot=s->order[index];
+    unlink_mru(s,slot);
+    memmove(s->order+index,s->order+index+1,(s->count-index-1)*sizeof *s->order); --s->count;
+    if(s->active==slot) {
+        s->active=s->mru_head;
+        if(s->count) *live=s->slots[s->active].state;
+        else { memset(live,0,sizeof *live); live->selection.preferred_col=VIEW_PREFERRED_UNSET; }
+    }
+    s->free_slots[s->free_count++]=slot;
+    return TABS_OK;
+}
 int tabs_reopen(tabs_set *s, view_state *live, uint64_t *id)
 {
     if(!ready(s) || !live || !id) return TABS_ERR_ARG;

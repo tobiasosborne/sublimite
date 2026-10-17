@@ -80,6 +80,10 @@ int tabs_replace(tabs_set *s, size_t index, piece_tree *buffer, undo_log *undo,
  * policy (save/discard/cancel) belongs to caller, before calling close. */
 int tabs_close(tabs_set *s, size_t index, view_state *live, tabs_tab *evicted);
 int tabs_reopen(tabs_set *s, view_state *live, uint64_t *id);
+/* edit-601: undo of tabs_open. Removes the live tab at index and frees its
+ * record without retaining it (no closed record, no eviction); an active drop
+ * chooses the MRU survivor as close does. Caller retires the borrowed handles. */
+int tabs_drop(tabs_set *s, size_t index, view_state *live);
 int tabs_reorder(tabs_set *s, size_t from, size_t to); /* final destination index */
 /* Key repeats call step; reverse for Ctrl+Shift+Tab. MRU order stays frozen
  * while held, wraps, and release promotes the final selection once. Other

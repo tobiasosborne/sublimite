@@ -1158,6 +1158,263 @@ static int large_restore(void)
     if (!rc) puts("large_restore: whole-text deferred; differences restore eagerly across hot exits");
     return rc;
 }
+/* edit-601: lazy-restore recoverability (restore.c). (a) a launch without a
+ * session journal never retires the source; (b) a checkpoint failure after the
+ * swap rolls back to the placeholder, keeps the source and is not fatal; (c) a
+ * scan NOMEM is a notice, not a fatal; (d) duplicate TABS ids stay in bounds.
+ * Fixtures reuse the qct shape: a sparse 1 GiB BASE ((P) 2^30, FM4_GIB) plus
+ * one typed byte. */
+static uint64_t e601_get64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (unsigned i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8u * i);
+    return v;
+}
+/* (P) the fixtures journal at most a few buffers; 64 ids is headroom. */
+typedef struct e601_ids { uint64_t base[64]; size_t n; bool ok; } e601_ids;
+static bool e601_known(const e601_ids *s, uint64_t id)
+{
+    for (size_t i = 0; i < s->n; i++) if (s->base[i] == id) return true;
+    return false;
+}
+/* Every id a record names (TABS entries, edits, VIEW, TARGET) follows its BASE. */
+static int e601_record(void *ctx, const journal_record *r)
+{
+    e601_ids *s = ctx;
+    if (r->type == JOURNAL_BASE) { if (s->n < 64) s->base[s->n++] = r->buffer_id; else s->ok = false; return 0; }
+    if (r->type == JOURNAL_TABS) {
+        uint64_t count = r->size >= 16 ? e601_get64(r->data) : 0;
+        for (uint64_t i = 0; i < count && 16 + (i + 1) * 8 <= r->size; i++)
+            if (!e601_known(s, e601_get64(r->data + 16 + i * 8))) s->ok = false;
+        return 0;
+    }
+    if (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE || r->type == JOURNAL_VIEW || r->type == JOURNAL_TARGET)
+        if (!e601_known(s, r->buffer_id)) s->ok = false;
+    return 0;
+}
+static int e601_consistent(const char *path)
+{
+    e601_ids s = {.ok = true}; journal_replay_result result;
+    T(journal_scan_file(path, e601_record, &s, &result) == 0);
+    if (!s.ok) fprintf(stderr, "editor_session_test: %s names an id without BASE\n", path);
+    T(s.ok); return 0;
+}
+static void e601_discard(qct_launch *l)
+{
+    if (l->e) editor_close(l->e);
+    l->e = NULL;
+    (void)unlink(l->journal);
+    (void)journal_session_release(l->journal, l->lease); close(l->lease);
+}
+/* Drive until no restore is in flight; every step must return 0 (no fail()). */
+static int e601_drive(editor *e)
+{
+    uint64_t limit = deadline();
+    while (e->restore_active) {
+        int rc = turn(e);
+        if (rc) fprintf(stderr, "editor_session_test: restore step returned %d (stats.error_cause=%d)\n", rc, editor_get_stats(e).error_cause);
+        T(rc == 0); T(trace_now_ns() < limit); sched_yield();
+    }
+    return settle(e);
+}
+static bool e601_same(const char *path, const struct stat *before)
+{
+    struct stat st;
+    return !stat(path, &st) && st.st_ino == before->st_ino && st.st_size == before->st_size &&
+        st.st_mtim.tv_sec == before->st_mtim.tv_sec && st.st_mtim.tv_nsec == before->st_mtim.tv_nsec;
+}
+/* edit-4da restores differences on a mapped BASE eagerly; forced COPY
+ * acquisition at launch keeps the qct orphan deferred ("differences with COPY
+ * acquisition deferred", large_restore). The lazy restore under test then
+ * opens with the configured default again ((P) zero selects it), mapped as
+ * before 4da. */
+static int e601_start(const char *dir, qct_launch *l)
+{
+    /* (P) UINT64_MAX selects COPY for every representable file. */
+    int rc = qct_start_threshold(dir, l, UINT64_MAX);
+    if (l->e) l->e->cfg.copy_threshold = 0;
+    return rc;
+}
+static int e601_no_journal(const char *dir, const char *orphan)
+{
+    struct stat before; T(stat(orphan, &before) == 0);
+    qct_launch l = {0};
+    int rc = e601_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    if (rc) { e601_discard(&l); T(rc == 0); }
+    editor *e = l.e;
+    journal *log = e->journal; e->journal = NULL; /* launch journal absent (open failed or disabled) */
+    rc = editor_reopen_tab(e);
+    if (!rc) rc = e601_drive(e);
+    bool live = !rc && tabs_count(&e->tabs) == 1 && !e->buffer->placeholder && !e->restore_active;
+    bool kept = e601_same(orphan, &before);
+    printf("edit-601 (a): no launch journal rc=%d restored_tab=%s len=%llu source_kept=%s notice=%s\n", rc,
+        live ? "yes" : "no", (unsigned long long)piece_len(e->buffer->tree), kept ? "yes" : "no",
+        e->recovery_notice ? e->recovery_notice : "(none)");
+    e->journal = log;
+    e601_discard(&l);
+    T(rc == 0 && live && kept);
+    return 0;
+}
+static int e601_checkpoint_failure(const char *dir, const char *orphan)
+{
+    struct stat before; T(stat(orphan, &before) == 0);
+    qct_launch l = {0};
+    int rc = e601_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    if (rc) { e601_discard(&l); T(rc == 0); }
+    editor *e = l.e;
+    /* Injection: the session directory refuses new names, so journal_rotate's
+     * checkpoint temp (and only it; appends use the open descriptor) fails
+     * with JOURNAL_IO. (P) 0500 = owner read/search, no write. */
+    T(chmod(dir, 0500) == 0);
+    char probe[IPC_PATH_CAP]; T(snprintf(probe, sizeof probe, "%s/probe-601", dir) > 0);
+    int fd = open(probe, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd >= 0) { /* root ignores the mode: no injection possible */
+        close(fd); unlink(probe); T(chmod(dir, 0700) == 0); e601_discard(&l);
+        puts("edit-601 (b): skipped, directory mode not enforced for this user"); return 0;
+    }
+    rc = editor_reopen_tab(e);
+    if (!rc) rc = e601_drive(e);
+    T(chmod(dir, 0700) == 0); /* (P) owner read/write/search */
+    bool settled = !rc && !e->restore_active && tabs_count(&e->tabs) == 1;
+    bool inert = settled && !e->buffer->placeholder && piece_len(e->buffer->tree) == 0; /* restore_fail: empty untitled */
+    bool notice = e->recovery_notice && strstr(e->recovery_notice, "retained");
+    bool kept = e601_same(orphan, &before);
+    printf("edit-601 (b): checkpoint failure rc=%d settled=%s placeholder_fallback=%s source_kept=%s notice=%s\n", rc,
+        settled ? "yes" : "no", inert ? "yes" : "no", kept ? "yes" : "no", e->recovery_notice ? e->recovery_notice : "(none)");
+    int consistent = 1;
+    if (settled) {
+        /* Metadata appended after the failure, then a later checkpoint: no
+         * record names a buffer whose BASE is not in the journal. */
+        consistent = journal_flush(e->journal) || e601_consistent(l.journal);
+        if (!consistent) consistent = editor_checkpoint(e) || e601_consistent(l.journal);
+        if (!consistent) consistent = turn(e);
+    }
+    e601_discard(&l);
+    T(rc == 0 && settled && inert && notice && kept && consistent == 0);
+    return 0;
+}
+static int e601_scan_nomem(const char *dir, const char *orphan)
+{
+    struct stat before; T(stat(orphan, &before) == 0);
+    qct_launch l = {0};
+    int rc = e601_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    if (rc) { e601_discard(&l); T(rc == 0); }
+    editor *e = l.e;
+    e->restore_fault = JOURNAL_NOMEM; /* the multi-GB journal arena NOMEM */
+    rc = editor_reopen_tab(e);
+    if (!rc) rc = e601_drive(e);
+    bool settled = !rc && !e->restore_active && tabs_count(&e->tabs) == 1 && !e->buffer->placeholder;
+    bool notice = e->recovery_notice && strstr(e->recovery_notice, "retained");
+    bool kept = e601_same(orphan, &before);
+    printf("edit-601 (c): scan NOMEM rc=%d settled=%s source_kept=%s notice=%s\n", rc, settled ? "yes" : "no",
+        kept ? "yes" : "no", e->recovery_notice ? e->recovery_notice : "(none)");
+    e601_discard(&l);
+    T(rc == 0 && settled && notice && kept);
+    return 0;
+}
+/* The qct orphan plus a TABS record listing the one buffer (P) three times. */
+static int e601_duplicate_orphan(const char *dir, const char *source, char *journal_path)
+{
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
+        uint64_t limit = deadline();
+        while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
+        if (press(e, 'x', 0, "x")) _exit(6);
+        if (journal_flush(e->journal) || editor_checkpoint(e)) _exit(7);
+        uint8_t tabs[16 + 3 * 8] = {0}; /* count, active, three ids */
+        uint64_t id = e->buffer->id;
+        tabs[0] = 3;
+        for (unsigned i = 0; i < 3; i++) for (unsigned k = 0; k < 8; k++) tabs[16 + i * 8 + k] = (uint8_t)(id >> (8u * k));
+        if (journal_append(e->journal, JOURNAL_TABS, 0, tabs, sizeof tabs) || journal_flush(e->journal)) _exit(8);
+        _exit(0); /* crash */
+    }
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    DIR *d = opendir(dir); T(d); struct dirent *entry; int found = 0;
+    while ((entry = readdir(d))) if (!strncmp(entry->d_name, "session-", 8) && !strchr(entry->d_name, '.')) {
+        T(snprintf(journal_path, IPC_PATH_CAP, "%s/%s", dir, entry->d_name) > 0); found++;
+    }
+    closedir(d); T(found == 1); return 0;
+}
+static int e601_duplicate_tabs(const char *dir, const char *orphan)
+{
+    qct_launch l = {0};
+    int rc = e601_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    if (rc) { e601_discard(&l); T(rc == 0); }
+    editor *e = l.e;
+    rc = editor_reopen_tab(e);
+    if (!rc) rc = e601_drive(e);
+    uint8_t head = 0;
+    bool text = !rc && tabs_count(&e->tabs) == 1 && piece_len(e->buffer->tree) == FM4_GIB + 1 &&
+        !piece_read(e->buffer->tree, 0, &head, 1) && head == 'x';
+    bool retired = access(orphan, F_OK) != 0;
+    printf("edit-601 (d): duplicate TABS ids rc=%d text=%s orphan_retired=%s\n", rc, text ? "yes" : "no", retired ? "yes" : "no");
+    e601_discard(&l);
+    T(rc == 0 && text && retired);
+    return 0;
+}
+/* Remove an orphan, its lock name and any set-aside copy of it. */
+static void e601_forget(const char *dir, const char *orphan)
+{
+    if (!*orphan) return;
+    char name[IPC_PATH_CAP];
+    (void)unlink(orphan);
+    if (snprintf(name, sizeof name, "%s/.%s.lock", dir, strrchr(orphan, '/') + 1) > 0) (void)unlink(name);
+    DIR *d = opendir(dir); struct dirent *entry; const char *leaf = strrchr(orphan, '/') + 1;
+    if (d) {
+        while ((entry = readdir(d))) if (!strncmp(entry->d_name, leaf, strlen(leaf)) && strstr(entry->d_name, ".set-aside-"))
+            (void)unlinkat(dirfd(d), entry->d_name, 0);
+        closedir(d);
+    }
+}
+static int e601_body(const char *root)
+{
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP] = "";
+    T(setenv("XDG_DATA_HOME", root, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root)) && !strcmp(dir + strlen(root), "/sublimite")); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(snprintf(source, sizeof source, "%s/corpus", root) > 0);
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(ftruncate(fd, (off_t)FM4_GIB) == 0); close(fd);
+    /* Each case runs even when an earlier one fails; a retired orphan is
+     * written again so the next case still has its source. */
+    int (*cases[])(const char *, const char *) = {e601_no_journal, e601_checkpoint_failure, e601_scan_nomem};
+    int failed = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        if (!*orphan || access(orphan, F_OK)) {
+            e601_forget(dir, orphan);
+            T(qct_orphan(dir, source, orphan) == 0);
+        }
+        failed |= cases[i](dir, orphan);
+    }
+    e601_forget(dir, orphan);
+    T(e601_duplicate_orphan(dir, source, orphan) == 0);
+    failed |= e601_duplicate_tabs(dir, orphan);
+    return failed;
+}
+static int e601_restore_failures(void)
+{
+    char made[] = "build/editor-601-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved) > 0);
+    int rc = e601_body(root);
+    char dir[IPC_PATH_CAP];
+    if (snprintf(dir, sizeof dir, "%s/sublimite", root) > 0) (void)chmod(dir, 0700); /* (P) undo (b) on a failure path */
+    fm4_remove_tree(root); /* on success and on every failure path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    if (!rc) puts("edit-601: no-journal restore keeps the source; checkpoint failure and scan NOMEM are notices; duplicate TABS ids stay in bounds");
+    return rc;
+}
 /* edit-c26 begin: Astra drive 5, task 37 (docs/reviews/astra-vs-sublime-5.md
  * "## 37."). A 64 MiB file opened in place, one typed byte, a checkpoint, one
  * more byte, clean close (hot exit), no-argument relaunch: build 2c48f9c
@@ -1498,6 +1755,7 @@ int main(int argc, char **argv)
     T(explicit_changed_base() == 0);
     T(clean_tab_set() == 0);
     T(large_restore() == 0);
+    T(e601_restore_failures() == 0);
     T(large_orphans() == 0);
     T(c26_dense_hot_exit() == 0);
     T(recoverable_save_retry(false, false) == 0); T(recoverable_save_retry(true, false) == 0);

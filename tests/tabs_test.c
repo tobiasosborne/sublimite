@@ -410,11 +410,34 @@ static void allocations(void)
     tabs_fini(&s);
     for(size_t i=0;i<100;++i) { undo_destroy(&logs[i]); piece_destroy(trees[i]); }
 }
+/* edit-601: drop undoes an open; the record is freed, never retained, and the
+ * MRU survivor becomes active with its own state. (P) capacity 2 live + 1 closed. */
+static void drop(void)
+{
+    tabs_set s; CHECK(tabs_init(&s,2,1)==0); view_state live={0};
+    piece_allocator allocator=piece_default_allocator(); piece_tree *tree=piece_create(&allocator); CHECK(tree);
+    undo_log undo; CHECK(undo_init(&undo,tree,8)==0);
+    tabs_desc d={.buffer=tree,.undo=&undo,.title="a",.title_len=1}; uint64_t a, b, c;
+    CHECK(tabs_open(&s,&d,&live,&a)==0); live.hscroll=11;
+    tabs_tab evicted; CHECK(tabs_close(&s,0,&live,&evicted)==0 && evicted.id==0);
+    CHECK(tabs_open(&s,&d,&live,&a)==0); live.hscroll=7;
+    CHECK(tabs_open(&s,&d,&live,&b)==0); live.hscroll=3;
+    CHECK(tabs_drop(&s,2,&live)==TABS_ERR_RANGE && tabs_drop(&s,0,NULL)==TABS_ERR_ARG);
+    CHECK(tabs_drop(&s,1,&live)==0);
+    CHECK(tabs_count(&s)==1 && tabs_closed_count(&s)==1 && tabs_active(&s)->id==a && live.hscroll==7);
+    /* The freed record is reusable at full capacity; the closed stack is intact. */
+    CHECK(tabs_open(&s,&d,&live,&c)==0 && c>b && tabs_closed_count(&s)==1);
+    CHECK(tabs_drop(&s,0,&live)==0 && tabs_active(&s)->id==c && tabs_count(&s)==1);
+    CHECK(tabs_drop(&s,0,&live)==0 && tabs_active(&s)==NULL && live.selection.preferred_col==VIEW_PREFERRED_UNSET);
+    CHECK(tabs_reopen(&s,&live,&a)==0 && tabs_count(&s)==1 && live.hscroll==11);
+    tabs_fini(&s); undo_destroy(&undo); piece_destroy(tree);
+    puts("tabs_test: drop frees the record and restores the MRU survivor");
+}
 int main(int argc, char **argv)
 {
     if(argc==2 && strcmp(argv[1],"memory-gate")==0) return memory_census(true);
     CHECK(argc==1); CHECK(memory_census(false)==0);
-    sequences(); rendering(); errors_and_eviction(); resource_retention(); allocations();
+    sequences(); rendering(); errors_and_eviction(); resource_retention(); drop(); allocations();
     puts("tabs_test: all passed"); return 0;
 }
 

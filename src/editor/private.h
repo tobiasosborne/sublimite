@@ -294,6 +294,7 @@ struct editor {
      * restore_prepare is the program editor_buffer_prepare applies. */
     size_t recovery_placeholder_ids, restore_active;
     struct editor_restore_buffer *restore_prepare;
+    int restore_fault; /* edit-601 test seam: a nonzero journal code fails the next restore scan with it */
     work_pool pool, journal_pool, startup_pool;
     editor_backend_init startup;
     render_backend retired_backend;

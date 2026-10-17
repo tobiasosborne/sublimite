@@ -714,6 +714,8 @@ int editor_step(editor *e, int timeout_ms)
     if (!rc) rc = editor_fif_service(e);
     if (!rc) rc = editor_map_service(e);
     if (!rc) editor_hl_service(e);
+    /* edit-601: restore failures are notices (restore.c restore_fail); a
+     * nonzero return is only a failed reactivation of the editor itself. */
     if (!rc) rc = editor_restore_service(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e, timeout_ms);

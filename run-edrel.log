@@ -1,0 +1,230 @@
+waiting for display :95 (held by 2340686)
+trailing typing default: space bg=0x20242c plain=0x20242c marker=0x493038
+trailing typing all: space bg=0x20242c plain=0x20242c marker=0x493038
+trailing all: completed line marked, typing cell plain passed
+trailing selection: empty, partial, reverse and cleared selection passed
+trailing none: range computation bypassed passed
+edit-97i: resolved-path reuse, full capacity, Ctrl+O, retained text/view/undo and CLI coordinates passed
+edit-o20 new: text and find focus PASS
+edit-o20 open: text and find focus PASS
+edit-o20 save-as: text and find focus PASS
+edit-o20 exit: text and find focus PASS
+edit-o20 cancel: text and find focus PASS
+edit-o20 scroll: text and find focus PASS
+edit-o20 open-empty: text and find focus PASS
+edit-o20 path-edit: text and find focus PASS
+edit-o20 save-source: text and find focus PASS
+edit-o20 save-watch: text and find focus PASS
+edit-o20 scroll-wrap: text and find focus PASS
+edit-o20 save-clean-watch: text and find focus PASS
+edit-o20 save-mapped: text and find focus PASS
+edit-o20 save-shared: text and find focus PASS
+edit-g02 Return/keypad/previous/wrap/pending/empty/Escape passed
+edit-n95 find in files: panel, results format, open at hit, F4 cycle, cancel, read-only passed
+edit-g02 uncached Shift+keypad Enter selects previous exactly once passed
+edit-d5o compose: minimap pixel rows match independent minimap_pixels reference
+edit-48u overscan passed
+edit-48u chain identity passed
+edit-48u chain identity passed
+edit-48u empty rows passed
+edit-48u panel resize passed
+edit-48u drag autoscroll passed
+edit-48u drag autoscroll passed
+edit-48u Escape retains match passed
+edit-m15 gutter: filled viewport ignores stale old EOF passed
+edit-m15 gutter: decimal widening ignores old text hit passed
+edit-m15 gutter: wrapped continuation uses logical line start passed
+edit-dr3 gutter: click/drag/Shift+click select whole lines passed
+edit-m15 find: anchor before approximate top is nonfatal passed
+edit-73j mouse contract passed
+edit-73j wheel contract passed
+edit-73j find/replace, disjoint undo/redo and journal recovery passed
+edit-73j replacement Escape/error prefixes, undo and recovery passed
+edit-73j distant wrapped/clipped find results are visible passed
+edit-73j production Unicode body atlas contract passed
+edit-73j pending minimap navigation passed
+edit-73j protected remote minimap sample: UI compose passed
+edit-g11 null typing: keys=95 frames=97 orange_frames=0 stale_frames=96 changed_pending=0 chrome_markers=0 mallocs=0 fill_max_ns=5357
+default center: hard lines: PASS
+default center: wrapped rows: PASS
+default skip: next/wrap/direction/empty selection/soft undo: PASS
+default word: alpha beta: PASS
+default word: fooBar_baz: PASS
+default word: naïve café: PASS
+default word: abc: PASS
+default goto: prompt/preview/cancel/accept/edit/overflow/soft undo: PASS
+default goto: cold index seek across chunk boundary: PASS
+default comment: comment caret: PASS
+default comment: uncomment caret: PASS
+default comment: uncomment compact: PASS
+default comment: comment backward lines: PASS
+default comment: comment ignores blank: PASS
+default comment: comment CRLF: PASS
+default comment: uncomment mixed lines: PASS
+default comment: comment mixed lines: PASS
+default comment: block selection: PASS
+default comment: block backward selection: PASS
+default comment: block caret: PASS
+default comment: unblock selection: PASS
+default comment: unblock inner caret: PASS
+default comment: block shortcut removes line comment: PASS
+default comment: comment mixed tabs aligns columns: PASS
+default comment: Python line: PASS
+default comment: Python block fallback: PASS
+default comment: CSS line fallback: PASS
+default comment: HTML line fallback: PASS
+default comment: HTML compact removal: PASS
+default comment: HTML shared space removal: PASS
+default comment: C quoted delimiter: PASS
+default comment: C all blank lines: PASS
+undo shrink top: follow at EOF: PASS
+undo shrink top: scrolled into the edit: PASS
+undo shrink top: edit above a scrolled top: PASS
+default goto: unwrapped preview/accept scrolls to the target: PASS
+default goto: Escape restores the pre-prompt top: PASS
+default editing: duplicate line: PASS
+default editing: duplicate backward selection: PASS
+default editing: delete line: PASS
+default editing: delete selected lines: PASS
+default editing: move line up: PASS
+default editing: move line down: PASS
+default editing: move final line up: PASS
+default editing: join lines: PASS
+default editing: join selection whitespace endpoint: PASS
+default editing: insert line after: PASS
+default editing: insert line before: PASS
+default editing: delete hard BOL: PASS
+default editing: delete hard EOL: PASS
+default editing: delete EOL chord: PASS
+default editing: indent selected lines: PASS
+default editing: unindent selected lines: PASS
+default editing: shift tab: PASS
+default editing: unindent mixed space/tab: PASS
+default editing: transpose: PASS
+default editing: transpose newline: PASS
+default editing: uppercase selection: PASS
+default editing: lowercase word: PASS
+default editing: uppercase Unicode word boundary: PASS
+default editing: sort insensitive: PASS
+default editing: sort sensitive: PASS
+default editing: uppercase expansion: PASS
+default editing: lowercase final sigma: PASS
+default editing: duplicate CRLF EOF: PASS
+default editing: insert CRLF EOF: PASS
+default state: subword selection: PASS
+default state: overwrite: PASS
+default state: set/select/swap/clear mark: PASS
+default state: delete mark/yank: PASS
+default state: goto bracket: PASS
+default state: select brackets: PASS
+default editing: unchanged unindent retains revision/history: PASS
+default state: soft undo/redo interleaves selection and text: PASS
+default editing: copy/cut current line retains caret and undo selection: PASS
+default editing: repeat retains chord arguments and groups undo: PASS
+default editing: soft-row and hard-line kill macros have distinct boundaries: PASS
+default editing: oversized command and every retained capability notice preserve text/selection/history: PASS
+default editing: undo preserves a trusted far anchor without a view continuation: PASS
+default state: evicted text markers redo before their selection records: PASS
+editor_test: separate Shift chords preserve exact ranges, reset after movement/mutation, and allocate nothing
+editor_test: Ctrl+Y redoes inserts/deletes, empty redo repeats the previous edit, Ctrl+Shift+Z still redoes
+editor_test: panel shortcuts show a generation-only status and restore the bottom row
+edit-bml: CRLF current-line copy/cut/paste, undo/redo, byte-exact save passed
+edit-bml: small mixed paste follows CRLF/LF, no-ending fallback, majority/tie passed
+edit-bml: in-memory CRLF style survives cutting all text passed
+edit-bml: bulk LF expansion, split CRLF, lone CR/invalid UTF-8, undo/redo passed
+clipboard malloc guard: 0 allocations (active); expected zero by law
+clipboard: null round trip, UTF-8/CRLF, replacement, cut/undo, alternate keys, PRIMARY passed
+clipboard bulk: worker queue, cross-slice CRLF, replacement/undo, journal, mallocs=0 passed
+clipboard middle click: deep horizontal position exact
+clipboard PRIMARY: queued selection/collapse/middle paste waits for latest capture, mallocs=0 passed
+clipboard middle click: no active tab preserves placeholder
+P4-3 section 3: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed
+edit-ret: clean open/save append reload, copied/mapped and inactive tabs, view preservation/clamping, undo reset and no submitted prompt passed
+edit-1um: null source prompt preserves first-line glyphs, uses bottom status, restores row and allocates nothing: PASS
+P4-3 section 8: complete-record credit bounded; independent durable image exact with dirty frames and occupied bulk worker
+P4-3 section 7: healthy flush survives abrupt child exit with exact selection/tab order/active/window metadata
+P4-3 section 7: missing named target association persisted independently of empty content BASE
+P4-3 section 10: journal-enabled editor rejects FIFO without a writer; child completes before alarm
+P4-3 section 4: mode=COPY choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=COPY choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Keep child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 section 4: mode=mapped choice=Reload child abrupt exit; selected/unrelated/closed recovery exact
+P4-3 40: cursor/text frames omit unchanged final tab chrome passed
+P4-3 41: closed drag owner and switched minimap capture cancel safely passed
+P4-3 22: evicted buffer retains held save lease during unrelated typing passed
+P4-3 16: reload preserves logical tab, view and real launcher wait passed
+P4-3 14: pre-prompt, modified, repeated and aged recovery keys ignored passed
+P4-3 13: suspended source preserves tab keys and tab pointer controls passed
+P4-3 12: pending COPY admits controls and retains edit owner passed
+P4-3 11: failed full-source identity adoption stays owner-local passed
+P4-3 11: deferred COPY and inactive ENOSPC errors preserve unrelated editing passed
+review 1: native batched key/close, key/focus, key/resize ordered passed
+review 2: native burst beyond both queue capacities preserves all keys passed
+review 3/P1.9-2.2: SIGKILL point=0 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=1 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=2 recovery=x passed
+review 3/P1.9-2.2: SIGKILL point=3 recovery=x passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: FULL/append IO retains unaccepted suffix without duplicate accepted records passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=0 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=1 restores current tree passed
+review 4: exit checkpoint after FULL/append IO/sync IO mode=2 restores current tree passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 4: failure checkpoint preserves named/untitled contents, views and active tab order passed
+review 5/P1.9-2.3: source changed between attachment and BASE registration rejected passed
+review 6: submitted mid-row caret/selection/blink/focus cells passed
+review 7: multiple long clipped lines preserve subsequent rows in first frame and edit/undo passed
+review 8: first viewport precedes stalled remainder work passed
+review 10: 10 GiB beginning edits metadata visits max=631 (M)[AC], bound=4096 (G)
+review 10: mutation cancels completed backlog without adopting it passed
+review 11: indivisible submit observed=2073695 reported=2114288 ns (M)[AC]
+review 11: first undo turn longest_slice_ns=56291 (M)[AC], slice limit=500000 ns (G)
+review 11: multi-record burst undo/redo yields across turns passed
+review 12: journaled large deletion and undo passed
+review 15: replay arena growth=0 bytes (M)[AC], bound=65536 bytes (G)
+review 13: typing/repeat bursts, movement/focus/timeout boundaries passed
+review 16: mapped watch overwrite, focus truncate, edit suspension and reload/keep passed
+review 21: native dequeue-to-translation mallocs=0; mutation-to-submit=0; guard=active (M)[AC]
+review 17: active job idle polls=2 (M)[AC], requested-timeout bound=4 (G)
+review 17: queued job idle polls=3 (M)[AC], requested-timeout bound=4 (G)
+review 22: allocator positions=21 failures=20; tree/view/history/journal rollback passed (M)[AC]
+review 23: backend init success/failure executes on work pool and adopts mailbox result passed
+required WM_DELETE_WINDOW: one turn, flushed recovery and shutdown passed
+P1-1 section 1: file-backed successive typing keeps bounded index geometry passed
+P1-1 section 1: replacement and undo capacity refuse before buffer/history mutation passed
+P1-1 section 6: inactive exact counts/jump, bulk cancellation/retry, mallocs=0 guard=active passed (M)[AC]
+editor_test: partial index deep typing reuses viewport line starts passed
+editor_test: default EGL and gl/raster override passed
+editor_test: headless EGL injected init failure -> null, one log through typing/close passed
+editor_test: headsublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+sublimite: EGL init failed: EGL/GL/Present unavailable (code=-10); using raster; no retry
+less EGL injected unsupported failure -> null, one log through typing/close passed
+editor_test: default EGL injected init failure -> raster, one log through typing/close passed
+editor_test: default EGL dlopen failure -> raster, one log through typing/close passed
+editor_test: failed EGL init falls back once and stays raster passed
+editor_test: GPU completion progresses and idle disarms polling passed
+editor_test: requested=gl actual=cpu-raster 10000 keys mallocs=0 guard=active
+editor_test: requested=gl actual=cpu-raster idle/unfocused background wakeups=0 passed
+editor_test: requested=raster actual=cpu-raster 10000 keys mallocs=0 guard=active
+editor_test: requested=raster actual=cpu-raster idle/unfocused background wakeups=0 passed
+editor_test: scrolled undo/redo viewport repair passed
+editor_test: mutation error is negative and stops the loop passed
+editor_test: null script and journal byte model passed
+editor_test: null 10000 keys mallocs=0 guard=active
+editor_test: null hl-on 10000 keys mallocs=0 guard=active
+editor_test: raster script and journal byte model passed
+editor_test: raster 10000 keys mallocs=0 guard=active
+G11 blink: mode=0 jobs=0 cells=1 minimap_fills=0
+G11 blink: mode=0 jobs=0 cells=1 minimap_fills=0
+G11 blink: mode=1 jobs=0 cells=1 minimap_fills=0
+G11 blink: mode=1 jobs=0 cells=1 minimap_fills=0
+G11 blink: mode=2 jobs=0 cells=2 minimap_fills=0
+G11 blink: mode=2 jobs=0 cells=2 minimap_fills=0
+G11 blink: mode=3 jobs=0 cells=1 minimap_fills=0
+G11 blink: mode=3 jobs=0 cells=1 minimap_fills=0
+editor_test: G11 inline caret damage and sleeping worker pool passed
+editor_test: idle blink timeout and unfocused timer disarm passed
+editor_test: queue depth one and coalesced edits passed
+editor_test: native X11 translation, editor loop and WM close passed
+editor_test: all passed

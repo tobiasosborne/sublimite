@@ -1,0 +1,44 @@
+display guard: real display :0 refused, using :99
+journal_test: full VIEW roundtrip/rotation, legacy defaults, invalid lengths/flags passed
+journal_test: empty placeholder cleanup preserves nonempty/replacement inodes; mode 0600 and legacy empty close passed
+P4-3 section 5: abrupt child exit, beyond-prefix rewrite/restored mtime rejected before callbacks
+journal_test: insert credit counts UI cache bytes, bounds blocked-worker loss including PAD, resumes after durable fence
+journal_test: insert continuations bound one record/step, protect every prefix, retain IO progress, allocate zero bytes
+journal_test: CRC32C wire/BASE vectors match independent oracle (tails, unaligned replay, maximum record)
+journal_test: overlapping saves preserve both targets/cutoffs/deltas in both finish orders and publication/retirement failures
+journal_test: session values exact after replay/rotation/power image; CRC-valid semantic mutants rejected
+journal_test: writeback loss requires a fresh checkpoint (released unsynced batch included)
+journal_test: retained identity has a full metadata barrier (empty BASE mtime survives)
+journal_test: retention completion crosses the routed work mailbox
+journal_test: PAD IO outranks submission BUSY and retries only on worker
+journal_test: valid 4095-byte BASE retains in bounded recovery directory
+journal_test: page cache ok (before pump, blocked worker, PAD gap, completion preserves UI prefix)
+journal_test: append failures ok (EAGAIN/ENOSPC/EIO/EINTR/short, single attempt, retained worker retry, sticky IO, allocations=0)
+journal_test: append gaps ok (PAD failure surfaced, split INSERT suffix retained, retry blocks later offsets)
+journal_test: directory guard contention returns BUSY; open journal accepts edits and rotation retries after release
+journal_test: invalid setup options create no journal
+journal_test: 4095-byte journal path rotates via retained directory fd
+journal_test: journal rotation survives parent directory rename
+journal_test: exact scripted corruption/truncation prefix (first page, 64 KiB, PAD, byte contents)
+journal_test: FULL flush reports suspension; complete checkpoint clears it
+journal_test: split 1 MB paste accepted, replay bytes exact, allocations=0
+journal_test: atomic 1 MiB paste accepted, replay bytes exact, allocations=0
+journal_test: untitled checkpoint >64 MiB restores exact content and resumes appends
+journal_test: canonical base and journal paths survive cwd changes
+journal_test: session IDs rejected by writer
+journal_test: session IDs rejected by CRC-repaired parser
+journal_test: unreadable/short/missing bases are conflicts; replay leaves log intact
+journal_test: 255-byte journal basename rotates with independent temporary name
+journal_test: retry ok (write failures retain progress; sync EIO requires fresh checkpoint)
+journal_test: barriers ok (durable image, creation, 64KiB straddle, sync/rename/dir failures)
+journal_test: save ok (file_save_begin, retained generation, post-save edits, two buffers, marker/rename/dir failures)
+journal_test: file mailbox ok (copy, mmap, empty, open failure, unread close, independent save wait)
+journal_test: worker returns with undrained completion
+journal_test: cadence parameter ok (byte boundary, timer, force, rotation)
+journal_test: save transaction accepts a 250-byte base filename
+journal_test: save retains a named base shared by two buffers
+journal_test: retained recovery survives old-fd truncate/overwrite (replacement, acknowledged post-save edits, restart before finish)
+journal_test: retained recovery survives hard-link alias overwrite (replacement, acknowledged post-save edits, restart before finish)
+journal_test: retained worker copy ok (short writes, exact multi-chunk bytes, mutation rejection, data/directory failures before publication)
+journal_test: malloc_guard=ASan-inactive (release run required) append_allocations=0
+journal_test: ok (roundtrip, corruption, torn pages, straddles, base conflict, rotation, allocator, back-pressure)

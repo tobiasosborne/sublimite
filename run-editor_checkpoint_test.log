@@ -1,0 +1,24 @@
+waiting for display :95 (held by 2297097)
+editor_checkpoint_test: directory inventory defers close checkpoint; current text and open journal survive until retry
+editor_checkpoint_test: inactive pending COPY recovered=1048590 expected=1048590 clean=yes disk_intact=yes
+editor_checkpoint_test: active pending COPY recovered=1048590 expected=1048590 clean=yes disk_intact=yes
+editor_checkpoint_test: adopted deletion to empty survives checkpoint/crash/recovery
+editor_checkpoint_test: (a) 1 GiB unchanged checkpoint 1: journal=4096 B bound=4096 B (P) time=13.611 ms (M) allocations=uncounted:0 power=Not load1=32.90
+editor_checkpoint_test: (a) 1 GiB unchanged checkpoint 2: journal=4096 B growth=0 B time=8.835 ms (M) allocations=uncounted:0 power=Not load1=32.90
+editor_checkpoint_test: (b) 1 GiB + 10 B checkpoint: journal=4096 B bound=4096 B (P) pieces=16385 deletes=0 inserts=1 inserted=10 B time=14.206 ms (M) allocations=uncounted:0 power=Not load1=32.90
+editor_checkpoint_test: (b) replay onto base: edit at middle, base bytes at head/quarter/after edit/tail
+editor_checkpoint_test: (a)+(b) wall=1210.490 ms (M) power=Not load1=32.90
+editor_checkpoint_test: (b2) 2 MiB edited checkpoint: journal=4096 B deletes=1 deleted=3 inserts=2 inserted=4 B
+editor_checkpoint_test: (b2) referencing checkpoint of an edited COPY file recovers the edited text
+editor_checkpoint_test: f3i (c) recovered 2 MiB buffer, install checkpoint: journal before=4096 B after=4292 B bound=4292 B (P) deletes=1 deleted=3 inserts=2 inserted=4 B
+editor_checkpoint_test: (c) changed BASE refuses the referencing journal; disk text opens, journal set aside
+editor_checkpoint_test: (d) legacy whole-text checkpoint journal still recovers
+editor_checkpoint_test: (e) saved+unchanged checkpoint: journal=4096 B deletes=0 inserts=0
+editor_checkpoint_test: (e) saved revision checkpoints as BASE only and recovers the saved text clean
+editor_checkpoint_test: f3i (a) 1 GiB, save, +1 B checkpoint: journal=4096 B bound=4096 B (P) pieces=16385 deletes=0 deleted=0 inserts=1 inserted=1 B save=3120.751 ms checkpoint=19.689 ms (M) allocations=uncounted:0 power=Not load1=32.75
+editor_checkpoint_test: f3i (a) replay onto saved file: xy at middle, head/tail intact
+editor_checkpoint_test: f3i (b) step 1: journal=4096 B bound=4096 B (P) bases=1 deletes=0 deleted=0 inserts=2 inserted=4 B
+editor_checkpoint_test: f3i (b) step 2: journal=4096 B bound=4096 B (P) bases=1 deletes=0 deleted=0 inserts=1 inserted=2 B
+editor_checkpoint_test: f3i (b) step 3: journal=4096 B bound=4096 B (P) bases=1 deletes=0 deleted=0 inserts=2 inserted=4 B
+editor_checkpoint_test: f3i (b) save in flight: pre-save BASE while held, saved file after; recovered at each step
+editor_checkpoint_test: pending COPY checkpoint/crash/recovery/save, edit-28u referencing checkpoints, edit-f3i post-save checkpoints passed

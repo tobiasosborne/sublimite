@@ -1,0 +1,30 @@
+waiting for display :95 (held by 2340638)
+edit-y5x: leased=no start_empty=no editor_open=0
+edit-y5x: leased=yes start_empty=no editor_open=0
+edit-y5x: leased=yes start_empty=yes editor_open=0
+editor_session_test:989: FAIL e->recovery_deferred == 1 && e->recovery_notice != NULL
+editor_session_test:1202: FAIL rc == 0
+editor_session_test:989: FAIL e->recovery_deferred == 1 && e->recovery_notice != NULL
+editor_session_test:1223: FAIL rc == 0
+editor_session_test:989: FAIL e->recovery_deferred == 1 && e->recovery_notice != NULL
+editor_session_test:1262: FAIL rc == 0
+editor_session_test:989: FAIL e->recovery_deferred == 1 && e->recovery_notice != NULL
+editor_session_test:1309: FAIL rc == 0
+editor_session_test:1711: FAIL e601_restore_failures() == 0
+edit-y5x: empty buffer, set-aside notice, profile preservation and close consistency passed
+edit-y5x: empty buffer, set-aside notice, profile preservation and close consistency passed
+edit-y5x: empty buffer, set-aside notice, profile preservation and close consistency passed
+clean_tab_set: launch tabs=1 title=source clean=yes
+clean_tab_set: after launch 1 session journals=1 [session-VrTHea .session-VrTHea.lock ]
+clean_tab_set: launch tabs=1 title=source clean=yes
+clean_tab_set: after launch 2 session journals=1 [.session-ICoqtO.lock session-ICoqtO ]
+clean_tab_set: launch tabs=1 title=source clean=yes
+clean_tab_set: after launch 3 session journals=1 [session-ERBi8p .session-ERBi8p.lock ]
+clean_tab_set: saved clean tab set restored on two relaunches; one session journal
+large_restore: closed tab title=corpus path=/home/tobias/Projects/sublimite/.wt/edit-601-s8/build/editor-qct-pBNMQw/corpus
+large_restore: whole-text journal bytes=4096 deferred=1
+large_restore: closed tab title=corpus path=/home/tobias/Projects/sublimite/.wt/edit-601-s8/build/editor-qct-pBNMQw/corpus
+large_restore: differences with COPY acquisition deferred
+large_restore: differences launch=0 tabs=1 closed=0 deferred=0 text=yes dirty=yes mapped=yes journal_small=yes retired=yes launch_ms=63.444 (M) G4a_p99=40 bound=tracked power=Not charging load1=15.82
+large_restore: differences launch=1 tabs=1 closed=0 deferred=0 text=yes dirty=yes mapped=yes journal_small=yes retired=yes launch_ms=52.891 (M) G4a_p99=40 bound=tracked power=Not charging load1=15.82
+large_restore: whole-text deferred; differences restore eagerly across hot exits
