@@ -71,6 +71,7 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 - One TOML file in `$XDG_CONFIG_HOME/edit/config.toml`, hot-reloaded. Keymap overrides in the same file. No settings UI.
 - Dark theme default, one light theme, both shipped. Embedded default monospace font with fallback to system fonts for missing glyphs (fontconfig discovery asynchronous, never on the typing path).
 - Cursor blink stops after 10 s idle; zero wakeups when idle (gate G11).
+- Discoverability (2026-10-18, Tobias): a command palette (Ctrl+Shift+P) listing every action with its bound chord, then a Sublime-style menu bar, hidden by default and shown while Alt is held or toggled from View; both generated from the single action table so no command exists in only one place (beads edit-ywd, edit-yey).
 
 ## 7. Non-functional requirements
 
