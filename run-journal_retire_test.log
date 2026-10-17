@@ -1,8 +1,0 @@
-display guard: real display :0 refused, using :99
-journal_retire_test: rotation case=0 swept
-journal_retire_test: rotation case=1 set aside and pinned
-journal_retire_test: rotation case=2 set aside and pinned
-journal_retire_test: rotation case=3 set aside and pinned
-journal_retire_test: rotation case=4 set aside and pinned
-(M)[AC] BAT0=Not charging empty_fixture_count=32 journal_bytes=4096 base_bytes=4 discovery_before_ns=1739464 discovery_after_ns=42844 load1=57.37
-journal_retire_test: passed

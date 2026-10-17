@@ -9,3 +9,6 @@ variants/
 *.db
 .beads-credential-key
 build/
+
+# coordinator landing logs written at worktree root
+/*.log
