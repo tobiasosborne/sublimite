@@ -541,7 +541,8 @@ void editor_save_overlay(editor *e)
         if (e->session->pending) status = "saving";
         else status = savectl_get_model(e->session->saving->save).status;
     } else if (b->save_error && !b->source_stale) status = "save failed";
-    else if (e->recovery_notice && e->stats.mutations == e->recovery_notice_mutations) {
+    /* edit-djg: panel chrome owns its rows; retain the notice for panel close. */
+    else if (!e->panel_rows && e->recovery_notice && e->stats.mutations == e->recovery_notice_mutations) {
         status = e->recovery_notice; e->recovery_notice_shown = true; /* edit-btj */
     }
     if (!status || !*status || !e->grid.dims.rows) return;

@@ -126,6 +126,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         rc = add_poll_fd(e, config_runtime_eventfd(e->preferences_runtime)); if (rc) goto fail;
     }
     if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
+    if (config->close_signal_fd) { rc = add_poll_fd(e, *config->close_signal_fd); if (rc) goto fail; }
     /* P3.4 reservation: maximum visible rows plus the bottom overscan row. */
     size_t reserved_rows = (size_t)e->max_rows + 1u;
     size_t cells = (size_t)e->max_cols * reserved_rows, words = (reserved_rows + 63) / 64;

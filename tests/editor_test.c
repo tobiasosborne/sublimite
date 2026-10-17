@@ -4172,6 +4172,36 @@ static int wheel_contract(void)
  * minimap plus tab slot, and tab/document/query/replacement/status rows.
  * Zero is success/empty/first byte; one is a C terminator or API direction.
  * No timing or allocation budget is introduced. */
+/* edit-djg (P): geometry reuses g02's tab/document/query/replacement/status
+ * rows and tab-slot/minimap columns. Compare every panel cell to the same
+ * composition without the recovery notice; zero denotes the first cell. */
+static int recovery_notice_findpanel(void)
+{
+    const char notice[] = "file changed on disk since this session; its unsaved edits were set aside";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 16u + 8u, .rows = 1u + 1u + 3u};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->recovery_notice = notice; e->recovery_notice_mutations = e->stats.mutations;
+    T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    T(editor_grid(e)->cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols].glyph_index == (uint32_t)notice[0]);
+    T(press(e, key(XKB_KEY_f, PLAT_MOD_CTRL, NULL)) == 0); T(e->panel_rows);
+    const render_grid *g = editor_grid(e);
+    size_t first = (size_t)(g->dims.rows - e->panel_rows) * g->dims.cols;
+    size_t cells = (size_t)e->panel_rows * g->dims.cols;
+    render_cell *with_notice = malloc(cells * sizeof *with_notice); T(with_notice);
+    memcpy(with_notice, g->cells + first, cells * sizeof *with_notice);
+    e->recovery_notice = NULL; T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    bool intact = !memcmp(with_notice, g->cells + first, cells * sizeof *with_notice);
+    free(with_notice);
+    printf("edit-djg: recovery notice with find panel: panel_cells_intact=%s\n", intact ? "yes" : "no");
+    if (!intact) editor_close(e);
+    T(intact);
+    e->recovery_notice = notice; T(editor_full_layout(e) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->panel_rows);
+    T(g->cells[(size_t)(g->dims.rows - 1u) * g->dims.cols].glyph_index == (uint32_t)notice[0]);
+    T(press(e, key(XKB_KEY_x, 0, "x")) == 0); T(!e->recovery_notice);
+    editor_close(e); return 0;
+}
 static int g02_find_return(void)
 {
     static const char text[]="cat cat cat", query[]="cat";
@@ -4849,6 +4879,7 @@ int main(int argc, char **argv)
     if (argc == 2) {
         /* (P) argv[1] is the selector after the program name. */
         if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
+        if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
         if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
         if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
         if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
@@ -4946,6 +4977,7 @@ int main(int argc, char **argv)
     T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
     T(paint_all_void() == 0);
     T(duplicate_path_contract() == 0);
+    T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);

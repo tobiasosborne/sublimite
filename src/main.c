@@ -5,10 +5,12 @@
 #include "trace/trace.h"
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/signalfd.h>
 #include <unistd.h>
 
 int main(int argc, char **argv)
@@ -97,15 +99,29 @@ int main(int argc, char **argv)
         close(session_lease); goto startup_fail;
     }
     render_backend backend = {0};
+    /* edit-djg: block before any editor/backend workers start; they inherit
+     * the mask. The UI receives termination through its existing poll set,
+     * with no handler or process global and no change to SIGBUS. Keep the
+     * mask through process exit so repeat signals cannot interrupt teardown.
+     * (P) Negative fd is absent; zero is syscall/API success. */
+    sigset_t close_signals;
+    int close_signal_fd = -1, rc = 0;
+    if (sigemptyset(&close_signals) || sigaddset(&close_signals, SIGTERM) ||
+        sigaddset(&close_signals, SIGINT) || pthread_sigmask(SIG_BLOCK, &close_signals, NULL)) rc = EDITOR_ERR_IO;
+    if (!rc) {
+        close_signal_fd = signalfd(-1, &close_signals, SFD_NONBLOCK | SFD_CLOEXEC);
+        if (close_signal_fd < 0) rc = EDITOR_ERR_IO;
+    }
     /* The only application backend selection site; init may fall back once. */
-    int rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
+    if (!rc) rc = editor_backend_select(&backend, getenv("EDIT_BACKEND"));
     const char *platform_error = NULL;
     editor *e = NULL;
     editor_config config = {.journal_path = journal_path, .session_lease = &session_lease, .start_empty = true, .raster_fallback = true, .load_preferences = true,
         .font_family = args.font_family, .font_file = args.font_file, .font_fallbacks = args.font_fallbacks,
         /* (G): edit-jmn's Sublime-comparable target. Tab records and buffer
          * pointers are reserved during startup, never on the typing path. */
-        .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend};
+        .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend,
+        .close_signal_fd = close_signal_fd >= 0 ? &close_signal_fd : NULL};
     editor_display_size display_size;
     /* A supplied Wayland fd is an existing protocol connection, not a socket
      * name from which another connection can be opened. Preserve it for
@@ -146,6 +162,7 @@ int main(int argc, char **argv)
         if (!rc) rc = flushed;
         editor_close(e);
     }
+    if (close_signal_fd >= 0) close(close_signal_fd);
     if (owns_server) ipc_server_fini(&server);
     /* Backend/platform setup can fail before editor_open owns the placeholder.
      * Retire only this launch's still-empty inode, never a recovery checkpoint. */

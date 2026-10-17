@@ -3,19 +3,23 @@
 #include "raster/raster.h"
 static int test_backend_select(render_backend *backend, const char *name);
 static int test_editor_open(editor **out, const editor_config *config, render_backend *backend);
+static int test_editor_flush(editor *e);
 #define editor_backend_select test_backend_select
 #define editor_open test_editor_open
+#define editor_flush test_editor_flush
 #define main editor_cli_main
 #include "../src/main.c"
 #undef main
 #undef editor_backend_select
 #undef editor_open
+#undef editor_flush
 #include "trace/trace_fmt.h"
 #include <dirent.h>
 #include "ipc_isolation.h"
 #include <signal.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 #include <time.h>
 #include <xcb/xcb.h>
 /* (G, fixture) capture capacity = sizeof the typed marker + original text. */
@@ -24,7 +28,20 @@ typedef struct hot_snapshot {
     view_state view;
     uint32_t width, height;
     uint8_t text[sizeof "xhello\n"];
+    char journal_name[sizeof "session-XXXXXX"]; /* (P) journal_session_create's mkstemp template. */
 } hot_snapshot;
+/* edit-djg (P): observe the production main's explicit flush, after the UI
+ * loop returns and before close. Pipe payload size follows journal_stats. */
+static int test_editor_flush(editor *e)
+{
+    int rc = editor_flush(e);
+    const char *descriptor = getenv("CLI_TEST_SIGNAL_FLUSH_FD");
+    if (descriptor) {
+        journal_stats stats = journal_get_stats(e->journal);
+        if (write(atoi(descriptor), &stats, sizeof stats) != (ssize_t)sizeof stats) return EDITOR_ERR_IO;
+    }
+    return rc;
+}
 static int test_editor_open(editor **out, const editor_config *config, render_backend *backend)
 {
     int rc = editor_open(out, config, backend);
@@ -275,7 +292,10 @@ static int hot_image(const char *directory, hot_snapshot *s)
             if (bytes) {
                 ssize_t n = read(fd, bytes, len); journal_replay_result rr;
                 *s = (hot_snapshot){0};
-                if (n == (ssize_t)len && !journal_replay_bytes(bytes, len, hot_record, s, &rr)) result = 0;
+                if (n == (ssize_t)len && !journal_replay_bytes(bytes, len, hot_record, s, &rr)) {
+                    int named = snprintf(s->journal_name, sizeof s->journal_name, "%s", entry->d_name);
+                    result = named > 0 && (size_t)named < sizeof s->journal_name ? 0 : 1;
+                }
                 free(bytes);
             }
         }
@@ -283,17 +303,31 @@ static int hot_image(const char *directory, hot_snapshot *s)
     }
     closedir(dir); return result;
 }
-static int hot_exit_cli(const char *source_path, const char *directory)
+static int hot_exit_cli(const char *source_path, const char *directory, int stop_signal)
 {
     int result = 1, status = 0, pipes[2] = {-1, -1}; pid_t child = -1;
+    int flush_pipe[2] = {-1, -1}, lease = -1;
+    char journal_path[IPC_PATH_CAP] = "";
     xcb_connection_t *c = NULL; xcb_get_geometry_reply_t *geometry = NULL;
     xcb_get_keyboard_mapping_reply_t *mapping = NULL;
     T(unsetenv("EDIT_TRACE_DUMP") == 0);
     c = xcb_connect(":99", NULL); T(c && !xcb_connection_has_error(c));
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data; T(screen);
     xcb_atom_t pid_atom = intern(c, "_NET_WM_PID");
+    /* edit-djg (P): a pipe has a read end and a write end; negative fd means
+     * absent. Reuse the existing idle watchdog and native typing fixture. */
+    if (stop_signal != SIGKILL) T(pipe(flush_pipe) == 0);
     child = fork(); T(child >= 0);
-    if (!child) { char *args[] = {"sublimite", (char *)source_path, NULL}; _exit(editor_cli_main(2, args)); }
+    if (!child) {
+        if (stop_signal != SIGKILL) {
+            close(flush_pipe[0]);
+            char descriptor[sizeof(int) * 3u + 1u]; /* (P) decimal digits <= bytes * 3 plus NUL. */
+            if (snprintf(descriptor, sizeof descriptor, "%d", flush_pipe[1]) <= 0 ||
+                setenv("CLI_TEST_SIGNAL_FLUSH_FD", descriptor, 1)) _exit(1);
+        }
+        char *args[] = {"sublimite", (char *)source_path, NULL}; _exit(editor_cli_main(2, args));
+    }
+    if (flush_pipe[1] >= 0) { close(flush_pipe[1]); flush_pipe[1] = -1; }
     uint64_t until = trace_now_ns() + EDITOR_IDLE_NS; /* G: existing editor idle watchdog */
     xcb_window_t window = XCB_WINDOW_NONE;
     while (!window && trace_now_ns() < until) { window = find_window(c, screen->root, pid_atom, child); if (!window) pause_poll(); }
@@ -324,8 +358,43 @@ static int hot_exit_cli(const char *source_path, const char *directory)
             before.view.selection.anchor == strlen("x") && before.width == width && before.height == height;
         if (!ready) pause_poll();
     }
-    T(ready); T(kill(child, SIGKILL) == 0); T(child_wait(child, &status, 0) == child); child = -1;
-    T(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    T(ready);
+    if (stop_signal != SIGKILL) {
+        char lock[IPC_PATH_CAP];
+        T(snprintf(lock, sizeof lock, "%s/.%s.lock", directory, before.journal_name) > 0);
+        T(snprintf(journal_path, sizeof journal_path, "%s/%s", directory, before.journal_name) > 0);
+        lease = open(lock, O_RDWR | O_CLOEXEC); T(lease >= 0);
+        T(flock(lease, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK);
+    }
+    T(kill(child, stop_signal) == 0);
+    until = trace_now_ns() + EDITOR_IDLE_NS;
+    pid_t stopped;
+    do { stopped = child_wait(child, &status, WNOHANG); if (!stopped) pause_poll(); }
+    while (!stopped && trace_now_ns() < until);
+    T(stopped == child); child = -1;
+    if (stop_signal == SIGKILL) T(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    else {
+        journal_stats flushed = {0};
+        bool observed = read(flush_pipe[0], &flushed, sizeof flushed) == (ssize_t)sizeof flushed;
+        close(flush_pipe[0]); flush_pipe[0] = -1;
+        bool released = flock(lease, LOCK_EX | LOCK_NB) == 0;
+        close(lease); lease = -1;
+        /* (P) POSIX shell signal status = 128 + signal number; success = zero. */
+        printf("edit-djg: %s exit=%d clean_flush=%s lease_released=%s accepted=%llu written=%llu durable=%llu\n",
+            stop_signal == SIGTERM ? "SIGTERM" : "SIGINT",
+            WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status),
+            observed ? "yes" : "no", released ? "yes" : "no",
+            (unsigned long long)flushed.accepted_sequence, (unsigned long long)flushed.written_sequence,
+            (unsigned long long)flushed.durable_sequence);
+        T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        T(observed && released && !flushed.error && !flushed.pending_bytes &&
+            flushed.accepted_sequence == flushed.written_sequence && flushed.written_sequence == flushed.durable_sequence);
+        hot_snapshot replay = {0}; journal_replay_result rr; struct stat st;
+        T(stat(journal_path, &st) == 0);
+        T(journal_replay_file(journal_path, hot_record, &replay, &rr) == JOURNAL_OK);
+        T(!rr.corrupt && rr.valid_bytes == (uint64_t)st.st_size && replay.len == before.len &&
+            !memcmp(replay.text, before.text, before.len));
+    }
     T(pipe(pipes) == 0); child = fork(); T(child >= 0);
     if (!child) {
         close(pipes[0]); char descriptor[sizeof(int) * 3u + 1u]; /* decimal digits <= bytes * 3 plus NUL */
@@ -360,17 +429,20 @@ static int hot_exit_cli(const char *source_path, const char *directory)
     until = trace_now_ns() + EDITOR_IDLE_NS; pid_t waited;
     do { waited = child_wait(child, &status, WNOHANG); if (!waited) pause_poll(); } while (!waited && trace_now_ns() < until);
     T(waited == child); child = -1; T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    puts("cli_test: SIGKILL after native typing; production relaunch restores marker/cursor/selection/scroll and actual X window geometry (G: bead display trial)");
+    puts("cli_test: termination after native typing; production relaunch restores marker/cursor/selection/scroll and actual X window geometry (G: bead display trial)");
     result = 0;
 cleanup:
     free(geometry); free(mapping);
     if (pipes[0] >= 0) close(pipes[0]);
     if (pipes[1] >= 0) close(pipes[1]);
+    if (flush_pipe[0] >= 0) close(flush_pipe[0]);
+    if (flush_pipe[1] >= 0) close(flush_pipe[1]);
+    if (lease >= 0) close(lease);
     if (child > 0) { (void)kill(child, SIGKILL); (void)child_wait(child, NULL, 0); }
     if (c) xcb_disconnect(c);
     return result;
 }
-static int run_cli_suite(void)
+static int run_cli_suite(int stop_signal)
 {
     int result = 1;
     bool root_created = false, decoy_live = false;
@@ -410,7 +482,7 @@ static int run_cli_suite(void)
     ipc_server_fini(&decoy); decoy_live = false;
     ran = session(source_path, root, true, NULL);
     T(ran == 0);
-    if (!getenv("CLI_TEST_DELAY_BACKEND")) T(hot_exit_cli(source_path, dir) == 0);
+    if (!getenv("CLI_TEST_DELAY_BACKEND")) T(hot_exit_cli(source_path, dir, stop_signal) == 0);
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
         if (!strncmp(entry->d_name, ".session-", 9)) {
@@ -531,15 +603,18 @@ cleanup:
 
 int main(int argc, char **argv)
 {
+    /* edit-djg (P): executable plus the named focused-test option. */
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigterm")) return run_cli_suite(SIGTERM);
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigint")) return run_cli_suite(SIGINT);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--duplicate-path")) return duplicate_cli_handoff();
     if (duplicate_cli_handoff()) return 1;
-    if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite();
+    if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite(SIGKILL);
     /* A live implementation that misses its window deadline must fail. */
     pid_t control = fork();
     if (control < 0) return 1;
     if (!control) {
         if (setenv("CLI_TEST_FORCE_WINDOW_TIMEOUT", "1", 1)) _exit(3);
-        _exit(run_cli_suite());
+        _exit(run_cli_suite(SIGKILL));
     }
     int status = 0;
     if (child_wait(control, &status, 0) != control || !WIFEXITED(status) || WEXITSTATUS(status) != 1) {
@@ -547,10 +622,11 @@ int main(int argc, char **argv)
         return 1;
     }
     fputs("cli_test: §36 forced startup timeout correctly failed\n", stderr);
-    int normal = run_cli_suite();
+    int normal = run_cli_suite(SIGKILL);
     if (normal) return normal;
+    if (run_cli_suite(SIGTERM) || run_cli_suite(SIGINT)) return 1;
     if (setenv("CLI_TEST_DELAY_BACKEND", "1", 1)) return 1;
-    int delayed = run_cli_suite();
+    int delayed = run_cli_suite(SIGKILL);
     (void)unsetenv("CLI_TEST_DELAY_BACKEND");
     return delayed;
 }

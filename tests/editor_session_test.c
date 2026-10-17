@@ -496,6 +496,36 @@ static int existing_journal(void)
     char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s/.journal.lock", root) > 0); unlink(lock);
     T(rmdir(root) == 0); return 0;
 }
+/* edit-djg (P): keep explicit-path recovery strict because its source is the
+ * live destination. Fixture bytes derive from the base and typed marker;
+ * compare the entire source artifact before/after refusal, with no new budget. */
+static int explicit_changed_base(void)
+{
+    fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    T(press(f.e, 'x', 0, "x") == 0);
+    editor_close(f.e); f.e = NULL;
+    int fd = open(f.log, O_RDONLY); T(fd >= 0);
+    struct stat before; T(fstat(fd, &before) == 0 && before.st_size > 0);
+    size_t len = (size_t)before.st_size;
+    uint8_t *original = malloc(len), *after = malloc(len); T(original && after);
+    T(read(fd, original, len) == (ssize_t)len); close(fd);
+    fd = open(f.path, O_WRONLY | O_TRUNC); T(fd >= 0);
+    const char disk[] = "changed on disk";
+    T(write(fd, disk, sizeof disk - 1u) == (ssize_t)(sizeof disk - 1u)); close(fd);
+    f.backend = (render_backend){0}; T(render_null_backend(&f.backend) == 0);
+    editor_config cfg = {.journal_path = f.log, .start_empty = true,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* (P) tab + text + status. */
+    int rc = editor_open(&f.e, &cfg, &f.backend);
+    T(rc == EDITOR_ERR_IO && !f.e);
+    fd = open(f.log, O_RDONLY); T(fd >= 0);
+    struct stat st; T(fstat(fd, &st) == 0 && st.st_size == before.st_size && st.st_ino == before.st_ino);
+    T(read(fd, after, len) == (ssize_t)len); close(fd);
+    T(!memcmp(original, after, len)); free(original); free(after);
+    T(disk_is(f.path, disk) == 0);
+    close_fixture(&f);
+    puts("edit-djg: explicit changed BASE rejected with EDITOR_ERR_IO; source journal and disk text intact");
+    return 0;
+}
 static int session_artifacts(void)
 {
     char root[] = "build/editor-artifacts-XXXXXX"; T(mkdtemp(root));
@@ -1455,12 +1485,17 @@ static int leased_install_failure(bool leased, bool start_empty)
     fm4_remove_tree(root);
     return rc;
 }
-int main(void)
+int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    /* (P) executable plus focused-test option; zero is API success. */
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
+        return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     T(leased_install_failure(false, false) == 0);
     T(leased_install_failure(true, false) == 0);
     T(leased_install_failure(true, true) == 0);
+    T(explicit_changed_base() == 0);
     T(clean_tab_set() == 0);
     T(large_restore() == 0);
     T(large_orphans() == 0);
