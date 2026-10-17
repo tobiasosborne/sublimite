@@ -645,12 +645,12 @@ static bool runnable(const editor *e)
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
-    if (runnable(e)) return 0;
+    if (!e->checkpoint_retry_ns && runnable(e)) return 0;
     /* A private XCB event or unsignalled GPU fence can outlast its sole
      * platform callback. Retry only an outstanding presented GPU frame.
      * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
-    uint64_t deadline = e->blinking ? e->next_blink : UINT64_MAX;
+    uint64_t deadline = e->checkpoint_retry_ns ? e->checkpoint_retry_ns : e->blinking ? e->next_blink : UINT64_MAX;
     if (e->journal && !editor_save_leased(e)) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;
@@ -678,15 +678,28 @@ int editor_inject(editor *e, const plat_event *event)
     e->queue_generation[at] = parked ? e->buffer->source_generation : 0;
     e->queue_count++; return 0;
 }
-static int close_result(editor *e)
+static int close_result(editor *e, int timeout_ms)
 {
+    if (e->checkpoint_retry_ns && trace_now_ns() < e->checkpoint_retry_ns) {
+        int pumped = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
+        if (pumped) return fail(e, pumped);
+        if (trace_now_ns() < e->checkpoint_retry_ns) return EDITOR_OK;
+    }
     int rc = editor_flush(e);
+    if (rc == JOURNAL_BUSY) {
+        /* edit-dr9 (E): reuse the existing durability interval as the retry
+         * tick. Keep quit, text, queued ops and the open journal until then;
+         * poll the deadline rather than spinning or latching fail(). */
+        e->checkpoint_retry_ns = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS;
+        return EDITOR_MORE;
+    }
+    e->checkpoint_retry_ns = 0; /* (P) no pending retry */
     return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
 }
 int editor_step(editor *e, int timeout_ms)
 {
     if (!e || !e->tree) return EDITOR_ERR_ARG;
-    if (e->quit) return close_result(e);
+    if (e->quit) return close_result(e, timeout_ms);
     if (e->error) return e->error;
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
     font_async_pump(e->fonts);
@@ -703,7 +716,7 @@ int editor_step(editor *e, int timeout_ms)
     if (!rc) editor_hl_service(e);
     if (!rc) rc = editor_restore_service(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
-    if (e->quit) return close_result(e);
+    if (e->quit) return close_result(e, timeout_ms);
     if (rc) return fail(e, rc);
     editor_journal_staged(e);
     if (e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
@@ -767,10 +780,7 @@ int editor_step(editor *e, int timeout_ms)
         if (rc) return fail(e, rc);
         if (e->quit || trace_now_ns() - start >= EDITOR_SLICE_NS) break;
     }
-    if (e->quit) {
-        rc = editor_flush(e);
-        return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
-    }
+    if (e->quit) return close_result(e, timeout_ms);
     rc = editor_scroll_slice(e); if (rc) return fail(e, rc);
     rc = editor_pointer_tick(e); if (rc) return fail(e, rc);
     if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
@@ -794,7 +804,7 @@ int editor_step(editor *e, int timeout_ms)
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (rc) return fail(e, rc);
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
-    if (e->quit) return close_result(e);
+    if (e->quit) return close_result(e, timeout_ms);
     return runnable(e) ? EDITOR_MORE : EDITOR_OK;
 }
 int editor_run(editor *e)

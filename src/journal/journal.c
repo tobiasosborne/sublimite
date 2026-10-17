@@ -856,13 +856,17 @@ static int checkpoint_size(const journal *j, const journal_record *records, size
 static int checkpoint_temp(const journal *j, char *name, size_t cap)
 {
     struct stat source; if(fstat(j->disk.fd,&source)) return -1;
+    /* edit-dr9: failed originals may lack accepted edits in this checkpoint.
+     * Explicit clean/failed flags survive owner death; old unflagged names
+     * cannot prove a clean start. Journal wire bytes remain unchanged. */
+    const char *state=(j->failed || j->append_failed)?"!":"+";
     uint64_t nonce=clock_ns();
     for(unsigned i=0;i<64;i++) {
         /* edit-52o (P): original device/inode/ctime identify a surviving copy using
          * directory metadata alone; PID/nonce/attempt retain name uniqueness.
          * The inherited collision ceiling above is unchanged. */
-        int n=snprintf(name,cap,".sublimite-journal-from-%jx-%jx-%jx-%jx-%lx-%llx-%x-",
-            (uintmax_t)source.st_dev,(uintmax_t)source.st_ino,
+        int n=snprintf(name,cap,".sublimite-journal-%sfrom-%jx-%jx-%jx-%jx-%lx-%llx-%x-",
+            state,(uintmax_t)source.st_dev,(uintmax_t)source.st_ino,
             (uintmax_t)source.st_ctim.tv_sec,(uintmax_t)source.st_ctim.tv_nsec,
             (unsigned long)getpid(),(unsigned long long)nonce,i);
         if(n<0 || (size_t)n>=cap) return -1;
@@ -876,7 +880,7 @@ static int checkpoint_temp(const journal *j, char *name, size_t cap)
          * nanosecond digits. A killed temp must still fit its aside name. */
         size_t aside=sizeof ".set-aside-"-1u+sizeof(time_t)*CHAR_BIT+sizeof "999999999"-1u;
         if(cap<=aside || prefix>=cap-aside || length>(cap-aside-prefix-1u)/2u) {
-            n=snprintf(name,cap,".sublimite-journal-%lx-%llx-%x",(unsigned long)getpid(),(unsigned long long)nonce,i);
+            n=snprintf(name,cap,".sublimite-journal-%s%lx-%llx-%x",state,(unsigned long)getpid(),(unsigned long long)nonce,i);
             if(n<0 || (size_t)n>=cap) return -1;
         } else {
             static const char hex[]="0123456789abcdef";
@@ -904,10 +908,16 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
      * Retirement's existing exclusive nonblocking flock proves owner death
      * without PID reuse, timers, extra files, or a create-before-lock window.
      * A separate open description avoids changing the retained fd's locks.
-     * Rotation is off path and can wait for an inventory already in flight. */
+     * edit-dr9: UI checkpoint callers must retry instead of waiting for an
+     * inventory already in flight. No temp exists before this admission. */
     int guard=openat(j->directory_fd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     if(guard<0) return JOURNAL_IO;
-    if(flock(guard,LOCK_SH)) { close(guard); return JOURNAL_IO; }
+    int locked;
+    do { locked=flock(guard,LOCK_SH|LOCK_NB); } while(locked && errno==EINTR);
+    if(locked) {
+        rc=(errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO;
+        close(guard); return rc;
+    }
     /* (P) NAME_MAX is the filesystem basename capacity, plus its NUL. */
     char tmpname[NAME_MAX+1u]; int tfd=checkpoint_temp(j,tmpname,sizeof tmpname);
     if(tfd<0) { close(guard); return JOURNAL_IO; }

@@ -301,6 +301,8 @@ int journal_flush(journal *j); /* blocking; setup/save/exit only */
  * for the new generation until retry completes that barrier. Checkpoint size
  * is preflighted; its durable bytes plus the original configured log budget
  * bound the new file. Large untitled checkpoints may exceed the old log limit. */
+/* Directory inventory contention returns BUSY without changing the open
+ * journal or creating a temp; retry the complete checkpoint on a later tick. */
 int journal_rotate(journal *j, const journal_record *records, size_t count);
 /* Parser: visits only structurally valid, CRC-checked records. A group's
  * complete span is validated through COMMIT before its data is delivered;

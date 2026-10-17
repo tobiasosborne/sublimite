@@ -6,6 +6,7 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/file.h>
@@ -386,7 +387,38 @@ static int rotation_names(const char *root, size_t *asides, bool *locks)
     }
     T(closedir(dir)==0); return 0;
 }
-static int rotation_temps(bool missing_source)
+/* (P) Cases derive from the sweep's existing clean/missing-original outcomes
+ * and the two failed states admitted by journal_rotate: UI append and worker.
+ * Reject the original append or lose its writeback so accepted checkpoint
+ * bytes exist only in temp. */
+typedef enum rotation_case {
+    ROTATION_CLEAN, ROTATION_MISSING, ROTATION_APPEND_FAILED, ROTATION_WORKER_FAILED,
+    ROTATION_UNFLAGGED_FAILED
+} rotation_case;
+static ssize_t rotation_reject_write(void *ctx, int fd, const uint8_t *bytes, size_t size, uint64_t off)
+{
+    (void)ctx; (void)fd; (void)bytes; (void)size; (void)off;
+    errno=EIO; return -1;
+}
+static int rotation_lose_writeback(void *ctx, int fd, bool directory)
+{
+    (void)ctx;
+    if(directory) return fsync(fd);
+    /* (P) A consumed writeback error can lose all unsynced bytes. Truncate
+     * to the empty durable prefix to exercise worker failure independently
+     * of append_failed; metadata is captured only after this damage. */
+    if(ftruncate(fd,0)) return -1;
+    errno=EIO; return -1;
+}
+static int rotation_checkpoint(void *ctx, const journal_record *record)
+{
+    bool *found=ctx;
+    if(record->type!=JOURNAL_INSERT || record->buffer_id!=1 ||
+       record->size!=sizeof(uint64_t)+strlen("checkpoint") ||
+       memcmp(record->data+sizeof(uint64_t),"checkpoint",strlen("checkpoint"))) return JOURNAL_INVALID;
+    *found=true; return JOURNAL_OK;
+}
+static int rotation_temps(rotation_case which)
 {
     char root[]="build/rotation-XXXXXX"; T(mkdtemp(root));
     char path[sizeof ((journal_base *)0)->captured_path], temp[sizeof path]={0}, stray[sizeof path];
@@ -399,6 +431,18 @@ static int rotation_temps(bool missing_source)
         if(work_pool_init(&pool,1,0)) _exit(EXIT_FAILURE);
         journal_io io={.ctx=&channel[1],.rename=rotation_pause}; journal *j=NULL;
         if(journal_open_with_io(&j,path,&pool,NULL,&io)) _exit(EXIT_FAILURE);
+        if(which==ROTATION_APPEND_FAILED || which==ROTATION_WORKER_FAILED || which==ROTATION_UNFLAGGED_FAILED) {
+            journal_io broken=which!=ROTATION_WORKER_FAILED?
+                (journal_io){.append_write=rotation_reject_write}:(journal_io){.sync=rotation_lose_writeback};
+            int appended=which!=ROTATION_WORKER_FAILED?JOURNAL_IO:JOURNAL_OK;
+            if(journal_set_io(j,&broken) ||
+               journal_insert(j,1,0,(const uint8_t *)"checkpoint",strlen("checkpoint"))!=appended)
+                _exit(EXIT_FAILURE);
+            if(which==ROTATION_WORKER_FAILED && journal_flush(j)!=JOURNAL_IO) _exit(EXIT_FAILURE);
+            journal_stats stats=journal_get_stats(j);
+            if(stats.accepted_sequence!=1 || stats.durable_sequence || stats.error!=JOURNAL_IO ||
+               journal_set_io(j,&io)) _exit(EXIT_FAILURE);
+        }
         /* (P) INSERT = offset64 followed by the literal checkpoint bytes. */
         uint8_t payload[sizeof(uint64_t)+sizeof "checkpoint"-1u]={0};
         memcpy(payload+sizeof(uint64_t),"checkpoint",strlen("checkpoint"));
@@ -413,6 +457,8 @@ static int rotation_temps(bool missing_source)
     }
     R(got && got<sizeof temp && temp[got-1u]==0);
     struct stat before,after; R(stat(temp,&before)==0 && before.st_size==(off_t)JOURNAL_PAGE);
+    if(which==ROTATION_APPEND_FAILED || which==ROTATION_WORKER_FAILED || which==ROTATION_UNFLAGGED_FAILED)
+        R(stat(path,&after)==0 && after.st_size==0);
     /* The journal API itself must protect its temp, even without an editor's
      * outer session lease. Housekeeping may skip the leased directory. */
     int retired=journal_retire_directory(root,NULL); R(retired==0 || retired==JOURNAL_BUSY);
@@ -422,19 +468,39 @@ static int rotation_temps(bool missing_source)
     if(locks || asides) { fprintf(stderr,"rotation_temps: live temp gained a lock or set-aside\n"); result=1; }
     R(kill(child,SIGKILL)==0); int status;
     R(waitpid(child,&status,0)==child); child=-1; R(WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    if(which==ROTATION_UNFLAGGED_FAILED) {
+        /* (P) Remove the sole state character to reproduce the older build's
+         * basename, retaining the actual failed checkpoint and original.
+         * Moving strlen(flag) bytes also copies the trailing NUL. */
+        char old[sizeof temp]; strcpy(old,temp);
+        char *flag=strstr(old,".sublimite-journal-"); R(flag);
+        flag+=strlen(".sublimite-journal-"); R(*flag=='!');
+        memmove(flag,flag+1,strlen(flag));
+        R(rename(temp,old)==0); strcpy(temp,old);
+    }
     const char *leaf=strrchr(temp,'/'); R(leaf);
     R(snprintf(stray,sizeof stray,"%s/.%s.lock",root,leaf+1)>0);
     int fd=open(stray,O_CREAT|O_WRONLY|O_CLOEXEC,0600); R(fd>=0); close(fd);
-    if(missing_source) R(unlink(path)==0);
+    if(which==ROTATION_MISSING) R(unlink(path)==0);
+    bool preserve=which!=ROTATION_CLEAN;
     /* A launch runs housekeeping before recovery. An absent original makes
      * the temp the possible sole copy; preserve its inode under set-aside. */
     R(journal_retire_directory(root,NULL)==0 && access(temp,F_OK)<0 && access(stray,F_OK)<0);
-    R(rotation_names(root,&asides,&locks)==0 && !locks && asides==(missing_source?1u:0u));
-    if(missing_source) {
+    R(rotation_names(root,&asides,&locks)==0 && !locks);
+    if(asides!=(preserve?1u:0u)) {
+        fprintf(stderr,"rotation_temps: case=%d set-asides=%zu expected=%u\n",which,asides,preserve?1u:0u);
+        result=1; goto done;
+    }
+    if(preserve) {
         DIR *dir=opendir(root); R(dir); struct dirent *entry; bool found=false;
         while((entry=readdir(dir))) if(strstr(entry->d_name,".set-aside-")) {
             if(fstatat(dirfd(dir),entry->d_name,&after,AT_SYMLINK_NOFOLLOW)==0 &&
-               before.st_ino==after.st_ino && before.st_size==after.st_size) found=true;
+               before.st_ino==after.st_ino && before.st_size==after.st_size) {
+                char aside[sizeof path]; bool checkpoint=false; journal_replay_result replayed;
+                if(snprintf(aside,sizeof aside,"%s/%s",root,entry->d_name)>0 &&
+                   journal_scan_file(aside,rotation_checkpoint,&checkpoint,&replayed)==JOURNAL_OK &&
+                   checkpoint && !replayed.corrupt && replayed.records==1) found=true;
+            }
         }
         closedir(dir); R(found);
         R(journal_retire_directory(root,NULL)==0);
@@ -445,6 +511,7 @@ done:
     for(size_t i=0;i<sizeof channel/sizeof *channel;i++) if(channel[i]>=0) close(channel[i]);
     if(cleanup(root)) result=1;
 #undef R
+    if(!result) printf("journal_retire_test: rotation case=%d %s\n",which,which==ROTATION_CLEAN?"swept":"set aside and pinned");
     return result;
 }
 /* Historical names contain no original-journal identity. From directory
@@ -484,7 +551,9 @@ static int legacy_rotation_temp(void)
 int main(void)
 {
     trace_init(); T(trace_thread_register()>=0);
-    int rotations=rotation_temps(false); rotations|=rotation_temps(true); rotations|=legacy_rotation_temp(); T(rotations==0);
+    int rotations=0;
+    for(rotation_case which=ROTATION_CLEAN;which<=ROTATION_UNFLAGGED_FAILED;which++) rotations|=rotation_temps(which);
+    rotations|=legacy_rotation_temp(); T(rotations==0);
     T(retirement()==0); T(protection()==0); T(clean_tab_set()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }

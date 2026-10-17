@@ -249,12 +249,13 @@ static void fuzz_groups(const uint8_t *data, size_t size)
 }
 /* edit-52o: directory-state oracles for rotation names, with arbitrary small
  * content. (P) Cases come from the protocol: surviving/missing/reused source,
- * legacy, malformed, already set aside, live. No content parser is the oracle.
+ * legacy, malformed, already set aside, live, failed rotation whose temp may
+ * exceed its original, older unflagged names. No content parser is the oracle.
  * Dispatch reuses a wire operation tag, rather than adding a fuzz budget. */
 static void fuzz_retirement(const uint8_t *data, size_t size)
 {
     if(!size || data[0]!=(uint8_t)JOURNAL_TARGET) return;
-    enum { SURVIVING, MISSING, REUSED, LEGACY, MALFORMED, ASIDE, LIVE, OTHER_NAME, CASES };
+    enum { SURVIVING, MISSING, REUSED, LEGACY, MALFORMED, ASIDE, LIVE, OTHER_NAME, MAY_EXCEED, UNFLAGGED, CASES };
     unsigned which=size>1?data[1]%CASES:SURVIVING;
     char root[]="build/journal-fuzz-retire-XXXXXX"; if(!mkdtemp(root)) return;
     DIR *dir=opendir(root); EDIT_ASSERT(dir); int dfd=dirfd(dir);
@@ -262,8 +263,8 @@ static void fuzz_retirement(const uint8_t *data, size_t size)
     struct stat st; EDIT_ASSERT(fstat(source,&st)==0); close(source);
     char temp[sizeof ((struct dirent *)0)->d_name];
     /* (P) ASCII basenames in hex: original=6f726967696e616c, other=6f74686572. */
-    int n=snprintf(temp,sizeof temp,".sublimite-journal-from-%jx-%jx-%jx-%jx-%jx-%zx-0-%s%s",
-        (uintmax_t)st.st_dev,(uintmax_t)st.st_ino,
+    int n=snprintf(temp,sizeof temp,".sublimite-journal-%sfrom-%jx-%jx-%jx-%jx-%jx-%zx-0-%s%s",
+        which==MAY_EXCEED?"!":which==UNFLAGGED?"":"+",(uintmax_t)st.st_dev,(uintmax_t)st.st_ino,
         (uintmax_t)st.st_ctim.tv_sec^(which==REUSED?UINTMAX_C(1):UINTMAX_C(0)),
         (uintmax_t)st.st_ctim.tv_nsec,(uintmax_t)getpid(),size,
         which==OTHER_NAME?"6f74686572":"6f726967696e616c",which==ASIDE?".set-aside-0":"");
@@ -294,7 +295,7 @@ static void fuzz_retirement(const uint8_t *data, size_t size)
     bool keep=which==MALFORMED || which==ASIDE || which==LIVE;
     EDIT_ASSERT((fstatat(dfd,temp,&st,AT_SYMLINK_NOFOLLOW)==0)==keep);
     close(fd);
-    bool preserve=which==MISSING || which==REUSED || which==LEGACY || which==OTHER_NAME || keep;
+    bool preserve=which==MISSING || which==REUSED || which==LEGACY || which==OTHER_NAME || which==MAY_EXCEED || which==UNFLAGGED || keep;
     size_t copies=0; struct dirent *entry; rewinddir(dir);
     while((entry=readdir(dir))) {
         EDIT_ASSERT(strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-"))!=0);

@@ -39,7 +39,7 @@ static bool same(const struct stat *a, const struct stat *b)
 typedef struct rotation_name {
     uintmax_t device, inode, ctime_sec, ctime_nsec;
     char owner[sizeof ((struct dirent *)0)->d_name];
-    bool source, aside;
+    bool source, aside, exceeds_source;
 } rotation_name;
 /* (P) Hexadecimal names use radix sixteen; overflow is bounded by uintmax_t,
  * not by a guessed pathname component length. Accept lowercase components. */
@@ -61,7 +61,11 @@ static bool rotation_parse(const char *name, rotation_name *out)
 {
     static const char prefix[]=".sublimite-journal-", source[]="from-", aside[]=".set-aside-";
     if(strncmp(name,prefix,sizeof prefix-1u)) return false;
-    const char *p=name+sizeof prefix-1u; *out=(rotation_name){0}; uintmax_t ignored;
+    const char *p=name+sizeof prefix-1u; *out=(rotation_name){.exceeds_source=true}; uintmax_t ignored;
+    /* edit-dr9: a failed original cannot prove the temp's redundancy even
+     * when its generation still matches. Only an explicit clean flag proves
+     * otherwise; old unflagged names are uncertain. Both flags are non-hex. */
+    if(*p=='!' || *p=='+') { out->exceeds_source=*p!='+'; p++; }
     if(!strncmp(p,source,sizeof source-1u)) {
         p+=sizeof source-1u; out->source=true;
         if(!hex_component(&p,&out->device,true) || !hex_component(&p,&out->inode,true) ||
@@ -153,11 +157,11 @@ static int sweep_rotations(DIR *dir, const char *current)
         bool valid=!flock(fd,LOCK_EX|LOCK_NB) && !fstat(fd,&held) && S_ISREG(held.st_mode) &&
             !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) && same(&held,&named);
         if(valid) {
-            if(name.source && rotation_source_exists(dir,&name)) {
+            if(name.source && !name.exceeds_source && rotation_source_exists(dir,&name)) {
                 if(unlinkat(dirfd(dir),entry->d_name,0)) rc=JOURNAL_IO; else changed=true;
             } else {
-                /* Missing original, or legacy's unknown original: possible
-                 * sole copy. Same set-aside convention as recovery; no copy,
+                /* Missing/unknown/failed original: possible sole copy.
+                 * Same set-aside convention as recovery; no copy,
                  * content read, age test, size limit, or replacement. */
                 struct timespec now; char aside[sizeof entry->d_name];
                 if(clock_gettime(CLOCK_REALTIME,&now)) rc=JOURNAL_IO;

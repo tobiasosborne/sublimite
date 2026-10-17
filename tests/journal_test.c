@@ -1,10 +1,13 @@
 #include "journal/journal.h"
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
+#include <signal.h>
 #include "file/file.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -1169,6 +1172,79 @@ static int rotate_name_test(void)
     puts("journal_test: 255-byte journal basename rotates with independent temporary name"); return 0;
 }
 
+/* edit-dr9 (P): one journal worker/buffer; pipe endpoints are read/write,
+ * zero denotes success/empty and one denotes a sole message/record.
+ * (E) The response watchdog reuses JOURNAL_DEFAULT_SYNC_NS: contending with
+ * inventory must yield within the existing durability tick, not await release.
+ * (P) ns / 1000000 = ms for poll. No timing performance budget is introduced. */
+static int rotate_busy_child(const char *path, int report, int resume)
+{
+    work_pool pool; CHECK(work_pool_init(&pool,1,0)==0); journal *j=NULL;
+    CHECK(journal_open(&j,path,&pool,NULL)==JOURNAL_OK);
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"original",strlen("original"))==JOURNAL_OK);
+    CHECK(journal_flush(j)==JOURNAL_OK);
+    journal_stats before=journal_get_stats(j); struct stat original,after;
+    CHECK(stat(path,&original)==0);
+    uint8_t payload[sizeof(uint64_t)+sizeof "checkpoint"-1u]={0};
+    memcpy(payload+sizeof(uint64_t),"checkpoint",strlen("checkpoint"));
+    journal_record cp={JOURNAL_INSERT,1,0,payload,sizeof payload};
+    int rc=JOURNAL_OK; CHECK(write(report,&rc,sizeof rc)==(ssize_t)sizeof rc);
+    rc=journal_rotate(j,&cp,1);
+    CHECK(rc==JOURNAL_BUSY);
+    journal_stats busy=journal_get_stats(j);
+    CHECK(busy.accepted_sequence==before.accepted_sequence && busy.durable_sequence==before.durable_sequence &&
+          busy.error==before.error && stat(path,&after)==0 && after.st_ino==original.st_ino && after.st_size==original.st_size);
+    CHECK(journal_insert(j,1,strlen("original"),(const uint8_t *)"!",strlen("!"))==JOURNAL_OK);
+    CHECK(write(report,&rc,sizeof rc)==(ssize_t)sizeof rc);
+    CHECK(read(resume,&rc,sizeof rc)==(ssize_t)sizeof rc && rc==JOURNAL_OK);
+    CHECK(journal_flush(j)==JOURNAL_OK);
+    CHECK(journal_rotate(j,&cp,1)==JOURNAL_OK);
+    model restored={0}; journal_replay_result replayed;
+    CHECK(journal_replay_file(path,apply,&restored,&replayed)==JOURNAL_OK && !replayed.corrupt);
+    CHECK(restored.len==strlen("checkpoint") && !memcmp(restored.text,"checkpoint",restored.len));
+    journal_close(j); work_pool_shutdown(&pool); return 0;
+}
+static int rotate_busy_test(void)
+{
+    char root[]="build/journal-rotate-busy-XXXXXX"; CHECK(mkdtemp(root));
+    char path[sizeof ((journal_base *)0)->captured_path];
+    int result=0, guard=-1, report[2]={-1,-1}, resume[2]={-1,-1}; pid_t child=-1;
+#define B(x) do { if(!(x)) { fprintf(stderr,"journal_test:%d FAIL %s\n",__LINE__,#x); result=1; goto done; } } while(0)
+    B(snprintf(path,sizeof path,"%s/session",root)>0);
+    guard=open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC); B(guard>=0 && flock(guard,LOCK_EX|LOCK_NB)==0);
+    B(pipe(report)==0 && pipe(resume)==0);
+    child=fork(); B(child>=0);
+    if(!child) {
+        close(guard); close(report[0]); close(resume[1]);
+        _exit(rotate_busy_child(path,report[1],resume[0]));
+    }
+    close(report[1]); report[1]=-1; close(resume[0]); resume[0]=-1;
+    int rc; B(read(report[0],&rc,sizeof rc)==(ssize_t)sizeof rc && rc==JOURNAL_OK);
+    struct pollfd ready={.fd=report[0],.events=POLLIN};
+    int polled;
+    do { polled=poll(&ready,1,(int)(JOURNAL_DEFAULT_SYNC_NS/UINT64_C(1000000))); } while(polled<0 && errno==EINTR);
+    if(polled==0) {
+        fprintf(stderr,"journal_test: rotation waited for the held directory guard beyond JOURNAL_DEFAULT_SYNC_NS (E watchdog)\n");
+        result=1; goto done;
+    }
+    B(polled>0 && read(report[0],&rc,sizeof rc)==(ssize_t)sizeof rc && rc==JOURNAL_BUSY);
+    B(close(guard)==0); guard=-1; rc=JOURNAL_OK;
+    B(write(resume[1],&rc,sizeof rc)==(ssize_t)sizeof rc);
+    int status; B(waitpid(child,&status,0)==child); child=-1;
+    B(WIFEXITED(status) && WEXITSTATUS(status)==0);
+done:
+    if(child>0) { (void)kill(child,SIGKILL); (void)waitpid(child,NULL,0); }
+    if(guard>=0) close(guard);
+    for(size_t i=0;i<sizeof report/sizeof *report;i++) {
+        if(report[i]>=0) close(report[i]);
+        if(resume[i]>=0) close(resume[i]);
+    }
+    (void)unlink(path); if(rmdir(root)) result=1;
+#undef B
+    if(!result) puts("journal_test: directory guard contention returns BUSY; open journal accepts edits and rotation retries after release");
+    return result;
+}
+
 
 static int open_options_test(void)
 {
@@ -1970,6 +2046,7 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--schema-parser")) return schema_test(true);
         if(!strcmp(argv[1],"--base-read")) return base_read_test();
         if(!strcmp(argv[1],"--rotate-name")) return rotate_name_test();
+        if(!strcmp(argv[1],"--rotate-busy")) return rotate_busy_test();
         if(!strcmp(argv[1],"--retry")) return retry_test();
         if(!strcmp(argv[1],"--barriers")) return barriers_test();
         if(!strcmp(argv[1],"--save")) return save_test();
@@ -1986,7 +2063,7 @@ int main(int argc, char **argv)
     CHECK(insert_credit_test()==0 && insert_steps_test()==0 && crc_wire_test()==0 && overlapping_saves_test()==0 && session_values_test()==0);
     CHECK(writeback_loss_test()==0 && retention_metadata_test()==0 && retention_channel_test()==0 && pad_busy_test()==0 && long_base_retention_test()==0);
     CHECK(page_cache_test()==0 && append_failure_test()==0 && append_gap_test()==0);
-    CHECK(open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
+    CHECK(rotate_busy_test()==0 && open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
     CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && file_mailbox_test()==0 && worker_test()==0 &&
           cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0 &&

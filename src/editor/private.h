@@ -365,6 +365,7 @@ struct editor {
     bool repair_line_valid;
     bool focused, visible, blinking, quit;
     bool journal_waiting;
+    uint64_t checkpoint_retry_ns; /* edit-dr9: busy close retries on the journal tick */
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
     uint32_t tab_rows, map_cols;
     tabs_strip strip;

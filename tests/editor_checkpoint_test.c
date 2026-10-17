@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
@@ -48,6 +49,42 @@ static int cleanup(const char *root)
         T(unlinkat(dirfd(directory), entry->d_name, 0) == 0);
     T(closedir(directory) == 0 && rmdir(root) == 0);
     return 0;
+}
+/* edit-dr9 (P): one buffer/worker, literal text, and schema path capacity.
+ * Inject the existing FULL checkpoint-fallback condition after a durable
+ * baseline. A directory inventory must defer close without latching fail().
+ * (E) Retry watchdog is the existing EDITOR_IDLE_NS, as in settle(). */
+static int busy_close_checkpoint(void)
+{
+    char root[]="build/editor-checkpoint-busy-XXXXXX"; T(mkdtemp(root));
+    char log[IPC_PATH_CAP]; editor *e=NULL; int guard=-1, result=0;
+#define C(x) do { if(!(x)) { fprintf(stderr,"editor_checkpoint_test:%d FAIL %s\n",__LINE__,#x); result=1; goto done; } } while(0)
+    C(snprintf(log,sizeof log,"%s/session",root)>0);
+    render_backend backend={0}; C(render_null_backend(&backend)==0);
+    editor_config config={.journal_path=log,.initial=(const uint8_t *)"checkpoint",.initial_len=sizeof "checkpoint"-1u};
+    C(editor_open(&e,&config,&backend)==0); C(settle(e)==0 && editor_flush(e)==0);
+    journal *original=e->journal; struct stat before,after; C(stat(log,&before)==0);
+    guard=open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC); C(guard>=0 && flock(guard,LOCK_EX|LOCK_NB)==0);
+    e->stats.journal_error=JOURNAL_FULL;
+    plat_event close_event={.kind=PLAT_EV_CLOSE}; C(editor_inject(e,&close_event)==0);
+    int rc=editor_step(e,0); C(rc==EDITOR_MORE || rc==EDITOR_OK);
+    C(e->quit && !e->error && e->journal==original && e->stats.journal_error==JOURNAL_FULL);
+    C(stat(log,&after)==0 && after.st_ino==before.st_ino && after.st_size==before.st_size);
+    uint8_t text[sizeof "checkpoint"-1u];
+    C(editor_read(e,0,text,sizeof text)==0 && !memcmp(text,"checkpoint",sizeof text));
+    rc=editor_step(e,0); C(rc==EDITOR_MORE || rc==EDITOR_OK); C(!e->error);
+    C(close(guard)==0); guard=-1;
+    uint64_t limit=trace_now_ns()+EDITOR_IDLE_NS;
+    do { rc=editor_step(e,0); C(trace_now_ns()<limit); sched_yield(); } while(rc==EDITOR_OK || rc==EDITOR_MORE);
+    C(rc==EDITOR_CLOSED && !e->error && !e->stats.journal_error && e->journal==original);
+    C(stat(log,&after)==0 && after.st_ino!=before.st_ino);
+done:
+    if(guard>=0) close(guard);
+    if(e) editor_close(e);
+    if(cleanup(root)) result=1;
+#undef C
+    if(!result) puts("editor_checkpoint_test: directory inventory defers close checkpoint; current text and open journal survive until retry");
+    return result;
 }
 typedef struct checkpoint_shape { uint64_t id; bool base, target, view, replacement; } checkpoint_shape;
 static int inspect(void *ctx, const journal_record *r)
@@ -826,6 +863,7 @@ int main(int argc, char **argv)
     char made[] = "build/editor-28u-xdg-XXXXXX"; T(mkdtemp(made));
     char xdg[IPC_PATH_CAP]; T(realpath(made, xdg)); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
     int failed = 0;
+    if (wanted("busy") && busy_close_checkpoint()) failed++;
     if (wanted("pending") && pending_checkpoint(false)) failed++;
     if (wanted("pending") && pending_checkpoint(true)) failed++;
     if (wanted("empty") && adopted_empty_checkpoint()) failed++;
