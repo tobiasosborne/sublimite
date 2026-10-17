@@ -3924,6 +3924,95 @@ static int pointer_autoscroll_contract(bool wrap)
     T(edit_malloc_guard_end()==0);
     editor_close(e); puts("edit-48u drag autoscroll passed"); return 0;
 }
+/* edit-ywd (P): geometry = query plus the existing replace panel's field
+ * and hints rows, one text row, one tab row. Width fits the longest expected
+ * label + gap + chord, plus the existing minimap. Fixture offsets are sizeof
+ * prefixes; zero is no allocation/no selection/first index. */
+static bool palette_grid_text(editor *e, uint32_t row, size_t column, const char *text)
+{
+    const render_grid *grid = editor_grid(e);
+    for (size_t i = 0; text[i]; i++) {
+        if (column >= grid->dims.cols || row >= grid->dims.rows) return false;
+        const render_cell *cell = &grid->cells[(size_t)row * grid->dims.cols + column++];
+        if (text[i] == ' ' && cell->atlas_slot == RENDER_NO_SLOT) continue;
+        if (cell->atlas_slot != e->find_ascii[(uint8_t)text[i] - (uint8_t)' ']) return false;
+    }
+    return true;
+}
+static int palette_contract(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    const char initial[] = "palette buffer";
+    editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
+        .cols = sizeof "Save As Ctrl+Shift+S" - 1u + 8u,
+        .rows = 1u + 1u + 3u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint32_t text_rows = e->v.config.rows;
+    edit_malloc_guard_begin();
+    T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(e->panel_rows == 3u); /* (P) existing replace/find-in-files panel rows */
+    uint32_t first = e->grid.dims.rows - e->panel_rows;
+    T(palette_grid_text(e, first, 0, "Command: "));
+    T(palette_grid_text(e, first + 1u, 0, "Left"));
+    T(palette_grid_text(e, first + 2u, 0, "Right"));
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(palette_grid_text(e, first + 1u, 0, "Right"));
+    T(palette_grid_text(e, first + 2u, 0, "Up"));
+    T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
+    T(press(e, key('s', 0, "sav")) == 0);
+    T(palette_grid_text(e, first, 0, "Command: sav"));
+    T(palette_grid_text(e, first + 1u, 0, "Save"));
+    T(palette_grid_text(e, first + 2u, 0, "Save As"));
+    T(palette_grid_text(e, first + 1u, e->grid.dims.cols - (sizeof "Ctrl+S" - 1u), "Ctrl+S"));
+    T(palette_grid_text(e, first + 2u, e->grid.dims.cols - (sizeof "Ctrl+Shift+S" - 1u), "Ctrl+Shift+S"));
+    T(expect(e, initial, 0) == 0);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(!e->panel_rows && e->v.config.rows == text_rows);
+    T(palette_grid_text(e, e->tab_rows, e->lay.gw, initial));
+    T(edit_malloc_guard_end() == 0);
+    T(press(e, key('s', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
+    editor_goto chord = e->go;
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_visible);
+    T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(!e->find_visible);
+    T(press(e, key('s', 0, "sav")) == 0);
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(!e->panel_rows && e->go.active && e->go.kind == chord.kind);
+    T(e->go.owner == chord.owner && e->go.generation == chord.generation &&
+      e->go.length == chord.length && e->go.cursor == chord.cursor && e->go.selected == chord.selected);
+    T(!memcmp(e->go.digits, chord.digits, chord.length));
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    /* Owner mutation bypasses key capture (as clipboard/worker edits can). */
+    undo_state state = {0}; const uint8_t inserted[] = "!";
+    T(editor_find_insert(e, e->undo, 0, inserted, sizeof inserted - 1u,
+        trace_now_ns(), &state, &state).changed);
+    T(settle(e) == 0); T(!e->panel_rows);
+    /* (P) user overrides change the displayed chord and opening stroke. */
+    const char preferences[] = "[keymap]\ncommand_palette='Alt+p'\nsave='Alt+s'\nsave_as='Alt+w'\n";
+    T(config_parse((const uint8_t *)preferences, sizeof preferences - 1u, &e->preferences, NULL) == CONFIG_OK);
+    T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(!e->panel_rows);
+    T(press(e, key('p', PLAT_MOD_ALT, NULL)) == 0);
+    T(e->panel_rows);
+    T(press(e, key('s', 0, "savx")) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    T(palette_grid_text(e, first, 0, "Command: sav"));
+    T(palette_grid_text(e, first + 1u, e->grid.dims.cols - (sizeof "Alt+S" - 1u), "Alt+S"));
+    T(palette_grid_text(e, first + 2u, e->grid.dims.cols - (sizeof "Alt+W" - 1u), "Alt+W"));
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+    T(press(e, focus) == 0); T(!e->panel_rows);
+    editor_close(e);
+    puts("edit-ywd palette: paint/filter/chords, shared Save As, Escape/mutation/focus and malloc guard passed");
+    return 0;
+}
 static int findpanel_escape_contract(void)
 {
     render_backend backend={0}; editor *e=NULL;
@@ -5054,6 +5143,7 @@ int main(int argc, char **argv)
         /* (P) argv[1] is the selector after the program name. */
         if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
         if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
+        if (!strcmp(argv[1], "--ywd-palette")) return palette_contract();
         if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
         if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
         if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
@@ -5155,6 +5245,7 @@ int main(int argc, char **argv)
     T(duplicate_path_contract() == 0);
     T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);
+    T(palette_contract() == 0);
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);

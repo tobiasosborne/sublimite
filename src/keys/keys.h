@@ -157,4 +157,17 @@ keys_result keys_lookup_overrides(keys_state *, uint32_t, uint16_t,
 /* Normalize a config stroke using the input lookup's exact rules. */
 bool keys_binding_normalize(keys_binding *);
 
+/* (P) a supported chord has at most a prefix and final stroke. Each reserves
+ * all modifier names and a uint32 keysym's hexadecimal fallback, plus the
+ * separating space/NUL. The built-in named keys fit that same bound. */
+#define KEYS_CHORD_FORMAT_CAP sizeof("Ctrl+Alt+Shift+Super+0xffffffff Ctrl+Alt+Shift+Super+0xffffffff")
+/* No allocation. Format a default/config binding as display text; zero on
+ * success, nonzero on invalid arguments or insufficient destination space. */
+int keys_chord_format(const keys_binding *, char *, size_t);
+/* Find a reachable live stroke for the same action/flags/value. Overrides
+ * shadow both strokes and actions, including a chord's prefix. Returns NULL
+ * when unbound. Prefers normal keyboard keys, then standalone strokes, then
+ * table order; returned storage belongs to defaults/overrides. */
+const keys_binding *keys_binding_for_command(const keys_binding *, const keys_binding *, size_t);
+
 #endif

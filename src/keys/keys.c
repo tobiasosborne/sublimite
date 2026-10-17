@@ -1,5 +1,7 @@
 #include "keys/keys.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
+#include <xkbcommon/xkbcommon.h>
+#include <string.h>
 /* (P) implemented find actions and boolean option toggles take no numeric
  * arguments or capability flags, hence zero flags/value in their rows. */
 
@@ -153,7 +155,7 @@ static const keys_binding defaults[] = {
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_l, KEYS_ACTION_SPLIT_SELECTION_LINES, {KEYS_ARG_UNIMPLEMENTED, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+l */
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_m, KEYS_ACTION_SELECT_BRACKETS, {0, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+m */
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_n, KEYS_ACTION_NEW_WINDOW, {KEYS_ARG_UNIMPLEMENTED, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+n */
-    {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_p, KEYS_ACTION_COMMAND_PALETTE, {KEYS_ARG_UNIMPLEMENTED, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+p */
+    {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_p, KEYS_ACTION_COMMAND_PALETTE, {0, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+p; (P) no payload */
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_r, KEYS_ACTION_GOTO_PROJECT_SYMBOL, {KEYS_ARG_UNIMPLEMENTED, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+r */
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_s, KEYS_ACTION_SAVE_AS, {0, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+s */
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_t, KEYS_ACTION_REOPEN_FILE, {0, 0, KEYS_CHORD_NONE}}, /* ctrl+shift+t */
@@ -391,4 +393,85 @@ keys_result keys_lookup(keys_state *state, uint32_t keysym, uint16_t modifiers,
                         const keys_binding **out)
 {
     return keys_lookup_overrides(state,keysym,modifiers,NULL,0,out);
+}
+
+static const keys_binding *prefix_binding(uint8_t chord)
+{
+    for (size_t i = 0; i < sizeof defaults / sizeof defaults[0]; i++)
+        if (defaults[i].action == KEYS_ACTION_CHORD && defaults[i].args.value == chord) return &defaults[i];
+    return NULL;
+}
+static bool reachable(const keys_binding *b, const keys_binding *overrides, size_t count)
+{
+    keys_state state = {0}; const keys_binding *out = NULL;
+    if (b->args.chord) {
+        const keys_binding *prefix = prefix_binding(b->args.chord);
+        if (!prefix || keys_lookup_overrides(&state, prefix->keysym, prefix->modifiers,
+            overrides, count, &out) != KEYS_PREFIX || out != prefix) return false;
+    }
+    return keys_lookup_overrides(&state, b->keysym, b->modifiers, overrides, count, &out) == KEYS_MATCH && out == b;
+}
+static bool preferred(const keys_binding *candidate, const keys_binding *previous)
+{
+    if (!previous) return true;
+    /* (P) standard XKB keyboard symbols end at Delete; XF86 device keys have
+     * a separate high namespace. Prefer the keyboard chord users can type. */
+    bool device = candidate->keysym > XKB_KEY_Delete, old_device = previous->keysym > XKB_KEY_Delete;
+    if (device != old_device) return !device;
+    return !candidate->args.chord && previous->args.chord;
+}
+const keys_binding *keys_binding_for_command(const keys_binding *command, const keys_binding *overrides, size_t count)
+{
+    if (!command || (!overrides && count)) return NULL;
+    const keys_binding *best = NULL;
+    /* (P) caller overrides precede defaults; each pass retains table order. */
+    const keys_binding *tables[] = {overrides, defaults};
+    const size_t lengths[] = {count, sizeof defaults / sizeof defaults[0]};
+    for (size_t pass = 0; pass < sizeof tables / sizeof tables[0]; pass++) {
+        const keys_binding *table = tables[pass];
+        size_t length = lengths[pass];
+        for (size_t i = 0; i < length; i++) {
+            const keys_binding *b = &table[i];
+            if (b->action != command->action || b->args.flags != command->args.flags ||
+                b->args.value != command->args.value || !preferred(b, best)) continue;
+            if (reachable(b, overrides, count)) best = b;
+        }
+    }
+    return best;
+}
+static int append_chord(char *out, size_t capacity, size_t *used, const char *text)
+{
+    size_t n = strlen(text);
+    if (n >= capacity - *used) return -1;
+    memcpy(out + *used, text, n + 1u); *used += n; return 0;
+}
+static int format_stroke(const keys_binding *b, char *out, size_t capacity, size_t *used)
+{
+    const uint16_t modifiers[] = {PLAT_MOD_CTRL, PLAT_MOD_ALT, PLAT_MOD_SHIFT, PLAT_MOD_SUPER};
+    const char *names[] = {"Ctrl+", "Alt+", "Shift+", "Super+"};
+    for (size_t i = 0; i < sizeof modifiers / sizeof modifiers[0]; i++)
+        if ((b->modifiers & modifiers[i]) && append_chord(out, capacity, used, names[i])) return -1;
+    char name[KEYS_CHORD_FORMAT_CAP];
+    if (b->keysym >= '!' && b->keysym <= '~') {
+        name[0] = b->keysym >= XKB_KEY_a && b->keysym <= XKB_KEY_z ?
+            (char)(b->keysym - XKB_KEY_a + 'A') : (char)b->keysym;
+        name[1] = '\0';
+    } else if (b->keysym == XKB_KEY_Return || b->keysym == XKB_KEY_KP_Enter) strcpy(name, "Enter");
+    else if (b->keysym == XKB_KEY_Prior) strcpy(name, "PageUp");
+    else if (b->keysym == XKB_KEY_Next) strcpy(name, "PageDown");
+    else {
+        int n = xkb_keysym_get_name(b->keysym, name, sizeof name);
+        if (n <= 0 || (size_t)n >= sizeof name) return -1;
+    }
+    return append_chord(out, capacity, used, name);
+}
+int keys_chord_format(const keys_binding *binding, char *out, size_t capacity)
+{
+    if (!binding || !out || !capacity) return -1;
+    out[0] = '\0'; size_t used = 0;
+    if (binding->args.chord) {
+        const keys_binding *prefix = prefix_binding(binding->args.chord);
+        if (!prefix || format_stroke(prefix, out, capacity, &used) || append_chord(out, capacity, &used, " ")) return -1;
+    }
+    return format_stroke(binding, out, capacity, &used);
 }

@@ -129,7 +129,7 @@ static const expectation expected[] = {
     T("ctrl+Return", INSERT_LINE_AFTER,0,0),
     T("ctrl+shift+Return", INSERT_LINE_BEFORE,0,0),
     T("ctrl+p", GOTO_FILE,U,0),
-    T("ctrl+shift+p", COMMAND_PALETTE,U,0),
+    T("ctrl+shift+p", COMMAND_PALETTE,0,0), /* (P) palette needs no argument */
     T("ctrl+alt+p", SELECT_WORKSPACE,U,0),
     T("ctrl+r", GOTO_SYMBOL,U,0),
     T("ctrl+g", GOTO_LINE,0,0),

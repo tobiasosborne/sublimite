@@ -148,9 +148,13 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         cells * sizeof(editor_hit) + 2 * cells * sizeof(render_cell) + 3 * words * sizeof(uint64_t) +
         reserved_rows * (2 * sizeof(layout_wrap_row) + sizeof(indent_range) + 64) +
         e->buffer_capacity * sizeof(editor_buffer *) + info.state_size + info.state_align +
+        sizeof(palette_state) + _Alignof(palette_state) + /* (P) action-table rows plus arena alignment */
         (may_fallback ? fallback.info.state_size + fallback.info.state_align : 0) +
         font_glyphs * words * sizeof(uint64_t) + 2u * 1024u * 1024u;
     rc = edit_arena_init(&e->arena, reserve); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    e->palette = edit_arena_alloc(&e->arena, sizeof *e->palette, _Alignof(palette_state));
+    if (!e->palette) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    palette_init(e->palette);
     rc = editor_hl_init(e, cells); if (rc) goto fail;
     rc = editor_clip_init(e); if (rc) goto fail;
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);

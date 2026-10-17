@@ -14,6 +14,7 @@
 #include "indent/indent.h"
 #include "minimap/minimap.h"
 #include "findui/findui.h"
+#include "palette/palette.h"
 #include "fif/fif.h"
 #include "editor/large_private.h"
 #include "editor/runtime.h"
@@ -23,6 +24,9 @@
 #define EDITOR_STAGE_BYTES (512u * 1024u)
 #define EDITOR_STAGE_OPS (2u * EDITOR_INPUT_CAP + 8u)
 #define EDITOR_PIECE_BINS (sizeof(size_t) * 8u)
+/* (P) existing expanded find panel: query, extra field, hints. Palette reuses
+ * its rows with the query first and actions in all remaining rows. */
+#define EDITOR_FIND_PANEL_ROWS (1u + 1u + 1u)
 typedef struct editor_piece_storage {
     edit_arena *arena;
     pthread_mutex_t mutex;
@@ -256,6 +260,9 @@ struct editor {
     bool preferences_font_fallbacks_override; /* CLI or env chain wins over the config key */
     int preferences_watchfd;
     findui_panel find;
+    palette_state *palette;
+    bool palette_open;
+    uint64_t palette_owner, palette_generation, palette_revision;
     uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
     uint32_t panel_rows;
     int find_direction, find_error, find_replace_request;
@@ -534,6 +541,12 @@ void editor_records_free(editor_records *c);
 int editor_resize_now(editor *e, uint32_t width, uint32_t height);
 bool editor_event_control(const editor *e, const plat_event *ev);
 int editor_handle_key(editor *e, const plat_event *ev);
+int editor_dispatch_action(editor *, const plat_event *, const keys_binding *, keys_result);
+int editor_palette_show(editor *);
+int editor_palette_close(editor *);
+int editor_palette_sync(editor *);
+int editor_palette_key(editor *, const plat_event *);
+int editor_palette_paint(editor *);
 int editor_handle_wheel(editor *e, const plat_event *ev);
 int editor_scroll_init(editor *e, editor_buffer *b);
 int editor_scroll_retire(editor_buffer *b);

@@ -488,7 +488,8 @@ int editor_text_geometry(editor *e)
     /* P: query row; replacement mode adds its field and hints row. Recompute
      * the desired size, since the last surface may have clipped the panel. */
     /* edit-n95: find in files adds the Where field and its hints row. */
-    e->panel_rows=e->find_visible ? (findui_get_state(&e->find).replace_mode || e->fif.mode ? 3u : 1u) : 0u;
+    e->panel_rows=e->palette_open ? EDITOR_FIND_PANEL_ROWS : e->find_visible ?
+        (findui_get_state(&e->find).replace_mode || e->fif.mode ? EDITOR_FIND_PANEL_ROWS : 1u) : 0u;
     if (e->panel_rows>=available) e->panel_rows=available>1 ? available-1 : 0;
     e->text_grid.dims.rows-=e->panel_rows;
     e->map_grid.dims.rows = (e->text_grid.dims.rows * dims.cell_h + 1u) / 2u;
@@ -528,6 +529,7 @@ static int nonkey(editor *e, const plat_event *ev)
     }
     if (ev->kind == PLAT_EV_FOCUS) {
         e->focused = ev->focused; undo_break_burst(e->undo);
+        if (!ev->focused) { int rc = editor_palette_close(e); if (rc) return rc; }
         if (ev->focused && e->buffer->file) {
             (void)file_check(e->buffer->file, NULL);
             int rc = editor_check_sources(e); if (rc) return rc;
@@ -717,6 +719,7 @@ int editor_step(editor *e, int timeout_ms)
     /* edit-601: restore failures are notices (restore.c restore_fail); a
      * nonzero return is only a failed reactivation of the editor itself. */
     if (!rc) rc = editor_restore_service(e);
+    if (!rc) rc = editor_palette_sync(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e, timeout_ms);
     if (rc) return fail(e, rc);

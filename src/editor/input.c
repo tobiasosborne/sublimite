@@ -64,6 +64,9 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
         e->buffer->index_dirty = true;
     }
     int sr = editor_scroll_edit(e, off, old, add, old_nl, new_nl); if (sr) return sr;
+    /* The edit first restores/transforms scroll_display. Close afterwards so
+     * the geometry resize survives that restoration into the next frame. */
+    int palette_rc = editor_palette_close(e); if (palette_rc) return palette_rc;
     int rc = editor_begin_frame(e); if (rc) return rc;
     if (!e->lay.src || e->full_pending) { e->full_pending = true; return 0; }
     rc = layout_edit(&e->lay, off, old, add, old_nl, new_nl);
@@ -969,6 +972,7 @@ static int large_doc_end(editor *e, bool extend)
 }
 int editor_handle_key(editor *e, const plat_event *ev)
 {
+    if (e->palette_open) return editor_palette_key(e, ev);
     /* edit-n95: Escape cancels a running find in files first; the partial
      * results stay. With no search running Escape keeps its panel meaning. */
     if (!e->go.active && ev->press && ev->keysym == XKB_KEY_Escape && editor_fif_cancel(e)) return 0;
@@ -995,6 +999,11 @@ int editor_handle_key(editor *e, const plat_event *ev)
     }
     const keys_binding *binding = NULL;
     keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    return editor_dispatch_action(e, ev, binding, result);
+}
+int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *binding, keys_result result)
+{
+    if (binding && binding->action == KEYS_ACTION_COMMAND_PALETTE) return editor_palette_show(e);
     /* edit-o20: file/exit/scroll commands bypass find-field consumption;
      * edit-x8i: configured find actions dispatch from the same lookup. */
     bool common = binding && (binding->action == KEYS_ACTION_NEW_FILE || binding->action == KEYS_ACTION_OPEN_FILE ||
