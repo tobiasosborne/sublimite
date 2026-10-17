@@ -1002,8 +1002,42 @@ static void t_cluster_step(void)
     }
 }
 
+/* edit-ptn: utf8_break_certain is sound (a 1 means a break before y in every
+ * left context of length 0..3 over this alphabet, by utf8_grapheme_next) and
+ * not vacuous (the pairs the view relies on are certain). */
+static size_t put_unit(uint8_t *p, uint32_t cp)
+{
+    if (cp == 0xFFFFFFFFu) { p[0] = 0xFF; return 1; }
+    return utf8_encode(cp, p);
+}
+static void t_break_certain(void)
+{
+    static const uint32_t al[] = { 'a', '\r', '\n', 0x01, 0x0301, 0x200D, 0x0903, 0x0600, 0x1F1E6,
+        0x1100, 0x1161, 0x11A8, 0xAC00, 0xAC01, 0x1F600, 0x0915, 0x094D, 0x6F22, 0xFFFFFFFFu };
+    size_t k = NELEM(al), contexts = 1 + k + k * k + k * k * k;
+    for (size_t xi = 0; xi < k; xi++) for (size_t yi = 0; yi < k; yi++) {
+        uint8_t xb[4], yb[4]; size_t xl = put_unit(xb, al[xi]), yl = put_unit(yb, al[yi]);
+        if (!utf8_break_certain(utf8_decode(xb, xl), utf8_decode(yb, yl))) continue;
+        for (size_t c = 0; c < contexts; c++) {
+            uint8_t buf[24]; size_t n = 0, code = c, len = c == 0 ? 0 : c <= k ? 1 : c <= k + k * k ? 2 : 3;
+            code -= len == 0 ? 0 : len == 1 ? 1 : len == 2 ? 1 + k : 1 + k + k * k;
+            for (size_t i = 0; i < len; i++) { n += put_unit(buf + n, al[code % k]); code /= k; }
+            memcpy(buf + n, xb, xl); n += xl; size_t at = n; memcpy(buf + n, yb, yl); n += yl;
+            size_t q = 0; while (q < at) q += utf8_grapheme_next(buf + q, n - q);
+            CHECK_BREAK(q == at);
+        }
+    }
+    uint8_t han[4], emoji[4], lv[4], lf = '\n', x = 'x';
+    utf8_encode(0x6F22, han); utf8_encode(0x1F600, emoji); utf8_encode(0xAC00, lv);
+    CHECK(utf8_break_certain(utf8_decode(han, 3), utf8_decode(han, 3)));
+    CHECK(utf8_break_certain(utf8_decode(han, 3), utf8_decode(&x, 1)));
+    CHECK(utf8_break_certain(utf8_decode(emoji, 4), utf8_decode(emoji, 4)));
+    CHECK(utf8_break_certain(utf8_decode(lv, 3), utf8_decode(lv, 3)));
+    CHECK(utf8_break_certain(utf8_decode(&lf, 1), utf8_decode(han, 3)));
+}
 int main(void)
 {
+    t_break_certain();
     for (int i = 0; i < PLACE_SLOTS; i++)
         tail4[i] = malloc(TAIL);
     t_table_facts();

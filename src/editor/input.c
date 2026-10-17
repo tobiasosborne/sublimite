@@ -1183,9 +1183,12 @@ int editor_handle_key(editor *e, const plat_event *ev)
     view_change c;
     editor_seed_view_lines(e);
     bool extend = moving && binding && (binding->args.flags & KEYS_ARG_EXTEND);
-    bool relative = moving && !e->v.state.wrap && e->buffer->lg.lazy && !e->buffer->lg.lines_exact &&
+    /* edit-ptn: deletes' motions and Home/End/word/select-line keys too;
+     * their line metadata would otherwise count LFs from byte 0. */
+    bool relative = (moving || back || del) && relative_repair(e) &&
         (move == VIEW_LEFT || move == VIEW_RIGHT || move == VIEW_UP || move == VIEW_DOWN ||
-         move == VIEW_PAGE_UP || move == VIEW_PAGE_DOWN);
+         move == VIEW_PAGE_UP || move == VIEW_PAGE_DOWN || move == VIEW_HOME || move == VIEW_END ||
+         move == VIEW_WORD_LEFT || move == VIEW_WORD_RIGHT || move == VIEW_SELECT_LINE);
     rc = relative ? view_relative_command(&e->v, move, extend, &c) :
         view_command(&e->v, move, extend, NULL, 0, &c);
     if (rc == VIEW_MORE) editor_scroll_mirror(e);
@@ -1334,7 +1337,9 @@ int editor_pointer(editor *e, const plat_event *ev)
             e->pointer_unit_pending=true; e->pointer_unit_initial=!shift;
             editor_seed_view_lines(e); e->action=EDITOR_ACTION_MOVE;
             view_change change;
-            int rc=view_command(&e->v,e->click_count==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE,false,NULL,0,&change);
+            view_key unit=e->click_count==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE;
+            int rc=relative_repair(e) ? view_relative_command(&e->v,unit,false,&change) :
+                view_command(&e->v,unit,false,NULL,0,&change); /* edit-ptn */
             if (rc==VIEW_MORE) return 0;
             if (rc) return rc;
             e->action=EDITOR_ACTION_NONE; pointer_unit_finish(e);
@@ -1344,7 +1349,9 @@ int editor_pointer(editor *e, const plat_event *ev)
         e->pointer_unit_pending=true; e->pointer_unit_initial=false;
         e->action=EDITOR_ACTION_MOVE; editor_seed_view_lines(e);
         view_change change;
-        int rc=view_command(&e->v,e->text_drag_mode==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE,false,NULL,0,&change);
+        view_key unit=e->text_drag_mode==2 ? VIEW_SELECT_WORD : VIEW_SELECT_LINE;
+        int rc=relative_repair(e) ? view_relative_command(&e->v,unit,false,&change) :
+            view_command(&e->v,unit,false,NULL,0,&change); /* edit-ptn */
         if (rc==VIEW_MORE) return 0;
         if (rc) return rc;
         e->action=EDITOR_ACTION_NONE; pointer_unit_finish(e);

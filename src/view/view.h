@@ -59,6 +59,11 @@ typedef struct view {
     piece_tree *tree;
     uint64_t scanned; /* bytes consumed/examined in most recent call <= bound */
     uint64_t line_scanned; /* cumulative bytes line_query counted; test probe, never reset */
+    /* edit-ptn test probe, never reset: bytes read to locate a boundary without
+     * line_query: near_seed windows, seeded repair/seek cluster scans and
+     * byte-relative LF walks. Follow/column scans are excluded. */
+    uint64_t seek_scanned;
+    bool seeking; /* private: the current scan counts toward line_scanned */
     bool busy, shift, edited, word_found;
     view_key key;
     unsigned phase, scan_mode;
@@ -96,6 +101,10 @@ typedef struct view {
     /* Byte-relative motion owns no logical ordinal; exact caches stay exact. */
     bool relative, relative_boundary;
     uint64_t relative_pos, relative_start, relative_rows;
+    /* edit-ptn: resumable seeded scans and byte-relative line metadata. */
+    unsigned seek_mode, seek_next, meta_stage;
+    uint64_t seek_from, seek_target, meta_lo, meta_hi, meta_end;
+    bool seek_walk;
 } view;
 
 void view_init(view *v, piece_tree *tree, const view_config *config);
@@ -121,7 +130,8 @@ void view_init(view *v, piece_tree *tree, const view_config *config);
 /* All APIs with a change output clear a nonnull output even on argument errors. */
 int view_command(view *v, view_key key, bool shift, const uint8_t *text,
                  size_t len, view_change *change);
-/* Unwrapped arrows/pages with an inexact external line count. Walk certified
+/* Unwrapped arrows/pages, and (edit-ptn) Home/End/word left-right/select
+ * word/select line, with an inexact external line count. Walk certified
  * LF boundaries locally, preserving exact grapheme columns and selection.
  * Leaves viewport ordinals/bytes to the host's resident scroll resolver.
  * Same scan/deadline/continuation contract; never writes exact line caches.

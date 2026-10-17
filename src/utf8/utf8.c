@@ -274,6 +274,32 @@ static int safe_start(const uint8_t *base, size_t q, size_t end)
     return g == G_LF && (q == 0 || base[q - 1] != '\r');
 }
 
+int utf8_break_certain(utf8_step x, utf8_step y)
+{
+    if (!x.valid || !y.valid)
+        return 1;                                   /* invalid: Control (GB4, GB5) */
+    enum gcb a = gcb_of(x.cp), b = gcb_of(y.cp);
+    if (a == G_CR)
+        return b != G_LF;                           /* GB3, GB4 */
+    if (a == G_LF || a == G_CONTROL || b == G_CR || b == G_LF || b == G_CONTROL)
+        return 1;                                   /* GB4, GB5 */
+    if (b == G_EXTEND || b == G_ZWJ || b == G_SPACING || a == G_PREPEND)
+        return 0;                                   /* GB9, GB9a, GB9b */
+    if (a == G_L)
+        return !(b == G_L || b == G_V || b == G_LV || b == G_LVT);  /* GB6 */
+    if (a == G_LV || a == G_V)
+        return !(b == G_V || b == G_T);             /* GB7 */
+    if (a == G_LVT || a == G_T)
+        return b != G_T;                            /* GB8 */
+    if (a == G_EXTEND || a == G_ZWJ)
+        return 0;                                   /* GB9c / GB11 depend on context */
+    if (a == G_RI)
+        return b != G_RI;                           /* GB12, GB13 depend on parity */
+    /* x is Other, ExtPict or SpacingMark: its join state carries no GB9c
+     * Linker/Extend, no pict_zwj and no RI parity (gstate_join), so GB999. */
+    return 1;
+}
+
 size_t utf8_grapheme_prev(const uint8_t *base, size_t off)
 {
     if (off == 0)

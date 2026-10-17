@@ -176,6 +176,14 @@ static inline void utf8_gprev_init(utf8_gprev *s) { memset(s, 0, sizeof *s); }
  * off and s; base and off must not change). Reads only base[0..off-1]. */
 int utf8_grapheme_prev_step(utf8_gprev *s, const uint8_t *base, size_t off, size_t budget, size_t *start);
 
+/* edit-ptn: 1 iff UAX #29 puts a cluster break between units x and y (x
+ * directly before y) for EVERY left context of x, so forward segmentation may
+ * start at y with fresh state. Conservative: 0 when x is Prepend, Extend or
+ * ZWJ (GB9b, GB9c, GB11 context), x and y are both RI (GB12/13), the pair is
+ * CR LF, y is Extend/ZWJ/SpacingMark, or a Hangul GB6-8 pair. Invalid units
+ * act as Control (a break on both sides), as in utf8_grapheme_next. */
+int utf8_break_certain(utf8_step x, utf8_step y);
+
 /* Terminal cells of the first cluster of p[0..n), and its byte length
  * (== utf8_grapheme_next). Rule (layout uses this, not a sum of scalar widths):
  *   - invalid byte, CR, LF, Control (incl. tab): 1 (the renderer draws a

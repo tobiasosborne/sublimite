@@ -69,7 +69,8 @@ enum { S_NEXT=1, S_PREV, S_CEIL, S_BYTE_COL, S_COL_BYTE, S_HOME,
 enum { P_MOVE=1, P_VERTICAL_COL, P_VERTICAL_DEST, P_APPLY,
        P_FOLLOW, P_REPAIR, P_VERTICAL_BOUNDARY, P_NORMAL_CURSOR, P_NORMAL_ANCHOR, P_SETUP, P_FINISH, P_NORMAL_SETUP,
        P_VISUAL_COL, P_VISUAL_SETUP, P_BULK, P_BULK_PREPARE, P_BULK_COLUMN,
-       P_REL_START, P_REL_LEFT_START, P_REL_COL, P_REL_ROWS, P_REL_DEST, P_REL_FOLLOW };
+       P_REL_START, P_REL_LEFT_START, P_REL_COL, P_REL_ROWS, P_REL_DEST, P_REL_FOLLOW,
+       P_SEEK, P_REL_META };
 enum { C_WORD=0, C_SEPARATOR=1, C_SPACE=2, C_NEWLINE=3 };
 
 static uint64_t min_u64(uint64_t a, uint64_t b) { return a<b?a:b; }
@@ -199,23 +200,38 @@ static int line_end(view *v, uint64_t line, uint64_t *result)
     }
     *result=end; return VIEW_OK;
 }
-/* A pair of ASCII scalars (except CR/LF) proves a boundary before its
- * second byte even if a Prepend/Indic/RI/ZWJ context precedes the pair.
- * Otherwise replay from line start, resumably. */
-static uint64_t near_seed(view *v, uint64_t target)
+/* edit-ptn: the nearest boundary before x proven from the bytes alone: an
+ * adjacent unit pair whose break holds for every left context
+ * (utf8_break_certain: ASCII pairs, CJK, emoji, Hangul syllables, after LF).
+ * Window (P): the 512 bytes before x (the pre-existing near_seed window)
+ * plus up to 3 bytes after it, so a unit starting before x decodes whole.
+ * Units are decoded from the window's first non-continuation byte: UTF-8
+ * self-synchronizes, so the decomposition there equals the scanner's.
+ * Returns 1 with *seed < x, 0 for none, VIEW_MORE when this call's charged
+ * budget cannot hold the window (a fresh slice always can: 515 + 264 < 4096). */
+static int near_seed(view *v, uint64_t x, uint64_t *seed)
 {
-    if(target==0) return 0;
-    uint64_t from=target>512u?target-512u:0;
-    size_t n=(size_t)(target-from);
+    if(x==0) { *seed=0; return 1; }
+    uint64_t total=piece_len(v->tree), from=x>512u?x-512u:0, to=min_u64(total,x+3u);
+    size_t n=(size_t)(to-from);
+    if(v->scanned+n+264u>VIEW_SCAN_BOUND) return VIEW_MORE;
     uint8_t buf[VIEW_WINDOW];
-    if(n>=2 && v->scanned+n+264u<=VIEW_SCAN_BOUND && piece_read(v->tree,from,buf,n)==0) {
-        v->scanned+=n;
-        for(size_t i=n-1;i>0;--i) {
-            if(buf[i]<128 && buf[i-1]<128 && buf[i]!='\n' && buf[i]!='\r' &&
-               buf[i-1]!='\r') return from+i;
-        }
+    if(piece_read(v->tree,from,buf,n)!=0) return 0;
+    v->scanned+=n; v->seek_scanned+=n;
+    size_t i=0, limit=(size_t)(x-from);
+    while(i<limit && from && (buf[i]&0xC0u)==0x80u) ++i;
+    bool found=false; utf8_step prev={0,0,0}; bool have=false;
+    while(i<limit) {
+        utf8_step u=utf8_decode(buf+i,n-i);
+        if(have && utf8_break_certain(prev,u)) { *seed=from+i; found=true; }
+        prev=u; have=true; i+=u.len;
     }
-    return 0;
+    return found?1:0;
+}
+static void seek_begin(view *v, unsigned mode, uint64_t from, uint64_t target, unsigned next)
+{
+    v->seek_mode=mode; v->seek_from=from; v->seek_target=target; v->seek_next=next;
+    v->seek_walk=false; v->phase=P_SEEK;
 }
 /* Certify the start of a nearby ASCII class run, including whitespace to
  * its right. If Unicode or a window edge hides the start, use exact replay. */
@@ -247,7 +263,12 @@ static void scan_begin(view *v, unsigned mode, uint64_t start, uint64_t end, uin
     v->scan_mode=mode; v->scan_pos=start; v->cluster_start=start;
     v->scan_col=col; v->end=end; v->target=target; v->word_found=false;
     v->result=start; v->column=col; v->run_start=start; v->run_class=-1;
-    v->cluster_class=-1; v->win_len=0; utf8_cseg_init(&v->cluster);
+    v->cluster_class=-1; v->win_len=0; utf8_cseg_init(&v->cluster); v->seeking=false;
+}
+/* edit-ptn probe: a boundary repair/seek scan from a seed counts into seek_scanned. */
+static void seek_scan(view *v, unsigned mode, uint64_t start, uint64_t end, uint64_t target)
+{
+    scan_begin(v,mode,start,end,target,0); v->seeking=true;
 }
 static void seed_store(view *v, uint64_t byte, uint64_t col);
 static int column_begin(view *v, unsigned mode, uint64_t line, uint64_t target)
@@ -318,7 +339,7 @@ static int cluster_next(view *v, int *width)
         size_t budget=(size_t)min_u64(256u,VIEW_SCAN_BOUND-v->scanned-256u);
         int rc=utf8_cluster_step(&v->cluster,v->win+at,available,budget,
             v->win_pos+v->win_len==total,&used,width);
-        v->scan_pos+=used; v->scanned+=used;
+        v->scan_pos+=used; v->scanned+=used; if(v->seeking) v->seek_scanned+=used;
         if(rc==UTF8_G_END) { v->scanned+=4; return VIEW_OK; }
         if(rc==UTF8_G_BUDGET) continue;
         /* MORE consumed all complete units; refill at the unconsumed tail. */
@@ -398,7 +419,7 @@ static int relative_start(view *v, uint64_t *start)
         size_t n=(size_t)min_u64(sizeof bytes,v->relative_pos);
         uint64_t from=v->relative_pos-n;
         int rc=piece_read(v->tree,from,bytes,n); if(rc) return rc;
-        v->scanned+=n;
+        v->scanned+=n; v->seek_scanned+=n;
         for(size_t i=n;i;i--) if(bytes[i-1u]=='\n') {
             *start=from+i; return VIEW_OK;
         }
@@ -424,7 +445,7 @@ static int relative_rows(view *v)
                 if(exhausted(v)) return VIEW_MORE;
                 size_t n=(size_t)min_u64(sizeof bytes,total-v->relative_pos);
                 int rc=piece_read(v->tree,v->relative_pos,bytes,n); if(rc) return rc;
-                v->scanned+=n;
+                v->scanned+=n; v->seek_scanned+=n;
                 for(size_t i=0;i<n;i++) if(bytes[i]=='\n') {
                     v->relative_start=v->relative_pos+i+1u;
                     v->relative_pos=v->relative_start; found=true; break;
@@ -443,6 +464,56 @@ static int relative_rows(view *v)
         v->phase=P_REL_DEST;
     }
     return VIEW_OK;
+}
+/* First LF at or after relative_pos: *lf is its position, or total. */
+static int relative_next(view *v, uint64_t *lf, bool *found)
+{
+    uint64_t total=piece_len(v->tree);
+    uint8_t bytes[256]; /* (P) same query quantum as relative_start */
+    while(v->relative_pos<total) {
+        if(exhausted(v)) return VIEW_MORE;
+        size_t n=(size_t)min_u64(sizeof bytes,total-v->relative_pos);
+        int rc=piece_read(v->tree,v->relative_pos,bytes,n); if(rc) return rc;
+        v->scanned+=n; v->seek_scanned+=n;
+        for(size_t i=0;i<n;i++) if(bytes[i]=='\n') { *lf=v->relative_pos+i; *found=true; return VIEW_OK; }
+        v->relative_pos+=n;
+    }
+    *lf=total; *found=false; return VIEW_OK;
+}
+/* edit-ptn: line metadata for Home/End/word/select keys proven by LF walks
+ * around the cursor (byte-relative), equal to line_at/line_start/line_end. */
+static int relative_meta(view *v)
+{
+    uint64_t pos=0; bool found=false; int rc;
+    for(;;) switch(v->meta_stage) {
+    case 0: /* start of the cursor's line (lo's for SELECT_LINE) */
+        rc=relative_start(v,&pos); if(rc) return rc;
+        v->home_start=pos; v->meta_lo=pos;
+        if(v->key==VIEW_SELECT_LINE) { v->relative_pos=v->hi; v->meta_stage=1; }
+        else if(v->key==VIEW_END) { v->relative_pos=v->origin; v->meta_stage=3; }
+        else { v->phase=P_SETUP; return VIEW_OK; }
+        break;
+    case 1: /* start of hi's line; hi at a line start ends the previous one */
+        rc=relative_start(v,&pos); if(rc) return rc;
+        if(v->hi>v->lo && v->hi==pos) { v->meta_hi=v->hi; v->meta_stage=4; }
+        else { v->relative_pos=v->hi; v->meta_stage=2; }
+        break;
+    case 2: case 5: /* next line start after relative_pos */
+        rc=relative_next(v,&pos,&found); if(rc) return rc;
+        v->meta_hi=found?pos+1u:pos;
+        if(v->meta_stage==2) v->meta_stage=4;
+        else { v->phase=P_SETUP; return VIEW_OK; }
+        break;
+    case 3: /* END: the cursor line's end before LF/CRLF */
+        rc=relative_next(v,&pos,&found); if(rc) return rc;
+        if(found && pos>v->home_start && byte_at(v,pos-1u)=='\r') --pos;
+        v->meta_end=pos; v->phase=P_SETUP; return VIEW_OK;
+    case 4: /* whole lines already selected: extend by one more line */
+        if(v->hi>v->lo && v->lo==v->meta_lo && v->hi==v->meta_hi) { v->relative_pos=v->meta_hi; v->meta_stage=5; }
+        else { v->phase=P_SETUP; return VIEW_OK; }
+        break;
+    default: return VIEW_ERR_ARG;
+    }
 }
 static int follow_line(view *v)
 {
@@ -520,8 +591,7 @@ static int bulk_run(view *v, view_change *change)
     v->scanned+=count; v->bulk_remaining-=count; v->edited=true;
     seeds_edit(v,change->offset); v->shift=false; fallback(v);
     if(v->bulk_remaining==0) {
-        scan_begin(v,S_CEIL,near_seed(v,v->bulk_target),piece_len(v->tree),v->bulk_target,0);
-        v->phase=P_REPAIR;
+        seek_begin(v,S_CEIL,v->bulk_target,v->bulk_target,P_REPAIR);
     }
     /* One bounded capture per call; no decoding or metadata replay on top. */
     return VIEW_MORE;
@@ -540,8 +610,7 @@ static int remove_range(view *v, uint64_t lo, uint64_t hi, view_change *change)
     v->shift=false;
     /* Joining two clusters can destroy the old cursor boundary. */
     fallback(v);
-    scan_begin(v,S_CEIL,near_seed(v,lo),piece_len(v->tree),lo,0);
-    v->phase=P_REPAIR; return 0;
+    seek_begin(v,S_CEIL,lo,lo,P_REPAIR); return 0;
 }
 bool view_wrap_default(const char *path)
 {
@@ -625,11 +694,9 @@ static int visual_command(view *v,view_key key)
 }
 static bool deletion(view_key key) { return key>=VIEW_BACKSPACE && key<=VIEW_WORD_DELETE; }
 static bool vertical(view_key key) { return key>=VIEW_UP && key<=VIEW_PAGE_DOWN; }
-static void repair_begin(view *v, uint64_t target, bool before)
+static void repair_begin(view *v, uint64_t target, bool before, unsigned next)
 {
-    uint64_t total=piece_len(v->tree);
-    uint64_t start=(target==0 || target==total)?target:near_seed(v,target);
-    scan_begin(v,before?S_FLOOR:S_CEIL,start,total,target,0);
+    seek_begin(v,before?S_FLOOR:S_CEIL,target,target,next);
 }
 static int setup_command(view *v, view_change *change)
 {
@@ -638,7 +705,9 @@ static int setup_command(view *v, view_change *change)
     uint64_t start=0, end=total;
     bool metadata=vertical(key) || key==VIEW_HOME || key==VIEW_END || key==VIEW_SELECT_WORD ||
         key==VIEW_WORD_LEFT || key==VIEW_WORD_RIGHT || key==VIEW_WORD_BACKSPACE || key==VIEW_WORD_DELETE;
-    if(metadata && !(v->state.wrap && v->wrap_layout && (vertical(key) || key==VIEW_HOME || key==VIEW_END))) {
+    if(metadata && v->relative) {
+        start=v->home_start; if(key==VIEW_END) end=v->meta_end;
+    } else if(metadata && !(v->state.wrap && v->wrap_layout && (vertical(key) || key==VIEW_HOME || key==VIEW_END))) {
         int rc=line_at(v,cursor,&v->line); if(rc!=VIEW_OK) return rc;
         rc=line_start(v,v->line,&start); if(rc!=VIEW_OK) return rc;
         bool need_end=key==VIEW_END;
@@ -653,11 +722,11 @@ static int setup_command(view *v, view_change *change)
     } else if((key==VIEW_LEFT || key==VIEW_RIGHT) && cursor!=anchor && !shift) {
         v->result=key==VIEW_LEFT?v->lo:v->hi; v->phase=P_APPLY;
     } else if(key==VIEW_LEFT || key==VIEW_BACKSPACE) {
-        scan_begin(v,S_PREV,near_seed(v,cursor),total,cursor,0);
+        seek_begin(v,S_PREV,cursor,cursor,P_MOVE);
     } else if(key==VIEW_RIGHT || key==VIEW_DELETE) {
         scan_begin(v,S_NEXT,cursor,total,0,0);
     } else if(key==VIEW_WORD_LEFT || key==VIEW_WORD_BACKSPACE) {
-        if(cursor==start && cursor>0) scan_begin(v,S_PREV,near_seed(v,cursor-1),total,cursor,0);
+        if(cursor==start && cursor>0) seek_begin(v,S_PREV,cursor-1,cursor,P_MOVE);
         else scan_begin(v,S_WORD_LEFT,word_seed(v,cursor,start),cursor,cursor,0);
     } else if(key==VIEW_WORD_RIGHT || key==VIEW_WORD_DELETE) {
         if(cursor>=end) scan_begin(v,S_NEXT,cursor,total,0,0);
@@ -667,6 +736,8 @@ static int setup_command(view *v, view_change *change)
         v->result=key==VIEW_END?end:(key==VIEW_DOC_HOME?0:total); v->phase=P_APPLY;
     } else if(key==VIEW_SELECT_ALL) {
         v->state.selection.anchor=0; v->state.selection.cursor=total; v->phase=P_FINISH;
+    } else if(key==VIEW_SELECT_LINE && v->relative) {
+        v->state.selection.anchor=v->meta_lo; v->state.selection.cursor=v->meta_hi; v->phase=P_FINISH;
     } else if(key==VIEW_SELECT_LINE) {
         uint64_t a, b, lo, hi, bs;
         int rc=line_at(v,v->lo,&a); if(rc!=VIEW_OK) return rc;
@@ -737,6 +808,27 @@ static int advance(view *v, view_change *change)
             }
             continue;
         }
+        if(v->phase==P_SEEK) {
+            /* edit-ptn: never byte 0 unless it is the nearest proof. A target
+             * at EOF/BOF is itself a boundary; else the local window; else
+             * walk back to the previous LF (resumable, certified line start). */
+            uint64_t total=piece_len(v->tree), seed=0;
+            if(!v->seek_walk) {
+                if(v->seek_mode!=S_PREV && (v->seek_target==0 || v->seek_target==total)) seed=v->seek_target;
+                else {
+                    int found=near_seed(v,v->seek_from,&seed);
+                    if(found==VIEW_MORE) return VIEW_MORE;
+                    if(!found) { v->seek_walk=true; v->relative_pos=v->seek_from>512u?v->seek_from-512u:0; }
+                }
+            }
+            if(v->seek_walk) { int rc=relative_start(v,&seed); if(rc) return rc; }
+            seek_scan(v,v->seek_mode,seed,total,v->seek_target); v->phase=v->seek_next;
+            continue;
+        }
+        if(v->phase==P_REL_META) {
+            int rc=relative_meta(v); if(rc) return rc;
+            continue;
+        }
         if(v->phase==P_REL_ROWS) {
             int rc=relative_rows(v); if(rc) return rc;
             continue;
@@ -769,14 +861,14 @@ static int advance(view *v, view_change *change)
             uint64_t start;
             int rc=relative_start(v,&start); if(rc!=VIEW_OK) return rc;
             v->restore_state.first_byte=start; v->restore_state.approximate=true;
-            repair_begin(v,v->restore_state.selection.cursor,v->cursor_before); v->phase=P_NORMAL_CURSOR;
+            repair_begin(v,v->restore_state.selection.cursor,v->cursor_before,P_NORMAL_CURSOR);
             continue;
         }
         if(v->phase==P_NORMAL_SETUP) {
             int rc=line_at(v,min_u64(v->restore_state.first_byte,piece_len(v->tree)),&v->restore_state.first_line);
             if(rc!=VIEW_OK) return rc;
             rc=line_start(v,v->restore_state.first_line,&v->restore_state.first_byte); if(rc!=VIEW_OK) return rc;
-            repair_begin(v,v->restore_state.selection.cursor,v->cursor_before); v->phase=P_NORMAL_CURSOR;
+            repair_begin(v,v->restore_state.selection.cursor,v->cursor_before,P_NORMAL_CURSOR);
             continue;
         }
         if(v->phase==P_VISUAL_SETUP) {
@@ -803,8 +895,7 @@ static int advance(view *v, view_change *change)
             v->phase=P_VISUAL_SETUP;
         } else if(v->phase==P_NORMAL_CURSOR) {
             v->restore_state.selection.cursor=v->result;
-            repair_begin(v,v->restore_state.selection.anchor,v->anchor_before);
-            v->phase=P_NORMAL_ANCHOR;
+            repair_begin(v,v->restore_state.selection.anchor,v->anchor_before,P_NORMAL_ANCHOR);
         } else if(v->phase==P_NORMAL_ANCHOR) {
             v->restore_state.selection.anchor=v->result;
             v->state=v->restore_state;
@@ -952,13 +1043,15 @@ int view_continue(view *v, view_change *change)
 int view_relative_command(view *v, view_key key, bool shift, view_change *change)
 {
     if(change) *change=(view_change){0};
+    bool meta=key==VIEW_HOME || key==VIEW_END || key==VIEW_WORD_LEFT || key==VIEW_WORD_RIGHT ||
+        key==VIEW_SELECT_WORD || key==VIEW_SELECT_LINE;
     if(!v || !v->tree || !change || v->state.wrap ||
-       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT)) return VIEW_ERR_ARG;
+       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT || meta)) return VIEW_ERR_ARG;
     if(v->busy) return VIEW_ERR_BUSY;
     uint64_t cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
     if(cursor>piece_len(v->tree) || anchor>piece_len(v->tree)) return VIEW_ERR_ARG;
-    if(cursor==anchor && ((key==VIEW_LEFT && cursor==0) ||
-       (key==VIEW_RIGHT && cursor==piece_len(v->tree)))) {
+    if(cursor==anchor && (((key==VIEW_LEFT || key==VIEW_WORD_LEFT) && cursor==0) ||
+       ((key==VIEW_RIGHT || key==VIEW_WORD_RIGHT) && cursor==piece_len(v->tree)))) {
         v->scanned=0; v->relative=true; return VIEW_OK;
     }
     slice_begin(v); v->before_state=v->state;
@@ -971,6 +1064,10 @@ int view_relative_command(view *v, view_key key, bool shift, view_change *change
     v->state.visual_end=false;
     if(!vertical(key)) v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
     v->phase=P_REL_START;
+    if(meta) {
+        v->state.approximate=false; v->meta_stage=0;
+        v->relative_pos=key==VIEW_SELECT_LINE?v->lo:cursor; v->phase=P_REL_META;
+    }
     return complete_call(v,advance(v,change));
 }
 int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t len, view_change *change)
@@ -1031,7 +1128,7 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t 
             seeds_edit(v,lo);
         }
         v->shift=false; fallback(v);
-        scan_begin(v,S_CEIL,near_seed(v,lo+len),piece_len(v->tree),lo+len,0); v->phase=P_REPAIR;
+        seek_begin(v,S_CEIL,lo+len,lo+len,P_REPAIR);
     } else v->phase=P_SETUP;
     if(!v->busy) return VIEW_OK;
     return complete_call(v,advance(v,change));

@@ -1699,10 +1699,121 @@ static int dz0_key_at_end(bool wrap)
     T(r.line_bytes <= VIEW_SCAN_BOUND);
     return 0;
 }
+/* edit-ptn: the dz0 setup (mmp_fixture's sparse 1 GiB layout, tail warmed,
+ * bulk lane held, Ctrl+End) with the last 64 KiB (P: MMP_ROWS) rewritten.
+ * PTN_CJK: rows of 21 x U+6F22 (3 B each) + LF = 64 B (P), no ASCII pair near
+ * the cursor; Left, then one key: the repair seed must not fall back to byte 0.
+ * PTN_LONG_TOP: ASCII, the screen's top line is 5000 B (P: > VIEW_SCAN_BOUND)
+ * before two 64 B rows; Left, one key. PTN_KEYS: Q at EOF, then Home, End,
+ * Ctrl+Left. Probe: view.line_scanned + seek_scanned (line_query counts plus
+ * every other byte read to locate a boundary from a seed). Asserted bound VIEW_SCAN_BOUND (P: every line near the cursor is at
+ * most 64 B or the 5000 B top line, which is proven from its own start; see
+ * docs/decisions/edit-ptn.md for the general bound). Settles: tracked prints. */
+enum { PTN_CJK, PTN_LONG_TOP, PTN_KEYS };
+static int ptn_tail(const char *path, uint64_t size, int kind)
+{
+    static uint8_t tail[MMP_ROWS];
+    size_t n = sizeof tail;
+    for (size_t i = 0; i < n; i++) tail[i] = i % 64u == 63u ? '\n' : (uint8_t)('a' + i % 26u);
+    if (kind == PTN_CJK)
+        for (size_t i = 0; i + 64u <= n; i += 64u) for (size_t k = 0; k < 21u; k++) memcpy(tail + i + 3u * k, "\xe6\xbc\xa2", 3);
+    if (kind == PTN_LONG_TOP) {
+        memset(tail + n - 128u - 5001u, 'b', 5001u); tail[n - 129u] = '\n'; tail[n - 128u - 5002u] = '\n';
+    }
+    int fd = open(path, O_WRONLY); T(fd >= 0);
+    bool ok = pwrite(fd, tail, n, (off_t)(size - n)) == (ssize_t)n;
+    T(close(fd) == 0); T(ok); return 0;
+}
+static void ptn_stamp(char *power, size_t cap, double *load1)
+{
+    snprintf(power, cap, "?"); FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fgets(power, (int)cap, f)) power[strcspn(power, "\n")] = 0; fclose(f); }
+    *load1 = 0; f = fopen("/proc/loadavg", "r"); if (f) { if (fscanf(f, "%lf", load1) != 1) *load1 = 0; fclose(f); }
+}
+static int ptn_key(editor *e, mmp_tally *t, const char *name, uint32_t sym, uint16_t mods, char text, uint64_t *worst)
+{
+    bool bad = false; uint64_t before = e->v.line_scanned + e->v.seek_scanned;
+    t->max_key_ns = 0;
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = sym ? sym : (uint8_t)text, .mods = mods,
+        .utf8_len = (uint8_t)(sym ? 0u : 1u), .t0_ns = trace_now_ns()};
+    if (!sym) key.utf8[0] = (uint8_t)text;
+    T(editor_inject(e, &key) == 0);
+    t->keys = true; int rc = mmp_settle(e, t, &bad); t->keys = false;
+    uint64_t bytes = e->v.line_scanned + e->v.seek_scanned - before; if (bytes > *worst) *worst = bytes;
+    char power[32]; double load1; ptn_stamp(power, sizeof power, &load1);
+    printf("editor_large_test: edit-ptn key=%s probe_bytes=%llu bound=%u (P: VIEW_SCAN_BOUND) key_settle=%.3f ms (M) rc=%d overdue=%u power=\"%s\" load1=%.2f\n",
+        name, (unsigned long long)bytes, VIEW_SCAN_BOUND, (double)t->max_key_ns / 1e6, rc, t->overdue, power, load1);
+    T(fflush(stdout) == 0);
+    T(rc == 0); T(!bad); T(!editor_index_complete(e));
+    return 0;
+}
+static int ptn_body(const char *root, int kind, uint64_t *worst)
+{
+    char path[256], xdg[256];
+    T(snprintf(path, sizeof path, "%s/source", root) > 0); T(snprintf(xdg, sizeof xdg, "%s/xdg", root) > 0);
+    uint64_t size = MMP_GIB;
+    T(mmp_fixture(path, size) == 0); T(ptn_tail(path, size, kind) == 0);
+    {
+        static uint8_t warm[64u * 1024u]; /* as dz0_body: last two 1 MiB lines */
+        int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+        bool ok = true;
+        for (uint64_t at = size - 2u * FILE_PREFIX_MAX; ok && at < size; at += sizeof warm)
+            ok = pread(fd, warm, sizeof warm, (off_t)at) == (ssize_t)sizeof warm;
+        T(close(fd) == 0); T(ok);
+    }
+    T(mkdir(xdg, 0700) == 0); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = path, .cols = 32, .rows = 3, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK});
+    int rc = held.epoch ? 0 : 1;
+    mmp_tally t = {0}; bool bad = false;
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!rc && !atomic_load(&lane.running)) { if (editor_step(e, 0) < 0 || trace_now_ns() >= deadline) rc = 1; }
+    if (!rc) rc = mmp_settle(e, &t, &bad);
+    if (!rc && (editor_index_complete(e) || e->buffer->lg.lines_exact)) rc = 1;
+    if (!rc) rc = ptn_key(e, &t, "ctrl+end", XKB_KEY_End, PLAT_MOD_CTRL, 0, &(uint64_t){0});
+    if (!rc && editor_view(e).selection.cursor != size) rc = 1;
+    if (!rc && kind != PTN_KEYS) {
+        rc = ptn_key(e, &t, "left", XKB_KEY_Left, 0, 0, worst);
+        if (!rc) rc = ptn_key(e, &t, kind == PTN_CJK ? "x-in-cjk" : "x-under-long-top", 0, 0, 'x', worst);
+        uint8_t got = 0;
+        if (!rc && (editor_read(e, size - 1u, &got, 1) || got != 'x' || editor_view(e).selection.cursor != size)) rc = 1;
+    } else if (!rc) {
+        rc = ptn_key(e, &t, "Q-at-eof", 0, 0, 'Q', worst);
+        if (!rc) rc = ptn_key(e, &t, "home", XKB_KEY_Home, 0, 0, worst);
+        /* (P) the last row is 63 bytes + LF, then Q: Home lands on its start. */
+        if (!rc && editor_view(e).selection.cursor != size) rc = 1;
+        if (!rc) rc = ptn_key(e, &t, "end", XKB_KEY_End, 0, 0, worst);
+        if (!rc && editor_view(e).selection.cursor != size + 1u) rc = 1;
+        if (!rc) rc = ptn_key(e, &t, "ctrl+left", XKB_KEY_Left, PLAT_MOD_CTRL, 0, worst);
+        if (!rc && editor_view(e).selection.cursor != size) rc = 1;
+    }
+    atomic_store(&lane.release, true);
+    while (held.epoch && !work_handle_finished(&e->pool, held)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    editor_close(e);
+    return rc;
+}
+static int ptn_case(int kind)
+{
+    char root[] = "build/editor-large-ptn-XXXXXX"; T(mkdtemp(root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[256] = "";
+    if (saved) (void)snprintf(keep, sizeof keep, "%s", saved);
+    uint64_t worst = 0;
+    int rc = ptn_body(root, kind, &worst);
+    if (saved) (void)setenv("XDG_DATA_HOME", keep, 1); else (void)unsetenv("XDG_DATA_HOME");
+    int removed = mmp_remove_tree(root);
+    printf("editor_large_test: edit-ptn case=%d rc=%d worst_probe_bytes=%llu bound=%u\n", kind, rc, (unsigned long long)worst, VIEW_SCAN_BOUND);
+    T(fflush(stdout) == 0);
+    T(removed == 0); T(rc == 0); T(worst <= VIEW_SCAN_BOUND);
+    return 0;
+}
 int main(void)
 {
     if (getenv("EDIT_MMP_REPRO")) { trace_init(); (void)trace_thread_register(); return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL); }
     trace_init(); (void)trace_thread_register();
+    if (getenv("EDIT_PTN_REPRO")) return ptn_case(atoi(getenv("EDIT_PTN_REPRO")));
     if (getenv("EDIT_DZ0_REPRO")) return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
     if (getenv("EDIT_JF9_VIEW")) return relative_motion();
     T(relative_motion() == 0);
@@ -1754,6 +1865,9 @@ int main(void)
     T(typing_while_indexing(MMP_SMALL, true) == 0);
     T(dz0_key_at_end(false) == 0);
     T(dz0_key_at_end(true) == 0);
+    T(ptn_case(PTN_CJK) == 0);
+    T(ptn_case(PTN_LONG_TOP) == 0);
+    T(ptn_case(PTN_KEYS) == 0);
 xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
