@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <limits.h>
+#include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -664,7 +665,7 @@ static int install_failure(void)
  * private XDG_DATA_HOME holding one orphan session journal that is a real
  * whole-text (pre-edit-28u shape) checkpoint of a 1 GiB buffer (the brief's size, (P) 2^30 bytes; its source
  * is a sparse file, but every byte of it is read into the checkpoint, so the
- * journal itself is 1 GiB of written records) whose /tmp-corpus-like BASE has
+ * journal itself has 1 GiB of records, with zero payload pages sparse) whose /tmp-corpus-like BASE has
  * since changed, plus a 1 GiB set-aside copy of it. Launch must reach input
  * accepted and leave every pre-existing profile file as it was (no replay, no
  * new set-aside); its time is printed against the G4a warm p99 (tracked). (G) G4a, perf/01-perf-target.md
@@ -706,6 +707,33 @@ static void fm4_remove_tree(const char *root)
     }
     (void)rmdir(root);
 }
+/* (P) Zero payload pages are holes. Both journal write seams see a fresh
+ * checkpoint inode here; writing only nonzero page fragments preserves every
+ * wire byte while keeping the inherited GB whole-text fixture sparse. */
+static ssize_t fm4_sparse_write(void *ctx, int fd, const uint8_t *data, size_t size, uint64_t off)
+{
+    (void)ctx;
+    const uint8_t zero[JOURNAL_PAGE] = {0};
+    for (size_t done = 0; done < size;) {
+        size_t n = JOURNAL_PAGE - (size_t)((off + done) % JOURNAL_PAGE);
+        if (n > size - done) n = size - done;
+        if (memcmp(data + done, zero, n) && pwrite(fd, data + done, n, (off_t)(off + done)) != (ssize_t)n) return -1;
+        done += n;
+    }
+    return ftruncate(fd, (off_t)(off + size)) ? -1 : (ssize_t)size;
+}
+static int fm4_sparse_copy(int in, int out, off_t size)
+{
+    for (off_t at = 0; at < size;) {
+        off_t data = lseek(in, at, SEEK_DATA);
+        if (data < 0) { T(errno == ENXIO); break; }
+        off_t hole = lseek(in, data, SEEK_HOLE); T(hole > data);
+        off_t src = data, dst = data;
+        while (src < hole) T(copy_file_range(in, &src, out, &dst, (size_t)(hole - src), 0) > 0);
+        at = hole;
+    }
+    T(ftruncate(out, size) == 0); return 0;
+}
 /* Child: open the corpus file, type one byte, checkpoint, crash. */
 static int fm4_orphan(const char *dir, const char *source, char *journal_path)
 {
@@ -724,7 +752,8 @@ static int fm4_orphan(const char *dir, const char *source, char *journal_path)
          * checkpoint (DELETE all + every byte as INSERT), the GB-scale orphan
          * shape Tobias's profile holds and older builds still leave behind. */
         e->buffer->origin.valid = false;
-        if (journal_flush(e->journal) || editor_checkpoint(e)) _exit(6);
+        journal_io io = {.write = fm4_sparse_write, .append_write = fm4_sparse_write};
+        if (journal_flush(e->journal) || journal_set_io(e->journal, &io) || editor_checkpoint(e)) _exit(6);
         _exit(0); /* crash: the 1 GiB checkpoint is an orphan */
     }
     int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -748,15 +777,13 @@ static int large_orphans_body(const char *root)
     T(ftruncate(fd, (off_t)FM4_GIB) == 0); close(fd);
     T(fm4_orphan(dir, source, orphan) == 0);
     struct stat st; T(stat(orphan, &st) == 0 && (uint64_t)st.st_size > FM4_GIB);
+    T((uint64_t)st.st_blocks * 512u < (uint64_t)st.st_size); /* (P) POSIX st_blocks counts 512-byte units */
     /* The set-aside copy: same bytes under editor_set_aside's naming. */
     int in = open(orphan, O_RDONLY); T(in >= 0);
     T(snprintf(aside, sizeof aside, "%s.set-aside-1", orphan) > 0);
     int out = open(aside, O_CREAT | O_EXCL | O_WRONLY, 0600); T(out >= 0);
-    for (off_t done = 0; done < st.st_size;) {
-        ssize_t n = copy_file_range(in, NULL, out, NULL, (size_t)(st.st_size - done), 0);
-        T(n > 0); done += n;
-    }
-    close(in); close(out);
+    int copied_ok = fm4_sparse_copy(in, out, st.st_size);
+    close(in); close(out); T(copied_ok == 0);
     char renamed[IPC_PATH_CAP]; strcpy(renamed, orphan);
     memcpy(strrchr(renamed, '/') + 1, "session-OLDSET", strlen("session-OLDSET"));
     T(snprintf(aside, sizeof aside, "%s.set-aside-1", renamed) > 0);
@@ -909,10 +936,8 @@ static int large_orphans(void)
     if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
     return rc;
 }
-/* edit-qct: a deferred orphan (fm4) is a recoverable closed tab, restored
- * lazily on reopen. The orphan is the post-edit-28u shape: a 1 GiB BASE ((P)
- * 2^30, the fm4 fixture size) plus one typed byte, so the journal is small but
- * journal + BASE exceed JOURNAL_STARTUP_SCAN_BYTES and startup defers it. */
+/* edit-4da: post-28u differences against the sparse fm4 BASE. Only the
+ * typed byte is checkpointed; the BASE must be mapped on the next launch. */
 static int qct_orphan(const char *dir, const char *source, char *journal_path)
 {
     pid_t child = fork(); T(child >= 0);
@@ -938,14 +963,17 @@ static int qct_orphan(const char *dir, const char *source, char *journal_path)
 static int qct_count_base(void *ctx, const journal_record *r)
 { if (r->type == JOURNAL_BASE) ++*(size_t *)ctx; return 0; }
 typedef struct qct_launch { char journal[IPC_PATH_CAP]; int lease; render_backend backend; editor *e; } qct_launch;
-static int qct_start(const char *dir, qct_launch *l)
+static int qct_start_threshold(const char *dir, qct_launch *l, uint64_t threshold)
 {
     l->lease = -1; l->e = NULL;
     T(journal_session_create(dir, l->journal, sizeof l->journal, &l->lease) == JOURNAL_OK);
     T(render_null_backend(&l->backend) == 0);
-    editor_config config = {.journal_path = l->journal, .session_lease = &l->lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor_config config = {.journal_path = l->journal, .session_lease = &l->lease, .start_empty = true,
+        .copy_threshold = threshold, .cols = 32, .rows = 3};
     T(editor_open(&l->e, &config, &l->backend) == 0); return settle(l->e);
 }
+static int qct_start(const char *dir, qct_launch *l)
+{ return qct_start_threshold(dir, l, 0); } /* (P) zero selects the configured default */
 static void qct_stop(qct_launch *l)
 {
     struct stat st;
@@ -970,73 +998,97 @@ static int qct_listed(qct_launch *l)
     T(journal_scan_file(l->journal, qct_count_base, &bases, &result) == 0); T(bases == 0);
     return 0;
 }
+/* edit-4da (P): pre-28u whole-text shape = DELETE of every BASE byte,
+ * then INSERT of the replacement text. Keeping the replacement short makes
+ * journal + prefix fit fm4 while journal + the required BASE read does not. */
+static int whole_text_orphan(const char *dir, const char *source, char *path)
+{
+    int lease = -1;
+    T(journal_session_create(dir, path, IPC_PATH_CAP, &lease) == 0);
+    work_pool pool;
+    bool pooled = work_pool_init(&pool, 1, 0) == 0; /* (P) one journal worker, no reserved jobs */
+    int rc = pooled ? 0 : 1;
+    journal *j = NULL;
+    journal_base base;
+    if (!rc) rc = journal_capture_base(source, &base);
+    if (!rc) rc = journal_open(&j, path, &pool, NULL);
+    /* (P) the sole buffer's journal id is one; replacement is strlen("old"). */
+    if (!rc) rc = journal_set_base(j, 1, &base);
+    if (!rc) rc = journal_delete(j, 1, 0, base.size);
+    if (!rc) rc = journal_insert(j, 1, 0, (const uint8_t *)"old", strlen("old"));
+    if (j) { if (!rc) rc = journal_flush(j); journal_close(j); }
+    if (pooled) work_pool_shutdown(&pool);
+    (void)journal_session_release(path, lease); close(lease);
+    T(rc == 0); return 0;
+}
 static int large_restore_body(const char *root)
 {
-    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP], lock[IPC_PATH_CAP];
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP];
     T(setenv("XDG_DATA_HOME", root, 1) == 0);
     T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
-    T(!strncmp(dir, root, strlen(root)) && !strcmp(dir + strlen(root), "/sublimite")); /* never the real profile */
+    T(!strncmp(dir, root, strlen(root)) && !strcmp(dir + strlen(root), "/sublimite"));
     T(editor_make_directory(dir, NULL, NULL) == 0);
     T(snprintf(source, sizeof source, "%s/corpus", root) > 0);
     int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
-    T(ftruncate(fd, (off_t)FM4_GIB) == 0); close(fd);
-    T(qct_orphan(dir, source, orphan) == 0);
-    struct stat before, st; T(stat(orphan, &before) == 0);
-    printf("large_restore: orphan journal bytes=%lld (M)\n", (long long)before.st_size);
-    T((uint64_t)before.st_size < JOURNAL_STARTUP_SCAN_BYTES); /* the post-28u shape: BASE referenced, not copied */
-    /* Launch 1: listed, then a clean exit leaves the orphan byte for byte. */
+    int rc = ftruncate(fd, (off_t)FM4_GIB); close(fd); T(rc == 0);
+    /* The whole-text case must stay deferred even though its journal is small. */
+    T(whole_text_orphan(dir, source, orphan) == 0);
+    struct stat before, st;
+    T(stat(orphan, &before) == 0 && (uint64_t)before.st_size < JOURNAL_STARTUP_SCAN_BYTES);
     qct_launch l = {0};
-    int rc = qct_start(dir, &l);
-    if (!rc) rc = qct_listed(&l);
-    qct_stop(&l); T(rc == 0);
-    T(stat(orphan, &st) == 0 && st.st_ino == before.st_ino && st.st_size == before.st_size &&
-      st.st_mtim.tv_sec == before.st_mtim.tv_sec && st.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
-    /* Launch 2: listed again; reopen restores it lazily. */
     rc = qct_start(dir, &l);
     if (!rc) rc = qct_listed(&l);
-    editor *e = l.e;
-    uint64_t worst = 0, steps = 0, t0 = trace_now_ns(), limit = deadline();
-    if (!rc) rc = editor_reopen_tab(e);
-    while (!rc && (e->buffer->placeholder || e->buffer->pending_open || !tabs_count(&e->tabs))) {
-        uint64_t a = trace_now_ns(); rc = turn(e); uint64_t b = trace_now_ns();
-        if (b - a > worst) worst = b - a;
-        steps++;
-        if (b >= limit) { fprintf(stderr, "editor_session_test: restore did not finish\n"); rc = 1; }
-        sched_yield();
+    if (!rc) printf("large_restore: whole-text journal bytes=%lld deferred=%zu\n",
+        (long long)before.st_size, l.e->recovery_deferred);
+    qct_stop(&l); T(rc == 0);
+    T(stat(orphan, &st) == 0 && st.st_ino == before.st_ino && st.st_size == before.st_size &&
+        st.st_mtim.tv_sec == before.st_mtim.tv_sec && st.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
+    T(unlink(orphan) == 0);
+    /* Same BASE, now a real differences-only checkpoint created by typing. */
+    T(qct_orphan(dir, source, orphan) == 0);
+    T(stat(orphan, &st) == 0 && (uint64_t)st.st_size < JOURNAL_STARTUP_SCAN_BYTES);
+    /* Forced COPY would still read the whole BASE: leave this same orphan
+     * deferred. (P) UINT64_MAX selects COPY for every representable file. */
+    rc = qct_start_threshold(dir, &l, UINT64_MAX);
+    if (!rc) rc = qct_listed(&l);
+    if (!rc) puts("large_restore: differences with COPY acquisition deferred");
+    qct_stop(&l); T(rc == 0);
+    /* (P) initial eager restore plus relaunch of its installed checkpoint:
+     * the regression was that every subsequent launch deferred again. */
+    for (unsigned launch = 0; launch < 2u; launch++) {
+        uint64_t t0 = trace_now_ns();
+        rc = qct_start(dir, &l);
+        uint64_t elapsed = trace_now_ns() - t0;
+        editor *e = l.e;
+        bool tab = !rc && tabs_count(&e->tabs) == 1; /* (P) sole source tab */
+        uint8_t head[sizeof "x"] = {0}; /* (P) typed byte and first sparse BASE byte */
+        bool text = tab && piece_len(e->buffer->tree) == FM4_GIB + strlen("x") &&
+            !piece_read(e->buffer->tree, 0, head, sizeof head) && head[0] == 'x' && head[1] == 0;
+        bool dirty = tab && editor_tab(e, 0)->modified && !strcmp(editor_tab(e, 0)->title, "corpus");
+        bool mapped = tab && e->buffer->file && file_open_mode(e->buffer->file) == FILE_MODE_MMAP &&
+            e->buffer->arena.size < FM4_GIB;
+        bool eager = tab && !e->recovery_deferred && !tabs_closed_count(&e->tabs) && !e->recovery_notice;
+        bool retired = access(orphan, F_OK) != 0;
+        if (!rc) rc = journal_flush(e->journal) || editor_checkpoint(e) ? 1 : 0;
+        bool small = !rc && !stat(l.journal, &st) && (uint64_t)st.st_size < JOURNAL_STARTUP_SCAN_BYTES;
+        char power[sizeof "Not charging"] = "unknown", load1[sizeof "Not charging"] = "unknown";
+        FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+        if (f) { if (!fgets(power, sizeof power, f)) strcpy(power, "unknown"); fclose(f); }
+        power[strcspn(power, "\n")] = 0;
+        f = fopen("/proc/loadavg", "r");
+        if (f) { if (!fgets(load1, sizeof load1, f)) strcpy(load1, "unknown"); fclose(f); }
+        load1[strcspn(load1, " \n")] = 0;
+        /* (P) 10^6 ns/ms; G4a is the existing fm4 tracked launch bound. */
+        printf("large_restore: differences launch=%u tabs=%zu closed=%zu deferred=%zu text=%s dirty=%s mapped=%s "
+            "journal_small=%s retired=%s launch_ms=%.3f (M) G4a_p99=%.0f bound=tracked power=%s load1=%s\n",
+            launch, e ? tabs_count(&e->tabs) : 0, e ? tabs_closed_count(&e->tabs) : 0,
+            e ? e->recovery_deferred : 0, text ? "yes" : "no", dirty ? "yes" : "no", mapped ? "yes" : "no",
+            small ? "yes" : "no", retired ? "yes" : "no", (double)elapsed / 1e6,
+            (double)FM4_G4A_P99_NS / 1e6, power, load1);
+        strcpy(orphan, l.journal);
+        qct_stop(&l);
+        T(rc == 0 && eager && text && dirty && mapped && small && retired);
     }
-    if (!rc) rc = settle(e);
-    char power[32] = "unknown", load1[32] = "unknown";
-    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
-    if (f) { if (fscanf(f, "%31s", power) != 1) strcpy(power, "unknown"); fclose(f); }
-    f = fopen("/proc/loadavg", "r");
-    if (f) { if (fscanf(f, "%31s", load1) != 1) strcpy(load1, "unknown"); fclose(f); }
-    /* Tracked, never asserted (Law 1): the longest UI step against the settle
-     * watchdog EDITOR_IDLE_NS. */
-    printf("large_restore: restore_ms=%.3f steps=%llu worst_step_ms=%.3f (M) idle_watchdog_ms=%.0f bound=tracked power=%s load1=%s\n",
-        (double)(trace_now_ns() - t0) / 1e6, (unsigned long long)steps, (double)worst / 1e6,
-        (double)EDITOR_IDLE_NS / 1e6, power, load1);
-    if (rc) { qct_stop(&l); T(rc == 0); }
-    editor_buffer *b = e->buffer;
-    uint8_t head[2] = {0, 1};
-    bool text = tabs_count(&e->tabs) == 1 && piece_len(b->tree) == FM4_GIB + 1 &&
-        piece_read(b->tree, 0, head, 2) == 0 && head[0] == 'x' && head[1] == 0;
-    bool named = text && !strcmp(editor_tab(e, 0)->title, "corpus") && editor_tab(e, 0)->modified;
-    /* No copy of BASE size: the restored tree maps BASE; COPY acquisition
-     * would size the buffer arena by the file (buffers.c prepare). */
-    bool mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP && b->arena.size < FM4_GIB;
-    printf("large_restore: text=%s named=%s mapped=%s arena_bytes=%zu\n", text ? "yes" : "no",
-        named ? "yes" : "no", mapped ? "yes" : "no", b->arena.size);
-    /* The recovered edit is durable in this launch's journal as a difference
-     * from BASE (edit-28u), and the orphan is retired. */
-    rc = journal_flush(e->journal) || editor_checkpoint(e) ? 1 : 0;
-    bool small = !rc && !stat(l.journal, &st) && (uint64_t)st.st_size < JOURNAL_STARTUP_SCAN_BYTES;
-    bool retired = access(orphan, F_OK) != 0;
-    printf("large_restore: launch journal bytes=%lld small=%s orphan_retired=%s\n", (long long)st.st_size,
-        small ? "yes" : "no", retired ? "yes" : "no");
-    qct_stop(&l);
-    T(text && named && mapped && small && retired);
-    T(snprintf(lock, sizeof lock, "%s/.%s.lock", dir, strrchr(orphan, '/') + 1) > 0);
-    T(access(lock, F_OK) != 0);
     return 0;
 }
 /* edit-qct: reopening the placeholder of an orphan whose BASE changed never
@@ -1073,7 +1125,7 @@ static int large_restore(void)
     int rc = large_restore_body(root);
     fm4_remove_tree(root); /* on success and on every failure path */
     if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
-    if (!rc) puts("large_restore: deferred orphan listed as a closed tab, survives a clean exit, restored lazily on reopen");
+    if (!rc) puts("large_restore: whole-text deferred; differences restore eagerly across hot exits");
     return rc;
 }
 /* edit-c26 begin: Astra drive 5, task 37 (docs/reviews/astra-vs-sublime-5.md

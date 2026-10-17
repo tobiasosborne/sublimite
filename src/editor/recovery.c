@@ -13,6 +13,30 @@
 #include <time.h>
 #include <unistd.h>
 
+/* edit-4da: the cost scan decides which buffers can replay only their ops.
+ * COPY/whole-text buffers keep the existing materialised recovery path. */
+typedef struct recovery_cost_buffer {
+    struct recovery_cost_buffer *next;
+    uint64_t id, full_bytes, prefix_bytes, deleted_bytes, len;
+    char path[IPC_PATH_CAP];
+    bool mapped;
+} recovery_cost_buffer;
+typedef struct recovery_cost {
+    recovery_cost_buffer *buffers;
+    uint64_t threshold;
+} recovery_cost;
+static recovery_cost_buffer *cost_find(const recovery_cost *cost, uint64_t id)
+{
+    for (recovery_cost_buffer *b = cost ? cost->buffers : NULL; b; b = b->next)
+        if (b->id == id) return b;
+    return NULL;
+}
+static void cost_fini(recovery_cost *cost)
+{
+    while (cost->buffers) {
+        recovery_cost_buffer *b = cost->buffers; cost->buffers = b->next; free(b);
+    }
+}
 typedef struct recovered_buffer {
     struct recovered_buffer *next;
     uint64_t id;
@@ -39,6 +63,7 @@ typedef struct recovered_buffer {
     uint8_t *ops;
     size_t ops_len, ops_cap;
     bool ops_valid;
+    bool mapped_replay; /* no flat text or whole-BASE fallback */
 } recovered_buffer;
 /* (P) op header: 1 type byte + 8-byte offset + 8-byte length. */
 #define OP_HEADER 17u
@@ -51,6 +76,7 @@ typedef struct recovered_session {
     bool window_chosen; /* WINDOW v2 with JOURNAL_WINDOW_CHOSEN */
     bool tolerant;      /* edit-btj second pass: a changed BASE marks its buffer */
     bool conflicts;     /* some buffer was marked */
+    const recovery_cost *cost;
 } recovered_session;
 static uint64_t get64(const uint8_t *p)
 {
@@ -147,6 +173,8 @@ static int restore_record(void *ctx, const journal_record *r)
             b = calloc(1, sizeof *b); if (!b) return JOURNAL_NOMEM;
             b->id = r->buffer_id; b->next = s->buffers; s->buffers = b;
         }
+        const recovery_cost_buffer *cost = cost_find(s->cost, r->buffer_id);
+        b->mapped_replay = cost && cost->mapped;
         b->conflict = false;
         if (s->tolerant && *path) {
             /* edit-btj: the first pass stopped at a changed BASE. Its edits
@@ -163,12 +191,12 @@ static int restore_record(void *ctx, const journal_record *r)
         /* edit-f3i: a BASE restarts the text, so the op log restarts too. */
         b->base_id = editor_base_id_of(&base); b->ops_len = 0; b->ops_valid = true;
         free(b->bytes); b->len = b->gap = (size_t)base.size; b->gap_len = 0;
-        b->bytes = b->len ? malloc(b->len) : NULL;
-        if (b->len && !b->bytes) { b->len = b->gap = 0; return JOURNAL_NOMEM; }
+        b->bytes = !b->mapped_replay && b->len ? malloc(b->len) : NULL;
+        if (!b->mapped_replay && b->len && !b->bytes) { b->len = b->gap = 0; return JOURNAL_NOMEM; }
         strcpy(b->target, path);
         const char *leaf = strrchr(path, '/');
         if (leaf && !strncmp(leaf + 1, ".sublimite-base-", strlen(".sublimite-base-"))) strcpy(b->retained, path);
-        if (*path) {
+        if (*path && !b->mapped_replay) {
             int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK); if (fd < 0) return JOURNAL_IO;
             size_t done = 0;
             while (done < b->len) {
@@ -190,6 +218,18 @@ static int restore_record(void *ctx, const journal_record *r)
     if (b->conflict && (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE)) return 0;
     uint64_t off = get64(p);
     if (off > b->len) return JOURNAL_INVALID;
+    if (b->mapped_replay) {
+        uint64_t n = r->type == JOURNAL_INSERT ? r->size - sizeof off : get64(p + sizeof off);
+        if (r->type == JOURNAL_INSERT) {
+            if (n > SIZE_MAX - b->len) return JOURNAL_NOMEM;
+            b->len += (size_t)n;
+        } else if (r->type == JOURNAL_DELETE) {
+            if (n > b->len - off) return JOURNAL_INVALID;
+            b->len -= (size_t)n;
+        } else return JOURNAL_INVALID;
+        op_log(b, r->type, off, n, r->type == JOURNAL_INSERT ? p + sizeof off : NULL);
+        return b->ops_valid ? 0 : JOURNAL_NOMEM;
+    }
     if (r->type == JOURNAL_INSERT) {
         int rc = gap_insert(b, (size_t)off, p + 8, r->size - 8);
         if (!rc) op_log(b, JOURNAL_INSERT, off, r->size - 8, p + 8);
@@ -236,13 +276,26 @@ static int apply_ops(piece_tree *tree, const recovered_buffer *r)
 }
 static int install_buffer(editor *e, recovered_buffer *r)
 {
-    gap_close(r);
+    if (!r->mapped_replay) gap_close(r);
     uint64_t id;
-    int rc = editor_add_recovered_buffer(e, *r->target ? r->target : NULL, &id);
+    editor_buffer *b = NULL;
+    int rc;
+    if (r->mapped_replay) {
+        /* (P) A threshold of one maps every nonempty file. Preflight already
+         * required configured MMAP; keep a changed/shrunken target mapped too.
+         * Prepare/install directly: add_buffer's mapped branch runs the loop
+         * to submit its preview, before the startup renderer is initialised. */
+        uint64_t threshold = e->cfg.copy_threshold; e->cfg.copy_threshold = 1;
+        rc = editor_buffer_prepare(e, r->target, NULL, 0, &b);
+        e->cfg.copy_threshold = threshold;
+        if (!rc) rc = editor_install_buffer(e, b, &id);
+        if (rc) { editor_buffer_destroy(b); return rc; }
+    } else {
+        rc = editor_add_recovered_buffer(e, *r->target ? r->target : NULL, &id);
+        b = e->buffer;
+    }
     if (rc) return rc;
-    editor_buffer *b = e->buffer;
-    /* Recovery uses private COPY acquisition. Its remainder must be installed
-     * without running editor_step, whose submit would expose unreplayed bytes. */
+    /* Attach without running editor_step or starting scans of unreplayed text. */
     while (b->pending_open && !file_open_ready(b->file)) {
         struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
         if (poll(&ready, 1, -1) < 0 && errno != EINTR) return EDITOR_ERR_IO;
@@ -250,59 +303,74 @@ static int install_buffer(editor *e, recovered_buffer *r)
         if (b->operation_error) return EDITOR_ERR_IO;
     }
     if (b->pending_open) {
-        e->dirty = false;
-        rc = editor_adopt_open(e, b); if (rc) return rc;
+        if (r->mapped_replay) {
+            if (file_check(b->file, NULL) || file_attach(b->file, b->tree)) return EDITOR_ERR_IO;
+            b->pending_open = false;
+            piece_destroy(b->preview); b->preview = NULL;
+        } else {
+            e->dirty = false;
+            rc = editor_adopt_open(e, b); if (rc) return rc;
+        }
     }
-    if (r->conflict) { /* edit-btj: disk text, clean, view from the start */
+    if (r->conflict && !r->mapped_replay) { /* edit-btj: disk text, clean, view from the start */
         (void)tabs_set_modified(&e->tabs, tabs_active_index(&e->tabs), false);
         r->installed = b; return editor_activate(e);
     }
-    bool clean = !r->save_pending && same_bytes(b, r);
+    bool clean = r->conflict || (!r->save_pending &&
+        (r->mapped_replay ? !r->ops_len : same_bytes(b, r)));
     undo_clear(&b->undo);
     /* edit-f3i: when the opened generation is the journalled BASE, replay
      * the logged ops onto it, so the tree keeps ORIGINAL spans and its
      * checkpoints are differences from BASE (edit-28u). Otherwise, or if
      * an op fails, the whole recovered text replaces the tree as before. */
-    rc = 1;
-    if (r->ops_valid && *r->target && base_id_equal(&b->origin, &r->base_id) &&
+    rc = r->conflict ? 0 : 1;
+    if (!r->conflict && r->ops_valid && *r->target && base_id_equal(&b->origin, &r->base_id) &&
         piece_len(b->tree) == r->base_id.size) {
         rc = apply_ops(b->tree, r);
         if (!rc && piece_len(b->tree) != r->len) rc = 1;
     }
     if (rc) {
+        /* A failed mapped install must never fall back to a whole-BASE copy. */
+        if (r->mapped_replay) return EDITOR_ERR_IO;
         rc = piece_delete(b->tree, 0, piece_len(b->tree), NULL);
         if (!rc) rc = piece_insert(b->tree, 0, r->bytes, r->len);
     }
     if (rc) return EDITOR_ERR_MEMORY;
-    b->revision++; b->saved_lost = !clean; b->lines = piece_line_count(b->tree);
+    b->revision++; b->saved_lost = !clean;
+    if (r->mapped_replay) editor_large_init(b);
+    else b->lines = piece_line_count(b->tree);
     b->history_count = b->history_cursor = b->history_head = b->saved_cursor = 0;
     b->soft_count = b->soft_cursor = b->soft_head = 0;
     b->soft_base_redo = 0;
     b->mark_valid = false;
     b->last_key_valid = false;
-    lineidx_destroy(b->index); b->index = lineidx_create(r->len);
+    size_t len = (size_t)piece_len(b->tree);
+    lineidx_destroy(b->index); b->index = lineidx_create(len);
     if (!b->index || lineidx_build_reserve(b->index)) return EDITOR_ERR_MEMORY;
     piece_snapshot *snapshot = piece_snapshot_take(b->tree); if (!snapshot) return EDITOR_ERR_MEMORY;
     rc = lineidx_bind_snapshot(b->index, snapshot); piece_snapshot_release(snapshot);
     if (rc) return EDITOR_ERR_MEMORY;
     b->index_dirty = true;
     view_state state = b->initial;
-    state.selection.cursor = r->view.position.cursor > r->len ? r->len : r->view.position.cursor;
-    state.selection.anchor = r->view.position.anchor > r->len ? r->len : r->view.position.anchor;
-    state.first_byte = r->view.position.scroll_byte > r->len ? r->len : r->view.position.scroll_byte;
-    state.first_line = piece_byte_to_line(b->tree, state.first_byte);
-    state.visual_byte = state.first_byte; state.hscroll = r->view.position.scroll_x;
-    if (r->full_view) {
-        state.selection.preferred_col = r->view.preferred_col;
-        state.first_line = r->view.first_line;
-        state.visual_byte = r->view.visual_byte; /* unused unwrapped value may outlive a deletion */
-        state.wrap = (r->view.flags & JOURNAL_VIEW_WRAP) != 0;
-        state.approximate = (r->view.flags & JOURNAL_VIEW_APPROXIMATE) != 0;
-        state.visual_end = (r->view.flags & JOURNAL_VIEW_VISUAL_END) != 0;
+    if (!r->conflict) {
+        state.selection.cursor = r->view.position.cursor > len ? len : r->view.position.cursor;
+        state.selection.anchor = r->view.position.anchor > len ? len : r->view.position.anchor;
+        state.first_byte = r->view.position.scroll_byte > len ? len : r->view.position.scroll_byte;
+        state.first_line = r->full_view ? r->view.first_line : piece_byte_to_line(b->tree, state.first_byte);
+        state.visual_byte = state.first_byte; state.hscroll = r->view.position.scroll_x;
+        if (r->full_view) {
+            state.selection.preferred_col = r->view.preferred_col;
+            state.first_line = r->view.first_line;
+            state.visual_byte = r->view.visual_byte; /* unused unwrapped value may outlive a deletion */
+            state.wrap = (r->view.flags & JOURNAL_VIEW_WRAP) != 0;
+            state.approximate = (r->view.flags & JOURNAL_VIEW_APPROXIMATE) != 0;
+            state.visual_end = (r->view.flags & JOURNAL_VIEW_VISUAL_END) != 0;
+        }
     }
     b->initial = state; e->v.state = state;
     e->tabs.slots[e->tabs.active].state = state;
     (void)tabs_set_modified(&e->tabs, tabs_active_index(&e->tabs), !clean);
+    if (r->mapped_replay) editor_large_start(e, b);
     r->installed = b; return editor_activate(e);
 }
 static int install_session(editor *e, recovered_session *s)
@@ -406,10 +474,10 @@ static bool session_fits(const editor *e, const recovered_session *s)
         (!closed || live < available) &&
         closed <= e->tabs.closed_capacity - tabs_closed_count(&e->tabs);
 }
-static int restore_source(editor *e, const char *directory, const char *previous)
+static int restore_source(editor *e, const char *directory, const char *previous, const recovery_cost *cost)
 {
     char lock_path[IPC_PATH_CAP];
-    recovered_session session = {0}; journal_replay_result result;
+    recovered_session session = {.cost = cost}; journal_replay_result result;
     int rc = journal_replay_file(previous, restore_record, &session, &result);
     /* edit-btj: a discovered journal never blocks launch. A changed BASE gets
      * a tolerant pass; any other failure sets the source aside and opens empty.
@@ -417,6 +485,7 @@ static int restore_source(editor *e, const char *directory, const char *previous
     bool aside = false;
     if (rc && !e->recover_existing) {
         fini(&session);
+        session.cost = cost;
         rc = replay_tolerant(previous, &session);
         if (rc) { fini(&session); aside = true; rc = 0; }
     }
@@ -487,25 +556,65 @@ static bool newer_source(struct timespec a, const char *a_path, struct timespec 
     return a.tv_sec > b.tv_sec || (a.tv_sec == b.tv_sec &&
         (a.tv_nsec > b.tv_nsec || (a.tv_nsec == b.tv_nsec && strcmp(a_path, b_path) > 0)));
 }
-/* edit-fm4: restoring a discovered session reads its journal and every BASE
- * it names, installs that text and checkpoints it, all before the first frame.
- * Sum the bytes of one such read pass; the scan itself stays within the bound
- * because the journal size is checked first. Undecodable BASE records are
- * replay's to reject, so they add nothing here. */
+/* edit-4da: preserve fm4's single-read-pass model, but an op-only mapped
+ * install touches the acquisition prefix and deleted ORIGINAL bytes, not
+ * every kept BASE byte. (P) UINT64_MAX is the over-bound sentinel. */
+static void cost_add(uint64_t *total, uint64_t size)
+{
+    if (*total > JOURNAL_STARTUP_SCAN_BYTES || size > JOURNAL_STARTUP_SCAN_BYTES - *total) *total = UINT64_MAX;
+    else *total += size;
+}
 static int cost_record(void *ctx, const journal_record *r)
 {
-    uint64_t *total = ctx;
-    if (r->type != JOURNAL_BASE) return 0;
-    journal_base base; char path[IPC_PATH_CAP];
-    if (journal_decode_base(r, &base, path, sizeof path)) return 0;
-    if (base.size > JOURNAL_STARTUP_SCAN_BYTES - *total) { *total = UINT64_MAX; return JOURNAL_FULL; }
-    *total += base.size; return 0;
+    recovery_cost *cost = ctx;
+    recovery_cost_buffer *b = cost_find(cost, r->buffer_id);
+    if (r->type == JOURNAL_BASE) {
+        journal_base base; char path[IPC_PATH_CAP];
+        if (journal_decode_base(r, &base, path, sizeof path)) return 0;
+        if (!b) {
+            b = calloc(1, sizeof *b); if (!b) return JOURNAL_NOMEM;
+            b->id = r->buffer_id; b->mapped = true; b->next = cost->buffers; cost->buffers = b;
+        }
+        cost_add(&b->full_bytes, base.size);
+        cost_add(&b->prefix_bytes, base.size < FILE_PREFIX_MAX ? base.size : FILE_PREFIX_MAX);
+        b->mapped = b->mapped && *path && base.size > FILE_PREFIX_MAX && base.size >= cost->threshold && base.size <= SIZE_MAX;
+        b->len = base.size; strcpy(b->path, path);
+    } else if (b && r->type == JOURNAL_TARGET) {
+        if (strcmp(b->path, (const char *)r->data)) {
+            char canonical[IPC_PATH_CAP];
+            if (!realpath((const char *)r->data, canonical) || strcmp(b->path, canonical)) b->mapped = false;
+        }
+    } else if (b && r->type == JOURNAL_VIEW) {
+        journal_view_state saved_view;
+        if (journal_decode_view_state(r, &saved_view) ||
+            (r->size != JOURNAL_VIEW_STATE_BYTES && saved_view.position.scroll_byte)) b->mapped = false;
+    } else if (b && (r->type == JOURNAL_INSERT || r->type == JOURNAL_DELETE)) {
+        uint64_t off = get64(r->data);
+        uint64_t n = r->type == JOURNAL_INSERT ? r->size - sizeof off : get64(r->data + sizeof off);
+        /* Malformed ranges remain the replay path's to reject. They cannot
+         * make an otherwise over-bound flat recovery eligible for startup. */
+        if (off > b->len) { b->mapped = false; return 0; }
+        if (r->type == JOURNAL_INSERT) {
+            if (n > UINT64_MAX - b->len) b->mapped = false;
+            else b->len += n;
+        } else {
+            if (n > b->len - off) { b->mapped = false; return 0; }
+            if (!off && n == b->len) b->mapped = false; /* pre-28u whole-text shape */
+            cost_add(&b->deleted_bytes, n); b->len -= n;
+        }
+    }
+    return 0;
 }
-static bool restore_deferred(const char *path, uint64_t size)
+static bool restore_deferred(const editor *e, const char *path, uint64_t size, recovery_cost *cost)
 {
     if (size > JOURNAL_STARTUP_SCAN_BYTES) return true;
+    cost->threshold = e->cfg.copy_threshold ? e->cfg.copy_threshold : file_default_copy_threshold();
     uint64_t total = size; journal_replay_result result;
-    (void)journal_scan_file(path, cost_record, &total, &result);
+    if (journal_scan_file(path, cost_record, cost, &result)) return true;
+    for (const recovery_cost_buffer *b = cost->buffers; b; b = b->next) {
+        cost_add(&total, b->mapped ? b->prefix_bytes : b->full_bytes);
+        if (b->mapped) cost_add(&total, b->deleted_bytes);
+    }
     return total > JOURNAL_STARTUP_SCAN_BYTES;
 }
 static int discover_source(editor *e, const char *directory, const char *before,
@@ -565,7 +674,7 @@ int editor_session_restore(editor *e)
     /* Housekeeping is best effort: a failed barrier leaves safe retired bytes,
      * and a busy lease preserves the source. Never block session recovery. */
     (void)journal_retire_directory(directory, path);
-    if (e->recover_existing) return restore_source(e, directory, path);
+    if (e->recover_existing) return restore_source(e, directory, path, NULL);
     char before[IPC_PATH_CAP] = "";
     struct timespec cutoff = {0};
     for (;;) {
@@ -574,7 +683,9 @@ int editor_session_restore(editor *e)
         int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_fd, &size);
         if (rc || previous_fd < 0) return rc;
         strcpy(before, previous); cutoff = newest;
-        if (restore_deferred(previous, size)) {
+        recovery_cost cost = {0};
+        if (restore_deferred(e, previous, size, &cost)) {
+            cost_fini(&cost);
             /* edit-fm4: a GB-scale orphan is not replayed, copied or renamed
              * before the first frame. It stays discoverable under its own
              * name, byte for byte, and the lease is released for later. */
@@ -589,7 +700,8 @@ int editor_session_restore(editor *e)
             if (!listed) close(previous_fd);
             continue;
         }
-        rc = restore_source(e, directory, previous);
+        rc = restore_source(e, directory, previous, &cost);
+        cost_fini(&cost);
         close(previous_fd);
         if (rc) return rc;
     }
