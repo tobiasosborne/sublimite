@@ -654,11 +654,110 @@ static int stranded_orphan(bool limited, bool shared_target)
     remove_tree(root); return 0;
 }
 
+/* edit-hw1: (P) the two tabs are the Save As owner and the target peer;
+ * pipe ends, zero sentinels and indexes follow POSIX/the tab ordering below.
+ * Text sizes derive from literals; path storage reuses IPC_PATH_CAP. */
+typedef struct shared_save_result { bool refused, untouched, peer_clean; } shared_save_result;
+static int shared_save_crash(void *ctx, const char *from, const char *to)
+{
+    (void)from; (void)to;
+    int fd = *(int *)ctx;
+    shared_save_result result = {0};
+    if (write(fd, &result, sizeof result) != (ssize_t)sizeof result) _exit(EXIT_FAILURE);
+    /* The target has been written, but the preceding checkpoint still names
+     * its old BASE. Crash immediately before publishing the replacement. */
+    (void)kill(getpid(), SIGKILL); return -1;
+}
+static int shared_save_child(const char *source, const char *target, const char *jpath, bool dirty, int fd)
+{
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 'A', 0, "A") == 0);
+    editor_buffer *owner = e->buffer;
+    uint64_t peer_id; T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0);
+    if (dirty) T(press(e, 'B', 0, "B") == 0);
+    editor_buffer *peer = e->buffer;
+    uint64_t owner_revision = owner->revision, peer_revision = peer->revision;
+    size_t owner_history = owner->history_cursor, peer_history = peer->history_cursor;
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(journal_flush(e->journal) == 0);
+    if (dirty) {
+        journal_io io = {.ctx = &fd, .rename = shared_save_crash};
+        T(journal_set_io(e->journal, &io) == 0);
+    }
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) {
+        char ch[] = {target[i], '\0'};
+        T(press(e, (uint8_t)target[i], 0, ch) == 0);
+    }
+    T(press(e, XKB_KEY_Return, 0, NULL) == 0);
+    shared_save_result result = {
+        .refused = e->recovery_notice && !strcmp(e->recovery_notice, "target is open and modified in another tab"),
+        .untouched = dirty && e->buffer == owner && owner->revision == owner_revision && peer->revision == peer_revision &&
+            owner->history_cursor == owner_history && peer->history_cursor == peer_history &&
+            !strcmp(owner->path, source) && !strcmp(peer->path, target)};
+    const tabs_tab *tab = editor_tab(e, 1);
+    uint8_t bytes[sizeof "Asource" - 1u]; /* (P) fixture bytes exclude NUL. */
+    result.peer_clean = tab->id == peer_id && !tab->modified && piece_len(tab->buffer) == sizeof bytes &&
+        !piece_read(tab->buffer, 0, bytes, sizeof bytes) && !memcmp(bytes, "Asource", sizeof bytes);
+    T(write(fd, &result, sizeof result) == (ssize_t)sizeof result);
+    /* No editor_close, flush, or later checkpoint after observing the command. */
+    (void)kill(getpid(), SIGKILL); return 1;
+}
+static int shared_save_as(bool dirty)
+{
+    char root[IPC_PATH_CAP], source[IPC_PATH_CAP], target[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, sizeof target, "%s/target", root) > 0); T(write_file(target, "base") == 0);
+    char canonical[IPC_PATH_CAP];
+    T(realpath(source, canonical)); strcpy(source, canonical);
+    T(realpath(target, canonical)); strcpy(target, canonical);
+    T(make_session(root, first, sizeof first) == 0);
+    int report[2]; T(pipe(report) == 0); pid_t child = fork(); T(child >= 0);
+    if (!child) { close(report[0]); _exit(shared_save_child(source, target, first, dirty, report[1])); }
+    close(report[1]); shared_save_result result = {0}; size_t received = 0;
+    while (received < sizeof result) {
+        ssize_t n = read(report[0], (uint8_t *)&result + received, sizeof result - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    close(report[0]); T(killed_by(child, SIGKILL) == 0); T(received == sizeof result);
+    char disk[TEXT_CAP]; ssize_t disk_len = read_file(target, disk, sizeof disk);
+    T(make_session(root, next, sizeof next) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, NULL, next) == 0);
+    bool owner_ok = false, peer_ok = false;
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = editor_tab(e, i);
+        char bytes[TEXT_CAP]; uint64_t len = piece_len(tab->buffer); T(len < sizeof bytes);
+        T(piece_read(tab->buffer, 0, (uint8_t *)bytes, (size_t)len) == 0); bytes[len] = '\0';
+        fprintf(stderr, "dataloss_test: shared_save_as(%s) restored %s modified=%d text=[%s]\n",
+            dirty ? "dirty" : "clean", tab->path, tab->modified, bytes);
+        if (i == 0) owner_ok = !strcmp(bytes, "Asource") && tab->modified == dirty;
+        if (i == 1) peer_ok = !strcmp(bytes, dirty ? "Bbase" : "Asource") && tab->modified == dirty;
+    }
+    bool aside = false; DIR *dir = opendir(root); T(dir); struct dirent *entry;
+    while ((entry = readdir(dir))) if (strstr(entry->d_name, ".set-aside-")) aside = true;
+    closedir(dir);
+    fprintf(stderr, "dataloss_test: shared_save_as(%s) refused=%d untouched=%d peer_clean=%d disk=[%.*s] set_aside=%d notice=[%s]\n",
+        dirty ? "dirty" : "clean", result.refused, result.untouched, result.peer_clean,
+        disk_len > 0 ? (int)disk_len : 0, disk, aside, e->recovery_notice ? e->recovery_notice : "");
+    const char *expected_disk = dirty ? "base" : "Asource";
+    bool disk_ok = disk_len == (ssize_t)strlen(expected_disk) && !memcmp(disk, expected_disk, strlen(expected_disk));
+    bool paths_ok = dirty || (tabs_count(&e->tabs) == 2 && tabs_active_index(&e->tabs) == 0 &&
+        editor_tab(e, 0)->path_len == editor_tab(e, 1)->path_len &&
+        !memcmp(editor_tab(e, 0)->path, editor_tab(e, 1)->path, editor_tab(e, 0)->path_len));
+    bool ok = tabs_count(&e->tabs) == 2 && owner_ok && peer_ok && paths_ok && disk_ok && !aside && !e->recovery_notice &&
+        (dirty ? result.refused && result.untouched : !result.refused && result.peer_clean);
+    editor_close(e); remove_tree(root); T(ok); return 0;
+}
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
     trace_init(); T(trace_thread_register() >= 0);
     /* (P) argc includes the program name and its single selector argument. */
+    if (argc == 2 && !strcmp(argv[1], "--shared-save-dirty")) return shared_save_as(true);
+    if (argc == 2 && !strcmp(argv[1], "--shared-save-clean")) return shared_save_as(false);
     if (argc == 2 && !strcmp(argv[1], "--stranded-orphan")) {
         T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
     }
@@ -671,6 +770,7 @@ int main(int argc, char **argv)
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
     T(two_process_save(false) == 0); T(two_process_save(true) == 0);
+    T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */

@@ -30,6 +30,19 @@ static int save_as(editor *e, const char *input)
     editor_buffer *b = e->buffer;
     if (!tabs_count(&e->tabs) || b->source_stale || b->pending_open) return EDITOR_ERR_ARG;
     char path[IPC_PATH_CAP]; int rc = canonical_target(input, path); if (rc) return rc;
+    /* edit-hw1: refuse before the write can invalidate a modified peer's
+     * differences-only BASE. Saved history, rather than frame dirtiness,
+     * determines whether its text may be replaced. */
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        editor_buffer *other = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (other == b || !editor_same_path(path, other->path) ||
+            (!other->saved_lost && other->history_cursor == other->saved_cursor)) continue;
+        (void)snprintf(e->file_command_notice, sizeof e->file_command_notice,
+            "%s is open and modified in another tab", tab->title);
+        e->recovery_notice = e->file_command_notice;
+        return EDITOR_ERR_ARG;
+    }
     if (!strcmp(path, b->save_path)) return editor_save_request(e, 0);
     if (b->save) {
         savectl_model model = savectl_get_model(b->save);
@@ -101,9 +114,9 @@ static int save_as(editor *e, const char *input)
     struct epoll_event event = {.events = EPOLLIN, .data.fd = fd};
     if (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &event) && errno != EEXIST) return EDITOR_ERR_IO;
     b->watch_fd = fd; b->watch_pending = false;
-    /* Same-target peers retain their text, as in the normal save completion
-     * path, but their recovery BASE and target identity must follow the inode
-     * replacement before a complete checkpoint can validate the session. */
+    /* Stage all peer BASEs together so each clean reload's complete checkpoint
+     * can validate every target. Retained closed tabs keep the existing policy;
+     * open peers adopt the saved bytes below before this command completes. */
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *other = e->buffers[i];
         if (!other || other == b || other->retired || strcmp(other->save_path, path)) continue;
@@ -118,6 +131,13 @@ static int save_as(editor *e, const char *input)
         editor_session_publish(e, other);
     }
     editor_session_publish(e, b);
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        editor_buffer *other = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (other == b || !editor_same_path(path, other->path)) continue;
+        rc = editor_reload_source(e, other, i);
+        if (rc || !other->retired) return EDITOR_ERR_IO;
+    }
     if (e->journal) {
         rc = journal_flush(e->journal);
         if (!rc) rc = editor_checkpoint(e);
@@ -131,6 +151,7 @@ int editor_file_command_service(editor *e)
         editor_activation_busy(e) || editor_save_active(e) || e->op_count || e->journal_waiting) return 0;
     keys_action command = e->file_command; e->file_command = KEYS_ACTION_NONE;
     if (e->file_command_owner != e->buffer->id || e->file_command_generation != e->buffer->source_generation) return 0;
+    e->recovery_notice = NULL;
     int rc = 0; uint64_t id;
     if (command == KEYS_ACTION_NEW_FILE) rc = editor_add_buffer(e, NULL, NULL, 0, &id);
     else if (command == KEYS_ACTION_OPEN_FILE) {
@@ -142,8 +163,8 @@ int editor_file_command_service(editor *e)
         else { if (fstat(fd, &st) || !S_ISREG(st.st_mode)) rc = EDITOR_ERR_IO; close(fd); }
         if (!rc) rc = editor_add_buffer(e, e->file_command_path, NULL, 0, &id);
     } else if (command == KEYS_ACTION_SAVE_AS) rc = save_as(e, e->file_command_path);
-    if (!rc) { e->recovery_notice = NULL; return 0; }
-    e->recovery_notice = command == KEYS_ACTION_OPEN_FILE ? "open failed" :
+    if (!rc) return 0;
+    if (!e->recovery_notice) e->recovery_notice = command == KEYS_ACTION_OPEN_FILE ? "open failed" :
         command == KEYS_ACTION_SAVE_AS ? "save as failed" : "new file failed";
     e->recovery_notice_mutations = e->stats.mutations;
     return editor_full_layout(e);

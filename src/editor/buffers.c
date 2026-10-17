@@ -433,7 +433,7 @@ static int install(editor *e, editor_buffer *b, uint64_t *id)
 /* Path resolution belongs to allocating open maintenance, never typing.
  * Match current targets, not original snapshot inodes: Save As retains its
  * original source while rebinding the tab to a different pathname. */
-static bool same_path(const char *path, const char *other)
+bool editor_same_path(const char *path, const char *other)
 {
     if (!path || !other || !*path || !*other) return false;
     char canonical[IPC_PATH_CAP], target[IPC_PATH_CAP];
@@ -447,7 +447,7 @@ static bool same_path(const char *path, const char *other)
 static size_t path_tab(editor *e, const char *path)
 {
     for (size_t i = 0; i < tabs_count(&e->tabs); i++)
-        if (same_path(path, tabs_at(&e->tabs, i)->path)) return i;
+        if (editor_same_path(path, tabs_at(&e->tabs, i)->path)) return i;
     return SIZE_MAX;
 }
 static int add_buffer(editor *e, const char *path, const uint8_t *bytes, size_t len, uint64_t *id, bool reuse)
@@ -750,7 +750,7 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         size_t existing = path_tab(e, path);
         if (existing != SIZE_MAX) members[i] = find_buffer(e, tabs_at(&e->tabs, existing)->buffer);
         for (size_t at = 0; !members[i] && at < i; at++)
-            if (same_path(path, members[at]->path)) members[i] = members[at];
+            if (editor_same_path(path, members[at]->path)) members[i] = members[at];
         if (members[i]) {
             /* (P) IPC origin coordinates preserve a retained view; coordinates
              * beyond origin explicitly reposition it. Repeated paths inherit
@@ -926,7 +926,7 @@ int editor_poll_sources(editor *e)
 
 /* Explicit Reload and clean-source refresh share replacement, view clamping,
  * empty undo history, journal reconciliation and logical tab identity. */
-static int reload_source(editor *e, editor_buffer *b, size_t tab_index)
+int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
 {
     size_t slot = 0;
     while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
@@ -1009,7 +1009,7 @@ int editor_check_sources(editor *e)
             size_t tab_index = 0;
             while (tab_index < tabs_count(&e->tabs) && tabs_at(&e->tabs, tab_index)->id != b->id) tab_index++;
             if (tab_index == tabs_count(&e->tabs)) continue; /* refresh retained closed tabs when reopened */
-            int rc = reload_source(e, b, tab_index);
+            int rc = editor_reload_source(e, b, tab_index);
             if (rc || b->retired) return rc; /* at most one replacement in a maintenance turn */
             /* Failed acquisition/reconciliation retains the old resources and
              * exposes the existing recovery choices rather than losing text. */
@@ -1063,5 +1063,5 @@ int editor_check_sources(editor *e)
         editor_large_keep(b);
         return editor_full_layout(e);
     }
-    return reload_source(e, b, tabs_active_index(&e->tabs));
+    return editor_reload_source(e, b, tabs_active_index(&e->tabs));
 }

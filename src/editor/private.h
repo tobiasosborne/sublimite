@@ -283,6 +283,8 @@ struct editor {
     /* edit-btj: startup recovery notice, shown on the status row until the
      * first mutation; recovery_aside names the set-aside source journal. */
     const char *recovery_notice;
+    /* (P) A tab title plus the Save As refusal suffix and its NUL. */
+    char file_command_notice[TABS_TITLE_BYTES + sizeof " is open and modified in another tab"];
     uint64_t recovery_notice_mutations;
     bool recovery_notice_shown, recovery_retry, recovery_skip;
     char recovery_aside[IPC_PATH_CAP];
@@ -433,6 +435,7 @@ void editor_restore_free(editor_restore *r);
 int editor_install_buffer(editor *e, editor_buffer *b, uint64_t *id);
 void editor_unpoll_buffer(editor *e, editor_buffer *b);
 size_t editor_tab_title(const char *path, const char **title);
+bool editor_same_path(const char *path, const char *other);
 /* Internal cross-file helpers; UI only. */
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);
@@ -560,6 +563,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
 void editor_buffer_destroy(editor_buffer *b);
 int editor_adopt_open(editor *e, editor_buffer *b);
 int editor_check_sources(editor *e);
+int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index);
 int editor_activate(editor *e);
 int editor_cycle_tab(editor *e, bool reverse);
 int editor_compose(editor *e);
