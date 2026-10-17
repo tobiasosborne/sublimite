@@ -85,6 +85,31 @@ static int wait_msg(uint32_t kind, file_msg *out)
     return 0;
 }
 
+static int wait_watch_changes(file *dispatcher, int fd, file *const *expected, size_t count)
+{
+    /* (E) Reuse wait_msg's existing 5000 attempts * 1 ms = 5 s allowance
+     * and 1 ms retry cadence, now bounded by monotonic elapsed time.
+     * (P) One millisecond contains 1000000 nanoseconds. Poll both event
+     * sources; poll each expected member to retry its coalesced/refused check
+     * after a worker finishes, even if completion was decoded before return. */
+    const int retry_ms = 1;
+    const uint64_t deadline = trace_now_ns() + 5000u * UINT64_C(1000000);
+    struct pollfd ready[] = { {fd, POLLIN, 0}, {work_pool_eventfd(&pool), POLLIN, 0} };
+    for (;;) {
+        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c);
+        (void)file_watch_poll(dispatcher);
+        bool changed = true;
+        for (size_t i = 0; i < count; i++) {
+            (void)file_watch_poll(expected[i]);
+            if (!file_changed(expected[i])) changed = false;
+        }
+        if (changed) return 1;
+        if (trace_now_ns() >= deadline) return 0;
+        if (poll(ready, sizeof ready / sizeof ready[0], retry_ms) < 0 && errno != EINTR)
+            return 0;
+    }
+}
+
 static _Atomic int blocker_go;
 static _Atomic int blocker_started;
 static void blocker(work_ctx *c)
@@ -288,8 +313,9 @@ static void t_astra_watch_many(void)
     }
 
     /* Closing and refreshing one member must preserve a shared parent watch.
-     * Drain through an unchanged member: both same-parent and other-parent
-     * changes must reach their own CHECK_DONE mailbox, never a status getter. */
+     * Dispatch through an unchanged member first, then retry each expected
+     * peer in the wait. Both parents' changes must install via CHECK_DONE,
+     * never a synchronous check hidden in a status getter. */
     file_close(files[0]); files[0] = NULL;
     CHECK(file_resolve_keep(files[1]) == FILE_OK);
     size_t targets[] = {2u, ASTRA_WATCH_FILES - 1u}; /* first surviving peer and other parent */
@@ -297,15 +323,10 @@ static void t_astra_watch_many(void)
         int fd = open(file_path(files[targets[i]]), O_WRONLY | O_APPEND); CHECK(fd >= 0);
         CHECK(write(fd, "changed\n", sizeof "changed\n" - 1u) == (ssize_t)(sizeof "changed\n" - 1u)); close(fd);
     }
-    CHECK(poll(&ready, 1, 2000) == 1); /* reuse t_change's existing watchdog */
     (void)file_watch_poll(files[1]);
     CHECK(!file_changed(files[targets[0]]) && !file_changed(files[targets[1]]));
-    /* Reuse wait_msg's existing watchdog and polling cadence. */
-    for (unsigned retry = 0; retry < 5000 &&
-         (!file_changed(files[targets[0]]) || !file_changed(files[targets[1]])); retry++) {
-        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c); sleep_ms(1);
-    }
-    CHECK(file_changed(files[targets[0]]) && file_changed(files[targets[1]]));
+    file *expected[] = {files[targets[0]], files[targets[1]]};
+    CHECK(wait_watch_changes(files[1], first_fd, expected, sizeof expected / sizeof expected[0]));
     CHECK(!file_changed(files[1]));
 cleanup:
     for (size_t i = 0; i < ASTRA_WATCH_FILES; i++) file_close(files[i]);
@@ -353,14 +374,15 @@ static void t_change(void)
     int fd = file_watch_start(f);
     CHECK(fd >= 0);
     CHECK(file_watch_poll(f) == 0);
+    /* (P) The API dispatches one 4096-byte batch. Queue more than that
+     * minimum record space before the target event. Each write/close pair
+     * alternates IN_MODIFY/IN_CLOSE_WRITE, so adjacent records cannot coalesce.
+     * The unrelated parent events must not satisfy the target's wait. */
+    for (size_t queued = 0; queued <= 4096u; queued += sizeof(struct inotify_event))
+        write_file("chg-noise.txt", (const uint8_t *)"x", sizeof "x" - 1u);
     int wfd = open(p, O_WRONLY | O_APPEND); CHECK(write(wfd, "x", 1) == 1); close(wfd);
-    struct pollfd pf = { fd, POLLIN, 0 };
-    CHECK(poll(&pf, 1, 2000) == 1);
-    (void)file_watch_poll(f);
-    for (unsigned i = 0; i < 5000 && !file_changed(f); i++) {
-        coll c = {0}; (void)work_mailbox_drain(&pool, on_msg, &c); sleep_ms(1);
-    }
-    CHECK(file_changed(f));
+    file *expected[] = {f};
+    CHECK(wait_watch_changes(f, fd, expected, sizeof expected / sizeof expected[0]));
     file_close(f);
 
     /* mapped inode truncated in place */

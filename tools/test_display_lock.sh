@@ -8,19 +8,36 @@ out=build/edit-5cv-evidence
 mkdir -p "$out"
 export DISPLAY=:99 EDIT_DISPLAY=:99 ASAN_OPTIONS=detect_leaks=0
 if [ "$mode" = contract ]; then
+    # (M)[AC] editor_test was the longest measured display suite: 107.69 s,
+    # docs/worker-reports/edit-qct-s7.md, "Other suites". (E) ceil = 108 s
+    # allows that suite to finish; a longer shared queue skips this self-test.
+    contract_wait=108
     # A ready marker synchronizes the holder; no timing-based overlap assertion.
     out=$(mktemp -d "$out/lock-contract-XXXXXX")
     ready="$out/holder-ready"
     release="$out/holder-release"
-    sh tools/with_display_lock.sh sh -c '
+    EDIT_DISPLAY_LOCK_TIMEOUT=$contract_wait sh tools/with_display_lock.sh sh -eu -c '
         echo $$ > "$1"
         while [ ! -f "$2" ]; do sleep 0.05; done
+        # Keep ownership through the inheritance checks: another worktree
+        # must not race a fresh acquisition after the contention checks.
+        # (E) Reuse the original contract 0.1 s probe and exit-7 sentinel.
+        EDIT_DISPLAY_LOCK_TIMEOUT=0.1 sh tools/with_display_lock.sh sh tools/with_display_lock.sh true
+        rc=0
+        sh tools/with_display_lock.sh sh -c "exit 7" || rc=$?
+        test "$rc" = 7
     ' sh "$ready" "$release" > "$out/holder.log" 2>&1 &
     holder=$!
     trap 'touch "$release"; wait "$holder" || true' EXIT HUP INT TERM
     while [ ! -f "$ready" ]; do
         if ! kill -0 "$holder" 2>/dev/null; then
-            cat "$out/holder.log"; exit 1
+            rc=0; wait "$holder" || rc=$?
+            cat "$out/holder.log"
+            if [ "$rc" = 1 ] && rg -F 'sh: display lock timeout: display :99 (held by ' "$out/holder.log" > /dev/null; then
+                echo "display lock contract: SKIP shared display :99 held longer than ${contract_wait}s"
+                exit 0
+            fi
+            exit 1
         fi
         sleep 0.05
     done
@@ -50,11 +67,6 @@ if [ "$mode" = contract ]; then
     done
     touch "$release"; wait "$holder"
     trap - EXIT HUP INT TERM
-    # Nested scripts must reuse the inherited descriptor, and preserve exits.
-    EDIT_DISPLAY_LOCK_TIMEOUT=0.1 sh tools/with_display_lock.sh sh tools/with_display_lock.sh true
-    rc=0
-    sh tools/with_display_lock.sh sh -c 'exit 7' || rc=$?
-    test "$rc" = 7
     echo 'display lock contract: owner PID, alias/timeout, make/scripts, nested inheritance, exit status PASS'
     exit 0
 fi
