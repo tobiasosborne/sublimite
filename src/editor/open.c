@@ -265,7 +265,13 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     rc = editor_preferences_font_init(e); if (rc) goto fail;
     *out = e; return 0;
 fail:
-    if (retry && e->recovery_retry) { *retry = true; strcpy(aside, e->recovery_aside); }
+    if (retry && e->recovery_retry) {
+        *retry = true; strcpy(aside, e->recovery_aside);
+        /* edit-y5x: hand cleanup to the retry. Closing this attempt must keep
+         * the empty launch journal and lock name guarding the caller's lease;
+         * the retry duplicates that lease and owns final-close cleanup. */
+        e->session_lock_owned = false;
+    }
     editor_close(e); return rc > 0 ? EDITOR_ERR_IO : rc;
 }
 int editor_open(editor **out, const editor_config *config, render_backend *backend)

@@ -1306,9 +1306,109 @@ static int c26_dense_hot_exit(void)
     return rc;
 }
 /* edit-c26 end */
+/* edit-y5x: install_failure now covers capacity deferral (edit-rzj). Force an
+ * actual install error by making a formerly missing TARGET a directory: its
+ * empty BASE still replays, but file acquisition rejects the TARGET. All
+ * numbers below are (P): zero is empty/success/the first tab, one is a single
+ * buffer or absent descriptor; geometry fits the notice plus tab/text/status.
+ * Owner-only directory permissions are the POSIX read/write/search bits. */
+typedef struct y5x_launch {
+    editor *e;
+    render_backend backend;
+    int lease;
+} y5x_launch;
+static int leased_install_failure_body(const char *root, bool leased, bool start_empty, y5x_launch *launch)
+{
+    static const char notice[] = "session recovery failed; its journal was set aside";
+    char source[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP], lock[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    T(snprintf(first, sizeof first, "%s/session-XXXXXX", root) > 0);
+    int fd = mkstemp(first); T(fd >= 0); T(close(fd) == 0);
+    T(render_null_backend(&launch->backend) == 0);
+    editor_config config = {.path = source, .journal_path = first,
+        .cols = (uint32_t)strlen(notice), .rows = 1u + 1u + 1u};
+    T(editor_open(&launch->e, &config, &launch->backend) == 0);
+    T(press(launch->e, 'M', 0, "MK") == 0);
+    editor_close(launch->e); launch->e = NULL;
+    T(mkdir(source, 0700) == 0);
+    if (leased) T(journal_session_create(root, next, sizeof next, &launch->lease) == JOURNAL_OK);
+    else {
+        T(snprintf(next, sizeof next, "%s/session-XXXXXX", root) > 0);
+        fd = mkstemp(next); T(fd >= 0); T(close(fd) == 0);
+    }
+    T(snprintf(lock, sizeof lock, "%s/.%s.lock", root, strrchr(next, '/') + 1) > 0);
+    /* (P) The profile consists of source directory + recovery journal + its
+     * lock + launch journal + optional launch lock. No other files allowed. */
+    fm4_entry before[1u + 1u + 1u + 1u + 1u], after[sizeof before / sizeof before[0]];
+    size_t nbefore = fm4_list(root, before, sizeof before / sizeof before[0]); T(nbefore != SIZE_MAX);
+    struct stat original; T(stat(first, &original) == 0);
+    launch->backend = (render_backend){0}; T(render_null_backend(&launch->backend) == 0);
+    config = (editor_config){.journal_path = next, .session_lease = leased ? &launch->lease : NULL,
+        .start_empty = start_empty, .cols = (uint32_t)strlen(notice), .rows = 1u + 1u + 1u};
+    int rc = editor_open(&launch->e, &config, &launch->backend);
+    fprintf(stderr, "edit-y5x: leased=%s start_empty=%s editor_open=%d\n",
+        leased ? "yes" : "no", start_empty ? "yes" : "no", rc);
+    T(rc == 0 && launch->e);
+    editor *e = launch->e;
+    T(e->recovery_notice && !strcmp(e->recovery_notice, notice));
+    T(e->buffer && piece_len(e->tree) == 0 && tabs_count(&e->tabs) == (start_empty ? 0u : 1u));
+    if (start_empty) {
+        T(e->buffer == e->empty);
+        for (size_t i = 0; i < e->buffer_capacity; i++) T(!e->buffers[i]);
+    } else T(!editor_tab(e, 0)->modified);
+    T(*e->recovery_aside && access(first, F_OK) < 0 && file_contains(e->recovery_aside, "MK"));
+    size_t nafter = fm4_list(root, after, sizeof after / sizeof after[0]);
+    T(nafter == nbefore + (leased ? 0u : 1u)); /* (P) only a non-leased launch creates its lock here. */
+    for (size_t i = 0; i < nbefore; i++) {
+        if (!strcmp(before[i].name, strrchr(next, '/') + 1)) {
+            if (start_empty) {
+                struct stat empty; T(stat(next, &empty) == 0 && empty.st_size == 0);
+                T(empty.st_dev == before[i].st.st_dev && empty.st_ino == before[i].st.st_ino);
+            }
+            continue; /* a live tab may already have appended to the destination */
+        }
+        const char *name = !strcmp(before[i].name, strrchr(first, '/') + 1) ?
+            strrchr(e->recovery_aside, '/') + 1 : before[i].name;
+        size_t j = 0; while (j < nafter && strcmp(name, after[j].name)) j++;
+        T(j < nafter);
+        const struct stat *a = &before[i].st, *b = &after[j].st;
+        T(a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size && a->st_mode == b->st_mode);
+        T(a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec);
+    }
+    struct stat named, held; T(stat(lock, &named) == 0);
+    T(e->session_lock_owned);
+    T(fstat(e->session_lock, &held) == 0 && held.st_dev == named.st_dev && held.st_ino == named.st_ino);
+    if (leased) T(fstat(launch->lease, &held) == 0 && held.st_dev == named.st_dev && held.st_ino == named.st_ino);
+    char aside[IPC_PATH_CAP]; strcpy(aside, e->recovery_aside);
+    editor_close(e); launch->e = NULL;
+    struct stat st; T(stat(aside, &st) == 0 && st.st_ino == original.st_ino && st.st_size == original.st_size);
+    if (start_empty) T(access(next, F_OK) < 0 && access(lock, F_OK) < 0);
+    else {
+        T(stat(next, &st) == 0 && st.st_size > 0);
+        T(stat(lock, &st) == 0 && st.st_dev == named.st_dev && st.st_ino == named.st_ino);
+        if (leased) T(journal_session_release(next, launch->lease) == JOURNAL_BUSY);
+    }
+    puts("edit-y5x: empty buffer, set-aside notice, profile preservation and close consistency passed");
+    return 0;
+}
+static int leased_install_failure(bool leased, bool start_empty)
+{
+    char root[] = "build/editor-y5x-XXXXXX"; T(mkdtemp(root));
+    y5x_launch launch = {.lease = -1}; /* (P) no descriptor yet */
+    int rc = leased_install_failure_body(root, leased, start_empty, &launch);
+    if (launch.e) editor_close(launch.e);
+    if (launch.lease >= 0) close(launch.lease);
+    char source[IPC_PATH_CAP];
+    if (snprintf(source, sizeof source, "%s/source", root) > 0) (void)rmdir(source);
+    fm4_remove_tree(root);
+    return rc;
+}
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(leased_install_failure(false, false) == 0);
+    T(leased_install_failure(true, false) == 0);
+    T(leased_install_failure(true, true) == 0);
     T(clean_tab_set() == 0);
     T(large_restore() == 0);
     T(large_orphans() == 0);
