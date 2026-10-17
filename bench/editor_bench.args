@@ -1,1 +1,1 @@
---track
+--track --no-idle --no-p4 --serial-only --keys=64

@@ -179,13 +179,17 @@ static bool results_equal(const find_result *a,const find_result *b)
 }
 static int measure_row(work_pool *pool,const row *r,size_t samples,bool quick)
 {
+    bool require_a=strcmp(r->name,"G6_dense_a")==0 || strncmp(r->name,"G6v_",4)==0;
     int fd=open(r->file,O_RDONLY); struct stat st;
+    if(fd<0 && errno==ENOENT && quick && require_a) {
+        printf("SKIP name=%s file=%s (quick: optional all-a fixture absent; full mode requires it)\n",r->name,r->file);
+        return 0;
+    }
     if(fd<0 || fstat(fd,&st)!=0 || st.st_size!=(off_t)r->full_size) {
         fprintf(stderr,"fixture missing/wrong size: %s\n",r->file); if(fd>=0) (void)close(fd); return 1;
     }
     size_t n=quick?QUICK_BYTES:r->full_size;
     find_result want;
-    bool require_a=strcmp(r->name,"G6_dense_a")==0 || strncmp(r->name,"G6v_",4)==0;
     if(!warm_oracle(fd,n,r->needle,r->nn,&want,require_a)) { fprintf(stderr,"warming/oracle failed\n"); (void)close(fd); return 1; }
     if(!quick && strcmp(r->name,"G6_newline")==0 && want.total!=8947841) { fprintf(stderr,"log newline fixture mismatch\n"); (void)close(fd); return 1; }
     if(!quick && strcmp(r->name,"periodic_dense")==0 && (want.total!=8388607 || want.offsets[0]!=6)) { fprintf(stderr,"periodic fixture mismatch\n"); (void)close(fd); return 1; }
@@ -234,9 +238,14 @@ static int measure_row(work_pool *pool,const row *r,size_t samples,bool quick)
     fflush(stdout); edit_arena_free(&arena); (void)close(fd);
     return !correct || structural ? 1:0;
 }
-static int measure_cancel(work_pool *pool,const row *r,size_t samples)
+static int measure_cancel(work_pool *pool,const row *r,size_t samples,bool quick)
 {
-    int fd=open(r->file,O_RDONLY); if(fd<0) return 1;
+    int fd=open(r->file,O_RDONLY);
+    if(fd<0 && errno==ENOENT && quick) {
+        printf("SKIP name=G6c file=%s (quick: optional all-a fixture absent; full mode requires it)\n",r->file);
+        return 0;
+    }
+    if(fd<0) return 1;
     find_result want; if(!warm_oracle(fd,GIB,r->needle,r->nn,&want,true)) { (void)close(fd); return 1; }
     uint64_t logical[SAMPLE_CAP],observed[SAMPLE_CAP],cpu_values[SAMPLE_CAP]; bench_samples ack,stop,cpu;
     bench_samples_init(&ack,logical,SAMPLE_CAP); bench_samples_init(&stop,observed,SAMPLE_CAP);
@@ -307,7 +316,7 @@ static int run_bench(void *arg)
     for(size_t i=0;i<sizeof rows/sizeof rows[0];i++) if(!only || strcmp(only,rows[i].name)==0) {
         found=true; miss|=measure_row(&pool,&rows[i],samples,quick);
     }
-    if(!only || strcmp(only,"G6c")==0) { found=true; miss|=measure_cancel(&pool,&rows[3],samples); }
+    if(!only || strcmp(only,"G6c")==0) { found=true; miss|=measure_cancel(&pool,&rows[3],samples,quick); }
     if(!found) miss=1;
     work_pool_shutdown(&pool);
     printf("find_bench: %s%s\n",miss?"STRUCTURAL FAILURE":"rows printed (MISS is a note)",quick?" (quick: limits off)":"");
