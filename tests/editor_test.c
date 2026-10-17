@@ -190,6 +190,46 @@ static int trailing_disabled_scan(void)
     puts("trailing none: range computation bypassed passed");
     return 0;
 }
+static int paint_all_void(void)
+{
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    T(trailing_open(&e, &backend, "prefix\n()  \n", NULL, &count) == 0);
+    /* (P) Reuse trailing_open's geometry. The top follows the prefix (minus
+     * its string NUL), with a label past the exact line count. Clipping every
+     * row leaves the layout position at zero, below that top. Zero also
+     * denotes success, no error and blank cells. */
+    T(editor_begin_frame(e) == 0); e->paint_ready = false;
+    e->v.state.first_byte = e->lay.first_byte = sizeof "prefix\n" - 1u; e->lay.pos = 0;
+    e->v.state.first_line = e->lay.first_line = e->buffer->lines;
+    e->buffer->scroll.first_byte = e->v.state.first_byte;
+    e->buffer->scroll.first_line = e->buffer->scroll.anchor_line = e->v.state.first_line;
+    e->buffer->scroll_display = e->buffer->scroll;
+    e->preferences.trailing = CONFIG_TRAILING_ALL;
+    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) e->row_byte[r] = LAYOUT_VOID_ROW;
+    T(layout_relayout_rows(&e->lay, 0, e->text_grid.dims.rows) >= 0);
+    while (layout_busy(&e->lay)) T(layout_run(&e->lay) >= 0);
+    T(e->lay.pos < e->v.state.first_byte);
+    size_t frames = count.frames;
+    int prepared = editor_paint_prepare(e);
+    int step = editor_step(e, 0);
+    int latched = e->error;
+    printf("all-void paint: prepare=%d step=%d latched=%d\n", prepared, step, latched);
+    if (prepared == 0 && step >= 0) T(settle(e) == 0);
+    bool blank_frame = count.frames > frames && e->paint_ready &&
+        e->bracket_source == INDENT_NONE && e->bracket_mate == INDENT_NONE && e->ws_count == 0;
+    for (uint32_t r = 0; r < e->text_grid.dims.rows; r++) {
+        blank_frame &= e->row_byte[r] == LAYOUT_VOID_ROW;
+        for (uint32_t c = 0; c < e->text_grid.dims.cols; c++) {
+            const render_cell *cell = &e->text_grid.cells[(size_t)r * e->text_grid.dims.cols + c];
+            blank_frame &= cell->glyph_index == 0 && cell->atlas_slot == RENDER_NO_SLOT &&
+                cell->attrs == 0 && cell->bg == (c < e->lay.gw ? e->lay.cfg.gutter_bg : e->lay.cfg.bg);
+        }
+    }
+    editor_close(e);
+    T(prepared == 0); T(step == EDITOR_OK || step == EDITOR_MORE); T(latched == 0); T(blank_frame);
+    puts("all-void paint: blank frame submitted passed");
+    return 0;
+}
 /* edit-g11: use the drive's keystroke count (G: the supplied typing repro),
  * and the allocation fixture's grid geometry. Storage covers cfg.rows times
  * the editor's existing eight-column minimap, including the chrome row. */
@@ -4807,6 +4847,8 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
+        /* (P) argv[1] is the selector after the program name. */
+        if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
         if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
         if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
         if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
@@ -4902,6 +4944,7 @@ int main(int argc, char **argv)
     if (only) return review_suite(only);
     T(trailing_typing(NULL) == 0); T(trailing_all() == 0);
     T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
+    T(paint_all_void() == 0);
     T(duplicate_path_contract() == 0);
     T(o20_all() == 0);
     T(g02_find_return() == 0);

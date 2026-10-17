@@ -71,6 +71,9 @@ int editor_paint_prepare(editor *e)
         if (end != LAYOUT_VOID_ROW && end > hi) hi = end;
     }
     if (hi > piece_len(e->tree)) hi = piece_len(e->tree);
+    /* (P) All-void rows can leave pos below the viewport start. Equal
+     * endpoints form an empty range and keep the subtraction from wrapping. */
+    if (hi < lo) hi = lo;
     /* No-wrap may skip an unbounded unused line tail. Decorations use only
      * its bounded prepared byte window; a cropped whitespace run is omitted
      * by indent until a visible terminator establishes it. */
