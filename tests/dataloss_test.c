@@ -498,22 +498,38 @@ static int reload_vs_keystroke(unsigned turns_between)
     editor_close(e); remove_tree(root); return 0;
 }
 
-/* (10a) Two processes edit and save the same file. Whoever loses the race
- * must know: a dirty buffer with a stale prompt or a save error, never a
- * clean tab over foreign bytes. */
+/* (10a) Two processes edit and save the same file. The outcomes are (P,
+ * literal insertions at the beginning of "base"): A saves "Abase" and B
+ * retains dirty "Bbase" with a stale prompt or save error; B saves "Bbase"
+ * and A retains stale "Abase"; or clean B reloads "Abase", types "B", and
+ * saves exactly "BAbase". A displaced edit must remain visible; a merged
+ * save must contain both contributions and leave B clean without an error. */
 typedef struct race_oracle { int save_error; bool modified, stale; oracle text; } race_oracle;
-static int two_process_child(const char *source, const char *jpath, const int *lease, int go, int fd)
+static int two_process_child(const char *source, const char *jpath, const int *lease, int go, int fd, bool reload_before_type)
 {
     render_backend backend; editor *e; T(open_editor_leased(&e, &backend, source, jpath, lease) == 0);
-    T(press(e, 'B', 0, "B") == 0);
+    if (reload_before_type) {
+        T(text_is(e, "base") == 0);
+        /* (P) One ready byte proves B opened the old base before A saves. */
+        T(write(fd, "r", sizeof(char)) == (ssize_t)sizeof(char));
+    } else T(press(e, 'B', 0, "B") == 0);
     uint8_t byte; ssize_t n; do n = read(go, &byte, 1); while (n < 0 && errno == EINTR); T(n == 1);
-    /* No turn between the parent's save and our Ctrl+S: the change notification
-     * and the key race inside one turn. */
+    if (reload_before_type) {
+        /* The suite can fork after the process-wide inotify fd exists.
+         * Probe explicitly: A's polling must not consume B's notice. */
+        T(file_check(e->buffer->file, NULL));
+        uint64_t limit = deadline();
+        while (editor_length(e) != strlen("Abase")) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+        T(text_is(e, "Abase") == 0); T(!editor_tab(e, 0)->modified);
+        T(press(e, 'B', 0, "B") == 0);
+    }
+    /* The race variant makes no turn between A's save and Ctrl+S; the
+     * ordered variant proves a clean reload before B types and saves. */
     T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
     race_oracle o = {.save_error = e->buffer->save_error, .modified = editor_tab(e, 0)->modified, .stale = e->buffer->source_stale};
     T(capture(e, &o.text) == 0); T(write(fd, &o, sizeof o) == (ssize_t)sizeof o); _exit(0);
 }
-static int two_process_save(void)
+static int two_process_save(bool reload_before_type)
 {
     char root[64], source[128], first[128], second[128]; T(make_root(root, sizeof root) == 0);
     T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
@@ -522,10 +538,15 @@ static int two_process_save(void)
     T(make_leased_session(root, second, sizeof second, &second_lease) == 0);
     int go[2], report[2]; T(pipe(go) == 0); T(pipe(report) == 0);
     pid_t child = fork(); T(child >= 0);
-    if (!child) { close(first_lease); close(go[1]); close(report[0]); _exit(two_process_child(source, second, &second_lease, go[0], report[1])); }
+    if (!child) { close(first_lease); close(go[1]); close(report[0]); _exit(two_process_child(source, second, &second_lease, go[0], report[1], reload_before_type)); }
     close(second_lease); close(go[0]); close(report[1]);
     render_backend backend; editor *e; T(open_editor_leased(&e, &backend, source, first, &first_lease) == 0);
     close(first_lease); /* the editor holds its own duplicate */
+    if (reload_before_type) {
+        uint8_t ready; ssize_t n;
+        do n = read(report[0], &ready, sizeof ready); while (n < 0 && errno == EINTR);
+        T(n == (ssize_t)sizeof ready);
+    }
     T(press(e, 'A', 0, "A") == 0); T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
     T(!e->buffer->save_error); T(disk_is(source, "Abase") == 0);
     T(write(go[1], "g", 1) == 1); close(go[1]);
@@ -540,12 +561,20 @@ static int two_process_save(void)
     uint64_t limit = deadline();
     while (trace_now_ns() < limit && !e->buffer->source_stale) { T(turn(e) == 0); sched_yield(); }
     char disk[TEXT_CAP]; ssize_t n = read_file(source, disk, sizeof disk);
-    fprintf(stderr, "dataloss_test: two_process_save disk=[%.*s] A(stale=%d modified=%d) B(err=%d stale=%d modified=%d text=[%.*s])\n",
-        n > 0 ? (int)n : 0, disk, e->buffer->source_stale, editor_tab(e, 0)->modified, b.save_error, b.stale, b.modified, (int)b.text.len, b.text.text);
-    bool a_won = n == 5 && !memcmp(disk, "Abase", 5), b_won = n == 5 && !memcmp(disk, "Bbase", 5);
-    T(a_won || b_won);
-    if (a_won) { T(b.modified && (b.save_error || b.stale)); T(b.text.len == 5 && !memcmp(b.text.text, "Bbase", 5)); }
-    else { T(e->buffer->source_stale); T(text_is(e, "Abase") == 0); }
+    fprintf(stderr, "dataloss_test: two_process_save reload_before_type=%d disk=[%.*s] A(stale=%d modified=%d) B(err=%d stale=%d modified=%d text=[%.*s])\n",
+        reload_before_type, n > 0 ? (int)n : 0, disk, e->buffer->source_stale, editor_tab(e, 0)->modified, b.save_error, b.stale, b.modified, (int)b.text.len, b.text.text);
+    /* (P) Exact lengths are the byte counts of the expected literals. */
+    bool a_won = n == (ssize_t)strlen("Abase") && !memcmp(disk, "Abase", strlen("Abase"));
+    bool b_won = n == (ssize_t)strlen("Bbase") && !memcmp(disk, "Bbase", strlen("Bbase"));
+    bool merged = n == (ssize_t)strlen("BAbase") && !memcmp(disk, "BAbase", strlen("BAbase"));
+    T(a_won || b_won || merged);
+    if (reload_before_type) T(merged);
+    if (a_won) { T(b.modified && (b.save_error || b.stale)); T(b.text.len == strlen("Bbase") && !memcmp(b.text.text, "Bbase", strlen("Bbase"))); }
+    else if (b_won) { T(e->buffer->source_stale); T(text_is(e, "Abase") == 0); }
+    else {
+        T(!b.save_error && !b.modified && !b.stale);
+        T(b.text.len == strlen("BAbase") && !memcmp(b.text.text, "BAbase", strlen("BAbase")));
+    }
     editor_close(e); remove_tree(root); return 0;
 }
 
@@ -633,6 +662,7 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--stranded-orphan")) {
         T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "--two-process-reload")) return two_process_save(true);
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
@@ -640,7 +670,7 @@ int main(int argc, char **argv)
     T(save_during_prompt(true) == 0); T(save_during_prompt(false) == 0);
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
-    T(two_process_save() == 0);
+    T(two_process_save(false) == 0); T(two_process_save(true) == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */
