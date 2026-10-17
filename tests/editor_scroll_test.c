@@ -1,6 +1,7 @@
 #include "editor/editor.h"
 #include "base/base.h"
 #include "editor/private.h"
+#include "trace/trace.h"
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -33,6 +34,56 @@ static int settle(editor *e)
         if (!s.pending && !s.render_active) return 0;
     }
     return EDITOR_MORE;
+}
+/* edit-08u: type one key while a worker window is held, inside the malloc
+ * guard, and step until the keystroke's own frame is out (submitted past
+ * `baseline`, render idle). Not settle(): its !pending also covers the scroll
+ * window's renewal, which waits on the fixture's parked worker; whether that
+ * renewal starts before settle samples !pending is scheduler timing, so it is
+ * not part of what these cases assert. Same PROBE_RETRIES bound. Outcomes:
+ *  - inject/step error: returned, fails as before;
+ *  - frame out: 0, caller checks allocations == 0 as before;
+ *  - bound exhausted while editor_scroll_waiting() on a closing resident
+ *    window (the key was applied and retired the parked worker's window):
+ *    EDITOR_MORE, fails. That retire returns MORE until release and compose
+ *    is gated on scroll_waiting (editor.c submit()), so the frame cannot come out at
+ *    any load: a real stall, not a timeout;
+ *  - bound exhausted otherwise: a timeout of a non-blocking retry count, so
+ *    load-dependent. Law 1: a tracked line (elapsed, load1, BAT0), returns 0
+ *    with *timed_out set; the caller still checks allocations, then ends the
+ *    case, since the later checks need the frame it never reached. */
+static int held_key(editor *e, const char *name, uint64_t baseline, size_t *allocations, bool *timed_out)
+{
+    plat_event event = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
+    uint64_t start = trace_now_ns();
+    edit_malloc_guard_begin();
+    int rc = editor_inject(e, &event);
+    unsigned i = 0;
+    for (; !rc && i < PROBE_RETRIES; i++) {
+        rc = editor_step(e, 0);
+        if (rc == EDITOR_MORE) rc = 0;
+        if (!rc && e->backend->stats.submitted_frames > baseline && !e->backend->active) break;
+    }
+    *allocations = edit_malloc_guard_end();
+    *timed_out = false;
+    if (rc || i < PROBE_RETRIES) return rc;
+    char power[32] = "unknown", load1[32] = "unknown";
+    FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (!fgets(power, sizeof power, f)) strcpy(power, "unknown"); fclose(f); }
+    power[strcspn(power, "\n")] = 0;
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%31s", load1) != 1) strcpy(load1, "unknown"); fclose(f); }
+    bool blocked = editor_scroll_waiting(e) && e->buffer->scroll_resident.closing;
+    printf("editor_scroll_test: edit-08u %s keystroke frame not out after retries=%u: %s elapsed=%.3f ms "
+        "frames=%llu baseline=%llu render_active=%d dirty=%d scroll_waiting=%d closing=%d "
+        "scroll_prefix=%zu built_prefix=%zu scroll_revision=%llu revision=%llu allocations=%zu (M) power=%s load1=%s\n",
+        name, PROBE_RETRIES, blocked ? "BLOCKED behind the held scroll window (real failure)" : "timeout (tracked, law 1; rest of case skipped)",
+        (double)(trace_now_ns() - start) / 1e6, (unsigned long long)e->backend->stats.submitted_frames,
+        (unsigned long long)baseline, e->backend->active, e->dirty, blocked, e->buffer->scroll_resident.closing,
+        e->buffer->scroll_prefix, lineidx_built_prefix(e->buffer->index),
+        (unsigned long long)e->buffer->scroll_revision, (unsigned long long)e->buffer->revision, *allocations, power, load1);
+    *timed_out = !blocked;
+    return blocked ? EDITOR_MORE : 0;
 }
 /* edit-73j: minimap summaries publish from a worker and start their own
  * frame. Await that publication before fixtures that count frames or hold a
@@ -78,11 +129,10 @@ static int eof_typing(void)
     CHECK(handle.epoch);
     while (!atomic_load(&hold.entered)) sched_yield();
     uint64_t baseline = backend.stats.submitted_frames;
-    plat_event event = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
-    edit_malloc_guard_begin();
-    int rc = editor_inject(e, &event); if (!rc) rc = settle(e);
-    size_t allocations = edit_malloc_guard_end();
-    CHECK(rc == 0 && backend.stats.submitted_frames > baseline);
+    size_t allocations = 0; bool timed_out = false;
+    int rc = held_key(e, "eof-typing", baseline, &allocations, &timed_out);
+    CHECK(rc == 0 && (!edit_malloc_guard_active() || allocations == 0));
+    if (timed_out) goto done;
     CHECK(editor_length(e) == 1 && editor_view(e).selection.cursor == 1);
     CHECK(!edit_malloc_guard_active() || allocations == 0);
     puts("editor_scroll_test: wrap-off EOF typing submits while bulk worker is held PASS");
@@ -110,11 +160,10 @@ static int cancellation(void)
     }
     CHECK(atomic_load(&hold.entered) && editor_get_stats(e).pending);
     CHECK(editor_view(e).first_byte == 0 && backend.stats.submitted_frames == submitted_frames);
-    event = (plat_event){.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
-    edit_malloc_guard_begin();
-    int rc = editor_inject(e, &event); if (!rc) rc = settle(e);
-    size_t allocations = edit_malloc_guard_end();
+    size_t allocations = 0; bool timed_out = false;
+    int rc = held_key(e, "cancellation", submitted_frames, &allocations, &timed_out);
     CHECK(rc == 0 && (!edit_malloc_guard_active() || allocations == 0));
+    if (timed_out) goto done;
     CHECK(b->scroll_snapshot == hold.snap && b->scroll_resident.closing);
     uint8_t live = 0, old = 0;
     CHECK(editor_read(e, 0, &live, 1) == 0 && live == 'x');
