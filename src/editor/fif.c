@@ -17,6 +17,10 @@
 /* (P) Decimal digits of UINT64_MAX. */
 #define FIF_DIGITS 20u
 static const char ellipsis[] = " ...";
+/* edit-5vz: the row (and, without its LF, the fallback notice) that ends
+ * results the results buffer refused to store. */
+static const char full_row[] = "Search truncated (results buffer full)\n";
+static const char full_notice[] = "Search truncated (results buffer full)";
 
 int editor_fif_init(editor *e)
 {
@@ -84,7 +88,7 @@ bool editor_fif_results_active(const editor *e)
 static bool assembling(const editor *e)
 {
     const editor_fif *f = &e->fif;
-    return f->current.live && editor_fif_results_active(e) &&
+    return f->current.live && !f->full && editor_fif_results_active(e) &&
         (f->assembled < available(f) || (f->done_received && !f->summary_written));
 }
 bool editor_fif_runnable(const editor *e)
@@ -110,8 +114,43 @@ static size_t put_number(uint8_t *out, size_t at, uint64_t value, size_t width)
     while (count) out[at++] = (uint8_t)digits[--count];
     return at;
 }
-/* Owner appends: line maps are recorded in results-buffer bytes, monotonic. */
-static int assemble(editor *e, uint64_t deadline)
+/* edit-5vz: the status-row notice (edit-btj), shown until the next mutation. */
+static void notice(editor *e, const char *text)
+{
+    e->recovery_notice = text; e->recovery_notice_mutations = e->stats.mutations;
+    (void)editor_begin_frame(e);
+}
+/* edit-5vz: an append the piece allocator or the line index refuses leaves
+ * the tree unchanged (piece.h, editor_results_append): it sets *full and is
+ * no error. An rc with the tree changed is the shared change bookkeeping's
+ * (layout, scroll, frame), which every edit propagates. */
+static int flush(editor *e, const uint8_t *bytes, size_t length, bool *full)
+{
+    uint64_t before = piece_len(e->tree);
+    int rc = editor_results_append(e, bytes, length);
+    if (!rc || piece_len(e->tree) != before) return rc;
+    *full = true; return 0;
+}
+/* edit-5vz: stop assembly and the search; append the truncation row, or
+ * show it as a notice when the buffer refuses even the row. */
+static int truncate_full(editor *e)
+{
+    editor_fif *f = &e->fif;
+    f->full = f->summary_written = true;
+    (void)editor_fif_cancel(e);
+    uint8_t *out = e->indent_bytes;
+    size_t used = 0;
+    if (f->assembled) out[used++] = '\n';
+    used = put_text(out, used, full_row);
+    bool refused = false;
+    int rc = flush(e, out, used, &refused);
+    if (refused) notice(e, full_notice);
+    return rc;
+}
+/* Owner appends: line maps are recorded in results-buffer bytes, monotonic.
+ * edit-5vz: maps of hits staged after the last stored append (from batch)
+ * are dropped with their bytes when an append is refused. */
+static int assemble(editor *e, uint64_t deadline, bool *full)
 {
     editor_fif *f = &e->fif;
     uint8_t *out = e->indent_bytes;
@@ -122,14 +161,15 @@ static int assemble(editor *e, uint64_t deadline)
     const size_t worst = 1u + FIF_PATH_BYTES + 2u + FIF_DIGITS + 2u + FIF_DEFAULT_CONTEXT + sizeof ellipsis - 1u + 1u;
     uint64_t base = piece_len(e->tree);
     size_t used = 0;
-    uint32_t limit = available(f);
+    uint32_t limit = available(f), batch = f->assembled;
     int rc = 0;
     while (f->assembled < limit) {
         fif_result_view hit;
         if (fif_results(&f->current.job, f->assembled, &hit) != FIF_OK) break;
         if (used + worst > cap) {
-            rc = editor_results_append(e, out, used); if (rc) return rc;
-            base = piece_len(e->tree); used = 0;
+            rc = flush(e, out, used, full); if (rc) return rc;
+            if (*full) { f->assembled = batch; return 0; }
+            base = piece_len(e->tree); used = 0; batch = f->assembled;
         }
         uint32_t k = f->assembled;
         bool same_line = f->last_file == hit.hit.file_index && f->last_line == hit.hit.line;
@@ -169,9 +209,10 @@ static int assemble(editor *e, uint64_t deadline)
         f->assembled++;
         if (trace_now_ns() >= deadline) break;
     }
-    return used ? editor_results_append(e, out, used) : rc;
+    if (used) { rc = flush(e, out, used, full); if (*full) f->assembled = batch; }
+    return rc;
 }
-static int summary(editor *e)
+static int summary(editor *e, bool *full)
 {
     editor_fif *f = &e->fif;
     uint8_t *out = e->indent_bytes;
@@ -195,7 +236,7 @@ static int summary(editor *e)
         used = put_number(out, used, d->errors, 0);
         used = put_text(out, used, d->errors == 1u ? " unreadable entry\n" : " unreadable entries\n");
     }
-    return editor_results_append(e, out, used);
+    return flush(e, out, used, full);
 }
 /* Highlight the visible hits' match ranges with the find-match style. */
 static void fill_ranges(editor *e)
@@ -229,11 +270,13 @@ int editor_fif_service(editor *e)
     if (!f->current.live) return 0;
     if (editor_fif_runnable(e)) {
         uint64_t deadline = trace_now_ns() + WORK_DRAIN_BUDGET_NS;
-        int rc = assemble(e, deadline); if (rc) return rc;
-        if (f->done_received && !f->summary_written && f->assembled == available(f) && trace_now_ns() < deadline) {
+        bool full = false;
+        int rc = assemble(e, deadline, &full); if (rc) return rc;
+        if (!full && f->done_received && !f->summary_written && f->assembled == available(f) && trace_now_ns() < deadline) {
             f->summary_written = true;
-            rc = summary(e); if (rc) return rc;
+            rc = summary(e, &full); if (rc) return rc;
         }
+        if (full) { rc = truncate_full(e); if (rc) return rc; }
     }
     fill_ranges(e);
     return 0;
@@ -285,41 +328,53 @@ int editor_fif_start(editor *e)
         memcpy(filter, f->where + end + 1u, n); filter[n] = 0;
         for (size_t i = 0; i < n && !include; i++) if (filter[i] != ' ' && filter[i] != '\t') include = filter;
     }
-    if (f->current.live) {
-        if (f->retiring.live) {
-            if (!fif_job_finished(&f->retiring.job) || fif_job_dispose(&f->retiring.job) != FIF_OK) {
-                e->stats.rejected_commands++; return 0;
-            }
-            f->retiring = (editor_fif_slot){0};
+    if (f->current.live && f->retiring.live) {
+        if (!fif_job_finished(&f->retiring.job) || fif_job_dispose(&f->retiring.job) != FIF_OK) {
+            e->stats.rejected_commands++; return 0;
         }
-        if (f->running) work_cancel(&e->pool, f->current.search);
-        f->retiring = f->current; f->current = (editor_fif_slot){0};
+        f->retiring = (editor_fif_slot){0};
     }
     fif_request request = {.root = root, .query = state.query, .query_length = state.query_length,
         .options = {state.options.regex, state.options.match_case, state.options.whole_word},
         .include = include};
-    if (fif_job_init(&f->current.job, &request) != FIF_OK) {
-        f->current = (editor_fif_slot){0}; e->stats.rejected_commands++; return 0;
+    fif_job job = {0};
+    if (fif_job_init(&job, &request) != FIF_OK) { e->stats.rejected_commands++; return 0; }
+    /* The in-buffer finder stops tracking: it would otherwise re-search the
+     * results buffer on the single bulk lane after every append. Ctrl+F or
+     * F3 reopens it with the same query. The panel closes before the results
+     * tab opens (the text geometry settles for the old buffer first). */
+    (void)findui_show(&e->find, false, false);
+    e->find_visible = false; f->mode = f->where_focus = f->where_all = false;
+    int rc = editor_text_geometry(e);
+    if (rc) { (void)fif_job_dispose(&job); return rc; }
+    /* edit-5vz: the fresh results buffer exists before anything is submitted.
+     * A refused open (activation busy, no tab or buffer slot) submits
+     * nothing: the old results text and the old search stay. */
+    rc = editor_results_open(e, &f->results_id);
+    if (rc) {
+        (void)fif_job_dispose(&job);
+        if (rc != EDITOR_ERR_CAPACITY && rc != EDITOR_ERR_ARG) return rc;
+        e->stats.rejected_commands++; notice(e, "find in files: no results tab available");
+        return 0;
     }
+    if (f->current.live) {
+        if (f->running) work_cancel(&e->pool, f->current.search);
+        f->retiring = f->current; f->current = (editor_fif_slot){0};
+    }
+    f->current.job = job;
+    f->received = f->assembled = f->files = 0; f->last_line = 0;
+    f->last_file = f->visited = FIF_NONE;
+    f->done = (fif_done){0}; f->done_received = f->summary_written = f->full = false;
     if (!++f->generation) f->generation++;
     work_handle handle = fif_submit(&e->pool, &f->current.job, f->generation);
     if (!handle.epoch) {
         (void)fif_job_dispose(&f->current.job); f->current = (editor_fif_slot){0};
-        e->stats.rejected_commands++; return 0;
+        e->stats.rejected_commands++; notice(e, "find in files could not start");
+        return 0;
     }
     f->current.search = handle; f->current.generation = f->generation; f->current.live = true;
-    f->received = f->assembled = f->files = 0; f->last_line = 0;
-    f->last_file = f->visited = FIF_NONE;
-    f->done = (fif_done){0}; f->done_received = f->summary_written = false; f->running = true;
-    /* The in-buffer finder stops tracking: it would otherwise re-search the
-     * results buffer on the single bulk lane after every append. Ctrl+F or
-     * F3 reopens it with the same query. */
-    (void)findui_show(&e->find, false, false);
-    e->find_visible = false; f->mode = f->where_focus = f->where_all = false;
-    int rc = editor_text_geometry(e); if (rc) return rc;
-    rc = editor_results_open(e, &f->results_id);
-    if (rc == EDITOR_ERR_CAPACITY || rc == EDITOR_ERR_ARG) { e->stats.rejected_commands++; rc = 0; }
-    return rc;
+    f->running = true;
+    return 0;
 }
 /* Where field editing; the query field keeps findpanel's editor. */
 static void where_edit(editor_fif *f, size_t at, size_t erase, const uint8_t *bytes, size_t add)

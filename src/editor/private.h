@@ -172,6 +172,7 @@ typedef struct editor_fif {
     char where[PATH_MAX];
     size_t where_length, where_cursor;
     bool mode, where_focus, where_all, running, done_received, summary_written;
+    bool full; /* edit-5vz: an append was refused; assembly stopped */
     bool ranges_owned; /* e->find_ranges currently hold results marks */
 } editor_fif;
 typedef struct editor_wait {

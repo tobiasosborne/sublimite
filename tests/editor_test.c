@@ -4872,6 +4872,180 @@ static int n95_find_in_files(void)
     return 0;
 }
 
+/* edit-5vz: find in files results-tab failures are refusals, never fail().
+ * A results append the piece allocator refuses truncates the results with a
+ * row (or, when even the row cannot be stored, a status notice); a refused
+ * results-tab open submits nothing and keeps the old results text. */
+static const char n5vz_full[] = "Search truncated (results buffer full)\n";
+static int n5vz_query(editor *e, const char *query, const char *where)
+{
+    T(press(e, key(XKB_KEY_f, N95_CS, NULL)) == 0); T(e->fif.mode && !e->fif.where_focus);
+    T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
+    T(n95_type(e, query) == 0);
+    T(press(e, key(XKB_KEY_Tab, 0, NULL)) == 0); T(e->fif.where_focus && e->fif.where_all);
+    T(n95_type(e, where) == 0);
+    return 0;
+}
+/* settle() with the failing step's rc printed: the red line of this bead. */
+static int n5vz_settle(editor *e)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* settle()'s bound */
+    do {
+        int rc = editor_step(e, 20);
+        if (rc != EDITOR_OK && rc != EDITOR_MORE) {
+            fprintf(stderr, "edit-5vz: editor_step rc %d error_cause %d\n", rc, editor_get_stats(e).error_cause);
+            return 1;
+        }
+        editor_stats s = editor_get_stats(e);
+        if (!s.pending && !s.render_active) return 0;
+    } while (trace_now_ns() < deadline);
+    T(false); return 1;
+}
+static int n5vz_tail(editor *e, const char *tail)
+{
+    size_t n = (size_t)editor_length(e), k = strlen(tail); char got[256];
+    T(k < sizeof got && n >= k && editor_read(e, n - k, (uint8_t *)got, k) == 0);
+    got[k] = 0;
+    return strcmp(got, tail) ? 1 : 0;
+}
+static int n5vz_results_full(void)
+{
+    tree_fixture tree; T(tree_fixture_init(&tree) == 0);
+    /* (P) One hit per line: "cat" then filler to FIF_DEFAULT_CONTEXT - 1
+     * content bytes, so no context is cut; the line count makes the file
+     * twice EDITOR_STAGE_BYTES, so its results (each line plus a number
+     * field) need more than one staged append. */
+    enum { W = FIF_DEFAULT_CONTEXT - 1u, L = 2u * EDITOR_STAGE_BYTES / (W + 1u) };
+    _Static_assert(L <= FIF_DEFAULT_HITS && (size_t)L * (W + 1u) <= FIF_DEFAULT_FILE_BYTES, "one engine job");
+    static char wide[(size_t)L * (W + 1u)];
+    for (size_t line = 0; line < L; line++) {
+        char *p = wide + line * (W + 1u);
+        memset(p, 'y', W); memcpy(p, "cat", 3); p[W] = '\n';
+    }
+    T(tree_fixture_file(&tree, "wide", wide, sizeof wide) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    /* (a1) G: the next piece allocator request of the fresh results buffer
+     * fails once: the whole first batch is refused, the row stands alone. */
+    T(n5vz_query(e, "cat", tree.root) == 0);
+    T(editor_fif_start(e) == 0); T(editor_fif_results_active(e));
+    editor_piece_storage *s = &e->buffer->piece_storage;
+    s->fail_request = s->requests + 1u;
+    T(n5vz_settle(e) == 0);
+    s->fail_request = 0;
+    T(!e->error && e->fif.assembled == 0);
+    size_t n = n95_read(e); T(n != SIZE_MAX);
+    if (strcmp(n95_text, n5vz_full)) fprintf(stderr, "edit-5vz a1 text [%s]\n", n95_text);
+    T(!strcmp(n95_text, n5vz_full));
+    /* The editor keeps taking keys; Enter and F4 find no hit to open. */
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_F4, 0, NULL)) == 0);
+    T(editor_fif_results_active(e) && !e->error && n95_read(e) == n);
+    /* A new search runs normally afterwards: the fixture's nine hits in
+     * three files (n95) plus one per wide line, in a fourth file. */
+    T(editor_fif_start(e) == 0); T(settle(e) == 0);
+    char all[64]; T(snprintf(all, sizeof all, "%u matches across 4 files\n", 9u + (unsigned)L) > 0);
+    T(n5vz_tail(e, all) == 0);
+    /* (a2) Each later request fails in turn (the K-th request of the results
+     * buffer), until the whole result fits: line maps stay inside the stored
+     * text and the row follows the last stored hit. All hits are received
+     * first and assembly is driven by editor_fif_service alone, so the armed
+     * request is an append's, not another service's (a scroll snapshot). */
+    char where[PATH_MAX + 16]; T(snprintf(where, sizeof where, "%s, wide", tree.root) > 0);
+    T(n5vz_query(e, "cat", where) == 0);
+    char done[64]; T(snprintf(done, sizeof done, "\n%u matches in 1 file\n", (unsigned)L) > 0);
+    bool mid = false;
+    for (uint64_t k = 1u;; k++) {
+        T(editor_fif_start(e) == 0); T(editor_fif_results_active(e));
+        while (!e->fif.done_received) { (void)work_mailbox_drain(&e->pool, editor_route_work, e); sched_yield(); }
+        s = &e->buffer->piece_storage; s->fail_request = s->requests + k;
+        while (editor_fif_runnable(e)) T(editor_fif_service(e) == 0);
+        s->fail_request = 0;
+        T(n5vz_settle(e) == 0);
+        T(!e->error);
+        uint64_t length = editor_length(e);
+        if (!n5vz_tail(e, done) && e->fif.assembled == L) break;
+        T(n5vz_tail(e, n5vz_full) == 0);
+        uint32_t a = e->fif.assembled; T(a <= L); /* a == L: the summary append was the refused one */
+        uint64_t row = length - (sizeof n5vz_full - 1u);
+        T(a ? row == e->fif.line_end[a - 1u] + 2u : row == 0);
+        for (uint32_t h = 0; h < a; h++) {
+            char want[16], got[16]; int m = snprintf(want, sizeof want, "%5u: cat", h + 1u);
+            T(m > 0 && e->fif.line_end[h] < row);
+            T(editor_read(e, e->fif.line_start[h], (uint8_t *)got, (size_t)m) == 0 && !memcmp(got, want, (size_t)m));
+            uint8_t lf; T(editor_read(e, e->fif.line_end[h], &lf, 1) == 0 && lf == '\n');
+        }
+        mid |= a > 0;
+        T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    }
+    T(mid);
+    editor_close(e);
+    /* (a3) Every request fails: the stopped_error reserve (open-time metadata
+     * fits, slack below one add chunk). Neither the hits nor the row can be
+     * stored; the notice reports the truncation and keys still work. */
+    cfg.history_keys = 1; e = NULL;
+    for (size_t reserve = 65536; reserve <= 2u * 1024u * 1024u; reserve += 65536) {
+        cfg.arena_bytes = reserve;
+        int rc = editor_open(&e, &cfg, &backend);
+        if (!rc) break;
+        T(rc == EDITOR_ERR_MEMORY || rc == PIECE_ERR_NOMEM);
+    }
+    T(e != NULL); T(settle(e) == 0);
+    T(n5vz_query(e, "cat", tree.root) == 0);
+    T(editor_fif_start(e) == 0); T(editor_fif_results_active(e));
+    T(n5vz_settle(e) == 0);
+    T(!e->error && editor_length(e) == 0);
+    T(e->recovery_notice && !strncmp(e->recovery_notice, n5vz_full, sizeof n5vz_full - 2u));
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0); T(!e->error);
+    editor_close(e); T(tree_fixture_remove(tree.root) == 0);
+    puts("edit-5vz: results append refusals truncate with a row or notice, never fail() passed");
+    return 0;
+}
+static int n5vz_open_refused(void)
+{
+    tree_fixture tree; T(tree_fixture_init(&tree) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(n5vz_query(e, "cat", tree.root) == 0);
+    T(editor_fif_start(e) == 0); T(settle(e) == 0);
+    T(n5vz_tail(e, "9 matches across 3 files\n") == 0);
+    size_t n = n95_read(e); T(n != SIZE_MAX);
+    static char old[sizeof n95_text]; memcpy(old, n95_text, n + 1u);
+    uint32_t generation = e->fif.current.generation;
+    size_t results = tabs_active_index(&e->tabs);
+    /* (b1) Results tab active, activation busy (G: find_replace_active is
+     * one editor_activation_busy term): editor_results_open refuses. */
+    T(n5vz_query(e, "cat", tree.root) == 0);
+    e->find_replace_active = true;
+    int rc = editor_fif_start(e);
+    e->find_replace_active = false;
+    T(rc == 0); T(n5vz_settle(e) == 0);
+    n = n95_read(e); T(n != SIZE_MAX);
+    if (strcmp(n95_text, old)) fprintf(stderr, "edit-5vz b1 text [%s]\n", n95_text);
+    T(!strcmp(n95_text, old));
+    T(e->fif.current.generation == generation);
+    T(e->recovery_notice && !strcmp(e->recovery_notice, "find in files: no results tab available"));
+    /* (b2) Results tab not active: a refused open must not run the search
+     * invisibly. */
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(results != 0);
+    e->find_replace_active = true;
+    rc = editor_fif_start(e);
+    e->find_replace_active = false;
+    T(rc == 0); T(n5vz_settle(e) == 0);
+    T(e->fif.current.generation == generation && tabs_active_index(&e->tabs) == 0);
+    T(!e->fif.running && !e->error);
+    /* Not busy: the search replaces the results as before. */
+    T(editor_fif_start(e) == 0); T(settle(e) == 0);
+    T(e->fif.current.generation != generation && tabs_active_index(&e->tabs) == results);
+    n = n95_read(e); T(n != SIZE_MAX && !strcmp(n95_text, old));
+    editor_close(e); T(tree_fixture_remove(tree.root) == 0);
+    puts("edit-5vz: refused results tab submits nothing, keeps the old results, shows a notice passed");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -4886,6 +5060,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--trailing-disabled-scan")) return trailing_disabled_scan();
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
         if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
+        if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
+        if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
@@ -4981,6 +5157,7 @@ int main(int argc, char **argv)
     T(o20_all() == 0);
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
+    T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(g02_find_previous_uncached() == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
