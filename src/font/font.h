@@ -372,6 +372,10 @@ bool font_async_pending(const font_async *owner);
 /* Live mailbox callback only; returns adopted slot, or RENDER_NO_SLOT. The
  * caller damages cells using that slot, including pixels-only changes. */
 uint32_t font_async_event(font_async *owner, const work_msg *msg);
+/* edit-2ghs: true while slot is a runtime slot whose image has ink (or is
+ * still pending behind its placeholder). Blank and vacant slots keep a valid
+ * blank descriptor in the bound table, but cells must use RENDER_NO_SLOT. */
+bool font_async_inked(const font_async *owner, uint32_t slot);
 
 /* edit-6e2: configured fallback chain (font.fallbacks). Text is the ordered
  * entries joined by '\n'. (P) Its bound is the config parser's decoded text

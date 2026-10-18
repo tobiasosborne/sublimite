@@ -5340,6 +5340,69 @@ static int menu_contract(void)
     return 0;
 }
 
+
+/* edit-2ghs: a binary file (PDF-like: NUL, high bytes, invalid UTF-8, blank
+ * and private-use scalars) opened as text must paint, never end the editor.
+ * The fixture is generated here, not committed. */
+static int binary_open_fixture(char *path, size_t *length)
+{
+    /* (P) 256 KiB exceeds FILE_PREFIX_MAX-scale prefixes and any viewport;
+     * the size only needs to be "a few hundred KB" like the bead's PDF. */
+    size_t len = (size_t)256u * 1024u;
+    uint8_t *bytes = malloc(len); T(bytes);
+    static const uint8_t header[] = "%PDF-1.5\n%\xe2\xe3\xcf\xd3\n";
+    /* (P) Scalars a font may draw without ink (NBSP U+00A0, EN SPACE U+2002,
+     * IDEOGRAPHIC SPACE U+3000 wide, ZWSP U+200B) and the PUA scalar U+F227
+     * that the bead's PDF showed rendering inkless through a fallback face. */
+    static const char *const blanks[] = {"\xc2\xa0", "\xe2\x80\x82", "\xe3\x80\x80",
+                                         "\xe2\x80\x8b", "\xef\x88\xa7"};
+    uint32_t state = 2463534242u; /* (P) xorshift32 seed, any nonzero value */
+    size_t at = 0;
+    memcpy(bytes, header, sizeof header - 1u); at = sizeof header - 1u;
+    while (at < len) {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        size_t pick = state % 16u;
+        if (pick < 5u) {
+            const char *b = blanks[pick]; size_t n = strlen(b);
+            if (at + n > len) break;
+            memcpy(bytes + at, b, n); at += n;
+        } else if (pick == 5u) bytes[at++] = 0;
+        else if (pick == 6u) bytes[at++] = '\n';
+        else bytes[at++] = (uint8_t)(state >> 8);
+    }
+    while (at < len) bytes[at++] = 0;
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, bytes, len) == (ssize_t)len); close(fd); free(bytes);
+    *length = len;
+    return 0;
+}
+static int binary_open_contract(void)
+{
+    char path[] = "build/2ghs-binary-XXXXXX"; size_t len = 0;
+    T(binary_open_fixture(path, &len) == 0);
+    for (int launch = 0; launch < 2; launch++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        counted count = {0};
+        /* (P) A large viewport, like the bead's 2880x1800 repro, so many
+         * distinct clusters reach the glyph table in the first frame. */
+        editor_config cfg = {.path = path, .cols = 200, .rows = 60, .wrap_mode = -1,
+            .hook_ctx = &count, .on_submit = submitted};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK);
+        /* (P) 200 steps: the bead's acceptance loop. */
+        for (int step = 0; step < 200; step++) {
+            int rc = editor_step(e, 5);
+            if (rc != EDITOR_OK && rc != EDITOR_MORE)
+                fprintf(stderr, "editor_test: 2ghs launch %d step %d rc %d\n", launch, step, rc);
+            T(rc == EDITOR_OK || rc == EDITOR_MORE);
+        }
+        T(settle(e) == 0);
+        T(count.frames > 0);
+        T(render_grid_validate(&e->grid) == RENDER_OK);
+        editor_close(e);
+    }
+    unlink(path);
+    puts("edit-2ghs binary file opens, paints and reopens"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -5347,6 +5410,7 @@ int main(int argc, char **argv)
     if (argc == 2) {
         /* (P) argv[1] is the selector after the program name. */
         if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
+        if (!strcmp(argv[1], "--2ghs-binary")) return binary_open_contract();
         if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
         if (!strcmp(argv[1], "--ywd-palette")) return palette_contract();
         if (!strcmp(argv[1], "--yey-menu")) return menu_contract();
@@ -5449,6 +5513,7 @@ int main(int argc, char **argv)
     T(trailing_typing(NULL) == 0); T(trailing_all() == 0);
     T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
     T(paint_all_void() == 0);
+    T(binary_open_contract() == 0);
     T(duplicate_path_contract() == 0);
     T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);

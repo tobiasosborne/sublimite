@@ -29,6 +29,7 @@ typedef struct async_request {
     size_t previous, following;
     uint32_t width, index;
     int result;
+    bool inked; /* edit-2ghs: false once the settled image proved blank */
 } async_request;
 typedef struct async_face {
     font_t font;
@@ -462,6 +463,23 @@ void font_async_reclaim(font_async *owner)
     for (size_t i = 0; i < owner->count; i++) owner->retained[i] &= ASYNC_CURRENT_PIN;
 }
 
+/* edit-2ghs: render.h validates every bound descriptor and forbids
+ * zero-sized rectangles. Blank (inkless) and vacant slots therefore carry
+ * the baked space rectangle (page 0, slot 0: a full cell with no ink) under
+ * their own identity; cells never reference them (lookups answer NO_SLOT). */
+static render_glyph blank_descriptor(const font_async *owner, size_t slot)
+{
+    render_glyph glyph = owner->glyphs[0];
+    glyph.glyph_index = (uint32_t)slot + 1u;
+    return glyph;
+}
+
+bool font_async_inked(const font_async *owner, uint32_t slot)
+{
+    if (!owner || slot < ASYNC_ASCII || slot >= ASYNC_ASCII + owner->count) return false;
+    return owner->requests[slot - ASYNC_ASCII].inked;
+}
+
 static void unlink_request(font_async *owner, size_t index)
 {
     async_request *request = &owner->requests[index];
@@ -547,7 +565,7 @@ int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width
         if (request->hash == hash && request->len == len && request->width == width &&
             !memcmp(owner->keys + request->key, bytes, len)) {
             touch(owner, request->index);
-            *slot = owner->glyphs[ASYNC_ASCII + request->index].w ? (uint32_t)ASYNC_ASCII + request->index : RENDER_NO_SLOT;
+            *slot = request->inked ? (uint32_t)ASYNC_ASCII + request->index : RENDER_NO_SLOT;
             return FONT_OK;
         }
         at = (at + 1u) % ASYNC_CACHE_ENTRIES;
@@ -561,9 +579,9 @@ int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width
         async_request *old = &owner->requests[victim];
         remove_key(owner, old); unlink_request(owner, victim);
         memset(owner->occupied + old->tile, 0, old->width);
-        old->len = 0; old->result = FONT_ERR_ARG;
+        old->len = 0; old->result = FONT_ERR_ARG; old->inked = false;
         old->following = owner->vacant; owner->vacant = victim;
-        owner->glyphs[ASYNC_ASCII + victim] = (render_glyph){0};
+        owner->glyphs[ASYNC_ASCII + victim] = blank_descriptor(owner, ASYNC_ASCII + victim);
         index = free_request(owner); tile = free_tile(owner, width);
     }
     /* Deletion can shift buckets: find the current insertion hole. */
@@ -574,7 +592,7 @@ int font_async_glyph(void *ctx, const uint8_t *bytes, size_t len, uint32_t width
     async_request *request = &owner->requests[index];
     *request = (async_request){.owner = owner, .hash = hash,
         .key = index * FONT_CLUSTER_MAX_BYTES, .len = len, .tile = tile, .width = width,
-        .index = (uint32_t)index, .result = FONT_MORE,
+        .index = (uint32_t)index, .result = FONT_MORE, .inked = true,
         .previous = SIZE_MAX, .following = SIZE_MAX};
     memcpy(owner->keys + request->key, bytes, len);
     memset(owner->occupied + tile, 1, width); /* (P) one occupancy byte per narrow tile */
@@ -604,7 +622,9 @@ uint32_t font_async_event(font_async *owner, const work_msg *msg)
         /* The worker writes only this unretained request's tile. Descriptors
          * change on authenticated adoption; retained frame pixels are intact. */
         output.glyph.glyph_index = slot + 1u;
-        owner->glyphs[slot] = output.glyph;
+        bool inked = output.glyph.w != 0;
+        owner->glyphs[slot] = inked ? output.glyph : blank_descriptor(owner, slot);
+        owner->requests[output.request].inked = inked;
     } else {
         /* Worker preparation failure is settled too. Use the baked missing
          * marker, preserving startup/ASCII even if runtime storage is refused. */

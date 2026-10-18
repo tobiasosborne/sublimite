@@ -60,7 +60,7 @@ bool editor_font_event(editor *e, const work_msg *msg)
                     e->glyph_only = glyphs;
                     begun = true;
                 }
-                if (!g->glyphs[slot].w) { cell->atlas_slot = RENDER_NO_SLOT; cell->glyph_index = 0; }
+                if (!font_async_inked(e->fonts, slot)) { cell->atlas_slot = RENDER_NO_SLOT; cell->glyph_index = 0; }
                 changed = true;
             }
             if (changed) {

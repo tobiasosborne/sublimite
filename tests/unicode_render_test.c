@@ -425,6 +425,38 @@ static int owner_mailbox(void)
     return 0;
 }
 
+static int blank_descriptors(void)
+{
+    /* edit-2ghs: a settled image without ink, and a slot vacated by
+     * eviction, must leave the bound table valid under render.h (no
+     * zero-sized rectangles); lookups of the blank key answer NO_SLOT.
+     * NBSP U+00A0 and IDEOGRAPHIC SPACE U+3000 (wide) are blank scalars. */
+    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    T(pool && work_pool_init(pool, 1, 0) == 0);
+    font_async *owner = NULL; T(font_async_open(&owner, font_ascii_px(), pool) == FONT_OK);
+    font_cell cell = font_ascii_cell();
+    render_cell cells[1] = {{.atlas_slot = RENDER_NO_SLOT}}; uint64_t dirty = 0;
+    render_grid grid;
+    T(render_grid_init(&grid, (render_dims){1, 1, cell.cell_w, cell.cell_h}, cells, 1, &dirty, 1) == RENDER_OK);
+    T(font_async_bind(owner, &grid) == FONT_OK);
+    owner_receiver receiver = {owner, &grid, false};
+    static const char *const blanks[] = {"\xc2\xa0", "\xe3\x80\x80"};
+    for (uint32_t i = 0; i < 2u; i++) {
+        uint32_t slot, again;
+        T(font_async_glyph(owner, (const uint8_t *)blanks[i], strlen(blanks[i]), i + 1u, &slot) == FONT_OK);
+        T(slot >= LAYOUT_ASCII_GLYPHS && font_async_inked(owner, slot)); /* placeholder while pending */
+        complete(pool, &receiver);
+        T(!font_async_inked(owner, slot));
+        T(render_grid_validate(&grid) == RENDER_OK);
+        T(font_async_glyph(owner, (const uint8_t *)blanks[i], strlen(blanks[i]), i + 1u, &again) == FONT_OK);
+        T(again == RENDER_NO_SLOT);
+    }
+    T(!receiver.duplicate);
+    work_pool_shutdown(pool); font_async_close(owner); free(pool);
+    puts("unicode_render_test: blank images keep a valid descriptor table");
+    return 0;
+}
+
 static size_t exhaustion_key(uint8_t *key, size_t value, size_t digits)
 {
     /* (P) Binary digits select Unicode default-ignorables U+034F / U+FE0F.
@@ -552,6 +584,9 @@ static int cache_exhaustion(bool large)
     T(font_async_glyph(owner, (const uint8_t *)"β", sizeof "β" - 1u, 2, &slot) == FONT_OK);
     T(slot != retained_slot); complete(pool, &receiver);
     T(grid.glyphs[slot].w == cell.cell_w * 2u);
+    /* edit-2ghs: the wide request may vacate more than one narrow slot;
+     * vacant slots stay in the bound table and must still validate. */
+    T(render_grid_validate(&grid) == RENDER_OK);
     for (uint32_t y = 0; y < cell.cell_h; y++)
         T(!memcmp(retained_pixels + (size_t)y * cell.cell_w,
             retained_page->pixels + (size_t)(retained_image.y + y) * retained_page->stride + retained_image.x, cell.cell_w));
@@ -720,6 +755,7 @@ static int tab_title_unicode(void)
 int main(void)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    T(blank_descriptors() == 0);
     T(cache_exhaustion(false) == 0);
     T(cache_exhaustion(true) == 0);
     T(tab_title_unicode() == 0);
