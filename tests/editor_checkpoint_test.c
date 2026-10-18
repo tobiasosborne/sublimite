@@ -436,11 +436,15 @@ static size_t small_expected(const uint8_t *base, uint8_t *out)
     memcpy(out + n, base + P2 + 3, SMALL - P2 - 3); n += SMALL - P2 - 3;
     memcpy(out + n, "EF", 2); n += 2; return n;
 }
+/* edit-fi2: case (c) pins edit-btj's set-aside fallback, which applies when
+ * no retained copy of BASE was referenced yet; the child disables retention. */
+static bool child_no_retain;
 static int small_child(const char *source, const char *log, const int *lease)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config config = {.path = source, .journal_path = log, .session_lease = lease, .cols = 32, .rows = 3};
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(wait_adopted(e) == 0);
+    if (child_no_retain) e->retain_limit = 0;
     T(editor_set_cursor(e, SMALL) == 0); T(type_text(e, "EF") == 0);
     T(editor_set_cursor(e, P2) == 0);
     for (int i = 0; i < 3; i++) {
@@ -524,8 +528,10 @@ static int changed_base_body(const char *root, uint8_t *base, uint8_t *got)
     char written[IPC_PATH_CAP];
     T(snprintf(written, sizeof written, "%s/orphan", root) > 0);
     T(snprintf(orphan, sizeof orphan, "%s/session-orphan", dir) > 0);
+    child_no_retain = true;
     pid_t child = fork(); T(child >= 0);
     if (!child) _exit(small_child(source, written, NULL));
+    child_no_retain = false;
     int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     T(rename(written, orphan) == 0);
     shape28 shape; T(shape_of(orphan, 1, &shape) == 0); T(shape.deletes == 1 && shape.inserted == 4);

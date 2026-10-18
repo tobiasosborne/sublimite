@@ -180,16 +180,25 @@ static int build_checkpoint(editor *e, editor_records *c)
          * as a closed tab with an empty BASE and its full text, as CURRENT
          * cancellation encodes it: recovery compares that text with the disk. */
         bool kept = b && b->retired;
+        if (b) b->retain_building = false;
         if (!b || b->placeholder || b->derived || (kept && !editor_session_retains(e, b, NULL))) continue; /* edit-qct; edit-n95 */
         const journal_base *base = &b->base, empty = {.path = ""};
         if (kept) base = &empty;
+        bool identical = !kept && b->revision == b->saved_text_revision &&
+            editor_base_id_matches(&b->saved_text, base) && piece_len(b->tree) == base->size;
+        /* edit-fi2: a modified text whose BASE has a retained private copy
+         * names the copy as BASE (same bytes, immutable) and the real file as
+         * TARGET, so recovery no longer depends on the mutable original. */
+        bool retained = !kept && !identical && !b->pending_open && editor_retain_matches(b, base);
+        const journal_base *record = retained ? &b->retain.copy : base;
         /* Preserve named BASE association. A source conflict must preserve the
          * preceding recovery file, rather than silently relabel the new tree. */
-        if (*base->path && journal_check_base(base)) return JOURNAL_BASE_CHANGED;
-        size_t path_len = strlen(base->path) + 1;
-        size_t base_size = 40 + path_len + (*base->path ? 8u : 0u);
+        if (*record->path && journal_check_base(record)) return JOURNAL_BASE_CHANGED;
+        size_t path_len = strlen(record->path) + 1;
+        size_t base_size = 40 + path_len + (*record->path ? 8u : 0u);
         uint8_t *p = editor_records_add(c, JOURNAL_BASE, b->id, base_size); if (!p) return c->error;
-        int rc = journal_encode_base(base, p, base_size, &base_size); if (rc) return rc;
+        int rc = journal_encode_base(record, p, base_size, &base_size); if (rc) return rc;
+        b->retain_building = retained;
         if (*b->path) {
             p = editor_records_add(c, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!p) return c->error;
             memcpy(p, b->path, strlen(b->path) + 1);
@@ -200,14 +209,16 @@ static int build_checkpoint(editor *e, editor_records *c)
          * edit-28u: a text equal to BASE (a completed save of this revision,
          * or an untouched original) needs no text records; otherwise only the
          * differences from BASE are written when the original is BASE. */
-        bool identical = !kept && b->revision == b->saved_text_revision &&
-            editor_base_id_matches(&b->saved_text, base) && piece_len(b->tree) == base->size;
         if (!b->pending_open && !identical) {
             /* edit-f3i: after a save, BASE is the saved file and the tree's
-             * original is not: encode against the saved revision instead. */
-            bool original = !kept && editor_checkpoint_references(&b->origin, base);
+             * original is not: encode against the saved revision instead.
+             * edit-fi2: against an immutable copy, small texts reference it
+             * too (28u decision 5 guarded against a mutable BASE). */
+            bool original = !kept && (editor_checkpoint_references(&b->origin, base) ||
+                (retained && editor_base_id_matches(&b->origin, base)));
             const editor_ref_map *ref = NULL;
-            if (!kept && !original && b->saved_snapshot && editor_checkpoint_references(&b->saved_text, base)) {
+            if (!kept && !original && b->saved_snapshot && (editor_checkpoint_references(&b->saved_text, base) ||
+                (retained && editor_base_id_matches(&b->saved_text, base)))) {
                 if (!b->saved_map.spans) { rc = editor_ref_map_build(&b->saved_map, b->saved_snapshot); if (rc) return rc; }
                 ref = &b->saved_map;
             }
@@ -266,6 +277,7 @@ int editor_checkpoint(editor *e)
     if (!rc) {
         e->op_count = e->stage_used = 0; e->stats.journal_error = 0;
         e->journal_group_open = false;
+        editor_retain_checkpointed(e); /* edit-fi2 */
     }
     editor_records_free(&c);
     return rc;

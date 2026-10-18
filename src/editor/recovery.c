@@ -64,6 +64,7 @@ typedef struct recovered_buffer {
     size_t ops_len, ops_cap;
     bool ops_valid;
     bool mapped_replay; /* no flat text or whole-BASE fallback */
+    bool rewritten; /* edit-fi2: replayed from a retained copy; the target now differs */
 } recovered_buffer;
 /* (P) op header: 1 type byte + 8-byte offset + 8-byte length. */
 #define OP_HEADER 17u
@@ -259,6 +260,23 @@ static bool base_id_equal(const editor_base_id *a, const editor_base_id *b)
         a->device == b->device && a->ctime_ns == b->ctime_ns && a->prefix_crc == b->prefix_crc &&
         a->prefix_len == b->prefix_len;
 }
+/* edit-fi2: does the opened target still hold exactly the retained copy's
+ * bytes? Startup only; the copy is within the startup scan bound because the
+ * cost scan charged its whole BASE (no mapped replay for a retained BASE). */
+static bool same_file(piece_tree *tree, const char *path, uint64_t size)
+{
+    if (piece_len(tree) != size) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return false;
+    uint8_t disk[JOURNAL_INSERT_SLICE_BYTES], text[JOURNAL_INSERT_SLICE_BYTES]; /* reuse the wire slice as a chunk */
+    bool same = true;
+    for (uint64_t off = 0; same && off < size;) {
+        size_t n = size - off < sizeof disk ? (size_t)(size - off) : sizeof disk;
+        ssize_t got = pread(fd, disk, n, (off_t)off);
+        same = got == (ssize_t)n && !piece_read(tree, off, text, n) && !memcmp(disk, text, n);
+        off += n;
+    }
+    close(fd); return same;
+}
 /* Ops were validated against the replayed length when logged; a failing
  * piece op leaves its own call's content unchanged and the caller then
  * replaces the whole text. */
@@ -324,7 +342,15 @@ static int install_buffer(editor *e, recovered_buffer *r)
      * checkpoints are differences from BASE (edit-28u). Otherwise, or if
      * an op fails, the whole recovered text replaces the tree as before. */
     rc = r->conflict ? 0 : 1;
-    if (!r->conflict && r->ops_valid && *r->target && base_id_equal(&b->origin, &r->base_id) &&
+    /* edit-fi2: BASE was a retained private copy (TARGET the real file). If
+     * the file still holds the copy's bytes, replay onto it as above; if it
+     * was rewritten, the whole recovered text replaces it and a notice says
+     * so. An interrupted save's copy (save_pending) keeps the whole-text
+     * install: its target may hold either generation. */
+    bool from_copy = !r->conflict && r->ops_valid && *r->target && *r->retained && !r->save_pending &&
+        strcmp(r->target, r->retained) && same_file(b->tree, r->retained, r->base_id.size);
+    r->rewritten = !r->conflict && *r->retained && !r->save_pending && !from_copy && !clean;
+    if (!r->conflict && r->ops_valid && *r->target && (from_copy || base_id_equal(&b->origin, &r->base_id)) &&
         piece_len(b->tree) == r->base_id.size) {
         rc = apply_ops(b->tree, r);
         if (!rc && piece_len(b->tree) != r->len) rc = 1;
@@ -507,6 +533,10 @@ static int restore_source(editor *e, const char *directory, const char *previous
             e->recovery_retry = true; e->recovering = true;
             fini(&session); return EDITOR_ERR_IO;
         }
+    }
+    for (recovered_buffer *b = session.buffers; !rc && !aside && !session.conflicts && b; b = b->next) if (b->rewritten) {
+        e->recovery_notice = "file changed on disk since this session; its unsaved edits were recovered";
+        e->recovery_notice_mutations = e->stats.mutations;
     }
     if (!rc && (aside || session.conflicts)) {
         e->recovery_notice = session.conflicts && !aside ?

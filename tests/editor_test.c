@@ -3321,6 +3321,17 @@ static int ck4_recovery(unsigned choice)
 }
 /* Headless process-crash oracle: same discovery entry point used by main.
  * Paths/capacities derive from IPC_PATH_CAP; launch count is crash + recovery. */
+/* edit-fi2: a hot exit with unsaved edits keeps the retained BASE copy its
+ * journal names (`.sublimite-base-*` beside the journal); remove it with the
+ * fixture. */
+static void remove_retained(const char *dir)
+{
+    DIR *d = opendir(dir); if (!d) return;
+    struct dirent *entry;
+    while ((entry = readdir(d))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")))
+        (void)unlinkat(dirfd(d), entry->d_name, 0);
+    closedir(d);
+}
 static int ck4_startup(void)
 {
     char root[] = "build/ck4-startup-XXXXXX"; T(mkdtemp(root));
@@ -3358,7 +3369,7 @@ static int ck4_startup(void)
     char lock[IPC_PATH_CAP];
     T(snprintf(lock, sizeof lock, "%s/.%s.lock", root, strrchr(logs[1], '/') + 1) > 0);
     T(unlink(lock) == 0);
-    unlink(source); unlink(logs[0]); unlink(logs[1]); T(rmdir(root) == 0);
+    unlink(source); unlink(logs[0]); unlink(logs[1]); remove_retained(root); T(rmdir(root) == 0);
     puts("ck4 startup: abrupt exit, same-file discovery, recovered bytes/dirty state before first paint passed");
     return 0;
 }
@@ -4704,6 +4715,7 @@ static int o20_case(const char *command)
         editor_close(e); unlink(path); unlink(target); unlink(log);
         /* Existing journal lock is retained by the session contract. */
         char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s/.journal.lock", dir) > 0); unlink(lock);
+        remove_retained(dir);
         T(rmdir(dir) == 0);
         if (panel) break;
     }

@@ -70,6 +70,9 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     atomic_init(&e->font_logged, false);
+    /* edit-fi2: retain BASEs that startup can restore in one pass
+     * (JOURNAL_STARTUP_SCAN_BYTES; derivation in docs/decisions/edit-fi2.md). */
+    e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
     e->cfg = *config; e->preferences_font_override = config->font_points; e->backend = backend; e->focused = e->visible = true;
     e->max_cols = config->max_cols ? config->max_cols : 360;
     e->max_rows = config->max_rows ? config->max_rows : 300;

@@ -238,6 +238,7 @@ int editor_refresh_placed(editor *e, uint64_t old_cursor)
 void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
+    if (msg->kind == JOURNAL_RETAIN_MESSAGE) return; /* edit-fi2: wake-up; retain.c polls the handle */
     if (editor_fif_receive(e, msg)) return; /* edit-n95: counts only; assembly is a UI service */
     if (editor_font_receive(e, msg)) return;
     if (editor_map_receive(e, msg)) return;

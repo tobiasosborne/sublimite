@@ -23,6 +23,9 @@ typedef struct session_node {
      * the generation holding its bytes; encode_leaf diffs against it. */
     piece_snapshot *reference;
     editor_base_id reference_id;
+    /* edit-fi2: the buffer's retained BASE copy at publication, if READY. */
+    journal_base retained;
+    bool has_retained;
 } session_node;
 typedef struct session_capture {
     struct editor_session *owner;
@@ -124,7 +127,9 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     if (!content && old->live == live && old->rank == rank &&
         !memcmp(&old->view, &state, sizeof state) &&
         old->base.inode == b->base.inode && old->base.ctime_ns == b->base.ctime_ns &&
-        !strcmp(old->base.path, b->base.path) && old->reference == b->saved_snapshot) { pthread_mutex_unlock(&s->mutex); return; }
+        !strcmp(old->base.path, b->base.path) && old->reference == b->saved_snapshot &&
+        old->has_retained == editor_retain_matches(b, &b->base) &&
+        (!old->has_retained || old->retained.inode == b->retain.copy.inode)) { pthread_mutex_unlock(&s->mutex); return; }
     piece_snapshot *snapshot = content ? piece_snapshot_take(b->tree) : piece_snapshot_retain(old->snapshot);
     /* Publication failure never changes a committed mutation. A later turn
      * retries; save refuses stale publication rather than saving old bytes. */
@@ -134,6 +139,8 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     leaf->view = state; leaf->live = live; leaf->live_count = live ? 1u : 0u; leaf->rank = rank; base_copy(&leaf->base, &b->base);
     leaf->reference = b->saved_snapshot ? piece_snapshot_retain(b->saved_snapshot) : NULL; /* edit-f3i */
     leaf->reference_id = b->saved_text;
+    leaf->has_retained = editor_retain_matches(b, &b->base); /* edit-fi2 */
+    if (leaf->has_retained) base_copy(&leaf->retained, &b->retain.copy);
     session_node *root = replace(s, s->root, s->width, b->session_slot, leaf);
     node_release(s, s->root); s->root = root;
     pthread_mutex_unlock(&s->mutex);
@@ -207,9 +214,18 @@ static int encode_leaf(session_capture *c, session_node *n)
      * BASE. Full snapshot deltas preserve their own (possibly different) text. */
     bool replaced = (c->finish || c->cancelling) && !strcmp(b->save_path, c->selected->save_path);
     if (replaced) base = &c->replacement;
-    size_t base_size = 40 + strlen(base->path) + 1 + (*base->path ? 8u : 0u);
+    bool identical = c->finish && b == c->selected && n->revision == b->save_revision &&
+        *base->path && piece_snapshot_len(n->snapshot) == base->size;
+    /* edit-fi2: as editor_checkpoint, a retained copy is BASE and the real
+     * file TARGET. Not for the buffer being prepared (save_prepare checks and
+     * substitutes its previous BASE itself), and only while the copy is
+     * intact (worker-side check: the UI may since have removed it). */
+    bool preparing = !c->finish && !c->cancelling && b == c->selected;
+    bool retained = !replaced && !preparing && !identical && n->has_retained && !journal_check_base(&n->retained);
+    const journal_base *record = retained ? &n->retained : base;
+    size_t base_size = 40 + strlen(record->path) + 1 + (*record->path ? 8u : 0u);
     uint8_t *data = editor_records_add(r, JOURNAL_BASE, b->id, base_size); if (!data) return r->error;
-    int rc = journal_encode_base(base, data, base_size, &base_size); if (rc) return rc;
+    int rc = journal_encode_base(record, data, base_size, &base_size); if (rc) return rc;
     if (*b->path) {
         data = editor_records_add(r, JOURNAL_TARGET, b->id, strlen(b->path) + 1); if (!data) return r->error;
         strcpy((char *)data, b->path);
@@ -218,8 +234,6 @@ static int encode_leaf(session_capture *c, session_node *n)
      * checkpoint of the saved revision is the replacement BASE itself; the
      * prepare checkpoint references the previous BASE when it is the
      * original (save_prepare substitutes a retained copy of those bytes). */
-    bool identical = c->finish && b == c->selected && n->revision == b->save_revision &&
-        *base->path && piece_snapshot_len(n->snapshot) == base->size;
     if (!identical) {
         /* edit-f3i: a text after a save (or saved while this one was in
          * flight) is encoded against the saved revision. */
@@ -233,7 +247,9 @@ static int encode_leaf(session_capture *c, session_node *n)
         }
         piece_iter it; piece_iter_begin_snapshot(&it, n->snapshot, 0);
         editor_records_sink sink = {r, b->id};
-        rc = editor_text_ops(&it, base->size, editor_checkpoint_references(&b->origin, base), map, editor_records_text, &sink);
+        bool original = editor_checkpoint_references(&b->origin, base) ||
+            (retained && editor_base_id_matches(&b->origin, base));
+        rc = editor_text_ops(&it, base->size, original, map, editor_records_text, &sink);
         if (rc) return rc;
     }
     data = editor_records_add(r, JOURNAL_VIEW, b->id, JOURNAL_VIEW_STATE_BYTES); if (!data) return r->error;

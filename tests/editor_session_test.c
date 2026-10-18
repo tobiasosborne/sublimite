@@ -66,6 +66,12 @@ static void close_fixture(fixture *f)
     editor_close(f->e); unlink(f->path); unlink(f->log);
     char lock[IPC_PATH_CAP];
     if (snprintf(lock, sizeof lock, "%s/.journal.lock", f->directory) > 0) (void)unlink(lock);
+    /* edit-fi2: a hot exit with unsaved edits keeps the retained BASE copy
+     * its journal names (`.sublimite-base-*` beside the journal). */
+    DIR *dir = opendir(f->directory); struct dirent *entry;
+    while (dir && (entry = readdir(dir))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")))
+        (void)unlinkat(dirfd(dir), entry->d_name, 0);
+    if (dir) closedir(dir);
     (void)rmdir(f->directory);
 }
 static int disk_is(const char *path, const char *expected)

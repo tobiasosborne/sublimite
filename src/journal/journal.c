@@ -1061,6 +1061,45 @@ static int retain_base(journal *j, const journal_base *previous, char *path, jou
     *base=r.base; base->path=path;
     return 0;
 }
+/* Recovery artifacts belong beside the journal, whose lifetime and access
+ * already protect the recovery session. For a maximal journal parent use its
+ * nearest existing ancestor that can encode the private leaf. */
+static void retention_name(const journal *j, char out[4097])
+{
+    size_t n=(size_t)(j->name-j->path);
+    const char name[]=".sublimite-base-XXXXXX";
+    while(n>4097-sizeof name-1u) {
+        n--; while(n>1 && j->path[n-1]!='/') n--;
+    }
+    memcpy(out,j->path,n);
+    memcpy(out+n,name,sizeof name);
+}
+/* edit-fi2: the asynchronous form of retain_base. The worker creates the
+ * temp itself, so the UI does no namespace I/O. */
+static void retain_async_worker(work_ctx *ctx)
+{
+    journal_retain *r=ctx->arg;
+    int fd=mkostemp(r->path,O_CLOEXEC);
+    if(fd<0) r->error=JOURNAL_IO;
+    else {
+        journal_retention t={.previous=&r->source,.path=r->path,.io=r->io,.fd=fd};
+        r->error=retain_generation(ctx,&t);
+        close(fd);
+        if(!r->error) { r->copy=t.base; r->copy.path=r->copy.captured_path; }
+        else (void)unlink(r->path);
+    }
+    work_msg msg={.kind=JOURNAL_RETAIN_MESSAGE};
+    (void)work_publish(ctx,&msg); /* wake-up only; a full mailbox loses nothing */
+}
+int journal_retain_start(journal *j, journal_retain *r, const journal_base *source, work_handle *handle)
+{
+    if(!j || !r || !source || !source->path || source->path[0]!='/' || strlen(source->path)>4096 || !handle) return JOURNAL_INVALID;
+    *r=(journal_retain){.source=*source,.io=&j->io,.error=JOURNAL_BUSY}; /* until the job reports */
+    strcpy(r->source.captured_path,source->path); r->source.path=r->source.captured_path;
+    retention_name(j,r->path);
+    *handle=work_submit(j->pool,(work_job){retain_async_worker,r,0,WORK_BULK});
+    return handle->epoch ? JOURNAL_OK : JOURNAL_BUSY;
+}
 /* A private reflink/copy freezes recovery data even when the old inode remains
  * writable through an external descriptor or another hard-link pathname. */
 int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
@@ -1086,15 +1125,7 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
         /* Recovery artifacts belong beside the journal, whose lifetime and
          * access already protect the recovery session. Reflink may cross
          * filesystems; retain_generation then falls back to bounded copying. */
-        size_t n=(size_t)(j->name-j->path);
-        const char name[]=".sublimite-base-XXXXXX";
-        /* For a maximal journal parent use its nearest existing ancestor
-         * that can encode the private leaf. No new namespace is required. */
-        while(n>sizeof save->previous_path-sizeof name-1u) {
-            n--; while(n>1 && j->path[n-1]!='/') n--;
-        }
-        memcpy(save->previous_path,j->path,n);
-        memcpy(save->previous_path+n,name,sizeof name);
+        retention_name(j,save->previous_path);
         rc=retain_base(j,previous,save->previous_path,&retained);
         if(rc) return rc;
     }

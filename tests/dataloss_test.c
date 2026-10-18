@@ -221,6 +221,7 @@ enum { BASE_SHORTER, BASE_DELETED };
 static int changed_base_child(const char *source, const char *other, const char *jpath)
 {
     render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    e->retain_limit = 0; /* edit-fi2: pin edit-btj's set-aside fallback (no retained copy) */
     T(editor_set_cursor(e, strlen("base")) == 0); T(settle(e) == 0);
     T(press(e, 'M', 0, "MK") == 0); /* "baseMK": offsets 4..6 exceed a 2-byte base */
     uint64_t id; T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
@@ -668,6 +669,21 @@ static int shared_save_crash(void *ctx, const char *from, const char *to)
      * its old BASE. Crash immediately before publishing the replacement. */
     (void)kill(getpid(), SIGKILL); return -1;
 }
+/* edit-fi2: wait until no BASE copy is running or awaiting its reference
+ * checkpoint (journal_set_io requires no active retention operation). */
+static int retain_settled(editor *e)
+{
+    uint64_t limit = deadline();
+    for (;;) {
+        bool busy = false;
+        for (size_t i = 0; i < e->buffer_capacity; i++) {
+            const editor_buffer *b = e->buffers[i];
+            if (b && (b->retain_state == EDITOR_RETAIN_RUNNING || (b->retain_state == EDITOR_RETAIN_READY && !b->retain_used))) busy = true;
+        }
+        if (!busy) return 0;
+        T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
+    }
+}
 static int shared_save_child(const char *source, const char *target, const char *jpath, bool dirty, int fd)
 {
     render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
@@ -678,7 +694,7 @@ static int shared_save_child(const char *source, const char *target, const char 
     editor_buffer *peer = e->buffer;
     uint64_t owner_revision = owner->revision, peer_revision = peer->revision;
     size_t owner_history = owner->history_cursor, peer_history = peer->history_cursor;
-    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(journal_flush(e->journal) == 0);
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(retain_settled(e) == 0); T(journal_flush(e->journal) == 0);
     if (dirty) {
         journal_io io = {.ctx = &fd, .rename = shared_save_crash};
         T(journal_set_io(e->journal, &io) == 0);
@@ -751,6 +767,166 @@ static int shared_save_as(bool dirty)
     editor_close(e); remove_tree(root); T(ok); return 0;
 }
 
+/* ---- edit-fi2: recovery survives an external rewrite of the original ----
+ * (P) Fixture: 2 * FILE_PREFIX_MAX + 7 bytes, above the synchronous prefix,
+ * so edit-28u checkpoints reference BASE instead of holding the text (the
+ * case the bead is about). Bytes are a 26-letter cycle; the rewrite uses a
+ * different cycle so original and rewritten bytes differ at every offset. */
+#define FI2_BYTES (2u * FILE_PREFIX_MAX + 7u)
+static uint8_t fi2_byte(size_t i, char first) { return (uint8_t)(first + (char)(i % 26u)); }
+static int fi2_fill(const char *path, size_t n, char first)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); T(fd >= 0);
+    uint8_t chunk[JOURNAL_INSERT_SLICE_BYTES]; /* reuse the wire slice as an I/O chunk */
+    for (size_t off = 0; off < n;) {
+        size_t k = n - off < sizeof chunk ? n - off : sizeof chunk;
+        for (size_t i = 0; i < k; i++) chunk[i] = fi2_byte(off + i, first);
+        T(write(fd, chunk, k) == (ssize_t)k); off += k;
+    }
+    T(close(fd) == 0); return 0;
+}
+static bool fi2_retained(const char *root)
+{
+    DIR *dir = opendir(root); if (!dir) return false;
+    struct dirent *entry; bool found = false;
+    while ((entry = readdir(dir))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-"))) found = true;
+    closedir(dir); return found;
+}
+/* Child: open, type "XY" at offset 0, then keep turning until the journal
+ * names a retained copy (or the idle watchdog expires: the red build never
+ * retains), report, and wait to be killed. */
+static int rewrite_child(const char *source, const char *root, const char *jpath, int fd)
+{
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 'X', 0, "XY") == 0);
+    uint64_t limit = deadline();
+    while (trace_now_ns() < limit && !(fi2_retained(root) && file_contains(jpath, ".sublimite-base-"))) {
+        T(turn(e) == 0); sched_yield();
+    }
+    T(write(fd, "r", 1) == 1);
+    for (;;) pause();
+}
+enum { REWRITE_RENAME, REWRITE_IN_PLACE };
+static int external_rewrite(int kind)
+{
+    char root[64], source[128], other[128], first[128], next[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(fi2_fill(source, FI2_BYTES, 'a') == 0);
+    T(snprintf(other, sizeof other, "%s/rewrite", root) > 0);
+    T(make_session(root, first, sizeof first) == 0);
+    int pipes[2]; T(pipe(pipes) == 0); pid_t child = fork(); T(child >= 0);
+    if (!child) { close(pipes[0]); _exit(rewrite_child(source, root, first, pipes[1])); }
+    close(pipes[1]); char byte; T(read(pipes[0], &byte, 1) == 1); close(pipes[0]);
+    /* The rewrite happens while the editor still lives (git checkout, a
+     * build step), then the editor dies without a clean exit. */
+    if (kind == REWRITE_RENAME) { T(fi2_fill(other, FI2_BYTES - 1u, 'A') == 0); T(rename(other, source) == 0); }
+    else T(fi2_fill(source, FI2_BYTES - 1u, 'A') == 0);
+    T(kill(child, SIGKILL) == 0); T(killed_by(child, SIGKILL) == 0);
+    T(make_session(root, next, sizeof next) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, NULL, next) == 0);
+    uint64_t len = editor_length(e);
+    uint8_t head[8] = {0}; T(editor_read(e, 0, head, len < sizeof head ? (size_t)len : sizeof head) == 0);
+    fprintf(stderr, "dataloss_test: external_rewrite kind=%s tabs=%zu len=%llu (want %u) head=[%.8s] modified=%d notice=[%s] aside=[%s]\n",
+        kind == REWRITE_RENAME ? "rename-over" : "in-place", tabs_count(&e->tabs), (unsigned long long)len, FI2_BYTES + 2u, head,
+        tabs_count(&e->tabs) ? editor_tab(e, 0)->modified : 0, e->recovery_notice ? e->recovery_notice : "", e->recovery_aside);
+    T(tabs_count(&e->tabs) == 1);
+    T(len == FI2_BYTES + 2u); T(!memcmp(head, "XY", 2));
+    uint8_t chunk[JOURNAL_INSERT_SLICE_BYTES];
+    for (size_t off = 0; off < FI2_BYTES;) {
+        size_t k = FI2_BYTES - off < sizeof chunk ? FI2_BYTES - off : sizeof chunk;
+        T(editor_read(e, 2u + off, chunk, k) == 0);
+        for (size_t i = 0; i < k; i++) if (chunk[i] != fi2_byte(off + i, 'a')) {
+            fprintf(stderr, "dataloss_test: external_rewrite: original byte %zu differs\n", off + i); T(false);
+        }
+        off += k;
+    }
+    T(editor_tab(e, 0)->modified);
+    T(e->recovery_notice && strstr(e->recovery_notice, "changed on disk"));
+    T(editor_tab(e, 0)->path_len == strlen(source) && !memcmp(editor_tab(e, 0)->path, source, strlen(source)));
+    /* The disk keeps the external bytes; nothing was written to the target. */
+    struct stat st; T(stat(source, &st) == 0); T(st.st_size == (off_t)(FI2_BYTES - 1u));
+    editor_close(e); remove_tree(root); return 0;
+}
+/* (c) A clean open writes no retained artifact; a saved buffer's copy is
+ * removed once the saved file is BASE. */
+static int retain_lifecycle(void)
+{
+    char root[64], source[128], jpath[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(fi2_fill(source, FI2_BYTES, 'a') == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, XKB_KEY_Right, 0, NULL) == 0); T(press(e, XKB_KEY_Left, 0, NULL) == 0);
+    for (unsigned i = 0; i < 64u; i++) { T(turn(e) == 0); sched_yield(); } /* (P) 64 = WORK_DRAIN_MAX_MESSAGES maintenance turns */
+    T(!fi2_retained(root));
+    T(press(e, 'q', 0, "q") == 0);
+    uint64_t limit = deadline();
+    while (!fi2_retained(root) && trace_now_ns() < limit) { T(turn(e) == 0); sched_yield(); }
+    fprintf(stderr, "dataloss_test: retain_lifecycle: retained after first edit=%d\n", fi2_retained(root));
+    T(fi2_retained(root));
+    T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
+    limit = deadline();
+    while (fi2_retained(root) && trace_now_ns() < limit) { T(turn(e) == 0); sched_yield(); }
+    fprintf(stderr, "dataloss_test: retain_lifecycle: retained after save=%d\n", fi2_retained(root));
+    T(!fi2_retained(root));
+    editor_close(e); T(!fi2_retained(root));
+    remove_tree(root); return 0;
+}
+/* (d) 1 GiB sparse open: time editor_open + settle and a first edit; above
+ * the retention bound no copy is made. (P) 2^30 bytes; sparse (ftruncate),
+ * removed on every exit path by the wrapper. */
+static int open_gib_body(const char *root, const char *source)
+{
+    char jpath[128]; T(make_session(root, jpath, sizeof jpath) == 0);
+    int fd = open(source, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); T(fd >= 0);
+    bool sized = ftruncate(fd, (off_t)1 << 30) == 0; close(fd); T(sized);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = source, .journal_path = jpath, .cols = COLS, .rows = ROWS};
+    editor *e = NULL; uint64_t t0 = trace_now_ns();
+    T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t t1 = trace_now_ns(); T(settle(e) == 0); uint64_t t2 = trace_now_ns();
+    T(press(e, 'q', 0, "q") == 0); uint64_t t3 = trace_now_ns();
+    for (unsigned i = 0; i < 64u; i++) { T(turn(e) == 0); sched_yield(); } /* (P) 64 = WORK_DRAIN_MAX_MESSAGES */
+    bool copy = fi2_retained(root);
+    printf("dataloss_test: open-gib (M) editor_open=%.3f ms settle=%.3f ms first edit=%.3f ms retained_copy=%d\n",
+        (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(t3 - t2) / 1e6, copy);
+    editor_close(e); T(!copy); return 0;
+}
+/* edit-fi2 measurement: a BASE at the retention bound (e->retain_limit,
+ * JOURNAL_STARTUP_SCAN_BYTES), sparse: first edit -> copy READY (worker,
+ * includes fsync), and the UI turn that writes the reference checkpoint. */
+static int retain_bound_body(const char *root, const char *source)
+{
+    char jpath[128]; T(make_session(root, jpath, sizeof jpath) == 0);
+    int fd = open(source, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); T(fd >= 0);
+    bool sized = ftruncate(fd, (off_t)JOURNAL_STARTUP_SCAN_BYTES) == 0; close(fd); T(sized);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(e->buffer->base.size <= e->retain_limit);
+    T(press(e, 'q', 0, "q") == 0);
+    uint64_t t0 = trace_now_ns(), ready = 0, turn_max = 0, limit = trace_now_ns() + 6u * EDITOR_IDLE_NS;
+    while (!e->buffer->retain_used) {
+        uint64_t a = trace_now_ns(); T(turn(e) == 0); uint64_t b = trace_now_ns();
+        if (!ready && e->buffer->retain_state == EDITOR_RETAIN_READY) ready = b;
+        if (b - a > turn_max) turn_max = b - a;
+        T(b < limit); sched_yield();
+    }
+    printf("dataloss_test: retain-bound (M) base=%llu B first edit->copy ready=%.3f ms longest UI turn (includes the reference checkpoint)=%.3f ms\n",
+        (unsigned long long)e->buffer->base.size, (double)(ready - t0) / 1e6, (double)turn_max / 1e6);
+    editor_close(e); return 0;
+}
+static int retain_bound(void)
+{
+    char root[64], source[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/bound", root) > 0);
+    int rc = retain_bound_body(root, source);
+    remove_tree(root); return rc;
+}
+static int open_gib(void)
+{
+    char root[64], source[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/gib", root) > 0);
+    int rc = open_gib_body(root, source);
+    remove_tree(root); return rc;
+}
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
@@ -762,6 +938,11 @@ int main(int argc, char **argv)
         T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--two-process-reload")) return two_process_save(true);
+    if (argc == 2 && !strcmp(argv[1], "--open-gib")) return open_gib();
+    if (argc == 2 && !strcmp(argv[1], "--retain-bound")) return retain_bound();
+    if (argc == 2 && !strcmp(argv[1], "--rewrite-rename")) return external_rewrite(REWRITE_RENAME);
+    if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
+    if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
@@ -771,6 +952,7 @@ int main(int argc, char **argv)
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
     T(two_process_save(false) == 0); T(two_process_save(true) == 0);
     T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
+    T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */
@@ -780,6 +962,7 @@ int main(int argc, char **argv)
         T(!deleted && !torn && !stranded);
     }
     puts("dataloss_test: kill-after-append, kill at every save step, shorter base, reload/keep during held save, "
-         "Ctrl+S under prompt, mixed hot exit with closed tab, reload vs keystroke, two-process save and orphan recovery passed");
+         "Ctrl+S under prompt, mixed hot exit with closed tab, reload vs keystroke, two-process save and orphan recovery, "
+         "edit-fi2 recovery after rename-over/in-place rewrite and retained-copy lifecycle passed");
     return 0;
 }

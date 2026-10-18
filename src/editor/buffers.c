@@ -79,6 +79,7 @@ void editor_buffer_destroy(editor_buffer *b)
 {
     if (!b) return;
     editor_restore_free(b->restore); b->restore = NULL; /* edit-qct: quiesces its scan job first */
+    editor_retain_stop(b); /* edit-fi2: quiesces a running copy; keeps a referenced one */
     if (b->map_snapshot) {
         work_cancel(b->pool,b->map_handle);
         while (!work_handle_finished(b->pool,b->map_handle)) sched_yield();
@@ -885,6 +886,7 @@ int editor_poll_sources(editor *e)
             }
         }
     }
+    editor_retain_tick(e); /* edit-fi2: before source checks may replace BASE */
     int source_rc = editor_check_sources(e); if (source_rc) return source_rc;
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) {
         int rc = editor_adopt_open(e, e->buffers[i]); if (rc) return rc;

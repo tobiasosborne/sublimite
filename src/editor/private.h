@@ -92,6 +92,18 @@ typedef struct editor_buffer {
      * saved_snapshot. Both are replaced together with saved_text. */
     piece_snapshot *save_snapshot, *saved_snapshot;
     editor_ref_map saved_map;
+    /* edit-fi2: private copy of BASE, made off the UI thread after the first
+     * modification (retain.c). retain_of is the BASE identity it copies;
+     * once READY, checkpoints write BASE = retain.copy + TARGET = path, with
+     * the text's differences from BASE (the copy holds BASE's bytes), so
+     * recovery survives an external rewrite of the original. retain_used:
+     * the checkpoint being built references the copy. */
+    journal_retain retain;
+    work_handle retain_handle;
+    work_pool *retain_pool;
+    editor_base_id retain_of;
+    uint8_t retain_state;
+    bool retain_used, retain_building;
     journal_view_state journal_view_state;
     bool journal_view_valid;
     lineidx *index;
@@ -291,6 +303,10 @@ struct editor {
     /* edit-btj: startup recovery notice, shown on the status row until the
      * first mutation; recovery_aside names the set-aside source journal. */
     const char *recovery_notice;
+    /* edit-fi2: largest BASE retained on first modification (retain.c);
+     * zero disables retention (tests of the set-aside fallback). */
+    uint64_t retain_limit;
+    uint64_t retain_retry; /* stats.mutations + 1 at a failed reference checkpoint; 0 none */
     /* (P) A tab title plus the Save As refusal suffix and its NUL. */
     char file_command_notice[TABS_TITLE_BYTES + sizeof " is open and modified in another tab"];
     uint64_t recovery_notice_mutations;
@@ -489,6 +505,12 @@ bool editor_font_pending(const editor *e);
 int editor_resize_grid(editor *e, render_dims dims);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
+/* edit-fi2 (retain.c): BASE retention after the first modification. */
+enum { EDITOR_RETAIN_IDLE, EDITOR_RETAIN_RUNNING, EDITOR_RETAIN_READY, EDITOR_RETAIN_FAILED };
+bool editor_retain_matches(const editor_buffer *b, const journal_base *base);
+void editor_retain_tick(editor *e);
+void editor_retain_checkpointed(editor *e);
+void editor_retain_stop(editor_buffer *b);
 int editor_journal_metadata(editor *e);
 /* Journal an applied action without waiting for a frame or durability credit. */
 int editor_journal_changed(editor *e);

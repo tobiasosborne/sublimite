@@ -196,6 +196,29 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
 int journal_save_cancel(journal *j, journal_save *save, const journal_record *checkpoint, size_t count);
 int journal_save_finish(journal *j, journal_save *save, const journal_base *saved,
                         const journal_record *checkpoint, size_t count);
+/* edit-fi2: asynchronous BASE retention (docs/decisions/edit-fi2.md). Retain
+ * source's bytes in a private `.sublimite-base-*` reflink/copy beside the
+ * journal, with save_prepare's validation (identity before and after the
+ * clone/copy, full fsync of the copy and its directory), but as one WORK_BULK
+ * job on the journal's pool: the caller never waits. The calling thread does
+ * no I/O and no allocation (the name is formed from the journal path; the
+ * worker creates the file). r must stay valid and unmoved until
+ * work_handle_finished(pool, *handle); cancel with work_cancel (the copy loop
+ * polls). The job publishes one JOURNAL_RETAIN_MESSAGE as a wake-up only; the
+ * result is read after the handle finished. r->error == JOURNAL_OK: r->copy
+ * names a complete durable copy equal to source; any error leaves no
+ * artifact. The caller owns the copy: reference it from a checkpoint (BASE =
+ * copy, TARGET = the real path) and unlink it once no durable checkpoint
+ * references it. Named, absolute source only. */
+#define JOURNAL_RETAIN_MESSAGE 0x4a525441u
+typedef struct journal_retain {
+    journal_base source;   /* source.path points at source.captured_path */
+    journal_base copy;     /* result; copy.path points at copy.captured_path */
+    char path[4097];
+    const journal_io *io;
+    int error;
+} journal_retain;
+int journal_retain_start(journal *j, journal_retain *r, const journal_base *source, work_handle *handle);
 /* Setup/close/rotation may allocate or block; never call on typing path.
  * New file only: open refuses a nonempty file (replay + checkpoint first).
  * Caller owns pool and must drain mailboxes through journal_receive (including
