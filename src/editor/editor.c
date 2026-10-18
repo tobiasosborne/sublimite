@@ -180,7 +180,13 @@ int editor_full_layout(editor *e)
         layout_wrap_row first; bool approximate=false;
         if (e->visual_seed_valid && e->visual_seed.start==s.visual_byte && e->visual_seed.line_start==s.first_byte) {
             first=e->visual_seed; approximate=first.approximate; rc=0;
-        } else rc = layout_visual_row(&e->lay, e->tree, s.visual_byte, 0, &first, &approximate);
+        } else if (s.visual_byte > s.first_byte && s.visual_byte - s.first_byte > LAYOUT_BYTE_BUDGET)
+            /* edit-1vun: the top row continues the line at first_byte (the
+             * view's wrapped invariant); beyond layout's resident budget an
+             * unanchored query asks piece for the line, which on an unindexed
+             * mapping counts newlines from byte 0 on the UI thread. */
+            rc = layout_visual_row_anchored(&e->lay, e->tree, s.visual_byte, s.first_byte, e->lay.first_line, &first, &approximate);
+        else rc = layout_visual_row(&e->lay, e->tree, s.visual_byte, 0, &first, &approximate);
         if (!rc) {
             rc = layout_begin_visual(&e->lay, e->tree, vp, &first);
             e->v.state.visual_byte = first.start;

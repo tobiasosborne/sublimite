@@ -144,7 +144,9 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text,
  * LF boundaries locally, preserving exact grapheme columns and selection.
  * Leaves viewport ordinals/bytes to the host's resident scroll resolver.
  * Same scan/deadline/continuation contract; never writes exact line caches.
- * relative remains set on completion so the host cannot adopt v->line. */
+ * relative remains set on completion so the host cannot adopt v->line.
+ * (edit-1vun) Select All is accepted unwrapped too: its follow walks back
+ * from EOF to the last LF. */
 int view_relative_command(view *v, view_key key, bool shift, view_change *change);
 /* view_restore for an unwrapped buffer whose external line count is inexact
  * (edit-dz0). state->first_line is the host's label, kept and marked

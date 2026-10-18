@@ -437,4 +437,49 @@ static void resize(void)
         destroy(&a);
     }
 }
-int main(void) { large_hscroll(); cursor_stops(); lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }
+/* edit-1vun: queries at or above a certified top (and upward from it) are
+ * anchored by a backward LF walk from the top instead of piece line queries.
+ * Every result must equal the exact result of a twin laid out from byte 0
+ * (short lines: both exact), with zero piece line queries on the subject. A
+ * previous line longer than LAYOUT_BYTE_BUDGET (P) keeps the piece query. */
+static void above_top_queries(void)
+{
+    const char *text="alpha beta gamma delta epsilon zeta eta theta\n\n  indented words here and more words\r\n"
+        "x\nshort\n\tTabbed line with several words to wrap around the edge\n\n\nlast but one\nthe top line\nafter top\n";
+    fixture ref, sub; init(&ref,text,16,4,0); init(&sub,text,16,4,0);
+    uint64_t total=strlen(text), top=(uint64_t)(strstr(text,"the top line")-text), line=0;
+    for(uint64_t i=0;i<top;i++) line+=text[i]=='\n';
+    CHECK(render_frame_begin(&ref.g,++ref.frame)==0 && layout_begin(&ref.l,ref.tree,(layout_viewport){0,0,0,0})==0); run(&ref);
+    CHECK(render_frame_begin(&sub.g,++sub.frame)==0 && layout_begin(&sub.l,sub.tree,(layout_viewport){top,line,0,0})==0); run(&sub);
+    uint64_t probe=0; sub.l.line_query_probe=&probe;
+    unsigned compared=0;
+    for(uint64_t b=0;b<=top;b++) {
+        if(b<total && text[b]=='\n' && b && text[b-1]=='\r') continue; /* CRLF: not a cluster boundary */
+        layout_wrap_row self; bool sa=false;
+        CHECK(layout_visual_row(&ref.l,ref.tree,b,0,&self,&sa)==LAYOUT_DONE);
+        for(int d=self.start==b?-1:0;d<=1;d++) { /* upward from row starts, as view asks */
+            layout_wrap_row want,got; bool wa=false,ga=false;
+            CHECK(layout_visual_row(&ref.l,ref.tree,b,d,&want,&wa)==LAYOUT_DONE);
+            CHECK(layout_visual_row(&sub.l,sub.tree,b,d,&got,&ga)==LAYOUT_DONE);
+            if(got.start!=want.start || got.end!=want.end || got.next!=want.next || got.line_start!=want.line_start ||
+               got.line!=want.line || got.column!=want.column || got.continuation!=want.continuation || ga!=wa)
+                fprintf(stderr,"above_top b=%llu d=%d got start=%llu line=%llu want start=%llu line=%llu\n",(unsigned long long)b,d,
+                    (unsigned long long)got.start,(unsigned long long)got.line,(unsigned long long)want.start,(unsigned long long)want.line);
+            CHECK(got.start==want.start && got.end==want.end && got.next==want.next && got.line_start==want.line_start);
+            CHECK(got.line==want.line && got.column==want.column && got.continuation==want.continuation && ga==wa);
+            compared++;
+        }
+    }
+    CHECK(compared>0 && probe==0);
+    destroy(&ref); destroy(&sub);
+    /* (P) 70000 > LAYOUT_BYTE_BUDGET = 65536: no LF within the walk. */
+    static char long_text[70000+16];
+    memset(long_text,'a',70000); memcpy(long_text+70000,"\nb\nc\n",6);
+    fixture f; init(&f,long_text,16,4,0);
+    CHECK(render_frame_begin(&f.g,++f.frame)==0 && layout_begin(&f.l,f.tree,(layout_viewport){70001,1,0,0})==0); run(&f);
+    probe=0; f.l.line_query_probe=&probe;
+    layout_wrap_row r; bool approx=false;
+    CHECK(layout_visual_row(&f.l,f.tree,70001,-1,&r,&approx)==LAYOUT_DONE && r.line==0 && r.line_start==0 && probe>0);
+    destroy(&f);
+}
+int main(void) { above_top_queries(); large_hscroll(); cursor_stops(); lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }

@@ -1114,8 +1114,8 @@ int view_relative_command(view *v, view_key key, bool shift, view_change *change
      * placement is relative. */
     bool wrapped=v && v->state.wrap;
     if(!v || !v->tree || !change || (wrapped && !v->wrap_layout) ||
-       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT || meta ||
-         (wrapped && (key==VIEW_DOC_HOME || key==VIEW_DOC_END || key==VIEW_SELECT_ALL)))) return VIEW_ERR_ARG;
+       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT || meta || key==VIEW_SELECT_ALL ||
+         (wrapped && (key==VIEW_DOC_HOME || key==VIEW_DOC_END)))) return VIEW_ERR_ARG;
     if(v->busy) return VIEW_ERR_BUSY;
     uint64_t cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
     if(cursor>piece_len(v->tree) || anchor>piece_len(v->tree)) return VIEW_ERR_ARG;
@@ -1145,6 +1145,9 @@ int view_relative_command(view *v, view_key key, bool shift, view_change *change
     v->state.visual_end=false;
     if(!vertical(key)) v->state.selection.preferred_col=VIEW_PREFERRED_UNSET;
     v->phase=P_REL_START;
+    /* edit-1vun: unwrapped Select All too; its follow walks back from EOF
+     * to the last LF (P_REL_FOLLOW) instead of line_at(EOF) from byte 0. */
+    if(key==VIEW_SELECT_ALL) v->phase=P_SETUP;
     if(meta) {
         v->state.approximate=false; v->meta_stage=0;
         v->relative_pos=key==VIEW_SELECT_LINE?v->lo:cursor; v->phase=P_REL_META;

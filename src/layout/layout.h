@@ -181,6 +181,11 @@ typedef struct layout {
     uint32_t vis;                /* next text cell */
     uint64_t win_pos; uint32_t wi, win_len; bool win_eof;
     layout_checkpoint_store *checkpoints;
+    /* edit-1vun probe, optional (NULL by layout_init): counts the piece line
+     * queries (piece_byte_to_line/piece_line_to_byte) a visual-row query
+     * makes; on an unindexed mapping they resolve lazy newline counts from
+     * byte 0 on the UI thread. Tests point it at a counter. */
+    uint64_t *line_query_probe;
     uint64_t bytes_scanned, bytes_read, cache_hits, cache_misses; /* per begin/relayout;
         consumed decode/tail bytes and physical source-read bytes respectively */
     uint64_t row_scanned, cluster_at, cluster_len;

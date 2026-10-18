@@ -1208,7 +1208,8 @@ int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *
         (move == VIEW_LEFT || move == VIEW_RIGHT || move == VIEW_UP || move == VIEW_DOWN ||
          move == VIEW_PAGE_UP || move == VIEW_PAGE_DOWN || move == VIEW_HOME || move == VIEW_END ||
          move == VIEW_WORD_LEFT || move == VIEW_WORD_RIGHT || move == VIEW_SELECT_LINE ||
-         (e->v.state.wrap && (move == VIEW_DOC_HOME || move == VIEW_DOC_END || move == VIEW_SELECT_ALL))); /* edit-wv7 */
+         move == VIEW_SELECT_ALL || /* edit-1vun: unwrapped too */
+         (e->v.state.wrap && (move == VIEW_DOC_HOME || move == VIEW_DOC_END))); /* edit-wv7 */
     rc = relative ? view_relative_command(&e->v, move, extend, &c) :
         view_command(&e->v, move, extend, NULL, 0, &c);
     if (rc == VIEW_MORE) editor_scroll_mirror(e);

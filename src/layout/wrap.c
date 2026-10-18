@@ -511,9 +511,13 @@ static int scan_row(const layout *context,const piece_tree *t,uint64_t byte,int 
     q.tab=context->tab; q.text_cols=context->text_cols; q.gw=context->gw;
     q.wrap_rows=row; q.wrap_plan=plan; q.row_byte=rb; q.row_used=ru; q.wrap=true; q.wrap_sink=true;
     q.cursor=UINT64_MAX;
+    if(!visual_seed && !logical_seed && context->line_query_probe) ++*context->line_query_probe;
     uint64_t line=visual_seed?visual_seed->line:logical_seed?logical_seed->line:piece_byte_to_line(t,byte);
     uint64_t start=visual_seed?visual_seed->start:logical_seed?logical_seed->line_start:piece_line_to_byte(t,line), col=visual_seed?visual_seed->column:0;
-    if(direction<0 && byte==start && line) { --line; start=piece_line_to_byte(t,line); byte=start==byte?byte:piece_line_to_byte(t,line+1)-1; direction=0; }
+    if(direction<0 && byte==start && line) {
+        if(context->line_query_probe) ++*context->line_query_probe;
+        --line; start=piece_line_to_byte(t,line); byte=start==byte?byte:piece_line_to_byte(t,line+1)-1; direction=0;
+    }
     uint64_t logical=visual_seed?visual_seed->line_start:start; bool seeded=false;
     const layout_checkpoint_store *s=indexed?context->checkpoints:NULL;
     uint64_t lookbehind=(uint64_t)q.text_cols*8u+LAYOUT_CHECKPOINT_STRIDE;
@@ -594,6 +598,51 @@ static const layout_wrap_row *resident_seed(const layout *l,const piece_tree *t,
     *seed=(layout_wrap_row){.start=l->first_byte,.line_start=l->first_byte,.line=l->first_line};
     return seed;
 }
+/* edit-1vun: the logical line containing `byte` at or above the certified
+ * top, proven from the top alone: one backward pass from first_byte counts
+ * the LFs in [byte, first_byte) and stops at the LF before byte, so the
+ * line's start is certified and its ordinal is the top's label minus that
+ * count (exact when the label is). Bound (P): the pass reads at most
+ * LAYOUT_BYTE_BUDGET bytes below the top, the distance within which
+ * resident_seed trusts the top and the scan bound of the row query that
+ * follows; a byte compare costs less than the cluster decode that bound
+ * charges. No piece line query: on an unindexed mapping one resolves the
+ * lazy newline counts from byte 0 on the UI thread (the first wrapped PageUp
+ * after Ctrl+End, 253 ms (M) on 1 GiB, docs/decisions/edit-1vun.md). A line
+ * start farther above the top keeps the piece query (false). */
+static bool above_top(const layout *l,const piece_tree *t,uint64_t byte,layout_wrap_row *anchor)
+{
+    if(l->src!=t || l->total!=piece_len(t) || !l->first_line_valid ||
+       l->first_line==LAYOUT_LINE_UNKNOWN || byte>l->first_byte) return false;
+    uint64_t floor=l->first_byte>LAYOUT_BYTE_BUDGET?l->first_byte-LAYOUT_BYTE_BUDGET:0;
+    if(byte<floor) return false;
+    uint8_t near[LAYOUT_CHECKPOINT_STRIDE];
+    uint64_t pos=l->first_byte, count=0, start=0;
+    bool found=false;
+    while(pos>floor && !found) {
+        size_t n=(size_t)(pos-floor<sizeof near?pos-floor:sizeof near);
+        uint64_t from=pos-n;
+        if(piece_read(t,from,near,n)!=PIECE_OK) return false;
+        for(size_t i=n;i;i--) if(near[i-1u]=='\n') {
+            if(from+i-1u<byte) { start=from+i; found=true; break; }
+            count++;
+        }
+        pos=from;
+    }
+    if(!found && floor) return false;
+    if(count>l->first_line) return false;
+    *anchor=(layout_wrap_row){.line_start=start,.line=l->first_line-count};
+    return true;
+}
+/* edit-1vun: byte lies on the top's logical line when it is past the top's
+ * line start and not past the laid-out top row (which belongs to it). */
+static bool on_top_line(const layout *l,const piece_tree *t,uint64_t byte)
+{
+    const layout_wrap_row *r=&l->wrap_rows[0];
+    return !layout_busy(l) && l->src==t && l->total==piece_len(t) && l->first_line_valid &&
+        l->first_line!=LAYOUT_LINE_UNKNOWN && r->start!=LAYOUT_VOID_ROW && r->line_start==l->first_byte &&
+        byte>l->first_byte && (byte<=r->start || contains(r,byte));
+}
 int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int direction,
                       layout_wrap_row *out,bool *approximate)
 {
@@ -604,7 +653,9 @@ int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int dire
         for(uint32_t i=0;i<rows;i++) if(contains(&l->wrap_rows[i],byte)) {
             const layout_wrap_row *r=NULL;
             if(direction==0) r=&l->wrap_rows[i];
-            else if(direction<0) { if(i) r=&l->wrap_rows[i-1]; else if(l->wrap_rows[i].start==0) r=&l->wrap_rows[i]; }
+            else if(direction<0) {
+                if(i) r=&l->wrap_rows[i-1]; else if(l->wrap_rows[i].start==0) r=&l->wrap_rows[i];
+            }
             else if(i+1<rows && l->row_byte[i+1]!=LAYOUT_VOID_ROW) r=&l->wrap_rows[i+1];
             else if(l->wrap_rows[i].next==LAYOUT_VOID_ROW) r=&l->wrap_rows[i];
             else {
@@ -616,10 +667,23 @@ int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int dire
             break;
         }
     }
-    layout_wrap_row seed;
-    const layout_wrap_row *anchor=resident_seed(l,t,byte,&seed);
+    layout_wrap_row seed, logical;
+    const layout_wrap_row *anchor=resident_seed(l,t,byte,&seed), *line=NULL;
     if(direction<0 && byte==l->first_byte) anchor=NULL;
-    int rc=scan_row(l,t,byte,direction,out,approximate,true,anchor,NULL);
+    if(!anchor && above_top(l,t,byte,&logical)) {
+        /* edit-1vun: at or above the top. Upward from a line start, the
+         * row above ends at the previous line's LF. */
+        if(direction<0 && byte && byte==logical.line_start) {
+            if(above_top(l,t,byte-1u,&logical)) { line=&logical; byte--; direction=0; }
+        } else line=&logical;
+    } else if(!anchor && on_top_line(l,t,byte)) {
+        /* edit-1vun: on the top's logical line, beyond resident_seed's
+         * budget (a long wrapped line): the laid-out top certifies the
+         * line's start and label. */
+        logical=(layout_wrap_row){.line_start=l->first_byte,.line=l->first_line};
+        line=&logical;
+    }
+    int rc=scan_row(l,t,byte,direction,out,approximate,true,anchor,line);
     if(rc==LAYOUT_DONE) out->approximate|=*approximate;
     return rc;
 }
