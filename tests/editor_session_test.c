@@ -1254,12 +1254,35 @@ static int e601_no_journal(const char *dir, const char *orphan)
     if (!rc) rc = e601_drive(e);
     bool live = !rc && tabs_count(&e->tabs) == 1 && !e->buffer->placeholder && !e->restore_active;
     bool kept = e601_same(orphan, &before);
-    printf("edit-601 (a): no launch journal rc=%d restored_tab=%s len=%llu source_kept=%s notice=%s\n", rc,
-        live ? "yes" : "no", (unsigned long long)piece_len(e->buffer->tree), kept ? "yes" : "no",
-        e->recovery_notice ? e->recovery_notice : "(none)");
+    /* edit-7i5: the restored edits are shown, not the disk text: (P) BASE plus
+     * the one typed byte, the byte at offset 0, the tab modified. */
+    uint64_t len = piece_len(e->buffer->tree); uint8_t typed = 0;
+    bool shown = live && len == FM4_GIB + 1 && piece_read(e->buffer->tree, 0, &typed, 1) == 0 && typed == 'x' &&
+        tabs_active(&e->tabs)->modified;
+    printf("edit-601 (a): no launch journal rc=%d restored_tab=%s len=%llu first=0x%02x modified=%s source_kept=%s notice=%s\n", rc,
+        live ? "yes" : "no", (unsigned long long)len, typed, live && tabs_active(&e->tabs)->modified ? "yes" : "no",
+        kept ? "yes" : "no", e->recovery_notice ? e->recovery_notice : "(none)");
     e->journal = log;
     e601_discard(&l);
-    T(rc == 0 && live && kept);
+    T(rc == 0 && live && kept && shown);
+    /* edit-7i5: a later launch with a journal finds the kept source and
+     * applies its edits once: still BASE + 1, and the source retires. */
+    qct_launch m = {0};
+    rc = e601_start(dir, &m);
+    if (!rc) rc = qct_listed(&m);
+    if (rc) { e601_discard(&m); T(rc == 0); }
+    e = m.e;
+    rc = editor_reopen_tab(e);
+    if (!rc) rc = e601_drive(e);
+    len = rc ? 0 : piece_len(e->buffer->tree); typed = 0;
+    bool once = !rc && !e->buffer->placeholder && len == FM4_GIB + 1 && piece_read(e->buffer->tree, 0, &typed, 1) == 0 &&
+        typed == 'x' && tabs_active(&e->tabs)->modified;
+    bool retired = access(orphan, F_OK) != 0;
+    printf("edit-7i5: relaunch with journal rc=%d len=%llu first=0x%02x source_retired=%s\n", rc,
+        (unsigned long long)len, typed, retired ? "yes" : "no");
+    int consistent = once ? e601_consistent(m.journal) : 1;
+    e601_discard(&m);
+    T(rc == 0 && once && retired && consistent == 0);
     return 0;
 }
 static int e601_checkpoint_failure(const char *dir, const char *orphan)

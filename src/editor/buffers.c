@@ -187,10 +187,13 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
                  * ORIGINAL offsets are BASE offsets for as long as BASE
                  * keeps this identity. */
                 b->origin = editor_base_id_of(&b->base);
-            } else if (e->recovering) {
+            } else if (e->recovering || e->restore_prepare) {
                 /* edit-f3i: startup recovery installs with the journal
                  * detached and captures BASE afterwards; the opened
-                 * generation is still the tree's ORIGINAL. */
+                 * generation is still the tree's ORIGINAL. edit-7i5: a lazy
+                 * restore in a launch without a session journal binds the
+                 * same way, so editor_restore_apply compares the opened
+                 * generation with the kept source's BASE. */
                 size_t prefix_size = 0; const uint8_t *prefix = file_prefix(b->file, &prefix_size);
                 journal_base opened;
                 rc = journal_base_from_prefix(file_path(b->file), file_prefix_identity(b->file),
