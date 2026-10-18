@@ -946,7 +946,9 @@ int editor_poll_sources(editor *e)
 
 /* Explicit Reload and clean-source refresh share replacement, view clamping,
  * empty undo history, journal reconciliation and logical tab identity. */
-int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
+/* edit-ivv: *refused reports a checkpoint the shared directory guard turned
+ * away (JOURNAL_BUSY): rolled back like any failure, retried on the tick. */
+static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *refused)
 {
     size_t slot = 0;
     while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
@@ -986,6 +988,7 @@ int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
     EDIT_ASSERT(rc == 0); /* replacement keeps the existing logical tab */
     if (e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
     if (rc) {
+        if (refused) *refused = rc == JOURNAL_BUSY;
         e->buffers[slot] = NULL; b->retired = false;
         (void)tabs_replace(&e->tabs, tab_index, b->tree, &b->undo, &previous_tab, &e->v.state);
         (void)tabs_set_modified(&e->tabs, tab_index, modified);
@@ -1003,6 +1006,11 @@ int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
     if (active) return editor_activate(e);
     editor_session_metadata(e);
     return editor_journal_changed(e);
+}
+
+int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
+{
+    return reload_source(e, b, tab_index, NULL);
 }
 
 int editor_source_resolve(editor *e, bool reload)
@@ -1029,8 +1037,11 @@ int editor_check_sources(editor *e)
             size_t tab_index = 0;
             while (tab_index < tabs_count(&e->tabs) && tabs_at(&e->tabs, tab_index)->id != b->id) tab_index++;
             if (tab_index == tabs_count(&e->tabs)) continue; /* refresh retained closed tabs when reopened */
-            int rc = editor_reload_source(e, b, tab_index);
+            if (!editor_checkpoint_due(e)) continue; /* edit-ivv: a refused refresh waits for its tick */
+            bool refused = false;
+            int rc = reload_source(e, b, tab_index, &refused);
             if (rc || b->retired) return rc; /* at most one replacement in a maintenance turn */
+            if (refused) continue; /* edit-ivv: retried on the journal tick, not prompted */
             /* Failed acquisition/reconciliation retains the old resources and
              * exposes the existing recovery choices rather than losing text. */
         }
@@ -1053,7 +1064,8 @@ int editor_check_sources(editor *e)
             e->paint_ready = true; rc = render_mark_full(&e->grid); if (rc) return rc;
         }
     }
-    if (!e->source_choice || editor_save_active(e)) return 0;
+    /* edit-ivv: a choice whose checkpoint was refused waits for the tick. */
+    if (!e->source_choice || editor_save_active(e) || !editor_checkpoint_due(e)) return 0;
     unsigned choice = e->source_choice; e->source_choice = 0;
     editor_buffer *b = e->buffer;
     if (!b->source_stale || b->id != e->source_choice_id || b->source_generation != e->source_choice_generation) return 0;
@@ -1069,6 +1081,7 @@ int editor_check_sources(editor *e)
             if (rc) {
                 b->base = previous;
                 b->base.path = *previous.path ? b->base.captured_path : "";
+                if (rc == JOURNAL_BUSY) e->source_choice = choice; /* edit-ivv: Keep again on the tick */
                 return 0;
             }
         }
@@ -1083,5 +1096,8 @@ int editor_check_sources(editor *e)
         editor_large_keep(b);
         return editor_full_layout(e);
     }
-    return editor_reload_source(e, b, tabs_active_index(&e->tabs));
+    bool refused = false;
+    int rc = reload_source(e, b, tabs_active_index(&e->tabs), &refused);
+    if (!rc && refused) e->source_choice = choice; /* edit-ivv: Reload again on the tick */
+    return rc;
 }

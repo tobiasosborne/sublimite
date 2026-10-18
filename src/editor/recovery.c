@@ -442,6 +442,10 @@ static int install_session(editor *e, recovered_session *s)
         }
     }
     if (!rc) rc = editor_checkpoint(e);
+    /* edit-ivv: refused by the shared directory guard. The recovered text is
+     * installed and the source stays on disk under its lease until the owed
+     * checkpoint lands (editor_checkpoint_owed, on the journal tick). */
+    if (rc == JOURNAL_BUSY) { e->busy_checkpoint = true; rc = 0; }
     if (!rc) editor_session_metadata(e);
     return rc;
 }
@@ -552,7 +556,10 @@ static int restore_source(editor *e, const char *directory, const char *previous
     /* Failure never retires the recovery source. Corrupt/torn tails are replay's
      * validated prefix, so the durable replacement checkpoint contains exactly
      * the accepted session. */
-    if (!rc && session.buffers) {
+    if (!rc && session.buffers && e->busy_checkpoint) {
+        /* edit-ivv: no durable replacement yet; retire after the owed one. */
+        if (!e->recover_existing) strcpy(e->busy_source, previous); /* both IPC_PATH_CAP */
+    } else if (!rc && session.buffers) {
         if (!e->recover_existing && unlink(previous)) rc = EDITOR_ERR_IO;
         else if (!e->recover_existing) {
             if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
@@ -732,7 +739,30 @@ int editor_session_restore(editor *e)
         }
         rc = restore_source(e, directory, previous, &cost);
         cost_fini(&cost);
-        close(previous_fd);
+        /* edit-ivv: a source awaiting the owed checkpoint keeps its lease. */
+        if (!rc && *e->busy_source && e->busy_source_lease < 0) e->busy_source_lease = previous_fd;
+        else close(previous_fd);
         if (rc) return rc;
+        if (e->busy_checkpoint) return 0; /* edit-ivv: later sources stay discoverable */
     }
+}
+/* edit-ivv: the owed checkpoint is durable; retire the source as
+ * restore_source does after its own checkpoint. Retained generations it named
+ * are left to journal_retire_directory's orphan-BASE sweep. */
+void editor_recovery_owed_done(editor *e)
+{
+    e->busy_checkpoint = false;
+    if (*e->busy_source) {
+        char lock_path[IPC_PATH_CAP], directory[IPC_PATH_CAP];
+        (void)unlink(e->busy_source);
+        if (!lock_name(lock_path, sizeof lock_path, e->busy_source)) (void)unlink(lock_path);
+        strcpy(directory, e->busy_source);
+        char *slash = strrchr(directory, '/');
+        if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
+        int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0) { (void)fsync(fd); close(fd); }
+        e->busy_source[0] = 0;
+    }
+    if (e->busy_source_lease >= 0) close(e->busy_source_lease);
+    e->busy_source_lease = -1; /* (P) no descriptor */
 }

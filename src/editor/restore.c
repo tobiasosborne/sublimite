@@ -18,7 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-enum { RESTORE_IDLE, RESTORE_SCANNING, RESTORE_OPENING, RESTORE_DONE };
+enum { RESTORE_IDLE, RESTORE_SCANNING, RESTORE_OPENING, RESTORE_RETRY, RESTORE_DONE }; /* edit-ivv: RETRY waits a journal tick */
 typedef struct restore_op { size_t buffer; uint64_t off, len; const uint8_t *data; bool insert; } restore_op;
 typedef struct restore_text { uint8_t *bytes; size_t len, gap, gap_len; } restore_text;
 struct editor_restore_buffer {
@@ -293,7 +293,7 @@ void editor_restore_free(editor_restore *r)
 {
     if (!r) return;
     /* An evicted or closing placeholder may still be in flight. */
-    if ((r->state == RESTORE_SCANNING || r->state == RESTORE_OPENING) && *r->active) --*r->active;
+    if ((r->state == RESTORE_SCANNING || r->state == RESTORE_OPENING || r->state == RESTORE_RETRY) && *r->active) --*r->active;
     job_quiesce(r);
     program_free(r);
     if (r->lease >= 0) close(r->lease);
@@ -593,6 +593,17 @@ static int install_all(editor *e, editor_buffer *p)
     e->recovering = false;
     /* The recovered text is durable here before the source is retired. */
     if (!rc && e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    if (rc == JOURNAL_BUSY) {
+        /* edit-ivv: the shared directory guard refused the checkpoint and
+         * nothing was retired. Put the placeholder back, keep the scanned
+         * program, the source and its lease, and prepare again once
+         * editor_checkpoint_due (one journal tick). */
+        int back = rollback(e, p, &u);
+        free(installed);
+        drop_replacements(e, r);
+        r->state = RESTORE_RETRY;
+        return back;
+    }
     if (rc) {
         int back = rollback(e, p, &u);
         free(installed);
@@ -650,6 +661,10 @@ int editor_restore_service(editor *e)
             (void)work_mailbox_bind(&e->pool, r->job, 0, NULL, NULL);
             r->job = (work_handle){0};
             if (r->scan_rc) { int rc = restore_fail(e, p, r->scan_rc); if (rc) return rc; continue; }
+            int rc = prepare_all(e, p); if (rc) return rc;
+        }
+        if (r->state == RESTORE_RETRY) {
+            if (!editor_checkpoint_due(e)) continue;
             int rc = prepare_all(e, p); if (rc) return rc;
         }
         if (r->state == RESTORE_OPENING) { int rc = install_all(e, p); if (rc) return rc; }

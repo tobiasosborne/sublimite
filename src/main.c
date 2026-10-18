@@ -170,7 +170,7 @@ int main(int argc, char **argv)
     ipc_args_fini(&args);
     if (!rc) rc = editor_run(e);
     if (e) {
-        int flushed = editor_flush(e);
+        int flushed = editor_flush_settle(e); /* edit-ivv: bounded JOURNAL_BUSY retry */
         if (!rc) rc = flushed;
         editor_close(e);
     }

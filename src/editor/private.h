@@ -408,6 +408,17 @@ struct editor {
     bool focused, visible, blinking, quit;
     bool journal_waiting;
     uint64_t checkpoint_retry_ns; /* edit-dr9: busy close retries on the journal tick */
+    /* edit-ivv: a checkpoint the shared directory guard refused (JOURNAL_BUSY)
+     * keeps its caller's state; the caller retries once editor_checkpoint_due.
+     * busy_due_ns is that tick (0 none); busy_refusals counts consecutive
+     * refusals (a second one has outlasted the tick: notice). A startup
+     * recovery whose checkpoint was refused owes one (busy_checkpoint) and
+     * retires its source journal (busy_source, lease held) only after it. */
+    uint64_t busy_due_ns;
+    uint32_t busy_refusals;
+    bool busy_checkpoint;
+    int busy_source_lease;
+    char busy_source[IPC_PATH_CAP];
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
     uint32_t tab_rows, map_cols; /* tab_rows: every row above the text (menu bar + tab strip) */
     uint32_t menu_rows; /* edit-yey: the bar's row (0/1); the tab strip is row menu_rows */
@@ -521,6 +532,10 @@ bool editor_font_pending(const editor *e);
 int editor_resize_grid(editor *e, render_dims dims);
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
+/* edit-ivv: JOURNAL_BUSY retry on the journal tick (checkpoint.c). */
+bool editor_checkpoint_due(const editor *e);
+void editor_checkpoint_owed(editor *e);
+void editor_recovery_owed_done(editor *e); /* recovery.c: retire the deferred source */
 /* edit-fi2 (retain.c): BASE retention after the first modification. */
 enum { EDITOR_RETAIN_IDLE, EDITOR_RETAIN_RUNNING, EDITOR_RETAIN_READY, EDITOR_RETAIN_FAILED };
 bool editor_retain_matches(const editor_buffer *b, const journal_base *base);

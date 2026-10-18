@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <time.h>
 
 static bool runnable(const editor *e);
 static int refresh_caret(editor *e);
@@ -669,6 +670,9 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
     /* edit-bt1: wake for a deferred scroll slice's retry tick. */
     if (e->buffer->scroll_retry_ns && e->buffer->scroll_pending && e->buffer->scroll_retry_ns < deadline)
         deadline = e->buffer->scroll_retry_ns;
+    /* edit-ivv: wake for a refused checkpoint's retry tick; once it has
+     * passed, the retrying path runs on this step and no wake is owed. */
+    if (e->busy_due_ns > now && e->busy_due_ns < deadline) deadline = e->busy_due_ns;
     if (e->journal && !editor_save_leased(e)) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;
@@ -735,6 +739,7 @@ int editor_step(editor *e, int timeout_ms)
     /* edit-601: restore failures are notices (restore.c restore_fail); a
      * nonzero return is only a failed reactivation of the editor itself. */
     if (!rc) rc = editor_restore_service(e);
+    if (!rc) editor_checkpoint_owed(e); /* edit-ivv */
     if (!rc) rc = editor_palette_sync(e);
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
     if (e->quit) return close_result(e, timeout_ms);
@@ -893,6 +898,18 @@ editor_stats editor_get_stats(const editor *e)
 }
 bool editor_index_complete(editor *e) { return e && (!e->buffer->index || lineidx_complete(e->buffer->index)); }
 uint64_t editor_line_count(const editor *e) { return e ? e->buffer->lines : 0; }
+int editor_flush_settle(editor *e)
+{
+    int rc = editor_flush(e);
+    if (rc != JOURNAL_BUSY) return rc;
+    /* edit-ivv: exit has no later tick. Wait the one close_result retries on
+     * (JOURNAL_DEFAULT_SYNC_NS) and ask once more; the text and the open
+     * journal are untouched by the refusal. (P) ns per s split for timespec. */
+    struct timespec tick = {(time_t)(JOURNAL_DEFAULT_SYNC_NS / UINT64_C(1000000000)),
+                            (long)(JOURNAL_DEFAULT_SYNC_NS % UINT64_C(1000000000))};
+    while (nanosleep(&tick, &tick) && errno == EINTR) {}
+    return editor_flush(e);
+}
 int editor_flush(editor *e)
 {
     if (!e) return EDITOR_ERR_ARG;
@@ -922,7 +939,8 @@ int editor_flush(editor *e)
     } while (metadata == JOURNAL_BUSY);
     int rc = metadata ? metadata : journal_flush(e->journal);
     e->journal_waiting = false;
-    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error)
+    /* edit-ivv: an owed recovery checkpoint (busy_checkpoint) lands here too. */
+    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint)
         return editor_checkpoint(e);
     return rc;
 }

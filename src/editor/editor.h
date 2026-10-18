@@ -184,6 +184,10 @@ uint64_t editor_line_count(const editor *e);
 /* Blocking journal flush/checkpoint, outside the typing path. Failure recovery
  * may allocate and rotate a complete current-state checkpoint before exit. */
 int editor_flush(editor *e);
+/* edit-ivv: editor_flush for exit paths (main's final flush, editor_close):
+ * a JOURNAL_BUSY refusal from the shared directory guard is retried once
+ * after one journal tick (JOURNAL_DEFAULT_SYNC_NS, the close_result bound). */
+int editor_flush_settle(editor *e);
 /* Allocating open path, UI thread; synchronous acceptance/partial-open rollback.
  * Requests and payloads are copied before return. token=0 for local startup.
  * Resolved paths already open activate their retained tab; origin coordinates

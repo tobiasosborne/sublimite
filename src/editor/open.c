@@ -16,7 +16,7 @@ void editor_close(editor *e)
     config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
     editor_hl_close(e);
     editor_find_close(e);
-    if (e->journal && !e->recovering) (void)editor_flush(e);
+    if (e->journal && !e->recovering) (void)editor_flush_settle(e); /* edit-ivv: bounded BUSY retry */
     editor_session_close(e);
     if (e->journal) {
         /* A failed startup can close before any BASE/metadata was admitted.
@@ -30,6 +30,7 @@ void editor_close(editor *e)
     if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path)
         (void)journal_session_release(e->cfg.journal_path, e->session_lock);
     if (e->session_lock >= 0) close(e->session_lock);
+    if (e->busy_source_lease >= 0) close(e->busy_source_lease); /* edit-ivv: source stays discoverable */
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);
     editor_backend_close_probe(e);
@@ -67,7 +68,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         render_null_backend(&fallback) : render_cpu_backend(&fallback))) return EDITOR_ERR_ARG;
     editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->recovery_skip = skip_recovery;
+    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->busy_source_lease = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     atomic_init(&e->font_logged, false);
     /* edit-fi2: retain BASEs that startup can restore in one pass

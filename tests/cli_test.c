@@ -6,13 +6,13 @@ static int test_editor_open(editor **out, const editor_config *config, render_ba
 static int test_editor_flush(editor *e);
 #define editor_backend_select test_backend_select
 #define editor_open test_editor_open
-#define editor_flush test_editor_flush
+#define editor_flush_settle test_editor_flush /* edit-ivv: main flushes via editor_flush_settle */
 #define main editor_cli_main
 #include "../src/main.c"
 #undef main
 #undef editor_backend_select
 #undef editor_open
-#undef editor_flush
+#undef editor_flush_settle
 #include "trace/trace_fmt.h"
 #include <dirent.h>
 #include "ipc_isolation.h"
@@ -34,7 +34,7 @@ typedef struct hot_snapshot {
  * loop returns and before close. Pipe payload size follows journal_stats. */
 static int test_editor_flush(editor *e)
 {
-    int rc = editor_flush(e);
+    int rc = editor_flush_settle(e);
     const char *descriptor = getenv("CLI_TEST_SIGNAL_FLUSH_FD");
     if (descriptor) {
         journal_stats stats = journal_get_stats(e->journal);

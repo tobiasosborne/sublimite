@@ -1,5 +1,6 @@
 /* Failure recovery at explicit flush/exit only; never on the typing path. */
 #include "editor/private.h"
+#include "trace/trace.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -265,6 +266,24 @@ static size_t recorded_tabs(const editor *e, uint8_t *out)
     if (out) { put64(out, count); put64(out + 8, active); }
     return count;
 }
+/* edit-ivv: the shared directory guard (edit-dr9) refuses a rotation with
+ * JOURNAL_BUSY while another editor's retirement sweep holds it; the refusal
+ * changes nothing. Every checkpoint caller keeps its state (text in memory,
+ * journal open, choice or restore pending) and asks again once
+ * editor_checkpoint_due: one journal tick later, the bound close_result uses
+ * (JOURNAL_DEFAULT_SYNC_NS; no new number). Only a refusal that outlasts that
+ * tick (a second consecutive one) is shown. */
+static const char busy_notice[] = "session journal directory busy (another editor is tidying it); retrying";
+static void checkpoint_refused(editor *e)
+{
+    e->busy_due_ns = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS;
+    if (e->busy_refusals < UINT32_MAX) e->busy_refusals++;
+    if (e->busy_refusals > 1u) { e->recovery_notice = busy_notice; e->recovery_notice_mutations = e->stats.mutations; }
+}
+bool editor_checkpoint_due(const editor *e)
+{
+    return !e->busy_due_ns || trace_now_ns() >= e->busy_due_ns;
+}
 int editor_checkpoint(editor *e)
 {
     editor_records c;
@@ -274,13 +293,29 @@ int editor_checkpoint(editor *e)
     if (!rc) rc = build_checkpoint(e, &c);
     if (!rc) rc = editor_records_check(&c);
     if (!rc) rc = journal_rotate(e->journal, c.records, c.count);
+    if (rc == JOURNAL_BUSY) checkpoint_refused(e);
     if (!rc) {
         e->op_count = e->stage_used = 0; e->stats.journal_error = 0;
         e->journal_group_open = false;
         editor_retain_checkpointed(e); /* edit-fi2 */
+        e->busy_due_ns = 0; e->busy_refusals = 0; /* (P) no retry pending */
+        if (e->recovery_notice == busy_notice) e->recovery_notice = NULL;
+        if (e->busy_checkpoint) editor_recovery_owed_done(e); /* edit-ivv */
     }
     editor_records_free(&c);
     return rc;
+}
+/* edit-ivv: a startup recovery whose checkpoint was refused owes one; retry it
+ * on the journal tick under the gate the refresh and retain paths use (no save
+ * owning the journal, no staged edits). Any other failure is a journal error
+ * like the rest; the recovery source stays discoverable either way. */
+void editor_checkpoint_owed(editor *e)
+{
+    if (!e->busy_checkpoint || !e->journal || !editor_checkpoint_due(e)) return;
+    if (editor_save_active(e) || editor_save_leased(e) || e->op_count) return;
+    int rc = journal_flush(e->journal);
+    if (!rc) rc = editor_checkpoint(e);
+    if (rc && rc != JOURNAL_BUSY) e->stats.journal_error = rc;
 }
 
 /* Coalesce metadata against the last accepted record. Reserved encoding storage

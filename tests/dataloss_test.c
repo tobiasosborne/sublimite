@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -927,6 +928,44 @@ static int open_gib(void)
     remove_tree(root); return rc;
 }
 
+/* edit-ivv (d): Reload/Keep chosen while another editor's directory sweep
+ * holds the shared guard LOCK_EX (journal_test --rotate-busy pattern): the
+ * choice survives the refused checkpoint and lands on a later journal tick.
+ * (P) zero = no refusal/empty; (E) watchdog EDITOR_IDLE_NS as settle. */
+static int ivv_choice(bool reload)
+{
+    char root[64], source[128], jpath[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 'x', 0, "x") == 0); T(stale_prompt(e, source, "external") == 0);
+    int guard = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC); T(guard >= 0 && flock(guard, LOCK_EX | LOCK_NB) == 0);
+    T(press(e, reload ? 'r' : 'k', 0, NULL) == 0);
+    uint64_t limit = deadline();
+    while (e->source_choice && !e->busy_refusals && trace_now_ns() < limit) { T(turn(e) == 0); sched_yield(); }
+    T(turn(e) == 0);
+    fprintf(stderr, "dataloss_test: edit-ivv %s with guard held: refusals=%u choice=%u stale=%d\n",
+        reload ? "reload" : "keep", e->busy_refusals, e->source_choice, e->buffer->source_stale);
+    T(e->busy_refusals > 0 && e->source_choice && e->buffer->source_stale);
+    T(!e->recovery_notice || !strstr(e->recovery_notice, "busy")); /* within the first tick: silent */
+    if (!reload) {
+        /* (P) a second consecutive refusal has outlasted the one-tick bound. */
+        limit = deadline();
+        while (e->busy_refusals < 2u) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+        fprintf(stderr, "dataloss_test: edit-ivv keep past the bound: refusals=%u notice=%s\n", e->busy_refusals,
+            e->recovery_notice ? e->recovery_notice : "(none)");
+        T(e->recovery_notice && strstr(e->recovery_notice, "busy") && e->source_choice && e->buffer->source_stale);
+    }
+    T(close(guard) == 0);
+    limit = deadline();
+    while (e->buffer->source_stale) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0); T(!e->busy_refusals);
+    if (reload) { T(text_is(e, "external") == 0); T(!editor_tab(e, 0)->modified); }
+    else { T(text_is(e, "xbase") == 0); T(editor_tab(e, 0)->modified); }
+    fprintf(stderr, "dataloss_test: edit-ivv %s landed after the guard was released\n", reload ? "reload" : "keep");
+    editor_close(e); remove_tree(root); return 0;
+}
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
@@ -943,10 +982,12 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--rewrite-rename")) return external_rewrite(REWRITE_RENAME);
     if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
     if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
+    if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
     T(reload_during_save(true) == 0); T(reload_during_save(false) == 0);
+    T(ivv_choice(false) == 0); T(ivv_choice(true) == 0);
     T(save_during_prompt(true) == 0); T(save_during_prompt(false) == 0);
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);

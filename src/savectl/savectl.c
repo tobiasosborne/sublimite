@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <unistd.h>
 #include <sys/random.h>
+#include <time.h>
 
 /* Epoch and the prepare-return acknowledgement are shared atomic fields.
  * Frozen task input is borrowed by a worker; a separate result lease transfers ownership only via
@@ -92,6 +93,20 @@ struct savectl {
     journal_base saved_base;
 };
 
+/* edit-ivv: the journal's shared directory guard refuses a rotation with
+ * JOURNAL_BUSY while another editor's retirement sweep holds it (edit-dr9);
+ * the refusal changes nothing. This worker has no later tick to come back
+ * on, so it waits the one the editor retries on (JOURNAL_DEFAULT_SYNC_NS, the
+ * close_result bound) and asks once more; a refusal that outlasts it is
+ * reported like any other journal error. (P) ns per s split for timespec. */
+static bool busy_wait(int rc)
+{
+    if (rc != JOURNAL_BUSY) return false;
+    struct timespec tick = {(time_t)(JOURNAL_DEFAULT_SYNC_NS / UINT64_C(1000000000)),
+                            (long)(JOURNAL_DEFAULT_SYNC_NS % UINT64_C(1000000000))};
+    while (nanosleep(&tick, &tick) && errno == EINTR) {}
+    return true;
+}
 static file_id identity(const struct stat *st)
 {
     file_id id;
@@ -262,9 +277,19 @@ static void worker(work_ctx *ctx)
                 savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
                 if (s->task.request_mode)
                     r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
+                char kept[sizeof lease->token.previous_path];
+                memcpy(kept,lease->token.previous_path,sizeof kept);
                 if (!r->journal_error)
                     r->journal_error=journal_save_prepare(s->options.journal,s->options.buffer_id,
                         &checkpoint.previous,checkpoint.records,checkpoint.count,&lease->token);
+                if (busy_wait(r->journal_error)) {
+                    /* A copy this refused prepare retained is named by no
+                     * checkpoint: drop it before preparing again. */
+                    if (*lease->token.previous_path && strcmp(kept,lease->token.previous_path))
+                        (void)unlink(lease->token.previous_path);
+                    r->journal_error=journal_save_prepare(s->options.journal,s->options.buffer_id,
+                        &checkpoint.previous,checkpoint.records,checkpoint.count,&lease->token);
+                }
             }
             if (!r->file_error && !r->journal_error && s->options.journal && !lease->prepared) {
                 lease->prepared=true; lease->handoff_pending=true; goto handoff;
@@ -293,8 +318,11 @@ static void worker(work_ctx *ctx)
             if (s->task.request_mode)
                 r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
             r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
-            if(!r->file_error && !r->journal_error)
+            if(!r->file_error && !r->journal_error) {
                 r->journal_error=journal_save_cancel(s->options.journal,&lease->token,checkpoint.records,checkpoint.count);
+                if (busy_wait(r->journal_error))
+                    r->journal_error=journal_save_cancel(s->options.journal,&lease->token,checkpoint.records,checkpoint.count);
+            }
             if (s->task.request_mode) {
                 piece_snapshot_release(s->task.snapshot);
                 s->task.request.release(s->task.request.ctx);
@@ -311,10 +339,16 @@ static void worker(work_ctx *ctx)
                 int rc=journal_flush(s->options.journal);
                 if (rc && rc!=JOURNAL_IO && rc!=JOURNAL_FULL) r->journal_error=rc;
                 else r->journal_error=journal_rotate(s->options.journal,checkpoint.records,checkpoint.count);
+                if (busy_wait(r->journal_error))
+                    r->journal_error=journal_rotate(s->options.journal,checkpoint.records,checkpoint.count);
             }
-            if (!r->file_error && !r->journal_error)
+            if (!r->file_error && !r->journal_error) {
                 r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
                     checkpoint.records,checkpoint.count);
+                if (busy_wait(r->journal_error))
+                    r->journal_error=journal_save_finish(s->options.journal,&lease->token,&s->task.base,
+                        checkpoint.records,checkpoint.count);
+            }
             if (s->task.request_mode) {
                 piece_snapshot_release(s->task.snapshot);
                 s->task.request.release(s->task.request.ctx);

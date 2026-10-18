@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1838,14 +1840,211 @@ static int leased_install_failure(bool leased, bool start_empty)
     fm4_remove_tree(root);
     return rc;
 }
+/* edit-ivv begin: JOURNAL_BUSY from the shared directory guard (edit-dr9)
+ * is retried on the journal tick by every checkpoint path, never a hard
+ * error. The test holds the guard LOCK_EX on its own open file description,
+ * as journal_retire_directory does (journal_test --rotate-busy pattern).
+ * (P) zero is success/empty/the first tab/no refusal; one is a single tab.
+ * (E) watchdogs reuse EDITOR_IDLE_NS (settle). The two synchronous retries
+ * (save worker, close) attempt once, wait one JOURNAL_DEFAULT_SYNC_NS tick and
+ * attempt again: the guard is released half a tick (JOURNAL_DEFAULT_SYNC_NS /
+ * 2) after the refused attempt starts, between the first attempt and the
+ * retry. No new duration or count is introduced. */
+static int ivv_hold(const char *dir)
+{
+    int guard = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (guard >= 0 && flock(guard, LOCK_EX | LOCK_NB)) { close(guard); guard = -1; }
+    return guard;
+}
+static int ivv_text(editor *e, const char *expected)
+{
+    uint8_t bytes[sizeof "MK"]; uint64_t len = editor_length(e);
+    T(len == strlen(expected) && len < sizeof bytes && editor_read(e, 0, bytes, (size_t)len) == 0);
+    T(!memcmp(bytes, expected, (size_t)len)); return 0;
+}
+/* (a) A launch installs a recovered session while another editor's sweep
+ * holds the guard: no set-aside, the text stays, the source is retired only
+ * after the owed checkpoint lands. */
+typedef struct ivv_paths { char source[IPC_PATH_CAP], first[IPC_PATH_CAP], next[IPC_PATH_CAP], lock[IPC_PATH_CAP]; } ivv_paths;
+static int ivv_recovery_body(const char *root, ivv_paths *p, editor **out, render_backend *backend, int *guard)
+{
+    char *source = p->source, *first = p->first, *next = p->next, *lock = p->lock;
+    T(snprintf(source, IPC_PATH_CAP, "%s/source", root) > 0);
+    T(snprintf(first, IPC_PATH_CAP, "%s/session-XXXXXX", root) > 0);
+    int fd = mkstemp(first); T(fd >= 0); T(close(fd) == 0);
+    T(render_null_backend(backend) == 0);
+    editor_config config = {.path = source, .journal_path = first, .cols = 32, .rows = 3};
+    T(editor_open(out, &config, backend) == 0);
+    T(press(*out, 'M', 0, "MK") == 0);
+    editor_close(*out); *out = NULL;
+    T(snprintf(next, IPC_PATH_CAP, "%s/session-XXXXXX", root) > 0);
+    fd = mkstemp(next); T(fd >= 0); T(close(fd) == 0);
+    T(snprintf(lock, IPC_PATH_CAP, "%s/.%s.lock", root, strrchr(first, '/') + 1) > 0);
+    *guard = ivv_hold(root); T(*guard >= 0);
+    *backend = (render_backend){0}; T(render_null_backend(backend) == 0);
+    config = (editor_config){.journal_path = next, .cols = 32, .rows = 3};
+    int rc = editor_open(out, &config, backend);
+    editor *e = *out;
+    fprintf(stderr, "edit-ivv (a): guard held editor_open=%d refusals=%u owed=%d notice=%s aside=%s source_kept=%s len=%llu\n", rc,
+        e ? e->busy_refusals : 0u, e ? e->busy_checkpoint : 0, e && e->recovery_notice ? e->recovery_notice : "(none)",
+        e && *e->recovery_aside ? e->recovery_aside : "(none)", access(first, F_OK) ? "no" : "yes",
+        e ? (unsigned long long)editor_length(e) : 0ull);
+    T(rc == 0 && e);
+    T(e->busy_refusals > 0 && e->busy_checkpoint && !*e->recovery_aside && !access(first, F_OK));
+    T(!e->recovery_notice); /* (P) one refusal is within the one-tick bound: silent */
+    T(ivv_text(e, "MK") == 0);
+    T(turn(e) == 0); T(turn(e) == 0); T(!access(first, F_OK) && e->busy_checkpoint);
+    T(close(*guard) == 0); *guard = -1;
+    uint64_t limit = deadline();
+    while (e->busy_checkpoint) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    fprintf(stderr, "edit-ivv (a): guard released refusals=%u source_kept=%s lock_kept=%s\n", e->busy_refusals,
+        access(first, F_OK) ? "no" : "yes", access(lock, F_OK) ? "no" : "yes");
+    T(e->busy_refusals == 0 && access(first, F_OK) < 0 && access(lock, F_OK) < 0 && e->busy_source_lease < 0);
+    T(ivv_text(e, "MK") == 0);
+    editor_close(e); *out = NULL;
+    T(file_contains(next, "MK"));
+    return 0;
+}
+static int ivv_recovery(void)
+{
+    char root[] = "build/editor-ivv-XXXXXX"; T(mkdtemp(root));
+    editor *e = NULL; render_backend backend = {0}; int guard = -1;
+    static ivv_paths paths; /* outlives the editor that borrows journal_path */
+    int rc = ivv_recovery_body(root, &paths, &e, &backend, &guard);
+    if (guard >= 0) close(guard);
+    if (e) editor_close(e);
+    fm4_remove_tree(root);
+    return rc;
+}
+/* (b) A lazy restore's checkpoint is refused: the placeholder and the source
+ * stay, and the restore completes on a later tick once the guard is free. */
+static int ivv_restore_case(const char *dir, const char *orphan)
+{
+    struct stat before; T(stat(orphan, &before) == 0);
+    qct_launch l = {0};
+    int rc = e601_start(dir, &l);
+    if (!rc) rc = qct_listed(&l);
+    if (rc) { e601_discard(&l); T(rc == 0); }
+    editor *e = l.e;
+    int guard = ivv_hold(dir); if (guard < 0) { e601_discard(&l); T(guard >= 0); }
+    rc = editor_reopen_tab(e);
+    uint64_t limit = deadline();
+    while (!rc && e->restore_active && !e->busy_refusals && trace_now_ns() < limit) { rc = turn(e); sched_yield(); }
+    bool waiting = !rc && e->restore_active && e->busy_refusals > 0 && e->buffer->placeholder && e601_same(orphan, &before);
+    fprintf(stderr, "edit-ivv (b): guard held rc=%d restore_active=%zu refusals=%u placeholder=%s source_kept=%s notice=%s\n", rc,
+        (size_t)e->restore_active, e->busy_refusals, e->buffer->placeholder ? "yes" : "no",
+        e601_same(orphan, &before) ? "yes" : "no", e->recovery_notice ? e->recovery_notice : "(none)");
+    close(guard);
+    if (waiting) rc = e601_drive(e);
+    bool live = waiting && !rc && tabs_count(&e->tabs) == 1 && !e->buffer->placeholder && !e->restore_active &&
+        piece_len(e->buffer->tree) == FM4_GIB + strlen("x");
+    bool retired = access(orphan, F_OK) < 0;
+    fprintf(stderr, "edit-ivv (b): guard released rc=%d restored=%s len=%llu source_retired=%s refusals=%u\n", rc, live ? "yes" : "no",
+        (unsigned long long)piece_len(e->buffer->tree), retired ? "yes" : "no", e->busy_refusals);
+    int consistent = live ? journal_flush(e->journal) || e601_consistent(l.journal) : 1;
+    e601_discard(&l);
+    T(waiting && live && retired && consistent == 0);
+    return 0;
+}
+static int ivv_restore(void)
+{
+    char made[] = "build/editor-ivv-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved_env = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved_env != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved_env) > 0);
+    char dir[IPC_PATH_CAP], source[IPC_PATH_CAP], orphan[IPC_PATH_CAP] = "";
+    int rc = setenv("XDG_DATA_HOME", root, 1) || journal_default_dir(dir, sizeof dir) || editor_make_directory(dir, NULL, NULL);
+    if (!rc) rc = snprintf(source, sizeof source, "%s/corpus", root) <= 0;
+    int fd = rc ? -1 : open(source, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd >= 0) { rc = ftruncate(fd, (off_t)FM4_GIB) != 0; close(fd); } else rc = 1; /* sparse */
+    if (!rc) rc = qct_orphan(dir, source, orphan);
+    if (!rc) rc = ivv_restore_case(dir, orphan);
+    fm4_remove_tree(root); /* on success and on every failure path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    return rc;
+}
+/* (c) A save whose journal rotation (prepare before the write, finish after
+ * it) meets the held guard completes after it is released, file and flag. */
+static int ivv_save(int phase)
+{
+    fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    T(press(f.e, 'x', 0, "x") == 0);
+    held_save held = {.phase = phase};
+    if (phase) T(savectl_set_step_hook(f.e->buffer->save, hold, &held) == 0);
+    int guard = phase ? -1 : ivv_hold(f.directory);
+    if (!phase) T(guard >= 0);
+    T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0);
+    if (phase) { T(enter_hold(f.e, &held) == 0); guard = ivv_hold(f.directory); T(guard >= 0); atomic_store(&held.release, true); }
+    uint64_t release = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS / 2u;
+    while (trace_now_ns() < release) { T(turn(f.e) == 0); sched_yield(); }
+    T(close(guard) == 0);
+    T(saved(f.e) == 0);
+    bool modified = editor_tab(f.e, 0)->modified;
+    fprintf(stderr, "edit-ivv (c): save %s guard: modified=%s save_error=%d operation_error=%d\n", phase ? "finish" : "prepare",
+        modified ? "yes" : "no", f.e->buffer->save_error, f.e->buffer->operation_error);
+    T(disk_is(f.path, "xbase") == 0); T(!modified && !f.e->buffer->save_error && !f.e->buffer->operation_error);
+    close_fixture(&f); return 0;
+}
+/* (e) editor_close flushes a failed journal while the guard is held: the
+ * checkpoint fallback retries one tick later instead of being skipped. */
+typedef struct ivv_release { int guard; uint64_t at; } ivv_release;
+static void *ivv_release_later(void *ctx)
+{
+    ivv_release *r = ctx;
+    while (trace_now_ns() < r->at) sched_yield();
+    close(r->guard); return NULL;
+}
+static int ivv_close_body(const char *root, char *log, editor **out, render_backend *backend, bool settle_first)
+{
+    T(snprintf(log, IPC_PATH_CAP, "%s/session", root) > 0);
+    T(render_null_backend(backend) == 0);
+    editor_config config = {.journal_path = log, .initial = (const uint8_t *)"checkpoint", .initial_len = strlen("checkpoint")};
+    T(editor_open(out, &config, backend) == 0); editor *e = *out;
+    T(settle(e) == 0); T(press(e, 'z', 0, "z") == 0); T(editor_flush(e) == 0);
+    struct stat before, after; T(stat(log, &before) == 0);
+    e->stats.journal_error = JOURNAL_FULL; /* accepted edits held only by a failed journal */
+    ivv_release r = {ivv_hold(root), trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS / 2u}; T(r.guard >= 0);
+    pthread_t thread; T(pthread_create(&thread, NULL, ivv_release_later, &r) == 0);
+    int flushed = settle_first ? editor_flush_settle(e) : 0;
+    if (!settle_first) { editor_close(e); *out = NULL; }
+    T(pthread_join(thread, NULL) == 0);
+    T(stat(log, &after) == 0);
+    fprintf(stderr, "edit-ivv (e): %s with guard held: flushed=%d rotated=%s\n", settle_first ? "final flush" : "editor_close",
+        flushed, after.st_ino != before.st_ino ? "yes" : "no");
+    T(flushed == 0 && after.st_ino != before.st_ino && file_contains(log, "z"));
+    return 0;
+}
+static int ivv_close(bool settle_first)
+{
+    char root[] = "build/editor-ivv-XXXXXX"; T(mkdtemp(root));
+    editor *e = NULL; render_backend backend = {0}; char log[IPC_PATH_CAP];
+    int rc = ivv_close_body(root, log, &e, &backend, settle_first);
+    if (e) editor_close(e);
+    fm4_remove_tree(root);
+    return rc;
+}
+static int ivv_all(void)
+{
+    int failed = ivv_recovery();
+    failed |= ivv_restore();
+    failed |= ivv_save(0);
+    failed |= ivv_save(FILE_STEP_DIR_SYNCED);
+    failed |= ivv_close(false);
+    failed |= ivv_close(true);
+    if (!failed) puts("edit-ivv: busy directory guard: recovery install, lazy restore, save prepare/finish, close and final flush retry on the journal tick");
+    return failed;
+}
+/* edit-ivv end */
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     /* (P) executable plus focused-test option; zero is API success. */
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
+    T(ivv_all() == 0);
     T(leased_install_failure(false, false) == 0);
     T(leased_install_failure(true, false) == 0);
     T(leased_install_failure(true, true) == 0);
