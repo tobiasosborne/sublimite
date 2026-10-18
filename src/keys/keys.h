@@ -90,6 +90,7 @@ typedef enum keys_action {
     KEYS_ACTION_DISTRACTION_FREE, KEYS_ACTION_SCROLL_LINES,
     KEYS_ACTION_NEXT_VIEW, KEYS_ACTION_PREVIOUS_VIEW,
     KEYS_ACTION_NEXT_VIEW_STACK, KEYS_ACTION_PREVIOUS_VIEW_STACK,
+    KEYS_ACTION_TOGGLE_MENU, /* edit-yey: View > Toggle Menu; no default stroke */
     KEYS_ACTION_COUNT
 } keys_action;
 
@@ -138,6 +139,10 @@ void keys_reset(keys_state *state); /* NULL is allowed */
 /* Read-only table sorted by (args.chord, modifiers, keysym). No allocation.
  * Returned storage has process lifetime; count is optional. */
 const keys_binding *keys_defaults(size_t *count);
+/* Commands with no default stroke (Sublime binds none): keysym zero, never
+ * matched by lookup, so they are reachable only through a config override,
+ * the palette or the menu. Process-lifetime storage; count is optional. */
+const keys_binding *keys_unbound(size_t *count);
 /* O(log n), no allocation. out is cleared except on MATCH/PREFIX.
  * Lock bits ignored; unknown modifier bits and AltGr never match shortcuts.
  * ASCII uppercase, ISO_Left_Tab, keypad navigation, and US shifted shortcut

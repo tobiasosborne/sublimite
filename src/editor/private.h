@@ -15,6 +15,7 @@
 #include "minimap/minimap.h"
 #include "findui/findui.h"
 #include "palette/palette.h"
+#include "menu/menu.h"
 #include "fif/fif.h"
 #include "editor/large_private.h"
 #include "editor/runtime.h"
@@ -275,6 +276,16 @@ struct editor {
     palette_state *palette;
     bool palette_open;
     uint64_t palette_owner, palette_generation, palette_revision;
+    /* edit-yey: menu bar, embedded (no allocation). The bar is shown while
+     * pinned (menu.visible / Toggle Menu), active (keyboard focus after a
+     * bare Alt press-and-release, mnemonic or title click) or with a
+     * drop-down open; open is the menu index or negative. A held Alt only
+     * arms; it never changes the layout. */
+    struct editor_menu {
+        bool pinned, config_visible, armed, was_active, active;
+        int open;
+        size_t title, item, first;
+    } menu;
     uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
     uint32_t panel_rows;
     int find_direction, find_error, find_replace_request;
@@ -394,7 +405,8 @@ struct editor {
     bool journal_waiting;
     uint64_t checkpoint_retry_ns; /* edit-dr9: busy close retries on the journal tick */
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
-    uint32_t tab_rows, map_cols;
+    uint32_t tab_rows, map_cols; /* tab_rows: every row above the text (menu bar + tab strip) */
+    uint32_t menu_rows; /* edit-yey: the bar's row (0/1); the tab strip is row menu_rows */
     tabs_strip strip;
     size_t drag_tab;
     uint64_t drag_id, map_drag_id, map_drag_generation;
@@ -570,6 +582,15 @@ int editor_palette_close(editor *);
 int editor_palette_sync(editor *);
 int editor_palette_key(editor *, const plat_event *);
 int editor_palette_paint(editor *);
+/* edit-yey menu bar (menubar.c). key/pointer return true when consumed,
+ * with the result in *rc. Paint runs at the end of every composition. */
+bool editor_menu_visible(const editor *);
+bool editor_menu_key(editor *, const plat_event *, int *rc);
+bool editor_menu_pointer(editor *, const plat_event *, int *rc);
+int editor_menu_toggle(editor *);
+int editor_menu_configure(editor *, bool visible);
+int editor_menu_reset(editor *);
+int editor_menu_paint(editor *);
 int editor_handle_wheel(editor *e, const plat_event *ev);
 int editor_scroll_init(editor *e, editor_buffer *b);
 int editor_scroll_retire(editor_buffer *b);

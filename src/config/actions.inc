@@ -161,4 +161,5 @@ static const action_name action_names[] = {
     {"previous_view", KEYS_ACTION_PREVIOUS_VIEW},
     {"next_view_stack", KEYS_ACTION_NEXT_VIEW_STACK},
     {"previous_view_stack", KEYS_ACTION_PREVIOUS_VIEW_STACK},
+    {"toggle_menu", KEYS_ACTION_TOGGLE_MENU},
 };

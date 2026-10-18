@@ -47,6 +47,10 @@ static int override(config_settings *s, const char *name, const char *stroke)
             if (!(candidate.args.flags & KEYS_ARG_UNIMPLEMENTED)) break;
         }
     }
+    /* edit-yey: a command with no default stroke takes its unbound form. */
+    const keys_binding *strokeless = keys_unbound(&count);
+    for (size_t i = 0; !found && i < count; i++)
+        if (strokeless[i].action == action) { candidate.args = strokeless[i].args; found = true; }
     if (!found) return CONFIG_ERR_VALUE; /* parameterized/chord-only intent */
     candidate.args.chord = KEYS_CHORD_NONE;
     for (size_t i = 0; i < s->binding_count; i++)
@@ -93,6 +97,9 @@ static int setting(void *ctx, const char *path, const config_value *v)
     } else if (!strcmp(path, "wrap")) {
         if (v->type != CONFIG_BOOLEAN) return CONFIG_ERR_VALUE;
         s->wrap_set = true; s->wrap = v->boolean;
+    } else if (!strcmp(path, "menu.visible")) {
+        if (v->type != CONFIG_BOOLEAN) return CONFIG_ERR_VALUE;
+        s->menu_visible = v->boolean;
     } else if (!strcmp(path, "tabs") || !strcmp(path, "tabs.width")) {
         /* (P) indentation's existing consumer supports stops up to
          * INDENT_MAX_WIDTH; reject rather than truncate to its byte width. */

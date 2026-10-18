@@ -270,6 +270,15 @@ static const keys_binding defaults[] = {
     {PLAT_MOD_SHIFT|PLAT_MOD_CTRL, XKB_KEY_Right, KEYS_ACTION_SELECT_RIGHT, {KEYS_ARG_UNIMPLEMENTED, 0, KEYS_CHORD_J}}, /* ctrl+j ctrl+shift+right */
 };
 
+/* (P) Sublime's toggle_menu has no default key binding on Linux. */
+static const keys_binding unbound[] = {
+    {0, 0, KEYS_ACTION_TOGGLE_MENU, {0, 0, KEYS_CHORD_NONE}},
+};
+const keys_binding *keys_unbound(size_t *count)
+{
+    if (count) *count=sizeof unbound/sizeof unbound[0];
+    return unbound;
+}
 void keys_reset(keys_state *state)
 {
     if (state) state->chord=KEYS_CHORD_NONE;

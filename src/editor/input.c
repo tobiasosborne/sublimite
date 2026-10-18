@@ -934,7 +934,7 @@ bool editor_event_control(const editor *e, const plat_event *ev)
 {
     if (ev->kind != PLAT_EV_KEY) {
         if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION)
-            return ev->y >= 0 && (uint32_t)ev->y < e->grid.dims.cell_h;
+            return ev->y >= 0 && (uint32_t)ev->y < e->tab_rows * e->grid.dims.cell_h; /* edit-yey: bar + strip */
         return true;
     }
     if (!ev->press) return true;
@@ -975,6 +975,13 @@ static int large_doc_end(editor *e, bool extend)
 int editor_handle_key(editor *e, const plat_event *ev)
 {
     if (e->palette_open) return editor_palette_key(e, ev);
+    /* edit-yey: the menu bar owns bare Alt, Alt+mnemonic and, while it has
+     * keyboard focus, navigation; otherwise it steals no key. A changed
+     * source or the go-to prompt keep their keys. */
+    if (!e->buffer->source_stale && !e->go.active) {
+        int rc = 0;
+        if (editor_menu_key(e, ev, &rc) || rc) return rc;
+    }
     /* edit-n95: Escape cancels a running find in files first; the partial
      * results stay. With no search running Escape keeps its panel meaning. */
     if (!e->go.active && ev->press && ev->keysym == XKB_KEY_Escape && editor_fif_cancel(e)) return 0;
@@ -1006,6 +1013,7 @@ int editor_handle_key(editor *e, const plat_event *ev)
 int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *binding, keys_result result)
 {
     if (binding && binding->action == KEYS_ACTION_COMMAND_PALETTE) return editor_palette_show(e);
+    if (binding && binding->action == KEYS_ACTION_TOGGLE_MENU) return editor_menu_toggle(e);
     /* edit-o20: file/exit/scroll commands bypass find-field consumption;
      * edit-x8i: configured find actions dispatch from the same lookup. */
     bool common = binding && (binding->action == KEYS_ACTION_NEW_FILE || binding->action == KEYS_ACTION_OPEN_FILE ||

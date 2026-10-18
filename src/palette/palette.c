@@ -74,17 +74,22 @@ static bool default_arguments(const keys_binding *binding)
     return !binding->args.value &&
         !(binding->args.flags & (uint16_t)~(KEYS_ARG_UNIMPLEMENTED | KEYS_ARG_SINGLE_SELECTION));
 }
+const keys_binding *palette_command(keys_action action)
+{
+    size_t count; const keys_binding *table = keys_defaults(&count);
+    for (size_t j = 0; j < count; j++)
+        if (table[j].action == action && default_arguments(&table[j])) return &table[j];
+    table = keys_unbound(&count); /* edit-yey: strokeless commands */
+    for (size_t j = 0; j < count; j++) if (table[j].action == action) return &table[j];
+    return NULL;
+}
 void palette_init(palette_state *p)
 {
     if (!p) return;
     memset(p, 0, sizeof *p);
-    size_t count; const keys_binding *table = keys_defaults(&count);
     for (size_t i = 0; i < PALETTE_ACTION_COUNT; i++) {
         if (palette_label(action_names[i].name, p->rows[i].label, sizeof p->rows[i].label)) continue;
-        for (size_t j = 0; j < count; j++)
-            if (table[j].action == action_names[i].action && default_arguments(&table[j])) {
-                p->rows[i].binding = &table[j]; break;
-            }
+        p->rows[i].binding = palette_command(action_names[i].action);
     }
     (void)palette_filter(p, "", 0);
 }

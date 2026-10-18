@@ -485,6 +485,10 @@ int editor_resize_grid(editor *e, render_dims dims)
 int editor_text_geometry(editor *e)
 {
     render_dims dims = e->grid.dims; int rc;
+    /* edit-yey: the menu bar row sits above the tab strip while visible and
+     * only when a text row remains (one bar + one strip + one text row). */
+    e->menu_rows = editor_menu_visible(e) && dims.rows > 2u ? 1u : 0u;
+    e->tab_rows = (dims.rows > 1u ? 1u : 0u) + e->menu_rows;
     e->text_grid.dims.rows = dims.rows - e->tab_rows;
     uint32_t available=e->text_grid.dims.rows;
     /* P: query row; replacement mode adds its field and hints row. Recompute
@@ -531,7 +535,7 @@ static int nonkey(editor *e, const plat_event *ev)
     }
     if (ev->kind == PLAT_EV_FOCUS) {
         e->focused = ev->focused; undo_break_burst(e->undo);
-        if (!ev->focused) { int rc = editor_palette_close(e); if (rc) return rc; }
+        if (!ev->focused) { int rc = editor_palette_close(e); if (!rc) rc = editor_menu_reset(e); if (rc) return rc; }
         if (ev->focused && e->buffer->file) {
             (void)file_check(e->buffer->file, NULL);
             int rc = editor_check_sources(e); if (rc) return rc;
@@ -544,6 +548,7 @@ static int nonkey(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
     if (ev->kind == PLAT_EV_WHEEL) return editor_handle_wheel(e, ev);
     if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) {
+        if (!e->buffer->source_stale) { int rc = 0; if (editor_menu_pointer(e, ev, &rc) || rc) return rc; }
         if (e->go.active && (ev->kind == PLAT_EV_MOTION || !ev->press)) return 0;
         if (e->go.active) { int cancel = editor_goto_cancel(e); if (cancel) return cancel; }
         return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);

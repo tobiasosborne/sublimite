@@ -5147,6 +5147,166 @@ static int n5vz_open_refused(void)
     return 0;
 }
 
+/* edit-yey (P): menu bar contract. Geometry: the File drop-down's longest
+ * label + gap + chord + two padding cells, plus the existing minimap; rows
+ * are the bar, the tab strip and enough text rows to show File's items.
+ * Zero is absence/first index/row, one is a row/index step or a NUL. */
+static plat_event key_release(uint32_t sym, uint16_t mods)
+{
+    plat_event ev = key(sym, mods, NULL); ev.press = false; return ev;
+}
+static size_t menu_grid_find(editor *e, uint32_t row, const char *text)
+{
+    const render_grid *grid = editor_grid(e);
+    for (size_t column = 0; column + strlen(text) <= grid->dims.cols; column++)
+        if (palette_grid_text(e, row, column, text)) return column;
+    return SIZE_MAX;
+}
+static size_t menu_index(size_t menu, keys_action action)
+{
+    const menu_def *m = &menu_table()[menu];
+    for (size_t i = 0; i < m->count; i++) if (m->items[i] == action) return i;
+    return SIZE_MAX;
+}
+static int menu_contract(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    const char initial[] = "menu buffer";
+    size_t items = menu_table()[0].count;
+    editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
+        .cols = sizeof " Close Window  Ctrl+Shift+W " - 1u + 8u,
+        .rows = 1u + 1u + (uint32_t)items + 1u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint32_t text_rows = e->v.config.rows, strip = e->tab_rows;
+    T(!e->menu_rows && strip == 1u); /* hidden by default: zero rows */
+    T(palette_grid_text(e, strip, e->lay.gw, initial));
+    size_t save_as = menu_index(0, KEYS_ACTION_SAVE_AS); T(save_as != SIZE_MAX);
+    edit_malloc_guard_begin();
+    /* (a) a held Alt changes nothing; a bare press-and-release shows the bar. */
+    uint64_t geometry = e->geometry_generation;
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(!e->menu_rows && e->tab_rows == strip && e->v.config.rows == text_rows);
+    T(e->geometry_generation == geometry);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    T(e->menu_rows == 1u && e->tab_rows == strip + 1u && e->v.config.rows == text_rows - 1u);
+    T(palette_grid_text(e, 0, 1, "File") && menu_grid_find(e, 0, "Edit") != SIZE_MAX);
+    T(palette_grid_text(e, strip + 1u, e->lay.gw, initial)); /* grid shifted one row */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(!e->menu_rows && e->tab_rows == strip && e->v.config.rows == text_rows);
+    T(palette_grid_text(e, strip, e->lay.gw, initial));
+    T(expect(e, initial, 0) == 0);
+    /* (b) Alt+F opens File; Save As carries its chord. */
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key('f', PLAT_MOD_ALT, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    T(e->menu_rows == 1u && e->menu.open == 0);
+    uint32_t item_row = e->menu_rows + (uint32_t)save_as;
+    size_t label = menu_grid_find(e, item_row, "Save As"), chord = menu_grid_find(e, item_row, "Ctrl+Shift+S");
+    T(label != SIZE_MAX && chord != SIZE_MAX && chord > label);
+    /* (c) Escape closes the drop-down, a second Escape hides the bar. */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(e->menu.open < 0 && e->menu_rows == 1u);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(!e->menu_rows && e->v.config.rows == text_rows);
+    T(palette_grid_text(e, strip, e->lay.gw, initial));
+    T(edit_malloc_guard_end() == 0); /* (P) open/navigate/escape allocate nothing */
+    /* (d) Enter on Save As dispatches exactly what its chord does. */
+    T(press(e, key('s', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
+    editor_goto expected = e->go;
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->go.active);
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key('F', PLAT_MOD_ALT | PLAT_MOD_SHIFT, NULL)) == 0); /* not a mnemonic: Shift */
+    T(e->menu.open < 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT | PLAT_MOD_SHIFT)) == 0);
+    T(!e->menu_rows);
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key('f', PLAT_MOD_ALT, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    for (size_t i = 0; i < save_as; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(e->menu.item == save_as);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(!e->menu_rows && e->menu.open < 0 && e->go.active && e->go.kind == expected.kind);
+    T(e->go.owner == expected.owner && e->go.generation == expected.generation &&
+      e->go.length == expected.length && e->go.cursor == expected.cursor && e->go.selected == expected.selected);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->go.active);
+    /* Left/Right switch menus; Escape closes one level each. */
+    T(press(e, key('e', PLAT_MOD_ALT, NULL)) == 0); T(e->menu.open == 1);
+    T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0); T(e->menu.open == 2);
+    T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0);
+    T(e->menu.open == 0);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(!e->menu_rows && e->menu.open < 0);
+    /* (e) Alt as the modifier of a bound chord: the chord runs, no menu. */
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_visible);
+    bool match_case = findui_get_state(&e->find).options.match_case;
+    uint32_t chord_rows = e->v.config.rows; geometry = e->geometry_generation;
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(!e->menu_rows && e->v.config.rows == chord_rows && e->geometry_generation == geometry);
+    T(press(e, key('c', PLAT_MOD_ALT, NULL)) == 0);
+    T(findui_get_state(&e->find).options.match_case != match_case);
+    T(e->menu.open < 0 && !e->menu_rows && e->geometry_generation == geometry);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    T(e->menu.open < 0 && !e->menu_rows && !e->menu.active);
+    T(e->v.config.rows == chord_rows && e->geometry_generation == geometry); /* layout untouched */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->find_visible);
+    /* Hidden menu steals no ordinary key. */
+    T(press(e, key('f', 0, "f")) == 0); T(expect(e, "fmenu buffer", 1) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0); T(expect(e, initial, 0) == 0);
+    /* Escape and a typed key in one turn: the edit keeps the new geometry. */
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0); T(e->menu_rows == 1u);
+    plat_event escape = key(XKB_KEY_Escape, 0, NULL), typed = key('f', 0, "f");
+    T(editor_inject(e, &escape) == EDITOR_OK && editor_inject(e, &typed) == EDITOR_OK);
+    T(settle(e) == 0); T(!e->menu_rows && e->v.config.rows == text_rows);
+    T(expect(e, "fmenu buffer", 1) == 0);
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0); T(expect(e, initial, 0) == 0);
+    /* (f) Mouse: click a title opens it, click an item runs it, click
+     * elsewhere closes. Pixel centre = cell * cell size + half a cell. */
+    uint32_t cw = e->grid.dims.cell_w, ch = e->grid.dims.cell_h;
+    plat_event click = {.kind = PLAT_EV_BUTTON, .press = true, .code = 1};
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    click.x = (int32_t)(menu_title_column(0) * cw + cw + cw / 2u); click.y = (int32_t)(ch / 2u);
+    T(press(e, click) == 0); click.press = false; T(press(e, click) == 0); click.press = true;
+    T(e->menu.open == 0);
+    click.y = (int32_t)(item_row * ch + ch / 2u);
+    T(press(e, click) == 0); click.press = false; T(press(e, click) == 0); click.press = true;
+    T(!e->menu_rows && e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0); T(press(e, key('f', PLAT_MOD_ALT, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0);
+    click.x = (int32_t)((e->text_grid.dims.cols - 1u) * cw + cw / 2u);
+    click.y = (int32_t)((e->grid.dims.rows - 1u) * ch + ch / 2u);
+    T(press(e, click) == 0); click.press = false; T(press(e, click) == 0);
+    T(!e->menu_rows && e->menu.open < 0 && expect(e, initial, 0) == 0);
+    /* Focus loss closes a latched or open menu. */
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0); T(e->menu_rows);
+    plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
+    T(press(e, focus) == 0); T(!e->menu_rows);
+    editor_close(e);
+    /* (g) menu.visible = true keeps the bar; View > Toggle Menu hides it. */
+    char path[] = "/tmp/editor-menu-visible-XXXXXX";
+    T(trailing_config_file(path, "menu.visible = true\n") == 0);
+    cfg.preferences_path = path;
+    T(render_null_backend(&backend) == 0);
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(e->menu_rows == 1u && e->v.config.rows == text_rows - 1u && palette_grid_text(e, 0, 1, "File"));
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(e->menu_rows == 1u);
+    T(press(e, key('f', 0, "f")) == 0); T(expect(e, "fmenu buffer", 1) == 0); /* pinned bar steals nothing */
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    size_t toggle = menu_index(4, KEYS_ACTION_TOGGLE_MENU); T(toggle != SIZE_MAX);
+    T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0); T(press(e, key('v', PLAT_MOD_ALT, NULL)) == 0);
+    T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0); T(e->menu.open == 4);
+    for (size_t i = 0; i < toggle; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(!e->menu_rows && e->v.config.rows == text_rows);
+    editor_close(e); T(unlink(path) == 0);
+    puts("edit-yey menu bar: bare Alt release shows (held Alt inert), Alt+F, chords, shared Save As, Escape levels, Alt chords, mouse, menu.visible and malloc guard passed");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -5156,6 +5316,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
         if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
         if (!strcmp(argv[1], "--ywd-palette")) return palette_contract();
+        if (!strcmp(argv[1], "--yey-menu")) return menu_contract();
         if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
         if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
         if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
@@ -5258,6 +5419,7 @@ int main(int argc, char **argv)
     T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);
     T(palette_contract() == 0);
+    T(menu_contract() == 0);
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);

@@ -188,8 +188,22 @@ static int trailing_test(void)
     puts("config_test: trailing whitespace defaults, values and invalid fallback passed");
     return 0;
 }
+static int menu_test(void)
+{
+    /* edit-yey (P): absent key is the hidden default; a boolean pins it;
+     * a wrong TOML type is a transactional value error. */
+    config_settings settings; config_defaults(&settings); config_error error;
+    T(!settings.menu_visible);
+    const char on[] = "menu.visible = true\n", off[] = "[menu]\nvisible = false\n", bad[] = "menu.visible = 'yes'\n";
+    T(config_parse((const uint8_t *)on, sizeof on - 1u, &settings, &error) == CONFIG_OK && settings.menu_visible);
+    T(config_parse((const uint8_t *)off, sizeof off - 1u, &settings, &error) == CONFIG_OK && !settings.menu_visible);
+    T(config_parse((const uint8_t *)bad, sizeof bad - 1u, &settings, &error) == CONFIG_ERR_VALUE);
+    puts("config_test: menu.visible default, values and wrong type passed");
+    return 0;
+}
 int main(void)
 {
+    T(menu_test() == 0);
     T(trailing_test() == 0);
     T(parser_test() == 0);
     const char source[] = "theme = 'light'\nwrap = true\ntabs = 8\n"

@@ -181,5 +181,6 @@ int editor_preferences_apply(editor *e)
         }
     }
     rc = editor_full_layout(e); if (rc) return rc;
+    rc = editor_menu_configure(e, s->menu_visible); if (rc) return rc; /* edit-yey */
     return font_selection_poll(e);
 }

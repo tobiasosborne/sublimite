@@ -290,7 +290,13 @@ int editor_scroll_edit(editor *e, uint64_t off, uint64_t old, uint64_t add, uint
     }
     b->scroll = b->scroll_display; /* a mutation cancels unpublished navigation */
     b->scroll_resolver = (scroll_resolver){0}; b->scroll_following = false;
-    int rc = scroll_set_extent(&b->scroll, extent(b, piece_len(e->tree)));
+    /* edit-yey: the displayed state predates a geometry change made since
+     * the last frame (menu bar, find panel: Escape and a key in one turn);
+     * keep the current viewport rather than restore the displayed one. */
+    scroll_config now = config(e); int rc = 0;
+    if (b->scroll.config.rows != now.rows || b->scroll.config.row_height != now.row_height ||
+        b->scroll.config.margin != now.margin) rc = scroll_resize(&b->scroll, now);
+    if (!rc) rc = scroll_set_extent(&b->scroll, extent(b, piece_len(e->tree)));
     if (!rc) rc = editor_scroll_seek(e, anchor);
     return rc;
 }

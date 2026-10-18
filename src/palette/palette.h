@@ -22,6 +22,10 @@ typedef struct palette_state {
  * label/filter capacity or argument refusals return nonzero. */
 int palette_label(const char *name, char *out, size_t capacity);
 bool palette_match(const char *label, const char *query, size_t length, size_t *score);
+/* The default-argument command for an action (the palette row's binding):
+ * a default stroke with default arguments, else its keys_unbound form, else
+ * NULL. Immutable process-lifetime storage; no allocation. */
+const keys_binding *palette_command(keys_action);
 void palette_init(palette_state *);
 int palette_filter(palette_state *, const char *query, size_t length);
 #endif

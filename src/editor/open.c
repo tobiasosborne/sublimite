@@ -158,6 +158,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     e->palette = edit_arena_alloc(&e->arena, sizeof *e->palette, _Alignof(palette_state));
     if (!e->palette) { rc = EDITOR_ERR_MEMORY; goto fail; }
     palette_init(e->palette);
+    e->menu.open = -1; /* edit-yey: no drop-down */
     rc = editor_hl_init(e, cells); if (rc) goto fail;
     rc = editor_clip_init(e); if (rc) goto fail;
     e->buffers = edit_arena_alloc(&e->arena, e->buffer_capacity * sizeof *e->buffers, 8);

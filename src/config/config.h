@@ -11,7 +11,7 @@
 /* (P) longest supported action path plus its NUL. Generic keys use the same
  * explicit subset limit; adding a longer action extends this bound. */
 #define CONFIG_NAME_CAP sizeof("keymap.split_selection_lines")
-#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 9u) /* (P) named scalars above (8 incl. whitespace.trailing) + font.fallbacks */
+#define CONFIG_ENTRY_CAP ((size_t)KEYS_ACTION_COUNT + 10u) /* (P) named scalars above (8 incl. whitespace.trailing) + menu.visible + font.fallbacks */
 #define CONFIG_BINDING_CAP ((size_t)KEYS_ACTION_COUNT)
 /* (P) maximum serialized settings: each entry can contain a path bounded by
  * CONFIG_NAME_CAP and a value bounded by CONFIG_TEXT_CAP; escape expansion is
@@ -57,6 +57,7 @@ typedef struct config_settings {
     bool trailing_warning; /* invalid value accepted as none; runtime reports it */
     uint32_t tab_width; /* zero = per-buffer detected/default indentation */
     bool tab_spaces, tabs_set, wrap, wrap_set;
+    bool menu_visible; /* edit-yey: menu.visible, default false (hidden) */
     keys_binding bindings[CONFIG_BINDING_CAP];
     size_t binding_count;
 } config_settings;

@@ -133,13 +133,13 @@ static bool glyph(void *ctx, const uint8_t *text, size_t len, int width, uint32_
     /* Chrome requires a resident image, including an empty space image. */
     if (*slot == RENDER_NO_SLOT) *slot = 0; /* baked space: ' ' - ' ' */
     *identity = e->grid.glyphs[*slot].glyph_index;
-    editor_font_track(e, *slot, 0); /* chrome uses the tab-strip row */
+    editor_font_track(e, *slot, e->menu_rows); /* chrome uses the tab-strip row (below the menu bar) */
     return true;
 }
 static int compose_chrome(editor *e)
 {
     uint32_t full = e->grid.dims.cols; int rc;
-    if (e->tab_rows) {
+    if (e->tab_rows > e->menu_rows) { /* edit-yey: the strip sits below the menu bar */
         size_t active = tabs_active_index(&e->tabs);
         uint32_t slots = full / 16; if (!slots) slots = 1;
         size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
@@ -160,9 +160,10 @@ static int compose_chrome(editor *e)
         chrome_glyphs ctx = {e, &scratch};
         tabs_strip strip = e->strip; strip.glyph = glyph; strip.glyph_ctx = &ctx;
         rc = tabs_strip_render(&e->tabs, &scratch, &strip); if (rc) return rc;
-        if (memcmp(e->grid.cells, cells, (size_t)full * sizeof *cells)) {
-            memcpy(e->grid.cells, cells, (size_t)full * sizeof *cells);
-            return render_mark_rows(&e->grid, 0, 1);
+        render_cell *row = e->grid.cells + (size_t)e->menu_rows * full;
+        if (memcmp(row, cells, (size_t)full * sizeof *cells)) {
+            memcpy(row, cells, (size_t)full * sizeof *cells);
+            return render_mark_rows(&e->grid, e->menu_rows, 1);
         }
     }
     return 0;
@@ -172,7 +173,7 @@ static int compose_scroll(editor *e)
     e->grid.scroll = (render_scroll){0};
     /* The renderer's scroll region runs to the surface bottom (edit-3kk).
      * With the find panel below the text (edit-73j), draw unshifted rows. */
-    if (e->v.state.wrap || e->panel_rows) return 0;
+    if (e->v.state.wrap || e->panel_rows || e->menu.open >= 0) return 0; /* edit-yey: drop-down overlay */
     uint32_t full = e->grid.dims.cols, tc = e->text_grid.dims.cols;
     uint32_t visible_rows = e->v.config.rows;
     render_cell *extra = e->grid.cells + (size_t)e->grid.dims.rows * full;
@@ -242,7 +243,8 @@ static int compose(editor *e)
                 if (rc) return rc;
             }
         }
-        return compose_scroll(e);
+        int rc = compose_scroll(e); if (rc) return rc;
+        return editor_menu_paint(e); /* edit-yey: restores overlay cells a text row covered */
     }
     minimap_input input = editor_map_input(e->buffer);
     config_theme theme = e->preferences.theme;
@@ -310,6 +312,7 @@ static int compose(editor *e)
     rc = compose_scroll(e); if (rc) return rc;
     rc = compose_chrome(e); if (rc) return rc;
     rc = editor_find_paint(e); if (rc) return rc;
+    rc = editor_menu_paint(e); if (rc) return rc;
     if (e->unimplemented_frame == e->grid.frame_id) {
         const char status[] = "not implemented";
         uint32_t row = e->grid.dims.rows - 1u;
@@ -335,7 +338,7 @@ int editor_chrome_pointer(editor *e, const plat_event *ev)
     int64_t row = ev->y < 0 ? -1 : (int64_t)ev->y / e->grid.dims.cell_h;
     if (ev->kind == PLAT_EV_BUTTON && ev->code == 1) {
         if (!ev->press) { e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; return 0; }
-        if (e->tab_rows && row == 0 && col >= 0) {
+        if (e->tab_rows > e->menu_rows && row == e->menu_rows && col >= 0) {
             size_t hit = tabs_strip_hit(&e->tabs, &e->strip, (uint32_t)col);
             if (hit != SIZE_MAX) {
                 int rc = editor_select_tab(e, hit);
