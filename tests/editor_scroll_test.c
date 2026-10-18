@@ -420,12 +420,106 @@ static int wrapped_wheel(void)
 done:
     editor_close(reference); editor_close(e); return result;
 }
+/* edit-bt1: a scroll slice whose piece snapshot cannot be allocated (the
+ * buffer's piece allocator refuses; editor_piece_storage.fail_request, the
+ * existing per-buffer fault seam) is deferred, never fail(): editor_step
+ * returns OK/MORE, the displayed window stays, the motion lands on a later
+ * tick, and a refusal persisting past the retry shows a status notice.
+ * The buffer is a find results tab, as in edit-5vz's gdb trace: a derived
+ * buffer has no session publication (session.c publish), whose snapshot of
+ * each revision would otherwise be the cached one the slice reuses; the
+ * surface is narrower than the minimap threshold for the same reason
+ * (editor_map_service takes its snapshot before the slice runs). */
+static const char bt1_notice[] = "scrolling deferred: buffer memory exhausted";
+static int snapshot_refused(void)
+{
+    /* (P) One attempt: append a line below the view (a new revision, which
+     * the next slice must install a snapshot of) and wheel up past the
+     * viewport, so no prepared row can be adopted (scrollctl.c row_byte
+     * fast path).
+     * NOTCHES travel TRAVEL = NOTCHES * SCROLL_CORE_ROWS rows > PROBE_ROWS.
+     * The loop cap keeps every attempt's travel inside the fixture's lines
+     * (PROBE_BYTES of "a\n", two bytes per line). */
+    enum { NOTCHES = PROBE_ROWS / SCROLL_CORE_ROWS + 1u, TRAVEL = NOTCHES * SCROLL_CORE_ROWS,
+        LINES = PROBE_BYTES / 2u, ATTEMPTS = (LINES - PROBE_ROWS) / TRAVEL };
+    /* (E) edit-bt1 reuses edit-dr9's retry tick (JOURNAL_DEFAULT_SYNC_NS);
+     * TICKS of them cover the deferral, one persisting retry and recovery. */
+    enum { TICKS = 4 };
+    int result = 0; editor *e = NULL; render_backend backend = {0}; observer o = {0};
+    piece_snapshot *held[ATTEMPTS]; size_t holds = 0; /* (P) one per attempt */
+    uint8_t bytes[PROBE_BYTES];
+    for (size_t i = 0; i < sizeof bytes; i++) bytes[i] = i % 2u ? '\n' : (uint8_t)'a';
+    /* (P) open.c: a minimap needs at least 24 columns. */
+    editor_config cfg = {.cols = 16u, .rows = PROBE_ROWS, .wrap_mode = -1, .hook_ctx = &o, .on_submit = submitted};
+    CHECK(render_null_backend(&backend) == 0 && editor_open(&e, &cfg, &backend) == 0 && settle(e) == 0);
+    CHECK(!e->map_cols);
+    uint64_t id = 0;
+    CHECK(editor_results_open(e, &id) == 0 && e->buffer->derived);
+    CHECK(editor_results_append(e, bytes, sizeof bytes) == 0 && settle(e) == 0);
+    editor_piece_storage *s = &e->buffer->piece_storage;
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .dy = -(int32_t)(NOTCHES * SCROLL_WHEEL_UNIT)};
+    /* Snapshot headers are pooled two per slab (piece.c pool_grow) and a
+     * retired snapshot's slot is reused by the next install, so a slice
+     * normally takes its snapshot with no allocator request. The test
+     * retains each installed snapshot: free slots run out and an install
+     * must grow the pool, which is the armed (refused) request. */
+    bool hit = false; uint64_t top = 0;
+    for (unsigned attempt = 0; attempt < ATTEMPTS && !hit; attempt++) {
+        top = editor_view(e).first_byte;
+        CHECK(o.last.scroll.first_byte == top);
+        if (e->buffer->scroll_snapshot) held[holds++] = piece_snapshot_retain(e->buffer->scroll_snapshot);
+        CHECK(editor_results_append(e, bytes, 2u) == 0);
+        s->fail_request = s->requests + 1u;
+        CHECK(editor_inject(e, &wheel) == 0);
+        int rc = settle(e);
+        /* The armed request was the slice's snapshot: the old window was
+         * retired and no replacement could be installed. */
+        hit = s->requests >= s->fail_request && !e->buffer->scroll_snapshot;
+        s->fail_request = 0;
+        if (rc) fprintf(stderr, "edit-bt1: editor_step rc %d error_cause %d (attempt %u, hit %d)\n",
+            rc, editor_get_stats(e).error_cause, attempt, hit);
+        CHECK(rc == 0 && !e->error);
+    }
+    CHECK(hit);
+    /* Window intact: the displayed and last submitted top are unchanged; no
+     * notice for a single refusal. */
+    CHECK(editor_view(e).first_byte == top && o.last.scroll.first_byte == top);
+    CHECK(!e->recovery_notice);
+    /* Persisting: every request refused again; the retry tick fails too and
+     * the notice appears, with editor_step still OK/MORE. */
+    uint64_t deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (!e->recovery_notice && trace_now_ns() < deadline) {
+        s->fail_request = s->requests + 1u;
+        int rc = editor_step(e, 20);
+        CHECK(rc == EDITOR_OK || rc == EDITOR_MORE);
+    }
+    s->fail_request = 0;
+    CHECK(e->recovery_notice && !strcmp(e->recovery_notice, bt1_notice));
+    CHECK(editor_view(e).first_byte == top);
+    /* Recovered allocator: the deferred motion lands TRAVEL rows up
+     * (two fixture bytes per line) on a later tick. */
+    deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (editor_view(e).first_byte == top && trace_now_ns() < deadline) {
+        int rc = editor_step(e, 20);
+        CHECK(rc == EDITOR_OK || rc == EDITOR_MORE);
+    }
+    CHECK(settle(e) == 0);
+    fprintf(stderr, "edit-bt1: landed top %llu (from %llu)\n",
+        (unsigned long long)editor_view(e).first_byte, (unsigned long long)top);
+    CHECK(editor_view(e).first_byte == top - TRAVEL * 2u && o.last.scroll.first_byte == top - TRAVEL * 2u);
+    CHECK(e->buffer->scroll_snapshot && !e->error);
+    puts("editor_scroll_test: refused scroll snapshot defers the slice, keeps the window, notices persistence PASS");
+done:
+    while (holds) piece_snapshot_release(held[--holds]);
+    editor_close(e); return result;
+}
 int main(int argc, char **argv)
 {
     /* (P) argv's first entry is the executable; the next is the selector. */
     if (argc > 1 && !strcmp(argv[1], "--pending-jump-wheel"))
         return pending_jump_motion((plat_event){.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT});
     if (argc > 1 && !strcmp(argv[1], "--pending-jump-keys")) return pending_jump_keys();
+    if (argc > 1 && !strcmp(argv[1], "--bt1-snapshot")) return snapshot_refused();
     int result = 0;
     editor *e = NULL; render_backend backend = {0}; observer o = {0};
     /* Fixture: one ASCII character plus LF per line; enough rows for wheel
@@ -487,5 +581,6 @@ done:
     if (!result) result = pending_jump_motion((plat_event){.kind = PLAT_EV_WHEEL, .dy = SCROLL_WHEEL_UNIT});
     if (!result) result = pending_jump_keys();
     if (!result) result = wrapped_wheel();
+    if (!result) result = snapshot_refused();
     return result;
 }

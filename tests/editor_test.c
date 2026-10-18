@@ -5147,6 +5147,39 @@ static int n5vz_open_refused(void)
     return 0;
 }
 
+/* edit-bt1 (2): the edit-5vz repro of the pre-5vz editor_fif_start order.
+ * The results tab opens (activation sizes its scroll with the find in files
+ * panel's rows), the panel then closes in the same turn (text geometry
+ * grows), results text arrives, and the tab is left and re-selected. The
+ * next scroll slice returned -1 (SCROLL_ERR_ARG, gdb editor.c:712). */
+static int nbt1_results_geometry(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_f, N95_CS, NULL)) == 0); T(e->fif.mode && e->panel_rows == EDITOR_FIND_PANEL_ROWS);
+    uint64_t id = 0;
+    T(editor_results_open(e, &id) == 0); T(e->buffer->derived && e->buffer->read_only);
+    size_t results = tabs_active_index(&e->tabs); T(results != 0);
+    (void)findui_show(&e->find, false, false);
+    e->find_visible = false; e->fif.mode = e->fif.where_focus = e->fif.where_all = false;
+    T(editor_text_geometry(e) == 0); T(e->panel_rows == 0);
+    /* (P) More result lines (64) than the 20 text rows, so the view can
+     * scroll; each line is the 8 bytes of "   1: x\n". */
+    static const char row[] = "   1: x\n";
+    static char text[64u * (sizeof row - 1u)];
+    for (size_t line = 0; line < 64u; line++) memcpy(text + line * (sizeof row - 1u), row, sizeof row - 1u);
+    T(editor_results_append(e, (const uint8_t *)text, sizeof text) == 0);
+    T(n5vz_settle(e) == 0);
+    T(editor_select_tab(e, 0) == 0); T(n5vz_settle(e) == 0);
+    T(editor_select_tab(e, results) == 0); T(n5vz_settle(e) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0); T(n5vz_settle(e) == 0);
+    T(!e->error && editor_view(e).selection.cursor == sizeof text);
+    editor_close(e);
+    puts("edit-bt1: results open, panel close, re-select: the scroll slice keeps the settled geometry passed");
+    return 0;
+}
+
 /* edit-yey (P): menu bar contract. Geometry: the File drop-down's longest
  * label + gap + chord + two padding cells, plus the existing minimap; rows
  * are the bar, the tab strip and enough text rows to show File's items.
@@ -5325,6 +5358,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
         if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
         if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
+        if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
@@ -5423,6 +5457,7 @@ int main(int argc, char **argv)
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
+    T(nbt1_results_geometry() == 0);
     T(g02_find_previous_uncached() == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);

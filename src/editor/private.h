@@ -167,6 +167,10 @@ typedef struct editor_buffer {
     int64_t scroll_queued_pages;
     int32_t scroll_queued_wheel;
     int64_t scroll_queued_pixels; /* edit-o20 scroll_lines, Q8 pixels, saturated */
+    /* edit-bt1: a refused piece snapshot defers the slice until this tick
+     * (0: none due); consecutive refusals, a notice from the second on. */
+    uint64_t scroll_retry_ns;
+    uint32_t scroll_refusals;
     char path[IPC_PATH_CAP], save_path[IPC_PATH_CAP];
     ipc_token wait_token;
 } editor_buffer;

@@ -660,6 +660,9 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
      * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
     uint64_t deadline = e->checkpoint_retry_ns ? e->checkpoint_retry_ns : e->blinking ? e->next_blink : UINT64_MAX;
+    /* edit-bt1: wake for a deferred scroll slice's retry tick. */
+    if (e->buffer->scroll_retry_ns && e->buffer->scroll_pending && e->buffer->scroll_retry_ns < deadline)
+        deadline = e->buffer->scroll_retry_ns;
     if (e->journal && !editor_save_leased(e)) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;

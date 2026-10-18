@@ -42,6 +42,27 @@ void editor_scroll_close(editor_buffer *b)
     /* Quiescent shutdown only; maintenance never blocks physical retirement. */
     while (editor_scroll_retire(b) == EDITOR_MORE) sched_yield();
 }
+/* edit-bt1: a refused snapshot allocation is no editor failure. The
+ * displayed window stays; the slice retries on the next tick, reusing
+ * edit-dr9's retry interval (E: JOURNAL_DEFAULT_SYNC_NS, the existing
+ * durability tick). Until then the buffer does not count as waiting, so
+ * frames (typing) still compose against the displayed window and the step
+ * loop blocks instead of spinning. A refusal that persists past one retry
+ * is shown on the status row (the edit-btj notice). */
+static const char refused_notice[] = "scrolling deferred: buffer memory exhausted";
+static bool deferred(const editor_buffer *b)
+{ return b->scroll_retry_ns && trace_now_ns() < b->scroll_retry_ns; }
+static int defer(editor *e, editor_buffer *b)
+{
+    b->scroll_pending = true;
+    b->scroll_retry_ns = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS;
+    if (b->scroll_refusals < UINT32_MAX) b->scroll_refusals++;
+    if (b->scroll_refusals > 1u && e->recovery_notice != refused_notice) {
+        e->recovery_notice = refused_notice; e->recovery_notice_mutations = e->stats.mutations;
+        (void)editor_begin_frame(e);
+    }
+    return 0;
+}
 static int install(editor_buffer *b)
 {
     piece_tree *tree = b->pending_open ? b->preview : b->tree;
@@ -138,7 +159,7 @@ static int apply_queued(editor_buffer *b)
 }
 static bool queued(const editor_buffer *b) { return b->scroll_queued_pages || b->scroll_queued_wheel || b->scroll_queued_pixels; }
 bool editor_scroll_waiting(const editor *e)
-{ return !e->v.state.wrap && e->buffer->scroll_pending && !e->buffer->source_stale && !e->buffer->pending_open; }
+{ return !e->v.state.wrap && e->buffer->scroll_pending && !e->buffer->source_stale && !e->buffer->pending_open && !deferred(e->buffer); }
 int editor_scroll_resize(editor *e)
 {
     if (e->v.state.wrap) return 0;
@@ -354,11 +375,15 @@ int editor_scroll_slice(editor *e)
             goto adopted;
         }
     }
-    if (b->scroll_revision != b->revision || b->scroll_resident.closing) {
+    if (!b->scroll_snapshot || b->scroll_revision != b->revision || b->scroll_resident.closing) {
+        if (deferred(b)) return 0; /* edit-bt1: keep the displayed window */
         int rc = editor_scroll_retire(b);
         if (rc == EDITOR_MORE) { b->scroll_pending = true; return 0; }
         if (rc) return rc;
-        rc = install(b); if (rc) return rc;
+        rc = install(b);
+        if (rc == EDITOR_ERR_MEMORY) return defer(e, b);
+        if (rc) return rc;
+        b->scroll_retry_ns = 0; b->scroll_refusals = 0;
     }
     scroll_extent current = extent(b, b->scroll_resident.snapshot.len);
     if (current.bytes != b->scroll.extent.bytes || current.lines != b->scroll.extent.lines ||
