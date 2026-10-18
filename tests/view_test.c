@@ -801,6 +801,68 @@ static void relative_restore(void)
     destroy(&exact); destroy(&rel); free(p);
     puts("edit-dz0: relative restore matches restore without counting the prefix");
 }
+/* edit-wv7: wrapped document End/Home through view_relative_command against
+ * view_command on twin trees. Fixture (P): a prefix of 8-byte rows
+ * 32 x VIEW_SCAN_BOUND long (twice LAYOUT_BYTE_BUDGET, so EOF is outside
+ * layout's resident budget and the anchored row query runs), then a tail
+ * whose last line wraps over 10-column rows. The relative placement proves
+ * the last line's start by walking back to LF and counts no line query. */
+typedef struct wrap_twin { render_grid grid; render_cell cells[30]; uint64_t dirty, rows[3]; uint32_t used[3]; layout l; } wrap_twin;
+static void wrap_twin_init(wrap_twin *w, fixture *f)
+{
+    CHECK(render_grid_init(&w->grid,(render_dims){10,3,1,1},w->cells,30,&w->dirty,1)==RENDER_OK);
+    CHECK(render_frame_begin(&w->grid,1)==RENDER_OK); layout_config cfg={0}; cfg.slice_clusters=256;
+    CHECK(layout_init(&w->l,&w->grid,&cfg,w->rows,w->used)==LAYOUT_DONE);
+    CHECK(layout_wrap_init(&w->l,&f->arena)==LAYOUT_DONE && layout_set_wrap(&w->l,true)==LAYOUT_DONE);
+    CHECK(layout_begin(&w->l,f->tree,(layout_viewport){0})==LAYOUT_DONE);
+    int rc; do { rc=layout_run(&w->l); } while(rc==LAYOUT_MORE); CHECK(rc==LAYOUT_DONE);
+    CHECK(view_set_wrap(&f->v,true,&w->l)==VIEW_OK);
+}
+static int finish_command(fixture *f, int rc)
+{
+    view_change c={0}; unsigned calls=0;
+    CHECK(f->v.scanned<=VIEW_SCAN_BOUND);
+    while(rc==VIEW_MORE) { CHECK(++calls<100000); rc=view_continue(&f->v,&c); CHECK(!c.changed && f->v.scanned<=VIEW_SCAN_BOUND); }
+    return rc;
+}
+static void wrapped_relative(void)
+{
+    const char tail[]="tail one\nmid two\nlast line wraps here";
+    size_t prefix=32u*VIEW_SCAN_BOUND, n=prefix+sizeof tail-1u;
+    uint64_t last=prefix+9u+8u;          /* start of "last ..." (P: tail spelling) */
+    uint8_t *p=malloc(n); CHECK(p);
+    for(size_t i=0;i<prefix;++i) p[i]=i%8u==7u?'\n':(uint8_t)('a'+i%8u);
+    memcpy(p+prefix,tail,sizeof tail-1u);
+    fixture exact, rel; init(&exact,p,n,3,10); init(&rel,p,n,3,10);
+    wrap_twin *we=calloc(1,sizeof *we), *wr=calloc(1,sizeof *wr); CHECK(we && wr);
+    wrap_twin_init(we,&exact); wrap_twin_init(wr,&rel);
+    view_change c={0};
+    CHECK(finish_command(&exact,view_command(&exact.v,VIEW_DOC_END,false,NULL,0,&c))==VIEW_OK && !c.changed);
+    uint64_t line_before=rel.v.line_scanned, seek_before=rel.v.seek_scanned;
+    edit_malloc_guard_begin();
+    int rc=finish_command(&rel,view_relative_command(&rel.v,VIEW_DOC_END,false,&c));
+    CHECK(edit_malloc_guard_end()==0);
+    CHECK(rc==VIEW_OK && !c.changed && !view_busy(&rel.v));
+    CHECK(rel.v.line_scanned==line_before);                  /* no line query */
+    CHECK(rel.v.seek_scanned-seek_before<=VIEW_SCAN_BOUND);   /* one LF walk over the last line */
+    CHECK(exact.v.line_scanned>=prefix);                      /* the exact path counts the prefix */
+    CHECK(rel.v.state.selection.cursor==n && exact.v.state.selection.cursor==n);
+    CHECK(rel.v.state.first_byte==last && exact.v.state.first_byte==last);
+    CHECK(rel.v.state.visual_byte==exact.v.state.visual_byte && rel.v.state.visual_byte>last);
+    CHECK(rel.v.relative && rel.v.relative_top && rel.v.state.approximate);
+    CHECK(rel.v.state.first_line==0);                         /* the previous label, relabelled by the host */
+    CHECK(exact.v.state.first_line==prefix/8u+2u && !exact.v.relative_top);
+    /* Document Home: byte 0 is its own certified ordinal. */
+    rc=finish_command(&rel,view_relative_command(&rel.v,VIEW_DOC_HOME,false,&c));
+    CHECK(rc==VIEW_OK && rel.v.line_scanned==line_before);
+    CHECK(rel.v.state.selection.cursor==0 && rel.v.state.first_byte==0 && rel.v.state.first_line==0);
+    CHECK(rel.v.state.visual_byte==0 && !rel.v.relative_top);
+    /* Unwrapped views still refuse document keys on the relative path. */
+    fixture plain; init(&plain,p,n,3,10); c=(view_change){1,2,3,true};
+    CHECK(view_relative_command(&plain.v,VIEW_DOC_END,false,&c)==VIEW_ERR_ARG && !c.changed);
+    destroy(&plain); destroy(&exact); destroy(&rel); free(we); free(wr); free(p);
+    puts("edit-wv7: wrapped relative document End/Home match view_command without a line query");
+}
 int main(int argc, char **argv)
 {
     if(argc==2 && strcmp(argv[1],"wrap-port")==0) { wrap_port(); return 0; }
@@ -814,6 +876,7 @@ int main(int argc, char **argv)
     for(size_t i=0;i<sizeof reviews/sizeof reviews[0];++i)
         if(argc==1 || strcmp(argv[1],reviews[i].name)==0) reviews[i].run();
     if(argc==2 && strcmp(argv[1],"dz0")==0) { relative_restore(); return 0; }
-    if(argc==1) { relative_restore(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
+    if(argc==2 && strcmp(argv[1],"wv7")==0) { wrapped_relative(); return 0; }
+    if(argc==1) { relative_restore(); wrapped_relative(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
     puts("view_test: all passed"); return 0;
 }

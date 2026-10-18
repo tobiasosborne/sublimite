@@ -1622,10 +1622,9 @@ static int typing_while_indexing(uint64_t size, bool reindex)
  * VIEW_SCAN_BOUND bytes (P: one view call's charged scan work), never the
  * file prefix (about the file size before the fix). The settle is a tracked
  * print (law 1); EDITOR_IDLE_NS is only the existing settle watchdog (E).
- * wrap: the same key with wrapping on (a .txt log's default). It keeps the
- * exact repair: one call counts from byte 0 (3840 B (M) = one call's
- * line_query budget, docs/decisions/edit-dz0.md), then editor_seed_view_lines installs
- * the laid-out top and the query restarts there; within the same bound. */
+ * wrap: the same key with wrapping on (a .txt log's default). Since edit-wv7
+ * it repairs byte-relatively too (0 B (M)); before, Ctrl+End's wrapped
+ * placement counted LFs from byte 0 (docs/decisions/edit-wv7.md). */
 typedef struct dz0_result { uint64_t line_bytes, settle_ns, size; mmp_tally t; } dz0_result;
 static int dz0_keys(editor *e, lane_hold *lane, dz0_result *r)
 {
@@ -1809,12 +1808,148 @@ static int ptn_case(int kind)
     T(removed == 0); T(rc == 0); T(worst <= VIEW_SCAN_BOUND);
     return 0;
 }
+/* edit-wv7: wrapped Ctrl+End on an unindexed lazy 1 GiB file, then one key.
+ * Fixture and hold as dz0_body (mmp_fixture's sparse GiB layout, tail
+ * warmed, bulk lane held from open, private XDG_DATA_HOME, root removed on
+ * every exit path), wrap on (.wrap_mode = 1, a .txt log's default).
+ * Probe per key: view.line_scanned + seek_scanned. Asserted bound
+ * VIEW_SCAN_BOUND (P: the rows near EOF are 64 B (mmp_fixture), so the
+ * byte-relative walks read one 256 B quantum each; before the fix the EOF
+ * placement counted LFs from byte 0, about 2^30 B). Settles: tracked prints
+ * (law 1); EDITOR_IDLE_NS is the existing settle watchdog (E). After the
+ * key the lane is released and the index publishes: the key's byte is at
+ * EOF, the cursor follows it, and every laid-out wrap row carries its exact
+ * logical line (no stale estimated rows). */
+static bool wv7_index_done(editor *e) { return editor_large_status_get(e).lines_exact && lineidx_complete(e->buffer->index); }
+static int wv7_key(editor *e, mmp_tally *t, const char *name, uint32_t sym, uint16_t mods, char text, uint64_t *worst)
+{
+    bool bad = false; uint64_t before_line = e->v.line_scanned, before_seek = e->v.seek_scanned;
+    t->max_key_ns = 0;
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = sym ? sym : (uint8_t)text, .mods = mods,
+        .utf8_len = (uint8_t)(sym ? 0u : 1u), .t0_ns = trace_now_ns()};
+    if (!sym) key.utf8[0] = (uint8_t)text;
+    T(editor_inject(e, &key) == 0);
+    t->keys = true; int rc = mmp_settle(e, t, &bad); t->keys = false;
+    uint64_t line = e->v.line_scanned - before_line, seek = e->v.seek_scanned - before_seek;
+    if (line + seek > *worst) *worst = line + seek;
+    char power[32]; double load1; ptn_stamp(power, sizeof power, &load1);
+    printf("editor_large_test: edit-wv7 wrap=1 key=%s line_scanned=%llu seek_scanned=%llu bound=%u (P: VIEW_SCAN_BOUND) key_settle=%.3f ms (M) rc=%d overdue=%u power=\"%s\" load1=%.2f\n",
+        name, (unsigned long long)line, (unsigned long long)seek, VIEW_SCAN_BOUND, (double)t->max_key_ns / 1e6, rc, t->overdue, power, load1);
+    T(fflush(stdout) == 0);
+    T(rc == 0); T(!bad); T(!editor_index_complete(e));
+    return 0;
+}
+static int wv7_body(const char *root, uint64_t *worst)
+{
+    char path[256], xdg[256];
+    T(snprintf(path, sizeof path, "%s/source", root) > 0); T(snprintf(xdg, sizeof xdg, "%s/xdg", root) > 0);
+    uint64_t size = MMP_GIB;
+    T(mmp_fixture(path, size) == 0);
+    {
+        static uint8_t warm[64u * 1024u]; /* as dz0_body: last two 1 MiB lines */
+        int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+        bool ok = true;
+        for (uint64_t at = size - 2u * FILE_PREFIX_MAX; ok && at < size; at += sizeof warm)
+            ok = pread(fd, warm, sizeof warm, (off_t)at) == (ssize_t)sizeof warm;
+        T(close(fd) == 0); T(ok);
+    }
+    T(mkdir(xdg, 0700) == 0); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = path, .cols = 32, .rows = 3, .wrap_mode = 1};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK});
+    int rc = held.epoch ? 0 : 1;
+    mmp_tally t = {0}; bool bad = false;
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!rc && !atomic_load(&lane.running)) { if (editor_step(e, 0) < 0 || trace_now_ns() >= deadline) rc = 1; }
+    if (!rc) rc = mmp_settle(e, &t, &bad);
+    if (!rc && (editor_index_complete(e) || e->buffer->lg.lines_exact || !e->v.state.wrap)) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "ctrl+end", XKB_KEY_End, PLAT_MOD_CTRL, 0, worst);
+    if (!rc && editor_view(e).selection.cursor != size) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "x-at-eof", 0, 0, 'x', worst);
+    uint8_t got = 0;
+    if (!rc && (editor_length(e) != size + 1u || editor_read(e, size, &got, 1) || got != 'x' ||
+                editor_view(e).selection.cursor != size + 1u)) rc = 1;
+    /* The same wrapped placement for a page and document Home, then back to
+     * EOF: (P) a page up from EOF over 64 B rows stays inside the tail. */
+    if (!rc) rc = wv7_key(e, &t, "page-up", XKB_KEY_Page_Up, 0, 0, worst);
+    if (!rc && editor_view(e).selection.cursor >= size) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "ctrl+home", XKB_KEY_Home, PLAT_MOD_CTRL, 0, worst);
+    if (!rc && (editor_view(e).selection.cursor != 0 || editor_view(e).first_byte != 0 ||
+                editor_view(e).first_line != 0)) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "ctrl+end-again", XKB_KEY_End, PLAT_MOD_CTRL, 0, worst);
+    if (!rc && editor_view(e).selection.cursor != size + 1u) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "ctrl+a", 'a', PLAT_MOD_CTRL, 0, worst);
+    if (!rc && (editor_view(e).selection.cursor != size + 1u || editor_view(e).selection.anchor != 0)) rc = 1;
+    if (!rc) rc = wv7_key(e, &t, "ctrl+end-collapse", XKB_KEY_End, PLAT_MOD_CTRL, 0, worst);
+    if (!rc && (editor_view(e).selection.cursor != size + 1u || editor_view(e).selection.anchor != size + 1u)) rc = 1;
+    atomic_store(&lane.release, true);
+    while (held.epoch && !work_handle_finished(&e->pool, held)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    if (!rc) {
+        /* (E) the existing settle watchdog bounds the index build too. */
+        uint64_t start = trace_now_ns(); deadline = start + EDITOR_IDLE_NS;
+        while (!rc && !wv7_index_done(e)) {
+            int s = editor_step(e, 5); if (s != EDITOR_OK && s != EDITOR_MORE) rc = 1;
+            if (trace_now_ns() >= deadline) { t.overdue++; rc = 1; }
+        }
+        if (!rc) rc = mmp_settle(e, &t, &bad);
+        char power[32]; double load1; ptn_stamp(power, sizeof power, &load1);
+        printf("editor_large_test: edit-wv7 index published after %.3f ms (M) rc=%d power=\"%s\" load1=%.2f\n",
+            (double)(trace_now_ns() - start) / 1e6, rc, power, load1);
+    }
+    if (!rc) {
+        view_state s = editor_view(e);
+        lineidx_src cur = editor_source(e->buffer);
+        if (s.selection.cursor != size + 1u || editor_length(e) != size + 1u) rc = 1;
+        if (!rc && (editor_read(e, size, &got, 1) || got != 'x')) rc = 1;
+        if (!rc && (s.approximate || editor_large_status_get(e).top_estimated)) rc = 1;
+        lineidx_result top = lineidx_byte_to_line(e->buffer->index, &cur, s.first_byte);
+        if (!rc && (!top.exact || top.value != s.first_line)) rc = 1;
+        bool cursor_row = false;
+        for (uint32_t i = 0; !rc && i < e->lay.grid->dims.rows; i++) {
+            const layout_wrap_row *r = &e->lay.wrap_rows[i];
+            if (r->start == LAYOUT_VOID_ROW) continue;
+            lineidx_result l = lineidx_byte_to_line(e->buffer->index, &cur, r->line_start);
+            uint8_t prev = '\n';
+            if (r->line_start && editor_read(e, r->line_start - 1u, &prev, 1)) rc = 1;
+            if (!l.exact || l.value != r->line || prev != '\n' || r->approximate) {
+                fprintf(stderr, "editor_large_test: edit-wv7 stale row %u start=%llu line_start=%llu line=%llu exact_line=%llu approximate=%d\n",
+                    i, (unsigned long long)r->start, (unsigned long long)r->line_start, (unsigned long long)r->line,
+                    (unsigned long long)l.value, r->approximate);
+                rc = 1;
+            }
+            if (size + 1u >= r->start && size + 1u <= r->end) cursor_row = true;
+        }
+        if (!rc && !cursor_row) rc = 1;
+        if (rc) fprintf(stderr, "editor_large_test: edit-wv7 after index cursor=%llu first_byte=%llu first_line=%llu exact=%llu approximate=%d\n",
+            (unsigned long long)s.selection.cursor, (unsigned long long)s.first_byte, (unsigned long long)s.first_line,
+            (unsigned long long)top.value, s.approximate);
+    }
+    editor_close(e);
+    return rc;
+}
+static int wv7_case(void)
+{
+    char root[] = "build/editor-large-wv7-XXXXXX"; T(mkdtemp(root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[256] = "";
+    if (saved) (void)snprintf(keep, sizeof keep, "%s", saved);
+    uint64_t worst = 0;
+    int rc = wv7_body(root, &worst);
+    if (saved) (void)setenv("XDG_DATA_HOME", keep, 1); else (void)unsetenv("XDG_DATA_HOME");
+    int removed = mmp_remove_tree(root);
+    printf("editor_large_test: edit-wv7 rc=%d worst_probe_bytes=%llu bound=%u\n", rc, (unsigned long long)worst, VIEW_SCAN_BOUND);
+    T(fflush(stdout) == 0);
+    T(removed == 0); T(rc == 0); T(worst <= VIEW_SCAN_BOUND);
+    return 0;
+}
 int main(void)
 {
     if (getenv("EDIT_MMP_REPRO")) { trace_init(); (void)trace_thread_register(); return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL); }
     trace_init(); (void)trace_thread_register();
     if (getenv("EDIT_PTN_REPRO")) return ptn_case(atoi(getenv("EDIT_PTN_REPRO")));
     if (getenv("EDIT_DZ0_REPRO")) return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
+    if (getenv("EDIT_WV7_REPRO")) return wv7_case();
     if (getenv("EDIT_JF9_VIEW")) return relative_motion();
     T(relative_motion() == 0);
     /* edit-xzw: isolate the existing null-backend fixture from IPC/display
@@ -1868,6 +2003,7 @@ int main(void)
     T(ptn_case(PTN_CJK) == 0);
     T(ptn_case(PTN_LONG_TOP) == 0);
     T(ptn_case(PTN_KEYS) == 0);
+    T(wv7_case() == 0);
 xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);

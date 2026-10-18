@@ -70,7 +70,7 @@ enum { P_MOVE=1, P_VERTICAL_COL, P_VERTICAL_DEST, P_APPLY,
        P_FOLLOW, P_REPAIR, P_VERTICAL_BOUNDARY, P_NORMAL_CURSOR, P_NORMAL_ANCHOR, P_SETUP, P_FINISH, P_NORMAL_SETUP,
        P_VISUAL_COL, P_VISUAL_SETUP, P_BULK, P_BULK_PREPARE, P_BULK_COLUMN,
        P_REL_START, P_REL_LEFT_START, P_REL_COL, P_REL_ROWS, P_REL_DEST, P_REL_FOLLOW,
-       P_SEEK, P_REL_META };
+       P_SEEK, P_REL_META, P_REL_WRAP };
 enum { C_WORD=0, C_SEPARATOR=1, C_SPACE=2, C_NEWLINE=3 };
 
 static uint64_t min_u64(uint64_t a, uint64_t b) { return a<b?a:b; }
@@ -524,8 +524,62 @@ static int follow_line(view *v)
     uint64_t byte; rc=line_start(v,first,&byte); if(rc!=VIEW_OK) return rc;
     v->state.first_line=first; v->state.first_byte=byte; v->line=line; return VIEW_OK;
 }
+/* edit-wv7: wrapped placement with an inexact external line count. The
+ * exact path (finish_move below) labels the new top with line_at/line_start,
+ * a line query from the nearest certified anchor: byte 0 on an unindexed
+ * lazy file, so Ctrl+End counted the whole file. Here `start` is the
+ * cursor's line start, proven by walking back to LF (P_REL_WRAP). The row
+ * query stays local: resident rows/seed when the cursor lies within layout's
+ * own budget of its certified top (no piece line query, as resident_seed),
+ * else anchored at `start` (layout_visual_row_anchored: no whole-source piece
+ * line query). The top's line start is the chosen row's certified
+ * line_start; its ordinal is unknown unless it is byte 0. The previous
+ * first_line stays as a label, approximate is set and relative_top tells the
+ * host to relabel (jf9: no estimate enters the view's exact caches). */
+static int relative_wrap_place(view *v, uint64_t start)
+{
+    const layout *l=v->wrap_layout;
+    uint64_t cursor=v->state.selection.cursor, total=piece_len(v->tree);
+    uint64_t visual=v->state.visual_byte;
+    v->state.hscroll=0;
+    layout_wrap_row r; bool approx=false;
+    bool resident=l->src==v->tree && l->total==total && l->first_line_valid &&
+        cursor>=l->first_byte && cursor-l->first_byte<=LAYOUT_BYTE_BUDGET;
+    uint64_t label=v->state.first_line==LAYOUT_LINE_UNKNOWN?0:v->state.first_line;
+    int query=!resident?layout_visual_row_anchored(l,v->tree,cursor,start,label,&r,&approx):
+        v->edited?layout_visual_row_fresh(l,v->tree,cursor,&r,&approx):
+        layout_visual_row(l,v->tree,cursor,0,&r,&approx);
+    if(query==LAYOUT_DONE) {
+        uint64_t top_start=v->state.first_byte;
+        if(cursor<v->state.visual_byte) { v->state.visual_byte=r.start; top_start=r.line_start; }
+        uint32_t n=l->grid->dims.rows;
+        uint64_t bottom=l->wrap_rows[n-1].next;
+        if(bottom!=LAYOUT_VOID_ROW && cursor>=bottom && !(cursor==bottom && v->state.visual_end)) {
+            layout_wrap_row top; bool top_approx=false;
+            if(!v->edited && r.start==bottom &&
+               layout_visual_row(l,v->tree,v->state.visual_byte,1,&top,&top_approx)==LAYOUT_DONE) {
+                v->state.visual_byte=top.start; top_start=top.line_start; approx|=top_approx;
+            } else { v->state.visual_byte=r.start; top_start=r.line_start; }
+        }
+        v->state.approximate|=approx;
+        if(v->state.visual_byte==visual || top_start==v->state.first_byte) {
+            /* Same logical top: keep its label and its estimate marker. */
+            v->state.approximate|=v->before_state.approximate;
+        } else if(top_start==0) {
+            v->state.first_byte=0; v->state.first_line=0;
+        } else {
+            v->state.first_byte=top_start; v->state.approximate=true; v->relative_top=true;
+        }
+    }
+    v->busy=false; return VIEW_OK;
+}
 static int finish_move(view *v)
 {
+    if(v->state.wrap && v->wrap_layout && v->relative) {
+        /* edit-wv7: prove the cursor's line start first (P_REL_WRAP). */
+        v->relative_pos=v->state.selection.cursor; v->phase=P_REL_WRAP;
+        return VIEW_OK;
+    }
     if(v->state.wrap && v->wrap_layout) {
         v->state.hscroll=0;
         uint64_t cursor=v->state.selection.cursor;
@@ -829,6 +883,13 @@ static int advance(view *v, view_change *change)
             int rc=relative_meta(v); if(rc) return rc;
             continue;
         }
+        if(v->phase==P_REL_WRAP) {
+            uint64_t start;
+            int rc=relative_start(v,&start); if(rc) return rc;
+            rc=relative_wrap_place(v,start); if(rc) return rc;
+            if(!v->busy) return VIEW_OK;
+            continue;
+        }
         if(v->phase==P_REL_ROWS) {
             int rc=relative_rows(v); if(rc) return rc;
             continue;
@@ -949,7 +1010,7 @@ static int complete_call(view *v, int rc)
 static int normalize(view *v, view_state saved, bool cursor_before, bool anchor_before, bool relative,
                      view_change *change)
 {
-    slice_begin(v); v->relative=relative; v->before_state=v->state; v->restore_state=saved;
+    slice_begin(v); v->relative=relative; v->relative_top=false; v->before_state=v->state; v->restore_state=saved;
     uint64_t total=piece_len(v->tree);
     v->relative_pos=min_u64(saved.first_byte,total);
     v->restore_state.selection.cursor=min_u64(saved.selection.cursor,total);
@@ -973,7 +1034,10 @@ int view_restore(view *v, const view_state *state, view_change *change)
 int view_relative_restore(view *v, const view_state *state, view_change *change)
 {
     if(change) *change=(view_change){0};
-    if(!v || !v->tree || !state || !change || state->wrap || v->state.wrap) return VIEW_ERR_ARG;
+    /* edit-wv7: wrapped state is accepted when it matches the view's bound
+     * wrap layout; its placement is relative_wrap_place. */
+    if(!v || !v->tree || !state || !change || state->wrap!=v->state.wrap ||
+       (state->wrap && !v->wrap_layout)) return VIEW_ERR_ARG;
     if(v->busy) return VIEW_ERR_BUSY;
     return normalize(v,*state,false,false,true,change);
 }
@@ -1026,7 +1090,7 @@ int view_set_undo(view *v, undo_log *log)
 void view_cancel(view *v)
 {
     if(v->busy) { if(v->edited) fallback(v); else v->state=v->before_state; }
-    v->busy=false; v->relative=false;
+    v->busy=false; v->relative=false; v->relative_top=false;
     for(unsigned i=0;i<16;++i) v->seeds[i].valid=false;
     queries_invalidate(v,0);
     (void)mutation_end(v,VIEW_OK);
@@ -1045,19 +1109,36 @@ int view_relative_command(view *v, view_key key, bool shift, view_change *change
     if(change) *change=(view_change){0};
     bool meta=key==VIEW_HOME || key==VIEW_END || key==VIEW_WORD_LEFT || key==VIEW_WORD_RIGHT ||
         key==VIEW_SELECT_WORD || key==VIEW_SELECT_LINE;
-    if(!v || !v->tree || !change || v->state.wrap ||
-       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT || meta)) return VIEW_ERR_ARG;
+    /* edit-wv7: wrapped buffers also accept document Home/End and Select
+     * All. Visual rows come from layout as in view_command; only the
+     * placement is relative. */
+    bool wrapped=v && v->state.wrap;
+    if(!v || !v->tree || !change || (wrapped && !v->wrap_layout) ||
+       !(vertical(key) || key==VIEW_LEFT || key==VIEW_RIGHT || meta ||
+         (wrapped && (key==VIEW_DOC_HOME || key==VIEW_DOC_END || key==VIEW_SELECT_ALL)))) return VIEW_ERR_ARG;
     if(v->busy) return VIEW_ERR_BUSY;
     uint64_t cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
     if(cursor>piece_len(v->tree) || anchor>piece_len(v->tree)) return VIEW_ERR_ARG;
     if(cursor==anchor && (((key==VIEW_LEFT || key==VIEW_WORD_LEFT) && cursor==0) ||
        ((key==VIEW_RIGHT || key==VIEW_WORD_RIGHT) && cursor==piece_len(v->tree)))) {
-        v->scanned=0; v->relative=true; return VIEW_OK;
+        v->scanned=0; v->relative=true; v->relative_top=false; return VIEW_OK;
     }
     slice_begin(v); v->before_state=v->state;
     v->busy=true; v->shift=shift; v->key=key; v->origin=cursor; v->edited=false;
     v->lo=min_u64(cursor,anchor); v->hi=max_u64(cursor,anchor);
-    v->relative=true; v->relative_pos=cursor; v->query_kind=0;
+    v->relative=true; v->relative_top=false; v->relative_pos=cursor; v->query_kind=0;
+    if(wrapped) {
+        /* view_command's wrapped command path; layout owns visual rows.
+         * Word and select keys first prove their line metadata (P_REL_META);
+         * wrapped Home/End use the visual row instead. */
+        v->state.approximate=false;
+        if(!(vertical(key) || key==VIEW_HOME || key==VIEW_END)) v->state.visual_end=false;
+        v->phase=P_SETUP;
+        if(meta && key!=VIEW_HOME && key!=VIEW_END) {
+            v->meta_stage=0; v->relative_pos=key==VIEW_SELECT_LINE?v->lo:cursor; v->phase=P_REL_META;
+        }
+        return complete_call(v,advance(v,change));
+    }
     /* (P) page displacement is exactly the configured visible row count;
      * an arrow advances its adjacent row. No estimated total limits motion. */
     v->relative_rows=(key==VIEW_PAGE_UP || key==VIEW_PAGE_DOWN)?v->config.rows:1u;
@@ -1077,7 +1158,7 @@ int view_command(view *v, view_key key, bool shift, const uint8_t *text, size_t 
     if(v->busy) return VIEW_ERR_BUSY;
     uint64_t total=piece_len(v->tree), cursor=v->state.selection.cursor, anchor=v->state.selection.anchor;
     if(cursor>total || anchor>total) return VIEW_ERR_ARG;
-    v->scanned=0; v->relative=false;
+    v->scanned=0; v->relative=false; v->relative_top=false;
     /* Older editor callers use empty TYPE to repair a target they installed
      * after an external mutation. An unchanged completed state is a true no-op.
      * Explicit notify/restore remains required for arbitrary external edits. */

@@ -100,6 +100,10 @@ typedef struct view {
     bool bulk_insert;
     /* Byte-relative motion owns no logical ordinal; exact caches stay exact. */
     bool relative, relative_boundary;
+    /* edit-wv7 output: a completed wrapped relative placement moved the top
+     * to a new certified line start whose ordinal is unknown; first_line is
+     * the previous label (approximate set). The host relabels it. */
+    bool relative_top;
     uint64_t relative_pos, relative_start, relative_rows;
     /* edit-ptn: resumable seeded scans and byte-relative line metadata. */
     unsigned seek_mode, seek_next, meta_stage;
@@ -131,7 +135,12 @@ void view_init(view *v, piece_tree *tree, const view_config *config);
 int view_command(view *v, view_key key, bool shift, const uint8_t *text,
                  size_t len, view_change *change);
 /* Unwrapped arrows/pages, and (edit-ptn) Home/End/word left-right/select
- * word/select line, with an inexact external line count. Walk certified
+ * word/select line, with an inexact external line count. (edit-wv7) A
+ * wrapped view (bound wrap layout) also accepts document Home/End and
+ * Select All: visual
+ * rows come from layout as in view_command, and the placement proves the
+ * cursor's line start by walking back to LF instead of a line query; see
+ * relative_top. Walk certified
  * LF boundaries locally, preserving exact grapheme columns and selection.
  * Leaves viewport ordinals/bytes to the host's resident scroll resolver.
  * Same scan/deadline/continuation contract; never writes exact line caches.
@@ -142,7 +151,8 @@ int view_relative_command(view *v, view_key key, bool shift, view_change *change
  * approximate; only first_byte's line start is proven, by walking back to LF.
  * Endpoints repair as view_restore; following is byte-relative as above, so
  * no line query counts from byte 0 and no estimate enters the exact caches.
- * relative remains set on completion. Wrapped state is VIEW_ERR_ARG. */
+ * relative remains set on completion. (edit-wv7) Wrapped state is accepted
+ * when it matches the view's wrap flag and layout; placement as above. */
 int view_relative_restore(view *v, const view_state *state, view_change *change);
 int view_continue(view *v, view_change *change);
 void view_cancel(view *v);

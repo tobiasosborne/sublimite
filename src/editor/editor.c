@@ -199,6 +199,7 @@ static uint32_t cursor_row(const editor *e, uint64_t byte)
 }
 static int refresh_cursor(editor *e, uint64_t old_cursor, bool caret)
 {
+    editor_large_relabel_top(e); /* edit-wv7: before layout reads the label */
     int rc = editor_begin_frame(e); if (rc) return rc;
     e->paint_ready = false;
     view_state s = e->v.state;

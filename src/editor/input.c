@@ -281,10 +281,12 @@ static int finish_edit(editor *e)
 /* edit-dz0: a lazy file whose line count is not exact has no certified
  * ordinal near a far cursor; the exact repair would count LFs from byte 0
  * (0.92 s at a 1 GiB offset, (M) in docs/decisions/edit-dz0.md). Repair
- * byte-relatively; the top keeps its estimated label until publication. */
+ * byte-relatively; the top keeps its estimated label until publication.
+ * edit-wv7: wrapped buffers too; their placement labelled the new top with
+ * a line query from byte 0 (Ctrl+End: 2^30 B (M), docs/decisions/edit-wv7.md). */
 static bool relative_repair(const editor *e)
 {
-    return !e->v.state.wrap && e->buffer->lg.lazy && !e->buffer->lg.lines_exact;
+    return e->buffer->lg.lazy && !e->buffer->lg.lines_exact;
 }
 /* Empty TYPE is the view's boundary repair/follow; its zero-length piece
  * insert is a no-op. Every actual text mutation goes through undo. */
@@ -1197,7 +1199,8 @@ int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *
     bool relative = (moving || back || del) && relative_repair(e) &&
         (move == VIEW_LEFT || move == VIEW_RIGHT || move == VIEW_UP || move == VIEW_DOWN ||
          move == VIEW_PAGE_UP || move == VIEW_PAGE_DOWN || move == VIEW_HOME || move == VIEW_END ||
-         move == VIEW_WORD_LEFT || move == VIEW_WORD_RIGHT || move == VIEW_SELECT_LINE);
+         move == VIEW_WORD_LEFT || move == VIEW_WORD_RIGHT || move == VIEW_SELECT_LINE ||
+         (e->v.state.wrap && (move == VIEW_DOC_HOME || move == VIEW_DOC_END || move == VIEW_SELECT_ALL))); /* edit-wv7 */
     rc = relative ? view_relative_command(&e->v, move, extend, &c) :
         view_command(&e->v, move, extend, NULL, 0, &c);
     if (rc == VIEW_MORE) editor_scroll_mirror(e);

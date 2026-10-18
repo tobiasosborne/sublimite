@@ -294,6 +294,27 @@ static void index_progress(editor *e, editor_buffer *b)
     }
     if (changed) e->full_pending = true;
 }
+/* edit-wv7: a completed wrapped relative placement (view relative_top)
+ * proved a new top line start but not its ordinal. Label it with the index
+ * when exact, else with the density estimate and top_estimated, so
+ * editor_seed_view_lines never installs it as a certified anchor and
+ * index_progress relabels it at publication (the wrapped path above). */
+void editor_large_relabel_top(editor *e)
+{
+    if (view_busy(&e->v) || !e->v.relative_top) return;
+    e->v.relative_top = false;
+    editor_buffer *b = e->buffer;
+    if (b->index && b->lg.lines_exact) {
+        lineidx_src cur = editor_source(b);
+        lineidx_result r = lineidx_byte_to_line(b->index, &cur, e->v.state.first_byte);
+        if (r.exact) {
+            e->v.state.first_line = r.value; e->v.state.approximate = false;
+            b->lg.top_estimated = false; return;
+        }
+    }
+    e->v.state.first_line = estimate_line(b, e->v.state.first_byte);
+    e->v.state.approximate = true; b->lg.top_estimated = true;
+}
 void editor_large_index_progress(editor *e)
 {
     for (size_t i = 0; i < e->buffer_capacity; i++)

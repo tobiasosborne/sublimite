@@ -477,6 +477,7 @@ int editor_full_layout(editor *e);
 int editor_refresh_cursor(editor *e, uint64_t old_cursor);
 int editor_refresh_placed(editor *e, uint64_t old_cursor);
 void editor_seed_view_lines(editor *e);
+void editor_large_relabel_top(editor *e);
 bool editor_line_start_before(editor *e, uint64_t end, uint64_t *start);
 void editor_restart_blink(editor *e, uint64_t now);
 void editor_route_work(const work_msg *msg, void *ctx);
