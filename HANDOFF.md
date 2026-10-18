@@ -1,3 +1,20 @@
+# HANDOFF — sublimité, session 17 IN PROGRESS (2026-10-18 ~12:50 box clock; Fable coordinator, Tobias present and using the editor)
+
+## Read first (session 17 continuation or session 18)
+**Goal set by Tobias 2026-10-18 09:55: as bug free as possible, then absolutely frictionless on this box, then daily use** (memory goal-bug-free-then-frictionless-2026-10-18; orchestration-2026-10-18.md items 28-36). **Installed:** `make install` put main d7c3a33 at ~/.local/bin/sublimite (desktop entry, icon, MIME default; `sublimite file` with no environment variables; default profile ~/.local/share/sublimite is clean, the 5.2 GB debris is at build/fixtures/profile-debris-2026-10-13). Law-1 gap recorded (item 33): no Astra drive on the installed build; Tobias was offered a core-set drive 7 and has not answered. Re-run `make install` after each landing that matters to him and tell him (a running instance keeps the old binary until relaunch).
+
+**Landed today, twenty beads (each verified in its worktree on the dedicated landing display :95, then ff):** 1wc, y5x, dr9, 4da, 2ea, 1t2, hw1, ev0, ptn, 08u, djg, 601, 5vz, 63p (typing frame no longer waits on a retiring scroll window), chy (install), ywd (command palette Ctrl+Shift+P), wv7 (wrapped Ctrl+End 7 s -> 0.06 ms), fi2 (async retained original, bounded 105 MB), q0g §21, yey (menu bar on bare Alt), 7i5. PRD §6.7 carries the palette/menu line. Worklog docs/worklog/2026-10-18.md has the per-landing record.
+
+**In flight (Opus, one bead each, worktrees .wt/edit-<b>-s8, briefs build/briefs/<b>-s8.md, reports docs/worker-reports/<b>-s8.md):** edit-2ghs P1 (Tobias's trial bug: a PDF tab kills the editor with error -2 on activation; repro in the brief; he has a workaround), edit-3f2k P1 (recovery-3 F1: Ctrl+S fails while Find Results is open), edit-ivv (BUSY retried on every checkpoint path), edit-1vun (layout upward row query on lazy files), edit-bt1 (scroll_slice fail() paths; branched from the yey tree: land with `git rebase --onto main <old-yey-sha>`), edit-qcuh (F3 retired buffers leak slots), edit-fkpk (F5 second save of a mapped file; verify first), edit-9ev6 (F2 use-after-free at close during retention). **Held with briefs written:** edit-ze59 (F10, after ivv), edit-4jhi (F6), edit-nlz (test selector tables, Sonnet, after the wave lands: it touches every test main). Backlog from the review: edit-fi0p.
+
+**Landing protocol that works (item 34):** `build/briefs/land8.sh <b>` commits the worker tree (strips the copied brief files; aborts on a conflicted rebase), then run the bead's suites with `DISPLAY=:95 EDIT_DISPLAY_LOCK_TIMEOUT=1800` under tools/with_display_lock.sh, then `git merge --ff-only`. Every conflict so far was a test selector ladder (edit-nlz fixes that). Logs written at a worktree root are ignored (/*.log) after 78f57bc. Xvfb :95 (2880x1800, 100 dpi) is the coordinator's; workers use :97/:99.
+
+**Quota 12:40 (M):** Claude Weekly 54 % (8.3 % behind pace, climbing ~6 points/h with eight Opus lanes), Codex Weekly 18 % (+15.6 % ahead, under Tobias's 20 %). Keep Opus at four to six lanes after this batch; Codex sol for one or two.
+
+**Next, in order:** land the eight in flight as they report (2ghs first, reinstall and tell Tobias); dispatch ze59, 4jhi, then nlz; a Sonnet bug hunt per landing is optional today (Tobias: no review loops; findings to beads only); drive 7 only if Tobias says so; HANDOFF and worklog at the end.
+
+---
+
 # HANDOFF — sublimité, end of session 16 (2026-10-16 ~21:50 box clock; Fable coordinator, Tobias present; stopped on Tobias's order "once the next work lands update handoff commit and push and stop all work")
 
 ## Read first (session 17)
