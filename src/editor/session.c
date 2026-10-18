@@ -149,7 +149,7 @@ void editor_session_publish(editor *e, editor_buffer *b)
 {
     if (!e->session || !b->id || b->retired) return;
     session_node *old = leaf_at(e->session, b->session_slot);
-    publish(e, b, old ? old->live : true, old ? old->rank : tabs_active_index(&e->tabs),
+    publish(e, b, old ? old->live : true, old ? old->rank : editor_recorded_rank(e, tabs_active_index(&e->tabs)), /* edit-3f2k */
             b == e->buffer ? e->v.state : b->initial);
 }
 void editor_session_forget(editor *e, editor_buffer *b)
@@ -177,10 +177,13 @@ void editor_session_metadata(editor *e)
     if (!e->session || e->recovering) return;
     for (size_t closed = 0; closed < 2; closed++) {
         size_t count = closed ? tabs_closed_count(&e->tabs) : tabs_count(&e->tabs);
-        for (size_t i = 0; i < count; i++) {
+        /* edit-3f2k: a live leaf's rank is its TABS position, which skips the
+         * unpublished placeholder and derived tabs (recorded_tabs). */
+        for (size_t i = 0, rank = 0; i < count; i++) {
             const tabs_tab *tab = closed ? tabs_closed_at(&e->tabs, i) : tabs_at(&e->tabs, i);
             editor_buffer *b = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
-            publish(e, b, !closed, i, b == e->buffer ? e->v.state : tab->state);
+            publish(e, b, !closed, closed ? i : rank, b == e->buffer ? e->v.state : tab->state);
+            if (!b->placeholder && !b->derived) rank++;
         }
     }
     /* The saving buffer keeps its leaf after eviction until its token retires
@@ -424,7 +427,7 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
     }
     if (b->source_stale) return 0;
     session_node *leaf = leaf_at(s, b->session_slot);
-    if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != tabs_count(&e->tabs)) {
+    if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != editor_recorded_rank(e, tabs_count(&e->tabs))) { /* edit-3f2k */
         b->save_error = b->operation_error = FILE_ERR_NOMEM; return 0;
     }
     capture(e, b, request_ns ? request_ns : trace_now_ns(), false);

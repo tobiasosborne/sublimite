@@ -536,6 +536,11 @@ int editor_checkpoint(editor *e);
 bool editor_checkpoint_due(const editor *e);
 void editor_checkpoint_owed(editor *e);
 void editor_recovery_owed_done(editor *e); /* recovery.c: retire the deferred source */
+/* edit-3f2k: the TABS rank of live tab `index`: the live tabs before it that
+ * TABS records (placeholders and derived tabs are skipped). With index =
+ * tabs_count, the recorded count. Session publication and save admission use
+ * the same mapping as the checkpoint's TABS record. */
+size_t editor_recorded_rank(const editor *e, size_t index);
 /* edit-fi2 (retain.c): BASE retention after the first modification. */
 enum { EDITOR_RETAIN_IDLE, EDITOR_RETAIN_RUNNING, EDITOR_RETAIN_READY, EDITOR_RETAIN_FAILED };
 bool editor_retain_matches(const editor_buffer *b, const journal_base *base);

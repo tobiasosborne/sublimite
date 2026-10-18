@@ -284,6 +284,16 @@ bool editor_checkpoint_due(const editor *e)
 {
     return !e->busy_due_ns || trace_now_ns() >= e->busy_due_ns;
 }
+size_t editor_recorded_rank(const editor *e, size_t index)
+{
+    size_t rank = 0;
+    for (size_t i = 0; i < index && i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (!b->placeholder && !b->derived) rank++;
+    }
+    return rank;
+}
 int editor_checkpoint(editor *e)
 {
     editor_records c;

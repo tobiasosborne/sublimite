@@ -4973,6 +4973,75 @@ static int n95_find_in_files(void)
     return 0;
 }
 
+/* edit-3f2k (recovery-3 F1): Ctrl+S on ordinary files while a Find Results
+ * tab is live. Tab order a.txt (0), Find Results (1, derived, never
+ * published), nested/b.c (2): the session's recorded order skips the derived
+ * tab, so saving needs the filtered live count (2, not 3) and dense ranks
+ * (b.c is recorded rank 1). (P) Expected bytes are the tree_fixture.h
+ * literals with one "x" typed at the caret; b.c's caret is the n95 "scatter"
+ * hit, byte 5. A count-only fix fails the first save in encode_all (TABS
+ * ids gap at sparse rank 1). */
+static int n3f2k_saved(editor *e)
+{
+    /* (E) reuse settle()'s existing scheduling bound, no new duration. */
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    T(settle(e) == 0);
+    return 0;
+}
+static int n3f2k_file(const char *path, const char *text)
+{
+    char bytes[64]; size_t n = strlen(text); T(n < sizeof bytes);
+    int fd = open(path, O_RDONLY); T(fd >= 0);
+    ssize_t got = read(fd, bytes, sizeof bytes); T(close(fd) == 0);
+    if (got != (ssize_t)n || memcmp(bytes, text, n))
+        fprintf(stderr, "edit-3f2k %s: expected [%s] actual [%.*s]\n", path, text, got > 0 ? (int)got : 0, bytes);
+    T(got == (ssize_t)n && !memcmp(bytes, text, n));
+    return 0;
+}
+static int n3f2k_save_with_results(void)
+{
+    tree_fixture tree; T(tree_fixture_init(&tree) == 0);
+    char a[PATH_MAX], b[PATH_MAX];
+    T(tree_fixture_path(&tree, "a.txt", a) == 0); T(tree_fixture_path(&tree, "nested/b.c", b) == 0);
+    /* The journal (outside the searched tree) makes each save encode the
+     * pinned session in its PREPARE checkpoint (savectl prepare). */
+    char log_path[] = "/tmp/editor-3f2k-XXXXXX";
+    int fd = mkstemp(log_path); T(fd >= 0); T(close(fd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.path = a, .journal_path = log_path, .cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_f, N95_CS, NULL)) == 0);
+    T(n95_type(e, "cat") == 0);
+    T(press(e, key(XKB_KEY_Tab, 0, NULL)) == 0);
+    T(n95_type(e, tree.root) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0); T(settle(e) == 0);
+    T(n95_results_tab(e) == 1u && tabs_active_index(&e->tabs) == 1u);
+    for (int i = 0; i < 7; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(n95_ends(n95_active_path(e), "/nested/b.c") && tabs_active_index(&e->tabs) == 2u);
+    T(editor_view(e).selection.cursor == sizeof "cat\ns" - 1u);
+    /* Saving the tab recorded after the derived one (sparse live index). */
+    T(press(e, key(XKB_KEY_x, 0, "x")) == 0);
+    T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL, NULL)) == 0); T(n3f2k_saved(e) == 0);
+    T(e->buffer->save_error == 0 && !editor_tab(e, 2u)->modified);
+    T(n3f2k_file(b, "cat\nsxcatter\ncat!\n") == 0);
+    /* Saving the tab recorded before it. */
+    T(editor_select_tab(e, 0u) == 0); T(settle(e) == 0); T(n95_ends(n95_active_path(e), "/a.txt"));
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_x, 0, "x")) == 0);
+    T(press(e, key(XKB_KEY_s, PLAT_MOD_CTRL, NULL)) == 0); T(n3f2k_saved(e) == 0);
+    T(e->buffer->save_error == 0 && !editor_tab(e, 0u)->modified);
+    T(n3f2k_file(a, "xAlpha cat\ncatapult CAT cat\nlast cat") == 0);
+    T(n95_results_tab(e) == 1u);
+    T(!count.active && count.allocations == 0); /* (P) no typing-path allocations */
+    editor_close(e); T(unlink(log_path) == 0); T(tree_fixture_remove(tree.root) == 0);
+    puts("edit-3f2k: Ctrl+S on files before and after a live Find Results tab passed");
+    return 0;
+}
+
 /* edit-5vz: find in files results-tab failures are refusals, never fail().
  * A results append the piece allocator refuses truncates the results with a
  * row (or, when even the row cannot be stored, a status notice); a refused
@@ -5420,6 +5489,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--trailing-disabled-scan")) return trailing_disabled_scan();
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
         if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
+        if (!strcmp(argv[1], "--3f2k-save")) return n3f2k_save_with_results();
         if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
         if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
         if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
@@ -5521,6 +5591,7 @@ int main(int argc, char **argv)
     T(menu_contract() == 0);
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
+    T(n3f2k_save_with_results() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(g02_find_previous_uncached() == 0);
