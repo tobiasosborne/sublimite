@@ -368,18 +368,19 @@ static void test_rebuild_guard(void) {
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     x11_runtime *rt = IN(&p)->runtime;
     struct xkb_keymap *old = xkb_keymap_ref(IN(&p)->keymap);
+    xcb_generic_event_t e = { .response_type = p.xkb_event };
+    ((uint8_t *)&e)[1] = XCB_XKB_MAP_NOTIFY;
     edit_malloc_guard_begin();
-    work_handle h = work_submit(&rt->pool, (work_job){ rebuild_keyboard, rt, 0, WORK_BULK });
-    if (h.epoch) rt->map_pending = true;
+    dispatch(&p, &cb, &e);                /* UI boundary + kick inside the window */
     struct pollfd pfd = { work_pool_eventfd(&rt->pool), POLLIN, 0 };
     int ready = 0;
     /* 200 x 10 ms = 2 s (G, liveness only) for one local Xvfb keymap fetch. */
-    for (unsigned i = 0; h.epoch && i < 200 && ready <= 0; i++) ready = poll(&pfd, 1, 10);
+    for (unsigned i = 0; i < 200 && ready <= 0; i++) ready = poll(&pfd, 1, 10);
     size_t allocs = edit_malloc_guard_end();
     for (unsigned i = 0; i < 100 && !s.keymaps; i++) plat_run_for(&p, &cb, 5);
-    printf("x11 keymap rebuild: worker_job=%d ready=%d counted_allocations=%zu guard=%d\n",
-           h.epoch != 0, ready, allocs, edit_malloc_guard_active());
-    CHECK(h.epoch && ready > 0 && s.keymaps == 1 && IN(&p)->keymap != old,
+    printf("x11 keymap rebuild: listener=%d ready=%d counted_allocations=%zu guard=%d\n",
+           rt->listener.epoch != 0, ready, allocs, edit_malloc_guard_active());
+    CHECK(rt->listener.epoch && ready > 0 && s.keymaps == 1 && IN(&p)->keymap != old,
           "edit-cx8 worker rebuild published a replacement keymap");
     CHECK(!edit_malloc_guard_active() || allocs == 0,
           "edit-cx8 keymap worker library allocations outside the law-2 count");
@@ -408,20 +409,44 @@ static void test_repeat_order(void) {
         plat_shutdown(&p);
     }
 }
+/* Stop the real listener so a test can fill the snapshot slots itself. */
+static void stop_listener(x11_runtime *rt) {
+    work_cancel(&rt->pool, rt->listener);
+    keyboard_kick(rt);                    /* wake its poll; it sees cancellation */
+    /* 200 x 10 ms = 2 s (G, liveness only, as test_rebuild_guard). */
+    for (unsigned i = 0; i < 200 && !work_handle_finished(&rt->pool, rt->listener); i++) {
+        struct pollfd none = { -1, 0, 0 };
+        (void)poll(&none, 1, 10);
+    }
+    CHECK(work_handle_finished(&rt->pool, rt->listener), "§21 listener stops for injected snapshots");
+}
+/* Model one listener publication plus its UI drain callback. */
+static bool inject_snapshot(x11_runtime *rt, const char *layout, bool labeled, uint32_t time, uint32_t kicks) {
+    struct xkb_rule_names names = { .layout = layout };
+    keyboard_result r = { .labeled = labeled, .label_time = time, .kicks = kicks };
+    r.ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    r.keymap = r.ctx ? xkb_keymap_new_from_names(r.ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS) : NULL;
+    r.state = r.keymap ? x11_input_prepare_state(r.keymap) : NULL;
+    if (!r.state) { keyboard_result_destroy(&r); return false; }
+    rt->slots[rt->produced++ % X11_KEYMAP_SLOTS] = r;
+    work_msg msg = { .kind = KEYBOARD_MSG_SNAPSHOT };
+    keyboard_ready(&msg, rt);
+    return true;
+}
 static void test_map_boundary(void) {
     plat p;
     if (!open_plat(&p)) return;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
+    x11_runtime *rt = IN(&p)->runtime;
+    stop_listener(rt);
     /* A pre-boundary key has already reached the translated queue. */
     xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
     dispatch(&p, &cb, (xcb_generic_event_t *)&key);
     xcb_generic_event_t notification = { .response_type = p.xkb_event };
     ((uint8_t *)&notification)[1] = XCB_XKB_MAP_NOTIFY;
     dispatch(&p, &cb, &notification);
-    /* Hold completion: retain the following raw release/press in XCB order. */
-    x11_runtime *rt = IN(&p)->runtime;
-    rt->map_pending = true;
+    /* No snapshot yet: retain the following raw release/press in XCB order. */
     key.response_type = XCB_KEY_RELEASE;
     xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
     key.response_type = XCB_KEY_PRESS;
@@ -429,14 +454,8 @@ static void test_map_boundary(void) {
     CHECK(barrier(p.conn), "§21 staged keys barrier");
     plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 1, "§21 later raw keys wait for matching map publication");
-    struct xkb_rule_names names = { .layout = "de" };
-    rt->result.ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    rt->result.keymap = xkb_keymap_new_from_names(rt->result.ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    CHECK(rt->result.keymap != NULL, "§21 replacement German keymap");
-    rt->result.state = x11_input_prepare_state(rt->result.keymap);
-    rt->result.device = p.xkb_dev;
-    rt->map_dirty = false;
-    work_msg msg = {0}; keyboard_ready(&msg, rt);
+    /* Unlabelled snapshot fetched after this boundary's kick. */
+    CHECK(inject_snapshot(rt, "de", false, 0, rt->want_kicks), "§21 replacement German keymap");
     /* Replay raw keys only after the map notification callback. */
     plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 3 && s.keymaps == 1, "§21 staged transitions replay after KEYMAP");
@@ -445,6 +464,98 @@ static void test_map_boundary(void) {
     x11_translate(IN(&p), 29, 0, &translated);
     CHECK(translated.utf8_len == 1 && translated.utf8[0] == 'z', "§21 German Y position translates as z");
     plat_shutdown(&p);
+}
+/* edit-q0g-s8, display-free: two map notifications, each followed by a key,
+ * reach the UI in one drain after the worker already captured both server maps
+ * (plus an older snapshot). Each key must use its own generation's map. The
+ * oracle for each layout is an independently compiled map. */
+static void history_key(plat *p, xkb_keycode_t code, const char *layout, const char *label) {
+    struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    struct xkb_rule_names names = { .layout = layout };
+    struct xkb_keymap *km = ctx ? xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS) : NULL;
+    x11_input oracle;
+    bool ok = km && x11_input_init(&oracle, km, NULL) == 0;
+    CHECK(ok, "§21 independent oracle map");
+    plat_event expected = {0}, got = {0};
+    if (ok) { x11_translate(&oracle, code, 0, &expected); x11_input_destroy(&oracle); }
+    else if (km) xkb_keymap_unref(km);
+    if (ctx) xkb_context_unref(ctx);
+    xcb_key_press_event_t key = { .detail = (uint8_t)code };
+    CHECK(x11_input_key(IN(p), &key, true, trace_now_ns(), &got), "§21 key translated");
+    (void)x11_input_key(IN(p), &key, false, trace_now_ns(), &(plat_event){0});
+    printf("x11_order_test: map_history %s layout=%s expected=%.*s actual=%.*s\n", label, layout,
+           (int)expected.utf8_len, expected.utf8, (int)got.utf8_len, got.utf8);
+    CHECK(ok && got.utf8_len == expected.utf8_len && !memcmp(got.utf8, expected.utf8, expected.utf8_len), label);
+}
+static unsigned history_keymaps(plat *p) {
+    unsigned n = 0;
+    plat_event ev;
+    while (x11_q_pop(IN(p), &ev)) n += ev.kind == PLAT_EV_KEYMAP;
+    return n;
+}
+static void test_map_history(void) {
+    plat p = { .repeat_fd = -1 };
+    x11_input in;
+    struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    struct xkb_rule_names us = { .layout = "us" };
+    struct xkb_keymap *km = ctx ? xkb_keymap_new_from_names(ctx, &us, XKB_KEYMAP_COMPILE_NO_FLAGS) : NULL;
+    int rc = km ? x11_input_init(&in, km, NULL) : -1;
+    x11_runtime *rt = rc == 0 ? aligned_alloc(_Alignof(x11_runtime), sizeof *rt) : NULL;
+    CHECK(rt != NULL, "§21 display-free fixture");
+    if (!rt) {
+        if (rc == 0) x11_input_destroy(&in); else if (km) xkb_keymap_unref(km);
+        if (ctx) xkb_context_unref(ctx);
+        return;
+    }
+    memset(rt, 0, sizeof *rt);
+    in.ctx = ctx;
+    rt->owner = &p;
+    rt->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    CHECK(rt->kick_fd >= 0 && work_pool_init(&rt->pool, 1, 0) == 0, "§21 display-free pool (no listener)");
+    in.runtime = rt;
+    p.in = &in;
+    /* AD06 is the physical Y position (US y, German z). */
+    xkb_keycode_t code = xkb_keymap_key_by_name(km, "AD06");
+    CHECK(code <= UINT8_MAX, "§21 fixture key fits core event detail");
+    /* Server times (ms): an older change at 50, then the two in this drain. */
+    CHECK(inject_snapshot(rt, "fr", true, 50, 0), "§21 older snapshot");
+    CHECK(inject_snapshot(rt, "de", true, 100, 0), "§21 first-switch snapshot");
+    CHECK(inject_snapshot(rt, "us", true, 200, 0), "§21 second-switch snapshot");
+    request_keymap(&p, 100);
+    poll_rescans(&p);
+    CHECK(!rt->map_blocked && history_keymaps(&p) == 1, "§21 first boundary adopts its own map");
+    history_key(&p, code, "de", "§21 key after first switch uses the first map");
+    request_keymap(&p, 200);
+    poll_rescans(&p);
+    CHECK(!rt->map_blocked && history_keymaps(&p) == 1, "§21 second boundary adopts its own map");
+    history_key(&p, code, "us", "§21 key after second switch uses the second map");
+    CHECK(rt->ready == 0, "§21 older snapshot discarded, adopted slots released");
+    /* Protocol limit: the first switch was replaced before the worker fetched
+     * (only the 300+ map exists). Best available map, one KEYMAP, and the next
+     * boundary it already covers resolves without waiting. */
+    CHECK(inject_snapshot(rt, "de", true, 400, 0), "§21 newest-only snapshot");
+    request_keymap(&p, 300);
+    poll_rescans(&p);
+    CHECK(!rt->map_blocked && history_keymaps(&p) == 1, "§21 lost generation uses newest captured map");
+    request_keymap(&p, 400);
+    poll_rescans(&p);
+    CHECK(!rt->map_blocked && history_keymaps(&p) == 0, "§21 covered boundary resolves without a fetch");
+    history_key(&p, code, "de", "§21 key after covered boundary");
+    /* A boundary the listener never saw (synthetic) is settled by its kick. */
+    request_keymap(&p, 400);
+    rt->cur_valid = false;
+    poll_rescans(&p);
+    CHECK(rt->map_blocked, "§21 boundary waits for its kicked fetch");
+    CHECK(inject_snapshot(rt, "us", false, 0, rt->want_kicks), "§21 kicked snapshot");
+    poll_rescans(&p);
+    CHECK(!rt->map_blocked && history_keymaps(&p) == 1, "§21 kicked fetch settles the boundary");
+    history_key(&p, code, "us", "§21 key after kicked boundary");
+    work_pool_shutdown(&rt->pool);
+    for (size_t i = 0; i < X11_KEYMAP_SLOTS; i++) keyboard_result_destroy(&rt->slots[i]);
+    close(rt->kick_fd);
+    free(rt);
+    in.runtime = NULL;
+    x11_input_destroy(&in);
 }
 /* edit-riu: snapshot the actual server map, including custom mappings. Rules
  * names alone (setxkbmap -query) cannot reconstruct an xmodmap/xkbcomp edit. */
@@ -583,7 +694,10 @@ static void test_live_map_boundary(void) {
     xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
     CHECK(barrier(p.conn), "§21 live after-map keys queued");
     CHECK(plat_run_for(&p, &cb, 20) == PLAT_OK, "§21 delayed snapshot UI remains bounded");
-    CHECK(s.chars == 1 && s.last_text == 'y', "§21 only pre-change US key delivered while worker delayed");
+    /* The listener may have captured German before the grab (edit-q0g-s8);
+     * either way the post-change key is never translated with US. */
+    CHECK((s.chars == 1 && s.last_text == 'y') || (s.chars == 2 && s.last_text == 'z'),
+          "§21 post-change key waits for, or uses, the German map while worker delayed");
     xcb_ungrab_server(p.conn); xcb_flush(p.conn);
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 4 && s.last_text == 'z' && s.keymaps > 0,
@@ -593,7 +707,13 @@ shutdown:
 restore:
     restore_saved_map();
 }
-/* Retained reproduction for the remaining exact server-generation gap. */
+/* edit-q0g-s8: two server map replacements, each followed by a key, all
+ * queued before one UI drain. Each key must translate with the map that was
+ * current when the server queued it. The worker may observe a replacement
+ * before the UI does; this fixture waits (liveness bound only) until a keymap
+ * result is pending after the first replacement, i.e. the worker kept up with
+ * the server. Changes that outrun the worker's fetch are the protocol limit
+ * recorded in docs/decisions/edit-q0g-s8.md. */
 static void test_map_generations_pending(void) {
     if (!save_server_map()) return;
     if (!set_layout("us")) {
@@ -609,6 +729,13 @@ static void test_map_generations_pending(void) {
         bool changed = set_layout(i ? "us" : "de");
         CHECK(changed, "§21 consecutive server map change");
         if (!changed) goto shutdown;
+        /* 200 x 10 ms = 2 s (G, liveness only, as test_rebuild_guard) for one
+         * local Xvfb keymap fetch; a miss falls through to the text check. */
+        x11_runtime *rt = IN(&p)->runtime;
+        for (unsigned w = 0; !i && w < 200 && !work_mailbox_pending(&rt->pool); w++) {
+            struct pollfd pfd = { work_pool_eventfd(&rt->pool), POLLIN, 0 };
+            (void)poll(&pfd, 1, 10);
+        }
         key.response_type = XCB_KEY_PRESS;
         xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
         key.response_type = XCB_KEY_RELEASE;
@@ -616,6 +743,9 @@ static void test_map_generations_pending(void) {
         CHECK(barrier(p.conn), "§21 generation keys queued");
     }
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
+    if (s.text_count != 2 || s.text[0] != 'z' || s.text[1] != 'y')
+        fprintf(stderr, "§21 generations: expected=zy actual=%.*s keymaps=%u\n",
+                (int)s.text_count, (const char *)s.text, s.keymaps);
     CHECK(s.text_count == 2 && s.text[0] == 'z' && s.text[1] == 'y',
           "§21 exact snapshots retain both successive server mapping generations");
 shutdown:
@@ -799,11 +929,18 @@ static void test_alignment(void) {
     faults.extended_alloc = false;
 }
 int main(int argc, char **argv) {
+    const char *which = argc > 1 ? argv[1] : "all";
+    if (!strcmp(which, "all") || !strcmp(which, "map_history")) {
+        test_map_history();   /* display-free: runs before the private Xvfb */
+        if (strcmp(which, "all")) {
+            printf("x11_order_test: %s %s\n", which, failed ? "FAILED" : "ok");
+            return failed;
+        }
+    }
     if (!xvfb_start()) { fprintf(stderr, "x11_order_test: FAIL no private Xvfb\n"); return 1; }
     /* Registered after xvfb_stop: the original map is restored before Xvfb
      * exits. Normal/failure paths restore explicitly so failure affects main. */
     if (atexit(restore_saved_map) != 0) { CHECK(false, "keymap cleanup registration"); return failed; }
-    const char *which = argc > 1 ? argv[1] : "all";
     if (!strcmp(which, "all") || !strcmp(which, "alignment")) test_alignment();
     if (!strcmp(which, "all") || !strcmp(which, "burst")) test_burst();
     if (!strcmp(which, "local_overflow")) test_local_overflow();
@@ -812,7 +949,8 @@ int main(int argc, char **argv) {
     if (!strcmp(which, "all") || !strcmp(which, "rescans")) { test_rescans(); test_rescan_publish(); test_rebuild_guard(); }
     if (!strcmp(which, "all") || !strcmp(which, "repeat_order")) test_repeat_order();
     if (!strcmp(which, "all") || !strcmp(which, "map_boundary")) { test_map_boundary(); test_live_map_boundary(); }
-    if (!strcmp(which, "map_generations_pending")) test_map_generations_pending();
+    if (!strcmp(which, "all") || !strcmp(which, "map_generations") ||
+        !strcmp(which, "map_generations_pending")) test_map_generations_pending();
     if (!strcmp(which, "all") || !strcmp(which, "wheel_pending")) test_wheel_pending();
     if (!strcmp(which, "all") || !strcmp(which, "xi_mask_pending")) { test_xi_mask_pending(); test_xi_group(); }
     if (!strcmp(which, "all") || !strcmp(which, "repeat_config")) test_repeat_config();

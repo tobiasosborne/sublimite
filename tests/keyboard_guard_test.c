@@ -87,17 +87,18 @@ int main(void) {
         x11_runtime rt = {0};
         work_ctx job = { .arg = &rt };
         edit_malloc_guard_begin();
-        rebuild_keyboard(&job);
+        keyboard_result r;
+        fetch_keyboard(&job, &rt, &r);
         probe(false); /* Exemption must be balanced on success/cancel/failure. */
         size_t counted = edit_malloc_guard_end();
         bool ok = !scope_failed && !probe_failed && !exempt_depth &&
             (!edit_malloc_guard_active() || counted == own_calls) &&
-            ((rt.result.state != NULL) == (fixture == SUCCESS));
+            ((r.state != NULL) == (fixture == SUCCESS));
         printf("keyboard_guard_test: case=%zu own_probes=%zu counted=%zu guard=%s %s\n",
                i, own_calls, counted, edit_malloc_guard_active() ? "active" : "ASan-inert",
                ok ? "PASS" : "FAIL");
         if (!ok) failed = true;
-        keyboard_result_destroy(&rt.result);
+        keyboard_result_destroy(&r);
     }
     xkb_keymap_unref(fixture_keymap); xkb_context_unref(fixture_ctx);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;

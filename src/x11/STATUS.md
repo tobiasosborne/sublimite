@@ -228,3 +228,6 @@ passed. Final verification and full red/green evidence are maintained in
 [the worker report](../../docs/worker-reports/edit-q0g-s9.md); design choices are
 in [the decision](../../docs/decisions/edit-q0g.md). Existing hardware XI2 and
 real-window performance gaps are unchanged.
+
+
+2026-10-18 (edit-q0g s8): the P2-1 §21 historical-map case is closed: a listener on the runtime's own worker fetches each keymap as its notification arrives and labels it by server time; keys translate with their own map unless a second switch reaches the server before the first fetch completes (docs/decisions/edit-q0g-s8.md).

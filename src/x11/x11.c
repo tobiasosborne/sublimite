@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/timerfd.h>
+#include <sys/eventfd.h>
+#include <stdatomic.h>
 #include <xcb/xcb.h>
 #include <xcb/present.h>
 
@@ -134,19 +136,53 @@ static void setup_xi2(plat *p) {
 }
 
 /* Runtime keymap I/O uses its own connection on the bulk worker. The UI
- * connection only sends/polls device queries; no dispatch path waits for replies. */
+ * connection only sends/polls device queries; no dispatch path waits for replies.
+ *
+ * edit-q0g-s8 (P2-1 §21, historical maps): the worker connection selects the
+ * same XKB map notifications as the UI connection and a persistent listener
+ * fetches the server map as soon as it sees one, before the UI thread reaches
+ * the notification in its own (possibly backlogged) queue. Each snapshot is
+ * labelled with the server time of the newest notification preceding its
+ * replies (a notification arriving during the fetch forces a refetch, so the
+ * label is exact) and with the number of UI kicks consumed before the fetch.
+ * The UI blocks raw input at each notification and adopts the oldest snapshot
+ * whose label is not older than that notification, or which followed the
+ * kick written at it. Snapshots travel through prepaid slots; the work
+ * mailbox carries only the slot order and memory ordering. */
 typedef struct keyboard_result {
     struct xkb_context *ctx;
     struct xkb_keymap *keymap;
     struct xkb_state *state;
     int32_t device;
+    uint32_t label_time;   /* server ms of the newest preceding notification */
+    uint32_t kicks;        /* UI kicks consumed before this fetch began */
+    bool labeled;          /* label_time is valid */
 } keyboard_result;
+
+/* (P) Every occupied slot has exactly one undrained message plus at most one
+ * failure message per listener, and X11_KEYMAP_SLOTS + 1 <= WORK_MAILBOX_CAP,
+ * so publish never fails for capacity. Slots = WORK_DRAIN_MAX_MESSAGES lets one
+ * bounded drain acknowledge every occupied slot. A full ring makes the worker
+ * drop its newest fetch; freeing a slot from a full ring kicks a fresh fetch. */
+#define X11_KEYMAP_SLOTS WORK_DRAIN_MAX_MESSAGES
+_Static_assert(X11_KEYMAP_SLOTS + 1u <= WORK_MAILBOX_CAP, "keymap slots exceed mailbox capacity");
+enum { KEYBOARD_MSG_SNAPSHOT = 1, KEYBOARD_MSG_FAILED = 2 };
 
 typedef struct x11_runtime {
     work_pool pool;
     xcb_connection_t *keyboard_conn;
-    keyboard_result result;
-    bool map_pending, map_dirty, map_blocked, map_failed, xi_dirty;
+    int kick_fd;                         /* eventfd: UI -> listener, "fetch now" */
+    uint8_t keyboard_event;              /* XKB event base on keyboard_conn */
+    work_handle listener;
+    keyboard_result slots[X11_KEYMAP_SLOTS];
+    _Atomic uint32_t consumed;           /* UI releases slots; worker reads */
+    uint32_t produced;                   /* worker only (read by UI after join) */
+    uint32_t ready;                      /* UI: published, unconsumed slots */
+    uint32_t kicks_sent;                 /* UI */
+    uint32_t want_time, want_kicks;      /* UI: boundary of the pending notification */
+    uint32_t cur_time, cur_kicks;        /* UI: labels of the adopted snapshot */
+    bool cur_valid, cur_labeled, kick_since_arrival;
+    bool map_blocked, map_failed, listener_dead, xi_dirty;
     unsigned xi_cookie;
     uint64_t xi_query_sequence;
     plat *owner;
@@ -159,8 +195,7 @@ static void keyboard_result_destroy(keyboard_result *r) {
     memset(r, 0, sizeof *r);
 }
 
-static void rebuild_keyboard(work_ctx *job) {
-    x11_runtime *rt = job->arg;
+static void fetch_keyboard(work_ctx *job, x11_runtime *rt, keyboard_result *out) {
     keyboard_result r = {0};
     /* edit-cuh: exempt only library construction on this off-path worker.
      * Cancellation checks, our state preparation and publication stay counted;
@@ -178,11 +213,67 @@ static void rebuild_keyboard(work_ctx *job) {
         }
         if (r.keymap && !work_should_stop(job)) r.state = x11_input_prepare_state(r.keymap);
     }
-    /* One worker/job at a time; publish provides the synchronization. Shutdown
-     * joins before reclaiming this result, even if cancellation drops the message. */
-    rt->result = r;
-    work_msg msg = { .kind = 1 };
-    (void)work_publish(job, &msg);
+    if (!r.state) keyboard_result_destroy(&r);
+    *out = r;
+}
+
+/* Worker: consume every XKB map notification already received on the worker
+ * connection. True when one was seen; *latest becomes the newest server time. */
+static bool keyboard_collect(x11_runtime *rt, uint32_t *latest, bool *labeled) {
+    bool seen = false;
+    for (;;) {
+        edit_malloc_guard_exempt_begin();
+        xcb_generic_event_t *e = xcb_poll_for_event(rt->keyboard_conn);
+        edit_malloc_guard_exempt_end();
+        if (!e) return seen;
+        const uint8_t *b = (const uint8_t *)e;
+        if ((b[0] & 0x7fu) == rt->keyboard_event &&
+            (b[1] == XCB_XKB_NEW_KEYBOARD_NOTIFY || b[1] == XCB_XKB_MAP_NOTIFY)) {
+            uint32_t t; memcpy(&t, b + 4, sizeof t);    /* both events: time at byte 4 */
+            *latest = t; *labeled = true; seen = true;
+        }
+        edit_malloc_guard_exempt_begin();
+        free(e);
+        edit_malloc_guard_exempt_end();
+    }
+}
+
+static void keyboard_listener(work_ctx *job) {
+    x11_runtime *rt = job->arg;
+    uint32_t latest = 0, kicks = 0;
+    bool labeled = false;
+    while (!work_should_stop(job)) {
+        bool want = keyboard_collect(rt, &latest, &labeled);
+        if (xcb_connection_has_error(rt->keyboard_conn)) break;
+        uint64_t v = 0;
+        if (read(rt->kick_fd, &v, sizeof v) == (ssize_t)sizeof v && v) { kicks += (uint32_t)v; want = true; }
+        if (!want) {
+            struct pollfd fds[2] = { { xcb_get_file_descriptor(rt->keyboard_conn), POLLIN, 0 },
+                                     { rt->kick_fd, POLLIN, 0 } };
+            (void)poll(fds, 2, -1);  /* shutdown() on the connection wakes this */
+            continue;
+        }
+        keyboard_result r;
+        for (;;) {
+            fetch_keyboard(job, rt, &r);
+            /* A notification received during the fetch may precede some of its
+             * replies: the snapshot could be torn or stale. Refetch. */
+            if (!r.state || !keyboard_collect(rt, &latest, &labeled)) break;
+            keyboard_result_destroy(&r);
+        }
+        if (!r.state) break;
+        r.label_time = latest; r.labeled = labeled; r.kicks = kicks;
+        uint32_t consumed = atomic_load_explicit(&rt->consumed, memory_order_acquire);
+        if (rt->produced - consumed >= X11_KEYMAP_SLOTS) { keyboard_result_destroy(&r); continue; }
+        rt->slots[rt->produced % X11_KEYMAP_SLOTS] = r;
+        rt->produced++;
+        work_msg msg = { .kind = KEYBOARD_MSG_SNAPSHOT };
+        (void)work_publish(job, &msg);  /* a stale slot is reclaimed at shutdown */
+    }
+    if (!work_should_stop(job)) {
+        work_msg msg = { .kind = KEYBOARD_MSG_FAILED };
+        (void)work_publish(job, &msg);
+    }
 }
 
 static int setup_runtime(plat *p) {
@@ -190,11 +281,30 @@ static int setup_runtime(plat *p) {
     if (!rt) return PLAT_ERR_FAIL;
     memset(rt, 0, sizeof *rt);
     rt->owner = p;
+    rt->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     rt->keyboard_conn = xcb_connect(NULL, NULL);
-    if (!rt->keyboard_conn || xcb_connection_has_error(rt->keyboard_conn) ||
+    uint8_t base = 0;
+    if (rt->kick_fd < 0 || !rt->keyboard_conn || xcb_connection_has_error(rt->keyboard_conn) ||
         !xkb_x11_setup_xkb_extension(rt->keyboard_conn, 1, 0, XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS,
-                                    NULL, NULL, NULL, NULL) || work_pool_init(&rt->pool, 1, 0) != 0) {
+                                    NULL, NULL, &base, NULL) || work_pool_init(&rt->pool, 1, 0) != 0) {
         if (rt->keyboard_conn) xcb_disconnect(rt->keyboard_conn);
+        if (rt->kick_fd >= 0) close(rt->kick_fd);
+        free(rt);
+        return PLAT_ERR_FAIL;
+    }
+    rt->keyboard_event = base;
+    /* Same map notifications and details as setup_keyboard, without state. */
+    uint16_t ev = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY | XCB_XKB_EVENT_TYPE_MAP_NOTIFY;
+    uint16_t parts = XCB_XKB_MAP_PART_KEY_TYPES | XCB_XKB_MAP_PART_KEY_SYMS | XCB_XKB_MAP_PART_MODIFIER_MAP |
+                     XCB_XKB_MAP_PART_EXPLICIT_COMPONENTS | XCB_XKB_MAP_PART_KEY_ACTIONS |
+                     XCB_XKB_MAP_PART_KEY_BEHAVIORS | XCB_XKB_MAP_PART_VIRTUAL_MODS | XCB_XKB_MAP_PART_VIRTUAL_MOD_MAP;
+    xcb_xkb_select_events(rt->keyboard_conn, XCB_XKB_ID_USE_CORE_KBD, ev, 0, ev, parts, parts, NULL);
+    xcb_flush(rt->keyboard_conn);
+    rt->listener = work_submit(&rt->pool, (work_job){ keyboard_listener, rt, 0, WORK_BULK });
+    if (!rt->listener.epoch) {
+        work_pool_shutdown(&rt->pool);
+        xcb_disconnect(rt->keyboard_conn);
+        close(rt->kick_fd);
         free(rt);
         return PLAT_ERR_FAIL;
     }
@@ -202,11 +312,20 @@ static int setup_runtime(plat *p) {
     return PLAT_OK;
 }
 
-static void request_keymap(plat *p) {
+static void keyboard_kick(x11_runtime *rt) {
+    rt->kicks_sent++;
+    rt->kick_since_arrival = true;
+    uint64_t one = 1;
+    (void)!write(rt->kick_fd, &one, sizeof one);
+}
+
+static void request_keymap(plat *p, uint32_t time) {
     x11_runtime *rt = IN(p)->runtime;
     if (rt) {
-        rt->map_dirty = true;
         rt->map_blocked = true;
+        keyboard_kick(rt);
+        rt->want_time = time;
+        rt->want_kicks = rt->kicks_sent;
         /* A synthetic repeat cannot cross the map generation boundary. */
         x11_repeat_cancel(IN(p));
         struct itimerspec stopped = {0};
@@ -216,25 +335,69 @@ static void request_keymap(plat *p) {
 
 static void rearm_repeat(plat *p);
 
+/* UI: one message per published slot, in production order. */
 static void keyboard_ready(const work_msg *msg, void *ud) {
-    (void)msg;
     x11_runtime *rt = ud;
-    plat *p = rt->owner;
-    keyboard_result *r = &rt->result;
-    rt->map_pending = false;
-    if (!rt->map_dirty && !r->state) rt->map_failed = true;
-    if (!rt->map_dirty && r->state) {
-        rt->map_blocked = false;
-        x11_input_adopt_keymap(IN(p), r->keymap, r->state);
-        if (IN(p)->ctx) xkb_context_unref(IN(p)->ctx);
-        IN(p)->ctx = r->ctx;
-        p->xkb_dev = r->device;
-        rearm_repeat(p);
-        memset(r, 0, sizeof *r);
+    if (msg->kind == KEYBOARD_MSG_FAILED) { rt->listener_dead = true; return; }
+    rt->ready++;
+    rt->kick_since_arrival = false;
+}
+
+/* Wrap-safe "a is not older than b" for 32-bit server ms and kick counts. */
+static bool keyboard_not_older(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
+
+static bool keyboard_covers(const x11_runtime *rt, bool labeled, uint32_t time, uint32_t kicks) {
+    return keyboard_not_older(kicks, rt->want_kicks) ||
+           (labeled && keyboard_not_older(time, rt->want_time));
+}
+
+static void keyboard_release_slot(x11_runtime *rt) {
+    uint32_t consumed = atomic_load_explicit(&rt->consumed, memory_order_relaxed);
+    bool was_full = rt->ready == X11_KEYMAP_SLOTS;
+    memset(&rt->slots[consumed % X11_KEYMAP_SLOTS], 0, sizeof rt->slots[0]);
+    atomic_store_explicit(&rt->consumed, consumed + 1u, memory_order_release);
+    rt->ready--;
+    if (was_full) keyboard_kick(rt);  /* the worker may have dropped a newer fetch */
+}
+
+/* UI, with no translated input pending: settle the current map boundary. */
+static void resolve_keymap(plat *p) {
+    x11_runtime *rt = IN(p)->runtime;
+    if (!rt->map_blocked) return;
+    bool adopted = false;
+    if (!(rt->cur_valid && keyboard_covers(rt, rt->cur_labeled, rt->cur_time, rt->cur_kicks))) {
+        for (;;) {
+            if (!rt->ready) {
+                /* As before the listener: a boundary no map can settle stops the loop. */
+                if (rt->listener_dead) { rt->map_failed = true; return; }
+                /* Snapshots arrived but none covers this boundary, and none is in
+                 * flight to the mailbox: make sure a fetch follows. */
+                if (!rt->kick_since_arrival && !work_mailbox_pending(&rt->pool)) keyboard_kick(rt);
+                return;
+            }
+            keyboard_result *r = &rt->slots[atomic_load_explicit(&rt->consumed, memory_order_relaxed) %
+                                            X11_KEYMAP_SLOTS];
+            if (keyboard_covers(rt, r->labeled, r->label_time, r->kicks)) {
+                x11_input_adopt_keymap(IN(p), r->keymap, r->state);
+                if (IN(p)->ctx) xkb_context_unref(IN(p)->ctx);
+                IN(p)->ctx = r->ctx;
+                p->xkb_dev = r->device;
+                rt->cur_valid = true; rt->cur_labeled = r->labeled;
+                rt->cur_time = r->label_time; rt->cur_kicks = r->kicks;
+                keyboard_release_slot(rt);
+                adopted = true;
+                break;
+            }
+            keyboard_result_destroy(r);
+            keyboard_release_slot(rt);
+        }
+    }
+    rt->map_blocked = false;
+    rearm_repeat(p);
+    if (adopted) {
         plat_event ev = { .kind = PLAT_EV_KEYMAP };
         (void)x11_q_push(IN(p), &ev);
     }
-    keyboard_result_destroy(r);
 }
 
 static void request_xi2_rescan(plat *p) {
@@ -245,13 +408,10 @@ static void request_xi2_rescan(plat *p) {
 static void poll_rescans(plat *p) {
     x11_runtime *rt = IN(p)->runtime;
     if (!rt) return;
+    if (rt->ready < X11_KEYMAP_SLOTS)
+        (void)work_mailbox_drain_bounded(&rt->pool, keyboard_ready, rt, X11_KEYMAP_SLOTS - rt->ready, 0);
     /* Apply a replacement only after preceding queued input was delivered. */
-    if (IN(p)->qh == IN(p)->qt) (void)work_mailbox_drain(&rt->pool, keyboard_ready, rt);
-    if (rt->map_dirty && !rt->map_pending) {
-        work_job job = { rebuild_keyboard, rt, 0, WORK_BULK };
-        work_handle h = work_submit(&rt->pool, job);
-        if (h.epoch) { rt->map_pending = true; rt->map_dirty = false; }
-    }
+    if (rt->map_blocked && IN(p)->qh == IN(p)->qt) resolve_keymap(p);
     if (!p->xi) return;
     if (rt->xi_cookie) {
         void *reply = NULL;
@@ -287,8 +447,10 @@ static void shutdown_runtime(plat *p) {
      * This is the dedicated worker connection; UI/XI/clipboard are unaffected. */
     (void)shutdown(xcb_get_file_descriptor(rt->keyboard_conn), SHUT_RDWR);
     work_pool_shutdown(&rt->pool);
-    keyboard_result_destroy(&rt->result);
+    /* Joined: every slot the listener filled and the UI did not consume. */
+    for (size_t i = 0; i < X11_KEYMAP_SLOTS; i++) keyboard_result_destroy(&rt->slots[i]);
     xcb_disconnect(rt->keyboard_conn);
+    close(rt->kick_fd);
     free(rt);
     IN(p)->runtime = NULL;
 }
@@ -527,7 +689,8 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
                 (void)x11_mods_from_state(IN(p), (uint32_t)s->mods | ((uint32_t)(s->group & 3u) << 13));
             }
             if (xt == XCB_XKB_NEW_KEYBOARD_NOTIFY || xt == XCB_XKB_MAP_NOTIFY) {
-                request_keymap(p);
+                uint32_t time; memcpy(&time, (const uint8_t *)e + 4, sizeof time); /* both: time at byte 4 */
+                request_keymap(p, time);
             }
         }
         break;
@@ -609,7 +772,9 @@ int x11_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         int keyboard_i = -1;
         if (rt) {
             keyboard_i = (int)n;
-            fds[n].fd = work_pool_eventfd(&rt->pool); fds[n++].events = POLLIN;
+            fds[n].fd = work_pool_eventfd(&rt->pool);
+            /* A full slot ring leaves results in the mailbox until a boundary frees one. */
+            fds[n++].events = rt->ready < X11_KEYMAP_SLOTS ? POLLIN : 0;
         }
         int r = poll(fds, n, to);
         if (r < 0) continue;
