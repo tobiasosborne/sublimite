@@ -359,6 +359,32 @@ int file_source_validate(void *ctx)
     file_id observed; file_id_from_stat(&observed,&st);
     return file_id_diff(&source->identity,&observed)==FILE_CHG_NONE ? FILE_OK : FILE_ERR_CHANGED;
 }
+/* edit-fkpk (recovery-3 F5): our own rename over the pathname drops the
+ * backing inode's link and so advances its ctime. Adopt exactly that change:
+ * same inode, size, mtime, permission bits and owner; unchanged fault epoch;
+ * the pathname now names a different inode (the replacement). Anything else
+ * leaves the authorization untouched, so validation keeps refusing. */
+int file_source_adopt_retired(file_source *source, const file_id *replacement)
+{
+    if (!source || !replacement) return FILE_ERR_STATE;
+    if (source->mode==FILE_MODE_COPY) return FILE_OK;
+    file_map *mapping=source->map;
+    if (!mapping || guard_faulted(mapping->slot) || guard_faults(mapping->slot)!=source->faults)
+        return FILE_ERR_CHANGED;
+    if (!replacement->exists ||
+        (replacement->dev==source->identity.dev && replacement->ino==source->identity.ino))
+        return FILE_ERR_CHANGED;
+    struct stat st;
+    if (fstat(mapping->fd,&st)) return FILE_ERR_IO;
+    file_id observed; file_id_from_stat(&observed,&st);
+    uint32_t diff=file_id_diff(&source->identity,&observed);
+    if (diff==FILE_CHG_NONE) return FILE_OK;
+    if (diff!=FILE_CHG_METADATA || !source->identity.metadata_valid ||
+        observed.mode!=source->identity.mode || observed.uid!=source->identity.uid ||
+        observed.gid!=source->identity.gid) return FILE_ERR_CHANGED;
+    source->identity.ctime_ns=observed.ctime_ns;
+    return FILE_OK;
+}
 
 /* Worker-owned physical transaction. UI passes it from preparation to commit
  * only after receiving SAVE_PREPARED; no descriptor operation is done by decode. */

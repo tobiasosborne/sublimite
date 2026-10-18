@@ -239,6 +239,12 @@ void file_source_release(file_source *source);
 const file_id *file_source_identity(const file_source *source);
 file_mode file_source_mode(const file_source *source);
 int file_source_validate(void *source);
+/* Worker-only, with exclusive use of the source (no concurrent validate).
+ * After the caller's own successful rename over the source's pathname,
+ * replacement being the renamed-in inode: adopt the retired backing's new
+ * ctime iff nothing else of its identity or its fault epoch changed. Returns
+ * FILE_OK (adopted or unchanged) or FILE_ERR_CHANGED/IO, leaving it as was. */
+int file_source_adopt_retired(file_source *source, const file_id *replacement);
 
 /* ---- change detection ---- */
 /* Stat-based check. Returns 1 if the source changed (sticky), else 0. If

@@ -45,7 +45,7 @@ static int saved(editor *e)
     while (editor_save_active(e)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
     return settle(e);
 }
-static int open_fixture_at(fixture *f, bool journalling, bool missing, bool nested_target)
+static int open_fixture_threshold(fixture *f, bool journalling, bool missing, bool nested_target, uint64_t threshold)
 {
     strcpy(f->directory, "build/editor-session-XXXXXX"); T(mkdtemp(f->directory));
     if (nested_target) {
@@ -58,9 +58,13 @@ static int open_fixture_at(fixture *f, bool journalling, bool missing, bool nest
     if (!missing) { fd = open(f->path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0); T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd); }
     T(render_null_backend(&f->backend) == 0);
     editor_config config = {.path = f->path, .journal_path = journalling ? f->log : NULL,
+        .copy_threshold = threshold,
         .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* tab + text + status */
     T(editor_open(&f->e, &config, &f->backend) == 0); return settle(f->e);
 }
+/* (P) zero selects file_default_copy_threshold(). */
+static int open_fixture_at(fixture *f, bool journalling, bool missing, bool nested_target)
+{ return open_fixture_threshold(f, journalling, missing, nested_target, 0); }
 static int open_fixture(fixture *f, bool journalling, bool missing)
 { return open_fixture_at(f, journalling, missing, false); }
 static void close_fixture(fixture *f)
@@ -117,6 +121,26 @@ static int repeated_save(bool journalling, bool missing)
     T(!editor_tab(f.e, 0)->modified && !f.e->buffer->operation_error);
     T(press(f.e, 'y', 0, "y") == 0); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
     T(disk_is(f.path, missing ? "xy" : "xybase") == 0); T(!editor_tab(f.e, 0)->modified);
+    close_fixture(&f); return 0;
+}
+/* edit-fkpk (recovery-3 F5): an original acquired as MMAP saved twice. The
+ * first save renames over the pathname, which updates the retained inode's
+ * ctime (link count 1 -> 0); the second save must still validate the mapped
+ * source. (P) copy_threshold 1 selects MMAP for the strlen("base")-byte file
+ * (size >= threshold); three saves cover the refresh being repeatable. */
+static int mapped_repeated_save(bool journalling)
+{
+    fixture f = {0}; T(open_fixture_threshold(&f, journalling, false, false, 1) == 0);
+    uint64_t limit = deadline();
+    while (f.e->buffer->pending_open) { T(turn(f.e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(f.e->buffer->file && file_open_mode(f.e->buffer->file) == FILE_MODE_MMAP);
+    T(press(f.e, 'x', 0, "x") == 0); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+    T(disk_is(f.path, "xbase") == 0); T(!editor_tab(f.e, 0)->modified && !f.e->buffer->operation_error);
+    T(press(f.e, 'y', 0, "y") == 0); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+    if (f.e->buffer->save_error) fprintf(stderr, "editor_session_test: fkpk second save error=%d journal=%d\n", f.e->buffer->save_error, (int)journalling);
+    T(!f.e->buffer->save_error); T(disk_is(f.path, "xybase") == 0); T(!editor_tab(f.e, 0)->modified);
+    T(press(f.e, 'z', 0, "z") == 0); T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f.e) == 0);
+    T(!f.e->buffer->save_error); T(disk_is(f.path, "xyzbase") == 0); T(!editor_tab(f.e, 0)->modified);
     close_fixture(&f); return 0;
 }
 static int post_cutoff(void)
@@ -2042,6 +2066,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     T(ivv_all() == 0);
@@ -2059,6 +2084,7 @@ int main(int argc, char **argv)
     T(session_artifacts() == 0); T(changed_base(false) == 0); T(changed_base(true) == 0); T(install_failure() == 0);
     T(unavailable_target_parent() == 0); T(existing_journal() == 0);
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
+    T(mapped_repeated_save(true) == 0); T(mapped_repeated_save(false) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);

@@ -237,7 +237,15 @@ end:
     else r->reload=copy;
     (void)close(fd);
 }
-static void save_replaced(void *ctx) { ((result *)ctx)->replaced=true; }
+/* edit-fkpk: runs right after the rename. The retired original's ctime moved
+ * with its link count; refresh the controller-owned source authorization so
+ * the next save validates. Failure keeps the old identity (refusal stands). */
+static void save_replaced(void *ctx)
+{
+    savectl *s=ctx; result *r=&s->completion->value;
+    r->replaced=true;
+    if (s->options.source) (void)file_source_adopt_retired(s->options.source,&r->id);
+}
 static int sync_target_parent(savectl *s)
 {
     char path[4097]; strcpy(path,s->path); char *slash=strrchr(path,'/');
@@ -299,7 +307,7 @@ static void worker(work_ctx *ctx)
                     .mode=s->options.create_mode_valid ? s->options.create_mode : s->task.expect.mode,
                     .mode_valid=s->options.create_mode_valid,.expect=&s->task.expect,
                     .stop=stop,.stop_ctx=s,.validate=validate,.validate_ctx=s,
-                    .out_id=&r->id,.replaced=save_replaced,.replaced_ctx=r,.step=s->options.step,.step_ctx=s->options.step_ctx};
+                    .out_id=&r->id,.replaced=save_replaced,.replaced_ctx=s,.step=s->options.step,.step_ctx=s->options.step_ctx};
                 r->file_error=file_save_write(&args); r->err_no=args.err_no;
                 if (r->file_error==FILE_ERR_CANCELLED && r->stop_error)
                     r->file_error=r->stop_error;
