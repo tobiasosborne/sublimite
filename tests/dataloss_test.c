@@ -871,6 +871,51 @@ static int retain_lifecycle(void)
     editor_close(e); T(!fi2_retained(root));
     remove_tree(root); return 0;
 }
+/* edit-9ev6 (recovery-3 F2): editor_close while a BASE copy is RUNNING. The
+ * retention job borrows the journal's IO callbacks (r->io = &j->io); close
+ * must quiesce it before the journal (an arena, unmapped on close) and its
+ * pool go. The metadata_sync hook (used only by retention) holds the job after
+ * its copy until the pool cancels it; the job then reaches sync_parent, which
+ * reads r->io. Before the fix that read hit the unmapped journal under ASan. */
+typedef struct held_retain {
+    atomic_bool entered, armed;
+    work_pool *pool; work_handle handle; /* written by the test before armed */
+} held_retain;
+static int hold_retain_sync(void *ctx, int fd)
+{
+    held_retain *h = ctx;
+    if (!atomic_load(&h->entered)) {
+        atomic_store(&h->entered, true);
+        while (!atomic_load(&h->armed) ||
+               atomic_load(&h->pool->slots[h->handle.slot].epoch) == h->handle.epoch) sched_yield();
+    }
+    return fsync(fd);
+}
+static int retain_close(void)
+{
+    char root[64], source[128], jpath[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(fi2_fill(source, FI2_BYTES, 'a') == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(journal_flush(e->journal) == 0);
+    held_retain held = {0};
+    journal_io io = {.ctx = &held, .metadata_sync = hold_retain_sync};
+    T(journal_set_io(e->journal, &io) == 0); /* no edit yet: no retention operation */
+    /* The journal pool has one worker: a held copy would queue every journal
+     * write behind it. Make the edit (and its metadata) durable first, then
+     * let retention start: close then finds a durable prefix, so its flush
+     * returns without joining the copy (the finding's sequence). */
+    e->retain_limit = 0; T(press(e, 'q', 0, "q") == 0); T(editor_flush(e) == 0);
+    e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
+    uint64_t limit = deadline();
+    while (!atomic_load(&held.entered)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    editor_buffer *b = e->buffer; T(b->retain_state == EDITOR_RETAIN_RUNNING);
+    held.pool = b->retain_pool; held.handle = b->retain_handle; atomic_store(&held.armed, true);
+    editor_close(e); /* the job is released only by a cancellation */
+    fprintf(stderr, "dataloss_test: retain_close: closed with a held copy, retained after close=%d\n", fi2_retained(root));
+    T(!fi2_retained(root)); /* an unreferenced copy is removed (fi2 policy) */
+    remove_tree(root); return 0;
+}
 /* (d) 1 GiB sparse open: time editor_open + settle and a first edit; above
  * the retention bound no copy is made. (P) 2^30 bytes; sparse (ftruncate),
  * removed on every exit path by the wrapper. */
@@ -983,6 +1028,7 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
     if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
     if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
+    if (argc == 2 && !strcmp(argv[1], "--retain-close")) return retain_close();
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
@@ -994,6 +1040,7 @@ int main(int argc, char **argv)
     T(two_process_save(false) == 0); T(two_process_save(true) == 0);
     T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
+    T(retain_close() == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */

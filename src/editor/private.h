@@ -542,6 +542,7 @@ bool editor_retain_matches(const editor_buffer *b, const journal_base *base);
 void editor_retain_tick(editor *e);
 void editor_retain_checkpointed(editor *e);
 void editor_retain_stop(editor_buffer *b);
+void editor_retain_quiesce(editor *e);
 int editor_journal_metadata(editor *e);
 /* Journal an applied action without waiting for a frame or durability credit. */
 int editor_journal_changed(editor *e);

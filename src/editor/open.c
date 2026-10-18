@@ -18,6 +18,8 @@ void editor_close(editor *e)
     editor_find_close(e);
     if (e->journal && !e->recovering) (void)editor_flush_settle(e); /* edit-ivv: bounded BUSY retry */
     editor_session_close(e);
+    /* edit-9ev6: running BASE copies borrow the journal's IO and pool. */
+    editor_retain_quiesce(e);
     if (e->journal) {
         /* A failed startup can close before any BASE/metadata was admitted.
          * Such a placeholder carries no recovery state. Nonempty sources,

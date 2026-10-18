@@ -98,3 +98,14 @@ void editor_retain_stop(editor_buffer *b)
                !(b->retain_used && editor_base_id_matches(&b->retain_of, &b->base))) drop_copy(NULL, b);
     b->retain_state = EDITOR_RETAIN_IDLE;
 }
+/* edit-9ev6 (recovery-3 F2): a running copy borrows the journal's IO
+ * callbacks (journal_retain.io = &j->io) and runs on the journal pool, so
+ * editor_close quiesces every buffer's retention before the journal or its
+ * pool goes. journal_flush does not join it: it returns at once when the
+ * journal prefix is already durable. Same policy as buffer teardown. */
+void editor_retain_quiesce(editor *e)
+{
+    for (size_t i = 0; e->buffers && i < e->buffer_capacity; i++)
+        if (e->buffers[i]) editor_retain_stop(e->buffers[i]);
+    if (e->empty) editor_retain_stop(e->empty);
+}
