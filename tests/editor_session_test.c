@@ -568,6 +568,7 @@ static int unavailable_target_parent(void)
     T(f.e->buffer->save_error && !f.e->error && editor_tab(f.e, 1)->modified);
     close_fixture(&f); return 0;
 }
+static void fm4_remove_tree(const char *root);
 static int existing_journal(void)
 {
     char root[] = "build/editor-existing-XXXXXX"; T(mkdtemp(root));
@@ -593,7 +594,10 @@ static int existing_journal(void)
     T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0); T(disk_is(source, "xbase") == 0);
     editor_close(e); unlink(source); unlink(log);
     char lock[IPC_PATH_CAP]; T(snprintf(lock, sizeof lock, "%s/.journal.lock", root) > 0); unlink(lock);
-    T(rmdir(root) == 0); return 0;
+    /* The simulated crash child may leave an edit-fi2 retained copy
+     * (.sublimite-base-*) that only startup housekeeping sweeps: remove the
+     * whole fixture tree instead of a bare rmdir (coordinator, 2026-10-18). */
+    fm4_remove_tree(root); T(access(root, F_OK) != 0); return 0;
 }
 /* edit-djg (P): keep explicit-path recovery strict because its source is the
  * live destination. Fixture bytes derive from the base and typed marker;
@@ -1315,6 +1319,114 @@ static int e601_drive(editor *e)
         T(rc == 0); T(trace_now_ns() < limit); sched_yield();
     }
     return settle(e);
+}
+/* edit-4jhi (P): the smallest BASE above the existing eager cost bound is
+ * JOURNAL_STARTUP_SCAN_BYTES + one byte. BASE and TARGET are distinct sparse
+ * inodes with identical or rewritten TARGET bytes, in the edit-fi2 shape.
+ * The sole buffer id is one; zero is success/the insertion offset/first tab;
+ * owner-only modes are the POSIX permission bits. No new wait or size bound. */
+static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritten, uint64_t threshold)
+{
+    char dir[IPC_PATH_CAP], retained[IPC_PATH_CAP], target[IPC_PATH_CAP], orphan[IPC_PATH_CAP];
+    T(snprintf(dir, sizeof dir, "%s/sublimite", root) > 0);
+    T(mkdir(dir, 0700) == 0);
+    T(snprintf(retained, sizeof retained, "%s/.sublimite-base-retained", dir) > 0);
+    T(snprintf(target, sizeof target, "%s/target", root) > 0);
+    const uint64_t size = JOURNAL_STARTUP_SCAN_BYTES + 1u;
+    const char marker[] = "base\n", edit[] = "x", changed[] = "disk\n";
+    /* (P) COPY also deletes the last zero byte after inserting edit, keeping
+     * the length unchanged. COPY adoption's pre-existing index-size mismatch
+     * on length-changing replay is outside F6 (reported in this bead). */
+    bool copy = threshold == UINT64_MAX;
+    uint64_t expected_size = size + (copy ? 0u : strlen(edit));
+    const char *paths[] = {retained, target};
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        int fd = open(paths[i], O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+        int rc = ftruncate(fd, (off_t)size);
+        const char *bytes = rewritten && i ? changed : marker;
+        if (!rc && pwrite(fd, bytes, strlen(bytes), 0) != (ssize_t)strlen(bytes)) rc = -1;
+        T(close(fd) == 0); T(rc == 0);
+    }
+    journal_base base, disk;
+    T(journal_capture_base(retained, &base) == 0);
+    T(journal_capture_base(target, &disk) == 0);
+    T(base.inode != disk.inode);
+    int lease = -1;
+    T(journal_session_create(dir, orphan, sizeof orphan, &lease) == 0);
+    work_pool pool;
+    T(work_pool_init(&pool, 1, 0) == 0); /* (P) sole journal worker; no reserved jobs */
+    journal *j = NULL;
+    int rc = journal_open(&j, orphan, &pool, NULL);
+    if (!rc) rc = journal_set_base(j, 1, &base);
+    if (!rc) rc = journal_append(j, JOURNAL_TARGET, 1, (const uint8_t *)target, strlen(target) + 1u);
+    if (!rc) rc = journal_insert(j, 1, 0, (const uint8_t *)edit, strlen(edit));
+    if (!rc && copy) rc = journal_delete(j, 1, size, strlen(edit));
+    if (j) { if (!rc) rc = journal_flush(j); journal_close(j); }
+    work_pool_shutdown(&pool);
+    (void)journal_session_release(orphan, lease); close(lease);
+    T(rc == 0);
+    /* (P) retained BASE + distinct TARGET charges the whole BASE at startup,
+     * independently of the configured acquisition threshold. */
+    T(qct_start_threshold(dir, launch, threshold) == 0);
+    editor *e = launch->e;
+    T(e->recovery_deferred == 1 && tabs_count(&e->tabs) == 0 && tabs_closed_count(&e->tabs) == 1);
+    T(editor_reopen_tab(e) == 0);
+    T(e601_drive(e) == 0);
+    uint8_t prefix[sizeof edit - 1u + sizeof marker - 1u] = {0};
+    int read_rc = piece_read(e->tree, 0, prefix, sizeof prefix);
+    bool text = piece_len(e->tree) == expected_size && read_rc == 0 &&
+        !memcmp(prefix, "xbase\n", sizeof prefix);
+    bool dirty = editor_tab(e, 0) && editor_tab(e, 0)->modified;
+    bool aside = *e->recovery_aside != 0;
+    bool bound = !strcmp(e->buffer->path, target) && !strcmp(e->buffer->save_path, target);
+    const file_id *destination = e->buffer->save ? savectl_target_identity(e->buffer->save) : NULL;
+    bound = bound && destination && destination->dev == disk.device && destination->ino == disk.inode &&
+        destination->mtime_ns == disk.mtime_ns && destination->ctime_ns == disk.ctime_ns;
+    bool original = editor_base_id_matches(&e->buffer->origin, &base) &&
+        e->buffer->base.inode == base.inode && !strcmp(e->buffer->base.path, retained);
+    printf("edit-4jhi: deferred retained BASE reopen text=%s modified=%s set-aside=%s target=%s\n",
+        text ? "yes" : "no", dirty ? "yes" : "no", aside ? "yes" : "no", bound ? "yes" : "no");
+    if (!text || !bound) printf("edit-4jhi: len=%llu expected=%llu prefix=%.*s path=%s save_path=%s notice=%s\n",
+        (unsigned long long)piece_len(e->tree), (unsigned long long)expected_size, (int)sizeof prefix, prefix,
+        e->buffer->path, e->buffer->save_path, e->recovery_notice ? e->recovery_notice : "none");
+    fflush(stdout);
+    T(text && dirty && !aside && bound && original);
+    T(access(orphan, F_OK) < 0);
+    T(e601_consistent(launch->journal) == 0);
+    T(journal_check_base(&base) == 0 && journal_check_base(&disk) == 0);
+    /* The replacement checkpoint still references BASE, with TARGET bound
+     * separately. A hot exit must recover the insertion exactly once. */
+    qct_stop(launch);
+    T(qct_start_threshold(dir, launch, threshold) == 0);
+    e = launch->e;
+    T(e->recovery_deferred == 1 && tabs_closed_count(&e->tabs) == 1);
+    T(editor_reopen_tab(e) == 0 && e601_drive(e) == 0);
+    T(piece_len(e->tree) == expected_size && piece_read(e->tree, 0, prefix, sizeof prefix) == 0);
+    T(!memcmp(prefix, "xbase\n", sizeof prefix) && editor_tab(e, 0)->modified && !*e->recovery_aside);
+    T(!strcmp(e->buffer->path, target) && !strcmp(e->buffer->save_path, target));
+    printf("edit-4jhi: target=%s acquisition=%s checkpoint relaunch preserved BASE edits and TARGET\n",
+        rewritten ? "rewritten" : "unchanged", threshold == UINT64_MAX ? "COPY" : "MMAP");
+    e601_discard(launch);
+    return 0;
+}
+static int retained_lazy_case(bool rewritten, uint64_t threshold)
+{
+    char made[] = "build/editor-4jhi-XXXXXX", root[IPC_PATH_CAP];
+    T(mkdtemp(made));
+    if (!realpath(made, root)) { fm4_remove_tree(made); T(false); }
+    qct_launch launch = {.lease = -1}; /* (P) no descriptor before launch */
+    int rc = retained_lazy_body(root, &launch, rewritten, threshold);
+    if (launch.e) e601_discard(&launch);
+    fm4_remove_tree(root); /* sparse fixtures removed on every body exit */
+    return rc;
+}
+static int retained_lazy(void)
+{
+    /* (P) one maps every nonempty file; UINT64_MAX copies every file size.
+     * Exercise both acquisitions and a TARGET whose bytes differ from BASE. */
+    T(retained_lazy_case(false, 1) == 0);
+    T(retained_lazy_case(true, UINT64_MAX) == 0);
+    return 0;
 }
 static bool e601_same(const char *path, const struct stat *before)
 {
@@ -2069,7 +2181,9 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
     T(ivv_all() == 0);
+    T(retained_lazy() == 0);
     T(leased_install_failure(false, false) == 0);
     T(leased_install_failure(true, false) == 0);
     T(leased_install_failure(true, true) == 0);

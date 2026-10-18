@@ -334,10 +334,9 @@ int editor_save_setup(editor *e, editor_buffer *b)
 {
     if (b->save || !*b->path || b->pending_open || e->recovering) return 0;
     char path[IPC_PATH_CAP]; file_id baseline = {0}; file_source *source = NULL;
-    if (b->file) {
+    if (b->file && !b->target_rebound) {
         strcpy(path, file_path(b->file));
         baseline = *file_prefix_identity(b->file);
-        if (file_open_mode(b->file) == FILE_MODE_MMAP && file_source_acquire(b->file, &source)) return EDITOR_ERR_IO;
     } else {
         char parent[IPC_PATH_CAP]; strcpy(parent, b->path);
         char *slash = strrchr(parent, '/'); const char *name = slash ? slash + 1 : b->path;
@@ -350,11 +349,16 @@ int editor_save_setup(editor *e, editor_buffer *b)
         if (n < 0 || (size_t)n >= sizeof path) return EDITOR_ERR_ARG;
         int rc = file_id_stat_path(path, &baseline); if (rc) return EDITOR_ERR_IO;
     }
+    if (b->file && file_open_mode(b->file) == FILE_MODE_MMAP && file_source_acquire(b->file, &source)) return EDITOR_ERR_IO;
     strcpy(b->save_path, path);
     savectl_options options = {.pool = &e->pool, .path = path, .baseline = baseline,
         .source_mode = FILE_MODE_COPY, .source = source, .journal = e->journal,
         .journal_pool = &e->journal_pool, .buffer_id = b->id};
     int rc = savectl_create(&b->save, &options, b->saved_lost || b->history_cursor != b->saved_cursor);
+    /* edit-4jhi: a retained BASE authorises source reads, not writes to a
+     * distinct TARGET. savectl_create adopts its source's identity, so bind
+     * the independently captured destination before any request can run. */
+    if (!rc && b->target_rebound) rc = savectl_rebase_target(b->save, &baseline);
     file_source_release(source); return rc ? EDITOR_ERR_IO : 0;
 }
 bool editor_save_leased(const editor *e)

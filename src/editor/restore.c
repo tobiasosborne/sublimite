@@ -453,8 +453,12 @@ static int prepare_all(editor *e, editor_buffer *p)
     for (size_t i = 0; i < r->count; i++) {
         editor_restore_buffer *b = r->buffers[i];
         const char *path = *b->target ? b->target : NULL;
+        /* edit-4jhi: the program's offsets name BASE, including a retained
+         * generation with a different inode from TARGET. Acquire that
+         * generation; bind the destination separately after replay. */
+        if (b->named) path = b->base_path;
         e->restore_prepare = b->conflict ? NULL : b;
-        int rc = editor_buffer_prepare(e, b->conflict && b->named ? b->base_path : path, NULL, 0, &b->replacement);
+        int rc = editor_buffer_prepare(e, path, NULL, 0, &b->replacement);
         e->restore_prepare = NULL;
         if (rc) return restore_fail(e, p, rc);
         if (b->replacement->pending_open) b->replacement->restore_apply = b->conflict ? NULL : b;
@@ -531,11 +535,22 @@ static int install_all(editor *e, editor_buffer *p)
     size_t index = live_index(e, p->id);
     if (index == SIZE_MAX || editor_activation_busy(e) || e->op_count || editor_save_active(e)) return 0;
     for (size_t i = 0; i < r->count; i++) {
-        editor_buffer *b = r->buffers[i]->replacement;
+        editor_restore_buffer *rb = r->buffers[i];
+        editor_buffer *b = rb->replacement;
         if (b->pending_open) {
+            /* Adoption must not create a save controller for the retained
+             * pathname before TARGET and the installed buffer id are bound. */
+            e->recovering = true;
             int rc = editor_adopt_open(e, b);
+            e->recovering = false;
             if (rc || b->operation_error) return restore_fail(e, p, rc ? rc : EDITOR_ERR_IO);
             if (b->pending_open) return 0;
+        }
+        if (!rb->conflict && rb->named && *rb->target && strcmp(rb->target, rb->base_path)) {
+            /* Keep ORIGINAL and the checkpoint BASE bound to the acquired
+             * retained bytes. TARGET is only the save destination, as with
+             * Save As's independent source and target bindings. */
+            strcpy(b->path, rb->target); b->target_rebound = true;
         }
     }
     /* Other tabs may have opened while the originals attached. */
@@ -618,6 +633,10 @@ static int install_all(editor *e, editor_buffer *p)
         editor_buffer *b = e->buffers[i];
         if (!b || b->retired || b->save || !*b->path) continue;
         int save_rc = editor_save_setup(e, b);
+        /* The retained file already registered the shared watch-service fd
+         * with this editor; also watch the independently bound destination. */
+        if (!save_rc && b->target_rebound && file_watch_path_start(&b->target_watch, b->save_path) < 0)
+            save_rc = EDITOR_ERR_IO;
         if (save_rc) { b->save_error = b->operation_error = save_rc; b->save_errno = errno; }
     }
     (void)editor_journal_changed(e); /* session tree and metadata, suppressed above */
