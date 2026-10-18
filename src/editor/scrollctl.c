@@ -308,6 +308,20 @@ int editor_scroll_slice(editor *e)
      * relabel the top early and submit an exact-numbered, dim-gutter frame
      * in between; count.exact flipping below triggers the relabel. */
     bool labels_held = b->lg.lazy && !b->lg.lines_exact;
+    if (!b->scroll_pending && b->scroll.request == SCROLL_READY && !b->scroll.approximate &&
+        !b->scroll_display_stale && b->scroll.extent.bytes == piece_len(e->tree)) {
+        /* A completed follow/place certified the current top independently
+         * of the retiring worker's windows. Prefix publication cannot change
+         * that exact byte/label pair. Refresh metadata without requesting a
+         * replacement unless the pure EOF policy actually moves the top. */
+        scroll_state ready = b->scroll;
+        int rc = scroll_set_extent(&ready, extent(b, piece_len(e->tree)));
+        if (rc) return rc;
+        if (ready.request == SCROLL_READY) {
+            b->scroll = b->scroll_display = ready;
+            b->scroll_prefix = prefix;
+        }
+    }
     if (!b->scroll_pending && (b->scroll_prefix == prefix || labels_held) && b->scroll.extent.exact == count.exact && b->scroll.extent.bytes == piece_len(e->tree)) {
         /* Keep the source lease until physical retirement, but do not ask a
          * typing frame to wait for replacement windows it does not need. */

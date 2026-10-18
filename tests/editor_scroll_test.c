@@ -51,13 +51,28 @@ static int settle(editor *e)
  *  - bound exhausted otherwise: a timeout of a non-blocking retry count, so
  *    load-dependent. Law 1: a tracked line (elapsed, load1, BAT0), returns 0
  *    with *timed_out set; the caller still checks allocations, then ends the
- *    case, since the later checks need the frame it never reached. */
-static int held_key(editor *e, const char *name, uint64_t baseline, size_t *allocations, bool *timed_out)
+ *    case, since the later checks need the frame it never reached.
+ * edit-63p's deterministic prefix-growth variant also requires the first
+ * turn after dispatch to submit; cancellation never skips on a timeout. */
+static int held_key(editor *e, const char *name, uint64_t baseline, bool grow_prefix, size_t *allocations, bool *timed_out)
 {
     plat_event event = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8_len = 1, .utf8 = {'x'}};
     uint64_t start = trace_now_ns();
     edit_malloc_guard_begin();
-    int rc = editor_inject(e, &event);
+    /* edit-63p (P): dispatch the key, then publish its edited chunk before
+     * the next scroll/submit turn. This forces seek -> prefix growth ->
+     * submit without depending on worker or UI scheduling. */
+    int rc = grow_prefix ? editor_handle_key(e, &event) : editor_inject(e, &event);
+    if (!rc && grow_prefix) {
+        rc = editor_scroll_slice(e);
+        if (!rc && !e->buffer->scroll_resident.closing) rc = EDITOR_ERR_HISTORY;
+    }
+    if (!rc && grow_prefix) {
+        lineidx_src source = editor_source(e->buffer);
+        (void)lineidx_refresh(e->buffer->index, &source);
+        if (lineidx_built_prefix(e->buffer->index) <= e->buffer->scroll_prefix)
+            rc = EDITOR_ERR_HISTORY;
+    }
     unsigned i = 0;
     for (; !rc && i < PROBE_RETRIES; i++) {
         rc = editor_step(e, 0);
@@ -66,6 +81,11 @@ static int held_key(editor *e, const char *name, uint64_t baseline, size_t *allo
     }
     *allocations = edit_malloc_guard_end();
     *timed_out = false;
+    if (!rc && grow_prefix && i < PROBE_RETRIES) {
+        /* (P) i is zero on the first turn after key dispatch. */
+        printf("editor_scroll_test: edit-63p prefix-growth key submitted turns=%u\n", i + 1u);
+        if (i != 0) return EDITOR_MORE;
+    }
     if (rc || i < PROBE_RETRIES) return rc;
     char power[32] = "unknown", load1[32] = "unknown";
     FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
@@ -130,7 +150,7 @@ static int eof_typing(void)
     while (!atomic_load(&hold.entered)) sched_yield();
     uint64_t baseline = backend.stats.submitted_frames;
     size_t allocations = 0; bool timed_out = false;
-    int rc = held_key(e, "eof-typing", baseline, &allocations, &timed_out);
+    int rc = held_key(e, "eof-typing", baseline, false, &allocations, &timed_out);
     CHECK(rc == 0 && (!edit_malloc_guard_active() || allocations == 0));
     if (timed_out) goto done;
     CHECK(editor_length(e) == 1 && editor_view(e).selection.cursor == 1);
@@ -161,13 +181,24 @@ static int cancellation(void)
     CHECK(atomic_load(&hold.entered) && editor_get_stats(e).pending);
     CHECK(editor_view(e).first_byte == 0 && backend.stats.submitted_frames == submitted_frames);
     size_t allocations = 0; bool timed_out = false;
-    int rc = held_key(e, "cancellation", submitted_frames, &allocations, &timed_out);
+    int rc = held_key(e, "cancellation", submitted_frames, true, &allocations, &timed_out);
     CHECK(rc == 0 && (!edit_malloc_guard_active() || allocations == 0));
-    if (timed_out) goto done;
+    CHECK(!timed_out);
     CHECK(b->scroll_snapshot == hold.snap && b->scroll_resident.closing);
     uint8_t live = 0, old = 0;
     CHECK(editor_read(e, 0, &live, 1) == 0 && live == 'x');
     CHECK(piece_snapshot_read(hold.snap, 0, &old, 1) == 0 && old == 'a');
+    /* (P) The key prefixes the fixture's first 'a'; capture every prepared
+     * text cell using the existing viewport capacity for the retire replay. */
+    CHECK(e->text_grid.cells[e->lay.gw].glyph_index == 'x');
+    CHECK(e->text_grid.cells[e->lay.gw + 1u].glyph_index == 'a');
+    render_cell cells[PROBE_COLS * PROBE_ROWS];
+    size_t cell_bytes = (size_t)e->text_grid.dims.cols * e->text_grid.dims.rows * sizeof(render_cell);
+    memcpy(cells, e->text_grid.cells, cell_bytes);
+    submitted_frames = backend.stats.submitted_frames;
+    CHECK(editor_full_layout(e) == 0 && editor_step(e, 0) >= 0);
+    CHECK(backend.stats.submitted_frames > submitted_frames && b->scroll_resident.closing);
+    CHECK(memcmp(cells, e->text_grid.cells, cell_bytes) == 0);
     atomic_store(&hold.release, true);
     for (unsigned retry = 0; retry < PROBE_RETRIES && b->scroll_snapshot == hold.snap && b->scroll_revision != b->revision; retry++) {
         CHECK(editor_step(e, 0) >= 0); sched_yield();
@@ -176,6 +207,8 @@ static int cancellation(void)
      * revision/bridge lease, rather than pointer inequality, proves renewal. */
     CHECK(b->scroll_snapshot != hold.snap || (b->scroll_revision == b->revision && !b->scroll_resident.closing));
     CHECK(editor_view(e).first_byte == 0 && editor_view(e).selection.cursor == 1);
+    CHECK(editor_full_layout(e) == 0 && settle(e) == 0);
+    CHECK(render_grid_validate(editor_grid(e)) == 0 && memcmp(cells, e->text_grid.cells, cell_bytes) == 0);
     printf("editor_scroll_test: held worker cancellation retains snapshot, typing submits, allocations=%zu guard=%s PASS\n",
         allocations, edit_malloc_guard_active() ? "active" : "sanitizer-inert");
 done:
