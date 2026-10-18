@@ -118,7 +118,7 @@ int editor_session_init(editor *e)
 static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_state state)
 {
     editor_session *s = e->session;
-    if (!s || !b->id || b->pending_open || b->placeholder || b->derived || e->recovering || /* edit-qct; edit-n95 */
+    if (!s || !b->id || !editor_tab_recorded(b) || e->recovering || /* edit-qct; edit-n95; edit-uzrb */
         (b == e->buffer && (e->action == EDITOR_ACTION_REPLAY_WORK ||
          e->action == EDITOR_ACTION_CLIP || e->find_replace_active || e->journal_group_open))) return;
     pthread_mutex_lock(&s->mutex);
@@ -149,6 +149,10 @@ void editor_session_publish(editor *e, editor_buffer *b)
 {
     if (!e->session || !b->id || b->retired) return;
     session_node *old = leaf_at(e->session, b->session_slot);
+    /* edit-uzrb: adoption introduces a leaf into the compact live order.
+     * Refresh the other ranks too, including when this newly ready tab is
+     * inactive. */
+    if (!old && editor_tab_recorded(b)) { editor_session_metadata(e); return; }
     publish(e, b, old ? old->live : true, old ? old->rank : editor_recorded_rank(e, tabs_active_index(&e->tabs)), /* edit-3f2k */
             b == e->buffer ? e->v.state : b->initial);
 }
@@ -178,12 +182,12 @@ void editor_session_metadata(editor *e)
     for (size_t closed = 0; closed < 2; closed++) {
         size_t count = closed ? tabs_closed_count(&e->tabs) : tabs_count(&e->tabs);
         /* edit-3f2k: a live leaf's rank is its TABS position, which skips the
-         * unpublished placeholder and derived tabs (recorded_tabs). */
+         * unpublished placeholder, derived and (edit-uzrb) pending-open tabs. */
         for (size_t i = 0, rank = 0; i < count; i++) {
             const tabs_tab *tab = closed ? tabs_closed_at(&e->tabs, i) : tabs_at(&e->tabs, i);
             editor_buffer *b = (editor_buffer *)((uint8_t *)tab->undo - offsetof(editor_buffer, undo));
             publish(e, b, !closed, closed ? i : rank, b == e->buffer ? e->v.state : tab->state);
-            if (!b->placeholder && !b->derived) rank++;
+            if (editor_tab_recorded(b)) rank++;
         }
     }
     /* The saving buffer keeps its leaf after eviction until its token retires
@@ -427,7 +431,7 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
     }
     if (b->source_stale) return 0;
     session_node *leaf = leaf_at(s, b->session_slot);
-    if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != editor_recorded_rank(e, tabs_count(&e->tabs))) { /* edit-3f2k */
+    if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != editor_recorded_rank(e, tabs_count(&e->tabs))) { /* edit-3f2k, edit-uzrb */
         b->save_error = b->operation_error = FILE_ERR_NOMEM; return 0;
     }
     capture(e, b, request_ns ? request_ns : trace_now_ns(), false);

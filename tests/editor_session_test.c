@@ -2171,6 +2171,69 @@ static int ivv_all(void)
     return failed;
 }
 /* edit-ivv end */
+/* edit-uzrb (P): FM4_GIB is the brief's sparse GiB fixture. The COPY
+ * threshold is its size plus one byte, keeping full acquisition behind the
+ * held bulk lane while the raster lane supplies the preview. Tab indices
+ * zero/one follow the small/large pair; reverse them to cover a rank gap.
+ * Geometry is the existing fixture's status width and tab/text/status rows.
+ * Zero/one also mean API success, Boolean state and string terminators;
+ * 0600 is POSIX owner read/write. (E) deadline() reuses EDITOR_IDLE_NS. */
+static int pending_open_save(bool pending_first)
+{
+    fixture f = {0}; held_bulk bulk = {0};
+    char large[IPC_PATH_CAP] = {0}; int fd = -1, result = 0;
+#define C(x) do { if (!(x)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    strcpy(f.directory, "build/editor-uzrb-XXXXXX"); C(mkdtemp(f.directory));
+    C(snprintf(f.path, sizeof f.path, "%s/source", f.directory) > 0);
+    C(snprintf(f.log, sizeof f.log, "%s/journal", f.directory) > 0);
+    C(snprintf(large, sizeof large, "%s/large", f.directory) > 0);
+    fd = open(f.path, O_WRONLY | O_CREAT | O_EXCL, 0600); C(fd >= 0);
+    C(write(fd, "base", strlen("base")) == (ssize_t)strlen("base"));
+    C(close(fd) == 0); fd = -1;
+    fd = open(large, O_WRONLY | O_CREAT | O_EXCL, 0600); C(fd >= 0);
+    C(ftruncate(fd, (off_t)FM4_GIB) == 0); C(close(fd) == 0); fd = -1;
+    C(render_null_backend(&f.backend) == 0);
+    f.backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+    editor_config config = {.path = f.path, .journal_path = f.log,
+        .copy_threshold = FM4_GIB + 1u,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3};
+    C(editor_open(&f.e, &config, &f.backend) == 0); C(settle(f.e) == 0);
+    C(press(f.e, 'x', 0, "x") == 0);
+    editor_buffer *small = f.e->buffer;
+    work_handle handle = work_submit(&f.e->pool, (work_job){hold_bulk, &bulk, 0, WORK_BULK}); C(handle.epoch);
+    uint64_t limit = deadline();
+    while (!atomic_load(&bulk.entered)) { C(trace_now_ns() < limit); sched_yield(); }
+    uint64_t id; C(editor_add_buffer(f.e, large, NULL, 0, &id) == 0);
+    editor_buffer *pending = f.e->buffer;
+    C(pending->pending_open && !file_open_ready(pending->file));
+    if (pending_first) { C(tabs_reorder(&f.e->tabs, 1, 0) == 0); editor_session_metadata(f.e); }
+    size_t small_index = pending_first ? 1u : 0u;
+    C(editor_select_tab(f.e, small_index) == 0); C(settle(f.e) == 0);
+    C(f.e->buffer == small && editor_tab(f.e, small_index)->modified && pending->pending_open);
+    edit_malloc_guard_begin();
+    int pressed = press(f.e, 's', PLAT_MOD_CTRL, NULL);
+    size_t allocations = edit_malloc_guard_end();
+    C(pressed == 0); if (edit_malloc_guard_active()) C(!allocations);
+    fprintf(stderr, "edit-uzrb: pending %s small tab: pending=%s save_active=%s save_error=%d\n",
+        pending_first ? "before" : "after", pending->pending_open ? "yes" : "no",
+        editor_save_active(f.e) ? "yes" : "no", small->save_error);
+    C(pending->pending_open && editor_save_active(f.e) && !small->save_error && !small->operation_error);
+    atomic_store(&bulk.release, true);
+    C(saved(f.e) == 0); C(disk_is(f.path, "xbase") == 0);
+    C(!editor_tab(f.e, small_index)->modified && !small->save_error && !small->operation_error);
+    C(!pending->pending_open);
+    C(press(f.e, 'y', 0, "y") == 0); C(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0);
+    C(saved(f.e) == 0); C(disk_is(f.path, "xybase") == 0);
+    C(!editor_tab(f.e, small_index)->modified && !small->save_error && !small->operation_error);
+done:
+    atomic_store(&bulk.release, true);
+    if (fd >= 0) close(fd);
+    if (f.e) editor_close(f.e);
+    fm4_remove_tree(f.directory); /* sparse source and journal on every exit */
+#undef C
+    if (!result) puts("edit-uzrb: Ctrl+S admitted during pending open; saved bytes and clean tab verified");
+    return result;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -2182,6 +2245,9 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-uzrb"))
+        return pending_open_save(false) || pending_open_save(true);
+    T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(ivv_all() == 0);
     T(retained_lazy() == 0);
     T(leased_install_failure(false, false) == 0);

@@ -290,7 +290,7 @@ size_t editor_recorded_rank(const editor *e, size_t index)
     for (size_t i = 0; i < index && i < tabs_count(&e->tabs); i++) {
         const tabs_tab *tab = tabs_at(&e->tabs, i);
         const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
-        if (!b->placeholder && !b->derived) rank++;
+        if (editor_tab_recorded(b)) rank++; /* edit-uzrb: also skips pending_open */
     }
     return rank;
 }
