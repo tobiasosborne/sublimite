@@ -294,6 +294,13 @@ static int recoverable_save_retry(bool other_tab, bool after_rename)
  * closed history of capacity 1 (the smallest nonzero retention, so exactly one
  * further close evicts), the session metadata forgets its leaf, and save
  * completion must still finish with the bytes captured at Ctrl+S. */
+/* edit-qcuh: a retired buffer is now physically released once its save
+ * resolves, so tests look it up by id instead of dereferencing a stale owner. */
+static editor_buffer *buffer_by_id(editor *e, uint64_t id)
+{
+    for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i] && e->buffers[i]->id == id) return e->buffers[i];
+    return NULL;
+}
 static int evicted_saving_tab(void)
 {
     fixture f = {0};
@@ -318,11 +325,70 @@ static int evicted_saving_tab(void)
     T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id == owner->id);
     T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
     T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id != owner->id);
-    T(owner->retired);
+    T(owner->retired); uint64_t owner_id = owner->id;
     atomic_store(&held.release, true); T(saved(f.e) == 0);
     T(disk_is(f.path, "xbase") == 0);
-    T(!owner->save_error && !f.e->error && !f.e->stats.journal_error);
+    /* The resolved save no longer pins the evicted buffer: it is released. */
+    T(!buffer_by_id(f.e, owner_id) && !f.e->error && !f.e->stats.journal_error);
     T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
+    close_fixture(&f); return 0;
+}
+/* edit-qcuh (recovery-3 F3): open and close distinct named files well past
+ * closed-stack eviction. Every evicted buffer must give back its slot and
+ * its file's descriptors, watch and backing; before the fix a retired named
+ * buffer was never destroyed and add_buffer ran out of slots after
+ * live + closed opens. (P) capacities: one live tab beyond the launch tab and
+ * one retained closed tab, so slots = 2 + 1; the round count is four times
+ * that slot count, enough to pass exhaustion several times over. copy == true
+ * keeps the default COPY acquisition; false forces MMAP with threshold 1
+ * byte (P: the 4-byte fixtures are >= 1). */
+static size_t open_descriptors(void)
+{
+    DIR *descriptors = opendir("/proc/self/fd"); if (!descriptors) return SIZE_MAX;
+    size_t count = 0; struct dirent *entry;
+    while ((entry = readdir(descriptors))) if (entry->d_name[0] != '.') count++;
+    (void)closedir(descriptors); return count;
+}
+static size_t used_slots(editor *e)
+{
+    size_t used = 0;
+    for (size_t i = 0; i < e->buffer_capacity; i++) used += e->buffers[i] != NULL;
+    return used;
+}
+static int retired_named_release(bool copy)
+{
+    fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    editor_close(f.e); f.e = NULL;
+    editor_config config = {.path = f.path, .journal_path = f.log, .tab_capacity = 2, .closed_capacity = 1,
+        .copy_threshold = copy ? 0 : 1,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = 3}; /* tab + text + status */
+    (void)unlink(f.log); T(render_null_backend(&f.backend) == 0);
+    T(editor_open(&f.e, &config, &f.backend) == 0); T(settle(f.e) == 0);
+    const size_t rounds = 4 * f.e->buffer_capacity;
+    size_t baseline = SIZE_MAX;
+    for (size_t round = 0; round < rounds; round++) {
+        char path[IPC_PATH_CAP];
+        T(snprintf(path, sizeof path, "%s/file-%zu", f.directory, round) > 0);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+        T(write(fd, "base", strlen("base")) == (ssize_t)strlen("base")); close(fd);
+        uint64_t id; int rc = editor_add_buffer(f.e, path, NULL, 0, &id);
+        if (rc) fprintf(stderr, "editor_session_test: retired_named_release(%s) round %zu add rc %d slots %zu/%zu\n",
+                        copy ? "copy" : "mmap", round, rc, used_slots(f.e), f.e->buffer_capacity);
+        T(rc == 0); T(settle(f.e) == 0);
+        T(tabs_count(&f.e->tabs) == 2 && tabs_active(&f.e->tabs)->id == id);
+        T(editor_close_tab(f.e, 1) == 0); T(settle(f.e) == 0);
+        T(unlink(path) == 0);
+        /* The closed stack is full from round 1 on; round 2 is the first
+         * whose add can reuse a retired slot. Measure there. */
+        if (round == 2) baseline = open_descriptors();
+    }
+    /* Retirement releases at most one buffer per maintenance turn. */
+    for (size_t turn_count = 0; turn_count < f.e->buffer_capacity; turn_count++) editor_retire_buffers(f.e);
+    size_t now = open_descriptors();
+    fprintf(stderr, "editor_session_test: retired_named_release(%s) slots %zu (live %zu + closed %zu) fds %zu baseline %zu\n",
+            copy ? "copy" : "mmap", used_slots(f.e), tabs_count(&f.e->tabs), tabs_closed_count(&f.e->tabs), now, baseline);
+    T(used_slots(f.e) == tabs_count(&f.e->tabs) + tabs_closed_count(&f.e->tabs));
+    T(baseline != SIZE_MAX && now <= baseline);
     close_fixture(&f); return 0;
 }
 /* edit-5u2: as evicted_saving_tab, but a complete checkpoint (the one a
@@ -351,12 +417,13 @@ static int checkpoint_during_evicted_save(void)
     T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
     T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
     T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
-    T(owner->retired && tabs_closed_at(&f.e->tabs, 0)->id != owner->id);
+    T(owner->retired && tabs_closed_at(&f.e->tabs, 0)->id != owner->id); uint64_t owner_id = owner->id;
     T(journal_flush(f.e->journal) == 0); T(editor_checkpoint(f.e) == 0);
     atomic_store(&held.release, true); T(saved(f.e) == 0);
     T(disk_is(f.path, "xbase") == 0);
-    T(!owner->save_error && !f.e->error && !f.e->stats.journal_error);
-    T(!editor_save_active(f.e) && !savectl_get_model(owner->save).needs_finish);
+    /* Released only after its save resolved (no FINISH or cancel pending). */
+    T(!buffer_by_id(f.e, owner_id) && !f.e->error && !f.e->stats.journal_error);
+    T(!editor_save_active(f.e));
     T(press(f.e, 'y', 0, "y") == 0); T(editor_length(f.e) == strlen("y"));
     close_fixture(&f); return 0;
 }
@@ -1776,6 +1843,7 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     /* (P) executable plus focused-test option; zero is API success. */
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     T(leased_install_failure(false, false) == 0);
@@ -1796,6 +1864,7 @@ int main(int argc, char **argv)
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
     T(crash_after_evicted_checkpoint() == 0);
-    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, checkpoint during evicted save and crash after it, interrupted-save startup, GB-scale orphan launch, Saving acknowledgement, allocation guard passed");
+    T(retired_named_release(true) == 0); T(retired_named_release(false) == 0);
+    puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, retired named buffers release slots and fds, checkpoint during evicted save and crash after it, interrupted-save startup, GB-scale orphan launch, Saving acknowledgement, allocation guard passed");
     return 0;
 }

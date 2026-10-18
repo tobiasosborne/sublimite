@@ -890,6 +890,25 @@ static void wait_job(file *f, work_handle h, _Atomic int *fin)
     }
 }
 
+int file_close_ready(file *f)
+{
+    if (f == NULL) return 1;
+    if (!f->save_installed || f->commit_pending || f->abort_pending ||
+        !atomic_load_explicit(&f->save_fin, memory_order_acquire) ||
+        !atomic_load_explicit(&f->prepare_fin, memory_order_acquire) ||
+        !atomic_load_explicit(&f->abort_fin, memory_order_acquire)) return 0;
+    work_cancel(f->pool, f->prefix_h);
+    work_cancel(f->pool, f->open_h);
+    work_cancel(f->pool, f->check_h);
+    for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
+        if (f->jobs[i].epoch && !work_handle_finished(f->pool, f->jobs[i])) return 0;
+    /* Named handles may be older than jobs[] entries for a reused slot; a
+     * finished handle is what makes each wait_job in file_close immediate. */
+    return work_handle_finished(f->pool, f->prefix_h) && work_handle_finished(f->pool, f->open_h) &&
+           work_handle_finished(f->pool, f->check_h) && work_handle_finished(f->pool, f->prepare_h) &&
+           work_handle_finished(f->pool, f->save_h) && work_handle_finished(f->pool, f->abort_h);
+}
+
 void file_close(file *f)
 {
     if (f == NULL) return;

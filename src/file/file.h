@@ -202,6 +202,13 @@ int file_open_begin(work_pool *pool, const char *path, const file_open_opts *opt
  * cleanup, and releases resources. Snapshots and the
  * tree keep any mapping alive through the refcount hooks. */
 void file_close(file *f);
+/* edit-qcuh: nonblocking physical-retirement probe for an owner that calls
+ * file_close next (recovery-3 F3). While a save transaction is unresolved it
+ * returns 0 and changes nothing. Otherwise it logically cancels the
+ * remaining prefix/open/check jobs and returns 1 once every job this file
+ * submitted has physically finished, so the following file_close neither
+ * waits nor races a worker. UI thread only; idempotent. NULL is ready. */
+int file_close_ready(file *f);
 
 /* Borrowed bytes until close. A successful mmap file_attach retires the
  * acquisition copy: earlier pointers expire; subsequent queries borrow the

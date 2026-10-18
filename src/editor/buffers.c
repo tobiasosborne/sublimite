@@ -128,15 +128,17 @@ void editor_retire_buffers(editor *e)
         if (b->index) { lineidx_build_cancel(b->index); (void)lineidx_poll(b->index); }
         unpoll_source(e, b);
         if (editor_scroll_retire(b) == EDITOR_MORE) continue;
-        /* file_close has no public logical-retirement/physical-ready split.
-         * Retain its complete storage until explicit quiescent shutdown; never
-         * guess at the private open/save/check handles or wait in this pump. */
         /* edit-5u2: the in-flight save still owns this buffer's leaf and tree. */
         if (editor_session_retains(e, b, NULL) || editor_clip_holds(e, b) ||
             (b->save && savectl_get_model(b->save).can_recover_cancel) ||
-            b->find_leases || b->hl_leases || b->map_snapshot || b->file || !work_handle_finished(&e->pool, b->lg.warm_h) ||
+            b->find_leases || b->hl_leases || b->map_snapshot || !work_handle_finished(&e->pool, b->lg.warm_h) ||
             !work_handle_finished(&e->pool, b->lg.find_h) ||
             !work_handle_finished(&e->pool, b->lg.find_retiring_h) || (b->index && lineidx_building(b->index))) continue;
+        /* edit-qcuh (recovery-3 F3): the file's own jobs must have physically
+         * finished, so the file_close in editor_buffer_destroy never waits in
+         * this pump. Until then the buffer stays retired and is retried on a
+         * later maintenance turn. */
+        if (b->file && (e->opening == b->file || !file_close_ready(b->file))) continue;
         editor_session_forget(e, b);
         if (b->save) { savectl_close_begin(b->save); if (savectl_destroy(b->save) != SAVECTL_OK) continue; b->save = NULL; }
         editor_buffer_destroy(b); e->buffers[i] = NULL;
