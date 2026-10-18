@@ -1,3 +1,20 @@
+# HANDOFF — sublimité, end of session 17 (2026-10-18 ~15:40 box clock; Fable coordinator, Tobias present and using the editor; stopped on his instruction "wind up work, land it slowly, update handoff, commit and stop")
+
+## Read first (session 18)
+**Goal (Tobias 2026-10-18): as bug free as possible, then absolutely frictionless on this box, then daily use.** Installed: `make install` put main **f436eb3** at ~/.local/bin/sublimite (desktop entry, icon, MIME default; `sublimite file`, no environment variables; default profile clean). It includes today's thirty landings, among them the PDF crash fix (edit-2ghs: zero-sized glyph entries from a blank fallback glyph), the second-save-of-a-mapped-file fix (fkpk), Ctrl+S with Find Results open (3f2k), the command palette (Ctrl+Shift+P) and the menu bar (tap Alt). Law-1 gap: no Astra drive on the installed build (orchestration item 33); Tobias did not answer the drive-7 offer; his trial findings arrive as beads with repros (edit-2ghs was the first).
+
+**First actions:** (1) `quota` (at 15:35 Claude Weekly about 60 %, Codex about 20 %: read it); (2) full `make check` on main f436eb3 (not run today; touch sources first) on a quiet box; (3) land the three parked trees in this order, each with its recovery suites on :95 and a gated ff: **edit-uzrb** (wt/edit-uzrb-s8 39df4d9; semantic conflict with 3f2k in src/editor/session.c: keep one tab-mapping helper, editor_recorded_rank or recorded()/recorded_count), **edit-ze59** (wt/edit-ze59-s8 6a242be; F10 worker checkpoint publish; conflicts near publish/encode_all), **edit-dzk1** (wt/edit-dzk1-s8 aab1934; render-rule violations no longer end the loop + JOURNAL_PAINT crash-loop guard; format change: an older binary truncates a journal at a PAINT record, so write the decision note and reinstall in the same step); then reinstall and tell Tobias; (4) edit-nlz (Sonnet: test selector tables; every rebase conflict today was a selector ladder) once no lane touches test mains; (5) the P3 follow-ups filed today (ivv save_as BUSY, COPY length-changing lazy replay, Keep-path fkpk sibling, remaining ERR_MEMORY fail() paths, ze59 follow-ups), then the recovery-3 backlog edit-fi0p.
+
+**Landing protocol (items 32, 34):** `build/briefs/land8.sh <b>` commits the worker tree and aborts on a conflicted rebase; suites run with `DISPLAY=:95 EDIT_DISPLAY_LOCK_TIMEOUT=1800` under tools/with_display_lock.sh (Xvfb :95 2880x1800 100 dpi is the coordinator's); gate the ff on every suite (`ok` variable), never `;`. Known load flakes (edit-gfx): editor_large_test cases, x11_identity_test hard-codes :99. Root-level *.log is ignored. Landed worktree builds were pruned (73 GB free at 14:50).
+
+**Today's record:** docs/worklog/2026-10-18.md (per landing), docs/decisions/orchestration-2026-10-18.md items 28-37, docs/reviews/recovery-3.md (Codex deep review: state machine + F1-F12, triage item 35). Thirty landed: 1wc y5x dr9 4da 2ea 1t2 hw1 ev0 ptn 08u djg 601 5vz 63p chy ywd wv7 fi2 q0g yey 7i5 1vun bt1 qcuh ivv 2ghs 9ev6 fkpk 4jhi 3f2k. Open 50, in progress 3 (the parked trees).
+
+**Peers/box:** castle-game-95 shares the box (its game simulation lane drives load1 to 40-70 at times); told "codex end" at 15:35. Xvfb :95, :98, :99 up. Battery stamps today alternated Charging / Not charging: all [AC].
+
+Everything below is the earlier session-17 section, kept for the session's own state, then session 16.
+
+---
+
 # HANDOFF — sublimité, session 17 IN PROGRESS (2026-10-18 ~12:50 box clock; Fable coordinator, Tobias present and using the editor)
 
 ## Read first (session 17 continuation or session 18)
