@@ -2345,6 +2345,80 @@ static int ivv_all(void)
     return failed;
 }
 /* edit-ivv end */
+/* edit-xdro begin: a Reload/Keep choice that waits on a save in flight or on
+ * the edit-ivv journal tick is not runnable work, so the UI loop sleeps until
+ * the save's mailbox message or the tick deadline wakes it instead of polling
+ * with a zero timeout. (P) MORE means runnable work (editor.h); a deferred
+ * choice is none, so no MORE return is allowed while it waits; zero is the
+ * unset choice and the first tab. (E) the save is released
+ * JOURNAL_DEFAULT_SYNC_NS / 2 after it is held (edit-ivv's release point), the
+ * tick is JOURNAL_DEFAULT_SYNC_NS (edit-ivv), the step timeout and watchdog
+ * reuse EDITOR_IDLE_NS. The pended choice names the live buffer, which is not
+ * stale, so once it may run check_sources drops it without touching the file. */
+typedef struct xdro_release { held_save *held; uint64_t at; } xdro_release;
+static void *xdro_release_later(void *ctx)
+{
+    xdro_release *r = ctx;
+    uint64_t now = trace_now_ns();
+    if (now < r->at) {
+        uint64_t left = r->at - now;
+        struct timespec pause = {(time_t)(left / UINT64_C(1000000000)), (long)(left % UINT64_C(1000000000))};
+        (void)nanosleep(&pause, NULL);
+    }
+    atomic_store(&r->held->release, true); return NULL;
+}
+static void xdro_pend(editor *e)
+{ e->source_choice = 1u; e->source_choice_id = e->buffer->id; e->source_choice_generation = e->buffer->source_generation; }
+/* Steps until the choice has run; counts steps and MORE returns while the
+ * choice is still deferred (save active, or the tick not yet due). */
+static int xdro_wait(editor *e, unsigned long long *steps, unsigned long long *more)
+{
+    uint64_t limit = deadline();
+    while (e->source_choice) {
+        uint64_t now = trace_now_ns(); T(now < limit);
+        int rc = editor_step(e, (int)((limit - now) / UINT64_C(1000000)));
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); ++*steps;
+        if (rc == EDITOR_MORE && e->source_choice && (editor_save_active(e) || !editor_checkpoint_due(e))) ++*more;
+    }
+    return 0;
+}
+static int xdro_save(void)
+{
+    fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    T(press(f.e, 'x', 0, "x") == 0);
+    held_save held = {.phase = FILE_STEP_DIR_SYNCED};
+    T(savectl_set_step_hook(f.e->buffer->save, hold, &held) == 0);
+    T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
+    T(settle(f.e) == 0); T(editor_save_active(f.e));
+    xdro_pend(f.e);
+    xdro_release r = {&held, trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS / 2u};
+    pthread_t timer; T(pthread_create(&timer, NULL, xdro_release_later, &r) == 0);
+    unsigned long long steps = 0, more = 0; int rc = xdro_wait(f.e, &steps, &more);
+    atomic_store(&held.release, true); T(pthread_join(timer, NULL) == 0); T(rc == 0);
+    fprintf(stderr, "edit-xdro (a): choice waiting on a save in flight: steps=%llu more=%llu (M)[AC]\n", steps, more);
+    T(more == 0);
+    T(saved(f.e) == 0); T(disk_is(f.path, "xbase") == 0); T(!editor_tab(f.e, 0)->modified);
+    close_fixture(&f); return 0;
+}
+static int xdro_tick(void)
+{
+    fixture f = {0}; T(open_fixture(&f, true, false) == 0);
+    T(press(f.e, 'x', 0, "x") == 0);
+    f.e->busy_due_ns = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS; /* as a refused checkpoint leaves it */
+    xdro_pend(f.e);
+    unsigned long long steps = 0, more = 0; T(xdro_wait(f.e, &steps, &more) == 0);
+    fprintf(stderr, "edit-xdro (b): choice waiting on the journal tick: steps=%llu more=%llu (M)[AC]\n", steps, more);
+    T(more == 0); T(editor_checkpoint_due(f.e));
+    f.e->busy_due_ns = 0; /* (P) no refusal pending */
+    close_fixture(&f); return 0;
+}
+static int xdro_all(void)
+{
+    int failed = xdro_save(); failed |= xdro_tick();
+    if (!failed) puts("edit-xdro: a deferred Reload/Keep choice sleeps until the save completes or the journal tick fires");
+    return failed;
+}
+/* edit-xdro end */
 /* edit-uzrb (P): FM4_GIB is the brief's sparse GiB fixture. The COPY
  * threshold is its size plus one byte, keeping full acquisition behind the
  * held bulk lane while the raster lane supplies the preview. Tab indices
@@ -2565,6 +2639,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-xdro")) return xdro_all();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-3620")) return kept_target_unreadable();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ut0m")) { int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b; }
@@ -2579,6 +2654,7 @@ int main(int argc, char **argv)
         return retained_lazy_case(true, UINT64_MAX, false);
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(ivv_all() == 0);
+    T(xdro_all() == 0);
     T(retained_lazy() == 0);
     T(dzk1_crash_loop() == 0);
     T(leased_install_failure(false, false) == 0);

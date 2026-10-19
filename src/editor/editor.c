@@ -692,7 +692,10 @@ static bool runnable(const editor *e)
            (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
            (editor_font_pending(e) && !e->font.handle.epoch) ||
            (e->font.received && !e->backend->active) || editor_clip_runnable(e) ||
-           e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->source_choice ||
+           e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO ||
+           /* edit-xdro: a choice deferred by a save in flight or the edit-ivv
+            * tick is woken by the save's mailbox or wait_timeout's busy_due_ns. */
+           (e->source_choice && !editor_save_active(e) && editor_checkpoint_due(e)) ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) || editor_fif_runnable(e) ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty) ||
