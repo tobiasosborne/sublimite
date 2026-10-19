@@ -878,6 +878,7 @@ int editor_poll_sources(editor *e)
     if (raster_rc) return raster_rc;
     editor_retire_buffers(e);
     editor_save_tick(e);
+    editor_save_as_tick(e); /* edit-ze59 */
     int command_rc = editor_file_command_service(e); if (command_rc) return command_rc;
     file_watch_dispatch();
     for (size_t i = 0; i < e->buffer_capacity; i++) {

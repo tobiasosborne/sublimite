@@ -246,6 +246,7 @@ void editor_route_work(const work_msg *msg, void *ctx)
 {
     editor *e = ctx;
     if (msg->kind == JOURNAL_RETAIN_MESSAGE) return; /* edit-fi2: wake-up; retain.c polls the handle */
+    if (msg->kind == EDITOR_PUBLISH_MESSAGE) return; /* edit-ze59: wake-up; retain.c polls the job */
     if (editor_fif_receive(e, msg)) return; /* edit-n95: counts only; assembly is a UI service */
     if (editor_font_receive(e, msg)) return;
     if (editor_map_receive(e, msg)) return;
@@ -657,7 +658,8 @@ static bool runnable(const editor *e)
            e->action == EDITOR_ACTION_CLIP || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->source_choice ||
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) || editor_fif_runnable(e) ||
-           (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty);
+           (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty) ||
+           editor_save_as_runnable(e); /* edit-ze59 */
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
@@ -892,7 +894,9 @@ editor_stats editor_get_stats(const editor *e)
     s.source_stale = e->buffer->source_stale; s.open_pending = e->buffer->pending_open;
     s.pending = e->file_command != KEYS_ACTION_NONE || editor_pointer_scrolling(e) || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending || editor_fif_pending(e) ||
-        e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows;
+        e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows ||
+        e->publish || e->save_as || /* edit-ze59; an owed checkpoint waits for a healthy journal */
+        (e->publish_owed && !e->stats.journal_error && e->journal && !journal_get_stats(e->journal).error);
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;
 }
@@ -919,6 +923,9 @@ int editor_flush(editor *e)
     while (editor_save_active(e)) {
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
         if (e->journal_pool_ready && !editor_save_leased(e)) (void)work_mailbox_drain(&e->journal_pool, editor_route_work, e);
+        int published; /* edit-ze59: worker checkpoint and Save As write */
+        if (editor_publish_poll(e, &published)) editor_checkpoint_published(e, published);
+        editor_save_as_tick(e);
         editor_save_tick(e);
         if (!editor_save_leased(e)) editor_journal_staged(e);
         sched_yield();
@@ -940,7 +947,7 @@ int editor_flush(editor *e)
     int rc = metadata ? metadata : journal_flush(e->journal);
     e->journal_waiting = false;
     /* edit-ivv: an owed recovery checkpoint (busy_checkpoint) lands here too. */
-    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint)
-        return editor_checkpoint(e);
+    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint || e->publish_owed)
+        return editor_checkpoint(e); /* edit-ze59: an owed Save As checkpoint too */
     return rc;
 }

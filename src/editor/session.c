@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <sched.h>
+#include <stdatomic.h>
 
 typedef struct session_node {
     struct session_node *child[2], *next;
@@ -41,6 +42,10 @@ typedef struct session_capture {
     piece_snapshot *reference;
     editor_ref_map *maps;
     editor_records records;
+    /* edit-ze59: a plain complete checkpoint (no save; selected is NULL);
+     * used records per session slot whether the leaf named its retained copy. */
+    bool plain;
+    uint8_t *used;
 } session_capture;
 struct editor_session {
     pthread_mutex_t mutex;
@@ -227,8 +232,9 @@ static int encode_leaf(session_capture *c, session_node *n)
      * file TARGET. Not for the buffer being prepared (save_prepare checks and
      * substitutes its previous BASE itself), and only while the copy is
      * intact (worker-side check: the UI may since have removed it). */
-    bool preparing = !c->finish && !c->cancelling && b == c->selected;
+    bool preparing = !c->plain && !c->finish && !c->cancelling && b == c->selected;
     bool retained = !replaced && !preparing && !identical && n->has_retained && !journal_check_base(&n->retained);
+    if (c->used) c->used[b->session_slot] = retained ? 1u : 0u; /* edit-ze59 */
     const journal_base *record = retained ? &n->retained : base;
     size_t base_size = 40 + strlen(record->path) + 1 + (*record->path ? 8u : 0u);
     uint8_t *data = editor_records_add(r, JOURNAL_BASE, b->id, base_size); if (!data) return r->error;
@@ -315,7 +321,8 @@ static int prepare(void *ctx, const piece_snapshot *snapshot, savectl_checkpoint
     if (!rc) { memset(ids, 0, c->owner->width * sizeof *ids); rc = encode_all(c, ids); }
     if (!rc) rc = editor_records_check(&c->records);
     free(ids);
-    if (!rc) {
+    if (!rc && c->plain) { out->records = c->records.records; out->count = c->records.count; } /* edit-ze59 */
+    else if (!rc) {
         /* Selected previous identity is frozen in the pinned graph. */
         session_node *n = c->root; size_t slot = c->selected->session_slot;
         for (size_t span = c->owner->width; span > 1; span /= 2) {
@@ -336,6 +343,85 @@ static void release(void *ctx)
     c->reference = NULL;
     pthread_mutex_lock(&c->owner->mutex); node_release(c->owner, c->root);
     c->root = NULL; pthread_mutex_unlock(&c->owner->mutex);
+}
+/* edit-ze59 (recovery-3 F10): a complete checkpoint written by a worker that
+ * owns the journal (the save controller's lease pattern: editor_save_leased
+ * is true until completion, so the UI neither appends, pumps nor drains the
+ * journal; input parks behind the lease exactly as behind a save prepare).
+ * The records come from the published immutable graph pinned at start, so
+ * the checkpoint describes the state of that UI turn; the UI adopts the
+ * result in maintenance (editor_publish_poll). Started only while the journal
+ * is quiescent (editor_retain_tick), so the worker's flush has nothing to
+ * wait for and a stalled journal worker never leases the journal. */
+struct editor_publish {
+    session_capture capture;
+    journal *journal;
+    uint8_t *used; /* per session slot: the leaf's BASE was its retained copy */
+    int rc;
+    _Atomic bool done;
+};
+static void publish_worker(work_ctx *ctx)
+{
+    editor_publish *p = ctx->arg;
+    savectl_checkpoint out = {0};
+    int rc = prepare(&p->capture, NULL, &out);
+    if (!rc) rc = journal_flush(p->journal);
+    if (!rc) rc = journal_rotate(p->journal, out.records, out.count);
+    p->rc = rc;
+    release(&p->capture);
+    atomic_store_explicit(&p->done, true, memory_order_release);
+    /* Wake-up only: the UI reads done, never touches p before it. */
+    work_msg msg = {.kind = EDITOR_PUBLISH_MESSAGE};
+    (void)work_publish(ctx, &msg);
+}
+int editor_publish_start(editor *e)
+{
+    editor_session *s = e->session;
+    if (!s || !e->journal || e->publish) return EDITOR_ERR_ARG;
+    editor_session_metadata(e);
+    /* Every buffer the checkpoint must name has a leaf of its current
+     * revision; otherwise a later turn retries (publication can lag). */
+    size_t live = 0;
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (!b->placeholder && !b->derived) live++;
+    }
+    pthread_mutex_lock(&s->mutex);
+    bool fresh = s->root && s->root->live_count == live;
+    for (size_t i = 0; fresh && i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (!b || b->placeholder || b->derived || b->retired) continue;
+        session_node *leaf = leaf_at(s, b->session_slot);
+        fresh = !b->pending_open && leaf && leaf->buffer == b && leaf->revision == b->revision;
+    }
+    if (!fresh) { pthread_mutex_unlock(&s->mutex); return EDITOR_ERR_MEMORY; }
+    editor_publish *p = calloc(1, sizeof *p);
+    uint8_t *used = p ? calloc(s->width, sizeof *used) : NULL;
+    if (!used) { pthread_mutex_unlock(&s->mutex); free(p); return EDITOR_ERR_MEMORY; }
+    s->root->refs++;
+    pthread_mutex_unlock(&s->mutex);
+    p->capture = (session_capture){.owner = s, .root = s->root, .plain = true, .used = used,
+        .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
+        .width = e->font.window_width, .height = e->font.window_height};
+    p->journal = e->journal; p->used = used;
+    atomic_init(&p->done, false);
+    work_handle h = work_submit(&e->pool, (work_job){publish_worker, p, 0, WORK_BULK});
+    if (!h.epoch) { release(&p->capture); free(used); free(p); return EDITOR_ERR_MEMORY; }
+    e->publish = p;
+    return 0;
+}
+bool editor_publish_poll(editor *e, int *rc)
+{
+    editor_publish *p = e->publish;
+    if (!p || !atomic_load_explicit(&p->done, memory_order_acquire)) return false;
+    *rc = p->rc;
+    for (size_t i = 0; i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (b) b->retain_building = !p->rc && p->used[b->session_slot];
+    }
+    e->publish = NULL; free(p->used); free(p);
+    return true;
 }
 int editor_save_setup(editor *e, editor_buffer *b)
 {
@@ -370,10 +456,15 @@ int editor_save_setup(editor *e, editor_buffer *b)
 }
 bool editor_save_leased(const editor *e)
 {
-    return e->session && e->session->saving && e->session->saving->save &&
-        savectl_get_model(e->session->saving->save).journal_leased;
+    return e->publish || (e->session && e->session->saving && e->session->saving->save &&
+        savectl_get_model(e->session->saving->save).journal_leased);
 }
-bool editor_save_active(const editor *e) { return e->session && e->session->saving && !e->session->blocked; }
+/* edit-ze59: a worker checkpoint (editor_publish_start) owns the journal like
+ * a save prepare does, and it and an in-flight Save As write pin buffers like
+ * an active save: every journal, retirement and file-command gate that waits
+ * for a save also waits for them. */
+bool editor_save_active(const editor *e)
+{ return (e->session && e->session->saving && !e->session->blocked) || e->publish || e->save_as; }
 static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finish)
 {
     editor_session *s = e->session; session_capture *c = &s->capture;
@@ -413,6 +504,9 @@ static void start_failed(editor_session *s, editor_buffer *b, int rc)
 static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
 {
     editor_session *s = e->session;
+    /* edit-ze59: Ctrl+S waits out an in-flight Save As (it rebinds the
+     * controller); the keystroke is ignored, the file command is not. */
+    if (e->save_as) return 0;
     if (!s || !b->save || b->pending_open) {
         if (!b->save) b->save_error = b->operation_error = FILE_ERR_STATE;
         return 0;
@@ -440,7 +534,7 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
     s->saving = b; s->pending = true; s->finishing = s->blocked = false; s->pending_submit_ns = 0;
     b->save_revision = b->revision; b->save_cursor = b->history_cursor; b->save_tracking = true;
     undo_break_burst(&b->undo);
-    if (!e->journal_waiting && !e->op_count && !e->journal_group_open) {
+    if (!e->journal_waiting && !e->op_count && !e->journal_group_open && !e->publish) {
         s->pending = false;
         int rc = start(e, false);
         if (rc) start_failed(s, b, rc);
@@ -465,7 +559,7 @@ void editor_save_tick(editor *e)
     if (!s || !s->saving || s->blocked) return;
     editor_buffer *b = s->saving;
     savectl_tick(b->save); savectl_model model = savectl_get_model(b->save);
-    if (s->pending && !e->journal_waiting && !e->op_count && !e->journal_group_open && !model.busy) {
+    if (s->pending && !e->journal_waiting && !e->op_count && !e->journal_group_open && !model.busy && !e->publish) {
         s->pending = false;
         int rc = start(e, s->capture.finish);
         if (rc) start_failed(s, b, rc);
@@ -592,6 +686,12 @@ void editor_session_close(editor *e)
 {
     if (!e->session) return;
     editor_session *s = e->session;
+    /* edit-ze59: the worker checkpoint and a Save As write hold graph and
+     * buffer leases; both finish before teardown. */
+    for (int rc; e->publish && !editor_publish_poll(e, &rc);) {
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e); sched_yield();
+    }
+    editor_save_as_close(e);
     if (s->pending) { piece_snapshot_release(s->capture.snapshot); release(&s->capture); s->pending = false; }
     /* Off-path teardown retains every controller/arena until physical work and
      * mailbox retirement. Cancel cannot erase ambiguous journal generations. */

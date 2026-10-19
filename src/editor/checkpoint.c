@@ -311,9 +311,32 @@ int editor_checkpoint(editor *e)
         e->busy_due_ns = 0; e->busy_refusals = 0; /* (P) no retry pending */
         if (e->recovery_notice == busy_notice) e->recovery_notice = NULL;
         if (e->busy_checkpoint) editor_recovery_owed_done(e); /* edit-ivv */
+        e->publish_owed = false; /* edit-ze59: any complete checkpoint pays it */
     }
     editor_records_free(&c);
     return rc;
+}
+/* edit-ze59: adopt a worker checkpoint (editor_publish_start). As above,
+ * except that staged input is untouched: the worker wrote the state of the
+ * turn that started it, and input parked behind its lease. A refusal keeps
+ * the edit-ivv tick; any other failure retries retention after the next
+ * mutation (the former UI rule) and reports a Save As rebind's checkpoint. */
+void editor_checkpoint_published(editor *e, int rc)
+{
+    if (!rc) {
+        editor_retain_checkpointed(e);
+        e->busy_due_ns = 0; e->busy_refusals = 0; /* (P) no retry pending */
+        if (e->recovery_notice == busy_notice) e->recovery_notice = NULL;
+        if (e->busy_checkpoint) editor_recovery_owed_done(e);
+        e->publish_owed = false; e->retain_retry = 0;
+        return;
+    }
+    if (rc == JOURNAL_BUSY) checkpoint_refused(e);
+    e->retain_retry = e->stats.mutations + 1u;
+    if (e->publish_owed && rc != JOURNAL_BUSY) {
+        e->publish_owed = false;
+        e->recovery_notice = "save as failed"; e->recovery_notice_mutations = e->stats.mutations;
+    }
 }
 /* edit-ivv: a startup recovery whose checkpoint was refused owes one; retry it
  * on the journal tick under the gate the refresh and retain paths use (no save

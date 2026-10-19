@@ -29,6 +29,11 @@ static void drop_copy(editor *e, editor_buffer *b)
 void editor_retain_tick(editor *e)
 {
     if (!e->journal || e->recovering || !e->buffers) return;
+    /* edit-ze59: while the worker checkpoint owns the journal nothing here
+     * runs (no retention job submission, no copy transition or removal). */
+    int published;
+    if (editor_publish_poll(e, &published)) editor_checkpoint_published(e, published);
+    if (e->publish) return;
     bool saving = editor_save_active(e) || editor_save_leased(e), want = false;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
@@ -44,7 +49,7 @@ void editor_retain_tick(editor *e)
         case EDITOR_RETAIN_READY:
             /* BASE was replaced (save, Keep): the copy is no longer written;
              * the replacing checkpoint is durable before BASE changes. */
-            if (!editor_base_id_matches(&b->retain_of, &b->base)) { if (!saving) drop_copy(e, b); }
+            if (!editor_base_id_matches(&b->retain_of, &b->base)) { if (!saving && !e->publish_owed) drop_copy(e, b); }
             else if (!b->retain_used) want = true;
             break;
         case EDITOR_RETAIN_FAILED:
@@ -61,15 +66,21 @@ void editor_retain_tick(editor *e)
     /* Reference the copy with the next complete checkpoint, under the same
      * gate as a clean-source refresh (edit-ret): no queued input, no frame in
      * flight, no staged journal edits, no save owning the journal. Its text
-     * records are the edit-28u/f3i differences, O(pieces + edited bytes). */
-    if (!want || saving || e->retain_retry == e->stats.mutations + 1u) return;
-    if (editor_activation_busy(e) || e->backend->active || e->queue_count ||
-        (e->dirty && e->frame.last_sequence) || e->op_count) return;
-    int rc = journal_flush(e->journal);
-    if (!rc) rc = editor_checkpoint(e);
-    /* Retry after the next mutation, not every tick (e.g. another buffer's
-     * BASE changed and awaits the user's Keep/Reload, which checkpoints). */
-    e->retain_retry = rc ? e->stats.mutations + 1u : 0;
+     * records are the edit-28u/f3i differences, O(pieces + edited bytes).
+     * edit-ze59: the checkpoint is written by a worker that leases the
+     * journal (editor_publish_start), and only while the journal is
+     * quiescent: no batch in flight, everything accepted already durable, so
+     * the lease never waits on a stalled journal worker. A Save As rebind
+     * (publish_owed) asks for the same checkpoint. A failed reference
+     * checkpoint retries after the next mutation (editor_checkpoint_published). */
+    if ((!want && !e->publish_owed) || saving) return;
+    if (!e->publish_owed && e->retain_retry == e->stats.mutations + 1u) return;
+    if (!editor_checkpoint_due(e) || editor_activation_busy(e) || e->backend->active || e->queue_count ||
+        (e->dirty && e->frame.last_sequence) || e->op_count || e->journal_waiting ||
+        e->journal_metadata_pending || e->journal_group_open || e->stats.journal_error) return;
+    journal_stats js = journal_get_stats(e->journal);
+    if (js.error || js.pending_bytes || js.accepted_sequence != js.durable_sequence) return;
+    (void)editor_publish_start(e); /* refused (stale leaf, full pool): a later tick */
 }
 /* After a durable checkpoint: copies it referenced are protected; READY copies
  * it did not reference (BASE replaced, text equal to BASE, buffer retired)

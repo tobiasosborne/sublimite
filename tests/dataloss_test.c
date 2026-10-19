@@ -12,6 +12,8 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <dirent.h>
+#include <limits.h>
+#include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -1011,6 +1013,175 @@ static int ivv_choice(bool reload)
     editor_close(e); remove_tree(root); return 0;
 }
 
+/* edit-ze59 (recovery-3 F10): retention publication and Save As do their
+ * filesystem transactions off the UI thread. (G) G1 typing p99 = 2 ms,
+ * perf/01-perf-target.md §0.2; enforced on release builds only, where the
+ * malloc guard is active (the editor_large_test latency convention), and
+ * printed everywhere. (E) watchdogs reuse EDITOR_IDLE_NS. */
+#define ZE59_G1_P99_NS UINT64_C(2000000)
+typedef struct ze59_stall {
+    _Atomic bool hold, timed_out, done;
+    _Atomic unsigned blocked;
+    pthread_mutex_t mutex; pthread_cond_t cond;
+} ze59_stall;
+/* Journal data barriers (fdatasync: the journal worker's batch sync and the
+ * rotation temp) wait while held; namespace barriers do not, so the BASE copy
+ * (metadata_sync + directory sync) still completes. */
+static int ze59_sync(void *ctx, int fd, bool directory)
+{
+    ze59_stall *s = ctx;
+    if (!directory && atomic_load(&s->hold)) {
+        atomic_fetch_add(&s->blocked, 1u);
+        while (atomic_load(&s->hold)) sched_yield();
+    }
+    int rc; do { rc = directory ? fsync(fd) : fdatasync(fd); } while (rc < 0 && errno == EINTR);
+    return rc;
+}
+static void *ze59_watchdog(void *ctx)
+{
+    ze59_stall *s = ctx;
+    struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+    /* (P) ns per s split for timespec. */
+    uint64_t ns = (uint64_t)until.tv_nsec + EDITOR_IDLE_NS;
+    until.tv_sec += (time_t)(ns / UINT64_C(1000000000)); until.tv_nsec = (long)(ns % UINT64_C(1000000000));
+    pthread_mutex_lock(&s->mutex);
+    while (!atomic_load(&s->done))
+        if (pthread_cond_timedwait(&s->cond, &s->mutex, &until)) break;
+    pthread_mutex_unlock(&s->mutex);
+    if (!atomic_load(&s->done) && atomic_load(&s->hold)) { atomic_store(&s->timed_out, true); atomic_store(&s->hold, false); }
+    return NULL;
+}
+static bool ze59_has(editor *e, uint8_t ch)
+{
+    /* The fixtures type at offset 0: the leading TEXT_CAP bytes suffice. */
+    uint8_t bytes[TEXT_CAP]; uint64_t len = editor_length(e);
+    if (len > sizeof bytes) len = sizeof bytes;
+    if (editor_read(e, 0, bytes, (size_t)len)) return false;
+    return memchr(bytes, ch, (size_t)len) != NULL;
+}
+static void ze59_stamp(void)
+{
+    char power[32] = "unknown"; FILE *f = fopen("/sys/class/power_supply/BAT0/status", "r");
+    if (f) { if (fgets(power, sizeof power, f)) power[strcspn(power, "\n")] = '\0'; fclose(f); }
+    double load = 0; f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%lf", &load) != 1) load = 0; fclose(f); }
+    printf(" [power=%s load1=%.2f build=%s]\n", power, load, edit_malloc_guard_active() ? "release" : "sanitized");
+}
+static int ze59_retain_stall_body(const char *root, ze59_stall *stall, pthread_t *watchdog, bool *started)
+{
+    char source[128], jpath[128];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base text") == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(journal_flush(e->journal) == 0);
+    journal_io io = {.ctx = stall, .sync = ze59_sync}; T(journal_set_io(e->journal, &io) == 0);
+    atomic_store(&stall->hold, true);
+    T(pthread_create(watchdog, NULL, ze59_watchdog, stall) == 0); *started = true;
+    plat_event x = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'X', .t0_ns = trace_now_ns(), .utf8_len = 1, .utf8 = "X"};
+    T(editor_inject(e, &x) == 0);
+    /* Retention becomes READY (the copy's barriers are not held); the next
+     * journal sync then stalls the journal worker. */
+    uint64_t limit = deadline(), turn_max = 0;
+    while (e->buffer->retain_state != EDITOR_RETAIN_READY || !atomic_load(&stall->blocked)) {
+        uint64_t a = trace_now_ns(); T(turn(e) == 0); uint64_t b = trace_now_ns();
+        if (b - a > turn_max) turn_max = b - a;
+        T(b < limit || atomic_load(&stall->timed_out)); if (atomic_load(&stall->timed_out)) break;
+        sched_yield();
+    }
+    printf("dataloss_test: edit-ze59 stall: retain_state=%u retain_used=%d blocked=%u longest UI turn=%.3f ms timed_out=%d",
+        e->buffer->retain_state, e->buffer->retain_used, atomic_load(&stall->blocked), (double)turn_max / 1e6,
+        atomic_load(&stall->timed_out)); ze59_stamp();
+    T(!atomic_load(&stall->timed_out) && atomic_load(&stall->hold));
+    /* A keystroke while the journal worker is stalled and retention is READY. */
+    plat_event y = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'Y', .t0_ns = trace_now_ns(), .utf8_len = 1, .utf8 = "Y"};
+    T(editor_inject(e, &y) == 0);
+    limit = deadline();
+    while (!ze59_has(e, 'Y') || e->dirty || e->queue_count) {
+        T(turn(e) == 0); T(trace_now_ns() < limit); if (atomic_load(&stall->timed_out)) break;
+        sched_yield();
+    }
+    uint64_t latency = e->active_frame.submit_ns - y.t0_ns;
+    printf("dataloss_test: edit-ze59 keystroke under stalled journal worker + READY retention: input->submit=%.3f ms (M) "
+           "bound=%.3f ms (G1 p99) held=%d timed_out=%d", (double)latency / 1e6, (double)ZE59_G1_P99_NS / 1e6,
+           atomic_load(&stall->hold), atomic_load(&stall->timed_out)); ze59_stamp();
+    T(!atomic_load(&stall->timed_out) && atomic_load(&stall->hold));
+    if (edit_malloc_guard_active()) T(latency <= ZE59_G1_P99_NS);
+    T(!e->buffer->retain_used); /* still unpublished: the journal is not quiescent */
+    atomic_store(&stall->hold, false);
+    limit = deadline();
+    while (!e->buffer->retain_used) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0); T(text_is(e, "XYbase text") == 0);
+    printf("dataloss_test: edit-ze59 retention published off the UI thread after the stall released\n");
+    editor_close(e); return 0;
+}
+static int ze59_retain_stall(void)
+{
+    char root[64]; T(make_root(root, sizeof root) == 0);
+    ze59_stall stall = {.mutex = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
+    pthread_t watchdog; bool started = false;
+    int rc = ze59_retain_stall_body(root, &stall, &watchdog, &started);
+    atomic_store(&stall.hold, false);
+    if (started) {
+        pthread_mutex_lock(&stall.mutex); atomic_store(&stall.done, true); pthread_cond_signal(&stall.cond);
+        pthread_mutex_unlock(&stall.mutex); pthread_join(watchdog, NULL);
+    }
+    remove_tree(root); return rc;
+}
+/* (G) the bead's fixture: a 100 MB file = 100 * 1000 * 1000 B, sparse. */
+#define ZE59_SAVE_AS_BYTES (UINT64_C(100) * 1000u * 1000u)
+static int ze59_save_as_body(const char *root)
+{
+    char source[160], target[PATH_MAX], jpath[128], absolute[PATH_MAX];
+    T(realpath(root, absolute)); T(snprintf(source, sizeof source, "%s/large", root) > 0);
+    T(snprintf(target, sizeof target, "%s/copy", absolute) > 0);
+    int fd = open(source, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); T(fd >= 0);
+    bool sized = ftruncate(fd, (off_t)ZE59_SAVE_AS_BYTES) == 0; close(fd); T(sized);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) {
+        plat_event ch = {.kind = PLAT_EV_KEY, .press = true, .keysym = (uint8_t)target[i], .t0_ns = trace_now_ns(), .utf8_len = 1};
+        ch.utf8[0] = (uint8_t)target[i]; T(editor_inject(e, &ch) == 0);
+    }
+    T(settle(e) == 0);
+    plat_event enter = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Return, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &enter) == 0);
+    plat_event z = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'Z', .t0_ns = trace_now_ns(), .utf8_len = 1, .utf8 = "Z"};
+    T(editor_inject(e, &z) == 0);
+    uint64_t limit = trace_now_ns() + 6u * EDITOR_IDLE_NS, landed = 0, saved = 0, turn_max = 0;
+    while (!landed || !saved) {
+        uint64_t a = trace_now_ns(); T(turn(e) == 0); uint64_t b = trace_now_ns();
+        if (b - a > turn_max) turn_max = b - a;
+        /* Text holds Z and no frame is owed: the last submission contains it. */
+        if (!landed && ze59_has(e, 'Z') && !e->dirty && !e->queue_count) landed = e->active_frame.submit_ns;
+        if (!saved && !strcmp(e->buffer->path, target)) saved = b;
+        if (b >= limit) fprintf(stderr, "dataloss_test: edit-ze59 save-as stuck: landed=%d saved=%d path=%s notice=%s go=%d\n",
+            landed != 0, saved != 0, e->buffer->path, e->recovery_notice ? e->recovery_notice : "(none)", e->go.active);
+        T(b < limit); sched_yield();
+    }
+    T(settle(e) == 0);
+    struct stat st; T(stat(target, &st) == 0);
+    printf("dataloss_test: edit-ze59 Save As %llu B sparse: Z input->submit=%.3f ms command->rebound=%.3f ms longest UI turn=%.3f ms "
+           "(M) G1 p99=%.3f ms written=%lld B", (unsigned long long)ZE59_SAVE_AS_BYTES, (double)(landed - z.t0_ns) / 1e6,
+           (double)(saved - enter.t0_ns) / 1e6, (double)turn_max / 1e6, (double)ZE59_G1_P99_NS / 1e6, (long long)st.st_size);
+    ze59_stamp();
+    T(landed < saved); /* the keystroke landed while the target was still being written */
+    T((uint64_t)st.st_size == ZE59_SAVE_AS_BYTES); /* the snapshot at the command, before Z */
+    T(editor_tab(e, 0)->modified); /* Z follows the saved cutoff */
+    /* Z modified the rebound buffer, so a copy of its new 100 MB BASE is
+     * retained; it finishes and is published before teardown (a copy still
+     * running at editor_close outlives the journal: recovery-3 shutdown
+     * finding, outside this bead). */
+    T(retain_settled(e) == 0); T(e->buffer->retain_used);
+    editor_close(e); return 0;
+}
+static int ze59_save_as(void)
+{
+    char root[64]; T(make_root(root, sizeof root) == 0);
+    int rc = ze59_save_as_body(root);
+    remove_tree(root); return rc;
+}
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
@@ -1027,6 +1198,8 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--rewrite-rename")) return external_rewrite(REWRITE_RENAME);
     if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
     if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
+    if (argc == 2 && !strcmp(argv[1], "--ze59-stall")) return ze59_retain_stall();
+    if (argc == 2 && !strcmp(argv[1], "--ze59-save-as")) return ze59_save_as();
     if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
     if (argc == 2 && !strcmp(argv[1], "--retain-close")) return retain_close();
     T(kill_after_append() == 0);
@@ -1041,6 +1214,7 @@ int main(int argc, char **argv)
     T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
     T(retain_close() == 0);
+    T(ze59_retain_stall() == 0); T(ze59_save_as() == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */
@@ -1051,6 +1225,7 @@ int main(int argc, char **argv)
     }
     puts("dataloss_test: kill-after-append, kill at every save step, shorter base, reload/keep during held save, "
          "Ctrl+S under prompt, mixed hot exit with closed tab, reload vs keystroke, two-process save and orphan recovery, "
-         "edit-fi2 recovery after rename-over/in-place rewrite and retained-copy lifecycle passed");
+         "edit-fi2 recovery after rename-over/in-place rewrite and retained-copy lifecycle, "
+         "edit-ze59 stalled journal worker and large Save As keep typing live passed");
     return 0;
 }

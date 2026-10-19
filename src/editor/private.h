@@ -40,6 +40,10 @@ typedef struct editor_delta { uint64_t off, old, add; undo_state before, after; 
 typedef struct editor_soft_delta { view_selection before, after; uint64_t serial; bool text; } editor_soft_delta;
 typedef struct editor_jop { uint64_t off, len; size_t at; bool insert, commit; uint64_t id; size_t progress; piece_tree *tree; } editor_jop;
 typedef struct editor_session editor_session;
+/* edit-ze59: worker checkpoint (session.c) and in-flight Save As (commands.c). */
+typedef struct editor_publish editor_publish;
+typedef struct editor_save_as editor_save_as;
+#define EDITOR_PUBLISH_MESSAGE UINT32_C(0x45505542) /* ASCII "EPUB": wake-up only */
 /* edit-28u: identity of one on-disk file generation, as journal_check_base
  * compares it (journal_base without its path). valid=false binds nothing. */
 typedef struct editor_base_id {
@@ -322,6 +326,13 @@ struct editor {
      * zero disables retention (tests of the set-aside fallback). */
     uint64_t retain_limit;
     uint64_t retain_retry; /* stats.mutations + 1 at a failed reference checkpoint; 0 none */
+    /* edit-ze59: retention publication and Save As's replacing checkpoint run
+     * on a worker that leases the journal (publish, non-NULL until adopted);
+     * publish_owed: a Save As rebind awaits its checkpoint; save_as: the
+     * target write in flight. */
+    editor_publish *publish;
+    editor_save_as *save_as;
+    bool publish_owed;
     /* (P) A tab title plus the Save As refusal suffix and its NUL. */
     char file_command_notice[TABS_TITLE_BYTES + sizeof " is open and modified in another tab"];
     uint64_t recovery_notice_mutations;
@@ -552,6 +563,16 @@ void editor_retain_tick(editor *e);
 void editor_retain_checkpointed(editor *e);
 void editor_retain_stop(editor_buffer *b);
 void editor_retain_quiesce(editor *e);
+/* edit-ze59: complete checkpoint on the bulk worker from the published graph.
+ * start: UI, journal quiescent, refuses (EDITOR_ERR_*) when a leaf is stale or
+ * the pool is full; poll: true once the worker finished (rc its result);
+ * published: the UI bookkeeping editor_checkpoint does after its rotation. */
+int editor_publish_start(editor *e);
+bool editor_publish_poll(editor *e, int *rc);
+void editor_checkpoint_published(editor *e, int rc);
+void editor_save_as_tick(editor *e);
+void editor_save_as_close(editor *e);
+bool editor_save_as_runnable(const editor *e);
 int editor_journal_metadata(editor *e);
 /* Journal an applied action without waiting for a frame or durability credit. */
 int editor_journal_changed(editor *e);
