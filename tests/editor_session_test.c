@@ -1,6 +1,7 @@
 /* Headless integration for Ctrl+S and crash recovery. Fixture byte lengths are
  * strlen(marker), geometry follows the status text plus gutter/chrome, and all
  * waits use EDITOR_IDLE_NS (G, existing loop-policy bound, not a latency claim). */
+#include "select.h"
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <fcntl.h>
@@ -2632,26 +2633,54 @@ static int dzk1_crash_loop(void)
     if (!rc) puts("dzk1: a tab killed in its first paint after restore is set aside on the next launch; its text survives");
     return rc;
 }
+/* (P) Adapters retain the existing case arguments, call order,
+ * short-circuiting and exit codes; numeric inputs are unchanged fixture inputs. */
+static int select_edit_qcuh(void)
+{
+    return retired_named_release(true) || retired_named_release(false);
+}
+static int select_edit_fkpk(void)
+{
+    int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b;
+}
+static int select_edit_ut0m(void)
+{
+    int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b;
+}
+static int select_edit_djg(void)
+{
+    return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
+}
+static int select_edit_uzrb(void)
+{
+    return pending_open_save(false) || pending_open_save(true);
+}
+static int select_edit_14bi(void)
+{
+    return retained_lazy_case(true, UINT64_MAX, false);
+}
+static const test_selector selectors[] = {
+    {"--explicit-changed-base", explicit_changed_base},
+    {"--edit-qcuh", select_edit_qcuh},
+    {"--edit-ivv", ivv_all},
+    {"--edit-xdro", xdro_all},
+    {"--edit-fkpk", select_edit_fkpk},
+    {"--edit-3620", kept_target_unreadable},
+    {"--edit-ut0m", select_edit_ut0m},
+    {"--edit-dzk1", dzk1_crash_loop},
+    {"--edit-djg", select_edit_djg},
+    {"--edit-4jhi", retained_lazy},
+    {"--edit-uzrb", select_edit_uzrb},
+    {"--edit-dxas", dxas_all},
+    {"--edit-14bi", select_edit_14bi},
+};
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
-    /* (P) executable plus focused-test option; zero is API success. */
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--explicit-changed-base")) return explicit_changed_base();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-xdro")) return xdro_all();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-3620")) return kept_target_unreadable();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ut0m")) { int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b; }
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-dzk1")) return dzk1_crash_loop();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
-        return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-uzrb"))
-        return pending_open_save(false) || pending_open_save(true);
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-dxas")) return dxas_all();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-14bi"))
-        return retained_lazy_case(true, UINT64_MAX, false);
+    /* (P) executable plus its selector: argc is two; argv skips the executable. */
+    test_select_fn selected = TEST_SELECT(selectors, argc == 2 ? argv[1] : NULL);
+    if (selected) return selected();
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(ivv_all() == 0);
     T(xdro_all() == 0);

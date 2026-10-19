@@ -4,6 +4,7 @@
  * `make check`. edit-9yd also reads the 1 GiB log corpus for gutter publication;
  * edit-2ty additionally asserts trace input-to-submit for the Astra near-end
  * navigation/typing sequence; broader rows live in bench/editor_large_bench.c. */
+#include "select.h"
 #include "editor/editor.h"
 #include "editor/large.h"
 #include "editor/private.h"
@@ -2050,54 +2051,146 @@ static int vun_case(void)
     T(removed == 0); T(rc == 0);
     return 0;
 }
+/* (P) Adapters retain existing fixture arguments and environment value
+ * parsing. Numeric inputs are copied from the original selector branches. */
+static int select_edit_dz0_repro(void)
+{
+    return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
+}
+static int select_edit_ptn_repro(void)
+{
+    return ptn_case(atoi(getenv("EDIT_PTN_REPRO")));
+}
+static int select_edit_mmp_repro(void)
+{
+    /* (P) Decimal MiB input: radix ten and a binary MiB byte shift. */
+    return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL);
+}
+static int select_edit_tn2_placement(void)
+{
+    /* (P) Zero is success after the preceding placement assertion. */
+    return 0;
+}
+static int select_edit_91c_starved(void)
+{
+    return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
+}
+static int select_edit_2ty_repro(void)
+{
+    return near_end_repro(getenv("EDIT_2TY_WRAP") != NULL);
+}
+static int select_p4_cold_wrap(void)
+{
+    return cold_bracket_paint(true);
+}
+static int select_p4_estimated_delete(void)
+{
+    return estimated_newline_delete(getenv("P4_ESTIMATED_WRAP") != NULL);
+}
+static int select_p4_cold_paint(void)
+{
+    return cold_bracket_paint(false);
+}
 int main(void)
 {
-    if (getenv("EDIT_MMP_REPRO")) { trace_init(); (void)trace_thread_register(); return typing_while_indexing(getenv("EDIT_MMP_MIB") ? (uint64_t)strtoull(getenv("EDIT_MMP_MIB"), NULL, 10) << 20 : MMP_SMALL, getenv("EDIT_MMP_REINDEX") != NULL); }
     trace_init(); (void)trace_thread_register();
-    if (getenv("EDIT_PTN_REPRO")) return ptn_case(atoi(getenv("EDIT_PTN_REPRO")));
-    if (getenv("EDIT_DZ0_REPRO")) return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
-    if (getenv("EDIT_WV7_REPRO")) return wv7_case();
-    if (getenv("EDIT_1VUN_REPRO")) return vun_case();
-    if (getenv("EDIT_JF9_VIEW")) return relative_motion();
+    test_select_fn selected;
+    static const test_selector select_edit_mmp_repro_cases[] = {
+        {"EDIT_MMP_REPRO", select_edit_mmp_repro},
+        {"EDIT_PTN_REPRO", select_edit_ptn_repro},
+        {"EDIT_DZ0_REPRO", select_edit_dz0_repro},
+        {"EDIT_WV7_REPRO", wv7_case},
+        {"EDIT_1VUN_REPRO", vun_case},
+        {"EDIT_JF9_VIEW", relative_motion},
+    };
+    selected = TEST_SELECT_ENV(select_edit_mmp_repro_cases);
+    if (selected) return selected();
     T(relative_motion() == 0);
     /* edit-xzw: isolate the existing null-backend fixture from IPC/display
      * prerequisites denied by the worker sandbox. */
     if (getenv("EDIT_XZW_REPRO")) goto xzw_fixture;
-    if (getenv("EDIT_TN2_WRAPPED_JUMP")) return wrapped_byte_jump();
+    static const test_selector select_edit_tn2_wrapped_jump_cases[] = {
+        {"EDIT_TN2_WRAPPED_JUMP", wrapped_byte_jump},
+    };
+    selected = TEST_SELECT_ENV(select_edit_tn2_wrapped_jump_cases);
+    if (selected) return selected();
     T(wrapped_placement() == 0);
-    if (getenv("EDIT_TN2_PLACEMENT")) return 0;
+    static const test_selector select_edit_tn2_placement_cases[] = {
+        {"EDIT_TN2_PLACEMENT", select_edit_tn2_placement},
+    };
+    selected = TEST_SELECT_ENV(select_edit_tn2_placement_cases);
+    if (selected) return selected();
     T(wrapped_byte_jump() == 0);
-    if (getenv("EDIT_91C_STARVED"))
-        return starved_follows(getenv("EDIT_91C_NOHOLD") == NULL, getenv("EDIT_91C_AFTER_INDEX") != NULL);
+    static const test_selector select_edit_91c_starved_cases[] = {
+        {"EDIT_91C_STARVED", select_edit_91c_starved},
+    };
+    selected = TEST_SELECT_ENV(select_edit_91c_starved_cases);
+    if (selected) return selected();
     T(starved_follows(true, false) == 0);
     T(starved_follows(true, true) == 0);
     T(starved_follows(false, false) == 0);
     T(jump_then_page() == 0);
-    if (getenv("P4_ESTIMATED_DELETE")) return estimated_newline_delete(getenv("P4_ESTIMATED_WRAP") != NULL);
-    if (getenv("P4_LAZY_LONG_LINE")) return lazy_long_line_rows();
-    if (getenv("P4_COLD_WRAP")) return cold_bracket_paint(true);
-    if (getenv("EDIT_2TY_REPRO")) return near_end_repro(getenv("EDIT_2TY_WRAP") != NULL);
+    static const test_selector select_p4_estimated_delete_cases[] = {
+        {"P4_ESTIMATED_DELETE", select_p4_estimated_delete},
+        {"P4_LAZY_LONG_LINE", lazy_long_line_rows},
+        {"P4_COLD_WRAP", select_p4_cold_wrap},
+        {"EDIT_2TY_REPRO", select_edit_2ty_repro},
+    };
+    selected = TEST_SELECT_ENV(select_p4_estimated_delete_cases);
+    if (selected) return selected();
     T(near_end_repro(false) == 0);
     T(near_end_repro(true) == 0);
-    if (getenv("P4_MAILBOX_YIELD")) return mailbox_yield();
+    static const test_selector select_p4_mailbox_yield_cases[] = {
+        {"P4_MAILBOX_YIELD", mailbox_yield},
+    };
+    selected = TEST_SELECT_ENV(select_p4_mailbox_yield_cases);
+    if (selected) return selected();
     T(mailbox_yield() == 0);
-    if (getenv("P4_COOPERATIVE_JOBS")) return cooperative_large_jobs();
+    static const test_selector select_p4_cooperative_jobs_cases[] = {
+        {"P4_COOPERATIVE_JOBS", cooperative_large_jobs},
+    };
+    selected = TEST_SELECT_ENV(select_p4_cooperative_jobs_cases);
+    if (selected) return selected();
     T(cooperative_large_jobs() == 0);
     T(lazy_long_line_rows() == 0);
-    if (getenv("P4_WARM_REPAINT")) return warm_repaint();
+    static const test_selector select_p4_warm_repaint_cases[] = {
+        {"P4_WARM_REPAINT", warm_repaint},
+    };
+    selected = TEST_SELECT_ENV(select_p4_warm_repaint_cases);
+    if (selected) return selected();
     T(warm_repaint() == 0);
     T(estimated_newline_delete(false) == 0);
     T(estimated_newline_delete(true) == 0);
-    if (getenv("P4_COLD_PAINT")) return cold_bracket_paint(false);
+    static const test_selector select_p4_cold_paint_cases[] = {
+        {"P4_COLD_PAINT", select_p4_cold_paint},
+    };
+    selected = TEST_SELECT_ENV(select_p4_cold_paint_cases);
+    if (selected) return selected();
     T(cold_bracket_paint(false) == 0);
     T(cold_bracket_paint(true) == 0);
-    if (getenv("P4_BYTE_JUMP")) return byte_jump_boundaries();
+    static const test_selector select_p4_byte_jump_cases[] = {
+        {"P4_BYTE_JUMP", byte_jump_boundaries},
+    };
+    selected = TEST_SELECT_ENV(select_p4_byte_jump_cases);
+    if (selected) return selected();
     T(byte_jump_boundaries() == 0);
-    if (getenv("P4_COORDINATES")) return explicit_coordinates();
+    static const test_selector select_p4_coordinates_cases[] = {
+        {"P4_COORDINATES", explicit_coordinates},
+    };
+    selected = TEST_SELECT_ENV(select_p4_coordinates_cases);
+    if (selected) return selected();
     T(explicit_coordinates() == 0);
-    if (getenv("P4_KEEP_BACKGROUND")) return keep_restarts_background();
+    static const test_selector select_p4_keep_background_cases[] = {
+        {"P4_KEEP_BACKGROUND", keep_restarts_background},
+    };
+    selected = TEST_SELECT_ENV(select_p4_keep_background_cases);
+    if (selected) return selected();
     T(keep_restarts_background() == 0);
-    if (getenv("P4_FIND_RESTART")) return cancelled_find_restart();
+    static const test_selector select_p4_find_restart_cases[] = {
+        {"P4_FIND_RESTART", cancelled_find_restart},
+    };
+    selected = TEST_SELECT_ENV(select_p4_find_restart_cases);
+    if (selected) return selected();
     T(cancelled_find_restart() == 0);
     if (getenv("DNC2_REQUIRE_EARLY_INDEX")) T(index_before_attachment_gap() == 0);
     T(mapped_startup_ipc() == 0);

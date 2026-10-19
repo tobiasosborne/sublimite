@@ -9,6 +9,7 @@
  * Probes that FAIL are findings (see docs/worker-reports/edit-dataloss-s6.md)
  * and run only with --probe so `make check` stays green; everything else is a
  * regression test. */
+#include "select.h"
 #include "editor/private.h"
 #include "editor/large.h"
 #include "trace/trace.h"
@@ -1799,42 +1800,102 @@ static int utin_deferred(void)
     editor_close(e); remove_tree(root); return 0;
 }
 
+/* (P) Adapters retain the existing case arguments, call order,
+ * short-circuiting and exit codes; zero is the existing success code. */
+static int select_shared_save_dirty(void)
+{
+    return shared_save_as(true);
+}
+static int select_shared_save_clean(void)
+{
+    return shared_save_as(false);
+}
+static int select_stranded_orphan(void)
+{
+    T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
+}
+static int select_two_process_reload(void)
+{
+    return two_process_save(true);
+}
+static int select_y315(void)
+{
+    T(y315_healthy() == 0); return y315_stall();
+}
+static int select_rewrite_rename(void)
+{
+    return external_rewrite(REWRITE_RENAME);
+}
+static int select_rewrite_in_place(void)
+{
+    return external_rewrite(REWRITE_IN_PLACE);
+}
+static int select_9fzc_peer(void)
+{
+    return followup(true);
+}
+static int select_9fzc_lease(void)
+{
+    return followup(false);
+}
+static int select_edit_ivv(void)
+{
+    T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0;
+}
+static int select_detached_rewrite(void)
+{
+    return detached_rewrite(false);
+}
+static int select_retain_window(void)
+{
+    return detached_rewrite(true);
+}
+static int select_reload_held(void)
+{
+    return reload_during_save(true) || reload_during_save(false);
+}
+static int select_edit_e3z5(void)
+{
+    /* every case runs, so one red run shows each failure */
+    int failed = e3z5_save_as(true); failed |= e3z5_save_as(false); failed |= e3z5_no_slot(); return failed;
+}
+static int select_edit_utin(void)
+{
+    /* every case runs, so one red run shows each failure */
+    int failed = utin_save_as(UTIN_NO_SLOT); failed |= utin_save_as(UTIN_UNREADABLE); failed |= utin_deferred(); return failed;
+}
+static const test_selector selectors[] = {
+    {"--shared-save-dirty", select_shared_save_dirty},
+    {"--shared-save-clean", select_shared_save_clean},
+    {"--stranded-orphan", select_stranded_orphan},
+    {"--two-process-reload", select_two_process_reload},
+    {"--open-gib", open_gib},
+    {"--y315", select_y315},
+    {"--y315-stall", y315_stall},
+    {"--retain-bound", retain_bound},
+    {"--rewrite-rename", select_rewrite_rename},
+    {"--rewrite-in-place", select_rewrite_in_place},
+    {"--retain-lifecycle", retain_lifecycle},
+    {"--ze59-stall", ze59_retain_stall},
+    {"--ze59-save-as", ze59_save_as},
+    {"--9fzc-peer", select_9fzc_peer},
+    {"--9fzc-lease", select_9fzc_lease},
+    {"--edit-ivv", select_edit_ivv},
+    {"--retain-close", retain_close},
+    {"--detached-rewrite", select_detached_rewrite},
+    {"--retain-window", select_retain_window},
+    {"--reload-held", select_reload_held},
+    {"--edit-e3z5", select_edit_e3z5},
+    {"--edit-utin", select_edit_utin},
+};
 
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
     trace_init(); T(trace_thread_register() >= 0);
-    /* (P) argc includes the program name and its single selector argument. */
-    if (argc == 2 && !strcmp(argv[1], "--shared-save-dirty")) return shared_save_as(true);
-    if (argc == 2 && !strcmp(argv[1], "--shared-save-clean")) return shared_save_as(false);
-    if (argc == 2 && !strcmp(argv[1], "--stranded-orphan")) {
-        T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); return 0;
-    }
-    if (argc == 2 && !strcmp(argv[1], "--two-process-reload")) return two_process_save(true);
-    if (argc == 2 && !strcmp(argv[1], "--open-gib")) return open_gib();
-    if (argc == 2 && !strcmp(argv[1], "--y315")) { T(y315_healthy() == 0); return y315_stall(); }
-    if (argc == 2 && !strcmp(argv[1], "--y315-stall")) return y315_stall();
-    if (argc == 2 && !strcmp(argv[1], "--retain-bound")) return retain_bound();
-    if (argc == 2 && !strcmp(argv[1], "--rewrite-rename")) return external_rewrite(REWRITE_RENAME);
-    if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
-    if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
-    if (argc == 2 && !strcmp(argv[1], "--ze59-stall")) return ze59_retain_stall();
-    if (argc == 2 && !strcmp(argv[1], "--ze59-save-as")) return ze59_save_as();
-    if (argc == 2 && !strcmp(argv[1], "--9fzc-peer")) return followup(true);
-    if (argc == 2 && !strcmp(argv[1], "--9fzc-lease")) return followup(false);
-    if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
-    if (argc == 2 && !strcmp(argv[1], "--retain-close")) return retain_close();
-    if (argc == 2 && !strcmp(argv[1], "--detached-rewrite")) return detached_rewrite(false);
-    if (argc == 2 && !strcmp(argv[1], "--retain-window")) return detached_rewrite(true);
-    if (argc == 2 && !strcmp(argv[1], "--reload-held")) return reload_during_save(true) || reload_during_save(false);
-    if (argc == 2 && !strcmp(argv[1], "--edit-e3z5")) {
-        /* every case runs, so one red run shows each failure */
-        int failed = e3z5_save_as(true); failed |= e3z5_save_as(false); failed |= e3z5_no_slot(); return failed;
-    }
-    if (argc == 2 && !strcmp(argv[1], "--edit-utin")) {
-        /* every case runs, so one red run shows each failure */
-        int failed = utin_save_as(UTIN_NO_SLOT); failed |= utin_save_as(UTIN_UNREADABLE); failed |= utin_deferred(); return failed;
-    }
+    /* (P) executable plus its selector: argc is two; argv skips the executable. */
+    test_select_fn selected = TEST_SELECT(selectors, argc == 2 ? argv[1] : NULL);
+    if (selected) return selected();
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);

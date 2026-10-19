@@ -1,3 +1,4 @@
+#include "select.h"
 #include "editor/editor.h"
 #include "editor/private.h"
 #include "raster/raster.h"
@@ -6029,119 +6030,239 @@ static int dzk1_render_reject(void)
     puts("editor_test: dzk1 render-rule violations repair or drop the frame and the loop survives passed");
     return 0;
 }
+/* (P) Adapters retain the existing case arguments, call order,
+ * short-circuiting and exit codes; numeric inputs are unchanged fixture inputs. */
+static int select_trailing_default(void)
+{
+    return trailing_typing(NULL);
+}
+static int select_48u_buffer(void)
+{
+    return pointer_chain_contract(false);
+}
+static int select_48u_button(void)
+{
+    return pointer_chain_contract(true);
+}
+static int select_48u_drag(void)
+{
+    return pointer_autoscroll_contract(false);
+}
+static int select_48u_drag_wrap(void)
+{
+    return pointer_autoscroll_contract(true);
+}
+static int select_hl_allocation(void)
+{
+    return allocation_case(false,true);
+}
+static int select_a7fo_click(void)
+{
+    /* (P) Existing config wrap modes: enabled/disabled; zero selects the
+     * default font. (E) Retain the default run's large-font fixture size. */
+    return a7fo_click_contract(1,false,0) ||
+            a7fo_click_contract(-1,false,0) || a7fo_click_contract(1,true,0) || a7fo_click_contract(1,true,30) ||
+            a7fo_click_contract(-1,true,30);
+}
+static int select_minimap_grab_inside(void)
+{
+    return minimap_grab_contract(false);
+}
+static int select_minimap_grab_outside(void)
+{
+    return minimap_grab_contract(true);
+}
+static int select_minimap_raster(void)
+{
+    return minimap_compose_pixels("raster");
+}
+static int select_minimap_gl(void)
+{
+    return minimap_compose_pixels("gl");
+}
+static int select_minimap_pixels(void)
+{
+    return minimap_compose_pixels(NULL);
+}
+static int select_73j_headless(void)
+{
+    return mouse_contract() || wheel_contract() ||
+            findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract() || unicode_editor_contract() || minimap_pending_contract() || minimap_protected_contract() ||
+            minimap_typing_flash() || script(false) || allocation_test(false);
+}
+static int select_73j_find(void)
+{
+    return findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract();
+}
+static int select_73j_minimap(void)
+{
+    return minimap_pending_contract() || minimap_protected_contract();
+}
+static int select_panel_state(void)
+{
+    return panel_shortcuts(false);
+}
+static int select_panel_notice(void)
+{
+    return panel_shortcuts(true);
+}
+static int select_clipboard_native(void)
+{
+    return clipboard_test(true);
+}
+static int select_clipboard_crlf(void)
+{
+    return clipboard_crlf_line_test() || clipboard_endings_test() || clipboard_crlf_empty_test() || clipboard_crlf_bulk_test();
+}
+static int select_clipboard(void)
+{
+    return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test() || clipboard_no_tabs_test();
+}
+static int select_ck4_save(void)
+{
+    /* (P) ck4_recovery's existing choice encoding: save is zero, then
+     * keep/reload, followed by the corresponding mapped keep/reload cases. */
+    return ck4_recovery(0);
+}
+static int select_ck4_keep(void)
+{
+    return ck4_recovery(1);
+}
+static int select_ck4_reload(void)
+{
+    return ck4_recovery(2);
+}
+static int select_ck4_mapped_keep(void)
+{
+    return ck4_recovery(3);
+}
+static int select_ck4_mapped_reload(void)
+{
+    return ck4_recovery(4);
+}
+static int select_backend_only(void)
+{
+    return selected_backend_test(getenv("EDIT_BACKEND"), false);
+}
+static int select_require_gl(void)
+{
+    return selected_backend_test("gl", true);
+}
+static const test_selector selectors[] = {
+    {"--dzk1", dzk1_render_reject},
+    {"--paint-all-void", paint_all_void},
+    {"--2ghs-binary", binary_open_contract},
+    {"--recovery-findpanel", recovery_notice_findpanel},
+    {"--ywd-palette", palette_contract},
+    {"--yey-menu", menu_contract},
+    {"--trailing-default", select_trailing_default},
+    {"--trailing-all", trailing_all},
+    {"--trailing-selection", trailing_selection},
+    {"--trailing-disabled-scan", trailing_disabled_scan},
+    {"--g02-find", g02_find_return},
+    {"--n95-fif", n95_find_in_files},
+    {"--3f2k-save", n3f2k_save_with_results},
+    {"--6090-typing", n6090_typing_top},
+    {"--vp4m-return", vp4m_return_bottom},
+    {"--5vz-full", n5vz_results_full},
+    {"--5vz-open", n5vz_open_refused},
+    {"--bt1-geometry", nbt1_results_geometry},
+    {"--ci6i-map", nci6i_map_refused},
+    {"--ci6i-seek", nci6i_resolve_refused},
+    {"--g02-previous", g02_find_previous_uncached},
+    {"--duplicate-path", duplicate_path_contract},
+    {"--o20-all", o20_all},
+    {"--48u-overscan", pointer_overscan_contract},
+    {"--48u-buffer", select_48u_buffer},
+    {"--48u-button", select_48u_button},
+    {"--48u-empty", pointer_empty_rows_contract},
+    {"--48u-resize", findpanel_resize_contract},
+    {"--48u-drag", select_48u_drag},
+    {"--48u-drag-wrap", select_48u_drag_wrap},
+    {"--48u-escape", findpanel_escape_contract},
+    {"--hl-allocation", select_hl_allocation},
+    {"--m15-gutter", gutter_click_contract},
+    {"--a7fo-click", select_a7fo_click},
+    {"--m15-gutter-growth", gutter_growth_contract},
+    {"--m15-gutter-wrap", gutter_wrap_contract},
+    {"--m15-follow", find_follow_before_top_contract},
+    {"--dr3-gutter", gutter_line_contract},
+    {"--minimap-cost", minimap_compose_cost},
+    {"--minimap-grab-inside", select_minimap_grab_inside},
+    {"--minimap-grab-outside", select_minimap_grab_outside},
+    {"--9f63-columns", minimap_text_columns},
+    {"--minimap-raster", select_minimap_raster},
+    {"--minimap-gl", select_minimap_gl},
+    {"--minimap-pixels", select_minimap_pixels},
+    {"--73j-headless", select_73j_headless},
+    {"--73j-find", select_73j_find},
+    {"--73j-font", unicode_editor_contract},
+    {"--73j-minimap", select_73j_minimap},
+    {"--73j-mouse", mouse_contract},
+    {"--73j-wheel", wheel_contract},
+    {"--minimap-flash", minimap_typing_flash},
+    {"--default-soft-capacity", default_soft_capacity},
+    {"--default-history-anchor", default_history_anchor},
+    {"--default-notices", default_notices},
+    {"--default-soft-lines", default_soft_lines},
+    {"--default-repeat", default_chord_repeat},
+    {"--default-clipboard-line", default_clipboard_line},
+    {"--default-soft", default_soft_history},
+    {"--default-noop", default_noop},
+    {"--default-states", default_states},
+    {"--default-center", default_center},
+    {"--default-skip", default_skip},
+    {"--default-word", default_word},
+    {"--default-goto-cold", default_goto_cold},
+    {"--default-goto", default_goto},
+    {"--default-comments", default_comments},
+    {"--undo-shrink-top", undo_shrink_top},
+    {"--goto-scroll", goto_scroll},
+    {"--default-edits", default_edits},
+    {"--selection-chords", selection_chords},
+    {"--redo-or-repeat", redo_or_repeat},
+    {"--panel-state", select_panel_state},
+    {"--panel-notice", select_panel_notice},
+    {"--clipboard-no-tabs", clipboard_no_tabs_test},
+    {"--clipboard-primary", clipboard_pending_primary_test},
+    {"--clipboard-bulk", clipboard_large_test},
+    {"--clipboard-native", select_clipboard_native},
+    {"--clipboard-crlf", select_clipboard_crlf},
+    {"--clipboard", select_clipboard},
+    {"--ck4-target", ck4_target},
+    {"--ck4-fifo", ck4_fifo},
+    {"--ck4-metadata", ck4_metadata_test},
+    {"--ck4-credit", ck4_credit},
+    {"--ck4-startup", ck4_startup},
+    {"--ck4-save", select_ck4_save},
+    {"--clean-source-change", clean_source_change},
+    {"--source-prompt-placement", source_prompt_placement},
+    {"--ck4-keep", select_ck4_keep},
+    {"--ck4-reload", select_ck4_reload},
+    {"--ck4-mapped-keep", select_ck4_mapped_keep},
+    {"--ck4-mapped-reload", select_ck4_mapped_reload},
+    {"--index-capacity", index_capacity_typing},
+    {"--index-refusal", index_capacity_refusal},
+    {"--index-repair", index_eventual_repair},
+    {"--raster-blink", raster_blink_damage},
+    {"--line-start-only", partial_line_start},
+    {"--selection", backend_selection},
+    {"--fallback", backend_fallback},
+    {"--fallback-headless", backend_fallback_headless},
+    {"--gpu-completion", backend_gpu_completion},
+    {"--backend-only", select_backend_only},
+    {"--require-gl", select_require_gl},
+};
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
+    /* (P) Executable plus its selector: argc is two; argv skips the executable. */
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
-        /* (P) argv[1] is the selector after the program name. */
-        if (!strcmp(argv[1], "--dzk1")) return dzk1_render_reject();
-        if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
-        if (!strcmp(argv[1], "--2ghs-binary")) return binary_open_contract();
-        if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
-        if (!strcmp(argv[1], "--ywd-palette")) return palette_contract();
-        if (!strcmp(argv[1], "--yey-menu")) return menu_contract();
-        if (!strcmp(argv[1], "--trailing-default")) return trailing_typing(NULL);
-        if (!strcmp(argv[1], "--trailing-all")) return trailing_all();
-        if (!strcmp(argv[1], "--trailing-selection")) return trailing_selection();
-        if (!strcmp(argv[1], "--trailing-disabled-scan")) return trailing_disabled_scan();
-        if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
-        if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
-        if (!strcmp(argv[1], "--3f2k-save")) return n3f2k_save_with_results();
-        if (!strcmp(argv[1], "--6090-typing")) return n6090_typing_top();
-        if (!strcmp(argv[1], "--vp4m-return")) return vp4m_return_bottom();
-        if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
-        if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
-        if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
-        if (!strcmp(argv[1], "--ci6i-map")) return nci6i_map_refused();
-        if (!strcmp(argv[1], "--ci6i-seek")) return nci6i_resolve_refused();
-        if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
-        if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
-        if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
-        if (!strcmp(argv[1], "--48u-overscan")) return pointer_overscan_contract();
-        if (!strcmp(argv[1], "--48u-buffer")) return pointer_chain_contract(false);
-        if (!strcmp(argv[1], "--48u-button")) return pointer_chain_contract(true);
-        if (!strcmp(argv[1], "--48u-empty")) return pointer_empty_rows_contract();
-        if (!strcmp(argv[1], "--48u-resize")) return findpanel_resize_contract();
-        if (!strcmp(argv[1], "--48u-drag")) return pointer_autoscroll_contract(false);
-        if (!strcmp(argv[1], "--48u-drag-wrap")) return pointer_autoscroll_contract(true);
-        if (!strcmp(argv[1], "--48u-escape")) return findpanel_escape_contract();
-        if (!strcmp(argv[1], "--hl-allocation")) return allocation_case(false,true);
-        if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
-        if (!strcmp(argv[1], "--a7fo-click")) return a7fo_click_contract(1,false,0) ||
-            a7fo_click_contract(-1,false,0) || a7fo_click_contract(1,true,0) || a7fo_click_contract(1,true,30) ||
-            a7fo_click_contract(-1,true,30);
-        if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
-        if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
-        if (!strcmp(argv[1], "--m15-follow")) return find_follow_before_top_contract();
-        if (!strcmp(argv[1], "--dr3-gutter")) return gutter_line_contract();
-        if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
-        if (!strcmp(argv[1], "--minimap-grab-inside")) return minimap_grab_contract(false);
-        if (!strcmp(argv[1], "--minimap-grab-outside")) return minimap_grab_contract(true);
-        if (!strcmp(argv[1], "--9f63-columns")) return minimap_text_columns();
-        if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
-        if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
-        if (!strcmp(argv[1], "--minimap-pixels")) return minimap_compose_pixels(NULL);
-        if (!strcmp(argv[1], "--73j-headless")) return mouse_contract() || wheel_contract() ||
-            findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract() || unicode_editor_contract() || minimap_pending_contract() || minimap_protected_contract() ||
-            minimap_typing_flash() || script(false) || allocation_test(false);
-        if (!strcmp(argv[1], "--73j-find")) return findpanel_contract() || findpanel_cancel_error_contract() || findpanel_far_wrap_contract();
-        if (!strcmp(argv[1], "--73j-font")) return unicode_editor_contract();
-        if (!strcmp(argv[1], "--73j-minimap")) return minimap_pending_contract() || minimap_protected_contract();
-        if (!strcmp(argv[1], "--73j-mouse")) return mouse_contract();
-        if (!strcmp(argv[1], "--73j-wheel")) return wheel_contract();
-        if (!strcmp(argv[1], "--minimap-flash")) return minimap_typing_flash();
-        if (!strcmp(argv[1], "--default-soft-capacity")) return default_soft_capacity();
-        if (!strcmp(argv[1], "--default-history-anchor")) return default_history_anchor();
-        if (!strcmp(argv[1], "--default-notices")) return default_notices();
-        if (!strcmp(argv[1], "--default-soft-lines")) return default_soft_lines();
-        if (!strcmp(argv[1], "--default-repeat")) return default_chord_repeat();
-        if (!strcmp(argv[1], "--default-clipboard-line")) return default_clipboard_line();
-        if (!strcmp(argv[1], "--default-soft")) return default_soft_history();
-        if (!strcmp(argv[1], "--default-noop")) return default_noop();
-        if (!strcmp(argv[1], "--default-states")) return default_states();
-        if (!strcmp(argv[1], "--default-center")) return default_center();
-        if (!strcmp(argv[1], "--default-skip")) return default_skip();
-        if (!strcmp(argv[1], "--default-word")) return default_word();
-        if (!strcmp(argv[1], "--default-goto-cold")) return default_goto_cold();
-        if (!strcmp(argv[1], "--default-goto")) return default_goto();
-        if (!strcmp(argv[1], "--default-comments")) return default_comments();
-        if (!strcmp(argv[1], "--undo-shrink-top")) return undo_shrink_top();
-        if (!strcmp(argv[1], "--goto-scroll")) return goto_scroll();
-        if (!strcmp(argv[1], "--default-edits")) return default_edits();
-        if (!strcmp(argv[1], "--selection-chords")) return selection_chords();
-        if (!strcmp(argv[1], "--redo-or-repeat")) return redo_or_repeat();
-        if (!strcmp(argv[1], "--panel-state")) return panel_shortcuts(false);
-        if (!strcmp(argv[1], "--panel-notice")) return panel_shortcuts(true);
-        if (!strcmp(argv[1], "--clipboard-no-tabs")) return clipboard_no_tabs_test();
-        if (!strcmp(argv[1], "--clipboard-primary")) return clipboard_pending_primary_test();
-        if (!strcmp(argv[1], "--clipboard-bulk")) return clipboard_large_test();
-        if (!strcmp(argv[1], "--clipboard-native")) return clipboard_test(true);
-        if (!strcmp(argv[1], "--clipboard-crlf")) return clipboard_crlf_line_test() || clipboard_endings_test() || clipboard_crlf_empty_test() || clipboard_crlf_bulk_test();
-        if (!strcmp(argv[1], "--clipboard")) return clipboard_test(false) || clipboard_large_test() || clipboard_middle_long_test() || clipboard_pending_primary_test() || clipboard_no_tabs_test();
-        if (!strcmp(argv[1], "--ck4-target")) return ck4_target();
-        if (!strcmp(argv[1], "--ck4-fifo")) return ck4_fifo();
-        if (!strcmp(argv[1], "--ck4-metadata")) return ck4_metadata_test();
-        if (!strcmp(argv[1], "--ck4-credit")) return ck4_credit();
-        if (!strcmp(argv[1], "--ck4-startup")) return ck4_startup();
-        if (!strcmp(argv[1], "--ck4-save")) return ck4_recovery(0);
-        if (!strcmp(argv[1], "--clean-source-change")) return clean_source_change();
-        if (!strcmp(argv[1], "--source-prompt-placement")) return source_prompt_placement();
-        if (!strcmp(argv[1], "--ck4-keep")) return ck4_recovery(1);
-        if (!strcmp(argv[1], "--ck4-reload")) return ck4_recovery(2);
-        if (!strcmp(argv[1], "--ck4-mapped-keep")) return ck4_recovery(3);
-        if (!strcmp(argv[1], "--ck4-mapped-reload")) return ck4_recovery(4);
-        if (!strcmp(argv[1], "--index-capacity")) return index_capacity_typing();
-        if (!strcmp(argv[1], "--index-refusal")) return index_capacity_refusal();
-        if (!strcmp(argv[1], "--index-repair")) return index_eventual_repair();
-        if (!strcmp(argv[1], "--raster-blink")) return raster_blink_damage();
-        if (!strcmp(argv[1], "--line-start-only")) return partial_line_start();
-        if (!strcmp(argv[1], "--selection")) return backend_selection();
-        if (!strcmp(argv[1], "--fallback")) return backend_fallback();
-        if (!strcmp(argv[1], "--fallback-headless")) return backend_fallback_headless();
-        if (!strcmp(argv[1], "--gpu-completion")) return backend_gpu_completion();
-        if (!strcmp(argv[1], "--backend-only")) return selected_backend_test(getenv("EDIT_BACKEND"), false);
-        if (!strcmp(argv[1], "--require-gl")) return selected_backend_test("gl", true);
+        test_select_fn selected = TEST_SELECT(selectors, argv[1]);
+        if (selected) return selected();
+        if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return o20_case(argv[1] + sizeof "--o20-" - 1u);
         if (!headless) return 2;
     }
     const char *allocation = getenv("EDITOR_ALLOC_ONLY");

@@ -1,4 +1,5 @@
 /* Compile the production entry point here so make check covers it with ASan. */
+#include "select.h"
 #include "editor/private.h"
 #include "raster/raster.h"
 static int test_backend_select(render_backend *backend, const char *name);
@@ -682,13 +683,28 @@ cleanup:
     return result;
 }
 
+/* (P) Adapters retain the existing case arguments, call order,
+ * short-circuiting and exit codes; numeric inputs are unchanged fixture inputs. */
+static int select_sigterm(void)
+{
+    return run_cli_suite(SIGTERM);
+}
+static int select_sigint(void)
+{
+    return run_cli_suite(SIGINT);
+}
+static const test_selector selectors[] = {
+    {"--sigterm", select_sigterm},
+    {"--sigint", select_sigint},
+    {"--display-policy", display_policy},
+    {"--duplicate-path", duplicate_cli_handoff},
+};
+
 int main(int argc, char **argv)
 {
-    /* edit-djg (P): executable plus the named focused-test option. */
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigterm")) return run_cli_suite(SIGTERM);
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--sigint")) return run_cli_suite(SIGINT);
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--display-policy")) return display_policy();
-    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--duplicate-path")) return duplicate_cli_handoff();
+    /* (P) executable plus its selector: argc is two; argv skips the executable. */
+    test_select_fn selected = TEST_SELECT(selectors, argc == 2 ? argv[1] : NULL);
+    if (selected) return selected();
     if (display_policy()) return EXIT_FAILURE;
     if (duplicate_cli_handoff()) return 1;
     if (getenv("CLI_TEST_FORCE_WINDOW_TIMEOUT")) return run_cli_suite(SIGKILL);
