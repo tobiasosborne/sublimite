@@ -723,6 +723,9 @@ static int close_result(editor *e, int timeout_ms)
         return EDITOR_MORE;
     }
     e->checkpoint_retry_ns = 0; /* (P) no pending retry */
+    /* edit-y315: the owed checkpoint outlived the exit deadline on its worker;
+     * the journal stays for recovery (editor_close leaves it to the process). */
+    if (rc == EDITOR_MORE) return EDITOR_CLOSED;
     return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
 }
 int editor_step(editor *e, int timeout_ms)
@@ -926,6 +929,9 @@ int editor_flush(editor *e)
      * touching the borrowed journal or releasing buffer arenas. */
     e->save_flushing = true;
     while (editor_save_active(e)) {
+        /* edit-y315: a running worker checkpoint is waited for with the exit
+         * deadline; past it the journal stays for recovery (editor_close). */
+        if (e->publish && editor_publish_wait(e) == EDITOR_MORE) { e->save_flushing = false; return EDITOR_MORE; }
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
         if (e->journal_pool_ready && !editor_save_leased(e)) (void)work_mailbox_drain(&e->journal_pool, editor_route_work, e);
         int published; /* edit-ze59: worker checkpoint and Save As write */
@@ -951,6 +957,12 @@ int editor_flush(editor *e)
     } while (metadata == JOURNAL_BUSY);
     int rc = metadata ? metadata : journal_flush(e->journal);
     e->journal_waiting = false;
+    /* edit-y315: an owed Save As checkpoint is written by the worker
+     * publication, as during the session (edit-ze59): the journal is durable
+     * here, so the UI only waits, with the exit deadline. A refused start
+     * (stale leaf, no memory) keeps the UI checkpoint below. */
+    if (!rc && e->publish_owed && !e->stats.journal_error && !e->busy_checkpoint && !editor_publish_start(e))
+        return editor_publish_wait(e);
     /* edit-ivv: an owed recovery checkpoint (busy_checkpoint) lands here too. */
     if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint || e->publish_owed)
         return editor_checkpoint(e); /* edit-ze59: an owed Save As checkpoint too */

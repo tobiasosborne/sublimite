@@ -1127,6 +1127,125 @@ static int ze59_retain_stall(void)
     }
     remove_tree(root); return rc;
 }
+/* edit-y315: a Save As checkpoint still owed at exit is written by the worker
+ * publication (editor_publish_start), and the exit path waits for it at most
+ * one journal tick (JOURNAL_DEFAULT_SYNC_NS, the tick editor_flush_settle
+ * already allows for a BUSY retry). Past that the journal stays for recovery.
+ * (G) The UI bound below is that deadline tick plus the flush_settle retry
+ * tick (edit-ivv): 2 * JOURNAL_DEFAULT_SYNC_NS. (E) The stall's watchdog reuses
+ * EDITOR_IDLE_NS (ze59). (P) Text lengths come from fixture literals; counters
+ * count observed rename callbacks (one per journal rotation). */
+#define Y315_EXIT_BOUND_NS (2u * JOURNAL_DEFAULT_SYNC_NS)
+typedef struct y315_io {
+    pthread_t ui;
+    _Atomic unsigned ui_rotations, worker_rotations;
+    ze59_stall stall;
+} y315_io;
+typedef struct y315_result {
+    uint64_t ui_ns;
+    int flushed;
+    unsigned ui_rotations, worker_rotations, blocked;
+    bool timed_out;
+} y315_result;
+/* Journal rotations only (rename is the rotation's publish step); held while
+ * the stall is armed, so a rotation started on any thread waits. */
+static int y315_rename(void *ctx, const char *from, const char *to)
+{
+    y315_io *io = ctx;
+    if (pthread_equal(pthread_self(), io->ui)) atomic_fetch_add(&io->ui_rotations, 1u);
+    else atomic_fetch_add(&io->worker_rotations, 1u);
+    if (atomic_load(&io->stall.hold)) {
+        atomic_fetch_add(&io->stall.blocked, 1u);
+        while (atomic_load(&io->stall.hold)) sched_yield();
+    }
+    return rename(from, to);
+}
+/* Exit while a Save As write is in flight (main's sequence after quit): the
+ * exit flush adopts it (rebind, checkpoint owed) and owes the checkpoint;
+ * no maintenance turn runs in between to start the publication. */
+static int y315_owed(const char *root, y315_io *io, char *target, char *jpath, editor **out, render_backend *backend)
+{
+    char absolute[IPC_PATH_CAP], source[IPC_PATH_CAP];
+    T(realpath(root, absolute));
+    T(snprintf(source, sizeof source, "%s/source", absolute) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, IPC_PATH_CAP, "%s/target", absolute) > 0);
+    T(make_session(root, jpath, IPC_PATH_CAP) == 0); /* the editor keeps the path: caller storage */
+    T(open_editor(out, backend, source, jpath) == 0);
+    editor *e = *out; e->retain_limit = 0;
+    T(press(e, 'A', 0, "A") == 0); T(editor_flush(e) == 0);
+    journal_io hooks = {.ctx = io, .rename = y315_rename}; T(journal_set_io(e->journal, &hooks) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) { char ch[] = {target[i], '\0'}; T(press(e, (uint8_t)target[i], 0, ch) == 0); }
+    plat_event enter = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Return, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &enter) == 0);
+    uint64_t limit = deadline();
+    do { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); } while (!e->save_as);
+    T(!e->publish && !e->publish_owed);
+    return 0;
+}
+static int y315_stall_child(const char *root, int fd)
+{
+    y315_io io = {.ui = pthread_self(), .stall = {.mutex = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER}};
+    char target[IPC_PATH_CAP], jpath[IPC_PATH_CAP]; render_backend backend; editor *e = NULL;
+    T(y315_owed(root, &io, target, jpath, &e, &backend) == 0);
+    atomic_store(&io.stall.hold, true);
+    pthread_t watchdog; T(pthread_create(&watchdog, NULL, ze59_watchdog, &io.stall) == 0);
+    /* main's exit sequence: the final flush, then teardown. */
+    uint64_t t0 = trace_now_ns();
+    int flushed = editor_flush_settle(e);
+    editor_close(e);
+    y315_result r = {.ui_ns = trace_now_ns() - t0, .flushed = flushed, .ui_rotations = atomic_load(&io.ui_rotations),
+        .worker_rotations = atomic_load(&io.worker_rotations), .blocked = atomic_load(&io.stall.blocked),
+        .timed_out = atomic_load(&io.stall.timed_out)};
+    T(write(fd, &r, sizeof r) == (ssize_t)sizeof r);
+    return 0; /* _exit: a rotation still held dies with the process */
+}
+static int y315_stall(void)
+{
+    char root[IPC_PATH_CAP], next[IPC_PATH_CAP], target[IPC_PATH_CAP], absolute[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0); T(realpath(root, absolute));
+    T(snprintf(target, sizeof target, "%s/target", absolute) > 0);
+    int report[2]; T(pipe(report) == 0); pid_t child = fork(); T(child >= 0);
+    if (!child) { close(report[0]); _exit(y315_stall_child(root, report[1])); }
+    close(report[1]); y315_result r = {0}; size_t received = 0;
+    while (received < sizeof r) {
+        ssize_t n = read(report[0], (uint8_t *)&r + received, sizeof r - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    close(report[0]); T(exited_with(child, 0) == 0); T(received == sizeof r);
+    printf("dataloss_test: edit-y315 owed Save As checkpoint at exit, stalled rotation: UI exit=%.3f ms bound=%.3f ms (G) "
+           "flush=%d UI rotations=%u worker rotations=%u held=%u timed_out=%d", (double)r.ui_ns / 1e6,
+           (double)Y315_EXIT_BOUND_NS / 1e6, r.flushed, r.ui_rotations, r.worker_rotations, r.blocked, r.timed_out);
+    ze59_stamp();
+    T(r.ui_ns <= Y315_EXIT_BOUND_NS && !r.timed_out);
+    T(r.ui_rotations == 0 && r.worker_rotations > 0 && r.flushed == EDITOR_MORE);
+    /* The kept journal still names the former target (ze59: the text
+     * recovers, modified); the new target holds the written bytes. */
+    T(disk_is(target, "Asource") == 0);
+    T(make_session(root, next, sizeof next) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, NULL, next) == 0);
+    printf("dataloss_test: edit-y315 recovered %zu tab(s): %s modified=%d\n", tabs_count(&e->tabs),
+        tabs_count(&e->tabs) ? e->buffer->path : "", tabs_count(&e->tabs) ? editor_tab(e, 0)->modified : 0);
+    int ok = tabs_count(&e->tabs) == 1 && !text_is(e, "Asource") && editor_tab(e, 0)->modified;
+    editor_close(e); remove_tree(root); T(ok); return 0;
+}
+static int y315_healthy(void)
+{
+    char root[IPC_PATH_CAP], target[IPC_PATH_CAP], jpath[IPC_PATH_CAP]; T(make_root(root, sizeof root) == 0);
+    y315_io io = {.ui = pthread_self(), .stall = {.mutex = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER}};
+    render_backend backend; editor *e = NULL;
+    int rc = y315_owed(root, &io, target, jpath, &e, &backend);
+    int flushed = rc ? 0 : editor_flush_settle(e);
+    bool owed = e && e->publish_owed, rebound = e && !strcmp(e->buffer->path, target);
+    if (e) editor_close(e);
+    remove_tree(root); T(rc == 0);
+    printf("dataloss_test: edit-y315 owed Save As checkpoint at exit, healthy journal: flush=%d owed=%d UI rotations=%u worker rotations=%u\n",
+        flushed, owed, atomic_load(&io.ui_rotations), atomic_load(&io.worker_rotations));
+    T(flushed == 0 && !owed && rebound && atomic_load(&io.ui_rotations) == 0 && atomic_load(&io.worker_rotations) > 0);
+    return 0;
+}
 /* (G) the bead's fixture: a 100 MB file = 100 * 1000 * 1000 B, sparse. */
 #define ZE59_SAVE_AS_BYTES (UINT64_C(100) * 1000u * 1000u)
 static int ze59_save_as_body(const char *root)
@@ -1298,6 +1417,8 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--two-process-reload")) return two_process_save(true);
     if (argc == 2 && !strcmp(argv[1], "--open-gib")) return open_gib();
+    if (argc == 2 && !strcmp(argv[1], "--y315")) { T(y315_healthy() == 0); return y315_stall(); }
+    if (argc == 2 && !strcmp(argv[1], "--y315-stall")) return y315_stall();
     if (argc == 2 && !strcmp(argv[1], "--retain-bound")) return retain_bound();
     if (argc == 2 && !strcmp(argv[1], "--rewrite-rename")) return external_rewrite(REWRITE_RENAME);
     if (argc == 2 && !strcmp(argv[1], "--rewrite-in-place")) return external_rewrite(REWRITE_IN_PLACE);
@@ -1319,6 +1440,7 @@ int main(int argc, char **argv)
     T(two_process_save(false) == 0); T(two_process_save(true) == 0);
     T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
+    T(y315_healthy() == 0); T(y315_stall() == 0);
     T(retain_close() == 0);
     T(ze59_retain_stall() == 0); T(ze59_save_as() == 0);
     T(followup(true) == 0); T(followup(false) == 0);

@@ -19,10 +19,7 @@ retention behavior; later maintenance resumes deferred retention. This leaves
 the save worker as the sole owner of journal-pool submission and draining
 while its `journal_flush` runs, under the existing ownership protocol.
 
-The exit path remains synchronous by the bead's explicit allowance:
-`editor_flush` finishes admitted saves and publication, flushes staged records,
-then writes an owed Save As checkpoint itself. This off-path operation may
-wait for storage. It does not promise a responsive shutdown.
+The exit-time owed Save As checkpoint (item 3) is superseded by edit-y315 (worker publication with a one-tick deadline; docs/decisions/edit-y315.md).
 
 Regression tests in `dataloss_test` observe journal rename callbacks by thread
 for a Save As with a clean target peer, and hold the main bulk lane before a

@@ -337,6 +337,7 @@ struct editor {
     editor_publish *publish;
     editor_save_as *save_as;
     bool publish_owed;
+    uint64_t publish_deadline_ns; /* edit-y315: exit wait on publish; 0 not waiting */
     /* (P) A tab title plus the Save As refusal suffix and its NUL. */
     char file_command_notice[TABS_TITLE_BYTES + sizeof " is open and modified in another tab"];
     uint64_t recovery_notice_mutations;
@@ -575,6 +576,10 @@ void editor_retain_quiesce(editor *e);
 int editor_publish_start(editor *e);
 bool editor_publish_poll(editor *e, int *rc);
 void editor_checkpoint_published(editor *e, int rc);
+/* edit-y315: exit paths only. Adopts the running worker checkpoint, waiting at
+ * most one journal tick from the first wait on it; EDITOR_MORE if it is still
+ * running past that deadline, else its result (0 when none ran). */
+int editor_publish_wait(editor *e);
 void editor_save_as_tick(editor *e);
 void editor_save_as_close(editor *e);
 bool editor_save_as_runnable(const editor *e);

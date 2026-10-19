@@ -182,7 +182,10 @@ editor_stats editor_get_stats(const editor *e);
 bool editor_index_complete(editor *e);
 uint64_t editor_line_count(const editor *e);
 /* Blocking journal flush/checkpoint, outside the typing path. Failure recovery
- * may allocate and rotate a complete current-state checkpoint before exit. */
+ * may allocate and rotate a complete current-state checkpoint before exit.
+ * edit-y315: an owed Save As checkpoint is written on a worker; the call waits
+ * for it at most one journal tick (JOURNAL_DEFAULT_SYNC_NS) and returns
+ * EDITOR_MORE if it is still running: the journal stays for recovery. */
 int editor_flush(editor *e);
 /* edit-ivv: editor_flush for exit paths (main's final flush, editor_close):
  * a JOURNAL_BUSY refusal from the shared directory guard is retried once

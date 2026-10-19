@@ -17,6 +17,12 @@ void editor_close(editor *e)
     editor_hl_close(e);
     editor_find_close(e);
     if (e->journal && !e->recovering) (void)editor_flush_settle(e); /* edit-ivv: bounded BUSY retry */
+    /* edit-y315: a worker checkpoint still running past its exit deadline owns
+     * the journal and pins the session graph, the buffers it encodes and the
+     * pool it runs on: nothing is closed, joined or freed, and the session
+     * lock stays held until the process exits. The journal file stays for
+     * recovery; the rotation is crash-safe (old or new journal). */
+    if (editor_publish_wait(e) == EDITOR_MORE) return;
     editor_session_close(e);
     /* edit-9ev6: running BASE copies borrow the journal's IO and pool. */
     editor_retain_quiesce(e);

@@ -408,7 +408,7 @@ int editor_publish_start(editor *e)
     atomic_init(&p->done, false);
     work_handle h = work_submit(&e->pool, (work_job){publish_worker, p, 0, WORK_BULK});
     if (!h.epoch) { release(&p->capture); free(used); free(p); return EDITOR_ERR_MEMORY; }
-    e->publish = p;
+    e->publish = p; e->publish_deadline_ns = 0; /* edit-y315: (P) no exit wait yet */
     return 0;
 }
 bool editor_publish_poll(editor *e, int *rc)
@@ -422,6 +422,23 @@ bool editor_publish_poll(editor *e, int *rc)
     }
     e->publish = NULL; free(p->used); free(p);
     return true;
+}
+/* edit-y315: (E) the deadline reuses the journal tick, JOURNAL_DEFAULT_SYNC_NS,
+ * that editor_flush_settle and close_result already wait at exit (edit-ivv,
+ * edit-dr9); it counts from the first wait, so later exit flushes on the same
+ * job return at once. The busy poll is the existing exit-flush loop's. */
+int editor_publish_wait(editor *e)
+{
+    int rc = 0;
+    while (e->publish) {
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e);
+        if (editor_publish_poll(e, &rc)) { editor_checkpoint_published(e, rc); return rc; }
+        uint64_t now = trace_now_ns();
+        if (!e->publish_deadline_ns) e->publish_deadline_ns = now + JOURNAL_DEFAULT_SYNC_NS;
+        if (now >= e->publish_deadline_ns) return EDITOR_MORE;
+        sched_yield();
+    }
+    return rc;
 }
 int editor_save_setup(editor *e, editor_buffer *b)
 {
