@@ -246,9 +246,19 @@ int editor_scroll_follow(editor *e)
      * must not delay typing behind a bulk copy of unchanged viewport bytes. */
     if (!e->full_pending && e->lay.src == e->tree && !e->lay.approximate) {
         uint64_t cursor = b->scroll_cursor;
+        /* edit-vp4m: rows still queued for layout (strictly after the row in
+         * progress, before row_end) keep their pre-edit starts: layout_edit
+         * shifts them only for an edit that keeps the newline count. A
+         * Return at the bottom row otherwise "finds" the caret in the stale
+         * last row and keeps a top that hides its new row. */
+        bool busy = layout_busy(&e->lay);
+        uint32_t laying = e->lay.row, queued_end = e->lay.row_end;
         for (uint32_t row = 0; row < e->v.config.rows; row++) {
+            uint32_t next = row + 1u;
+            if (busy && ((row > laying && row < queued_end) || next >= e->text_grid.dims.rows ||
+                         (next > laying && next < queued_end))) continue;
             uint64_t start = e->row_byte[row];
-            uint64_t end = row + 1u < e->text_grid.dims.rows ? e->row_byte[row + 1u] : e->lay.pos;
+            uint64_t end = next < e->text_grid.dims.rows ? e->row_byte[next] : e->lay.pos;
             if (start == LAYOUT_VOID_ROW || start > cursor || end == LAYOUT_VOID_ROW || cursor >= end) continue;
             b->scroll.first_byte = e->lay.first_byte;
             b->scroll.first_line = e->lay.first_line;

@@ -5844,6 +5844,65 @@ static int n6090_typing_top(void)
     return 0;
 }
 
+/* edit-vp4m: unwrapped buffer, Return typed on the bottom visible row. The
+ * frame submitted for that key must show the caret's row: the top advances
+ * by the one new row (as Down does) and the caret's line is the bottom one.
+ * Fixture (E): sixty short lines, more than the text rows of a twelve-row
+ * config (M: e->v.config.rows reads eleven in the red run) so the viewport
+ * scrolls; three Returns each at three caret placements on the bottom row
+ * (end of line, mid-line, end of file). Mid-line was the red case: the
+ * stale last row still spans the caret. */
+static int vp4m_visible(editor *e, const char *what)
+{
+    view_state v = editor_view(e);
+    uint32_t rows = e->v.config.rows;
+    uint64_t cursor = v.selection.cursor, line = 0; uint8_t c;
+    for (uint64_t i = 0; i < cursor; i++) { T(editor_read(e, i, &c, 1) == 0); line += c == '\n'; }
+    uint32_t row = 0; /* (P) last laid-out row whose start is at or before the caret */
+    while (row + 1u < e->text_grid.dims.rows && e->row_byte[row + 1u] <= cursor) row++;
+    bool shown = e->lay.first_line <= line && line < e->lay.first_line + rows && row < rows &&
+                 v.first_line == e->lay.first_line;
+    if (!shown) fprintf(stderr, "edit-vp4m %s: caret line %llu row %u, top %llu (view %llu), rows %u\n", what,
+        (unsigned long long)line, row, (unsigned long long)e->lay.first_line, (unsigned long long)v.first_line, rows);
+    return shown ? 0 : 1;
+}
+static int vp4m_case(int place)
+{
+    char text[60u * 8u + 1u]; size_t n = 0;
+    for (unsigned i = 0; i < 60u; i++) n += (size_t)snprintf(text + n, sizeof text - n, "line %02u\n", i);
+    if (place == 2) n--; /* end of file: no final newline, the caret ends the last line */
+    render_backend b = {0}; T(render_null_backend(&b) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = n, .cols = 32, .rows = 12, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
+    uint32_t rows = e->v.config.rows; T(rows >= 2u);
+    if (place == 2) {
+        T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    } else {
+        for (uint32_t i = 0; i + 1u < rows; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+        T(press(e, key(place == 0 ? XKB_KEY_End : XKB_KEY_Right, 0, NULL)) == 0);
+    }
+    T(vp4m_visible(e, "before") == 0);
+    uint64_t top = editor_view(e).first_line;
+    int failed = 0;
+    for (unsigned k = 0; k < 3u; k++) {
+        T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+        failed += vp4m_visible(e, place == 0 ? "end of line" : place == 1 ? "mid-line" : "end of file");
+        if (editor_view(e).first_line != top + k + 1u) {
+            fprintf(stderr, "edit-vp4m: Return %u moved the top %llu -> %llu, not by one row\n", k,
+                (unsigned long long)top, (unsigned long long)editor_view(e).first_line);
+            failed++;
+        }
+    }
+    editor_close(e);
+    return failed;
+}
+static int vp4m_return_bottom(void)
+{
+    int failed = 0;
+    for (int place = 0; place < 3; place++) failed += vp4m_case(place);
+    T(failed == 0);
+    puts("edit-vp4m: unwrapped Return on the bottom row shows the caret's row in the same frame"); return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -5863,6 +5922,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
         if (!strcmp(argv[1], "--3f2k-save")) return n3f2k_save_with_results();
         if (!strcmp(argv[1], "--6090-typing")) return n6090_typing_top();
+        if (!strcmp(argv[1], "--vp4m-return")) return vp4m_return_bottom();
         if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
         if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
         if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
@@ -5973,6 +6033,7 @@ int main(int argc, char **argv)
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);
     T(n6090_typing_top() == 0);
+    T(vp4m_return_bottom() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(nci6i_map_refused() == 0);
