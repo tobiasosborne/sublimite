@@ -1,3 +1,30 @@
+# HANDOFF — sublimité, session 19 IN PROGRESS (2026-10-20 ~07:20 box clock; Fable coordinator; Tobias gave the session's orders at 02:08 and is using the installed editor)
+
+## Read first (session 19 continuation or session 20)
+**Goal unchanged (Tobias 2026-10-18): bug free, then frictionless on this box, then daily use.** Session-19 orders (02:08): fan out, lots of Codex and Opus, Fable kept level with Claude, occasional Fable subagents that know the quota situation, work up to pace, one tightly scoped job per lane then terminate, no review loops, merge as work lands, coordinate with the peer session initech-os-8a (different repo: shared box and quota only), Codex may run about 10 % over pace.
+
+**Installed:** `make install` put main **3b23f0a** at ~/.local/bin/sublimite at 05:35 (includes the JOURNAL_PAINT format change from edit-dzk1: an older binary truncates a journal at the first PAINT record, so never run an older build on the default profile). Tobias was told to relaunch. Main has moved on since (9f63, e3z5, xdro, utin): reinstall again when the next code lands.
+
+**Tobias's four trial findings of 2026-10-20, all landed:** edit-6090 (view jumped to the last line every 1-5 min: a Return on the bottom visual row in wrapped mode took the far-jump re-anchor; Fable worker found it), edit-a7fo (mouse click put the caret at line end and selected whole lines: the wrapped ASCII span path recorded no hit entries; also restored syntax colour in wrapped buffers), edit-2mhd (minimap viewport grab keeps the pointer offset), edit-9f63 (text one column too wide under the minimap: stale view column count after the gutter widened).
+
+**Twenty-one landed this session** (main 4669780 + docs): the three session-17 parked trees uzrb, ze59, dzk1; the four trial beads; 0rge, ut0m, 14bi, ci6i, 6yom, vp4m, y315, 3620, dxas (P2: undo history lost after Save As then Ctrl+S), 7cj8, 9fzc (items 1-2), e3z5, xdro, utin. Each verified in its worktree by an Opus lander (suites on :95/:97/:98 under the display lock, LeakSanitizer on, release malloc guard) and fast-forwarded by the coordinator after a gated rebase and a smoke. Per-landing record: docs/worklog/2026-10-18.md (session 19 section); orchestration items 39-42 in docs/decisions/orchestration-2026-10-18.md.
+
+**In flight at 07:20:** edit-qzam P2 (Opus, :98): the full sanitizer dataloss_test fails on main at dataloss_test:1121 (ivv_choice's LOCK_NB flock refused: an earlier case keeps the session directory lock; timing-dependent: the utin lander's full run passed at load 6.5); suspects y315's close keeping the lock when the one-tick exit publication deadline expires under ASan, or the e3z5 reconciled sequence. Codex sol xhigh lanes edit-nlz (test selector tables: the source of every landing conflict) and edit-fi0p (recovery-3 backlog), launched 05:40 on :99; land them with an Opus lander each when build/briefs/edit-<b>-s9.launch.log says done.
+
+**Lander protocol v2 (item 42):** a lander rebases once onto the main it finds, verifies, commits its report, stops; it never chases main (dzk1 and e3z5 landers lost 2-3 h each re-verifying after every main move). The coordinator does the final rebase gated on the exit code (`git rebase main || abort`; a `| tail` masked a conflict once and ran suites on a half-rebased tree), a build plus one or two suites on :97/:98, then `git merge --ff-only`; :95 for long suite sets, :99 for workers. `build/briefs/land9.sh <b>` commits and rebases; `launch9.sh` runs Codex.
+
+**Box after the reboot (item 41, memory xvfb-noreset-and-corpus-after-reboot):** Xvfb :95/:97/:98/:99 are up (2880x1800, 100 dpi) but were started without `-noreset`; `xprop -root -spy` holders keep them alive (gl_test and raster_test fail at plat_init otherwise). Restart them as `Xvfb :N -screen 0 2880x1800x24 -dpi 100 -nolisten tcp -noreset` when nothing is running. The corpus was rebuilt (`build/tools/mkcorpus` + `truncate -s 10G /tmp/edit-corpus/sparse_10g.bin`, 2.4 GB). The Makefile `check` loop runs under `set -e`. Full `make check` on a clean main has NOT passed this session: the triage (docs/worker-reports/check18-triage.md) classified the nine failures (environment, corpus, load, two test bugs fixed by edit-6yom); run it on a quiet box after qzam lands.
+
+**Quota 07:20 (M):** Claude Weekly 88 % (+0.5 % ahead), Fable 89 % (+1.5 % ahead), Codex 35 % (+7.5 %). At pace: no new Claude worker lanes beyond landing what is in flight; Codex stop line +9 % agreed with the peer. Peer initech-os-8a runs one serial gate at a time plus Opus lanes; displays :100-:109 are theirs.
+
+**Open beads filed this session (law 8 triage):** P2 edit-qzam (in flight); P3 edit-3620-sibling list: edit-b3hk (worker publish carries no pending PAINT record), edit-vp4m landed, edit-y315 landed; P4 backlog edit-xpm0 (ci6i), edit-zgey (Keep notices), edit-gtm8 (y315 exit waits), edit-t7ny (utin), plus the xdro follow-up (DEFERRED reload window). Next in order after the three lanes: reinstall and tell Tobias; full `make check` on a quiet box; then P3 edit-b3hk, edit-fi0p remainder, and whatever Tobias reports from use.
+
+**Disk:** landed worktree builds pruned at 05:40 (53 -> 67 GB free); prune `.wt/*/build` of landed trees again before GB fixtures.
+
+Everything below is the session-17 handoff, kept for its own state.
+
+---
+
 # HANDOFF — sublimité, end of session 17 (2026-10-18 ~15:40 box clock; Fable coordinator, Tobias present and using the editor; stopped on his instruction "wind up work, land it slowly, update handoff, commit and stop")
 
 ## Read first (session 18)
