@@ -10,6 +10,7 @@
  * and run only with --probe so `make check` stays green; everything else is a
  * regression test. */
 #include "editor/private.h"
+#include "editor/large.h"
 #include "trace/trace.h"
 #include <dirent.h>
 #include <limits.h>
@@ -1652,6 +1653,130 @@ static int followup(bool peer)
     remove_tree(root); return rc;
 }
 
+/* edit-utin (a): Save As onto a path open in a clean peer tab whose reload
+ * then fails for a reason other than JOURNAL_BUSY. The file is written, so
+ * this is never "save as failed": the peer becomes clean and stale, keeps the
+ * old text (what the user chose to overwrite), and the clean refresh replaces
+ * it once the cause clears. Landed on edit-9fzc's shape: the peer reload is
+ * editor_reload_saved_peer (deferred checkpoint, so never REFUSED) and the
+ * command's checkpoint is the owed worker publication (publish_owed). NO_SLOT: (P) slots = tab_capacity + closed_capacity
+ * = 2 + 1, filled by the owner, a retained closed tab and the peer. UNREADABLE:
+ * the written target is made mode 0 after the worker's rename, before the
+ * adoption; no journal, since a journal's BASE capture of the written target
+ * (same worker, right after the write) would race the chmod. (E) watchdogs reuse
+ * EDITOR_IDLE_NS. */
+typedef enum utin_reason { UTIN_NO_SLOT, UTIN_UNREADABLE } utin_reason;
+static int utin_save_as(utin_reason reason)
+{
+    static const char *const names[] = {"no slot", "unreadable"};
+    char root[IPC_PATH_CAP], source[IPC_PATH_CAP], target[IPC_PATH_CAP], other[IPC_PATH_CAP], jpath[IPC_PATH_CAP], canonical[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, sizeof target, "%s/target", root) > 0); T(write_file(target, "base") == 0);
+    T(snprintf(other, sizeof other, "%s/other", root) > 0); T(write_file(other, "other") == 0);
+    T(realpath(source, canonical)); strcpy(source, canonical);
+    T(realpath(target, canonical)); strcpy(target, canonical);
+    bool journaled = reason != UTIN_UNREADABLE;
+    if (journaled) T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = source, .journal_path = journaled ? jpath : NULL, .cols = COLS, .rows = ROWS};
+    if (reason == UTIN_NO_SLOT) { cfg.tab_capacity = 2; cfg.closed_capacity = 1; }
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, 'A', 0, "A") == 0);
+    uint64_t id, peer_id;
+    if (reason == UTIN_NO_SLOT) {
+        T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
+    }
+    T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0);
+    if (reason == UTIN_NO_SLOT) {
+        size_t used = 0; for (size_t i = 0; i < e->buffer_capacity; i++) used += e->buffers[i] != NULL;
+        T(used == e->buffer_capacity);
+    }
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    if (journaled) { T(retain_settled(e) == 0); T(journal_flush(e->journal) == 0); }
+    struct stat before; T(stat(target, &before) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) { char ch[] = {target[i], '\0'}; T(press(e, (uint8_t)target[i], 0, ch) == 0); }
+    plat_event enter = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Return, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &enter) == 0);
+    uint64_t limit = deadline();
+    /* Return is queued: run until the write started and was adopted (or refused). */
+    bool started = false;
+    if (reason == UTIN_UNREADABLE) {
+        /* No turn runs between the worker's rename and the chmod, so the
+         * adoption (maintenance) finds the written target unreadable. */
+        while (!e->save_as && !e->recovery_notice) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+        T(e->save_as);
+        for (struct stat now;; sched_yield()) {
+            T(trace_now_ns() < limit);
+            if (!stat(target, &now) && now.st_ino != before.st_ino) break;
+        }
+        T(chmod(target, 0) == 0);
+    }
+    while (!(started || e->recovery_notice) || e->file_command != KEYS_ACTION_NONE || e->save_as)
+    { T(turn(e) == 0); started |= e->save_as != NULL; T(trace_now_ns() < limit); sched_yield(); }
+    const editor_buffer *peer = e3z5_buffer(e, peer_id);
+    fprintf(stderr, "dataloss_test: edit-utin save_as(%s): notice=%s path_moved=%d owner_modified=%d peer_stale=%d peer_modified=%d\n",
+        names[reason], e->recovery_notice ? e->recovery_notice : "(none)", !strcmp(e->buffer->path, target),
+        editor_tab(e, 0)->modified, peer ? peer->source_stale : -1, editor_tab(e, 1) ? editor_tab(e, 1)->modified : -1);
+    T(!e->recovery_notice); /* the file is written: never "save as failed" */
+    T(!strcmp(e->buffer->path, target) && !editor_tab(e, 0)->modified);
+    T(peer && peer->source_stale && !editor_tab(e, 1)->modified); /* clean and stale, not modified */
+    if (journaled) T(e->publish_owed || e->publish); /* edit-ze59: the rebind's worker publication */
+    T(e3z5_tab_is(e, 1, "base") == 0); /* the overwritten text until the refresh lands */
+    size_t peer_tab = 1;
+    if (reason == UTIN_UNREADABLE) T(chmod(target, 0600) == 0);
+    else { T(settle(e) == 0); T(editor_close_tab(e, 0) == 0); peer_tab = 0; } /* evicts the retained tab: a slot frees */
+    T(disk_is(target, "Asource") == 0);
+    limit = deadline();
+    while (!e3z5_tab_holds(e, peer_tab, "Asource") || e->publish_owed || e->publish)
+    { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0);
+    peer = e3z5_buffer(e, peer_id);
+    T(peer && !peer->source_stale && !editor_tab(e, peer_tab)->modified && !e->recovery_notice);
+    fprintf(stderr, "dataloss_test: edit-utin save_as(%s): peer refreshed once the cause cleared\n", names[reason]);
+    editor_close(e); remove_tree(root); return 0;
+}
+/* edit-utin (b): the two DEFERRED branches of the static reload_source leave
+ * the buffer untouched; reached through editor_reload_saved_peer (edit-9fzc),
+ * the only exported entry, a deferral shows as rc 0 with the buffer neither
+ * retired nor replaced. A save in flight on the buffer's own file (file_save_busy;
+ * only the file-level save, editor_large_save_begin, takes it) is held at
+ * FILE_STEP_TEMP_WRITTEN; staged journal ops are e->op_count, set only around
+ * the direct call (no editor turn sees it). */
+static int utin_deferred(void)
+{
+    char root[64], source[128], jpath[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 'x', 0, "x") == 0);
+    held_save held = {.phase = FILE_STEP_TEMP_WRITTEN};
+    file_set_step_hook(e->buffer->file, hold, &held);
+    T(editor_large_save_begin(e) == 0); T(enter_hold(e, &held) == 0);
+    editor_buffer *b = e->buffer;
+    T(editor_reload_saved_peer(e, b, 0) == 0);
+    fprintf(stderr, "dataloss_test: edit-utin reload under a file save in flight: replaced=%d\n", e->buffer != b || b->retired);
+    T(e->buffer == b && !b->retired); T(text_is(e, "xbase") == 0);
+    atomic_store(&held.release, true);
+    uint64_t limit = deadline();
+    while (file_save_busy(b->file)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0);
+    e->op_count = 1u;
+    int rc = editor_reload_saved_peer(e, b, 0);
+    e->op_count = 0;
+    fprintf(stderr, "dataloss_test: edit-utin reload with staged journal ops: replaced=%d\n", e->buffer != b || b->retired);
+    T(rc == 0 && e->buffer == b && !b->retired); T(text_is(e, "xbase") == 0);
+    T(editor_reload_saved_peer(e, b, 0) == 0);
+    T(e->buffer != b && b->retired && e->publish_owed); /* DONE: replaced, its checkpoint owed (edit-9fzc) */
+    limit = deadline();
+    while (e->publish_owed || e->publish) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0); T(text_is(e, "xbase") == 0); /* the large save wrote "xbase" */
+    editor_close(e); remove_tree(root); return 0;
+}
+
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
@@ -1683,12 +1808,17 @@ int main(int argc, char **argv)
         /* every case runs, so one red run shows each failure */
         int failed = e3z5_save_as(true); failed |= e3z5_save_as(false); failed |= e3z5_no_slot(); return failed;
     }
+    if (argc == 2 && !strcmp(argv[1], "--edit-utin")) {
+        /* every case runs, so one red run shows each failure */
+        int failed = utin_save_as(UTIN_NO_SLOT); failed |= utin_save_as(UTIN_UNREADABLE); failed |= utin_deferred(); return failed;
+    }
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
     T(reload_during_save(true) == 0); T(reload_during_save(false) == 0);
     T(ivv_choice(false) == 0); T(ivv_choice(true) == 0);
     T(e3z5_save_as(true) == 0); T(e3z5_save_as(false) == 0); T(e3z5_no_slot() == 0);
+    T(utin_save_as(UTIN_NO_SLOT) == 0); T(utin_save_as(UTIN_UNREADABLE) == 0); T(utin_deferred() == 0);
     T(save_during_prompt(true) == 0); T(save_during_prompt(false) == 0);
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);

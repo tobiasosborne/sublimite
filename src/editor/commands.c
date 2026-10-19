@@ -190,12 +190,21 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
         editor_session_publish(e, other);
     }
     editor_session_publish(e, b);
-    /* A reload replaces the peer's tab in place: tab indices are stable. */
+    /* A reload replaces the peer's tab in place: tab indices are stable.
+     * edit-utin: the file is written, so a peer reload that leaves the peer
+     * in place (NO_SLOT, DEFERRED, FAILED; the deferred checkpoint means it
+     * is never REFUSED here, edit-9fzc) is owed, not "save as failed". The
+     * peer, admitted only unmodified (edit-hw1), is made clean again and
+     * stale: editor_check_sources retries the clean refresh, and a cause
+     * that persists shows the stale prompt, whose Reload says why (e3z5). */
     for (size_t i = 0; !rc && i < peers && i < tabs_count(&e->tabs); i++) {
         if (!reload[i]) continue;
         editor_buffer *other = (editor_buffer *)((uint8_t *)tabs_at(&e->tabs, i)->undo - offsetof(editor_buffer, undo));
         rc = editor_reload_saved_peer(e, other, i);
-        if (!rc && !other->retired) rc = EDITOR_ERR_IO;
+        if (rc || other->retired) continue;
+        other->saved_lost = false; other->source_stale = true; other->prompt_ns = 0;
+        (void)tabs_set_modified(&e->tabs, i, false);
+        editor_session_publish(e, other);
     }
     free(reload);
     if (rc) return EDITOR_ERR_IO;
