@@ -327,17 +327,24 @@ static void combined_release(void *ctx)
 static void test_combined_ownership(void)
 {
 #ifdef OBSERVE_ALLOCATIONS
+    const char *fixture = "/tmp/edit-corpus/sparse_10g.bin";
+    struct stat fixture_st;
+    /* edit-0rge: absent corpus skips, as test_corpus does (tools/mkcorpus). */
+    if (stat(fixture, &fixture_st) != 0) { fprintf(stderr, "  skip %s\n", fixture); return; }
     size_t before = __sanitizer_get_current_allocated_bytes();
     file *f = NULL;
     file_open_opts opts = {.copy_threshold = 1, .generation = 57};
-    REQUIRE(file_open_begin(&pool, "/tmp/edit-corpus/sparse_10g.bin", &opts, &f) == FILE_OK);
+    REQUIRE(file_open_begin(&pool, fixture, &opts, &f) == FILE_OK);
     uint64_t deadline = 20000;
     while (!file_open_ready(f) && deadline--) {
         (void)work_mailbox_drain(&pool, decode_file_message, NULL);
         nanosleep(&(struct timespec){0, 1000000}, NULL);
     }
-    REQUIRE(file_open_ready(f) && file_open_mode(f) == FILE_MODE_MMAP);
-    uint64_t size = file_size(f);
+    bool mapped = file_open_ready(f) && file_open_mode(f) == FILE_MODE_MMAP;
+    uint64_t size = mapped ? file_size(f) : 0;
+    /* edit-0rge: REQUIRE's early return must not abandon the handle. */
+    if (!mapped || size != 10ull * 1024u * 1024u * 1024u) file_close(f);
+    REQUIRE(mapped);
     REQUIRE(size == 10ull * 1024u * 1024u * 1024u);
     size_t prefix_len = 0;
     (void)file_prefix(f, &prefix_len);
