@@ -28,6 +28,7 @@ typedef struct hot_snapshot {
     size_t count, active, len;
     view_state view;
     uint32_t width, height;
+    uint64_t paint; /* edit-3oew: last JOURNAL_PAINT id (edit-dzk1); 0 = first frame presented */
     uint8_t text[sizeof "xhello\n"];
     char journal_name[sizeof "session-XXXXXX"]; /* (P) journal_session_create's mkstemp template. */
 } hot_snapshot;
@@ -358,6 +359,8 @@ static int hot_record(void *ctx, const journal_record *r)
         s->count = (size_t)hot_u64(p); s->active = (size_t)hot_u64(p + sizeof(uint64_t));
     } else if (r->type == JOURNAL_WINDOW) {
         uint64_t dims = hot_u64(p); s->width = (uint32_t)dims; s->height = (uint32_t)(dims >> 32);
+    } else if (r->type == JOURNAL_PAINT) {
+        s->paint = r->buffer_id;
     }
     return 0;
 }
@@ -373,7 +376,8 @@ static int hot_image(const char *directory, hot_snapshot *s)
             size_t len = (size_t)st.st_size; uint8_t *bytes = malloc(len);
             if (bytes) {
                 ssize_t n = read(fd, bytes, len); journal_replay_result rr;
-                *s = (hot_snapshot){0};
+                /* edit-3oew: no PAINT record yet is not "presented". */
+                *s = (hot_snapshot){.paint = UINT64_MAX};
                 if (n == (ssize_t)len && !journal_replay_bytes(bytes, len, hot_record, s, &rr)) {
                     int named = snprintf(s->journal_name, sizeof s->journal_name, "%s", entry->d_name);
                     result = named > 0 && (size_t)named < sizeof s->journal_name ? 0 : 1;
@@ -437,7 +441,12 @@ static int hot_exit_cli(const char *source_path, const char *directory, int stop
     while (!ready && trace_now_ns() < until) {
         ready = !hot_image(directory, &before) && before.len == strlen("xhello\n") &&
             !memcmp(before.text, "xhello\n", before.len) && before.view.selection.cursor == strlen("x") &&
-            before.view.selection.anchor == strlen("x") && before.width == width && before.height == height;
+            before.view.selection.anchor == strlen("x") && before.width == width && before.height == height &&
+            /* edit-3oew: a user types into a window they saw. Until the tab's
+             * first frame presents, PAINT names it, and edit-dzk1's crash-loop
+             * guard restores a tab killed inside its first paint closed (by
+             * design). Kill only after the first present (PAINT 0). */
+            before.paint == 0;
         if (!ready) pause_poll();
     }
     T(ready);
@@ -568,6 +577,16 @@ static int run_cli_suite(int stop_signal)
     d = opendir(dir); T(d != NULL); struct dirent *entry; unsigned journals = 0;
     while ((entry = readdir(d))) {
         if (!strncmp(entry->d_name, ".session-", 9)) {
+            T(unlinkat(dirfd(d), entry->d_name, 0) == 0);
+            continue;
+        }
+        /* edit-3oew: edit-fi2 retention state. A hot exit with unsaved edits
+         * keeps the BASE copy its journal names, and the SIGKILLed launch can
+         * leave a copy (or edit-7cj8 stage) it never referenced: fi2's
+         * documented crash window, swept only by startup housekeeping. Same
+         * cleanup as editor_session_test's fixtures. */
+        if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")) ||
+            !strncmp(entry->d_name, ".sublimite-copy-", strlen(".sublimite-copy-"))) {
             T(unlinkat(dirfd(d), entry->d_name, 0) == 0);
             continue;
         }
