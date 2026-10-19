@@ -885,6 +885,11 @@ int editor_poll_sources(editor *e)
     file_watch_dispatch();
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
+        /* edit-dxas: the controller's own job renames over the target and
+         * its result (the new baseline) can reach the UI after the inotify
+         * event. Leave the event pending until the job's result is adopted;
+         * the identity is then compared with the baseline that job wrote. */
+        if (b && !b->retired && b->target_rebound && b->save && savectl_get_model(b->save).busy) continue;
         if (b && !b->retired && b->target_rebound && file_watch_path_take(&b->target_watch)) {
             file_id identity;
             if (file_id_stat_path(b->path, &identity) || !b->save ||

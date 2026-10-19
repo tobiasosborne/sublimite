@@ -227,7 +227,7 @@ static int kept_target_unreadable(void)
      * rebases onto the replacement and the next save writes the buffer. */
     T(editor_source_resolve(e, false) == 0); T(settle(e) == 0);
     T(!b->source_stale && editor_tab(e, 0)->modified && e->recovery_notice != notice);
-    T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0); /* a clean reload may replace b */
+    T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0); /* the save's own rename no longer reloads b (edit-dxas) */
     T(!e->buffer->save_error && !editor_tab(e, 0)->modified); T(disk_is(target, "xbase") == 0);
     (void)unlink(target); (void)unlink(replacement); (void)rmdir(parent);
     close_fixture(&f); return 0;
@@ -241,6 +241,72 @@ static int mapped_keep_save(bool journalling)
     char replacement[IPC_PATH_CAP];
     if (snprintf(replacement, sizeof replacement, "%s/replacement", f.directory) > 0) (void)unlink(replacement);
     (void)rmdir(f.directory);
+    return rc;
+}
+/* edit-dxas: Save As, an edit, a plain Ctrl+S, then Ctrl+Z. The save's own
+ * rename over the Save As target must not read as an external change: no
+ * clean reload replaces the editor_buffer, and Ctrl+Z still undoes the edit
+ * typed before the save. Variants: journal on/off, COPY (threshold zero, the
+ * default for the strlen("base")-byte fixture) or MMAP ((P) sizeof "" is the
+ * smallest nonzero threshold), and a new or an existing target. Zero is API
+ * success, the first tab or byte offset. */
+static int save_as_then_save_body(fixture *f, bool existing)
+{
+    editor *e = f->e;
+    uint64_t limit = deadline();
+    while (e->buffer->pending_open) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    editor_buffer *b = e->buffer; /* compared, never dereferenced, once replaced */
+    bool mapped = b->file && file_open_mode(b->file) == FILE_MODE_MMAP;
+    char target[IPC_PATH_CAP];
+    T(snprintf(target, sizeof target, "%s/saved", f->directory) > 0);
+    if (existing) {
+        int fd = open(target, O_WRONLY | O_CREAT | O_EXCL, 0600); /* (P) owner read/write */
+        T(fd >= 0);
+        ssize_t written = write(fd, "old", strlen("old")); int closed = close(fd);
+        T(written == (ssize_t)strlen("old") && closed == 0);
+    }
+    e->file_command = KEYS_ACTION_SAVE_AS; strcpy(e->file_command_path, target);
+    e->file_command_owner = b->id; e->file_command_generation = b->source_generation;
+    limit = deadline();
+    while (e->file_command != KEYS_ACTION_NONE || e->save_as || !b->target_rebound || e->publish_owed || e->publish) {
+        T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
+    }
+    T(settle(e) == 0); T(disk_is(target, "base") == 0);
+    T(e->buffer == b && !editor_tab(e, 0)->modified);
+    T(press(e, 'x', 0, "x") == 0); T(editor_tab(e, 0)->modified);
+    T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0);
+    T(disk_is(target, "xbase") == 0);
+    bool replaced = e->buffer != b;
+    T(press(e, 'z', PLAT_MOD_CTRL, NULL) == 0);
+    uint8_t head[sizeof "base" - 1u] = {0};
+    bool undone = piece_len(e->buffer->tree) == sizeof head && !piece_read(e->buffer->tree, 0, head, sizeof head) &&
+        !memcmp(head, "base", sizeof head);
+    fprintf(stderr, "edit-dxas: journal=%s mode=%s target=%s replaced=%s undone=%s\n",
+        e->journal ? "on" : "off", mapped ? "mmap" : "copy",
+        existing ? "existing" : "new", replaced ? "yes" : "no", undone ? "yes" : "no");
+    T(!replaced); T(undone); T(editor_tab(e, 0)->modified);
+    (void)unlink(target);
+    return 0;
+}
+static int save_as_then_save(bool journalling, uint64_t threshold, bool existing)
+{
+    fixture f = {0};
+    int rc = open_fixture_threshold(&f, journalling, false, false, threshold);
+    if (!rc) rc = save_as_then_save_body(&f, existing);
+    char target[IPC_PATH_CAP];
+    if (snprintf(target, sizeof target, "%s/saved", f.directory) > 0) (void)unlink(target);
+    close_fixture(&f);
+    return rc;
+}
+/* Every variant runs, so the report names which reproduce. */
+static int dxas_all(void)
+{
+    static const bool choices[] = {false, true};
+    int rc = 0;
+    for (size_t j = 0; j < sizeof choices / sizeof *choices; j++)
+        for (size_t m = 0; m < sizeof choices / sizeof *choices; m++)
+            for (size_t x = 0; x < sizeof choices / sizeof *choices; x++)
+                rc |= save_as_then_save(choices[j], choices[m] ? sizeof "" : 0, choices[x]);
     return rc;
 }
 static int post_cutoff(void)
@@ -2355,6 +2421,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-uzrb"))
         return pending_open_save(false) || pending_open_save(true);
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-dxas")) return dxas_all();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-14bi"))
         return retained_lazy_case(true, UINT64_MAX, false);
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
@@ -2377,6 +2444,7 @@ int main(int argc, char **argv)
     T(mapped_repeated_save(true) == 0); T(mapped_repeated_save(false) == 0);
     T(mapped_keep_save(true) == 0); T(mapped_keep_save(false) == 0);
     T(kept_target_unreadable() == 0);
+    T(dxas_all() == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
