@@ -75,7 +75,12 @@ static int changed(editor *e, uint64_t off, uint64_t old, uint64_t add, uint64_t
             joined_line_anchor(e, off, e->lay.first_line - old_nl);
         e->full_pending = true; return 0;
     }
-    return rc < 0 ? rc : 0;
+    if (rc < 0) return rc;
+    /* (P) Layout reserves whole minimap/gutter cells. A decimal gutter
+     * change must reach cursor follow before it can count a hidden cell;
+     * one cell retains the existing positive-width view fallback. */
+    e->v.config.cols = e->lay.text_cols ? e->lay.text_cols : 1u;
+    return EDITOR_OK;
 }
 static int stage_delete(editor *e, uint64_t off, uint64_t len)
 {

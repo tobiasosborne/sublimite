@@ -372,6 +372,87 @@ static int minimap_grab_contract(bool outside)
     T(allocations == 0);
     return 0;
 }
+/* edit-9f63 (E): reuse minimap_compose_pixels' surface columns/rows and
+ * editor_config's default baked font size. (P): a pair of surface-widths of ASCII exceeds the text
+ * width. Eight LF separators give nine logical lines; Return adds the tenth,
+ * growing the decimal gutter by one cell. Pixel remainders enumerate every
+ * integer width within a cell, including the exact-cell boundary at zero.
+ * Zero/one also denote array origins, success and a single cell/byte step.
+ * Wrap modes reuse editor_config's off/on values. No timing bound is added. */
+static int minimap_text_columns(void)
+{
+    enum { cols = 40, rows = 8, font_px = 15, separators = 8 };
+    const font_ascii_atlas *atlas = font_ascii_atlas_for_px(font_px);
+    T(atlas && atlas->cell.cell_w > 1u);
+    uint8_t text[2u * cols + separators];
+    memset(text, 'x', 2u * cols);
+    memset(text + 2u * cols, '\n', separators);
+    const int modes[] = {-1, 1};
+    for (size_t mode = 0; mode < sizeof modes / sizeof modes[0]; mode++) {
+        for (uint32_t step = 1u; step <= atlas->cell.cell_w; step++) {
+            uint32_t remainder = step % atlas->cell.cell_w;
+            render_backend backend = {0}; counted count = {0}; editor *e = NULL;
+            T(render_null_backend(&backend) == RENDER_OK);
+            editor_config cfg = {.initial = text, .initial_len = sizeof text,
+                .cols = cols, .rows = rows, .font_px = font_px, .wrap_mode = modes[mode],
+                .window_width = cols * atlas->cell.cell_w + remainder,
+                .font_family = "", .font_file = "", .hook_ctx = &count,
+                .on_ingress = ingress, .on_submit = submitted};
+            T(editor_open(&e, &cfg, &backend) == EDITOR_OK); T(settle(e) == 0);
+            uint32_t cell_w = e->grid.dims.cell_w;
+            uint32_t map_width = e->grid.region.width;
+            uint32_t expected = (cfg.window_width - map_width) / cell_w;
+            T(e->map_cols && e->grid.region.pixels);
+            T((cfg.window_width - map_width) % cell_w == remainder);
+            T(e->text_grid.dims.cols == expected);
+            T(e->lay.gw + e->lay.text_cols == expected);
+            T(e->v.config.cols == e->lay.text_cols);
+            T(e->grid.region.x == expected * cell_w);
+            T(e->text_grid.cells[expected - 1u].glyph_index == 'x');
+            if (e->v.state.wrap) T(e->lay.wrap_rows[0].end == e->lay.text_cols);
+
+            uint32_t old_gutter = e->lay.gw;
+            T(editor_set_cursor(e, 1u) == EDITOR_OK); T(settle(e) == 0);
+            T(press(e, key(XKB_KEY_Return, 0, NULL)) == EDITOR_OK);
+            T(e->lay.gw == old_gutter + 1u);
+            uint32_t view_right = (e->lay.gw + e->v.config.cols) * cell_w;
+            printf("edit-9f63 (P): wrap=%d remainder=%u cell_w=%u view_right=%u minimap_left=%u\n",
+                modes[mode], remainder, cell_w, view_right, e->grid.region.x);
+            bool fits = view_right <= e->grid.region.x && e->v.config.cols == e->lay.text_cols;
+            /* (P) The split line starts after its first byte and inserted LF.
+             * Typing into its last visible cell advances the caret one cell;
+             * unwrapped follow must then scroll to keep that caret visible. */
+            bool wraps = true;
+            if (e->v.state.wrap) {
+                /* (P) Follow may move the split line to the top screen row. */
+                uint32_t line_row = 0;
+                while (line_row < e->text_grid.dims.rows && e->row_byte[line_row] != 2u) line_row++;
+                wraps = line_row < e->text_grid.dims.rows &&
+                    e->lay.wrap_rows[line_row].end == 2u + e->lay.text_cols;
+            }
+            bool caret = true;
+            if (!e->v.state.wrap) {
+                T(editor_set_cursor(e, 2u + e->lay.text_cols - 1u) == EDITOR_OK); T(settle(e) == 0);
+                T(press(e, key('y', 0, "y")) == EDITOR_OK);
+                uint32_t cursor_row = 0;
+                while (cursor_row + 1u < e->text_grid.dims.rows &&
+                    e->row_byte[cursor_row + 1u] <= e->v.state.selection.cursor) cursor_row++;
+                uint32_t last = (cursor_row + 1u) * expected - 1u;
+                caret = e->v.state.hscroll == 1u &&
+                    (e->text_grid.cells[last].attrs & RENDER_ATTR_CURSOR);
+                if (!caret) printf("edit-9f63 (P): cursor_byte=%llu hscroll=%llu first_byte=%llu row_start=%llu last_attrs=%#x\n",
+                    (unsigned long long)e->v.state.selection.cursor, (unsigned long long)e->v.state.hscroll,
+                    (unsigned long long)e->v.state.first_byte, (unsigned long long)e->row_byte[cursor_row],
+                    e->text_grid.cells[last].attrs);
+            }
+            bool allocation_free = !count.active && count.allocations == 0;
+            editor_close(e);
+            T(fits); T(wraps); T(caret); T(allocation_free);
+        }
+    }
+    puts("edit-9f63: whole text cells, view and soft-wrap columns exclude the minimap through gutter growth");
+    return 0;
+}
 static int minimap_compose_pixels(const char *backend_name)
 {
     render_backend backend = {0};
@@ -5997,6 +6078,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
         if (!strcmp(argv[1], "--minimap-grab-inside")) return minimap_grab_contract(false);
         if (!strcmp(argv[1], "--minimap-grab-outside")) return minimap_grab_contract(true);
+        if (!strcmp(argv[1], "--9f63-columns")) return minimap_text_columns();
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
         if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
         if (!strcmp(argv[1], "--minimap-pixels")) return minimap_compose_pixels(NULL);
@@ -6088,6 +6170,7 @@ int main(int argc, char **argv)
     T(g02_find_previous_uncached() == 0);
     T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);
+    T(minimap_text_columns() == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);
     T(pointer_autoscroll_contract(false)==0); T(pointer_autoscroll_contract(true)==0); T(findpanel_escape_contract()==0);
