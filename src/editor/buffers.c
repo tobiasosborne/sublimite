@@ -958,13 +958,17 @@ int editor_poll_sources(editor *e)
 
 /* Explicit Reload and clean-source refresh share replacement, view clamping,
  * empty undo history, journal reconciliation and logical tab identity. */
-/* edit-ivv: *refused reports a checkpoint the shared directory guard turned
- * away (JOURNAL_BUSY): rolled back like any failure, retried on the tick. */
-static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *refused, bool defer_checkpoint)
+/* edit-ivv: a checkpoint the shared directory guard turned away (JOURNAL_BUSY)
+ * is rolled back like any failure and retried on the tick. edit-e3z5: every
+ * outcome is reported (*outcome), so no caller drops a Reload silently. */
+static int reload_source(editor *e, editor_buffer *b, size_t tab_index, editor_reload_outcome *outcome, bool defer_checkpoint)
 {
+    editor_reload_outcome ignored; if (!outcome) outcome = &ignored;
+    *outcome = EDITOR_RELOAD_FAILED;
     size_t slot = 0;
     while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
-    if (slot == e->buffer_capacity || (b->file && file_save_busy(b->file)) || e->op_count) return 0;
+    if (slot == e->buffer_capacity) { *outcome = EDITOR_RELOAD_NO_SLOT; return 0; }
+    if ((b->file && file_save_busy(b->file)) || e->op_count) { *outcome = EDITOR_RELOAD_DEFERRED; return 0; }
     editor_buffer *replacement = NULL;
     int rc = editor_buffer_prepare(e, b->path, NULL, 0, &replacement);
     if (rc) return 0;
@@ -1005,7 +1009,7 @@ static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *re
         else { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
     }
     if (rc) {
-        if (refused) *refused = rc == JOURNAL_BUSY;
+        if (rc == JOURNAL_BUSY) *outcome = EDITOR_RELOAD_REFUSED;
         e->buffers[slot] = NULL; b->retired = false;
         (void)tabs_replace(&e->tabs, tab_index, b->tree, &b->undo, &previous_tab, &e->v.state);
         (void)tabs_set_modified(&e->tabs, tab_index, modified);
@@ -1013,6 +1017,7 @@ static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *re
         unpoll_source(e, replacement);
         editor_buffer_destroy(replacement); return 0;
     }
+    *outcome = EDITOR_RELOAD_DONE;
     lineidx_build_cancel(b->index);
     work_cancel(&e->pool, b->lg.warm_h); work_cancel(&e->pool, b->lg.find_h);
     b->lg.find_running = false;
@@ -1029,6 +1034,11 @@ int editor_reload_saved_peer(editor *e, editor_buffer *b, size_t tab_index)
 {
     return reload_source(e, b, tab_index, NULL, true);
 }
+/* edit-e3z5: an explicit Reload that cannot run says why. It is not re-armed:
+ * only the user can free a slot or fix the file, and a pending choice is
+ * runnable work. The prompt stays, so R works again afterwards. */
+static const char reload_no_slot[] = "reload needs a free tab slot: close a tab, then press R";
+static const char reload_failed[] = "reload failed: the file could not be read (R reload / K keep)";
 
 /* edit-3620: replaces the prompt row (save overlay), so it repeats the choices. */
 static const char keep_failed_notice[] = "Keep failed: R reload / K keep";
@@ -1057,10 +1067,10 @@ int editor_check_sources(editor *e)
             while (tab_index < tabs_count(&e->tabs) && tabs_at(&e->tabs, tab_index)->id != b->id) tab_index++;
             if (tab_index == tabs_count(&e->tabs)) continue; /* refresh retained closed tabs when reopened */
             if (!editor_checkpoint_due(e)) continue; /* edit-ivv: a refused refresh waits for its tick */
-            bool refused = false;
-            int rc = reload_source(e, b, tab_index, &refused, false);
+            editor_reload_outcome outcome;
+            int rc = reload_source(e, b, tab_index, &outcome, false);
             if (rc || b->retired) return rc; /* at most one replacement in a maintenance turn */
-            if (refused) continue; /* edit-ivv: retried on the journal tick, not prompted */
+            if (outcome == EDITOR_RELOAD_REFUSED) continue; /* edit-ivv: retried on the journal tick, not prompted */
             /* Failed acquisition/reconciliation retains the old resources and
              * exposes the existing recovery choices rather than losing text. */
         }
@@ -1088,6 +1098,8 @@ int editor_check_sources(editor *e)
     unsigned choice = e->source_choice; e->source_choice = 0;
     editor_buffer *b = e->buffer;
     if (!b->source_stale || b->id != e->source_choice_id || b->source_generation != e->source_choice_generation) return 0;
+    /* edit-e3z5: a new choice supersedes the previous one's notice. */
+    if (e->recovery_notice == reload_no_slot || e->recovery_notice == reload_failed) e->recovery_notice = NULL;
     if (choice == 1) {
         if (b->pending_open) return 0; /* failed acquisition cannot become editable */
         int rc = b->target_rebound && (!b->file || file_open_mode(b->file) == FILE_MODE_COPY) ? 0 : file_resolve_keep(b->file);
@@ -1123,8 +1135,13 @@ int editor_check_sources(editor *e)
         return editor_full_layout(e);
     }
     if (e->recovery_notice == keep_failed_notice) e->recovery_notice = NULL;
-    bool refused = false;
-    int rc = reload_source(e, b, tabs_active_index(&e->tabs), &refused, false);
-    if (!rc && refused) e->source_choice = choice; /* edit-ivv: Reload again on the tick */
-    return rc;
+    editor_reload_outcome outcome;
+    int rc = reload_source(e, b, tabs_active_index(&e->tabs), &outcome, false);
+    if (rc || outcome == EDITOR_RELOAD_DONE) return rc;
+    /* edit-ivv: Reload again on the tick. edit-e3z5: a save on the file or
+     * staged journal ops clear without the user; Reload again once they do. */
+    if (outcome == EDITOR_RELOAD_REFUSED || outcome == EDITOR_RELOAD_DEFERRED) { e->source_choice = choice; return 0; }
+    e->recovery_notice = outcome == EDITOR_RELOAD_NO_SLOT ? reload_no_slot : reload_failed;
+    e->recovery_notice_mutations = e->stats.mutations;
+    return editor_full_layout(e);
 }

@@ -201,7 +201,9 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
     if (rc) return EDITOR_ERR_IO;
     /* edit-ze59: the replacing checkpoint is written by a worker
      * (editor_publish_start, from editor_retain_tick); the retained copy of
-     * the former BASE stays until it lands. */
+     * the former BASE stays until it lands. A refusal there (JOURNAL_BUSY)
+     * keeps it owed (editor_checkpoint_published): never "save as failed"
+     * once the file is written (edit-e3z5). */
     if (e->journal) e->publish_owed = true;
     return b == e->buffer && !e->save_flushing ? editor_full_layout(e) : editor_begin_frame(e);
 }

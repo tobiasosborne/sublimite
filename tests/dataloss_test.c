@@ -1432,6 +1432,121 @@ static int ze59_save_as(void)
     int rc = ze59_save_as_body(root);
     remove_tree(root); return rc;
 }
+/* edit-e3z5 (a): Save As onto a path open in another (clean) tab while the
+ * shared directory guard is held. The write lands; the worker publication
+ * (which carries the peer's reload since edit-9fzc) is refused (JOURNAL_BUSY)
+ * and retried on the journal tick instead of reporting "save as failed".
+ * peer=false has no peer. (P) zero = no refusal; (E) watchdog EDITOR_IDLE_NS. */
+static const editor_buffer *e3z5_buffer(const editor *e, uint64_t id)
+{
+    for (size_t i = 0; i < e->buffer_capacity; i++)
+        if (e->buffers[i] && !e->buffers[i]->retired && e->buffers[i]->id == id) return e->buffers[i];
+    return NULL;
+}
+static bool e3z5_tab_holds(const editor *e, size_t index, const char *expected)
+{
+    const tabs_tab *tab = editor_tab(e, index); uint8_t bytes[TEXT_CAP];
+    uint64_t len = tab ? piece_len(tab->buffer) : 0;
+    return tab && len == strlen(expected) && !piece_read(tab->buffer, 0, bytes, (size_t)len) && !memcmp(bytes, expected, (size_t)len);
+}
+static int e3z5_tab_is(const editor *e, size_t index, const char *expected)
+{
+    const tabs_tab *tab = editor_tab(e, index); T(tab);
+    char bytes[TEXT_CAP]; uint64_t len = piece_len(tab->buffer); T(len < sizeof bytes);
+    T(piece_read(tab->buffer, 0, (uint8_t *)bytes, (size_t)len) == 0);
+    if (len != strlen(expected) || memcmp(bytes, expected, (size_t)len)) {
+        fprintf(stderr, "dataloss_test: tab %zu holds [%.*s], expected [%s]\n", index, (int)len, bytes, expected);
+        T(false);
+    }
+    return 0;
+}
+static int e3z5_save_as(bool peer)
+{
+    char root[IPC_PATH_CAP], source[IPC_PATH_CAP], target[IPC_PATH_CAP], jpath[IPC_PATH_CAP], canonical[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, sizeof target, "%s/target", root) > 0); T(write_file(target, "base") == 0);
+    T(realpath(source, canonical)); strcpy(source, canonical);
+    T(realpath(target, canonical)); strcpy(target, canonical);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
+    T(press(e, 'A', 0, "A") == 0);
+    uint64_t peer_id = 0;
+    if (peer) { T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0); }
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(retain_settled(e) == 0); T(journal_flush(e->journal) == 0);
+    int guard = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC); T(guard >= 0 && flock(guard, LOCK_EX | LOCK_NB) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) { char ch[] = {target[i], '\0'}; T(press(e, (uint8_t)target[i], 0, ch) == 0); }
+    /* No settle: an owed publication is pending work until the guard frees. */
+    plat_event enter = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Return, .t0_ns = trace_now_ns()};
+    T(editor_inject(e, &enter) == 0);
+    uint64_t limit = deadline();
+    /* edit-ze59: the write runs on a worker and editor_save_as_tick adopts it
+     * (peer reloads there); the command's checkpoint is the worker
+     * publication (publish_owed), whose refusal is adopted later still. */
+    while (e->file_command != KEYS_ACTION_NONE || e->save_as || !e->busy_refusals)
+    { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    const editor_buffer *other = peer ? e3z5_buffer(e, peer_id) : NULL;
+    fprintf(stderr, "dataloss_test: edit-e3z5 save_as(%s) with guard held: notice=%s refusals=%u owed=%d path_moved=%d owner_modified=%d peer_stale=%d peer_modified=%d\n",
+        peer ? "peer" : "alone", e->recovery_notice ? e->recovery_notice : "(none)", e->busy_refusals, e->publish_owed,
+        !strcmp(e->buffer->path, target), editor_tab(e, 0)->modified, other ? other->source_stale : -1,
+        peer ? editor_tab(e, 1)->modified : -1);
+    T(!e->recovery_notice); /* within the first tick a refusal is silent; never "save as failed" */
+    T(disk_is(target, "Asource") == 0);
+    T(e->busy_refusals == 1u && !strcmp(e->buffer->path, target) && !editor_tab(e, 0)->modified);
+    /* edit-9fzc: the clean peer took the written bytes; its checkpoint is the owed publication. */
+    if (peer) { T(other && !other->source_stale && !editor_tab(e, 1)->modified); T(e3z5_tab_is(e, 1, "Asource") == 0); }
+    T(e->publish_owed && !e->busy_checkpoint); /* the worker publication stays owed */
+    T(close(guard) == 0);
+    limit = deadline();
+    while (e->busy_refusals || e->publish_owed || e->publish || (peer && !e3z5_tab_holds(e, 1, "Asource")))
+    { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0);
+    T(!e->recovery_notice && !e->busy_refusals && !e->publish_owed && !e->busy_checkpoint && !editor_tab(e, 0)->modified);
+    if (peer) {
+        other = e3z5_buffer(e, peer_id);
+        T(other && !other->source_stale && !editor_tab(e, 1)->modified); T(e3z5_tab_is(e, 1, "Asource") == 0);
+    }
+    fprintf(stderr, "dataloss_test: edit-e3z5 save_as(%s) landed after the guard was released\n", peer ? "peer" : "alone");
+    editor_close(e); remove_tree(root); return 0;
+}
+/* edit-e3z5 (b): an explicit Reload with every buffer slot taken. (P) Slots =
+ * tab_capacity + closed_capacity = 2 + 1: the stale tab, a retained closed tab
+ * and a second live tab fill them. The Reload is not silently dropped: a
+ * notice says why and the prompt stays, so R works once a slot frees. */
+static int e3z5_no_slot(void)
+{
+    char root[64], source[128], other[128], third[128], jpath[128]; T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
+    T(snprintf(other, sizeof other, "%s/other", root) > 0); T(write_file(other, "other") == 0);
+    T(snprintf(third, sizeof third, "%s/third", root) > 0); T(write_file(third, "third") == 0);
+    T(make_session(root, jpath, sizeof jpath) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = source, .journal_path = jpath, .cols = COLS, .rows = ROWS,
+        .tab_capacity = 2, .closed_capacity = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id;
+    T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
+    T(editor_add_buffer(e, third, NULL, 0, &id) == 0); T(settle(e) == 0);
+    size_t used = 0; for (size_t i = 0; i < e->buffer_capacity; i++) used += e->buffers[i] != NULL;
+    T(used == e->buffer_capacity);
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    T(press(e, 'x', 0, "x") == 0); T(stale_prompt(e, source, "external") == 0);
+    T(choose(e, true) == 0);
+    fprintf(stderr, "dataloss_test: edit-e3z5 reload with no free slot: notice=%s stale=%d choice=%u\n",
+        e->recovery_notice ? e->recovery_notice : "(none)", e->buffer->source_stale, e->source_choice);
+    T(e->recovery_notice && strstr(e->recovery_notice, "reload") && e->buffer->source_stale);
+    T(text_is(e, "xbase") == 0);
+    /* Closing the live tab evicts the retained one (closed capacity 1), whose
+     * slot maintenance frees; the prompt is still there and R now lands. */
+    T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
+    T(e->buffer->source_stale); T(choose(e, true) == 0);
+    fprintf(stderr, "dataloss_test: edit-e3z5 reload after a slot freed: notice=%s stale=%d\n",
+        e->recovery_notice ? e->recovery_notice : "(none)", e->buffer->source_stale);
+    T(!e->recovery_notice && !e->buffer->source_stale); T(text_is(e, "external") == 0); T(!editor_tab(e, 0)->modified);
+    editor_close(e); remove_tree(root); return 0;
+}
 
 /* edit-9fzc: (P) the tabs are the Save As owner and its clean target peer;
  * lengths come from fixture literals, indexes from that insertion order.
@@ -1564,11 +1679,16 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--detached-rewrite")) return detached_rewrite(false);
     if (argc == 2 && !strcmp(argv[1], "--retain-window")) return detached_rewrite(true);
     if (argc == 2 && !strcmp(argv[1], "--reload-held")) return reload_during_save(true) || reload_during_save(false);
+    if (argc == 2 && !strcmp(argv[1], "--edit-e3z5")) {
+        /* every case runs, so one red run shows each failure */
+        int failed = e3z5_save_as(true); failed |= e3z5_save_as(false); failed |= e3z5_no_slot(); return failed;
+    }
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
     T(reload_during_save(true) == 0); T(reload_during_save(false) == 0);
     T(ivv_choice(false) == 0); T(ivv_choice(true) == 0);
+    T(e3z5_save_as(true) == 0); T(e3z5_save_as(false) == 0); T(e3z5_no_slot() == 0);
     T(save_during_prompt(true) == 0); T(save_during_prompt(false) == 0);
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);

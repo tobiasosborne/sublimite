@@ -434,7 +434,9 @@ struct editor {
      * busy_due_ns is that tick (0 none); busy_refusals counts consecutive
      * refusals (a second one has outlasted the tick: notice). A startup
      * recovery whose checkpoint was refused owes one (busy_checkpoint) and
-     * retires its source journal (busy_source, lease held) only after it. */
+     * retires its source journal (busy_source, lease held) only after it.
+     * A refused Save As checkpoint stays publish_owed instead (edit-ze59,
+     * edit-e3z5). */
     uint64_t busy_due_ns;
     uint32_t busy_refusals;
     bool busy_checkpoint;
@@ -698,6 +700,15 @@ int editor_adopt_open(editor *e, editor_buffer *b);
 int editor_check_sources(editor *e);
 /* Save As peers share its owed worker checkpoint (edit-9fzc). */
 int editor_reload_saved_peer(editor *e, editor_buffer *b, size_t tab_index);
+/* edit-e3z5: why a reload (buffers.c reload_source) left the buffer in
+ * place. REFUSED is JOURNAL_BUSY (retry on the journal tick); DEFERRED waits
+ * for a save on the file or staged journal ops (transient); NO_SLOT needs a
+ * free buffer slot (a user action); FAILED is any other rollback
+ * (acquisition or checkpoint). */
+typedef enum editor_reload_outcome {
+    EDITOR_RELOAD_DONE, EDITOR_RELOAD_FAILED, EDITOR_RELOAD_REFUSED,
+    EDITOR_RELOAD_DEFERRED, EDITOR_RELOAD_NO_SLOT
+} editor_reload_outcome;
 int editor_activate(editor *e);
 int editor_cycle_tab(editor *e, bool reverse);
 int editor_compose(editor *e);
