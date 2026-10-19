@@ -1108,6 +1108,28 @@ static int open_gib(void)
     remove_tree(root); return rc;
 }
 
+/* edit-qzam: this editor's own jobs that hold the session directory guard
+ * LOCK_SH (journal.c): the edit-fi2/7cj8 BASE copy (RUNNING) and the worker
+ * checkpoint (e->publish, edit-ze59) that references a READY copy or, for an
+ * unprotected stale BASE, the edit-7cj8 detached original. Both follow the
+ * first edit by themselves; a test that takes the guard LOCK_EX|LOCK_NB to
+ * stand in for another editor's sweep waits until neither runs or is owed. */
+static bool guard_quiet(const editor *e)
+{
+    const editor_buffer *b = e->buffer;
+    if (e->publish || b->retain_state == EDITOR_RETAIN_RUNNING) return false;
+    if (b->retain_state == EDITOR_RETAIN_READY) return b->retain_used;
+    return !editor_retain_unprotected(b);
+}
+static int wait_guard_quiet(editor *e)
+{
+    uint64_t limit = deadline();
+    while (!guard_quiet(e)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    fprintf(stderr, "dataloss_test: edit-qzam own guard holders done: retain_state=%u retain_used=%d\n",
+        e->buffer->retain_state, e->buffer->retain_used);
+    return 0;
+}
+
 /* edit-ivv (d): Reload/Keep chosen while another editor's directory sweep
  * holds the shared guard LOCK_EX (journal_test --rotate-busy pattern): the
  * choice survives the refused checkpoint and lands on a later journal tick.
@@ -1119,6 +1141,7 @@ static int ivv_choice(bool reload)
     T(make_session(root, jpath, sizeof jpath) == 0);
     render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
     T(press(e, 'x', 0, "x") == 0); T(stale_prompt(e, source, "external") == 0);
+    T(wait_guard_quiet(e) == 0); /* edit-qzam: no own job holds or is owed the guard */
     int guard = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC); T(guard >= 0 && flock(guard, LOCK_EX | LOCK_NB) == 0);
     T(press(e, reload ? 'r' : 'k', 0, NULL) == 0);
     uint64_t limit = deadline();
