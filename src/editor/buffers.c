@@ -1021,6 +1021,8 @@ int editor_reload_saved_peer(editor *e, editor_buffer *b, size_t tab_index)
     return reload_source(e, b, tab_index, NULL, true);
 }
 
+/* edit-3620: replaces the prompt row (save overlay), so it repeats the choices. */
+static const char keep_failed_notice[] = "Keep failed: R reload / K keep";
 int editor_source_resolve(editor *e, bool reload)
 {
     if (!e || !e->buffer->source_stale) return EDITOR_ERR_ARG;
@@ -1094,16 +1096,24 @@ int editor_check_sources(editor *e)
             }
         }
         if (b->save) {
+            /* edit-3620: an unexaminable target (stat FILE_ERR_IO) or a
+             * refused rebase retains the prompt and says so; dismissing
+             * would leave the controller on the pre-rename baseline. */
             file_id identity;
-            if (file_id_stat_path(b->save_path, &identity) == FILE_OK &&
-                savectl_rebase_kept_target(b->save, &identity)) return 0;
+            if (file_id_stat_path(b->save_path, &identity) != FILE_OK ||
+                savectl_rebase_kept_target(b->save, &identity)) {
+                e->recovery_notice = keep_failed_notice; e->recovery_notice_mutations = e->stats.mutations;
+                return editor_full_layout(e);
+            }
         }
+        if (e->recovery_notice == keep_failed_notice) e->recovery_notice = NULL;
         b->saved_lost = true;
         if (b->target_rebound) { b->operation_kind = 0; b->operation_error = 0; }
         b->source_stale = false; b->prompt_ns = 0; editor_modified(e);
         editor_large_keep(b);
         return editor_full_layout(e);
     }
+    if (e->recovery_notice == keep_failed_notice) e->recovery_notice = NULL;
     bool refused = false;
     int rc = reload_source(e, b, tabs_active_index(&e->tabs), &refused, false);
     if (!rc && refused) e->source_choice = choice; /* edit-ivv: Reload again on the tick */

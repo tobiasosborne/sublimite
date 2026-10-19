@@ -178,6 +178,60 @@ static int mapped_keep_save_body(fixture *f)
     T(disk_is(f->path, "xyzbase") == 0);
     return 0;
 }
+/* edit-3620: Keep after an external rename-over of a Save As target whose
+ * name can no longer be examined. A search-denied parent makes
+ * file_id_stat_path(save_path) return FILE_ERR_IO (EACCES, never accepted as
+ * absence); Keep must retain the prompt and say so instead of rebasing
+ * nothing and dismissing. Journal-less COPY (the default threshold for the
+ * strlen("base")-byte fixture) is the configuration where this stat is the
+ * first one Keep performs. (P) 0700 owner rwx, 0 no access; zero is API
+ * success or the first tab. Root ignores search permission: skipped. */
+static int kept_target_unreadable(void)
+{
+    if (geteuid() == 0) { puts("edit-3620: skipped (root bypasses directory search permission)"); return 0; }
+    fixture f = {0}; T(open_fixture(&f, false, false) == 0);
+    char parent[IPC_PATH_CAP], target[IPC_PATH_CAP], replacement[IPC_PATH_CAP];
+    T(snprintf(parent, sizeof parent, "%s/target", f.directory) > 0);
+    T(snprintf(target, sizeof target, "%s/saved", parent) > 0);
+    T(snprintf(replacement, sizeof replacement, "%s/replacement", f.directory) > 0);
+    T(mkdir(parent, 0700) == 0);
+    editor *e = f.e; editor_buffer *b = e->buffer;
+    T(file_open_mode(b->file) == FILE_MODE_COPY);
+    e->file_command = KEYS_ACTION_SAVE_AS; strcpy(e->file_command_path, target);
+    e->file_command_owner = b->id; e->file_command_generation = b->source_generation;
+    uint64_t limit = deadline();
+    while (e->file_command != KEYS_ACTION_NONE || e->save_as || !b->target_rebound) {
+        T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
+    }
+    T(settle(e) == 0); T(disk_is(target, "base") == 0);
+    T(press(e, 'x', 0, "x") == 0); T(editor_tab(e, 0)->modified);
+    int fd = open(replacement, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+    ssize_t written = write(fd, "disk", strlen("disk")); int closed = close(fd);
+    T(written == (ssize_t)strlen("disk") && closed == 0);
+    T(rename(replacement, target) == 0);
+    limit = deadline();
+    while (!b->source_stale) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0);
+    file_id probe; T(chmod(parent, 0) == 0);
+    int stat_rc = file_id_stat_path(target, &probe);
+    e->recovery_notice = NULL;
+    int resolve_rc = editor_source_resolve(e, false);
+    int settle_rc = resolve_rc ? 0 : settle(e);
+    bool stale = b->source_stale; const char *notice = e->recovery_notice;
+    T(chmod(parent, 0700) == 0);
+    fprintf(stderr, "edit-3620: Keep with unreadable target stat=%d stale=%s notice=%s\n",
+        stat_rc, stale ? "yes" : "no", notice ? notice : "(none)");
+    T(stat_rc == FILE_ERR_IO && resolve_rc == 0 && settle_rc == 0);
+    T(stale && notice && *notice); T(editor_tab(e, 0)->modified);
+    /* The prompt stays answerable: once the name is readable again, Keep
+     * rebases onto the replacement and the next save writes the buffer. */
+    T(editor_source_resolve(e, false) == 0); T(settle(e) == 0);
+    T(!b->source_stale && editor_tab(e, 0)->modified && e->recovery_notice != notice);
+    T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(e) == 0); /* a clean reload may replace b */
+    T(!e->buffer->save_error && !editor_tab(e, 0)->modified); T(disk_is(target, "xbase") == 0);
+    (void)unlink(target); (void)unlink(replacement); (void)rmdir(parent);
+    close_fixture(&f); return 0;
+}
 static int mapped_keep_save(bool journalling)
 {
     fixture f = {0};
@@ -2294,6 +2348,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-3620")) return kept_target_unreadable();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ut0m")) { int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
@@ -2321,6 +2376,7 @@ int main(int argc, char **argv)
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(mapped_repeated_save(true) == 0); T(mapped_repeated_save(false) == 0);
     T(mapped_keep_save(true) == 0); T(mapped_keep_save(false) == 0);
+    T(kept_target_unreadable() == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
