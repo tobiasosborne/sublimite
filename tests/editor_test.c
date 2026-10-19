@@ -5337,6 +5337,161 @@ static int nbt1_results_geometry(void)
     return 0;
 }
 
+/* edit-ci6i: a minimap snapshot the buffer's piece allocator refuses
+ * (editor_piece_storage.fail_request, edit-bt1's fault seam) is deferred,
+ * never fail(): editor_step stays OK/MORE, the old map stays, the take is
+ * retried on the edit-bt1 tick (E: JOURNAL_DEFAULT_SYNC_NS, edit-dr9's
+ * durability interval), and a refusal that persists past one retry shows a
+ * status notice. A find results tab, as in edit-bt1: a derived buffer has
+ * no session publication, whose snapshot of each revision would otherwise
+ * be the cached one the minimap reuses. The view wraps, so the scroll
+ * slice (unwrapped only) takes no snapshot either: the map is the
+ * revision's only taker. 120 columns (P: open.c gives a minimap from 24). */
+static const char ci6i_notice[] = "minimap deferred: buffer memory exhausted";
+static bool ci6i_map_due(editor *e)
+{
+    minimap_input input = editor_map_input(e->buffer);
+    return input.index_ready && minimap_stale(&e->buffer->map, &input);
+}
+static int nci6i_map_refused(void)
+{
+    /* (P) One appended line ("a\n", two bytes) per attempt. Snapshot
+     * headers are pooled two per slab (piece.c pool_grow) and a released
+     * snapshot's slot is reused, so a take normally needs no allocator
+     * request; the test retains each revision's snapshot until free slots
+     * run out and a take must grow the pool, which is the armed (refused)
+     * request. */
+    enum { ATTEMPTS = 64 };
+    /* (E) TICKS retry ticks cover one persisting retry and the recovery. */
+    enum { TICKS = 4 };
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 120u, .rows = 1u + 3u + 20u, .wrap_mode = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id = 0;
+    T(editor_results_open(e, &id) == 0 && e->buffer->derived);
+    static const char line[] = "a\n";
+    T(editor_results_append(e, (const uint8_t *)line, sizeof line - 1u) == 0);
+    T(settle_map(e) == 0); T(e->map_cols && e->buffer->map.filled && e->v.state.wrap);
+    editor_piece_storage *s = &e->buffer->piece_storage;
+    piece_snapshot *held[ATTEMPTS]; size_t holds = 0;
+    bool hit = false;
+    for (unsigned attempt = 0; attempt < ATTEMPTS && !hit; attempt++) {
+        held[holds] = piece_snapshot_take(e->buffer->tree); T(held[holds]); holds++;
+        T(editor_results_append(e, (const uint8_t *)line, sizeof line - 1u) == 0);
+        s->fail_request = s->requests + 1u;
+        int rc = editor_step(e, 0);
+        hit = s->requests >= s->fail_request && !e->buffer->map_snapshot && ci6i_map_due(e);
+        s->fail_request = 0;
+        if (rc) fprintf(stderr, "edit-ci6i: editor_step rc %d error_cause %d (attempt %u, hit %d)\n",
+            rc, editor_get_stats(e).error_cause, attempt, hit);
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(!e->error);
+        if (!hit) T(settle_map(e) == 0);
+    }
+    T(hit);
+    /* One refusal: no notice; the editor keeps taking keys. */
+    T(!e->recovery_notice);
+    T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0); T(!e->error);
+    /* Persisting: the first request of each step is refused again; the
+     * retry tick fails too and the notice appears. */
+    uint64_t deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (!e->recovery_notice && trace_now_ns() < deadline) {
+        s->fail_request = s->requests + 1u;
+        int rc = editor_step(e, 20);
+        s->fail_request = 0;
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(!e->error);
+    }
+    T(e->recovery_notice && !strcmp(e->recovery_notice, ci6i_notice));
+    T(ci6i_map_due(e));
+    /* Recovered allocator: the map is prepared on a later tick. */
+    deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (ci6i_map_due(e) || e->buffer->map_snapshot) {
+        int rc = editor_step(e, 20);
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(trace_now_ns() < deadline);
+    }
+    T(settle(e) == 0); T(!e->error && !ci6i_map_due(e));
+    while (holds) piece_snapshot_release(held[--holds]);
+    editor_close(e);
+    puts("edit-ci6i: refused minimap snapshot defers the map, keeps the editor, notices persistence passed");
+    return 0;
+}
+
+/* edit-ci6i (2): the wrapped byte seek (far find result, pending minimap
+ * target; editor_wheel_continue -> editor_scroll_resolve) whose resident
+ * window cannot be installed is deferred like edit-bt1's slice: the seek
+ * stays pending, the view stays, the retry tick lands it, and a refusal
+ * persisting past one retry shows edit-bt1's notice (the same resident
+ * window and the same refusal). 16 columns: no minimap (P: open.c gives one
+ * from 24 columns), whose take would cache each revision's snapshot. */
+static int nci6i_seek(editor *e, uint64_t byte)
+{
+    /* The wrapped seek findpanel.c sets up for a far match. */
+    T(scroll_init(&e->wheel, (scroll_config){e->text_grid.dims.rows, 1, 0},
+        (scroll_extent){piece_len(e->tree), e->buffer->lines, e->buffer->lg.lines_exact}) == 0);
+    e->wheel.first_line = e->v.state.first_line; e->wheel.first_byte = e->v.state.first_byte;
+    T(scroll_seek_byte(&e->wheel, byte) == 0);
+    e->wheel_resolver = (scroll_resolver){0}; e->wheel_pending = true; e->find_scroll = false;
+    return 0;
+}
+static int nci6i_resolve_refused(void)
+{
+    /* (P) LINES lines of "a\n" (two bytes each), many more than the text
+     * rows, so the seek target is off screen: the last line from the top
+     * (byte 0), byte 0 from anywhere else (an earlier attempt's seek). */
+    enum { LINES = 512, ATTEMPTS = 64 };
+    enum { TICKS = 4 }; /* (E) as in nci6i_map_refused */
+    static const char bt1_notice[] = "scrolling deferred: buffer memory exhausted";
+    static char text[2u * LINES];
+    for (size_t i = 0; i < sizeof text; i++) text[i] = i % 2u ? '\n' : 'a';
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 16u, .rows = 8u, .wrap_mode = 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t id = 0;
+    T(editor_results_open(e, &id) == 0 && e->buffer->derived);
+    T(editor_results_append(e, (const uint8_t *)text, sizeof text) == 0);
+    T(settle(e) == 0); T(!e->map_cols && e->v.state.wrap);
+    editor_piece_storage *s = &e->buffer->piece_storage;
+    piece_snapshot *held[ATTEMPTS]; size_t holds = 0;
+    bool hit = false; uint64_t top = 0, target = 0;
+    for (unsigned attempt = 0; attempt < ATTEMPTS && !hit; attempt++) {
+        held[holds] = piece_snapshot_take(e->buffer->tree); T(held[holds]); holds++;
+        T(editor_results_append(e, (const uint8_t *)"a\n", 2u) == 0);
+        T(settle(e) == 0);
+        top = editor_view(e).first_byte; target = top ? 0 : editor_length(e) - 2u;
+        T(nci6i_seek(e, target) == 0);
+        s->fail_request = s->requests + 1u;
+        int rc = editor_step(e, 0);
+        hit = s->requests >= s->fail_request && !e->buffer->scroll_snapshot;
+        s->fail_request = 0;
+        if (rc) fprintf(stderr, "edit-ci6i: wrapped seek editor_step rc %d error_cause %d (attempt %u, hit %d)\n",
+            rc, editor_get_stats(e).error_cause, attempt, hit);
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(!e->error);
+        if (!hit) { T(settle(e) == 0); T(!e->wheel_pending); }
+    }
+    T(hit);
+    T(e->wheel_pending && editor_view(e).first_byte == top && !e->recovery_notice);
+    uint64_t deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (!e->recovery_notice && trace_now_ns() < deadline) {
+        s->fail_request = s->requests + 1u;
+        int rc = editor_step(e, 20);
+        s->fail_request = 0;
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(!e->error);
+    }
+    T(e->recovery_notice && !strcmp(e->recovery_notice, bt1_notice));
+    T(e->wheel_pending && editor_view(e).first_byte == top);
+    deadline = trace_now_ns() + TICKS * JOURNAL_DEFAULT_SYNC_NS;
+    while (e->wheel_pending) {
+        int rc = editor_step(e, 20);
+        T(rc == EDITOR_OK || rc == EDITOR_MORE); T(trace_now_ns() < deadline);
+    }
+    T(settle(e) == 0); T(!e->error);
+    fprintf(stderr, "edit-ci6i: wrapped seek landed top %llu (from %llu, target %llu)\n",
+        (unsigned long long)editor_view(e).first_byte, (unsigned long long)top, (unsigned long long)target);
+    T(target ? editor_view(e).first_byte > top : editor_view(e).first_byte == 0);
+    while (holds) piece_snapshot_release(held[--holds]);
+    editor_close(e);
+    puts("edit-ci6i: refused wrapped seek window defers the seek, keeps the view, notices persistence passed");
+    return 0;
+}
 /* edit-yey (P): menu bar contract. Geometry: the File drop-down's longest
  * label + gap + chord + two padding cells, plus the existing minimap; rows
  * are the bar, the tab strip and enough text rows to show File's items.
@@ -5581,6 +5736,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
         if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
         if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
+        if (!strcmp(argv[1], "--ci6i-map")) return nci6i_map_refused();
+        if (!strcmp(argv[1], "--ci6i-seek")) return nci6i_resolve_refused();
         if (!strcmp(argv[1], "--g02-previous")) return g02_find_previous_uncached();
         if (!strcmp(argv[1], "--duplicate-path")) return duplicate_path_contract();
         if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return !strcmp(argv[1], "--o20-all") ? o20_all() : o20_case(argv[1] + sizeof "--o20-" - 1u);
@@ -5687,6 +5844,8 @@ int main(int argc, char **argv)
     T(n3f2k_save_with_results() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
+    T(nci6i_map_refused() == 0);
+    T(nci6i_resolve_refused() == 0);
     T(g02_find_previous_uncached() == 0);
     T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);

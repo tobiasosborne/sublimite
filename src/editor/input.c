@@ -1453,7 +1453,7 @@ bool editor_wheel_ready(const editor *e)
     const editor_buffer *b=e->buffer;
     /* Waiting on 3kk's scroll slice or on its resident window is not work. */
     if (e->find_scroll && !e->v.state.wrap) return !b->scroll_pending;
-    if (e->v.state.wrap && e->wheel.request==SCROLL_BYTE) return !b->scroll_resident.pending;
+    if (e->v.state.wrap && e->wheel.request==SCROLL_BYTE) return !b->scroll_resident.pending && !editor_scroll_deferred(b); /* edit-ci6i */
     return true;
 }
 int editor_wheel_continue(editor *e)

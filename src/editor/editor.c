@@ -669,9 +669,14 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
      * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
     uint64_t deadline = e->checkpoint_retry_ns ? e->checkpoint_retry_ns : e->blinking ? e->next_blink : UINT64_MAX;
-    /* edit-bt1: wake for a deferred scroll slice's retry tick. */
-    if (e->buffer->scroll_retry_ns && e->buffer->scroll_pending && e->buffer->scroll_retry_ns < deadline)
+    /* edit-bt1: wake for a deferred scroll slice's retry tick (edit-ci6i:
+     * or a deferred wrapped seek's, which keeps wheel_pending instead). */
+    if (e->buffer->scroll_retry_ns && (e->buffer->scroll_pending || e->wheel_pending) && e->buffer->scroll_retry_ns < deadline)
         deadline = e->buffer->scroll_retry_ns;
+    /* edit-ci6i: and for a deferred minimap snapshot's, while a map is due;
+     * editor_map_service retries on the step that follows. */
+    uint64_t map_tick = editor_map_retry_ns(e);
+    if (map_tick && map_tick < deadline) deadline = map_tick;
     /* edit-ivv: wake for a refused checkpoint's retry tick; once it has
      * passed, the retrying path runs on this step and no wake is owed. */
     if (e->busy_due_ns > now && e->busy_due_ns < deadline) deadline = e->busy_due_ns;

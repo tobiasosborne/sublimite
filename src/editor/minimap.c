@@ -1,5 +1,6 @@
 #include "editor/private.h"
 #include "file/file.h"
+#include "trace/trace.h"
 #include <string.h>
 #define EDITOR_MAP_MESSAGE UINT32_C(0x454d4150) /* ASCII EMAP */
 static size_t snapshot_span(void *ctx, uint64_t off, const uint8_t **bytes)
@@ -41,6 +42,33 @@ bool editor_map_receive(editor *e, const work_msg *msg)
     }
     return true;
 }
+/* edit-ci6i: a refused map snapshot is no editor failure (the edit-bt1
+ * pattern). The old map stays on screen; the take is retried on the next
+ * tick, edit-dr9's retry interval (E: JOURNAL_DEFAULT_SYNC_NS, the existing
+ * durability tick), and wait_timeout wakes the step for it. A refusal that
+ * persists past one retry is shown on the status row (the edit-btj notice). */
+static const char refused_notice[] = "minimap deferred: buffer memory exhausted";
+static bool map_due(const editor *e, editor_buffer *b)
+{
+    if (!b || !e->map_cols || b->map_snapshot || b->map_sync_fill || b->pending_open || b->source_stale) return false;
+    minimap_input input=editor_map_input(b);
+    return input.index_ready && (minimap_stale(&b->map,&input) || b->map.height!=e->map_grid.dims.rows);
+}
+uint64_t editor_map_retry_ns(const editor *e)
+{
+    editor_buffer *b=e->buffer;
+    return b && b->map_retry_ns && map_due(e,b) ? b->map_retry_ns : 0;
+}
+static int defer(editor *e, editor_buffer *b)
+{
+    b->map_retry_ns=trace_now_ns()+JOURNAL_DEFAULT_SYNC_NS;
+    if (b->map_refusals<UINT32_MAX) b->map_refusals++;
+    if (b->map_refusals>1u && e->recovery_notice!=refused_notice) {
+        e->recovery_notice=refused_notice; e->recovery_notice_mutations=e->stats.mutations;
+        (void)editor_begin_frame(e);
+    }
+    return 0;
+}
 int editor_map_service(editor *e)
 {
     for (size_t i=0;i<e->buffer_capacity;i++) {
@@ -53,11 +81,12 @@ int editor_map_service(editor *e)
         }
     }
     editor_buffer *b=e->buffer;
-    if (!b || !e->map_cols || b->map_snapshot || b->map_sync_fill || b->pending_open || b->source_stale) return 0;
+    if (!map_due(e,b)) return 0;
+    if (b->map_retry_ns && trace_now_ns()<b->map_retry_ns) return 0; /* edit-ci6i: keep the old map */
     minimap_input input=editor_map_input(b);
-    if (!input.index_ready || (!minimap_stale(&b->map,&input) && b->map.height==e->map_grid.dims.rows)) return 0;
     b->map_snapshot=piece_snapshot_take(b->tree);
-    if (!b->map_snapshot) return EDITOR_ERR_MEMORY;
+    if (!b->map_snapshot) return defer(e,b);
+    b->map_retry_ns=0; b->map_refusals=0;
     /* Lane (landing decision, docs/decisions/edit-73j.md): the bulk lane can
      * be monopolised by a large file's index/warm/find jobs, so a summary must
      * not wait behind them. A memory-resident snapshot is CPU-only work of at

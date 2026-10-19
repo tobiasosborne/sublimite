@@ -151,6 +151,10 @@ typedef struct editor_buffer {
     int map_job_error;
     bool map_job_sealed, map_received;
     bool map_sync_fill; /* file-backed source: compose prepares the first map (edit-73j landing) */
+    /* edit-ci6i: a refused map snapshot defers the take until this tick
+     * (0: none due); consecutive refusals, a notice from the second on. */
+    uint64_t map_retry_ns;
+    uint32_t map_refusals;
     view_state initial;
     scroll_state scroll;
     scroll_state scroll_display;
@@ -690,12 +694,14 @@ void editor_hl_service(editor *e);
 void editor_hl_request(editor *e);
 void editor_hl_paint(editor *e, uint64_t byte, uint32_t *fg);
 int editor_map_service(editor *e);
+uint64_t editor_map_retry_ns(const editor *e); /* edit-ci6i: the due retry tick, 0 if none */
 bool editor_map_receive(editor *e, const work_msg *msg);
 int editor_chrome_pointer(editor *e, const plat_event *ev);
 int editor_wheel_continue(editor *e);
 int editor_text_geometry(editor *e);
 bool editor_wheel_ready(const editor *e);
 int editor_scroll_resolve(editor *e, scroll_state *s, scroll_resolver *r);
+bool editor_scroll_deferred(const editor_buffer *b); /* edit-bt1/ci6i: a refused install waits for its tick */
 void editor_hit_record(void *ctx, uint32_t row, uint32_t column, uint32_t count,
     uint32_t skip, uint32_t width, uint64_t before, uint64_t after);
 int editor_find_init(editor *e);

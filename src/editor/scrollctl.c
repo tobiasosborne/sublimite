@@ -52,17 +52,22 @@ void editor_scroll_close(editor_buffer *b)
 static const char refused_notice[] = "scrolling deferred: buffer memory exhausted";
 static bool deferred(const editor_buffer *b)
 { return b->scroll_retry_ns && trace_now_ns() < b->scroll_retry_ns; }
-static int defer(editor *e, editor_buffer *b)
+/* edit-ci6i: the wrapped byte seek (editor_scroll_resolve) shares the
+ * window and so the refusal; it keeps its own pending seek (wheel_pending). */
+static void refuse(editor *e, editor_buffer *b)
 {
-    b->scroll_pending = true;
     b->scroll_retry_ns = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS;
     if (b->scroll_refusals < UINT32_MAX) b->scroll_refusals++;
     if (b->scroll_refusals > 1u && e->recovery_notice != refused_notice) {
         e->recovery_notice = refused_notice; e->recovery_notice_mutations = e->stats.mutations;
         (void)editor_begin_frame(e);
     }
-    return 0;
 }
+static int defer(editor *e, editor_buffer *b)
+{
+    b->scroll_pending = true; refuse(e, b); return 0;
+}
+bool editor_scroll_deferred(const editor_buffer *b) { return deferred(b); }
 static int install(editor_buffer *b)
 {
     piece_tree *tree = b->pending_open ? b->preview : b->tree;
@@ -82,10 +87,14 @@ int editor_scroll_resolve(editor *e, scroll_state *s, scroll_resolver *r)
 {
     editor_buffer *b = e->buffer;
     if (!b->scroll_snapshot || b->scroll_revision != b->revision || b->scroll_resident.closing) {
+        if (deferred(b)) return SCROLL_MORE; /* edit-ci6i: keep the view, seek stays pending */
         int rc = editor_scroll_retire(b);
         if (rc == EDITOR_MORE) return SCROLL_MORE;
         if (rc) return rc;
-        rc = install(b); if (rc) return rc;
+        rc = install(b);
+        if (rc == EDITOR_ERR_MEMORY) { refuse(e, b); return SCROLL_MORE; }
+        if (rc) return rc;
+        b->scroll_retry_ns = 0; b->scroll_refusals = 0;
         *r = (scroll_resolver){0};
     }
     return scroll_resolve_resident(s, r, b->index, &b->scroll_resident, 0, trace_now_ns() + EDITOR_SLICE_NS);
