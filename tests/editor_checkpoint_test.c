@@ -6,6 +6,7 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -49,6 +50,53 @@ static int cleanup(const char *root)
         T(unlinkat(dirfd(directory), entry->d_name, 0) == 0);
     T(closedir(directory) == 0 && rmdir(root) == 0);
     return 0;
+}
+/* edit-fi0p F4: (P) directory barriers are temp creation then publication.
+ * Zero/one are success/failure, first tab, empty offsets and unit increments;
+ * the fixture size is its literal's byte length. No timing assertion. */
+typedef struct name_barrier { bool renamed, fail; } name_barrier;
+static int barrier_rename(void *ctx, const char *from, const char *to)
+{
+    name_barrier *b = ctx;
+    int rc = rename(from, to);
+    if (!rc) b->renamed = true;
+    return rc;
+}
+static int barrier_sync(void *ctx, int fd, bool directory)
+{
+    name_barrier *b = ctx;
+    if (directory && b->renamed && b->fail) { errno = EIO; return -1; }
+    return directory ? fsync(fd) : fdatasync(fd);
+}
+static int retry_name_barrier(void)
+{
+    char root[] = "build/editor-fi0p-barrier-XXXXXX"; T(mkdtemp(root));
+    char log[IPC_PATH_CAP]; editor *e = NULL; int result = 0;
+#define C(x) do { if (!(x)) { fprintf(stderr, "editor_checkpoint_test:%d FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(snprintf(log, sizeof log, "%s/session", root) > 0);
+    render_backend backend = {0}; C(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = log, .initial = (const uint8_t *)"checkpoint",
+        .initial_len = sizeof "checkpoint" - 1u};
+    C(editor_open(&e, &config, &backend) == 0); C(settle(e) == 0 && editor_flush(e) == 0);
+    name_barrier fault = {.fail = true};
+    journal_io io = {.ctx = &fault, .rename = barrier_rename, .sync = barrier_sync};
+    C(journal_set_io(e->journal, &io) == 0);
+    C(editor_checkpoint(e) == JOURNAL_IO && fault.renamed);
+    C(journal_get_stats(e->journal).durable_sequence == 0);
+    C(editor_flush(e) != 0); /* failed repair never acknowledges durability */
+    C(journal_get_stats(e->journal).durable_sequence == 0);
+    fault.fail = false;
+    C(editor_flush(e) == 0);
+    journal_stats js = journal_get_stats(e->journal);
+    C(!js.error && js.accepted_sequence == js.durable_sequence && !js.unprotected_bytes);
+    C(!e->stats.journal_error && !e->error);
+    C(journal_set_io(e->journal, NULL) == 0);
+done:
+    if (e) { (void)journal_set_io(e->journal, NULL); editor_close(e); }
+    if (cleanup(root)) result = 1;
+#undef C
+    if (!result) puts("editor_checkpoint_test: fi0p flush repairs failed checkpoint name barrier");
+    return result;
 }
 /* edit-dr9 (P): one buffer/worker, literal text, and schema path capacity.
  * Inject the existing FULL checkpoint-fallback condition after a durable
@@ -869,6 +917,7 @@ int main(int argc, char **argv)
     char made[] = "build/editor-28u-xdg-XXXXXX"; T(mkdtemp(made));
     char xdg[IPC_PATH_CAP]; T(realpath(made, xdg)); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
     int failed = 0;
+    if (wanted("fi0p-barrier") && retry_name_barrier()) failed++;
     if (wanted("busy") && busy_close_checkpoint()) failed++;
     if (wanted("pending") && pending_checkpoint(false)) failed++;
     if (wanted("pending") && pending_checkpoint(true)) failed++;

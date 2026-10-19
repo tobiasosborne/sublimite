@@ -54,6 +54,7 @@ void editor_retain_tick(editor *e)
             b->retain_handle = (work_handle){0};
             b->retain_state = b->retain.error == JOURNAL_BUSY ? EDITOR_RETAIN_IDLE :
                 b->retain.error ? EDITOR_RETAIN_FAILED : EDITOR_RETAIN_READY;
+            if (b->retain_state == EDITOR_RETAIN_FAILED) b->retain_failed_revision = b->revision;
             b->retain_used = b->retain_building = false;
             if (b->retain_state == EDITOR_RETAIN_READY) editor_session_publish(e, b);
             break;
@@ -64,7 +65,8 @@ void editor_retain_tick(editor *e)
             else if (!b->retain_used) want = true;
             break;
         case EDITOR_RETAIN_FAILED:
-            if (!editor_base_id_matches(&b->retain_of, &b->base)) b->retain_state = EDITOR_RETAIN_IDLE;
+            if (!editor_base_id_matches(&b->retain_of, &b->base) || b->revision != b->retain_failed_revision)
+                b->retain_state = EDITOR_RETAIN_IDLE;
             break;
         default:
             if (b->retired || b->pending_open || !*b->path || !*b->base.path || !b->base.size ||

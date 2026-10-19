@@ -146,6 +146,42 @@ static void fini(recovered_session *s)
     }
     free(s->tabs); *s = (recovered_session){0};
 }
+/* edit-fi0p F7: the bytes must belong to the recorded BASE, independently
+ * of replay's earlier prefix check. Hold and validate the actual descriptor
+ * across the complete read, and verify its pathname still selects it. */
+static int materialize_base(recovered_buffer *b, const journal_base *base)
+{
+    int fd = open(base->path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return JOURNAL_BASE_CHANGED;
+    struct stat st;
+    file_id before = {0}, after = {0}, named = {0};
+    int rc = fstat(fd, &st) ? JOURNAL_BASE_CHANGED : 0;
+    if (!rc) {
+        file_id_from_stat(&before, &st);
+        if (before.type != S_IFREG || before.dev != base->device || before.ino != base->inode ||
+            before.size != base->size || before.mtime_ns != base->mtime_ns || before.ctime_ns != base->ctime_ns)
+            rc = JOURNAL_BASE_CHANGED;
+    }
+    size_t done = 0;
+    while (!rc && done < b->len) {
+        ssize_t n = read(fd, b->bytes + done, b->len - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { rc = JOURNAL_BASE_CHANGED; break; }
+        done += (size_t)n;
+    }
+    if (!rc && fstat(fd, &st)) rc = JOURNAL_BASE_CHANGED;
+    if (!rc) {
+        file_id_from_stat(&after, &st);
+        if (file_id_stat_path(base->path, &named) || file_id_diff(&before, &after) || file_id_diff(&after, &named))
+            rc = JOURNAL_BASE_CHANGED;
+    }
+    journal_base captured;
+    if (!rc) {
+        rc = journal_base_from_prefix(base->path, &after, b->bytes, b->len, &captured);
+        if (!rc && !editor_base_id_matches(&b->base_id, &captured)) rc = JOURNAL_BASE_CHANGED;
+    }
+    close(fd); return rc;
+}
 static int restore_record(void *ctx, const journal_record *r)
 {
     recovered_session *s = ctx;
@@ -200,15 +236,7 @@ static int restore_record(void *ctx, const journal_record *r)
         const char *leaf = strrchr(path, '/');
         if (leaf && !strncmp(leaf + 1, ".sublimite-base-", strlen(".sublimite-base-"))) strcpy(b->retained, path);
         if (*path && !b->mapped_replay) {
-            int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK); if (fd < 0) return JOURNAL_IO;
-            size_t done = 0;
-            while (done < b->len) {
-                ssize_t n = read(fd, b->bytes + done, b->len - done);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) { close(fd); return JOURNAL_IO; }
-                done += (size_t)n;
-            }
-            close(fd);
+            int rc = materialize_base(b, &base); if (rc) return rc;
         }
         return 0;
     }

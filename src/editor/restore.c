@@ -49,6 +49,7 @@ struct editor_restore {
     size_t op_count, op_capacity;
     edit_arena payload;
     uint64_t *tabs;
+    uint64_t active_id;          /* edit-fi0p F11: source id survives TABS deduplication */
     size_t tab_count;
     bool tabs_valid, conflicts;
 };
@@ -122,6 +123,8 @@ static int scan_record(void *ctx, const journal_record *rec)
         uint64_t *tabs = count ? realloc(r->tabs, (size_t)count * sizeof *tabs) : r->tabs;
         if (count && !tabs) return JOURNAL_NOMEM;
         for (size_t i = 0; i < count; i++) tabs[i] = get64(p + 16 + i * 8);
+        uint64_t active = get64(p + sizeof(uint64_t));
+        r->active_id = active < count ? tabs[active] : 0; /* (P) zero = no saved active tab */
         r->tabs = tabs; r->tab_count = (size_t)count; r->tabs_valid = true; return 0;
     }
     editor_restore_buffer *b = find(r, rec->buffer_id);
@@ -279,6 +282,7 @@ static void program_free(editor_restore *r)
     if (r->payload.base) edit_arena_free(&r->payload);
     r->buffers = NULL; r->ops = NULL; r->tabs = NULL; r->payload = (edit_arena){0};
     r->count = r->capacity = r->op_count = r->op_capacity = r->tab_count = 0;
+    r->active_id = 0;
     r->tabs_valid = r->conflicts = false;
 }
 static void job_quiesce(editor_restore *r)
@@ -623,8 +627,11 @@ static int install_all(editor *e, editor_buffer *p)
         mark(e, tabs_active_index(&e->tabs), b, order[k]);
         if (k >= live) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
+    editor_buffer *active = first;
+    if (!rc && r->tabs_valid) for (size_t k = 0; k < live; k++)
+        if (order[k]->id == r->active_id) active = installed[k];
     free(order);
-    if (!rc) { rc = tabs_select(&e->tabs, live_index(e, first->id), &e->v.state); rc = rc ? EDITOR_ERR_ARG : editor_activate(e); }
+    if (!rc) { rc = tabs_select(&e->tabs, live_index(e, active->id), &e->v.state); rc = rc ? EDITOR_ERR_ARG : editor_activate(e); }
     e->recovering = false;
     /* The recovered text is durable here before the source is retired. */
     if (!rc && e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }

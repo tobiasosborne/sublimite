@@ -387,6 +387,12 @@ int journal_scan_file(const char *path, journal_visit visit, void *ctx,
  * empty journal + strlen("base")=4-byte retained original) = 131200 bytes.
  * (E): reuse that observed footprint as the eligible-artifact retention cap. */
 int journal_retire_directory(const char *directory, const char *current);
+/* Operator acknowledgement AFTER manually resolving a reserved rotation
+ * set-aside. No automatic caller. Verify a complete CRC-valid regular source
+ * under exclusive directory/file leases, recheck its identity, unlink, and
+ * fsync the held parent. Refuse ordinary sessions, symlinks and corrupt/torn
+ * sources; BUSY preserves a leased or changing source. Off typing path. */
+int journal_acknowledge(const char *source);
 /* edit-fm4: startup reads at most this many bytes of one journal artifact
  * synchronously (retirement session scan; rotation temps need no scan;
  * for a discovered session, the journal plus

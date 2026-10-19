@@ -783,6 +783,41 @@ static int shared_save_as(bool dirty)
     editor_close(e); remove_tree(root); T(ok); return 0;
 }
 
+/* edit-fi0p F8: (P) owner and closed peer are the two named fixture
+ * buffers; literal lengths determine bytes. Disable retention to exercise
+ * the same unprotected BASE state as a file above the retention bound. */
+static int closed_peer_save_as(void)
+{
+    char root[IPC_PATH_CAP], source[IPC_PATH_CAP], target[IPC_PATH_CAP], log[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, sizeof target, "%s/target", root) > 0); T(write_file(target, "base") == 0);
+    char canonical[IPC_PATH_CAP]; T(realpath(target, canonical)); strcpy(target, canonical);
+    T(make_session(root, log, sizeof log) == 0);
+    render_backend backend; editor *e; T(open_editor(&e, &backend, source, log) == 0);
+    e->retain_limit = 0;
+    T(press(e, 'A', 0, "A") == 0);
+    uint64_t peer_id; T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0);
+    T(press(e, 'B', 0, "B") == 0);
+    editor_buffer *peer = e->buffer; uint64_t revision = peer->revision;
+    T(editor_close_tab(e, tabs_active_index(&e->tabs)) == 0); T(settle(e) == 0);
+    T(editor_flush(e) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) {
+        char ch[] = {target[i], '\0'}; T(press(e, (uint8_t)target[i], 0, ch) == 0);
+    }
+    T(press(e, XKB_KEY_Return, 0, NULL) == 0); T(saved(e) == 0);
+    char bytes[sizeof "base"]; ssize_t count = read_file(target, bytes, sizeof bytes);
+    bool refused = e->recovery_notice && strstr(e->recovery_notice, "modified") &&
+        count == (ssize_t)strlen("base") && !memcmp(bytes, "base", strlen("base")) &&
+        peer->revision == revision && tabs_closed_count(&e->tabs) == 1 &&
+        tabs_closed_at(&e->tabs, 0)->id == peer_id && tabs_closed_at(&e->tabs, 0)->modified;
+    editor_close(e); remove_tree(root);
+    T(refused);
+    puts("dataloss_test: fi0p Save As refuses a modified closed peer before target write");
+    return 0;
+}
+
 /* ---- edit-fi2: recovery survives an external rewrite of the original ----
  * (P) Fixture: 2 * FILE_PREFIX_MAX + 7 bytes, above the synchronous prefix,
  * so edit-28u checkpoints reference BASE instead of holding the text (the
@@ -1007,6 +1042,65 @@ static int retain_lifecycle(void)
     editor_close(e); T(!fi2_retained(root));
     remove_tree(root); return 0;
 }
+/* edit-fi0p F9: (P) one failed copy plus one mutation-authorised retry.
+ * The successful copy has two metadata barriers: copy, then promotion.
+ * Counts are callback observations, byte sizes are literal lengths; the
+ * existing EDITOR_IDLE_NS policy is only a deadlock watchdog (E). */
+typedef struct retry_retain { atomic_bool fail; atomic_uint syncs; } retry_retain;
+static int retry_retain_sync(void *ctx, int fd)
+{
+    retry_retain *r = ctx;
+    atomic_fetch_add(&r->syncs, 1u);
+    if (atomic_load(&r->fail)) { errno = EIO; return -1; }
+    return fsync(fd);
+}
+static int retain_after_failure(void)
+{
+    char root[IPC_PATH_CAP], source[IPC_PATH_CAP], log[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(source, sizeof source, "%s/source", root) > 0); T(write_file(source, "base") == 0);
+    T(make_session(root, log, sizeof log) == 0);
+    render_backend backend; editor *e = NULL; int result = 0;
+    retry_retain fault = {.fail = true};
+#define C(x) do { if (!(x)) { fprintf(stderr, "dataloss_test:%d FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(open_editor(&e, &backend, source, log) == 0);
+    e->retain_limit = 0; C(press(e, 'q', 0, "q") == 0); C(editor_flush(e) == 0);
+    journal_io io = {.ctx = &fault, .metadata_sync = retry_retain_sync};
+    C(journal_set_io(e->journal, &io) == 0);
+    e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
+    editor_retain_tick(e);
+    uint64_t limit = deadline();
+    while (e->buffer->retain_state == EDITOR_RETAIN_RUNNING) {
+        editor_retain_tick(e); C(trace_now_ns() < limit); sched_yield();
+    }
+    C(e->buffer->retain_state == EDITOR_RETAIN_FAILED);
+    unsigned failed_syncs = atomic_load(&fault.syncs); C(failed_syncs == 1u);
+    atomic_store(&fault.fail, false);
+    editor_retain_tick(e); editor_retain_tick(e);
+    C(e->buffer->retain_state == EDITOR_RETAIN_FAILED && atomic_load(&fault.syncs) == failed_syncs);
+    C(press(e, 'x', 0, "x") == 0);
+    editor_retain_tick(e);
+    C(e->buffer->retain_state != EDITOR_RETAIN_FAILED);
+    limit = deadline();
+    while (!e->buffer->retain_used && trace_now_ns() < limit) { C(turn(e) == 0); sched_yield(); }
+    if (!e->buffer->retain_used || atomic_load(&fault.syncs) != failed_syncs + 2u)
+        fprintf(stderr, "fi0p retain retry: state=%u used=%d syncs=%u error=%d journal=%d pending=%zu\n",
+            e->buffer->retain_state, e->buffer->retain_used, atomic_load(&fault.syncs), e->buffer->retain.error,
+            e->stats.journal_error, e->op_count);
+    C(e->buffer->retain_used && atomic_load(&fault.syncs) == failed_syncs + 2u);
+    C(editor_flush(e) == 0); C(journal_set_io(e->journal, NULL) == 0);
+    editor_close(e); e = NULL;
+    C(write_file(source, "changed") == 0);
+    C(make_session(root, log, sizeof log) == 0); C(open_editor(&e, &backend, NULL, log) == 0);
+    C(text_is(e, "qxbase") == 0 && editor_tab(e, 0)->modified);
+done:
+    if (e) { (void)editor_flush(e); (void)journal_set_io(e->journal, NULL); editor_close(e); }
+    remove_tree(root);
+#undef C
+    if (!result) puts("dataloss_test: fi0p failed retention retries after mutation and protects BASE from rewrite");
+    return result;
+}
+
 /* edit-9ev6 (recovery-3 F2): editor_close while a BASE copy is RUNNING. The
  * retention job borrows the journal's IO callbacks (r->io = &j->io); close
  * must quiesce it before the journal (an arena, unmapped on close) and its
@@ -1864,7 +1958,64 @@ static int select_edit_utin(void)
     /* every case runs, so one red run shows each failure */
     int failed = utin_save_as(UTIN_NO_SLOT); failed |= utin_save_as(UTIN_UNREADABLE); failed |= utin_deferred(); return failed;
 }
+/* edit-fi0p F11: (P) two literal buffers, second active. The duplicate
+ * variant lists the first id twice, so the active wire index must survive
+ * deduplication by source id. Wire fields are little-endian uint64_t. */
+static int lazy_active_tab(bool duplicate)
+{
+    char root[IPC_PATH_CAP], log[IPC_PATH_CAP], source[IPC_PATH_CAP];
+    T(make_root(root, sizeof root) == 0);
+    T(snprintf(log, sizeof log, "%s/launch", root) > 0);
+    render_backend backend; editor *e = NULL; int lease = -1, result = 0;
+    journal *j = NULL; work_pool pool; bool pool_ready = false;
+#define C(x) do { if (!(x)) { fprintf(stderr, "dataloss_test:%d FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(open_editor(&e, &backend, NULL, log) == 0);
+    C(journal_session_create(root, source, sizeof source, &lease) == 0);
+    C(work_pool_init(&pool, 1, 0) == 0); pool_ready = true;
+    C(journal_open(&j, source, &pool, NULL) == 0);
+    journal_base empty = {.path = ""};
+    C(journal_set_base(j, 1, &empty) == 0);
+    C(journal_insert(j, 1, 0, (const uint8_t *)"first", strlen("first")) == 0);
+    C(journal_set_base(j, 2, &empty) == 0);
+    C(journal_insert(j, 2, 0, (const uint8_t *)"second", strlen("second")) == 0);
+    const uint64_t unique[] = {2, 1, 1, 2}, repeated[] = {3, 2, 1, 1, 2};
+    const uint64_t *fields = duplicate ? repeated : unique;
+    size_t size = duplicate ? sizeof repeated : sizeof unique;
+    uint8_t wire[sizeof repeated];
+    for (size_t i = 0; i < size / sizeof(uint64_t); i++)
+        for (size_t k = 0; k < sizeof(uint64_t); k++) wire[i * sizeof(uint64_t) + k] = (uint8_t)(fields[i] >> (k * CHAR_BIT));
+    C(journal_append(j, JOURNAL_TABS, 0, wire, size) == 0); C(journal_flush(j) == 0);
+    journal_close(j); j = NULL; work_pool_shutdown(&pool); pool_ready = false;
+    C(editor_restore_defer(e, root, source, lease) == 0); lease = -1;
+    C(editor_reopen_tab(e) == 0);
+    uint64_t limit = deadline();
+    while (e->restore_active) { C(turn(e) == 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(settle(e) == 0);
+    C(tabs_count(&e->tabs) == 2 && tabs_active_index(&e->tabs) == 1);
+    C(text_is(e, "second") == 0 && access(source, F_OK) != 0);
+    C(editor_flush(e) == 0); editor_close(e); e = NULL;
+    C(open_editor(&e, &backend, NULL, log) == 0);
+    C(tabs_active_index(&e->tabs) == 1 && text_is(e, "second") == 0);
+done:
+    if (j) journal_close(j);
+    if (pool_ready) work_pool_shutdown(&pool);
+    if (lease >= 0) close(lease);
+    if (e) editor_close(e);
+    remove_tree(root);
+#undef C
+    if (!result) puts(duplicate ? "dataloss_test: fi0p lazy active id survives TABS deduplication and relaunch" :
+        "dataloss_test: fi0p lazy restore and relaunch preserve the second active tab");
+    return result;
+}
+
+static int select_fi0p_lazy_active(void)
+{
+    return lazy_active_tab(false) || lazy_active_tab(true);
+}
 static const test_selector selectors[] = {
+    {"--fi0p-lazy-active", select_fi0p_lazy_active},
+    {"--fi0p-retain-retry", retain_after_failure},
+    {"--fi0p-closed-peer", closed_peer_save_as},
     {"--shared-save-dirty", select_shared_save_dirty},
     {"--shared-save-clean", select_shared_save_clean},
     {"--stranded-orphan", select_stranded_orphan},
@@ -1907,6 +2058,9 @@ int main(int argc, char **argv)
     T(hot_exit_mixed() == 0);
     T(reload_vs_keystroke(0) == 0); T(reload_vs_keystroke(1) == 0);
     T(two_process_save(false) == 0); T(two_process_save(true) == 0);
+    T(lazy_active_tab(false) == 0); T(lazy_active_tab(true) == 0);
+    T(retain_after_failure() == 0);
+    T(closed_peer_save_as() == 0);
     T(shared_save_as(true) == 0); T(shared_save_as(false) == 0);
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
     T(y315_healthy() == 0); T(y315_stall() == 0);

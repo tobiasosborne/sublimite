@@ -998,6 +998,13 @@ int editor_flush(editor *e)
     } while (metadata == JOURNAL_BUSY);
     int rc = metadata ? metadata : journal_flush(e->journal);
     e->journal_waiting = false;
+    /* edit-fi0p F4: flush is off-path and has joined the journal worker.
+     * Repair a failed name barrier (or queued append transport) before
+     * considering rotation. Writeback loss still refuses retry and needs
+     * the complete fresh-inode checkpoint below. */
+    bool repaired = false;
+    if (rc == JOURNAL_IO && journal_get_stats(e->journal).error == JOURNAL_IO &&
+        !journal_retry(e->journal)) { repaired = true; rc = journal_flush(e->journal); }
     /* edit-y315: an owed Save As checkpoint is written by the worker
      * publication, as during the session (edit-ze59): the journal is durable
      * here, so the UI only waits, with the exit deadline. A refused start
@@ -1005,7 +1012,7 @@ int editor_flush(editor *e)
     if (!rc && e->publish_owed && !e->stats.journal_error && !e->busy_checkpoint && !editor_publish_start(e))
         return editor_publish_wait(e);
     /* edit-ivv: an owed recovery checkpoint (busy_checkpoint) lands here too. */
-    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint || e->publish_owed)
+    if (rc == JOURNAL_FULL || rc == JOURNAL_IO || e->stats.journal_error || e->busy_checkpoint || e->publish_owed || repaired)
         return editor_checkpoint(e); /* edit-ze59: an owed Save As checkpoint too */
     return rc;
 }

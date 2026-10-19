@@ -75,6 +75,18 @@ static int save_as(editor *e, const char *input)
         e->recovery_notice = e->file_command_notice;
         return EDITOR_ERR_ARG;
     }
+    /* edit-fi0p F8: retained closed tabs still own differences against BASE.
+     * Refuse before the worker can overwrite their only named generation. */
+    for (size_t i = 0; i < tabs_closed_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_closed_at(&e->tabs, i);
+        const editor_buffer *other = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
+        if (other == b || !editor_same_path(path, other->path) ||
+            (!other->saved_lost && other->history_cursor == other->saved_cursor)) continue;
+        (void)snprintf(e->file_command_notice, sizeof e->file_command_notice,
+            "%s is modified in a closed tab", tab->title);
+        e->recovery_notice = e->file_command_notice;
+        return EDITOR_ERR_ARG;
+    }
     if (!strcmp(path, b->save_path)) return editor_save_request(e, 0);
     if (b->save) {
         savectl_model model = savectl_get_model(b->save);

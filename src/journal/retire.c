@@ -100,6 +100,47 @@ static DIR *rescan(DIR *dir)
     if(fd<0) return NULL;
     DIR *scan=fdopendir(fd); if(!scan) close(fd); return scan;
 }
+/* edit-fi0p F12: only the operator can release a possible sole checkpoint.
+ * Pin its directory and descriptor, scan through the pinned parent, and
+ * verify that the name still selects the same complete source before unlink.
+ * (P) path capacities follow journal_base; zero/one are structural values. */
+int journal_acknowledge(const char *source)
+{
+    if(!source || !*source || strlen(source)>=sizeof ((journal_base *)0)->captured_path) return JOURNAL_INVALID;
+    char parent[sizeof ((journal_base *)0)->captured_path], leaf[sizeof parent];
+    strcpy(parent,source); char *slash=strrchr(parent,'/');
+    strcpy(leaf,slash?slash+1:parent);
+    rotation_name name;
+    if(!rotation_parse(leaf,&name) || !name.aside) return JOURNAL_INVALID;
+    if(slash==parent) slash[1]=0; else if(slash) *slash=0; else strcpy(parent,".");
+    int dfd=open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dfd<0) return JOURNAL_IO;
+    int locked;
+    do { locked=flock(dfd,LOCK_EX|LOCK_NB); } while(locked && errno==EINTR);
+    int rc=locked?((errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO):0;
+    int fd=-1;
+    if(!rc) { fd=openat(dfd,leaf,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK); if(fd<0) rc=JOURNAL_IO; }
+    if(!rc) {
+        do { locked=flock(fd,LOCK_EX|LOCK_NB); } while(locked && errno==EINTR);
+        if(locked) rc=(errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO;
+    }
+    struct stat held,named,after;
+    if(!rc && (fstat(fd,&held) || !S_ISREG(held.st_mode) || held.st_size<0 ||
+        fstatat(dfd,leaf,&named,AT_SYMLINK_NOFOLLOW) || !same(&held,&named))) rc=JOURNAL_BUSY;
+    char anchored[sizeof parent];
+    if(!rc) {
+        int n=snprintf(anchored,sizeof anchored,"/proc/self/fd/%d/%s",dfd,leaf);
+        if(n<0 || (size_t)n>=sizeof anchored) rc=JOURNAL_INVALID;
+    }
+    journal_replay_result result;
+    if(!rc) rc=journal_scan_file(anchored,NULL,NULL,&result);
+    if(!rc && (result.corrupt || result.valid_bytes!=(uint64_t)held.st_size)) rc=JOURNAL_INVALID;
+    if(!rc && (fstat(fd,&after) || !same(&held,&after) ||
+        fstatat(dfd,leaf,&named,AT_SYMLINK_NOFOLLOW) || !same(&held,&named))) rc=JOURNAL_BUSY;
+    if(!rc && (unlinkat(dfd,leaf,0) || fsync(dfd))) rc=JOURNAL_IO;
+    if(fd>=0) close(fd);
+    close(dfd); return rc;
+}
 /* Legacy names cannot identify their owner. A busy existing session lease
  * therefore protects all of them, except this launch's fresh destination.
  * Do not create any lease just to perform this liveness check. */

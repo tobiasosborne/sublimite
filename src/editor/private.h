@@ -107,6 +107,7 @@ typedef struct editor_buffer {
     work_handle retain_handle;
     work_pool *retain_pool;
     editor_base_id retain_of;
+    uint64_t retain_failed_revision; /* edit-fi0p F9: retry only after a later mutation */
     uint8_t retain_state;
     bool retain_used, retain_building;
     journal_view_state journal_view_state;
