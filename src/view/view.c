@@ -573,6 +573,24 @@ static int relative_wrap_place(view *v, uint64_t start)
     }
     v->busy=false; return VIEW_OK;
 }
+/* edit-6090: after a mutation the cached rows are stale from the edit on,
+ * so `cursor>=bottom` (the pre-edit end of the last row) cannot tell a
+ * typed Return at the bottom row, which puts the caret on the row right
+ * below it, from a far jump. Prove the one-row case with a fresh query of
+ * the row above the caret's: it is the old bottom row (same start, since
+ * an edit inside or after that row keeps every earlier start) exactly when
+ * the caret moved down one row; the viewport then advances one row
+ * (old row 1, untouched by the edit) as the non-edit path does, instead of
+ * re-anchoring at the caret's row, which showed only that row at the top
+ * and, at the end of the file, only the last line. */
+static bool one_row_below(view *v,const layout_wrap_row *r)
+{
+    const layout *l=v->wrap_layout; uint32_t n=l->grid->dims.rows;
+    if(!r->start || l->wrap_rows[n-1].start==LAYOUT_VOID_ROW) return false;
+    layout_wrap_row prev; bool approx=false;
+    return layout_visual_row_fresh(l,v->tree,r->start-1u,&prev,&approx)==LAYOUT_DONE && !approx &&
+        prev.start==l->wrap_rows[n-1].start;
+}
 static int finish_move(view *v)
 {
     if(v->state.wrap && v->wrap_layout && v->relative) {
@@ -598,6 +616,7 @@ static int finish_move(view *v)
                 if(!v->edited && r.start==bottom &&
                    layout_visual_row(v->wrap_layout,v->tree,v->state.visual_byte,1,&top,&approx)==LAYOUT_DONE)
                     v->state.visual_byte=top.start;
+                else if(v->edited && n>1u && one_row_below(v,&r)) v->state.visual_byte=v->wrap_layout->wrap_rows[1].start; /* edit-6090 */
                 else v->state.visual_byte=r.start;
             }
             uint64_t line, byte;

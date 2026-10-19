@@ -5715,6 +5715,135 @@ static int binary_open_contract(void)
     unlink(path);
     puts("edit-2ghs binary file opens, paints and reopens"); return 0;
 }
+/* edit-6090 (trial, Tobias 2026-10-20): while typing mid-file the view
+ * periodically jumps so that only the file's last line is visible. The
+ * fixture types a long stream (words, Return, BackSpace) into the middle
+ * of a journaled file across index chunk boundaries and the journal's
+ * sync/page ticks, with the real wall-clock journal tick between batches,
+ * and asserts after every key that the caret's line stays on screen and
+ * the top never moves by more than the typed newline (no jump). Sizes (P):
+ * the fixture is 3000 lines of 40 bytes (120,000 B, above LINEIDX_CHUNK so
+ * typing crosses chunk boundaries); the stream is 3000 keys, enough to pass
+ * JOURNAL_DEFAULT_SYNC_BYTES (65,536 B at ~41 B per 1-byte INSERT record)
+ * and several JOURNAL_PAGE batches. */
+static int n6090_check(editor *e, uint64_t cursor_line, uint64_t previous_top, unsigned at, char what)
+{
+    editor_buffer *b = e->buffer;
+    view_state v = editor_view(e);
+    uint32_t rows = e->v.config.rows;
+    /* The bead's contract: the top never jumps past the typed newline and
+     * the caret's line is never above it. (The caret's row can still lag one
+     * key below the unwrapped viewport after a Return at the bottom row:
+     * a separate defect, reported in docs/worker-reports/edit-6090-s9.md.) */
+    bool below_top = v.first_line <= cursor_line;
+    bool jumped = v.first_line > previous_top + 1u;
+    if (!below_top || jumped) {
+        fprintf(stderr, "edit-6090: key %u '%c': top %llu (was %llu) cursor line %llu rows %u lines %llu"
+            " scroll{first %llu/%llu req %d approx %d extent %llu/%llu exact %d} display{%llu/%llu}"
+            " pending %d following %d stale %d index complete %d dirty %d lines_exact %d top_estimated %d\n",
+            at, what, (unsigned long long)v.first_line, (unsigned long long)previous_top,
+            (unsigned long long)cursor_line, rows, (unsigned long long)editor_line_count(e),
+            (unsigned long long)b->scroll.first_line, (unsigned long long)b->scroll.first_byte, (int)b->scroll.request,
+            (int)b->scroll.approximate, (unsigned long long)b->scroll.extent.lines, (unsigned long long)b->scroll.extent.bytes,
+            (int)b->scroll.extent.exact, (unsigned long long)b->scroll_display.first_line, (unsigned long long)b->scroll_display.first_byte,
+            (int)b->scroll_pending, (int)b->scroll_following, (int)b->scroll_display_stale,
+            b->index ? (int)lineidx_complete(b->index) : -1, (int)b->index_dirty, (int)b->lg.lines_exact, (int)b->lg.top_estimated);
+        fprintf(stderr, "    view{line %llu relative %d busy %d cursor %llu} lay{first %llu/%llu src==tree %d approx %d pos %llu} full_pending %d"
+            " row_byte[%u]=%llu row_byte[%u]=%llu scroll_cursor %llu repair_valid %d\n",
+            (unsigned long long)e->v.line, (int)e->v.relative, (int)view_busy(&e->v), (unsigned long long)v.selection.cursor,
+            (unsigned long long)e->lay.first_line, (unsigned long long)e->lay.first_byte, (int)(e->lay.src == e->tree), (int)e->lay.approximate,
+            (unsigned long long)e->lay.pos, (int)e->full_pending, rows - 1u, (unsigned long long)e->row_byte[rows - 1u], rows,
+            (unsigned long long)e->row_byte[rows], (unsigned long long)b->scroll_cursor, (int)e->repair_line_valid);
+        uint8_t text[200]; uint64_t from = e->row_byte[rows - 1u], to = e->lay.pos;
+        if (from != LAYOUT_VOID_ROW && to > from && to - from <= sizeof text && editor_read(e, from, text, (size_t)(to - from)) == 0) {
+            fprintf(stderr, "    rows %u..: [", rows - 1u);
+            for (size_t i = 0; i < to - from; i++) fputs(text[i] == '\n' ? "\\n" : (char[]){(char)text[i], 0}, stderr);
+            fprintf(stderr, "] length %llu\n", (unsigned long long)editor_length(e));
+        }
+        return 1;
+    }
+    return 0;
+}
+static int n6090_tick(editor *e)
+{
+    /* The journal's durability tick (JOURNAL_DEFAULT_SYNC_NS) is wall-clock;
+     * let one pass between batches, stepping as the main loop would. */
+    uint64_t until = trace_now_ns() + JOURNAL_DEFAULT_SYNC_NS + JOURNAL_DEFAULT_SYNC_NS / 4u;
+    while (trace_now_ns() < until) { int rc = editor_step(e, 20); T(rc == EDITOR_OK || rc == EDITOR_MORE); }
+    return settle(e);
+}
+/* One run: `long_tail` puts 300 lines of 420 B after 2000 lines of 22 B so
+ * the line-density estimate of the edited chunk overshoots the real count
+ * (P: average 59 B/line over the prefix against 420 B/line at the top);
+ * `burst` keys are injected per settle so a key can land while layout is
+ * still busy (fast typing, key repeat). (P) sizes: see the fixture. */
+static int n6090_case(bool wrap, bool long_tail, unsigned burst, uint64_t start_line, unsigned keys)
+{
+    char source[] = "build/editor-6090-XXXXXX.txt";
+    int fd = mkstemps(source, (int)(sizeof ".txt" - 1u)); T(fd >= 0);
+    FILE *f = fdopen(fd, "w"); T(f);
+    char filler[409]; memset(filler, 'x', sizeof filler - 1u); filler[sizeof filler - 1u] = 0;
+    for (unsigned i = 0; i < 3000u; i++) {
+        if (long_tail && i >= 2000u) fprintf(f, "line %04u: %s\n", i, filler); /* (P) 420 B */
+        else if (long_tail) fprintf(f, "line %04u: short text\n", i); /* (P) 22 B */
+        else fprintf(f, "line %04u: the quick brown fox jumps over\n", i); /* (P) 42 B */
+        if (long_tail && i == 2299u) break;
+    }
+    T(fclose(f) == 0);
+    char log_path[] = "/tmp/editor-6090-XXXXXX"; int lfd = mkstemp(log_path); T(lfd >= 0); T(close(lfd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.path = source, .journal_path = log_path, .cols = 80u, .rows = 1u + 3u + 24u, .wrap_mode = wrap ? 1 : -1,
+        .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_view(e).wrap == wrap);
+    int jr;
+    while ((jr = editor_jump_line(e, start_line)) == EDITOR_MORE) T(settle(e) == 0);
+    T(jr == 0); T(settle(e) == 0);
+    uint64_t cursor_line = start_line, top = editor_view(e).first_line;
+    T(top <= cursor_line && cursor_line < top + e->v.config.rows);
+    const char words[] = "lorem ipsum dolor sit amet consectetur ";
+    unsigned column = 0; size_t w = 0; int failed = 0; unsigned typed_lines = 0; bool blank = false;
+    for (unsigned at = 0; at < keys && failed < 40; ) {
+        unsigned n = 0; char last = 0;
+        for (; n < burst && at + n < keys; n++) {
+            char c; plat_event ev;
+            if ((at + n) % 97u == 96u) { c = '\b'; ev = key(XKB_KEY_BackSpace, 0, NULL); }
+            else if (blank) { c = '\n'; ev = key(XKB_KEY_Return, 0, NULL); blank = false; } /* paragraph break */
+            else if (column >= 40u) { c = '\n'; ev = key(XKB_KEY_Return, 0, NULL); blank = ++typed_lines % 4u == 0; }
+            else { c = words[w++ % (sizeof words - 1u)]; char one[2] = {c, 0}; ev = key((uint32_t)(uint8_t)c, 0, one); }
+            T(editor_inject(e, &ev) == 0);
+            if (c == '\n') { cursor_line++; column = 0; }
+            else if (c == '\b') { if (column) column--; }
+            else column++;
+            last = c;
+        }
+        T(settle(e) == 0);
+        at += n;
+        failed += n6090_check(e, cursor_line, top + n, at - 1u, last == '\n' ? 'N' : last == '\b' ? 'B' : last);
+        top = editor_view(e).first_line;
+        if (at % 500u < burst) { T(n6090_tick(e) == 0); failed += n6090_check(e, cursor_line, top, at - 1u, 'T'); }
+    }
+    T(!count.active && count.allocations == 0); /* (P) no typing-path allocations */
+    editor_stats s = editor_get_stats(e); T(!s.journal_error);
+    editor_close(e); T(unlink(log_path) == 0); T(unlink(source) == 0);
+    T(!failed);
+    return 0;
+}
+static int n6090_typing_top(void)
+{
+    T(n6090_case(true, false, 1u, 3000u, 3000u) == 0); /* wrapped (.md/.txt/.tex default), typing at the end of the file */
+    T(n6090_case(true, false, 1u, 2999u, 3000u) == 0); /* wrapped, on the last text line */
+    T(n6090_case(true, false, 1u, 1500u, 3000u) == 0);
+    T(n6090_case(true, true, 1u, 2299u, 1500u) == 0);
+    T(n6090_case(false, false, 1u, 2999u, 3000u) == 0); /* unwrapped, appending at the end of the file */
+    T(n6090_case(false, true, 1u, 2299u, 1500u) == 0);
+    T(n6090_case(false, true, 3u, 2260u, 1500u) == 0);
+    T(n6090_case(false, false, 1u, 1500u, 3000u) == 0);
+    puts("edit-6090: mid-file typing keeps the caret's line on screen and the top steady");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -5733,6 +5862,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--g02-find")) return g02_find_return();
         if (!strcmp(argv[1], "--n95-fif")) return n95_find_in_files();
         if (!strcmp(argv[1], "--3f2k-save")) return n3f2k_save_with_results();
+        if (!strcmp(argv[1], "--6090-typing")) return n6090_typing_top();
         if (!strcmp(argv[1], "--5vz-full")) return n5vz_results_full();
         if (!strcmp(argv[1], "--5vz-open")) return n5vz_open_refused();
         if (!strcmp(argv[1], "--bt1-geometry")) return nbt1_results_geometry();
@@ -5842,6 +5972,7 @@ int main(int argc, char **argv)
     T(g02_find_return() == 0);
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);
+    T(n6090_typing_top() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(nci6i_map_refused() == 0);
