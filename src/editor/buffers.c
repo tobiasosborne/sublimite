@@ -312,7 +312,9 @@ int editor_adopt_open(editor *e, editor_buffer *b)
     b->pending_open = false;
     b->revision++; /* invalidate the preview's resident scroll source */
     editor_large_init(b);
-    if (file_open_mode(b->file) == FILE_MODE_MMAP) {
+    /* Lazy replay can change COPY length after the pending index was sized
+     * for the original file. Bind only an index matching the adopted tree. */
+    if (file_open_mode(b->file) == FILE_MODE_MMAP || lineidx_len(b->index) != piece_len(b->tree)) {
         lineidx_destroy(b->index);
         b->index = lineidx_create(piece_len(b->tree));
         if (!b->index) return EDITOR_ERR_MEMORY;

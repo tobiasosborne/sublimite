@@ -1371,7 +1371,7 @@ static int e601_drive(editor *e)
  * inodes with identical or rewritten TARGET bytes, in the edit-fi2 shape.
  * The sole buffer id is one; zero is success/the insertion offset/first tab;
  * owner-only modes are the POSIX permission bits. No new wait or size bound. */
-static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritten, uint64_t threshold)
+static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritten, uint64_t threshold, bool trim_tail)
 {
     char dir[IPC_PATH_CAP], retained[IPC_PATH_CAP], target[IPC_PATH_CAP], orphan[IPC_PATH_CAP];
     T(snprintf(dir, sizeof dir, "%s/sublimite", root) > 0);
@@ -1380,11 +1380,10 @@ static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritt
     T(snprintf(target, sizeof target, "%s/target", root) > 0);
     const uint64_t size = JOURNAL_STARTUP_SCAN_BYTES + 1u;
     const char marker[] = "base\n", edit[] = "x", changed[] = "disk\n";
-    /* (P) COPY also deletes the last zero byte after inserting edit, keeping
-     * the length unchanged. COPY adoption's pre-existing index-size mismatch
-     * on length-changing replay is outside F6 (reported in this bead). */
-    bool copy = threshold == UINT64_MAX;
-    uint64_t expected_size = size + (copy ? 0u : strlen(edit));
+    /* (P) Trimming strlen(edit) trailing zero bytes cancels the insertion's
+     * length change; otherwise replay grows by strlen(edit) (edit-14bi).
+     * Zero is the net byte growth when trimming. */
+    uint64_t expected_size = size + (trim_tail ? 0u : strlen(edit));
     const char *paths[] = {retained, target};
     for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
         int fd = open(paths[i], O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
@@ -1406,7 +1405,7 @@ static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritt
     if (!rc) rc = journal_set_base(j, 1, &base);
     if (!rc) rc = journal_append(j, JOURNAL_TARGET, 1, (const uint8_t *)target, strlen(target) + 1u);
     if (!rc) rc = journal_insert(j, 1, 0, (const uint8_t *)edit, strlen(edit));
-    if (!rc && copy) rc = journal_delete(j, 1, size, strlen(edit));
+    if (!rc && trim_tail) rc = journal_delete(j, 1, size, strlen(edit));
     if (j) { if (!rc) rc = journal_flush(j); journal_close(j); }
     work_pool_shutdown(&pool);
     (void)journal_session_release(orphan, lease); close(lease);
@@ -1437,6 +1436,9 @@ static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritt
         e->buffer->path, e->buffer->save_path, e->recovery_notice ? e->recovery_notice : "none");
     fflush(stdout);
     T(text && dirty && !aside && bound && original);
+    T(e->buffer->file && file_open_mode(e->buffer->file) ==
+        (threshold == UINT64_MAX ? FILE_MODE_COPY : FILE_MODE_MMAP));
+    T(lineidx_len(e->buffer->index) == piece_len(e->tree));
     T(access(orphan, F_OK) < 0);
     T(e601_consistent(launch->journal) == 0);
     T(journal_check_base(&base) == 0 && journal_check_base(&disk) == 0);
@@ -1450,18 +1452,19 @@ static int retained_lazy_body(const char *root, qct_launch *launch, bool rewritt
     T(piece_len(e->tree) == expected_size && piece_read(e->tree, 0, prefix, sizeof prefix) == 0);
     T(!memcmp(prefix, "xbase\n", sizeof prefix) && editor_tab(e, 0)->modified && !*e->recovery_aside);
     T(!strcmp(e->buffer->path, target) && !strcmp(e->buffer->save_path, target));
-    printf("edit-4jhi: target=%s acquisition=%s checkpoint relaunch preserved BASE edits and TARGET\n",
-        rewritten ? "rewritten" : "unchanged", threshold == UINT64_MAX ? "COPY" : "MMAP");
+    printf("edit-4jhi: target=%s acquisition=%s length=%s checkpoint relaunch preserved BASE edits and TARGET\n",
+        rewritten ? "rewritten" : "unchanged", threshold == UINT64_MAX ? "COPY" : "MMAP",
+        trim_tail ? "unchanged" : "grown");
     e601_discard(launch);
     return 0;
 }
-static int retained_lazy_case(bool rewritten, uint64_t threshold)
+static int retained_lazy_case(bool rewritten, uint64_t threshold, bool trim_tail)
 {
     char made[] = "build/editor-4jhi-XXXXXX", root[IPC_PATH_CAP];
     T(mkdtemp(made));
     if (!realpath(made, root)) { fm4_remove_tree(made); T(false); }
     qct_launch launch = {.lease = -1}; /* (P) no descriptor before launch */
-    int rc = retained_lazy_body(root, &launch, rewritten, threshold);
+    int rc = retained_lazy_body(root, &launch, rewritten, threshold, trim_tail);
     if (launch.e) e601_discard(&launch);
     fm4_remove_tree(root); /* sparse fixtures removed on every body exit */
     return rc;
@@ -1470,8 +1473,11 @@ static int retained_lazy(void)
 {
     /* (P) one maps every nonempty file; UINT64_MAX copies every file size.
      * Exercise both acquisitions and a TARGET whose bytes differ from BASE. */
-    T(retained_lazy_case(false, 1) == 0);
-    T(retained_lazy_case(true, UINT64_MAX) == 0);
+    T(retained_lazy_case(false, 1, false) == 0);
+    T(retained_lazy_case(true, UINT64_MAX, true) == 0);
+    /* edit-14bi (P): force COPY, replay the insertion without a compensating
+     * deletion, and require the longer text through checkpoint relaunch. */
+    T(retained_lazy_case(true, UINT64_MAX, false) == 0);
     return 0;
 }
 static bool e601_same(const char *path, const struct stat *before)
@@ -2294,6 +2300,8 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-uzrb"))
         return pending_open_save(false) || pending_open_save(true);
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-14bi"))
+        return retained_lazy_case(true, UINT64_MAX, false);
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(ivv_all() == 0);
     T(retained_lazy() == 0);
