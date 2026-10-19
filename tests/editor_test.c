@@ -4128,6 +4128,44 @@ static int gutter_click_contract(void)
     T(editor_view(e).selection.anchor==start && editor_view(e).selection.cursor==next);
     editor_close(e); puts("edit-m15 gutter: filled viewport ignores stale old EOF passed"); return 0;
 }
+/* edit-a7fo: a click on ASCII text places the caret under the pointer, and a
+ * drag selects by character, with word wrap on (the file default; Tobias's
+ * trial) and off, with the menu bar visible, and at a non-default font size.
+ * (P) every fixture line is the 26-byte alphabet plus LF, so line L starts at
+ * byte 27*L and text column c of a one-row line is byte 27*L+c. font_px 30 =
+ * the default 15 px (editor.h) at Xft.dpi 192 / the 96 dpi base (M: xrdb on
+ * the trial display :0 reports Xft.dpi 192). */
+static int a7fo_click_contract(int wrap, bool menu, uint32_t font_px)
+{
+    static const char text[]="abcdefghijklmnopqrstuvwxyz\nabcdefghijklmnopqrstuvwxyz\n"
+        "abcdefghijklmnopqrstuvwxyz\nabcdefghijklmnopqrstuvwxyz\n";
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.initial=(const uint8_t *)text,.initial_len=sizeof text-1,
+        .cols=40,.rows=8,.font_px=font_px,.wrap_mode=wrap};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    if (menu) { T(editor_menu_configure(e,true)==0); T(settle_map(e)==0); T(e->menu_rows==1u); }
+    T(e->v.state.wrap==(wrap>0));
+    uint64_t when=trace_now_ns();
+    /* Click text column 4 of line 1 ('e'): caret before 'e', no selection. */
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,1,4,true,when))==0);
+    T(editor_view(e).selection.cursor==27u+4u && editor_view(e).selection.anchor==27u+4u);
+    /* Drag to column 10 of the same line: a character selection, not a line. */
+    T(press(e,pointer_event(e,PLAT_EV_MOTION,1,10,false,when))==0);
+    T(editor_view(e).selection.anchor==27u+4u && editor_view(e).selection.cursor==27u+10u);
+    /* Drag to column 2 of line 2. */
+    T(press(e,pointer_event(e,PLAT_EV_MOTION,2,2,false,when))==0);
+    T(editor_view(e).selection.anchor==27u+4u && editor_view(e).selection.cursor==54u+2u);
+    T(press(e,pointer_event(e,PLAT_EV_BUTTON,2,2,false,when))==0);
+    /* A click in the right half of a cell snaps after that character. */
+    plat_event right=pointer_event(e,PLAT_EV_BUTTON,0,7,true,when+EDITOR_BLINK_NS+1u);
+    right.x+=(int32_t)(e->grid.dims.cell_w-1u);
+    T(press(e,right)==0);
+    T(editor_view(e).selection.cursor==8u && editor_view(e).selection.anchor==8u);
+    right.press=false; T(press(e,right)==0);
+    editor_close(e);
+    printf("edit-a7fo click placement wrap=%d menu=%d font_px=%u passed\n",wrap,(int)menu,font_px);
+    return 0;
+}
 static int find_follow_before_top_contract(void)
 {
     const char text[]="before\nafter\nlast";
@@ -5556,6 +5594,9 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--48u-escape")) return findpanel_escape_contract();
         if (!strcmp(argv[1], "--hl-allocation")) return allocation_case(false,true);
         if (!strcmp(argv[1], "--m15-gutter")) return gutter_click_contract();
+        if (!strcmp(argv[1], "--a7fo-click")) return a7fo_click_contract(1,false,0) ||
+            a7fo_click_contract(-1,false,0) || a7fo_click_contract(1,true,0) || a7fo_click_contract(1,true,30) ||
+            a7fo_click_contract(-1,true,30);
         if (!strcmp(argv[1], "--m15-gutter-growth")) return gutter_growth_contract();
         if (!strcmp(argv[1], "--m15-gutter-wrap")) return gutter_wrap_contract();
         if (!strcmp(argv[1], "--m15-follow")) return find_follow_before_top_contract();
@@ -5654,6 +5695,8 @@ int main(int argc, char **argv)
     T(pointer_autoscroll_contract(false)==0); T(pointer_autoscroll_contract(true)==0); T(findpanel_escape_contract()==0);
     T(gutter_click_contract()==0); T(gutter_growth_contract()==0); T(gutter_wrap_contract()==0);
     T(gutter_line_contract()==0);
+    T(a7fo_click_contract(1,false,0)==0); T(a7fo_click_contract(-1,false,0)==0);
+    T(a7fo_click_contract(1,true,0)==0); T(a7fo_click_contract(1,true,30)==0); T(a7fo_click_contract(-1,true,30)==0);
     T(find_follow_before_top_contract()==0);
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
     T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);

@@ -243,6 +243,11 @@ static uint32_t ascii_span(layout *l,render_cell *cells,const uint8_t *p,size_t 
     if(!l->wrap_sink && !l->wrap_planning) {
         render_cell *dst=cells+l->gw+l->vis;
         uint32_t fg=l->cfg.fg, bg=l->cfg.bg;
+        /* edit-a7fo: each ASCII cell is its own one-byte cluster, as on the
+         * unwrapped fast path. Without this, start_row's row-start prefill
+         * answered every click on wrapped ASCII text. */
+        if(l->cfg.hit) for(size_t i=0;i<n;i++)
+            l->cfg.hit(l->cfg.hit_ctx,l->row,l->gw+l->vis+(uint32_t)i,1,0,1,at+i,at+i+1u);
         if(!l->marks) {
             const uint32_t colors[2]={fg,bg};
             for(size_t i=0;i<n;i++) {
