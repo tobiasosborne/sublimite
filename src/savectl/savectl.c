@@ -610,6 +610,19 @@ int savectl_rebase_target(savectl *s, const file_id *id)
     s->file_error=s->journal_error=s->err_no=0; s->state=SAVECTL_IDLE;
     return SAVECTL_OK;
 }
+int savectl_rebase_kept_target(savectl *s, const file_id *id)
+{
+    if (!s || !id) return SAVECTL_INVALID;
+    if (s->active || s->needs_finish || s->token.prepared || *s->token.previous_path) return SAVECTL_BUSY;
+    if (s->options.source && id->exists) {
+        const file_id *original=file_source_identity(s->options.source);
+        if (id->dev!=original->dev || id->ino!=original->ino) {
+            int rc=file_source_adopt_retired(s->options.source,id);
+            if (rc) return rc;
+        }
+    }
+    return savectl_rebase_target(s,id);
+}
 const journal_base *savectl_saved_base(const savectl *s) { return s->needs_finish ? &s->saved_base : NULL; }
 const journal_save *savectl_save_token(const savectl *s) { return s->journal_leased ? NULL : &s->token; }
 void savectl_file_event(savectl *s)

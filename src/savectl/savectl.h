@@ -168,6 +168,12 @@ const journal_base *savectl_saved_base(const savectl *s);
  * only and refuses active/recovery-token ownership; it preserves dirty state. */
 const file_id *savectl_target_identity(const savectl *s);
 int savectl_rebase_target(savectl *s, const file_id *identity);
+/* Explicit Keep after the caller validates its retained source and publishes
+ * the kept checkpoint. Off-path I/O: for an existing different target inode,
+ * refresh the owned source's retired ctime under exclusive idle ownership,
+ * then rebase. Same admission as rebase_target; FILE_ERR_CHANGED/IO leaves
+ * the target baseline unchanged and the caller must retain its prompt. */
+int savectl_rebase_kept_target(savectl *s, const file_id *identity);
 /* Borrowed UI token, available once prepare hands back journal ownership,
  * including during file work. NULL while journal_leased. Copy before close. */
 const journal_save *savectl_save_token(const savectl *s);

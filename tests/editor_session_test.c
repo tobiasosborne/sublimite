@@ -143,6 +143,52 @@ static int mapped_repeated_save(bool journalling)
     T(!f.e->buffer->save_error); T(disk_is(f.path, "xyzbase") == 0); T(!editor_tab(f.e, 0)->modified);
     close_fixture(&f); return 0;
 }
+/* edit-ut0m: (P) sizeof "" is the smallest nonzero copy threshold, so
+ * strlen("base") selects MMAP. The first edit makes the source dirty and
+ * exposes Keep instead of automatic reload. All lengths derive from literals;
+ * zero is API success, the first tab/byte offset, or an empty initializer. */
+static int mapped_keep_save_body(fixture *f)
+{
+    uint64_t limit = deadline();
+    while (f->e->buffer->pending_open) { T(turn(f->e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(f->e->buffer->file && file_open_mode(f->e->buffer->file) == FILE_MODE_MMAP);
+    T(press(f->e, 'x', 0, "x") == 0);
+    char replacement[IPC_PATH_CAP];
+    T(snprintf(replacement, sizeof replacement, "%s/replacement", f->directory) > 0);
+    int fd = open(replacement, O_WRONLY | O_CREAT | O_EXCL, 0600); /* (P) owner read/write */
+    T(fd >= 0);
+    ssize_t written = write(fd, "disk", strlen("disk"));
+    int closed = close(fd);
+    T(written == (ssize_t)strlen("disk") && closed == 0);
+    T(rename(replacement, f->path) == 0);
+    limit = deadline();
+    while (!f->e->buffer->source_stale) { T(turn(f->e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(editor_source_resolve(f->e, false) == 0); T(settle(f->e) == 0);
+    T(!f->e->buffer->source_stale && editor_tab(f->e, 0)->modified);
+    T(disk_is(f->path, "disk") == 0);
+    T(press(f->e, 'y', 0, "y") == 0);
+    T(press(f->e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f->e) == 0);
+    fprintf(stderr, "edit-ut0m: save after mapped rename-over/Keep error=%d journal=%s\n",
+        f->e->buffer->save_error, f->e->journal ? "on" : "off");
+    T(!f->e->buffer->save_error);
+    T(disk_is(f->path, "xybase") == 0); T(!editor_tab(f->e, 0)->modified);
+    T(press(f->e, 'z', 0, "z") == 0);
+    T(press(f->e, 's', PLAT_MOD_CTRL, NULL) == 0); T(saved(f->e) == 0);
+    T(!f->e->buffer->save_error && !editor_tab(f->e, 0)->modified);
+    T(disk_is(f->path, "xyzbase") == 0);
+    return 0;
+}
+static int mapped_keep_save(bool journalling)
+{
+    fixture f = {0};
+    int rc = open_fixture_threshold(&f, journalling, false, false, sizeof "");
+    if (!rc) rc = mapped_keep_save_body(&f);
+    close_fixture(&f);
+    char replacement[IPC_PATH_CAP];
+    if (snprintf(replacement, sizeof replacement, "%s/replacement", f.directory) > 0) (void)unlink(replacement);
+    (void)rmdir(f.directory);
+    return rc;
+}
 static int post_cutoff(void)
 {
     fixture f = {0}; T(open_fixture(&f, true, false) == 0);
@@ -2242,6 +2288,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-qcuh")) return retired_named_release(true) || retired_named_release(false);
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ivv")) return ivv_all();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ut0m")) { int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
@@ -2265,6 +2312,7 @@ int main(int argc, char **argv)
     T(unavailable_target_parent() == 0); T(existing_journal() == 0);
     T(repeated_save(false, false) == 0); T(repeated_save(true, false) == 0); T(repeated_save(true, true) == 0);
     T(mapped_repeated_save(true) == 0); T(mapped_repeated_save(false) == 0);
+    T(mapped_keep_save(true) == 0); T(mapped_keep_save(false) == 0);
     T(interrupted_save(FILE_STEP_TEMP_WRITTEN) == 0); T(interrupted_save(FILE_STEP_RENAMED) == 0);
     T(post_cutoff() == 0); T(saving_frame_busy() == 0); T(shared_target() == 0); T(failed_inactive() == 0);
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);

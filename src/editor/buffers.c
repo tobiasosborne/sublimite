@@ -1088,8 +1088,8 @@ int editor_check_sources(editor *e)
         }
         if (b->save) {
             file_id identity;
-            if (file_id_stat_path(b->save_path, &identity) == FILE_OK)
-                (void)savectl_rebase_target(b->save, &identity);
+            if (file_id_stat_path(b->save_path, &identity) == FILE_OK &&
+                savectl_rebase_kept_target(b->save, &identity)) return 0;
         }
         b->saved_lost = true;
         if (b->target_rebound) { b->operation_kind = 0; b->operation_error = 0; }
