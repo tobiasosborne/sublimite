@@ -114,7 +114,7 @@ static int scan_record(void *ctx, const journal_record *rec)
     restore_scan *s = ctx; editor_restore *r = s->r;
     if (work_should_stop(s->c)) return JOURNAL_CALLBACK;
     const uint8_t *p = rec->data;
-    if (rec->type == JOURNAL_WINDOW) return 0;
+    if (rec->type == JOURNAL_WINDOW || rec->type == JOURNAL_PAINT) return 0; /* edit-dzk1: PAINT is session metadata */
     if (rec->type == JOURNAL_TABS) {
         if (rec->size < 16) return JOURNAL_INVALID;
         uint64_t count = get64(p);

@@ -166,6 +166,41 @@ static int cells_test(void)
     return 0;
 }
 
+/* edit-dzk1: repair after a rejected grid. The edit-2ghs zero-sized
+ * descriptor becomes the blank under its own identity (retained cells keep
+ * the slot), broken cells become background-only or lose an unpaired wide
+ * marker, and nothing is repaired against invalid pages or an invalid blank. */
+static int repair_test(void)
+{
+    fixture f; CHECK(setup(&f) == 0);
+    CHECK(render_frame_begin(&f.g, 1) == RENDER_OK);
+    render_glyph table[2] = {{65, 0, 0, 0, 8, 16}, {66, 0, 0, 0, 0, 0}};
+    f.g.glyphs = table; f.g.glyph_count = 2;
+    f.cells[2] = (render_cell){66, 1, 0xffffff, 0x102030, 0, 0};
+    f.cells[3] = (render_cell){67, 0, 0xff000000, 0x102030, 0, 0};
+    f.cells[5] = (render_cell){0, RENDER_NO_SLOT, 0xffffff, 0x102030, RENDER_ATTR_WIDE_RIGHT, 0};
+    f.cells[8].attrs = RENDER_ATTR_WIDE_LEFT;
+    CHECK(render_grid_validate(&f.g) == RENDER_ERR_BOUNDS);
+    render_glyph blank = table[0];
+    /* (P) one descriptor plus cells 3, 5 and 8 */
+    CHECK(render_grid_repair(&f.g, table, blank) == 4);
+    CHECK(render_grid_validate(&f.g) == RENDER_OK);
+    CHECK(table[1].glyph_index == 66 && table[1].w == 8 && table[1].h == 16);
+    CHECK(f.cells[2].atlas_slot == 1 && f.cells[2].glyph_index == 66);
+    CHECK(f.cells[3].atlas_slot == RENDER_NO_SLOT && f.cells[3].glyph_index == 0 && f.cells[3].fg == 0);
+    CHECK(f.cells[5].attrs == 0 && f.cells[8].attrs == 0 && f.cells[8].atlas_slot == 0);
+    CHECK(f.g.full_frame);
+    CHECK(render_grid_repair(&f.g, table, blank) == 0);
+    table[1].w = 0; f.page.width = 0;
+    CHECK(render_grid_repair(&f.g, table, blank) == 0 && table[1].w == 0);
+    f.page.width = 8;
+    CHECK(render_grid_repair(&f.g, table, (render_glyph){0}) == 0 && table[1].w == 0);
+    CHECK(render_grid_repair(&f.g, NULL, blank) == 0 && table[1].w == 0);
+    CHECK(render_grid_repair(&f.g, table, blank) == 1);
+    CHECK(render_grid_validate(&f.g) == RENDER_OK);
+    return 0;
+}
+
 typedef struct delivery { uint32_t t5_id, t6_id; size_t t5_count, t6_count; uint64_t t5_ns, t6_ns; } delivery;
 static void done_hook(void *u, uint32_t id, uint64_t ns)
 { delivery *d = u; d->t5_id = id; d->t5_ns = ns; d->t5_count++; }
@@ -538,7 +573,7 @@ int main(void)
 {
 #endif
     trace_init(); CHECK(trace_thread_register() >= 0);
-    CHECK(strips_test() == 0); CHECK(arguments_test() == 0); CHECK(cells_test() == 0);
+    CHECK(strips_test() == 0); CHECK(arguments_test() == 0); CHECK(cells_test() == 0); CHECK(repair_test() == 0);
     CHECK(backend_test() == 0); CHECK(async_test() == 0); CHECK(trace_test() == 0);
     printf("render_test: PASS (strips, bounds, cells, lifecycle, ownership, hooks, allocator)\n");
     return 0;

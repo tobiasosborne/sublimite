@@ -82,7 +82,7 @@ static void structured_bytes(const uint8_t *data, size_t size)
     wire[0]='J'; wire[1]='N'; wire[2]='L'; wire[3]='1';
     for(unsigned k=0;k<4;k++) wire[4+k]=(uint8_t)((uint32_t)total>>(8*k));
     /* (P) modulo the last wire enum plus the PAD value exercises every type. */
-    wire[8]=(uint8_t)(data[0]%(JOURNAL_GROUP_COMMIT+1u)); wire[16]=1;
+    wire[8]=(uint8_t)(data[0]%(JOURNAL_PAINT+1u)); wire[16]=1;
     wire[24]=(data[0]&16u)?99:(wire[8]==JOURNAL_TABS || wire[8]==JOURNAL_WINDOW || wire[8]==JOURNAL_GROUP_BEGIN || wire[8]==JOURNAL_GROUP_COMMIT?0:1);
     memcpy(wire+32,data+1,n);
     uint32_t crc=UINT32_MAX;

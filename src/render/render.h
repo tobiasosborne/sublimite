@@ -137,6 +137,16 @@ int render_dirty_strips(const render_grid *g, render_strip *out, size_t capacity
  * bits are semantic only. A continuation never draws a second glyph. Any
  * change to a slot/image used by retained cells must damage their rows too. */
 int render_grid_validate(const render_grid *g);
+/* edit-dzk1: best-effort repair of a grid a submit rejected, UI only, no
+ * allocation. glyphs is the descriptor owner's writable view of g->glyphs
+ * (NULL repairs cells only). With valid pages and a valid blank no wider than
+ * a cell, every descriptor that is not a real in-page rectangle becomes blank
+ * under its own glyph_index. Then non-opaque colours are masked, an invalid
+ * region is disabled, and every cell that breaks the rules above becomes
+ * background-only or loses an unpaired wide marker. Pages and storage are
+ * never repaired. Returns the number of repairs; any repair marks the begun
+ * grid full. Retained cells of a replaced slot thereby draw the blank. */
+size_t render_grid_repair(render_grid *g, render_glyph *glyphs, render_glyph blank);
 
 /* T5/T6 hooks receive CLOCK_MONOTONIC ns and the ORIGINAL frame ID, once each.
  * Default hooks below call trace_record_at (ns!=0), or trace_record (ns==0).
@@ -291,6 +301,11 @@ int render_backend_init(render_backend *b, const render_config *config,
 int render_backend_resize(render_backend *b, render_dims dims);
 int render_backend_submit(render_backend *b, const render_grid *g,
                           const render_strip *strips, size_t count);
+/* edit-dzk1: exactly the adapter checks submit runs before the backend's own
+ * submit, with no state change. A rejected submit whose check now passes
+ * failed in the backend; one whose check fails broke a rule of this header. */
+int render_backend_check(const render_backend *b, const render_grid *g,
+                         const render_strip *strips, size_t count);
 int render_backend_present(render_backend *b, uint32_t frame_id);
 int render_backend_event(render_backend *b, const render_event *event);
 /* Trusted backend acknowledgement only, after backend-specific ownership

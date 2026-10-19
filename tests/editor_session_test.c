@@ -2408,6 +2408,156 @@ done:
     if (!result) puts("edit-uzrb: Ctrl+S admitted during pending open; saved bytes and clean tab verified");
     return result;
 }
+
+/* edit-dzk1: crash-loop guard. Launch 1 leaves two dirty tabs (alpha active).
+ * Launch 2 restores them, paints alpha, then dies inside the first paint of
+ * the restored bravo tab (the backend's submit exits, as Tobias's PDF tab
+ * did). Launch 3 must set bravo aside as a closed tab with a notice and paint;
+ * Ctrl+Shift+T brings its text back; launch 4 restores both tabs again. */
+static int (*dzk1_submit)(render_backend *, const render_grid *, const render_strip *, size_t);
+static editor *dzk1_editor;
+static uint64_t dzk1_victim;
+#define DZK1_KILLED 42 /* (G) test-chosen exit status: died in the hooked paint */
+static int dzk1_crash_submit(render_backend *b, const render_grid *g, const render_strip *s, size_t n)
+{
+    if (dzk1_editor && dzk1_editor->buffer->id == dzk1_victim) _exit(DZK1_KILLED);
+    return dzk1_submit(b, g, s, n);
+}
+static int dzk1_write(const char *path, const char *text)
+{
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+    T(write(fd, text, strlen(text)) == (ssize_t)strlen(text)); T(close(fd) == 0); return 0;
+}
+static int dzk1_opened(editor *e)
+{
+    uint64_t limit = deadline();
+    while (e->buffer->pending_open) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    return settle(e);
+}
+/* (P) child exit codes: zero success, each failing step its own small code. */
+static int dzk1_first_launch(const char *dir, const char *alpha, const char *bravo)
+{
+    fflush(stdout);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        char journal_path[IPC_PATH_CAP]; int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.path = alpha, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || dzk1_opened(e)) _exit(4);
+        if (press(e, 'x', 0, "x")) _exit(5);
+        uint64_t id; if (editor_add_buffer(e, bravo, NULL, 0, &id) || dzk1_opened(e)) _exit(6);
+        if (press(e, 'y', 0, "y")) _exit(7);
+        if (editor_select_tab(e, 0) || settle(e)) _exit(8);
+        editor_close(e); /* hot exit keeps the dirty session */
+        (void)journal_session_release(journal_path, lease); close(lease);
+        _exit(0);
+    }
+    int status; T(waitpid(child, &status, 0) == child);
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) fprintf(stderr, "editor_session_test: dzk1 launch 1 status=%d\n", status);
+    T(WIFEXITED(status) && WEXITSTATUS(status) == 0); return 0;
+}
+static int dzk1_killed_launch(const char *dir)
+{
+    fflush(stdout);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) {
+        char journal_path[IPC_PATH_CAP]; int lease = -1;
+        if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
+        render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
+        editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+        editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
+        if (tabs_count(&e->tabs) != 2 || tabs_active_index(&e->tabs) != 0) _exit(5); /* (P) the two launch-1 tabs */
+        dzk1_editor = e; dzk1_victim = editor_tab(e, 1)->id;
+        dzk1_submit = backend.ops.submit; backend.ops.submit = dzk1_crash_submit;
+        if (editor_select_tab(e, 1)) _exit(6);
+        (void)settle(e);
+        _exit(7); /* the paint did not reach the backend */
+    }
+    int status; T(waitpid(child, &status, 0) == child);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != DZK1_KILLED) fprintf(stderr, "editor_session_test: dzk1 launch 2 status=%d\n", status);
+    T(WIFEXITED(status) && WEXITSTATUS(status) == DZK1_KILLED); return 0;
+}
+typedef struct dzk1_launch { char journal_path[IPC_PATH_CAP]; int lease; render_backend backend; editor *e; } dzk1_launch;
+static int dzk1_start(const char *dir, dzk1_launch *l)
+{
+    l->lease = -1; l->e = NULL; l->backend = (render_backend){0};
+    T(journal_session_create(dir, l->journal_path, sizeof l->journal_path, &l->lease) == JOURNAL_OK);
+    T(render_null_backend(&l->backend) == 0);
+    editor_config config = {.journal_path = l->journal_path, .session_lease = &l->lease, .start_empty = true, .cols = 32, .rows = 3};
+    T(editor_open(&l->e, &config, &l->backend) == 0);
+    return settle(l->e);
+}
+static void dzk1_stop(dzk1_launch *l)
+{
+    if (l->e) editor_close(l->e);
+    struct stat st;
+    if (!lstat(l->journal_path, &st) && !st.st_size) (void)unlink(l->journal_path);
+    if (l->lease >= 0) { (void)journal_session_release(l->journal_path, l->lease); close(l->lease); }
+    l->e = NULL; l->lease = -1;
+}
+static int dzk1_text(editor *e, const char *expected)
+{
+    size_t n = strlen(expected); uint8_t got[16] = {0}; T(n <= sizeof got);
+    T(piece_len(e->buffer->tree) == n); T(piece_read(e->buffer->tree, 0, got, n) == 0);
+    T(!memcmp(got, expected, n)); return 0;
+}
+static int dzk1_guarded(const char *dir)
+{
+    dzk1_launch l; int rc = dzk1_start(dir, &l);
+    editor *e = l.e;
+    const char *notice = !rc && e->recovery_notice ? e->recovery_notice : "none";
+    printf("dzk1: launch 3 tabs=%zu closed=%zu notice=%s\n", rc ? (size_t)0 : tabs_count(&e->tabs),
+           rc ? (size_t)0 : tabs_closed_count(&e->tabs), notice);
+    if (!rc) rc = tabs_count(&e->tabs) == 1 && !strcmp(editor_tab(e, 0)->title, "alpha.txt") ? 0 : 1;
+    if (!rc) rc = tabs_closed_count(&e->tabs) == 1 && !strcmp(tabs_closed_at(&e->tabs, 0)->title, "bravo.txt") ? 0 : 1;
+    if (!rc) rc = strstr(notice, "paint") ? 0 : 1;
+    if (!rc) rc = dzk1_text(e, "xalpha\n");
+    /* The set-aside tab keeps its unsaved edit: reopen (Ctrl+Shift+T) brings it back. */
+    if (!rc) rc = editor_reopen_tab(e) ? 1 : settle(e);
+    if (!rc) rc = tabs_count(&e->tabs) == 2 && !strcmp(editor_tab(e, tabs_active_index(&e->tabs))->title, "bravo.txt") ? 0 : 1;
+    if (!rc) rc = dzk1_text(e, "ybravo\n");
+    dzk1_stop(&l);
+    T(rc == 0); return 0;
+}
+static int dzk1_after(const char *dir)
+{
+    dzk1_launch l; int rc = dzk1_start(dir, &l);
+    editor *e = l.e;
+    printf("dzk1: launch 4 tabs=%zu notice=%s\n", rc ? (size_t)0 : tabs_count(&e->tabs),
+           !rc && e->recovery_notice ? e->recovery_notice : "none");
+    if (!rc) rc = tabs_count(&e->tabs) == 2 && !e->recovery_notice ? 0 : 1; /* painted in launch 3: restored normally */
+    dzk1_stop(&l);
+    T(rc == 0); return 0;
+}
+static int dzk1_body(const char *root)
+{
+    char dir[IPC_PATH_CAP], alpha[IPC_PATH_CAP], bravo[IPC_PATH_CAP];
+    T(setenv("XDG_DATA_HOME", root, 1) == 0);
+    T(journal_default_dir(dir, sizeof dir) == JOURNAL_OK);
+    T(!strncmp(dir, root, strlen(root))); /* never the real profile */
+    T(editor_make_directory(dir, NULL, NULL) == 0);
+    T(snprintf(alpha, sizeof alpha, "%s/alpha.txt", root) > 0);
+    T(snprintf(bravo, sizeof bravo, "%s/bravo.txt", root) > 0);
+    T(dzk1_write(alpha, "alpha\n") == 0); T(dzk1_write(bravo, "bravo\n") == 0);
+    T(dzk1_first_launch(dir, alpha, bravo) == 0);
+    T(dzk1_killed_launch(dir) == 0);
+    T(dzk1_guarded(dir) == 0);
+    T(dzk1_after(dir) == 0);
+    return 0;
+}
+static int dzk1_crash_loop(void)
+{
+    char made[] = "build/editor-dzk1-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP]; T(realpath(made, root));
+    const char *saved_env = getenv("XDG_DATA_HOME"); char keep[IPC_PATH_CAP] = ""; bool had = saved_env != NULL;
+    if (had) T(snprintf(keep, sizeof keep, "%s", saved_env) > 0);
+    int rc = dzk1_body(root);
+    fm4_remove_tree(root); /* every path */
+    if (had) setenv("XDG_DATA_HOME", keep, 1); else unsetenv("XDG_DATA_HOME");
+    if (!rc) puts("dzk1: a tab killed in its first paint after restore is set aside on the next launch; its text survives");
+    return rc;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
@@ -2418,6 +2568,7 @@ int main(int argc, char **argv)
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-fkpk")) { int a = mapped_repeated_save(true), b = mapped_repeated_save(false); return a || b; }
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-3620")) return kept_target_unreadable();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-ut0m")) { int a = mapped_keep_save(true), b = mapped_keep_save(false); return a || b; }
+    if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-dzk1")) return dzk1_crash_loop();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-djg"))
         return explicit_changed_base() || session_artifacts() || changed_base(false) || changed_base(true) || existing_journal();
     if (argc == (int)(sizeof "ab" - 1u) && !strcmp(argv[1], "--edit-4jhi")) return retained_lazy();
@@ -2429,6 +2580,7 @@ int main(int argc, char **argv)
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(ivv_all() == 0);
     T(retained_lazy() == 0);
+    T(dzk1_crash_loop() == 0);
     T(leased_install_failure(false, false) == 0);
     T(leased_install_failure(true, false) == 0);
     T(leased_install_failure(true, true) == 0);

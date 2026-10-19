@@ -146,11 +146,11 @@ static inline void trace_fmt_startup_report(FILE *out, const trace_rec *r, size_
     const char *names[] = {"process_start", "display_connect", "egl_probe_start", "egl_probe_end",
         "raster_fallback", "font_atlas_ready", "file_prefix_read", "first_layout",
         "first_submit", "first_present", "egl_load_start", "egl_load_end"};
-    _Static_assert(sizeof names / sizeof names[0] == TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START,
+    _Static_assert(sizeof names / sizeof names[0] == TRACE_STARTUP_END - TRACE_STARTUP_PROCESS_START,
                    "startup names match stages");
-    uint64_t ns[TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START] = {0};
+    uint64_t ns[TRACE_STARTUP_END - TRACE_STARTUP_PROCESS_START] = {0};
     for (size_t i = 0; i < n; i++) {
-        if (r[i].ev < TRACE_STARTUP_PROCESS_START || r[i].ev >= TRACE_EV_COUNT) continue;
+        if (r[i].ev < TRACE_STARTUP_PROCESS_START || r[i].ev >= TRACE_STARTUP_END) continue;
         size_t stage = r[i].ev - TRACE_STARTUP_PROCESS_START;
         if (!ns[stage] || r[i].ns < ns[stage]) ns[stage] = r[i].ns;
     }

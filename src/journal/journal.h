@@ -27,8 +27,13 @@ int journal_default_dir(char *out, size_t cap);
 typedef enum journal_type {
     JOURNAL_BASE = 1, JOURNAL_INSERT, JOURNAL_DELETE, JOURNAL_VIEW,
     JOURNAL_TABS, JOURNAL_WINDOW, JOURNAL_SAVE, JOURNAL_TARGET,
-    JOURNAL_GROUP_BEGIN, JOURNAL_GROUP_COMMIT
+    JOURNAL_GROUP_BEGIN, JOURNAL_GROUP_COMMIT, JOURNAL_PAINT
 } journal_type;
+/* edit-dzk1 PAINT: empty payload; buffer_id is the buffer whose first frame of
+ * this launch is being painted, zero once it presented (or none is pending).
+ * The last PAINT in a journal names a tab that died in its first paint;
+ * recovery restores that tab closed. Builds before this type see an invalid
+ * record and truncate the journal there on file replay: no downgrades. */
 /* edit-pgr (P): each empty group marker costs JOURNAL_HEADER bytes; begin +
  * commit cost JOURNAL_HEADER + JOURNAL_HEADER = 64 bytes per multi-record
  * action. Single-record actions emit neither marker: zero added bytes.

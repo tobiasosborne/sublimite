@@ -19,11 +19,11 @@ static trace_input_rec g_in[TRACE_INPUT_CAP];
 static uint64_t g_in_total;
 static _Thread_local trace_ring *tl_ring;
 /* Derived capacity: one retained stamp for each startup enum member. */
-#define TRACE_STARTUP_COUNT (TRACE_EV_COUNT - TRACE_STARTUP_PROCESS_START)
+#define TRACE_STARTUP_COUNT (TRACE_STARTUP_END - TRACE_STARTUP_PROCESS_START)
 static _Atomic uint64_t g_startup[TRACE_STARTUP_COUNT];
 
 static bool startup_event(enum trace_ev ev) {
-    return ev >= TRACE_STARTUP_PROCESS_START && ev < TRACE_EV_COUNT;
+    return ev >= TRACE_STARTUP_PROCESS_START && ev < TRACE_STARTUP_END;
 }
 uint64_t trace_startup_get(enum trace_ev ev) {
     return startup_event(ev) ? atomic_load(&g_startup[ev - TRACE_STARTUP_PROCESS_START]) : 0;

@@ -126,6 +126,7 @@ typedef struct editor_buffer {
     view_selection mark;
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
+    bool painted; /* edit-dzk1: one of its frames presented in this launch */
     /* edit-qct: closed-tab stand-in for a deferred session journal (restore.c):
      * inert, never recorded in this launch's journal or session tree. */
     bool placeholder;
@@ -360,6 +361,10 @@ struct editor {
     size_t journal_tabs_size;
     uint32_t journal_width, journal_height;
     bool journal_metadata_pending, journal_group_open;
+    /* edit-dzk1: buffer id of the last PAINT record appended (0: none pending);
+     * render_dropped: a rejected frame was dropped, the next one is full. */
+    uint64_t journal_paint;
+    bool render_dropped;
     plat platform;
     render_backend *backend;
     render_grid grid;
@@ -588,6 +593,13 @@ bool editor_save_as_runnable(const editor *e);
 int editor_journal_metadata(editor *e);
 /* Journal an applied action without waiting for a frame or durability credit. */
 int editor_journal_changed(editor *e);
+/* edit-dzk1: PAINT bookkeeping (checkpoint.c). paint names e->buffer while it
+ * has not presented in this launch, zero otherwise; BUSY means retry before
+ * submitting. painted records that buffer id presented; paint_clear is the
+ * clean-close path (no paint is in flight). */
+int editor_journal_paint(editor *e);
+void editor_journal_painted(editor *e, uint64_t id);
+void editor_journal_paint_clear(editor *e);
 void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES]);
 /* edit-28u: checkpoint text encoding against BASE (docs/decisions/edit-28u.md). */
 editor_base_id editor_base_id_of(const journal_base *base);

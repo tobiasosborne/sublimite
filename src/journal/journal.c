@@ -140,7 +140,7 @@ static bool payload_valid(uint32_t type, const uint8_t *p, size_t n)
         return true;
     }
     case JOURNAL_SAVE: return n>=57 && (u32(p+8)==1 || u32(p+8)==2) && u32(p+12)==0 && payload_valid(JOURNAL_BASE,p+16,n-16);
-    case JOURNAL_GROUP_BEGIN: case JOURNAL_GROUP_COMMIT: return n==0;
+    case JOURNAL_GROUP_BEGIN: case JOURNAL_GROUP_COMMIT: case JOURNAL_PAINT: return n==0;
     case JOURNAL_INSERT: return n>=8;
     case JOURNAL_DELETE: return n==16 && u64(p)<=UINT64_MAX-u64(p+8);
     case JOURNAL_TARGET: return n>=1 && n<=4097 && p[n-1]==0 && memchr(p,0,n-1)==NULL;

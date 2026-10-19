@@ -355,6 +355,10 @@ int font_async_reset_atlas(font_async *owner, const font_ascii_atlas *atlas, boo
  * bytes remain borrowed until reset/shutdown and backend retirement. */
 int font_async_set_primary(font_async *owner, const font_t *primary);
 int font_async_bind(font_async *owner, render_grid *grid);
+/* edit-dzk1: UI, after a submit rejected grid: render_grid_repair with this
+ * owner's descriptor table (only while grid is bound to it) and the baked
+ * ASCII space as the blank. Returns the number of repairs. */
+size_t font_async_repair(font_async *owner, render_grid *grid);
 /* UI, at frame begin: retain both existing grids and all subsequent lookups.
  * active preserves the preceding frame's pins until backend retirement.
  * Grids are inspected during this call only. Standalone users without frame

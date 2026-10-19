@@ -38,8 +38,13 @@ enum trace_ev {
     TRACE_STARTUP_FIRST_PRESENT,
     TRACE_STARTUP_EGL_LOAD_START,
     TRACE_STARTUP_EGL_LOAD_END,
+    /* edit-dzk1: a submit the render adapter rejected; frame_id is the
+     * rejected frame. An ordinary ring event, outside the startup stamps. */
+    TRACE_RENDER_REJECTED,
     TRACE_EV_COUNT
 };
+/* One past the last startup stamp: the startup range is [PROCESS_START, END). */
+#define TRACE_STARTUP_END TRACE_RENDER_REJECTED
 
 typedef struct trace_rec {
     uint64_t ns;

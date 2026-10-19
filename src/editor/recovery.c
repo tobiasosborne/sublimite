@@ -77,6 +77,7 @@ typedef struct recovered_session {
     bool window_chosen; /* WINDOW v2 with JOURNAL_WINDOW_CHOSEN */
     bool tolerant;      /* edit-btj second pass: a changed BASE marks its buffer */
     bool conflicts;     /* some buffer was marked */
+    uint64_t paint;     /* edit-dzk1: last PAINT id; nonzero = died in that tab's first paint */
     const recovery_cost *cost;
 } recovered_session;
 static uint64_t get64(const uint8_t *p)
@@ -161,6 +162,7 @@ static int restore_record(void *ctx, const journal_record *r)
         s->width = w.width; s->height = w.height; s->window_chosen = (w.flags & JOURNAL_WINDOW_CHOSEN) != 0;
         return 0;
     }
+    if (r->type == JOURNAL_PAINT) { s->paint = r->buffer_id; return 0; } /* edit-dzk1 */
     if (r->type == JOURNAL_SAVE) {
         recovered_buffer *owner = find(s, r->buffer_id);
         if (owner) owner->save_pending = get32(p + 8) == 1; /* journal's PREPARED wire phase */
@@ -399,6 +401,16 @@ static int install_buffer(editor *e, recovered_buffer *r)
     if (r->mapped_replay) editor_large_start(e, b);
     r->installed = b; return editor_activate(e);
 }
+/* edit-dzk1: the session's last PAINT names a known buffer that would be
+ * restored as a live tab. */
+static bool unpainted_live(const recovered_session *s)
+{
+    bool known = false;
+    for (const recovered_buffer *b = s->buffers; s->paint && b; b = b->next) known = known || b->id == s->paint;
+    if (!known || !s->tabs_valid) return known;
+    for (size_t i = 0; i < s->count; i++) if (s->tabs[i] == s->paint) return true;
+    return false;
+}
 static int install_session(editor *e, recovered_session *s)
 {
     /* edit-rzj: appended sessions keep the newest session's active tab and
@@ -418,18 +430,38 @@ static int install_session(editor *e, recovered_session *s)
         s->window_chosen ? s->height : e->font.window_height;
     int rc = !e->startup_restored && s->width && s->height ? editor_resize_now(e, width, height) : 0;
     /* Live order is authoritative. Keep other journalled buffers as retained
-     * closed tabs so unrelated recovery content survives the new checkpoint. */
+     * closed tabs so unrelated recovery content survives the new checkpoint.
+     * edit-dzk1: the source launch died inside the first paint of the tab its
+     * last PAINT names. Restoring it live would repeat that death on every
+     * launch, so it is installed last and closed (the newest closed tab, the
+     * one reopen restores) with a notice; its text and edits are kept. */
+    recovered_buffer *unpainted = s->paint ? find(s, s->paint) : NULL;
+    bool unpainted_was_live = unpainted_live(s);
+    size_t count = s->count, restored_active = s->active, skipped = SIZE_MAX;
     for (size_t i = 0; !rc && i < s->count; i++) {
         recovered_buffer *b = find(s, s->tabs[i]);
         if (!b) { rc = EDITOR_ERR_IO; break; }
+        if (b == unpainted) { skipped = i; continue; }
         rc = install_buffer(e, b);
     }
-    for (recovered_buffer *b = s->buffers; !rc && b; b = b->next) if (!b->installed) {
+    for (recovered_buffer *b = s->buffers; !rc && b; b = b->next) if (!b->installed && b != unpainted) {
         rc = install_buffer(e, b);
         if (!rc && s->tabs_valid) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
+    if (!rc && unpainted) {
+        rc = install_buffer(e, unpainted);
+        if (!rc) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
+        if (!rc && unpainted_was_live) {
+            e->recovery_notice = "a restored tab died in its first paint last time; it is closed (reopen: Ctrl+Shift+T)";
+            e->recovery_notice_mutations = e->stats.mutations;
+        }
+    }
+    if (skipped != SIZE_MAX) { /* the same tab, or its right (else left) neighbour, stays active */
+        count--;
+        if (restored_active > skipped || (restored_active == skipped && restored_active == count && count)) restored_active--;
+    }
     if (!rc && live) rc = editor_select_tab(e, active);
-    else if (!rc && s->count) rc = editor_select_tab(e, s->active);
+    else if (!rc && count) rc = editor_select_tab(e, restored_active);
     e->cfg.copy_threshold = threshold; e->journal = log; e->recovering = false;
     /* BASE was acquired while journal temporarily disabled. Derive it from the
      * opened generation off-path before publishing the recovered checkpoint. */
@@ -498,6 +530,7 @@ static bool session_fits(const editor *e, const recovered_session *s)
     for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) used++;
     size_t live = s->tabs_valid ? s->count : buffers;
     if (live > buffers) return false;
+    if (unpainted_live(s)) live--; /* edit-dzk1: restored closed instead */
     size_t closed = buffers - live;
     size_t available = e->tabs.capacity - tabs_count(&e->tabs);
     return buffers <= e->buffer_capacity - used && live <= available &&

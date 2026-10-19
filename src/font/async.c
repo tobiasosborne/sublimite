@@ -432,6 +432,15 @@ int font_async_bind(font_async *owner, render_grid *grid)
     return FONT_OK;
 }
 
+/* edit-dzk1: the bound table is this owner's; slot 0 is the baked ASCII space,
+ * a full cell with no ink, so a replaced descriptor draws nothing. */
+size_t font_async_repair(font_async *owner, render_grid *grid)
+{
+    if (!owner || !grid) return 0;
+    bool owned = owner->glyphs && grid->glyphs == owner->glyphs;
+    return render_grid_repair(grid, owned ? owner->glyphs : NULL, owned ? owner->glyphs[0] : (render_glyph){0});
+}
+
 void font_async_frame(font_async *owner, const render_grid *grid,
                       const render_grid *text, bool active)
 {

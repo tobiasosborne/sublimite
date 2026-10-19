@@ -118,6 +118,8 @@ typedef struct editor_stats {
     uint32_t font_fallback_skipped; /* edit-6e2: unresolvable chain entries, adopted version */
     bool font_pending;
     int backend_init_error;           /* failed GPU init, 0 if no fallback */
+    uint64_t render_rejects;          /* edit-dzk1: submits the render adapter rejected */
+    int render_reject_cause;          /* edit-dzk1: the last rejection's render code */
 } editor_stats;
 
 /* UI-owned, no copies. The factory-filled backend is borrowed exclusively and

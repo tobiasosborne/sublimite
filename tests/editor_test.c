@@ -5905,12 +5905,56 @@ static int vp4m_return_bottom(void)
     T(failed == 0);
     puts("edit-vp4m: unwrapped Return on the bottom row shows the caret's row in the same frame"); return 0;
 }
+
+/* edit-dzk1: a render-rule violation in submit must not end the loop. The
+ * test hook is private access to the font cache's bound descriptor table and
+ * pages. First the edit-2ghs shape (a zero-sized descriptor, after the font
+ * fix it can only be injected): the glyph table is repaired and the same
+ * frame is submitted, with a notice. Then an unrepairable violation (a page
+ * with no width): the frame is dropped, the loop keeps running and settles
+ * (no resubmission spin), and the next frame after the page is valid again
+ * reaches the backend. */
+static int dzk1_render_reject(void)
+{
+    editor *e = NULL; render_backend backend = {0}; counted count = {0};
+    T(render_null_backend(&backend) == RENDER_OK);
+    editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = 3, .cols = 24, .rows = 4,
+        .hook_ctx = &count, .on_submit = submitted};
+    T(editor_open(&e, &cfg, &backend) == EDITOR_OK); T(settle(e) == 0);
+    size_t slot = (size_t)('a' - ' '); /* (P) the baked ASCII run starts at the space */
+    T(e->grid.glyph_count > slot);
+    render_glyph *table = (render_glyph *)e->grid.glyphs;
+    table[slot].w = table[slot].h = 0;
+    T(render_grid_validate(&e->grid) == RENDER_ERR_BOUNDS);
+    size_t frames = count.frames;
+    T(press(e, key('x', 0, "x")) == 0);
+    T(expect(e, "xabc", 1) == 0);
+    T(count.frames > frames);
+    T(render_grid_validate(&e->grid) == RENDER_OK);
+    T(table[slot].w && table[slot].h);
+    T(e->recovery_notice && strstr(e->recovery_notice, "render"));
+    render_atlas_page *pages = (render_atlas_page *)e->grid.pages;
+    T(e->grid.page_count);
+    uint32_t width = pages[0].width; pages[0].width = 0;
+    frames = count.frames;
+    T(press(e, key('y', 0, "y")) == 0);
+    T(count.frames == frames);
+    pages[0].width = width;
+    T(press(e, key('z', 0, "z")) == 0);
+    T(count.frames > frames);
+    T(expect(e, "xyzabc", 3) == 0);
+    T(render_grid_validate(&e->grid) == RENDER_OK);
+    editor_close(e);
+    puts("editor_test: dzk1 render-rule violations repair or drop the frame and the loop survives passed");
+    return 0;
+}
 int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register() >= 0);
     bool headless = argc == 2 && !strcmp(argv[1], "--headless");
     if (argc == 2) {
         /* (P) argv[1] is the selector after the program name. */
+        if (!strcmp(argv[1], "--dzk1")) return dzk1_render_reject();
         if (!strcmp(argv[1], "--paint-all-void")) return paint_all_void();
         if (!strcmp(argv[1], "--2ghs-binary")) return binary_open_contract();
         if (!strcmp(argv[1], "--recovery-findpanel")) return recovery_notice_findpanel();
@@ -6026,6 +6070,7 @@ int main(int argc, char **argv)
     T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
     T(paint_all_void() == 0);
     T(binary_open_contract() == 0);
+    T(dzk1_render_reject() == 0);
     T(duplicate_path_contract() == 0);
     T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);

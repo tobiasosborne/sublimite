@@ -379,6 +379,8 @@ static int present(editor *e)
     if (rc) return rc;
     trace_record(TRACE_STARTUP_FIRST_PRESENT, 0);
     e->startup_presented = true;
+    /* edit-dzk1: this buffer's first frame of the launch reached the display. */
+    if (e->journal_paint && e->active_frame.source_id == e->journal_paint) editor_journal_painted(e, e->journal_paint);
     e->active_frame.present_ns = b->submitted_ns; /* the adapter's actual T4 */
     for (size_t i = 0; i < sizeof e->refresh_frames / sizeof e->refresh_frames[0]; i++)
         if (e->refresh_frames[i].id == e->active_frame.id) e->refresh_frames[i] = e->active_frame;
@@ -386,6 +388,33 @@ static int present(editor *e)
     if (e->cfg.on_present) e->cfg.on_present(e->cfg.hook_ctx, &e->active_frame);
     editor_refresh_flush(e);
     return 0;
+}
+/* edit-dzk1: the render adapter rejected the frame for a render.h rule (its
+ * check fails). That never ends the loop. Trace it, put the notice on the
+ * status row, repair the font cache's descriptor table and the cells
+ * (font_async_repair) and resubmit the same frame once; a rejected frame
+ * consumes no ID. A grid that cannot be repaired (pages, storage, capacity,
+ * dimensions) drops the frame: dirty clears, so nothing resubmits before the
+ * next change, and that next frame is full. A backend's own failure (the
+ * check passes) is returned as before. */
+static const char render_notice[] = "render rule broken: frame repaired or skipped; save your work";
+static int render_rejected(editor *e, int rc, size_t *count)
+{
+    trace_record(TRACE_RENDER_REJECTED, e->grid.frame_id);
+    if (e->stats.render_rejects < UINT64_MAX) e->stats.render_rejects++;
+    e->stats.render_reject_cause = rc;
+    e->recovery_notice = render_notice; e->recovery_notice_mutations = e->stats.mutations;
+    editor_save_overlay(e);
+    if (font_async_repair(e->fonts, &e->grid)) {
+        e->caret_only = false; raster_set_caret_only(e->backend, false);
+        rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, count);
+        if (!rc) rc = render_backend_submit(e->backend, &e->grid, e->strips, *count);
+        if (rc == RENDER_OK || rc == RENDER_ERR_BUSY) return rc;
+        if (render_backend_check(e->backend, &e->grid, e->strips, *count) == RENDER_OK) return rc;
+        e->stats.render_reject_cause = rc;
+    }
+    e->dirty = false; e->render_dropped = true;
+    return EDITOR_MORE; /* dropped */
 }
 static int submit(editor *e)
 {
@@ -396,12 +425,17 @@ static int submit(editor *e)
     int metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
+    if (editor_journal_paint(e) == JOURNAL_BUSY) return 0; /* edit-dzk1: guard before composing */
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     editor_save_overlay(e);
     editor_goto_overlay(e);
     editor_large_index_progress(e);
     if (e->full_pending) return 0;
+    if (e->render_dropped) { /* edit-dzk1: the backend lacks the dropped frame's damage */
+        rc = render_mark_full(&e->grid); if (rc) return rc;
+        e->caret_only = false;
+    }
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
     if (e->caret_only && !count) {
         e->dirty = false; /* Visibility changed outside the viewport: no pixels to submit. */
@@ -410,8 +444,11 @@ static int submit(editor *e)
     trace_record(TRACE_T3_RENDER_DONE, e->grid.frame_id);
     raster_set_caret_only(e->backend, e->caret_only);
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
-    if (rc == RENDER_ERR_BUSY) return 0;
+    if (rc && rc != RENDER_ERR_BUSY && render_backend_check(e->backend, &e->grid, e->strips, count))
+        rc = render_rejected(e, rc, &count);
+    if (rc == RENDER_ERR_BUSY || rc == EDITOR_MORE) return 0;
     if (rc) return rc;
+    e->render_dropped = false;
     trace_record(TRACE_STARTUP_FIRST_SUBMIT, 0);
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
     editor_save_submitted(e, e->frame.submit_ns);
@@ -715,6 +752,7 @@ static int close_result(editor *e, int timeout_ms)
         if (trace_now_ns() < e->checkpoint_retry_ns) return EDITOR_OK;
     }
     int rc = editor_flush(e);
+    if (!rc) editor_journal_paint_clear(e); /* edit-dzk1: a clean close is no paint death */
     if (rc == JOURNAL_BUSY) {
         /* edit-dr9 (E): reuse the existing durability interval as the retry
          * tick. Keep quit, text, queued ops and the open journal until then;

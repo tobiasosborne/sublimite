@@ -118,7 +118,7 @@ int render_dirty_strips(const render_grid *g, render_strip *out, size_t capacity
     return RENDER_OK;
 }
 
-static int render_atlas_validate(const render_grid *g, size_t *bytes)
+static int render_pages_validate(const render_grid *g, size_t *bytes)
 {
     if ((g->page_count != 0 && g->pages == NULL) || (g->glyph_count != 0 && g->glyphs == NULL))
         return RENDER_ERR_ARG;
@@ -137,16 +137,43 @@ static int render_atlas_validate(const render_grid *g, size_t *bytes)
         if (p->pixels_len > SIZE_MAX - total) return RENDER_ERR_BOUNDS;
         total += p->pixels_len;
     }
-    for (size_t i = 0; i < g->glyph_count; i++) {
-        const render_glyph *glyph = &g->glyphs[i];
-        if (glyph->page >= g->page_count) return RENDER_ERR_BOUNDS;
-        const render_atlas_page *page = &g->pages[glyph->page];
-        if (!glyph->w || !glyph->h || glyph->x > page->width || glyph->y > page->height ||
-            glyph->w > page->width - glyph->x || glyph->h > page->height - glyph->y ||
-            (uint64_t)glyph->w > (uint64_t)g->dims.cell_w * 2u || glyph->h > g->dims.cell_h)
-            return RENDER_ERR_BOUNDS;
-    }
     *bytes = total;
+    return RENDER_OK;
+}
+
+/* A real rectangle inside its (already validated) page, at most two cells
+ * wide and one cell high. */
+static bool render_glyph_fits(const render_grid *g, const render_glyph *glyph)
+{
+    if (glyph->page >= g->page_count) return false;
+    const render_atlas_page *page = &g->pages[glyph->page];
+    return glyph->w && glyph->h && glyph->x <= page->width && glyph->y <= page->height &&
+        glyph->w <= page->width - glyph->x && glyph->h <= page->height - glyph->y &&
+        (uint64_t)glyph->w <= (uint64_t)g->dims.cell_w * 2u && glyph->h <= g->dims.cell_h;
+}
+
+static int render_atlas_validate(const render_grid *g, size_t *bytes)
+{
+    size_t total;
+    int rc = render_pages_validate(g, &total);
+    if (rc != RENDER_OK) return rc;
+    for (size_t i = 0; i < g->glyph_count; i++)
+        if (!render_glyph_fits(g, &g->glyphs[i])) return RENDER_ERR_BOUNDS;
+    *bytes = total;
+    return RENDER_OK;
+}
+
+static int render_region_validate(const render_grid *g)
+{
+    const render_pixels *p = &g->region;
+    if (!p->pixels) return RENDER_OK;
+    uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;
+    if (!p->width || !p->height || p->stride < p->width ||
+        p->x > w || p->width > w - p->x || p->y > h || p->height > h - p->y ||
+        (size_t)(p->height - 1u) > (SIZE_MAX - p->width) / p->stride)
+        return RENDER_ERR_BOUNDS;
+    if (p->capacity < (size_t)(p->height - 1u) * p->stride + p->width)
+        return RENDER_ERR_CAPACITY;
     return RENDER_OK;
 }
 
@@ -154,16 +181,8 @@ static int render_cells_validate(const render_grid *g)
 {
     /* (P) opaque RGB permits only the low three eight-bit channels. */
     if (g->surface_background & UINT32_C(0xff000000)) return RENDER_ERR_CELL;
-    const render_pixels *p = &g->region;
-    if (p->pixels) {
-        uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;
-        if (!p->width || !p->height || p->stride < p->width ||
-            p->x > w || p->width > w - p->x || p->y > h || p->height > h - p->y ||
-            (size_t)(p->height - 1u) > (SIZE_MAX - p->width) / p->stride)
-            return RENDER_ERR_BOUNDS;
-        if (p->capacity < (size_t)(p->height - 1u) * p->stride + p->width)
-            return RENDER_ERR_CAPACITY;
-    }
+    int rc = render_region_validate(g);
+    if (rc != RENDER_OK) return rc;
     size_t count = (size_t)g->dims.cols * (g->dims.rows + (g->scroll.cols ? 1u : 0u));
     for (size_t i = 0; i < count; i++) {
         const render_cell *c = &g->cells[i];
@@ -200,6 +219,66 @@ int render_grid_validate(const render_grid *g)
     rc = render_atlas_validate(g, &bytes);
     if (rc != RENDER_OK) return rc;
     return render_cells_validate(g);
+}
+
+size_t render_grid_repair(render_grid *g, render_glyph *glyphs, render_glyph blank)
+{
+    if (g == NULL || render_grid_storage(g) != RENDER_OK || !g->begun) return 0;
+    size_t fixed = 0, bytes;
+    /* Descriptors are judged only against valid pages, and replaced only by a
+     * valid narrow blank: a narrow cell may reference the replaced slot. */
+    if (glyphs != NULL && glyphs == g->glyphs && render_pages_validate(g, &bytes) == RENDER_OK &&
+        render_glyph_fits(g, &blank) && blank.w <= g->dims.cell_w) {
+        for (size_t i = 0; i < g->glyph_count; i++) {
+            if (render_glyph_fits(g, &glyphs[i])) continue;
+            uint32_t identity = glyphs[i].glyph_index;
+            glyphs[i] = blank; glyphs[i].glyph_index = identity; fixed++;
+        }
+    }
+    /* (P) opaque RGB keeps only the low three eight-bit channels. */
+    const uint32_t rgb = UINT32_C(0x00ffffff);
+    if (g->surface_background & ~rgb) { g->surface_background &= rgb; fixed++; }
+    if (render_region_validate(g) != RENDER_OK) { g->region = (render_pixels){0}; fixed++; }
+    const uint16_t wide = RENDER_ATTR_WIDE_LEFT | RENDER_ATTR_WIDE_RIGHT;
+    uint32_t cols = g->dims.cols;
+    size_t count = (size_t)cols * (g->dims.rows + (g->scroll.cols ? 1u : 0u));
+    for (size_t i = 0; i < count; i++) {
+        render_cell *c = &g->cells[i], was = *c;
+        c->reserved = 0; c->attrs &= RENDER_ATTR_MASK; c->fg &= rgb; c->bg &= rgb;
+        if ((c->attrs & wide) == wide) c->attrs &= (uint16_t)~wide;
+        if (c->atlas_slot == RENDER_NO_SLOT) c->glyph_index = 0;
+        else if (c->atlas_slot >= g->glyph_count || (c->attrs & RENDER_ATTR_WIDE_RIGHT) ||
+                 g->glyphs[c->atlas_slot].glyph_index != c->glyph_index ||
+                 (!(c->attrs & RENDER_ATTR_WIDE_LEFT) && g->glyphs[c->atlas_slot].w > g->dims.cell_w)) {
+            c->atlas_slot = RENDER_NO_SLOT; c->glyph_index = 0;
+        }
+        if (memcmp(&was, c, sizeof was)) fixed++;
+    }
+    /* Pairs, left to right: an unpaired left loses its width (and a wide
+     * image); the orphaned right half then loses its marker in turn. */
+    for (size_t i = 0; i < count; i++) {
+        render_cell *c = &g->cells[i];
+        if (c->attrs & RENDER_ATTR_WIDE_LEFT) {
+            bool paired = i % cols != cols - 1u;
+            if (paired) {
+                const render_cell *right = &g->cells[i + 1];
+                uint16_t attrs = (c->attrs & (uint16_t)~RENDER_ATTR_WIDE_LEFT) | RENDER_ATTR_WIDE_RIGHT;
+                paired = right->attrs == attrs && right->fg == c->fg && right->bg == c->bg &&
+                    right->atlas_slot == RENDER_NO_SLOT && right->glyph_index == 0;
+            }
+            if (paired) continue;
+            c->attrs &= (uint16_t)~RENDER_ATTR_WIDE_LEFT;
+            if (c->atlas_slot != RENDER_NO_SLOT && g->glyphs[c->atlas_slot].w > g->dims.cell_w) {
+                c->atlas_slot = RENDER_NO_SLOT; c->glyph_index = 0;
+            }
+            fixed++;
+        } else if ((c->attrs & RENDER_ATTR_WIDE_RIGHT) &&
+                   (i % cols == 0 || !(g->cells[i - 1].attrs & RENDER_ATTR_WIDE_LEFT))) {
+            c->attrs &= (uint16_t)~RENDER_ATTR_WIDE_RIGHT; fixed++;
+        }
+    }
+    if (fixed) (void)render_mark_full(g);
+    return fixed;
 }
 
 void render_trace_device_done(void *user, uint32_t frame_id, uint64_t ns)
@@ -299,7 +378,7 @@ static uint64_t render_add_count(uint64_t count, uint64_t add)
     return add > UINT64_MAX - count ? UINT64_MAX : count + add;
 }
 
-int render_backend_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
+int render_backend_check(const render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
 {
     if (b == NULL || g == NULL) return RENDER_ERR_ARG;
     if (!b->initialized) return RENDER_ERR_STATE;
@@ -330,6 +409,13 @@ int render_backend_submit(render_backend *b, const render_grid *g, const render_
     if (rc != RENDER_OK) return rc;
     if (g->region.pixels && (g->region.width > b->config.max_region_width ||
         g->region.height > b->config.max_region_height)) return RENDER_ERR_CAPACITY;
+    return RENDER_OK;
+}
+
+int render_backend_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
+{
+    int rc = render_backend_check(b, g, strips, count);
+    if (rc != RENDER_OK) return rc;
     /* Implementations must not signal inside submit: adapter activates only
      * after success. Completion mailboxes are dispatched by UI after return. */
     rc = b->ops.submit(b, g, strips, count);

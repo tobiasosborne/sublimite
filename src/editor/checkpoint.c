@@ -247,6 +247,8 @@ static int build_checkpoint(editor *e, editor_records *c)
     (void)recorded_tabs(e, p);
     p = editor_records_add(c, JOURNAL_WINDOW, 0, JOURNAL_WINDOW_BYTES); if (!p) return c->error;
     journal_encode_window(&(journal_window){e->font.window_width, e->font.window_height, JOURNAL_WINDOW_CHOSEN}, p);
+    /* edit-dzk1: a rotation inside a first paint keeps its marker. */
+    if (e->journal_paint && !editor_records_add(c, JOURNAL_PAINT, e->journal_paint, 0)) return c->error;
     return 0;
 }
 /* edit-qct: TABS lists every live tab except placeholders, whose IDs have no
@@ -414,4 +416,37 @@ int editor_journal_changed(editor *e)
     if (rc == JOURNAL_BUSY) return 0; /* retained for the next credit fence */
     if (rc) { e->stats.journal_error = rc; return EDITOR_ERR_IO; }
     return 0;
+}
+/* edit-dzk1: the crash-loop guard. Before a buffer's first frame of this
+ * launch is composed, PAINT names it, in the page cache (journal_append: a
+ * process crash keeps it); its first present appends PAINT 0. A launch that
+ * dies inside that paint leaves the name for recovery, which restores the tab
+ * closed. Typing path: one comparison, then one empty record per buffer per
+ * launch, no allocation. As for metadata: nothing before the journal holds a
+ * tab (the empty-placeholder contract) or while a save owns the fence, and
+ * BUSY holds the frame for the next credit. Any other refusal paints without
+ * the guard; the edit path surfaces journal errors itself. */
+int editor_journal_paint(editor *e)
+{
+    const editor_buffer *b = e->buffer;
+    uint64_t pending = b->painted || b->placeholder || b->derived ? 0 : b->id;
+    if (pending == e->journal_paint || !e->journal || e->recovering || editor_save_leased(e)) return 0;
+    if (e->tabs.next_id == 1 + e->recovery_placeholder_ids && !recorded_tabs(e, NULL)) return 0;
+    int rc = journal_append_protected(e->journal, JOURNAL_PAINT, pending, NULL, 0);
+    if (rc == JOURNAL_BUSY) { e->journal_metadata_pending = true; return rc; } /* forces the pump */
+    if (!rc) e->journal_paint = pending;
+    return 0;
+}
+void editor_journal_painted(editor *e, uint64_t id)
+{
+    editor_buffer *b = e->buffer && e->buffer->id == id ? e->buffer : NULL;
+    for (size_t i = 0; !b && i < e->buffer_capacity; i++)
+        if (e->buffers[i] && e->buffers[i]->id == id) b = e->buffers[i];
+    if (b) b->painted = true;
+    (void)editor_journal_paint(e);
+}
+void editor_journal_paint_clear(editor *e)
+{
+    if (e->journal && e->journal_paint && !journal_append_protected(e->journal, JOURNAL_PAINT, 0, NULL, 0))
+        e->journal_paint = 0;
 }
