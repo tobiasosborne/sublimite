@@ -22,7 +22,14 @@ static void startup_case(bool guarded)
         if (guarded) {
             assert(!unsetenv("EDIT_ALLOW_REAL_DISPLAY"));
             assert(!unsetenv("EDIT_WAYLAND_DISPLAY"));
-        } else assert(!setenv("EDIT_ALLOW_REAL_DISPLAY", "1", 1));
+        } else {
+            /* (P) Since edit-chy refusal is opt-in via EDIT_REFUSE_REAL_DISPLAY,
+             * which display_guard.h and make check export; clear it so this
+             * child reaches the compositor connect. EDIT_ALLOW_REAL_DISPLAY is
+             * kept for the guard's own explicit real-display bench opt-in. */
+            assert(!unsetenv("EDIT_REFUSE_REAL_DISPLAY"));
+            assert(!setenv("EDIT_ALLOW_REAL_DISPLAY", "1", 1));
+        }
         assert(!setenv("EDIT_BACKEND", "gl", 1));
         char *args[] = {"sublimite", "--new-instance", NULL};
         _exit(wayland_application_main((int)(sizeof args / sizeof args[0] - 1), args));

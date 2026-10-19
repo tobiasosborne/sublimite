@@ -20,7 +20,10 @@ static int property(plat *p, xcb_atom_t key, xcb_atom_t type, const char *want, 
 }
 int main(void)
 {
-    T(getenv("DISPLAY") != NULL && strcmp(getenv("DISPLAY"), ":99") == 0);
+    /* The force-included display guard has already redirected a real display;
+     * accept whichever private display it left (:99 under make check). */
+    const char *display = getenv("DISPLAY");
+    T(display != NULL && display[0] != '\0' && !edit_display_is_real(display));
     plat p; plat_config cfg = {NULL, 100, 100, false, -1, 0};
     T(plat_init(&p, &cfg) == PLAT_OK);
     static const char cls[] = "sublimite\0sublimite";
@@ -29,6 +32,6 @@ int main(void)
     failed |= property(&p, intern(p.conn, "_NET_WM_NAME"), intern(p.conn, "UTF8_STRING"), "sublimité", strlen("sublimité"));
     failed |= property(&p, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, "sublimite", 9);
     plat_shutdown(&p); T(failed == 0);
-    puts("x11_identity_test: WM_CLASS, UTF8_STRING _NET_WM_NAME and WM_NAME readback passed on :99");
+    printf("x11_identity_test: WM_CLASS, UTF8_STRING _NET_WM_NAME and WM_NAME readback passed on %s\n", display);
     return 0;
 }

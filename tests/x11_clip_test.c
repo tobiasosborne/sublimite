@@ -269,7 +269,14 @@ static void test_large_and_snapshot(plat *a, sink *sa, rawp *r) {
     pump_until(a, sa, r, &r->done, NULL, 30000);
     CHECK(r->done && r->is_incr && r->got_len == n && memcmp(r->got, d, n) == 0,
           "INCR keeps its immutable snapshot across a replacement (%zu/%zu)", r->got_len, n);
-    pump(a, sa, r, 3); CHECK(x11_clip_busy(a) == 0, "large snapshot released");
+    /* The 20 MiB snapshot is freed on the clipboard worker and reported by
+     * MSG_FREE; at load1 > 25 that took longer than a fixed 3 x 4 ms pump (M,
+     * check18 triage). Pump until released; the 1000 ms watchdog is the one the
+     * notify wait above and test_serve_stalled_requester use (a hang bound,
+     * not a latency gate). */
+    uint64_t t0 = now_ms();
+    while (x11_clip_busy(a) && now_ms() - t0 < 1000) pump(a, sa, r, 1);
+    CHECK(x11_clip_busy(a) == 0, "large snapshot released");
     free(d);
 }
 

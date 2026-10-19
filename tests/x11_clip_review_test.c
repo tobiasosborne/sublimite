@@ -8,8 +8,12 @@
 typedef struct fixture { plat p; x11_input in; } fixture;
 static bool fixture_init(fixture *f) {
     memset(f, 0, sizeof *f);
-    f->p.conn = xcb_connect(":99", NULL);
-    REQUIRE(!xcb_connection_has_error(C(&f->p)), "connect DISPLAY=:99");
+    /* DISPLAY from the environment (the display tools/with_display_lock.sh
+     * locked); :99, the session's private Xvfb, when it is unset or empty. */
+    const char *display = getenv("DISPLAY");
+    if (display == NULL || display[0] == '\0') display = ":99";
+    f->p.conn = xcb_connect(display, NULL);
+    REQUIRE(!xcb_connection_has_error(C(&f->p)), "connect DISPLAY");
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(C(&f->p))).data;
     f->p.win = xcb_generate_id(C(&f->p));
     xcb_create_window(C(&f->p), XCB_COPY_FROM_PARENT, f->p.win, screen->root,
