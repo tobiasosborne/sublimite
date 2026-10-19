@@ -29,11 +29,12 @@ static void drop_copy(editor *e, editor_buffer *b)
 void editor_retain_tick(editor *e)
 {
     if (!e->journal || e->recovering || !e->buffers) return;
-    /* edit-ze59: while the worker checkpoint owns the journal nothing here
-     * runs (no retention job submission, no copy transition or removal). */
+    /* Poll publication before checking its lease so completion can release it.
+     * edit-9fzc: every save lease excludes retention submissions, transitions
+     * and removal while the worker owns the journal pool, not just publish. */
     int published;
     if (editor_publish_poll(e, &published)) editor_checkpoint_published(e, published);
-    if (e->publish) return;
+    if (editor_save_leased(e)) return;
     bool saving = editor_save_active(e) || editor_save_leased(e), want = false;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];

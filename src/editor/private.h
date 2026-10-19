@@ -677,7 +677,8 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes,
 void editor_buffer_destroy(editor_buffer *b);
 int editor_adopt_open(editor *e, editor_buffer *b);
 int editor_check_sources(editor *e);
-int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index);
+/* Save As peers share its owed worker checkpoint (edit-9fzc). */
+int editor_reload_saved_peer(editor *e, editor_buffer *b, size_t tab_index);
 int editor_activate(editor *e);
 int editor_cycle_tab(editor *e, bool reverse);
 int editor_compose(editor *e);

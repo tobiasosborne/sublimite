@@ -951,7 +951,7 @@ int editor_poll_sources(editor *e)
  * empty undo history, journal reconciliation and logical tab identity. */
 /* edit-ivv: *refused reports a checkpoint the shared directory guard turned
  * away (JOURNAL_BUSY): rolled back like any failure, retried on the tick. */
-static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *refused)
+static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *refused, bool defer_checkpoint)
 {
     size_t slot = 0;
     while (slot < e->buffer_capacity && e->buffers[slot]) slot++;
@@ -982,14 +982,19 @@ static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *re
     replacement->session_slot = slot;
     replacement->id = b->id; replacement->source_generation = b->source_generation + 1;
     replacement->wait_token = b->wait_token; replacement->initial = state;
-    /* Stage the replacement tab/state for the complete checkpoint, rolling it
-     * back on failure. Retired generations retain leases, but are not recovery
-     * state. Inactive tabs must checkpoint their clamped replacement view too. */
+    /* Stage the replacement tab/state for the complete checkpoint. Explicit
+     * Reload and source refresh roll back on checkpoint failure; a Save As
+     * peer joins the rebind's worker publication (edit-9fzc). Retired
+     * generations retain leases, but are not recovery state. Inactive tabs
+     * must checkpoint their clamped replacement view too. */
     e->buffers[slot] = replacement; b->retired = true;
     if (active) e->buffer = replacement;
     rc = tabs_replace(&e->tabs, tab_index, replacement->tree, &replacement->undo, &state, &e->v.state);
     EDIT_ASSERT(rc == 0); /* replacement keeps the existing logical tab */
-    if (e->journal) { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    if (e->journal) {
+        if (defer_checkpoint) e->publish_owed = true;
+        else { rc = journal_flush(e->journal); if (!rc) rc = editor_checkpoint(e); }
+    }
     if (rc) {
         if (refused) *refused = rc == JOURNAL_BUSY;
         e->buffers[slot] = NULL; b->retired = false;
@@ -1011,9 +1016,9 @@ static int reload_source(editor *e, editor_buffer *b, size_t tab_index, bool *re
     return editor_journal_changed(e);
 }
 
-int editor_reload_source(editor *e, editor_buffer *b, size_t tab_index)
+int editor_reload_saved_peer(editor *e, editor_buffer *b, size_t tab_index)
 {
-    return reload_source(e, b, tab_index, NULL);
+    return reload_source(e, b, tab_index, NULL, true);
 }
 
 int editor_source_resolve(editor *e, bool reload)
@@ -1042,7 +1047,7 @@ int editor_check_sources(editor *e)
             if (tab_index == tabs_count(&e->tabs)) continue; /* refresh retained closed tabs when reopened */
             if (!editor_checkpoint_due(e)) continue; /* edit-ivv: a refused refresh waits for its tick */
             bool refused = false;
-            int rc = reload_source(e, b, tab_index, &refused);
+            int rc = reload_source(e, b, tab_index, &refused, false);
             if (rc || b->retired) return rc; /* at most one replacement in a maintenance turn */
             if (refused) continue; /* edit-ivv: retried on the journal tick, not prompted */
             /* Failed acquisition/reconciliation retains the old resources and
@@ -1100,7 +1105,7 @@ int editor_check_sources(editor *e)
         return editor_full_layout(e);
     }
     bool refused = false;
-    int rc = reload_source(e, b, tabs_active_index(&e->tabs), &refused);
+    int rc = reload_source(e, b, tabs_active_index(&e->tabs), &refused, false);
     if (!rc && refused) e->source_choice = choice; /* edit-ivv: Reload again on the tick */
     return rc;
 }

@@ -1182,6 +1182,110 @@ static int ze59_save_as(void)
     remove_tree(root); return rc;
 }
 
+/* edit-9fzc: (P) the tabs are the Save As owner and its clean target peer;
+ * lengths come from fixture literals, indexes from that insertion order.
+ * Zero is the API success/empty sentinel; counters count observed callbacks.
+ * The watchdog reuses EDITOR_IDLE_NS (E), with no new timing bound. */
+typedef struct followup_io {
+    pthread_t ui;
+    _Atomic unsigned ui_rotations, worker_rotations;
+    _Atomic bool hold;
+} followup_io;
+typedef struct followup_fixture {
+    editor *e;
+    render_backend backend;
+    followup_io io;
+    char source[IPC_PATH_CAP], target[IPC_PATH_CAP], journal[IPC_PATH_CAP];
+} followup_fixture;
+static int followup_rename(void *ctx, const char *from, const char *to)
+{
+    followup_io *io = ctx;
+    if (pthread_equal(pthread_self(), io->ui)) atomic_fetch_add(&io->ui_rotations, 1u);
+    else atomic_fetch_add(&io->worker_rotations, 1u);
+    return rename(from, to);
+}
+static int followup_peer_body(const char *root, followup_fixture *fixture)
+{
+    char *source = fixture->source, *target = fixture->target, *jpath = fixture->journal;
+    followup_io *io = &fixture->io;
+    char absolute[IPC_PATH_CAP];
+    T(realpath(root, absolute));
+    T(snprintf(source, IPC_PATH_CAP, "%s/source", absolute) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, IPC_PATH_CAP, "%s/target", absolute) > 0); T(write_file(target, "base") == 0);
+    T(make_session(root, jpath, IPC_PATH_CAP) == 0);
+    T(open_editor(&fixture->e, &fixture->backend, source, jpath) == 0);
+    editor *e = fixture->e; e->retain_limit = 0;
+    T(press(e, 'A', 0, "A") == 0);
+    uint64_t peer_id; T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0);
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(editor_flush(e) == 0);
+    journal_io hooks = {.ctx = io, .rename = followup_rename};
+    T(journal_set_io(e->journal, &hooks) == 0);
+    T(press(e, 's', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL) == 0); T(e->go.active);
+    for (size_t i = 0; target[i]; i++) {
+        char ch[] = {target[i], '\0'}; T(press(e, (uint8_t)target[i], 0, ch) == 0);
+    }
+    T(press(e, XKB_KEY_Return, 0, NULL) == 0);
+    uint64_t limit = deadline();
+    while (e->save_as || e->publish || e->publish_owed) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0); T(disk_is(target, "Asource") == 0); T(text_is(e, "Asource") == 0);
+    const tabs_tab *peer = editor_tab(e, 1);
+    uint8_t bytes[sizeof "Asource" - 1u];
+    T(peer && peer->id == peer_id && !peer->modified && piece_len(peer->buffer) == sizeof bytes);
+    T(piece_read(peer->buffer, 0, bytes, sizeof bytes) == 0 && !memcmp(bytes, "Asource", sizeof bytes));
+    T(!e->recovery_notice);
+    printf("dataloss_test: edit-9fzc Save As peer: UI rotations=%u worker rotations=%u peer clean=1\n",
+        atomic_load(&io->ui_rotations), atomic_load(&io->worker_rotations));
+    T(atomic_load(&io->ui_rotations) == 0 && atomic_load(&io->worker_rotations) > 0);
+    return 0;
+}
+static void followup_hold(work_ctx *ctx)
+{
+    followup_io *io = ctx->arg;
+    while (atomic_load(&io->hold) && !work_should_stop(ctx)) sched_yield();
+}
+static int followup_lease_body(const char *root, followup_fixture *fixture)
+{
+    char *source = fixture->source, *target = fixture->target, *jpath = fixture->journal;
+    followup_io *io = &fixture->io;
+    T(snprintf(source, IPC_PATH_CAP, "%s/source", root) > 0); T(write_file(source, "source") == 0);
+    T(snprintf(target, IPC_PATH_CAP, "%s/target", root) > 0); T(write_file(target, "base") == 0);
+    T(make_session(root, jpath, IPC_PATH_CAP) == 0);
+    T(open_editor(&fixture->e, &fixture->backend, source, jpath) == 0);
+    editor *e = fixture->e; e->retain_limit = 0;
+    T(press(e, 'A', 0, "A") == 0);
+    editor_buffer *owner = e->buffer;
+    uint64_t peer_id; T(editor_add_buffer(e, target, NULL, 0, &peer_id) == 0); T(settle(e) == 0);
+    T(press(e, 'B', 0, "B") == 0); editor_buffer *peer = e->buffer;
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(editor_flush(e) == 0);
+    /* Hold the main bulk lane before the save prepare is queued: its journal
+     * lease is real, but it cannot race this test's inspection of retention. */
+    atomic_store(&io->hold, true);
+    work_handle held = work_submit(&e->pool, (work_job){followup_hold, io, 0, WORK_BULK});
+    T(held.epoch != 0); T(editor_save_request(e, 0) == 0); T(editor_save_leased(e));
+    e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
+    editor_retain_tick(e);
+    bool idle = owner->retain_state == EDITOR_RETAIN_IDLE && peer->retain_state == EDITOR_RETAIN_IDLE;
+    printf("dataloss_test: edit-9fzc Ctrl+S prepare: leased=%d retention idle=%d\n", editor_save_leased(e), idle);
+    T(idle);
+    atomic_store(&io->hold, false); T(saved(e) == 0);
+    uint64_t limit = deadline();
+    while (!peer->retain_used) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(disk_is(source, "Asource") == 0); T(disk_is(target, "base") == 0);
+    T(editor_select_tab(e, 1) == 0); T(settle(e) == 0); T(text_is(e, "Bbase") == 0);
+    T(editor_tab(e, 1)->id == peer_id && editor_tab(e, 1)->modified);
+    puts("dataloss_test: edit-9fzc retention resumed after the save lease");
+    return 0;
+}
+static int followup(bool peer)
+{
+    char root[IPC_PATH_CAP]; T(make_root(root, sizeof root) == 0);
+    followup_fixture fixture = {.io.ui = pthread_self()};
+    int rc = peer ? followup_peer_body(root, &fixture) : followup_lease_body(root, &fixture);
+    atomic_store(&fixture.io.hold, false);
+    if (fixture.e) editor_close(fixture.e);
+    remove_tree(root); return rc;
+}
+
 int main(int argc, char **argv)
 {
     bool probe = argc == 2 && !strcmp(argv[1], "--probe");
@@ -1200,6 +1304,8 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--retain-lifecycle")) return retain_lifecycle();
     if (argc == 2 && !strcmp(argv[1], "--ze59-stall")) return ze59_retain_stall();
     if (argc == 2 && !strcmp(argv[1], "--ze59-save-as")) return ze59_save_as();
+    if (argc == 2 && !strcmp(argv[1], "--9fzc-peer")) return followup(true);
+    if (argc == 2 && !strcmp(argv[1], "--9fzc-lease")) return followup(false);
     if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
     if (argc == 2 && !strcmp(argv[1], "--retain-close")) return retain_close();
     T(kill_after_append() == 0);
@@ -1215,6 +1321,7 @@ int main(int argc, char **argv)
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
     T(retain_close() == 0);
     T(ze59_retain_stall() == 0); T(ze59_save_as() == 0);
+    T(followup(true) == 0); T(followup(false) == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }
     if (probe) {
         /* Findings run to completion independently; each reports its own verdict. */

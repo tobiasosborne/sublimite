@@ -173,9 +173,9 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
         reload[i] = other != b && editor_same_path(path, other->path) &&
             !other->saved_lost && other->history_cursor == other->saved_cursor;
     }
-    /* Stage all peer BASEs together so each clean reload's complete checkpoint
-     * can validate every target. Retained closed tabs keep the existing policy;
-     * open peers adopt the saved bytes below before this command completes. */
+    /* Stage all peer BASEs together for the rebind's worker checkpoint.
+     * Retained closed tabs keep the existing policy; open peers adopt the
+     * saved bytes below before the graph is published (edit-9fzc). */
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *other = e->buffers[i];
         if (!other || other == b || other->retired || strcmp(other->save_path, path)) continue;
@@ -194,7 +194,7 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
     for (size_t i = 0; !rc && i < peers && i < tabs_count(&e->tabs); i++) {
         if (!reload[i]) continue;
         editor_buffer *other = (editor_buffer *)((uint8_t *)tabs_at(&e->tabs, i)->undo - offsetof(editor_buffer, undo));
-        rc = editor_reload_source(e, other, i);
+        rc = editor_reload_saved_peer(e, other, i);
         if (!rc && !other->retired) rc = EDITOR_ERR_IO;
     }
     free(reload);
