@@ -548,12 +548,72 @@ static int legacy_rotation_temp(void)
     if(cleanup(root)) result=1;
     return result;
 }
-int main(void)
+typedef struct partial_copy { int ready; } partial_copy;
+static ssize_t hold_partial_copy(void *ctx, int fd, const uint8_t *bytes, size_t n, uint64_t off)
+{
+    partial_copy *p=ctx;
+    ssize_t written=pwrite(fd,bytes,n,(off_t)off);
+    if(written>0) {
+        if(write(p->ready,"r",sizeof "r"-1u)!=(ssize_t)(sizeof "r"-1u)) return -1;
+        for(;;) pause(); /* parent kills the actual copying process */
+    }
+    return written;
+}
+static int partial_copy_child(const char *source, const char *path, int ready)
+{
+    work_pool pool; T(work_pool_init(&pool,1,0)==0);
+    journal *j; T(journal_open(&j,path,&pool,NULL)==0);
+    journal_base base; T(journal_capture_base(source,&base)==0);
+    partial_copy partial={.ready=ready}; journal_io io={.ctx=&partial,.write=hold_partial_copy};
+    T(journal_set_io(j,&io)==0);
+    journal_retain retained={0}; work_handle handle;
+    T(journal_retain_start(j,&retained,&base,&handle)==0);
+    for(;;) pause();
+}
+static int partial_copy_body(const char *root, pid_t *child)
+{
+    char source[sizeof ((journal_base *)0)->captured_path], path[sizeof source], partial[sizeof source]="";
+    T(snprintf(source,sizeof source,"%s/source",root)>0);
+    int fd=open(source,O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0600); T(fd>=0);
+    /* (P) reuse the artifact cap as sparse source length. The hook holds
+     * after the first actual copy write, whose length is checked below. */
+    bool sized=ftruncate(fd,(off_t)JOURNAL_ARTIFACT_BYTES)==0; close(fd); T(sized);
+    T(snprintf(path,sizeof path,"%s/session-copy",root)>0);
+    int pipes[2]; T(pipe(pipes)==0); *child=fork(); T(*child>=0);
+    if(!*child) { close(pipes[0]); _exit(partial_copy_child(source,path,pipes[1])); }
+    close(pipes[1]); char ready; ssize_t got=read(pipes[0],&ready,sizeof ready); close(pipes[0]);
+    DIR *dir=opendir(root); T(dir); struct dirent *entry;
+    while((entry=readdir(dir))) if(!strncmp(entry->d_name,".sublimite-base-",strlen(".sublimite-base-")) ||
+        !strncmp(entry->d_name,".sublimite-copy-",strlen(".sublimite-copy-")))
+        T(snprintf(partial,sizeof partial,"%s/%s",root,entry->d_name)>0);
+    closedir(dir);
+    int live=journal_retire_directory(root,path);
+    T(kill(*child,SIGKILL)==0); int status; T(waitpid(*child,&status,0)==*child); *child=0;
+    T(got==(ssize_t)sizeof ready && WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    struct stat st; T(*partial && stat(partial,&st)==0);
+    T(st.st_size>0 && (uint64_t)st.st_size<=JOURNAL_ARTIFACT_BYTES);
+    T(journal_retire_directory(root,NULL)==0);
+    bool removed=access(partial,F_OK)<0;
+    printf("edit-7cj8: partial copy live=%s dead=%s (below artifact cap)\n",live==JOURNAL_BUSY?"protected":"unleased",removed?"removed":"left behind");
+    T(removed && live==JOURNAL_BUSY); return 0;
+}
+static int partial_copy_crash(void)
+{
+    char root[]="build/partial-copy-XXXXXX"; T(mkdtemp(root)); pid_t child=0;
+    int rc=partial_copy_body(root,&child);
+    if(child>0) { (void)kill(child,SIGKILL); (void)waitpid(child,NULL,0); }
+    if(cleanup(root)) rc=1;
+    return rc;
+}
+int main(int argc, char **argv)
 {
     trace_init(); T(trace_thread_register()>=0);
+    /* (P) program name plus the focused selector. */
+    if(argc==2 && !strcmp(argv[1],"--partial-copy")) return partial_copy_crash();
     int rotations=0;
     for(rotation_case which=ROTATION_CLEAN;which<=ROTATION_UNFLAGGED_FAILED;which++) rotations|=rotation_temps(which);
     rotations|=legacy_rotation_temp(); T(rotations==0);
+    T(partial_copy_crash()==0);
     T(retirement()==0); T(protection()==0); T(clean_tab_set()==0); T(artifacts()==0); T(save_metadata()==0); T(custom_reference()==0); T(targets()==0); T(manual()==0); T(startup_window()==0); T(orphan_leases()==0); T(measurement()==0);
     puts("journal_retire_test: passed"); return 0;
 }

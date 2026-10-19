@@ -200,7 +200,10 @@ int journal_save_finish(journal *j, journal_save *save, const journal_base *save
  * source's bytes in a private `.sublimite-base-*` reflink/copy beside the
  * journal, with save_prepare's validation (identity before and after the
  * clone/copy, full fsync of the copy and its directory), but as one WORK_BULK
- * job on the journal's pool: the caller never waits. The calling thread does
+ * job on the journal's pool: the caller never waits. Incomplete copies use
+ * `.sublimite-copy-*`, under a shared directory lease, and are promoted only
+ * after validation. Housekeeping removes dead staging copies below the
+ * ordinary artifact cap too. The calling thread does
  * no I/O and no allocation (the name is formed from the journal path; the
  * worker creates the file). r must stay valid and unmoved until
  * work_handle_finished(pool, *handle); cancel with work_cancel (the copy loop

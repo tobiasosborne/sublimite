@@ -1079,15 +1079,53 @@ static void retention_name(const journal *j, char out[4097])
 static void retain_async_worker(work_ctx *ctx)
 {
     journal_retain *r=ctx->arg;
-    int fd=mkostemp(r->path,O_CLOEXEC);
-    if(fd<0) r->error=JOURNAL_IO;
+    /* edit-7cj8: an incomplete copy is never a journal BASE. Its distinct
+     * staging name is swept after owner death regardless of the artifact cap.
+     * The shared directory lease starts before creation, so housekeeping's
+     * exclusive lease cannot race a live copy or its durable promotion. */
+    _Static_assert(sizeof ".sublimite-copy-"==sizeof ".sublimite-base-", "equal retention prefix lengths");
+    char pending[sizeof r->path], directory[sizeof r->path];
+    strcpy(pending,r->path);
+    char *leaf=strrchr(pending,'/')+1;
+    size_t parent=(size_t)(leaf-pending);
+    memcpy(leaf,".sublimite-copy-",sizeof ".sublimite-copy-"-1u);
+    memcpy(directory,pending,parent); directory[parent]=0;
+    r->error=0;
+    int guard=open(directory,O_RDONLY|O_DIRECTORY|O_CLOEXEC), fd=-1;
+    bool promoted=false;
+    if(guard<0) r->error=JOURNAL_IO;
     else {
-        journal_retention t={.previous=&r->source,.path=r->path,.io=r->io,.fd=fd};
-        r->error=retain_generation(ctx,&t);
-        close(fd);
-        if(!r->error) { r->copy=t.base; r->copy.path=r->copy.captured_path; }
-        else (void)unlink(r->path);
+        int locked;
+        do { locked=flock(guard,LOCK_SH|LOCK_NB); } while(locked && errno==EINTR);
+        if(locked) r->error=(errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO;
     }
+    if(!r->error) {
+        fd=mkostemp(pending,O_CLOEXEC);
+        if(fd<0) r->error=JOURNAL_IO;
+    }
+    if(fd>=0) {
+        journal_retention t={.previous=&r->source,.path=pending,.io=r->io,.fd=fd};
+        r->error=retain_generation(ctx,&t);
+        if(!r->error) {
+            strcpy(r->path,pending);
+            memcpy(r->path+parent,".sublimite-base-",sizeof ".sublimite-base-"-1u);
+            if(renameat2(AT_FDCWD,pending,AT_FDCWD,r->path,RENAME_NOREPLACE)) r->error=JOURNAL_IO;
+            else {
+                promoted=true;
+                /* Rename advances ctime. Capture and persist that final
+                 * identity before the caller can reference the copy. */
+                r->error=journal_capture_base_with_io(r->path,&r->copy,r->io);
+                if(!r->error) r->error=metadata_sync(r->io,fd);
+                if(!r->error) r->error=sync_parent(r->path,r->io);
+            }
+        }
+        close(fd);
+        if(r->error) {
+            (void)unlink(pending);
+            if(promoted) (void)unlink(r->path);
+        }
+    }
+    if(guard>=0) close(guard);
     work_msg msg={.kind=JOURNAL_RETAIN_MESSAGE};
     (void)work_publish(ctx,&msg); /* wake-up only; a full mailbox loses nothing */
 }

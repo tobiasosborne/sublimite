@@ -144,6 +144,30 @@ static bool remove_rotation_lock(DIR *dir, const char *name)
        held.st_dev==named.st_dev && held.st_ino==named.st_ino) removed=unlinkat(dirfd(dir),name,0)==0;
     close(fd); return removed;
 }
+/* edit-7cj8: these names never appear in a durable journal. The caller's
+ * exclusive directory lease excludes every live asynchronous copy. No
+ * content scan, reference inventory, age rule or byte cap is needed. */
+static int sweep_copies(DIR *dir)
+{
+    const char prefix[]=".sublimite-copy-";
+    bool changed=false; int rc=0;
+    rewinddir(dir); struct dirent *entry;
+    while((entry=readdir(dir))) {
+        /* (P) mkostemp's suffix schema is the literal XXXXXX. */
+        if(strncmp(entry->d_name,prefix,sizeof prefix-1u) ||
+           strlen(entry->d_name)!=(sizeof prefix-1u)+(sizeof "XXXXXX"-1u)) continue;
+        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+        if(fd<0) continue;
+        struct stat held,named;
+        if(!fstat(fd,&held) && S_ISREG(held.st_mode) &&
+           !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) && same(&held,&named)) {
+            if(unlinkat(dirfd(dir),entry->d_name,0)) rc=JOURNAL_IO; else changed=true;
+        }
+        close(fd);
+    }
+    if(changed && fsync(dirfd(dir))) rc=JOURNAL_IO;
+    return rc;
+}
 static int sweep_rotations(DIR *dir, const char *current)
 {
     bool legacy_live=legacy_owner_live(dir,current), changed=false; int rc=0;
@@ -316,6 +340,7 @@ int journal_retire_directory(const char *directory, const char *current)
     char current_path[sizeof canonical]=""; if(current && !realpath(current,current_path)) current_path[0]=0;
     /* Sweep before inventory/scanning/retirement can remove an original.
      * The exclusive directory lease excludes every live new rotation. */
+    int copy_rc=sweep_copies(dir);
     int rotation_rc=sweep_rotations(dir,current_path);
     rewinddir(dir);
     size_t count=0; struct dirent *entry;
@@ -324,7 +349,7 @@ int journal_retire_directory(const char *directory, const char *current)
     edit_arena arena;
     if(edit_arena_init(&arena,(count?count:1)*sizeof(artifact))) { close(guard); closedir(dir); return JOURNAL_NOMEM; }
     artifact *items=edit_arena_alloc(&arena,count*sizeof *items,_Alignof(artifact));
-    inventory inv={.items=items}; int rc=rotation_rc; uint64_t total=0;
+    inventory inv={.items=items}; int rc=copy_rc?copy_rc:rotation_rc; uint64_t total=0;
     rewinddir(dir);
     while((entry=readdir(dir))) {
         /* Never content-probe or lease a rotation temp, including its pinned

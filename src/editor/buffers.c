@@ -213,6 +213,10 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     }
     size_t content = b->file ? (file_open_mode(b->file) == FILE_MODE_COPY ? (size_t)file_size(b->file) : 0) : len;
     size_t reserve = e->cfg.arena_bytes ? e->cfg.arena_bytes : 64u * 1024u * 1024u;
+    size_t restore_bytes;
+    rc = editor_restore_reserve(e->restore_prepare, &restore_bytes); if (rc) goto fail;
+    if (restore_bytes > SIZE_MAX - reserve) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    reserve += restore_bytes;
     if (content > SIZE_MAX - reserve) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = edit_arena_init(&b->arena, reserve + content); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
     b->piece_storage.arena = &b->arena;

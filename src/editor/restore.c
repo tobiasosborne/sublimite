@@ -370,12 +370,32 @@ bool editor_restore_receive(editor *e, const work_msg *msg)
     }
     return true;
 }
+/* edit-7cj8 (P): each inserted byte consumes add-buffer arena storage, even
+ * when a later operation deletes it. Reserve the actual accepted program. */
+int editor_restore_reserve(const editor_restore_buffer *rb, size_t *bytes)
+{
+    *bytes = 0;
+    if (!rb) return 0;
+    for (size_t k = 0; k < rb->owner->op_count; k++) {
+        const restore_op *op = &rb->owner->ops[k];
+        if (op->buffer != rb->index || !op->insert) continue;
+        if (op->len > SIZE_MAX - *bytes) return EDITOR_ERR_MEMORY;
+        *bytes += (size_t)op->len;
+    }
+    return 0;
+}
 int editor_restore_apply(editor_buffer *b)
 {
     editor_restore_buffer *rb = b->restore_apply; b->restore_apply = NULL;
     if (!rb || rb->conflict) return 0;
     /* edit-btj: the opened generation must be the journalled BASE. */
     if (rb->named && !editor_base_id_matches(&b->origin, &rb->base)) { rb->conflict = rb->owner->conflicts = true; return 0; }
+    /* An empty BASE plus TARGET is a self-contained snapshot. TARGET is the
+     * save destination; its current contents are not part of this program. */
+    if (!rb->named) {
+        int rc = piece_delete(b->tree, 0, piece_len(b->tree), NULL);
+        if (rc) return rc == PIECE_ERR_NOMEM ? EDITOR_ERR_MEMORY : EDITOR_ERR_IO;
+    }
     editor_restore *r = rb->owner;
     for (size_t k = 0; k < r->op_count; k++) {
         const restore_op *op = &r->ops[k];

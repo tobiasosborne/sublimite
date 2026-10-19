@@ -241,10 +241,13 @@ file_mode file_source_mode(const file_source *source);
 int file_source_validate(void *source);
 /* Off-path I/O, with exclusive use of the source (no concurrent validate):
  * a worker after its own replacement, or explicit Keep maintenance while the
- * controller is idle. After a successful rename over the source's pathname,
+ * controller is idle. After a confirmed rename over the source's pathname,
  * replacement being the accepted renamed-in inode: adopt the retired backing's
  * new ctime iff nothing else of its identity or its fault epoch changed. Returns
- * FILE_OK (adopted or unchanged) or FILE_ERR_CHANGED/IO, leaving it as was. */
+ * FILE_OK (adopted or unchanged) or FILE_ERR_CHANGED/IO, leaving it as was.
+ * A save caller uses only its own successful rename. A read-only recovery
+ * checkpoint may use an observed external replacement on an independent
+ * lease; that lease must never authorize writes to the replacement. */
 int file_source_adopt_retired(file_source *source, const file_id *replacement);
 
 /* ---- change detection ---- */

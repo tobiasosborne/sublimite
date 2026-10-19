@@ -3378,7 +3378,9 @@ static void remove_retained(const char *dir)
 {
     DIR *d = opendir(dir); if (!d) return;
     struct dirent *entry;
-    while ((entry = readdir(d))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")))
+    /* edit-7cj8: the last abrupt exit can also leave an incomplete stage. */
+    while ((entry = readdir(d))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")) ||
+        !strncmp(entry->d_name, ".sublimite-copy-", strlen(".sublimite-copy-")))
         (void)unlinkat(dirfd(d), entry->d_name, 0);
     closedir(d);
 }

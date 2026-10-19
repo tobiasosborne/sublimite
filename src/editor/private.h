@@ -500,6 +500,7 @@ int editor_restore_start(editor *e, editor_buffer *b);
 bool editor_restore_receive(editor *e, const work_msg *msg);
 int editor_restore_service(editor *e);
 int editor_restore_apply(editor_buffer *b);
+int editor_restore_reserve(const editor_restore_buffer *rb, size_t *bytes);
 void editor_restore_free(editor_restore *r);
 int editor_install_buffer(editor *e, editor_buffer *b, uint64_t *id);
 void editor_unpoll_buffer(editor *e, editor_buffer *b);
@@ -565,6 +566,7 @@ size_t editor_recorded_rank(const editor *e, size_t index);
 /* edit-fi2 (retain.c): BASE retention after the first modification. */
 enum { EDITOR_RETAIN_IDLE, EDITOR_RETAIN_RUNNING, EDITOR_RETAIN_READY, EDITOR_RETAIN_FAILED };
 bool editor_retain_matches(const editor_buffer *b, const journal_base *base);
+bool editor_retain_unprotected(const editor_buffer *b);
 void editor_retain_tick(editor *e);
 void editor_retain_checkpointed(editor *e);
 void editor_retain_stop(editor_buffer *b);

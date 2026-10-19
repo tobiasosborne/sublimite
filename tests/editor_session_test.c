@@ -75,7 +75,9 @@ static void close_fixture(fixture *f)
     /* edit-fi2: a hot exit with unsaved edits keeps the retained BASE copy
      * its journal names (`.sublimite-base-*` beside the journal). */
     DIR *dir = opendir(f->directory); struct dirent *entry;
-    while (dir && (entry = readdir(dir))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")))
+    /* edit-7cj8: include a stage left by the last simulated crash. */
+    while (dir && (entry = readdir(dir))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-")) ||
+        !strncmp(entry->d_name, ".sublimite-copy-", strlen(".sublimite-copy-")))
         (void)unlinkat(dirfd(dir), entry->d_name, 0);
     if (dir) closedir(dir);
     (void)rmdir(f->directory);

@@ -32,7 +32,14 @@
 enum { COLS = 40, ROWS = 4, TEXT_CAP = 4096 };
 typedef struct oracle { uint64_t len, cursor; uint8_t text[TEXT_CAP]; } oracle;
 static uint64_t deadline(void) { return trace_now_ns() + EDITOR_IDLE_NS; }
-static int turn(editor *e) { int rc = editor_step(e, 0); return rc == EDITOR_OK || rc == EDITOR_MORE ? 0 : rc; }
+static int turn(editor *e)
+{
+    int rc = editor_step(e, 0);
+    if (rc != EDITOR_OK && rc != EDITOR_MORE)
+        fprintf(stderr, "dataloss_test: step error=%d journal=%d active_BASE=[%s]\n", rc,
+            e->stats.journal_error, e->buffer->base.path);
+    return rc == EDITOR_OK || rc == EDITOR_MORE ? 0 : rc;
+}
 static int settle(editor *e)
 {
     uint64_t limit = deadline();
@@ -310,10 +317,14 @@ static int reload_during_save(bool reload)
     T(make_session(root, jpath, sizeof jpath) == 0);
     render_backend backend; editor *e; T(open_editor(&e, &backend, source, jpath) == 0);
     uint64_t id; T(editor_add_buffer(e, other, NULL, 0, &id) == 0); T(settle(e) == 0);
+    /* edit-7cj8 (P): the existing zero-limit seam keeps copies unavailable
+     * until save owns the journal, making this peer-BASE race deterministic. */
+    e->retain_limit = 0;
     T(press(e, 'y', 0, "y") == 0); T(stale_prompt(e, other, "external") == 0);
     T(editor_select_tab(e, 0) == 0); T(settle(e) == 0); T(press(e, 'x', 0, "x") == 0);
     held_save held = {.phase = FILE_STEP_TEMP_WRITTEN}; T(savectl_set_step_hook(e->buffer->save, hold, &held) == 0);
     T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(e, &held) == 0);
+    e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
     T(editor_select_tab(e, 1) == 0); T(settle(e) == 0); T(e->buffer->source_stale);
     uint64_t limit = deadline();
     while (!e->buffer->prompt_ns) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
@@ -794,6 +805,127 @@ static bool fi2_retained(const char *root)
     struct dirent *entry; bool found = false;
     while ((entry = readdir(dir))) if (!strncmp(entry->d_name, ".sublimite-base-", strlen(".sublimite-base-"))) found = true;
     closedir(dir); return found;
+}
+/* edit-7cj8 (P): the first byte above the existing retention bound exercises
+ * its excluded generation. Sparse holes are original zero bytes; boundary
+ * sentinels distinguish the old mapping from the renamed-in disk text. */
+typedef struct detached_hold { atomic_bool entered, release; } detached_hold;
+static ssize_t detached_hold_write(void *ctx, int fd, const uint8_t *bytes, size_t n, uint64_t off)
+{
+    detached_hold *hold = ctx;
+    atomic_store(&hold->entered, true);
+    while (!atomic_load(&hold->release)) sched_yield();
+    return pwrite(fd, bytes, n, (off_t)off);
+}
+static int detached_child(const char *source, const char *other, const char *jpath, int ready, bool window)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = source, .journal_path = jpath, .cols = COLS, .rows = ROWS,
+        .closed_capacity = window ? sizeof "x" - 1u : 0, /* (P) minimal eviction history, or default */
+        /* (P) map every nonempty original, or force private COPY for the
+         * in-place rewrite while the retained generation is not READY. */
+        .copy_threshold = window ? UINT64_MAX : sizeof "x" - 1u};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t limit = deadline();
+    while (e->buffer->pending_open) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    T(settle(e) == 0);
+    detached_hold hold = {0};
+    if (window) {
+        e->retain_limit = 0; /* (P) no copy until the edit is durable */
+        /* (P) In the binary session graph, source + these literal-named
+         * leaves cross a sibling branch. Evicting its only leaf leaves an
+         * empty internal branch that validation must skip safely. */
+        const char *temporary[] = {"branch", "evicted"};
+        for (size_t i = 0; i < sizeof temporary / sizeof *temporary; i++) {
+            uint64_t id;
+            T(editor_add_buffer(e, NULL, (const uint8_t *)temporary[i], strlen(temporary[i]), &id) == 0);
+            T(settle(e) == 0);
+        }
+        for (size_t i = 0; i < sizeof temporary / sizeof *temporary; i++) {
+            T(editor_close_tab(e, tabs_count(&e->tabs) - 1u) == 0); T(settle(e) == 0);
+        }
+        T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    }
+    T(press(e, 'X', 0, "XY") == 0); T(editor_flush(e) == 0);
+    if (window) {
+        journal_io io = {.ctx = &hold, .write = detached_hold_write};
+        T(journal_set_io(e->journal, &io) == 0);
+        e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;
+        limit = deadline();
+        while (!atomic_load(&hold.entered)) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+        T(e->buffer->retain_state == EDITOR_RETAIN_RUNNING && !e->buffer->retain_used);
+        T(write_file(source, "external\n") == 0);
+        atomic_store(&hold.release, true); /* old BASE fails the copy's validation */
+    } else {
+        T(write_file(other, "external\n") == 0); T(rename(other, source) == 0);
+    }
+    T(file_check(e->buffer->file, NULL));
+    limit = deadline();
+    while (*e->buffer->base.path && trace_now_ns() < limit) { T(turn(e) == 0); sched_yield(); }
+    fprintf(stderr, "dataloss_test: edit-7cj8 %s checkpoint=%s\n", window ? "copy window" : "detached",
+        *e->buffer->base.path ? "missing" : "durable");
+    T(write(ready, "r", sizeof "r" - 1u) == (ssize_t)(sizeof "r" - 1u));
+    for (;;) pause();
+}
+typedef struct detached_fixture {
+    editor *e;
+    render_backend backend;
+    pid_t child;
+    char journal[IPC_PATH_CAP]; /* config borrows this until wrapper teardown */
+} detached_fixture;
+static int detached_body(const char *root, detached_fixture *f, bool window)
+{
+    char source[IPC_PATH_CAP], other[IPC_PATH_CAP], first[IPC_PATH_CAP];
+    T(snprintf(source, sizeof source, "%s/source", root) > 0);
+    T(snprintf(other, sizeof other, "%s/rewrite", root) > 0);
+    const uint64_t bytes = window ? FI2_BYTES : JOURNAL_STARTUP_SCAN_BYTES + (sizeof "x" - 1u);
+    int fd = open(source, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600); T(fd >= 0);
+    bool sized = ftruncate(fd, (off_t)bytes) == 0;
+    bool head = pwrite(fd, "original\n", sizeof "original\n" - 1u, 0) == (ssize_t)(sizeof "original\n" - 1u);
+    bool tail = pwrite(fd, "tail\n", sizeof "tail\n" - 1u, (off_t)(bytes - (sizeof "tail\n" - 1u))) == (ssize_t)(sizeof "tail\n" - 1u);
+    T(close(fd) == 0); T(sized && head && tail);
+    T(make_session(root, first, sizeof first) == 0);
+    int pipes[2]; T(pipe(pipes) == 0); f->child = fork(); T(f->child >= 0);
+    if (!f->child) { close(pipes[0]); _exit(detached_child(source, other, first, pipes[1], window)); }
+    close(pipes[1]); char ready; ssize_t got = read(pipes[0], &ready, sizeof ready); close(pipes[0]);
+    T(kill(f->child, SIGKILL) == 0); T(killed_by(f->child, SIGKILL) == 0); f->child = 0;
+    T(got == (ssize_t)sizeof ready);
+    T(make_session(root, f->journal, sizeof f->journal) == 0);
+    T(open_editor(&f->e, &f->backend, NULL, f->journal) == 0);
+    editor *e = f->e;
+    if (!tabs_count(&e->tabs) && tabs_closed_count(&e->tabs)) {
+        T(editor_reopen_tab(e) == 0);
+        uint64_t limit = deadline();
+        while (e->restore_active || e->buffer->placeholder || e->buffer->pending_open) {
+            T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
+        }
+        T(settle(e) == 0);
+    }
+    fprintf(stderr, "dataloss_test: edit-7cj8 %s recovered original=%s modified=%d\n", window ? "copy window" : "detached",
+        editor_length(e) == bytes + (sizeof "XY" - 1u) ? "complete" : "lost", editor_tab(e, 0)->modified);
+    T(editor_length(e) == bytes + (sizeof "XY" - 1u));
+    uint8_t chunk[JOURNAL_INSERT_SLICE_BYTES];
+    T(editor_read(e, 0, chunk, sizeof "XYoriginal\n" - 1u) == 0);
+    T(!memcmp(chunk, "XYoriginal\n", sizeof "XYoriginal\n" - 1u));
+    uint64_t end = bytes - (sizeof "tail\n" - 1u);
+    for (uint64_t off = sizeof "original\n" - 1u; off < end;) {
+        size_t n = end - off < sizeof chunk ? (size_t)(end - off) : sizeof chunk;
+        T(editor_read(e, off + (sizeof "XY" - 1u), chunk, n) == 0);
+        for (size_t i = 0; i < n; i++) T(chunk[i] == 0); /* (P) sparse holes */
+        off += n;
+    }
+    T(editor_read(e, end + (sizeof "XY" - 1u), chunk, sizeof "tail\n" - 1u) == 0);
+    T(!memcmp(chunk, "tail\n", sizeof "tail\n" - 1u));
+    T(editor_tab(e, 0)->modified); T(!*e->recovery_aside); T(disk_is(source, "external\n") == 0);
+    return 0;
+}
+static int detached_rewrite(bool window)
+{
+    char root[sizeof "build/dataloss-XXXXXX"]; T(make_root(root, sizeof root) == 0);
+    detached_fixture f = {0}; int rc = detached_body(root, &f, window);
+    if (f.child > 0) { (void)kill(f.child, SIGKILL); (void)waitpid(f.child, NULL, 0); }
+    if (f.e) editor_close(f.e);
+    remove_tree(root); return rc;
 }
 /* Child: open, type "XY" at offset 0, then keep turning until the journal
  * names a retained copy (or the idle watchdog expires: the red build never
@@ -1429,6 +1561,9 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--9fzc-lease")) return followup(false);
     if (argc == 2 && !strcmp(argv[1], "--edit-ivv")) { T(ivv_choice(false) == 0); T(ivv_choice(true) == 0); return 0; }
     if (argc == 2 && !strcmp(argv[1], "--retain-close")) return retain_close();
+    if (argc == 2 && !strcmp(argv[1], "--detached-rewrite")) return detached_rewrite(false);
+    if (argc == 2 && !strcmp(argv[1], "--retain-window")) return detached_rewrite(true);
+    if (argc == 2 && !strcmp(argv[1], "--reload-held")) return reload_during_save(true) || reload_during_save(false);
     T(kill_after_append() == 0);
     for (int phase = FILE_STEP_TEMP_CREATED; phase <= FILE_STEP_DIR_SYNCED; phase++) T(killed_mid_save(phase) == 0);
     T(changed_base(BASE_SHORTER) == 0);
@@ -1442,6 +1577,7 @@ int main(int argc, char **argv)
     T(external_rewrite(REWRITE_RENAME) == 0); T(external_rewrite(REWRITE_IN_PLACE) == 0); T(retain_lifecycle() == 0);
     T(y315_healthy() == 0); T(y315_stall() == 0);
     T(retain_close() == 0);
+    T(detached_rewrite(false) == 0); T(detached_rewrite(true) == 0);
     T(ze59_retain_stall() == 0); T(ze59_save_as() == 0);
     T(followup(true) == 0); T(followup(false) == 0);
     if (!probe) { T(torn_undo_group() == 0); T(stranded_orphan(false, false) == 0); T(stranded_orphan(true, false) == 0); T(stranded_orphan(false, true) == 0); }

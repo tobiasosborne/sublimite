@@ -20,6 +20,14 @@ static bool references_base(const editor_buffer *b)
     return editor_base_id_matches(&b->origin, &b->base) ||
         (b->saved_snapshot && editor_base_id_matches(&b->saved_text, &b->base));
 }
+/* edit-7cj8: the snapshot still pins the opened original, but its pathname
+ * can no longer supply BASE. Preserve it through the plain worker checkpoint
+ * even when asynchronous retention was excluded or has not become READY. */
+bool editor_retain_unprotected(const editor_buffer *b)
+{
+    return !b->retired && !b->pending_open && b->source_stale && *b->base.path &&
+        modified(b) && references_base(b) && !editor_retain_matches(b, &b->base);
+}
 static void drop_copy(editor *e, editor_buffer *b)
 {
     (void)unlink(b->retain.copy.captured_path);
@@ -39,11 +47,13 @@ void editor_retain_tick(editor *e)
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         if (!b || b->placeholder || b->derived) continue;
+        if (e->retain_limit && editor_retain_unprotected(b)) want = true;
         switch (b->retain_state) {
         case EDITOR_RETAIN_RUNNING:
             if (!work_handle_finished(b->retain_pool, b->retain_handle)) break;
             b->retain_handle = (work_handle){0};
-            b->retain_state = b->retain.error ? EDITOR_RETAIN_FAILED : EDITOR_RETAIN_READY;
+            b->retain_state = b->retain.error == JOURNAL_BUSY ? EDITOR_RETAIN_IDLE :
+                b->retain.error ? EDITOR_RETAIN_FAILED : EDITOR_RETAIN_READY;
             b->retain_used = b->retain_building = false;
             if (b->retain_state == EDITOR_RETAIN_READY) editor_session_publish(e, b);
             break;
@@ -76,7 +86,10 @@ void editor_retain_tick(editor *e)
      * checkpoint retries after the next mutation (editor_checkpoint_published). */
     if ((!want && !e->publish_owed) || saving) return;
     if (!e->publish_owed && e->retain_retry == e->stats.mutations + 1u) return;
-    if (!editor_checkpoint_due(e) || editor_activation_busy(e) || e->backend->active || e->queue_count ||
+    /* A queued Reload/Keep owns the next reconciliation. Starting a lease
+     * here would postpone that choice while save-status repaint resumes on
+     * its stale, deliberately unbound layout. */
+    if (!editor_checkpoint_due(e) || e->source_choice || editor_activation_busy(e) || e->backend->active || e->queue_count ||
         (e->dirty && e->frame.last_sequence) || e->op_count || e->journal_waiting ||
         e->journal_metadata_pending || e->journal_group_open || e->stats.journal_error) return;
     journal_stats js = journal_get_stats(e->journal);

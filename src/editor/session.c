@@ -47,6 +47,8 @@ typedef struct session_capture {
     bool plain;
     uint8_t *used;
 } session_capture;
+/* (P) independent per-slot bits: retained BASE versus complete snapshot. */
+enum { SESSION_RETAINED = 1u << 0, SESSION_DETACHED = 1u << 1 };
 struct editor_session {
     pthread_mutex_t mutex;
     session_node *nodes, *free, *root;
@@ -222,6 +224,9 @@ static int encode_leaf(session_capture *c, session_node *n)
     editor_buffer *b = n->buffer;
     editor_records *r = &c->records;
     const journal_base *base = &n->base;
+    journal_base empty = {.path = ""};
+    bool detached = c->used && (c->used[b->session_slot] & SESSION_DETACHED);
+    if (detached) base = &empty;
     /* All buffers associated with the replaced target must have a valid new
      * BASE. Full snapshot deltas preserve their own (possibly different) text. */
     bool replaced = (c->finish || c->cancelling) && !strcmp(b->save_path, c->selected->save_path);
@@ -233,8 +238,9 @@ static int encode_leaf(session_capture *c, session_node *n)
      * substitutes its previous BASE itself), and only while the copy is
      * intact (worker-side check: the UI may since have removed it). */
     bool preparing = !c->plain && !c->finish && !c->cancelling && b == c->selected;
-    bool retained = !replaced && !preparing && !identical && n->has_retained && !journal_check_base(&n->retained);
-    if (c->used) c->used[b->session_slot] = retained ? 1u : 0u; /* edit-ze59 */
+    bool retained = !detached && !replaced && !preparing && !identical && n->has_retained && !journal_check_base(&n->retained);
+    if (c->used) c->used[b->session_slot] = (uint8_t)((retained ? SESSION_RETAINED : 0) |
+        (detached ? SESSION_DETACHED : 0));
     const journal_base *record = retained ? &n->retained : base;
     size_t base_size = 40 + strlen(record->path) + 1 + (*record->path ? 8u : 0u);
     uint8_t *data = editor_records_add(r, JOURNAL_BASE, b->id, base_size); if (!data) return r->error;
@@ -357,14 +363,45 @@ struct editor_publish {
     session_capture capture;
     journal *journal;
     uint8_t *used; /* per session slot: the leaf's BASE was its retained copy */
+    file_source **sources; /* edit-7cj8: independent validation of pinned originals */
     int rc;
     _Atomic bool done;
 };
+static void publish_free(editor_publish *p)
+{
+    for (size_t i = 0; i < p->capture.owner->width; i++) file_source_release(p->sources[i]);
+    free(p->sources); free(p->used); free(p);
+}
+/* A source lease is private to this read-only checkpoint. A rename-over may
+ * change only the detached inode's ctime; accepting that here never grants a
+ * save permission to overwrite the external replacement. The journal lease
+ * freezes target bindings until this checkpoint is adopted. */
+static int publish_validate(editor_publish *p, session_node *n, bool adopt)
+{
+    if (!n) return 0;
+    /* Eviction can leave an internal node with no children. Only published
+     * leaves carry a buffer; child presence is not a leaf discriminator. */
+    if (!n->buffer) {
+        int rc = publish_validate(p, n->child[0], adopt);
+        return rc ? rc : publish_validate(p, n->child[1], adopt);
+    }
+    file_source *source = p->sources[n->buffer->session_slot];
+    if (!source) return 0;
+    if (!file_source_validate(source)) return 0;
+    if (adopt) {
+        file_id replacement;
+        if (!file_id_stat_path(n->buffer->path, &replacement) &&
+            !file_source_adopt_retired(source, &replacement) && !file_source_validate(source)) return 0;
+    }
+    return JOURNAL_BASE_CHANGED;
+}
 static void publish_worker(work_ctx *ctx)
 {
     editor_publish *p = ctx->arg;
     savectl_checkpoint out = {0};
-    int rc = prepare(&p->capture, NULL, &out);
+    int rc = publish_validate(p, p->capture.root, true);
+    if (!rc) rc = prepare(&p->capture, NULL, &out);
+    if (!rc) rc = publish_validate(p, p->capture.root, false);
     if (!rc) rc = journal_flush(p->journal);
     if (!rc) rc = journal_rotate(p->journal, out.records, out.count);
     p->rc = rc;
@@ -398,16 +435,25 @@ int editor_publish_start(editor *e)
     if (!fresh) { pthread_mutex_unlock(&s->mutex); return EDITOR_ERR_MEMORY; }
     editor_publish *p = calloc(1, sizeof *p);
     uint8_t *used = p ? calloc(s->width, sizeof *used) : NULL;
-    if (!used) { pthread_mutex_unlock(&s->mutex); free(p); return EDITOR_ERR_MEMORY; }
+    file_source **sources = used ? calloc(s->width, sizeof *sources) : NULL;
+    if (!sources) { pthread_mutex_unlock(&s->mutex); free(used); free(p); return EDITOR_ERR_MEMORY; }
     s->root->refs++;
     pthread_mutex_unlock(&s->mutex);
     p->capture = (session_capture){.owner = s, .root = s->root, .plain = true, .used = used,
         .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
         .width = e->font.window_width, .height = e->font.window_height};
-    p->journal = e->journal; p->used = used;
+    p->journal = e->journal; p->used = used; p->sources = sources;
+    for (size_t i = 0; e->retain_limit && i < e->buffer_capacity; i++) {
+        editor_buffer *b = e->buffers[i];
+        if (!b || !editor_retain_unprotected(b)) continue;
+        used[b->session_slot] = SESSION_DETACHED;
+        if (b->file && file_source_acquire(b->file, &sources[b->session_slot])) {
+            release(&p->capture); publish_free(p); return EDITOR_ERR_MEMORY;
+        }
+    }
     atomic_init(&p->done, false);
     work_handle h = work_submit(&e->pool, (work_job){publish_worker, p, 0, WORK_BULK});
-    if (!h.epoch) { release(&p->capture); free(used); free(p); return EDITOR_ERR_MEMORY; }
+    if (!h.epoch) { release(&p->capture); publish_free(p); return EDITOR_ERR_MEMORY; }
     e->publish = p; e->publish_deadline_ns = 0; /* edit-y315: (P) no exit wait yet */
     return 0;
 }
@@ -416,11 +462,17 @@ bool editor_publish_poll(editor *e, int *rc)
     editor_publish *p = e->publish;
     if (!p || !atomic_load_explicit(&p->done, memory_order_acquire)) return false;
     *rc = p->rc;
+    e->publish = NULL;
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
-        if (b) b->retain_building = !p->rc && p->used[b->session_slot];
+        if (!b) continue;
+        b->retain_building = !p->rc && (p->used[b->session_slot] & SESSION_RETAINED);
+        if (!p->rc && (p->used[b->session_slot] & SESSION_DETACHED)) {
+            b->base = (journal_base){.path = ""};
+            editor_session_publish(e, b);
+        }
     }
-    e->publish = NULL; free(p->used); free(p);
+    publish_free(p);
     return true;
 }
 /* edit-y315: (E) the deadline reuses the journal tick, JOURNAL_DEFAULT_SYNC_NS,

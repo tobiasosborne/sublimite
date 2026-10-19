@@ -343,6 +343,15 @@ static void journal_transaction(bool fail_prepare, bool fail_file)
             journal_record current[]={{JOURNAL_BASE,1,0,empty,sizeof empty},{JOURNAL_INSERT,1,0,text,sizeof text}};
             CHECK(savectl_recover_cancel(f.s,current,2)==0); wait_controller(&f);
             CHECK(!savectl_save_token(f.s)->previous_path[0] && savectl_get_model(f.s).modified);
+            /* edit-7cj8: cancellation already publishes empty BASE + full
+             * CURRENT text. Dropping the old copy cannot reintroduce a
+             * dependency on TARGET before another checkpoint is made. */
+            put(f.path,"rewritten after cancellation");
+            piece_allocator a=piece_default_allocator(); piece_tree *recovered=piece_create(&a); CHECK(recovered);
+            journal_replay_result rr; CHECK(journal_replay_file(logpath,restore,recovered,&rr)==0);
+            uint8_t bytes[sizeof "old!!"-1u];
+            CHECK(piece_len(recovered)==sizeof bytes && piece_read(recovered,0,bytes,sizeof bytes)==0);
+            CHECK(!memcmp(bytes,"old!!",sizeof bytes)); piece_destroy(recovered);
             puts("P4-3 section 32: pre-rename failure cancels through complete CURRENT checkpoint, no manual token deletion");
         } else {
             CHECK(savectl_get_model(f.s).needs_finish && savectl_get_model(f.s).modified);
