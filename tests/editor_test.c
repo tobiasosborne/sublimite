@@ -326,6 +326,52 @@ static int settle_map(editor *e)
     }
     return settle(e);
 }
+/* edit-2mhd: (P) the alphabet fixture has one character plus LF per line;
+ * sizeof supplies its byte stride and line count. (E) reuse the existing
+ * minimap compose fixture's geometry. The initial top is one viewport down,
+ * the grab and motion are half a viewport, and the outside click is half a
+ * viewport beyond its bottom. (P) two pixels per summary is the existing
+ * minimap geometry; one pixel selects the second scanline within a summary.
+ * Zero means no allocation/displacement, one is the primary button or an
+ * inclusive/exclusive endpoint adjustment; minus one disables wrapping. */
+static int minimap_grab_contract(bool outside)
+{
+    const char fixture[] = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz\n";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)fixture, .initial_len = sizeof fixture - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle_map(e) == 0);
+    const uint64_t stride = sizeof "a\n" - 1u;
+    uint64_t first = e->v.config.rows, offset = e->v.config.rows / 2u, motion = offset;
+    T(editor_scroll_seek(e, first * stride) == 0); T(editor_begin_frame(e) == 0); T(settle_map(e) == 0);
+    T(e->v.state.first_line == first && e->buffer->map.lines_per_row == 1u);
+    uint64_t clicked = outside ? first + e->v.config.rows + offset : first + offset;
+    uint64_t expected = outside ? clicked - offset : first;
+    T(expected + motion + e->v.config.rows < sizeof fixture / stride);
+    plat_event ev = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)(e->text_grid.dims.cols * e->grid.dims.cell_w),
+        .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h + clicked * 2u + 1u)};
+    edit_malloc_guard_begin();
+    int press_rc = editor_pointer(e, &ev), press_settled = settle(e);
+    uint64_t pressed_line = e->v.state.first_line, pressed_byte = e->v.state.first_byte;
+    ev.kind = PLAT_EV_MOTION; ev.y += (int32_t)(motion * 2u);
+    int motion_rc = editor_pointer(e, &ev), motion_settled = settle(e);
+    uint64_t moved_line = e->v.state.first_line, moved_byte = e->v.state.first_byte;
+    ev.kind = PLAT_EV_BUTTON; ev.press = false;
+    int release_rc = editor_pointer(e, &ev); bool released = !e->map_drag;
+    size_t allocations = edit_malloc_guard_end();
+    bool guard_active = edit_malloc_guard_active();
+    editor_close(e);
+    printf("edit-2mhd %s: press top=%llu expected=%llu; motion top=%llu expected=%llu; mallocs=%zu guard=%s\n",
+        outside ? "outside" : "inside", (unsigned long long)pressed_line, (unsigned long long)expected,
+        (unsigned long long)moved_line, (unsigned long long)(expected + motion), allocations,
+        guard_active ? "active" : "ASan-inert");
+    T(press_rc == 0 && press_settled == 0 && motion_rc == 0 && motion_settled == 0 && release_rc == 0 && released);
+    T(moved_line == expected + motion && moved_byte == (expected + motion) * stride);
+    T(pressed_line == expected && pressed_byte == expected * stride);
+    T(allocations == 0);
+    return 0;
+}
 static int minimap_compose_pixels(const char *backend_name)
 {
     render_backend backend = {0};
@@ -393,7 +439,11 @@ static int minimap_compose_pixels(const char *backend_name)
     /* Pointer coordinates come from the fixture's second summary scanline;
      * dragging above/below the region retains the existing endpoint clamps. */
     uint32_t summary_row = e->buffer->map.active_rows / 2u;
-    minimap_target target; T(minimap_hit(&e->buffer->map, &input, e->buffer->index, summary_row, &target) == 0);
+    /* edit-2mhd (P): this outside press centres the visible summary rows;
+     * subtract half their count from the clicked row before resolving. */
+    minimap_target target;
+    T(minimap_hit(&e->buffer->map, &input, e->buffer->index,
+        (int64_t)summary_row - (int64_t)(visible / 2u), &target) == 0);
     plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
         .x = (int32_t)(w - 1u), .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h + summary_row * 2u + 1u)};
     T(editor_pointer(e, &click) == 0 && e->map_drag);
@@ -5511,6 +5561,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--m15-follow")) return find_follow_before_top_contract();
         if (!strcmp(argv[1], "--dr3-gutter")) return gutter_line_contract();
         if (!strcmp(argv[1], "--minimap-cost")) return minimap_compose_cost();
+        if (!strcmp(argv[1], "--minimap-grab-inside")) return minimap_grab_contract(false);
+        if (!strcmp(argv[1], "--minimap-grab-outside")) return minimap_grab_contract(true);
         if (!strcmp(argv[1], "--minimap-raster")) return minimap_compose_pixels("raster");
         if (!strcmp(argv[1], "--minimap-gl")) return minimap_compose_pixels("gl");
         if (!strcmp(argv[1], "--minimap-pixels")) return minimap_compose_pixels(NULL);
@@ -5595,6 +5647,7 @@ int main(int argc, char **argv)
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(g02_find_previous_uncached() == 0);
+    T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);

@@ -436,6 +436,7 @@ struct editor {
     tabs_strip strip;
     size_t drag_tab;
     uint64_t drag_id, map_drag_id, map_drag_generation;
+    int64_t map_drag_offset; /* edit-2mhd: pointer pixels below the captured viewport top */
     bool map_drag, paint_ready, caret_only;
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     bool text_drag;

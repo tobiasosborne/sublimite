@@ -332,8 +332,61 @@ int editor_compose(editor *e)
     trace_record(TRACE_COMPOSE_END, e->grid.frame_id);
     return rc;
 }
+/* edit-2mhd (P): match the painted half-open viewport band, including its
+ * retained bounds during indexing. Grid cell height is the existing summary
+ * pixel spacing. Zero denotes an empty band/first row; one advances an
+ * exclusive endpoint; dividing the band height by two gives its centre. */
+static bool map_grab(editor *e, const minimap_input *input, int64_t y)
+{
+    const minimap *map = &e->buffer->map;
+    uint32_t rows = e->map_grid.dims.rows;
+    int64_t height = (int64_t)e->v.config.rows * e->grid.dims.cell_h;
+    int64_t top = height, bottom = 0;
+    bool retained = map->filled && map->height == rows &&
+        map->identity.ctx == input->source.ctx && map->identity.span == input->source.span;
+    uint64_t first = map->painted_first, end = map->painted_end;
+    if (!retained) {
+        first = e->v.state.first_line;
+        uint64_t visible = 0;
+        for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
+            uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;
+            if (line >= first && line - first + 1u > visible) visible = line - first + 1u;
+        }
+        end = first;
+        if (first < input->lines) {
+            uint64_t remaining = input->lines - first;
+            end += visible < remaining ? visible : remaining;
+        }
+    }
+    for (uint32_t r = 0; r < rows && (int64_t)r * e->map_grid.dims.cell_h < height; r++) {
+        bool band;
+        if (retained) {
+            const minimap_row *v = &map->rows[r];
+            band = v->line_count && first < end && v->first_line < end &&
+                first < v->first_line + v->line_count;
+        } else {
+            /* (P) floor(lines * row / rows), split before multiplying so
+             * even a byte-sized line estimate cannot overflow. Match the
+             * pending scrollbar's inclusive lower-bound overlap rule. */
+            uint64_t after = (uint64_t)r + 1u;
+            uint64_t lo = input->lines / rows * r + input->lines % rows * r / rows;
+            uint64_t hi = input->lines / rows * after + input->lines % rows * after / rows;
+            band = first < end && lo < end && first <= hi;
+        }
+        if (band) {
+            if (top == height) top = (int64_t)r * e->map_grid.dims.cell_h;
+            bottom = ((int64_t)r + 1) * e->map_grid.dims.cell_h;
+            if (bottom > height) bottom = height;
+        }
+    }
+    if (bottom <= top) top = bottom = 0;
+    bool inside = y >= top && y < bottom;
+    e->map_drag_offset = inside ? y - top : (bottom - top) / 2;
+    return inside;
+}
 int editor_chrome_pointer(editor *e, const plat_event *ev)
 {
+    bool map_press = false;
     int64_t col = ev->x < 0 ? -1 : (int64_t)ev->x / e->grid.dims.cell_w;
     int64_t row = ev->y < 0 ? -1 : (int64_t)ev->y / e->grid.dims.cell_h;
     if (ev->kind == PLAT_EV_BUTTON && ev->code == 1) {
@@ -350,6 +403,7 @@ int editor_chrome_pointer(editor *e, const plat_event *ev)
             col >= (int64_t)e->text_grid.dims.cols && row >= e->tab_rows) {
             e->map_drag = true; e->map_drag_id = e->buffer->id;
             e->map_drag_generation = e->buffer->source_generation;
+            map_press = true;
         }
     }
     if (ev->kind == PLAT_EV_MOTION && e->drag_id && col >= 0) {
@@ -367,7 +421,9 @@ int editor_chrome_pointer(editor *e, const plat_event *ev)
     if (e->map_drag) {
         e->find_scroll=false; e->wheel_pending=false;
         minimap_input input = editor_map_input(e->buffer); minimap_target target;
-        int64_t map_y = ((int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h) / 2;
+        int64_t local_y = (int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h;
+        if (map_press && map_grab(e, &input, local_y)) return 0;
+        int64_t map_y = (local_y - e->map_drag_offset) / e->map_grid.dims.cell_h;
         int rc;
         if (e->buffer->map.sampled || minimap_stale(&e->buffer->map, &input)) {
             /* edit-73j: a pending/sampled summary still navigates, to an
