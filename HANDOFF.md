@@ -1,3 +1,22 @@
+# HANDOFF — sublimité, session 20 IN PROGRESS (2026-10-21 ~09:00 box clock; Fable consultant, Tobias present; Claude windows reset this morning)
+
+## Read first (session 20 continuation or session 21)
+**Goal unchanged (Tobias 2026-10-18): bug free, then frictionless on this box, then daily use.** Main at the session start was 1ce5471, clean; installed build a2fa5ab (code 21cbb90) at ~/.local/bin/sublimite, full `make check` passed on it (session 19). No trial findings from Tobias yet this session; no code changed; no beads opened or closed.
+
+**Design workups delivered (Tobias's ask 2026-10-21: "utilitarian and rudimentary, this is fine, but curious what design options are available without sacrificing perf or memory footprint; 3-5 workups from conservative to experimental").** One Opus lane (brief build/briefs/design-workups-s10.md, report docs/worker-reports/design-workups-s10.md, 48 tool calls) produced `docs/design/workups-2026-10-21/`: README.md (comparison table with memory and typing-path costs, all (P)/(M)/(E) with derivations), contact-sheet.png, a fresh baseline.png of the installed build on a private Xvfb :96 at 243 DPI, and five mocks at 2880x1800 (SVG + PNG from one pycairo script, kept in tools/): 01 quiet tokens (theme.c values only, 0 B), 02 calm chrome (tokens + 2-row tab bar, unsaved dot, status row, wider gutter gap, bar caret, minimap off: net -971,200 B (P)), 03 type and air (02 + Iosevka 34 px, line height 1.45, hairlines; 25 % fewer rows), 04 rail (left file rail, breadcrumb, overview ruler, no tab bar: -985,600 B (P)), 05 floating (needs one new primitive, an RGBA overlay 4,729,088 B (P) reserved; breaks the frozen render.h and needs a contract bead). All five keep the typing path allocation-free; 01-04 fit the cell grid plus the one existing pixel region. **Worker's recommendation, which the consultant endorsed: 02, as two beads (01's tokens first, then 02's layout). Tobias has not chosen yet; edit-b0j (P0) is where the choice lands.** Do not start chrome beads before he picks.
+
+**Two constraints found for any chrome brief:** every row is cell_h and margins exist only right and bottom (src/raster/raster.c:336), so a tab bar is 1 or 2 rows, never 1.6x; labels centre in a 2-row bar by splitting chrome glyph images into upper/lower halves (allowed by the contract). None of the research shortlist typefaces (JetBrains Mono, Geist Mono, IBM Plex Mono, Commit Mono) is installed; only Iosevka (/usr/local/share/fonts/iosevka).
+
+**Measured on today's screen, not filed (become beads on Tobias's word):** no status line at rest (the bottom row is only a transient prompt row, src/editor/paint.c:187); the tab separator `|` (src/tabs/tabs.h:111) reads as a second caret; the active tab is lighter than the page; the minimap is a barcode of 1 px stripes with a 160 px viewport box over at most 73 px of ink; comments (6.8:1) louder than keywords (6.3:1); default window 60 % x 70 % of the screen; block caret; code starts one cell after the numbers.
+
+**Quota (M, 09:00):** Claude 5-hour 5 %, Weekly 2 %, Fable 2 % (reset Tue 27 Oct 23:59); Codex Weekly last read 35 % (+7.1 %) at the session-19 stop, resets 2026-10-25. BAT0 Charging [AC], load1 < 1. Box: Xvfb :95/:97/:98/:99 as session 19 left them (holders, no -noreset); :96 used by the design lane and killed afterwards. A sublimite pid 14825 on /tmp/probe.txt was running at 08:40 and is not ours.
+
+**Open, in order:** whatever Tobias reports from use; his pick from the workups (then beads: theme tokens, chrome layout; the seven measured defects above as their own beads or folded into 02); P3 edit-b3hk (worker publish carries no pending PAINT record); edit-fi0p remainder; edit-gfx notes; P4 backlog xpm0, zgey, gtm8, t7ny; edit-pi6 (M0 exit by use).
+
+Everything below is the session-19 handoff, kept for its own state.
+
+---
+
 # HANDOFF — sublimité, end of session 19 (2026-10-20 ~07:00 box clock; Fable coordinator; Tobias gave the session's orders at 02:08 and is using the installed editor)
 
 ## Read first (session 20)
