@@ -2645,7 +2645,8 @@ static int review_stale_controls(void)
     plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = 1, .y = 1};
     T(press(e, click) == 0); T(tabs_active_index(&e->tabs) == 0);
     T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
-    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(tabs_count(&e->tabs) == 1);
+    /* edit-2ye3: the untitled "safe" buffer is unsaved: Ctrl+W prompts, D closes. */
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('d', 0, "d")) == 0); T(tabs_count(&e->tabs) == 1);
     T(press(e, key('T', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(tabs_count(&e->tabs) == 2);
     T(e->buffer->source_stale); T(press(e, key('x', 0, "x")) == 0); T(editor_length(e) == 4);
     editor_close(e); puts("P4-3 13: suspended source preserves tab keys and tab pointer controls passed"); return 0;
@@ -3937,7 +3938,8 @@ static int clipboard_no_tabs_test(void)
         .cols = 32, .rows = 8, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('c', PLAT_MOD_CTRL, NULL)) == 0);
-    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(tabs_count(&e->tabs) == 0);
+    /* edit-2ye3: an untitled buffer with text is unsaved: Ctrl+W prompts, D closes. */
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(press(e, key('d', 0, "d")) == 0); T(tabs_count(&e->tabs) == 0);
     uint64_t before = editor_length(e); T(before == 0); /* empty placeholder, no active document */
     plat_event middle = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
         .x = (int32_t)(e->lay.gw * e->grid.dims.cell_w),
@@ -6309,7 +6311,130 @@ static int close_evict_contract(void)
     puts("edit-2ye3: eviction keeps modified closed tabs (17 later closes; all-modified pool): PASS");
     return 0;
 }
+/* edit-2ye3 round 2 (review docs/reviews/edit-2ye3.md). (E) geometry: 64
+ * columns hold the prompt's fixed text plus short titles and leave minimap
+ * columns; 8 rows = tab chrome + six text rows + status row. Capacity 1 is
+ * the smallest closed pool that one modified close fills. */
+static int close_review_open(editor **e, render_backend *backend, char *dir, char *path, size_t cap, const char *name)
+{
+    strcpy(dir, "build/edit-2ye3-XXXXXX"); T(mkdtemp(dir));
+    (void)snprintf(path, cap, "%s/%s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0); T(write(fd, "abc", 3) == 3); close(fd);
+    T(render_null_backend(backend) == 0);
+    editor_config cfg = {.path = path, .cols = 64, .rows = 8, .wrap_mode = -1, .closed_capacity = 1};
+    *e = NULL; T(editor_open(e, &cfg, backend) == 0); return settle(*e);
+}
+static int close_review_done(editor *e, const char *dir, const char *path)
+{
+    editor_close(e); T(unlink(path) == 0 && rmdir(dir) == 0); return 0;
+}
+/* (1) A prompt that takes the row (the mouse menu's File > Save As
+ * dispatch) leaves the close prompt no keys: d goes into the filename. */
+static int close_review_hidden(void)
+{
+    editor *e; render_backend backend = {0}; char dir[32], path[64];
+    T(close_review_open(&e, &backend, dir, path, sizeof path, "doc.txt") == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, "Save changes to doc.txt?"));
+    const keys_binding *save_as = menu_command(KEYS_ACTION_SAVE_AS); T(save_as);
+    plat_event command = {.kind = PLAT_EV_KEY, .press = true, .keysym = save_as->keysym, .mods = save_as->modifiers};
+    T(editor_dispatch_action(e, &command, save_as, KEYS_MATCH) == 0); T(settle(e) == 0);
+    T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
+    T(press(e, key('d', 0, "d")) == 0);
+    T(tabs_count(&e->tabs) == 1 && e->go.active && e->go.length == 1 && e->go.digits[0] == 'd');
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->go.active && !close_status(e, "Save changes"));
+    T(tabs_count(&e->tabs) == 1 && close_text_is(e, "xabc"));
+    T(close_review_done(e, dir, path) == 0);
+    puts("edit-2ye3 round 2 (1): a prompt over the close prompt gets the keys: PASS"); return 0;
+}
+/* (2) A wide title keeps the row contract-valid and the prompt answerable;
+ * a prompt whose frame never reached the screen swallows no key. */
+static int close_review_wide(void)
+{
+    editor *e; render_backend backend = {0}; char dir[32], path[64];
+    T(close_review_open(&e, &backend, dir, path, sizeof path, "\xe4\xb8\xad.txt") == 0); /* U+4E2D, wide */
+    T(press(e, key('x', 0, "x")) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(render_grid_validate(editor_grid(e)) == RENDER_OK && !e->stats.render_rejects);
+    T(close_status(e, "Save changes to "));
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 1 && !close_status(e, "Save changes") && close_text_is(e, "xabc"));
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    e->close_prompt.prompt_ns = 0; /* as if its frame had been dropped */
+    T(press(e, key('y', 0, "y")) == 0);
+    T(tabs_count(&e->tabs) == 1 && close_text_is(e, "xyabc"));
+    T(close_review_done(e, dir, path) == 0);
+    puts("edit-2ye3 round 2 (2): wide title row valid; unshown prompt takes no keys: PASS"); return 0;
+}
+/* (3) A user close the closed pool refuses (a restore placeholder, which
+ * closes without a prompt, while the pool holds a modified tab) keeps the
+ * tab open with a notice and never ends the editor. */
+static int close_review_refused(void)
+{
+    editor *e; render_backend backend = {0}; char dir[32], path[64];
+    T(close_review_open(&e, &backend, dir, path, sizeof path, "doc.txt") == 0);
+    T(press(e, key('x', 0, "x")) == 0);
+    T(editor_close_tab(e, 0) == 0); T(settle(e) == 0); T(tabs_closed_count(&e->tabs) == 1);
+    uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    e->buffer->placeholder = true; /* the flag restore.c sets; its tab is marked modified there */
+    T(tabs_set_modified(&e->tabs, 0, true) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 1 && e->recovery_notice && !e->error);
+    e->buffer->placeholder = false;
+    T(close_review_done(e, dir, path) == 0);
+    puts("edit-2ye3 round 2 (3): refused user close keeps the tab and the editor: PASS"); return 0;
+}
+/* (4) The prompt row leaves the text scroll region and the minimap. */
+static int close_review_scroll(void)
+{
+    static const char lines[] = "alpha beta\nalpha beta\nalpha beta\nalpha beta\n"
+        "alpha beta\nalpha beta\nalpha beta\nalpha beta\nalpha beta\nalpha beta\n";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)lines, .initial_len = sizeof lines - 1u,
+        .cols = 64, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle_map(e) == 0);
+    T(press(e, key('x', 0, "x")) == 0); T(settle_map(e) == 0);
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .smooth = true,
+        .dy = PLAT_WHEEL_UNIT / (int32_t)(SCROLL_CORE_ROWS * 2u)}; /* P: half row, as edit-48u overscan */
+    T(press(e, wheel) == 0); T(e->scroll_plan.origin_y_q8 < 0 && e->grid.scroll.origin_y_q8 < 0);
+    T(e->map_cols && e->grid.region.pixels);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, "Save changes to untitled?"));
+    T(e->scroll_plan.origin_y_q8 < 0 && !e->grid.scroll.origin_y_q8 && !e->grid.region.pixels);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(settle_map(e) == 0);
+    T(e->grid.region.pixels && !close_status(e, "Save changes"));
+    editor_close(e);
+    puts("edit-2ye3 round 2 (4): prompt row outside scroll region and minimap: PASS"); return 0;
+}
+/* (5) An untitled buffer opened with bytes and no edits (stdin) is unsaved:
+ * Ctrl+W prompts and eviction keeps it. */
+static int close_review_stdin(void)
+{
+    editor *e; render_backend backend = {0}; char dir[32], path[64];
+    T(close_review_open(&e, &backend, dir, path, sizeof path, "doc.txt") == 0);
+    uint64_t piped; T(editor_add_buffer(e, NULL, (const uint8_t *)"piped", 5, &piped) == 0); T(settle(e) == 0);
+    T(!editor_tab(e, 1)->modified);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 2 && close_status(e, "Save changes to untitled?"));
+    T(press(e, key('d', 0, "d")) == 0);
+    T(tabs_count(&e->tabs) == 1 && close_retained(e, piped) && tabs_closed_at(&e->tabs, 0)->modified);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); /* the unmodified file tab: no prompt */
+    T(tabs_count(&e->tabs) == 0 && close_retained(e, piped));
+    T(editor_reopen_tab(e) == 0); T(settle(e) == 0); T(close_text_is(e, "piped"));
+    T(close_review_done(e, dir, path) == 0);
+    puts("edit-2ye3 round 2 (5): untitled buffer with bytes is prompted and kept: PASS"); return 0;
+}
+static int close_review_contract(void)
+{
+    T(close_review_hidden() == 0); T(close_review_wide() == 0); T(close_review_refused() == 0);
+    T(close_review_scroll() == 0); T(close_review_stdin() == 0); return 0;
+}
 static const test_selector selectors[] = {
+    {"--close-review", close_review_contract},
+    {"--close-review-hidden", close_review_hidden},
+    {"--close-review-wide", close_review_wide},
+    {"--close-review-refused", close_review_refused},
+    {"--close-review-scroll", close_review_scroll},
+    {"--close-review-stdin", close_review_stdin},
     {"--close-prompt", close_prompt_contract},
     {"--close-evict", close_evict_contract},
     {"--dzk1", dzk1_render_reject},
@@ -6477,7 +6602,7 @@ int main(int argc, char **argv)
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(clean_source_change() == 0);
     T(source_prompt_placement() == 0);
-    T(close_prompt_contract() == 0); T(close_evict_contract() == 0);
+    T(close_prompt_contract() == 0); T(close_evict_contract() == 0); T(close_review_contract() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(headless ? "headless" : NULL) == 0);

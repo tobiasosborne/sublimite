@@ -484,7 +484,7 @@ static int submit(editor *e)
         e->buffer->prompt_serial = e->event_serial;
         e->buffer->prompt_generation = e->buffer->source_generation;
     }
-    if (e->close_prompt.owner == e->buffer->id && !e->close_prompt.prompt_ns) { /* edit-2ye3 */
+    if (editor_close_prompt_shown(e) && !e->close_prompt.prompt_ns) { /* edit-2ye3 */
         e->close_prompt.prompt_ns = e->frame.submit_ns; e->close_prompt.prompt_serial = e->event_serial;
     }
     if (e->frame.last_sequence) e->stats.submitted_sequence = e->frame.last_sequence;

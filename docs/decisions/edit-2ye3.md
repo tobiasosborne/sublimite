@@ -66,3 +66,41 @@ them first. The tabs model oracle (`tests/tabs_test.c`, shared with
 ## Tests
 `tests/editor_test.c` `--close-prompt`, `--close-evict` (also in the default
 run); `tests/tabs_test.c` `eviction_policy`.
+
+## Round 2 (review docs/reviews/edit-2ye3.md)
+- **Another prompt cancels the close prompt.** The prompt owns the row and
+  the keys only while it is the visible owner (`editor_close_prompt_shown`):
+  no go-to/Open/Save As prompt, palette, menu focus or open drop-down. When
+  any of those takes over (for example the mouse menu's File > Save As), the
+  close prompt is cancelled. The overlay cancels it at the next submit, the key
+  handler at the next key, and a full recompose follows. It never resumes. The
+  user presses Ctrl+W again. Cancelling is chosen over yield-and-resume
+  because a resumed prompt would answer keys the user typed for the other
+  prompt's purpose, and a cancelled one loses nothing (the tab stays open).
+- **Title drawing.** Non-ASCII title graphemes draw as one '?' cell each (the
+  source-change prompt is ASCII-only). Every cell is then a one-cell
+  resident ASCII cell, so the row is always render-contract-valid. Wide
+  titles no longer get a frame rejected.
+- **No swallowed keys without a shown prompt.** `prompt_ns` is stamped only
+  on a submitted frame that showed the prompt. Without the stamp, a key still
+  waits while that frame is pending (`e->dirty`). If no frame is pending (the
+  frame was dropped), the prompt is cancelled and the key is handled normally.
+- **Refused user close.** Every user close (Ctrl+W/menu/palette direct close,
+  D, the post-save close) goes through `user_close`. On
+  `EDITOR_ERR_CAPACITY` (the closed pool holds only modified tabs and the
+  closing tab is modified, for example a restore placeholder, which closes
+  without a prompt) the tab stays open with the notice
+  `close refused: every closed tab holds unsaved text; reopen one (Ctrl+Shift+T) first`
+  and the editor keeps running. D still drops a prompted modified tab
+  outright, so the refusal reaches only prompt-less closes and the post-save
+  close.
+- **Scroll and minimap.** While the prompt is drawn, the frame's text-scroll
+  region and minimap region are disabled, as for the source-change prompt
+  (full damage when either was active). Esc's full recompose restores them.
+- **Untitled buffers with bytes.** An untitled, non-derived, non-placeholder
+  buffer with text (for example from stdin) is treated as unsaved
+  (`close_unsaved`). Ctrl+W prompts, and any close marks its tab modified
+  first, so the closed record is protected by the eviction rule.
+- Backlog, not fixed here: review finding 5 (a peer save leaves a closed
+  tab's modified flag stale), a notice when D drops a tab outright, and the
+  editor_session_test hang on a failed check with a held save.

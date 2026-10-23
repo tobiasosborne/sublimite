@@ -2338,7 +2338,10 @@ xzw_fixture:;
     T(editor_select_tab(e, 1) == 0);
     T(editor_large_find_begin(e, needle, 6) == 0);
     T(editor_close_tab(e, 0) == 0);
-    T(editor_close_tab(e, 0) == 0); /* evicts the first retained buffer */
+    /* edit-2ye3: the untitled buffer with text is unsaved, so eviction keeps
+     * the modified retained tab; Don't save retires this closing buffer. */
+    T(editor_close_tab(e, 0) == EDITOR_ERR_CAPACITY);
+    T(editor_close_discard(e, 0) == 0);
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     editor_close(e); unlink(path);
     puts("editor_large_test: ok");

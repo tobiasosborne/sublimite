@@ -878,9 +878,12 @@ static int detached_child(const char *source, const char *other, const char *jpa
             T(editor_add_buffer(e, NULL, (const uint8_t *)temporary[i], strlen(temporary[i]), &id) == 0);
             T(settle(e) == 0);
         }
-        for (size_t i = 0; i < sizeof temporary / sizeof *temporary; i++) {
-            T(editor_close_tab(e, tabs_count(&e->tabs) - 1u) == 0); T(settle(e) == 0);
-        }
+        /* edit-2ye3: untitled buffers with text are unsaved, so eviction
+         * keeps them; "evicted" is retired the remaining way, Don't save
+         * while the one-record pool holds "branch". */
+        T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
+        T(editor_close_tab(e, 1) == EDITOR_ERR_CAPACITY);
+        T(editor_close_discard(e, 1) == 0); T(settle(e) == 0);
         T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
     }
     T(press(e, 'X', 0, "XY") == 0); T(editor_flush(e) == 0);

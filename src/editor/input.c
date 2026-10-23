@@ -1004,12 +1004,20 @@ static bool close_prompt_key(editor *e, const plat_event *ev, int *rc)
 {
     editor_close_prompt *p = &e->close_prompt; *rc = 0;
     if (!p->owner) return false;
-    if (p->owner != e->buffer->id || !tabs_count(&e->tabs)) { p->owner = 0; return false; }
+    /* Round 2: a prompt that is not the visible owner of the row (another
+     * prompt, the palette or the menu took it) is cancelled, never answered. */
+    if (!editor_close_prompt_shown(e)) { p->owner = 0; e->full_pending = true; return false; }
     if (!ev->press) return false;
-    if (!p->prompt_ns || e->dispatch_serial <= p->prompt_serial || ev->repeat ||
+    /* Its frame is still to be submitted: typed-ahead keys wait it out. A
+     * prompt whose frame was dropped never reached the screen: cancel it. */
+    if (!p->prompt_ns) {
+        if (e->dirty) return true;
+        p->owner = 0; e->full_pending = true; return false;
+    }
+    if (e->dispatch_serial <= p->prompt_serial || ev->repeat ||
         (ev->t0_ns && ev->t0_ns <= p->prompt_ns) || (ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER))) return true;
     if (ev->keysym == XKB_KEY_Escape) { p->owner = 0; *rc = editor_full_layout(e); }
-    else if (ev->keysym == 'd' || ev->keysym == 'D') { p->owner = 0; *rc = editor_close_discard(e, tabs_active_index(&e->tabs)); }
+    else if (ev->keysym == 'd' || ev->keysym == 'D') { p->owner = 0; *rc = editor_close_answer_discard(e); }
     else if (ev->keysym == 's' || ev->keysym == 'S') {
         /* The normal save; Save As for an untitled buffer. The tab closes in
          * maintenance once that save has left it unmodified. */

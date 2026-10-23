@@ -549,12 +549,21 @@ static void closed_wait(editor *e, editor_buffer *b)
     }
     b->wait_token = 0;
 }
+/* edit-2ye3: unsaved text. An untitled buffer opened with bytes and never
+ * edited (stdin) has no file holding them, so it counts as modified for the
+ * close prompt and for eviction. Derived results and placeholders excluded. */
+static bool close_unsaved(const editor_buffer *b, const tabs_tab *tab)
+{
+    return tab->modified || (!*b->path && !b->derived && !b->placeholder && b->tree && piece_len(b->tree));
+}
 static int close_tab(editor *e, size_t index, bool discard)
 {
     if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
     const tabs_tab *tab = tabs_at(&e->tabs, index); if (!tab) return EDITOR_ERR_ARG;
     if (e->cfg.allow_close && !e->cfg.allow_close(e->cfg.hook_ctx, tab->id, tab->modified)) return 0;
     editor_buffer *b = find_buffer(e, tab->buffer);
+    /* The closed record carries the flag tabs' eviction reads. */
+    if (!tab->modified && close_unsaved(b, tab)) (void)tabs_set_modified(&e->tabs, index, true);
     tabs_tab evicted = {0}; int rc = tabs_close(&e->tabs, index, &e->v.state, &evicted);
     /* edit-2ye3: tabs refuses a modified close when every retained closed tab
      * is modified, so nothing modified is evicted without the user's say-so.
@@ -574,14 +583,32 @@ int editor_close_discard(editor *e, size_t index) { return close_tab(e, index, t
 /* edit-2ye3: a user close (Ctrl+W, menu, palette) of a modified document
  * tab shows the Save / Don't save / Cancel prompt instead of closing.
  * Derived results and restore placeholders hold no user text to save. */
+static const char close_refused[] = "close refused: every closed tab holds unsaved text; reopen one (Ctrl+Shift+T) first";
+/* A user close never ends the editor: the closed pool's refusal (every
+ * retained tab modified) keeps the tab open and says so. */
+static int user_close(editor *e, size_t index, bool discard)
+{
+    int rc = close_tab(e, index, discard);
+    if (rc != EDITOR_ERR_CAPACITY) return rc;
+    e->recovery_notice = close_refused; e->recovery_notice_mutations = e->stats.mutations;
+    return editor_full_layout(e);
+}
 int editor_close_request(editor *e)
 {
     size_t index = tabs_active_index(&e->tabs);
     const tabs_tab *tab = tabs_at(&e->tabs, index);
-    if (!tab || !tab->modified || e->buffer->derived || e->buffer->placeholder) return editor_close_tab(e, index);
+    if (!tab || !close_unsaved(e->buffer, tab) || e->buffer->derived || e->buffer->placeholder) return user_close(e, index, false);
     if (e->close_prompt.owner == e->buffer->id) return 0;
     e->close_prompt = (editor_close_prompt){.owner = e->buffer->id};
     return editor_begin_frame(e);
+}
+int editor_close_answer_discard(editor *e) { return user_close(e, tabs_active_index(&e->tabs), true); }
+/* The prompt owns the status row and the keys only while no other prompt,
+ * panel focus or menu has them (round 2: another prompt cancels it). */
+bool editor_close_prompt_shown(const editor *e)
+{
+    return e->close_prompt.owner && e->close_prompt.owner == e->buffer->id && tabs_count(&e->tabs) &&
+        !e->go.active && !e->palette_open && e->menu.open < 0 && !e->menu.active;
 }
 /* The save chosen with S has ended: no Save As path being typed or queued,
  * no save, Save As write or checkpoint in flight. */
@@ -604,7 +631,7 @@ int editor_close_service(editor *e)
         if (tab->id != id) continue;
         const editor_buffer *b = find_buffer(e, tab->buffer);
         if (b->saved_lost || b->history_cursor != b->saved_cursor || b->save_error) return 0;
-        return editor_close_tab(e, i);
+        return user_close(e, i, false);
     }
     return 0;
 }

@@ -704,6 +704,8 @@ int editor_goto_cancel(editor *e);
  * (Don't save), the post-save close and the overlay (paint.c). */
 int editor_close_request(editor *e);
 int editor_close_discard(editor *e, size_t index);
+int editor_close_answer_discard(editor *e);
+bool editor_close_prompt_shown(const editor *e);
 bool editor_close_ready(const editor *e);
 int editor_close_service(editor *e);
 void editor_close_overlay(editor *e);
