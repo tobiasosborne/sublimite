@@ -1,3 +1,12 @@
+# HANDOFF — sublimité, session 20 continued (2026-10-23 ~11:40 box clock; Fable consultant/coordinator, Tobias present)
+
+## Read first
+**Installed: main 4a71e27 at ~/.local/bin/sublimite (make install 11:36), full make check passed on it (102 binaries, exit 0).** New in it: edit-2ye3 (Tobias's trial finding: closing an unsaved tab gave no warning, and a modified closed tab was silently evicted after 16 further closes). Now Ctrl+W/menu/palette on a modified or untitled non-empty tab prompts "Save changes to <title>? S save / D don't save / Esc cancel" on the status row; eviction drops the oldest unmodified closed tab and never a modified one silently; at full modified capacity the close is refused with a notice. Decision docs/decisions/edit-2ye3.md, report docs/worker-reports/edit-2ye3-s10.md, review docs/reviews/edit-2ye3.md (Codex sol xhigh; findings 1-4 fixed in round 2; finding 5 and two minor items in backlog edit-f42b P4). No Astra drive on this build (law-1 gap stands).
+
+**Box after the 2026-10-22 reboot:** Xvfb :95/:97/:99 restarted with -noreset; /tmp/edit-corpus rebuilt. Quota at 10:05 (M): Claude weekly 19 %, Fable 18 %, Codex 5 %, all behind pace.
+
+**Open, in order:** whatever Tobias reports from use; his pick from the design workups (edit-b0j, below); P3 edit-b3hk; edit-fi0p remainder; edit-pi6 (M0 exit by use).
+
 # HANDOFF — sublimité, session 20 IN PROGRESS (2026-10-21 ~09:00 box clock; Fable consultant, Tobias present; Claude windows reset this morning)
 
 ## Read first (session 20 continuation or session 21)
