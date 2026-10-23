@@ -355,6 +355,7 @@ int editor_activate(editor *e)
     const tabs_tab *tab = tabs_active(&e->tabs);
     view_state live = e->v.state;
     e->buffer = tab ? find_buffer(e, tab->buffer) : e->empty;
+    if (e->close_prompt.owner != e->buffer->id) e->close_prompt.owner = 0; /* edit-2ye3: prompt belongs to its tab */
     bool config_wrap = e->buffer->config_wrap;
     editor_preferences_buffer(e, e->buffer);
     if (e->preferences.wrap_set) live.wrap = e->preferences.wrap;
@@ -548,17 +549,64 @@ static void closed_wait(editor *e, editor_buffer *b)
     }
     b->wait_token = 0;
 }
-int editor_close_tab(editor *e, size_t index)
+static int close_tab(editor *e, size_t index, bool discard)
 {
     if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
     const tabs_tab *tab = tabs_at(&e->tabs, index); if (!tab) return EDITOR_ERR_ARG;
     if (e->cfg.allow_close && !e->cfg.allow_close(e->cfg.hook_ctx, tab->id, tab->modified)) return 0;
     editor_buffer *b = find_buffer(e, tab->buffer);
-    tabs_tab evicted; int rc = tabs_close(&e->tabs, index, &e->v.state, &evicted); if (rc) return rc;
+    tabs_tab evicted = {0}; int rc = tabs_close(&e->tabs, index, &e->v.state, &evicted);
+    /* edit-2ye3: tabs refuses a modified close when every retained closed tab
+     * is modified, so nothing modified is evicted without the user's say-so.
+     * Don't save is that say-so for this tab only: it is dropped, not retained. */
+    bool dropped = rc == TABS_ERR_CAPACITY && discard;
+    if (dropped) rc = tabs_drop(&e->tabs, index, &e->v.state);
+    if (rc == TABS_ERR_CAPACITY) return EDITOR_ERR_CAPACITY;
+    if (rc) return rc;
     closed_wait(e, b);
     minimap_fini(&b->map);
+    if (dropped) b->retired = true;
     if (evicted.id) find_buffer(e, evicted.buffer)->retired = true;
     return editor_activate(e);
+}
+int editor_close_tab(editor *e, size_t index) { return close_tab(e, index, false); }
+int editor_close_discard(editor *e, size_t index) { return close_tab(e, index, true); }
+/* edit-2ye3: a user close (Ctrl+W, menu, palette) of a modified document
+ * tab shows the Save / Don't save / Cancel prompt instead of closing.
+ * Derived results and restore placeholders hold no user text to save. */
+int editor_close_request(editor *e)
+{
+    size_t index = tabs_active_index(&e->tabs);
+    const tabs_tab *tab = tabs_at(&e->tabs, index);
+    if (!tab || !tab->modified || e->buffer->derived || e->buffer->placeholder) return editor_close_tab(e, index);
+    if (e->close_prompt.owner == e->buffer->id) return 0;
+    e->close_prompt = (editor_close_prompt){.owner = e->buffer->id};
+    return editor_begin_frame(e);
+}
+/* The save chosen with S has ended: no Save As path being typed or queued,
+ * no save, Save As write or checkpoint in flight. */
+bool editor_close_ready(const editor *e)
+{
+    const editor_close_prompt *p = &e->close_prompt;
+    if (!p->saving) return false;
+    if (e->go.active && e->go.owner == p->saving) return false;
+    if (e->file_command == KEYS_ACTION_SAVE_AS && e->file_command_owner == p->saving) return false;
+    return !editor_save_active(e);
+}
+/* Maintenance: close the tab once its save left it unmodified. A failed or
+ * cancelled save, or edits made meanwhile, leave it open. */
+int editor_close_service(editor *e)
+{
+    if (!editor_close_ready(e) || e->dirty || e->backend->active || e->op_count || editor_activation_busy(e)) return 0;
+    uint64_t id = e->close_prompt.saving; e->close_prompt.saving = 0;
+    for (size_t i = 0; i < tabs_count(&e->tabs); i++) {
+        const tabs_tab *tab = tabs_at(&e->tabs, i);
+        if (tab->id != id) continue;
+        const editor_buffer *b = find_buffer(e, tab->buffer);
+        if (b->saved_lost || b->history_cursor != b->saved_cursor || b->save_error) return 0;
+        return editor_close_tab(e, i);
+    }
+    return 0;
 }
 int editor_reopen_tab(editor *e)
 {
@@ -886,6 +934,7 @@ int editor_poll_sources(editor *e)
     editor_save_tick(e);
     editor_save_as_tick(e); /* edit-ze59 */
     int command_rc = editor_file_command_service(e); if (command_rc) return command_rc;
+    command_rc = editor_close_service(e); if (command_rc) return command_rc; /* edit-2ye3 */
     file_watch_dispatch();
     for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];

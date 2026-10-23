@@ -91,12 +91,19 @@ static void model_op(tabs_set *s, tabs_model *m, view_state *live,
         tabs_tab evicted; memset(&evicted,0x5a,sizeof evicted);
         rc=tabs_close(s,index,live,&evicted);
         if(!m->n) { CHECK(rc==TABS_ERR_RANGE); break; }
+        /* edit-2ye3: oldest unmodified record is the victim; with none, an
+         * unmodified close is not retained and a modified one is refused. */
+        size_t victim=m->nc;
+        if(m->nc==MODEL_CLOSED) { victim=0; while(victim<m->nc && m->closed[victim].modified) ++victim; }
+        if(victim==MODEL_CLOSED && m->open[index].modified) { CHECK(rc==TABS_ERR_CAPACITY); break; }
         CHECK(rc==0); model_release(m); model_save(m);
         model_item e=m->open[index]; e.position=index;
         uint64_t expected=0;
-        if(m->nc==MODEL_CLOSED) { expected=m->closed[0].id;
-            memmove(m->closed,m->closed+1,(MODEL_CLOSED-1)*sizeof e); --m->nc; }
-        m->closed[m->nc++]=e; CHECK(evicted.id==expected);
+        if(m->nc<MODEL_CLOSED) m->closed[m->nc++]=e;
+        else if(victim<m->nc) { expected=m->closed[victim].id;
+            memmove(m->closed+victim,m->closed+victim+1,(m->nc-victim-1)*sizeof e); m->closed[m->nc-1]=e; }
+        else expected=e.id;
+        CHECK(evicted.id==expected);
         size_t rank=0; while(m->mru[rank]!=e.id) ++rank;
         memmove(m->mru+rank,m->mru+rank+1,(m->n-rank-1)*sizeof m->mru[0]);
         memmove(m->open+index,m->open+index+1,(m->n-index-1)*sizeof e); --m->n;
@@ -412,6 +419,38 @@ static void allocations(void)
 }
 /* edit-601: drop undoes an open; the record is freed, never retained, and the
  * MRU survivor becomes active with its own state. (P) capacity 2 live + 1 closed. */
+/* edit-2ye3: a full closed stack evicts its oldest unmodified record; with
+ * every retained record modified an unmodified close is not retained and a
+ * modified close is refused with state unchanged. (P) live capacity 4 holds
+ * the fixture's four tabs; closed capacity 2 is the smallest stack with an
+ * oldest and a newer record. */
+static void eviction_policy(void)
+{
+    tabs_set s; CHECK(tabs_init(&s,4,2)==0); view_state live={0};
+    piece_allocator allocator=piece_default_allocator(); piece_tree *tree=piece_create(&allocator); undo_log undo;
+    CHECK(tree && piece_init_copy(tree,(const uint8_t *)"x",1)==0 && undo_init(&undo,tree,8)==0);
+    uint64_t ids[4];
+    for(size_t i=0;i<4;++i) {
+        tabs_desc d={.buffer=tree,.undo=&undo,.title="t",.title_len=1,.modified=i!=1};
+        CHECK(tabs_open(&s,&d,&live,&ids[i])==0);
+    }
+    tabs_tab evicted;
+    /* closed: [modified 0, unmodified 1]; closing modified 2 evicts 1, not 0. */
+    CHECK(tabs_close(&s,0,&live,&evicted)==0 && evicted.id==0);
+    CHECK(tabs_close(&s,0,&live,&evicted)==0 && evicted.id==0);
+    CHECK(tabs_close(&s,0,&live,&evicted)==0 && evicted.id==ids[1]);
+    CHECK(tabs_closed_count(&s)==2 && tabs_closed_at(&s,0)->id==ids[2] && tabs_closed_at(&s,1)->id==ids[0]);
+    /* All retained modified: a modified close is refused, nothing changes. */
+    memset(&evicted,0x5a,sizeof evicted); tabs_tab before=evicted;
+    CHECK(tabs_close(&s,0,&live,&evicted)==TABS_ERR_CAPACITY);
+    CHECK(!memcmp(&evicted,&before,sizeof evicted) && tabs_count(&s)==1 && tabs_closed_count(&s)==2);
+    /* An unmodified close is returned as evicted and not retained. */
+    CHECK(tabs_set_modified(&s,0,false)==0);
+    CHECK(tabs_close(&s,0,&live,&evicted)==0 && evicted.id==ids[3] && tabs_count(&s)==0);
+    CHECK(tabs_closed_count(&s)==2 && tabs_closed_at(&s,0)->id==ids[2] && tabs_closed_at(&s,1)->id==ids[0]);
+    tabs_fini(&s); undo_destroy(&undo); piece_destroy(tree);
+    puts("tabs_test: eviction keeps modified closed records passed");
+}
 static void drop(void)
 {
     tabs_set s; CHECK(tabs_init(&s,2,1)==0); view_state live={0};
@@ -437,7 +476,7 @@ int main(int argc, char **argv)
 {
     if(argc==2 && strcmp(argv[1],"memory-gate")==0) return memory_census(true);
     CHECK(argc==1); CHECK(memory_census(false)==0);
-    sequences(); rendering(); errors_and_eviction(); resource_retention(); drop(); allocations();
+    sequences(); rendering(); errors_and_eviction(); resource_retention(); eviction_policy(); drop(); allocations();
     puts("tabs_test: all passed"); return 0;
 }
 

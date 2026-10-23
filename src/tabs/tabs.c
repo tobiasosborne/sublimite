@@ -139,7 +139,16 @@ int tabs_close(tabs_set *s, size_t index, view_state *live, tabs_tab *evicted)
 {
     if(!ready(s) || !live || !evicted) return TABS_ERR_ARG;
     if(index>=s->count) return TABS_ERR_RANGE;
-    tabs_mru_release(s); save(s,live); uint32_t slot=s->order[index];
+    uint32_t slot=s->order[index];
+    /* edit-2ye3: a full stack evicts its oldest unmodified record. With every
+     * retained record modified, an unmodified close is not retained and a
+     * modified close is refused before any state changes. */
+    size_t victim=s->closed_count;
+    if(s->closed_capacity && s->closed_count==s->closed_capacity) {
+        victim=0; while(victim<s->closed_count && s->slots[s->closed[victim]].modified) ++victim;
+        if(victim==s->closed_count && s->slots[slot].modified) return TABS_ERR_CAPACITY;
+    }
+    tabs_mru_release(s); save(s,live);
     tabs_tab *t=&s->slots[slot]; t->closed_index=index; unlink_mru(s,slot);
     memmove(s->order+index,s->order+index+1,(s->count-index-1)*sizeof *s->order); --s->count;
     if(s->active==slot) {
@@ -148,14 +157,14 @@ int tabs_close(tabs_set *s, size_t index, view_state *live, tabs_tab *evicted)
         else { memset(live,0,sizeof *live); live->selection.preferred_col=VIEW_PREFERRED_UNSET; }
     }
     memset(evicted,0,sizeof *evicted);
-    if(!s->closed_capacity) { *evicted=*t; s->free_slots[s->free_count++]=slot; }
-    else {
-        if(s->closed_count==s->closed_capacity) {
-            uint32_t old=s->closed[0]; *evicted=s->slots[old];
-            s->free_slots[s->free_count++]=old;
-            memmove(s->closed,s->closed+1,(s->closed_count-1)*sizeof *s->closed); --s->closed_count;
-        }
-        s->closed[s->closed_count++]=slot;
+    if(!s->closed_capacity || victim==s->closed_count) {
+        if(s->closed_count<s->closed_capacity) s->closed[s->closed_count++]=slot;
+        else { *evicted=*t; s->free_slots[s->free_count++]=slot; }
+    } else {
+        uint32_t old=s->closed[victim]; *evicted=s->slots[old];
+        s->free_slots[s->free_count++]=old;
+        memmove(s->closed+victim,s->closed+victim+1,(s->closed_count-victim-1)*sizeof *s->closed);
+        s->closed[s->closed_count-1]=slot;
     }
     return TABS_OK;
 }

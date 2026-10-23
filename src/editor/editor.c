@@ -429,6 +429,7 @@ static int submit(editor *e)
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
     editor_save_overlay(e);
+    editor_close_overlay(e);
     editor_goto_overlay(e);
     editor_large_index_progress(e);
     if (e->full_pending) return 0;
@@ -482,6 +483,9 @@ static int submit(editor *e)
         e->buffer->prompt_ns = e->frame.submit_ns;
         e->buffer->prompt_serial = e->event_serial;
         e->buffer->prompt_generation = e->buffer->source_generation;
+    }
+    if (e->close_prompt.owner == e->buffer->id && !e->close_prompt.prompt_ns) { /* edit-2ye3 */
+        e->close_prompt.prompt_ns = e->frame.submit_ns; e->close_prompt.prompt_serial = e->event_serial;
     }
     if (e->frame.last_sequence) e->stats.submitted_sequence = e->frame.last_sequence;
     e->dirty = false;
@@ -699,7 +703,8 @@ static bool runnable(const editor *e)
            (e->queue_count && can_drain) || view_busy(&e->v) || layout_busy(&e->lay) || e->extra_rows ||
            e->find_replace_request || e->find_replace_active || e->find_select_pending || editor_wheel_ready(e) || editor_fif_runnable(e) ||
            (e->dirty && !e->backend->active && !editor_clip_busy(e)) || (e->resize_pending && !e->backend->active && !e->dirty) ||
-           editor_save_as_runnable(e); /* edit-ze59 */
+           editor_save_as_runnable(e) || /* edit-ze59 */
+           (editor_close_ready(e) && !e->dirty && !e->backend->active && !e->op_count && !editor_activation_busy(e)); /* edit-2ye3 */
 }
 static int wait_timeout(editor *e, int requested, uint64_t now)
 {
@@ -944,7 +949,7 @@ editor_stats editor_get_stats(const editor *e)
     s.pending = e->file_command != KEYS_ACTION_NONE || editor_pointer_scrolling(e) || editor_scroll_waiting(e) || editor_font_pending(e) || editor_clip_pending(e) || e->action == EDITOR_ACTION_CLIP ||
         e->find_replace_request || e->find_replace_active || e->find_select_pending || (e->find.private_ && findui_get_state(&e->find).searching) || e->wheel_pending || editor_fif_pending(e) ||
         e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || e->dirty || e->queue_count || view_busy(&e->v) || e->resize_pending || e->full_pending || e->extra_rows ||
-        e->publish || e->save_as || /* edit-ze59; an owed checkpoint waits for a healthy journal */
+        e->publish || e->save_as || editor_close_ready(e) || /* edit-ze59, edit-2ye3; an owed checkpoint waits for a healthy journal */
         (e->publish_owed && !e->stats.journal_error && e->journal && !journal_get_stats(e->journal).error);
     s.tabs = tabs_count(&e->tabs); s.active_tab = tabs_active_index(&e->tabs); s.minimap_stale = e->buffer->map.stale;
     return s;

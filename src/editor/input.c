@@ -997,8 +997,32 @@ static int large_doc_end(editor *e, bool extend)
     pointer_unit_finish(e);
     return editor_refresh_cursor(e, e->old_cursor);
 }
+/* edit-2ye3: the close prompt owns the keyboard as the source-change prompt
+ * does: keys dispatched before the frame showing it was submitted, repeats
+ * and chords are swallowed; S, D and Esc answer. Releases pass through. */
+static bool close_prompt_key(editor *e, const plat_event *ev, int *rc)
+{
+    editor_close_prompt *p = &e->close_prompt; *rc = 0;
+    if (!p->owner) return false;
+    if (p->owner != e->buffer->id || !tabs_count(&e->tabs)) { p->owner = 0; return false; }
+    if (!ev->press) return false;
+    if (!p->prompt_ns || e->dispatch_serial <= p->prompt_serial || ev->repeat ||
+        (ev->t0_ns && ev->t0_ns <= p->prompt_ns) || (ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER))) return true;
+    if (ev->keysym == XKB_KEY_Escape) { p->owner = 0; *rc = editor_full_layout(e); }
+    else if (ev->keysym == 'd' || ev->keysym == 'D') { p->owner = 0; *rc = editor_close_discard(e, tabs_active_index(&e->tabs)); }
+    else if (ev->keysym == 's' || ev->keysym == 'S') {
+        /* The normal save; Save As for an untitled buffer. The tab closes in
+         * maintenance once that save has left it unmodified. */
+        p->owner = 0; p->saving = e->buffer->id;
+        if (!*e->buffer->path) *rc = goto_key(e, ev, KEYS_ACTION_SAVE_AS);
+        else { *rc = editor_save_request(e, ev->t0_ns); if (!*rc) *rc = editor_full_layout(e); }
+    }
+    return true;
+}
 int editor_handle_key(editor *e, const plat_event *ev)
 {
+    int close_rc = 0;
+    if (close_prompt_key(e, ev, &close_rc)) return close_rc;
     if (e->palette_open) return editor_palette_key(e, ev);
     /* edit-yey: the menu bar owns bare Alt, Alt+mnemonic and, while it has
      * keyboard focus, navigation; otherwise it steals no key. A changed
@@ -1171,7 +1195,7 @@ int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *
     if (tab) {
         undo_break_burst(e->undo);
         if (stack) return editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);
-        if (close) return editor_close_tab(e, tabs_active_index(&e->tabs));
+        if (close) return editor_close_request(e); /* edit-2ye3: prompts for a modified tab */
         if (reopen) return editor_reopen_tab(e);
         size_t count = tabs_count(&e->tabs), index = tabs_active_index(&e->tabs);
         if (adjacent) index = action == KEYS_ACTION_NEXT_VIEW ? (index + 1) % count : (index + count - 1) % count;

@@ -511,14 +511,19 @@ static int evicted_saving_tab(void)
     uint64_t first, second;
     T(editor_add_buffer(f.e, NULL, NULL, 0, &first) == 0); T(settle(f.e) == 0);
     T(editor_add_buffer(f.e, NULL, NULL, 0, &second) == 0); T(settle(f.e) == 0);
+    /* edit-2ye3: eviction never drops a modified closed tab, so the saving
+     * tab is retired the one remaining way: the closed pool (capacity 1)
+     * holds a modified tab and Don't save drops the closing one. */
+    T(editor_select_tab(f.e, 1) == 0); T(settle(f.e) == 0);
+    T(press(f.e, 'z', 0, "z") == 0); T(editor_close_tab(f.e, 1) == 0); T(settle(f.e) == 0);
     T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
     T(press(f.e, 'x', 0, "x") == 0); editor_buffer *owner = f.e->buffer;
     held_save held = {.phase = FILE_STEP_TEMP_WRITTEN}; T(savectl_set_step_hook(owner->save, hold, &held) == 0);
     T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
     T(!savectl_get_model(owner->save).journal_leased);
-    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
-    T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id == owner->id);
-    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(editor_close_tab(f.e, 0) == EDITOR_ERR_CAPACITY); T(settle(f.e) == 0);
+    T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id == first);
+    T(editor_close_discard(f.e, 0) == 0); T(settle(f.e) == 0);
     T(tabs_closed_count(&f.e->tabs) == 1 && tabs_closed_at(&f.e->tabs, 0)->id != owner->id);
     T(owner->retired); uint64_t owner_id = owner->id;
     atomic_store(&held.release, true); T(saved(f.e) == 0);
@@ -606,12 +611,16 @@ static int checkpoint_during_evicted_save(void)
     uint64_t first, second;
     T(editor_add_buffer(f.e, NULL, NULL, 0, &first) == 0); T(settle(f.e) == 0);
     T(editor_add_buffer(f.e, NULL, NULL, 0, &second) == 0); T(settle(f.e) == 0);
+    /* edit-2ye3: eviction never drops a modified closed tab, so the saving
+     * tab is retired the one remaining way: the closed pool (capacity 1)
+     * holds a modified tab and Don't save drops the closing one. */
+    T(editor_select_tab(f.e, 1) == 0); T(settle(f.e) == 0);
+    T(press(f.e, 'z', 0, "z") == 0); T(editor_close_tab(f.e, 1) == 0); T(settle(f.e) == 0);
     T(editor_select_tab(f.e, 0) == 0); T(settle(f.e) == 0);
     T(press(f.e, 'x', 0, "x") == 0); editor_buffer *owner = f.e->buffer;
     held_save held = {.phase = FILE_STEP_TEMP_WRITTEN}; T(savectl_set_step_hook(owner->save, hold, &held) == 0);
     T(press(f.e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(f.e, &held) == 0);
-    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
-    T(editor_close_tab(f.e, 0) == 0); T(settle(f.e) == 0);
+    T(editor_close_discard(f.e, 0) == 0); T(settle(f.e) == 0);
     T(owner->retired && tabs_closed_at(&f.e->tabs, 0)->id != owner->id); uint64_t owner_id = owner->id;
     T(journal_flush(f.e->journal) == 0); T(editor_checkpoint(f.e) == 0);
     atomic_store(&held.release, true); T(saved(f.e) == 0);
@@ -687,13 +696,15 @@ static int crash_after_evicted_checkpoint(void)
         uint64_t id;
         T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
         T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        /* edit-2ye3: retired as in evicted_saving_tab (Don't save drop). */
+        T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
+        T(press(e, 'z', 0, "z") == 0); T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
         T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
         T(press(e, 'x', 0, "x") == 0); editor_buffer *owner = e->buffer;
         static held_save held = {.phase = FILE_STEP_TEMP_WRITTEN};
         T(savectl_set_step_hook(owner->save, hold, &held) == 0);
         T(press(e, 's', PLAT_MOD_CTRL, NULL) == 0); T(enter_hold(e, &held) == 0);
-        T(editor_close_tab(e, 0) == 0); T(settle(e) == 0);
-        T(editor_close_tab(e, 0) == 0); T(settle(e) == 0); T(owner->retired);
+        T(editor_close_discard(e, 0) == 0); T(settle(e) == 0); T(owner->retired);
         T(journal_flush(e->journal) == 0); T(editor_checkpoint(e) == 0);
         _exit(0); /* crash: the held write never renames */
     }

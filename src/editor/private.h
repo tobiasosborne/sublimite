@@ -225,6 +225,14 @@ typedef struct editor_goto {
     scroll_state original_scroll; /* displayed 3kk top before the prompt */
     bool active, selected, valid, accept;
 } editor_goto;
+/* edit-2ye3: Save / Don't save / Cancel for a user close of a modified tab.
+ * Embedded storage; owner 0 = no prompt. prompt_ns/serial follow the
+ * source-change prompt: set when the frame showing it is submitted, so only
+ * keys dispatched after that answer it. saving: the tab whose save (or Save
+ * As) decides the close; it closes once that save leaves it unmodified. */
+typedef struct editor_close_prompt {
+    uint64_t owner, prompt_ns, prompt_serial, saving;
+} editor_close_prompt;
 typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_GOTO, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
 typedef struct editor_backend_init {
     render_backend backend;
@@ -313,6 +321,7 @@ struct editor {
     editor_fif fif;
     bool open_byte_column; /* edit-n95: position_buffer reads col as a one-based byte column */
     editor_goto go;
+    editor_close_prompt close_prompt;
     keys_action file_command;
     char file_command_path[IPC_PATH_CAP];
     uint64_t file_command_owner, file_command_generation;
@@ -690,6 +699,14 @@ void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);
 void editor_goto_overlay(editor *e);
 int editor_goto_cancel(editor *e);
+/* edit-2ye3 (buffers.c): user close (prompts for a modified tab), the close
+ * that drops a modified tab outright when the closed pool is all modified
+ * (Don't save), the post-save close and the overlay (paint.c). */
+int editor_close_request(editor *e);
+int editor_close_discard(editor *e, size_t index);
+bool editor_close_ready(const editor *e);
+int editor_close_service(editor *e);
+void editor_close_overlay(editor *e);
 int editor_file_command_service(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 /* editor_add_buffer without path reuse: journal recovery only (edit-dlfix). */

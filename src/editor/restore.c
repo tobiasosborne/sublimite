@@ -341,6 +341,9 @@ int editor_restore_defer(editor *e, const char *directory, const char *source, i
     const char *title; size_t title_len = editor_tab_title(name, &title);
     size_t index = tabs_active_index(&e->tabs);
     rc = tabs_rename(&e->tabs, index, title, title_len, name, strlen(name) < TABS_PATH_BYTES ? strlen(name) : 0);
+    /* edit-2ye3: the placeholder stands for unsaved journalled edits, so the
+     * closed pool's eviction (oldest unmodified first) keeps it like one. */
+    (void)tabs_set_modified(&e->tabs, index, true);
     tabs_tab evicted;
     int closed = tabs_close(&e->tabs, index, &e->v.state, &evicted);
     EDIT_ASSERT(closed == 0 && !evicted.id); /* (P) capacity checked above */

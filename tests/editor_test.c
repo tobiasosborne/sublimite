@@ -6148,7 +6148,170 @@ static int select_require_gl(void)
 {
     return selected_backend_test("gl", true);
 }
+/* edit-2ye3: a user close of a modified tab asks Save / Don't save / Cancel
+ * on the status row (the source-change prompt's row). The prompt text is
+ * compared as glyph identities on the bottom row, as source_prompt_submit
+ * does; zero-based last row = rows minus one. */
+static bool close_status(editor *e, const char *text)
+{
+    const render_grid *g = editor_grid(e);
+    size_t row = (size_t)(g->dims.rows - 1u) * g->dims.cols;
+    for (size_t i = 0; text[i]; i++)
+        if (i >= g->dims.cols || g->cells[row + i].glyph_index != (uint8_t)text[i]) return false;
+    return true;
+}
+static bool close_text_is(editor *e, const char *text)
+{
+    uint8_t bytes[64]; size_t n = strlen(text);
+    return n <= sizeof bytes && editor_length(e) == n && editor_read(e, 0, bytes, n) == 0 && !memcmp(bytes, text, n);
+}
+static bool close_file_is(const char *path, const char *text)
+{
+    char bytes[64]; int fd = open(path, O_RDONLY); if (fd < 0) return false;
+    ssize_t n = read(fd, bytes, sizeof bytes); close(fd);
+    return n == (ssize_t)strlen(text) && !memcmp(bytes, text, (size_t)n);
+}
+static int close_wait_saved(editor *e)
+{
+    /* Reuse settle's watchdog: 5 s = 5000000000 ns / 10^9 ns/s. */
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    return settle(e);
+}
+static bool close_retained(editor *e, uint64_t id)
+{
+    for (size_t i = 0; i < tabs_closed_count(&e->tabs); i++) if (tabs_closed_at(&e->tabs, i)->id == id) return true;
+    return false;
+}
+/* (E) Geometry: 96 columns hold the longest prompt (its fixed text plus the
+ * fixture's short titles); rows = tab chrome + text row + status row + one. */
+static int close_prompt_contract(void)
+{
+    char dir[] = "build/edit-2ye3-XXXXXX"; T(mkdtemp(dir));
+    char path[64], log[64], target[64];
+    (void)snprintf(path, sizeof path, "%s/doc.txt", dir);
+    (void)snprintf(log, sizeof log, "%s/journal", dir);
+    (void)snprintf(target, sizeof target, "%s/new.txt", dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0);
+    T(write(fd, "abc", 3) == 3); close(fd);
+    fd = open(log, O_WRONLY | O_CREAT | O_EXCL, 0600); T(fd >= 0); close(fd);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.path = path, .journal_path = log, .cols = 96, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    const char prompt[] = "Save changes to doc.txt? S save / D don't save / Esc cancel";
+    /* An unmodified tab closes at once, with no prompt. */
+    uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == 2);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 1 && !close_status(e, "Save changes"));
+    /* Ctrl+W on a modified tab leaves it open and shows the prompt. A key
+     * dispatched before the prompt's frame was submitted does not answer it. */
+    T(press(e, key('x', 0, "x")) == 0); T(editor_tab(e, 0)->modified);
+    plat_event w = key('w', PLAT_MOD_CTRL, NULL), typed_ahead = key('d', 0, "d");
+    edit_malloc_guard_begin();
+    int rc = editor_inject(e, &w); if (!rc) rc = editor_inject(e, &typed_ahead);
+    if (!rc) rc = settle(e);
+    size_t allocations = edit_malloc_guard_end();
+    T(rc == 0 && allocations == 0);
+    T(tabs_count(&e->tabs) == 1 && close_text_is(e, "xabc"));
+    T(close_status(e, prompt));
+    /* Esc cancels: the tab stays open and modified, the row returns to text. */
+    edit_malloc_guard_begin();
+    rc = press(e, key(XKB_KEY_Escape, 0, NULL));
+    allocations = edit_malloc_guard_end();
+    T(rc == 0 && allocations == 0);
+    T(tabs_count(&e->tabs) == 1 && editor_tab(e, 0)->modified && !close_status(e, "Save changes"));
+    T(close_text_is(e, "xabc"));
+    /* D closes; the closed tab keeps its edits for Ctrl+Shift+T. */
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, prompt));
+    uint64_t doc = editor_tab(e, 0)->id;
+    T(press(e, key('d', 0, "d")) == 0);
+    T(tabs_count(&e->tabs) == 0 && close_retained(e, doc) && tabs_closed_at(&e->tabs, 0)->modified);
+    T(press(e, key('T', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 1 && close_text_is(e, "xabc") && editor_tab(e, 0)->modified);
+    /* S runs the normal save and closes once it has succeeded. */
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, prompt));
+    T(press(e, key('s', 0, "s")) == 0); T(close_wait_saved(e) == 0);
+    T(tabs_count(&e->tabs) == 0 && close_file_is(path, "xabc"));
+    /* An untitled buffer saves through Save As. Cancelling Save As keeps the
+     * tab open and modified; a completed Save As closes it. */
+    T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(press(e, key('y', 0, "y")) == 0); T(editor_tab(e, 0)->modified);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 1 && close_status(e, "Save changes to untitled? S save"));
+    T(press(e, key('s', 0, "s")) == 0);
+    T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS && tabs_count(&e->tabs) == 1);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->go.active);
+    T(tabs_count(&e->tabs) == 1 && editor_tab(e, 0)->modified && close_text_is(e, "y"));
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, "Save changes to untitled?"));
+    T(press(e, key('s', 0, "s")) == 0); T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
+    /* (P) PLAT_UTF8_MAX bytes of text per synthetic key event. */
+    for (size_t at = 0; target[at];) {
+        char chunk[PLAT_UTF8_MAX + 1u] = {0}; size_t n = strlen(target + at);
+        if (n > PLAT_UTF8_MAX) n = PLAT_UTF8_MAX;
+        memcpy(chunk, target + at, n); at += n;
+        T(press(e, key((uint32_t)(uint8_t)chunk[0], 0, chunk)) == 0);
+    }
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0); T(close_wait_saved(e) == 0);
+    T(tabs_count(&e->tabs) == 0 && close_file_is(target, "y"));
+    editor_close(e);
+    T(unlink(path) == 0 && unlink(target) == 0 && unlink(log) == 0);
+    char remove_dir[96]; (void)snprintf(remove_dir, sizeof remove_dir, "rm -rf -- '%s'", dir);
+    T(system(remove_dir) == 0);
+    puts("edit-2ye3: modified close prompts (S saves+closes, D closes, Esc cancels); unmodified closes at once: PASS");
+    return 0;
+}
+/* edit-2ye3: eviction never silently drops a modified closed tab. (P) 16 is
+ * the editor's default closed capacity (editor.h); 16 + 1 later closes would
+ * evict the oldest record under first-in-first-out. Capacity 2 is the
+ * smallest pool holding two modified records ahead of a third close. */
+static int close_evict_contract(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 64, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('m', 0, "m")) == 0); T(editor_tab(e, 0)->modified);
+    uint64_t kept = editor_tab(e, 0)->id;
+    T(editor_close_tab(e, 0) == 0); T(settle(e) == 0); /* internal close: no prompt, no say-so */
+    for (unsigned i = 0; i < 16u + 1u; i++) {
+        uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(tabs_count(&e->tabs) == 0);
+    }
+    T(close_retained(e, kept));
+    while (tabs_closed_count(&e->tabs)) { T(editor_reopen_tab(e) == 0); T(settle(e) == 0); }
+    T(tabs_active(&e->tabs)->id == kept && close_text_is(e, "m"));
+    editor_close(e);
+    /* Every retained record modified: an unmodified close is not retained, a
+     * modified internal close is refused, and D drops only the closing tab. */
+    cfg.closed_capacity = 2; e = NULL;
+    T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    uint64_t first = editor_tab(e, 0)->id, second, id;
+    T(press(e, key('a', 0, "a")) == 0);
+    T(editor_add_buffer(e, NULL, NULL, 0, &second) == 0); T(settle(e) == 0);
+    T(press(e, key('b', 0, "b")) == 0);
+    T(editor_close_tab(e, 1) == 0); T(settle(e) == 0);
+    T(editor_close_tab(e, 0) == 0); T(settle(e) == 0);
+    T(tabs_closed_count(&e->tabs) == 2 && close_retained(e, first) && close_retained(e, second));
+    T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
+    T(tabs_count(&e->tabs) == 0 && close_retained(e, first) && close_retained(e, second));
+    T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+    T(press(e, key('c', 0, "c")) == 0);
+    T(editor_close_tab(e, 0) == EDITOR_ERR_CAPACITY); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == 1 && close_text_is(e, "c"));
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(close_status(e, "Save changes to untitled?"));
+    T(press(e, key('d', 0, "d")) == 0);
+    T(tabs_count(&e->tabs) == 0 && tabs_closed_count(&e->tabs) == 2);
+    T(close_retained(e, first) && close_retained(e, second));
+    T(editor_reopen_tab(e) == 0); T(settle(e) == 0); T(close_text_is(e, "a"));
+    T(editor_reopen_tab(e) == 0); T(settle(e) == 0); T(close_text_is(e, "b"));
+    editor_close(e);
+    puts("edit-2ye3: eviction keeps modified closed tabs (17 later closes; all-modified pool): PASS");
+    return 0;
+}
 static const test_selector selectors[] = {
+    {"--close-prompt", close_prompt_contract},
+    {"--close-evict", close_evict_contract},
     {"--dzk1", dzk1_render_reject},
     {"--paint-all-void", paint_all_void},
     {"--2ghs-binary", binary_open_contract},
@@ -6314,6 +6477,7 @@ int main(int argc, char **argv)
     T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
     T(clean_source_change() == 0);
     T(source_prompt_placement() == 0);
+    T(close_prompt_contract() == 0); T(close_evict_contract() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
     T(review_suite(headless ? "headless" : NULL) == 0);

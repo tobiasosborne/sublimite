@@ -504,3 +504,46 @@ void editor_goto_overlay(editor *e)
     }
     (void)render_mark_rows(&e->grid, row, 1);
 }
+/* edit-2ye3: the close prompt takes the status row in the source-change
+ * prompt's colours. ASCII uses the resident ASCII slots as that prompt does;
+ * other title graphemes use the resident font path of the Save As prompt.
+ * The title is cut so the choices stay visible. Embedded storage only. */
+static uint32_t close_ascii(editor *e, render_cell *cells, uint32_t col, const char *text, uint32_t fg, uint32_t bg)
+{
+    for (; *text && col < e->grid.dims.cols; text++, col++) {
+        uint32_t ch = (uint8_t)*text;
+        cells[col] = (render_cell){ch, ch - ' ', fg, bg, 0, 0};
+    }
+    return col;
+}
+void editor_close_overlay(editor *e)
+{
+    const tabs_tab *tab = tabs_active(&e->tabs);
+    if (!e->close_prompt.owner || e->close_prompt.owner != e->buffer->id || !tab || !e->grid.dims.rows) return;
+    static const char prefix[] = "Save changes to ", suffix[] = "? S save / D don't save / Esc cancel";
+    uint32_t fg = config_theme_color(e->preferences.theme, "warning.foreground");
+    uint32_t bg = config_theme_color(e->preferences.theme, "chrome.background");
+    uint32_t row = e->grid.dims.rows - 1u, cols = e->grid.dims.cols;
+    render_cell *cells = e->grid.cells + (size_t)row * cols;
+    for (uint32_t c = 0; c < cols; c++) cells[c] = (render_cell){' ', 0, fg, bg, 0, 0};
+    uint32_t col = close_ascii(e, cells, 0, prefix, fg, bg);
+    /* (P) string lengths exclude their terminators. */
+    uint32_t reserve = (uint32_t)(sizeof suffix - 1u), end = cols > col + reserve ? cols - reserve : col;
+    size_t byte = 0;
+    while (byte < tab->title_len && col < end) {
+        const uint8_t *at = (const uint8_t *)tab->title + byte;
+        size_t n = utf8_grapheme_next(at, tab->title_len - byte);
+        if (n == 1 && *at >= ' ' && *at < 0x7f) { cells[col] = (render_cell){*at, (uint32_t)(*at - ' '), fg, bg, 0, 0}; col++; byte++; continue; }
+        int width = utf8_cluster_width(at, n);
+        if (width <= 0) { byte += n; continue; }
+        uint32_t span = (uint32_t)width, slot = RENDER_NO_SLOT;
+        if (span > end - col || editor_font_glyph(e, at, n, span, &slot) != FONT_OK) break;
+        uint32_t identity = slot == RENDER_NO_SLOT ? (uint32_t)' ' : e->grid.glyphs[slot].glyph_index;
+        cells[col] = (render_cell){identity, slot, fg, bg, span > 1u ? RENDER_ATTR_WIDE_LEFT : 0, 0};
+        for (uint32_t tail = 1; tail < span; tail++)
+            cells[col + tail] = (render_cell){.glyph_index = ' ', .atlas_slot = RENDER_NO_SLOT, .fg = fg, .bg = bg, .attrs = RENDER_ATTR_WIDE_RIGHT};
+        editor_font_track(e, slot, row); byte += n; col += span;
+    }
+    (void)close_ascii(e, cells, col, suffix, fg, bg);
+    (void)render_mark_rows(&e->grid, row, 1);
+}

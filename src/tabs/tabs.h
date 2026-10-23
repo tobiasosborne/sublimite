@@ -76,8 +76,11 @@ int tabs_replace(tabs_set *s, size_t index, piece_tree *buffer, undo_log *undo,
 /* Close commits any held cycle, saves live, then chooses MRU survivor if active
  * closed. evicted is required: id==0 means nothing evicted; otherwise the caller
  * may retire its resources after frame/worker references are quiescent. At zero
- * closed capacity the closed record is returned immediately. Modified close
- * policy (save/discard/cancel) belongs to caller, before calling close. */
+ * closed capacity the closed record is returned immediately. A full closed
+ * stack evicts its oldest unmodified record (edit-2ye3); when every retained
+ * record is modified, an unmodified close is returned as evicted (not
+ * retained) and a modified close fails with TABS_ERR_CAPACITY, unchanged.
+ * Modified close policy (save/discard/cancel) belongs to caller, before close. */
 int tabs_close(tabs_set *s, size_t index, view_state *live, tabs_tab *evicted);
 int tabs_reopen(tabs_set *s, view_state *live, uint64_t *id);
 /* edit-601: undo of tabs_open. Removes the live tab at index and frees its

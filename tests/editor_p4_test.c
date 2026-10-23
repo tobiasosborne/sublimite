@@ -243,7 +243,9 @@ static int tabs_script(bool raster)
     T(press(e, release) == 0);
     T(editor_set_cursor(e, 3) == 0); T(settle(e) == 0);
     T(press(e, key('x', 0, "x")) == 0); T(editor_tab(e, 2)->modified);
-    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).tabs == 2);
+    /* edit-2ye3: Ctrl+W on a modified tab prompts; D (Don't save) closes it. */
+    T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0); T(editor_get_stats(e).tabs == 3);
+    T(press(e, key('d', 0, "d")) == 0); T(editor_get_stats(e).tabs == 2);
     T(press(e, key('T', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(editor_get_stats(e).tabs == 3);
     T(editor_tab(e, 2)->id == gamma); T(expect(e, "gamxma", 4) == 0);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "gamma", 3) == 0); T(!editor_tab(e, 2)->modified);
