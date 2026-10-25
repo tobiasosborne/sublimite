@@ -11,7 +11,8 @@ mutable = [
     for line in symbols
     if len(fields := line.split()) == 3 and fields[1] in ("b", "B", "d", "D")
 ]
-ok = set(mutable) <= {"file_bus", "file_watches"}
+# os_fault_service: the OS-layer fault service (edit-177r.2, Tobias 2026-10-25); file_bus goes when W2 migrates src/file.
+ok = set(mutable) <= {"file_bus", "file_watches", "os_fault_service"}
 print(f"finding10: {'ok' if ok else 'FAIL'} mutable globals={len(mutable)} "
       + ",".join(mutable))
 sys.exit(0 if ok else 1)
