@@ -36,3 +36,21 @@ sudo apt install libxcb-xkb-dev libxkbcommon-x11-dev libxcb-present-dev
 
 ## libFuzzer link
 clang 18 selects `/usr/lib/gcc/x86_64-linux-gnu/14` (partial install, no libstdc++) and `-fsanitize=fuzzer` fails with `cannot find -lstdc++`. The Makefile passes `--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13` on fuzz links. Workers building fuzzers by hand need the same flag.
+
+## Windows cross toolchain (edit-177r.1) — PARTIAL, not yet verified
+
+- Release chosen: llvm-mingw `20260922` (published 2026-09-22; 33 days old on 2026-10-25), asset `llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz`.
+- sha256 (M, of the downloaded file): `bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21`.
+- Install (no sudo):
+  ```
+  mkdir -p ~/opt/dl && cd ~/opt/dl && curl -LO https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz
+  sha256sum -c <<< "bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21  llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz"
+  cd ~/opt && tar xf dl/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz && ln -sfn llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64 llvm-mingw
+  ```
+- Build: `make TARGET=win all|check|clean` (`mk/win.mk`, `WIN_TOOLCHAIN` overrides `~/opt/llvm-mingw`); output in `build/win/{rel,san}`.
+- Run: `tools/winrun.sh <exe> [args...]` (runs the exe in place; see below).
+- Clang version (M): 23.1.2, target x86_64-w64-windows-gnu. sha256 matches GitHub's published digest.
+- Release smoke exe imports (M, `llvm-readobj --coff-imports`): KERNEL32.dll and the UCRT api-sets api-ms-win-crt-{stdio,runtime,locale,heap,private,string,math,environment}-l1-1-0.dll. All system DLLs. Sanitizer exe additionally imports `libclang_rt.asan_dynamic-x86_64.dll` (in `<toolchain>/x86_64-w64-mingw32/bin/`; the Makefile copies it next to the exe and winrun.sh copies sibling DLLs).
+- LeakSanitizer on this target (M, 2026-10-25, clang 23.1.2): NOT available. A leaking exe built with `-fsanitize=address` and run with `ASAN_OPTIONS=detect_leaks=1` prints `AddressSanitizer: detect_leaks is not supported on this platform.` and exits 1; with the default options the leak goes unreported (exit 0). So leak checking stays a Linux-only check.
+- Run in place: `/mnt/c` is mounted read-only by Tobias's choice (`/etc/wsl.conf` automount option `ro`). Never write to or remount `/mnt/*`. `tools/winrun.sh` therefore runs the exe in place from its build directory (WSL interop starts it from the `\\wsl.localhost` path), passes args, propagates the exit code and writes nothing. A test that needs NTFS scratch files creates them itself as a Windows process under `%TEMP%\sublimite-test-*` and deletes them afterwards.
+- Sanitizer exe runtime DLLs, copied beside it by mk/win.mk from `<toolchain>/x86_64-w64-mingw32/bin/`: `libclang_rt.asan_dynamic-x86_64.dll` imports `libc++.dll`, which imports `libunwind.dll`. Missing ones give exit 53 (0xC0000135).

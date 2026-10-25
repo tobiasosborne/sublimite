@@ -1,5 +1,10 @@
-# GNU Makefile. Globs everything: drop files in src/<m>/, tests/<m>_test.c,
+# GNU Makefile. TARGET=win hands over to mk/win.mk (Windows cross build, edit-177r.1).
+# Globs everything: drop files in src/<m>/, tests/<m>_test.c,
 # bench/<m>_bench.c, fuzz/<m>_fuzz.c, tools/<name>.c. Vendored runtimes are explicit.
+ifeq ($(TARGET),win)
+include mk/win.mk
+else
+
 CC_RELEASE ?= gcc
 CC_SAN     ?= clang
 # clang 18 on this box selects a half-installed gcc-14 dir and cannot find -lstdc++ (libFuzzer needs it); pin gcc 13. See docs/toolchain.md.
@@ -253,3 +258,5 @@ clean:
 	rm -rf $(B)
 
 -include $(shell find $(B) -name '*.d' 2>/dev/null)
+
+endif # TARGET
