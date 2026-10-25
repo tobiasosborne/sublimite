@@ -1,3 +1,28 @@
+# HANDOFF — sublimité, end of session 21 (2026-10-25 ~15:30 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "we stop work for today")
+
+## Read first (session 22)
+**New box and new challenge.** This session ran on **Spiral**, Tobias's desktop: WSL2 Ubuntu 24.04 on Windows 10 22H2 (build 19045), 64 cores, RTX 3090, 5120×1440 at 165 Hz, no battery (stamp measurements [AC, desktop Spiral]). The ThinkPad sections below describe the other box. Tobias's new goal: **a native Windows build (M3) as good as or better than Sublime Text 4 on Windows**, developed in WSL, with Linux kept first-class. Scope and his decisions: `docs/design/windows-port.md`; epic **edit-177r**. Record: docs/worklog/2026-10-25.md.
+
+**Main 729bad2, pushed.** Landed: edit-177r.1 W0.1 (f923d1a: llvm-mingw 20260922 in ~/opt/llvm-mingw, `make TARGET=win all|check`, tools/winrun.sh runs Windows test exes in place) and edit-177r.2 W0.2 (8f78b7f: `src/os/os.h` frozen contract, Linux implementation, 17-case tests/os_test.c; Codex review docs/reviews/edit-177r.2.md, round 2 fixed the triaged findings; backlog edit-pc3s). Decisions recorded in docs/decisions/edit-177r.2.md §8 and CLAUDE.md (os_fault_service replaces file_bus as the sanctioned fault global; Windows directory locks are identity-keyed lock files under %LOCALAPPDATA%\sublimite\dirlocks).
+
+**Ready, not dispatched (dispatch after `quota`):** edit-177r.3 W0.3 (Windows os.h implementation + Windows malloc guard + UTF-8 manifest; Opus or Codex sol), edit-177r.4 W0.4 (core modules onto os.h per decision §9; Sonnet), edit-hltk P1 (the three Spiral make-check failures: BAT0, private Xvfb under WSLg's read-only /tmp/.X11-unix, refproto failed-open leak; Sonnet). No file overlap between the three. Briefs follow the s11 pattern: build/briefs/_rules-s11.md (box facts, platform-file convention `<m>_win.c`/`<m>_posix.c`), worktrees `.wt/<bead>-s11`, reports docs/worker-reports/<bead>-s11.md. build/ is not in git: recreate the rules file from this description if the box lost it.
+
+**Box facts for Spiral (binding):**
+- /mnt/c etc. are mounted **read-only** by Tobias's /etc/wsl.conf: nothing on the Linux side writes to Windows drives. Windows test exes run in place from the WSL build folder; tests needing NTFS scratch create it themselves under %TEMP%\sublimite-test-*.
+- clang is clang-18 via symlinks in ~/.local/bin; the X11 dev packages and libxcb-xtest0 are installed.
+- Xvfb :95 and :99 (2880x1800, 100 dpi, -noreset) were started this session; restart them after a reboot. :0 is WSLg (the real desktop): the test guard already redirects it to :99. Corpus at /tmp/edit-corpus (rebuild after a reboot: build/tools/mkcorpus + `truncate -s 10G sparse_10g.bin`).
+- Full Linux make check: 99/102 pass; the 3 failures are edit-hltk. Until it lands, make check cannot reach the end here (law 1).
+- Beads: imported from the ThinkPad export; no Dolt remote. Both machines share state only through `bd export` → .beads/issues.jsonl in git: export before every push, and import on the other machine before working there.
+- `.wt/` is excluded via .git/info/exclude (local).
+
+**Quota:** the quota tool cannot read Claude since 13:23 (token expired; it says a `claude` session refreshes it). Last reading 13:00: Claude weekly 69 % (0.2 % behind), Fable 71 % (+1.8 %). Codex Weekly 17 % (+12.6 % ahead) at 15:20, past the +12 % line earlier sessions held: prefer Claude lanes once its reading returns.
+
+**Still open from session 20 (ThinkPad), unchanged:** Tobias's pick from the design workups (edit-b0j), P3 edit-b3hk, edit-fi0p remainder, edit-pi6. The installed ThinkPad build is 4a71e27; nothing is installed on Spiral.
+
+Everything below is the session-20 handoff, kept for its own state.
+
+---
+
 # HANDOFF — sublimité, session 20 continued (2026-10-23 ~11:40 box clock; Fable consultant/coordinator, Tobias present)
 
 ## Read first
