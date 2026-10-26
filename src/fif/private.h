@@ -2,10 +2,23 @@
 #define EDIT_FIF_PRIVATE_H
 #include "fif/fif.h"
 #include "find/options.h"
-#include <sys/types.h>
 
-typedef struct fif_node { char path[PATH_MAX]; } fif_node;
-typedef struct fif_identity { dev_t device; ino_t inode; } fif_identity;
+typedef struct fif_node { char path[OS_PATH_MAX]; } fif_node;
+typedef os_identity fif_identity;
+/* POSIX retains the walker's checked closedir/close results, which the frozen
+ * os.h void-close entries cannot expose. Windows uses os_dir_iter directly. */
+typedef struct fif_iterator {
+#if defined(_WIN32)
+    os_dir_iter it;
+#else
+    void *dir;
+#endif
+} fif_iterator;
+int fif_iter_open(fif_iterator *it, const os_dir *dir);
+int fif_iter_next(fif_iterator *it, const char **name);
+int fif_iter_close(fif_iterator *it);
+int fif_close_file(os_file *file);
+os_err fif_stat_dir(const os_dir *dir, os_stat *st);
 typedef struct fif_frame { size_t first, count, next; } fif_frame;
 typedef struct fif_file_record { const char *path; atomic_bool ready; } fif_file_record;
 typedef struct fif_hit_record {
@@ -19,7 +32,7 @@ typedef struct fif_impl {
     fif_limits limits;
     fif_options options;
     fif_filter filter;
-    char root[PATH_MAX];
+    char root[OS_PATH_MAX];
     uint8_t query[FIND_MAX_PATTERN];
     size_t query_length, root_length;
     fif_node *nodes;

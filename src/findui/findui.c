@@ -1,9 +1,6 @@
 #include "findui/private.h"
 #include "file/file.h"
 #include <string.h>
-#include <time.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 static findui_impl *implementation(const findui_panel *panel)
 { return panel ? panel->private_ : NULL; }
@@ -11,9 +8,7 @@ static findui_range unset_range(void)
 { return (findui_range){FIND_UNSET, FIND_UNSET}; }
 static uint64_t now_ns(void)
 {
-    struct timespec time;
-    (void)clock_gettime(CLOCK_MONOTONIC, &time);
-    return (uint64_t)time.tv_sec * UINT64_C(1000000000) + (uint64_t)time.tv_nsec;
+    return os_now_ns();
 }
 static bool intersects(findui_range range, uint64_t start, uint64_t end)
 {
@@ -119,7 +114,7 @@ static void restart(findui_impl *impl, uint64_t desired)
 findui_code findui_init(findui_panel *panel, const findui_config *config)
 {
     if (!panel || panel->private_ || !config || !config->arena || !config->workers ||
-        work_pool_eventfd(config->workers) < 0 || !config->match_capacity || !config->visible_capacity ||
+        !work_pool_wake(config->workers) || !config->match_capacity || !config->visible_capacity ||
         config->match_capacity > FINDUI_RESULT_RANGES ||
         config->visible_capacity > FINDUI_RESULT_RANGES)
         return FINDUI_ERR_ARGUMENT;
@@ -127,7 +122,7 @@ findui_code findui_init(findui_panel *panel, const findui_config *config)
     findui_impl *impl = edit_arena_alloc(config->arena, sizeof *impl, _Alignof(findui_impl));
     if (!impl) return FINDUI_ERR_MEMORY;
     memset(impl, 0, sizeof *impl); impl->config = *config;
-    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) impl->slots[i].plan.fd = -1;
+    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) impl->slots[i].plan.file = (os_file)OS_FILE_INIT;
     impl->cache = edit_arena_alloc(config->arena, config->match_capacity * sizeof *impl->cache,
                                    _Alignof(findui_range));
     impl->visible = edit_arena_alloc(config->arena, config->visible_capacity * sizeof *impl->visible,
@@ -146,11 +141,19 @@ findui_code findui_init(findui_panel *panel, const findui_config *config)
         /* Setup only: unlinked, private, close-on-exec spool. Queries and
          * retrieval reuse this descriptor without allocating on input. */
         /* Owner read/write permission bits; no dependency on a writable cwd. */
-        slot->plan.fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
-        memory_ok = slot->program && slot->scratch && slot->pattern && slot->outbox && slot->plan.fd >= 0;
+        os_dir dir = OS_DIR_INIT;
+        const char *temp = "/tmp";
+#if defined(_WIN32)
+        char path[OS_PATH_MAX];
+        temp = os_temp_dir(path, sizeof path) == OS_OK ? path : NULL;
+#endif
+        bool opened = temp && os_dir_open(&dir, temp) == OS_OK &&
+                      os_file_open_anon(&slot->plan.file, &dir) == OS_OK;
+        os_dir_close(&dir);
+        memory_ok = slot->program && slot->scratch && slot->pattern && slot->outbox && opened;
     }
     if (!memory_ok) {
-        for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) if (impl->slots[i].plan.fd >= 0) close(impl->slots[i].plan.fd);
+        for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) os_file_close(&impl->slots[i].plan.file);
         edit_arena_reset_to_mark(config->arena, mark); return FINDUI_ERR_MEMORY;
     }
     impl->state.query = impl->query; impl->state.replacement = impl->replacement;
@@ -165,7 +168,7 @@ findui_code findui_service(findui_panel *panel)
     (void)invalidate_source(impl);
     reap(impl, false);
     if (!impl->pending_submit) return FINDUI_OK;
-    if (work_pool_eventfd(impl->config.workers) < 0) return FINDUI_ERR_BUSY;
+    if (!work_pool_wake(impl->config.workers)) return FINDUI_ERR_BUSY;
     for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) {
         findui_slot *slot = &impl->slots[i];
         if (slot->snapshot || slot == impl->plan) continue;
@@ -221,7 +224,7 @@ findui_code findui_dispose(findui_panel *panel)
     for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) if (impl->slots[i].snapshot) return FINDUI_MORE;
     if (impl->source) piece_snapshot_release(impl->source);
     if (impl->source_lease.release) impl->source_lease.release(impl->source_lease.user);
-    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) close(impl->slots[i].plan.fd);
+    for (size_t i = 0; i < FINDUI_SLOT_COUNT; i++) os_file_close(&impl->slots[i].plan.file);
     panel->private_ = NULL;
     return FINDUI_OK;
 }

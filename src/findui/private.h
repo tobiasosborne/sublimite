@@ -14,7 +14,7 @@
 typedef struct findui_plan_run { uint64_t ordinal, count, start, end, stride; } findui_plan_run;
 #define FINDUI_PLAN_RUNS (FIND_POLL_UNITS / sizeof(findui_plan_run))
 typedef struct findui_plan {
-    int fd;
+    os_file file;
     uint64_t records, total;
     findui_plan_run run, buffer[FINDUI_PLAN_RUNS];
     size_t buffered;

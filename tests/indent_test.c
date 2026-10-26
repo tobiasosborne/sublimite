@@ -2,7 +2,11 @@
 #include "base/base.h"
 #include <string.h>
 #include <stdio.h>
+#if defined(_WIN32)
+#include "win/dependency_vm.h"
+#else
 #include <sys/mman.h>
+#endif
 
 #define CHECK(x) EDIT_ASSERT(x)
 static piece_tree *tree_bytes(const uint8_t *p, size_t n, bool fragmented)

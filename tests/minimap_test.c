@@ -3,7 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include "win/dependency_vm.h"
+#else
 #include <sys/mman.h>
+#endif
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "minimap_test:%d: %s\n", __LINE__, #c); exit(1); } } while (0)
 typedef struct flat { const uint8_t *p; size_t n, fragment, calls; } flat;

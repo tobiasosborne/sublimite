@@ -522,6 +522,8 @@ int main(void)
 {
 #if !defined(_WIN32)
     keysym_names();
+#else
+    puts("keys_test: SKIP libxkbcommon differential name oracle (Linux-only library); binding expectations unchanged");
 #endif
     bindings(); edge_cases(); no_allocations(); puts("keys_test: all passed"); return 0;
 }

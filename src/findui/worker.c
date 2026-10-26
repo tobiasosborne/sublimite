@@ -3,7 +3,6 @@
 #include "find/options.h"
 #include "file/file.h"
 #include <string.h>
-#include <time.h>
 
 static void scan_trace(const findui_slot *slot, uint32_t generation)
 { if (slot->hook) slot->hook(slot->hook_user, generation); }

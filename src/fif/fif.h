@@ -6,7 +6,7 @@
 #include "base/base.h"
 #include "find/find.h"
 #include "work/work.h"
-#include <limits.h>
+#include "os/os.h"
 
 /* (P) POSIX path interface limit, including NUL. (E) Rule/depth defaults reuse
  * the core's nesting capacity; result/file caps reuse its offset capacity.
@@ -16,7 +16,7 @@
  * (E) 1 MiB poll/read span: 2^20 / (16e9 B/s G6 (M)[AC]) = 65.536 us;
  * scalar preprocessing also polls at FIND_POLL_UNITS, search polls internally.
  * (E) Binary probe = requested 8 KiB = eight core polling quanta. */
-#define FIF_PATH_BYTES ((size_t)PATH_MAX)
+#define FIF_PATH_BYTES ((size_t)OS_PATH_MAX)
 #define FIF_MAX_RULES FIND_MAX_DEPTH
 #define FIF_DEFAULT_DEPTH FIND_MAX_DEPTH
 #define FIF_DEFAULT_FILES FIND_MAX_OFFSETS
@@ -60,11 +60,11 @@ typedef struct fif_request {
  * Glob syntax: *, ?, [a-z], [!a-z], backslash escape, ** across separators.
  * A double-star followed by slash also matches no directory. No shell expansion, braces, or quoted commas.
  * Paths/filter matching are case sensitive independently of search options.
- * Parser storage <= PATH_MAX, rules <= FIF_MAX_RULES; overflow returns FILTER.
+ * Parser storage <= OS_PATH_MAX, rules <= FIF_MAX_RULES; overflow returns FILTER.
  * Standalone matcher is anchored (it does not implicitly strip directories). */
 typedef struct fif_rule { size_t offset; bool exclude, glob, slash; } fif_rule;
 typedef struct fif_filter {
-    char text[PATH_MAX];
+    char text[OS_PATH_MAX];
     fif_rule rules[FIF_MAX_RULES];
     size_t count, used, includes;
 } fif_filter;

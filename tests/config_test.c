@@ -1,13 +1,19 @@
 #include "config/config.h"
+#include "os/os.h"
 #include "base/base.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#include "win/dependency_fixture.h"
+#include "file/file.h"
+#else
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sched.h>
+#endif
 #include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 #define T(x) do { if (!(x)) { fprintf(stderr, "config_test: FAIL %s\n", #x); return 1; } } while (0)
@@ -93,8 +99,12 @@ static int parser_test(void)
 }
 static int write_config(const char *path, const char *source)
 {
+#if defined(_WIN32)
+    return dep_put(path, source, strlen(source));
+#else
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); T(fd >= 0);
     T(write(fd, source, strlen(source)) == (ssize_t)strlen(source)); T(close(fd) == 0); return 0;
+#endif
 }
 static void wait_runtime(config_runtime *r)
 {
@@ -102,15 +112,37 @@ static void wait_runtime(config_runtime *r)
      * time budget. Finished leases can lag a delivered mailbox by scheduling,
      * so yield in that case instead of waiting for a nonexistent message. */
     do {
+#if !defined(_WIN32)
         struct pollfd fds[] = {{config_runtime_eventfd(r), POLLIN, 0}, {config_runtime_watchfd(r), POLLIN, 0}};
         (void)poll(fds, sizeof fds / sizeof fds[0], 0);
+#endif
         (void)config_runtime_tick(r);
-        sched_yield();
+        os_yield();
     } while (config_runtime_busy(r));
+}
+static int wait_notice(config_runtime *r)
+{
+#if defined(_WIN32)
+    (void)r;
+    return WaitForSingleObject(file_watch_handle(), INFINITE) == WAIT_OBJECT_0 ? 0 : -1;
+#else
+    struct pollfd notice = {config_runtime_watchfd(r), POLLIN, 0};
+    return poll(&notice, 1, -1) == 1 ? 0 : -1;
+#endif
 }
 static int runtime_test(void)
 {
-    char root[] = "/tmp/sublimite-config-XXXXXX", path[CONFIG_TEXT_CAP], other[CONFIG_TEXT_CAP];
+    char path[CONFIG_TEXT_CAP], other[CONFIG_TEXT_CAP];
+#if defined(_WIN32)
+    char root[OS_PATH_MAX], expected[OS_PATH_MAX]; T(dep_temp(root, sizeof root) == 0);
+    T(config_path(path, sizeof path) == CONFIG_OK);
+    T(os_app_dir(OS_APP_CONFIG, expected, sizeof expected) == OS_OK);
+    T(snprintf(other, sizeof other, "%s/config.toml", expected) > 0 && !strcmp(path, other));
+    T(config_path(path, strlen(path)) == CONFIG_ERR_LIMIT);
+    T(snprintf(path, sizeof path, "%s/sublimite/config.toml", root) > 0);
+    config_runtime *r = NULL; T(config_runtime_open(&r, path) == CONFIG_OK); wait_runtime(r);
+#else
+    char root[] = "/tmp/sublimite-config-XXXXXX";
     T(mkdtemp(root)); T(setenv("XDG_CONFIG_HOME", root, 1) == 0);
     T(config_path(path, sizeof path) == CONFIG_OK);
     T(config_path(path, sizeof root) == CONFIG_ERR_LIMIT);
@@ -120,51 +152,56 @@ static int runtime_test(void)
     T(!strcmp(path, other)); T(setenv("XDG_CONFIG_HOME", root, 1) == 0);
     T(config_path(path, sizeof path) == CONFIG_OK);
     config_runtime *r = NULL; T(config_runtime_open(&r, NULL) == CONFIG_OK); wait_runtime(r);
+#endif
     T(config_runtime_error(r).code == CONFIG_OK && config_runtime_watchfd(r) >= 0);
     T(write_config(path, "theme='light'\n[font]\nsize=14\n") == 0);
-    struct pollfd notice = {config_runtime_watchfd(r), POLLIN, 0}; T(poll(&notice, 1, -1) == 1);
+    T(wait_notice(r) == 0);
     (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_current(r)->theme == CONFIG_LIGHT && config_runtime_current(r)->font_points == 14.0);
     uint64_t generation = config_runtime_generation(r);
     T(write_config(path, "theme='broken'\n") == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_ERR_VALUE);
     T(config_runtime_generation(r) == generation && config_runtime_current(r)->theme == CONFIG_LIGHT);
     /* edit-6e2: a non-array font.fallbacks is the usual runtime warning
      * (config_runtime_error), keeping the last valid chain current. */
     T(write_config(path, "theme='light'\nfont.fallbacks=['Noto Emoji']\n") == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_OK);
     T(!strcmp(config_runtime_current(r)->font_fallbacks, "Noto Emoji"));
     generation = config_runtime_generation(r);
     T(write_config(path, "theme='light'\nfont.fallbacks='Noto Emoji'\n") == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_ERR_VALUE && config_runtime_generation(r) == generation);
     T(!strcmp(config_runtime_current(r)->font_fallbacks, "Noto Emoji"));
     T(snprintf(other, sizeof other, "%s/sublimite/other.toml", root) > 0);
     config_runtime *peer = NULL; T(config_runtime_open(&peer, other) == CONFIG_OK); wait_runtime(peer);
     T(config_runtime_watchfd(peer) == config_runtime_watchfd(r));
     config_runtime_close(peer); /* stopping a shared parent member must keep r */
-    T(write_config(other, "theme='dark'\nwrap=false\n") == 0); T(rename(other, path) == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(write_config(other, "theme='dark'\nwrap=false\n") == 0); T(os_rename(other, path, OS_RENAME_REPLACE) == OS_OK);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_OK && config_runtime_current(r)->theme == CONFIG_DARK);
     T(config_runtime_current(r)->wrap_set && !config_runtime_current(r)->wrap);
     T(config_runtime_generation(r) == generation + 1u); /* (P) one valid replacement publication */
     T(write_config(path, "whitespace.trailing='all'\n") == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_current(r)->trailing == CONFIG_TRAILING_ALL);
     T(config_runtime_error(r).code == CONFIG_OK);
     T(write_config(path, "theme='light'\nwhitespace.trailing='invalid'\n") == 0);
-    T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(config_runtime_error(r).code == CONFIG_ERR_VALUE);
     T(config_runtime_current(r)->trailing == CONFIG_TRAILING_NONE);
     T(config_runtime_current(r)->theme == CONFIG_LIGHT);
-    T(unlink(path) == 0); T(poll(&notice, 1, -1) == 1); (void)config_runtime_tick(r); wait_runtime(r);
+    T(os_unlink(path) == OS_OK); T(wait_notice(r) == 0); (void)config_runtime_tick(r); wait_runtime(r);
     T(!config_runtime_current(r)->wrap_set); /* absent file restores defaults */
     T(!config_runtime_current(r)->trailing_warning && config_runtime_error(r).code == CONFIG_OK);
     config_runtime_close(r);
-    T(snprintf(path, sizeof path, "%s/sublimite", root) > 0); T(rmdir(path) == 0); T(rmdir(root) == 0);
-    puts("config_test: absent file, inotify create/rename/delete, invalid reload and shared watch lifetime passed");
+    T(snprintf(path, sizeof path, "%s/sublimite", root) > 0);
+    /* Migration rule edit-177r.2 section 9: directory-as-file stays IO. */
+    r = NULL; T(config_runtime_open(&r, path) == CONFIG_OK); wait_runtime(r);
+    T(config_runtime_error(r).code == CONFIG_ERR_IO); config_runtime_close(r);
+    T(os_rmdir(path) == OS_OK); T(os_rmdir(root) == OS_OK);
+    puts("config_test: absent file, notifications create/rename/delete, invalid reload, directory rejection and shared watch lifetime passed");
     return 0;
 }
 static int trailing_test(void)

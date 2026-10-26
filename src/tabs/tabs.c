@@ -1,7 +1,7 @@
 #include "tabs.h"
 #include "utf8/utf8.h"
 #include <string.h>
-#include <unistd.h>
+#include "os/os.h"
 
 static bool ready(const tabs_set *s) { return s && s->arena.base; }
 static bool names_valid(const char *title, size_t tn, const char *path, size_t pn)
@@ -39,9 +39,8 @@ int tabs_init(tabs_set *s, size_t capacity, size_t closed_capacity)
     size_t per=sizeof(tabs_tab)+2*sizeof(uint32_t);
     if(total>SIZE_MAX/per) return TABS_ERR_CAPACITY;
     size_t bytes=total*per;
-    long page=sysconf(_SC_PAGESIZE);
-    if(page<=0) return TABS_ERR_INIT;
-    size_t pg=(size_t)page;
+    size_t pg=os_page_size();
+    if(!pg) return TABS_ERR_INIT;
     if(bytes>SIZE_MAX-(pg-1)) return TABS_ERR_CAPACITY;
     bytes=((bytes+pg-1)/pg)*pg;
     tabs_set value={.capacity=capacity,.closed_capacity=closed_capacity,

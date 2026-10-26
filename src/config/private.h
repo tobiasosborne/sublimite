@@ -6,4 +6,6 @@
 int config_toml_parse_worker(const uint8_t *, size_t, config_visit_fn, void *,
                              config_error *, const work_ctx *);
 int config_parse_worker(const uint8_t *, size_t, config_settings *, config_error *, const work_ctx *);
+void *config_runtime_alloc(size_t alignment, size_t size);
+void config_runtime_free(void *p);
 #endif

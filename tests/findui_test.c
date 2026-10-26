@@ -1,15 +1,26 @@
 #include "findui/findui.h"
 #include "findui/private.h"
+#if !defined(_WIN32)
 #include "editor/private.h"
+#endif
 #include "trace/trace.h"
 #include "journal/journal.h"
 #include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
+#if defined(_WIN32)
+#include "win/dependency_vm.h"
+#else
 #include <sys/mman.h>
+#endif
+#if defined(_WIN32)
+#include "win/dependency_fixture.h"
+#define sched_yield os_yield
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -17,7 +28,7 @@
 #define CHECK(x) EDIT_ASSERT(x)
 
 typedef struct probe {
-    pthread_t caller;
+    uint64_t caller;
     atomic_uint scans, on_caller;
     atomic_bool park, entered, release;
 } probe;
@@ -53,7 +64,7 @@ static void scan_hook(void *context, uint32_t generation)
         atomic_store(&p->entered, true);
         while (!atomic_load(&p->release)) sched_yield();
     }
-    if (pthread_equal(pthread_self(), p->caller)) atomic_fetch_add(&p->on_caller, 1);
+    if (os_thread_self() == p->caller) atomic_fetch_add(&p->on_caller, 1);
 }
 static void route(const work_msg *message, void *context)
 {
@@ -65,7 +76,7 @@ static void route(const work_msg *message, void *context)
     (void)findui_accept(&f->panel, message);
 }
 static void pause_worker(void)
-{ const struct timespec delay = {0, 100000}; (void)nanosleep(&delay, NULL); }
+{ os_sleep_ns(UINT64_C(100000)); }
 static void pump(fixture *f)
 {
     CHECK(findui_service(&f->panel) <= FINDUI_MORE);
@@ -84,7 +95,7 @@ static void start(fixture *f, const uint8_t *text, size_t length,
                   size_t cache, size_t visible)
 {
     memset(f, 0, sizeof *f);
-    f->hook.caller = pthread_self();
+    f->hook.caller = os_thread_self();
     atomic_init(&f->hook.scans, 0); atomic_init(&f->hook.on_caller, 0);
     atomic_init(&f->hook.park, false); atomic_init(&f->hook.entered, false); atomic_init(&f->hook.release, false);
     CHECK(edit_arena_init(&f->arena, 16u * 1024u * 1024u) == 0);
@@ -514,7 +525,12 @@ static void replacement_host_bookkeeping(void)
         fixture f; start(&f, (const uint8_t *)"a\n a\n", 5, 8, 8); query(&f, "a\n");
         CHECK(findui_set_replacement(&f.panel, (const uint8_t *)"X", 1, 1) == FINDUI_OK);
         undo_log undo; CHECK(undo_init(&undo, f.tree, 128) == 0);
+#if defined(_WIN32)
+        char dir[OS_PATH_MAX], path[OS_PATH_MAX]; CHECK(dep_temp(dir, sizeof dir) == 0);
+        CHECK(snprintf(path, sizeof path, "%s/journal", dir) > 0); CHECK(dep_put(path, "", 0) == 0);
+#else
         char path[] = "build/findui-host-XXXXXX"; int fd = mkstemp(path); CHECK(fd >= 0); CHECK(close(fd) == 0);
+#endif
         journal *log; CHECK(journal_open(&log, path, f.pool, NULL) == JOURNAL_OK);
         CHECK(journal_insert(log, 1, 0, (const uint8_t *)"a\n a\n", 5) == JOURNAL_OK);
         host_probe host = {.journal = log, .tree = f.tree, .lines = 3, .reject = mode == 2, .fail_insert = mode == 1};
@@ -535,8 +551,10 @@ static void replacement_host_bookkeeping(void)
         printf("S29 host mutation: mode=%u revision=%llu records=%llu lines=%llu\n", mode,
                (unsigned long long)host.revision, (unsigned long long)host.records,
                (unsigned long long)host.lines); fflush(stdout);
-        uint8_t wire[16384]; fd = open(path, O_RDONLY); CHECK(fd >= 0);
-        ssize_t got = read(fd, wire, sizeof wire); CHECK(got > 0); CHECK(close(fd) == 0);
+        uint8_t wire[16384];
+        os_file input = OS_FILE_INIT; CHECK(os_file_open(&input, path, OS_OPEN_READ) == OS_OK);
+        size_t got; CHECK(os_file_read(&input, wire, sizeof wire, &got) == OS_OK && got > 0);
+        os_file_close(&input);
         piece_allocator allocator = {&f, test_alloc, test_free}; piece_tree *recovered = piece_create(&allocator); CHECK(recovered);
         journal_replay_result result;
         CHECK(journal_replay_bytes(wire, (size_t)got, host_replay, recovered, &result) == JOURNAL_OK && !result.corrupt);
@@ -552,7 +570,10 @@ static void replacement_host_bookkeeping(void)
             undo_change change; CHECK(undo_undo(&undo, 1, &change) == 0 && change.groups == 1);
             same(f.tree, (const uint8_t *)"a\n a\n", 5);
         }
-        journal_close(log); CHECK(unlink(path) == 0);
+        journal_close(log); CHECK(os_unlink(path) == OS_OK);
+#if defined(_WIN32)
+        CHECK(os_rmdir(dir) == OS_OK);
+#endif
         undo_destroy(&undo); finish(&f);
     }
     puts("S29: PASS host preflight, newline bookkeeping, partial edit journal/recovery and undo");
@@ -968,6 +989,7 @@ static void search_stage_yields(void)
 /* edit-m15: use the null editor host to check dispatch and clipboard routing,
  * not only the standalone query API. Geometry and settle bound reuse the
  * editor mouse/panel fixtures; byte expectations derive from these strings. */
+#if !defined(_WIN32)
 static void panel_settle(editor *e)
 {
     uint64_t deadline=trace_now_ns()+UINT64_C(5000000000);
@@ -1072,10 +1094,15 @@ static void panel_editing_chords(void)
     puts("edit-m15 find panel: clipboard/query chords isolated from document passed");
 }
 
+#endif
 int main(void)
 {
+#if !defined(_WIN32)
     if (getenv("EDIT_M15_PANEL")) { panel_editing_chords(); return 0; }
     panel_editing_chords();
+#else
+    puts("findui_test: SKIP editor panel clipboard/chord integration (editor not in Windows build)");
+#endif
     if (getenv("EDIT_LEZ_REGEX_WORD")) { whole_word_regex_worker(); return 0; }
     if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
     if (getenv("P4_SPARSE_PAGES")) { sparse_page_work(); return 0; }

@@ -1,10 +1,5 @@
 #include "fif/private.h"
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 static bool stopped(fif_impl *impl, const work_ctx *context)
 {
@@ -47,37 +42,41 @@ static bool directory(fif_impl *impl, const char *path, const work_ctx *context)
     if (stopped(impl, context)) return false;
     /* opendir's libc DIR allocation is confined to directory acquisition;
      * entry storage/sort/search/publication use only the prepaid base arena. */
-    DIR *dir = opendir(path);
-    if (!dir) { io_error(impl); return true; }
-    struct stat st;
-    if (fstat(dirfd(dir), &st)) { io_error(impl); (void)closedir(dir); return true; }
+    os_dir dir = OS_DIR_INIT;
+    if (os_dir_open(&dir, path)) { io_error(impl); return true; }
+    fif_iterator it;
+    if (fif_iter_open(&it, &dir)) { io_error(impl); os_dir_close(&dir); return true; }
+    os_stat st;
+    if (fif_stat_dir(&dir, &st)) { io_error(impl); (void)fif_iter_close(&it); os_dir_close(&dir); return true; }
     for (size_t i = 0; i < impl->seen_count; i++) {
-        if (stopped(impl, context)) { (void)closedir(dir); return false; }
-        if (impl->seen[i].device == st.st_dev && impl->seen[i].inode == st.st_ino) {
-            (void)closedir(dir); return true;
+        if (stopped(impl, context)) { (void)fif_iter_close(&it); os_dir_close(&dir); return false; }
+        if (os_identity_equal(&impl->seen[i], &st.id)) {
+            (void)fif_iter_close(&it); os_dir_close(&dir); return true;
         }
     }
-    impl->seen[impl->seen_count++] = (fif_identity){st.st_dev, st.st_ino};
+    impl->seen[impl->seen_count++] = st.id;
     size_t first = impl->node_count;
     bool ok = true;
     for (;;) {
         if (stopped(impl, context)) { ok = false; break; }
-        errno = 0; struct dirent *entry = readdir(dir);
-        if (!entry) { if (errno) io_error(impl); break; }
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") || !strcmp(entry->d_name, ".git")) continue;
+        const char *name;
+        int rc = fif_iter_next(&it, &name);
+        if (rc || !name) { if (rc) io_error(impl); break; }
+        if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".git")) continue;
         if (impl->node_count == impl->limits.max_entries) {
             impl->done.truncated = true; impl->exhausted = true; ok = false; break;
         }
-        size_t a = strlen(path), b = strlen(entry->d_name);
+        size_t a = strlen(path), b = strlen(name);
         bool slash = a && path[a - 1u] != '/';
         if (a + (slash ? 1u : 0u) + b >= FIF_PATH_BYTES) {
             impl->done.truncated = true; impl->exhausted = true; ok = false; break;
         }
         char *out = impl->nodes[impl->node_count++].path;
         memcpy(out, path, a); if (slash) out[a++] = '/';
-        memcpy(out + a, entry->d_name, b + 1u);
+        memcpy(out + a, name, b + 1u);
     }
-    if (closedir(dir)) io_error(impl);
+    if (fif_iter_close(&it)) io_error(impl);
+    os_dir_close(&dir);
     /* Never search the readdir-order-dependent prefix of an overflowing dir. */
     if (!ok) return false;
     if (!sort_nodes(impl, impl->nodes + first, impl->node_count - first, context)) return false;
@@ -93,18 +92,18 @@ static bool line_end(fif_impl *impl, const work_ctx *context)
     }
     return true;
 }
-static bool read_file(fif_impl *impl, const char *path, const work_ctx *context)
+static bool read_file(fif_impl *impl, const os_dir *parent, const char *name, const char *path, const work_ctx *context)
 {
     if (impl->selected == impl->limits.max_files) { impl->done.truncated = true; impl->exhausted = true; return false; }
     impl->selected++;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0) { io_error(impl); return true; }
-    struct stat st;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0) {
-        io_error(impl); (void)close(fd); return true;
+    os_file file = OS_FILE_INIT;
+    if (os_file_open_at(&file, parent, name, OS_OPEN_READ | OS_OPEN_NOFOLLOW | OS_OPEN_NONBLOCK)) { io_error(impl); return true; }
+    os_stat st;
+    if (os_file_stat(&file, &st) || st.kind != OS_KIND_FILE) {
+        io_error(impl); (void)fif_close_file(&file); return true;
     }
-    if ((uint64_t)st.st_size > impl->limits.max_file_bytes) {
-        impl->done.truncated = true; (void)close(fd); return true;
+    if (st.size > impl->limits.max_file_bytes) {
+        impl->done.truncated = true; (void)fif_close_file(&file); return true;
     }
     size_t length = 0;
     bool ok = true, binary = false, probed = false;
@@ -114,9 +113,8 @@ static bool read_file(fif_impl *impl, const char *path, const work_ctx *context)
         size_t span = capacity < FIF_POLL_BYTES ? capacity : FIF_POLL_BYTES;
         if (!probed && span > FIF_BINARY_BYTES - length) span = FIF_BINARY_BYTES - length;
         if (!span) { impl->done.truncated = true; ok = false; break; }
-        ssize_t n = read(fd, impl->bytes + length, span);
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0) { io_error(impl); ok = false; break; }
+        size_t n;
+        if (os_file_read(&file, impl->bytes + length, span, &n)) { io_error(impl); ok = false; break; }
         if (!n) break;
         length += (size_t)n; impl->done.bytes += (uint64_t)n;
         if (!probed) {
@@ -125,7 +123,7 @@ static bool read_file(fif_impl *impl, const char *path, const work_ctx *context)
         }
         if (length > impl->limits.max_file_bytes) { impl->done.truncated = true; ok = false; break; }
     }
-    if (close(fd)) { io_error(impl); ok = false; }
+    if (fif_close_file(&file)) { io_error(impl); ok = false; }
     if (binary) { impl->done.binary++; return true; }
     if (!ok) return !impl->done.cancelled;
     if (impl->folded) {
@@ -137,8 +135,8 @@ static bool read_file(fif_impl *impl, const char *path, const work_ctx *context)
     impl->length = length; impl->offset = 0; impl->line_start = 0; impl->line = 1;
     if (!line_end(impl, context)) return false;
     impl->current_file = impl->done.files++;
-    fif_file_record *file = &impl->files[impl->current_file]; file->path = path;
-    atomic_store_explicit(&file->ready, true, memory_order_release);
+    fif_file_record *record = &impl->files[impl->current_file]; record->path = path;
+    atomic_store_explicit(&record->ready, true, memory_order_release);
     fif_file_msg payload = {.bytes = length, .file_index = impl->current_file};
     impl->outbox = (work_msg){.kind = FIF_MSG_FILE, .generation = context->generation};
     memcpy(impl->outbox.data, &payload, sizeof payload); impl->pending = true; impl->searching = true;
@@ -153,14 +151,26 @@ static bool next_file(fif_impl *impl, const work_ctx *context)
         const char *path = impl->nodes[frame->first + frame->next++].path;
         const char *rel = relative(impl, path);
         if (fif_filter_excludes(&impl->filter, rel, context)) continue;
-        struct stat st;
-        if (lstat(path, &st)) { io_error(impl); continue; }
-        if (S_ISLNK(st.st_mode)) { impl->done.symlinks++; continue; }
-        if (S_ISDIR(st.st_mode)) {
+        /* Entries are acquired relative to their opened parent. */
+        char parent_path[OS_PATH_MAX]; strcpy(parent_path, path);
+        char *name = strrchr(parent_path, '/');
+        if (!name) { io_error(impl); continue; }
+        *name++ = 0;
+        os_dir parent = OS_DIR_INIT;
+        if (os_dir_open(&parent, *parent_path ? parent_path : "/")) { io_error(impl); continue; }
+        os_stat st;
+        os_err rc = os_stat_at(&parent, name, OS_STAT_NOFOLLOW, &st);
+        if (rc) { os_dir_close(&parent); io_error(impl); continue; }
+        if (st.kind == OS_KIND_LINK) { os_dir_close(&parent); impl->done.symlinks++; continue; }
+        if (st.kind == OS_KIND_DIR) {
+            os_dir_close(&parent);
             if (impl->frames_count > impl->limits.max_depth) { impl->done.truncated = true; continue; }
             if (!directory(impl, path, context)) return false;
-        } else if (S_ISREG(st.st_mode) && fif_filter_matches_work(&impl->filter, rel, context)) {
-            if (!read_file(impl, path, context)) return false;
+        } else {
+            bool ok = st.kind != OS_KIND_FILE || !fif_filter_matches_work(&impl->filter, rel, context) ||
+                      read_file(impl, &parent, name, path, context);
+            os_dir_close(&parent);
+            if (!ok) return false;
             if (impl->searching) return true;
         }
     }
@@ -234,8 +244,8 @@ void fif_worker(work_ctx *context)
         }
         /* edit-n95: the root itself may be a symlink (~/proj -> /data/proj);
          * stat follows it. Entries below the root keep the lstat skip rule. */
-        struct stat st;
-        if (stat(impl->root, &st) || !S_ISDIR(st.st_mode)) {
+        os_stat st;
+        if (os_stat_path(impl->root, 0, &st) || st.kind != OS_KIND_DIR) {
             root_error(impl); impl->search_complete = true; return;
         }
         bool walking = directory(impl, impl->root, context);

@@ -11,12 +11,12 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32 savectl ipc
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32 savectl ipc config fif findui tabs keys menu minimap palette indent
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
-WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c
-WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
+WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS)
+WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker config config_worker fif findui tabs keys menu minimap palette indent
 WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c tests/journal_safety_test.c tests/file_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
 WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
@@ -46,6 +46,11 @@ $(WIN_B)/san/tests/hl_test.exe: WIN_TEST_FLAGS := $(foreach l,$(WIN_HL_OPTIN),$(
 # ASan inlines layout fixtures into a 0x15fd58-byte main frame (objdump),
 # exceeding PE's default 1 MiB reserve. Match this host's Linux 8192 KiB stack.
 $(WIN_B)/san/tests/layout_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
+# findui's replacement_large_match has a 0x2002e8-byte release frame (M,
+# llvm-objdump), above PE's default reserve. Match Linux's 8192 KiB stack.
+$(foreach c,rel san,$(WIN_B)/$(c)/tests/findui_test.exe): WIN_TEST_FLAGS := -Wl,--stack,8388608
+# ASan inlines fif fixtures into main: 0x14f838 bytes (M, llvm-objdump).
+$(WIN_B)/san/tests/fif_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
 WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl journal
 all: $(WIN_TEST_REL)
 $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
@@ -218,6 +223,8 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
 	@echo "Windows journal: transport, retained-BASE transactions, wire/CRC/PAD, PAINT, sharing states and process-death oracles passed"
 	@echo "Windows journal: SKIP editor-dependent group/retire/session/recovery/dataloss integration and first-paint closed-tab restart (editor/platform not ported)"
 	@echo "Windows journal: SKIP src/file save integration (file module not ported); journal_save_prepare/finish/cancel run in journal_safety_test"
+	@echo "Windows dependencies: config/config_worker, fif, findui, tabs, keys, menu, minimap, palette and indent suites passed"
+	@echo "Windows dependencies: SKIP config_editor/config_find and findui panel clipboard/chords (require editor, owned by W2.4b/W2.4c); POSIX chmod and libxkbcommon oracle skipped with native-suite reasons"
 	@echo "Windows check: $(words $(WIN_TEST_REL)) release + $(words $(WIN_TEST_SAN)) sanitizer test binaries passed; ASan negative control passed"
 
 clean:
