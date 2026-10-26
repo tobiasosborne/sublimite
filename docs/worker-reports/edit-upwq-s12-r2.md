@@ -439,3 +439,13 @@ A **real IME engine compose/commit/cancel run remains unavailable**: installed l
 The coordinator must decide whether the unavailable real-IME and physical-monitor coverage is acceptable for landing or requires a later equipped run, and review the asynchronous copy/error policy when wiring editor clipboard feedback. Preserve both the new clipboard source and the platform-test link recipes when combining `mk/win.mk` changes with other W1 work. Existing assignments for editor-side DPI/font-metric rescaling (W2.4) and renderer/editor T6 integration remain as settled in the decision document; this continuation does not reopen them. Renderer producers must still stop before platform shutdown, and owner-thread teardown must occur after the active pump returns.
 
 No additional code fixes were made during report recovery. The only continuation writes are this report and the appended Round 2 decision section; inherited source/test/build-rule contents were fingerprinted before the documentation edits for readback verification.
+
+## Coordinator verification (session 22)
+
+Rebased onto main over W0.5 (mk/win.mk: W0.5's lists plus `win32`). On that tree, (M)[AC, desktop Spiral], load1 1.94 at start:
+
+```
+make TARGET=win -j64 check    → exit 0, 60 results all exit=0 (win32_plat_test rel and san among them)
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:96 make -j64 check   → exit 0, 105 suites, 12:55:41 → 13:19:00, LeakSanitizer on
+```
