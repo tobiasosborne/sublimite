@@ -325,3 +325,13 @@ The cold-publication test's observation window is an estimate (E): the existing 
 ## Coordinator decisions
 
 No new public-contract decision is required. Decide whether/where to arrange Developer Mode/elevation for the native file-symlink fixture and a real visible cloud/HSM data-tag fixture. The per-view native VM descriptor and the explicit fixture limits are recorded in the decision document for review. The coordinator owns commit/tracking and any main-checkout handoff/worklog updates.
+
+## Coordinator verification (session 22)
+
+On the round-2 tree (c4edf77), all (M)[AC, desktop Spiral], load1 0.05 at start:
+
+```
+make TARGET=win -j64 check    → exit 0: os_test 17/17 rel and san; os_win_test 18/19 rel and san (file symlink unavailable, privilege 1314); smoke; --expect-asan fires
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:95 make -j64 check   → exit 0, 105 suites, 09:47:36 → 10:02:21, LeakSanitizer on
+```
