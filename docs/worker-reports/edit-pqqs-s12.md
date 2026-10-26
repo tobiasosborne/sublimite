@@ -178,3 +178,12 @@ The quoted reference-pair count and suite count are (M), emitted by the runner f
 - The X11 reference tool and white-box tests still use the private typed accessor for protocol metadata/fault injection. They remain X11-specific consumers; renderer production code uses only public accessors.
 
 No unrelated defects were changed. Coordinator decisions: integrate the parallel RandR work and carry the aggregate-wake migration into W2; no new platform policy decision is required by this bead.
+
+## Coordinator verification (session 22)
+
+Rebased onto main 5765be1 over edit-v4ee (W1.0a); conflicts and the `x11_posix.c` fix are in the decision doc's merge note. On the merged tree, (M)[AC, desktop Spiral]:
+
+```
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:95 make -j64 check   → exit 0, 105 suites, 10:50:28 → 11:13:00, load1 4.20 at start, LeakSanitizer on
+```
