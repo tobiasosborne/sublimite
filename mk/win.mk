@@ -156,11 +156,11 @@ $(WIN_B)/san/tests/%_test.exe: tests/%_test.c $(WIN_SAN_LIB) $(WIN_MANIFEST_OBJ)
 # --expect-asan red case, which must exit nonzero with an ASan report.
 # The os suite's reparse case reads OS_TEST_DATA_REPARSE: a compact-compressed
 # (WOF reparse tag) file that tools/win_reparse_fixture.sh creates as a Windows
-# process under %TEMP%\sublimite-test-reparse and removes afterwards.
+# process under a per-run %TEMP%\sublimite-test-reparse-<id> and removes afterwards.
 # tools/winrun.sh forwards OS_TEST_CASE and OS_TEST_DATA_REPARSE through WSLENV.
 check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
 	@set -e; fx=$$(tools/win_reparse_fixture.sh create); printf "reparse fixture: %s\n" "$$fx"; \
-	  trap 'tools/win_reparse_fixture.sh remove' EXIT; status=0; \
+	  trap "tools/win_reparse_fixture.sh remove \"$$fx\"" EXIT; status=0; \
 	  for t in $(WIN_TEST_REL) $(WIN_TEST_SAN); do \
 	    echo "== $$t"; \
 	    if OS_TEST_DATA_REPARSE="$$fx" tools/winrun.sh $$t; then echo "RESULT $$t exit=0"; \

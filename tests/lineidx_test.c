@@ -1211,7 +1211,7 @@ static void test_review_polling(bool enlarged)
         enlarged ? "enlarged" : "ordinary", (unsigned long long)atomic_load(&s.cpu_ns),
         (unsigned long long)lineidx_cancel_cpu_ns(x), (unsigned long long)os_thread_cpu_resolution_ns());
 #endif
-    CHECK(atomic_load(&s.cpu_ns) <= 5000000);
+    CHECK(atomic_load(&s.cpu_ns) <= UINT64_C(5000000) + os_thread_cpu_resolution_ns()); /* span CPU: one accounting step of slack, as cancel_cpu_within_bound */
     CHECK(cancel_cpu_within_bound(x));
     CHECK(!lineidx_complete(x));
     lineidx_destroy(x);
