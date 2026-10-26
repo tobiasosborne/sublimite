@@ -155,12 +155,15 @@ lib: $(REL_LIB)
 
 # Install only the release artifacts; all also builds tests and benches.
 # (P) install modes are POSIX executable/data permission conventions.
-install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/sublimite.svg
+ICON_SIZES := 16 24 32 48
+# edit-36b3: hand-tuned bitmaps from tools/mkicon.py beside the scalable icon.
+install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/sublimite.svg $(ICON_SIZES:%=tools/icons/sublimite-%.png)
 	install -d "$(PREFIX)/bin" "$(PREFIX)/share/applications" "$(PREFIX)/share/icons/hicolor/scalable/apps"
 	install -m 755 $(B)/sublimite "$(PREFIX)/bin/sublimite"
 	install -m 755 $(B)/tools/tracedump "$(PREFIX)/bin/tracedump"
 	install -m 644 tools/sublimite.desktop "$(PREFIX)/share/applications/sublimite.desktop"
 	install -m 644 tools/sublimite.svg "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+	@set -e; for s in $(ICON_SIZES); do install -d "$(PREFIX)/share/icons/hicolor/$${s}x$$s/apps"; install -m 644 tools/icons/sublimite-$$s.png "$(PREFIX)/share/icons/hicolor/$${s}x$$s/apps/sublimite.png"; done
 	@if command -v update-desktop-database >/dev/null; then update-desktop-database "$(PREFIX)/share/applications"; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
 	@if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
 	@if command -v xdg-mime >/dev/null; then xdg-mime default sublimite.desktop text/plain; else printf '%s\n' 'Run: xdg-mime default sublimite.desktop text/plain'; fi
@@ -168,6 +171,7 @@ install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/subli
 
 uninstall:
 	rm -f "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+	rm -f $(foreach s,$(ICON_SIZES),"$(PREFIX)/share/icons/hicolor/$(s)x$(s)/apps/sublimite.png")
 	@if command -v update-desktop-database >/dev/null; then if test -d "$(PREFIX)/share/applications"; then update-desktop-database "$(PREFIX)/share/applications"; fi; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
 	@if command -v gtk-update-icon-cache >/dev/null; then if test -d "$(PREFIX)/share/icons/hicolor"; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; fi; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
 

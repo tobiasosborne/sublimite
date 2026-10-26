@@ -20,6 +20,12 @@ cmp build/tools/tracedump "$prefix/bin/tracedump"
 desktop="$prefix/share/applications/sublimite.desktop"
 test -f "$desktop"
 test -s "$prefix/share/icons/hicolor/scalable/apps/sublimite.svg"
+# edit-36b3: the scalable icon is paths only (no font on the target), and the
+# hand-tuned bitmaps are installed at the sizes panels and menus ask for.
+! grep -q '<text\|<use\|<symbol' "$prefix/share/icons/hicolor/scalable/apps/sublimite.svg"
+for size in 16 24 32 48; do
+    cmp "tools/icons/sublimite-$size.png" "$prefix/share/icons/hicolor/${size}x$size/apps/sublimite.png"
+done
 cmp tools/sublimite.desktop "$desktop"
 grep -qx 'Exec=sublimite %F' "$desktop"
 grep -qx 'TryExec=sublimite' "$desktop"
@@ -36,4 +42,7 @@ test ! -e "$prefix/bin/sublimite"
 test ! -e "$prefix/bin/tracedump"
 test ! -e "$desktop"
 test ! -e "$prefix/share/icons/hicolor/scalable/apps/sublimite.svg"
+for size in 16 24 32 48; do
+    test ! -e "$prefix/share/icons/hicolor/${size}x$size/apps/sublimite.png"
+done
 printf '%s\n' 'test_install: release binaries, desktop validation, icon, help, MIME default and uninstall passed'
