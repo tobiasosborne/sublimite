@@ -11,7 +11,7 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32 savectl ipc
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
@@ -33,7 +33,7 @@ WIN_MANIFEST_OBJ := $(WIN_B)/utf8_manifest.o
 # malloc in the san build, where the guard is compiled out and nothing is wrapped.
 WIN_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free
 
-.PHONY: all check clean win-compile
+.PHONY: all check clean win-compile check-savectl-production
 WIN_AR := $(WIN_TOOLCHAIN)/bin/llvm-ar
 WIN_REL_LIB := $(WIN_B)/rel/libcore.a
 WIN_SAN_LIB := $(WIN_B)/san/libcore.a
@@ -241,5 +241,17 @@ $(WIN_B)/san/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/wi
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
+
+# W2.3's controller units refuse unavailable file/journal operations; with
+# file and journal in the Windows build they run against the production symbols.
+ifneq ($(filter file,$(WIN_MODULES)),)
+ifneq ($(filter journal,$(WIN_MODULES)),)
+$(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,savectl_test.exe savectl_reload_test.exe)): WIN_TEST_FLAGS += -DEDIT_WIN_SAVECTL_REAL_DEPS
+endif
+endif
+# Integration gate for the W2.1/W2.2 dependency landing (edit-1kqw).
+check-savectl-production: $(WIN_B)/rel/tests/savectl_test.exe $(WIN_B)/san/tests/savectl_test.exe
+	@set -e; for t in $^; do echo "== $$t"; tools/winrun.sh $$t; done
 
 -include $(shell find $(WIN_B) -name '*.d' 2>/dev/null)
