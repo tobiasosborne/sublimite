@@ -24,6 +24,7 @@
 #include <winioctl.h>
 #include <bcrypt.h>
 #include <shlobj.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
@@ -87,24 +88,45 @@ static struct os_win_state {
     valloc2_fn valloc2;         /* kernelbase placeholder APIs, probed once */
     mapview3_fn mapview3;
     unmap2_fn unmap2;
-    int kb_probed;
+    INIT_ONCE immutable_once;
+    INIT_ONCE cpu_once;
     temp2_fn temp2;             /* GetTempPath2W (build 20348+), NULL before */
-    int temp2_probed;
+
 } os_win_state;
 #define kb os_win_state
+/* Publish the immutable cache as a unit. CPU calibration has its own once:
+ * it calls os_now_ns and must not recurse into the immutable initializer. */
+static BOOL CALLBACK immutable_init(PINIT_ONCE once, PVOID arg, PVOID *ctx)
+{
+    (void)once; (void)arg; (void)ctx;
+    HMODULE m = GetModuleHandleW(L"kernelbase.dll");
+    if (m) {
+        kb.valloc2 = (valloc2_fn)(void *)GetProcAddress(m, "VirtualAlloc2");
+        kb.mapview3 = (mapview3_fn)(void *)GetProcAddress(m, "MapViewOfFile3");
+        kb.unmap2 = (unmap2_fn)(void *)GetProcAddress(m, "UnmapViewOfFile2");
+    }
+    m = GetModuleHandleW(L"kernel32.dll");
+    kb.temp2 = m ? (temp2_fn)(void *)GetProcAddress(m, "GetTempPath2W") : NULL;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    kb.freq = f.QuadPart;
+    GetSystemInfo(&kb.si);
+    return TRUE;
+}
+static void immutable_ready(void)
+{
+    (void)InitOnceExecuteOnce(&kb.immutable_once, immutable_init, NULL, NULL);
+}
 static bool placeholders_ok(void)
 {
-    if (!kb.kb_probed) {
-        HMODULE m = GetModuleHandleW(L"kernelbase.dll");
-        if (m) {
-            kb.valloc2 = (valloc2_fn)(void *)GetProcAddress(m, "VirtualAlloc2");
-            kb.mapview3 = (mapview3_fn)(void *)GetProcAddress(m, "MapViewOfFile3");
-            kb.unmap2 = (unmap2_fn)(void *)GetProcAddress(m, "UnmapViewOfFile2");
-        }
-        kb.kb_probed = 1;
-    }
+    immutable_ready();
     return kb.valloc2 && kb.mapview3 && kb.unmap2;
 }
+/* Expanded only by the white-box supplemental suite; no branch or pointer in
+ * the normal implementation, including its release fault/clock paths. */
+#ifndef OS_WIN_TEST_HOOK
+#define OS_WIN_TEST_HOOK(event, context) ((void)0)
+#endif
 #define SHARE_ALL (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
 #define NS_PER_S 1000000000ull
 /* (P) FILETIME units of 100 ns between 1601-01-01 and 1970-01-01: 11644473600 s. */
@@ -206,9 +228,28 @@ static os_err nt_path(const char *path, WCHAR *out, UNICODE_STRING *us)
     os_err rc = to_wide(path, in, OS_PATH_MAX, NULL);
     if (rc) return rc;
     if (!in[0]) return fail_with(OS_E_NOENT);
+    for (WCHAR *at = in; *at; at++) if (*at == L'/') *at = L'\\';
+    WCHAR *leaf = wcsrchr(in, L'\\');
+    leaf = leaf ? leaf + 1 : in + (in[0] && in[1] == L':' ? 2 : 0);
+    WCHAR literal[OS_PATH_MAX];
+    size_t units = wcslen(leaf);
+    bool keep = units && wcscmp(leaf, L".") && wcscmp(leaf, L"..");
+    if (keep) {
+        memcpy(literal, leaf, (units + 1) * sizeof(WCHAR));
+        /* Normalise a harmless final component, then append the literal name.
+         * Win32 otherwise silently trims a final period or space. */
+        leaf[0] = L'x'; leaf[1] = 0;
+    }
     DWORD n = GetFullPathNameW(in, OS_PATH_MAX, full, NULL);
     if (!n) return fail();
     if (n >= OS_PATH_MAX) return fail_with(OS_E_NAMETOOLONG);
+    if (keep) {
+        WCHAR *tail = wcsrchr(full, L'\\');
+        if (!tail) return fail_with(OS_E_INVAL);
+        size_t parent = (size_t)(tail + 1 - full);
+        if (units >= OS_PATH_MAX - parent) return fail_with(OS_E_NAMETOOLONG);
+        memcpy(full + parent, literal, (units + 1) * sizeof(WCHAR));
+    }
     const WCHAR *rest = full, *pre = L"\\??\\";
     if ((full[0] == L'\\' && full[1] == L'\\') && (full[2] == L'?' || full[2] == L'.') && full[3] == L'\\')
         rest = full + 4;
@@ -257,7 +298,7 @@ static void close_keep(HANDLE h)
 /* ---- clocks, sleep ------------------------------------------------------ */
 static uint64_t qpc_freq(void)
 {
-    if (!os_win_state.freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); os_win_state.freq = f.QuadPart; }
+    immutable_ready();
     return (uint64_t)os_win_state.freq;
 }
 uint64_t os_now_ns(void)
@@ -277,16 +318,21 @@ uint64_t os_thread_cpu_ns(void)
 /* Measured at first use: the smallest step GetThreadTimes moves by while this
  * thread spins, over 4 steps (P: 4 x 15.625 ms = 62.5 ms at the default
  * scheduler tick, the suite's own 40 ms spin sees at most 3). */
-uint64_t os_thread_cpu_resolution_ns(void)
+static BOOL CALLBACK cpu_resolution_init(PINIT_ONCE once, PVOID arg, PVOID *ctx)
 {
-    if (os_win_state.cpu_res) return os_win_state.cpu_res;
+    (void)once; (void)arg; (void)ctx;
     uint64_t best = UINT64_MAX, prev = os_thread_cpu_ns(), guard = os_now_ns() + NS_PER_S;
     for (int steps = 0; steps < 4 && os_now_ns() < guard;) {
         uint64_t c = os_thread_cpu_ns();
         if (c > prev) { if (c - prev < best) best = c - prev; prev = c; steps++; }
     }
     os_win_state.cpu_res = best == UINT64_MAX ? 100u : best;   /* 100 ns: one FILETIME unit, the floor */
-    return os_win_state.cpu_res;
+    return TRUE;
+}
+uint64_t os_thread_cpu_resolution_ns(void)
+{
+    (void)InitOnceExecuteOnce(&kb.cpu_once, cpu_resolution_init, NULL, NULL);
+    return kb.cpu_res;
 }
 uint64_t os_slice_ns(void) { return os_now_ns(); }   /* QPC: elapsed bounds CPU time from above (os.h) */
 uint64_t os_wall_ns(void)
@@ -469,10 +515,12 @@ static os_err stat_handle(HANDLE h, os_stat *st)
     os_err rc = identity_of(h, &st->id);
     if (rc) return rc;
     DWORD attrs = b.FileAttributes, tag = 0;
-    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) &&
-        GetFileInformationByHandleEx(h, FileAttributeTagInfo, &t, sizeof t)) tag = t.ReparseTag;
-    if (attrs & FILE_ATTRIBUTE_DIRECTORY) st->kind = OS_KIND_DIR;
-    else if (tag && IsReparseTagNameSurrogate(tag)) st->kind = OS_KIND_LINK;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+        if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &t, sizeof t)) return fail();
+        tag = t.ReparseTag;
+    }
+    if (tag && IsReparseTagNameSurrogate(tag)) st->kind = OS_KIND_LINK;
+    else if (attrs & FILE_ATTRIBUTE_DIRECTORY) st->kind = OS_KIND_DIR;
     else if (tag && special_tag(tag)) st->kind = OS_KIND_OTHER;
     else if (GetFileType(h) != FILE_TYPE_DISK) st->kind = OS_KIND_OTHER;
     else st->kind = OS_KIND_FILE;
@@ -545,24 +593,41 @@ static os_err open_file(os_file *out, HANDLE root, UNICODE_STRING *name, unsigne
     unsigned mode = flags & (OS_OPEN_READ | OS_OPEN_WRITE | OS_OPEN_RDWR);
     if (mode != OS_OPEN_READ && mode != OS_OPEN_WRITE && mode != OS_OPEN_RDWR) return fail_with(OS_E_INVAL);
     if ((flags & OS_OPEN_TRUNC) && mode == OS_OPEN_READ) return fail_with(OS_E_INVAL);
-    /* Every handle may read and write attributes (os_file_stat, os_file_set_mode
-     * on read-only opens); data access follows the mode. */
-    ACCESS_MASK access = SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
+    ACCESS_MASK access = SYNCHRONIZE;
     if (mode != OS_OPEN_WRITE) access |= FILE_GENERIC_READ;
     if (mode != OS_OPEN_READ) access |= FILE_GENERIC_WRITE;
+    bool nofollow = (flags & OS_OPEN_NOFOLLOW) != 0;
+    if (nofollow) access |= FILE_READ_ATTRIBUTES;   /* required for tag inspection */
     ULONG disp;
     if (flags & OS_OPEN_CREATE) {
         if (flags & OS_OPEN_EXCL) disp = FILE_CREATE;
-        else disp = (flags & OS_OPEN_TRUNC) ? FILE_OVERWRITE_IF : FILE_OPEN_IF;
-    } else disp = (flags & OS_OPEN_TRUNC) ? FILE_OVERWRITE : FILE_OPEN;
-    ULONG options = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
-    if (flags & OS_OPEN_NOFOLLOW) options |= FILE_OPEN_REPARSE_POINT;
+        else disp = !nofollow && (flags & OS_OPEN_TRUNC) ? FILE_OVERWRITE_IF : FILE_OPEN_IF;
+    } else disp = !nofollow && (flags & OS_OPEN_TRUNC) ? FILE_OVERWRITE : FILE_OPEN;
+    /* NOFOLLOW must open directories too: junctions are name surrogates,
+     * and CREATE|EXCL must report a collision before any link inspection,
+     * including when the caller otherwise allows following. */
+    ULONG options = FILE_SYNCHRONOUS_IO_NONALERT |
+                    (nofollow || disp == FILE_CREATE ? FILE_OPEN_REPARSE_POINT : FILE_NON_DIRECTORY_FILE);
     HANDLE h;
     NTSTATUS s = nt_open(&h, root, name, access, disp, options, FILE_ATTRIBUTE_NORMAL);
     if (!NT_SUCCESS(s)) return fail_nt(s);
-    if (flags & OS_OPEN_NOFOLLOW) {
+    if (nofollow) {
         os_err rc = reparse_reopen(&h, root, name, access, options, true);
         if (rc) return rc;
+        FILE_STANDARD_INFO info;
+        if (!GetFileInformationByHandleEx(h, FileStandardInfo, &info, sizeof info)) {
+            rc = fail(); close_keep(h); return rc;
+        }
+        if (info.Directory) { close_keep(h); return fail_with(OS_E_ISDIR); }
+        /* One EOF update on the validated data handle. No destructive bypass
+         * open, and no second pathname resolution between validation/truncation. */
+        if (flags & OS_OPEN_TRUNC) {
+            FILE_END_OF_FILE_INFO eof;
+            eof.EndOfFile.QuadPart = 0;
+            if (!SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof)) {
+                rc = fail(); close_keep(h); return rc;
+            }
+        }
     }
     out->handle = h;
     return OS_OK;
@@ -600,25 +665,33 @@ os_err os_file_open_anon(os_file *out, const os_dir *dir)
     if (rc) return rc;
     char name[40];
     snprintf(name, sizeof name, ".anon-%016llx", (unsigned long long)nonce);
-    rc = os_file_open_at(out, dir, name, OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_EXCL);
-    if (rc) return rc;
     WCHAR w[OS_NAME_MAX];
     UNICODE_STRING us;
-    HANDLE del;
     (void)rel_name(name, w, &us);
-    NTSTATUS s = nt_open(&del, dir->handle, &us, DELETE, FILE_OPEN,
-                         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, 0);
-    rc = NT_SUCCESS(s) ? set_disposition(del, NT_FILE_DISPOSITION_DELETE | NT_FILE_DISPOSITION_POSIX_SEMANTICS)
-                       : fail_nt(s);
-    if (NT_SUCCESS(s)) close_keep(del);
+    HANDLE data, del;
+    NTSTATUS s = nt_open(&data, dir->handle, &us, FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                         FILE_CREATE, FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, FILE_ATTRIBUTE_NORMAL);
+    if (!NT_SUCCESS(s)) return fail_nt(s);
+    s = nt_open(&del, dir->handle, &us, DELETE, FILE_OPEN,
+                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, 0);
+    if (NT_SUCCESS(s)) {
+        os_identity a, b;
+        rc = identity_of(data, &a);
+        if (!rc) rc = identity_of(del, &b);
+        if (!rc && !os_identity_equal(&a, &b)) { SetLastError(ERROR_SHARING_VIOLATION); rc = OS_E_BUSY; }
+        if (!rc) rc = set_disposition(del, NT_FILE_DISPOSITION_DELETE | NT_FILE_DISPOSITION_POSIX_SEMANTICS);
+        close_keep(del);
+    } else rc = fail_nt(s);
     if (rc) {
-        /* No POSIX delete here (not NTFS): give the name back and report. */
+        /* Cleanup authority belongs to the created object even if its name
+         * moved. Never unlink the entry found at the old random name. */
         DWORD e = GetLastError();
-        os_file_close(out);
-        (void)os_unlink_at(dir, name);
+        (void)set_disposition(data, NT_FILE_DISPOSITION_DELETE | NT_FILE_DISPOSITION_POSIX_SEMANTICS);
+        close_keep(data);
         SetLastError(e);
         return rc == OS_E_INVAL || rc == OS_E_NOTSUP ? OS_E_NOTSUP : rc;
     }
+    out->handle = data;
     return OS_OK;
 }
 void os_file_close(os_file *f)
@@ -693,7 +766,29 @@ os_err os_file_pwrite_once(os_file *f, const void *buf, size_t n, uint64_t offse
 {
     return os_file_pwrite(f, buf, n, offset, done);
 }
-os_err os_file_stat(const os_file *f, os_stat *st) { return stat_handle(H(f), st); }
+/* Additional metadata access is requested only by the operation that needs
+ * it, never as a precondition for a read/write-data open. ReOpenFile follows
+ * the existing object rather than resolving its possibly replaced path. */
+static os_err metadata_handle(HANDLE data, DWORD access, HANDLE *out)
+{
+    *out = ReOpenFile(data, access, SHARE_ALL, 0);
+    if (*out == INVALID_HANDLE_VALUE) return fail();
+    os_identity a, b;
+    os_err rc = identity_of(data, &a);
+    if (!rc) rc = identity_of(*out, &b);
+    if (!rc && !os_identity_equal(&a, &b)) rc = fail_with(OS_E_BUSY);
+    if (rc) { close_keep(*out); *out = INVALID_HANDLE_VALUE; }
+    return rc;
+}
+os_err os_file_stat(const os_file *f, os_stat *st)
+{
+    os_err rc = stat_handle(H(f), st);
+    if (rc != OS_E_ACCESS) return rc;
+    HANDLE meta;
+    rc = metadata_handle(H(f), FILE_READ_ATTRIBUTES, &meta);
+    if (!rc) { rc = stat_handle(meta, st); close_keep(meta); }
+    return rc;
+}
 os_err os_file_set_size(os_file *f, uint64_t size)
 {
     if (size > (uint64_t)INT64_MAX) return fail_with(OS_E_INVAL);
@@ -713,8 +808,12 @@ os_err os_file_sync_data(os_file *f) { return FlushFileBuffers(H(f)) ? OS_OK : f
 /* Only the owner-write bit has a Windows form: FILE_ATTRIBUTE_READONLY. */
 os_err os_file_set_mode(os_file *f, uint32_t perm)
 {
+    HANDLE meta;
+    os_err rc = metadata_handle(H(f), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, &meta);
+    if (rc) return rc;
     FILE_BASIC_INFO b;
-    if (!GetFileInformationByHandleEx(H(f), FileBasicInfo, &b, sizeof b)) return fail();
+    if (!rc && !GetFileInformationByHandleEx(meta, FileBasicInfo, &b, sizeof b)) rc = fail();
+    if (rc) { close_keep(meta); return rc; }
     DWORD attrs = b.FileAttributes;
     if (perm & 0200u) attrs &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
     else attrs |= FILE_ATTRIBUTE_READONLY;
@@ -722,23 +821,48 @@ os_err os_file_set_mode(os_file *f, uint32_t perm)
     if (!attrs) attrs = FILE_ATTRIBUTE_NORMAL;
     memset(&b, 0, sizeof b);   /* zero times = unchanged */
     b.FileAttributes = attrs;
-    return SetFileInformationByHandle(H(f), FileBasicInfo, &b, sizeof b) ? OS_OK : fail();
+    rc = SetFileInformationByHandle(meta, FileBasicInfo, &b, sizeof b) ? OS_OK : fail();
+    close_keep(meta);
+    return rc;
 }
 /* No reflink on NTFS (os.h): the caller copies. */
 os_err os_file_clone(os_file *dst, const os_file *src) { (void)dst; (void)src; return fail_with(OS_E_NOTSUP); }
+static os_err fail_crt(int e)
+{
+    DWORD native;
+    switch (e) {
+    case ENOMEM: native = ERROR_NOT_ENOUGH_MEMORY; break;
+    case EMFILE: native = ERROR_TOO_MANY_OPEN_FILES; break;
+    case EACCES: native = ERROR_ACCESS_DENIED; break;
+    case EBADF: native = ERROR_INVALID_HANDLE; break;
+    case EINVAL: native = ERROR_INVALID_PARAMETER; break;
+    case ENOSPC: native = ERROR_DISK_FULL; break;
+    default: native = ERROR_GEN_FAILURE; break;
+    }
+    SetLastError(native);
+    return map_win(native);
+}
 os_err os_file_to_stdio(os_file *f, const char *mode, FILE **out)
 {
     *out = NULL;
     if (!mode || !os_file_is_open(f)) return fail_with(OS_E_INVAL);
+    HANDLE dup;
+    if (!DuplicateHandle(GetCurrentProcess(), H(f), GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) return fail();
     int oflags = _O_BINARY;
     if (mode[0] == 'r' && !strchr(mode, '+')) oflags |= _O_RDONLY;
     if (mode[0] == 'a') oflags |= _O_APPEND;
-    int fd = _open_osfhandle((intptr_t)H(f), oflags);
-    if (fd < 0) return fail_with(OS_E_NOMEM);
+    int fd = _open_osfhandle((intptr_t)dup, oflags);
+    if (fd < 0) { os_err rc = fail_crt(errno); close_keep(dup); return rc; }
     FILE *fp = _fdopen(fd, mode);
-    if (!fp) { os_err rc = fail_with(OS_E_INVAL); (void)_close(fd); f->handle = INVALID_HANDLE_VALUE; return rc; }
+    if (!fp) {
+        os_err rc = fail_crt(errno);
+        DWORD e = GetLastError();
+        (void)_close(fd);
+        SetLastError(e);
+        return rc;
+    }
     *out = fp;
-    f->handle = INVALID_HANDLE_VALUE;   /* the FILE owns the handle now */
+    os_file_close(f);
     return OS_OK;
 }
 
@@ -907,9 +1031,16 @@ os_err os_mkdir(const char *path)
 static os_err delete_h(HANDLE root, UNICODE_STRING *name, bool directory)
 {
     HANDLE h;
-    ULONG options = FILE_OPEN_REPARSE_POINT | (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
-    NTSTATUS s = nt_open(&h, root, name, DELETE | FILE_WRITE_ATTRIBUTES, FILE_OPEN, options, 0);
+    NTSTATUS s = nt_open(&h, root, name, DELETE | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+                         FILE_OPEN, FILE_OPEN_REPARSE_POINT, 0);
     if (!NT_SUCCESS(s)) return fail_nt(s);
+    FILE_ATTRIBUTE_TAG_INFO info;
+    if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof info)) {
+        os_err rc = fail(); close_keep(h); return rc;
+    }
+    bool link = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(info.ReparseTag);
+    bool is_dir = !link && (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    if (directory != is_dir) { close_keep(h); return fail_with(directory ? OS_E_NOTDIR : OS_E_ISDIR); }
     ULONG flags = NT_FILE_DISPOSITION_DELETE | NT_FILE_DISPOSITION_POSIX_SEMANTICS |
                   (directory ? 0 : NT_FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE);
     os_err rc = set_disposition(h, flags);
@@ -1027,9 +1158,8 @@ os_err os_dir_next(os_dir_iter *it, const char **name)
         int units = (int)(e->FileNameLength / sizeof(WCHAR));
         if ((units == 1 && e->FileName[0] == L'.') ||
             (units == 2 && e->FileName[0] == L'.' && e->FileName[1] == L'.')) continue;
-        int n = WideCharToMultiByte(CP_UTF8, 0, e->FileName, units, it->name, (int)sizeof it->name - 1, NULL, NULL);
-        if (n <= 0) continue;   /* a name UTF-8 cannot carry: skipped */
-        it->name[n] = 0;
+        os_err rc = to_utf8(e->FileName, units, it->name, sizeof it->name);
+        if (rc) return rc;
         *name = it->name;
         return OS_OK;
     }
@@ -1123,11 +1253,7 @@ os_err os_app_dir(os_app_dir_kind kind, char *out, size_t cap)
 }
 os_err os_temp_dir(char *out, size_t cap)
 {
-    if (!os_win_state.temp2_probed) {
-        HMODULE k = GetModuleHandleW(L"kernel32.dll");
-        os_win_state.temp2 = k ? (temp2_fn)(void *)GetProcAddress(k, "GetTempPath2W") : NULL;
-        os_win_state.temp2_probed = 1;
-    }
+    immutable_ready();
     WCHAR w[OS_PATH_MAX];
     DWORD n = os_win_state.temp2 ? os_win_state.temp2(OS_PATH_MAX, w) : GetTempPathW(OS_PATH_MAX, w);
     if (!n) return fail();
@@ -1164,7 +1290,7 @@ os_err os_env_set(const char *name, const char *value)
 /* ---- memory ------------------------------------------------------------- */
 static SYSTEM_INFO *sysinfo(void)
 {
-    if (!os_win_state.si.dwPageSize) GetSystemInfo(&os_win_state.si);
+    immutable_ready();
     return &os_win_state.si;
 }
 size_t os_page_size(void) { return sysinfo()->dwPageSize; }
@@ -1176,9 +1302,43 @@ uint64_t os_phys_mem_bytes(void)
     return GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
 }
 static size_t round_page(size_t n) { size_t p = os_page_size(); return (n + p - 1) & ~(p - 1); }
-/* os.h recipe: a section of the file's current size, a placeholder of the
- * page-rounded extent, and a view replacing the placeholder, so recovery can
- * split it (fault service). A range past the end of the file is OS_E_RANGE. */
+/* The private section field points at this VM descriptor (no CRT heap).
+ * The descriptor owns the native section and at most two address pieces:
+ * a file prefix and a zero suffix, or their placeholders after a failed step.
+ * Registration pins this descriptor; duplicate registrations share its lock
+ * and epoch. It survives retirement until os_unmap, so cleanup needs no
+ * registry lookup and never queries an address it has already released. */
+typedef enum map_piece_kind { PIECE_NONE, PIECE_FILE, PIECE_ZERO, PIECE_PLACEHOLDER } map_piece_kind;
+typedef struct map_piece {
+    void *addr;
+    size_t len;
+    map_piece_kind kind;
+} map_piece;
+typedef struct map_owner {
+    HANDLE section;
+    uintptr_t addr;
+    size_t len, extent;
+    uint64_t offset;
+    map_piece pieces[2];
+    _Atomic int busy;
+    _Atomic uint64_t epoch;
+    bool failed;
+} map_owner;
+
+/* Preserve the native acquisition error unless the same handle proves that
+ * the requested range disappeared after the first size query (§9.2). */
+static os_err map_acquire_error(const os_file *f, uint64_t end)
+{
+    DWORD e = GetLastError();
+    LARGE_INTEGER size;
+    if (GetFileSizeEx(H(f), &size) && (size.QuadPart < 0 || end > (uint64_t)size.QuadPart)) {
+        SetLastError(e);
+        return OS_E_RANGE;
+    }
+    SetLastError(e);
+    return map_win(e);
+}
+/* os.h recipe: section + page-rounded placeholder + read-only view. */
 os_err os_map_file(os_map *out, const os_file *f, uint64_t offset, size_t len)
 {
     out->addr = NULL;
@@ -1192,44 +1352,49 @@ os_err os_map_file(os_map *out, const os_file *f, uint64_t offset, size_t len)
     if (size.QuadPart < 0 || offset + len > (uint64_t)size.QuadPart) return fail_with(OS_E_RANGE);
     if (!placeholders_ok()) return fail_with(OS_E_NOTSUP);
     HANDLE sec = CreateFileMappingW(H(f), NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!sec) return fail();
+    if (!sec) return map_acquire_error(f, offset + len);
     size_t extent = round_page(len);
+    map_owner *owner = VirtualAlloc(NULL, sizeof *owner, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!owner) { os_err rc = fail(); close_keep(sec); return rc; }
     void *base = kb.valloc2(GetCurrentProcess(), NULL, extent, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                               PAGE_NOACCESS, NULL, 0);
-    if (!base) { os_err rc = fail(); close_keep(sec); return rc; }
-    /* ViewSize is the LOGICAL length (M, probe: 3 bytes of a 3-byte file map;
-     * the page-rounded 4096 fails ERROR_ACCESS_DENIED past the section's byte
-     * size); the view still occupies the page-rounded placeholder. */
+                           PAGE_NOACCESS, NULL, 0);
+    if (!base) { os_err rc = fail(); VirtualFree(owner, 0, MEM_RELEASE); close_keep(sec); return rc; }
+    /* Logical ViewSize can be shorter than a page at EOF (frozen map case). */
     void *view = kb.mapview3(sec, GetCurrentProcess(), base, offset, len, MEM_REPLACE_PLACEHOLDER,
-                                PAGE_READONLY, NULL, 0);
+                             PAGE_READONLY, NULL, 0);
     if (!view) {
-        os_err rc = fail();
+        os_err rc = map_acquire_error(f, offset + len);
         VirtualFree(base, 0, MEM_RELEASE);
+        VirtualFree(owner, 0, MEM_RELEASE);
         close_keep(sec);
         return rc;
     }
+    owner->section = sec;
+    owner->addr = (uintptr_t)view;
+    owner->len = len;
+    owner->extent = extent;
+    owner->offset = offset;
+    owner->pieces[0] = (map_piece){view, extent, PIECE_FILE};
+    atomic_init(&owner->busy, 0);
+    atomic_init(&owner->epoch, 0);
     out->addr = view;
     out->len = len;
-    out->section = sec;
+    out->section = owner;
     out->offset = offset;
     return OS_OK;
 }
-/* Releases every piece of a view: the file-backed prefix (a view) and, after
- * recoveries, the committed zero suffix (private pages); then the section. */
 void os_unmap(os_map *m)
 {
     if (!m->addr) return;
     DWORD e = GetLastError();
-    uintptr_t p = (uintptr_t)m->addr, end = p + round_page(m->len);
-    while (p < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((void *)p, &mbi, sizeof mbi) || !mbi.RegionSize) break;
-        if (mbi.State == MEM_FREE) { p += mbi.RegionSize; continue; }
-        BOOL ok = mbi.Type == MEM_MAPPED ? UnmapViewOfFile(mbi.AllocationBase)
-                                          : VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
-        if (!ok) p += mbi.RegionSize;   /* do not spin on a piece that will not go */
+    map_owner *owner = m->section;
+    for (size_t i = 0; i < sizeof owner->pieces / sizeof owner->pieces[0]; i++) {
+        map_piece piece = owner->pieces[i];
+        if (piece.kind == PIECE_FILE) (void)UnmapViewOfFile(piece.addr);
+        else if (piece.kind != PIECE_NONE) (void)VirtualFree(piece.addr, 0, MEM_RELEASE);
     }
-    if (m->section) CloseHandle((HANDLE)m->section);
+    CloseHandle(owner->section);
+    VirtualFree(owner, 0, MEM_RELEASE);
     SetLastError(e);
     m->addr = NULL;
     m->len = 0;
@@ -1277,9 +1442,9 @@ void os_vm_release(void *addr, size_t len)
 /* The file module's slot algorithm (os_posix.c, P1.7c §§1, 2, 9) under a
  * vectored exception handler. EXCEPTION_IN_PAGE_ERROR inside a LIVE slot:
  * count the epoch, then split the view at the faulting page (the os.h
- * recipe) with the slot marked busy; an access violation inside a busy slot
- * is a reader that hit the placeholder mid-split and is retried once the
- * split is done. The one mapped piece of a recovered view is always its
+ * recipe) with the view marked busy; a read access violation is retried only
+ * after serialization and verification of the current owned readable piece,
+ * including dispatch delayed until after a split. The one mapped piece of a recovered view is always its
  * prefix, so a remap reads from the view's own offset. Registered LAST
  * (AddVectoredExceptionHandler first = 0): AddressSanitizer commits its
  * shadow pages from a vectored handler of its own, and this handler is
@@ -1297,12 +1462,7 @@ void os_vm_release(void *addr, size_t len)
 #define SLOT_READER 4u
 typedef struct fault_slot {
     _Atomic uint32_t state;
-    _Atomic int busy;
-    uintptr_t addr;
-    size_t len, extent;
-    HANDLE section;
-    uint64_t offset;
-    _Atomic uint64_t epoch;
+    map_owner *owner;
 } fault_slot;
 typedef struct fault_service {
     fault_slot slots[OS_FAULT_SLOTS];
@@ -1313,33 +1473,72 @@ typedef struct fault_service {
 } fault_service;
 static fault_service os_fault_service;
 
-static bool split_view(fault_slot *s, uintptr_t from)
+static bool piece_readable(const map_piece *piece, uintptr_t a)
 {
-    HANDLE me = GetCurrentProcess();
+    if (piece->kind != PIECE_FILE && piece->kind != PIECE_ZERO) return false;
+    if (a < (uintptr_t)piece->addr || a - (uintptr_t)piece->addr >= piece->len) return false;
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((void *)from, &mbi, sizeof mbi)) return false;
-    if (mbi.Type != MEM_MAPPED) return true;   /* already zero pages (an earlier split) */
-    uintptr_t piece = (uintptr_t)mbi.AllocationBase, piece_end = piece;
-    /* The mapped prefix piece: every region sharing its allocation base. */
-    for (;;) {
-        if (!VirtualQuery((void *)piece_end, &mbi, sizeof mbi) || (uintptr_t)mbi.AllocationBase != piece ||
-            mbi.State == MEM_FREE) break;
-        piece_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (piece_end >= s->addr + s->extent) { piece_end = s->addr + s->extent; break; }
-    }
-    if (!kb.unmap2(me, (void *)piece, MEM_PRESERVE_PLACEHOLDER)) return false;
-    bool ok = true;
-    if (from > piece) {
-        if (!VirtualFree((void *)piece, from - piece, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) ok = false;
-        else if (!kb.mapview3(s->section, me, (void *)piece, s->offset + (piece - s->addr), from - piece,
-                                 MEM_REPLACE_PLACEHOLDER, PAGE_READONLY, NULL, 0)) ok = false;
-    }
-    if (!kb.valloc2(me, (void *)from, piece_end - from, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-                       PAGE_READONLY, NULL, 0)) ok = false;
-    return ok;
+    if (!VirtualQuery((void *)a, &mbi, sizeof mbi) || mbi.AllocationBase != piece->addr ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    if (mbi.Type != (piece->kind == PIECE_FILE ? MEM_MAPPED : MEM_PRIVATE)) return false;
+    return (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
-/* in_page: a lost-backing fault to recover; otherwise an access violation,
- * recoverable only as a retry inside a slot that is mid-split. */
+static bool owned_readable(map_owner *owner, uintptr_t a)
+{
+    return !owner->failed && (piece_readable(&owner->pieces[0], a) || piece_readable(&owner->pieces[1], a));
+}
+/* Convert one *owned* allocation to a placeholder and record every successful
+ * topology change before attempting the next fallible native call. */
+static bool preserve_piece(map_piece *piece)
+{
+    if (piece->kind == PIECE_NONE || piece->kind == PIECE_PLACEHOLDER) return true;
+    BOOL ok = piece->kind == PIECE_FILE
+        ? kb.unmap2(GetCurrentProcess(), piece->addr, MEM_PRESERVE_PLACEHOLDER)
+        : VirtualFree(piece->addr, piece->len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (ok) piece->kind = PIECE_PLACEHOLDER;
+    return ok != FALSE;
+}
+static bool split_view(map_owner *owner, uintptr_t from)
+{
+    if (owner->failed) return false;
+    map_piece *prefix = &owner->pieces[0], *suffix = &owner->pieces[1];
+    /* A pagefile failure in an existing zero range needs new pages, not an
+     * endless retry of the page that failed. Keep the reservation owned. */
+    map_piece *zero = prefix->kind == PIECE_ZERO ? prefix : suffix;
+    if (zero->kind == PIECE_ZERO && from >= (uintptr_t)zero->addr && from - (uintptr_t)zero->addr < zero->len) {
+        if (!piece_readable(zero, from)) goto failed;
+        if (!VirtualFree(zero->addr, zero->len, MEM_DECOMMIT)) goto failed;
+        if (VirtualAlloc(zero->addr, zero->len, MEM_COMMIT, PAGE_READONLY)) return true;
+        /* The reservation still belongs to us even when commit failed. */
+        owner->failed = true;
+        return false;
+    }
+    if (prefix->kind != PIECE_FILE || !piece_readable(prefix, from)) goto failed;
+    if (!preserve_piece(prefix) || !preserve_piece(suffix)) goto failed;
+    if (suffix->kind != PIECE_NONE) {
+        if (!VirtualFree(prefix->addr, owner->extent, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) goto failed;
+        prefix->len = owner->extent;
+        *suffix = (map_piece){0};
+    }
+    size_t before = from - owner->addr;
+    if (before) {
+        if (!VirtualFree(prefix->addr, before, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) goto failed;
+        prefix->len = before;
+        *suffix = (map_piece){(void *)from, owner->extent - before, PIECE_PLACEHOLDER};
+        if (!kb.mapview3(owner->section, GetCurrentProcess(), prefix->addr, owner->offset, before,
+                          MEM_REPLACE_PLACEHOLDER, PAGE_READONLY, NULL, 0)) goto failed;
+        prefix->kind = PIECE_FILE;
+        zero = suffix;
+    } else zero = prefix;
+    if (!kb.valloc2(GetCurrentProcess(), zero->addr, zero->len, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                     PAGE_READONLY, NULL, 0)) goto failed;
+    zero->kind = PIECE_ZERO;
+    return true;
+failed:
+    owner->failed = true;
+    return false;
+}
 static int fault_recover(uintptr_t a, bool in_page)
 {
     for (int i = 0; i < OS_FAULT_SLOTS; i++) {
@@ -1349,29 +1548,29 @@ static int fault_recover(uintptr_t a, bool in_page)
             if ((state & SLOT_PHASE) != SLOT_LIVE || state > UINT32_MAX - SLOT_READER) break;
             if (atomic_compare_exchange_weak_explicit(&slot->state, &state, state + SLOT_READER,
                                                      memory_order_acquire, memory_order_relaxed)) {
-                uintptr_t base = slot->addr;
-                size_t extent = slot->extent;
-                if (a < base || a - base >= extent) {
+                map_owner *owner = slot->owner;
+                if (a < owner->addr || a - owner->addr >= owner->extent) {
                     atomic_fetch_sub_explicit(&slot->state, SLOT_READER, memory_order_release);
                     break;
                 }
-                int recovered;
+                OS_WIN_TEST_HOOK("admitted", owner);
                 int zero = 0;
-                if (!atomic_compare_exchange_strong_explicit(&slot->busy, &zero, 1, memory_order_acq_rel,
-                                                             memory_order_acquire)) {
-                    /* Another thread is splitting this view: wait, then retry the read. */
-                    while (atomic_load_explicit(&slot->busy, memory_order_acquire)) SwitchToThread();
-                    recovered = 1;
-                } else if (!in_page) {
-                    atomic_store_explicit(&slot->busy, 0, memory_order_release);
-                    recovered = 0;   /* a genuine access violation in a quiet view */
+                while (!atomic_compare_exchange_weak_explicit(&owner->busy, &zero, 1, memory_order_acquire,
+                                                               memory_order_relaxed)) {
+                    zero = 0;
+                    SwitchToThread();
+                }
+                int recovered;
+                if (!in_page) {
+                    /* Dispatch can be delayed until AFTER a split clears busy.
+                     * Retry only a read whose address is now owned/readable. */
+                    recovered = owned_readable(owner, a);
                 } else {
                     uintptr_t from = a & ~(os_fault_service.page_size - 1u);
-                    /* Count BEFORE the zero pages become visible to readers. */
-                    atomic_fetch_add_explicit(&slot->epoch, 1, memory_order_release);
-                    recovered = split_view(slot, from);
-                    atomic_store_explicit(&slot->busy, 0, memory_order_release);
+                    atomic_fetch_add_explicit(&owner->epoch, 1, memory_order_release);
+                    recovered = split_view(owner, from);
                 }
+                atomic_store_explicit(&owner->busy, 0, memory_order_release);
                 atomic_fetch_sub_explicit(&slot->state, SLOT_READER, memory_order_release);
                 return recovered;
             }
@@ -1383,7 +1582,7 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *ep)
 {
     const EXCEPTION_RECORD *r = ep->ExceptionRecord;
     if ((r->ExceptionCode != EXCEPTION_IN_PAGE_ERROR && r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) ||
-        r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+        r->NumberParameters < 2 || r->ExceptionInformation[0] != 0) return EXCEPTION_CONTINUE_SEARCH;
     DWORD saved = GetLastError();
     int recovered = fault_recover((uintptr_t)r->ExceptionInformation[1], r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR);
     SetLastError(saved);
@@ -1395,8 +1594,7 @@ static BOOL CALLBACK fault_install(PINIT_ONCE o, PVOID param, PVOID *ctx)
     uintptr_t page = os_page_size();
     if (!page || (page & (page - 1u))) return TRUE;
     for (int i = 0; i < OS_FAULT_SLOTS; i++) {
-        if (!atomic_is_lock_free(&os_fault_service.slots[i].state) ||
-            !atomic_is_lock_free(&os_fault_service.slots[i].epoch)) return TRUE;
+        if (!atomic_is_lock_free(&os_fault_service.slots[i].state)) return TRUE;
     }
     os_fault_service.page_size = page;
     os_fault_service.handler = AddVectoredExceptionHandler(0, fault_handler);
@@ -1411,18 +1609,14 @@ os_err os_fault_register(const os_map *m, int *slot)
     uintptr_t addr = (uintptr_t)m->addr;
     if (!addr || !m->len || (addr & (os_fault_service.page_size - 1u)) != 0 ||
         m->len > UINTPTR_MAX - addr || !m->section) return fail_with(OS_E_INVAL);
+    map_owner *owner = m->section;
+    if (!atomic_is_lock_free(&owner->busy) || !atomic_is_lock_free(&owner->epoch)) return fail_with(OS_E_NOTSUP);
     for (int i = 0; i < OS_FAULT_SLOTS; i++) {
         fault_slot *s = &os_fault_service.slots[i];
         uint32_t free_state = SLOT_FREE;
         if (atomic_compare_exchange_strong_explicit(&s->state, &free_state, SLOT_RESERVED,
                                                     memory_order_acquire, memory_order_relaxed)) {
-            s->addr = addr;
-            s->len = m->len;
-            s->extent = round_page(m->len);
-            s->section = (HANDLE)m->section;
-            s->offset = m->offset;
-            atomic_store_explicit(&s->busy, 0, memory_order_relaxed);
-            atomic_store_explicit(&s->epoch, 0, memory_order_relaxed);
+            s->owner = m->section;
             atomic_store_explicit(&s->state, SLOT_LIVE, memory_order_release);
             *slot = i;
             return OS_OK;
@@ -1433,7 +1627,9 @@ os_err os_fault_register(const os_map *m, int *slot)
 uint64_t os_fault_epoch(int slot)
 {
     if (slot < 0 || slot >= OS_FAULT_SLOTS) return 0;
-    return atomic_load_explicit(&os_fault_service.slots[slot].epoch, memory_order_acquire);
+    fault_slot *s = &os_fault_service.slots[slot];
+    if ((atomic_load_explicit(&s->state, memory_order_acquire) & SLOT_PHASE) != SLOT_LIVE) return 0;
+    return atomic_load_explicit(&s->owner->epoch, memory_order_acquire);
 }
 void os_fault_retire(int slot)
 {
@@ -1446,6 +1642,7 @@ void os_fault_retire(int slot)
         uint32_t retiring = (state & ~SLOT_PHASE) | SLOT_RETIRING;
         if (atomic_compare_exchange_weak_explicit(&s->state, &state, retiring,
                                                   memory_order_acq_rel, memory_order_acquire)) {
+            OS_WIN_TEST_HOOK("retiring", s);
             while (atomic_load_explicit(&s->state, memory_order_acquire) != SLOT_RETIRING) SwitchToThread();
             break;
         }
@@ -1532,18 +1729,30 @@ os_err os_proc_spawn(os_proc *out, const char *const argv[])
      * child (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), nothing else. */
     HANDLE std[3] = {GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE)};
     HANDLE dup[3] = {NULL, NULL, NULL}, list[3];
-    DWORD nlist = 0;
+    DWORD nlist = 0, error = ERROR_SUCCESS;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    bool initialized = false;
+    BOOL ok = FALSE;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
     for (int i = 0; i < 3; i++) {
         if (!std[i] || std[i] == INVALID_HANDLE_VALUE) continue;
-        if (!DuplicateHandle(GetCurrentProcess(), std[i], GetCurrentProcess(), &dup[i], 0, TRUE, DUPLICATE_SAME_ACCESS))
-            continue;
-        bool seen = false;
-        for (DWORD j = 0; j < nlist; j++) seen |= list[j] == dup[i];
-        if (!seen) list[nlist++] = dup[i];
+        if (!DuplicateHandle(GetCurrentProcess(), std[i], GetCurrentProcess(), &dup[i], 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+            error = GetLastError(); goto cleanup;
+        }
+        list[nlist++] = dup[i];
     }
     SIZE_T attr_size = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
-    LPPROC_THREAD_ATTRIBUTE_LIST attrs = malloc(attr_size);
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    if (!attr_size) { error = GetLastError(); goto cleanup; }
+    attrs = malloc(attr_size);
+    if (!attrs) { error = ERROR_NOT_ENOUGH_MEMORY; goto cleanup; }
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size)) { error = GetLastError(); goto cleanup; }
+    initialized = true;
+    if (nlist && !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list,
+                                           nlist * sizeof(HANDLE), NULL, NULL)) {
+        error = GetLastError(); goto cleanup;
+    }
     STARTUPINFOEXW si;
     memset(&si, 0, sizeof si);
     si.StartupInfo.cb = sizeof si;
@@ -1551,22 +1760,16 @@ os_err os_proc_spawn(os_proc *out, const char *const argv[])
     si.StartupInfo.hStdInput = dup[0];
     si.StartupInfo.hStdOutput = dup[1];
     si.StartupInfo.hStdError = dup[2];
-    BOOL ok = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
-              (nlist == 0 || UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list,
-                                                       nlist * sizeof(HANDLE), NULL, NULL));
-    PROCESS_INFORMATION pi;
-    memset(&pi, 0, sizeof pi);
-    if (ok) {
-        si.lpAttributeList = attrs;
-        ok = CreateProcessW(app, cmd, NULL, NULL, nlist > 0, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
-                            &si.StartupInfo, &pi);
-    }
-    DWORD e = GetLastError();
-    if (attrs) { DeleteProcThreadAttributeList(attrs); free(attrs); }
+    si.lpAttributeList = attrs;
+    ok = CreateProcessW(app, cmd, NULL, NULL, nlist > 0, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                         &si.StartupInfo, &pi);
+    if (!ok) error = GetLastError();
+cleanup:
+    if (initialized) DeleteProcThreadAttributeList(attrs);
+    free(attrs);
     for (int i = 0; i < 3; i++) if (dup[i]) CloseHandle(dup[i]);
     free(cmd);
-    SetLastError(e);
-    if (!ok) return attrs ? fail() : fail_with(OS_E_NOMEM);
+    if (!ok) { SetLastError(error); return fail(); }
     CloseHandle(pi.hThread);
     out->process = pi.hProcess;
     out->id = pi.dwProcessId;

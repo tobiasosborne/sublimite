@@ -80,3 +80,79 @@ A second handle to the directory (relative open of the empty name) with a 64 KiB
 4. **Handler registered last** (ASan's shadow-commit handler must run first): accepted as recorded in §3.6.
 5. **`src/base/base.c`:** migrated onto `os_vm_*` by edit-177r.4 in parallel; W0.5 widens `WIN_MODULES` and links the core suites.
 6. **First-spawn cost (about 5 s per child for the first few spawns, (E) Defender on the `\\wsl.localhost` share):** tracked number, not a bead (law 1); W0.5 notes it if the core suites feel it.
+
+## 8. Round 2: review findings → change → test
+
+Scope is the coordinator's round-2 brief; finding numbers below are identifiers
+from `docs/reviews/edit-177r.3.md`. The frozen header, portable suite and POSIX
+implementation remain unchanged. Run evidence and limitations are in
+`docs/worker-reports/edit-177r.3-s12-r2.md`.
+
+| # | Finding | Change | Test |
+|---|---|---|---|
+| 1 | Unmap can release another allocator's object | Record each owned file/zero/placeholder piece before releasing it; cleanup never discovers ownership with `VirtualQuery` | `unmap_ownership`: another thread allocates and writes the released prefix before unmap continues; its allocation survives |
+| 2 | Delayed AV dispatch after busy clears kills a reader | Serialize on the view; retry read AVs only after verifying the current committed, readable owned piece; writes/execution continue searching; failed recovery is published before unlocking | `delayed_read_av`: pause a real read AV in a test VEH, finish the split, then dispatch it; reject write/execute exceptions. `same_view_readers`: ordinary readers race faults on the same view |
+| 3 | Partially published write-once caches | `INIT_ONCE` in `os_win_state` publishes system info, API pointers, temp API and QPC frequency together; separate once for CPU calibration avoids recursion | `cold_caches`: fresh process, pause `GetSystemInfo` after page size but before granularity, race clocks/temp/maps and verify complete publication and single initialization |
+| 4 | Duplicate registrations have separate recovery state | Keep per-registration admission/retirement pins, but share serialization, owned pieces and epoch through the private map descriptor | `duplicate_epochs`: both epochs see recovery; retire an admitted registration while the other faults; frozen `fault` capacity case still fills every registration slot |
+| 5 | A non-mapped address is falsely called recovered | Explicit file/zero/placeholder states; decommit/recommit a failed private zero range; reject unexpected/protected state and partial recovery | `zero_suffix_fault`: poison private zeros then inject an in-page error and require fresh zeros; protected memory is rejected. `split_stage_failures`: native failures during initial split, suffix preservation/coalescing and zero recreation, followed by complete unmap |
+| 6 | NOFOLLOW destructive open precedes validation | Non-destructive bypass open, tag/identity validation and filtered data reopen first; one EOF update on the verified data handle before publication | `nofollow_truncation`: surrogate and visible-data-tag shims check both dispositions, retained bytes on rejection and no destructive bypass; native symlink fixture is attempted |
+| 7 | Directory surrogates bypass link semantics; tag errors hidden | Inspect tag before directory classification; open final component generally for NOFOLLOW/delete; unlink permits a junction, rmdir rejects it; tag errors propagate; EXCL collision precedes inspection with or without NOFOLLOW | `junction`: native `mklink /J`, NOFOLLOW stat/open/unlink/rmdir and EXCL. `tag_query_error`; attempted dangling file-symlink coverage |
+| 12 | Anonymous-file race deletes a replacement name | Creation handle retains DELETE authority; compare data/deletion identities before disposition; failure cleanup addresses only the created object | `anon_replacement`: rename the original and create a replacement between opens; require BUSY, replacement survives and the created object is cleaned up |
+| 19 | Path form trims literal final periods/spaces | Normalize a harmless substitute final component, then restore the literal UTF-16 component before forming the NT path; representability/size errors remain explicit | `literal_names`: NTFS `note`, `note.`, `note ` remain distinct through listing, absolute/relative open, identity comparison with `_at`, rename and unlink |
+| 24 | Listing replaces invalid UTF-16 or skips entries | Strict UTF-16 conversion, return INVAL/RANGE for an unrepresentable entry after consuming that record | `strict_listing`: native unpaired-surrogate name beside the actual U+FFFD name yields an explicit error and exactly the real representable entry |
+| 8 | Data opens demand unrelated metadata rights | Plain read/write opens request their own mode's rights; NOFOLLOW additionally needs tag-read rights. `set_mode` obtains an identity-checked `ReOpenFile` metadata handle or returns ACCESS; write-only `file_stat` obtains one on demand after ACCESS | `read_acl`: real ACL denies WRITE_ATTRIBUTES but allows reading, then denies READ_DATA/READ_ATTRIBUTES but permits writing. Frozen `files` pins stat/mode on ordinary write-only handles |
+| 14 | Failed stdio conversion consumes the file | Duplicate non-inheritable first, convert duplicate, close original only after success; translate the CRT's actual errno | `stdio_failure`: injected ENOMEM retains original I/O and exclusive-lock lifetime; frozen `files` checks successful conversion |
+| 16 | Acquisition shrink escapes as ACCESS/IO | On section/view acquisition failure, recheck EOF on the same file handle; proven missing range returns RANGE while preserving native error; unchanged EOF preserves the genuine failure | `map_shrink`: nonzero offset, native shrink before section; smaller-section shim before the real failed view map; unchanged-size NOMEM control |
+| 21 | Spawn silently loses std handles; invalid attribute cleanup | Fail every valid-standard-handle duplication error; explicit cleanup state; delete only an initialized attribute list; preserve errors across cleanup | `spawn_failures`: each standard duplicate, command allocation, attribute size/allocation/init/update and process creation; native error mapping and handle-count leak checks |
+| 30 (scoped parts) | Missing Windows regression coverage | Windows-only supervised supplemental suite with native fixtures/API shims; explicit unavailable verdict, nonzero on any failure | `make TARGET=win check` builds/runs the suite in release and ASan/UBSan alongside unchanged `os_test` |
+
+### Shared view ownership and cost
+
+`os_map.section` is private in the frozen contract. It now points to a
+`map_owner` descriptor whose `section` member holds the actual section HANDLE.
+The descriptor is obtained with `VirtualAlloc`, avoiding CRT heap allocation or
+another process-global cache. Its address-space reservation follows allocation
+granularity and its committed storage is `round_page(sizeof(map_owner))` (P:
+Windows VM rounding); it is freed by `os_unmap`. This is additional native VM
+storage per live mapping. There are at most a file prefix and a zero suffix
+(P: the split algorithm preserves/coalesces the old suffix before replacing the
+new suffix); partial failures retain the exact placeholder ownership too.
+
+Sharing the descriptor preserves the frozen registration-capacity semantics and
+makes every registrant observe the same recovery epoch. It also keeps topology
+available after the last registration retires, until unmap. Each registration
+retains its own admitted-handler pins, so retirement waits for its admitted
+handlers even if another registration remains live. The test-only
+`OS_WIN_TEST_HOOK` macro expands away in normal objects; supplemental API shims
+and the delayed-AV interceptor exist only in the suite's translation unit.
+
+### Truncation, metadata rights and fixture limits
+
+NOFOLLOW truncation has one atomic EOF update against the validated object; a
+name replacement cannot redirect that update. The validation/open/EOF sequence
+is not a single namespace transaction. The existing data-tag two-open retry race
+(finding 9) is explicitly outside this brief and remains unchanged.
+
+Reading does not require WRITE_ATTRIBUTES. `os_file_set_mode` obtains additional
+rights through the same object, verifies its identity and returns ACCESS when
+its ACL denies them. `os_file_stat` similarly obtains READ_ATTRIBUTES only if
+needed for a write-only handle. This preserves the frozen suite without adding
+read-attribute rights to every plain write open.
+
+NTFS prevents truncating an existing section on this box, so the second map
+acquisition race uses an invalidated/replaced smaller section shim followed by
+real `MapViewOfFile3` failure. A visible data tag is also shimmed: the existing
+WOF fixture hides its tag. The native junction fixture runs successfully; file
+symlink creation is explicitly unavailable with ERROR_PRIVILEGE_NOT_HELD (M:
+native code 1314), so Developer Mode/elevation is needed for that fixture.
+External-volume, FAT/exFAT and network-disconnect coverage remains outside scope.
+
+
+Round-2 acceptance (M, [AC, desktop Spiral]; derivation: case verdicts in
+`build/r2/acceptance.log`): `make TARGET=win check` exits 0; each frozen-suite
+variant prints `os_test: 17 cases, 0 failed`; each supplemental variant prints
+`os_win_test: 18/19 passed, 1 unavailable`. The unavailable item is the native
+file-symlink fixture, explicitly permitted by the brief's host limitation.
+Linux `make -j64 all` exits 0 and release/sanitizer `os_test` each report
+`17 cases, 0 failed`. The report records each run's `uptime` load and red/green
+commands/output. No excluded finding is claimed fixed.
