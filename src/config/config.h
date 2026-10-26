@@ -78,13 +78,15 @@ uint32_t config_theme_color(config_theme, const char *);
 
 typedef struct config_runtime config_runtime;
 /* UI-owned, allocating setup/close outside typing. path=NULL uses XDG with
- * HOME fallback. Worker reads/parses; work mailbox installs immutable results.
+ * HOME fallback on Linux, RoamingAppData/sublimite on Windows. Worker reads/parses; work mailbox installs immutable results.
  * A private worker pool keeps config I/O independent of editor bulk work. */
 int config_runtime_open(config_runtime **, const char *);
 void config_runtime_close(config_runtime *);
+#if !defined(_WIN32)
 int config_runtime_eventfd(const config_runtime *);
+#endif
 int config_runtime_watchfd(const config_runtime *);
-/* Off typing: polls shared file inotify, drains config's own mailbox, retries
+/* Off typing: polls shared file notifications, drains config's own mailbox, retries
  * saturation. No sleep/debounce/frame delay; valid publication becomes current
  * in this call. Returns true if the caller should relayout this generation. */
 bool config_runtime_tick(config_runtime *);

@@ -4,6 +4,21 @@
 _Static_assert(sizeof(fif_hit) <= WORK_MSG_DATA, "HIT fits the mailbox");
 _Static_assert(sizeof(fif_file_msg) <= WORK_MSG_DATA, "FILE fits the mailbox");
 _Static_assert(sizeof(fif_done) <= WORK_MSG_DATA, "DONE fits the mailbox");
+static bool path_separator(char c)
+{
+#if defined(_WIN32)
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+static bool root_prefix(const char *text, const char *root, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!text[i] || (text[i] != root[i] && !(path_separator(text[i]) && path_separator(root[i])))) return false;
+    }
+    return true;
+}
 static bool add_bytes(size_t *total, size_t n, size_t width)
 {
     /* (P) Each arena allocation may round up by max_align_t - one. */
@@ -51,19 +66,29 @@ fif_code fif_job_init(fif_job *job, const fif_request *request)
     memset(impl, 0, sizeof *impl); impl->arena = arena; impl->limits = limits;
     impl->options = request->options; impl->query_length = request->query_length;
     memcpy(impl->root, request->root, root_length + 1u);
-    while (root_length > 1u && impl->root[root_length - 1u] == '/') impl->root[--root_length] = 0;
+    size_t root_floor = 1u;
+#if defined(_WIN32)
+    /* Preserve the separator in a drive root: C: names its current directory. */
+    if (root_length >= 3u && impl->root[1] == ':' && path_separator(impl->root[2])) root_floor = 3u;
+#endif
+    while (root_length > root_floor && path_separator(impl->root[root_length - 1u])) impl->root[--root_length] = 0;
     impl->root_length = root_length;
     if (request->query_length) memcpy(impl->query, request->query, request->query_length);
     fif_code code = fif_filter_parse(&impl->filter, request->include, request->exclude);
     if (code != FIF_OK) { arena = impl->arena; edit_arena_free(&arena); return code; }
     for (size_t i = 0; i < impl->filter.count; i++) {
         fif_rule *rule = &impl->filter.rules[i]; char *text = impl->filter.text + rule->offset;
-        if (text[0] == '/' && !strncmp(text, impl->root, root_length) &&
-            (root_length == 1u || text[root_length] == '/' || !text[root_length])) {
+        if (os_path_is_absolute(text) && root_prefix(text, impl->root, root_length) &&
+            (path_separator(impl->root[root_length - 1u]) || path_separator(text[root_length]) || !text[root_length])) {
             const char *suffix = text + root_length;
-            if (*suffix == '/') suffix++;
+            if (path_separator(*suffix)) suffix++;
             if (*suffix) memmove(text, suffix, strlen(suffix) + 1u);
             else strcpy(text, ".");
+#if defined(_WIN32)
+            /* Only absolute path rules use native separators; relative globs
+             * retain their documented backslash-escape syntax. */
+            for (char *at = text; *at; at++) if (*at == '\\') *at = '/';
+#endif
             rule->slash = strchr(text, '/') != NULL;
         }
     }

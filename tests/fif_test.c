@@ -1,6 +1,10 @@
 #include "fif/fif.h"
+#if defined(_WIN32)
+#include "win/fif_fixture.h"
+#else
 #include "tree_fixture.h"
 #include <sched.h>
+#endif
 #include <string.h>
 #define CHECK(x) EDIT_ASSERT(x)
 /* (E) Test capacities come from the actual witness tree and the core's bounded
@@ -194,11 +198,29 @@ static void n95_fixes(work_pool *pool, tree_fixture *tree)
     capture got;
     /* 1. A symlinked project root is followed; entries below keep the skip rule. */
     char link[PATH_MAX]; strcpy(link, tree->root); strcat(link, "-link");
+#if defined(_WIN32)
+    CHECK(dep_junction(tree->root, link) == 0);
+#else
     CHECK(symlink(tree->root, link) == 0);
+#endif
     r.root = link; run(pool, &r, &got);
     CHECK(got.count == 8 && got.done.symlinks == 1); /* (E) the eight sensitive hits, loop skipped. */
+#if defined(_WIN32)
+    CHECK(dep_remove(link) == 0); r.root = tree->root;
+    /* Native absolute filters and a trailing project separator select the
+     * same a.txt witness as the slash spelling below. */
+    char native_root[PATH_MAX], native_file[PATH_MAX];
+    strcpy(native_root, tree->root); strcat(native_root, "\\");
+    CHECK(tree_fixture_path(tree, "a.txt", native_file) == 0);
+    for (char *at = native_file; *at; at++) if (*at == '/') *at = '\\';
+    r.root = native_root; r.include = native_file; run(pool, &r, &got);
+    CHECK(got.count == 4); /* (E) four sensitive hits in a.txt. */
+    r.root = tree->root; r.include = NULL;
+#else
     CHECK(unlink(link) == 0); r.root = tree->root;
+#endif
     /* 2. An unreadable subdirectory counts an error but keeps the walk OK. */
+#if !defined(_WIN32)
     if (geteuid() != 0) {
         CHECK(tree_fixture_dir(tree, "locked") == 0);
         CHECK(tree_fixture_file(tree, "locked/x", "cat", sizeof "cat" - 1u) == 0);
@@ -208,6 +230,9 @@ static void n95_fixes(work_pool *pool, tree_fixture *tree)
         CHECK(got.count == 8 && got.done.errors >= 1);
         CHECK(chmod(locked, S_IRWXU) == 0); CHECK(tree_fixture_remove(locked) == 0);
     }
+#else
+    puts("fif_test: SKIP POSIX chmod unreadable directory (Windows uses ACLs)");
+#endif
     /* A missing root is still a whole-job I/O failure. */
     char missing[PATH_MAX]; CHECK(tree_fixture_path(tree, "no-such-dir", missing) == 0);
     r.root = missing; fif_job job = {0}; CHECK(fif_job_init(&job, &r) == FIF_OK);
@@ -227,7 +252,7 @@ static void n95_fixes(work_pool *pool, tree_fixture *tree)
     CHECK(view.context_truncated && view.context_length == FIF_DEFAULT_CONTEXT - 1u);
     CHECK(view.context[view.context_length - 1u] == 'x');
     CHECK(fif_job_dispose(&job) == FIF_OK);
-    char wide[PATH_MAX]; CHECK(tree_fixture_path(tree, "wide.txt", wide) == 0); CHECK(unlink(wide) == 0);
+    char wide[PATH_MAX]; CHECK(tree_fixture_path(tree, "wide.txt", wide) == 0); CHECK(os_unlink(wide) == OS_OK);
     r.include = NULL;
 }
 int main(void)

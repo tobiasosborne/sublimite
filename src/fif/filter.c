@@ -73,9 +73,9 @@ static bool glob_match(const char *pattern, const char *path, const work_ctx *co
     if (!pattern || !path) return false;
     size_t pn = strnlen(pattern, FIF_PATH_BYTES), n = strnlen(path, FIF_PATH_BYTES);
     if (pn == FIF_PATH_BYTES || n == FIF_PATH_BYTES) return false;
-    /* (E) Two rows of PATH_MAX booleans: the anchored glob DP needs only its
+    /* (E) Two rows of OS_PATH_MAX booleans: the anchored glob DP needs only its
      * previous row. Polynomial bounded work, no recursion or heap allocation. */
-    bool rows[2][PATH_MAX] = {{false}};
+    bool rows[2][OS_PATH_MAX] = {{false}};
     size_t row = 0; rows[row][0] = true;
     for (size_t p = 0; p < pn;) {
         if (context && work_should_stop(context)) return false;

@@ -1,15 +1,14 @@
 #include "findui/private.h"
-#include <errno.h>
-#include <unistd.h>
 
-static bool transfer(int fd, void *bytes, size_t size, uint64_t offset, bool writing)
+static bool transfer(const os_file *file, void *bytes, size_t size, uint64_t offset, bool writing)
 {
     if (offset > INT64_MAX || size > (uint64_t)INT64_MAX - offset) return false;
     uint8_t *p = bytes;
     while (size) {
-        ssize_t n = writing ? pwrite(fd, p, size, (off_t)offset) : pread(fd, p, size, (off_t)offset);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        size_t n;
+        os_err rc = writing ? os_file_pwrite((os_file *)file, p, size, offset, &n)
+                            : os_file_pread((os_file *)file, p, size, offset, &n);
+        if (rc || !n) return false;
         size -= (size_t)n; p += (size_t)n; offset += (size_t)n;
     }
     return true;
@@ -18,13 +17,13 @@ bool findui_plan_reset(findui_plan *plan)
 {
     plan->records = plan->total = 0; plan->buffered = 0;
     plan->run = (findui_plan_run){0}; plan->ready = false;
-    return ftruncate(plan->fd, 0) == 0;
+    return os_file_set_size(&plan->file, 0) == OS_OK;
 }
 static bool write_buffer(findui_plan *plan)
 {
     if (plan->records > (uint64_t)INT64_MAX / sizeof(findui_plan_run)) return false;
     size_t size = plan->buffered * sizeof(findui_plan_run);
-    if (!transfer(plan->fd, plan->buffer, size, plan->records * sizeof(findui_plan_run), true)) return false;
+    if (!transfer(&plan->file, plan->buffer, size, plan->records * sizeof(findui_plan_run), true)) return false;
     plan->records += plan->buffered; plan->buffered = 0;
     return true;
 }
@@ -79,7 +78,7 @@ bool findui_plan_seal(findui_plan *plan)
 bool findui_plan_read(const findui_plan *plan, uint64_t record, findui_plan_run *run)
 {
     if (!plan->ready || record >= plan->records || record > (uint64_t)INT64_MAX / sizeof *run) return false;
-    return transfer(plan->fd, run, sizeof *run, record * sizeof *run, false);
+    return transfer(&plan->file, run, sizeof *run, record * sizeof *run, false);
 }
 bool findui_plan_ordinal(const findui_plan *plan, uint64_t ordinal, findui_plan_run *run)
 {

@@ -3,10 +3,6 @@
 #include "file/file.h"
 #include <string.h>
 #include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <errno.h>
 
 struct config_runtime {
     work_pool pool;
@@ -22,28 +18,45 @@ struct config_runtime {
     int watchfd;
     bool pool_ready, requested, received, staged_ready, directory_ready;
 };
-int config_path(char *out, size_t cap)
-{
-    if (!out || !cap) return CONFIG_ERR_ARG;
-    const char *root = getenv("XDG_CONFIG_HOME"), *suffix = "/sublimite/config.toml";
-    if (!root || root[0] != '/') { root = getenv("HOME"); suffix = "/.config/sublimite/config.toml"; }
-    if (!root || root[0] != '/') return CONFIG_ERR_ARG;
-    size_t n = strlen(root);
-    while (n && root[n - 1u] == '/') n--;
-    if (n >= cap || strlen(suffix) >= cap - n) return CONFIG_ERR_LIMIT;
-    memcpy(out, root, n); strcpy(out + n, suffix); return CONFIG_OK;
-}
 static int directory(config_runtime *r)
 {
     char path[CONFIG_TEXT_CAP]; strcpy(path, r->path);
-    char *end = strrchr(path, '/'); if (!end || !end[1]) return CONFIG_ERR_ARG;
+    char *end = strrchr(path, '/');
+#if defined(_WIN32)
+    char *back = strrchr(path, '\\');
+    if (back && (!end || back > end)) end = back;
+#endif
+    if (!end || !end[1]) return CONFIG_ERR_ARG;
+#if defined(_WIN32)
+    if (path[1] == ':' && end == path + 2) {
+        end[1] = 0;
+        os_stat st;
+        return os_stat_path(path, 0, &st) == OS_OK && st.kind == OS_KIND_DIR ? CONFIG_OK : CONFIG_ERR_IO;
+    }
+#endif
     *end = 0;
-    for (char *at = path + 1; ; at++) {
-        if (*at && *at != '/') continue;
+    char *start = path + 1;
+#if defined(_WIN32)
+    /* Do not mkdir the drive or UNC server/share prefix. */
+    if (path[1] == ':') start = path + 3;
+    else if ((path[0] == '/' || path[0] == '\\') && path[1] == path[0]) {
+        start = path + 2;
+        for (unsigned part = 0; part < 2u; part++) {
+            while (*start && *start != '/' && *start != '\\') start++;
+            if (*start) start++;
+        }
+    }
+#endif
+    for (char *at = start; ; at++) {
+        if (*at && *at != '/'
+#if defined(_WIN32)
+            && *at != '\\'
+#endif
+        ) continue;
         char saved = *at; *at = 0;
-        /* (P) POSIX private directory permissions, owner rwx only. */
-        if (mkdir(path, 0700) && errno != EEXIST) return CONFIG_ERR_IO;
-        struct stat st; if (stat(path, &st) || !S_ISDIR(st.st_mode)) return CONFIG_ERR_IO;
+        os_err rc = os_mkdir(path);
+        if (rc && rc != OS_E_EXIST) return CONFIG_ERR_IO;
+        os_stat st; if (os_stat_path(path, 0, &st) || st.kind != OS_KIND_DIR) return CONFIG_ERR_IO;
         *at = saved; if (!saved) return CONFIG_OK;
     }
 }
@@ -53,20 +66,20 @@ static int read_settings(config_runtime *r, work_ctx *ctx)
         int rc = directory(r); if (rc) return rc;
         r->directory_ready = true;
     }
-    int fd = open(r->path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
-    if (fd < 0) {
-        if (errno != ENOENT) return CONFIG_ERR_IO;
+    os_file source = OS_FILE_INIT;
+    os_err opened = os_file_open(&source, r->path, OS_OPEN_READ | OS_OPEN_NONBLOCK | OS_OPEN_NOFOLLOW);
+    if (opened) {
+        if (opened != OS_E_NOENT) return CONFIG_ERR_IO;
         config_defaults(&r->staged); return CONFIG_OK;
     }
-    os_file source = os_file_from_fd(fd);
     os_stat before, after; int rc = CONFIG_OK;
     if (os_file_stat(&source, &before) || before.kind != OS_KIND_FILE) { rc = CONFIG_ERR_IO; goto done; }
     if (before.size > CONFIG_SOURCE_CAP) { rc = CONFIG_ERR_LIMIT; goto done; }
     size_t length = (size_t)before.size, used = 0;
     while (used < length && !work_should_stop(ctx)) {
         size_t n = length - used; if (n > FILE_PREFIX_MAX) n = FILE_PREFIX_MAX;
-        ssize_t got = pread(fd, r->source + used, n, (off_t)used);
-        if (got < 0) { if (errno == EINTR) continue; rc = CONFIG_ERR_IO; goto done; }
+        size_t got;
+        if (os_file_pread(&source, r->source + used, n, used, &got)) { rc = CONFIG_ERR_IO; goto done; }
         if (!got) { rc = CONFIG_ERR_BUSY; goto done; }
         used += (size_t)got;
     }
@@ -77,7 +90,7 @@ static int read_settings(config_runtime *r, work_ctx *ctx)
     if (file_id_diff(&first, &last) || file_id_diff(&last, &entry)) { rc = CONFIG_ERR_BUSY; goto done; }
     rc = config_parse_worker(r->source, length, &r->staged, &r->staged_error, ctx);
 done:
-    close(fd); return rc;
+    os_file_close(&source); return rc;
 }
 static void reload_job(work_ctx *ctx)
 {
@@ -123,12 +136,12 @@ int config_runtime_open(config_runtime **out, const char *path)
 {
     if (!out) return CONFIG_ERR_ARG;
     *out = NULL;
-    config_runtime *r = aligned_alloc(_Alignof(config_runtime), sizeof *r);
+    config_runtime *r = config_runtime_alloc(_Alignof(config_runtime), sizeof *r);
     if (!r) return CONFIG_ERR_IO;
     memset(r, 0, sizeof *r); r->watchfd = -1; r->watch.wd = -1;
     int rc = CONFIG_OK;
     if (path) {
-        if (path[0] != '/' || strlen(path) >= sizeof r->path) rc = CONFIG_ERR_ARG;
+        if (!os_path_is_absolute(path) || strlen(path) >= sizeof r->path) rc = CONFIG_ERR_ARG;
         else strcpy(r->path, path);
     } else rc = config_path(r->path, sizeof r->path);
     if (rc) goto fail;
@@ -144,9 +157,11 @@ void config_runtime_close(config_runtime *r)
     if (!r) return;
     file_watch_path_stop(&r->watch);
     if (r->pool_ready) work_pool_shutdown(&r->pool);
-    edit_arena_free(&r->arena); free(r);
+    edit_arena_free(&r->arena); config_runtime_free(r);
 }
+#if !defined(_WIN32)
 int config_runtime_eventfd(const config_runtime *r) { return r ? work_pool_eventfd(&r->pool) : -1; }
+#endif
 int config_runtime_watchfd(const config_runtime *r) { return r ? r->watchfd : -1; }
 bool config_runtime_tick(config_runtime *r)
 {
