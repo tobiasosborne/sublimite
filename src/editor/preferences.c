@@ -156,6 +156,7 @@ int editor_preferences_apply(editor *e)
         }
     }
     config_theme theme = s->theme;
+    if (e->has_platform) plat_set_dark(&e->platform, theme == CONFIG_DARK); /* edit-29y2 */
     e->layout_cfg.fg = config_theme_color(theme, "editor.foreground");
     e->layout_cfg.bg = config_theme_color(theme, "editor.background");
     e->layout_cfg.gutter_fg = config_theme_color(theme, "gutter.foreground");

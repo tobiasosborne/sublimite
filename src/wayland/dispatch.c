@@ -39,6 +39,12 @@ void plat_set_blink(plat *p, uint32_t ms)
     x11_plat_set_blink(p, ms);
 }
 
+void plat_set_dark(plat *p, bool dark)
+{
+    if (p && p->backend == PLAT_BACKEND_WAYLAND) return; /* no client hint for server decorations */
+    x11_plat_set_dark(p, dark);
+}
+
 int plat_set_present_events(plat *p, bool enabled)
 {
     if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_set_present_events(p, enabled); }

@@ -259,6 +259,13 @@ int main(void)
     const config_token *light = config_theme_tokens(CONFIG_LIGHT, &light_count);
     T(dark_count == light_count && dark_count);
     for (size_t i = 0; i < dark_count; i++) T(!strcmp(dark[i].name, light[i].name));
+    /* edit-29y2: the dark page, gutter and tab strip continue the dark
+     * title bar the window manager draws for _GTK_THEME_VARIANT=dark;
+     * (P) Mint-Y-Dark gtk-3.0/gtk.css @define-color wm_bg #222226. */
+    T(config_theme_color(CONFIG_DARK, "editor.background") == 0x222226u);
+    T(config_theme_color(CONFIG_DARK, "gutter.background") == 0x222226u);
+    T(config_theme_color(CONFIG_DARK, "chrome.background") == 0x222226u);
+    T(config_theme_color(CONFIG_DARK, "caret.foreground") == 0x222226u);
     edit_malloc_guard_begin();
     T(config_keys_lookup(&settings, &state, 'y', PLAT_MOD_CTRL, &binding) == KEYS_MATCH);
     size_t allocations = edit_malloc_guard_end();

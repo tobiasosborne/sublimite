@@ -260,8 +260,8 @@ int editor_menu_paint(editor *e)
         const keys_binding *command = item_command(e, item);
         bool selected = item == m->item;
         bool unimplemented = command && (command->args.flags & KEYS_ARG_UNIMPLEMENTED);
-        uint32_t fg = selected ? e->layout_cfg.sel_fg : unimplemented ? dim : 0xd8dee9;
-        uint32_t bg = selected ? e->layout_cfg.sel_bg : 0x171b22;
+        uint32_t fg = selected ? e->layout_cfg.sel_fg : unimplemented ? dim : config_theme_color(theme, "editor.foreground");
+        uint32_t bg = selected ? e->layout_cfg.sel_bg : config_theme_color(theme, "chrome.background");
         const char *label = item_label(e, item);
         size_t length = item_chord(e, item, chord, sizeof chord);
         uint32_t right = box.col + box.width - 1u; /* the trailing padding cell */

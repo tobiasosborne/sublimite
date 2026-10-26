@@ -18,6 +18,12 @@ static int property(plat *p, xcb_atom_t key, xcb_atom_t type, const char *want, 
     T(xcb_get_property_value_length(r) == (int)len);
     T(memcmp(xcb_get_property_value(r), want, len) == 0); free(r); return 0;
 }
+static int absent(plat *p, xcb_atom_t key)
+{
+    xcb_get_property_reply_t *r = xcb_get_property_reply(plat_native_x11(p).connection,
+        xcb_get_property(plat_native_x11(p).connection, 0, plat_native_x11(p).window, key, XCB_GET_PROPERTY_TYPE_ANY, 0, 64), NULL);
+    T(r != NULL && r->type == XCB_ATOM_NONE); free(r); return 0;
+}
 int main(void)
 {
     /* The force-included display guard has already redirected a real display;
@@ -31,7 +37,15 @@ int main(void)
     failed |= property(&p, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, cls, sizeof cls);
     failed |= property(&p, intern(plat_native_x11(&p).connection, "_NET_WM_NAME"), intern(plat_native_x11(&p).connection, "UTF8_STRING"), "sublimité", strlen("sublimité"));
     failed |= property(&p, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, "sublimite", 9);
+    /* edit-29y2: the dark theme asks the window manager for its dark
+     * decoration variant; the light theme removes the request. */
+    xcb_atom_t variant = intern(plat_native_x11(&p).connection, "_GTK_THEME_VARIANT");
+    T(absent(&p, variant) == 0);
+    plat_set_dark(&p, true);
+    failed |= property(&p, variant, intern(plat_native_x11(&p).connection, "UTF8_STRING"), "dark", 4);
+    plat_set_dark(&p, false);
+    failed |= absent(&p, variant);
     plat_shutdown(&p); T(failed == 0);
-    printf("x11_identity_test: WM_CLASS, UTF8_STRING _NET_WM_NAME and WM_NAME readback passed on %s\n", display);
+    printf("x11_identity_test: WM_CLASS, UTF8_STRING _NET_WM_NAME, WM_NAME and _GTK_THEME_VARIANT readback passed on %s\n", display);
     return 0;
 }

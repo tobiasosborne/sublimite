@@ -214,8 +214,10 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     (void)font_async_bind(e->fonts, &e->grid);
     (void)font_async_bind(e->fonts, &e->text_grid);
     e->layout_cfg = (layout_config){.hit = editor_hit_record, .hit_ctx = e, .tab_width = 4, .gutter = true, .slice_clusters = 256,
-        .fg = 0xd8dee9, .bg = 0x20242c, .gutter_fg = 0x78808e, .gutter_bg = 0x20242c,
-        .cursor_fg = 0x20242c, .cursor_bg = 0xe5e9f0, .sel_fg = 0xffffff, .sel_bg = 0x425471};
+        .fg = config_theme_color(CONFIG_DARK, "editor.foreground"), .bg = config_theme_color(CONFIG_DARK, "editor.background"),
+        .gutter_fg = config_theme_color(CONFIG_DARK, "gutter.foreground"), .gutter_bg = config_theme_color(CONFIG_DARK, "gutter.background"),
+        .cursor_fg = config_theme_color(CONFIG_DARK, "caret.foreground"), .cursor_bg = config_theme_color(CONFIG_DARK, "caret.background"),
+        .sel_fg = config_theme_color(CONFIG_DARK, "selection.foreground"), .sel_bg = config_theme_color(CONFIG_DARK, "selection.background")};
     e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
     /* Initialize the reserved row even when the first tab wraps. Later
      * wrap-off activation must never expose uninitialized tail cells. */
@@ -252,7 +254,11 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
         plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, &e->poll_wake, 0};
         rc = plat_init_backend(&e->platform, &pc, config->platform_backend); if (rc) goto fail;
-        e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
+        e->has_platform = true; plat_set_blink(&e->platform, 0);
+        /* edit-29y2: before mapping, so the window manager's first frame already matches. */
+        const config_settings *prefs = e->preferences_runtime ? config_runtime_current(e->preferences_runtime) : NULL;
+        plat_set_dark(&e->platform, (prefs ? prefs->theme : e->preferences.theme) == CONFIG_DARK);
+        plat_map(&e->platform);
     }
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
     if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }

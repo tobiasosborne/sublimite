@@ -6,13 +6,16 @@
  * Syntax RGB: (M)[AC] installed Sublime Mariana/Breakers scheme HSL values;
  * (P) HSL -> sRGB, nearest integer(channel * 255), the uint8 channel range.
  * Per-token source variables/selectors: docs/decisions/edit-v0o.3.md. */
+/* edit-29y2: the page, gutter and tab strip continue the window manager's
+ * dark title bar (_GTK_THEME_VARIANT=dark): (P) Mint-Y-Dark gtk-3.0/gtk.css
+ * wm_bg #222226; the active tab is its theme_bg #2e2e33. */
 static const config_token dark[] = {
-    {"editor.background", 0x20242c}, {"editor.foreground", 0xd8dee9},
-    {"gutter.background", 0x20242c}, {"gutter.foreground", 0x78808e},
-    {"caret.background", 0xe5e9f0}, {"caret.foreground", 0x20242c},
+    {"editor.background", 0x222226}, {"editor.foreground", 0xd8dee9},
+    {"gutter.background", 0x222226}, {"gutter.foreground", 0x78808e},
+    {"caret.background", 0xe5e9f0}, {"caret.foreground", 0x222226},
     {"selection.background", 0x425471}, {"selection.foreground", 0xffffff},
-    {"chrome.background", 0x171b22}, {"chrome.foreground", 0x8d98a9},
-    {"tab.active.background", 0x384356}, {"tab.active.foreground", 0xe5e9f0},
+    {"chrome.background", 0x222226}, {"chrome.foreground", 0x8d98a9},
+    {"tab.active.background", 0x2e2e33}, {"tab.active.foreground", 0xe5e9f0},
     {"minimap.foreground", 0x8091a8}, {"warning.foreground", 0xe5b56b},
     {"bracket.background", 0x53667e}, {"error.foreground", 0xbf616a},
     {"error.background", 0x493038}, {"syntax.comment", 0xa6acb9},

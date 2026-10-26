@@ -8,6 +8,8 @@
 #include "editor/editor.h"
 #include "editor/large.h"
 #include "editor/private.h"
+#include "editor/theme.h"
+#include "config/config.h"
 #include "raster/raster.h"
 #include "base/base.h"
 #include "trace/trace.h"
@@ -121,6 +123,13 @@ static int step_until(editor *e, bool (*done)(editor *), uint64_t budget_ns)
     return 0;
 }
 static bool settled(editor *e) { editor_stats s = editor_get_stats(e); return !s.pending && !s.render_active; }
+/* Estimated gutter digits in the default (dark) theme: gutter.foreground halved
+ * towards gutter.background (0x4c525d before edit-29y2 moved the page to 0x222226). */
+static uint32_t dark_estimated_fg(void)
+{
+    return editor_theme_estimated_gutter(config_theme_color(CONFIG_DARK, "gutter.foreground"),
+        config_theme_color(CONFIG_DARK, "gutter.background"));
+}
 static bool find_done(editor *e) { return editor_large_status_get(e).find_done; }
 static bool save_done(editor *e) { return editor_large_status_get(e).save_done; }
 static bool all_done(editor *e) { editor_large_status s = editor_large_status_get(e); return s.lines_exact && s.find_done && s.warm_done; }
@@ -265,7 +274,7 @@ static void gutter_snapshot_release(void *ctx) { piece_snapshot_release(ctx); }
 static int index_arrives_during_frame(const char *path)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    hooks h = {.estimated_fg = 0x4c525d};
+    hooks h = {.estimated_fg = dark_estimated_fg()};
     editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
         .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
         .on_submit = submitted, .on_io = io_boundary};
@@ -304,7 +313,7 @@ static int index_arrives_during_frame(const char *path)
 static int index_completes_between_steps(const char *path)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    hooks h = {.estimated_fg = 0x4c525d};
+    hooks h = {.estimated_fg = dark_estimated_fg()};
     editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1,
         .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
         .on_submit = submitted, .on_io = io_boundary};
@@ -357,7 +366,7 @@ static int index_completes_between_steps(const char *path)
 static int gutter_estimates(void)
 {
     render_backend b = {0}; T(render_null_backend(&b) == 0);
-    hooks h = {.estimated_fg = 0x4c525d};
+    hooks h = {.estimated_fg = dark_estimated_fg()};
     editor_config cfg = {.cols = 60, .rows = 8, .wrap_mode = -1,
         .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0);

@@ -252,12 +252,16 @@ static void flash_submit(void *ctx, const editor_frame *frame)
     flash_probe *p = ctx; submitted(&p->allocations, frame);
     if (!p->e) return;
     editor *e = p->e; bool orange = false;
+    /* Raw stale paint and its actual background blend: (chrome.background +
+     * 0xbf853d) / two, rounded per channel by minimap (0x6b5030 when chrome
+     * was 0x171b22; edit-29y2 derives it from the current theme). */
+    uint32_t chrome = config_theme_color(e->preferences.theme, "chrome.background"), stale_blend = 0;
+    for (uint32_t shift = 0; shift < 24; shift += 8)
+        stale_blend |= ((((chrome >> shift) & 255u) + ((UINT32_C(0xbf853d) >> shift) & 255u) + 1u) / 2u) << shift;
     for (uint32_t r = e->tab_rows; r < e->grid.dims.rows; r++) {
         for (uint32_t c = e->text_grid.dims.cols; c < e->grid.dims.cols; c++) {
             const render_cell *cell = &e->grid.cells[(size_t)r * e->grid.dims.cols + c];
-            /* Raw stale paint and its actual background blend:
-             * (0x171b22 + 0xbf853d) / two, rounded per channel by minimap. */
-            if (cell->fg == 0xbf853d || cell->bg == 0xbf853d || cell->bg == 0x6b5030)
+            if (cell->fg == 0xbf853d || cell->bg == 0xbf853d || cell->bg == stale_blend)
                 orange = true;
         }
     }
@@ -472,7 +476,8 @@ static int minimap_compose_pixels(const char *backend_name)
     uint32_t *expected = calloc((size_t)mw * mh, sizeof *expected);
     uint32_t *frame = calloc((size_t)w * h, sizeof *frame); T(rows && expected && frame);
     minimap reference; minimap_input input = editor_map_input(e->buffer);
-    minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0, 0}; /* existing paint theme */
+    minimap_style colors = {config_theme_color(CONFIG_DARK, "editor.background"),
+        config_theme_color(CONFIG_DARK, "gutter.foreground"), config_theme_color(CONFIG_DARK, "caret.background"), 0}; /* paint theme */
     T(minimap_init(&reference, rows, summaries) == 0);
     T(minimap_prepare(&reference, &input, summaries) == 0);
     uint64_t visible = e->buffer->lines < e->text_grid.dims.rows ? e->buffer->lines : e->text_grid.dims.rows;

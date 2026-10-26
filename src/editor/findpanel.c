@@ -429,7 +429,10 @@ int editor_find_paint(editor *e)
 {
     if (e->palette_open) return editor_palette_paint(e);
     if (!e->panel_rows) return 0;
-    findui_style style={0xd8dee9,0x171b22,0x8d98a9,0x20242c,0xe5e9f0,e->find_ascii,LAYOUT_ASCII_GLYPHS};
+    config_theme t=e->preferences.theme; /* edit-29y2: theme tokens, not dark literals */
+    findui_style style={config_theme_color(t,"editor.foreground"),config_theme_color(t,"chrome.background"),
+        config_theme_color(t,"chrome.foreground"),config_theme_color(t,"caret.foreground"),
+        config_theme_color(t,"caret.background"),e->find_ascii,LAYOUT_ASCII_GLYPHS};
     if (findui_render(&e->find,&e->grid,e->grid.dims.rows-e->panel_rows,e->panel_rows,&style)!=FINDUI_OK)
         return EDITOR_ERR_ARG;
     editor_fif_paint(e,e->grid.dims.rows-e->panel_rows,e->panel_rows); /* edit-n95 */

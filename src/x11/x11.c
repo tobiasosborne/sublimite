@@ -590,6 +590,18 @@ void x11_plat_set_blink(plat *p, uint32_t ms) {
     timerfd_settime(x11_private(p)->timer_fd, 0, &it, NULL);
 }
 
+/* Startup and preference reload only (one atom round trip), never typing. */
+void x11_plat_set_dark(plat *p, bool dark) {
+    x11_plat *x = x11_private(p);
+    if (!x || !x->conn || !x->win) return;
+    xcb_connection_t *c = x->conn;
+    xcb_atom_t variant = atom(c, "_GTK_THEME_VARIANT");
+    if (variant == XCB_ATOM_NONE) return;
+    if (dark) xcb_change_property(c, XCB_PROP_MODE_REPLACE, x->win, variant, atom(c, "UTF8_STRING"), 8, 4, "dark");
+    else xcb_delete_property(c, x->win, variant);
+    xcb_flush(c);
+}
+
 int x11_plat_set_present_events(plat *p, bool enabled) {
     if (!x11_private(p) || !x11_private(p)->conn) return PLAT_ERR_FAIL;
     if (!x11_private(p)->present_ok) return PLAT_OK;

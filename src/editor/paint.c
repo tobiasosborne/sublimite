@@ -318,7 +318,9 @@ static int compose(editor *e)
         uint32_t row = e->grid.dims.rows - 1u;
         for (uint32_t c = 0; c < full; c++) {
             uint32_t ch = c < sizeof status - 1u ? (uint8_t)status[c] : (uint32_t)' ';
-            e->grid.cells[(size_t)row * full + c] = (render_cell){ch, ch - 0x20u, 0xe5b56b, 0x171b22, 0, 0};
+            e->grid.cells[(size_t)row * full + c] = (render_cell){ch, ch - 0x20u,
+                config_theme_color(e->preferences.theme, "warning.foreground"),
+                config_theme_color(e->preferences.theme, "chrome.background"), 0, 0};
         }
         return render_mark_rows(&e->grid, row, 1);
     }
@@ -469,18 +471,21 @@ void editor_goto_overlay(editor *e)
         go->kind == KEYS_ACTION_OPEN_FILE ? "Open file: " : "Save as: ";
     size_t prefix = strlen(label);
     uint32_t row = e->grid.dims.rows - 1u;
+    const config_theme t = e->preferences.theme; /* edit-29y2 */
+    const uint32_t ink = config_theme_color(t, "tab.active.foreground"), plain = config_theme_color(t, "chrome.background"),
+        marked = config_theme_color(t, "bracket.background");
     for (uint32_t col = 0; col < e->grid.dims.cols; col++) {
         uint32_t ch = col < prefix ? (uint8_t)label[col] :
             go->kind == KEYS_ACTION_GOTO_LINE && col - prefix < go->length ? (uint8_t)go->digits[col - prefix] : (uint32_t)' ';
         uint16_t attrs = col == prefix + go->cursor ? RENDER_ATTR_UNDERLINE : 0;
-        uint32_t bg = go->selected && col >= prefix && col - prefix < go->length ? 0x53667e : 0x171b22;
-        e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){ch, ch - ' ', 0xe5e9f0, bg, attrs, 0};
+        uint32_t bg = go->selected && col >= prefix && col - prefix < go->length ? marked : plain;
+        e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){ch, ch - ' ', ink, bg, attrs, 0};
     }
     if (go->kind != KEYS_ACTION_GOTO_LINE) {
         /* (P) UTF-8 byte cursors map to grapheme cell widths, as tab titles do.
          * Decimal prompts retain their preceding byte-identical drawing. */
         for (uint32_t col = (uint32_t)prefix; col < e->grid.dims.cols; col++)
-            e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){' ', 0, 0xe5e9f0, 0x171b22, 0, 0};
+            e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){' ', 0, ink, plain, 0, 0};
         size_t byte = 0; uint32_t col = (uint32_t)prefix;
         while (byte < go->length && col < e->grid.dims.cols) {
             size_t n = utf8_grapheme_next((const uint8_t *)go->digits + byte, go->length - byte);
@@ -493,10 +498,10 @@ void editor_goto_overlay(editor *e)
             uint32_t identity = slot == RENDER_NO_SLOT ? (uint32_t)' ' : e->grid.glyphs[slot].glyph_index;
             uint16_t attrs = byte == go->cursor ? RENDER_ATTR_UNDERLINE : 0;
             if (cells > 1u) attrs |= RENDER_ATTR_WIDE_LEFT;
-            uint32_t bg = go->selected ? 0x53667e : 0x171b22;
-            e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){identity, slot, 0xe5e9f0, bg, attrs, 0};
+            uint32_t bg = go->selected ? marked : plain;
+            e->grid.cells[(size_t)row * e->grid.dims.cols + col] = (render_cell){identity, slot, ink, bg, attrs, 0};
             for (uint32_t tail = 1; tail < cells; tail++)
-                e->grid.cells[(size_t)row * e->grid.dims.cols + col + tail] = (render_cell){.glyph_index = ' ', .atlas_slot = RENDER_NO_SLOT, .fg = 0xe5e9f0, .bg = bg, .attrs = RENDER_ATTR_WIDE_RIGHT};
+                e->grid.cells[(size_t)row * e->grid.dims.cols + col + tail] = (render_cell){.glyph_index = ' ', .atlas_slot = RENDER_NO_SLOT, .fg = ink, .bg = bg, .attrs = RENDER_ATTR_WIDE_RIGHT};
             editor_font_track(e, slot, row); byte += n; col += cells;
         }
         if (byte == go->cursor && col < e->grid.dims.cols)

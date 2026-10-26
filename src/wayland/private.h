@@ -4,6 +4,7 @@
 int x11_plat_init(plat *p, const plat_config *cfg);
 void x11_plat_map(plat *p);
 void x11_plat_set_blink(plat *p, uint32_t ms);
+void x11_plat_set_dark(plat *p, bool dark);
 int x11_plat_set_present_events(plat *p, bool enabled);
 void x11_plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz);
 bool x11_plat_poll_event(plat *p, plat_event *out);

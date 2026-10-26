@@ -60,17 +60,20 @@ int editor_palette_key(editor *e, const plat_event *ev)
     return editor_begin_frame(e);
 }
 /* Same ASCII atlas/cell convention and style as findui/paint.c. Numbers are
- * (P) ASCII space/tilde bounds and RGB values from the existing find style. */
+ * (P) ASCII space/tilde bounds; colours are the find panel's theme tokens. */
 static void cell(editor *e, uint32_t row, uint32_t column, unsigned char byte, bool selected, bool cursor)
 {
     if (column >= e->grid.dims.cols) return;
-    render_cell value = {.atlas_slot = RENDER_NO_SLOT, .fg = 0xd8dee9, .bg = 0x171b22};
+    config_theme t = e->preferences.theme;
+    render_cell value = {.atlas_slot = RENDER_NO_SLOT, .fg = config_theme_color(t, "editor.foreground"),
+        .bg = config_theme_color(t, "chrome.background")};
     if (byte >= ' ' && byte <= '~') {
         value.atlas_slot = e->find_ascii[byte - (unsigned char)' '];
         if (value.atlas_slot != RENDER_NO_SLOT) value.glyph_index = e->grid.glyphs[value.atlas_slot].glyph_index;
     }
     if (selected) { value.fg = e->layout_cfg.sel_fg; value.bg = e->layout_cfg.sel_bg; }
-    if (cursor) { value.fg = 0x20242c; value.bg = 0xe5e9f0; value.attrs = RENDER_ATTR_CURSOR; }
+    if (cursor) { value.fg = config_theme_color(t, "caret.foreground");
+        value.bg = config_theme_color(t, "caret.background"); value.attrs = RENDER_ATTR_CURSOR; }
     e->grid.cells[(size_t)row * e->grid.dims.cols + column] = value;
 }
 static void text(editor *e, uint32_t row, uint32_t column, uint32_t limit, const char *bytes, bool selected)

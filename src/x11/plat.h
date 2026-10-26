@@ -115,6 +115,9 @@ int  plat_init(plat *p, const plat_config *cfg);
 int  plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend);
 void plat_map(plat *p);
 void plat_set_blink(plat *p, uint32_t ms);  /* 0 disarms; ignored while unfocused */
+/* X11: sets or deletes _GTK_THEME_VARIANT="dark", the hint Muffin/Mutter read to
+ * draw the dark decoration variant (edit-29y2). Wayland: no-op. */
+void plat_set_dark(plat *p, bool dark);
 /* Raster owns completion on its private connection; avoid duplicate UI wakes. */
 int  plat_set_present_events(plat *p, bool enabled);
 void plat_quit(plat *p);
