@@ -140,26 +140,28 @@ static inline int refproto_display_open(refproto_display *d, const char *tool, b
     if (stamp) { if (fscanf(stamp,"%31s",d->load) != 1) d->load[0] = 0; fclose(stamp); }
     int screen = 0;
     d->conn = xcb_connect(NULL,&screen);
-    if (!d->conn || xcb_connection_has_error(d->conn))
-        return refproto_fail(d,0,"connect DISPLAY=%s: connection error=%d",getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)",
+    if (!d->conn || xcb_connection_has_error(d->conn)) {
+        refproto_fail(d,0,"connect DISPLAY=%s: connection error=%d",getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)",
             d->conn ? xcb_connection_has_error(d->conn) : -1);
+        goto fail;
+    }
     xcb_screen_iterator_t si = xcb_setup_roots_iterator(xcb_get_setup(d->conn));
     while (screen-- > 0 && si.rem) xcb_screen_next(&si);
-    if (!si.rem) return refproto_fail(d,0,"selected X screen does not exist");
+    if (!si.rem) { refproto_fail(d,0,"selected X screen does not exist"); goto fail; }
     d->root = si.data->root;
     const xcb_query_extension_reply_t *ext = xcb_get_extension_data(d->conn,&xcb_present_id);
-    if (!ext || !ext->present) return refproto_fail(d,0,"Present extension unavailable");
+    if (!ext || !ext->present) { refproto_fail(d,0,"Present extension unavailable"); goto fail; }
     d->opcode = ext->major_opcode;
     xcb_generic_error_t *error = NULL;
     xcb_present_query_version_reply_t *version = xcb_present_query_version_reply(d->conn,
         xcb_present_query_version(d->conn,1,0),&error);
     if (!version || error) {
-        int rc = refproto_fail(d,0,"Present QueryVersion 1.0 reply failed: X error=%u",error ? error->error_code : 0u);
-        free(version); free(error); return rc;
+        refproto_fail(d,0,"Present QueryVersion 1.0 reply failed: X error=%u",error ? error->error_code : 0u);
+        free(version); free(error); goto fail;
     }
     uint32_t major = version->major_version, minor = version->minor_version;
     free(version);
-    if (major != 1) return refproto_fail(d,0,"Present version incompatible: server=%" PRIu32 ".%" PRIu32,major,minor);
+    if (major != 1) { refproto_fail(d,0,"Present version incompatible: server=%" PRIu32 ".%" PRIu32,major,minor); goto fail; }
     xcb_query_extension_reply_t *xtest = xcb_query_extension_reply(d->conn,xcb_query_extension(d->conn,5,"XTEST"),NULL);
     bool available = xtest && xtest->present; free(xtest);
     if (available) {
@@ -170,10 +172,13 @@ static inline int refproto_display_open(refproto_display *d, const char *tool, b
             memcpy(&d->fake,&symbol,sizeof d->fake);
         }
     }
-    if (require_xtest && !available) return refproto_fail(d,0,"XTEST extension unavailable (no automatic XSendEvent fallback)");
-    if (require_xtest && !d->library) return refproto_fail(d,0,"XTEST runtime dlopen libxcb-xtest.so.0: %s",dlerror());
-    if (require_xtest && !d->fake) return refproto_fail(d,0,"XTEST runtime symbol xcb_test_fake_input_checked unavailable");
+    if (require_xtest && !available) { refproto_fail(d,0,"XTEST extension unavailable (no automatic XSendEvent fallback)"); goto fail; }
+    if (require_xtest && !d->library) { refproto_fail(d,0,"XTEST runtime dlopen libxcb-xtest.so.0: %s",dlerror()); goto fail; }
+    if (require_xtest && !d->fake) { refproto_fail(d,0,"XTEST runtime symbol xcb_test_fake_input_checked unavailable"); goto fail; }
     return 0;
+fail:
+    refproto_display_close(d);
+    return -1;
 }
 static inline int refproto_window(refproto_display *d, refproto_target *t, bool unchanged)
 {

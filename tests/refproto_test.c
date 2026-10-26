@@ -4,14 +4,18 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <dlfcn.h>
+static void *fixture_dlopen(void *, const char *, int);
 static xcb_void_cookie_t fixture_notify(void *, xcb_connection_t *, xcb_window_t, uint32_t,
     uint64_t, uint64_t, uint64_t);
 static xcb_generic_event_t *fixture_poll(void *, xcb_connection_t *);
 #define xcb_present_notify_msc_checked(c,w,s,t,v,r) fixture_notify(d,c,w,s,t,v,r)
 #define xcb_poll_for_event(c) fixture_poll(d,c)
+#define dlopen(path,flags) fixture_dlopen(d,path,flags)
 #include "../tools/refwin_protocol.h"
 #undef xcb_present_notify_msc_checked
 #undef xcb_poll_for_event
+#undef dlopen
 
 typedef struct fixture {
     /* First member lets the compile-time NotifyMSC seam recover this fixture
@@ -21,7 +25,13 @@ typedef struct fixture {
     unsigned clock_count, clock_at;
     uint32_t pending_serial;
     xcb_window_t pending_window;
+    bool missing_xtest;
 } fixture;
+static void *fixture_dlopen(void *ctx, const char *path, int flags)
+{
+    fixture *f = ctx;
+    return dlopen(f->missing_xtest ? "libedit-hltk-missing-xtest.so" : path, flags);
+}
 static xcb_void_cookie_t fixture_notify(void *ctx, xcb_connection_t *c, xcb_window_t w, uint32_t serial,
     uint64_t target, uint64_t divisor, uint64_t remainder)
 {
@@ -58,6 +68,11 @@ static void stream(fixture *f, uint64_t period)
 }
 int main(void)
 {
+    /* A missing runtime must release the already-open X connection even when
+     * the caller returns immediately after open fails. */
+    fixture missing = {.missing_xtest=true};
+    T(refproto_display_open(&missing.display,"refproto_failed_open_test",true) < 0);
+    T(!missing.display.conn && !missing.display.library);
     fixture state = {0}; fixture *f = &state;
     refproto_display *d = &f->display; T(refproto_display_open(d,"refproto_test",true) == 0);
     xcb_window_t w = xcb_generate_id(d->conn);

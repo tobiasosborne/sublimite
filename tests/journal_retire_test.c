@@ -295,7 +295,8 @@ static int manual(void)
 static int measurement(void)
 {
     char power[sizeof "Not charging"]="unknown"; FILE *f=fopen("/sys/class/power_supply/BAT0/status","r");
-    T(f); T(fgets(power,sizeof power,f)); fclose(f); power[strcspn(power,"\n")]=0;
+    bool battery_absent=!f && errno==ENOENT;
+    if(f) { T(fgets(power,sizeof power,f)); fclose(f); power[strcspn(power,"\n")]=0; }
     double load1=0; f=fopen("/proc/loadavg","r"); T(f); T(fscanf(f,"%lf",&load1)==1); fclose(f);
     char root[]="build/discovery-XXXXXX"; T(mkdtemp(root)); char base[sizeof ((journal_base *)0)->captured_path], path[sizeof base];
     T(snprintf(base,sizeof base,"%s/base",root)>0); int fd=open(base,O_CREAT|O_EXCL|O_WRONLY,0600); T(fd>=0);
@@ -305,8 +306,8 @@ static int measurement(void)
     struct stat st; T(stat(path,&st)==0);
     T(journal_retire_directory(root,NULL)==0);
     T(discovery(root,&count,&after)==0 && count==0);
-    printf("(M)[%s] BAT0=%s empty_fixture_count=%u journal_bytes=%lld base_bytes=%zu discovery_before_ns=%llu discovery_after_ns=%llu load1=%g\n",
-        !strcmp(power,"Discharging")?"bat":"AC",power,FIXTURE_SESSIONS,(long long)st.st_size,strlen("base"),(unsigned long long)before,(unsigned long long)after,load1);
+    printf("(M)[%s] BAT0=%s%s empty_fixture_count=%u journal_bytes=%lld base_bytes=%zu discovery_before_ns=%llu discovery_after_ns=%llu load1=%g\n",
+        !strcmp(power,"Discharging")?"bat":"AC",power,battery_absent?" (status file absent)":"",FIXTURE_SESSIONS,(long long)st.st_size,strlen("base"),(unsigned long long)before,(unsigned long long)after,load1);
     T(cleanup(root)==0); return 0;
 }
 /* edit-cxo: a second instance's startup housekeeping runs in the window
