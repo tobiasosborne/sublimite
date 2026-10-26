@@ -11,19 +11,11 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-<<<<<<< HEAD
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11
-WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
-WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
-WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
-WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c tests/win/core_file.c tests/win/core_font.c
-=======
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render font
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
 WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c tests/win/core_file.c
->>>>>>> 3f3c8c0 (edit-cyn4: W1.3 fonts on Windows: src/font on os.h; DirectWrite fallback discovery (discovery_win.c) and glyph rasterisation (dwrite_win.c) with stb fallback; tests/win/font_dwrite_test.c)
 WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
 WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
