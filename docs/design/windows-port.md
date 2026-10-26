@@ -10,7 +10,7 @@ A native Windows build of sublimité that is as good as or better than Sublime T
 
 1. **Files live in both places, mostly on Windows drives.** NTFS paths are the primary case and get the full file layer (copy or map, change notification, atomic save). Paths under `\\wsl.localhost\` / `\\wsl$\` are supported too. Whether mapping, change notification and the §2.8 rename recipe work on that share is unverified; a W2 bead measures it and picks a degraded mode where they don't (read-copy instead of map, polling on focus and before save instead of notification).
 2. **Linux stays a first-class target.** No Windows bead may change Linux behaviour; Linux implementations behind the new OS layer are today's calls.
-3. **The Astra vs Sublime drive (law 1, PLAN P5.1b) runs on Tobias's real Windows desktop.** No Xvfb equivalent exists, so the drive takes over the screen while it runs. It runs Windows-side (`codex.exe` is installed there).
+3. ~~The Astra vs Sublime drive runs on Tobias's real Windows desktop.~~ **Retired 2026-10-26 (Tobias): the drive is no longer a requirement; it was a bootstrap loop for the first Linux builds.** W3 exits by Tobias's own use. If a drive is ever wanted on Windows it would run Windows-side (`codex.exe` is installed) and take over the screen, since no Xvfb equivalent exists.
 4. **Glyphs come from DirectWrite on Windows, with our own rasteriser as the fallback.** DirectWrite also supplies font fallback (replacing `fc-match`). Our rasteriser (`src/font`) stays the path when DirectWrite is missing or fails, and for the baked ASCII atlas if DirectWrite's output is not wanted there.
 
 Settled decisions that still hold (law 5): C11, no toolkit (raw Win32 here, as raw xcb on Linux), static link of our code, piece tree, UI-thread ownership with `src/work` mailboxes, no malloc on the typing path.
@@ -63,7 +63,7 @@ Modelled on the GL renderer (`src/gl/renderer.inc`, 1,358 lines (M)): one instan
 | **W0 core** | toolchain; `os.h` spec with Linux and Windows implementations and a conformance suite; core modules migrated to `os.h` | the core suites (base, trace, work, utf8, scan, piece, undo, lineidx, layout, view, find, hl) pass as Windows executables in release and sanitizer builds; Linux `make check` unchanged |
 | **W1 glass** | `src/win32` platform, D3D11 backend, DirectWrite glyphs and fallback | typing in one file on the Windows desktop; the G1 typing-latency guard runs on Windows |
 | **W2 editor** | file, save, journal and hot exit, savectl, ipc, font discovery, editor loop on `os.h`; `\\wsl.localhost` measurement and degraded mode | the editor suites pass on Windows; hot exit survives `TerminateProcess` |
-| **W3 daily** | Windows integration (§5.4), installer-free per-user registration | Astra vs Sublime drive on the Windows desktop filed (law 1), then Tobias's own use (milestones exit by use) |
+| **W3 daily** | Windows integration (§5.4), installer-free per-user registration | `make check` green on both targets, then Tobias's own use declares M3 done or lists blockers (milestones exit by use; the Astra drive was retired 2026-10-26) |
 
 ## 7. Open questions
 - The WSL launcher's command name.

@@ -92,7 +92,7 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 
 ## 9. Milestones (exit by use, not by gate; 2026-10-11)
 
-Precondition for every hand-over to Tobias: the Astra vs Sublime Text comparison drive (PLAN P5.1b) has run on that build and its report lists what diverges, what is missing and the verdict. Tobias sees a build only after Astra has.
+M0 exited by use 2026-10-26 (Tobias: "the editor is good enough that I can use it and report bugs slowly"; bead edit-pi6). Precondition for every hand-over to Tobias: full `make check` green on that build and the landed beads' own verification. The Astra vs Sublime drive (PLAN P5.1b) was the precondition from 2026-10-11 to 2026-10-25 and is retired (Tobias, 2026-10-26: a bootstrap loop to get the first versions above the buggy floor); it stays available as a test tool on request.
 
 | | Scope | Exit criterion |
 |---|---|---|
