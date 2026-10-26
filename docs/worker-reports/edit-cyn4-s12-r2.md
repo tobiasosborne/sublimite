@@ -346,3 +346,13 @@ operations. No native Windows performance claim is made.
 No new product decision is required for the font changes. The retry-family
 policy, locale consequence, exact oracle derivation and measured-only filter
 expectations are explicit in the Round 2 decision table and accompanying text.
+
+## Coordinator verification (session 22)
+
+Rebased over W0.5 (font fixture then failed: W0.5's winrun starts at the worktree root; fixed in round 3, docs/worker-reports/edit-cyn4-s12-r3.md) and over W1.2 (mk/win.mk union `… render raster d3d11 font`, W0.5's font stub dropped). On the final tree, (M)[AC, desktop Spiral]:
+
+```
+make TARGET=win -j64 check    → 69 results exit=0; one red: rel d3d11_test `first_frame == 0` (line 318) while W1.1's verification was opening windows on the same desktop; passes twice in isolation afterwards (coord-d3d11-rerun1/2.log) → desktop-concurrency flake, noted on edit-kv2g, not this bead
+make -j64 all                 → exit 0
+Linux font_test and font_gsub_test (san, :95) → exit 0; the full Linux check of 13:03 (105 suites) stands: the Linux-visible delta since is the fixture header (Windows-only) and mk/win.mk
+```
