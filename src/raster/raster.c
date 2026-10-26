@@ -1,3 +1,4 @@
+#if !defined(_WIN32)
 /* P2.5: backend-owned cell snapshots, MT4 WORK_RASTER strips, XShm staging
  * into a retained off-screen pixmap. present submits that pixmap exactly once.
  * T5: TriggerFence + AwaitFence + QueryFence after the upload/presentation.
@@ -881,3 +882,5 @@ bool raster_frame_metrics(const render_backend *b, raster_metrics *out)
     *out = ((const cpu_state *)b->state)->metrics;
     return out->frame_id != 0;
 }
+
+#endif /* !_WIN32 */

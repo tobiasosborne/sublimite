@@ -11,19 +11,19 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
-WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/render/render.c src/config/theme.c tests/win/core_file.c tests/win/core_font.c
+WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c tests/win/core_file.c tests/win/core_font.c
 WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
 WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
 WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 WIN_TEST_SAN := $(addprefix $(WIN_B)/san/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
-# System import libraries os_win.c needs (NT native calls, BCryptGenRandom, SHGetKnownFolderPath).
-WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32
+# OS imports plus D3D11/DXGI and interface GUIDs. Shader compiler is runtime-loaded.
+WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid
 # UTF-8 activeCodePage manifest (src/os/utf8.manifest, decision doc edit-177r.2
 # §3.9), embedded as RT_MANIFEST 1 through a windres-compiled resource and linked
 # into every Windows executable: the CRT's narrow argv, fopen and getenv become UTF-8.
