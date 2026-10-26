@@ -2,7 +2,7 @@
  * (P) Counts/sizes below derive from literal payloads, wire fields and existing
  * journal constants. Hang guards reuse the journal's existing sync interval;
  * they are test escapes, not latency claims. */
-#include "journal/journal.h"
+#include "journal/private.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -56,7 +56,8 @@ static int transport(const char *dir)
     char path[OS_PATH_MAX]; T(!join(path,sizeof path,dir,"transport"));
     work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
     T(journal_open(&j,path,&pool,NULL)==0);
-    journal *rejected=NULL; T(journal_open(&rejected,dir,&pool,NULL)==JOURNAL_INVALID && !rejected);
+    journal *rejected=NULL; T(journal_open(&rejected,dir,&pool,NULL)==JOURNAL_IO && !rejected);
+    T(journal_open_checkpoint(&rejected,dir,&pool,NULL)==JOURNAL_IO && !rejected);
     FILE *output=tmpfile(); T(output);
     T(journal_manual_replay(path,dir,1,false,output)==JOURNAL_INVALID); T(fclose(output)==0);
     T(JOURNAL_TEST_SANITIZER || edit_malloc_guard_active());
@@ -186,21 +187,168 @@ static int sweep_and_ack(const char *dir)
     T(journal_acknowledge(aside)==0); T(os_stat_path(aside,0,&st)==OS_E_NOENT);
     puts("journal_os_test: clean rotation sweep, dead staging copy and pinned-file acknowledgment passed"); return 0;
 }
+static int long_rotations(const char *dir)
+{
+    /* (P) NTFS and Linux permit 255 ASCII component bytes; (G) the brief's
+     * non-ASCII owner has 200 UTF-8 bytes = 100 two-byte U+00E9 encodings. */
+    for(unsigned utf8=0;utf8<2;utf8++) {
+        char owner[256], path[OS_PATH_MAX];
+        if(utf8) { for(size_t i=0;i<200;i+=2u) { owner[i]=(char)0xc3; owner[i+1]=(char)0xa9; } owner[200]=0; }
+        else { memset(owner,'a',sizeof owner-1u); owner[sizeof owner-1u]=0; }
+        T(!join(path,sizeof path,dir,owner));
+        work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
+        T(journal_open(&j,path,&pool,NULL)==0); T(journal_insert(j,1,0,(const uint8_t *)"old",3)==0); T(journal_flush(j)==0);
+        uint8_t p[8u+sizeof "checkpoint"-1u]={0}; memcpy(p+8,"checkpoint",sizeof "checkpoint"-1u);
+        journal_record cp={JOURNAL_INSERT,1,0,p,sizeof p};
+        T(journal_rotate(j,&cp,1)==0); T(expect(path,"checkpoint",true)==0);
+        journal_close(j); work_pool_shutdown(&pool); O(os_unlink(path));
+    }
+    puts("journal_os_test: maximal ASCII and 200-byte non-ASCII owners rotate successfully"); return 0;
+}
+static uint64_t aside_time(void *ctx) { (void)ctx; return UINT64_C(1000000000); }
+static int aside_no_clobber(const char *dir)
+{
+    char temp[OS_PATH_MAX], aside[OS_PATH_MAX];
+    T(!join(temp,sizeof temp,dir,".sublimite-journal-!1-1-0"));
+    T(!join(aside,sizeof aside,dir,".sublimite-journal-!1-1-0.set-aside-1000000000"));
+    T(create(temp,"sole-copy")==0 && create(aside,"existing")==0);
+    os_stat original,target,after; O(os_stat_path(temp,0,&original)); O(os_stat_path(aside,0,&target));
+    journal_retire_io io={.wall_ns=aside_time};
+    T(journal_retire_with_io(dir,NULL,&io)==JOURNAL_IO);
+    O(os_stat_path(temp,0,&after)); T(journal_same_stat(&original,&after));
+    O(os_stat_path(aside,0,&after)); T(journal_same_stat(&target,&after));
+    O(os_unlink(aside)); T(journal_retire_with_io(dir,NULL,&io)==0);
+    os_file f=OS_FILE_INIT; O(os_file_open(&f,aside,OS_OPEN_READ));
+    char bytes[sizeof "sole-copy"-1u]; size_t got; O(os_file_read(&f,bytes,sizeof bytes,&got)); os_file_close(&f);
+    T(got==sizeof bytes && !memcmp(bytes,"sole-copy",sizeof bytes));
+    T(journal_retire_with_io(dir,NULL,&io)==0); O(os_unlink(aside));
+    puts("journal_os_test: sole-copy set-aside collision preserves both identities/bytes and retries without clobber"); return 0;
+}
+typedef struct replaced_directory {
+    char live[OS_PATH_MAX], moved[OS_PATH_MAX], replacement[OS_PATH_MAX];
+    os_err error;
+} replaced_directory;
+static void replace_locked(void *ctx)
+{
+    replaced_directory *r=ctx;
+    r->error=os_rename(r->live,r->moved,OS_RENAME_NOREPLACE);
+    if(!r->error) r->error=os_rename(r->replacement,r->live,OS_RENAME_NOREPLACE);
+
+}
+static int directory_identity(const char *dir)
+{
+    replaced_directory r={0};
+    T(!join(r.live,sizeof r.live,dir,"identity")); T(!join(r.moved,sizeof r.moved,dir,"moved"));
+    T(!join(r.replacement,sizeof r.replacement,dir,"replacement"));
+    O(os_mkdir(r.live)); O(os_mkdir(r.replacement));
+    char a[OS_PATH_MAX], b[OS_PATH_MAX], path[OS_PATH_MAX];
+    T(!join(a,sizeof a,r.live,".sublimite-base-shared"));
+    T(!join(b,sizeof b,r.replacement,".sublimite-base-shared"));
+    T(create(a,"old-directory")==0); T(create(b,"live-recovery")==0);
+    os_file f=OS_FILE_INIT;
+    O(os_file_open(&f,a,OS_OPEN_RDWR)); O(os_file_set_size(&f,JOURNAL_ARTIFACT_BYTES+1u)); os_file_close(&f);
+    O(os_file_open(&f,b,OS_OPEN_RDWR)); O(os_file_set_size(&f,JOURNAL_ARTIFACT_BYTES+1u)); os_file_close(&f);
+    journal_base base; T(journal_capture_base(b,&base)==0);
+    /* The future replacement's BASE path is the pathname installed by the hook. */
+    strcpy(base.captured_path,a); base.path=base.captured_path;
+    T(!join(path,sizeof path,r.replacement,"session-live"));
+    work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
+    T(journal_open(&j,path,&pool,NULL)==0); T(journal_set_base(j,1,&base)==0);
+    T(journal_insert(j,1,0,(const uint8_t *)"edit",sizeof "edit"-1u)==0);
+    T(journal_flush(j)==0); journal_close(j); work_pool_shutdown(&pool);
+    journal_retire_io io={.ctx=&r,.locked=replace_locked};
+    T(journal_retire_with_io(r.live,NULL,&io)==0); O(r.error);
+    T(journal_check_base(&base)==0);
+    T(!join(path,sizeof path,r.live,"session-live")); T(expect(path,"edit",false)==0);
+    O(os_unlink(path)); O(os_unlink(a));
+    T(!join(a,sizeof a,r.moved,".sublimite-base-shared"));
+    os_stat st; T(os_stat_path(a,0,&st)==OS_E_NOENT);
+    O(os_rmdir(r.moved)); O(os_rmdir(r.live));
+    puts("journal_os_test: renamed locked directory never mutates replacement recovery namespace"); return 0;
+}
+static void replace_retention(void *ctx, const os_dir *guard)
+{ (void)guard; replace_locked(ctx); }
+static int retention_identity(const char *dir)
+{
+    replaced_directory r={0};
+    T(!join(r.live,sizeof r.live,dir,"retain-identity")); T(!join(r.moved,sizeof r.moved,dir,"retain-moved"));
+    T(!join(r.replacement,sizeof r.replacement,dir,"retain-replacement"));
+    O(os_mkdir(r.live)); O(os_mkdir(r.replacement));
+    char source[OS_PATH_MAX], path[OS_PATH_MAX];
+    T(!join(source,sizeof source,dir,"retention-origin")); T(create(source,"base")==0);
+    T(!join(path,sizeof path,r.live,"journal"));
+    journal_base base; T(journal_capture_base(source,&base)==0);
+    work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
+    T(journal_open(&j,path,&pool,NULL)==0);
+    /* An unlinked open journal also lets NTFS express parent renaming: a
+     * named open child otherwise makes the directory move fail with ACCESS. */
+    O(os_unlink(path));
+    journal_io io={.ctx=&r,.retention_locked=replace_retention}; T(journal_set_io(j,&io)==0);
+    journal_retain retained; work_handle h; T(journal_retain_start(j,&retained,&base,&h)==0);
+    while(!work_handle_finished(&pool,h)) os_sleep_ns(1000000);
+    O(r.error); T(retained.error==JOURNAL_BASE_CHANGED);
+    journal_close(j); work_pool_shutdown(&pool);
+    os_dir d=OS_DIR_INIT; O(os_dir_open(&d,r.live)); os_dir_iter it; O(os_dir_iter_open(&it,&d));
+    const char *name; O(os_dir_next(&it,&name)); T(!name);
+    os_dir_iter_close(&it); os_dir_close(&d);
+    O(os_unlink(source));
+    O(os_rmdir(r.moved)); O(os_rmdir(r.live));
+    puts("journal_os_test: retained copy refuses stale absolute parent and cleans the pinned directory"); return 0;
+}
+typedef struct interrupted_inventory { unsigned calls; } interrupted_inventory;
+static os_err interrupted_next(void *ctx, os_dir_iter *it, const char **name, journal_inventory_pass pass)
+{
+    interrupted_inventory *f=ctx;
+    if(pass!=JOURNAL_LIST_INVENTORY) return os_dir_next(it,name);
+    if(!f->calls++) { *name=".sublimite-base-interrupted"; return OS_OK; }
+    *name=NULL; return OS_E_IO;
+}
+static int inventory_interruption(const char *dir)
+{
+    char basepath[OS_PATH_MAX], path[OS_PATH_MAX];
+    T(!join(basepath,sizeof basepath,dir,".sublimite-base-interrupted"));
+    T(!join(path,sizeof path,dir,"session-interrupted")); T(create(basepath,"BASE")==0);
+    os_file f=OS_FILE_INIT; O(os_file_open(&f,basepath,OS_OPEN_RDWR));
+    /* (P) Sparse size exceeds the existing artifact cap by one byte. */
+    O(os_file_set_size(&f,JOURNAL_ARTIFACT_BYTES+1u)); os_file_close(&f);
+    journal_base base; T(journal_capture_base(basepath,&base)==0);
+    work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j;
+    T(journal_open(&j,path,&pool,NULL)==0); T(journal_set_base(j,1,&base)==0);
+    T(journal_insert(j,1,0,(const uint8_t *)"edit",sizeof "edit"-1u)==0);
+    T(journal_flush(j)==0); journal_close(j); work_pool_shutdown(&pool);
+    interrupted_inventory interrupted={0}; journal_retire_io io={.ctx=&interrupted,.next=interrupted_next};
+    int rc=journal_retire_with_io(dir,NULL,&io);
+    /* Check bytes/identity before the return code: loss must be the red oracle. */
+    T(journal_check_base(&base)==0); T(expect(path,"edit",false)==0);
+    T(rc==JOURNAL_IO); O(os_unlink(path)); O(os_unlink(basepath));
+    puts("journal_os_test: interrupted reference inventory preserves recoverable BASE and journal"); return 0;
+}
 static int cleanup(const char *dir)
 {
     os_dir d=OS_DIR_INIT; O(os_dir_open(&d,dir)); os_dir_iter it; O(os_dir_iter_open(&it,&d));
     const char *name; os_err e;
-    while((e=os_dir_next(&it,&name))==OS_OK && name) O(os_unlink_at(&d,name));
+    while((e=os_dir_next(&it,&name))==OS_OK && name) {
+        os_stat st; O(os_stat_at(&d,name,OS_STAT_NOFOLLOW,&st));
+        if(st.kind==OS_KIND_DIR) { char child[OS_PATH_MAX]; T(!join(child,sizeof child,dir,name)); T(cleanup(child)==0); }
+        else O(os_unlink_at(&d,name));
+    }
     O(e); os_dir_iter_close(&it); os_dir_close(&d); O(os_rmdir(dir)); return 0;
 }
-int main(void)
+int main(int argc, char **argv)
 {
+    bool long_only=argc==2 && !strcmp(argv[1],"--long-only"); T(argc==1 || long_only);
     char temp[OS_PATH_MAX], root[OS_PATH_MAX]; O(os_temp_dir(temp,sizeof temp));
     int n=snprintf(root,sizeof root,"%s/sublimite-test-journal-%" PRIu64 "-%" PRIu64,temp,os_proc_id(),os_wall_ns()); T(n>0 && (size_t)n<sizeof root); O(os_mkdir(root));
 #if defined(_WIN32)
     for(char *p=root;*p;p++) if(*p=='\\') *p='/';
 #endif
-    int rc=transport(root);
+    if(long_only) { int rc=long_rotations(root); if(!rc) rc=cleanup(root); return rc; }
+    int rc=inventory_interruption(root);
+    if(!rc) rc=directory_identity(root);
+    if(!rc) rc=retention_identity(root);
+    if(!rc) rc=long_rotations(root);
+    if(!rc) rc=aside_no_clobber(root);
+    if(!rc) rc=transport(root);
     if(!rc) rc=counting_append(root);
     if(!rc) rc=append_errors(root);
     if(!rc) rc=leases(root);

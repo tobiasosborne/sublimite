@@ -10,6 +10,19 @@ int journal_hook_file(const os_file *file);
 int journal_hook_dir(const os_dir *dir);
 int journal_scan_open(os_file file, journal_visit visit, void *ctx,
                       journal_replay_result *result);
+/* Startup fault seam; NULL uses the production iterator/lock path. */
+typedef enum journal_inventory_pass {
+    JOURNAL_LIST_COPY, JOURNAL_LIST_ROTATION, JOURNAL_LIST_ROTATION_LOCK,
+    JOURNAL_LIST_COUNT, JOURNAL_LIST_INVENTORY, JOURNAL_LIST_LEASE
+} journal_inventory_pass;
+typedef struct journal_retire_io {
+    void *ctx;
+    os_err (*next)(void *, os_dir_iter *, const char **, journal_inventory_pass);
+    void (*locked)(void *);
+    uint64_t (*wall_ns)(void *);
+} journal_retire_io;
+int journal_retire_with_io(const char *directory, const char *current, const journal_retire_io *io);
+os_err journal_temp_at(os_file *out, const os_dir *dir, char *name, size_t suffix);
 os_err journal_temp(os_file *out, char *path, size_t suffix);
 char *journal_canonical(const char *path, char *out, size_t cap);
 static inline void journal_slashes(char *path)

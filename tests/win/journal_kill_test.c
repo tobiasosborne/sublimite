@@ -46,28 +46,49 @@ static int random_writer(const char *path, const char *shared, uint64_t seed, bo
     os_file f=OS_FILE_INIT; O(os_file_open(&f,shared,OS_OPEN_RDWR)); work_pool pool;
     T(work_pool_init(&pool,1,0)==0); journal *j; journal_options opt={.batch_bytes=1048576,.max_file_bytes=16777216};
     T(journal_open(&j,path,&pool,&opt)==0); kill_model m={.rng=seed};
+    const uint64_t tabs[]={1,19,271}; /* same discriminating metadata as Linux */
+    T(journal_set_view(j,1,&(journal_view){79,13,4099,27})==0);
+    T(journal_set_tabs(j,tabs,3,2)==0); T(journal_set_window(j,1373,911)==0);
     for(uint64_t i=0;i<100000;i++) {
         T(publish(&f,offsetof(progress,issued),i+1u)==0);
         if(operation(&m,j,NULL)) { (void)publish(&f,offsetof(progress,error),1); return 1; }
         T(publish(&f,offsetof(progress,cached),i+1u)==0);
         if(before_pump) park();
         if((i&255u)==255u) {
-            work_mailbox_drain(&pool,receive,j); T(publish(&f,offsetof(progress,ack),journal_get_stats(j).durable_sequence)==0);
+            work_mailbox_drain(&pool,receive,j); T(publish(&f,offsetof(progress,ack),(journal_get_stats(j).durable_sequence>=3?journal_get_stats(j).durable_sequence-3u:0))==0);
             int rc=journal_pump(j,os_now_ns(),false); T(rc==0 || rc==JOURNAL_BUSY);
         }
-        if((i&4095u)==4095u) { T(journal_flush(j)==0); T(publish(&f,offsetof(progress,ack),journal_get_stats(j).durable_sequence)==0); }
+        if((i&4095u)==4095u) { T(journal_flush(j)==0); T(publish(&f,offsetof(progress,ack),(journal_get_stats(j).durable_sequence>=3?journal_get_stats(j).durable_sequence-3u:0))==0); }
     }
-    T(journal_flush(j)==0); T(publish(&f,offsetof(progress,ack),journal_get_stats(j).durable_sequence)==0); park(); return 1;
+    T(journal_flush(j)==0); T(publish(&f,offsetof(progress,ack),(journal_get_stats(j).durable_sequence>=3?journal_get_stats(j).durable_sequence-3u:0))==0); park(); return 1;
 }
-typedef struct restored { kill_model script; piece_tree *tree; } restored;
+typedef struct restored { kill_model script; piece_tree *tree; bool view,tabs,window; } restored;
 static int replay_random(void *ctx, const journal_record *r)
 {
-    restored *s=ctx; if(operation(&s->script,NULL,r)) return 1;
+    restored *s=ctx;
+    if(r->type==JOURNAL_VIEW) {
+        if(s->view || r->sequence!=1 || r->buffer_id!=1 || r->size!=32 ||
+           get64(r->data)!=79 || get64(r->data+8)!=13 || get64(r->data+16)!=4099 || get64(r->data+24)!=27) return 1;
+        s->view=true; return 0;
+    }
+    if(r->type==JOURNAL_TABS) {
+        if(s->tabs || r->sequence!=2 || r->buffer_id || r->size!=40 || get64(r->data)!=3 || get64(r->data+8)!=2 ||
+           get64(r->data+16)!=1 || get64(r->data+24)!=19 || get64(r->data+32)!=271) return 1;
+        s->tabs=true; return 0;
+    }
+    if(r->type==JOURNAL_WINDOW) {
+        journal_window window;
+        if(s->window || r->sequence!=3 || r->buffer_id || journal_decode_window(r,&window) ||
+           window.width!=1373 || window.height!=911 || window.flags!=JOURNAL_WINDOW_CHOSEN) return 1;
+        s->window=true; return 0;
+    }
+    if(r->sequence<=3) return 1;
+    journal_record edit=*r; edit.sequence-=3;
+    if(operation(&s->script,NULL,&edit)) return 1;
     return journal_apply_piece(s->tree,r);
 }
-static int random_campaign(void)
+static int random_campaign(unsigned trials)
 {
-    const unsigned trials=50; /* inherited default */
     uint64_t total_issued=0,total_cache=0,total_ack=0,total_replayed=0;
     char temp[OS_PATH_MAX], root[OS_PATH_MAX], self[OS_PATH_MAX]; O(os_temp_dir(temp,sizeof temp)); O(os_proc_self_path(self,sizeof self));
     int n=snprintf(root,sizeof root,"%s/sublimite-test-journal-random-%" PRIu64,temp,os_proc_id()); T(n>0 && (size_t)n<sizeof root); O(os_mkdir(root));
@@ -95,11 +116,11 @@ static int random_campaign(void)
         O(os_file_pread(&f,&p,sizeof p,0,&moved)); T(moved==sizeof p && !p.error); os_file_close(&f);
         piece_allocator a=piece_default_allocator(); restored r={.script={.rng=seed},.tree=piece_create(&a)}; T(r.tree);
         journal_replay_result rr; T(journal_replay_file(path,replay_random,&r,&rr)==0);
-        kill_model want=expected_prefix(seed,rr.last_sequence); uint8_t bytes[sizeof want.bytes];
-        T(rr.records==r.script.edits && rr.last_sequence==r.script.edits && rr.last_sequence>=p.cached && rr.last_sequence>=p.ack && rr.last_sequence<=p.issued);
+        kill_model want=expected_prefix(seed,r.script.edits); uint8_t bytes[sizeof want.bytes];
+        T(r.view && r.tabs && r.window && rr.records==r.script.edits+3u && rr.last_sequence==r.script.edits+3u && r.script.edits>=p.cached && r.script.edits>=p.ack && r.script.edits<=p.issued);
         T(piece_len(r.tree)==want.len && piece_read(r.tree,0,bytes,want.len)==0 && !memcmp(bytes,want.bytes,want.len));
         T(r.script.len==want.len && !memcmp(r.script.bytes,want.bytes,want.len)); piece_destroy(r.tree);
-        total_issued+=p.issued; total_cache+=p.cached; total_ack+=p.ack; total_replayed+=rr.last_sequence;
+        total_issued+=p.issued; total_cache+=p.cached; total_ack+=p.ack; total_replayed+=r.script.edits;
         O(os_unlink(shared)); O(os_unlink(path));
     }
     O(os_rmdir(root));
@@ -111,6 +132,7 @@ int main(int argc, char **argv)
         char *end; uint64_t seed=strtoull(argv[4],&end,10); T(!*end);
         return random_writer(argv[2],argv[3],seed,!strcmp(argv[5],"1"));
     }
+    if(argc==2 && !strcmp(argv[1],"--metadata-only")) return random_campaign(1);
     if(argc!=1) return journal_boundaries_main(argc,argv);
-    T(journal_boundaries_main(argc,argv)==0); return random_campaign();
+    T(journal_boundaries_main(argc,argv)==0); return random_campaign(50);
 }

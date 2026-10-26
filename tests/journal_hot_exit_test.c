@@ -10,9 +10,10 @@
 #include <string.h>
 #define T(c) do { if(!(c)) { fprintf(stderr,"journal_hot_exit_test:%d FAIL %s native=%d\n",__LINE__,#c,os_native_error()); return 1; } } while(0)
 #define O(c) T((c)==OS_OK)
-typedef enum phase { CACHE, DURABLE, BEGIN, DELETE, BEFORE_COMMIT, COMMIT, PAINT,
-    ROTATE_CLEAN, ROTATE_FAILED, ROTATE_MISSING, COPY_PARTIAL, PHASE_END } phase;
-typedef struct crash { char ready[OS_PATH_MAX]; os_file copy; } crash;
+typedef enum phase { CACHE, DURABLE, BEGIN, DELETE, BEFORE_COMMIT, COMMIT, PAINT, TORN_INSERT, TORN_COMMIT,
+    ROTATE_CLEAN, ROTATE_FAILED, ROTATE_MISSING, ROTATE_ASCII, ROTATE_UTF8,
+    ROTATE_WRITEBACK, ROTATE_REPLACED, ROTATE_ADOPTED, ROTATE_CLEANUP, COPY_PARTIAL, PHASE_END } phase;
+typedef struct crash { char ready[OS_PATH_MAX], path[OS_PATH_MAX]; os_file copy; phase at; } crash;
 static int notify(const char *path)
 {
     os_file f=OS_FILE_INIT; O(os_file_open(&f,path,OS_OPEN_WRITE|OS_OPEN_CREATE|OS_OPEN_EXCL));
@@ -28,6 +29,30 @@ static int paused_rename(void *ctx, const char *from, const char *to)
 }
 static ssize_t fail_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
 { (void)ctx; (void)fd; (void)p; (void)n; (void)off; errno=EIO; return -1; }
+static int consumed_sync(void *ctx, int fd, bool directory)
+{
+    (void)fd; crash *c=ctx;
+    if(directory) return 0;
+    os_file f=OS_FILE_INIT;
+    if(os_file_open(&f,c->path,OS_OPEN_RDWR)==OS_OK) { (void)os_file_set_size(&f,0); os_file_close(&f); }
+    errno=EIO; return -1;
+}
+static void publication_pause(void *ctx, journal_rotation_point point)
+{
+    crash *c=ctx;
+    bool stop=(c->at==ROTATE_REPLACED && point==JOURNAL_ROTATION_REPLACED) ||
+        (c->at==ROTATE_ADOPTED && point==JOURNAL_ROTATION_ADOPTED) ||
+        (c->at==ROTATE_CLEANUP && point==JOURNAL_ROTATION_CLEANUP);
+    if(stop && !notify(c->ready)) park();
+}
+static ssize_t torn_append(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
+{
+    (void)fd; crash *c=ctx; os_file f=OS_FILE_INIT; size_t done=0;
+    if(os_file_open(&f,c->path,OS_OPEN_RDWR)!=OS_OK) return -1;
+    os_err e=os_file_pwrite_once(&f,p,n-1u,off,&done); os_file_close(&f);
+    if(e!=OS_OK || done!=n-1u || notify(c->ready)) return -1;
+    park(); return -1;
+}
 static ssize_t copy_pause(void *ctx, int fd, const uint8_t *p, size_t n, uint64_t off)
 {
     (void)fd; crash *c=ctx;
@@ -52,7 +77,7 @@ static ssize_t copy_pause(void *ctx, int fd, const uint8_t *p, size_t n, uint64_
 static int writer(const char *path, const char *ready, phase at)
 {
     work_pool pool; T(work_pool_init(&pool,1,0)==0); journal *j; T(journal_open(&j,path,&pool,NULL)==0);
-    crash c={.copy=OS_FILE_INIT}; strcpy(c.ready,ready);
+    crash c={.copy=OS_FILE_INIT,.at=at}; strcpy(c.ready,ready); strcpy(c.path,path);
     if(at==COPY_PARTIAL) {
         char source[OS_PATH_MAX]; int n=snprintf(source,sizeof source,"%s.base",path); T(n>0 && (size_t)n<sizeof source);
         os_file f=OS_FILE_INIT; O(os_file_open(&f,source,OS_OPEN_RDWR|OS_OPEN_CREATE|OS_OPEN_EXCL));
@@ -67,12 +92,19 @@ static int writer(const char *path, const char *ready, phase at)
     T(journal_insert(j,1,0,(const uint8_t *)"before",sizeof "before"-1u)==0);
     if(at==CACHE) { T(notify(ready)==0); park(); }
     T(journal_flush(j)==0);
-    if(at>=ROTATE_CLEAN && at<=ROTATE_MISSING) {
-        journal_io io={.ctx=&c,.rename=paused_rename};
-        if(at==ROTATE_FAILED) {
+    if(at>=ROTATE_CLEAN && at<=ROTATE_CLEANUP) {
+        journal_io io={.ctx=&c};
+        if(at<=ROTATE_WRITEBACK) io.rename=paused_rename;
+        else io.rotation_point=publication_pause;
+        if(at==ROTATE_FAILED || at==ROTATE_ASCII || at==ROTATE_UTF8) {
             io.append_write=fail_append; T(journal_set_io(j,&io)==0);
             T(journal_insert(j,1,sizeof "before"-1u,(const uint8_t *)"!",1)==JOURNAL_IO);
             io.append_write=NULL;
+        }
+        if(at==ROTATE_WRITEBACK) {
+            io.sync=consumed_sync; T(journal_set_io(j,&io)==0);
+            T(journal_insert(j,1,sizeof "before"-1u,(const uint8_t *)"!",1)==0);
+            T(journal_flush(j)==JOURNAL_IO && journal_retry(j)==JOURNAL_IO); io.sync=NULL;
         }
         T(journal_set_io(j,&io)==0);
         uint8_t bytes[sizeof(uint64_t)+sizeof "checkpoint"-1u]={0}; memcpy(bytes+sizeof(uint64_t),"checkpoint",sizeof "checkpoint"-1u);
@@ -81,6 +113,11 @@ static int writer(const char *path, const char *ready, phase at)
     }
     if(at==DURABLE) { T(notify(ready)==0); park(); }
     if(at==PAINT) { T(journal_append(j,JOURNAL_PAINT,1,NULL,0)==0); T(notify(ready)==0); park(); }
+    if(at==TORN_INSERT) {
+        journal_io io={.ctx=&c,.append_write=torn_append}; T(journal_set_io(j,&io)==0);
+        uint8_t large[17000]; memset(large,'x',sizeof large); /* journal_test exact-prefix fixture */
+        T(journal_insert(j,1,sizeof "before"-1u,large,sizeof large)==0); return 1;
+    }
     T(journal_append(j,JOURNAL_GROUP_BEGIN,0,NULL,0)==0);
     if(at==BEGIN) { T(notify(ready)==0); park(); }
     T(journal_delete(j,1,0,sizeof "before"-1u)==0);
@@ -88,6 +125,9 @@ static int writer(const char *path, const char *ready, phase at)
     T(journal_flush(j)==0); /* PAD across a batch boundary within the action */
     T(journal_insert(j,1,0,(const uint8_t *)"after",sizeof "after"-1u)==0);
     if(at==BEFORE_COMMIT) { T(notify(ready)==0); park(); }
+    if(at==TORN_COMMIT) {
+        journal_io io={.ctx=&c,.append_write=torn_append}; T(journal_set_io(j,&io)==0);
+    }
     T(journal_append(j,JOURNAL_GROUP_COMMIT,0,NULL,0)==0);
     T(notify(ready)==0); park(); return 1;
 }
@@ -129,7 +169,12 @@ static int cleanup(const char *dir)
 static int trial(const char *self, const char *dir, phase at)
 {
     char path[OS_PATH_MAX], ready[OS_PATH_MAX], role[sizeof "--writer=4294967295"];
-    int n=snprintf(path,sizeof path,"%s/session-owner",dir); T(n>0 && (size_t)n<sizeof path);
+    char owner[201]; /* (G) brief: 200 UTF-8 bytes; ASCII and 100 U+00E9. */
+    if(at==ROTATE_ASCII) memset(owner,'a',sizeof owner-1u);
+    else if(at==ROTATE_UTF8) for(size_t i=0;i<sizeof owner-1u;i+=2u) { owner[i]=(char)0xc3; owner[i+1]=(char)0xa9; }
+    else strcpy(owner,"session-owner");
+    if(at==ROTATE_ASCII || at==ROTATE_UTF8) owner[sizeof owner-1u]=0;
+    int n=snprintf(path,sizeof path,"%s/%s",dir,owner); T(n>0 && (size_t)n<sizeof path);
     n=snprintf(ready,sizeof ready,"%s/ready",dir); T(n>0 && (size_t)n<sizeof ready);
     n=snprintf(role,sizeof role,"--writer=%u",(unsigned)at); T(n>0 && (size_t)n<sizeof role);
     const char *args[]={self,role,path,ready,NULL}; os_proc child; O(os_proc_spawn(&child,args));
@@ -145,18 +190,22 @@ static int trial(const char *self, const char *dir, phase at)
     if(!reached) { (void)os_proc_kill(&child); os_proc_status status; (void)os_proc_wait(&child,-1,&status); T(reached); }
     if(at>=ROTATE_CLEAN) T(journal_retire_directory(dir,path)==JOURNAL_BUSY);
     char tmp[OS_PATH_MAX]; size_t count=0;
-    if(at>=ROTATE_CLEAN && at<=ROTATE_MISSING) {
-        T(entries(dir,".sublimite-journal-",&count,tmp,sizeof tmp)==0 && count==1);
+    if(at>=ROTATE_CLEAN && at<=ROTATE_CLEANUP) {
+        T(entries(dir,".sublimite-journal-",&count,tmp,sizeof tmp)==0 && count==(at<=ROTATE_WRITEBACK?1u:0u));
         if(at==ROTATE_MISSING) O(os_unlink(path));
     }
     O(os_proc_kill(&child)); os_proc_status status; O(os_proc_wait(&child,-1,&status)); T(status.how==OS_PROC_ABNORMAL);
     if(at>=ROTATE_CLEAN) {
         T(journal_retire_directory(dir,path)==0);
         T(entries(dir,".sublimite-journal-",&count,tmp,sizeof tmp)==0);
-        if(at==ROTATE_CLEAN || at==COPY_PARTIAL) T(count==0);
+        if(at==ROTATE_CLEAN || at==COPY_PARTIAL || (at>=ROTATE_REPLACED && at<=ROTATE_CLEANUP)) T(count==0);
         else {
             T(count==1 && strstr(tmp,".set-aside-")); model m={0}; journal_replay_result rr;
             T(journal_scan_file(tmp,replay,&m,&rr)==0 && !rr.corrupt);
+            T(m.len==sizeof "checkpoint"-1u && !memcmp(m.text,"checkpoint",m.len));
+        }
+        if(at>=ROTATE_REPLACED && at<=ROTATE_CLEANUP) {
+            model m={0}; journal_replay_result rr; T(journal_replay_file(path,replay,&m,&rr)==0 && !rr.corrupt);
             T(m.len==sizeof "checkpoint"-1u && !memcmp(m.text,"checkpoint",m.len));
         }
         if(at==COPY_PARTIAL) T(entries(dir,".sublimite-copy-",&count,tmp,sizeof tmp)==0 && count==0);
@@ -164,7 +213,8 @@ static int trial(const char *self, const char *dir, phase at)
         model m={0}; journal_replay_result rr; T(journal_replay_file(path,replay,&m,&rr)==0);
         const char *want=at==COMMIT?"after":"before";
         T(m.len==strlen(want) && !memcmp(m.text,want,m.len));
-        T(rr.corrupt==(at==BEGIN || at==DELETE || at==BEFORE_COMMIT)); T(m.paint==(at==PAINT?1u:0u));
+        T(rr.corrupt==(at==BEGIN || at==DELETE || at==BEFORE_COMMIT || at==TORN_INSERT || at==TORN_COMMIT)); T(m.paint==(at==PAINT?1u:0u));
+        os_stat st; O(os_stat_path(path,0,&st)); T((uint64_t)st.size==rr.valid_bytes);
     }
     T(cleanup(dir)==0); return 0;
 }
@@ -174,8 +224,13 @@ int main(int argc, char **argv)
         unsigned at; T(sscanf(argv[1],"--writer=%u",&at)==1 && at<PHASE_END);
         return writer(argv[2],argv[3],(phase)at);
     }
-    T(argc==1); char self[OS_PATH_MAX], temp[OS_PATH_MAX], root[OS_PATH_MAX]; O(os_proc_self_path(self,sizeof self)); O(os_temp_dir(temp,sizeof temp));
+    unsigned only=PHASE_END;
+    if(argc==2 && !strncmp(argv[1],"--boundary=",sizeof "--boundary="-1u)) {
+        T(sscanf(argv[1],"--boundary=%u",&only)==1 && only<PHASE_END);
+    } else T(argc==1);
+    char self[OS_PATH_MAX], temp[OS_PATH_MAX], root[OS_PATH_MAX]; O(os_proc_self_path(self,sizeof self)); O(os_temp_dir(temp,sizeof temp));
     for(phase at=CACHE;at<PHASE_END;at++) {
+        if(only<PHASE_END && (unsigned)at!=only) continue;
         int n=snprintf(root,sizeof root,"%s/sublimite-test-journal-kill-%" PRIu64 "-%u",temp,os_proc_id(),(unsigned)at); T(n>0 && (size_t)n<sizeof root);
 #if defined(_WIN32)
         for(char *p=root;*p;p++) if(*p=='\\') *p='/';

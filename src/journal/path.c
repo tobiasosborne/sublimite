@@ -15,7 +15,7 @@ char *journal_canonical(const char *path, char *out, size_t cap)
 }
 /* (P) Preserve mkstemp's six-character schema and exclusive creation. Each
  * collision draws fresh random bytes; no retry limit or overwrite. */
-os_err journal_temp(os_file *out, char *path, size_t suffix)
+os_err journal_temp_at(os_file *out, const os_dir *dir, char *path, size_t suffix)
 {
     static const char alphabet[]="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     size_t len=strlen(path), count=sizeof "XXXXXX"-1u;
@@ -25,7 +25,11 @@ os_err journal_temp(os_file *out, char *path, size_t suffix)
         uint8_t random[sizeof "XXXXXX"-1u];
         os_err e=os_random(random,sizeof random); if(e!=OS_OK) return e;
         for(size_t i=0;i<count;i++) at[i]=alphabet[random[i]%(sizeof alphabet-1u)];
-        e=os_file_open(out,path,OS_OPEN_RDWR|OS_OPEN_CREATE|OS_OPEN_EXCL);
+        e=dir?os_file_open_at(out,dir,path,OS_OPEN_RDWR|OS_OPEN_CREATE|OS_OPEN_EXCL):
+              os_file_open(out,path,OS_OPEN_RDWR|OS_OPEN_CREATE|OS_OPEN_EXCL);
         if(e!=OS_E_EXIST) return e;
     }
 }
+
+os_err journal_temp(os_file *out, char *path, size_t suffix)
+{ return journal_temp_at(out,NULL,path,suffix); }

@@ -141,3 +141,44 @@ reason. The original journal_test also calls the unported file-save module;
 Windows runs journal_os_test for its portable journal coverage and states the
 file-save fixture skip explicitly. End-to-end editor save/recovery on Windows
 belongs to the editor/file/savectl integration beads.
+
+## Round 2: review findings → change → test
+
+| # | Finding | Change | Test |
+|---|---|---|---|
+| 1 | Incomplete reference inventory can retire a recoverable BASE (inherited) | Check iterator errors before every rewind; abort on incomplete count/inventory/sweeps. Finish gathering/marking before retirement. | `journal_os_test`: ordered iterator yields an over-cap BASE then IO before its referencing session; recovery still validates the BASE and edits. |
+| 2 | Locked and mutated directory identities can differ (inherited) | Keep artifact leaf names; stat, lease, scan-open, retirement, temp creation, copy capture, promotion, cleanup and barriers use the pinned parent. Refuse an absolute retained BASE when its parent pathname no longer selects that directory. | `journal_os_test`: rename locked A and install B containing a live referenced BASE; only A is retired. Async copy refuses the stale parent and cleans A. |
+| 3 | UI and worker share a synchronous Windows file object | Independently reopen and identity-check the worker transport through the pinned parent while each generation's actual name exists. Linux duplicates the descriptor. Transfer/close both handles together on adoption. | Windows `journal_transport_test`: distinct handles and independent file positions (DuplicateHandle cannot pass), concurrent actual FlushFileBuffers/UI append, allocation guard. `journal_safety_test` snapshots bytes after the worker's successful writable-stream fence. |
+| 4 | UTF-8 storage capacity used as an ASCII generated-name budget | Budget generated ASCII against the component limit, including a future aside suffix; hex length uses the real owner's UTF-8 bytes. Fall back to the historical short spelling. | Death fixtures use ASCII and non-ASCII owners of (G) 200 bytes each, from the brief; kill before rename and recover the sole checkpoint under a set-aside. |
+| 5 | Missing transport, publication, retained-save and native refusal oracles | Add portable journal-only safety fixtures and publication-point seams; native second-process sharing/delete-pending fixtures. | `journal_safety_test`, `journal_hot_exit_test`/Windows `journal_kill_test`, `journal_transport_test`, `journal_os_test` aside collision. |
+| 6 | Windows campaign lacks metadata and checkpoint PAINT coverage | Restore Linux's exact VIEW/TABS/WINDOW prelude and sequence accounting; add independent fixed wire fixtures and PAINT preservation/clear/torn-tail cases. | Windows seeded campaign checks all fields, ordered tabs and active index; safety suite checks checkpoint bytes including CRC/PAD and last-marker semantics. Actual editor closed-tab restart remains editor-port integration. |
+| 7 | Linux writable-directory opens changed IO to INVALID | Writable-open failure returns IO; successful nonregular read classification stays separate. | `journal_os_test`: open and open_checkpoint return IO, manual directory target is INVALID; acknowledgment directory remains BUSY. |
+| 8 | Included Windows test/CLI sources do not trigger relink | Explicit release and sanitizer prerequisites for the included crash suite and replay CLI; white-box suites also depend on included journal.c. | `make -n -W <included source> <exe>` schedules the appropriate relink in both configurations. |
+| 9 | Opaque clone EINTR retry drops cancellation checkpoint | Use the existing bounded copy loop, with the work epoch checked between chunks, instead of the frozen internally retrying clone wrapper. | `journal_cancel_test`: cancellation before copying never enters the opaque clone wrapper; cancellation in the first write stops before the next chunk. |
+
+The worker owns a distinct Windows synchronous file object, rather than a
+DuplicateHandle alias: explicit offsets alone do not remove object-level
+serialization. Both objects name the same verified stream. The successful
+worker file-data/size fence covers completed UI writes to that stream; it does
+not establish a Windows directory namespace power-loss guarantee.
+
+No new wire schema or OS-layer entry is introduced. The startup iterator,
+retention-lease, rotation-point and wall-clock hooks are caller-owned fault
+seams with NULL production defaults. None runs on the typing path. The
+journal-only OS failure shim exists solely in the safety test translation unit.
+
+(P) Generated temp names consist only of ASCII, so each byte consumes one of
+NTFS's 255 UTF-16 component units. Linux retains NAME_MAX. Every owner UTF-8
+byte consumes two generated hex digits; the existing aside reservation remains
+part of that same budget. OS_NAME_MAX remains appropriate storage for decoded
+arbitrary UTF-8 input. Removing the opaque clone optimization is deliberate:
+the frozen wrapper cannot poll cancellation at an EINTR boundary. There is no
+claim to cancel one uninterruptible filesystem operation.
+
+The report distinguishes actual production regressions (red against round 1)
+from added safety oracles that already pass round 1. A deliberately corrupt CRC
+is the latter suite's negative control; it is not labelled a production defect.
+The inherited blockers were reproduced in this worktree. The main checkout's
+pre-migration sources were not read: the worker's authorization permits only
+the two briefing files there. Pre-migration behavior evidence comes from this
+worktree's preserved `build/worker-logs/inventory-before.txt` and review.

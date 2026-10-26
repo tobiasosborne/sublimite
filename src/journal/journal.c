@@ -26,7 +26,7 @@ typedef struct journal_batch {
     bool force, pad_failed;
 } journal_batch;
 typedef struct journal_disk {
-    os_file fd;
+    os_file fd, worker_fd;
     uint64_t unsynced, written_sequence;
     journal_stats stats;
     bool writeback_failed;    /* only a fresh complete checkpoint can repair */
@@ -36,7 +36,7 @@ struct journal {
     work_pool *pool;
     work_handle handle;
     journal_batch batches[2];
-    journal_disk disk;          /* worker state; UI also uses its stable fd */
+    journal_disk disk;          /* UI fd and worker transport have separate ownership */
     journal_stats stats;        /* exclusively UI owned */
     journal_crc crc_table;
     size_t capacity;
@@ -331,13 +331,9 @@ int journal_replay_file(const char *path, journal_visit visit, void *ctx, journa
 { return journal_replay_file_with_io(path,visit,ctx,result,NULL); }
 static bool stat_equal(const os_stat *a, const os_stat *b)
 { return journal_same_stat(a,b); }
-int journal_capture_base_with_io(const char *path, journal_base *base, const journal_io *io)
+static int capture_open(os_file fd, const os_dir *dir, const char *name,
+                        const char *canonical, journal_base *base, const journal_io *io)
 {
-    if(!path || !base) return JOURNAL_INVALID;
-    if(!*path) { *base=(journal_base){.path=path}; return 0; }
-    char canonical[4097];
-    if(strlen(path)>4096 || !journal_canonical(path,canonical,sizeof canonical)) return JOURNAL_BASE_CHANGED;
-    os_file fd=OS_FILE_INIT; if(os_file_open(&fd,canonical,OS_OPEN_READ|OS_OPEN_NONBLOCK)!=OS_OK) return JOURNAL_BASE_CHANGED;
     os_stat before,after,atpath; uint8_t prefix[4096]; journal_crc table; size_t got=0; int rc=0;
     if(os_file_stat(&fd,&before) || before.kind!=OS_KIND_FILE || before.mtime_ns<0 || before.id.index[1]!=0) rc=JOURNAL_BASE_CHANGED;
     /* The existing BASE wire identity holds volume + a 64-bit file index.
@@ -354,7 +350,7 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
             got+=(size_t)k;
         }
     }
-    if(!rc && (os_file_stat(&fd,&after) || os_stat_path(canonical,0,&atpath) || !stat_equal(&before,&after) || !stat_equal(&after,&atpath))) rc=JOURNAL_BASE_CHANGED;
+    if(!rc && (os_file_stat(&fd,&after) || (dir?os_stat_at(dir,name,0,&atpath):os_stat_path(canonical,0,&atpath)) || !stat_equal(&before,&after) || !stat_equal(&after,&atpath))) rc=JOURNAL_BASE_CHANGED;
     if(!rc) {
         crc_init(&table); *base=(journal_base){.size=(uint64_t)before.size,
             .mtime_ns=(uint64_t)before.mtime_ns,
@@ -363,6 +359,16 @@ int journal_capture_base_with_io(const char *path, journal_base *base, const jou
             .prefix_crc=crc_data(&table,prefix,got),.prefix_len=(uint32_t)got};
         strcpy(base->captured_path,canonical); base->path=base->captured_path;
     }
+    return rc;
+}
+int journal_capture_base_with_io(const char *path, journal_base *base, const journal_io *io)
+{
+    if(!path || !base) return JOURNAL_INVALID;
+    if(!*path) { *base=(journal_base){.path=path}; return 0; }
+    char canonical[4097];
+    if(strlen(path)>4096 || !journal_canonical(path,canonical,sizeof canonical)) return JOURNAL_BASE_CHANGED;
+    os_file fd=OS_FILE_INIT; if(os_file_open(&fd,canonical,OS_OPEN_READ|OS_OPEN_NONBLOCK)!=OS_OK) return JOURNAL_BASE_CHANGED;
+    int rc=capture_open(fd,NULL,NULL,canonical,base,io);
     os_file_close(&fd); return rc;
 }
 int journal_base_from_prefix(const char *path, const file_id *identity,
@@ -430,7 +436,7 @@ static size_t prefix_bytes(const journal_batch *b, size_t upto)
 static int sync_disk(journal *j, uint64_t sequence, uint64_t complete_bytes)
 {
     journal_disk *d=&j->disk;
-    int rc=io_sync(&j->io,d->fd);
+    int rc=io_sync(&j->io,d->worker_fd);
     if(rc) { d->writeback_failed=true; return rc; }
     uint64_t now=clock_ns(); journal_stats *s=&d->stats;
     uint64_t interval=now-s->last_sync_ns;
@@ -452,7 +458,7 @@ static void worker(work_ctx *ctx)
         /* Account the UI-written prefix at the existing sync boundaries.
          * Only a failed/short UI write (or its PAD) needs another data write. */
         if(pos<b->cached) { if(n>b->cached-pos) n=b->cached-pos; done=n; }
-        else rc=write_at(&j->io,d->fd,b->bytes+pos,n,b->offset+pos,&done);
+        else rc=write_at(&j->io,d->worker_fd,b->bytes+pos,n,b->offset+pos,&done);
         pos+=done; b->progress=pos; d->unsynced+=done; d->written_sequence=prefix_sequence(b,pos,initial);
         d->stats.written_sequence=d->written_sequence; d->stats.file_bytes=b->offset+pos;
         if(rc) break;
@@ -504,7 +510,7 @@ static bool options_valid(const journal_options *options)
 /* Takes fd/directory ownership only on success. Used for live and temporary
  * journals, avoiding temporary full-path length restrictions. */
 static int journal_create(journal **out, const char *path, size_t name_offset,
-                           os_file fd, os_dir dfd, work_pool *pool,
+                           os_file fd, const char *transport_name, os_dir dfd, work_pool *pool,
                            const journal_options *options, const journal_io *io)
 {
     size_t cap=options && options->batch_bytes?options->batch_bytes:JOURNAL_DEFAULT_BATCH_BYTES;
@@ -520,7 +526,20 @@ static int journal_create(journal **out, const char *path, size_t name_offset,
     j->directory_fd=dfd; crc_init(&j->crc_table);
     for(unsigned i=0;i<2;i++) { j->batches[i].bytes=edit_arena_alloc(&j->arena,cap+sizeof(journal_completion),4096); memset(j->batches[i].bytes,0,cap+sizeof(journal_completion)); }
     int rc=directory_sync(&j->io,&dfd); if(rc) { edit_arena_free(&a); return rc; }
-    j->disk.fd=fd; j->disk.stats.last_sync_ns=clock_ns();
+    os_file worker_fd=OS_FILE_INIT;
+#if defined(_WIN32)
+    /* DuplicateHandle shares the synchronous file object, so independently
+     * reopen the pinned generation and verify it before any worker can run. */
+    os_stat ui,worker_stat;
+    if(os_file_open_at(&worker_fd,&dfd,transport_name,OS_OPEN_RDWR|OS_OPEN_NOFOLLOW)!=OS_OK ||
+       os_file_stat(&fd,&ui) || os_file_stat(&worker_fd,&worker_stat) ||
+       !journal_same_id(&ui,&worker_stat)) rc=JOURNAL_IO;
+#else
+    (void)transport_name;
+    if(os_file_dup(&worker_fd,&fd)!=OS_OK) rc=JOURNAL_IO;
+#endif
+    if(rc) { os_file_close(&worker_fd); edit_arena_free(&a); return rc; }
+    j->disk.fd=fd; j->disk.worker_fd=worker_fd; j->disk.stats.last_sync_ns=clock_ns();
     j->disk.stats.file_limit_bytes=limit; j->disk.stats.queue_bytes=2*cap;
     j->stats=j->disk.stats; *out=j; return 0;
 }
@@ -531,9 +550,9 @@ int journal_open_with_io(journal **out, const char *path, work_pool *pool, const
     char canonical[4097]; size_t name_offset=0; os_dir dfd=OS_DIR_INIT;
     int rc=journal_path(path,canonical,&name_offset,&dfd); if(rc) return rc;
     os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dfd,canonical+name_offset,OS_OPEN_RDWR|OS_OPEN_CREATE|OS_OPEN_NOFOLLOW); os_stat sb;
-    if(opened!=OS_OK || os_file_stat(&fd,&sb) || sb.kind!=OS_KIND_FILE || sb.size!=0) rc=opened!=OS_OK && opened!=OS_E_ISDIR?JOURNAL_IO:JOURNAL_INVALID;
+    if(opened!=OS_OK || os_file_stat(&fd,&sb) || sb.kind!=OS_KIND_FILE || sb.size!=0) rc=opened!=OS_OK?JOURNAL_IO:JOURNAL_INVALID;
     else if(os_file_set_mode(&fd,0600)) rc=JOURNAL_IO;
-    else rc=journal_create(out,canonical,name_offset,fd,dfd,pool,options,io);
+    else rc=journal_create(out,canonical,name_offset,fd,canonical+name_offset,dfd,pool,options,io);
     if(rc) { os_file_close(&fd); os_dir_close(&dfd); } return rc;
 }
 int journal_open(journal **out, const char *path, work_pool *pool, const journal_options *options)
@@ -545,8 +564,8 @@ int journal_open_checkpoint(journal **out, const char *path, work_pool *pool, co
     char canonical[4097]; size_t name_offset=0; os_dir dfd=OS_DIR_INIT;
     int rc=journal_path(path,canonical,&name_offset,&dfd); if(rc) return rc;
     os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dfd,canonical+name_offset,OS_OPEN_RDWR|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK); os_stat sb;
-    if(opened!=OS_OK || os_file_stat(&fd,&sb) || sb.kind!=OS_KIND_FILE || sb.size<=0) rc=opened!=OS_OK && opened!=OS_E_ISDIR?JOURNAL_IO:JOURNAL_INVALID;
-    else rc=journal_create(out,canonical,name_offset,fd,dfd,pool,options,NULL);
+    if(opened!=OS_OK || os_file_stat(&fd,&sb) || sb.kind!=OS_KIND_FILE || sb.size<=0) rc=opened!=OS_OK?JOURNAL_IO:JOURNAL_INVALID;
+    else rc=journal_create(out,canonical,name_offset,fd,canonical+name_offset,dfd,pool,options,NULL);
     if(rc) { os_file_close(&fd); os_dir_close(&dfd); }
     else (*out)->recovery_pending=true;
     return rc;
@@ -852,7 +871,7 @@ static void close_journal(journal *j, bool discard_empty)
            journal_same_id(&owned,&named) &&
            !os_unlink_at(&j->directory_fd,j->name)) (void)directory_sync(&j->io,&j->directory_fd);
     }
-    os_file_close(&j->disk.fd); os_dir_close(&j->directory_fd); edit_arena a=j->arena; edit_arena_free(&a);
+    os_file_close(&j->disk.worker_fd); os_file_close(&j->disk.fd); os_dir_close(&j->directory_fd); edit_arena a=j->arena; edit_arena_free(&a);
 }
 void journal_close(journal *j) { close_journal(j,false); }
 void journal_close_discard_empty(journal *j) { close_journal(j,true); }
@@ -939,9 +958,11 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
         rc=locked==OS_E_BUSY?JOURNAL_BUSY:JOURNAL_IO;
         os_dir_close(&guard); return rc;
     }
-    /* (P) Preserve Linux NAME_MAX + NUL; Windows uses os.h's UTF-8 bound. */
+    /* (P) Generated names are ASCII: NTFS permits 255 UTF-16 units,
+     * each of these bytes consumes one unit. OS_NAME_MAX is a UTF-8 storage
+     * bound for arbitrary input, not a generated-component budget. */
 #if defined(_WIN32)
-    char tmpname[OS_NAME_MAX];
+    char tmpname[255u+1u];
 #else
     char tmpname[NAME_MAX+1u];
 #endif
@@ -953,7 +974,7 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
     }
     journal *next=NULL; journal_options opt={.batch_bytes=j->capacity,.max_file_bytes=checkpoint_bytes+j->log_budget,
         .sync_bytes=j->sync_bytes,.sync_interval_ns=j->sync_interval_ns};
-    rc=journal_create(&next,j->path,(size_t)(j->name-j->path),tfd,dfd,j->pool,&opt,&j->io);
+    rc=journal_create(&next,j->path,(size_t)(j->name-j->path),tfd,tmpname,dfd,j->pool,&opt,&j->io);
     if(rc) { os_file_close(&tfd); os_dir_close(&dfd); }
     if(!rc) journal_set_message_handler(next,j->message_handler,j->message_ctx);
     for(size_t i=0;!rc && i<count;i++) {
@@ -981,9 +1002,10 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
         }
     }
     if(renamed) {
+        if(j->io.rotation_point) j->io.rotation_point(j->io.ctx,JOURNAL_ROTATION_REPLACED);
         j->recovery_pending=false;
-        os_file oldfd=j->disk.fd;
-        j->disk=next->disk; next->disk.fd=(os_file)OS_FILE_INIT; j->stats=next->stats; j->reserved=next->reserved;
+        os_file oldfd=j->disk.fd, oldworker=j->disk.worker_fd;
+        j->disk=next->disk; next->disk.fd=(os_file)OS_FILE_INIT; next->disk.worker_fd=(os_file)OS_FILE_INIT; j->stats=next->stats; j->reserved=next->reserved;
         for(unsigned i=0;i<2;i++) {
             j->batches[i].used=0; j->batches[i].sealed=0; j->batches[i].cached=0;
             j->batches[i].progress=0; j->batches[i].pad_failed=false;
@@ -995,9 +1017,11 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
         if(rc || directory_sync(&j->io,&j->directory_fd)) {
             rc=JOURNAL_IO; j->stats.error=rc; j->stats.durable_sequence=0; j->stats.durable_bytes=0;
         } else j->directory_pending=false;
-        os_file_close(&oldfd);
+        if(j->io.rotation_point) j->io.rotation_point(j->io.ctx,JOURNAL_ROTATION_ADOPTED);
+        os_file_close(&oldworker); os_file_close(&oldfd);
     }
     if(next) journal_close(next);
+    if(renamed && j->io.rotation_point) j->io.rotation_point(j->io.ctx,JOURNAL_ROTATION_CLEANUP);
     os_unlink_at(&j->directory_fd,tmpname); os_dir_close(&guard); return rc;
 }
 
@@ -1005,6 +1029,8 @@ int journal_rotate(journal *j, const journal_record *records, size_t count)
 struct journal_retention {
     const journal_base *previous;
     const char *path;
+    const os_dir *directory;
+    const char *name;
     const journal_io *io;
     os_file fd;
     int error;
@@ -1020,8 +1046,8 @@ static bool retention_receive(journal *j, const work_msg *m)
     j->retention->received=true;
     return true;
 }
-/* Bounded fallback: no whole-file mapping/allocation, and no bulk I/O on the
- * owner thread. A write hook requests copying so fault seams observe the data. */
+/* Bounded copy: no whole-file mapping/allocation or bulk I/O on the owner
+ * thread; cancellation is checked before every chunk. */
 static int retain_copy(work_ctx *ctx, journal_retention *r, os_file source)
 {
     uint8_t bytes[65536]; uint64_t off=0;
@@ -1036,6 +1062,22 @@ static int retain_copy(work_ctx *ctx, journal_retention *r, os_file source)
     }
     return 0;
 }
+/* The absolute BASE path must still resolve through the leased parent. */
+static bool retention_parent(const os_dir *dir, const char *path)
+{
+    char parent[sizeof ((journal_base *)0)->captured_path]; strcpy(parent,path);
+    journal_parent(parent,strrchr(parent,'/'));
+    os_stat held,named;
+    return os_stat_at(dir,".",0,&held)==OS_OK && os_stat_path(parent,0,&named)==OS_OK &&
+           journal_same_id(&held,&named);
+}
+static int capture_retained(journal_retention *r, journal_base *base)
+{
+    if(!retention_parent(r->directory,r->path)) return JOURNAL_BASE_CHANGED;
+    int rc=capture_open(r->fd,r->directory,r->name,r->path,base,r->io);
+    if(!rc && !retention_parent(r->directory,r->path)) rc=JOURNAL_BASE_CHANGED;
+    return rc;
+}
 static int retain_generation(work_ctx *ctx, journal_retention *r)
 {
     os_file source=OS_FILE_INIT;
@@ -1045,22 +1087,19 @@ static int retain_generation(work_ctx *ctx, journal_retention *r)
        (uint64_t)before.size!=p->size || (uint64_t)before.id.index[0]!=p->inode || (uint64_t)before.id.volume!=p->device ||
        (uint64_t)before.mtime_ns!=p->mtime_ns ||
        (uint64_t)before.ctime_ns!=p->ctime_ns) rc=JOURNAL_BASE_CHANGED;
-    if(!rc) {
-        os_err cloned=r->io->write?OS_E_NOTSUP:os_file_clone(&r->fd,&source);
-        /* Preserve the existing fallback for every clone failure (including
-         * NOTSUP and cross-device sources); the copy validates both ends. */
-        if(cloned!=OS_OK) rc=retain_copy(ctx,r,source);
-    }
+    /* The frozen clone wrapper retries EINTR without a work epoch. Copy in
+     * bounded chunks so every interruption boundary remains cancellable. */
+    if(!rc) rc=retain_copy(ctx,r,source);
     /* The retained inode has its own identity. Check its expected bytes, and
      * detect source changes throughout clone/copy using size/mtime/ctime and
      * pathname identity, including changes outside the small BASE prefix. */
-    if(!rc) rc=journal_capture_base_with_io(r->path,&r->base,r->io);
+    if(!rc) rc=capture_retained(r,&r->base);
     if(!rc && (r->base.size!=p->size || r->base.prefix_len!=p->prefix_len || r->base.prefix_crc!=p->prefix_crc ||
                (r->base.inode==p->inode && r->base.device==p->device))) rc=JOURNAL_BASE_CHANGED;
     if(!rc && (os_file_stat(&source,&after) || os_stat_path(p->path,0,&named) || !stat_equal(&before,&after) || !stat_equal(&after,&named))) rc=JOURNAL_BASE_CHANGED;
     os_file_close(&source);
     if(!rc) rc=metadata_sync(r->io,r->fd);
-    if(!rc) rc=sync_parent(r->path,r->io);
+    if(!rc) rc=directory_sync(r->io,(os_dir *)r->directory);
     return rc;
 }
 static void retention_worker(work_ctx *ctx)
@@ -1074,8 +1113,15 @@ static void retention_worker(work_ctx *ctx)
 }
 static int retain_base(journal *j, const journal_base *previous, char *path, journal_base *base)
 {
-    os_file fd=OS_FILE_INIT; if(journal_temp(&fd,path,0)!=OS_OK) return JOURNAL_IO;
-    journal_retention r={.previous=previous,.path=path,.io=&j->io,.fd=fd};
+    char parent[sizeof ((journal_base *)0)->captured_path]; strcpy(parent,path);
+    char *name=strrchr(path,'/')+1; journal_parent(parent,strrchr(parent,'/'));
+    os_dir guard=OS_DIR_INIT;
+    if(os_dir_open(&guard,parent)!=OS_OK) return JOURNAL_IO;
+    os_err locked=os_dir_try_lock(&guard,OS_LOCK_SHARED);
+    if(locked!=OS_OK) { os_dir_close(&guard); return locked==OS_E_BUSY?JOURNAL_BUSY:JOURNAL_IO; }
+    os_file fd=OS_FILE_INIT;
+    if(journal_temp_at(&fd,&guard,name,0)!=OS_OK) { os_dir_close(&guard); return JOURNAL_IO; }
+    journal_retention r={.previous=previous,.path=path,.directory=&guard,.name=name,.io=&j->io,.fd=fd};
     j->retention=&r;
     do {
         j->retention_handle=work_submit(j->pool,(work_job){retention_worker,&r,0,WORK_BULK});
@@ -1086,7 +1132,9 @@ static int retain_base(journal *j, const journal_base *previous, char *path, jou
     }
     j->retention=NULL;
     os_file_close(&fd);
-    if(r.error) { (void)os_unlink(path); path[0]=0; return r.error; }
+    if(r.error) (void)os_unlink_at(&guard,name);
+    os_dir_close(&guard);
+    if(r.error) { path[0]=0; return r.error; }
     *base=r.base; base->path=path;
     return 0;
 }
@@ -1127,27 +1175,29 @@ static void retain_async_worker(work_ctx *ctx)
         os_err locked=os_dir_try_lock(&guard,OS_LOCK_SHARED);
         if(locked!=OS_OK) r->error=locked==OS_E_BUSY?JOURNAL_BUSY:JOURNAL_IO;
     }
-    if(!r->error && journal_temp(&fd,pending,0)!=OS_OK) r->error=JOURNAL_IO;
+    if(!r->error && r->io->retention_locked) r->io->retention_locked(r->io->ctx,&guard);
+    if(!r->error && journal_temp_at(&fd,&guard,leaf,0)!=OS_OK) r->error=JOURNAL_IO;
     if(os_file_is_open(&fd)) {
-        journal_retention t={.previous=&r->source,.path=pending,.io=r->io,.fd=fd};
+        journal_retention t={.previous=&r->source,.path=pending,.directory=&guard,.name=leaf,.io=r->io,.fd=fd};
         r->error=retain_generation(ctx,&t);
         if(!r->error) {
             strcpy(r->path,pending);
             memcpy(r->path+parent,".sublimite-base-",sizeof ".sublimite-base-"-1u);
-            if(os_rename(pending,r->path,OS_RENAME_NOREPLACE)) r->error=JOURNAL_IO;
+            if(os_rename_at(&guard,leaf,&guard,r->path+parent,OS_RENAME_NOREPLACE)) r->error=JOURNAL_IO;
             else {
                 promoted=true;
                 /* Rename advances ctime. Capture and persist that final
                  * identity before the caller can reference the copy. */
-                r->error=journal_capture_base_with_io(r->path,&r->copy,r->io);
+                t.path=r->path; t.name=r->path+parent;
+                r->error=capture_retained(&t,&r->copy);
                 if(!r->error) r->error=metadata_sync(r->io,fd);
-                if(!r->error) r->error=sync_parent(r->path,r->io);
+                if(!r->error) r->error=directory_sync(r->io,&guard);
             }
         }
         os_file_close(&fd);
         if(r->error) {
-            (void)os_unlink(pending);
-            if(promoted) (void)os_unlink(r->path);
+            (void)os_unlink_at(&guard,leaf);
+            if(promoted) (void)os_unlink_at(&guard,r->path+parent);
         }
     }
     os_dir_close(&guard);
@@ -1186,8 +1236,8 @@ int journal_save_prepare(journal *j, uint64_t id, const journal_base *previous,
     journal_base retained=*previous;
     if(*previous->path) {
         /* Recovery artifacts belong beside the journal, whose lifetime and
-         * access already protect the recovery session. Reflink may cross
-         * filesystems; retain_generation then falls back to bounded copying. */
+         * access already protect the recovery session. The worker copies in
+         * bounded chunks, including across filesystems. */
         retention_name(j,save->previous_path);
         rc=retain_base(j,previous,save->previous_path,&retained);
         if(rc) return rc;

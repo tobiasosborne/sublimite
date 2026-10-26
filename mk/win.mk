@@ -17,7 +17,7 @@ WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
 WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c tests/win/core_file.c
 WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
-WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
+WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c tests/journal_safety_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
 WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
@@ -145,6 +145,23 @@ $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
+# White-box journal transport shim; production has no per-syscall indirection.
+$(WIN_B)/rel/tests/journal_transport_test.exe: tests/win/journal_transport_test.c src/journal/journal.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/journal_transport_test.exe: tests/win/journal_transport_test.c src/journal/journal.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
+$(WIN_B)/rel/tests/journal_safety_test.exe: tests/journal_safety_test.c src/journal/journal.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/journal_safety_test.exe: tests/journal_safety_test.c src/journal/journal.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
 # Static link; release has only system-DLL imports. The sanitizer exe needs the runtime DLLs beside it (tools/winrun.sh runs in place).
 # Font white-box regressions keep all shims out of the production objects.
 $(WIN_B)/rel/tests/font_dwrite_r2_test.exe: tests/win/font_dwrite_r2_test.c tests/win/font_dwrite_oracle.h tests/win/font_fixture.h src/font/dwrite_win.c src/font/discovery_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
@@ -170,6 +187,10 @@ $(WIN_B)/san/tests/%_test.exe: tests/%_test.c $(WIN_SAN_LIB) $(WIN_MANIFEST_OBJ)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) -MMD -MP -MF $(@:.exe=.d) -MT $@ $< $(WIN_TEST_FLAGS) $(WIN_SAN_LIB) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
+# Included test/CLI translation units are part of the executable's source.
+$(WIN_B)/rel/tests/journal_kill_test.exe $(WIN_B)/san/tests/journal_kill_test.exe: tests/journal_hot_exit_test.c
+$(WIN_B)/rel/tests/journal_ack_test.exe $(WIN_B)/san/tests/journal_ack_test.exe: tools/journal_replay.c
+
 # check = release run + sanitizer run of every Windows test, plus the
 # --expect-asan red case, which must exit nonzero with an ASan report.
 # The os suite's reparse case reads OS_TEST_DATA_REPARSE: a compact-compressed
@@ -190,8 +211,9 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
 	    else echo "no ASan report"; cat $(WIN_B)/asan.err; status=1; fi; \
 	  done; exit $$status
 
-	@echo "Windows journal: SKIP journal_group_test, journal_retire_test, editor_session_test, editor_recovery_test, dataloss_test (require editor/platform modules)"
-	@echo "Windows journal: SKIP legacy journal_test file-save fixtures (require src/file); journal_os_test covers portable journal cases"
+	@echo "Windows journal: transport, retained-BASE transactions, wire/CRC/PAD, PAINT, sharing states and process-death oracles passed"
+	@echo "Windows journal: SKIP editor-dependent group/retire/session/recovery/dataloss integration and first-paint closed-tab restart (editor/platform not ported)"
+	@echo "Windows journal: SKIP src/file save integration (file module not ported); journal_save_prepare/finish/cancel run in journal_safety_test"
 	@echo "Windows check: $(words $(WIN_TEST_REL)) release + $(words $(WIN_TEST_SAN)) sanitizer test binaries passed; ASan negative control passed"
 
 clean:

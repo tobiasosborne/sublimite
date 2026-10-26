@@ -121,6 +121,9 @@ typedef struct journal journal;
  * owner and must make one attempt without allocation or retry. Its ctx can be
  * used concurrently by the worker's other hooks. open_with_io also covers the
  * creation-directory barrier. */
+typedef enum journal_rotation_point {
+    JOURNAL_ROTATION_REPLACED, JOURNAL_ROTATION_ADOPTED, JOURNAL_ROTATION_CLEANUP
+} journal_rotation_point;
 typedef struct journal_io {
     void *ctx;
     ssize_t (*write)(void *, int, const uint8_t *, size_t, uint64_t);
@@ -133,6 +136,9 @@ typedef struct journal_io {
     /* Full inode metadata barrier for identities containing exact mtime.
      * NULL uses fsync; distinct from the fdatasync data hook above. */
     int (*metadata_sync)(void *, int);
+    /* Off-path retained-copy fault seam, after acquiring the directory lease. */
+    void (*retention_locked)(void *, const os_dir *);
+    void (*rotation_point)(void *, journal_rotation_point);
 } journal_io;
 /* Zero-initialize each save token. Its sequence is the saved snapshot cutoff
  * in the PREPARED checkpoint generation (checkpoint record count). */
@@ -205,7 +211,7 @@ int journal_save_cancel(journal *j, journal_save *save, const journal_record *ch
 int journal_save_finish(journal *j, journal_save *save, const journal_base *saved,
                         const journal_record *checkpoint, size_t count);
 /* edit-fi2: asynchronous BASE retention (docs/decisions/edit-fi2.md). Retain
- * source's bytes in a private `.sublimite-base-*` reflink/copy beside the
+ * source's bytes in a private `.sublimite-base-*` bounded copy beside the
  * journal, with save_prepare's validation (identity before and after the
  * clone/copy, full fsync of the copy and its directory), but as one WORK_BULK
  * job on the journal's pool: the caller never waits. Incomplete copies use
