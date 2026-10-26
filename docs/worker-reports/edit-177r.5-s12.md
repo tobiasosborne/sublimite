@@ -1545,3 +1545,14 @@ ASan fired: ok
 make: *** [mk/win.mk:162: check] Error 1
 ```
 
+
+## Coordinator verification (session 22)
+
+Two coordinator commits after the continuation (decision doc §4-5: span CPU bound takes one accounting step; per-run reparse fixture directory). Verification, all (M)[AC, desktop Spiral]:
+
+```
+round 1 (d356cfd, before the fixture fix): DISPLAY=:99 make -j64 check → exit 0, 105 suites, 11:00 → 11:43; Windows: 55 green, lineidx_test (span bound) and os_test san (fixture removed by a concurrent worktree check) red
+round 2 (f7afda2): make -j64 all → 0; Linux lineidx_test rel and san → 0; make TARGET=win -j64 check → exit 0, 58 results all exit=0 (26 core suites + os_test + os_win_test + smoke, rel and san; --expect-asan fires), 11:44:47 → 11:55:33, load1 1.20 at start
+lineidx on Windows: span 15,625,000 ns and cancel 15,625,000 ns against resolution 15,625,000 ns (ordinary); 0 and 0 (enlarged): both within bound + one step
+```
+The Linux-visible delta between the rounds is the one lineidx bound (rerun) and the fixture script (Windows-only), so the round-1 full Linux check stands for the landed tree.
