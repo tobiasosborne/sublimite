@@ -11,21 +11,13 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-<<<<<<< HEAD
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal
-=======
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font file
->>>>>>> d7c99cd (edit-pf3l: W2.1 src/file on os.h; file_bus deleted, mapped originals registered with os_fault_register; file_posix.c (inotify, xattrs) and file_win.c (ReadDirectoryChangesW, security descriptor); §9.1/§9.2 regressions; file_test as a Windows exe)
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
 WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c
 WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
-<<<<<<< HEAD
-WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c tests/journal_safety_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
-=======
-WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/file_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
->>>>>>> d7c99cd (edit-pf3l: W2.1 src/file on os.h; file_bus deleted, mapped originals registered with os_fault_register; file_posix.c (inotify, xattrs) and file_win.c (ReadDirectoryChangesW, security descriptor); §9.1/§9.2 regressions; file_test as a Windows exe)
+WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c tests/journal_safety_test.c tests/file_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
 WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
@@ -54,11 +46,7 @@ $(WIN_B)/san/tests/hl_test.exe: WIN_TEST_FLAGS := $(foreach l,$(WIN_HL_OPTIN),$(
 # ASan inlines layout fixtures into a 0x15fd58-byte main frame (objdump),
 # exceeding PE's default 1 MiB reserve. Match this host's Linux 8192 KiB stack.
 $(WIN_B)/san/tests/layout_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
-<<<<<<< HEAD
 WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl journal
-=======
-WIN_COMPILE_MODULES := file base trace work piece undo scroll lineidx layout view utf8 scan find hl
->>>>>>> d7c99cd (edit-pf3l: W2.1 src/file on os.h; file_bus deleted, mapped originals registered with os_fault_register; file_posix.c (inotify, xattrs) and file_win.c (ReadDirectoryChangesW, security descriptor); §9.1/§9.2 regressions; file_test as a Windows exe)
 all: $(WIN_TEST_REL)
 $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
 # Objects reached only through pattern rules would be intermediates and deleted after each link.
@@ -157,8 +145,6 @@ $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 # White-box journal transport shim; production has no per-syscall indirection.
 $(WIN_B)/rel/tests/journal_transport_test.exe: tests/win/journal_transport_test.c src/journal/journal.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
@@ -175,21 +161,6 @@ $(WIN_B)/san/tests/journal_safety_test.exe: tests/journal_safety_test.c src/jour
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
-=======
-=======
-# File shims replace only the file implementation objects in this test TU.
-$(WIN_B)/rel/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
-	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
-$(WIN_B)/san/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
-	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
-	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
-
->>>>>>> 38c0acc (edit-pf3l round 2: review findings 1-15 (temporary created under the source's security state before any write; EFS sources saved encrypted; named streams preserved; exact DACL/label copy without re-inheritance; identity published after writer close; one OVERLAPPED event per watched directory; watch re-arm after parent move; identity+handle cache key; UTF-8 temporary name budget; cancellation between interrupted reads; savectl fuzzer builds; shared safety regressions on Windows; Linux CHANGED classification restored))
-# file_test's platform-selected and shared cases are included by its source.
-$(WIN_B)/rel/tests/file_test.exe $(WIN_B)/san/tests/file_test.exe: tests/file_os_cases.inc tests/file_win_cases.inc
->>>>>>> d7c99cd (edit-pf3l: W2.1 src/file on os.h; file_bus deleted, mapped originals registered with os_fault_register; file_posix.c (inotify, xattrs) and file_win.c (ReadDirectoryChangesW, security descriptor); §9.1/§9.2 regressions; file_test as a Windows exe)
 
 # Static link; release has only system-DLL imports. The sanitizer exe needs the runtime DLLs beside it (tools/winrun.sh runs in place).
 # Font white-box regressions keep all shims out of the production objects.
@@ -247,5 +218,18 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
 
 clean:
 	rm -rf $(WIN_B)
+
+
+# File shims replace only the file implementation objects in this test TU (edit-pf3l).
+$(WIN_B)/rel/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
+# file_test's platform-selected and shared cases are included by its source.
+$(WIN_B)/rel/tests/file_test.exe $(WIN_B)/san/tests/file_test.exe: tests/file_os_cases.inc tests/file_win_cases.inc
 
 -include $(shell find $(WIN_B) -name '*.d' 2>/dev/null)
