@@ -64,3 +64,9 @@ int win32_plat_present_complete(plat *p, uint32_t serial,
 Supply the matching frame identity, actual displayed-frame timestamp converted from QPC to `os_now_ns()` nanoseconds, and DXGI displayed-frame counter. Submission is not completion. The fixed mailbox is protected by an SRW lock and signalled with a manual-reset event; resetting while holding the lock avoids a lost producer wake. The UI loop delivers `on_present_complete(ud, serial, ust, msc)`. `plat_set_present_events(false)` discards queued records and suppresses later ones, without changing renderer ownership. A full mailbox returns an error for producer retry. The suite sends a record from an OS thread and verifies callback payload and UI-thread delivery.
 
 The Windows timestamp convention is explicit here; X11's raw UST has a different native epoch/unit and is not converted by this module. W1.2/W2 must route this callback to the D3D11 completion consumer: the current editor callback is still GL-specific. No frozen render-interface change is needed.
+
+## Coordinator decisions (session 22, 2026-10-26)
+
+1. **Editor-side DPI/font-metric rescaling on `WM_DPICHANGED`** is the editor's concern (W2.4, the editor loop on os.h and the win32 platform); the platform delivers RESIZE with the new DPI as documented here.
+2. **T6 wiring** between this module's documented entry and the D3D11 backend (edit-xgcn) is the W1 integration bead (sublimite.exe typing in one file on the Windows desktop), filed after W2.4 lands, since the editor loop must run on Windows first.
+3. The Codex review (docs/reviews/edit-upwq.md) is triaged before landing; landing rebases over W0.5 and the other W1 trees (mk/win.mk lists kept from all).
