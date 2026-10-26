@@ -37,10 +37,13 @@ static void production_save(void)
     CHECK(blocked!=INVALID_HANDLE_VALUE);
     CHECK(savectl_save(f.s,tree,NULL,NULL,0)==SAVECTL_OK); wait_idle(f.s);
     savectl_model model=savectl_get_model(f.s);
-    CHECK(model.state==SAVECTL_FAILED && model.file_error==FILE_ERR_BUSY && model.modified);
+    /* A sharing violation is an OS failure like any other: FILE_ERR_IO with the
+     * native code. FILE_ERR_BUSY means a save job is already in flight (file.h). */
+    CHECK(model.state==SAVECTL_FAILED && model.file_error==FILE_ERR_IO &&
+          model.err_no==ERROR_SHARING_VIOLATION && model.modified);
     contents(f.path,"old"); no_save_temporary(&f); CHECK(CloseHandle(blocked));
     uint8_t retained[5]; CHECK(piece_read(tree,0,retained,sizeof retained)==0 && !memcmp(retained,"saved",5));
-    puts("savectl production Windows sharing violation: BUSY, old target and edits retained, no temporary: ok");
+    puts("savectl production Windows sharing violation: IO/ERROR_SHARING_VIOLATION, old target and edits retained, no temporary: ok");
 
     os_file old=OS_FILE_INIT; CHECK(os_file_open(&old,f.path,OS_OPEN_READ)==OS_OK);
     os_map mapping={0}; CHECK(os_map_file(&mapping,&old,0,3)==OS_OK);
