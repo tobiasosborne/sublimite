@@ -58,10 +58,11 @@ static int read_settings(config_runtime *r, work_ctx *ctx)
         if (errno != ENOENT) return CONFIG_ERR_IO;
         config_defaults(&r->staged); return CONFIG_OK;
     }
-    struct stat before, after; int rc = CONFIG_OK;
-    if (fstat(fd, &before) || !S_ISREG(before.st_mode)) { rc = CONFIG_ERR_IO; goto done; }
-    if (before.st_size < 0 || (uint64_t)before.st_size > CONFIG_SOURCE_CAP) { rc = CONFIG_ERR_LIMIT; goto done; }
-    size_t length = (size_t)before.st_size, used = 0;
+    os_file source = os_file_from_fd(fd);
+    os_stat before, after; int rc = CONFIG_OK;
+    if (os_file_stat(&source, &before) || before.kind != OS_KIND_FILE) { rc = CONFIG_ERR_IO; goto done; }
+    if (before.size > CONFIG_SOURCE_CAP) { rc = CONFIG_ERR_LIMIT; goto done; }
+    size_t length = (size_t)before.size, used = 0;
     while (used < length && !work_should_stop(ctx)) {
         size_t n = length - used; if (n > FILE_PREFIX_MAX) n = FILE_PREFIX_MAX;
         ssize_t got = pread(fd, r->source + used, n, (off_t)used);
@@ -70,7 +71,7 @@ static int read_settings(config_runtime *r, work_ctx *ctx)
         used += (size_t)got;
     }
     if (work_should_stop(ctx)) { rc = CONFIG_ERR_BUSY; goto done; }
-    if (fstat(fd, &after)) { rc = CONFIG_ERR_IO; goto done; }
+    if (os_file_stat(&source, &after)) { rc = CONFIG_ERR_IO; goto done; }
     file_id first, last, entry; file_id_from_stat(&first, &before); file_id_from_stat(&last, &after);
     if (file_id_stat_path(r->path, &entry) != FILE_OK) { rc = CONFIG_ERR_IO; goto done; }
     if (file_id_diff(&first, &last) || file_id_diff(&last, &entry)) { rc = CONFIG_ERR_BUSY; goto done; }

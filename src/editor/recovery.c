@@ -153,9 +153,10 @@ static int materialize_base(recovered_buffer *b, const journal_base *base)
 {
     int fd = open(base->path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return JOURNAL_BASE_CHANGED;
-    struct stat st;
+    os_stat st;
+    os_file source = os_file_from_fd(fd);
     file_id before = {0}, after = {0}, named = {0};
-    int rc = fstat(fd, &st) ? JOURNAL_BASE_CHANGED : 0;
+    int rc = os_file_stat(&source, &st) ? JOURNAL_BASE_CHANGED : 0;
     if (!rc) {
         file_id_from_stat(&before, &st);
         if (before.type != S_IFREG || before.dev != base->device || before.ino != base->inode ||
@@ -169,7 +170,7 @@ static int materialize_base(recovered_buffer *b, const journal_base *base)
         if (n <= 0) { rc = JOURNAL_BASE_CHANGED; break; }
         done += (size_t)n;
     }
-    if (!rc && fstat(fd, &st)) rc = JOURNAL_BASE_CHANGED;
+    if (!rc && os_file_stat(&source, &st)) rc = JOURNAL_BASE_CHANGED;
     if (!rc) {
         file_id_from_stat(&after, &st);
         if (file_id_stat_path(base->path, &named) || file_id_diff(&before, &after) || file_id_diff(&after, &named))

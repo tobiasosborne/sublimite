@@ -13,7 +13,7 @@
  * work_publish; the UI then calls file_attach, which hands the data to the
  * piece tree through piece_init_mapped lifetime hooks for either backing mode.
  * Workers never touch the tree. Small copies also report OPEN_READY; filesystem
- * errors are asynchronous OPEN_FAILED results with errno in the payload/getter.
+ * errors are asynchronous OPEN_FAILED results with a native error code in the payload/getter.
  * Terminal/phase publication retries while cancellable on mailbox saturation.
  * Copy threshold = min(256 MiB, RAM/32), injectable via file_open_opts.
  *
@@ -67,7 +67,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <pthread.h>
+#include "os/os.h"
 
 #include "piece/piece.h"
 #include "work/work.h"
@@ -130,6 +130,14 @@ typedef struct file_prefix_info {
 /* Pure scan; any bytes. Counts are exact over [p, p+n). */
 void file_prefix_scan(const uint8_t *p, size_t n, file_prefix_info *out);
 
+/* Preserve the existing POSIX type encoding for Linux consumers (S_IF*).
+ * OS_KIND_OTHER is rejected at acquisition; its precise native subtype is
+ * irrelevant once the canonical baseline is a regular file. */
+#define FILE_TYPE_REG   0100000u
+#define FILE_TYPE_DIR   0040000u
+#define FILE_TYPE_LINK  0120000u
+#define FILE_TYPE_OTHER 0u
+
 /* Identity used for change detection. */
 typedef struct file_id {
     uint64_t dev, ino, size, mtime_ns;
@@ -138,7 +146,8 @@ typedef struct file_id {
     uint64_t ctime_ns;   /* source-version validation, including restored mtime */
     uint32_t uid, gid;
     int metadata_valid; /* extended fields populated by file; 0 for legacy IDs */
-    uint32_t type;       /* st_mode & S_IFMT; canonical entry must stay regular */
+    uint32_t type;       /* FILE_TYPE_*; canonical entry must stay regular */
+    uint64_t ino_hi;     /* upper half of Windows FILE_ID_128; zero on POSIX */
 } file_id;
 
 #define FILE_CHG_NONE      0u
@@ -154,8 +163,7 @@ typedef struct file_id {
  * entry, returning an absent ID for ENOENT/ENOTDIR. diff compares extended
  * metadata when both IDs carry it; legacy IDs retain their original contract.
  * from_stat/diff are CPU-only; stat_path performs filesystem I/O. */
-struct stat;
-void file_id_from_stat(file_id *id, const struct stat *st);
+void file_id_from_stat(file_id *id, const os_stat *st);
 uint32_t file_id_diff(const file_id *a, const file_id *b);
 int file_id_stat_path(const char *path, file_id *id);
 
@@ -222,7 +230,7 @@ file_mode file_open_mode(const file *f);
  * successful PREFIX_READY. CPU-only; borrowed until file_close. */
 const file_id *file_prefix_identity(const file *f);
 const char *file_path(const file *f);       /* canonical after PREFIX_READY; "" while pending */
-int file_errno(const file *f);              /* errno of the last FILE_ERR_IO */
+int file_errno(const file *f);              /* native code of the last FILE_ERR_IO */
 /* 1 once the full content is ready for file_attach. */
 int file_open_ready(const file *f);
 /* Give the content to an empty tree. Valid once; FILE_ERR_STATE if not ready. */
@@ -263,8 +271,9 @@ int file_changed(const file *f);
  * metadata/ctime change on the still-named mapped inode conservatively requires
  * reload, since restored mtime cannot prove its original bytes are intact. */
 int file_resolve_keep(file *f);
-/* Optional inotify. All calls, including close, belong to the single UI owner.
- * start returns a borrowed shared process fd; never close it per file. epoll
+/* Optional parent-directory notification (inotify / ReadDirectoryChangesW).
+ * All calls, including close, belong to the single UI owner.
+ * Linux start returns a borrowed shared process fd; never close it per file. epoll
  * callers register it once and retain registration while any member uses it.
  * Setup uses a fixed registry bounded by the existing editor reservation caps
  * (4096 live + 4096 retained); exhaustion returns ENOSPC. The fd is installed
@@ -277,6 +286,11 @@ int file_resolve_keep(file *f);
  * detection is asynchronous. Saturated submission is retried on a later poll. */
 int file_watch_start(file *f);
 int file_watch_poll(file *f);
+#if defined(_WIN32)
+/* Borrowed shared ReadDirectoryChangesW completion event for the platform loop.
+ * Windows start returns a nonnegative service token, not a CRT descriptor. */
+void *file_watch_handle(void);
+#endif
 /* Path-only member of the SAME service, for untrusted config files. Setup
  * takes an absolute path whose parent exists, including an absent target.
  * Caller retains path/member until stop; single UI owner, setup off typing.
@@ -324,7 +338,7 @@ typedef struct file_save_args {
     void *validate_ctx;
     void (*replaced)(void *ctx);      /* publish replacement identity under lock, if any */
     void *replaced_ctx;
-    pthread_mutex_t *lock;            /* held across check+rename+identity; may be NULL */
+    os_mutex *lock;            /* held across check+rename+identity; may be NULL */
     file_id *out_id;                  /* identity of the new file; may be NULL */
     uint64_t written;                 /* out */
     int err_no;                       /* out */

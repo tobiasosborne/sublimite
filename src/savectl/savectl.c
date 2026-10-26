@@ -107,7 +107,7 @@ static bool busy_wait(int rc)
     while (nanosleep(&tick, &tick) && errno == EINTR) {}
     return true;
 }
-static file_id identity(const struct stat *st)
+static file_id identity(const os_stat *st)
 {
     file_id id;
     file_id_from_stat(&id,st);
@@ -167,14 +167,15 @@ static void reload_worker(savectl *s)
     result *r=&s->completion->value;
     int fd=open(s->path,O_RDONLY|O_CLOEXEC|O_NONBLOCK);
     if (fd<0) { r->file_error=FILE_ERR_IO; r->err_no=errno; return; }
-    struct stat before,after;
+    os_file source=os_file_from_fd(fd);
+    os_stat before,after;
     reload_bytes *copy=NULL;
-    if (fstat(fd,&before)) { r->file_error=FILE_ERR_IO; goto end; }
-    if (!S_ISREG(before.st_mode) || before.st_size<0) { r->file_error=FILE_ERR_NOTREG; goto end; }
+    if (os_file_stat(&source,&before)) { r->file_error=FILE_ERR_IO; goto end; }
+    if (before.kind!=OS_KIND_FILE) { r->file_error=FILE_ERR_NOTREG; goto end; }
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),r->id)) { r->file_error=FILE_ERR_CHANGED; goto end; }
-    uint64_t len=(uint64_t)before.st_size;
+    uint64_t len=(uint64_t)before.size;
     if (len>SIZE_MAX) { r->file_error=FILE_ERR_NOMEM; goto end; }
     copy=calloc(1,sizeof *copy);
     if (!copy) { r->file_error=FILE_ERR_NOMEM; goto end; }
@@ -225,7 +226,7 @@ static void reload_worker(savectl *s)
         int saved_errno=errno; (void)close(backing); errno=saved_errno;
         if (r->file_error) goto end;
     }
-    if (fstat(fd,&after)) { r->file_error=FILE_ERR_IO; goto end; }
+    if (os_file_stat(&source,&after)) { r->file_error=FILE_ERR_IO; goto end; }
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),identity(&after)) || !same(identity(&after),r->id))

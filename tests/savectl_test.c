@@ -87,7 +87,7 @@ static void contents(const char *path, const char *expected)
 }
 static file_id base_id(const char *path)
 {
-    struct stat st; CHECK(stat(path,&st)==0);
+    os_stat st; CHECK(os_stat_path(path,0,&st)==OS_OK);
     file_id id; file_id_from_stat(&id,&st); return id;
 }
 static void nap(void) { struct timespec t={0,100000}; (void)nanosleep(&t,NULL); }

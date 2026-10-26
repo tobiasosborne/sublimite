@@ -1,3 +1,6 @@
+#if defined(_WIN32)
+#include "file_win_cases.inc"
+#else
 /* file_test.c -- P1.7: open, EOL, change detection, durable save. */
 #include "file/file.h"
 #include "file/file_test.h"
@@ -1261,7 +1264,8 @@ ssize_t __wrap_pread(int fd, void *p, size_t n, off_t off)
     return __real_pread(fd, p, n, off);
 }
 ssize_t __real_write(int, const void *, size_t);
-ssize_t __wrap_write(int fd, const void *p, size_t n)
+ssize_t __real_pwrite(int, const void *, size_t, off_t);
+static ssize_t latency_write(int fd, const void *p, size_t n, off_t offset, bool positioned)
 {
     int mode = atomic_load(&latency_write_mode);
     if (mode) {
@@ -1272,8 +1276,12 @@ ssize_t __wrap_write(int fd, const void *p, size_t n)
         if (mode == 1 || mode == 2 || mode == 4) { errno = ENOSPC; return -1; }
         if (mode == 3 && n > 7) n = 7;
     }
-    return __real_write(fd, p, n);
+    return positioned ? __real_pwrite(fd, p, n, offset) : __real_write(fd, p, n);
 }
+ssize_t __wrap_write(int fd, const void *p, size_t n)
+{ return latency_write(fd, p, n, 0, false); }
+ssize_t __wrap_pwrite(int fd, const void *p, size_t n, off_t off)
+{ return latency_write(fd, p, n, off, true); }
 ssize_t __real_read(int, void *, size_t);
 ssize_t __wrap_read(int fd, void *p, size_t n)
 {
@@ -2156,6 +2164,8 @@ static int semantic_dispatch(const char *which)
     return 1;
 }
 
+#include "file_os_cases.inc"
+
 int main(void)
 {
     const char *base = getenv("TMPDIR");
@@ -2172,6 +2182,7 @@ int main(void)
     const char *review_case = getenv("FT_CASE");
     if (review_case) {
         if (semantic_dispatch(review_case)) {}
+        else if (strcmp(review_case, "os-migration") == 0) file_os_migration_cases(&pool, dir);
         else if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
         else if (strcmp(review_case, "p1-fault") == 0) review_run("P1-1 section 2", t_p1_fault_publication);
         else if (strcmp(review_case, "p1-cancel") == 0) review_run("P1-1 section 3", t_p1_cancel_readiness);
@@ -2213,6 +2224,7 @@ int main(void)
     if (getenv("FT_V")) {
         fprintf(stderr, "run eol\n");
     }
+    file_os_migration_cases(&pool, dir);
     t_eol();
     if (getenv("FT_V")) {
         fprintf(stderr, "run open_small_copy\n");
@@ -2293,3 +2305,5 @@ finish:
     printf("file_test: ok\n");
     return 0;
 }
+
+#endif

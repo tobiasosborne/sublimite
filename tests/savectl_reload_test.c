@@ -50,9 +50,10 @@ ssize_t pread(int fd, void *bytes, size_t n, off_t off)
     return got;
 }
 
-static file_id baseline(const struct stat *st)
+static file_id baseline(int fd)
 {
-    file_id id; file_id_from_stat(&id,st); return id;
+    os_file source=os_file_from_fd(fd); os_stat st; CHECK(os_file_stat(&source,&st)==OS_OK);
+    file_id id; file_id_from_stat(&id,&st); return id;
 }
 static void wait_idle(savectl *s)
 {
@@ -91,7 +92,7 @@ int main(int argc, char **argv)
     piece_allocator a=piece_default_allocator();
     piece_tree *old=piece_create(&a); CHECK(old);
     CHECK(piece_init_copy(old,(const uint8_t *)"old edits",9)==0);
-    savectl_options options={.pool=pool,.path=path,.baseline=baseline(&st),
+    savectl_options options={.pool=pool,.path=path,.baseline=baseline(fd),
         .source_mode=FILE_MODE_COPY,.reload_allocator=a};
     savectl *s=NULL; CHECK(savectl_create(&s,&options,true)==0);
     memset(bytes,'B',len);
