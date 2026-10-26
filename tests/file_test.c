@@ -2182,6 +2182,7 @@ int main(void)
     const char *review_case = getenv("FT_CASE");
     if (review_case) {
         if (semantic_dispatch(review_case)) {}
+        else if (strcmp(review_case, "round2") == 0) file_os_round2_cases(&pool, dir);
         else if (strcmp(review_case, "os-migration") == 0) file_os_migration_cases(&pool, dir);
         else if (strcmp(review_case, "signal_child") == 0 && signal_mode) t_review_signal_child(signal_mode);
         else if (strcmp(review_case, "p1-fault") == 0) review_run("P1-1 section 2", t_p1_fault_publication);
@@ -2225,6 +2226,7 @@ int main(void)
         fprintf(stderr, "run eol\n");
     }
     file_os_migration_cases(&pool, dir);
+    file_os_round2_cases(&pool, dir);
     t_eol();
     if (getenv("FT_V")) {
         fprintf(stderr, "run open_small_copy\n");

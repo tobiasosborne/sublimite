@@ -335,7 +335,9 @@ static void prefix_job(work_ctx *c)
         size_t n = want - off;
         if (n > 65536u) n = 65536u;
         size_t got;
-        if (os_file_pread(&fd, bytes + off, n, off, &got) != OS_OK) {
+        os_err read_result = file_pread_once(&fd, bytes + off, n, off, &got);
+        if (read_result == OS_E_INTR) continue;
+        if (read_result != OS_OK) {
             en = os_native_error(); rc = FILE_ERR_IO; goto done;
         }
         if (got == 0) { rc = FILE_ERR_CHANGED; goto done; }
@@ -420,7 +422,9 @@ static void open_job(work_ctx *c)
             if (want > FILE_READ_CHUNK) want = FILE_READ_CHUNK;
             if (work_should_stop(c)) { status = FILE_ERR_CANCELLED; goto done; }
             size_t r;
-            if (os_file_pread(&f->fd, buf + off, want, off, &r) != OS_OK) {
+            os_err read_result = file_pread_once(&f->fd, buf + off, want, off, &r);
+            if (read_result == OS_E_INTR) continue;
+            if (read_result != OS_OK) {
                 en = os_native_error(); status = FILE_ERR_IO; break;
             }
             if (r == 0) { status = FILE_ERR_CHANGED; break; }
@@ -885,11 +889,16 @@ static int metadata_capture(save_transaction *tx)
     if (tx->metadata_id.exists && (st.kind == OS_KIND_LINK)) return FILE_ERR_CHANGED;
     if (a->expect && file_id_diff(a->expect, &tx->metadata_id)) return FILE_ERR_CHANGED;
     if (!tx->metadata_id.exists || !(st.kind == OS_KIND_FILE)) return FILE_OK;
-    if (os_file_open_at(&tx->metadata_fd, &tx->dfd, tx->base,
-                        OS_OPEN_READ | OS_OPEN_NONBLOCK | OS_OPEN_NOFOLLOW) != OS_OK) { a->err_no = os_native_error(); return FILE_ERR_IO; }
+    os_err opened = os_file_open_at(&tx->metadata_fd, &tx->dfd, tx->base,
+                                    OS_OPEN_READ | OS_OPEN_NONBLOCK | OS_OPEN_NOFOLLOW);
+    if (opened != OS_OK) {
+        a->err_no = os_native_error();
+        return opened == OS_E_ISDIR ? FILE_ERR_CHANGED : FILE_ERR_IO;
+    }
     if (os_file_stat(&tx->metadata_fd, &st) != 0) { a->err_no = os_native_error(); return FILE_ERR_IO; }
     file_id observed; file_id_from_stat(&observed, &st);
     if (file_id_diff(&tx->metadata_id, &observed)) return FILE_ERR_CHANGED;
+    if (file_metadata_check(&tx->metadata_fd) != 0) { a->err_no = os_native_error(); return FILE_ERR_IO; }
     return FILE_OK;
 }
 static int metadata_apply(save_transaction *tx)
@@ -924,12 +933,20 @@ static int transaction_prepare(save_transaction *tx)
     if (os_dir_open(&tx->dfd, dir) != OS_OK) { a->err_no = os_native_error(); return FILE_ERR_IO; }
     int rc = metadata_capture(tx);
     if (rc != FILE_OK) { transaction_discard(tx); return rc; }
+#if defined(_WIN32)
+    /* Native components are UTF-16; never byte-truncate a UTF-8 basename. */
+    snprintf(tx->tmp, sizeof tx->tmp, ".edit-%llu-%llu.tmp",
+             (unsigned long long)os_proc_id(), (unsigned long long)os_wall_ns());
+#else
     snprintf(tx->tmp, sizeof tx->tmp, ".%.*s.edit-%llu-%llu.tmp", FILE_NAME_MAX_KEEP,
              tx->base, (unsigned long long)os_proc_id(), (unsigned long long)os_wall_ns());
-    if (os_file_open_at(&tx->fd, &tx->dfd, tx->tmp,
-                        OS_OPEN_WRITE | OS_OPEN_CREATE | OS_OPEN_EXCL) != OS_OK) {
+#endif
+    if (file_save_temp(tx) != 0) {
         /* A failed O_EXCL may name somebody else's temp: never unlink it. */
         a->err_no = os_native_error(); tx->tmp[0] = '\0'; transaction_discard(tx); return FILE_ERR_IO;
+    }
+    if (file_metadata_prepare(tx) != 0) {
+        a->err_no = os_native_error(); transaction_discard(tx); return FILE_ERR_IO;
     }
     step_call(a, FILE_STEP_TEMP_CREATED);
     piece_iter it; const uint8_t *bytes; size_t n;
@@ -964,6 +981,7 @@ static int transaction_commit(save_transaction *tx)
 {
     file_save_args *a = &tx->args;
     int rc = FILE_ERR_IO, locked = 0;
+    os_file observer = OS_FILE_INIT;
     if (a->lock) { os_mutex_lock(a->lock); locked = 1; }
     if (a->stop && a->stop(a->stop_ctx)) { rc = FILE_ERR_CANCELLED; goto fail; }
     {
@@ -980,19 +998,21 @@ static int transaction_commit(save_transaction *tx)
     if (os_file_stat(&tx->fd, &st) != 0) { a->err_no = os_native_error(); goto fail; }
     if (a->validate) { rc = a->validate(a->validate_ctx); if (rc != FILE_OK) goto fail; }
     rc = FILE_ERR_IO;
+    if (file_save_observer(&tx->fd, &observer) != 0) { a->err_no = os_native_error(); goto fail; }
     if (os_rename_at(&tx->dfd, tx->tmp, &tx->dfd, tx->base, OS_RENAME_REPLACE) != 0) { a->err_no = os_native_error(); goto fail; }
     tx->tmp[0] = '\0';
+    os_file_close(&tx->fd); tx->fd = (os_file)OS_FILE_INIT;
     int identity_error = 0;
     os_stat renamed;
-    if (os_file_stat(&tx->fd, &renamed) != 0) identity_error = os_native_error();
+    if (os_file_stat(&observer, &renamed) != 0) identity_error = os_native_error();
     else st = renamed;
+    os_file_close(&observer); observer = (os_file)OS_FILE_INIT;
     if (a->out_id) {
         file_id_from_stat(a->out_id, &st);
         if (identity_error) a->out_id->metadata_valid = 0;
     }
     if (a->replaced) a->replaced(a->replaced_ctx);
     if (locked) { os_mutex_unlock(a->lock); locked = 0; }
-    os_file_close(&tx->fd); tx->fd = (os_file)OS_FILE_INIT;
     a->written = tx->done;
     step_call(a, FILE_STEP_RENAMED);
     if (os_dir_sync(&tx->dfd) != 0) {
@@ -1003,6 +1023,7 @@ static int transaction_commit(save_transaction *tx)
     if (identity_error) { a->err_no = identity_error; return FILE_ERR_IO; }
     return FILE_OK;
 fail:
+    os_file_close(&observer);
     if (locked) os_mutex_unlock(a->lock);
     transaction_discard(tx); return rc;
 }

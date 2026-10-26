@@ -123,5 +123,10 @@ void file_split_path(const char *, char *, size_t, char *, size_t);
 void file_watch_check_pump(file *);
 void file_watch_detach(file *);
 int file_native_error(os_err);
+os_err file_pread_once(os_file *, void *, size_t, uint64_t, size_t *);
+int file_save_observer(const os_file *, os_file *);
+int file_metadata_prepare(save_transaction *);
+int file_save_temp(save_transaction *);
+int file_metadata_check(const os_file *);
 int file_metadata_copy(const os_file *, os_file *, const file_id *);
 #endif

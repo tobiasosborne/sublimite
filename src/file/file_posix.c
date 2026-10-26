@@ -266,6 +266,22 @@ int file_native_error(os_err error)
     return errno;
 }
 
+os_err file_pread_once(os_file *source, void *bytes, size_t n, uint64_t offset, size_t *got)
+{
+    ssize_t result = pread(os_file_fd(source), bytes, n, (off_t)offset);
+    *got = result < 0 ? 0 : (size_t)result;
+    return result >= 0 ? OS_OK : errno == EINTR ? OS_E_INTR : OS_E_IO;
+}
+int file_save_observer(const os_file *writer, os_file *observer)
+{ return os_file_dup(observer, writer) == OS_OK ? 0 : -1; }
+int file_metadata_prepare(save_transaction *tx) { (void)tx; return 0; }
+int file_save_temp(save_transaction *tx)
+{
+    return os_file_open_at(&tx->fd, &tx->dfd, tx->tmp,
+                           OS_OPEN_WRITE | OS_OPEN_CREATE | OS_OPEN_EXCL) == OS_OK ? 0 : -1;
+}
+int file_metadata_check(const os_file *source) { (void)source; return 0; }
+
 int file_metadata_copy(const os_file *source, os_file *target, const file_id *identity)
 {
     int src = os_file_fd(source), dst = os_file_fd(target);

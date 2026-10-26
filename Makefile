@@ -145,6 +145,9 @@ EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
 $(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
+# File acquisition syscall injection is confined to this regression binary.
+$(B)/tests/file_acquire_test $(B)/san/tests/file_acquire_test: LDLIBS += -Wl,--wrap=pread,--wrap=os_file_open_at
+
 # Linux-only oracle; production keys/config have no libxkbcommon dependency.
 $(B)/tests/keys_test $(B)/san/tests/keys_test: LDLIBS += -lxkbcommon
 

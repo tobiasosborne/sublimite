@@ -111,7 +111,7 @@ static void journal_session(const uint8_t *data, size_t size)
     journal *j = NULL; REQUIRE(journal_open_with_io(&j, logpath, jp, NULL, &io) == 0);
     journal_base previous; REQUIRE(journal_capture_base(path, &previous) == 0);
     REQUIRE(journal_set_base(j, 1, &previous) == 0);
-    struct stat st; REQUIRE(stat(path, &st) == 0); file_id id; file_id_from_stat(&id, &st);
+    os_stat st; REQUIRE(os_stat_path(path, 0, &st) == OS_OK); file_id id; file_id_from_stat(&id, &st);
     unsigned scenario = data[0] % 6u;
     fuzz_pause pause = {0};
     savectl_options options = {.pool=pool, .path=path, .baseline=id, .source_mode=FILE_MODE_COPY,
@@ -227,7 +227,7 @@ static void acquisition_session(const uint8_t *data, size_t size)
     char path[128], away[128]; REQUIRE(snprintf(path, sizeof path, "%s/target", directory) > 0);
     REQUIRE(snprintf(away, sizeof away, "%s-away", directory) > 0);
     replace_disk(path, (const uint8_t *)"base", 4);
-    struct stat before; REQUIRE(stat(path, &before) == 0); file_id id; file_id_from_stat(&id, &before);
+    os_stat before; REQUIRE(os_stat_path(path, 0, &before) == OS_OK); file_id id; file_id_from_stat(&id, &before);
     work_pool *pool = new_pool(); acquisition_fault fault = {0};
     unsigned scenario = data[0] % 6u;
     savectl_options options = {.pool=pool, .path=path, .baseline=id, .source_mode=FILE_MODE_COPY,
@@ -307,7 +307,7 @@ static int backing_guard(void *ctx)
 static void real_mapped_fault(const uint8_t *data, const char *path, work_pool *pool)
 {
     uint8_t bytes[8192]; memset(bytes, 'a', sizeof bytes); replace_disk(path, bytes, sizeof bytes);
-    struct stat st; REQUIRE(stat(path, &st) == 0); file_id id; file_id_from_stat(&id, &st);
+    os_stat st; REQUIRE(os_stat_path(path, 0, &st) == OS_OK); file_id id; file_id_from_stat(&id, &st);
     file *opened = NULL; file_open_opts opts = {.copy_threshold=1, .generation=73};
     REQUIRE(file_open_begin(pool, path, &opts, &opened) == FILE_OK);
     while (!file_open_ready(opened)) {
@@ -340,7 +340,9 @@ static void multichunk_reload(const uint8_t *data, size_t size, const char *path
     uint8_t *block = malloc(FILE_PREFIX_MAX); REQUIRE(block); memset(block, 'a', FILE_PREFIX_MAX);
     int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0600); REQUIRE(fd >= 0);
     for (size_t i = 0; i < chunks; i++) REQUIRE(write(fd, block, FILE_PREFIX_MAX) == FILE_PREFIX_MAX);
-    struct stat st; REQUIRE(fstat(fd, &st) == 0); file_id id; file_id_from_stat(&id, &st);
+    struct stat st; REQUIRE(fstat(fd, &st) == 0);
+    os_file source = os_file_from_fd(fd); os_stat observed;
+    REQUIRE(os_file_stat(&source, &observed) == OS_OK); file_id id; file_id_from_stat(&id, &observed);
     int events = inotify_init1(IN_NONBLOCK|IN_CLOEXEC); REQUIRE(events >= 0);
     REQUIRE(inotify_add_watch(events, path, IN_ACCESS) >= 0);
     piece_allocator allocator = piece_default_allocator();

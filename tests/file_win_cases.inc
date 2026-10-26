@@ -6,6 +6,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -258,8 +259,14 @@ static int win_child_save(const char *path, int step)
 {
     piece_allocator allocator = piece_default_allocator(); piece_tree *t = piece_create(&allocator);
     if (!t) return 2;
-    const uint8_t next[] = "new durable generation\n";
-    if (piece_init_copy(t, next, sizeof next - 1) != PIECE_OK) return 2;
+    /* Four native save chunks (FILE_PREFIX_MAX / 256 KiB) put MID_WRITE
+     * before the final byte, exercising a partially written crash artifact. */
+    uint8_t *next = malloc(FILE_PREFIX_MAX);
+    if (!next) return 2;
+    memset(next, 'N', FILE_PREFIX_MAX);
+    int initialized = piece_init_copy(t, next, FILE_PREFIX_MAX);
+    free(next);
+    if (initialized != PIECE_OK) return 2;
     piece_snapshot *snapshot = piece_snapshot_take(t);
     if (!snapshot) return 2;
     file_save_args args = {.path = path, .snap = snapshot, .step = win_crash_step, .step_ctx = &step};
@@ -270,10 +277,18 @@ static int win_child_save(const char *path, int step)
 static void win_durability(void)
 {
     char path[OS_PATH_MAX], exe[OS_PATH_MAX]; win_path(path, "durability");
-    const uint8_t old[] = "old durable generation\n", next[] = "new durable generation\n";
+    const uint8_t old[] = "old durable generation\n";
+    uint8_t *next = malloc(FILE_PREFIX_MAX); CHECK(next); memset(next, 'N', FILE_PREFIX_MAX);
     CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
     for (int step = FILE_STEP_TEMP_CREATED; step <= FILE_STEP_DIR_SYNCED; step++) {
         win_write(path, old, sizeof old - 1);
+        PSECURITY_DESCRIPTOR sd = NULL; PACL acl = NULL; BOOL present, def;
+        CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;OW)", SDDL_REVISION_1, &sd, NULL));
+        CHECK(GetSecurityDescriptorDacl(sd, &present, &acl, &def));
+        WCHAR wide[OS_PATH_MAX]; CHECK(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, OS_PATH_MAX));
+        CHECK(SetNamedSecurityInfoW(wide, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                   NULL, NULL, acl, NULL) == ERROR_SUCCESS);
+        LocalFree(sd);
         char which[16]; CHECK(snprintf(which, sizeof which, "%d", step) > 0);
         const char *argv[] = {exe, "--child-save", path, which, NULL};
         os_proc child; os_proc_status status;
@@ -283,20 +298,33 @@ static void win_durability(void)
          * returning normally cannot satisfy this expected process outcome. */
         CHECK(status.how == OS_PROC_EXITED && status.code == FILE_STEP_DIR_SYNCED + 1);
         const uint8_t *expected = step >= FILE_STEP_RENAMED ? next : old;
-        size_t n = step >= FILE_STEP_RENAMED ? sizeof next - 1 : sizeof old - 1;
+        size_t n = step >= FILE_STEP_RENAMED ? FILE_PREFIX_MAX : sizeof old - 1;
         win_read_equals(path, expected, n);
         os_dir dir = OS_DIR_INIT; os_dir_iter it; const char *name;
         CHECK(os_dir_open(&dir, root) == OS_OK && os_dir_iter_open(&it, &dir) == OS_OK);
         for (;;) {
             CHECK(os_dir_next(&it, &name) == OS_OK);
             if (!name) break;
-            CHECK(!strcmp(name, "durability") || !strncmp(name, ".durability.edit-", strlen(".durability.edit-")));
-            if (strcmp(name, "durability")) CHECK(os_unlink_at(&dir, name) == OS_OK);
+            CHECK(!strcmp(name, "durability") || !strncmp(name, ".edit-", strlen(".edit-")));
+            if (strcmp(name, "durability")) {
+                os_file temp = OS_FILE_INIT;
+                CHECK(os_file_open_at(&temp, &dir, name, OS_OPEN_READ) == OS_OK);
+                PSECURITY_DESCRIPTOR saved = NULL; PACL dacl = NULL;
+                CHECK(GetSecurityInfo(os_file_handle(&temp), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                      NULL, NULL, &dacl, NULL, &saved) == ERROR_SUCCESS);
+                BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD size = sizeof sid;
+                CHECK(CreateWellKnownSid(WinWorldSid, NULL, sid, &size));
+                TRUSTEE_W trustee; BuildTrusteeWithSidW(&trustee, sid); ACCESS_MASK rights = 0;
+                CHECK(GetEffectiveRightsFromAclW(dacl, &trustee, &rights) == ERROR_SUCCESS);
+                CHECK(!(rights & (FILE_READ_DATA | FILE_WRITE_DATA)));
+                LocalFree(saved); os_file_close(&temp); CHECK(os_unlink_at(&dir, name) == OS_OK);
+            }
         }
         os_dir_iter_close(&it); os_dir_close(&dir);
     }
     CHECK(os_unlink(path) == OS_OK);
-    puts("file_test: self-reexec crash at every atomic-save step: ok");
+    free(next);
+    puts("file_test: self-reexec multichunk crash at every atomic-save step, restrictive artifacts: ok");
 }
 int main(int argc, char **argv)
 {
@@ -308,6 +336,7 @@ int main(int argc, char **argv)
         (unsigned long long)os_proc_id(), (unsigned long long)os_wall_ns()) > 0);
     CHECK(os_mkdir(root) == OS_OK); trace_init(); CHECK(work_pool_init(&pool, 1, 1) == 0);
     file_os_migration_cases(&pool, root);
+    file_os_round2_cases(&pool, root);
     win_eol_and_copy(); win_copy_suffix(); win_mapping(); win_save_roundtrip(); win_save_errors(); win_notifications(); win_durability();
     CHECK(file_test_guard_registry() == 3);
     work_pool_shutdown(&pool); CHECK(os_rmdir(root) == OS_OK);

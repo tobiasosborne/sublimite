@@ -158,6 +158,7 @@ $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 # White-box journal transport shim; production has no per-syscall indirection.
 $(WIN_B)/rel/tests/journal_transport_test.exe: tests/win/journal_transport_test.c src/journal/journal.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
@@ -175,6 +176,17 @@ $(WIN_B)/san/tests/journal_safety_test.exe: tests/journal_safety_test.c src/jour
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/journal/journal.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 =======
+=======
+# File shims replace only the file implementation objects in this test TU.
+$(WIN_B)/rel/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c src/file/file_win.c tests/file_win_cases.inc tests/file_os_cases.inc $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/file.o %/file_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
+>>>>>>> 38c0acc (edit-pf3l round 2: review findings 1-15 (temporary created under the source's security state before any write; EFS sources saved encrypted; named streams preserved; exact DACL/label copy without re-inheritance; identity published after writer close; one OVERLAPPED event per watched directory; watch re-arm after parent move; identity+handle cache key; UTF-8 temporary name budget; cancellation between interrupted reads; savectl fuzzer builds; shared safety regressions on Windows; Linux CHANGED classification restored))
 # file_test's platform-selected and shared cases are included by its source.
 $(WIN_B)/rel/tests/file_test.exe $(WIN_B)/san/tests/file_test.exe: tests/file_os_cases.inc tests/file_win_cases.inc
 >>>>>>> d7c99cd (edit-pf3l: W2.1 src/file on os.h; file_bus deleted, mapped originals registered with os_fault_register; file_posix.c (inotify, xattrs) and file_win.c (ReadDirectoryChangesW, security descriptor); §9.1/§9.2 regressions; file_test as a Windows exe)

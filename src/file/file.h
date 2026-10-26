@@ -287,7 +287,7 @@ int file_resolve_keep(file *f);
 int file_watch_start(file *f);
 int file_watch_poll(file *f);
 #if defined(_WIN32)
-/* Borrowed shared ReadDirectoryChangesW completion event for the platform loop.
+/* Borrowed aggregate ReadDirectoryChangesW wake event for the platform loop.
  * Windows start returns a nonnegative service token, not a CRT descriptor. */
 void *file_watch_handle(void);
 #endif
