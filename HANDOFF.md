@@ -1,3 +1,22 @@
+# HANDOFF — sublimité, session 22 IN PROGRESS (2026-10-26 ~09:05 box clock; Fable consultant/coordinator in the main session, Tobias present; desktop Spiral)
+
+## Read first (session 22 continuation or session 23)
+**Two rule changes from Tobias this morning, recorded in CLAUDE.md law 1, PLAN §1/P5.1b, PRD §9, windows-port.md:** (1) the Astra vs Sublime drive is retired as a gate ("a bootstrap loop to get the first versions above the buggy floor"); hand-over is `make check` green plus bead verification; (2) **M0 exited by use**: "the editor is good enough that I can use it and report bugs slowly" (edit-pi6 closed). Linux is in use-and-fix mode at his pace; the Windows port (edit-177r) is the main line.
+
+**Landed today (main 8713c65, pushed):** edit-hltk (Spiral `make check` reaches the end: 104-105 suites, exit 0, 12-13 min), edit-177r.4 W0.4 (nine core modules on os.h, four verified pure, `win-compile` target; mincore gap → backlog edit-uunn, Windows takes the bulk lane).
+
+**Verified, awaiting its Codex review, then lands:** edit-177r.3 W0.3 on branch `wt/edit-177r.3-s12` (3cc78a5, rebased onto 8713c65): os_win.c, Windows malloc guard, UTF-8 manifest; os_test 17/17 rel and san as a Windows exe; decisions docs/decisions/edit-177r.3.md §7. Review output: docs/reviews/edit-177r.3.md in that worktree (Codex sol xhigh, session 01a17734-c9eb). Triage per law 8, fix blockers in the worktree, run the full Linux check once, ff-merge, close, then dispatch **W0.5** (brief already written: build/briefs/edit-177r.5-s12.md; worktree from main after W0.3 lands; Codex sol high).
+
+**In flight (Codex sol high, one bead each):** edit-v4ee W1.0a (`.wt/edit-v4ee-s12`, display size + keysym table), edit-pqqs W1.0b (`.wt/edit-pqqs-s12`, struct plat backend-private). Both Linux-only refactors, land with a full `make check` each; they both touch src/x11/plat.h, so the second to land rebases over the first.
+
+**Quota policy today (Tobias):** work around pace; equalise Fable and Claude (they were 5 points apart at 08:07, 3 at 08:52); the one exceptional Fable subagent was spent on W0.3 (359,685 tokens (M)); Codex sol carries everything else. Codex's quota row reads 0 % all morning: the Windows-side login the quota app reads does not see WSL's codex usage (E); treat Codex pace as unknown.
+
+**Box:** Xvfb :95 and :99 up (2880x1800, 100 dpi, -noreset); corpus rebuilt at /tmp/edit-corpus; Codex worktrees under `.wt/*-s12`; briefs and codex logs under build/briefs/ (not in git). Worklog: docs/worklog/2026-10-26.md.
+
+Everything below is the session-21 handoff, kept for its own state.
+
+---
+
 # HANDOFF — sublimité, end of session 21 (2026-10-25 ~15:30 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "we stop work for today")
 
 ## Read first (session 22)
