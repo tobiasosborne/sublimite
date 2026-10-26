@@ -11,7 +11,7 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
@@ -23,7 +23,7 @@ WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 WIN_TEST_SAN := $(addprefix $(WIN_B)/san/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 # OS imports plus D3D11/DXGI and interface GUIDs. Shader compiler is runtime-loaded.
-WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid -ldwmapi -ladvapi32
+WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid -ldwmapi -ladvapi32 -luser32 -lshcore
 # UTF-8 activeCodePage manifest (src/os/utf8.manifest, decision doc edit-177r.2
 # §3.9), embedded as RT_MANIFEST 1 through a windres-compiled resource and linked
 # into every Windows executable: the CRT's narrow argv, fopen and getenv become UTF-8.
@@ -143,13 +143,6 @@ $(WIN_B)/rel/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d11_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
-# Platform contract suite includes its implementation for native API fixtures.
-$(WIN_B)/rel/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
-	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
-$(WIN_B)/san/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
-	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 # White-box journal transport shim; production has no per-syscall indirection.
@@ -238,5 +231,15 @@ $(WIN_B)/san/tests/file_win_test.exe: tests/win/file_win_test.c src/file/file.c 
 
 # file_test's platform-selected and shared cases are included by its source.
 $(WIN_B)/rel/tests/file_test.exe $(WIN_B)/san/tests/file_test.exe: tests/file_os_cases.inc tests/file_win_cases.inc
+
+
+# Platform contract suite includes its implementation for native API fixtures (edit-upwq).
+$(WIN_B)/rel/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 -include $(shell find $(WIN_B) -name '*.d' 2>/dev/null)
