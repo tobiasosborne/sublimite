@@ -10,6 +10,7 @@
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <d3dcompiler.h>
+#include <dwmapi.h>
 #include <limits.h>
 #include <string.h>
 
@@ -23,8 +24,12 @@ typedef struct d3d11_strip { render_strip rows; UINT first, count; } d3d11_strip
 typedef struct d3d11_constants { uint32_t surface[4], motion[4]; } d3d11_constants;
 typedef struct d3d11_state {
     HWND window;
-    bool force_warp, readback, warp, debug, failed, swapped, drawn;
+    bool force_warp, readback, warp, debug, failed, swapped, drawn, query_ready;
     bool own_arena, full_frame, region_upload, latency_ready;
+    bool sync_started, sync_ready, suspended, invisible, resume_pending, recovery;
+    work_pool *sync_pool;
+    work_handle sync_job;
+    HRESULT sync_status;
     edit_arena arena;
     HMODULE compiler;
     ID3D11Device *device;
@@ -45,16 +50,16 @@ typedef struct d3d11_state {
     d3d11_strip *strips;
     size_t strip_count, instance_count;
     size_t *page_offsets;
-    uint8_t *atlas_cache;
+    uint8_t *atlas_cache, *glyph_seen, *atlas_dirty;
     uint32_t *region_pixels;
-    render_pixels region;
+    render_pixels region, previous_region;
     render_scroll scroll;
     render_dims dims;
     uint32_t surface_background, width, height, max_width, max_height, atlas_width, atlas_height;
     UINT pending_count;
     HRESULT present_error;
     d3d11_present_info present_info;
-    uint64_t deadline;
+    uint64_t deadline, last_observation;
 } d3d11_state;
 
 static bool d3d11_descriptor(const render_backend *b)
@@ -63,8 +68,29 @@ static bool d3d11_descriptor(const render_backend *b)
 }
 static int d3d11_fail(d3d11_state *s)
 { s->failed = true; return RENDER_ERR_DEVICE; }
+/* Healthy device, but this chain cannot authenticate a displayed frame.
+ * Adapter retains the active slot; W1.1 must shut down and rebuild on worker. */
+static int d3d11_recover(render_backend *b)
+{
+    d3d11_state *s = b->state; s->recovery = true;
+    b->info.capabilities &= ~RENDER_CAP_PRESENT_TIMING;
+    return RENDER_ERR_UNSUPPORTED;
+}
+static bool d3d11_paused(d3d11_state *s)
+{
+    uint64_t now = os_now_ns();
+    bool invisible = s->suspended || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
+    if ((!s->last_observation && s->deadline && now >= s->deadline) ||
+        (s->last_observation && now-s->last_observation >= D3D11_COMPLETION_NS) || invisible || s->invisible)
+        s->deadline = now+D3D11_COMPLETION_NS;
+    if (s->invisible && !invisible) s->resume_pending = true;
+    s->invisible = invisible; s->last_observation = now;
+    return invisible;
+}
 static void d3d11_release(d3d11_state *s)
 {
+    /* Join before releasing borrowed swapchain/window state or the arena. */
+    if (s->sync_started) { work_pool_shutdown(s->sync_pool); s->sync_started = false; }
     if (s->context) {
         s->context->lpVtbl->ClearState(s->context);
         s->context->lpVtbl->Flush(s->context);
@@ -91,7 +117,16 @@ static void d3d11_release(d3d11_state *s)
     D3D11_RELEASE(s->scene_rtv); D3D11_RELEASE(s->target_rtv);
     D3D11_RELEASE(s->scene_srv); D3D11_RELEASE(s->atlas_srv);
     D3D11_RELEASE(s->scene); D3D11_RELEASE(s->target); D3D11_RELEASE(s->atlas);
-    D3D11_RELEASE(s->backbuffer); D3D11_RELEASE(s->media); D3D11_RELEASE(s->swapchain);
+    D3D11_RELEASE(s->backbuffer);
+    /* D3D defers destruction. Drop dependent refs before the final unbind/
+     * flush, then drop the chain; keep context alive for the post-chain flush
+     * prescribed for immediate flip-chain replacement on the same HWND. */
+    if (s->context) {
+        s->context->lpVtbl->ClearState(s->context);
+        s->context->lpVtbl->Flush(s->context);
+    }
+    D3D11_RELEASE(s->media); D3D11_RELEASE(s->swapchain);
+    if (s->context) s->context->lpVtbl->Flush(s->context);
     if (s->latency) { CloseHandle(s->latency); s->latency = NULL; }
     D3D11_RELEASE(s->context); D3D11_RELEASE(s->device);
     if (s->compiler) { FreeLibrary(s->compiler); s->compiler = NULL; }
@@ -255,11 +290,12 @@ static bool d3d11_reserve(d3d11_state *s, const render_config *cfg)
     size_t strips = cfg->max_cells/2u+1u;
     size_t sizes[] = {cfg->max_cells*sizeof(d3d11_instance),strips*sizeof(d3d11_strip),
         cfg->max_pages*sizeof(size_t),atlas_bytes,
-        (size_t)cfg->max_region_width*cfg->max_region_height*sizeof(uint32_t)};
+        (size_t)cfg->max_region_width*cfg->max_region_height*sizeof(uint32_t),
+        cfg->max_glyphs,s->atlas_height,sizeof(work_pool)};
     size_t total = 0;
     for (size_t i = 0; i < sizeof sizes/sizeof sizes[0]; i++) {
-        if (sizes[i] > SIZE_MAX-total-_Alignof(max_align_t)) return false;
-        total += sizes[i]+_Alignof(max_align_t);
+        if (sizes[i] > SIZE_MAX-total-_Alignof(work_pool)) return false;
+        total += sizes[i]+_Alignof(work_pool);
     }
     edit_arena *arena = cfg->arena;
     if (!arena) {
@@ -271,12 +307,70 @@ static bool d3d11_reserve(d3d11_state *s, const render_config *cfg)
     s->page_offsets = edit_arena_alloc(arena,sizes[2],_Alignof(size_t));
     s->atlas_cache = edit_arena_alloc(arena,sizes[3],_Alignof(uint8_t));
     s->region_pixels = edit_arena_alloc(arena,sizes[4],_Alignof(uint32_t));
+    s->glyph_seen = edit_arena_alloc(arena,sizes[5],_Alignof(uint8_t));
+    s->atlas_dirty = edit_arena_alloc(arena,sizes[6],_Alignof(uint8_t));
+    if (!s->glyph_seen || !s->atlas_dirty) return false;
     if (!s->instances || !s->strips || !s->page_offsets || !s->atlas_cache || !s->region_pixels) return false;
+    s->sync_pool = edit_arena_alloc(arena,sizes[7],_Alignof(work_pool));
+    if (!s->sync_pool || work_pool_init(s->sync_pool,1,0) != 0) return false;
+    s->sync_started = true;
     memset(s->atlas_cache,0,atlas_bytes); return true;
+}
+/* Neither a latency signal nor SyncQPCTime identifies our displayed frame. */
+static HRESULT d3d11_statistics(d3d11_state *s, DXGI_FRAME_STATISTICS *stats)
+{
+    HRESULT hr = s->swapchain->lpVtbl->GetFrameStatistics(s->swapchain,stats);
+    if (s->media && (FAILED(hr) || !stats->PresentCount)) {
+        DXGI_FRAME_STATISTICS_MEDIA media = {0};
+        HRESULT other = s->media->lpVtbl->GetFrameStatisticsMedia(s->media,&media);
+        if (SUCCEEDED(other) && media.PresentCount) {
+            hr = other; stats->PresentCount = media.PresentCount; stats->SyncQPCTime = media.SyncQPCTime;
+        }
+    }
+    return hr;
+}
+/* Ordinary INIT runs on the exclusive worker while the HWND owner pumps.
+ * Exercise both completion sources before UI adoption; no application hooks. */
+static bool d3d11_probe(d3d11_state *s)
+{
+    if (!IsWindowVisible(s->window) || IsIconic(s->window)) return false;
+    uint64_t deadline = os_now_ns()+D3D11_COMPLETION_NS;
+    if (WaitForSingleObject(s->latency,(DWORD)(D3D11_COMPLETION_NS/UINT64_C(1000000))) != WAIT_OBJECT_0)
+        return false;
+    ID3D11RenderTargetView *probe_view = NULL;
+    if (FAILED(s->device->lpVtbl->CreateRenderTargetView(s->device,(ID3D11Resource *)s->backbuffer,NULL,&probe_view)))
+        return false;
+    const float black[4] = {0,0,0,1};
+    s->context->lpVtbl->ClearRenderTargetView(s->context,probe_view,black);
+    D3D11_RELEASE(probe_view);
+    s->context->lpVtbl->End(s->context,(ID3D11Asynchronous *)s->query);
+    s->context->lpVtbl->Flush(s->context);
+    for (;;) {
+        BOOL ready = FALSE;
+        HRESULT hr = s->context->lpVtbl->GetData(s->context,(ID3D11Asynchronous *)s->query,
+            &ready,sizeof ready,D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (FAILED(hr)) return false;
+        if (hr == S_OK && ready) break;
+        if (os_now_ns() >= deadline) return false;
+        Sleep(1);
+    }
+    DXGI_PRESENT_PARAMETERS params = {0};
+    if (FAILED(s->swapchain->lpVtbl->Present1(s->swapchain,1,0,&params))) return false;
+    UINT expected = 0;
+    if (FAILED(s->swapchain->lpVtbl->GetLastPresentCount(s->swapchain,&expected))) return false;
+    do {
+        if (FAILED(DwmFlush())) return false;
+        DXGI_FRAME_STATISTICS stats = {0};
+        HRESULT hr = d3d11_statistics(s,&stats);
+        if (SUCCEEDED(hr) && stats.PresentCount == expected && expected) return true;
+        if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return false;
+    } while (os_now_ns() < deadline);
+    return false;
 }
 static int d3d11_init(render_backend *b, const render_config *cfg)
 {
     d3d11_state *s = b->state;
+    b->info.capabilities &= ~RENDER_CAP_PRESENT_TIMING;
     HWND window = s->window; bool warp = s->force_warp, readback = s->readback;
     memset(s,0,sizeof *s); s->window = window; s->force_warp = warp; s->readback = readback;
     if (!cfg->platform) return RENDER_ERR_UNSUPPORTED;
@@ -303,15 +397,17 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
     if (!d3d11_native_init(s)) goto fail;
     rc = RENDER_ERR_INIT;
     if (!d3d11_resources(s,cfg)) goto fail;
-    DXGI_FRAME_STATISTICS initial_stats = {0};
-    (void)s->swapchain->lpVtbl->GetFrameStatistics(s->swapchain,&initial_stats);
-    if (s->media) {
-        DXGI_FRAME_STATISTICS_MEDIA initial_media = {0};
-        (void)s->media->lpVtbl->GetFrameStatisticsMedia(s->media,&initial_media);
+    rc = RENDER_ERR_UNSUPPORTED;
+    if (!cfg->background_init) {
+        if (!d3d11_probe(s)) goto fail;
+        b->info.capabilities |= RENDER_CAP_PRESENT_TIMING;
+    } else {
+        DXGI_FRAME_STATISTICS stats = {0};
+        HRESULT hr = d3d11_statistics(s,&stats);
+        if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) goto fail;
+        /* Background init cannot display a probe over the bootstrap. Advertise
+         * timing only after its first real matching-frame observation. */
     }
-    /* No diagnostic Present, including background_init. The first real frame
-     * must prove matching statistics; a missing/unsupported observation is
-     * terminal after the inherited completion watchdog, never endless BUSY. */
     return RENDER_OK;
 fail:
     d3d11_release(s);
@@ -322,6 +418,7 @@ static int d3d11_resize(render_backend *b, render_dims dims)
 {
     d3d11_state *s = b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
     RECT client;
     if (!GetClientRect(s->window,&client) || client.right <= 0 || client.bottom <= 0) return RENDER_ERR_BOUNDS;
     uint32_t w = (uint32_t)client.right, h = (uint32_t)client.bottom;
@@ -341,26 +438,34 @@ static int d3d11_submit(render_backend *b, const render_grid *g, const render_st
 {
     d3d11_state *s = b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
-    if (g->scroll.origin_y_q8 && !g->full_frame) return RENDER_ERR_STRIPS;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
+    if (g->scroll.cols && g->scroll.origin_y_q8 && !g->full_frame) return RENDER_ERR_STRIPS;
     /* Descriptors are consumed into value-only instances and packed pixels;
      * not even an atlas pointer survives submit. No native calls/allocations. */
     size_t offset = 0;
     for (size_t page = 0; page < g->page_count; page++) {
         const render_atlas_page *p = &g->pages[page]; s->page_offsets[page] = offset;
-        for (uint32_t y = 0; y < p->height; y++)
-            memcpy(s->atlas_cache+offset+(size_t)y*p->width,p->pixels+(size_t)y*p->stride,p->width);
         offset += (size_t)p->width*p->height;
     }
+    memset(s->glyph_seen,0,g->glyph_count);
+    memset(s->atlas_dirty,0,s->atlas_height);
     render_strip expanded = {0,g->dims.rows+1u};
-    bool fractional = g->scroll.origin_y_q8 != 0;
+    bool fractional = g->scroll.cols && g->scroll.origin_y_q8 != 0;
     const render_strip *draw = fractional ? &expanded : strips;
     s->strip_count = fractional ? 1u : count;
     s->instance_count = 0;
+    size_t rows = (size_t)g->dims.rows+(g->scroll.cols ? 1u : 0u);
+    if (s->strip_count > b->config.max_cells/2u+1u) return RENDER_ERR_CAPACITY;
     for (size_t i = 0; i < s->strip_count; i++) {
         UINT first = (UINT)s->instance_count;
+        if (draw[i].first_row > rows || draw[i].row_count > rows-draw[i].first_row)
+            return RENDER_ERR_BOUNDS;
         uint32_t end = draw[i].first_row+draw[i].row_count;
         for (uint32_t row = draw[i].first_row; row < end; row++) for (uint32_t col = 0; col < g->dims.cols; col++) {
-            const render_cell *c = &g->cells[(size_t)row*g->dims.cols+col];
+            size_t cell = (size_t)row*g->dims.cols+col;
+            if (cell >= g->cell_capacity || s->instance_count >= b->config.max_cells)
+                return RENDER_ERR_CAPACITY;
+            const render_cell *c = &g->cells[cell];
             d3d11_instance *instance = &s->instances[s->instance_count++];
             *instance = (d3d11_instance){.pos = {col*g->dims.cell_w,row*g->dims.cell_h,
                 g->dims.cell_w*((c->attrs & RENDER_ATTR_WIDE_LEFT) ? 2u : 1u),g->dims.cell_h},
@@ -370,22 +475,37 @@ static int d3d11_submit(render_backend *b, const render_grid *g, const render_st
                 const render_atlas_page *page = &g->pages[glyph->page];
                 instance->glyph[0] = (uint32_t)(s->page_offsets[glyph->page]+(size_t)glyph->y*page->width+glyph->x);
                 instance->glyph[1] = page->width; instance->glyph[2] = glyph->w; instance->glyph[3] = glyph->h;
+                if (!s->glyph_seen[c->atlas_slot]) {
+                    s->glyph_seen[c->atlas_slot] = 1;
+                    for (uint32_t y = 0; y < glyph->h; y++) {
+                        size_t dst = instance->glyph[0]+(size_t)y*page->width;
+                        const uint8_t *src = page->pixels+(size_t)(glyph->y+y)*page->stride+glyph->x;
+                        memcpy(s->atlas_cache+dst,src,glyph->w);
+                        size_t first_row = dst/s->atlas_width;
+                        size_t last_row = (dst+glyph->w-1u)/s->atlas_width;
+                        memset(s->atlas_dirty+first_row,1,last_row-first_row+1u);
+                    }
+                }
             }
         }
         s->strips[i] = (d3d11_strip){draw[i],first,(UINT)s->instance_count-first};
     }
+    s->previous_region = s->region;
+    s->region_upload = g->region.pixels && (g->region.dirty || g->full_frame ||
+        !s->region.pixels || s->region.width != g->region.width || s->region.height != g->region.height);
     s->region = g->region;
-    if (g->region.pixels) {
+    if (s->region_upload) {
         for (uint32_t y = 0; y < g->region.height; y++) for (uint32_t x = 0; x < g->region.width; x++)
             s->region_pixels[(size_t)y*g->region.width+x] =
                 g->region.pixels[(size_t)y*g->region.stride+x] | UINT32_C(0xff000000);
+    }
+    if (g->region.pixels) {
         s->region.pixels = s->region_pixels; s->region.stride = s->region.width;
         s->region.capacity = (size_t)s->region.width*s->region.height;
     }
-    s->region_upload = g->region.pixels && (g->region.dirty || g->full_frame || count);
-    s->full_frame = g->full_frame; s->scroll = g->scroll;
-    s->surface_background = g->surface_background; s->swapped = false; s->drawn = false;
-    s->pending_count = 0; s->present_error = S_OK; s->deadline = 0;
+    s->full_frame = g->full_frame; s->scroll = g->scroll.cols ? g->scroll : (render_scroll){0};
+    s->surface_background = g->surface_background; s->swapped = false; s->drawn = false; s->query_ready = false;
+    s->resume_pending = false; s->pending_count = 0; s->present_error = S_OK; s->deadline = 0;
     s->present_info = (d3d11_present_info){0};
     return RENDER_OK;
 }
@@ -412,7 +532,15 @@ static bool d3d11_draw(d3d11_state *s)
                                                 s->instance_count*sizeof(d3d11_instance))) return false;
     ID3D11ShaderResourceView *empty[2] = {NULL,NULL};
     c->lpVtbl->PSSetShaderResources(c,0,2,empty);
-    c->lpVtbl->UpdateSubresource(c,(ID3D11Resource *)s->atlas,0,NULL,s->atlas_cache,s->atlas_width,0);
+    /* Upload dirty rows of our private cache, never caller page bytes. */
+    for (uint32_t row = 0; row < s->atlas_height;) {
+        if (!s->atlas_dirty[row]) { row++; continue; }
+        uint32_t first = row++;
+        while (row < s->atlas_height && s->atlas_dirty[row]) row++;
+        D3D11_BOX box = {0,first,0,s->atlas_width,row,1};
+        c->lpVtbl->UpdateSubresource(c,(ID3D11Resource *)s->atlas,0,&box,
+            s->atlas_cache+(size_t)first*s->atlas_width,s->atlas_width,0);
+    }
     c->lpVtbl->RSSetState(c,s->rasterizer);
     c->lpVtbl->VSSetConstantBuffers(c,0,1,&s->constants);
     c->lpVtbl->PSSetConstantBuffers(c,0,1,&s->constants);
@@ -451,6 +579,19 @@ static bool d3d11_draw(d3d11_state *s)
             (LONG)(s->dims.cols*s->dims.cell_w),(LONG)end};
         c->lpVtbl->RSSetScissorRects(c,1,&clip); c->lpVtbl->Draw(c,4,0);
     }
+    /* Restore pixels formerly covered by the independent region from the
+     * uncomposited retained scene, applying this frame's scroll transform. */
+    if (s->previous_region.pixels) {
+        const render_pixels *old = &s->previous_region;
+        uint32_t right = old->x+old->width, bottom = old->y+old->height;
+        uint32_t gw = s->dims.cols*s->dims.cell_w, gh = s->dims.rows*s->dims.cell_h;
+        if (right > gw) right = gw;
+        if (bottom > gh) bottom = gh;
+        if (old->x < right && old->y < bottom) {
+            D3D11_RECT clip = {(LONG)old->x,(LONG)old->y,(LONG)right,(LONG)bottom};
+            c->lpVtbl->RSSetScissorRects(c,1,&clip); c->lpVtbl->Draw(c,4,0);
+        }
+    }
     /* Like GL, surface margins are independent of cell strips. A theme/base
      * change with zero cell damage still repaints every native margin. */
     c->lpVtbl->PSSetShader(c,s->margin_ps,NULL,0);
@@ -468,6 +609,9 @@ static bool d3d11_draw(d3d11_state *s)
         D3D11_BOX box = {0,0,0,s->region.width,s->region.height,1};
         c->lpVtbl->UpdateSubresource(c,(ID3D11Resource *)s->region_texture,0,&box,s->region_pixels,
                                     s->region.width*sizeof(uint32_t),0);
+    }
+    if (s->region.pixels) {
+        D3D11_BOX box = {0,0,0,s->region.width,s->region.height,1};
         c->lpVtbl->CopySubresourceRegion(c,(ID3D11Resource *)s->target,0,s->region.x,s->region.y,0,
                                        (ID3D11Resource *)s->region_texture,0,&box);
     }
@@ -482,13 +626,17 @@ static int d3d11_present(render_backend *b, uint32_t id)
 {
     (void)id; d3d11_state *s = b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
     if (s->swapped) return RENDER_OK;
     if (!s->deadline) s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
-    if (os_now_ns() >= s->deadline) return d3d11_fail(s);
+    if (d3d11_paused(s)) return RENDER_ERR_BUSY;
     /* A zero-time poll only. No fence wait or frame-latency wait on UI. */
     if (!s->latency_ready) {
         DWORD ready = WaitForSingleObject(s->latency,0);
-        if (ready == WAIT_TIMEOUT) { s->present_info.status = (int32_t)HRESULT_FROM_WIN32(ERROR_IO_PENDING); return RENDER_ERR_BUSY; }
+        if (ready == WAIT_TIMEOUT) {
+            s->present_info.status = (int32_t)HRESULT_FROM_WIN32(ERROR_IO_PENDING);
+            return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_ERR_BUSY;
+        }
         if (ready != WAIT_OBJECT_0) return d3d11_fail(s);
         s->latency_ready = true;
     }
@@ -496,35 +644,77 @@ static int d3d11_present(render_backend *b, uint32_t id)
         if (!d3d11_draw(s)) return d3d11_fail(s);
         s->drawn = true;
     }
-    /* Poll the query across present retries, never spin/block on UI. Ordering
-     * follows the T5 table literally: event query signalled, then Present. */
+    /* Observe if already ready, but do not gate native Present on this query:
+     * flip queues can retain a buffer until presentation advances. T5 requires
+     * BOTH query completion and T4; event() delivers their later observation. */
     BOOL ready = FALSE;
     HRESULT hr = s->context->lpVtbl->GetData(s->context,(ID3D11Asynchronous *)s->query,&ready,sizeof ready,D3D11_ASYNC_GETDATA_DONOTFLUSH);
     s->present_info.status = (int32_t)hr;
-    if (hr == S_FALSE || (hr == S_OK && !ready)) return RENDER_ERR_BUSY;
     if (FAILED(hr)) return d3d11_fail(s);
+    s->query_ready = hr == S_OK && ready;
     DXGI_PRESENT_PARAMETERS params = {0};
     hr = s->swapchain->lpVtbl->Present1(s->swapchain,1,DXGI_PRESENT_DO_NOT_WAIT,&params);
     s->present_info.status = (int32_t)hr;
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return RENDER_ERR_BUSY;
-    if (FAILED(hr) || hr == DXGI_STATUS_OCCLUDED) return d3d11_fail(s);
-    s->swapped = true; s->latency_ready = false;
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED)
+        return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_ERR_BUSY;
+    if (FAILED(hr)) return d3d11_fail(s);
+    s->swapped = true; s->latency_ready = false; s->resume_pending = false;
     s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
     s->present_error = s->swapchain->lpVtbl->GetLastPresentCount(s->swapchain,&s->pending_count);
     /* Present committed: latch subsequent failure for event, never invite a
      * duplicate retry of an already submitted frame. */
     return RENDER_OK;
 }
+/* A private init-reserved bulk lane guarantees DWM progress even when the
+ * caller's raster/font pool is saturated. It never touches the UI context. */
+static void d3d11_sync_worker(work_ctx *ctx)
+{
+    d3d11_state *s = ctx->arg;
+    UINT expected = s->pending_count;
+    HRESULT hr = DwmFlush();
+    work_msg msg = {.kind = D3D11_POLL_MESSAGE,.generation = ctx->generation};
+    memcpy(msg.data,&expected,sizeof expected);
+    memcpy(msg.data+sizeof expected,&hr,sizeof hr);
+    while (!work_should_stop(ctx) && !work_publish(ctx,&msg)) os_yield();
+}
+static void d3d11_sync_receive(const work_msg *msg, void *arg)
+{
+    render_backend *b = arg; d3d11_state *s = b->state;
+    UINT expected; HRESULT hr;
+    memcpy(&expected,msg->data,sizeof expected);
+    memcpy(&hr,msg->data+sizeof expected,sizeof hr);
+    if (!b->active || msg->generation != b->active_frame || expected != s->pending_count) return;
+    s->sync_ready = true; s->sync_status = hr;
+}
+static bool d3d11_sync_progress(render_backend *b, uint32_t id)
+{
+    d3d11_state *s = b->state;
+    if (s->sync_job.epoch)
+        (void)work_mailbox_receive(s->sync_pool,s->sync_job,id,d3d11_sync_receive,b);
+    if (s->sync_ready) return true;
+    if (!s->sync_job.epoch || work_handle_finished(s->sync_pool,s->sync_job))
+        s->sync_job = work_submit(s->sync_pool,(work_job){d3d11_sync_worker,s,id,WORK_BULK});
+    return false;
+}
 static int d3d11_event(render_backend *b, const render_event *event)
 {
     d3d11_state *s = b->state;
     if (event->work->kind != D3D11_POLL_MESSAGE) return RENDER_ERR_UNSUPPORTED;
     if (s->failed) return RENDER_ERR_DEVICE;
-    if (!s->swapped) return s->deadline && os_now_ns() >= s->deadline ? d3d11_fail(s) : RENDER_OK;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
+    if (d3d11_paused(s)) return RENDER_OK;
+    if (!s->swapped) return RENDER_OK;
     if (FAILED(s->present_error) || FAILED(s->device->lpVtbl->GetDeviceRemovedReason(s->device))) return d3d11_fail(s);
     if (!b->device_seen) {
-        /* The query was observed before Present; observation now is the later
-         * bound. Adapter clamps to T4 and delivers hooks here on UI. */
+        if (!s->query_ready) {
+            BOOL ready = FALSE;
+            HRESULT hr = s->context->lpVtbl->GetData(s->context,(ID3D11Asynchronous *)s->query,
+                &ready,sizeof ready,D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (FAILED(hr)) return d3d11_fail(s);
+            if (hr != S_OK || !ready) return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_OK;
+            s->query_ready = true;
+        }
+        /* Actual query readiness plus successful T4; hooks stay on UI. */
         int rc = render_backend_signal(b,RENDER_EVENT_DEVICE_DONE,event->frame_id,os_now_ns());
         if (rc != RENDER_OK) return rc;
     }
@@ -534,30 +724,27 @@ static int d3d11_event(render_backend *b, const render_event *event)
             if (ready == WAIT_OBJECT_0) s->latency_ready = true;
             else if (ready != WAIT_TIMEOUT) return d3d11_fail(s);
         }
+        if (!d3d11_sync_progress(b,event->frame_id))
+            return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_OK;
+        s->sync_ready = false;
         DXGI_FRAME_STATISTICS stats = {0};
-        HRESULT hr = s->swapchain->lpVtbl->GetFrameStatistics(s->swapchain,&stats);
-        if (s->media && (FAILED(hr) || !stats.PresentCount)) {
-            DXGI_FRAME_STATISTICS_MEDIA media = {0};
-            HRESULT media_hr = s->media->lpVtbl->GetFrameStatisticsMedia(s->media,&media);
-            if (SUCCEEDED(media_hr) && media.PresentCount) {
-                hr = media_hr; stats.PresentCount = media.PresentCount; stats.SyncQPCTime = media.SyncQPCTime;
-            }
-        }
+        HRESULT hr = d3d11_statistics(s,&stats);
         s->present_info.expected = s->pending_count; s->present_info.observed = stats.PresentCount;
         s->present_info.status = (int32_t)hr;
         s->present_info.sync_qpc = (uint64_t)stats.SyncQPCTime.QuadPart;
         if (SUCCEEDED(hr) && stats.PresentCount == s->pending_count && stats.PresentCount != 0) {
             s->present_info.statistics_matched = true;
+            b->info.capabilities |= RENDER_CAP_PRESENT_TIMING;
             /* SyncQPCTime describes SyncRefreshCount, not necessarily this
              * frame's scanout. Use the monotonic observation of its exact
              * PresentCount, never mislabel a raw DXGI sync clock as T6. */
             return render_backend_signal(b,RENDER_EVENT_PRESENT_COMPLETE,event->frame_id,os_now_ns());
         }
-        if (SUCCEEDED(hr) && stats.PresentCount > s->pending_count) return d3d11_fail(s);
-        if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return d3d11_fail(s);
+        if (SUCCEEDED(hr) && stats.PresentCount > s->pending_count) return d3d11_recover(b);
+        if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return d3d11_recover(b);
 
     }
-    return os_now_ns() >= s->deadline ? d3d11_fail(s) : RENDER_OK;
+    return s->resume_pending || os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_OK;
 }
 static void d3d11_shutdown(render_backend *b)
 { d3d11_release(b->state); }
@@ -566,7 +753,7 @@ int render_d3d11_backend(render_backend *b)
     if (!b) return RENDER_ERR_ARG;
     if (b->initialized) return RENDER_ERR_STATE;
     *b = (render_backend){.info = {"d3d11",sizeof(d3d11_state),_Alignof(d3d11_state),
-        RENDER_CAP_GPU|RENDER_CAP_DEVICE_TIMING|RENDER_CAP_PRESENT_TIMING},
+        RENDER_CAP_GPU|RENDER_CAP_DEVICE_TIMING},
         .ops = {d3d11_init,d3d11_resize,d3d11_submit,d3d11_present,d3d11_event,d3d11_shutdown}};
     return RENDER_OK;
 }
@@ -587,11 +774,22 @@ int d3d11_poll_completions(render_backend *b)
     if (!d3d11_descriptor(b) || !b->initialized) return RENDER_ERR_STATE;
     d3d11_state *s = b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
     if (!b->active) return RENDER_OK;
     work_msg poll = {.kind = D3D11_POLL_MESSAGE,.generation = b->active_frame};
     render_event event = {RENDER_EVENT_WORK,b->active_frame,0,&poll};
     return render_backend_event(b,&event);
 }
+int d3d11_set_suspended(render_backend *b, bool suspended)
+{
+    if (!d3d11_descriptor(b) || !b->initialized) return RENDER_ERR_STATE;
+    d3d11_state *s = b->state;
+    if (s->suspended && !suspended) s->resume_pending = true;
+    s->suspended = suspended; s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
+    return RENDER_OK;
+}
+bool d3d11_recovery_required(const render_backend *b)
+{ return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->recovery; }
 int d3d11_present_stats(const render_backend *b, d3d11_present_info *out)
 {
     if (!d3d11_descriptor(b) || !b->initialized || !out) return RENDER_ERR_ARG;
@@ -602,6 +800,7 @@ int d3d11_notify_latency_ready(render_backend *b)
     if (!d3d11_descriptor(b) || !b->initialized) return RENDER_ERR_STATE;
     d3d11_state *s = b->state;
     if (s->failed) return RENDER_ERR_DEVICE;
+    if (s->recovery) return RENDER_ERR_UNSUPPORTED;
     s->latency_ready = true; return RENDER_OK;
 }
 void *d3d11_latency_handle(const render_backend *b)

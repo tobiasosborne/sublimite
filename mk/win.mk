@@ -23,7 +23,7 @@ WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 WIN_TEST_SAN := $(addprefix $(WIN_B)/san/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 # OS imports plus D3D11/DXGI and interface GUIDs. Shader compiler is runtime-loaded.
-WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid
+WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid -ldwmapi
 # UTF-8 activeCodePage manifest (src/os/utf8.manifest, decision doc edit-177r.2
 # §3.9), embedded as RT_MANIFEST 1 through a windres-compiled resource and linked
 # into every Windows executable: the CRT's narrow argv, fopen and getenv become UTF-8.
@@ -133,6 +133,15 @@ $(WIN_B)/rel/tests/os_win_test.exe: tests/win/os_win_test.c src/os/os_win.c $(WI
 $(WIN_B)/san/tests/os_win_test.exe: tests/win/os_win_test.c src/os/os_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) -MMD -MP -MF $(@:.exe=.d) -MT $@ $< $(filter-out %/os_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
+# D3D11 white-box regression suite, like the OS native shim suite above.
+$(WIN_B)/rel/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d11_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d11_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 # Static link; release has only system-DLL imports. The sanitizer exe needs the runtime DLLs beside it (tools/winrun.sh runs in place).

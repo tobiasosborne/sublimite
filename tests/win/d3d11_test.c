@@ -24,6 +24,7 @@ typedef struct stamps {
     uint32_t id, t5_count, t6_count, stats_frames;
     uint64_t t5, t6, ui;
     bool bad;
+    HWND minimize;
 } stamps;
 static void done(void *user, uint32_t id, uint64_t ns)
 {
@@ -138,11 +139,32 @@ static int frame(render_backend *b, render_grid *grid, stamps *p,
         memset((void *)grid->pages,0,grid->page_count*sizeof *grid->pages);
         if (grid->region.pixels) memset((void *)grid->region.pixels,0,grid->region.capacity*sizeof(uint32_t));
     }
+    if (p->minimize) {
+        HWND window = p->minimize;
+        (void)ShowWindow(window,SW_MINIMIZE); pump(); T(IsIconic(window));
+        T(render_backend_present(b,p->id) == RENDER_ERR_BUSY);
+        T(d3d11_poll_completions(b) == RENDER_OK && !d3d11_recovery_required(b));
+        T(p->t5_count == n5 && p->t6_count == n6);
+        (void)ShowWindow(window,SW_SHOWNOACTIVATE); pump(); T(!IsIconic(window));
+        p->minimize = NULL;
+    }
     uint64_t deadline = os_now_ns() + WATCHDOG_NS;
     do {
         rc = render_backend_present(b,p->id);
         if (rc == RENDER_ERR_BUSY) { pump(); Sleep(1); }
-        T(os_now_ns() < deadline);
+        if (os_now_ns() >= deadline) {
+            d3d11_present_info info; T(d3d11_present_stats(b,&info) == RENDER_OK);
+            fprintf(stderr,"present timeout frame=%u rc=%d status=%08x visible=%d iconic=%d\n",
+                p->id,rc,(unsigned)info.status,IsWindowVisible(((struct plat *)b->config.platform)->window),
+                IsIconic(((struct plat *)b->config.platform)->window));
+            ID3D11Device *native = d3d11_device(b);
+            fprintf(stderr,"device removal=%08x\n",(unsigned)native->lpVtbl->GetDeviceRemovedReason(native));
+            ID3D11InfoQueue *messages = NULL;
+            if (SUCCEEDED(native->lpVtbl->QueryInterface(native,&IID_ID3D11InfoQueue,(void **)&messages))) {
+                (void)debug_messages(messages); messages->lpVtbl->Release(messages);
+            }
+            return 1;
+        }
     } while (rc == RENDER_ERR_BUSY);
     T(rc == RENDER_OK);
     T(render_backend_present(b,p->id) == RENDER_ERR_STATE);
@@ -179,6 +201,7 @@ static int frame(render_backend *b, render_grid *grid, stamps *p,
     T(p->t5_count == n5+1 && p->t6_count == n6+1 && !p->bad);
     T(p->t5 >= b->submitted_ns && p->t6 >= p->t5);
     d3d11_present_info info; T(d3d11_present_stats(b,&info) == RENDER_OK);
+    T(b->info.capabilities & RENDER_CAP_PRESENT_TIMING);
     T(info.expected && info.observed == info.expected && info.sync_qpc && info.statistics_matched);
     p->stats_frames++;
     T(d3d11_poll_completions(b) == RENDER_OK);
@@ -214,7 +237,19 @@ static void fixtures(render_cell *cells, render_glyph *glyphs, render_atlas_page
     cells[4] = (render_cell){4,3,0xffffff,0x776655,RENDER_ATTR_BOLD|RENDER_ATTR_ITALIC|RENDER_ATTR_CURSOR|RENDER_ATTR_SELECTION,0};
     cells[5] = (render_cell){0,RENDER_NO_SLOT,0,0x998877,0,0};
 }
-static int run_device(HWND window, bool warp)
+typedef struct atlas_append {
+    uint8_t *page;
+    _Atomic bool ready, stop;
+} atlas_append;
+static void append_pixels(void *arg)
+{
+    atlas_append *a = arg;
+    do {
+        for (size_t row = 0; row < 16; row++) a->page[row*32+31]++;
+        atomic_store_explicit(&a->ready,true,memory_order_release);
+    } while (!atomic_load_explicit(&a->stop,memory_order_acquire));
+}
+static int run_device(HWND window, bool warp, bool background)
 {
     T(client_size(window,130,67) == 0);
     render_backend b = {0}; T(render_d3d11_backend(&b) == RENDER_OK);
@@ -226,7 +261,7 @@ static int run_device(HWND window, bool warp)
     render_config config = {.dims = {16,4,8,16},.max_width = 136,.max_height = 80,
         .max_cells = 16*6,.max_glyphs = 4,.max_pages = 2,.max_atlas_bytes = 19*16+32*16,
         .max_region_width = 4,.max_region_height = 3,
-        .hooks = {done,complete,&p},.background_init = true};
+        .hooks = {done,complete,&p},.background_init = background};
     edit_arena pool_arena;
     T(edit_arena_init(&pool_arena,sizeof(work_pool)+_Alignof(work_pool)) == 0);
     work_pool *pool = edit_arena_alloc(&pool_arena,sizeof *pool,_Alignof(work_pool)); T(pool);
@@ -238,6 +273,18 @@ static int run_device(HWND window, bool warp)
     T(render_d3d11_backend_for_window(&b,window) == RENDER_OK);
     T(d3d11_diagnostics(&b,warp,true) == RENDER_OK);
     struct plat platform = {window}; init.config.platform = &platform;
+    /* Ordinary init must roll back native acquisitions when no diagnostic
+     * presentation can be displayed; retry on this same HWND must succeed. */
+    bool init_background = init.config.background_init;
+    init.config.background_init = false;
+    (void)ShowWindow(window,SW_HIDE); pump();
+    T(initialize(&init) == 0);
+    T(init.rc == RENDER_ERR_UNSUPPORTED && !b.initialized && b.state == NULL);
+    (void)ShowWindow(window,SW_SHOWNOACTIVATE); pump();
+    b.state = state;
+    T(render_d3d11_backend_for_window(&b,window) == RENDER_OK);
+    T(d3d11_diagnostics(&b,warp,true) == RENDER_OK);
+    init.config.background_init = init_background;
     /* UI dispatches while the init worker owns the descriptor; publication
      * and adoption both cross the work mailbox, including the failure above. */
     T(initialize(&init) == 0);
@@ -249,7 +296,8 @@ static int run_device(HWND window, bool warp)
     ID3D11Device *device = d3d11_device(&b); ID3D11InfoQueue *queue = NULL; ID3D11Debug *debugger = NULL;
     if (debug) T(SUCCEEDED(device->lpVtbl->QueryInterface(device,&IID_ID3D11InfoQueue,(void **)&queue)));
     if (debug) T(SUCCEEDED(device->lpVtbl->QueryInterface(device,&IID_ID3D11Debug,(void **)&debugger)));
-    T(p.t5_count == 0 && p.t6_count == 0); /* background init never Presents */
+    T(p.t5_count == 0 && p.t6_count == 0);
+    T(((b.info.capabilities & RENDER_CAP_PRESENT_TIMING) != 0) == !background);
     T(d3d11_diagnostics(&b,true,true) == RENDER_ERR_STATE);
     render_cell cells[16*5]; render_glyph glyphs[4]; render_atlas_page pages[2];
     uint8_t a[19*16], z[32*16]; uint64_t dirty = 0;
@@ -261,7 +309,13 @@ static int run_device(HWND window, bool warp)
     for (size_t i = 0; i < 15; i++) ink[i] = (uint32_t)i*0x10203u;
     g.region = (render_pixels){ink,15,5,3,17,4,3,true};
     T(render_frame_begin(&g,1) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
-    oracle(&g,want,130,67); T(frame(&b,&g,&p,want,130,67,true) == 0);
+    oracle(&g,want,130,67);
+    atlas_append append = {.page = z}; os_thread writer;
+    T(os_thread_start(&writer,append_pixels,&append) == OS_OK);
+    while (!atomic_load_explicit(&append.ready,memory_order_acquire)) os_yield();
+    int first_frame = frame(&b,&g,&p,want,130,67,true);
+    atomic_store_explicit(&append.stop,true,memory_order_release);
+    T(os_thread_join(&writer) == OS_OK); T(first_frame == 0);
     fixtures(cells,glyphs,pages,a,z);
     for (size_t i = 0; i < 15; i++) ink[i] = (uint32_t)i*0x10203u;
     /* A changed row, atlas and retained untouched rows through flip rotation. */
@@ -292,17 +346,37 @@ static int run_device(HWND window, bool warp)
     T(render_backend_submit(&b,&g,NULL,0) == RENDER_ERR_STRIPS);
     T(render_mark_full(&g) == RENDER_OK);
     oracle(&g,want,122,51); T(frame(&b,&g,&p,want,122,51,false) == 0);
+    /* Independent region changes must restore the entire old and new bounds. */
+    uint32_t next = 8;
+    for (unsigned step = 0; step < 6; step++) {
+        T(render_frame_begin(&g,next++) == RENDER_OK);
+        if (step == 0) g.region = (render_pixels){ink,15,5,5,7,4,3,false};
+        if (step == 1) { g.region.x = 20; g.region.y = 17; g.region.dirty = true; }
+        if (step == 2) { g.region.width = 2; g.region.height = 1; g.region.dirty = false; }
+        if (step == 3) g.region.pixels = NULL;
+        if (step == 4) { g.region.pixels = ink; g.region.x = 3; g.region.y = 3; }
+        if (step == 5) {
+            cells[0].bg = 0x897654; T(render_mark_rows(&g,0,1) == RENDER_OK);
+        }
+        oracle(&g,want,122,51); T(frame(&b,&g,&p,want,122,51,false) == 0);
+    }
+    puts("d3d11_test: region enable/move/shrink/disable/re-enable/clean-over-damage exact PASS");
+    T(render_frame_begin(&g,next++) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
+    a[0] ^= 255u; /* Previous T5 retired; referenced coverage may now change. */
+    p.minimize = window;
+    oracle(&g,want,122,51); T(frame(&b,&g,&p,want,122,51,false) == 0);
+    puts("d3d11_test: minimize/restore before Present, post-T5 atlas change exact PASS");
     T(debug_messages(queue) == 0);
     render_stats stats; T(render_backend_stats(&b,&stats) == RENDER_OK);
-    T(stats.submitted_frames == 7 && stats.presented_frames == 7);
+    T(stats.submitted_frames == p.stats_frames && stats.presented_frames == p.stats_frames);
     /* Quiescent shutdown discards pending T5/T6 and releases native refs. */
-    T(render_frame_begin(&g,8) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
+    T(render_frame_begin(&g,next) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
     render_strip full = {0,small.rows};
     T(render_backend_submit(&b,&g,&full,1) == RENDER_OK);
     int present_rc;
     uint64_t deadline = os_now_ns()+WATCHDOG_NS;
     do {
-        present_rc = render_backend_present(&b,8);
+        present_rc = render_backend_present(&b,next);
         if (os_now_ns() >= deadline) {
             d3d11_present_info pending; T(d3d11_present_stats(&b,&pending) == RENDER_OK);
             fprintf(stderr,"shutdown present rc=%d status=%08x\n",present_rc,(unsigned)pending.status);
@@ -312,15 +386,26 @@ static int run_device(HWND window, bool warp)
     } while (present_rc == RENDER_ERR_BUSY);
     T(present_rc == RENDER_OK && b.active);
     render_backend_shutdown(&b); render_backend_shutdown(&b);
-    T(p.t5_count == 7 && p.t6_count == 7);
+    T(p.t5_count == p.stats_frames && p.t6_count == p.stats_frames);
     T(debug_messages(queue) == 0);
     T(debug_live_children(debugger,queue) == 0);
+    /* Retained diagnostics keep the OLD device alive across replacement. */
+    memset(state,0,info.state_size); b.state = state;
+    T(render_d3d11_backend_for_window(&b,window) == RENDER_OK);
+    T(d3d11_diagnostics(&b,warp,true) == RENDER_OK);
+    init.config.dims = small;
+    T(initialize(&init) == 0 && init.rc == RENDER_OK);
+    T(render_frame_begin(&g,next+1u) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
+    oracle(&g,want,122,51); T(frame(&b,&g,&p,want,122,51,false) == 0);
+    render_backend_shutdown(&b);
+    T(debug_messages(queue) == 0 && debug_live_children(debugger,queue) == 0);
+    puts("d3d11_test: same-HWND shutdown/re-init with old diagnostic device retained PASS");
     if (debugger) debugger->lpVtbl->Release(debugger);
     if (queue) queue->lpVtbl->Release(queue);
     free(state); work_pool_shutdown(pool); edit_arena_free(&pool_arena);
-    printf("d3d11_test: %s%s pixels=exact frames=7 T5/T6=7/7 monotone UI resize shutdown-pending PASS T6=DXGI-statistics:%u debug=%s guard=%s\n",
+    printf("d3d11_test: %s%s pixels=exact frames=%u T5/T6=%u/%u monotone UI resize shutdown-pending PASS T6=DXGI-statistics:%u debug=%s guard=%s init=%s present-timing=validated\n",
         warp ? "WARP" : "hardware", !warp && actual_warp ? " unavailable (WARP fallback)" : "",
-        p.stats_frames,debug ? "enabled, no live children" : "SDK layers unavailable",edit_malloc_guard_active() ? "zero allocations" : "sanitizer owns malloc");
+        p.stats_frames,p.t5_count,p.t6_count,p.stats_frames,debug ? "enabled, no live children" : "SDK layers unavailable",edit_malloc_guard_active() ? "zero allocations" : "sanitizer owns malloc", background ? "background" : "ordinary");
     return 0;
 }
 int main(int argc, char **argv)
@@ -337,8 +422,11 @@ int main(int argc, char **argv)
         WS_OVERLAPPEDWINDOW,50,50,160,120,NULL,NULL,instance,NULL);
     T(window); ShowWindow(window,SW_SHOWNOACTIVATE);
     T(SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)); pump();
-    int rc = run_device(window,argc > 1 && strcmp(argv[1],"--warp") == 0);
-    if (!rc && argc == 1) rc = run_device(window,true);
+    bool ordinary = argc > 1 && strcmp(argv[1],"--ordinary") == 0;
+    int rc = run_device(window,argc > 1 && strcmp(argv[1],"--warp") == 0,!ordinary);
+    if (!rc && argc == 1) rc = run_device(window,true,true);
+    if (!rc && argc == 1) rc = run_device(window,false,false);
+    if (!rc && argc == 1) rc = run_device(window,true,false);
     DestroyWindow(window); UnregisterClassW(cls.lpszClassName,instance);
     (void)SetThreadExecutionState(execution);
     return rc;
