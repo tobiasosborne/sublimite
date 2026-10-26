@@ -11,13 +11,13 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
 WIN_SRCS := $(foreach m,$(WIN_MODULES),$(wildcard src/$(m)/*.c)) $(WIN_TS_SRCS) src/config/theme.c tests/win/core_file.c
 WIN_CORE_TESTS := base trace trace_pairs work work_foreground utf8 utf8_tables scan piece piece_bounds piece_mem piece_mt undo lineidx lineidx_os layout view find find_bench find_bestof find_p1r find_simd_filter_verify find_timeout hl hl_parse hl_worker
-WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
+WIN_TESTS := $(sort $(wildcard tests/win/*_test.c)) tests/os_test.c tests/font_test.c tests/font_gsub_test.c tests/journal_os_test.c $(addprefix tests/,$(addsuffix _test.c,$(WIN_CORE_TESTS)))
 WIN_REL_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/rel/%.o)
 WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
@@ -46,6 +46,7 @@ $(WIN_B)/san/tests/hl_test.exe: WIN_TEST_FLAGS := $(foreach l,$(WIN_HL_OPTIN),$(
 # ASan inlines layout fixtures into a 0x15fd58-byte main frame (objdump),
 # exceeding PE's default 1 MiB reserve. Match this host's Linux 8192 KiB stack.
 $(WIN_B)/san/tests/layout_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
+WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl journal
 all: $(WIN_TEST_REL)
 $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
 # Objects reached only through pattern rules would be intermediates and deleted after each link.
@@ -188,6 +189,10 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
 	    elif grep -q AddressSanitizer $(WIN_B)/asan.err; then echo "ASan fired: ok"; \
 	    else echo "no ASan report"; cat $(WIN_B)/asan.err; status=1; fi; \
 	  done; exit $$status
+
+	@echo "Windows journal: SKIP journal_group_test, journal_retire_test, editor_session_test, editor_recovery_test, dataloss_test (require editor/platform modules)"
+	@echo "Windows journal: SKIP legacy journal_test file-save fixtures (require src/file); journal_os_test covers portable journal cases"
+	@echo "Windows check: $(words $(WIN_TEST_REL)) release + $(words $(WIN_TEST_SAN)) sanitizer test binaries passed; ASan negative control passed"
 
 clean:
 	rm -rf $(WIN_B)

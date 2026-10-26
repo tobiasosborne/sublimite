@@ -1,21 +1,14 @@
 /* Startup only. (P) structural numbers denote empty/one, wire/schema sizes
  * come from journal.h; permissions are owner read/write (POSIX 0600). */
-#include "journal/journal.h"
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
+#include "journal/private.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
 
 typedef struct artifact {
     char path[sizeof ((journal_base *)0)->captured_path];
-    struct stat identity;
-    int lease;
+    os_stat identity;
+    os_file lease;
     bool base, session, generated, aside, retired, clean, referenced;
 } artifact;
 typedef struct saved_identity {
@@ -30,15 +23,38 @@ typedef struct inventory {
     edit_pool identities;
     saved_identity *bases;
 } inventory;
-static bool same(const struct stat *a, const struct stat *b)
+static bool same(const os_stat *a, const os_stat *b)
+{ return journal_same_stat(a,b); }
+/* Iterators own their cursors; the independently pinned directory owns the
+ * namespace and its lock through every rewind and nested liveness scan. */
+typedef struct journal_entry { char d_name[OS_NAME_MAX]; } journal_entry;
+typedef struct journal_listing {
+    os_dir dir;
+    os_dir_iter it;
+    journal_entry entry;
+    os_err error;
+} journal_listing;
+static bool listing_open(journal_listing *out, const char *path, const os_dir *parent)
 {
-    return a->st_dev==b->st_dev && a->st_ino==b->st_ino && a->st_size==b->st_size &&
-        a->st_mtim.tv_sec==b->st_mtim.tv_sec && a->st_mtim.tv_nsec==b->st_mtim.tv_nsec &&
-        a->st_ctim.tv_sec==b->st_ctim.tv_sec && a->st_ctim.tv_nsec==b->st_ctim.tv_nsec;
+    out->dir=(os_dir)OS_DIR_INIT;
+    os_err e=parent?os_dir_open_at(&out->dir,parent,"."):os_dir_open(&out->dir,path);
+    if(e!=OS_OK) return false;
+    e=os_dir_iter_open(&out->it,&out->dir);
+    if(e!=OS_OK) { os_dir_close(&out->dir); return false; }
+    out->error=OS_OK; return true;
 }
+static journal_entry *listing_next(journal_listing *scan)
+{
+    const char *name=NULL;
+    scan->error=os_dir_next(&scan->it,&name);
+    if(scan->error!=OS_OK || !name) return NULL;
+    strcpy(scan->entry.d_name,name); return &scan->entry;
+}
+static void listing_rewind(journal_listing *scan) { os_dir_rewind(&scan->it); scan->error=OS_OK; }
+static void listing_close(journal_listing *scan) { os_dir_iter_close(&scan->it); os_dir_close(&scan->dir); }
 typedef struct rotation_name {
     uintmax_t device, inode, ctime_sec, ctime_nsec;
-    char owner[sizeof ((struct dirent *)0)->d_name];
+    char owner[sizeof ((journal_entry *)0)->d_name];
     bool source, aside, exceeds_source;
 } rotation_name;
 /* (P) Hexadecimal names use radix sixteen; overflow is bounded by uintmax_t,
@@ -94,12 +110,6 @@ static bool rotation_parse(const char *name, rotation_name *out)
     while(*p>='0' && *p<='9') p++;
     out->aside=true; return !*p;
 }
-static DIR *rescan(DIR *dir)
-{
-    int fd=openat(dirfd(dir),".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if(fd<0) return NULL;
-    DIR *scan=fdopendir(fd); if(!scan) close(fd); return scan;
-}
 /* edit-fi0p F12: only the operator can release a possible sole checkpoint.
  * Pin its directory and descriptor, scan through the pinned parent, and
  * verify that the name still selects the same complete source before unlink.
@@ -108,155 +118,149 @@ int journal_acknowledge(const char *source)
 {
     if(!source || !*source || strlen(source)>=sizeof ((journal_base *)0)->captured_path) return JOURNAL_INVALID;
     char parent[sizeof ((journal_base *)0)->captured_path], leaf[sizeof parent];
-    strcpy(parent,source); char *slash=strrchr(parent,'/');
+    strcpy(parent,source); journal_slashes(parent); char *slash=strrchr(parent,'/');
     strcpy(leaf,slash?slash+1:parent);
     rotation_name name;
     if(!rotation_parse(leaf,&name) || !name.aside) return JOURNAL_INVALID;
-    if(slash==parent) slash[1]=0; else if(slash) *slash=0; else strcpy(parent,".");
-    int dfd=open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if(dfd<0) return JOURNAL_IO;
-    int locked;
-    do { locked=flock(dfd,LOCK_EX|LOCK_NB); } while(locked && errno==EINTR);
-    int rc=locked?((errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO):0;
-    int fd=-1;
-    if(!rc) { fd=openat(dfd,leaf,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK); if(fd<0) rc=JOURNAL_IO; }
+    journal_parent(parent,slash);
+    os_dir dfd=OS_DIR_INIT;
+    if(os_dir_open(&dfd,parent)!=OS_OK) return JOURNAL_IO;
+    os_err locked=os_dir_try_lock(&dfd,OS_LOCK_EXCLUSIVE);
+    int rc=locked==OS_OK?0:locked==OS_E_BUSY?JOURNAL_BUSY:JOURNAL_IO;
+    os_file fd=OS_FILE_INIT;
     if(!rc) {
-        do { locked=flock(fd,LOCK_EX|LOCK_NB); } while(locked && errno==EINTR);
-        if(locked) rc=(errno==EAGAIN || errno==EWOULDBLOCK)?JOURNAL_BUSY:JOURNAL_IO;
+        os_err opened=os_file_open_at(&fd,&dfd,leaf,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+        if(opened!=OS_OK) rc=opened==OS_E_ISDIR?JOURNAL_BUSY:JOURNAL_IO;
     }
-    struct stat held,named,after;
-    if(!rc && (fstat(fd,&held) || !S_ISREG(held.st_mode) || held.st_size<0 ||
-        fstatat(dfd,leaf,&named,AT_SYMLINK_NOFOLLOW) || !same(&held,&named))) rc=JOURNAL_BUSY;
-    char anchored[sizeof parent];
     if(!rc) {
-        int n=snprintf(anchored,sizeof anchored,"/proc/self/fd/%d/%s",dfd,leaf);
-        if(n<0 || (size_t)n>=sizeof anchored) rc=JOURNAL_INVALID;
+        locked=os_file_try_lock(&fd,OS_LOCK_EXCLUSIVE);
+        if(locked!=OS_OK) rc=locked==OS_E_BUSY?JOURNAL_BUSY:JOURNAL_IO;
     }
+    os_stat held,named,after;
+    if(!rc && (os_file_stat(&fd,&held) || held.kind!=OS_KIND_FILE ||
+        os_stat_at(&dfd,leaf,OS_STAT_NOFOLLOW,&named) || !same(&held,&named))) rc=JOURNAL_BUSY;
     journal_replay_result result;
-    if(!rc) rc=journal_scan_file(anchored,NULL,NULL,&result);
-    if(!rc && (result.corrupt || result.valid_bytes!=(uint64_t)held.st_size)) rc=JOURNAL_INVALID;
-    if(!rc && (fstat(fd,&after) || !same(&held,&after) ||
-        fstatat(dfd,leaf,&named,AT_SYMLINK_NOFOLLOW) || !same(&held,&named))) rc=JOURNAL_BUSY;
-    if(!rc && (unlinkat(dfd,leaf,0) || fsync(dfd))) rc=JOURNAL_IO;
-    if(fd>=0) close(fd);
-    close(dfd); return rc;
+    if(!rc) rc=journal_scan_open(fd,NULL,NULL,&result);
+    if(!rc && (result.corrupt || result.valid_bytes!=(uint64_t)held.size)) rc=JOURNAL_INVALID;
+    if(!rc && (os_file_stat(&fd,&after) || !same(&held,&after) ||
+        os_stat_at(&dfd,leaf,OS_STAT_NOFOLLOW,&named) || !same(&held,&named))) rc=JOURNAL_BUSY;
+    if(!rc && (os_unlink_at(&dfd,leaf) || os_dir_sync(&dfd))) rc=JOURNAL_IO;
+    os_file_close(&fd);
+    os_dir_close(&dfd); return rc;
 }
 /* Legacy names cannot identify their owner. A busy existing session lease
  * therefore protects all of them, except this launch's fresh destination.
  * Do not create any lease just to perform this liveness check. */
-static bool legacy_owner_live(DIR *dir, const char *current)
+static bool legacy_owner_live(journal_listing *dir, const char *current)
 {
-    DIR *scan=rescan(dir); if(!scan) return true;
-    char own[sizeof ((struct dirent *)0)->d_name]="";
+    journal_listing storage, *scan=&storage; if(!listing_open(scan,NULL,&dir->dir)) return true;
+    char own[sizeof ((journal_entry *)0)->d_name]="";
     const char *leaf=strrchr(current,'/');
     if(*current) {
         int n=snprintf(own,sizeof own,".%s.lock",leaf?leaf+1:current);
         if(n<0 || (size_t)n>=sizeof own) *own=0;
     }
-    bool live=false; struct dirent *entry;
+    bool live=false; journal_entry *entry;
     for(;;) {
-        errno=0; entry=readdir(scan); if(!entry) { live=errno!=0; break; }
+        entry=listing_next(scan); if(!entry) { live=scan->error!=OS_OK; break; }
         size_t len=strlen(entry->d_name);
         if(len<sizeof ".lock" || strcmp(entry->d_name+len-(sizeof ".lock"-1u),".lock") ||
            !strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-")) ||
            !strcmp(entry->d_name,own)) continue;
-        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        if(fd<0) { live=true; break; }
-        live=flock(fd,LOCK_EX|LOCK_NB)!=0; close(fd); if(live) break;
+        os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dir->dir,entry->d_name,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+        if(opened!=OS_OK) { live=true; break; }
+        live=os_file_try_lock(&fd,OS_LOCK_EXCLUSIVE)!=0; os_file_close(&fd); if(live) break;
     }
-    closedir(scan); return live;
+    listing_close(scan); return live;
 }
-static bool rotation_source_exists(DIR *dir, const rotation_name *name)
+static bool rotation_source_exists(journal_listing *dir, const rotation_name *name)
 {
-    struct stat st;
-    return !fstatat(dirfd(dir),name->owner,&st,AT_SYMLINK_NOFOLLOW) && S_ISREG(st.st_mode) &&
-        (uintmax_t)st.st_dev==name->device && (uintmax_t)st.st_ino==name->inode &&
-        (uintmax_t)st.st_ctim.tv_sec==name->ctime_sec && (uintmax_t)st.st_ctim.tv_nsec==name->ctime_nsec;
+    os_stat st;
+    return !os_stat_at(&dir->dir,name->owner,OS_STAT_NOFOLLOW,&st) && st.kind==OS_KIND_FILE && st.id.index[1]==0 &&
+        (uintmax_t)st.id.volume==name->device && (uintmax_t)st.id.index[0]==name->inode &&
+        (uintmax_t)(st.ctime_ns/1000000000)==name->ctime_sec && (uintmax_t)(st.ctime_ns%1000000000)==name->ctime_nsec;
 }
 /* Existing stray lock files are litter only. Never O_CREAT for temp leases;
  * verify that the locked inode still has this name before removing it. */
-static bool remove_rotation_lock(DIR *dir, const char *name)
+static bool remove_rotation_lock(journal_listing *dir, const char *name)
 {
-    int fd=openat(dirfd(dir),name,O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-    if(fd<0) return false;
-    struct stat held,named; bool removed=false;
-    if(!flock(fd,LOCK_EX|LOCK_NB) && !fstat(fd,&held) &&
-       !fstatat(dirfd(dir),name,&named,AT_SYMLINK_NOFOLLOW) && S_ISREG(named.st_mode) &&
-       held.st_dev==named.st_dev && held.st_ino==named.st_ino) removed=unlinkat(dirfd(dir),name,0)==0;
-    close(fd); return removed;
+    os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dir->dir,name,OS_OPEN_RDWR|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+    if(opened!=OS_OK) return false;
+    os_stat held,named; bool removed=false;
+    if(!os_file_try_lock(&fd,OS_LOCK_EXCLUSIVE) && !os_file_stat(&fd,&held) &&
+       !os_stat_at(&dir->dir,name,OS_STAT_NOFOLLOW,&named) && named.kind==OS_KIND_FILE &&
+       journal_same_id(&held,&named)) removed=os_unlink_at(&dir->dir,name)==0;
+    os_file_close(&fd); return removed;
 }
 /* edit-7cj8: these names never appear in a durable journal. The caller's
  * exclusive directory lease excludes every live asynchronous copy. No
  * content scan, reference inventory, age rule or byte cap is needed. */
-static int sweep_copies(DIR *dir)
+static int sweep_copies(journal_listing *dir)
 {
     const char prefix[]=".sublimite-copy-";
     bool changed=false; int rc=0;
-    rewinddir(dir); struct dirent *entry;
-    while((entry=readdir(dir))) {
+    listing_rewind(dir); journal_entry *entry;
+    while((entry=listing_next(dir))) {
         /* (P) mkostemp's suffix schema is the literal XXXXXX. */
         if(strncmp(entry->d_name,prefix,sizeof prefix-1u) ||
            strlen(entry->d_name)!=(sizeof prefix-1u)+(sizeof "XXXXXX"-1u)) continue;
-        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        if(fd<0) continue;
-        struct stat held,named;
-        if(!fstat(fd,&held) && S_ISREG(held.st_mode) &&
-           !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) && same(&held,&named)) {
-            if(unlinkat(dirfd(dir),entry->d_name,0)) rc=JOURNAL_IO; else changed=true;
+        os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dir->dir,entry->d_name,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+        if(opened!=OS_OK) continue;
+        os_stat held,named;
+        if(!os_file_stat(&fd,&held) && held.kind==OS_KIND_FILE &&
+           !os_stat_at(&dir->dir,entry->d_name,OS_STAT_NOFOLLOW,&named) && same(&held,&named)) {
+            if(os_unlink_at(&dir->dir,entry->d_name)) rc=JOURNAL_IO; else changed=true;
         }
-        close(fd);
+        os_file_close(&fd);
     }
-    if(changed && fsync(dirfd(dir))) rc=JOURNAL_IO;
+    if(changed && os_dir_sync(&dir->dir)) rc=JOURNAL_IO;
     return rc;
 }
-static int sweep_rotations(DIR *dir, const char *current)
+static int sweep_rotations(journal_listing *dir, const char *current)
 {
     bool legacy_live=legacy_owner_live(dir,current), changed=false; int rc=0;
-    rewinddir(dir); struct dirent *entry;
-    while((entry=readdir(dir))) {
+    listing_rewind(dir); journal_entry *entry;
+    while((entry=listing_next(dir))) {
         rotation_name name;
         if(!rotation_parse(entry->d_name,&name) || name.aside || (!name.source && legacy_live)) continue;
-        int fd=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        if(fd<0) continue;
-        struct stat held,named;
-        bool valid=!flock(fd,LOCK_EX|LOCK_NB) && !fstat(fd,&held) && S_ISREG(held.st_mode) &&
-            !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) && same(&held,&named);
+        os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dir->dir,entry->d_name,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+        if(opened!=OS_OK) continue;
+        os_stat held,named;
+        bool valid=!os_file_try_lock(&fd,OS_LOCK_EXCLUSIVE) && !os_file_stat(&fd,&held) && held.kind==OS_KIND_FILE &&
+            !os_stat_at(&dir->dir,entry->d_name,OS_STAT_NOFOLLOW,&named) && same(&held,&named);
         if(valid) {
             if(name.source && !name.exceeds_source && rotation_source_exists(dir,&name)) {
-                if(unlinkat(dirfd(dir),entry->d_name,0)) rc=JOURNAL_IO; else changed=true;
+                if(os_unlink_at(&dir->dir,entry->d_name)) rc=JOURNAL_IO; else changed=true;
             } else {
                 /* Missing/unknown/failed original: possible sole copy.
                  * Same set-aside convention as recovery; no copy,
                  * content read, age test, size limit, or replacement. */
-                struct timespec now; char aside[sizeof entry->d_name];
-                if(clock_gettime(CLOCK_REALTIME,&now)) rc=JOURNAL_IO;
-                else {
-                    /* (P) timespec nanoseconds occupy nine decimal digits,
-                     * matching editor_set_aside's existing naming convention. */
-                    int n=snprintf(aside,sizeof aside,"%s.set-aside-%lld%09ld",entry->d_name,(long long)now.tv_sec,now.tv_nsec);
-                    if(n<0 || (size_t)n>=sizeof aside) rc=JOURNAL_INVALID;
-                    else if(renameat2(dirfd(dir),entry->d_name,dirfd(dir),aside,RENAME_NOREPLACE)) rc=JOURNAL_IO;
-                    else changed=true;
-                }
+                uint64_t now=os_wall_ns(); char aside[sizeof entry->d_name];
+                /* (P) Nanoseconds occupy nine decimal digits, matching
+                 * editor_set_aside's existing naming convention. */
+                int n=snprintf(aside,sizeof aside,"%s.set-aside-%lld%09ld",entry->d_name,(long long)(now/1000000000u),(long)(now%1000000000u));
+                if(n<0 || (size_t)n>=sizeof aside) rc=JOURNAL_INVALID;
+                else if(os_rename_at(&dir->dir,entry->d_name,&dir->dir,aside,OS_RENAME_NOREPLACE)) rc=JOURNAL_IO;
+                else changed=true;
             }
         }
-        close(fd);
+        os_file_close(&fd);
     }
     /* This separate pass also removes lock litter whose temp disappeared
      * before this launch. Live/malformed names are preserved. */
-    rewinddir(dir);
-    while((entry=readdir(dir))) {
+    listing_rewind(dir);
+    while((entry=listing_next(dir))) {
         size_t len=strlen(entry->d_name); static const char suffix[]=".lock";
         if(strncmp(entry->d_name,"..sublimite-journal-",strlen("..sublimite-journal-")) ||
            len<=sizeof suffix || strcmp(entry->d_name+len-(sizeof suffix-1u),suffix)) continue;
         char temp[sizeof entry->d_name]; size_t size=len-1u-(sizeof suffix-1u);
         memcpy(temp,entry->d_name+1,size); temp[size]=0; rotation_name name;
         if(!rotation_parse(temp,&name) || (!name.source && legacy_live)) continue;
-        struct stat st;
-        if(fstatat(dirfd(dir),temp,&st,AT_SYMLINK_NOFOLLOW) && errno==ENOENT)
+        os_stat st;
+        if(os_stat_at(&dir->dir,temp,OS_STAT_NOFOLLOW,&st)==OS_E_NOENT)
             changed=remove_rotation_lock(dir,entry->d_name) || changed;
     }
-    if(changed && fsync(dirfd(dir))) rc=JOURNAL_IO;
+    if(changed && os_dir_sync(&dir->dir)) rc=JOURNAL_IO;
     return rc;
 }
 static int record(void *ctx, const journal_record *r)
@@ -316,30 +320,29 @@ static int lease(artifact *a)
     *slash=0;
     int n=snprintf(path,sizeof path,"%s/.%s.lock",source,slash+1);
     if(n<0 || (size_t)n>=sizeof path) return JOURNAL_INVALID;
-    a->lease=open(path,O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
-    if(a->lease<0 || flock(a->lease,LOCK_EX|LOCK_NB)) return JOURNAL_BUSY;
+    if(os_file_open(&a->lease,path,OS_OPEN_CREATE|OS_OPEN_RDWR|OS_OPEN_NOFOLLOW)!=OS_OK ||
+       os_file_try_lock(&a->lease,OS_LOCK_EXCLUSIVE)!=OS_OK) return JOURNAL_BUSY;
     return 0;
 }
-static int remove_verified(int dfd, artifact *a)
+static int remove_verified(os_dir *dfd, artifact *a)
 {
-    struct stat now;
-    if(lstat(a->path,&now) || !same(&now,&a->identity)) return JOURNAL_BUSY;
+    os_stat now;
+    if(os_stat_path(a->path,OS_STAT_NOFOLLOW,&now) || !same(&now,&a->identity)) return JOURNAL_BUSY;
     char retired[sizeof a->path];
     int n=snprintf(retired,sizeof retired,"%s%s",a->path,a->retired?"":".retired");
     if(n<0 || (size_t)n>=sizeof retired) return JOURNAL_INVALID;
-    if(!a->retired && renameat2(AT_FDCWD,a->path,AT_FDCWD,retired,RENAME_NOREPLACE)) return JOURNAL_IO;
+    if(!a->retired && os_rename(a->path,retired,OS_RENAME_NOREPLACE)) return JOURNAL_IO;
     /* A crash at either barrier leaves only already-proven discardable bytes.
      * The dotted name is excluded from session discovery on the next launch. */
-    if(fsync(dfd)) return JOURNAL_IO;
-    if(lstat(retired,&now) || now.st_ino!=a->identity.st_ino || now.st_dev!=a->identity.st_dev || now.st_size!=a->identity.st_size) return JOURNAL_BUSY;
-    if(unlink(retired) || fsync(dfd)) return JOURNAL_IO;
+    if(os_dir_sync(dfd)) return JOURNAL_IO;
+    if(os_stat_path(retired,OS_STAT_NOFOLLOW,&now) || !journal_same_id(&now,&a->identity) || now.size!=a->identity.size) return JOURNAL_BUSY;
+    if(os_unlink(retired) || os_dir_sync(dfd)) return JOURNAL_IO;
     return 0;
 }
 static int oldest(const void *left, const void *right)
 {
     const artifact *a=left, *b=right;
-    if(a->identity.st_mtim.tv_sec!=b->identity.st_mtim.tv_sec) return a->identity.st_mtim.tv_sec<b->identity.st_mtim.tv_sec?-1:1;
-    if(a->identity.st_mtim.tv_nsec!=b->identity.st_mtim.tv_nsec) return a->identity.st_mtim.tv_nsec<b->identity.st_mtim.tv_nsec?-1:1;
+    if(a->identity.mtime_ns!=b->identity.mtime_ns) return a->identity.mtime_ns<b->identity.mtime_ns?-1:1;
     return strcmp(a->path,b->path);
 }
 /* edit-cxo/oo3: a generated lease file whose journal (and every dotted
@@ -348,51 +351,50 @@ static int oldest(const void *left, const void *right)
  * holding the lease, after rechecking absence and that the name is still the
  * locked inode; journal_session_create picks a new name if it lost that race.
  * One namespace scan per lease file: startup only. */
-static void sweep_leases(DIR *dir)
+static void sweep_leases(journal_listing *dir)
 {
     static const char prefix[]=".session-", suffix[]=".lock";
-    rewinddir(dir); struct dirent *entry;
-    while((entry=readdir(dir))) {
+    listing_rewind(dir); journal_entry *entry;
+    while((entry=listing_next(dir))) {
         size_t len=strlen(entry->d_name);
         if(len<=sizeof prefix-1u+sizeof suffix-1u || strncmp(entry->d_name,prefix,sizeof prefix-1u) ||
            strcmp(entry->d_name+len-(sizeof suffix-1u),suffix)) continue;
         char leaf[sizeof entry->d_name];
         memcpy(leaf,entry->d_name+1,len-1u-(sizeof suffix-1u)); leaf[len-1u-(sizeof suffix-1u)]=0;
-        if(journal_session_absent(dirfd(dir),leaf)) continue;
-        int fd=openat(dirfd(dir),entry->d_name,O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        if(fd<0) continue;
-        struct stat held,named;
-        if(!flock(fd,LOCK_EX|LOCK_NB) && !journal_session_absent(dirfd(dir),leaf) &&
-           !fstat(fd,&held) && !fstatat(dirfd(dir),entry->d_name,&named,AT_SYMLINK_NOFOLLOW) &&
-           S_ISREG(named.st_mode) && held.st_dev==named.st_dev && held.st_ino==named.st_ino)
-            (void)unlinkat(dirfd(dir),entry->d_name,0);
-        close(fd);
+        if(journal_session_absent_at(&dir->dir,leaf)) continue;
+        os_file fd=OS_FILE_INIT; os_err opened=os_file_open_at(&fd,&dir->dir,entry->d_name,OS_OPEN_RDWR|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+        if(opened!=OS_OK) continue;
+        os_stat held,named;
+        if(!os_file_try_lock(&fd,OS_LOCK_EXCLUSIVE) && !journal_session_absent_at(&dir->dir,leaf) &&
+           !os_file_stat(&fd,&held) && !os_stat_at(&dir->dir,entry->d_name,OS_STAT_NOFOLLOW,&named) &&
+           named.kind==OS_KIND_FILE && journal_same_id(&held,&named))
+            (void)os_unlink_at(&dir->dir,entry->d_name);
+        os_file_close(&fd);
     }
 }
 int journal_retire_directory(const char *directory, const char *current)
 {
     char canonical[sizeof ((journal_base *)0)->captured_path];
-    if(!directory || !realpath(directory,canonical)) return JOURNAL_IO;
-    DIR *dir=opendir(canonical); if(!dir) return JOURNAL_IO;
+    if(!directory || !journal_canonical(directory,canonical,sizeof canonical)) return JOURNAL_IO;
+    journal_listing storage, *dir=&storage; if(!listing_open(dir,canonical,NULL)) return JOURNAL_IO;
     /* Serialize housekeeping on the directory inode itself: no additional
      * persistent artifact and no replaceable lock-file name. */
-    int guard=fcntl(dirfd(dir),F_DUPFD_CLOEXEC,0);
-    if(guard<0 || flock(guard,LOCK_EX|LOCK_NB)) { if(guard>=0) close(guard); closedir(dir); return JOURNAL_BUSY; }
-    char current_path[sizeof canonical]=""; if(current && !realpath(current,current_path)) current_path[0]=0;
+    if(os_dir_try_lock(&dir->dir,OS_LOCK_EXCLUSIVE)!=OS_OK) { listing_close(dir); return JOURNAL_BUSY; }
+    char current_path[sizeof canonical]=""; if(current && !journal_canonical(current,current_path,sizeof current_path)) current_path[0]=0;
     /* Sweep before inventory/scanning/retirement can remove an original.
      * The exclusive directory lease excludes every live new rotation. */
     int copy_rc=sweep_copies(dir);
     int rotation_rc=sweep_rotations(dir,current_path);
-    rewinddir(dir);
-    size_t count=0; struct dirent *entry;
-    while((entry=readdir(dir))) count++;
-    if(count>SIZE_MAX/sizeof(artifact)) { close(guard); closedir(dir); return JOURNAL_NOMEM; }
+    listing_rewind(dir);
+    size_t count=0; journal_entry *entry;
+    while((entry=listing_next(dir))) count++;
+    if(count>SIZE_MAX/sizeof(artifact)) { listing_close(dir); return JOURNAL_NOMEM; }
     edit_arena arena;
-    if(edit_arena_init(&arena,(count?count:1)*sizeof(artifact))) { close(guard); closedir(dir); return JOURNAL_NOMEM; }
+    if(edit_arena_init(&arena,(count?count:1)*sizeof(artifact))) { listing_close(dir); return JOURNAL_NOMEM; }
     artifact *items=edit_arena_alloc(&arena,count*sizeof *items,_Alignof(artifact));
     inventory inv={.items=items}; int rc=copy_rc?copy_rc:rotation_rc; uint64_t total=0;
-    rewinddir(dir);
-    while((entry=readdir(dir))) {
+    listing_rewind(dir);
+    while((entry=listing_next(dir))) {
         /* Never content-probe or lease a rotation temp, including its pinned
          * set-aside. Unknown reserved names also cannot prove orphan BASEs. */
         if(!strncmp(entry->d_name,".sublimite-journal-",strlen(".sublimite-journal-"))) { inv.uncertain=true; continue; }
@@ -402,31 +404,31 @@ int journal_retire_directory(const char *directory, const char *current)
         bool session=named;
         if(!strcmp(entry->d_name,".") || !strcmp(entry->d_name,"..")) continue;
         if(!base && !named) {
-            struct stat other;
-            if(fstatat(dirfd(dir),entry->d_name,&other,AT_SYMLINK_NOFOLLOW)) { inv.uncertain=true; continue; }
+            os_stat other;
+            if(os_stat_at(&dir->dir,entry->d_name,OS_STAT_NOFOLLOW,&other)) { inv.uncertain=true; continue; }
             /* A fallback retained original may be referenced by a journal in
              * a child directory. Do not assume this shallow inventory proves
              * orphanhood in that case. */
-            if(S_ISDIR(other.st_mode) || S_ISLNK(other.st_mode)) { inv.uncertain=true; continue; }
-            if(!S_ISREG(other.st_mode)) continue;
-            int probe=openat(dirfd(dir),entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-            if(probe<0) { inv.uncertain=true; continue; }
+            if(other.kind==OS_KIND_DIR || other.kind==OS_KIND_LINK) { inv.uncertain=true; continue; }
+            if(other.kind!=OS_KIND_FILE) continue;
+            os_file probe=OS_FILE_INIT;
+            if(os_file_open_at(&probe,&dir->dir,entry->d_name,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK)!=OS_OK) { inv.uncertain=true; continue; }
             /* (P) wire magic is the ASCII byte string JNL1. This includes
              * explicitly named journals, not just generated session names. */
-            uint8_t magic[sizeof "JNL1"-1u]; ssize_t got=pread(probe,magic,sizeof magic,0); close(probe);
-            if(got<0) { inv.uncertain=true; continue; }
-            if(got!=(ssize_t)sizeof magic || memcmp(magic,"JNL1",sizeof magic)) continue;
+            uint8_t magic[sizeof "JNL1"-1u]; size_t got=0; os_err read=os_file_pread(&probe,magic,sizeof magic,0,&got); os_file_close(&probe);
+            if(read!=OS_OK) { inv.uncertain=true; continue; }
+            if(got!=sizeof magic || memcmp(magic,"JNL1",sizeof magic)) continue;
             session=true;
         }
         /* Directory growth while inventorying is uncertain: preserve all bases. */
         if(inv.count==count) { inv.uncertain=true; break; }
-        artifact *a=&items[inv.count++]; memset(a,0,sizeof *a); a->lease=-1; a->base=base; a->generated=named;
+        artifact *a=&items[inv.count++]; memset(a,0,sizeof *a); a->lease=(os_file)OS_FILE_INIT; a->base=base; a->generated=named;
         int n=snprintf(a->path,sizeof a->path,"%s/%s",canonical,entry->d_name);
-        if(n<0 || (size_t)n>=sizeof a->path || lstat(a->path,&a->identity) || !S_ISREG(a->identity.st_mode) || a->identity.st_size<0) { inv.uncertain=true; continue; }
+        if(n<0 || (size_t)n>=sizeof a->path || os_stat_path(a->path,OS_STAT_NOFOLLOW,&a->identity) || a->identity.kind!=OS_KIND_FILE) { inv.uncertain=true; continue; }
         a->aside=strstr(entry->d_name,".set-aside-")!=NULL;
         a->retired=strstr(entry->d_name,".retired")!=NULL;
         a->session=session && (!named || !strchr(entry->d_name,'.') || a->aside || a->retired);
-        if((base || a->aside) && (uint64_t)a->identity.st_size<=UINT64_MAX-total) total+=(uint64_t)a->identity.st_size;
+        if((base || a->aside) && (uint64_t)a->identity.size<=UINT64_MAX-total) total+=(uint64_t)a->identity.size;
         else if(base || a->aside) inv.uncertain=true;
     }
     /* Gather the entire namespace before marking BASE/SAVE references. A
@@ -440,11 +442,11 @@ int journal_retire_directory(const char *directory, const char *current)
         a->clean=!own && (a->generated || a->aside || a->retired); inv.scanning=a;
         /* edit-fm4: never read a GB-scale artifact on the startup path. An
          * unscanned artifact is pinned, and its BASE references are unknown. */
-        if((uint64_t)a->identity.st_size>JOURNAL_STARTUP_SCAN_BYTES) { a->clean=false; inv.uncertain=true; continue; }
+        if((uint64_t)a->identity.size>JOURNAL_STARTUP_SCAN_BYTES) { a->clean=false; inv.uncertain=true; continue; }
         /* (P) every BASE consumes at least JOURNAL_HEADER wire bytes. The
          * file-size/header quotient bounds identity nodes without a guessed
          * buffer count. Pool pages commit only for actual BASE records. */
-        uint64_t slots=(uint64_t)a->identity.st_size/JOURNAL_HEADER;
+        uint64_t slots=(uint64_t)a->identity.size/JOURNAL_HEADER;
         if(slots>SIZE_MAX/sizeof(saved_identity) ||
            edit_pool_init(&inv.identities,sizeof(saved_identity),_Alignof(saved_identity),slots?(size_t)slots:1)) {
             a->clean=false; inv.uncertain=true; continue;
@@ -453,8 +455,8 @@ int journal_retire_directory(const char *directory, const char *current)
         journal_replay_result result;
         if(journal_scan_file(a->path,record,&inv,&result) || result.corrupt) { a->clean=false; inv.uncertain=true; }
         edit_pool_free(&inv.identities); inv.bases=NULL;
-        struct stat after;
-        if(lstat(a->path,&after) || !same(&a->identity,&after)) { a->clean=false; inv.uncertain=true; }
+        os_stat after;
+        if(os_stat_path(a->path,OS_STAT_NOFOLLOW,&after) || !same(&a->identity,&after)) { a->clean=false; inv.uncertain=true; }
         /* An empty placeholder contains no bytes that could encode edits. */
     }
     qsort(items,inv.count,sizeof *items,oldest);
@@ -463,12 +465,12 @@ int journal_retire_directory(const char *directory, const char *current)
         bool eligible=a->base?!inv.uncertain && !a->referenced:a->session && a->clean;
         bool capped=a->base || a->aside;
         if(!eligible || (capped && !a->retired && total<=JOURNAL_ARTIFACT_BYTES)) continue;
-        int removed=remove_verified(dirfd(dir),a);
-        if(!removed && capped) total-=(uint64_t)a->identity.st_size;
+        int removed=remove_verified(&dir->dir,a);
+        if(!removed && capped) total-=(uint64_t)a->identity.size;
         else if(removed && removed!=JOURNAL_BUSY) rc=removed;
     }
-    for(size_t i=0;i<inv.count;i++) if(items[i].lease>=0) close(items[i].lease);
+    for(size_t i=0;i<inv.count;i++) os_file_close(&items[i].lease);
     edit_arena_free(&arena);
     sweep_leases(dir);
-    close(guard); closedir(dir); return rc;
+    listing_close(dir); return rc;
 }

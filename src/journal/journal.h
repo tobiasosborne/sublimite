@@ -5,6 +5,7 @@
 #include "work/work.h"
 #include "piece/piece.h"
 #include <sys/types.h>
+#include "os/os.h"
 
 #define JOURNAL_PAGE 4096u
 #define JOURNAL_HEADER 32u
@@ -108,6 +109,8 @@ typedef struct journal_stats {
 } journal_stats;
 typedef struct journal journal;
 /* Optional per-instance syscall seam; callbacks have POSIX return/errno semantics.
+ * Descriptor arguments are borrowed Linux fds; Windows passes -1 (injection
+ * only: a hook cannot forward that argument to a native file operation).
  * sync receives directory=true for namespace barriers, false for fdatasync.
  * metadata_sync is a separate full-inode fsync barrier for retained BASEs.
  * NULL callbacks use real syscalls; contexts must outlive all jobs, including
@@ -411,6 +414,12 @@ int journal_acknowledge(const char *source);
  * Writes the journal path to path; *lease receives the held flock descriptor
  * (O_CLOEXEC). Pass it to editor_config.session_lease; close it after the
  * editor has closed (the editor holds its own duplicate). */
+/* Portable lease handoff: use os_file_dup for the editor's owned duplicate;
+ * close the creator only after that handoff. */
+int journal_session_create_file(const char *directory, char *path, size_t cap, os_file *lease);
+int journal_session_release_file(const char *path, const os_file *lease);
+int journal_session_absent_at(const os_dir *dir, const char *leaf);
+#if !defined(_WIN32)
 int journal_session_create(const char *directory, char *path, size_t cap, int *lease);
 /* After the owner removed its empty journal at path: unlink the lease file
  * that lease (still held) names. JOURNAL_BUSY if the journal still exists or
@@ -418,6 +427,7 @@ int journal_session_create(const char *directory, char *path, size_t cap, int *l
 int journal_session_release(const char *path, int lease);
 /* JOURNAL_OK if directory dfd has no entry named leaf or leaf.<suffix>. */
 int journal_session_absent(int dfd, const char *leaf);
+#endif
 /* Manual recovery onto explicitly supplied bytes. id=0 selects only when
  * unambiguous. Dry run validates and prints; apply durably replaces the file.
  * Never modifies the source journal. Conflicting BASE identity is printed;

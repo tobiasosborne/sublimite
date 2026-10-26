@@ -1,13 +1,9 @@
 /* Off-path manual recovery. (P) structural constants are empty/one, field
  * widths are sizeof wire integers; POSIX owner read/write mode = 0600. */
-#include "journal/journal.h"
-#include <errno.h>
-#include <fcntl.h>
+#include "journal/private.h"
 #include <inttypes.h>
 #include <limits.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 typedef struct replay {
     uint64_t id;
@@ -68,73 +64,81 @@ static int apply_record(void *ctx, const journal_record *r)
     fprintf(s->output,"%s offset=%" PRIu64 " bytes=%zu\n",r->type==JOURNAL_INSERT?"INSERT":"DELETE",off,n);
     return 0;
 }
-static bool unchanged(const struct stat *a, const struct stat *b)
-{
-    return a->st_ino==b->st_ino && a->st_dev==b->st_dev && a->st_size==b->st_size &&
-        a->st_mtim.tv_sec==b->st_mtim.tv_sec && a->st_mtim.tv_nsec==b->st_mtim.tv_nsec &&
-        a->st_ctim.tv_sec==b->st_ctim.tv_sec && a->st_ctim.tv_nsec==b->st_ctim.tv_nsec;
-}
-static int transfer(int fd, uint8_t *bytes, size_t size, bool writing)
+static bool unchanged(const os_stat *a, const os_stat *b)
+{ return journal_same_stat(a,b); }
+static int transfer(os_file fd, uint8_t *bytes, size_t size, bool writing)
 {
     size_t done=0;
     while(done<size) {
-        ssize_t n=writing?write(fd,bytes+done,size-done):read(fd,bytes+done,size-done);
-        if(n<0 && errno==EINTR) continue;
-        if(n<=0) return JOURNAL_IO;
-        done+=(size_t)n;
+        size_t n=0;
+        os_err e=writing?os_file_write(&fd,bytes+done,size-done,&n):os_file_read(&fd,bytes+done,size-done,&n);
+        if(e!=OS_OK || !n) return JOURNAL_IO;
+        done+=n;
     }
     return 0;
+}
+/* os_file_close has no result. The final publication close historically
+ * reports errors, so transfer ownership to stdio and use its checked close.
+ * This setup-only bridge may allocate; no bytes are buffered through it. */
+static int close_written(os_file *out)
+{
+    FILE *stream=NULL;
+    if(os_file_to_stdio(out,"r+b",&stream)!=OS_OK) { os_file_close(out); return JOURNAL_IO; }
+    return fclose(stream)==0?0:JOURNAL_IO;
 }
 int journal_manual_replay(const char *source, const char *target, uint64_t id, bool apply, FILE *output)
 {
     if(!source || !target || !output) return JOURNAL_INVALID;
-    int fd=open(target,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK); if(fd<0) return JOURNAL_IO;
-    struct stat original,journal_identity,now;
+    os_file fd=OS_FILE_INIT;
+    os_err opened=os_file_open(&fd,target,OS_OPEN_READ|OS_OPEN_NOFOLLOW|OS_OPEN_NONBLOCK);
+    if(opened!=OS_OK) return opened==OS_E_ISDIR?JOURNAL_INVALID:JOURNAL_IO;
+    os_stat original,journal_identity,now;
     int rc=0;
-    if(fstat(fd,&original) || !S_ISREG(original.st_mode) || original.st_size<0 ||
-       (uint64_t)original.st_size>SIZE_MAX || lstat(source,&journal_identity) || !S_ISREG(journal_identity.st_mode) ||
-       (original.st_ino==journal_identity.st_ino && original.st_dev==journal_identity.st_dev)) rc=JOURNAL_INVALID;
+    if(os_file_stat(&fd,&original) || original.kind!=OS_KIND_FILE ||
+       (uint64_t)original.size>SIZE_MAX || os_stat_path(source,OS_STAT_NOFOLLOW,&journal_identity) || journal_identity.kind!=OS_KIND_FILE ||
+       (journal_same_id(&original,&journal_identity))) rc=JOURNAL_INVALID;
     replay state={.id=id,.automatic=id==0,.output=output}; journal_replay_result result;
-    if(!rc) { state.capacity=(size_t)original.st_size; rc=journal_scan_file(source,plan,&state,&result); }
+    if(!rc) { state.capacity=(size_t)original.size; rc=journal_scan_file(source,plan,&state,&result); }
     if(!rc && (result.corrupt || !state.selected || state.ambiguous)) rc=JOURNAL_INVALID;
     edit_arena arena={0};
     if(!rc && edit_arena_init(&arena,state.capacity?state.capacity:1)) rc=JOURNAL_NOMEM;
     if(!rc) {
         state.bytes=edit_arena_alloc(&arena,state.capacity?state.capacity:1,_Alignof(uint8_t));
-        state.len=(size_t)original.st_size; rc=transfer(fd,state.bytes,state.len,false);
+        state.len=(size_t)original.size; rc=transfer(fd,state.bytes,state.len,false);
     }
-    close(fd);
+    os_file_close(&fd);
     if(!rc) rc=journal_scan_file(source,apply_record,&state,&result);
     if(state.error) rc=state.error;
-    if(!rc && (result.corrupt || !state.base_seen || lstat(source,&now) || !unchanged(&journal_identity,&now))) rc=JOURNAL_INVALID;
-    if(!rc && (lstat(target,&now) || !unchanged(&original,&now))) rc=JOURNAL_BASE_CHANGED;
+    if(!rc && (result.corrupt || !state.base_seen || os_stat_path(source,OS_STAT_NOFOLLOW,&now) || !unchanged(&journal_identity,&now))) rc=JOURNAL_INVALID;
+    if(!rc && (os_stat_path(target,OS_STAT_NOFOLLOW,&now) || !unchanged(&original,&now))) rc=JOURNAL_BASE_CHANGED;
     if(!rc) fprintf(output,"%s %s: resulting_bytes=%zu\n",apply?"APPLY":"WOULD REPLACE",target,state.len);
     char temporary[sizeof ((journal_base *)0)->captured_path]="";
-    int dfd=-1; bool created=false;
+    os_dir dfd=OS_DIR_INIT; bool created=false;
     if(!rc && apply) {
         int n=snprintf(temporary,sizeof temporary,"%s.replay-XXXXXX",target);
         if(n<0 || (size_t)n>=sizeof temporary) rc=JOURNAL_INVALID;
         if(!rc) {
-            fd=mkstemp(temporary);
-            if(fd<0) rc=JOURNAL_IO;
+            opened=journal_temp(&fd,temporary,0);
+            if(opened!=OS_OK) rc=JOURNAL_IO;
             else {
                 created=true;
-                if(fchmod(fd,original.st_mode & (S_IRWXU|S_IRWXG|S_IRWXO))) rc=JOURNAL_IO;
+                if(os_file_set_mode(&fd,original.perm & 0777u)) rc=JOURNAL_IO;
                 if(!rc) rc=transfer(fd,state.bytes,state.len,true);
-                if(!rc && fsync(fd)) rc=JOURNAL_IO;
-                if(close(fd) && !rc) rc=JOURNAL_IO;
+                if(!rc && os_file_sync(&fd)) rc=JOURNAL_IO;
+                if(rc) os_file_close(&fd);
+                else rc=close_written(&fd);
             }
         }
-        char parent[sizeof temporary]; strcpy(parent,target); char *slash=strrchr(parent,'/');
-        if(slash==parent) slash[1]=0; else if(slash) *slash=0; else strcpy(parent,".");
-        if(!rc) { dfd=open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC); if(dfd<0) rc=JOURNAL_IO; }
-        if(!rc && (lstat(target,&now) || !unchanged(&original,&now))) rc=JOURNAL_BASE_CHANGED;
-        if(!rc && (lstat(source,&now) || !unchanged(&journal_identity,&now))) rc=JOURNAL_INVALID;
-        if(!rc && rename(temporary,target)) rc=JOURNAL_IO;
-        else if(!rc) { created=false; if(fsync(dfd)) rc=JOURNAL_IO; }
+        char parent[sizeof temporary]; strcpy(parent,target); journal_slashes(parent); char *slash=strrchr(parent,'/');
+        journal_parent(parent,slash);
+        if(!rc && os_dir_open(&dfd,parent)!=OS_OK) rc=JOURNAL_IO;
+        if(!rc && (os_stat_path(target,OS_STAT_NOFOLLOW,&now) || !unchanged(&original,&now))) rc=JOURNAL_BASE_CHANGED;
+        if(!rc && (os_stat_path(source,OS_STAT_NOFOLLOW,&now) || !unchanged(&journal_identity,&now))) rc=JOURNAL_INVALID;
+        if(!rc && os_rename(temporary,target,OS_RENAME_REPLACE)) rc=JOURNAL_IO;
+        else if(!rc) { created=false; if(os_dir_sync(&dfd)) rc=JOURNAL_IO; }
     }
-    if(created && unlink(temporary) && !rc) rc=JOURNAL_IO;
-    if(dfd>=0) close(dfd);
+    if(created && os_unlink(temporary) && !rc) rc=JOURNAL_IO;
+    os_dir_close(&dfd);
     if(arena.base) edit_arena_free(&arena);
     return rc;
 }
