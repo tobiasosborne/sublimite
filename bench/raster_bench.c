@@ -636,7 +636,7 @@ int main(int argc, char **argv)
     }
     memset(r, 0, sizeof *r);
     r->track = track;
-    plat_config pc = {"raster_bench",2880,1800,false,-1,0};
+    plat_config pc = {"raster_bench",2880,1800,false, NULL,0};
     if (plat_init(&r->pl,&pc) != PLAT_OK) {
         if (scroll_only) render_pace_skip(stdout,"raster_scroll_600","X11_unavailable");
         puts("SKIP G3/G3z/G3i: cannot open display; not measured"); free(r); return fixture_status(track);

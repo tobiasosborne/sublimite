@@ -8,6 +8,7 @@
 #include "trace/trace.h"
 #include "work/work.h"
 #include "x11/plat.h"
+#include "wayland/plat.h"
 #include <poll.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -363,14 +364,17 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     cpu_state *st = b->state;
     memset(st, 0, sizeof *st);
     st->shmid = -1;
-    if (cfg->platform == NULL || cfg->workers == NULL || cfg->platform->conn == NULL)
+    const plat_x11_native native = plat_native_x11(cfg->platform);
+    void *connection = cfg->platform && cfg->platform->backend == PLAT_BACKEND_WAYLAND
+        ? wayland_display(cfg->platform) : native.connection;
+    if (cfg->platform == NULL || cfg->workers == NULL || connection == NULL)
         return RENDER_ERR_INIT;
     if (cfg->max_width > UINT16_MAX || cfg->max_height > INT16_MAX ||
         cfg->workers->n_workers <= cfg->workers->n_bulk) return RENDER_ERR_UNSUPPORTED;
     const plat *pl = cfg->platform;
     if (pl->backend == PLAT_BACKEND_WAYLAND) return RENDER_ERR_UNSUPPORTED;
-    st->win = pl->win; st->depth = pl->depth; st->pool = cfg->workers;
-    st->alpha_or = pl->depth == 32 ? 0xff000000u : 0u;
+    st->win = native.window; st->depth = native.depth; st->pool = cfg->workers;
+    st->alpha_or = native.depth == 32 ? 0xff000000u : 0u;
     st->max_w = cfg->max_width; st->max_h = cfg->max_height;
     st->stride_px = cfg->max_width;
     int scr = 0;
@@ -386,7 +390,7 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     bool depth_ok = false;
     for (xcb_format_iterator_t it = xcb_setup_pixmap_formats_iterator(setup); it.rem; xcb_format_next(&it))
         if (it.data->depth == st->depth && it.data->bits_per_pixel == 32) depth_ok = true;
-    if (!fmt_ok || !depth_ok || !cpu_visual_rgb888(setup, pl->visual, pl->depth)) goto fail;
+    if (!fmt_ok || !depth_ok || !cpu_visual_rgb888(setup, native.visual, native.depth)) goto fail;
     xcb_shm_query_version_reply_t *sv = xcb_shm_query_version_reply(st->conn, xcb_shm_query_version(st->conn), NULL);
     if (sv == NULL) goto fail;
     free(sv);

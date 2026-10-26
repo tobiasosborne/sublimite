@@ -24,7 +24,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t bound = 256u / 2u / 2u;
     size_t len = size < bound ? size : bound;
     pid_t child = mock_start_payload(true, data, len);
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = -1};
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
     int rc = plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND);
     if (rc == PLAT_OK) {
         bool received = false; plat_callbacks cb = {.ud = &received, .on_event = fuzz_event};

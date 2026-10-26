@@ -300,7 +300,7 @@ static int view_init(view *v, work_pool *pool)
     layout_config cfg = {.tab_width = 4, .fg = 0xffffff, .slice_clusters = 500};
     if (layout_init(&v->lay, &v->grid, &cfg, v->row_byte, v->row_used) != 0) return 1;
     plat_config pc = {.title = "file bench TRACK", .width = COLS * dims.cell_w,
-        .height = ROWS * dims.cell_h, .work_eventfd = work_pool_eventfd(pool)};
+        .height = ROWS * dims.cell_h, .work_wake = work_pool_wake(pool)};
     if (plat_init(&v->platform, &pc) != 0) return 1;
     plat_map(&v->platform);
     if (render_cpu_backend(&v->backend) != 0) return 1;
@@ -645,6 +645,6 @@ int main(int argc, char **argv)
     }
     if (!cold)
         printf("MANUAL cold rows unmeasured: --cold evicts + verifies residency before EACH sample; G8d cold 2200/3000 ms (G); see docs/decisions/P1.7f.md\n");
-    if (v) { render_backend_shutdown(&v->backend); free(v->state); if (v->platform.conn) plat_shutdown(&v->platform); free(v); }
+    if (v) { render_backend_shutdown(&v->backend); free(v->state); if (plat_native_x11(&v->platform).connection) plat_shutdown(&v->platform); free(v); }
     work_pool_shutdown(&pool); return rc;
 }

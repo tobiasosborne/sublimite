@@ -1,3 +1,4 @@
+#include "x11/private.h"
 #include "editor/private.h"
 #include "journal/journal.h"
 #include "trace/trace.h"
@@ -48,9 +49,9 @@ static int close_case(bool native)
     e->v.busy = true;
     if (native) {
         plat *p = &e->platform;
-        xcb_client_message_event_t msg = {.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=p->win,
-            .type=p->wm_protocols,.data.data32={p->wm_delete,0,0,0,0}};
-        xcb_generic_error_t *err = xcb_request_check(p->conn,xcb_send_event_checked(p->conn,0,p->win,0,(const char *)&msg));
+        xcb_client_message_event_t msg = {.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=plat_native_x11(p).window,
+            .type=x11_private(p)->wm_protocols,.data.data32={x11_private(p)->wm_delete,0,0,0,0}};
+        xcb_generic_error_t *err = xcb_request_check(plat_native_x11(p).connection,xcb_send_event_checked(plat_native_x11(p).connection,0,plat_native_x11(p).window,0,(const char *)&msg));
         T(!err); free(err);
     } else {
         plat_event close = {.kind=PLAT_EV_CLOSE};

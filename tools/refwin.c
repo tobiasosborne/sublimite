@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* Bare reference renderer: one baked glyph, editor's CPU backend/Present path.
  * Metadata and CSV are handled only after the key's submit has returned. */
 #include "refwin_protocol.h"
@@ -87,7 +88,7 @@ static int refwin_submit(refwin_state *s, bool changed)
 }
 static int refwin_pump(refwin_state *s)
 {
-    xcb_connection_t *c = s->platform.conn;
+    xcb_connection_t *c = plat_native_x11(&s->platform).connection;
     xcb_generic_event_t *e;
     while ((e = xcb_poll_for_event(c)) != NULL) {
         uint8_t kind = e->response_type & UINT8_C(0x7f);
@@ -105,11 +106,11 @@ static int refwin_pump(refwin_state *s)
                 if (!s->key_pending || s->notified_pair || !msg->data.data32[0] ||
                     msg->data.data32[0] <= s->last_pair) s->error = "metadata ClientMessage missing key/pair, duplicate or backwards pair";
                 else s->notified_pair = msg->data.data32[0];
-            } else if (msg->type == s->platform.wm_protocols &&
-                       msg->data.data32[0] == s->platform.wm_delete) s->error = "WM_DELETE_WINDOW before pairs completed";
+            } else if (msg->type == x11_private(&s->platform)->wm_protocols &&
+                       msg->data.data32[0] == x11_private(&s->platform)->wm_delete) s->error = "WM_DELETE_WINDOW before pairs completed";
         } else if (kind == XCB_GE_GENERIC) {
             xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)e;
-            if (ge->extension == s->platform.present_opcode && ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
+            if (ge->extension == x11_private(&s->platform)->present_opcode && ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
                 xcb_present_complete_notify_event_t *complete = (xcb_present_complete_notify_event_t *)e;
                 if (complete->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP && complete->serial == s->grid.frame_id && !s->platform_t6)
                     s->platform_t6 = trace_now_ns();
@@ -134,7 +135,7 @@ static int refwin_finish(refwin_state *s, FILE *csv)
 {
     if (!s->key_pending || s->backend.active || !s->notified_pair) return 0;
     refproto_row row;
-    if (refproto_get(s->platform.conn,s->platform.win,s->injection,&row)) {
+    if (refproto_get(plat_native_x11(&s->platform).connection,plat_native_x11(&s->platform).window,s->injection,&row)) {
         s->error = "injection metadata property missing/malformed"; return -1;
     }
     s->metadata = row;
@@ -151,7 +152,7 @@ static int refwin_finish(refwin_state *s, FILE *csv)
     if (s->platform_t6 && s->platform_t6 < row.t6) row.t6 = s->platform_t6;
     if (row.t6 < row.t4) { s->error = "platform Present completion precedes T4"; return -1; }
     if (refproto_csv(csv,"reference",&row)) { s->last_result = errno; s->error = "reference CSV write/flush failed"; return -1; }
-    if (refproto_set(s->platform.conn,s->platform.win,s->complete,&row)) {
+    if (refproto_set(plat_native_x11(&s->platform).connection,plat_native_x11(&s->platform).window,s->complete,&row)) {
         s->error = "write reference completion acknowledgement failed"; return -1;
     }
     s->last_pair = row.pair; s->completed++; s->notified_pair = 0; s->key_pending = false;
@@ -210,46 +211,46 @@ int main(int argc, char **argv)
     refwin_state s = {0}; s.keycode = (uint32_t)keycode;
     trace_init(); (void)trace_thread_register();
     font_cell dims = font_ascii_cell();
-    plat_config pc = {"P2.6 reference",dims.cell_w,dims.cell_h,false,-1,0};
+    plat_config pc = {"P2.6 reference",dims.cell_w,dims.cell_h,false, NULL,0};
     s.last_result = plat_init(&s.platform,&pc);
     if (s.last_result) { s.error = "plat_init failed (see platform return code)"; goto done; }
     platform_ready = true;
-    if (!s.platform.present_ok) { s.error = "platform Present unavailable"; goto done; }
-    if (!refproto_checked(s.platform.conn,xcb_change_window_attributes_checked(s.platform.conn,s.platform.win,
+    if (!plat_present_available(&s.platform)) { s.error = "platform Present unavailable"; goto done; }
+    if (!refproto_checked(plat_native_x11(&s.platform).connection,xcb_change_window_attributes_checked(plat_native_x11(&s.platform).connection,plat_native_x11(&s.platform).window,
         XCB_CW_OVERRIDE_REDIRECT,(uint32_t[]){managed ? 0u : 1u}))) {
         s.error = "set reference override-redirect attribute failed"; goto done;
     }
-    if (!refproto_checked(s.platform.conn,xcb_map_window_checked(s.platform.conn,s.platform.win))) {
+    if (!refproto_checked(plat_native_x11(&s.platform).connection,xcb_map_window_checked(plat_native_x11(&s.platform).connection,plat_native_x11(&s.platform).window))) {
         s.error = "map reference window request failed"; goto done;
     }
     /* Managed windows can be reparented/mapped asynchronously by the WM. */
     uint64_t map_deadline = trace_now_ns()+timeout_ms*UINT64_C(1000000);
     for (;;) {
-        xcb_get_window_attributes_reply_t *attrs = xcb_get_window_attributes_reply(s.platform.conn,
-            xcb_get_window_attributes(s.platform.conn,s.platform.win),NULL);
+        xcb_get_window_attributes_reply_t *attrs = xcb_get_window_attributes_reply(plat_native_x11(&s.platform).connection,
+            xcb_get_window_attributes(plat_native_x11(&s.platform).connection,plat_native_x11(&s.platform).window),NULL);
         if (!attrs) { s.error = "GetWindowAttributes after MapWindow failed"; goto done; }
         bool viewable = attrs->map_state == XCB_MAP_STATE_VIEWABLE; free(attrs);
         if (viewable) break;
         if (trace_now_ns() >= map_deadline) { s.error = "map timeout: WM has not made reference viewable"; goto done; }
         struct timespec delay = {0,1000000}; (void)nanosleep(&delay,NULL);
     }
-    refproto_target target = {.window=s.platform.win};
+    refproto_target target = {.window=plat_native_x11(&s.platform).window};
     if (refproto_preflight(&probe,&target)) goto done;
     refproto_display_close(&probe);
     s.last_result = work_pool_init(&s.pool,1,4);
     if (s.last_result) { s.error = "work pool initialization failed"; goto done; }
     pool_ready = true;
-    s.injection = refproto_atom(s.platform.conn,"_EDIT_REF_INJECT");
-    s.complete = refproto_atom(s.platform.conn,"_EDIT_REF_COMPLETE");
-    s.notify = refproto_atom(s.platform.conn,"_EDIT_REF_NOTIFY");
-    xcb_atom_t bypass = refproto_atom(s.platform.conn,"_NET_WM_BYPASS_COMPOSITOR");
+    s.injection = refproto_atom(plat_native_x11(&s.platform).connection,"_EDIT_REF_INJECT");
+    s.complete = refproto_atom(plat_native_x11(&s.platform).connection,"_EDIT_REF_COMPLETE");
+    s.notify = refproto_atom(plat_native_x11(&s.platform).connection,"_EDIT_REF_NOTIFY");
+    xcb_atom_t bypass = refproto_atom(plat_native_x11(&s.platform).connection,"_NET_WM_BYPASS_COMPOSITOR");
     uint32_t one = 1;
     if (!s.injection) { s.error = "intern _EDIT_REF_INJECT failed"; goto done; }
     if (!s.complete) { s.error = "intern _EDIT_REF_COMPLETE failed"; goto done; }
     if (!s.notify) { s.error = "intern _EDIT_REF_NOTIFY failed"; goto done; }
     if (!bypass) { s.error = "intern _NET_WM_BYPASS_COMPOSITOR failed"; goto done; }
-    if (!refproto_checked(s.platform.conn,xcb_change_property_checked(s.platform.conn,
-            XCB_PROP_MODE_REPLACE,s.platform.win,bypass,XCB_ATOM_CARDINAL,32,1,&one))) { s.error = "write _NET_WM_BYPASS_COMPOSITOR failed"; goto done; }
+    if (!refproto_checked(plat_native_x11(&s.platform).connection,xcb_change_property_checked(plat_native_x11(&s.platform).connection,
+            XCB_PROP_MODE_REPLACE,plat_native_x11(&s.platform).window,bypass,XCB_ATOM_CARDINAL,32,1,&one))) { s.error = "write _NET_WM_BYPASS_COMPOSITOR failed"; goto done; }
     size_t pixel_len = 0; const uint8_t *pixels = font_ascii_pixels(&pixel_len);
     s.page = (render_atlas_page){pixels,pixel_len,(size_t)dims.cell_w*95u,dims.cell_w*95u,dims.cell_h};
     for (uint32_t i = 0; i < 95; i++) s.glyphs[i] = (render_glyph){i+32u,0,i*dims.cell_w,0,dims.cell_w,dims.cell_h};
@@ -282,11 +283,11 @@ int main(int argc, char **argv)
     csv = fopen(csv_path,"w");
     if (!csv) { s.last_result = errno; s.error = "open reference CSV failed"; goto done; }
     if (fputs(REFPROTO_HEADER,csv) == EOF || fflush(csv)) { s.error = "CSV header write/flush failed"; s.last_result = errno; goto done; }
-    xcb_atom_t ready = refproto_atom(s.platform.conn,"_EDIT_REF_READY");
+    xcb_atom_t ready = refproto_atom(plat_native_x11(&s.platform).connection,"_EDIT_REF_READY");
     uint32_t ready_words[] = {1,s.keycode};
-    if (!ready || !refproto_checked(s.platform.conn,xcb_change_property_checked(s.platform.conn,XCB_PROP_MODE_REPLACE,
-        s.platform.win,ready,XCB_ATOM_CARDINAL,32,2,ready_words))) { s.error = "write reference readiness property failed"; goto done; }
-    if (dprintf((int)ready_fd,"%" PRIu32 "\n",s.platform.win) < 0) { s.error = "READY fd write failed"; s.last_result = errno; goto done; }
+    if (!ready || !refproto_checked(plat_native_x11(&s.platform).connection,xcb_change_property_checked(plat_native_x11(&s.platform).connection,XCB_PROP_MODE_REPLACE,
+        plat_native_x11(&s.platform).window,ready,XCB_ATOM_CARDINAL,32,2,ready_words))) { s.error = "write reference readiness property failed"; goto done; }
+    if (dprintf((int)ready_fd,"%" PRIu32 "\n",plat_native_x11(&s.platform).window) < 0) { s.error = "READY fd write failed"; s.last_result = errno; goto done; }
     fprintf(stderr,"refwin: cpu-raster, one glyph; compositor bypass requested (not guaranteed)\n");
     deadline = trace_now_ns()+timeout_ms*UINT64_C(1000000);
     while (!pairs || s.completed < pairs) {
@@ -301,11 +302,11 @@ int main(int argc, char **argv)
         }
     }
     /* Keep the acknowledgement available until the injector consumes it. */
-    xcb_atom_t consumed = refproto_atom(s.platform.conn,"_EDIT_REF_CONSUMED");
+    xcb_atom_t consumed = refproto_atom(plat_native_x11(&s.platform).connection,"_EDIT_REF_CONSUMED");
     if (!consumed) { s.error = "intern consumed acknowledgement atom failed"; goto done; }
     for (;;) {
         refproto_row ack;
-        int property = refproto_get(s.platform.conn,s.platform.win,consumed,&ack);
+        int property = refproto_get(plat_native_x11(&s.platform).connection,plat_native_x11(&s.platform).window,consumed,&ack);
         if (property < 0) { s.error = "read consumed acknowledgement failed"; goto done; }
         if (!property && ack.pair == s.last_pair) break;
         if (refwin_pump(&s)) goto done;
@@ -316,7 +317,7 @@ done:
     if (s.error) fprintf(stderr,"refwin: window=0x%08" PRIx32 " %s; result=%d init_result=%d frame=%" PRIu32
         " pair=%" PRIu32 " completed=%" PRIu32 " key_pending=%u active=%u presented=%u allocations=%zu"
         " T4=%" PRIu64 " T5=%" PRIu64 " T6=%" PRIu64 " inject=%" PRIu64 " MSC=%" PRIu64
-        " phase=%" PRIu64 " period=%" PRIu64 " actual_phase=%" PRIu64 "\n",s.platform.win,s.error,s.last_result,s.init_result,
+        " phase=%" PRIu64 " period=%" PRIu64 " actual_phase=%" PRIu64 "\n",plat_native_x11(&s.platform).window,s.error,s.last_result,s.init_result,
         s.grid.frame_id,s.notified_pair,s.completed,s.key_pending,s.backend.active,s.backend.presented,s.allocations,s.t4,s.t5,s.t6,s.metadata.inject,s.metadata.msc,s.metadata.phase,s.metadata.period,s.metadata.actual);
     render_backend_shutdown(&s.backend);
     if (pool_ready) work_pool_shutdown(&s.pool);

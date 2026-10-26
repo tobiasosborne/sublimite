@@ -1,6 +1,7 @@
 /* Runtime selection policy is a truth table over the environment, not a
  * timing/count budget. Headless init must not contact either display. */
 #include "wayland/plat.h"
+#include "os/os.h"
 #include "wayland/private.h"
 #include "base/base.h"
 #include "editor/editor.h"
@@ -64,8 +65,8 @@ static void work(void *user)
 static void presentation_fallback_test(bool require_fallback)
 {
     pid_t child = mock_start_options(true, false, NULL, 0, 0, true);
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = -1};
-    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK && !p.present_ok);
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK && !plat_present_available(&p));
     int armed = wayland_frame_arm(&p, 1); /* (P) first nonzero frame identity */
     if (require_fallback) assert(armed == PLAT_OK);
     else assert(armed == PLAT_ERR_FAIL);
@@ -77,18 +78,18 @@ static void submitted(void *user, const editor_frame *frame)
 static void allocation_test(void)
 {
     pid_t child = mock_start(true);
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = -1};
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
     plat_event event;
     while (plat_poll_event(&p, &event)) { /* retire startup input */ }
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_flush(p.conn) >= 0);
-    struct pollfd native = {wl_display_get_fd(p.conn), POLLIN, 0};
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_flush(wayland_display(&p)) >= 0);
+    struct pollfd native = {wl_display_get_fd(wayland_display(&p)), POLLIN, 0};
     assert(poll(&native, 1, -1) > 0); /* (P) one actual native fd; no time budget */
     const char *power = bench_evidence_tag(); /* BAT0 checked before counting */
     edit_malloc_guard_begin();
-    assert(!wl_display_prepare_read(p.conn));
-    assert(!wl_display_read_events(p.conn));
-    assert(wl_display_dispatch_pending(p.conn) >= 0);
+    assert(!wl_display_prepare_read(wayland_display(&p)));
+    assert(!wl_display_read_events(wayland_display(&p)));
+    assert(wl_display_dispatch_pending(wayland_display(&p)) >= 0);
     size_t transport = edit_malloc_guard_end();
     /* The red probe showed foreign packet allocation before decoded ingress.
      * Keep it visible. G1's enforced bracket starts at decoded input and ends
@@ -148,7 +149,7 @@ static void output_test(void)
     assert(plat_display_interval_ns(&unknown) == 0);
     mock_join(child);
     child = mock_start_options(true, false, NULL, 0, scale, false);
-    plat p; plat_config cfg = {.width = (uint32_t)scale, .height = (uint32_t)scale, .work_eventfd = -1};
+    plat p; plat_config cfg = {.width = (uint32_t)scale, .height = (uint32_t)scale, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
     assert(p.width == (uint32_t)scale * cfg.width && p.height == cfg.height);
     bool motion = false; plat_event event;
@@ -162,10 +163,11 @@ static void output_test(void)
 static void protocol_test(void)
 {
     pid_t child = mock_start(true);
-    int work_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); assert(work_fd >= 0);
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = work_fd};
+    os_wake work_wake; assert(os_wake_init(&work_wake) == OS_OK);
+    int work_fd = os_wake_fd(&work_wake);
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = &work_wake};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
-    assert(p.present_ok && wayland_egl_window(&p));
+    assert(plat_present_available(&p) && wayland_egl_window(&p));
     assert(p.width == cfg.width + 1 && p.height == cfg.height); /* independent configure dimensions */
     observed o = {.platform = &p, .work_fd = work_fd}; plat_callbacks cb = {.ud = &o, .on_event = observe, .on_blink = blink, .on_work = work};
     assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
@@ -219,11 +221,11 @@ static void protocol_test(void)
     assert(wayland_frame_arm(&p, id + 1) == PLAT_ERR_FAIL);
     assert(wayland_frame_result(&p, id + 1, &ready, &ns, &msc) == PLAT_ERR_FAIL);
     wl_surface_commit(wayland_surface(&p));
-    assert(wl_display_roundtrip(p.conn) >= 0);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     assert(wayland_frame_result(&p, id, &ready, &ns, &msc) == PLAT_OK && ready && ns && msc);
     assert(wayland_frame_arm(&p, ++id) == PLAT_OK);
     wl_surface_commit(wayland_surface(&p));
-    assert(wl_display_roundtrip(p.conn) >= 0);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     assert(wayland_frame_result(&p, id, &ready, &ns, &msc) == PLAT_ERR_FAIL);
     assert(plat_clip_set(&p, PLAT_CLIP_CLIPBOARD, "owned clipboard", sizeof "owned clipboard" - 1) == PLAT_OK);
     o.clip = false;
@@ -238,8 +240,8 @@ static void protocol_test(void)
     /* Clamp/delay derives from existing X11_REPEAT_MAX_HZ and the immediate
      * repeat mode; no latency budget is asserted. */
     plat_set_repeat(&p, 0, 1000);
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_flush(p.conn) >= 0);
-    struct pollfd native = {wl_display_get_fd(p.conn), POLLIN, 0};
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_flush(wayland_display(&p)) >= 0);
+    struct pollfd native = {wl_display_get_fd(wayland_display(&p)), POLLIN, 0};
     assert(poll(&native, 1, -1) > 0); /* wait for the actual mock key packet, no duration budget */
     o.stop_key = true; o.work = false;
     assert(write(work_fd, &wake, sizeof wake) == sizeof wake);
@@ -248,9 +250,9 @@ static void protocol_test(void)
     p.quit = false; o.stop_key = false;
     assert(plat_run_for(&p, &cb, 0) == PLAT_OK && o.work); p.quit = false;
     while (!o.repeat) assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(p.conn) >= 0);
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     o.repeat = false; assert(plat_run_for(&p, &cb, 0) == PLAT_OK && !o.focus && !o.repeat);
-    plat_shutdown(&p); plat_shutdown(&p); mock_join(child); close(work_fd); cfg.work_eventfd = -1;
+    plat_shutdown(&p); plat_shutdown(&p); mock_join(child); os_wake_close(&work_wake); cfg.work_wake = NULL;
     child = mock_start(false);
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_ERR_FAIL);
     plat_shutdown(&p); mock_join(child);
@@ -291,7 +293,7 @@ static void socket_path_test(void)
     memset(name, 'x', sizeof name - 1); name[sizeof name - 1] = '\0';
     assert(!setenv("WAYLAND_DISPLAY", name, 1));
     assert(!setenv("XDG_RUNTIME_DIR", "/tmp", 1));
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = -1};
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_ERR_SOCKET_PATH);
     plat_shutdown(&p);
     assert(!unsetenv("WAYLAND_DISPLAY"));
@@ -337,7 +339,7 @@ int main(int argc, char **argv)
     assert(plat_backend_select("", "wayland-test") == PLAT_BACKEND_WAYLAND);
     plat p;
     plat_config cfg = {.width = 1, .height = 1, .headless = true,
-        .work_eventfd = -1};
+        .work_wake = NULL};
     /* Unit dimensions are the minimum nonzero legal surface, derived from
      * the platform dimension contract. */
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_ERR_NO_DISPLAY);

@@ -1,3 +1,4 @@
+#include "x11/private.h"
 #include "select.h"
 #include "editor/editor.h"
 #include "editor/private.h"
@@ -495,8 +496,8 @@ static int minimap_compose_pixels(const char *backend_name)
         free(rgba);
     } else if (backend_name) {
         plat *platform = backend.config.platform;
-        xcb_get_image_reply_t *reply = xcb_get_image_reply(platform->conn,
-            xcb_get_image(platform->conn, XCB_IMAGE_FORMAT_Z_PIXMAP, platform->win,
+        xcb_get_image_reply_t *reply = xcb_get_image_reply(plat_native_x11(platform).connection,
+            xcb_get_image(plat_native_x11(platform).connection, XCB_IMAGE_FORMAT_Z_PIXMAP, plat_native_x11(platform).window,
                 (int16_t)(w - mw), (int16_t)(e->tab_rows * e->grid.dims.cell_h),
                 (uint16_t)mw, (uint16_t)mh, UINT32_MAX), NULL);
         T(reply && xcb_get_image_data_length(reply) >= (int)((size_t)mw * mh * sizeof(uint32_t)));
@@ -1750,14 +1751,14 @@ static int queue_depth(void)
 }
 static int native_key(editor *e, plat *p, const char *name, uint16_t state)
 {
-    x11_input *in = p->in;
+    x11_input *in = x11_private(p)->in;
     xkb_keycode_t code = xkb_keymap_key_by_name(in->keymap, name); T(code <= UINT8_MAX);
     xcb_key_press_event_t ev = {.response_type = XCB_KEY_PRESS, .detail = (uint8_t)code,
-        .event = p->win, .state = state, .same_screen = 1};
-    xcb_connection_t *conn = p->conn;
-    (void)xcb_send_event(conn, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&ev);
+        .event = plat_native_x11(p).window, .state = state, .same_screen = 1};
+    xcb_connection_t *conn = plat_native_x11(p).connection;
+    (void)xcb_send_event(conn, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_PRESS, (const char *)&ev);
     ev.response_type = XCB_KEY_RELEASE;
-    (void)xcb_send_event(conn, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&ev);
+    (void)xcb_send_event(conn, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&ev);
     (void)xcb_flush(conn);
     uint64_t sequence = editor_get_stats(e).input_sequence;
     uint64_t deadline = trace_now_ns() + UINT64_C(3000000000);
@@ -1769,8 +1770,8 @@ static int native_input(void)
     render_backend b = {0}; T(render_cpu_backend(&b) == 0);
     editor_config cfg = {.cols = 32, .rows = 8}; editor *e = NULL;
     T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); plat *p = b.config.platform;
-    xcb_get_property_reply_t *title = xcb_get_property_reply(p->conn,
-        xcb_get_property(p->conn, 0, p->win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 64), NULL);
+    xcb_get_property_reply_t *title = xcb_get_property_reply(plat_native_x11(p).connection,
+        xcb_get_property(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 64), NULL);
     T(title != NULL && xcb_get_property_value_length(title) == 9);
     T(memcmp(xcb_get_property_value(title), "sublimite", 9) == 0); free(title);
     T(native_key(e, p, "AC01", 0) == 0); T(expect(e, "a", 1) == 0);
@@ -1778,9 +1779,9 @@ static int native_input(void)
     T(native_key(e, p, "BKSP", 0) == 0); T(expect(e, "a", 1) == 0);
     T(native_key(e, p, "AB01", XCB_MOD_MASK_CONTROL) == 0); T(expect(e, "a\n", 2) == 0);
     T(native_key(e, p, "AB01", XCB_MOD_MASK_CONTROL | XCB_MOD_MASK_SHIFT) == 0); T(expect(e, "a", 1) == 0);
-    xcb_client_message_event_t close_event = {.response_type = XCB_CLIENT_MESSAGE, .format = 32, .window = p->win,
-        .type = p->wm_protocols, .data.data32 = {p->wm_delete, 0, 0, 0, 0}};
-    (void)xcb_send_event(p->conn, 0, p->win, 0, (const char *)&close_event); (void)xcb_flush(p->conn);
+    xcb_client_message_event_t close_event = {.response_type = XCB_CLIENT_MESSAGE, .format = 32, .window = plat_native_x11(p).window,
+        .type = x11_private(p)->wm_protocols, .data.data32 = {x11_private(p)->wm_delete, 0, 0, 0, 0}};
+    (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, 0, (const char *)&close_event); (void)xcb_flush(plat_native_x11(p).connection);
     int rc = EDITOR_OK; uint64_t deadline = trace_now_ns() + UINT64_C(3000000000);
     while (rc != EDITOR_CLOSED && trace_now_ns() < deadline) rc = editor_step(e, 20);
     T(rc == EDITOR_CLOSED); editor_close(e);
@@ -1822,24 +1823,24 @@ static int stopped_error(void)
 /* Review regressions run separately so every finding keeps its own red line. */
 static void raw_key(plat *p, const char *name)
 {
-    x11_input *in = p->in;
+    x11_input *in = x11_private(p)->in;
     xkb_keycode_t code = xkb_keymap_key_by_name(in->keymap, name);
     EDIT_ASSERT(code <= UINT8_MAX);
     xcb_key_press_event_t ev = {.response_type = XCB_KEY_PRESS, .detail = (uint8_t)code,
-        .event = p->win, .same_screen = 1};
-    (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&ev);
+        .event = plat_native_x11(p).window, .same_screen = 1};
+    (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_PRESS, (const char *)&ev);
     ev.response_type = XCB_KEY_RELEASE;
-    (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&ev);
+    (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&ev);
 }
 static void raw_close(plat *p)
 {
     xcb_client_message_event_t ev = {.response_type = XCB_CLIENT_MESSAGE, .format = 32,
-        .window = p->win, .type = p->wm_protocols, .data.data32 = {p->wm_delete, 0, 0, 0, 0}};
-    (void)xcb_send_event(p->conn, 0, p->win, 0, (const char *)&ev); (void)xcb_flush(p->conn);
+        .window = plat_native_x11(p).window, .type = x11_private(p)->wm_protocols, .data.data32 = {x11_private(p)->wm_delete, 0, 0, 0, 0}};
+    (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, 0, (const char *)&ev); (void)xcb_flush(plat_native_x11(p).connection);
 }
 static void raw_barrier(plat *p)
 {
-    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(p->conn, xcb_get_input_focus(p->conn), NULL);
+    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(plat_native_x11(p).connection, xcb_get_input_focus(plat_native_x11(p).connection), NULL);
     free(r);
 }
 static int review_native_order(void)
@@ -1851,13 +1852,13 @@ static int review_native_order(void)
         raw_key(p, "AC01");
         if (kind == 0) raw_close(p);
         else if (kind == 1) {
-            xcb_focus_out_event_t ev = {.response_type = XCB_FOCUS_OUT, .event = p->win,
+            xcb_focus_out_event_t ev = {.response_type = XCB_FOCUS_OUT, .event = plat_native_x11(p).window,
                 .mode = XCB_NOTIFY_MODE_NORMAL, .detail = XCB_NOTIFY_DETAIL_NONLINEAR};
-            (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&ev);
+            (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&ev);
         } else {
-            xcb_configure_notify_event_t ev = {.response_type = XCB_CONFIGURE_NOTIFY, .event = p->win,
-                .window = p->win, .width = 264, .height = 120};
-            (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&ev);
+            xcb_configure_notify_event_t ev = {.response_type = XCB_CONFIGURE_NOTIFY, .event = plat_native_x11(p).window,
+                .window = plat_native_x11(p).window, .width = 264, .height = 120};
+            (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&ev);
         }
         raw_barrier(p);
         if (kind == 0) {
@@ -1876,8 +1877,8 @@ static int review_native_burst(void)
     T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0); plat *p = b.config.platform;
     for (unsigned i = 0; i < 1300; i++) {
         raw_key(p, "AC01");
-        xcb_expose_event_t ev = {.response_type = XCB_EXPOSE, .window = p->win, .width = 256, .height = 120};
-        (void)xcb_send_event(p->conn, 0, p->win, XCB_EVENT_MASK_EXPOSURE, (const char *)&ev);
+        xcb_expose_event_t ev = {.response_type = XCB_EXPOSE, .window = plat_native_x11(p).window, .width = 256, .height = 120};
+        (void)xcb_send_event(plat_native_x11(p).connection, 0, plat_native_x11(p).window, XCB_EVENT_MASK_EXPOSURE, (const char *)&ev);
     }
     raw_barrier(p);
     for (unsigned i = 0; i < 10000 && editor_length(e) < 1300; i++) T(editor_step(e, 1) >= 0);
@@ -2158,7 +2159,7 @@ static int review_native_allocations(void)
     counted c = {0}; editor_config cfg = {.cols = 32, .rows = 4,
         .hook_ctx = &c, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
-    plat *p = backend.config.platform; x11_input *in = p->in;
+    plat *p = backend.config.platform; x11_input *in = x11_private(p)->in;
     xcb_key_press_event_t calibration = {.detail = 38};
     size_t calibrated = native_translation_probe(in, &calibration);
     T(!edit_malloc_guard_active() || calibrated == 1);
@@ -2166,7 +2167,7 @@ static int review_native_allocations(void)
     for (unsigned i = 0; i < 100; i++) {
         raw_key(p, "AC01"); raw_barrier(p);
         xcb_generic_event_t *raw;
-        while ((raw = xcb_poll_for_event(p->conn)) != NULL) {
+        while ((raw = xcb_poll_for_event(plat_native_x11(p).connection)) != NULL) {
             uint8_t type = raw->response_type & 0x7fu;
             if (type == XCB_KEY_PRESS || type == XCB_KEY_RELEASE) {
                 plat_event translated; uint64_t now = trace_now_ns();

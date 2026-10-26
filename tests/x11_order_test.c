@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* P2.2e regressions. Include the implementation only to inject setup failures
  * and inspect ordered dispatch without adding production test hooks. */
 #include "base/base.h"
@@ -138,14 +139,14 @@ static void blink(void *ud) { ((sink *)ud)->blinks++; }
 static void work(void *ud) {
     sink *s = ud;
     uint64_t v;
-    if (read(s->p->work_fd, &v, sizeof v) == (ssize_t)sizeof v) s->works++;
+    if (read(x11_private(s->p)->work_fd, &v, sizeof v) == (ssize_t)sizeof v) s->works++;
 }
 static bool barrier(xcb_connection_t *c) {
     xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL);
     bool ok = r != NULL; free(r); return ok;
 }
 static bool open_plat(plat *p) {
-    plat_config cfg = { "order test", 100, 100, false, -1, 0 };
+    plat_config cfg = { "order test", 100, 100, false, NULL, 0 };
     int rc = plat_init(p, &cfg);
     CHECK(rc == PLAT_OK, "fixture initialization");
     if (rc != PLAT_OK) return false;
@@ -158,8 +159,8 @@ static bool open_plat(plat *p) {
 }
 static void send_key(plat *p, bool press) {
     xcb_key_press_event_t e = { .response_type = press ? XCB_KEY_PRESS : XCB_KEY_RELEASE,
-                              .detail = 38, .event = p->win, .same_screen = 1 };
-    xcb_send_event(p->conn, 0, p->win, press ? XCB_EVENT_MASK_KEY_PRESS : XCB_EVENT_MASK_KEY_RELEASE,
+                              .detail = 38, .event = x11_private(p)->win, .same_screen = 1 };
+    xcb_send_event(x11_private(p)->conn, 0, x11_private(p)->win, press ? XCB_EVENT_MASK_KEY_PRESS : XCB_EVENT_MASK_KEY_RELEASE,
                    (const char *)&e);
 }
 static void test_burst(void) {
@@ -168,30 +169,30 @@ static void test_burst(void) {
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     for (unsigned i = 0; i < 129; i++) { send_key(&p, true); send_key(&p, false); }
-    CHECK(barrier(p.conn), "burst barrier");
+    CHECK(barrier(x11_private(&p)->conn), "burst barrier");
     plat_run_for(&p, &cb, 20);
     CHECK(s.keys == 258 && s.chars == 129 && IN(&p)->q_dropped == 0, "§2 raw burst preserves every edit");
     CHECK(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "local", 5) == PLAT_OK, "burst local set");
-    CHECK(barrier(p.conn), "burst local barrier");
+    CHECK(barrier(x11_private(&p)->conn), "burst local barrier");
     plat_run_for(&p, &cb, 10);
     s.keys = s.chars = s.clips = 0; s.request_on_key = true;
     for (unsigned i = 0; i < 129; i++) { send_key(&p, true); send_key(&p, false); }
-    CHECK(barrier(p.conn), "completion burst barrier");
+    CHECK(barrier(x11_private(&p)->conn), "completion burst barrier");
     plat_run_for(&p, &cb, 20);
     CHECK(s.chars == 129 && s.clips == 129 && IN(&p)->q_dropped == 0,
           "§2 raw burst and callback local completions preserve exact counts");
     s.request_on_key = false;
     /* Core fallback motion must not fill the ring ahead of a later edit. */
-    void *saved_xi = p.xi; p.xi = NULL;
+    void *saved_xi = x11_private(&p)->xi; x11_private(&p)->xi = NULL;
     for (unsigned i = 0; i < X11_QUEUE_CAP + 1; i++) {
-        xcb_motion_notify_event_t m = { .response_type = XCB_MOTION_NOTIFY, .event = p.win };
-        xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_POINTER_MOTION, (const char *)&m);
+        xcb_motion_notify_event_t m = { .response_type = XCB_MOTION_NOTIFY, .event = x11_private(&p)->win };
+        xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_POINTER_MOTION, (const char *)&m);
     }
     send_key(&p, true); send_key(&p, false);
-    CHECK(barrier(p.conn), "motion burst barrier");
+    CHECK(barrier(x11_private(&p)->conn), "motion burst barrier");
     plat_run_for(&p, &cb, 20);
     CHECK(s.chars == 130 && IN(&p)->q_dropped == 0, "§2 motion burst cannot discard later edit");
-    p.xi = saved_xi;
+    x11_private(&p)->xi = saved_xi;
     plat_shutdown(&p);
 }
 static void test_local_overflow(void) {
@@ -201,7 +202,7 @@ static void test_local_overflow(void) {
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     /* Callback-produced local completions compete with raw input in the same ring. */
     CHECK(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "local", 5) == PLAT_OK, "local set");
-    CHECK(barrier(p.conn), "local barrier");
+    CHECK(barrier(x11_private(&p)->conn), "local barrier");
     plat_run_for(&p, &cb, 10);
     s.clips = 0;
     for (unsigned i = 0; i < X11_QUEUE_CAP; i++) {
@@ -221,27 +222,27 @@ static void test_order(void) {
         sink s = { .p = &p };
         plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
         if (second[i] == PLAT_EV_RESIZE) {
-            xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 1, .event = p.win };
-            xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_BUTTON_PRESS, (const char *)&b);
+            xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 1, .event = x11_private(&p)->win };
+            xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_BUTTON_PRESS, (const char *)&b);
         } else send_key(&p, true);
         if (second[i] == PLAT_EV_FOCUS) {
-            xcb_focus_out_event_t f = { .response_type = XCB_FOCUS_OUT, .event = p.win,
+            xcb_focus_out_event_t f = { .response_type = XCB_FOCUS_OUT, .event = x11_private(&p)->win,
                                        .mode = XCB_NOTIFY_MODE_NORMAL, .detail = XCB_NOTIFY_DETAIL_NONLINEAR };
-            xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&f);
+            xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&f);
         } else if (second[i] == PLAT_EV_CLOSE) {
             xcb_client_message_event_t c = { .response_type = XCB_CLIENT_MESSAGE, .format = 32,
-                                            .window = p.win, .type = p.wm_protocols };
-            c.data.data32[0] = p.wm_delete;
-            xcb_send_event(p.conn, 0, p.win, 0, (const char *)&c);
+                                            .window = x11_private(&p)->win, .type = x11_private(&p)->wm_protocols };
+            c.data.data32[0] = x11_private(&p)->wm_delete;
+            xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, 0, (const char *)&c);
         } else if (second[i] == PLAT_EV_RESIZE) {
-            xcb_configure_notify_event_t c = { .response_type = XCB_CONFIGURE_NOTIFY, .event = p.win,
-                                              .window = p.win, .width = 101, .height = 101 };
-            xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&c);
+            xcb_configure_notify_event_t c = { .response_type = XCB_CONFIGURE_NOTIFY, .event = x11_private(&p)->win,
+                                              .window = x11_private(&p)->win, .width = 101, .height = 101 };
+            xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&c);
         } else {
-            xcb_expose_event_t e = { .response_type = XCB_EXPOSE, .window = p.win };
-            xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_EXPOSURE, (const char *)&e);
+            xcb_expose_event_t e = { .response_type = XCB_EXPOSE, .window = x11_private(&p)->win };
+            xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_EXPOSURE, (const char *)&e);
         }
-        CHECK(barrier(p.conn), "order barrier");
+        CHECK(barrier(x11_private(&p)->conn), "order barrier");
         plat_run_for(&p, &cb, 20);
         CHECK(s.n >= 2 && s.kinds[0] == (second[i] == PLAT_EV_RESIZE ? PLAT_EV_BUTTON : PLAT_EV_KEY) &&
               s.kinds[1] == second[i], "§3 preceding input reaches callback first");
@@ -269,7 +270,7 @@ static void run_slices(bool raw_stream) {
         close(fds[0]);
         plat p;
         if (!open_plat(&p)) _exit(2);
-        p.work_fd = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
+        x11_private(&p)->work_fd = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
         p.focused = true;
         plat_set_blink(&p, 1);
         sink s = { .p = &p, .sustain = !raw_stream };
@@ -281,7 +282,7 @@ static void run_slices(bool raw_stream) {
         char ok = rc == PLAT_OK && s.blinks && s.works ? 'y' : 'n';
         ssize_t sent = write(fds[1], &ok, 1);
         if (sent != 1) _exit(3);
-        close(p.work_fd);
+        close(x11_private(&p)->work_fd);
         plat_shutdown(&p);
         _exit(0);
     }
@@ -307,7 +308,7 @@ static void test_rescans(void) {
             plat p;
             if (!open_plat(&p)) _exit(2);
             send_key(&p, true);
-            if (!barrier(p.conn)) _exit(3);
+            if (!barrier(x11_private(&p)->conn)) _exit(3);
             xcb_connection_t *peer = xcb_connect(NULL, NULL);
             xcb_grab_server(peer);
             if (!barrier(peer)) _exit(4);
@@ -315,7 +316,7 @@ static void test_rescans(void) {
             plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
             if (mode == 0) {
                 (void)drain(&p, &cb, 0);
-                xcb_generic_event_t e = { .response_type = p.xkb_event };
+                xcb_generic_event_t e = { .response_type = x11_private(&p)->xkb_event };
                 ((uint8_t *)&e)[1] = XCB_XKB_MAP_NOTIFY;
                 dispatch(&p, &cb, &e);
             } else {
@@ -347,7 +348,7 @@ static void test_rescan_publish(void) {
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     struct xkb_keymap *old = xkb_keymap_ref(IN(&p)->keymap);
-    xcb_generic_event_t e = { .response_type = p.xkb_event };
+    xcb_generic_event_t e = { .response_type = x11_private(&p)->xkb_event };
     ((uint8_t *)&e)[1] = XCB_XKB_MAP_NOTIFY;
     for (unsigned i = 0; i < 4; i++) dispatch(&p, &cb, &e);
     for (unsigned i = 0; i < 100 && !s.keymaps; i++) plat_run_for(&p, &cb, 5);
@@ -368,7 +369,7 @@ static void test_rebuild_guard(void) {
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     x11_runtime *rt = IN(&p)->runtime;
     struct xkb_keymap *old = xkb_keymap_ref(IN(&p)->keymap);
-    xcb_generic_event_t e = { .response_type = p.xkb_event };
+    xcb_generic_event_t e = { .response_type = x11_private(&p)->xkb_event };
     ((uint8_t *)&e)[1] = XCB_XKB_MAP_NOTIFY;
     edit_malloc_guard_begin();
     dispatch(&p, &cb, &e);                /* UI boundary + kick inside the window */
@@ -441,17 +442,17 @@ static void test_map_boundary(void) {
     x11_runtime *rt = IN(&p)->runtime;
     stop_listener(rt);
     /* A pre-boundary key has already reached the translated queue. */
-    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
+    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = x11_private(&p)->win };
     dispatch(&p, &cb, (xcb_generic_event_t *)&key);
-    xcb_generic_event_t notification = { .response_type = p.xkb_event };
+    xcb_generic_event_t notification = { .response_type = x11_private(&p)->xkb_event };
     ((uint8_t *)&notification)[1] = XCB_XKB_MAP_NOTIFY;
     dispatch(&p, &cb, &notification);
     /* No snapshot yet: retain the following raw release/press in XCB order. */
     key.response_type = XCB_KEY_RELEASE;
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
     key.response_type = XCB_KEY_PRESS;
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
-    CHECK(barrier(p.conn), "§21 staged keys barrier");
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    CHECK(barrier(x11_private(&p)->conn), "§21 staged keys barrier");
     plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 1, "§21 later raw keys wait for matching map publication");
     /* Unlabelled snapshot fetched after this boundary's kick. */
@@ -494,7 +495,8 @@ static unsigned history_keymaps(plat *p) {
     return n;
 }
 static void test_map_history(void) {
-    plat p = { .repeat_fd = -1 };
+    x11_plat native = {.repeat_fd = -1};
+    plat p = {.backend_state = &native};
     x11_input in;
     struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     struct xkb_rule_names us = { .layout = "us" };
@@ -513,7 +515,7 @@ static void test_map_history(void) {
     rt->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     CHECK(rt->kick_fd >= 0 && work_pool_init(&rt->pool, 1, 0) == 0, "§21 display-free pool (no listener)");
     in.runtime = rt;
-    p.in = &in;
+    x11_private(&p)->in = &in;
     /* AD06 is the physical Y position (US y, German z). */
     xkb_keycode_t code = xkb_keymap_key_by_name(km, "AD06");
     CHECK(code <= UINT8_MAX, "§21 fixture key fits core event detail");
@@ -677,28 +679,28 @@ static void test_live_map_boundary(void) {
     if (!open_plat(&p)) goto restore;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
-    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = p.win };
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    xcb_key_press_event_t key = { .response_type = XCB_KEY_PRESS, .detail = 29, .event = x11_private(&p)->win };
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
     key.response_type = XCB_KEY_RELEASE;
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
-    CHECK(barrier(p.conn), "§21 live before-map keys queued");
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    CHECK(barrier(x11_private(&p)->conn), "§21 live before-map keys queued");
     bool changed = set_layout("de");
     CHECK(changed, "§21 actual server map change");
     if (!changed) goto shutdown;
     /* The UI connection owns this test-only grab: only worker snapshot I/O
      * stalls, while UI dispatch and its ordered raw queue remain runnable. */
-    xcb_grab_server(p.conn); CHECK(barrier(p.conn), "§21 delay snapshot worker");
+    xcb_grab_server(x11_private(&p)->conn); CHECK(barrier(x11_private(&p)->conn), "§21 delay snapshot worker");
     key.response_type = XCB_KEY_PRESS;
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
     key.response_type = XCB_KEY_RELEASE;
-    xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
-    CHECK(barrier(p.conn), "§21 live after-map keys queued");
+    xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+    CHECK(barrier(x11_private(&p)->conn), "§21 live after-map keys queued");
     CHECK(plat_run_for(&p, &cb, 20) == PLAT_OK, "§21 delayed snapshot UI remains bounded");
     /* The listener may have captured German before the grab (edit-q0g-s8);
      * either way the post-change key is never translated with US. */
     CHECK((s.chars == 1 && s.last_text == 'y') || (s.chars == 2 && s.last_text == 'z'),
           "§21 post-change key waits for, or uses, the German map while worker delayed");
-    xcb_ungrab_server(p.conn); xcb_flush(p.conn);
+    xcb_ungrab_server(x11_private(&p)->conn); xcb_flush(x11_private(&p)->conn);
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
     CHECK(s.keys == 4 && s.last_text == 'z' && s.keymaps > 0,
           "§21 immediate post-notification key uses actual German map");
@@ -724,7 +726,7 @@ static void test_map_generations_pending(void) {
     if (!open_plat(&p)) goto restore;
     sink s = { .p = &p };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
-    xcb_key_press_event_t key = { .detail = 29, .event = p.win };
+    xcb_key_press_event_t key = { .detail = 29, .event = x11_private(&p)->win };
     for (unsigned i = 0; i < 2; i++) {
         bool changed = set_layout(i ? "us" : "de");
         CHECK(changed, "§21 consecutive server map change");
@@ -737,10 +739,10 @@ static void test_map_generations_pending(void) {
             (void)poll(&pfd, 1, 10);
         }
         key.response_type = XCB_KEY_PRESS;
-        xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
+        xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&key);
         key.response_type = XCB_KEY_RELEASE;
-        xcb_send_event(p.conn, 0, p.win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
-        CHECK(barrier(p.conn), "§21 generation keys queued");
+        xcb_send_event(x11_private(&p)->conn, 0, x11_private(&p)->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&key);
+        CHECK(barrier(x11_private(&p)->conn), "§21 generation keys queued");
     }
     for (unsigned i = 0; i < 200 && s.keys < 4; i++) plat_run_for(&p, &cb, 5);
     if (s.text_count != 2 || s.text[0] != 'z' || s.text[1] != 'y')
@@ -790,7 +792,7 @@ static void test_wheel_pending(void) {
         xi_wheel_button(&p, &cb, 12, false);
         plat_run_for(&p, &cb, 5);
         CHECK(s.wheels == 3, "§24 smooth + independent notches counted, own emulation suppressed in both orders");
-        uint8_t req[20]; xi2_build_select_events(x->opcode, req, p.win);
+        uint8_t req[20]; xi2_build_select_events(x->opcode, req, x11_private(&p)->win);
         CHECK((req[16] & 0x30u) == 0x30u, "§24 XI button press/release selected");
         plat_shutdown(&p);
     }
@@ -860,7 +862,7 @@ static void test_quit(void) {
     sink s = { .p = &p, .quit_on_event = true };
     plat_callbacks cb = { &s, on_event, NULL, NULL, NULL };
     send_key(&p, true); send_key(&p, false);
-    CHECK(barrier(p.conn), "quit barrier");
+    CHECK(barrier(x11_private(&p)->conn), "quit barrier");
     CHECK(plat_run_for(&p, &cb, -1) == PLAT_OK && s.keys == 1,
           "§8 quit stops dispatch before later callbacks");
     plat_shutdown(&p);
@@ -886,7 +888,7 @@ static void test_setup_failure(void) {
         faults.input_alloc = mode == 0;
         faults.flags = mode;
         faults.table_unrefs = 0;
-        plat_config cfg = { "setup failure", 100, 100, false, -1, 0 };
+        plat_config cfg = { "setup failure", 100, 100, false, NULL, 0 };
         int rc = plat_init(&p, &cfg);
         unsigned unrefs = faults.table_unrefs;
         faults.input_alloc = false; faults.flags = 0;
@@ -900,7 +902,7 @@ static void test_startup_trace(void) {
     for (unsigned i = 0; i < 2; i++) {
         trace_reset();
         plat p;
-        plat_config cfg = { "startup trace", 100, 100, false, -1, i ? 0 : UINT64_C(123456789) };
+        plat_config cfg = { "startup trace", 100, 100, false, NULL, i ? 0 : UINT64_C(123456789) };
         CHECK(plat_init(&p, &cfg) == PLAT_OK, "trace init");
         plat_map(&p);
         FILE *f = tmpfile();

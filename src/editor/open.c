@@ -133,6 +133,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (e->font.max_width < e->font.window_width) e->font.max_width = e->font.window_width;
     if (e->font.max_height < e->font.window_height) e->font.max_height = e->font.window_height;
     e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
+    e->poll_wake.fd = e->poll_fd;
     rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
     if (e->preferences_runtime) {
         rc = add_poll_fd(e, config_runtime_eventfd(e->preferences_runtime)); if (rc) goto fail;
@@ -249,7 +250,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     }
     dims = e->grid.dims;
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
-        plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, e->poll_fd, 0};
+        plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, &e->poll_wake, 0};
         rc = plat_init_backend(&e->platform, &pc, config->platform_backend); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0); plat_map(&e->platform);
     }

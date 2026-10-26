@@ -1,6 +1,7 @@
 /* Typed Present/fence state model. No window, GL calls, threads or global
  * fixture state: fuzz the production completion code through its dispatch. */
 #include "gl/gl.h"
+#include "x11/private.h"
 #include "base/base.h"
 #include <xcb/xcb.h>
 #include <xcb/present.h>
@@ -51,7 +52,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
 {
     if (size<3) return 0;
-    gl_state s={0}; render_backend b={0}; gl_fuzz_queue q={0}; plat platform={.win=44,.height=8};
+    gl_state s={0}; render_backend b={0}; gl_fuzz_queue q={0}; x11_plat native={.win=44}; plat platform={.backend_state=&native,.height=8};
     EDIT_ASSERT(render_gl_backend(&b)==RENDER_OK);
     b.state=&s; b.initialized=true; b.active=true; b.presented=true;
     b.active_frame=1u+data[0]; b.submitted_ns=1;

@@ -782,8 +782,9 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
         free(dri3);
         if (!available) return RENDER_ERR_UNSUPPORTED;
     }
-    s->native_win=cfg->platform->win;
-    s->native_visual=cfg->platform->visual;
+    const plat_x11_native native=plat_native_x11(cfg->platform);
+    s->native_win=native.window;
+    s->native_visual=native.visual;
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(s->native_conn,
         xcb_get_geometry(s->native_conn,s->native_win),NULL);
     if (geometry==NULL) return RENDER_ERR_UNSUPPORTED;
@@ -794,7 +795,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
     const char *client=s->eQueryString(EGL_NO_DISPLAY,EGL_EXTENSIONS);
     if (wayland) {
         if (!gl_extension(client,"EGL_EXT_platform_wayland") && !gl_extension(client,"EGL_KHR_platform_wayland")) goto fail;
-        s->display=s->eGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,cfg->platform->conn,NULL);
+        s->display=s->eGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,wayland_display(cfg->platform),NULL);
     } else {
         if (!gl_extension(client,"EGL_EXT_platform_xcb") && !gl_extension(client,"EGL_MESA_platform_xcb")) goto fail;
         (void)xcb_flush(s->native_conn);
@@ -862,7 +863,9 @@ static int gl_init_mode(render_backend *b,const render_config *cfg,bool startup)
         (!cfg->workers->foreground_enabled && cfg->workers->n_workers<=cfg->workers->n_bulk))
         return RENDER_ERR_UNSUPPORTED;
     s->workers=cfg->workers;
-    if (cfg->platform==NULL || cfg->platform->conn==NULL || !cfg->platform->present_ok) return RENDER_ERR_UNSUPPORTED;
+    void *connection=cfg->platform && cfg->platform->backend==PLAT_BACKEND_WAYLAND
+        ? wayland_display(cfg->platform) : plat_native_x11(cfg->platform).connection;
+    if (cfg->platform==NULL || connection==NULL || !plat_present_available(cfg->platform)) return RENDER_ERR_UNSUPPORTED;
     s->platform=cfg->platform; s->dims=cfg->dims; s->max_width=cfg->max_width; s->max_height=cfg->max_height;
     if (gl_select_upload(s)!=RENDER_OK) return RENDER_ERR_ARG;
     const char *mode=getenv("EDIT_GL_VBO");

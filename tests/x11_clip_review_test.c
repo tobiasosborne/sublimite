@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* White-box clipboard regressions: deterministic ownership/queue/worker states,
  * real X transport. Including the implementation avoids production test hooks. */
 #include "../src/x11/clip.c"
@@ -5,25 +6,26 @@
 #include "base/base.h"
 
 #define REQUIRE(x, message) do { if (!(x)) { fprintf(stderr, "FAIL: %s\n", message); return false; } } while (0)
-typedef struct fixture { plat p; x11_input in; } fixture;
+typedef struct fixture { plat p; x11_plat native; x11_input in; } fixture;
 static bool fixture_init(fixture *f) {
     memset(f, 0, sizeof *f);
+    f->p.backend_state = &f->native;
     /* DISPLAY from the environment (the display tools/with_display_lock.sh
      * locked); :99, the session's private Xvfb, when it is unset or empty. */
     const char *display = getenv("DISPLAY");
     if (display == NULL || display[0] == '\0') display = ":99";
-    f->p.conn = xcb_connect(display, NULL);
+    x11_private(&f->p)->conn = xcb_connect(display, NULL);
     REQUIRE(!xcb_connection_has_error(C(&f->p)), "connect DISPLAY");
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(C(&f->p))).data;
-    f->p.win = xcb_generate_id(C(&f->p));
-    xcb_create_window(C(&f->p), XCB_COPY_FROM_PARENT, f->p.win, screen->root,
+    x11_private(&f->p)->win = xcb_generate_id(C(&f->p));
+    xcb_create_window(C(&f->p), XCB_COPY_FROM_PARENT, x11_private(&f->p)->win, screen->root,
                       0, 0, 10, 10, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, 0, NULL);
-    f->p.in = &f->in;
+    x11_private(&f->p)->in = &f->in;
     REQUIRE(x11_clip_init(&f->p) == PLAT_OK, "clipboard init");
     return true;
 }
 static void fixture_destroy(fixture *f) {
-    x11_clip_destroy(&f->p); xcb_destroy_window(C(&f->p), f->p.win); xcb_disconnect(C(&f->p));
+    x11_clip_destroy(&f->p); xcb_destroy_window(C(&f->p), x11_private(&f->p)->win); xcb_disconnect(C(&f->p));
 }
 static bool local_set(fixture *f, int which, const char *data, size_t len) {
     REQUIRE(plat_clip_set(&f->p, which, data, len) == PLAT_OK, "local set");
@@ -108,7 +110,7 @@ static bool remote_partial_batch(void) {
     r->sink.buf = x11_clip_buf_new(6); REQUIRE(r->sink.buf != NULL, "receive blob");
     memcpy(r->sink.buf->data, "remote", 6); c->mem += 6; r->cap = 6;
     r->state = 5; r->fin_ok = true; r->waiters = MAX_WAITERS; r->win = xcb_generate_id(C(&f.p));
-    xcb_create_window(C(&f.p), 0, r->win, f.p.win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+    xcb_create_window(C(&f.p), 0, r->win, x11_private(&f.p)->win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
                       XCB_COPY_FROM_PARENT, 0, NULL);
     plat_event ev = { .kind = PLAT_EV_MOTION };
     for (unsigned i = 0; i < X11_QUEUE_CAP - 2u; i++) REQUIRE(x11_q_push(&f.in, &ev), "fill ring");
@@ -126,7 +128,7 @@ static bool remote_partial_batch(void) {
     /* Failed admission can leave charged capacity without an allocated sink. */
     r->state = 5; r->fin_ok = false; r->waiters = 1; r->cap = 4096; c->mem += r->cap;
     r->win = xcb_generate_id(C(&f.p));
-    xcb_create_window(C(&f.p), 0, r->win, f.p.win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+    xcb_create_window(C(&f.p), 0, r->win, x11_private(&f.p)->win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
                       XCB_COPY_FROM_PARENT, 0, NULL);
     rx_complete(&f.p, 1);
     REQUIRE(c->mem == 6, "failed receive releases charged capacity even without a sink blob");
@@ -137,10 +139,10 @@ static bool saturated_multiple(void) {
     fixture f; REQUIRE(fixture_init(&f), "fixture");
     REQUIRE(local_set(&f, 0, "ordered", 7), "owner");
     x11_clip *c = CL(&f.p);
-    xcb_selection_request_event_t rq = { .response_type = XCB_SELECTION_REQUEST, .owner = f.p.win,
-        .requestor = f.p.win, .selection = c->sel[0], .target = c->multiple, .time = 0 };
+    xcb_selection_request_event_t rq = { .response_type = XCB_SELECTION_REQUEST, .owner = x11_private(&f.p)->win,
+        .requestor = x11_private(&f.p)->win, .selection = c->sel[0], .target = c->multiple, .time = 0 };
     xcb_atom_t pair[2] = { c->utf8, c->prop[1] };
-    xcb_change_property(C(&f.p), XCB_PROP_MODE_REPLACE, f.p.win, c->prop[0], c->atom_pair, 32, 2, pair);
+    xcb_change_property(C(&f.p), XCB_PROP_MODE_REPLACE, x11_private(&f.p)->win, c->prop[0], c->atom_pair, 32, 2, pair);
     rq.property = c->prop[0];
     for (unsigned i = 0; i < NJOB; i++) serve(&f.p, &rq);
     for (unsigned i = 0; i < NJOB; i++) REQUIRE(c->jobs[i].state == 1, "all MULTIPLE slots occupied");

@@ -53,21 +53,21 @@ static void pending(render_backend *b, gl_state *s, plat *p, hook_log *log)
 static void gl_protocol_test(void)
 {
     pid_t child = mock_start_ex(true, true, NULL, 0);
-    plat p; plat_config cfg = {.width = 1, .height = 1, .work_eventfd = -1};
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
     gl_state state; render_backend b; hook_log log = {.id = 1}; pending(&b, &state, &p, &log);
     assert(wayland_frame_arm(&p, log.id) == PLAT_OK);
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(p.conn) >= 0);
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     assert(wayland_test_present_complete(&b, log.id + 1, UINT64_MAX, UINT64_MAX) == RENDER_ERR_FRAME);
     assert(wayland_test_present_complete(&b, log.id, UINT64_MAX, UINT64_MAX) == RENDER_OK);
     assert(b.active && log.device == 1 && !log.displayed); /* frame hint + fence, no presentation yet */
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(p.conn) >= 0);
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     assert(wayland_test_present_complete(&b, log.id, UINT64_MAX, UINT64_MAX) == RENDER_OK);
     assert(!b.active && log.displayed == 1 && log.t6 >= log.t5 && state.msc == 1);
     assert(wayland_test_present_complete(&b, log.id, 0, 0) == RENDER_ERR_FRAME);
     log = (hook_log){.id = log.id + 1}; pending(&b, &state, &p, &log);
     assert(wayland_frame_arm(&p, log.id) == PLAT_OK);
-    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(p.conn) >= 0);
+    wl_surface_commit(wayland_surface(&p)); assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
     assert(wayland_test_present_complete(&b, log.id, 0, 0) == RENDER_ERR_DEVICE);
     assert(!log.displayed); /* discarded surface update never emits T6 */
     plat_shutdown(&p); mock_join(child);

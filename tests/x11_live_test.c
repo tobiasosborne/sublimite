@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* x11_live_test.c - private-X assertions for startup failures, window/Present/idle,
  * input ordering, and clipboard round trips. A parent watchdog bounds the runner. */
 #include "x11/plat.h"
@@ -63,7 +64,7 @@ static void on_ev(void *ud, const plat_event *e) {
 }
 
 static int open_plat(plat *p) {
-    plat_config cfg = { "x11 live", 100, 100, getenv("DISPLAY") == NULL, -1, 0 };
+    plat_config cfg = { "x11 live", 100, 100, getenv("DISPLAY") == NULL, NULL, 0 };
     int r = plat_init(p, &cfg);
     if (r == PLAT_OK) x11_clip_set_limits(p, 0, 0, UINT32_MAX);
     return r;
@@ -79,7 +80,7 @@ static void roundtrip(plat *a, sink *sa, plat *b, sink *sb, int which, const cha
     CHECK(plat_clip_set(a, which, text, n) == PLAT_OK, "set %d", which);
     /* set now queues ownership: establish server ordering before a different
      * connection requests it, then let the loop complete the owner check. */
-    xcb_connection_t *c = a->conn;
+    xcb_connection_t *c = plat_native_x11(a).connection;
     xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL);
     CHECK(r != NULL, "ownership request reached server");
     free(r);
@@ -101,23 +102,23 @@ static void test_startup_errors(void) {
     const uint32_t dims[][2] = { {0, 100}, {100, 0}, {65536, 100}, {100, 65536}, {UINT32_MAX, 100} };
     for (size_t i = 0; i < sizeof dims / sizeof dims[0]; i++) {
         plat p;
-        plat_config cfg = { "invalid dimensions", dims[i][0], dims[i][1], false, -1, 0 };
+        plat_config cfg = { "invalid dimensions", dims[i][0], dims[i][1], false, NULL, 0 };
         int rc = plat_init(&p, &cfg);
         CHECK(rc == PLAT_ERR_FAIL, "§22 invalid dimensions %u x %u returned %d", cfg.width, cfg.height, rc);
         if (rc == PLAT_OK) plat_shutdown(&p);
-        CHECK(!p.conn && !p.in && !p.clip && !p.present_ok && p.timer_fd == -1 && p.repeat_fd == -1,
+        CHECK(!p.backend_state && !plat_native_x11(&p).connection && !plat_present_available(&p),
               "§22 invalid dimensions leave no resources");
     }
     const char *faults[] = { "colormap", "window", "present" };
     for (size_t i = 0; i < sizeof faults / sizeof faults[0]; i++) {
         plat p;
-        plat_config cfg = { "injected protocol error", 100, 100, false, -1, 0 };
+        plat_config cfg = { "injected protocol error", 100, 100, false, NULL, 0 };
         setenv("EDIT_X11_TEST_FAULT", faults[i], 1);
         int rc = plat_init(&p, &cfg);
         unsetenv("EDIT_X11_TEST_FAULT");
         CHECK(rc == PLAT_ERR_FAIL, "§22 %s protocol error returned %d", faults[i], rc);
         if (rc == PLAT_OK) plat_shutdown(&p);
-        CHECK(!p.conn && !p.in && !p.clip && !p.present_ok && p.timer_fd == -1 && p.repeat_fd == -1,
+        CHECK(!p.backend_state && !plat_native_x11(&p).connection && !plat_present_available(&p),
               "§22 %s failure unwinds resources", faults[i]);
     }
     puts(g_fail ? "§22 startup errors: FAILED" : "§22 startup errors: ok");
@@ -134,7 +135,7 @@ static int live_main(int argc, char **argv) {
     test_window_contracts(&a);
     if (argc > 1 && strcmp(argv[1], "--contracts") == 0) { plat_shutdown(&a); return g_fail ? 1 : 0; }
     if (open_plat(&b) != PLAT_OK) { CHECK(false, "second connection"); plat_shutdown(&a); return 1; }
-    printf("xi2 %s, core wheel fallback %d\n", a.xi ? "active" : "unavailable", a.core_wheel);
+    printf("xi2 %s, core wheel fallback %d\n", x11_private(&a)->xi ? "active" : "unavailable", x11_private(&a)->core_wheel);
     sink sa, sb;
     memset(&sa, 0, sizeof sa); memset(&sb, 0, sizeof sb);
     roundtrip(&a, &sa, &b, &sb, PLAT_CLIP_CLIPBOARD, "h\xc3\xa9llo clipboard \xe2\x82\xac");
@@ -160,7 +161,7 @@ static int live_main(int argc, char **argv) {
     CHECK(sb.arrived == 1 && d && got == 6 && memcmp(d, "b owns", 6) == 0, "self request");
     /* Pending owner replies can be superseded. A timestamp older than b's
      * ownership must retry with CurrentTime; a local paste waits for confirmation. */
-    a.last_time = 1;
+    x11_private(&a)->last_time = 1;
     sa.arrived = sa.failed = 0;
     CHECK(plat_clip_set(&a, PLAT_CLIP_CLIPBOARD, "superseded", 10) == PLAT_OK, "pending set");
     CHECK(plat_clip_set(&a, PLAT_CLIP_CLIPBOARD, "latest", 6) == PLAT_OK, "replacement set");

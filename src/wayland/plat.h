@@ -21,6 +21,7 @@ const char *wayland_display_select(const char *display, const char *safe, const 
 const char *wayland_error_string(int code);
 /* Same drop-newest policy as X11; counter survives until shutdown. */
 uint64_t wayland_input_dropped(const plat *p);
+void *wayland_display(const plat *p);
 void *wayland_egl_window(const plat *p);
 void *wayland_surface(const plat *p);
 int wayland_frame_arm(plat *p, uint32_t id);

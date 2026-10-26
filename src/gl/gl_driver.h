@@ -76,7 +76,7 @@ static int gl_driver_prepare(gl_driver *d, render_backend *b, render_config *cfg
     int rc = render_gl_backend(b);
     if (rc != RENDER_OK) return rc;
     plat_config pc = {.title = "editor EGL test/bench", .width = cfg->dims.cols * cfg->dims.cell_w,
-        .height = cfg->dims.rows * cfg->dims.cell_h, .work_eventfd = -1};
+        .height = cfg->dims.rows * cfg->dims.cell_h, .work_wake = NULL};
     if (plat_init(&d->platform, &pc) != PLAT_OK) return RENDER_ERR_UNSUPPORTED;
     d->plat_live = true; plat_map(&d->platform);
     if (work_pool_init(&d->workers, 1, 1) != 0) return RENDER_ERR_INIT;

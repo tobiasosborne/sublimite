@@ -1,4 +1,5 @@
 /* X selections: bounded, asynchronous ICCCM INCR and MULTIPLE (P2.2b). */
+#include "private.h"
 #include "clip.h"
 #include "wayland/private.h"
 #include "input.h"
@@ -11,7 +12,7 @@
 #include <time.h>
 #include <limits.h>
 
-#define C(p) ((xcb_connection_t *)(p)->conn)
+#define C(p) ((xcb_connection_t *)x11_private(p)->conn)
 #define NSEL 2
 #define NSERVE 16u
 #define NJOB 8u
@@ -126,7 +127,7 @@ typedef struct x11_clip {
     bool saving, save_done;
     uint8_t scratch[CHUNK_MAX];
 } x11_clip;
-#define CL(p) ((x11_clip *)(p)->clip)
+#define CL(p) (x11_private(p) ? (x11_clip *)x11_private(p)->clip : NULL)
 
 static void note(x11_clip *c, size_t n) { c->slice += n; if (c->slice > c->max_slice) c->max_slice = c->slice; }
 static uint64_t deadline_after(uint32_t ms) { return trace_now_ns() + (uint64_t)ms * UINT64_C(1000000); }
@@ -153,7 +154,7 @@ static void tx_free(plat *p, clip_serve *s) {
     xcb_window_t win = s->win;
     blob_unref(CL(p), s->blob);
     memset(s, 0, sizeof *s);
-    if (win && win != p->win) {
+    if (win && win != x11_private(p)->win) {
         bool other = false;
         for (unsigned i = 0; i < NSERVE; i++) if (CL(p)->tx[i].blob && CL(p)->tx[i].win == win) other = true;
         if (!other) { uint32_t mask = 0; xcb_change_window_attributes(C(p), win, XCB_CW_EVENT_MASK, &mask); }
@@ -197,7 +198,7 @@ int x11_clip_init(plat *p) {
     c->chunk = c->max_chunk;
     c->timeout_ms = 5000; c->save_ms = 1000; c->budget = OWN_BUDGET;
     if (!pool_init(c)) { free(c); return PLAT_ERR_FAIL; }
-    p->clip = c;
+    x11_private(p)->clip = c;
     return PLAT_OK;
 }
 void x11_clip_destroy(plat *p) {
@@ -214,7 +215,7 @@ void x11_clip_destroy(plat *p) {
         if (c->rx[w].win) xcb_destroy_window(C(p), c->rx[w].win);
         free(c->rx[w].sink.buf); blob_unref(c, c->own[w]); blob_unref(c, c->local_blob[w]);
     }
-    blob_unref(c, c->got); free(c); p->clip = NULL;
+    blob_unref(c, c->got); free(c); x11_private(p)->clip = NULL;
 }
 
 /* Consume a whole UTF-8 sequence even when only its Latin-1 replacement fits the output chunk. */
@@ -291,7 +292,7 @@ static bool reply_view(const xcb_get_property_reply_t *r, x11_clip_property *v) 
 }
 
 static bool event_room(const plat *p) {
-    const x11_input *in = p->in;
+    const x11_input *in = x11_private(p)->in;
     return in && in->qt - in->qh < X11_QUEUE_CAP;
 }
 static void result(plat *p, int w, bool ok, uint32_t code) {
@@ -309,11 +310,11 @@ static void claim(plat *p, int w, uint32_t time) {
     x11_clip *c = CL(p);
     c->own_time[w] = time;
     if (!time) {
-        c->stamp_cookie[w] = xcb_change_property(C(p), XCB_PROP_MODE_REPLACE, p->win, c->claim_prop[w],
+        c->stamp_cookie[w] = xcb_change_property(C(p), XCB_PROP_MODE_REPLACE, x11_private(p)->win, c->claim_prop[w],
                                                 XCB_ATOM_INTEGER, 8, 0, NULL).sequence;
         c->claiming[w] = 1;
     } else {
-        xcb_set_selection_owner(C(p), p->win, c->sel[w], time);
+        xcb_set_selection_owner(C(p), x11_private(p)->win, c->sel[w], time);
         c->owner_cookie[w] = xcb_get_selection_owner(C(p), c->sel[w]).sequence;
         c->claiming[w] = 2;
     }
@@ -342,7 +343,7 @@ static void install(plat *p, int which, clip_blob *b) {
     c->clear_pending[which] = c->clear_deferred[which] = false; c->clear_deadline[which] = 0;
     blob_unref(c, c->own[which]); c->mem += b->len; c->own[which] = b;
     c->confirmed[which] = false; c->retried[which] = false; c->uncertain[which] = false;
-    claim(p, which, p->last_time);
+    claim(p, which, x11_private(p)->last_time);
 }
 x11_clip_buf *x11_clip_buf_new(size_t len) {
     if (len > DATA_MAX) return NULL;
@@ -538,7 +539,7 @@ int x11_plat_clip_request(plat *p, int which) {
     r->win = xcb_generate_id(C(p));
     if (!r->win || r->win == UINT32_MAX) { r->win = 0; r->waiters--; return PLAT_ERR_FAIL; }
     uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
-    xcb_create_window(C(p), 0, r->win, p->win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+    xcb_create_window(C(p), 0, r->win, x11_private(p)->win, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
                       XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &mask);
     r->deadline = deadline_after(c->timeout_ms);
     rx_convert(p, which, c->utf8); return PLAT_OK;
@@ -571,7 +572,7 @@ static void rx_complete(plat *p, int w) {
 static void rx_advance(plat *p, int w) {
     x11_clip *c = CL(p); clip_receive *r = &c->rx[w];
     if (r->need_close && rx_close(c, w, r->close_discard)) r->need_close = false;
-    if (!r->need_close && !r->infl && (!p->in || ((x11_input *)p->in)->qh == ((x11_input *)p->in)->qt)) rx_complete(p, w);
+    if (!r->need_close && !r->infl && (!x11_private(p)->in || ((x11_input *)x11_private(p)->in)->qh == ((x11_input *)x11_private(p)->in)->qt)) rx_complete(p, w);
 }
 static void rx_finish(plat *p, int w, bool ok) {
     x11_clip *c = CL(p); clip_receive *r = &c->rx[w];
@@ -723,7 +724,7 @@ static int tx_new(plat *p, clip_job *j, xcb_atom_t target, xcb_atom_t prop) {
     for (unsigned i = 0; i < NSERVE; i++)
         if (c->tx[i].blob && c->tx[i].win == j->rq.requestor && c->tx[i].prop == prop) return -1;
     for (unsigned i = 0; i < NSERVE; i++) if (!c->tx[i].blob) {
-        if (j->rq.requestor != p->win) {
+        if (j->rq.requestor != x11_private(p)->win) {
             uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
             xcb_change_window_attributes(C(p), j->rq.requestor, XCB_CW_EVENT_MASK, &mask);
         }
@@ -785,7 +786,7 @@ static void job_start_writes(plat *p, clip_job *j) {
 }
 static void serve(plat *p, const xcb_selection_request_event_t *rq) {
     x11_clip *c = CL(p); int w = which_of(c, rq->selection);
-    if (w < 0 || !c->own[w] || rq->owner != p->win || older(rq->time, c->own_time[w]) ||
+    if (w < 0 || !c->own[w] || rq->owner != x11_private(p)->win || older(rq->time, c->own_time[w]) ||
         (rq->target == c->multiple && !rq->property)) { refuse(p, rq); return; }
     clip_job *j = NULL;
     for (unsigned i = 0; i < NJOB; i++) if (!c->jobs[i].state) { j = &c->jobs[i]; break; }
@@ -837,7 +838,7 @@ static bool clip_event(plat *p, const xcb_generic_event_t *e, plat_event *ev) {
         /* Only the server generates Clear for an ownership change; a SendEvent copy (bit 0x80) is a forgery. */
         if (e->response_type & 0x80) return false;
         int w = which_of(c, x->selection);
-        if (w < 0 || x->owner != p->win || !c->own[w] || older(x->time, c->own_time[w])) return false;
+        if (w < 0 || x->owner != x11_private(p)->win || !c->own[w] || older(x->time, c->own_time[w])) return false;
         if (c->claiming[w]) { c->clear_deferred[w] = true; return false; }
         /* X accepts equal timestamps. A previous owner's Clear can share the new
          * claim's millisecond; confirm that we actually lost it before releasing data. */
@@ -848,7 +849,7 @@ static bool clip_event(plat *p, const xcb_generic_event_t *e, plat_event *ev) {
     }
     if (t == XCB_SELECTION_NOTIFY) {
         const xcb_selection_notify_event_t *x = (const xcb_selection_notify_event_t *)e;
-        if (c->saving && x11_clip_notify_matches(x, p->win, c->manager, c->save, c->save_prop, XCB_CURRENT_TIME)) {
+        if (c->saving && x11_clip_notify_matches(x, x11_private(p)->win, c->manager, c->save, c->save_prop, XCB_CURRENT_TIME)) {
             c->save_done = true; return false;
         }
         int w = which_of(c, x->selection);
@@ -863,7 +864,7 @@ static bool clip_event(plat *p, const xcb_generic_event_t *e, plat_event *ev) {
     if (t == XCB_PROPERTY_NOTIFY) {
         const xcb_property_notify_event_t *x = (const xcb_property_notify_event_t *)e;
         for (int w = 0; w < NSEL; w++) {
-            if (x->window == p->win && x->atom == c->claim_prop[w] && x->state == XCB_PROPERTY_NEW_VALUE &&
+            if (x->window == x11_private(p)->win && x->atom == c->claim_prop[w] && x->state == XCB_PROPERTY_NEW_VALUE &&
                 c->claiming[w] == 1 && x->sequence == (uint16_t)c->stamp_cookie[w]) claim(p, w, x->time);
             clip_receive *r = &c->rx[w];
             if (x->window == r->win && x->atom == c->prop[w] && x->state == XCB_PROPERTY_NEW_VALUE && r->state == 3)
@@ -1018,14 +1019,14 @@ static bool clip_poll(plat *p) {
     c->slice = 0;
     /* Deliver already queued completions before replacing the single plat_clip_data
      * buffer with another selection's result (both receives can finish together). */
-    if (!c->saving && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt) return false;
+    if (!c->saving && x11_private(p)->in && ((x11_input *)x11_private(p)->in)->qh != ((x11_input *)x11_private(p)->in)->qt) return false;
     bool progress = false; uint64_t now = trace_now_ns();
     if (c->jobs_out && c->pool && work_mailbox_drain(c->pool, on_work_msg, c)) progress = true;
     for (int w = 0; w < NSEL; w++) {
         while (c->failed[w] && event_room(p)) { c->failed[w]--; result(p, w, false, 1); progress = true; }
         while (c->lost[w] && event_room(p)) { c->lost[w]--; result(p, w, false, 2); progress = true; }
     }
-    if (progress && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt) return true;
+    if (progress && x11_private(p)->in && ((x11_input *)x11_private(p)->in)->qh != ((x11_input *)x11_private(p)->in)->qt) return true;
     for (int w = 0; w < NSEL; w++)
         if (c->local_ready[w] && deliver_local(p, w)) return true;     /* its events are queued: drain them first */
     for (int w = 0; w < NSEL; w++) {
@@ -1037,13 +1038,13 @@ static bool clip_poll(plat *p) {
             void *reply = NULL; xcb_generic_error_t *error = NULL;
             if (xcb_poll_for_reply(C(p), c->owner_cookie[w], &reply, &error)) {
                 xcb_get_selection_owner_reply_t *r = reply;
-                bool ok = r && !error && r->owner == p->win;
+                bool ok = r && !error && r->owner == x11_private(p)->win;
                 free(reply); free(error); progress = true;
                 if (!ok && !c->retried[w] && c->own[w]) { c->retried[w] = true; claim(p, w, 0); }
                 else owner_finish(p, w, ok);
             }
         }
-        if (!c->saving && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt) return true;
+        if (!c->saving && x11_private(p)->in && ((x11_input *)x11_private(p)->in)->qh != ((x11_input *)x11_private(p)->in)->qt) return true;
         if (c->clear_pending[w]) {
             void *reply = NULL; xcb_generic_error_t *error = NULL;
             if (now >= c->clear_deadline[w]) {
@@ -1051,7 +1052,7 @@ static bool clip_poll(plat *p) {
                 c->clear_deadline[w] = 0; progress = true; flush_local(p, w);
             } else if (xcb_poll_for_reply(C(p), c->clear_cookie[w], &reply, &error)) {
                 xcb_get_selection_owner_reply_t *owner = reply;
-                if (owner && !error && owner->owner != p->win && c->own[w]) {
+                if (owner && !error && owner->owner != x11_private(p)->win && c->own[w]) {
                     blob_unref(c, c->own[w]); c->own[w] = NULL; c->confirmed[w] = false;
                     result(p, w, false, 2);
                 }
@@ -1070,7 +1071,7 @@ static bool clip_poll(plat *p) {
         if (r->state == 5) {
             unsigned before = r->infl; rx_advance(p, w);
             if (!c->rx[w].state || before != r->infl) progress = true;
-            if (!c->saving && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt) return true;
+            if (!c->saving && x11_private(p)->in && ((x11_input *)x11_private(p)->in)->qh != ((x11_input *)x11_private(p)->in)->qt) return true;
             continue;
         }
         if (r->state == 2 && !slice_room(c, c->max_chunk)) progress = true;      /* budget spent: next slice */
@@ -1082,7 +1083,7 @@ static bool clip_poll(plat *p) {
                 xcb_get_property_reply_t *rep = reply;
                 if (error) rx_finish(p, w, false); else rx_reply(p, w, &rep);
                 free(rep); free(error);
-                if (!c->saving && p->in && ((x11_input *)p->in)->qh != ((x11_input *)p->in)->qt)
+                if (!c->saving && x11_private(p)->in && ((x11_input *)x11_private(p)->in)->qh != ((x11_input *)x11_private(p)->in)->qt)
                     return true; /* deliver completed data before replacing it; partial reads stay fair */
             }
         }
@@ -1172,7 +1173,7 @@ void x11_clip_save_on_exit(plat *p) {
             void *reply = NULL; xcb_generic_error_t *error = NULL;
             if (xcb_poll_for_reply(C(p), actual_owner, &reply, &error)) {
                 xcb_get_selection_owner_reply_t *r = reply;
-                bool ours = r && !error && r->owner == p->win;
+                bool ours = r && !error && r->owner == x11_private(p)->win;
                 free(reply); free(error); actual_probing = false;
                 if (!ours) break;
             }
@@ -1185,8 +1186,8 @@ void x11_clip_save_on_exit(plat *p) {
                 free(reply); free(error); probing = false;
                 if (!found) break;
                 xcb_atom_t t[] = { c->utf8, c->textplain, XCB_ATOM_STRING };
-                xcb_change_property(C(p), XCB_PROP_MODE_REPLACE, p->win, c->save_prop, XCB_ATOM_ATOM, 32, 3, t);
-                xcb_convert_selection(C(p), p->win, c->manager, c->save, c->save_prop, XCB_CURRENT_TIME); xcb_flush(C(p));
+                xcb_change_property(C(p), XCB_PROP_MODE_REPLACE, x11_private(p)->win, c->save_prop, XCB_ATOM_ATOM, 32, 3, t);
+                xcb_convert_selection(C(p), x11_private(p)->win, c->manager, c->save, c->save_prop, XCB_CURRENT_TIME); xcb_flush(C(p));
             }
         }
         bool progress = x11_clip_poll(p);

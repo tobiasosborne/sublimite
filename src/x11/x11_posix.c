@@ -1,5 +1,6 @@
 #if !defined(_WIN32)
 #include "x11/plat.h"
+#include "x11/private.h"
 #include "wayland/plat.h"
 #include "editor/runtime.h"
 #include <stdlib.h>
@@ -113,8 +114,10 @@ int plat_display_size(plat_backend backend, plat_display_info *info)
  * Unknown/zero clocks remain unknown, never a fabricated fallback rate. */
 uint64_t plat_display_interval_ns(const plat *p)
 {
-    if (!p || !p->conn || p->backend!=PLAT_BACKEND_X11) return 0;
-    xcb_connection_t *connection=p->conn;
+    if (!p || p->backend!=PLAT_BACKEND_X11) return 0;
+    const x11_plat *x=x11_private(p);
+    if (!x || !x->conn) return 0;
+    xcb_connection_t *connection=x->conn;
     xcb_screen_iterator_t screens=xcb_setup_roots_iterator(xcb_get_setup(connection));
     if (!screens.rem) return 0;
     xcb_randr_get_screen_resources_current_reply_t *resources=xcb_randr_get_screen_resources_current_reply(connection,

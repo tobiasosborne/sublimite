@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* x11_clip_test.c - selection transfers against a raw xcb peer (P2.2b): INCR both directions, MULTIPLE,
  * STRING fallback, unsolicited/stale selection events, request timeouts, clipboard-manager save and the
  * grab-mode focus rule. The peer is a hand-written ICCCM client so the plat code is not tested against itself.
@@ -191,7 +192,7 @@ static bool pump_until(plat *a, sink *sa, rawp *r, const bool *flag, const int *
 }
 
 static plat *open_plat(plat *p) {
-    plat_config cfg = { "x11 clip", 100, 100, false, -1, 0 };
+    plat_config cfg = { "x11 clip", 100, 100, false, NULL, 0 };
     int rc = plat_init(p, &cfg);
     if (rc != PLAT_OK) { fprintf(stderr, "x11_clip_test: plat_init rc=%d\n", rc); return NULL; }
     x11_clip_set_limits(p, 0, 0, UINT32_MAX);        /* never talk to a real clipboard manager unless a test asks */
@@ -207,7 +208,7 @@ static uint8_t *pattern(size_t n) {
 
 static void set_and_confirm(plat *a, sink *sa, rawp *r, int which, const void *d, size_t n) {
     CHECK(plat_clip_set(a, which, d, n) == PLAT_OK, "set");
-    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(a->conn, xcb_get_input_focus(a->conn), NULL);
+    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(plat_native_x11(a).connection, xcb_get_input_focus(plat_native_x11(a).connection), NULL);
     free(f);
     pump(a, sa, r, 3);
 }
@@ -418,8 +419,8 @@ static void test_receive_unsolicited(plat *a, sink *sa, rawp *r) {
     plat_clip_data(a, &before);
     sa->arrived = sa->failed = 0;
     xcb_atom_t prop = intern(r->c, "EDIT_SELECTION");
-    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, a->win, prop, r->utf8, 8, 6, "forged");
-    rp_send_notify(r, a->win, r->clipboard, r->utf8, prop, XCB_CURRENT_TIME);
+    xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, plat_native_x11(a).window, prop, r->utf8, 8, 6, "forged");
+    rp_send_notify(r, plat_native_x11(a).window, r->clipboard, r->utf8, prop, XCB_CURRENT_TIME);
     pump(a, sa, r, 25);
     size_t after = 0;
     plat_clip_data(a, &after);
@@ -452,7 +453,7 @@ static void test_receive_timeouts(plat *a, sink *sa, rawp *r) {
 }
 
 static void test_late_notify_and_old_input_time(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0; x11_clip_set_limits(a, 0, 60, 0);
+    x11_private(a)->last_time = 0; x11_clip_set_limits(a, 0, 60, 0);
     rp_own(r, OWN_SILENT, NULL, 0, 0); pump(a, sa, r, 3);
     sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
     pump_until(a, sa, r, NULL, &sa->failed, 1000);
@@ -468,18 +469,18 @@ static void test_late_notify_and_old_input_time(plat *a, sink *sa, rawp *r) {
     size_t n; const uint8_t *d = plat_clip_data(a, &n);
     CHECK(sa->arrived == 1 && d && n == 5 && memcmp(d, "fresh", 5) == 0, "new conversion receives fresh data");
     x11_clip_set_limits(a, 0, 5000, 0);
-    r->reject_old_time = true; a->last_time = 1; sa->arrived = sa->failed = 0;
+    r->reject_old_time = true; x11_private(a)->last_time = 1; sa->arrived = sa->failed = 0;
     plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
     pump_until(a, sa, r, NULL, &sa->arrived, 1000);
     CHECK(sa->arrived == 1 && !sa->failed, "remote paste does not reuse an ancient unrelated input timestamp");
-    r->reject_old_time = false; a->last_time = 0;
+    r->reject_old_time = false; x11_private(a)->last_time = 0;
 }
 
 static void send_clear(rawp *r, plat *a, uint32_t time) {
     xcb_selection_clear_event_t c;
     memset(&c, 0, sizeof c);
-    c.response_type = XCB_SELECTION_CLEAR; c.time = time; c.owner = a->win; c.selection = r->clipboard;
-    xcb_send_event(r->c, 0, a->win, 0, (const char *)&c);
+    c.response_type = XCB_SELECTION_CLEAR; c.time = time; c.owner = plat_native_x11(a).window; c.selection = r->clipboard;
+    xcb_send_event(r->c, 0, plat_native_x11(a).window, 0, (const char *)&c);
     xcb_flush(r->c);
 }
 
@@ -501,7 +502,7 @@ static void test_stale_events(plat *a, sink *sa, rawp *r) {
         }
         free(e);
     }
-    a->last_time = stamp;
+    x11_private(a)->last_time = stamp;
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "keep me", 7);
     sa->lost = 0;
     send_clear(r, a, stamp - 500u);                      /* older than our ownership: stale */
@@ -541,16 +542,16 @@ static uint32_t server_time(rawp *r) {
     return stamp;
 }
 static void barrier(plat *a) {
-    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(a->conn, xcb_get_input_focus(a->conn), NULL);
+    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(plat_native_x11(a).connection, xcb_get_input_focus(plat_native_x11(a).connection), NULL);
     free(f);
 }
 
 /* #1: only a server-generated SelectionClear (real ownership change) may free our data. */
 static void test_forged_clear(plat *a, sink *sa, rawp *r) {
-    a->last_time = server_time(r);
+    x11_private(a)->last_time = server_time(r);
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "keep me", 7);
     sa->lost = 0;
-    send_clear(r, a, a->last_time + 1000u);               /* forged by SendEvent: nobody took the selection */
+    send_clear(r, a, x11_private(a)->last_time + 1000u);               /* forged by SendEvent: nobody took the selection */
     pump(a, sa, r, 10);
     CHECK(sa->lost == 0, "forged SelectionClear raised a loss event");
     rp_reset_req(r);
@@ -574,7 +575,7 @@ static void on_loc(void *ud, const plat_event *e) {
     if (!s->chained && e->clip_which == 0) { s->chained = true; plat_clip_request(s->a, PLAT_CLIP_PRIMARY); }
 }
 static void test_local_completion_data(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "clipboard", 9);
     set_and_confirm(a, sa, r, PLAT_CLIP_PRIMARY, "primary", 7);
     loc_sink s = { .a = a }; plat_callbacks cb = { &s, on_loc, NULL, NULL, NULL };
@@ -587,7 +588,7 @@ static void test_local_completion_data(plat *a, sink *sa, rawp *r) {
 
 /* #5: a takeover that lands after the confirmation query must not be forgotten. */
 static void test_takeover_after_confirmation(plat *a, sink *sa, rawp *r) {
-    a->last_time = server_time(r);
+    x11_private(a)->last_time = server_time(r);
     sa->lost = sa->arrived = sa->failed = 0;
     plat_clip_set(a, PLAT_CLIP_CLIPBOARD, "mine", 4);
     barrier(a);                                            /* our claim and owner query are answered (owner = us) */
@@ -598,7 +599,7 @@ static void test_takeover_after_confirmation(plat *a, sink *sa, rawp *r) {
     size_t n = 0; const uint8_t *d = plat_clip_data(a, &n);
     CHECK(sa->lost == 1, "takeover after confirmation reports the loss (lost %d)", sa->lost);
     CHECK(sa->arrived == 1 && d && n == 6 && memcmp(d, "theirs", 6) == 0, "paste after takeover returned stale data (%zu bytes)", n);
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
 }
 
 /* #6: an INCR transfer that ends below its advertised lower bound is a failure. */
@@ -626,7 +627,7 @@ static void test_incr_short(plat *a, sink *sa, rawp *r) {
 /* #13: bulk clipboard work is bounded per slice; local pastes share the immutable blob. */
 #define SLICE_LIMIT (1024u * 1024u)
 static void test_bulk_slices(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 5000, 0);
+    x11_private(a)->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 5000, 0);
     size_t big = 20u * 1024u * 1024u; uint8_t *d = pattern(big);
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, d, big);
     (void)x11_clip_max_slice(a, true);
@@ -727,7 +728,7 @@ static void recv_big(plat *a, sink *sa, rawp *r, unsigned mode, const uint8_t *d
            what, expect >> 20, (unsigned long long)took, ui, (double)worst / 1e6, (double)cpu / 1e6);
 }
 static void test_large_paste_latency(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 30000, 0);
+    x11_private(a)->last_time = 0; x11_clip_set_limits(a, 256 * 1024, 30000, 0);
     size_t n = 64u * 1024u * 1024u; uint8_t *d = pattern(n);
     recv_big(a, sa, r, OWN_INCR, d, n, n, "64 MiB UTF8 INCR");
     size_t g_len = 0; const uint8_t *g = plat_clip_data(a, &g_len);
@@ -766,7 +767,7 @@ static void test_large_paste_latency(plat *a, sink *sa, rawp *r) {
 
 /* Large owners hand over a buffer filled elsewhere: adopting it moves no bytes on the UI thread. */
 static void test_zero_copy_set(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
     size_t n = 20u * 1024u * 1024u;
     x11_clip_buf *b = x11_clip_buf_new(n);
     CHECK(b != NULL, "buf_new");
@@ -775,7 +776,7 @@ static void test_zero_copy_set(plat *a, sink *sa, rawp *r) {
     (void)x11_clip_ui_bytes(a, true);
     CHECK(x11_clip_set_buf(a, PLAT_CLIP_CLIPBOARD, b) == PLAT_OK, "set_buf");
     CHECK(x11_clip_ui_bytes(a, true) == 0, "adopting a buffer moved bytes on the UI thread");
-    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(a->conn, xcb_get_input_focus(a->conn), NULL); free(f);
+    xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(plat_native_x11(a).connection, xcb_get_input_focus(plat_native_x11(a).connection), NULL); free(f);
     pump(a, sa, r, 3);
     CHECK(x11_clip_mem(a) >= n && x11_clip_mem(a) < n + 8192, "adopted buffer is accounted (%zu)", x11_clip_mem(a));
     sa->arrived = sa->failed = 0; plat_clip_request(a, PLAT_CLIP_CLIPBOARD);
@@ -808,14 +809,14 @@ static void test_string_fallback_deadline(plat *a, sink *sa, rawp *r) {
 
 /* #28: notifications for identical MULTIPLE tuples keep arrival order. */
 static void test_multiple_order(plat *a, sink *sa, rawp *r) {
-    a->last_time = server_time(r);
+    x11_private(a)->last_time = server_time(r);
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "ordered", 7);
     xcb_atom_t good[2] = { r->utf8, r->p4 };
     rp_reset_req(r);
     xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p1, r->string, 8, 1, "x");   /* malformed */
     xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p2, r->atom_pair, 32, 2, good);
     xcb_change_property(r->c, XCB_PROP_MODE_REPLACE, r->win, r->p3, r->string, 8, 1, "y");   /* malformed */
-    uint32_t t = a->last_time;
+    uint32_t t = x11_private(a)->last_time;
     xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p1, t);
     xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p2, t);
     xcb_convert_selection(r->c, r->win, r->clipboard, r->multiple, r->p3, t);
@@ -824,7 +825,7 @@ static void test_multiple_order(plat *a, sink *sa, rawp *r) {
     while (now_ms() < end && r->nn < 3) pump(a, sa, r, 1);
     CHECK(r->nn == 3 && r->nprops[0] == XCB_ATOM_NONE && r->nprops[1] == r->p2 && r->nprops[2] == XCB_ATOM_NONE,
           "MULTIPLE notifications out of order: %u %u %u (want none, p2, none)", r->nprops[0], r->nprops[1], r->nprops[2]);
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
 }
 
 /* ---- clipboard manager ---- */
@@ -964,13 +965,13 @@ static void test_idle_timeout(plat *a, sink *sa, rawp *r) {
 }
 /* A failed owner confirmation must retain bytes if the queued claim succeeds later. */
 static void test_owner_confirmation_timeout(plat *a, sink *sa, rawp *r) {
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
     set_and_confirm(a, sa, r, PLAT_CLIP_CLIPBOARD, "before", 6);
     xcb_grab_server(r->c);
     xcb_get_input_focus_reply_t *f = xcb_get_input_focus_reply(r->c, xcb_get_input_focus(r->c), NULL); free(f);
     /* The claim/query are delayed by the grab. Even if the stale claim is rejected later,
      * X still lists us as the real owner; uncertainty must not free the replacement bytes. */
-    a->last_time = 1;
+    x11_private(a)->last_time = 1;
     x11_clip_set_limits(a, 0, 60, 0);
     sa->lost = 0;
     plat_clip_set(a, PLAT_CLIP_CLIPBOARD, "after timeout", 13);
@@ -986,7 +987,7 @@ static void test_owner_confirmation_timeout(plat *a, sink *sa, rawp *r) {
     pump_until(a, sa, r, &r->done, NULL, 1000);
     CHECK(r->done && r->got_len == 13 && memcmp(r->got, "after timeout", 13) == 0,
           "unconfirmed claim retains bytes while still the actual owner");
-    x11_clip_set_limits(a, 0, 5000, 0); a->last_time = 0;
+    x11_clip_set_limits(a, 0, 5000, 0); x11_private(a)->last_time = 0;
 }
 typedef struct dual_sink { plat *a; unsigned completed[2]; bool bad; } dual_sink;
 static void on_dual(void *ud, const plat_event *e) {
@@ -1003,7 +1004,7 @@ static void test_concurrent_receive(plat *a, sink *sa, rawp *r) {
     uint8_t cdata[4096], pdata[4096]; memset(cdata, 'c', sizeof cdata); memset(pdata, 'p', sizeof pdata);
     rp_own(r, OWN_INCR, cdata, sizeof cdata, 512);
     rp_own(&primary, OWN_INCR, pdata, sizeof pdata, 512); pump(a, sa, r, 3);
-    a->last_time = 0;
+    x11_private(a)->last_time = 0;
     plat_clip_request(a, PLAT_CLIP_CLIPBOARD); plat_clip_request(a, PLAT_CLIP_PRIMARY);
     dual_sink s = { .a = a }; plat_callbacks cb = { &s, on_dual, NULL, NULL, NULL };
     uint64_t end = now_ms() + 2000;
@@ -1028,13 +1029,13 @@ static void test_paged_property(plat *a, sink *sa, rawp *r) {
 static void send_focus(rawp *r, plat *a, bool in, uint8_t mode, uint8_t detail) {
     xcb_focus_in_event_t f;
     memset(&f, 0, sizeof f);
-    f.response_type = in ? XCB_FOCUS_IN : XCB_FOCUS_OUT; f.detail = detail; f.event = a->win; f.mode = mode;
-    xcb_send_event(r->c, 0, a->win, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&f);
+    f.response_type = in ? XCB_FOCUS_IN : XCB_FOCUS_OUT; f.detail = detail; f.event = plat_native_x11(a).window; f.mode = mode;
+    xcb_send_event(r->c, 0, plat_native_x11(a).window, XCB_EVENT_MASK_FOCUS_CHANGE, (const char *)&f);
     xcb_flush(r->c);
 }
 
 static void test_focus_modes(plat *a, sink *sa, rawp *r) {
-    x11_input *in = a->in;
+    x11_input *in = x11_private(a)->in;
     in->down[3] = 0x10;
     sa->focus = 0;
     send_focus(r, a, false, 1 /* NotifyGrab */, 3);

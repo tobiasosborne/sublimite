@@ -24,8 +24,8 @@ int main(void)
     render_backend backend = {0}; T(render_cpu_backend(&backend) == 0);
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
     T(e->font.applied_px == editor_runtime_em_px(display.dpi, EDITOR_FONT_DEFAULT_PT));
-    xcb_connection_t *c = e->platform.conn;
-    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(c, xcb_get_geometry(c, e->platform.win), NULL);
+    xcb_connection_t *c = plat_native_x11(&e->platform).connection;
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(c, xcb_get_geometry(c, plat_native_x11(&e->platform).window), NULL);
     T(geometry != NULL); T(geometry->width == width && geometry->height == height); free(geometry);
     render_dims before = editor_grid(e)->dims;
     plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_equal, .mods = PLAT_MOD_CTRL};

@@ -48,7 +48,7 @@ typedef struct plat_event {
     int32_t x, y;
     uint32_t time_ms;       /* raw native server time (ms), informational */
     /* ---- P2.2 ---- */
-    uint32_t keysym;        /* KEY: xkb keysym with the event's modifiers applied */
+    uint32_t keysym;        /* KEY: keysym with the event's modifiers applied */
     uint8_t  utf8[PLAT_UTF8_MAX]; /* KEY: text to insert, printable only, else len 0 (see decisions/P2.2.md) */
     uint8_t  utf8_len;
     bool     repeat;        /* KEY: synthesised by our repeat timer */
@@ -58,23 +58,25 @@ typedef struct plat_event {
     bool     smooth;        /* WHEEL: from XI2 smooth-scroll valuators (else core buttons 4-7) */
     bool     clip_ok;       /* CLIPBOARD: data available via plat_clip_data; false = failed/lost */
     uint8_t  clip_which;    /* CLIPBOARD: PLAT_CLIP_* */
-    uint64_t t0_ns;         /* CLOCK_MONOTONIC ns of the physical event (X time mapped, never later than ingest) */
+    uint64_t t0_ns;         /* monotonic ns of the physical event (never later than ingest) */
 } plat_event;
 
 typedef struct plat_callbacks {
     void *ud;
     void (*on_event)(void *ud, const plat_event *ev);
-    void (*on_blink)(void *ud);                       /* timerfd fired */
-    void (*on_work)(void *ud);                        /* work eventfd readable */
+    void (*on_blink)(void *ud);                       /* blink timer fired */
+    void (*on_work)(void *ud);                        /* work wake readable */
     void (*on_present_complete)(void *ud, uint32_t serial, uint64_t ust, uint64_t msc); /* T6 */
 } plat_callbacks;
+
+struct os_wake;
 
 typedef struct plat_config {
     const char *title;
     uint32_t width, height;
     bool headless;          /* tests without DISPLAY: init returns PLAT_ERR_NO_DISPLAY */
-    int work_eventfd;       /* -1 if none */
-    uint64_t exec_ns;       /* CLOCK_MONOTONIC at process start (0 = unknown) */
+    const struct os_wake *work_wake; /* borrowed; NULL if none */
+    uint64_t exec_ns;       /* monotonic ns at process start (0 = unknown) */
 } plat_config;
 
 typedef enum plat_backend { PLAT_BACKEND_X11, PLAT_BACKEND_WAYLAND } plat_backend;
@@ -84,27 +86,10 @@ plat_backend plat_backend_select(const char *display, const char *wayland_displa
 
 typedef struct plat {
     plat_backend backend;
-    void *wayland;          /* private Wayland state, NULL on X11 */
-    void *conn;             /* X11: xcb_connection_t*; Wayland: wl_display* */
-    uint32_t win, colormap, visual;
-    uint8_t depth;
-    bool argb, present_ok, focused, quit;
-    uint8_t present_opcode;
-    uint32_t present_eid;
-    uint32_t wm_protocols, wm_delete;
-    int timer_fd, work_fd;
+    void *backend_state;   /* owned by the selected backend */
     uint32_t width, height;
-    uint64_t iterations;    /* loop wakeups, for G11 */
-    /* ---- P2.2 ---- */
-    int repeat_fd;          /* timerfd for our key repeat */
-    void *in;               /* x11_input* (xkb state, repeat, queue); allocated at init, not on the typing path */
-    void *xi;               /* xi2 state or NULL if XI2 unavailable */
-    void *clip;             /* clipboard state */
-    uint32_t last_time;     /* last X server timestamp seen (for selection ownership) */
-    uint8_t xkb_event;      /* XKB extension first-event code, 0 if none */
-    int32_t xkb_dev;        /* core keyboard device id */
-    bool core_wheel;        /* core buttons 4-7 are wheel (no XI2 scroll devices) */
-    uint32_t xi_scroll_ms;  /* time of last XI2 scroll event, to drop its emulated core buttons */
+    bool focused, quit;
+    uint64_t iterations;   /* loop wakeups, for G11 */
 } plat;
 
 typedef struct plat_display_info {
@@ -116,6 +101,15 @@ typedef struct plat_display_info {
 int plat_display_size(plat_backend backend, plat_display_info *info);
 /* INIT only: mode timing in ns; zero when unknown or no platform exists. */
 uint64_t plat_display_interval_ns(const plat *p);
+/* Borrowed native handles, sampled during exclusive renderer initialization. */
+typedef struct plat_x11_native {
+    void *connection;
+    uint32_t window, visual;
+    uint8_t depth;
+    bool argb;
+} plat_x11_native;
+plat_x11_native plat_native_x11(const plat *p);
+bool plat_present_available(const plat *p);
 
 int  plat_init(plat *p, const plat_config *cfg);
 int  plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend);

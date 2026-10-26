@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* Automated window/Present/idle fixture, included by tests/x11_live_test.c.
  * Promotes the old src/x11 manual smoke template into the test build.
  * CHECK and g_fail belong to the live runner; all callback state is per fixture. */
@@ -51,36 +52,36 @@ static void test_window_contracts(plat *p) {
     plat_set_repeat(p, 0, 0);
     plat_set_blink(p, 0);
     plat_map(p);
-    window_barrier(p->conn);
+    window_barrier(plat_native_x11(p).connection);
     xcb_get_window_attributes_reply_t *attrs = xcb_get_window_attributes_reply(
-        peer, xcb_get_window_attributes(peer, p->win), NULL);
+        peer, xcb_get_window_attributes(peer, plat_native_x11(p).window), NULL);
     CHECK(attrs && attrs->map_state == XCB_MAP_STATE_VIEWABLE, "§25 mapped window is viewable");
     free(attrs);
     window_pump(p, &cb, &s.expose);
     CHECK(s.expose > 0, "§25 map delivers Expose");
     uint32_t dims[] = { 320, 240 };
-    xcb_configure_window(peer, p->win, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, dims);
+    xcb_configure_window(peer, plat_native_x11(p).window, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, dims);
     window_barrier(peer);
     window_pump(p, &cb, &s.resize);
     CHECK(s.resize == 1 && s.width == 320 && s.height == 240 && p->width == 320 && p->height == 240,
           "§25 resize callback and platform dimensions");
-    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, p->win, XCB_CURRENT_TIME);
+    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, plat_native_x11(p).window, XCB_CURRENT_TIME);
     window_barrier(peer);
     window_pump(p, &cb, &s.focus_in);
     CHECK(s.focus_in == 1 && p->focused, "§25 focus-in callback/state");
-    CHECK(p->present_ok, "§25 private Xvfb supports Present");
-    if (p->present_ok) {
+    CHECK(plat_present_available(p), "§25 private Xvfb supports Present");
+    if (plat_present_available(p)) {
         xcb_pixmap_t pixmap = xcb_generate_id(peer);
         xcb_generic_error_t *err = xcb_request_check(peer,
-            xcb_create_pixmap_checked(peer, p->depth, pixmap, p->win, 320, 240));
+            xcb_create_pixmap_checked(peer, plat_native_x11(p).depth, pixmap, plat_native_x11(p).window, 320, 240));
         CHECK(!err, "§25 create Present pixmap"); free(err);
         /* Real server-generated pixmap completion, with a distinctive serial. */
-        xcb_key_press_event_t prior = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = p->win, .same_screen = 1 };
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&prior);
+        xcb_key_press_event_t prior = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = plat_native_x11(p).window, .same_screen = 1 };
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_PRESS, (const char *)&prior);
         prior.response_type = XCB_KEY_RELEASE;
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&prior);
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&prior);
         const uint32_t serial = UINT32_C(0x21a5);
-        err = xcb_request_check(peer, xcb_present_pixmap_checked(peer, p->win, pixmap, serial,
+        err = xcb_request_check(peer, xcb_present_pixmap_checked(peer, plat_native_x11(p).window, pixmap, serial,
             0, 0, 0, 0, 0, 0, 0, XCB_PRESENT_OPTION_ASYNC, 0, 0, 0, 0, NULL));
         CHECK(!err, "§25 Present request accepted"); free(err);
         window_pump(p, &cb, &s.present);
@@ -94,19 +95,19 @@ static void test_window_contracts(plat *p) {
      * Delivery must preserve both every transition and the final close position. */
     enum { PAIRS = 300 };
     for (unsigned i = 0; i < PAIRS; i++) {
-        xcb_key_press_event_t k = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = p->win, .same_screen = 1 };
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_PRESS, (const char *)&k);
+        xcb_key_press_event_t k = { .response_type = XCB_KEY_PRESS, .detail = 38, .event = plat_native_x11(p).window, .same_screen = 1 };
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_PRESS, (const char *)&k);
         k.response_type = XCB_KEY_RELEASE;
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&k);
-        xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 1, .event = p->win, .same_screen = 1 };
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_BUTTON_PRESS, (const char *)&b);
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_KEY_RELEASE, (const char *)&k);
+        xcb_button_press_event_t b = { .response_type = XCB_BUTTON_PRESS, .detail = 1, .event = plat_native_x11(p).window, .same_screen = 1 };
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_BUTTON_PRESS, (const char *)&b);
         b.response_type = XCB_BUTTON_RELEASE;
-        xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_BUTTON_RELEASE, (const char *)&b);
+        xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_BUTTON_RELEASE, (const char *)&b);
     }
     xcb_client_message_event_t close = { .response_type = XCB_CLIENT_MESSAGE, .format = 32,
-        .window = p->win, .type = p->wm_protocols };
-    close.data.data32[0] = p->wm_delete;
-    xcb_send_event(peer, 0, p->win, XCB_EVENT_MASK_NO_EVENT, (const char *)&close);
+        .window = plat_native_x11(p).window, .type = x11_private(p)->wm_protocols };
+    close.data.data32[0] = x11_private(p)->wm_delete;
+    xcb_send_event(peer, 0, plat_native_x11(p).window, XCB_EVENT_MASK_NO_EVENT, (const char *)&close);
     window_barrier(peer);
     window_pump(p, &cb, &s.close);
     CHECK(s.keys == 2 * PAIRS && s.buttons == 2 * PAIRS, "§25 burst preserves every transition (%u keys, %u buttons)", s.keys, s.buttons);
@@ -116,13 +117,13 @@ static void test_window_contracts(plat *p) {
     window_pump(p, &cb, &s.focus_out);
     CHECK(s.focus_out == 1 && !p->focused, "§25 focus-out callback/state");
     /* Flush residual map/resize/Present events before counting idle wakeups. */
-    window_barrier(p->conn);
+    window_barrier(plat_native_x11(p).connection);
     CHECK(plat_run_for(p, &cb, 50) == PLAT_OK, "§25 settle before idle");
     plat_set_blink(p, 1); /* must be ignored while unfocused */
     uint64_t before = p->iterations;
     CHECK(plat_run_for(p, &cb, 100) == PLAT_OK, "§25 unfocused idle returns");
     CHECK(p->iterations == before && s.blink == 0, "§25 unfocused idle has zero wakeups/blinks");
-    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, p->win, XCB_CURRENT_TIME);
+    xcb_set_input_focus(peer, XCB_INPUT_FOCUS_POINTER_ROOT, plat_native_x11(p).window, XCB_CURRENT_TIME);
     window_barrier(peer);
     CHECK(plat_run_for(p, &cb, 50) == PLAT_OK && p->focused, "§25 refocus before disabled-blink idle");
     plat_set_blink(p, 0);

@@ -57,7 +57,7 @@ static int startup_bench(double load) {
     trace_init(); trace_thread_register();
     /* One unmeasured warm-up. Each measured sample initializes a fresh connection/window. */
     for (unsigned i = 0; i <= START_N; i++) {
-        plat p; plat_config cfg = { "startup bench", 1600, 900, false, -1, 0 };
+        plat p; plat_config cfg = { "startup bench", 1600, 900, false, NULL, 0 };
         uint64_t t0 = bench_now_ns(); cfg.exec_ns = t0;
         int r = plat_init(&p, &cfg);
         if (r != PLAT_OK) { fprintf(stderr, "FAIL x11 startup: plat_init failed (%d) with supplied DISPLAY\n", r); return 1; }

@@ -224,7 +224,7 @@ static int test_editor(int ready_fd, const char *trace_path)
         int step = editor_step(e,10);
         if (step < 0 || trace_now_ns()>deadline) rc = 1;
     }
-    if (!rc && dprintf(ready_fd,"%" PRIu32 "\n",backend.config.platform->win) < 0) rc = 1;
+    if (!rc && dprintf(ready_fd,"%" PRIu32 "\n",plat_native_x11(backend.config.platform).window) < 0) rc = 1;
     close(ready_fd);
     if (!rc) rc = editor_run(e);
     uint8_t bytes[12];

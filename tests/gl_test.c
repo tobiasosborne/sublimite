@@ -1,3 +1,4 @@
+#include "x11/private.h"
 #include "gl/gl_driver.h"
 #include "raster/raster.h"
 #include "editor/editor.h"
@@ -13,6 +14,7 @@
 #include <xcb/present.h>
 #include <xcb/xcbext.h>
 typedef struct gl_review_queue {
+    x11_plat platform_state;
     xcb_present_complete_notify_event_t events[16];
     size_t next, count;
 } gl_review_queue;
@@ -657,13 +659,15 @@ static int gl_review_binding_test(void)
     ca=(render_config){.dims={2,2,4,4},.max_width=8,.max_height=8,.max_cells=4}; cb=ca;
     GL_CHECK(gl_review_readback_open(&a,&ba,&ca)==0);
     plat shared=a.platform;
-    shared.win=xcb_generate_id(shared.conn);
-    uint32_t attrs[]={0,0,shared.colormap};
-    xcb_generic_error_t *error=xcb_request_check(shared.conn,xcb_create_window_checked(shared.conn,
-        shared.depth,shared.win,a.platform.win,0,0,8,8,0,XCB_WINDOW_CLASS_INPUT_OUTPUT,
-        shared.visual,XCB_CW_BACK_PIXEL|XCB_CW_BORDER_PIXEL|XCB_CW_COLORMAP,attrs));
+    x11_plat shared_state=*x11_private(&shared);
+    shared.backend_state=&shared_state;
+    x11_private(&shared)->win=xcb_generate_id(plat_native_x11(&shared).connection);
+    uint32_t attrs[]={0,0,x11_private(&shared)->colormap};
+    xcb_generic_error_t *error=xcb_request_check(plat_native_x11(&shared).connection,xcb_create_window_checked(plat_native_x11(&shared).connection,
+        plat_native_x11(&shared).depth,plat_native_x11(&shared).window,plat_native_x11(&a.platform).window,0,0,8,8,0,XCB_WINDOW_CLASS_INPUT_OUTPUT,
+        plat_native_x11(&shared).visual,XCB_CW_BACK_PIXEL|XCB_CW_BORDER_PIXEL|XCB_CW_COLORMAP,attrs));
     GL_CHECK(error==NULL);
-    (void)xcb_map_window(shared.conn,shared.win); (void)xcb_flush(shared.conn);
+    (void)xcb_map_window(plat_native_x11(&shared).connection,plat_native_x11(&shared).window); (void)xcb_flush(plat_native_x11(&shared).connection);
     GL_CHECK(gl_driver_prepare(&b,&bb,&cb)==RENDER_OK);
     bb.ops.init=gl_readback_init; bb.info.capabilities=RENDER_CAP_GPU;
     b.config.platform=&shared;
@@ -673,7 +677,7 @@ static int gl_review_binding_test(void)
     render_backend_shutdown(&ba);
     GL_CHECK(gl_read_pixels(&bb,rgba,sizeof rgba)==RENDER_OK && rgba[0]==0xab);
     gl_driver_cleanup(&b);
-    (void)xcb_destroy_window(shared.conn,shared.win);
+    (void)xcb_destroy_window(plat_native_x11(&shared).connection,plat_native_x11(&shared).window);
     gl_driver_cleanup(&a);
     puts("gl_review: section=1 PASS (alternating EGL contexts, pixels, shutdown isolation)");
     return 0;
@@ -752,7 +756,9 @@ static void gl_review_pending(render_backend *b, gl_state *s, plat *p, gl_review
     (void)gl_test_factory(b); b->state=s; b->initialized=true; b->active=true; b->presented=true;
     b->active_frame=9001; b->submitted_ns=trace_now_ns();
     b->config.hooks=(render_hooks){gl_ignore_hook,gl_ignore_hook,NULL};
-    p->win=44; p->height=8; s->platform=p; s->native_win=44;
+    memset(&q->platform_state,0,sizeof q->platform_state);
+    p->backend_state=&q->platform_state;
+    x11_private(p)->win=44; p->height=8; s->platform=p; s->native_win=44;
     s->pending_serial=17; s->gClientWaitSync=gl_ring_script_wait;
     s->gDeleteSync=gl_delete_test_fence; s->eMakeCurrent=gl_review_accept_bind;
     s->fence=(void *)(uintptr_t)2; s->present_special=(void *)q;
@@ -954,7 +960,7 @@ static void gl_review_platform_complete(void *user,uint32_t serial,uint64_t ust,
 static int gl_review_trace_test(void)
 {
     trace_reset(); gl_state s; render_backend b; plat p; gl_review_queue q={.count=1};
-    gl_review_pending(&b,&s,&p,&q); p.present_ok=true; p.present_opcode=99;
+    gl_review_pending(&b,&s,&p,&q); x11_private(&p)->present_ok=true; x11_private(&p)->present_opcode=99;
     plat_callbacks callbacks={.ud=&b,.on_present_complete=gl_review_platform_complete};
     b.active=false;
     /* Startup swaps must not create renderer-frame T6 records. */
@@ -965,7 +971,7 @@ static int gl_review_trace_test(void)
         GL_CHECK(native!=NULL); gl_review_dispatch(&p,&callbacks,native); free(native);
     }
     for (uint32_t id=1;id<=4;id++) {
-        gl_review_pending(&b,&s,&p,&q); p.present_ok=true; p.present_opcode=99;
+        gl_review_pending(&b,&s,&p,&q); x11_private(&p)->present_ok=true; x11_private(&p)->present_opcode=99;
         b.active_frame=id; b.config.hooks=(render_hooks){render_trace_device_done,render_trace_present_complete,NULL};
         s.pending_serial=id+3; q.next=0;
         q.events[0]=(xcb_present_complete_notify_event_t){.response_type=XCB_GE_GENERIC,.extension=99,
@@ -995,9 +1001,9 @@ static void gl_review_native_event(void *user,const plat_event *event)
 static int gl_review_window_size(void *user,uint32_t width,uint32_t height)
 {
     gl_driver *d=user; uint32_t values[2]={width,height};
-    xcb_void_cookie_t cookie=xcb_configure_window_checked(d->platform.conn,d->platform.win,
+    xcb_void_cookie_t cookie=xcb_configure_window_checked(plat_native_x11(&d->platform).connection,plat_native_x11(&d->platform).window,
         XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
-    xcb_generic_error_t *error=xcb_request_check(d->platform.conn,cookie);
+    xcb_generic_error_t *error=xcb_request_check(plat_native_x11(&d->platform).connection,cookie);
     GL_CHECK(error==NULL);
     plat_callbacks callbacks={0};
     uint64_t deadline=trace_now_ns()+UINT64_C(1000000000);
@@ -1020,8 +1026,8 @@ static int gl_review_native_pixels(void *user,uint32_t *pixels,size_t capacity)
 {
     gl_driver *d=user; plat *p=&d->platform;
     GL_CHECK((size_t)p->width*p->height<=capacity);
-    xcb_get_image_reply_t *reply=xcb_get_image_reply(p->conn,xcb_get_image(p->conn,
-        XCB_IMAGE_FORMAT_Z_PIXMAP,p->win,0,0,(uint16_t)p->width,(uint16_t)p->height,UINT32_MAX),NULL);
+    xcb_get_image_reply_t *reply=xcb_get_image_reply(plat_native_x11(p).connection,xcb_get_image(plat_native_x11(p).connection,
+        XCB_IMAGE_FORMAT_Z_PIXMAP,plat_native_x11(p).window,0,0,(uint16_t)p->width,(uint16_t)p->height,UINT32_MAX),NULL);
     GL_CHECK(reply!=NULL && reply->depth==32);
     int bytes=xcb_get_image_data_length(reply);
     GL_CHECK(bytes>=0 && (size_t)bytes>=(size_t)p->width*p->height*4);
@@ -1035,13 +1041,13 @@ static int gl_review_native_close(void *user,bool destroy)
 {
     gl_driver *d=user; plat *p=&d->platform;
     if (destroy) {
-        xcb_generic_error_t *error=xcb_request_check(p->conn,xcb_destroy_window_checked(p->conn,p->win));
+        xcb_generic_error_t *error=xcb_request_check(plat_native_x11(p).connection,xcb_destroy_window_checked(plat_native_x11(p).connection,plat_native_x11(p).window));
         GL_CHECK(error==NULL); return 0;
     }
-    xcb_client_message_event_t event={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=p->win,.type=p->wm_protocols};
-    event.data.data32[0]=p->wm_delete;
-    (void)xcb_send_event(p->conn,0,p->win,XCB_EVENT_MASK_NO_EVENT,(const char *)&event);
-    (void)xcb_flush(p->conn);
+    xcb_client_message_event_t event={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=plat_native_x11(p).window,.type=x11_private(p)->wm_protocols};
+    event.data.data32[0]=x11_private(p)->wm_delete;
+    (void)xcb_send_event(plat_native_x11(p).connection,0,plat_native_x11(p).window,XCB_EVENT_MASK_NO_EVENT,(const char *)&event);
+    (void)xcb_flush(plat_native_x11(p).connection);
     bool closed=false; plat_callbacks callbacks={.ud=&closed,.on_event=gl_review_native_event};
     uint64_t deadline=trace_now_ns()+UINT64_C(1000000000);
     while (!closed && trace_now_ns()<deadline) GL_CHECK(plat_run_for(p,&callbacks,1)==PLAT_OK);

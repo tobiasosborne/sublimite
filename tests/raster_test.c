@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* Raster kernels and live conformance. The unchanged render suite is scoped
  * by this driver to count each ingress-through-submit window (P2.0 addendum).
  * Present/completion and libxcb reply allocations are outside that window. */
@@ -265,7 +266,7 @@ static bool g_up;
 int render_test_prepare(render_backend *b, render_config *cfg)
 {
     if (!g_up) {
-        plat_config pc = {"raster_test", 64, 128, false, -1, 0};
+        plat_config pc = {"raster_test", 64, 128, false, NULL, 0};
         if (plat_init(&g_plat, &pc) != PLAT_OK) return RENDER_ERR_INIT;
         if (work_pool_init(&g_pool, 1, 4) != 0) { plat_shutdown(&g_plat); return RENDER_ERR_INIT; }
         plat_map(&g_plat);
@@ -293,9 +294,9 @@ static void noop_ev(void *ud, const plat_event *e) { (void)ud; (void)e; }
 static int compare_window(const render_config *cfg, const render_cell *cells,
                           const render_glyph *glyph, const render_atlas_page *page)
 {
-    xcb_connection_t *c = g_plat.conn;
+    xcb_connection_t *c = plat_native_x11(&g_plat).connection;
     xcb_get_image_reply_t *im = xcb_get_image_reply(c,
-        xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, g_plat.win, 0, 0, 32, 96, ~0u), NULL);
+        xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, plat_native_x11(&g_plat).window, 0, 0, 32, 96, ~0u), NULL);
     T(im != NULL);
     T(xcb_get_image_data_length(im) >= 32 * 96 * 4);
     const uint32_t *got = (const uint32_t *)xcb_get_image_data(im);
@@ -562,8 +563,8 @@ static int raster_native_window(void *user, uint32_t width, uint32_t height)
 {
     raster_native_size *size=user; *size=(raster_native_size){width,height};
     uint32_t values[]={width,height};
-    xcb_configure_window(g_plat.conn,g_plat.win,XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
-    xcb_get_geometry_reply_t *reply=xcb_get_geometry_reply(g_plat.conn,xcb_get_geometry(g_plat.conn,g_plat.win),NULL);
+    xcb_configure_window(plat_native_x11(&g_plat).connection,plat_native_x11(&g_plat).window,XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
+    xcb_get_geometry_reply_t *reply=xcb_get_geometry_reply(plat_native_x11(&g_plat).connection,xcb_get_geometry(plat_native_x11(&g_plat).connection,plat_native_x11(&g_plat).window),NULL);
     T(reply && reply->width==width && reply->height==height); free(reply);
     /* edit-u82: mirror the confirmed native geometry before submit, as the
      * production ConfigureNotify dispatcher does. */
@@ -587,8 +588,8 @@ static int raster_native_pixels(void *user, uint32_t *pixels, size_t capacity)
 {
     raster_native_size *size=user;
     T((size_t)size->width*size->height<=capacity);
-    xcb_get_image_reply_t *reply=xcb_get_image_reply(g_plat.conn,
-        xcb_get_image(g_plat.conn,XCB_IMAGE_FORMAT_Z_PIXMAP,g_plat.win,0,0,
+    xcb_get_image_reply_t *reply=xcb_get_image_reply(plat_native_x11(&g_plat).connection,
+        xcb_get_image(plat_native_x11(&g_plat).connection,XCB_IMAGE_FORMAT_Z_PIXMAP,plat_native_x11(&g_plat).window,0,0,
             (uint16_t)size->width,(uint16_t)size->height,~0u),NULL);
     T(reply && (size_t)xcb_get_image_data_length(reply)>=(size_t)size->width*size->height*4u);
     memcpy(pixels,xcb_get_image_data(reply),(size_t)size->width*size->height*4u); free(reply);
@@ -632,7 +633,7 @@ int main(int argc, char **argv)
     if (kernel_random_test() || blend_exact_test() || partition_test()) return 1;
     printf("raster_test: kernels PASS (SSE2 == scalar on 4000 random grids, 10240 blends, partitions)\n");
     plat probe;
-    plat_config pc = {"probe", 16, 16, false, -1, 0};
+    plat_config pc = {"probe", 16, 16, false, NULL, 0};
     if (getenv("DISPLAY") == NULL || plat_init(&probe, &pc) != PLAT_OK) {
         printf("raster_test: SKIP live X11 (no DISPLAY / cannot connect)\n");
         return 0;
@@ -1221,18 +1222,18 @@ static int review_diagnostics(void)
 static int review_visual(void)
 {
     review_fake = false;
-    plat pl; plat_config pc = {"P2.5b visual",16,16,false,-1,0};
+    plat pl; plat_config pc = {"P2.5b visual",16,16,false, NULL,0};
     T(plat_init(&pl, &pc) == PLAT_OK);
     work_pool pool; T(work_pool_init(&pool,1,1) == 0);
     render_config cfg = {.dims={1,1,1,1},.max_width=1,.max_height=1,.max_cells=1,
         .platform=&pl,.workers=&pool};
     render_backend b = {0}; T(render_cpu_backend(&b) == RENDER_OK);
     void *state = aligned_alloc(64, (b.info.state_size + 63u) & ~(size_t)63u); T(state);
-    uint32_t visual = pl.visual;
-    pl.visual = UINT32_MAX; /* nonexistent visual: must not accept RGB packing */
+    uint32_t visual = plat_native_x11(&pl).visual;
+    x11_private(&pl)->visual = UINT32_MAX; /* nonexistent visual: must not accept RGB packing */
     int rc = init_on_worker(&b,&cfg,state,b.info.state_size);
     if (rc == RENDER_OK) render_backend_shutdown(&b);
-    pl.visual = visual;
+    x11_private(&pl)->visual = visual;
     free(state); work_pool_shutdown(&pool); plat_shutdown(&pl);
     T(rc == RENDER_ERR_UNSUPPORTED);
     struct {xcb_setup_t setup; xcb_screen_t screen; xcb_depth_t depth; xcb_visualtype_t visual;} fixture_x = {0};

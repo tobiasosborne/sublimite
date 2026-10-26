@@ -215,7 +215,7 @@ static void file_test_viewport(file_test_context *test)
     }
     if (v) {
         render_backend_shutdown(&v->backend); free(v->state);
-        if (v->platform.conn) plat_shutdown(&v->platform);
+        if (plat_native_x11(&v->platform).connection) plat_shutdown(&v->platform);
         free(v);
     }
     work_pool_shutdown(&pool);

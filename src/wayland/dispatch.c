@@ -1,5 +1,6 @@
 #include "wayland/private.h"
 #include <string.h>
+#include "x11/private.h"
 
 const char *wayland_display_select(const char *display, const char *safe, const char *allow)
 {
@@ -90,4 +91,18 @@ const uint8_t * plat_clip_data(const plat *p, size_t *len)
 {
     if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_clip_data(p, len); }
     return x11_plat_clip_data(p, len);
+}
+
+plat_x11_native plat_native_x11(const plat *p)
+{
+    if (!p || p->backend != PLAT_BACKEND_X11 || !p->backend_state)
+        return (plat_x11_native){0};
+    const x11_plat *x = x11_private(p);
+    return (plat_x11_native){x->conn, x->win, x->visual, x->depth, x->argb};
+}
+bool plat_present_available(const plat *p)
+{
+    if (!p) return false;
+    if (p->backend == PLAT_BACKEND_WAYLAND) return wayland_present_available(p);
+    return x11_private(p) && x11_private(p)->present_ok;
 }

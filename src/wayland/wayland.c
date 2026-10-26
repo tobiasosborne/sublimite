@@ -1,5 +1,6 @@
 #include "wayland/private.h"
 #include "trace/trace.h"
+#include "os/os.h"
 #include <string.h>
 #include <unistd.h>
 #ifdef EDIT_HAVE_WAYLAND
@@ -40,6 +41,10 @@ typedef struct wayland_blob { size_t refs, len; uint8_t bytes[]; } wayland_blob;
 typedef struct wayland_tx { int fd; size_t offset; wayland_blob *blob; } wayland_tx;
 typedef struct wayland_state {
     plat *p;
+    void *conn;
+    int timer_fd, repeat_fd, work_fd;
+    bool present_ok;
+    uint32_t last_time;
     struct wl_registry *registry;
     struct wl_compositor *compositor;
     struct xdg_wm_base *shell;
@@ -83,8 +88,8 @@ typedef struct wayland_state {
     int rx_fd; wayland_tx tx[WL_CLIP_SENDS];
     uint32_t blink_ms;
 } wayland_state;
-static wayland_state *W(const plat *p) { return p ? p->wayland : NULL; }
-static struct wl_display *D(const plat *p) { return p->conn; }
+static wayland_state *W(const plat *p) { return p ? p->backend_state : NULL; }
+static struct wl_display *D(const plat *p) { return W(p)->conn; }
 static void push(wayland_state *s, plat_event ev)
 {
     if (s->count == WL_EVENT_CAP) { s->dropped++; return; }
@@ -120,7 +125,7 @@ void wayland_plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz)
     s->delay_ms = delay_ms;
     /* At most one repeat per millisecond: same clamp as X11_REPEAT_MAX_HZ. */
     s->rate_hz = rate_hz > 1000u ? 1000u : rate_hz;
-    if (s->repeat_key) timer_arm(p->repeat_fd, delay_ms, s->rate_hz);
+    if (s->repeat_key) timer_arm(W(p)->repeat_fd, delay_ms, s->rate_hz);
 }
 void wayland_plat_set_blink(plat *p, uint32_t ms)
 {
@@ -132,12 +137,12 @@ void wayland_plat_set_blink(plat *p, uint32_t ms)
         it.it_value.tv_nsec = (long)(ms % 1000u) * 1000000L;
         it.it_interval = it.it_value;
     }
-    (void)timerfd_settime(p->timer_fd, 0, &it, NULL);
+    (void)timerfd_settime(W(p)->timer_fd, 0, &it, NULL);
 }
 static void focus(wayland_state *s, bool focused)
 {
     s->p->focused = focused; s->repeat_key = 0;
-    timer_arm(s->p->repeat_fd, 0, 0);
+    timer_arm(W(s->p)->repeat_fd, 0, 0);
     if (!focused && s->keys) {
         (void)xkb_state_update_mask(s->keys, 0, 0, 0, 0, 0, 0); s->mods = 0;
         if (s->compose) xkb_compose_state_reset(s->compose);
@@ -189,7 +194,7 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
     if (!keys) { xkb_keymap_unref(keymap); s->failed = true; return; }
     xkb_state_unref(s->keys); xkb_keymap_unref(s->keymap);
     s->keys = keys; s->keymap = keymap; s->repeat_key = 0; s->mods = 0;
-    timer_arm(s->p->repeat_fd, 0, 0);
+    timer_arm(W(s->p)->repeat_fd, 0, 0);
     if (s->compose) xkb_compose_state_reset(s->compose);
     push(s, (plat_event){.kind = PLAT_EV_KEYMAP});
 }
@@ -244,13 +249,13 @@ bool wayland_input_key(plat *p, uint32_t key, uint32_t time, bool press, bool re
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
 {
-    (void)keyboard; wayland_state *s = data; s->serial = serial; s->p->last_time = time;
+    (void)keyboard; wayland_state *s = data; s->serial = serial; s->last_time = time;
     bool press = state == WL_KEYBOARD_KEY_STATE_PRESSED;
     bool emitted = wayland_input_key(s->p, key, time, press, false);
     if (press && emitted && s->keymap && key <= UINT32_MAX - 8u && xkb_keymap_key_repeats(s->keymap, key + 8u)) {
-        s->repeat_key = key + 8u; timer_arm(s->p->repeat_fd, s->delay_ms, s->rate_hz);
+        s->repeat_key = key + 8u; timer_arm(W(s->p)->repeat_fd, s->delay_ms, s->rate_hz);
     } else if (!press && key <= UINT32_MAX - 8u && s->repeat_key == key + 8u) {
-        s->repeat_key = 0; timer_arm(s->p->repeat_fd, 0, 0);
+        s->repeat_key = 0; timer_arm(W(s->p)->repeat_fd, 0, 0);
     }
 }
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
@@ -432,7 +437,6 @@ static const struct wl_registry_listener registry_listener = {.global = registry
 int wayland_plat_init(plat *p, const plat_config *cfg)
 {
     memset(p, 0, sizeof *p); p->backend = PLAT_BACKEND_WAYLAND;
-    p->timer_fd = p->repeat_fd = p->work_fd = -1;
     if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
     if (cfg->headless) return PLAT_ERR_NO_DISPLAY;
     if (!cfg->width || !cfg->height || cfg->width > INT32_MAX || cfg->height > INT32_MAX) return PLAT_ERR_FAIL;
@@ -440,16 +444,18 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
     int connected = wayland_connect(&connection);
     if (connected != PLAT_OK) return connected;
     struct wl_display *display = connection;
-    p->conn = display; p->width = cfg->width; p->height = cfg->height;
-    wayland_state *s = calloc(1, sizeof *s); p->wayland = s;
-    if (!s) goto fail;
+    p->width = cfg->width; p->height = cfg->height;
+    wayland_state *s = calloc(1, sizeof *s); p->backend_state = s;
+    if (!s) { wl_display_disconnect(display); goto fail; }
+    W(p)->conn = display;
+    W(p)->timer_fd = W(p)->repeat_fd = W(p)->work_fd = -1;
     s->p = p; s->rx_fd = -1; s->scale = 1; /* (P) initial buffer scale is unity */
     for (size_t i = 0; i < WL_CLIP_SENDS; i++) s->tx[i].fd = -1;
     s->clock_id = UINT32_MAX;
-    p->work_fd = cfg->work_eventfd;
-    p->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    p->repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (p->timer_fd < 0 || p->repeat_fd < 0) goto fail;
+    W(p)->work_fd = cfg->work_wake ? os_wake_fd(cfg->work_wake) : -1;
+    W(p)->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    W(p)->repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (W(p)->timer_fd < 0 || W(p)->repeat_fd < 0) goto fail;
     s->context = xkb_context_new(XKB_CONTEXT_NO_FLAGS); if (!s->context) goto fail;
     const char *locale = setlocale(LC_CTYPE, NULL);
     s->compose_table = xkb_compose_table_new_from_locale(s->context, locale ? locale : "C", XKB_COMPOSE_COMPILE_NO_FLAGS);
@@ -481,7 +487,7 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
     while (!s->configured && !s->failed) if (wl_display_dispatch(display) < 0) goto fail;
     if (s->failed) goto fail;
     s->window = wl_egl_window_create(s->surface, (int)p->width, (int)p->height); if (!s->window) goto fail;
-    p->present_ok = s->presentation != NULL;
+    W(p)->present_ok = s->presentation != NULL;
     trace_record_at(trace_now_ns(), TRACE_T2_MUTATION_DONE, 0);
     return PLAT_OK;
 fail:
@@ -491,6 +497,8 @@ void wayland_plat_map(plat *p)
 { if (W(p)) { (void)wl_display_flush(D(p)); trace_record_at(trace_now_ns(), TRACE_T4_PRESENT_SUBMITTED, 0); } }
 int wayland_plat_set_present_events(plat *p, bool enabled)
 { (void)enabled; return W(p) ? PLAT_OK : PLAT_ERR_FAIL; }
+void *wayland_display(const plat *p) { return W(p) ? W(p)->conn : NULL; }
+bool wayland_present_available(const plat *p) { return W(p) && W(p)->present_ok; }
 void *wayland_egl_window(const plat *p) { return W(p) ? W(p)->window : NULL; }
 void *wayland_surface(const plat *p) { return W(p) ? W(p)->surface : NULL; }
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
@@ -695,7 +703,7 @@ int wayland_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
         int flushed = wl_display_flush(D(p));
         if (flushed < 0 && errno != EAGAIN) { wl_display_cancel_read(D(p)); return PLAT_ERR_FAIL; }
         struct pollfd fds[5u + WL_CLIP_SENDS] = {{wl_display_get_fd(D(p)), (short)(POLLIN | (flushed < 0 ? POLLOUT : 0)), 0},
-            {p->timer_fd, POLLIN, 0}, {p->repeat_fd, POLLIN, 0}, {p->work_fd, POLLIN, 0},
+            {W(p)->timer_fd, POLLIN, 0}, {W(p)->repeat_fd, POLLIN, 0}, {W(p)->work_fd, POLLIN, 0},
             {s->rx_fd, POLLIN, 0}};
         for (size_t i = 0; i < WL_CLIP_SENDS; i++) fds[5u + i] = (struct pollfd){s->tx[i].fd, POLLOUT, 0};
         int wait_ms = -1;
@@ -719,10 +727,10 @@ int wayland_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
         for (size_t i = 0; i < WL_CLIP_SENDS; i++)
             if (fds[5u + i].revents & (POLLOUT | POLLHUP | POLLERR)) clip_send(s, &s->tx[i]);
         uint64_t ticks;
-        if ((fds[2].revents & POLLIN) && read(p->repeat_fd, &ticks, sizeof ticks) > 0 && s->repeat_key)
+        if ((fds[2].revents & POLLIN) && read(W(p)->repeat_fd, &ticks, sizeof ticks) > 0 && s->repeat_key)
             wayland_input_key(s->p, s->repeat_key - 8u, 0, true, true); /* coalesce missed repeats, never burst */
         deliver(s, cb); if (p->quit) break;
-        if ((fds[1].revents & POLLIN) && read(p->timer_fd, &ticks, sizeof ticks) > 0 && p->focused && cb->on_blink) cb->on_blink(cb->ud);
+        if ((fds[1].revents & POLLIN) && read(W(p)->timer_fd, &ticks, sizeof ticks) > 0 && p->focused && cb->on_blink) cb->on_blink(cb->ud);
         if (!p->quit && (fds[3].revents & POLLIN) && cb->on_work) cb->on_work(cb->ud);
     }
     return PLAT_OK;
@@ -752,20 +760,20 @@ void wayland_plat_shutdown(plat *p)
         if (s->registry) wl_registry_destroy(s->registry);
         xkb_compose_state_unref(s->compose); xkb_compose_table_unref(s->compose_table);
         xkb_state_unref(s->keys); xkb_keymap_unref(s->keymap); xkb_context_unref(s->context);
-        blob_unref(s, s->owned); free(s->received); free(s->incoming); free(s);
+        blob_unref(s, s->owned); free(s->received); free(s->incoming);
     }
-    if (p->timer_fd >= 0) close(p->timer_fd);
-    if (p->repeat_fd >= 0) close(p->repeat_fd);
-    if (p->conn) wl_display_disconnect(D(p));
+    if (s && W(p)->timer_fd >= 0) close(W(p)->timer_fd);
+    if (s && W(p)->repeat_fd >= 0) close(W(p)->repeat_fd);
+    if (s && W(p)->conn) wl_display_disconnect(D(p));
+    free(s);
     memset(p, 0, sizeof *p); p->backend = PLAT_BACKEND_WAYLAND;
-    p->timer_fd = p->repeat_fd = p->work_fd = -1;
 }
 #else
 uint64_t wayland_input_dropped(const plat *p) { (void)p; return 0; }
 bool wayland_input_key(plat *p, uint32_t key, uint32_t time, bool press, bool repeat)
 { (void)p; (void)key; (void)time; (void)press; (void)repeat; return false; }
 int wayland_plat_init(plat *p, const plat_config *cfg)
-{ (void)cfg; memset(p, 0, sizeof *p); p->backend = PLAT_BACKEND_WAYLAND; p->timer_fd = p->repeat_fd = p->work_fd = -1; return PLAT_ERR_NO_DISPLAY; }
+{ (void)cfg; memset(p, 0, sizeof *p); p->backend = PLAT_BACKEND_WAYLAND; return PLAT_ERR_NO_DISPLAY; }
 void wayland_plat_shutdown(plat *p) { (void)p; }
 void wayland_plat_map(plat *p) { (void)p; }
 void wayland_plat_set_blink(plat *p, uint32_t ms) { (void)p; (void)ms; }
@@ -777,6 +785,8 @@ int wayland_plat_run(plat *p, const plat_callbacks *cb) { return wayland_plat_ru
 int wayland_plat_clip_set(plat *p, int which, const void *utf8, size_t len) { (void)p; (void)which; (void)utf8; (void)len; return PLAT_ERR_FAIL; }
 int wayland_plat_clip_request(plat *p, int which) { (void)p; (void)which; return PLAT_ERR_FAIL; }
 const uint8_t *wayland_plat_clip_data(const plat *p, size_t *len) { (void)p; if (len) *len = 0; return NULL; }
+void *wayland_display(const plat *p) { (void)p; return NULL; }
+bool wayland_present_available(const plat *p) { (void)p; return false; }
 void *wayland_egl_window(const plat *p) { (void)p; return NULL; }
 void *wayland_surface(const plat *p) { (void)p; return NULL; }
 int wayland_frame_arm(plat *p, uint32_t id) { (void)p; (void)id; return PLAT_ERR_FAIL; }

@@ -327,6 +327,7 @@ struct editor {
     uint64_t file_command_owner, file_command_generation;
     editor_wait waits[IPC_MAX_CLIENTS];
     int poll_fd;
+    os_wake poll_wake; /* borrowed epoll readiness view; never signal/drain/close */
     file *opening;
     int open_error;
     view v;

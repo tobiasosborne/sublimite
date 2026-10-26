@@ -109,7 +109,7 @@ static int prewake_setup(prewake_fixture *f)
     f->page=(render_atlas_page){a->pixels,a->pixels_len,(size_t)dims.cell_w*95,dims.cell_w*95,dims.cell_h};
     f->grid.pages=&f->page; f->grid.page_count=1; f->grid.glyphs=f->glyphs; f->grid.glyph_count=95;
     f->config=(render_config){.dims=dims,.max_width=2880,.max_height=1800,.max_cells=count,.max_glyphs=95,.max_pages=1,.max_atlas_bytes=a->pixels_len};
-    plat_config pc={.title="P3.7 prewake TRACK",.width=dims.cols*dims.cell_w,.height=dims.rows*dims.cell_h,.work_eventfd=-1};
+    plat_config pc={.title="P3.7 prewake TRACK",.width=dims.cols*dims.cell_w,.height=dims.rows*dims.cell_h,.work_wake = NULL};
     REQUIRE(plat_init(&f->platform,&pc)==0);
     plat_map(&f->platform); plat_set_blink(&f->platform,0); plat_set_repeat(&f->platform,0,0);
     pthread_t worker;

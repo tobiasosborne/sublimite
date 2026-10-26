@@ -12,8 +12,8 @@ static xcb_atom_t intern(xcb_connection_t *c, const char *name)
 }
 static int property(plat *p, xcb_atom_t key, xcb_atom_t type, const char *want, size_t len)
 {
-    xcb_get_property_reply_t *r = xcb_get_property_reply(p->conn,
-        xcb_get_property(p->conn, 0, p->win, key, XCB_GET_PROPERTY_TYPE_ANY, 0, 64), NULL);
+    xcb_get_property_reply_t *r = xcb_get_property_reply(plat_native_x11(p).connection,
+        xcb_get_property(plat_native_x11(p).connection, 0, plat_native_x11(p).window, key, XCB_GET_PROPERTY_TYPE_ANY, 0, 64), NULL);
     T(r != NULL && r->type == type && r->format == 8);
     T(xcb_get_property_value_length(r) == (int)len);
     T(memcmp(xcb_get_property_value(r), want, len) == 0); free(r); return 0;
@@ -24,12 +24,12 @@ int main(void)
      * accept whichever private display it left (:99 under make check). */
     const char *display = getenv("DISPLAY");
     T(display != NULL && display[0] != '\0' && !edit_display_is_real(display));
-    plat p; plat_config cfg = {NULL, 100, 100, false, -1, 0};
+    plat p; plat_config cfg = {NULL, 100, 100, false, NULL, 0};
     T(plat_init(&p, &cfg) == PLAT_OK);
     static const char cls[] = "sublimite\0sublimite";
     int failed = 0;
     failed |= property(&p, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, cls, sizeof cls);
-    failed |= property(&p, intern(p.conn, "_NET_WM_NAME"), intern(p.conn, "UTF8_STRING"), "sublimité", strlen("sublimité"));
+    failed |= property(&p, intern(plat_native_x11(&p).connection, "_NET_WM_NAME"), intern(plat_native_x11(&p).connection, "UTF8_STRING"), "sublimité", strlen("sublimité"));
     failed |= property(&p, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, "sublimite", 9);
     plat_shutdown(&p); T(failed == 0);
     printf("x11_identity_test: WM_CLASS, UTF8_STRING _NET_WM_NAME and WM_NAME readback passed on %s\n", display);

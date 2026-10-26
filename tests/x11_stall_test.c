@@ -1,7 +1,9 @@
+#include "x11/private.h"
 /* P2.2c: reply waits can consume the fd while leaving events in XCB's queue.
  * The peer grabs the server to order injected events before the awaited reply.
  * Unmapped window, disabled timers and a bounded run avoid incidental wakeups. */
 #include "x11/plat.h"
+#include "os/os.h"
 #include "x11_xvfb.h"
 #include "trace/trace.h"
 #include <xcb/xcb.h>
@@ -53,9 +55,9 @@ static void send_key(fixture *f, uint8_t code, bool press) {
     memset(&e, 0, sizeof e);
     e.response_type = press ? XCB_KEY_PRESS : XCB_KEY_RELEASE;
     e.detail = code;
-    e.event = f->p.win;
+    e.event = plat_native_x11(&f->p).window;
     e.same_screen = 1;
-    xcb_send_event(f->peer, 0, f->p.win,
+    xcb_send_event(f->peer, 0, plat_native_x11(&f->p).window,
                    press ? XCB_EVENT_MASK_KEY_PRESS : XCB_EVENT_MASK_KEY_RELEASE,
                    (const char *)&e);
 }
@@ -79,10 +81,10 @@ static void *inject(void *ud) {
     memset(&e, 0, sizeof e);
     e.response_type = XCB_CLIENT_MESSAGE;
     e.format = 32;
-    e.window = f->p.win;
-    e.type = f->p.wm_protocols;
-    e.data.data32[0] = f->p.wm_delete;
-    xcb_send_event(f->peer, 0, f->p.win, 0, (const char *)&e);
+    e.window = plat_native_x11(&f->p).window;
+    e.type = x11_private(&f->p)->wm_protocols;
+    e.data.data32[0] = x11_private(&f->p)->wm_delete;
+    xcb_send_event(f->peer, 0, plat_native_x11(&f->p).window, 0, (const char *)&e);
     /* Force all injected events to be written before releasing the first
      * connection's query. No peer requests or fd activity follow this. */
     (void)barrier(f->peer);
@@ -112,7 +114,7 @@ static void wait_in_callback(fixture *f) {
         pthread_join(thread, NULL);
         return;
     }
-    xcb_connection_t *c = f->p.conn;
+    xcb_connection_t *c = plat_native_x11(&f->p).connection;
     if (f->mode == CLIP_SET) {
         /* The server is still grabbed. A synchronous ownership query would
          * block until the peer's bounded command wait expires and ungrabs. */
@@ -162,7 +164,7 @@ static void on_blink(void *ud) {
 static void on_work(void *ud) {
     fixture *f = ud;
     uint64_t count;
-    if (read(f->p.work_fd, &count, sizeof count) != (ssize_t)sizeof count) f->failed = true;
+    if (read(x11_private(&f->p)->work_fd, &count, sizeof count) != (ssize_t)sizeof count) f->failed = true;
     wait_in_callback(f);
 }
 
@@ -179,10 +181,11 @@ static int run_case(trigger mode, const char *name, const char *power) {
     fixture f;
     memset(&f, 0, sizeof f);
     f.mode = mode;
-    plat_config cfg = { "x11 stall", 100, 100, false, -1, 0 };
+    plat_config cfg = { "x11 stall", 100, 100, false, NULL, 0 };
+    os_wake work_wake;
     if (mode == WORK_REPLY) {
-        cfg.work_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (cfg.work_eventfd < 0) return 1;
+        if (os_wake_init(&work_wake) != OS_OK) return 1;
+        cfg.work_wake = &work_wake;
     }
     if (plat_init(&f.p, &cfg) != PLAT_OK) {
         fprintf(stderr, "FAIL: live display initialization\n");
@@ -194,18 +197,18 @@ static int run_case(trigger mode, const char *name, const char *power) {
     /* Drain setup events and synchronize creation before starting the fixture. */
     plat_callbacks cb = { &f, on_event, on_blink, on_work, NULL };
     plat_run_for(&f.p, &cb, 5);
-    if (!barrier(f.p.conn)) return 1;
+    if (!barrier(plat_native_x11(&f.p).connection)) return 1;
     if (mode == PREQUEUED_REPLY) wait_in_callback(&f);
     else if (mode == WORK_REPLY) {
         uint64_t count = 1;
-        if (write(f.p.work_fd, &count, sizeof count) != (ssize_t)sizeof count) f.failed = true;
+        if (write(x11_private(&f.p)->work_fd, &count, sizeof count) != (ssize_t)sizeof count) f.failed = true;
     } else if (mode == BLINK_REPLY) {
         f.p.focused = true;
         plat_set_blink(&f.p, 1);
     } else {
         if (mode == DIRECT_REPLY) {
-            xcb_expose_event_t e = { .response_type = XCB_EXPOSE, .window = f.p.win };
-            xcb_send_event(f.peer, 0, f.p.win, XCB_EVENT_MASK_EXPOSURE, (const char *)&e);
+            xcb_expose_event_t e = { .response_type = XCB_EXPOSE, .window = plat_native_x11(&f.p).window };
+            xcb_send_event(f.peer, 0, plat_native_x11(&f.p).window, XCB_EVENT_MASK_EXPOSURE, (const char *)&e);
         } else send_key(&f, 24, true);
         xcb_flush(f.peer);
     }
@@ -222,7 +225,7 @@ static int run_case(trigger mode, const char *name, const char *power) {
     close(f.command[0]); close(f.command[1]); close(f.ready[0]); close(f.ready[1]);
     xcb_disconnect(f.peer);
     plat_shutdown(&f.p);
-    if (cfg.work_eventfd >= 0) close(cfg.work_eventfd);
+    if (cfg.work_wake) os_wake_close(&work_wake);
     return ok ? 0 : 1;
 }
 

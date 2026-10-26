@@ -1,3 +1,4 @@
+#include "x11/private.h"
 /* libFuzzer: arbitrary bytes into the X-server-free input decoders (P2.2): core key/button events, XI2 generic
  * events (wire and xcb layout), QueryDevice replies, and a repeat/clock schedule. Must never crash or trip ASan/UBSan. */
 #include "x11/input.h"
@@ -215,6 +216,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
 typedef struct clip_peer {
     plat p;
+    x11_plat native;
     x11_input queue;
     xcb_connection_t *raw;
     xcb_window_t win;
@@ -335,10 +337,10 @@ static void clip_app_step(clip_peer *h, int which, const uint8_t *want, size_t l
 static void clip_finish(clip_peer *h, int which, const uint8_t *want, size_t len, bool failure, unsigned count) {
     uint64_t end = trace_now_ns() + UINT64_C(2000000000);
     while (h->completed < count && trace_now_ns() < end) {
-        xcb_flush(h->p.conn); xcb_flush(h->raw);
+        xcb_flush(x11_private(&h->p)->conn); xcb_flush(h->raw);
         clip_raw_step(h); clip_app_step(h, which, want, len, failure);
         if (h->completed < count) {
-            struct pollfd fds[2] = { { xcb_get_file_descriptor(h->p.conn), POLLIN, 0 },
+            struct pollfd fds[2] = { { xcb_get_file_descriptor(x11_private(&h->p)->conn), POLLIN, 0 },
                                     { xcb_get_file_descriptor(h->raw), POLLIN, 0 } };
             (void)poll(fds, 2, 1);
         }
@@ -348,7 +350,7 @@ static void clip_finish(clip_peer *h, int which, const uint8_t *want, size_t len
      * Settle that traffic before the next accepted request, while checking
      * every queued completion against the same model. */
     for (unsigned i = 0; i < 16; i++) {
-        clip_barrier(h->raw); clip_barrier(h->p.conn);
+        clip_barrier(h->raw); clip_barrier(x11_private(&h->p)->conn);
         clip_raw_step(h); xcb_flush(h->raw);
         clip_app_step(h, which, want, len, failure);
         clip_assert(h->completed == count, "no duplicate completion");
@@ -363,12 +365,12 @@ static void fuzz_clip_sequences(const uint8_t *data, size_t size) {
         clip_assert(xvfb_start() != 0, "private Xvfb required in live mode");
         trace_init(); trace_thread_register(); started = true;
     }
-    clip_peer h; memset(&h, 0, sizeof h);
-    h.p.conn = xcb_connect(NULL, NULL); h.raw = xcb_connect(NULL, NULL);
-    clip_assert(!xcb_connection_has_error(h.p.conn) && !xcb_connection_has_error(h.raw), "private connections");
-    h.p.win = clip_window(h.p.conn); h.win = clip_window(h.raw);
-    h.p.in = &h.queue;
-    h.p.timer_fd = h.p.repeat_fd = h.p.work_fd = -1;
+    clip_peer h; memset(&h, 0, sizeof h); h.p.backend_state = &h.native;
+    x11_private(&h.p)->conn = xcb_connect(NULL, NULL); h.raw = xcb_connect(NULL, NULL);
+    clip_assert(!xcb_connection_has_error(x11_private(&h.p)->conn) && !xcb_connection_has_error(h.raw), "private connections");
+    x11_private(&h.p)->win = clip_window(x11_private(&h.p)->conn); h.win = clip_window(h.raw);
+    x11_private(&h.p)->in = &h.queue;
+    x11_private(&h.p)->timer_fd = x11_private(&h.p)->repeat_fd = x11_private(&h.p)->work_fd = -1;
     clip_assert(x11_clip_init(&h.p) == PLAT_OK, "clipboard initialization");
     x11_clip_set_limits(&h.p, 4, 250, UINT32_MAX);
     h.clipboard = clip_atom(h.raw, "CLIPBOARD"); h.primary = XCB_ATOM_PRIMARY;
@@ -391,17 +393,17 @@ static void fuzz_clip_sequences(const uint8_t *data, size_t size) {
             continue;
         }
         if (h.mode == 5) {
-            h.p.last_time = clip_server_time(&h);
+            x11_private(&h.p)->last_time = clip_server_time(&h);
             clip_assert(plat_clip_set(&h.p, which, "old", 3) == PLAT_OK, "racing claim");
-            clip_barrier(h.p.conn); /* server accepted claim; confirmation still pending */
+            clip_barrier(x11_private(&h.p)->conn); /* server accepted claim; confirmation still pending */
             clip_assert(plat_clip_request(&h.p, which) == PLAT_OK, "request behind racing confirmation");
         }
         xcb_set_selection_owner(h.raw, h.win, selection, XCB_CURRENT_TIME);
         clip_barrier(h.raw);
         if (h.mode == 5) {
-            clip_barrier(h.p.conn);
+            clip_barrier(x11_private(&h.p)->conn);
             clip_finish(&h, which, h.bytes, h.len, false, 1);
-            h.p.last_time = 0;
+            x11_private(&h.p)->last_time = 0;
             continue;
         }
         /* Finish ownership loss before asking the raw owner. */
@@ -416,5 +418,5 @@ static void fuzz_clip_sequences(const uint8_t *data, size_t size) {
     }
     x11_clip_destroy(&h.p);
     clip_assert(x11_clip_mem(&h.p) == 0, "destroy releases clipboard memory");
-    xcb_disconnect(h.p.conn); xcb_disconnect(h.raw);
+    xcb_disconnect(x11_private(&h.p)->conn); xcb_disconnect(h.raw);
 }
