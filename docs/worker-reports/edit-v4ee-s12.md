@@ -331,3 +331,14 @@ behavioral edits are described above.
 - `tools/keysymgen.py`
 - `vendor/README.md`
 - `vendor/xkbcommon/xkbcommon-keysyms.h`
+
+## Coordinator verification (session 22)
+
+The worker's Codex session ended with `ERROR: Selected model is at capacity` while its unrestricted full check waited on the :99 display lock. The coordinator ran the full verification on :95, LeakSanitizer on, all (M)[AC, desktop Spiral]:
+
+```
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:95 make -j64 check   → exit 0, 104 suites, 09:16:11 → 09:28:42, load1 0.82 at start
+```
+
+Acceptance grep: no `<xcb/`, `<X11/` or `<xkbcommon/xkbcommon.h>` include in `.c`/`.h` outside src/x11, src/wayland, src/raster; `src/gl/renderer.inc` keeps its xcb includes under the coordinator's waiver (decision doc).
