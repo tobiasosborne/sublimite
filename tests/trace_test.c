@@ -7,7 +7,7 @@
 #include "../src/trace/trace_fmt.h"
 #include "base/base.h"
 
-#include <pthread.h>
+#include "os/os.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -31,7 +31,7 @@ static int g_fail;
  * T5 = T0 + 2f*1000, T6 = T0 + 3f*1000. Known percentiles over f = 1..100:
  * G1 (T4-T0) p50 50000 p99 99000; G3 (T5-T0) p50 100000 p99 198000;
  * T6-T0 p50 150000 p99 297000. */
-static void *thread_a(void *arg) {
+static void thread_a(void *arg) {
     (void)arg;
     trace_thread_register();
     for (uint32_t f = 1; f <= NFRAMES; f++) {
@@ -39,10 +39,10 @@ static void *thread_a(void *arg) {
         trace_record_at(t0, TRACE_T0_INGRESS, f);
         trace_record_at(t0 + (uint64_t)f * 2000u, TRACE_T5_DEVICE_DONE, f);
     }
-    return NULL;
+    return;
 }
 
-static void *thread_b(void *arg) {
+static void thread_b(void *arg) {
     (void)arg;
     trace_thread_register();
     for (uint32_t f = 1; f <= NFRAMES; f++) {
@@ -50,7 +50,7 @@ static void *thread_b(void *arg) {
         trace_record_at(t0 + (uint64_t)f * 1000u, TRACE_T4_PRESENT_SUBMITTED, f);
         trace_record_at(t0 + (uint64_t)f * 3000u, TRACE_T6_PRESENT_COMPLETE, f);
     }
-    return NULL;
+    return;
 }
 
 static void check_gate(const trace_rec *recs, size_t n, enum trace_ev from, enum trace_ev to,
@@ -107,8 +107,15 @@ static size_t dump_to_bytes(unsigned char *buf, size_t cap) {
     return got == (size_t)len ? got : 0;
 }
 
+static FILE *input_bytes(const void *buf, size_t n) {
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    if (fwrite(buf, 1, n, f) != n) { fclose(f); return NULL; }
+    rewind(f); return f;
+}
+
 static int load_bytes(const unsigned char *buf, size_t n, trace_loaded *d) {
-    FILE *f = fmemopen((void *)buf, n, "rb");
+    FILE *f = input_bytes(buf, n);
     int rc;
     if (f == NULL) return -1;
     rc = trace_fmt_load_dump(f, d);
@@ -225,7 +232,7 @@ static void test_legacy_v1_loads(void) {
     trace_fmt_dump_free(&d);
     /* And the legacy loader entry point still works on it. */
     {
-        FILE *f = fmemopen(buf, off, "rb");
+        FILE *f = input_bytes(buf, off);
         trace_rec *r = NULL;
         size_t nr = 0;
         CHECK(f != NULL && trace_fmt_load(f, &r, &nr) == 0 && nr == 2, "trace_fmt_load legacy");
@@ -313,16 +320,16 @@ static void test_no_malloc(void) {
 }
 
 int main(void) {
-    pthread_t a, b;
+    os_thread a, b;
     FILE *f;
     trace_rec *recs = NULL;
     size_t n = 0;
 
     trace_init();
-    CHECK(pthread_create(&a, NULL, thread_a, NULL) == 0, "create a");
-    CHECK(pthread_create(&b, NULL, thread_b, NULL) == 0, "create b");
-    pthread_join(a, NULL);
-    pthread_join(b, NULL);
+    CHECK(os_thread_start(&a, thread_a, NULL) == 0, "create a");
+    CHECK(os_thread_start(&b, thread_b, NULL) == 0, "create b");
+    os_thread_join(&a);
+    os_thread_join(&b);
 
     /* Exercise the real clock path on the main thread (not part of the gates). */
     trace_thread_register();

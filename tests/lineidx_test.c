@@ -1,3 +1,4 @@
+#include "os/os.h"
 #include "lineidx/lineidx.h"
 #include "piece/piece.h"
 #include "base/base.h"
@@ -6,11 +7,9 @@
 #include "find/find.h"
 
 #include <fcntl.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -51,7 +50,7 @@ typedef struct { const uint8_t *b; uint64_t n; size_t frag; unsigned delay_us; }
 static size_t flat_span(void *ctx, uint64_t off, const uint8_t **p)
 {
     flat *f = ctx;
-    if (f->delay_us) usleep(f->delay_us);
+    if (f->delay_us) os_sleep_ns((uint64_t)f->delay_us * 1000u);
     if (off >= f->n) return 0;
     uint64_t r = f->n - off;
     if (f->frag && r > f->frag) r = f->frag;
@@ -74,7 +73,7 @@ static size_t lease_span(void *ctx, uint64_t off, const uint8_t **p)
     if (off >= s->n) return 0;
     *p = s->b + (s->repeat ? 0 : off);
     atomic_store_explicit(&s->entered, true, memory_order_release);
-    while (!atomic_load_explicit(&s->resume, memory_order_acquire)) sched_yield();
+    while (!atomic_load_explicit(&s->resume, memory_order_acquire)) os_yield();
     uint64_t k = s->n - off;
     return (size_t)(k > LINEIDX_CHUNK ? LINEIDX_CHUNK : k);
 }
@@ -90,7 +89,7 @@ static bool lease_entered(lease *s)
 {
     for (unsigned i = 0; i < 20000; i++) {
         if (atomic_load_explicit(&s->entered, memory_order_acquire)) return true;
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     }
     return false;
 }
@@ -193,7 +192,7 @@ static void check_epoch_lease(uint32_t epoch)
      * acknowledgement before cleanup, so its expected failure cannot itself
      * turn into a second use-after-free in destroy(). */
     for (unsigned i = 0; i < 20000 && atomic_load(&wp.slots[0].busy); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(atomic_load(&wp.slots[0].busy) == 0);
     if (atomic_load(&wp.slots[0].busy)) work_pool_shutdown(&wp);
     lineidx_destroy(x);
@@ -281,6 +280,7 @@ static void test_review_memory(void)
 
 #ifdef OBSERVE_ALLOCATIONS
 typedef struct combined_counter { size_t baseline, peak; } combined_counter;
+#if !defined(_WIN32)
 static void *combined_alloc(void *ctx, size_t size)
 {
     combined_counter *counter = ctx;
@@ -307,7 +307,7 @@ static size_t combined_span(void *ctx, uint64_t off, const uint8_t **p)
 {
     combined_source *s = ctx;
     atomic_store_explicit(&s->gate.entered, true, memory_order_release);
-    while (!atomic_load_explicit(&s->gate.resume, memory_order_acquire)) sched_yield();
+    while (!atomic_load_explicit(&s->gate.resume, memory_order_acquire)) os_yield();
     piece_iter it;
     size_t n = 0;
     piece_iter_begin_snapshot(&it, s->snap, off);
@@ -320,13 +320,14 @@ static void combined_release(void *ctx)
     atomic_store_explicit(&s->gate.released, true, memory_order_release);
 }
 #endif
+#endif
 
 /* Count actual deduplicated malloc ownership, including opaque file/piece/find
  * storage. Clean file-backed mapping bytes contribute zero to G10f. The
  * sanitizer allocator census includes every private allocation, counted once. */
 static void test_combined_ownership(void)
 {
-#ifdef OBSERVE_ALLOCATIONS
+#if defined(OBSERVE_ALLOCATIONS) && !defined(_WIN32)
     const char *fixture = "/tmp/edit-corpus/sparse_10g.bin";
     struct stat fixture_st;
     /* edit-0rge: absent corpus skips, as test_corpus does (tools/mkcorpus). */
@@ -338,7 +339,7 @@ static void test_combined_ownership(void)
     uint64_t deadline = 20000;
     while (!file_open_ready(f) && deadline--) {
         (void)work_mailbox_drain(&pool, decode_file_message, NULL);
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     }
     bool mapped = file_open_ready(f) && file_open_mode(f) == FILE_MODE_MMAP;
     uint64_t size = mapped ? file_size(f) : 0;
@@ -400,6 +401,9 @@ static void test_combined_ownership(void)
     free(result); free(scratch); free(program);
     CHECK(__sanitizer_get_current_allocated_bytes() == before);
 #else
+#if defined(_WIN32)
+    puts("SKIP lineidx combined_ownership (file-backed integration requires W2 file port)");
+#endif
     fprintf(stderr, "G10f combined ownership census runs in the sanitizer suite\n");
 #endif
 }
@@ -470,7 +474,7 @@ static void test_review_mailbox(void)
     work_cancel(&pool, h); /* pool rejects all messages from this lease */
     atomic_store_explicit(&s.resume, true, memory_order_release);
     for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     size_t delivered = 0;
     (void)work_mailbox_drain(&pool, count_message, &delivered);
     CHECK(delivered == 0);
@@ -487,7 +491,7 @@ static bool wait_complete(lineidx *x, int ms)
         (void)work_mailbox_drain(&pool, count_message, &delivered);
         if (lineidx_complete(x)) return true;
         struct timespec ts = { 0, 1000000 };
-        nanosleep(&ts, NULL);
+        os_sleep_ns((uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec);
     }
     return false;
 }
@@ -581,9 +585,9 @@ static void test_estimate_and_cancel_resume(void)
     lineidx_src s = mk(&slow);
     CHECK(lineidx_build_start(x, &pool, &s) == 0);
     struct timespec ts = { 0, 5000000 };
-    nanosleep(&ts, NULL);
+    os_sleep_ns((uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec);
     lineidx_build_cancel(x);
-    for (int i = 0; i < 200 && lineidx_building(x); i++) nanosleep(&(struct timespec){0, 1000000}, NULL);
+    for (int i = 0; i < 200 && lineidx_building(x); i++) os_sleep_ns(1000000);
     CHECK(!lineidx_building(x));
     lineidx_poll(x);
     size_t pre = lineidx_built_prefix(x);
@@ -733,7 +737,7 @@ static void check_snapshot_edit(uint64_t off, uint64_t del, uint64_t il)
     CHECK(copy != b && n_lines(copy, ss.len) == old_lines);
     atomic_store_explicit(&slow.resume, true, memory_order_release);
     for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(!lineidx_building(x));
     CHECK(atomic_load(&slow.released));
     flat cur = { b, n, 0, 0 };
@@ -855,15 +859,28 @@ static void test_piece_source(void)
 
 static void test_corpus(const char *path)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "  skip %s\n", path); return; }
-    struct stat st;
-    REQUIRE(fstat(fd, &st) == 0);
-    uint64_t n = (uint64_t)st.st_size;
-    if (n == 0) { close(fd); return; }
-    const uint8_t *m = mmap(NULL, (size_t)n, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    REQUIRE(m != MAP_FAILED);
+#if defined(_WIN32)
+    char converted[OS_PATH_MAX];
+    const char *root = getenv("SUBLIMITE_TEST_CORPUS");
+    if (root && *root) {
+        const char *name = strrchr(path, '/');
+        int length = snprintf(converted, sizeof converted, "%s/%s", root, name ? name + 1 : path);
+        REQUIRE(length > 0 && (size_t)length < sizeof converted);
+        path = converted;
+    }
+#endif
+    os_file input = OS_FILE_INIT;
+    if (os_file_open(&input, path, OS_OPEN_READ) != OS_OK) {
+        fprintf(stderr, "SKIP corpus %s (fixture absent)\n", path); return;
+    }
+    os_stat st;
+    REQUIRE(os_file_stat(&input, &st) == OS_OK);
+    uint64_t n = st.size;
+    if (n == 0) { os_file_close(&input); return; }
+    os_map map;
+    REQUIRE(os_map_file(&map, &input, 0, (size_t)n) == OS_OK);
+    os_file_close(&input);
+    const uint8_t *m = map.addr;
     lineidx *x = lineidx_create(n);
     REQUIRE(x != NULL);
     flat f = { m, n, 0, 0 };
@@ -881,7 +898,7 @@ static void test_corpus(const char *path)
         if (n > (1u << 28)) break;                 /* naive model is O(n): few probes for the big files */
     }
     lineidx_destroy(x);
-    munmap((void *)m, (size_t)n);
+    os_unmap(&map);
 }
 
 static void test_mailbox_pressure(void);
@@ -1016,7 +1033,7 @@ static void test_review_worker_seek(void)
         bool ready = false;
         for (unsigned i = 0; i < 20000; i++) {
             if (lineidx_seek_result(x, &result)) { ready = true; break; }
-            nanosleep(&(struct timespec){0, 1000000}, NULL);
+            os_sleep_ns(1000000);
         }
         CHECK(ready && result.exact && result.value == 17ull * LINEIDX_CHUNK + 123u);
         CHECK(lineidx_built_prefix(x) < lineidx_chunk_count(x));
@@ -1051,7 +1068,7 @@ static void test_review_metadata(void)
         bool busy = false;
         for (unsigned k = 0; k < WORK_MAX_JOBS; k++) busy |= atomic_load(&pool.slots[k].busy) != 0;
         if (!busy) break;
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     }
     size_t applied = lineidx_poll(x);
     CHECK(applied <= 64);
@@ -1110,9 +1127,7 @@ typedef struct { uint8_t b[LINEIDX_CHUNK]; uint64_t n; size_t span_size;
 } polling_source;
 static uint64_t test_cpu_ns(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    return os_thread_cpu_ns();
 }
 static size_t polling_span(void *ctx, uint64_t off, const uint8_t **p)
 {
@@ -1122,7 +1137,7 @@ static size_t polling_span(void *ctx, uint64_t off, const uint8_t **p)
     if (call == s->pause_at) {
         atomic_store_explicit(&s->entered, true, memory_order_release);
         while (!atomic_load_explicit(&s->resume, memory_order_acquire))
-            nanosleep(&(struct timespec){0, 100000}, NULL);
+            os_sleep_ns(100000);
     }
     uint64_t begin = test_cpu_ns();
     while (test_cpu_ns() - begin < s->cost_ns) { }
@@ -1136,7 +1151,7 @@ static bool await_flag(_Atomic bool *flag)
 {
     for (unsigned i = 0; i < 20000; i++) {
         if (atomic_load_explicit(flag, memory_order_acquire)) return true;
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     }
     return false;
 }
@@ -1151,7 +1166,7 @@ static void test_review_cancel(void)
     REQUIRE(lineidx_build_start_owned(x, &wp, &src, 0) == 0);
     work_handle h = {0, 2};
     for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, h); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     REQUIRE(work_handle_finished(&wp, h));
     lineidx_build_cancel(x);
     CHECK(atomic_load(&wp.slots[h.slot].epoch) != h.epoch);
@@ -1177,9 +1192,14 @@ static void test_review_polling(bool enlarged)
     lineidx_build_cancel(x);
     atomic_store_explicit(&s.resume, true, memory_order_release);
     for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(!lineidx_building(x));
     CHECK(atomic_load(&s.calls) == 1);
+#if defined(_WIN32)
+    fprintf(stderr, "lineidx polling %s: span_cpu_ns=%llu cancel_cpu_ns=%llu bound_ns=5000000 (G) resolution_ns=%llu (M)[AC, desktop Spiral]\n",
+        enlarged ? "enlarged" : "ordinary", (unsigned long long)atomic_load(&s.cpu_ns),
+        (unsigned long long)lineidx_cancel_cpu_ns(x), (unsigned long long)os_thread_cpu_resolution_ns());
+#endif
     CHECK(atomic_load(&s.cpu_ns) <= 5000000);
     CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
     CHECK(!lineidx_complete(x));
@@ -1198,7 +1218,7 @@ static void test_review_fragmented(void)
     lineidx_build_cancel(x);
     atomic_store_explicit(&s.resume, true, memory_order_release);
     for (unsigned i = 0; i < 20000 && lineidx_building(x); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(!lineidx_building(x));
     CHECK(atomic_load(&s.calls) == 10001);
     CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
@@ -1211,7 +1231,7 @@ static void held_bulk(work_ctx *c)
 {
     bulk_hold *s = c->arg;
     atomic_store_explicit(&s->entered, true, memory_order_release);
-    while (!atomic_load_explicit(&s->resume, memory_order_acquire) && !work_should_stop(c)) sched_yield();
+    while (!atomic_load_explicit(&s->resume, memory_order_acquire) && !work_should_stop(c)) os_yield();
 }
 static void test_review_queued_destroy(void)
 {
@@ -1259,7 +1279,7 @@ static void test_prepaid_restart(void)
     while (!lineidx_complete(x) || lineidx_building(x)) {
         (void)lineidx_poll(x);
         if (trace_now_ns() >= deadline) { CHECK(false); break; }
-        sched_yield();
+        os_yield();
     }
     size_t allocations = edit_malloc_guard_end();
     if (edit_malloc_guard_active()) CHECK(allocations == 0);
@@ -1272,7 +1292,7 @@ static void test_prepaid_restart(void)
     while (!lineidx_complete(x) || lineidx_building(x)) {
         (void)lineidx_poll(x);
         if (trace_now_ns() >= deadline) { CHECK(false); break; }
-        sched_yield();
+        os_yield();
     }
     CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == 3u);
     /* Physical lease retirement owns accepted sources; refusal owns nothing. */
@@ -1295,7 +1315,7 @@ static void test_prepaid_restart(void)
     while (lineidx_building(x)) {
         (void)lineidx_poll(x);
         if (trace_now_ns() >= deadline) { CHECK(false); break; }
-        sched_yield();
+        os_yield();
     }
     CHECK(atomic_load(&accepted.released));
     CHECK(lineidx_build_start_prepaid(x, &pool, &src) == 0);
@@ -1397,7 +1417,7 @@ static void test_mailbox_pressure(void)
     work_handle foreign = work_submit(&wp, (work_job){foreign_mailbox_job, NULL, 81, WORK_BULK});
     REQUIRE(foreign.epoch != 0);
     for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, foreign); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(work_handle_finished(&wp, foreign));
     uint8_t b[LINEIDX_CHUNK]; memset(b, '\n', sizeof b);
     lease s = {.b = b, .n = 33ull * LINEIDX_CHUNK, .repeat = true, .resume = true};
@@ -1406,7 +1426,7 @@ static void test_mailbox_pressure(void)
     REQUIRE(x != NULL);
     REQUIRE(lineidx_build_start(x, &wp, &src) == 0);
     for (unsigned i = 0; i < 20000 && atomic_load(&wp.dropped_full) == 0; i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(atomic_load(&wp.dropped_full) != 0);
     CHECK(lineidx_poll(x) == 0);
     CHECK(atomic_load(&wp.slots[foreign.slot].pending) == WORK_MAILBOX_CAP);
@@ -1417,7 +1437,7 @@ static void test_mailbox_pressure(void)
         (void)work_mailbox_drain(&wp, foreign_message, &foreign_count);
         (void)lineidx_poll(x);
         if (lineidx_complete(x)) { completed = true; break; }
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     }
     CHECK(completed && foreign_count == WORK_MAILBOX_CAP);
     CHECK(lineidx_line_count(x).exact && lineidx_line_count(x).value == s.n + 1u);
@@ -1427,7 +1447,7 @@ static void test_mailbox_pressure(void)
 }
 static void hold_replacement(work_ctx *c)
 {
-    while (!work_should_stop(c)) sched_yield();
+    while (!work_should_stop(c)) os_yield();
 }
 static void test_completed_slot_reuse(void)
 {
@@ -1441,7 +1461,7 @@ static void test_completed_slot_reuse(void)
     REQUIRE(lineidx_build_start(x, &wp, &src) == 0);
     work_handle completed = {0, 2};
     for (unsigned i = 0; i < 20000 && !work_handle_finished(&wp, completed); i++)
-        nanosleep(&(struct timespec){0, 1000000}, NULL);
+        os_sleep_ns(1000000);
     CHECK(work_handle_finished(&wp, completed));
     size_t stolen = 0;
     while (work_mailbox_pending(&wp)) (void)work_mailbox_drain(&wp, count_message, &stolen);

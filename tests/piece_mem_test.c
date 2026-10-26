@@ -2,7 +2,7 @@
  * queries. The perf G10f edit term funds deleted ORIGINAL bytes only. */
 #include "piece/piece.h"
 #include "piece/piece_test.h"
-#include <pthread.h>
+#include "os/os.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,10 +126,10 @@ static int overflow_delete(int requested) {
     }
     piece_destroy(t); free(data); CHECK(!atomic_load(&m.live)); puts("overflow delete: ok"); return 0;
 }
-static void *release_snapshots(void *ctx) {
+static void release_snapshots(void *ctx) {
     piece_snapshot **snapshots = ctx;
     for (unsigned i = 0; i < 32; i++) piece_snapshot_release(snapshots[i]);
-    return NULL;
+    return;
 }
 static int final_release(int worker, int cached) {
     mem_allocator m = {0}; piece_allocator a = mem_hooks(&m); piece_tree *t = piece_create(&a); CHECK(t);
@@ -141,7 +141,7 @@ static int final_release(int worker, int cached) {
     }
     if (cached) { piece_snapshot *current = piece_snapshot_take(t); CHECK(current); piece_snapshot_release(current); }
     if (worker) {
-        pthread_t th; CHECK(!pthread_create(&th, NULL, release_snapshots, snapshots)); CHECK(!pthread_join(th, NULL));
+        os_thread th; CHECK(!os_thread_start(&th, release_snapshots, snapshots)); CHECK(!os_thread_join(&th));
         /* Worker return acknowledges logical release. Account physical
          * retirement after bounded owner maintenance, before any query. */
         unsigned batches = 0;

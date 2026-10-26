@@ -1,3 +1,5 @@
+#include "os/os.h"
+#include "core_sync.h"
 /* layout suite (P3.1): text -> render.h grid. Every layout is checked with
  * render_grid_validate; edits are checked against a fresh full layout. */
 #include "layout/layout.h"
@@ -576,7 +578,7 @@ static void wait_checkpoint(work_pool *pool, layout_checkpoint_store *store)
     for (unsigned i = 0; store->pending && i < 20000; i++) {
         (void)work_mailbox_drain(pool, checkpoint_cb, store);
         struct timespec ts = {0, 1000000};
-        if (store->pending) (void)nanosleep(&ts, NULL);
+        if (store->pending) (void)os_sleep_ns((uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec);
     }
     CHECK(!store->pending);
 }
@@ -602,7 +604,7 @@ static void test_checkpoints(void)
     layout_checkpoint_store store;
     CHECK(layout_checkpoint_init(&store, &arena, n + 5) == LAYOUT_DONE);
     CHECK(layout_set_checkpoints(&f.l, &store) == LAYOUT_DONE);
-    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    work_pool *pool = core_aligned_alloc(_Alignof(work_pool), sizeof *pool);
     CHECK(work_pool_init(pool, 1, 0) == 0);
     show(&f, 0, 1000000);
     CHECK(layout_approximate(&f.l) && f.l.bytes_scanned <= LAYOUT_BYTE_BUDGET + LAYOUT_WIN);
@@ -638,7 +640,7 @@ static void test_checkpoints(void)
     wait_checkpoint(pool, &store);
     CHECK(!store.complete);
     CHECK(store.count <= 1);
-    work_pool_shutdown(pool); free(pool);
+    work_pool_shutdown(pool); core_aligned_free(pool);
     fx_free(&f); edit_arena_free(&arena); free(text);
 }
 
@@ -649,7 +651,7 @@ static void test_crlf_cursor_indexed(void)
     layout_checkpoint_store store;
     CHECK(layout_checkpoint_init(&store, &arena, 4) == LAYOUT_DONE);
     CHECK(layout_set_checkpoints(&f.l, &store) == LAYOUT_DONE);
-    work_pool *pool = aligned_alloc(_Alignof(work_pool), sizeof *pool);
+    work_pool *pool = core_aligned_alloc(_Alignof(work_pool), sizeof *pool);
     CHECK(work_pool_init(pool, 1, 0) == 0);
     show(&f, 0, 0); build_checkpoint(pool, &store, &f);
     CHECK(store.complete && store.newline && store.end == 2 && store.columns == 1);
@@ -666,7 +668,7 @@ static void test_crlf_cursor_indexed(void)
     CHECK(cell(&f, 0, 1)->attrs & RENDER_ATTR_CURSOR);
     CHECK(f.row_byte[1] == 3);
     piece_snapshot_release(snapshot);
-    work_pool_shutdown(pool); free(pool); fx_free(&f); edit_arena_free(&arena);
+    work_pool_shutdown(pool); core_aligned_free(pool); fx_free(&f); edit_arena_free(&arena);
 }
 
 /* No synthetic cluster boundary at a window or budget boundary. */

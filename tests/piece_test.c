@@ -1,7 +1,7 @@
 /* Piece tree conformance suite. Build against any implementation of piece.h. */
 #include "piece/piece.h"
 #include "piece_model.h"
-#include <pthread.h>
+#include "os/os.h"
 #include <stdio.h>
 
 static int g_fail;
@@ -181,13 +181,13 @@ static void t_snapshot(void) {
 }
 
 typedef struct { piece_snapshot *s; pm_model *m; int ok; } rdarg;
-static void *reader(void *x) {
+static void reader(void *x) {
     rdarg *r = x; uint8_t *b = malloc(r->m->n + 1);
     for (int k = 0; k < 20; k++) {
         if (piece_snapshot_read(r->s, 0, b, r->m->n) || memcmp(b, r->m->d, r->m->n)) r->ok = 0;
         if (piece_snapshot_line_count(r->s) != pm_line_count(r->m)) r->ok = 0;
     }
-    free(b); return NULL;
+    free(b); return;
 }
 static void t_threads(void) {
     g_name = "snapshot from threads";
@@ -196,10 +196,10 @@ static void t_threads(void) {
     uint8_t *o = malloc(20000); for (int i = 0; i < 20000; i++) o[i] = (uint8_t)(i % 9 == 0 ? '\n' : 'a');
     CHECK(piece_init_copy(t, o, 20000) == 0); pm_init(&fz, o, 20000);
     piece_snapshot *s = piece_snapshot_take(t);
-    pthread_t th[3]; rdarg ra[3];
-    for (int i = 0; i < 3; i++) { ra[i] = (rdarg){ piece_snapshot_retain(s), &fz, 1 }; pthread_create(&th[i], NULL, reader, &ra[i]); }
+    os_thread th[3]; rdarg ra[3];
+    for (int i = 0; i < 3; i++) { ra[i] = (rdarg){ piece_snapshot_retain(s), &fz, 1 }; os_thread_start(&th[i], reader, &ra[i]); }
     for (int i = 0; i < 500; i++) { piece_insert(t, rnd() % (piece_len(t) + 1), (const uint8_t *)"zz\n", 3); piece_delete(t, rnd() % (piece_len(t) - 4), 3, NULL); }
-    for (int i = 0; i < 3; i++) { pthread_join(th[i], NULL); CHECK(ra[i].ok); piece_snapshot_release(ra[i].s); }
+    for (int i = 0; i < 3; i++) { os_thread_join(&th[i]); CHECK(ra[i].ok); piece_snapshot_release(ra[i].s); }
     piece_snapshot_release(s); piece_destroy(t); free(o); pm_free(&fz);
 }
 
@@ -282,7 +282,7 @@ static void t_ref(void) {
     CHECK(piece_init_copy(t, o, N) == 0);
     pm_model m; pm_init(&m, o, N);
     for (int i = 0; i < 40; i++) {                     /* build mixed content */
-        uint64_t off = rnd() % (m.n + 1); uint8_t b[9] = "ab\ncd\nef\n"; size_t l = 1 + rnd() % 8;
+        uint64_t off = rnd() % (m.n + 1); uint8_t b[9] = {'a','b','\n','c','d','\n','e','f','\n'}; size_t l = 1 + rnd() % 8;
         CHECK(piece_insert(t, off, b, l) == 0); pm_insert(&m, off, b, l);
     }
     for (int it = 0; it < 300; it++) {

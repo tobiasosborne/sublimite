@@ -4,7 +4,11 @@
 #include "base/base.h"
 #include "piece_model.h"
 #include <limits.h>
+#include "os/os.h"
+#include "core_sync.h"
+#if !defined(_WIN32)
 #include <pthread.h>
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <errno.h>
@@ -42,37 +46,35 @@ static int kernel_threads_test(void) {
 static void *arena_hook_alloc(void *p, size_t n);
 static void arena_hook_free(void *p, void *q, size_t n);
 static uint64_t reclaim_now_ns(void) {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 typedef struct reclaim_gate {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    os_mutex mu;
+    os_cond cv;
     unsigned entered, goal;
     int typing_done, resume, blocked;
 } reclaim_gate;
 static void reclaim_park(void *ctx) {
     reclaim_gate *g = ctx;
-    pthread_mutex_lock(&g->mu);
-    g->entered++; pthread_cond_broadcast(&g->cv);
-    while (!g->resume) pthread_cond_wait(&g->cv, &g->mu);
-    pthread_mutex_unlock(&g->mu);
+    os_mutex_lock(&g->mu);
+    g->entered++; os_cond_broadcast(&g->cv);
+    while (!g->resume) os_cond_wait(&g->cv, &g->mu);
+    os_mutex_unlock(&g->mu);
 }
-static void *reclaim_release(void *ctx) { piece_snapshot_release(ctx); return NULL; }
-static void *reclaim_watchdog(void *ctx) {
+static void reclaim_release(void *ctx) { piece_snapshot_release(ctx); return; }
+static void reclaim_watchdog(void *ctx) {
     reclaim_gate *g = ctx;
-    pthread_mutex_lock(&g->mu);
-    while (!g->entered) pthread_cond_wait(&g->cv, &g->mu);
-    struct timespec deadline;
-    (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 5; /* Deadlock watchdog, not a performance gate. */
-    int rc = 0;
-    while (!g->typing_done && rc != ETIMEDOUT)
-        rc = pthread_cond_timedwait(&g->cv, &g->mu, &deadline);
+    os_mutex_lock(&g->mu);
+    while (!g->entered) os_cond_wait(&g->cv, &g->mu);
+    uint64_t deadline = os_now_ns() + UINT64_C(5000000000); /* existing 5 s watchdog */
+    while (!g->typing_done && os_now_ns() < deadline) {
+        os_mutex_unlock(&g->mu);
+        os_sleep_ns(1000000);
+        os_mutex_lock(&g->mu);
+    }
     g->blocked = !g->typing_done;
-    g->resume = 1; pthread_cond_broadcast(&g->cv);
-    pthread_mutex_unlock(&g->mu); return NULL;
+    g->resume = 1; os_cond_broadcast(&g->cv);
+    os_mutex_unlock(&g->mu); return;
 }
 static int reclaim_typing_test(void) {
     const size_t sizes[] = {20000, 200000};
@@ -93,14 +95,15 @@ static int reclaim_typing_test(void) {
             }
             REQUIRE(!piece_delete(t, 0, piece_len(t), NULL));
             REQUIRE(!piece_insert(t, 0, (const uint8_t *)"x", 1));
-            reclaim_gate g = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .goal = jobs };
+            reclaim_gate g = { .mu = OS_MUTEX_INIT, .goal = jobs };
+            REQUIRE(os_cond_init(&g.cv) == OS_OK);
             piece_test_reclaim_hook(t, reclaim_park, &g);
-            pthread_t workers[3], watchdog;
-            REQUIRE(!pthread_create(&watchdog, NULL, reclaim_watchdog, &g));
-            for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_create(&workers[i], NULL, reclaim_release, snapshots[i]));
-            pthread_mutex_lock(&g.mu);
-            while (g.entered < g.goal && !g.resume) pthread_cond_wait(&g.cv, &g.mu);
-            pthread_mutex_unlock(&g.mu);
+            os_thread workers[3], watchdog;
+            REQUIRE(!os_thread_start(&watchdog, reclaim_watchdog, &g));
+            for (unsigned i = 0; i < jobs; i++) REQUIRE(!os_thread_start(&workers[i], reclaim_release, snapshots[i]));
+            os_mutex_lock(&g.mu);
+            while (g.entered < g.goal && !g.resume) os_cond_wait(&g.cv, &g.mu);
+            os_mutex_unlock(&g.mu);
             uint64_t began = reclaim_now_ns();
             edit_malloc_guard_begin();
             int rc = piece_insert(t, 1, (const uint8_t *)"\n", 1);
@@ -112,9 +115,9 @@ static int reclaim_typing_test(void) {
             if (now) piece_snapshot_release(now);
             size_t malloc_calls = edit_malloc_guard_end();
             uint64_t typing_ns = reclaim_now_ns() - began;
-            pthread_mutex_lock(&g.mu); g.typing_done = 1; pthread_cond_broadcast(&g.cv); pthread_mutex_unlock(&g.mu);
-            REQUIRE(!pthread_join(watchdog, NULL));
-            for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_join(workers[i], NULL));
+            os_mutex_lock(&g.mu); g.typing_done = 1; os_cond_broadcast(&g.cv); os_mutex_unlock(&g.mu);
+            REQUIRE(!os_thread_join(&watchdog));
+            for (unsigned i = 0; i < jobs; i++) REQUIRE(!os_thread_join(&workers[i]));
             piece_test_reclaim_hook(t, NULL, NULL);
             printf("reclamation typing: pieces=%zu workers=%u typing_before_worker_resume=%s\n",
                    sizes[z], jobs, g.blocked ? "FAIL" : "ok");
@@ -138,7 +141,7 @@ static int reclaim_typing_test(void) {
             printf("reclamation maintenance: batches=%u bounded_steps=64 (G)\n", batches);
             piece_destroy(t);
             edit_arena_free(&arena);
-            REQUIRE(!pthread_cond_destroy(&g.cv) && !pthread_mutex_destroy(&g.mu));
+            REQUIRE(!core_cond_destroy(&g.cv) && !core_mutex_destroy(&g.mu));
             REQUIRE(!g.blocked && !rc);
         }
     }
@@ -163,14 +166,14 @@ typedef struct orphan_job {
 static void orphan_observe(void *ctx) {
     orphan_job *j = ctx; atomic_fetch_add_explicit(&j->visits, 1, memory_order_relaxed);
 }
-static void *orphan_create(void *ctx) {
+static void orphan_create(void *ctx) {
     orphan_job *j = ctx; piece_tree *t = piece_create(&j->allocator);
-    if (!t) return NULL;
+    if (!t) return;
     if (!piece_insert(t, 0, (const uint8_t *)"x", 1)) {
         j->snapshot = piece_snapshot_take(t);
         piece_test_reclaim_hook(t, orphan_observe, j);
     }
-    piece_destroy(t); return NULL;
+    piece_destroy(t); return;
 }
 static int reclaim_lifetime_test(void) {
     for (unsigned jobs = 1; jobs <= 3; jobs += 2) {
@@ -183,72 +186,73 @@ static int reclaim_lifetime_test(void) {
             s[i] = piece_snapshot_take(t); REQUIRE(s[i]);
             REQUIRE(!piece_insert(t, 0, (const uint8_t *)"+", 1));
         }
-        reclaim_gate g = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .goal = jobs };
+        reclaim_gate g = { .mu = OS_MUTEX_INIT, .goal = jobs };
+            REQUIRE(os_cond_init(&g.cv) == OS_OK);
         piece_test_reclaim_hook(t, reclaim_park, &g);
-        pthread_t workers[3], watchdog;
-        REQUIRE(!pthread_create(&watchdog, NULL, reclaim_watchdog, &g));
-        for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_create(&workers[i], NULL, reclaim_release, s[i]));
-        pthread_mutex_lock(&g.mu);
-        while (g.entered < g.goal && !g.resume) pthread_cond_wait(&g.cv, &g.mu);
-        pthread_mutex_unlock(&g.mu);
+        os_thread workers[3], watchdog;
+        REQUIRE(!os_thread_start(&watchdog, reclaim_watchdog, &g));
+        for (unsigned i = 0; i < jobs; i++) REQUIRE(!os_thread_start(&workers[i], reclaim_release, s[i]));
+        os_mutex_lock(&g.mu);
+        while (g.entered < g.goal && !g.resume) os_cond_wait(&g.cv, &g.mu);
+        os_mutex_unlock(&g.mu);
         /* Producers still own their cores before queue publication. Destroy
          * must return without waiting, then the final producer frees all. */
         piece_destroy(t);
-        pthread_mutex_lock(&g.mu); g.typing_done = 1; pthread_cond_broadcast(&g.cv); pthread_mutex_unlock(&g.mu);
-        REQUIRE(!pthread_join(watchdog, NULL));
-        for (unsigned i = 0; i < jobs; i++) REQUIRE(!pthread_join(workers[i], NULL));
-        REQUIRE(!pthread_cond_destroy(&g.cv) && !pthread_mutex_destroy(&g.mu));
+        os_mutex_lock(&g.mu); g.typing_done = 1; os_cond_broadcast(&g.cv); os_mutex_unlock(&g.mu);
+        REQUIRE(!os_thread_join(&watchdog));
+        for (unsigned i = 0; i < jobs; i++) REQUIRE(!os_thread_join(&workers[i]));
+        REQUIRE(!core_cond_destroy(&g.cv) && !core_mutex_destroy(&g.mu));
         printf("reclamation lifetime: workers=%u destroy_before_worker_resume=%s live_bytes=%zu\n",
                jobs, g.blocked ? "FAIL" : "ok", atomic_load_explicit(&count.live, memory_order_relaxed));
         REQUIRE(!g.blocked && !atomic_load_explicit(&count.live, memory_order_relaxed));
     }
     /* The original owning thread may exit before its last snapshot. Do not
-     * compare an expired pthread_t, even if a new worker reuses that ID. */
+     * compare an expired os_thread, even if a new worker reuses that ID. */
     reclaim_allocator count; atomic_init(&count.live, 0);
     orphan_job j = {.allocator={ &count, reclaim_alloc, reclaim_free }};
     atomic_init(&j.visits, 0);
-    pthread_t creator, releaser;
-    REQUIRE(!pthread_create(&creator, NULL, orphan_create, &j));
-    REQUIRE(!pthread_join(creator, NULL) && j.snapshot);
+    os_thread creator, releaser;
+    REQUIRE(!os_thread_start(&creator, orphan_create, &j));
+    REQUIRE(!os_thread_join(&creator) && j.snapshot);
     uint8_t b; REQUIRE(!piece_snapshot_read(j.snapshot, 0, &b, 1) && b == 'x');
-    REQUIRE(!pthread_create(&releaser, NULL, reclaim_release, j.snapshot));
-    REQUIRE(!pthread_join(releaser, NULL));
+    REQUIRE(!os_thread_start(&releaser, reclaim_release, j.snapshot));
+    REQUIRE(!os_thread_join(&releaser));
     REQUIRE(atomic_load_explicit(&j.visits, memory_order_relaxed) == 1);
     REQUIRE(!atomic_load_explicit(&count.live, memory_order_relaxed));
     puts("reclamation lifetime: owner thread exited; final worker release; live_bytes=0");
     return 0;
 }
 typedef struct {
-    pthread_barrier_t *barrier;
+    core_barrier *barrier;
     piece_snapshot *snapshot, *retained;
 } owner_race_job;
-static void *owner_race_retain(void *ctx) {
+static void owner_race_retain(void *ctx) {
     owner_race_job *j = ctx;
-    (void)pthread_barrier_wait(j->barrier);
+    (void)core_barrier_wait(j->barrier);
     j->retained = piece_snapshot_retain(j->snapshot);
-    return NULL;
+    return;
 }
 static int owner_race_test(void) {
     piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
     REQUIRE(!piece_init_copy(t, (const uint8_t *)"x", 1));
     piece_snapshot *s = piece_snapshot_take(t); REQUIRE(s);
     piece_test_snapshot_set_owners(s, UINT_MAX - 1);
-    pthread_barrier_t barrier; REQUIRE(!pthread_barrier_init(&barrier, NULL, 5));
-    pthread_t threads[4]; owner_race_job jobs[4];
+    core_barrier barrier; REQUIRE(!core_barrier_init(&barrier, 5));
+    os_thread threads[4]; owner_race_job jobs[4];
     for (unsigned i = 0; i < 4; i++) {
         jobs[i] = (owner_race_job){ &barrier, s, NULL };
-        REQUIRE(!pthread_create(&threads[i], NULL, owner_race_retain, &jobs[i]));
+        REQUIRE(!os_thread_start(&threads[i], owner_race_retain, &jobs[i]));
     }
-    (void)pthread_barrier_wait(&barrier);
+    (void)core_barrier_wait(&barrier);
     unsigned retained = 0;
     for (unsigned i = 0; i < 4; i++) {
-        REQUIRE(!pthread_join(threads[i], NULL)); retained += jobs[i].retained != NULL;
+        REQUIRE(!os_thread_join(&threads[i])); retained += jobs[i].retained != NULL;
     }
     REQUIRE(retained == 1 && piece_test_snapshot_owners(s) == UINT_MAX);
     for (unsigned i = 0; i < 4; i++) if (jobs[i].retained) piece_snapshot_release(jobs[i].retained);
     REQUIRE(piece_test_snapshot_owners(s) == UINT_MAX - 1);
     piece_test_snapshot_set_owners(s, 2);
-    REQUIRE(!pthread_barrier_destroy(&barrier));
+    REQUIRE(!core_barrier_destroy(&barrier));
     piece_destroy(t);
     uint8_t b = 0; REQUIRE(!piece_snapshot_read(s, 0, &b, 1) && b == 'x');
     piece_snapshot_release(s);
@@ -312,8 +316,8 @@ static int gap_test(void) {
 #endif
 
 typedef struct mt_ctx {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    os_mutex mu;
+    os_cond cv;
     struct mt_job *head;
     int done;
     atomic_uint bad, checked, owners;
@@ -344,37 +348,38 @@ static int snapshot_same(piece_snapshot *s, const pm_model *m) {
         if (piece_snapshot_byte_to_line(s, off) != pm_byte_to_line(m, off)) ok = 0;
     return ok;
 }
-static void *mt_reader(void *p) {
+static void mt_reader(void *p) {
     mt_ctx *c = p;
     for (;;) {
-        pthread_mutex_lock(&c->mu);
-        while (!c->head && !c->done) pthread_cond_wait(&c->cv, &c->mu);
+        os_mutex_lock(&c->mu);
+        while (!c->head && !c->done) os_cond_wait(&c->cv, &c->mu);
         mt_job *j = c->head;
         if (j) c->head = j->next;
-        pthread_mutex_unlock(&c->mu);
+        os_mutex_unlock(&c->mu);
         if (!j) break;
         if (!snapshot_same(j->s, &j->model)) atomic_fetch_add(&c->bad, 1);
         piece_snapshot_release(j->s); pm_free(&j->model); free(j);
         atomic_fetch_add(&c->checked, 1);
     }
-    return NULL;
+    return;
 }
 static uint64_t mt_rand(uint64_t *r) { *r ^= *r << 13; *r ^= *r >> 7; *r ^= *r << 17; return *r; }
 static int mt_test(void) {
-    mt_ctx c = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+    mt_ctx c = { .mu = OS_MUTEX_INIT };
+    REQUIRE(os_cond_init(&c.cv) == OS_OK);
     atomic_init(&c.bad, 0); atomic_init(&c.checked, 0); atomic_init(&c.owners, 0);
     piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
     size_t len = 2u << 20; uint8_t *map = malloc(len); REQUIRE(map);
     for (size_t i = 0; i < len; i++) map[i] = (uint8_t)(i % 113 == 0 ? '\n' : 'a' + i % 26);
     piece_map_hooks h = { &c, map_acquire, map_release };
     REQUIRE(!piece_init_mapped(t, map, len, &h));
-    pthread_t th[4];
-    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_create(&th[i], NULL, mt_reader, &c));
+    os_thread th[4];
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!os_thread_start(&th[i], mt_reader, &c));
     /* Many owners read the same unresolved nodes and release on worker threads. */
     piece_snapshot *shared = piece_snapshot_take(t); REQUIRE(shared);
     for (unsigned i = 0; i < 8; i++) {
         mt_job *j = malloc(sizeof *j); REQUIRE(j); j->s = piece_snapshot_retain(shared); pm_init(&j->model, map, len);
-        pthread_mutex_lock(&c.mu); j->next = c.head; c.head = j; pthread_cond_signal(&c.cv); pthread_mutex_unlock(&c.mu);
+        os_mutex_lock(&c.mu); j->next = c.head; c.head = j; os_cond_signal(&c.cv); os_mutex_unlock(&c.mu);
     }
     piece_snapshot_release(shared);
     uint64_t r = UINT64_C(88172645463325252);
@@ -397,7 +402,7 @@ static int mt_test(void) {
             size_t n = (size_t)piece_len(t); uint8_t *copy = malloc(n + 1); REQUIRE(copy);
             REQUIRE(!piece_read(t, 0, copy, n)); pm_init(&j->model, copy, n); free(copy);
             j->s = piece_snapshot_take(t); REQUIRE(j->s);
-            pthread_mutex_lock(&c.mu); j->next = c.head; c.head = j; pthread_cond_signal(&c.cv); pthread_mutex_unlock(&c.mu);
+            os_mutex_lock(&c.mu); j->next = c.head; c.head = j; os_cond_signal(&c.cv); os_mutex_unlock(&c.mu);
         }
         if (i % 83 == 0) (void)piece_line_count(t);
     }
@@ -406,7 +411,7 @@ static int mt_test(void) {
     piece_snapshot *final = piece_snapshot_take(t); REQUIRE(final);
     size_t final_len = (size_t)piece_len(t); uint8_t *copy = malloc(final_len + 1); REQUIRE(copy);
     REQUIRE(!piece_read(t, 0, copy, final_len));
-    pthread_mutex_lock(&c.mu);
+    os_mutex_lock(&c.mu);
     for (unsigned i = 0; i < 4; i++) {
         mt_job *j = malloc(sizeof *j); REQUIRE(j);
         j->s = piece_snapshot_retain(final); pm_init(&j->model, copy, final_len);
@@ -414,11 +419,11 @@ static int mt_test(void) {
     }
     free(copy); piece_snapshot_release(final);
     piece_destroy(t);
-    c.done = 1; pthread_cond_broadcast(&c.cv); pthread_mutex_unlock(&c.mu);
-    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_join(th[i], NULL));
+    c.done = 1; os_cond_broadcast(&c.cv); os_mutex_unlock(&c.mu);
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!os_thread_join(&th[i]));
     unsigned bad = atomic_load(&c.bad), checked = atomic_load(&c.checked);
     REQUIRE(atomic_load(&c.owners) == 0); free(map);
-    pthread_cond_destroy(&c.cv); pthread_mutex_destroy(&c.mu);
+    os_cond_destroy(&c.cv); os_mutex_destroy(&c.mu);
     printf("piece_mt_test: %s (%u snapshots checked, mapping owners=0)\n", bad ? "FAILED" : "ok", checked);
     return bad != 0;
 }
@@ -459,14 +464,15 @@ static int checkpoint_initialization_test(void) {
  * subsequent edits reuse the same logical offsets. The mapping owners remain
  * balanced across both kinds of checkpoint outcome and tree destruction. */
 static int checkpoint_mt_test(void) {
-    mt_ctx c = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+    mt_ctx c = { .mu = OS_MUTEX_INIT };
+    REQUIRE(os_cond_init(&c.cv) == OS_OK);
     atomic_init(&c.bad, 0); atomic_init(&c.checked, 0); atomic_init(&c.owners, 0);
     piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
     uint8_t original[1024]; memset(original, 'o', sizeof original); original[17] = '\n';
     piece_map_hooks h = { &c, map_acquire, map_release };
     REQUIRE(!piece_init_mapped(t, original, sizeof original, &h));
-    pthread_t th[4];
-    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_create(&th[i], NULL, mt_reader, &c));
+    os_thread th[4];
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!os_thread_start(&th[i], mt_reader, &c));
     uint8_t *payload = malloc(131091); REQUIRE(payload);
     /* An append run straddles the saved mark in a partially used add chunk. */
     REQUIRE(!piece_insert(t, sizeof original, (const uint8_t *)"tail", 4));
@@ -480,7 +486,7 @@ static int checkpoint_mt_test(void) {
         size_t n = (size_t)piece_len(t); uint8_t *copy = malloc(n); REQUIRE(copy);
         REQUIRE(!piece_read(t, 0, copy, n)); pm_init(&j->model, copy, n); free(copy);
         j->s = piece_snapshot_take(t); REQUIRE(j->s);
-        pthread_mutex_lock(&c.mu); j->next = c.head; c.head = j; pthread_cond_signal(&c.cv); pthread_mutex_unlock(&c.mu);
+        os_mutex_lock(&c.mu); j->next = c.head; c.head = j; os_cond_signal(&c.cv); os_mutex_unlock(&c.mu);
         if (i % 3) {
             piece_checkpoint_abort(cp);
             REQUIRE(piece_len(t) == before_len && piece_piece_count(t) == before_pieces);
@@ -492,16 +498,17 @@ static int checkpoint_mt_test(void) {
         }
     }
     piece_destroy(t); free(payload);
-    pthread_mutex_lock(&c.mu); c.done = 1; pthread_cond_broadcast(&c.cv); pthread_mutex_unlock(&c.mu);
-    for (unsigned i = 0; i < 4; i++) REQUIRE(!pthread_join(th[i], NULL));
+    os_mutex_lock(&c.mu); c.done = 1; os_cond_broadcast(&c.cv); os_mutex_unlock(&c.mu);
+    for (unsigned i = 0; i < 4; i++) REQUIRE(!os_thread_join(&th[i]));
     REQUIRE(!atomic_load(&c.bad) && atomic_load(&c.checked) == 192 && !atomic_load(&c.owners));
-    pthread_cond_destroy(&c.cv); pthread_mutex_destroy(&c.mu);
+    os_cond_destroy(&c.cv); os_mutex_destroy(&c.mu);
     puts("checkpoint snapshot threads: ok (abort/reuse/commit/destroy; mapping owners=0)");
     return 0;
 }
 /* Frozen lifetime edge cases, absent from the old bptree variant's tests. */
 static int init_lifetime_test(void) {
-    mt_ctx c = {0}; atomic_init(&c.owners, 0);
+    mt_ctx c = {0};
+    REQUIRE(os_cond_init(&c.cv) == OS_OK); atomic_init(&c.owners, 0);
     piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a); REQUIRE(t);
     piece_map_hooks h = { &c, map_acquire, map_release };
     REQUIRE(!piece_init_mapped(t, NULL, 0, &h));
@@ -592,7 +599,8 @@ static int repeat_snapshot_test(void) {
     int bad = (double)f.live > bound;
     for (unsigned i = 0; i < 100; i++) { REQUIRE(piece_snapshot_len(s[i]) == 0); piece_snapshot_release(s[i]); }
     piece_destroy(t); REQUIRE(!f.live);
-    mt_ctx c = {0}; atomic_init(&c.owners, 0); a = piece_default_allocator(); t = piece_create(&a); REQUIRE(t);
+    mt_ctx c = {0};
+    REQUIRE(os_cond_init(&c.cv) == OS_OK); atomic_init(&c.owners, 0); a = piece_default_allocator(); t = piece_create(&a); REQUIRE(t);
     piece_map_hooks h = { &c, map_acquire, map_release }; REQUIRE(!piece_init_mapped(t, NULL, 0, &h));
     for (unsigned i = 0; i < 100; i++) { s[i] = piece_snapshot_take(t); REQUIRE(s[i]); }
     if (atomic_load(&c.owners) != 101) bad = 1;

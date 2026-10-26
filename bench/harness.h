@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "os/os.h"
+#endif
 
 typedef struct bench_samples {
     uint64_t *v;      /* caller-supplied storage */
@@ -40,9 +43,13 @@ static inline int bench_add(bench_samples *s, uint64_t ns)
 
 static inline uint64_t bench_now_ns(void)
 {
+#if defined(_WIN32)
+    return os_now_ns();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 /* Times one statement and records it. samples is a bench_samples pointer. */

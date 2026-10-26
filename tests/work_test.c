@@ -1,7 +1,10 @@
+#include "os/os.h"
 #include "work/work.h"
 #include "base/base.h"
 #include "trace/trace.h"
 
+#include "core_sync.h"
+#if !defined(_WIN32)
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -13,10 +16,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#endif
+#include <stdio.h>
+#include <string.h>
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
-#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#if !defined(_WIN32) && (defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer))
 /* ASan's interceptor lives in the executable, before RTLD_NEXT. Thread
  * creation must pass through it so the runtime can match create with join. */
 extern int __interceptor_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
@@ -28,10 +34,12 @@ static _Atomic int fails;
 
 static void sleep_ms(long ms)
 {
-    struct timespec ts = {0, ms * 1000000L};
-    (void)nanosleep(&ts, NULL);
+    os_sleep_ns((uint64_t)ms * UINT64_C(1000000));
 }
 
+#if defined(_WIN32)
+#include "win/work_hooks.h"
+#else
 /* Test-only libc interposition: deterministic failure injection without a
  * Makefile change or production hooks. Resolve before starting any workers. */
 static int (*real_mutex_init)(pthread_mutex_t *, const pthread_mutexattr_t *);
@@ -125,6 +133,12 @@ static void resolve_sync(void)
     real_eventfd = (int (*)(unsigned int, int))dlsym(RTLD_NEXT, "eventfd");
     EDIT_ASSERT(real_mutex_init && real_mutex_destroy && real_mutex_lock && real_mutex_unlock && real_cond_init && real_cond_destroy && real_thread_create && real_eventfd);
 }
+
+static bool test_wake_closed(void)
+{
+    return last_eventfd >= 0 && fcntl(last_eventfd, F_GETFD) == -1 && errno == EBADF;
+}
+#endif
 
 static bool wait_value(_Atomic uint32_t *v, uint32_t value)
 {
@@ -237,9 +251,9 @@ static void test_alignment(void)
         (void)fclose(fp);
     }
     CHECK(bad == 0);
-    work_pool *heap = aligned_alloc(_Alignof(work_pool), sizeof *heap);
+    work_pool *heap = core_aligned_alloc(_Alignof(work_pool), sizeof *heap);
     CHECK(heap && (uintptr_t)heap % _Alignof(work_pool) == 0);
-    if (heap) { CHECK(work_pool_init(heap, 1, 0) == 0); work_pool_shutdown(heap); free(heap); }
+    if (heap) { CHECK(work_pool_init(heap, 1, 0) == 0); work_pool_shutdown(heap); core_aligned_free(heap); }
     printf("work_test: section2 unaligned_callers=%zu\n", bad);
     result("section2 alignment", before);
 }
@@ -330,20 +344,20 @@ static void test_init_errors(void)
         injecting = false;
         CHECK(rc != 0 && fault_fired);
         if (rc == 0) work_pool_shutdown(&pool);
-        CHECK(work_pool_eventfd(&pool) == -1 && !mutex_live && !cond_live[0] && !cond_live[1]);
+        CHECK(work_pool_wake(&pool) == NULL && !mutex_live && !cond_live[0] && !cond_live[1]);
         CHECK(bad_destroy == 0);
-        CHECK(last_eventfd >= 0 && fcntl(last_eventfd, F_GETFD) == -1 && errno == EBADF);
+        CHECK(test_wake_closed());
         if (stage <= 3) CHECK(thread_attempts == 0);
         printf("work_test: section6 stage=%d rc=%d thread_attempts=%d bad_destroy=%d\n", stage, rc, thread_attempts, bad_destroy);
         work_pool_shutdown(&pool);
     }
     fail_eventfd = true;
-    CHECK(work_pool_init(&pool, 1, 2) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init(&pool, 1, 2) != 0 && work_pool_wake(&pool) == NULL);
     fail_eventfd = false;
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init(&pool, 0, 0) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init(&pool, 0, 0) != 0 && work_pool_wake(&pool) == NULL);
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_wake(&pool) == NULL);
     work_pool_shutdown(&pool);
     if (init_pool(2)) work_pool_shutdown(&pool);
     result("section6 init_errors", before);
@@ -393,9 +407,9 @@ static void test_slice(void)
     collection c = {0};
     size_t n = work_mailbox_drain(&pool, slow_collect, &c);
     CHECK(n > 0 && n < WORK_MAILBOX_CAP);
-    struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
-    CHECK(poll(&fd, 1, 0) == 1);
-    printf("work_test: section8 slice_delivered=%zu continuation_ready=%d\n", n, fd.revents & POLLIN ? 1 : 0);
+    core_poll fd = {work_pool_wake(&pool), CORE_READY, 0};
+    CHECK(core_poll_wait(&fd, 1, 0) == 1);
+    printf("work_test: section8 slice_delivered=%zu continuation_ready=%d\n", n, fd.revents & CORE_READY ? 1 : 0);
     while (c.n < f.n) {
         size_t got = work_mailbox_drain(&pool, collect, &c);
         if (!got) { CHECK(false); break; }
@@ -485,14 +499,14 @@ static void test_budget_controls(void)
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 0, 0) == 0);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 1) == 0);
     CHECK(work_mailbox_pending(&pool));
-    struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
-    CHECK(poll(&fd, 1, 0) == 1);
+    core_poll fd = {work_pool_wake(&pool), CORE_READY, 0};
+    CHECK(core_poll_wait(&fd, 1, 0) == 1);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 11);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 22);
     work_cancel(&pool, b);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 0);
     CHECK(atomic_load(&pool.slots[b.slot].pending) == WORK_MAILBOX_CAP - 2u);
-    CHECK(poll(&fd, 1, 0) == 1);
+    CHECK(core_poll_wait(&fd, 1, 0) == 1);
     work_pool_shutdown(&pool);
     /* Dropping stale messages after shutdown must still release reservations. */
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
@@ -541,7 +555,7 @@ static void job_stream(work_ctx *ctx)
         for (size_t byte = 0; byte < sizeof m.data; byte++) m.data[byte] = payload_byte(f->id, seq, byte);
         while (!work_publish(ctx, &m)) {
             if (work_should_stop(ctx)) return;
-            sched_yield();
+            os_yield();
         }
     }
 }
@@ -576,8 +590,8 @@ static void test_live_ordering(void)
     while (c.total < 3u * fixtures[0].n && trace_now_ns() < end && atomic_load(&fails) == before) {
         (void)work_mailbox_drain(&pool, stream_collect, &c);
         if (!work_mailbox_pending(&pool)) {
-            struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
-            (void)poll(&fd, 1, 10);
+            core_poll fd = {work_pool_wake(&pool), CORE_READY, 0};
+            (void)core_poll_wait(&fd, 1, 10);
         }
     }
     CHECK(c.total == 3u * fixtures[0].n);
@@ -611,7 +625,7 @@ static void test_full_wrap(void)
     work_handle h = work_submit(&pool, (work_job){job_full, &f, 0, WORK_BULK});
     CHECK(h.epoch);
     uint64_t end = trace_now_ns() + 5000000000ull;
-    while (!atomic_load_explicit(&f.attempted, memory_order_relaxed) && trace_now_ns() < end) sched_yield();
+    while (!atomic_load_explicit(&f.attempted, memory_order_relaxed) && trace_now_ns() < end) os_yield();
     CHECK(atomic_load_explicit(&f.attempted, memory_order_relaxed));
     CHECK(atomic_load_explicit(&pool.dropped_full, memory_order_relaxed) == 1);
     collection c = {0};
@@ -655,7 +669,7 @@ static void test_state_machine(void)
             handles[index] = work_submit(&pool, (work_job){job_maybe_pub, &fixtures[index], step, (random_step(&rng) & 1u) ? WORK_BULK : WORK_RASTER});
         }
         (void)work_mailbox_drain_bounded(&pool, discard, NULL, random_step(&rng) % 8u, 0);
-        if (!(step % 32u)) sched_yield();
+        if (!(step % 32u)) os_yield();
     }
     work_pool_shutdown(&pool);
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
@@ -997,8 +1011,8 @@ static void test_receive_slices(void)
     CHECK(received.n == 3);
     CHECK(atomic_load(&pool.mb[0].head) == origin); /* foreign head still owns capacity */
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 129);
-    struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
-    CHECK(poll(&fd, 1, 0) == 1 && (fd.revents & POLLIN));
+    core_poll fd = {work_pool_wake(&pool), CORE_READY, 0};
+    CHECK(core_poll_wait(&fd, 1, 0) == 1 && (fd.revents & CORE_READY));
     collection others = {0};
     while (work_mailbox_pending(&pool))
         (void)work_mailbox_drain_bounded(&pool, collect, &others, 1, 0);
@@ -1247,7 +1261,7 @@ static bool init_foreground_pool(uint32_t raster)
 typedef struct foreground_bulk {
     _Atomic uint32_t started, release;
     uint32_t kind; /* index, find, save */
-    int read_fd;
+    core_pipe *read_fd;
     uint8_t bytes[65536];
     uint64_t sink;
 } foreground_bulk;
@@ -1259,9 +1273,7 @@ static void job_foreground_bulk(work_ctx *c)
     if (f->kind == 2u && !atomic_load_explicit(&f->release, memory_order_acquire)) {
         /* Real blocking syscall: cancellation cannot physically retire this
          * lease until the owner supplies the completion byte. */
-        uint8_t byte;
-        ssize_t n;
-        do { n = read(f->read_fd, &byte, 1); } while (n < 0 && errno == EINTR);
+        int n = core_pipe_read(f->read_fd);
         CHECK(n == 1);
     } else {
         while (!atomic_load_explicit(&f->release, memory_order_acquire) &&
@@ -1296,13 +1308,13 @@ static void test_foreground_latency(void)
     for (uint32_t count = 1; count <= 3; count += 2) {
         for (uint32_t active = 0; active < 3; active++) {
             if (!init_foreground_pool(0)) return;
-            int io[2];
-            if (pipe(io) != 0) { CHECK(false); work_pool_shutdown(&pool); return; }
+            core_pipe io;
+            if (core_pipe_init(&io) != 0) { CHECK(false); work_pool_shutdown(&pool); return; }
             foreground_bulk bulk[3] = {{0}};
             work_job jobs[3]; work_handle handles[3] = {{0}};
             for (uint32_t i = 0; i < count; i++) {
                 bulk[i].kind = (active + i) % 3u;
-                bulk[i].read_fd = io[0];
+                bulk[i].read_fd = &io;
                 memset(bulk[i].bytes, bulk[i].kind == 0u ? '\n' : 'a', sizeof bulk[i].bytes);
                 jobs[i] = (work_job){job_foreground_bulk, &bulk[i], 83, WORK_BULK};
             }
@@ -1327,12 +1339,12 @@ static void test_foreground_latency(void)
                 (unsigned long long)gate_ns);
             for (uint32_t i = 0; i < count; i++) atomic_store_explicit(&bulk[i].release, 1, memory_order_release);
             uint8_t byte = 1;
-            CHECK(write(io[1], &byte, 1) == 1);
+            CHECK(core_pipe_write(&io, byte) == 1);
             for (uint32_t i = 0; i < count; i++) wait_finished(handles[i]);
             wait_finished(foreground);
             while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
             work_pool_shutdown(&pool);
-            CHECK(close(io[0]) == 0 && close(io[1]) == 0);
+            CHECK(core_pipe_close(&io) == 0);
         }
     }
     result("P1-1_section4_foreground_latency", before);
@@ -1507,19 +1519,19 @@ static void test_foreground_init_errors(void)
         injecting = false;
         CHECK(rc != 0 && fault_fired);
         if (rc == 0) work_pool_shutdown(&pool);
-        CHECK(work_pool_eventfd(&pool) == -1 && !mutex_live && !cond_live[0] && !cond_live[1] && !foreground_cond_live);
+        CHECK(work_pool_wake(&pool) == NULL && !mutex_live && !cond_live[0] && !cond_live[1] && !foreground_cond_live);
         CHECK(!pool.foreground_started && bad_destroy == 0);
-        CHECK(last_eventfd >= 0 && fcntl(last_eventfd, F_GETFD) == -1 && errno == EBADF);
+        CHECK(test_wake_closed());
         if (stage <= 4) CHECK(thread_attempts == 0);
         work_pool_shutdown(&pool);
     }
     fail_eventfd = true;
-    CHECK(work_pool_init_foreground(&pool, 1, 2) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init_foreground(&pool, 1, 2) != 0 && work_pool_wake(&pool) == NULL);
     fail_eventfd = false;
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init_foreground(&pool, 0, 0) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init_foreground(&pool, 0, 0) != 0 && work_pool_wake(&pool) == NULL);
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init_foreground(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_eventfd(&pool) == -1);
+    CHECK(work_pool_init_foreground(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_wake(&pool) == NULL);
     work_pool_shutdown(&pool);
     if (init_foreground_pool(1)) work_pool_shutdown(&pool);
     result("foreground_init_failure_cleanup", before);

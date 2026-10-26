@@ -1,6 +1,6 @@
 #include "base/base.h"
 #include <string.h>
-#include <pthread.h>
+#include "os/os.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -98,7 +98,7 @@ static void test_pool(void) {
  * Threads are created and joined outside the guard window (pthread
  * bookkeeping allocates); only the worker body runs inside it. */
 typedef struct exempt_arg { bool exempt; _Atomic int go, done; } exempt_arg;
-static void *exempt_alloc(void *arg) {
+static void exempt_alloc(void *arg) {
     exempt_arg *a = arg;
     void *(*volatile allocate)(size_t) = malloc;
     while (!atomic_load(&a->go)) { }
@@ -107,18 +107,18 @@ static void *exempt_alloc(void *arg) {
     if (a->exempt) edit_malloc_guard_exempt_end();
     free(p);
     atomic_store(&a->done, 1);
-    return NULL;
+    return;
 }
 
 static size_t guarded_worker(bool exempt) {
     exempt_arg a = {.exempt = exempt};
-    pthread_t t;
-    EDIT_ASSERT(pthread_create(&t, NULL, exempt_alloc, &a) == 0);
+    os_thread t;
+    EDIT_ASSERT(os_thread_start(&t, exempt_alloc, &a) == 0);
     edit_malloc_guard_begin();
     atomic_store(&a.go, 1);
     while (!atomic_load(&a.done)) { }
     size_t n = edit_malloc_guard_end();
-    EDIT_ASSERT(pthread_join(t, NULL) == 0);
+    EDIT_ASSERT(os_thread_join(&t) == 0);
     return n;
 }
 

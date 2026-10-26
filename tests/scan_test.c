@@ -2,8 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "core_vm.h"
 #if defined(__SANITIZE_ADDRESS__)
 #define SCAN_ASAN 1
 #elif defined(__has_feature)
@@ -74,17 +73,17 @@ static void run_on(const uint8_t *src, size_t n, const char *what)
 
 static void guarded_ranges(void)
 {
-    long page_value = sysconf(_SC_PAGESIZE);
+    long page_value = (long)os_page_size();
     if (page_value <= 0) { CHECK(0, "sysconf page size"); return; }
     size_t page = (size_t)page_value;
     const size_t limit = 8192;
     size_t accessible = ((limit + page - 1) / page) * page;
     size_t mapped = accessible + 2 * page;
-    uint8_t *mapping = mmap(NULL, mapped, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED) { CHECK(0, "guard mmap"); return; }
+    uint8_t *mapping = core_vm_alloc(mapped, false);
+    if (mapping == NULL) { CHECK(0, "guard mmap"); return; }
     uint8_t *begin = mapping + page, *end = begin + accessible;
-    if (mprotect(begin, accessible, PROT_READ | PROT_WRITE) != 0) {
-        CHECK(0, "guard mprotect"); (void)munmap(mapping, mapped); return;
+    if (core_vm_protect(begin, accessible, true) != 0) {
+        CHECK(0, "guard mprotect"); (void)core_vm_free(mapping, mapped); return;
     }
     /* Right-bound ranges end exactly at PROT_NONE, including an empty range
      * whose pointer itself is inaccessible. Every SIMD alignment is covered.
@@ -97,7 +96,7 @@ static void guarded_ranges(void)
             check_range(p, n, side ? "left-guard" : "right-guard", 0);
         }
     }
-    CHECK(munmap(mapping, mapped) == 0, "guard munmap");
+    CHECK(core_vm_free(mapping, mapped) == 0, "guard munmap");
 }
 
 static void large_ranges(void)

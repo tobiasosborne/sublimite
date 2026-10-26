@@ -6,8 +6,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <sys/mman.h>
+#include "core_vm.h"
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
+#include "core_proc.h"
 #include <unistd.h>
 
 #define CHECK(x) EDIT_ASSERT(x)
@@ -542,21 +545,32 @@ static void review_15(void)
     free(p); puts("review_15: insert/delete/prefix allocation failures and retry passed");
 }
 /* Protected mappings turn accidental unbounded reads into deterministic reds. */
+#if !defined(_WIN32)
 static void query_tail_signal(int sig)
 {
     (void)sig;
     const char msg[]="review_7 RED: unindexed Down read protected tail before yielding\n";
     ssize_t written=write(STDERR_FILENO,msg,sizeof msg-1); (void)written; _exit(99);
 }
+#endif
+#if defined(_WIN32)
+static bool tail_child;
+#endif
 static void proposal_7(void)
 {
-    size_t n=2u*1024u*1024u; uint8_t *p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    CHECK(p!=MAP_FAILED); memset(p,'x',n); p[n-1]='\n'; fault_fixture q; fault_init(&q,p,n);
-    CHECK(mprotect(p+n/2,n/2,PROT_NONE)==0);
+    size_t n=2u*1024u*1024u; uint8_t *p=core_vm_alloc(n, true);
+    CHECK(p!=NULL); memset(p,'x',n); p[n-1]='\n'; fault_fixture q; fault_init(&q,p,n);
+    CHECK(core_vm_protect(p+n/2, n/2, false)==0);
+#if defined(_WIN32)
+    if (tail_child) {
+#else
     pid_t child=fork(); CHECK(child>=0);
     if(child==0) {
+#endif
+#if !defined(_WIN32)
         struct sigaction sa={0}; sa.sa_handler=query_tail_signal; sigemptyset(&sa.sa_mask);
         CHECK(sigaction(SIGSEGV,&sa,NULL)==0);
+#endif
         view_change c;
         CHECK(view_command(&q.f.v,VIEW_TYPE,false,(const uint8_t *)"a",1,&c)==VIEW_OK && c.changed);
         int rc=view_command(&q.f.v,VIEW_DOWN,false,NULL,0,&c);
@@ -568,24 +582,37 @@ static void proposal_7(void)
         view_cancel(&q.f.v); CHECK(q.f.v.state.selection.cursor==1);
         _exit(0);
     }
+#if defined(_WIN32)
+    os_proc_status child_status;
+    CHECK(core_child("--child=tail", -1, &child_status) == OS_OK);
+    int status = child_status.code;
+    CHECK(child_status.how == OS_PROC_EXITED);
+#else
     int status; CHECK(waitpid(child,&status,0)==child);
-    CHECK(mprotect(p+n/2,n/2,PROT_READ|PROT_WRITE)==0);
+#endif
+    CHECK(core_vm_protect(p+n/2, n/2, true)==0);
+#if defined(_WIN32)
+    CHECK(status == 0);
+#else
     CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
     (void)command(&q.f,VIEW_DOWN,false,NULL,0);
     CHECK(q.f.v.state.selection.cursor==n && q.f.v.state.first_line==1);
     (void)command(&q.f,VIEW_PAGE_UP,false,NULL,0); CHECK(q.f.v.state.selection.cursor==0);
-    destroy(&q.f); CHECK(munmap(p,n)==0);
+    destroy(&q.f); CHECK(core_vm_free(p,n)==0);
     puts("review_7: protected-tail queries and exact resumable line motion passed");
 }
+#if !defined(_WIN32)
 static void prefix_signal(int sig)
 {
     (void)sig; const char msg[]="review_8 RED: post-capture follow reread protected prefix\n";
     ssize_t written=write(STDERR_FILENO,msg,sizeof msg-1); (void)written; _exit(99);
 }
+#endif
 static void proposal_8(void)
 {
-    size_t n=1048576; uint8_t *p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    CHECK(p!=MAP_FAILED); memset(p,'x',n);
+    size_t n=1048576; uint8_t *p=core_vm_alloc(n, true);
+    CHECK(p!=NULL); memset(p,'x',n);
     for(unsigned use_undo=0;use_undo<2;++use_undo) {
         fault_fixture q; fault_init(&q,p,n); undo_log u;
         if(use_undo) { CHECK(undo_init(&u,q.f.tree,n/VIEW_MUTATION_BOUND+8)==UNDO_OK); CHECK(view_set_undo(&q.f.v,&u)==VIEW_OK); }
@@ -597,11 +624,11 @@ static void proposal_8(void)
         typed='z'; view_cancel(&q.f.v);
         CHECK(q.f.v.state.selection.cursor==n && q.f.v.state.selection.anchor==0 && piece_len(q.f.tree)==n);
         typed='a'; rc=view_command(&q.f.v,VIEW_TYPE,false,&typed,1,&c); typed='z';
-        CHECK(rc==VIEW_MORE && !c.changed); CHECK(mprotect(p+n/2,n/2,PROT_NONE)==0);
+        CHECK(rc==VIEW_MORE && !c.changed); CHECK(core_vm_protect(p+n/2, n/2, false)==0);
         rc=view_continue(&q.f.v,&c);
         CHECK(rc==VIEW_MORE && c.changed && c.offset==0 && c.old_len==VIEW_MUTATION_BOUND && c.new_len==1);
         CHECK(q.f.v.scanned<=VIEW_SCAN_BOUND && piece_len(q.f.tree)==n-VIEW_MUTATION_BOUND+1);
-        CHECK(mprotect(p+n/2,n/2,PROT_READ|PROT_WRITE)==0);
+        CHECK(core_vm_protect(p+n/2, n/2, true)==0);
         view_cancel(&q.f.v); CHECK(q.f.v.state.selection.cursor==0 && q.f.v.state.first_byte==0);
         if(use_undo) {
             undo_change uc; CHECK(!u.open && undo_undo(&u,1,&uc)==UNDO_OK && uc.groups==1);
@@ -634,11 +661,11 @@ static void proposal_8(void)
         }
         destroy(&q.f);
     }
-    CHECK(munmap(p,n)==0);
+    CHECK(core_vm_free(p,n)==0);
     /* Maximum deferred TYPE input shares a slice with a smaller first
      * capture; both the byte-work bound and synchronous input ownership hold. */
-    p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    CHECK(p!=MAP_FAILED); memset(p,'x',n); fault_fixture maximum; fault_init(&maximum,p,n);
+    p=core_vm_alloc(n, true);
+    CHECK(p!=NULL); memset(p,'x',n); fault_fixture maximum; fault_init(&maximum,p,n);
     maximum.f.v.state.selection=(view_selection){n,0,VIEW_PREFERRED_UNSET};
     uint8_t payload[VIEW_MUTATION_BOUND]; memset(payload,'z',sizeof payload); view_change chunk;
     int maximum_rc=view_command(&maximum.f.v,VIEW_TYPE,false,payload,sizeof payload,&chunk);
@@ -650,17 +677,19 @@ static void proposal_8(void)
     CHECK(maximum_rc==VIEW_OK && piece_len(maximum.f.tree)==sizeof payload);
     CHECK(piece_read(maximum.f.tree,0,payload,sizeof payload)==PIECE_OK);
     for(size_t i=0;i<sizeof payload;++i) CHECK(payload[i]=='z');
-    destroy(&maximum.f); CHECK(munmap(p,n)==0);
+    destroy(&maximum.f); CHECK(core_vm_free(p,n)==0);
     /* Retain exact prefix metadata before a remote replacement. Following
      * must not reread a protected earlier prefix after capture completes. */
-    n=2u*1024u*1024u; p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    CHECK(p!=MAP_FAILED); memset(p,'x',n); fault_fixture deep; fault_init(&deep,p,n);
+    n=2u*1024u*1024u; p=core_vm_alloc(n, true);
+    CHECK(p!=NULL); memset(p,'x',n); fault_fixture deep; fault_init(&deep,p,n);
     unsigned checkpoints=0; deep.f.v.config.checkpoint=ascii_checkpoint; deep.f.v.config.checkpoint_ctx=&checkpoints;
     (void)command(&deep.f,VIEW_DOC_END,false,NULL,0);
     size_t old=16384; deep.f.v.state.selection.anchor=n-old;
+#if !defined(_WIN32)
     struct sigaction previous_signal, handler={0}; handler.sa_handler=prefix_signal; sigemptyset(&handler.sa_mask);
     CHECK(sigaction(SIGSEGV,&handler,&previous_signal)==0);
-    CHECK(mprotect(p,n/2,PROT_NONE)==0); view_change c;
+#endif
+    CHECK(core_vm_protect(p, n/2, false)==0); view_change c;
     int rc=view_command(&deep.f.v,VIEW_TYPE,false,(const uint8_t *)"a",1,&c);
     CHECK(rc==VIEW_MORE && !c.changed); unsigned calls=0; uint64_t removed=0;
     while(rc==VIEW_MORE) {
@@ -668,8 +697,11 @@ static void proposal_8(void)
         if(c.changed) removed+=c.old_len;
     }
     CHECK(rc==VIEW_OK && removed==old && deep.f.v.state.selection.cursor==n-old+1);
-    CHECK(mprotect(p,n/2,PROT_READ|PROT_WRITE)==0); CHECK(sigaction(SIGSEGV,&previous_signal,NULL)==0);
-    destroy(&deep.f); CHECK(munmap(p,n)==0);
+    CHECK(core_vm_protect(p, n/2, true)==0);
+#if !defined(_WIN32)
+    CHECK(sigaction(SIGSEGV,&previous_signal,NULL)==0);
+#endif
+    destroy(&deep.f); CHECK(core_vm_free(p,n)==0);
     puts("review_8: bounded replacement/progress/input ownership/cancel/undo passed");
 }
 static void wrap_selection(void)
@@ -865,6 +897,10 @@ static void wrapped_relative(void)
 }
 int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+    if (argc == 2 && strcmp(argv[1], "--child=tail") == 0) { tail_child = true; proposal_7(); return 2; }
+#endif
+
     if(argc==2 && strcmp(argv[1],"wrap-port")==0) { wrap_port(); return 0; }
     if(argc==2 && strcmp(argv[1],"wrap-selection")==0) { wrap_selection(); return 0; }
     if(argc==2 && strcmp(argv[1],"proposal-7")==0) { proposal_7(); return 0; }

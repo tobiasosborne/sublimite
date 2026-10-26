@@ -1,30 +1,44 @@
 /* P1-1 MAJOR 4: real bulk clients cannot own the interactive worker. */
 #include "base/base.h"
-#include "editor/private.h"
-#include "findui/findui.h"
-#include "font/font.h"
+#include "work/work.h"
 #include "lineidx/lineidx.h"
-#include "savectl/savectl.h"
 #include "trace/trace.h"
-#include <errno.h>
+#include "core_sync.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include "editor/private.h"
+#include "findui/findui.h"
+#include "font/font.h"
+#include "savectl/savectl.h"
+#include <errno.h>
 #include <unistd.h>
+#endif
 
 static _Atomic int failures;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "work_foreground_test:%d: FAIL %s\n", __LINE__, #x); failures++; } } while (0)
 static work_pool pool;
-static void nap(void) { (void)nanosleep(&(struct timespec){0, 100000}, NULL); }
-typedef struct pause_state { _Atomic bool entered, completed; bool enabled; int fd; } pause_state;
+static void nap(void) { os_sleep_ns(100000); }
+typedef struct pause_state { _Atomic bool entered, completed; bool enabled; int fd; core_pipe *portable; } pause_state;
 static void pause_io(pause_state *s)
 {
     if (!s->enabled || atomic_exchange(&s->entered, true)) return;
-    uint8_t byte; ssize_t n;
-    do { n = read(s->fd, &byte, 1); } while (n < 0 && errno == EINTR);
+    int n;
+    if (s->portable) n = core_pipe_read(s->portable);
+#if !defined(_WIN32)
+    else {
+        uint8_t byte; ssize_t got;
+        do { got = read(s->fd, &byte, 1); } while (got < 0 && errno == EINTR);
+        n = (int)got;
+    }
+#else
+    else n = -1;
+#endif
     CHECK(n == 1);
     atomic_store(&s->completed, true);
 }
+#if !defined(_WIN32)
 typedef struct source { const uint8_t *bytes; size_t size; pause_state *pause; } source;
 static size_t span(void *ctx, uint64_t off, const uint8_t **bytes)
 {
@@ -149,6 +163,7 @@ static void run_case(uint32_t active, uint32_t count)
     if (unlink(c.path) != 0) CHECK(errno == ENOENT);
     CHECK(close(io[0]) == 0 && close(io[1]) == 0);
 }
+#endif
 typedef struct fragmented_source {
     uint8_t bytes[131072];
     pause_state pause;
@@ -180,11 +195,11 @@ static void slice_reply(const work_msg *msg, void *ctx)
 }
 static void run_slice_case(void)
 {
-    fragmented_source f = {0}; int io[2];
-    CHECK(pipe(io) == 0);
+    fragmented_source f = {0}; core_pipe io;
+    CHECK(core_pipe_init(&io) == 0);
     CHECK(work_pool_init_foreground(&pool, 1, 0) == 0);
     for (size_t i = 0; i < sizeof f.bytes; i++) f.bytes[i] = (i & 1u) ? '\n' : 'a';
-    f.pause = (pause_state){.enabled = true, .fd = io[0]};
+    f.pause = (pause_state){.enabled = true, .portable = &io};
     lineidx_src input = {&f, sizeof f.bytes, fragmented_span, fragmented_release};
     lineidx *index = lineidx_create(sizeof f.bytes); CHECK(index);
     CHECK(lineidx_build_start_foreground(index, &pool, &input) == 0);
@@ -193,7 +208,7 @@ static void run_slice_case(void)
     CHECK(atomic_load(&f.pause.entered));
     work_handle reply = work_submit(&pool, (work_job){observe_slice, &f, 99, WORK_FOREGROUND});
     CHECK(reply.epoch);
-    uint8_t byte = 1; CHECK(write(io[1], &byte, 1) == 1);
+    uint8_t byte = 1; CHECK(core_pipe_write(&io, byte) == 1);
     slice_observation seen = {0};
     while (!seen.received && trace_now_ns() < deadline) {
         (void)work_mailbox_receive(&pool, reply, 99, slice_reply, &seen);
@@ -229,10 +244,11 @@ static void run_slice_case(void)
     }
     puts("work_foreground_test: fragmented worker seeks zero/partial/EOF + cancellation suppression checked");
     work_pool_shutdown(&pool);
-    close(io[0]); close(io[1]);
+    (void)core_pipe_close(&io);
     printf("work_foreground_test: running_index_yields fragment_spans_before_reply=%u bound=64 (G) lease_released=%d\n",
            seen.calls, atomic_load(&f.released));
 }
+#if !defined(_WIN32)
 static void hold_bulk(work_ctx *ctx) { pause_io(ctx->arg); }
 static void run_editor_case(void)
 {
@@ -270,8 +286,10 @@ static void run_editor_case(void)
     editor_close(e); close(io[0]); close(io[1]); CHECK(unlink(path) == 0);
     puts("work_foreground_test: editor_resident_jump_before_bulk_release checked");
 }
+#endif
 int main(int argc, char **argv)
 {
+#if !defined(_WIN32)
     if (argc > 3 && strcmp(argv[1], "-f") == 0) {
         const char *value = getenv("WORK_FOREGROUND_DISCOVERY_FD");
         if (value && strstr(argv[3], "charset=4e2d")) {
@@ -281,11 +299,21 @@ int main(int argc, char **argv)
         }
         return 0;
     }
+#else
+    (void)argc; (void)argv;
+#endif
     trace_init();
+#if !defined(_WIN32)
     for (uint32_t count = 1; count <= 3; count += 2)
         for (uint32_t active = 0; active < 4; active++) run_case(active, count);
+#else
+    puts("SKIP work_foreground real clients (8 cases require W2 savectl/findui/font discovery)");
+    puts("SKIP work_foreground editor jump (requires Windows editor/platform port)");
+#endif
     run_slice_case();
+#if !defined(_WIN32)
     run_editor_case();
+#endif
     printf("work_foreground_test: %s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

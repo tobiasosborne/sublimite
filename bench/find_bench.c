@@ -7,11 +7,10 @@
 #include "find_supervise.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdlib.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "os/os.h"
 
 #define GIB ((size_t)1073741824)
 #define PERIODIC_BYTES ((size_t)268435456)
@@ -27,7 +26,7 @@ typedef struct row {
     uint64_t g50,g99;
 } row;
 typedef struct job {
-    int fd; size_t n;
+    os_file fd; size_t n;
     const row *row;
     const find_regex *regex; void *scratch; size_t sn;
     find_result result;
@@ -40,9 +39,7 @@ typedef struct job {
 } job;
 static uint64_t cpu_now(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID,&ts)) { perror("thread clock"); _exit(2); }
-    return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
+    return os_thread_cpu_ns();
 }
 static void cpu_record(job *j,uint64_t now,bool cancelled)
 {
@@ -63,7 +60,7 @@ static bool find_bench_should_stop(const work_ctx *ctx)
     return stopped;
 }
 #include "find_probe.h"
-static void pause_briefly(void) { struct timespec t={0,100000}; (void)nanosleep(&t,NULL); }
+static void pause_briefly(void) { os_sleep_ns(100000); }
 /* Timeouts exit the isolated process without freeing/joining live arguments. */
 static void wait_flag(const atomic_bool *flag,uint64_t deadline,const char *label)
 {
@@ -111,7 +108,7 @@ static int missing_event(void *arg)
     return 0;
 }
 static int stuck_shutdown(void *arg)
-{ (void)arg; for (;;) pause(); return 0; }
+{ (void)arg; for (;;) os_sleep_ns(UINT64_C(1000000000)); return 0; }
 static int self_check_deadlines(void)
 {
     int start=find_fixture_supervise(missing_event,"missing start",UINT64_C(1000000000),"missing start");
@@ -125,8 +122,9 @@ static void drain(const work_msg *message,void *ud) { (void)message; (*(size_t *
 static void run_job(work_ctx *ctx)
 {
     job *j=ctx->arg;
-    void *mapping=mmap(NULL,j->n,PROT_READ,MAP_PRIVATE,j->fd,0);
-    if(mapping==MAP_FAILED) { j->code=FIND_ERR_MEMORY; atomic_store(&j->done,true); return; }
+    os_map map;
+    if (os_map_file(&map, &j->fd, 0, j->n) != OS_OK) { j->code=FIND_ERR_MEMORY; atomic_store(&j->done,true); return; }
+    const void *mapping=map.addr;
     find_source s={mapping,j->n,NULL}; find_control c={0}; c.work=ctx;
     if (j->meter_cpu) j->cpu_previous=cpu_now();
     atomic_store_explicit(&j->begun,true,memory_order_release);
@@ -138,15 +136,15 @@ static void run_job(work_ctx *ctx)
     /* UI owns j, kept live through worker completion/drain. Mailbox is bounded. */
     uintptr_t handle=(uintptr_t)j; memcpy(msg.data,&handle,sizeof handle);
     j->published=work_publish(ctx,&msg); j->published_ns=bench_now_ns();
-    (void)munmap(mapping,j->n);
+    os_unmap(&map);
     atomic_store_explicit(&j->done,true,memory_order_release);
 }
 /* Independent KMP oracle while warming with read(). No mapping is retained.
  * Reset after acceptance implements the specified non-overlapping enumeration. */
-static bool warm_oracle(int fd,size_t size,const uint8_t *needle,size_t nn,find_result *want,bool require_a)
+static bool warm_oracle(os_file *fd,size_t size,const uint8_t *needle,size_t nn,find_result *want,bool require_a)
 {
     size_t failure[64]={0}; uint8_t block[1024*1024];
-    if(nn==0 || nn>64 || lseek(fd,0,SEEK_SET)<0) return false;
+    if(nn==0 || nn>64) return false;
     for(size_t i=1,k=0;i<nn;i++) {
         while(k && needle[i]!=needle[k]) k=failure[k-1];
         if(needle[i]==needle[k]) k++;
@@ -156,9 +154,8 @@ static bool warm_oracle(int fd,size_t size,const uint8_t *needle,size_t nn,find_
     size_t off=0,k=0;
     while(off<size) {
         size_t ask=size-off; if(ask>sizeof block) ask=sizeof block;
-        ssize_t got=read(fd,block,ask);
-        if(got<0 && errno==EINTR) continue;
-        if(got<=0) return false;
+        size_t got;
+        if (os_file_pread(fd,block,ask,off,&got) != OS_OK || got == 0) return false;
         for(size_t i=0;i<(size_t)got;i++) {
             uint8_t c=block[i]; if(require_a && c!='a') return false;
             while(k && c!=needle[k]) k=failure[k-1];
@@ -180,32 +177,33 @@ static bool results_equal(const find_result *a,const find_result *b)
 static int measure_row(work_pool *pool,const row *r,size_t samples,bool quick)
 {
     bool require_a=strcmp(r->name,"G6_dense_a")==0 || strncmp(r->name,"G6v_",4)==0;
-    int fd=open(r->file,O_RDONLY); struct stat st;
-    if(fd<0 && errno==ENOENT && quick && require_a) {
+    os_file fd=OS_FILE_INIT; os_stat st;
+    os_err open_rc=os_file_open(&fd,r->file,OS_OPEN_READ);
+    if(open_rc == OS_E_NOENT && quick && require_a) {
         printf("SKIP name=%s file=%s (quick: optional all-a fixture absent; full mode requires it)\n",r->name,r->file);
         return 0;
     }
-    if(fd<0 || fstat(fd,&st)!=0 || st.st_size!=(off_t)r->full_size) {
-        fprintf(stderr,"fixture missing/wrong size: %s\n",r->file); if(fd>=0) (void)close(fd); return 1;
+    if(!os_file_is_open(&fd) || os_file_stat(&fd,&st)!=OS_OK || st.size!=(uint64_t)r->full_size) {
+        fprintf(stderr,"fixture missing/wrong size: %s\n",r->file); if(os_file_is_open(&fd)) os_file_close(&fd); return 1;
     }
     size_t n=quick?QUICK_BYTES:r->full_size;
     find_result want;
-    if(!warm_oracle(fd,n,r->needle,r->nn,&want,require_a)) { fprintf(stderr,"warming/oracle failed\n"); (void)close(fd); return 1; }
-    if(!quick && strcmp(r->name,"G6_newline")==0 && want.total!=8947841) { fprintf(stderr,"log newline fixture mismatch\n"); (void)close(fd); return 1; }
-    if(!quick && strcmp(r->name,"periodic_dense")==0 && (want.total!=8388607 || want.offsets[0]!=6)) { fprintf(stderr,"periodic fixture mismatch\n"); (void)close(fd); return 1; }
+    if(!warm_oracle(&fd,n,r->needle,r->nn,&want,require_a)) { fprintf(stderr,"warming/oracle failed\n"); os_file_close(&fd); return 1; }
+    if(!quick && strcmp(r->name,"G6_newline")==0 && want.total!=8947841) { fprintf(stderr,"log newline fixture mismatch\n"); os_file_close(&fd); return 1; }
+    if(!quick && strcmp(r->name,"periodic_dense")==0 && (want.total!=8388607 || want.offsets[0]!=6)) { fprintf(stderr,"periodic fixture mismatch\n"); os_file_close(&fd); return 1; }
     /* [EW]RROR adds WRROR; verify independently that it has no extra hits. */
     if(r->pattern && r->pattern[0]=='[') {
         find_result extra;
-        if(!warm_oracle(fd,n,(const uint8_t *)"WRROR",5,&extra,false) || extra.total!=0) { (void)close(fd); return 1; }
+        if(!warm_oracle(&fd,n,(const uint8_t *)"WRROR",5,&extra,false) || extra.total!=0) { os_file_close(&fd); return 1; }
     }
-    edit_arena arena; if(edit_arena_init(&arena,1024*1024)!=0) { (void)close(fd); return 1; }
+    edit_arena arena; if(edit_arena_init(&arena,1024*1024)!=0) { os_file_close(&fd); return 1; }
     find_regex *regex=NULL; void *scratch=NULL; size_t sn=0;
     if(r->pattern) {
         void *mem=edit_arena_alloc(&arena,find_regex_bytes(),_Alignof(max_align_t));
-        if(find_regex_compile(mem,find_regex_bytes(),(const uint8_t *)r->pattern,strlen(r->pattern),&regex,NULL)!=FIND_OK) { edit_arena_free(&arena); (void)close(fd); return 1; }
+        if(find_regex_compile(mem,find_regex_bytes(),(const uint8_t *)r->pattern,strlen(r->pattern),&regex,NULL)!=FIND_OK) { edit_arena_free(&arena); os_file_close(&fd); return 1; }
         sn=find_regex_scratch_bytes(regex); scratch=edit_arena_alloc(&arena,sn,_Alignof(max_align_t));
         size_t pn; (void)find_regex_prefix(regex,&pn);
-        if((r->pattern[0]=='[' && pn!=0) || (r->pattern[0]!='[' && pn==0)) { fprintf(stderr,"regex prefix fixture mismatch\n"); edit_arena_free(&arena); (void)close(fd); return 1; }
+        if((r->pattern[0]=='[' && pn!=0) || (r->pattern[0]!='[' && pn==0)) { fprintf(stderr,"regex prefix fixture mismatch\n"); edit_arena_free(&arena); os_file_close(&fd); return 1; }
     }
     printf("ROW name=%s bytes=%zu expected=%llu stored=%zu first=%llu last_stored=%llu mapping=NEW cache=read-warm kind=%s\n",
         r->name,n,(unsigned long long)want.total,want.stored,
@@ -235,18 +233,19 @@ static int measure_row(work_pool *pool,const row *r,size_t samples,bool quick)
     int timing_miss=g50 && bench_judge(&times,g50,g99,0)==BENCH_MISS;
     printf("FIND %s %s correctness=%s (M)%s; limits=(G); unit=ns\n",r->name,
            !correct || timing_miss ? "MISS": g50?"PASS":"TRACK",correct?"PASS":"MISS",bench_evidence_tag());
-    fflush(stdout); edit_arena_free(&arena); (void)close(fd);
+    fflush(stdout); edit_arena_free(&arena); os_file_close(&fd);
     return !correct || structural ? 1:0;
 }
 static int measure_cancel(work_pool *pool,const row *r,size_t samples,bool quick)
 {
-    int fd=open(r->file,O_RDONLY);
-    if(fd<0 && errno==ENOENT && quick) {
+    os_file fd=OS_FILE_INIT;
+    os_err open_rc=os_file_open(&fd,r->file,OS_OPEN_READ);
+    if(open_rc == OS_E_NOENT && quick) {
         printf("SKIP name=G6c file=%s (quick: optional all-a fixture absent; full mode requires it)\n",r->file);
         return 0;
     }
-    if(fd<0) return 1;
-    find_result want; if(!warm_oracle(fd,GIB,r->needle,r->nn,&want,true)) { (void)close(fd); return 1; }
+    if(!os_file_is_open(&fd)) return 1;
+    find_result want; if(!warm_oracle(&fd,GIB,r->needle,r->nn,&want,true)) { os_file_close(&fd); return 1; }
     uint64_t logical[SAMPLE_CAP],observed[SAMPLE_CAP],cpu_values[SAMPLE_CAP]; bench_samples ack,stop,cpu;
     bench_samples_init(&ack,logical,SAMPLE_CAP); bench_samples_init(&stop,observed,SAMPLE_CAP);
     bench_samples_init(&cpu,cpu_values,SAMPLE_CAP); uint64_t cpu_max=0;
@@ -272,7 +271,7 @@ static int measure_cancel(work_pool *pool,const row *r,size_t samples,bool quick
     int miss=cancel_miss(&ack,cpu_max); /* a timing MISS is a note (edit-lwq) */
     structural|=bench_report("G6c_worker_return_TRACK",&stop,0,0);
     printf("FIND cancel %s correctness=%s max_CPU_interval=%llu target=(G)1/5ms logical; every_CPU_interval<=5ms; worker return is wall time (M)%s\n",correct && !miss?"PASS":"MISS",correct?"PASS":"MISS",(unsigned long long)cpu_max,bench_evidence_tag());
-    (void)close(fd); return correct && !structural?0:1;
+    os_file_close(&fd); return correct && !structural?0:1;
 }
 typedef struct arguments { int argc; char **argv; } arguments;
 static int run_bench(void *arg)
@@ -296,9 +295,10 @@ static int run_bench(void *arg)
     memset(near,'a',sizeof near); near[31]='b';
     memset(middle,'a',sizeof middle); middle[16]='b';
     memset(early,'a',sizeof early); early[1]='b';
-    int nf=open("/tmp/edit-corpus/needle.txt",O_RDONLY);
-    if(nf<0 || read(nf,periodic,sizeof periodic)!=(ssize_t)sizeof periodic || memcmp(periodic,near,sizeof near)!=0) { if(nf>=0) (void)close(nf); fprintf(stderr,"needle fixture mismatch\n"); return 2; }
-    (void)close(nf);
+    os_file nf=OS_FILE_INIT; size_t read_size=0;
+    os_err needle_rc=os_file_open(&nf,"/tmp/edit-corpus/needle.txt",OS_OPEN_READ);
+    if(needle_rc != OS_OK || os_file_read(&nf,periodic,sizeof periodic,&read_size) != OS_OK || read_size != sizeof periodic || memcmp(periodic,near,sizeof near)!=0) { if(os_file_is_open(&nf)) os_file_close(&nf); fprintf(stderr,"needle fixture mismatch\n"); return 2; }
+    os_file_close(&nf);
     const row rows[]={
         {"G6_ERROR","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"ERROR",5,GIB,NULL,80000000,125000000},
         {"G6_newline","/tmp/edit-corpus/log_1g.txt",(const uint8_t *)"\n",1,GIB,NULL,80000000,125000000},
@@ -324,6 +324,14 @@ static int run_bench(void *arg)
 }
 int main(int argc,char **argv)
 {
+#if defined(_WIN32)
+    if (argc == 2 && strncmp(argv[1], "--find-fixture=", 15) == 0) {
+        const char *label = argv[1] + 15;
+        if (!strcmp(label, "missing start") || !strcmp(label, "missing completion")) return missing_event((void *)label);
+        if (!strcmp(label, "stuck shutdown")) return stuck_shutdown(NULL);
+        return 2;
+    }
+#endif
     if (argc==2 && strcmp(argv[1],"--self-check-cancel")==0) return self_check_cancel();
     if (argc==2 && strcmp(argv[1],"--self-check-deadlines")==0) return self_check_deadlines();
     arguments args={argc,argv};

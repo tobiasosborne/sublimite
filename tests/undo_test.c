@@ -2,10 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/mman.h>
+#include "core_vm.h"
 #include <time.h>
 #include <signal.h>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
+#include "core_proc.h"
+#if defined(_WIN32)
+#include <psapi.h>
+#endif
 #include <unistd.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"undo_test:%d: FAIL %s\n",__LINE__,#x); exit(1); } } while (0)
 static undo_state state(uint8_t v) { undo_state s; memset(&s,v,sizeof s); return s; }
@@ -253,7 +259,17 @@ static void review_2(void) {
 }
 static size_t resident(const edit_pool *p) {
     size_t pages=p->map_bytes/4096; unsigned char *v=malloc(pages); CHECK(v);
-    CHECK(mincore(p->base,p->map_bytes,v)==0); size_t n=0;
+#if defined(_WIN32)
+    for (size_t i = 0; i < pages; i++) {
+        PSAPI_WORKING_SET_EX_INFORMATION info = {0};
+        info.VirtualAddress = (unsigned char *)p->base + i * 4096;
+        CHECK(QueryWorkingSetEx(GetCurrentProcess(), &info, sizeof info));
+        v[i] = info.VirtualAttributes.Valid ? 1 : 0;
+    }
+#else
+    CHECK(mincore(p->base,p->map_bytes,v)==0);
+#endif
+    size_t n=0;
     for(size_t i=0;i<pages;i++) if(v[i]&1u) n+=4096;
     free(v); return n;
 }
@@ -521,6 +537,11 @@ static void sliced_lifecycle(void) {
     /* A successful same-length out-of-band tree edit between slices is a
      * contract violation, including when the replacement bytes are identical. */
     puts("review 5: expecting an assertion in the out-of-band mutation child");
+#if defined(_WIN32)
+    os_proc_status status;
+    CHECK(core_child("--child=mutation", -1, &status) == OS_OK);
+    CHECK(status.how == OS_PROC_EXITED && status.code == 99);
+#else
     fflush(NULL);pid_t child=fork();CHECK(child>=0);
     if(child==0) {
         undo_log u;piece_tree *t;start(&u,&t,32);undo_change c;
@@ -531,8 +552,12 @@ static void sliced_lifecycle(void) {
     }
     int status;CHECK(waitpid(child,&status,0)==child);
     CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
+#endif
     puts("review 5: slice clear/destroy abort and out-of-band mutation assertion passed");
 }
+#if defined(_WIN32)
+static bool history_child;
+#endif
 static void bounded_history(void) {
     undo_log u; piece_tree *t; undo_change c; start(&u,&t,64);
     ins(&u,0,"a",0,0,0);ins(&u,1,"b",1,0,0);
@@ -540,14 +565,25 @@ static void bounded_history(void) {
     CHECK(undo_undo(&u,1,&c)==0);
     /* The query must work even when the entire retained record mapping is
      * inaccessible. This checks the work bound without a loaded-box timer. */
+#if defined(_WIN32)
+    if (history_child) {
+        CHECK(core_vm_protect(u.pool.base, u.pool.map_bytes, false) == 0);
+        undo_history h = undo_get_history(&u);
+        _Exit(h.undo_groups==1 && h.redo_groups==1 && h.group_serial==2?0:2);
+    }
+    os_proc_status status;
+    CHECK(core_child("--child=history", -1, &status) == OS_OK);
+    CHECK(status.how == OS_PROC_EXITED && status.code == 0);
+#else
     pid_t child=fork();CHECK(child>=0);
     if(child==0) {
-        CHECK(mprotect(u.pool.base,u.pool.map_bytes,PROT_NONE)==0);
+        CHECK(core_vm_protect(u.pool.base, u.pool.map_bytes, false)==0);
         undo_history h=undo_get_history(&u);
         _exit(h.undo_groups==1 && h.redo_groups==1 && h.group_serial==2?0:2);
     }
     int status;CHECK(waitpid(child,&status,0)==child);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
     CHECK(undo_redo(&u,1,&c)==0);
     for(unsigned i=0;i<100;i++) {
         undo_break_burst(&u);ins(&u,piece_len(t),"x",i,0,0);
@@ -560,7 +596,25 @@ static void bounded_history(void) {
     undo_clear(&u);CHECK(undo_get_history(&u).undo_groups==0);finish(&u);
     puts("review editor 9: bounded group query, bursts, replay, eviction and clear passed");
 }
+#if defined(_WIN32)
+static void expected_abort(int sig) { _Exit(sig == SIGABRT ? 99 : 98); }
+static void mutation_child(void)
+{
+    (void)signal(SIGABRT, expected_abort);
+    undo_log u;piece_tree *t;start(&u,&t,32);undo_change c;
+    ins(&u,0,"a",0,0,0);ins(&u,1,"b",1,0,0);
+    CHECK(undo_undo_slice(&u,1,1,UINT64_MAX,&c)==UNDO_MORE);
+    CHECK(piece_delete(t,0,1,NULL)==0 && piece_insert(t,0,(const uint8_t *)"a",1)==0);
+    (void)undo_undo_slice(&u,1,1,UINT64_MAX,&c);_Exit(0);
+}
+#endif
 int main(int argc,char **argv) {
+#if defined(_WIN32)
+    if (argc == 2 && strcmp(argv[1], "--child=mutation") == 0) mutation_child();
+    if (argc == 2 && strcmp(argv[1], "--child=history") == 0) {
+        history_child = true; bounded_history(); return 2;
+    }
+#endif
     if(argc==2) {
         switch(atoi(argv[1])) {case 1:review_1();atomic_sweep();undo_batch_failure_reporting();break;case 2:review_2();break;case 3:review_3();break;case 4:review_4();break;case 5:review_5();sliced_lifecycle();break;case 9:bounded_history();break;case 8:review_8();batch_failure_reporting();break;default:return 2;}
         return 0;

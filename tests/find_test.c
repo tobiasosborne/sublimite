@@ -1,14 +1,13 @@
+#include "os/os.h"
 #include "find/find.h"
 #include "base/base.h"
 #include "trace/trace.h"
 #include "../bench/find_supervise.h"
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
 #include <time.h>
 #include <stdlib.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "core_vm.h"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#c); return 1; } } while (0)
 
 static find_source bytes(const char *s) { return (find_source){(const uint8_t *)s,strlen(s),NULL}; }
@@ -64,16 +63,16 @@ static int literal_edges(void)
     CHECK(find_literal(&s,needle,40,NULL,NULL)==FIND_ERR_ARGUMENT);
     s=(find_source){NULL,1,NULL}; CHECK(find_literal(&s,needle,40,NULL,&r)==FIND_ERR_ARGUMENT);
     /* Read boundaries, including a needle ending at the last mapped byte. */
-    long page=sysconf(_SC_PAGESIZE); CHECK(page>0);
+    long page=(long)os_page_size(); CHECK(page>0);
     size_t pn=(size_t)page;
-    uint8_t *map=mmap(NULL,3*pn,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); CHECK(map!=MAP_FAILED);
-    CHECK(mprotect(map+pn,pn,PROT_READ|PROT_WRITE)==0);
+    uint8_t *map=core_vm_alloc(3*pn, false); CHECK(map!=NULL);
+    CHECK(core_vm_protect(map+pn, pn, true)==0);
     uint8_t *tail=map+2*pn-33; memset(tail,'a',33); tail[32]='b';
     s=(find_source){tail,33,NULL};
     CHECK(find_literal(&s,(const uint8_t *)"ab",2,NULL,&r)==FIND_OK && r.total==1 && r.offsets[0]==31);
     s=(find_source){map+pn,1,NULL}; /* leading guard */
     CHECK(find_literal(&s,(const uint8_t *)"z",1,NULL,&r)==FIND_OK && r.total==0);
-    CHECK(munmap(map,3*pn)==0); return 0;
+    CHECK(core_vm_free(map,3*pn)==0); return 0;
 }
 
 static int snapshot_cases(void)
@@ -232,13 +231,13 @@ static int regex_contract(void)
     s=bytes("ab");
     CHECK(find_regex_captures(&s,re,0,scratch,sn,NULL,&m)==FIND_OK && m.matched && m.groups==1 && m.captures[0].start==1 && m.captures[0].end==2);
     CHECK(find_regex_group_count(re)==1);
-    long page=sysconf(_SC_PAGESIZE); CHECK(page>0); size_t pn=(size_t)page;
-    uint8_t *map=mmap(NULL,2*pn,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); CHECK(map!=MAP_FAILED);
-    CHECK(mprotect(map,pn,PROT_READ|PROT_WRITE)==0); map[pn-1]='a';
+    long page=(long)os_page_size(); CHECK(page>0); size_t pn=(size_t)page;
+    uint8_t *map=core_vm_alloc(2*pn, false); CHECK(map!=NULL);
+    CHECK(core_vm_protect(map, pn, true)==0); map[pn-1]='a';
     CHECK(find_regex_compile(mem,find_regex_bytes(),(const uint8_t *)"a$",2,&re,NULL)==FIND_OK);
     s=(find_source){map+pn-1,1,NULL};
     CHECK(find_regex_search(&s,re,scratch,sn,NULL,&r)==FIND_OK && r.total==1 && r.offsets[0]==0);
-    CHECK(munmap(map,2*pn)==0);
+    CHECK(core_vm_free(map,2*pn)==0);
     uint8_t dense[6000]; memset(dense,'x',sizeof dense); s=(find_source){dense,sizeof dense,NULL};
     CHECK(find_regex_compile(mem,find_regex_bytes(),NULL,0,&re,NULL)==FIND_OK);
     edit_malloc_guard_begin();
@@ -272,10 +271,10 @@ static int cancellation(void)
     cancel_job j={0}; j.s=(find_source){data,a.size,NULL};
     atomic_init(&j.begun,false); atomic_init(&j.done,false);
     work_handle h=work_submit(&pool,(work_job){cancel_scan,&j,17,WORK_BULK}); CHECK(h.epoch!=0);
-    while(!atomic_load(&j.begun)) { struct timespec wait={0,100000}; nanosleep(&wait,NULL); }
-    struct timespec wait={0,1000000}; nanosleep(&wait,NULL);
+    while(!atomic_load(&j.begun)) { struct timespec wait={0,100000}; os_sleep_ns((uint64_t)wait.tv_sec * UINT64_C(1000000000) + (uint64_t)wait.tv_nsec); }
+    struct timespec wait={0,1000000}; os_sleep_ns((uint64_t)wait.tv_sec * UINT64_C(1000000000) + (uint64_t)wait.tv_nsec);
     work_cancel(&pool,h);
-    while(!atomic_load_explicit(&j.done,memory_order_acquire)) { struct timespec pause={0,100000}; nanosleep(&pause,NULL); }
+    while(!atomic_load_explicit(&j.done,memory_order_acquire)) { struct timespec pause={0,100000}; os_sleep_ns((uint64_t)pause.tv_sec * UINT64_C(1000000000) + (uint64_t)pause.tv_nsec); }
     work_pool_shutdown(&pool);
     /* A fast implementation may finish before this thread is scheduled to
      * cancel. Either completion ordering is valid; precancel below is exact. */
@@ -293,8 +292,14 @@ static int run_find_tests(void *unused)
     CHECK(literal_cases()==0); CHECK(literal_edges()==0); CHECK(regex_contract()==0); CHECK(snapshot_cases()==0); CHECK(regex_cases()==0); CHECK(cancellation()==0);
     puts("find_test: ok (frozen P1.10a)"); return 0;
 }
-int main(void)
+int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+    if (argc == 2 && strcmp(argv[1], "--find-fixture=frozen find tests through shutdown") == 0)
+        return run_find_tests(NULL);
+#else
+    (void)argc; (void)argv;
+#endif
     /* Keep the frozen assertions intact, but bound lost starts, worker returns
      * and shutdown as one fixture. Timeout kills the child before its storage
      * can be released; the parent never joins an unresponsive worker. */

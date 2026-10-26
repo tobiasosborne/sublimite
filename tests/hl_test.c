@@ -1,3 +1,4 @@
+#include "os/os.h"
 /* edit-v0o.2 mailbox contract. Ranges are derived from the fixture bytes;
  * refresh comes from the caller, never from a guessed display rate. */
 #include "hl/hl.h"
@@ -9,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sched.h>
 
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", #c); return 1; } } while (0)
 
@@ -192,7 +192,7 @@ static int mailbox_query_test(const TSLanguage *language, const char *text)
     received_scopes received = {generation, strlen(text), 0, false, false, false};
     while (!work_handle_finished(pool, handle) || work_mailbox_pending(pool)) {
         (void)work_mailbox_receive(pool, handle, generation, receive_scopes, &received);
-        sched_yield();
+        os_yield();
     }
     REQUIRE(job.status == HL_QUERY_OK && received.completed && !received.failed);
     REQUIRE(received.spans && received.saw_function);

@@ -3,7 +3,7 @@
 #include "trace/trace.h"
 #include "file/file.h"
 #include "hl_fixture.h"
-#include <poll.h>
+#include "os/os.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -20,6 +20,7 @@ static void collect(const work_msg *message, void *payload)
     EDIT_ASSERT(result.phase == *phase + 1u);
     *phase = result.phase;
 }
+#if !defined(_WIN32)
 static void file_collect(const work_msg *message, void *payload)
 {
     (void)payload;
@@ -66,6 +67,13 @@ static int faulted_snapshot(void)
     REQUIRE(unlink(path) == 0);
     return 0;
 }
+#else
+static int faulted_snapshot(void)
+{
+    puts("SKIP hl_worker faulted_snapshot (requires W2 mapped file/fault integration)");
+    return 0;
+}
+#endif
 static int sliced(hl_request *request)
 {
     logical_clock clock = {0};
@@ -142,9 +150,9 @@ int main(void)
     uint32_t phase = 0;
     while (!work_handle_finished(&pool, handle) || work_mailbox_pending(&pool)) {
         (void)work_mailbox_receive(&pool, handle, 5, collect, &phase);
-        struct pollfd fd = {work_pool_eventfd(&pool), POLLIN, 0};
+
         /* poll timeout zero is the nonblocking progress-pump control. */
-        (void)poll(&fd, 1, 0);
+        (void)os_wake_wait(work_pool_wake(&pool), 0);
     }
     REQUIRE(phase == HL_DOCUMENT_READY);
     work_pool_shutdown(&pool);
