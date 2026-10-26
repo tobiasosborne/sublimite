@@ -611,7 +611,10 @@ static os_err open_file(os_file *out, HANDLE root, UNICODE_STRING *name, unsigne
     HANDLE h;
     NTSTATUS s = nt_open(&h, root, name, access, disp, options, FILE_ATTRIBUTE_NORMAL);
     if (!NT_SUCCESS(s)) return fail_nt(s);
-    if (nofollow) {
+    /* FILE_CREATE success proves a new regular object, not a pre-existing
+     * reparse point. Do not introduce post-create query/truncate failures that
+     * would close the only owned handle and leave its name behind. */
+    if (nofollow && disp != FILE_CREATE) {
         os_err rc = reparse_reopen(&h, root, name, access, options, true);
         if (rc) return rc;
         FILE_STANDARD_INFO info;

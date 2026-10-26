@@ -1,6 +1,7 @@
 #include "ipc.h"
 #include "os/os.h"
 #if defined(_WIN32)
+#include "crt_win.h"
 #include <io.h>
 #include <fcntl.h>
 #endif
@@ -246,7 +247,7 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
     uint8_t *data=edit_arena_alloc(&args->arena,cap,1);
     if(data==NULL) return IPC_LIMIT;
 #if defined(_WIN32)
-    int mode=_setmode(fd,_O_BINARY);
+    int mode=ipc_crt_mode(fd,_O_BINARY);
     if(mode<0) return IPC_IO;
     ipc_result rc=IPC_OK;
 #endif
@@ -254,7 +255,7 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
     for(;;) {
         uint8_t extra;
 #if defined(_WIN32)
-        int got=_read(fd,n<cap?data+n:&extra,(unsigned)(n<cap?cap-n:1u));
+        int got=ipc_crt_read(fd,n<cap?data+n:&extra,(unsigned)(n<cap?cap-n:1u));
 #else
         ssize_t got=read(fd,n<cap?data+n:&extra,n<cap?cap-n:1u);
 #endif
@@ -277,7 +278,7 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
         n+=(size_t)got;
     }
 #if defined(_WIN32)
-    if(_setmode(fd,mode)<0) return IPC_IO;
+    if(ipc_crt_mode(fd,mode)<0) return IPC_IO;
     if(rc!=IPC_OK) return rc;
 #endif
     args->request.stdin_data=data; args->request.stdin_size=n; return IPC_OK;

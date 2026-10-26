@@ -20,10 +20,17 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } } while (0)
 
 static _Thread_local bool ui_no_io;
+static _Atomic int r2_unlink_failures;
+static char r2_collision[80];
 int stat(const char *path, struct stat *st) { CHECK(!ui_no_io); return (int)syscall(SYS_newfstatat,AT_FDCWD,path,st,0); }
 int fstat(int fd, struct stat *st)
 {
     CHECK(!ui_no_io);
+    if(getenv("EDIT_R2_POST_CREATE")) {
+        char entry[64],path[4097]; CHECK(snprintf(entry,sizeof entry,"/proc/self/fd/%d",fd)>0);
+        ssize_t size=readlink(entry,path,sizeof path-1);
+        if(size>0) { path[size]=0; if(strstr(path,"/.sublimite-reload-") && !strstr(path,"(deleted)")) { errno=EIO; return -1; } }
+    }
     if(getenv("EDIT_CK4_ID_FAIL") && (fcntl(fd,F_GETFL)&O_ACCMODE)==O_WRONLY) {
         char entry[64],path[4097]; int n=snprintf(entry,sizeof entry,"/proc/self/fd/%d",fd);
         CHECK(n>0 && (size_t)n<sizeof entry); ssize_t size=readlink(entry,path,sizeof path-1);
@@ -47,7 +54,19 @@ int openat(int fd, const char *path, int flags, ...)
     if (getenv("EDIT_CK4_NO_TMPFILE") && (flags & O_TMPFILE)==O_TMPFILE) { errno=EOPNOTSUPP; return -1; }
     mode_t mode=0;
     if ((flags & O_CREAT) || (flags & O_TMPFILE)==O_TMPFILE) { va_list args; va_start(args,flags); mode=(mode_t)va_arg(args,int); va_end(args); }
+    if(getenv("EDIT_R2_COLLISION") && !r2_collision[0] && !strncmp(path,".sublimite-reload-",strlen(".sublimite-reload-")) && (flags&O_EXCL)) {
+        int collision=(int)syscall(SYS_openat,fd,path,flags,mode); CHECK(collision>=0);
+        CHECK(write(collision,"owned by fixture",16)==16 && close(collision)==0);
+        CHECK(strlen(path)<sizeof r2_collision); strcpy(r2_collision,path); errno=EEXIST; return -1;
+    }
     return (int)syscall(SYS_openat,fd,path,flags,mode);
+}
+int unlinkat(int fd, const char *path, int flags)
+{
+    if(!strncmp(path,".sublimite-reload-",strlen(".sublimite-reload-")) && atomic_load(&r2_unlink_failures)>0) {
+        (void)atomic_fetch_sub(&r2_unlink_failures,1); errno=EIO; return -1;
+    }
+    return (int)syscall(SYS_unlinkat,fd,path,flags);
 }
 int fsync(int fd) { CHECK(!ui_no_io); return (int)syscall(SYS_fsync,fd); }
 ssize_t pread(int fd, void *bytes, size_t n, off_t off) { CHECK(!ui_no_io); return (ssize_t)syscall(SYS_pread64,fd,bytes,n,off); }
@@ -1140,6 +1159,52 @@ static void ck4_readonly_reload(void)
     piece_destroy(f.tree); f.tree=replacement; finish_fixture(&f);
     puts("P4-3 section 33: read-only source parent and unsupported O_TMPFILE reload through private writable backing");
 }
+static void r2_reload_access(void)
+{
+    CHECK(geteuid()!=0); /* This permission regression must run unprivileged. */
+    fixture f; init(&f,"source bytes"); CHECK(savectl_destroy(f.s)==SAVECTL_OK);
+    char cache[]="/tmp/edit-savectl-cache-XXXXXX"; CHECK(mkdtemp(cache)); CHECK(chmod(cache,0500)==0);
+    savectl_options o={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),.source_mode=FILE_MODE_COPY,
+        .reload_allocator=piece_default_allocator(),.reload_cache_dir=cache};
+    CHECK(savectl_create(&f.s,&o,false)==SAVECTL_OK); CHECK(chmod(f.dir,0300)==0);
+    int old=open(f.dir,O_TMPFILE|O_RDWR,0600); CHECK(old>=0 && close(old)==0);
+    CHECK(savectl_reload(f.s)==SAVECTL_OK); wait_controller(&f);
+    savectl_model m=savectl_get_model(f.s);
+    CHECK(chmod(f.dir,0700)==0 && chmod(cache,0700)==0);
+    printf("r2 reload search/write-only parent: file_error=%d\n",m.file_error); fflush(stdout);
+    CHECK(m.file_error==FILE_OK);
+    piece_tree *tree=NULL; savectl_view view; int rc;
+    do { rc=savectl_take_reload(f.s,&tree,&view); } while(rc==SAVECTL_BUSY);
+    CHECK(rc==SAVECTL_OK && tree); uint8_t text[12];
+    CHECK(piece_read(tree,0,text,sizeof text)==0 && !memcmp(text,"source bytes",sizeof text));
+    piece_destroy(tree); finish_fixture(&f); CHECK(rmdir(cache)==0);
+    puts("savectl r2 search/write-only source and unwritable cache: ok");
+}
+static void r2_reload_temporary(const char *mode)
+{
+    fixture f; init(&f,"source bytes"); CHECK(savectl_destroy(f.s)==SAVECTL_OK);
+    savectl_options o={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),.source_mode=FILE_MODE_COPY,
+        .reload_allocator=piece_default_allocator(),.reload_cache_dir=f.dir};
+    CHECK(savectl_create(&f.s,&o,false)==SAVECTL_OK);
+    CHECK(setenv("EDIT_CK4_NO_TMPFILE","1",1)==0);
+    if(!strcmp(mode,"post-create")) CHECK(setenv("EDIT_R2_POST_CREATE","1",1)==0);
+    if(!strcmp(mode,"unlink")) atomic_store(&r2_unlink_failures,1);
+    if(!strcmp(mode,"collision")) CHECK(setenv("EDIT_R2_COLLISION","1",1)==0);
+    CHECK(savectl_reload(f.s)==SAVECTL_OK); wait_controller(&f);
+    CHECK(unsetenv("EDIT_CK4_NO_TMPFILE")==0 && unsetenv("EDIT_R2_POST_CREATE")==0 && unsetenv("EDIT_R2_COLLISION")==0);
+    DIR *directory=opendir(f.dir); CHECK(directory); struct dirent *entry; size_t residue=0;
+    while((entry=readdir(directory))) if(!strncmp(entry->d_name,".sublimite-reload-",strlen(".sublimite-reload-")) && strcmp(entry->d_name,r2_collision)) residue++;
+    CHECK(closedir(directory)==0);
+    printf("r2 reload %s: owned temporary residue=%zu\n",mode,residue); fflush(stdout); CHECK(residue==0);
+    if(r2_collision[0]) {
+        int directory_fd=open(f.dir,O_RDONLY|O_DIRECTORY); CHECK(directory_fd>=0);
+        int collision=openat(directory_fd,r2_collision,O_RDONLY); CHECK(collision>=0); char text[16];
+        CHECK(read(collision,text,sizeof text)==sizeof text && !memcmp(text,"owned by fixture",sizeof text));
+        CHECK(close(collision)==0 && unlinkat(directory_fd,r2_collision,0)==0 && close(directory_fd)==0); r2_collision[0]=0;
+    }
+    savectl_close_begin(f.s); wait_controller(&f); finish_fixture(&f);
+    printf("savectl r2 %s temporary ownership: ok\n",mode);
+}
 static int ck4_ambiguous_rename(void *ctx,const char *from,const char *to)
 {
     bool *fail=ctx; int rc=rename(from,to);
@@ -1173,6 +1238,8 @@ static void ck4_prepare_recovery(void)
 }
 int main(int argc, char **argv)
 {
+    if(argc>1 && !strcmp(argv[1],"--r2-access")) { r2_reload_access(); return 0; }
+    if(argc>1 && !strncmp(argv[1],"--r2-",5)) { r2_reload_temporary(argv[1]+5); return 0; }
     trace_init();
     if (argc>1 && !strcmp(argv[1],"--ck4-prepare")) { ck4_prepare_recovery(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--ck4-identity")) { ck4_directory_recovery(true); return 0; }
@@ -1191,6 +1258,7 @@ int main(int argc, char **argv)
     if (argc>1 && !strcmp(argv[1],"--reload-failure")) { reload_allocation_recovery(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--mailbox-protocol")) { mailbox_terminal_protocol(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--file-source")) { for (unsigned i=0;i<4u;++i) mapped_file_source(i); puts("savectl retained actual mapped identity/guard: ok"); return 0; }
+    r2_reload_access(); r2_reload_temporary("post-create"); r2_reload_temporary("unlink"); r2_reload_temporary("collision");
     ck4_prepare_recovery(); ck4_readonly_reload(); ck4_directory_recovery(false); ck4_directory_recovery(true);
     journal_handoff_crash(); finish_writeback_recovery(); bounded_request_status(false); bounded_request_status(true);
     mailbox_terminal_protocol();

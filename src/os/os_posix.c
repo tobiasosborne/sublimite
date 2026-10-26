@@ -298,6 +298,11 @@ os_err os_file_open(os_file *out, const char *path, unsigned flags)
     if (!ok || !path) return fail_with(OS_E_INVAL);
     int fd;
     RETRY(fd, open(path, o, 0600));
+    /* A successful exclusive creation is already known to be a new regular
+     * file. No fallible classification may lose ownership of its name. */
+    if(fd>=0 && (flags&(OS_OPEN_CREATE|OS_OPEN_EXCL))==(OS_OPEN_CREATE|OS_OPEN_EXCL)) {
+        out->fd=fd; return OS_OK;
+    }
     return finish_open(out, fd);
 }
 os_err os_file_open_at(os_file *out, const os_dir *dir, const char *name, unsigned flags)
@@ -308,6 +313,9 @@ os_err os_file_open_at(os_file *out, const os_dir *dir, const char *name, unsign
     if (!ok || bad_name(name)) return fail_with(OS_E_INVAL);
     int fd;
     RETRY(fd, openat(dir->fd, name, o, 0600));
+    if(fd>=0 && (flags&(OS_OPEN_CREATE|OS_OPEN_EXCL))==(OS_OPEN_CREATE|OS_OPEN_EXCL)) {
+        out->fd=fd; return OS_OK;
+    }
     return finish_open(out, fd);
 }
 os_err os_file_open_anon(os_file *out, const os_dir *dir)
@@ -467,6 +475,9 @@ os_err os_dir_open(os_dir *out, const char *path)
     if (!path) return fail_with(OS_E_INVAL);
     int fd;
     RETRY(fd, open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    /* Anonymous creation only needs search/create permission. Keep the usual
+     * readable reference whenever possible, so sync and flock stay unchanged. */
+    if(fd<0 && errno==EACCES) RETRY(fd, open(path, O_PATH | O_DIRECTORY | O_CLOEXEC));
     if (fd < 0) return fail();
     out->fd = fd;
     return OS_OK;
@@ -477,6 +488,7 @@ os_err os_dir_open_at(os_dir *out, const os_dir *dir, const char *name)
     if (bad_name(name)) return fail_with(OS_E_INVAL);
     int fd;
     RETRY(fd, openat(dir->fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if(fd<0 && errno==EACCES) RETRY(fd, openat(dir->fd, name, O_PATH | O_DIRECTORY | O_CLOEXEC));
     if (fd < 0) return fail();
     out->fd = fd;
     return OS_OK;
@@ -486,14 +498,27 @@ void os_dir_close(os_dir *d)
     if (d && d->fd >= 0) { int e = errno; (void)close(d->fd); errno = e; }
     if (d) d->fd = -1;
 }
+static os_err readable_directory(os_dir *d)
+{
+    int flags=fcntl(d->fd,F_GETFL);
+    if(flags<0) return fail();
+    if(!(flags&O_PATH)) return OS_OK;
+    int fd;
+    RETRY(fd, openat(d->fd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+    if(fd<0) return fail();
+    (void)close(d->fd); d->fd=fd; return OS_OK;
+}
 os_err os_dir_sync(os_dir *d)
 {
-    int rc;
-    RETRY(rc, fsync(d->fd));
-    return rc ? fail() : OS_OK;
+    os_err rc=readable_directory(d);
+    if(rc!=OS_OK) return rc;
+    int synced;
+    RETRY(synced, fsync(d->fd));
+    return synced ? fail() : OS_OK;
 }
 /* flock on the directory inode itself (journal_retire_directory's guard). */
-os_err os_dir_try_lock(os_dir *d, os_lock kind) { return lock_fd(d->fd, kind); }
+os_err os_dir_try_lock(os_dir *d, os_lock kind)
+{ os_err rc=readable_directory(d); return rc!=OS_OK?rc:lock_fd(d->fd, kind); }
 void os_dir_unlock(os_dir *d) { unlock_fd(d->fd); }
 int os_dir_fd(const os_dir *d) { return d->fd; }
 

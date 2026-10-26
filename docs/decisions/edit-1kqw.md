@@ -104,3 +104,70 @@ closes; the process-kill test verifies a new server can bind afterward.
 ## Coordinator decision (session 22, 2026-10-26)
 
 The file- and journal-dependent cases that SKIP on Windows until edit-pf3l (W2.1) and edit-xt90 (W2.2) land are accepted as such; the shared file-identity conversion is aligned at landing, when this tree rebases over those two, and the production integration is verified by the coordinator's full checks then. The Codex review (docs/reviews/edit-1kqw.md) is triaged before landing.
+
+## Round 2: review findings → change → test
+
+Finding numbers refer to `docs/reviews/edit-1kqw.md`; evidence and the remaining
+dependency blockers are in `docs/worker-reports/edit-1kqw-s12-r2.md`.
+The generation-publication protocol below supersedes the earlier fixed-name
+Windows transport description.
+
+| Finding | Change | Test |
+| --- | --- | --- |
+| 1 — startup publication | The service thread owns the SID/namespace mutex until shutdown. A contender reports EXISTS only after opening an authenticated published listener; otherwise it waits within the existing lock deadline. | `ipc_transport_test --startup`: separate processes, pre-listener barrier, handoff and killed-initializer takeover. Red then green. |
+| 2 — stale client-held pipe | A protected mapping publishes a random generation-specific name and owner PID. A replacement creates its first listener under a fresh name instead of reusing the client-held name. | `ipc_transport_test --orphan`: retain a raw client across owner kill, rebind and ACK a fresh request before closing it. Round 1 already passed on this host; no native red is claimed. |
+| 3 — launcher handoff | `ipc_launcher_prepare` returns a non-inheritable listener and endpoint string. Pass the string in argv; `ipc_server_connect_wait` adopts a child-local endpoint. Frozen process inheritance stays unchanged. | `ipc_win_test --launcher-cases`: separate launcher/UI processes, primary and isolated ownership, UI disconnect. Missing-symbol red, native green. |
+| 4 — CRT descriptors | Scoped thread-local invalid-parameter handlers guard handle lookup, stdin mode and reads, restoring the caller's handler. | `ipc_win_test --invalid-cases`; `ipc_descriptor_test` also injects the documented callback, which this host's CRT does not consistently invoke. Round-1 callback red, guarded green; stdin mode restored after I/O failure and LIMIT. |
+| 5 — client impersonation | Every production client open requests `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`. | `ipc_transport_test --sqos`: inspect primary and launcher client opens. Red then green. |
+| 6 — launcher ACL | Both launcher constructors use the SID-only protected descriptor and reject remote clients, with non-inheritable handles and peer authentication. | `ipc_transport_test --security`: inspect actual ACLs and refuse restricted-token read and duplex opens. Red then green. |
+| 7 — trailing requests | Peek buffered bytes before READY and again immediately before the callback. Reply IPC_PROTOCOL without a callback; no pending extra-byte read consumes the evidence first. | `ipc_transport_test --trailers`: frame plus garbage/second frame, service mutex held while UI drains. Red then green. |
+| 8 — reload permissions | On EACCES a POSIX directory reference may use O_PATH for relative anonymous creation. Sync/lock must reopen the pinned directory readably before use. | `savectl_test --r2-access`: unprivileged write/search-only source parent, unwritable cache and old O_TMPFILE positive control. Red then green. |
+| 9 — temporary ownership | Exclusive creation avoids fallible post-create classification on either OS. A named reload creation retains its unlink obligation; failed unlink retries on worker maintenance and prevents premature destruction. | `savectl_test --r2-post-create`, `--r2-unlink`, `--r2-collision`: injected failures, no owned residue, foreign collision preserved. First two red then green; collision already green. |
+| 10 — production save coverage | Conditional real-dependency cases assert sharing/BUSY preservation and cleanup, then pause at the fsynced-before-rename seam and replace an open/mapped target. `check-savectl-production` refuses a dependency SKIP. | Body compiles with REAL_DEPS. Integration target remains red: this worktree lacks Windows file/journal. Production green awaits dependency integration. |
+| 11 — complete identity | Reload compares intact `os_stat.id` values at descriptor/path and before/after boundaries. The legacy public baseline cannot store the high word. | `savectl_identity_test`: high-word-only changes, red then green. Complete baseline/converter integration awaits W2.1; finding only partially closed. |
+
+### Publication and crash recovery protocol
+
+The named mutex supplies exclusion through actual ownership, not existence. The
+service thread acquires it, including WAIT_ABANDONED after a crash. While another
+thread owns it, an initializer tries the published generation and returns EXISTS
+only after SID and published-PID authentication. If no listener opens, it retries
+against the existing absolute lock deadline, or acquires the abandoned mutex and
+initializes a replacement.
+
+Only the owner writes the SID-protected named mapping. It clears readiness,
+generates a random pipe suffix, creates the first overlapped listener with the
+SID-only ACL and remote rejection, then publishes name/PID and readiness last.
+Clients read readiness around their snapshot, open with restricted SQOS, and
+authenticate the server SID and PID before sending. Missing or busy publication
+during startup is retried within the caller's absolute deadline.
+
+A crashed owner's old pipe can remain through a surviving client and return
+BUSY or ACCESS_DENIED if reused. Replacements do not classify that as a live
+owner or attempt to reclaim that name: the authenticated rendezvous selects a
+fresh generation under exclusive ownership. Old generations disappear at last
+handle close. Normal teardown clears readiness before releasing the mutex.
+No arbitrary handle inheritance is added.
+
+### OS edits and identity integration boundary
+
+The inherited `os_posix.c` edits address findings 8 and 9; the inherited
+`os_win.c` edit addresses finding 9. Retention requires the OS suites to remain
+green, as recorded in the report. `os.h` stays frozen. Reopening an O_PATH
+reference for sync/lock can still fail with EACCES; it never reports successful
+durability on failure or substitutes a pathname for the pinned object.
+
+This checkout's `file_id` has only `dev` and `ino`; it cannot hold a volume plus
+the entire Windows FileId. This worker does not change `src/file`. W2.1's shared
+conversion must preserve `os_stat.id.volume`, `index[0]` and `index[1]` without
+hashing or dropping a word, and use the same timestamp/metadata encoding for
+descriptor and path identities. Controller baselines, rebases, source validation
+and the fixture adapter must then use that representation. The native reload
+guards prevent high-word-only substitution during reload; complete baseline and
+production save acceptance remain open until the dependency is integrated.
+
+## Coordinator decisions after round 2 (session 22 wind-up, 2026-10-26)
+
+1. The round-2 edits to `src/os/os_posix.c` and `os_win.c` stay: the frozen header is untouched and `tests/os_test.c` (17/17) and `tests/win/os_win_test.c` pass in the same `make TARGET=win check`; the Linux os suite passes in the full check.
+2. Finding 2's crash coverage (a crashed server's pipe name held by a surviving client) is accepted on the deterministic test without a reproduced native red; noted on backlog edit-l3qd.
+3. Landing order: after edit-pf3l (W2.1) lands, rebase this tree over it, align the Windows file-identity conversion with W2.1's, run the production-save gate the report names, verify, land.

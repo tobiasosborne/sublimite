@@ -8,7 +8,7 @@
 /* Epoch and the prepare-return acknowledgement are shared atomic fields.
  * Frozen task input is borrowed by a worker; a separate result lease transfers ownership only via
  * its generation-validated terminal mailbox message. */
-typedef enum operation { OP_SAVE, OP_FINISH, OP_RECOVER_FINISH, OP_CANCEL, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD } operation;
+typedef enum operation { OP_SAVE, OP_FINISH, OP_RECOVER_FINISH, OP_CANCEL, OP_CHECK, OP_KEEP, OP_RELOAD, OP_DISCARD, OP_CLEANUP } operation;
 typedef struct reload_bytes {
     _Atomic size_t refs;
     uint8_t *bytes;
@@ -49,6 +49,7 @@ struct savectl {
     savectl_options options;
     char path[4097];
     os_dir reload_cache;
+    char reload_cleanup[80]; /* worker-owned name until unlink succeeds */
     file_id baseline;
     savectl_state state;
     bool modified, active, event, external, ready_reload, needs_finish, closing;
@@ -120,6 +121,22 @@ static bool same(file_id a, file_id b)
 {
     return file_id_diff(&a,&b)==FILE_CHG_NONE;
 }
+#if defined(_WIN32)
+/* file_id in this dependency snapshot cannot represent index[1]. Keep native
+ * identities intact at the descriptor/path reload boundaries until W2.1's
+ * shared conversion and complete baseline representation are available. */
+static bool same_native(const os_stat *a, const os_stat *b)
+{
+    return os_identity_equal(&a->id,&b->id) && same(identity(a),identity(b));
+}
+static int reload_path_id(const char *path, os_stat *st, file_id *out)
+{
+    os_err rc=os_stat_path(path,OS_STAT_NOFOLLOW,st);
+    if(rc!=OS_OK) return rc==OS_E_NOENT || rc==OS_E_NOTDIR ? FILE_ERR_CHANGED : FILE_ERR_IO;
+    if(st->kind!=OS_KIND_FILE || st->size>INT64_MAX) return FILE_ERR_NOTREG;
+    *out=identity(st); return FILE_OK;
+}
+#endif
 static int disk_id(const char *path, file_id *out)
 {
     *out=(file_id){0};
@@ -159,8 +176,14 @@ static os_err private_reload_backing(savectl *s, os_file *out)
         rc=os_file_open_at(out,&s->reload_cache,name,OS_OPEN_CREATE|OS_OPEN_EXCL|OS_OPEN_NOFOLLOW|OS_OPEN_RDWR);
         if(rc==OS_E_EXIST) continue;
         if(rc!=OS_OK) return rc;
+        strcpy(s->reload_cleanup,name);
         rc=os_unlink_at(&s->reload_cache,name);
-        if(rc!=OS_OK) os_file_close(out);
+        if(rc!=OS_OK) {
+            os_file_close(out);
+            /* Closing first can remove a transient sharing obstacle. If this
+             * also fails, retain the obligation for worker maintenance. */
+            if(os_unlink_at(&s->reload_cache,name)==OS_OK) s->reload_cleanup[0]=0;
+        } else s->reload_cleanup[0]=0;
         return rc;
     }
     return OS_E_EXIST;
@@ -178,9 +201,16 @@ static void reload_worker(savectl *s)
     reload_bytes *copy=NULL;
     if (os_file_stat(&fd,&before)!=OS_OK) { r->file_error=FILE_ERR_IO; goto end; }
     if (before.kind!=OS_KIND_FILE || before.size>INT64_MAX) { r->file_error=FILE_ERR_NOTREG; goto end; }
+#if defined(_WIN32)
+    os_stat path_id;
+    r->file_error=reload_path_id(s->path,&path_id,&r->id);
+    if (r->file_error) goto end;
+    if (!same_native(&before,&path_id)) { r->file_error=FILE_ERR_CHANGED; goto end; }
+#else
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),r->id)) { r->file_error=FILE_ERR_CHANGED; goto end; }
+#endif
     uint64_t len=before.size;
     if (len>SIZE_MAX) { r->file_error=FILE_ERR_NOMEM; goto end; }
     copy=calloc(1,sizeof *copy);
@@ -240,10 +270,17 @@ static void reload_worker(savectl *s)
         if (r->file_error) goto end;
     }
     if (os_file_stat(&fd,&after)!=OS_OK) { r->file_error=FILE_ERR_IO; goto end; }
+#if defined(_WIN32)
+    r->file_error=reload_path_id(s->path,&path_id,&r->id);
+    if (r->file_error) goto end;
+    if (!same_native(&before,&after) || !same_native(&after,&path_id))
+        r->file_error=FILE_ERR_CHANGED;
+#else
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),identity(&after)) || !same(identity(&after),r->id))
         r->file_error=FILE_ERR_CHANGED;
+#endif
 
 end:
     if (r->file_error==FILE_ERR_IO && !r->err_no) r->err_no=os_native_error();
@@ -285,6 +322,11 @@ static void worker(work_ctx *ctx)
     }
     operation op=s->task.op;
     if (op==OP_DISCARD) { *r=(result){0}; bytes_release(s->task.discard); }
+    else if(op==OP_CLEANUP) {
+        *r=(result){0};
+        os_err rc=os_unlink_at(&s->reload_cache,s->reload_cleanup);
+        if(rc==OS_OK || rc==OS_E_NOENT) s->reload_cleanup[0]=0;
+    }
     else {
         *r=(result){0};
         if (op==OP_RELOAD) reload_worker(s);
@@ -464,7 +506,7 @@ int savectl_set_step_hook(savectl *s, void (*step)(void *, int), void *ctx)
 int savectl_destroy(savectl *s)
 {
     if (!s) return SAVECTL_INVALID;
-    if (s->active || s->ready_reload || s->result.reload || s->reload_tree ||
+    if (s->active || s->reload_cleanup[0] || s->ready_reload || s->result.reload || s->reload_tree ||
         (s->handle.epoch && !work_handle_finished(s->options.pool,s->handle)))
         return SAVECTL_BUSY;
     if (s->handle.epoch)
@@ -728,7 +770,7 @@ void savectl_tick(savectl *s)
         operation op=s->task.op;
         result *r=&s->result;
         s->active=false; s->journal_leased=false;
-        if (op!=OP_DISCARD) {
+        if (op!=OP_DISCARD && op!=OP_CLEANUP) {
             s->file_error=r->file_error; s->err_no=r->err_no;
             if (op==OP_SAVE || op==OP_FINISH || op==OP_RECOVER_FINISH || op==OP_CANCEL) s->journal_error=r->journal_error;
             if (op==OP_SAVE && r->replaced && s->options.journal && *r->base.captured_path && !r->journal_error) {
@@ -771,6 +813,7 @@ void savectl_tick(savectl *s)
     if (s->active || s->ready_reload || (!s->closing && s->needs_finish)) return;
     reload_rollback(s);
     if (s->result.reload) { (void)submit(s,OP_DISCARD); return; }
+    if (s->reload_cleanup[0]) { (void)submit(s,OP_CLEANUP); return; }
     if (s->closing) return;
     if (s->event) {
         if (s->options.source_mode==FILE_MODE_MMAP && !s->options.validate_source) {

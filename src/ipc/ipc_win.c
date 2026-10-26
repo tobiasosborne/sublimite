@@ -1,5 +1,6 @@
 #if defined(_WIN32)
 #include "ipc.h"
+#include "crt_win.h"
 #include <windows.h>
 #include <sddl.h>
 #include <io.h>
@@ -13,6 +14,7 @@
  * remain on the loop thread. Pending buffers survive cancellation completion. */
 #define PIPE_SLOTS (IPC_MAX_CLIENTS+1u) /* admitted peers plus one listener */
 #define NAME_CAP 256u /* (P) Win32 named-pipe name limit, including prefix */
+typedef struct rendezvous { volatile LONG ready; DWORD pid; WCHAR pipe[NAME_CAP]; } rendezvous;
 typedef enum peer_state { FREE, LISTENING, READING, READY, OPENED, DROPPING } peer_state;
 struct ipc_peer {
     HANDLE pipe;
@@ -30,7 +32,10 @@ struct ipc_win {
     os_rmutex mutex;
     os_thread thread;
     os_wake wake;
-    HANDLE port, arbitration;
+    HANDLE port, arbitration, publication, initialized;
+    rendezvous *published;
+    ipc_result setup_result;
+    WCHAR publication_name[NAME_CAP];
     PSECURITY_DESCRIPTOR security;
     WCHAR pipe_name[NAME_CAP];
     BYTE sid[SECURITY_MAX_SID_SIZE];
@@ -41,7 +46,7 @@ struct ipc_win {
     size_t nsmall, nbig;
 };
 typedef struct endpoint {
-    WCHAR pipe[NAME_CAP], mutex[NAME_CAP];
+    WCHAR pipe[NAME_CAP], mutex[NAME_CAP], publication[NAME_CAP];
     BYTE sid[SECURITY_MAX_SID_SIZE];
     PSECURITY_DESCRIPTOR security;
 } endpoint;
@@ -93,7 +98,8 @@ static ipc_result resolve(const char *runtime, const char *display, endpoint *ep
     if(rc!=IPC_OK) return rc;
     if(used+wcslen(L"\\\\.\\pipe\\")+1u>NAME_CAP) return IPC_LIMIT;
     if(swprintf(ep->pipe,NAME_CAP,L"\\\\.\\pipe\\%ls",identity)<0 ||
-       swprintf(ep->mutex,NAME_CAP,L"Local\\%ls",identity)<0) return IPC_LIMIT;
+       swprintf(ep->mutex,NAME_CAP,L"Local\\%ls",identity)<0 ||
+       swprintf(ep->publication,NAME_CAP,L"Local\\%ls-endpoint",identity)<0) return IPC_LIMIT;
     if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(acl,SDDL_REVISION_1,&ep->security,NULL)) return IPC_IO;
     return IPC_OK;
 }
@@ -116,6 +122,35 @@ static DWORD timeout_left(uint64_t deadline)
     if(deadline==UINT64_MAX) return INFINITE;
     uint64_t now=milliseconds(), left=deadline>now?deadline-now:0;
     return left>=INFINITE ? INFINITE-1u : (DWORD)left;
+}
+/* The mutex is owned for the service thread's lifetime. Only that owner may
+ * publish a random generation's pipe. Old client-held instances therefore
+ * never occupy a replacement listener's name. Readiness is published last. */
+static HANDLE published_connect(const endpoint *ep)
+{
+    HANDLE mapping=OpenFileMappingW(FILE_MAP_READ,FALSE,ep->publication);
+    if(!mapping) return INVALID_HANDLE_VALUE;
+    const rendezvous *view=MapViewOfFile(mapping,FILE_MAP_READ,0,0,sizeof *view);
+    HANDLE pipe=INVALID_HANDLE_VALUE;
+    if(view) {
+        LONG ready=view->ready; MemoryBarrier();
+        if(ready) {
+            WCHAR name[NAME_CAP]; memcpy(name,view->pipe,sizeof name);
+            DWORD pid=view->pid; name[NAME_CAP-1u]=0;
+            MemoryBarrier();
+            if(ready==view->ready) {
+                pipe=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,NULL);
+                ULONG server=0;
+                if(pipe!=INVALID_HANDLE_VALUE &&
+                   (!GetNamedPipeServerProcessId(pipe,&server) || server!=pid || !own_peer(pipe,ep->sid,true))) {
+                    CloseHandle(pipe); pipe=INVALID_HANDLE_VALUE;
+                }
+            }
+        }
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(mapping); return pipe;
 }
 /* All client transfers are overlapped, including the unbounded close wait.
  * Cancellation is always reaped before stack OVERLAPPED/buffers expire. */
@@ -163,16 +198,16 @@ ipc_result ipc_client_send_display(const char *runtime, const char *display, con
     rc=ipc_wire_encode(r,wire,IPC_MAX_WIRE,&n);
     uint64_t deadline=timeout_ms<0?UINT64_MAX:milliseconds()+(uint64_t)timeout_ms;
     while(rc==IPC_OK) {
-        pipe=CreateFileW(ep.pipe,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+        pipe=published_connect(&ep);
         if(pipe!=INVALID_HANDLE_VALUE) break;
-        DWORD error=GetLastError();
-        if(error!=ERROR_PIPE_BUSY) { rc=IPC_IO; break; }
+        HANDLE owner=OpenMutexW(SYNCHRONIZE,FALSE,ep.mutex);
+        if(!owner) { rc=IPC_IO; break; }
+        CloseHandle(owner);
         DWORD left=timeout_left(deadline);
         if(!left) { rc=IPC_TIMEOUT; break; }
-        /* WaitNamedPipe's zero means the server default, not an infinite wait. */
-        if(!WaitNamedPipeW(ep.pipe,left==INFINITE?NMPWAIT_WAIT_FOREVER:left)) {
-            rc=GetLastError()==ERROR_SEM_TIMEOUT?IPC_TIMEOUT:IPC_IO; break;
-        }
+        /* WaitNamedPipe returns immediately while the first name is absent.
+         * Reuse the OS process-wait poll interval, under the same deadline. */
+        os_sleep_ns(UINT64_C(1000000));
     }
     if(rc==IPC_OK && !own_peer(pipe,ep.sid,true)) rc=IPC_REJECTED;
     if(rc==IPC_OK) rc=transfer(pipe,wire,n,true,deadline);
@@ -306,13 +341,56 @@ static void read_complete(ipc_server *s, struct ipc_peer *p, DWORD bytes)
         memcpy(p->wire,p->head,sizeof p->head);
     }
     if(p->expected && p->received==p->expected) {
+        DWORD available=0;
+        if(!PeekNamedPipe(p->pipe,NULL,0,NULL,&available,NULL)) { drop_peer(s,p); return; }
+        if(available) { reject_peer(s,p,IPC_PROTOCOL); return; }
         p->state=READY; os_wake_signal(&s->win->wake);
+        return;
     }
     start_read(s,p);
+}
+static ipc_result bind_endpoint(ipc_server *s)
+{
+    struct ipc_win *w=s->win;
+    uint64_t deadline=milliseconds()+IPC_LOCK_TIMEOUT_MS;
+    for(;;) {
+        DWORD acquired=WaitForSingleObject(w->arbitration,0);
+        if(acquired==WAIT_OBJECT_0 || acquired==WAIT_ABANDONED) break;
+        if(acquired!=WAIT_TIMEOUT) return IPC_IO;
+        endpoint ep={0};
+        memcpy(ep.publication,w->publication_name,sizeof ep.publication);
+        memcpy(ep.sid,w->sid,sizeof ep.sid);
+        HANDLE incumbent=published_connect(&ep);
+        if(incumbent!=INVALID_HANDLE_VALUE) { CloseHandle(incumbent); return IPC_EXISTS; }
+        if(!timeout_left(deadline)) return IPC_TIMEOUT;
+        os_sleep_ns(UINT64_C(1000000));
+    }
+    SECURITY_ATTRIBUTES sa={sizeof sa,w->security,FALSE};
+    w->publication=CreateFileMappingW(INVALID_HANDLE_VALUE,&sa,PAGE_READWRITE,0,sizeof(rendezvous),w->publication_name);
+    if(!w->publication) goto fail;
+    w->published=MapViewOfFile(w->publication,FILE_MAP_WRITE|FILE_MAP_READ,0,0,sizeof(rendezvous));
+    if(!w->published) goto fail;
+    InterlockedExchange(&w->published->ready,0);
+    uint64_t nonce[2];
+    if(os_random(nonce,sizeof nonce)!=OS_OK) goto fail;
+    size_t used=wcslen(w->pipe_name);
+    /* (P) Two 64-bit words need 32 hex digits, plus separator and NUL. */
+    if(used+34u>NAME_CAP || swprintf(w->pipe_name+used,NAME_CAP-used,L"-%016llx%016llx",
+        (unsigned long long)nonce[0],(unsigned long long)nonce[1])<0) goto fail;
+    if(!create_listener(s,&s->peers[0],true)) goto fail;
+    memcpy(w->published->pipe,w->pipe_name,sizeof w->pipe_name);
+    w->published->pid=GetCurrentProcessId();
+    InterlockedExchange(&w->published->ready,(LONG)((nonce[0]&INT32_MAX)|1u));
+    return IPC_OK;
+fail:
+    ReleaseMutex(w->arbitration); return IPC_IO;
 }
 static void service(void *arg)
 {
     ipc_server *s=arg; struct ipc_win *w=s->win;
+    w->setup_result=w->endpoint?bind_endpoint(s):IPC_OK;
+    SetEvent(w->initialized);
+    if(w->setup_result!=IPC_OK) return;
     for(;;) {
         os_rmutex_lock(&w->mutex);
         uint64_t now=milliseconds(), earliest=UINT64_MAX; bool pending=false;
@@ -325,14 +403,17 @@ static void service(void *arg)
                     if(now>=end) drop_peer(s,p); else if(end<earliest) earliest=end;
                 }
                 flush_peer(s,p);
-                if(p->state==OPENED || p->state==READY) start_read(s,p);
+                if(p->state==OPENED) start_read(s,p);
             }
             if(p->state!=FREE) pending=true;
         }
         ensure_listener(s);
         bool quit=w->stop && !pending;
         os_rmutex_unlock(&w->mutex);
-        if(quit) return;
+        if(quit) {
+            if(w->endpoint) { InterlockedExchange(&w->published->ready,0); ReleaseMutex(w->arbitration); }
+            return;
+        }
         DWORD bytes=0; ULONG_PTR key=0; OVERLAPPED *ov=NULL;
         BOOL ok=GetQueuedCompletionStatus(w->port,&bytes,&key,&ov,timeout_left(earliest));
         if(!ov) {
@@ -393,14 +474,18 @@ static ipc_result setup(ipc_server *s, endpoint *ep)
     if(ep) {
         w->security=ep->security; ep->security=NULL; w->endpoint=true;
         memcpy(w->sid,ep->sid,sizeof w->sid); memcpy(w->pipe_name,ep->pipe,sizeof w->pipe_name);
+        memcpy(w->publication_name,ep->publication,sizeof w->publication_name);
         SECURITY_ATTRIBUTES sa={sizeof sa,w->security,FALSE};
         w->arbitration=CreateMutexW(&sa,FALSE,ep->mutex);
-        DWORD error=GetLastError();
         if(!w->arbitration) goto fail;
-        if(error==ERROR_ALREADY_EXISTS) { rc=IPC_EXISTS; goto fail; }
-        if(!create_listener(s,&s->peers[0],true)) { rc=GetLastError()==ERROR_ACCESS_DENIED?IPC_EXISTS:IPC_IO; goto fail; }
     }
+    w->initialized=CreateEventW(NULL,TRUE,FALSE,NULL);
+    if(!w->initialized) goto fail;
     if(os_thread_start(&w->thread,service,s)!=OS_OK) goto fail;
+    WaitForSingleObject(w->initialized,INFINITE);
+    rc=w->setup_result;
+    if(rc!=IPC_OK) { (void)os_thread_join(&w->thread); goto fail; }
+    CloseHandle(w->initialized); w->initialized=NULL;
     return IPC_OK;
 fail:
     /* A listener can already have a queued connect. Closing the port after the
@@ -412,6 +497,9 @@ fail:
         CloseHandle(p->pipe);
     }
     if(w->port) CloseHandle(w->port);
+    if(w->initialized) CloseHandle(w->initialized);
+    if(w->published) UnmapViewOfFile(w->published);
+    if(w->publication) CloseHandle(w->publication);
     if(w->arbitration) CloseHandle(w->arbitration);
     if(w->security) LocalFree(w->security);
     if(wake) os_wake_close(&w->wake);
@@ -443,6 +531,9 @@ ipc_result ipc_server_drain(ipc_server *s, ipc_open_callback callback, void *ctx
         size_t credit=p->expected-p->credited; if(credit>bytes) credit=bytes;
         p->credited+=credit; bytes-=credit; s->drain_bytes+=credit;
         if(p->credited!=p->expected || !calls) { os_wake_signal(&w->wake); continue; }
+        DWORD available=0;
+        if(!PeekNamedPipe(p->pipe,NULL,0,NULL,&available,NULL)) { drop_peer(s,p); continue; }
+        if(available) { reject_peer(s,p,IPC_PROTOCOL); continue; }
         ipc_request r; ipc_result rc=ipc_wire_decode(p->wire,p->expected,&r);
         p->state=OPENED; p->opened=true;
         if(rc==IPC_OK) {
@@ -479,6 +570,8 @@ void ipc_server_fini(ipc_server *s)
     struct ipc_win *w=s->win; os_rmutex_lock(&w->mutex); w->stop=true;
     (void)PostQueuedCompletionStatus(w->port,0,0,NULL); os_rmutex_unlock(&w->mutex);
     (void)os_thread_join(&w->thread); CloseHandle(w->port);
+    if(w->published) UnmapViewOfFile(w->published);
+    if(w->publication) CloseHandle(w->publication);
     if(w->arbitration) CloseHandle(w->arbitration);
     if(w->security) LocalFree(w->security);
     os_wake_close(&w->wake); os_rmutex_destroy(&w->mutex); edit_arena_free(&s->arena); reset_server(s);
@@ -494,10 +587,15 @@ ipc_result ipc_launcher_pair(int fds[2])
     WCHAR name[NAME_CAP];
     if(swprintf(name,NAME_CAP,L"\\\\.\\pipe\\sublimite-launch-%llu-%llu",
         (unsigned long long)os_proc_id(),(unsigned long long)nonce)<0) return IPC_IO;
+    endpoint ep; ipc_result rc=resolve(NULL,NULL,&ep);
+    if(rc!=IPC_OK) return rc;
+    SECURITY_ATTRIBUTES sa={sizeof sa,ep.security,FALSE};
     HANDLE server=CreateNamedPipeW(name,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,IPC_RX_SMALL_SIZE,IPC_RX_SMALL_SIZE,0,NULL);
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,IPC_RX_SMALL_SIZE,IPC_RX_SMALL_SIZE,0,&sa);
+    LocalFree(ep.security);
     if(server==INVALID_HANDLE_VALUE) return IPC_IO;
-    HANDLE client=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+    HANDLE client=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,NULL);
     if(client==INVALID_HANDLE_VALUE) { CloseHandle(server); return IPC_IO; }
     /* The client connected before ConnectNamedPipe; no pending operation. */
     OVERLAPPED ov={0}; ov.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL);
@@ -513,10 +611,50 @@ ipc_result ipc_launcher_pair(int fds[2])
     }
     return IPC_OK;
 }
+ipc_result ipc_launcher_prepare(int *fd, char *name, size_t capacity)
+{
+    if(!fd || !name || !capacity) return IPC_INVALID;
+    *fd=-1; name[0]=0;
+    uint64_t nonce[2];
+    if(os_random(nonce,sizeof nonce)!=OS_OK) return IPC_IO;
+    char endpoint_name[NAME_CAP];
+    int n=snprintf(endpoint_name,sizeof endpoint_name,"\\\\.\\pipe\\sublimite-launch-%016llx%016llx",
+        (unsigned long long)nonce[0],(unsigned long long)nonce[1]);
+    if(n<0 || (size_t)n>=capacity) return IPC_LIMIT;
+    endpoint ep; ipc_result rc=resolve(NULL,NULL,&ep);
+    if(rc!=IPC_OK) return rc;
+    WCHAR wide[NAME_CAP];
+    if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,endpoint_name,-1,wide,NAME_CAP)) {
+        LocalFree(ep.security); return IPC_INVALID;
+    }
+    SECURITY_ATTRIBUTES sa={sizeof sa,ep.security,FALSE};
+    HANDLE pipe=CreateNamedPipeW(wide,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,IPC_RX_SMALL_SIZE,IPC_RX_SMALL_SIZE,0,&sa);
+    LocalFree(ep.security);
+    if(pipe==INVALID_HANDLE_VALUE) return IPC_IO;
+    *fd=_open_osfhandle((intptr_t)pipe,_O_BINARY|_O_RDWR|_O_NOINHERIT);
+    if(*fd<0) { CloseHandle(pipe); return IPC_IO; }
+    memcpy(name,endpoint_name,(size_t)n+1u); return IPC_OK;
+}
+ipc_result ipc_server_connect_wait(ipc_server *s, const char *name, ipc_token *token)
+{
+    if(!s || !s->win || !name || !token || strncmp(name,"\\\\.\\pipe\\sublimite-launch-",strlen("\\\\.\\pipe\\sublimite-launch-"))) return IPC_INVALID;
+    WCHAR wide[NAME_CAP]; BYTE sid[SECURITY_MAX_SID_SIZE];
+    if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,name,-1,wide,NAME_CAP) || !current_sid(sid)) return IPC_INVALID;
+    HANDLE pipe=CreateFileW(wide,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,NULL);
+    if(pipe==INVALID_HANDLE_VALUE) return IPC_IO;
+    if(!own_peer(pipe,sid,true)) { CloseHandle(pipe); return IPC_REJECTED; }
+    int fd=_open_osfhandle((intptr_t)pipe,_O_BINARY|_O_RDWR|_O_NOINHERIT);
+    if(fd<0) { CloseHandle(pipe); return IPC_IO; }
+    ipc_result rc=ipc_server_adopt_wait(s,fd,token);
+    if(rc!=IPC_OK) (void)_close(fd);
+    return rc;
+}
 ipc_result ipc_server_adopt_wait(ipc_server *s, int fd, ipc_token *token)
 {
     if(!s || !s->win || fd<0 || !token) return IPC_INVALID;
-    HANDLE pipe=(HANDLE)_get_osfhandle(fd);
+    HANDLE pipe=(HANDLE)ipc_crt_handle(fd);
     if(pipe==INVALID_HANDLE_VALUE) return IPC_INVALID;
     struct ipc_win *w=s->win; os_rmutex_lock(&w->mutex); ipc_result rc=IPC_LIMIT;
     size_t active=0; struct ipc_peer *slot=NULL;
@@ -540,8 +678,23 @@ ipc_result ipc_server_adopt_wait(ipc_server *s, int fd, ipc_token *token)
 ipc_result ipc_launcher_wait(int fd)
 {
     if(fd<0) return IPC_INVALID;
-    HANDLE pipe=(HANDLE)_get_osfhandle(fd);
+    HANDLE pipe=(HANDLE)ipc_crt_handle(fd);
     if(pipe==INVALID_HANDLE_VALUE) return IPC_INVALID;
+    DWORD flags=0;
+    if(!GetNamedPipeInfo(pipe,&flags,NULL,NULL,NULL)) { (void)_close(fd); return IPC_INVALID; }
+    if(flags&PIPE_SERVER_END) {
+        OVERLAPPED ov={0}; ov.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL);
+        if(!ov.hEvent) { (void)_close(fd); return IPC_IO; }
+        BOOL connected=ConnectNamedPipe(pipe,&ov); DWORD error=GetLastError(), done=0;
+        if(!connected && error==ERROR_IO_PENDING) {
+            DWORD waited=WaitForSingleObject(ov.hEvent,IPC_REQUEST_DEADLINE_MS);
+            if(waited==WAIT_OBJECT_0) connected=GetOverlappedResult(pipe,&ov,&done,FALSE);
+            else { (void)CancelIoEx(pipe,&ov); (void)GetOverlappedResult(pipe,&ov,&done,TRUE); }
+        } else if(!connected && error==ERROR_PIPE_CONNECTED) connected=TRUE;
+        CloseHandle(ov.hEvent);
+        BYTE sid[SECURITY_MAX_SID_SIZE];
+        if(!connected || !current_sid(sid) || !own_peer(pipe,sid,false)) { (void)_close(fd); return IPC_IO; }
+    }
     ipc_result rc=receive_reply(pipe,'C',UINT64_MAX); (void)_close(fd); return rc;
 }
 #endif

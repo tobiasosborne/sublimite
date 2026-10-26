@@ -109,6 +109,12 @@ int ipc_server_fd(const ipc_server *server);
 /* Borrowed wake for the Win32 platform loop. Drain through server_drain;
  * fd is unavailable on Windows and returns -1. */
 const os_wake *ipc_server_wake(const ipc_server *server);
+/* Windows self-spawn handoff: prepare owns a non-inheritable listening CRT
+ * descriptor; pass only endpoint in argv. The UI connects and owns its own
+ * adopted descriptor. The launcher waits after spawning, with no close-result
+ * deadline once connected. Both endpoints authenticate the current user. */
+ipc_result ipc_launcher_prepare(int *launcher_fd, char *endpoint, size_t capacity);
+ipc_result ipc_server_connect_wait(ipc_server *server, const char *endpoint, ipc_token *token);
 #endif
 /* Nonblocking; borrowed request is valid only inside callback. Callback OK
  * queues ACK; other result rejects. Retain token for wait; copy desired data.
