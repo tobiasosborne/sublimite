@@ -1,5 +1,4 @@
 #include "editor/private.h"
-#include <sys/epoll.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,8 +122,7 @@ int editor_preferences_poll(editor *e)
     (void)config_runtime_tick(e->preferences_runtime);
     int fd = config_runtime_watchfd(e->preferences_runtime);
     if (fd >= 0 && fd != e->preferences_watchfd) {
-        struct epoll_event event = {.events = EPOLLIN, .data.fd = fd};
-        if (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &event) && errno != EEXIST) return EDITOR_ERR_IO;
+        if (editor_wait_file(&e->poll_set, fd) != OS_OK) return EDITOR_ERR_IO;
         e->preferences_watchfd = fd;
     }
     return 0;

@@ -159,6 +159,7 @@ void config_runtime_close(config_runtime *r)
     if (r->pool_ready) work_pool_shutdown(&r->pool);
     edit_arena_free(&r->arena); config_runtime_free(r);
 }
+const os_wake *config_runtime_wake(const config_runtime *r) { return r ? work_pool_wake(&r->pool) : NULL; }
 #if !defined(_WIN32)
 int config_runtime_eventfd(const config_runtime *r) { return r ? work_pool_eventfd(&r->pool) : -1; }
 #endif

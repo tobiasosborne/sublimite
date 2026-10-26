@@ -1,6 +1,5 @@
 #include "editor/private.h"
 #include <math.h>
-#include <poll.h>
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
@@ -55,7 +54,7 @@ static void font_worker(work_ctx *ctx)
     editor_font_size *f = ctx->arg;
     editor_font_atlas *a = &f->atlas[f->preparing];
     font_selection *selection = &a->selection;
-    f->worker = pthread_self();
+    f->worker = os_thread_self();
     int rc = FONT_OK;
     if (!f->face.data) {
         rc = embedded_face(&f->face);
@@ -153,7 +152,7 @@ int editor_font_init(editor *e, const font_ascii_atlas **atlas)
     while (!f->received || !work_handle_finished(&e->pool, f->handle)) {
         (void)work_mailbox_receive(&e->pool, f->handle, 0, init_receive, e);
         if (f->received && work_handle_finished(&e->pool, f->handle)) break;
-        struct pollfd fd = {work_pool_eventfd(&e->pool), POLLIN, 0}; (void)poll(&fd, 1, 1);
+        (void)os_wake_wait(work_pool_wake(&e->pool), INT64_C(1000000));
     }
     f->handle = (work_handle){0}; f->received = false;
     if (f->result) return f->result;
