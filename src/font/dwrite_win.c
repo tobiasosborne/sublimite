@@ -4,8 +4,15 @@
 #define INITGUID
 #include "font/dwrite.h"
 #include "font/dwrite_internal.h"
+#include "../../vendor/stb_truetype.h"
 #include <limits.h>
 #include <string.h>
+#ifndef FONT_DWRITE_TEST_FAIL
+#define FONT_DWRITE_TEST_FAIL(point) 0
+#endif
+#ifndef FONT_DWRITE_TEST_REFS
+#define FONT_DWRITE_TEST_REFS(kind, refs) ((void)(refs))
+#endif
 
 int font_dwrite_open(font_dwrite *dw, const char *library)
 {
@@ -17,7 +24,7 @@ int font_dwrite_open(font_dwrite *dw, const char *library)
     WCHAR name[FONT_FALLBACK_PATH_MAX];
     if (!library || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, library, -1,
                                          name, FONT_FALLBACK_PATH_MAX)) goto fail;
-    dw->library = LoadLibraryW(name);
+    dw->library = LoadLibraryExW(name, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dw->library) goto fail;
     typedef HRESULT (WINAPI *create_fn)(DWRITE_FACTORY_TYPE, REFIID, IUnknown **);
     create_fn create = NULL;
@@ -32,7 +39,7 @@ fail:
 }
 void font_dwrite_close(font_dwrite *dw)
 {
-    if (dw->factory) dw->factory->lpVtbl->Release(dw->factory);
+    if (dw->factory) FONT_DWRITE_TEST_REFS("factory", dw->factory->lpVtbl->Release(dw->factory));
     if (dw->library) FreeLibrary(dw->library);
     if (dw->uninitialize) CoUninitialize();
     memset(dw, 0, sizeof *dw);
@@ -127,6 +134,7 @@ int font_dwrite_raster(const font_t *f, uint32_t gid, edit_arena *arena,
 {
     if (unavailable || !f || !arena || !out || !f->data || !f->px || !gid || gid >= f->num_glyphs)
         return FONT_ERR_INIT;
+    memset(out, 0, sizeof *out);
     font_dwrite dw;
     if (!font_dwrite_open(&dw, "dwrite.dll")) return FONT_ERR_INIT;
     /* Static const vtables are immutable, not process state. */
@@ -144,8 +152,10 @@ int font_dwrite_raster(const font_t *f, uint32_t gid, edit_arena *arena,
     edit_arena_mark_t mark = edit_arena_mark(arena);
     if (FAILED(dw.factory->lpVtbl->RegisterFontFileLoader(dw.factory, &loader.iface))) goto done;
     registered = 1;
+    if (FONT_DWRITE_TEST_FAIL("loader")) goto done;
     uint32_t key = 0;
     if (FAILED(dw.factory->lpVtbl->CreateCustomFontFileReference(dw.factory, &key, sizeof key, &loader.iface, &file))) goto done;
+    if (FONT_DWRITE_TEST_FAIL("file")) goto done;
     BOOL supported = FALSE;
     DWRITE_FONT_FILE_TYPE type;
     DWRITE_FONT_FACE_TYPE face_type;
@@ -153,18 +163,31 @@ int font_dwrite_raster(const font_t *f, uint32_t gid, edit_arena *arena,
     if (FAILED(file->lpVtbl->Analyze(file, &supported, &type, &face_type, &count)) || !supported || f->face_index >= count) goto done;
     if (FAILED(dw.factory->lpVtbl->CreateFontFace(dw.factory, face_type, 1, &file,
                     f->face_index, DWRITE_FONT_SIMULATIONS_NONE, &face))) goto done;
+    if (FONT_DWRITE_TEST_FAIL("face")) goto done;
     DWRITE_FONT_METRICS metrics;
     face->lpVtbl->GetMetrics(face, &metrics);
     UINT16 glyph = (UINT16)gid;
     DWRITE_GLYPH_METRICS gm;
     if (FAILED(face->lpVtbl->GetDesignGlyphMetrics(face, &glyph, 1, &gm, FALSE))) goto done;
     FLOAT advance = (FLOAT)gm.advanceWidth * f->scale;
+    /* stb places TrueType contours in raw glyf coordinates. DirectWrite's
+     * writing origin is xMin - hmtx.lsb; restore it before rasterisation so
+     * the fractional phase, as well as the returned bounds, matches that pen. */
+    FLOAT origin_x = 0;
+    if (f->glyf_len) {
+        int left = 0, bottom = 0, right = 0, top = 0;
+        (void)stbtt_GetGlyphBox((const stbtt_fontinfo *)(const void *)f->info,
+                              (int)gid, &left, &bottom, &right, &top);
+        origin_x = ((FLOAT)left - (FLOAT)gm.leftSideBearing) * f->scale;
+    }
     DWRITE_GLYPH_RUN run = {face, (FLOAT)metrics.designUnitsPerEm * f->scale, 1, &glyph, &advance, NULL, FALSE, 0};
     if (FAILED(dw.factory->lpVtbl->IDWriteFactory2_CreateGlyphRunAnalysis(dw.factory, &run, NULL,
             DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_MEASURING_MODE_NATURAL,
-            DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, 0, 0, &analysis))) goto done;
+            DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, origin_x, 0, &analysis))) goto done;
+    if (FONT_DWRITE_TEST_FAIL("analysis")) goto done;
     RECT box;
     if (FAILED(analysis->lpVtbl->GetAlphaTextureBounds(analysis, DWRITE_TEXTURE_ALIASED_1x1, &box))) goto done;
+    if (FONT_DWRITE_TEST_FAIL("bounds")) goto done;
     if (box.right < box.left || box.bottom < box.top) goto done;
     uint64_t w = (uint64_t)((int64_t)box.right - box.left), h = (uint64_t)((int64_t)box.bottom - box.top);
     /* Same worker bitmap bounds as metrics_of_glyph in font.c. */
@@ -172,17 +195,22 @@ int font_dwrite_raster(const font_t *f, uint32_t gid, edit_arena *arena,
     size_t bytes = (size_t)(w * h);
     uint8_t *pixels = bytes ? edit_arena_alloc(arena, bytes, 1) : NULL;
     if (bytes && !pixels) { result = FONT_ERR_NOMEM; goto done; }
+    if (FONT_DWRITE_TEST_FAIL("pixels")) goto done;
     if (bytes && FAILED(analysis->lpVtbl->CreateAlphaTexture(analysis, DWRITE_TEXTURE_ALIASED_1x1,
                                                             &box, pixels, (UINT32)bytes))) goto done;
+    if (FONT_DWRITE_TEST_FAIL("texture")) goto done;
     out->pixels = pixels; out->w = (uint32_t)w; out->h = (uint32_t)h;
     out->m = (font_metric){(int32_t)(advance + 0.5f), box.left, box.top, out->w, out->h};
     result = FONT_OK;
 done:
-    if (analysis) analysis->lpVtbl->Release(analysis);
-    if (face) face->lpVtbl->Release(face);
-    if (file) file->lpVtbl->Release(file);
-    if (registered) (void)dw.factory->lpVtbl->UnregisterFontFileLoader(dw.factory, &loader.iface);
+    if (analysis) FONT_DWRITE_TEST_REFS("analysis", analysis->lpVtbl->Release(analysis));
+    if (face) FONT_DWRITE_TEST_REFS("face", face->lpVtbl->Release(face));
+    if (file) FONT_DWRITE_TEST_REFS("file", file->lpVtbl->Release(file));
+    if (registered) FONT_DWRITE_TEST_REFS("unregister",
+        dw.factory->lpVtbl->UnregisterFontFileLoader(dw.factory, &loader.iface));
     font_dwrite_close(&dw);
+    FONT_DWRITE_TEST_REFS("loader", loader.refs);
+    FONT_DWRITE_TEST_REFS("stream", loader.stream.refs);
     if (result != FONT_OK) edit_arena_reset_to_mark(arena, mark);
     return result;
 }

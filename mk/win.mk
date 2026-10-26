@@ -153,6 +153,14 @@ $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 # Static link; release has only system-DLL imports. The sanitizer exe needs the runtime DLLs beside it (tools/winrun.sh runs in place).
+# Font white-box regressions keep all shims out of the production objects.
+$(WIN_B)/rel/tests/font_dwrite_r2_test.exe: tests/win/font_dwrite_r2_test.c tests/win/font_dwrite_oracle.h tests/win/font_fixture.h src/font/dwrite_win.c src/font/discovery_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/dwrite_win.o %/discovery_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/font_dwrite_r2_test.exe: tests/win/font_dwrite_r2_test.c tests/win/font_dwrite_oracle.h tests/win/font_fixture.h src/font/dwrite_win.c src/font/discovery_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/dwrite_win.o %/discovery_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 # Two source locations per test name: tests/win/<t>.c (Windows-only) or tests/<t>.c (portable suite); make takes the rule whose source exists.
 $(WIN_B)/rel/tests/%_test.exe: tests/win/%_test.c $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
