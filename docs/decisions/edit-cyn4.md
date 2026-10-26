@@ -111,3 +111,10 @@ new headless DirectWrite/async atlas suite. Editor/IPC/display-dependent font
 suites require their owning modules' Windows migrations; this worker does not
 stub them or silently claim that they ran. The report identifies the acceptance
 gap for the coordinator.
+
+## Coordinator decisions (session 22, 2026-10-26)
+
+1. **Editor-dependent Windows font suites** (those that link the editor or layout integration) stay with their owning W2 migrations; the module-level coverage here (font_test, font_gsub_test, font_dwrite_test as Windows exes) is the W1.3 acceptance. Recorded on the bead.
+2. **Call-scoped DirectWrite faces over the same immutable bytes, no owning pointer in the copyable `font_t`:** accepted; the cost is repeated face creation on the worker, outside the typing path. The Codex review (docs/reviews/edit-cyn4.md) scrutinises the COM lifetime.
+3. **`tools/with_display_lock.sh`'s own `detect_leaks=0` for its shell-contract probes** is outside this bead and stays; it does not touch the sanitizer test binaries.
+4. Landing after the review's triaged fixes, rebased over W0.5 (both widen `mk/win.mk`: keep both module and test lists).
