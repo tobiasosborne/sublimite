@@ -145,3 +145,8 @@ detection suppression or package installation was used.
 - Findings 12–16 remain outside scope for coordinator backlog triage. Full
   Windows main/editor launcher wiring is W2.4. No claim of production save/journal
   crash integration or complete public Windows baseline identity is made here.
+
+## Coordinator verification (session 23, 2026-10-26)
+- Rebased onto main a4feb31; mk/win.mk rebuilt from main plus the bead's three hunks (`savectl ipc` in WIN_MODULES, the PHONY entry, the REAL_DEPS / `check-savectl-production` block): 30f1d80.
+- Production-save gate red read: state FAILED, file_error FILE_ERR_IO (1), modified. Correct behaviour; the test expected FILE_ERR_BUSY, which file.h defines as a save job in flight. Test now asserts FILE_ERR_IO with err_no == ERROR_SHARING_VIOLATION (31a79cf). `make TARGET=win check-savectl-production` rel and san green.
+- 19:05:46-19:29:47 (M)[AC, desktop Spiral], load1 0.10 at start: `make all` 0; Linux `make check` 0 on :95 (110 test binaries, test_replay_cli, display lock contract PASS, leaks on); `make TARGET=win check` 0 (98 RESULT lines, all exit=0).
