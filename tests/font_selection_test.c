@@ -10,7 +10,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #define T(c) do { if (!(c)) { fprintf(stderr, "font_selection_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 typedef struct guard { bool active; size_t allocations, submits; } guard;
 static void ingress(void *ctx, uint64_t sequence, uint64_t ns)

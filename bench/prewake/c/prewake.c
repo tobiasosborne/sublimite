@@ -1,5 +1,5 @@
 #include "../prewake.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../../vendor/xkbcommon/xkbcommon-keysyms.h"
 static bool prewake_trigger(const plat_event *event)
 {
     if (event->kind==PLAT_EV_FOCUS) return event->focused;

@@ -2,7 +2,7 @@
 #include "trace/trace.h"
 #include "gl/gl.h"
 #include "raster/raster.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>

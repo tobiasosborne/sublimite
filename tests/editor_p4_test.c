@@ -5,7 +5,7 @@
 #include "trace/trace.h"
 #include "base/base.h"
 #include <errno.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

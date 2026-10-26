@@ -1,7 +1,7 @@
 #include "editor/private.h"
 #include "layout/wrap.h"
 #include "trace/trace.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
 static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }

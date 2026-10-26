@@ -13,7 +13,7 @@
 #include "trace/trace.h"
 #include "trace/trace_fmt.h"
 #include "file/file_test.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>

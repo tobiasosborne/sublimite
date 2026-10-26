@@ -1,6 +1,6 @@
 #include "prewake.h"
 #include <stdio.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #ifndef PREWAKE_VARIANT
 #define PREWAKE_VARIANT 0
 #endif

@@ -6,7 +6,7 @@
  * Decisions and conventions: docs/decisions/edit-n95.md. */
 #include "editor/private.h"
 #include "trace/trace.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <poll.h>
 #include <string.h>
 #include <unistd.h>

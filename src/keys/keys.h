@@ -135,6 +135,13 @@ typedef enum keys_result {
     KEYS_NONE, KEYS_MATCH, KEYS_PREFIX, KEYS_CANCELLED, KEYS_ERR_ARG
 } keys_result;
 
+/* ASCII case-insensitive XKB names; NoSymbol (zero) on invalid input.
+ * INIT/UI formatting helpers; neither lookup allocates. */
+uint32_t keys_keysym_from_name(const char *name);
+/* Like xkb_keysym_get_name: full length (excluding NUL), -1 for invalid input;
+ * writes a NUL-terminated prefix when capacity is nonzero. */
+int keys_keysym_name(uint32_t keysym, char *out, size_t capacity);
+
 void keys_reset(keys_state *state); /* NULL is allowed */
 /* Read-only table sorted by (args.chord, modifiers, keysym). No allocation.
  * Returned storage has process lifetime; count is optional. */

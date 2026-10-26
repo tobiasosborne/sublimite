@@ -29,7 +29,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #define T(c) do { if (!(c)) { fprintf(stderr, "dataloss_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 enum { COLS = 40, ROWS = 4, TEXT_CAP = 4096 };
 typedef struct oracle { uint64_t len, cursor; uint8_t text[TEXT_CAP]; } oracle;

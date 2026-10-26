@@ -1,7 +1,7 @@
 #include "editor/editor.h"
 #include "undo/undo.h"
 #include "base/base.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
 #define MODEL_BYTES 4096u

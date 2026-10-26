@@ -1,6 +1,6 @@
 #include "editor/private.h"
 #include "trace/trace.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 #include <poll.h>
 

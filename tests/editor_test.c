@@ -12,7 +12,7 @@
 #include "fif/fif.h"
 #include "tree_fixture.h"
 #include <sys/mman.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,7 +1,7 @@
 #include "keys/keys.h"
 #include "base/base.h"
 #include "harness.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 #define EVENTS 1000000u
 

@@ -140,6 +140,14 @@ static void output_test(void)
     assert(info.dpi == 96.0 * scale);
     mock_join(child);
     child = mock_start_options(true, false, NULL, 0, scale, false);
+    plat_display_info shared;
+    assert(plat_display_size(PLAT_BACKEND_WAYLAND, &shared) == PLAT_OK);
+    assert(shared.dpi == info.dpi && shared.work_width == info.width && shared.work_height == info.height);
+    assert(plat_display_interval_ns(NULL) == 0);
+    plat unknown = {.backend = PLAT_BACKEND_WAYLAND};
+    assert(plat_display_interval_ns(&unknown) == 0);
+    mock_join(child);
+    child = mock_start_options(true, false, NULL, 0, scale, false);
     plat p; plat_config cfg = {.width = (uint32_t)scale, .height = (uint32_t)scale, .work_eventfd = -1};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
     assert(p.width == (uint32_t)scale * cfg.width && p.height == cfg.height);

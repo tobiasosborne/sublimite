@@ -1,5 +1,5 @@
 #include "editor/private.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
 int editor_palette_show(editor *e)

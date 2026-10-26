@@ -134,20 +134,16 @@ int main(int argc, char **argv)
          * pointers are reserved during startup, never on the typing path. */
         .tab_capacity = 1000u, .server = owns_server ? &server : NULL, .platform_backend = platform_backend,
         .close_signal_fd = close_signal_fd >= 0 ? &close_signal_fd : NULL};
-    editor_display_size display_size;
+    plat_display_info display_size;
     /* A supplied Wayland fd is an existing protocol connection, not a socket
      * name from which another connection can be opened. Preserve it for
      * platform init rather than consume it in the preliminary output query. */
     bool native_size = platform_backend == PLAT_BACKEND_X11 ||
         (!(backend.info.capabilities & RENDER_CAP_HEADLESS) && !getenv("WAYLAND_SOCKET"));
     if (!rc && native_size) {
-        if (platform_backend == PLAT_BACKEND_X11) rc = editor_runtime_display_size(&display_size);
-        else {
-            wayland_display_info output;
-            rc = wayland_display_size(&output);
-            if (rc) platform_error = wayland_error_string(rc);
-            if (!rc) display_size = (editor_display_size){output.dpi, output.width, output.height};
-        }
+        rc = plat_display_size(platform_backend, &display_size);
+        if (rc && platform_backend == PLAT_BACKEND_WAYLAND) platform_error = wayland_error_string(rc);
+        else if (rc) rc = EDITOR_ERR_IO;
     }
     if (!rc && native_size) {
         config.font_dpi = display_size.dpi;

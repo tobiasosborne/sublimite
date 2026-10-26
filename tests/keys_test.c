@@ -1,7 +1,11 @@
 #include "keys/keys.h"
 #include "base/base.h"
+#if !defined(_WIN32)
+#include "keys/keysym_names.h"
 #include <xkbcommon/xkbcommon.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#endif
+#include "config/config.h"
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -286,6 +290,80 @@ static const expectation expected[] = {
     T("ctrl+j", CHORD,0,KEYS_CHORD_J),
 };
 
+#if !defined(_WIN32)
+/* Linux oracle: keep libxkbcommon in this test, never in keys/config. */
+static void keysym_roundtrip(const char *name, uint32_t value)
+{
+    uint32_t folded=xkb_keysym_from_name(name,XKB_KEYSYM_CASE_INSENSITIVE);
+    CHECK(keys_keysym_from_name(name)==folded);
+    char actual[KEYS_KEYSYM_NAME_CAP], oracle[KEYS_KEYSYM_NAME_CAP]; /* (P) longest generated name plus NUL. */
+    int n=xkb_keysym_get_name(value,oracle,sizeof oracle);
+    CHECK(n>0 && (size_t)n<sizeof oracle);
+    CHECK(keys_keysym_name(value,actual,sizeof actual)==n);
+    if (strcmp(actual,oracle)) fprintf(stderr,"keysym %#x: %s != %s\n",value,actual,oracle);
+    CHECK(!strcmp(actual,oracle));
+    CHECK(keys_keysym_from_name(actual)==xkb_keysym_from_name(oracle,XKB_KEYSYM_CASE_INSENSITIVE));
+    char upper[sizeof actual], lower[sizeof actual];
+    CHECK(strlen(name)<sizeof upper);
+    for (size_t i=0;i<=strlen(name);i++) {
+        unsigned char c=(unsigned char)name[i];
+        upper[i]=(char)(c>='a' && c<='z' ? c-'a'+'A' : c);
+        lower[i]=(char)(c>='A' && c<='Z' ? c-'A'+'a' : c);
+    }
+    CHECK(keys_keysym_from_name(upper)==xkb_keysym_from_name(upper,XKB_KEYSYM_CASE_INSENSITIVE));
+    CHECK(keys_keysym_from_name(lower)==xkb_keysym_from_name(lower,XKB_KEYSYM_CASE_INSENSITIVE));
+}
+static void keysym_names(void)
+{
+    for (size_t i=0;i<sizeof keys_keysym_names/sizeof keys_keysym_names[0];i++) {
+        const keys_keysym_entry *entry=&keys_keysym_names[i];
+        keysym_roundtrip(entry->name,entry->value);
+    }
+    for (size_t i=0;i<sizeof keys_keysym_by_value/sizeof keys_keysym_by_value[0];i++) {
+        const keys_keysym_entry *entry=&keys_keysym_names[keys_keysym_by_value[i]];
+        keysym_roundtrip(entry->name,entry->value);
+    }
+    const char *forms[] = {"", "UnknownKeysym", "U0041", "u000041", "U0100", "U+0041", "U001f", "U0000",
+        "U007f", "U0080", "U009f", "U00a0", "U00ff", "U10000", "U10FFFF", "U110000", "UD800",
+        "UFFFFFFFFF", "U000000041", "0x000000041", "XF86_AudioMute", "XF86__AudioMute", "0x00000041", "0XFF51", "0x1fffffff", "0x20000000", "0xffffffff", "0x",
+        "0x+41", "0x 41", "0x-1", "0x100000000", "U-1", " U0041", "U0041 ", "Greek_LAMBDA"};
+    for (size_t i=0;i<sizeof forms/sizeof forms[0];i++)
+        CHECK(keys_keysym_from_name(forms[i])==xkb_keysym_from_name(forms[i],XKB_KEYSYM_CASE_INSENSITIVE));
+    CHECK(keys_keysym_from_name(NULL)==0);
+    const uint32_t values[] = {0,1,31,32,65,0x01000041u,0x010000ffu,0x01000100u,0x0100d800u,
+        0x01010000u,0x0110ffffu,0x01110000u,0x1fffffffu,0x20000000u,UINT32_MAX};
+    for (size_t i=0;i<sizeof values/sizeof values[0];i++) {
+        char actual[sizeof "0xffffffff"], oracle[sizeof actual];
+        for (size_t cap=0;cap<=sizeof actual;cap++) {
+            memset(actual,'?',sizeof actual); memset(oracle,'?',sizeof oracle);
+            CHECK(keys_keysym_name(values[i],actual,cap)==xkb_keysym_get_name(values[i],oracle,cap));
+            CHECK(!memcmp(actual,oracle,sizeof actual));
+        }
+    }
+    CHECK(keys_keysym_name(0,NULL,0)==(int)strlen("NoSymbol"));
+    CHECK(keys_keysym_name(0,NULL,1)==-1);
+    const char *config_names[] = {"Y","U","!","+","Return","LEFT","Page_Up","KP_Enter","XF86Save",
+        "Greek_LAMBDA","U0041","0xFF51","dead_i","kana_yo","UnknownKeysym"};
+    for (size_t i=0;i<sizeof config_names/sizeof config_names[0];i++) {
+        const char *name=config_names[i];
+        char source[sizeof "[keymap]\nundo='Ctrl+'\n" + sizeof "UnknownKeysym"];
+        int n=snprintf(source,sizeof source,"[keymap]\nundo='Ctrl+%s'\n",name);
+        CHECK(n>0 && (size_t)n<sizeof source);
+        keys_binding expected_binding={.keysym=strlen(name)==1u ? (uint8_t)*name :
+            xkb_keysym_from_name(name,XKB_KEYSYM_CASE_INSENSITIVE),.modifiers=PLAT_MOD_CTRL};
+        bool valid=keys_binding_normalize(&expected_binding);
+        config_settings settings; config_error error;
+        int rc=config_parse((const uint8_t *)source,(size_t)n,&settings,&error);
+        CHECK(rc==(valid ? CONFIG_OK : CONFIG_ERR_VALUE));
+        if (valid) CHECK(settings.binding_count==1 && settings.bindings[0].keysym==expected_binding.keysym &&
+            settings.bindings[0].modifiers==expected_binding.modifiers);
+    }
+    printf("keys_test: %zu generated names and %zu canonical values checked both directions against libxkbcommon\n",
+        sizeof keys_keysym_names/sizeof keys_keysym_names[0],sizeof keys_keysym_by_value/sizeof keys_keysym_by_value[0]);
+}
+
+#endif
+
 static void stroke(const char *text, uint32_t *sym, uint16_t *mods)
 {
     *mods=0;
@@ -295,7 +373,12 @@ static void stroke(const char *text, uint32_t *sym, uint16_t *mods)
         else if (strncmp(text,"alt+",4)==0) { *mods|=PLAT_MOD_ALT; text+=4; }
         else break;
     }
+#if !defined(_WIN32)
+    CHECK(keys_keysym_from_name(text)==xkb_keysym_from_name(text,XKB_KEYSYM_CASE_INSENSITIVE));
     *sym=xkb_keysym_from_name(text,XKB_KEYSYM_NO_FLAGS);
+#else
+    *sym=keys_keysym_from_name(text);
+#endif
     CHECK(*sym!=XKB_KEY_NoSymbol);
 }
 static void compare(const keys_binding *b, const expectation *e)
@@ -437,5 +520,8 @@ static void no_allocations(void)
 }
 int main(void)
 {
+#if !defined(_WIN32)
+    keysym_names();
+#endif
     bindings(); edge_cases(); no_allocations(); puts("keys_test: all passed"); return 0;
 }

@@ -1,6 +1,6 @@
 #include "keys/keys.h"
 #include "base/base.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 static uint32_t read_u32(const uint8_t *p)
 {

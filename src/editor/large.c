@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 /* --- helpers ---------------------------------------------------------- */
 static uint64_t estimate_line(const editor_buffer *b, uint64_t byte)

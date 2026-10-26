@@ -3,7 +3,7 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include "journal/journal.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>

@@ -1,6 +1,5 @@
 #include "keys/keys.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
-#include <xkbcommon/xkbcommon.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 /* (P) implemented find actions and boolean option toggles take no numeric
  * arguments or capability flags, hence zero flags/value in their rows. */
@@ -469,7 +468,7 @@ static int format_stroke(const keys_binding *b, char *out, size_t capacity, size
     else if (b->keysym == XKB_KEY_Prior) strcpy(name, "PageUp");
     else if (b->keysym == XKB_KEY_Next) strcpy(name, "PageDown");
     else {
-        int n = xkb_keysym_get_name(b->keysym, name, sizeof name);
+        int n = keys_keysym_name(b->keysym, name, sizeof name);
         if (n <= 0 || (size_t)n >= sizeof name) return -1;
     }
     return append_chord(out, capacity, used, name);

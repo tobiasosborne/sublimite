@@ -13,7 +13,7 @@
 #include "base/base.h"
 #include "harness.h"
 #include "editor_accounting.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <inttypes.h>
 #include <fcntl.h>
 #include <sys/mman.h>

@@ -145,6 +145,9 @@ EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
 $(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
+# Linux-only oracle; production keys/config have no libxkbcommon dependency.
+$(B)/tests/keys_test $(B)/san/tests/keys_test: LDLIBS += -lxkbcommon
+
 .PHONY: all lib install uninstall check check-sh bench bench-zygote fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)

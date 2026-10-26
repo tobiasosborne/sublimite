@@ -6,7 +6,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "font_size_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 static int settle(editor *e)

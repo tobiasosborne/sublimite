@@ -1,7 +1,7 @@
 /* Existing A/B/C hint policies against an independent event/clock model. */
 #include "base/base.h"
 #include "../bench/prewake/prewake.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #define prewake_hint prewake_hint_a
 #define prewake_activity prewake_activity_a
 #include "../bench/prewake/a/prewake.c"

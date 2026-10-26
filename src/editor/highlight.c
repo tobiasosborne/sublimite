@@ -4,8 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sched.h>
-#include <xcb/xcb.h>
-#include <xcb/randr.h>
 
 /* All ordinals are (P): zero is empty/success/first, one advances a byte,
  * row or identity. Storage derives from the existing reserved cell geometry.
@@ -21,36 +19,6 @@ static bool same(editor_hl_stamp a, editor_hl_stamp b)
     return a.id==b.id && a.revision==b.revision && a.source==b.source &&
         a.first==b.first && a.visual==b.visual && a.hscroll==b.hscroll &&
         a.geometry==b.geometry && a.cols==b.cols && a.rows==b.rows && a.wrap==b.wrap;
-}
-/* Startup only. RandR mode timing provides (P) total pixel clocks per frame
- * divided by pixel clocks/second; ns/second is the SI unit conversion.
- * Unknown/zero clocks remain unknown, never a fabricated fallback rate. */
-static uint64_t display_interval(const editor *e)
-{
-    if (!e->has_platform || e->platform.backend!=PLAT_BACKEND_X11) return 0;
-    xcb_connection_t *connection=e->platform.conn;
-    xcb_screen_iterator_t screens=xcb_setup_roots_iterator(xcb_get_setup(connection));
-    if (!screens.rem) return 0;
-    xcb_randr_get_screen_resources_current_reply_t *resources=xcb_randr_get_screen_resources_current_reply(connection,
-        xcb_randr_get_screen_resources_current(connection,screens.data->root),NULL);
-    if (!resources) return 0;
-    xcb_randr_crtc_t *crtcs=xcb_randr_get_screen_resources_current_crtcs(resources);
-    xcb_randr_mode_info_t *modes=xcb_randr_get_screen_resources_current_modes(resources);
-    int crtc_count=xcb_randr_get_screen_resources_current_crtcs_length(resources);
-    int mode_count=xcb_randr_get_screen_resources_current_modes_length(resources);
-    uint64_t interval=0;
-    for (int i=0;i<crtc_count && !interval;i++) {
-        xcb_randr_get_crtc_info_reply_t *info=xcb_randr_get_crtc_info_reply(connection,
-            xcb_randr_get_crtc_info(connection,crtcs[i],resources->config_timestamp),NULL);
-        if (info) for (int j=0;j<mode_count;j++) if (modes[j].id==info->mode && modes[j].dot_clock) {
-            uint64_t clocks=(uint64_t)modes[j].htotal*modes[j].vtotal;
-            interval=clocks*UINT64_C(1000000000)/modes[j].dot_clock;
-            if (modes[j].mode_flags & XCB_RANDR_MODE_FLAG_DOUBLE_SCAN) interval+=interval;
-            if (modes[j].mode_flags & XCB_RANDR_MODE_FLAG_INTERLACE) interval/=2u; /* two fields/frame */
-        }
-        free(info);
-    }
-    free(resources); return interval;
 }
 int editor_hl_init(editor *e, size_t cells)
 {
@@ -203,7 +171,7 @@ void editor_hl_service(editor *e)
     editor_highlight *h=&e->hl;
     if (!h->clock_checked) {
         h->clock_checked=true;
-        if (!h->refresh_interval_ns) h->refresh_interval_ns=display_interval(e);
+        if (!h->refresh_interval_ns) h->refresh_interval_ns=(e->has_platform ? plat_display_interval_ns(&e->platform) : 0);
     }
     if (!h->snapshot) return;
     if (!same(h->wanted,stamp(e)) || e->buffer->source_stale || e->buffer->pending_open) {

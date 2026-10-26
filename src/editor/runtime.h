@@ -10,19 +10,12 @@
  * largest whole em fitting that prepaid per-frame coverage bound. */
 #define EDITOR_FONT_DEFAULT_PT 10.0
 #define EDITOR_FONT_MAX_PX 62u
-typedef struct editor_display_size {
-    double dpi;
-    uint32_t work_width, work_height;
-} editor_display_size;
 double editor_runtime_dpi(double xft, uint32_t width, uint32_t height,
                           uint32_t mm_width, uint32_t mm_height);
 double editor_runtime_xft_dpi(const char *resources, size_t len);
 uint32_t editor_runtime_em_px(double dpi, double points);
 void editor_runtime_window(uint32_t work_width, uint32_t work_height,
                             uint32_t *width, uint32_t *height);
-/* INIT only: X resources, active RANDR output physical size, EWMH work area.
- * Returns EDITOR_ERR_IO when the display cannot be opened. */
-int editor_runtime_display_size(editor_display_size *size);
 /* Pure selection: preserve display by default; any non-NULL refuse selects
  * a private alternate for unsafe displays. Caller applies or refuses it. */
 const char *editor_runtime_display(const char *display, const char *safe, const char *refuse);

@@ -107,6 +107,16 @@ typedef struct plat {
     uint32_t xi_scroll_ms;  /* time of last XI2 scroll event, to drop its emulated core buttons */
 } plat;
 
+typedef struct plat_display_info {
+    double dpi;
+    uint32_t work_width, work_height;
+} plat_display_info;
+/* INIT only: X resources/active RandR output/EWMH work area, or Wayland
+ * current output DPI and physical buffer dimensions. Returns PLAT_* errors. */
+int plat_display_size(plat_backend backend, plat_display_info *info);
+/* INIT only: mode timing in ns; zero when unknown or no platform exists. */
+uint64_t plat_display_interval_ns(const plat *p);
+
 int  plat_init(plat *p, const plat_config *cfg);
 int  plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend);
 void plat_map(plat *p);

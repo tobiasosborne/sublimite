@@ -8,7 +8,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sched.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 #define T(x) do { if (!(x)) { fprintf(stderr, "config_test: FAIL %s\n", #x); return 1; } } while (0)
 typedef struct oracle { size_t visited; } oracle;

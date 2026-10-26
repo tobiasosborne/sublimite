@@ -10,3 +10,10 @@
   hostile CFF font cannot nest subrs into ~20^9 steps. The sha256 above is of the upstream
   file; the patched file differs by exactly those lines. Everything else about CFF safety
   (INDEX/DICT/FDSelect bounds) is validated in `src/font/font.c` before `stbtt_InitFont`.
+- `xkbcommon/xkbcommon-keysyms.h`: copied unchanged from
+  `/usr/include/xkbcommon/xkbcommon-keysyms.h`, Ubuntu package
+  `libxkbcommon-dev` version `1.6.0-1build1` (`dpkg -s libxkbcommon-dev`).
+  X11/MIT-style Open Group, DEC and subsequent licence notices are retained
+  verbatim in the header. `tools/keysymgen.py` reads only this pinned header
+  to generate `src/keys/keysym_names.h`; `python3 tools/keysymgen.py --check`
+  verifies the committed output without needing libxkbcommon.

@@ -11,7 +11,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_hot_exit_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 #define HOT_LINE "abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz"
 /* G: bead acceptance; three distinct tabs distinguish outgoing/active/survivor

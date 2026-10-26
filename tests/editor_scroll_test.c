@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 /* (G) Reuse the public editor fixture and retry bound in
  * scroll_test.c:editor_observability/settle_editor; these are fixture controls,

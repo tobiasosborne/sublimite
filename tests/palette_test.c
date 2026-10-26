@@ -1,6 +1,6 @@
 #include "palette/palette.h"
 #include "base/base.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdio.h>
 #include <string.h>
 

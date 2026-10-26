@@ -2,7 +2,7 @@
 #include "palette/palette.h"
 #include "config/config.h"
 #include "base/base.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdio.h>
 #include <string.h>
 #include "config/actions.inc"

@@ -3,7 +3,6 @@
 #include "indent/indent.h"
 #include <string.h>
 #include <math.h>
-#include <xkbcommon/xkbcommon.h>
 
 /* Generated from the public keys_action enum; every enumerated action has its
  * lowercase name. This is immutable data, not a second default keymap. */
@@ -28,7 +27,7 @@ static int chord(const char *s, keys_binding *binding)
         binding->modifiers |= mod; part = plus + 1;
     }
     if (!*part || strchr(part, ' ') || strchr(part, '\t')) return CONFIG_ERR_VALUE;
-    binding->keysym = strlen(part) == 1u ? (uint8_t)*part : xkb_keysym_from_name(part, XKB_KEYSYM_CASE_INSENSITIVE);
+    binding->keysym = strlen(part) == 1u ? (uint8_t)*part : keys_keysym_from_name(part);
     return keys_binding_normalize(binding) ? CONFIG_OK : CONFIG_ERR_VALUE;
 }
 static int override(config_settings *s, const char *name, const char *stroke)

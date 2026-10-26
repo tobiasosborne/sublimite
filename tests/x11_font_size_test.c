@@ -4,7 +4,7 @@
 #include "raster/raster.h"
 #include <stdio.h>
 #include <xcb/xcb.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "x11_font_size_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 static int settle(editor *e)
@@ -14,8 +14,8 @@ static int settle(editor *e)
 }
 int main(void)
 {
-    editor_display_size display;
-    T(editor_runtime_display_size(&display) == 0);
+    plat_display_info display;
+    T(plat_display_size(PLAT_BACKEND_X11, &display) == 0);
     uint32_t width, height;
     editor_runtime_window(display.work_width, display.work_height, &width, &height);
     editor_config config = {.font_dpi = display.dpi, .window_width = width, .window_height = height,

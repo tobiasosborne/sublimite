@@ -3,7 +3,7 @@
  * Items dispatch through editor_dispatch_action, the palette's dispatcher.
  * All state is embedded in the editor (no allocation on any path here). */
 #include "editor/private.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
 #define MODS (PLAT_MOD_CTRL | PLAT_MOD_SHIFT | PLAT_MOD_ALT | PLAT_MOD_SUPER | PLAT_MOD_ALTGR)

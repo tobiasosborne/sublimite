@@ -1,6 +1,6 @@
 #include "editor/private.h"
 #include "base/base.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>

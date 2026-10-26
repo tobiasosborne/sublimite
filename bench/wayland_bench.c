@@ -8,7 +8,7 @@
 #include "trace/trace.h"
 #include "harness.h"
 #include "interaction.h"
-#include <xkbcommon/xkbcommon-keysyms.h>
+#include "../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <stdlib.h>
 #include <string.h>
 
