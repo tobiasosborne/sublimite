@@ -234,3 +234,13 @@ Derivation: the existing harness samples the relevant trace intervals, computes 
 The asynchronous clarification offered those policy choices; absent a decision, the blocker is reported rather than disguising audit loss as an accepted exclusion. The new full-security requirement and ordinary non-privileged save requirement need to be reconciled by the coordinator.
 
 **Found, not fixed / integration:** finding 16 (short-name notifications) is unchanged as instructed. A filesystem that cannot enumerate streams is conservatively refused rather than assumed stream-free; share/degraded-mode policy remains with its Windows integration bead. Retain the broader module/test lists from concurrent Windows workers when integrating `mk/win.mk`. Include the pre-existing fuzzer migration and both new regression sources in the coordinator's commit. No clean-final-commit claim is made before that commit exists.
+
+## Coordinator verification (session 22)
+
+Rebased over W0.5, W1.2, W1.3 (mk/win.mk: `… font file`, W0.5's `tests/win/core_file.c` stub dropped since the real module links, `-ladvapi32`). On that tree, (M)[AC, desktop Spiral]:
+
+```
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:96 make -j64 check   → exit 0, 107 suites, LeakSanitizer on (14:05 → 14:33)
+make TARGET=win -j64 check    → 72 results exit=0 (every file suite rel and san); two red: d3d11_test rel and san `first_frame == 0`, W1.2's occlusion-sensitive test failing on main's own binary since 13:49 (edit-kv2g first item), not this bead
+```
