@@ -231,3 +231,13 @@ Final checks: `git diff --check` exits 0; frozen render/OS headers and common ad
 - Windows `os_win_test` reports its existing file-symlink fixture unavailable without Developer Mode/elevation. It is an explicit suite UNAVAILABLE result, not a D3D11 skip.
 
 No changes outside this worktree; no new coordinator design decision is required for the backend fix. The W1.1 ownership/recovery handoff above remains integration work.
+
+## Coordinator verification (session 22)
+
+Rebased onto main over W0.5 (mk/win.mk: W0.5's lists plus `render raster d3d11`). On the rebased tree, (M)[AC, desktop Spiral], load1 2.79 at start:
+
+```
+make TARGET=win -j64 check    → exit 0, 62 results all exit=0 (d3d11_test and d3d11_win_test rel and san among them)
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:98 make -j64 check   → exit 0, 105 suites, 12:40:32 → 13:04:07, LeakSanitizer on
+```
