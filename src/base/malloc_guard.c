@@ -1,8 +1,9 @@
-#if !defined(_WIN32)
 /* Counting interposition for malloc/calloc/realloc, used by the no-malloc
  * law tests. Underneath we call glibc's exported __libc_* entry points, so
  * no dlsym bootstrap (and no recursion) is involved. Compiled out under
- * AddressSanitizer and ThreadSanitizer, which own malloc themselves. */
+ * AddressSanitizer and ThreadSanitizer, which own malloc themselves.
+ * Linux only: the Windows guard is malloc_guard_win.c (link-time --wrap). */
+#if !defined(_WIN32)
 #include "base/base.h"
 
 #include <stddef.h>
@@ -75,5 +76,4 @@ size_t edit_malloc_guard_end(void) { return 0; }
 void edit_malloc_guard_exempt_begin(void) {}
 void edit_malloc_guard_exempt_end(void) {}
 #endif
-
-#endif /* !defined(_WIN32): edit-177r.4, glibc guard; Windows twin is W0.3. */
+#endif /* !defined(_WIN32): glibc guard; the Windows twin is malloc_guard_win.c (edit-177r.3). */

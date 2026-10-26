@@ -5,7 +5,9 @@
 # (mk/win.mk copies them). Args pass through; stdout/stderr stream; the exe's
 # exit code is returned. Writes nothing. A test that needs NTFS scratch makes
 # it itself as a Windows process under %TEMP%\sublimite-test-* and deletes it.
+# Interop passes only WSLENV-listed variables: the os suite's selectors go through.
 set -u
+export WSLENV="OS_TEST_CASE:OS_TEST_DATA_REPARSE${WSLENV:+:$WSLENV}"
 [ $# -ge 1 ] || { echo "usage: winrun.sh <exe> [args...]" >&2; exit 2; }
 exe=$(readlink -f "$1"); shift
 [ -f "$exe" ] || { echo "winrun: no such file: $exe" >&2; exit 2; }

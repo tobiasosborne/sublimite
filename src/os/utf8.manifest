@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- UTF-8 process code page (Windows 10 1903+): the CRT's narrow argv, fopen
+     and getenv carry UTF-8 bytes unchanged (os.h, os_proc_spawn; decision doc
+     edit-177r.2 §3.9). Linked into every Windows executable by mk/win.mk. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="sublimite" version="0.0.0.1"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
