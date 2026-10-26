@@ -1,9 +1,7 @@
 #include "base/base.h"
 
-#include <errno.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "os/os.h"
 
 const char *edit_version(void) { return "0.0.1-dev"; }
 
@@ -18,9 +16,10 @@ static size_t align_up(size_t x, size_t align) {
 int edit_arena_init(edit_arena *a, size_t size) {
     memset(a, 0, sizeof *a);
     if (size == 0) return -1;
-    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) return -1;
+    size_t pg = os_page_size();
+    if (size > SIZE_MAX - (pg - 1)) return -1;
+    void *p;
+    if (os_vm_reserve(&p, align_up(size, pg)) != OS_OK) return -1;
     a->base = (unsigned char *)p;
     a->size = size;
     return 0;
@@ -31,6 +30,15 @@ void *edit_arena_alloc(edit_arena *a, size_t size, size_t align) {
     /* Align the absolute address; base is page-aligned so offsets suffice. */
     size_t off = align_up(a->used, align);
     if (off < a->used || off > a->size || size > a->size - off) return NULL;
+#if defined(_WIN32)
+    /* Linux reservations are already writable; Windows commits only the
+     * pages this allocation can touch, retaining the lazy arena policy. */
+    if (size) {
+        size_t pg = os_page_size(), first = off & ~(pg - 1);
+        size_t end = align_up(off + size, pg);
+        if (os_vm_commit(a->base + first, end - first) != OS_OK) return NULL;
+    }
+#endif
     a->used = off + size;
     return a->base + off;
 }
@@ -44,7 +52,7 @@ void edit_arena_reset_to_mark(edit_arena *a, edit_arena_mark_t m) {
 void edit_arena_reset(edit_arena *a) { a->used = 0; }
 
 void edit_arena_free(edit_arena *a) {
-    if (a->base) munmap(a->base, a->size);
+    if (a->base) os_vm_release(a->base, align_up(a->size, os_page_size()));
     memset(a, 0, sizeof *a);
 }
 
@@ -62,11 +70,11 @@ int edit_pool_init(edit_pool *p, size_t block_size, size_t block_align,
     size_t stride = align_up(block_size, block_align);
     if (capacity > SIZE_MAX / stride) return -1;
     size_t bytes = stride * capacity;
-    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    size_t pg = os_page_size();
+    if (bytes > SIZE_MAX - (pg - 1)) return -1;
     size_t map_bytes = align_up(bytes, pg);
-    void *m = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (m == MAP_FAILED) return -1;
+    void *m;
+    if (os_vm_reserve(&m, map_bytes) != OS_OK) return -1;
     p->base = (unsigned char *)m;
     p->stride = stride;
     p->capacity = capacity;
@@ -81,6 +89,11 @@ void *edit_pool_get(edit_pool *p) {
         p->free_head = *(void **)blk;
     } else if (p->fresh < p->capacity) {
         blk = p->base + p->fresh * p->stride;
+#if defined(_WIN32)
+        size_t pg = os_page_size(), off = p->fresh * p->stride;
+        size_t first = off & ~(pg - 1), end = align_up(off + p->stride, pg);
+        if (os_vm_commit(p->base + first, end - first) != OS_OK) return NULL;
+#endif
         p->fresh++;
     } else {
         return NULL;
@@ -104,7 +117,7 @@ bool edit_pool_put(edit_pool *p, void *ptr) {
 size_t edit_pool_count_live(const edit_pool *p) { return p->live; }
 
 void edit_pool_free(edit_pool *p) {
-    if (p->base) munmap(p->base, p->map_bytes);
+    if (p->base) os_vm_release(p->base, p->map_bytes);
     memset(p, 0, sizeof *p);
 }
 

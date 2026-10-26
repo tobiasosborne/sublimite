@@ -652,8 +652,25 @@ done:
 }
 #undef CP_CHECK
 
+/* edit-177r.4: destroying an uncached, uniquely owned root goes through
+ * node_unref -> pool_free while pool_mu is already held. This exercises the
+ * recursive acquisition; the suite runner bounds a mistaken default lock. */
+static void t_recursive_pool_release(void) {
+    g_name = "recursive pool release";
+    ca count; piece_allocator a = ca_make(&count);
+    piece_tree *t = piece_create(&a); CHECK(t);
+    CHECK(piece_init_copy(t, (const uint8_t *)"root", 4) == PIECE_OK);
+    piece_snapshot *snapshot = piece_snapshot_take(t); CHECK(snapshot);
+    CHECK(piece_insert(t, 2, (const uint8_t *)"new", 3) == PIECE_OK);
+    piece_destroy(t);
+    piece_snapshot_release(snapshot);
+    CHECK(count.live == 0);
+    puts("piece_test: recursive pool release passed");
+}
+
 int main(void) {
     rng_s = 12345;
+    t_recursive_pool_release();
     t_empty(); t_basic(); t_crlf(); t_undo(); t_mapped(); t_snapshot(); t_threads(); t_random(); t_mapped_mem(); t_coalesce(); t_ref();
     if (!g_fail) puts("piece_test: pre-P1.3c rows all passed");
     t_checkpoint_model(); t_checkpoint_commit(); t_checkpoint_abort(); t_checkpoint_range(); t_checkpoint_begin_nomem();

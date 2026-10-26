@@ -1414,7 +1414,7 @@ static void t_latency_save(void)
 static int latency_journal_sync(void *ctx, int fd, bool directory)
 {
     unsigned *calls = ctx; (void)directory;
-    if (pthread_equal(pthread_self(), pool.threads[0]) == 0) (*calls)++;
+    if (os_thread_self() != work_pool_worker_id(&pool, 0)) (*calls)++;
     return fsync(fd);
 }
 static void t_latency_journal(void)

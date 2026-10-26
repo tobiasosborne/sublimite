@@ -1,6 +1,6 @@
 #include "scroll/scroll.h"
 #include <string.h>
-#include <time.h>
+#include "os/os.h"
 
 #define SPAN_LIMIT 256u
 #define SPAN_BYTES 4096u
@@ -13,9 +13,7 @@ typedef struct slice {
 } slice;
 static uint64_t now_ns(void)
 {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static size_t limited_span(void *ctx, uint64_t off, const uint8_t **out)
 {

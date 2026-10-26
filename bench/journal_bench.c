@@ -217,7 +217,10 @@ static int worker_cpu(work_pool *pool)
     char tag[128];
     stamp("worker_cpu"); char path[]="/tmp/journal-cpu-XXXXXX"; REQUIRE(temporary(path)>=0);
     journal *j; REQUIRE(journal_open(&j,path,pool,NULL)==0);
-    clockid_t clk; REQUIRE(pthread_getcpuclockid(pool->threads[0],&clk)==0);
+    /* os_thread is opaque. The Linux identity is documented as pthread_self;
+     * wait for the worker to publish it before asking pthread for its clock. */
+    uint64_t id; while (!(id=work_pool_worker_id(pool,0))) nap();
+    clockid_t clk; REQUIRE(pthread_getcpuclockid((pthread_t)(uintptr_t)id,&clk)==0);
     uint64_t before=worker_cpu_ns(clk), parked_cpu=0; unsigned syncs=8;
     for(unsigned i=0;i<syncs;i++) {
         REQUIRE(journal_insert(j,1,i,(const uint8_t *)"x",1)==0 && journal_pump(j,1,true)==0);

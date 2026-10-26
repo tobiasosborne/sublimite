@@ -1,7 +1,7 @@
 /* P3.1b: caller-reserved single-line column index, snapshot worker + mailbox. */
 #include "layout/layout.h"
 #include <string.h>
-#include <time.h>
+#include "os/os.h"
 
 /* Fits in work_msg.data; completion is the sole worker -> UI handoff. */
 typedef struct checkpoint_result {
@@ -83,7 +83,7 @@ static void checkpoint_worker(work_ctx *ctx)
     piece_snapshot_release(snapshot);
     /* A full mailbox must not strand the single in-flight storage lease. */
     while (!work_should_stop(ctx) && !work_publish(ctx, &msg)) {
-        struct timespec ts = {0, 1000000}; (void)nanosleep(&ts, NULL);
+        os_sleep_ns(1000000);
     }
 }
 

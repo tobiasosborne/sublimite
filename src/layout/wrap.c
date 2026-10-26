@@ -2,6 +2,17 @@
 #include "layout/wrap.h"
 #include <string.h>
 
+#if defined(_WIN32)
+/* The Windows CRT has no memrchr; the same reverse byte search in C11. */
+static const uint8_t *last_byte(const uint8_t *p, int byte, size_t n)
+{
+    while (n) { if (p[--n] == (uint8_t)byte) return p + n; }
+    return NULL;
+}
+#else
+#define last_byte memrchr
+#endif
+
 static render_cell blank(const layout *l)
 {
     return (render_cell){0,RENDER_NO_SLOT,l->cfg.fg,l->cfg.bg,0,0};
@@ -233,7 +244,7 @@ static uint32_t ascii_span(layout *l,render_cell *cells,const uint8_t *p,size_t 
         if(leading<n) l->wrap_leading=false;
     }
     if(!l->wrap_leading) {
-        const uint8_t *last=memrchr(p,' ',n);
+        const uint8_t *last=last_byte(p,' ',n);
         if(last && (size_t)(last-p)>=leading) {
             uint32_t after=(uint32_t)(last-p)+1u;
             l->wrap_break_byte=at+after; l->wrap_break_col=col+after;

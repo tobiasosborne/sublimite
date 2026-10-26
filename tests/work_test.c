@@ -61,15 +61,15 @@ int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a)
 {
     if (injecting && ++init_stage == inject_stage) { fault_fired = true; return ENOMEM; }
     int rc = real_mutex_init(m, a);
-    if (m == &pool.mu) mutex_live = rc == 0;
+    if ((void *)m == (void *)&pool.mu) mutex_live = rc == 0;
     return rc;
 }
 int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *a)
 {
     if (injecting && ++init_stage == inject_stage) { fault_fired = true; return ENOMEM; }
     int rc = real_cond_init(c, a);
-    for (size_t i = 0; i < 2; i++) if (c == &pool.cv[i]) cond_live[i] = rc == 0;
-    if (c == &pool.foreground_cv) foreground_cond_live = rc == 0;
+    for (size_t i = 0; i < 2; i++) if ((void *)c == (void *)&pool.cv[i]) cond_live[i] = rc == 0;
+    if ((void *)c == (void *)&pool.foreground_cv) foreground_cond_live = rc == 0;
     return rc;
 }
 int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *ud)
@@ -82,7 +82,7 @@ int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), v
 }
 int pthread_mutex_destroy(pthread_mutex_t *m)
 {
-    if (m == &pool.mu) {
+    if ((void *)m == (void *)&pool.mu) {
         if (!mutex_live) { bad_destroy++; return EINVAL; }
         mutex_live = false;
     }
@@ -90,11 +90,11 @@ int pthread_mutex_destroy(pthread_mutex_t *m)
 }
 int pthread_cond_destroy(pthread_cond_t *c)
 {
-    for (size_t i = 0; i < 2; i++) if (c == &pool.cv[i]) {
+    for (size_t i = 0; i < 2; i++) if ((void *)c == (void *)&pool.cv[i]) {
         if (!cond_live[i]) { bad_destroy++; return EINVAL; }
         cond_live[i] = false;
     }
-    if (c == &pool.foreground_cv) {
+    if ((void *)c == (void *)&pool.foreground_cv) {
         if (!foreground_cond_live) { bad_destroy++; return EINVAL; }
         foreground_cond_live = false;
     }
@@ -102,12 +102,12 @@ int pthread_cond_destroy(pthread_cond_t *c)
 }
 int pthread_mutex_lock(pthread_mutex_t *m)
 {
-    if (m == &pool.mu && watch_dead) { dead_locks++; return EINVAL; }
+    if ((void *)m == (void *)&pool.mu && watch_dead) { dead_locks++; return EINVAL; }
     return real_mutex_lock(m);
 }
 int pthread_mutex_unlock(pthread_mutex_t *m)
 {
-    if (m == &pool.mu && watch_dead) return EINVAL;
+    if ((void *)m == (void *)&pool.mu && watch_dead) return EINVAL;
     return real_mutex_unlock(m);
 }
 static void resolve_sync(void)
@@ -330,7 +330,7 @@ static void test_init_errors(void)
         injecting = false;
         CHECK(rc != 0 && fault_fired);
         if (rc == 0) work_pool_shutdown(&pool);
-        CHECK(pool.efd == -1 && !mutex_live && !cond_live[0] && !cond_live[1]);
+        CHECK(work_pool_eventfd(&pool) == -1 && !mutex_live && !cond_live[0] && !cond_live[1]);
         CHECK(bad_destroy == 0);
         CHECK(last_eventfd >= 0 && fcntl(last_eventfd, F_GETFD) == -1 && errno == EBADF);
         if (stage <= 3) CHECK(thread_attempts == 0);
@@ -338,12 +338,12 @@ static void test_init_errors(void)
         work_pool_shutdown(&pool);
     }
     fail_eventfd = true;
-    CHECK(work_pool_init(&pool, 1, 2) != 0 && pool.efd == -1);
+    CHECK(work_pool_init(&pool, 1, 2) != 0 && work_pool_eventfd(&pool) == -1);
     fail_eventfd = false;
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init(&pool, 0, 0) != 0 && pool.efd == -1);
+    CHECK(work_pool_init(&pool, 0, 0) != 0 && work_pool_eventfd(&pool) == -1);
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && pool.efd == -1);
+    CHECK(work_pool_init(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_eventfd(&pool) == -1);
     work_pool_shutdown(&pool);
     if (init_pool(2)) work_pool_shutdown(&pool);
     result("section6 init_errors", before);
@@ -888,10 +888,10 @@ static void test_foreground_priority(void)
     uint64_t deadline = trace_now_ns() + 2000000000ull;
     bool continuation_queued = false;
     while (!continuation_queued && trace_now_ns() < deadline) {
-        pthread_mutex_lock(&pool.mu);
+        os_mutex_lock(&pool.mu);
         for (uint32_t i = 0; i < pool.foreground_queue.count; i++)
             continuation_queued = continuation_queued || pool.foreground_queue.q[(pool.foreground_queue.head + i) % WORK_MAX_JOBS] == moving.slot;
-        pthread_mutex_unlock(&pool.mu);
+        os_mutex_unlock(&pool.mu);
         if (!continuation_queued) sleep_ms(1);
     }
     CHECK(continuation_queued);
@@ -1507,19 +1507,19 @@ static void test_foreground_init_errors(void)
         injecting = false;
         CHECK(rc != 0 && fault_fired);
         if (rc == 0) work_pool_shutdown(&pool);
-        CHECK(pool.efd == -1 && !mutex_live && !cond_live[0] && !cond_live[1] && !foreground_cond_live);
+        CHECK(work_pool_eventfd(&pool) == -1 && !mutex_live && !cond_live[0] && !cond_live[1] && !foreground_cond_live);
         CHECK(!pool.foreground_started && bad_destroy == 0);
         CHECK(last_eventfd >= 0 && fcntl(last_eventfd, F_GETFD) == -1 && errno == EBADF);
         if (stage <= 4) CHECK(thread_attempts == 0);
         work_pool_shutdown(&pool);
     }
     fail_eventfd = true;
-    CHECK(work_pool_init_foreground(&pool, 1, 2) != 0 && pool.efd == -1);
+    CHECK(work_pool_init_foreground(&pool, 1, 2) != 0 && work_pool_eventfd(&pool) == -1);
     fail_eventfd = false;
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init_foreground(&pool, 0, 0) != 0 && pool.efd == -1);
+    CHECK(work_pool_init_foreground(&pool, 0, 0) != 0 && work_pool_eventfd(&pool) == -1);
     work_pool_shutdown(&pool);
-    CHECK(work_pool_init_foreground(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && pool.efd == -1);
+    CHECK(work_pool_init_foreground(&pool, 1, WORK_MAX_RASTER + 1u) != 0 && work_pool_eventfd(&pool) == -1);
     work_pool_shutdown(&pool);
     if (init_foreground_pool(1)) work_pool_shutdown(&pool);
     result("foreground_init_failure_cleanup", before);

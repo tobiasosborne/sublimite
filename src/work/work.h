@@ -1,6 +1,6 @@
 /* work.h - fixed worker pool + UI-thread mailbox (P1.8).
  * Threads are created once in work_pool_init (each calls trace_thread_register).
- * Pool lifecycle, eventfd access, submit, cancel and drain: UI thread only;
+ * Pool lifecycle, wake access, submit, cancel and drain: UI thread only;
  * serialize them on that thread. Do not overlap shutdown/init with any use.
  * Callbacks may submit/cancel; nested drains return 0. Shutdown/init must wait
  * until the outer drain returns. A pool must be initialized before any use;
@@ -16,7 +16,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <pthread.h>
+#include "os/os.h"
 
 #define WORK_MAX_RASTER   8u
 #define WORK_MAX_WORKERS  (1u + WORK_MAX_RASTER)
@@ -101,13 +101,15 @@ typedef struct work_pool {
     work_slot slots[WORK_MAX_JOBS];
     work_mailbox mb[WORK_MAX_WORKERS];
     work_queue queue[2];
-    pthread_mutex_t mu;
-    pthread_cond_t cv[2];
-    pthread_t threads[WORK_MAX_WORKERS];
+    os_mutex mu;
+    os_cond cv[2];
+    os_thread threads[WORK_MAX_WORKERS];
     work_ctx wctx[WORK_MAX_WORKERS];
+    _Atomic uint64_t worker_ids[WORK_MAX_MAILBOXES];
     uint32_t n_workers, n_bulk;
     bool shutting_down;                 /* under mu */
-    int efd;
+    os_wake wake;
+    bool active;
     _Atomic uint64_t dropped_stale;
     _Atomic uint64_t dropped_full;
     bool draining;                     /* UI-only callback reentrancy guard */
@@ -115,8 +117,8 @@ typedef struct work_pool {
     /* Optional foreground lane. Existing n_workers/arrays describe only the
      * bulk/raster workers; its ctx.worker is WORK_FOREGROUND_WORKER. */
     work_queue foreground_queue;
-    pthread_cond_t foreground_cv;
-    pthread_t foreground_thread;
+    os_cond foreground_cv;
+    os_thread foreground_thread;
     work_ctx foreground_wctx;
     work_mailbox foreground_mb;
     bool foreground_enabled, foreground_started;
@@ -143,7 +145,17 @@ int  work_pool_init_foreground(work_pool *p, uint32_t n_bulk, uint32_t n_raster)
  * caller-owned, including dropped jobs. Undrained messages remain reserved
  * until drained (and are stale); drain is allowed after shutdown. */
 void work_pool_shutdown(work_pool *p);
+/* Borrowed wake object, NULL while inactive. Platform loops use its native
+ * accessor; ordinary clients can use os_wake_wait. Never drain it separately
+ * from the mailbox protocol. */
+const os_wake *work_pool_wake(const work_pool *p);
+/* os_thread_self identity for ownership diagnostics; zero before that worker
+ * starts. Foreground uses WORK_FOREGROUND_WORKER. Never a native thread handle. */
+uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker);
+#if !defined(_WIN32)
+/* Linux compatibility for callers migrating in W2. */
 int  work_pool_eventfd(const work_pool *p);
+#endif
 
 /* Returns handle with epoch 0 if the pool is full / shutting down, or all
  * otherwise free slots exhausted their identities. Slots retire before epoch

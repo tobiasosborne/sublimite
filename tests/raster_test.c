@@ -920,7 +920,7 @@ static int minimap_region_test(void)
     uint32_t pixels[WIDTH * HEIGHT], source[MAP_WIDTH * MAP_HEIGHT], owned[MAP_WIDTH * MAP_HEIGHT];
     for (size_t i = 0; i < WIDTH * HEIGHT; i++) pixels[i] = UINT32_MAX;
     for (size_t i = 0; i < MAP_WIDTH * MAP_HEIGHT; i++) source[i] = i % 2 ? 0x20242c : 0x78808e;
-    render_strip copied_strip; work_pool pool = {.efd = -1};
+    render_strip copied_strip; work_pool pool = {.active = false};
     cpu_state st = {.up = true, .pool = &pool, .max_strips = 1, .cells = copied,
         .strips = &copied_strip, .pix = pixels, .stride_px = WIDTH,
         .max_w = WIDTH, .max_h = HEIGHT, .region_pixels = owned};
@@ -1093,7 +1093,7 @@ static int review_default_memory_gate(bool target_capacity)
 static int review_nonblocking_retirement(void)
 {
     review_reset_fixture();
-    work_pool pool = {.efd=42, .mu=PTHREAD_MUTEX_INITIALIZER};
+    work_pool pool = {.active=true, .mu=OS_MUTEX_INIT};
     atomic_store(&pool.slots[0].busy,1); atomic_store(&pool.slots[0].epoch,9);
     render_cell cell={0,RENDER_NO_SLOT,0,0,0,0};
     render_strip full={0,1}, copied;
@@ -1119,7 +1119,7 @@ static int review_nonblocking_retirement(void)
     T(cpu_submit(&b,&g,&full,1)==RENDER_ERR_BUSY && st.nhandles==1);
     atomic_store(&pool.slots[0].finished_epoch,9);
     T(cpu_retire_jobs(&st)==RENDER_OK && st.nretired==0 && st.nhandles==0);
-    pthread_mutex_destroy(&pool.mu);
+    os_mutex_destroy(&pool.mu);
     return 0;
 }
 static int review_raw_completion(void)
@@ -1186,7 +1186,7 @@ static int review_pending_acceptance_gate(void)
 static int review_capacity_proposal(void)
 {
     review_reset_fixture(); review_partial_capacity = true;
-    work_pool pool = {0};
+    work_pool pool = {.active=true, .mu=OS_MUTEX_INIT};
     atomic_store(&pool.slots[0].busy,1); atomic_store(&pool.slots[0].epoch,9);
     render_cell cells[2] = {{0}}; render_strip full = {0,2}, copied;
     cpu_state st = {.up=true,.pool=&pool,.max_strips=1,.cells=cells,.strips=&copied};
@@ -1658,7 +1658,7 @@ static int remainder_background_test(void)
     grid.surface_background = config_theme_color(CONFIG_DARK, "editor.background");
     cells[0].bg = config_theme_color(CONFIG_DARK, "chrome.background"); /* (P) sole cell index */
     for (size_t i = 0; i < WIDTH * HEIGHT; i++) surface[i] = UINT32_MAX;
-    work_pool pool = {.efd = -1}; /* (P) no real scheduler fd. */
+    work_pool pool = {.active = false}; /* Inactive scheduler fixture. */
     cpu_state st = {.up = true, .pool = &pool, .max_strips = CELLS,
         .cells = copied, .strips = &owned_strip, .pix = pixels,
         .conn = (xcb_connection_t *)pixels, .stride_px = WIDTH,
@@ -1746,7 +1746,7 @@ static void *review_release_batch(void *arg)
 static int review_batch_rollback(void)
 {
     review_reset_fixture(); review_partial_capacity = true; review_fail_at = 3;
-    work_pool p = {.efd = -1};
+    work_pool p = {.active = false};
     for (uint32_t i = 0; i < 2; i++) {
         atomic_store(&p.slots[i].busy, 1);
         atomic_store(&p.slots[i].epoch, 10); /* cancelled predecessor of handle 9 */

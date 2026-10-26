@@ -4,7 +4,18 @@
 #include "file/file.h"
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+
+#if defined(_WIN32)
+/* The Windows CRT has no memrchr; the same reverse byte search in C11. */
+static const uint8_t *last_byte(const uint8_t *p, int byte, size_t n)
+{
+    while (n) { if (p[--n] == (uint8_t)byte) return p + n; }
+    return NULL;
+}
+#else
+#define last_byte memrchr
+#endif
+#include "os/os.h"
 
 #define FL_BUILT 1u
 #define FL_NONASCII 2u
@@ -87,12 +98,6 @@ struct lineidx {
 size_t lineidx_entry_bytes(void) { return sizeof(entry); }
 uint64_t lineidx_foreground_work(const lineidx *x) { return x->foreground_work; }
 uint64_t lineidx_scanned_bytes(const lineidx *x) { return x->scanned_bytes; }
-static uint64_t now_ns(clockid_t clock)
-{
-    struct timespec ts;
-    if (clock_gettime(clock, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 
 /* ---- summarized fixed-pool chunk rope (UI only) ---- */
 static void pull(lineidx *x, uint32_t id)
@@ -372,7 +377,7 @@ static uint64_t align_back(const lineidx_src *s, uint64_t lo, uint64_t hi)
         size_t m = s->span(s->ctx, pos, &p);
         if (!m) break;
         if (m > hi - pos) m = (size_t)(hi - pos);
-        const uint8_t *q = memrchr(p, '\n', m);
+        const uint8_t *q = last_byte(p, '\n', m);
         if (q) last = pos + (uint64_t)(q - p) + 1u;
         pos += m;
     }
@@ -434,7 +439,7 @@ static bool worker_stop(work_ctx *c)
     lineidx_job *j = c->arg;
     if (!work_should_stop(c) && !file_backing_faulted(j->backing)) return false;
     if (!j->cancel_cpu_ns && j->cpu_begin)
-        j->cancel_cpu_ns = now_ns(CLOCK_THREAD_CPUTIME_ID) - j->cpu_begin;
+        j->cancel_cpu_ns = os_thread_cpu_ns() - j->cpu_begin;
     return true;
 }
 /* Backpressure retains progress and yields the execution resource. */
@@ -473,8 +478,8 @@ static void receive_results(const work_msg *msg, void *ud)
 static void build_fn(work_ctx *c)
 {
     lineidx_job *j = c->arg;
-    j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
-    uint64_t deadline = j->cpu_begin + 4000000ull;
+    j->cpu_begin = os_thread_cpu_ns();
+    uint64_t deadline = os_slice_ns() + 4000000ull;
     size_t bytes = 0, spans = 0, chunks = 0;
     if (worker_stop(c)) return;
     if (j->cursor > j->sealed) {
@@ -494,7 +499,7 @@ static void build_fn(work_ctx *c)
             while (j->scan_pos < end) {
                 if (worker_stop(c)) return;
                 const uint8_t *p;
-                j->cpu_begin = now_ns(CLOCK_THREAD_CPUTIME_ID);
+                j->cpu_begin = os_thread_cpu_ns();
                 size_t k = j->src.span(j->src.ctx, j->scan_pos, &p);
                 if (worker_stop(c) || !k) return;
                 if (k > end - j->scan_pos) k = (size_t)(end - j->scan_pos);
@@ -514,7 +519,7 @@ static void build_fn(work_ctx *c)
                     if (worker_stop(c)) return;
                     if (found) { j->seek_pending = true; goto publish_results; }
                     p += batch; k -= batch;
-                    if (bytes >= 16u * LINEIDX_CHUNK || now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline)
+                    if (bytes >= 16u * LINEIDX_CHUNK || os_slice_ns() >= deadline)
                         goto publish_results;
                 }
                 if (spans >= 64u) goto publish_results;
@@ -525,7 +530,7 @@ static void build_fn(work_ctx *c)
         }
         j->chunk_start = end; j->scan_pos = end;
         j->cumulative += count; j->cursor++; chunks++;
-        if (chunks >= PUBLISH_CHUNKS || now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+        if (chunks >= PUBLISH_CHUNKS || os_slice_ns() >= deadline) break;
     }
     if (j->seeking && j->cursor == j->n) {
         j->answer = j->src.len; j->seek_pending = true;
@@ -613,7 +618,7 @@ void lineidx_destroy(lineidx *x)
     lineidx_build_cancel(x);
     while (x->retired) {
         reap(x);
-        if (x->retired) nanosleep(&(struct timespec){0, 100000}, NULL);
+        if (x->retired) os_sleep_ns(100000);
     }
     file_backing_release(x->backing);
     if (x->reserved) { free(x->reserved->lengths); free(x->reserved->res); free(x->reserved); }
@@ -670,7 +675,7 @@ bool lineidx_building(lineidx *x)
 static void prepare_job(lineidx *x)
 {
     lineidx_job *j = x->job;
-    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    uint64_t deadline = os_slice_ns() + UI_CPU_NS;
     size_t limit = j->prepared + POLL_CHUNKS;
     while (j->prepared < j->n && j->prepared < limit) {
         const entry *e = &x->e[j->prepare_entry];
@@ -682,7 +687,7 @@ static void prepare_job(lineidx *x)
             j->prepare_block = successor(x, j->prepare_block);
             j->prepare_entry = x->b[j->prepare_block].head;
         }
-        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+        if (os_slice_ns() >= deadline) break;
     }
     if (j->prepared != j->n) return;
     j->preparing = false;
@@ -730,12 +735,12 @@ size_t lineidx_poll(lineidx *x)
     (void)invalidate_backing(x);
     lineidx_job *j = x->job;
     size_t got = 0;
-    uint64_t deadline = now_ns(CLOCK_MONOTONIC) + UI_CPU_NS;
-    uint64_t cpu_deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    uint64_t deadline = os_now_ns() + UI_CPU_NS;
+    uint64_t cpu_deadline = os_slice_ns() + UI_CPU_NS;
     if (j && j->preparing) { prepare_job(x); reap(x); return 0; }
     if (j) {
         (void)work_mailbox_receive_bounded(j->pool, j->h, j->generation, receive_results, x, 4, deadline);
-        while (j->applied < j->available && got < POLL_CHUNKS && now_ns(CLOCK_THREAD_CPUTIME_ID) < cpu_deadline) {
+        while (j->applied < j->available && got < POLL_CHUNKS && os_slice_ns() < cpu_deadline) {
             if (invalidate_backing(x)) { j = NULL; break; }
             location at = {.block = j->apply_block, .id = j->apply_entry};
             entry *e = &x->e[at.id];
@@ -749,7 +754,7 @@ size_t lineidx_poll(lineidx *x)
                 j->apply_entry = x->b[j->apply_block].head;
             }
             /* Built entries also consume this slice's traversal budget. */
-            if ((j->applied & (POLL_CHUNKS - 1u)) == 0 || now_ns(CLOCK_THREAD_CPUTIME_ID) >= cpu_deadline) break;
+            if ((j->applied & (POLL_CHUNKS - 1u)) == 0 || os_slice_ns() >= cpu_deadline) break;
         }
         if (j && (j->applied == j->n || (j->seeking && x->async_ready && j->applied == j->available)) && job_done(j)) retire_job(x);
     }
@@ -795,7 +800,7 @@ static int start_job(lineidx *x, work_pool *pool, const lineidx_src *snap,
     x->job = j;
     if (work_mailbox_bind(pool, j->h, j->generation, receive_results, x) != 0) {
         work_cancel(pool, j->h);
-        while (!job_done(j)) nanosleep(&(struct timespec){0, 100000}, NULL);
+        while (!job_done(j)) os_sleep_ns(100000);
         x->job = NULL; j->src.release = NULL; job_free(j); return -1;
     }
     return 0;
@@ -903,7 +908,7 @@ size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
         x->refresh_id = at.id; x->refresh_pos = at.byte; x->refresh_nl = x->refresh_na = 0;
     }
     uint64_t end = at.byte + x->e[at.id].len;
-    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    uint64_t deadline = os_slice_ns() + UI_CPU_NS;
     for (unsigned spans = 0; spans < SPAN_MAX && x->refresh_pos < end; spans++) {
         const uint8_t *p; size_t k = cur->span(cur->ctx, x->refresh_pos, &p);
         if (!k) return 0;
@@ -911,7 +916,7 @@ size_t lineidx_refresh(lineidx *x, const lineidx_src *cur)
         scan_counts counts = scan_count(p, k);
         x->refresh_nl += counts.newlines; x->refresh_na += counts.nonascii; x->refresh_pos += k;
         x->scanned_bytes += k;
-        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+        if (os_slice_ns() >= deadline) break;
     }
     if (x->refresh_pos != end) return 0;
     if (invalidate_backing(x)) return 0;
@@ -971,7 +976,7 @@ static lineidx_result seek_known(lineidx *x, const lineidx_src *cur, location at
         x->query_nl = at.lines; x->query_line = line; x->query_last = 0;
         x->query_active = true;
     }
-    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    uint64_t deadline = os_slice_ns() + UI_CPU_NS;
     for (unsigned spans = 0; spans < SPAN_MAX && budget && x->query_pos < end; spans++) {
         uint64_t pos = x->query_pos, cum = x->query_nl;
         const uint8_t *p; size_t k = cur->span(cur->ctx, pos, &p);
@@ -988,10 +993,10 @@ static lineidx_result seek_known(lineidx *x, const lineidx_src *cur, location at
             x->query_active = false;
             return (lineidx_result){x->seek_value, true};
         }
-        const uint8_t *last = memrchr(p, '\n', k);
+        const uint8_t *last = last_byte(p, '\n', k);
         if (last) x->query_last = pos + (uint64_t)(last - p) + 1u;
         x->query_nl += counts.newlines; x->query_pos += k; budget -= k;
-        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+        if (os_slice_ns() >= deadline) break;
     }
     return (lineidx_result){x->query_last, false};
 }
@@ -1012,7 +1017,7 @@ static lineidx_result seek_line_impl(lineidx *x, const lineidx_src *cur, uint64_
         location at = locate(x, (uint32_t)x->pfx_n);
         return seek_known(x, cur, at, line, x->seek_pos - at.byte, budget);
     }
-    uint64_t deadline = now_ns(CLOCK_THREAD_CPUTIME_ID) + UI_CPU_NS;
+    uint64_t deadline = os_slice_ns() + UI_CPU_NS;
     for (unsigned spans = 0; spans < SPAN_MAX && budget && x->pfx_n < x->n; spans++) {
         location at = locate(x, (uint32_t)x->pfx_n);
         uint64_t end = at.byte + x->e[at.id].len;
@@ -1029,7 +1034,7 @@ static lineidx_result seek_line_impl(lineidx *x, const lineidx_src *cur, uint64_
             const uint8_t *q = scan_find_nth_newline(p, k, line - cum - 1u);
             answer = x->seek_pos + (uint64_t)(q - p) + 1u;
         }
-        const uint8_t *last = memrchr(p, '\n', k);
+        const uint8_t *last = last_byte(p, '\n', k);
         if (last) x->seek_last = x->seek_pos + (uint64_t)(last - p) + 1u;
         x->seek_nl += counts.newlines; x->seek_na += counts.nonascii;
         x->seek_pos += k; budget -= k; x->scanned_bytes += k;
@@ -1048,7 +1053,7 @@ static lineidx_result seek_line_impl(lineidx *x, const lineidx_src *cur, uint64_
             location known = locate_line(x, line);
             return seek_known(x, cur, known, line, x->e[known.id].len, budget);
         }
-        if (now_ns(CLOCK_THREAD_CPUTIME_ID) >= deadline) break;
+        if (os_slice_ns() >= deadline) break;
     }
     if (x->pfx_n == x->n) return (lineidx_result){x->len, true};
     return (lineidx_result){x->seek_last, false};

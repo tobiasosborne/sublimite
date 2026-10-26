@@ -1,9 +1,11 @@
 #include "scroll/scroll.h"
 #include "file/file.h"
 #include <string.h>
-#include <time.h>
+#include "os/os.h"
+#if !defined(_WIN32)
+/* edit-177r.4: mincore has no frozen os.h entry; coordinator decision pending. */
 #include <sys/mman.h>
-#include <unistd.h>
+#endif
 
 /* Window state belongs to UI; filled/error and byte storage belong to the
  * worker until the terminal message seals them. UI never polls worker fields. */
@@ -11,9 +13,7 @@ enum { WINDOW_FREE, WINDOW_PENDING, WINDOW_READY, WINDOW_FAILED };
 typedef struct resident_result { uint32_t window; int error; } resident_result;
 static uint64_t monotonic_ns(void)
 {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static void acquire_window(work_ctx *ctx)
 {
@@ -121,8 +121,14 @@ int scroll_resident_close(scroll_resident *r)
 #define RESIDENT_PROBE_PAGES (SCROLL_SCAN_BUDGET / 4096u)
 static work_class window_class(const scroll_resident *r, uint64_t start, size_t length)
 {
+#if defined(_WIN32)
+    /* edit-177r.4: no residency query in os.h; keep blocking faults off the
+     * foreground lane until the coordinator resolves the contract gap. */
+    (void)r; (void)start; (void)length;
+    return WORK_BULK;
+#else
     if (!r->pool->foreground_enabled) return WORK_BULK;
-    long page_size = sysconf(_SC_PAGESIZE);
+    size_t page_size = os_page_size();
     if (page_size < 4096) return WORK_BULK;
     uintptr_t page = (uintptr_t)page_size, mask = ~(page - 1u);
     const lineidx_src *src = &r->snapshot;
@@ -142,6 +148,7 @@ static work_class window_class(const scroll_resident *r, uint64_t start, size_t 
         off += n;
     }
     return WORK_FOREGROUND;
+#endif
 }
 static size_t resident_span(void *ctx, uint64_t off, const uint8_t **out)
 {

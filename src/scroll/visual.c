@@ -1,5 +1,5 @@
 #include "scroll/scroll.h"
-#include <time.h>
+#include "os/os.h"
 
 static bool source_valid(const scroll_visual_source *source)
 {
@@ -92,9 +92,7 @@ int scroll_visual_resize(scroll_visual *s, scroll_config config,
 }
 static uint64_t now_ns(void)
 {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static int discard(scroll_visual_resolver *r, int rc)
 {

@@ -2946,10 +2946,10 @@ static int review_fairness(void)
 static int worker_owned_init(render_backend *b, const render_config *cfg)
 {
     (void)b;
-    return pthread_equal(pthread_self(), cfg->workers->threads[0]) ? 0 : RENDER_ERR_INIT;
+    return (os_thread_self() == work_pool_worker_id(cfg->workers, 0)) ? 0 : RENDER_ERR_INIT;
 }
 static int worker_failed_init(render_backend *b, const render_config *cfg)
-{ (void)b; return pthread_equal(pthread_self(), cfg->workers->threads[0]) ? RENDER_ERR_INIT : RENDER_ERR_ARG; }
+{ (void)b; return (os_thread_self() == work_pool_worker_id(cfg->workers, 0)) ? RENDER_ERR_INIT : RENDER_ERR_ARG; }
 static int review_init(void)
 {
     render_backend b = {.info = {"mailbox init test", sizeof(delayed), 16, RENDER_CAP_HEADLESS},

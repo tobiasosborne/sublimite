@@ -2,26 +2,16 @@
 #include "base/base.h"
 #include "trace/trace.h"
 
-#include <errno.h>
-#include <sys/eventfd.h>
-#include <time.h>
-#include <unistd.h>
+#include "os/os.h"
 
 static uint64_t now_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 
 static void mailbox_notify(const work_pool *p)
 {
-    uint64_t one = 1;
-    ssize_t r;
-    do {
-        r = write(p->efd, &one, sizeof one);
-    } while (r < 0 && errno == EINTR);
-    /* EAGAIN means the nonblocking eventfd is already readable. */
+    os_wake_signal(&p->wake);
 }
 
 static work_queue *class_queue(work_pool *p, uint32_t cls)
@@ -29,7 +19,7 @@ static work_queue *class_queue(work_pool *p, uint32_t cls)
     return cls == (uint32_t)WORK_FOREGROUND ? &p->foreground_queue : &p->queue[cls];
 }
 
-static pthread_cond_t *class_condition(work_pool *p, uint32_t cls)
+static os_cond *class_condition(work_pool *p, uint32_t cls)
 {
     return cls == (uint32_t)WORK_FOREGROUND ? &p->foreground_cv : &p->cv[cls];
 }
@@ -51,20 +41,21 @@ static uint32_t *receive_cursor(work_pool *p, work_slot *s, uint32_t pos)
     return pos == p->n_workers ? &s->receive_foreground_pos : &s->receive_pos[pos];
 }
 
-static void *worker_main(void *vp)
+static void worker_main(void *vp)
 {
     work_ctx *wc = vp;
     work_pool *p = wc->pool;
     uint32_t cls = wc->worker == WORK_FOREGROUND_WORKER ? (uint32_t)WORK_FOREGROUND :
                    wc->worker < p->n_bulk ? (uint32_t)WORK_BULK : (uint32_t)WORK_RASTER;
     work_queue *q = class_queue(p, cls);
-    pthread_cond_t *cv = class_condition(p, cls);
+    os_cond *cv = class_condition(p, cls);
 
+    atomic_store_explicit(&p->worker_ids[wc->worker], os_thread_self(), memory_order_release);
     (void)trace_thread_register();
-    pthread_mutex_lock(&p->mu);
+    os_mutex_lock(&p->mu);
     for (;;) {
         while (q->count == 0 && !p->shutting_down)
-            pthread_cond_wait(cv, &p->mu);
+            os_cond_wait(cv, &p->mu);
         if (p->shutting_down)
             break;
         uint32_t si = q->q[q->head], ep = q->epochs[q->head];
@@ -74,7 +65,7 @@ static void *worker_main(void *vp)
         bool deferred = wc->worker != s->mailbox_worker &&
             atomic_load_explicit(&s->pending, memory_order_acquire) != 0;
         if (!deferred) s->mailbox_worker = wc->worker;
-        pthread_mutex_unlock(&p->mu);
+        os_mutex_unlock(&p->mu);
 
         bool continuing = deferred;
         if (!deferred && atomic_load_explicit(&s->epoch, memory_order_acquire) == ep) {
@@ -82,7 +73,7 @@ static void *worker_main(void *vp)
             s->job.fn(&c);
             continuing = c.continue_;
         }
-        pthread_mutex_lock(&p->mu);
+        os_mutex_lock(&p->mu);
         /* Requeue and cancellation share the dequeue mutex. In particular,
          * cancellation during the final CPU slice cannot resurrect a lease. */
         if (continuing && !p->shutting_down &&
@@ -92,43 +83,42 @@ static void *worker_main(void *vp)
             next->q[pos] = si;
             next->epochs[pos] = ep;
             next->count++;
-            pthread_cond_signal(class_condition(p, (uint32_t)s->job.cls));
+            os_cond_signal(class_condition(p, (uint32_t)s->job.cls));
         } else {
             atomic_store_explicit(&s->finished_epoch, ep, memory_order_release);
             atomic_store_explicit(&s->busy, 0, memory_order_release);
         }
     }
-    pthread_mutex_unlock(&p->mu);
-    return NULL;
+    os_mutex_unlock(&p->mu);
 }
 
 static int pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster, bool foreground)
 {
-    *p = (work_pool){.efd = -1};
+    *p = (work_pool){0};
     if (n_bulk != 1 || n_raster > WORK_MAX_RASTER)
         return -1;
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
         atomic_init(&p->slots[i].epoch, 1u);
     p->n_bulk = n_bulk;
     p->n_workers = n_bulk + n_raster;
-    p->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (p->efd < 0)
+    if (os_wake_init(&p->wake) != OS_OK)
         return -1;
-    if (pthread_mutex_init(&p->mu, NULL) != 0)
+    p->active = true;
+    if (os_mutex_init(&p->mu) != OS_OK)
         goto fail_fd;
-    if (pthread_cond_init(&p->cv[0], NULL) != 0)
+    if (os_cond_init(&p->cv[0]) != OS_OK)
         goto fail_mutex;
-    if (pthread_cond_init(&p->cv[1], NULL) != 0)
+    if (os_cond_init(&p->cv[1]) != OS_OK)
         goto fail_cond;
     if (foreground) {
-        if (pthread_cond_init(&p->foreground_cv, NULL) != 0)
+        if (os_cond_init(&p->foreground_cv) != OS_OK)
             goto fail_raster_cond;
         p->foreground_enabled = true;
     }
     for (uint32_t i = 0; i < p->n_workers; i++) {
         p->wctx[i].pool = p;
         p->wctx[i].worker = i;
-        if (pthread_create(&p->threads[i], NULL, worker_main, &p->wctx[i]) != 0) {
+        if (os_thread_start(&p->threads[i], worker_main, &p->wctx[i]) != OS_OK) {
             p->n_workers = i;
             work_pool_shutdown(p);
             return -1;
@@ -137,7 +127,7 @@ static int pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster, bool fore
     if (foreground) {
         p->foreground_wctx.pool = p;
         p->foreground_wctx.worker = WORK_FOREGROUND_WORKER;
-        if (pthread_create(&p->foreground_thread, NULL, worker_main, &p->foreground_wctx) != 0) {
+        if (os_thread_start(&p->foreground_thread, worker_main, &p->foreground_wctx) != OS_OK) {
             work_pool_shutdown(p);
             return -1;
         }
@@ -146,14 +136,14 @@ static int pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster, bool fore
     return 0;
 
 fail_raster_cond:
-    pthread_cond_destroy(&p->cv[1]);
+    os_cond_destroy(&p->cv[1]);
 fail_cond:
-    pthread_cond_destroy(&p->cv[0]);
+    os_cond_destroy(&p->cv[0]);
 fail_mutex:
-    pthread_mutex_destroy(&p->mu);
+    os_mutex_destroy(&p->mu);
 fail_fd:
-    close(p->efd);
-    p->efd = -1;
+    os_wake_close(&p->wake);
+    p->active = false;
     p->n_workers = 0;
     return -1;
 }
@@ -170,9 +160,9 @@ int work_pool_init_foreground(work_pool *p, uint32_t n_bulk, uint32_t n_raster)
 
 void work_pool_shutdown(work_pool *p)
 {
-    if (p->efd < 0)
+    if (!p->active)
         return;
-    pthread_mutex_lock(&p->mu);
+    os_mutex_lock(&p->mu);
     p->shutting_down = true;
     uint64_t stamp = now_ns();
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) {
@@ -198,23 +188,28 @@ void work_pool_shutdown(work_pool *p)
         }
         q->head = 0;
     }
-    pthread_cond_broadcast(&p->cv[0]);
-    pthread_cond_broadcast(&p->cv[1]);
-    if (p->foreground_enabled) pthread_cond_broadcast(&p->foreground_cv);
-    pthread_mutex_unlock(&p->mu);
+    os_cond_broadcast(&p->cv[0]);
+    os_cond_broadcast(&p->cv[1]);
+    if (p->foreground_enabled) os_cond_broadcast(&p->foreground_cv);
+    os_mutex_unlock(&p->mu);
     for (uint32_t i = 0; i < p->n_workers; i++)
-        pthread_join(p->threads[i], NULL);
-    if (p->foreground_started) pthread_join(p->foreground_thread, NULL);
+        (void)os_thread_join(&p->threads[i]);
+    if (p->foreground_started) (void)os_thread_join(&p->foreground_thread);
     p->foreground_started = false;
-    close(p->efd);
-    p->efd = -1;
-    pthread_cond_destroy(&p->cv[0]);
-    pthread_cond_destroy(&p->cv[1]);
-    if (p->foreground_enabled) pthread_cond_destroy(&p->foreground_cv);
-    pthread_mutex_destroy(&p->mu);
+    os_wake_close(&p->wake);
+    p->active = false;
+    os_cond_destroy(&p->cv[0]);
+    os_cond_destroy(&p->cv[1]);
+    if (p->foreground_enabled) os_cond_destroy(&p->foreground_cv);
+    os_mutex_destroy(&p->mu);
 }
 
-int work_pool_eventfd(const work_pool *p) { return p->efd; }
+const os_wake *work_pool_wake(const work_pool *p) { return p->active ? &p->wake : NULL; }
+uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker)
+{
+    return worker < WORK_MAX_MAILBOXES ?
+        atomic_load_explicit(&p->worker_ids[worker], memory_order_acquire) : 0;
+}
 
 work_handle work_submit(work_pool *p, work_job job)
 {
@@ -228,17 +223,17 @@ work_handle work_submit(work_pool *p, work_job job)
 
 int work_prioritize(work_pool *p, work_handle h)
 {
-    if (p->efd < 0 || p->shutting_down || !p->foreground_enabled ||
+    if (!p->active || p->shutting_down || !p->foreground_enabled ||
         h.slot >= WORK_MAX_JOBS || !h.epoch || h.epoch == UINT32_MAX) return -1;
-    pthread_mutex_lock(&p->mu);
+    os_mutex_lock(&p->mu);
     work_slot *s = &p->slots[h.slot];
     if (atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch ||
         (s->job.cls != WORK_BULK && s->job.cls != WORK_FOREGROUND)) {
-        pthread_mutex_unlock(&p->mu);
+        os_mutex_unlock(&p->mu);
         return -1;
     }
     if (s->job.cls == WORK_FOREGROUND) {
-        pthread_mutex_unlock(&p->mu);
+        os_mutex_unlock(&p->mu);
         return 0;
     }
     work_queue *q = &p->queue[WORK_BULK];
@@ -256,13 +251,13 @@ int work_prioritize(work_pool *p, work_handle h)
         foreground->q[tail] = h.slot;
         foreground->epochs[tail] = h.epoch;
         foreground->count++;
-        pthread_cond_signal(&p->foreground_cv);
+        os_cond_signal(&p->foreground_cv);
         break;
     }
     /* The worker reads this member only while holding mu. A running function
      * reads immutable fn/arg/generation members, never its scheduling class. */
     s->job.cls = WORK_FOREGROUND;
-    pthread_mutex_unlock(&p->mu);
+    os_mutex_unlock(&p->mu);
     return 0;
 }
 
@@ -270,7 +265,7 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
 {
     if (count == 0) return 0;
     if (count > WORK_MAX_JOBS || jobs == NULL || handles == NULL ||
-        p->efd < 0 || p->shutting_down)
+        !p->active || p->shutting_down)
         return -1;
     uint32_t needed[3] = {0};
     for (size_t j = 0; j < count; j++) {
@@ -281,11 +276,11 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
             return -1;
         needed[(uint32_t)jobs[j].cls]++;
     }
-    pthread_mutex_lock(&p->mu);
+    os_mutex_lock(&p->mu);
     if (needed[0] > WORK_MAX_JOBS - p->queue[0].count ||
         needed[1] > WORK_MAX_JOBS - p->queue[1].count ||
         needed[2] > WORK_MAX_JOBS - p->foreground_queue.count) {
-        pthread_mutex_unlock(&p->mu);
+        os_mutex_unlock(&p->mu);
         return -1;
     }
     uint32_t raster_reserve = p->n_workers > p->n_bulk ? WORK_RASTER_RESERVE : 0u;
@@ -318,7 +313,7 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
                 break;
             }
             if (!found) {
-                pthread_mutex_unlock(&p->mu);
+                os_mutex_unlock(&p->mu);
                 return -1;
             }
         }
@@ -352,28 +347,28 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
         q->count++;
     }
     for (uint32_t cls = 0; cls < 3; cls++)
-        if (needed[cls]) pthread_cond_broadcast(class_condition(p, cls));
-    pthread_mutex_unlock(&p->mu);
+        if (needed[cls]) os_cond_broadcast(class_condition(p, cls));
+    os_mutex_unlock(&p->mu);
     return 0;
 }
 
 bool work_handle_finished(const work_pool *p, work_handle h)
 {
-    if (h.epoch == 0 || h.epoch == UINT32_MAX || h.slot >= WORK_MAX_JOBS || p->efd < 0)
+    if (h.epoch == 0 || h.epoch == UINT32_MAX || h.slot >= WORK_MAX_JOBS || !p->active)
         return true;
     return atomic_load_explicit(&p->slots[h.slot].finished_epoch, memory_order_acquire) >= h.epoch;
 }
 
 void work_cancel(work_pool *p, work_handle h)
 {
-    if (p->efd < 0 || p->shutting_down || h.epoch == 0 ||
+    if (!p->active || p->shutting_down || h.epoch == 0 ||
         h.epoch == UINT32_MAX || h.slot >= WORK_MAX_JOBS)
         return;
-    pthread_mutex_lock(&p->mu);
+    os_mutex_lock(&p->mu);
     work_slot *s = &p->slots[h.slot];
     uint32_t expect = h.epoch;
     if (atomic_load_explicit(&s->epoch, memory_order_acquire) != expect) {
-        pthread_mutex_unlock(&p->mu);
+        os_mutex_unlock(&p->mu);
         return;
     }
     /* Record time first; the epoch bump (release) publishes it. */
@@ -399,7 +394,7 @@ void work_cancel(work_pool *p, work_handle h)
         atomic_store_explicit(&s->busy, 0, memory_order_release);
         break;
     }
-    pthread_mutex_unlock(&p->mu);
+    os_mutex_unlock(&p->mu);
 }
 
 bool work_should_stop(const work_ctx *c)
@@ -469,7 +464,7 @@ int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
         }
         return 0;
     }
-    if (p->efd < 0 || p->shutting_down ||
+    if (!p->active || p->shutting_down ||
         atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch ||
         s->job.generation != generation)
         return -1;
@@ -480,13 +475,9 @@ int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
 
 static void mailbox_clear_notification(const work_pool *p)
 {
-    uint64_t v;
-    if (p->efd >= 0) {
-        ssize_t r;
-        do {
-            r = read(p->efd, &v, sizeof v);
-        } while (r < 0 && errno == EINTR);
-    }
+    /* Clear before acquiring mailbox state, so a racing publisher either
+     * leaves a wake or is observed by this drain (os.h wake protocol). */
+    if (p->active) os_wake_drain(&p->wake);
 }
 
 /* Only the UI touches received[]. Publish reclaimed capacity after clearing
@@ -533,7 +524,7 @@ static bool mailbox_consume(work_pool *p, work_mailbox *mb, uint32_t pos,
 
 static void mailbox_end_drain(work_pool *p)
 {
-    if (p->efd >= 0 && work_mailbox_pending(p)) mailbox_notify(p);
+    if (p->active && work_mailbox_pending(p)) mailbox_notify(p);
     p->draining = false;
 }
 

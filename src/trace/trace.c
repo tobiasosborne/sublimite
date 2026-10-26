@@ -4,7 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
-#include <time.h>
+#include "os/os.h"
 
 typedef struct trace_ring {
     uint64_t total;   /* events ever written to this ring */
@@ -65,9 +65,7 @@ static inline void ring_put(trace_ring *r, uint64_t ns, enum trace_ev ev, uint32
 }
 
 uint64_t trace_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 
 void trace_record(enum trace_ev ev, uint32_t frame_id) {

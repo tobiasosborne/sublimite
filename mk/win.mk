@@ -18,8 +18,12 @@ WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(patsubst tests/win/%_test.c,$(WIN_B)/rel/tests/%_test.exe,$(WIN_TESTS))
 WIN_TEST_SAN := $(patsubst tests/win/%_test.c,$(WIN_B)/san/tests/%_test.exe,$(WIN_TESTS))
 
-.PHONY: all check clean
+.PHONY: all check clean win-compile
+WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl
 all: $(WIN_TEST_REL)
+
+win-compile: WIN_INC += -Ivendor/tree-sitter/lib/include
+win-compile: $(patsubst %.c,$(WIN_B)/rel/%.o,$(foreach m,$(WIN_COMPILE_MODULES),$(wildcard src/$(m)/*.c)))
 
 $(WIN_B)/rel/%.o: %.c
 	@mkdir -p $(@D)

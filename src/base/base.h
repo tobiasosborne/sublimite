@@ -22,10 +22,10 @@
 
 const char *edit_version(void);
 
-/* ---- Arena: bump allocator over one mmap'd region ----------------------
- * Design: the region is mmap'd PROT_READ|PROT_WRITE|MAP_NORESERVE up front.
- * The kernel commits pages lazily on first touch, so there is no mprotect
- * step and no 64 KiB commit bookkeeping. Returns NULL on exhaustion. */
+/* ---- Arena: bump allocator over one OS reservation ---------------------
+ * Linux: writable MAP_NORESERVE, pages backed lazily on first touch.
+ * Windows: reserve up front, commit allocation pages before returning them.
+ * Returns NULL on exhaustion or commit failure. */
 typedef struct edit_arena {
     unsigned char *base;
     size_t         size;
@@ -34,7 +34,7 @@ typedef struct edit_arena {
 
 typedef size_t edit_arena_mark_t;
 
-/* Returns 0 on success, -1 on mmap failure or size == 0. */
+/* Returns 0 on success, -1 on reservation failure or size == 0. */
 int   edit_arena_init(edit_arena *a, size_t size);
 /* align must be a power of two; returns NULL on exhaustion. */
 void *edit_arena_alloc(edit_arena *a, size_t size, size_t align);
@@ -43,7 +43,7 @@ void  edit_arena_reset_to_mark(edit_arena *a, edit_arena_mark_t m);
 void  edit_arena_reset(edit_arena *a);
 void  edit_arena_free(edit_arena *a);
 
-/* ---- Pool: fixed-size blocks in one mmap, intrusive free list ----------
+/* ---- Pool: fixed-size blocks in one reservation, intrusive free list ---
  * get/put are O(1). Blocks are carved lazily (bump index) so init touches
  * no memory beyond the first page. */
 typedef struct edit_pool {

@@ -1,8 +1,6 @@
 #include "undo/undo.h"
 #include <string.h>
-#include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
+#include "os/os.h"
 
 /* Two tag bits in each link keep boundary states and group indexing in 64 B.
  * Only the first.before and last.after blobs of a group are public states.
@@ -56,16 +54,20 @@ static size_t committed(const undo_log *u) {
 static void decommit(undo_log *u) {
     size_t bytes=committed(u);
     if(bytes<u->committed_bytes) {
-        if(madvise(u->pool.base+bytes,u->committed_bytes-bytes,MADV_DONTNEED)==0)
+        if(os_vm_decommit(u->pool.base+bytes,u->committed_bytes-bytes)==OS_OK)
             u->committed_bytes=bytes;
     }
 }
 static uint32_t take(undo_log *u) {
     if(u->pool.fresh==u->pool.capacity) return 0;
+    size_t bytes=((u->pool.fresh+1)*u->pool.stride+u->page_bytes-1)/u->page_bytes*u->page_bytes;
+    if(bytes>u->committed_bytes) {
+        if(os_vm_commit(u->pool.base+u->committed_bytes,bytes-u->committed_bytes)!=OS_OK) return 0;
+        u->committed_bytes=bytes;
+    }
     uint32_t id=(uint32_t)++u->pool.fresh;u->pool.live++;
     memset(record(u,id),0,sizeof(undo_record));
     record(u,id)->prev=START;record(u,id)->next=END;
-    size_t bytes=committed(u);if(bytes>u->committed_bytes) u->committed_bytes=bytes;
     return id;
 }
 static void release_scratch(undo_log *u,size_t n) {
@@ -141,18 +143,23 @@ static undo_record *backup(const undo_log *u,size_t i) {
 static void reset_backup(undo_log *u) {
     u->replay_pool.fresh=u->replay_pool.live=0;
     if(u->replay_committed_bytes &&
-       madvise(u->replay_pool.base,u->replay_committed_bytes,MADV_DONTNEED)==0)
+       os_vm_decommit(u->replay_pool.base,u->replay_committed_bytes)==OS_OK)
         u->replay_committed_bytes=0;
 }
-static void save_capture(undo_log *u,uint32_t id) {
+static int save_capture(undo_log *u,uint32_t id) {
     /* Unknown insert records have no published ref. Reuse their zero add_off
      * word for the handle in a full 64 B backup; every other byte is preserved. */
     EDIT_ASSERT(!(record(u,id)->next&KNOWN) && record(u,id)->add_off==0);
     EDIT_ASSERT(u->replay_pool.fresh<u->replay_pool.capacity);
+    size_t bytes=((u->replay_pool.fresh+1)*u->replay_pool.stride+u->page_bytes-1)/u->page_bytes*u->page_bytes;
+    if(bytes>u->replay_committed_bytes) {
+        if(os_vm_commit(u->replay_pool.base+u->replay_committed_bytes,bytes-u->replay_committed_bytes)!=OS_OK)
+            return UNDO_ERR_NOMEM;
+        u->replay_committed_bytes=bytes;
+    }
     undo_record *r=backup(u,u->replay_pool.fresh++);u->replay_pool.live++;
     *r=*record(u,id);r->add_off=id;
-    size_t bytes=(u->replay_pool.fresh*u->replay_pool.stride+u->page_bytes-1)/u->page_bytes*u->page_bytes;
-    if(bytes>u->replay_committed_bytes) u->replay_committed_bytes=bytes;
+    return UNDO_OK;
 }
 static void assert_replay_tree(const undo_log *u) {
     if(!u->replay_guard) return;
@@ -233,9 +240,9 @@ int undo_init(undo_log *u,piece_tree *tree,size_t max_records) {
     if(edit_pool_init(&u->replay_pool,sizeof(undo_record),8,max_records+8)!=0) {
         edit_pool_free(&u->pool);return UNDO_ERR_NOMEM;
     }
-    long pg=sysconf(_SC_PAGESIZE);
-    if(pg<=0) { edit_pool_free(&u->replay_pool);edit_pool_free(&u->pool);return UNDO_ERR_NOMEM; }
-    u->page_bytes=(size_t)pg;
+    size_t pg=os_page_size();
+    if(!pg) { edit_pool_free(&u->replay_pool);edit_pool_free(&u->pool);return UNDO_ERR_NOMEM; }
+    u->page_bytes=pg;
     u->tree=tree;u->cap=u->max_records=max_records;return 0;
 }
 void undo_destroy(undo_log *u) {
@@ -387,9 +394,7 @@ static void dirty(undo_change *c,uint64_t off,uint64_t end) {
     c->len=end-c->off;
 }
 static uint64_t now_ns(void) {
-    struct timespec ts;
-    if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0) return UINT64_MAX;
-    return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static int replay(undo_log *u,size_t groups,size_t budget,uint64_t deadline,undo_change *c,int direction) {
     if(!c) return UNDO_ERR_RANGE;
@@ -426,7 +431,10 @@ static int replay(undo_log *u,size_t groups,size_t budget,uint64_t deadline,undo
                 if(rc) { abort_replay(u);*c=completed_change;return rc; }
                 /* A one-operation group has no possible failure after its
                  * successful capture: commit is void and allocation-free. */
-                if(u->replay_view) save_capture(u,id);
+                if(u->replay_view && save_capture(u,id)!=UNDO_OK) {
+                    release_scratch(u,PIECE_REF_SPANS-1);
+                    abort_replay(u);*c=completed_change;return UNDO_ERR_NOMEM;
+                }
             }
             piece_ref ref;rc=piece_delete(u->tree,r->off,r->len,&ref);
             if(unknown) {

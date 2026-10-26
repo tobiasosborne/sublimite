@@ -2,13 +2,11 @@
 #include "layout/layout.h"
 #include "undo/undo.h"
 #include <string.h>
-#include <time.h>
+#include "os/os.h"
 
 static uint64_t now_ns(void)
 {
-    struct timespec ts;
-    if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0) return 0;
-    return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static void slice_begin(view *v)
 {

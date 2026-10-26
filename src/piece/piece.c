@@ -6,7 +6,7 @@
 #include "base/base.h"
 #include "scan/scan.h"
 #include <limits.h>
-#include <pthread.h>
+#include "os/os.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +90,7 @@ typedef struct add_store {
     _Atomic(add_chunk **) tbl;
     size_t cap, nch;
     retired ret[24]; int nret, sealed;
-    pthread_mutex_t mu;
+    os_mutex mu;
     piece_snapshot *snapshots;
     atomic_uint_fast64_t live_high;
 } add_store;
@@ -106,9 +106,9 @@ typedef struct core {
     const uint8_t *orig; size_t orig_len; int orig_owned;
     atomic_int owner_live; /* distinguish the live owner from a recycled ID */
     add_store *add; orig_store *original;
-    pthread_mutex_t pool_mu;
+    os_rmutex pool_mu;
     node_pool pool[3]; /* leaves, branches, compact snapshot headers */
-    uintptr_t owner; /* Linux pthread identity value, never an expired API handle */
+    uint64_t owner; /* OS identity value, never an expired API handle */
     _Atomic(piece_snapshot *) released;
     piece_snapshot *pending; /* owner-only detached release queue */
     node *retiring; /* owner-only zero-reference nodes, linked in add_high */
@@ -260,7 +260,7 @@ static node *pool_get(core *c, unsigned pi) {
     return n;
 }
 static void pool_free(core *c, node *n, unsigned pi) { /* any thread */
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
 #ifdef PIECE_TESTING
     c->stats.pool_returns++;
 #endif
@@ -276,7 +276,7 @@ static void pool_free(core *c, node *n, unsigned pi) { /* any thread */
         slab_dequeue(&p->partial, slab_slot(s, slot, 1u - i)); slab_enqueue(&p->empty, s);
     }
     atomic_fetch_add_explicit(&p->returned, 1, memory_order_relaxed);
-    pthread_mutex_unlock(&c->pool_mu);
+    os_rmutex_unlock(&c->pool_mu);
 }
 static node *node_new(core *c, int leaf) {
     node *n = pool_get(c, leaf ? 0u : 1u);
@@ -313,18 +313,18 @@ static void pool_trim_locked(core *c, int force) {
         for (unsigned pi = 0; pi < 3; pi++) atomic_store_explicit(&c->pool[pi].returned, 0, memory_order_relaxed);
 }
 static void pool_trim(core *c, int force) {
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     pool_trim_locked(c, force);
-    pthread_mutex_unlock(&c->pool_mu);
+    os_rmutex_unlock(&c->pool_mu);
 }
 static int pool_done(core *c, int result) {
-    pthread_mutex_unlock(&c->pool_mu); return result;
+    os_rmutex_unlock(&c->pool_mu); return result;
 }
 /* A leaf root needs only its own possible COW/split. At greater heights a
  * delete visits two boundary paths and may own their merge neighbours. Small
  * fixed slabs keep these reservations inside the tiny-buffer G10f allowance. */
 static int reserve_delete(piece_tree *t, int snapshot) {
-    pthread_mutex_lock(&t->c->pool_mu);
+    os_rmutex_lock(&t->c->pool_mu);
     core *c = t->c; size_t h = (size_t)t->height;
     size_t leaves = h ? 4 : 2;
     size_t branches = h == 0 ? (t->root->cnt == FAN ? 1u : 0u) :
@@ -335,7 +335,7 @@ static int reserve_delete(piece_tree *t, int snapshot) {
     return r;
 }
 static int reserve_insert(piece_tree *t, size_t np) {
-    pthread_mutex_lock(&t->c->pool_mu);
+    os_rmutex_lock(&t->c->pool_mu);
     core *c = t->c; size_t h = (size_t)t->height, leaves, branches;
     if (!h && np <= (FAN - t->root->cnt) / 2u) {
         leaves = atomic_load_explicit(&t->root->rc, memory_order_acquire) > 1 ? 1u : 0u;
@@ -354,7 +354,7 @@ static void node_unref_locked(core *c, node *n) {
     pool_free(c, n, n->leaf ? 0u : 1u);
 }
 static void node_unref(core *c, node *n) {
-    pthread_mutex_lock(&c->pool_mu); node_unref_locked(c, n); pthread_mutex_unlock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu); node_unref_locked(c, n); os_rmutex_unlock(&c->pool_mu);
 }
 static node *cow(core *c, node *n) {
     if (atomic_load_explicit(&n->rc, memory_order_acquire) == 1) return n;
@@ -394,7 +394,7 @@ static add_store *add_store_new(core *c) {
     if (!v) return NULL;
     memset(v, 0, sizeof *v); atomic_init(&v->rc, 1);
     atomic_init(&v->tbl, NULL); atomic_init(&v->live_high, 0);
-    if (pthread_mutex_init(&v->mu, NULL)) { c->a.free(c->a.ctx, v, sizeof *v); return NULL; }
+    if (os_mutex_init(&v->mu) != OS_OK) { c->a.free(c->a.ctx, v, sizeof *v); return NULL; }
     return v;
 }
 static void chunk_unref(core *c, add_chunk *ch) {
@@ -407,7 +407,7 @@ static void add_store_unref(core *c, add_store *v) {
     for (size_t i = 0; i < v->nch; i++) chunk_unref(c, tbl[i]);
     if (tbl) c->a.free(c->a.ctx, tbl, v->cap * sizeof *tbl);
     for (int i = 0; i < v->nret; i++) c->a.free(c->a.ctx, v->ret[i].p, v->ret[i].cap * sizeof *tbl);
-    pthread_mutex_destroy(&v->mu); c->a.free(c->a.ctx, v, sizeof *v);
+    os_mutex_destroy(&v->mu); c->a.free(c->a.ctx, v, sizeof *v);
 }
 /* Called under the view lock. A sealed view has no writer; release can reclaim
  * transaction-only chunks immediately, even while older snapshots survive. */
@@ -473,7 +473,7 @@ static void core_unref(core *c) {
             UNPOISON(slab, sz); a.free(a.ctx, slab, sz); slab = next;
         }
     }
-    pthread_mutex_destroy(&c->pool_mu); a.free(a.ctx, c, sizeof *c);
+    os_rmutex_destroy(&c->pool_mu); a.free(a.ctx, c, sizeof *c);
 }
 
 /* A dead snapshot has no readers: its length becomes an intrusive release
@@ -502,11 +502,11 @@ static void reclaim_drain(core *c, size_t budget) {
             add_store *v = s->add;
             /* Workers never touch the view list or its lock. The owner (or
              * exclusive final-core thread) alone removes released headers. */
-            pthread_mutex_lock(&v->mu);
+            os_mutex_lock(&v->mu);
             if (s->prev) s->prev->next = s->next; else v->snapshots = s->next;
             if (s->next) s->next->prev = s->prev;
             add_store_prune(c, v);
-            pthread_mutex_unlock(&v->mu);
+            os_mutex_unlock(&v->mu);
             retire_node(c, s->root);
             orig_store_unref(c, s->original);
             pool_free(c, (node *)(void *)s, 2);
@@ -528,7 +528,7 @@ static void snapshot_drop(piece_snapshot *s, int external) {
     if (external && s->has_mh) s->original->mh.release(s->original->mh.ctx);
     int no_external = external && atomic_fetch_sub_explicit(&c->external, 1, memory_order_acq_rel) == 1;
     if (!atomic_load_explicit(&c->owner_live, memory_order_acquire) ||
-        (uintptr_t)pthread_self() != c->owner) {
+        os_thread_self() != c->owner) {
         if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) return;
 #ifdef PIECE_TESTING
         if (c->reclaim_hook) c->reclaim_hook(c->reclaim_ctx);
@@ -541,22 +541,22 @@ static void snapshot_drop(piece_snapshot *s, int external) {
          * snapshot owners keep it alive. The final core owner drains it. */
         core_unref(c); return;
     }
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     if (atomic_fetch_sub_explicit(&s->rc, 1, memory_order_acq_rel) != 1) {
         if (no_external) pool_trim_locked(c, 2);
-        pthread_mutex_unlock(&c->pool_mu); return;
+        os_rmutex_unlock(&c->pool_mu); return;
     }
     add_store *v = s->add;
-    pthread_mutex_lock(&v->mu);
+    os_mutex_lock(&v->mu);
     if (s->prev) s->prev->next = s->next; else v->snapshots = s->next;
     if (s->next) s->next->prev = s->prev;
     add_store_prune(c, v);
-    pthread_mutex_unlock(&v->mu);
+    os_mutex_unlock(&v->mu);
     orig_store_unref(c, s->original);
     node_unref(c, s->root); pool_free(c, (node *)(void *)s, 2);
     add_store_unref(c, v);
     if (no_external) pool_trim_locked(c, 2);
-    pthread_mutex_unlock(&c->pool_mu); core_unref(c);
+    os_rmutex_unlock(&c->pool_mu); core_unref(c);
 }
 static void snapshot_uncache(piece_tree *t) {
     piece_snapshot *s = t->cached_snapshot; t->cached_snapshot = NULL;
@@ -590,7 +590,9 @@ static inline const uint8_t *view_data(const uint8_t *original, const add_store 
     return original + x;
 }
 static inline const uint8_t *ent_data(const core *c, uint64_t x) { return view_data(c->orig, c->add, x); }
+#ifdef PIECE_TESTING
 static inline uint8_t *add_ptr(const core *c, uint64_t a) { return (uint8_t *)(uintptr_t)ent_data(c, a | TOP); }
+#endif
 
 static int add_reserve(piece_tree *t, uint64_t n) {
     core *c = t->c; add_store *v = c->add;
@@ -1109,26 +1111,21 @@ piece_tree *piece_create(const piece_allocator *a) {
     core *c = a->alloc(a->ctx, sizeof *c);
     if (!c) return NULL;
     memset(c, 0, sizeof *c); atomic_init(&c->rc, 1); atomic_init(&c->external, 0); c->a = *a;
-    c->owner = (uintptr_t)pthread_self(); atomic_init(&c->released, NULL);
+    c->owner = os_thread_self(); atomic_init(&c->released, NULL);
     atomic_init(&c->owner_live, 1);
-    pthread_mutexattr_t attr;
-    if (pthread_mutexattr_init(&attr)) { a->free(a->ctx, c, sizeof *c); return NULL; }
-    int lock_error = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    if (!lock_error) lock_error = pthread_mutex_init(&c->pool_mu, &attr);
-    pthread_mutexattr_destroy(&attr);
-    if (lock_error) { a->free(a->ctx, c, sizeof *c); return NULL; }
+    if (os_rmutex_init(&c->pool_mu) != OS_OK) { a->free(a->ctx, c, sizeof *c); return NULL; }
     c->add = add_store_new(c);
-    if (!c->add) { pthread_mutex_destroy(&c->pool_mu); a->free(a->ctx, c, sizeof *c); return NULL; }
+    if (!c->add) { os_rmutex_destroy(&c->pool_mu); a->free(a->ctx, c, sizeof *c); return NULL; }
     c->original = orig_store_new(c, NULL, 0, 0, NULL);
     if (!c->original) { core_unref(c); return NULL; }
     for (unsigned pi = 0; pi < 3; pi++) atomic_init(&c->pool[pi].returned, 0);
     piece_tree *t = a->alloc(a->ctx, sizeof *t);
     if (!t) { core_unref(c); return NULL; }
     memset(t, 0, sizeof *t); t->c = c;
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     int reserve_error = pool_reserve_class(c, 0, 1);
     if (!reserve_error) t->root = node_new(c, 1);
-    pthread_mutex_unlock(&c->pool_mu);
+    os_rmutex_unlock(&c->pool_mu);
     if (reserve_error) { a->free(a->ctx, t, sizeof *t); core_unref(c); return NULL; }
     return t;
 }
@@ -1146,7 +1143,7 @@ void piece_destroy(piece_tree *t) {
     if (t->mapped && c->has_mh) c->mh.release(c->mh.ctx);
     orig_store_unref(c, c->original); c->original = NULL;
     add_store *v = c->add; c->add = NULL;
-    pthread_mutex_lock(&v->mu); v->sealed = 1; add_store_prune(c, v); pthread_mutex_unlock(&v->mu);
+    os_mutex_lock(&v->mu); v->sealed = 1; add_store_prune(c, v); os_mutex_unlock(&v->mu);
     add_store_unref(c, v);
     reclaim_drain(c, SIZE_MAX);
     pool_trim(c, 1);
@@ -1160,7 +1157,7 @@ static int build(piece_tree *t, size_t len, int mapped) {
     if (np == 0) return 0;
     uint64_t nleaf = (np + FAN - 1) / FAN, tot = 0, lv = nleaf;
     for (;;) { tot += lv; if (lv == 1) break; lv = (lv + FAN - 1) / FAN; }
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     if (pool_reserve_class(c, 0, (size_t)nleaf + 2) ||
         pool_reserve_class(c, 1, (size_t)(tot - nleaf) + 2)) { pool_trim_locked(c, 2); return pool_done(c, PIECE_ERR_NOMEM); }
     node **arr = c->a.alloc(c->a.ctx, (size_t)nleaf * sizeof *arr);
@@ -1258,7 +1255,7 @@ int piece_init_mapped_step(piece_tree *t, size_t max_chunks) {
      * covers carries and final assembly, including an unfinished prior leaf. */
     size_t leaf_need = batch / FAN + 2;
     size_t branch_need = batch / (FAN * FAN) + (size_t)b->height + 2;
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     if (pool_reserve_class(c, 0, leaf_need) || pool_reserve_class(c, 1, branch_need))
         return pool_done(c, PIECE_ERR_NOMEM);
     for (size_t i = 0; i < batch; ++i) {
@@ -1531,7 +1528,7 @@ void piece_checkpoint_abort(piece_checkpoint *cp) {
      * saved cursor path. Its publication invalidation must survive rollback. */
     if (t->cursor_valid) for (unsigned d = 0; d <= t->cursor_depth; d++)
         if (atomic_load_explicit(&t->cursor[d]->rc, memory_order_acquire) != 1) { t->cursor_valid = 0; break; }
-    pthread_mutex_lock(&old->mu);
+    os_mutex_lock(&old->mu);
     uint64_t high = 0;
     for (piece_snapshot *s = old->snapshots; s; s = s->next) if (s->add_len > high) high = s->add_len;
     /* If all transaction observers died, reuse the original saved boundary
@@ -1543,7 +1540,7 @@ void piece_checkpoint_abort(piece_checkpoint *cp) {
         add_chunk *backup = dst[i]; dst[i] = src[i]; atomic_fetch_add_explicit(&dst[i]->rc, 1, memory_order_relaxed);
         chunk_unref(c, backup);
     }
-    old->sealed = 1; add_store_prune(c, old); pthread_mutex_unlock(&old->mu);
+    old->sealed = 1; add_store_prune(c, old); os_mutex_unlock(&old->mu);
     add_store_unref(c, old);
     /* Restore the ordinary append cache now, never on a later inactive edit.
      * A surviving transaction snapshot has its prepaid separate boundary. */
@@ -1585,11 +1582,11 @@ piece_snapshot *piece_snapshot_take(piece_tree *t) {
     s->original = c->original; atomic_fetch_add_explicit(&s->original->rc, 1, memory_order_relaxed);
     s->has_mh = t->mapped; s->add = c->add; s->add_len = t->root->add_high;
     atomic_fetch_add_explicit(&s->add->rc, 1, memory_order_relaxed);
-    pthread_mutex_lock(&s->add->mu);
+    os_mutex_lock(&s->add->mu);
     s->prev = NULL; s->next = s->add->snapshots;
     if (s->next) s->next->prev = s;
     s->add->snapshots = s;
-    pthread_mutex_unlock(&s->add->mu);
+    os_mutex_unlock(&s->add->mu);
     t->cached_snapshot = s;
     piece_snapshot *out = piece_snapshot_retain(s); pool_done(c, 0); return out;
 }
@@ -1643,7 +1640,7 @@ int piece_iter_next_source(piece_iter *it, const uint8_t **p, size_t *n, uint64_
 
 #ifdef PIECE_TESTING
 piece_test_stats piece_test_get_stats(const piece_tree *t) {
-    core *c = t->c; pthread_mutex_lock(&c->pool_mu);
+    core *c = t->c; os_rmutex_lock(&c->pool_mu);
     piece_test_stats s = {0};
     s.root_descents = c->stats.root_descents; s.cursor_hits = c->stats.cursor_hits;
     s.pathcopy_bytes = c->stats.pathcopy_bytes; s.gap_deletes = c->stats.gap_deletes;
@@ -1653,12 +1650,12 @@ piece_test_stats piece_test_get_stats(const piece_tree *t) {
     s.reclaim_steps = c->stats.reclaim_steps;
     s.leaf_bytes = LEAF_SZ; s.branch_bytes = BRANCH_SZ; s.snapshot_bytes = SNAPSHOT_SZ;
     s.slab_overhead = SLAB_OVERHEAD; s.height = (unsigned)t->height;
-    pthread_mutex_unlock(&c->pool_mu); return s;
+    os_rmutex_unlock(&c->pool_mu); return s;
 }
 piece_test_memory piece_test_get_memory(const piece_tree *t) {
     core *c = t->c; piece_test_memory m = {0};
     m.deleted_original = t->deleted_original; m.fallback_add = t->fallback_add;
-    pthread_mutex_lock(&c->pool_mu);
+    os_rmutex_lock(&c->pool_mu);
     for (unsigned pi = 0; pi < 3; pi++) {
         size_t slot = slot_size(pi);
         for (node *slab = c->pool[pi].slabs; slab; slab = slab_end(slab, slot)->next) {
@@ -1671,7 +1668,7 @@ piece_test_memory piece_test_get_memory(const piece_tree *t) {
             }
         }
     }
-    pthread_mutex_unlock(&c->pool_mu); return m;
+    os_rmutex_unlock(&c->pool_mu); return m;
 }
 void piece_test_reset_stats(piece_tree *t) { memset(&t->c->stats, 0, sizeof t->c->stats); }
 void piece_test_reclaim_hook(piece_tree *t, void (*hook)(void *), void *ctx) {

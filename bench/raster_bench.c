@@ -562,9 +562,9 @@ static int bulk_start(rig *r, bulk_fixture *fixture, unsigned scenario)
         }
     }
     if (jobs == 3) {
-        pthread_mutex_lock(&r->pool.mu);
+        os_mutex_lock(&r->pool.mu);
         bool queued = r->pool.queue[WORK_BULK].count == 2;
-        pthread_mutex_unlock(&r->pool.mu);
+        os_mutex_unlock(&r->pool.mu);
         if (!queued) { bulk_stop(r,fixture); return -1; }
     }
     return 0;
