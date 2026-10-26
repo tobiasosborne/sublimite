@@ -2,7 +2,6 @@
 #include "font/font.h"
 #include "utf8/utf8.h"
 #include <string.h>
-#include <time.h>
 
 int font_cluster_ignorable(uint32_t cp)
 {
@@ -75,7 +74,13 @@ int font_cache_init(font_cache *cache, font_family *family, edit_arena *arena,
     cache->negative_keys = edit_arena_alloc(arena, cache->negative_capacity * 256u, 1);
     cache->pending_key = edit_arena_alloc(arena, FONT_CLUSTER_MAX_BYTES, 1);
     cache->image = edit_arena_alloc(arena, (size_t)cell.cell_w * 2u * cell.cell_h, 1);
+#if defined(_WIN32)
+    /* base's Windows commit path requires a page-aligned arena base, even
+     * for this borrowed subarena inside the already committed parent. */
+    cache->scratch.base = edit_arena_alloc(arena, scratch_bytes, os_page_size());
+#else
     cache->scratch.base = edit_arena_alloc(arena, scratch_bytes, 16);
+#endif
     cache->scratch.size = scratch_bytes;
     if (!cache->entries || !cache->glyphs || !cache->keys || !cache->image || !cache->scratch.base || !cache->negative_entries || !cache->negative_keys || !cache->pending_key) goto nomem;
     memset(cache->entries, 0, entries * sizeof *cache->entries);
@@ -132,8 +137,7 @@ static void composite(font_cache *cache, const font_bitmap *b, uint32_t width, i
 
 static uint64_t compose_time(void)
 {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 
 enum { RENDER_SCALARS = 0, RENDER_PROJECTED = 1, RENDER_GLYPHS = 2 };

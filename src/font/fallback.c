@@ -1,130 +1,11 @@
-/* src/font/fallback.c - fallback font discovery (P2.3b, edit-e6x.8).
- * Runs on a work-pool worker, never the UI thread. libfontconfig.so.1 is
- * dlopen'd with local prototypes (static-link decision: heavy system libs are
- * loaded at runtime on a worker). Missing library -> no fallback, no error.
- * Results are cached in the caller's font_fallback (fixed storage). FcFini releases fontconfig's state
- * after the paths are copied; the library handle is never dlclose'd. Not a typing-path module: libc
- * allocation inside fontconfig is acceptable here. */
+/* Shared fallback mailbox protocol and arena file loading. Platform discovery
+ * lives in discovery_posix.c / discovery_win.c and runs only on a worker. */
 #include "font/font.h"
 #include "font/file.h"
 #include "font/selection.h"
-#include <strings.h>
 #include "font/discovery.h"
-#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
-#include <sys/stat.h>
-
-/* Local fontconfig declarations (checked against fontconfig/fontconfig.h). */
-typedef struct FcPattern FcPattern;
-typedef struct FcCharSet FcCharSet;
-typedef struct FcConfig  FcConfig;
-typedef unsigned char    FcChar8;
-typedef unsigned int     FcChar32;
-typedef int              FcBool;
-typedef int              FcResult;      /* FcResultMatch == 0 */
-enum { FC_MATCH_PATTERN = 0, FC_RESULT_MATCH = 0 };
-
-typedef struct fc_api {
-    FcConfig  *(*InitLoadConfigAndFonts)(void);
-    FcPattern *(*PatternCreate)(void);
-    FcPattern *(*NameParse)(const FcChar8 *);
-    void       (*PatternDestroy)(FcPattern *);
-    FcCharSet *(*CharSetCreate)(void);
-    void       (*CharSetDestroy)(FcCharSet *);
-    FcBool     (*CharSetAddChar)(FcCharSet *, FcChar32);
-    FcBool     (*CharSetHasChar)(const FcCharSet *, FcChar32);
-    FcBool     (*PatternAddCharSet)(FcPattern *, const char *, const FcCharSet *);
-    FcBool     (*PatternAddString)(FcPattern *, const char *, const FcChar8 *);
-    FcBool     (*PatternAddBool)(FcPattern *, const char *, FcBool);
-    FcBool     (*ConfigSubstitute)(FcConfig *, FcPattern *, int);
-    void       (*DefaultSubstitute)(FcPattern *);
-    FcPattern *(*FontMatch)(FcConfig *, FcPattern *, FcResult *);
-    void       (*ConfigDestroy)(FcConfig *);
-    void       (*Fini)(void);
-    FcResult   (*PatternGetInteger)(const FcPattern *, const char *, int, int *);
-    FcResult   (*PatternGetString)(const FcPattern *, const char *, int, FcChar8 **);
-    FcResult   (*PatternGetBool)(const FcPattern *, const char *, int, FcBool *);
-    FcResult   (*PatternGetCharSet)(const FcPattern *, const char *, int, FcCharSet **);
-} fc_api;
-
-static uint64_t now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-static int fc_bind(fc_api *a, void *h)
-{
-#define BIND(field, sym) do { *(void **)(&a->field) = dlsym(h, sym); if (!a->field) return 0; } while (0)
-    BIND(InitLoadConfigAndFonts, "FcInitLoadConfigAndFonts");
-    BIND(PatternCreate, "FcPatternCreate");
-    BIND(NameParse, "FcNameParse");
-    BIND(PatternDestroy, "FcPatternDestroy");
-    BIND(CharSetCreate, "FcCharSetCreate");
-    BIND(CharSetDestroy, "FcCharSetDestroy");
-    BIND(CharSetAddChar, "FcCharSetAddChar");
-    BIND(CharSetHasChar, "FcCharSetHasChar");
-    BIND(PatternAddCharSet, "FcPatternAddCharSet");
-    BIND(PatternAddString, "FcPatternAddString");
-    BIND(PatternAddBool, "FcPatternAddBool");
-    BIND(ConfigSubstitute, "FcConfigSubstitute");
-    BIND(DefaultSubstitute, "FcDefaultSubstitute");
-    BIND(FontMatch, "FcFontMatch");
-    BIND(ConfigDestroy, "FcConfigDestroy");
-    BIND(Fini, "FcFini");
-    BIND(PatternGetInteger, "FcPatternGetInteger");
-    BIND(PatternGetString, "FcPatternGetString");
-    BIND(PatternGetBool, "FcPatternGetBool");
-    BIND(PatternGetCharSet, "FcPatternGetCharSet");
-#undef BIND
-    return 1;
-}
-
-/* Best font covering cp. lang may be NULL. mono_only rejects colour fonts.
- * Copies the file path into out (empty when nothing suitable). */
-static void fc_query(const fc_api *a, FcConfig *cfg, uint32_t cp, const char *lang,
-                     int mono_only, char *out, uint32_t *index)
-{
-    out[0] = 0;
-    *index = 0;
-    FcPattern *pat = a->PatternCreate();
-    FcCharSet *cs = a->CharSetCreate();
-    if (!pat || !cs) goto done;
-    a->CharSetAddChar(cs, cp);
-    a->PatternAddCharSet(pat, "charset", cs);
-    if (lang) a->PatternAddString(pat, "lang", (const FcChar8 *)lang);
-    if (mono_only) a->PatternAddBool(pat, "color", 0);
-    a->ConfigSubstitute(cfg, pat, FC_MATCH_PATTERN);
-    a->DefaultSubstitute(pat);
-    FcResult res = 0;
-    FcPattern *m = a->FontMatch(cfg, pat, &res);
-    if (m) {
-        FcChar8 *file = NULL;
-        FcCharSet *mcs = NULL;
-        FcBool color = 0;
-        int face = 0;
-        int ok = a->PatternGetString(m, "file", 0, &file) == FC_RESULT_MATCH && file;
-        /* FC_INDEX: face within a TTC. High 16 bits select a named variation
-         * instance, which stb cannot render: reject those. */
-        ok = ok && a->PatternGetInteger(m, "index", 0, &face) == FC_RESULT_MATCH &&
-             face >= 0 && face <= 0xffff;
-        ok = ok && a->PatternGetCharSet(m, "charset", 0, &mcs) == FC_RESULT_MATCH &&
-             mcs && a->CharSetHasChar(mcs, cp);
-        if (ok && mono_only && a->PatternGetBool(m, "color", 0, &color) == FC_RESULT_MATCH && color)
-            ok = 0;
-        if (ok && strlen((const char *)file) < FONT_FALLBACK_PATH_MAX) {
-            memcpy(out, file, strlen((const char *)file) + 1);
-            *index = (uint32_t)face;
-        }
-        a->PatternDestroy(m);
-    }
-done:
-    if (cs) a->CharSetDestroy(cs);
-    if (pat) a->PatternDestroy(pat);
-}
 
 void font_fallback_reset(font_fallback *fb)
 {
@@ -137,29 +18,6 @@ void font_fallback_reset(font_fallback *fb)
     fb->elapsed_ns = 0;
     fb->staged_epoch = 0; fb->discovery_program = NULL;
     atomic_store(&fb->child_pid, 0u); atomic_store(&fb->cancellation_polls, 0u);
-}
-
-void font_fallback_discover(font_fallback *fb, const char *soname)
-{
-    uint64_t t0 = now_ns();
-    font_fallback_reset(fb);
-    fb->worker = pthread_self();
-    void *h = soname ? dlopen(soname, RTLD_NOW | RTLD_LOCAL) : NULL;
-    fc_api api;
-    if (h && fc_bind(&api, h)) {
-        FcConfig *cfg = api.InitLoadConfigAndFonts();
-        if (cfg) {
-            fb->have_fontconfig = 1;
-            fc_query(&api, cfg, 0x4E2Du, "zh-cn", 0, fb->cjk, &fb->cjk_index);
-            fc_query(&api, cfg, 0x1F600u, NULL, 1, fb->emoji, &fb->emoji_index);
-            api.ConfigDestroy(cfg);   /* paths are copied out */
-            api.Fini();
-        }
-    }
-    /* handle intentionally kept open: nothing else uses fontconfig, and
-     * dlclose of a library with live TLS/atexit hooks buys nothing. */
-    fb->elapsed_ns = now_ns() - t0;
-    atomic_store_explicit(&fb->done, 1u, memory_order_release);
 }
 
 void font_fallback_job(work_ctx *c)
@@ -177,7 +35,7 @@ void font_fallback_job(work_ctx *c)
      * the terminal event. Cancellation suppresses both publication and adoption. */
     while (!work_should_stop(c)) {
         if (work_publish(c, &msg)) return;
-        struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+        os_sleep_ns(UINT64_C(1000000));
     }
 }
 
@@ -216,57 +74,28 @@ unsigned char *font_load_stream(FILE *fp, edit_arena *arena, size_t *len)
 unsigned char *font_load_file(const char *path, edit_arena *arena, size_t *len)
 {
     if (len) *len = 0;
-    FILE *fp = path && arena && len ? fopen(path, "rb") : NULL;
-    if (!fp) return NULL;
-    unsigned char *buf = font_load_stream(fp, arena, len);
-    fclose(fp);
+    if (!path || !arena || !len) return NULL;
+    os_file file;
+    if (os_file_open(&file, path, OS_OPEN_READ) != OS_OK) return NULL;
+    os_stat st;
+    edit_arena_mark_t mark = edit_arena_mark(arena);
+    unsigned char *buf = NULL;
+    if (os_file_stat(&file, &st) == OS_OK && st.kind == OS_KIND_FILE &&
+        st.size > 0 && st.size <= SIZE_MAX) {
+        buf = edit_arena_alloc(arena, (size_t)st.size, 16);
+        size_t used = 0;
+        while (buf && used < st.size) {
+            size_t got = 0;
+            if (os_file_read(&file, buf + used, (size_t)st.size - used, &got) != OS_OK || !got) buf = NULL;
+            else used += got;
+        }
+        if (buf) *len = (size_t)st.size;
+    }
+    os_file_close(&file);
+    if (!buf) edit_arena_reset_to_mark(arena, mark);
     return buf;
 }
 
-/* Worker-only primary selection; use the same runtime Fontconfig API. */
-int font_selection_resolve(const char *pattern, char *file, size_t cap, uint32_t *index)
-{
-    if (!pattern || !file || !cap || !index) return FONT_ERR_ARG;
-    file[0] = 0; *index = 0;
-    void *h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
-    fc_api api;
-    if (!h || !fc_bind(&api, h)) return FONT_ERR_MISSING;
-    FcConfig *cfg = api.InitLoadConfigAndFonts();
-    FcPattern *requested = api.NameParse((const FcChar8 *)pattern);
-    FcPattern *query = api.NameParse((const FcChar8 *)pattern);
-    FcPattern *match = NULL;
-    int result = FONT_ERR_MISSING;
-    if (!cfg || !requested || !query) goto done;
-    if (!api.ConfigSubstitute(cfg, query, FC_MATCH_PATTERN)) goto done;
-    api.DefaultSubstitute(query);
-    FcResult status = FC_RESULT_MATCH;
-    match = api.FontMatch(cfg, query, &status);
-    if (!match || status != FC_RESULT_MATCH) goto done;
-    int family_ok = 0;
-    for (int i = 0;; i++) {
-        FcChar8 *want = NULL;
-        if (api.PatternGetString(requested, "family", i, &want) != FC_RESULT_MATCH) break;
-        if (!strcasecmp((const char *)want, "monospace")) family_ok = 1;
-        for (int j = 0;; j++) {
-            FcChar8 *got = NULL;
-            if (api.PatternGetString(match, "family", j, &got) != FC_RESULT_MATCH) break;
-            if (!strcasecmp((const char *)want, (const char *)got)) family_ok = 1;
-        }
-    }
-    FcChar8 *path = NULL; int face = 0;
-    if (family_ok && api.PatternGetString(match, "file", 0, &path) == FC_RESULT_MATCH && path &&
-        api.PatternGetInteger(match, "index", 0, &face) == FC_RESULT_MATCH && face >= 0 && face <= UINT16_MAX &&
-        strlen((const char *)path) < cap) {
-        memcpy(file, path, strlen((const char *)path) + 1u); *index = (uint32_t)face; result = FONT_OK;
-    }
-done:
-    if (match) api.PatternDestroy(match);
-    if (query) api.PatternDestroy(query);
-    if (requested) api.PatternDestroy(requested);
-    if (cfg) api.ConfigDestroy(cfg);
-    api.Fini();
-    return result;
-}
 /* edit-6e2: one font.fallbacks entry to a file + face. Worker-only. */
 int font_chain_resolve(const char *entry, char *path, size_t cap, uint32_t *index)
 {
@@ -279,8 +108,8 @@ int font_chain_resolve(const char *entry, char *path, size_t cap, uint32_t *inde
         const char *file = entry + sizeof file_prefix - 1u;
         if (!*file || font_selection_parse(&parsed, NULL, file) || !parsed.file[0] ||
             strlen(parsed.file) >= cap) return FONT_ERR_ARG;
-        struct stat st;
-        if (stat(parsed.file, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) return FONT_ERR_INIT;
+        os_stat st;
+        if (os_stat_path(parsed.file, 0, &st) != OS_OK || st.kind != OS_KIND_FILE || !st.size) return FONT_ERR_INIT;
         memcpy(path, parsed.file, strlen(parsed.file) + 1u); *index = parsed.index;
         return FONT_OK;
     }

@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "win/font_fixture.h"
+#endif
 
 static int failures;
 #define CHECK(c)                                                              \
@@ -313,8 +316,7 @@ static void test_render(font_t *emoji)
 
 static uint64_t now_ns(void)
 {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    return os_now_ns();
 }
 static int cmp_u64(const void *a, const void *b)
 {
@@ -353,6 +355,12 @@ static void timings(font_t *f)
 
 int main(void)
 {
+#if defined(_WIN32)
+    if (!font_test_root()) return 1;
+    /* This suite pins the historical stb golden hashes; native raster has
+     * its own same-face conformance suite in tests/win/font_dwrite_test.c. */
+    CHECK(SetEnvironmentVariableW(L"SUBLIMITE_TEST_NO_DWRITE", L"1"));
+#endif
     size_t len = 0;
     unsigned char *ttf = load(FIXTURE, &len);
     CHECK(ttf != NULL);

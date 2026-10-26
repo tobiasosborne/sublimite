@@ -1,5 +1,6 @@
 /* src/font/font.c - see font.h. stb_truetype is vendored in vendor/. */
 #include "font/font.h"
+#include "font/dwrite.h"
 #include <setjmp.h>
 #include <limits.h>
 #include <math.h>
@@ -834,9 +835,33 @@ static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *
     return FONT_OK;
 }
 
-int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
+#if defined(_WIN32)
+int font_raster_glyph_stb(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
 {
     return raster_glyph(f, cp, arena, out, 0, 0);
+}
+static int raster_worker(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int by_id)
+{
+    int g = 0;
+    if (!f || !arena || !out || !f->data || !f->px) return FONT_ERR_ARG;
+    int result = by_id ? glyph_checked(f, cp, &g) : glyph_of(f, cp, &g);
+    if (result != FONT_OK) return raster_glyph(f, cp, arena, out, 0, by_id);
+    int ascii = !by_id && cp >= FONT_ASCII_FIRST && cp <= FONT_ASCII_LAST;
+    if (by_id) for (uint32_t ch = FONT_ASCII_FIRST; ch <= FONT_ASCII_LAST && !ascii; ch++) {
+        int ascii_gid = 0;
+        ascii = glyph_of(f, ch, &ascii_gid) == FONT_OK && ascii_gid == g;
+    }
+    if (!ascii && font_dwrite_raster(f, (uint32_t)g, arena, out, 0) == FONT_OK) return FONT_OK;
+    return raster_glyph(f, cp, arena, out, 0, by_id);
+}
+#endif
+int font_raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
+{
+#if defined(_WIN32)
+    return raster_worker(f, cp, arena, out, 0);
+#else
+    return raster_glyph(f, cp, arena, out, 0, 0);
+#endif
 }
 int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)
 {
@@ -844,7 +869,11 @@ int font_raster_glyph_ui(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap 
 }
 int font_raster_glyph_id(font_t *f, uint32_t gid, edit_arena *arena, font_bitmap *out)
 {
+#if defined(_WIN32)
+    return raster_worker(f, gid, arena, out, 1);
+#else
     return raster_glyph(f, gid, arena, out, 0, 1);
+#endif
 }
 uint32_t font_glyph_id(const font_t *f, uint32_t cp)
 {

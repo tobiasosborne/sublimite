@@ -4,8 +4,6 @@
 #include "utf8/utf8.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <time.h>
 
 /* (P) Inherited raster/GL descriptor ceiling, less baked printable ASCII.
  * These are storage ceilings, not invented latency or memory targets. */
@@ -130,6 +128,9 @@ int font_async_open_atlas(font_async **out, const font_ascii_atlas *a, bool em,
     /* (P) One private atlas page satisfies font_cache_init; published pixels
      * live in separate, pre-touched pages with reusable per-request tiles. */
     size_t storage_bytes = ASYNC_SCRATCH + _Alignof(max_align_t);
+#if defined(_WIN32)
+    storage_bytes += os_page_size(); /* one page-alignment allowance for the cache scratch subarena */
+#endif
     for (size_t i = 0; i < sizeof storage_sizes / sizeof storage_sizes[0]; i++)
         storage_bytes += storage_sizes[i] + _Alignof(max_align_t);
     if (edit_arena_init(&owner->ui, ui_bytes) || edit_arena_init(&owner->storage, storage_bytes) ||
@@ -148,6 +149,12 @@ int font_async_open_atlas(font_async **out, const font_ascii_atlas *a, bool em,
         font_async_close(owner); return FONT_ERR_NOMEM;
     }
     memset(owner->faces, 0, ui_sizes[1]);
+#if defined(_WIN32)
+    /* Atlas pixels use the reservation directly, outside edit_arena_alloc. */
+    if (os_vm_commit(owner->pixels.base, owner->pixels.size) != OS_OK) {
+        font_async_close(owner); return FONT_ERR_NOMEM;
+    }
+#endif
     memset(owner->pixels.base, 0, owner->pixels.size); /* INIT pre-touch */
     int rc = font_async_reset_atlas(owner, a, em);
     if (rc) { font_async_close(owner); return rc; }
@@ -229,10 +236,10 @@ void font_async_close(font_async *owner)
 /* Worker-only: read and size one face file into its own arena. */
 static int load_face(font_async *owner, async_face *face)
 {
-    struct stat st;
+    os_stat st;
     face->result = FONT_ERR_INIT;
-    if (!stat(face->path, &st) && st.st_size > 0 && (uintmax_t)st.st_size <= SIZE_MAX &&
-        !edit_arena_init(&face->arena, (size_t)st.st_size)) {
+    if (os_stat_path(face->path, 0, &st) == OS_OK && st.size > 0 && st.size <= SIZE_MAX &&
+        !edit_arena_init(&face->arena, (size_t)st.size)) {
         size_t len; unsigned char *bytes = font_load_file(face->path, &face->arena, &len);
         if (bytes) face->result = font_init_index(&face->font, bytes, len, face->index);
         if (face->result == FONT_OK) face->result = owner->em ?
@@ -403,8 +410,7 @@ static void glyph_job(work_ctx *ctx)
     memcpy(msg.data, &output, sizeof output);
     while (!work_should_stop(ctx)) {
         if (work_publish(ctx, &msg)) return; /* no owner writes after publication */
-        struct timespec delay = {0, 1000000}; /* inherited mailbox retry cadence */
-        (void)nanosleep(&delay, NULL);
+        os_sleep_ns(UINT64_C(1000000)); /* inherited mailbox retry cadence */
     }
 }
 

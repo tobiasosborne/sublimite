@@ -1,10 +1,5 @@
 #include "font/selection.h"
 #include <string.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <limits.h>
 
 int font_selection_parse(font_selection *s, const char *family, const char *file)
 {
@@ -47,13 +42,13 @@ int font_selection_load(font_selection *s, uint32_t px, bool em,
         memcpy(s->file, path, sizeof s->file); s->index = index;
     }
     if (work_should_stop(ctx)) return FONT_MORE;
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return FONT_ERR_INIT;
-    struct stat sb;
-    if (fstat(fd, &sb) || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
-        (uintmax_t)sb.st_size > SIZE_MAX) { close(fd); return FONT_ERR_INIT; }
-    size_t len = (size_t)sb.st_size;
-    if (edit_arena_init(&s->files, len)) { close(fd); return FONT_ERR_NOMEM; }
+    os_file fd;
+    if (os_file_open(&fd, path, OS_OPEN_READ) != OS_OK) return FONT_ERR_INIT;
+    os_stat sb;
+    if (os_file_stat(&fd, &sb) != OS_OK || sb.kind != OS_KIND_FILE || !sb.size ||
+        sb.size > SIZE_MAX) { os_file_close(&fd); return FONT_ERR_INIT; }
+    size_t len = (size_t)sb.size;
+    if (edit_arena_init(&s->files, len)) { os_file_close(&fd); return FONT_ERR_NOMEM; }
     unsigned char *bytes = edit_arena_alloc(&s->files, len, 1);
     int rc = bytes ? FONT_OK : FONT_ERR_NOMEM;
     size_t used = 0;
@@ -62,12 +57,11 @@ int font_selection_load(font_selection *s, uint32_t px, bool em,
     while (!rc && used < len) {
         if (work_should_stop(ctx)) { rc = FONT_MORE; break; }
         size_t remaining = len - used;
-        size_t chunk = remaining > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : remaining;
-        ssize_t n = read(fd, bytes + used, chunk);
-        if (n > 0) used += (size_t)n;
-        else if (n == 0 || errno != EINTR) rc = FONT_ERR_INIT;
+        size_t got = 0;
+        if (os_file_read(&fd, bytes + used, remaining, &got) != OS_OK || !got) rc = FONT_ERR_INIT;
+        else used += got;
     }
-    close(fd);
+    os_file_close(&fd);
     if (!rc) rc = font_init_index(&s->face, bytes, len, index);
     if (!rc) rc = font_monospace(&s->face);
     if (!rc) rc = em ? font_set_em_px(&s->face, px) : font_set_px(&s->face, px);

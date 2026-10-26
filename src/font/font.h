@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
-#include <pthread.h>
+#include "os/os.h"
 #include "base/base.h"
 #include "work/work.h"
 #include "render/render.h"
@@ -87,7 +87,8 @@ typedef struct font_atlas {
  * Every table the raster path reads is bounds-checked against len first
  * (docs/decisions/P2.3c.md); malformed data returns FONT_ERR_INIT and clears f.
  * font_init selects face 0; font_init_index selects face `index` of a TTC
- * (index must be 0 for a plain TTF/OTF). */
+ * (index must be 0 for a plain TTF/OTF). DirectWrite borrows the same bytes
+ * for a temporary face on worker raster calls; no platform ownership escapes. */
 int  font_init(font_t *f, const unsigned char *ttf, size_t len);
 int  font_init_index(font_t *f, const unsigned char *ttf, size_t len, uint32_t index);
 /* Sets the pixel height and recomputes scale and cell metrics. */
@@ -99,7 +100,8 @@ const unsigned char *font_embedded_data(size_t *len);
 int  font_cell_metrics(const font_t *f, font_cell *out);
 /* Metrics of a codepoint without rasterising. */
 int  font_glyph_metrics(const font_t *f, uint32_t cp, font_metric *out);
-/* Rasterises cp into arena memory. FONT_ERR_MISSING for absent glyphs.
+/* Worker: rasterises cp into arena memory. Windows uses DirectWrite for
+ * non-ASCII, falling back to stb on unavailability/failure. ASCII stays stb. FONT_ERR_MISSING for absent glyphs.
  * FONT_ERR_NOMEM leaves pixels NULL and the arena at its entry mark.
  * A font_t must not be rasterised concurrently (stb userdata is per-call). */
 /* UI cache admission: at most 256 expanded TT points / 16 components,
@@ -133,7 +135,7 @@ uint32_t           font_ascii_px(void);
 const font_ascii_atlas *font_ascii_atlas_for_px(uint32_t px);
 const font_metric      *font_ascii_atlas_glyph(const font_ascii_atlas *a, uint32_t cp);
 
-/* ---- Fallback font discovery (fontconfig via dlopen, on a work-pool worker) */
+/* ---- Platform fallback discovery, on a work-pool worker ---------------- */
 #define FONT_FALLBACK_PATH_MAX 512u
 #define FONT_FALLBACK_MSG_KIND 0x46414C42u   /* "FALB" */
 
@@ -142,7 +144,7 @@ typedef struct font_fallback_result {
     uint32_t cjk_index, emoji_index;
     int have_fontconfig;
     uint64_t elapsed_ns;
-    pthread_t worker;
+    uint64_t worker;
 } font_fallback_result;
 
 typedef struct font_fallback {
@@ -150,11 +152,11 @@ typedef struct font_fallback {
     /* Valid after done == 1: */
     char       cjk[FONT_FALLBACK_PATH_MAX];    /* "" if none */
     char       emoji[FONT_FALLBACK_PATH_MAX];  /* monochrome emoji; "" if none */
-    uint32_t   cjk_index;             /* FC_INDEX of cjk: pass to font_init_index */
+    uint32_t   cjk_index;             /* face within the font file: pass to font_init_index */
     uint32_t   emoji_index;
-    int        have_fontconfig;       /* libfontconfig.so.1 loaded */
+    int        have_fontconfig;       /* platform discovery service available (legacy field name) */
     uint64_t   elapsed_ns;
-    pthread_t  worker;                /* thread that ran the discovery */
+    uint64_t   worker;                /* os_thread_self identity of discovery worker */
     font_fallback_result staged;      /* worker-owned; only event() may adopt */
     uint32_t staged_generation, staged_slot, staged_epoch;
     const char *discovery_program; /* INIT test seam: trusted absolute fc-match-compatible executable; NULL=system */
@@ -169,12 +171,12 @@ typedef struct font_fallback {
  * Synchronous discovery is for exclusively owned INIT storage (not a pooled
  * cancellable job); it publishes done directly and cannot be cancelled. */
 void font_fallback_reset(font_fallback *fb);
-/* Synchronous discovery with the given soname (test seam). Resets fb, fills it,
- * publishes done (release). */
+/* Synchronous discovery with the given library name (test seam; NULL=none).
+ * Resets fb, fills it, publishes done (release). */
 void font_fallback_discover(font_fallback *fb, const char *soname);
-/* work_job fn: ctx->arg is a font_fallback*. Uses isolated /usr/bin/fc-match
- * (unavailable executable gracefully gives empty fallbacks). Stages a result and retries full
- * mailbox publication cancellably. Never sets public done. */
+/* work_job fn: ctx->arg is a font_fallback*. Uses isolated fc-match on Linux
+ * and DirectWrite on Windows (unavailable service gives empty fallbacks).
+ * Stages a result and retries full mailbox publication cancellably. Never sets public done. */
 void font_fallback_job(work_ctx *c);
 /* UI mailbox callback ONLY: adopt matching live result, once. Returns true
  * on adoption. Family preparation may then read the public fields/done. */
@@ -309,7 +311,7 @@ typedef struct font_runtime {
     font_runtime_config config;
     char primary_path[FONT_FALLBACK_PATH_MAX];
     edit_arena *files, *storage;
-    pthread_t worker;
+    uint64_t worker; /* os_thread_self identity; owned thread belongs to work_pool */
     int adopted, result, staged_result, fallback_error;
     uint32_t staged_generation, staged_slot, staged_epoch;
 } font_runtime;

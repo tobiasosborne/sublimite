@@ -1,7 +1,6 @@
 /* Worker preparation and mailbox-only handoff for an editor font owner. */
 #include "font/font.h"
 #include <string.h>
-#include <time.h>
 
 int font_runtime_limits(const font_runtime_config *config, uint32_t *pages,
                         size_t *glyphs, size_t *pixel_bytes)
@@ -43,7 +42,7 @@ void font_runtime_prepare_job(work_ctx *ctx)
     font_runtime *owner = ctx->arg;
     edit_arena_mark_t files_mark = edit_arena_mark(owner->files);
     edit_arena_mark_t storage_mark = edit_arena_mark(owner->storage);
-    owner->worker = pthread_self();
+    owner->worker = os_thread_self();
     size_t len = 0;
     unsigned char *bytes = font_load_file(owner->primary_path, owner->files, &len);
     font_t primary;
@@ -76,7 +75,7 @@ void font_runtime_prepare_job(work_ctx *ctx)
     memcpy(message.data, &identity, sizeof identity);
     while (!work_should_stop(ctx)) {
         if (work_publish(ctx, &message)) return;
-        struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+        os_sleep_ns(UINT64_C(1000000));
     }
 }
 
