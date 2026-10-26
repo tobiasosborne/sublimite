@@ -15,6 +15,23 @@
 
 **Box:** Xvfb :95/:97/:98/:99 up (2880x1800, 100 dpi, -noreset); corpus at /tmp/edit-corpus; briefs and codex logs under build/briefs/ (not in git); landed worktrees can be removed (hltk, 177r.3, 177r.4, 177r.5, v4ee, pqqs). Worklog: docs/worklog/2026-10-26.md.
 
+---
+
+# HANDOFF — sublimité, ThinkPad box, session 22 in parallel with Spiral's (2026-10-26 ~07:45 box clock; Fable 5.1 in the main session, Tobias present; the ThinkPad reinstalled)
+
+## Read first (session 23)
+**The ThinkPad X1 Carbon Gen 11 was reinstalled: Linux Mint 22.3 (Ubuntu 24.04 base), native X11 Cinnamon session, battery present.** Session 22 was environment work only (no code, no workers): the tree builds and is **installed at ~/.local/bin/sublimite (main 8652549, `make install` 07:31; desktop entry, icon, text/plain default)**. Full `make check`: **exit 0 at 07:42 on main 8652549, 103 test binaries + test_replay_cli + the display-lock contract, about 11 min (M)[AC] (started 07:31), log in the session scratchpad only.** Two earlier runs each found one environment dependency the fresh box lacked (Go Mono font, ripgrep), both documented in docs/toolchain.md; no code failure. Record: docs/worklog/2026-10-26.md; box facts and the exact apt line in docs/toolchain.md (Mint section); memory thinkpad-mint-reinstall-2026-10-26.
+
+**Box facts for the Mint ThinkPad (binding):**
+- sudo needs a password: apt lines go to Tobias as `! sudo apt install ...`. Two suite dependencies were satisfied per user instead: Go Mono (`fonts-go`, needed by tests/font_selection_test.c and font_cli_test.c) in ~/.fonts and ripgrep (`rg`, needed by tools/test_display_lock.sh contract) in ~/.local/bin; `sudo apt install fonts-go ripgrep` makes them system-wide. clang-18 and llvm-symbolizer-18 are symlinked as `clang`/`llvm-symbolizer` in ~/.local/bin.
+- The old laptop's home is at ~/Documents/x1-backup-2026-10-26 (home.sqfs, 60 GB; home.index.tsv is a grep-able listing; inventory/ has apt and font lists). `unsquashfs -f -d <dir> home.sqfs <path>` extracts single paths without root. Already restored: ~/.fonts/NotoEmoji-wght.ttf, build/briefs (through _rules-s10), build/astra/*.md, the Claude memory directory. Not restored: ~/.local/share/sublimite (the default profile is absent here, which is the clean state), .wt worktrees, build/astra* drive outputs. Not on this box: Iosevka, llvm-mingw (Spiral), the `quota` tool.
+- Xvfb :95 and :99 (2880x1800, 100 dpi, -noreset) are up; restart them after a reboot. /tmp/edit-corpus built (no all_a_1g.txt). :0 is the real desktop; the test guard redirects it to :99. **Never run tools/test_runtime_identity.sh or a bare `build/sublimite` without EDIT_REFUSE_REAL_DISPLAY=1** (edit-8yer: the script is stale and the bare launch opens a window on the real display).
+- Beads: rebuilt from .beads/issues.jsonl with `bd init -p edit --from-jsonl`; `bd init` rewrites CLAUDE.md, .beads/hooks, .claude/settings.json, .gitignore and adds AGENTS.md/.agents/.codex/.cursor: revert those after any re-init. Export before every push (no Dolt remote); Spiral imports before working.
+
+**Open, in order (unchanged from session 21 plus one):** whatever Tobias reports from use on this box; edit-177r.3 / edit-177r.4 (Windows port, need Spiral or llvm-mingw here), edit-hltk (Spiral-only failures; not reproducible here), his pick from the design workups (edit-b0j), P3 edit-b3hk, edit-fi0p remainder, edit-pi6; new P3 edit-8yer (stale runtime-identity script, ci.sh cannot pass).
+
+**Quota:** no `quota` tool on this box; no readings this session.
+
 Everything below is the session-21 handoff, kept for its own state.
 
 ---
