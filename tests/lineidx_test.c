@@ -20,6 +20,17 @@
 #endif
 #endif
 
+/* Cancellation accounting is read from os_thread_cpu_ns, whose step is the
+ * platform's accounting resolution r (M: 400-500 ns Linux CLOCK_THREAD_CPUTIME_ID,
+ * 15,625,000 ns Windows GetThreadTimes = 1/64 s (P)). The 5,000,000 ns bound (G)
+ * is widened by one step, and a zero delta is accepted only when one step
+ * exceeds the bound (coordinator decision, edit-177r.5, 2026-10-26). */
+static int cancel_cpu_within_bound(const lineidx *x)
+{
+    uint64_t r = os_thread_cpu_resolution_ns(), c = lineidx_cancel_cpu_ns(x);
+    return c <= UINT64_C(5000000) + r && (c > 0 || r > UINT64_C(5000000));
+}
+
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: FAIL %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "%s:%d: FATAL %s\n", __FILE__, __LINE__, #c); fails++; return; } } while (0)
@@ -1201,7 +1212,7 @@ static void test_review_polling(bool enlarged)
         (unsigned long long)lineidx_cancel_cpu_ns(x), (unsigned long long)os_thread_cpu_resolution_ns());
 #endif
     CHECK(atomic_load(&s.cpu_ns) <= 5000000);
-    CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
+    CHECK(cancel_cpu_within_bound(x));
     CHECK(!lineidx_complete(x));
     lineidx_destroy(x);
     fprintf(stderr, "review %s: cancelled first span requests no further data\n", enlarged ? "work-scan 9" : "10");
@@ -1221,7 +1232,7 @@ static void test_review_fragmented(void)
         os_sleep_ns(1000000);
     CHECK(!lineidx_building(x));
     CHECK(atomic_load(&s.calls) == 10001);
-    CHECK(lineidx_cancel_cpu_ns(x) > 0 && lineidx_cancel_cpu_ns(x) <= 5000000);
+    CHECK(cancel_cpu_within_bound(x));
     CHECK(!lineidx_complete(x) && lineidx_poll(x) == 0);
     lineidx_destroy(x);
     fprintf(stderr, "review 10: one-byte source cancels inside partially counted chunk\n");
