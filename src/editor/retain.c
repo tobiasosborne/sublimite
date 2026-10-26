@@ -3,10 +3,12 @@
  * a build step). docs/decisions/edit-fi2.md. Nothing here runs on the typing
  * path: the tick runs in source maintenance (editor_poll_sources), the copy
  * is one WORK_BULK job on the journal pool, and the UI never waits for it. */
+/* Unported editor storage in private.h still names pthread types. */
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "editor/private.h"
-#include <sched.h>
 #include <string.h>
-#include <unistd.h>
 
 bool editor_retain_matches(const editor_buffer *b, const journal_base *base)
 { return b->retain_state == EDITOR_RETAIN_READY && *base->path && editor_base_id_matches(&b->retain_of, base); }
@@ -30,7 +32,7 @@ bool editor_retain_unprotected(const editor_buffer *b)
 }
 static void drop_copy(editor *e, editor_buffer *b)
 {
-    (void)unlink(b->retain.copy.captured_path);
+    (void)os_unlink(b->retain.copy.captured_path);
     b->retain_state = EDITOR_RETAIN_IDLE; b->retain_used = b->retain_building = false;
     if (e) editor_session_publish(e, b);
 }
@@ -119,7 +121,7 @@ void editor_retain_stop(editor_buffer *b)
 {
     if (b->retain_state == EDITOR_RETAIN_RUNNING) {
         work_cancel(b->retain_pool, b->retain_handle);
-        while (!work_handle_finished(b->retain_pool, b->retain_handle)) sched_yield();
+        while (!work_handle_finished(b->retain_pool, b->retain_handle)) os_yield();
         if (!b->retain.error) drop_copy(NULL, b);
     } else if (b->retain_state == EDITOR_RETAIN_READY &&
                !(b->retain_used && editor_base_id_matches(&b->retain_of, &b->base))) drop_copy(NULL, b);

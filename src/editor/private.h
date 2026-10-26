@@ -333,7 +333,11 @@ struct editor {
     view v;
     journal *journal;
     editor_session *session;
-    int session_lock;
+#if defined(_WIN32)
+    os_file session_lock;
+#else
+    int session_lock; /* Linux compatibility until open.c migrates. */
+#endif
     bool recovering, startup_restored, save_flushing, recover_existing, session_lock_owned;
     /* edit-btj: startup recovery notice, shown on the status row until the
      * first mutation; recovery_aside names the set-aside source journal. */
@@ -451,7 +455,11 @@ struct editor {
     uint64_t busy_due_ns;
     uint32_t busy_refusals;
     bool busy_checkpoint;
-    int busy_source_lease;
+#if defined(_WIN32)
+    os_file busy_source_lease;
+#else
+    int busy_source_lease; /* Linux compatibility until open.c migrates. */
+#endif
     char busy_source[IPC_PATH_CAP];
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
     uint32_t tab_rows, map_cols; /* tab_rows: every row above the text (menu bar + tab strip) */

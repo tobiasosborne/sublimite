@@ -2,10 +2,8 @@
 #include "editor/editor.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include "os/os.h"
 #include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 static bool real_display(const char *s)
 {
@@ -24,38 +22,52 @@ const char *editor_runtime_display(const char *display, const char *safe, const 
 int editor_config_dir(char *out, size_t cap)
 {
     if (!out || !cap) return EDITOR_ERR_ARG;
-    const char *root = getenv("XDG_CONFIG_HOME"), *suffix = "/sublimite";
-    if (!root || root[0] != '/') {
-        root = getenv("HOME"); suffix = "/.config/sublimite";
-    }
-    if (!root || root[0] != '/') return EDITOR_ERR_ARG;
-    size_t len = strlen(root);
-    while (len && root[len - 1] == '/') len--;
-    if (len >= cap || strlen(suffix) >= cap - len) return EDITOR_ERR_ARG;
-    memcpy(out, root, len); strcpy(out + len, suffix); return EDITOR_OK;
+    return os_app_dir(OS_APP_CONFIG, out, cap) == OS_OK ? EDITOR_OK : EDITOR_ERR_ARG;
 }
 
 int editor_make_directory(const char *source, int (*sync_parent)(void *, int), void *ctx)
 {
-    if (!source || source[0] != '/' || strlen(source) > 4096) return EDITOR_ERR_ARG;
+    if (!source || !os_path_is_absolute(source) || strlen(source) > 4096) return EDITOR_ERR_ARG;
     char path[4097]; strcpy(path, source);
-    int parent = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC); if (parent < 0) return EDITOR_ERR_IO;
-    char *part = path + 1; int rc = 0;
+    size_t root = 1;
+#if defined(_WIN32)
+    for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+    if (path[1] == ':') root = 3;
+    else {
+        /* UNC roots include both the server and share components. */
+        char *server = strchr(path + 2, '/');
+        char *share = server ? strchr(server + 1, '/') : NULL;
+        root = share ? (size_t)(share - path) + 1u : strlen(path);
+    }
+    /* The callback is a Linux descriptor fault seam, never a HANDLE cast. */
+    if (sync_parent) return EDITOR_ERR_ARG;
+    (void)ctx;
+#endif
+    char saved = path[root]; path[root] = 0;
+    os_dir parent = OS_DIR_INIT;
+    os_err opened = os_dir_open(&parent, path); path[root] = saved;
+    if (opened != OS_OK) return EDITOR_ERR_IO;
+    char *part = path + root; int rc = 0;
     while (*part) {
         while (*part == '/') part++;
         if (!*part) break;
         char *end = strchr(part, '/'); if (end) *end = '\0';
-        if (mkdirat(parent, part, 0700) && errno != EEXIST) { rc = EDITOR_ERR_IO; break; }
-        int child = openat(parent, part, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (child < 0) { rc = EDITOR_ERR_IO; break; }
-        /* Also barrier existing components: a preceding failed startup may
-         * have created their names without completing this same barrier. */
+        os_err made = os_mkdir_at(&parent, part);
+        if (made != OS_OK && made != OS_E_EXIST) { rc = EDITOR_ERR_IO; break; }
+        os_dir child = OS_DIR_INIT;
+        if (os_dir_open_at(&child, &parent, part) != OS_OK) { rc = EDITOR_ERR_IO; break; }
+        /* Also barrier existing components after an interrupted startup. */
         int synced;
-        do { synced = sync_parent ? sync_parent(ctx, parent) : fsync(parent); } while (synced < 0 && errno == EINTR);
-        if (synced) { close(child); rc = EDITOR_ERR_IO; break; }
-        close(parent); parent = child;
+#if !defined(_WIN32)
+        if (sync_parent) {
+            do { synced = sync_parent(ctx, os_dir_fd(&parent)); } while (synced < 0 && errno == EINTR);
+        } else
+#endif
+            synced = os_dir_sync(&parent) != OS_OK;
+        if (synced) { os_dir_close(&child); rc = EDITOR_ERR_IO; break; }
+        os_dir_close(&parent); parent = child;
         if (!end) break;
         part = end + 1;
     }
-    close(parent); return rc;
+    os_dir_close(&parent); return rc;
 }

@@ -15,25 +15,29 @@
 #include <unistd.h>
 
 static struct { const char *path; bool before, armed; } rewrite;
-static ssize_t materialize_read(int fd, void *out, size_t size)
+static os_err materialize_read(os_file *source, void *out, size_t size, size_t *got)
 {
-    if (!rewrite.armed) return read(fd, out, size);
+    if (!rewrite.armed) return os_file_read(source, out, size, got);
     rewrite.armed = false;
-    ssize_t n = 0;
+    *got = 0;
     /* (P) Split the read in half to force a mixed-generation prefix even
      * on filesystems whose timestamps coalesce adjacent writes. */
-    if (!rewrite.before) n = read(fd, out, size / 2u);
-    int writer = open(rewrite.path, O_WRONLY | O_CLOEXEC);
-    if (writer < 0) return -1;
+    if (!rewrite.before) {
+        os_err read_rc = os_file_read(source, out, size / 2u, got);
+        if (read_rc != OS_OK) return read_rc;
+    }
+    os_file writer = OS_FILE_INIT;
+    if (os_file_open(&writer, rewrite.path, OS_OPEN_WRITE) != OS_OK) return OS_E_IO;
     const char changed[] = "rewritten";
-    ssize_t wrote = pwrite(writer, changed, sizeof changed - 1u, 0);
-    close(writer);
-    if (wrote != (ssize_t)(sizeof changed - 1u)) return -1;
-    return rewrite.before ? read(fd, out, size) : n;
+    size_t wrote;
+    os_err written = os_file_pwrite(&writer, changed, sizeof changed - 1u, 0, &wrote);
+    os_file_close(&writer);
+    if (written != OS_OK || wrote != sizeof changed - 1u) return OS_E_IO;
+    return rewrite.before ? os_file_read(source, out, size, got) : OS_OK;
 }
-#define read materialize_read
+#define os_file_read materialize_read
 #include "../src/editor/recovery.c"
-#undef read
+#undef os_file_read
 
 #define T(c) do { if (!(c)) { fprintf(stderr, "editor_recovery_test:%d FAIL %s\n", __LINE__, #c); rc = 1; goto done; } } while (0)
 static int changed_materialization(bool before)

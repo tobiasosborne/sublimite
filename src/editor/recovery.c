@@ -1,17 +1,41 @@
 /* Startup only: validate and replay before any editor frame is submitted. Keep
  * the prior artifact until a complete recovered checkpoint is durable. */
+/* Unported editor storage in private.h still names pthread types. */
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "editor/private.h"
-#include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
+
+static void path_slashes(char *path)
+{
+#if defined(_WIN32)
+    for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+#else
+    (void)path;
+#endif
+}
+static void path_parent(char *path, char *slash)
+{
+    bool root = slash == path;
+#if defined(_WIN32)
+    if (slash == path + 2 && path[1] == ':') root = true;
+#endif
+    if (!slash) strcpy(path, ".");
+    else if (root) slash[1] = 0;
+    else *slash = 0;
+}
+static bool canonical_path(const char *path, char *out, size_t cap)
+{
+    if (os_path_canonical(path, out, cap) != OS_OK) return false;
+    path_slashes(out); return true;
+}
+
+/* Portable ownership transfer; the legacy private.h entry remains for Linux. */
+int editor_restore_defer_file(editor *e, const char *directory, const char *source, os_file lease);
 
 /* edit-4da: the cost scan decides which buffers can replay only their ops.
  * COPY/whole-text buffers keep the existing materialised recovery path. */
@@ -151,24 +175,22 @@ static void fini(recovered_session *s)
  * across the complete read, and verify its pathname still selects it. */
 static int materialize_base(recovered_buffer *b, const journal_base *base)
 {
-    int fd = open(base->path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0) return JOURNAL_BASE_CHANGED;
+    os_file source = OS_FILE_INIT;
+    if (os_file_open(&source, base->path, OS_OPEN_READ | OS_OPEN_NONBLOCK) != OS_OK) return JOURNAL_BASE_CHANGED;
     os_stat st;
-    os_file source = os_file_from_fd(fd);
     file_id before = {0}, after = {0}, named = {0};
     int rc = os_file_stat(&source, &st) ? JOURNAL_BASE_CHANGED : 0;
     if (!rc) {
         file_id_from_stat(&before, &st);
-        if (before.type != S_IFREG || before.dev != base->device || before.ino != base->inode ||
+        if (st.kind != OS_KIND_FILE || before.dev != base->device || before.ino != base->inode ||
             before.size != base->size || before.mtime_ns != base->mtime_ns || before.ctime_ns != base->ctime_ns)
             rc = JOURNAL_BASE_CHANGED;
     }
     size_t done = 0;
     while (!rc && done < b->len) {
-        ssize_t n = read(fd, b->bytes + done, b->len - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { rc = JOURNAL_BASE_CHANGED; break; }
-        done += (size_t)n;
+        size_t n;
+        if (os_file_read(&source, b->bytes + done, b->len - done, &n) != OS_OK || !n) { rc = JOURNAL_BASE_CHANGED; break; }
+        done += n;
     }
     if (!rc && os_file_stat(&source, &st)) rc = JOURNAL_BASE_CHANGED;
     if (!rc) {
@@ -181,7 +203,7 @@ static int materialize_base(recovered_buffer *b, const journal_base *base)
         rc = journal_base_from_prefix(base->path, &after, b->bytes, b->len, &captured);
         if (!rc && !editor_base_id_matches(&b->base_id, &captured)) rc = JOURNAL_BASE_CHANGED;
     }
-    close(fd); return rc;
+    os_file_close(&source); return rc;
 }
 static int restore_record(void *ctx, const journal_record *r)
 {
@@ -297,16 +319,18 @@ static bool base_id_equal(const editor_base_id *a, const editor_base_id *b)
 static bool same_file(piece_tree *tree, const char *path, uint64_t size)
 {
     if (piece_len(tree) != size) return false;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return false;
+    os_file source = OS_FILE_INIT;
+    if (os_file_open(&source, path, OS_OPEN_READ | OS_OPEN_NOFOLLOW) != OS_OK) return false;
     uint8_t disk[JOURNAL_INSERT_SLICE_BYTES], text[JOURNAL_INSERT_SLICE_BYTES]; /* reuse the wire slice as a chunk */
     bool same = true;
     for (uint64_t off = 0; same && off < size;) {
         size_t n = size - off < sizeof disk ? (size_t)(size - off) : sizeof disk;
-        ssize_t got = pread(fd, disk, n, (off_t)off);
-        same = got == (ssize_t)n && !piece_read(tree, off, text, n) && !memcmp(disk, text, n);
+        size_t got;
+        same = os_file_pread(&source, disk, n, off, &got) == OS_OK && got == n &&
+            !piece_read(tree, off, text, n) && !memcmp(disk, text, n);
         off += n;
     }
-    close(fd); return same;
+    os_file_close(&source); return same;
 }
 /* Ops were validated against the replayed length when logged; a failing
  * piece op leaves its own call's content unchanged and the caller then
@@ -346,8 +370,7 @@ static int install_buffer(editor *e, recovered_buffer *r)
     if (rc) return rc;
     /* Attach without running editor_step or starting scans of unreplayed text. */
     while (b->pending_open && !file_open_ready(b->file)) {
-        struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
-        if (poll(&ready, 1, -1) < 0 && errno != EINTR) return EDITOR_ERR_IO;
+        if (os_wake_wait(work_pool_wake(&e->pool), -1) != OS_OK) return EDITOR_ERR_IO;
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
         if (b->operation_error) return EDITOR_ERR_IO;
     }
@@ -523,17 +546,17 @@ static int lock_name(char *out, size_t cap, const char *path)
  * streaming replay stops at the first changed BASE without truncating. */
 static int replay_tolerant(const char *path, recovered_session *s)
 {
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return JOURNAL_IO;
-    struct stat st; uint8_t *bytes = NULL; size_t size = 0, done = 0; int rc = 0;
-    if (fstat(fd, &st) || st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX) rc = JOURNAL_IO;
-    else { size = (size_t)st.st_size; bytes = size ? malloc(size) : NULL; if (size && !bytes) rc = JOURNAL_NOMEM; }
+    os_file source = OS_FILE_INIT;
+    if (os_file_open(&source, path, OS_OPEN_READ | OS_OPEN_NOFOLLOW) != OS_OK) return JOURNAL_IO;
+    os_stat st; uint8_t *bytes = NULL; size_t size = 0, done = 0; int rc = 0;
+    if (os_file_stat(&source, &st) != OS_OK || st.size > SIZE_MAX) rc = JOURNAL_IO;
+    else { size = (size_t)st.size; bytes = size ? malloc(size) : NULL; if (size && !bytes) rc = JOURNAL_NOMEM; }
     while (!rc && done < size) {
-        ssize_t n = read(fd, bytes + done, size - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { rc = JOURNAL_IO; break; }
-        done += (size_t)n;
+        size_t n;
+        if (os_file_read(&source, bytes + done, size - done, &n) != OS_OK || !n) { rc = JOURNAL_IO; break; }
+        done += n;
     }
-    close(fd);
+    os_file_close(&source);
     journal_replay_result result;
     s->tolerant = true;
     if (!rc) rc = journal_replay_bytes(bytes, size, restore_record, s, &result);
@@ -543,10 +566,12 @@ static int replay_tolerant(const char *path, recovered_session *s)
  * dotted name, which session discovery skips; never replace an existing name. */
 int editor_set_aside(const char *path, char *out, size_t cap)
 {
-    struct timespec now; if (clock_gettime(CLOCK_REALTIME, &now)) return EDITOR_ERR_IO;
-    int n = snprintf(out, cap, "%s.set-aside-%lld%09ld", path, (long long)now.tv_sec, now.tv_nsec);
+    uint64_t now = os_wall_ns();
+    /* (P) nanoseconds per second, matching the previous timespec suffix. */
+    int n = snprintf(out, cap, "%s.set-aside-%llu%09llu", path,
+        (unsigned long long)(now / UINT64_C(1000000000)), (unsigned long long)(now % UINT64_C(1000000000)));
     if (n < 0 || (size_t)n >= cap) { *out = 0; return EDITOR_ERR_ARG; }
-    if (renameat2(AT_FDCWD, path, AT_FDCWD, out, RENAME_NOREPLACE)) { *out = 0; return EDITOR_ERR_IO; }
+    if (os_rename(path, out, OS_RENAME_NOREPLACE) != OS_OK) { *out = 0; return EDITOR_ERR_IO; }
     return 0;
 }
 /* edit-rzj: capacity comes from the configured live/closed tab pools, not a
@@ -610,9 +635,9 @@ static int restore_source(editor *e, const char *directory, const char *previous
             "session recovery failed; its journal was set aside";
         e->recovery_notice_mutations = e->stats.mutations;
         (void)editor_set_aside(previous, e->recovery_aside, sizeof e->recovery_aside);
-        if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
-        int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) { (void)fsync(fd); close(fd); }
+        if (!lock_name(lock_path, sizeof lock_path, previous)) (void)os_unlink(lock_path);
+        os_dir dir = OS_DIR_INIT;
+        if (os_dir_open(&dir, directory) == OS_OK) { (void)os_dir_sync(&dir); os_dir_close(&dir); }
         fini(&session); return 0;
     }
     /* Failure never retires the recovery source. Corrupt/torn tails are replay's
@@ -622,22 +647,26 @@ static int restore_source(editor *e, const char *directory, const char *previous
         /* edit-ivv: no durable replacement yet; retire after the owed one. */
         if (!e->recover_existing) strcpy(e->busy_source, previous); /* both IPC_PATH_CAP */
     } else if (!rc && session.buffers) {
-        if (!e->recover_existing && unlink(previous)) rc = EDITOR_ERR_IO;
+        if (!e->recover_existing && os_unlink(previous) != OS_OK) rc = EDITOR_ERR_IO;
         else if (!e->recover_existing) {
-            if (!lock_name(lock_path, sizeof lock_path, previous)) (void)unlink(lock_path);
+            if (!lock_name(lock_path, sizeof lock_path, previous)) (void)os_unlink(lock_path);
         }
-        int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd < 0 || fsync(fd)) rc = EDITOR_ERR_IO;
-        if (fd >= 0) close(fd);
+        os_dir dir = OS_DIR_INIT;
+        if (os_dir_open(&dir, directory) != OS_OK || os_dir_sync(&dir) != OS_OK) rc = EDITOR_ERR_IO;
+        os_dir_close(&dir);
         if (!rc) {
             /* The durable CURRENT checkpoint no longer references private
              * generations retained by an interrupted save. Retire only journal
              * retention names beside this session's canonical directory. */
             char canonical[IPC_PATH_CAP];
-            if (realpath(directory, canonical)) for (recovered_buffer *b = session.buffers; b; b = b->next) {
-                size_t length = strlen(canonical);
-                if (*b->retained && !strncmp(b->retained, canonical, length) && b->retained[length] == '/' &&
-                    !strchr(b->retained + length + 1, '/')) (void)unlink(b->retained);
+            if (canonical_path(directory, canonical, sizeof canonical)) {
+                os_dir retained = OS_DIR_INIT;
+                if (os_dir_open(&retained, canonical) == OS_OK) for (recovered_buffer *b = session.buffers; b; b = b->next) {
+                    size_t length = strlen(canonical);
+                    if (*b->retained && !strncmp(b->retained, canonical, length) && b->retained[length] == '/' &&
+                        !strchr(b->retained + length + 1, '/')) (void)os_unlink_at(&retained, b->retained + length + 1);
+                }
+                os_dir_close(&retained);
             }
         }
     }
@@ -650,11 +679,11 @@ static int restore_source(editor *e, const char *directory, const char *previous
  * when a source is empty or retained because capacity is exhausted.
  * (P) Zero is empty/equality/success; negative descriptors mean no lease.
  * POSIX 0600 grants only the owner read/write on the existing lease file. */
-static bool newer_source(struct timespec a, const char *a_path, struct timespec b, const char *b_path)
+static bool newer_source(int64_t a, const char *a_path, int64_t b, const char *b_path)
 {
-    return a.tv_sec > b.tv_sec || (a.tv_sec == b.tv_sec &&
-        (a.tv_nsec > b.tv_nsec || (a.tv_nsec == b.tv_nsec && strcmp(a_path, b_path) > 0)));
+    return a > b || (a == b && strcmp(a_path, b_path) > 0);
 }
+
 /* edit-4da: preserve fm4's single-read-pass model, but an op-only mapped
  * install touches the acquisition prefix and deleted ORIGINAL bytes, not
  * every kept BASE byte. (P) UINT64_MAX is the over-bound sentinel. */
@@ -681,7 +710,7 @@ static int cost_record(void *ctx, const journal_record *r)
     } else if (b && r->type == JOURNAL_TARGET) {
         if (strcmp(b->path, (const char *)r->data)) {
             char canonical[IPC_PATH_CAP];
-            if (!realpath((const char *)r->data, canonical) || strcmp(b->path, canonical)) b->mapped = false;
+            if (!canonical_path((const char *)r->data, canonical, sizeof canonical) || strcmp(b->path, canonical)) b->mapped = false;
         }
     } else if (b && r->type == JOURNAL_VIEW) {
         journal_view_state saved_view;
@@ -717,37 +746,44 @@ static bool restore_deferred(const editor *e, const char *path, uint64_t size, r
     return total > JOURNAL_STARTUP_SCAN_BYTES;
 }
 static int discover_source(editor *e, const char *directory, const char *before,
-    struct timespec cutoff, char *previous, struct timespec *newest, int *previous_fd, uint64_t *size)
+    int64_t cutoff, char *previous, int64_t *newest, os_file *previous_file, uint64_t *size)
 {
-    DIR *dir = opendir(directory); if (!dir) return EDITOR_ERR_IO;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (strncmp(entry->d_name, "session-", strlen("session-"))) continue;
-        /* mkstemp names have no suffix. Ignore retained SAVE originals and
-         * checkpoint temporaries, which share the prefix but contain a dot. */
-        if (strchr(entry->d_name, '.')) continue;
+    os_dir dir = OS_DIR_INIT; os_dir_iter it;
+    if (os_dir_open(&dir, directory) != OS_OK) return EDITOR_ERR_IO;
+    if (os_dir_iter_open(&it, &dir) != OS_OK) { os_dir_close(&dir); return EDITOR_ERR_IO; }
+    char current[IPC_PATH_CAP]; strcpy(current, e->cfg.journal_path); path_slashes(current);
+    const char *entry; os_err next;
+    while ((next = os_dir_next(&it, &entry)) == OS_OK && entry) {
+        if (strncmp(entry, "session-", strlen("session-")) || strchr(entry, '.')) continue;
         char candidate[IPC_PATH_CAP], lock_path[IPC_PATH_CAP];
-        int n = snprintf(candidate, sizeof candidate, "%s/%s", directory, entry->d_name);
-        if (n < 0 || (size_t)n >= sizeof candidate || !strcmp(candidate, e->cfg.journal_path)) continue;
-        int fd = open(candidate, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-        if (fd < 0) continue;
-        struct stat st;
-        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_size) { close(fd); continue; }
-        if (*before && !newer_source(cutoff, before, st.st_mtim, candidate)) { close(fd); continue; }
-        if (lock_name(lock_path, sizeof lock_path, candidate)) { close(fd); continue; }
-        int lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-        close(fd); fd = lock;
-        if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) { if (fd >= 0) close(fd); continue; }
-        if (*previous_fd < 0 || newer_source(st.st_mtim, candidate, *newest, previous)) {
-            if (*previous_fd >= 0) close(*previous_fd);
-            *previous_fd = fd; *newest = st.st_mtim; strcpy(previous, candidate); *size = (uint64_t)st.st_size;
-        } else close(fd);
+        int n = snprintf(candidate, sizeof candidate, "%s/%s", directory, entry);
+        if (n < 0 || (size_t)n >= sizeof candidate || !strcmp(candidate, current)) continue;
+        os_file source = OS_FILE_INIT;
+        if (os_file_open_at(&source, &dir, entry, OS_OPEN_READ | OS_OPEN_NOFOLLOW | OS_OPEN_NONBLOCK) != OS_OK) continue;
+        os_stat st;
+        os_err stated = os_file_stat(&source, &st); os_file_close(&source);
+        if (stated != OS_OK || st.kind != OS_KIND_FILE || !st.size) continue;
+        if (*before && !newer_source(cutoff, before, st.mtime_ns, candidate)) continue;
+        n = snprintf(lock_path, sizeof lock_path, ".%s.lock", entry);
+        if (n < 0 || (size_t)n >= sizeof lock_path) continue;
+        os_file lease = OS_FILE_INIT;
+        if (os_file_open_at(&lease, &dir, lock_path, OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_NOFOLLOW) != OS_OK ||
+            os_file_try_lock(&lease, OS_LOCK_EXCLUSIVE) != OS_OK) { os_file_close(&lease); continue; }
+        if (!os_file_is_open(previous_file) || newer_source(st.mtime_ns, candidate, *newest, previous)) {
+            os_file_close(previous_file);
+            *previous_file = lease; *newest = st.mtime_ns; strcpy(previous, candidate); *size = st.size;
+        } else os_file_close(&lease);
     }
-    closedir(dir); return 0;
+    os_dir_iter_close(&it); os_dir_close(&dir);
+    return next == OS_OK ? 0 : EDITOR_ERR_IO;
 }
+
 int editor_session_restore(editor *e)
 {
-    const char *path = e->cfg.journal_path;
+    char normalized[IPC_PATH_CAP];
+    if (strlen(e->cfg.journal_path) >= sizeof normalized) return EDITOR_ERR_ARG;
+    strcpy(normalized, e->cfg.journal_path); path_slashes(normalized);
+    const char *path = normalized;
     const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
     if (!e->recover_existing && strncmp(name, "session-", strlen("session-"))) return 0;
     char lock_path[IPC_PATH_CAP];
@@ -757,30 +793,43 @@ int editor_session_restore(editor *e)
          * visible (journal_session_create). Share its open file description:
          * a second flock on a new description would conflict with it. Refuse
          * a descriptor that does not guard this journal's lock name. */
-        struct stat held, named;
-        e->session_lock = fcntl(*e->cfg.session_lease, F_DUPFD_CLOEXEC, 0);
-        if (e->session_lock < 0 || fstat(e->session_lock, &held) || stat(lock_path, &named) ||
-            held.st_dev != named.st_dev || held.st_ino != named.st_ino) return EDITOR_ERR_IO;
+#if defined(_WIN32)
+        /* editor_config still carries the Linux lease API until W2.4d. */
+        return EDITOR_ERR_ARG;
+#else
+        os_stat held, named; os_file lease = OS_FILE_INIT;
+        os_file creator = os_file_from_fd(*e->cfg.session_lease);
+        if (os_file_dup(&lease, &creator) != OS_OK) return EDITOR_ERR_IO;
+        e->session_lock = os_file_fd(&lease);
+        if (os_file_stat(&lease, &held) != OS_OK || os_stat_path(lock_path, 0, &named) != OS_OK ||
+            !os_identity_equal(&held.id, &named.id)) return EDITOR_ERR_IO;
+#endif
     } else {
-        e->session_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (e->session_lock < 0 || flock(e->session_lock, LOCK_EX | LOCK_NB)) return EDITOR_ERR_IO;
+        os_file lease = OS_FILE_INIT;
+        if (os_file_open(&lease, lock_path, OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_NOFOLLOW) != OS_OK) return EDITOR_ERR_IO;
+#if defined(_WIN32)
+        e->session_lock = lease;
+#else
+        e->session_lock = os_file_fd(&lease);
+#endif
+        if (os_file_try_lock(&lease, OS_LOCK_EXCLUSIVE) != OS_OK) return EDITOR_ERR_IO;
     }
     e->session_lock_owned = true;
     if (e->recovery_skip) return 0; /* edit-btj retry: own lease only, no discovery */
     char directory[IPC_PATH_CAP]; strcpy(directory, path);
     char *slash = strrchr(directory, '/');
-    if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
+    path_parent(directory, slash);
     /* Housekeeping is best effort: a failed barrier leaves safe retired bytes,
      * and a busy lease preserves the source. Never block session recovery. */
     (void)journal_retire_directory(directory, path);
     if (e->recover_existing) return restore_source(e, directory, path, NULL);
     char before[IPC_PATH_CAP] = "";
-    struct timespec cutoff = {0};
+    int64_t cutoff = 0;
     for (;;) {
-        char previous[IPC_PATH_CAP] = ""; int previous_fd = -1;
-        struct timespec newest = {0}; uint64_t size = 0;
-        int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_fd, &size);
-        if (rc || previous_fd < 0) return rc;
+        char previous[IPC_PATH_CAP] = ""; os_file previous_file = OS_FILE_INIT;
+        int64_t newest = 0; uint64_t size = 0;
+        int rc = discover_source(e, directory, before, cutoff, previous, &newest, &previous_file, &size);
+        if (rc || !os_file_is_open(&previous_file)) { os_file_close(&previous_file); return rc; }
         strcpy(before, previous); cutoff = newest;
         recovery_cost cost = {0};
         if (restore_deferred(e, previous, size, &cost)) {
@@ -792,18 +841,22 @@ int editor_session_restore(editor *e)
             /* edit-qct: listed as a recoverable closed tab holding the lease,
              * restored lazily on reopen (restore.c). A full closed-tab pool
              * leaves the remainder counted only, as fm4 did. */
-            bool listed = editor_restore_defer(e, directory, previous, previous_fd) == 0;
+            bool listed = editor_restore_defer_file(e, directory, previous, previous_file) == 0;
             e->recovery_notice = listed ? "large session journal kept as a closed tab; reopen it to restore" :
                 "large session journal kept for recovery; not replayed at startup (closed-tab pool full)";
             e->recovery_notice_mutations = e->stats.mutations;
-            if (!listed) close(previous_fd);
+            if (!listed) os_file_close(&previous_file);
             continue;
         }
         rc = restore_source(e, directory, previous, &cost);
         cost_fini(&cost);
         /* edit-ivv: a source awaiting the owed checkpoint keeps its lease. */
-        if (!rc && *e->busy_source && e->busy_source_lease < 0) e->busy_source_lease = previous_fd;
-        else close(previous_fd);
+#if defined(_WIN32)
+        if (!rc && *e->busy_source && !os_file_is_open(&e->busy_source_lease)) e->busy_source_lease = previous_file;
+#else
+        if (!rc && *e->busy_source && e->busy_source_lease < 0) e->busy_source_lease = os_file_fd(&previous_file);
+#endif
+        else os_file_close(&previous_file);
         if (rc) return rc;
         if (e->busy_checkpoint) return 0; /* edit-ivv: later sources stay discoverable */
     }
@@ -816,15 +869,19 @@ void editor_recovery_owed_done(editor *e)
     e->busy_checkpoint = false;
     if (*e->busy_source) {
         char lock_path[IPC_PATH_CAP], directory[IPC_PATH_CAP];
-        (void)unlink(e->busy_source);
-        if (!lock_name(lock_path, sizeof lock_path, e->busy_source)) (void)unlink(lock_path);
+        (void)os_unlink(e->busy_source);
+        if (!lock_name(lock_path, sizeof lock_path, e->busy_source)) (void)os_unlink(lock_path);
         strcpy(directory, e->busy_source);
         char *slash = strrchr(directory, '/');
-        if (slash == directory) slash[1] = 0; else if (slash) *slash = 0; else strcpy(directory, ".");
-        int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) { (void)fsync(fd); close(fd); }
+        path_parent(directory, slash);
+        os_dir dir = OS_DIR_INIT;
+        if (os_dir_open(&dir, directory) == OS_OK) { (void)os_dir_sync(&dir); os_dir_close(&dir); }
         e->busy_source[0] = 0;
     }
-    if (e->busy_source_lease >= 0) close(e->busy_source_lease);
+#if defined(_WIN32)
+    os_file_close(&e->busy_source_lease);
+#else
+    os_file lease = os_file_from_fd(e->busy_source_lease); os_file_close(&lease);
     e->busy_source_lease = -1; /* (P) no descriptor */
+#endif
 }

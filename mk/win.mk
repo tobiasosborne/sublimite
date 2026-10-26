@@ -54,6 +54,10 @@ $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
 
 win-compile: $(WIN_REL_OBJ)
 
+# W2.4b: filesystem units only; editor linking follows in W2.4d.
+.PHONY: win-editor-fs
+win-editor-fs: $(addprefix $(WIN_B)/rel/src/editor/,$(addsuffix .o,recovery restore runtime retain session))
+
 $(WIN_REL_LIB): $(WIN_REL_OBJ)
 	$(WIN_AR) rcs $@ $^
 $(WIN_SAN_LIB): $(WIN_SAN_OBJ)

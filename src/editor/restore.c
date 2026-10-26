@@ -7,16 +7,16 @@
  * acquisition (mapped for large files), applies the program when the original
  * is attached, swaps the result into the placeholder's tab and checkpoints it.
  * The UI thread never reads the journal; it copies only journalled bytes. */
+/* Unported editor storage in private.h still names pthread types. */
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "editor/private.h"
 #include <errno.h>
-#include <fcntl.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 enum { RESTORE_IDLE, RESTORE_SCANNING, RESTORE_OPENING, RESTORE_RETRY, RESTORE_DONE }; /* edit-ivv: RETRY waits a journal tick */
 typedef struct restore_op { size_t buffer; uint64_t off, len; const uint8_t *data; bool insert; } restore_op;
@@ -37,7 +37,8 @@ struct editor_restore {
     work_pool *pool;
     size_t *active;              /* editor.restore_active while SCANNING or OPENING */
     char journal[IPC_PATH_CAP], directory[IPC_PATH_CAP];
-    int lease, state, scan_rc;
+    os_file lease;
+    int state, scan_rc;
     int fault;                   /* edit-601 test seam (editor.restore_fault), consumed by one scan */
     work_handle job;
     uint32_t generation;
@@ -197,40 +198,42 @@ static int trim(restore_scan *s, editor_restore_buffer *b)
 {
     restore_text *t = &b->text; text_move(t, t->len);
     uint64_t m = b->base.size, n = t->len, p = 0, q = 0, limit = m < n ? m : n;
-    int fd = open(b->base_path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st) || (uint64_t)st.st_size != m) { if (fd >= 0) close(fd); b->conflict = b->owner->conflicts = true; return 0; }
+    os_file source = OS_FILE_INIT; os_stat st;
+    if (os_file_open(&source, b->base_path, OS_OPEN_READ | OS_OPEN_NONBLOCK) != OS_OK ||
+        os_file_stat(&source, &st) != OS_OK || st.size != m) {
+        os_file_close(&source); b->conflict = b->owner->conflicts = true; return 0;
+    }
     uint8_t chunk[JOURNAL_INSERT_SLICE_BYTES];
     int rc = 0;
     while (!rc && p < limit) {
         size_t want = limit - p < sizeof chunk ? (size_t)(limit - p) : sizeof chunk, k = 0;
-        ssize_t got = pread(fd, chunk, want, (off_t)p);
-        if (got <= 0) { rc = got < 0 && errno == EINTR ? 0 : JOURNAL_IO; if (rc) break; continue; }
-        while (k < (size_t)got && chunk[k] == t->bytes[p + k]) k++;
-        p += k; if (k < (size_t)got) break;
+        size_t got;
+        if (os_file_pread(&source, chunk, want, p, &got) != OS_OK || !got) { rc = JOURNAL_IO; break; }
+        while (k < got && chunk[k] == t->bytes[p + k]) k++;
+        p += k; if (k < got) break;
         if (work_should_stop(s->c)) rc = JOURNAL_CALLBACK;
     }
     while (!rc && q < limit - p) {
         uint64_t left = limit - p - q;
         size_t want = left < sizeof chunk ? (size_t)left : sizeof chunk, k = 0;
-        ssize_t got = pread(fd, chunk, want, (off_t)(m - q - want));
-        if (got != (ssize_t)want) { if (got < 0 && errno == EINTR) continue; rc = JOURNAL_IO; break; }
+        size_t got;
+        if (os_file_pread(&source, chunk, want, m - q - want, &got) != OS_OK || got != want) { rc = JOURNAL_IO; break; }
         while (k < want && chunk[want - 1 - k] == t->bytes[n - q - 1 - k]) k++;
         q += k; if (k < want) break;
         if (work_should_stop(s->c)) rc = JOURNAL_CALLBACK;
     }
-    close(fd); if (rc) return rc;
+    os_file_close(&source); if (rc) return rc;
     if (m - p - q) rc = push_op(b->owner, b->index, false, p, m - p - q, NULL);
     if (!rc && n - p - q) rc = push_op(b->owner, b->index, true, p, n - p - q, t->bytes + p);
     return rc;
 }
 static int scan(editor_restore *r, work_ctx *c)
 {
-    struct stat st;
+    os_stat st;
     if (r->fault) return r->fault;
-    if (stat(r->journal, &st) || st.st_size < 0) return JOURNAL_IO;
+    if (os_stat_path(r->journal, 0, &st) != OS_OK) return JOURNAL_IO;
     /* (P) every journalled insert byte is a byte of the journal file. */
-    if (edit_arena_init(&r->payload, (size_t)st.st_size + 1u)) return JOURNAL_NOMEM;
+    if (edit_arena_init(&r->payload, (size_t)st.size + 1u)) return JOURNAL_NOMEM;
     restore_scan s = {r, c}; journal_replay_result result;
     /* Read-only: a torn tail is the accepted prefix (as journal_replay_file
      * would truncate to), but the source keeps every byte until retirement. */
@@ -267,7 +270,7 @@ static void restore_job(work_ctx *c)
     work_msg msg = {.kind = EDITOR_RESTORE_MSG, .generation = r->generation};
     memcpy(msg.data, &r, sizeof r);
     /* The completion only wakes the UI loop; service also polls the handle. */
-    while (!work_publish(c, &msg) && !work_should_stop(c)) sched_yield();
+    while (!work_publish(c, &msg) && !work_should_stop(c)) os_yield();
 }
 
 /* ---- lifetime ------------------------------------------------------------- */
@@ -289,7 +292,7 @@ static void job_quiesce(editor_restore *r)
 {
     if (!r->job.epoch) return;
     work_cancel(r->pool, r->job);
-    while (!work_handle_finished(r->pool, r->job)) sched_yield();
+    while (!work_handle_finished(r->pool, r->job)) os_yield();
     (void)work_mailbox_bind(r->pool, r->job, 0, NULL, NULL);
     r->job = (work_handle){0};
 }
@@ -300,7 +303,7 @@ void editor_restore_free(editor_restore *r)
     if ((r->state == RESTORE_SCANNING || r->state == RESTORE_OPENING || r->state == RESTORE_RETRY) && *r->active) --*r->active;
     job_quiesce(r);
     program_free(r);
-    if (r->lease >= 0) close(r->lease);
+    os_file_close(&r->lease);
     free(r);
 }
 
@@ -318,7 +321,7 @@ static int probe_record(void *ctx, const journal_record *rec)
     }
     return rec->type == JOURNAL_INSERT || rec->type == JOURNAL_DELETE ? JOURNAL_CALLBACK : 0;
 }
-int editor_restore_defer(editor *e, const char *directory, const char *source, int lease)
+int editor_restore_defer_file(editor *e, const char *directory, const char *source, os_file lease)
 {
     size_t free_slot = 0;
     while (free_slot < e->buffer_capacity && e->buffers[free_slot]) free_slot++;
@@ -330,7 +333,7 @@ int editor_restore_defer(editor *e, const char *directory, const char *source, i
     (void)journal_scan_file(source, probe_record, &probe, &result);
     const char *name = *probe.path ? probe.path : source;
     editor_restore *r = calloc(1, sizeof *r); if (!r) return EDITOR_ERR_MEMORY;
-    r->pool = &e->pool; r->active = &e->restore_active; r->lease = -1;
+    r->pool = &e->pool; r->active = &e->restore_active; r->lease = (os_file)OS_FILE_INIT;
     if (strlen(source) >= sizeof r->journal || strlen(directory) >= sizeof r->directory) { free(r); return EDITOR_ERR_ARG; }
     strcpy(r->journal, source); strcpy(r->directory, directory);
     editor_buffer *b = NULL; int rc = editor_buffer_prepare(e, NULL, NULL, 0, &b);
@@ -440,7 +443,7 @@ static int restore_fail(editor *e, editor_buffer *p, int rc)
     } else e->recovery_notice = "large session journal could not be restored; journal retained";
     e->recovery_notice_mutations = e->stats.mutations;
     program_free(r); r->state = RESTORE_DONE; e->restore_active--;
-    if (r->lease >= 0) { close(r->lease); r->lease = -1; }
+    os_file_close(&r->lease);
     p->placeholder = false;
     if (e->recovery_placeholder_ids) e->recovery_placeholder_ids--;
     size_t index = live_index(e, p->id);
@@ -676,7 +679,7 @@ static int install_all(editor *e, editor_buffer *p)
          * of these edits: never unlink or set it aside. */
         e->recovery_notice = "large session restored; its journal is kept (this launch has no session journal)";
         e->recovery_notice_mutations = e->stats.mutations;
-        if (r->lease >= 0) { close(r->lease); r->lease = -1; }
+        os_file_close(&r->lease);
         program_free(r); r->state = RESTORE_DONE; e->restore_active--;
         return 0;
     }
@@ -685,16 +688,16 @@ static int install_all(editor *e, editor_buffer *p)
         if (!editor_set_aside(r->journal, aside, sizeof aside)) strcpy(e->recovery_aside, aside);
     } else {
         e->recovery_notice = NULL;
-        (void)unlink(r->journal);
+        (void)os_unlink(r->journal);
     }
     e->recovery_notice_mutations = e->stats.mutations;
     const char *leaf = strrchr(r->journal, '/');
     size_t parent = leaf ? (size_t)(leaf - r->journal) + 1 : 0;
     int len = snprintf(lock, sizeof lock, "%.*s.%s.lock", (int)parent, r->journal, r->journal + parent);
-    if (len > 0 && (size_t)len < sizeof lock) (void)unlink(lock);
-    int fd = open(r->directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd >= 0) { (void)fsync(fd); close(fd); }
-    if (r->lease >= 0) { close(r->lease); r->lease = -1; }
+    if (len > 0 && (size_t)len < sizeof lock) (void)os_unlink(lock);
+    os_dir dir = OS_DIR_INIT;
+    if (os_dir_open(&dir, r->directory) == OS_OK) { (void)os_dir_sync(&dir); os_dir_close(&dir); }
+    os_file_close(&r->lease);
     program_free(r); r->state = RESTORE_DONE; e->restore_active--;
     return 0;
 }
@@ -720,3 +723,10 @@ int editor_restore_service(editor *e)
     }
     return 0;
 }
+
+#if !defined(_WIN32)
+int editor_restore_defer(editor *e, const char *directory, const char *source, int lease)
+{
+    return editor_restore_defer_file(e, directory, source, os_file_from_fd(lease));
+}
+#endif

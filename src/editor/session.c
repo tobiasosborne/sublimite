@@ -1,14 +1,16 @@
 /* Published immutable session graph. Save input pins a root and selected
  * snapshot; complete checkpoint encoding and all filesystem work are bulk jobs. */
+/* Unported editor storage in private.h still names pthread types. */
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
-#include <sched.h>
 #include <stdatomic.h>
 
 typedef struct session_node {
@@ -50,7 +52,7 @@ typedef struct session_capture {
 /* (P) independent per-slot bits: retained BASE versus complete snapshot. */
 enum { SESSION_RETAINED = 1u << 0, SESSION_DETACHED = 1u << 1 };
 struct editor_session {
-    pthread_mutex_t mutex;
+    os_mutex mutex;
     session_node *nodes, *free, *root;
     size_t width;
     session_capture capture;
@@ -118,7 +120,7 @@ int editor_session_init(editor *e)
      * structural reservation, derived from binary-tree ownership). */
     size_t count = 3 * (2 * s->width - 1);
     s->nodes = calloc(count, sizeof *s->nodes);
-    if (!s->nodes || pthread_mutex_init(&s->mutex, NULL)) { free(s->nodes); free(s); return EDITOR_ERR_MEMORY; }
+    if (!s->nodes || os_mutex_init(&s->mutex)) { free(s->nodes); free(s); return EDITOR_ERR_MEMORY; }
     for (size_t i = 0; i < count; i++) { s->nodes[i].next = s->free; s->free = &s->nodes[i]; }
     e->session = s; return 0;
 }
@@ -128,7 +130,7 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     if (!s || !b->id || !editor_tab_recorded(b) || e->recovering || /* edit-qct; edit-n95; edit-uzrb */
         (b == e->buffer && (e->action == EDITOR_ACTION_REPLAY_WORK ||
          e->action == EDITOR_ACTION_CLIP || e->find_replace_active || e->journal_group_open))) return;
-    pthread_mutex_lock(&s->mutex);
+    os_mutex_lock(&s->mutex);
     session_node *old = leaf_at(s, b->session_slot);
     bool content = !old || old->buffer != b || old->revision != b->revision;
     if (!content && old->live == live && old->rank == rank &&
@@ -136,11 +138,11 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
         old->base.inode == b->base.inode && old->base.ctime_ns == b->base.ctime_ns &&
         !strcmp(old->base.path, b->base.path) && old->reference == b->saved_snapshot &&
         old->has_retained == editor_retain_matches(b, &b->base) &&
-        (!old->has_retained || old->retained.inode == b->retain.copy.inode)) { pthread_mutex_unlock(&s->mutex); return; }
+        (!old->has_retained || old->retained.inode == b->retain.copy.inode)) { os_mutex_unlock(&s->mutex); return; }
     piece_snapshot *snapshot = content ? piece_snapshot_take(b->tree) : piece_snapshot_retain(old->snapshot);
     /* Publication failure never changes a committed mutation. A later turn
      * retries; save refuses stale publication rather than saving old bytes. */
-    if (!snapshot) { pthread_mutex_unlock(&s->mutex); return; }
+    if (!snapshot) { os_mutex_unlock(&s->mutex); return; }
     session_node *leaf = node_alloc(s); EDIT_ASSERT(leaf);
     leaf->buffer = b; leaf->snapshot = snapshot; leaf->revision = b->revision;
     leaf->view = state; leaf->live = live; leaf->live_count = live ? 1u : 0u; leaf->rank = rank; base_copy(&leaf->base, &b->base);
@@ -150,7 +152,7 @@ static void publish(editor *e, editor_buffer *b, bool live, size_t rank, view_st
     if (leaf->has_retained) base_copy(&leaf->retained, &b->retain.copy);
     session_node *root = replace(s, s->root, s->width, b->session_slot, leaf);
     node_release(s, s->root); s->root = root;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
 }
 void editor_session_publish(editor *e, editor_buffer *b)
 {
@@ -166,20 +168,20 @@ void editor_session_publish(editor *e, editor_buffer *b)
 void editor_session_forget(editor *e, editor_buffer *b)
 {
     editor_session *s = e->session; if (!s) return;
-    pthread_mutex_lock(&s->mutex);
+    os_mutex_lock(&s->mutex);
     session_node *root = replace(s, s->root, s->width, b->session_slot, NULL);
     node_release(s, s->root); s->root = root;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
 }
 bool editor_session_retains(const editor *e, const editor_buffer *b, view_state *state)
 {
     editor_session *s = e->session;
     if (!s || !b || s->saving != b) return false;
     if (state) {
-        pthread_mutex_lock(&s->mutex);
+        os_mutex_lock(&s->mutex);
         session_node *leaf = leaf_at(s, b->session_slot);
         *state = leaf && leaf->buffer == b ? leaf->view : b->initial;
-        pthread_mutex_unlock(&s->mutex);
+        os_mutex_unlock(&s->mutex);
     }
     return true;
 }
@@ -347,8 +349,8 @@ static void release(void *ctx)
     free(c->maps); c->maps = NULL;
     if (c->reference) piece_snapshot_release(c->reference);
     c->reference = NULL;
-    pthread_mutex_lock(&c->owner->mutex); node_release(c->owner, c->root);
-    c->root = NULL; pthread_mutex_unlock(&c->owner->mutex);
+    os_mutex_lock(&c->owner->mutex); node_release(c->owner, c->root);
+    c->root = NULL; os_mutex_unlock(&c->owner->mutex);
 }
 /* edit-ze59 (recovery-3 F10): a complete checkpoint written by a worker that
  * owns the journal (the save controller's lease pattern: editor_save_leased
@@ -424,7 +426,7 @@ int editor_publish_start(editor *e)
         const editor_buffer *b = (const editor_buffer *)((const uint8_t *)tab->undo - offsetof(editor_buffer, undo));
         if (!b->placeholder && !b->derived) live++;
     }
-    pthread_mutex_lock(&s->mutex);
+    os_mutex_lock(&s->mutex);
     bool fresh = s->root && s->root->live_count == live;
     for (size_t i = 0; fresh && i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
@@ -432,13 +434,13 @@ int editor_publish_start(editor *e)
         session_node *leaf = leaf_at(s, b->session_slot);
         fresh = !b->pending_open && leaf && leaf->buffer == b && leaf->revision == b->revision;
     }
-    if (!fresh) { pthread_mutex_unlock(&s->mutex); return EDITOR_ERR_MEMORY; }
+    if (!fresh) { os_mutex_unlock(&s->mutex); return EDITOR_ERR_MEMORY; }
     editor_publish *p = calloc(1, sizeof *p);
     uint8_t *used = p ? calloc(s->width, sizeof *used) : NULL;
     file_source **sources = used ? calloc(s->width, sizeof *sources) : NULL;
-    if (!sources) { pthread_mutex_unlock(&s->mutex); free(used); free(p); return EDITOR_ERR_MEMORY; }
+    if (!sources) { os_mutex_unlock(&s->mutex); free(used); free(p); return EDITOR_ERR_MEMORY; }
     s->root->refs++;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
     p->capture = (session_capture){.owner = s, .root = s->root, .plain = true, .used = used,
         .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
         .width = e->font.window_width, .height = e->font.window_height};
@@ -488,7 +490,7 @@ int editor_publish_wait(editor *e)
         uint64_t now = trace_now_ns();
         if (!e->publish_deadline_ns) e->publish_deadline_ns = now + JOURNAL_DEFAULT_SYNC_NS;
         if (now >= e->publish_deadline_ns) return EDITOR_MORE;
-        sched_yield();
+        os_yield();
     }
     return rc;
 }
@@ -501,12 +503,22 @@ int editor_save_setup(editor *e, editor_buffer *b)
         baseline = *file_prefix_identity(b->file);
     } else {
         char parent[IPC_PATH_CAP]; strcpy(parent, b->path);
+#if defined(_WIN32)
+        for (char *p = parent; *p; p++) if (*p == '\\') *p = '/';
+#endif
         char *slash = strrchr(parent, '/'); const char *name = slash ? slash + 1 : b->path;
         char name_copy[IPC_PATH_CAP]; strcpy(name_copy, name);
-        if (slash == parent) slash[1] = 0;
+        bool root = slash == parent;
+#if defined(_WIN32)
+        if (slash == parent + 2 && parent[1] == ':') root = true;
+#endif
+        if (root) slash[1] = 0;
         else if (slash) *slash = 0;
         else strcpy(parent, ".");
-        char canonical[IPC_PATH_CAP]; if (!realpath(parent, canonical)) return EDITOR_ERR_IO;
+        char canonical[IPC_PATH_CAP]; if (os_path_canonical(parent, canonical, sizeof canonical) != OS_OK) return EDITOR_ERR_IO;
+#if defined(_WIN32)
+        for (char *p = canonical; *p; p++) if (*p == '\\') *p = '/';
+#endif
         int n = snprintf(path, sizeof path, "%s/%s", canonical, name_copy);
         if (n < 0 || (size_t)n >= sizeof path) return EDITOR_ERR_ARG;
         int rc = file_id_stat_path(path, &baseline); if (rc) return EDITOR_ERR_IO;
@@ -541,11 +553,11 @@ static void capture(editor *e, editor_buffer *b, uint64_t request_ns, bool finis
         .active_id = tabs_active(&e->tabs) ? tabs_active(&e->tabs)->id : 0,
         .request_ns = request_ns, .width = e->font.window_width,
         .height = e->font.window_height, .finish = finish, .cancelling = s->reconciling && !finish};
-    pthread_mutex_lock(&s->mutex); c->root->refs++;
+    os_mutex_lock(&s->mutex); c->root->refs++;
     session_node *leaf = leaf_at(s, b->session_slot);
     /* No leaf: start() refuses the NULL snapshot instead of dereferencing. */
     c->snapshot = leaf && leaf->buffer == b ? piece_snapshot_retain(leaf->snapshot) : NULL;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
     if (finish) {
         base_copy(&c->replacement, savectl_saved_base(b->save));
         /* edit-f3i: the replacement holds the bytes of the snapshot that
@@ -758,7 +770,7 @@ void editor_session_close(editor *e)
     /* edit-ze59: the worker checkpoint and a Save As write hold graph and
      * buffer leases; both finish before teardown. */
     for (int rc; e->publish && !editor_publish_poll(e, &rc);) {
-        (void)work_mailbox_drain(&e->pool, editor_route_work, e); sched_yield();
+        (void)work_mailbox_drain(&e->pool, editor_route_work, e); os_yield();
     }
     editor_save_as_close(e);
     if (s->pending) { piece_snapshot_release(s->capture.snapshot); release(&s->capture); s->pending = false; }
@@ -771,10 +783,10 @@ void editor_session_close(editor *e)
             savectl_tick(b->save);
             if (savectl_destroy(b->save) == SAVECTL_OK) break;
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
-            sched_yield();
+            os_yield();
         }
         b->save = NULL;
     }
-    pthread_mutex_lock(&s->mutex); node_release(s, s->root); pthread_mutex_unlock(&s->mutex);
-    pthread_mutex_destroy(&s->mutex); free(s->nodes); free(s); e->session = NULL;
+    os_mutex_lock(&s->mutex); node_release(s, s->root); os_mutex_unlock(&s->mutex);
+    os_mutex_destroy(&s->mutex); free(s->nodes); free(s); e->session = NULL;
 }
