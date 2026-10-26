@@ -404,3 +404,13 @@ editor/file integration forward with their ports; the shared OS fixture's
 fixed-name collision is outside this bead. The optional main pre-migration
 scratch build would require broader read authorization and was not necessary
 to demonstrate the inherited round-1 losses.
+
+## Coordinator verification (session 22)
+
+Rebased over W0.5, W1.2, W1.3 (mk/win.mk: `… font journal`, journal_os_test and journal_safety_test in WIN_TESTS, W2.2's WIN_COMPILE_MODULES line kept). On that tree, (M)[AC, desktop Spiral]:
+
+```
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:95 make -j64 check   → exit 0, 109 suites, LeakSanitizer on (13:47 → 14:18)
+make TARGET=win -j64 check    → 78 results exit=0 (every journal suite rel and san); two red: d3d11_test rel and san `first_frame == 0`, an already-landed W1.2 test that fails identically on main's own binary from 13:49 on (desktop foreground changed; environmental, edit-kv2g first item), not this bead
+```
