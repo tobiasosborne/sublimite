@@ -449,3 +449,14 @@ make TARGET=win -j64 check    → exit 0, 60 results all exit=0 (win32_plat_test
 make -j64 all                 → exit 0 (gcc 13)
 DISPLAY=:96 make -j64 check   → exit 0, 105 suites, 12:55:41 → 13:19:00, LeakSanitizer on
 ```
+
+## Coordinator verification 2 (session 22 wind-up)
+
+Re-rebased over W1.3 and W2.2 (mk/win.mk: `… font journal win32`, both WIN_LIBS sets, both white-box rule blocks; stale `libcore.a` purged). On that tree, (M)[AC, desktop Spiral]:
+
+```
+make TARGET=win -j64 check    → 81 results exit=0 (win32_plat_test rel and san among them); one red: rel d3d11_test `first_frame == 0`, W1.2's occlusion-sensitive test failing on main's own binary since 13:49 (edit-kv2g first item); its san build passed in this run
+make -j64 all                 → exit 0 (gcc 13)
+DISPLAY=:94 make -j64 check   → exit 0, 109 suites, LeakSanitizer on (14:25 → 14:56)
+```
+The earlier "deterministic on this tree" reading (13:49) was wrong: those reruns overlapped another worktree's Windows check and the desktop state had already changed.
