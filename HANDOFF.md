@@ -1,3 +1,17 @@
+# HANDOFF — sublimité, ThinkPad box, end of session 23 (2026-10-26 afternoon; Opus 5.5 in the main session, Tobias present; Spiral's session 22 runs in parallel, its section follows)
+
+## Read first
+**Look and feel on the Mint ThinkPad, two beads landed, installed at ~/.local/bin/sublimite:**
+- **edit-29y2 dark title bar:** new `plat_set_dark(plat *, bool)` in src/x11/plat.h (X11: `_GTK_THEME_VARIANT="dark"` set or deleted, which Muffin/Mutter read for the dark decoration; Wayland: no-op). Called before `plat_map` and on every preference apply. The dark theme's page, gutter, tab strip and caret ink are 0x222226 (Mint-Y-Dark wm_bg), active tab 0x2e2e33; panels read theme tokens. **For the Windows port (W1.1 edit-upwq, src/win32):** plat.h now has `plat_set_dark`; the win32 platform needs an implementation, and `DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on, sizeof on)` is the Windows equivalent of this hint (a no-op is also acceptable). It was not compiled with `make TARGET=win` here (no llvm-mingw on the ThinkPad).
+- **edit-36b3 app icon:** Bodoni Moda Italic é on the dark tile (Tobias's pick from docs/design/icon-workups-2026-10-26/, workup 04). tools/mkicon.py regenerates tools/sublimite.svg (paths only) and tools/icons/sublimite-{16,24,32,48}.png; `make install` installs all sizes.
+- Verification on the rebased tree (origin 9af5551 + the ThinkPad commits): full `make check` exit 0 (104 test binaries, 12:30-12:55 (M)[AC]), tools/test_install.sh PASS, `make install` done.
+
+**Box facts added:** `quota` is installed (/usr/bin/quota). Xvfb :95 and :99 up. CLAUDE.md law 1 changed upstream today: the Astra drive is no longer a hand-over gate; `make check` green plus the bead's verification is.
+
+**Open on this box, in order:** whatever Tobias reports from use (his look-and-feel asks are the current thread: further chrome from the 2026-10-21 workups, edit-b0j); P3 edit-8yer (stale runtime-identity script); edit-b3hk, edit-fi0p remainder. The Windows line is Spiral's.
+
+---
+
 # HANDOFF — sublimité, session 22 IN PROGRESS (2026-10-26 ~12:00 box clock; Fable consultant/coordinator in the main session; Tobias away from the desktop "for the next hours" (10:44) and has authorised windows opening on it)
 
 ## Read first (session 22 continuation or session 23)
