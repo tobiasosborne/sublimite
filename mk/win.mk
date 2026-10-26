@@ -143,6 +143,13 @@ $(WIN_B)/rel/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d11_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+# Platform contract suite includes its implementation for native API fixtures.
+$(WIN_B)/rel/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 # White-box journal transport shim; production has no per-syscall indirection.

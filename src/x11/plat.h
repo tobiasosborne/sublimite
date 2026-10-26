@@ -142,6 +142,9 @@ bool plat_poll_event(plat *p, plat_event *out);
 int  plat_clip_set(plat *p, int which, const void *utf8, size_t len);
 /* Asynchronous request; result arrives as PLAT_EV_CLIPBOARD, then plat_clip_data(). */
 int  plat_clip_request(plat *p, int which);
-/* Last received data (valid until the next request completes); NUL not guaranteed. */
+/* Last received data, associated with the completion currently being delivered.
+ * Remains valid until the next request completion is popped/delivered; merely
+ * queueing another request (including in its callback) does not invalidate it.
+ * NUL is not guaranteed. */
 const uint8_t *plat_clip_data(const plat *p, size_t *len);
 #endif
