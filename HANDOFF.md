@@ -1,3 +1,22 @@
+# HANDOFF — sublimité, end of session 23 on Spiral (2026-10-26 ~20:50 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "time to stop; please recover what you can, update handoff, commit and push")
+
+## Read first (session 24 on Spiral)
+**Goal (Tobias, this session): `sublimite.exe` running on Windows, orchestrated at pace.** Path: W2.3 (done) → W2.4a/b/c in parallel (a, b landed or landing; c committed, unlanded) → **W2.4d edit-177r.9 = link sublimite.exe, type in one file, save** (brief written, not launched) → one Codex review of W2.4 (per-bead reviews deferred, law 8) → W2.5 / W3.
+
+**Landed this session:** edit-1kqw W2.3 a93f651 (the production-save gate red was the test: a save onto a share-locked target correctly ends FAILED / FILE_ERR_IO / modified; FILE_ERR_BUSY means "save job in flight"; test now asserts FILE_ERR_IO + ERROR_SHARING_VIOLATION; make all 0, Linux check 0 (110), Windows check 0 (98)); edit-177r.7 W2.4b eef1590 (editor recovery/restore/runtime/retain/session on os.h; partial by design, leftovers on edit-177r.9's notes); edit-177r.6 W2.4a: see the worklog's last line for whether it landed (verification on the rebased tree was running at the stop).
+
+**Not landed, committed on its branch:** **edit-177r.8 W2.4c** `wt/edit-177r.8-s13` ea83e85 (worktree `.wt/edit-177r.8-s13`): portable wait set (src/editor/wait.h, wait_posix.c epoll, wait_win.c handle array into the win32 MsgWaitForMultipleObjectsEx loop; at most 59 lent handles = 64 − 1 queue − 4 platform-owned (P), editor worst case 7, 8 with the D3D11 latency event), Windows close request (src/win32/close.h, win32_close_win.c), UTF-8 argv from GetCommandLineW, self-spawned --wait launcher, D3D11 selection. Worker evidence: make all 0, Linux make check 0 (110), allocator 10000 keys mallocs=0 (null and raster), editor_wait_test rel+san green; earlier full Windows runs had one red each (an allocation-audit fix, then journal_kill_test's PID-named %TEMP% root colliding with a stale directory, native 183, passes standalone). The worker was stopped during its final isolated Windows check; its report docs/worker-reports/edit-177r.8-s13.md is current. **First task:** rebase onto main (expect src/editor/private.h and mk/win.mk overlaps with W2.4a/b: rebuild win.mk from main plus this bead's deltas), `rm build/win/*/libcore.a`, verify (make all, full Linux check on :95, `make TARGET=win check`), land, close.
+
+**Then launch W2.4d:** `build/briefs/launch13.sh edit-177r.9 xhigh` after creating `.wt/edit-177r.9-s13` from main (brief build/briefs/edit-177r.9-s13.md; bead notes carry W2.4b's leftovers: session_lock/busy_source_lease consumers in open.c/editor.h onto os_file, drop the #if, editor_restore_defer_file declaration; also W2.4c's Found list, incl. the editor_config.session_lease handoff).
+
+**Box at the stop:** Xvfb :94-:99 up. Two Windows `file_test.exe` processes from the interrupted checks may still be alive on the Windows side (tasklist 20:45). Worktrees `.wt/*-s13` (keep .8 until landed; .6 and .7 removable once landed), `.wt/*-s12` landed ones removable. Launcher build/briefs/launch13.sh `<bead> <effort> [round-suffix]`; rules _rules-s13.md (rule 12: parallel siblings on disjoint files).
+
+**Quota (M, 18:52):** Claude Weekly 87 % (+0.2 %), Fable 90 % (+3.2 %: no Fable lanes until the Tue 16:59 reset), Codex 9 % (+2.7 %). Today's three Codex lanes: .6 270,300 tokens, .7 189,260 (M); .8 not reported (stopped).
+
+Everything below is the earlier session-23 (ThinkPad) and session-22 (Spiral) handoffs, kept for their state.
+
+---
+
 # HANDOFF — sublimité, ThinkPad box, end of session 23 (2026-10-26 afternoon; Opus 5.5 in the main session, Tobias present; Spiral's session 22 runs in parallel, its section follows)
 
 ## Read first
