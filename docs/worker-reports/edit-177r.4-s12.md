@@ -190,3 +190,14 @@ base, trace, work, piece --quick, piece_reclaim --quick, undo, lineidx --track, 
 ## Open questions for coordinator
 
 Resolve the unrelated journal_retire_test BAT0 assumption in its own scope, then re-run the unchanged full check with DISPLAY=:99 EDIT_DISPLAY=:99. Decide whether to add an OS residency-query entry in a later contract bead, or accept Windows' conservative bulk lane. Rebase the small shared base and win.mk changes with W0.3. Full linked Windows core-suite verification belongs to W0.5 after os_win.c and the Windows guard land.
+
+## Coordinator verification (session 22)
+
+Rebased onto main eaaec35 (edit-hltk landed, so the BAT0 assertion and the private-Xvfb failures the worker hit are gone). On the rebased tree, all (M)[AC, desktop Spiral]:
+
+```
+make TARGET=win -j64 win-compile   → exit 0
+make TARGET=win -j64 check         → exit 0 (smoke rel + san, --expect-asan fires)
+make -j64 all                      → exit 0 (gcc 13)
+DISPLAY=:99 make -j64 check        → exit 0, 105 suites, 08:45:50 → 08:59:02, load1 0.39 at start, LeakSanitizer on
+```
