@@ -47,7 +47,7 @@ typedef struct savectl_options {
     size_t (*reload_mark)(void *ctx);
     void (*reload_reset)(void *ctx, size_t mark);
     uint64_t buffer_id;
-    const char *reload_cache_dir; /* setup-reserved writable directory; NULL uses TMPDIR or /tmp */
+    const char *reload_cache_dir; /* setup-reserved directory; NULL uses os_temp_dir */
     uint64_t reload_copy_threshold; /* clone threshold; 0 uses file policy */
     void (*step)(void *ctx, int step);
     void *step_ctx;

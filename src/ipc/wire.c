@@ -1,4 +1,5 @@
 #include "ipc.h"
+#include "os/os.h"
 #include <string.h>
 
 /* Input ranges may not overlap the output buffer: writing the header would
@@ -19,7 +20,8 @@ static void put32(uint8_t *p, uint32_t n)
 }
 static bool string_ok(const uint8_t *p, size_t n)
 {
-    return n>=2 && n<=IPC_PATH_CAP && p[0]=='/' && p[n-1]==0 && memchr(p,0,n-1)==NULL;
+    return n>=2 && n<=IPC_PATH_CAP && p[n-1]==0 && memchr(p,0,n-1)==NULL &&
+        (p[0]=='/' || os_path_is_absolute((const char *)p));
 }
 ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out)
 {

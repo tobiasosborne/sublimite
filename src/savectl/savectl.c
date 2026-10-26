@@ -2,15 +2,8 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <fcntl.h>
+#include "os/os.h"
 #include <sys/stat.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <linux/fs.h>
-#include <unistd.h>
-#include <sys/random.h>
-#include <time.h>
 
 /* Epoch and the prepare-return acknowledgement are shared atomic fields.
  * Frozen task input is borrowed by a worker; a separate result lease transfers ownership only via
@@ -21,6 +14,7 @@ typedef struct reload_bytes {
     uint8_t *bytes;
     size_t len;
     bool mapped;
+    os_map mapping;
 } reload_bytes;
 static void bytes_acquire(void *ctx)
 {
@@ -31,7 +25,7 @@ static void bytes_release(void *ctx)
 {
     reload_bytes *b=ctx;
     if (atomic_fetch_sub_explicit(&b->refs,1,memory_order_acq_rel)==1) {
-        if (b->mapped) (void)munmap(b->bytes,b->len);
+        if (b->mapped) os_unmap(&b->mapping);
         else free(b->bytes);
         free(b);
     }
@@ -54,7 +48,7 @@ typedef struct notification { savectl *owner; completion *lease; bool handoff; }
 struct savectl {
     savectl_options options;
     char path[4097];
-    int reload_cache_fd;
+    os_dir reload_cache;
     file_id baseline;
     savectl_state state;
     bool modified, active, event, external, ready_reload, needs_finish, closing;
@@ -102,16 +96,25 @@ struct savectl {
 static bool busy_wait(int rc)
 {
     if (rc != JOURNAL_BUSY) return false;
-    struct timespec tick = {(time_t)(JOURNAL_DEFAULT_SYNC_NS / UINT64_C(1000000000)),
-                            (long)(JOURNAL_DEFAULT_SYNC_NS % UINT64_C(1000000000))};
-    while (nanosleep(&tick, &tick) && errno == EINTR) {}
+    os_sleep_ns(JOURNAL_DEFAULT_SYNC_NS);
     return true;
 }
 static file_id identity(const os_stat *st)
 {
-    file_id id;
-    file_id_from_stat(&id,st);
-    return id;
+    return (file_id){.dev=st->id.volume,.ino=st->id.index[0],.size=st->size,
+        .mtime_ns=(uint64_t)st->mtime_ns,.ctime_ns=(uint64_t)st->ctime_ns,
+        .mode=st->perm,.uid=st->uid,.gid=st->gid,.exists=1,.metadata_valid=1,
+        .type=st->kind==OS_KIND_FILE ? S_IFREG : S_IFDIR};
+}
+static void parent_path(char *path)
+{
+    char *slash=strrchr(path,'/');
+#if defined(_WIN32)
+    char *backslash=strrchr(path,'\\');
+    if(backslash && (!slash || backslash>slash)) slash=backslash;
+    if(slash==path+2 && path[1]==':') { slash[1]=0; return; }
+#endif
+    if(slash==path) slash[1]=0; else if(slash) *slash=0;
 }
 static bool same(file_id a, file_id b)
 {
@@ -140,42 +143,45 @@ static int stop(void *ctx)
     if (rc) s->completion->value.stop_error=rc;
     return rc!=FILE_OK;
 }
-static int private_reload_backing(savectl *s)
+static os_err private_reload_backing(savectl *s, os_file *out)
 {
-    int fd=openat(s->reload_cache_fd,".",O_TMPFILE|O_RDWR|O_CLOEXEC,0600);
-    if(fd>=0) return fd;
+    os_err rc=os_file_open_anon(out,&s->reload_cache);
+    if(rc==OS_OK) return rc;
+    /* Keep the existing exclusive-create fallback on filesystems without
+     * anonymous files. Randomness and EINTR policy belong to the OS layer. */
     for(unsigned attempt=0;attempt<64;attempt++) {
-        uint64_t nonce[2]; size_t got=0;
-        while(got<sizeof nonce) {
-            ssize_t n=getrandom((uint8_t *)nonce+got,sizeof nonce-got,0);
-            if(n<0 && errno==EINTR) continue;
-            if(n<=0) return -1;
-            got+=(size_t)n;
-        }
+        uint64_t nonce[2];
+        rc=os_random(nonce,sizeof nonce);
+        if(rc!=OS_OK) return rc;
         char name[80];
         int n=snprintf(name,sizeof name,".sublimite-reload-%llx-%llx",(unsigned long long)nonce[0],(unsigned long long)nonce[1]);
-        if(n<0 || (size_t)n>=sizeof name) { errno=EINVAL; return -1; }
-        fd=openat(s->reload_cache_fd,name,O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR|O_CLOEXEC,0600);
-        if(fd<0) { if(errno==EEXIST) continue; return -1; }
-        if(unlinkat(s->reload_cache_fd,name,0)) { int en=errno; (void)close(fd); errno=en; return -1; }
-        return fd;
+        if(n<0 || (size_t)n>=sizeof name) return OS_E_INVAL;
+        rc=os_file_open_at(out,&s->reload_cache,name,OS_OPEN_CREATE|OS_OPEN_EXCL|OS_OPEN_NOFOLLOW|OS_OPEN_RDWR);
+        if(rc==OS_E_EXIST) continue;
+        if(rc!=OS_OK) return rc;
+        rc=os_unlink_at(&s->reload_cache,name);
+        if(rc!=OS_OK) os_file_close(out);
+        return rc;
     }
-    errno=EEXIST; return -1;
+    return OS_E_EXIST;
 }
 static void reload_worker(savectl *s)
 {
     result *r=&s->completion->value;
-    int fd=open(s->path,O_RDONLY|O_CLOEXEC|O_NONBLOCK);
-    if (fd<0) { r->file_error=FILE_ERR_IO; r->err_no=errno; return; }
-    os_file source=os_file_from_fd(fd);
+    os_file fd=OS_FILE_INIT;
+    os_err opened=os_file_open(&fd,s->path,OS_OPEN_READ|OS_OPEN_NONBLOCK);
+    if (opened!=OS_OK) {
+        r->file_error=opened==OS_E_ISDIR ? FILE_ERR_NOTREG : FILE_ERR_IO;
+        r->err_no=os_native_error(); return;
+    }
     os_stat before,after;
     reload_bytes *copy=NULL;
-    if (os_file_stat(&source,&before)) { r->file_error=FILE_ERR_IO; goto end; }
-    if (before.kind!=OS_KIND_FILE) { r->file_error=FILE_ERR_NOTREG; goto end; }
+    if (os_file_stat(&fd,&before)!=OS_OK) { r->file_error=FILE_ERR_IO; goto end; }
+    if (before.kind!=OS_KIND_FILE || before.size>INT64_MAX) { r->file_error=FILE_ERR_NOTREG; goto end; }
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),r->id)) { r->file_error=FILE_ERR_CHANGED; goto end; }
-    uint64_t len=(uint64_t)before.size;
+    uint64_t len=before.size;
     if (len>SIZE_MAX) { r->file_error=FILE_ERR_NOMEM; goto end; }
     copy=calloc(1,sizeof *copy);
     if (!copy) { r->file_error=FILE_ERR_NOMEM; goto end; }
@@ -184,18 +190,22 @@ static void reload_worker(savectl *s)
      * file-size reservation overlaps the old tree or any retained snapshot. */
     if (len) {
         char directory[4097]; strcpy(directory,s->path);
-        char *slash=strrchr(directory,'/');
-        if (slash==directory) slash[1]=0; else *slash=0;
-        int backing=open(directory,O_TMPFILE|O_RDWR|O_CLOEXEC,0600);
-        if (backing<0) backing=private_reload_backing(s);
-        if (backing<0) { r->file_error=FILE_ERR_IO; goto end; }
-        int cloned=-1;
+        parent_path(directory);
+        os_dir parent=OS_DIR_INIT;
+        os_file backing=OS_FILE_INIT;
+        if(os_dir_open(&parent,directory)==OS_OK) {
+            (void)os_file_open_anon(&backing,&parent);
+            os_dir_close(&parent);
+        }
+        if (!os_file_is_open(&backing)) (void)private_reload_backing(s,&backing);
+        if (!os_file_is_open(&backing)) { r->file_error=FILE_ERR_IO; goto end; }
+        os_err cloned=OS_E_NOTSUP;
         uint64_t threshold=s->options.reload_copy_threshold;
         if (!threshold) threshold=file_default_copy_threshold();
-        if (len>=threshold) cloned=ioctl(backing,FICLONE,fd);
-        if (cloned<0) {
+        if (len>=threshold) cloned=os_file_clone(&backing,&fd);
+        if (cloned!=OS_OK) {
             uint8_t *scratch=malloc(FILE_PREFIX_MAX);
-            if (!scratch) { (void)close(backing); r->file_error=FILE_ERR_NOMEM; goto end; }
+            if (!scratch) { os_file_close(&backing); r->file_error=FILE_ERR_NOMEM; goto end; }
             size_t off=0;
             while (off<(size_t)len) {
                 if (atomic_load_explicit(&s->epoch,memory_order_acquire)!=s->task.epoch) {
@@ -203,40 +213,43 @@ static void reload_worker(savectl *s)
                 }
                 size_t chunk=(size_t)len-off;
                 if (chunk>FILE_PREFIX_MAX) chunk=FILE_PREFIX_MAX;
-                ssize_t n=pread(fd,scratch,chunk,(off_t)off);
-                if (n<0 && errno==EINTR) continue;
-                if (n<=0) { r->file_error=n<0 ? FILE_ERR_IO : FILE_ERR_CHANGED; break; }
+                size_t n=0;
+                os_err rc=os_file_pread(&fd,scratch,chunk,off,&n);
+                if (rc!=OS_OK || n==0) { r->file_error=rc!=OS_OK ? FILE_ERR_IO : FILE_ERR_CHANGED; break; }
                 size_t written=0;
                 while (written<(size_t)n) {
-                    ssize_t w=pwrite(backing,scratch+written,(size_t)n-written,(off_t)(off+written));
-                    if (w<0 && errno==EINTR) continue;
-                    if (w<=0) { r->file_error=FILE_ERR_IO; break; }
+                    size_t w=0;
+                    if (os_file_pwrite(&backing,scratch+written,n-written,off+written,&w)!=OS_OK || w==0) {
+                        r->file_error=FILE_ERR_IO; break;
+                    }
                     written+=(size_t)w;
                 }
                 if (r->file_error) break;
                 off+=(size_t)n;
             }
-            int saved_errno=errno; free(scratch); errno=saved_errno;
+            if(r->file_error==FILE_ERR_IO) r->err_no=os_native_error();
+            free(scratch);
         }
         if (!r->file_error) {
-            void *mapping=mmap(NULL,(size_t)len,PROT_READ,MAP_PRIVATE,backing,0);
-            if (mapping==MAP_FAILED) r->file_error=FILE_ERR_NOMEM;
-            else { copy->bytes=mapping; copy->mapped=true; }
+            os_err rc=os_map_file(&copy->mapping,&backing,0,(size_t)len);
+            if (rc!=OS_OK) r->file_error=rc==OS_E_RANGE ? FILE_ERR_CHANGED : FILE_ERR_NOMEM;
+            else { copy->bytes=(uint8_t *)copy->mapping.addr; copy->mapped=true; }
         }
-        int saved_errno=errno; (void)close(backing); errno=saved_errno;
+        if(r->file_error==FILE_ERR_IO && !r->err_no) r->err_no=os_native_error();
+        os_file_close(&backing);
         if (r->file_error) goto end;
     }
-    if (os_file_stat(&source,&after)) { r->file_error=FILE_ERR_IO; goto end; }
+    if (os_file_stat(&fd,&after)!=OS_OK) { r->file_error=FILE_ERR_IO; goto end; }
     r->file_error=disk_id(s->path,&r->id);
     if (r->file_error) goto end;
     if (!same(identity(&before),identity(&after)) || !same(identity(&after),r->id))
         r->file_error=FILE_ERR_CHANGED;
 
 end:
-    if (r->file_error==FILE_ERR_IO) r->err_no=errno;
+    if (r->file_error==FILE_ERR_IO && !r->err_no) r->err_no=os_native_error();
     if (r->file_error) { if (copy) bytes_release(copy); }
     else r->reload=copy;
-    (void)close(fd);
+    os_file_close(&fd);
 }
 /* edit-fkpk: runs right after the rename. The retired original's ctime moved
  * with its link count; refresh the controller-owned source authorization so
@@ -249,13 +262,14 @@ static void save_replaced(void *ctx)
 }
 static int sync_target_parent(savectl *s)
 {
-    char path[4097]; strcpy(path,s->path); char *slash=strrchr(path,'/');
-    if(slash==path) slash[1]=0; else *slash=0;
-    int fd=open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC); if(fd<0) return FILE_ERR_DIRSYNC;
-    int rc; do { rc=fsync(fd); } while(rc<0 && errno==EINTR);
-    int saved_errno=errno; (void)close(fd); errno=saved_errno;
-    return rc<0?FILE_ERR_DIRSYNC:FILE_OK;
+    char path[4097]; strcpy(path,s->path); parent_path(path);
+    os_dir dir=OS_DIR_INIT;
+    if(os_dir_open(&dir,path)!=OS_OK) return FILE_ERR_DIRSYNC;
+    os_err rc=os_dir_sync(&dir);
+    os_dir_close(&dir);
+    return rc!=OS_OK?FILE_ERR_DIRSYNC:FILE_OK;
 }
+
 static void worker(work_ctx *ctx)
 {
     savectl *s=ctx->arg;
@@ -279,7 +293,7 @@ static void worker(work_ctx *ctx)
             if (!r->file_error && op==OP_KEEP) r->file_error=validate(s);
             if (!r->file_error && op==OP_CHECK && s->task.guarded)
                 r->file_error=s->options.validate_source(s->options.source_ctx);
-            if (r->file_error==FILE_ERR_IO) r->err_no=errno;
+            if (r->file_error==FILE_ERR_IO) r->err_no=os_native_error();
         } else if (op==OP_SAVE) {
             r->file_error=validate(s);
             if (!r->file_error && s->options.journal && !lease->prepared) {
@@ -295,7 +309,7 @@ static void worker(work_ctx *ctx)
                     /* A copy this refused prepare retained is named by no
                      * checkpoint: drop it before preparing again. */
                     if (*lease->token.previous_path && strcmp(kept,lease->token.previous_path))
-                        (void)unlink(lease->token.previous_path);
+                        (void)os_unlink(lease->token.previous_path);
                     r->journal_error=journal_save_prepare(s->options.journal,s->options.buffer_id,
                         &checkpoint.previous,checkpoint.records,checkpoint.count,&lease->token);
                 }
@@ -326,7 +340,7 @@ static void worker(work_ctx *ctx)
             savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
             if (s->task.request_mode)
                 r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
-            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
+            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=os_native_error();
             if(!r->file_error && !r->journal_error) {
                 r->journal_error=journal_save_cancel(s->options.journal,&lease->token,checkpoint.records,checkpoint.count);
                 if (busy_wait(r->journal_error))
@@ -340,7 +354,7 @@ static void worker(work_ctx *ctx)
             savectl_checkpoint checkpoint={s->task.previous,s->task.checkpoint,s->task.count};
             if (s->task.request_mode)
                 r->journal_error=s->task.request.prepare(s->task.request.ctx,s->task.snapshot,&checkpoint);
-            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=errno;
+            r->file_error=sync_target_parent(s); if(r->file_error) r->err_no=os_native_error();
             if (!r->file_error && !r->journal_error && op==OP_RECOVER_FINISH) {
                 /* CURRENT may include newly appended edits. Drain their
                  * batch before rotation; damaged/full logs are precisely
@@ -411,7 +425,7 @@ static int submit(savectl *s, operation op)
 }
 int savectl_create(savectl **out, const savectl_options *o, bool modified)
 {
-    if (!out || !o || !o->pool || !o->path || o->path[0]!='/' ||
+    if (!out || !o || !o->pool || !o->path || !os_path_is_absolute(o->path) ||
         strlen(o->path)>4096 || (o->source_mode!=FILE_MODE_COPY && o->source_mode!=FILE_MODE_MMAP))
         return SAVECTL_INVALID;
     if (o->journal && (!o->journal_pool || o->journal_pool==o->pool)) return SAVECTL_INVALID;
@@ -420,10 +434,15 @@ int savectl_create(savectl **out, const savectl_options *o, bool modified)
     if (!s) return SAVECTL_NOMEM;
     s->completion=calloc(1,sizeof *s->completion);
     if (!s->completion) { free(s); return SAVECTL_NOMEM; }
+    char temporary[OS_PATH_MAX];
     const char *cache=o->reload_cache_dir;
-    if(!cache) { cache=getenv("TMPDIR"); if(!cache || cache[0]!='/') cache="/tmp"; }
-    s->reload_cache_fd=cache[0]=='/'?open(cache,O_RDONLY|O_DIRECTORY|O_CLOEXEC):-1;
-    if(s->reload_cache_fd<0) { free(s->completion); free(s); return SAVECTL_INVALID; }
+    if(!cache) {
+        if(os_temp_dir(temporary,sizeof temporary)!=OS_OK) { free(s->completion); free(s); return SAVECTL_INVALID; }
+        cache=temporary;
+    }
+    if(!os_path_is_absolute(cache) || os_dir_open(&s->reload_cache,cache)!=OS_OK) {
+        free(s->completion); free(s); return SAVECTL_INVALID;
+    }
     s->options=*o; strcpy(s->path,o->path); s->options.path=s->path;
     s->baseline=o->baseline; s->modified=modified;
     if (o->source) {
@@ -450,7 +469,7 @@ int savectl_destroy(savectl *s)
         return SAVECTL_BUSY;
     if (s->handle.epoch)
         (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,NULL,NULL);
-    (void)close(s->reload_cache_fd);
+    os_dir_close(&s->reload_cache);
     free(s->completion);
     file_source_release(s->options.source);
     free(s); return SAVECTL_OK;

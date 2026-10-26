@@ -1,3 +1,4 @@
+#if !defined(_WIN32)
 #include "ipc.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -584,3 +585,5 @@ ipc_result ipc_client_send(const char *runtime, const ipc_request *r, int timeou
 {
     return ipc_client_send_display(runtime, NULL, r, timeout_ms);
 }
+
+#endif

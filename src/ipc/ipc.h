@@ -1,6 +1,7 @@
 #ifndef EDIT_IPC_H
 #define EDIT_IPC_H
 #include "base/base.h"
+#include "os/os.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -70,12 +71,16 @@ typedef struct ipc_server {
     char socket_path[108]; /* leaf name inside dir_fd (edit-457.21); abstract: empty */
     uint64_t socket_device, socket_inode;
     bool owns_path;
-    /* edit-457.21 additions. Init sets the defaults; tests may lower them. */
+    /* edit-457.21 additions. Init sets the defaults; tests may lower them.
+     * Windows snapshots these settings at the next drain. */
     int dir_fd, timer_fd;
     uint32_t request_deadline_ms, evict_idle_ms;
     uint64_t wait_drops;  /* wait clients that vanished before their closed reply */
     uint64_t drain_bytes; /* bytes received by the most recent drain call */
     struct ipc_rx *rx;
+#if defined(_WIN32)
+    struct ipc_win *win; /* platform-private service and pipe state */
+#endif
 } ipc_server;
 typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
 /* Caller-owned, zero-init before init; runtime NULL uses XDG_RUNTIME_DIR,
@@ -86,6 +91,10 @@ typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
  * Empty namespaces return IPC_INVALID; names too long return IPC_LIMIT.
  * Filesystem endpoints ignore this hook. Set it before IPC calls, and keep
  * it stable for the endpoint lifetime; do not change it from another thread.
+ * Windows uses a SID-scoped named pipe and Local mutex with a user-only ACL;
+ * remote clients are refused. runtime, when supplied, selects a bounded,
+ * losslessly encoded namespace rather than a directory. EDIT_IPC_NAMESPACE
+ * applies to every Windows endpoint. Named objects leave no stale files.
  * All server calls belong to the loop thread; fini only after successful init. */
 ipc_result ipc_server_init(ipc_server *server, const char *runtime);
 /* CLI endpoints include a lossless, bounded encoding of the selected DISPLAY.
@@ -96,9 +105,14 @@ ipc_result ipc_server_init_display(ipc_server *server, const char *runtime, cons
 ipc_result ipc_client_send_display(const char *runtime, const char *display,
                                    const ipc_request *request, int timeout_ms);
 int ipc_server_fd(const ipc_server *server);
+#if defined(_WIN32)
+/* Borrowed wake for the Win32 platform loop. Drain through server_drain;
+ * fd is unavailable on Windows and returns -1. */
+const os_wake *ipc_server_wake(const ipc_server *server);
+#endif
 /* Nonblocking; borrowed request is valid only inside callback. Callback OK
  * queues ACK; other result rejects. Retain token for wait; copy desired data.
- * Call drain on epoll readability, and after report_closed. */
+ * Call drain on epoll readability / Windows wake, and after report_closed. */
 ipc_result ipc_server_drain(ipc_server *server, ipc_open_callback callback, void *ctx);
 ipc_result ipc_server_report_closed(ipc_server *server, ipc_token token);
 void ipc_server_fini(ipc_server *server);

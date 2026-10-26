@@ -1,4 +1,9 @@
 #include "ipc.h"
+#include "os/os.h"
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -14,6 +19,73 @@ static char *copy_string(edit_arena *arena, const char *s)
 }
 /* Resolve each existing prefix before interpreting the next '..'. This also
  * canonicalizes the existing parent of a file that will be created later. */
+#if defined(_WIN32)
+static void separators(char *s)
+{
+    for(;*s;s++) if(*s=='\\') *s='/';
+}
+static size_t root_size(const char *s)
+{
+    if(s[0] && s[1]==':' && s[2]=='/') return 3;
+    if(s[0]=='/' && s[1]=='/') {
+        const char *server=strchr(s+2,'/');
+        if(!server || server==s+2 || !server[1]) return 0;
+        const char *share=strchr(server+1,'/');
+        return share ? (size_t)(share-s)+1u : strlen(s);
+    }
+    return 0;
+}
+static ipc_result canonical(const char *cwd, const char *path, char *out)
+{
+    char full[IPC_PATH_CAP], resolved[IPC_PATH_CAP];
+    if(!path[0]) return IPC_INVALID;
+    int n;
+    if(os_path_is_absolute(path)) n=snprintf(full,sizeof full,"%s",path);
+    else {
+        /* Do not silently reinterpret drive-relative or root-relative paths. */
+        if(path[0]=='/' || path[0]=='\\' || (path[1]==':' && path[0])) return IPC_INVALID;
+        n=snprintf(full,sizeof full,"%s/%s",cwd,path);
+    }
+    if(n<0 || (size_t)n>=sizeof full) return IPC_LIMIT;
+    separators(full);
+    size_t root=root_size(full), used=root;
+    if(!root) return IPC_INVALID;
+    memcpy(out,full,root); out[root]=0;
+    bool known=true, isdir=true;
+    char *cursor=full+root;
+    while(*cursor) {
+        while(*cursor=='/') cursor++;
+        if(!*cursor) break;
+        char *part=cursor;
+        while(*cursor && *cursor!='/') cursor++;
+        char saved=*cursor; *cursor=0;
+        if(known && !isdir) return IPC_INVALID;
+        if(!strcmp(part,"..")) {
+            while(used>root && out[used-1]!='/') used--;
+            if(used>root) used--;
+            out[used]=0;
+            if(known) isdir=true;
+        } else if(strcmp(part,".")) {
+            size_t len=strlen(part), sep=used && out[used-1]!='/' ? 1u : 0u;
+            if(used+sep+len+1>IPC_PATH_CAP) return IPC_LIMIT;
+            if(sep) out[used++]='/';
+            memcpy(out+used,part,len+1); used+=len;
+            if(known) {
+                os_err rc=os_path_canonical(out,resolved,sizeof resolved);
+                if(rc==OS_OK) {
+                    separators(resolved); used=strlen(resolved); memcpy(out,resolved,used+1);
+                    root=root_size(out);
+                    os_stat st; isdir=os_stat_path(out,0,&st)==OS_OK && st.kind==OS_KIND_DIR;
+                } else if(rc==OS_E_NOENT) known=false;
+                else return rc==OS_E_NOTDIR || rc==OS_E_INVAL ? IPC_INVALID : IPC_IO;
+            }
+        }
+        *cursor=saved;
+    }
+    if(strlen(full)>root && full[strlen(full)-1]=='/' && !(known && isdir)) return IPC_INVALID;
+    return IPC_OK;
+}
+#else
 static ipc_result canonical(const char *cwd, const char *path, char *out)
 {
     char full[IPC_PATH_CAP], resolved[IPC_PATH_CAP];
@@ -66,6 +138,7 @@ static ipc_result canonical(const char *cwd, const char *path, char *out)
     if(strlen(full)>1 && full[strlen(full)-1]=='/' && !(known && isdir)) return IPC_INVALID;
     return IPC_OK;
 }
+#endif
 static int coordinate(const char *s, uint32_t *out)
 {
     if(*s=='\0') return 0;
@@ -90,7 +163,7 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
     if(argc<1 || argv==NULL) return IPC_INVALID;
     if(edit_arena_init(&out->arena,2u*IPC_MAX_WIRE)!=0) return IPC_IO;
     ipc_result rc=IPC_OK; char cwd[IPC_PATH_CAP];
-    if(getcwd(cwd,sizeof cwd)==NULL) { rc=IPC_IO; goto fail; }
+    if(os_cwd(cwd,sizeof cwd)!=OS_OK) { rc=IPC_IO; goto fail; }
     out->request.cwd=copy_string(&out->arena,cwd);
     if(out->request.cwd==NULL) { rc=IPC_LIMIT; goto fail; }
     bool options=true;
@@ -128,12 +201,23 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
         if(options && arg[0]=='-') { rc=IPC_INVALID; goto fail; }
         if(out->request.count==IPC_MAX_PATHS || strlen(arg)>=IPC_PATH_CAP) { rc=IPC_LIMIT; goto fail; }
         char name[IPC_PATH_CAP], path[IPC_PATH_CAP]; memcpy(name,arg,strlen(arg)+1);
-        uint32_t line=1,col=1; struct stat st;
+        uint32_t line=1,col=1;
+#if defined(_WIN32)
+        os_stat st;
+#else
+        struct stat st;
+#endif
         /* A directory entry of that exact name (even a dangling symlink) wins over
          * coordinate parsing; only true absence enables suffixes, and every other
          * lookup failure is an error, never "absent" (edit-457.21 review §4). */
+#if defined(_WIN32)
+        os_err lookup=os_stat_path(name,OS_STAT_NOFOLLOW,&st);
+        if(lookup!=OS_OK) {
+            if(lookup!=OS_E_NOENT && lookup!=OS_E_INVAL) { rc=lookup==OS_E_NOTDIR?IPC_INVALID:IPC_IO; goto fail; }
+#else
         if(lstat(name,&st)!=0) {
             if(errno!=ENOENT) { rc=errno==ENOTDIR?IPC_INVALID:IPC_IO; goto fail; }
+#endif
             char *last=strrchr(name,':'); uint32_t value=1;
             int numeric=last!=NULL?coordinate(last+1,&value):0;
             if(numeric<0) { rc=IPC_INVALID; goto fail; }
@@ -161,13 +245,40 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
     for(size_t i=0;i<args->request.count;i++) cap-=12u+strlen(args->request.paths[i].path)+1u;
     uint8_t *data=edit_arena_alloc(&args->arena,cap,1);
     if(data==NULL) return IPC_LIMIT;
+#if defined(_WIN32)
+    int mode=_setmode(fd,_O_BINARY);
+    if(mode<0) return IPC_IO;
+    ipc_result rc=IPC_OK;
+#endif
     size_t n=0;
     for(;;) {
-        uint8_t extra; ssize_t got=read(fd,n<cap?data+n:&extra,n<cap?cap-n:1u);
-        if(got<0) { if(errno==EINTR) continue; return IPC_IO; }
+        uint8_t extra;
+#if defined(_WIN32)
+        int got=_read(fd,n<cap?data+n:&extra,(unsigned)(n<cap?cap-n:1u));
+#else
+        ssize_t got=read(fd,n<cap?data+n:&extra,n<cap?cap-n:1u);
+#endif
+        if(got<0) {
+            if(errno==EINTR) continue;
+#if defined(_WIN32)
+            rc=IPC_IO; break;
+#else
+            return IPC_IO;
+#endif
+        }
         if(got==0) break;
-        if(n==cap) return IPC_LIMIT;
+        if(n==cap) {
+#if defined(_WIN32)
+            rc=IPC_LIMIT; break;
+#else
+            return IPC_LIMIT;
+#endif
+        }
         n+=(size_t)got;
     }
+#if defined(_WIN32)
+    if(_setmode(fd,mode)<0) return IPC_IO;
+    if(rc!=IPC_OK) return rc;
+#endif
     args->request.stdin_data=data; args->request.stdin_size=n; return IPC_OK;
 }
