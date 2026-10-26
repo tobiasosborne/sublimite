@@ -79,7 +79,7 @@ typedef struct plat_config {
     uint64_t exec_ns;       /* monotonic ns at process start (0 = unknown) */
 } plat_config;
 
-typedef enum plat_backend { PLAT_BACKEND_X11, PLAT_BACKEND_WAYLAND } plat_backend;
+typedef enum plat_backend { PLAT_BACKEND_X11, PLAT_BACKEND_WAYLAND, PLAT_BACKEND_WIN32 } plat_backend;
 
 /* Runtime policy: X11 wins when both environment variables are nonempty. */
 plat_backend plat_backend_select(const char *display, const char *wayland_display);
@@ -109,6 +109,7 @@ typedef struct plat_x11_native {
     bool argb;
 } plat_x11_native;
 plat_x11_native plat_native_x11(const plat *p);
+void *plat_native_win32(const plat *p); /* borrowed HWND; NULL for other backends */
 bool plat_present_available(const plat *p);
 
 int  plat_init(plat *p, const plat_config *cfg);

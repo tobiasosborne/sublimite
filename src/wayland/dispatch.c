@@ -1,3 +1,4 @@
+#if !defined(_WIN32)
 #include "wayland/private.h"
 #include <string.h>
 #include "x11/private.h"
@@ -112,3 +113,6 @@ bool plat_present_available(const plat *p)
     if (p->backend == PLAT_BACKEND_WAYLAND) return wayland_present_available(p);
     return x11_private(p) && x11_private(p)->present_ok;
 }
+
+void *plat_native_win32(const plat *p) { (void)p; return NULL; }
+#endif
