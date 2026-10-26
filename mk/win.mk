@@ -234,12 +234,14 @@ $(WIN_B)/rel/tests/file_test.exe $(WIN_B)/san/tests/file_test.exe: tests/file_os
 
 
 # Platform contract suite includes its implementation for native API fixtures (edit-upwq).
+# Existing positional fixtures predate the optional Windows source callback;
+# omitted trailing members are zero, preserving their single-wake contract.
 $(WIN_B)/rel/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+	$(WIN_CC) $(WIN_WARN) -Wno-missing-field-initializers $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
 $(WIN_B)/san/tests/win32_plat_test.exe: tests/win/win32_plat_test.c src/win32/win32_plat.c src/win32/win32_clip_win.c $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
-	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	$(WIN_CC) $(WIN_WARN) -Wno-missing-field-initializers $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/win32_plat.o %/win32_clip_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
 
@@ -255,3 +257,21 @@ check-savectl-production: $(WIN_B)/rel/tests/savectl_test.exe $(WIN_B)/san/tests
 	@set -e; for t in $^; do echo "== $$t"; tools/winrun.sh $$t; done
 
 -include $(shell find $(WIN_B) -name '*.d' 2>/dev/null)
+
+# W2.4c's isolated wait sources are linkable before the rest of editor.
+WIN_EDITOR_WAIT_REL := $(WIN_B)/rel/src/editor/wait_posix.o $(WIN_B)/rel/src/editor/wait_win.o
+WIN_EDITOR_WAIT_SAN := $(WIN_B)/san/src/editor/wait_posix.o $(WIN_B)/san/src/editor/wait_win.o
+$(WIN_B)/rel/tests/editor_wait_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_WAIT_REL)
+$(WIN_B)/san/tests/editor_wait_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_WAIT_SAN)
+$(WIN_B)/rel/tests/editor_wait_test.exe: $(WIN_EDITOR_WAIT_REL)
+$(WIN_B)/san/tests/editor_wait_test.exe: $(WIN_EDITOR_WAIT_SAN)
+
+# Deliberately object-only: sibling dependency/filesystem ports land before
+# W2.4d links the application. Compile every loop TU and main with production flags.
+WIN_EDITOR_LOOP := backend buffers editor open commands preferences fif findpanel font_size wait_posix wait_win
+WIN_EDITOR_LOOP_SRC := $(addprefix src/editor/,$(addsuffix .c,$(WIN_EDITOR_LOOP))) src/main.c
+.PHONY: win-editor-loop
+check: win-editor-loop
+win-editor-loop: $(WIN_EDITOR_LOOP_SRC:%.c=$(WIN_B)/rel/%.o) $(WIN_EDITOR_LOOP_SRC:%.c=$(WIN_B)/san/%.o)
+
+$(WIN_B)/rel/tests/editor_wait_test.exe $(WIN_B)/san/tests/editor_wait_test.exe: src/win32/win32_close_win.c src/win32/close.h

@@ -82,6 +82,8 @@ typedef struct config_runtime config_runtime;
  * A private worker pool keeps config I/O independent of editor bulk work. */
 int config_runtime_open(config_runtime **, const char *);
 void config_runtime_close(config_runtime *);
+struct os_wake;
+const struct os_wake *config_runtime_wake(const config_runtime *);
 int config_runtime_eventfd(const config_runtime *);
 int config_runtime_watchfd(const config_runtime *);
 /* Off typing: polls shared file inotify, drains config's own mailbox, retries

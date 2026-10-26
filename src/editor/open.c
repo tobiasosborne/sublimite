@@ -4,11 +4,14 @@
 #include "raster/raster.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <unistd.h>
-#include <poll.h>
 #include <time.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <malloc.h>
+static editor *allocate_editor(void)
+{ return _aligned_malloc(sizeof(editor), _Alignof(editor)); }
+#endif
 
 void editor_close(editor *e)
 {
@@ -35,15 +38,20 @@ void editor_close(editor *e)
         e->journal = NULL;
     }
     /* edit-cxo: a discarded empty session leaves no lease file behind. */
+#if defined(_WIN32)
+    if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path && e->cfg.session_lease)
+        (void)journal_session_release_file(e->cfg.journal_path, e->cfg.session_lease);
+#else
     if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path)
         (void)journal_session_release(e->cfg.journal_path, e->session_lock);
+#endif
     if (e->session_lock >= 0) close(e->session_lock);
     if (e->busy_source_lease >= 0) close(e->busy_source_lease); /* edit-ivv: source stays discoverable */
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);
     editor_backend_close_probe(e);
-    if (e->backend) render_backend_shutdown(e->backend);
-    render_backend_shutdown(&e->retired_backend);
+    if (e->backend) editor_backend_shutdown_sync(e, e->backend);
+    editor_backend_shutdown_sync(e, &e->retired_backend);
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
@@ -54,14 +62,14 @@ void editor_close(editor *e)
     edit_arena_free(&e->font.storage); edit_arena_free(&e->font.scratch);
     if (e->has_platform) plat_shutdown(&e->platform);
     editor_clip_close(e);
-    if (e->poll_fd >= 0) close(e->poll_fd);
+    if (e->poll_ready) editor_wait_close(&e->poll_set);
     if (e->tabs_ready) tabs_fini(&e->tabs);
-    edit_arena_free(&e->arena); free(e);
-}
-static int add_poll_fd(editor *e, int fd)
-{
-    struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
-    return epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &ev) ? EDITOR_ERR_IO : 0;
+    edit_arena_free(&e->arena);
+#if defined(_WIN32)
+    _aligned_free(e);
+#else
+    free(e);
+#endif
 }
 static int open_editor(editor **out, const editor_config *config, render_backend *backend,
                        bool skip_recovery, bool *retry, char *aside)
@@ -71,12 +79,22 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     render_backend_info info;
     if (render_backend_query(backend, &info)) return EDITOR_ERR_ARG;
     render_backend fallback = {0};
+#if defined(_WIN32)
+    /* D3D11 owns the only swapchain; native raster bootstrap is W2.4d. */
+    bool may_fallback = false;
+#else
     bool may_fallback = config->raster_fallback && (info.capabilities & RENDER_CAP_GPU);
+#endif
     if (may_fallback && ((info.capabilities & RENDER_CAP_HEADLESS) ?
         render_null_backend(&fallback) : render_cpu_backend(&fallback))) return EDITOR_ERR_ARG;
-    editor *e = aligned_alloc(_Alignof(editor), sizeof *e); if (!e) return EDITOR_ERR_MEMORY;
+#if defined(_WIN32)
+    editor *e = allocate_editor();
+#else
+    editor *e = aligned_alloc(_Alignof(editor), sizeof *e);
+#endif
+    if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->busy_source_lease = -1; e->recovery_skip = skip_recovery;
+    e->raster_poll_fd = -1; e->session_lock = -1; e->busy_source_lease = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     atomic_init(&e->font_logged, false);
     /* edit-fi2: retain BASEs that startup can restore in one pass
@@ -108,8 +126,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
             do {
                 (void)config_runtime_tick(e->preferences_runtime);
                 if (!config_runtime_busy(e->preferences_runtime)) break;
-                struct pollfd fd = {config_runtime_eventfd(e->preferences_runtime), POLLIN, 0};
-                (void)poll(&fd, 1, 1);
+                (void)os_wake_wait(config_runtime_wake(e->preferences_runtime), INT64_C(1000000));
             } while (true);
             if (e->preferences_font_override == 0.0)
                 e->cfg.font_points = config_runtime_current(e->preferences_runtime)->font_points;
@@ -132,14 +149,22 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (config->max_window_height) e->font.max_height = config->max_window_height;
     if (e->font.max_width < e->font.window_width) e->font.max_width = e->font.window_width;
     if (e->font.max_height < e->font.window_height) e->font.max_height = e->font.window_height;
-    e->poll_fd = epoll_create1(EPOLL_CLOEXEC); if (e->poll_fd < 0) { rc = EDITOR_ERR_IO; goto fail; }
-    e->poll_wake.fd = e->poll_fd;
-    rc = add_poll_fd(e, work_pool_eventfd(&e->pool)); if (rc) goto fail;
-    if (e->preferences_runtime) {
-        rc = add_poll_fd(e, config_runtime_eventfd(e->preferences_runtime)); if (rc) goto fail;
+    if (editor_wait_init(&e->poll_set) != OS_OK) { rc = EDITOR_ERR_IO; goto fail; }
+    e->poll_ready = true;
+    if (editor_wait_add(&e->poll_set, work_pool_wake(&e->pool), EDITOR_WAIT_POOL) != OS_OK ||
+        (e->preferences_runtime && editor_wait_add(&e->poll_set,
+            config_runtime_wake(e->preferences_runtime), EDITOR_WAIT_CONFIG) != OS_OK)) {
+        rc = EDITOR_ERR_IO; goto fail;
     }
-    if (config->server) { rc = add_poll_fd(e, ipc_server_fd(config->server)); if (rc) goto fail; }
-    if (config->close_signal_fd) { rc = add_poll_fd(e, *config->close_signal_fd); if (rc) goto fail; }
+#if defined(_WIN32)
+    if ((config->server && editor_wait_add(&e->poll_set, ipc_server_wake(config->server), EDITOR_WAIT_IPC) != OS_OK) ||
+        (config->close_wake && editor_wait_add(&e->poll_set, config->close_wake, EDITOR_WAIT_CLOSE) != OS_OK)) {
+#else
+    if ((config->server && editor_wait_add_fd(&e->poll_set, ipc_server_fd(config->server), EDITOR_WAIT_IPC) != OS_OK) ||
+        (config->close_signal_fd && editor_wait_add_fd(&e->poll_set, *config->close_signal_fd, EDITOR_WAIT_CLOSE) != OS_OK)) {
+#endif
+        rc = EDITOR_ERR_IO; goto fail;
+    }
     /* P3.4 reservation: maximum visible rows plus the bottom overscan row. */
     size_t reserved_rows = (size_t)e->max_rows + 1u;
     size_t cells = (size_t)e->max_cols * reserved_rows, words = (reserved_rows + 63) / 64;
@@ -233,11 +258,13 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (config->journal_path) {
         if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
         e->journal_pool_ready = true;
-        rc = add_poll_fd(e, work_pool_eventfd(&e->journal_pool)); if (rc) goto fail;
+        if (editor_wait_add(&e->poll_set, work_pool_wake(&e->journal_pool), EDITOR_WAIT_JOURNAL) != OS_OK) {
+            rc = EDITOR_ERR_IO; goto fail;
+        }
         rc = journal_open(&e->journal, config->journal_path, &e->journal_pool, NULL);
         if (rc == JOURNAL_INVALID) {
-            struct stat st;
-            if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0) {
+            os_stat st;
+            if (os_stat_path(config->journal_path, OS_STAT_NOFOLLOW, &st) == OS_OK && st.kind == OS_KIND_FILE && st.size > 0) {
                 rc = journal_open_checkpoint(&e->journal, config->journal_path, &e->journal_pool, NULL);
                 if (!rc) e->recover_existing = true;
             }
@@ -252,7 +279,12 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     }
     dims = e->grid.dims;
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
-        plat_config pc = {"sublimité", e->font.window_width, e->font.window_height, false, &e->poll_wake, 0};
+        plat_config pc = {.title = "sublimité", .width = e->font.window_width, .height = e->font.window_height,
+#if defined(_WIN32)
+            .work_sources = editor_wait_handles, .work_sources_ctx = &e->poll_set};
+#else
+            .work_wake = editor_wait_wake(&e->poll_set)};
+#endif
         rc = plat_init_backend(&e->platform, &pc, config->platform_backend); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0);
         /* edit-29y2: before mapping, so the window manager's first frame already matches. */
@@ -307,8 +339,8 @@ int editor_open(editor **out, const editor_config *config, render_backend *backe
     /* edit-btj: installing a discovered session failed after its source was
      * set aside. A partial checkpoint in this launch's destination is set
      * aside too (journal_open requires it empty); then open without discovery. */
-    struct stat st; char partial[IPC_PATH_CAP];
-    if (!lstat(config->journal_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0)
+    os_stat st; char partial[IPC_PATH_CAP];
+    if (os_stat_path(config->journal_path, OS_STAT_NOFOLLOW, &st) == OS_OK && st.kind == OS_KIND_FILE && st.size > 0)
         (void)editor_set_aside(config->journal_path, partial, sizeof partial);
     rc = open_editor(out, config, backend, true, NULL, NULL);
     if (!rc) {

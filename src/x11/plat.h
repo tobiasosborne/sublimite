@@ -70,6 +70,8 @@ typedef struct plat_callbacks {
 } plat_callbacks;
 
 struct os_wake;
+/* (P) MAXIMUM_WAIT_OBJECTS - message queue - blink/repeat/present/clipboard. */
+#define PLAT_WORK_SOURCE_CAP (64u - 1u - 4u)
 
 typedef struct plat_config {
     const char *title;
@@ -77,6 +79,13 @@ typedef struct plat_config {
     bool headless;          /* tests without DISPLAY: init returns PLAT_ERR_NO_DISPLAY */
     const struct os_wake *work_wake; /* borrowed; NULL if none */
     uint64_t exec_ns;       /* monotonic ns at process start (0 = unknown) */
+#if defined(_WIN32)
+    /* Alternative to work_wake. UI-only callback snapshots borrowed native
+     * level-triggered handles on every wait, including native modal loops.
+     * At most PLAT_WORK_SOURCE_CAP; SIZE_MAX reports invalid/overflow. */
+    size_t (*work_sources)(void *ctx, void **handles, size_t capacity);
+    void *work_sources_ctx;
+#endif
 } plat_config;
 
 typedef enum plat_backend { PLAT_BACKEND_X11, PLAT_BACKEND_WAYLAND, PLAT_BACKEND_WIN32 } plat_backend;

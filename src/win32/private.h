@@ -26,6 +26,8 @@ typedef struct win32_plat {
     WCHAR class_name[64]; /* (P) prefix + pointer hex + terminating NUL fits. */
     HANDLE blink_timer, repeat_timer, present_wake;
     const os_wake *work_wake;
+    size_t (*work_sources)(void *, void **, size_t);
+    void *work_sources_ctx;
     uint32_t dpi, blink_ms, repeat_delay, repeat_rate, repeat_key, buttons;
     uint64_t repeat_next;
     LPARAM repeat_lparam;

@@ -1,6 +1,7 @@
 #ifndef EDIT_EDITOR_PRIVATE_H
 #define EDIT_EDITOR_PRIVATE_H
 #include "editor/editor.h"
+#include "editor/wait.h"
 #include "font/selection.h"
 #include "base/base.h"
 #include "file/file.h"
@@ -30,7 +31,7 @@
 #define EDITOR_FIND_PANEL_ROWS (1u + 1u + 1u)
 typedef struct editor_piece_storage {
     edit_arena *arena;
-    pthread_mutex_t mutex;
+    os_mutex mutex;
     void *free[EDITOR_PIECE_BINS];
     size_t size[EDITOR_PIECE_BINS], classes;
     size_t requests, fail_request; /* per-buffer allocator fault-test seam */
@@ -269,7 +270,7 @@ typedef struct editor_font_size {
     _Atomic bool *logged;
     int result;
     work_handle handle;
-    pthread_t worker;
+    uint64_t worker;
 } editor_font_size;
 struct editor {
     editor_clip *clipboard;
@@ -326,8 +327,8 @@ struct editor {
     char file_command_path[IPC_PATH_CAP];
     uint64_t file_command_owner, file_command_generation;
     editor_wait waits[IPC_MAX_CLIENTS];
-    int poll_fd;
-    os_wake poll_wake; /* borrowed epoll readiness view; never signal/drain/close */
+    editor_wait_set poll_set;
+    bool poll_ready;
     file *opening;
     int open_error;
     view v;
@@ -543,6 +544,7 @@ int editor_replace_delete(editor *e, uint64_t off, uint64_t len);
 int editor_replace_insert(editor *e, uint64_t off, const uint8_t *bytes, size_t len);
 int editor_replace_end(editor *e, uint64_t target);
 
+void editor_backend_shutdown_sync(editor *, render_backend *);
 int editor_backend_init_sync(editor *e, render_config config, void *state);
 int editor_backend_start_probe(editor *e, render_backend backend, render_config config, void *state);
 int editor_backend_poll_probe(editor *e);

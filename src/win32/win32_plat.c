@@ -395,6 +395,11 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (msg==WM_KILLFOCUS && GetCapture()==hwnd) (void)ReleaseCapture();
         (void)push(s,(plat_event){.kind=PLAT_EV_FOCUS,.focused=s->owner->focused}); return 0;
     case WM_CLOSE: (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); return 0;
+    case WM_QUERYENDSESSION:
+        (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); return TRUE;
+    case WM_ENDSESSION:
+        if (wp) (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE});
+        return 0;
     case WM_SIZE: resize(s); return 0;
     case WM_DPICHANGED: {
         s->dpi=HIWORD(wp); RECT *r=(RECT *)lp;
@@ -464,13 +469,15 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     if (!p || !cfg || backend!=PLAT_BACKEND_WIN32) return PLAT_ERR_FAIL;
     memset(p,0,sizeof *p); p->backend=backend;
     if (cfg->headless) return PLAT_ERR_NO_DISPLAY;
+    if (cfg->work_wake && cfg->work_sources) return PLAT_ERR_FAIL;
     if (!cfg->width || !cfg->height || cfg->width>INT_MAX || cfg->height>INT_MAX) return PLAT_ERR_FAIL;
     /* ERROR_ACCESS_DENIED means the host/manifest already fixed awareness.
      * Accept it only if it really is per-monitor v2. */
     if (!awareness()) return PLAT_ERR_FAIL;
     win32_plat *s=calloc(1,sizeof *s); if (!s) return PLAT_ERR_FAIL;
     p->backend_state=s; p->width=cfg->width; p->height=cfg->height; s->owner=p; s->ui_thread=GetCurrentThreadId();
-    s->work_wake=cfg->work_wake; s->instance=GetModuleHandleW(NULL);
+    s->work_wake=cfg->work_wake; s->work_sources=cfg->work_sources;
+    s->work_sources_ctx=cfg->work_sources_ctx; s->instance=GetModuleHandleW(NULL);
     s->repeat_delay=400; s->repeat_rate=30; /* (G) P2.2 shared defaults. */
     s->present_enabled=true; InitializeSRWLock(&s->present_lock);
     s->blink_timer=CreateWaitableTimerW(NULL,FALSE,NULL);
@@ -657,6 +664,20 @@ static void repeat_poll(win32_plat *s, const plat_callbacks *cb)
         (void)SetWaitableTimer(s->repeat_timer,&due,0,NULL,NULL,FALSE);
     }
 }
+static size_t work_handles(win32_plat *s, HANDLE *handles)
+{
+    if (s->work_sources) return s->work_sources(s->work_sources_ctx, handles, PLAT_WORK_SOURCE_CAP);
+    if (s->work_wake && os_wake_handle(s->work_wake)) {
+        handles[0] = os_wake_handle(s->work_wake); return 1;
+    }
+    return 0;
+}
+static bool work_ready(const HANDLE *handles, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+        if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) return true;
+    return false;
+}
 static void modal_service(win32_plat *s)
 {
     if (!s->modal_depth || !s->callbacks || s->servicing || s->callback_depth) return;
@@ -669,8 +690,11 @@ static void modal_service(win32_plat *s)
         if (cb->on_event) { s->callback_depth++; cb->on_event(cb->ud,&ev); s->callback_depth--; }
     }
     if (!s->owner->quit) present_drain(s,cb);
-    if (!s->owner->quit && cb->on_work && s->work_wake &&
-        WaitForSingleObject(os_wake_handle(s->work_wake),0)==WAIT_OBJECT_0) { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; }
+    HANDLE handles[PLAT_WORK_SOURCE_CAP];
+    size_t count = work_handles(s, handles);
+    if (count > PLAT_WORK_SOURCE_CAP) { plat_quit(s->owner); }
+    else if (!s->owner->quit && cb->on_work && work_ready(handles, count))
+        { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; }
     if (!s->owner->quit) repeat_poll(s,cb);
     if (!s->owner->quit && s->owner->focused && s->blink_ms &&
         WaitForSingleObject(s->blink_timer,0)==WAIT_OBJECT_0) {
@@ -695,12 +719,15 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
         if (timeout_ms>0 && os_now_ns()>=end) break;
         if (!buffered) repeat_poll(s,cb);
         if (p->quit) break;
-        HANDLE handles[5]; DWORD count=0,work_index=MAXDWORD;
+        /* (P) four platform handles + bounded editor sources, with one
+         * MAXIMUM_WAIT_OBJECTS position reserved for the message queue. */
+        HANDLE handles[MAXIMUM_WAIT_OBJECTS - 1u]; DWORD count=0;
         handles[count++]=s->blink_timer; handles[count++]=s->repeat_timer; handles[count++]=s->present_wake;
         handles[count++]=win32_clip_wake(s);
-        if (s->work_wake && os_wake_handle(s->work_wake) && cb->on_work) {
-            work_index=count; handles[count++]=os_wake_handle(s->work_wake);
-        }
+        DWORD work_index=count;
+        size_t work_count=cb->on_work ? work_handles(s, handles+count) : 0;
+        if (work_count>PLAT_WORK_SOURCE_CAP) { s->callbacks=NULL; return PLAT_ERR_FAIL; }
+        count+=(DWORD)work_count;
         DWORD wait=INFINITE;
         if (timeout_ms==0 || buffered || s->head!=s->tail) wait=0;
         else if (timeout_ms>0) {
@@ -717,7 +744,7 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
             timer(s->blink_timer,s->blink_ms);
             if (cb->on_blink) { s->callback_depth++; cb->on_blink(cb->ud); s->callback_depth--; }
         }
-        if (!p->quit && work_index!=MAXDWORD && WaitForSingleObject(handles[work_index],0)==WAIT_OBJECT_0 && cb->on_work)
+        if (!p->quit && cb->on_work && work_ready(handles+work_index, work_count))
             { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; } /* Borrowed wake: callback drains before mailbox reads. */
     }
     s->callbacks=NULL;

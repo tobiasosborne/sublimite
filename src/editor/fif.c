@@ -7,7 +7,6 @@
 #include "editor/private.h"
 #include "trace/trace.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
-#include <poll.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -48,8 +47,7 @@ static void slot_finish(editor *e, editor_fif_slot *slot)
      * gone (edit-34l duty); the poll interval reuses findpanel's close loop. */
     while (fif_job_dispose(&slot->job) == FIF_ERR_BUSY) {
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
-        struct pollfd fd = {work_pool_eventfd(&e->pool), POLLIN, 0};
-        (void)poll(&fd, 1, 1);
+        (void)os_wake_wait(work_pool_wake(&e->pool), INT64_C(1000000));
     }
     *slot = (editor_fif_slot){0};
 }

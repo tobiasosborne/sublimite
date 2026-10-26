@@ -2,13 +2,13 @@
 #include "raster/raster.h"
 #include "trace/trace.h"
 #include <errno.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
 #include <time.h>
-#include <sys/epoll.h>
+#if !defined(_WIN32)
 #include <sys/signalfd.h>
+#endif
 #include <unistd.h>
 
 typedef struct piece_block { struct piece_block *next; size_t bin; } piece_block;
@@ -17,20 +17,20 @@ static void *piece_alloc(void *ctx, size_t n)
 {
     editor_piece_storage *s = ctx;
     if (n > SIZE_MAX - sizeof(piece_block)) return NULL;
-    pthread_mutex_lock(&s->mutex);
+    os_mutex_lock(&s->mutex);
     s->requests++;
-    if (s->requests == s->fail_request) { pthread_mutex_unlock(&s->mutex); return NULL; }
+    if (s->requests == s->fail_request) { os_mutex_unlock(&s->mutex); return NULL; }
     /* Exact sizes avoid doubling add chunks/original storage. The fixed
      * class table bounds lookup independently of retired slab count. */
     size_t bin = 0;
     while (bin < s->classes && s->size[bin] != n) bin++;
-    if (bin == EDITOR_PIECE_BINS) { pthread_mutex_unlock(&s->mutex); return NULL; }
+    if (bin == EDITOR_PIECE_BINS) { os_mutex_unlock(&s->mutex); return NULL; }
     if (bin == s->classes) { s->size[bin] = n; s->classes++; }
     piece_block *block = s->free[bin];
     if (block) s->free[bin] = block->next;
     else block = edit_arena_alloc(s->arena, n + sizeof *block, 16);
     if (block) block->bin = bin;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
     return block ? block + 1 : NULL;
 }
 static void piece_free(void *ctx, void *p, size_t n)
@@ -38,11 +38,11 @@ static void piece_free(void *ctx, void *p, size_t n)
     if (!p) return;
     editor_piece_storage *s = ctx;
     piece_block *block = (piece_block *)p - 1;
-    pthread_mutex_lock(&s->mutex);
+    os_mutex_lock(&s->mutex);
     size_t bin = block->bin;
     EDIT_ASSERT(bin < s->classes && s->size[bin] == n);
     block->next = s->free[bin]; s->free[bin] = block;
-    pthread_mutex_unlock(&s->mutex);
+    os_mutex_unlock(&s->mutex);
 }
 static size_t tree_span(void *ctx, uint64_t off, const uint8_t **p)
 {
@@ -58,8 +58,8 @@ static void snapshot_release(void *ctx) { piece_snapshot_release(ctx); }
 static int wait_open_ready(editor *e, editor_buffer *b)
 {
     while (!file_open_ready(b->file)) {
-        struct pollfd ready = {work_pool_eventfd(&e->pool), POLLIN, 0};
-        if (poll(&ready, 1, 100) < 0 && errno != EINTR) return EDITOR_ERR_IO;
+        os_err waited = os_wake_wait(work_pool_wake(&e->pool), INT64_C(100000000));
+        if (waited != OS_OK && waited != OS_E_TIMEDOUT) return EDITOR_ERR_IO;
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
         if (e->error || (e->opening == b->file && e->open_error) || b->source_stale) return EDITOR_ERR_IO;
     }
@@ -82,7 +82,7 @@ void editor_buffer_destroy(editor_buffer *b)
     editor_retain_stop(b); /* edit-fi2: quiesces a running copy; keeps a referenced one */
     if (b->map_snapshot) {
         work_cancel(b->pool,b->map_handle);
-        while (!work_handle_finished(b->pool,b->map_handle)) sched_yield();
+        while (!work_handle_finished(b->pool,b->map_handle)) os_yield();
         (void)work_mailbox_bind(b->pool,b->map_handle,0,NULL,NULL);
         piece_snapshot_release(b->map_snapshot);
     }
@@ -99,7 +99,7 @@ void editor_buffer_destroy(editor_buffer *b)
     editor_saved_reference(b, NULL);
     if (b->tree) piece_destroy(b->tree);
     if (b->preview) piece_destroy(b->preview);
-    if (b->piece_storage.ready) pthread_mutex_destroy(&b->piece_storage.mutex);
+    if (b->piece_storage.ready) os_mutex_destroy(&b->piece_storage.mutex);
     edit_arena_free(&b->arena); free(b);
 }
 /* file_watch_start now lends one process fd. epoll owns one registration per
@@ -112,7 +112,7 @@ static void unpoll_source(editor *e, editor_buffer *b)
     if (fd == e->preferences_watchfd) return;
     for (size_t i = 0; i < e->buffer_capacity; i++)
         if (e->buffers[i] && e->buffers[i] != b && e->buffers[i]->watch_fd == fd) return;
-    (void)epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, fd, NULL);
+    (void)editor_wait_remove(&e->poll_set, EDITOR_WAIT_FILE);
 }
 void editor_unpoll_buffer(editor *e, editor_buffer *b) { unpoll_source(e, b); }
 void editor_retire_buffers(editor *e)
@@ -161,8 +161,8 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
         e->opening = b->file; e->open_error = 0;
         while (b->file && (!file_prefix_ready(b->file) ||
                (file_size(b->file) <= FILE_PREFIX_MAX && !file_open_ready(b->file)))) {
-            struct pollfd p = {work_pool_eventfd(&e->pool), POLLIN, 0};
-            if (poll(&p, 1, 100) < 0 && errno != EINTR) { rc = EDITOR_ERR_IO; goto fail; }
+            os_err waited = os_wake_wait(work_pool_wake(&e->pool), INT64_C(100000000));
+            if (waited != OS_OK && waited != OS_E_TIMEDOUT) { rc = EDITOR_ERR_IO; goto fail; }
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
             if (e->error) { rc = e->error; goto fail; }
             if (e->open_error) {
@@ -204,8 +204,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
                 b->origin = editor_base_id_of(&opened);
             }
             b->watch_fd = file_watch_start(b->file);
-            struct epoll_event event = {.events = EPOLLIN, .data.fd = b->watch_fd};
-            if (b->watch_fd < 0 || (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, b->watch_fd, &event) && errno != EEXIST)) {
+            if (editor_wait_file(&e->poll_set, b->watch_fd) != OS_OK) {
                 rc = EDITOR_ERR_IO; goto fail;
             }
             if (file_check(b->file, NULL)) { rc = EDITOR_ERR_IO; goto fail; }
@@ -220,7 +219,7 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     if (content > SIZE_MAX - reserve) { rc = EDITOR_ERR_MEMORY; goto fail; }
     rc = edit_arena_init(&b->arena, reserve + content); if (rc) { rc = EDITOR_ERR_MEMORY; goto fail; }
     b->piece_storage.arena = &b->arena;
-    if (pthread_mutex_init(&b->piece_storage.mutex, NULL)) { rc = EDITOR_ERR_MEMORY; goto fail; }
+    if (os_mutex_init(&b->piece_storage.mutex)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     b->piece_storage.ready = true;
     piece_allocator a = {&b->piece_storage, piece_alloc, piece_free};
     b->tree = piece_create(&a); if (!b->tree) { rc = EDITOR_ERR_MEMORY; goto fail; }
@@ -452,8 +451,13 @@ bool editor_same_path(const char *path, const char *other)
 {
     if (!path || !other || !*path || !*other) return false;
     char canonical[IPC_PATH_CAP], target[IPC_PATH_CAP];
+#if defined(_WIN32)
+    const char *a = os_path_canonical(path, canonical, sizeof canonical) == OS_OK ? canonical : path;
+    const char *b = os_path_canonical(other, target, sizeof target) == OS_OK ? target : other;
+#else
     const char *a = realpath(path, canonical) ? canonical : path;
     const char *b = realpath(other, target) ? target : other;
+#endif
     if (!strcmp(a, b)) return true;
     file_id left, right;
     return !file_id_stat_path(a, &left) && !file_id_stat_path(b, &right) &&
@@ -929,34 +933,39 @@ static void sweep_waits(editor *e)
 int editor_poll_sources(editor *e)
 {
     int preferences_rc = editor_preferences_poll(e); if (preferences_rc) return preferences_rc;
-    struct epoll_event events[16];
-    int event_count = epoll_wait(e->poll_fd, events, 16, 0);
-    if (event_count < 0 && errno != EINTR) return EDITOR_ERR_IO;
-    /* edit-djg (P): one complete signalfd record requests close; EAGAIN is
-     * harmless stale readiness and EINTR retries the same read. No handler,
-     * allocation, timer, or signal work occurs on a worker thread. */
-    if (e->cfg.close_signal_fd) for (int at = 0; at < event_count; at++) {
-        if (events[at].data.fd != *e->cfg.close_signal_fd) continue;
+    /* (G) existing maintenance batch, unchanged from the epoll loop. */
+    uint32_t events[16]; size_t event_count = 0;
+    if (editor_wait_ready(&e->poll_set, 0, events, 16, &event_count) != OS_OK) return EDITOR_ERR_IO;
+    for (size_t at = 0; at < event_count; at++) if (events[at] == EDITOR_WAIT_CLOSE) {
+#if defined(_WIN32)
+        os_wake_drain(e->cfg.close_wake);
+        e->quit = true; return 0;
+#else
+        /* edit-djg: complete signalfd record only; tolerate stale readiness. */
         struct signalfd_siginfo termination;
         ssize_t n;
         do { n = read(*e->cfg.close_signal_fd, &termination, sizeof termination); } while (n < 0 && errno == EINTR);
         if (n == (ssize_t)sizeof termination) { e->quit = true; return 0; }
         if (n >= 0 || errno != EAGAIN) return EDITOR_ERR_IO;
+#endif
     }
-    for (int at = 0; at < event_count; at++) for (size_t i = 0; i < e->buffer_capacity; i++) {
-        editor_buffer *b = e->buffers[i];
-        if (b && !b->retired && b->file && b->watch_fd == events[at].data.fd) {
-            b->watch_pending = true; (void)file_watch_poll(b->file);
+    for (size_t at = 0; at < event_count; at++) if (events[at] == EDITOR_WAIT_FILE)
+        for (size_t i = 0; i < e->buffer_capacity; i++) {
+            editor_buffer *b = e->buffers[i];
+            if (b && !b->retired && b->file && b->watch_fd >= 0) {
+                b->watch_pending = true; (void)file_watch_poll(b->file);
+            }
         }
-    }
     size_t messages = work_mailbox_drain(&e->pool, editor_route_work, e);
     if (e->journal_pool_ready && !editor_save_leased(e)) messages += work_mailbox_drain(&e->journal_pool, editor_route_work, e);
     if (messages) for (size_t i = 0; i < e->buffer_capacity; i++) {
         editor_buffer *b = e->buffers[i];
         if (b && !b->retired && b->file && b->watch_pending && !b->source_stale) (void)file_watch_poll(b->file);
     }
+#if !defined(_WIN32)
     int raster_rc = raster_poll_completions(e->backend);
     if (raster_rc) return raster_rc;
+#endif
     editor_retire_buffers(e);
     editor_save_tick(e);
     editor_save_as_tick(e); /* edit-ze59 */

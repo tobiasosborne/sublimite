@@ -1,12 +1,14 @@
 #include "editor/private.h"
 #include "trace/trace.h"
+#if defined(_WIN32)
+#include "d3d11/d3d11.h"
+#else
 #include "gl/gl.h"
+#endif
 #include "raster/raster.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
-#include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
@@ -305,6 +307,7 @@ static void platform_work(void *ctx)
     editor *e = ctx; int rc = editor_poll_sources(e); if (rc) e->error = rc;
     e->pump_stopped = true; plat_quit(&e->platform);
 }
+#if !defined(_WIN32)
 static bool gpu_pending(const editor *e)
 {
     return (e->backend->info.capabilities & RENDER_CAP_GPU) &&
@@ -317,43 +320,63 @@ static void platform_complete(void *ctx, uint32_t serial, uint64_t ust, uint64_t
     int rc = gl_present_complete(e->backend, serial, ust, msc);
     if (rc && rc != RENDER_ERR_FRAME && rc != RENDER_ERR_STATE) e->error = rc;
 }
+#endif
 /* A clean caret frame has no work waiting for completion. Observe its XCB
  * queue on the next existing blink/input turn, without a completion-only wake.
  * When damage is waiting, arm the same epoll set used by platform on_work. */
 static int raster_poll_set(editor *e)
 {
+#if defined(_WIN32)
+    (void)e;
+#else
     int fd = raster_completion_fd(e->backend);
     if (e->caret_only && !e->dirty && !e->queue_count && !e->resize_pending) fd = -1;
     if (fd == e->raster_poll_fd) return 0;
-    if (e->raster_poll_fd >= 0 && epoll_ctl(e->poll_fd, EPOLL_CTL_DEL, e->raster_poll_fd, NULL))
+    if (e->raster_poll_fd >= 0 && editor_wait_remove(&e->poll_set, EDITOR_WAIT_RASTER) != OS_OK)
         return EDITOR_ERR_IO;
     e->raster_poll_fd = -1;
     if (fd >= 0) {
-        struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
-        if (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &ev)) return EDITOR_ERR_IO;
+        if (editor_wait_add_fd(&e->poll_set, fd, EDITOR_WAIT_RASTER) != OS_OK) return EDITOR_ERR_IO;
         e->raster_poll_fd = fd;
     }
+#endif
     return 0;
 }
 static int pump(editor *e, int timeout)
 {
     int probe_rc = editor_backend_poll_probe(e); if (probe_rc) return probe_rc;
     bool active = e->backend->active;
+#if !defined(_WIN32)
     int raster_rc = raster_poll_completions(e->backend);
     if (raster_rc) return fail(e, raster_rc);
     if (active && !e->backend->active && runnable(e)) timeout = 0;
+#else
+    (void)active;
+    int raster_rc;
+#endif
     raster_rc = raster_poll_set(e); if (raster_rc) return raster_rc;
+#if defined(_WIN32)
+    if ((e->backend->info.capabilities & RENDER_CAP_GPU) && e->backend->active) {
+#else
     if (gpu_pending(e)) {
+#endif
+#if defined(_WIN32)
+        int rc = d3d11_poll_completions(e->backend);
+#else
         work_msg msg = {.kind = GL_POLL_MESSAGE};
         render_event ev = {RENDER_EVENT_WORK, e->backend->active_frame, 0, &msg};
         int rc = render_backend_event(e->backend, &ev);
+#endif
         if (rc) return fail(e, rc);
         /* A completed frame may unblock already prepared/input work. */
         if (!e->backend->active) timeout = 0;
     }
     if (e->has_platform && e->queue_count < EDITOR_INPUT_CAP) {
         plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work,
-            .on_present_complete = platform_complete};
+#if !defined(_WIN32)
+            .on_present_complete = platform_complete
+#endif
+        };
         uint64_t before = e->platform.iterations;
         e->platform.quit = false; e->pump_stopped = false;
         int rc = plat_run_for(&e->platform, &cb, timeout);
@@ -361,10 +384,9 @@ static int pump(editor *e, int timeout)
         if (timeout > 0 && !e->pump_stopped && rc == PLAT_OK) e->stats.poll_returns++;
         if (rc) return fail(e, rc);
     } else if (timeout != 0 && e->pool_ready) {
-        struct pollfd p = {e->poll_fd, POLLIN, 0};
-        int rc = poll(&p, 1, timeout);
-        if (rc >= 0) e->stats.poll_returns++;
-        else if (errno != EINTR) return EDITOR_ERR_IO;
+        uint32_t tag; size_t count;
+        if (editor_wait_ready(&e->poll_set, timeout, &tag, 1, &count) != OS_OK) return EDITOR_ERR_IO;
+        e->stats.poll_returns++;
     }
     probe_rc = editor_backend_poll_probe(e); if (probe_rc) return probe_rc;
     if (e->pool_ready) return editor_poll_sources(e);
@@ -406,7 +428,10 @@ static int render_rejected(editor *e, int rc, size_t *count)
     e->recovery_notice = render_notice; e->recovery_notice_mutations = e->stats.mutations;
     editor_save_overlay(e);
     if (font_async_repair(e->fonts, &e->grid)) {
-        e->caret_only = false; raster_set_caret_only(e->backend, false);
+        e->caret_only = false;
+#if !defined(_WIN32)
+        raster_set_caret_only(e->backend, false);
+#endif
         rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, count);
         if (!rc) rc = render_backend_submit(e->backend, &e->grid, e->strips, *count);
         if (rc == RENDER_OK || rc == RENDER_ERR_BUSY) return rc;
@@ -443,7 +468,9 @@ static int submit(editor *e)
         return 0;
     }
     trace_record(TRACE_T3_RENDER_DONE, e->grid.frame_id);
+#if !defined(_WIN32)
     raster_set_caret_only(e->backend, e->caret_only);
+#endif
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc && rc != RENDER_ERR_BUSY && render_backend_check(e->backend, &e->grid, e->strips, count))
         rc = render_rejected(e, rc, &count);
@@ -712,7 +739,14 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
     /* A private XCB event or unsignalled GPU fence can outlast its sole
      * platform callback. Retry only an outstanding presented GPU frame.
      * Once T5/T6 release that slot, no GL timer/job/poll remains at idle. */
+#if defined(_WIN32)
+    /* D3D11 can wait for frame latency before Present as well as after it.
+     * Reuse the existing active-GPU cadence; an idle backend has no timer. */
+    if ((e->backend->info.capabilities & RENDER_CAP_GPU) && e->backend->active &&
+        (requested < 0 || requested > 1)) requested = 1;
+#else
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
+#endif
     uint64_t deadline = e->checkpoint_retry_ns ? e->checkpoint_retry_ns : e->blinking ? e->next_blink : UINT64_MAX;
     /* edit-bt1: wake for a deferred scroll slice's retry tick (edit-ci6i:
      * or a deferred wrapped seek's, which keeps wheel_pending instead). */
@@ -985,7 +1019,7 @@ int editor_flush(editor *e)
         editor_save_as_tick(e);
         editor_save_tick(e);
         if (!editor_save_leased(e)) editor_journal_staged(e);
-        sched_yield();
+        os_yield();
     }
     e->save_flushing = false;
     if (!e->journal) return 0;

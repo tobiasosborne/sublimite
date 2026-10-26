@@ -8,13 +8,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static int canonical_target(const char *input, char out[IPC_PATH_CAP])
 {
     if (!*input || strlen(input) >= IPC_PATH_CAP) return EDITOR_ERR_ARG;
+#if defined(_WIN32)
+    os_err resolved = os_path_canonical(input, out, IPC_PATH_CAP);
+    if (resolved == OS_OK) return 0;
+    if (resolved != OS_E_NOENT) return EDITOR_ERR_IO;
+    char parent[IPC_PATH_CAP], leaf[IPC_PATH_CAP]; strcpy(parent, input);
+    char *slash = strrchr(parent, '/'), *backslash = strrchr(parent, '\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+    strcpy(leaf, slash ? slash + 1 : parent);
+    if (!*leaf) return EDITOR_ERR_ARG;
+    if (slash == parent || (slash && slash == parent + 2 && parent[1] == ':')) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    else strcpy(parent, ".");
+    char canonical[IPC_PATH_CAP];
+    if (os_path_canonical(parent, canonical, sizeof canonical) != OS_OK) return EDITOR_ERR_IO;
+    int n = snprintf(out, IPC_PATH_CAP, "%s\\%s", canonical, leaf);
+    return n < 0 || (size_t)n >= IPC_PATH_CAP ? EDITOR_ERR_ARG : 0;
+#else
     if (realpath(input, out)) return 0;
     if (errno != ENOENT) return EDITOR_ERR_IO;
     char parent[IPC_PATH_CAP], leaf[IPC_PATH_CAP]; strcpy(parent, input);
@@ -26,6 +42,7 @@ static int canonical_target(const char *input, char out[IPC_PATH_CAP])
     char canonical[IPC_PATH_CAP]; if (!realpath(parent, canonical)) return EDITOR_ERR_IO;
     int n = snprintf(out, IPC_PATH_CAP, "%s/%s", canonical, leaf);
     return n < 0 || (size_t)n >= IPC_PATH_CAP ? EDITOR_ERR_ARG : 0;
+#endif
 }
 /* edit-ze59 (recovery-3 F10): Save As writes the target on the bulk worker.
  * A journal-less save controller (the save path's worker-owned write, its
@@ -172,8 +189,7 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
     file_watch_dispatch();
     int fd = file_watch_path_start(&b->target_watch, b->path);
     if (fd < 0) return EDITOR_ERR_IO;
-    struct epoll_event event = {.events = EPOLLIN, .data.fd = fd};
-    if (epoll_ctl(e->poll_fd, EPOLL_CTL_ADD, fd, &event) && errno != EEXIST) return EDITOR_ERR_IO;
+    if (editor_wait_file(&e->poll_set, fd) != OS_OK) return EDITOR_ERR_IO;
     b->watch_fd = fd; b->watch_pending = false;
     /* Peers with unsaved history keep their text (edited while the target
      * was written): no reload; the new BASE makes their checkpoint whole-text. */
@@ -267,7 +283,7 @@ void editor_save_as_close(editor *e)
         savectl_tick(a->writer);
         if (savectl_destroy(a->writer) == SAVECTL_OK) break;
         (void)work_mailbox_drain(&e->pool, editor_route_work, e);
-        sched_yield();
+        os_yield();
     }
     e->save_as = NULL; save_as_free(a);
 }
@@ -284,10 +300,19 @@ int editor_file_command_service(editor *e)
     else if (command == KEYS_ACTION_OPEN_FILE) {
         /* The shared buffer API permits absent paths; this command promises
          * an existing readable regular file. Validate before publishing a tab. */
+#if defined(_WIN32)
+        os_file source; os_stat st;
+        if (os_file_open(&source, e->file_command_path, OS_OPEN_READ) != OS_OK) rc = EDITOR_ERR_IO;
+        else {
+            if (os_file_stat(&source, &st) != OS_OK || st.kind != OS_KIND_FILE) rc = EDITOR_ERR_IO;
+            os_file_close(&source);
+        }
+#else
         int fd = open(e->file_command_path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         struct stat st;
         if (fd < 0) rc = EDITOR_ERR_IO;
         else { if (fstat(fd, &st) || !S_ISREG(st.st_mode)) rc = EDITOR_ERR_IO; close(fd); }
+#endif
         if (!rc) rc = editor_add_buffer(e, e->file_command_path, NULL, 0, &id);
     } else if (command == KEYS_ACTION_SAVE_AS) rc = save_as(e, e->file_command_path);
     if (!rc) return 0;

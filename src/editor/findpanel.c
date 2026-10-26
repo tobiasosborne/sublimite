@@ -2,7 +2,6 @@
 #include "trace/trace.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
-#include <poll.h>
 
 static void replace_begin(editor *e, bool all);
 static void retain_source(void *ctx) { ((editor_buffer *)ctx)->find_leases++; }
@@ -49,8 +48,7 @@ void editor_find_close(editor *e)
         }
         while (findui_dispose(&e->find)==FINDUI_MORE) {
             (void)work_mailbox_drain(&e->pool,editor_route_work,e);
-            struct pollfd fd={work_pool_eventfd(&e->pool),POLLIN,0};
-            (void)poll(&fd,1,1);
+            (void)os_wake_wait(work_pool_wake(&e->pool), INT64_C(1000000));
         }
     }
     edit_arena_free(&e->find_arena);

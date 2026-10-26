@@ -146,6 +146,7 @@ void config_runtime_close(config_runtime *r)
     if (r->pool_ready) work_pool_shutdown(&r->pool);
     edit_arena_free(&r->arena); free(r);
 }
+const os_wake *config_runtime_wake(const config_runtime *r) { return r ? work_pool_wake(&r->pool) : NULL; }
 int config_runtime_eventfd(const config_runtime *r) { return r ? work_pool_eventfd(&r->pool) : -1; }
 int config_runtime_watchfd(const config_runtime *r) { return r ? r->watchfd : -1; }
 bool config_runtime_tick(config_runtime *r)
