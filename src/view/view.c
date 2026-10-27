@@ -729,8 +729,13 @@ static int remove_range(view *v, uint64_t lo, uint64_t hi, view_change *change)
 bool view_wrap_default(const char *path)
 {
     if(!path || !*path) return true;
-    const char *dot=strrchr(path,'.');
-    return dot && (!strcmp(dot,".md") || !strcmp(dot,".txt") || !strcmp(dot,".tex"));
+    /* edit-cxho.27: decide on the basename only (after the last / or \\, the
+     * Windows separator), so a dot in a directory name is not an extension.
+     * A name with no dot past its first byte (README, .bashrc) wraps. */
+    const char *base=path;
+    for(const char *p=path;*p;p++) if(*p=='/' || *p=='\\') base=p+1;
+    const char *dot=*base ? strrchr(base+1,'.') : NULL;
+    return !dot || !strcmp(dot,".md") || !strcmp(dot,".txt") || !strcmp(dot,".tex");
 }
 int view_set_wrap(view *v,bool enabled,struct layout *context)
 {

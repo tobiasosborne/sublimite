@@ -475,7 +475,9 @@ static int ipc_positions(bool raster)
     for (unsigned i = 0; i < 120; i++) T(fputc('a' + (int)(i % 26u), stream) != EOF);
     T(fclose(stream) == 0);
     render_backend b = {0}; T((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
-    editor_config cfg = {.start_empty = true, .cols = 32, .rows = 4}; editor *e = NULL;
+    /* The mkstemp name has no extension, which wraps by default since
+     * edit-cxho.27; this case is about horizontal scroll, so force unwrapped. */
+    editor_config cfg = {.start_empty = true, .cols = 32, .rows = 4, .wrap_mode = -1}; editor *e = NULL;
     T(editor_open(&e, &cfg, &b) == 0);
     ipc_request request = {.count = 1}; request.paths[0] = (ipc_path){path, 1, 45};
     T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);

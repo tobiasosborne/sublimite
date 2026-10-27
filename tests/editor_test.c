@@ -6801,8 +6801,8 @@ static int c25_named(int which)
 }
 static int cxho25_typing_jump(void)
 {
-    /* Defaults by path (view_wrap_default): .md/.txt wrap, .c and an
-     * extension-less name do not; wrap_mode 1/-1 force the other mode. */
+    /* Defaults by path (view_wrap_default): .md/.txt and an extension-less
+     * name wrap (edit-cxho.27), .c does not; wrap_mode 1/-1 force the other mode. */
     static const char *const exts[] = {".md", ".txt", ".c", "", ".md", ".c"};
     static const int modes[] = {0, 0, 0, 0, -1, 1};
     unsigned checked = 0; int failed = 0;

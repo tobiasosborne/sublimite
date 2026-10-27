@@ -231,7 +231,8 @@ int view_swap_mark(const view *v, view_selection *mark, bool *valid, view_edit_p
 int view_delete_to_mark(const view *v, const view_selection *mark, bool valid, view_edit_plan *plan);
 int view_yank(const view *v, const uint8_t *text, size_t len, uint8_t *out, size_t cap, view_edit_plan *plan);
 int view_overwrite_range(const view *v, const uint8_t *text, size_t len, uint64_t *old_len);
-/* Tiny P4.1 defaults; NULL/empty = untitled. Config overrides are P6.4. */
+/* Tiny P4.1 defaults; NULL/empty = untitled. Config overrides are P6.4.
+ * Decided on the basename: no extension, .md, .txt, .tex wrap (edit-cxho.27). */
 bool view_wrap_default(const char *path);
 /* Apply open-time defaults to both the buffer flag and its layout. Reserve
  * layout_wrap_init first for text/untitled buffers; begin after this call. */

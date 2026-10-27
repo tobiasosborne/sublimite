@@ -966,6 +966,25 @@ static void c26_bottom_row(void)
     c26_relative_letter(true); c26_relative_letter(false); c26_reset_motion();
     puts("edit-cxho.26: relative placement and motions after LAYOUT_RESET follow fresh rows");
 }
+static void c27_wrap_default(void)
+{
+    /* edit-cxho.27: the default is decided on the basename (last component
+     * after / or \\); no extension (README, a leading-dot name) wraps, as
+     * docs/decisions/edit-6090.md states; .md/.txt/.tex wrap; others do not. */
+    static const struct { const char *path; bool wrap; } rows[]={
+        {"README",true},{"notes",true},{"dir.v2/notes",true},{"a.b/c.md",true},{"a.b/c.c",false},
+        {".bashrc",true},{NULL,true},{"",true},{"note.md",true},{"note.txt",true},{"note.tex",true},
+        {"code.c",false},{"note.md.c",false},{"/home/u/proj.d/LICENSE",true},{"dir.md/code.c",false},
+        {"C:\\Users\\u\\dir.v2\\notes",true},{"C:\\dir.c\\note.md",true},{"/tmp/.hidden/notes",true}
+    };
+    int bad=0;
+    for(size_t i=0;i<sizeof rows/sizeof rows[0];i++) if(view_wrap_default(rows[i].path)!=rows[i].wrap) {
+        fprintf(stderr,"edit-cxho.27: view_wrap_default(%s%s%s) = %d, want %d\n",rows[i].path?"\"":"",
+            rows[i].path?rows[i].path:"NULL",rows[i].path?"\"":"",(int)!rows[i].wrap,(int)rows[i].wrap); bad++;
+    }
+    CHECK(bad==0);
+    puts("edit-cxho.27: wrap default decided on the basename; extension-less names wrap");
+}
 int main(int argc, char **argv)
 {
 #if defined(_WIN32)
@@ -987,6 +1006,7 @@ int main(int argc, char **argv)
     if(argc==2 && strcmp(argv[1],"c26-resident")==0) { c26_relative_letter(true); return 0; }
     if(argc==2 && strcmp(argv[1],"c26-anchored")==0) { c26_relative_letter(false); return 0; }
     if(argc==2 && strcmp(argv[1],"c26-reset")==0) { c26_reset_motion(); return 0; }
-    if(argc==1) { c26_bottom_row(); relative_restore(); wrapped_relative(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
+    if(argc==2 && strcmp(argv[1],"c27")==0) { c27_wrap_default(); return 0; }
+    if(argc==1) { c27_wrap_default(); c26_bottom_row(); relative_restore(); wrapped_relative(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
     puts("view_test: all passed"); return 0;
 }
