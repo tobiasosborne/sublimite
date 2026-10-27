@@ -12,7 +12,7 @@ typedef struct x11_plat {
     uint32_t present_eid;
     uint32_t wm_protocols, wm_delete;
     int timer_fd, work_fd, repeat_fd;
-    void *in, *xi, *clip;
+    void *in, *xi, *clip, *dnd;
     uint32_t last_time;
     uint8_t xkb_event;
     int32_t xkb_dev;

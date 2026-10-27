@@ -17,7 +17,8 @@ typedef enum plat_ev_kind {
     PLAT_EV_KEY, PLAT_EV_BUTTON, PLAT_EV_MOTION,
     PLAT_EV_WHEEL,          /* P2.2: dx/dy in 1/256 notch, smooth flag */
     PLAT_EV_CLIPBOARD,      /* P2.2: code 0 = requested data arrived (clip_ok), 1 = request failed, 2 = we lost ownership */
-    PLAT_EV_KEYMAP          /* P2.2: keymap/layout changed */
+    PLAT_EV_KEYMAP,         /* P2.2: keymap/layout changed */
+    PLAT_EV_DROP            /* Raw URI-list available through plat_drop_data. */
 } plat_ev_kind;
 
 /* Modifier bits in plat_event.mods (platform-neutral, not X bits). */
@@ -147,4 +148,7 @@ int  plat_clip_request(plat *p, int which);
  * queueing another request (including in its callback) does not invalidate it.
  * NUL is not guaranteed. */
 const uint8_t *plat_clip_data(const plat *p, size_t *len);
+/* Raw text/uri-list, borrowed until the next drop completes or shutdown.
+ * No event on failed drops. NULL/zero before success; len may be NULL. */
+const uint8_t *plat_drop_data(const plat *p, size_t *len);
 #endif

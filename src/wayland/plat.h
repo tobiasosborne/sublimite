@@ -1,6 +1,7 @@
 #ifndef EDIT_WAYLAND_PLAT_H
 #define EDIT_WAYLAND_PLAT_H
 /* Shared ABI: callers need no Wayland headers and retain all plat_* entries. */
+/* PLAT_EV_DROP shares this ABI; plat_drop_data is a no-data stub until edit-cxho.19. */
 #include "x11/plat.h"
 /* (P) Next platform setup error after NO_DISPLAY/FAIL; socket ABI bound. */
 #define PLAT_ERR_SOCKET_PATH (-3)

@@ -143,6 +143,9 @@ FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
 TOOL_BIN  := $(patsubst tools/%.c,$(B)/tools/%,$(TOOLS))
 EDIT_BIN  := $(if $(MAINC),$(B)/sublimite)
 
+# XDND uses the existing source/test globs and display lock; keep its harness dependency.
+$(B)/rel/tests/x11_dnd_test.o $(B)/san/tests/x11_dnd_test.o: tests/x11_xvfb.h
+
 $(B)/tests/wayland_test $(B)/tests/wayland_gl_test $(B)/san/tests/wayland_test $(B)/san/tests/wayland_gl_test $(B)/fuzz/wayland_fuzz: LDLIBS += $(WAYLAND_TEST_LIBS)
 
 # File acquisition syscall injection is confined to this regression binary.

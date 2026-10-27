@@ -2,6 +2,7 @@
 #include "wayland/private.h"
 #include <string.h>
 #include "x11/private.h"
+#include "x11/dnd.h"
 
 const char *wayland_display_select(const char *display, const char *safe, const char *allow)
 {
@@ -98,6 +99,13 @@ const uint8_t * plat_clip_data(const plat *p, size_t *len)
 {
     if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_clip_data(p, len); }
     return x11_plat_clip_data(p, len);
+}
+
+const uint8_t *plat_drop_data(const plat *p, size_t *len)
+{
+    /* Wayland drop implementation follows in edit-cxho.19. */
+    if (p && p->backend == PLAT_BACKEND_WAYLAND) { if (len) *len = 0; return NULL; }
+    return x11_plat_drop_data(p, len);
 }
 
 plat_x11_native plat_native_x11(const plat *p)

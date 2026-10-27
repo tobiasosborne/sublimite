@@ -38,6 +38,15 @@ typedef void *(*x11_clip_alloc_fn)(void *ctx, size_t bytes);
 typedef void (*x11_clip_free_fn)(void *ctx, void *ptr, size_t bytes);
 x11_clip_buf *x11_clip_buf_new_alloc(size_t len, x11_clip_alloc_fn alloc,
                                     x11_clip_free_fn release, void *ctx);
+/* (P) Existing clipboard wire slice ceiling, shared with XDND type-list reads. */
+#define X11_CLIP_CHUNK_MAX (256u * 1024u)
+/* Dedicated raw receive slot: shares clipboard buffers, worker and peer timeout.
+ * Only one drop at once; callback is x11_dnd_complete, never a clipboard event. */
+int x11_clip_drop_request(plat *p, xcb_atom_t selection, xcb_atom_t target,
+                          xcb_atom_t property, uint32_t time);
+const uint8_t *x11_clip_drop_data(const plat *p, size_t *len);
+/* Existing peer timeout, also used for asynchronous XDND type negotiation. */
+uint64_t x11_clip_peer_deadline(const plat *p);
 #define X11_CLIP_DATA_MAX (64u * 1024u * 1024u) /* existing protocol DATA_MAX */
 #define X11_CLIP_OWN_BUDGET (2u * X11_CLIP_DATA_MAX) /* existing OWN_BUDGET */
 x11_clip_buf *x11_clip_buf_new(size_t len);          /* NULL above 64 MiB or on OOM; len bytes uninitialised */

@@ -532,6 +532,10 @@ int plat_clip_request(plat *p, int which)
     if (!ui(s) || (which!=PLAT_CLIP_PRIMARY && which!=PLAT_CLIP_CLIPBOARD)) return PLAT_ERR_FAIL;
     return win32_clip_submit(s,false,which,NULL,0);
 }
+/* Win32 drop implementation follows in edit-cxho.20. */
+const uint8_t *plat_drop_data(const plat *p, size_t *len)
+{ (void)p; if (len) *len = 0; return NULL; }
+
 const uint8_t *plat_clip_data(const plat *p, size_t *len)
 {
     win32_plat *s=win32_private(p); if (len) *len=s ? s->clip_len : 0;

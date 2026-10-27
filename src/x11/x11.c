@@ -6,6 +6,7 @@
 #include "input.h"
 #include "xi2.h"
 #include "clip.h"
+#include "dnd.h"
 #include <limits.h>
 #include "work/work.h"
 #include <sys/socket.h>
@@ -565,6 +566,7 @@ found:
     setup_xi2(p);
     if (!x11_private(p)->xi) x11_private(p)->core_wheel = true;
     if (x11_clip_init(p) != PLAT_OK) { plat_shutdown(p); return PLAT_ERR_FAIL; }
+    if (x11_dnd_init(p) != PLAT_OK) { plat_shutdown(p); return PLAT_ERR_FAIL; }
     xcb_flush(c);
     trace_record_at(trace_now_ns(), TRACE_T2_MUTATION_DONE, 0);
     x11_private(p)->repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -640,6 +642,7 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         if (cb->on_event) cb->on_event(cb->ud, &ev);
         break; }
     case XCB_CLIENT_MESSAGE: {
+        x11_dnd_event(p, (const xcb_client_message_event_t *)e);
         xcb_client_message_event_t *x = (xcb_client_message_event_t *)e;
         if (x->type == x11_private(p)->wm_protocols && x->data.data32[0] == x11_private(p)->wm_delete) {
             ev.kind = PLAT_EV_CLOSE; if (cb->on_event) cb->on_event(cb->ud, &ev);
@@ -739,7 +742,8 @@ static bool drain(plat *p, const plat_callbacks *cb, uint64_t t_end) {
         if (!e) e = xcb_poll_for_event(C(p));
         if (e) { dispatch(p, cb, e); free(e); continue; }
         poll_rescans(p);
-        bool progress = x11_clip_poll(p);
+        bool progress = x11_dnd_poll(p);
+        if (x11_clip_poll(p)) progress = true;
         /* Reply polling can both enqueue platform events and read X events.
          * Deliver its queued input before any subsequent raw callback. */
         if (IN(p)->qh != IN(p)->qt || progress) continue;
@@ -757,6 +761,7 @@ int x11_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) {
         /* Expiry/reply progress also runs under a continuously readable X fd.
          * Clipboard internals retain their own transfer bounds. */
         poll_rescans(p);
+        (void)x11_dnd_poll(p);
         (void)x11_clip_poll(p);
         bool buffered = drain(p, cb, timeout_ms > 0 ? t_end : 0);
         if (xcb_connection_has_error(C(p)) ||
@@ -833,6 +838,7 @@ void x11_plat_shutdown(plat *p) {
     x11_clip_save_on_exit(p);
     if (x11_private(p)->timer_fd >= 0) close(x11_private(p)->timer_fd);
     if (x11_private(p)->repeat_fd >= 0) close(x11_private(p)->repeat_fd);
+    x11_dnd_destroy(p);
     x11_clip_destroy(p);
     free(x11_private(p)->xi);
     if (x11_private(p)->in) { x11_input_destroy(IN(p)); free(x11_private(p)->in); }
