@@ -409,7 +409,7 @@ static int render_rejected(editor *e, int rc, size_t *count)
     if (e->stats.render_rejects < UINT64_MAX) e->stats.render_rejects++;
     e->stats.render_reject_cause = rc;
     e->recovery_notice = render_notice; e->recovery_notice_mutations = e->stats.mutations;
-    editor_save_overlay(e);
+    editor_status_overlay(e);
     if (font_async_repair(e->fonts, &e->grid)) {
         e->caret_only = false; raster_set_caret_only(e->backend, false);
         rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, count);
@@ -433,9 +433,7 @@ static int submit(editor *e)
     if (editor_journal_paint(e) == JOURNAL_BUSY) return 0; /* edit-dzk1: guard before composing */
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
-    editor_save_overlay(e);
-    editor_close_overlay(e);
-    editor_goto_overlay(e);
+    editor_status_overlay(e);
     editor_large_index_progress(e);
     if (e->full_pending) return 0;
     if (e->render_dropped) { /* edit-dzk1: the backend lacks the dropped frame's damage */
@@ -583,6 +581,10 @@ static int drop_notice(editor *e, const char *message)
 }
 static int drop_files(editor *e)
 {
+    if (editor_active_modal(e) == EDITOR_MODAL_CLOSE_PROMPT) {
+        e->close_prompt.drop_refused = true;
+        return editor_full_layout(e); /* Refuse visibly without retaining a borrowed drop payload. */
+    }
     keys_reset(&e->keys); tabs_mru_release(&e->tabs); undo_break_burst(e->undo);
     e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = e->text_drag = false;
     e->map_drag_id = e->map_drag_generation = 0; /* (P) no captured owner. */
@@ -645,6 +647,21 @@ static int drop_files(editor *e)
     if (e->recovery_notice == e->drop_notice) e->recovery_notice = NULL;
     return 0; /* (P) no recoverable drop error reaches fail(). */
 }
+editor_modal editor_active_modal(const editor *e)
+{
+    if (editor_close_prompt_shown(e)) return EDITOR_MODAL_CLOSE_PROMPT;
+    if (e->buffer->source_stale) return EDITOR_MODAL_SOURCE_STALE;
+    if (e->go.active && e->go.owner == e->buffer->id && e->go.generation == e->buffer->source_generation) {
+        if (e->go.kind == KEYS_ACTION_OPEN_FILE) return EDITOR_MODAL_OPEN_PROMPT;
+        if (e->go.kind == KEYS_ACTION_SAVE_AS) return EDITOR_MODAL_SAVE_AS_PROMPT;
+        return EDITOR_MODAL_GOTO;
+    }
+    if (e->palette_open) return EDITOR_MODAL_PALETTE;
+    if (e->menu.active || e->menu.open >= 0) return EDITOR_MODAL_MENU;
+    if (e->buffer->pending_open) return EDITOR_MODAL_PENDING_OPEN;
+    if (e->find_visible) return e->fif.mode ? EDITOR_MODAL_FIND_IN_FILES : EDITOR_MODAL_FIND;
+    return EDITOR_MODAL_NONE;
+}
 static int nonkey_dispatch(editor *e, const plat_event *ev)
 {
     if (ev->kind == PLAT_EV_DROP) return drop_files(e);
@@ -674,20 +691,48 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_KEYMAP) { keys_reset(&e->keys); tabs_mru_release(&e->tabs); return 0; }
     if (ev->kind == PLAT_EV_WHEEL) return editor_handle_wheel(e, ev);
     if (ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) {
-        if (!e->buffer->source_stale) { int rc = 0; if (editor_menu_pointer(e, ev, &rc) || rc) return rc; }
-        if (e->go.active && (ev->kind == PLAT_EV_MOTION || !ev->press)) return 0;
-        if (e->go.active) { int cancel = editor_goto_cancel(e); if (cancel) return cancel; }
         return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);
     }
     return 0;
 }
 static int nonkey(editor *e, const plat_event *ev)
 {
+    editor_modal modal = editor_active_modal(e);
+    bool pointer = ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION || ev->kind == PLAT_EV_WHEEL;
+    /* Required answers own every pointer route, before find focus, menus,
+     * tab/minimap captures or PRIMARY can touch the document underneath. */
+    if (pointer && modal == EDITOR_MODAL_CLOSE_PROMPT) return 0;
+    bool transient = modal == EDITOR_MODAL_PALETTE || modal == EDITOR_MODAL_MENU ||
+        modal == EDITOR_MODAL_GOTO || modal == EDITOR_MODAL_OPEN_PROMPT || modal == EDITOR_MODAL_SAVE_AS_PROMPT;
     bool field_focused=e->find_focus==EDITOR_FIND_FIELD;
+    bool palette_was_open = e->palette_open, menu_was_visible = editor_menu_visible(e);
+    if (pointer && transient) {
+        /* Swallow middle paste and wheel/motion while a transient owns focus.
+         * A primary press dismisses it before document routing, using the
+         * painted hit map; geometry changes wait until after placement. */
+        if (ev->kind != PLAT_EV_BUTTON || ev->code != 1 || !ev->press) return 0;
+        int rc = 0;
+        if (modal == EDITOR_MODAL_PALETTE && editor_palette_pointer(e, ev, &rc)) return rc;
+        if (modal == EDITOR_MODAL_GOTO || modal == EDITOR_MODAL_OPEN_PROMPT || modal == EDITOR_MODAL_SAVE_AS_PROMPT) {
+            if (ev->y >= 0 && (uint32_t)ev->y / e->grid.dims.cell_h == e->grid.dims.rows - 1u) return 0;
+            /* Clicking the preview adopts the painted viewport, unlike Escape
+             * or a window command, which restores the pre-prompt position. */
+            e->go.active = e->go.accept = false;
+            if (e->action == EDITOR_ACTION_GOTO) e->action = EDITOR_ACTION_NONE;
+            keys_reset(&e->keys);
+        }
+        if (modal == EDITOR_MODAL_PALETTE) { e->palette_open = false; keys_reset(&e->keys); }
+    }
+    if ((ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION) && !e->buffer->source_stale) {
+        int menu_rc = 0;
+        if (editor_menu_pointer(e, ev, &menu_rc) || menu_rc) return menu_rc;
+    }
     bool handled=false;
     int rc=editor_find_pointer(e,ev,&handled);
     if (!rc && !handled) rc=nonkey_dispatch(e,ev);
-    if (!rc && field_focused!=(e->find_focus==EDITOR_FIND_FIELD)) {
+    if (!rc && (palette_was_open != e->palette_open || menu_was_visible != editor_menu_visible(e)))
+        return editor_text_geometry(e);
+    if (!rc && (field_focused!=(e->find_focus==EDITOR_FIND_FIELD) || modal != editor_active_modal(e))) {
         /* Transfer focus before dispatch, repaint after the pointer used the
          * currently painted hit map to place the document selection. */
         editor_restart_blink(e,trace_now_ns());

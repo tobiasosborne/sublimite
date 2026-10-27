@@ -1000,8 +1000,7 @@ static bool close_prompt_key(editor *e, const plat_event *ev, int *rc)
 {
     editor_close_prompt *p = &e->close_prompt; *rc = 0;
     if (!p->owner) return false;
-    /* Round 2: a prompt that is not the visible owner of the row (another
-     * prompt, the palette or the menu took it) is cancelled, never answered. */
+    /* Only a retired/changed owner invalidates the required answer. */
     if (!editor_close_prompt_shown(e)) { p->owner = 0; e->full_pending = true; return false; }
     if (!ev->press) return false;
     /* Its frame is still to be submitted: typed-ahead keys wait it out. A
@@ -1023,23 +1022,63 @@ static bool close_prompt_key(editor *e, const plat_event *ev, int *rc)
     }
     return true;
 }
+static bool window_action(keys_action action)
+{
+    switch (action) {
+    case KEYS_ACTION_CLOSE: case KEYS_ACTION_CLOSE_FILE: case KEYS_ACTION_CLOSE_WINDOW:
+    case KEYS_ACTION_NEXT_VIEW_STACK: case KEYS_ACTION_PREVIOUS_VIEW_STACK:
+    case KEYS_ACTION_NEXT_VIEW: case KEYS_ACTION_PREVIOUS_VIEW:
+    case KEYS_ACTION_SELECT_TAB: case KEYS_ACTION_SELECT_LAST_TAB:
+    case KEYS_ACTION_NEW_FILE: case KEYS_ACTION_OPEN_FILE: case KEYS_ACTION_REOPEN_FILE:
+    case KEYS_ACTION_SAVE: case KEYS_ACTION_SAVE_AS: case KEYS_ACTION_EXIT:
+    case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE: case KEYS_ACTION_FIND_IN_FILES:
+    case KEYS_ACTION_FIND_NEXT: case KEYS_ACTION_FIND_PREVIOUS: case KEYS_ACTION_INCREMENTAL_FIND:
+    case KEYS_ACTION_COMMAND_PALETTE: case KEYS_ACTION_GOTO_LINE:
+    case KEYS_ACTION_GOTO_FILE: case KEYS_ACTION_GOTO_SYMBOL:
+    case KEYS_ACTION_FONT_SIZE: case KEYS_ACTION_TOGGLE_MENU: case KEYS_ACTION_SCROLL_LINES:
+        return true;
+    default: return false;
+    }
+}
+static bool transient_field_key(const plat_event *ev)
+{
+    bool altgr = (ev->mods & PLAT_MOD_ALTGR) != 0;
+    bool ctrl = (ev->mods & PLAT_MOD_CTRL) != 0 && !altgr;
+    bool alt = (ev->mods & PLAT_MOD_ALT) != 0 && !altgr;
+    if (ev->keysym == XKB_KEY_Escape) return true;
+    if (ev->mods & PLAT_MOD_SUPER) return false;
+    if (ev->utf8_len && ((!ctrl && !alt) || altgr)) return true;
+    if (alt) return false;
+    if (ctrl && (ev->keysym == 'a' || ev->keysym == 'A' ||
+        ev->keysym == 'c' || ev->keysym == 'C' || ev->keysym == 'x' || ev->keysym == 'X' ||
+        ev->keysym == 'v' || ev->keysym == 'V' || ev->keysym == 'z' || ev->keysym == 'Z' ||
+        ev->keysym == 'y' || ev->keysym == 'Y')) return true;
+    switch (ev->keysym) {
+    case XKB_KEY_Left: case XKB_KEY_Right: case XKB_KEY_Home: case XKB_KEY_End:
+    case XKB_KEY_BackSpace: case XKB_KEY_Delete: case XKB_KEY_Return: case XKB_KEY_KP_Enter:
+        return true;
+    case XKB_KEY_Up: case XKB_KEY_Down: case XKB_KEY_Page_Up: case XKB_KEY_Page_Down: case XKB_KEY_Tab:
+        return !ctrl;
+    default: return false;
+    }
+}
 int editor_handle_key(editor *e, const plat_event *ev)
 {
     int close_rc = 0;
     if (close_prompt_key(e, ev, &close_rc)) return close_rc;
-    if (e->palette_open) return editor_palette_key(e, ev);
     /* edit-yey: the menu bar owns bare Alt, Alt+mnemonic and, while it has
      * keyboard focus, navigation; otherwise it steals no key. A changed
      * source or the go-to prompt keep their keys. */
-    if (!e->buffer->source_stale && !e->go.active) {
+    editor_modal modal = editor_active_modal(e);
+    if (modal != EDITOR_MODAL_SOURCE_STALE && !e->go.active && !e->palette_open) {
         int rc = 0;
         if (editor_menu_key(e, ev, &rc) || rc) return rc;
     }
     /* edit-n95: Escape cancels a running find in files first; the partial
      * results stay. With no search running Escape keeps its panel meaning. */
-    if (!e->go.active && ev->press && ev->keysym == XKB_KEY_Escape && editor_fif_cancel(e)) return 0;
+    if (!e->go.active && !e->palette_open && ev->press && ev->keysym == XKB_KEY_Escape && editor_fif_cancel(e)) return 0;
     /* An open go-to-line prompt owns Escape and digits over the find panel. */
-    if (!e->go.active && ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
+    if (!e->go.active && !e->palette_open && ev->press && ev->keysym==XKB_KEY_Escape && (e->find_visible || e->find_replace_active)) {
         (void)editor_find_key(e,ev); return 0;
     }
     if (e->go.active && (e->buffer->source_stale || e->go.owner != e->buffer->id ||
@@ -1060,7 +1099,17 @@ int editor_handle_key(editor *e, const plat_event *ev)
         return 0;
     }
     const keys_binding *binding = NULL;
-    keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    keys_result result = config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    if (e->palette_open || e->go.active) {
+        if (transient_field_key(ev)) {
+            keys_reset(&e->keys);
+            return e->palette_open ? editor_palette_key(e, ev) : goto_key(e, ev, e->go.kind);
+        }
+        /* Prefixes remain available to configured window commands. Other
+         * unowned editing chords cannot mutate the document behind a field. */
+        if (!binding || !window_action(binding->action)) return 0;
+        return editor_dispatch_action(e, ev, binding, result);
+    }
     /* Physical field keys belong to the focused panel. Menu/palette commands
      * enter editor_dispatch_action directly and retain their command intent. */
     if (!e->go.active && editor_find_key(e, ev)) return 0;
@@ -1068,6 +1117,12 @@ int editor_handle_key(editor *e, const plat_event *ev)
 }
 int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *binding, keys_result result)
 {
+    if (editor_active_modal(e) == EDITOR_MODAL_CLOSE_PROMPT) return 0;
+    if (binding && window_action(binding->action)) {
+        int rc = editor_goto_cancel(e);
+        if (!rc) rc = editor_palette_close(e);
+        if (rc) return rc;
+    }
     if (binding && binding->action == KEYS_ACTION_COMMAND_PALETTE) return editor_palette_show(e);
     if (binding && binding->action == KEYS_ACTION_TOGGLE_MENU) return editor_menu_toggle(e);
     if (!e->go.active && editor_find_action(e, ev, binding)) return 0;

@@ -379,11 +379,15 @@ static state expected(const fixture *f, mode m, action a, state s)
         else if (s.find) hide_find(&s);
         break;
     case CLICK:
-        if (s.close || s.palette || s.stale) { s.check_selection = true; break; } /* true modals own the mouse */
-        s.menu = -1; s.go = KEYS_ACTION_NONE; s.go_text[0] = '\0';
-        s.focused = DOCUMENT; s.map_drag = s.text_drag = false; break;
+        if (s.close || s.stale) { s.check_selection = true; break; }
+        s.palette = false; s.menu = -1; s.go = KEYS_ACTION_NONE; s.go_text[0] = '\0';
+        s.focused = DOCUMENT; s.map_drag = s.text_drag = false;
+        if (s.doc == DOC_B) { s.check_selection = true; s.cursor = s.anchor = sizeof "xalpha beta" - 1u; }
+        break;
     case MIDDLE:
-        if (s.close || s.palette || s.go || s.stale) break;
+        /* The brief permits swallowing PRIMARY at a transient. Selection and
+         * focus stay with it; no paste reaches the document underneath. */
+        if (s.close || s.palette || s.go || s.menu != -1 || s.stale) { s.check_selection = true; break; }
         s.menu = -1; s.focused = DOCUMENT; mutate(&s); break;
     case TYPE:
         if (s.palette) strcpy(s.palette_query, "x");
@@ -476,37 +480,6 @@ typedef enum observed {
 } observed;
 typedef struct expected_failure { mode m; action a; observed current; const char *reason; } expected_failure;
 static const expected_failure xfails[] = {
-    {GOTO, CLOSE, UNCHANGED, "edit-cxho.17: go-to swallows window Close chord"},
-    {GOTO, NEXT_MRU, UNCHANGED, "edit-cxho.17: go-to swallows next MRU tab chord"},
-    {GOTO, PREV_MRU, UNCHANGED, "edit-cxho.17: go-to swallows previous MRU tab chord"},
-    {GOTO, PREV_TAB, UNCHANGED, "edit-cxho.17: go-to swallows previous adjacent tab chord"},
-    {GOTO, NEXT_TAB, UNCHANGED, "edit-cxho.17: go-to swallows next adjacent tab chord"},
-    {GOTO, NEW, UNCHANGED, "edit-cxho.17: go-to swallows New File chord"},
-    {GOTO, OPEN, UNCHANGED, "edit-cxho.17: go-to swallows Open File chord; no open prompt appears"},
-    {GOTO, SAVE, UNCHANGED, "edit-cxho.17: go-to swallows Save chord; dirty document stays dirty"},
-    {GOTO, REOPEN, UNCHANGED, "edit-cxho.17: go-to swallows Reopen File chord"},
-    {GOTO, FIND, UNCHANGED, "edit-cxho.17: go-to swallows Find chord"},
-    {GOTO, COMMANDS, UNCHANGED, "edit-cxho.17: go-to swallows Command Palette chord"},
-    {GOTO, CLICK, DISMISS_WITH_FIELD_FOCUS, "edit-cxho.17: click cancels go-to but leaves find field focus and caret unchanged"},
-    {GOTO, MIDDLE, PASTE_BEHIND_GO, "edit-cxho.17: middle paste edits the document behind go-to"},
-    {PALETTE, CLOSE, UNCHANGED, "edit-cxho.17: palette swallows window Close chord"},
-    {PALETTE, NEXT_MRU, UNCHANGED, "edit-cxho.17: palette swallows next MRU tab chord"},
-    {PALETTE, PREV_MRU, UNCHANGED, "edit-cxho.17: palette swallows previous MRU tab chord"},
-    {PALETTE, PREV_TAB, UNCHANGED, "edit-cxho.17: palette swallows previous adjacent tab chord"},
-    {PALETTE, NEXT_TAB, UNCHANGED, "edit-cxho.17: palette swallows next adjacent tab chord"},
-    {PALETTE, NEW, UNCHANGED, "edit-cxho.17: palette swallows New File chord"},
-    {PALETTE, OPEN, UNCHANGED, "edit-cxho.17: palette swallows Open File chord; no prompt appears"},
-    {PALETTE, SAVE, UNCHANGED, "edit-cxho.17: palette swallows Save chord; dirty document stays dirty"},
-    {PALETTE, REOPEN, UNCHANGED, "edit-cxho.17: palette swallows Reopen File chord"},
-    {PALETTE, GO, UNCHANGED, "edit-cxho.17: palette swallows Go to Line chord"},
-    {PALETTE, FIND, UNCHANGED, "edit-cxho.17: palette swallows Find chord"},
-    {PALETTE, CLICK, PALETTE_CARET, "edit-cxho.17: primary click moves the document caret behind palette"},
-    {PALETTE, MIDDLE, PASTE_BEHIND_PALETTE, "edit-cxho.17: middle paste edits document and closes palette"},
-    {MENU, CLICK, DISMISS_WITH_FIELD_FOCUS, "edit-cxho.17: text click dismisses menu but retains find field focus"},
-    {MENU, MIDDLE, PASTE_BEHIND_MENU, "edit-cxho.17: middle paste edits behind open menu without transferring focus"},
-    {CLOSE_PROMPT, CLICK, CLOSE_CARET, "edit-cxho.17: primary click moves caret and find focus behind close prompt"},
-    {CLOSE_PROMPT, MIDDLE, PASTE_BEHIND_CLOSE, "edit-cxho.17: middle paste edits document behind unanswered close prompt"},
-    {CLOSE_PROMPT, DROP, DROP_LOSES_CLOSE, "edit-cxho.17: drop activates a new tab and silently cancels unanswered close prompt"},
     /* MODE_COUNT denotes the supplemental running-job witness, not a matrix row. */
     {MODE_COUNT, CLOSE, LIVE_SEARCH_AFTER_CLOSE, "edit-cxho.18: closing live Find Results leaves its search running"}
 };
@@ -543,7 +516,7 @@ static state observed_state(const fixture *f, const expected_failure *xf, state 
     return current;
 }
 
-typedef enum route { VIA_MENU, VIA_PALETTE } route;
+typedef enum route { VIA_MENU, VIA_PALETTE, VIA_PALETTE_CLICK } route;
 static const struct command_case { action a; keys_action command; const char *label; } commands[] = {
     {CLOSE, KEYS_ACTION_CLOSE, "Close"}, {NEW, KEYS_ACTION_NEW_FILE, "New File"},
     {OPEN, KEYS_ACTION_OPEN_FILE, "Open File"}, {SAVE, KEYS_ACTION_SAVE, "Save"},
@@ -571,8 +544,17 @@ static int run_command(fixture *f, route via, const struct command_case *c, bool
             e->palette->rows[e->palette->matches[selected]].binding->action != c->command) selected++;
         T(selected < e->palette->count);
         for (size_t i = 0; i < selected; i++) T(chord(e, XKB_KEY_Down, 0) == 0);
+        if (via == VIA_PALETTE_CLICK) {
+            /* (P) The query is the first panel row; matches start one row
+             * later, with the painter's existing scroll offset. */
+            uint32_t row = e->grid.dims.rows - e->panel_rows + 1u + (uint32_t)(selected - e->palette->first);
+            plat_event ev = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+                .x = 0, .y = (int32_t)(row * e->grid.dims.cell_h)};
+            T(send_event(e, ev) == 0);
+            ev.press = false; T(send_event(e, ev) == 0);
+        }
     }
-    T(chord(e, XKB_KEY_Return, 0) == 0);
+    if (via != VIA_PALETTE_CLICK) T(chord(e, XKB_KEY_Return, 0) == 0);
     if (c->a == OPEN) {
         *open_seen = e->go.active && e->go.kind == KEYS_ACTION_OPEN_FILE;
         if (*open_seen) T(chord(e, XKB_KEY_Escape, 0) == 0);
@@ -581,12 +563,12 @@ static int run_command(fixture *f, route via, const struct command_case *c, bool
 }
 static int command_witnesses(size_t *passed, size_t *failed)
 {
-    puts("\n| Find focus | Command | Menu | Palette |\n|---|---|---|---|");
+    puts("\n| Find focus | Command | Menu | Palette | Palette click |\n|---|---|---|---|---|");
     const mode modes[] = {FIND_FIELD, FIND_DOCUMENT};
     for (size_t i = 0; i < N(modes); i++) for (size_t j = 0; j < N(commands); j++) {
         const struct command_case *c = &commands[j];
         printf("| %s | %s |", mode_names[modes[i]], c->label);
-        for (route via = VIA_MENU; via <= VIA_PALETTE; via++) {
+        for (route via = VIA_MENU; via <= VIA_PALETTE_CLICK; via++) {
             fixture f = {0}; state before = {0}, actual = {0};
             int rc = fixture_open(&f, modes[i], c->a);
             if (!rc) rc = snapshot(&f, &before);
@@ -598,7 +580,7 @@ static int command_witnesses(size_t *passed, size_t *failed)
                 if (c->a == UNDO) want.focused = DOCUMENT;
                 want = expected(&f, modes[i], c->a, want);
                 want.focused = before.focused;
-                if (via == VIA_PALETTE) strcpy(want.palette_query, c->label);
+                if (via != VIA_MENU) strcpy(want.palette_query, c->label);
             }
             bool open_seen = false;
             if (!rc) rc = run_command(&f, via, c, &open_seen);
@@ -606,7 +588,7 @@ static int command_witnesses(size_t *passed, size_t *failed)
             actual.open_seen = open_seen;
             bool ok = !rc && equal(want, actual);
             if (!ok) {
-                fprintf(stderr, "FAIL %s x %s %s rc=%d\n", mode_names[modes[i]], via == VIA_MENU ? "menu" : "palette", c->label, rc);
+                fprintf(stderr, "FAIL %s x route=%d %s rc=%d\n", mode_names[modes[i]], (int)via, c->label, rc);
                 describe("want", want); describe(" got", actual); (*failed)++;
             } else (*passed)++;
             if (fixture_close(&f)) { (*failed)++; ok = false; }
@@ -615,13 +597,18 @@ static int command_witnesses(size_t *passed, size_t *failed)
         putchar('\n');
     }
     puts("\n| Find focus | click then type x |\n|---|---|");
-    for (size_t i = 0; i < N(modes); i++) {
+    const mode click_modes[] = {FIND_FIELD, FIND_DOCUMENT, GOTO, PALETTE, MENU};
+    for (size_t i = 0; i < N(click_modes); i++) {
         fixture f = {0}; state before = {0}, actual = {0};
-        int rc = fixture_open(&f, modes[i], TYPE);
+        int rc = fixture_open(&f, click_modes[i], TYPE);
         if (!rc) rc = snapshot(&f, &before);
-        if (!rc) rc = precondition(modes[i], before);
+        if (!rc) rc = precondition(click_modes[i], before);
         state want = before;
-        if (!rc) { want = expected(&f, modes[i], CLICK, want); want = expected(&f, FIND_DOCUMENT, TYPE, want); }
+        if (!rc) {
+            want = expected(&f, click_modes[i], CLICK, want);
+            want = expected(&f, FIND_DOCUMENT, TYPE, want);
+            want.cursor++; want.anchor++; /* (P) the inserted literal x is one byte. */
+        }
         if (!rc) rc = click_text(f.e);
         if (!rc) rc = send_event(f.e, key('x', 0, "x"));
         if (!rc) rc = snapshot(&f, &actual);
@@ -629,9 +616,87 @@ static int command_witnesses(size_t *passed, size_t *failed)
         if (!ok) { describe("want click/type", want); describe("got click/type", actual); (*failed)++; }
         else (*passed)++;
         if (fixture_close(&f)) { (*failed)++; ok = false; }
-        printf("| %s | %s |\n", mode_names[modes[i]], ok ? "PASS" : "FAIL");
+        printf("| %s | %s |\n", mode_names[click_modes[i]], ok ? "PASS" : "FAIL");
     }
     return 0;
+}
+static int field_witness(mode m)
+{
+    fixture f = {0}; int rc = fixture_open(&f, m, TYPE);
+    const struct { uint32_t sym; uint16_t mods; } fields[] = {
+        {XKB_KEY_Left, 0}, {XKB_KEY_Right, 0}, {XKB_KEY_Home, 0}, {XKB_KEY_End, 0},
+        {XKB_KEY_BackSpace, 0}, {XKB_KEY_Delete, 0}, {XKB_KEY_Tab, 0},
+        {'a', PLAT_MOD_CTRL}, {'c', PLAT_MOD_CTRL}, {'x', PLAT_MOD_CTRL},
+        {'v', PLAT_MOD_CTRL}, {'z', PLAT_MOD_CTRL}, {'y', PLAT_MOD_CTRL}
+    };
+    for (size_t i = 0; !rc && i < N(fields); i++) rc = chord(f.e, fields[i].sym, fields[i].mods);
+    if (!rc && (f.e->buffer->revision != f.revisions[DOC_B] ||
+        (m == GOTO ? !f.e->go.active : !f.e->palette_open) ||
+        findui_get_state(&f.e->find).query_length != sizeof needle - 1u)) rc = 1;
+    if (fixture_close(&f)) rc = 1;
+    return rc;
+}
+static bool last_row_contains(editor *e, const char *text)
+{
+    size_t n = strlen(text);
+    if (!e->grid.dims.rows || n > e->grid.dims.cols) return false;
+    for (size_t col = 0; col <= e->grid.dims.cols - n; col++) {
+        size_t at = 0;
+        while (at < n && e->grid.cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols + col + at].glyph_index == (uint32_t)(uint8_t)text[at]) at++;
+        if (at == n) return true;
+    }
+    return false;
+}
+static int close_mouse_witness(bool drop)
+{
+    fixture f = {0}; int rc = fixture_open(&f, drop ? CLOSE_PROMPT : NONE, CLICK);
+    if (!rc && !drop) {
+        /* Explicit View > Toggle Menu command, before requesting close;
+         * its pinned title remains a mouse target behind the prompt. */
+        rc = editor_menu_toggle(f.e);
+        if (!rc) rc = settle(f.e);
+        if (!rc) rc = send_event(f.e, key('x', 0, "x"));
+        if (!rc) rc = chord(f.e, 'w', PLAT_MOD_CTRL);
+    }
+    state before = {0}, after = {0};
+    if (!rc) rc = snapshot(&f, &before);
+    bool ignored = false;
+    if (!rc && drop) rc = perform(&f, DROP, &ignored);
+    if (!rc && !drop) rc = send_event(f.e, (plat_event){.kind = PLAT_EV_BUTTON, .code = 1, .press = true});
+    if (!rc) rc = snapshot(&f, &after);
+    before.check_selection = true;
+    if (!rc && (!equal(before, after) || !editor_close_prompt_shown(f.e) ||
+        !grid_prefix(f.e, f.e->grid.dims.rows - 1u, "Save changes to ") ||
+        (drop && !last_row_contains(f.e, "Drop refused")))) rc = 1;
+    if (fixture_close(&f)) rc = 1;
+    return rc;
+}
+static int preview_click_witness(void)
+{
+    fixture f = {0}; int rc = fixture_open(&f, GOTO, CLICK);
+    if (!rc) rc = type_string(f.e, "2"); /* (P) the fixture's trailing newline starts its second line. */
+    if (!rc && f.e->v.state.selection.cursor != sizeof edited - 1u) rc = 1;
+    if (!rc) rc = click_text(f.e);
+    if (!rc && (f.e->go.active || f.e->find_focus != EDITOR_FIND_DOCUMENT ||
+        f.e->v.state.selection.cursor != sizeof "xalpha beta" - 1u ||
+        f.e->v.state.selection.anchor != f.e->v.state.selection.cursor)) rc = 1;
+    if (fixture_close(&f)) rc = 1;
+    return rc;
+}
+static void transient_witnesses(size_t *passed, size_t *failed)
+{
+    const struct { const char *name; int rc; } cases[] = {
+        {"go-to field keys", field_witness(GOTO)},
+        {"palette field keys", field_witness(PALETTE)},
+        {"close prompt swallows menu title", close_mouse_witness(false)},
+        {"close prompt refuses drop visibly", close_mouse_witness(true)},
+        {"go-to preview click uses painted text", preview_click_witness()}
+    };
+    puts("\n| Transient witness | Outcome |\n|---|---|");
+    for (size_t i = 0; i < N(cases); i++) {
+        if (cases[i].rc) (*failed)++; else (*passed)++;
+        printf("| %s | %s |\n", cases[i].name, cases[i].rc ? "FAIL" : "PASS");
+    }
 }
 static int lifecycle_witnesses(size_t *passed, size_t *xfailed, size_t *failed)
 {
@@ -728,11 +793,12 @@ int main(void)
         putchar('\n');
     }
     T(command_witnesses(&passed, &failed) == 0);
+    transient_witnesses(&passed, &failed);
     T(lifecycle_witnesses(&passed, &xfailed, &failed) == 0);
     puts("\nXFAIL table (strict observed-state pins; XPASS fails):\n\n| Mode | Action | Reason |\n|---|---|---|");
     for (size_t i = 0; i < N(xfails); i++) printf("| %s | %s | %s |\n",
         xfails[i].m == MODE_COUNT ? "running results" : mode_names[xfails[i].m], action_names[xfails[i].a], xfails[i].reason);
-    printf("modal_matrix_test: %zu PASS, %zu XFAIL, %zu FAIL (P: enum cross product plus command/click/lifecycle witnesses)\n", passed, xfailed, failed);
+    printf("modal_matrix_test: %zu PASS, %zu XFAIL, %zu FAIL (P: enum cross product plus command/click/transient/lifecycle witnesses)\n", passed, xfailed, failed);
     fflush(stdout);
     return failed ? 1 : 0;
 }

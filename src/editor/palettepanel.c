@@ -26,6 +26,17 @@ int editor_palette_sync(editor *e)
         return editor_palette_close(e);
     return 0;
 }
+static int palette_run(editor *e, const plat_event *ev)
+{
+    palette_state *p = e->palette;
+    const keys_binding *binding = p->count ? p->rows[p->matches[p->selected]].binding : NULL;
+    int rc = editor_palette_close(e); if (rc || !binding) return rc;
+    /* The command's own stroke preserves intent for both Enter and clicks,
+     * including Undo while the retained find field owns physical Ctrl+Z. */
+    plat_event command = {.kind = PLAT_EV_KEY, .press = true, .keysym = binding->keysym,
+        .mods = binding->modifiers, .t0_ns = ev->t0_ns};
+    return editor_dispatch_action(e, &command, binding, KEYS_MATCH);
+}
 int editor_palette_key(editor *e, const plat_event *ev)
 {
     if (!ev->press) return 0;
@@ -34,16 +45,7 @@ int editor_palette_key(editor *e, const plat_event *ev)
     if (ev->keysym == XKB_KEY_Escape) return editor_palette_close(e);
     if (ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_SUPER) ||
         ((ev->mods & PLAT_MOD_ALT) && !(ev->mods & PLAT_MOD_ALTGR))) return 0;
-    if (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter) {
-        const keys_binding *binding = p->count ? p->rows[p->matches[p->selected]].binding : NULL;
-        int rc = editor_palette_close(e); if (rc || !binding) return rc;
-        /* The immutable command pointer also remains valid for repeat/history.
-         * Synthesize its stroke so field/Return semantics see the same event
-         * as the binding, rather than the palette's confirming Enter. */
-        plat_event command = {.kind = PLAT_EV_KEY, .press = true, .keysym = binding->keysym,
-            .mods = binding->modifiers, .t0_ns = ev->t0_ns};
-        return editor_dispatch_action(e, &command, binding, KEYS_MATCH);
-    }
+    if (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter) return palette_run(e, ev);
     if (ev->keysym == XKB_KEY_Up) {
         if (p->selected) p->selected--;
     } else if (ev->keysym == XKB_KEY_Down) {
@@ -58,6 +60,24 @@ int editor_palette_key(editor *e, const plat_event *ev)
         (void)palette_filter(p, p->query, length + ev->utf8_len);
     }
     return editor_begin_frame(e);
+}
+bool editor_palette_pointer(editor *e, const plat_event *ev, int *rc)
+{
+    *rc = 0;
+    if (!e->palette_open || !e->panel_rows || ev->kind != PLAT_EV_BUTTON ||
+        ev->code != 1 || !ev->press || ev->x < 0 || ev->y < 0) return false;
+    /* (P) Hit the same half-open rows and scroll offset as the painter:
+     * query first, then one row per visible command. */
+    uint32_t row = (uint32_t)ev->y / e->grid.dims.cell_h;
+    uint32_t col = (uint32_t)ev->x / e->grid.dims.cell_w;
+    uint32_t first = e->grid.dims.rows - e->panel_rows;
+    if (col >= e->grid.dims.cols || row < first || row >= e->grid.dims.rows) return false;
+    size_t index = e->palette->first + row - first;
+    if (row != first && index - 1u < e->palette->count) {
+        e->palette->selected = index - 1u;
+        *rc = palette_run(e, ev);
+    }
+    return true; /* Query/unused panel cells retain palette focus. */
 }
 /* Same ASCII atlas/cell convention and style as findui/paint.c. Numbers are
  * (P) ASCII space/tilde bounds; colours are the find panel's theme tokens. */

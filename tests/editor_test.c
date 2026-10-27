@@ -6253,7 +6253,9 @@ static int menu_contract(void)
     click.x = (int32_t)((e->text_grid.dims.cols - 1u) * cw + cw / 2u);
     click.y = (int32_t)((e->grid.dims.rows - 1u) * ch + ch / 2u);
     T(press(e, click) == 0); click.press = false; T(press(e, click) == 0);
-    T(!e->menu_rows && e->menu.open < 0 && expect(e, initial, 0) == 0);
+    /* edit-cxho.17 (P): this blank text row places the caret at the fixture's
+     * EOF while dismissing the menu, rather than consuming the first click. */
+    T(!e->menu_rows && e->menu.open < 0 && expect(e, initial, sizeof initial - 1u) == 0);
     /* Focus loss closes a latched or open menu. */
     T(press(e, key(XKB_KEY_Alt_L, 0, NULL)) == 0);
     T(press(e, key_release(XKB_KEY_Alt_L, PLAT_MOD_ALT)) == 0); T(e->menu_rows);
@@ -7167,8 +7169,8 @@ static int close_review_done(editor *e, const char *dir, const char *path)
 {
     editor_close(e); T(unlink(path) == 0 && rmdir(dir) == 0); return 0;
 }
-/* (1) A prompt that takes the row (the mouse menu's File > Save As
- * dispatch) leaves the close prompt no keys: d goes into the filename. */
+/* edit-cxho.17: even an explicit menu command cannot replace an unanswered
+ * close prompt. Physical keyboard/window chords keep their pinned policy. */
 static int close_review_hidden(void)
 {
     editor *e; render_backend backend = {0}; char dir[32], path[64];
@@ -7178,13 +7180,13 @@ static int close_review_hidden(void)
     const keys_binding *save_as = menu_command(KEYS_ACTION_SAVE_AS); T(save_as);
     plat_event command = {.kind = PLAT_EV_KEY, .press = true, .keysym = save_as->keysym, .mods = save_as->modifiers};
     T(editor_dispatch_action(e, &command, save_as, KEYS_MATCH) == 0); T(settle(e) == 0);
-    T(e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);
-    T(press(e, key('d', 0, "d")) == 0);
-    T(tabs_count(&e->tabs) == 1 && e->go.active && e->go.length == 1 && e->go.digits[0] == 'd');
+    T(!e->go.active && editor_close_prompt_shown(e) && close_status(e, "Save changes to doc.txt?"));
+    T(press(e, key('q', 0, "q")) == 0);
+    T(tabs_count(&e->tabs) == 1 && !e->go.active && close_status(e, "Save changes to doc.txt?"));
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->go.active && !close_status(e, "Save changes"));
     T(tabs_count(&e->tabs) == 1 && close_text_is(e, "xabc"));
     T(close_review_done(e, dir, path) == 0);
-    puts("edit-2ye3 round 2 (1): a prompt over the close prompt gets the keys: PASS"); return 0;
+    puts("edit-cxho.17: explicit menu command preserves the required close answer: PASS"); return 0;
 }
 /* (2) A wide title keeps the row contract-valid and the prompt answerable;
  * a prompt whose frame never reached the screen swallows no key. */

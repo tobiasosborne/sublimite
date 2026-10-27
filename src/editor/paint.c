@@ -511,8 +511,8 @@ void editor_goto_overlay(editor *e)
  * region and the minimap region disabled for the frame (round 2). Title
  * bytes outside printable ASCII draw '?' per grapheme, so every cell is a
  * plain one-cell ASCII cell and the row is always contract-valid. The title
- * is cut so the choices stay visible. A prompt that lost the row to another
- * prompt, the palette or the menu is cancelled here. Embedded storage only. */
+ * is cut so the choices stay visible. The required answer keeps precedence
+ * over the other transients. Embedded storage only. */
 static uint32_t close_ascii(editor *e, render_cell *cells, uint32_t col, const char *text, uint32_t fg, uint32_t bg)
 {
     for (; *text && col < e->grid.dims.cols; text++, col++) {
@@ -528,7 +528,9 @@ void editor_close_overlay(editor *e)
     if (!e->close_prompt.owner || !tab || !e->grid.dims.rows) return;
     if (e->grid.region.pixels || e->grid.scroll.origin_y_q8) (void)render_mark_full(&e->grid);
     e->grid.region = (render_pixels){0}; e->grid.scroll = (render_scroll){0};
-    static const char prefix[] = "Save changes to ", suffix[] = "? S save / D don't save / Esc cancel";
+    static const char prefix[] = "Save changes to ";
+    const char *suffix = e->close_prompt.drop_refused ?
+        "? Drop refused; S save / D don't save / Esc cancel" : "? S save / D don't save / Esc cancel";
     uint32_t fg = config_theme_color(e->preferences.theme, "warning.foreground");
     uint32_t bg = config_theme_color(e->preferences.theme, "chrome.background");
     uint32_t row = e->grid.dims.rows - 1u, cols = e->grid.dims.cols;
@@ -536,7 +538,7 @@ void editor_close_overlay(editor *e)
     for (uint32_t c = 0; c < cols; c++) cells[c] = (render_cell){' ', 0, fg, bg, 0, 0};
     uint32_t col = close_ascii(e, cells, 0, prefix, fg, bg);
     /* (P) string lengths exclude their terminators. */
-    uint32_t reserve = (uint32_t)(sizeof suffix - 1u), end = cols > col + reserve ? cols - reserve : col;
+    uint32_t reserve = (uint32_t)strlen(suffix), end = cols > col + reserve ? cols - reserve : col;
     for (size_t byte = 0; byte < tab->title_len && col < end; col++) {
         const uint8_t *at = (const uint8_t *)tab->title + byte;
         size_t n = utf8_grapheme_next(at, tab->title_len - byte);
@@ -546,4 +548,19 @@ void editor_close_overlay(editor *e)
     }
     (void)close_ascii(e, cells, col, suffix, fg, bg);
     (void)render_mark_rows(&e->grid, row, 1);
+}
+void editor_status_overlay(editor *e)
+{
+    /* One owner for the last row: required close, source answer, navigation
+     * input, palette/find panel, then ordinary save/error/notice status.
+     * Menus occupy their own bar/dropdown and retain the underlying owner. */
+    switch (editor_active_modal(e)) {
+    case EDITOR_MODAL_CLOSE_PROMPT: editor_close_overlay(e); return;
+    case EDITOR_MODAL_GOTO: case EDITOR_MODAL_OPEN_PROMPT: case EDITOR_MODAL_SAVE_AS_PROMPT:
+        editor_goto_overlay(e); return;
+    case EDITOR_MODAL_SOURCE_STALE: return; /* compose already painted its answer. */
+    default:
+        if (!e->panel_rows) editor_save_overlay(e);
+        return;
+    }
 }

@@ -612,12 +612,11 @@ int editor_close_request(editor *e)
     return editor_begin_frame(e);
 }
 int editor_close_answer_discard(editor *e) { return user_close(e, tabs_active_index(&e->tabs), true); }
-/* The prompt owns the status row and the keys only while no other prompt,
- * panel focus or menu has them (round 2: another prompt cancels it). */
+/* An unanswered close owns input and its status row over other transients.
+ * In particular, opening/clicking a menu cannot silently cancel the answer. */
 bool editor_close_prompt_shown(const editor *e)
 {
-    return e->close_prompt.owner && e->close_prompt.owner == e->buffer->id && tabs_count(&e->tabs) &&
-        !e->go.active && !e->palette_open && e->menu.open < 0 && !e->menu.active;
+    return e->close_prompt.owner && e->close_prompt.owner == e->buffer->id && tabs_count(&e->tabs);
 }
 /* The save chosen with S has ended: no Save As path being typed or queued,
  * no save, Save As write or checkpoint in flight. */

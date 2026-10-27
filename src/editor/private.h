@@ -235,7 +235,15 @@ typedef struct editor_goto {
  * As) decides the close; it closes once that save leaves it unmodified. */
 typedef struct editor_close_prompt {
     uint64_t owner, prompt_ns, prompt_serial, saving;
+    bool drop_refused; /* The required answer and its drop notice share the row. */
 } editor_close_prompt;
+/* Computed from existing owners; never cached across input or tab changes. */
+typedef enum editor_modal {
+    EDITOR_MODAL_NONE, EDITOR_MODAL_FIND, EDITOR_MODAL_FIND_IN_FILES,
+    EDITOR_MODAL_PALETTE, EDITOR_MODAL_MENU, EDITOR_MODAL_GOTO,
+    EDITOR_MODAL_OPEN_PROMPT, EDITOR_MODAL_SAVE_AS_PROMPT,
+    EDITOR_MODAL_CLOSE_PROMPT, EDITOR_MODAL_SOURCE_STALE, EDITOR_MODAL_PENDING_OPEN
+} editor_modal;
 typedef enum editor_action { EDITOR_ACTION_NONE, EDITOR_ACTION_GOTO, EDITOR_ACTION_MOVE, EDITOR_ACTION_DELETE, EDITOR_ACTION_REPAIR, EDITOR_ACTION_REPLAY, EDITOR_ACTION_REPLAY_WORK, EDITOR_ACTION_CLIP } editor_action;
 typedef struct editor_backend_init {
     render_backend backend;
@@ -693,12 +701,14 @@ int editor_records_check(const editor_records *c);
 void editor_records_free(editor_records *c);
 int editor_resize_now(editor *e, uint32_t width, uint32_t height);
 bool editor_event_control(const editor *e, const plat_event *ev);
+editor_modal editor_active_modal(const editor *e);
 int editor_handle_key(editor *e, const plat_event *ev);
 int editor_dispatch_action(editor *, const plat_event *, const keys_binding *, keys_result);
 int editor_palette_show(editor *);
 int editor_palette_close(editor *);
 int editor_palette_sync(editor *);
 int editor_palette_key(editor *, const plat_event *);
+bool editor_palette_pointer(editor *, const plat_event *, int *rc);
 int editor_palette_paint(editor *);
 /* edit-yey menu bar (menubar.c). key/pointer return true when consumed,
  * with the result in *rc. Paint runs at the end of every composition. */
@@ -730,6 +740,7 @@ void editor_refresh_complete(void *ctx, uint32_t id, uint64_t ns);
 void editor_refresh_flush(editor *e);
 int editor_continue_action(editor *e);
 void editor_goto_overlay(editor *e);
+void editor_status_overlay(editor *e);
 int editor_goto_cancel(editor *e);
 /* edit-2ye3 (buffers.c): user close (prompts for a modified tab), the close
  * that drops a modified tab outright when the closed pool is all modified

@@ -205,7 +205,9 @@ bool editor_menu_pointer(editor *e, const plat_event *ev, int *rc)
         }
     }
     if (!latched) return false; /* a pinned idle bar leaves other clicks alone */
-    close_all(e); *rc = update(e, was, true); return true;
+    /* Outside press falls through to field/document placement on the painted
+     * geometry. nonkey updates visibility/layout after that hit is consumed. */
+    close_all(e); return false;
 }
 /* Paint with change detection, so an unchanged overlay adds no damage and
  * a caret-only frame stays caret-only. ASCII atlas as the palette/find
