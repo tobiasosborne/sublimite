@@ -4665,6 +4665,154 @@ static int find_incremental_contract(void)
     T(find_incremental_case(true, false) == 0);
     return 0;
 }
+/* edit-cxho.13 (P): offsets/lengths/counts derive from the literal fixtures;
+ * zero is success/absence/first byte and one advances a byte or removes NUL.
+ * (E) geometry reuses find_focus_contract. Zero allocations (P) is the
+ * binding typing-path rule. Selection helpers use ASCII fixture bytes. */
+static int find_seed_selection(editor *e, uint64_t start, uint64_t end)
+{
+    T(editor_set_cursor(e, start) == 0); T(settle(e) == 0);
+    for (uint64_t at = start; at < end; at++)
+        T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+    return 0;
+}
+static int find_seed_prefill(void)
+{
+    static const char text[] = "foo bar foo\nfoo", query[] = "foo";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(find_seed_selection(e, 0, sizeof query - 1u) == 0);
+    edit_malloc_guard_begin();
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    T(edit_malloc_guard_end() == 0);
+    T(find_focus_query(e, query) == 0);
+    findui_state state = findui_get_state(&e->find);
+    T(state.complete && state.match_count == 3u); /* (P) fixture foo occurrences */
+    T(e->find_field_all && state.query_cursor == sizeof query - 1u);
+    T(editor_view(e).selection.anchor == sizeof "foo bar " - 1u);
+    T(editor_view(e).selection.cursor == sizeof "foo bar foo" - 1u);
+    bool count_shown = false;
+    uint32_t row = e->grid.dims.rows - e->panel_rows;
+    for (size_t col = 0; col < e->grid.dims.cols; col++)
+        count_shown |= palette_grid_text(e, row, col, "2/3"); /* (P) second of three matches */
+    T(count_shown);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(editor_set_cursor(e, 0) == 0); T(settle(e) == 0);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    T(find_focus_query(e, query) == 0); T(e->find_field_all);
+    T(press(e, key('b', 0, "bar")) == 0); T(find_focus_query(e, "bar") == 0);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    /* A multiline selection retains the previous query. */
+    T(find_seed_selection(e, 0, sizeof text - 1u) == 0);
+    T(press(e, key('h', PLAT_MOD_CTRL, NULL)) == 0);
+    T(find_focus_query(e, "bar") == 0); T(e->find_field_all);
+    T(findui_get_state(&e->find).replace_mode);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(find_seed_selection(e, 0, sizeof query - 1u) == 0);
+    T(press(e, key('h', PLAT_MOD_CTRL, NULL)) == 0);
+    T(find_focus_query(e, query) == 0); T(e->find_field_all);
+    editor_close(e);
+    puts("edit-cxho.13 prefill: selection/count/origin, retained selected query, Replace, multiline fallback passed");
+    return 0;
+}
+static int find_seed_slurp(void)
+{
+    static const char text[] = "foo bar foo\nfoo", query[] = "foo", replacement[] = "bar";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(find_seed_selection(e, 0, sizeof query - 1u) == 0);
+    view_selection origin = editor_view(e).selection;
+    edit_malloc_guard_begin();
+    T(press(e, key('e', PLAT_MOD_CTRL, NULL)) == 0);
+    T(edit_malloc_guard_end() == 0);
+    T(!e->find_visible && !e->panel_rows); T(find_focus_query(e, query) == 0);
+    T(editor_view(e).selection.cursor == origin.cursor && editor_view(e).selection.anchor == origin.anchor);
+    T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0);
+    T(editor_view(e).selection.anchor == sizeof "foo bar " - 1u);
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_view(e).selection.anchor == 0);
+    T(find_seed_selection(e, sizeof "foo " - 1u, sizeof "foo bar" - 1u) == 0);
+    T(press(e, key('e', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    findui_state state = findui_get_state(&e->find);
+    T(state.replacement_length == sizeof replacement - 1u);
+    T(!memcmp(state.replacement, replacement, sizeof replacement - 1u));
+    T(find_focus_query(e, query) == 0); T(!e->find_visible && !e->panel_rows);
+    /* Empty selections slurp a word without moving the document selection. */
+    T(editor_set_cursor(e, sizeof "foo b" - 1u) == 0); T(settle(e) == 0);
+    T(press(e, key('e', PLAT_MOD_CTRL, NULL)) == 0);
+    T(find_focus_query(e, replacement) == 0);
+    T(editor_view(e).selection.cursor == sizeof "foo b" - 1u &&
+        editor_view(e).selection.anchor == sizeof "foo b" - 1u);
+    editor_close(e);
+    puts("edit-cxho.13 slurp: hidden query/F3/previous, replacement, caret word, unchanged selection passed");
+    return 0;
+}
+static int find_seed_under(void)
+{
+    static const char text[] = "foo foobar foo\nfoo", query[] = "foo";
+    const uint64_t next = sizeof "foo foobar " - 1u, last = sizeof "foo foobar foo\n" - 1u;
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, sizeof "f" - 1u) == 0); T(settle(e) == 0);
+    edit_malloc_guard_begin();
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_CTRL, NULL)) == 0);
+    T(edit_malloc_guard_end() == 0);
+    T(find_focus_query(e, query) == 0); T(findui_get_state(&e->find).options.whole_word);
+    T(!e->find_visible && !e->panel_rows);
+    T(editor_view(e).selection.anchor == next && editor_view(e).selection.cursor == next + sizeof query - 1u);
+    T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0); T(editor_view(e).selection.anchor == last);
+    T(editor_set_cursor(e, next + sizeof "f" - 1u) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_view(e).selection.anchor == 0 && editor_view(e).selection.cursor == sizeof query - 1u);
+    T(editor_set_cursor(e, sizeof "f" - 1u) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_view(e).selection.anchor == last); /* (P) previous wraps before the first word */
+    /* Explicit selection searches substrings, rather than retaining the
+     * whole-word mode chosen for a caret slurp. */
+    T(find_seed_selection(e, 0, sizeof query - 1u) == 0);
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_CTRL, NULL)) == 0);
+    T(!findui_get_state(&e->find).options.whole_word);
+    T(editor_view(e).selection.anchor == sizeof "foo " - 1u);
+    /* A queued F3 advances the pending find-under result once. */
+    T(editor_set_cursor(e, sizeof "f" - 1u) == 0); T(settle(e) == 0);
+    plat_event under = key(XKB_KEY_F3, PLAT_MOD_CTRL, NULL), again = key(XKB_KEY_F3, 0, NULL);
+    T(editor_inject(e, &under) == 0); T(editor_inject(e, &again) == 0); T(settle(e) == 0);
+    T(editor_view(e).selection.anchor == last);
+    editor_close(e);
+    puts("edit-cxho.13 find-under: next/previous whole words, wrap, explicit substring, queued F3 passed");
+    return 0;
+}
+static int find_seed_regex(void)
+{
+    static const char literal[] = ".^$*+?()[]{}|\\", text[] = ".^$*+?()[]{}|\\ .^$*+?()[]{}|\\";
+    static const char escaped[] = "\\.\\^\\$\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|\\\\";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(findui_set_options(&e->find, (findui_options){.regex = true}) == FINDUI_OK);
+    T(find_seed_selection(e, 0, sizeof literal - 1u) == 0);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    T(find_focus_query(e, escaped) == 0);
+    T(findui_get_state(&e->find).match_count == 2u); /* (P) the repeated literal */
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(find_seed_selection(e, 0, sizeof literal - 1u) == 0);
+    T(press(e, key('e', PLAT_MOD_CTRL, NULL)) == 0); T(find_focus_query(e, escaped) == 0);
+    T(press(e, key('e', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
+    findui_state state = findui_get_state(&e->find);
+    T(state.replacement_length == sizeof literal - 1u && !memcmp(state.replacement, literal, sizeof literal - 1u));
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_view(e).selection.anchor == sizeof literal); /* (P) literal plus space */
+    editor_close(e);
+    puts("edit-cxho.13 regex: escaped prefill/slurp/find-under and literal replacement passed");
+    return 0;
+}
 static int g02_find_return(void)
 {
     static const char text[]="cat cat cat", query[]="cat";
@@ -4750,6 +4898,11 @@ static int findpanel_contract(void)
     T(press(e,key(XKB_KEY_F3,0,NULL))==0);
     T(editor_view(e).selection.anchor==8 && editor_view(e).selection.cursor==11);
     T(press(e,key('h',PLAT_MOD_CTRL,NULL))==0);
+    /* edit-cxho.13 (P): seeding cat previews from the reopened panel's
+     * saved cursor at EOF, wrapping to the first cat. Advance to the last
+     * cat again before testing the existing replacement/undo sequence. */
+    T(editor_view(e).selection.anchor==0 && editor_view(e).selection.cursor==sizeof "cat"-1u);
+    T(press(e,key(XKB_KEY_Return,0,NULL))==0);
     T(press(e,key(XKB_KEY_Tab,0,NULL))==0);
     T(press(e,key('x',0,"fox"))==0);
     T(press(e,key(XKB_KEY_Return,PLAT_MOD_CTRL,NULL))==0);
@@ -7118,6 +7271,10 @@ static const test_selector selectors[] = {
     {"--drop-failure", drop_failure_contract},
     {"--cxho3-focus", find_focus_contract},
     {"--cxho12-incremental", find_incremental_contract},
+    {"--cxho13-prefill", find_seed_prefill},
+    {"--cxho13-slurp", find_seed_slurp},
+    {"--cxho13-under", find_seed_under},
+    {"--cxho13-regex", find_seed_regex},
     {"--close-review", close_review_contract},
     {"--close-review-hidden", close_review_hidden},
     {"--close-review-wide", close_review_wide},
@@ -7263,6 +7420,8 @@ int main(int argc, char **argv)
     T(menu_contract() == 0);
     T(g02_find_return() == 0);
     T(find_incremental_contract() == 0);
+    T(find_seed_prefill() == 0); T(find_seed_slurp() == 0);
+    T(find_seed_under() == 0); T(find_seed_regex() == 0);
     T(find_focus_contract() == 0);
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);

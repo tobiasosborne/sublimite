@@ -95,6 +95,7 @@ static int restore_origin(editor *e)
 static void preview(editor *e)
 {
     if (!e->find_visible || e->fif.mode) return;
+    e->find_seek_pending=false;
     e->find_preview_pending=true; e->find_select_pending=true;
     e->find_direction=0; e->find_navigated=false;
     /* New field input cancels a preview's unpublished viewport request. */
@@ -227,6 +228,16 @@ int editor_find_service(editor *e)
         replace_begin(e,all); state=findui_get_state(&e->find);
     }
     if (e->find_select_pending && !state.searching) {
+        if (e->find_seek_pending) {
+            e->find_seek_pending=false;
+            if (state.complete && state.match_count) {
+                findui_range selected;
+                findui_code code=findui_seek(&e->find,e->find_seek_byte,&selected);
+                e->find_navigated=true;
+                if (code==FINDUI_MORE) return editor_find_highlights(e);
+                if (code!=FINDUI_OK) e->find_error=(int)code;
+            }
+        }
         if (e->find_preview_pending) {
             e->find_preview_pending=false;
             if (state.complete && state.match_count) {
@@ -280,8 +291,28 @@ int editor_find_highlights(editor *e)
     }
     return 0;
 }
+static findui_range selection_range(view_selection selection)
+{
+    return selection.cursor<selection.anchor ?
+        (findui_range){selection.cursor,selection.anchor} :
+        (findui_range){selection.anchor,selection.cursor};
+}
+static void navigate_from(editor *e, findui_range range, int direction)
+{
+    e->find_seek_byte=direction<0 ? range.start : range.end;
+    e->find_seek_pending=true; e->find_preview_pending=false;
+    /* (P) seek yields the first start >= the boundary. Forward uses that
+     * match; backward advances one ordinal to the preceding match. */
+    e->find_direction=direction<0 ? -1 : 0;
+    e->find_select_pending=true; e->find_navigated=false;
+    e->find_error=editor_find_service(e);
+}
 static void navigate(editor *e, int direction)
 {
+    if (!e->find_visible && !e->find_select_pending) {
+        navigate_from(e,selection_range(e->v.state.selection),direction);
+        return;
+    }
     e->find_direction=direction; e->find_select_pending=true;
     e->find_error=editor_find_service(e);
 }
@@ -397,6 +428,46 @@ int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool repla
     e->find_field_all=false;
     return editor_begin_frame(e);
 }
+/* Copy a bounded document range through the existing field scratch into
+ * findui's arena-owned query/replacement. No document mutation or allocation.
+ * (P) zero means no seed; byte steps follow the half-open source range. */
+static int seed_field(editor *e, bool word, bool single_line, bool replacement,
+                      findui_range *range, bool *seeded)
+{
+    *seeded=false;
+    view_selection selection=e->v.state.selection;
+    if (word && selection.cursor==selection.anchor) {
+        view_edit_plan plan;
+        int rc=view_select_word(&e->v,&plan); if (rc) return rc;
+        selection=plan.selection;
+    }
+    *range=selection_range(selection);
+    uint64_t bytes=range->end-range->start;
+    if (!bytes) return 0;
+    if (bytes>sizeof e->find_edit) return FINDUI_ERR_LIMIT;
+    size_t length=(size_t)bytes;
+    int rc=piece_read(e->tree,range->start,e->find_edit,length); if (rc) return rc;
+    if (single_line && (memchr(e->find_edit,'\n',length) || memchr(e->find_edit,'\r',length))) return 0;
+    findui_state state=findui_get_state(&e->find);
+    if (!replacement && state.options.regex) {
+        size_t escaped=length;
+        for (size_t i=0;i<length;i++)
+            if (e->find_edit[i] && strchr(".^$*+?()[]{}|\\",e->find_edit[i])) escaped++;
+        if (escaped>sizeof e->find_edit) return FINDUI_ERR_LIMIT;
+        /* Expand backwards so literal source bytes cannot be overwritten.
+         * (P) each regex metacharacter contributes one backslash byte. */
+        size_t at=escaped;
+        for (size_t i=length;i;i--) {
+            uint8_t byte=e->find_edit[i-1u]; e->find_edit[--at]=byte;
+            if (byte && strchr(".^$*+?()[]{}|\\",byte)) e->find_edit[--at]='\\';
+        }
+        length=escaped;
+    }
+    rc=(int)(replacement ? findui_set_replacement(&e->find,e->find_edit,length,length) :
+        findui_set_query(&e->find,e->find_edit,length));
+    *seeded=rc==FINDUI_OK;
+    return rc;
+}
 bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding)
 {
     if (!e->find.private_ || !ev->press || !binding) return false;
@@ -414,7 +485,7 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         if (rc && !e->error) e->error=rc;
         keys_reset(&e->keys); return true;
     }
-    case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE:
+    case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE: {
         if (!e->find_visible || e->fif.mode) save_origin(e);
         (void)editor_find_service(e);
         e->fif.mode=false;
@@ -422,8 +493,40 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         e->find_focus=EDITOR_FIND_FIELD;
         (void)findui_show(&e->find,true,binding->action==KEYS_ACTION_REPLACE);
         (void)findui_focus_replacement(&e->find,false);
+        findui_range range; bool seeded;
+        int rc=seed_field(e,false,true,false,&range,&seeded);
+        if (seeded) preview(e);
         field_select_all(e); keys_reset(&e->keys);
-        e->find_error=geometry(e); return true;
+        e->find_error=geometry(e);
+        if (!e->find_error) e->find_error=rc;
+        return true;
+    }
+    case KEYS_ACTION_SLURP_FIND: case KEYS_ACTION_SLURP_REPLACE:
+    case KEYS_ACTION_FIND_UNDER: case KEYS_ACTION_FIND_UNDER_PREVIOUS: {
+        if (e->find_replace_active) return true;
+        bool replacement=binding->action==KEYS_ACTION_SLURP_REPLACE;
+        bool under=binding->action==KEYS_ACTION_FIND_UNDER || binding->action==KEYS_ACTION_FIND_UNDER_PREVIOUS;
+        bool caret=e->v.state.selection.cursor==e->v.state.selection.anchor;
+        findui_range range; bool seeded;
+        e->find_error=seed_field(e,true,false,replacement,&range,&seeded);
+        if (!seeded) return true;
+        if (!replacement) {
+            findui_state state=findui_get_state(&e->find);
+            if (under) {
+                findui_options options=state.options; options.whole_word=caret;
+                e->find_error=(int)findui_set_options(&e->find,options);
+            }
+            if (!e->find_error) e->find_error=(int)findui_show(&e->find,true,state.replace_mode);
+            e->find_preview_pending=e->find_select_pending=e->find_seek_pending=false;
+            e->find_navigated=false;
+            if (!e->find_error) {
+                if (under) navigate_from(e,range,binding->action==KEYS_ACTION_FIND_UNDER_PREVIOUS ? -1 : 1);
+                else e->find_error=editor_find_service(e);
+            }
+        }
+        keys_reset(&e->keys);
+        (void)editor_begin_frame(e); return true;
+    }
     case KEYS_ACTION_FIND_NEXT: case KEYS_ACTION_FIND_PREVIOUS:
         if (!findui_get_state(&e->find).open) (void)findui_show(&e->find,true,false);
         /* (P) findui_next's direction contract is negative/positive one. */

@@ -327,6 +327,10 @@ struct editor {
     view_state find_origin;
     uint64_t find_origin_id, find_origin_subrow;
     bool find_preview_pending, find_scroll_adjust;
+    /* Slurped navigation seeks from the document range, independently of
+     * the panel's saved incremental-preview origin. */
+    bool find_seek_pending;
+    uint64_t find_seek_byte;
     uint64_t find_scroll_first, find_scroll_visual_first, find_scroll_visual_last;
     uint8_t find_edit[FINDUI_QUERY_BYTES];
     uint32_t find_ascii[LAYOUT_ASCII_GLYPHS];
