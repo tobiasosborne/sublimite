@@ -1,0 +1,3 @@
+Fixed fixture for tools/design_shots.sh.
+Three lines of plain text.
+Nothing here changes.
