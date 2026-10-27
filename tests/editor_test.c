@@ -4131,13 +4131,13 @@ static int palette_contract(void)
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
     T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_visible);
     T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
-    T(!e->find_visible);
+    T(e->find_visible); /* edit-cxho.2: palette overlays the retained panel */
     T(press(e, key('s', 0, "sav")) == 0);
     T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
-    T(!e->panel_rows && e->go.active && e->go.kind == chord.kind);
+    T(e->find_visible && e->panel_rows && e->go.active && e->go.kind == chord.kind);
     T(e->go.owner == chord.owner && e->go.generation == chord.generation &&
       e->go.length == chord.length && e->go.cursor == chord.cursor && e->go.selected == chord.selected);
     T(!memcmp(e->go.digits, chord.digits, chord.length));
@@ -4147,7 +4147,8 @@ static int palette_contract(void)
     undo_state state = {0}; const uint8_t inserted[] = "!";
     T(editor_find_insert(e, e->undo, 0, inserted, sizeof inserted - 1u,
         trace_now_ns(), &state, &state).changed);
-    T(settle(e) == 0); T(!e->panel_rows);
+    T(settle(e) == 0); T(!e->palette_open && e->find_visible && e->panel_rows);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->panel_rows);
     /* (P) user overrides change the displayed chord and opening stroke. */
     const char preferences[] = "[keymap]\ncommand_palette='Alt+p'\nsave='Alt+s'\nsave_as='Alt+w'\n";
     T(config_parse((const uint8_t *)preferences, sizeof preferences - 1u, &e->preferences, NULL) == CONFIG_OK);

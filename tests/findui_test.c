@@ -1016,11 +1016,10 @@ static void panel_editing_chords(void)
     panel_query(e,"alpha ",sizeof "alpha "-1);
     panel_key(e,'a',PLAT_MOD_CTRL); CHECK(e->find_field_all);
     panel_key(e,'v',PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
-    /* Ctrl+X is deliberately consumed as a field no-op; other global chords
-     * must leave both the selected document and the panel state untouched.
-     * edit-o20: Ctrl+N and Ctrl+Up/Down are file/viewport commands that bypass
-     * the focused field (docs/decisions/edit-o20.md), so they are not listed. */
-    const uint32_t consumed[]={'x','z','y','s','w','t',XKB_KEY_Delete};
+    /* (P) Field undo has no history yet; undo/redo remain field no-ops.
+     * Delete at the field end cannot change either field or document.
+     * Window commands formerly pinned here are exercised below. */
+    const uint32_t consumed[]={'z','y',XKB_KEY_Delete};
     for (size_t i=0;i<sizeof consumed/sizeof *consumed;i++) {
         panel_key(e,consumed[i],PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
         same(e->tree,(const uint8_t *)text,sizeof text-1);
@@ -1030,7 +1029,6 @@ static void panel_editing_chords(void)
     const struct { uint32_t sym; uint16_t mods; } other_chords[]={
         {'v',PLAT_MOD_CTRL|PLAT_MOD_ALT}, {'a',PLAT_MOD_SUPER},
         {XKB_KEY_Return,PLAT_MOD_ALT}, {XKB_KEY_Tab,PLAT_MOD_ALT},
-        {'F',PLAT_MOD_CTRL|PLAT_MOD_SHIFT}
     };
     for (size_t i=0;i<sizeof other_chords/sizeof *other_chords;i++) {
         panel_key(e,other_chords[i].sym,other_chords[i].mods); panel_query(e,text,sizeof text-1);
@@ -1045,6 +1043,11 @@ static void panel_editing_chords(void)
     findui_options restored=findui_get_state(&e->find).options;
     CHECK(options.regex==restored.regex && options.match_case==restored.match_case &&
         options.whole_word==restored.whole_word);
+    /* (P) Copy/cut apply to the field's select-all, never the document. */
+    panel_key(e,'a',PLAT_MOD_CTRL); panel_key(e,'c',PLAT_MOD_CTRL);
+    panel_query(e,text,sizeof text-1);
+    panel_key(e,'x',PLAT_MOD_CTRL); panel_query(e,"",0);
+    panel_key(e,'v',PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
     const char unicode[]="é 中"; /* combining cluster, NBSP, CJK word */
     CHECK(findui_set_query(&e->find,(const uint8_t *)unicode,sizeof unicode-1)==FINDUI_OK);
     e->find_field_all=false;
@@ -1072,10 +1075,162 @@ static void panel_editing_chords(void)
     puts("edit-m15 find panel: clipboard/query chords isolated from document passed");
 }
 
+/* edit-cxho.2 (P): reuse panel_editing_chords geometry and panel_settle's
+ * existing watchdog. Counts/offsets derive from the fixture strings and tab
+ * operations. Zero denotes absence/first index, one removes a C terminator
+ * or advances a tab/byte; minus one selects the existing no-wrap mode.
+ * No new capacity or timing budget. */
+static void panel_text(editor *e, const char *text)
+{
+    for (size_t i=0;i<strlen(text);i++) {
+        plat_event ev={.kind=PLAT_EV_KEY,.press=true,.keysym=(uint8_t)text[i],
+            .utf8={(uint8_t)text[i]},.utf8_len=sizeof text[i]};
+        CHECK(editor_inject(e,&ev)==EDITOR_OK); panel_settle(e);
+    }
+}
+static editor *panel_host(render_backend *backend, const char *path)
+{
+    const char text[]="alpha beta alpha";
+    CHECK(render_null_backend(backend)==0);
+    editor_config cfg={.path=path,.initial=path ? NULL : (const uint8_t *)text,
+        .initial_len=path ? 0 : sizeof text-1u,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; CHECK(editor_open(&e,&cfg,backend)==0); panel_settle(e);
+    return e;
+}
+static void panel_matches(editor *e, uint64_t count)
+{
+    findui_state state=findui_get_state(&e->find);
+    CHECK(e->find_visible && state.open && state.complete && !state.searching);
+    CHECK(e->find_id==e->buffer->id && e->find_buffer_revision==e->buffer->revision);
+    CHECK(state.match_count==count);
+    /* Highlight byte ranges must belong to the newly active source. */
+    findui_range ranges[sizeof "alpha beta alpha"]; size_t got=0;
+    CHECK(findui_highlights(&e->find,0,editor_length(e),ranges,
+        sizeof ranges/sizeof *ranges,&got)==FINDUI_OK);
+    CHECK(got==count);
+    for (size_t i=0;i<got;i++) {
+        uint8_t actual[sizeof "alpha"-1u];
+        CHECK(ranges[i].end-ranges[i].start==sizeof actual);
+        CHECK(editor_read(e,ranges[i].start,actual,sizeof actual)==EDITOR_OK);
+        CHECK(!memcmp(actual,"alpha",sizeof actual));
+    }
+}
+static void panel_window_commands(const char *which)
+{
+    /* Saved files exercise immediate close; untitled nonempty buffers
+     * correctly prompt even before their first mutation. */
+    char first_path[]="build/find-panel-first-XXXXXX", second_path[]="build/find-panel-second-XXXXXX";
+    const char first[]="alpha beta alpha", second[]="beta alpha";
+    int fd=mkstemp(first_path); CHECK(fd>=0);
+    CHECK(write(fd,first,sizeof first-1u)==(ssize_t)(sizeof first-1u)); CHECK(close(fd)==0);
+    fd=mkstemp(second_path); CHECK(fd>=0);
+    CHECK(write(fd,second,sizeof second-1u)==(ssize_t)(sizeof second-1u)); CHECK(close(fd)==0);
+    render_backend backend={0}; editor *e=panel_host(&backend,first_path);
+    uint64_t original=e->buffer->id, other;
+    CHECK(editor_add_buffer(e,second_path,NULL,0,&other)==EDITOR_OK);
+    panel_settle(e); panel_key(e,'f',PLAT_MOD_CTRL);
+    edit_malloc_guard_begin(); panel_text(e,"alpha");
+    CHECK(edit_malloc_guard_end()==0); /* (P) binding no-malloc typing rule */
+    panel_query(e,"alpha",sizeof "alpha"-1u); panel_matches(e,1);
+    if (!strcmp(which,"switch")) {
+        panel_key(e,XKB_KEY_Tab,PLAT_MOD_CTRL);
+        CHECK(e->buffer->id==original); panel_matches(e,2);
+        /* Release ends MRU cycling; both directions and adjacent selection
+         * must retarget instead of changing query focus via plain Tab. */
+        plat_event release={.kind=PLAT_EV_KEY,.keysym=XKB_KEY_Control_L};
+        CHECK(editor_inject(e,&release)==EDITOR_OK); panel_settle(e);
+        panel_key(e,XKB_KEY_Tab,PLAT_MOD_CTRL|PLAT_MOD_SHIFT);
+        CHECK(e->buffer->id==other); panel_matches(e,1);
+        CHECK(editor_inject(e,&release)==EDITOR_OK); panel_settle(e);
+        panel_key(e,XKB_KEY_Prior,PLAT_MOD_CTRL);
+        CHECK(e->buffer->id==original); panel_matches(e,2);
+        panel_key(e,XKB_KEY_Next,PLAT_MOD_CTRL);
+        CHECK(e->buffer->id==other); panel_matches(e,1);
+        panel_key(e,'1',PLAT_MOD_ALT);
+        CHECK(e->buffer->id==original); panel_matches(e,2);
+    } else if (!strcmp(which,"goto")) {
+        panel_key(e,'g',PLAT_MOD_CTRL);
+        CHECK(e->go.active && e->go.kind==KEYS_ACTION_GOTO_LINE && e->find_visible);
+        panel_key(e,XKB_KEY_Escape,0); CHECK(!e->go.active && e->find_visible);
+    } else {
+        if (!strcmp(which,"menu")) {
+            panel_key(e,'f',PLAT_MOD_ALT);
+            CHECK(e->menu.open==menu_mnemonic('f'));
+            const menu_def *file_menu=&menu_table()[e->menu.open];
+            size_t item=0;
+            while (item<file_menu->count && file_menu->items[item]!=KEYS_ACTION_CLOSE) item++;
+            CHECK(item<file_menu->count);
+            for (size_t i=0;i<item;i++) panel_key(e,XKB_KEY_Down,0);
+            panel_key(e,XKB_KEY_Return,0);
+        } else if (!strcmp(which,"palette")) {
+            panel_key(e,'p',PLAT_MOD_CTRL|PLAT_MOD_SHIFT);
+            CHECK(e->palette_open && e->find_visible);
+            /* Select the actual Close command in the existing palette model;
+             * Enter still travels through the normal injected key path. */
+            size_t selected=0;
+            while (selected<e->palette->count &&
+                e->palette->rows[e->palette->matches[selected]].binding->action!=KEYS_ACTION_CLOSE) selected++;
+            CHECK(selected<e->palette->count); e->palette->selected=selected;
+            panel_key(e,XKB_KEY_Return,0); CHECK(!e->palette_open);
+        } else panel_key(e,'w',PLAT_MOD_CTRL);
+        CHECK(tabs_count(&e->tabs)==1 && e->buffer->id==original); panel_matches(e,2);
+        panel_key(e,'t',PLAT_MOD_CTRL|PLAT_MOD_SHIFT);
+        CHECK(tabs_count(&e->tabs)==2 && e->buffer->id==other); panel_matches(e,1);
+        panel_key(e,'w',PLAT_MOD_CTRL); panel_key(e,'w',PLAT_MOD_CTRL);
+        CHECK(!tabs_count(&e->tabs) && e->buffer==e->empty); panel_matches(e,0);
+        CHECK(!e->find_range_count && !e->find_select_pending);
+    }
+    panel_query(e,"alpha",sizeof "alpha"-1u);
+    editor_close(e); CHECK(unlink(first_path)==0); CHECK(unlink(second_path)==0);
+    printf("edit-cxho.2 find panel: %s passed\n",which);
+}
+static void panel_save_and_prompt(void)
+{
+    char path[]="build/find-panel-save-XXXXXX";
+    const char text[]="alpha", saved[]="xalpha";
+    int fd=mkstemp(path); CHECK(fd>=0);
+    CHECK(write(fd,text,sizeof text-1u)==(ssize_t)(sizeof text-1u)); CHECK(close(fd)==0);
+    render_backend backend={0}; editor *e=panel_host(&backend,path);
+    panel_text(e,"x"); CHECK(editor_tab(e,0)->modified);
+    uint64_t revision=e->buffer->revision;
+    panel_key(e,'f',PLAT_MOD_CTRL); panel_text(e,"alpha");
+    /* (P) There is document undo history here: field undo/redo must keep it. */
+    panel_key(e,'z',PLAT_MOD_CTRL); panel_key(e,'y',PLAT_MOD_CTRL);
+    same(e->tree,(const uint8_t *)saved,sizeof saved-1u);
+    CHECK(e->buffer->revision==revision && editor_tab(e,0)->modified);
+    panel_key(e,'s',PLAT_MOD_CTRL);
+    CHECK(editor_flush(e)==EDITOR_OK); panel_settle(e);
+    CHECK(!editor_tab(e,0)->modified && e->buffer->revision==revision);
+    CHECK(!savectl_get_model(e->buffer->save).modified); panel_matches(e,1);
+    uint8_t actual[sizeof saved]; fd=open(path,O_RDONLY); CHECK(fd>=0);
+    CHECK(read(fd,actual,sizeof actual)==(ssize_t)(sizeof saved-1u)); CHECK(close(fd)==0);
+    CHECK(!memcmp(actual,saved,sizeof saved-1u));
+    panel_key(e,XKB_KEY_Escape,0); panel_text(e,"y");
+    panel_key(e,'f',PLAT_MOD_CTRL); panel_key(e,'w',PLAT_MOD_CTRL);
+    CHECK(tabs_count(&e->tabs)==1 && e->close_prompt.owner==e->buffer->id && e->find_visible);
+    panel_key(e,XKB_KEY_Escape,0); CHECK(!e->close_prompt.owner && e->find_visible);
+    panel_key(e,'w',PLAT_MOD_CTRL); panel_key(e,'s',0);
+    CHECK(editor_flush(e)==EDITOR_OK); panel_settle(e);
+    CHECK(!tabs_count(&e->tabs) && e->find_visible && !e->close_prompt.saving);
+    panel_matches(e,0);
+    editor_close(e); CHECK(unlink(path)==0);
+    puts("edit-cxho.2 find panel: save revision/modified state and close prompt passed");
+}
+
 int main(void)
 {
+    const char *panel_case=getenv("EDIT_CXHO_PANEL");
+    if (panel_case) {
+        if (!strcmp(panel_case,"save")) panel_save_and_prompt();
+        else if (!strcmp(panel_case,"field")) panel_editing_chords();
+        else panel_window_commands(panel_case);
+        return 0;
+    }
     if (getenv("EDIT_M15_PANEL")) { panel_editing_chords(); return 0; }
     panel_editing_chords();
+    panel_window_commands("close"); panel_window_commands("switch");
+    panel_window_commands("goto"); panel_window_commands("menu"); panel_window_commands("palette");
+    panel_save_and_prompt();
     if (getenv("EDIT_LEZ_REGEX_WORD")) { whole_word_regex_worker(); return 0; }
     if (getenv("P4_SPARSE_WINDOW")) { sparse_window_work(); return 0; }
     if (getenv("P4_SPARSE_PAGES")) { sparse_page_work(); return 0; }

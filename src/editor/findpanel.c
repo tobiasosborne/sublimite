@@ -292,18 +292,6 @@ int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool repla
 bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding)
 {
     if (!e->find.private_ || !ev->press || !binding) return false;
-    /* Focus keeps its physical field-editing keys even when their global
-     * actions are rebound. Other strokes dispatch the configured find action. */
-    bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0;
-    bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
-    if (e->find_visible && !(ev->mods&PLAT_MOD_SUPER) &&
-        (!(ev->mods&PLAT_MOD_ALT) || (ctrl && enter)) &&
-        (ev->keysym==XKB_KEY_Escape || ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter ||
-         ev->keysym==XKB_KEY_Tab || ev->keysym==XKB_KEY_Left || ev->keysym==XKB_KEY_Right ||
-         ev->keysym==XKB_KEY_Home || ev->keysym==XKB_KEY_End || ev->keysym==XKB_KEY_BackSpace ||
-         ev->keysym==XKB_KEY_Delete ||
-         (ctrl && (ev->keysym=='a' || ev->keysym=='A' || ev->keysym=='v' || ev->keysym=='V'))))
-        return false;
     switch (binding->action) {
     case KEYS_ACTION_FIND_IN_FILES: /* edit-n95: Where field mode; cancels a running search */
         (void)editor_find_service(e);
@@ -349,10 +337,27 @@ bool editor_find_key(editor *e, const plat_event *ev)
 {
     if (!e->find.private_ || !ev->press) return false;
     if (!e->find_visible && !e->find_replace_active) return false;
-    /* A consumed panel chord must not seed the global keymap's next stroke. */
-    keys_reset(&e->keys);
-    bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0;
+    bool altgr=(ev->mods&PLAT_MOD_ALTGR)!=0;
+    bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0 && !altgr;
     bool shift=(ev->mods&PLAT_MOD_SHIFT)!=0;
+    bool alt=(ev->mods&PLAT_MOD_ALT)!=0, super=(ev->mods&PLAT_MOD_SUPER)!=0;
+    bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
+    bool text=ev->utf8_len && !super && ((!ctrl && !alt) || altgr);
+    bool editing=ev->keysym==XKB_KEY_Left || ev->keysym==XKB_KEY_Right ||
+        ev->keysym==XKB_KEY_Home || ev->keysym==XKB_KEY_End ||
+        ev->keysym==XKB_KEY_BackSpace || ev->keysym==XKB_KEY_Delete;
+    bool control=ctrl && (ev->keysym=='a' || ev->keysym=='A' ||
+        ev->keysym=='c' || ev->keysym=='C' || ev->keysym=='x' || ev->keysym=='X' ||
+        ev->keysym=='v' || ev->keysym=='V' || ev->keysym=='z' || ev->keysym=='Z' ||
+        ev->keysym=='y' || ev->keysym=='Y');
+    /* The panel owns field editing, not all input while it is visible.
+     * Alt+Enter remains a field no-op; Alt toggles/F3 use their find actions.
+     * Ctrl+Tab must reach the tab dispatcher, unlike plain/Shift+Tab. */
+    if (ev->keysym!=XKB_KEY_Escape && (super ||
+        !(text || enter || (!alt && (editing || control || (!ctrl && ev->keysym==XKB_KEY_Tab))))))
+        return false;
+    /* Only consumed keys cancel a pending global keymap prefix. */
+    keys_reset(&e->keys);
     findui_state state=findui_get_state(&e->find);
     if (ev->keysym==XKB_KEY_Escape) {
         if (e->find_replace_active) { (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e); }
@@ -361,10 +366,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
         e->find_error=geometry(e); return true;
     }
     if (e->find_replace_active) return true;
-    bool alt=(ev->mods&PLAT_MOD_ALT)!=0, super=(ev->mods&PLAT_MOD_SUPER)!=0;
-    bool enter=ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter;
-    /* Focus owns editing chords, including Ctrl(+Alt)+Enter below. */
-    if (super || (ctrl && alt && !enter)) return true;
+    if (alt && !ctrl && !altgr) return true;
     if (ctrl && (ev->keysym=='a' || ev->keysym=='A')) {
         if (e->fif.mode && e->fif.where_focus) (void)editor_fif_key(e,ev); /* edit-n95 */
         else field_select_all(e);
@@ -373,10 +375,24 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (ctrl && (ev->keysym=='v' || ev->keysym=='V')) {
         e->find_error=editor_clip_find_paste(e); return true;
     }
-    /* Ctrl+X (and unsupported global chords) is a consumed no-op. */
-    if (ctrl && !enter && ev->keysym!=XKB_KEY_Left && ev->keysym!=XKB_KEY_Right &&
-        ev->keysym!=XKB_KEY_BackSpace) return true;
-    if (alt && !ctrl) return true;
+    if (ctrl && (ev->keysym=='c' || ev->keysym=='C' || ev->keysym=='x' || ev->keysym=='X')) {
+        bool where=e->fif.mode && e->fif.where_focus;
+        if (!(where ? e->fif.where_all : e->find_field_all)) return true;
+        const uint8_t *bytes=state.replacement_focus ? state.replacement : state.query;
+        size_t length=state.replacement_focus ? state.replacement_length : state.query_length;
+        if (where) { bytes=(const uint8_t *)e->fif.where; length=e->fif.where_length; }
+        if (!length) return true;
+        e->find_error=editor_clip_find_copy(e,bytes,length);
+        if (!e->find_error && (ev->keysym=='x' || ev->keysym=='X')) {
+            if (where) (void)editor_fif_key(e,&(plat_event){
+                .kind=PLAT_EV_KEY,.press=true,.keysym=XKB_KEY_BackSpace});
+            else { field_edit(e,state,0,length,NULL,0); e->find_field_all=false; }
+            (void)editor_begin_frame(e);
+        }
+        return true;
+    }
+    /* No field undo log exists: never apply these chords to the document. */
+    if (ctrl && (ev->keysym=='z' || ev->keysym=='Z' || ev->keysym=='y' || ev->keysym=='Y')) return true;
     if (e->fif.mode && (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter)) {
         int rc=editor_fif_start(e); /* edit-n95: refusals are counted, not errors */
         if (rc && !e->error) e->error=rc;
@@ -404,7 +420,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
         size_t cursor=state.replacement_focus ? state.replacement_cursor : state.query_cursor;
         size_t at=cursor, erase=0, add=0;
         if (e->find_field_all && (ev->keysym==XKB_KEY_BackSpace || ev->keysym==XKB_KEY_Delete ||
-            (ev->utf8_len && !(ev->mods&(PLAT_MOD_CTRL|PLAT_MOD_SUPER))))) {
+            text)) {
             at=0; erase=length;
             if (ev->keysym!=XKB_KEY_BackSpace && ev->keysym!=XKB_KEY_Delete) add=ev->utf8_len;
             e->find_field_all=false;
@@ -420,7 +436,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
         else if (ev->keysym==XKB_KEY_BackSpace && cursor) {
             at=ctrl ? field_word_left(bytes,cursor) : utf8_grapheme_prev(bytes,cursor); erase=cursor-at;
         } else if (ev->keysym==XKB_KEY_Delete && cursor<length) erase=utf8_grapheme_next(bytes+cursor,length-cursor);
-        else if (ev->utf8_len && !(ev->mods&(PLAT_MOD_CTRL|PLAT_MOD_SUPER))) add=ev->utf8_len;
+        else if (text) add=ev->utf8_len;
         field_edit(e,state,at,erase,ev->utf8,add);
     }
     (void)editor_begin_frame(e); return true;

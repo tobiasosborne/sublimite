@@ -1065,17 +1065,16 @@ int editor_handle_key(editor *e, const plat_event *ev)
     }
     const keys_binding *binding = NULL;
     keys_result result = e->go.active ? KEYS_NONE : config_keys_lookup(&e->preferences, &e->keys, ev->keysym, ev->mods, &binding);
+    /* Physical field keys belong to the focused panel. Menu/palette commands
+     * enter editor_dispatch_action directly and retain their command intent. */
+    if (!e->go.active && editor_find_key(e, ev)) return 0;
     return editor_dispatch_action(e, ev, binding, result);
 }
 int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *binding, keys_result result)
 {
     if (binding && binding->action == KEYS_ACTION_COMMAND_PALETTE) return editor_palette_show(e);
     if (binding && binding->action == KEYS_ACTION_TOGGLE_MENU) return editor_menu_toggle(e);
-    /* edit-o20: file/exit/scroll commands bypass find-field consumption;
-     * edit-x8i: configured find actions dispatch from the same lookup. */
-    bool common = binding && (binding->action == KEYS_ACTION_NEW_FILE || binding->action == KEYS_ACTION_OPEN_FILE ||
-        binding->action == KEYS_ACTION_SAVE_AS || binding->action == KEYS_ACTION_EXIT || binding->action == KEYS_ACTION_SCROLL_LINES);
-    if (!e->go.active && (editor_find_action(e, ev, binding) || (!common && editor_find_key(e, ev)))) return 0;
+    if (!e->go.active && editor_find_action(e, ev, binding)) return 0;
     /* edit-n95: Enter on a Find Results line opens its hit (or file). */
     if (!e->go.active && editor_fif_results_active(e) && !(ev->mods & (PLAT_MOD_CTRL | PLAT_MOD_ALT | PLAT_MOD_SUPER)) &&
         (ev->keysym == XKB_KEY_Return || ev->keysym == XKB_KEY_KP_Enter)) return editor_fif_open_at_caret(e);
@@ -1202,13 +1201,18 @@ int editor_dispatch_action(editor *e, const plat_event *ev, const keys_binding *
     }
     if (tab) {
         undo_break_burst(e->undo);
-        if (stack) return editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);
-        if (close) return editor_close_request(e); /* edit-2ye3: prompts for a modified tab */
-        if (reopen) return editor_reopen_tab(e);
-        size_t count = tabs_count(&e->tabs), index = tabs_active_index(&e->tabs);
-        if (adjacent) index = action == KEYS_ACTION_NEXT_VIEW ? (index + 1) % count : (index + count - 1) % count;
-        else index = action == KEYS_ACTION_SELECT_LAST_TAB ? count - 1 : (size_t)binding->args.value;
-        return index < count ? editor_select_tab(e, index) : 0;
+        if (stack) rc = editor_cycle_tab(e, action == KEYS_ACTION_PREVIOUS_VIEW_STACK);
+        else if (close) rc = editor_close_request(e); /* edit-2ye3: prompts for a modified tab */
+        else if (reopen) rc = editor_reopen_tab(e);
+        else {
+            size_t count = tabs_count(&e->tabs), index = tabs_active_index(&e->tabs);
+            if (adjacent) index = action == KEYS_ACTION_NEXT_VIEW ? (index + 1) % count : (index + count - 1) % count;
+            else index = action == KEYS_ACTION_SELECT_LAST_TAB ? count - 1 : (size_t)binding->args.value;
+            rc = index < count ? editor_select_tab(e, index) : 0;
+        }
+        /* Start the existing source reset in this turn. Otherwise a fully
+         * submitted switch can leave the old source until the next input. */
+        return rc ? rc : editor_find_service(e);
     }
     if (undo || redo) return replay_history(e, redo);
     if (soft) return soft_history(e, action == KEYS_ACTION_SOFT_REDO);

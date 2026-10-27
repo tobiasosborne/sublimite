@@ -5,8 +5,8 @@
 int editor_palette_show(editor *e)
 {
     if (e->find_replace_active) { e->stats.rejected_commands++; return 0; }
-    e->find_visible = false; e->find_select_pending = false; e->find_replace_request = 0;
-    e->fif.mode = false;
+    /* The palette overlays the find panel. Closing it or dispatching a
+     * command restores the same field and its current source. */
     (void)palette_filter(e->palette, "", 0);
     e->palette_open = true; e->palette_owner = e->buffer->id;
     e->palette_generation = e->buffer->source_generation; e->palette_revision = e->buffer->revision;

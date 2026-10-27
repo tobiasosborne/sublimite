@@ -539,6 +539,7 @@ void editor_clip_close(editor *e);
 void editor_clip_selection(editor *e);
 int editor_clip_action(editor *e, keys_action action, const plat_event *ev);
 int editor_clip_find_paste(editor *e);
+int editor_clip_find_copy(editor *e, const uint8_t *bytes, size_t length);
 int editor_clip_event(editor *e, const plat_event *ev);
 int editor_clip_poll(editor *e);
 bool editor_clip_busy(const editor *e);

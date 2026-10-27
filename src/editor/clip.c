@@ -363,6 +363,16 @@ int editor_clip_find_paste(editor *e)
     if (editor_clip_busy(e)) return 0;
     return request_paste(e,PLAT_CLIP_CLIPBOARD,true);
 }
+int editor_clip_find_copy(editor *e, const uint8_t *bytes, size_t length)
+{
+    /* Field capacity already bounds this copy. Reuse the clipboard arena's
+     * recycler and transport ownership; no document snapshot or mutation. */
+    editor_clip *c=e->clipboard;
+    x11_clip_buf *b=new_owned(c,length);
+    if (!b) return EDITOR_ERR_MEMORY;
+    memcpy(x11_clip_buf_data(b),bytes,length);
+    return publish_owned(e,PLAT_CLIP_CLIPBOARD,b);
+}
 int editor_clip_action(editor *e, keys_action action, const plat_event *ev)
 {
     if (!tabs_count(&e->tabs) || editor_clip_busy(e)) return 0;
