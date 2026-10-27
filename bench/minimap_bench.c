@@ -44,21 +44,16 @@ static int reference(const minimap *m, const flat *f)
             NEED(m->rows[r].density == den && m->rows[r].ink == sums[r]);
         }
     } else {
-        size_t chunks = f->n/LINEIDX_CHUNK + (f->n%LINEIDX_CHUNK != 0);
+        /* edit-cxho.9: rows are lines 0.. (the window at line 0), each
+         * summarised from its first 80 bytes. */
+        size_t at = 0;
         for (uint32_t r = 0; r < m->active_rows; r++) {
-            size_t samples = m->active_rows < MINIMAP_MAX_SAMPLES ? m->active_rows : MINIMAP_MAX_SAMPLES;
-            if (chunks < samples) samples = chunks;
-            size_t group = samples*r/m->active_rows;
-            size_t start = chunks*group/samples*LINEIDX_CHUNK;
-            NEED(m->rows[r].first_byte == start);
-            size_t end = start + MINIMAP_SAMPLE_BYTES;
-            if (end > f->n) end = f->n;
-            size_t first = start;
-            if (start) { while (first < end && f->p[first] != '\n') first++; if (first < end) first++; else first = start; }
+            NEED(m->rows[r].first_byte == at && m->rows[r].first_line == r);
             uint64_t ink = 0;
-            for (size_t j = first; j < end && f->p[j] != '\n'; j++) ink += !space(f->p[j]);
-            if (ink > 80) ink = 80;
+            for (size_t j = at; j < f->n && f->p[j] != '\n'; j++) if (j - at < 80) ink += !space(f->p[j]);
             NEED(m->rows[r].ink == ink && m->rows[r].density == ink*255/80);
+            while (at < f->n && f->p[at] != '\n') at++;
+            at++;
         }
     }
     return 0;
@@ -143,6 +138,25 @@ static int run(flat *f, const char *name, work_pool *pool)
     NEED(minimap_fill_cached(&m,&in,&g,4,WIDTH,0,100,&style) == 0 && !minimap_stale(&m,&in));
     NEED(reference(&m,f) == 0);
     printf("minimap_%s stale-after-edit / fresh-refill-reference: ok %s load1=%s\n",name,tag,load);
+    /* edit-cxho.9: worker-side window preparation around the viewport.
+     * (M) research repro: 1410 px strip = 705 rows of 2 px, 45-line view.
+     * The anchor's line start comes from the index outside the timer.
+     * Tracked only: no gate row exists for the worker prepare. */
+    if (m.windowed) {
+        bench_samples prep; uint64_t prep_values[SAMPLES];
+        bench_samples_init(&prep,prep_values,SAMPLES);
+        for (uint32_t i = 0; i < SAMPLES; i++) {
+            minimap_anchor a = {.first_line = (uint64_t)i*7919%in.lines};
+            a.first_byte = lineidx_line_to_byte(idx,&src,a.first_line).value;
+            NEED(minimap_window_lines(in.lines,45,a.first_line,MINIMAP_LINE_PX,1410,&a.window) == 0);
+            uint64_t t = bench_now_ns();
+            int rc = minimap_prepare_window(&worker,&in,NULL,&a,705);
+            uint64_t elapsed = bench_now_ns()-t; NEED(rc == 0 && worker.window_exact);
+            NEED(bench_add(&prep,elapsed) == 0);
+        }
+        printf("BENCH minimap_%s_window_prepare TRACK (M)%s load1=%s p50_ns=%llu p99_ns=%llu rows=705 view=45 n=%u worker_side=1\n",
+               name,tag,load,(unsigned long long)bench_p50(&prep),(unsigned long long)bench_p99(&prep),SAMPLES);
+    }
     minimap_fini(&m); minimap_fini(&worker); free(worker_rows); free(rows); free(cells); lineidx_destroy(idx);
     return 0; /* a timing MISS is a note (edit-lwq); the rows above print pass=0 */
 }

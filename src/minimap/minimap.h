@@ -14,17 +14,16 @@
  * of the first line in each group are retained separately for miniature ink.
  * A row covers K=ceil(lines/height) consecutive lines;
  * density=floor(255*sum(clipped counts)/(80*row line count)). Extra rows blank.
- * Large files share <=256 representative nominal LINEIDX_CHUNK samples across
- * adjacent rows (also bounded by the chunk/active-row counts). Each sample
- * reads <=256 bytes. The first line after that boundary supplies the count;
- * a line longer than the sample is clipped. This is an approximation, flagged
- * sampled, and costs O(height*256 + width*height), independent of file size.
+ * Large files (edit-cxho.9): minimap_prepare's rows are the window at line 0,
+ * one real line per row, summarised from its first MINIMAP_LINE_CAP bytes;
+ * minimap_prepare_window builds the window around the viewport. Flagged
+ * sampled (whole-file navigation is approximate) and windowed. Reads are
+ * bounded by the window's lines (see minimap_prepare_window), independent of
+ * file size.
  */
 #define MINIMAP_SMALL_BYTES UINT64_C(65536)
 #define MINIMAP_SMALL_LINES UINT64_C(20000)
 #define MINIMAP_LINE_CAP UINT64_C(80)
-#define MINIMAP_SAMPLE_BYTES 256u
-#define MINIMAP_MAX_SAMPLES 256u
 
 enum { MINIMAP_OK = 0, MINIMAP_ERR_ARG = -1, MINIMAP_ERR_CAPACITY = -2,
        MINIMAP_ERR_STALE = -3, MINIMAP_ERR_SOURCE = -4 };
@@ -38,8 +37,8 @@ typedef struct minimap_input {
 
 typedef struct minimap_row {
     uint64_t first_line, line_count;
-    uint64_t first_byte;      /* small: line start; large: representative sample */
-    uint64_t ink;             /* small: sum of clipped counts; large: sample */
+    uint64_t first_byte;      /* line start (small: the group's first line) */
+    uint64_t ink;             /* small: sum of clipped counts; windowed: prefix count */
     uint8_t density;
     /* (G) existing clipped line bound: ceil(MINIMAP_LINE_CAP / 64)
      * machine words. Representative character columns; tabs expand to the
@@ -51,6 +50,27 @@ typedef struct minimap_style {
     uint32_t background, density, viewport, stale; /* opaque 0x00RRGGBB; stale is the pending edge bar */
 } minimap_style;
 
+/* edit-cxho.8 window geometry; documented with minimap_window_lines below. */
+#define MINIMAP_LINE_PX 2u /* (G) perf §1 Layout: 2 logical px per line */
+#define MINIMAP_LINE_UNKNOWN UINT64_MAX /* byte variant: window has no line number */
+
+typedef struct minimap_window {
+    uint64_t first_line;  /* line whose top scanline is at y = -phase; UNKNOWN for bytes */
+    uint64_t range;       /* R: scroll range in lines (or bytes); seek returns 0..range */
+    uint32_t above;       /* window lines above the viewport's first line: ceil(box_top/scale) */
+    uint32_t phase;       /* px of first_line clipped above y = 0; < scale */
+    uint32_t rows;        /* line slots touching [0, height); exact: <= lines - first_line */
+    uint32_t box_top, box_height; /* box_top + box_height <= height */
+    uint32_t travel;      /* D: box_top spans 0..travel */
+    uint32_t scale, height;
+    bool scrolls;         /* box is a thumb (always for bytes); else box over its lines */
+} minimap_window;
+typedef struct minimap_anchor {
+    minimap_window window;  /* from minimap_window_lines, or _bytes while indexing */
+    uint64_t first_line;    /* viewport's first line (a label while indexing) */
+    uint64_t first_byte;    /* a byte on the viewport's first line */
+} minimap_anchor;
+
 typedef struct minimap {
     minimap_row *rows;
     size_t capacity;
@@ -58,6 +78,8 @@ typedef struct minimap {
     uint64_t painted_first, painted_end; /* retain the ready map's viewport during edits */
     uint32_t height, active_rows;
     bool initialized, filled, stale, sampled;
+    bool windowed, window_exact; /* edit-cxho.9: rows are the anchor's window lines */
+    minimap_anchor anchor;       /* the window rows were prepared for */
     const void *buffer_identity; /* optional stable token set by bind */
     lineidx_src identity; /* callback/context identity only; never dereferenced */
 } minimap;
@@ -129,9 +151,10 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
 bool minimap_pending_band(uint64_t lines, uint32_t rows, uint32_t r,
                           uint64_t first_line, uint64_t end_line);
 /* y is a strip row (pixel_y/cell_h), clamped for dragging outside the strip.
- * Small hits use exact cached line starts. Large hits resolve via index on
- * demand (one existing line_to_byte query, may scan one chunk); idx must model
- * input.source. Stale hits fail; output unchanged on failure. */
+ * Hits return the row's cached line start: exact for small and exact-window
+ * maps, exact=false for a window prepared while indexing (edit-cxho.9: no
+ * index query; idx is unused and may be NULL). Stale hits fail; output
+ * unchanged on failure. */
 /* Source-read-free pixel dump of prepared summaries. Stale summaries retain
  * their painted viewport, as in fill; caller verifies source/height identity.
  * (G) perf target §2:
@@ -168,20 +191,6 @@ int minimap_row_for_line(const minimap *m, uint64_t line, uint32_t *out);
  * cannot drift: line L is drawn at y = (L - first_line) * scale - phase.
  * Scroll past end: pass lines + visible - 1 so R covers first <= lines - 1.
  * docs/decisions/edit-cxho.8.md. */
-#define MINIMAP_LINE_PX 2u /* (G) perf §1 Layout: 2 logical px per line */
-#define MINIMAP_LINE_UNKNOWN UINT64_MAX /* byte variant: window has no line number */
-
-typedef struct minimap_window {
-    uint64_t first_line;  /* line whose top scanline is at y = -phase; UNKNOWN for bytes */
-    uint64_t range;       /* R: scroll range in lines (or bytes); seek returns 0..range */
-    uint32_t above;       /* window lines above the viewport's first line: ceil(box_top/scale) */
-    uint32_t phase;       /* px of first_line clipped above y = 0; < scale */
-    uint32_t rows;        /* line slots touching [0, height); exact: <= lines - first_line */
-    uint32_t box_top, box_height; /* box_top + box_height <= height */
-    uint32_t travel;      /* D: box_top spans 0..travel */
-    uint32_t scale, height;
-    bool scrolls;         /* box is a thumb (always for bytes); else box over its lines */
-} minimap_window;
 
 /* scale == 0 or out == NULL: MINIMAP_ERR_ARG, out unchanged. lines == 0 gives
  * an empty window (rows 0) with the box at the top. */
@@ -204,4 +213,40 @@ bool minimap_window_grab(const minimap_window *w, int64_t y, int64_t *offset);
  * when range <= travel, seek(box_top(f)) == f. Otherwise within one step,
  * ceil(range / travel). NULL w: 0. */
 uint64_t minimap_window_seek(const minimap_window *w, int64_t y, int64_t offset);
+
+/* edit-cxho.9: miniature of the window's real lines (replaces the 256-sample
+ * striped path for large files). Row i is logical line top+i, where top is
+ * the window's first line: the anchor's line start walked back
+ * (anchor.first_line - window.first_line) lines when the window is exact
+ * (minimap_window_lines, index ready), or window.above lines while the index
+ * builds (minimap_window_bytes: first_byte is the byte-fraction anchor and is
+ * snapped back to its line start). Rows are labelled first_line =
+ * anchor.first_line - walked + i, the caller's own line numbering, so the
+ * painted viewport band falls on the anchor's row. Each line is summarised
+ * from its first MINIMAP_LINE_CAP bytes (ink and marks); its end is found by
+ * a newline search of at most MINIMAP_SCAN_BYTES. A longer line ends the walk
+ * (forward: later rows stay blank; backward: the window starts below it).
+ * Reads (P): every inspected byte belongs to a walked line or one backward
+ * block of MINIMAP_LINE_CAP + 1 bytes, so for a window of lines no longer
+ * than L <= MINIMAP_SCAN_BYTES bytes, inspected bytes <=
+ * (walk_back + 1) * (L + MINIMAP_LINE_CAP + 2) + rows * (L + 1); with
+ * L <= MINIMAP_LINE_CAP that is about (2 * walk_back + rows) * 81 bytes, the
+ * window rows times the summary width. Independent of file size.
+ * No allocation. Rows past EOF stay blank (line_count 0); active_rows counts
+ * the filled rows. The map is `windowed` and `sampled` (approximate whole-file
+ * navigation: the editor drags by byte fraction until edit-cxho.10). A map
+ * prepared without an index (window_exact false) is fresh for an input with
+ * index_ready false and the same revision, bytes and source identity; the
+ * index completing makes it stale so the exact window replaces it. */
+/* (G) per-line newline search cap: the existing per-query scan bound, one
+ * LINEIDX_CHUNK (minimap_hit's line_to_byte and lineidx_refresh each scan at
+ * most one chunk). Not a budget invented here. */
+#define MINIMAP_SCAN_BYTES ((uint64_t)LINEIDX_CHUNK)
+/* snapshot_source NULL reads input->source (UI/sync callers); otherwise as
+ * minimap_prepare_source. height caps the rows (capacity reserved at init). */
+int minimap_prepare_window(minimap *m, const minimap_input *input,
+                           const lineidx_src *snapshot_source,
+                           const minimap_anchor *anchor, uint32_t height);
+/* True when m is not a windowed map prepared for exactly this anchor. */
+bool minimap_anchor_moved(const minimap *m, const minimap_anchor *anchor);
 #endif

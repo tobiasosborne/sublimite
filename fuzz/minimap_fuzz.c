@@ -13,19 +13,6 @@ static size_t span(void *ctx, uint64_t off, const uint8_t **p)
     *p = f->p + off; return n;
 }
 static bool space(uint8_t c) { return c == ' ' || (c >= 9 && c <= 13); }
-static uint64_t sample_model(const uint8_t *p, size_t n, size_t start)
-{
-    size_t end = start + MINIMAP_SAMPLE_BYTES;
-    if (end > n) end = n;
-    size_t begin = start;
-    if (start) {
-        while (begin < end && p[begin] != '\n') begin++;
-        if (begin < end) begin++; else begin = start;
-    }
-    uint64_t ink = 0;
-    for (size_t i = begin; i < end && p[i] != '\n'; i++) ink += !space(p[i]);
-    return ink > 80 ? 80 : ink;
-}
 /* edit-cxho.8: window mapping bounds over arbitrary lines, viewport, scroll
  * position, scale, strip height and pointer. Fields read little-endian with
  * zero padding; a shift byte makes small magnitudes as likely as huge ones. */
@@ -79,6 +66,41 @@ static void window_op(const uint8_t *data, size_t size)
     MUST((uint64_t)b.above * s - b.phase == b.box_top && b.phase < s);
     MUST(minimap_window_seek(&b, y, off) <= n);
 }
+/* edit-cxho.9: window rows over the same line vectors. A viewport line and
+ * a byte inside it come from the input; exact (index ready) and byte-anchored
+ * (indexing) windows must both list consecutive real lines from the top
+ * the mapping implies, each summarised from its first MINIMAP_LINE_CAP bytes. */
+static void window_rows_op(const uint8_t *data, size_t size, const minimap_input *base,
+                           const uint64_t *starts, const uint64_t *prefix, size_t lines, uint32_t h)
+{
+    uint64_t at = field(data, size, 4, 2) % lines, vis = field(data, size, 6, 1) % 64u;
+    uint32_t sc = (uint32_t)field(data, size, 7, 1) % 3u + 1u;
+    uint64_t span_len = starts[at + 1] - starts[at]; /* line bytes incl. its newline */
+    uint64_t byte = starts[at] + field(data, size, 8, 2) % span_len;
+    minimap_row rows[512]; minimap m; MUST(minimap_init(&m, rows, 512) == 0);
+    for (int exact = 0; exact < 2; exact++) {
+        minimap_input in = *base; minimap_anchor a = {.first_line = at, .first_byte = byte};
+        uint64_t top;
+        if (exact) {
+            MUST(minimap_window_lines(lines, vis, at, sc, h * sc, &a.window) == 0);
+            top = a.window.first_line;
+        } else {
+            in.index_ready = false;
+            MUST(minimap_window_bytes(base->source.len, vis, byte, sc, h * sc, &a.window) == 0);
+            top = at > a.window.above ? at - a.window.above : 0;
+        }
+        MUST(minimap_prepare_window(&m, &in, NULL, &a, h) == 0);
+        MUST(m.window_exact == (exact != 0) && !minimap_stale(&m, &in) && !minimap_anchor_moved(&m, &a));
+        uint64_t want = a.window.rows < h ? a.window.rows : h;
+        if (want > lines - top) want = lines - top;
+        MUST(m.active_rows == want);
+        for (uint32_t i = 0; i < m.active_rows; i++) {
+            MUST(rows[i].first_byte == starts[top + i] && rows[i].line_count == 1);
+            MUST(rows[i].first_line == top + i && rows[i].ink == prefix[top + i]);
+        }
+    }
+    minimap_fini(&m);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
@@ -86,20 +108,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (size < 5) return 0;
     uint32_t h = (uint32_t)data[0] * 2u + 1, w = data[1] % 8u + 1;
     size_t count = (size - 4) / 2; if (count > 512) count = 512;
-    uint64_t starts[513], inks[513]; size_t n = 0;
+    uint64_t starts[514], inks[513], prefix[513]; size_t n = 0;
     uint8_t *bytes = malloc(1049600); MUST(bytes);
     for (size_t j = 0; j < count; j++) {
         size_t len = ((size_t)data[4+j*2] * 256 + data[5+j*2]) % 2049;
-        starts[j] = n; inks[j] = 0;
+        starts[j] = n; inks[j] = 0; prefix[j] = 0;
         for (size_t k = 0; k < len; k++) {
             uint8_t c = k % (data[2] % 17u + 1u) == 0 ? ' ' : (uint8_t)(128u + (k % 128));
             bytes[n++] = c; inks[j] += !space(c);
+            if (k < MINIMAP_LINE_CAP) prefix[j] += !space(c); /* edit-cxho.9 summary prefix */
         }
         if (inks[j] > 80) inks[j] = 80;
         if (j + 1 < count || (data[3]&1)) bytes[n++] = '\n';
     }
     size_t lines = count;
-    if (count == 0 || (data[3]&1)) { starts[lines] = n; inks[lines++] = 0; }
+    if (count == 0 || (data[3]&1)) { starts[lines] = n; prefix[lines] = 0; inks[lines++] = 0; }
+    starts[lines] = n + 1; /* one past the last line's (absent) newline */
     flat f = {bytes,n,(size_t)(data[2] % 64u + 1u)};
     minimap_input in = {{&f,n,span,NULL},lines,1,true};
     render_cell cells[512*10]; uint64_t dirty[8]; minimap_row rows[512]; minimap m; render_grid g;
@@ -113,11 +137,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     flat fast = {bytes,n,n ? n : 1};
     minimap_input hit_input = in;
     lineidx_src fast_src = in.source; fast_src.ctx = &fast;
-    lineidx *idx = NULL;
-    if (m.sampled) {
-        idx = lineidx_create(n); MUST(idx);
-        (void)lineidx_seek_line(idx,&fast_src,UINT64_MAX,n); MUST(lineidx_complete(idx));
-    }
+    /* edit-cxho.9: large maps are the window at line 0, one line per row
+     * (no samples, no index: the edit-cxho.29 lineidx crash path is gone). */
+    if (m.sampled) k = 1;
     for (uint32_t r = 0; r < h; r++) {
         uint64_t first = (uint64_t)r*k;
         if (first >= lines) { MUST(rows[r].line_count == 0 && rows[r].density == 0); continue; }
@@ -126,28 +148,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (!m.sampled) {
             for (uint64_t j = first; j < end; j++) ink += inks[j];
             den = ink*255/(80*(end-first));
-            MUST(rows[r].first_byte == starts[first]);
-        } else {
-            size_t chunks = n/LINEIDX_CHUNK + (n%LINEIDX_CHUNK != 0);
-            size_t active = (lines+k-1)/k;
-            size_t samples = active < MINIMAP_MAX_SAMPLES ? active : MINIMAP_MAX_SAMPLES;
-            if (chunks < samples) samples = chunks;
-            size_t group = samples*r/active;
-            size_t boundary = chunks*group/samples*LINEIDX_CHUNK;
-            MUST(rows[r].first_byte == boundary);
-            ink = sample_model(bytes,n,boundary); den = ink*255/80;
-        }
+        } else { ink = prefix[first]; den = ink*255/80; }
+        MUST(rows[r].first_byte == starts[first]);
         MUST(rows[r].density == den && rows[r].ink == ink && rows[r].first_line == first);
         minimap_target target; uint32_t back;
-        MUST(minimap_hit(&m,&hit_input,idx,r,&target) == 0 && target.exact);
+        MUST(minimap_hit(&m,&hit_input,NULL,r,&target) == 0 && target.exact);
         MUST(target.line == first && target.byte == starts[first]);
         MUST(minimap_row_for_line(&m,target.line,&back) == 0 && back == r);
         MUST(cells[r*(w+2)].bg == 0x42424242);
     }
+    window_rows_op(data, size, &in, starts, prefix, lines, h);
     in.revision++; MUST(minimap_stale(&m,&in));
     in.index_ready = false;
     MUST(minimap_fill(&m,&in,&g,2,w,0,0,&style) == 0 && m.stale);
-    minimap_target target = {0}; MUST(minimap_hit(&m,&in,idx,0,&target) == MINIMAP_ERR_STALE);
+    minimap_target target = {0}; MUST(minimap_hit(&m,&in,NULL,0,&target) == MINIMAP_ERR_STALE);
     in.index_ready = true;
     MUST(minimap_fill(&m,&in,&g,2,w,0,0,&style) == 0 && !minimap_stale(&m,&in));
     minimap_row worker_rows[512]; minimap worker;
@@ -162,6 +176,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* Identity-only switch, with equal bytes/revision/count, cannot hit cache. */
     hit_input = in; hit_input.source.ctx = &fast;
     MUST(minimap_stale(&m,&hit_input));
-    MUST(minimap_hit(&m,&hit_input,idx,0,&target) == MINIMAP_ERR_STALE);
-    minimap_fini(&worker); minimap_fini(&m); lineidx_destroy(idx); free(bytes); return 0;
+    MUST(minimap_hit(&m,&hit_input,NULL,0,&target) == MINIMAP_ERR_STALE);
+    minimap_fini(&worker); minimap_fini(&m); free(bytes); return 0;
 }

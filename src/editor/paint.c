@@ -263,7 +263,7 @@ static int compose(editor *e)
     /* A file-backed first map is prepared here, synchronously (main's path
      * before edit-73j); every other summary comes from the worker job. */
     bool sync = e->buffer->map_sync_fill;
-    int rc = sync ? minimap_fill(&e->buffer->map, &input, &e->map_grid, 0, 8, first, visible, &colors) :
+    int rc = sync ? editor_map_fill_sync(e, &input, first, visible, &colors) :
         minimap_fill_cached(&e->buffer->map, &input, &e->map_grid, 0, 8, first, visible, &colors);
     if (!rc && sync && e->buffer->map.filled) e->buffer->map_sync_fill = false;
     e->stats.minimap_ns = trace_now_ns() - start; e->stats.minimap_fills++;

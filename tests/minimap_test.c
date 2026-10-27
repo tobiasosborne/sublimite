@@ -270,15 +270,15 @@ static void large_and_errors(void)
     edit_malloc_guard_begin();
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && !m.stale && m.sampled);
     CHECK(edit_malloc_guard_end() == 0);
-    CHECK(f.calls <= 10*37); /* <= ceil(256/7) source calls per row */
+    /* edit-cxho.9: rows are lines 0..9 (the window at line 0), each read up
+     * to its newline: (P) 10 lines of 101 bytes in 7-byte spans, plus the
+     * snap at byte 0 which reads nothing: <= 10 * ceil(101/7) = 150 calls. */
+    CHECK(f.calls <= 10*15);
     for (uint32_t r = 0; r < 10; r++) {
-        size_t start = (size_t)rows[r].first_byte, end = start+256;
-        if (end > n) end = n;
-        size_t first = start;
-        if (start) { while (first < end && bytes[first] != '\n') first++; if (first < end) first++; else first = start; }
+        size_t first = (size_t)r * 101u, end = first + 80u; /* summary prefix */
+        CHECK(rows[r].first_byte == first && rows[r].first_line == r && rows[r].line_count == 1);
         uint64_t ink = 0;
         for (size_t i = first; i < end && bytes[i] != '\n'; i++) if (!space(bytes[i])) ink++;
-        if (ink > 80) ink = 80;
         CHECK(rows[r].density == ink*255/80);
         minimap_target target; uint32_t back;
         CHECK(minimap_hit(&m,&in,idx,r,&target) == 0 && target.exact);
@@ -311,7 +311,8 @@ static void large_and_errors(void)
     in.lines = lineidx_line_count(idx).value; in.index_ready = true;
     CHECK(minimap_stale(&m,&in));
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == 0 && !m.stale);
-    CHECK(rows[0].density == 79*255/80);
+    /* (P) 80-byte prefix: 16 spaces at i % 5 == 0 plus the edited byte 1. */
+    CHECK(rows[0].density == 63*255/80);
     /* Broken source must not partially modify the grid. */
     memcpy(saved,cells,sizeof cells); f.n = 0; in.revision++;
     CHECK(minimap_fill(&m,&in,&g,6,3,0,1,&style) == MINIMAP_ERR_SOURCE && m.stale);
@@ -350,12 +351,12 @@ static void sample_cap_and_resize(void)
     CHECK(render_frame_begin(&g,1) == 0);
     edit_malloc_guard_begin();
     CHECK(minimap_fill(&m,&in,&g,0,2,0,100,&style) == 0);
-    CHECK(edit_malloc_guard_end() == 0 && f.calls == MINIMAP_MAX_SAMPLES);
-    for (uint32_t r = 0; r < m.active_rows; r++) {
-        uint64_t group = (uint64_t)r*256/m.active_rows;
-        uint64_t boundary = UINT64_C(16384)*group/256*LINEIDX_CHUNK;
-        CHECK(rows[r].first_byte == boundary && rows[r].density == 63*255/80);
-    }
+    /* edit-cxho.9: the window at line 0 reads only its 1800 lines of 64
+     * bytes, in spans that end at each 256-byte block: (P) 1800*64/256 =
+     * 450 calls, independent of the 1 GiB length. */
+    CHECK(edit_malloc_guard_end() == 0 && f.calls == 1800u*64u/256u && m.active_rows == 1800);
+    for (uint32_t r = 0; r < m.active_rows; r++)
+        CHECK(rows[r].first_byte == (uint64_t)r*64 && rows[r].density == 63*255/80);
     size_t calls = f.calls;
     CHECK(minimap_fill(&m,&in,&g,0,1,1000,50,&style) == 0 && f.calls == calls);
     /* Changed height invalidates cache even with an unchanged revision. */
@@ -665,9 +666,215 @@ static void window_mapping(void)
     CHECK(edit_malloc_guard_end() == 0);
     puts("edit-cxho.8: fixed-scale window, constant box, round trip, clamps: ok");
 }
+/* edit-cxho.9: miniature of the window's real lines. Strip H = 1410 px,
+ * v = 45 lines and 705 summary rows are the research repro (M) used by
+ * edit-cxho.8; 200000 lines / window at 150000 and the 640943-byte file
+ * (Tobias's CONTENTS.md size, (M)) are the bead's fixtures, not budgets. */
+typedef struct counted {
+    const uint8_t *p; size_t n, fragment, calls;
+    uint64_t delivered, lo, hi;
+} counted;
+static size_t counted_span(void *ctx, uint64_t off, const uint8_t **p)
+{
+    counted *f = ctx; f->calls++;
+    if (off >= f->n) return 0;
+    size_t n = f->n - (size_t)off;
+    if (f->fragment && n > f->fragment) n = f->fragment;
+    f->delivered += n;
+    if (off < f->lo) f->lo = off;
+    if (off + n > f->hi) f->hi = off + n;
+    *p = f->p + off; return n;
+}
+/* Independent model of one line's marks: tabs to four-column stops,
+ * columns clipped at MINIMAP_LINE_CAP. */
+static void model_marks(const uint8_t *p, size_t n, size_t start, uint64_t marks[2])
+{
+    marks[0] = marks[1] = 0; uint32_t col = 0;
+    for (size_t i = start; i < n && p[i] != '\n' && col < MINIMAP_LINE_CAP; i++) {
+        if (p[i] == '\t') { col += 4u - col % 4u; continue; }
+        if (!space(p[i])) marks[col / 64u] |= UINT64_C(1) << (col % 64u);
+        col++;
+    }
+}
+/* Line j: indent j % 13 (neighbours always differ), then 1..40 bytes of 'x'
+ * with a space wherever (k + j) % 6 == 0: <= 12 + 40 = 52 bytes (P), so
+ * every line fits the summary width. No trailing newline. */
+static size_t region_lines(uint8_t *buf, size_t lines, uint64_t *starts)
+{
+    size_t n = 0;
+    for (size_t j = 0; j < lines; j++) {
+        starts[j] = n;
+        for (size_t k = 0; k < j % 13u; k++) buf[n++] = ' ';
+        size_t len = 1 + (j / 13u * 7u + j) % 40u;
+        for (size_t k = 0; k < len; k++) buf[n++] = (k + j) % 6u == 0 ? ' ' : 'x';
+        if (j + 1 < lines) buf[n++] = '\n';
+    }
+    starts[lines] = n + 1; /* one past the last line's (absent) newline */
+    return n;
+}
+static void check_rows(const minimap *m, const uint8_t *p, size_t n, const uint64_t *starts,
+                       uint64_t top, uint64_t label, uint32_t count)
+{
+    CHECK(m->active_rows == count);
+    for (uint32_t i = 0; i < count; i++) {
+        const minimap_row *r = &m->rows[i]; uint64_t want[2];
+        model_marks(p, n, (size_t)starts[top + i], want);
+        if (r->first_byte != starts[top + i] || r->marks[0] != want[0] || r->marks[1] != want[1])
+            fprintf(stderr, "row %u: byte %llu want %llu (line %llu)\n", i,
+                    (unsigned long long)r->first_byte, (unsigned long long)starts[top + i],
+                    (unsigned long long)(top + i));
+        CHECK(r->first_byte == starts[top + i] && r->line_count == 1);
+        CHECK(r->first_line == label + i);
+        CHECK(r->marks[0] == want[0] && r->marks[1] == want[1]);
+    }
+}
+static void window_lines_exact(void)
+{
+    enum { LINES = 200000, ROWS = 705, H = 1410, V = 45, AT = 150000, FRAG = 16 };
+    uint8_t *buf = malloc((size_t)LINES * 53u); uint64_t *starts = malloc((LINES + 1u) * sizeof *starts);
+    minimap_row *rows = malloc(ROWS * sizeof *rows); CHECK(buf && starts && rows);
+    size_t n = region_lines(buf, LINES, starts);
+    counted f = {buf, n, FRAG, 0, 0, UINT64_MAX, 0};
+    minimap_input in = {{&f, n, counted_span, NULL}, LINES, 7, true};
+    minimap_anchor a = {.first_line = AT, .first_byte = starts[AT]};
+    CHECK(minimap_window_lines(LINES, V, AT, 2, H, &a.window) == 0 && a.window.scrolls);
+    minimap m; CHECK(minimap_init(&m, rows, ROWS) == 0);
+    edit_malloc_guard_begin();
+    int rc = minimap_prepare_window(&m, &in, NULL, &a, ROWS);
+    CHECK(edit_malloc_guard_end() == 0);
+    CHECK(rc == MINIMAP_OK && m.filled && !m.stale && m.windowed && m.window_exact && m.sampled);
+    uint32_t count = a.window.rows < ROWS ? a.window.rows : ROWS;
+    check_rows(&m, buf, n, starts, a.window.first_line, a.window.first_line, count);
+    CHECK(m.rows[a.window.above].first_line == AT); /* the box's row is the viewport's line */
+    CHECK(!minimap_stale(&m, &in) && !minimap_anchor_moved(&m, &a));
+    /* (P) bounded reads: walk_back = above lines, every line <= 52 bytes. */
+    uint64_t walk = AT - a.window.first_line, longest = 52;
+    uint64_t bound = (walk + 1) * (longest + MINIMAP_LINE_CAP + 2) + count * (longest + 1) + FRAG;
+    printf("edit-cxho.9 (M): window %u rows, walk back %llu, delivered %llu bytes of %zu, bound %llu, span calls %zu\n",
+           count, (unsigned long long)walk, (unsigned long long)f.delivered, n,
+           (unsigned long long)bound, f.calls);
+    CHECK(f.delivered <= bound);
+    CHECK(f.lo + MINIMAP_LINE_CAP + 1 >= starts[a.window.first_line]);
+    CHECK(f.hi <= starts[a.window.first_line + count] + FRAG);
+    /* The window moves with the viewport: a different anchor is a move. */
+    minimap_anchor b = a; b.first_line++; CHECK(minimap_anchor_moved(&m, &b));
+    /* Worker source and UI identity, as minimap_prepare_source. */
+    counted g = f; g.delivered = 0; lineidx_src snap = {&g, n, counted_span, NULL};
+    minimap_row wrows[ROWS]; minimap w; CHECK(minimap_init(&w, wrows, ROWS) == 0);
+    CHECK(minimap_prepare_window(&w, &in, &snap, &a, ROWS) == 0 && g.delivered > 0);
+    CHECK(w.identity.ctx == &f && !minimap_stale(&w, &in));
+    /* The legacy whole-map prepare rows are each a real line too: the
+     * window at line 0 (no sampled groups). */
+    CHECK(minimap_prepare(&m, &in, ROWS) == 0);
+    check_rows(&m, buf, n, starts, 0, 0, ROWS);
+    minimap_target hit; uint32_t back;
+    CHECK(minimap_hit(&m, &in, NULL, 300, &hit) == 0 && hit.exact && hit.line == 300 && hit.byte == starts[300]);
+    CHECK(minimap_row_for_line(&m, 300, &back) == 0 && back == 300);
+    minimap_fini(&m); free(rows); free(starts); free(buf);
+    puts("edit-cxho.9: window at line 150000: row i is line first+i, bounded reads: ok");
+}
+/* A 640943-byte file with markdown-like line lengths 0..119 (some longer
+ * than the summary width): ten 64 KiB chunks. No two adjacent rows may be
+ * identical copies where their lines differ. */
+static void no_stripes(void)
+{
+    enum { N = 640943, ROWS = 705, H = 1410, V = 45 };
+    uint8_t *buf = malloc(N); uint64_t *starts = malloc((N + 2u) * sizeof *starts);
+    minimap_row *rows = malloc(ROWS * sizeof *rows); CHECK(buf && starts && rows);
+    size_t lines = 0, n = 0;
+    while (n < N) {
+        starts[lines] = n;
+        size_t len = (lines * 37u) % 120u;
+        for (size_t k = 0; k < len && n < N; k++) buf[n++] = k % 9u == 4u ? ' ' : (uint8_t)('a' + (lines + k) % 26u);
+        if (n < N) buf[n++] = '\n';
+        lines++;
+    }
+    if (buf[N - 1] == '\n') starts[lines++] = N;
+    starts[lines] = N + 1;
+    CHECK(N / LINEIDX_CHUNK + 1 == 10);
+    flat f = {buf, N, 0, 0};
+    minimap_input in = {{&f, N, span, NULL}, lines, 1, true};
+    minimap m; CHECK(minimap_init(&m, rows, ROWS) == 0);
+    CHECK(minimap_prepare(&m, &in, ROWS) == 0);
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t top = m.rows[0].first_line;
+        check_rows(&m, buf, N, starts, top, top, m.active_rows);
+        for (uint32_t i = 0; i + 1 < m.active_rows; i++) {
+            uint64_t x[2], y[2];
+            model_marks(buf, N, (size_t)starts[top + i], x); model_marks(buf, N, (size_t)starts[top + i + 1], y);
+            if (x[0] != y[0] || x[1] != y[1])
+                CHECK(m.rows[i].marks[0] != m.rows[i + 1].marks[0] || m.rows[i].marks[1] != m.rows[i + 1].marks[1]);
+        }
+        minimap_anchor a = {.first_line = lines / 2, .first_byte = starts[lines / 2]};
+        CHECK(minimap_window_lines(lines, V, lines / 2, 2, H, &a.window) == 0);
+        CHECK(minimap_prepare_window(&m, &in, NULL, &a, ROWS) == 0);
+        CHECK(m.rows[0].first_line == a.window.first_line && m.active_rows == a.window.rows);
+    }
+    minimap_fini(&m); free(rows); free(starts); free(buf);
+    puts("edit-cxho.9: 640943-byte file (10 chunks): adjacent rows are their own lines, no stripes: ok");
+}
+/* Index building: the byte-fraction window anchors mid-line, snaps to the
+ * line start and walks `above` lines back; rows carry the caller's label. */
+static void window_unindexed(void)
+{
+    enum { LINES = 200000, ROWS = 705, H = 1410, V = 45, AT = 150000, LABEL = 149000 };
+    uint8_t *buf = malloc((size_t)LINES * 53u); uint64_t *starts = malloc((LINES + 1u) * sizeof *starts);
+    minimap_row *rows = malloc(ROWS * sizeof *rows); CHECK(buf && starts && rows);
+    size_t n = region_lines(buf, LINES, starts);
+    flat f = {buf, n, 5, 0};
+    minimap_input in = {{&f, n, span, NULL}, 123, 3, false}; /* lines: a stale estimate */
+    minimap_anchor a = {.first_line = LABEL, .first_byte = starts[AT] + 3};
+    CHECK(buf[a.first_byte - 1] != '\n');
+    CHECK(minimap_window_bytes(n, V, a.first_byte, 2, H, &a.window) == 0 && a.window.above > 0);
+    minimap m; CHECK(minimap_init(&m, rows, ROWS) == 0);
+    CHECK(minimap_prepare_window(&m, &in, NULL, &a, ROWS) == 0);
+    CHECK(m.windowed && !m.window_exact && m.filled);
+    uint32_t count = a.window.rows < ROWS ? a.window.rows : ROWS;
+    check_rows(&m, buf, n, starts, AT - a.window.above, LABEL - a.window.above, count);
+    CHECK(m.rows[a.window.above].first_byte == starts[AT]); /* snapped */
+    CHECK(!minimap_stale(&m, &in) && !minimap_anchor_moved(&m, &a));
+    in.lines = 124; CHECK(!minimap_stale(&m, &in)); /* the estimate may move */
+    in.revision++; CHECK(minimap_stale(&m, &in)); in.revision--;
+    in.index_ready = true; in.lines = LINES; CHECK(minimap_stale(&m, &in)); /* exact replaces it */
+    in.index_ready = false;
+    /* Anchor on line 0's newline (byte 1): snaps to byte 0, no lines above. */
+    a.first_byte = 1; a.first_line = 0; CHECK(buf[1] == '\n');
+    CHECK(minimap_window_bytes(n, V, 1, 2, H, &a.window) == 0 && a.window.above == 0);
+    CHECK(minimap_prepare_window(&m, &in, NULL, &a, ROWS) == 0);
+    count = a.window.rows < ROWS ? a.window.rows : ROWS;
+    check_rows(&m, buf, n, starts, 0, 0, count);
+    /* UI fill paints the fresh unindexed window without reading the source. */
+    render_cell cells[ROWS * 2]; uint64_t dirty[(ROWS + 63) / 64]; render_grid g;
+    CHECK(render_grid_init(&g, (render_dims){2, ROWS, 1, 1}, cells, ROWS * 2, dirty, (ROWS + 63) / 64) == 0);
+    CHECK(render_frame_begin(&g, 1) == 0);
+    size_t calls = f.calls;
+    CHECK(minimap_fill_cached(&m, &in, &g, 0, 2, 0, V, &style) == 0 && !m.stale && f.calls == calls);
+    minimap_fini(&m); free(rows); free(starts); free(buf);
+    puts("edit-cxho.9: unindexed byte anchor snaps to line starts, walks above lines back: ok");
+}
+/* A line longer than MINIMAP_SCAN_BYTES ends the walk: bounded reads. */
+static void window_long_line(void)
+{
+    size_t big = (size_t)MINIMAP_SCAN_BYTES + 10u, n = 2 + big + 1 + 2;
+    uint8_t *buf = malloc(n); CHECK(buf);
+    buf[0] = 'a'; buf[1] = '\n'; memset(buf + 2, 'x', big); buf[2 + big] = '\n';
+    buf[3 + big] = 'b'; buf[4 + big] = '\n';
+    counted f = {buf, n, 16, 0, 0, UINT64_MAX, 0};
+    minimap_input in = {{&f, n, counted_span, NULL}, 4, 1, true};
+    minimap_row rows[8]; minimap m; CHECK(minimap_init(&m, rows, 8) == 0);
+    minimap_anchor a = {.first_line = 0, .first_byte = 0};
+    CHECK(minimap_window_lines(4, 2, 0, 1, 8, &a.window) == 0 && a.window.rows == 4);
+    CHECK(minimap_prepare_window(&m, &in, NULL, &a, 8) == 0);
+    CHECK(m.active_rows == 2 && rows[1].first_byte == 2 && rows[1].marks[0] == UINT64_MAX);
+    CHECK(rows[2].line_count == 0);
+    CHECK(f.hi <= 2 + MINIMAP_SCAN_BYTES + 16);
+    minimap_fini(&m); free(buf);
+    puts("edit-cxho.9: a line over MINIMAP_SCAN_BYTES ends the walk: ok");
+}
 int main(void)
 {
     window_mapping();
+    window_lines_exact(); no_stripes(); window_unindexed(); window_long_line();
     character_marks(); viewport_geometry(); pixel_geometry(); dump_map();
     deferred_samples();
     pending_navigation(); pending_one_line();

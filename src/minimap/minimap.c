@@ -33,6 +33,12 @@ void minimap_fini(minimap *m)
 
 bool minimap_stale(const minimap *m, const minimap_input *input)
 {
+    /* edit-cxho.9: a window prepared while the index builds stays fresh for
+     * the same unindexed source; its line count is only an estimate. */
+    if (m && input && m->windowed && !m->window_exact)
+        return !m->initialized || !m->filled || m->stale || input->index_ready
+            || m->revision != input->revision || m->bytes != input->source.len
+            || m->identity.ctx != input->source.ctx || m->identity.span != input->source.span;
     return !m || !input || !m->initialized || !m->filled || m->stale
         || !input->index_ready || m->revision != input->revision
         || m->bytes != input->source.len || m->lines != input->lines
@@ -118,72 +124,159 @@ static uint64_t scale(uint64_t a, uint32_t b, uint32_t d)
     return (a / d) * b + (a % d) * b / d;
 }
 
-static int sample_ink(const lineidx_src *s, uint64_t off, minimap_row *out)
+/* edit-cxho.9: window walker. Spans are read forward from a cursor; the
+ * backward search gathers fixed blocks of MINIMAP_LINE_CAP + 1 bytes (one
+ * summary-width line and its newline), so a short line costs one block. */
+#define WINDOW_BLOCK ((size_t)MINIMAP_LINE_CAP + 1u)
+enum { WALK_LINE = 0, WALK_EOF = 1, WALK_CLIPPED = 2 };
+
+/* Copy [off, off+n) into out; n <= WINDOW_BLOCK. */
+static int gather(const lineidx_src *s, uint64_t off, size_t n, uint8_t *out)
 {
-    uint8_t scratch[MINIMAP_SAMPLE_BYTES];
-    const uint8_t *sample = scratch;
-    size_t have = (size_t)(s->len - off < MINIMAP_SAMPLE_BYTES
-                        ? s->len - off : MINIMAP_SAMPLE_BYTES);
-    uint64_t boundary = off;
-    if (have) {
+    size_t done = 0;
+    while (done < n) {
         const uint8_t *p = NULL;
-        size_t n = s->span(s->ctx, off, &p);
-        if (!n || !p) return MINIMAP_ERR_SOURCE;
-        if (n >= have) sample = p;
-        else {
-            /* Fragmented piece source: gather only the fixed sampling bound.
-             * Contiguous/mapped sources take the zero-copy fast path above. */
-            size_t done = 0;
-            for (;;) {
-                if (n > have - done) n = have - done;
-                memcpy(scratch + done, p, n); done += n; off += n;
-                if (done == have) break;
-                p = NULL; n = s->span(s->ctx, off, &p);
-                if (!n || !p) return MINIMAP_ERR_SOURCE;
-            }
-        }
+        size_t got = s->span(s->ctx, off + done, &p);
+        if (!got || !p) return MINIMAP_ERR_SOURCE;
+        if (got > n - done) got = n - done;
+        memcpy(out + done, p, got); done += got;
     }
-    size_t begin = 0;
-    /* Boundary zero is already a line start. At other boundaries skip the
-     * partial line; absent a newline, use the clipped long-line fragment. */
-    if (boundary != 0) {
-        const uint8_t *nl = memchr(sample, '\n', have);
-        if (nl) begin = (size_t)(nl - sample) + 1;
-    }
-    const uint8_t *nl = memchr(sample + begin, '\n', have - begin);
-    size_t end = nl ? (size_t)(nl - sample) : have;
-    out->ink = count_ink(sample + begin, end - begin, 0);
-    uint32_t column = 0;
-    mark_chars(out, sample + begin, end - begin, &column);
     return MINIMAP_OK;
 }
 
-static int large_rows(minimap *m, const minimap_input *input)
+/* Start of the line holding byte pos - 1 ... i.e. one past the last '\n' in
+ * [pos - MINIMAP_SCAN_BYTES, pos), 0 at the file start. *found false: no
+ * newline within the cap (a line longer than the scan bound). */
+static int line_start_before(const lineidx_src *s, uint64_t pos, uint64_t *start, bool *found)
 {
-    uint64_t chunks = input->source.len / LINEIDX_CHUNK
-                    + (input->source.len % LINEIDX_CHUNK != 0);
-    uint32_t samples = m->active_rows < MINIMAP_MAX_SAMPLES ? m->active_rows : MINIMAP_MAX_SAMPLES;
-    if (chunks && chunks < samples) samples = (uint32_t)chunks;
-    uint32_t previous = UINT32_MAX;
-    uint64_t boundary = 0; minimap_row sample = {0};
-    for (uint32_t r = 0; r < m->active_rows; r++) {
-        minimap_row *v = &m->rows[r];
-        v->first_line = (uint64_t)r * m->lines_per_row;
-        v->line_count = input->lines - v->first_line;
-        if (v->line_count > m->lines_per_row) v->line_count = m->lines_per_row;
-        uint32_t group = (uint32_t)((uint64_t)samples * r / m->active_rows);
-        if (group != previous) {
-            boundary = scale(chunks, group, samples) * LINEIDX_CHUNK;
-            memset(&sample, 0, sizeof sample);
-            int rc = sample_ink(&input->source, boundary, &sample);
-            if (rc != MINIMAP_OK) return rc;
-            previous = group;
+    uint8_t block[WINDOW_BLOCK];
+    uint64_t scanned = 0;
+    while (pos > 0 && scanned < MINIMAP_SCAN_BYTES) {
+        size_t n = pos < WINDOW_BLOCK ? (size_t)pos : WINDOW_BLOCK;
+        int rc = gather(s, pos - n, n, block);
+        if (rc != MINIMAP_OK) return rc;
+        size_t j = n;
+        while (j > 0 && block[j - 1u] != '\n') j--; /* no memrchr on every target */
+        if (j) { *start = pos - n + j; *found = true; return MINIMAP_OK; }
+        pos -= n; scanned += n;
+    }
+    *start = pos; *found = pos == 0;
+    return MINIMAP_OK;
+}
+
+typedef struct walk_cursor {
+    const lineidx_src *s;
+    uint64_t off;             /* offset of p[0] */
+    const uint8_t *p; size_t n;
+} walk_cursor;
+
+/* Summarise the line starting at c->off into row and advance past its
+ * newline: marks from the first MINIMAP_LINE_CAP bytes, ink counted over
+ * the same prefix, the newline searched for at most MINIMAP_SCAN_BYTES. */
+static int walk_line(walk_cursor *c, minimap_row *row)
+{
+    uint64_t scanned = 0, ink = 0; uint32_t column = 0;
+    for (;;) {
+        if (c->off >= c->s->len) { row->ink = ink; return WALK_EOF; }
+        if (!c->n) {
+            const uint8_t *p = NULL;
+            size_t n = c->s->span(c->s->ctx, c->off, &p);
+            if (!n || !p) return MINIMAP_ERR_SOURCE;
+            if (n > c->s->len - c->off) n = (size_t)(c->s->len - c->off);
+            c->p = p; c->n = n;
         }
-        v->first_byte = boundary; v->ink = sample.ink;
-        memcpy(v->marks, sample.marks, sizeof v->marks);
-        v->density = (uint8_t)(sample.ink * 255 / MINIMAP_LINE_CAP);
+        size_t limit = c->n;
+        if (limit > MINIMAP_SCAN_BYTES - scanned) limit = (size_t)(MINIMAP_SCAN_BYTES - scanned);
+        const uint8_t *nl = memchr(c->p, '\n', limit);
+        size_t body = nl ? (size_t)(nl - c->p) : limit;
+        if (scanned < MINIMAP_LINE_CAP) {
+            size_t k = body;
+            if (k > MINIMAP_LINE_CAP - scanned) k = (size_t)(MINIMAP_LINE_CAP - scanned);
+            ink = count_ink(c->p, k, ink);
+            mark_chars(row, c->p, k, &column);
+        }
+        scanned += body;
+        size_t step = nl ? body + 1u : body;
+        c->p += step; c->n -= step; c->off += step;
+        if (nl) { row->ink = ink; return WALK_LINE; }
+        if (scanned >= MINIMAP_SCAN_BYTES) { row->ink = ink; return WALK_CLIPPED; }
+    }
+}
+
+static int window_rows(minimap *m, const lineidx_src *src, const minimap_anchor *a,
+                       bool exact, uint32_t height)
+{
+    const minimap_window *w = &a->window;
+    uint64_t back = exact ? a->first_line - w->first_line : w->above;
+    uint64_t pos = a->first_byte < src->len ? a->first_byte : src->len, start = 0;
+    bool found = false;
+    int rc = line_start_before(src, pos, &start, &found);
+    if (rc != MINIMAP_OK) return rc;
+    if (!found) { start = pos; m->window_exact = false; } /* anchor line over the scan bound */
+    uint64_t walked = 0;
+    while (walked < back && start > 0) {
+        uint64_t prev = 0;
+        rc = line_start_before(src, start - 1u, &prev, &found);
+        if (rc != MINIMAP_OK) return rc;
+        if (!found) break; /* the line above is over the scan bound */
+        start = prev; walked++;
+    }
+    uint64_t label = a->first_line > walked ? a->first_line - walked : 0;
+    uint32_t want = w->rows < height ? w->rows : height;
+    walk_cursor c = {src, start, NULL, 0};
+    m->active_rows = 0;
+    for (uint32_t i = 0; i < want; i++) {
+        minimap_row *r = &m->rows[i];
+        r->first_line = label + i; r->first_byte = c.off; r->line_count = 1;
+        rc = walk_line(&c, r);
+        if (rc < 0) return rc;
+        r->density = (uint8_t)(r->ink * 255 / MINIMAP_LINE_CAP);
+        m->active_rows = i + 1u;
+        if (rc != WALK_LINE) break;
     }
     return MINIMAP_OK;
+}
+
+/* Shared tail of minimap_prepare and minimap_prepare_window. */
+static int window_prepare(minimap *m, const minimap_input *input, const lineidx_src *src,
+                          const minimap_anchor *anchor, uint32_t height)
+{
+    m->stale = true; m->filled = false; m->height = height;
+    m->lines_per_row = 1; m->sampled = true; m->windowed = true;
+    m->window_exact = input->index_ready && anchor->window.first_line != MINIMAP_LINE_UNKNOWN
+                   && anchor->first_line >= anchor->window.first_line;
+    m->anchor = *anchor;
+    memset(m->rows, 0, (size_t)height * sizeof *m->rows);
+    int rc = window_rows(m, src, anchor, m->window_exact, height);
+    if (rc != MINIMAP_OK) return rc;
+    m->identity = input->source;
+    m->revision = input->revision; m->bytes = input->source.len; m->lines = input->lines;
+    m->filled = true; m->stale = false;
+    return MINIMAP_OK;
+}
+
+int minimap_prepare_window(minimap *m, const minimap_input *input,
+                           const lineidx_src *snapshot_source,
+                           const minimap_anchor *anchor, uint32_t height)
+{
+    if (!m || !m->initialized || !input || !input->lines || !height || !anchor
+        || !anchor->window.scale || (input->source.len && !input->source.span))
+        return MINIMAP_ERR_ARG;
+    const lineidx_src *src = snapshot_source ? snapshot_source : &input->source;
+    if (src->len != input->source.len || (src->len && !src->span)) return MINIMAP_ERR_ARG;
+    if (m->capacity < height) return MINIMAP_ERR_CAPACITY;
+    return window_prepare(m, input, src, anchor, height);
+}
+
+bool minimap_anchor_moved(const minimap *m, const minimap_anchor *anchor)
+{
+    if (!m || !anchor || !m->windowed) return true;
+    const minimap_window *a = &m->anchor.window, *b = &anchor->window;
+    return m->anchor.first_line != anchor->first_line || m->anchor.first_byte != anchor->first_byte
+        || a->first_line != b->first_line || a->range != b->range || a->above != b->above
+        || a->phase != b->phase || a->rows != b->rows || a->box_top != b->box_top
+        || a->box_height != b->box_height || a->travel != b->travel || a->scale != b->scale
+        || a->height != b->height || a->scrolls != b->scrolls;
 }
 
 int minimap_prepare(minimap *m, const minimap_input *input, uint32_t height)
@@ -192,13 +285,20 @@ int minimap_prepare(minimap *m, const minimap_input *input, uint32_t height)
         || !input->index_ready || (input->source.len && !input->source.span))
         return MINIMAP_ERR_ARG;
     if (m->capacity < height) return MINIMAP_ERR_CAPACITY;
+    if (input->source.len > MINIMAP_SMALL_BYTES || input->lines > MINIMAP_SMALL_LINES) {
+        /* edit-cxho.9: a large file's whole-map rows are the window at line
+         * 0, one real line per row (scale 1, height rows), not samples. */
+        minimap_anchor top = {0};
+        (void)minimap_window_lines(input->lines, 0, 0, 1, height, &top.window);
+        return window_prepare(m, input, &input->source, &top, height);
+    }
     m->stale = true; m->filled = false; m->height = height;
     m->lines_per_row = input->lines / height + (input->lines % height != 0);
     m->active_rows = (uint32_t)(input->lines / m->lines_per_row
                         + (input->lines % m->lines_per_row != 0));
     memset(m->rows, 0, (size_t)height * sizeof *m->rows);
-    m->sampled = input->source.len > MINIMAP_SMALL_BYTES || input->lines > MINIMAP_SMALL_LINES;
-    int rc = m->sampled ? large_rows(m, input) : small_rows(m, input);
+    m->sampled = false; m->windowed = false; m->window_exact = false;
+    int rc = small_rows(m, input);
     if (rc != MINIMAP_OK) return rc;
     m->identity = input->source;
     m->revision = input->revision; m->bytes = input->source.len; m->lines = input->lines;
@@ -267,21 +367,23 @@ bool minimap_pending_band(uint64_t lines, uint32_t rows, uint32_t r,
     return row_line < end_line && first_line <= next_line;
 }
 
-int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
-                 uint32_t first_col, uint32_t width,
-                 uint64_t first_line, uint64_t visible_lines,
-                 const minimap_style *style)
+/* pending: fill_cached's cache miss (stale or resized): never prepare and
+ * paint the retained or pending map, as with an unready index. */
+static int fill(minimap *m, const minimap_input *input, render_grid *grid,
+                uint32_t first_col, uint32_t width,
+                uint64_t first_line, uint64_t visible_lines,
+                const minimap_style *style, bool pending)
 {
     int rc = validate(m, input, grid, first_col, width, style);
     if (rc != MINIMAP_OK) return rc;
     bool retained = m->filled && m->height == grid->dims.rows
         && m->identity.ctx == input->source.ctx && m->identity.span == input->source.span;
-    bool fresh = retained && !minimap_stale(m, input);
-    if (input->index_ready && !fresh) {
+    bool fresh = !pending && retained && !minimap_stale(m, input);
+    if (!pending && input->index_ready && !fresh) {
         rc = minimap_prepare(m, input, grid->dims.rows);
         if (rc != MINIMAP_OK) return rc;
         retained = true;
-    } else m->stale = !input->index_ready;
+    } else m->stale = !fresh; /* edit-cxho.9: a fresh unindexed window is ready */
     uint64_t end = first_line;
     if (first_line < input->lines) {
         uint64_t remaining = input->lines - first_line;
@@ -342,6 +444,13 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
     }
     return MINIMAP_OK;
 }
+int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
+                 uint32_t first_col, uint32_t width,
+                 uint64_t first_line, uint64_t visible_lines,
+                 const minimap_style *style)
+{
+    return fill(m, input, grid, first_col, width, first_line, visible_lines, style, false);
+}
 
 int minimap_pixels(const minimap *m, uint32_t *pixels, size_t capacity,
                    uint32_t width, uint32_t height, size_t stride,
@@ -399,12 +508,10 @@ int minimap_hit(const minimap *m, const minimap_input *input, lineidx *idx,
     if (minimap_stale(m, input)) return MINIMAP_ERR_STALE;
     uint32_t row = y < 0 ? 0 : (uint64_t)y >= m->active_rows ? m->active_rows - 1 : (uint32_t)y;
     const minimap_row *v = &m->rows[row];
-    minimap_target target = {v->first_line, v->first_byte, true};
-    if (m->sampled) {
-        if (!idx || lineidx_len(idx) != input->source.len) return MINIMAP_ERR_ARG;
-        lineidx_result pos = lineidx_line_to_byte(idx, &input->source, target.line);
-        target.byte = pos.value; target.exact = pos.exact;
-    }
+    /* edit-cxho.9: every row is a real line start found by the walk (or
+     * small-file grouping); no index query. idx is kept for the API. */
+    (void)idx;
+    minimap_target target = {v->first_line, v->first_byte, !m->windowed || m->window_exact};
     *out = target;
     return MINIMAP_OK;
 }
@@ -414,7 +521,10 @@ int minimap_row_for_line(const minimap *m, uint64_t line, uint32_t *out)
     if (!m || !out || !m->initialized || !m->filled) return MINIMAP_ERR_ARG;
     if (m->stale) return MINIMAP_ERR_STALE;
     if (line >= m->lines) line = m->lines - 1;
-    *out = (uint32_t)(line / m->lines_per_row);
+    /* Windowed rows start at rows[0].first_line (0 for small maps). */
+    uint64_t base = m->active_rows ? m->rows[0].first_line : 0;
+    uint64_t row = line > base ? (line - base) / m->lines_per_row : 0;
+    *out = (uint32_t)(m->active_rows && row >= m->active_rows ? m->active_rows - 1u : row);
     return MINIMAP_OK;
 }
 
@@ -436,12 +546,9 @@ int minimap_fill_cached(minimap *m, const minimap_input *input, render_grid *gri
 {
     int rc = validate(m, input, grid, first_col, width, style);
     if (rc != MINIMAP_OK) return rc;
-    minimap_input pending = *input;
-    if (m->height != grid->dims.rows || minimap_stale(m, input)) {
-        pending.index_ready = false;
-    }
-    return minimap_fill(m, &pending, grid, first_col, width,
-                        first_line, visible_lines, style);
+    if (!m) return MINIMAP_ERR_ARG;
+    bool pending = m->height != grid->dims.rows || minimap_stale(m, input);
+    return fill(m, input, grid, first_col, width, first_line, visible_lines, style, pending);
 }
 
 int minimap_prepare_source(minimap *m, const minimap_input *input,

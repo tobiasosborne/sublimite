@@ -147,6 +147,9 @@ typedef struct editor_buffer {
     minimap_row *map_rows, *map_worker_rows;
     minimap map_worker;
     minimap_input map_job_input;
+    minimap_anchor map_job_anchor; /* edit-cxho.9: the window a windowed job prepares */
+    bool map_job_windowed;
+    bool map_hold_unindexed; /* edit-cxho.9: file-backed window waits for the index */
     piece_snapshot *map_snapshot;
     work_handle map_handle;
     uint32_t map_job_height;
@@ -770,6 +773,10 @@ void editor_hl_paint(editor *e, uint64_t byte, uint32_t *fg);
 int editor_map_service(editor *e);
 uint64_t editor_map_retry_ns(const editor *e); /* edit-ci6i: the due retry tick, 0 if none */
 bool editor_map_receive(editor *e, const work_msg *msg);
+/* edit-cxho.9: compose's synchronous first map of a file-backed buffer;
+ * a large one prepares the viewport's window (bounded reads), then fills. */
+int editor_map_fill_sync(editor *e, const minimap_input *input, uint64_t first,
+                         uint64_t visible, const minimap_style *colors);
 int editor_chrome_pointer(editor *e, const plat_event *ev);
 int editor_wheel_continue(editor *e);
 int editor_text_geometry(editor *e);
