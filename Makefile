@@ -131,7 +131,7 @@ TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
 # Display ownership includes focus, selection, Present and live raster/GL tests.
 # Keep other module tests outside the cross-worktree lane; new editor/X11 tests match
 # automatically. All callers share tools/with_display_lock.sh.
-DISPLAY_TEST_SAN := $(filter $(B)/san/tests/cli_test $(B)/san/tests/editor% $(B)/san/tests/x11% $(B)/san/tests/ref% $(B)/san/tests/gl% $(B)/san/tests/raster_test,$(TEST_SAN))
+DISPLAY_TEST_SAN := $(filter $(B)/san/tests/cli_test $(B)/san/tests/editor% $(B)/san/tests/modal_matrix_test $(B)/san/tests/x11% $(B)/san/tests/ref% $(B)/san/tests/gl% $(B)/san/tests/raster_test,$(TEST_SAN))
 BENCH_BIN := $(patsubst bench/%.c,$(B)/bench/%,$(BENCHS))
 # P4.14 copies stale editor internals; retain its driver build in all.
 DEFAULT_BENCH_BIN := $(filter-out $(B)/bench/zygote_bench,$(BENCH_BIN))
