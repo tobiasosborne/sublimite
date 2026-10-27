@@ -26,9 +26,63 @@ static uint64_t sample_model(const uint8_t *p, size_t n, size_t start)
     for (size_t i = begin; i < end && p[i] != '\n'; i++) ink += !space(p[i]);
     return ink > 80 ? 80 : ink;
 }
+/* edit-cxho.8: window mapping bounds over arbitrary lines, viewport, scroll
+ * position, scale, strip height and pointer. Fields read little-endian with
+ * zero padding; a shift byte makes small magnitudes as likely as huge ones. */
+static uint64_t field(const uint8_t *data, size_t size, size_t at, unsigned bytes)
+{
+    uint64_t v = 0;
+    for (unsigned i = 0; i < bytes; i++)
+        if (at + i < size) v |= (uint64_t)data[at + i] << (8u * i);
+    uint8_t shift = at + bytes < size ? data[at + bytes] : 0;
+    return bytes == 8 ? v >> (shift % 64u) : v;
+}
+static uint64_t up_div(uint64_t a, uint64_t b) { return a / b + (a % b != 0); }
+static void window_op(const uint8_t *data, size_t size)
+{
+    uint64_t n = field(data, size, 0, 8), v = field(data, size, 9, 8);
+    uint64_t f = field(data, size, 18, 8);
+    uint32_t s = (uint32_t)field(data, size, 27, 1) % 9u;
+    uint32_t h = (uint32_t)field(data, size, 28, 4) >> (field(data, size, 32, 1) % 32u);
+    int64_t y = (int64_t)field(data, size, 33, 8), off = (int64_t)field(data, size, 41, 8);
+    minimap_window w = {0}, b = {0};
+    int rc = minimap_window_lines(n, v, f, s, h, &w);
+    MUST(minimap_window_bytes(n, v, f, s, h, &b) == rc);
+    if (!s) { MUST(rc == MINIMAP_ERR_ARG && w.scale == 0 && b.scale == 0); return; }
+    MUST(rc == MINIMAP_OK);
+    uint64_t r = n > v ? n - v : 0, fc = f < r ? f : r;
+    uint64_t box = v > h / s ? h : v * s;
+    MUST(w.box_height == box && w.box_top + w.box_height <= h && w.box_top <= w.travel);
+    MUST(w.travel == (r > (h - box) / s ? h - box : r * s) && w.range == r);
+    MUST(w.phase < s && (uint64_t)w.above * s - w.phase == w.box_top);
+    MUST(w.first_line + w.above == fc && w.rows <= n - w.first_line);
+    MUST(w.rows <= up_div((uint64_t)h + w.phase, s));
+    if (!w.scrolls) MUST(w.first_line == 0 && w.box_top == fc * s);
+    uint64_t back = minimap_window_seek(&w, w.box_top, 0);
+    MUST(back <= fc);
+    if (w.travel) MUST(fc - back < (r > w.travel ? up_div(r, w.travel) : 1));
+    else MUST(back == 0);
+    int64_t grab = -1; bool inside = minimap_window_grab(&w, y, &grab);
+    MUST(inside ? grab >= 0 && grab < (int64_t)w.box_height : grab == (int64_t)(w.box_height / 2u));
+    uint64_t line = minimap_window_seek(&w, y, off);
+    MUST(line <= r);
+    if (w.travel && r >= w.travel) {
+        minimap_window again;
+        MUST(minimap_window_lines(n, v, line, s, h, &again) == 0);
+        /* Halves of int64 cannot overflow the difference. */
+        bool small = y > INT64_MIN / 2 && y < INT64_MAX / 2 && off > INT64_MIN / 2 && off < INT64_MAX / 2;
+        int64_t t = small ? y - off : -1;
+        if (small && t >= 0 && t <= (int64_t)w.travel) MUST(again.box_top == (uint64_t)t);
+    }
+    MUST(b.first_line == MINIMAP_LINE_UNKNOWN && b.scrolls && b.range == n);
+    MUST(b.box_height == box && b.travel == h - box && b.box_top <= b.travel);
+    MUST((uint64_t)b.above * s - b.phase == b.box_top && b.phase < s);
+    MUST(minimap_window_seek(&b, y, off) <= n);
+}
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    window_op(data, size);
     if (size < 5) return 0;
     uint32_t h = (uint32_t)data[0] * 2u + 1, w = data[1] % 8u + 1;
     size_t count = (size - 4) / 2; if (count > 512) count = 512;

@@ -454,3 +454,76 @@ int minimap_prepare_source(minimap *m, const minimap_input *input,
     if (rc == MINIMAP_OK) m->identity = input->source;
     return rc;
 }
+
+/* edit-cxho.8: fixed-scale scrolling window. Pure integer arithmetic; the
+ * rounding is documented in minimap.h and docs/decisions/edit-cxho.8.md. */
+/* (P) a * b / c in 128 bits (gcc/clang, the only toolchains, incl. llvm-mingw);
+ * callers keep a <= c or b <= c so the quotient fits in 64 bits. */
+static uint64_t window_mul_div(uint64_t a, uint64_t b, uint64_t c, bool up)
+{
+    unsigned __int128 p = (unsigned __int128)a * b;
+    return (uint64_t)(p / c) + (up && p % c != 0);
+}
+static void window_place(minimap_window *w, uint64_t first, uint64_t range,
+                         uint32_t top, uint32_t box, uint32_t travel,
+                         uint32_t scale, uint32_t height, bool scrolls)
+{
+    /* The viewport's first line sits at y = top: ceil(top / scale) whole or
+     * partial lines above it; phase clips the topmost one. */
+    uint32_t above = top / scale + (top % scale != 0);
+    uint32_t phase = above * scale - top;
+    uint64_t slots = ((uint64_t)height + phase + scale - 1u) / scale;
+    *w = (minimap_window){ .first_line = first, .range = range, .above = above,
+        .phase = phase, .rows = (uint32_t)slots, .box_top = top, .box_height = box,
+        .travel = travel, .scale = scale, .height = height, .scrolls = scrolls };
+}
+static uint32_t window_box(uint64_t visible, uint32_t scale, uint32_t height)
+{
+    return visible > height / scale ? height : (uint32_t)visible * scale;
+}
+int minimap_window_lines(uint64_t lines, uint64_t visible, uint64_t first_line,
+                         uint32_t scale, uint32_t height, minimap_window *out)
+{
+    if (!scale || !out) return MINIMAP_ERR_ARG;
+    uint32_t box = window_box(visible, scale, height), spare = height - box;
+    uint64_t range = lines > visible ? lines - visible : 0;
+    /* range * scale > spare without overflow. Not scrolling, the product
+     * fits in spare, so the travel is exactly range lines of scale px. */
+    bool scrolls = range > spare / scale;
+    uint32_t travel = scrolls ? spare : (uint32_t)range * scale;
+    uint64_t first = first_line < range ? first_line : range;
+    uint32_t top = range ? (uint32_t)window_mul_div(first, travel, range, false) : 0;
+    window_place(out, first, range, top, box, travel, scale, height, scrolls);
+    /* above <= first: top <= first * scale (travel <= range * scale). */
+    out->first_line = first - out->above;
+    uint64_t left = lines - out->first_line;
+    if (out->rows > left) out->rows = (uint32_t)left;
+    return MINIMAP_OK;
+}
+int minimap_window_bytes(uint64_t bytes, uint64_t visible, uint64_t first_byte,
+                         uint32_t scale, uint32_t height, minimap_window *out)
+{
+    if (!scale || !out) return MINIMAP_ERR_ARG;
+    uint32_t box = window_box(visible, scale, height), travel = height - box;
+    uint64_t first = first_byte < bytes ? first_byte : bytes;
+    uint32_t top = bytes ? (uint32_t)window_mul_div(first, travel, bytes, false) : 0;
+    window_place(out, MINIMAP_LINE_UNKNOWN, bytes, top, box, travel, scale, height, true);
+    return MINIMAP_OK;
+}
+bool minimap_window_grab(const minimap_window *w, int64_t y, int64_t *offset)
+{
+    if (!w || !offset) return false;
+    bool inside = y >= (int64_t)w->box_top && y - (int64_t)w->box_top < (int64_t)w->box_height;
+    *offset = inside ? y - (int64_t)w->box_top : (int64_t)(w->box_height / 2u);
+    return inside;
+}
+uint64_t minimap_window_seek(const minimap_window *w, int64_t y, int64_t offset)
+{
+    if (!w || !w->travel) return 0;
+    int64_t t; /* y - offset, saturating */
+    if (offset > 0 && y < INT64_MIN + offset) t = INT64_MIN;
+    else if (offset < 0 && y > INT64_MAX + offset) t = INT64_MAX;
+    else t = y - offset;
+    uint64_t top = t <= 0 ? 0 : (uint64_t)t > w->travel ? w->travel : (uint64_t)t;
+    return window_mul_div(top, w->range, w->travel, true);
+}

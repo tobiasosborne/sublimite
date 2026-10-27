@@ -151,4 +151,57 @@ int minimap_hit(const minimap *m, const minimap_input *input, lineidx *idx,
 int minimap_hit_approx(const minimap_input *input, uint32_t height,
                        int64_t y, minimap_target *out);
 int minimap_row_for_line(const minimap *m, uint64_t line, uint32_t *out);
+
+/* edit-cxho.8: fixed-scale scrolling window (Sublime model). Pure integer
+ * mapping; no state, source reads, allocation or floating point. Units are
+ * strip pixels (y = 0 is the strip top) and document lines, or bytes in the
+ * byte-fraction variant used while the line index is building.
+ *
+ * Box height B = min(visible * scale, height): constant whatever the size.
+ * Scroll range R = lines - visible (0 when visible >= lines); first clamps to
+ * R. Box travel D = min(R * scale, height - B). The window scrolls iff
+ * R * scale > height - B (the document's map is taller than the strip less
+ * the box); then box_top = floor(first * D / R), a scrollbar thumb spanning
+ * 0..height-B as first spans 0..R. Otherwise box_top = first * scale, the box
+ * over its own lines, and the window starts at line 0. In both cases the
+ * viewport's first line is drawn at y = box_top, so the miniature and the box
+ * cannot drift: line L is drawn at y = (L - first_line) * scale - phase.
+ * Scroll past end: pass lines + visible - 1 so R covers first <= lines - 1.
+ * docs/decisions/edit-cxho.8.md. */
+#define MINIMAP_LINE_PX 2u /* (G) perf §1 Layout: 2 logical px per line */
+#define MINIMAP_LINE_UNKNOWN UINT64_MAX /* byte variant: window has no line number */
+
+typedef struct minimap_window {
+    uint64_t first_line;  /* line whose top scanline is at y = -phase; UNKNOWN for bytes */
+    uint64_t range;       /* R: scroll range in lines (or bytes); seek returns 0..range */
+    uint32_t above;       /* window lines above the viewport's first line: ceil(box_top/scale) */
+    uint32_t phase;       /* px of first_line clipped above y = 0; < scale */
+    uint32_t rows;        /* line slots touching [0, height); exact: <= lines - first_line */
+    uint32_t box_top, box_height; /* box_top + box_height <= height */
+    uint32_t travel;      /* D: box_top spans 0..travel */
+    uint32_t scale, height;
+    bool scrolls;         /* box is a thumb (always for bytes); else box over its lines */
+} minimap_window;
+
+/* scale == 0 or out == NULL: MINIMAP_ERR_ARG, out unchanged. lines == 0 gives
+ * an empty window (rows 0) with the box at the top. */
+int minimap_window_lines(uint64_t lines, uint64_t visible, uint64_t first_line,
+                         uint32_t scale, uint32_t height, minimap_window *out);
+/* Byte fraction while indexing: box_top = floor(first_byte * D / bytes) with
+ * R = bytes and D = height - B (no small-document case: lines are unknown).
+ * The renderer walks `above` lines back from the viewport's first byte; the
+ * box jumps to the exact line mapping when the index completes. */
+int minimap_window_bytes(uint64_t bytes, uint64_t visible, uint64_t first_byte,
+                         uint32_t scale, uint32_t height, minimap_window *out);
+/* Press at strip y: inside [box_top, box_top + box_height) grabs at
+ * *offset = y - box_top; outside, *offset = box_height / 2 (centre on the
+ * pointer, the click warp). Returns inside. NULL w or offset: false. */
+bool minimap_window_grab(const minimap_window *w, int64_t y, int64_t *offset);
+/* Inverse: box top t = clamp(y - offset, 0, travel), result
+ * ceil(t * range / travel) (0 when travel == 0), in w's unit (line or byte).
+ * Exact inverse of box_top whichever side has the finer step: when
+ * range >= travel, box_top(seek(t)) == t (drag is 1:1 with the pointer);
+ * when range <= travel, seek(box_top(f)) == f. Otherwise within one step,
+ * ceil(range / travel). NULL w: 0. */
+uint64_t minimap_window_seek(const minimap_window *w, int64_t y, int64_t offset);
 #endif

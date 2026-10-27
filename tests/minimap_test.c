@@ -530,8 +530,144 @@ static void deferred_samples(void)
     CHECK(munmap(p,n) == 0);
     puts("review 9: UI deferred fill reads no dispersed samples: ok");
 }
+/* edit-cxho.8: fixed-scale window mapping. Strip H = 1410 px and v = 45
+ * lines are the research repro (Sonnet 2026-10-27): ~705 summary rows of
+ * 2 px (M) and a 45-line text view (M), so the box is 45 * 2 = 90 px (P).
+ * Line counts are test inputs spanning tiny to 10^7, not budgets. */
+static uint64_t ceil_div(uint64_t a, uint64_t b) { return a / b + (a % b != 0); }
+static bool window_equal(const minimap_window *a, const minimap_window *b)
+{
+    return a->first_line == b->first_line && a->range == b->range && a->above == b->above
+        && a->phase == b->phase && a->rows == b->rows && a->box_top == b->box_top
+        && a->box_height == b->box_height && a->travel == b->travel
+        && a->scale == b->scale && a->height == b->height && a->scrolls == b->scrolls;
+}
+static void window_invariants(uint64_t n, uint64_t v, uint64_t f, uint32_t s,
+                              uint32_t h, const minimap_window *w)
+{
+    uint64_t r = n > v ? n - v : 0, fc = f < r ? f : r;
+    uint64_t b = v > h / s ? h : v * s;
+    CHECK(w->box_height == b && w->box_top + w->box_height <= h);
+    CHECK(w->range == r && w->scale == s && w->height == h);
+    CHECK(w->travel == (r > (h - b) / s ? h - b : r * s));
+    CHECK(w->scrolls == (r > (h - b) / s));
+    CHECK(w->box_top <= w->travel && w->phase < s);
+    /* The viewport's first line is drawn exactly at the box top. */
+    CHECK(w->first_line <= fc && fc - w->first_line == w->above);
+    CHECK((uint64_t)w->above * s - w->phase == w->box_top);
+    CHECK(w->above == ceil_div(w->box_top, s));
+    uint64_t slots = ceil_div((uint64_t)h + w->phase, s);
+    uint64_t left = n - w->first_line;
+    CHECK(w->rows == (slots < left ? slots : left));
+    if (!w->scrolls) CHECK(w->first_line == 0 && w->phase == 0 && w->box_top == fc * s);
+    else if (n <= UINT64_MAX / s) /* never shows past EOF */
+        CHECK(w->first_line * s + w->phase + h <= n * s);
+}
+static void window_mapping(void)
+{
+    static const uint64_t sizes[] = {0, 1, 44, 45, 46, 100, 660, 661, 704, 705,
+        706, 1000, 20000, 200000, 1000000, 10000000};
+    const uint32_t s = MINIMAP_LINE_PX, h = 1410; const uint64_t v = 45;
+    CHECK(MINIMAP_LINE_PX == 2u);
+    edit_malloc_guard_begin();
+    for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+        uint64_t n = sizes[i], r = n > v ? n - v : 0;
+        minimap_window w, prev = {0};
+        uint64_t stride = r > 4000 ? r / 4000 : 1;
+        for (uint64_t f = 0;; f = f + stride > r && f < r ? r : f + stride) {
+            CHECK(minimap_window_lines(n, v, f, s, h, &w) == 0);
+            window_invariants(n, v, f, s, h, &w);
+            CHECK(w.box_height == 90); /* constant across N */
+            CHECK(n * s > h || !w.scrolls); /* small documents do not scroll */
+            if (f) CHECK(w.box_top >= prev.box_top);
+            if (f == 0) CHECK(w.box_top == 0 && w.first_line == 0);
+            if (f == r) CHECK(w.box_top == (w.scrolls ? h - 90u : r * s));
+            /* f -> top -> f: exact when lines are no denser than pixels. */
+            uint64_t back = minimap_window_seek(&w, w.box_top, 0);
+            uint64_t step = w.travel ? ceil_div(r, w.travel) : r;
+            CHECK(back <= f && f - back < (step ? step : 1));
+            if (r <= w.travel) CHECK(back == f);
+            prev = w;
+            if (f == r) break;
+        }
+        /* top -> f -> top: the drag is 1:1 when lines are denser than px. */
+        for (uint32_t t = 0; t <= w.travel; t++) {
+            uint64_t line = minimap_window_seek(&w, t, 0);
+            minimap_window again;
+            CHECK(line <= r && minimap_window_lines(n, v, line, s, h, &again) == 0);
+            if (r >= w.travel) CHECK(again.box_top == t);
+            else CHECK(again.box_top >= t && again.box_top - t <= ceil_div(w.travel, r));
+        }
+        CHECK(minimap_window_seek(&w, -100000, 0) == 0);
+        CHECK(minimap_window_seek(&w, 100000, 0) == r);
+        if (n >= 20000) CHECK(w.scrolls && w.rows == 705);
+    }
+    /* Grab: inside keeps the offset; outside centres the box on the pointer. */
+    minimap_window w; int64_t off = -1;
+    CHECK(minimap_window_lines(20000, v, 10000, s, h, &w) == 0 && w.scrolls);
+    CHECK(minimap_window_grab(&w, (int64_t)w.box_top + 5, &off) && off == 5);
+    uint64_t grabbed = minimap_window_seek(&w, (int64_t)w.box_top + 5, off);
+    CHECK(grabbed <= 10000 && 10000 - grabbed < ceil_div(w.range, w.travel));
+    CHECK(!minimap_window_grab(&w, (int64_t)w.box_top - 1, &off) && off == 45);
+    CHECK(!minimap_window_grab(&w, (int64_t)w.box_top + 90, &off) && off == 45);
+    CHECK(minimap_window_grab(&w, (int64_t)w.box_top + 89, &off) && off == 89);
+    uint64_t warp = minimap_window_seek(&w, 700, 45);
+    minimap_window c; CHECK(minimap_window_lines(20000, v, warp, s, h, &c) == 0);
+    CHECK(c.box_top == 700 - 45); /* the click lands at the box centre */
+    CHECK(!minimap_window_grab(NULL, 0, &off) && !minimap_window_grab(&w, 0, NULL));
+    CHECK(minimap_window_seek(NULL, 0, 0) == 0);
+    /* Degenerate inputs clamp. */
+    minimap_window keep = w;
+    CHECK(minimap_window_lines(100, v, 0, 0, h, &w) == MINIMAP_ERR_ARG);
+    CHECK(window_equal(&keep, &w));
+    CHECK(minimap_window_lines(100, v, 0, s, h, NULL) == MINIMAP_ERR_ARG);
+    CHECK(minimap_window_bytes(100, v, 0, 0, h, &w) == MINIMAP_ERR_ARG);
+    CHECK(minimap_window_lines(0, v, 7, s, h, &w) == 0 && w.rows == 0);
+    window_invariants(0, v, 7, s, h, &w);
+    CHECK(minimap_window_lines(10, v, 3, s, h, &w) == 0 && w.box_top == 0 && w.rows == 10);
+    window_invariants(10, v, 3, s, h, &w);
+    CHECK(minimap_window_lines(1000, v, 500, s, 50, &w) == 0); /* H < box */
+    window_invariants(1000, v, 500, s, 50, &w);
+    CHECK(w.box_height == 50 && w.box_top == 0 && w.first_line == 500 && w.travel == 0);
+    CHECK(minimap_window_seek(&w, 30, 0) == 0);
+    CHECK(minimap_window_lines(1000, v, 500, s, 0, &w) == 0);
+    window_invariants(1000, v, 500, s, 0, &w);
+    CHECK(w.box_height == 0 && w.rows == 0);
+    CHECK(minimap_window_lines(1000, v, 5000, s, h, &w) == 0);
+    CHECK(minimap_window_lines(1000, v, 955, s, h, &c) == 0 && window_equal(&w, &c));
+    CHECK(minimap_window_lines(UINT64_MAX, UINT64_MAX / 3, UINT64_MAX / 2, 7, UINT32_MAX, &w) == 0);
+    window_invariants(UINT64_MAX, UINT64_MAX / 3, UINT64_MAX / 2, 7, UINT32_MAX, &w);
+    CHECK(minimap_window_lines(UINT64_MAX, 1, UINT64_MAX - 2, s, h, &w) == 0);
+    window_invariants(UINT64_MAX, 1, UINT64_MAX - 2, s, h, &w);
+    /* floor((R - 1) * 1408 / R) = 1407 = h - 3 (P) */
+    CHECK(w.box_top == h - 3u && minimap_window_seek(&w, h, 0) == UINT64_MAX - 1);
+    /* Byte fraction while indexing: a thumb over [0, bytes]. 10^9 bytes is
+     * a test input (a GB-class file), not a budget. */
+    const uint64_t bytes = UINT64_C(1000000000);
+    for (uint64_t b = 0; b <= bytes; b += bytes / 997) {
+        CHECK(minimap_window_bytes(bytes, v, b, s, h, &w) == 0);
+        CHECK(w.first_line == MINIMAP_LINE_UNKNOWN && w.scrolls && w.range == bytes);
+        CHECK(w.box_height == 90 && w.travel == h - 90u);
+        CHECK(w.box_top == b * (h - 90u) / bytes);
+        CHECK(w.above == ceil_div(w.box_top, s) && w.above * s - w.phase == w.box_top);
+        CHECK(w.rows == ceil_div(h + w.phase, s));
+        uint64_t back = minimap_window_seek(&w, w.box_top, 0);
+        CHECK(back <= b && b - back < ceil_div(bytes, w.travel));
+    }
+    CHECK(minimap_window_bytes(bytes, v, bytes * 2, s, h, &w) == 0 && w.box_top == h - 90u);
+    for (uint32_t t = 0; t <= h - 90u; t++) {
+        minimap_window again;
+        CHECK(minimap_window_bytes(bytes, v, minimap_window_seek(&w, t, 0), s, h, &again) == 0);
+        CHECK(again.box_top == t);
+    }
+    CHECK(minimap_window_bytes(0, v, 5, s, h, &w) == 0 && w.box_top == 0);
+    CHECK(minimap_window_seek(&w, 900, 0) == 0);
+    CHECK(edit_malloc_guard_end() == 0);
+    puts("edit-cxho.8: fixed-scale window, constant box, round trip, clamps: ok");
+}
 int main(void)
 {
+    window_mapping();
     character_marks(); viewport_geometry(); pixel_geometry(); dump_map();
     deferred_samples();
     pending_navigation(); pending_one_line();
