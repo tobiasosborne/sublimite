@@ -56,6 +56,7 @@ void editor_close(editor *e)
     editor_clip_close(e);
     if (e->poll_fd >= 0) close(e->poll_fd);
     if (e->tabs_ready) tabs_fini(&e->tabs);
+    edit_arena_free(&e->drop_arena);
     edit_arena_free(&e->arena); free(e);
 }
 static int add_poll_fd(editor *e, int fd)

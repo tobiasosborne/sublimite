@@ -277,6 +277,13 @@ struct editor {
     editor_highlight hl;
     editor_stats stats;
     edit_arena arena;
+    edit_arena drop_arena;
+    /* (P) Longest notice is the concatenation of these failure categories. */
+    char drop_notice[sizeof "Drop: folders ignored; path limit reached; invalid entries ignored; tab capacity reached; some files could not open; "];
+    /* Headless injected DROP borrows these bytes through dispatch. Native
+     * DROP always reads plat_drop_data instead. */
+    const uint8_t *drop_data;
+    size_t drop_size;
     piece_tree *tree;
     undo_log *undo;
     editor_buffer *buffer, *empty;

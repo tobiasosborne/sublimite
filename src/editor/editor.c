@@ -2,6 +2,7 @@
 #include "trace/trace.h"
 #include "gl/gl.h"
 #include "raster/raster.h"
+#include "dnd/dnd.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <sys/epoll.h>
 #include <errno.h>
@@ -11,6 +12,8 @@
 #include <string.h>
 #include <sched.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static bool runnable(const editor *e);
 static int refresh_caret(editor *e);
@@ -571,8 +574,80 @@ static int resize(editor *e)
     e->resize_pending = false;
     return editor_resize_now(e, e->resize_w, e->resize_h);
 }
+static int drop_notice(editor *e, const char *message)
+{
+    if (message != e->drop_notice) strcpy(e->drop_notice, message);
+    e->recovery_notice = e->drop_notice; e->recovery_notice_mutations = e->stats.mutations;
+    /* Drop failures are recoverable UI notices, never input-loop failures. */
+    (void)editor_full_layout(e); return 0; /* (P) successful event consumption. */
+}
+static int drop_files(editor *e)
+{
+    keys_reset(&e->keys); tabs_mru_release(&e->tabs); undo_break_burst(e->undo);
+    e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = e->text_drag = false;
+    e->map_drag_id = e->map_drag_generation = 0; /* (P) no captured owner. */
+    int rc = editor_palette_close(e);
+    if (!rc) rc = editor_menu_reset(e);
+    if (rc) return drop_notice(e, "Drop: could not close the overlay");
+    size_t size = e->drop_size;
+    const uint8_t *data = e->has_platform ? plat_drop_data(&e->platform, &size) : e->drop_data;
+    /* (P) The parser's maximum copied paths, each including its NUL. Reserve
+     * lazily on this off-typing path; subsequent drops reset the same arena. */
+    if (!e->drop_arena.base && edit_arena_init(&e->drop_arena, (size_t)IPC_MAX_PATHS * IPC_PATH_CAP))
+        return drop_notice(e, "Drop: not enough memory");
+    edit_arena_reset(&e->drop_arena);
+    char hostname[IPC_PATH_CAP]; /* (P) reuse the parser's existing path bound. */
+    const char *local_hostname = gethostname(hostname, sizeof hostname) ? NULL : hostname;
+    hostname[sizeof hostname - 1u] = '\0'; /* (P) C terminator at the last byte. */
+    ipc_request request; dnd_counts counts;
+    dnd_result parsed = dnd_parse_uri_list(data, size, local_hostname, &e->drop_arena, &request, &counts);
+    if (parsed != dnd_ok) return drop_notice(e, parsed == dnd_no_space ?
+        "Drop: not enough memory" : "Drop: invalid file list");
+    bool folders = false, failed = false, capacity = false;
+    size_t retained = 0;
+    for (size_t i = 0; i < request.count; i++) {
+        struct stat st;
+        if (stat(request.paths[i].path, &st)) { failed = true; continue; }
+        if (S_ISDIR(st.st_mode)) { folders = true; continue; }
+        request.paths[retained++] = request.paths[i];
+    }
+    request.count = retained;
+    /* An empty open request would create an untitled tab. Absolute parser
+     * paths need no cwd; the cleared request supplies NULL safely. */
+    if (request.count) {
+        rc = editor_open_request(e, &request, 0); /* (P) no IPC waiter token. */
+        if (rc) {
+            /* Shared opens are transactional. Retry individual paths so a
+             * refused file/capacity does not discard the accepted prefix or
+             * prevent a later already-open path from selecting its tab. */
+            ipc_request single = {0}; single.count = 1u; /* (P) one retry path. */
+            for (size_t i = 0; i < request.count; i++) {
+                single.paths[0] = request.paths[i];
+                rc = editor_open_request(e, &single, 0);
+                capacity |= rc == EDITOR_ERR_CAPACITY;
+                failed |= rc && rc != EDITOR_ERR_CAPACITY;
+            }
+        }
+        /* Retain query, panel and field/document focus; retire the outgoing
+         * source in the same event turn, like tab-switch commands. */
+        if (editor_find_service(e)) failed = true;
+    }
+    edit_arena_reset(&e->drop_arena);
+    if (folders || counts.skipped || capacity || failed) {
+        strcpy(e->drop_notice, "Drop: ");
+        if (folders) strcat(e->drop_notice, "folders ignored; ");
+        if (counts.overflow) strcat(e->drop_notice, "path limit reached; ");
+        if (counts.skipped > counts.overflow) strcat(e->drop_notice, "invalid entries ignored; ");
+        if (capacity) strcat(e->drop_notice, "tab capacity reached; ");
+        if (failed) strcat(e->drop_notice, "some files could not open; ");
+        return drop_notice(e, e->drop_notice);
+    }
+    if (e->recovery_notice == e->drop_notice) e->recovery_notice = NULL;
+    return 0; /* (P) no recoverable drop error reaches fail(). */
+}
 static int nonkey_dispatch(editor *e, const plat_event *ev)
 {
+    if (ev->kind == PLAT_EV_DROP) return drop_files(e);
     /* P: button identity belongs to the chain even on clipboard dispatch. */
     if (ev->kind == PLAT_EV_BUTTON && ev->press && ev->code != e->click_button) e->click_ns = 0;
     if (ev->kind == PLAT_EV_CLIPBOARD || (ev->kind == PLAT_EV_BUTTON && ev->code == 2))

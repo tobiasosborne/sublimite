@@ -6853,7 +6853,165 @@ static int close_review_contract(void)
     T(close_review_hidden() == 0); T(close_review_wide() == 0); T(close_review_refused() == 0);
     T(close_review_scroll() == 0); T(close_review_stdin() == 0); return 0;
 }
+/* edit-cxho.6 (P): fixture counts are the brief's pair and IPC_MAX_PATHS
+ * plus that pair (the requested overflow case). Lengths derive from literals;
+ * zero is success/absence/first index, unit steps advance entries or omit NUL.
+ * (E) Geometry reuses duplicate_path_contract's panel-capable grid. */
+typedef struct drop_fixture {
+    char root[sizeof "/tmp/editor-drop-XXXXXX"];
+    char paths[IPC_MAX_PATHS + sizeof "ab" - 1u][IPC_PATH_CAP];
+    char uris[(IPC_MAX_PATHS + sizeof "ab" - 1u) * (IPC_PATH_CAP + sizeof "file://\r\n")];
+    size_t count, size;
+} drop_fixture;
+static int drop_fixture_init(drop_fixture *f, size_t count)
+{
+    memset(f, 0, sizeof *f); strcpy(f->root, "/tmp/editor-drop-XXXXXX");
+    T(mkdtemp(f->root)); f->count = count;
+    for (size_t i = 0; i < count; i++) {
+        int n = snprintf(f->paths[i], sizeof f->paths[i], "%s/%zu.txt", f->root, i);
+        T(n > 0 && (size_t)n < sizeof f->paths[i]);
+        int fd = open(f->paths[i], O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR); T(fd >= 0);
+        const char text[] = "needle\n";
+        T(write(fd, text, sizeof text - 1u) == (ssize_t)(sizeof text - 1u)); T(close(fd) == 0);
+        n = snprintf(f->uris + f->size, sizeof f->uris - f->size, "file://%s\r\n", f->paths[i]);
+        T(n > 0 && (size_t)n < sizeof f->uris - f->size); f->size += (size_t)n;
+    }
+    return 0;
+}
+static int drop_fixture_close(drop_fixture *f)
+{
+    for (size_t i = 0; i < f->count; i++) T(unlink(f->paths[i]) == 0);
+    T(rmdir(f->root) == 0); return 0;
+}
+static int drop_open(editor **out, render_backend *backend, size_t capacity)
+{
+    T(render_null_backend(backend) == 0);
+    editor_config cfg = {.start_empty = true, .tab_capacity = capacity,
+        .cols = sizeof "Go to line: :18446744073709551615" + 1u,
+        .rows = sizeof "text" + 1u, .wrap_mode = -1};
+    T(editor_open(out, &cfg, backend) == 0); return settle(*out);
+}
+static int drop_inject(editor *e, const char *bytes, size_t size)
+{
+    T(!e->has_platform); e->drop_data = (const uint8_t *)bytes; e->drop_size = size;
+    int rc = press(e, (plat_event){.kind = PLAT_EV_DROP});
+    e->drop_data = NULL; e->drop_size = 0; return rc;
+}
+static int drop_pair_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, sizeof "ab" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, f.count) == 0);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(tabs_count(&e->tabs) == f.count && tabs_active_index(&e->tabs) == f.count - 1u);
+    for (size_t i = 0; i < f.count; i++) {
+        T(editor_select_tab(e, i) == 0); T(settle(e) == 0); T(!strcmp(e->buffer->path, f.paths[i]));
+    }
+    uint64_t original = editor_tab(e, 0)->id;
+    T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
+    T(press(e, key('x', 0, "x")) == 0); view_state retained = editor_view(e);
+    T(editor_select_tab(e, f.count - 1u) == 0); T(settle(e) == 0);
+    char uri[IPC_PATH_CAP + sizeof "file://\r\n"];
+    int n = snprintf(uri, sizeof uri, "file://%s\r\n", f.paths[0]); T(n > 0 && (size_t)n < sizeof uri);
+    T(drop_inject(e, uri, (size_t)n) == 0);
+    T(tabs_count(&e->tabs) == f.count && tabs_active(&e->tabs)->id == original);
+    T(expect(e, "xneedle\n", retained.selection.cursor) == 0);
+    T(!e->error && !e->stats.error_cause);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: pair opens last active; duplicate retains tab/text/view passed"); return 0;
+}
+static int drop_directory_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, sizeof "a" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, f.count) == 0);
+    T(drop_inject(e, f.root, strlen(f.root)) == 0);
+    T(!tabs_count(&e->tabs) && !e->error && !e->stats.error_cause);
+    T(e->recovery_notice && strstr(e->recovery_notice, "folder"));
+    T(drop_inject(e, f.uris, f.size) == 0); T(tabs_count(&e->tabs) == f.count);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: directory skipped with notice; next drop opens passed"); return 0;
+}
+static int drop_overflow_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, IPC_MAX_PATHS + sizeof "ab" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, IPC_MAX_PATHS) == 0);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(tabs_count(&e->tabs) == IPC_MAX_PATHS && tabs_active_index(&e->tabs) == IPC_MAX_PATHS - 1u);
+    T(!strcmp(e->buffer->path, f.paths[IPC_MAX_PATHS - 1u]));
+    T(e->recovery_notice && strstr(e->recovery_notice, "limit"));
+    T(!e->error && !e->stats.error_cause);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: IPC prefix opened and overflow noticed passed"); return 0;
+}
+static int drop_palette_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, sizeof "a" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, f.count) == 0);
+    T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0); T(e->palette_open);
+    e->drag_tab = 0; e->drag_id = e->buffer->id; e->map_drag = e->text_drag = true;
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(!e->palette_open && e->drag_tab == SIZE_MAX && !e->drag_id && !e->map_drag && !e->text_drag);
+    T(tabs_count(&e->tabs) == f.count);
+    T(press(e, key(XKB_KEY_Alt_L, PLAT_MOD_ALT, NULL)) == 0);
+    plat_event release = key(XKB_KEY_Alt_L, 0, NULL); release.press = false;
+    T(press(e, release) == 0); T(e->menu.active);
+    T(drop_inject(e, f.uris, f.size) == 0); T(!e->menu.active && e->menu.open < 0);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: palette/menu and pointer captures reset passed"); return 0;
+}
+static int drop_find_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, sizeof "ab" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, f.count) == 0);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_visible);
+    T(press(e, key('n', 0, "n")) == 0); T(find_focus_query(e, "n") == 0);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(e->find_visible && e->panel_rows && e->find_focus == EDITOR_FIND_FIELD);
+    T(e->find_id == e->buffer->id && e->find_source_generation == e->buffer->source_generation);
+    T(find_focus_query(e, "n") == 0);
+    findui_state state = findui_get_state(&e->find); T(state.complete && state.match_count == sizeof "n" - 1u);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: find panel/query/focus retained and source retargeted passed"); return 0;
+}
+static int drop_failure_contract(void)
+{
+    drop_fixture f; T(drop_fixture_init(&f, sizeof "ab" - 1u) == 0);
+    editor *e = NULL; render_backend backend = {0}; T(drop_open(&e, &backend, sizeof "a" - 1u) == 0);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(tabs_count(&e->tabs) == sizeof "a" - 1u && !strcmp(e->buffer->path, f.paths[0]));
+    T(e->recovery_notice && strstr(e->recovery_notice, "capacity"));
+    T(!e->error && !e->stats.error_cause);
+    T(press(e, key('x', 0, "x")) == 0); T(expect(e, "xneedle\n", sizeof "x" - 1u) == 0);
+    editor_close(e);
+    T(drop_open(&e, &backend, f.count) == 0);
+    /* (P) The arena can hold only a NUL, so no fixture path fits. */
+    T(edit_arena_init(&e->drop_arena, sizeof "") == 0);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(!tabs_count(&e->tabs) && !e->error && !e->stats.error_cause);
+    T(e->recovery_notice && strstr(e->recovery_notice, "memory"));
+    edit_arena_free(&e->drop_arena);
+    const char invalid[] = "file://remote.invalid/not-local\r\n";
+    T(drop_inject(e, invalid, sizeof invalid - 1u) == 0);
+    T(!tabs_count(&e->tabs) && e->recovery_notice && !e->error);
+    char mixed[sizeof f.uris];
+    int n = snprintf(mixed, sizeof mixed, "file://%s/missing\r\nfile://%s\r\n%s", f.root, f.root, f.uris);
+    T(n > 0 && (size_t)n < sizeof mixed); T(drop_inject(e, mixed, (size_t)n) == 0);
+    T(tabs_count(&e->tabs) == f.count && !e->error && !e->stats.error_cause);
+    T(e->recovery_notice && strstr(e->recovery_notice, "folder") && strstr(e->recovery_notice, "open"));
+    void *storage = e->drop_arena.base; T(storage);
+    const char empty[] = "# comment\r\n\r\n";
+    T(drop_inject(e, empty, sizeof empty - 1u) == 0); T(tabs_count(&e->tabs) == f.count);
+    T(drop_inject(e, f.uris, f.size) == 0);
+    T(e->drop_arena.base == storage && !e->drop_arena.used);
+    editor_close(e); T(drop_fixture_close(&f) == 0);
+    puts("edit-cxho.6 drop: capacity/memory/stat/parse failures recover; arena reused passed"); return 0;
+}
 static const test_selector selectors[] = {
+    {"--drop-pair", drop_pair_contract},
+    {"--drop-directory", drop_directory_contract},
+    {"--drop-overflow", drop_overflow_contract},
+    {"--drop-palette", drop_palette_contract},
+    {"--drop-find", drop_find_contract},
+    {"--drop-failure", drop_failure_contract},
     {"--cxho3-focus", find_focus_contract},
     {"--close-review", close_review_contract},
     {"--close-review-hidden", close_review_hidden},
@@ -6990,6 +7148,9 @@ int main(int argc, char **argv)
     T(paint_all_void() == 0);
     T(binary_open_contract() == 0);
     T(dzk1_render_reject() == 0);
+    T(drop_pair_contract() == 0); T(drop_directory_contract() == 0);
+    T(drop_overflow_contract() == 0); T(drop_palette_contract() == 0); T(drop_find_contract() == 0);
+    T(drop_failure_contract() == 0);
     T(duplicate_path_contract() == 0);
     T(recovery_notice_findpanel() == 0);
     T(o20_all() == 0);
