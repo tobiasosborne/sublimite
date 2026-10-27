@@ -104,6 +104,10 @@ findui_code findui_focus_replacement(findui_panel *panel, bool focus);
  * empty match is a caret range. *count is required size; LIMIT means output
  * capacity or init-time visible capacity was exceeded (no partial output). */
 findui_code findui_next(findui_panel *panel, int direction, findui_range *selected);
+/* First match whose start is at/after byte, wrapping to the first match.
+ * Requires a completed count. MORE resolves through the immutable worker
+ * plan, including beyond the prefix cache; no source scan or UI allocation. */
+findui_code findui_seek(findui_panel *panel, uint64_t byte, findui_range *selected);
 findui_code findui_highlights(const findui_panel *panel, uint64_t start, uint64_t end,
                              findui_range *ranges, size_t capacity, size_t *count);
 

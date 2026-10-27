@@ -4524,11 +4524,13 @@ static int find_focus_contract(void)
     size_t document_allocations = edit_malloc_guard_end(); T(document_allocations == 0);
     T(expect(e, edited, sizeof edited - 1u) == 0); T(find_focus_query(e, "alpha") == 0);
     T(e->find_visible && findui_get_state(&e->find).match_count == 2u); /* (P) the fixture's two occurrences */
+    T(e->find_range_count == findui_get_state(&e->find).match_count);
     T(find_focus_carets(e, false) == 0);
 
     T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_field_all);
     T(press(e, key('b', 0, "beta")) == 0);
-    T(find_focus_query(e, "beta") == 0); T(expect(e, edited, sizeof edited - 1u) == 0);
+    T(find_focus_query(e, "beta") == 0);
+    T(expect(e, edited, sizeof "alpha beta" - 1u) == 0); /* (P) incremental beta selection */
     T(find_focus_carets(e, true) == 0);
     plat_event panel = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
         .x = (int32_t)((sizeof "Find: b" - 1u) * e->grid.dims.cell_w),
@@ -4542,7 +4544,6 @@ static int find_focus_contract(void)
     T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
     T(press(e, key('a', 0, "alpha")) == 0);
     T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, 0, true, 0)) == 0);
-    T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0);
     T(editor_view(e).selection.anchor == sizeof "alpha beta " - 1u &&
         editor_view(e).selection.cursor == sizeof text - 1u);
@@ -4564,6 +4565,104 @@ static int find_focus_contract(void)
     editor_close(e);
     printf("edit-cxho.3 focus: document/query typing, panel caret, Tab, F3/previous, Escape, Return, Ctrl+F/H passed; field mallocs=%zu document mallocs=%zu guard=%s\n",
         field_allocations, document_allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    return 0;
+}
+/* edit-cxho.12 (P): the brief supplies 300 lines and target line 250.
+ * The origin is the fixture midpoint; the next line supplies Enter's next
+ * match for the prefix "line 25". Byte offsets come from snprintf lengths.
+ * (E) geometry reuses find_focus_contract. Zero/one are success, first byte,
+ * adjacent key/line, C terminator and the minimal nonzero mmap threshold.
+ * Zero allocations (P) follows the binding typing-path rule. */
+static int find_incremental_case(bool mapped, bool wrapped)
+{
+    enum { lines = 300, target = 250, origin_line = lines / 2 };
+    char text[lines * sizeof "line 299\n"];
+    uint64_t offsets[lines + 1u]; size_t length = 0;
+    for (unsigned line = 0; line < lines; line++) {
+        offsets[line] = length;
+        int n = snprintf(text + length, sizeof text - length, "line %u\n", line);
+        T(n > 0 && (size_t)n < sizeof text - length); length += (size_t)n;
+    }
+    offsets[lines] = length;
+    char path[] = "build/find-incremental-XXXXXX";
+    int fd = -1;
+    if (mapped) {
+        fd = mkstemp(path); T(fd >= 0);
+        T(write(fd, text, length) == (ssize_t)length); T(close(fd) == 0);
+    }
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = mapped ? NULL : (const uint8_t *)text,
+        .initial_len = mapped ? 0 : length, .path = mapped ? path : NULL,
+        .copy_threshold = 1u, .cols = 40, .rows = 8, .wrap_mode = wrapped ? 1 : -1};
+    editor *e = NULL; int opened = editor_open(&e, &cfg, &backend);
+    T(opened == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, offsets[origin_line]) == 0); T(settle(e) == 0);
+    T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
+    view_state origin = editor_view(e); T(origin.first_line > 0);
+    if (mapped) T(e->buffer->lg.lazy);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    edit_malloc_guard_begin();
+    static const char query[] = "line 250";
+    for (size_t i = 0; i < sizeof query - 1u; i++) {
+        char ch[] = {query[i], '\0'};
+        T(press(e, key((uint8_t)query[i], 0, ch)) == 0);
+    }
+    size_t allocations = edit_malloc_guard_end(); T(allocations == 0);
+    T(findui_get_state(&e->find).match_count == 1u);
+    T(editor_view(e).selection.anchor == offsets[target]);
+    T(editor_view(e).selection.cursor == offsets[target] + sizeof query - 1u);
+    T(editor_view(e).first_line <= target && target < editor_view(e).first_line + e->v.config.rows);
+    T(editor_view(e).first_line == target - e->v.config.rows / 2u); /* (P) centred in live rows */
+    if (mapped) T(e->buffer->scroll.target_byte == offsets[target]); /* existing worker byte seek */
+    T(e->find_range_count == 1u);
+    /* Removing the last byte must search again from the saved origin, even
+     * though the selected result's end is already after line 250's start. */
+    T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    T(editor_view(e).selection.anchor == offsets[target]);
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    T(editor_view(e).selection.anchor == offsets[target + 1u]);
+    T(press(e, key(XKB_KEY_Return, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_view(e).selection.anchor == offsets[target]);
+    while (findui_get_state(&e->find).query_length)
+        T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
+    view_state restored = editor_view(e);
+    T(restored.selection.cursor == origin.selection.cursor && restored.selection.anchor == origin.selection.anchor);
+    T(restored.selection.preferred_col == origin.selection.preferred_col);
+    T(restored.first_line == origin.first_line && restored.first_byte == origin.first_byte);
+    T(restored.visual_byte == origin.visual_byte && restored.hscroll == origin.hscroll);
+    T(press(e, key('l', 0, "line 0")) == 0);
+    T(editor_view(e).selection.anchor == offsets[0]); /* (P) no suffix match: wrap */
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    plat_event pending_query=key('l',0,"line 25"), pending_enter=key(XKB_KEY_Return,0,NULL);
+    T(editor_inject(e,&pending_query)==0); T(editor_inject(e,&pending_enter)==0);
+    T(settle(e)==0);
+    T(editor_view(e).selection.anchor==offsets[target+1u]); /* pending Enter advances preview once */
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('l', 0, "line 299")) == 0); /* (P) last numbered fixture line: lines - one */
+    T(editor_view(e).selection.anchor==offsets[lines-1u]);
+    T(editor_view(e).first_line<=lines-1u && lines-1u<editor_view(e).first_line+e->v.config.rows);
+    T(press(e, key('a', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('z', 0, "zzz")) == 0);
+    T(findui_get_state(&e->find).complete && !findui_get_state(&e->find).match_count);
+    T(editor_view(e).selection.cursor == origin.selection.cursor && editor_view(e).selection.anchor == origin.selection.anchor);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); /* refocus keeps origin */
+    T(press(e, key('l', 0, query)) == 0);
+    view_selection selected = editor_view(e).selection;
+    T(selected.anchor == offsets[target]);
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+    T(!e->find_visible && editor_view(e).selection.anchor == selected.anchor &&
+        editor_view(e).selection.cursor == selected.cursor);
+    editor_close(e);
+    if (mapped) T(unlink(path) == 0);
+    printf("edit-cxho.12 incremental: mapped=%d wrapped=%d preview/scroll/origin/empty/next/previous/no-match/Escape mallocs=%zu passed\n",
+        (int)mapped, (int)wrapped, allocations);
+    return 0;
+}
+static int find_incremental_contract(void)
+{
+    T(find_incremental_case(false, false) == 0);
+    T(find_incremental_case(false, true) == 0);
+    T(find_incremental_case(true, false) == 0);
     return 0;
 }
 static int g02_find_return(void)
@@ -4633,9 +4732,9 @@ static int findpanel_contract(void)
     T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0);
     const render_grid *grid=editor_grid(e);
     T(grid->cells[(size_t)(grid->dims.rows-1)*grid->dims.cols].glyph_index=='F');
-    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,0)==0);
+    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,sizeof "cat"-1u)==0);
     T(press(e,key('a',PLAT_MOD_CTRL,NULL))==0); T(e->find_field_all);
-    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,0)==0);
+    T(press(e,key('c',0,"cat"))==0); T(expect(e,text,sizeof "cat"-1u)==0);
     T(findui_get_state(&e->find).query_length==sizeof "cat"-1);
     /* (P) match offsets derive from the fixture prefixes. Return advances
      * past the initial preview; keymap navigation retains its own contract. */
@@ -4749,7 +4848,12 @@ static int findpanel_far_wrap_contract(void)
     T(press(e,key(XKB_KEY_Return,0,NULL))==0);
     T(editor_view(e).selection.anchor==at && editor_view(e).selection.cursor==length);
     T(editor_view(e).visual_byte>0);
-    T(e->lay.wrap_rows[0].start<=at && e->lay.wrap_rows[0].end>=length);
+    /* edit-cxho.12 (P): a far result inside one logical line is centred
+     * by half the live visual rows, just like a far logical-line result. */
+    uint32_t match_row=0;
+    while (match_row<e->v.config.rows && !(e->lay.wrap_rows[match_row].start<=at &&
+        e->lay.wrap_rows[match_row].end>=length)) match_row++;
+    T(match_row==e->v.config.rows/2u);
     editor_close(e); memset(&backend,0,sizeof backend); T(render_null_backend(&backend)==0);
     cfg.wrap_mode=-1;
     T(editor_open(&e,&cfg,&backend)==0); free(text); T(settle(e)==0);
@@ -7013,6 +7117,7 @@ static const test_selector selectors[] = {
     {"--drop-find", drop_find_contract},
     {"--drop-failure", drop_failure_contract},
     {"--cxho3-focus", find_focus_contract},
+    {"--cxho12-incremental", find_incremental_contract},
     {"--close-review", close_review_contract},
     {"--close-review-hidden", close_review_hidden},
     {"--close-review-wide", close_review_wide},
@@ -7157,6 +7262,7 @@ int main(int argc, char **argv)
     T(palette_contract() == 0);
     T(menu_contract() == 0);
     T(g02_find_return() == 0);
+    T(find_incremental_contract() == 0);
     T(find_focus_contract() == 0);
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);

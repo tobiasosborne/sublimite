@@ -97,8 +97,12 @@ static int other_overrides(void)
     T(press(e, XKB_KEY_r, PLAT_MOD_SUPER) == 0); T(findui_get_state(&e->find).options.regex);
     T(press(e, XKB_KEY_c, PLAT_MOD_SUPER) == 0); T(findui_get_state(&e->find).options.match_case);
     T(press(e, XKB_KEY_w, PLAT_MOD_SUPER) == 0); T(findui_get_state(&e->find).options.whole_word);
+    /* edit-cxho.12: toggles select the origin preview; the disabled binding
+     * must preserve that selection (P: fixture literal offsets). */
+    view_selection preview = editor_view(e).selection;
+    T(preview.cursor == sizeof query - 1u && preview.anchor == 0);
     T(press(e, XKB_KEY_F3, PLAT_MOD_SHIFT) == 0);
-    T(editor_view(e).selection.cursor == 0 && editor_view(e).selection.anchor == 0);
+    T(editor_view(e).selection.cursor == preview.cursor && editor_view(e).selection.anchor == preview.anchor);
     T(press(e, XKB_KEY_p, PLAT_MOD_SUPER) == 0);
     T(editor_view(e).selection.anchor == sizeof "cat " - 1u &&
       editor_view(e).selection.cursor == sizeof "cat cat" - 1u);

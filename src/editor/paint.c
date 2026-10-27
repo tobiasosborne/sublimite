@@ -62,6 +62,9 @@ static bool byte_visible(editor *e, uint64_t byte)
 int editor_paint_prepare(editor *e)
 {
     if (e->paint_ready) return 0;
+    /* Source adoption can precede layout completion in editor_find_service.
+     * Refresh the visible cache against the finished layout before painting. */
+    int find_rc=editor_find_highlights(e); if (find_rc) return find_rc;
     uint64_t lo = e->v.state.wrap ? e->v.state.visual_byte : e->v.state.first_byte;
     uint64_t hi = e->lay.wrap ? lo : e->lay.pos;
     for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {

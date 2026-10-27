@@ -116,6 +116,25 @@ static find_code retrieve(findui_slot *slot,visitor_output *out)
     slot->total=plan->total;
     if (slot->selection_request) {
         findui_plan_run run;
+        if (slot->seek_request) {
+            /* (P) binary search by the final start in each compressed run.
+             * Unit increments advance records; halves bisect the interval.
+             * A missing suffix wraps to ordinal zero. */
+            uint64_t low=0, high=plan->records;
+            while (low<high) {
+                uint64_t mid=low+(high-low)/2u;
+                if (!findui_plan_read(plan,mid,&run)) return FIND_ERR_MEMORY;
+                uint64_t last=run.start+(run.count-1u)*run.stride;
+                if (last<slot->desired_byte) low=mid+1u; else high=mid;
+            }
+            slot->desired_index=0;
+            if (low<plan->records) {
+                if (!findui_plan_read(plan,low,&run)) return FIND_ERR_MEMORY;
+                uint64_t within=slot->desired_byte>run.start && run.stride ?
+                    ceiling_quotient(slot->desired_byte-run.start,run.stride) : 0;
+                slot->desired_index=run.ordinal+within;
+            }
+        }
         if (!findui_plan_ordinal(plan,slot->desired_index,&run)) return FIND_ERR_MEMORY;
         if (!emit_range(out,slot->desired_index,run_range(&run,slot->desired_index-run.ordinal))) return FIND_CANCELLED;
         slot->scan_done=true; return FIND_OK;

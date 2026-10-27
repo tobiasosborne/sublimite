@@ -320,6 +320,11 @@ struct editor {
     enum { EDITOR_FIND_DOCUMENT, EDITOR_FIND_FIELD } find_focus;
     int find_direction, find_error, find_replace_request;
     bool find_select_pending, find_replace_active, find_visible, find_navigated, find_field_all;
+    /* Saved when the panel opens; query previews never move this origin. */
+    view_state find_origin;
+    uint64_t find_origin_id, find_origin_subrow;
+    bool find_preview_pending, find_scroll_adjust;
+    uint64_t find_scroll_first, find_scroll_visual_first, find_scroll_visual_last;
     uint8_t find_edit[FINDUI_QUERY_BYTES];
     uint32_t find_ascii[LAYOUT_ASCII_GLYPHS];
     findui_range *find_ranges;
@@ -776,6 +781,8 @@ void editor_hit_record(void *ctx, uint32_t row, uint32_t column, uint32_t count,
 int editor_find_init(editor *e);
 void editor_find_close(editor *e);
 int editor_find_service(editor *e);
+int editor_find_highlights(editor *e);
+uint64_t editor_find_scroll_back(const editor *e, uint64_t line);
 bool editor_find_key(editor *e, const plat_event *ev);
 int editor_find_pointer(editor *e, const plat_event *ev, bool *handled);
 bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding);

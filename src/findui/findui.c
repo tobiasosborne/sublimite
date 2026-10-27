@@ -180,6 +180,8 @@ findui_code findui_service(findui_panel *panel)
         slot->window_start = impl->window_start; slot->window_end = impl->window_end;
         slot->window_request = impl->window_request;
         slot->selection_request = impl->selection_request;
+        slot->seek_request = impl->seek_request;
+        slot->desired_byte = impl->desired_byte;
         slot->plan_source = impl->window_request || impl->page_request || impl->selection_request ? impl->plan : NULL;
         slot->page_request = impl->page_request;
         slot->page_first = impl->page_first; slot->page_count = impl->page_count;
@@ -308,17 +310,18 @@ bool findui_accept(findui_panel *panel, const work_msg *message)
     for (size_t i = 0; i < count; i++) {
         uint64_t ordinal = batch.ordinal + i;
         findui_range range = batch.ranges[i];
-        if (!impl->window_request && ordinal < impl->config.match_capacity) {
+        if (!impl->window_request && !impl->selection_request && ordinal < impl->config.match_capacity) {
             impl->cache[(size_t)ordinal] = range;
             impl->state.cached_matches = (size_t)ordinal + 1;
         }
-        if (!impl->window_dirty && intersects(range, impl->window_start, impl->window_end)) {
+        if (!impl->selection_request && !impl->window_dirty && intersects(range, impl->window_start, impl->window_end)) {
             if (impl->state.visible_matches < impl->config.visible_capacity)
                 impl->visible[impl->state.visible_matches] = range;
             else impl->state.visible_overflow = true;
             impl->state.visible_matches++;
         }
-        if (!impl->window_request && ordinal == impl->desired_index) {
+        if (!impl->window_request && (ordinal == impl->desired_index ||
+            (impl->selection_request && impl->seek_request))) {
             impl->state.match_index = ordinal; impl->state.selected = range;
         }
         if (!impl->window_request && ordinal >= impl->state.match_count) impl->state.match_count = ordinal + 1;
@@ -437,6 +440,26 @@ findui_code findui_next(findui_panel *panel, int direction, findui_range *select
     /* An uncached ordinal belongs to the already counted immutable plan. */
     *selected = unset_range(); cancel_jobs(impl); impl->state.generation++;
     impl->desired_index = index; impl->window_request = false; impl->selection_request = true;
+    impl->seek_request = false;
+    impl->state.complete = false; impl->state.searching = true;
+    impl->pending_submit = impl->request_active = true;
+    (void)findui_service(panel); return FINDUI_MORE;
+}
+findui_code findui_seek(findui_panel *panel, uint64_t byte, findui_range *selected)
+{
+    findui_impl *impl = implementation(panel); findui_code code = editable(impl);
+    if (impl && invalidate_source(impl)) return FINDUI_ERR_STALE;
+    if (code != FINDUI_OK) return code;
+    if (!selected) return FINDUI_ERR_ARGUMENT;
+    if (!impl->state.complete) return impl->state.searching ? FINDUI_ERR_BUSY : FINDUI_ERR_FIND;
+    *selected = unset_range();
+    if (!impl->state.match_count) return FINDUI_OK;
+    /* (P) zero is the first ordinal. Byte rank is resolved on the worker;
+     * keep a cancelled window refresh owed until selection has completed. */
+    impl->window_dirty = impl->window_dirty || impl->window_request;
+    cancel_jobs(impl); impl->state.generation++;
+    impl->desired_byte = byte; impl->desired_index = 0;
+    impl->window_request = false; impl->selection_request = true; impl->seek_request = true;
     impl->state.complete = false; impl->state.searching = true;
     impl->pending_submit = impl->request_active = true;
     (void)findui_service(panel); return FINDUI_MORE;

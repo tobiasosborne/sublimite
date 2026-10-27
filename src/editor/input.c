@@ -1524,6 +1524,21 @@ int editor_wheel_continue(editor *e)
         /* The seek went through editor_scroll_seek; once 3kk adopted the
          * target line, follow horizontally (hscroll is not scroll state). */
         if (b->scroll_pending) return 0;
+        if (e->find_scroll_adjust) {
+            e->find_scroll_adjust=false;
+            uint64_t line=b->scroll.first_line;
+            uint64_t back=editor_find_scroll_back(e,line);
+            /* The byte resolver may have clipped the top at EOF already.
+             * Retain that viewport: centring its top again could hide the
+             * match below the bottom. (P) max top = total lines - live rows. */
+            if (b->scroll.extent.exact && b->scroll.extent.lines>e->v.config.rows &&
+                line==b->scroll.extent.lines-e->v.config.rows) back=0;
+            uint64_t top=line>back ? line-back : 0; /* (P) saturate at the first line. */
+            if (top!=line) {
+                int rc=scroll_seek_line(&b->scroll,top); if (rc) return rc;
+                b->scroll_pending=true; return 0;
+            }
+        }
         e->wheel_pending=false; e->find_scroll=false;
         int rc=find_horizontal_follow(e); if (rc) return rc;
         return editor_full_layout(e);
@@ -1561,6 +1576,16 @@ int editor_wheel_continue(editor *e)
         if (rc) { e->find_scroll=false; return rc; }
         e->visual_seed_valid=true; e->v.state.visual_byte=e->visual_seed.start;
         e->v.state.approximate|=approximate;
+        if (e->find_scroll_adjust) {
+            uint64_t back=editor_find_scroll_back(e,e->visual_seed.line);
+            e->find_scroll_adjust=false;
+            if (back) {
+                /* (P) reuse visual-row wheel continuation for the live row
+                 * count; the seed is already the selected visual row. */
+                e->wheel.request=SCROLL_READY; e->wrap_wheel_rows=-(int64_t)back;
+                e->wheel_pending=true;
+            }
+        }
     }
     e->find_scroll=false;
     return editor_full_layout(e);

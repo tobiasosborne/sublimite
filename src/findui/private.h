@@ -27,7 +27,7 @@ typedef struct findui_slot {
     piece_snapshot *snapshot;
     findui_source_lease lease;
     work_handle handle;
-    uint64_t owner, window_start, window_end, desired_index;
+    uint64_t owner, window_start, window_end, desired_index, desired_byte;
     size_t query_length, cache_capacity, visible_capacity;
     uint8_t query[FINDUI_QUERY_BYTES];
     findui_options options;
@@ -41,7 +41,7 @@ typedef struct findui_slot {
     size_t page_first, page_count;
     findui_plan plan;
     struct findui_slot *plan_source;
-    bool selection_request, started, scan_done;
+    bool selection_request, seek_request, started, scan_done;
     find_regex *regex;
     uint64_t total, visible, offset, plan_record;
     size_t matched;
@@ -62,7 +62,7 @@ typedef struct findui_impl {
     size_t retired_count;
     uint8_t query[FINDUI_QUERY_BYTES], replacement[FINDUI_QUERY_BYTES];
     findui_range *cache, *visible, *replace_page;
-    uint64_t window_start, window_end, desired_index;
+    uint64_t window_start, window_end, desired_index, desired_byte;
     findui_slot slots[FINDUI_SLOT_COUNT];
     bool request_active, pending_submit, disposing, window_request, window_dirty;
     findui_mutation_host host;
@@ -73,7 +73,7 @@ typedef struct findui_impl {
     bool replace_single, replace_changed, replace_paged, page_request, page_ready;
     size_t page_first, page_count;
     findui_slot *plan;
-    bool selection_request;
+    bool selection_request, seek_request;
     find_code page_error;
     findui_range replace_selected, replace_range;
     uint64_t replace_delete_remaining;

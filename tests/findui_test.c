@@ -115,6 +115,46 @@ static void finish(fixture *f)
 }
 static void query(fixture *f, const char *text)
 { CHECK(findui_set_query(&f->panel, (const uint8_t *)text, strlen(text)) == FINDUI_OK); wait_result(f); }
+/* edit-cxho.12 (P): cache one match (the shortest nonempty literal); offsets
+ * and visible counts derive from the fixture strings. Zero is success/first
+ * byte, unit steps select adjacent matches. No new workload budget. */
+static void origin_seek(void)
+{
+    const char text[]="cat cat cat", needle[]="cat";
+    fixture f; start(&f,(const uint8_t *)text,sizeof text-1u,sizeof "c"-1u,sizeof text-1u);
+    query(&f,needle);
+    unsigned scans=atomic_load(&f.hook.scans);
+    size_t visible=findui_get_state(&f.panel).visible_matches;
+    const uint64_t origins[]={sizeof "c"-1u,sizeof "cat "-1u,sizeof text-1u};
+    const uint64_t expected[]={sizeof "cat "-1u,sizeof "cat "-1u,0};
+    for (size_t i=0;i<sizeof origins/sizeof origins[0];i++) {
+        findui_range selected;
+        CHECK(findui_seek(&f.panel,origins[i],&selected)==FINDUI_MORE);
+        wait_result(&f);
+        findui_state state=findui_get_state(&f.panel);
+        CHECK(state.selected.start==expected[i] && state.selected.end==expected[i]+sizeof needle-1u);
+        CHECK(state.visible_matches==visible && state.cached_matches==sizeof "c"-1u);
+        CHECK(atomic_load(&f.hook.scans)==scans);
+    }
+    findui_range selected;
+    CHECK(findui_seek(&f.panel,sizeof "c"-1u,&selected)==FINDUI_MORE); wait_result(&f);
+    CHECK(findui_next(&f.panel,1,&selected)==FINDUI_MORE); wait_result(&f);
+    CHECK(findui_get_state(&f.panel).selected.start==sizeof "cat cat "-1u);
+    CHECK(findui_next(&f.panel,-1,&selected)==FINDUI_MORE); wait_result(&f);
+    CHECK(findui_get_state(&f.panel).selected.start==sizeof "cat "-1u);
+    CHECK(findui_set_window(&f.panel,sizeof "cat "-1u,sizeof text-1u)==FINDUI_OK);
+    CHECK(findui_seek(&f.panel,sizeof text-1u,&selected)==FINDUI_MORE); wait_result(&f);
+    findui_range ranges[sizeof text-1u]; size_t count=0;
+    CHECK(findui_highlights(&f.panel,sizeof "cat "-1u,sizeof text-1u,ranges,
+        sizeof ranges/sizeof ranges[0],&count)==FINDUI_OK);
+    CHECK(count==sizeof "cc"-1u && atomic_load(&f.hook.scans)==scans);
+    CHECK(findui_seek(&f.panel,sizeof "cat "-1u,&selected)==FINDUI_MORE);
+    query(&f,"dog");
+    CHECK(!findui_get_state(&f.panel).match_count);
+    CHECK(findui_seek(&f.panel,0,&selected)==FINDUI_OK && selected.start==FIND_UNSET);
+    finish(&f);
+    puts("edit-cxho.12 worker origin seek: starts/inside/wrap/uncached/next/previous/window/cancel without rescanning passed");
+}
 static void same(piece_tree *tree, const uint8_t *text, size_t length)
 {
     uint8_t bytes[512];
@@ -999,7 +1039,6 @@ static void panel_editing_chords(void)
     editor *e=NULL; CHECK(editor_open(&e,&cfg,&backend)==0); panel_settle(e);
     panel_key(e,'a',PLAT_MOD_CTRL); panel_key(e,'c',PLAT_MOD_CTRL);
     panel_key(e,XKB_KEY_End,PLAT_MOD_CTRL);
-    view_selection selected=editor_view(e).selection;
     uint64_t revision=e->buffer->revision;
     panel_key(e,'f',PLAT_MOD_CTRL);
     edit_malloc_guard_begin();
@@ -1016,6 +1055,9 @@ static void panel_editing_chords(void)
     panel_query(e,"alpha ",sizeof "alpha "-1);
     panel_key(e,'a',PLAT_MOD_CTRL); CHECK(e->find_field_all);
     panel_key(e,'v',PLAT_MOD_CTRL); panel_query(e,text,sizeof text-1);
+    /* edit-cxho.12: field input has now selected its matching preview.
+     * Field no-ops preserve that selection. */
+    view_selection selected=editor_view(e).selection;
     /* (P) Field undo has no history yet; undo/redo remain field no-ops.
      * Delete at the field end cannot change either field or document.
      * Window commands formerly pinned here are exercised below. */
@@ -1163,7 +1205,9 @@ static void panel_focus_document_areas(void)
         panel_key(e, 'f', PLAT_MOD_CTRL); panel_text(e, "alpha");
         panel_click(e, e->tab_rows, in_minimap[i] ? e->text_grid.dims.cols : 0);
         panel_text(e, "x"); panel_query(e, "alpha", sizeof "alpha" - 1u);
-        const char *expected = in_minimap[i] ? "xalpha beta alpha" : "x";
+        /* edit-cxho.12: the minimap retains the incremental match selection;
+         * typing replaces that "alpha". The gutter selects the whole line. */
+        const char *expected = in_minimap[i] ? "x beta alpha" : "x";
         same(e->tree, (const uint8_t *)expected, strlen(expected));
         /* Tab changes retain document focus, then retain field focus. */
         uint64_t added;
@@ -1300,6 +1344,7 @@ static void panel_save_and_prompt(void)
 
 int main(void)
 {
+    origin_seek();
     const char *panel_case=getenv("EDIT_CXHO_PANEL");
     if (panel_case) {
         if (!strcmp(panel_case,"focus")) { panel_focus_rows(); panel_focus_document_areas(); }

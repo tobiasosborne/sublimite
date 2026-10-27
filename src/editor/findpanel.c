@@ -59,6 +59,83 @@ static int geometry(editor *e)
 {
     return editor_text_geometry(e);
 }
+static void save_origin(editor *e)
+{
+    e->find_origin=e->v.state; e->find_origin_id=e->buffer->id;
+    e->find_origin_subrow=e->buffer->scroll_display.subrow_q8;
+}
+static int restore_origin(editor *e)
+{
+    if (e->find_origin_id!=e->buffer->id) return 0;
+    editor_buffer *b=e->buffer;
+    editor_scroll_cancel_jump(e);
+    e->find_scroll=false; e->wheel_pending=false; e->find_scroll_adjust=false;
+    e->visual_seed_valid=false;
+    e->old_selection=e->v.state.selection;
+    bool wrap=e->v.state.wrap;
+    e->v.state=e->find_origin; e->v.state.wrap=wrap;
+    /* (P) a document edit may shorten the saved byte range. */
+    uint64_t length=piece_len(e->tree);
+    if (e->v.state.selection.cursor>length) e->v.state.selection.cursor=length;
+    if (e->v.state.selection.anchor>length) e->v.state.selection.anchor=length;
+    if (e->v.state.first_byte>length) return editor_refresh_cursor(e,e->old_selection.cursor);
+    if (!wrap && b->scroll_ready) {
+        b->scroll.first_line=b->scroll.anchor_line=e->v.state.first_line;
+        b->scroll.first_byte=e->v.state.first_byte;
+        b->scroll.subrow_q8=e->find_origin_subrow;
+        b->scroll.approximate=e->v.state.approximate;
+        b->scroll.request=SCROLL_READY; b->scroll.pending_rows=0;
+        b->scroll_display=b->scroll; b->scroll_display_stale=false;
+        b->scroll_pending=b->scroll_following=false;
+    }
+    b->lg.top_estimated=e->v.state.approximate;
+    editor_restart_blink(e,trace_now_ns());
+    return editor_full_layout(e);
+}
+static void preview(editor *e)
+{
+    if (!e->find_visible || e->fif.mode) return;
+    e->find_preview_pending=true; e->find_select_pending=true;
+    e->find_direction=0; e->find_navigated=false;
+    /* New field input cancels a preview's unpublished viewport request. */
+    if (e->find_scroll) editor_scroll_cancel_jump(e);
+    e->find_scroll=false; e->wheel_pending=false; e->find_scroll_adjust=false;
+    if (!findui_get_state(&e->find).query_length) {
+        e->find_preview_pending=e->find_select_pending=false;
+        e->find_error=restore_origin(e);
+    }
+}
+uint64_t editor_find_scroll_back(const editor *e, uint64_t line)
+{
+    /* (P) a far result is at least a viewport beyond its nearest edge.
+     * Centre it by half the live rows; a near result moves only enough to
+     * reveal it. Unit subtraction converts row counts to last-row offsets. */
+    uint64_t rows=e->v.config.rows, first=e->find_scroll_first;
+    if (e->v.state.wrap) {
+        layout_wrap_row row=e->visual_seed;
+        uint64_t top=e->find_scroll_visual_first, last=e->find_scroll_visual_last;
+        bool above=row.start<top, below=row.start>last;
+        /* Logical-line labels cannot measure distance inside a wrapped
+         * line. Prove a near result with at most one viewport of existing
+         * visual-row queries; otherwise use the centred continuation.
+         * (P) the live row count bounds this walk; each query retains the
+         * layout's existing source-read bounds. */
+        for (uint64_t step=0;step<rows;step++) {
+            if (above && row.start>=top) return 0;
+            if (below && row.start<=last) return rows-1u;
+            if (!above && !below && row.start<=top) return step;
+            layout_wrap_row next; bool approximate;
+            if (layout_visual_row(&e->lay,e->tree,row.start,above ? 1 : -1,&next,&approximate)!=LAYOUT_DONE ||
+                next.start==row.start) break;
+            row=next;
+        }
+        return rows/2u;
+    }
+    uint64_t gap=line<first ? first-line : line-first>=rows ? line-first-rows+1u : 0;
+    if (gap>=rows) return rows/2u;
+    if (line>=first && line-first>=rows) return rows-1u;
+    return line>=first ? line-first : 0;
+}
 static bool visible_byte(const editor *e, uint64_t byte)
 {
     uint32_t cols=e->text_grid.dims.cols;
@@ -84,11 +161,20 @@ static int select_result(editor *e, findui_range range)
     uint64_t old=e->v.state.selection.cursor;
     e->old_selection=e->v.state.selection;
     e->find_scroll=false; e->wheel_pending=false;
+    e->find_scroll_adjust=false;
     e->v.state.selection.cursor=range.end; e->v.state.selection.anchor=range.start;
     e->v.state.selection.preferred_col=VIEW_PREFERRED_UNSET;
     undo_break_burst(e->undo); editor_restart_blink(e,trace_now_ns());
     uint64_t last=range.end>range.start ? range.end-1u : range.start;
     if (visible_byte(e,range.start) && visible_byte(e,last)) return editor_refresh_cursor(e,old);
+    e->find_scroll_first=e->v.state.first_line; e->find_scroll_adjust=true;
+    if (e->v.state.wrap) {
+        e->find_scroll_visual_first=e->v.state.visual_byte;
+        e->find_scroll_visual_last=e->find_scroll_visual_first;
+        for (uint32_t row=0;row<e->v.config.rows;row++)
+            if (e->lay.wrap_rows[row].start!=LAYOUT_VOID_ROW)
+                e->find_scroll_visual_last=e->lay.wrap_rows[row].start;
+    }
     /* Search results may be far beyond the resident viewport. Resolve the
      * byte through the worker-backed navigation bridge, never a whole-source
      * piece_byte_to_line/line_to_byte query on the input thread. Unwrapped,
@@ -130,6 +216,7 @@ int editor_find_service(editor *e)
         if (code!=FINDUI_OK) return EDITOR_ERR_HISTORY;
         e->find_id=e->buffer->id; e->find_source_generation=e->buffer->source_generation;
         e->find_buffer_revision=e->buffer->revision; e->find_range_count=0;
+        if (e->find_origin_id!=e->buffer->id) save_origin(e);
         e->find_navigated=false; state=findui_get_state(&e->find);
     }
     if (e->find_replace_request && !state.searching && !state.complete) {
@@ -140,6 +227,21 @@ int editor_find_service(editor *e)
         replace_begin(e,all); state=findui_get_state(&e->find);
     }
     if (e->find_select_pending && !state.searching) {
+        if (e->find_preview_pending) {
+            e->find_preview_pending=false;
+            if (state.complete && state.match_count) {
+                findui_range selected;
+                findui_code code=findui_seek(&e->find,e->find_origin.selection.cursor,&selected);
+                if (code==FINDUI_MORE) {
+                    e->find_navigated=true;
+                    return editor_find_highlights(e);
+                }
+                if (code!=FINDUI_OK) e->find_error=(int)code;
+            } else if (state.complete) {
+                e->find_select_pending=false;
+                return restore_origin(e);
+            }
+        }
         e->find_select_pending=false;
         if (state.complete && state.match_count) {
             findui_range selected=state.selected;
@@ -158,7 +260,12 @@ int editor_find_service(editor *e)
             }
         }
     }
-    if (!e->find_replace_active && !layout_busy(&e->lay) && !e->full_pending) {
+    return editor_find_highlights(e);
+}
+int editor_find_highlights(editor *e)
+{
+    if (editor_fif_results_active(e)) return 0; /* results service owns its marks */
+    if (e->find.private_ && !e->find_replace_active && !layout_busy(&e->lay) && !e->full_pending) {
         uint64_t start=e->v.state.wrap ? e->v.state.visual_byte : e->v.state.first_byte;
         uint64_t end=e->lay.pos; if (end<start) end=start;
         if (end>piece_len(e->tree)) end=piece_len(e->tree);
@@ -264,7 +371,8 @@ static void field_edit(editor *e, findui_state state, size_t at, size_t erase,
         memcpy(e->find_edit+at+add,state.replacement+at+erase,length-at-erase);
         e->find_error=(int)findui_set_replacement(&e->find,e->find_edit,length-erase+add,at+add);
     } else if (erase || add) {
-        e->find_error=(int)findui_edit_query(&e->find,at,erase,insert,add); e->find_navigated=false;
+        e->find_error=(int)findui_edit_query(&e->find,at,erase,insert,add);
+        if (e->find_error==FINDUI_OK) preview(e);
     } else e->find_error=(int)findui_set_query_cursor(&e->find,at);
 }
 int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement)
@@ -307,6 +415,7 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         keys_reset(&e->keys); return true;
     }
     case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE:
+        if (!e->find_visible || e->fif.mode) save_origin(e);
         (void)editor_find_service(e);
         e->fif.mode=false;
         e->find_visible=true;
@@ -331,7 +440,7 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         if (binding->action==KEYS_ACTION_TOGGLE_REGEX) options.regex=!options.regex;
         else if (binding->action==KEYS_ACTION_TOGGLE_CASE_SENSITIVE) options.match_case=!options.match_case;
         else options.whole_word=!options.whole_word;
-        (void)findui_set_options(&e->find,options); e->find_navigated=false;
+        if (findui_set_options(&e->find,options)==FINDUI_OK) preview(e);
         (void)editor_begin_frame(e); return true;
     }
     default: return false;
@@ -367,6 +476,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (ev->keysym==XKB_KEY_Escape) {
         if (e->find_replace_active) { (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e); }
         e->find_visible=false; e->find_select_pending=false; e->find_replace_request=0;
+        e->find_preview_pending=false;
         e->find_focus=EDITOR_FIND_DOCUMENT;
         e->fif.mode=false;
         e->find_error=geometry(e); return true;
@@ -411,8 +521,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     } else if (ev->keysym==XKB_KEY_Return || ev->keysym==XKB_KEY_KP_Enter) {
         if (ctrl && state.replace_mode) replace_begin(e,(ev->mods&PLAT_MOD_ALT)!=0);
         else {
-            /* Return advances from the query's initial preview as well as
-             * subsequent selections. Keep keymap/hidden navigation unchanged.
+            /* Return advances from the selected incremental preview.
              * (P) direction magnitude follows findui_next's one-step contract. */
             e->find_navigated=true;
             navigate(e,shift ? -1 : 1);
@@ -492,7 +601,8 @@ int editor_find_pointer(editor *e, const plat_event *ev, bool *handled)
         if (hit.kind==FINDUI_HIT_REGEX) options.regex=!options.regex;
         else if (hit.kind==FINDUI_HIT_CASE) options.match_case=!options.match_case;
         else options.whole_word=!options.whole_word;
-        e->find_error=(int)findui_set_options(&e->find,options); e->find_navigated=false;
+        e->find_error=(int)findui_set_options(&e->find,options);
+        if (e->find_error==FINDUI_OK) preview(e);
     }
     return editor_begin_frame(e);
 }
