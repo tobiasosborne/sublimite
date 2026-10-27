@@ -1,3 +1,16 @@
+# HANDOFF — sublimité, session 25 on the ThinkPad (2026-10-27 evening; Opus 5.5 coordinator; Tobias set the design bar then left the session unattended with permission to proceed)
+
+## Read first (session 26)
+**Design hill-climb, two rounds, on branch `wt/design-s25` (fc5ee75, worktree .wt/design-s25), NOT landed: it waits on Tobias's eye.** Sheets: `docs/design/hillclimb-2026-10-27/` on the branch (before-after-dark.jpg, before-after-light.jpg, code-detail-1to1.jpg). Tobias's standard (memory design-bar-pinnacle): the pinnacle, Apple at its most restrained and the most elegant design periodicals; never other editors; perf never suffers. Rubric `docs/design/rubric.md`, runner `docs/design/council.md` (Codex sol xhigh, Muse `muse-wonder-full-1.0` via `muse exec`, quota via `muse usage`; Claude Opus via `claude -p`). Round 1 (today's build, absolute): mean 1.73/5. Round 2 (blind A/B, candidate edit-cxho.24: OKLCH palette on the title bar tint, tabs without `|`, U+2022 unsaved, minimap on its ladder rung, find/notice from tokens; +4 B, no typing-path change): 1.83 -> 2.43, no criterion regressed for any member. `make check` exit 0 (117 suites) on the branch [AC]. Report `docs/reviews/design-council-2026-10-27.md`; decision and next candidates `docs/decisions/edit-cxho.24.md` (panels without labels/brackets, a margin system, bar caret = render-contract bead, an OFL face of real quality = Tobias's pick).
+
+**If Tobias approves:** rebase the branch onto main, `make check`, ff, close edit-cxho.22/.23/.24, `make install` (also brings cxho.27/.16/.17/.21, still uninstalled). **Still first otherwise:** full `make check` on main + `make install` (installed binary is 6667453 from 14:27).
+
+Quota for the session (M): Claude weekly 4 -> 5 %, Codex 39 -> 39 % (+16 % ahead of pace from other sessions: hold sol work), Muse weekly 6 -> 7 %.
+
+Everything below is the earlier handoffs, kept for their state.
+
+---
+
 # HANDOFF — sublimité, end of session 24 on the ThinkPad (2026-10-27 ~15:40 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "please stop work now. recover/save what you can commit and push")
 
 ## Read first (session 25)
