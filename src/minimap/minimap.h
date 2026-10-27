@@ -249,4 +249,29 @@ int minimap_prepare_window(minimap *m, const minimap_input *input,
                            const minimap_anchor *anchor, uint32_t height);
 /* True when m is not a windowed map prepared for exactly this anchor. */
 bool minimap_anchor_moved(const minimap *m, const minimap_anchor *anchor);
+
+/* edit-cxho.10: pixel dump in window geometry (the editor's strip). Row
+ * labels share line_y/line's numbering: a row's line L paints its marks on
+ * scanline y = line_y + (L - line) * scale and leaves the remaining
+ * scale - 1 scanlines blank (perf §2: two logical px per line, marks on
+ * the first). The box [box_top, box_top + box_height) is drawn as in
+ * minimap_pixels (32/255 wash, 96/255 one-pixel perimeter), clipped to the
+ * strip; it comes from the caller's window or drag, never from the rows,
+ * so the box can lead a summary still being prepared. pending (m unused,
+ * may be NULL): no compatible summaries; the quiet placeholder ink
+ * (minimap_fill's 64/255 blend over its first ceil(64 * width / 255)
+ * columns) covers only the scanlines of lines 0..lines-1, and the last
+ * column is style->stale. Never reads source; no allocation. */
+typedef struct minimap_frame {
+    int64_t line_y;       /* strip y of `line`'s top scanline */
+    uint64_t line;        /* reference line in the rows' numbering */
+    uint64_t lines;       /* document lines (pending ink stops after the last) */
+    int64_t box_top;
+    uint32_t box_height;
+    uint32_t scale;       /* px per line, > 0 */
+    bool pending;
+} minimap_frame;
+int minimap_pixels_window(const minimap *m, uint32_t *pixels, size_t capacity,
+                          uint32_t width, uint32_t height, size_t stride,
+                          const minimap_frame *frame, const minimap_style *style);
 #endif

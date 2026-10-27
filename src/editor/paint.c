@@ -289,20 +289,35 @@ static int compose(editor *e)
         minimap *map = &e->buffer->map;
         bool retained = map->filled && map->height == e->map_grid.dims.rows &&
             map->identity.ctx == input.source.ctx && map->identity.span == input.source.span;
-        if (retained) {
+        minimap_window w;
+        if (retained && !map->windowed) {
+            /* Legacy grouped summaries (none are prepared since edit-cxho.10
+             * once the index is ready; kept for any retained one). */
             rc = minimap_pixels(map, e->map_scratch, e->map_pixel_capacity,
                 width, height, width, first, visible, &colors);
             if (rc) return rc;
-        } else {
-            /* Existing pending scrollbar at summary-row geometry, with the
-             * narrowest physical edge bar (one pixel, from edit-g11). */
-            for (uint32_t y = 0; y < height; y++) for (uint32_t x = 0; x < width; x++) {
-                uint32_t col = (uint32_t)((uint64_t)x * e->map_grid.dims.cols / width);
-                if (col + 1u == e->map_grid.dims.cols) col--; /* pending bar belongs only to the last pixel */
-                e->map_scratch[(size_t)y * width + x] = x + 1u == width ? colors.stale :
-                    e->map_grid.cells[(size_t)(y / 2u) * e->map_grid.dims.cols + col].bg;
+        } else if (editor_map_window(e, &input, &w)) {
+            /* edit-cxho.10: the box is the current window's (the pointer's
+             * while dragging, so it never lags the resolving scroll). Rows
+             * labelled in the current numbering (a fresh exact window) are
+             * placed relative to the viewport's first line at box_top; any
+             * other retained rows keep their own anchor's geometry until
+             * the job for the new anchor lands. */
+            minimap_frame frame = {.line_y = w.box_top, .line = w.first_line + w.above,
+                .lines = input.lines, .box_top = w.box_top, .box_height = w.box_height,
+                .scale = w.scale, .pending = !retained};
+            if (e->map_drag && e->map_drag_id == e->buffer->id &&
+                e->map_drag_generation == e->buffer->source_generation) frame.box_top = e->map_drag_top;
+            if (retained && !(!map->stale && map->window_exact && input.index_ready)) {
+                frame.line_y = map->anchor.window.box_top; frame.line = map->anchor.first_line;
+            } else if (!retained && !input.index_ready) {
+                /* Byte window: the viewport's line label is an estimate. */
+                frame.line = e->v.state.first_line;
             }
-        }
+            rc = minimap_pixels_window(retained ? map : NULL, e->map_scratch, e->map_pixel_capacity,
+                width, height, width, &frame, &colors);
+            if (rc) return rc;
+        } else return EDITOR_ERR_ARG;
         render_pixels *region = &e->grid.region;
         bool changed = !region->pixels || region->width != width || region->height != height ||
             region->x != tc * e->grid.dims.cell_w || region->y != e->tab_rows * e->grid.dims.cell_h ||
@@ -336,50 +351,6 @@ int editor_compose(editor *e)
     int rc = compose(e);
     trace_record(TRACE_COMPOSE_END, e->grid.frame_id);
     return rc;
-}
-/* edit-2mhd (P): match the painted half-open viewport band, including its
- * retained bounds during indexing. Grid cell height is the existing summary
- * pixel spacing. Zero denotes an empty band/first row; one advances an
- * exclusive endpoint; dividing the band height by two gives its centre. */
-static bool map_grab(editor *e, const minimap_input *input, int64_t y)
-{
-    const minimap *map = &e->buffer->map;
-    uint32_t rows = e->map_grid.dims.rows;
-    int64_t height = (int64_t)e->v.config.rows * e->grid.dims.cell_h;
-    int64_t top = height, bottom = 0;
-    bool retained = map->filled && map->height == rows &&
-        map->identity.ctx == input->source.ctx && map->identity.span == input->source.span;
-    uint64_t first = map->painted_first, end = map->painted_end;
-    if (!retained) {
-        first = e->v.state.first_line;
-        uint64_t visible = 0;
-        for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {
-            uint64_t line = e->lay.wrap ? e->lay.wrap_rows[r].line : first + r;
-            if (line >= first && line - first + 1u > visible) visible = line - first + 1u;
-        }
-        end = first;
-        if (first < input->lines) {
-            uint64_t remaining = input->lines - first;
-            end += visible < remaining ? visible : remaining;
-        }
-    }
-    for (uint32_t r = 0; r < rows && (int64_t)r * e->map_grid.dims.cell_h < height; r++) {
-        bool band;
-        if (retained) {
-            const minimap_row *v = &map->rows[r];
-            band = v->line_count && first < end && v->first_line < end &&
-                first < v->first_line + v->line_count;
-        } else band = minimap_pending_band(input->lines, rows, r, first, end); /* edit-cxho.1: the painted pending band */
-        if (band) {
-            if (top == height) top = (int64_t)r * e->map_grid.dims.cell_h;
-            bottom = ((int64_t)r + 1) * e->map_grid.dims.cell_h;
-            if (bottom > height) bottom = height;
-        }
-    }
-    if (bottom <= top) top = bottom = 0;
-    bool inside = y >= top && y < bottom;
-    e->map_drag_offset = inside ? y - top : (bottom - top) / 2;
-    return inside;
 }
 int editor_chrome_pointer(editor *e, const plat_event *ev)
 {
@@ -417,32 +388,63 @@ int editor_chrome_pointer(editor *e, const plat_event *ev)
         e->map_drag_id != e->buffer->id || e->map_drag_generation != e->buffer->source_generation)) e->map_drag = false;
     if (e->map_drag) {
         e->find_scroll=false; e->wheel_pending=false;
-        minimap_input input = editor_map_input(e->buffer); minimap_target target;
+        minimap_input input = editor_map_input(e->buffer); minimap_window w;
         int64_t local_y = (int64_t)ev->y - (int64_t)e->tab_rows * e->grid.dims.cell_h;
-        if (map_press && map_grab(e, &input, local_y)) return 0;
-        int64_t map_y = (local_y - e->map_drag_offset) / e->map_grid.dims.cell_h;
+        if (!editor_map_window(e, &input, &w)) return 0;
+        /* edit-cxho.10: the painted box is the window's (Sublime model).
+         * A press inside grabs it at the pointer's offset; outside, the box
+         * centres on the pointer (minimap_window_grab) and the document
+         * follows. Motion places the box top at pointer - offset, clamped
+         * to the travel, and seeks its inverse: 1:1 with the pointer when
+         * lines outnumber travel pixels (minimap.h). */
+        if (map_press) {
+            bool inside = minimap_window_grab(&w, local_y, &e->map_drag_offset);
+            e->map_drag_top = w.box_top;
+            if (inside) return 0;
+        }
+        int64_t top = local_y - e->map_drag_offset;
+        top = top < 0 ? 0 : top > (int64_t)w.travel ? (int64_t)w.travel : top;
+        /* A box over its own lines moves in whole lines (floor: the line
+         * under the pointer), as the grouped map did. */
+        if (!w.scrolls) top -= top % w.scale;
+        bool moved = top != e->map_drag_top;
+        e->map_drag_top = top;
+        if (top == (int64_t)w.box_top) return moved ? editor_begin_frame(e) : 0;
+        uint64_t target = minimap_window_seek(&w, top, 0);
         int rc;
-        if (e->buffer->map.sampled || minimap_stale(&e->buffer->map, &input)) {
-            /* edit-73j: a pending/sampled summary still navigates, to an
-             * approximate byte resolved on the scroll path (3kk) when
-             * unwrapped, or through the resident window when wrapped. */
-            rc = minimap_hit_approx(&input, e->map_grid.dims.rows, map_y, &target); if (rc) return rc;
-            e->v.state.hscroll = 0;
-            if (!e->v.state.wrap) { rc = editor_scroll_seek(e, target.byte); return rc ? rc : editor_begin_frame(e); }
+        e->v.state.hscroll = 0;
+        if (!input.index_ready) {
+            /* edit-73j: while indexing, the byte target is resolved on the
+             * scroll path (3kk) when unwrapped, or through the resident
+             * window when wrapped; the box shows the pointer meanwhile. */
+            if (!e->v.state.wrap) { rc = editor_scroll_seek(e, target); return rc ? rc : editor_begin_frame(e); }
             rc = scroll_init(&e->wheel, (scroll_config){e->v.config.rows, 1, 0},
                 (scroll_extent){input.source.len, input.lines, input.index_ready}); if (rc) return rc;
             e->wheel.first_byte = e->v.state.first_byte; e->wheel.first_line = e->v.state.first_line;
-            rc = scroll_seek_byte(&e->wheel, target.byte); if (rc) return rc;
+            rc = scroll_seek_byte(&e->wheel, target); if (rc) return rc;
             e->wheel_resolver = (scroll_resolver){0}; e->wheel_pending = true;
             return editor_wheel_continue(e);
         }
-        rc = minimap_hit(&e->buffer->map, &input, e->buffer->index, map_y, &target);
-        if (rc == MINIMAP_ERR_STALE) return editor_begin_frame(e);
-        if (rc) return rc;
-        e->v.state.first_line = target.line; e->v.state.first_byte = e->v.state.visual_byte = target.byte;
-        e->v.state.approximate = !target.exact; e->v.state.hscroll = 0;
-        rc = editor_scroll_seek(e, target.byte); if (rc) return rc;
-        return editor_full_layout(e);
+        uint64_t line = target < input.lines ? target : input.lines - 1u;
+        const minimap *map = &e->buffer->map;
+        uint64_t base = map->active_rows ? map->rows[0].first_line : 0;
+        if (map->windowed && map->window_exact && !minimap_stale(map, &input) &&
+            map->active_rows && line >= base && line - base < map->active_rows) {
+            /* The summary holds this line's exact start: adopt it now, as
+             * go-to-line adopts a certified start (input.c goto_scroll_to). */
+            uint64_t byte = map->rows[line - base].first_byte;
+            e->v.state.first_line = line; e->v.state.first_byte = e->v.state.visual_byte = byte;
+            e->v.state.approximate = false; e->v.state.visual_end = false;
+            if (!editor_scroll_place(e, byte, line, false)) { rc = editor_scroll_seek(e, byte); if (rc) return rc; }
+            return editor_full_layout(e);
+        }
+        if (!e->v.state.wrap) { rc = editor_scroll_seek_line(e, line); return rc ? rc : editor_begin_frame(e); }
+        rc = scroll_init(&e->wheel, (scroll_config){e->v.config.rows, 1, 0},
+            (scroll_extent){input.source.len, input.lines, input.index_ready}); if (rc) return rc;
+        e->wheel.first_byte = e->v.state.first_byte; e->wheel.first_line = e->v.state.first_line;
+        rc = scroll_seek_line(&e->wheel, line); if (rc) return rc;
+        e->wheel_resolver = (scroll_resolver){0}; e->wheel_pending = true;
+        return editor_wheel_continue(e);
     }
     return 0;
 }

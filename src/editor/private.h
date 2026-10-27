@@ -489,6 +489,7 @@ struct editor {
     size_t drag_tab;
     uint64_t drag_id, map_drag_id, map_drag_generation;
     int64_t map_drag_offset; /* edit-2mhd: pointer pixels below the captured viewport top */
+    int64_t map_drag_top;    /* edit-cxho.10: pointer-derived box top, painted while dragging */
     bool map_drag, paint_ready, caret_only;
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     bool text_drag;
@@ -780,6 +781,11 @@ uint64_t editor_map_retry_ns(const editor *e); /* edit-ci6i: the due retry tick,
 bool editor_map_receive(editor *e, const work_msg *msg);
 /* edit-cxho.9: compose's synchronous first map of a file-backed buffer;
  * a large one prepares the viewport's window (bounded reads), then fills. */
+/* edit-cxho.10: the current viewport's minimap window (strip px), and
+ * whether a map job is due (test helpers wait on it). */
+bool editor_map_window(const editor *e, const minimap_input *in, minimap_window *w);
+bool editor_map_due(const editor *e);
+int editor_scroll_seek_line(editor *e, uint64_t line);
 int editor_map_fill_sync(editor *e, const minimap_input *input, uint64_t first,
                          uint64_t visible, const minimap_style *colors);
 int editor_chrome_pointer(editor *e, const plat_event *ev);

@@ -634,3 +634,71 @@ uint64_t minimap_window_seek(const minimap_window *w, int64_t y, int64_t offset)
     uint64_t top = t <= 0 ? 0 : (uint64_t)t > w->travel ? w->travel : (uint64_t)t;
     return window_mul_div(top, w->range, w->travel, true);
 }
+
+/* edit-cxho.10: window-geometry pixel dump; see minimap.h. */
+int minimap_pixels_window(const minimap *m, uint32_t *pixels, size_t capacity,
+                          uint32_t width, uint32_t height, size_t stride,
+                          const minimap_frame *f, const minimap_style *style)
+{
+    if (!pixels || !f || !style || !f->scale || !width || !height || stride < width
+        || (!f->pending && (!m || !m->initialized || !m->filled))
+        || ((style->background | style->density | style->viewport | style->stale) & 0xff000000u))
+        return MINIMAP_ERR_ARG;
+    if ((size_t)(height - 1) > (SIZE_MAX - width) / stride
+        || capacity < (size_t)(height - 1) * stride + width)
+        return MINIMAP_ERR_CAPACITY;
+    uint32_t ink = style->density;
+    uint32_t occupied = 0;
+    int64_t ink_top = 0, ink_end = 0; /* pending: scanlines holding a line */
+    if (f->pending) {
+        ink = blend(style->background, ink, 64);
+        occupied = (uint32_t)(((uint64_t)64 * width + 254) / 255);
+        /* (P) lines 0..lines-1 lie line*scale above and (lines-line)*scale
+         * below line_y; a span beyond the strip saturates to it. */
+        uint64_t span = (uint64_t)height + (uint64_t)(f->line_y < 0 ? -f->line_y : f->line_y);
+        uint64_t up = f->line < span / f->scale ? f->line * f->scale : span;
+        uint64_t below = f->lines > f->line ? f->lines - f->line : 0;
+        uint64_t down = below < span / f->scale ? below * f->scale : span;
+        ink_top = f->line_y - (int64_t)up; ink_end = f->line_y + (int64_t)down;
+    }
+    uint32_t wash_bg = blend(style->background, style->viewport, 32);
+    uint32_t wash_ink = blend(ink, style->viewport, 32);
+    uint32_t edge_bg = blend(style->background, style->viewport, 96);
+    uint32_t edge_ink = blend(ink, style->viewport, 96);
+    int64_t top = f->box_top, bottom = f->box_top + (int64_t)f->box_height;
+    for (uint32_t y = 0; y < height; y++) {
+        bool band = (int64_t)y >= top && (int64_t)y < bottom;
+        bool edge_row = band && ((int64_t)y == top || (int64_t)y + 1 == bottom);
+        bool lined = f->pending && (int64_t)y >= ink_top && (int64_t)y < ink_end;
+        uint32_t *out = pixels + (size_t)y * stride;
+        for (uint32_t x = 0; x < width; x++) {
+            bool mark = lined && x < occupied;
+            bool edge = band && (edge_row || x == 0 || x + 1 == width);
+            out[x] = edge ? (mark ? edge_ink : edge_bg)
+                : band ? (mark ? wash_ink : wash_bg) : mark ? ink : style->background;
+            if (f->pending && x + 1 == width) out[x] = style->stale;
+        }
+    }
+    if (f->pending) return MINIMAP_OK;
+    /* Ready rows: marks on each line's first scanline. A row whose label is
+     * more than the strip away from line cannot touch it. */
+    uint64_t reach = (uint64_t)height / f->scale + 1u
+        + (uint64_t)(f->line_y < 0 ? -f->line_y : f->line_y) / f->scale;
+    for (uint32_t r = 0; r < m->active_rows; r++) {
+        const minimap_row *v = &m->rows[r];
+        if (!v->line_count) continue;
+        uint64_t d = v->first_line > f->line ? v->first_line - f->line : f->line - v->first_line;
+        if (d > reach) continue;
+        int64_t y = f->line_y + (v->first_line >= f->line ? 1 : -1) * (int64_t)d * f->scale;
+        if (y < 0 || y >= (int64_t)height) continue;
+        bool band = y >= top && y < bottom;
+        bool edge_row = band && (y == top || y + 1 == bottom);
+        uint32_t *out = pixels + (size_t)y * stride;
+        for (uint32_t x = 0; x < width && x < MINIMAP_LINE_CAP; x++) {
+            if (!(v->marks[x / 64u] & (UINT64_C(1) << (x % 64u)))) continue;
+            bool edge = band && (edge_row || x == 0 || x + 1 == width);
+            out[x] = edge ? edge_ink : band ? wash_ink : ink;
+        }
+    }
+    return MINIMAP_OK;
+}

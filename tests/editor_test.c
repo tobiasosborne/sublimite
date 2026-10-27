@@ -323,14 +323,168 @@ static int settle_map(editor *e)
 {
     uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
     for (;;) {
-        /* Mirrors editor_map_service: a job is in flight, or one is due. */
-        minimap_input input = editor_map_input(e->buffer);
-        bool due = e->map_cols && !e->buffer->pending_open && !e->buffer->source_stale && input.index_ready &&
-            (minimap_stale(&e->buffer->map, &input) || e->buffer->map.height != e->map_grid.dims.rows);
-        if (!e->buffer->map_snapshot && !due && !e->dirty) break;
+        /* editor_map_service's own test: a job is in flight, or one is due,
+         * including a windowed refresh after a scroll (edit-cxho.10). */
+        if (!e->buffer->map_snapshot && !editor_map_due(e) && !e->dirty) break;
         T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
     }
     return settle(e);
+}
+/* edit-cxho.10: the painted viewport box and the document follow the
+ * pointer 1:1 (Sublime model, docs/decisions/edit-cxho.10.md).
+ * Fixtures (P), from the research repro (use-findings-2026-10-27
+ * research.json minimap_model findings/1): skew20k is 10000 lines of 22 B
+ * then 10000 lines of 87 B (newline included); 200k is 200000 lines of
+ * 24 B, the edit-cxho.9 window test's shape; small is 50 lines of 4 B,
+ * fewer than the strip's 2 px rows, so its map does not scroll. Geometry:
+ * 40 columns (open.c gives the minimap from 24) and 30 rows, so the strip
+ * is the text rows' pixel height H and the box is B = v x 2 px (v = text
+ * rows, MINIMAP_LINE_PX = 2, the (G) perf §1 scale). Ten pointer ys cover
+ * the box's travel 0..H-B in nine equal steps (the brief's ten positions).
+ * Tolerance 2 px is the brief's (one summary line, MINIMAP_LINE_PX).
+ * skew20k-wrapped repeats skew20k with soft wrap on: its 87 B lines wrap
+ * at 40 columns, and the wrapped view scrolls the top to the last line. */
+enum { TRACK_SKEW20K, TRACK_200K, TRACK_BYTES, TRACK_SMALL, TRACK_WRAP };
+static uint32_t track_blend(uint32_t a, uint32_t b, uint32_t t)
+{
+    /* minimap.c's blend: per channel (a(255-t) + bt + 127) / 255. */
+    uint32_t color = 0;
+    for (uint32_t shift = 0; shift < 24; shift += 8) {
+        uint32_t av = (a >> shift) & 255u, bv = (b >> shift) & 255u;
+        color |= ((av * (255 - t) + bv * t + 127) / 255) << shift;
+    }
+    return color;
+}
+/* Painted box rows: the box perimeter colours (edge = 96/255 viewport over
+ * background or ink, minimap_pixels' blend) fill the strip's first column
+ * on every box row. top -1: no box painted. */
+static void track_box(editor *e, int64_t *top, uint32_t *height)
+{
+    const render_pixels *r = &e->grid.region;
+    config_theme t = e->preferences.theme;
+    uint32_t viewport = config_theme_color(t, "caret.background");
+    uint32_t edge_bg = track_blend(config_theme_color(t, "editor.background"), viewport, 96);
+    uint32_t edge_ink = track_blend(config_theme_color(t, "gutter.foreground"), viewport, 96);
+    *top = -1; *height = 0;
+    for (uint32_t y = 0; r->pixels && y < r->height; y++) {
+        uint32_t px = r->pixels[(size_t)y * r->stride];
+        bool edge = px == edge_bg || px == edge_ink;
+        if (edge && *top < 0) *top = y;
+        if (edge && *top >= 0 && (int64_t)y == *top + (int64_t)*height) (*height)++;
+    }
+}
+static int track_settle(editor *e)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
+    for (int i = 0; i < 4; i++) { /* a published map starts one more frame */
+        T(settle_map(e) == 0);
+        while (e->buffer->map_snapshot) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    }
+    return settle(e);
+}
+static int64_t track_abs(int64_t v) { return v < 0 ? -v : v; }
+static int minimap_track_contract(int kind)
+{
+    const char *name = kind == TRACK_SKEW20K ? "skew20k" : kind == TRACK_200K ? "200k" :
+        kind == TRACK_BYTES ? "skew20k-indexing" : kind == TRACK_SMALL ? "small50" : "skew20k-wrapped";
+    uint64_t lines = kind == TRACK_200K ? 200000u : kind == TRACK_SMALL ? 50u : 20000u;
+    size_t length = 0;
+    for (uint64_t i = 0; i < lines; i++)
+        length += kind == TRACK_200K ? 24u : kind == TRACK_SMALL ? 4u : i < 10000u ? 22u : 87u;
+    uint8_t *text = malloc(length); T(text);
+    size_t at = 0;
+    for (uint64_t i = 0; i < lines; i++) {
+        size_t n = kind == TRACK_200K ? 24u : kind == TRACK_SMALL ? 4u : i < 10000u ? 22u : 87u;
+        for (size_t j = 0; j + 1u < n; j++) text[at + j] = (uint8_t)((j + i) % 3u ? 'x' : ' ');
+        text[at + n - 1u] = '\n'; at += n;
+    }
+    /* The final LF opens one empty last line: N = lines + 1 lines. */
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = text, .initial_len = length, .cols = 40, .rows = 30,
+        .wrap_mode = kind == TRACK_WRAP ? 1 : -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
+    while (!editor_index_complete(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    T(track_settle(e) == 0);
+    if (kind == TRACK_BYTES) {
+        /* minimap_pending_contract's unbuilt index: the byte-fraction case. */
+        lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+        e->buffer->lg.lines_exact = false;
+        T(editor_begin_frame(e) == 0); T(track_settle(e) == 0);
+        T(!editor_map_input(e->buffer).index_ready);
+    }
+    const render_pixels *region = &e->grid.region;
+    T(region->pixels && region->height > 0);
+    /* Travel D = min(R x 2, H - B) with R = N - v, scroll.c's max top
+     * (lines - rows), or R = N - 1 wrapped (the visual-row view scrolls
+     * past end); the byte case is always a thumb (H - B). */
+    int64_t H = region->height, v = e->v.config.rows, B = 2 * v, travel = H - B;
+    int64_t range = kind == TRACK_WRAP ? (int64_t)lines : (int64_t)lines + 1 - v;
+    if (kind != TRACK_BYTES && 2 * range < travel) travel = 2 * range;
+    int64_t top = 0; uint32_t height = 0;
+    track_box(e, &top, &height);
+    printf("edit-cxho.10 %s: N=%llu bytes=%zu H=%lld v=%lld box top=%lld height=%u (want 0, %lld)\n", name,
+        (unsigned long long)(lines + 1u), length, (long long)H, (long long)v, (long long)top, height, (long long)B);
+    T(travel > 0); T(top == 0 && height == (uint32_t)B);
+    plat_event ev = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)(region->x + 1u), .y = (int32_t)(region->y + (uint32_t)(B / 2))};
+    int64_t grab = B / 2; int failed = 0;
+    T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+    T(e->v.state.first_line == 0); /* a press inside the box only grabs */
+    ev.kind = PLAT_EV_MOTION;
+    for (int k = 0; k < 10; k++) {
+        int64_t want = travel * k / 9, y = want + grab;
+        ev.y = (int32_t)(region->y + y);
+        T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+        track_box(e, &top, &height);
+        /* The painted box follows the pointer while dragging; the document
+         * must follow too: its own window (from first_line, or first_byte
+         * while indexing) puts the box at the same top. */
+        minimap_input input = editor_map_input(e->buffer); minimap_window doc;
+        T(editor_map_window(e, &input, &doc));
+        bool bad = track_abs(top - want) > 2 || height != (uint32_t)B || track_abs((int64_t)doc.box_top - want) > 2;
+        printf("edit-cxho.10 %s: pointer y=%lld grab=%lld box top=%lld height=%u want top=%lld off=%lld doc top=%u first_line=%llu first_byte=%llu%s\n",
+            name, (long long)y, (long long)grab, (long long)top, height, (long long)want, (long long)(top - want), doc.box_top,
+            (unsigned long long)e->v.state.first_line, (unsigned long long)e->v.state.first_byte, bad ? " FAIL" : "");
+        failed += bad;
+    }
+    /* Bottom clamp: past the strip the box sits at the end of its travel;
+     * the exact document's top reaches its last top, R. */
+    ev.y = (int32_t)(region->y + (uint32_t)H + 40u);
+    T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+    track_box(e, &top, &height);
+    printf("edit-cxho.10 %s: bottom box top=%lld height=%u want %lld first_line=%llu\n", name,
+        (long long)top, height, (long long)travel, (unsigned long long)e->v.state.first_line);
+    failed += top != travel || height != (uint32_t)B;
+    if (kind != TRACK_BYTES) failed += (int64_t)e->v.state.first_line != range;
+    ev.kind = PLAT_EV_BUTTON; ev.press = false; T(editor_pointer(e, &ev) == 0); T(!e->map_drag);
+    T(track_settle(e) == 0);
+    track_box(e, &top, &height); /* released: painted from the document */
+    failed += kind == TRACK_BYTES ? track_abs(top - travel) > 2 : top != travel;
+    /* Press outside warps: the box centres on the pointer (half the travel,
+     * above the box, which sits at the bottom). */
+    int64_t click = travel / 2;
+    ev.press = true; ev.y = (int32_t)(region->y + click);
+    T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+    ev.press = false; T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+    track_box(e, &top, &height);
+    printf("edit-cxho.10 %s: warp click y=%lld box top=%lld want %lld first_line=%llu\n", name,
+        (long long)click, (long long)top, (long long)(click > B / 2 ? click - B / 2 : 0), (unsigned long long)e->v.state.first_line);
+    failed += track_abs(top - (click > B / 2 ? click - B / 2 : 0)) > 2 || height != (uint32_t)B;
+    if (kind == TRACK_SMALL) {
+        /* Not scrolling: line L paints at 2L, the box over its own lines. */
+        failed += top != 2 * (int64_t)e->v.state.first_line;
+    }
+    editor_close(e); free(text);
+    printf("edit-cxho.10 %s: %d failures\n", name, failed);
+    T(failed == 0);
+    return 0;
+}
+static int minimap_track_all(void)
+{
+    int failed = 0; /* every case runs, so a report shows all four */
+    for (int kind = TRACK_SKEW20K; kind <= TRACK_WRAP; kind++) failed |= minimap_track_contract(kind);
+    return failed;
 }
 /* edit-2mhd: (P) the alphabet fixture has one character plus LF per line;
  * sizeof supplies its byte stride and line count. (E) reuse the existing
@@ -7512,6 +7666,7 @@ static const test_selector selectors[] = {
     {"--m15-follow", find_follow_before_top_contract},
     {"--dr3-gutter", gutter_line_contract},
     {"--minimap-cost", minimap_compose_cost},
+    {"--cxho10-track", minimap_track_all},
     {"--minimap-grab-inside", select_minimap_grab_inside},
     {"--minimap-grab-outside", select_minimap_grab_outside},
     {"--9f63-columns", minimap_text_columns},
@@ -7629,6 +7784,7 @@ int main(int argc, char **argv)
     T(g02_find_previous_uncached() == 0);
     T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);
+    T(minimap_track_all() == 0);
     T(minimap_text_columns() == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);

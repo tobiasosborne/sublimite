@@ -58,29 +58,62 @@ bool editor_map_receive(editor *e, const work_msg *msg)
  * persists past one retry is shown on the status row (the edit-btj notice). */
 static const char refused_notice[] = "minimap deferred: buffer memory exhausted";
 /* edit-cxho.9: a large file's minimap is the window of real lines around
- * the viewport (minimap_prepare_window), the same size predicate as
- * minimap_prepare's large branch. While the index builds only the byte
- * length is known, and the window anchors at the viewport's byte. */
+ * the viewport (minimap_prepare_window). edit-cxho.10: small files join it
+ * once their index is ready (docs/decisions/edit-cxho.10.md), so every
+ * strip has the constant box and the 1:1 drag. While a large index builds
+ * only the byte length is known, and the window anchors at the viewport's
+ * byte. A small file is indexed at open (buffers.c), so it is unindexed
+ * only transiently and keeps the pending placeholder then. */
 static bool map_windowed(const minimap_input *in)
 {
-    return in->source.len > MINIMAP_SMALL_BYTES || (in->index_ready && in->lines > MINIMAP_SMALL_LINES);
+    return in->index_ready || in->source.len > MINIMAP_SMALL_BYTES;
 }
-/* The window for the current viewport. visible counts the logical lines on
- * screen, as compose passes to minimap_fill. Geometry is the painter's:
- * MINIMAP_LINE_PX (2) pixels per summary row over the map grid's rows,
- * unchanged until edit-cxho.10, so row i paints at y = 2i and the band over
- * the viewport's rows falls at the window's box_top (+ phase < 2 px). */
+/* edit-cxho.10: the box covers v lines: the text rows, or the whole
+ * document when it has fewer lines, so the box is constant whatever the
+ * scroll position. Wrapped rows can show fewer logical lines than rows;
+ * the box then stands for a screenful of rows as a scrollbar thumb does
+ * (the minimap is in logical lines, docs/decisions/edit-cxho.10.md). */
+static uint64_t map_visible(const editor *e, const minimap_input *in)
+{
+    uint64_t rows = e->v.config.rows ? e->v.config.rows : 1u;
+    /* in->lines is the buffer's own count while the index catches up, so
+     * the box keeps its height across an edit's pending frames (edit-g11). */
+    return in->lines < rows ? in->lines : rows;
+}
+/* Lines the window spans. Unwrapped, scroll.c's max_top clamps the top to
+ * N - rows, so N gives R = N - v exactly. Wrapped, the visual-row view
+ * lets the top reach the last line (edit-cxho.8's scroll-past-end note):
+ * N + v - 1 gives R = N - 1, so the thumb reaches the bottom there too. */
+static uint64_t map_lines(const editor *e, const minimap_input *in, uint64_t visible)
+{
+    return e->v.state.wrap ? in->lines + visible - 1u : in->lines;
+}
+/* The window for the current viewport (minimap.h edit-cxho.8 model).
+ * Units are the strip's device pixels: MINIMAP_LINE_PX (2) per line over
+ * the strip's height, the text rows' pixels (paint.c's region), as the
+ * painter drew before this bead. */
+bool editor_map_window(const editor *e, const minimap_input *in, minimap_window *w)
+{
+    if (!e->map_cols) return false;
+    uint64_t visible = map_visible(e, in);
+    uint32_t height = e->v.config.rows * e->grid.dims.cell_h;
+    int rc = in->index_ready ?
+        minimap_window_lines(map_lines(e, in, visible), visible, e->v.state.first_line, MINIMAP_LINE_PX, height, w) :
+        minimap_window_bytes(in->source.len, visible, e->v.state.first_byte, MINIMAP_LINE_PX, height, w);
+    return rc == MINIMAP_OK;
+}
+/* The anchor a windowed job prepares. A window that does not scroll starts
+ * at line 0 whatever the top, so it anchors at line 0 (byte 0) and a
+ * scroll needs no new job; its rows are the whole document. */
 static void map_anchor(const editor *e, const minimap_input *in, minimap_anchor *a)
 {
-    uint64_t first=e->v.state.first_line, visible=0;
-    for (uint32_t r=0;r<e->v.config.rows;r++) if (e->row_byte[r]!=LAYOUT_VOID_ROW) {
-        uint64_t line=e->lay.wrap ? e->lay.wrap_rows[r].line : first+r;
-        if (line>=first && line-first+1u>visible) visible=line-first+1u;
+    *a=(minimap_anchor){.first_line=e->v.state.first_line,.first_byte=e->v.state.first_byte};
+    if (!editor_map_window(e,in,&a->window)) return;
+    if (in->index_ready && !a->window.scrolls) {
+        a->first_line=0; a->first_byte=0;
+        uint64_t visible=map_visible(e,in);
+        (void)minimap_window_lines(map_lines(e,in,visible),visible,0,MINIMAP_LINE_PX,a->window.height,&a->window);
     }
-    *a=(minimap_anchor){.first_line=first,.first_byte=e->v.state.first_byte};
-    uint32_t height=e->map_grid.dims.rows*MINIMAP_LINE_PX;
-    if (in->index_ready) (void)minimap_window_lines(in->lines,visible,first,MINIMAP_LINE_PX,height,&a->window);
-    else (void)minimap_window_bytes(in->source.len,visible,a->first_byte,MINIMAP_LINE_PX,height,&a->window);
 }
 static bool map_due(const editor *e, editor_buffer *b)
 {
@@ -93,6 +126,7 @@ static bool map_due(const editor *e, editor_buffer *b)
     minimap_anchor a; map_anchor(e,&input,&a);
     return minimap_anchor_moved(&b->map,&a); /* the viewport scrolled: a new window */
 }
+bool editor_map_due(const editor *e) { return map_due(e,e->buffer); }
 int editor_map_fill_sync(editor *e, const minimap_input *input, uint64_t first,
                          uint64_t visible, const minimap_style *colors)
 {

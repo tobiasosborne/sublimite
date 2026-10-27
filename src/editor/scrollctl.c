@@ -190,6 +190,18 @@ int editor_scroll_seek(editor *e, uint64_t byte)
     if (!rc) b->scroll_pending = true;
     return rc;
 }
+/* edit-cxho.10: an exact line target (minimap drag outside the summary's
+ * rows); the resident resolver finds its start, as for a byte seek. */
+int editor_scroll_seek_line(editor *e, uint64_t line)
+{
+    if (e->v.state.wrap) return 0;
+    editor_buffer *b = e->buffer;
+    b->scroll_following = false; b->scroll_resolver = (scroll_resolver){0};
+    unqueue(b);
+    int rc = scroll_seek_line(&b->scroll, line);
+    if (!rc) b->scroll_pending = true;
+    return rc;
+}
 bool editor_scroll_place(editor *e, uint64_t byte, uint64_t line, bool approximate)
 {
     if (e->v.state.wrap) {

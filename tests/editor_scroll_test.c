@@ -111,12 +111,9 @@ static int held_key(editor *e, const char *name, uint64_t baseline, bool grow_pr
 static int settle_map(editor *e)
 {
     for (unsigned i = 0; i < PROBE_RETRIES; i++) {
-        const editor_buffer *b = e->buffer;
-        /* Mirrors editor_map_service: a job is in flight, or one is due. */
-        minimap_input input = editor_map_input(e->buffer);
-        bool due = e->map_cols && !b->pending_open && !b->source_stale && input.index_ready &&
-            (minimap_stale(&b->map, &input) || b->map.height != e->map_grid.dims.rows);
-        if (!b->map_snapshot && !due) return settle(e);
+        /* editor_map_service's own test: a job is in flight, or one is due,
+         * including a windowed refresh after a scroll (edit-cxho.10). */
+        if (!e->buffer->map_snapshot && !editor_map_due(e)) return settle(e);
         int rc = editor_step(e, 1);
         if (rc != EDITOR_OK && rc != EDITOR_MORE) return rc;
     }
@@ -559,6 +556,7 @@ int main(int argc, char **argv)
     CHECK(editor_on_refresh(e, last.id, seq + 1u, o.last_refresh.completion_ns, true) == EDITOR_ERR_ARG);
     CHECK(editor_on_refresh(e, 0, seq + 2u, o.last_refresh.completion_ns, true) == 0);
     CHECK(!o.last_refresh.metadata_valid);
+    int (*present)(struct render_backend *, uint32_t) = backend.ops.present;
     backend.ops.present = delayed_present;
     wheel.dy = 1;
     CHECK(editor_inject(e, &wheel) == 0);
@@ -571,6 +569,10 @@ int main(int argc, char **argv)
     CHECK(render_backend_signal(&backend, RENDER_EVENT_PRESENT_COMPLETE, last.id, 0) == RENDER_ERR_FRAME);
     CHECK(backend.active && backend.active_frame == active);
     CHECK(render_backend_signal(&backend, RENDER_EVENT_DEVICE_DONE, active, 0) == 0);
+    /* edit-cxho.10: this 200-line fixture's minimap now scrolls with the
+     * view (the window model), so the wheel's new window publishes one more
+     * frame; the delayed present would hold that frame forever. */
+    backend.ops.present = present;
     CHECK(render_backend_signal(&backend, RENDER_EVENT_PRESENT_COMPLETE, active, 0) == 0 && settle(e) == 0);
     puts("editor_scroll_test: null fractional/core wheel, overscan, immutable refresh/repeat/missing/stale correlation PASS");
 done:

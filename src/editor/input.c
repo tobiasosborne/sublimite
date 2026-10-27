@@ -1510,7 +1510,8 @@ bool editor_wheel_ready(const editor *e)
     const editor_buffer *b=e->buffer;
     /* Waiting on 3kk's scroll slice or on its resident window is not work. */
     if (e->find_scroll && !e->v.state.wrap) return !b->scroll_pending;
-    if (e->v.state.wrap && e->wheel.request==SCROLL_BYTE) return !b->scroll_resident.pending && !editor_scroll_deferred(b); /* edit-ci6i */
+    if (e->v.state.wrap && (e->wheel.request==SCROLL_BYTE || e->wheel.request==SCROLL_LINE)) /* edit-cxho.10: minimap line */
+        return !b->scroll_resident.pending && !editor_scroll_deferred(b); /* edit-ci6i */
     return true;
 }
 int editor_wheel_continue(editor *e)
@@ -1543,7 +1544,7 @@ int editor_wheel_continue(editor *e)
         int rc=find_horizontal_follow(e); if (rc) return rc;
         return editor_full_layout(e);
     }
-    if (e->v.state.wrap && e->wheel.request!=SCROLL_BYTE) {
+    if (e->v.state.wrap && e->wheel.request!=SCROLL_BYTE && e->wheel.request!=SCROLL_LINE) {
         layout_wrap_row next; bool approximate;
         int direction=e->wrap_wheel_rows<0 ? -1 : 1;
         int rc=layout_visual_row(&e->lay,e->tree,e->v.state.visual_byte,direction,&next,&approximate);
@@ -1558,9 +1559,10 @@ int editor_wheel_continue(editor *e)
         return editor_full_layout(e);
     }
     if (!e->v.state.wrap) { e->wheel_pending=false; e->find_scroll=false; return 0; }
-    /* Wrapped byte seek (far find result, pending minimap target): resolve
-     * the logical line through the buffer's one resident window, then
-     * anchor the visual row. */
+    /* Wrapped byte seek (far find result, pending minimap target) or line
+     * seek (edit-cxho.10: an exact minimap target outside the summary's
+     * rows): resolve the logical line through the buffer's one resident
+     * window, then anchor the visual row. */
     int rc=editor_scroll_resolve(e,&e->wheel,&e->wheel_resolver);
     if (rc==SCROLL_MORE) return 0;
     e->wheel_pending=false;

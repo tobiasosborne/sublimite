@@ -871,8 +871,55 @@ static void window_long_line(void)
     minimap_fini(&m); free(buf);
     puts("edit-cxho.9: a line over MINIMAP_SCAN_BYTES ends the walk: ok");
 }
+/* edit-cxho.10 (P): a 4-line source "a\nbb\n\nc" prepared as one row per
+ * line (window at line 0, scale 1, 8 rows), painted at scale 2 with line 0
+ * placed at y = 3, so line L's marks sit on scanline 3 + 2L; the box is
+ * 4 px at y = 5 (lines 1 and 2). Strip 4 px wide, 12 px tall. Pending: the
+ * same frame for a 2-line source inks only scanlines 3..6. */
+static void window_paint(void)
+{
+    enum { W = 4, H = 12 };
+    static const uint8_t src[] = "a\nbb\n\nc";
+    flat f = {src, sizeof src - 1, 0, 0};
+    minimap_input in = {{&f, sizeof src - 1, span, NULL}, 4, 1, true};
+    minimap_row rows[8]; minimap m; CHECK(minimap_init(&m, rows, 8) == 0);
+    minimap_anchor a = {0};
+    CHECK(minimap_window_lines(4, 0, 0, 1, 8, &a.window) == 0);
+    CHECK(minimap_prepare_window(&m, &in, NULL, &a, 8) == 0 && m.active_rows == 4);
+    uint32_t px[W * H];
+    minimap_frame fr = {.line_y = 3, .line = 0, .lines = 4, .box_top = 5, .box_height = 4, .scale = 2};
+    CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
+    uint32_t bg = style.background, ink = style.density;
+    for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) {
+        bool band = y >= 5 && y < 9, edge = band && (y == 5 || y == 8 || x == 0 || x == W - 1);
+        bool mark = (y == 3 && x == 0) || (y == 5 && x < 2) || (y == 9 && x == 0);
+        uint32_t got = px[y * W + x];
+        if (edge) CHECK(got != bg && got != ink && got != px[6 * W + 1]);
+        else if (band) CHECK(got == px[6 * W + 1] && got != bg);
+        else CHECK(got == (mark ? ink : bg));
+    }
+    CHECK(px[5 * W + 1] != px[5 * W + 2]);          /* marked edge pixel vs plain edge pixel */
+    /* Rows far outside the strip are skipped; a label offset moves them. */
+    fr.line = 2; fr.line_y = 0; /* line 2 at y 0: line 3 at y 2, lines 0/1 above */
+    fr.box_height = 0;
+    CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
+    CHECK(px[0] == bg && px[2 * W] == ink && px[3 * W] == bg);
+    /* Pending: placeholder ink only on lines 0..1 (scanlines 3..6). */
+    minimap_frame pend = {.line_y = 3, .line = 0, .lines = 2, .box_top = 100, .box_height = 4, .scale = 2, .pending = true};
+    CHECK(minimap_pixels_window(NULL, px, W * H, W, H, W, &pend, &style) == 0);
+    for (uint32_t y = 0; y < H; y++) {
+        CHECK(px[y * W + W - 1] == style.stale);
+        CHECK((px[y * W] != bg) == (y >= 3 && y < 7));
+    }
+    CHECK(minimap_pixels_window(NULL, px, W * H, W, H, W, &fr, &style) == MINIMAP_ERR_ARG);
+    fr.scale = 0; CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == MINIMAP_ERR_ARG);
+    fr.scale = 2; CHECK(minimap_pixels_window(&m, px, W * H - 1, W, H, W, &fr, &style) == MINIMAP_ERR_CAPACITY);
+    minimap_fini(&m);
+    puts("edit-cxho.10: window-geometry pixels, box from the caller, bounded pending ink: ok");
+}
 int main(void)
 {
+    window_paint();
     window_mapping();
     window_lines_exact(); no_stripes(); window_unindexed(); window_long_line();
     character_marks(); viewport_geometry(); pixel_geometry(); dump_map();
