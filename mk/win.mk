@@ -11,7 +11,7 @@ WIN_B := build/win
 # asan runtime imports libc++.dll, which imports libunwind.dll; all three must sit beside the exe.
 WIN_SAN_DLLS := libclang_rt.asan_dynamic-x86_64.dll libc++.dll libunwind.dll
 # W0 core modules plus the pure render-grid and theme dependencies of their suites.
-WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32 savectl ipc
+WIN_MODULES := os base trace work piece undo scroll lineidx layout view utf8 scan find hl render raster d3d11 font journal file win32 savectl ipc dnd
 WIN_TS_SRCS := vendor/tree-sitter/lib/src/lib.c
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-*/src/parser.c vendor/tree-sitter-*/src/scanner.c)
 WIN_TS_SRCS += $(wildcard vendor/tree-sitter-typescript/typescript/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown/src/*.c vendor/tree-sitter-markdown/tree-sitter-markdown-inline/src/*.c)
