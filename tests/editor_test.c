@@ -4483,6 +4483,89 @@ static int recovery_notice_findpanel(void)
     T(press(e, key(XKB_KEY_x, 0, "x")) == 0); T(!e->recovery_notice);
     editor_close(e); return 0;
 }
+/* edit-cxho.3 (P): byte offsets and lengths derive from these literals;
+ * zero is success/absence/first row, one removes a NUL or advances a cell.
+ * (E) geometry reuses findpanel_contract's existing panel fixture. The
+ * allocation expectation is zero (P), the binding no-malloc typing rule. */
+static int find_focus_query(editor *e, const char *query)
+{
+    findui_state state = findui_get_state(&e->find);
+    T(state.query_length == strlen(query));
+    T(!memcmp(state.query, query, state.query_length));
+    return 0;
+}
+static int find_focus_carets(editor *e, bool field)
+{
+    const render_grid *g = editor_grid(e);
+    size_t panel = (size_t)(g->dims.rows - e->panel_rows) * g->dims.cols;
+    bool document_cursor = false, field_cursor = false;
+    for (size_t i = (size_t)e->tab_rows * g->dims.cols; i < panel; i++)
+        document_cursor |= (g->cells[i].attrs & RENDER_ATTR_CURSOR) != 0;
+    for (size_t i = panel; i < (size_t)g->dims.rows * g->dims.cols; i++)
+        field_cursor |= (g->cells[i].attrs & RENDER_ATTR_CURSOR) != 0;
+    T(field_cursor == field); T(document_cursor != field);
+    return 0;
+}
+static int find_focus_contract(void)
+{
+    static const char text[] = "alpha beta alpha", edited[] = "alpha beta alphaX";
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
+        .cols = 40, .rows = 8, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    edit_malloc_guard_begin();
+    T(press(e, key('a', 0, "alpha")) == 0);
+    size_t field_allocations = edit_malloc_guard_end(); T(field_allocations == 0);
+    T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, sizeof text - 1u, true, 0)) == 0);
+    T(e->find_range_count == findui_get_state(&e->find).match_count);
+    edit_malloc_guard_begin();
+    T(press(e, key('X', PLAT_MOD_SHIFT, "X")) == 0);
+    size_t document_allocations = edit_malloc_guard_end(); T(document_allocations == 0);
+    T(expect(e, edited, sizeof edited - 1u) == 0); T(find_focus_query(e, "alpha") == 0);
+    T(e->find_visible && findui_get_state(&e->find).match_count == 2u); /* (P) the fixture's two occurrences */
+    T(find_focus_carets(e, false) == 0);
+
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_field_all);
+    T(press(e, key('b', 0, "beta")) == 0);
+    T(find_focus_query(e, "beta") == 0); T(expect(e, edited, sizeof edited - 1u) == 0);
+    T(find_focus_carets(e, true) == 0);
+    plat_event panel = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)((sizeof "Find: b" - 1u) * e->grid.dims.cell_w),
+        .y = (int32_t)((e->grid.dims.rows - e->panel_rows) * e->grid.dims.cell_h)};
+    T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, 0, true, 0)) == 0);
+    T(press(e, panel) == 0); T(!e->find_field_all);
+    T(press(e, key('X', PLAT_MOD_SHIFT, "X")) == 0);
+    T(find_focus_query(e, "bXeta") == 0); T(find_focus_carets(e, true) == 0);
+    T(press(e, key(XKB_KEY_Tab, 0, "\t")) == 0); T(find_focus_query(e, "bXeta") == 0);
+
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key('a', 0, "alpha")) == 0);
+    T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, 0, true, 0)) == 0);
+    T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_F3, 0, NULL)) == 0);
+    T(editor_view(e).selection.anchor == sizeof "alpha beta " - 1u &&
+        editor_view(e).selection.cursor == sizeof text - 1u);
+    T(press(e, key(XKB_KEY_F3, PLAT_MOD_SHIFT, NULL)) == 0);
+    T(editor_view(e).selection.anchor == 0 && editor_view(e).selection.cursor == sizeof "alpha" - 1u);
+    T(find_focus_carets(e, false) == 0);
+    view_selection selected = editor_view(e).selection;
+    T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0); T(!e->find_visible);
+    T(editor_view(e).selection.anchor == selected.anchor && editor_view(e).selection.cursor == selected.cursor);
+
+    T(press(e, key('f', PLAT_MOD_CTRL, NULL)) == 0); T(find_focus_carets(e, true) == 0);
+    T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, sizeof edited - 1u, true, 0)) == 0);
+    T(press(e, key(XKB_KEY_Home, 0, NULL)) == 0);
+    T(press(e, key(XKB_KEY_Return, 0, "\n")) == 0);
+    T(expect(e, "\nalpha beta alphaX", sizeof "\n" - 1u) == 0);
+    T(find_focus_query(e, "alpha") == 0); /* document Return follows the detailed brief */
+    T(press(e, key('h', PLAT_MOD_CTRL, NULL)) == 0); T(e->find_field_all);
+    T(find_focus_carets(e, true) == 0);
+    editor_close(e);
+    printf("edit-cxho.3 focus: document/query typing, panel caret, Tab, F3/previous, Escape, Return, Ctrl+F/H passed; field mallocs=%zu document mallocs=%zu guard=%s\n",
+        field_allocations, document_allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    return 0;
+}
 static int g02_find_return(void)
 {
     static const char text[]="cat cat cat", query[]="cat";
@@ -6475,6 +6558,7 @@ static int close_review_contract(void)
     T(close_review_scroll() == 0); T(close_review_stdin() == 0); return 0;
 }
 static const test_selector selectors[] = {
+    {"--cxho3-focus", find_focus_contract},
     {"--close-review", close_review_contract},
     {"--close-review-hidden", close_review_hidden},
     {"--close-review-wide", close_review_wide},
@@ -6615,6 +6699,7 @@ int main(int argc, char **argv)
     T(palette_contract() == 0);
     T(menu_contract() == 0);
     T(g02_find_return() == 0);
+    T(find_focus_contract() == 0);
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);
     T(n6090_typing_top() == 0);

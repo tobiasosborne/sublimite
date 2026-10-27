@@ -1097,6 +1097,87 @@ static editor *panel_host(render_backend *backend, const char *path)
     editor *e=NULL; CHECK(editor_open(&e,&cfg,backend)==0); panel_settle(e);
     return e;
 }
+/* edit-cxho.3 (P): coordinates come from live grid cells and painted labels;
+ * offsets/lengths come from the literals, zero is success/first cell, one
+ * removes a NUL or selects the primary mouse button. Geometry/watchdog reuse
+ * panel_host/panel_settle. No timing or capacity budget is introduced. */
+static void panel_click(editor *e, uint32_t row, uint32_t column)
+{
+    plat_event ev = {.kind = PLAT_EV_BUTTON, .press = true, .code = 1,
+        .x = (int32_t)(column * e->grid.dims.cell_w),
+        .y = (int32_t)(row * e->grid.dims.cell_h)};
+    CHECK(editor_inject(e, &ev) == EDITOR_OK); panel_settle(e);
+    ev.press = false;
+    CHECK(editor_inject(e, &ev) == EDITOR_OK); panel_settle(e);
+}
+static uint32_t panel_toggle_column(editor *e)
+{
+    const render_grid *g = editor_grid(e);
+    size_t start = (size_t)(g->dims.rows - e->panel_rows) * g->dims.cols;
+    for (uint32_t c = 0; c < g->dims.cols; c++)
+        if (g->cells[start + c].glyph_index == '[') return c;
+    CHECK(false); return 0;
+}
+static void panel_focus_rows(void)
+{
+    render_backend backend = {0}; editor *e = panel_host(&backend, NULL);
+    panel_key(e, 'h', PLAT_MOD_CTRL); panel_text(e, "alpha");
+    panel_key(e, XKB_KEY_Tab, 0); panel_text(e, "beta");
+    uint32_t row = e->grid.dims.rows - e->panel_rows;
+    panel_click(e, row, (uint32_t)(sizeof "Find: a" - 1u));
+    panel_text(e, "X"); panel_query(e, "aXlpha", sizeof "aX" - 1u);
+    panel_click(e, row + 1u, (uint32_t)(sizeof "Replace: b" - 1u));
+    panel_text(e, "Y");
+    findui_state state = findui_get_state(&e->find);
+    CHECK(state.replacement_length == sizeof "bYeta" - 1u &&
+        state.replacement_cursor == sizeof "bY" - 1u);
+    CHECK(!memcmp(state.replacement, "bYeta", state.replacement_length));
+    /* Ctrl+H must select the query even when the replacement was last active. */
+    panel_click(e, e->tab_rows, e->lay.gw);
+    panel_key(e, 'h', PLAT_MOD_CTRL); panel_text(e, "alpha");
+    panel_query(e, "alpha", sizeof "alpha" - 1u);
+    state = findui_get_state(&e->find);
+    CHECK(!state.replacement_focus && state.replacement_length == sizeof "bYeta" - 1u);
+    CHECK(!memcmp(state.replacement, "bYeta", state.replacement_length));
+    panel_key(e, 'f', PLAT_MOD_CTRL); panel_text(e, "alpha");
+    uint32_t toggle = panel_toggle_column(e);
+    row = e->grid.dims.rows - e->panel_rows;
+    edit_malloc_guard_begin();
+    panel_click(e, row, toggle);
+    CHECK(findui_get_state(&e->find).options.regex != state.options.regex);
+    panel_click(e, row, toggle); /* restore, so later clicks retain the same summary width */
+    panel_click(e, row, toggle + (uint32_t)(sizeof "[  ] " - 1u));
+    CHECK(findui_get_state(&e->find).options.match_case != state.options.match_case);
+    panel_click(e, row, toggle + (uint32_t)(sizeof "[  ] [aa] " - 1u));
+    CHECK(findui_get_state(&e->find).options.whole_word != state.options.whole_word);
+    CHECK(edit_malloc_guard_end() == 0); /* (P) no allocations on the input path */
+    panel_query(e, "alpha", sizeof "alpha" - 1u);
+    editor_close(e);
+    puts("edit-cxho.3 find panel: query/replacement cell clicks and option toggles passed");
+}
+static void panel_focus_document_areas(void)
+{
+    const bool in_minimap[] = {false, true}; /* (P) gutter and minimap hit regions */
+    for (size_t i = 0; i < sizeof in_minimap / sizeof *in_minimap; i++) {
+        render_backend backend = {0}; editor *e = panel_host(&backend, NULL);
+        panel_key(e, 'f', PLAT_MOD_CTRL); panel_text(e, "alpha");
+        panel_click(e, e->tab_rows, in_minimap[i] ? e->text_grid.dims.cols : 0);
+        panel_text(e, "x"); panel_query(e, "alpha", sizeof "alpha" - 1u);
+        const char *expected = in_minimap[i] ? "xalpha beta alpha" : "x";
+        same(e->tree, (const uint8_t *)expected, strlen(expected));
+        /* Tab changes retain document focus, then retain field focus. */
+        uint64_t added;
+        CHECK(editor_add_buffer(e, NULL, (const uint8_t *)"other", sizeof "other" - 1u, &added) == EDITOR_OK);
+        panel_settle(e); panel_text(e, "y");
+        same(e->tree, (const uint8_t *)"yother", sizeof "yother" - 1u);
+        panel_query(e, "alpha", sizeof "alpha" - 1u);
+        panel_key(e, 'f', PLAT_MOD_CTRL); panel_key(e, XKB_KEY_Page_Up, PLAT_MOD_CTRL);
+        panel_text(e, "beta"); panel_query(e, "beta", sizeof "beta" - 1u);
+        same(e->tree, (const uint8_t *)expected, strlen(expected));
+        editor_close(e);
+    }
+    puts("edit-cxho.3 find panel: gutter/minimap document focus and tab focus retention passed");
+}
 static void panel_matches(editor *e, uint64_t count)
 {
     findui_state state=findui_get_state(&e->find);
@@ -1221,13 +1302,15 @@ int main(void)
 {
     const char *panel_case=getenv("EDIT_CXHO_PANEL");
     if (panel_case) {
-        if (!strcmp(panel_case,"save")) panel_save_and_prompt();
+        if (!strcmp(panel_case,"focus")) { panel_focus_rows(); panel_focus_document_areas(); }
+        else if (!strcmp(panel_case,"save")) panel_save_and_prompt();
         else if (!strcmp(panel_case,"field")) panel_editing_chords();
         else panel_window_commands(panel_case);
         return 0;
     }
     if (getenv("EDIT_M15_PANEL")) { panel_editing_chords(); return 0; }
     panel_editing_chords();
+    panel_focus_rows(); panel_focus_document_areas();
     panel_window_commands("close"); panel_window_commands("switch");
     panel_window_commands("goto"); panel_window_commands("menu"); panel_window_commands("palette");
     panel_save_and_prompt();

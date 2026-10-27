@@ -310,6 +310,7 @@ struct editor {
     } menu;
     uint64_t find_id, find_source_generation, find_buffer_revision, find_revision, find_replace_end;
     uint32_t panel_rows;
+    enum { EDITOR_FIND_DOCUMENT, EDITOR_FIND_FIELD } find_focus;
     int find_direction, find_error, find_replace_request;
     bool find_select_pending, find_replace_active, find_visible, find_navigated, find_field_all;
     uint8_t find_edit[FINDUI_QUERY_BYTES];
@@ -769,6 +770,7 @@ int editor_find_init(editor *e);
 void editor_find_close(editor *e);
 int editor_find_service(editor *e);
 bool editor_find_key(editor *e, const plat_event *ev);
+int editor_find_pointer(editor *e, const plat_event *ev, bool *handled);
 bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding);
 int editor_find_paste(editor *e, const uint8_t *bytes, size_t length, bool replacement);
 int editor_find_paint(editor *e);

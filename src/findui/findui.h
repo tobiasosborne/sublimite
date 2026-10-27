@@ -169,4 +169,16 @@ findui_code findui_render(const findui_panel *panel, render_grid *grid,
                          uint32_t first_row, uint32_t row_count,
                          const findui_style *style);
 
+/* Cell geometry shared with rendering; row is relative to the panel.
+ * Labels clamp to the field start, blank field cells to its end. Escaped
+ * bytes map to their byte start; cursor includes horizontal field scroll. */
+typedef enum findui_hit_kind {
+    FINDUI_HIT_NONE, FINDUI_HIT_QUERY, FINDUI_HIT_REPLACEMENT,
+    FINDUI_HIT_REGEX, FINDUI_HIT_CASE, FINDUI_HIT_WORD
+} findui_hit_kind;
+typedef struct findui_hit { findui_hit_kind kind; size_t cursor; } findui_hit;
+findui_code findui_hit_test(const findui_panel *panel, uint32_t columns,
+                           uint32_t row_count, uint32_t row, uint32_t column,
+                           findui_hit *hit);
+
 #endif

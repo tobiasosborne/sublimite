@@ -169,7 +169,8 @@ int editor_full_layout(editor *e)
     if (s.visual_byte > total) s.visual_byte = e->v.state.visual_byte = s.first_byte;
     uint32_t hs = s.hscroll > UINT32_MAX ? UINT32_MAX : (uint32_t)s.hscroll;
     layout_viewport vp = {s.first_byte, s.first_line, hs, e->buffer->lines};
-    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
+    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) &&
+        (!e->find_visible || e->find_focus==EDITOR_FIND_DOCUMENT) ? s.selection.cursor : UINT64_MAX, s.visual_end);
     layout_set_selection(&e->lay, min64(s.selection.cursor, s.selection.anchor), max64(s.selection.cursor, s.selection.anchor));
     e->extra_rows = false; e->full_pending = false;
     /* Establish the incoming gutter/text width before asking for a visual
@@ -210,7 +211,8 @@ static int refresh_cursor(editor *e, uint64_t old_cursor, bool caret)
     int rc = editor_begin_frame(e); if (rc) return rc;
     e->paint_ready = false;
     view_state s = e->v.state;
-    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) ? s.selection.cursor : UINT64_MAX, s.visual_end);
+    layout_set_cursor_visual(&e->lay, e->visible && e->focused && tabs_count(&e->tabs) &&
+        (!e->find_visible || e->find_focus==EDITOR_FIND_DOCUMENT) ? s.selection.cursor : UINT64_MAX, s.visual_end);
     layout_set_selection(&e->lay, min64(s.selection.cursor, s.selection.anchor), max64(s.selection.cursor, s.selection.anchor));
     if (e->full_pending || !e->lay.src || s.first_byte != e->lay.first_byte || s.first_line != e->lay.first_line ||
         (!s.wrap && s.hscroll != e->lay.hscroll) || (s.wrap && s.visual_byte != e->row_byte[0]))
@@ -569,7 +571,7 @@ static int resize(editor *e)
     e->resize_pending = false;
     return editor_resize_now(e, e->resize_w, e->resize_h);
 }
-static int nonkey(editor *e, const plat_event *ev)
+static int nonkey_dispatch(editor *e, const plat_event *ev)
 {
     /* P: button identity belongs to the chain even on clipboard dispatch. */
     if (ev->kind == PLAT_EV_BUTTON && ev->press && ev->code != e->click_button) e->click_ns = 0;
@@ -603,6 +605,20 @@ static int nonkey(editor *e, const plat_event *ev)
         return e->buffer->source_stale && !editor_event_control(e, ev) ? 0 : editor_pointer(e, ev);
     }
     return 0;
+}
+static int nonkey(editor *e, const plat_event *ev)
+{
+    bool field_focused=e->find_focus==EDITOR_FIND_FIELD;
+    bool handled=false;
+    int rc=editor_find_pointer(e,ev,&handled);
+    if (!rc && !handled) rc=nonkey_dispatch(e,ev);
+    if (!rc && field_focused!=(e->find_focus==EDITOR_FIND_FIELD)) {
+        /* Transfer focus before dispatch, repaint after the pointer used the
+         * currently painted hit map to place the document selection. */
+        editor_restart_blink(e,trace_now_ns());
+        rc=editor_full_layout(e);
+    }
+    return rc;
 }
 void editor_restart_blink(editor *e, uint64_t now)
 {

@@ -64,13 +64,24 @@ static size_t escaped(uint8_t byte, uint8_t *output)
     output[0] = '\\'; output[1] = 'x'; output[2] = (uint8_t)digits[byte >> 4u];
     output[3] = (uint8_t)digits[byte & 15u]; return 4;
 }
+/* edit-cxho.3 (P): printable ASCII occupies one cell; the existing \\xHH
+ * escape occupies sizeof "\\xHH" minus its terminator. Zero is the first
+ * cell/absence, one advances a cell or removes a terminator. */
+static size_t byte_cells(uint8_t byte)
+{
+    return byte >= ' ' && byte <= '~' ? 1u : sizeof "\\xHH" - 1u;
+}
+static size_t field_scroll(const uint8_t *bytes, size_t cursor, uint32_t width)
+{
+    size_t cursor_column = 0;
+    for (size_t i = 0; i < cursor; i++) cursor_column += byte_cells(bytes[i]);
+    return cursor_column >= width ? cursor_column - width + 1u : 0;
+}
 static void field(painter *paint, uint32_t column, uint32_t width, const uint8_t *bytes,
                    size_t length, size_t cursor, bool focus)
 {
     if (!width) return;
-    size_t cursor_column = 0;
-    for (size_t i = 0; i < cursor; i++) cursor_column += bytes[i] >= 32 && bytes[i] <= 126 ? 1u : 4u;
-    size_t scroll = cursor_column >= width ? cursor_column - width + 1 : 0;
+    size_t scroll = field_scroll(bytes, cursor, width);
     size_t virtual_column = 0;
     for (size_t i = 0; i <= length; i++) {
         uint8_t output[4];
@@ -82,6 +93,63 @@ static void field(painter *paint, uint32_t column, uint32_t width, const uint8_t
         }
         if (virtual_column >= scroll + width) break;
     }
+}
+static uint32_t summary_width(uint32_t remaining, size_t length)
+{
+    /* (P) retain the painter's two-cell minimum field/gap allowance. */
+    return remaining > length + 2u ? (uint32_t)length : 0;
+}
+findui_code findui_hit_test(const findui_panel *panel, uint32_t columns,
+                           uint32_t row_count, uint32_t row, uint32_t column,
+                           findui_hit *hit)
+{
+    const findui_impl *impl = panel ? panel->private_ : NULL;
+    if (!impl || !hit || !columns || row >= row_count || column >= columns)
+        return FINDUI_ERR_ARGUMENT;
+    *hit = (findui_hit){FINDUI_HIT_NONE, 0};
+    if (!impl->state.open) return FINDUI_OK;
+    const findui_state *state = &impl->state;
+    char summary[128]; /* (P) same status buffer as findui_render below */
+    size_t length = status(state, summary);
+    uint32_t start = (uint32_t)(sizeof "Find: " - 1u);
+    if (start > columns) start = columns;
+    uint32_t summary_cells = summary_width(columns - start, length);
+    uint32_t width = columns - start - (summary_cells ? summary_cells + 1u : 0);
+    bool status_row = row == 1u && !state->replace_mode;
+    if ((row == 0 && summary_cells && column >= columns - summary_cells) || status_row) {
+        uint32_t local = status_row ? column : column - (columns - summary_cells);
+        /* (P) toggle spans exclude their separating space, matching status(). */
+        const size_t regex_end = sizeof "[  ]" - 1u;
+        const size_t case_start = sizeof "[  ] " - 1u;
+        const size_t case_end = sizeof "[  ] [aa]" - 1u;
+        const size_t word_start = sizeof "[  ] [aa] " - 1u;
+        const size_t word_end = sizeof "[  ] [aa] [ ]" - 1u;
+        if (local < regex_end) hit->kind = FINDUI_HIT_REGEX;
+        else if (local >= case_start && local < case_end) hit->kind = FINDUI_HIT_CASE;
+        else if (local >= word_start && local < word_end) hit->kind = FINDUI_HIT_WORD;
+        return FINDUI_OK;
+    }
+    bool replacement = row == 1u && state->replace_mode;
+    if (row && !replacement) return FINDUI_OK;
+    if (replacement) {
+        start = (uint32_t)(sizeof "Replace: " - 1u);
+        if (start > columns) start = columns;
+        width = columns - start;
+    }
+    hit->kind = replacement ? FINDUI_HIT_REPLACEMENT : FINDUI_HIT_QUERY;
+    const uint8_t *bytes = replacement ? state->replacement : state->query;
+    length = replacement ? state->replacement_length : state->query_length;
+    size_t cursor = replacement ? state->replacement_cursor : state->query_cursor;
+    if (!width) return FINDUI_OK;
+    uint32_t local = column > start ? column - start : 0;
+    if (local >= width) local = width - 1u;
+    size_t target = field_scroll(bytes, cursor, width) + local, at = 0;
+    while (hit->cursor < length) {
+        size_t cells = byte_cells(bytes[hit->cursor]);
+        if (at + cells > target) break;
+        at += cells; hit->cursor++;
+    }
+    return FINDUI_OK;
 }
 findui_code findui_render(const findui_panel *panel, render_grid *grid, uint32_t first_row,
                          uint32_t row_count, const findui_style *style)
@@ -114,11 +182,11 @@ findui_code findui_render(const findui_panel *panel, render_grid *grid, uint32_t
     uint32_t column = text(&paint, 0, "Find: ", true);
     char summary[128]; size_t summary_length = status(&impl->state, summary);
     uint32_t remaining = grid->dims.cols - column;
-    uint32_t summary_width = remaining > summary_length + 2 ? (uint32_t)summary_length : 0;
-    uint32_t field_width = remaining - (summary_width ? summary_width + 1 : 0);
+    uint32_t summary_cells = summary_width(remaining, summary_length);
+    uint32_t field_width = remaining - (summary_cells ? summary_cells + 1 : 0);
     field(&paint, column, field_width, impl->query, impl->state.query_length,
           impl->state.query_cursor, !impl->state.replacement_focus);
-    if (summary_width) (void)text(&paint, grid->dims.cols - summary_width, summary, true);
+    if (summary_cells) (void)text(&paint, grid->dims.cols - summary_cells, summary, true);
     if (row_count >= 2) {
         paint.row++;
         if (impl->state.replace_mode) {

@@ -296,6 +296,7 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
     case KEYS_ACTION_FIND_IN_FILES: /* edit-n95: Where field mode; cancels a running search */
         (void)editor_find_service(e);
         e->find_visible=true;
+        e->find_focus=EDITOR_FIND_FIELD;
         (void)findui_show(&e->find,true,false);
         editor_fif_show(e);
         field_select_all(e); keys_reset(&e->keys);
@@ -309,7 +310,9 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         (void)editor_find_service(e);
         e->fif.mode=false;
         e->find_visible=true;
+        e->find_focus=EDITOR_FIND_FIELD;
         (void)findui_show(&e->find,true,binding->action==KEYS_ACTION_REPLACE);
+        (void)findui_focus_replacement(&e->find,false);
         field_select_all(e); keys_reset(&e->keys);
         e->find_error=geometry(e); return true;
     case KEYS_ACTION_FIND_NEXT: case KEYS_ACTION_FIND_PREVIOUS:
@@ -317,12 +320,13 @@ bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *bin
         /* (P) findui_next's direction contract is negative/positive one. */
         navigate(e,binding->action==KEYS_ACTION_FIND_PREVIOUS ? -1 : 1); return true;
     case KEYS_ACTION_REPLACE_NEXT:
-        if (e->find_visible && findui_get_state(&e->find).replace_mode && !e->find_replace_active)
+        if (e->find_visible && e->find_focus==EDITOR_FIND_FIELD &&
+            findui_get_state(&e->find).replace_mode && !e->find_replace_active)
             replace_begin(e,false);
         return true;
     case KEYS_ACTION_TOGGLE_REGEX: case KEYS_ACTION_TOGGLE_CASE_SENSITIVE:
     case KEYS_ACTION_TOGGLE_WHOLE_WORD: {
-        if (!e->find_visible || e->find_replace_active) return true;
+        if (!e->find_visible || e->find_focus!=EDITOR_FIND_FIELD || e->find_replace_active) return true;
         findui_options options=findui_get_state(&e->find).options;
         if (binding->action==KEYS_ACTION_TOGGLE_REGEX) options.regex=!options.regex;
         else if (binding->action==KEYS_ACTION_TOGGLE_CASE_SENSITIVE) options.match_case=!options.match_case;
@@ -337,6 +341,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
 {
     if (!e->find.private_ || !ev->press) return false;
     if (!e->find_visible && !e->find_replace_active) return false;
+    if (e->find_focus!=EDITOR_FIND_FIELD && ev->keysym!=XKB_KEY_Escape) return false;
     bool altgr=(ev->mods&PLAT_MOD_ALTGR)!=0;
     bool ctrl=(ev->mods&PLAT_MOD_CTRL)!=0 && !altgr;
     bool shift=(ev->mods&PLAT_MOD_SHIFT)!=0;
@@ -362,6 +367,7 @@ bool editor_find_key(editor *e, const plat_event *ev)
     if (ev->keysym==XKB_KEY_Escape) {
         if (e->find_replace_active) { (void)findui_replace_cancel(&e->find); editor_find_replace_finish(e); }
         e->find_visible=false; e->find_select_pending=false; e->find_replace_request=0;
+        e->find_focus=EDITOR_FIND_DOCUMENT;
         e->fif.mode=false;
         e->find_error=geometry(e); return true;
     }
@@ -414,6 +420,8 @@ bool editor_find_key(editor *e, const plat_event *ev)
     } else if (ev->keysym==XKB_KEY_Tab && state.replace_mode) {
         (void)findui_focus_replacement(&e->find,!state.replacement_focus);
         field_select_all(e);
+    } else if (ev->keysym==XKB_KEY_Tab) {
+        /* A find-only panel has no second field; native Tab text is not a query byte. */
     } else {
         const uint8_t *bytes=state.replacement_focus ? state.replacement : state.query;
         size_t length=state.replacement_focus ? state.replacement_length : state.query_length;
@@ -441,6 +449,53 @@ bool editor_find_key(editor *e, const plat_event *ev)
     }
     (void)editor_begin_frame(e); return true;
 }
+int editor_find_pointer(editor *e, const plat_event *ev, bool *handled)
+{
+    *handled=false;
+    if (!e->find_visible || e->palette_open || e->menu.open>=0 || e->go.active ||
+        ev->kind!=PLAT_EV_BUTTON || !ev->press || ev->x<0 || ev->y<0) return 0;
+    /* (P) cell coordinates and half-open regions come from the live grid;
+     * zero is absence/first row, one removes a NUL or selects a primary press. */
+    uint32_t column=(uint32_t)ev->x/e->grid.dims.cell_w;
+    uint32_t row=(uint32_t)ev->y/e->grid.dims.cell_h;
+    if (column>=e->grid.dims.cols || row>=e->grid.dims.rows || row<e->tab_rows) return 0;
+    uint32_t first=e->grid.dims.rows-e->panel_rows;
+    if (row<first) { e->find_focus=EDITOR_FIND_DOCUMENT; return 0; }
+    e->find_focus=EDITOR_FIND_FIELD; *handled=true;
+    e->text_drag=false; e->map_drag=false; e->click_ns=0;
+    keys_reset(&e->keys); undo_break_burst(e->undo);
+    if (ev->code!=1 || e->find_replace_active) return editor_begin_frame(e);
+    if (e->fif.mode && row==first+1u) {
+        /* (P) Where paints one byte per cell; reuse its existing cursor scroll. */
+        uint32_t start=(uint32_t)(sizeof "Where: "-1u);
+        uint32_t width=e->grid.dims.cols>start+1u ? e->grid.dims.cols-start-1u : 0;
+        size_t scroll=e->fif.where_cursor>width ? e->fif.where_cursor-width : 0;
+        size_t at=scroll+(column>start ? column-start : 0);
+        e->fif.where_cursor=at<e->fif.where_length ? at : e->fif.where_length;
+        e->fif.where_focus=true; e->fif.where_all=false; e->find_field_all=false;
+        return editor_begin_frame(e);
+    }
+    findui_hit hit;
+    findui_code code=findui_hit_test(&e->find,e->grid.dims.cols,e->panel_rows,row-first,column,&hit);
+    if (code!=FINDUI_OK) { e->find_error=(int)code; return editor_begin_frame(e); }
+    findui_state state=findui_get_state(&e->find);
+    if (hit.kind==FINDUI_HIT_QUERY || hit.kind==FINDUI_HIT_REPLACEMENT) {
+        bool replacement=hit.kind==FINDUI_HIT_REPLACEMENT;
+        (void)findui_focus_replacement(&e->find,replacement);
+        if (replacement) {
+            memcpy(e->find_edit,state.replacement,state.replacement_length);
+            (void)findui_set_replacement(&e->find,e->find_edit,state.replacement_length,hit.cursor);
+        } else (void)findui_set_query_cursor(&e->find,hit.cursor);
+        e->fif.where_focus=false; e->find_field_all=false;
+    } else if (hit.kind!=FINDUI_HIT_NONE) {
+        findui_options options=state.options;
+        if (hit.kind==FINDUI_HIT_REGEX) options.regex=!options.regex;
+        else if (hit.kind==FINDUI_HIT_CASE) options.match_case=!options.match_case;
+        else options.whole_word=!options.whole_word;
+        e->find_error=(int)findui_set_options(&e->find,options); e->find_navigated=false;
+    }
+    return editor_begin_frame(e);
+}
 int editor_find_paint(editor *e)
 {
     if (e->palette_open) return editor_palette_paint(e);
@@ -452,7 +507,20 @@ int editor_find_paint(editor *e)
     if (findui_render(&e->find,&e->grid,e->grid.dims.rows-e->panel_rows,e->panel_rows,&style)!=FINDUI_OK)
         return EDITOR_ERR_ARG;
     editor_fif_paint(e,e->grid.dims.rows-e->panel_rows,e->panel_rows); /* edit-n95 */
-    if (e->find_field_all && !(e->fif.mode && e->fif.where_focus)) {
+    if (e->find_focus!=EDITOR_FIND_FIELD) {
+        /* The panel renderer already identifies its caret cell. Restore that
+         * cell's ordinary ink after painting, retaining the query/highlights. */
+        size_t first=(size_t)(e->grid.dims.rows-e->panel_rows)*e->grid.dims.cols;
+        size_t end=(size_t)e->grid.dims.rows*e->grid.dims.cols;
+        for (size_t i=first;i<end;i++) {
+            render_cell *cell=&e->grid.cells[i];
+            if (cell->attrs&RENDER_ATTR_CURSOR) {
+                cell->attrs=(uint16_t)(cell->attrs&~RENDER_ATTR_CURSOR);
+                cell->fg=style.foreground; cell->bg=style.background;
+            }
+        }
+    }
+    if (e->find_focus==EDITOR_FIND_FIELD && e->find_field_all && !(e->fif.mode && e->fif.where_focus)) {
         findui_state state=findui_get_state(&e->find);
         uint32_t row=e->grid.dims.rows-e->panel_rows;
         uint32_t column=(uint32_t)(sizeof "Find: "-1u);
