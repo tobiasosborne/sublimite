@@ -1,0 +1,953 @@
+{
+ "minimap_render": {
+  "summary": "Both defects reproduced on Xvfb :91 with the frozen binary. (a) Empty-tab bands: they appear when the last tab is closed (Ctrl+W on the only file). The editor then falls back to the special buffer `e->empty` (src/editor/buffers.c:357), which is never installed in `e->buffers[]`. The minimap worker publication path (`editor_map_receive` and `editor_map_service` in src/editor/minimap.c, both loop only over `e->buffers[]`) can never find it. The first job leaves `b->map_snapshot` set forever, so `map_due()` stays false and the map is never filled. Compose then takes the \"not retained\" branch in src/editor/paint.c:~295-301 and src/minimap/minimap.c:~233-262, which draws the pending scrollbar. For a 1-line buffer, every row satisfies `row_line(0) < end`, so the whole strip is a \"viewport\" with edge column, 3 occupied columns and wash. That gives the bright/mid/dark vertical bands. In my repro the tab strip was also blank, matching Tobias's screenshot (no tab row). A fresh Ctrl+N, a launch with no file, and a zero-byte file all render correctly (a single thin line at row 0), because those buffers are installed as tabs. (b) Fragmented stripes on big files: files over MINIMAP_SMALL_BYTES (64 KiB) or 20000 lines use `large_rows()` (src/minimap/minimap.c:~118-145). It takes at most min(256, active_rows, file_bytes/LINEIDX_CHUNK) samples, one per 64 KiB chunk, and every row in a group copies the one sample line's marks. Tobias's CONTENTS.md is 640943 bytes, so ceil(640943/65536)=10 chunks and 10 samples shared by ~1000 map rows (about 100 identical rows each). Identical marks on every row give vertical stripes. A sample landing on a blank, short or closing-tag line gives a blank gap. My 358 KB, 8000-line repro has 6 samples and shows the same pattern (a short-line band at the top, blank gaps, a stripe band). The viewport is small because it is drawn truthfully at squeeze scale: 14 px for 56 lines of 8000 (rows pixels = ~1003 for 8000 lines, ~8 lines/row). Tobias's \"thin line\" is the same effect, and Sublime avoids it with a fixed-scale minimap that scrolls with the document.",
+  "findings": [
+   {
+    "title": "Closed-last-tab empty buffer never gets a minimap; strip shows pending-scrollbar garbage",
+    "detail": "close_tab then editor_activate selects e->empty. map_due() allows the job, editor_map_service takes a snapshot and submits prepare_map, but editor_map_receive and the snapshot-release loop iterate only e->buffers[], which does not contain e->empty (created via editor_buffer_prepare at open.c:230, never install()ed). The map message is dropped and b->map_snapshot is never released, so map_due is false forever. Compose draws the not-retained pending scrollbar: a 1-line buffer marks every row as viewport, giving edge column, 3 occupied columns, wash and a stale bar over the full height.",
+    "evidence": "Repro: fresh XDG dirs, launch with a small .md, Ctrl+W: /tmp/claude-1000/-home-tobias-Projects-sublimite/3dfb7436-2086-45df-b788-60ade1f4789a/scratchpad/minimap-render/c1.png and c2c.png show the same 3-band strip as shot-empty-tab.png. Code: src/editor/buffers.c:357, src/editor/open.c:230, src/editor/minimap.c:25-46 and 66-79, src/editor/paint.c:285-301, src/minimap/minimap.c:~233-262",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Pending (unfilled) minimap draws a full-height viewport for tiny buffers",
+    "detail": "In the not-retained branch of minimap_fill, viewport = first_line<end && row_line<end && first_line<=next_line, where row_line = scale(lines, r, rows). With lines=1 that is 0 for every row, so all rows are in the viewport. The pending scrollbar should draw nothing, or one row, when lines < rows. This amplifies defect 1 and would show for any buffer whose map is pending (e.g. 1-line file during index build).",
+    "evidence": "src/minimap/minimap.c:~232-240 (row_line/next_line computation); same rule duplicated in map_grab at src/editor/paint.c:~372-377",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Large-file minimap uses <=256 chunk-level samples shared across all rows, giving vertical stripes and blank gaps",
+    "detail": "large_rows(): samples = min(active_rows, 256, chunks) with chunks = ceil(len/65536). Each row copies the marks of its group's one sample (memcpy of sample.marks). A 640943-byte file gets 10 samples for ~1000 rows. Rows in a group are identical, so ticks form vertical stripes; blank or short sample lines leave blank bands.",
+    "evidence": "src/minimap/minimap.c:~118-145; header comment minimap.h:15-21; repro /tmp/claude-1000/-home-tobias-Projects-sublimite/3dfb7436-2086-45df-b788-60ade1f4789a/scratchpad/minimap-render/b0.png (8000-line, 358199-byte file, 6 samples) vs shot-big-file.png; pixel column profile showed x=3170 marks from y=33 onward and x=3190 blank from y=45 to 699",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Viewport indicator is a thin line on big files because the minimap is squeezed, not fixed-scale",
+    "detail": "The minimap maps all lines onto height rows (lines_per_row=ceil(lines/height)). A 56-line viewport in an 8000-line file is 14 px in my repro (y=31..44 in b0.png); with CONTENTS.md (9167 lines) it is ~11 px. Sublime uses a fixed per-line scale and scrolls the minimap with the document, so the viewport box keeps a constant, readable height and the miniature shows real text near the viewport.",
+    "evidence": "pixel profile at x=3190 in b0.png: edge at y=31 and y=44 (14 px band); src/minimap/minimap.c minimap_prepare lines_per_row; src/editor/paint.c:~285-310",
+    "severity": "friction"
+   },
+   {
+    "title": "Frozen binary placed single-file session restore untitled tabs",
+    "detail": "Relaunching with the same XDG_DATA_HOME restored two extra 'untitled *' tabs, so closing the file did not hit the zero-tab state until a fresh profile was used. Not a bug in itself; noted for repro hygiene (use a fresh XDG dir).",
+    "evidence": "b1.png and z1s.png in /tmp/claude-1000/-home-tobias-Projects-sublimite/3dfb7436-2086-45df-b788-60ade1f4789a/scratchpad/minimap-render/",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "(a) e->empty (the zero-tab fallback buffer) is not registered in e->buffers[], and editor_map_receive/editor_map_service only iterate e->buffers[]; large.c:355 already special-cases e->empty for other messages, minimap.c does not. The map job's snapshot is therefore never published or released, and the pending-scrollbar fallback is what stays on screen.",
+   "(a') The pending-scrollbar fallback is not sane for lines<rows: all rows count as viewport, so it paints a full-height framed band.",
+   "(b) large_rows() samples one line per 64 KiB chunk (<=256) and broadcasts it to every row in the group; row count (~1000) greatly exceeds sample count (10 for a 640 KB file). This is an explicit design limit in minimap.h, not a rendering bug.",
+   "(b') The minimap is a squeeze-to-height design: viewport height = visible_lines * height/lines is tiny for big files, unlike Sublime's fixed-scale scrolling minimap."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Minimap: zero-tab empty buffer (e->empty) never gets its map published",
+    "scope": "Make editor_map_receive and editor_map_service also consider e->empty (as large.c:355 does), or give e->empty map_sync_fill=true so compose prepares its trivial map synchronously. Then pending-state bands cannot persist after the last tab is closed.",
+    "acceptance": "Failing test first in tests/editor_test.c: open one file, close its tab (tabs_count==0), step the editor until idle, assert e->empty->map.filled and !map.stale, and that the minimap pixel region is background-only except the viewport row (no stale-color column, no wash below row 0). Red before fix, green after. make check green. Screenshot on private Xvfb of Ctrl+W on the last tab shows the thin single-row viewport like a fresh untitled tab.",
+    "files": "src/editor/minimap.c, src/editor/open.c (if sync flag route), tests/editor_test.c",
+    "size": "S"
+   },
+   {
+    "title": "Minimap pending scrollbar: do not mark every row as viewport when lines < rows",
+    "scope": "In minimap_fill not-retained branch and the mirrored map_grab calc, compute viewport rows by clamped row mapping so a 1-line buffer lights one row; keep the stale edge bar.",
+    "acceptance": "Failing test first in tests/minimap_test.c: fill with a fresh (unfilled) map, lines=1, rows=100, assert viewport edge/wash cells only in row 0. Also map_grab test for the same inputs. make check green.",
+    "files": "src/minimap/minimap.c, src/editor/paint.c, tests/minimap_test.c",
+    "size": "S",
+    "depends_on": "none (independent of the e->empty bead; should land after it to avoid masking)"
+   },
+   {
+    "title": "Minimap large-file sampling: one sample per row at proportional byte offsets",
+    "scope": "Replace large_rows' group-of-chunks sampling with per-row sampling: row r reads MINIMAP_SAMPLE_BYTES at byte floor(len*r/active_rows), skips to the next line start, and marks that line. Cost remains O(height*256) reads, independent of file size (derivation: ~1000 rows x 256 B = ~256 KB per prepare). Update minimap.h comment and drop MINIMAP_MAX_SAMPLES cap.",
+    "acceptance": "Failing test first in tests/minimap_test.c: build a >64 KiB, 10-chunk file whose lines differ per region; assert that adjacent rows in different 1/1000 slices can have different marks, and that no more than 3 consecutive rows are identical when the underlying lines differ (the current code yields ~100). Fuzz op in fuzz/minimap_fuzz.c still green; bench/minimap_bench prints p50/p99 stamped with power status and load (tracked only). Screenshot of the 8000-line repro on Xvfb shows ticks continuous top to bottom with no blank bands.",
+    "files": "src/minimap/minimap.c, src/minimap/minimap.h, tests/minimap_test.c, fuzz/minimap_fuzz.c",
+    "size": "M"
+   },
+   {
+    "title": "Minimap fixed-scale mode (Sublime-style): scrolling miniature with constant viewport box height for big files",
+    "scope": "For files with lines > rows, draw at a fixed scale (e.g. 2 px per summary line as already specified in minimap_pixels, one row per source line / wrapped row), keep the viewport box at visible_lines*scale, and scroll the minimap window proportionally to the document scroll fraction. Update hit/drag mapping (map_grab, minimap_hit) accordingly. Needs worker-prepared rows per displayed window, so depends on the sampling bead. Coordinate with the sibling research topic on minimap navigation/drag and edit-2mhd.",
+    "acceptance": "Failing test first: in tests/editor_test.c, a 9000-line buffer with a 50-line viewport has a viewport band of at least visible_lines*2 px (100 px) tall and scrolling by one screen moves the minimap window by less than the band height; click/drag at the band centre does not move first_line. make check green; before/after screenshots at 3296x2060 on Xvfb.",
+    "files": "src/minimap/minimap.c, src/minimap/minimap.h, src/editor/paint.c, src/editor/minimap.c, tests/editor_test.c, tests/minimap_test.c",
+    "size": "L",
+    "depends_on": "Minimap large-file sampling bead"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Do you want the Sublime-style fixed-scale scrolling minimap (large bead) or just fix the stripes and keep the squeezed whole-file overview?",
+   "Is the empty-tab state in your screenshot what you see after closing the last tab (no tab strip, no caret), or did you see it on a normal untitled tab too? My repro only hits it after closing the last tab; fresh untitled tabs render correctly.",
+   "Should closing the last tab arguably open a fresh untitled tab instead of showing the tab-less empty state? That would make the e->empty path unreachable."
+  ]
+ },
+ "minimap_model": {
+  "summary": "Our minimap fits the whole document into the strip (K=ceil(lines/705) lines per 2 px row), so the viewport box is ceil(visible/K)*2 px: 4 px at 20k lines, 2 px at 200k. Files over 64 KiB or 20000 lines use a 256-sample striped density map. Drag on sampled files resolves pointer to a byte fraction while the box is painted from the line number; measured on a skewed-line 20k file, pointer y=300 puts the box at y=687 (387 px off). Proposal: cheap consistency fix, then a Sublime-like windowed model (fixed 2 px/line, constant 90 px box, scrollbar-style window, miniature of window lines only, byte-fraction fallback while indexing). Sublime facts are secondhand (forum, unofficial docs).",
+  "findings": [
+   {
+    "title": "Viewport box is 2 to 4 px tall on large files",
+    "detail": "Map rows=(text px)/2 (~705); K=ceil(lines/rows); box=ceil(visible/K)*2 px. Measured 4 px at 20k lines (20000/705=28.4, K=29, 45/29 -> 2 rows), 2 px at 200k.",
+    "evidence": "src/minimap/minimap.c:196-198,359-364; src/editor/open.c:205-206; scratchpad/minimap-model/meas.py",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Drag uses byte fraction, paint uses line number",
+    "detail": "For sampled (>64 KiB or >20000 lines) or stale maps, drag calls minimap_hit_approx (byte=len*row/(rows-1)) then editor_scroll_seek; the box is painted from first_line/K. Measured skewed 20k file (lines 0-9999 22 B, rest 87 B): pointer 100->box 197/line 2416; 300->687/9525; 500->835/11677; 700->959/13474; 900->1083/15272; 1100->1207/17070; 1300->1331/18867; 1430->1407/19956. Uniform 20k file: 100->97/960; 300->293/3810; 500->491/6676; 700->689/9541; 900->889/12442; 1100->1089/15345; 1300->1283/18179; 1430->1407/19956; return trip stable. First line decoded from a 15-bit pixel code per line; Xvfb :92 raster, BAT0 Not charging, load 1.42.",
+    "evidence": "src/editor/paint.c:430-440; src/minimap/minimap.c:410-419; scratchpad/minimap-model/drag.py and data/*.txt",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Sampled large-file map is stripes, not a miniature",
+    "detail": "large_rows takes <=256 samples of 256 bytes at chunk boundaries and repeats them across adjacent rows.",
+    "evidence": "src/minimap/minimap.c:161-187; shot-big-file.png",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Press on a 4 px box nearly always counts as outside and jumps",
+    "detail": "map_grab recognises only presses inside the painted band; with a tiny band the press centres the box and scrolls (code reading).",
+    "evidence": "src/editor/paint.c:341-396",
+    "severity": "friction"
+   },
+   {
+    "title": "Sublime behaviour (secondhand)",
+    "detail": "Click warps to clicked position; dragging inside the box acts like a scrollbar; always_show_minimap_viewport default false (hover only); draw_minimap_border; minimap_scroll_to_clicked_text; map does not hold the whole file on long files. Fixed scale constant undocumented; official settings page lists no minimap keys.",
+    "evidence": "https://forum.sublimetext.com/t/minimap-scroll-behavior-has-some-issues/2866 ; https://forum.sublimetext.com/t/bug-minimap-does-not-scroll-to-cursor-on-large-files/18201 ; https://sublime-text-unofficial-documentation.readthedocs.io/en/latest/reference/settings.html",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "Whole-document-to-strip mapping with K lines per row collapses box height to the 1-row minimum; no minimap scroll offset exists.",
+   "Paint is line-based but drag on sampled/stale maps is byte-based.",
+   "Sampling is whole-file (<=256 repeated samples) rather than a bounded window of real lines.",
+   "Row 0..rows-1 maps to lines 0..N-1 instead of box top over 0..N-visible, so not scrollbar-exact near the end."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Minimap drag: line-exact hit for sampled files once index complete",
+    "scope": "Use minimap_hit exact path (one LINEIDX_CHUNK=65536 scan) when sampled but index_ready and fresh; keep hit_approx only while indexing/stale.",
+    "acceptance": "Failing test first in tests/editor_test.c: >64 KiB file with 10000 short + 10000 long lines, drag to 50% of strip, box top within 1 row of (pointer-grab)/2; red on main, green after.",
+    "files": "src/editor/paint.c, tests/editor_test.c",
+    "size": "S"
+   },
+   {
+    "title": "minimap_window pure fixed-scale mapping",
+    "scope": "Pure functions: N, v, s=2 px, H, f -> window offset, box top, height v*s; inverse f=top*(N-v)/(H-v*s); byte-fraction variant.",
+    "acceptance": "Failing tests first in tests/minimap_test.c: constant box height for N 100..1e7; round trip within 1 step; top spans 0..H-box as f spans 0..N-v; fuzz op for bounds.",
+    "files": "src/minimap/minimap.h, src/minimap/minimap.c, tests/minimap_test.c, fuzz/minimap_fuzz.c",
+    "size": "M"
+   },
+   {
+    "title": "Window miniature replaces 256-sample path",
+    "scope": "Summarise only the ~705 real lines in the window (<=80 B each) on the worker snapshot; unindexed anchors at byte fraction snapped to a line start.",
+    "acceptance": "Failing test first: 200k-line source, window at line 150000, row i marks equal line 150000+i marks; counting source bounds reads; bench stamped with power/load.",
+    "files": "src/minimap/minimap.c, src/editor/minimap.c, tests/minimap_test.c, bench/minimap_bench.c",
+    "size": "L",
+    "depends_on": "minimap_window pure mapping"
+   },
+   {
+    "title": "Editor glue: constant box, scrolling minimap, 1:1 drag",
+    "scope": "Paint box from window model; press inside grabs at offset; outside warps/centres; motion via scrollbar inverse; paint from pointer-derived value while dragging; byte-fraction while indexing.",
+    "acceptance": "Failing editor tests first: skew20k and 200k box height constant v*2 px and box_top==pointer-grab within 2 px at 10 pointer ys (red today: 387 px); bottom clamp; byte-space case while indexing; docs/decisions note.",
+    "files": "src/editor/paint.c, src/editor/input.c, src/editor/private.h, src/editor/minimap.c, tests/editor_test.c",
+    "size": "M",
+    "depends_on": "minimap_window pure mapping"
+   },
+   {
+    "title": "Minimap polish: wheel over strip, always_show_viewport and draw_border keys",
+    "scope": "Optional wheel scroll and two Sublime-named config keys.",
+    "acceptance": "Config test for both keys; paint test per setting; wheel step moves first_line by step*(N-v)/(H-v*s).",
+    "files": "src/config/, src/editor/paint.c, src/editor/input.c, tests/config_test.c, tests/editor_test.c",
+    "size": "S",
+    "depends_on": "glue bead"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Fixed scale: 2 px per line (existing spec, 90 px box at 45 lines) or per your Sublime screenshot? I could not see the second screenshot.",
+   "Click outside the box: warp box to pointer (proposed) or jump view to clicked text?",
+   "Viewport box always shown (today) or hover-only like Sublime default?",
+   "While a huge file indexes: approximate byte-fraction map with a small jump on completion, or pending bar only as today?"
+  ]
+ },
+ "find_ux": {
+  "summary": "Our find is a one-row, character-grid panel at the bottom of the window (src/editor/findpanel.c plus src/findui). Matching and replace are solid: all-match highlighting, N/M count, regex/case/word toggles on Alt+R/C/W, Enter and Shift+Enter, F3 and Shift+F3 with the panel closed, Ctrl+H replace, Find in Files. Almost everything that fails to feel like Sublime is ergonomics and focus. I confirmed these on Xvfb :93 with the frozen binary. (1) While the panel is open it swallows every global chord: Ctrl+W (tab stayed), Ctrl+S, Ctrl+Z and Ctrl+Tab did nothing. This is the 'find then kill the tab is weird' complaint, caused by the 'consumed no-op' rule at findpanel.c:~383-391. (2) Clicking in the buffer does not move focus out of the field, so typing after a click still goes into the Find field. (3) Typing a query does not move the selection or scroll. On a 300-line file, typing 'line 250' showed count 1/1 with the view still at line 0, and only Enter jumped. Sublime selects and scrolls to the nearest match as you type. (4) Ctrl+F does not prefill from the selection; it re-selects the old query. Ctrl+E, Ctrl+Shift+E, Ctrl+F3/Ctrl+Shift+F3, Alt+F3 and Ctrl+I are all registered but marked KEYS_ARG_UNIMPLEMENTED in src/keys/keys.c. (5) Missing outright: Alt+Enter find-all (multi-select), in-selection, wrap toggle, highlight toggle, query history, Ctrl+Enter newline in the field, mouse use of the panel (the toggles are text such as '[aa]', not clickable), and a match count in the status bar (it is in the panel only). Escape closes the panel and keeps the selection, which matches Sublime. Web sources: the Sublime docs mirror https://docs.sublimetext.io/guide/usage/search-and-replace.html (shortcut tables) and https://github.com/SublimeTextIssues/Core/issues/1447 (toggle command names). The default keymap file and the official docs URLs returned 404, so panel focus semantics, incremental selection and prefill rules are recalled from experience (E), not quoted. Proposed order is focus and chord pass-through first, then incremental select, prefill and slurp, then find-all, then toggles and history.",
+  "findings": [
+   {
+    "title": "Open find panel swallows global chords (Ctrl+W, Ctrl+S, Ctrl+Z, Ctrl+Tab)",
+    "detail": "editor_find_key treats any Ctrl chord other than A/V/Left/Right/BackSpace/Enter as a consumed no-op, and Alt+non-Ctrl likewise. With the panel open, Ctrl+W did not close the tab, Ctrl+S did not save, Ctrl+Z did not undo and Ctrl+Tab did not switch tabs. This is the 'find then try to kill the tab' report. Only a short 'common' list (new, open, save-as, exit, scroll) bypasses the panel in editor_dispatch_action.",
+    "evidence": "src/editor/findpanel.c:~383-391 ('Ctrl+X (and unsupported global chords) is a consumed no-op'); src/editor/input.c:1076-1079; Xvfb :93 screenshots t2-ctrlw.png and u-all.png in scratchpad/find-ux",
+    "severity": "friction"
+   },
+   {
+    "title": "Clicking in the buffer leaves focus in the find field",
+    "detail": "The panel never yields focus. After clicking text in the buffer with the panel open, typing 'XY' went into the Find field, not the document. Sublime moves focus to the buffer on click and keeps the panel open. There is no mouse handling for the panel rows (no clicks on the field, toggles or replace field).",
+    "evidence": "scratchpad/find-ux/u-all.png (typed XY lands in Find: XY, document unchanged); findpanel.c has no pointer code; the only panel_rows references in input.c are the Escape path (1046) and overscan (1375)",
+    "severity": "friction"
+   },
+   {
+    "title": "No incremental select or scroll while typing",
+    "detail": "Typing a query highlights matches and updates N/M, but the selection and viewport do not move. On a 300-line file, typing 'line 250' left the view at line 0 with count 1/1. Only Enter jumps. Sublime selects and scrolls to the nearest match as you type. The Enter-commits-first-match rule (edit-g02) was a patch for this.",
+    "evidence": "scratchpad/find-ux/w.png (first panel: view at line 0, count 1/1; second panel after Enter: scrolled to line 250); docs/decisions/edit-g02.md",
+    "severity": "friction"
+   },
+   {
+    "title": "Ctrl+F does not prefill from the selection; Ctrl+E and friends are not implemented",
+    "detail": "Ctrl+F calls field_select_all on the old query. Selection prefill is absent. Ctrl+E (slurp_find), Ctrl+Shift+E, Ctrl+F3 and Ctrl+Shift+F3 (find_under), Alt+F3 (find_all_under) and Ctrl+I/Ctrl+Shift+I (incremental find) are keymap rows flagged KEYS_ARG_UNIMPLEMENTED. Ctrl+E and Ctrl+F3 did nothing in my run.",
+    "evidence": "src/keys/keys.c:89,93,126,148,151,178,204; src/editor/findpanel.c KEYS_ACTION_FIND case; scratchpad/find-ux/v.png (Find field still 'XY' after selecting text, Ctrl+E and Ctrl+F3 pressed)",
+    "severity": "friction"
+   },
+   {
+    "title": "Missing find options and actions",
+    "detail": "Absent: Alt+Enter find-all with multi-select, in-selection, wrap toggle, highlight-matches toggle, preserve case, query/replace history (Up/Down), Ctrl+Enter newline in the query. Wrap is implicit and cannot be switched off. The only options are regex, case and whole word.",
+    "evidence": "grep for in_selection, wrap_around, highlight_matches and find_all in src/editor and src/findui returns nothing; findui_options has only regex, match_case, whole_word (src/findui/findui.h:21)",
+    "severity": "friction"
+   },
+   {
+    "title": "Panel presentation is a single text row with ASCII toggles",
+    "detail": "A grid row reading 'Find: foo ... [  ] [aa] [ ] 1/2'. The toggles are not clickable, there are no icons, no Find/Find Prev/Find All buttons, and the match count lives only in the panel (no status bar). In replace mode three rows are used, including a hint row ('Ctrl+Enter: Replace  Ctrl+Alt+Enter: All  Tab: field  Esc: close'). Non-ASCII queries are shown as \\xHH escapes. This is the 'not nice' look, and it is tied to the design-hillclimb goal.",
+    "evidence": "src/findui/paint.c:90-136; screenshots s1-typed.png and t-all.png",
+    "severity": "polish"
+   },
+   {
+    "title": "Matches stay highlighted after the panel closes",
+    "detail": "After Escape (s3-esc), the 'foo' matches were still highlighted. The Escape handler only clears find_visible, so e->find_ranges keep painting from editor_find_service. I have not confirmed whether Sublime clears them on close (I believe it does unless highlight_matches is set). Please check before treating this as a bug.",
+    "evidence": "scratchpad/find-ux/montage.png (second/third rows); findpanel.c Escape branch and editor_find_service",
+    "severity": "polish"
+   },
+   {
+    "title": "Beads already open that overlap",
+    "detail": "edit-rsw (backlog): find-panel geometry() errors swallowed. edit-pam (backlog): silent drop of a third search while a job retires. edit-xkd (backlog): Astra drive 3 observations, including source text and minimap monochrome. Closed history: edit-g02 (Return semantics), edit-x8i (keymap), edit-2gx (Ctrl+F inserted text, F3/Ctrl+H), edit-457.6 (UI), edit-n95 and edit-338 (Find in Files).",
+    "evidence": ".beads/issues.jsonl",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "The find panel is modal by construction. editor_find_key (findpanel.c) runs before the global keymap for every key while find_visible is true, and consumes unknown Ctrl/Alt chords on purpose. There is no notion of 'panel open, focus in buffer'.",
+   "Panel state has one focus flag (replacement_focus) and no buffer-focus state. Only keyboard events reach the panel, and the click path in input.c has no panel hit-test, so focus cannot move by clicking.",
+   "Search is split into a worker 'preview' and an explicit navigate step. findui_next only runs from Enter or F3 (find_select_pending / find_navigated in findpanel.c), so typing never commits a selection or scroll. edit-g02 patched the symptom by making first Enter advance.",
+   "Sublime's find-adjacent commands exist as keymap rows with KEYS_ARG_UNIMPLEMENTED but have no handlers in editor_find_action (only FIND, REPLACE, FIND_NEXT/PREV, REPLACE_NEXT, TOGGLE_REGEX/CASE/WORD, FIND_IN_FILES, NEXT/PREVIOUS_RESULT).",
+   "findui_options carries only {regex, match_case, whole_word}; the search core has no in-selection or wrap parameters. Adding them touches src/findui and src/find, not only the editor glue."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Find panel: stop swallowing global chords; Esc/click return focus to buffer",
+    "scope": "In editor_find_key / editor_dispatch_action, let every bound global action (close tab, save, undo/redo, next/prev tab, new tab, open, go-to, palette, menu, font size) fall through to the normal dispatch while the panel is open. The panel keeps only its field-editing keys (printable text, Left/Right/Home/End, BackSpace/Delete, Ctrl+A/V, Enter, Tab, Escape, Alt+R/C/W/Enter, Ctrl+Enter). Closing, switching or saving a tab leaves the panel open and re-targets it to the new buffer through the existing editor_find_service source reset. Closing the last tab or exiting needs no special case beyond that.",
+    "acceptance": "Red test first, in tests/editor_test.c: open the panel, type a query, inject Ctrl+W and assert tab count decreases and the panel is still visible and bound to the new buffer; likewise Ctrl+S saves, Ctrl+Z undoes a document edit, Ctrl+Tab switches. Drive these through the editor's input-injection path (editor_handle_key, as the existing find-panel tests do) and run them red before the fix. Also assert printable keys still go to the field. Add a matrix test table of (panel state x chord) as a regression for the 'start a find then do something else' class. make check green.",
+    "files": "src/editor/findpanel.c, src/editor/input.c, tests/editor_test.c",
+    "size": "M"
+   },
+   {
+    "title": "Find panel: click in buffer moves focus to buffer (panel stays open); click on panel focuses its fields",
+    "scope": "Add a find_focus_buffer state. A mouse press in the text area sets it, so typing goes to the document, Escape then closes the panel, and F3/Enter-in-panel still work. Ctrl+F, Ctrl+H, F3-with-panel-closed and clicking the panel row restore field focus. Hit-test the panel rows: clicking the query or replace field places the caret, and clicking a toggle flips it. Toggles painted as [ ] text become clickable by cell column from paint.c's status().",
+    "acceptance": "Red tests: (a) open panel, click text, type 'X', assert the document gained 'X' and the query is unchanged; (b) click panel row, type, assert the query changed; (c) click a '[aa]' cell flips match_case. Escape with focus in buffer closes the panel and keeps the selection.",
+    "files": "src/editor/input.c, src/editor/findpanel.c, src/findui/paint.c (cell column metrics export), tests/editor_test.c, tests/findui_test.c",
+    "size": "M",
+    "depends_on": "Bead 1"
+   },
+   {
+    "title": "Incremental find: select and scroll to the nearest match from the caret as the query is typed",
+    "scope": "On each query edit, once the worker count reports a match, select the first match at or after the caret origin (the position where the panel opened), scrolling if off-screen, without moving that origin so repeated edits keep the same anchor. Backspacing to empty restores the original selection and scroll. Enter then advances to the next match, replacing the edit-g02 'first Enter commits' rule. Large files keep the existing worker-backed seek (select_result and editor_scroll_seek). No new allocation on the typing path.",
+    "acceptance": "Red test: 300-line fixture, type 'line 250', pump the worker, assert selection equals that match and the first visible line includes it, without Enter; backspace to empty restores selection; Enter goes to the next. The existing G1 typing-latency regression and the counting allocator test stay green.",
+    "files": "src/editor/findpanel.c, tests/editor_test.c, docs/decisions/ (new note superseding edit-g02's Enter rule)",
+    "size": "M",
+    "depends_on": "Bead 1"
+   },
+   {
+    "title": "Prefill from selection and implement Ctrl+E, Ctrl+Shift+E, Ctrl+F3 / Ctrl+Shift+F3, Alt+F3",
+    "scope": "Ctrl+F and Ctrl+H seed the query from a single-line non-empty selection (word under caret only for the find-under and slurp actions, as in Sublime), otherwise keep the previous query selected. Implement slurp_find, slurp_replace, find_under, find_under_previous and find_all_under handlers in editor_find_action; remove KEYS_ARG_UNIMPLEMENTED on those rows. Copy bytes into the arena-backed query buffer only (no malloc on the typing path).",
+    "acceptance": "Red tests: select 'foo', Ctrl+F, assert the query is 'foo' and the count is shown; Ctrl+E with the panel closed seeds the query so F3 jumps; Ctrl+F3 on a word caret selects the next occurrence. keys_test row flags updated and passing.",
+    "files": "src/editor/findpanel.c, src/keys/keys.c, tests/editor_test.c, tests/keys_test.c",
+    "size": "M",
+    "depends_on": "Bead 1"
+   },
+   {
+    "title": "Find All (Alt+Enter) with multi-selection, plus Escape/close behaviour for highlights",
+    "scope": "Alt+Enter selects every match as a multi-selection if the editor's selection model supports multiple regions. If it does not, say so in the bead report first: this decides whether the bead is M or L, since multi-cursor is a separate feature. Also decide, by checking Sublime's actual behaviour in an install, whether highlights are cleared when the panel closes, and match that.",
+    "acceptance": "Red test: Alt+Enter with the query 'foo' on b.txt yields two selection regions; typing then edits both. Closing the panel clears or keeps highlights per the verified Sublime behaviour, with a test for each.",
+    "files": "src/editor/findpanel.c, src/view (selection model), tests/editor_test.c",
+    "size": "L",
+    "depends_on": "Beads 3, 4 (and multi-cursor support, to be checked)"
+   },
+   {
+    "title": "Find options: in-selection, wrap toggle, highlight toggle, history (Up/Down), Ctrl+Enter newline",
+    "scope": "Extend findui_options and src/find window parameters for in_selection and wrap. Bind the missing commands (toggle_wrap, toggle_in_selection, toggle_highlight) to the Sublime-proposed keys from issue 1447 (alt+p, alt+s, alt+h; check these are not already taken). Add a small fixed ring of previous queries and replacements (arena storage) navigated with Up/Down in the field. Ctrl+Enter inserts a newline in the query.",
+    "acceptance": "Red tests per option in tests/findui_test.c (and the find fuzz target run for the changed core parameters): in-selection counts only inside the selection; wrap off stops at the last match; history Up recalls the last two queries in order.",
+    "files": "src/find/*, src/findui/*, src/editor/findpanel.c, src/keys/keys.c, tests/findui_test.c, fuzz/findui_fuzz.c",
+    "size": "L"
+   },
+   {
+    "title": "Find panel redesign (visual) and status-bar match count",
+    "scope": "Replace the ASCII row with a styled panel: input boxes with focus ring, icon or labelled toggles with pressed state, Find/Prev/All buttons, count badge, optional status-bar 'N of M matches'. This is an input to the design-hillclimb effort Tobias described, so schedule it with that effort rather than ahead of beads 1-4; it needs rendering primitives beyond the character grid (check whether the grid renderer can draw boxes).",
+    "acceptance": "To be set when the design work starts; at minimum, screenshots before and after on Xvfb and no change to G1 typing latency.",
+    "files": "src/findui/paint.c, src/editor/findpanel.c, src/render",
+    "size": "L",
+    "depends_on": "Beads 2, 6 and the design council"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Is the ordering right? I put 'panel must not swallow Ctrl+W/Ctrl+S/etc.' and 'click in buffer moves focus' first, since that is the weird-sequences complaint; incremental select-and-scroll comes next.",
+   "Does the editor have multiple selections or multi-cursor yet? Alt+Enter find-all and Ctrl+D depend on it. I did not verify, and if it is missing, bead 5 is blocked on a separate feature.",
+   "Should highlights stay visible after Escape? Our panel keeps them until the next edit or search. I could not confirm Sublime's behaviour from the web, so please check your Sublime.",
+   "Sublime remembers the last query across Ctrl+F. Do you want that, or always seed from the selection and otherwise start empty? I proposed Sublime's rule.",
+   "Do you want a status-bar match count? It requires a status bar, which the editor does not have today. I left it inside the panel redesign bead."
+  ]
+ },
+ "modes": {
+  "summary": "Code-reading inventory of src/editor modal states and input routing, with no display used and nothing edited. Keyboard routing is one ordered if-ladder, editor_handle_key (input.c:1030-1068), then editor_dispatch_action (input.c:1070). Mouse and wheel go through nonkey (editor.c:571-606), then editor_pointer (input.c:1350), then editor_chrome_pointer (paint.c:389). The root cause of \"find, then kill the tab\" is that the find panel is a global key sink and has no separate focus state. While e->find_visible is true, editor_find_key (findpanel.c:329) consumes every key except Esc, the `common` actions and the find actions (input.c:1073-1077). A consumed Ctrl chord is a deliberate no-op (findpanel.c:352-353). That swallows Ctrl+W, Ctrl+Tab, Ctrl+PgUp, Ctrl+S, Ctrl+Z/Y, Ctrl+C/X, Ctrl+G, Ctrl+Shift+T, arrows and PgUp/PgDn. tests/findui_test.c:1019-1024 pins x,z,y,s,w,t as \"consumed\" with find open, so this is tested behaviour that has to be reversed. Menu items and palette-dispatched commands are re-fed through the same dispatcher as synthetic key events, so File > Close, Edit > Undo and Goto line are also dead while find is open. Clicking in the text does not move keyboard focus out of the panel, so typing after a click still edits the find query. Other routing problems: the palette ignores mouse clicks and middle-click paste still targets the document, and palette Ctrl/Alt chords are swallowed. Drag-and-drop does not exist: there is no plat event kind for it and no Xdnd or data_offer code on X11 or Wayland. Other risks are fatal EDITOR_ERR_INPUT_FULL when 1024 events park behind a pending open, and a fatal fail() on any nonzero rc from an input handler. Both are plausible, not reproduced.",
+  "findings": [
+   {
+    "title": "MODE find panel (Ctrl+F / Ctrl+H): global key sink, swallows tab/file/edit commands",
+    "severity": "friction",
+    "detail": "State: e->find_visible (+ findui_panel e->find, e->find_field_all, e->find_replace_request/active, e->panel_rows via editor_text_geometry editor.c:546). There is no focus flag: while find_visible every key belongs to the panel. ROUTING (editor_handle_key -> editor_dispatch_action): (1) Esc is routed early at input.c:1046 to editor_find_key, which hides the panel (findpanel.c:338-343). (2) dispatch_action runs editor_find_action (findpanel.c:262) then, unless the binding is `common` (NEW_FILE, OPEN_FILE, SAVE_AS, EXIT, SCROLL_LINES; input.c:1073-1077), editor_find_key (findpanel.c:329). editor_find_key returns true for every other key. INTERCEPTED/handled: Esc, Enter/Shift+Enter (next/prev), Ctrl+Enter (replace one), Ctrl+Alt+Enter (replace all, replace mode), Tab (toggle fields in replace mode), Left/Right/Home/End/BackSpace/Delete and Ctrl-word variants, Ctrl+A (select field), Ctrl+V (field paste), printable text. Palette (Ctrl+Shift+P) and menu toggle are dispatched before the find code (input.c:1071-1072) so they do work; palette show force-hides find (palettepanel.c:8). SWALLOWED AS NO-OPS: findpanel.c:352-353 `ctrl && !enter && keysym not Left/Right/BS -> return true`, and `alt && !ctrl` (:354). So Ctrl+W, Ctrl+Tab, Ctrl+PgUp/PgDn, Ctrl+S, Ctrl+Z/Y, Ctrl+C, Ctrl+X, Ctrl+G, Ctrl+Shift+T, Ctrl+1..9, Alt+digit do nothing. NON-CTRL keys that are not text also vanish: Up/Down/PgUp/PgDn/F-keys fall into the final else (findpanel.c:376-396) with add=0 and are consumed (the document caret cannot be moved from the keyboard while find is open; Sublime lets arrows return focus to the buffer). Plain Tab in non-replace mode likely inserts a literal TAB into the query (ev->utf8_len path; not verified at runtime). Tested design: tests/findui_test.c:1019-1024 lists x,z,y,s,w,t as consumed with find open. HOW IT ENDS: Esc; palette show; find-in-files Enter (editor_fif_start hides it, fif.c:347); Ctrl+F again just reselects the field. It never ends on tab switch/close: editor_find_service (findpanel.c:116) silently re-targets the panel to the new active buffer, so the panel stays open across tabs. Sticky across mouse clicks: editor_pointer text clicks move the caret but find_visible stays true, so subsequent typing still goes to the query.",
+    "evidence": "src/editor/input.c:1031-1068, 1070-1078; src/editor/findpanel.c:262-327 (find_action), 329-398 (find_key); tests/findui_test.c:1019-1024; src/editor/palettepanel.c:8"
+   },
+   {
+    "title": "MODE replace-in-progress (find_replace_active) and replace request",
+    "severity": "friction",
+    "detail": "State: e->find_replace_active (+ find_replace_request 1/2 waiting for a search to finish, findpanel.c:130-135). Started by replace_begin (findpanel.c:187). ROUTING: editor_step has a dedicated branch (editor.c:825-835): while active, only queue entries that are Esc (-> editor_find_key cancels, findpanel.c:338) or PLAT_EV_CLOSE (quit) are picked; every other queued event, including tab clicks and mouse motion, stays in the queue until replace finishes. editor_activation_busy (buffers.c:347) is true so tab select/close/cycle return EDITOR_ERR_ARG if ever reached. editor_palette_show refuses (palettepanel.c:7). Ends on completion (editor_find_replace_continue -> editor_find_replace_finish input.c:1596) or Esc. RISK: events parked here accumulate toward EDITOR_INPUT_CAP=1024 (editor.h:22) and platform_event turns a full queue into fatal e->error=EDITOR_ERR_INPUT_FULL (editor.c:300); mouse MOTION events are individually queued (x11.c:666-672, no coalescing found). A long replace-all with a moving mouse is a plausible crash; needs a repro.",
+    "evidence": "src/editor/editor.c:825-835, 300; src/editor/buffers.c:347; src/editor/palettepanel.c:7; src/editor/editor.h:22"
+   },
+   {
+    "title": "MODE find in files (Ctrl+Shift+F, Where field) and Find Results tab",
+    "severity": "friction",
+    "detail": "State: e->fif (editor_fif, private.h): mode, where_focus, where_all, where/where_length/where_cursor, running, done_received, results_id; panel_rows=3 when fif.mode (editor.c:546). Entered via KEYS_ACTION_FIND_IN_FILES in editor_find_action (findpanel.c:272-279): shows the find panel, fif.mode=true, cancels any running search (editor_fif_show fif.c:304). ROUTING: same find_visible sink as the plain panel, plus: Enter -> editor_fif_start (findpanel.c:359-360) which hides the panel and opens/reuses the results tab (fif.c:347+); Tab toggles where_focus (:362); with where_focus keys go to editor_fif_key (fif.c:399) and Ctrl+V to editor_fif_paste. Esc cancels a running search FIRST and leaves the panel open (input.c:1043; needs a second Esc to close panel). Results tab: derived+read_only buffer; Enter and double-click open the hit (input.c:1079-1081, 1388-1392); F4/Shift+F4 via KEYS_ACTION_NEXT/PREVIOUS_RESULT (findpanel.c:280-284); editing, cut, paste, replace refused (input.c:1144-1147, findpanel.c:188). Results assembly runs only while the results tab is the ACTIVE tab (fif.c:82-92 editor_fif_results_active, assembling): switching away pauses assembly while the job keeps running. Closing the results tab does not cancel the job (no fif reference in buffers.c close path); editor_fif_pending stays true until the worker's DONE arrives. Ends: search DONE, Esc, new search (old job retires), editor_fif_close at exit.",
+    "evidence": "src/editor/findpanel.c:272-284, 355-365; src/editor/fif.c:82-102, 260-310, 311-380; src/editor/input.c:1043, 1079-1081; src/editor/editor.c:546"
+   },
+   {
+    "title": "MODE command palette (Ctrl+Shift+P)",
+    "severity": "friction",
+    "detail": "State: e->palette_open, palette_owner/generation/revision, palette_state e->palette. Opened by editor_palette_show (palettepanel.c:5), dispatched BEFORE find handling (input.c:1071). ROUTING: editor_handle_key checks palette_open right after the close prompt (input.c:1034), before menu, stale prompt and find. editor_palette_key (palettepanel.c:30): Esc closes; Enter runs the selected row by synthesising a key event and calling editor_dispatch_action (:42-46); Up/Down move; BackSpace and text edit the query. Any Ctrl/Super or non-AltGr Alt chord is swallowed (`return 0`, :35-36), so Ctrl+Shift+P cannot toggle it closed, Ctrl+W/Tab do nothing; Left/Right/Home/End/PgUp/PgDn/Delete are ignored. Mouse: nonkey has no palette_open check, so a click in the text moves the caret behind the palette, middle-click pastes PRIMARY into the document (editor.c:576-577), wheel scrolls; palette rows are not clickable. Ends: Esc, Enter, focus loss (editor.c:586-587 editor_palette_close), and editor_palette_sync closes it when the owner buffer id, source generation or REVISION changes (palettepanel.c:23-28) - a tab click, a file change on disk or an IPC open closes it. Opening it hides find (palettepanel.c:8).",
+    "evidence": "src/editor/palettepanel.c:5-60; src/editor/input.c:1034, 1071; src/editor/editor.c:576-577, 586-587"
+   },
+   {
+    "title": "MODE menu bar (Alt tap, Alt+mnemonic, click) incl. pinned/active/open",
+    "severity": "polish",
+    "detail": "State: e->menu {pinned, config_visible, armed, was_active, active, open, title, item, first}. Visible = pinned||active||open>=0 and costs one row (editor_text_geometry editor.c:539). KEYS: editor_menu_key (menubar.c:90) is called from editor_handle_key (input.c:1038-1042) only when no go-to prompt and no stale source, and AFTER the palette check, so Alt does nothing while the palette is open. A bare Alt press+release arms then latches focus; Alt+letter opens a menu unless that chord is bound (:122-131); while latched, Esc/arrows/Enter/mnemonics are handled and every other key is swallowed (:150-153); a Ctrl/Super chord closes the menu then falls through and runs (:138-141). MOUSE: editor_menu_pointer (menubar.c:183) is called first in nonkey (editor.c:600) unless the buffer is stale: title click opens/closes, an item click runs, any other click while latched closes the bar; a pinned idle bar leaves other clicks alone. Items run via editor_dispatch_action with a synthetic event (menubar.c:66-72), so they inherit the find-panel sink (File > Close, Edit > Undo, Goto line do nothing while find is open) and the go-to prompt's lookup suppression. Ends: Esc, Enter/run, outside click, focus loss (editor_menu_reset editor.c:587). Also affects the close prompt: editor_close_prompt_shown requires menu.open<0 && !menu.active (buffers.c:610-613), so opening the menu silently cancels a pending close prompt.",
+    "evidence": "src/editor/menubar.c:90-155, 183-207, 66-72; src/editor/input.c:1038-1042; src/editor/editor.c:600; src/editor/buffers.c:608-613"
+   },
+   {
+    "title": "MODE go-to-line / Open file / Save As prompt (e->go)",
+    "severity": "friction",
+    "detail": "State: editor_go go {active, kind (GOTO_LINE/OPEN_FILE/SAVE_AS), digits[], length, cursor, selected, valid, accept, owner, generation, original view + scroll}. Entered via goto_key when the action is GOTO_LINE, OPEN_FILE or SAVE_AS (input.c:1129-1130, 1177; goto_key 863). It draws on the last grid row (editor_goto_overlay paint.c:462). ROUTING: when go.active the keymap lookup is skipped entirely (input.c:1065 `result = e->go.active ? KEYS_NONE`), find and fif code is skipped (`!e->go.active`, input.c:1076,1079), and ALL keys go to goto_key: Esc cancels (restores original viewport), Enter commits (goto: seek and accept; open/save-as: sets e->file_command and queues work), Ctrl+A selects, arrows/Home/End/BackSpace/Delete edit, text inserts (digits only for goto). Any other Ctrl/Alt chord is ignored by falling to `editor_full_layout` (input.c:924). So Ctrl+W, Ctrl+Tab and Ctrl+F are dead inside the prompt - consistent, but nothing tells the user. MOUSE: nonkey cancels the prompt on a button PRESS (restoring the viewport) and then the click proceeds; motion/release are dropped while active (editor.c:601-602). A tab click therefore cancels and switches. Go-to line also previews as you type (scroll jumps while typing, restored on Esc). Ends: Enter, Esc, mouse press, owner buffer id/generation change or stale source (input.c:1049-1053), editor_goto_cancel input.c:803. Note editor_open path: Open file is a typed-path prompt (no file dialog).",
+    "evidence": "src/editor/input.c:863-934, 1049-1053, 1065, 1129-1130; src/editor/editor.c:601-602; src/editor/paint.c:462-518"
+   },
+   {
+    "title": "MODE close-modified-tab prompt (status row: S save / D don't save / Esc cancel)",
+    "severity": "friction",
+    "detail": "State: e->close_prompt {owner, prompt_ns, prompt_serial, saving}. Created by editor_close_request (buffers.c:596) from Ctrl+W/CLOSE_FILE (input.c:1206) for a modified, non-derived, non-placeholder tab. ROUTING: close_prompt_key is the FIRST check in editor_handle_key (input.c:1033). Keys typed before the prompt frame was submitted are swallowed (prompt_ns/prompt_serial gate); repeats and Ctrl/Alt/Super chords are swallowed; S saves (Save As prompt for untitled, then the tab closes in maintenance editor_close_service buffers.c:625 once the save leaves it unmodified), D discards, Esc cancels. All other keys are SWALLOWED while shown (returns true), so Ctrl+Tab/typing are dead. MOUSE: not gated. Clicking a tab calls editor_activate which clears owner when the buffer changes (buffers.c:358); clicks in text and wheel work with the prompt still shown; middle-click paste still edits the buffer. The prompt is cancelled silently when go.active, palette_open or the menu is active (editor_close_prompt_shown buffers.c:608-613, checked at input.c:1009, paint.c:529). It does NOT account for find_visible: Ctrl+W never gets here while find is open (see find finding), and if both are visible the overlay overwrites the last row (find panel's final row), hiding the field. A failed/cancelled save leaves the tab open with no message beyond save_error. Close refused (all closed-tab slots modified) shows a notice (buffers.c:586-590).",
+    "evidence": "src/editor/input.c:1003-1028, 1033; src/editor/buffers.c:596-632, 358; src/editor/paint.c:520-552; src/editor/editor.c:487-489"
+   },
+   {
+    "title": "MODE source-changed prompt (R reload / K keep) and pending_open / placeholder",
+    "severity": "polish",
+    "detail": "State: editor_buffer.source_stale + prompt_ns/prompt_serial/prompt_generation; e->source_choice (editor_check_sources buffers.c:1129). Set when the file changes on disk and the buffer has unsaved edits (clean buffers reload silently, buffers.c:1138). ROUTING: in editor_handle_key after the find Esc code (input.c:1056-1063): while source_stale and the key is not in editor_event_control (input.c:958-985: next/prev view, close, close_file, reopen, select tab, font size, exit, save, new file, open file), only plain r/R (reload) and k/K (keep) act, after the prompt frame was submitted; everything else (typing, Ctrl+F, Ctrl+G, Save As, Ctrl+Shift+P, menu Alt - input.c:1038 skips the menu when stale) is dropped with no feedback. Control keys then still pass through editor_dispatch_action, where an open find panel swallows them. MOUSE: editor_menu_pointer skipped; editor_pointer routes only tab-strip clicks (editor_event_control for MOUSE = y within the tab rows, input.c:962-965); text clicks, wheel (editor_handle_wheel:1306) and minimap drag are disabled. Ends on R/K (applied in maintenance, may be deferred while a save is active), or Reload/Keep rewrites source_stale=false. pending_open (async large-file open): same event_control passthrough, all other events are PARKED in the queue with queue_owner (editor.c:656-671, editor_inject:676-679) - motion events included, so the 1024-event cap (editor.h:22 -> fatal EDITOR_ERR_INPUT_FULL, editor.c:300) is reachable during a long open while the mouse moves (needs repro).",
+    "evidence": "src/editor/input.c:958-985, 1056-1063; src/editor/buffers.c:1115-1223; src/editor/editor.c:600-603, 643-672, 676-684; src/editor/editor.h:22"
+   },
+   {
+    "title": "MODE minimap drag (e->map_drag) and tab drag-reorder (e->drag_tab/drag_id)",
+    "severity": "friction",
+    "detail": "State: map_drag/map_drag_id/map_drag_generation/map_drag_offset; drag_tab/drag_id. Both live in editor_chrome_pointer (paint.c:389-457), reached from editor_pointer when the event is not a text press/drag (input.c:1357-1367). Press on the minimap column (col >= text cols, row >= tab_rows) sets map_drag and map_grab (paint.c:343) decides whether the press lands in the painted viewport band (keeps the grab offset) or recenters the band on the click; motion while map_drag seeks via minimap_hit/minimap_hit_approx and editor_scroll_seek; release (BUTTON code 1 !press) clears both drags (paint.c:394). Cleared also on tab activate, resize, focus change (editor.c:582,592, buffers.c:339-341) and when the buffer goes stale/pending. Interaction holes: (a) editor_pointer clears text_drag first but nothing clears map_drag when the release arrives while go.active (nonkey drops releases at editor.c:601-602); go.active during a drag requires a key chord mid-drag, rare. (b) map_drag does not consult palette/find/close-prompt state: dragging works behind a palette or close prompt. (c) map_grab / minimap_hit use e->map_grid.dims.cell_h pixels and sampled/approx summaries for large files; the 'indicator does not follow the cursor on big files' complaint belongs here (the retained vs unretained band at paint.c:352-367 and the approx seek at 430-440), analysed by the minimap agent.",
+    "evidence": "src/editor/paint.c:343-457; src/editor/input.c:1350-1368; src/editor/editor.c:580-583, 592"
+   },
+   {
+    "title": "MODE text drag-select, multi-click chain, edge autoscroll",
+    "severity": "polish",
+    "detail": "State: e->text_drag, text_drag_id/generation, text_drag_mode (1 shift-extend, 2 word, 3 line/gutter), click_ns/row/col/count/button/id/generation, text_pointer, text_drag_pixels, text_drag_rehit, pointer_unit_pending. editor_pointer (input.c:1350): left press in the text rect starts it; motion with text_drag extends; release clears (input.c:1352). Edge distance beyond the text rect autoscrolls from editor_pointer_tick (input.c:1452) once per completed frame. Cancels: tab switch (buffers.c:339-341), resize/focus (editor.c:582,592), source generation change (input.c:1359-1360), palette show (palettepanel.c:11). It is NOT cancelled by opening find or the menu, and the pointer path has no palette/find/prompt awareness: a click while the palette or close prompt is shown moves the document caret and starts a selection behind it. Double-click on a Find Results line opens the hit (input.c:1388-1392). Wrapped and unwrapped hit-testing differ (scroll_frame_hit only when !wrap && !panel_rows, input.c:1380): while the find panel is open (panel_rows>0) clicks use the non-plan row mapping.",
+    "evidence": "src/editor/input.c:1334-1480; src/editor/editor.c:575, 580-583; src/editor/palettepanel.c:11"
+   },
+   {
+    "title": "MODE scroll / wheel / byte-seek (wheel_pending, find_scroll, scroll_pending, queued pages)",
+    "severity": "polish",
+    "detail": "State: e->wheel_pending, find_scroll, wheel (scroll_state), wrap_wheel_rows; per buffer scroll_pending, scroll_following, scroll_queued_pages/wheel/pixels, scroll_resident. Wheel: PLAT_EV_WHEEL -> editor_handle_wheel (input.c:1304) - ignored when stale/pending_open/no tab; NOT gated by palette/find/menu/prompt/go (wheel works under every overlay and under go-to preview). During an unresolved byte jump (find result far away, minimap seek) wheel and PgUp/PgDn are queued for the landed top (edit-pd6, input.c:1313-1316, 1228-1233). Any click or minimap press clears wheel_pending/find_scroll (input.c:1394, paint.c:420). Ctrl+Up/Down (SCROLL_LINES) is `common` so it works with find open (input.c:1073-1075). Home/End/Ctrl+End supersede a pending jump. editor_wheel_continue/editor_scroll_slice advance it from editor_step (editor.c:793).",
+    "evidence": "src/editor/input.c:1304-1332, 1213-1237, 1394; src/editor/editor.c:793; src/editor/paint.c:420"
+   },
+   {
+    "title": "MODE pending file command (Ctrl+N / Ctrl+O / Save As confirm) and in-flight save, Save As, checkpoint publish",
+    "severity": "friction",
+    "detail": "State: e->file_command (+path/owner/generation); editor_save_leased(e) (session.c:538: e->publish or save journal_leased), editor_save_active (session.c:547: saving, publish, save_as), e->save_as, publish_owed. Ctrl+N sets file_command at input.c:1103-1108; Ctrl+O/Save As use the e->go prompt then Enter sets file_command (input.c:878-886). queue_pick returns SIZE_MAX (consumes no input at all) while file_command is set or the journal is leased (editor.c:655-656): ALL input incl. clicks and mouse motion is parked, only PLAT_EV_CLOSE bypasses (editor_inject:675). editor_file_command_service (commands.c:274) runs in maintenance once not dirty/active; if the active buffer changed meanwhile it silently drops the command (commands.c:280). Open failure shows 'open failed' notice only. Save (Ctrl+S): editor_save_request (input.c:1116) is a no-op on derived/placeholder; save success/failure appears on the status row (session.c save status ~:745), with S-from-close-prompt chaining. Parked events count toward the 1024-event fatal cap (see above). Ctrl+S is swallowed by an open find panel.",
+    "evidence": "src/editor/editor.c:650-672; src/editor/commands.c:274-298; src/editor/session.c:538-548, 625; src/editor/input.c:878-886, 1103-1108, 1116"
+   },
+   {
+    "title": "MODE clipboard in flight (EDITOR_ACTION_CLIP, middle-click paste)",
+    "severity": "polish",
+    "detail": "State: e->action==EDITOR_ACTION_CLIP, editor_clip (c->waiting, hitting, primary_waiting). Ctrl+C/X/V go through editor_clip_action (input.c:1139-1148) AFTER find handling, so with find open copy/cut/paste in the document are dead (Ctrl+V pastes into the find field instead via editor_clip_find_paste). Middle-click (button 2) and PLAT_EV_CLIPBOARD are routed straight to editor_clip_event in nonkey (editor.c:576-577) before every overlay check: with the palette, menu, go-to or close prompt open, middle-click still pastes PRIMARY into the document (clip.c:476-483 guards only stale/pending_open/busy). While editor_clip_busy, queue_pick lets only CLIPBOARD events through (editor.c:657-661); no timeout is visible in clip.c for a selection owner that never replies (platform-level failure event code 1 clears waiting, clip.c:489) - unverified for a hung owner.",
+    "evidence": "src/editor/editor.c:576-577, 657-661; src/editor/clip.c:476-492; src/editor/input.c:1139-1148, 361-365 (clip.c)"
+   },
+   {
+    "title": "MODE tab cycling (Ctrl+Tab MRU) and tab-strip mouse",
+    "severity": "friction",
+    "detail": "State: tabs.cycling (MRU walk), released on Ctrl key-up in editor_handle_key (input.c:1065-1067), focus loss/keymap events (editor.c:597). Ctrl+Tab/Ctrl+Shift+Tab (NEXT/PREVIOUS_VIEW_STACK) -> editor_cycle_tab; Ctrl+PgDn/PgUp -> adjacent; Alt+1..9 select. All gated by editor_activation_busy, which returns EDITOR_ERR_ARG (a hard error, because editor_step turns any non-zero input rc into fatal fail(), editor.c:862-863, 117-122) when view_busy, a clip, a save lease, replace-all or EDITOR_ACTION_GOTO is active; queue_pick/step ordering currently keeps those states from dispatching tab commands, but that invariant is the whole safety net and is worth a matrix test. Tab strip mouse: editor_chrome_pointer (paint.c:396-403): press selects and starts a drag-reorder; no close button and no middle-click-close exist in tabs_strip_hit (tabs.h:120) - middle-click on the strip goes to clipboard code. Find panel/palette state is not reset on a tab click except the palette (revision/owner sync); the find panel survives and retargets (findpanel.c:116-139).",
+    "evidence": "src/editor/input.c:1195-1210, 1065-1067; src/editor/buffers.c:347, 523-533; src/editor/paint.c:396-403; src/editor/editor.c:862-863, 117-122; src/tabs/tabs.h:120"
+   },
+   {
+    "title": "GLOBAL ACTIONS matrix inputs: how each reaches (or fails to reach) its handler with each mode open",
+    "severity": "friction",
+    "detail": "Order of checks in editor_handle_key (input.c:1030): 1 close_prompt_key; 2 palette (editor_palette_key); 3 menu keys (skipped if stale or go.active); 4 Esc cancels running find-in-files; 5 Esc closes find; 6 go-to staleness cleanup; 7 stale-source filter (R/K only, except editor_event_control keys); 8 key release handling (Ctrl-up releases MRU); 9 config_keys_lookup (skipped while go.active); 10 editor_dispatch_action: palette-open and menu toggle first, then `common` bypass list, then editor_find_action/editor_find_key (find sink), then fif Enter, modifier-only keys dropped, then EXIT, NEW_FILE, CANCEL, SAVE, FONT_SIZE, clip, tab group, undo/redo, edit/move/text. Per global action: Close tab Ctrl+W: dead in find/palette/go/stale-find; prompts for modified tabs (close prompt), immediate for derived/results tabs. New tab Ctrl+N and Open Ctrl+O, Save As, Exit, Ctrl+Up/Down: common, work with find open (o20). Ctrl+Tab / Ctrl+PgUp/PgDn / Alt+N: dead in find, palette, go, close prompt; pass in stale. Save Ctrl+S: dead in find; passes in stale; no-op on derived. Undo/Redo: dead in find (swallowed), palette, go. Ctrl+F again: reselects the field (field_select_all) and resets mode; closed by go-to, close prompt, palette, stale (stale swallows it since not event-control). Palette: opens over everything except go.active and stale and replace-all; closes find; close prompt cancelled. Menu Alt: blocked by palette, go, stale; cancels close prompt. Click in text: moves caret in every state except stale/pending_open (silently ignored); cancels go; does not move key focus out of find; does nothing to palette. Click on tab: cancels go, closes palette via sync, clears close prompt if tab differs, keeps find open. Quit/window close: PLAT_EV_CLOSE sets e->quit immediately everywhere (editor.c:578, 746, 831, editor_inject:675); modified tabs are not prompted - hot-exit journal/recovery preserves them (HANDOFF/edit-2ye3 scope was tab close only). Resize: PLAT_EV_RESIZE clears drags (editor.c:580-584), deferred while dirty/backend active (resize editor.c:559). File changed on disk: focus-in triggers file_check + editor_check_sources (editor.c:588-592); clean buffers reload silently, modified ones raise the R/K prompt. External IPC open (open.c/buffers.c editor_add_buffer) changes the active tab under any open mode, relying on the owner-id guards of palette/go/close prompt/find retarget. Typing: with find open it edits the query regardless of where the user last clicked. IME/compose: only xkbcommon dead-key compose in the X11 input layer (x11/input.h:9,26-31), no preedit/IME UI. Drag-and-drop: absent (plat_ev_kind has no drop kind, x11/plat.h:15-21; no Xdnd/data_offer code in src/x11, src/wayland, src/editor).",
+    "evidence": "src/editor/input.c:1030-1078; src/editor/editor.c:571-606, 746; src/x11/plat.h:15-21; src/x11/input.h:9,26-31"
+   },
+   {
+    "title": "No drag-and-drop support anywhere in the platform layer",
+    "severity": "friction",
+    "detail": "plat_ev_kind has EXPOSE, RESIZE, FOCUS, CLOSE, KEY, BUTTON, MOTION, WHEEL, CLIPBOARD, KEYMAP only. grep for xdnd, data_offer, uri-list, drop finds nothing in src/x11, src/wayland, src/win32, src/editor. The window does not advertise XdndAware, so the Files app (Cinnamon/Nemo) cannot drop onto it. The open path to reuse: the CLI hand-off/IPC open (ipc paths, editor_add_buffer) and the Open command's editor_file_command_service validation (commands.c:283-291); edit-97i (closed) dedups already-open paths.",
+    "evidence": "src/x11/plat.h:15-21; grep results empty for xdnd|data_offer|uri-list in src/x11 src/wayland src/editor; src/editor/commands.c:283-291"
+   }
+  ],
+  "root_causes": [
+   "Find panel has no focus model: find_visible alone decides that editor_find_key eats the keyboard (findpanel.c:329-398). Only five actions (NEW/OPEN/SAVE_AS/EXIT/SCROLL_LINES) are exempted, ad hoc, in editor_dispatch_action (input.c:1073-1077). Every other global chord is deliberately swallowed, and tests/findui_test.c:1019-1024 locks that in.",
+   "Menu items and palette commands are executed by synthesising a key press and re-entering editor_dispatch_action (menubar.c:66-72, palettepanel.c:42-46), so any input-routing sink in that function (find panel, go prompt) also disables the menu and palette commands.",
+   "Mouse routing (nonkey editor.c:599-604 -> editor_pointer) is independent of keyboard overlay ownership: palette, close prompt and find do not gate clicks, and middle-click paste is dispatched before every overlay check (editor.c:576-577). Overlays are cancelled by implicit generation, owner or revision checks scattered over five files (editor_palette_sync, editor_close_prompt_shown, goto owner check, find retarget, menu reset) with no single 'active modal' enum.",
+   "Modal prompts share the last grid row (goto, close prompt, stale R/K prompt, find panel's last row) with ad hoc mutual exclusion: editor_close_prompt_shown omits find_visible; the menu silently cancels the close prompt; Esc ordering lets find-in-files cancel eat the first Esc.",
+   "Parked input is queued without a bound that is safe: queue_pick returns SIZE_MAX or parks events during replace-all, file_command, save lease and pending_open, and a full 1024-slot queue becomes the fatal EDITOR_ERR_INPUT_FULL (editor.c:300), while any non-zero rc from an input handler (e.g. EDITOR_ERR_ARG from editor_activation_busy) becomes a fatal fail() (editor.c:117-122, 862-863). Unreproduced."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Find panel: let global commands pass through (Ctrl+W, Ctrl+Tab, Ctrl+PgUp/Dn, Ctrl+S, Ctrl+Z/Y, Ctrl+C/X, Ctrl+G, Ctrl+Shift+T, Alt+N)",
+    "scope": "In editor_dispatch_action, stop routing a bound command to editor_find_key unless the key is a panel-owned editing key. Replace the `common` whitelist with an allowlist of panel-owned keys (Esc, Enter variants, Tab, Left/Right/Home/End/BackSpace/Delete with Ctrl word variants, Ctrl+A, Ctrl+V, printable text) and let every other bound action fall through to the normal dispatcher. Decide Ctrl+C/Ctrl+X in the field (copy/cut the field text vs document): minimum is that they no longer silently die. Make menu and palette synthetic dispatch bypass the sink the same way.",
+    "acceptance": "FAILING TEST FIRST in tests/findui_test.c: invert the 'consumed' list at lines 1019-1024: with find open, Ctrl+W closes (or prompts for) the tab, Ctrl+Tab/Ctrl+PgUp change tab, Ctrl+S saves, Ctrl+Z undoes the document, Ctrl+G opens go-to, menu File > Close and Edit > Undo run. Field keys still edit the field. Add editor_test cases: modified tab + find open + Ctrl+W shows the close prompt; Ctrl+Tab with find open switches tab and the panel retargets. make check green.",
+    "files": "src/editor/input.c, src/editor/findpanel.c, tests/findui_test.c, tests/editor_test.c, docs/decisions/ (supersedes edit-o20 note)",
+    "size": "M"
+   },
+   {
+    "title": "Find panel focus model: click in text returns focus to the document; arrows leave the panel",
+    "scope": "Add an explicit e->find_focus (field vs document). Mouse press in the text area sets document focus (panel stays visible, highlights stay); Ctrl+F / Enter in the field / click in the panel row regains field focus; Esc from either closes. While document-focused, typing, arrows, PgUp/PgDn, Ctrl+A etc. reach the buffer. Optional: Up/Down in the field moves to the next/prev match like Sublime. Fix Tab inserting a literal tab in the plain (non-replace) query field.",
+    "acceptance": "FAILING TEST FIRST in tests/editor_test.c: open find, click in text, type 'x' - the text gets 'x' and the query is unchanged; Ctrl+F refocuses the field; Esc closes. Panel row click focuses the field (mouse support for the panel row is new; if it is out of scope, assert key-based refocus only). Tab in non-replace mode does not change the query.",
+    "files": "src/editor/findpanel.c, src/editor/input.c, src/editor/editor.c (nonkey), src/editor/private.h, tests/editor_test.c, tests/findui_test.c",
+    "size": "M",
+    "depends_on": "Find panel: let global commands pass through"
+   },
+   {
+    "title": "Central modal state and mouse gating: one 'active modal' enum with a routing table",
+    "scope": "Introduce enum editor_modal {NONE, FIND, FIND_IN_FILES, PALETTE, MENU, GOTO, OPEN_PROMPT, SAVE_AS_PROMPT, CLOSE_PROMPT, SOURCE_STALE, PENDING_OPEN} computed from existing state (no behaviour change first), used by editor_handle_key/nonkey. Then fix mouse: palette open swallows text clicks and middle-click (or closes the palette), close prompt and palette suppress middle-click paste and minimap drag, menu open closes the close prompt only with a notice, find-in-files Esc closes panel after cancelling in one press. Add the status-row ownership rule (close prompt vs find panel vs goto) in one place.",
+    "acceptance": "FAILING TESTS FIRST in tests/editor_test.c, one per matrix cell fixed: palette open + click in text leaves caret unchanged; palette open + middle-click does not paste into the buffer; close prompt shown + middle-click does not paste; opening the menu while the close prompt is shown either keeps the prompt or shows a visible cancel. A table-driven test enumerates (modal x global action) and asserts the documented result; the table doubles as the behaviour matrix doc.",
+    "files": "src/editor/input.c, src/editor/editor.c, src/editor/paint.c, src/editor/buffers.c, src/editor/palettepanel.c, src/editor/clip.c, tests/editor_test.c",
+    "size": "L",
+    "depends_on": "Find panel: let global commands pass through"
+   },
+   {
+    "title": "Reproduce the parked-input crash risks: INPUT_FULL during pending_open/replace-all and fatal ARG from activation_busy",
+    "scope": "Write a deterministic test using editor_inject that parks the queue (pending large open, replace-all active, file_command pending, save lease) and injects 1100 MOTION events and then tab commands. If it reproduces, fix by dropping or coalescing MOTION (and redundant WHEEL) events at inject time when the queue is parked, and by making input handlers return 0 instead of EDITOR_ERR_ARG when editor_activation_busy rejects a user command (re-queue or ignore). If it does not reproduce, record the invariant as a test and close.",
+    "acceptance": "FAILING TEST FIRST: 1100 MOTION events during pending_open leave the editor running (e->error==0) and the later keys still apply; editor_cycle_tab/editor_select_tab/user close under activation_busy never set e->error. make check green.",
+    "files": "src/editor/editor.c (editor_inject, queue_pick), src/editor/buffers.c, tests/editor_test.c",
+    "size": "M"
+   },
+   {
+    "title": "Find-in-files lifecycle: cancel on results-tab close, keep assembling while hidden, sensible Esc",
+    "scope": "Closing the Find Results tab cancels its job (or retires it) instead of leaving editor_fif_pending true until DONE; assembly continues (or is explicitly paused with a status note) when the user switches away; first Esc cancels the search AND closes the panel.",
+    "acceptance": "FAILING TEST FIRST in tests/fif_test or editor_test: start a search, close the results tab, assert the job is cancelled and editor_fif_pending(e) becomes false without DONE; start a search, switch tab, switch back, hits are complete.",
+    "files": "src/editor/fif.c, src/editor/buffers.c, src/editor/input.c, tests/editor_test.c",
+    "size": "M"
+   },
+   {
+    "title": "Drag-and-drop file open (X11 XDND first, Wayland data_offer second)",
+    "scope": "Add PLAT_EV_DROP (carries up to IPC_MAX_PATHS paths) to src/x11/plat.h; implement XdndAware + XdndEnter/Position/Drop/Finished with text/uri-list parsing on X11 (Files app/Nemo uses it); route in nonkey to the same open path as Ctrl+O/IPC (editor_add_buffer with dedup from edit-97i), ignoring the drop when pending_open/replace/save-lease parks input. Wayland and Windows ports are separate beads.",
+    "acceptance": "FAILING TEST FIRST: a unit test feeds a synthetic PLAT_EV_DROP with two file:// URIs (percent-escapes, a directory, a missing file) and asserts two tabs open / the invalid ones are reported; an xvfb test using xdotool-less XDND client or the platform's injected event path covers the X11 parser. Manual check by Tobias in Nemo.",
+    "files": "src/x11/plat.h, src/x11/x11.c, src/x11/input.c, src/editor/editor.c (nonkey), src/editor/commands.c, tests/x11_test.c, tests/editor_test.c",
+    "size": "L"
+   },
+   {
+    "title": "Tab strip mouse: middle-click closes, per-tab close affordance",
+    "scope": "Route button 2 on a tab to the user-close path (modified tabs prompt) instead of the clipboard handler; add a close box on hover/active tabs if the design review wants it.",
+    "acceptance": "FAILING TEST FIRST in tests/editor_test.c: middle-click on a clean tab closes it, on a modified tab shows the close prompt, middle-click in the text still pastes PRIMARY.",
+    "files": "src/editor/editor.c, src/editor/paint.c, src/tabs/tabs.h, tests/editor_test.c",
+    "size": "S"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Find panel Ctrl+C/Ctrl+X: should they copy/cut the selected document text when the field has no selection (Sublime-style: find then copy the match), or operate on the field text? Which wins when the field is focused?",
+   "After a click in the text with the find panel open, should the panel stay open and highlighted with focus in the document (Sublime), or close?",
+   "Window close button with modified tabs: today quit is immediate and relies on hot-exit recovery (no prompt). Is that the behaviour you want, or should it prompt like Ctrl+W?",
+   "Palette and menu mouse behaviour: should clicking outside close the palette, and should palette rows be clickable?",
+   "Find in files: should the Find Results tab keep filling while it is a background tab, and should closing it cancel the search?",
+   "Are you OK with replacing the tested 'Ctrl+W/S/Z are no-ops while find is open' behaviour (tests/findui_test.c:1019, edit-o20 decision) - i.e. was that intentional for a reason I cannot see in the code?"
+  ]
+ },
+ "matrix": {
+  "summary": "I built the mode x action matrix at /tmp/claude-1000/-home-tobias-Projects-sublimite/3dfb7436-2086-45df-b788-60ade1f4789a/scratchpad/matrix/matrix.md and checked the top cells on Xvfb :94 with the frozen binary. Screenshots are in the shots/ folder beside it. \"Find, then kill the tab\" is confirmed: with the find panel open, Ctrl+W does nothing, and so do Ctrl+Tab, Ctrl+PgUp, Ctrl+S, Ctrl+Z and Ctrl+G. After clicking in the text, typing still goes into the find query; I typed \"ZZ\" and the query became \"alphaZZ\". The root cause is that the find panel has no focus state, so any open find panel swallows every key that is not an allowlisted global (findpanel.c:329-398). Menu and palette commands re-enter the same dispatcher, so File>Close and Edit>Undo should be dead too; I did not run that cell. In Sublime the panel is non-modal, global shortcuts always act on the window, and clicking the view moves focus to it. Other cells: the go-to prompt and the close prompt swallow chords with no feedback, which I confirmed. The palette ignores the mouse and middle-click paste bypasses every overlay, but those two come from code reading only. Drag-and-drop does not exist, because there is no XDND code and no plat event kind. Possible INPUT_FULL crashes while input is parked are plausible but not reproduced. I did not run minimap drag, so the minimap seek problem is left to the other agent.",
+  "findings": [
+   {
+    "title": "Find panel swallows Ctrl+W (close tab)",
+    "detail": "Ctrl+F, type 'alpha', Ctrl+W: tab stays, nothing happens, no feedback.",
+    "evidence": "shots/c02_find_ctrlw.png; src/editor/input.c:1076-1078; src/editor/findpanel.c:352-353",
+    "severity": "friction"
+   },
+   {
+    "title": "Find panel swallows Ctrl+Tab, Ctrl+PgUp, Ctrl+S, Ctrl+Z, Ctrl+G",
+    "detail": "Tab switch, go-to prompt do not appear, verified by screenshot. Save, undo, copy, cut are predicted from code to be dead as well.",
+    "evidence": "shots/c03, c04, d06; tests/findui_test.c:1019-1024 pins this as intended",
+    "severity": "friction"
+   },
+   {
+    "title": "Click in text does not move focus out of find; typing edits the query",
+    "detail": "After clicking in the document and typing 'ZZ' the query became 'alphaZZ' while the caret moved in the document. Sublime moves focus to the view.",
+    "evidence": "shots/c06_click_text_type.png; src/editor/editor.c nonkey -> editor_pointer; no find_focus flag",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Menu and palette commands inherit the find sink",
+    "detail": "Menu items and palette rows are dispatched as synthetic key events through the same dispatcher, so File>Close, Edit>Undo and Goto line are dead while find is open (predicted from code, not run).",
+    "evidence": "src/editor/menubar.c:66-72; src/editor/palettepanel.c:42-46",
+    "severity": "friction"
+   },
+   {
+    "title": "Go-to prompt and close prompt swallow chords silently",
+    "detail": "Ctrl+W and Ctrl+Tab in the go-to prompt do nothing. Ctrl+F with the close prompt shown is ignored. No hint is shown for either.",
+    "evidence": "shots/d05, d02; src/editor/input.c:1065, 924",
+    "severity": "polish"
+   },
+   {
+    "title": "Mouse not gated by palette or close prompt; middle-click paste bypasses overlays",
+    "detail": "With the palette or close prompt open, clicks move the document caret and middle-click pastes PRIMARY into the buffer. This is predicted from code; the palette screenshot was inconclusive.",
+    "evidence": "src/editor/editor.c:576-577, 599-604; shots/d04",
+    "severity": "wrong-on-screen"
+   },
+   {
+    "title": "Parked input can overflow into a fatal error",
+    "detail": "During pending_open, replace-all, file_command or a save lease, events are parked. A full 1024-slot queue sets a fatal INPUT_FULL, and a nonzero input rc becomes a fatal fail(). Not reproduced.",
+    "evidence": "src/editor/editor.c:300, 655-672, 862-863; src/editor/editor.h:22",
+    "severity": "crash-or-dataloss"
+   },
+   {
+    "title": "No drag-and-drop from the Files app",
+    "detail": "No Xdnd or data_offer code and no plat event kind exists in src/x11, src/wayland, src/win32 or src/editor.",
+    "evidence": "src/x11/plat.h:15-21",
+    "severity": "friction"
+   },
+   {
+    "title": "Menu bar tap while find is open shows the menu above the tab row",
+    "detail": "Works, with the find row still visible. Fine, but the menu also silently cancels a pending close prompt (predicted from code).",
+    "evidence": "shots/d07; src/editor/buffers.c:608-613",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "The find panel has no focus model. find_visible alone makes editor_find_key eat every key, and the escape hatch is an ad hoc 5-action whitelist (input.c:1073-1077).",
+   "Menu and palette run commands by re-injecting synthetic key events, so any input sink also disables those commands.",
+   "Mouse routing is independent of keyboard modal state, and overlays are cancelled by scattered owner, generation or revision checks across five files. There is no single active-modal enum.",
+   "Prompts share the last grid row with ad hoc mutual exclusion.",
+   "Parked input is unbounded and rc errors are fatal."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Table-driven modal matrix test (red first)",
+    "scope": "Create tests/modal_matrix_test.c with rows {setup mode, input, expected tab_count/active/revision/find_visible/focus/query/go/palette}. Start with the find rows, which are red today.",
+    "acceptance": "Failing test first: Find x {Ctrl+W, Ctrl+Tab, Ctrl+PgUp, Ctrl+S, Ctrl+Z, Ctrl+G, menu File>Close}, plus click-then-type. make check wiring added.",
+    "files": "tests/modal_matrix_test.c, Makefile",
+    "size": "M"
+   },
+   {
+    "title": "Find panel: bound global commands pass through",
+    "scope": "Replace the common whitelist with a panel-owned-key allowlist so Ctrl+W, Ctrl+Tab, Ctrl+PgUp/Dn, Ctrl+S, Ctrl+Z/Y, Ctrl+G and Alt+N act normally. Menu and palette synthetic dispatch bypass the sink.",
+    "acceptance": "Failing test first: invert tests/findui_test.c:1019-1024. With find open, Ctrl+W closes or prompts, Ctrl+Tab switches and the panel retargets, Ctrl+Z undoes the document. Field keys still edit the field. make check green.",
+    "files": "src/editor/input.c, src/editor/findpanel.c, tests/findui_test.c, tests/editor_test.c, docs/decisions/",
+    "size": "M"
+   },
+   {
+    "title": "Find panel focus flag: click in text returns focus to the document",
+    "scope": "Add e->find_focus (field or document). A click in the text sets document focus and keeps the panel visible. Ctrl+F or Enter regains field focus. Esc closes. Arrows leave the field. Tab in non-replace mode must not insert a literal tab.",
+    "acceptance": "Failing test first in tests/editor_test.c: find open, click in text, type 'x' adds 'x' to the document with the query unchanged. Ctrl+F refocuses the field.",
+    "files": "src/editor/findpanel.c, src/editor/input.c, src/editor/editor.c, src/editor/private.h, tests/editor_test.c",
+    "size": "M",
+    "depends_on": "Find panel: bound global commands pass through"
+   },
+   {
+    "title": "Active-modal enum and mouse gating",
+    "scope": "Compute enum editor_modal from existing state, then gate the mouse: palette and close prompt dismiss or swallow presses and middle-click paste, one rule for who owns the last status row, and the menu does not silently cancel the close prompt.",
+    "acceptance": "Failing tests first: palette open + click leaves the caret unchanged; palette open + middle-click does not paste; close prompt + middle-click does not paste. The matrix test gains these rows.",
+    "files": "src/editor/input.c, src/editor/editor.c, src/editor/paint.c, src/editor/buffers.c, src/editor/palettepanel.c, src/editor/clip.c, tests/editor_test.c",
+    "size": "L",
+    "depends_on": "Table-driven modal matrix test"
+   },
+   {
+    "title": "Parked-input bound and non-fatal busy rejections",
+    "scope": "Reproduce INPUT_FULL with 1100 MOTION events during pending_open or replace-all. If it reproduces, drop or coalesce MOTION and WHEEL while input is parked. Make editor_activation_busy rejections non-fatal.",
+    "acceptance": "Failing test first: 1100 MOTION events during pending_open leave e->error==0. Tab commands under activation_busy never set e->error.",
+    "files": "src/editor/editor.c, src/editor/buffers.c, tests/editor_test.c",
+    "size": "M"
+   },
+   {
+    "title": "X11 drag-and-drop file open (XDND)",
+    "scope": "Add PLAT_EV_DROP, XdndAware and Enter/Position/Drop/Finished handling with a text/uri-list parser. Route to the existing open path with edit-97i dedup. Wayland and Windows are follow-ups.",
+    "acceptance": "Failing test first: a synthetic drop with two file:// URIs (one percent-escaped, plus a directory and a missing file) opens the valid ones and reports the invalid ones.",
+    "files": "src/x11/plat.h, src/x11/x11.c, src/x11/input.c, src/editor/editor.c, src/editor/commands.c, tests/x11_test.c, tests/editor_test.c",
+    "size": "L"
+   },
+   {
+    "title": "Find-in-files lifecycle and Esc behaviour",
+    "scope": "Closing the Find Results tab cancels the job. First Esc cancels the search and closes the panel. Assembly keeps running or is visibly paused while the tab is in the background.",
+    "acceptance": "Failing test first: start a search, close the results tab, and editor_fif_pending becomes false without waiting for DONE.",
+    "files": "src/editor/fif.c, src/editor/buffers.c, src/editor/input.c, tests/editor_test.c",
+    "size": "M"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "With find open and a selection in the document, should Ctrl+C and Ctrl+X act on the document selection (Sublime style) or on the query field? Which wins when the field is focused?",
+   "After clicking in the text with find open, should the panel stay open with highlights (Sublime) or close?",
+   "Is the tested 'Ctrl+W/S/Z are no-ops while find is open' behaviour (findui_test.c:1019, edit-o20) intentional for a reason not visible in the code? I propose reversing it.",
+   "Closing the window with modified tabs quits immediately and relies on hot-exit recovery. Do you want a prompt instead?",
+   "Should palette rows be clickable and a click outside close the palette?",
+   "Should the Find Results tab keep filling while it is a background tab, and should closing it cancel the search?"
+  ]
+ },
+ "dnd": {
+  "summary": "Confirmed: drop is not implemented on X11, Win32 or in the editor. A grep for Xdnd, XdndAware, WM_DROPFILES, IDropTarget and DragAcceptFiles across src finds nothing. The X11 window's event mask and properties (src/x11/x11.c:525-547) have no XdndAware, and XCB_CLIENT_MESSAGE handles only WM_DELETE_WINDOW (x11.c:642). Wayland binds wl_data_device only for the clipboard (wayland.c:424-468); device_enter/drop even say \"file drops outside this backend's scope\" and do nothing (wayland.c:388-402). The cheapest route on X11 is to reuse the existing selection receive machinery in src/x11/clip.c (INCR, timeouts, budgets, tested against a raw-xcb peer in tests/x11_clip_test.c) with XdndSelection as a third selection and text/uri-list as the target. Add a small platform-neutral hand-off, e.g. a PLAT_EV_DROP event plus plat_drop_data() mirroring plat_clip_data(), then a pure URI-list parser that fills an ipc_request and calls editor_open_request() on the UI thread. That is exactly what CLI and second-instance opens already do (src/editor/buffers.c:807), and it already handles de-duplication, tab selection and activation. Limits to respect: IPC_MAX_PATHS=128 and IPC_PATH_CAP=4096 (src/ipc/ipc.h:9-10), and ipc_path.path is a borrowed const char* so the parser needs a UI-owned scratch arena. The drop payload is small, so reading it on the UI thread via the async clip state machine does not break the no-blocking rule; Wayland reads from a nonblocking pipe pumped by the loop, as the clipboard already does. Folder-to-sidebar (Sublime behaviour) cannot be done because no sidebar UI exists yet (only sidebar_revision fields in editor.h:38), so v1 should open files only and ignore or report directories. Beads: 1) pure parser, 2) X11 XDND target, 3) editor wiring plus UX, 4) Wayland, 5) Win32. I did not run the editor under Xvfb. Nemo's offered target types are unverified from here (E), so bead 2 includes a one-off logger step.",
+  "findings": [
+   {
+    "title": "No drop support anywhere",
+    "detail": "No XdndAware property is set, no Xdnd client messages are handled. Wayland device_enter calls wl_data_offer_accept(offer, serial, NULL) (a NULL mime means reject) and drop just destroys the offer. The manager is bound at version 1, so set_actions/finish (v3) are unavailable. Win32 has no WM_DROPFILES/DragAcceptFiles. plat_event has no path or payload field.",
+    "evidence": "grep -rniE 'xdnd|WM_DROPFILES|IDropTarget|DragAcceptFiles' src => no hits; src/wayland/wayland.c:388-402, 425; src/x11/x11.c:642-647",
+    "severity": "friction"
+   },
+   {
+    "title": "X11 window never advertises XDND",
+    "detail": "Without XdndAware on the toplevel (ATOM[1] = 5), Nemo/GTK/Qt sources will not send XdndEnter/Position/Drop at all, so the drag shows a no-drop cursor. Window creation sets the event mask, WM_PROTOCOLS, _NET_WM_NAME and PID, then stops; no extra mask bit is needed because ClientMessage is delivered regardless.",
+    "evidence": "src/x11/x11.c:524-547",
+    "severity": "friction"
+   },
+   {
+    "title": "Existing infrastructure to reuse",
+    "detail": "clip.c already implements async ConvertSelection plus property read, INCR, timeouts and memory budget. XdndSelection is an ordinary selection owned by the source window, so a receive for target text/uri-list, selection XdndSelection, timestamp from XdndDrop data.l[2], is the same flow. SELECTION_NOTIFY is routed via x11_clip_event (x11.c:674). Needs: a third selection id and a target atom parameter. The clip request is currently UTF8/text-plain only, so it must be generalised or a parallel small receiver added.",
+    "evidence": "src/x11/clip.h:7-12, src/x11/clip.c:126,178,850; src/x11/x11.c:674",
+    "severity": "polish"
+   },
+   {
+    "title": "Open path to reuse",
+    "detail": "All opens funnel into editor_open_request(e, ipc_request*, token). It dedups against open tabs (path_tab / editor_same_path), selects existing tabs, prepares buffers, and journals. Paths limited to 128 and under 4096 bytes; invalid ones return EDITOR_ERR_ARG for the entire request. A drop of more than 128 files must be truncated or batched. Two other callers already do this on the UI thread (IPC drain buffers.c:906, find-in-files fif.c:489).",
+    "evidence": "src/editor/buffers.c:807-905; src/ipc/ipc.h:9-10,31-39",
+    "severity": "polish"
+   },
+   {
+    "title": "Event hand-off point",
+    "detail": "Editor dispatch for non-key events is nonNkEY in editor.c (~575). A PLAT_EV_DROP branch belongs there next to PLAT_EV_CLIPBOARD. Payload should be fetched through an accessor (plat_drop_data) rather than bloating plat_event, matching the clipboard pattern. The Wayland and X11 backends both implement the accessor; Win32 can queue the converted UTF-8 list the same way.",
+    "evidence": "src/editor/editor.c:572-580; src/x11/plat.h:118-130",
+    "severity": "polish"
+   },
+   {
+    "title": "Folder drop and sidebar",
+    "detail": "Sublime adds a dropped folder to the sidebar; sublimite has no sidebar surface. Directory entries in a drop should be skipped for now (with a status message if a message line exists), and a follow-up bead tied to whatever sidebar/project work is planned.",
+    "evidence": "grep sidebar src/editor/*.h => only sidebar_revision/sidebar_identity at editor.h:38",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "The X11 window never sets the XdndAware property, so XDND sources do not target it (no XdndEnter ever arrives).",
+   "The X11 ClientMessage handler only recognises WM_DELETE_WINDOW; none of the Xdnd messages are handled, and nothing replies with XdndStatus/XdndFinished.",
+   "Wayland accepts the drag offer with a NULL mime type, a rejection, and discards it on drop; the data-device manager is bound at version 1 so there is no set_actions/finish.",
+   "The platform event model (plat_event, plat.h) has no drop event or payload accessor, and no URI-list parser exists.",
+   "Win32 layer does not call DragAcceptFiles and has no WM_DROPFILES case."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Drop: pure text/uri-list and file URI parser",
+    "scope": "New module src/dnd (dnd.h, dnd.c): parse a text/uri-list byte buffer (RFC 2483: CRLF or LF separated lines, '#' comment lines skipped, blank lines skipped, no NUL) into at most IPC_MAX_PATHS UTF-8 paths in a caller-provided arena, filling ipc_request. Accept file:///p, file://localhost/p, file://<this-host>/p (compare against gethostname); reject other hosts; reject non-file schemes; percent-decode (%XX, UTF-8 passthrough, reject %00 and bad hex); skip entries over IPC_PATH_CAP; report skipped count. Also a bare absolute path line (some sources send plain paths). Skip directories only at open time, not here. No malloc: arena only. Pure, no X dependency, so Win32 and Wayland reuse it.",
+    "acceptance": "Write tests/dnd_test.c first and see it red: CRLF and LF lists, comment lines, spaces and unicode via %20 / %C3%A9, localhost vs foreign host, %00, truncated %, 130 entries (128 kept, 2 reported skipped), 5000-byte path skipped, empty list. fuzz/dnd_fuzz.c over arbitrary bytes under ASan/UBSan. make check green.",
+    "files": "src/dnd/dnd.h, src/dnd/dnd.c, tests/dnd_test.c, fuzz/dnd_fuzz.c, Makefile",
+    "size": "S"
+   },
+   {
+    "title": "X11 XDND v5 drop target producing PLAT_EV_DROP",
+    "scope": "In src/x11: set XdndAware=5 (ATOM property on the window at creation). Add src/x11/dnd.c handling ClientMessage types XdndEnter (version in data.l[1]>>24, ignore >5; source window data.l[0]; if bit0 of l[1] set read XdndTypeList from the source window, else types in l[2..4]), XdndPosition (reply XdndStatus: data.l[0]=our window, l[1]=1 if text/uri-list offered, l[2]/l[3]=0 empty rect, l[4]=XdndActionCopy), XdndLeave (reset), XdndDrop (timestamp in l[2] for v>=1, CurrentTime otherwise; call ConvertSelection(XdndSelection, text/uri-list, property on our window, that timestamp)). On SelectionNotify reuse the clip receive path (generalise the target/selection parameter in clip.c), then send XdndFinished (l[0]=our window, l[1]=1 success/0 failure, l[2]=XdndActionCopy; only for v>=2) and queue PLAT_EV_DROP. Add plat.h: PLAT_EV_DROP, plat_drop_data(const plat*, size_t*len) returning the raw URI-list bytes valid until the next drop completes. Reject (Status accept=0, Finished 0) when no text/uri-list in types, when a drag is already in flight from another source, or after a 5 s peer timeout using the existing clip timeout machinery. Ignore XdndProxy for now (note it; Nemo does not need it). Verify Nemo's actual type list with a throwaway logger in the test peer and record it in docs/decisions.",
+    "acceptance": "Red first: tests/x11_dnd_test.c using x11_xvfb.h (private Xvfb, never the real display) with a hand-written raw-xcb source peer that owns XdndSelection and sends Enter(3 types and >3 types via XdndTypeList)/Position/Drop. Assert: XdndStatus accept bit and action reply; PLAT_EV_DROP delivered with exact bytes; XdndFinished sent with success flag; leave-before-drop yields no event; drop with no uri-list yields Finished rejected; source never answering ConvertSelection times out cleanly; a stale drop timestamp is passed through; INCR payload of 100 KiB works; second drag while first in flight rejected. Manual: drag from Nemo, Nautilus and Dolphin under X11 opens the tab. make check green.",
+    "depends_on": "edit bead 1 (parser) not required for this bead; PLAT_EV_DROP definition lives here",
+    "files": "src/x11/x11.c, src/x11/private.h, src/x11/dnd.c (new), src/x11/clip.c/.h (generalise selection+target), src/x11/plat.h, tests/x11_dnd_test.c, Makefile",
+    "size": "M"
+   },
+   {
+    "title": "Editor: handle PLAT_EV_DROP by opening files",
+    "scope": "In src/editor/editor.c nonkey(): on PLAT_EV_DROP fetch plat_drop_data, parse with dnd parser into an arena that is reused (no malloc on the typing path; a drop is not the typing path but keep arena use), lstat/stat each path off nothing special (small, same as IPC open), skip directories and report them, build an ipc_request with cwd NULL-safe, call editor_open_request(e,&req,0). Bring the window to a consistent state: close open menus/palette/find panel before opening (ties to the interaction-matrix work), reset drag/text_drag state like FOCUS does. A request over 128 paths is split into batches. Failures (EDITOR_ERR_CAPACITY) show whatever status mechanism exists; do not abort the loop.",
+    "acceptance": "Red first in tests/editor_test.c: inject a PLAT_EV_DROP with two-file URI list through the headless backend and assert two tabs open and the last is active; a dropped already-open path selects the existing tab instead of duplicating; a directory is skipped without error; a 130-path drop opens 128 (or batches) without crashing; drop while the palette is open closes it. make check green; G1 typing-latency regression test unchanged.",
+    "depends_on": "X11 XDND bead, parser bead",
+    "files": "src/editor/editor.c, src/editor/open.c or buffers.c (helper), tests/editor_test.c",
+    "size": "S"
+   },
+   {
+    "title": "Wayland: wl_data_device drop target for text/uri-list",
+    "scope": "Bump data_device_manager bind to version 3 (min of advertised). Track mime types per drag offer (offer_mime already stores flags; add uri_list). On device_enter: set_actions(COPY, preferred COPY) and accept(serial,\"text/uri-list\") only if offered, else accept NULL. On device_drop: pipe2 O_CLOEXEC|O_NONBLOCK, wl_data_offer_receive(\"text/uri-list\"), read in the loop with the existing rx pump (not on the UI thread blocking), cap at the existing WL_CLIP_MAX; on EOF queue PLAT_EV_DROP, call wl_data_offer_finish (v3 only), destroy the offer. Leave-after-drop ordering and offer lifetime: do not destroy on leave if a drop transfer is in flight. Share plat_drop_data accessor with X11.",
+    "acceptance": "Red first: extend tests/wayland_test.c / wayland_mock.h so the mock compositor sends data_offer(text/uri-list), enter, motion, drop and serves the pipe; assert accept sent with the mime, set_actions copy, PLAT_EV_DROP with exact bytes, finish sent exactly once for v3 and not for v1/v2 manager, a non-uri offer is rejected, a slow writer does not block the loop, a writer that never closes times out. Manual check under a Wayland session with Nautilus/Dolphin if available. make check green.",
+    "depends_on": "X11 XDND bead (defines PLAT_EV_DROP and accessor)",
+    "files": "src/wayland/wayland.c, src/wayland/private.h, tests/wayland_test.c, tests/wayland_mock.h",
+    "size": "M"
+   },
+   {
+    "title": "Win32: WM_DROPFILES (then optional IDropTarget)",
+    "scope": "In src/win32/win32_plat.c: DragAcceptFiles(hwnd, TRUE) after CreateWindowEx (mind UIPI: elevated process refuses drops from non-elevated Explorer; ChangeWindowMessageFilterEx for WM_DROPFILES, WM_COPYGLOBALDATA 0x49 if elevated), handle WM_DROPFILES: DragQueryFileW(hdrop,0xFFFFFFFF) for count, DragQueryFileW per index, convert UTF-16 to UTF-8, DragFinish. Build the same URI-list-free path list: expose via plat_drop_data as newline-separated or add a plat_drop_paths accessor shared by the editor (decide in a docs/decisions note; prefer one accessor returning NUL-separated UTF-8 paths and let X11/Wayland convert uri-list through the parser first). Note IDropTarget/OLE is only needed for drag hover feedback, virtual files or Outlook-style items, and is a later bead.",
+    "acceptance": "Red first: a win32 object/unit test (win-editor-fs style gate) that sends WM_DROPFILES with a hand-built DROPFILES HGLOBAL containing a wide-char list including a non-BMP name and a path over MAX_PATH with long-path prefix, asserting the queued PLAT_EV_DROP bytes. Manual on Windows: drag from Explorer opens each file in a tab. make check green on Linux (Windows gate where available).",
+    "depends_on": "X11 XDND bead, editor wiring bead",
+    "files": "src/win32/win32_plat.c, src/win32/private.h, tests/ (win32 object gate)",
+    "size": "M"
+   },
+   {
+    "title": "Folder drop adds to sidebar (deferred)",
+    "scope": "Placeholder tied to future sidebar/project feature; not startable now because no sidebar surface exists. Editor wiring bead skips directories and shows a message.",
+    "acceptance": "To be defined when the sidebar bead exists.",
+    "depends_on": "a sidebar epic",
+    "files": "src/editor (TBD)",
+    "size": "L"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Do you want dropped directories ignored for now, or opened as something (for example files-in-folder via the existing find-in-files panel)? Sublime adds them to a sidebar, which we do not have.",
+   "Which session do you run, X11 only (Cinnamon X11 per the brief)? If so Wayland and Win32 beads can wait behind the X11 plus editor beads.",
+   "Should a drop onto the tab strip vs the text area behave differently (Sublime treats both the same)? Plan assumes anywhere in the window opens in a new tab.",
+   "Is it acceptable to cap one drop at 128 files and batch beyond that, given the IPC_MAX_PATHS limit?"
+  ]
+ },
+ "tstack": {
+  "summary": "Found it: github.com/t3dotgg/tstack (Theo Browne), \"agent skills I use every day\", 9 skills, latest commit 2026-10-27. The council skill is `skills/council/SKILL.md`, triggered by the word \"council\". It is a code/PR-review loop, NOT a design hill-climb: the README lists no design skill, and the skill contains no rubric, screenshot judging or design criteria. Mechanism (read verbatim via gh api): the orchestrator spawns three read-only delegates in parallel, one flagship model per provider at high reasoning effort (default example Claude Opus, GPT Sol, Gemini Pro; user may name members; if a provider is unreachable it reports rather than substitutes). Each gets the request plus context. For code review each returns a score out of 10; one full pass is a round and a fresh review after fixes starts a new round. The orchestrator summarizes findings/disagreements, makes the changes it agrees with, requests a fresh review, and repeats until all delegates are satisfied. Disagreement is resolved by the orchestrating agent's judgment (no vote rule), and it is told to fight scope creep. Results go in a \"Council review\" table (rounds x delegate scores, \"no score\" if absent) in the PR description. The stopping rule is only \"all delegates satisfied\"; no numeric threshold or round cap in council itself. The sibling skill sol-loop adds a budget (3 rounds, extend to 5 for security/data-loss, stop on nit-only round, single reviewer, findings ledger). Tobias has nothing named tstack locally (find and ~/.claude/skills checked). Tobias's design hill-climb would be an adaptation: council's loop shape plus a design rubric and rendered screenshots that tstack does not supply. Tobias lacks Gemini (he said so), so the council would be Opus plus Sol (two providers), which council's rule would report as unavailable unless he names members explicitly.",
+  "findings": [
+   {
+    "title": "tstack council located",
+    "detail": "t3dotgg/tstack skills/council/SKILL.md: 3 delegates from 3 providers, high effort, read-only, parallel; scores /10 per round for code review; orchestrator applies agreed fixes, re-reviews, loops until all delegates satisfied; scope-creep guard; results table in PR description. Uses T3 Code delegate_task or harness subagents.",
+    "evidence": "https://github.com/t3dotgg/tstack ; gh api repos/t3dotgg/tstack/contents/skills/council/SKILL.md",
+    "severity": "polish"
+   },
+   {
+    "title": "Council is not a design skill",
+    "detail": "No rubric, no screenshot/render judging, no design criteria, no numeric stop threshold or round cap in council. README lists no design-related skill. Hill-climb design logic would have to be authored.",
+    "evidence": "README fetch of github.com/t3dotgg/tstack (9 skills: full-send, full-stop, council, sol-loop, file-pr, takeover, babysit-pr, modernize, leaving-pr-comments)",
+    "severity": "polish"
+   },
+   {
+    "title": "sol-loop gives the stopping rules",
+    "detail": "sol-loop: default 3 rounds, extend to 5 only for security/data-loss, stop early on nit-only round, one reviewer, ledger of finding id/severity/outcome, severity tiers blocker/should/nit, minimal-change instruction.",
+    "evidence": "gh api repos/t3dotgg/tstack/contents/skills/sol-loop/SKILL.md",
+    "severity": "polish"
+   },
+   {
+    "title": "Nothing local named tstack",
+    "detail": "find ~ -maxdepth 6 -iname '*tstack*' empty; ~/.claude/skills contains only 'synced'; grep of ~/.claude md files for tstack found nothing.",
+    "evidence": "Bash output this session",
+    "severity": "polish"
+   },
+   {
+    "title": "Closest equivalents",
+    "detail": "ngmeyer/council-review (5 advisors, anonymous peer review, based on Karpathy LLM Council); gstack design-review skill listing; juuukk/theory-skills (design review principles); 7-phase frontend review skill articles. Not fetched in depth.",
+    "evidence": "https://github.com/ngmeyer/council-review ; https://awesomeskill.ai/skill/gstack-gstack-design-review ; https://github.com/juuukk/theory-skills ; https://medium.com/@julian.oczkowski/7-claude-code-design-skills-that-follow-a-real-design-process-b871b8673d05 ; https://alphasignal.ai/news/theo-browne-open-sources-tstack-to-automate-the-entire-pr-lifecycle",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [],
+  "proposed_beads": [],
+  "open_questions_for_tobias": [
+   "Did you mean tstack council (a code-review loop) as the pattern to copy, or a different Theo video/tweet where he applied it to design? The repo has no design content.",
+   "Council needs three providers; with only Opus and Sol, accept a two-member council (name members explicitly) or add a third reviewer?",
+   "Do you want a design rubric authored from named reference apps first, before any loop skill is built?"
+  ]
+ },
+ "best_design": {
+  "summary": "Awards are a poor guide for grading a code editor. The 2026 Apple Design Award winners (12 of them, announced 2 June 2026) are consumer apps and games (grug, Moonlitt, Tide Guide, Guitar Wiz, Cyberpunk 2077 and others), and the 2025 winners are the same kind (CapWords, Taobao, Speechify, Watch Duty, Feather). Red Dot Brands & Communication Design 2026 winners are not public until 6 Nov 2026, and I found no iF 2026 software winners. So the useful exemplars are working tools: Linear, Zed, Sublime, Ghostty, iA Writer, Things, Nova, Raycast, plus the type and colour systems behind them (Geist, JetBrains Mono, Commit Mono, Radix). docs/design/state-of-design-2026.md and the 2026-10-21 workups already settled palette, motion and type choices, so this adds only what they lack: the exact defaults of the editors Tobias compares against (Zed, VS Code, Sublime), which are the nearest evidence for minimap and find-panel design. Three transferable decisions came out of that. First, Zed ships the minimap off, with a left-open thumb border and a width capped at 80 columns. VS Code's is proportional, shows characters, and reveals its slider on mouseover. Sublime's minimap scrolls with the document on huge files and its click-to-scroll is known to miss there (forum). Second, Linear's 2026 refresh gives the clearest rules for chrome: dim what is not the work, fewer and softer dividers, compact non-full-width tabs, \"structure should be felt, not seen\". Third, the right-hand column is where eyes go, and sublimit\u00e9's minimap thumb is the loudest thing there. The deliverable ends with 10 criteria scored 1 to 5 for a council of Sol and Opus, and with beads that build the grading harness before any design change. Caveats: Raycast 2.0 details come from third-party summaries; the Linear, Zed, Ghostty and VS Code numbers are from primary sources; designer attributions for Inter, JetBrains Mono, Monaspace and iA Writer come from my training knowledge and were not re-fetched.",
+  "findings": [
+   {
+    "title": "Exemplar: Linear (desktop app, March 2026 refresh)",
+    "detail": "Observable decisions: sidebar made 'a few notches dimmer' than the work area; tab bar made compact, not full-width, with rounded corners and smaller icon and text; coloured team-icon backgrounds removed; dividers fewer and lower contrast ('structure should be felt, not seen'); palette moved from cool blue-ish grey to a warmer, less saturated grey ('too warm risks looking muddy'); success test 'if most people don't immediately notice what changed, that's a good sign'. Process: a dev toolbar toggles old vs new in one click (so a council can A/B), and a colour tool exposes hue/chroma/lightness per token (earlier theme system used 3 inputs: base, accent, contrast). Transfers: tab shape, divider policy, dim-the-periphery rule, the A/B toggle as a grading mechanism. Does not transfer: icon-heavy sidebar, rounded pills at cell-grid cost.",
+    "evidence": "https://linear.app/now/behind-the-latest-design-refresh ; https://linear.app/now/how-we-redesigned-the-linear-ui",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: Zed (editor defaults as a design statement)",
+    "detail": "Defaults from assets/settings/default.json: minimap show 'never', thumb 'always', thumb_border 'left_open', max_width_columns 80; tabs close button 'hover', diagnostics off, git status off; search_on_type true, seed_search_query_from_cursor 'always', search_wrap true; scrollbar auto-hides and carries search results, selected text/symbol, diagnostics and git marks as ticks (the scrollbar does the minimap's job); cursor bar, blink on; buffer 15 / UI 16, line height 'comfortable' (1.618 per prior doc); status bar shows cursor position and language only, line endings and non-UTF-8 encoding only when unusual. Theme Builder (Feb 2026) links tokens (focus border, icon-to-text, shared panel/tab/surface base) so a theme cannot drift; 16 UI colour categories, 10 syntax. 1.9.0 (June 2026) added a project-search picker with live preview and resizable picker modals. Transfers: off-by-default minimap plus information-bearing scrollbar; incremental find seeded from the cursor; status bar that shows only what is non-default.",
+    "evidence": "https://raw.githubusercontent.com/zed-industries/zed/main/assets/settings/default.json ; https://zed.dev/blog/theme-builder ; https://zed.dev/releases/stable/1.9.0",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: VS Code (the minimap and find reference)",
+    "detail": "Minimap defaults from editorOptions.ts: enabled true, size 'proportional', side right, showSlider 'mouseover', renderCharacters true, maxColumn 120, scale 1, autohide none. Scrollbar 14 px vertical, 12 px horizontal. Find: seedSearchStringFromSelection 'always', addExtraSpaceOnTop true (the page scrolls so the first line is not hidden under the find widget), loop true, globalFindClipboard false. Caret smoothing and smooth scrolling off. Transfers: slider only on hover; find widget must not occlude text (addExtraSpaceOnTop is the exact fix for 'find covers my code'); 'proportional' means the map shrinks to the file only up to a cap, so a huge file gives a viewport slider of a few pixels, which is the 'thin line' Tobias saw and which Sublime avoids by scrolling the map.",
+    "evidence": "https://raw.githubusercontent.com/microsoft/vscode/main/src/vs/editor/common/config/editorOptions.ts",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: Sublime Text 4 (the reference Tobias grades against)",
+    "detail": "Build 4213 (21 Sep 2026) is current; GPU rendering since 4.0. Minimap: viewport box hidden until hover by default; forum reports that on files too tall for the map, the map itself scrolls with the document and click-to-scroll then misses (developer: it cannot satisfy all expectations); `minimap_scroll_to_clicked_text` false is a workaround that felt jittery. The settings page does not document defaults (they are in Preferences > Settings), so I could not extract minimap_style or find-panel defaults; they need a look at the real app. Transfers: the large-file minimap model (scrolling map plus viewport that tracks the document) is the behaviour Tobias asked for, and its known weakness (click mapping while the map scrolls) is a design constraint to test.",
+    "evidence": "https://www.sublimetext.com/blog/ ; https://forum.sublimetext.com/t/bug-minimap-does-not-scroll-to-cursor-on-large-files/18201 ; https://forum.sublimetext.com/t/minimap-viewport-indicator-turned-on-permanently/37228",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: Ghostty and Zed rendering (already in prior doc, here only the delta)",
+    "detail": "Ghostty: native widgets, cursor styles block/bar/underline/block_hollow, blink on unless the app requests otherwise, unfocused splits dimmed (minimum opacity 0.15 per config reference). Prior doc already has linear-corrected blending and Zed gamma 1.8. Transfer not yet in the workups: dimming of the unfocused pane/window as the focus signal instead of borders, which fits an editor with several windows or a find bar that holds focus.",
+    "evidence": "https://ghostty.org/docs/config/reference ; docs/design/state-of-design-2026.md section 2 refs [30][35]",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: iA Writer and Things (restraint and focus)",
+    "detail": "iA Writer: deliberately few features; monospace chosen 'because we want people to slow down' (founder quote via Macworld); Focus Mode dims everything except the current sentence/paragraph; the Mono/Duo/Quattro family modified from IBM Plex to remove IBM-typical round dots. Things (Apple Design Award 2009 and 2017): 'never feels messy or overbearing no matter the length of the list', animations keep your place, top-rated keyboard support. Transfer: focus dimming as an optional mode; emptiness as a feature; animation only to preserve spatial continuity (never on the typing path, per Law 2 and prior doc section 5). Evidence for Things is reviewer praise, not a design post.",
+    "evidence": "https://www.macworld.com/article/226417/ia-writer-3-0-1-review-mac-app-gets-back-to-basics-for-focused-writing.html ; https://ia.net/writer ; https://en.wikipedia.org/wiki/Things_(software)",
+    "severity": "polish"
+   },
+   {
+    "title": "Exemplar: Nova (Panic) and Raycast (weak evidence, flagged)",
+    "detail": "Nova: MacStories credits 'Mac-like' care: a real preferences pane instead of JSON, functional sidebar, git status in sidebar and editor; one developer-forum thread notes horizontal tabs crowd with many files. Raycast: stated principles fast, simple, delightful (official blog); 'Cmd-N picks the Nth result' with shortcuts shown inline (third-party analysis); 2.0 left beta 25 Aug 2026 and restyled for Liquid Glass (third-party, unverified); a motion token file listing 150/200 ms is a derived 'inspired by' file and must not be cited as Raycast's own. Transfer: discoverable shortcuts shown inline in palette rows; palette as a list with numbered picks. Do not transfer glass.",
+    "evidence": "https://www.macstories.net/reviews/nova-review-panics-code-editor-demonstrates-why-mac-like-design-matters/ ; https://raycast.com/blog/a-fresh-look-and-feel ; https://chatgate.ai/post/raycast-2-0 (secondary)",
+    "severity": "polish"
+   },
+   {
+    "title": "Type and colour systems worth borrowing from",
+    "detail": "Geist (Vercel with Basement Studio and Andres Briganti; influences Inter, Univers, SF Mono, Suisse, Diatype; Geist Mono meant for editors and terminals, OFL). Commit Mono (Eigil Nikolajsen; cites Jasper Morrison's Super Normal manifesto; weight 400 recommended for dark and 450 for light, so weight should follow theme; ligatures off by default; OFL). JetBrains Mono (Philipp Nurullin and Konstantin Bulenkov, from training knowledge). Inter (Rasmus Andersson), Monaspace (GitHub Next with Lettermatic), iA fonts (Oliver Reichenstein) are from training knowledge. Radix 12-step scale: 1-2 app/subtle background, 3-5 component fill rest/hover/active, 6-8 borders (subtle, interactive, strong/focus), 9-10 solid, 11 low-contrast text, 12 high-contrast text; for dark mode use step 1 or 2 as app background. New fact for sublimite: Commit Mono's advice that dark mode wants a lighter weight than light mode is a gradeable decision (does text weight differ between themes?).",
+    "evidence": "https://github.com/vercel/geist-font ; https://commitmono.com/ ; https://www.radix-ui.com/colors/docs/palette-composition/understanding-the-scale",
+    "severity": "polish"
+   },
+   {
+    "title": "Rubric for the council: 10 criteria, each scored 1 to 5 on a screenshot",
+    "detail": "Scale for every criterion: 1 = the failure named; 3 = acceptable default; 5 = exemplar-level. Contrast numbers are WCAG 2.2 ratios, computed as in docs/design/workups-2026-10-21/README.md (P).\nC1 Type size and rendering. 1: glyphs under 3 mm on the glass, or blurry/uneven stem weight, or a missing-glyph box. 3: legible, em about 28 px at 192-243 DPI (prior doc: 30 px = 3.14 mm), even weight. 5: crisp even stems, no fringes, one face with a fallback chain, line pitch a whole number of pixels, weight chosen per theme.\nC2 Contrast hierarchy. 1: UI chrome or minimap brighter than code text. 3: text at least 4.5:1, chrome below text. 5: strict ladder text > muted > gutter > minimap > hairline, comments readable at 4.5:1 or more, nothing but the caret and current match saturated.\nC3 Colour discipline. 1: more than one accent, pure red/green/yellow, pure #FFF on #000. 3: one accent, syntax hues clearly distinct. 5: one accent used only for caret, focus and current match; five or fewer low-chroma syntax hues at similar lightness; neutral greys share one tint; light and dark both pass.\nC4 Chrome density and quietness. 1: chrome competes with text (heavy borders, bright tab strip, labels touching edges). 3: chrome is flat and dimmer than the page. 5: Linear test, the active tab joins the page, structure felt not seen, at most hairline dividers, nothing in chrome that does no work.\nC5 Tab bar. 1: separators or markers as characters (| or *), no clear active tab. 3: clear active tab, readable labels. 5: compact, active tab continuous with the page, unsaved shown by a dot, close button on hover, overflow has a defined behaviour.\nC6 Status and gutter. 1: status line shouts or is missing information needed to work; gutter numbers as bright as code. 3: dim numbers, status with position. 5: current line number brighter than others, status shows only what is useful and non-default, readable in one glance, same grey family as chrome.\nC7 Minimap and scrollbar. 1: the map is the loudest column, or a huge file shows a hairline viewport, or the viewport does not track the pointer. 3: quiet texture, visible viewport. 5: map quieter than text, viewport visible and draggable at the pointer on a 1 GiB file (map scrolls like Sublime or has a defined minimum viewport height), scroll marks for find matches and caret.\nC8 Find and palette panel. 1: panel hides the match or changes layout under the user, Escape or tab close is ambiguous. 3: incremental find with a visible count. 5: search-as-you-type seeded from the selection, match count and current match emphasised, text never occluded (VS Code addExtraSpaceOnTop), one key to dismiss and focus returns to the caret, palette rows show shortcuts inline.\nC9 Selection, caret and match states. 1: states indistinguishable (selection vs find vs current line). 3: all four distinct. 5: selection about 24-27 percent accent over the page, current match different from other matches, 2 px bar caret that stays solid while typing, active line fill barely visible.\nC10 Empty and edge states. 1: broken layout in an empty tab, giant gaps, stale overlays. 3: blank page with intact chrome. 5: calm single-line empty state, minimap absent or consistent, no artefacts after any sequence of open/close/find.\nEach criterion can be graded from a still image except motion; motion (no animation on keyboard actions, one frame maximum) is graded from the code or a frame-timing note, not from screenshots, so it is left out of the ten.",
+    "evidence": "Built from sources above plus docs/design/state-of-design-2026.md sections 3, 4, 7 and workups README table (derivations there)",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "The design has no gradeable standard: edit-b0j (visual spec, P0) is still open since 2026-10-10, and the five workups exist as pictures but nothing scores shipped screenshots against them.",
+   "Awards (Apple Design Awards, Red Dot, iF) reward consumer apps and games; no code editor appears, so they cannot be the council's reference. The credible reference set is Linear, Zed, Sublime, VS Code, Ghostty, iA Writer.",
+   "The minimap complaints (empty tab artefacts, hairline viewport on big files) are a design-spec gap as well as bugs: Zed ships the minimap off, VS Code caps and shows the slider on hover, and Sublime scrolls the map on huge files; sublimite has no stated rule for any of these cases."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Design grading rubric and screenshot harness for the council",
+    "scope": "Check the 10 criteria (C1-C10) from this report into docs/design/rubric.md with anchors, and add tools/design_shots.sh that starts a private Xvfb (EDIT_REFUSE_REAL_DISPLAY=1, private XDG dirs), opens a fixed set of states (empty tab, C file, Markdown file, 1 GiB log, find open with matches, palette open, modified tab, light and dark) and writes PNGs to a stable directory with a manifest. No design changes.",
+    "acceptance": "Failing test first: tests/design_shots_test.sh (or a make target) that expects the manifest to list every state and every PNG to exist and be non-uniform (not a single colour); red because the script does not exist, green after. Running the harness twice yields identical PNGs for static states (byte compare), or the report names the nondeterministic region. Rubric file lists each criterion with 1/3/5 anchors; each number in an anchor has a derivation or a pointer to one.",
+    "files": "docs/design/rubric.md, tools/design_shots.sh, tests/design_shots_test.sh",
+    "size": "M"
+   },
+   {
+    "title": "Council protocol: score screenshots with Sol 6.1 and Opus, record scores",
+    "scope": "Write docs/design/council.md and a runner script that sends each manifest PNG plus the rubric to `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh` and to an Opus run, collects JSON scores per criterion with a one-line observation, and writes a table plus deltas between runs to docs/reviews/. Include a control: grade the same state twice and report disagreement, and grade the Sublime Text screenshot as a calibration point. Not run today.",
+    "acceptance": "Failing test first: a unit test of the score-aggregation script that feeds two canned JSON score files and expects a median, a per-criterion disagreement and a regression list; red before the script exists. Output schema rejects a score outside 1-5 or a missing criterion. Document that scores are advisory, per Law 1 (use is the gate).",
+    "files": "docs/design/council.md, tools/council_score.py, tests/council_score_test.py",
+    "size": "M",
+    "depends_on": "Design grading rubric and screenshot harness"
+   },
+   {
+    "title": "Minimap policy spec: empty tab, huge file, viewport tracking",
+    "scope": "Write down the decision for the minimap in docs/decisions/ as one page: show or hide by default (Zed hides, VS Code shows), width cap (Zed 80 columns, VS Code maxColumn 120), what happens when the file is taller than the map (scroll the map like Sublime, with a stated click mapping, or a minimum viewport height), when the viewport box shows (hover vs always), and what an empty buffer shows (nothing). Decision input for the two minimap bug beads being researched in parallel; no code.",
+    "acceptance": "The decision file states each case with the rule and one sentence of evidence from the exemplars above; a test list (names only) for each rule is attached so the implementing bead writes the failing tests first. Tobias approves before implementation.",
+    "files": "docs/decisions/minimap-policy.md",
+    "size": "S"
+   },
+   {
+    "title": "Apply workup 01 'Quiet tokens' as the default dark and light theme",
+    "scope": "Replace the 29 token values in src/config/theme.c with the dark and light values in docs/design/workups-2026-10-21/README.md table 01 (no layout changes, 0 B memory per the README). Keep the current theme selectable by name.",
+    "acceptance": "Failing test first: tests/config_theme_test.c asserts the contrast ratios of the table (text on bg at least 4.5:1 for every text pair, minimap below 2:1, gutter between 2.5 and 3:1) computed from the token values; red against today's theme (minimap 4.8:1), green after. make check passes. design_shots before/after attached to the bead; Tobias decides by use.",
+    "files": "src/config/theme.c, tests/config_theme_test.c",
+    "size": "S"
+   },
+   {
+    "title": "Find panel does not occlude text and has a defined dismiss/focus contract",
+    "scope": "Spec and implement, after the interaction-matrix research lands: when find opens the first visible line is not hidden (VS Code addExtraSpaceOnTop); Escape closes and returns the caret; closing a tab with find open closes find first or the tab, decided in the spec. Only the design rules here; the behaviour matrix comes from the other research topic.",
+    "acceptance": "Failing tests first in tests/findui_test.c: open find on line 1 and assert the first line is still visible after layout; open find then close tab and assert one defined outcome and no stale overlay in the next frame. Names and expected outcomes come from the matrix bead.",
+    "files": "src/findui, src/editor, tests/findui_test.c",
+    "size": "M",
+    "depends_on": "interaction-matrix research output"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Which exemplars do you actually admire? The council needs your pick (my candidates: Sublime as the baseline, Zed, Linear, iA Writer, Ghostty). A council grading against apps you do not care about wastes quota.",
+   "Should the minimap default to off, as in Zed, or stay on with a quiet texture, as in VS Code and Sublime? This decides whether the large-file minimap fix is worth doing first.",
+   "Calibrate with Sublime: may the harness screenshot Sublime Text on a private Xvfb as a calibration point, and is that allowed under CLAUDE.md Law 1 (a drive as a test tool, never a gate)?",
+   "How far should chrome go? Workup 02 spends two text rows (44 to 42 per the README) on a taller tab bar and a status row; workup 04 moves files to a rail. Which direction should the council reward?",
+   "Light theme: required for the first grading round, or dark only? The prior doc recommends following the system setting.",
+   "Quota: the council is two xhigh runs per state; how many states and rounds fit under the pace ceiling (Law 11)? I did not invent a number."
+  ],
+  "existing_beads": [
+   "edit-b0j",
+   "edit-1nm",
+   "edit-m3g",
+   "edit-29y2",
+   "edit-v0o.7",
+   "edit-5ih",
+   "edit-6e2",
+   "edit-36b3",
+   "edit-d5o",
+   "edit-73j"
+  ]
+ },
+ "council": {
+  "summary": "Protocol: a deterministic scene-capture harness (private Xvfb, frozen fixtures, 6 scenes x 2 themes = 12 PNGs, P: 6x2) feeds a two-member council (Codex gpt-6.1-sol xhigh and Claude Opus; no Gemini) that scores each scene 1-5 on 10 rubric criteria with written evidence. Grading is blind and pairwise (candidate vs current baseline, random A/B order, no mention of which is new), plus one sighted pass after to name fixes. The council only ranks and proposes; a change lands only if the council median rises with no regressed criterion AND Tobias's eye approves a before/after sheet (Law 1: use is the gate, scores are advisory). Loop shape is borrowed from tstack council (parallel read-only delegates, scores per round, orchestrator judges disagreements, scope-creep guard) with sol-loop's stopping rules; tstack has no design content, so the rubric, screenshots and A/B logic are ours. Awards (Apple Design Awards, Red Dot, iF) are consumer-app oriented, so the references are working tools: Sublime (baseline Tobias grades against), Zed, Linear, VS Code, Ghostty, iA Writer; Tobias should confirm the list. Reference images come only from public marketing pages/press kits/docs (used for private grading, never redistributed or committed) or Tobias's own captures; Sublime and Zed can be captured by Tobias on his machine. Codex accepts images (`codex exec -i/--image`, verified in --help), so both members see PNGs directly. Cost per iteration is 4 sighted-batch calls per candidate-vs-baseline blind pass (2 members x 2 themes, P: 2x2), plus 2 for the sighted fix pass; per-scene calls (24, P: 2x12) are the fallback if a batch hides detail. The first thing to build is the capture script, then the scoring runner; neither changes the editor. Design changes themselves reuse the existing workups (01 Quiet tokens is S and 0 B memory per its README) as the first candidate, which also exercises the loop end to end.",
+  "findings": [
+   {
+    "title": "Scenes: fixed matrix, rendered deterministically",
+    "detail": "Scenes (6): S1 empty tab; S2 C source file (a frozen copy of src/piece/piece.c lines, same as workups baseline); S3 find open with matches and a current match; S4 palette open; S5 many tabs (enough to overflow the strip; count chosen as strip width / min label width, derived at build time, not guessed); S6 large file with minimap (generated by tools/mkcorpus to a fixed size and seed, scrolled to a fixed offset). x 2 themes (dark, light) = 12 PNGs (P: 6x2). Determinism: private Xvfb at 3296x2060x24, -dpi 192 (as given in the topic brief; workups used 243 DPI, so pin one and record it in the manifest), -noreset, private XDG dirs, EDIT_REFUSE_REAL_DISPLAY=1 (src/main.c:34), reuse tools/with_display_lock.sh for the display guard, fixed window size via xdotool, fixed fonts (fonts-go + Noto Emoji per memory note), caret blink frozen or sampled at a fixed phase, mouse parked off-window, wait for N identical consecutive captures before saving (stability check), and run twice and byte-compare as the self-test; differing regions are reported, not hidden.",
+    "evidence": "src/main.c:34; Makefile:193 SAFE_DISPLAY; tools/with_display_lock.sh:37; docs/design/workups-2026-10-21/README.md (baseline.png on private Xvfb :96)",
+    "severity": "polish"
+   },
+   {
+    "title": "References: legal sourcing",
+    "detail": "Exemplar images are inputs to private grading only; they are not committed to the repo or published. Sources, in order: (1) Tobias's own captures of the apps he has installed (Sublime for sure; Zed/VS Code are free and capturable on a private Xvfb or his desktop) on the same fixture file and same scene list, which also makes them comparable; (2) official marketing screenshots and press kits (Linear, Zed, iA Writer, Ghostty docs) fetched with WebFetch and stored under a gitignored refs/ directory with a SOURCES.md of URLs and fetch dates; (3) no scraping of paywalled or licensed galleries. Marketing shots are staged, so the council is told they are aspirational, not like-for-like; captured Sublime is the calibration anchor. Nothing here imitates or republishes a third party's brand.",
+    "evidence": "Best-design research report (Linear, Zed, VS Code, Sublime, Ghostty, iA Writer); Law 1 amendment 2026-10-26 allows Sublime drives as a test tool",
+    "severity": "polish"
+   },
+   {
+    "title": "Council: members, blindness, rubric",
+    "detail": "Members: Codex gpt-6.1-sol at xhigh (CLAUDE.md Law 10: Opus-grade, `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh -s read-only --skip-git-repo-check -i <png>... -o out.md`) and Claude Opus. Two members only: tstack council expects three providers and reports an unreachable one rather than substituting, so we name members explicitly. No Fable (Law 10). Sonnet is not a member; Sonnet only runs scripts. Rubric: the 10 criteria from the best-design research (C1 type rendering, C2 contrast hierarchy, C3 colour discipline, C4 chrome quietness, C5 tab bar, C6 status and gutter, C7 minimap and scrollbar, C8 find and palette, C9 selection/caret/match states, C10 empty and edge states), anchors 1/3/5, checked into docs/design/rubric.md. Motion is excluded from screenshot grading (graded from code). Blind pass: the member sees two images per scene labelled X and Y in random order, with no word on which is new, and returns per criterion a score for each plus a one-sentence evidence quote tied to a pixel region. Controls: one scene pair is submitted with identical images (expect equal scores; disagreement measures noise) and the captured Sublime scene is scored as calibration. Sighted pass: after blind scoring, members are told which is the candidate and asked for the top 3 concrete fixes ranked, each naming the token or layout element.",
+    "evidence": "tstack skills/council/SKILL.md and sol-loop/SKILL.md (per research input); codex exec --help shows -i/--image and --output-schema",
+    "severity": "polish"
+   },
+   {
+    "title": "Disagreement and acceptance",
+    "detail": "Per criterion, score = mean of the two members; a disagreement of 2 or more points on a criterion is not averaged away, it is listed with both quotes and Tobias or the coordinator decides (the tstack rule: orchestrator judgment, no vote). Council acceptance: candidate median over scenes is not lower on any criterion beyond the measured noise (identical-pair control gap) and higher on at least one the change targets. Then Tobias's eye on a before/after contact sheet is the second, binding half (Law 1: milestones exit by use; scores advisory). Cost gate per Law 4: each candidate bead states memory and typing-path cost with derivation as the workups README does (for example 01 is 0 B because the same 29 tokens change value; 02 net -971,200 B is derived there); any candidate that adds allocation on input -> mutation -> layout -> submit is rejected by Law 2 and the counting-allocator test regardless of score. The only enforced perf guard stays G1 in tests/editor_test.c; benches are notes only.",
+    "evidence": "CLAUDE.md Laws 1, 2, 4; docs/design/workups-2026-10-21/README.md comparison table",
+    "severity": "polish"
+   },
+   {
+    "title": "Proposing a change: mock first, then a one-worker bead",
+    "detail": "Step 1 mock: the sighted pass or Tobias names a weakness; a worker produces an SVG/PNG mock (as the workups did, cairo drawn at the capture resolution) and the council grades the mock against the baseline blind, cheaply, before any code. Step 2 bead: only mocks that win the council and Tobias's eye become a one-worker bead with scope, acceptance (red test first: for token changes a contrast-ratio test on theme values, for layout changes a render/layout test), files, and the cost derivation. Step 3: the harness re-captures the real build and the same blind comparison runs on real pixels, since mocks lie about glyph rendering and grid snapping (every chrome bar is a whole number of rows, per the workups README grid fact). One axis changes per candidate so score deltas are attributable; hill-climb = one accepted candidate becomes the new baseline.",
+    "evidence": "docs/design/workups-2026-10-21/README.md (grid fact; mocks were SVG+PNG); CLAUDE.md Law 9",
+    "severity": "polish"
+   },
+   {
+    "title": "Stopping rule",
+    "detail": "Per candidate: max 3 council rounds (copied from sol-loop default; no extension, there is no security/data-loss class here), stop earlier if a round yields only nits (no criterion delta beyond the control noise). Per campaign: stop when Tobias says the look is done by use, or when two consecutive accepted-candidate attempts fail to raise any criterion beyond noise (plateau). Never stop on a numeric total alone, since ten 1-5 scores are a coarse proxy. The campaign is explicitly not for today; the order of work is bug fixes first (the minimap and find bugs from the other topics), because an empty-tab minimap artefact is C10=1 regardless of palette.",
+    "evidence": "tstack sol-loop (3 rounds, nit-only stop); research root cause: edit-b0j still open since 2026-10-10",
+    "severity": "polish"
+   },
+   {
+    "title": "Quota and lanes",
+    "detail": "Calls per iteration, derived from the design above (P, arithmetic, not measured usage): blind pass = 2 members x 2 themes with one batched call each carrying that theme's 6 scene pairs = 4 calls; control and calibration ride inside those same calls (extra images, no extra calls); sighted fix pass = 2 calls (one per member, dark+light together) = 6 calls per candidate round. Fallback if batching blurs detail: one call per scene per member = 2x12 = 24 calls per blind pass. Three rounds per candidate = 18 calls (P: 6x3) in the batched design. Lanes: Codex sol xhigh is the preferred worker while Codex is behind pace (Law 10, PLAN 5.7); Opus member is one call per batch from the main coordinator session (Opus is permitted to coordinate); capture and scoring scripts are Sonnet/Haiku beads or Codex; implementation beads follow existing routing. Before each dispatch wave the coordinator runs `quota` and defers Claude calls if any window is more than +2 % ahead of pace (Law 11); Codex calls shift to the other lane when it is the one ahead. No number of campaigns is committed here; the real cost per call is to be measured on the first run and written into the worklog.",
+    "evidence": "CLAUDE.md Laws 10 and 11; PLAN.md lines 19, 190-191",
+    "severity": "polish"
+   },
+   {
+    "title": "What is not in the protocol on purpose",
+    "detail": "No automatic merge on score. No Gemini substitute. No screenshots of real files from Tobias's profile (fixtures only, so nothing private reaches a model). No redistributing third-party images. No taste judgments about brand identity (name 'sublimit\u00e9', icon) in the rubric; those stay Tobias's.",
+    "evidence": "Topic brief and CLAUDE.md Law 1",
+    "severity": "polish"
+   }
+  ],
+  "root_causes": [
+   "There is no gradeable standard: edit-b0j (visual spec, open since 2026-10-10) never produced a scored rubric, and the five 2026-10-21 workups exist as pictures only, with no repeatable capture or scoring.",
+   "Screenshots of the installed build were taken ad hoc on a hand-started Xvfb (workups baseline), so before/after comparisons are not reproducible.",
+   "tstack council is a code-review loop with no design rubric, so the design hill-climb needs its own rubric, rendering and blind A/B logic."
+  ],
+  "proposed_beads": [
+   {
+    "title": "Scene-capture harness: tools/design_shots.sh renders 6 scenes x 2 themes deterministically",
+    "scope": "Script that starts a private Xvfb (3296x2060x24, pinned DPI, -noreset), private XDG dirs, EDIT_REFUSE_REAL_DISPLAY=1, uses tools/with_display_lock.sh, opens frozen fixtures from tests/fixtures/design/ (C file, mkcorpus large file with fixed seed and size, many-tab set), drives scenes with xdotool (empty tab, code, find with matches, palette, many tabs, large file with minimap) for dark and light, waits for stable frames, writes PNGs plus manifest.json (scene, theme, sha256, DPI, binary hash, power state from /sys/class/power_supply/BAT0/status). No editor changes.",
+    "acceptance": "Red first: tests/design_shots_test.sh expects manifest.json to list 12 entries and each PNG to exist and have more than one colour; fails because the script does not exist. Green after. Second test runs the harness twice and byte-compares PNGs, listing differing scenes (blinking caret must be handled so static scenes match). Kills its Xvfb and editor on exit, even on failure. Every number in the script (window size, wait frames) has a derivation comment.",
+    "files": "tools/design_shots.sh, tests/design_shots_test.sh, tests/fixtures/design/*",
+    "size": "M"
+   },
+   {
+    "title": "Design rubric and reference-sheet spec",
+    "scope": "Check the 10 criteria with 1/3/5 anchors into docs/design/rubric.md (WCAG ratios derived as in the workups README), docs/design/references.md with the exemplar list (pending Tobias's pick), legal sourcing rules and a SOURCES template, and a .gitignore entry for docs/design/refs/. No code.",
+    "acceptance": "A lint script tests/rubric_lint_test.py (red first: file missing) checks that all 10 criteria exist with 1, 3 and 5 anchors and that any numeric anchor has a derivation or tag (P/M/E/G). Tobias approves the exemplar list before any council run.",
+    "files": "docs/design/rubric.md, docs/design/references.md, .gitignore, tests/rubric_lint_test.py",
+    "size": "S"
+   },
+   {
+    "title": "Council runner: blind pairwise scoring with Codex sol and Opus, JSON output and aggregation",
+    "scope": "tools/council_run.py sends, per theme, the scene pairs (baseline vs candidate in random seeded order, one identical control pair, optionally the Sublime calibration image) plus the rubric to codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh -s read-only --skip-git-repo-check -i <png...> --output-schema <schema.json> -o out.json (< /dev/null for background use), and to an Opus run through the claude CLI with the same prompt; aggregate script computes per-criterion mean, member disagreement of 2 or more, control-pair noise, regression list, and writes docs/reviews/design-council-<date>.md. Dry-run mode prints calls and the count without invoking models. Scores marked advisory.",
+    "acceptance": "Red first: tests/council_aggregate_test.py feeds two canned JSON score files and expects mean, disagreement list, noise gap and regression list; fails before the script exists. Schema rejects a score outside 1-5 or a missing criterion; the dry-run count equals 4 calls for the batched design (2 members x 2 themes), asserted in the test. The blind prompt must not contain the words baseline, candidate, new or old (test greps the generated prompt).",
+    "files": "tools/council_run.py, tools/council_schema.json, tests/council_aggregate_test.py, docs/design/council.md",
+    "size": "M",
+    "depends_on": "Design rubric and reference-sheet spec; Scene-capture harness"
+   },
+   {
+    "title": "First loop candidate: apply workup 01 Quiet tokens as a theme (end-to-end trial of the protocol)",
+    "scope": "Replace the 29 token values in src/config/theme.c with the dark/light values of workups table 01; keep the current theme selectable by name. Capture before/after with the harness, run one council round, and produce a before/after contact sheet for Tobias. No layout change.",
+    "acceptance": "Red first: tests/config_theme_test.c asserts the contrast ratios of the table (text on bg at least 4.5:1 for text pairs, minimap below 2:1, gutter about 2.7:1) from token values; fails on today's theme, passes after. make check green. Cost line: 0 B memory (same 29 tokens, README derivation); no typing-path change. Tobias decides by use.",
+    "files": "src/config/theme.c, tests/config_theme_test.c",
+    "size": "S",
+    "depends_on": "Scene-capture harness"
+   }
+  ],
+  "open_questions_for_tobias": [
+   "Which exemplars do you actually admire? Candidates: Sublime (baseline), Zed, Linear, iA Writer, Ghostty, VS Code. The council should grade against only the ones you pick.",
+   "May we capture Sublime Text (and Zed/VS Code if installed) on your machine as calibration references, kept local and gitignored?",
+   "Light theme in the first grading round, or dark only?",
+   "Minimap default: off (Zed style) or quiet texture on (Sublime/VS Code)? This decides how much C7 matters and whether the large-file minimap fix comes before any design work.",
+   "Two-member council (Sol + Opus) is accepted, with disagreements of 2 or more points decided by you or the coordinator?",
+   "Which direction should the council reward for chrome: the calm 2-row chrome of workup 02, the left rail of 04, or just 01 tokens first?",
+   "How many council rounds per week are you willing to spend under the Law 11 pace ceiling? I only derived calls per round (6 per candidate round), not a quota budget."
+  ]
+ }
+}
