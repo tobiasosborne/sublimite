@@ -1,3 +1,24 @@
+# HANDOFF — sublimité, end of session 24 on the ThinkPad (2026-10-27 ~15:40 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "please stop work now. recover/save what you can commit and push")
+
+## Read first (session 25)
+**Tobias's findings from daily use became epic edit-cxho (research: docs/reviews/use-findings-2026-10-27/; worklog docs/worklog/2026-10-27.md).** Two lanes all day (Codex sol xhigh via build/briefs/launch24.sh, Opus/Sonnet via the Agent tool), landed serially by the coordinator: commit in .wt/<bead>-s24, rebase once (build/briefs/land24.sh), touched suites under ASan on :95/:97, ff, close, full make check on main before each install.
+
+**Landed today (main 9dcdf6f):** cxho.1 empty-tab minimap bands; cxho.2 find panel lets window commands through; cxho.3 find field/document focus, clickable toggles; cxho.25 P1 jump-to-top while typing in wrapped mode (multi-key frames, soft-wrap growth, paste; seeded random test 0/15012 violations) and cxho.26 its root cause (busy layout restart left zeroed rows; readers audited; large lazy files); cxho.4/.5/.6 drag-and-drop open on X11 (parser, XDND, editor); cxho.12 incremental find; cxho.13 prefill + Ctrl+E/F3 family; cxho.7 two reproduced crashes (input flood behind a pending open, busy Ctrl+W); cxho.8/.9/.10 Sublime-style minimap (constant box, scrolling thumb, real lines, 1:1 drag, 0 px off at 10 positions); cxho.27 wrap default for extension-less files; cxho.16 modal interaction matrix test; cxho.17 go-to/palette/menu/close-prompt consistency (matrix 307 PASS, 1 XFAIL for cxho.18); cxho.21 tools/design_shots.sh (8 scenes x dark/light, byte-identical).
+
+**Installed:** ~/.local/bin/sublimite = main 6667453 (14:27; full make check 112 green). NOT yet installed: cxho.27, .16, .17, .21. First action next session: full `make check` on main, then `make install`, tell Tobias (go-to/palette/menu now behave like find; README/notes wrap).
+
+**Open, waiting on Tobias:** edit-cxho.6 stays in progress until he confirms a live drag from Nemo (recipe in docs/worker-reports/edit-cxho.6-s24.md); dotfile wrap and case-insensitive .MD (edit-cxho.28 notes); whether to run a bolder second round of persona images (docs/design/persona-workups-2026-10-27/, seven Codex image-generation redesigns: Ive, Saarinen, Reichenstein, Kouthoofd, Andersson, Mrgan, Yuan).
+
+**Next, in order:** cxho.18 (find-in-files lifecycle; last matrix XFAIL), cxho.15 (find options/history), cxho.22-.24 (design rubric, council runner with Codex sol -i images + Opus, first candidate; Tobias: references from any app with window/tabs/bottom minibar, leading figures, not only editors), cxho.14 (find all needs multi-selection: a separate feature), cxho.19/.20 (Wayland/Win32 drop; .20 and the dnd entry in mk/win.mk are uncompiled for Windows: check on Spiral), P4 cxho.11, .28, .30.
+
+**Quota at the stop (M, 14:39):** Claude weekly 95 % (3.6 % behind; reset 16:59 today). Codex weekly 29 % (+10.9 % ahead), driven mostly by other sessions on the shared account (gpt-6-astra lanes in explorations/ and riemann-channel); hold sol dispatch until it is back near pace.
+
+**Box:** ThinkPad; Xvfb :95, :97, :99 up (-noreset). Worktrees .wt/edit-cxho.*-s24 all landed and removable. A flake seen once under load: editor_test:2360 settle in review_replay_slices (passed 2/2 on rerun); dataloss_test:1839 once (cxho.27 report). Spiral's Windows line (W2.4a/c landing, W2.4d) is untouched since session 23: see the Spiral section below.
+
+Everything below is the earlier handoffs, kept for their state.
+
+---
+
 # HANDOFF — sublimité, end of session 23 on Spiral (2026-10-26 ~20:50 box clock; Opus 5.5 coordinator in the main session, Tobias present; stopped on his word "time to stop; please recover what you can, update handoff, commit and push")
 
 ## Read first (session 24 on Spiral)
