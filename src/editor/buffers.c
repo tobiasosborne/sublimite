@@ -520,14 +520,21 @@ int editor_add_recovered_buffer(editor *e, const char *path, uint64_t *id)
 {
     return add_buffer(e, path, NULL, 0, id, false);
 }
+static bool tab_command_busy(editor *e)
+{
+    if (!editor_activation_busy(e)) return false;
+    e->stats.rejected_commands++; return true;
+}
 int editor_select_tab(editor *e, size_t index)
 {
-    if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
+    if (!e) return EDITOR_ERR_ARG;
+    if (tab_command_busy(e)) return 0;
     int rc = tabs_select(&e->tabs, index, &e->v.state); return rc ? EDITOR_ERR_ARG : editor_activate(e);
 }
 int editor_cycle_tab(editor *e, bool reverse)
 {
-    if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
+    if (!e) return EDITOR_ERR_ARG;
+    if (tab_command_busy(e)) return 0;
     if (!tabs_count(&e->tabs)) return 0;
     int rc = tabs_mru_step(&e->tabs, reverse, &e->v.state); return rc ? rc : editor_activate(e);
 }
@@ -558,7 +565,8 @@ static bool close_unsaved(const editor_buffer *b, const tabs_tab *tab)
 }
 static int close_tab(editor *e, size_t index, bool discard)
 {
-    if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
+    if (!e) return EDITOR_ERR_ARG;
+    if (tab_command_busy(e)) return 0;
     const tabs_tab *tab = tabs_at(&e->tabs, index); if (!tab) return EDITOR_ERR_ARG;
     if (e->cfg.allow_close && !e->cfg.allow_close(e->cfg.hook_ctx, tab->id, tab->modified)) return 0;
     editor_buffer *b = find_buffer(e, tab->buffer);
@@ -595,6 +603,7 @@ static int user_close(editor *e, size_t index, bool discard)
 }
 int editor_close_request(editor *e)
 {
+    if (tab_command_busy(e)) return 0;
     size_t index = tabs_active_index(&e->tabs);
     const tabs_tab *tab = tabs_at(&e->tabs, index);
     if (!tab || !close_unsaved(e->buffer, tab) || e->buffer->derived || e->buffer->placeholder) return user_close(e, index, false);
@@ -637,7 +646,8 @@ int editor_close_service(editor *e)
 }
 int editor_reopen_tab(editor *e)
 {
-    if (!e || editor_activation_busy(e)) return EDITOR_ERR_ARG;
+    if (!e) return EDITOR_ERR_ARG;
+    if (tab_command_busy(e)) return 0;
     uint64_t id; int rc = tabs_reopen(&e->tabs, &e->v.state, &id);
     if (rc == TABS_ERR_EMPTY || rc == TABS_ERR_CAPACITY) return 0;
     if (!rc) rc = editor_activate(e);

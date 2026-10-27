@@ -423,6 +423,7 @@ struct editor {
     plat_event queue[EDITOR_INPUT_CAP];
     uint64_t queue_owner[EDITOR_INPUT_CAP], queue_generation[EDITOR_INPUT_CAP];
     size_t queue_head, queue_count;
+    bool input_notice_pending; /* excess input awaits a visible status frame */
     size_t index_cursor; /* round-robin dirty-buffer maintenance */
     editor_delta edit_delta, replay_delta;
     uint64_t replay_old_nl, replay_before_len;

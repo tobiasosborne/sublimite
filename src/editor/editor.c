@@ -830,17 +830,75 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
     int limit = ms > INT_MAX ? INT_MAX : (int)ms;
     return requested < 0 || requested > limit ? limit : requested;
 }
+static const char input_full_notice[] = "input queue full: excess input ignored";
+static bool pointer_event(const plat_event *event)
+{ return event->kind == PLAT_EV_MOTION || event->kind == PLAT_EV_WHEEL; }
+static int32_t wheel_sum(int32_t a, int32_t b)
+{
+    /* (P) Sum in the wider type, then saturate to plat_event's signed range. */
+    int64_t sum = (int64_t)a + b;
+    return sum > INT32_MAX ? INT32_MAX : sum < INT32_MIN ? INT32_MIN : (int32_t)sum;
+}
+static bool coalesce_pointer(editor *e, plat_event *event, uint64_t owner, uint64_t generation)
+{
+    if (!pointer_event(event)) return false;
+    /* Only the trailing pointer run can merge: keys, buttons, focus changes
+     * and other controls remain ordering barriers. Keep the latest motion
+     * and the wheel sum, placed at the latest event's position in that run.
+     * (P) a count n addresses ring offset n - 1; zero ends the walk. */
+    for (size_t n = e->queue_count; n; n--) {
+        size_t at = (e->queue_head + n - 1u) % EDITOR_INPUT_CAP;
+        const plat_event *old = &e->queue[at];
+        if (!pointer_event(old) || old->mods != event->mods || old->buttons != event->buttons ||
+            old->state != event->state) break;
+        if (old->kind != event->kind) continue;
+        if (e->queue_owner[at] != owner || e->queue_generation[at] != generation ||
+            (event->kind == PLAT_EV_WHEEL && old->smooth != event->smooth)) break;
+        if (event->kind == PLAT_EV_WHEEL) {
+            event->dx = wheel_sum(old->dx, event->dx);
+            event->dy = wheel_sum(old->dy, event->dy);
+            event->t0_ns = old->t0_ns;
+        }
+        queue_remove(e, n - 1u); return true;
+    }
+    return false;
+}
+static int input_notice(editor *e)
+{
+    if (!e->input_notice_pending) return 0;
+    bool repaint = e->recovery_notice != input_full_notice ||
+        e->recovery_notice_mutations != e->stats.mutations;
+    e->recovery_notice = input_full_notice;
+    e->recovery_notice_mutations = e->stats.mutations;
+    if (repaint) e->recovery_notice_shown = false;
+    /* Retained keys may mutate before the first frame. Keep the notice
+     * current through their drain, then use the ordinary status lifetime. */
+    e->input_notice_pending = e->queue_count || editor_activation_busy(e);
+    return repaint ? editor_full_layout(e) : 0;
+}
 int editor_inject(editor *e, const plat_event *event)
 {
     if (!e || !event || event->utf8_len > PLAT_UTF8_MAX) return EDITOR_ERR_ARG;
     /* Closing is control flow, independent of command/view/journal capacity. */
     if (event->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
-    if (e->queue_count == EDITOR_INPUT_CAP) return EDITOR_ERR_INPUT_FULL;
-    size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
-    e->queue[at] = *event; e->queue_serial[at] = ++e->event_serial;
     bool parked = (e->buffer->pending_open || e->buffer->placeholder) && !editor_event_control(e, event);
-    e->queue_owner[at] = parked ? e->buffer->id : 0;
-    e->queue_generation[at] = parked ? e->buffer->source_generation : 0;
+    uint64_t owner = parked ? e->buffer->id : 0;
+    uint64_t generation = parked ? e->buffer->source_generation : 0;
+    bool waiting = e->buffer->pending_open || e->buffer->placeholder || editor_activation_busy(e) ||
+        e->file_command != KEYS_ACTION_NONE || (e->journal && (e->op_count || e->journal_metadata_pending)) ||
+        layout_busy(&e->lay) || e->full_pending || !e->paint_ready;
+    plat_event combined = *event;
+    if (waiting || e->queue_count == EDITOR_INPUT_CAP) (void)coalesce_pointer(e, &combined, owner, generation);
+    if (e->queue_count == EDITOR_INPUT_CAP) {
+        /* Recoverable overload: preserve the accepted FIFO, discard the new
+         * event, count the rejection and paint a notice on the next turn. */
+        e->stats.rejected_commands++; e->input_notice_pending = true;
+        return 0;
+    }
+    size_t at = (e->queue_head + e->queue_count) % EDITOR_INPUT_CAP;
+    e->queue[at] = combined; e->queue_serial[at] = ++e->event_serial;
+    e->queue_owner[at] = owner;
+    e->queue_generation[at] = generation;
     e->queue_count++; return 0;
 }
 static int close_result(editor *e, int timeout_ms)
@@ -958,6 +1016,7 @@ int editor_step(editor *e, int timeout_ms)
     rc = editor_pointer_tick(e); if (rc) return fail(e, rc);
     if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
     editor_hl_request(e);
+    rc = input_notice(e); if (rc) return fail(e, rc);
     uint64_t submit_start = trace_now_ns(); rc = submit(e);
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);

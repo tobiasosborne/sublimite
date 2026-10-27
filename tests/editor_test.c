@@ -2219,12 +2219,15 @@ static int review_replay_slices(void)
     T(editor_length(e) == 4096);
     uint8_t committed[4096]; T(editor_read(e, 0, committed, sizeof committed) == 0);
     for (size_t i = 0; i < sizeof committed; i++) T(committed[i] == 'x');
-    T(editor_select_tab(e, 1) == EDITOR_ERR_ARG);
-    T(editor_close_tab(e, 0) == EDITOR_ERR_ARG);
-    T(editor_reopen_tab(e) == EDITOR_ERR_ARG);
+    /* edit-cxho.7 (P): each busy tab command is a counted successful no-op;
+     * unit increments count the commands actually issued below. */
+    uint64_t rejected = e->stats.rejected_commands;
+    T(editor_select_tab(e, 1) == EDITOR_OK); T(e->stats.rejected_commands == ++rejected);
+    T(editor_close_tab(e, 0) == EDITOR_OK); T(e->stats.rejected_commands == ++rejected);
+    T(editor_reopen_tab(e) == EDITOR_OK); T(e->stats.rejected_commands == ++rejected);
     T(editor_add_buffer(e, NULL, NULL, 0, &other) == EDITOR_ERR_ARG);
     ipc_request request = {0}; T(editor_open_request(e, &request, 0) == EDITOR_ERR_ARG);
-    T(editor_cycle_tab(e, false) == EDITOR_ERR_ARG);
+    T(editor_cycle_tab(e, false) == EDITOR_OK); T(e->stats.rejected_commands == ++rejected);
     T(editor_set_cursor(e, 0) == EDITOR_ERR_ARG); T(editor_jump_line(e, 0) == EDITOR_ERR_ARG);
     T(e->action == EDITOR_ACTION_REPLAY_WORK && tabs_active_index(&e->tabs) == 0);
     T(settle(e) == 0); T(editor_length(e) == 0);
@@ -7262,7 +7265,193 @@ static int drop_failure_contract(void)
     editor_close(e); T(drop_fixture_close(&f) == 0);
     puts("edit-cxho.6 drop: capacity/memory/stat/parse failures recover; arena reused passed"); return 0;
 }
+/* edit-cxho.7 (E): the brief supplies the 1100-event reproduction burst;
+ * (P) it exceeds EDITOR_INPUT_CAP. The pending-open fixture is the bounded
+ * prefix plus the literal remainder, held on the existing bulk-worker gate.
+ * Geometry reuses review_pending_controls (E). Zero means success/absence/
+ * first index; unit steps count events, skip NUL, or select the other tab. */
+static int parked_input_case(bool opening, plat_ev_kind kind)
+{
+    const size_t events = 1100u; /* (E) requested reproduction burst, above capacity */
+    T(events > EDITOR_INPUT_CAP);
+    const char source[] = "a a";
+    char path[] = "build/cxho7-input-XXXXXX";
+    int fd = mkstemp(path); T(fd >= 0);
+    T(write(fd, source, sizeof source - 1u) == (ssize_t)(sizeof source - 1u));
+    T(ftruncate(fd, (off_t)(FILE_PREFIX_MAX + sizeof source - 1u)) == 0);
+    T(close(fd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+    editor_config cfg = {.initial = (const uint8_t *)source, .initial_len = sizeof source - 1u,
+        .cols = 40, .rows = 4, .wrap_mode = -1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    review_hold hold = {0};
+    if (opening) {
+        work_handle held = work_submit(&e->pool, (work_job){review_hold_job, &hold, 0, WORK_BULK});
+        T(held.epoch);
+        while (!atomic_load(&hold.entered)) sched_yield();
+        uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(e->buffer->pending_open);
+    } else {
+        T(press(e, key('h', PLAT_MOD_CTRL, NULL)) == 0);
+        T(press(e, key('a', 0, "a")) == 0);
+        T(findui_set_replacement(&e->find, (const uint8_t *)"b", sizeof "b" - 1u,
+            sizeof "b" - 1u) == FINDUI_OK);
+        plat_event all = key(XKB_KEY_Return, PLAT_MOD_CTRL | PLAT_MOD_ALT, NULL);
+        T(editor_find_key(e, &all)); T(e->find_replace_active);
+        e->find_focus = EDITOR_FIND_DOCUMENT;
+    }
+    plat_event ev = kind == PLAT_EV_KEY ? key('x', 0, "x") :
+        (plat_event){.kind = kind, .x = 0, .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h),
+            .dx = -PLAT_WHEEL_UNIT, .dy = PLAT_WHEEL_UNIT};
+    int inject_rc = 0;
+    edit_malloc_guard_begin();
+    for (size_t i = 0; i < events; i++) {
+        if (kind == PLAT_EV_MOTION) ev.x = (int32_t)i;
+        int rc = editor_inject(e, &ev);
+        if (rc && !inject_rc) inject_rc = rc;
+    }
+    size_t allocations = edit_malloc_guard_end();
+    size_t queued = e->queue_count;
+    bool preserved = true;
+    if (kind == PLAT_EV_MOTION) {
+        preserved = queued == 1u && e->queue[e->queue_head].x == (int32_t)(events - 1u);
+    } else if (kind == PLAT_EV_WHEEL) {
+        preserved = queued == 1u && e->queue[e->queue_head].dy == (int32_t)events * PLAT_WHEEL_UNIT &&
+            e->queue[e->queue_head].dx == -(int32_t)events * PLAT_WHEEL_UNIT;
+    } else {
+        preserved = queued == EDITOR_INPUT_CAP &&
+            e->stats.rejected_commands == events - EDITOR_INPUT_CAP;
+    }
+    atomic_store(&hold.release, true);
+    int running = settle(e);
+    bool alive = !e->error && !e->quit;
+    printf("edit-cxho.7 %s %s: inject_rc=%d error=%d queued=%zu preserved=%s running=%s mallocs=%zu\n",
+        opening ? "pending-open" : "replace-all", kind == PLAT_EV_MOTION ? "MOTION" :
+        kind == PLAT_EV_WHEEL ? "WHEEL" : "KEY", inject_rc, e->error, queued,
+        preserved ? "yes" : "no", !running && alive ? "yes" : "no", allocations);
+    fflush(stdout);
+    if (kind == PLAT_EV_KEY && !inject_rc) {
+        uint8_t retained[EDITOR_INPUT_CAP];
+        T(editor_read(e, 0, retained, sizeof retained) == 0);
+        for (size_t i = 0; i < sizeof retained; i++) T(retained[i] == 'x');
+        T(e->recovery_notice && strstr(e->recovery_notice, "input"));
+        if (e->find_visible) T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
+        T(e->recovery_notice_shown);
+        const render_grid *grid = editor_grid(e);
+        T(grid->cells[(size_t)(grid->dims.rows - 1u) * grid->dims.cols].glyph_index == (uint32_t)'i');
+        T(press(e, key('y', 0, "y")) == 0); T(!e->recovery_notice);
+    }
+    editor_close(e); T(unlink(path) == 0);
+    T(!inject_rc && preserved && alive && !running && !allocations);
+    return 0;
+}
+static int parked_open_motion(void) { return parked_input_case(true, PLAT_EV_MOTION); }
+static int parked_open_wheel(void) { return parked_input_case(true, PLAT_EV_WHEEL); }
+static int parked_open_key(void) { return parked_input_case(true, PLAT_EV_KEY); }
+static int parked_replace_motion(void) { return parked_input_case(false, PLAT_EV_MOTION); }
+static int parked_replace_wheel(void) { return parked_input_case(false, PLAT_EV_WHEEL); }
+static int parked_replace_key(void) { return parked_input_case(false, PLAT_EV_KEY); }
+
+/* (P) Every implemented tab action in editor_dispatch_action, with distinct
+ * names for the switch variants. A go-to continuation is an activation-busy
+ * state whose queue still dispatches tab commands before continuing the jump.
+ * This white-box hold needs no file size or timing assumption. */
+static int parked_tab_commands(void)
+{
+    const keys_action actions[] = {KEYS_ACTION_CLOSE, KEYS_ACTION_CLOSE_FILE,
+        KEYS_ACTION_NEXT_VIEW_STACK, KEYS_ACTION_PREVIOUS_VIEW_STACK,
+        KEYS_ACTION_NEXT_VIEW, KEYS_ACTION_PREVIOUS_VIEW, KEYS_ACTION_SELECT_TAB,
+        KEYS_ACTION_SELECT_LAST_TAB, KEYS_ACTION_REOPEN_FILE, KEYS_ACTION_NEW_FILE};
+    bool passed = true;
+    for (size_t i = 0; i < sizeof actions / sizeof *actions; i++) {
+        render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+        editor_config cfg = {.cols = 40, .rows = 4};
+        editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+        uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
+        T(editor_close_tab(e, tabs_active_index(&e->tabs)) == 0); T(settle(e) == 0);
+        e->action = EDITOR_ACTION_GOTO; T(editor_activation_busy(e));
+        keys_binding binding = {.action = actions[i]};
+        plat_event ev = key(XKB_KEY_F1, 0, NULL);
+        edit_malloc_guard_begin();
+        int rc = editor_dispatch_action(e, &ev, &binding, KEYS_MATCH);
+        size_t allocations = edit_malloc_guard_end();
+        bool ok = !rc && !e->error && !allocations && tabs_count(&e->tabs) == 1u &&
+            tabs_active_index(&e->tabs) == 0 && !e->close_prompt.owner;
+        if (actions[i] != KEYS_ACTION_NEW_FILE) ok = ok && e->stats.rejected_commands == 1u;
+        printf("edit-cxho.7 busy tab action=%d: rc=%d error=%d\n", (int)actions[i], rc, e->error);
+        fflush(stdout);
+        passed = passed && ok;
+        e->action = EDITOR_ACTION_NONE;
+        T(settle(e) == 0); T(!e->error && !e->quit);
+        editor_close(e);
+    }
+    T(passed); return 0;
+}
+
+static int parked_tab_loop(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4}; /* (E) same fixture geometry */
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->action = EDITOR_ACTION_GOTO;
+    plat_event close = key('w', PLAT_MOD_CTRL, NULL);
+    T(editor_inject(e, &close) == 0);
+    int rc = editor_step(e, 0);
+    printf("edit-cxho.7 busy Ctrl+W through input loop: rc=%d error=%d rejected=%llu\n",
+        rc, e->error, (unsigned long long)e->stats.rejected_commands);
+    fflush(stdout);
+    bool alive = rc >= 0 && !e->error && !e->quit;
+    e->action = EDITOR_ACTION_NONE;
+    if (alive) T(settle(e) == 0);
+    editor_close(e);
+    T(alive); return 0;
+}
+
+/* (P) The sequence below defines the expected queue length, wheel sums and
+ * ring wrap: starting at the last slot crosses the ring after one insertion.
+ * INT32_MIN/MAX are plat_event's representable limits, not scroll budgets. */
+static int parked_pointer_order(void)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.cols = 40, .rows = 4}; /* (E) same fixture geometry */
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    e->action = EDITOR_ACTION_GOTO; e->queue_head = EDITOR_INPUT_CAP - 1u;
+    plat_event motion = {.kind = PLAT_EV_MOTION, .x = 0, .y = 0};
+    plat_event wheel = {.kind = PLAT_EV_WHEEL, .dx = INT32_MIN, .dy = INT32_MAX};
+    T(editor_inject(e, &motion) == 0); T(editor_inject(e, &wheel) == 0);
+    motion.x++; T(editor_inject(e, &motion) == 0);
+    T(editor_inject(e, &wheel) == 0);
+    T(e->queue_count == 2u); /* (P) latest motion plus summed wheel */
+    T(e->queue[e->queue_head].kind == PLAT_EV_MOTION && e->queue[e->queue_head].x == motion.x);
+    size_t tail = (e->queue_head + 1u) % EDITOR_INPUT_CAP;
+    T(e->queue[tail].kind == PLAT_EV_WHEEL && e->queue[tail].dx == INT32_MIN &&
+        e->queue[tail].dy == INT32_MAX);
+    plat_event barrier = key('x', 0, "x");
+    T(editor_inject(e, &barrier) == 0); motion.x++;
+    T(editor_inject(e, &motion) == 0);
+    T(e->queue_count == 4u); /* (P) prior pair plus the key and later motion */
+    motion.buttons = 1u; /* (P) left-button bit in plat_event's mask */
+    T(editor_inject(e, &motion) == 0);
+    T(e->queue_count == 5u); /* (P) changed button state starts a separate run */
+    plat_event button = {.kind = PLAT_EV_BUTTON, .code = 1u, .press = true};
+    T(editor_inject(e, &button) == 0); T(editor_inject(e, &motion) == 0);
+    T(e->queue_count == 7u); /* (P) prior sequence plus button and later motion */
+    e->queue_count = 0; /* (P) discard fixture events before releasing the hold */
+    e->action = EDITOR_ACTION_NONE; T(settle(e) == 0); T(!e->error && !e->quit);
+    editor_close(e); puts("edit-cxho.7 pointer order, ring wrap and wheel saturation: PASS"); return 0;
+}
+
 static const test_selector selectors[] = {
+    {"--cxho7-open-motion", parked_open_motion},
+    {"--cxho7-open-wheel", parked_open_wheel},
+    {"--cxho7-open-key", parked_open_key},
+    {"--cxho7-replace-motion", parked_replace_motion},
+    {"--cxho7-replace-wheel", parked_replace_wheel},
+    {"--cxho7-replace-key", parked_replace_key},
+    {"--cxho7-tabs", parked_tab_commands},
+    {"--cxho7-tab-loop", parked_tab_loop},
+    {"--cxho7-pointer-order", parked_pointer_order},
     {"--drop-pair", drop_pair_contract},
     {"--drop-directory", drop_directory_contract},
     {"--drop-overflow", drop_overflow_contract},
@@ -7405,6 +7594,11 @@ int main(int argc, char **argv)
     if (allocation) return allocation_test(!strcmp(allocation, "raster"));
     const char *only = getenv("EDITOR_REVIEW_ONLY");
     if (only) return review_suite(only);
+    T(parked_open_motion() == 0); T(parked_open_wheel() == 0); T(parked_open_key() == 0);
+    T(parked_replace_motion() == 0); T(parked_replace_wheel() == 0); T(parked_replace_key() == 0);
+    T(parked_tab_commands() == 0);
+    T(parked_tab_loop() == 0);
+    T(parked_pointer_order() == 0);
     T(trailing_typing(NULL) == 0); T(trailing_all() == 0);
     T(trailing_selection() == 0); T(trailing_disabled_scan() == 0);
     T(paint_all_void() == 0);

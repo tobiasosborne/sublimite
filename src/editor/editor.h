@@ -150,6 +150,8 @@ void editor_close(editor *e);
 int editor_font_request(editor *e, const char *family, const char *file);
 /* Fixed queue; stamp ingress when drained by step, not when injected. Native
  * events and injected events take the same command/layout/submit path.
+ * Parked pointer runs coalesce. Excess events are ignored with a status notice
+ * and counted in rejected_commands; queue pressure is a successful no-op.
  * CLOSE requests an immediate stop, even when command storage is full.
  * Shutdown flushes applied edits; commands still queued are not applied. */
 int editor_inject(editor *e, const plat_event *event);
