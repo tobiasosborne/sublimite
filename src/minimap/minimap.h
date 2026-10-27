@@ -122,6 +122,12 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
                  uint32_t first_col, uint32_t width,
                  uint64_t first_line, uint64_t visible_lines,
                  const minimap_style *style);
+/* Pending scrollbar geometry (no compatible summaries): whether summary row
+ * r of rows paints the viewport [first_line, end_line) of a lines-line
+ * source. minimap_fill's pending branch and the editor's grab hit share it
+ * (edit-cxho.1), so the painted band and the grabbable band cannot drift. */
+bool minimap_pending_band(uint64_t lines, uint32_t rows, uint32_t r,
+                          uint64_t first_line, uint64_t end_line);
 /* y is a strip row (pixel_y/cell_h), clamped for dragging outside the strip.
  * Small hits use exact cached line starts. Large hits resolve via index on
  * demand (one existing line_to_byte query, may scan one chunk); idx must model

@@ -444,6 +444,44 @@ static void pending_navigation(void)
     CHECK(f.calls == 0);
     puts("review 8: pending index paints current byte scrollbar and drag works: ok");
 }
+/* edit-cxho.1: an unfilled map has no summaries, so fill paints the pending
+ * scrollbar. (P) a one-line source in a strip of more rows than lines owns
+ * one row, as minimap_prepare's one-line-per-row grouping gives it; the band
+ * may light only that row. 100 rows is the bead's fixture (any rows > lines
+ * shows it); width 4 reuses the strip widths above. Occupied columns are
+ * ceil(64 * 4 / 255) = 2, the pending ink coverage minimap_fill uses. The
+ * three-line case puts the one-line viewport on the middle line. */
+static void pending_one_line(void)
+{
+    enum { rows = 100, width = 4, occupied = 2 };
+    flat f = {(const uint8_t *)"x", 1, 0, 0};
+    minimap_input in = {{&f,f.n,span,NULL},1,1,false};
+    minimap_row summaries[rows]; minimap m; render_grid g;
+    render_cell cells[rows * width]; uint64_t dirty[2];
+    CHECK(minimap_init(&m,summaries,rows) == 0 && !m.filled);
+    CHECK(render_grid_init(&g,(render_dims){width,rows,1,1},cells,rows*width,dirty,2) == 0);
+    CHECK(render_frame_begin(&g,1) == 0);
+    CHECK(minimap_fill(&m,&in,&g,0,width,0,1,&style) == 0 && m.stale && !m.filled && f.calls == 0);
+    uint32_t ink = model_blend(style.background,style.density,64);
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t c = 0; c + 1 < width; c++) {
+            uint32_t plain = c < occupied ? ink : style.background;
+            uint32_t want = r ? plain : c == 0 ? model_blend(plain,style.viewport,96)
+                                      : model_blend(plain,style.viewport,32);
+            if (cells[r*width+c].bg != want)
+                fprintf(stderr, "row %u col %u bg %06x want %06x\n", r, c, cells[r*width+c].bg, want);
+            CHECK(cells[r*width+c].bg == want);
+        }
+        CHECK(cells[r*width+width-1].bg == style.stale); /* the pending edge bar stays */
+    }
+    /* The editor's grab hit (paint.c map_grab) uses this same predicate. */
+    for (uint32_t r = 0; r < rows; r++) {
+        CHECK(minimap_pending_band(1,rows,r,0,1) == (r == 0));
+        CHECK(minimap_pending_band(3,rows,r,1,2) == (r == 1));
+    }
+    minimap_fini(&m);
+    puts("edit-cxho.1: pending one-line map lights only its own row: ok");
+}
 static void deferred_samples(void)
 {
     virtual_source f = {{0},0}; memset(f.block,'x',sizeof f.block);
@@ -496,7 +534,7 @@ int main(void)
 {
     character_marks(); viewport_geometry(); pixel_geometry(); dump_map();
     deferred_samples();
-    pending_navigation();
+    pending_navigation(); pending_one_line();
     cache_identity();
     uint8_t mixed[600];
     for (size_t i = 0; i < sizeof mixed; i++) mixed[i] = i%99 == 98 ? '\n' : i%7 == 0 ? '\t' : i%11 == 0 ? ' ' : i%3 == 0 ? 0xff : 'x';

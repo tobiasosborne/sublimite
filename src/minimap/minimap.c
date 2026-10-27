@@ -252,6 +252,21 @@ static int validate(const minimap *m, const minimap_input *input,
     return MINIMAP_OK;
 }
 
+bool minimap_pending_band(uint64_t lines, uint32_t rows, uint32_t r,
+                          uint64_t first_line, uint64_t end_line)
+{
+    if (!rows || r >= rows || first_line >= end_line) return false;
+    /* edit-cxho.1 (P): fewer lines than rows maps one line per row, as
+     * minimap_prepare groups them (lines_per_row = 1), so row r is line r and
+     * rows past the last line hold none; overlap is half-open, as for ready
+     * summaries. Otherwise row r spans floor(lines * r / rows) up to the next
+     * row's start, with the existing inclusive lower-bound overlap rule. */
+    if (lines < rows) return r < lines && r < end_line && first_line <= r;
+    uint64_t row_line = scale(lines, r, rows);
+    uint64_t next_line = scale(lines, r + 1, rows);
+    return row_line < end_line && first_line <= next_line;
+}
+
 int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
                  uint32_t first_col, uint32_t width,
                  uint64_t first_line, uint64_t visible_lines,
@@ -303,12 +318,8 @@ int minimap_fill(minimap *m, const minimap_input *input, render_grid *grid,
                          + m->rows[r - 1].line_count <= first_line);
         bool bottom = viewport && (r + 1 == m->active_rows
                                   || m->rows[r + 1].first_line >= end);
-        if (m->stale && !retained) {
-            uint64_t row_line = scale(input->lines, r, grid->dims.rows);
-            uint64_t next_line = scale(input->lines, r + 1, grid->dims.rows);
-            viewport = first_line < end && row_line < end
-                && first_line <= next_line;
-        }
+        if (m->stale && !retained)
+            viewport = minimap_pending_band(input->lines, grid->dims.rows, r, first_line, end);
         render_cell *dst = &grid->cells[(size_t)r * grid->dims.cols + first_col];
         bool changed = false;
         for (uint32_t c = 0; c < width; c++) {

@@ -4699,6 +4699,45 @@ static int unicode_editor_contract(void)
      * "73j-å文" currently renders blank after its ASCII prefix on main too. */
     editor_close(e); puts("edit-73j production Unicode body atlas contract passed"); return 0;
 }
+/* edit-cxho.1: closing the last tab activates the zero-tab fallback buffer
+ * (e->empty, never installed in e->buffers). Its worker map must publish and
+ * release its snapshot like any tab's, so the strip shows a fresh untitled
+ * tab's thin viewport rather than the pending scrollbar. (P) the fallback is
+ * empty: one line, one summary, which the existing minimap geometry paints
+ * as two pixel scanlines (minimap_pixels: two per summary); every scanline
+ * below is background, including the last column (no pending bar). Window
+ * geometry reuses minimap_pending_contract's 40x8; the three-line file is
+ * any small named source. */
+static int minimap_last_tab_contract(void)
+{
+    const char text[]="a\nb\nc\n";
+    char path[]="build/cxho1-map-XXXXXX"; int fd=mkstemp(path); T(fd>=0);
+    T(write(fd,text,sizeof text-1)==(ssize_t)(sizeof text-1)); close(fd);
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.path=path,.cols=40,.rows=8,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle_map(e)==0);
+    T(tabs_count(&e->tabs)==1 && e->map_cols && e->buffer->map.filled);
+    T(editor_close_tab(e,0)==0);
+    T(tabs_count(&e->tabs)==0 && e->buffer==e->empty);
+    uint64_t deadline=trace_now_ns()+UINT64_C(5000000000); /* existing settle bound */
+    do { T(editor_step(e,0)>=0); sched_yield(); }
+    while ((e->buffer->map_snapshot || !e->buffer->map.filled || e->buffer->map.stale || e->dirty) &&
+        trace_now_ns()<deadline);
+    T(settle(e)==0);
+    printf("edit-cxho.1 last tab: filled=%d stale=%d snapshot=%s\n", e->buffer->map.filled,
+        e->buffer->map.stale, e->buffer->map_snapshot ? "held" : "released");
+    T(e->buffer==e->empty && e->buffer->map.filled && !e->buffer->map.stale && !e->buffer->map_snapshot);
+    const render_pixels *region=&e->grid.region;
+    uint32_t background=config_theme_color(e->preferences.theme,"editor.background");
+    T(region->pixels && region->width && region->height>2u);
+    uint32_t edge=region->pixels[0]; T(edge!=background);
+    for (uint32_t y=0;y<region->height;y++) for (uint32_t x=0;x<region->width;x++) {
+        uint32_t px=region->pixels[(size_t)y*region->stride+x], want=y<2u ? edge : background;
+        if (px!=want) { printf("edit-cxho.1 pixel x=%u y=%u is %06x, want %06x\n",x,y,px,want); T(false); }
+    }
+    editor_close(e); unlink(path);
+    puts("edit-cxho.1 last-tab close: empty fallback map fills, single-row viewport passed"); return 0;
+}
 static int minimap_protected_contract(void)
 {
     /* G: reuse two index chunks; the viewport occupies the first, and the
@@ -6104,7 +6143,7 @@ static int select_73j_find(void)
 }
 static int select_73j_minimap(void)
 {
-    return minimap_pending_contract() || minimap_protected_contract();
+    return minimap_pending_contract() || minimap_last_tab_contract() || minimap_protected_contract();
 }
 static int select_panel_state(void)
 {
@@ -6492,6 +6531,7 @@ static const test_selector selectors[] = {
     {"--73j-find", select_73j_find},
     {"--73j-font", unicode_editor_contract},
     {"--73j-minimap", select_73j_minimap},
+    {"--cxho1-minimap", minimap_last_tab_contract},
     {"--73j-mouse", mouse_contract},
     {"--73j-wheel", wheel_contract},
     {"--minimap-flash", minimap_typing_flash},
@@ -6595,7 +6635,7 @@ int main(int argc, char **argv)
     T(a7fo_click_contract(1,true,0)==0); T(a7fo_click_contract(1,true,30)==0); T(a7fo_click_contract(-1,true,30)==0);
     T(find_follow_before_top_contract()==0);
     T(mouse_contract()==0); T(wheel_contract()==0); T(findpanel_contract()==0); T(findpanel_cancel_error_contract()==0); T(findpanel_far_wrap_contract()==0);
-    T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_protected_contract()==0);
+    T(unicode_editor_contract()==0); T(minimap_pending_contract()==0); T(minimap_last_tab_contract()==0); T(minimap_protected_contract()==0);
     T(minimap_typing_flash() == 0);
     T(default_center() == 0); T(default_skip() == 0); T(default_word() == 0); T(default_goto() == 0); T(default_goto_cold() == 0); T(default_comments() == 0); T(undo_shrink_top() == 0); T(goto_scroll() == 0); T(default_edits() == 0); T(default_states() == 0); T(default_noop() == 0); T(default_soft_history() == 0); T(default_clipboard_line() == 0); T(default_chord_repeat() == 0); T(default_soft_lines() == 0); T(default_notices() == 0); T(default_history_anchor() == 0); T(default_soft_capacity() == 0);
     T(selection_chords() == 0);

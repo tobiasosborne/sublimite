@@ -366,15 +366,7 @@ static bool map_grab(editor *e, const minimap_input *input, int64_t y)
             const minimap_row *v = &map->rows[r];
             band = v->line_count && first < end && v->first_line < end &&
                 first < v->first_line + v->line_count;
-        } else {
-            /* (P) floor(lines * row / rows), split before multiplying so
-             * even a byte-sized line estimate cannot overflow. Match the
-             * pending scrollbar's inclusive lower-bound overlap rule. */
-            uint64_t after = (uint64_t)r + 1u;
-            uint64_t lo = input->lines / rows * r + input->lines % rows * r / rows;
-            uint64_t hi = input->lines / rows * after + input->lines % rows * after / rows;
-            band = first < end && lo < end && first <= hi;
-        }
+        } else band = minimap_pending_band(input->lines, rows, r, first, end); /* edit-cxho.1: the painted pending band */
         if (band) {
             if (top == height) top = (int64_t)r * e->map_grid.dims.cell_h;
             bottom = ((int64_t)r + 1) * e->map_grid.dims.cell_h;

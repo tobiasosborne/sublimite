@@ -23,12 +23,19 @@ static void prepare_map(work_ctx *ctx)
     uintptr_t identity=(uintptr_t)b; memcpy(msg.data,&identity,sizeof identity);
     if (!work_publish(ctx,&msg)) (void)work_continue(ctx);
 }
+/* edit-cxho.1: slot buffer_capacity is the zero-tab fallback e->empty, which
+ * is never installed in e->buffers (large.c's receiver covers it the same
+ * way); its map job must publish and release its snapshot like any tab's. */
+static editor_buffer *map_buffer(const editor *e, size_t i)
+{
+    return i<e->buffer_capacity ? (e->buffers ? e->buffers[i] : NULL) : e->empty;
+}
 bool editor_map_receive(editor *e, const work_msg *msg)
 {
     if (msg->kind!=EDITOR_MAP_MESSAGE) return false;
     uintptr_t identity=0; memcpy(&identity,msg->data,sizeof identity);
-    for (size_t i=0;i<e->buffer_capacity;i++) {
-        editor_buffer *b=e->buffers ? e->buffers[i] : NULL;
+    for (size_t i=0;i<=e->buffer_capacity;i++) {
+        editor_buffer *b=map_buffer(e,i);
         if (!b || (uintptr_t)b!=identity || b->map_handle.epoch!=msg->epoch_ ||
             b->map_handle.slot!=msg->slot_) continue;
         b->map_received=true;
@@ -71,8 +78,8 @@ static int defer(editor *e, editor_buffer *b)
 }
 int editor_map_service(editor *e)
 {
-    for (size_t i=0;i<e->buffer_capacity;i++) {
-        editor_buffer *b=e->buffers ? e->buffers[i] : NULL;
+    for (size_t i=0;i<=e->buffer_capacity;i++) {
+        editor_buffer *b=map_buffer(e,i);
         if (!b) continue;
         if (b->map_snapshot && (b->map_received || b->retired || b->source_stale) &&
             work_handle_finished(&e->pool,b->map_handle)) {
