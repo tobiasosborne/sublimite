@@ -895,6 +895,77 @@ static void wrapped_relative(void)
     destroy(&plain); destroy(&exact); destroy(&rel); free(we); free(wr); free(p);
     puts("edit-wv7: wrapped relative document End/Home match view_command without a line query");
 }
+/* edit-cxho.26: the stale bottom-row comparisons left after edit-cxho.25.
+ * c26_place puts the twin layout at a visual top and the view on it. */
+static void c26_place(fixture *f, wrap_twin *w, const layout_wrap_row *top, uint64_t first_line, uint64_t cursor, bool relative)
+{
+    CHECK(render_frame_begin(&w->grid,2)==RENDER_OK);
+    CHECK(layout_begin_visual(&w->l,f->tree,(layout_viewport){0},top)==LAYOUT_DONE);
+    int rc; do { rc=layout_run(&w->l); } while(rc==LAYOUT_MORE); CHECK(rc==LAYOUT_DONE);
+    view_state s=f->v.state; s.wrap=true; s.first_byte=top->line_start; s.first_line=first_line; s.visual_byte=top->start;
+    s.selection=(view_selection){cursor,cursor,VIEW_PREFERRED_UNSET}; s.visual_end=false; s.approximate=false;
+    view_change c={0};
+    CHECK(finish_command(f,relative?view_relative_restore(&f->v,&s,&c):view_restore(&f->v,&s,&c))==VIEW_OK && !c.changed);
+    CHECK(f->v.state.visual_byte==top->start && f->v.state.selection.cursor==cursor);
+}
+/* A letter typed at the end of the bottom row's line, then the relative
+ * repair (lazy file, inexact line count) the editor runs for it. (P) The
+ * stale bottom row's next is the old line end + 1 = the new caret. */
+static void c26_relative_letter(bool resident)
+{
+    /* resident: short lines. Not resident: the top is a continuation row
+     * near the end of a line of 69995 bytes (> LAYOUT_BYTE_BUDGET = 65536,
+     * so the caret's row comes from the anchored query). */
+    size_t lead=resident?0u:69995u; const char tail[]="row one\nabc\ndef\nghi\n";
+    size_t n=lead+(resident?0u:1u)+sizeof tail-1u; uint8_t *p=malloc(n); CHECK(p);
+    memset(p,'a',lead); if(!resident) p[lead]='\n';
+    memcpy(p+n-(sizeof tail-1u),tail,sizeof tail-1u);
+    /* (P) tail spelling: resident rows abc|def|ghi from byte 8, bottom line
+     * ghi ends at 19; anchored rows a{5}|row one|abc, abc ends at base+11. */
+    uint64_t base=resident?0u:lead+1u, top_byte=resident?8u:69990u, bottom_end=resident?19u:base+11u;
+    fixture f; init(&f,p,n,3,10); wrap_twin *w=calloc(1,sizeof *w); CHECK(w); wrap_twin_init(w,&f);
+    layout_wrap_row top={.start=top_byte,.line_start=resident?8u:0u,.line=resident?1u:0u,.column=resident?0u:top_byte,.continuation=!resident};
+    c26_place(&f,w,&top,top.line,bottom_end,true);
+    CHECK(w->l.wrap_rows[2].next==bottom_end+1u);                       /* the bottom row is the caret's line */
+    CHECK(piece_insert(f.tree,bottom_end,(const uint8_t *)"x",1)==0);
+    CHECK(layout_edit(&w->l,bottom_end,0,1,0,0)==LAYOUT_MORE);
+    view_state s=f.v.state; s.selection=(view_selection){bottom_end+1u,bottom_end+1u,VIEW_PREFERRED_UNSET};
+    view_change c={0};
+    CHECK(finish_command(&f,view_relative_restore(&f.v,&s,&c))==VIEW_OK && !c.changed && f.v.relative);
+    if(f.v.state.visual_byte!=top_byte)
+        fprintf(stderr,"edit-cxho.26 relative letter (%s): top %llu -> %llu, caret %llu on the bottom row\n",resident?"resident":"anchored",
+            (unsigned long long)top_byte,(unsigned long long)f.v.state.visual_byte,(unsigned long long)f.v.state.selection.cursor);
+    CHECK(f.v.state.visual_byte==top_byte);
+    destroy(&f); free(w); free(p);
+}
+/* LAYOUT_RESET (an edit before a continuation top on its line) leaves the
+ * layout idle with pre-edit rows until the host re-lays out. Motions before
+ * that must not follow from its stale bottom row. (P) 40 'a' then 35 'a'
+ * fill four 10-column rows; the fourth row starts at byte 30. */
+static void c26_reset_motion(void)
+{
+    const char text[]="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nx\ny\nz\n";
+    fixture f; init(&f,(const uint8_t *)text,sizeof text-1u,3,10); wrap_twin *w=calloc(1,sizeof *w); CHECK(w); wrap_twin_init(w,&f);
+    layout_wrap_row top={.start=20,.line_start=0,.line=0,.column=20,.continuation=true};
+    c26_place(&f,w,&top,0,25,false);
+    CHECK(piece_delete(f.tree,0,5,NULL)==0);
+    CHECK(layout_edit(&w->l,0,5,0,0,0)==LAYOUT_RESET && !layout_busy(&w->l));
+    view_state s=f.v.state; s.selection=(view_selection){0,0,VIEW_PREFERRED_UNSET};
+    view_change c={0};
+    CHECK(finish_command(&f,view_restore(&f.v,&s,&c))==VIEW_OK && f.v.state.visual_byte==0);
+    for(int k=0;k<3;k++) (void)command(&f,VIEW_DOWN,false,NULL,0);
+    uint64_t cursor=f.v.state.selection.cursor, row_start=cursor/10u*10u;   /* (P) rows of 10 'a' */
+    if(f.v.state.visual_byte+20u<row_start)
+        fprintf(stderr,"edit-cxho.26 reset motion: caret %llu (row %llu) hidden below top %llu\n",(unsigned long long)cursor,
+            (unsigned long long)row_start,(unsigned long long)f.v.state.visual_byte);
+    CHECK(cursor==30 && f.v.state.visual_byte+20u>=row_start && f.v.state.visual_byte<=row_start);
+    destroy(&f); free(w);
+}
+static void c26_bottom_row(void)
+{
+    c26_relative_letter(true); c26_relative_letter(false); c26_reset_motion();
+    puts("edit-cxho.26: relative placement and motions after LAYOUT_RESET follow fresh rows");
+}
 int main(int argc, char **argv)
 {
 #if defined(_WIN32)
@@ -913,6 +984,9 @@ int main(int argc, char **argv)
         if(argc==1 || strcmp(argv[1],reviews[i].name)==0) reviews[i].run();
     if(argc==2 && strcmp(argv[1],"dz0")==0) { relative_restore(); return 0; }
     if(argc==2 && strcmp(argv[1],"wv7")==0) { wrapped_relative(); return 0; }
-    if(argc==1) { relative_restore(); wrapped_relative(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
+    if(argc==2 && strcmp(argv[1],"c26-resident")==0) { c26_relative_letter(true); return 0; }
+    if(argc==2 && strcmp(argv[1],"c26-anchored")==0) { c26_relative_letter(false); return 0; }
+    if(argc==2 && strcmp(argv[1],"c26-reset")==0) { c26_reset_motion(); return 0; }
+    if(argc==1) { c26_bottom_row(); relative_restore(); wrapped_relative(); scripts(); joins(); long_lines(); scroll_and_selection(); allocation_log(); wrap_selection(); wrap_port(); }
     puts("view_test: all passed"); return 0;
 }

@@ -78,8 +78,13 @@ void layout_wrap_geometry(layout *l)
 }
 void layout_wrap_begin(layout *l)
 {
-    l->hscroll=0; l->wrap_planning=false; l->wrap_fill=l->grid->dims.rows;
-    memset(l->wrap_rows,0,(size_t)l->grid->dims.rows*sizeof *l->wrap_rows);
+    l->hscroll=0; l->wrap_planning=false; l->wrap_fill=l->grid->dims.rows; l->wrap_stale=false;
+    /* edit-cxho.26: rows not yet laid out are empty, as past EOF: zeroed
+     * rows read as real rows at byte 0 (a restart while busy left the bottom
+     * row's next at 0, so every caret was "below the screen"). end_row
+     * seeds each next row as layout reaches it. */
+    const layout_wrap_row empty={.start=LAYOUT_VOID_ROW,.end=LAYOUT_VOID_ROW,.next=LAYOUT_VOID_ROW};
+    for(uint32_t r=1;r<l->grid->dims.rows;r++) { l->wrap_rows[r]=empty; l->row_byte[r]=LAYOUT_VOID_ROW; }
     l->wrap_rows[0]=(layout_wrap_row){.start=l->first_byte,.line_start=l->first_byte,.line=l->first_line};
 }
 int layout_begin_visual(layout *l,const piece_tree *t,layout_viewport vp,const layout_wrap_row *first)
@@ -472,7 +477,7 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
                                         : l->line_count-old_nl+new_nl;
     if(off<l->first_byte) {
         if(off+old_len>l->first_byte || (off+old_len==l->first_byte && old_nl)) {
-            l->first_line_valid=false; return LAYOUT_RESET;
+            l->first_line_valid=false; l->wrap_stale=true; return LAYOUT_RESET;
         }
         l->first_byte=l->first_byte-old_len+new_len; l->first_line=l->first_line-old_nl+new_nl;
         shift_bytes(l,0,off,old_len,new_len);
@@ -494,7 +499,7 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
     if(found+1u==rows && l->wrap_plan[found].next>context) context=l->wrap_plan[found].next;
     if(off>context && off-context>4u) return LAYOUT_DONE;
     uint32_t first=found; while(first && l->wrap_rows[first-1].line_start==hit->line_start) first--;
-    if(l->wrap_rows[first].continuation && off<l->wrap_rows[first].start) return LAYOUT_RESET;
+    if(l->wrap_rows[first].continuation && off<l->wrap_rows[first].start) { l->wrap_stale=true; return LAYOUT_RESET; }
     uint32_t after=found+1; while(after<rows && l->row_byte[after]!=LAYOUT_VOID_ROW && l->wrap_rows[after].line_start==hit->line_start) after++;
     shift_bytes(l,after,off,old_len,new_len);
     l->bytes_scanned=l->bytes_read=l->cache_hits=l->cache_misses=0; l->wrap_fill=rows;
@@ -508,6 +513,27 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
     return LAYOUT_MORE;
 }
 
+/* edit-cxho.26: rows [0, k) are current. Busy, wrap_rows[k].start is
+ * current too (*frontier): the seed of the row being laid out (end_row
+ * derives it from the previous row; a restart seeds row 0), or while planning
+ * the edited line's first row, which layout_wrap_edit keeps (edits at or after
+ * it leave its start; one before a continuation top is LAYOUT_RESET). */
+static uint32_t current_rows(const layout *l,const piece_tree *t,bool *frontier)
+{
+    *frontier=false;
+    if(!l->wrap || !l->wrap_rows || !l->grid || l->src!=t || l->is_snap || l->total!=piece_len(t) ||
+       !l->first_line_valid || l->wrap_stale) return 0;
+    uint32_t n=l->grid->dims.rows;
+    if(!layout_busy(l)) return n;
+    uint32_t k=l->wrap_planning?l->wrap_first:l->row;
+    if(k>n) k=n;
+    *frontier=k<n && l->wrap_rows[k].start!=LAYOUT_VOID_ROW;
+    return k;
+}
+uint32_t layout_wrap_current_rows(const layout *l,const piece_tree *t)
+{
+    bool frontier; return l && t ? current_rows(l,t,&frontier) : 0u;
+}
 static bool contains(const layout_wrap_row *r,uint64_t byte)
 {
     return r->start!=LAYOUT_VOID_ROW && byte>=r->start && (byte<=r->end || (r->newline && byte<r->next)) &&
@@ -664,7 +690,9 @@ int layout_visual_row(const layout *l,const piece_tree *t,uint64_t byte,int dire
 {
     if(!l || !l->grid || !l->wrap || !t || !out || !approximate || byte>piece_len(t) || direction< -1 || direction>1) return LAYOUT_ERR_ARG;
     *approximate=false;
-    if(!layout_busy(l) && l->src==t && l->total==piece_len(t)) {
+    /* edit-cxho.26: only rows current for t; LAYOUT_RESET leaves an idle
+     * layout with pre-edit rows until the host lays out again. */
+    if(layout_wrap_current_rows(l,t)==l->grid->dims.rows) {
         uint32_t rows=l->grid->dims.rows;
         for(uint32_t i=0;i<rows;i++) if(contains(&l->wrap_rows[i],byte)) {
             const layout_wrap_row *r=NULL;
@@ -715,6 +743,18 @@ int layout_visual_row_fresh(const layout *l,const piece_tree *t,uint64_t byte,
     return rc;
 }
 
+/* edit-cxho.26: one row up the walk. On the caret's certified logical line
+ * the anchored query; above it only the resident top's seed, never a piece
+ * line query (an unindexed lazy file resolves those from byte 0). */
+static int row_above(const layout *l,const piece_tree *t,uint64_t byte,const layout_wrap_row *line,
+                     layout_wrap_row *out,bool *approximate)
+{
+    if(!line) return layout_visual_row_fresh(l,t,byte,out,approximate);
+    if(byte>=line->line_start) return layout_visual_row_anchored(l,t,byte,line->line_start,line->line,out,approximate);
+    layout_wrap_row seed;
+    if(!resident_seed(l,t,byte,&seed)) return LAYOUT_ERR_STATE;
+    return layout_visual_row_fresh(l,t,byte,out,approximate);
+}
 /* edit-cxho.25: after a mutation, before relayout, decide the wrapped top
  * from the text, not from the pre-edit bottom row. Rows [0, certified) of
  * the cached viewport are proven current: layout_wrap_edit restarts work at
@@ -725,16 +765,23 @@ int layout_visual_row_fresh(const layout *l,const piece_tree *t,uint64_t byte,
  * the top. d < rows: keep the top. rows <= d <= rows-1+max_scroll: the row
  * rows-1 above the caret is the minimal top (caret on the bottom row).
  * Farther: the caret's row is the top (a far jump, as before). Cost (P): at
- * most rows-1+max_scroll fresh row queries; typing inside a line stops one
- * row above the line's first row. */
-int layout_wrap_follow_edit(const layout *l,const piece_tree *t,uint64_t top,const layout_wrap_row *caret,
-                            uint32_t max_scroll,layout_wrap_row *new_top,bool *moved,bool *approximate)
+ * most rows-1+max_scroll fresh row queries; typing inside a line stops at
+ * the line's first row (edit-cxho.26: the busy layout's frontier row). */
+int layout_wrap_follow_edit_anchored(const layout *l,const piece_tree *t,uint64_t top,const layout_wrap_row *caret,
+                            uint32_t max_scroll,const layout_wrap_row *line,layout_wrap_row *new_top,bool *moved,
+                            bool *approximate)
 {
-    if(!l || !l->grid || !l->wrap || !l->wrap_rows || !t || !caret || !new_top || !moved || !approximate) return LAYOUT_ERR_ARG;
+    if(!l || !l->grid || !l->wrap || !l->wrap_rows || !t || !caret || !new_top || !moved || !approximate ||
+       (line && line->line==LAYOUT_LINE_UNKNOWN)) return LAYOUT_ERR_ARG;
     uint32_t n=l->grid->dims.rows; *moved=false;
     if(!n || caret->start==LAYOUT_VOID_ROW) return LAYOUT_DONE;
-    uint32_t certified=l->src==t && l->total==piece_len(t) && l->first_line_valid ? (layout_busy(l)?l->row:n) : 0u;
-    if(certified>n) certified=n;
+    /* edit-cxho.26: rows [0, certified) are current; a busy layout's next
+     * row start is current too (the frontier) and ends a walk on the edited
+     * line without a query above it. Matching uses starts only; a new top is
+     * taken from below the matched row, so always from a complete row. */
+    bool frontier=false;
+    uint32_t certified=current_rows(l,t,&frontier);
+    if(frontier) certified++;
     uint32_t tj=0;
     while(tj<certified && l->wrap_rows[tj].start!=LAYOUT_VOID_ROW && l->wrap_rows[tj].start<top) tj++;
     if(tj==certified || l->wrap_rows[tj].start!=top) certified=0;
@@ -759,9 +806,14 @@ int layout_wrap_follow_edit(const layout *l,const piece_tree *t,uint64_t top,con
         }
         if(steps>=limit) { *new_top=*caret; *moved=true; return LAYOUT_DONE; }
         bool approx=false;
-        int rc=layout_visual_row_fresh(l,t,w.start-1u,&w,&approx); if(rc) return rc;
+        int rc=row_above(l,t,w.start-1u,line,&w,&approx); if(rc) return rc;
         *approximate|=approx;
     }
+}
+int layout_wrap_follow_edit(const layout *l,const piece_tree *t,uint64_t top,const layout_wrap_row *caret,
+                            uint32_t max_scroll,layout_wrap_row *new_top,bool *moved,bool *approximate)
+{
+    return layout_wrap_follow_edit_anchored(l,t,top,caret,max_scroll,NULL,new_top,moved,approximate);
 }
 
 int layout_visual_row_anchored(const layout *l,const piece_tree *t,uint64_t byte,

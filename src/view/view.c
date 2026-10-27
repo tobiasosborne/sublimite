@@ -522,6 +522,41 @@ static int follow_line(view *v)
     uint64_t byte; rc=line_start(v,first,&byte); if(rc!=VIEW_OK) return rc;
     v->state.first_line=first; v->state.first_byte=byte; v->line=line; return VIEW_OK;
 }
+/* edit-6090, edit-cxho.25: after a mutation the cached rows are stale from
+ * the edited line on, so `cursor>=bottom` (the pre-edit end of the last row)
+ * cannot tell a caret still on screen (a letter typed at the end of the
+ * bottom row's line reaches its old end), one row below (a Return) or a few
+ * rows below (a paste) from a far jump; each was followed directly, the
+ * caret's row becoming the top row. layout_wrap_follow_edit decides from the
+ * fresh rows: keep the top, or the minimal top with the caret on the bottom
+ * row, or (farther) the caret's row. The caret's row honours its trailing
+ * affinity at a soft row end. edit-cxho.26: `line`, when set, is the caret's
+ * certified logical line (relative placement, inexact line count): rows come
+ * from anchored queries, never a piece line query. Returns true with *top
+ * when the top changes. */
+static bool follow_rows(view *v,uint64_t cursor,const layout_wrap_row *r,const layout_wrap_row *line,
+                        layout_wrap_row *top,bool *approx)
+{
+    const layout *l=v->wrap_layout; layout_wrap_row c=*r; bool moved=false;
+    if(v->state.visual_end && cursor && c.start==cursor && c.continuation) {
+        int rc=line ? layout_visual_row_anchored(l,v->tree,cursor-1u,line->line_start,line->line,&c,approx) :
+            layout_visual_row_fresh(l,v->tree,cursor-1u,&c,approx);
+        if(rc!=LAYOUT_DONE) c=*r;
+    }
+    if(c.start<v->state.visual_byte) { *top=c; return true; }
+    /* An edit scrolls minimally while the caret is less than a screen below
+     * (Return bursts, a paste); a motion over a rebuilding layout keeps the
+     * one-row rule of the cached path and follows farther targets directly. */
+    uint32_t n=l->grid->dims.rows, scroll=v->edited ? (n ? n-1u : 0u) : 1u;
+    int rc=layout_wrap_follow_edit_anchored(l,v->tree,v->state.visual_byte,&c,scroll,line,top,&moved,approx);
+    if(rc!=LAYOUT_DONE) { *top=c; return true; } /* unproven: keep the caret's row visible */
+    return moved;
+}
+static void fresh_follow(view *v,uint64_t cursor,const layout_wrap_row *r,bool *approx)
+{
+    layout_wrap_row top;
+    if(follow_rows(v,cursor,r,NULL,&top,approx)) v->state.visual_byte=top.start;
+}
 /* edit-wv7: wrapped placement with an inexact external line count. The
  * exact path (finish_move below) labels the new top with line_at/line_start,
  * a line query from the nearest certified anchor: byte 0 on an unindexed
@@ -549,15 +584,28 @@ static int relative_wrap_place(view *v, uint64_t start)
         layout_visual_row(l,v->tree,cursor,0,&r,&approx);
     if(query==LAYOUT_DONE) {
         uint64_t top_start=v->state.first_byte;
-        if(cursor<v->state.visual_byte) { v->state.visual_byte=r.start; top_start=r.line_start; }
         uint32_t n=l->grid->dims.rows;
-        uint64_t bottom=l->wrap_rows[n-1].next;
-        if(bottom!=LAYOUT_VOID_ROW && cursor>=bottom && !(cursor==bottom && v->state.visual_end)) {
-            layout_wrap_row top; bool top_approx=false;
-            if(!v->edited && r.start==bottom &&
-               layout_visual_row(l,v->tree,v->state.visual_byte,1,&top,&top_approx)==LAYOUT_DONE) {
-                v->state.visual_byte=top.start; top_start=top.line_start; approx|=top_approx;
-            } else { v->state.visual_byte=r.start; top_start=r.line_start; }
+        /* edit-cxho.26: after an edit, or while the layout's rows are not
+         * current (restarted, planning, LAYOUT_RESET), the cached bottom row
+         * is stale (a letter at the end of its line reaches its old next):
+         * follow from fresh rows as finish_move does. Not resident, rows on
+         * the caret's line are anchored at its proven start; a row above it
+         * beyond layout's budget is unproven and the caret's row is the top. */
+        if(v->edited || layout_wrap_current_rows(l,v->tree)<n) {
+            layout_wrap_row line={.line_start=start,.line=label}, top;
+            if(follow_rows(v,cursor,&r,resident?NULL:&line,&top,&approx)) {
+                v->state.visual_byte=top.start; top_start=top.line_start;
+            }
+        } else {
+            if(cursor<v->state.visual_byte) { v->state.visual_byte=r.start; top_start=r.line_start; }
+            uint64_t bottom=n ? l->wrap_rows[n-1].next : LAYOUT_VOID_ROW;
+            if(bottom!=LAYOUT_VOID_ROW && cursor>=bottom && !(cursor==bottom && v->state.visual_end)) {
+                layout_wrap_row top; bool top_approx=false;
+                if(r.start==bottom &&
+                   layout_visual_row(l,v->tree,v->state.visual_byte,1,&top,&top_approx)==LAYOUT_DONE) {
+                    v->state.visual_byte=top.start; top_start=top.line_start; approx|=top_approx;
+                } else { v->state.visual_byte=r.start; top_start=r.line_start; }
+            }
         }
         v->state.approximate|=approx;
         if(v->state.visual_byte==visual || top_start==v->state.first_byte) {
@@ -571,29 +619,6 @@ static int relative_wrap_place(view *v, uint64_t start)
     }
     v->busy=false; return VIEW_OK;
 }
-/* edit-6090, edit-cxho.25: after a mutation the cached rows are stale from
- * the edited line on, so `cursor>=bottom` (the pre-edit end of the last row)
- * cannot tell a caret still on screen (a letter typed at the end of the
- * bottom row's line reaches its old end), one row below (a Return) or a few
- * rows below (a paste) from a far jump; each was followed directly, the
- * caret's row becoming the top row. layout_wrap_follow_edit decides from the
- * fresh rows: keep the top, or the minimal top with the caret on the bottom
- * row, or (farther) the caret's row. The caret's row honours its trailing
- * affinity at a soft row end. */
-static void fresh_follow(view *v,uint64_t cursor,const layout_wrap_row *r,bool *approx)
-{
-    const layout *l=v->wrap_layout; layout_wrap_row c=*r, top; bool moved=false;
-    if(v->state.visual_end && cursor && c.start==cursor && c.continuation &&
-       layout_visual_row_fresh(l,v->tree,cursor-1u,&c,approx)!=LAYOUT_DONE) c=*r;
-    if(c.start<v->state.visual_byte) { v->state.visual_byte=c.start; return; }
-    /* An edit scrolls minimally while the caret is less than a screen below
-     * (Return bursts, a paste); a motion over a rebuilding layout keeps the
-     * one-row rule of the cached path and follows farther targets directly. */
-    uint32_t n=l->grid->dims.rows, scroll=v->edited ? (n ? n-1u : 0u) : 1u;
-    int rc=layout_wrap_follow_edit(l,v->tree,v->state.visual_byte,&c,scroll,&top,&moved,approx);
-    if(rc!=LAYOUT_DONE) v->state.visual_byte=c.start; /* unproven: keep the caret's row visible */
-    else if(moved) v->state.visual_byte=top.start;
-}
 static int finish_move(view *v)
 {
     if(v->state.wrap && v->wrap_layout && v->relative) {
@@ -605,15 +630,17 @@ static int finish_move(view *v)
         v->state.hscroll=0;
         uint64_t cursor=v->state.selection.cursor;
         layout_wrap_row r; bool approx=false;
-        /* edit-cxho.25: a busy layout's rows are being rebuilt (a restart
-         * zeroes them), so a motion keyed before the frame (key repeat after
-         * an edit) is followed from the fresh rows as an edit is. */
-        bool fresh=v->edited || layout_busy(v->wrap_layout);
+        /* edit-cxho.25: a busy layout's rows are being rebuilt, so a motion
+         * keyed before the frame (key repeat after an edit) is followed from
+         * the fresh rows as an edit is. edit-cxho.26: likewise whenever its
+         * rows are not all current (LAYOUT_RESET leaves an idle layout with
+         * pre-edit rows until the host lays out again). */
+        uint32_t n=v->wrap_layout->grid->dims.rows;
+        bool fresh=v->edited || layout_wrap_current_rows(v->wrap_layout,v->tree)<n;
         int query=fresh?layout_visual_row_fresh(v->wrap_layout,v->tree,cursor,&r,&approx):
             layout_visual_row(v->wrap_layout,v->tree,cursor,0,&r,&approx);
         if(query==LAYOUT_DONE) {
-            uint32_t n=v->wrap_layout->grid->dims.rows;
-            uint64_t bottom=v->wrap_layout->wrap_rows[n-1].next;
+            uint64_t bottom=n ? v->wrap_layout->wrap_rows[n-1].next : LAYOUT_VOID_ROW;
             /* edit-cxho.25: with trailing affinity at a soft row end the
              * caret shows on the row above its byte's row; follow that row
              * (Down onto such an end below the bottom row re-anchored the

@@ -482,4 +482,128 @@ static void above_top_queries(void)
     CHECK(layout_visual_row(&f.l,f.tree,70001,-1,&r,&approx)==LAYOUT_DONE && r.line==0 && r.line_start==0 && probe>0);
     destroy(&f);
 }
-int main(void) { above_top_queries(); large_hscroll(); cursor_stops(); lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0; }
+/* edit-cxho.26: a layout restarted while busy (a second key before the
+ * frame) must not leave its cached rows reading as real rows at byte 0. */
+static void c26_restart_rows(void)
+{
+    const char *text="one two three\nfour five six seven\neight\nnine ten\neleven twelve\nthirteen\n";
+    fixture f,fresh; init(&f,text,10,6,0); show(&f);
+    CHECK(piece_insert(f.tree,3,(const uint8_t *)"x",1)==0);
+    CHECK(layout_edit(&f.l,3,0,1,0,0)==LAYOUT_MORE && layout_busy(&f.l));
+    CHECK(piece_insert(f.tree,4,(const uint8_t *)"y",1)==0);
+    CHECK(layout_edit(&f.l,4,0,1,0,0)==LAYOUT_MORE && layout_busy(&f.l) && f.l.row==0); /* restarted */
+    for(uint32_t r=1;r<6;r++) {
+        const layout_wrap_row *w=&f.l.wrap_rows[r];
+        if(w->start!=LAYOUT_VOID_ROW || w->end!=LAYOUT_VOID_ROW || w->next!=LAYOUT_VOID_ROW || f.rb[r]!=LAYOUT_VOID_ROW)
+            fprintf(stderr,"edit-cxho.26 restart: row %u start=%llu next=%llu row_byte=%llu, want empty\n",r,
+                (unsigned long long)w->start,(unsigned long long)w->next,(unsigned long long)f.rb[r]);
+        CHECK(w->start==LAYOUT_VOID_ROW && w->end==LAYOUT_VOID_ROW && w->next==LAYOUT_VOID_ROW && f.rb[r]==LAYOUT_VOID_ROW);
+    }
+    run(&f);
+    init(&fresh,"onexy two three\nfour five six seven\neight\nnine ten\neleven twelve\nthirteen\n",10,6,0); show(&fresh);
+    CHECK(memcmp(f.rb,fresh.rb,6u*sizeof f.rb[0])==0 && memcmp(f.cells,fresh.cells,60u*sizeof f.cells[0])==0);
+    for(uint32_t r=0;r<6;r++) CHECK(f.l.wrap_rows[r].start==fresh.l.wrap_rows[r].start && f.l.wrap_rows[r].next==fresh.l.wrap_rows[r].next);
+    destroy(&f); destroy(&fresh);
+    puts("edit-cxho.26: a restarted layout's rows read empty, not row 0");
+}
+/* edit-cxho.26: an edit on the top's logical line before a continuation top
+ * returns LAYOUT_RESET and leaves the layout idle with pre-edit rows (the
+ * host re-lays out at its next turn); a row query meanwhile must not
+ * answer from those rows. (P) 40 'a' fill four 10-column rows. */
+static void c26_reset_rows(void)
+{
+    const char *text="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nx\ny\nz\n";
+    fixture f; init(&f,text,10,3,0); show(&f);
+    layout_wrap_row top=f.l.wrap_rows[2]; CHECK(top.start==20 && top.continuation);
+    CHECK(render_frame_begin(&f.g,++f.frame)==0 && layout_begin_visual(&f.l,f.tree,(layout_viewport){0,0,0,0},&top)==0); run(&f);
+    CHECK(f.l.wrap_rows[0].start==20);
+    CHECK(piece_delete(f.tree,0,5,NULL)==0);
+    CHECK(layout_edit(&f.l,0,5,0,0,0)==LAYOUT_RESET && !layout_busy(&f.l));
+    unsigned stale=0;
+    for(uint64_t b=15;b<=piece_len(f.tree);b++) {
+        layout_wrap_row got,want; bool ga=false,wa=false;
+        CHECK(layout_visual_row(&f.l,f.tree,b,0,&got,&ga)==LAYOUT_DONE);
+        CHECK(layout_visual_row_fresh(&f.l,f.tree,b,&want,&wa)==LAYOUT_DONE);
+        if(got.start!=want.start || got.next!=want.next) {
+            fprintf(stderr,"edit-cxho.26 reset: byte %llu cached row %llu..%llu, fresh %llu..%llu\n",(unsigned long long)b,
+                (unsigned long long)got.start,(unsigned long long)got.next,(unsigned long long)want.start,(unsigned long long)want.next);
+            stale++;
+        }
+    }
+    CHECK(stale==0);
+    destroy(&f);
+    puts("edit-cxho.26: rows left by LAYOUT_RESET are not answered from");
+}
+/* edit-cxho.26: layout_wrap_follow_edit against the truth of a complete
+ * fresh layout twice as tall, in every state a key can find the layout in:
+ * idle, planning a line partway, painting partway, restarted (two edits
+ * before a frame). Slices of 1-4 clusters stop it partway. */
+static uint64_t c26_next(uint64_t *s) { *s^=*s<<13; *s^=*s>>7; *s^=*s<<17; return *s; }
+static void c26_follow_truth(void)
+{
+    enum { N=5, TALL=10, W=12 };
+    unsigned checked=0, wrong=0, states[4]={0}, far=0;
+    const char *env=getenv("C26_SEEDS"); uint64_t seeds=env?strtoull(env,NULL,10):600u;
+    for(uint64_t seed=1;seed<=seeds;seed++) {
+        uint64_t s=seed*UINT64_C(0x9e3779b97f4a7c15)|1u;
+        char text[512]; size_t len=0;
+        while(len<300) {
+            uint64_t r=c26_next(&s); size_t w=1+r%11;
+            for(size_t i=0;i<w;i++) text[len++]=(char)('a'+(r>>8)%3);
+            text[len++]=(r>>16)%6==0?'\n':' ';
+        }
+        text[len]=0;
+        fixture f; init(&f,text,W,N,1+(uint32_t)(c26_next(&s)%4)); show(&f);
+        unsigned edits=1+(unsigned)(c26_next(&s)%2); uint64_t caret=0;
+        for(unsigned k=0;k<edits;k++) {
+            uint64_t total=piece_len(f.tree), off=c26_next(&s)%(total<90?total:90);
+            if(c26_next(&s)%3==0 && off+3<=total) {
+                uint8_t gone[3]; uint64_t n=1+c26_next(&s)%3, nl=0;
+                CHECK(piece_read(f.tree,off,gone,(size_t)n)==0);
+                for(uint64_t i=0;i<n;i++) nl+=gone[i]=='\n';
+                CHECK(piece_delete(f.tree,off,n,NULL)==0);
+                CHECK(layout_edit(&f.l,off,n,0,nl,0)>=0); caret=off;
+            } else {
+                static const char pool[]="ab ab ab \n";
+                uint8_t add[14]; uint64_t n=1+c26_next(&s)%14, nl=0;
+                for(uint64_t i=0;i<n;i++) { add[i]=(uint8_t)pool[c26_next(&s)%(sizeof pool-1)]; nl+=add[i]=='\n'; }
+                CHECK(piece_insert(f.tree,off,add,(size_t)n)==0);
+                CHECK(layout_edit(&f.l,off,0,n,0,nl)>=0); caret=off+n;
+            }
+            unsigned slices=(unsigned)(c26_next(&s)%6);
+            for(unsigned j=0;j<slices && layout_busy(&f.l);j++) CHECK(layout_run(&f.l)>=0);
+        }
+        if(c26_next(&s)%4==0) caret=c26_next(&s)%(piece_len(f.tree)+1);
+        char now[512]; size_t total=(size_t)piece_len(f.tree); CHECK(total<sizeof now);
+        CHECK(piece_read(f.tree,0,(uint8_t *)now,total)==0); now[total]=0;
+        fixture t; init(&t,now,W,TALL,0); show(&t);
+        layout_wrap_row c; bool a=false;
+        CHECK(layout_visual_row_fresh(&f.l,f.tree,caret,&c,&a)==LAYOUT_DONE);
+        uint32_t i=0; while(i<TALL && t.l.wrap_rows[i].start!=c.start) i++;
+        states[!layout_busy(&f.l)?0:f.l.wrap_planning?(f.l.row>f.l.wrap_first?2:1):3]++; far+=i>=N;
+        for(uint32_t scroll=1;scroll<=N-1u;scroll+=N-2u) {
+            layout_wrap_row top; bool moved=false, ap=false;
+            CHECK(layout_wrap_follow_edit(&f.l,f.tree,0,&c,scroll,&top,&moved,&ap)==LAYOUT_DONE);
+            uint64_t want=i<N?0:i<=N-1u+scroll?t.l.wrap_rows[i-(N-1u)].start:c.start;
+            bool ok=i<N?!moved:moved && top.start==want;
+            if(!ok && wrong++<8)
+                fprintf(stderr,"edit-cxho.26 follow seed %llu: busy %d planning %d row %u caret %llu row idx %u scroll %u: moved %d top %llu, want top %llu\n",
+                    (unsigned long long)seed,layout_busy(&f.l),f.l.wrap_planning,f.l.row,(unsigned long long)caret,i,scroll,moved,
+                    (unsigned long long)(moved?top.start:0),(unsigned long long)want);
+            checked++;
+        }
+        destroy(&t); destroy(&f);
+    }
+    printf("edit-cxho.26: %u follow decisions checked against a fresh layout, %u wrong "
+        "(idle %u, planning at its first row %u, planning partway %u, painting %u; caret below the screen %u)\n",
+        checked,wrong,states[0],states[1],states[2],states[3],far);
+    CHECK(wrong==0);
+}
+int main(int argc,char **argv)
+{
+    /* edit-cxho.26 selectors, each case alone. */
+    if(argc==2 && strcmp(argv[1],"c26-restart")==0) { c26_restart_rows(); return 0; }
+    if(argc==2 && strcmp(argv[1],"c26-reset")==0) { c26_reset_rows(); return 0; }
+    if(argc==2 && strcmp(argv[1],"c26-follow")==0) { c26_follow_truth(); return 0; }
+    c26_restart_rows(); c26_reset_rows(); c26_follow_truth(); above_top_queries(); large_hscroll(); cursor_stops(); lookahead_word_edit(); whitespace_home(); resize(); gutter_only_boundary(); wide_navigation(); lookahead_edit(); hidden_separator_cursor(); query_edges(); basic(); edits(); navigation(); hard_end(); edges(); newline_edits(); long_line(); typing_allocations(); puts("wrap_test: all passed"); return 0;
+}

@@ -197,6 +197,7 @@ typedef struct layout {
     /* P4.1 private wrap state. Reserved once with layout_wrap_init. */
     layout_wrap_row *wrap_rows, *wrap_plan;
     bool wrap, wrap_planning, wrap_leading, wrap_sink, wrap_cr, wrap_cursor_end;
+    bool wrap_stale;             /* edit-cxho.26: LAYOUT_RESET left pre-edit rows; begin clears */
     uint32_t wrap_first, wrap_after, wrap_fill, wrap_break_vis, wrap_written;
     uint64_t wrap_break_byte, wrap_break_col, wrap_break_last, wrap_last;
     uint32_t wrap_indent, wrap_capacity;
@@ -271,6 +272,20 @@ int layout_visual_row_fresh(const layout *l, const piece_tree *t, uint64_t byte,
  * farther it is the caret's row. At most rows-1+max_scroll row queries. */
 int layout_wrap_follow_edit(const layout *l, const piece_tree *t, uint64_t top, const layout_wrap_row *caret,
                             uint32_t max_scroll, layout_wrap_row *new_top, bool *moved, bool *approximate);
+/* edit-cxho.26: the same with the caret's logical line certified by the
+ * caller (line_start, line; the ordinal may be a label). Rows on that line
+ * come from layout_visual_row_anchored; rows above it only from layout's
+ * resident top (no piece line query), else LAYOUT_ERR_STATE: unproven. */
+int layout_wrap_follow_edit_anchored(const layout *l, const piece_tree *t, uint64_t top, const layout_wrap_row *caret,
+                            uint32_t max_scroll, const layout_wrap_row *line, layout_wrap_row *new_top, bool *moved,
+                            bool *approximate);
+/* edit-cxho.26: rows [0, k) of wrap_rows describe t as it is now. k is the
+ * grid's rows when idle; while busy the rows before the one being laid out
+ * (before the edited line while planning); 0 when t is not the laid-out
+ * source or an edit returned LAYOUT_RESET. A restart (layout_begin while
+ * busy) leaves rows 1.. empty (LAYOUT_VOID_ROW), never zeroed rows that read
+ * as byte 0. Readers of wrap_rows outside the layout check this first. */
+uint32_t layout_wrap_current_rows(const layout *l, const piece_tree *t);
 /* Same bounded visual query using a caller-certified logical line start and
  * ordinal (which may be estimated). Avoids whole-source piece line queries;
  * deep unindexed wrap phase retains the existing explicit approximation. */
