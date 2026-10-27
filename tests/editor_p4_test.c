@@ -189,17 +189,17 @@ static int decorations(bool raster)
 {
     editor *e = NULL; render_backend b = {0}; T(decorated_editor(&e, &b, raster, "(x)  ") == 0);
     T(cell(e, 1, 4)->attrs & RENDER_ATTR_UNDERLINE);
-    T(cell(e, 1, 5)->bg == 0x493038);
+    T(cell(e, 1, 5)->bg == config_theme_color(CONFIG_DARK, "error.background"));
     editor_close(e); memset(&b, 0, sizeof b);
     T(decorated_editor(&e, &b, raster, "x\t\n") == 0);
     T(editor_set_cursor(e, 1) == 0); T(settle(e) == 0);
     T(cell(e, 1, 3)->attrs & RENDER_ATTR_CURSOR);
-    T(cell(e, 1, 4)->bg == 0x493038); /* remaining cells of the cursor tab still paint */
+    T(cell(e, 1, 4)->bg == config_theme_color(CONFIG_DARK, "error.background")); /* remaining cells of the cursor tab still paint */
     T(cell(e, 1, 5)->attrs & RENDER_ATTR_UNDERLINE);
     editor_close(e); memset(&b, 0, sizeof b);
     T(decorated_editor(&e, &b, raster, "(x)  \nabc\n") == 0);
     T(cell(e, 1, 2)->attrs & RENDER_ATTR_UNDERLINE); T(cell(e, 1, 4)->attrs & RENDER_ATTR_UNDERLINE);
-    T(cell(e, 1, 5)->bg == 0x493038); T(cell(e, 1, 6)->bg == 0x493038);
+    T(cell(e, 1, 5)->bg == config_theme_color(CONFIG_DARK, "error.background")); T(cell(e, 1, 6)->bg == config_theme_color(CONFIG_DARK, "error.background"));
     T(editor_set_cursor(e, 7) == 0); T(settle(e) == 0); /* start abc: old bracket decorations vanish */
     T(!(cell(e, 1, 4)->attrs & RENDER_ATTR_UNDERLINE));
     T(press(e, key('k', PLAT_MOD_CTRL, NULL)) == 0);

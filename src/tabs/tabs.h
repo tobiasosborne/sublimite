@@ -111,7 +111,7 @@ typedef struct tabs_strip {
     tabs_glyph_fn glyph;
     void *glyph_ctx;
 } tabs_strip;
-/* Uniform tab slots, space padding, final separator '|', modified '*', and
+/* Uniform tab slots, space padding, a blank final cell, modified U+2022, and
  * truncated-title ellipsis U+2026. At tiny widths marker has priority. Caller
  * chooses first_tab to keep active visible and binds resident atlas before
  * render. Fills/damages only the requested row range in a begun frame; no

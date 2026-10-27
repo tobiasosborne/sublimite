@@ -362,9 +362,9 @@ static void track_box(editor *e, int64_t *top, uint32_t *height)
 {
     const render_pixels *r = &e->grid.region;
     config_theme t = e->preferences.theme;
-    uint32_t viewport = config_theme_color(t, "caret.background");
+    uint32_t viewport = config_theme_color(t, "editor.foreground"); /* edit-cxho.24: neutral wash */
     uint32_t edge_bg = track_blend(config_theme_color(t, "editor.background"), viewport, 96);
-    uint32_t edge_ink = track_blend(config_theme_color(t, "gutter.foreground"), viewport, 96);
+    uint32_t edge_ink = track_blend(config_theme_color(t, "minimap.foreground"), viewport, 96);
     *top = -1; *height = 0;
     for (uint32_t y = 0; r->pixels && y < r->height; y++) {
         uint32_t px = r->pixels[(size_t)y * r->stride];
@@ -631,7 +631,7 @@ static int minimap_compose_pixels(const char *backend_name)
     uint32_t *frame = calloc((size_t)w * h, sizeof *frame); T(rows && expected && frame);
     minimap reference; minimap_input input = editor_map_input(e->buffer);
     minimap_style colors = {config_theme_color(CONFIG_DARK, "editor.background"),
-        config_theme_color(CONFIG_DARK, "gutter.foreground"), config_theme_color(CONFIG_DARK, "caret.background"), 0}; /* paint theme */
+        config_theme_color(CONFIG_DARK, "minimap.foreground"), config_theme_color(CONFIG_DARK, "editor.foreground"), 0}; /* paint theme (edit-cxho.24) */
     T(minimap_init(&reference, rows, summaries) == 0);
     T(minimap_prepare(&reference, &input, summaries) == 0);
     uint64_t visible = e->buffer->lines < e->text_grid.dims.rows ? e->buffer->lines : e->text_grid.dims.rows;

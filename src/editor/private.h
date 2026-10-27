@@ -499,6 +499,7 @@ struct editor {
     int64_t map_drag_offset; /* edit-2mhd: pointer pixels below the captured viewport top */
     int64_t map_drag_top;    /* edit-cxho.10: pointer-derived box top, painted while dragging */
     bool map_drag, paint_ready, caret_only;
+    uint32_t find_bg; /* edit-cxho.24: bracket.background, resolved when the theme applies, not per painted cell */
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     bool text_drag;
     uint64_t text_drag_id, text_drag_generation, click_ns, click_byte;

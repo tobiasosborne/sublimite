@@ -243,8 +243,10 @@ static void strip_tab(render_grid *g, render_cell *cells, uint32_t n,
     uint32_t fg=active?strip->active_fg:strip->fg, bg=active?strip->active_bg:strip->bg;
     for(uint32_t i=0;i<n;++i) cells[i]=blank(fg,bg);
     uint32_t end=n;
-    if(n>=2) { --end; glyph_cell(g,cells+end,strip,(const uint8_t *)"|",1,1,fg,bg); }
-    if(t->modified && end) { --end; glyph_cell(g,cells+end,strip,(const uint8_t *)"*",1,1,fg,bg); }
+    /* edit-cxho.24: tabs are separated by space alone (rubric C5: no
+     * characters doing the work of UI); the last cell stays blank. */
+    if(n>=2) --end;
+    if(t->modified && end) { --end; glyph_cell(g,cells+end,strip,(const uint8_t *)"\xe2\x80\xa2",3,1,fg,bg); }
     uint32_t at=n>=4?1u:0u;
     if(at>=end) return;
     uint32_t room=end-at;

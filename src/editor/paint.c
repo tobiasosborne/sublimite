@@ -13,7 +13,7 @@ static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t
         size_t middle=first+(after-first)/2u;
         if (e->find_ranges[middle].end<=byte) first=middle+1u; else after=middle;
     }
-    if (first<e->find_range_count && e->find_ranges[first].start<=byte) *bg=0x53667e;
+    if (first<e->find_range_count && e->find_ranges[first].start<=byte) *bg=e->find_bg;
     if (byte == e->bracket_source || byte == e->bracket_mate) {
         *bg = config_theme_color(e->preferences.theme, "bracket.background"); *attrs |= RENDER_ATTR_UNDERLINE;
     }
@@ -251,8 +251,11 @@ static int compose(editor *e)
     }
     minimap_input input = editor_map_input(e->buffer);
     config_theme theme = e->preferences.theme;
+    /* edit-cxho.24: the map's ink is the minimap rung of the ladder (below the
+     * gutter, rubric C7) and the viewport a neutral wash of the text tone,
+     * not the accent. */
     minimap_style colors = {config_theme_color(theme, "editor.background"),
-        config_theme_color(theme, "gutter.foreground"), config_theme_color(theme, "caret.background"),
+        config_theme_color(theme, "minimap.foreground"), config_theme_color(theme, "editor.foreground"),
         editor_theme_estimated_gutter(config_theme_color(theme, "minimap.foreground"), config_theme_color(theme, "chrome.background"))};
     uint64_t first = e->v.state.first_line, visible = 0;
     for (uint32_t r = 0; r < e->v.config.rows; r++) if (e->row_byte[r] != LAYOUT_VOID_ROW) {

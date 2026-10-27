@@ -165,6 +165,7 @@ int editor_preferences_apply(editor *e)
     e->layout_cfg.cursor_bg = config_theme_color(theme, "caret.background");
     e->layout_cfg.sel_fg = config_theme_color(theme, "selection.foreground");
     e->layout_cfg.sel_bg = config_theme_color(theme, "selection.background");
+    e->find_bg = config_theme_color(theme, "bracket.background");
     e->layout_cfg.tab_width = e->buffer->style.width;
     e->lay.cfg = e->layout_cfg; e->lay.tab = e->buffer->style.width;
     int rc = view_set_tab_width(&e->v, e->buffer->style.width); if (rc) return EDITOR_ERR_ARG;

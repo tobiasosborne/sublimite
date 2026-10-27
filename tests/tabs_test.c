@@ -206,7 +206,7 @@ static void rendering(void)
         CHECK(tabs_open(&s,&d,&live,&id)==0);
     }
     glyph_fixture fixture={0};
-    const uint32_t cps[12]={'a','b','c','x','|','*',0x2026,0xfffd,0x4e2d,'e',0x1f469,' '};
+    const uint32_t cps[12]={'a','b','c','x','|',0x2022,0x2026,0xfffd,0x4e2d,'e',0x1f469,' '};
     for(size_t i=0;i<12;++i) fixture.glyphs[i]=(render_glyph){.glyph_index=cps[i],.page=0,
         .x=(uint32_t)(i*2),.w=i==8 || i==10?2u:1u,.h=1};
     uint8_t pixels[24]={0}; render_atlas_page page={pixels,sizeof pixels,24,24,1};
@@ -224,7 +224,7 @@ static void rendering(void)
     CHECK(cells[35].glyph_index=='a' && cells[35].bg==2);
     CHECK(cells[43].glyph_index==0x4e2d && cells[43].attrs==RENDER_ATTR_WIDE_LEFT);
     CHECK(cells[44].attrs==RENDER_ATTR_WIDE_RIGHT && cells[44].atlas_slot==RENDER_NO_SLOT);
-    CHECK(cells[47].glyph_index==0x2026 && cells[48].glyph_index=='*' && cells[49].glyph_index=='|');
+    CHECK(cells[47].glyph_index==0x2026 && cells[48].glyph_index==0x2022 && cells[49].atlas_slot==RENDER_NO_SLOT);
     CHECK(cells[51].glyph_index=='e' && cells[51].fg==3 && cells[51].bg==4);
     CHECK(tabs_strip_hit(&s,&strip,1)==SIZE_MAX && tabs_strip_hit(&s,&strip,2)==0);
     CHECK(tabs_strip_hit(&s,&strip,10)==1 && tabs_strip_hit(&s,&strip,25)==2);

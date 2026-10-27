@@ -255,6 +255,10 @@ static int render_unicode(bool inject)
          * tab strip when the held index job completes. Check text damage
          * separately; this bead deliberately leaves that overlay unchanged. */
         if (e->tab_rows) gate.damage &= ~UINT64_C(1);
+        /* edit-cxho.24: the tab strip's unsaved mark is U+2022, a non-ASCII
+         * slot in row 0 once the buffer is modified; row 0 is checked apart
+         * from text damage on both sides. */
+        if (e->tab_rows) expected_damage &= ~UINT64_C(1);
         if (gate.damage != expected_damage)
             fprintf(stderr, "Unicode completion damage observed=%llx expected=%llx (M: union of submitted dirty-row bits)\n",
                     (unsigned long long)gate.damage, (unsigned long long)expected_damage);

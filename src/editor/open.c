@@ -220,6 +220,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         .cursor_fg = config_theme_color(CONFIG_DARK, "caret.foreground"), .cursor_bg = config_theme_color(CONFIG_DARK, "caret.background"),
         .sel_fg = config_theme_color(CONFIG_DARK, "selection.foreground"), .sel_bg = config_theme_color(CONFIG_DARK, "selection.background")};
     e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
+    e->find_bg = config_theme_color(CONFIG_DARK, "bracket.background");
     /* Initialize the reserved row even when the first tab wraps. Later
      * wrap-off activation must never expose uninitialized tail cells. */
     e->text_grid.dims.rows = td.rows + 1u;

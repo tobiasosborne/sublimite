@@ -1,55 +1,73 @@
 #include "config/config.h"
 #include <string.h>
-/* Palette data: placeholders copied from existing editor dark colors and
- * their light counterparts. Token names require reconciliation with the
- * visual spec when that dependency lands in this worktree.
- * Syntax RGB: (M)[AC] installed Sublime Mariana/Breakers scheme HSL values;
- * (P) HSL -> sRGB, nearest integer(channel * 255), the uint8 channel range.
- * Per-token source variables/selectors: docs/decisions/edit-v0o.3.md. */
-/* edit-29y2: the page, gutter and tab strip continue the window manager's
- * dark title bar (_GTK_THEME_VARIANT=dark): (P) Mint-Y-Dark gtk-3.0/gtk.css
- * wm_bg #222226; the active tab is its theme_bg #2e2e33. */
+/* edit-cxho.24 (design hill-climb round 2): every value is derived in
+ * tools/mkpalette.py from OKLCH (P: Ottosson OKLab, sRGB transfer, nearest
+ * integer of channel * 255); the comment on each line is its WCAG 2.2
+ * contrast ratio against its background (P). One neutral tint for both
+ * themes: (M) the window manager's dark title bar #222226 (edit-29y2,
+ * Mint-Y-Dark wm_bg), so title bar, tab strip and page are one surface in the
+ * dark theme. Ladder (rubric C2): text > comment > gutter > minimap; one
+ * accent for caret, selection tint and focus; five low-chroma syntax hues at
+ * one lightness. tests/config_theme_test.c pins the ladder. */
 static const config_token dark[] = {
-    {"editor.background", 0x222226}, {"editor.foreground", 0xd8dee9},
-    {"gutter.background", 0x222226}, {"gutter.foreground", 0x78808e},
-    {"caret.background", 0xe5e9f0}, {"caret.foreground", 0x222226},
-    {"selection.background", 0x425471}, {"selection.foreground", 0xffffff},
-    {"chrome.background", 0x222226}, {"chrome.foreground", 0x8d98a9},
-    {"tab.active.background", 0x2e2e33}, {"tab.active.foreground", 0xe5e9f0},
-    {"minimap.foreground", 0x8091a8}, {"warning.foreground", 0xe5b56b},
-    {"bracket.background", 0x53667e}, {"error.foreground", 0xbf616a},
-    {"error.background", 0x493038}, {"syntax.comment", 0xa6acb9},
-    {"syntax.keyword", 0xc695c6},
-    {"syntax.string", 0x99c794},
-    {"syntax.number", 0xf9ae58},
-    {"syntax.constant", 0xc695c6},
-    {"syntax.function", 0x5fb4b4},
-    {"syntax.type", 0xc695c6},
-    {"syntax.variable", 0xd8dee9},
-    {"syntax.operator", 0xf97b58},
-    {"syntax.punctuation", 0xa6acb9},
-    {"syntax.attribute", 0xc695c6}
+    {"editor.background", 0x222226},
+    {"editor.foreground", 0xe2e2e8},  /* 12.29:1 */
+    {"gutter.background", 0x222226},
+    {"gutter.foreground", 0x6e6e73},  /* 3.13:1 */
+    {"caret.background", 0x70adea},
+    {"caret.foreground", 0x222226},
+    {"selection.background", 0x39485b},  /* text on it 7.23:1 */
+    {"selection.foreground", 0xe2e2e8},  /* 12.29:1 */
+    {"chrome.background", 0x222226},
+    {"chrome.foreground", 0x98989d},  /* 5.52:1 */
+    {"tab.active.background", 0x222226},
+    {"tab.active.foreground", 0xe2e2e8},  /* 12.29:1 */
+    {"minimap.foreground", 0x444449},  /* 1.64:1 */
+    {"warning.foreground", 0xe0b771},  /* 8.44:1 */
+    {"bracket.background", 0x443f37},  /* text on it 8.09:1 */
+    {"error.foreground", 0xd87972},  /* 5.21:1 */
+    {"error.background", 0x403133},
+    {"syntax.comment", 0x9b9ba0},  /* 5.73:1 */
+    {"syntax.keyword", 0xc6b9e3},  /* 8.64:1 */
+    {"syntax.string", 0xa9cca9},  /* 8.98:1 */
+    {"syntax.number", 0xdbbb97},  /* 8.73:1 */
+    {"syntax.constant", 0xdbbb97},  /* 8.73:1 */
+    {"syntax.function", 0x93cdd0},  /* 8.97:1 */
+    {"syntax.type", 0xc6b9e3},  /* 8.64:1 */
+    {"syntax.variable", 0xe2e2e8},  /* 12.29:1 */
+    {"syntax.operator", 0xb0b0b6},  /* 7.35:1 */
+    {"syntax.punctuation", 0xb0b0b6},  /* 7.35:1 */
+    {"syntax.attribute", 0xc6b9e3}   /* 8.64:1 */
 };
 static const config_token light[] = {
-    {"editor.background", 0xf7f7f8}, {"editor.foreground", 0x282c34},
-    {"gutter.background", 0xf7f7f8}, {"gutter.foreground", 0x777d88},
-    {"caret.background", 0x282c34}, {"caret.foreground", 0xf7f7f8},
-    {"selection.background", 0xc5d6ee}, {"selection.foreground", 0x20242c},
-    {"chrome.background", 0xe9ebef}, {"chrome.foreground", 0x555d6a},
-    {"tab.active.background", 0xf7f7f8}, {"tab.active.foreground", 0x282c34},
-    {"minimap.foreground", 0x777d88}, {"warning.foreground", 0x895714},
-    {"bracket.background", 0xd0deee}, {"error.foreground", 0xa0303d},
-    {"error.background", 0xf2d7dc}, {"syntax.comment", 0x999999},
-    {"syntax.keyword", 0xc695c6},
-    {"syntax.string", 0x80b979},
-    {"syntax.number", 0xf9ae58},
-    {"syntax.constant", 0xc695c6},
-    {"syntax.function", 0x5fb4b4},
-    {"syntax.type", 0xc695c6},
-    {"syntax.variable", 0x333333},
-    {"syntax.operator", 0xf97b58},
-    {"syntax.punctuation", 0xac7a68},
-    {"syntax.attribute", 0xc695c6}
+    {"editor.background", 0xfbfbff},
+    {"editor.foreground", 0x1d1d20},  /* 16.29:1 */
+    {"gutter.background", 0xfbfbff},
+    {"gutter.foreground", 0x9e9ea2},  /* 2.59:1 */
+    {"caret.background", 0x226bc0},
+    {"caret.foreground", 0xfbfbff},
+    {"selection.background", 0xccdbf3},  /* text on it 12.01:1 */
+    {"selection.foreground", 0x1d1d20},  /* 16.29:1 */
+    {"chrome.background", 0xf4f4f8},
+    {"chrome.foreground", 0x636367},  /* 5.45:1 */
+    {"tab.active.background", 0xfbfbff},
+    {"tab.active.foreground", 0x1d1d20},  /* 16.29:1 */
+    {"minimap.foreground", 0xcdcdd2},  /* 1.53:1 */
+    {"warning.foreground", 0x9d671c},  /* 4.63:1 */
+    {"bracket.background", 0xe9dec9},  /* text on it 12.62:1 */
+    {"error.foreground", 0xaf3c3a},  /* 5.76:1 */
+    {"error.background", 0xf1d9da},
+    {"syntax.comment", 0x68686c},  /* 5.37:1 */
+    {"syntax.keyword", 0x6b588d},  /* 5.97:1 */
+    {"syntax.string", 0x427044},  /* 5.60:1 */
+    {"syntax.number", 0x825a27},  /* 5.91:1 */
+    {"syntax.constant", 0x825a27},  /* 5.91:1 */
+    {"syntax.function", 0x007176},  /* 5.61:1 */
+    {"syntax.type", 0x6b588d},  /* 5.97:1 */
+    {"syntax.variable", 0x1d1d20},  /* 16.29:1 */
+    {"syntax.operator", 0x4d4d50},  /* 8.16:1 */
+    {"syntax.punctuation", 0x4d4d50},  /* 8.16:1 */
+    {"syntax.attribute", 0x6b588d}   /* 5.97:1 */
 };
 _Static_assert(sizeof dark == sizeof light, "same tokens in both palettes");
 const config_token *config_theme_tokens(config_theme theme, size_t *count)
