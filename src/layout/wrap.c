@@ -715,6 +715,55 @@ int layout_visual_row_fresh(const layout *l,const piece_tree *t,uint64_t byte,
     return rc;
 }
 
+/* edit-cxho.25: after a mutation, before relayout, decide the wrapped top
+ * from the text, not from the pre-edit bottom row. Rows [0, certified) of
+ * the cached viewport are proven current: layout_wrap_edit restarts work at
+ * the edited line's first row (l->row) and an idle layout holds every row
+ * (shifted past the edit). A stale or reset layout certifies none. The walk
+ * goes up from the caret's row one fresh row at a time until it reaches the
+ * top or a certified row; either gives the caret's distance d in rows below
+ * the top. d < rows: keep the top. rows <= d <= rows-1+max_scroll: the row
+ * rows-1 above the caret is the minimal top (caret on the bottom row).
+ * Farther: the caret's row is the top (a far jump, as before). Cost (P): at
+ * most rows-1+max_scroll fresh row queries; typing inside a line stops one
+ * row above the line's first row. */
+int layout_wrap_follow_edit(const layout *l,const piece_tree *t,uint64_t top,const layout_wrap_row *caret,
+                            uint32_t max_scroll,layout_wrap_row *new_top,bool *moved,bool *approximate)
+{
+    if(!l || !l->grid || !l->wrap || !l->wrap_rows || !t || !caret || !new_top || !moved || !approximate) return LAYOUT_ERR_ARG;
+    uint32_t n=l->grid->dims.rows; *moved=false;
+    if(!n || caret->start==LAYOUT_VOID_ROW) return LAYOUT_DONE;
+    uint32_t certified=l->src==t && l->total==piece_len(t) && l->first_line_valid ? (layout_busy(l)?l->row:n) : 0u;
+    if(certified>n) certified=n;
+    uint32_t tj=0;
+    while(tj<certified && l->wrap_rows[tj].start!=LAYOUT_VOID_ROW && l->wrap_rows[tj].start<top) tj++;
+    if(tj==certified || l->wrap_rows[tj].start!=top) certified=0;
+    while(certified && l->wrap_rows[certified-1u].start==LAYOUT_VOID_ROW) certified--;
+    uint64_t limit=(uint64_t)n-1u+max_scroll;
+    layout_wrap_row w=*caret, minimal=*caret;
+    for(uint64_t steps=0;;steps++) {
+        if(steps==n-1u) minimal=w;
+        uint64_t d=UINT64_MAX; uint32_t j=0;
+        if(w.start<=top) d=steps;
+        else if(certified && w.start<=l->wrap_rows[certified-1u].start) {
+            for(j=tj;j<certified && l->wrap_rows[j].start!=w.start;j++) {}
+            if(j<certified) d=j-tj+steps;
+        }
+        if(d!=UINT64_MAX) {
+            if(d<n) return LAYOUT_DONE;
+            *moved=true;
+            /* The row n-1 above the caret: walked (steps >= n-1) or certified. */
+            if(d>limit) *new_top=*caret;
+            else *new_top=steps>=n-1u ? minimal : l->wrap_rows[j+steps-(n-1u)];
+            return LAYOUT_DONE;
+        }
+        if(steps>=limit) { *new_top=*caret; *moved=true; return LAYOUT_DONE; }
+        bool approx=false;
+        int rc=layout_visual_row_fresh(l,t,w.start-1u,&w,&approx); if(rc) return rc;
+        *approximate|=approx;
+    }
+}
+
 int layout_visual_row_anchored(const layout *l,const piece_tree *t,uint64_t byte,
     uint64_t line_start,uint64_t line,layout_wrap_row *out,bool *approximate)
 {

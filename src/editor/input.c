@@ -258,41 +258,37 @@ static void remember_key(editor *e)
         e->buffer->last_key_valid = true;
     }
 }
-/* edit-6090: the cached rows are pre-edit, so a caret row starting after the
- * old bottom row's start is either one row below it (a typed Return at the
- * bottom row: the most frequent case) or a far jump. One fresh query of the
- * row above the caret's tells them apart: it is the old bottom row (same
- * start, since an edit inside or after that row keeps every earlier start)
- * exactly in the one-row case. Then the viewport advances one row (old row 1,
- * untouched by the edit) as a plain Down motion does, instead of re-anchoring
- * at the caret's row, which showed only that row at the top and, at the end
- * of the file, only the last line (the trial's periodic jump). */
-static bool wrapped_one_row_below(editor *e, const layout_wrap_row *cursor, uint32_t last)
-{
-    if (!last || !cursor->start) return false;
-    layout_wrap_row prev; bool approximate = false;
-    return layout_visual_row_fresh(&e->lay, e->tree, cursor->start - 1u, &prev, &approximate) == LAYOUT_DONE &&
-        !approximate && prev.start == e->lay.wrap_rows[last].start;
-}
 static int finish_edit(editor *e)
 {
     if (e->v.state.wrap) {
         layout_wrap_row cursor; bool approximate;
-        int query = layout_visual_row_fresh(&e->lay, e->tree, e->v.state.selection.cursor, &cursor, &approximate);
+        uint64_t caret = e->v.state.selection.cursor;
+        int query = layout_visual_row_fresh(&e->lay, e->tree, caret, &cursor, &approximate);
         if (query) return query;
-        uint32_t last = e->text_grid.dims.rows - 1;
-        const layout_wrap_row *bottom = &e->lay.wrap_rows[last];
+        if (e->v.state.visual_end && caret && cursor.start == caret && cursor.continuation) {
+            /* Trailing affinity: the caret shows at the end of the row above. */
+            bool above_approximate = false;
+            query = layout_visual_row_fresh(&e->lay, e->tree, caret - 1u, &cursor, &above_approximate);
+            if (query) return query;
+            approximate |= above_approximate;
+        }
         /* Undo mutates outside view_command. Its empty TYPE repairs cluster
-         * boundaries, but cached EOF cannot describe newly appended rows. */
-        if (cursor.start < e->v.state.visual_byte) {
-            e->v.state.visual_byte = cursor.start;
-            e->v.state.first_line = cursor.line;
-            e->v.state.first_byte = cursor.line_start;
-        } else if (bottom->start != LAYOUT_VOID_ROW && cursor.start > bottom->start) {
-            const layout_wrap_row *top = wrapped_one_row_below(e, &cursor, last) ? &e->lay.wrap_rows[1] : &cursor; /* edit-6090 */
-            e->v.state.visual_byte = top->start;
-            e->v.state.first_line = top->line;
-            e->v.state.first_byte = top->line_start;
+         * boundaries, but cached EOF cannot describe newly appended rows.
+         * edit-6090, edit-cxho.25: nor can the pre-edit bottom row tell the
+         * caret's row on screen, one row or a few rows below it (Return,
+         * soft wrap, paste) from a far jump; decide from the fresh rows
+         * (layout_wrap_follow_edit): keep the top or scroll minimally. */
+        layout_wrap_row top = cursor; bool moved = cursor.start < e->v.state.visual_byte;
+        if (!moved) {
+            uint32_t rows = e->lay.grid->dims.rows; /* minimal scroll up to a screen below (finish_move's rule) */
+            int follow = layout_wrap_follow_edit(&e->lay, e->tree, e->v.state.visual_byte, &cursor, rows ? rows - 1u : 0u,
+                &top, &moved, &approximate);
+            if (follow) return follow;
+        }
+        if (moved) {
+            e->v.state.visual_byte = top.start;
+            e->v.state.first_line = top.line;
+            e->v.state.first_byte = top.line_start;
         }
         e->v.state.approximate |= approximate;
     }

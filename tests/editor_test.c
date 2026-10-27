@@ -6119,6 +6119,302 @@ static int vp4m_return_bottom(void)
     puts("edit-vp4m: unwrapped Return on the bottom row shows the caret's row in the same frame"); return 0;
 }
 
+/* edit-cxho.25 (trial, Tobias 2026-10-27): the view still jumps while typing
+ * so the caret's line lands on the top row. Seeded random typing at the
+ * bottom rows of a buffer longer than the screen, wrapped and unwrapped,
+ * every file type's default, LF and CRLF: letters, spaces, Return (bursts
+ * too: key repeat before a frame), Tab, BackSpace, paste (multi-line and
+ * one long line), undo, redo, arrows/Home/End, and a wheel notch or a
+ * resize to a height that need not be whole rows (those two move the view
+ * on purpose and are not judged). After every settled frame the viewport
+ * invariant: when the caret was on screen before the key, it is on screen
+ * after; k is the caret's row counted from the old top row in the new text;
+ * k < rows keeps the top; rows <= k < 2 rows - 1 (less than a screen below)
+ * scrolls minimally, so the caret is on the bottom row, never re-anchored
+ * on the top row. Farther moves (a large paste, undo far away) need only
+ * visibility. Sizes (P): see c25_fixture. */
+static uint32_t c25_next(uint32_t *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
+#define C25_FAR INT64_MAX
+#define C25_BAD INT64_MIN
+/* Displayed rows from the row holding `from` to the caret's row, in the
+ * current text: -1 when the caret is above, C25_FAR beyond `cap`. */
+static int64_t c25_rows(editor *e, uint64_t from, uint64_t caret, bool visual_end, int64_t cap)
+{
+    if (caret < from) return -1;
+    if (!e->v.state.wrap) {
+        uint8_t bytes[4096]; int64_t n = 0;
+        while (from < caret) {
+            size_t take = caret - from < sizeof bytes ? (size_t)(caret - from) : sizeof bytes;
+            if (editor_read(e, from, bytes, take)) return C25_BAD;
+            for (size_t i = 0; i < take; i++) n += bytes[i] == '\n';
+            if (n > cap) return C25_FAR;
+            from += take;
+        }
+        return n;
+    }
+    layout_wrap_row r, c; bool approx = false;
+    if (layout_visual_row_fresh(&e->lay, e->tree, caret, &c, &approx) != LAYOUT_DONE) return C25_BAD;
+    if (visual_end && caret && c.start == caret && c.continuation &&
+        layout_visual_row_fresh(&e->lay, e->tree, caret - 1u, &c, &approx) != LAYOUT_DONE) return C25_BAD;
+    if (layout_visual_row_fresh(&e->lay, e->tree, from, &r, &approx) != LAYOUT_DONE) return C25_BAD;
+    if (c.start < r.start) return -1;
+    int64_t n = 0;
+    while (r.start < c.start) {
+        if (++n > cap) return C25_FAR;
+        if (r.next == LAYOUT_VOID_ROW || r.next <= r.start) return C25_BAD;
+        if (layout_visual_row_fresh(&e->lay, e->tree, r.next, &r, &approx) != LAYOUT_DONE) return C25_BAD;
+    }
+    return r.start == c.start ? n : C25_BAD;
+}
+/* The displayed top: the first laid-out row's start (what is on screen). */
+static uint64_t c25_top(editor *e) { return e->v.state.wrap ? e->lay.wrap_rows[0].start : e->lay.first_byte; }
+/* The invariant for one settled frame after `burst` keys, from the top
+ * before them (top0) and the text rows then (R). */
+typedef struct c25_after { const char *bad; uint64_t top; int64_t idx, k; } c25_after;
+static c25_after c25_judge(editor *e, uint64_t top0, int64_t R, unsigned burst)
+{
+    view_state v1 = editor_view(e);
+    uint64_t top1 = c25_top(e), caret1 = v1.selection.cursor;
+    c25_after a = {NULL, top1, c25_rows(e, top1, caret1, v1.visual_end, R), c25_rows(e, top0, caret1, v1.visual_end, 2 * R)};
+    bool viewtop = v1.wrap ? v1.visual_byte == top1 : v1.first_byte == top1;
+    if (!viewtop) a.bad = "view top differs from the displayed top";
+    else if (a.idx < 0 || a.idx >= R) a.bad = "caret off screen";
+    /* A burst (key repeat before one frame) may scroll minimally for an
+     * intermediate caret (BackSpace onto a soft row start), so only a
+     * single key's frame is held to the exact minimum. */
+    else if (a.k >= 0 && a.k < R && top1 > top0 && (burst == 1 || (a.idx == 0 && a.k > 1)))
+        a.bad = a.idx == 0 && a.k > 1 ? "JUMP: top moved to the caret row although it stayed on screen" :
+            "top moved down although the caret stayed on screen";
+    else if (a.k >= R && a.k < 2 * R - 1 && a.idx != R - 1 && (burst == 1 || a.idx == 0))
+        a.bad = a.idx == 0 ? "JUMP: caret re-anchored on the top row" : "scroll not minimal (caret not on the bottom row)";
+    return a;
+}
+typedef struct c25_case {
+    const char *ext; int wrap_mode; bool crlf; int place; bool long_paste; uint32_t seed; unsigned keys;
+    unsigned return_weight; /* percent of keys that are Return (the coordinator's focus) */
+} c25_case;
+/* Fixture (P): a 300-byte paste source line, a four-line paste block, then
+ * 240 paragraphs of 0..399 bytes (blank lines, list items, indented lines,
+ * single and multi-row wraps at the 80-column window's text width): more
+ * than ten screens of 24 text rows, short enough to keep ASan runs short. */
+static int c25_fixture(char *path, const c25_case *c)
+{
+    int fd = mkstemps(path, (int)strlen(c->ext)); T(fd >= 0);
+    FILE *f = fdopen(fd, "w"); T(f);
+    const char *eol = c->crlf ? "\r\n" : "\n";
+    const char words[] = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor ";
+    uint32_t s = c->seed * 2654435761u + 1u; size_t w = 0;
+    for (unsigned i = 0; i < 300u; i++) fputc(words[w++ % (sizeof words - 1u)], f);
+    fputs(eol, f);
+    for (unsigned i = 0; i < 4u; i++) fprintf(f, "paste block line %u%s", i, eol);
+    for (unsigned i = 0; i < 240u; i++) {
+        uint32_t kind = c25_next(&s) % 8u, len = c25_next(&s) % 400u;
+        if (kind == 0) len = 0; /* blank */
+        else if (kind == 1) fputs("- ", f); /* list item */
+        else if (kind == 2) fputs("    ", f); /* indented: Return auto-indents */
+        else if (kind == 3) fputc('\t', f);
+        for (uint32_t k = 0; k < len; k++) fputc(words[w++ % (sizeof words - 1u)], f);
+        fputs(eol, f);
+    }
+    T(fclose(f) == 0);
+    return 0;
+}
+static int c25_run(const c25_case *c, unsigned *checked)
+{
+    char path[64]; snprintf(path, sizeof path, "build/editor-c25-XXXXXX%s", c->ext);
+    T(c25_fixture(path, c) == 0);
+    char log_path[] = "/tmp/editor-c25-XXXXXX"; int lfd = mkstemp(log_path); T(lfd >= 0); T(close(lfd) == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.path = path, .journal_path = log_path, .cols = 80u, .rows = 1u + 3u + 24u,
+        .wrap_mode = c->wrap_mode, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
+    int64_t R = (int64_t)e->v.config.rows; T(R >= 4);
+    /* The clipboard: one long line (Shift+End from its start) or a block. */
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    if (c->long_paste) T(press(e, key(XKB_KEY_End, PLAT_MOD_SHIFT, NULL)) == 0);
+    else {
+        T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+        for (int i = 0; i < 3; i++) T(press(e, key(XKB_KEY_Down, PLAT_MOD_SHIFT, NULL)) == 0);
+        T(press(e, key(XKB_KEY_End, PLAT_MOD_SHIFT, NULL)) == 0);
+    }
+    T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+    /* Placement: 0 the true end of the file; 1 the bottom row, end of a line
+     * mid-file; 2 the bottom row mid-line; 3 the row above the bottom. */
+    if (c->place == 0) T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    else {
+        int jr; while ((jr = editor_jump_line(e, 100u)) == EDITOR_MORE) T(settle(e) == 0);
+        T(jr == 0); T(settle(e) == 0);
+        int64_t down = c->place == 3 ? R - 2 : R - 1;
+        for (int64_t i = 0; i < down; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+        T(press(e, key(c->place == 2 ? XKB_KEY_Right : XKB_KEY_End, 0, NULL)) == 0);
+    }
+    uint32_t s = c->seed; int failed = 0;
+    const char letters[] = "the quick brown fox jumps over the lazy dog";
+    for (unsigned at = 0; at < c->keys && !failed; ) {
+        view_state v0 = editor_view(e); R = (int64_t)e->v.config.rows;
+        uint64_t top0 = c25_top(e), caret0 = v0.selection.cursor;
+        int64_t idx0 = c25_rows(e, top0, caret0, v0.visual_end, R);
+        uint32_t pick = c25_next(&s) % 100u; unsigned burst = 1; const char *what; bool viewing = false;
+        plat_event ev;
+        if (pick < c->return_weight) {
+            what = "Return"; ev = key(XKB_KEY_Return, 0, NULL);
+            if (c25_next(&s) % 8u == 0) burst = 2u + c25_next(&s) % 3u; /* key repeat before a frame */
+        } else {
+            pick = c25_next(&s) % 100u;
+            if (pick < 60u) { char one[2] = {letters[c25_next(&s) % (sizeof letters - 1u)], 0}; what = "letter";
+                ev = key((uint32_t)(uint8_t)one[0], 0, one);
+                if (c25_next(&s) % 16u == 0) burst = 2u + c25_next(&s) % 8u; }
+            else if (pick < 72u) { what = "space"; ev = key(' ', 0, " "); }
+            else if (pick < 76u) { what = "Tab"; ev = key(XKB_KEY_Tab, 0, NULL); }
+            else if (pick < 88u) { what = "BackSpace"; ev = key(XKB_KEY_BackSpace, 0, NULL);
+                if (c25_next(&s) % 8u == 0) burst = 2u + c25_next(&s) % 8u; }
+            else if (pick < 91u) { what = "paste"; ev = key(XKB_KEY_v, PLAT_MOD_CTRL, NULL); }
+            else if (pick < 94u) { what = "undo"; ev = key(XKB_KEY_z, PLAT_MOD_CTRL, NULL); }
+            else if (pick < 95u) { what = "redo"; ev = key(XKB_KEY_y, PLAT_MOD_CTRL, NULL); }
+            else if (pick < 98u) {
+                static const uint32_t moves[] = {XKB_KEY_Up, XKB_KEY_Down, XKB_KEY_Left, XKB_KEY_Right, XKB_KEY_End, XKB_KEY_Home};
+                what = "motion"; ev = key(moves[c25_next(&s) % (sizeof moves / sizeof moves[0])], 0, NULL);
+            } else if (pick < 99u) {
+                /* One wheel notch either way: the view moves on purpose. */
+                what = "wheel"; viewing = true;
+                ev = (plat_event){.kind = PLAT_EV_WHEEL, .dy = c25_next(&s) % 2u ? (int32_t)SCROLL_WHEEL_UNIT : -(int32_t)SCROLL_WHEEL_UNIT};
+            } else {
+                /* A resize to a height that need not be a whole number of
+                 * rows (the bottom pixel row partially visible): (P) the
+                 * original text rows plus -3..+3 rows plus 0..cell_h-1 px. */
+                what = "resize"; viewing = true;
+                uint32_t ch = e->grid.dims.cell_h, rows = 1u + 3u + 24u - 3u + c25_next(&s) % 7u;
+                ev = (plat_event){.kind = PLAT_EV_RESIZE, .w = 80u * e->grid.dims.cell_w,
+                    .h = rows * ch + c25_next(&s) % ch};
+            }
+        }
+        for (unsigned b = 0; b < burst; b++) T(editor_inject(e, &ev) == 0);
+        T(settle(e) == 0);
+        c25_after a = c25_judge(e, top0, R, burst);
+        const char *bad = NULL;
+        if (!viewing && idx0 >= 0 && idx0 < R && (int64_t)e->v.config.rows == R) { (*checked)++; bad = a.bad; }
+        view_state v1 = editor_view(e);
+        uint64_t top1 = a.top, caret1 = v1.selection.cursor; int64_t idx1 = a.idx, k = a.k;
+        if (bad) {
+            fprintf(stderr, "edit-cxho.25: ext %s wrap %d crlf %d place %d long_paste %d seed %u key %u (%s x%u): %s;"
+                " rows %lld idx %lld -> %lld k %lld top %llu -> %llu caret %llu -> %llu visual_end %d len %llu\n",
+                c->ext, (int)v1.wrap, (int)c->crlf, c->place, (int)c->long_paste, c->seed, at, what, burst, bad,
+                (long long)R, (long long)idx0, (long long)idx1, (long long)k, (unsigned long long)top0,
+                (unsigned long long)top1, (unsigned long long)caret0, (unsigned long long)caret1, (int)v1.visual_end,
+                (unsigned long long)editor_length(e));
+            failed++;
+        }
+        at += burst;
+    }
+    T(!count.active && count.allocations == 0); /* (P) no typing-path allocations */
+    editor_close(e); T(unlink(log_path) == 0); T(unlink(path) == 0);
+    return failed;
+}
+/* The named deterministic cases minimised from the random run's red seeds
+ * (docs/worker-reports/edit-cxho.25-s24.md). Fixture (P): 200 short lines
+ * "line NNN: short text", except line 120, a 300-byte word paragraph (four
+ * or more word-wrapped rows at the window's text width), and line 150, 1000
+ * bytes without a space (hard-wrapped full rows, so End leaves the caret at
+ * a soft row end with trailing affinity); 3-digit numbering keeps the
+ * gutter width fixed. Window as the random run's: 80 columns, 24 text rows
+ * plus chrome. Each case places the caret by plain motions (Down from a
+ * line set as the top), so only the named keys edit. */
+enum { C25_LETTER, C25_RETURN_CONTINUATION, C25_RETURN_BURST, C25_RETURN_BURST_EOF, C25_PASTE,
+       C25_BACKSPACE_BURST, C25_DOWN_TRAILING, C25_NAMED };
+static const char *const c25_names[C25_NAMED] = {
+    "letter at the end of the bottom row's line", "Return at the start of a continuation row on the bottom row",
+    "two Returns before a frame at the bottom row", "two Returns before a frame at the end of the file",
+    "paste of four lines at the bottom row", "three BackSpaces before a frame at the bottom row",
+    "Down onto a soft row end below the bottom row"};
+static int c25_named(int which)
+{
+    char *text = malloc(64u * 1024u); T(text); size_t n = 0;
+    for (unsigned i = 0; i < 200u; i++) {
+        if (i == 120u) {
+            const char words[] = "paragraph words wrap across rows ";
+            for (unsigned k = 0; k < 300u; k++) text[n++] = words[k % (sizeof words - 1u)];
+            text[n++] = '\n';
+        } else if (i == 150u) { memset(text + n, 'x', 1000u); n += 1000u; text[n++] = '\n'; }
+        else n += (size_t)snprintf(text + n, 64u * 1024u - n, "line %03u: short text\n", i);
+    }
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    counted count = {0};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = n, .cols = 80u, .rows = 1u + 3u + 24u,
+        .wrap_mode = 1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0); free(text);
+    int64_t R = (int64_t)e->v.config.rows; T(R >= 4);
+    uint64_t line = 20u; unsigned burst = 1; int64_t down = R - 1;
+    if (which == C25_PASTE) {
+        T(editor_set_cursor(e, 0) == 0); T(settle(e) == 0);
+        T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+        for (int i = 0; i < 4; i++) T(press(e, key(XKB_KEY_Down, PLAT_MOD_SHIFT, NULL)) == 0);
+        T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
+    }
+    if (which == C25_RETURN_CONTINUATION) line = 120u - (uint64_t)(R - 2); /* line 120's second row is the bottom row */
+    if (which == C25_DOWN_TRAILING) line = 150u - (uint64_t)(R - 1); /* line 150's first row is the bottom row */
+    if (which == C25_RETURN_BURST_EOF) line = 190u;
+    T(editor_jump_line(e, line) == 0); T(settle(e) == 0);
+    if (which == C25_RETURN_BURST_EOF) T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    else {
+        for (int64_t i = 0; i < down; i++) T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
+        if (which != C25_RETURN_CONTINUATION) T(press(e, key(XKB_KEY_End, 0, NULL)) == 0);
+    }
+    view_state v0 = editor_view(e);
+    uint64_t top0 = c25_top(e);
+    int64_t idx0 = c25_rows(e, top0, v0.selection.cursor, v0.visual_end, R);
+    T(idx0 >= 0 && idx0 < R);
+    if (which != C25_RETURN_BURST_EOF) T(idx0 == R - 1); /* on the bottom row */
+    if (which == C25_DOWN_TRAILING) T(v0.visual_end);
+    plat_event ev;
+    switch (which) {
+    case C25_LETTER: ev = key('x', 0, "x"); break;
+    case C25_RETURN_CONTINUATION: T(editor_view(e).selection.cursor > top0); ev = key(XKB_KEY_Return, 0, NULL); break;
+    case C25_RETURN_BURST: case C25_RETURN_BURST_EOF: ev = key(XKB_KEY_Return, 0, NULL); burst = 2; break;
+    case C25_PASTE: ev = key(XKB_KEY_v, PLAT_MOD_CTRL, NULL); break;
+    case C25_BACKSPACE_BURST: ev = key(XKB_KEY_BackSpace, 0, NULL); burst = 3; break;
+    default: ev = key(XKB_KEY_Down, 0, NULL); break;
+    }
+    for (unsigned b = 0; b < burst; b++) T(editor_inject(e, &ev) == 0);
+    T(settle(e) == 0);
+    c25_after a = c25_judge(e, top0, R, burst);
+    if (a.bad) fprintf(stderr, "edit-cxho.25 named case '%s': %s; rows %lld idx %lld -> %lld k %lld top %llu -> %llu\n",
+        c25_names[which], a.bad, (long long)R, (long long)idx0, (long long)a.idx, (long long)a.k,
+        (unsigned long long)top0, (unsigned long long)a.top);
+    T(!count.active && count.allocations == 0); /* (P) no typing-path allocations */
+    editor_close(e);
+    return a.bad ? 1 : 0;
+}
+static int cxho25_typing_jump(void)
+{
+    /* Defaults by path (view_wrap_default): .md/.txt wrap, .c and an
+     * extension-less name do not; wrap_mode 1/-1 force the other mode. */
+    static const char *const exts[] = {".md", ".txt", ".c", "", ".md", ".c"};
+    static const int modes[] = {0, 0, 0, 0, -1, 1};
+    unsigned checked = 0; int failed = 0;
+    for (int which = 0; which < C25_NAMED; which++) failed += c25_named(which);
+    /* Bounds (M) [bat], from this test's red run (worker report): every
+     * wrapped run failed by key 68, so 400 keys per run is ~6x that; two
+     * seeds per mode and placement cover LF with a block paste and Return
+     * at 35 % (seed 1) and CRLF with a long-line paste and Return at 10 %
+     * (seed 2). The selector takes 6.7 s release, 16.9 s ASan (M) [bat]
+     * (worker report). C25_SEEDS / C25_KEYS lengthen a soak run. */
+    const char *only = getenv("C25_SEEDS"); unsigned seeds = only ? (unsigned)atoi(only) : 2u;
+    unsigned keys = getenv("C25_KEYS") ? (unsigned)atoi(getenv("C25_KEYS")) : 400u;
+    for (size_t m = 0; m < sizeof exts / sizeof exts[0]; m++)
+        for (int place = 0; place < 4; place++)
+            for (unsigned seed = 1; seed <= seeds; seed++) {
+                c25_case c = {.ext = exts[m], .wrap_mode = modes[m], .crlf = (seed & 1u) == 0, .place = place,
+                    .long_paste = (seed & 2u) != 0, .seed = seed * 7919u + (unsigned)place * 104729u + (unsigned)m,
+                    .keys = keys, .return_weight = (seed % 2u == 0) ? 10u : 35u};
+                failed += c25_run(&c, &checked);
+            }
+    printf("edit-cxho.25: %u keys checked, %d violations\n", checked, failed);
+    T(failed == 0);
+    puts("edit-cxho.25: random typing at the bottom rows never re-anchors the caret on the top row");
+    return 0;
+}
+
 /* edit-dzk1: a render-rule violation in submit must not end the loop. The
  * test hook is private access to the font cache's bound descriptor table and
  * pages. First the edit-2ghs shape (a zero-sized descriptor, after the font
@@ -6582,6 +6878,7 @@ static const test_selector selectors[] = {
     {"--3f2k-save", n3f2k_save_with_results},
     {"--6090-typing", n6090_typing_top},
     {"--vp4m-return", vp4m_return_bottom},
+    {"--cxho25-typing", cxho25_typing_jump},
     {"--5vz-full", n5vz_results_full},
     {"--5vz-open", n5vz_open_refused},
     {"--bt1-geometry", nbt1_results_geometry},
@@ -6704,6 +7001,7 @@ int main(int argc, char **argv)
     T(n3f2k_save_with_results() == 0);
     T(n6090_typing_top() == 0);
     T(vp4m_return_bottom() == 0);
+    T(cxho25_typing_jump() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(nci6i_map_refused() == 0);

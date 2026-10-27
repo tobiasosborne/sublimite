@@ -264,6 +264,13 @@ int layout_visual_row(const layout *l, const piece_tree *t, uint64_t byte,
 /* Query after a mutation before layout_edit: ignore stale row/checkpoint data. */
 int layout_visual_row_fresh(const layout *l, const piece_tree *t, uint64_t byte,
                             layout_wrap_row *out, bool *approximate);
+/* edit-cxho.25: the wrapped top after a mutation (before relayout) that
+ * keeps `caret` (its fresh row) on screen below `top`. *moved is false when
+ * the caret's row is within the rows below `top`; up to max_scroll rows
+ * below them *new_top is the row rows-1 above the caret's (minimal scroll);
+ * farther it is the caret's row. At most rows-1+max_scroll row queries. */
+int layout_wrap_follow_edit(const layout *l, const piece_tree *t, uint64_t top, const layout_wrap_row *caret,
+                            uint32_t max_scroll, layout_wrap_row *new_top, bool *moved, bool *approximate);
 /* Same bounded visual query using a caller-certified logical line start and
  * ordinal (which may be estimated). Avoids whole-source piece line queries;
  * deep unindexed wrap phase retains the existing explicit approximation. */
