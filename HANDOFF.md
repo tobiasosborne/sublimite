@@ -1,3 +1,34 @@
+# HANDOFF — sublimité, session 26 on the ThinkPad (2026-10-28 morning; Opus 5.5 coordinator, Tobias present, partly by phone via remote control; stopped on his word "I'll work with round 3 for a while. So now we can update handoff and commit and push")
+
+## Read first (session 27)
+
+**Installed: design round 3, main 062686f (11:46).** Tobias is living with it; his findings from use come first. Round 4 waits for his word.
+
+**Landed today, all on main and pushed:**
+- **Design rounds 2 and 3** (edit-cxho.22/.23/.24 closed). Blind council A/B: round 2 1.83 -> 2.43; round 3 2.17 -> 2.93 (`docs/reviews/design-council-2026-10-28-r3.md`). No criterion regressed in either round. Round 3: one text edge for tabs/text/find query; gutter margins; a spacer row under the tabs; panels without labels or brackets (`Aa`, underlined `ab`, `.*`, `n of m`, placeholders); a panel token; hover for tabs, toggles, rows and minimap; X11 I-beam via our own Xcursor loader (`src/x11/xcursor.c`, fuzz target). Decision: `docs/decisions/edit-cxho.24-r3.md`. Sheets: `docs/design/hillclimb-2026-10-28/`.
+- **Fast `make check`** (edit-nafu, edit-edgt). Suites run in parallel on six private Xvfbs, and `editor_test` is split into five parts. raster_test's Present-paced loop runs 1,000 frames when the malloc guard is inert (ASan) and 10,000 when it is live. Measured 66-82 s (M)[AC], against 669 s of serial suites before. `make check-serial` keeps the old loop. A failed task is rerun once alone and printed as `check: FLAKY`, appended to build/check-flaky.log; treat every FLAKY as a bead. Docs-only changes need `make all` (CLAUDE.md law 1).
+- **`tools/codex_run.py`** (edit-n4qk): retries and resumes Codex jobs across capacity errors (CLAUDE.md law 10). Use it for every Codex call.
+- **Rubric correction** (Tobias): the bar is the platonic ultimate design. Generated targets are ideation and calibration only; resemblance earns nothing (rubric "The standard"; council.md).
+
+**Design state, for round 4** (bead edit-p304; typeface edit-kf04):
+- Target images: `docs/design/targets-2026-10-28/` (Codex image_gen), graded in `docs/reviews/design-council-targets-2026-10-28.md`. Best target T1 3.47 vs build 1.77 absolute.
+- Typeface shoot-out, blind (`docs/reviews/design-council-typeface-2026-10-28.md`): IBM Plex Mono first (C1 4.00, mean rank 1.33), JetBrains Mono second. Plex, JetBrains and Commit Mono are installed in `~/.local/share/fonts` (OFL). Tobias can try Plex now with `[font] file = ...` in `~/.config/sublimite/config.toml`; he has no config file yet.
+- Weakest criterion: C9 states, 1.67 (block caret). Round 4 adds render-contract hairlines plus a bar caret (raster, GL, D3D11) and a state grammar: hover changes tone, "on" gets a fill, "selected" a stronger fill. Each synthesis move must earn its place.
+- Platform gaps, backlog edit-osn3: Wayland cursor shape (header not vendored), Win32 pointer leave.
+
+**How a round runs now:**
+1. Codex draws targets.
+2. Implement on a worktree via codex_run.
+3. `make check`.
+4. `tools/design_shots.sh` both builds.
+5. `tools/council_run.py prepare --mode ab`, renaming the run dir to something neutral and moving key.json out while members run.
+6. Aggregate, then show Tobias the sheets (SendUserFile when he is on the phone).
+7. Install on his word.
+
+Quota at stop (M): Claude weekly 9 % (2.5 % behind pace), Codex 5 % (+3.3 % ahead, reset this morning), Muse weekly 10 %.
+
+---
+
 # HANDOFF — sublimité, session 25 on the ThinkPad (2026-10-27 evening; Opus 5.5 coordinator; Tobias set the design bar then left the session unattended with permission to proceed)
 
 ## Read first (session 26)
