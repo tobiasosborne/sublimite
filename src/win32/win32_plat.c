@@ -37,6 +37,12 @@ static bool pop(win32_plat *s, plat_event *out)
     if (s->head==s->tail) return win32_clip_poll(s,out);
     *out=s->queue[s->head++ % WIN32_EVENT_CAP]; return true;
 }
+void plat_set_cursor(plat *p, plat_cursor_shape shape)
+{
+    win32_plat *s=win32_private(p);
+    if (!ui(s) || (unsigned)shape>PLAT_CURSOR_TEXT || s->cursor_shape==shape) return;
+    s->cursor_shape=shape; SetCursor(s->cursors[shape]);
+}
 bool plat_poll_event(plat *p, plat_event *out)
 {
     win32_plat *s=win32_private(p);
@@ -379,6 +385,9 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         s->layout_altgr=layout_altgr(); s->real_ctrl=false;
         repeat_cancel(s); clear_compose(s); memset(s->hidden,0,sizeof s->hidden);
         (void)push(s,(plat_event){.kind=PLAT_EV_KEYMAP}); return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp)==HTCLIENT) { SetCursor(s->cursors[s->cursor_shape]); return TRUE; }
+        break;
     case WM_MOUSEMOVE: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
     case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: case WM_XBUTTONDOWN:
     case WM_LBUTTONUP: case WM_MBUTTONUP: case WM_RBUTTONUP: case WM_XBUTTONUP:
@@ -479,7 +488,9 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     if (!s->blink_timer || !s->repeat_timer || !s->present_wake) goto fail;
     (void)swprintf(s->class_name,sizeof s->class_name / sizeof s->class_name[0],L"sublimite-%p",(void *)s);
     WNDCLASSEXW cls={0}; cls.cbSize=sizeof cls; cls.lpfnWndProc=procedure; cls.hInstance=s->instance;
-    cls.hCursor=LoadCursorW(NULL,MAKEINTRESOURCEW(32513)); cls.lpszClassName=s->class_name;
+    s->cursors[PLAT_CURSOR_DEFAULT]=LoadCursorW(NULL,MAKEINTRESOURCEW(32512));
+    s->cursors[PLAT_CURSOR_TEXT]=LoadCursorW(NULL,MAKEINTRESOURCEW(32513));
+    cls.hCursor=s->cursors[PLAT_CURSOR_DEFAULT]; cls.lpszClassName=s->class_name;
     if (!RegisterClassExW(&cls)) goto fail;
     WCHAR *title=wide_utf8(cfg->title ? cfg->title : "sublimite",strlen(cfg->title ? cfg->title : "sublimite"));
     if (!title) goto fail;

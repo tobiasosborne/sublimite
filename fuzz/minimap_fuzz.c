@@ -131,7 +131,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     MUST(render_grid_init(&g,(render_dims){w+2,h,1,1},cells,512*10,dirty,8) == 0);
     MUST(render_frame_begin(&g,1) == 0);
     memset(cells,0x42,sizeof cells);
-    minimap_style style = {0,0xffffff,0x002244,0x440000};
+    minimap_style style = {0,0xffffff,0x002244,0x440000, false};
     MUST(minimap_fill(&m,&in,&g,2,w,data[3],data[2],&style) == 0);
     uint64_t k = (lines + h - 1) / h;
     flat fast = {bytes,n,n ? n : 1};

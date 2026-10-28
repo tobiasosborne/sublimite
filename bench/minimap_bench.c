@@ -69,7 +69,7 @@ static int run(flat *f, const char *name, work_pool *pool)
     NEED(minimap_init(&worker,worker_rows,HEIGHT) == 0);
     NEED(render_grid_init(&g,(render_dims){COLS,HEIGHT,1,1},cells,HEIGHT*COLS,dirty,(HEIGHT+63)/64) == 0);
     NEED(render_frame_begin(&g,1) == 0);
-    minimap_style style = {0x101010,0x999999,0x224466,0x663300};
+    minimap_style style = {0x101010,0x999999,0x224466,0x663300, false};
     minimap_input in = {src,1,1,false}; minimap_target target;
     size_t pending_calls=f->calls;
     NEED(minimap_fill_cached(&m,&in,&g,4,WIDTH,0,1,&style) == 0);
@@ -173,7 +173,7 @@ static int cold_sample_check(void)
     flat f={p,n,0}; minimap_input in={{&f,n,span,NULL},65537,1,true};
     minimap_row rows[HEIGHT], worker_rows[HEIGHT]; minimap m, worker;
     render_cell cells[HEIGHT*2]={0}; uint64_t dirty[(HEIGHT+63)/64]; render_grid g;
-    minimap_style style={0,0xffffff,0x224466,0x663300};
+    minimap_style style={0,0xffffff,0x224466,0x663300, false};
     NEED(minimap_init(&m,rows,HEIGHT)==0 && minimap_init(&worker,worker_rows,HEIGHT)==0);
     NEED(render_grid_init(&g,(render_dims){2,HEIGHT,1,1},cells,HEIGHT*2,dirty,(HEIGHT+63)/64)==0);
     NEED(render_frame_begin(&g,1)==0);

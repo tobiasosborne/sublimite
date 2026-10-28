@@ -1,4 +1,5 @@
 #include "editor/private.h"
+#include "editor/theme.h"
 #include "trace/trace.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
@@ -688,7 +689,7 @@ int editor_find_pointer(editor *e, const plat_event *ev, bool *handled)
         return editor_begin_frame(e);
     }
     findui_hit hit;
-    findui_code code=findui_hit_test(&e->find,e->grid.dims.cols,e->panel_rows,row-first,column,&hit);
+    findui_code code=findui_hit_test(&e->find,editor_panel_bounds(e),e->panel_rows,row-first,column,&hit);
     if (code!=FINDUI_OK) { e->find_error=(int)code; return editor_begin_frame(e); }
     findui_state state=findui_get_state(&e->find);
     if (hit.kind==FINDUI_HIT_QUERY || hit.kind==FINDUI_HIT_REPLACEMENT) {
@@ -713,18 +714,28 @@ int editor_find_paint(editor *e)
 {
     if (e->palette_open) return editor_palette_paint(e);
     if (!e->panel_rows) return 0;
-    config_theme t=e->preferences.theme; /* edit-29y2: theme tokens, not dark literals */
-    findui_style style={config_theme_color(t,"editor.foreground"),config_theme_color(t,"chrome.background"),
-        config_theme_color(t,"chrome.foreground"),config_theme_color(t,"caret.foreground"),
-        config_theme_color(t,"caret.background"),e->find_ascii,LAYOUT_ASCII_GLYPHS};
+    if (e->hover_only && !render_row_dirty(&e->grid,e->grid.dims.rows-e->panel_rows)) return 0;
+    uint32_t dot = RENDER_NO_SLOT;
+    if (!e->hover_only && e->panel_rows >= 3u) {
+        (void)editor_font_glyph(e, (const uint8_t *)"\xc2\xb7", 2, 1, &dot);
+        editor_font_track(e, dot, e->grid.dims.rows - 1u);
+    }
+    findui_style style = {.foreground=e->layout_cfg.fg, .background=e->colors.panel,
+        .accent=e->colors.chrome_fg, .cursor_foreground=e->layout_cfg.cursor_fg,
+        .cursor_background=e->layout_cfg.cursor_bg, .ascii_slots=e->find_ascii,
+        .ascii_slot_count=LAYOUT_ASCII_GLYPHS, .bounds=editor_panel_bounds(e),
+        .muted=e->layout_cfg.gutter_fg, .error=e->colors.error_fg,
+        .selected_background=e->layout_cfg.sel_bg, .dot_slot=dot, .hover_background=e->colors.hover,
+        .hover_toggle=e->hover.kind==EDITOR_HOVER_FIND ? (uint32_t)e->hover.index : 0, .hover_only=e->hover_only};
     if (findui_render(&e->find,&e->grid,e->grid.dims.rows-e->panel_rows,e->panel_rows,&style)!=FINDUI_OK)
         return EDITOR_ERR_ARG;
+    if (e->hover_only) return 0; /* only toggle cells were touched */
     editor_fif_paint(e,e->grid.dims.rows-e->panel_rows,e->panel_rows); /* edit-n95 */
-    if (e->find_focus!=EDITOR_FIND_FIELD) {
+    if (e->find_focus!=EDITOR_FIND_FIELD || (e->hover_only && e->fif.mode && e->fif.where_focus)) {
         /* The panel renderer already identifies its caret cell. Restore that
          * cell's ordinary ink after painting, retaining the query/highlights. */
         size_t first=(size_t)(e->grid.dims.rows-e->panel_rows)*e->grid.dims.cols;
-        size_t end=(size_t)e->grid.dims.rows*e->grid.dims.cols;
+        size_t end=e->hover_only ? first+e->grid.dims.cols : (size_t)e->grid.dims.rows*e->grid.dims.cols;
         for (size_t i=first;i<end;i++) {
             render_cell *cell=&e->grid.cells[i];
             if (cell->attrs&RENDER_ATTR_CURSOR) {
@@ -732,13 +743,21 @@ int editor_find_paint(editor *e)
                 cell->fg=style.foreground; cell->bg=style.background;
             }
         }
+        findui_state state=findui_get_state(&e->find);
+        if (!state.query_length && style.bounds.first<style.bounds.end)
+            e->grid.cells[first+style.bounds.first].attrs &= (uint16_t)~RENDER_ATTR_UNDERLINE;
+        if (!e->hover_only && state.replace_mode && !state.replacement_length && e->panel_rows>1u && style.bounds.first<style.bounds.end)
+            e->grid.cells[first+e->grid.dims.cols+style.bounds.first].attrs &= (uint16_t)~RENDER_ATTR_UNDERLINE;
     }
     if (e->find_focus==EDITOR_FIND_FIELD && e->find_field_all && !(e->fif.mode && e->fif.where_focus)) {
         findui_state state=findui_get_state(&e->find);
+        size_t length = state.replacement_focus ? state.replacement_length : state.query_length;
+        if (!length) return 0; /* empty placeholders retain the gutter tone */
         uint32_t row=e->grid.dims.rows-e->panel_rows;
-        uint32_t column=(uint32_t)(sizeof "Find: "-1u);
-        if (state.replacement_focus && e->panel_rows>1u) { row++; column=(uint32_t)(sizeof "Replace: "-1u); }
-        for (uint32_t c=column;c<e->grid.dims.cols;c++) {
+        uint32_t column=style.bounds.first;
+        uint32_t end=findui_get_geometry(&e->find,style.bounds).field_end;
+        if (state.replacement_focus && e->panel_rows>1u) { row++; end=style.bounds.end; }
+        for (uint32_t c=column;c<end;c++) {
             render_cell *cell=&e->grid.cells[(size_t)row*e->grid.dims.cols+c];
             if ((cell->attrs&RENDER_ATTR_CURSOR) || cell->fg==style.accent) break;
             cell->fg=e->layout_cfg.sel_fg; cell->bg=e->layout_cfg.sel_bg;

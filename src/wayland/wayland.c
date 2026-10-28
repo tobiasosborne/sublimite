@@ -281,7 +281,7 @@ static int32_t pointer_pixel(wl_fixed_t value, uint32_t scale)
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 { (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale); }
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
-{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; }
+{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; push(s, (plat_event){.kind=PLAT_EV_LEAVE, .t0_ns=trace_now_ns()}); }
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
     (void)pointer; wayland_state *s = data; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale);

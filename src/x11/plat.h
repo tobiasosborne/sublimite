@@ -18,7 +18,8 @@ typedef enum plat_ev_kind {
     PLAT_EV_WHEEL,          /* P2.2: dx/dy in 1/256 notch, smooth flag */
     PLAT_EV_CLIPBOARD,      /* P2.2: code 0 = requested data arrived (clip_ok), 1 = request failed, 2 = we lost ownership */
     PLAT_EV_KEYMAP,         /* P2.2: keymap/layout changed */
-    PLAT_EV_DROP            /* Raw URI-list available through plat_drop_data. */
+    PLAT_EV_DROP,           /* Raw URI-list available through plat_drop_data. */
+    PLAT_EV_LEAVE           /* Pointer left the client surface. */
 } plat_ev_kind;
 
 /* Modifier bits in plat_event.mods (platform-neutral, not X bits). */
@@ -120,6 +121,9 @@ void plat_set_blink(plat *p, uint32_t ms);  /* 0 disarms; ignored while unfocuse
 /* X11: sets or deletes _GTK_THEME_VARIANT="dark", the hint Muffin/Mutter read to
  * draw the dark decoration variant (edit-29y2). Wayland: no-op. */
 void plat_set_dark(plat *p, bool dark);
+typedef enum plat_cursor_shape { PLAT_CURSOR_DEFAULT, PLAT_CURSOR_TEXT } plat_cursor_shape;
+/* Changes only on a new wanted shape. Unsupported backends leave it alone. */
+void plat_set_cursor(plat *p, plat_cursor_shape shape);
 /* Raster owns completion on its private connection; avoid duplicate UI wakes. */
 int  plat_set_present_events(plat *p, bool enabled);
 void plat_quit(plat *p);

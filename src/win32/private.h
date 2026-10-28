@@ -27,6 +27,8 @@ typedef struct win32_plat {
     HANDLE blink_timer, repeat_timer, present_wake;
     const os_wake *work_wake;
     uint32_t dpi, blink_ms, repeat_delay, repeat_rate, repeat_key, buttons;
+    HCURSOR cursors[2];
+    plat_cursor_shape cursor_shape;
     uint64_t repeat_next;
     LPARAM repeat_lparam;
     int32_t wheel_x, wheel_y, pointer_x, pointer_y;

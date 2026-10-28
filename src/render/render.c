@@ -81,9 +81,9 @@ int render_mark_full(render_grid *g)
     return RENDER_OK;
 }
 
-static bool render_row_dirty(const render_grid *g, uint32_t row)
+bool render_row_dirty(const render_grid *g, uint32_t row)
 {
-    return g->full_frame || (g->dirty[row / 64u] & (UINT64_C(1) << (row % 64u))) != 0;
+    return g && row < g->dims.rows && (g->full_frame || (g->dirty[row / 64u] & (UINT64_C(1) << (row % 64u))) != 0);
 }
 
 static size_t render_strip_count(const render_grid *g)

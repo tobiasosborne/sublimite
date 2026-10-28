@@ -178,7 +178,7 @@ static int queued_groups(bool raster)
     editor_close(e); unlink(path); printf("editor_p4_test: %s full input queue journal groups preserve every key passed\n", raster ? "raster" : "null"); return 0;
 }
 static const render_cell *cell(editor *e, uint32_t row, uint32_t col)
-{ const render_grid *g = editor_grid(e); return &g->cells[(size_t)row * g->dims.cols + col]; }
+{ const render_grid *g = editor_grid(e); return &g->cells[(size_t)(row + e->tab_rows - 1u) * g->dims.cols + col + e->lay.gw - 2u]; /* old fixture coordinates relative to text */ }
 static int decorated_editor(editor **e, render_backend *b, bool raster, const char *text)
 {
     T(new_editor(e, b, raster, text) == 0);
@@ -214,7 +214,7 @@ static int decorations(bool raster)
     editor_close(e); memset(&b, 0, sizeof b);
     T((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
     const char text[] = "(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)\n";
-    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1, .cols = 32, .rows = 4, .wrap_mode = -1};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1, .cols = 36, .rows = 5, .wrap_mode = -1};
     T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
     T(!(cell(e, 1, 2)->attrs & RENDER_ATTR_UNDERLINE)); /* mate clipped by the right edge */
     editor_close(e); printf("editor_p4_test: %s bracket/whitespace/chord paint passed\n", raster ? "raster" : "null"); return 0;
@@ -250,9 +250,9 @@ static int tabs_script(bool raster)
     T(editor_tab(e, 2)->id == gamma); T(expect(e, "gamxma", 4) == 0);
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "gamma", 3) == 0); T(!editor_tab(e, 2)->modified);
     const render_grid *g = editor_grid(e);
-    plat_event pointer = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = (int32_t)(g->dims.cell_w * 2), .y = 1};
+    plat_event pointer = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = (int32_t)(g->dims.cell_w * (e->lay.gw + 1u)), .y = 1};
     T(press(e, pointer) == 0);
-    pointer.kind = PLAT_EV_MOTION; pointer.x = (int32_t)(g->dims.cell_w * 34); T(press(e, pointer) == 0);
+    pointer.kind = PLAT_EV_MOTION; pointer.x = (int32_t)(g->dims.cell_w * (e->lay.gw + 33u)); T(press(e, pointer) == 0);
     pointer.kind = PLAT_EV_BUTTON; pointer.press = false; T(press(e, pointer) == 0);
     T(editor_tab(e, 2)->id == a);
     while (editor_get_stats(e).tabs) T(editor_close_tab(e, 0) == 0);
@@ -265,7 +265,7 @@ static int wrap_navigation(bool raster)
 {
     render_backend b = {0}; T((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
     const char text[] = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrst";
-    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1, .cols = 32, .rows = 4};
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1, .cols = 36, .rows = 5};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_End, 0, NULL)) == 0); T(editor_view(e).selection.cursor == 22 && editor_view(e).visual_end);
     T(cell(e, 1, 23)->attrs & RENDER_ATTR_CURSOR);
@@ -284,7 +284,7 @@ static int wrap_geometry(bool raster)
     uint8_t text[120], lines[2000];
     for (unsigned i = 0; i < sizeof text; i++) text[i] = (uint8_t)('a' + i % 26u);
     for (unsigned i = 0; i < sizeof lines; i++) lines[i] = i % 2 ? '\n' : 'x';
-    editor_config cfg = {.initial = text, .initial_len = sizeof text, .cols = 32, .rows = 4};
+    editor_config cfg = {.initial = text, .initial_len = sizeof text, .cols = 36, .rows = 5};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
     T(editor_set_cursor(e, 80) == 0); T(settle(e) == 0); T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
     T(editor_view(e).visual_byte == 22);
@@ -377,7 +377,7 @@ static int ipc_pending_input(ipc_server *server, const char *runtime)
 {
     render_backend b = {.info = {"P4 delayed submit", sizeof(blocked), 16, RENDER_CAP_HEADLESS},
         .ops = {block_init, block_resize, block_submit, block_present, block_event, block_close}};
-    counted count = {0}; editor_config cfg = {.cols = 32, .rows = 4, .server = server,
+    counted count = {0}; editor_config cfg = {.cols = 36, .rows = 5, .server = server,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted, .on_io = io};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0);
     for (unsigned i = 0; i < 128 && !b.active; i++) T(editor_step(e, 0) >= 0);
@@ -477,7 +477,7 @@ static int ipc_positions(bool raster)
     render_backend b = {0}; T((raster ? render_cpu_backend(&b) : render_null_backend(&b)) == 0);
     /* The mkstemp name has no extension, which wraps by default since
      * edit-cxho.27; this case is about horizontal scroll, so force unwrapped. */
-    editor_config cfg = {.start_empty = true, .cols = 32, .rows = 4, .wrap_mode = -1}; editor *e = NULL;
+    editor_config cfg = {.start_empty = true, .cols = 36, .rows = 5, .wrap_mode = -1}; editor *e = NULL;
     T(editor_open(&e, &cfg, &b) == 0);
     ipc_request request = {.count = 1}; request.paths[0] = (ipc_path){path, 1, 45};
     T(editor_open_request(e, &request, 0) == 0); T(settle(e) == 0);
@@ -521,7 +521,7 @@ static int wait_client(editor *e, ipc_server *server, int *client, ipc_token *to
 static int ipc_wait_sweep(ipc_server *server)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config cfg = {.start_empty = true, .cols = 32, .rows = 4, .server = server,
+    editor_config cfg = {.start_empty = true, .cols = 36, .rows = 5, .server = server,
         .tab_capacity = IPC_MAX_CLIENTS + 4u, .closed_capacity = 2};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     int live_fd; ipc_token live_token; T(wait_client(e, server, &live_fd, &live_token) == 0);

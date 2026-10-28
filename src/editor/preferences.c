@@ -129,6 +129,21 @@ int editor_preferences_poll(editor *e)
     }
     return 0;
 }
+void editor_theme_cache(editor *e, config_theme t)
+{
+    for (unsigned i = 0; i < HL_SCOPE_COUNT; i++) e->syntax_colors[i] = config_theme_color(t, hl_scope_key((hl_scope)i));
+    e->colors.panel = config_theme_color(t, "panel.background");
+    e->colors.hover = config_theme_color(t, "hover.background");
+    e->colors.chrome_fg = config_theme_color(t, "chrome.foreground");
+    e->colors.chrome_bg = config_theme_color(t, "chrome.background");
+    e->colors.tab_fg = config_theme_color(t, "tab.active.foreground");
+    e->colors.tab_bg = config_theme_color(t, "tab.active.background");
+    e->colors.tab_hover = config_theme_color(t, "tab.hover.foreground");
+    e->colors.error_fg = config_theme_color(t, "error.foreground");
+    e->colors.error_bg = config_theme_color(t, "error.background");
+    e->colors.map_fg = config_theme_color(t, "minimap.foreground");
+    e->colors.warning = config_theme_color(t, "warning.foreground");
+}
 int editor_preferences_apply(editor *e)
 {
     if (!e->preferences_runtime || e->preferences_generation == config_runtime_generation(e->preferences_runtime))
@@ -166,6 +181,7 @@ int editor_preferences_apply(editor *e)
     e->layout_cfg.sel_fg = config_theme_color(theme, "selection.foreground");
     e->layout_cfg.sel_bg = config_theme_color(theme, "selection.background");
     e->find_bg = config_theme_color(theme, "bracket.background");
+    editor_theme_cache(e, theme);
     e->layout_cfg.tab_width = e->buffer->style.width;
     e->lay.cfg = e->layout_cfg; e->lay.tab = e->buffer->style.width;
     int rc = view_set_tab_width(&e->v, e->buffer->style.width); if (rc) return EDITOR_ERR_ARG;

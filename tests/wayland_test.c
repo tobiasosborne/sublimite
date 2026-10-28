@@ -44,7 +44,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length)
 #include <poll.h>
 #include "wayland_mock.h"
 
-typedef struct observed { bool focus, key, release, button, motion, wheel, clip, close, lost, repeat, blink, work, stop_key, priority_key; unsigned wheels; plat *platform; int work_fd; } observed;
+typedef struct observed { bool focus, key, release, button, motion, leave, wheel, clip, close, lost, repeat, blink, work, stop_key, priority_key; unsigned wheels; plat *platform; int work_fd; } observed;
 static void observe(void *user, const plat_event *ev)
 {
     observed *o = user;
@@ -53,6 +53,7 @@ static void observe(void *user, const plat_event *ev)
         if (o->stop_key) { o->priority_key = true; plat_quit(o->platform); } }
     if (ev->kind == PLAT_EV_KEY && !ev->press) o->release = true;
     if (ev->kind == PLAT_EV_BUTTON && ev->press) { assert(ev->code == 1 && ev->buttons == 1); o->button = true; }
+    if (ev->kind == PLAT_EV_LEAVE) o->leave = true;
     if (ev->kind == PLAT_EV_MOTION) { assert(ev->x == 1 && ev->y == 1); o->motion = true; }
     if (ev->kind == PLAT_EV_WHEEL) { assert(ev->dy == PLAT_WHEEL_UNIT); o->wheel = true; o->wheels++; }
     if (ev->kind == PLAT_EV_CLIPBOARD) { if (ev->clip_ok) o->clip = true; else { assert(ev->code == 2); o->lost = true; } }
@@ -171,7 +172,7 @@ static void protocol_test(void)
     assert(p.width == cfg.width + 1 && p.height == cfg.height); /* independent configure dimensions */
     observed o = {.platform = &p, .work_fd = work_fd}; plat_callbacks cb = {.ud = &o, .on_event = observe, .on_blink = blink, .on_work = work};
     assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
-    assert(o.focus && o.key && o.release && o.button && o.motion && o.wheel);
+    assert(o.focus && o.key && o.release && o.button && o.motion && o.leave && o.wheel);
     /* (P) minimum nonzero representable blink period in plat's ms ABI. */
     plat_set_blink(&p, 1); assert(plat_run_for(&p, &cb, -1) == PLAT_OK && o.blink);
     p.quit = false; plat_set_blink(&p, 0); o.blink = false;

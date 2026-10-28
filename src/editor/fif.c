@@ -435,8 +435,8 @@ static void paint_text(editor *e, uint32_t row, uint32_t column, const uint8_t *
         if (slot != RENDER_NO_SLOT && g->glyphs && slot < g->glyph_count) {
             cell.atlas_slot = slot; cell.glyph_index = g->glyphs[slot].glyph_index;
         }
-        if (i == cursor) { cell.fg = config_theme_color(e->preferences.theme, "caret.foreground");
-            cell.bg = config_theme_color(e->preferences.theme, "caret.background"); cell.attrs = RENDER_ATTR_CURSOR; }
+        if (i == cursor) { cell.fg = e->layout_cfg.cursor_fg;
+            cell.bg = e->layout_cfg.cursor_bg; cell.attrs = RENDER_ATTR_CURSOR; }
         g->cells[(size_t)row * g->dims.cols + column] = cell;
     }
 }
@@ -446,9 +446,7 @@ void editor_fif_paint(editor *e, uint32_t first_row, uint32_t rows)
 {
     editor_fif *f = &e->fif;
     if (!f->mode || rows < 2u) return;
-    const config_theme t = e->preferences.theme;
-    const uint32_t fg = config_theme_color(t, "editor.foreground"), bg = config_theme_color(t, "chrome.background"),
-        accent = config_theme_color(t, "chrome.foreground");
+    const uint32_t fg = e->layout_cfg.fg, bg = e->colors.panel, accent = e->colors.chrome_fg;
     render_grid *g = &e->grid;
     if (f->where_focus) {
         for (uint32_t c = 0; c < g->dims.cols; c++) {

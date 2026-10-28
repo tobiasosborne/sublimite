@@ -241,6 +241,9 @@ void layout_set_paint(layout *l, layout_paint_fn paint, void *ctx);
 
 bool layout_approximate(const layout *l);
 uint32_t layout_gutter_width(const layout *l);
+/* Geometry for an incoming line count, clamped to the grid. All editor
+ * consumers (including initial horizontal scroll) share this calculation. */
+uint32_t layout_gutter_columns(const layout *l, uint64_t line_count);
 bool layout_busy(const layout *l);
 
 /* Open-time reserve: two descriptors per viewport row; no typing allocation.

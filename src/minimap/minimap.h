@@ -48,6 +48,7 @@ typedef struct minimap_row {
 
 typedef struct minimap_style {
     uint32_t background, density, viewport, stale; /* opaque 0x00RRGGBB; stale is the pending edge bar */
+    bool hover; /* wash = 32/255 + half a base wash (16/255) on hover */
 } minimap_style;
 
 /* edit-cxho.8 window geometry; documented with minimap_window_lines below. */

@@ -89,7 +89,7 @@ static int child_script(const char *path, unsigned trial, unsigned kill_point, i
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config cfg = {.journal_path = path, .start_empty = true,
-        .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = LIVE_TABS,
+        .cols = (uint32_t)strlen("Source changed: R reload / K keep") + 5u, /* preserve two visible slots after the inset/right margin */ .rows = LIVE_TABS,
         .tab_capacity = LIVE_TABS, .closed_capacity = LIVE_TABS, .wrap_mode = trial % 2u ? -1 : 1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
     const char *corpus[] = {
@@ -120,7 +120,7 @@ static int child_script(const char *path, unsigned trial, unsigned kill_point, i
         .x = (int32_t)((e->strip.first_col + (LIVE_TABS - 1u - e->strip.first_tab) *
             e->strip.tab_cols) * e->grid.dims.cell_w)};
     T(editor_inject(e, &down) == 0); T(settle(e) == 0);
-    plat_event drag = {.kind = PLAT_EV_MOTION, .x = 0};
+    plat_event drag = {.kind = PLAT_EV_MOTION, .x = (int32_t)(e->strip.first_col * e->grid.dims.cell_w)};
     T(editor_inject(e, &drag) == 0); T(settle(e) == 0);
     T(destination != LIVE_TABS - 1u && editor_tab(e, destination)->id == moved_id);
     /* Crash immediately after successful setup APIs, before their next frame.
@@ -172,7 +172,7 @@ static int kill_trials(void)
         T(received == sizeof want);
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         editor_config cfg = {.journal_path = path, .start_empty = true,
-            .cols = (uint32_t)strlen("Source changed: R reload / K keep"), .rows = LIVE_TABS,
+            .cols = (uint32_t)strlen("Source changed: R reload / K keep") + 5u, /* preserve two visible slots after the inset/right margin */ .rows = LIVE_TABS,
             .tab_capacity = LIVE_TABS, .closed_capacity = LIVE_TABS};
         editor *e = NULL; int opened = editor_open(&e, &cfg, &backend);
         if (opened) fprintf(stderr, "trial=%u kill_point=%u recovery open returned %d\n", trial, point, opened);

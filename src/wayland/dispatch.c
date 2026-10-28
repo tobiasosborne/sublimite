@@ -46,6 +46,12 @@ void plat_set_dark(plat *p, bool dark)
     if (p && p->backend == PLAT_BACKEND_WAYLAND) return; /* no client hint for server decorations */
     x11_plat_set_dark(p, dark);
 }
+void plat_set_cursor(plat *p, plat_cursor_shape shape)
+{
+    /* cursor-shape-v1 is not vendored; leave Wayland's cursor alone. */
+    if (p && p->backend == PLAT_BACKEND_WAYLAND) return;
+    x11_plat_set_cursor(p, shape);
+}
 
 int plat_set_present_events(plat *p, bool enabled)
 {

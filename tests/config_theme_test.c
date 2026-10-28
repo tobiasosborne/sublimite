@@ -66,6 +66,16 @@ static void ladder(config_theme t)
     /* Selection and find match keep text readable (rubric C9). */
     T(ratio(c(t, "editor.foreground"), c(t, "selection.background")) >= 7.0);
     T(ratio(c(t, "editor.foreground"), c(t, "bracket.background")) >= 7.0);
+    /* (P) round 3: AAA body ink and AA chrome on both panel surfaces. */
+    const char *surfaces[] = {"panel.background", "hover.background"};
+    for (size_t i = 0; i < sizeof surfaces / sizeof *surfaces; i++) {
+        T(c(t, surfaces[i]) != 0 && c(t, surfaces[i]) != bg);
+        T(neutral(c(t, surfaces[i])));
+        T(ratio(c(t, "editor.foreground"), c(t, surfaces[i])) >= 7.0);
+        T(ratio(c(t, "chrome.foreground"), c(t, surfaces[i])) >= 4.5);
+    }
+    double hover = ratio(c(t, "tab.hover.foreground"), bg);
+    T(hover > ratio(c(t, "chrome.foreground"), bg) && hover < text);
 }
 
 int main(void)

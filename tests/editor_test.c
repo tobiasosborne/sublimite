@@ -572,7 +572,7 @@ static int minimap_text_columns(void)
             T(editor_open(&e, &cfg, &backend) == EDITOR_OK); T(settle(e) == 0);
             uint32_t cell_w = e->grid.dims.cell_w;
             uint32_t map_width = e->grid.region.width;
-            uint32_t expected = (cfg.window_width - map_width) / cell_w;
+            uint32_t expected = (cfg.window_width - map_width) / cell_w - 1u; /* (P) outer right margin */
             T(e->map_cols && e->grid.region.pixels);
             T((cfg.window_width - map_width) % cell_w == remainder);
             T(e->text_grid.dims.cols == expected);
@@ -642,7 +642,7 @@ static int minimap_compose_pixels(const char *backend_name)
     uint32_t *frame = calloc((size_t)w * h, sizeof *frame); T(rows && expected && frame);
     minimap reference; minimap_input input = editor_map_input(e->buffer);
     minimap_style colors = {config_theme_color(CONFIG_DARK, "editor.background"),
-        config_theme_color(CONFIG_DARK, "minimap.foreground"), config_theme_color(CONFIG_DARK, "editor.foreground"), 0}; /* paint theme (edit-cxho.24) */
+        config_theme_color(CONFIG_DARK, "minimap.foreground"), config_theme_color(CONFIG_DARK, "editor.foreground"), 0, false}; /* paint theme (edit-cxho.24) */
     T(minimap_init(&reference, rows, summaries) == 0);
     T(minimap_prepare(&reference, &input, summaries) == 0);
     uint64_t visible = e->buffer->lines < e->text_grid.dims.rows ? e->buffer->lines : e->text_grid.dims.rows;
@@ -653,13 +653,13 @@ static int minimap_compose_pixels(const char *backend_name)
         raster_row_scalar(&scene, frame + (size_t)r * e->grid.dims.cell_h * w, w, r);
     raster_blit_pixels(&e->grid.region, frame, w, 0, e->grid.region.height, 0);
     for (uint32_t y = 0; y < mh; y++)
-        T(!memcmp(frame + (size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + w - mw,
+        T(!memcmp(frame + (size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + e->grid.region.x,
             expected + (size_t)y * mw, (size_t)mw * sizeof *expected));
     if (backend_name && !strcmp(backend_name, "gl")) {
         uint8_t *rgba = calloc((size_t)w * h, 4); T(rgba);
         T(gl_read_pixels(&backend, rgba, (size_t)w * h * 4u) == 0);
         for (uint32_t y = 0; y < mh; y++) for (uint32_t x = 0; x < mw; x++) {
-            size_t at = ((size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + w - mw + x) * 4u;
+            size_t at = ((size_t)(y + e->tab_rows * e->grid.dims.cell_h) * w + e->grid.region.x + x) * 4u;
             uint32_t color = ((uint32_t)rgba[at] << 16) | ((uint32_t)rgba[at + 1u] << 8) | rgba[at + 2u];
             T(color == expected[(size_t)y * mw + x] && rgba[at + 3u] == UINT8_MAX);
         }
@@ -668,7 +668,7 @@ static int minimap_compose_pixels(const char *backend_name)
         plat *platform = backend.config.platform;
         xcb_get_image_reply_t *reply = xcb_get_image_reply(plat_native_x11(platform).connection,
             xcb_get_image(plat_native_x11(platform).connection, XCB_IMAGE_FORMAT_Z_PIXMAP, plat_native_x11(platform).window,
-                (int16_t)(w - mw), (int16_t)(e->tab_rows * e->grid.dims.cell_h),
+                (int16_t)(e->grid.region.x), (int16_t)(e->tab_rows * e->grid.dims.cell_h),
                 (uint16_t)mw, (uint16_t)mh, UINT32_MAX), NULL);
         T(reply && xcb_get_image_data_length(reply) >= (int)((size_t)mw * mh * sizeof(uint32_t)));
         const uint32_t *actual = (const uint32_t *)xcb_get_image_data(reply);
@@ -698,7 +698,7 @@ static int minimap_compose_pixels(const char *backend_name)
     T(minimap_hit(&e->buffer->map, &input, e->buffer->index,
         (int64_t)summary_row - (int64_t)(visible / 2u), &target) == 0);
     plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
-        .x = (int32_t)(w - 1u), .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h + summary_row * 2u + 1u)};
+        .x = (int32_t)(e->grid.region.x + e->grid.region.width - 1u), .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h + summary_row * 2u + 1u)};
     T(editor_pointer(e, &click) == 0 && e->map_drag);
     T(e->v.state.first_line == target.line && e->v.state.first_byte == target.byte);
     click.kind = PLAT_EV_MOTION; click.y = -1; T(editor_pointer(e, &click) == 0);
@@ -775,8 +775,8 @@ static int default_edit_case_path(const default_edit_case *test, int wrap_mode, 
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)test->before,
-        .initial_len = strlen(test->before), .cols = sizeof "alpha beta gamma delta!",
-        .rows = 2u + 1u, /* text-row pair plus tab row, as selection_chords */
+        .initial_len = strlen(test->before), .cols = sizeof "alpha beta gamma delta!" + 4u,
+        .rows = 2u + 2u, /* text-row pair plus tab row, as selection_chords */
         .wrap_mode = wrap_mode, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     if (path) {
@@ -884,7 +884,7 @@ static int undo_shrink_case(int variant)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     top_probe probe = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = LINES * LINE,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 5u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 5u + 1u, .wrap_mode = -1,
         .hook_ctx = &probe, .on_ingress = top_ingress, .on_submit = top_submit};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     snprintf(e->buffer->path, sizeof e->buffer->path, "%s", "fixture.c");
@@ -940,7 +940,7 @@ static int goto_scroll_case(bool accept)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     top_probe probe = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = LINES * LINE,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 5u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 5u + 1u, .wrap_mode = -1,
         .hook_ctx = &probe, .on_ingress = top_ingress, .on_submit = top_submit};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     probe.e = e;
@@ -986,16 +986,16 @@ static int default_goto(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 1u,
+        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 2u,
         .wrap_mode = -1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(editor_set_cursor(e, sizeof "al" - 1u) == 0); T(settle(e) == 0);
     view_state original = editor_view(e); uint64_t revision = e->buffer->revision;
     undo_history history = undo_get_history(e->undo);
     T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
-    const char prompt[] = "Go to line: :";
+    const char prompt[] = "Line number";
     for (size_t i = 0; i < sizeof prompt - 1u; i++)
-        T(e->grid.cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols + i].glyph_index == (uint8_t)prompt[i]);
+        T(e->grid.cells[(size_t)(e->grid.dims.rows - 1u) * e->grid.dims.cols + e->lay.gw + i].glyph_index == (uint8_t)prompt[i]);
     T(press(e, key(XKB_KEY_2, 0, "2")) == 0);
     T(expect(e, text, sizeof "alpha\r\n" - 1u) == 0); /* preview */
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
@@ -1061,7 +1061,7 @@ static int default_goto_cold(void)
     for (size_t i = 0; i < lines; i++) memcpy(text + i * (sizeof row - 1u), row, sizeof row - 1u);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0}; editor_config cfg = {.initial = text, .initial_len = length,
-        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "Go to line: :18446744073709551615" + 1u, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(length); T(e->buffer->index);
@@ -1093,7 +1093,7 @@ static int default_word(void)
     for (size_t i = 0; i < sizeof texts / sizeof texts[0]; i++) {
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)texts[i],
-            .initial_len = strlen(texts[i]), .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u,
+            .initial_len = strlen(texts[i]), .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u,
             .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
         editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
         e->v.state.selection.cursor = e->v.state.selection.anchor = strlen(positions[i]);
@@ -1132,8 +1132,8 @@ static int default_center(void)
     for (size_t i = 0; i < sizeof texts / sizeof texts[0]; i++) {
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)texts[i], .initial_len = strlen(texts[i]),
-            .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u),
-            .rows = (sizeof "abc" - 1u) + 1u, /* text row trio + tab row */
+            .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u) + 4u,
+            .rows = (sizeof "abc" - 1u) + 2u, /* trio + strip/spacer */
             .wrap_mode = i ? 1 : -1, .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
         editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
         T(editor_set_cursor(e, strlen(positions[i])) == 0); T(settle(e) == 0);
@@ -1158,7 +1158,7 @@ static int default_skip(void)
     const char text[] = "abc xx abc yy abc";
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0}; editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     e->v.state.selection = (view_selection){sizeof "abc" - 1u, 0, VIEW_PREFERRED_UNSET};
@@ -1228,7 +1228,7 @@ static int default_state_case(unsigned which)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = sizeof text, .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof text, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     if (which == 0) {
@@ -1306,7 +1306,7 @@ static int default_soft_capacity(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1,
         .history_keys = sizeof "x" - 1u, /* retain the single edit in this fixture */
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
@@ -1341,7 +1341,7 @@ static int default_history_anchor(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = text, .initial_len = sizeof text,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     e->v.state.selection.cursor = 0; e->v.state.selection.anchor = anchor;
@@ -1363,7 +1363,7 @@ static int default_notices(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = long_line, .initial_len = sizeof long_line,
-        .cols = sizeof "not implemented", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "not implemented", .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     uint64_t revision = e->buffer->revision;
@@ -1396,9 +1396,9 @@ static int default_soft_lines(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u),
+        .cols = (sizeof "  " - 1u) + (sizeof "abc def " - 1u) + 4u,
         /* Gutter digit/space + row including its break space; minimap is disabled at this width. */
-        .rows = 2u + 1u, .wrap_mode = 1,
+        .rows = 2u + 2u, .wrap_mode = 1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(e->lay.text_cols == sizeof "abc def " - 1u);
@@ -1429,7 +1429,7 @@ static int default_chord_repeat(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     e->v.state.selection.cursor = sizeof "abc" - 1u; e->v.state.selection.anchor = 0;
@@ -1457,7 +1457,7 @@ static int default_clipboard_line(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_Right, 0, NULL)) == 0);
@@ -1482,7 +1482,7 @@ static int default_soft_history(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     counted count = {0};
     editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1,
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_Right, PLAT_MOD_SHIFT, NULL)) == 0);
@@ -1512,7 +1512,7 @@ static int default_noop(void)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = sizeof "abc" - 1u,
-        .cols = sizeof "alpha beta gamma delta!", .rows = 2u + 1u, .wrap_mode = -1};
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = 2u + 2u, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     uint64_t revision = e->buffer->revision;
     T(press(e, key(XKB_KEY_bracketleft, PLAT_MOD_CTRL, NULL)) == 0);
@@ -1548,7 +1548,7 @@ static int selection_chords(void)
         render_backend b = {0}; T(render_null_backend(&b) == 0);
         counted count = {0};
         editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = sizeof text - 1u,
-            .cols = sizeof text, .rows = 2u + 1u, /* text-row pair + tab row */ .wrap_mode = modes[mode],
+            .cols = sizeof text, .rows = 2u + 2u, /* text-row pair + tab row */ .wrap_mode = modes[mode],
             .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
         editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
         T(selection_chord(e, XKB_KEY_Right, shift, one, start) == 0);
@@ -1590,7 +1590,7 @@ static int redo_or_repeat(void)
     static const char text[] = "a\nbeta";
     render_backend b = {0}; T(render_null_backend(&b) == 0);
     counted count = {0};
-    editor_config cfg = {.cols = sizeof "not implemented", .rows = 1u + 2u,
+    editor_config cfg = {.cols = sizeof "not implemented", .rows = 2u + 2u,
         .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
     T(press(e, key('a', 0, text)) == 0); T(expect(e, text, sizeof text - 1u) == 0);
@@ -1636,7 +1636,7 @@ static int panel_shortcuts(bool notice)
         render_backend b = {0}; T(render_null_backend(&b) == 0);
         counted count = {0};
         editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
-            .cols = sizeof typed, .rows = 1u + 2u, .wrap_mode = -1,
+            .cols = sizeof typed, .rows = 2u + 2u, .wrap_mode = -1,
             .hook_ctx = &count, .on_ingress = ingress, .on_submit = submitted};
         editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); T(settle(e) == 0);
         T(press(e, key(XKB_KEY_Right, PLAT_MOD_CTRL, NULL)) == 0);
@@ -2241,7 +2241,7 @@ static int review_style(void)
         else e->focused = false;
         T(editor_refresh_cursor(e, 0) == 0); T(settle(e) == 0);
         const render_grid *g = editor_grid(e); uint32_t col = layout_gutter_width(&e->lay);
-        const render_cell *a = &g->cells[g->dims.cols + col], *z = a + 1;
+        const render_cell *a = &g->cells[(size_t)e->tab_rows * g->dims.cols + col], *z = a + 1;
         T(!(a->attrs & RENDER_ATTR_CURSOR));
         if (mode < 2) T(z->attrs & RENDER_ATTR_CURSOR);
         if (mode == 1) T(a->bg == e->layout_cfg.sel_bg);
@@ -2258,16 +2258,16 @@ static int review_long_line(void)
     editor_config cfg = {.initial = bytes, .initial_len = len, .cols = 32, .rows = 7, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
     const render_grid *g = editor_grid(e); uint32_t col = layout_gutter_width(&e->lay);
-    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
-    T(g->cells[2u * g->dims.cols + col + 6].glyph_index == 'e');
-    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    T(g->cells[(e->tab_rows + 1u) * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[(e->tab_rows + 1u) * g->dims.cols + col + 6].glyph_index == 'e');
+    T(g->cells[(e->tab_rows + 3u) * g->dims.cols + col].glyph_index == 'a');
     T(b.stats.submitted_frames == 1);
     T(press(e, key('x', 0, "x")) == 0);
-    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
-    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    T(g->cells[(e->tab_rows + 1u) * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[(e->tab_rows + 3u) * g->dims.cols + col].glyph_index == 'a');
     T(press(e, key('z', PLAT_MOD_CTRL, NULL)) == 0);
-    T(g->cells[2u * g->dims.cols + col].glyph_index == 'v');
-    T(g->cells[4u * g->dims.cols + col].glyph_index == 'a');
+    T(g->cells[(e->tab_rows + 1u) * g->dims.cols + col].glyph_index == 'v');
+    T(g->cells[(e->tab_rows + 3u) * g->dims.cols + col].glyph_index == 'a');
     editor_close(e); puts("review 7: multiple long clipped lines preserve subsequent rows in first frame and edit/undo passed"); return 0;
 }
 static int review_large_undo(void)
@@ -2693,11 +2693,11 @@ static int review_capture_identity(void)
         uint64_t id; T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
         T(editor_add_buffer(e, NULL, NULL, 0, &id) == 0); T(settle(e) == 0);
         plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
-            .x = (int32_t)(dragged * 16 * e->grid.dims.cell_w + 1), .y = 1};
+            .x = (int32_t)((e->strip.first_col + (uint32_t)(dragged - e->strip.first_tab) * e->strip.tab_cols) * e->grid.dims.cell_w + 1u), .y = 1};
         T(press(e, click) == 0); T(tabs_active_index(&e->tabs) == dragged);
         T(press(e, key('w', PLAT_MOD_CTRL, NULL)) == 0);
         uint64_t first = tabs_at(&e->tabs, 0)->id, second = tabs_at(&e->tabs, 1)->id;
-        plat_event motion = {.kind = PLAT_EV_MOTION, .x = 1, .y = 1};
+        plat_event motion = {.kind = PLAT_EV_MOTION, .x = (int32_t)(e->strip.first_col * e->grid.dims.cell_w + 1u), .y = 1};
         T(editor_inject(e, &motion) == 0); T(editor_step(e, 0) >= 0);
         T(tabs_at(&e->tabs, 0)->id == first && tabs_at(&e->tabs, 1)->id == second);
         e->map_drag = true; T(editor_select_tab(e, 0) == 0); T(!e->map_drag); T(settle(e) == 0);
@@ -2831,7 +2831,7 @@ static int review_stale_controls(void)
     e->buffer->source_stale = true; T(editor_full_layout(e) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_Tab, PLAT_MOD_CTRL, NULL)) == 0); T(tabs_active_index(&e->tabs) == 0);
     T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
-    plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = 1, .y = 1};
+    plat_event click = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true, .x = (int32_t)(e->strip.first_col * e->grid.dims.cell_w + 1u), .y = 1};
     T(press(e, click) == 0); T(tabs_active_index(&e->tabs) == 0);
     T(editor_select_tab(e, 1) == 0); T(settle(e) == 0);
     /* edit-2ye3: the untitled "safe" buffer is unsaved: Ctrl+W prompts, D closes. */
@@ -3381,7 +3381,7 @@ static int partial_line_start(void)
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0); free(bytes); T(settle(e) == 0);
     /* P3.4 clips EOF to the last full viewport. The fixture has one final
      * empty line after its LF-terminated rows; chrome consumes one row. */
-    uint64_t visible_rows = cfg.rows - 1u;
+    uint64_t visible_rows = cfg.rows - 2u; /* strip + spacer */
     const uint64_t starts[] = {0, (uint64_t)(len / 128u * 9u / 10u) * 128u,
         ((uint64_t)len / 128u + 1u - visible_rows) * 128u};
     for (size_t at = 0; at < sizeof starts / sizeof starts[0]; at++) {
@@ -3874,7 +3874,7 @@ static int clipboard_endings_test(void)
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
         render_backend backend = {0}; T(render_null_backend(&backend) == 0);
         editor_config cfg = {.initial = (const uint8_t *)cases[i].source,
-            .initial_len = strlen(cases[i].source), .cols = sizeof "alpha beta gamma delta!",
+            .initial_len = strlen(cases[i].source), .cols = sizeof "alpha beta gamma delta!" + 4u,
             .rows = sizeof "\n\n\n" + 1u, .wrap_mode = -1};
         editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
         T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
@@ -3895,7 +3895,7 @@ static int clipboard_crlf_empty_test(void)
     const char original[] = "alpha\r\n";
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config cfg = {.initial = (const uint8_t *)original,
-        .initial_len = sizeof original - 1u, .cols = sizeof "alpha beta gamma delta!",
+        .initial_len = sizeof original - 1u, .cols = sizeof "alpha beta gamma delta!" + 4u,
         .rows = sizeof "\n" + 1u, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_x, PLAT_MOD_CTRL, NULL)) == 0); T(expect(e, "", 0) == 0);
@@ -3922,7 +3922,7 @@ static int clipboard_crlf_bulk_test(void)
     }
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config cfg = {.initial = raw, .initial_len = len,
-        .cols = sizeof "alpha beta gamma delta!", .rows = sizeof "\n\n" + 1u, .wrap_mode = -1};
+        .cols = sizeof "alpha beta gamma delta!" + 4u, .rows = sizeof "\n\n" + 1u, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     T(press(e, key(XKB_KEY_a, PLAT_MOD_CTRL, NULL)) == 0);
     T(press(e, key(XKB_KEY_c, PLAT_MOD_CTRL, NULL)) == 0);
@@ -4280,29 +4280,29 @@ static int palette_contract(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     const char initial[] = "palette buffer";
     editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
-        .cols = sizeof "Save As Ctrl+Shift+S" - 1u + 8u,
-        .rows = 1u + 1u + 3u, .wrap_mode = -1};
+        .cols = sizeof "Save As Ctrl+Shift+S" - 1u + 8u + 5u + 2u, /* map + gutter + right gap/margin */
+        .rows = 2u + 2u + 3u, /* strip/spacer + text + panel */ .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     uint32_t text_rows = e->v.config.rows;
     edit_malloc_guard_begin();
     T(press(e, key('p', PLAT_MOD_CTRL | PLAT_MOD_SHIFT, NULL)) == 0);
     T(e->panel_rows == 3u); /* (P) existing replace/find-in-files panel rows */
     uint32_t first = e->grid.dims.rows - e->panel_rows;
-    T(palette_grid_text(e, first, 0, "Command: "));
-    T(palette_grid_text(e, first + 1u, 0, "Left"));
-    T(palette_grid_text(e, first + 2u, 0, "Right"));
+    T(palette_grid_text(e, first, e->lay.gw, "Command"));
+    T(palette_grid_text(e, first + 1u, e->lay.gw, "Left"));
+    T(palette_grid_text(e, first + 2u, e->lay.gw, "Right"));
     T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_Down, 0, NULL)) == 0);
-    T(palette_grid_text(e, first + 1u, 0, "Right"));
-    T(palette_grid_text(e, first + 2u, 0, "Up"));
+    T(palette_grid_text(e, first + 1u, e->lay.gw, "Right"));
+    T(palette_grid_text(e, first + 2u, e->lay.gw, "Up"));
     T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
     T(press(e, key(XKB_KEY_Up, 0, NULL)) == 0);
     T(press(e, key('s', 0, "sav")) == 0);
-    T(palette_grid_text(e, first, 0, "Command: sav"));
-    T(palette_grid_text(e, first + 1u, 0, "Save"));
-    T(palette_grid_text(e, first + 2u, 0, "Save As"));
-    T(palette_grid_text(e, first + 1u, e->grid.dims.cols - (sizeof "Ctrl+S" - 1u), "Ctrl+S"));
-    T(palette_grid_text(e, first + 2u, e->grid.dims.cols - (sizeof "Ctrl+Shift+S" - 1u), "Ctrl+Shift+S"));
+    T(palette_grid_text(e, first, e->lay.gw, "sav"));
+    T(palette_grid_text(e, first + 1u, e->lay.gw, "Save"));
+    T(palette_grid_text(e, first + 2u, e->lay.gw, "Save As"));
+    T(palette_grid_text(e, first + 1u, e->text_grid.dims.cols - 1u - (sizeof "Ctrl+S" - 1u), "Ctrl+S"));
+    T(palette_grid_text(e, first + 2u, e->text_grid.dims.cols - 1u - (sizeof "Ctrl+Shift+S" - 1u), "Ctrl+Shift+S"));
     T(expect(e, initial, 0) == 0);
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
     T(!e->panel_rows && e->v.config.rows == text_rows);
@@ -4341,9 +4341,9 @@ static int palette_contract(void)
     T(e->panel_rows);
     T(press(e, key('s', 0, "savx")) == 0);
     T(press(e, key(XKB_KEY_BackSpace, 0, NULL)) == 0);
-    T(palette_grid_text(e, first, 0, "Command: sav"));
-    T(palette_grid_text(e, first + 1u, e->grid.dims.cols - (sizeof "Alt+S" - 1u), "Alt+S"));
-    T(palette_grid_text(e, first + 2u, e->grid.dims.cols - (sizeof "Alt+W" - 1u), "Alt+W"));
+    T(palette_grid_text(e, first, e->lay.gw, "sav"));
+    T(palette_grid_text(e, first + 1u, e->text_grid.dims.cols - 1u - (sizeof "Alt+S" - 1u), "Alt+S"));
+    T(palette_grid_text(e, first + 2u, e->text_grid.dims.cols - 1u - (sizeof "Alt+W" - 1u), "Alt+W"));
     plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
     T(press(e, focus) == 0); T(!e->panel_rows);
     editor_close(e);
@@ -4716,7 +4716,7 @@ static int find_focus_contract(void)
     T(expect(e, edited, sizeof "alpha beta" - 1u) == 0); /* (P) incremental beta selection */
     T(find_focus_carets(e, true) == 0);
     plat_event panel = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
-        .x = (int32_t)((sizeof "Find: b" - 1u) * e->grid.dims.cell_w),
+        .x = (int32_t)((e->lay.gw + 1u) * e->grid.dims.cell_w),
         .y = (int32_t)((e->grid.dims.rows - e->panel_rows) * e->grid.dims.cell_h)};
     T(press(e, pointer_event(e, PLAT_EV_BUTTON, 0, 0, true, 0)) == 0);
     T(press(e, panel) == 0); T(!e->find_field_all);
@@ -4879,7 +4879,7 @@ static int find_seed_prefill(void)
     bool count_shown = false;
     uint32_t row = e->grid.dims.rows - e->panel_rows;
     for (size_t col = 0; col < e->grid.dims.cols; col++)
-        count_shown |= palette_grid_text(e, row, col, "2/3"); /* (P) second of three matches */
+        count_shown |= palette_grid_text(e, row, col, "2 of 3"); /* (P) second of three matches */
     T(count_shown);
     T(press(e, key(XKB_KEY_Escape, 0, NULL)) == 0);
     T(editor_set_cursor(e, 0) == 0); T(settle(e) == 0);
@@ -5062,7 +5062,7 @@ static int findpanel_contract(void)
     editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); T(settle(e)==0);
     T(press(e,key('f',PLAT_MOD_CTRL,NULL))==0);
     const render_grid *grid=editor_grid(e);
-    T(grid->cells[(size_t)(grid->dims.rows-1)*grid->dims.cols].glyph_index=='F');
+    T(grid->cells[(size_t)(grid->dims.rows-1)*grid->dims.cols+e->lay.gw].glyph_index=='F');
     T(press(e,key('c',0,"cat"))==0); T(expect(e,text,sizeof "cat"-1u)==0);
     T(press(e,key('a',PLAT_MOD_CTRL,NULL))==0); T(e->find_field_all);
     T(press(e,key('c',0,"cat"))==0); T(expect(e,text,sizeof "cat"-1u)==0);
@@ -6174,11 +6174,11 @@ static int menu_contract(void)
     const char initial[] = "menu buffer";
     size_t items = menu_table()[0].count;
     editor_config cfg = {.initial = (const uint8_t *)initial, .initial_len = sizeof initial - 1u,
-        .cols = sizeof " Close Window  Ctrl+Shift+W " - 1u + 8u,
+        .cols = sizeof " Close Window  Ctrl+Shift+W " - 1u + 8u + 5u + 2u,
         .rows = 1u + 1u + (uint32_t)items + 1u, .wrap_mode = -1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     uint32_t text_rows = e->v.config.rows, strip = e->tab_rows;
-    T(!e->menu_rows && strip == 1u); /* hidden by default: zero rows */
+    T(!e->menu_rows && strip == 2u); /* hidden by default: zero rows */
     T(palette_grid_text(e, strip, e->lay.gw, initial));
     size_t save_as = menu_index(0, KEYS_ACTION_SAVE_AS); T(save_as != SIZE_MAX);
     edit_malloc_guard_begin();
@@ -6270,6 +6270,7 @@ static int menu_contract(void)
     click.x = (int32_t)(menu_title_column(0) * cw + cw + cw / 2u); click.y = (int32_t)(ch / 2u);
     T(press(e, click) == 0); click.press = false; T(press(e, click) == 0); click.press = true;
     T(e->menu.open == 0);
+    click.x = (int32_t)(e->lay.gw * cw + cw / 2u);
     click.y = (int32_t)(item_row * ch + ch / 2u);
     T(press(e, click) == 0); click.press = false; T(press(e, click) == 0); click.press = true;
     T(!e->menu_rows && e->go.active && e->go.kind == KEYS_ACTION_SAVE_AS);

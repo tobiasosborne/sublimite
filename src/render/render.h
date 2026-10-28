@@ -120,6 +120,7 @@ int render_grid_init(render_grid *g, render_dims dims, render_cell *cells,
                      size_t cell_capacity, uint64_t *dirty, size_t dirty_capacity);
 int render_frame_begin(render_grid *g, uint32_t frame_id);
 int render_mark_rows(render_grid *g, uint32_t first_row, uint32_t row_count);
+bool render_row_dirty(const render_grid *g, uint32_t row);
 int render_mark_full(render_grid *g);
 /* Minimal contiguous dirty row runs, or one full-height run when full_frame.
  * out_count is required; it receives required count even on ERR_CAPACITY.

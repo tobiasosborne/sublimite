@@ -100,9 +100,9 @@ static void gutter(layout *l,render_cell *cells,const layout_wrap_row *r)
     if(l->wrap_sink || l->wrap_planning) return;
     render_cell b={0,RENDER_NO_SLOT,l->cfg.gutter_fg,l->cfg.gutter_bg,0,0};
     for(uint32_t c=0;c<l->gw;c++) cells[c]=b;
-    if(r->start==LAYOUT_VOID_ROW || r->continuation || l->gw<2) return;
-    uint32_t c=l->gw-1; uint64_t number=r->line+1;
-    do { if(!c) break; --c; uint32_t digit=(uint32_t)(number%10); number/=10;
+    if(r->start==LAYOUT_VOID_ROW || r->continuation || l->gw<5) return;
+    uint32_t c=l->gw-2u; uint64_t number=r->line+1;
+    do { if(c<=2u) break; --c; uint32_t digit=(uint32_t)(number%10); number/=10;
         cells[c].glyph_index='0'+digit; cells[c].atlas_slot='0'+digit-0x20u;
     } while(number);
 }
@@ -467,7 +467,6 @@ static void shift_bytes(layout *l,uint32_t from,uint64_t off,uint64_t old_len,ui
         l->row_byte[i]=r->start;
     }
 }
-static uint32_t width_digits(uint64_t n) { uint32_t d=1; while(n>=10) { n/=10; d++; } return d; }
 int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,uint64_t old_nl,uint64_t new_nl)
 {
     bool busy=layout_busy(l); uint32_t rows=l->grid->dims.rows;
@@ -484,7 +483,7 @@ int layout_wrap_edit(layout *l,uint64_t off,uint64_t old_len,uint64_t new_len,ui
         if(!busy && old_nl==new_nl) return LAYOUT_DONE;
         for(uint32_t i=0;i<rows;i++) l->wrap_rows[i].line=l->wrap_rows[i].line-old_nl+new_nl;
     }
-    uint32_t gw=l->cfg.gutter?width_digits(l->line_count)+1:0; if(gw>l->grid->dims.cols) gw=l->grid->dims.cols;
+    uint32_t gw=layout_gutter_columns(l,l->line_count);
     if(busy || gw!=l->gw) {
         layout_viewport vp={l->first_byte,l->first_line,0,l->line_count};
         return layout_begin(l,(const piece_tree *)l->src,vp)<0?LAYOUT_ERR_STATE:LAYOUT_MORE;

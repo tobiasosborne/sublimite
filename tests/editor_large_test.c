@@ -390,7 +390,7 @@ static int gutter_estimates(void)
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     const render_grid *g = editor_grid(e);
     uint32_t gw = layout_gutter_width(&e->lay);
-    const render_cell *digit = &g->cells[(size_t)e->tab_rows * g->dims.cols + gw - 2u];
+    const render_cell *digit = &g->cells[(size_t)e->tab_rows * g->dims.cols + gw - 3u];
     T(digit->glyph_index == '1');
     T(digit->fg != e->layout_cfg.gutter_fg);
     T(h.estimated_frames == 1); T(!h.gutter_error);

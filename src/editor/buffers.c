@@ -771,11 +771,7 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
         at += step; cells += w;
     }
     if (!bytes && at == n && end - start > n && cells < target) return EDITOR_ERR_CAPACITY;
-    uint32_t gutter = 0;
-    if (e->layout_cfg.gutter) {
-        gutter = 2; for (uint64_t value = b->lines; value >= 10; value /= 10) gutter++;
-        if (gutter > e->text_grid.dims.cols) gutter = e->text_grid.dims.cols;
-    }
+    uint32_t gutter = layout_gutter_columns(&e->lay, b->lines);
     uint32_t width = e->text_grid.dims.cols - gutter;
     if (!width) width = 1;
     if (!b->initial.wrap && cells >= width) b->initial.hscroll = cells - width + 1;

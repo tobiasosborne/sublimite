@@ -33,7 +33,7 @@ static void reference(const uint8_t *p, size_t n, uint32_t h, minimap_row *rows)
     for (uint32_t i = 0; i < h; i++) if (rows[i].line_count)
         rows[i].density = (uint8_t)(rows[i].ink * 255 / (rows[i].line_count * 80));
 }
-static const minimap_style style = {0x101010, 0xffffff, 0x224466, 0x552200};
+static const minimap_style style = {0x101010, 0xffffff, 0x224466, 0x552200, false};
 static void small_case(const uint8_t *p, size_t n, uint32_t h, size_t frag)
 {
     render_cell cells[64 * 7]; uint64_t dirty[1]; minimap_row rows[64], ref[64];
@@ -230,7 +230,7 @@ static void dump_map(void)
     flat f = {text, sizeof text - 1, 0, 0}; uint32_t lines = 1;
     for (size_t i = 0; i < f.n; i++) lines += text[i] == '\n';
     minimap_input in = {{&f, f.n, span, NULL}, lines, 1, true};
-    const minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0, 0xbf853d};
+    const minimap_style colors = {0x20242c, 0x78808e, 0xe5e9f0, 0xbf853d, false};
     CHECK(minimap_init(&m, rows, MAX_LINES) == 0);
     CHECK(minimap_prepare(&m, &in, lines) == 0);
     /* Viewport is the loop body: derive its extent from fixture substrings. */

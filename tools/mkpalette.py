@@ -25,6 +25,7 @@ DARK = {
     "syntax.punctuation": 0.760, "syntax.operator": 0.760,
     "syntax.variable": 0.915, "gutter.foreground": 0.540,
     "minimap.foreground": 0.390,
+    "panel.background": 0.285, "tab.hover.foreground": 0.800,
 }
 LIGHT = {
     "editor.background": 0.990, "chrome.background": 0.968,
@@ -34,6 +35,7 @@ LIGHT = {
     "syntax.punctuation": 0.420, "syntax.operator": 0.420,
     "syntax.variable": 0.230, "gutter.foreground": 0.700,
     "minimap.foreground": 0.850,
+    "panel.background": 0.968, "tab.hover.foreground": 0.370,
 }
 # The one accent (caret, focus, current match edge, selection tint) and the
 # syntax hues: five at equal lightness and low chroma (rubric C3).
@@ -60,7 +62,8 @@ ORDER = ["editor.background", "editor.foreground", "gutter.background",
          "error.foreground", "error.background", "syntax.comment",
          "syntax.keyword", "syntax.string", "syntax.number", "syntax.constant",
          "syntax.function", "syntax.type", "syntax.variable", "syntax.operator",
-         "syntax.punctuation", "syntax.attribute"]
+         "syntax.punctuation", "syntax.attribute", "panel.background",
+         "tab.hover.foreground", "hover.background"]
 
 
 def oklch_to_oklab(L, C, h):
@@ -120,6 +123,7 @@ def theme(name):
     t = {k: oklab_to_srgb(*oklch_to_oklab(L, c, h)) for k, L in ladder.items()}
     accent = oklab_to_srgb(*oklch_to_oklab(*ACCENT[name]))
     bg = t["editor.background"]
+    t["hover.background"] = mix(t["editor.foreground"], bg, 0.06 if name == "dark" else 0.05)
     t["caret.background"] = accent
     t["caret.foreground"] = bg
     t["selection.background"] = mix(accent, bg, SELECTION_MIX[name])
@@ -149,6 +153,8 @@ def main():
                 note = ""
             else:
                 note = f"{ratio(t[k], ref):.2f}:1"
+            if k in ("panel.background", "hover.background"):
+                note = f"text {ratio(t['editor.foreground'], t[k]):.2f}:1; chrome {ratio(t['chrome.foreground'], t[k]):.2f}:1"
             if k in ("selection.background", "bracket.background"):
                 note = f"text on it {ratio(t['editor.foreground'], t[k]):.2f}:1"
             print(f"    {{\"{k}\", {hexs(t[k])}}},  /* {note} */")

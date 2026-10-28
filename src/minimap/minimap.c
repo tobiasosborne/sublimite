@@ -408,8 +408,8 @@ static int fill(minimap *m, const minimap_input *input, render_grid *grid,
     /* (E) wash = existing 128/4 = 32 coverage; edge = 3*32 = 96. Both
      * below half opacity. Pixel-exact perimeter is in minimap_pixels;
      * this legacy adapter can resolve only whole render cells. */
-    uint32_t wash_bg = blend(background, style->viewport, 32);
-    uint32_t wash_ink = blend(ink, style->viewport, 32);
+    uint32_t wash_bg = blend(background, style->viewport, style->hover ? 48u : 32u);
+    uint32_t wash_ink = blend(ink, style->viewport, style->hover ? 48u : 32u);
     uint32_t edge_bg = blend(background, style->viewport, 96);
     uint32_t edge_ink = blend(ink, style->viewport, 96);
     for (uint32_t r = 0; r < grid->dims.rows; r++) {
@@ -483,8 +483,8 @@ int minimap_pixels(const minimap *m, uint32_t *pixels, size_t capacity,
             bottom = (uint32_t)((uint64_t)(r + 1) * 2 < height ? (uint64_t)(r + 1) * 2 : height);
         }
     }
-    uint32_t wash_bg = blend(style->background, style->viewport, 32);
-    uint32_t wash_ink = blend(style->density, style->viewport, 32);
+    uint32_t wash_bg = blend(style->background, style->viewport, style->hover ? 48u : 32u);
+    uint32_t wash_ink = blend(style->density, style->viewport, style->hover ? 48u : 32u);
     uint32_t edge_bg = blend(style->background, style->viewport, 96);
     uint32_t edge_ink = blend(style->density, style->viewport, 96);
     for (uint32_t y = 0; y < height; y++) {
@@ -661,8 +661,8 @@ int minimap_pixels_window(const minimap *m, uint32_t *pixels, size_t capacity,
         uint64_t down = below < span / f->scale ? below * f->scale : span;
         ink_top = f->line_y - (int64_t)up; ink_end = f->line_y + (int64_t)down;
     }
-    uint32_t wash_bg = blend(style->background, style->viewport, 32);
-    uint32_t wash_ink = blend(ink, style->viewport, 32);
+    uint32_t wash_bg = blend(style->background, style->viewport, style->hover ? 48u : 32u);
+    uint32_t wash_ink = blend(ink, style->viewport, style->hover ? 48u : 32u);
     uint32_t edge_bg = blend(style->background, style->viewport, 96);
     uint32_t edge_ink = blend(ink, style->viewport, 96);
     int64_t top = f->box_top, bottom = f->box_top + (int64_t)f->box_height;

@@ -231,5 +231,5 @@ void editor_hl_paint(editor *e, uint64_t byte, uint32_t *fg)
         if (h->published[mid].end_byte<=byte) lo=mid+1u; else hi=mid;
     }
     if (lo<h->published_count && h->published[lo].first_byte<=byte)
-        *fg=config_theme_color(e->preferences.theme,hl_scope_key(h->published[lo].scope));
+        *fg=e->syntax_colors[h->published[lo].scope];
 }

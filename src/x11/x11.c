@@ -7,6 +7,7 @@
 #include "xi2.h"
 #include "clip.h"
 #include "dnd.h"
+#include "xcursor.h"
 #include <limits.h>
 #include "work/work.h"
 #include <sys/socket.h>
@@ -483,6 +484,35 @@ static bool init_request_ok(xcb_connection_t *c, xcb_void_cookie_t cookie) {
     return ok;
 }
 
+static void setup_cursors(plat *p, xcb_window_t root)
+{
+    x11_plat *x=x11_private(p); xcb_connection_t *c=x->conn;
+    xcb_atom_t property=atom(c,"RESOURCE_MANAGER");
+    xcb_get_property_reply_t *r=property ? xcb_get_property_reply(c,
+        xcb_get_property(c,0,root,property,XCB_ATOM_STRING,0,UINT32_MAX),NULL) : NULL;
+    bool valid=r && r->type==XCB_ATOM_STRING && r->format==8;
+    char theme[NAME_MAX+1u]; uint32_t size;
+    xcursor_settings(valid ? xcb_get_property_value(r) : NULL,
+        valid ? (size_t)xcb_get_property_value_length(r) : 0,getenv("XCURSOR_THEME"),getenv("XCURSOR_SIZE"),theme,sizeof theme,&size);
+    free(r);
+    const char *names[2][2]={{"left_ptr","default"},{"xterm","text"}};
+    for (unsigned shape=0;shape<2;shape++) {
+        for (unsigned alias=0;alias<2 && !x->cursors[shape];alias++) {
+            xcursor_image im; uint8_t *storage=NULL;
+            if (xcursor_load(getenv("HOME"),theme,names[shape][alias],size,&im,&storage))
+                x->cursors[shape]=xcursor_upload(c,root,&im);
+            free(storage);
+        }
+    }
+    if (!x->cursors[0] || !x->cursors[1]) {
+        for (unsigned i=0;i<2;i++) { if (x->cursors[i]) xcb_free_cursor(c,x->cursors[i]); x->cursors[i]=0; }
+        return;
+    }
+    /* A complete pair is required, so failure never leaves an I-beam stuck. */
+    xcb_change_window_attributes(c,x->win,XCB_CW_CURSOR,&x->cursors[PLAT_CURSOR_DEFAULT]);
+    x->cursor_shape=PLAT_CURSOR_DEFAULT;
+}
+
 int x11_plat_init(plat *p, const plat_config *cfg) {
     memset(p, 0, sizeof *p);
     if (cfg->exec_ns) trace_record_at(cfg->exec_ns, TRACE_T0_INGRESS, 0);
@@ -525,7 +555,7 @@ found:
         0, 0,
         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_FOCUS_CHANGE |
         XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS |
-        XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_PROPERTY_CHANGE,
+        XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_PROPERTY_CHANGE,
         x11_private(p)->colormap };
     /* value order: BACK_PIXEL, BORDER_PIXEL, EVENT_MASK, COLORMAP */
     if (!init_request_ok(c, xcb_create_window_checked(c, x11_private(p)->depth, x11_private(p)->win, s->root, 0, 0, (uint16_t)cfg->width, (uint16_t)cfg->height, 0,
@@ -533,6 +563,7 @@ found:
                       XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, vals))) {
         plat_shutdown(p); return PLAT_ERR_FAIL;
     }
+    setup_cursors(p,s->root);
     const char *title = cfg->title ? cfg->title : "sublimité";
     xcb_atom_t a_name = atom(c, "_NET_WM_NAME"), a_utf8 = atom(c, "UTF8_STRING"), a_pid = atom(c, "_NET_WM_PID");
     x11_private(p)->wm_protocols = atom(c, "WM_PROTOCOLS");
@@ -593,6 +624,16 @@ void x11_plat_set_blink(plat *p, uint32_t ms) {
 }
 
 /* Startup and preference reload only (one atom round trip), never typing. */
+void x11_plat_set_cursor(plat *p, plat_cursor_shape shape)
+{
+    x11_plat *x=x11_private(p);
+    if (!x || !x->conn || !x->win || (unsigned)shape>PLAT_CURSOR_TEXT ||
+        !x->cursors[shape] || shape==x->cursor_shape) return;
+    x->cursor_shape=shape;
+    xcb_change_window_attributes(x->conn,x->win,XCB_CW_CURSOR,&x->cursors[shape]);
+    xcb_flush(x->conn);
+}
+
 void x11_plat_set_dark(plat *p, bool dark) {
     x11_plat *x = x11_private(p);
     if (!x || !x->conn || !x->win) return;
@@ -666,6 +707,10 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         if (x11_private(p)->xi && !(e->response_type & 0x80u)) break;
         if (x11_input_button(IN(p), x, t == XCB_BUTTON_PRESS, trace_now_ns(), true, &ev)) x11_q_push(IN(p), &ev);
         break; }
+    case XCB_LEAVE_NOTIFY: {
+        const xcb_leave_notify_event_t *x = (const xcb_leave_notify_event_t *)e;
+        ev.kind = PLAT_EV_LEAVE; ev.x = x->event_x; ev.y = x->event_y;
+        ev.t0_ns = trace_now_ns(); x11_q_push(IN(p), &ev); break; }
     case XCB_MOTION_NOTIFY: {
         xcb_motion_notify_event_t *x = (xcb_motion_notify_event_t *)e;
         if (x11_private(p)->xi) break;                         /* XI2 supplies motion */
@@ -843,6 +888,7 @@ void x11_plat_shutdown(plat *p) {
     free(x11_private(p)->xi);
     if (x11_private(p)->in) { x11_input_destroy(IN(p)); free(x11_private(p)->in); }
     if (x11_private(p)->conn) {
+        for (unsigned i=0;i<2;i++) if (x11_private(p)->cursors[i]) xcb_free_cursor(C(p),x11_private(p)->cursors[i]);
         if (x11_private(p)->win) xcb_destroy_window(C(p), x11_private(p)->win);
         xcb_disconnect(C(p));
     }

@@ -57,7 +57,7 @@ int main(void)
     int fd = open(path,O_CREAT|O_WRONLY,S_IRUSR|S_IWUSR); T(fd >= 0);
     T(write(fd,source,sizeof source-1u) == (ssize_t)(sizeof source-1u)); close(fd);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config cfg = {.path=path,.cols=sizeof source,.rows=sizeof source,.wrap_mode=-1};
+    editor_config cfg = {.path=path,.cols=sizeof source + 5u + 8u + 1u, /* (P) gutter + map + outer margin */.rows=sizeof source,.wrap_mode=-1};
     editor *e = NULL; T(editor_open(&e,&cfg,&backend) == 0);
     held_worker held; T(start_hold(e,&held)==0);
     uint64_t interval = UINT64_C(1000000000)/90u;
@@ -84,7 +84,7 @@ int main(void)
     T(e->grid.cells[(size_t)e->tab_rows*e->grid.dims.cols+e->lay.gw+offset].fg ==
       config_theme_color(e->preferences.theme,"syntax.comment"));
     /* Theme uses the same published scope without recompiling a query. */
-    e->preferences.theme=CONFIG_LIGHT; T(editor_full_layout(e)==0); T(text_ready(e)==0);
+    e->preferences.theme=CONFIG_LIGHT; editor_theme_cache(e, CONFIG_LIGHT); T(editor_full_layout(e)==0); T(text_ready(e)==0);
     T(e->grid.cells[(size_t)e->tab_rows*e->grid.dims.cols+e->lay.gw+offset].fg ==
       config_theme_color(CONFIG_LIGHT,"syntax.comment"));
     /* A new buffer must not inherit byte-identical old captures. */

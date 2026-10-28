@@ -25,10 +25,10 @@ static uint32_t digits_of(uint64_t v)
     return d;
 }
 
-static uint32_t gutter_width(const layout *l, uint64_t line_count)
+uint32_t layout_gutter_columns(const layout *l, uint64_t line_count)
 {
     if (!l->cfg.gutter) return 0;
-    uint32_t w = digits_of(line_count) + 1;
+    uint32_t w = digits_of(line_count) + 4u /* (P) two inset cells + two gap cells */;
     return w < l->grid->dims.cols ? w : l->grid->dims.cols;
 }
 
@@ -81,7 +81,7 @@ static int begin_common(layout *l, layout_viewport vp)
     l->bytes_scanned = l->bytes_read = l->cache_hits = l->cache_misses = 0;
     l->cluster_active = false;
     l->line_count = vp.line_count;
-    uint32_t gw = gutter_width(l, l->line_count);
+    uint32_t gw = layout_gutter_columns(l, l->line_count);
     if (gw != l->gw) {                      /* old gutter cells may be anywhere: re-clear */
         for (uint32_t r = 0; r < l->grid->dims.rows; r++) l->row_used[r] = l->grid->dims.cols;
     }
@@ -162,13 +162,13 @@ static void write_gutter(layout *l, render_cell *row, uint64_t line, bool number
 {
     render_cell b = {0, RENDER_NO_SLOT, l->cfg.gutter_fg, l->cfg.gutter_bg, 0, 0};
     for (uint32_t i = 0; i < l->gw; i++) row[i] = b;
-    if (!number || l->gw < 2) return;
-    uint32_t i = l->gw - 1;            /* last cell is the separator */
+    if (!number || l->gw < 5) return;
+    uint32_t i = l->gw - 2u; /* (P) two blank cells before text */
     uint64_t v = line + 1;
     do {
         uint32_t d = (uint32_t)(v % 10);
         v /= 10;
-        if (i == 0) break;             /* number wider than the gutter (cannot happen with exact count) */
+        if (i <= 2u) break; /* retain the two-cell left margin at tiny widths */
         i--;
         row[i].glyph_index = '0' + d;
         row[i].atlas_slot = '0' + d - 0x20u;
@@ -610,7 +610,7 @@ int layout_edit(layout *l, uint64_t off, uint64_t old_len, uint64_t new_len,
         layout_viewport vp = {l->first_byte, l->first_line, l->hscroll, l->line_count};
         return begin_common(l, vp) == RENDER_OK ? LAYOUT_MORE : LAYOUT_ERR_STATE;
     }
-    if (was_busy || gutter_width(l, lc) != l->gw) {
+    if (was_busy || layout_gutter_columns(l, lc) != l->gw) {
         /* busy: restart; gutter width changed: geometry changes, redo everything */
         layout_viewport vp = {l->first_byte, l->first_line, l->hscroll, lc};
         return begin_common(l, vp) == RENDER_OK ? LAYOUT_MORE : LAYOUT_ERR_STATE;

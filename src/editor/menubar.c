@@ -3,6 +3,7 @@
  * Items dispatch through editor_dispatch_action, the palette's dispatcher.
  * All state is embedded in the editor (no allocation on any path here). */
 #include "editor/private.h"
+#include "editor/theme.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
@@ -164,21 +165,23 @@ static drop_box dropdown(editor *e)
 {
     const menu_def *d = &menu_table()[e->menu.open];
     uint32_t cols = e->grid.dims.cols, rows = e->grid.dims.rows;
-    size_t widest = 0; char chord[KEYS_CHORD_FORMAT_CAP];
-    for (size_t i = 0; i < d->count; i++) {
-        size_t n = strlen(item_label(e, i)), c = item_chord(e, i, chord, sizeof chord);
-        if (c) n += 2u + c;
-        if (n > widest) widest = n;
-    }
-    drop_box box = {.row = e->menu_rows};
-    box.width = widest + 2u < cols ? (uint32_t)widest + 2u : cols;
-    box.col = menu_title_column((size_t)e->menu.open);
-    if (box.col > cols - box.width) box.col = cols - box.width;
+    findui_bounds bounds = editor_panel_bounds(e);
+    drop_box box = {.row = e->menu_rows, .col = 0, .width = cols};
+    (void)bounds;
     box.visible = box.row < rows ? rows - box.row : 0;
     if (box.visible > d->count) box.visible = (uint32_t)d->count;
     if (e->menu.item < e->menu.first) e->menu.first = e->menu.item;
     if (box.visible && e->menu.item - e->menu.first >= box.visible) e->menu.first = e->menu.item - box.visible + 1u;
     return box;
+}
+bool editor_menu_hover(editor *e, uint32_t row, uint32_t col, editor_hover *hit)
+{
+    if (e->menu.open < 0) return false;
+    drop_box box = dropdown(e); findui_bounds b = editor_panel_bounds(e);
+    if (row >= box.row && row - box.row < box.visible && col >= b.first && col < b.end) {
+        *hit = (editor_hover){EDITOR_HOVER_MENU, row, e->menu.first + row - box.row}; return true;
+    }
+    return false;
 }
 bool editor_menu_pointer(editor *e, const plat_event *ev, int *rc)
 {
@@ -199,7 +202,8 @@ bool editor_menu_pointer(editor *e, const plat_event *ev, int *rc)
     }
     if (m->open >= 0) {
         drop_box box = dropdown(e);
-        if (row >= box.row && row < (int64_t)box.row + box.visible && col >= box.col && col < (int64_t)box.col + box.width) {
+        findui_bounds bounds = editor_panel_bounds(e);
+        if (row >= box.row && row < (int64_t)box.row + box.visible && col >= bounds.first && col < bounds.end) {
             m->item = m->first + (size_t)(row - box.row);
             return run(e, ev, rc);
         }
@@ -234,9 +238,8 @@ int editor_menu_paint(editor *e)
 {
     const struct editor_menu *m = &e->menu;
     uint32_t cols = e->grid.dims.cols; int rc;
-    config_theme theme = e->preferences.theme;
-    if (e->menu_rows) {
-        uint32_t fg = config_theme_color(theme, "chrome.foreground"), bg = config_theme_color(theme, "chrome.background");
+    if (e->menu_rows && (!e->hover_only || render_row_dirty(&e->grid, 0))) {
+        uint32_t fg = e->colors.chrome_fg, bg = e->colors.chrome_bg;
         bool focus = m->active || m->open >= 0, changed = false;
         size_t lit = m->open >= 0 ? (size_t)m->open : m->title;
         uint32_t column = 0;
@@ -255,25 +258,24 @@ int editor_menu_paint(editor *e)
     }
     if (m->open < 0) return 0;
     drop_box box = dropdown(e);
-    uint32_t dim = config_theme_color(theme, "gutter.foreground");
     char chord[KEYS_CHORD_FORMAT_CAP];
     for (uint32_t r = 0; r < box.visible; r++) {
+        if (e->hover_only && !render_row_dirty(&e->grid, box.row + r)) continue;
         size_t item = e->menu.first + r;
-        const keys_binding *command = item_command(e, item);
         bool selected = item == m->item;
-        bool unimplemented = command && (command->args.flags & KEYS_ARG_UNIMPLEMENTED);
-        uint32_t fg = selected ? e->layout_cfg.sel_fg : unimplemented ? dim : config_theme_color(theme, "editor.foreground");
-        uint32_t bg = selected ? e->layout_cfg.sel_bg : config_theme_color(theme, "chrome.background");
+        uint32_t fg = e->layout_cfg.fg;
+        uint32_t bg = selected ? e->layout_cfg.sel_bg : e->hover.kind == EDITOR_HOVER_MENU && e->hover.index == item ? e->colors.hover : e->colors.panel;
         const char *label = item_label(e, item);
         size_t length = item_chord(e, item, chord, sizeof chord);
-        uint32_t right = box.col + box.width - 1u; /* the trailing padding cell */
-        uint32_t chord_at = length < right - box.col ? right - (uint32_t)length : right;
+        findui_bounds bounds = editor_panel_bounds(e);
+        uint32_t right = bounds.end;
+        uint32_t chord_at = length < right - bounds.first ? right - (uint32_t)length : right;
         bool changed = false; size_t at = 0, from = 0;
         for (uint32_t c = box.col; c < box.col + box.width; c++) {
             unsigned char byte = ' ';
-            if (c > box.col && c < chord_at && label[at]) byte = (unsigned char)label[at++];
+            if (c >= bounds.first && c < chord_at && label[at]) byte = (unsigned char)label[at++];
             else if (c >= chord_at && c < right && chord[from]) byte = (unsigned char)chord[from++];
-            changed |= put(e, box.row + r, c, byte, fg, bg, 0);
+            changed |= put(e, box.row + r, c, byte, c >= chord_at && c < right ? e->colors.chrome_fg : fg, bg, 0);
         }
         rc = mark(e, box.row + r, changed); if (rc) return rc;
     }

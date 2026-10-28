@@ -88,6 +88,7 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
                 (wl_fixed_t)((int)m->payload[i] - (int)UINT8_MAX / 2) * PLAT_WHEEL_UNIT);
         }
         if (m->payload_len) wl_pointer_send_frame(m->pointer);
+        wl_pointer_send_leave(m->pointer, wl_display_next_serial(m->display), m->surface);
         return;
     }
     assert(m->acked);

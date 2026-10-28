@@ -240,13 +240,14 @@ static row_owner expected_owner(const state *s)
     if (s->palette) return ROW_PALETTE;
     return s->find ? ROW_FIND : ROW_NONE;
 }
-static bool grid_prefix(editor *e, uint32_t row, const char *text)
+static bool grid_at(editor *e, uint32_t row, size_t col, const char *text)
 {
     for (size_t i = 0; text[i]; i++) {
-        if (i >= e->grid.dims.cols || e->grid.cells[(size_t)row * e->grid.dims.cols + i].glyph_index != (uint32_t)(uint8_t)text[i]) return false;
+        if (col + i >= e->grid.dims.cols || e->grid.cells[(size_t)row * e->grid.dims.cols + col + i].glyph_index != (uint32_t)(uint8_t)text[i]) return false;
     }
     return true;
 }
+static bool grid_prefix(editor *e, uint32_t row, const char *text) { return grid_at(e, row, 0, text); }
 static int snapshot(const fixture *f, state *s)
 {
     editor *e = f->e; findui_state fs = findui_get_state(&e->find);
@@ -271,12 +272,12 @@ static int snapshot(const fixture *f, state *s)
     if (s->go) strcpy(s->go_text, e->go.digits);
     uint32_t last = e->grid.dims.rows - 1u;
     if (grid_prefix(e, last, "Save changes to ")) s->painted = ROW_CLOSE;
-    else if (grid_prefix(e, last, "Go to line: :") || grid_prefix(e, last, "Open file: ") || grid_prefix(e, last, "Save as: ")) s->painted = ROW_GO;
+    else if (e->go.active && grid_at(e, last, e->lay.gw, e->go.length ? e->go.digits : e->go.kind == KEYS_ACTION_GOTO_LINE ? "Line number" : e->go.kind == KEYS_ACTION_OPEN_FILE ? "Open file" : "Save as")) s->painted = ROW_GO;
     else if (grid_prefix(e, last, "Source changed: ")) s->painted = ROW_RELOAD;
     else if (e->panel_rows) {
         uint32_t first = e->grid.dims.rows - e->panel_rows;
-        if (grid_prefix(e, first, "Command: ")) s->painted = ROW_PALETTE;
-        else if (grid_prefix(e, first, "Find: ")) s->painted = ROW_FIND;
+        if (e->palette_open && grid_at(e, first, e->lay.gw, e->palette->query_length ? e->palette->query : "Command")) s->painted = ROW_PALETTE;
+        else if (e->find_visible && grid_at(e, first, e->lay.gw, fs.query_length ? s->query : "Find")) s->painted = ROW_FIND;
     }
     return 0;
 }

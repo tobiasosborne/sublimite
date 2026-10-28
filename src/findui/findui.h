@@ -158,12 +158,21 @@ findui_code findui_replace_step(findui_panel *panel, size_t match_budget,
                                uint64_t deadline_ns, size_t *replaced);
 findui_code findui_replace_cancel(findui_panel *panel);
 
+typedef struct findui_bounds { uint32_t first, end; } findui_bounds; /* half-open content columns */
+typedef struct findui_geometry { uint32_t field_end, toggles, count; } findui_geometry;
+findui_geometry findui_get_geometry(const findui_panel *, findui_bounds);
 typedef struct findui_style {
     uint32_t foreground, background, accent, cursor_foreground, cursor_background;
     /* 95 slots for ASCII 32..126 in the grid's existing glyph table. Missing
      * glyphs may use RENDER_NO_SLOT. Their glyph_index comes from that table. */
     const uint32_t *ascii_slots;
     size_t ascii_slot_count;
+    findui_bounds bounds;
+    uint32_t muted, error, selected_background;
+    uint32_t dot_slot; /* resident U+00B7, or RENDER_NO_SLOT */
+    uint32_t hover_background;
+    uint32_t hover_toggle; /* FINDUI_HIT_* identity, zero when absent */
+    bool hover_only; /* paint only rows already marked by the host */
 } findui_style;
 /* Paint only [first_row,first_row+row_count), mark those rows. Begun grid and
  * valid glyph table required. 1 row=find; 2 adds replacement/status; 3+ adds
@@ -181,7 +190,9 @@ typedef enum findui_hit_kind {
     FINDUI_HIT_REGEX, FINDUI_HIT_CASE, FINDUI_HIT_WORD
 } findui_hit_kind;
 typedef struct findui_hit { findui_hit_kind kind; size_t cursor; } findui_hit;
-findui_code findui_hit_test(const findui_panel *panel, uint32_t columns,
+/* Hover classification only: no field scroll or byte-position scan. */
+findui_hit_kind findui_hit_target(const findui_panel *, findui_bounds, uint32_t row_count, uint32_t row, uint32_t column);
+findui_code findui_hit_test(const findui_panel *panel, findui_bounds bounds,
                            uint32_t row_count, uint32_t row, uint32_t column,
                            findui_hit *hit);
 

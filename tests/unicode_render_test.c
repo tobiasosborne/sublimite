@@ -117,7 +117,7 @@ static int emoji_fallback(bool inject, bool wrapping)
     /* (G) Byte extent bounds the text columns; each expected item has its own
      * row, plus the leading blank line and tab strip. */
     editor_config cfg = {.cols = (uint32_t)sizeof text,
-        .rows = (uint32_t)(sizeof expected / sizeof expected[0]) + 1u + 1u,
+        .rows = (uint32_t)(sizeof expected / sizeof expected[0]) + 1u + 2u, /* leading LF + strip/spacer */
         .initial = (const uint8_t *)(inject ? "\n" : text),
         .initial_len = inject ? sizeof "\n" - 1u : sizeof text - 1u,
         .hook_ctx = &gate, .on_submit = submitted};
@@ -207,7 +207,7 @@ static int render_unicode(bool inject)
     render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
     /* Geometry derives from the test text's utf8 widths plus the gutter. */
     editor_config cfg = {.cols = (uint32_t)sizeof text,
-        .rows = 3, /* (G) leading-LF text occupies two rows, plus the tab strip */
+        .rows = 4, /* (P) two text rows + tab strip + spacer */
         .initial = inject ? (const uint8_t *)"\n" : (const uint8_t *)text,
         .initial_len = inject ? sizeof "\n" - 1u : sizeof text - 1u,
         .hook_ctx = &gate, .on_submit = submitted};
@@ -218,7 +218,7 @@ static int render_unicode(bool inject)
      * must remain blank when sharing the runtime lookup with text layout. */
     T(tabs_rename(&e->tabs, tabs_active_index(&e->tabs), "a b", sizeof "a b" - 1u, "", 0) == TABS_OK);
     T(editor_begin_frame(e) == EDITOR_OK); T(settle(e) == 0);
-    T(editor_grid(e)->cells[sizeof "a"].glyph_index == ' '); /* title starts after its leading padding cell */
+    T(editor_grid(e)->cells[e->lay.gw + 1u].glyph_index == ' '); /* title starts after its leading padding cell */
     if (inject) {
         T(editor_set_cursor(e, sizeof "\n" - 1u) == EDITOR_OK); T(settle(e) == 0);
         /* Hold the bulk lane through input->submit. The process-wide malloc

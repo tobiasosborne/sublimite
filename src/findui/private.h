@@ -56,6 +56,9 @@ typedef struct findui_slot {
 typedef struct findui_impl {
     findui_config config;
     findui_state state;
+    findui_bounds painted_bounds;
+    findui_geometry painted_geometry;
+    bool painted_geometry_valid; /* hits follow visible cells until the next paint */
     piece_snapshot *source;
     findui_source_lease source_lease;
     struct { piece_snapshot *snapshot; findui_source_lease lease; } retired[FINDUI_RETIRE_COUNT];

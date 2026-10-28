@@ -1,7 +1,7 @@
 #!/bin/sh
 # tools/design_shots.sh <binary> <outdir>
 # Deterministic scene capture for the design hill-climb (edit-cxho.21).
-# Renders 8 scenes x 2 themes (dark, light) of the given sublimite binary on a
+# Renders 11 scenes x 2 themes (dark, light) of the given sublimite binary on a
 # private Xvfb, writes NN-name-theme.png, manifest.json and contact-sheet.png.
 # Needs: Xvfb xdotool import(ImageMagick) montage sha256sum.
 # Env: EDIT_SHOTS_DISPLAY (default :91, private; never :0).
@@ -21,6 +21,17 @@ W=3296; H=2060
 # (P) 192 dpi = 2x the 96 dpi CSS reference pixel; the same scale the panel
 # reports, so glyph sizes match his screenshots.
 DPI=192
+# (P) default 10 pt -> round(10*DPI/72) em px; embedded DejaVu's
+# units/em=2048, ASCII advance=1233, hhea ascent/descent=1901/483
+# (src/editor/runtime.h, src/font/font.c round-to-nearest metrics).
+# These are the same 16 x 31 px cells at this harness DPI, not screen guesses.
+em=$(((10 * DPI + 36) / 72))
+cw=$(((em * 1233 + 1024) / 2048))
+ch=$((((em * 1901 + 1024) / 2048) + ((em * 483 + 1024) / 2048)))
+text_col=$(awk 'END{n=NR+1; d=1; while(n>=10){d++;n=int(n/10)};print d+4}' "$fix/readme.md")
+# The find scene selects the first literal occurrence; derive its count width.
+matches=$(awk '{s=$0;while(match(s,/minimap/)){n++;s=substr(s,RSTART+RLENGTH)}} END{print n+0}' "$fix/readme.md")
+count_cells=$((1 + 4 + ${#matches})) # (P) "1 of " plus decimal count
 # Settle rule: a frame is settled when the screen has not changed for QUIET_NS.
 # (P) the caret blinks with a 500 ms half period (EDITOR_BLINK_NS in
 # src/editor/editor.h), so a blinking caret changes the screen at least every
@@ -38,7 +49,7 @@ lane_pids=""
 cleanup() {
     for p in $lane_pids; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
-    rm -rf "$work"
+    if [ -n "${EDIT_SHOTS_KEEP_WORK:-}" ]; then echo "design_shots work: $work" >&2; else rm -rf "$work"; fi
 }
 trap cleanup EXIT HUP INT TERM
 export EDIT_REFUSE_REAL_DISPLAY=1
@@ -107,6 +118,7 @@ run_scene() {
     # No window manager under Xvfb: the client chooses its own size, so force
     # the panel geometry directly (verified in report: editor relayouts).
     xdotool windowmove "$win" 0 0 windowsize "$win" "$W" "$H"
+    xdotool mousemove --window "$win" 0 $((H / 2)) # deterministic non-hover margin
     # Keys queue on the window in X order, so they are processed after the
     # resize; one settle at the end (no intermediate base frame: it would cost
     # a second 10 s idle wait per scene).
@@ -115,10 +127,25 @@ run_scene() {
             case $line in
                 "key "*) xdotool key --delay 50 ${line#key } ;;
                 "type "*) xdotool type --delay 50 -- "${line#type }" ;;
+                "hover tab")
+                    settle "" "$sd/prehover.xwd"
+                    # (P) second tab is one 16-cell slot past the text edge.
+                    xdotool mousemove --window "$win" $(((text_col + 16 + 2) * cw)) $((ch / 2)) ;;
+                "hover find")
+                    settle "" "$sd/prehover.xwd"
+                    # (P) map 8 + outer margin 1 + panel gap 1; toggles 8,
+                    # count gap 1. Aa is the first two cells of that summary.
+                    aa=$((W / cw - 8 - 1 - 1 - 8 - 1 - count_cells))
+                    xdotool mousemove --window "$win" $((aa * cw + cw / 2)) $(((H / ch - 1) * ch + ch / 2)) ;;
+
             esac
         done
     fi
-    settle "" "$sd/final.xwd" || return 1
+    if [ -f "$sd/prehover.xwd" ]; then
+        settle "$sd/prehover.xwd" "$sd/final.xwd" || { echo "$name-$theme: hover settle failed" >&2; return 1; }
+    else
+        settle "" "$sd/final.xwd" || return 1
+    fi
     topng "$sd/final.xwd" "$out/$name-$theme.png"
     kill "$epid" 2>/dev/null || true; wait "$epid" 2>/dev/null || true; epid=""
 }
@@ -126,7 +153,7 @@ run_scene() {
 # Scene table: id, keystrokes, files. Order of the four tabs puts README last
 # so the Markdown file is the active one.
 four="$fix/hello.c $fix/util.py $fix/notes.txt $fix/readme.md"
-all_scenes="01-empty 02-tabs 03-find 04-replace 05-goto 06-palette 07-code 08-large"
+all_scenes="01-empty 02-tabs 03-find 04-replace 05-goto 06-palette 07-code 08-large 09-hover-tab 10-hover-find 11-find-empty"
 [ -z "${EDIT_SHOTS_ONLY:-}" ] || all_scenes=$EDIT_SHOTS_ONLY  # debugging: e.g. "01-empty"
 # lane <theme> <display>: private Xvfb plus every scene for one theme. Its own
 # trap kills the Xvfb and the editor even when a scene fails.
@@ -153,6 +180,11 @@ type 12" $four ;;
             06-palette) run_scene $s $theme "key ctrl+shift+p
 type wrap" $four ;;
             07-code)    run_scene $s $theme "" "$fix/hello.c" ;;
+            09-hover-tab) run_scene $s $theme "hover tab" $four ;;
+            10-hover-find) run_scene $s $theme "key ctrl+f
+type minimap
+hover find" $four ;;
+            11-find-empty) run_scene $s $theme "key ctrl+f" $four ;;
             08-large)   run_scene $s $theme "key ctrl+g
 type 10000
 key Return" "$big" ;;

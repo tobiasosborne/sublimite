@@ -228,6 +228,11 @@ typedef struct editor_goto {
     scroll_state original_scroll; /* displayed 3kk top before the prompt */
     bool active, selected, valid, accept;
 } editor_goto;
+typedef enum editor_hover_kind {
+    EDITOR_HOVER_NONE, EDITOR_HOVER_TAB, EDITOR_HOVER_FIND,
+    EDITOR_HOVER_PALETTE, EDITOR_HOVER_MENU, EDITOR_HOVER_MAP
+} editor_hover_kind;
+typedef struct editor_hover { editor_hover_kind kind; uint32_t row; size_t index; } editor_hover;
 /* edit-2ye3: Save / Don't save / Cancel for a user close of a modified tab.
  * Embedded storage; owner 0 = no prompt. prompt_ns/serial follow the
  * source-change prompt: set when the frame showing it is submitted, so only
@@ -500,6 +505,12 @@ struct editor {
     int64_t map_drag_top;    /* edit-cxho.10: pointer-derived box top, painted while dragging */
     bool map_drag, paint_ready, caret_only;
     uint32_t find_bg; /* edit-cxho.24: bracket.background, resolved when the theme applies, not per painted cell */
+    struct { uint32_t panel, hover, chrome_fg, chrome_bg, tab_fg, tab_bg, tab_hover,
+                      error_fg, error_bg, map_fg, warning; } colors;
+    uint32_t syntax_colors[HL_SCOPE_COUNT]; /* scope ids resolve once per theme */
+    editor_hover hover;
+    plat_cursor_shape pointer_shape;
+    bool hover_only, hover_map;
     bool glyph_only; /* glyph pixels plus caret damage; retain minimap/chrome cells */
     bool text_drag;
     uint64_t text_drag_id, text_drag_generation, click_ns, click_byte;
@@ -711,6 +722,9 @@ int editor_palette_sync(editor *);
 int editor_palette_key(editor *, const plat_event *);
 bool editor_palette_pointer(editor *, const plat_event *, int *rc);
 int editor_palette_paint(editor *);
+void editor_theme_cache(editor *, config_theme);
+int editor_hover_pointer(editor *, const plat_event *);
+bool editor_menu_hover(editor *, uint32_t row, uint32_t col, editor_hover *);
 /* edit-yey menu bar (menubar.c). key/pointer return true when consumed,
  * with the result in *rc. Paint runs at the end of every composition. */
 bool editor_menu_visible(const editor *);

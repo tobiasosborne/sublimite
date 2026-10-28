@@ -125,6 +125,7 @@ static int fail(editor *e, int cause)
 }
 int editor_begin_frame(editor *e)
 {
+    e->hover_only = e->hover_map = false;
     e->caret_only = false;
     e->glyph_only = false;
     if (e->dirty) return 0;
@@ -441,7 +442,7 @@ static int submit(editor *e)
         e->caret_only = false;
     }
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
-    if (e->caret_only && !count) {
+    if ((e->caret_only || (e->hover_only && !e->grid.region.dirty)) && !count) {
         e->dirty = false; /* Visibility changed outside the viewport: no pixels to submit. */
         return 0;
     }
@@ -526,8 +527,8 @@ int editor_resize_grid(editor *e, render_dims dims)
     if (rc) return rc;
     e->grid.dims = dims;
     e->grid.scroll = (render_scroll){0}; /* the old rectangle belongs to the old surface */
-    e->tab_rows = dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
-    e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols; e->text_grid.dims.rows -= e->tab_rows;
+    e->tab_rows = dims.rows > 2 ? 2u : dims.rows > 1 ? 1u : 0u; e->map_cols = dims.cols >= 24 ? 8u : 0u;
+    e->text_grid.dims = dims; e->text_grid.dims.cols -= e->map_cols + (dims.cols > 1u ? 1u : 0u); e->text_grid.dims.rows -= e->tab_rows;
     rc = font_async_bind(e->fonts, &e->grid); if (rc) return rc;
     rc = font_async_bind(e->fonts, &e->text_grid); if (rc) return rc;
     return editor_text_geometry(e);
@@ -540,7 +541,7 @@ int editor_text_geometry(editor *e)
     /* edit-yey: the menu bar row sits above the tab strip while visible and
      * only when a text row remains (one bar + one strip + one text row). */
     e->menu_rows = editor_menu_visible(e) && dims.rows > 2u ? 1u : 0u;
-    e->tab_rows = (dims.rows > 1u ? 1u : 0u) + e->menu_rows;
+    e->tab_rows = e->menu_rows + (dims.rows > e->menu_rows + 2u ? 2u : dims.rows > e->menu_rows + 1u ? 1u : 0u);
     e->text_grid.dims.rows = dims.rows - e->tab_rows;
     uint32_t available=e->text_grid.dims.rows;
     /* P: query row; replacement mode adds its field and hints row. Recompute
@@ -697,6 +698,8 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
 }
 static int nonkey(editor *e, const plat_event *ev)
 {
+    if (ev->kind == PLAT_EV_LEAVE || (ev->kind == PLAT_EV_MOTION && !ev->buttons &&
+        !e->drag_id && !e->map_drag && !e->text_drag)) return editor_hover_pointer(e, ev);
     editor_modal modal = editor_active_modal(e);
     bool pointer = ev->kind == PLAT_EV_BUTTON || ev->kind == PLAT_EV_MOTION || ev->kind == PLAT_EV_WHEEL;
     /* Required answers own every pointer route, before find focus, menus,

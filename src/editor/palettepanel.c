@@ -1,4 +1,5 @@
 #include "editor/private.h"
+#include "editor/theme.h"
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <string.h>
 
@@ -84,16 +85,15 @@ bool editor_palette_pointer(editor *e, const plat_event *ev, int *rc)
 static void cell(editor *e, uint32_t row, uint32_t column, unsigned char byte, bool selected, bool cursor)
 {
     if (column >= e->grid.dims.cols) return;
-    config_theme t = e->preferences.theme;
-    render_cell value = {.atlas_slot = RENDER_NO_SLOT, .fg = config_theme_color(t, "editor.foreground"),
-        .bg = config_theme_color(t, "chrome.background")};
+    render_cell value = {.atlas_slot = RENDER_NO_SLOT, .fg = e->layout_cfg.fg,
+        .bg = e->hover.kind == EDITOR_HOVER_PALETTE && e->hover.row == row ? e->colors.hover : e->colors.panel};
     if (byte >= ' ' && byte <= '~') {
         value.atlas_slot = e->find_ascii[byte - (unsigned char)' '];
         if (value.atlas_slot != RENDER_NO_SLOT) value.glyph_index = e->grid.glyphs[value.atlas_slot].glyph_index;
     }
     if (selected) { value.fg = e->layout_cfg.sel_fg; value.bg = e->layout_cfg.sel_bg; }
-    if (cursor) { value.fg = config_theme_color(t, "caret.foreground");
-        value.bg = config_theme_color(t, "caret.background"); value.attrs = RENDER_ATTR_CURSOR; }
+    if (cursor) { value.fg = e->layout_cfg.cursor_fg;
+        value.bg = e->layout_cfg.cursor_bg; value.attrs = RENDER_ATTR_CURSOR; }
     e->grid.cells[(size_t)row * e->grid.dims.cols + column] = value;
 }
 static void text(editor *e, uint32_t row, uint32_t column, uint32_t limit, const char *bytes, bool selected)
@@ -105,35 +105,43 @@ int editor_palette_paint(editor *e)
     if (!e->palette_open || !e->panel_rows) return 0;
     palette_state *p = e->palette;
     uint32_t first = e->grid.dims.rows - e->panel_rows, cols = e->grid.dims.cols;
-    if (render_mark_rows(&e->grid, first, e->panel_rows) != RENDER_OK) return EDITOR_ERR_ARG;
+    if (!e->hover_only && render_mark_rows(&e->grid, first, e->panel_rows) != RENDER_OK) return EDITOR_ERR_ARG;
     /* (P) the query consumes the first panel row; the rest are action rows. */
     uint32_t visible = e->panel_rows - 1u;
     if (p->selected < p->first) p->first = p->selected;
     if (visible && p->selected - p->first >= visible) p->first = p->selected - visible + 1u;
     for (uint32_t r = 0; r < e->panel_rows; r++) {
+        if (e->hover_only && !render_row_dirty(&e->grid, first + r)) continue;
         bool selected = r && p->first + r - 1u < p->count && p->first + r - 1u == p->selected;
         for (uint32_t c = 0; c < cols; c++) cell(e, first + r, c, ' ', selected, false);
     }
-    const char prompt[] = "Command: ";
-    text(e, first, 0, cols, prompt, false);
-    uint32_t column = (uint32_t)(sizeof prompt - 1u);
-    if (cols > column) {
-        size_t width = cols - column;
+    findui_bounds bounds = editor_panel_bounds(e);
+    uint32_t column = bounds.first, end = bounds.end;
+    if ((!e->hover_only || render_row_dirty(&e->grid, first)) && !p->query_length) {
+        text(e, first, column, end, "Command", false);
+        for (uint32_t c = column; c < end; c++) e->grid.cells[(size_t)first * cols + c].fg = e->layout_cfg.gutter_fg;
+        if (column < end) e->grid.cells[(size_t)first * cols + column].attrs |= RENDER_ATTR_UNDERLINE;
+    } else if ((!e->hover_only || render_row_dirty(&e->grid, first)) && end > column) {
+        size_t width = end - column;
         size_t scroll = p->query_length >= width ? p->query_length - width + 1u : 0;
-        text(e, first, column, cols, p->query + scroll, false);
+        text(e, first, column, end, p->query + scroll, false);
         cell(e, first, column + (uint32_t)(p->query_length - scroll), ' ', false, true);
     }
     for (uint32_t r = 0; r < visible && p->first + r < p->count; r++) {
+        if (e->hover_only && !render_row_dirty(&e->grid, first + r + 1u)) continue;
         size_t index = p->first + r;
         const palette_row *row = &p->rows[p->matches[index]];
         const keys_binding *live = keys_binding_for_command(row->binding, e->preferences.bindings, e->preferences.binding_count);
         char chord[KEYS_CHORD_FORMAT_CAP]; chord[0] = '\0';
         if (live && keys_chord_format(live, chord, sizeof chord)) chord[0] = '\0';
         size_t length = strlen(chord);
-        uint32_t right = length < cols ? cols - (uint32_t)length : cols;
+        uint32_t right = length < end - column ? end - (uint32_t)length : end;
         bool selected = index == p->selected;
-        text(e, first + r + 1u, 0, right < cols && right ? right - 1u : right, row->label, selected);
-        if (right < cols) text(e, first + r + 1u, right, cols, chord, selected);
+        text(e, first + r + 1u, column, right < end && right ? right - 1u : right, row->label, selected);
+        if (right < end) {
+            text(e, first + r + 1u, right, end, chord, selected);
+            for (uint32_t c = right; c < end; c++) e->grid.cells[(size_t)(first + r + 1u) * cols + c].fg = e->colors.chrome_fg;
+        }
     }
     return 0;
 }

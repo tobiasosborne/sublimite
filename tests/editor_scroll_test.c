@@ -233,7 +233,7 @@ static int resized(void)
     event = (plat_event){.kind = PLAT_EV_RESIZE,
         .w = cfg.cols / 2u * editor_grid(e)->dims.cell_w, .h = cfg.rows / 2u * editor_grid(e)->dims.cell_h};
     CHECK(editor_inject(e, &event) == 0 && settle(e) == 0);
-    CHECK(o.last.scroll.origin_y_q8 == origin && o.last.scroll.layout_rows == editor_grid(e)->dims.rows);
+    CHECK(o.last.scroll.origin_y_q8 == origin && o.last.scroll.layout_rows == editor_grid(e)->dims.rows - e->tab_rows + 1u);
     CHECK(render_grid_validate(editor_grid(e)) == 0);
     puts("editor_scroll_test: fractional resize rebuilds clip/overscan and preserves origin PASS");
 done:
@@ -542,7 +542,7 @@ int main(int argc, char **argv)
     CHECK(editor_inject(e, &wheel) == 0 && settle(e) == 0);
     CHECK(o.frames > baseline);
     CHECK(o.last.scroll.origin_y_q8 == -(int64_t)(SCROLL_CORE_ROWS * editor_grid(e)->dims.cell_h));
-    CHECK(o.last.scroll.layout_rows == cfg.rows); /* visible rows = surface minus tab; plus overscan */
+    CHECK(o.last.scroll.layout_rows == cfg.rows - e->tab_rows + 1u); /* visible rows = surface minus chrome, plus overscan */
     const render_grid *grid = editor_grid(e);
     CHECK(grid->region.pixels && grid->region.x == grid->scroll.cols * grid->dims.cell_w);
     CHECK(grid->region.y == grid->scroll.first_row * grid->dims.cell_h);

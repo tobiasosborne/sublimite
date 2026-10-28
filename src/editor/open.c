@@ -205,8 +205,8 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (!e->ops || !e->stage || !e->indent_bytes || !e->ws_ranges || !e->strips || !e->hits || !e->row_byte || !e->row_used ||
         !e->map_pixels || !e->map_scratch || !full || !text || !map || !full_bits || !text_bits || !map_bits) { rc = EDITOR_ERR_MEMORY; goto fail; }
     render_dims dims = {cols, rows, atlas->cell.cell_w, atlas->cell.cell_h};
-    e->tab_rows = rows > 1 ? 1u : 0u; e->map_cols = cols >= 24 ? 8u : 0u;
-    render_dims td = dims; td.cols -= e->map_cols; td.rows -= e->tab_rows;
+    e->tab_rows = rows > 2 ? 2u : rows > 1 ? 1u : 0u; e->map_cols = cols >= 24 ? 8u : 0u;
+    render_dims td = dims; td.cols -= e->map_cols + (cols > 1u ? 1u : 0u); td.rows -= e->tab_rows;
     render_dims md = {8, (td.rows * dims.cell_h + 1u) / 2u, 1, 2};
     rc = render_grid_init(&e->grid, dims, full, cells, full_bits, words); if (rc) goto fail;
     rc = render_grid_init(&e->text_grid, td, text, cells, text_bits, words); if (rc) goto fail;
@@ -221,6 +221,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         .sel_fg = config_theme_color(CONFIG_DARK, "selection.foreground"), .sel_bg = config_theme_color(CONFIG_DARK, "selection.background")};
     e->layout_cfg.glyph = editor_font_glyph; e->layout_cfg.glyph_ctx = e;
     e->find_bg = config_theme_color(CONFIG_DARK, "bracket.background");
+    editor_theme_cache(e, CONFIG_DARK);
     /* Initialize the reserved row even when the first tab wraps. Later
      * wrap-off activation must never expose uninitialized tail cells. */
     e->text_grid.dims.rows = td.rows + 1u;
@@ -231,7 +232,8 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     rc = editor_find_init(e); if (rc) goto fail;
     rc = editor_buffer_prepare(e, NULL, NULL, 0, &e->empty); if (rc) goto fail;
     e->buffer = e->empty; e->tree = e->empty->tree; e->undo = &e->empty->undo;
-    view_config vc = {4, td.rows, td.cols > 2 ? td.cols - 2 : 1, NULL, NULL}; view_init(&e->v, e->tree, &vc);
+    uint32_t text_cols = td.cols - layout_gutter_columns(&e->lay, e->empty->lines);
+    view_config vc = {4, td.rows, text_cols ? text_cols : 1u, NULL, NULL}; view_init(&e->v, e->tree, &vc);
     if (config->journal_path) {
         if (work_pool_init(&e->journal_pool, 1, 0)) { rc = EDITOR_ERR_MEMORY; goto fail; }
         e->journal_pool_ready = true;

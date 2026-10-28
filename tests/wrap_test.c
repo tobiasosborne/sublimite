@@ -180,9 +180,9 @@ static void edges(void)
     destroy(&f);
     init(&f,"\xe4\xb8\xad" "z\n",1,5,1); show(&f);
     row(&f,0,"?"); row(&f,1,"z"); CHECK(layout_approximate(&f.l)); destroy(&f);
-    init(&f,"abc def ghi\nsecond\nthird",8,8,1); f.l.cfg.gutter=true; show(&f);
-    CHECK(layout_gutter_width(&f.l)==2); CHECK(f.cells[0].glyph_index=='1');
-    CHECK(f.cells[8].atlas_slot==RENDER_NO_SLOT); /* continuation gutter is blank */
+    init(&f,"abc def ghi\nsecond\nthird",11,8,1); /* preserve six text columns after new gutter */ f.l.cfg.gutter=true; show(&f);
+    CHECK(layout_gutter_width(&f.l)==5); CHECK(f.cells[2].glyph_index=='1');
+    CHECK(f.cells[11].atlas_slot==RENDER_NO_SLOT); /* continuation gutter is blank */
     CHECK(f.l.wrap_rows[1].line==0 && f.l.wrap_rows[3].line==1);
     destroy(&f);
 }

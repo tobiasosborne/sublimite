@@ -349,14 +349,14 @@ static void test_gutter(void)
         char *s = malloc(n); memset(s, '\n', n - 1); s[n - 1] = 'z';
         fx f; fx_make(&f, 12, 3, gutter(), s, n);
         show(&f, 0, 0);
-        CHECK(layout_gutter_width(&f.l) == k + 1);
-        char buf[16]; snprintf(buf, sizeof buf, "%*u", (int)k, 1u);
+        CHECK(layout_gutter_width(&f.l) == k + 4);
+        char buf[16]; snprintf(buf, sizeof buf, "  %*u", (int)k, 1u);
         char exp[32]; snprintf(exp, sizeof exp, "%s", buf);
         char got[512]; row_str(&f, 0, 0, got);
         CHECK(strcmp(got, exp) == 0 || (k == 1 && strcmp(got, "1") == 0));
-        CHECK(cell(&f, 0, k)->bg == 0x202020 && cell(&f, 0, k)->atlas_slot == RENDER_NO_SLOT);
-        CHECK(cell(&f, 0, k - 1)->fg == 0x808080 && cell(&f, 0, k - 1)->atlas_slot == (uint32_t)('1' - 0x20));
-        CHECK(cell(&f, 0, k + 1)->bg == 0x101010);
+        CHECK(cell(&f, 0, k + 2u)->bg == 0x202020 && cell(&f, 0, k + 2u)->atlas_slot == RENDER_NO_SLOT);
+        CHECK(cell(&f, 0, k + 1u)->fg == 0x808080 && cell(&f, 0, k + 1u)->atlas_slot == (uint32_t)('1' - 0x20));
+        CHECK(cell(&f, 0, k + 4u)->bg == 0x101010);
         free(s); fx_free(&f);
     }
     /* mid-file viewport: exact line numbers, text excluded from column maths */
@@ -364,15 +364,15 @@ static void test_gutter(void)
     for (int i = 0; i < 1000; i++) n += (size_t)snprintf(s + n, 8, "%d\t\n", i % 10);
     fx f; fx_make(&f, 14, 4, gutter(), s, n);
     show(&f, piece_line_to_byte(f.t, 500), 0);
-    ROW_IS(&f, 0, 0, " 501 0");
-    ROW_IS(&f, 1, 0, " 502 1");
-    CHECK(layout_gutter_width(&f.l) == 5);
+    ROW_IS(&f, 0, 0, "   501  0");
+    ROW_IS(&f, 1, 0, "   502  1");
+    CHECK(layout_gutter_width(&f.l) == 8);
     fx_frame(&f);                                      /* caller-supplied first_line hook */
     CHECK(layout_begin(&f.l, f.t, (layout_viewport){piece_line_to_byte(f.t, 998), 998, 0, 0}) >= 0);
     run_all(&f);
-    ROW_IS(&f, 0, 0, " 999 8");
-    ROW_IS(&f, 1, 0, "1000 9");
-    ROW_IS(&f, 2, 0, "1001");                          /* final empty line after the last \n */
+    ROW_IS(&f, 0, 0, "   999  8");
+    ROW_IS(&f, 1, 0, "  1000  9");
+    ROW_IS(&f, 2, 0, "  1001");                          /* final empty line after the last \n */
     ROW_IS(&f, 3, 0, "");
     free(s); fx_free(&f);
 }
@@ -524,9 +524,9 @@ static void test_dirty(void)
     memset(s, '\n', 8); s[8] = 'x';
     fx_make(&f, 12, 4, c, s, 9);
     show(&f, 0, 0);
-    CHECK(layout_gutter_width(&f.l) == 2);
+    CHECK(layout_gutter_width(&f.l) == 5);
     edit_insert(&f, 0, "\n");
-    CHECK(f.g.full_frame && layout_gutter_width(&f.l) == 3);
+    CHECK(f.g.full_frame && layout_gutter_width(&f.l) == 6);
     check_vs_fresh(&f, c, 12, 4, 0, 0);
     free(s); fx_free(&f);
 }

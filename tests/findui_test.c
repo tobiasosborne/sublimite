@@ -413,13 +413,48 @@ static void painting_and_no_malloc(void)
     CHECK(render_grid_init(&grid, (render_dims){COLS, ROWS, 8, 16}, cells, COLS * ROWS, dirty, 1) == 0);
     grid.pages = &page; grid.page_count = 1; grid.glyphs = glyphs; grid.glyph_count = 95;
     CHECK(render_frame_begin(&grid, 1) == 0);
-    findui_style style = {0xffffff, 0x112233, 0xffcc00, 0, 0xffffff, slots, 95};
+    findui_style style = {.foreground=0xffffff, .background=0x112233, .accent=0xffcc00, .cursor_background=0xffffff, .ascii_slots=slots, .ascii_slot_count=95, .bounds={5, COLS - 1u}, .muted=0x999999, .error=0xff0000, .selected_background=0x334455, .dot_slot=RENDER_NO_SLOT};
     CHECK(findui_render(&f.panel, &grid, 2, 3, &style) == FINDUI_OK);
-    CHECK(cells[0].bg == 2 && cells[COLS].bg == 2 && cells[2 * COLS].glyph_index == 'F');
+    CHECK(cells[0].bg == 2 && cells[COLS].bg == 2 && cells[2 * COLS + style.bounds.first].glyph_index == 'a');
     CHECK(render_grid_validate(&grid) == 0 && (dirty[0] & UINT64_C(28)) == UINT64_C(28));
     bool cursor = false;
     for (size_t i = 2 * COLS; i < 3 * COLS; i++) if (cells[i].attrs & RENDER_ATTR_CURSOR) cursor = true;
     CHECK(cursor);
+    findui_geometry geometry = findui_get_geometry(&f.panel, style.bounds);
+    for (uint32_t col = 0; col < COLS; col++) {
+        findui_hit hit;
+        CHECK(findui_hit_test(&f.panel, style.bounds, 3, 0, col, &hit) == FINDUI_OK);
+        findui_hit_kind expected = FINDUI_HIT_NONE;
+        if (col >= style.bounds.first && col < geometry.field_end) expected = FINDUI_HIT_QUERY;
+        if (col >= geometry.toggles && col < geometry.toggles + 2u) expected = FINDUI_HIT_CASE;
+        if (col >= geometry.toggles + 3u && col < geometry.toggles + 5u) expected = FINDUI_HIT_WORD;
+        if (col >= geometry.toggles + 6u && col < geometry.toggles + 8u) expected = FINDUI_HIT_REGEX;
+        CHECK(hit.kind == expected);
+        CHECK(findui_hit_target(&f.panel,style.bounds,3,0,col)==expected);
+    }
+    /* (P) the fixture has two matches and selects the first one. */
+    const char count_text[] = "1 of 2";
+    for (size_t i = 0; i < sizeof count_text - 1u; i++)
+        CHECK(cells[2 * COLS + geometry.count + i].glyph_index == (uint8_t)count_text[i]);
+    query(&f, "zz");
+    /* Input still targets the last painted cells until the next frame. */
+    CHECK(findui_hit_target(&f.panel,style.bounds,3,0,geometry.toggles)==FINDUI_HIT_CASE);
+    CHECK(findui_render(&f.panel, &grid, 2, 3, &style) == FINDUI_OK);
+    geometry = findui_get_geometry(&f.panel, style.bounds);
+    const char none[] = "No results";
+    for (size_t i = 0; i < sizeof none - 1u; i++)
+        CHECK(cells[2 * COLS + geometry.count + i].glyph_index == (uint8_t)none[i]);
+    CHECK(findui_set_options(&f.panel, (findui_options){.regex=true, .whole_word=true}) == FINDUI_OK);
+    query(&f, "(");
+    CHECK(findui_render(&f.panel, &grid, 2, 3, &style) == FINDUI_OK);
+    geometry = findui_get_geometry(&f.panel, style.bounds);
+    const char invalid[] = "Invalid pattern";
+    for (size_t i = 0; i < sizeof invalid - 1u; i++) {
+        render_cell v = cells[2 * COLS + geometry.count + i];
+        CHECK(v.glyph_index == (uint8_t)invalid[i] && v.fg == style.error);
+    }
+    CHECK(cells[2 * COLS + geometry.toggles + 3u].attrs & RENDER_ATTR_UNDERLINE);
+    CHECK(cells[2 * COLS + geometry.toggles + 3u].bg == style.selected_background);
     render_cell old = cells[2 * COLS];
     CHECK(findui_render(&f.panel, &grid, 4, 2, &style) == FINDUI_ERR_ARGUMENT);
     CHECK(memcmp(&old, &cells[2 * COLS], sizeof old) == 0);
@@ -1157,7 +1192,7 @@ static uint32_t panel_toggle_column(editor *e)
     const render_grid *g = editor_grid(e);
     size_t start = (size_t)(g->dims.rows - e->panel_rows) * g->dims.cols;
     for (uint32_t c = 0; c < g->dims.cols; c++)
-        if (g->cells[start + c].glyph_index == '[') return c;
+        if (c + 1u < g->dims.cols && g->cells[start + c].glyph_index == 'A' && g->cells[start + c + 1u].glyph_index == 'a') return c;
     CHECK(false); return 0;
 }
 static void panel_focus_rows(void)
@@ -1166,9 +1201,9 @@ static void panel_focus_rows(void)
     panel_key(e, 'h', PLAT_MOD_CTRL); panel_text(e, "alpha");
     panel_key(e, XKB_KEY_Tab, 0); panel_text(e, "beta");
     uint32_t row = e->grid.dims.rows - e->panel_rows;
-    panel_click(e, row, (uint32_t)(sizeof "Find: a" - 1u));
+    panel_click(e, row, e->lay.gw + 1u);
     panel_text(e, "X"); panel_query(e, "aXlpha", sizeof "aX" - 1u);
-    panel_click(e, row + 1u, (uint32_t)(sizeof "Replace: b" - 1u));
+    panel_click(e, row + 1u, e->lay.gw + 1u);
     panel_text(e, "Y");
     findui_state state = findui_get_state(&e->find);
     CHECK(state.replacement_length == sizeof "bYeta" - 1u &&
@@ -1185,12 +1220,12 @@ static void panel_focus_rows(void)
     uint32_t toggle = panel_toggle_column(e);
     row = e->grid.dims.rows - e->panel_rows;
     edit_malloc_guard_begin();
-    panel_click(e, row, toggle);
+    panel_click(e, row, toggle + 6u); /* (P) Aa ab .* offsets */
     CHECK(findui_get_state(&e->find).options.regex != state.options.regex);
-    panel_click(e, row, toggle); /* restore, so later clicks retain the same summary width */
-    panel_click(e, row, toggle + (uint32_t)(sizeof "[  ] " - 1u));
+    panel_click(e, row, toggle + 6u); /* restore, so later clicks retain the same summary width */
+    panel_click(e, row, toggle);
     CHECK(findui_get_state(&e->find).options.match_case != state.options.match_case);
-    panel_click(e, row, toggle + (uint32_t)(sizeof "[  ] [aa] " - 1u));
+    panel_click(e, row, toggle + 3u);
     CHECK(findui_get_state(&e->find).options.whole_word != state.options.whole_word);
     CHECK(edit_malloc_guard_end() == 0); /* (P) no allocations on the input path */
     panel_query(e, "alpha", sizeof "alpha" - 1u);
