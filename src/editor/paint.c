@@ -149,7 +149,7 @@ static int compose_chrome(editor *e)
         uint32_t slots = span / 16; if (!slots) slots = 1;
         size_t first_tab = active != SIZE_MAX && active >= slots ? active - slots + 1 : 0;
         e->strip = (tabs_strip){0, left, span, 16, first_tab,
-            e->colors.chrome_fg, e->colors.chrome_bg, e->colors.tab_fg, e->colors.tab_bg, NULL, NULL};
+            e->colors.chrome_fg, e->layout_cfg.bg, e->colors.tab_fg, e->layout_cfg.bg, NULL, NULL};
         /* Decoration preparation is complete; reuse its aligned reserved
          * scratch for the final chrome. */
         if ((size_t)full * sizeof(render_cell) > EDITOR_STAGE_BYTES) return EDITOR_ERR_CAPACITY;

@@ -400,3 +400,49 @@ Requested work is complete except the explicitly permitted platform gaps:
 Wayland cursor shapes (missing vendored protocol header), Win32 leave
 (stub retained), and unverified Windows compilation (toolchain absent).
 All other brief items are implemented and checked as recorded above.
+
+## Follow-up: hover capture assertions and continuous tab surface
+
+Find diagnosis: the supplied `shots-r3b/03-find-dark.png` and
+`10-hover-find-dark.png` differ at Aa, with 834 changed RGB pixels inside
+`32x31+2896+2015`; light changes 847 pixels in the same region (M [AC],
+decoded RGB comparisons in `/tmp/r3c-supplied-pixels.log`). The reported
+top-left location does not match these files. The shot coordinates are
+correct: Aa column = 206 − 8 − 1 − 1 − 8 − 1 − length("1 of 1") = 181;
+its pixel origin is (181 × 16, (66 − 1) × 31) = (2896, 2015) (P: grid/cell
+metrics from the harness). Fresh native captures match the supplied hover
+images pixel-for-pixel. No product hover or pointer-coordinate change is needed.
+
+The actual capture gap was accepting any whole-frame change. Every hover
+scene now compares the intended element against its own settled prehover
+frame, fails on an unchanged region or comparison error, and requires a
+baseline/region. Unknown hover targets also fail. The light strip used
+`chrome.background` for inactive tabs and unused strip cells; composition
+now supplies the page background for both tab states. The chrome token and
+its remaining consumers stay intact.
+
+Red/green: `/tmp/r3c-hover-negative.log` exits 1 in both themes when a test
+copy deliberately moves to an inactive tab during the find scene: unrelated
+changes cannot satisfy Aa's assertion. `/tmp/r3c-strip-red.log` fails the
+new whole-strip cell assertion before the colour change. Release and
+ASan/UBSan native-pointer design tests then pass, as do the unchanged theme
+ladders (`/tmp/r3c-design{,-san}-green.log`, `/tmp/r3c-theme-green.log`).
+
+All 22 scenes (P: 11 × two themes) are re-rendered into
+`/tmp/claude-1000/-home-tobias-Projects-sublimite/85a23efe-08d5-4b61-b7ac-6f526f14f57f/scratchpad/shots-r3c`.
+Hover-region changed-pixel counts are tab dark/light 712/710 and find
+dark/light 834/847 (M [AC], `/tmp/r3c-shots.log`). All manifest/binary hashes
+and full-width strip background scanlines pass (`/tmp/r3c-pixels.log`).
+Full `make check` exits 0: 117 test binaries plus replay-CLI and display-lock
+contracts; 11:38:42–11:40:05 +01:00, BAT0 Not charging at both ends [AC]
+(M: 83 s = timestamp difference; runner itself reports 77.2 s).
+Log: `/tmp/r3c-check.log`. `editor_bench --track --p4-only` exits 0, with
+zero allocations in both tab-switch lanes (M [AC], `/tmp/r3c-bench.log`).
+Raster p99 is 5855864 ns against the existing 5560000 ns TRACK goal
+(M: sorted 10000-switch fixture samples, shared load stamped in the log;
+no before/after latency claim).
+
+Cost: +0 B editor storage and no extra allocations, colour lookups or per-key
+damaged pixels (P: only existing strip colour arguments change). The harness adds
+two temporary element crops and one comparison per hover scene; it adds no
+editor work or animation. No `bd` or commit was run.

@@ -162,6 +162,12 @@ static void native_hover(void)
         editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0); if (!e) { unlink(path); continue; } settle(e);
         uint64_t id; T(editor_add_buffer(e,NULL,NULL,0,&id)==0); settle(e);
         T(editor_select_tab(e,0)==0); settle(e);
+        /* One page surface through active/inactive tabs and the unused tail,
+         * in each theme. Theme token ladders remain an independent contract. */
+        bool page_strip=true;
+        for (uint32_t c=0;c<e->grid.dims.cols;c++)
+            if (e->grid.cells[(size_t)e->menu_rows*e->grid.dims.cols+c].bg!=e->layout_cfg.bg) page_strip=false;
+        T(page_strip);
         x11_plat *x=x11_private(&e->platform); T(x);
         if (x) {
             uint32_t col=e->strip.first_col+e->strip.tab_cols+1u;

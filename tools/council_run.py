@@ -31,7 +31,9 @@ RUBRIC = ROOT / "docs/design/rubric.md"
 CRITERIA = [f"C{i}" for i in range(1, 11)]
 # Scenes sent to the council: six of design_shots.sh's eight. 04-replace and
 # 05-goto repeat 03-find's minibar.
-SCENES = ["01-empty", "02-tabs", "03-find", "06-palette", "07-code", "08-large"]
+# edit-cxho.24 round 3: the hover and empty-find scenes put states (C9, C10) in front of the council.
+SCENES = ["01-empty", "02-tabs", "03-find", "06-palette", "07-code", "08-large",
+          "09-hover-tab", "10-hover-find", "11-find-empty"]
 # The control pair shows one build on both sides. It must not be the crop
 # scene: round 2 (2026-10-27) used 07-code for both, so a member saw the
 # change in the crops next to an unchanged control and reported it as noise.

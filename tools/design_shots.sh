@@ -73,6 +73,21 @@ XWD_SKIP=3179
 grab() { xwd -root -silent >"$1"; }
 topng() { convert xwd:"$1" -strip -depth 8 "$2"; }
 
+# Compare only the intended element. Cursor changes, carets and unrelated
+# damage elsewhere cannot stand in for a visible hover state.
+assert_hover() {
+    region=$(cat "$sd/hover-region")
+    convert xwd:"$sd/prehover.xwd" -crop "$region" +repage "$sd/hover-before.miff"
+    convert xwd:"$sd/final.xwd" -crop "$region" +repage "$sd/hover-after.miff"
+    if compare -metric AE "$sd/hover-before.miff" "$sd/hover-after.miff" null: 2>"$sd/hover-diff"; then
+        echo "$name-$theme: hover region $region did not change" >&2; return 1
+    else
+        status=$?
+        [ "$status" -eq 1 ] || { cat "$sd/hover-diff" >&2; return "$status"; }
+    fi
+    echo "$name-$theme: hover region $region changed $(cat "$sd/hover-diff") pixels"
+}
+
 # settle <prev-file-or-empty> <result-file>: wait until the frame differs from
 # prev (when given: the input has been consumed), then until the screen has
 # been identical for QUIET_NS. Compare dumps from byte XWD_SKIP.
@@ -130,19 +145,27 @@ run_scene() {
                 "hover tab")
                     settle "" "$sd/prehover.xwd"
                     # (P) second tab is one 16-cell slot past the text edge.
+                    printf '%sx%s+%s+0\n' $((16 * cw)) "$ch" $(((text_col - 1 + 16) * cw)) >"$sd/hover-region"
                     xdotool mousemove --window "$win" $(((text_col + 16 + 2) * cw)) $((ch / 2)) ;;
                 "hover find")
                     settle "" "$sd/prehover.xwd"
                     # (P) map 8 + outer margin 1 + panel gap 1; toggles 8,
                     # count gap 1. Aa is the first two cells of that summary.
                     aa=$((W / cw - 8 - 1 - 1 - 8 - 1 - count_cells))
+                    printf '%sx%s+%s+%s\n' $((2 * cw)) "$ch" $((aa * cw)) $(((H / ch - 1) * ch)) >"$sd/hover-region"
                     xdotool mousemove --window "$win" $((aa * cw + cw / 2)) $(((H / ch - 1) * ch + ch / 2)) ;;
-
+                "hover "*) echo "$name-$theme: unknown hover target: $line" >&2; exit 1 ;;
             esac
         done
     fi
+    case $name in
+        *-hover-*) [ -f "$sd/prehover.xwd" ] && [ -f "$sd/hover-region" ] || {
+            echo "$name-$theme: missing hover baseline or element region" >&2; return 1;
+        } ;;
+    esac
     if [ -f "$sd/prehover.xwd" ]; then
         settle "$sd/prehover.xwd" "$sd/final.xwd" || { echo "$name-$theme: hover settle failed" >&2; return 1; }
+        assert_hover || return 1
     else
         settle "" "$sd/final.xwd" || return 1
     fi
