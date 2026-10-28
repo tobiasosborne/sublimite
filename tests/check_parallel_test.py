@@ -4,12 +4,16 @@ holds the job a headless suite needs, a failing suite reports its log tail while
 Ctrl-C exits 130 with suites and private Xvfbs gone. Run from the repo root:
 python3 tests/check_parallel_test.py"""
 import importlib.util
+import contextlib
+from datetime import datetime
+import io
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
+from unittest.mock import patch
 
 root = Path.cwd()
 import tempfile
@@ -112,3 +116,82 @@ finally:
     runner.close()
 assert order == ['unknown', 'known_slow', 'known_fast'], order
 print('PASS: unknown suites first, then longest recorded duration first')
+
+# edit-edgt: a failed task is retried exactly once, after its peer finishes.
+# Cover exit status at main(), original/rerun logs, and the persistent audit.
+for permanent in (False, True):
+    case = work / ('permanent' if permanent else 'flaky')
+    case.mkdir()
+    attempts = case / 'attempts'
+    initial_done = case / 'initial-done'
+    peer_done = case / 'peer-done'
+    suspect = helper(case.name + '_suspect', f'''attempts = Path({str(attempts)!r})
+count = int(attempts.read_text()) if attempts.exists() else 0
+attempts.write_text(str(count + 1))
+if count == 0:
+    print('setup noise before the assertion', flush=True)
+    print('test: FAIL first failure sentinel', flush=True)
+    Path({str(initial_done)!r}).touch()
+    raise SystemExit(7)
+assert Path({str(peer_done)!r}).exists(), 'rerun overlapped a parallel peer'
+print('rerun failure sentinel' if {permanent!r} else 'isolated pass sentinel', flush=True)
+raise SystemExit(7 if {permanent!r} else 0)
+''')
+    peer = helper(case.name + '_peer', f'''stop = time.monotonic() + {m.STARTUP_SECONDS}
+while not Path({str(initial_done)!r}).exists():
+    assert time.monotonic() < stop
+    time.sleep(0.01)
+Path({str(peer_done)!r}).touch()
+''')
+    m.LOGS = case / 'logs'
+    m.TIMES = case / 'times.txt'
+    output = io.StringIO()
+    with patch.object(sys, 'argv', ['check_parallel.py', suspect, peer]), \
+            patch.dict(os.environ, CHECK_JOBS='2', CHECK_DISPLAYS='1'), \
+            contextlib.redirect_stdout(output):
+        rc = m.main()
+    assert attempts.read_text() == '2', output.getvalue()
+    assert rc == int(permanent), output.getvalue()
+    name = Path(suspect).name
+    assert 'test: FAIL first failure sentinel' in (m.LOGS / (name + '.log')).read_text()
+    rerun = (m.LOGS / (name + '.rerun.log')).read_text()
+    assert ('rerun failure sentinel' if permanent else 'isolated pass sentinel') in rerun
+    flaky_log = m.LOGS.parent / 'check-flaky.log'
+    if permanent:
+        assert 'check: FLAKY' not in output.getvalue()
+        assert not flaky_log.exists()
+    else:
+        assert f'check: FLAKY {name} (failed in parallel, passed alone; see {m.LOGS / (name + ".log")} and {flaky_log})' in output.getvalue()
+        audit = flaky_log.read_text()
+        assert name in audit and 'test: FAIL first failure sentinel' in audit
+        assert datetime.now().astimezone().date().isoformat() in audit
+        assert 'setup noise' not in audit
+print('PASS: isolated rerun recovers flakes, preserves both logs/audit; repeated failure stays red')
+
+# A flaky part must not clear a sibling's permanent failure in the same binary.
+case = work / 'split'
+case.mkdir()
+split = helper('split_suite', f'''import sys
+selector = sys.argv[1]
+attempts = Path({str(case)!r}) / selector
+count = int(attempts.read_text()) if attempts.exists() else 0
+attempts.write_text(str(count + 1))
+print('FAIL split sentinel' if count == 0 or selector == '--hard' else 'PASS split rerun')
+raise SystemExit(7 if count == 0 or selector == '--hard' else 0)
+''')
+m.LOGS = case / 'logs'
+m.TIMES = case / 'times.txt'
+output = io.StringIO()
+with patch.object(sys, 'argv', ['check_parallel.py', split]), \
+        patch.dict(os.environ, CHECK_JOBS='2', CHECK_DISPLAYS='1'), \
+        patch.dict(m.PARTS, split_suite=('--hard', '--flaky')), \
+        contextlib.redirect_stdout(output):
+    assert m.main() == 1
+assert (case / '--flaky').read_text() == (case / '--hard').read_text() == '2'
+assert 'check: FLAKY split_suite.flaky ' in output.getvalue()
+assert 'check: FLAKY split_suite.hard ' not in output.getvalue()
+for part in ('flaky', 'hard'):
+    assert (m.LOGS / f'split_suite.{part}.log').exists()
+    assert (m.LOGS / f'split_suite.{part}.rerun.log').exists()
+assert '== split_suite.flaky' in (m.LOGS / 'split_suite.log').read_text()
+print('PASS: split tasks retry individually and preserve a sibling permanent failure')

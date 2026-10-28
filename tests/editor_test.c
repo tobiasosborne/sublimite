@@ -58,16 +58,27 @@ static plat_event key(uint32_t sym, uint16_t mods, const char *text)
     if (text) { size_t n = strlen(text); EDIT_ASSERT(n <= PLAT_UTF8_MAX); ev.utf8_len = (uint8_t)n; memcpy(ev.utf8, text, n); }
     return ev;
 }
-static int settle(editor *e)
+/* (G) Existing settle deadline: five seconds, unchanged. All waits added by
+ * edit-edgt reuse it; a step's slice limit is not a completion deadline. */
+#define SETTLE_NS UINT64_C(5000000000)
+static int settle_frame(editor *e, bool glyphs)
 {
-    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    uint64_t deadline = trace_now_ns() + SETTLE_NS;
     do {
         int rc = editor_step(e, 20); T(rc == EDITOR_OK || rc == EDITOR_MORE);
         editor_stats s = editor_get_stats(e);
-        if (!s.pending && !s.render_active) return 0;
+        if (!s.pending && !s.render_active && (!glyphs || !font_async_pending(e->fonts))) return 0;
     } while (trace_now_ns() < deadline);
+    fprintf(stderr, "settle timeout: queue=%zu action=%d dirty=%d layout=%d op_count=%zu journal_waiting=%d journal_pending=%zu font=%d map=%d full=%d render=%d\n",
+        e->queue_count, e->action, e->dirty, layout_busy(&e->lay), e->op_count, e->journal_waiting,
+        e->journal ? journal_get_stats(e->journal).pending_bytes : 0u, font_async_pending(e->fonts),
+        e->buffer->map_snapshot != NULL, e->full_pending, e->backend->active);
     T(false); return 1;
 }
+static int settle(editor *e) { return settle_frame(e, false); }
+/* pending covers input/frame work; a cold glyph's pixels arrive separately.
+ * Chrome invariants need its adoption and repaint before measuring damage. */
+static int settle_glyphs(editor *e) { return settle_frame(e, true); }
 static int press(editor *e, plat_event ev)
 {
     T(editor_inject(e, &ev) == EDITOR_OK); return settle(e);
@@ -321,7 +332,7 @@ static int minimap_typing_flash(void)
  * its frame (existing settle bound) before reading pixels. */
 static int settle_map(editor *e)
 {
-    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
+    uint64_t deadline = trace_now_ns() + SETTLE_NS;
     for (;;) {
         /* editor_map_service's own test: a job is in flight, or one is due,
          * including a windowed refresh after a scroll (edit-cxho.10). */
@@ -1849,7 +1860,7 @@ static int raster_blink_damage(void)
             T(settle(e) == 0);
         }
         plat_event focus = {.kind = PLAT_EV_FOCUS, .focused = false};
-        T(editor_inject(e, &focus) == 0); T(editor_step(e, 0) >= 0);
+        T(editor_inject(e, &focus) == 0); T(settle(e) == 0);
         raster_metrics m; T(raster_frame_metrics(&b, &m));
         T(m.jobs == 0 && m.completion_jobs == 0);
         T(!editor_get_stats(e).blinking && !editor_get_stats(e).pending);
@@ -2355,9 +2366,15 @@ static int review_replay_slices(void)
     editor_config cfg = {.cols = 40, .rows = 4, .history_keys = 8192, .journal_path = journal_path}; editor *e = NULL;
     T(editor_open(&e, &cfg, &backend) == 0); T(settle(e) == 0);
     for (unsigned batch = 0; batch < 4; batch++) {
-        for (unsigned i = 0; i < 1024; i++) T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY,
-            .press = true, .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1, .t0_ns = 1}) == 0);
-        T(settle(e) == 0);
+        /* This case tests replay of the entire multi-record group, not a
+         * throughput deadline for draining a queued batch. Give each input
+         * the existing settle deadline; the fixed ingress time preserves the
+         * same 4 * 1024 records in one undo burst, independent of scheduling. */
+        for (unsigned i = 0; i < 1024; i++) {
+            T(editor_inject(e, &(plat_event){.kind = PLAT_EV_KEY,
+                .press = true, .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1, .t0_ns = 1}) == 0);
+            T(settle(e) == 0);
+        }
     }
     uint64_t other; T(editor_add_buffer(e, NULL, (const uint8_t *)"other", 5, &other) == 0);
     T(settle(e) == 0); T(editor_select_tab(e, 0) == 0); T(settle(e) == 0);
@@ -2640,7 +2657,13 @@ typedef struct review_chrome { editor *e; bool checking, damaged; } review_chrom
 static void review_chrome_submit(void *ctx, const editor_frame *frame)
 {
     review_chrome *probe = ctx; (void)frame;
-    if (probe->checking && (probe->e->grid.full_frame || (probe->e->grid.dirty[0] & 1u))) probe->damaged = true;
+    if (probe->checking && (probe->e->grid.full_frame || (probe->e->grid.dirty[0] & 1u))) {
+        probe->damaged = true;
+        editor *e = probe->e;
+        fprintf(stderr, "chrome damage: full=%d glyph=%d fonts=%d map=%d index=%d origin=%lld mutations=%llu\n",
+            e->grid.full_frame, e->glyph_only, font_async_pending(e->fonts), e->buffer->map_snapshot != NULL,
+            editor_index_complete(e), (long long)e->scroll_plan.origin_y_q8, (unsigned long long)e->stats.mutations);
+    }
 }
 static int review_chrome_damage(void)
 {
@@ -2649,9 +2672,12 @@ static int review_chrome_damage(void)
     editor_config cfg = {.initial = (const uint8_t *)"abc", .initial_len = 3, .cols = 40, .rows = 4,
         .hook_ctx = &probe, .on_submit = review_chrome_submit}; editor *e = NULL;
     T(editor_open(&e, &cfg, &backend) == 0); probe.e = e; T(settle(e) == 0);
-    T(editor_set_cursor(e, 2) == 0); T(settle(e) == 0);
+    T(editor_set_cursor(e, 2) == 0); T(settle_glyphs(e) == 0);
     probe.checking = true; T(press(e, key(XKB_KEY_Left, 0, NULL)) == 0); T(!probe.damaged);
     probe.checking = false; T(press(e, key('x', 0, "x")) == 0);
+    /* The first mutation adds U+2022 to the tab. Its deferred image must
+     * finish before the next key's unchanged-chrome observation starts. */
+    T(settle_glyphs(e) == 0);
     probe.checking = true; probe.damaged = false;
     T(press(e, key('y', 0, "y")) == 0); T(!probe.damaged);
     /* Recomposition of identical final chrome, including its stale marker. */
@@ -7599,6 +7625,9 @@ static int parked_pointer_order(void)
 }
 
 static const test_selector selectors[] = {
+    {"--edgt-blink", raster_blink_damage},
+    {"--edgt-chrome", review_chrome_damage},
+    {"--edgt-replay", review_replay_slices},
     {"--cxho7-open-motion", parked_open_motion},
     {"--cxho7-open-wheel", parked_open_wheel},
     {"--cxho7-open-key", parked_open_key},

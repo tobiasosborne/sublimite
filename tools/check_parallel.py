@@ -4,11 +4,13 @@
 import argparse
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 import fcntl
 import itertools
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -38,6 +40,10 @@ class Task:
     @property
     def log(self):
         return LOGS / (self.name + ".log")
+
+    @property
+    def rerun_log(self):
+        return LOGS / (self.name + ".rerun.log")
 
 
 class Interrupted(Exception):
@@ -95,6 +101,18 @@ def tail(path):
         return "\n".join(output.read().decode(errors="replace").splitlines()[-24:])
 
 
+def first_failure(path):
+    first = '(empty log)'
+    with path.open(errors='replace') as output:
+        for line in output:
+            line = line.strip()
+            if first == '(empty log)' and line:
+                first = line
+            if re.search(r'FAIL|ERROR|[Aa]ssertion.*failed|AssertionError|[Cc]heck failed|runtime error:|[Ss]egmentation fault', line):
+                return line
+    return first
+
+
 def signal_group(process, signum):
     try:
         os.killpg(process.pid, signum)
@@ -110,6 +128,8 @@ class Runner:
         self.locks = []
         self.available = deque()
         self.active = {}
+        self.rerunning = False
+        self.failed_tasks = []
         self.environment = dict(os.environ, EDIT_REFUSE_REAL_DISPLAY="1")
         # Match SAFE_DISPLAY for direct invocations as well as make callers.
         display = self.environment.get("DISPLAY", "")
@@ -170,7 +190,7 @@ class Runner:
             descriptors = (fd,)
             command = ["sh", "tools/with_display_lock.sh"] + command
         started = time.monotonic()
-        with task.log.open("wb") as output:
+        with self.log_path(task).open("wb") as output:
             try:
                 process = subprocess.Popen(command, env=env, stdout=output,
                                            stderr=subprocess.STDOUT, pass_fds=descriptors,
@@ -183,15 +203,21 @@ class Runner:
         self.active[process] = (task, started, lease)
         return True
 
+    def log_path(self, task):
+        return task.rerun_log if self.rerunning else task.log
+
     def run(self, tasks, durations):
         # Unknown suites precede every known suite, then longest first.
         pending = sorted(tasks, key=lambda t: (t.name in durations,
                                                -durations.get(t.name, 0)))
         failed = set()
+        self.failed_tasks = []
 
         def failure(task, rc):
             failed.add(task.binary)
-            print(f"FAIL {task.name}: exit {rc} ({task.log})\n{tail(task.log)}", flush=True)
+            self.failed_tasks.append(task)
+            log = self.log_path(task)
+            print(f"FAIL {task.name}: exit {rc} ({log})\n{tail(log)}", flush=True)
 
         while pending or self.active:
             raise_if_interrupted()
@@ -224,6 +250,29 @@ class Runner:
                     failure(task, rc)
             if self.active:
                 time.sleep(POLL_SECONDS)
+        return failed
+
+    def rerun_failed(self):
+        # The parallel phase has drained completely. Keep its durations for
+        # scheduling and its logs for diagnosis; retry each failed task alone.
+        tasks = self.failed_tasks[:]
+        failed = set()
+        self.rerunning = True
+        try:
+            for task in tasks:
+                raise_if_interrupted()
+                print(f'check: rerunning {task.name} alone ({task.rerun_log})', flush=True)
+                if self.run([task], {}):
+                    failed.add(task.binary)
+                    continue
+                flaky_log = LOGS.parent / 'check-flaky.log'
+                with flaky_log.open('a') as output:
+                    output.write(f'{datetime.now().astimezone().isoformat()} {task.name}: '
+                                 f'{first_failure(task.log)}\n')
+                print(f'check: FLAKY {task.name} (failed in parallel, passed alone; '
+                      f'see {task.log} and {flaky_log})', flush=True)
+        finally:
+            self.rerunning = False
         return failed
 
     def close(self):
@@ -277,6 +326,8 @@ def main():
         print(f"check: running {len(args.suites)} test binaries "
               f"({len(tasks)} tasks, {jobs} jobs, {runner.display_count} displays)", flush=True)
         failed = runner.run(tasks, durations)
+        if failed:
+            failed = runner.rerun_failed()
         raise_if_interrupted()
         # Preserve a per-binary log as well as the individual part logs.
         for binary in args.suites:

@@ -193,7 +193,14 @@ static int cancellation(void)
     size_t cell_bytes = (size_t)e->text_grid.dims.cols * e->text_grid.dims.rows * sizeof(render_cell);
     memcpy(cells, e->text_grid.cells, cell_bytes);
     submitted_frames = backend.stats.submitted_frames;
-    CHECK(editor_full_layout(e) == 0 && editor_step(e, 0) >= 0);
+    CHECK(editor_full_layout(e) == 0);
+    /* Full layout and decoration preparation may span turns. The parked
+     * resident must remain closing through submission; do not settle(),
+     * which would also wait for the worker this fixture deliberately holds.
+     * Reuse this file's existing retry bound, with the same final checks. */
+    for (unsigned retry = 0; retry < PROBE_RETRIES && backend.stats.submitted_frames == submitted_frames; retry++) {
+        CHECK(editor_step(e, 0) >= 0); sched_yield();
+    }
     CHECK(backend.stats.submitted_frames > submitted_frames && b->scroll_resident.closing);
     CHECK(memcmp(cells, e->text_grid.cells, cell_bytes) == 0);
     atomic_store(&hold.release, true);
