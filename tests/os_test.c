@@ -1332,8 +1332,12 @@ static void case_fault(void)
         ic[i] = (install_ctx){&start, &im[i], -1, OS_E_IO, OS_E_IO, false, false, 0, 0};
         OK(os_thread_start(&it[i], install_body, &ic[i]));
     }
+    /* edit-nafu: join every installer before retiring any slot. Retiring
+     * slot 0 while installer 3 still sits between the barrier and its
+     * registration lets it legally reuse slot 0, which the uniqueness check
+     * below then reports as a duplicate (seen under parallel make check). */
+    for (int i = 0; i < INSTALLERS; i++) OK(os_thread_join(&it[i]));
     for (int i = 0; i < INSTALLERS; i++) {
-        OK(os_thread_join(&it[i]));
         CHECK(ic[i].reg == OS_OK && ic[i].trig == OS_OK);
         CHECK(ic[i].e1 == ic[i].e0 + 1);
         CHECK(ic[i].prefix && ic[i].zero);

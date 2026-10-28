@@ -15,6 +15,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The null backend keeps the original law-2 workload. Native drivers may
+ * parameterize only this paced typing loop, including its completion checks. */
+#ifndef RENDER_TEST_TYPING_FRAMES
+#define RENDER_TEST_TYPING_FRAMES 10000u /* (G) original counting-allocator workload */
+#endif
+
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "render_test:%d: FAIL %s\n", __LINE__, #c); return 1; } } while (0)
 
 typedef struct fixture {
@@ -327,10 +333,12 @@ static int backend_test(void)
     CHECK(render_mark_full(&f.g) == RENDER_OK);
     CHECK(render_backend_submit(&b, &f.g, &full, 1) == RENDER_OK);
     CHECK(finish_frame(&b, 4) == 0);
-    /* 10k typing edits including begin/fill/damage/submit/present/events. */
+    /* Typing edits including begin/fill/damage/submit/present/events.
+     * (P) IDs start at five after the four setup frames above. */
+    const uint32_t typing_frames = RENDER_TEST_TYPING_FRAMES;
     edit_malloc_guard_begin();
     int failed = 0;
-    for (uint32_t id = 5; id < 10005; id++) {
+    for (uint32_t id = 5; id < 5u + typing_frames; id++) {
         render_strip strips[3]; size_t count = 0;
         if (render_frame_begin(&f.g, id) != RENDER_OK) { failed = 1; break; }
         f.cells[8].bg = id;
@@ -341,9 +349,11 @@ static int backend_test(void)
     }
     size_t allocations = edit_malloc_guard_end();
     CHECK(!failed);
-    if (edit_malloc_guard_active()) { CHECK(allocations == 0); printf("render no-malloc: 10000 frames, %zu allocations\n", allocations); }
+    CHECK(allocations == 0);
+    if (edit_malloc_guard_active()) { printf("render no-malloc: %u frames, %zu allocations\n", typing_frames, allocations); }
     else printf("render no-malloc: ASan guard inactive; release run required\n");
-    CHECK(d.t5_count == 10004 && d.t6_count == 10004 && d.t5_id == 10004 && d.t6_id == 10004);
+    CHECK(d.t5_count == typing_frames + 4u && d.t6_count == typing_frames + 4u &&
+          d.t5_id == typing_frames + 4u && d.t6_id == typing_frames + 4u);
     CHECK(shutdown_on_ui(&b) == 0);
     CHECK(shutdown_on_ui(&b) == 0);
     CHECK(render_backend_submit(&b, &f.g, &row, 1) == RENDER_ERR_STATE);

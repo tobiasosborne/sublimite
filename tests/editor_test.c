@@ -7736,21 +7736,12 @@ static const test_selector selectors[] = {
     {"--require-gl", select_require_gl},
 };
 
-int main(int argc, char **argv)
+/* Consecutive slices of the original main, in its original order.
+ * (M)[AC] edit-nafu input: journal ticks ~56 s; backend idle checks
+ * ~2 x 10 s; final allocations ~3 x 5.5 s plus idle ~10 s.
+ * Isolating those waits keeps each slice near the requested ~60 s (E). */
+static int editor_part_1(void)
 {
-    trace_init(); T(trace_thread_register() >= 0);
-    /* (P) Executable plus its selector: argc is two; argv skips the executable. */
-    bool headless = argc == 2 && !strcmp(argv[1], "--headless");
-    if (argc == 2) {
-        test_select_fn selected = TEST_SELECT(selectors, argv[1]);
-        if (selected) return selected();
-        if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return o20_case(argv[1] + sizeof "--o20-" - 1u);
-        if (!headless) return 2;
-    }
-    const char *allocation = getenv("EDITOR_ALLOC_ONLY");
-    if (allocation) return allocation_test(!strcmp(allocation, "raster"));
-    const char *only = getenv("EDITOR_REVIEW_ONLY");
-    if (only) return review_suite(only);
     T(parked_open_motion() == 0); T(parked_open_wheel() == 0); T(parked_open_key() == 0);
     T(parked_replace_motion() == 0); T(parked_replace_wheel() == 0); T(parked_replace_key() == 0);
     T(parked_tab_commands() == 0);
@@ -7776,7 +7767,15 @@ int main(int argc, char **argv)
     T(find_focus_contract() == 0);
     T(n95_find_in_files() == 0);
     T(n3f2k_save_with_results() == 0);
+    return 0;
+}
+static int editor_part_2(void)
+{
     T(n6090_typing_top() == 0);
+    return 0;
+}
+static int editor_part_3(void)
+{
     T(vp4m_return_bottom() == 0);
     T(cxho25_typing_jump() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
@@ -7813,6 +7812,10 @@ int main(int argc, char **argv)
     T(close_prompt_contract() == 0); T(close_evict_contract() == 0); T(close_review_contract() == 0);
     T(ck4_credit() == 0); T(ck4_metadata_test() == 0); T(ck4_target() == 0); T(ck4_fifo() == 0);
     T(ck4_recovery(1) == 0); T(ck4_recovery(2) == 0); T(ck4_recovery(3) == 0); T(ck4_recovery(4) == 0);
+    return 0;
+}
+static int editor_part_4(bool headless)
+{
     T(review_suite(headless ? "headless" : NULL) == 0);
     T(index_capacity_typing() == 0); T(index_capacity_refusal() == 0); T(index_eventual_repair() == 0);
     T(partial_line_start() == 0);
@@ -7824,6 +7827,10 @@ int main(int argc, char **argv)
         if (name) T(selected_backend_test(name, false) == 0);
         else { T(selected_backend_test("gl", false) == 0); T(selected_backend_test("raster", false) == 0); }
     }
+    return 0;
+}
+static int editor_part_5(bool headless)
+{
     T(scrolled_undo() == 0);
     T(stopped_error() == 0);
     T(script(false) == 0); T(allocation_test(false) == 0); T(allocation_case(false,true) == 0);
@@ -7834,5 +7841,44 @@ int main(int argc, char **argv)
     T(idle_policy() == 0);
     T(queue_depth() == 0);
     if (!headless) T(native_input() == 0);
+    return 0;
+}
+static int editor_part(unsigned part, bool headless)
+{
+    switch (part) {
+    case 1: return editor_part_1();
+    case 2: return editor_part_2();
+    case 3: return editor_part_3();
+    case 4: return editor_part_4(headless);
+    case 5: return editor_part_5(headless);
+    default: return 2;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    trace_init(); T(trace_thread_register() >= 0);
+    /* (P) Executable plus its selector: argc is two; argv skips the executable. */
+    bool headless = argc == 2 && !strcmp(argv[1], "--headless");
+    if (argc == 2) {
+        /* (P) Five explicit selectors correspond to the five slices above. */
+        const char *part_names[] = {"--part-1", "--part-2", "--part-3", "--part-4", "--part-5"};
+        for (unsigned i = 0; i < sizeof part_names / sizeof part_names[0]; i++) {
+            if (!strcmp(argv[1], part_names[i])) {
+                T(editor_part(i + 1u, false) == 0);
+                printf("editor_test: part %u passed\n", i + 1u);
+                return 0;
+            }
+        }
+        test_select_fn selected = TEST_SELECT(selectors, argv[1]);
+        if (selected) return selected();
+        if (!strncmp(argv[1], "--o20-", sizeof "--o20-" - 1u)) return o20_case(argv[1] + sizeof "--o20-" - 1u);
+        if (!headless) return 2;
+    }
+    const char *allocation = getenv("EDITOR_ALLOC_ONLY");
+    if (allocation) return allocation_test(!strcmp(allocation, "raster"));
+    const char *only = getenv("EDITOR_REVIEW_ONLY");
+    if (only) return review_suite(only);
+    for (unsigned part = 1; part <= 5; part++) T(editor_part(part, headless) == 0);
     puts(headless ? "editor_test: headless passed" : "editor_test: all passed"); return 0;
 }

@@ -41,7 +41,20 @@ xcb_void_cookie_t xcb_shm_put_image(xcb_connection_t *conn, xcb_drawable_t drawa
                         dx, dy, depth, format, send, seg, offset);
 }
 
-/* Driver-local state; no backend or frozen-suite changes. */
+static uint32_t raster_typing_frames(void)
+{
+    /* (G) Keep the original 10,000-frame law-2 workload when its malloc
+     * guard is live. With an inert guard (ASan), this proves Present instead:
+     * (P) 1,000 x (1 / 60 Hz) = 16.7 s, about 17 s on Xvfb.
+     * src/raster/raster.c cpu_state has ONE retained pixmap and ONE SHM
+     * buffer, reused only after fence/PresentComplete/Idle retirement.
+     * Thus 1,000 frames cycle that one-slot ring 1,000 times; every frame
+     * still asserts T5/T6 identity, ordering and completion. */
+    return edit_malloc_guard_active() ? 10000u : 1000u;
+}
+#define RENDER_TEST_TYPING_FRAMES raster_typing_frames()
+
+/* Driver-local allocation windows around the conformance loop. */
 typedef struct allocation_scope {
     bool enabled, window;
     size_t allocations, frames;
@@ -72,7 +85,7 @@ static size_t scoped_guard_end(void)
     printf("raster law2: windows=%zu allocations=%zu guard=%d scope=input->submit\n",
         scope->frames, scope->allocations, edit_malloc_guard_active());
     /* A truncated loop must fail even if no allocation was observed. */
-    return scope->allocations + (scope->frames != 10000 ? 1u : 0u);
+    return scope->allocations + (scope->frames != raster_typing_frames() ? 1u : 0u);
 }
 static int scoped_frame_begin(render_grid *g, uint32_t id)
 {

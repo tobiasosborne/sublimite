@@ -1,6 +1,10 @@
 # GNU Makefile. TARGET=win hands over to mk/win.mk (Windows cross build, edit-177r.1).
 # Globs everything: drop files in src/<m>/, tests/<m>_test.c,
 # bench/<m>_bench.c, fuzz/<m>_fuzz.c, tools/<name>.c. Vendored runtimes are explicit.
+# Independent objects use the available CPUs; an explicit make -j still wins.
+ifeq ($(filter -j%,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(shell nproc)
+endif
 ifeq ($(TARGET),win)
 include mk/win.mk
 else
@@ -154,7 +158,7 @@ $(B)/tests/file_acquire_test $(B)/san/tests/file_acquire_test: LDLIBS += -Wl,--w
 # Linux-only oracle; production keys/config have no libxkbcommon dependency.
 $(B)/tests/keys_test $(B)/san/tests/keys_test: LDLIBS += -lxkbcommon
 
-.PHONY: all lib install uninstall check check-sh bench bench-zygote fuzz clean
+.PHONY: all lib install uninstall check check-serial check-sh bench bench-zygote fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)
 lib: $(REL_LIB)
@@ -242,7 +246,18 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(FUZZ_LIB)
 
 # ---- phony drivers ----
 # Test binaries are built in sanitizer config under build/san/tests/.
+# Explicit suite overrides retain the shared-display entry lock. In particular,
+# the unchanged display-lock contract probes make with TEST_SAN on its argv.
+CHECK_RUNNER = python3 tools/check_parallel.py
+ifeq ($(origin TEST_SAN),command line)
+CHECK_RUNNER = sh tools/with_display_lock.sh python3 tools/check_parallel.py
+endif
 check: $(TEST_SAN) $(B)/tools/replay
+	@$(SAFE_DISPLAY); DISPLAY=$$d $(CHECK_RUNNER) --display $(DISPLAY_TEST_SAN) -- $(TEST_SAN)
+	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
+	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
+
+check-serial: $(TEST_SAN) $(B)/tools/replay
 	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; case " $(DISPLAY_TEST_SAN) " in *" $$t "*) DISPLAY=$$d sh tools/with_display_lock.sh $$t;; *) DISPLAY=$$d $$t;; esac; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
 	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
