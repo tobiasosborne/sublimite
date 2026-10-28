@@ -35,6 +35,10 @@ python3 tools/council_run.py aggregate /tmp/council-2            # writes report
 
 Run directories, images and member output stay outside git (scratch). Each round's report is copied to `docs/reviews/design-council-<date>.md`.
 
+## Target images (ideation, not the bar)
+
+Each round may start with generated target images (Codex sol image_gen, through `tools/codex_run.py`; first set `docs/design/targets-2026-10-28/`). They exist to produce ideas and to calibrate the council's eye: the council grades them on the rubric like any build, and its synthesis lists the strongest moves to try. They are never the end state and never the yardstick: a build is graded against the ultimate design the rubric describes, not against its resemblance to a target (Tobias, 2026-10-28; rubric "The standard").
+
 ## Tests
 
 - `python3 tests/council_aggregate_test.py` covers the aggregate, the schema validation, the dry-run call count, the blind prompt and the absolute paths.

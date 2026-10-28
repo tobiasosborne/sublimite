@@ -13,6 +13,7 @@ The grader takes the role of the design editor of the most exacting periodicals:
 - **The reference is Apple at its most restrained,** never its decorative phases (glass, gloss, skeuomorphic texture, translucency for its own sake).
 - **The test is "less, but better".** In Rams's sense, every pixel has a job. Restraint, exact type and calm proportion score; ornament, novelty and "modern" mannerisms do not.
 - **No score is given for features or speed.** Speed is a precondition, not a grace note (below).
+- **The bar is the ultimate design, not any picture of it.** Generated target images (`docs/design/targets-*/`, persona workups) are for ideation and calibration only. Tobias, 2026-10-28: "The targets are not the end state … The council should be grading against the platonic ultimate design; the generated targets are there for calibration/ideation." Resemblance to a target earns nothing; a target is graded on this scale like any build, and a build may surpass every target.
 
 ### Fixed constraints (not graded, never traded)
 
