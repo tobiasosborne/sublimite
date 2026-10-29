@@ -236,3 +236,132 @@ Manual check (fresh private copy of the real journal, final binary, :97):
 
 Background work: none left running. The one leftover log monitor (a
 `tail -f` on the check log) was stopped.
+
+## Round 2 (Codex review docs/reviews/edit-zizz.md, on top of 75ee874)
+
+### 1. BLOCKER: comparison race could drop unsaved text and delete the source
+
+Fixes in `src/editor/recovery.c`:
+- **Set aside instead of delete.** A partial restore that dropped any buffer
+  (`session.partial && session.dropped`, no conflicts, no failure) now sets its
+  source aside with `editor_set_aside`. It is never unlinked.
+  - restore_source returns before the retained-copy unlink loop, so retained
+    BASE copies stay.
+  - `journal_retire_directory` already scans set-aside sessions for BASE
+    references and pins them (retire.c inventory: `a->aside`).
+  - Notice suffix: "; the old session journal was set aside". It is not
+    repeated when the conflict text already says the journal was set aside.
+- **Revalidated comparison.** `disk_equals` now fstats after the read and
+  stats the name. Identity, kind, size, mtime and ctime must all equal the
+  pre-read fstat, otherwise the buffer ranks as unsaved.
+- Sessions that fit, and partial restores that dropped nothing, are retired as
+  before.
+
+Deterministic tests in `tests/editor_recovery_test.c`:
+- Seam: the file includes recovery.c (as the edit-fi0p F7 cases do), with
+  macro hooks on `journal_replay_file`, `os_file_pread` and
+  `editor_checkpoint`.
+- Fixture: c0, c1 and m with "M" typed (unsaved "Mm"), relaunched at 2 live /
+  1 closed.
+- `zz_race(false)`: m is rewritten to "Mm" after replay, so the comparison is
+  honestly equal. It is reverted to "m" at the checkpoint, before retirement.
+  Assert: the set-aside source replays m as "Mm".
+- `zz_race(true)`: the same, but the revert happens right after the comparison
+  read, before revalidation. Assert: m is restored as a modified "Mm" tab, and
+  the source is set aside.
+
+Red (pre-round-2 recovery.c, exit 1): m's text is gone, no restored tab and no
+source:
+```
+editor_recovery_test: zizz race before-retire: tabs=2 live_Mm=0 source=0 aside=0 aside_m=(none) notice=1 unmodified tab from the last session was not reopened
+editor_recovery_test: zizz race during: tabs=2 live_Mm=0 source=0 aside=0 aside_m=(none) notice=1 unmodified tab from the last session was not reopened
+```
+
+Green (exit 0):
+```
+editor_recovery_test: zizz race before-retire: tabs=2 live_Mm=0 source=0 aside=1 aside_m=Mm notice=1 unmodified tab from the last session was not reopened; the old session journal was set aside
+editor_recovery_test: zizz race during: tabs=2 live_Mm=1 source=0 aside=1 aside_m=Mm notice=restored 1 unsaved tab; 1 unmodified tab from the last session was not reopened; the old session journal was set aside
+```
+
+### 2. MINOR: rewritten retained-copy notice replaced the partial notice
+
+The rewritten loop now appends to `session_notice` when a partial notice is
+showing. `session_notice` is resized for the recovered and kept suffixes
+together (derivation in private.h).
+
+Test `zizz_rewritten` (editor_session_test):
+- Setup: the child waits for m's edit-fi2 copy to be READY and used, so the
+  checkpoint BASE is the copy. m is then rewritten in place before the
+  relaunch at 6 / 1.
+- Red: `zizz rewritten: tabs=6 notice=file changed on disk since this session; its unsaved edits were recovered`.
+- Green: `zizz rewritten: tabs=6 notice=restored 4 unsaved tabs; 5 unmodified tabs from the last session were not reopened; file changed on disk since this session; its unsaved edits were recovered; the old session journal was set aside`.
+- All bytes are verified too (m restored as "Mm", modified).
+
+### 3. MINOR: relaunch checks only counted tabs
+
+Changes to `zizz_partial(false/true)`:
+- The partial restore runs in a child that `_exit`s right after `editor_open`
+  returns: no settle and no clean close, so a crash right after the
+  replacement checkpoint and the set-aside.
+- The parent relaunches and verifies, with `zizz_bytes_live` /
+  `zizz_bytes_closed`, every tab's complete bytes and modified state. That
+  covers all four unsaved buffers, live and closed (closed via
+  `tabs_closed_at`), plus the clean c0 and c1.
+- It also verifies no notice, no deferral, and one session journal.
+- The first launch now also asserts that the set-aside source exists and holds
+  the closed untitled buffer's text.
+
+The red run fails the updated cases (old notice, source deleted):
+```
+editor_session_test:2789: FAIL e->recovery_notice && !strcmp(e->recovery_notice, "restored 4 unsaved tabs; 5 unmodified tabs from the last session were not reopened; the old session journal was set aside")
+editor_session_test:2807: FAIL ... "the old session journal was set aside")
+```
+
+Green (`--edit-zizz`, exit 0):
+```
+zizz: unsaved buffers and clean tabs that fit restored in tab order; source set aside; crash relaunch keeps every byte
+zizz: unsaved buffers beyond live room restored as closed tabs; clean tabs dropped; source set aside; crash relaunch keeps every byte
+zizz: more unsaved buffers than capacity keeps the source whole; a launch with room restores all
+zizz: changed-on-disk tabs rank as unmodified; the source is set aside whole
+zizz: clean tabs whose files vanished are not reopened and are counted
+zizz: a rewritten retained-copy target appends its notice to the partial restore's
+```
+
+Not added: the review's further list (checkpoint BUSY and failure on the
+partial path, interrupted saves, mapped edits, retained-copy conflicts,
+occupied dirty closed pools, PAINT). These are outside the coordinator's three
+items.
+
+### Verification (round 2)
+
+- `make -j4 all`: exit 0.
+- Under ASan with detect_leaks=1 on :97, all exit 0:
+  - `editor_session_test` (full default run, 6 zizz lines)
+  - `editor_recovery_test` (4 lines)
+  - `dataloss_test`
+- The full suite was skipped, as instructed.
+
+### Manual check (round 2, fresh private copy, final binary, :97)
+
+- Notice: "restored 3 unsaved tabs; 1008 unmodified tabs from the last session were not reopened; file changed on disk since this session; its unsaved edits were set aside".
+  - This journal has conflicts, so the set-aside text is the conflict one; the
+    kept suffix is not repeated.
+- Tabs: 5 live, 0 closed: untitled, config.toml, CLAUDE.md, untitled,
+  untitled. The clean-close checkpoint agrees: 5 buffers, 5 tabs; untitled
+  654, 29 and 3967 bytes.
+- The three untitled tabs show their text: "What is the …", "xiaoming be …",
+  "Bennett.jl is certainly …".
+- The source was set aside and is byte-identical to the original.
+
+### Notes
+
+- Set-aside sources from partial restores accumulate, one per over-capacity
+  launch that drops something. retire.c pins set-aside sessions that hold
+  edits. Releasing one is the operator's `journal_replay --acknowledge`
+  (edit-fi0p F12).
+- Under a JOURNAL_BUSY replacement checkpoint, the kept source is set aside
+  immediately, as the conflict branch already does. That is no loss, but if
+  the owed checkpoint never lands, the restored state is reachable only
+  through the set-aside file.
+
+Background work: none running.

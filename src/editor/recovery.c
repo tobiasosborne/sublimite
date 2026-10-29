@@ -469,12 +469,20 @@ static bool unpainted_live(const recovered_session *s)
     for (size_t i = 0; i < s->count; i++) if (s->tabs[i] == s->paint) return true;
     return false;
 }
-/* edit-zizz: does the regular file at path hold exactly these bytes? */
+/* edit-zizz: does the regular file at path hold exactly these bytes? Round 2
+ * (review): the descriptor's generation (identity, size, mtime, ctime) must
+ * be unchanged across the whole read and the name must still select it, so
+ * a file rewritten between or after chunks never compares equal. */
+static bool same_generation(const os_stat *a, const os_stat *b)
+{
+    return os_identity_equal(&a->id, &b->id) && a->kind == b->kind && a->size == b->size &&
+        a->mtime_ns == b->mtime_ns && a->ctime_ns == b->ctime_ns;
+}
 static bool disk_equals(const char *path, const uint8_t *bytes, size_t len)
 {
     os_file source = OS_FILE_INIT;
     if (os_file_open(&source, path, OS_OPEN_READ | OS_OPEN_NONBLOCK) != OS_OK) return false;
-    os_stat st;
+    os_stat st, after, named;
     bool same = os_file_stat(&source, &st) == OS_OK && st.kind == OS_KIND_FILE && st.size == len;
     uint8_t disk[JOURNAL_INSERT_SLICE_BYTES]; /* reuse the wire slice as a chunk, as same_file does */
     for (size_t off = 0; same && off < len;) {
@@ -482,6 +490,8 @@ static bool disk_equals(const char *path, const uint8_t *bytes, size_t len)
         same = os_file_pread(&source, disk, n, off, &got) == OS_OK && got == n && !memcmp(disk, bytes + off, n);
         off += n;
     }
+    same = same && os_file_stat(&source, &after) == OS_OK && same_generation(&st, &after) &&
+        os_stat_path(path, 0, &named) == OS_OK && same_generation(&st, &named);
     os_file_close(&source); return same;
 }
 /* edit-zizz: a buffer whose loss would lose text. An untitled buffer with
@@ -788,14 +798,35 @@ static int restore_source(editor *e, const char *directory, const char *previous
         }
     }
     for (recovered_buffer *b = session.buffers; !rc && !aside && !session.conflicts && b; b = b->next) if (b->rewritten) {
-        e->recovery_notice = "file changed on disk since this session; its unsaved edits were recovered";
+        static const char recovered[] = "file changed on disk since this session; its unsaved edits were recovered";
+        if (session.partial && e->recovery_notice == e->session_notice) {
+            /* edit-zizz round 2: keep the partial restore's account in view. */
+            size_t used = strlen(e->session_notice);
+            if (!strstr(e->session_notice, recovered))
+                (void)snprintf(e->session_notice + used, sizeof e->session_notice - used, "; %s", recovered);
+        } else e->recovery_notice = recovered;
         e->recovery_notice_mutations = e->stats.mutations;
     }
-    if (!rc && (aside || session.conflicts)) {
-        const char *text = session.conflicts && !aside ?
+    /* edit-zizz round 2: a partial restore that dropped buffers never deletes
+     * its source. Dropping rests on a comparison with files that can change
+     * at any time; the set-aside source (dotted name, never discovered, its
+     * BASE references pinned by journal_retire_directory's scan of set-aside
+     * sessions) still replays every dropped buffer. */
+    bool kept = !rc && !aside && !session.conflicts && session.partial && session.dropped;
+    if (kept) {
+        static const char kept_notice[] = "the old session journal was set aside";
+        if (e->recovery_notice == e->session_notice) {
+            size_t used = strlen(e->session_notice);
+            (void)snprintf(e->session_notice + used, sizeof e->session_notice - used, "; %s", kept_notice);
+        } else e->recovery_notice = kept_notice;
+        e->recovery_notice_mutations = e->stats.mutations;
+    }
+    if (!rc && (aside || session.conflicts || kept)) {
+        const char *text = kept ? NULL : session.conflicts && !aside ?
             "file changed on disk since this session; its unsaved edits were set aside" :
             "session recovery failed; its journal was set aside";
-        if (session.partial && e->recovery_notice == e->session_notice) {
+        if (!text) { /* kept: its notice is set above */ }
+        else if (session.partial && e->recovery_notice == e->session_notice) {
             /* edit-zizz: keep what the partial restore left out in view too. */
             size_t used = strlen(e->session_notice);
             (void)snprintf(e->session_notice + used, sizeof e->session_notice - used, "; %s", text);

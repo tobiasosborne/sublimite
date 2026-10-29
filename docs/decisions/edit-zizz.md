@@ -78,12 +78,38 @@ closed room`, the temporary slot again. The existing install_failure case
 
 ## Retirement and notices
 
-When every unsaved buffer was installed, the source is retired as before: the
-durable replacement checkpoint holds the accepted state. A session with
+Round 2 (Codex review BLOCKER; the fix was chosen by the coordinator): a
+partial restore that dropped any buffer never deletes its source. It sets the
+source aside with `editor_set_aside`: a dotted `.set-aside-*` name that
+discovery skips, renamed and never copied.
+- The retained BASE copies the source references are kept: restore_source
+  returns before its retained-copy unlink loop, as the conflict branch already
+  did.
+- `journal_retire_directory` scans set-aside sessions for BASE references and
+  pins them, so orphan cleanup keeps what the set-aside source needs.
+- Why: dropping rests on comparing replayed bytes with a file that another
+  process can rewrite at any time (between chunks, after the comparison,
+  before retirement). Keeping the source makes a wrong "unmodified" verdict
+  lose nothing. Every dropped buffer still replays from the set-aside file
+  (`journal_replay`).
+- `disk_equals` also requires the descriptor's generation (identity, kind,
+  size, mtime, ctime) to be unchanged across the read, and requires the name
+  to still select that generation. A file that changed during the comparison
+  therefore ranks as unsaved and is restored. This is cheap: two stats per
+  compared file, on the over-capacity path only.
+- The no-ops shortcut stays: its exposure is covered by the set-aside.
+- A partial restore that dropped nothing, and every session that fits, is
+  retired as before.
+
+When every unsaved buffer was installed and nothing was dropped, the source is
+retired as before: the durable replacement checkpoint holds the accepted state. A session with
 conflicts is set aside as before. The partial notice is
 `restored N unsaved tabs[ (K closed: Ctrl+Shift+T)]; M unmodified tabs from the last session were not reopened`.
 When there are conflicts, the existing changed-on-disk text is appended after
-"; ". The dzk1 first-paint notice, if install sets it, takes precedence.
+"; ". Otherwise a partial restore that dropped buffers appends "the old
+session journal was set aside". The edit-fi2 rewritten-target notice ("file
+changed on disk since this session; its unsaved edits were recovered") is
+appended too, instead of replacing the partial notice (round 2). The dzk1 first-paint notice, if install sets it, takes precedence.
 The editor-owned `session_notice` buffer holds the text. Its size is derived
 in `private.h`.
 
