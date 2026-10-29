@@ -298,6 +298,13 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
     rc = editor_scroll_init(e, b); if (rc) goto fail;
     *out = b; return 0;
 fail:
+    {
+        /* edit-m25u: the open worker records its native code on the file;
+         * synchronous setup leaves it in errno. editor_open_request turns
+         * either into its one descriptor notice. */
+        int native = b->file ? file_errno(b->file) : 0, now = errno;
+        if (native == EMFILE || native == ENFILE || now == EMFILE || now == ENFILE) e->open_fd_exhausted = true;
+    }
     e->opening = NULL;
     unpoll_source(e, b);
     editor_buffer_destroy(b); return rc > 0 ? EDITOR_ERR_IO : rc;
@@ -809,6 +816,7 @@ static int prepare_position(editor *e, editor_buffer *b, const view_state *incom
     b->scroll_display_stale = stale;
     return rc;
 }
+static const char fd_refused[] = "open refused: too many open files";
 int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
 {
     if (!e || !request || request->count > IPC_MAX_PATHS || editor_activation_busy(e) ||
@@ -828,6 +836,7 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
         if (wait_slot == IPC_MAX_CLIENTS) return EDITOR_ERR_CAPACITY;
     }
     editor_retire_buffers(e);
+    e->open_fd_exhausted = false;
     size_t available = 0;
     for (size_t i = 0; i < e->buffer_capacity; i++) available += e->buffers[i] == NULL;
     /* (P) IPC's maximum paths plus its optional stdin buffer bound these
@@ -875,6 +884,13 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
     if (rc) {
         for (size_t i = 0; i < count; i++) if (prepared[i]) {
             unpoll_source(e, prepared[i]); editor_buffer_destroy(prepared[i]);
+        }
+        /* edit-m25u: the whole request is refused (IPC clients get their
+         * rejection). A burst of refusals shows this one notice: the slot
+         * holds one pointer and setting it again changes nothing. */
+        if (e->open_fd_exhausted && e->recovery_notice != fd_refused) {
+            e->recovery_notice = fd_refused; e->recovery_notice_mutations = e->stats.mutations;
+            (void)editor_full_layout(e); /* a recoverable notice, never a loop failure */
         }
         return rc;
     }

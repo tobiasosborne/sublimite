@@ -5,6 +5,16 @@
 #include <stdbool.h>
 
 typedef struct savectl savectl;
+/* edit-m25u: one pinned reload-cache directory descriptor shared by every
+ * controller that is given it, instead of one per controller (one per open
+ * tab). Reference counted: each controller created with it retains it until
+ * savectl_destroy succeeds, so the creator may release its reference at any
+ * time. The descriptor is only read (openat-family calls), so workers of
+ * different controllers may use it at once. dir NULL uses os_temp_dir.
+ * Setup only; allocates. */
+typedef struct savectl_cache savectl_cache;
+int savectl_cache_open(savectl_cache **out, const char *dir);
+void savectl_cache_release(savectl_cache *cache);
 typedef enum savectl_state {
     SAVECTL_IDLE, SAVECTL_SAVING, SAVECTL_SAVED, SAVECTL_FAILED,
     SAVECTL_EXTERNAL_MODIFIED, SAVECTL_EXTERNAL_UNMODIFIED, SAVECTL_RELOADING
@@ -48,6 +58,7 @@ typedef struct savectl_options {
     void (*reload_reset)(void *ctx, size_t mark);
     uint64_t buffer_id;
     const char *reload_cache_dir; /* setup-reserved directory; NULL uses os_temp_dir */
+    savectl_cache *reload_cache;  /* optional shared pinned directory; wins over reload_cache_dir */
     uint64_t reload_copy_threshold; /* clone threshold; 0 uses file policy */
     void (*step)(void *ctx, int step);
     void *step_ctx;

@@ -789,5 +789,18 @@ os_err os_proc_wait(os_proc *p, int64_t timeout_ns, os_proc_status *st);
 uint64_t os_proc_id(void);
 /* Path of the running executable (/proc/self/exe / GetModuleFileNameW). */
 os_err os_proc_self_path(char *out, size_t cap);
+#if !defined(_WIN32)
+/* edit-m25u, POSIX startup only: raise the soft RLIMIT_NOFILE to the hard
+ * limit. A desktop session hands its children soft 1024 against hard 1048576
+ * (M: /proc/<pid>/limits of cinnamon and nemo-desktop, 2026-10-29), and one
+ * open file holds one descriptor. An unlimited hard limit is bounded by
+ * /proc/sys/fs/nr_open, the kernel's own per-process ceiling (setrlimit
+ * refuses a larger soft value with EPERM); 1048576 = 1024 * 1024 when that
+ * file is unreadable (P: the kernel default of sysctl_nr_open, fs/file.c).
+ * Never lowers the limit. *soft (optional) receives the soft limit in force
+ * on return. An error leaves the limit unchanged; callers may ignore it.
+ * Windows has no equivalent per-process soft cap on kernel handles. */
+os_err os_fd_limit_raise(uint64_t *soft);
+#endif
 
 #endif

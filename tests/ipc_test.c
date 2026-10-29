@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <dirent.h>
 #include <sys/file.h>
 #include <time.h>
 #include <sys/un.h>
@@ -35,6 +37,7 @@ typedef struct cli_state {
     pid_t ui_pid;
     ipc_token token;
     size_t tabs, remaining, tab_capacity;
+    uint64_t nofile_soft, nofile_hard; /* edit-m25u: RLIMIT_NOFILE after startup */
     bool live, has_server, isolated, binary;
     char socket_leaf[108];
 } cli_state;
@@ -49,6 +52,8 @@ static void cli_state_send(editor *e, ipc_token token)
 {
     cli_state state = {.ui_pid = getpid(), .token = token, .tabs = editor_get_stats(e).tabs,
         .has_server = e->cfg.server != NULL, .tab_capacity = e->tabs.capacity};
+    struct rlimit nofile; CHECK(getrlimit(RLIMIT_NOFILE, &nofile) == 0);
+    state.nofile_soft = (uint64_t)nofile.rlim_cur; state.nofile_hard = (uint64_t)nofile.rlim_max;
     if (e->cfg.server) {
         state.live = ipc_server_token_live(e->cfg.server, token);
         state.isolated = e->cfg.server->listener < 0;
@@ -389,6 +394,138 @@ static void t_cli_capacity(const char *dir)
     close(events[0]); close(commands[1]); rm_rf(rt);
     printf("ipc_test: CLI tab capacity=%zu; expected>=1000 (G: edit-jmn target)\n", state.tab_capacity);
     CHECK(state.tab_capacity >= 1000u);
+}
+/* edit-m25u: main's POSIX startup raises the soft descriptor limit to the
+ * hard one. A desktop session hands its children soft 1024 (M: the bead's
+ * /proc/<pid>/limits of cinnamon and nemo-desktop); the child starts lower. */
+static void t_fd_limit_startup(const char *dir)
+{
+    struct rlimit start; CHECK(getrlimit(RLIMIT_NOFILE, &start) == 0);
+    /* (E) 256: below desktop's 1024 and above the ~30 descriptors an idle
+     * instance holds (M: the bead), so startup itself cannot run out. */
+    const rlim_t low = 256;
+    if (start.rlim_max != RLIM_INFINITY && start.rlim_max <= low) {
+        printf("ipc_test: fd_limit_startup skipped: hard limit %llu\n", (unsigned long long)start.rlim_max); return;
+    }
+    char rt[IPC_PATH_CAP]; subdir(dir, "fd-limit", rt);
+    int events[2], commands[2]; CHECK(pipe(events) == 0 && pipe(commands) == 0);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        close(events[0]); close(commands[1]);
+        struct rlimit lowered = {low, start.rlim_max}; CHECK(setrlimit(RLIMIT_NOFILE, &lowered) == 0);
+        char number[32]; CHECK(snprintf(number, sizeof number, "%d", events[1]) > 0);
+        CHECK(setenv("IPC_TEST_EVENTS", number, 1) == 0);
+        CHECK(snprintf(number, sizeof number, "%d", commands[0]) > 0);
+        CHECK(setenv("IPC_TEST_COMMANDS", number, 1) == 0);
+        CHECK(setenv("XDG_DATA_HOME", rt, 1) == 0 && unsetenv("EDIT_TRACE_DUMP") == 0);
+        char *argv[] = {"sublimite", "--new-instance"};
+        _exit(ipc_cli_main((int)(sizeof argv / sizeof argv[0]), argv));
+    }
+    close(events[1]); close(commands[0]);
+    cli_state state; CHECK(read(events[0], &state, sizeof state) == (ssize_t)sizeof state);
+    CHECK(write(commands[1], "Q", 1) == 1); reap_ok(child);
+    close(events[0]); close(commands[1]); rm_rf(rt);
+    printf("ipc_test: edit-m25u startup soft RLIMIT_NOFILE %llu -> %llu (hard %llu)\n",
+           (unsigned long long)low, (unsigned long long)state.nofile_soft, (unsigned long long)state.nofile_hard);
+    if (state.nofile_hard == (uint64_t)RLIM_INFINITY) CHECK(state.nofile_soft > low);
+    else CHECK(state.nofile_soft == state.nofile_hard);
+}
+static void text_file(const char *dir, const char *name)
+{
+    char p[IPC_PATH_CAP]; CHECK(snprintf(p,sizeof p,"%s/%s",dir,name)>0);
+    int f=open(p,O_CREAT|O_WRONLY|O_TRUNC,0600); CHECK(f>=0); CHECK(write(f,"text\n",5)==5); close(f);
+}
+static size_t open_fds(void)
+{
+    DIR *d = opendir("/proc/self/fd"); CHECK(d != NULL);
+    size_t n = 0; for (struct dirent *ent; (ent = readdir(d)) != NULL;) n += ent->d_name[0] != '.';
+    closedir(d); return n;
+}
+/* Descriptor count without taking one: usable when none are left. */
+static size_t open_fds_below(rlim_t limit)
+{
+    size_t n = 0; for (rlim_t fd = 0; fd < limit; fd++) n += fcntl((int)fd, F_GETFD) != -1;
+    return n;
+}
+/* edit-m25u: an open file costs one descriptor (its retained source), not
+ * one more for a per-tab reload-cache directory. */
+static void t_fd_per_file(const char *dir)
+{
+    const size_t count = 32u; /* (E) enough that a per-file cost stands out from worker noise */
+    char rt[IPC_PATH_CAP], path[IPC_PATH_CAP]; subdir(dir, "fd-per-file", rt);
+    for (size_t i = 0; i < count; i++) {
+        CHECK(snprintf(path, sizeof path, "fd-%zu", i) > 0); text_file(rt, path);
+    }
+    render_backend backend = {0}; CHECK(render_null_backend(&backend) == 0);
+    editor_config config = {.cols = 40, .rows = 4, .max_cols = 40, .max_rows = 4,
+        .start_empty = true, .tab_capacity = count + 1u};
+    editor *e = NULL; CHECK(editor_open(&e, &config, &backend) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/fd-0", rt) > 0);
+    ipc_request first = {.count = 1, .cwd = rt}; first.paths[0] = (ipc_path){path, 1, 1};
+    CHECK(editor_open_request(e, &first, 0) == 0); /* warms any one-time descriptors */
+    size_t before = open_fds();
+    for (size_t i = 1; i < count; i++) {
+        CHECK(snprintf(path, sizeof path, "%s/fd-%zu", rt, i) > 0);
+        ipc_request r = {.count = 1, .cwd = rt}; r.paths[0] = (ipc_path){path, 1, 1};
+        CHECK(editor_open_request(e, &r, 0) == 0 && e->buffer->save_error == 0);
+    }
+    size_t after = open_fds();
+    printf("ipc_test: edit-m25u %zu opens held %zu descriptors\n", count - 1u, after - before);
+    CHECK(after - before == count - 1u);
+    editor_close(e); rm_rf(rt);
+}
+/* edit-m25u: with descriptors exhausted an open is refused whole (no tab, no
+ * descriptor kept), the tab before it is complete (its save controller
+ * exists) and the editor shows one notice however many requests are refused. */
+static void t_fd_exhausted(const char *dir)
+{
+    char rt[IPC_PATH_CAP], path[IPC_PATH_CAP]; subdir(dir, "fd-exhausted", rt);
+    /* (E) headroom: each accepted open costs one descriptor, so this many
+     * files are enough to reach any limit set a few descriptors above use. */
+    const size_t files = 24u;
+    for (size_t i = 0; i < files; i++) {
+        CHECK(snprintf(path, sizeof path, "x-%zu", i) > 0); text_file(rt, path);
+    }
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        render_backend backend = {0}; CHECK(render_null_backend(&backend) == 0);
+        editor_config config = {.cols = 40, .rows = 4, .max_cols = 40, .max_rows = 4,
+            .start_empty = true, .tab_capacity = files + 1u};
+        editor *e = NULL; CHECK(editor_open(&e, &config, &backend) == 0);
+        CHECK(snprintf(path, sizeof path, "%s/x-0", rt) > 0);
+        ipc_request first = {.count = 1, .cwd = rt}; first.paths[0] = (ipc_path){path, 1, 1};
+        CHECK(editor_open_request(e, &first, 0) == 0);
+        struct rlimit saved; CHECK(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+        /* (E) 4 spare: a few files open before the limit is reached, so
+         * the boundary is crossed inside the loop. */
+        struct rlimit tight = {(rlim_t)open_fds() + 4u, saved.rlim_max};
+        CHECK(setrlimit(RLIMIT_NOFILE, &tight) == 0);
+        size_t accepted = 1, refused = 0; const char *notice = NULL;
+        for (size_t i = 1; i < files; i++) {
+            CHECK(snprintf(path, sizeof path, "%s/x-%zu", rt, i) > 0);
+            ipc_request r = {.count = 1, .cwd = rt}; r.paths[0] = (ipc_path){path, 1, 1};
+            size_t tabs = editor_get_stats(e).tabs, fds = open_fds_below(tight.rlim_cur);
+            int rc = editor_open_request(e, &r, 0);
+            if (!rc) {
+                CHECK(!refused); /* nothing frees descriptors in between */
+                CHECK(e->buffer->save_error == 0 && editor_get_stats(e).tabs == tabs + 1u);
+                accepted++; continue;
+            }
+            CHECK(editor_get_stats(e).tabs == tabs && open_fds_below(tight.rlim_cur) == fds);
+            CHECK(e->recovery_notice && strstr(e->recovery_notice, "too many open files"));
+            if (notice) CHECK(e->recovery_notice == notice);
+            notice = e->recovery_notice; refused++;
+        }
+        printf("ipc_test: edit-m25u limit %llu: %zu accepted, %zu refused, notice \"%s\"\n",
+               (unsigned long long)tight.rlim_cur, accepted, refused, notice ? notice : "");
+        CHECK(refused >= 2u);
+        CHECK(setrlimit(RLIMIT_NOFILE, &saved) == 0);
+        CHECK(snprintf(path, sizeof path, "%s/x-%zu", rt, files - 1u) > 0);
+        ipc_request again = {.count = 1, .cwd = rt}; again.paths[0] = (ipc_path){path, 1, 1};
+        CHECK(editor_open_request(e, &again, 0) == 0 && e->buffer->save_error == 0);
+        editor_close(e); fflush(stdout); _exit(0);
+    }
+    reap_ok(child); rm_rf(rt);
 }
 static void t_result_text(void)
 {
@@ -946,6 +1083,7 @@ static int run_suite(const char *only, int ns_fd)
     T("cli_capacity",t_cli_capacity(dir));
     T("result_text",t_result_text());
     T("editor_tabs",t_editor_tabs(dir));
+    T("fd_limit_startup",t_fd_limit_startup(dir)); T("fd_per_file",t_fd_per_file(dir)); T("fd_exhausted",t_fd_exhausted(dir));
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));

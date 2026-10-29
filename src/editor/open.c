@@ -56,6 +56,7 @@ void editor_close(editor *e)
     editor_clip_close(e);
     if (e->poll_fd >= 0) close(e->poll_fd);
     if (e->tabs_ready) tabs_fini(&e->tabs);
+    savectl_cache_release(e->reload_cache); /* controllers still alive keep their own references */
     edit_arena_free(&e->drop_arena);
     edit_arena_free(&e->arena); free(e);
 }
@@ -80,6 +81,9 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     e->poll_fd = -1; e->raster_poll_fd = -1; e->session_lock = -1; e->busy_source_lease = -1; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     atomic_init(&e->font_logged, false);
+    /* edit-m25u: every tab's save controller shares one pinned reload-cache
+     * directory. On failure each controller pins its own, as before. */
+    (void)savectl_cache_open(&e->reload_cache, NULL);
     /* edit-fi2: retain BASEs that startup can restore in one pass
      * (JOURNAL_STARTUP_SCAN_BYTES; derivation in docs/decisions/edit-fi2.md). */
     e->retain_limit = JOURNAL_STARTUP_SCAN_BYTES;

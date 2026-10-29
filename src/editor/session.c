@@ -527,7 +527,7 @@ int editor_save_setup(editor *e, editor_buffer *b)
     strcpy(b->save_path, path);
     savectl_options options = {.pool = &e->pool, .path = path, .baseline = baseline,
         .source_mode = FILE_MODE_COPY, .source = source, .journal = e->journal,
-        .journal_pool = &e->journal_pool, .buffer_id = b->id};
+        .journal_pool = &e->journal_pool, .buffer_id = b->id, .reload_cache = e->reload_cache};
     int rc = savectl_create(&b->save, &options, b->saved_lost || b->history_cursor != b->saved_cursor);
     /* edit-4jhi: a retained BASE authorises source reads, not writes to a
      * distinct TARGET. savectl_create adopts its source's identity, so bind

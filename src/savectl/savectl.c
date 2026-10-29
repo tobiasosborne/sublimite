@@ -45,10 +45,14 @@ typedef struct completion {
     bool pending; /* worker-owned until terminal message transfers the lease */
 } completion;
 typedef struct notification { savectl *owner; completion *lease; bool handoff; } notification;
+struct savectl_cache {
+    os_dir dir;
+    _Atomic size_t refs;
+};
 struct savectl {
     savectl_options options;
     char path[4097];
-    os_dir reload_cache;
+    savectl_cache *cache; /* retained; its dir is the pinned reload cache */
     char reload_cleanup[80]; /* worker-owned name until unlink succeeds */
     file_id baseline;
     savectl_state state;
@@ -162,7 +166,7 @@ static int stop(void *ctx)
 }
 static os_err private_reload_backing(savectl *s, os_file *out)
 {
-    os_err rc=os_file_open_anon(out,&s->reload_cache);
+    os_err rc=os_file_open_anon(out,&s->cache->dir);
     if(rc==OS_OK) return rc;
     /* Keep the existing exclusive-create fallback on filesystems without
      * anonymous files. Randomness and EINTR policy belong to the OS layer. */
@@ -173,16 +177,16 @@ static os_err private_reload_backing(savectl *s, os_file *out)
         char name[80];
         int n=snprintf(name,sizeof name,".sublimite-reload-%llx-%llx",(unsigned long long)nonce[0],(unsigned long long)nonce[1]);
         if(n<0 || (size_t)n>=sizeof name) return OS_E_INVAL;
-        rc=os_file_open_at(out,&s->reload_cache,name,OS_OPEN_CREATE|OS_OPEN_EXCL|OS_OPEN_NOFOLLOW|OS_OPEN_RDWR);
+        rc=os_file_open_at(out,&s->cache->dir,name,OS_OPEN_CREATE|OS_OPEN_EXCL|OS_OPEN_NOFOLLOW|OS_OPEN_RDWR);
         if(rc==OS_E_EXIST) continue;
         if(rc!=OS_OK) return rc;
         strcpy(s->reload_cleanup,name);
-        rc=os_unlink_at(&s->reload_cache,name);
+        rc=os_unlink_at(&s->cache->dir,name);
         if(rc!=OS_OK) {
             os_file_close(out);
             /* Closing first can remove a transient sharing obstacle. If this
              * also fails, retain the obligation for worker maintenance. */
-            if(os_unlink_at(&s->reload_cache,name)==OS_OK) s->reload_cleanup[0]=0;
+            if(os_unlink_at(&s->cache->dir,name)==OS_OK) s->reload_cleanup[0]=0;
         } else s->reload_cleanup[0]=0;
         return rc;
     }
@@ -324,7 +328,7 @@ static void worker(work_ctx *ctx)
     if (op==OP_DISCARD) { *r=(result){0}; bytes_release(s->task.discard); }
     else if(op==OP_CLEANUP) {
         *r=(result){0};
-        os_err rc=os_unlink_at(&s->reload_cache,s->reload_cleanup);
+        os_err rc=os_unlink_at(&s->cache->dir,s->reload_cleanup);
         if(rc==OS_OK || rc==OS_E_NOENT) s->reload_cleanup[0]=0;
     }
     else {
@@ -465,6 +469,29 @@ static int submit(savectl *s, operation op)
     (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,controller_message,s);
     return SAVECTL_OK;
 }
+int savectl_cache_open(savectl_cache **out, const char *dir)
+{
+    if (!out) return SAVECTL_INVALID;
+    *out=NULL;
+    char temporary[OS_PATH_MAX];
+    if(!dir) {
+        if(os_temp_dir(temporary,sizeof temporary)!=OS_OK) return SAVECTL_INVALID;
+        dir=temporary;
+    }
+    if(!os_path_is_absolute(dir)) return SAVECTL_INVALID;
+    savectl_cache *c=calloc(1,sizeof *c);
+    if(!c) return SAVECTL_NOMEM;
+    c->dir=(os_dir)OS_DIR_INIT;
+    if(os_dir_open(&c->dir,dir)!=OS_OK) { free(c); return SAVECTL_INVALID; }
+    atomic_init(&c->refs,1);
+    *out=c; return SAVECTL_OK;
+}
+void savectl_cache_release(savectl_cache *c)
+{
+    if (!c || atomic_fetch_sub_explicit(&c->refs,1,memory_order_acq_rel)!=1) return;
+    os_dir_close(&c->dir);
+    free(c);
+}
 int savectl_create(savectl **out, const savectl_options *o, bool modified)
 {
     if (!out || !o || !o->pool || !o->path || !os_path_is_absolute(o->path) ||
@@ -476,14 +503,12 @@ int savectl_create(savectl **out, const savectl_options *o, bool modified)
     if (!s) return SAVECTL_NOMEM;
     s->completion=calloc(1,sizeof *s->completion);
     if (!s->completion) { free(s); return SAVECTL_NOMEM; }
-    char temporary[OS_PATH_MAX];
-    const char *cache=o->reload_cache_dir;
-    if(!cache) {
-        if(os_temp_dir(temporary,sizeof temporary)!=OS_OK) { free(s->completion); free(s); return SAVECTL_INVALID; }
-        cache=temporary;
-    }
-    if(!os_path_is_absolute(cache) || os_dir_open(&s->reload_cache,cache)!=OS_OK) {
-        free(s->completion); free(s); return SAVECTL_INVALID;
+    if(o->reload_cache) {
+        s->cache=o->reload_cache;
+        (void)atomic_fetch_add_explicit(&s->cache->refs,1,memory_order_relaxed);
+    } else {
+        int rc=savectl_cache_open(&s->cache,o->reload_cache_dir);
+        if(rc) { free(s->completion); free(s); return rc; }
     }
     s->options=*o; strcpy(s->path,o->path); s->options.path=s->path;
     s->baseline=o->baseline; s->modified=modified;
@@ -511,7 +536,7 @@ int savectl_destroy(savectl *s)
         return SAVECTL_BUSY;
     if (s->handle.epoch)
         (void)work_mailbox_bind(s->options.pool,s->handle,s->generation,NULL,NULL);
-    os_dir_close(&s->reload_cache);
+    savectl_cache_release(s->cache);
     free(s->completion);
     file_source_release(s->options.source);
     free(s); return SAVECTL_OK;

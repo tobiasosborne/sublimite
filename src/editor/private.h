@@ -375,6 +375,9 @@ struct editor {
     /* edit-btj: startup recovery notice, shown on the status row until the
      * first mutation; recovery_aside names the set-aside source journal. */
     const char *recovery_notice;
+    /* edit-m25u: the reload-cache directory every savectl_create shares. */
+    savectl_cache *reload_cache;
+    bool open_fd_exhausted; /* edit-m25u: set by a prepare refused for EMFILE/ENFILE */
     /* edit-fi2: largest BASE retained on first modification (retain.c);
      * zero disables retention (tests of the set-aside fallback). */
     uint64_t retain_limit;

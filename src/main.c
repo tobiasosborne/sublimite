@@ -2,6 +2,7 @@
 #include "editor/runtime.h"
 #include "wayland/plat.h"
 #include "journal/journal.h"
+#include "os/os.h"
 #include "trace/trace.h"
 #include <errno.h>
 #include <math.h>
@@ -20,6 +21,9 @@ int main(int argc, char **argv)
         puts(usage); return EXIT_SUCCESS;
     }
     uint64_t startup_ns = trace_now_ns();
+    /* edit-m25u: one open file holds one descriptor, and a desktop launch
+     * starts at soft 1024. An optimisation: a failure keeps today's limit. */
+    (void)os_fd_limit_raise(NULL);
     trace_init(); (void)trace_thread_register();
     trace_record_at(startup_ns, TRACE_T0_INGRESS, 0);
     trace_record_at(startup_ns, TRACE_STARTUP_PROCESS_START, 0);

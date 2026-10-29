@@ -26,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1018,6 +1019,32 @@ os_err os_proc_wait(os_proc *p, int64_t timeout_ns, os_proc_status *st)
     return OS_OK;
 }
 uint64_t os_proc_id(void) { return (uint64_t)getpid(); }
+os_err os_fd_limit_raise(uint64_t *soft)
+{
+    struct rlimit now;
+    if (getrlimit(RLIMIT_NOFILE, &now)) return fail();
+    if (soft) *soft = (uint64_t)now.rlim_cur;
+    /* (P) the kernel default of fs.nr_open, used if the sysctl is unreadable. */
+    rlim_t ceiling = (rlim_t)1024u * 1024u, target = now.rlim_max;
+    int fd;
+    RETRY(fd, open("/proc/sys/fs/nr_open", O_RDONLY | O_CLOEXEC));
+    if (fd >= 0) {
+        char text[32]; ssize_t n;
+        RETRY(n, read(fd, text, sizeof text - 1u));
+        close(fd);
+        if (n > 0) {
+            text[n] = 0; char *end = NULL;
+            unsigned long long v = strtoull(text, &end, 10);
+            if (end != text && v) ceiling = (rlim_t)v;
+        }
+    }
+    if (target == RLIM_INFINITY || target > ceiling) target = ceiling;
+    if (target <= now.rlim_cur) return OS_OK;
+    struct rlimit raised = {target, now.rlim_max};
+    if (setrlimit(RLIMIT_NOFILE, &raised)) return fail();
+    if (soft) *soft = (uint64_t)target;
+    return OS_OK;
+}
 os_err os_proc_self_path(char *out, size_t cap)
 {
     char tmp[PATH_MAX];

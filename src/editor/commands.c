@@ -102,7 +102,8 @@ static int save_as(editor *e, const char *input)
     if (b->file && file_open_mode(b->file) == FILE_MODE_MMAP && file_source_acquire(b->file, &a->source)) { free(a); return EDITOR_ERR_IO; }
     savectl_options options = {.pool = &e->pool, .path = path, .baseline = baseline,
         .source_mode = a->source ? FILE_MODE_MMAP : FILE_MODE_COPY,
-        .validate_source = a->source ? file_source_validate : NULL, .source_ctx = a->source};
+        .validate_source = a->source ? file_source_validate : NULL, .source_ctx = a->source,
+        .reload_cache = e->reload_cache};
     if (savectl_create(&a->writer, &options, true)) { save_as_free(a); return EDITOR_ERR_IO; }
     a->snapshot = piece_snapshot_take(b->tree);
     piece_snapshot *task = a->snapshot ? piece_snapshot_retain(a->snapshot) : NULL;
@@ -129,7 +130,8 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
     savectl_options options = {.pool = &e->pool, .path = path, .baseline = a->baseline,
         .source_mode = a->source ? FILE_MODE_MMAP : FILE_MODE_COPY,
         .validate_source = a->source ? file_source_validate : NULL, .source_ctx = a->source,
-        .journal = e->journal, .journal_pool = &e->journal_pool, .buffer_id = b->id};
+        .journal = e->journal, .journal_pool = &e->journal_pool, .buffer_id = b->id,
+        .reload_cache = e->reload_cache};
     savectl *replacement = NULL;
     if (savectl_create(&replacement, &options, false)) return EDITOR_ERR_IO;
     (void)savectl_rebase_target(replacement, &saved);
