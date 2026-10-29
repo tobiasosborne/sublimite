@@ -2894,7 +2894,8 @@ static int duuw_all(void) { return duuw_gated() || duuw_save_as_queue() || duuw_
 /* edit-zizz: an over-capacity session restores every unsaved buffer first,
  * then unmodified file tabs in tab order while live room remains; the rest
  * are dropped (their bytes are on disk). (P) Fixture: six plain clean files
- * c0..c5, one file edited and undone (x: ops after BASE, bytes equal disk),
+ * c0..c5, one file edited and undone (x: self-contained text records after
+ * BASE whose bytes equal disk, so it ranks unmodified),
  * one modified file (m) and three untitled buffers with text (u1, u2, and u3,
  * which is closed): 11 buffers, source tab order
  * c0 u1 c1 m c2 x c3 u2 c4 c5 with c2 (index 4) active. */
@@ -3033,9 +3034,13 @@ static int zizz_bytes_closed(editor *e)
     T(tabs_count(&e->tabs) == 2 && tabs_closed_count(&e->tabs) == 2);
     T(zizz_text(editor_tab(e, 0), "U1x") && editor_tab(e, 0)->modified);
     T(zizz_text(editor_tab(e, 1), "Mm") && editor_tab(e, 1)->modified);
-    const tabs_tab *a = tabs_closed_at(&e->tabs, 0), *b = tabs_closed_at(&e->tabs, 1);
-    T((zizz_text(a, "U2y") && zizz_text(b, "U3z")) || (zizz_text(a, "U3z") && zizz_text(b, "U2y")));
-    T(a->modified && b->modified);
+    bool u2 = false, u3 = false; /* closed order is install order: a set */
+    for (size_t i = 0; i < 2u; i++) {
+        const tabs_tab *t = tabs_closed_at(&e->tabs, i); T(t);
+        if (zizz_text(t, "U2y") && t->modified) u2 = true;
+        if (zizz_text(t, "U3z") && t->modified) u3 = true;
+    }
+    T(u2 && u3);
     return 0;
 }
 static int zizz_partial(bool closed)
@@ -3211,11 +3216,56 @@ static int zizz_rewritten(void)
     if (!rc) puts("zizz: a rewritten retained-copy target appends its notice to the partial restore's");
     return rc;
 }
+/* Round 3: the first-paint (edit-dzk1) warning keeps priority over the
+ * set-aside suffix. A second launch restores the fixture at default capacity
+ * (it fits) and dies in the first paint of m. (P) At tab_capacity 6 /
+ * closed_capacity 1, m (unsaved, PAINT) is closed, the other four unsaved
+ * buffers are live and one clean tab fills the spare slot: 5 tabs, 1 closed,
+ * 5 not reopened. */
+static int zizz_paint(void)
+{
+    char made[] = "build/editor-zizz-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP], first[IPC_PATH_CAP]; T(realpath(made, root));
+    zizz_launch a = {0};
+    int rc = zizz_source(root, first, sizeof first);
+    if (!rc) {
+        fflush(stdout); fflush(stderr);
+        pid_t child = fork(); T(child >= 0);
+        if (!child) {
+            zizz_launch l = {0};
+            if (zizz_start(root, &l, 0, 0)) _exit(2); /* (P) zero selects the default capacity */
+            size_t m = SIZE_MAX;
+            for (size_t i = 0; i < tabs_count(&l.e->tabs); i++) if (zizz_text(editor_tab(l.e, i), "Mm")) m = i;
+            if (m == SIZE_MAX || m == tabs_active_index(&l.e->tabs)) _exit(3);
+            dzk1_editor = l.e; dzk1_victim = editor_tab(l.e, m)->id;
+            dzk1_submit = l.backend.ops.submit; l.backend.ops.submit = dzk1_crash_submit;
+            if (editor_select_tab(l.e, m)) _exit(4);
+            (void)settle(l.e);
+            _exit(5); /* the paint did not reach the backend */
+        }
+        int status; T(waitpid(child, &status, 0) == child);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != DZK1_KILLED) rc = 1;
+    }
+    if (!rc) rc = zizz_start(root, &a, 6, 1);
+    if (!rc) {
+        editor *e = a.e;
+        fprintf(stderr, "editor_session_test: zizz paint: tabs=%zu closed=%zu notice=%s aside=%d\n", tabs_count(&e->tabs),
+            tabs_closed_count(&e->tabs), e->recovery_notice ? e->recovery_notice : "(none)", *e->recovery_aside != 0);
+        if (tabs_count(&e->tabs) != 5 || tabs_closed_count(&e->tabs) != 1 || !zizz_text(tabs_closed_at(&e->tabs, 0), "Mm") ||
+            !e->recovery_notice ||
+            strcmp(e->recovery_notice, "a restored tab died in its first paint last time; it is closed (reopen: Ctrl+Shift+T)") ||
+            !*e->recovery_aside) rc = 1;
+    }
+    if (a.e) editor_close(a.e);
+    zizz_remove(root);
+    if (!rc) puts("zizz: the first-paint warning keeps priority over a partial restore's notice");
+    return rc;
+}
 static int zizz_all(void)
 {
     int a = zizz_partial(false), b = zizz_partial(true), c = zizz_deferred(), d = zizz_changed(), v = zizz_vanished();
-    int w = zizz_rewritten();
-    return a || b || c || d || v || w;
+    int w = zizz_rewritten(), p = zizz_paint();
+    return a || b || c || d || v || w || p;
 }
 static const test_selector selectors[] = {
     {"--edit-duuw", duuw_all},

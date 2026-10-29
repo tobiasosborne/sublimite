@@ -494,23 +494,36 @@ static bool disk_equals(const char *path, const uint8_t *bytes, size_t len)
         os_stat_path(path, 0, &named) == OS_OK && same_generation(&st, &named);
     os_file_close(&source); return same;
 }
-/* edit-zizz: a buffer whose loss would lose text. An untitled buffer with
- * content, or a file whose replayed bytes differ from the file install would
- * open (the same comparison install_buffer's clean flag makes). A buffer
- * without ops after a BASE that is the file itself replayed exactly the BASE
- * bytes, which replay validated against the file. A retained private BASE
- * copy (edit-fi2) is compared with the target like any edited buffer. An
- * interrupted save always counts as unsaved. A changed BASE (edit-btj
- * conflict) installs only the disk text: its edits live in the source
- * journal, which a session with conflicts sets aside whole, so its tab ranks
- * as unmodified. */
+/* edit-zizz: a buffer whose loss would lose text. Round 3 (after the round-2
+ * review): a file buffer is droppable only when what the user saw is
+ * recoverable without the target file.
+ * - No INSERT/DELETE after the BASE that replay validated: it holds only the
+ *   file's own earlier bytes.
+ * - Self-contained text records (the first op deletes the whole BASE, edit-28u
+ *   decision 5's shape for small files, or an empty BASE): the source journal
+ *   holds every byte, and the buffer is dropped only if those bytes equal the
+ *   target now. A partial restore that dropped anything sets its source aside,
+ *   so a target changing after the comparison loses nothing.
+ * - Delta records against a BASE (large files, retained copies) would need the
+ *   BASE bytes, which can change after any comparison: always unsaved.
+ * Untitled buffers with text, interrupted saves and mapped buffers with ops
+ * are unsaved. A changed BASE (edit-btj conflict) installs only the disk text
+ * and keeps its edits in the source, which a session with conflicts sets
+ * aside whole, so its tab ranks as unmodified. */
+static bool self_contained(const recovered_buffer *r)
+{
+    if (!r->base_id.size) return true;
+    uint64_t off, len; memcpy(&off, r->ops + 1, 8); memcpy(&len, r->ops + 9, 8);
+    return r->ops[0] == JOURNAL_DELETE && !off && len == r->base_id.size;
+}
 static bool unsaved_buffer(recovered_buffer *r)
 {
     if (r->conflict) return false;
     if (r->save_pending) return true;
     if (!*r->target) return r->len != 0;
-    if (r->ops_valid && !r->ops_len && !*r->retained) return false;
-    if (r->mapped_replay) return true; /* ops onto a mapped BASE: no flat text to compare */
+    if (!r->ops_valid) return true;
+    if (!r->ops_len) return false;
+    if (r->mapped_replay || !self_contained(r)) return true;
     gap_close(r);
     return !disk_equals(r->target, r->bytes, r->len);
 }
@@ -751,6 +764,7 @@ static int restore_source(editor *e, const char *directory, const char *previous
      * a tolerant pass; any other failure sets the source aside and opens empty.
      * An explicitly named existing journal keeps the strict contract. */
     bool aside = false;
+    const char *prior = e->recovery_notice; /* edit-zizz: notice before install */
     if (rc && !e->recover_existing) {
         fini(&session);
         session.cost = cost;
@@ -771,7 +785,7 @@ static int restore_source(editor *e, const char *directory, const char *previous
             e->recovery_notice_mutations = e->stats.mutations;
             fini(&session); return 0;
         }
-        const char *prior = e->recovery_notice;
+        prior = e->recovery_notice;
         rc = install_session(e, &session);
         if (!rc) e->startup_restored = true;
         else if (!e->recover_existing) {
@@ -815,7 +829,9 @@ static int restore_source(editor *e, const char *directory, const char *previous
     bool kept = !rc && !aside && !session.conflicts && session.partial && session.dropped;
     if (kept) {
         static const char kept_notice[] = "the old session journal was set aside";
-        if (e->recovery_notice == e->session_notice) {
+        if (e->recovery_notice && e->recovery_notice != prior && e->recovery_notice != e->session_notice) {
+            /* round 3: install's first-paint (edit-dzk1) warning keeps priority */
+        } else if (e->recovery_notice == e->session_notice) {
             size_t used = strlen(e->session_notice);
             (void)snprintf(e->session_notice + used, sizeof e->session_notice - used, "; %s", kept_notice);
         } else e->recovery_notice = kept_notice;

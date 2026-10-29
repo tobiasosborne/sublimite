@@ -365,3 +365,80 @@ items.
   through the set-aside file.
 
 Background work: none running.
+
+## Round 3 (Codex re-review docs/reviews/edit-zizz-r2.md)
+
+### Deviation from the coordinator's rule (needs a decision)
+
+"Droppable only without INSERT/DELETE records" cannot be applied as written.
+Untouched small files are checkpointed as DELETE-all + INSERT-all
+(edit-28u decision 5, checkpoint.c:101-104).
+- With that rule, all 11 fixture buffers ranked unsaved: every case deferred
+  ("11 unsaved tabs").
+- Any over-capacity session of existing files would be deferred, which brings
+  back the original bug.
+
+Implemented instead:
+- Droppable: no records.
+- Droppable after comparison: self-contained records (first op deletes the
+  whole BASE, or an empty BASE) whose bytes equal disk. The source journal
+  holds every byte, and partial restores set the source aside.
+- Always unsaved: delta records (files above FILE_PREFIX_MAX, retained
+  copies). This closes the review's mutable-BASE hole.
+- `disk_equals` (with revalidation) is kept only for the self-contained case.
+
+If the coordinator still wants comparison gone, the alternative is a
+different rule for whole-text records, e.g. trusting them without comparing.
+That would drop user text, so I did not do it.
+
+### Changes
+
+- `src/editor/recovery.c`:
+  - `unsaved_buffer` is reworked and a new `self_contained` helper is added.
+  - The kept (set-aside) notice no longer replaces an install-set notice
+    (edit-dzk1 first paint). `prior` is hoisted to restore_source scope.
+- `tests/editor_recovery_test.c`:
+  - The round-2 race seams and race tests are removed.
+  - New `zz_classify` unit test: no ops = droppable, whole-text equal =
+    droppable, whole-text differs = unsaved, deltas equal to disk = unsaved.
+- `tests/editor_session_test.c`: new `zizz_paint`. A second launch dies in m's
+  first paint; the relaunch at 6/1 must show the first-paint warning,
+  m closed, and the source set aside.
+- The edit-duuw tests are untouched.
+
+### Red (round-2 recovery.c)
+
+```
+editor_recovery_test: zizz classify: none=0 whole_equal=0 whole_differs=1 delta_equal=0 (1 = unsaved)
+editor_session_test: zizz paint: tabs=5 closed=1 notice=the old session journal was set aside aside=1
+```
+
+### Green
+
+```
+editor_recovery_test: zizz classify: none=0 whole_equal=0 whole_differs=1 delta_equal=1 (1 = unsaved)
+editor_session_test: zizz paint: tabs=5 closed=1 notice=a restored tab died in its first paint last time; it is closed (reopen: Ctrl+Shift+T) aside=1
+```
+
+All seven zizz session lines pass.
+
+### Verification
+
+- `make -j4 all`: exit 0.
+- Under ASan with detect_leaks=1 on :97, all exit 0:
+  - `editor_session_test` (full default run)
+  - `editor_recovery_test`
+  - `dataloss_test`
+
+### Manual check (fresh private copy, final binary)
+
+- Notice: "restored 3 unsaved tabs; 1008 unmodified tabs from the last session were not reopened; file changed on disk since this session; its unsaved edits were set aside".
+- Tabs: untitled, config.toml, CLAUDE.md, untitled, untitled (5 live, 0 closed).
+- The three untitled buffers keep their 654, 29 and 3967 bytes in the
+  checkpoint.
+- The set-aside source is byte-identical to the original.
+
+### Missing
+
+No end-to-end test of a delta-encoded buffer (file above FILE_PREFIX_MAX)
+through a relaunch. The rule is covered by the `zz_classify` unit test only.

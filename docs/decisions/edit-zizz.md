@@ -118,3 +118,38 @@ in `private.h`.
 The active source tab stays active if it is restored live. Otherwise its right
 live neighbour (else its left) becomes active, the rule edit-dzk1 uses for its
 skipped tab.
+
+## Round 3: classification never trusts disk for delta-encoded text
+
+Codex round 2 (docs/reviews/edit-zizz-r2.md) found the remaining hole. A
+buffer whose records are deltas against a mutable ordinary BASE can be dropped
+after an equal comparison. If the target then changes, the set-aside source
+holds only deltas, and the text cannot be rebuilt.
+
+The coordinator decided to drop content comparison entirely: droppable only
+without edit records. That rule could not be used as written. A checkpoint
+writes edit records for untouched small files too: edit-28u decision 5's
+DELETE-all + INSERT-all shape (checkpoint.c `editor_text_ops` when the
+original is not referenced; references need `base->size > FILE_PREFIX_MAX`).
+- In the fixture, all 11 buffers ranked unsaved and the whole session was
+  deferred again.
+- In the real journal, nearly every file buffer carries such records (M,
+  shape scan).
+- So any over-capacity session of existing files would be deferred, which is
+  the original bug.
+
+Implemented instead (`unsaved_buffer`, `self_contained`). A file buffer is
+droppable only when what the user saw is recoverable without the target:
+- **No records after the validated BASE:** droppable. It holds the file's own
+  earlier bytes.
+- **Self-contained records** (the first op deletes the whole BASE, or the BASE
+  is empty): the journal holds every byte. Droppable only if the replayed
+  bytes equal the target (revalidated comparison). The set-aside source
+  replays them whatever happens to the target later.
+- **Delta records against a BASE** (files above FILE_PREFIX_MAX, retained
+  copies): always unsaved, never compared. This closes the review's scenario.
+- Vanished targets, conflicts, untitled buffers, interrupted saves and mapped
+  buffers keep their earlier rules. The set-aside-not-unlink rule stays.
+
+The first-paint (edit-dzk1) warning now keeps priority over the set-aside
+suffix.
