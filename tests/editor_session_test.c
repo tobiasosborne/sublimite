@@ -2672,43 +2672,100 @@ static int select_edit_14bi(void)
 }
 /* edit-duuw: an open burst makes protected_record (buffers.c) meet
  * JOURNAL_BUSY and run a blocking journal_flush while the step's pump is in
- * flight; that flush's own drain takes the pump's completion. Each open is
- * added right after a step, before the next step's drain, so every open
- * after a pumping step falls in that window, as the coordinator's repro
- * (IPC opens admitted in the step after a pump) does. (E) each open re-emits a TABS
- * record of 48 + 8n bytes for n tabs (journal_set_tabs: 32-byte header,
- * 16 fixed payload bytes, 8 per id): n opens write 48n + 4n(n + 1) bytes,
- * first past JOURNAL_DEFAULT_SYNC_BYTES at n = 126 (bead text); the loop sums
- * the exact records, so crossing that window makes protected_record flush at
- * least once, within the fixture's 128-tab strip (open 128 is refused: (M)).
+ * flight; that flush's own drain takes the pump's completion.
+ * Forced, not timed: a held job occupies the journal pool's one worker
+ * (open.c) from the first open on, so the first pump stays in flight and no
+ * sync returns durability credit; opens continue until protected_record runs
+ * out of credit and flushes. The held job knows it is inside that flush
+ * without a clock: while the UI thread is inside editor_add_buffer (an armed
+ * serial) it publishes a wake-up-only probe (EDITOR_PUBLISH_MESSAGE, a no-op
+ * in editor_route_work) and returns once the probe is drained while the same
+ * add is still running. A COPY open (the default threshold for these
+ * strlen("x\n")-byte files) never steps the editor inside the add, so that
+ * drain is journal_flush's own. The test asserts the overlap: the pump was in
+ * flight before that add and taken by the flush after it.
+ * (P) the original, unforced trigger: open k (k = 1..n) re-emits TABS for
+ * k + 1 tabs, 48 + 8(k + 1) bytes (journal_set_tabs: 32-byte header, 16 fixed
+ * payload bytes, 8 per id), so n opens write 56n + 4n(n + 1) = 4n^2 + 60n
+ * bytes, first past JOURNAL_DEFAULT_SYNC_BYTES (65536) at n = 121
+ * (4 * 121^2 + 60 * 121 = 65824; n = 120 gives 64800), matching the 121 opens
+ * of the first red run. With the worker held, BASE and TARGET records also
+ * count against the fixed durable boundary, so the forced flush comes no
+ * later. The loop is bounded by the fixture's 128-tab strip (open 128 is
+ * refused: (M)).
  * After the burst: Ctrl+N completes, the idle step reports EDITOR_OK (not
  * EDITOR_MORE forever), durable_sequence reaches accepted_sequence, and a
  * window close finishes. Bounds are deadline() (EDITOR_IDLE_NS); the blocking
  * step waits at most one journal tick (JOURNAL_DEFAULT_SYNC_NS in ms). */
+typedef struct duuw_probe {
+    work_pool *pool;
+    _Atomic uint64_t add; /* (P) serial * 2 + 1 while that add runs, serial * 2 after */
+    atomic_bool entered, release, flushed;
+} duuw_probe;
+static bool duuw_mailbox_empty(const work_mailbox *mb)
+{ return atomic_load(&mb->head) == atomic_load(&mb->tail); }
+static void duuw_hold(work_ctx *ctx)
+{
+    duuw_probe *p = ctx->arg; const work_mailbox *mb = &p->pool->mb[ctx->worker];
+    atomic_store(&p->entered, true);
+    while (!atomic_load(&p->release) && !work_should_stop(ctx)) {
+        uint64_t add = atomic_load(&p->add);
+        if (!(add & 1u) || !duuw_mailbox_empty(mb)) { sched_yield(); continue; }
+        work_msg probe = {.kind = EDITOR_PUBLISH_MESSAGE};
+        if (!work_publish(ctx, &probe)) { sched_yield(); continue; }
+        while (!duuw_mailbox_empty(mb) && atomic_load(&p->add) == add && !work_should_stop(ctx)) sched_yield();
+        if (duuw_mailbox_empty(mb) && atomic_load(&p->add) == add) { atomic_store(&p->flushed, true); return; }
+    }
+}
 static int duuw_burst(void)
 {
-    fixture f = {0}; int result = 0; size_t opened = 0; uint64_t bytes = 0;
+    fixture f = {0}; duuw_probe probe = {0}; int result = 0; size_t opened = 0; uint64_t bytes = 0;
+    bool overlapped = false;
 #define C(x) do { if (!(x)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
     C(open_fixture(&f, true, false) == 0);
-    while (bytes <= JOURNAL_DEFAULT_SYNC_BYTES) {
+    probe.pool = &f.e->journal_pool;
+    C(!journal_in_flight(f.e->journal));
+    C(work_submit(&f.e->journal_pool, (work_job){duuw_hold, &probe, 0, WORK_BULK}).epoch);
+    uint64_t limit = deadline();
+    while (!atomic_load(&probe.entered)) { C(trace_now_ns() < limit); sched_yield(); }
+    while (!overlapped) {
         char path[IPC_PATH_CAP]; uint64_t id;
+        C(tabs_count(&f.e->tabs) < f.e->tabs.capacity); /* credit must run out first */
         C(snprintf(path, sizeof path, "%s/small-%zu", f.directory, opened) > 0);
         int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); C(fd >= 0);
         ssize_t wrote = write(fd, "x\n", strlen("x\n")); close(fd); C(wrote == (ssize_t)strlen("x\n"));
+        bool before = journal_in_flight(f.e->journal);
+        atomic_store(&probe.add, (opened + 1u) * 2u + 1u);
         int added = editor_add_buffer(f.e, path, NULL, 0, &id);
+        atomic_store(&probe.add, (opened + 1u) * 2u);
         if (added) fprintf(stderr, "edit-duuw: open %zu refused: %d (journal error %d)\n", opened, added, f.e->stats.journal_error);
         C(added == 0);
         opened++; bytes += 48u + 8u * tabs_count(&f.e->tabs); /* this open's TABS record */
+        if (atomic_load(&probe.flushed)) {
+            /* The pump submitted under the hold was out before this add and
+             * the add's own flush took its completion. */
+            overlapped = before && !journal_in_flight(f.e->journal);
+            fprintf(stderr, "edit-duuw: open %zu flushed with the pump in flight before=%d after=%d\n",
+                opened, before, journal_in_flight(f.e->journal));
+            C(overlapped);
+        } else if (opened > 1u && !before) {
+            journal_stats js = journal_get_stats(f.e->journal);
+            fprintf(stderr, "edit-duuw: open %zu: no pump in flight before it (accepted=%ju durable=%ju pending=%ju)\n", opened, (uintmax_t)js.accepted_sequence, (uintmax_t)js.durable_sequence, (uintmax_t)js.pending_bytes);
+            C(before); /* the first pump stays out while held */
+        }
         /* The IPC drain's own admission (buffers.c): no activation or mapped
-         * open in progress; the next open follows the last step's pump. */
+         * open in progress. Until the flush, also wait for the held pump:
+         * editor_step admits it once a page fills or one journal tick
+         * (editor.c, 1 s) passes; held, it then stays in flight. */
         uint64_t admit = deadline();
-        do { C(turn(f.e) == 0); C(trace_now_ns() < admit); } while (editor_activation_busy(f.e) || f.e->opening);
+        do { C(turn(f.e) == 0); C(trace_now_ns() < admit); sched_yield(); }
+        while (editor_activation_busy(f.e) || f.e->opening || (!overlapped && !journal_in_flight(f.e->journal)));
     }
     size_t tabs = tabs_count(&f.e->tabs);
     fprintf(stderr, "edit-duuw: %zu opens, %zu tabs, %ju TABS bytes\n", opened, tabs, (uintmax_t)bytes);
     plat_event ctrl_n = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'n', .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
     C(editor_inject(f.e, &ctrl_n) == 0);
-    uint64_t limit = deadline();
+    limit = deadline();
     while (tabs_count(&f.e->tabs) == tabs) {
         C(turn(f.e) == 0);
         if (trace_now_ns() >= limit) {
@@ -2735,6 +2792,7 @@ static int duuw_burst(void)
     while (rc == EDITOR_OK || rc == EDITOR_MORE) { rc = editor_step(f.e, 0); C(trace_now_ns() < limit); sched_yield(); }
     C(rc == EDITOR_CLOSED);
 done:
+    atomic_store(&probe.release, true); /* a failed check may leave the worker held */
     if (f.e) editor_close(f.e);
     fm4_remove_tree(f.directory); /* sources and journal on every exit */
 #undef C
@@ -2778,9 +2836,66 @@ done:
     if (!result) puts("edit-duuw: a Ctrl+N gated by an in-flight journal job sleeps, then runs on its completion");
     return result;
 }
-static int duuw_all(void) { return duuw_gated() || duuw_burst(); }
+/* edit-duuw (review round 2): Save As in flight, then Ctrl+N with trailing
+ * input queued behind it. Adoption owes a checkpoint (publish_owed); the file
+ * command waits for it; queued input parks behind the pending command; the
+ * checkpoint used to refuse any queued input. A held job keeps the Save As
+ * write on the editor pool's one bulk worker (open.c) while the events are
+ * queued. After release the new tab must appear, the trailing key must be
+ * typed, and the idle step must report EDITOR_OK. */
+static int duuw_save_as_queue(void)
+{
+    fixture f = {0}; held_bulk bulk = {0}; int result = 0; char target[IPC_PATH_CAP] = {0};
+#define C(x) do { if (!(x)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(open_fixture(&f, true, false) == 0);
+    editor *e = f.e; editor_buffer *b = e->buffer;
+    C(snprintf(target, sizeof target, "%s/saved", f.directory) > 0);
+    C(work_submit(&e->pool, (work_job){hold_bulk, &bulk, 0, WORK_BULK}).epoch);
+    uint64_t limit = deadline();
+    while (!atomic_load(&bulk.entered)) { C(trace_now_ns() < limit); sched_yield(); }
+    e->file_command = KEYS_ACTION_SAVE_AS; strcpy(e->file_command_path, target);
+    e->file_command_owner = b->id; e->file_command_generation = b->source_generation;
+    limit = deadline();
+    while (e->file_command != KEYS_ACTION_NONE || !e->save_as) { C(turn(e) == 0); C(trace_now_ns() < limit); sched_yield(); }
+    size_t tabs = tabs_count(&e->tabs);
+    plat_event events[] = {
+        {.kind = PLAT_EV_KEY, .press = true, .keysym = 'n', .mods = PLAT_MOD_CTRL},
+        {.kind = PLAT_EV_KEY, .press = false, .keysym = 'n', .mods = PLAT_MOD_CTRL},
+        {.kind = PLAT_EV_KEY, .press = true, .keysym = 'y', .utf8 = "y", .utf8_len = 1},
+    };
+    for (size_t i = 0; i < sizeof events / sizeof *events; i++) { events[i].t0_ns = trace_now_ns(); C(editor_inject(e, &events[i]) == 0); }
+    limit = deadline();
+    while (e->file_command != KEYS_ACTION_NEW_FILE) { C(turn(e) == 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(e->queue_count && e->save_as); /* trailing input parked behind the command */
+    atomic_store(&bulk.release, true);
+    limit = deadline();
+    while (tabs_count(&e->tabs) == tabs || e->queue_count || e->save_as || e->publish_owed || e->publish) {
+        C(turn(e) == 0);
+        if (trace_now_ns() >= limit)
+            fprintf(stderr, "edit-duuw: Save As queue stuck: file_command=%d queue=%zu save_as=%d publish_owed=%d publish=%d tabs=%zu\n",
+                (int)e->file_command, e->queue_count, e->save_as != NULL, e->publish_owed, e->publish != NULL, tabs_count(&e->tabs));
+        C(trace_now_ns() < limit); sched_yield();
+    }
+    C(tabs_count(&e->tabs) == tabs + 1u && e->file_command == KEYS_ACTION_NONE);
+    C(e->buffer != b && dzk1_text(e, "y") == 0); /* typed into the new tab */
+    int rc = EDITOR_MORE; limit = deadline();
+    while (rc == EDITOR_MORE) { rc = editor_step(e, 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(rc == EDITOR_OK);
+    C(disk_is(target, "base") == 0 && b->target_rebound);
+done:
+    atomic_store(&bulk.release, true);
+    if (f.e) editor_close(f.e);
+    fm4_remove_tree(f.directory); /* source, target and journal on every exit */
+#undef C
+    if (!result) puts("edit-duuw: Ctrl+N and trailing input queued during Save As run once its checkpoint lands");
+    return result;
+}
+static int duuw_all(void) { return duuw_gated() || duuw_save_as_queue() || duuw_burst(); }
 static const test_selector selectors[] = {
     {"--edit-duuw", duuw_all},
+    {"--edit-duuw-gated", duuw_gated},
+    {"--edit-duuw-save-as", duuw_save_as_queue},
+    {"--edit-duuw-burst", duuw_burst},
     {"--explicit-changed-base", explicit_changed_base},
     {"--edit-qcuh", select_edit_qcuh},
     {"--edit-ivv", ivv_all},

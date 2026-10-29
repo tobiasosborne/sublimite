@@ -93,7 +93,13 @@ void editor_retain_tick(editor *e)
     /* A queued Reload/Keep owns the next reconciliation. Starting a lease
      * here would postpone that choice while save-status repaint resumes on
      * its stale, deliberately unbound layout. */
-    if (!editor_checkpoint_due(e) || e->source_choice || editor_activation_busy(e) || e->backend->active || e->queue_count ||
+    /* edit-duuw: input queued behind a pending file command cannot drain
+     * (queue_pick) until that command runs, and the command waits for the
+     * owed checkpoint (editor_file_command_ready). That input is parked, not
+     * in progress: it does not hold an owed checkpoint back. The journal,
+     * mutation and lease guards below still apply. */
+    bool parked = e->publish_owed && e->file_command != KEYS_ACTION_NONE;
+    if (!editor_checkpoint_due(e) || e->source_choice || editor_activation_busy(e) || e->backend->active || (e->queue_count && !parked) ||
         (e->dirty && e->frame.last_sequence) || e->op_count || editor_journal_waiting(e) ||
         e->journal_metadata_pending || e->journal_group_open || e->stats.journal_error) return;
     journal_stats js = journal_get_stats(e->journal);

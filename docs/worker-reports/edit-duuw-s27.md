@@ -183,3 +183,135 @@ command did. Making them stricter without a wake audit risks a missed wake.
   returned `EDITOR_ERR_ARG` at open 128 (M). `build/sublimite` accepted 200
   opens in the manual check, so its strip is sized differently. I did not look into
   this.
+
+## Round 2 (Codex review docs/reviews/edit-duuw.md; on top of fc8429d)
+
+### 1. MAJOR: Save As, then queued Ctrl+N and trailing input, deadlocked
+
+**Cause (confirmed).** Save As adoption sets `publish_owed`, and that sets
+up a cycle with no way out:
+
+- `editor_file_command_ready` waits for the owed checkpoint.
+- `queue_pick` parks all queued input while a file command is pending.
+- `editor_retain_tick` refused the checkpoint while `queue_count` was
+  nonzero.
+
+Before round 1 this spun. With round 1 it slept forever, with input
+blocked.
+
+**Fix (the review's suggestion).** In `src/editor/retain.c`, queued input
+no longer refuses the checkpoint when it is parked behind a pending file
+command and that checkpoint is owed:
+
+    bool parked = e->publish_owed && e->file_command != KEYS_ACTION_NONE;
+    ... (e->queue_count && !parked) ...
+
+Every other guard stays: checkpoint due, source choice, activation busy,
+backend active, a frame in flight, op_count, journal waiting, metadata
+pending, an open group, journal error, and the quiescent-journal stats.
+Want-driven retention, where nothing is owed, still refuses any queued
+input. I rejected the alternative of letting `queue_pick` drain input past a
+pending command, because it would reorder input against the command. I
+corrected the decision doc's "every gate has a clearing wake" claim and
+added a Round 2 section there.
+
+**Regression test.** `duuw_save_as_queue` (`--edit-duuw-save-as`, also part
+of `--edit-duuw` and the default run):
+
+- A held job keeps the Save As write on the editor pool's one bulk worker.
+- The test queues Ctrl+N press, Ctrl+N release and a 'y' key, then
+  releases the worker.
+- It asserts that the new tab appears, the queue drains, 'y' is typed into
+  the new tab, the idle step returns `EDITOR_OK`, and the target holds
+  `base`.
+
+### 2. MINOR: the burst test now forces its trigger
+
+`duuw_burst` (`--edit-duuw-burst`) no longer depends on timing:
+
+- A held job occupies the journal pool's one worker for the whole burst.
+  The first pump therefore stays in flight, and no sync can return
+  durability credit.
+- Each admission step also waits until a pump is in flight. editor_step
+  admits a pump once a page fills or one journal tick passes.
+- The held job detects the flush without a clock. While the UI thread is
+  inside `editor_add_buffer` (an armed serial in one atomic,
+  `serial * 2 + 1`), it publishes a wake-up-only `EDITOR_PUBLISH_MESSAGE`,
+  which is a no-op in `editor_route_work`. It returns once that probe is
+  drained while the same add is still running. A COPY open never steps the
+  editor inside the add, so that drain can only be `journal_flush`'s own.
+- The test asserts the overlap: the pump was in flight before that add and
+  not in flight after it.
+
+Result: `open 82 flushed with the pump in flight before=1 after=0`.
+
+**Threshold comment fixed (P).** Open k (k = 1..n) re-emits TABS for k + 1
+tabs, so it writes 48 + 8(k + 1) bytes. The sum over n opens is
+56n + 4n(n + 1) = 4n^2 + 60n. That first exceeds 65,536 at n = 121
+(4 * 121^2 + 60 * 121 = 65,824; n = 120 gives 64,800). This matches the
+review and the 121 opens of the round-1 red run. With the worker held,
+BASE and TARGET records also count against the fixed durable boundary, so
+the forced flush comes earlier (open 82).
+
+### Red runs (round 2)
+
+Save As case on the round-1 code (the deadlock; the bounded wait fails):
+
+    edit-duuw: Save As queue stuck: file_command=150 queue=2 save_as=0 publish_owed=1 publish=0 tabs=1
+    editor_session_test:2877: FAIL trace_now_ns() < limit
+    exit=1
+
+I reconstructed the original code inside the worktree by undoing round 1's
+edits by hand on the five editor sources. The `journal_in_flight` query
+stayed, because the test needs it; that is test scaffolding, not a fix. The
+main checkout has moved past this worktree's base, so I could not use its
+files. On that reconstruction:
+
+    --edit-duuw-burst:
+    edit-duuw: open 82 flushed with the pump in flight before=1 after=0
+    edit-duuw: 82 opens, 83 tabs, 31816 TABS bytes
+    edit-duuw: Ctrl+N pending: file_command=150 op_count=0 accepted=493 durable=488 pending_bytes=941
+    editor_session_test:2776: FAIL trace_now_ns() < limit
+    burst exit=1
+    --edit-duuw-save-as:
+    edit-duuw: Save As queue stuck: file_command=150 queue=2 save_as=0 publish_owed=1 publish=0 tabs=1
+    editor_session_test:2877: FAIL trace_now_ns() < limit
+    save-as exit=1
+
+After the red runs I put the round-2 sources back from a byte copy, then
+rebuilt and re-ran everything below.
+
+### Green run and verification (round 2)
+
+Not charging, load avg 3.77 at start.
+
+    edit-duuw: gated Ctrl+N: step=0 file_command=150 in_flight=1 tabs=1
+    edit-duuw: open 82 flushed with the pump in flight before=1 after=0
+    edit-duuw: 82 opens, 83 tabs, 31816 TABS bytes
+    edit-duuw: a Ctrl+N gated by an in-flight journal job sleeps, then runs on its completion
+    edit-duuw: Ctrl+N and trailing input queued during Save As run once its checkpoint lands
+    edit-duuw: after an open burst Ctrl+N completes, the idle step sleeps, the journal stays durable and close finishes
+    duuw exit=0
+
+- `make -j4 all` (after the round-2 sources were put back): exit 0.
+- `ASAN_OPTIONS=detect_leaks=1`, through `tools/with_display_lock.sh`, :99:
+  `build/san/tests/journal_test` exit 0; `build/san/tests/editor_session_test`
+  (full default run, which now includes all three duuw cases) exit 0;
+  `build/san/tests/editor_test` exit 0 ("editor_test: all passed").
+- Release `build/tests/editor_test`: exit 0. Every one of its 23 `mallocs=`
+  reports reads `mallocs=0`, and 10 lines report `guard=active`.
+
+### Not done (as instructed)
+
+I left the pointer-scroll, Save As adoption and dirty-frame runnable
+clauses alone; they go to backlog. I did not run the full make check; the
+coordinator runs it at landing.
+
+### Files touched in round 2
+
+- `src/editor/retain.c`: the parked-input exception
+- `tests/editor_session_test.c`: `duuw_save_as_queue`, the forced
+  `duuw_burst` (`duuw_probe`, `duuw_hold`), and selectors
+  `--edit-duuw-gated`, `--edit-duuw-save-as`, `--edit-duuw-burst`
+- `docs/decisions/edit-duuw.md`: corrected the wake claim, added Round 2
+- this report
