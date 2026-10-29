@@ -1,3 +1,19 @@
+# HANDOFF — sublimité, session 27 on the ThinkPad (2026-10-29 morning; Opus 5.5 coordinator, Tobias present, partly by phone)
+
+## Read first (session 28)
+
+**v1 is reached by Tobias's declaration (2026-10-29):** "Two weeks is arbitrary. Let us assume I am happy and we have reached this milestone." Sublime was never installed after the 2026-10-26 reinstall. His condition: fixes from his use land quickly. Future work besides Windows: epic edit-wipw (design hill-climb: p304, kf04, b0j) and epic edit-nsgs (code quality: no slop, perf, memory footprint, binary size; set scope with Tobias, baseline first). PRD §5, §9, §12.
+
+**Installed 08:28: main e2b3284** with edit-m25u (one fd per file, raised RLIMIT_NOFILE), edit-duuw (idle spin and stalled journal after an open burst; Save As gate deadlock) and edit-zizz (over-capacity session restores unsaved buffers first, never unlinks its source). Tobias's next launch should show about 5 tabs (his three untitled texts, config.toml, CLAUDE.md) and the notice "restored 3 unsaved tabs; 1008 unmodified tabs …"; the old journal session-GSwNpK is then set aside, not deleted. Backup of his texts: ~/Documents/sublimite-recovered-2026-10-29/. Record: docs/worklog/2026-10-29.md.
+
+**How this session ran (worked, keep it):** Opus workers via the Agent tool, one per bead, worktrees .wt/<bead>-s27, briefs build/briefs/<bead>-s27.md with _rules-s27.md; Codex gpt-6.1-sol xhigh read-only reviews via tools/codex_run.py (briefs build/briefs/review*-s27.md, outputs docs/reviews/edit-<bead>[-rN].md); triage per law 8; fixes sent back to the same worker; coordinator rebases, full `make check` on the rebased tree, ff, install. Re-review every BLOCKER fix: edit-zizz took three rounds.
+
+**Open from today:** P3 edit-mvro (dataloss_test failed twice under load, two_process_save EDITOR_ERR_IO, not reproduced in 15 reruns); P4 backlog edit-9gpj, edit-t4q3, edit-99ko. A test instance from the m25u worker may still run on Xvfb :98 (pid 3844961, scratchpad profile); the coordinator's kill was refused by the permission classifier. Xvfb :95, :97, :98, :99 up. Worktrees .wt/*-s27 are landed and removable.
+
+**Next, in order:** Tobias's findings from use; then edit-hxa7 (G1 and the counting allocator are not enforced by make check); then the hill-climbs on his word.
+
+---
+
 # HANDOFF — sublimité, session 26 on the ThinkPad (2026-10-28 morning; Opus 5.5 coordinator, Tobias present, partly by phone via remote control; stopped on his word "I'll work with round 3 for a while. So now we can update handoff and commit and push")
 
 ## Read first (session 27)
