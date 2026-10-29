@@ -395,6 +395,12 @@ struct editor {
     uint64_t recovery_notice_mutations;
     bool recovery_notice_shown, recovery_retry, recovery_skip;
     char recovery_aside[IPC_PATH_CAP];
+    /* edit-zizz: an over-capacity session's restore or deferral notice.
+     * (P) the longest format with its three size_t counts at their widest,
+     * 20 decimal digits each (2^64 - 1), the NUL that sizeof counts, and the
+     * changed-on-disk suffix a session with conflicts appends after "; ". */
+    char session_notice[sizeof "restored  unsaved tabs ( closed: Ctrl+Shift+T);  unmodified tabs from the last session were not reopened" + 3u * 20u +
+        sizeof "; file changed on disk since this session; its unsaved edits were set aside" - 1u];
     size_t recovery_deferred; /* edit-fm4: discovered sessions left pending (too large to replay at startup) */
     /* edit-qct: placeholders hold tab IDs that never reach the journal;
      * restore_active counts placeholders with a scan or open in flight;

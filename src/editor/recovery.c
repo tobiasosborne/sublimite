@@ -89,7 +89,10 @@ typedef struct recovered_buffer {
     bool ops_valid;
     bool mapped_replay; /* no flat text or whole-BASE fallback */
     bool rewritten; /* edit-fi2: replayed from a retained copy; the target now differs */
+    uint8_t pick;   /* edit-zizz: recovered_pick, used only by a partial restore */
 } recovered_buffer;
+/* edit-zizz: what an over-capacity restore does with each buffer. */
+enum recovered_pick { PICK_DROP, PICK_LIVE, PICK_CLOSED, PICK_UNSAVED /* not yet placed */ };
 /* (P) op header: 1 type byte + 8-byte offset + 8-byte length. */
 #define OP_HEADER 17u
 typedef struct recovered_session {
@@ -103,6 +106,9 @@ typedef struct recovered_session {
     bool conflicts;     /* some buffer was marked */
     uint64_t paint;     /* edit-dzk1: last PAINT id; nonzero = died in that tab's first paint */
     const recovery_cost *cost;
+    /* edit-zizz: the session does not fit; install only picked buffers. */
+    bool partial;
+    size_t unsaved, unsaved_closed, dropped;
 } recovered_session;
 static uint64_t get64(const uint8_t *p)
 {
@@ -463,6 +469,140 @@ static bool unpainted_live(const recovered_session *s)
     for (size_t i = 0; i < s->count; i++) if (s->tabs[i] == s->paint) return true;
     return false;
 }
+/* edit-zizz: does the regular file at path hold exactly these bytes? */
+static bool disk_equals(const char *path, const uint8_t *bytes, size_t len)
+{
+    os_file source = OS_FILE_INIT;
+    if (os_file_open(&source, path, OS_OPEN_READ | OS_OPEN_NONBLOCK) != OS_OK) return false;
+    os_stat st;
+    bool same = os_file_stat(&source, &st) == OS_OK && st.kind == OS_KIND_FILE && st.size == len;
+    uint8_t disk[JOURNAL_INSERT_SLICE_BYTES]; /* reuse the wire slice as a chunk, as same_file does */
+    for (size_t off = 0; same && off < len;) {
+        size_t n = len - off < sizeof disk ? len - off : sizeof disk, got;
+        same = os_file_pread(&source, disk, n, off, &got) == OS_OK && got == n && !memcmp(disk, bytes + off, n);
+        off += n;
+    }
+    os_file_close(&source); return same;
+}
+/* edit-zizz: a buffer whose loss would lose text. An untitled buffer with
+ * content, or a file whose replayed bytes differ from the file install would
+ * open (the same comparison install_buffer's clean flag makes). A buffer
+ * without ops after a BASE that is the file itself replayed exactly the BASE
+ * bytes, which replay validated against the file. A retained private BASE
+ * copy (edit-fi2) is compared with the target like any edited buffer. An
+ * interrupted save always counts as unsaved. A changed BASE (edit-btj
+ * conflict) installs only the disk text: its edits live in the source
+ * journal, which a session with conflicts sets aside whole, so its tab ranks
+ * as unmodified. */
+static bool unsaved_buffer(recovered_buffer *r)
+{
+    if (r->conflict) return false;
+    if (r->save_pending) return true;
+    if (!*r->target) return r->len != 0;
+    if (r->ops_valid && !r->ops_len && !*r->retained) return false;
+    if (r->mapped_replay) return true; /* ops onto a mapped BASE: no flat text to compare */
+    gap_close(r);
+    return !disk_equals(r->target, r->bytes, r->len);
+}
+/* edit-zizz (coordinator follow-up): an unmodified file tab whose target no
+ * longer exists carries no bytes; the over-capacity path never reopens it.
+ * Only a definite absence counts: any other stat failure keeps the tab. */
+static bool target_vanished(const recovered_buffer *r)
+{
+    os_stat st;
+    os_err rc = *r->target ? os_stat_path(r->target, 0, &st) : OS_OK;
+    return rc == OS_E_NOENT || rc == OS_E_NOTDIR;
+}
+/* edit-zizz: pick what an over-capacity session restores (decided by Tobias
+ * 2026-10-29). Every unsaved buffer first: live while live room remains,
+ * then closed; then unmodified tabs in recorded tab order while live room
+ * remains, except tabs whose file vanished; the rest are dropped. Capacity
+ * follows session_fits: a closed buffer needs one temporary live slot before
+ * editor_close_tab retains it,
+ * and the edit-dzk1 unpainted buffer is never live. False when some unsaved
+ * buffer does not fit: the caller defers the whole source. */
+static bool plan_partial(const editor *e, recovered_session *s)
+{
+    size_t used = 0, total = 0, unsaved = 0, held = 0;
+    for (size_t i = 0; i < e->buffer_capacity; i++) if (e->buffers[i]) used++;
+    size_t room = e->tabs.capacity - tabs_count(&e->tabs);
+    size_t closed_room = e->tabs.closed_capacity - tabs_closed_count(&e->tabs);
+    size_t slots = e->buffer_capacity - used;
+    recovered_buffer *unpainted = s->paint ? find(s, s->paint) : NULL;
+    for (recovered_buffer *b = s->buffers; b; b = b->next) {
+        total++; b->pick = PICK_DROP;
+        if (!unsaved_buffer(b)) continue;
+        if (b == unpainted) { b->pick = PICK_CLOSED; held++; }
+        else { b->pick = PICK_UNSAVED; unsaved++; }
+    }
+    size_t live = unsaved, closed = held;
+    if (closed || live > room) {
+        size_t open = room ? room - 1u : 0; /* the temporary slot */
+        if (live > open) { closed += live - open; live = open; }
+    }
+    s->unsaved = unsaved + held; s->unsaved_closed = closed;
+    if ((closed && !room) || closed > closed_room || live + closed > slots) return false;
+    /* Unsaved buffers in tab order, then the closed ones, take live slots. */
+    size_t spare = room - live - (closed ? 1u : 0u), left = live;
+    if (spare > slots - live - closed) spare = slots - live - closed;
+    for (size_t i = 0; left && s->tabs_valid && i < s->count; i++) {
+        recovered_buffer *b = find(s, s->tabs[i]);
+        if (b && b->pick == PICK_UNSAVED) { b->pick = PICK_LIVE; left--; }
+    }
+    for (recovered_buffer *b = s->buffers; b; b = b->next) if (b->pick == PICK_UNSAVED) {
+        if (left) { b->pick = PICK_LIVE; left--; }
+        else b->pick = PICK_CLOSED;
+    }
+    /* Unmodified tabs in recorded tab order (buffer order without TABS). */
+    size_t kept = 0;
+    if (s->tabs_valid) {
+        for (size_t i = 0; kept < spare && i < s->count; i++) {
+            recovered_buffer *b = find(s, s->tabs[i]);
+            if (b && b != unpainted && b->pick == PICK_DROP && !target_vanished(b)) { b->pick = PICK_LIVE; kept++; }
+        }
+    } else {
+        for (recovered_buffer *b = s->buffers; kept < spare && b; b = b->next)
+            if (b != unpainted && b->pick == PICK_DROP && !target_vanished(b)) { b->pick = PICK_LIVE; kept++; }
+    }
+    s->dropped = total - live - closed - kept;
+    s->partial = true; return true;
+}
+/* edit-zizz: install the picked buffers. Live tabs keep their recorded order
+ * (unsaved buffers that were closed follow them); the active tab, or its
+ * right (else left) live neighbour, stays active, as for edit-dzk1's skip. */
+static int install_partial(editor *e, recovered_session *s, recovered_buffer *unpainted, bool unpainted_was_live,
+    size_t *count, size_t *active)
+{
+    size_t installed = 0, before = 0;
+    bool found = !s->tabs_valid; /* without TABS the first buffer is active */
+    int rc = 0;
+    for (size_t i = 0; !rc && s->tabs_valid && i < s->count; i++) {
+        recovered_buffer *b = find(s, s->tabs[i]);
+        if (!b) return EDITOR_ERR_IO;
+        if (b == unpainted || b->pick != PICK_LIVE || b->installed) continue;
+        if (i == s->active) found = true;
+        else if (i < s->active) before++;
+        rc = install_buffer(e, b);
+        if (!rc) installed++;
+    }
+    for (recovered_buffer *b = s->buffers; !rc && b; b = b->next)
+        if (b != unpainted && b->pick == PICK_LIVE && !b->installed) { rc = install_buffer(e, b); if (!rc) installed++; }
+    for (recovered_buffer *b = s->buffers; !rc && b; b = b->next) if (b != unpainted && b->pick == PICK_CLOSED) {
+        rc = install_buffer(e, b);
+        if (!rc) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
+    }
+    if (!rc && unpainted && unpainted->pick == PICK_CLOSED) {
+        rc = install_buffer(e, unpainted);
+        if (!rc) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
+        if (!rc && unpainted_was_live) {
+            e->recovery_notice = "a restored tab died in its first paint last time; it is closed (reopen: Ctrl+Shift+T)";
+            e->recovery_notice_mutations = e->stats.mutations;
+        }
+    }
+    *count = installed;
+    *active = found || before < installed ? before : installed ? installed - 1u : 0;
+    return rc;
+}
 static int install_session(editor *e, recovered_session *s)
 {
     /* edit-rzj: appended sessions keep the newest session's active tab and
@@ -490,17 +630,18 @@ static int install_session(editor *e, recovered_session *s)
     recovered_buffer *unpainted = s->paint ? find(s, s->paint) : NULL;
     bool unpainted_was_live = unpainted_live(s);
     size_t count = s->count, restored_active = s->active, skipped = SIZE_MAX;
-    for (size_t i = 0; !rc && i < s->count; i++) {
+    if (!rc && s->partial) rc = install_partial(e, s, unpainted, unpainted_was_live, &count, &restored_active);
+    for (size_t i = 0; !rc && !s->partial && i < s->count; i++) {
         recovered_buffer *b = find(s, s->tabs[i]);
         if (!b) { rc = EDITOR_ERR_IO; break; }
         if (b == unpainted) { skipped = i; continue; }
         rc = install_buffer(e, b);
     }
-    for (recovered_buffer *b = s->buffers; !rc && b; b = b->next) if (!b->installed && b != unpainted) {
+    for (recovered_buffer *b = s->buffers; !rc && !s->partial && b; b = b->next) if (!b->installed && b != unpainted) {
         rc = install_buffer(e, b);
         if (!rc && s->tabs_valid) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
     }
-    if (!rc && unpainted) {
+    if (!rc && !s->partial && unpainted) {
         rc = install_buffer(e, unpainted);
         if (!rc) rc = editor_close_tab(e, tabs_active_index(&e->tabs));
         if (!rc && unpainted_was_live) {
@@ -608,13 +749,19 @@ static int restore_source(editor *e, const char *directory, const char *previous
     }
     if (!rc && e->recover_existing && !session.buffers) rc = EDITOR_ERR_IO;
     if (!rc && session.buffers) {
-        if (!e->recover_existing && !session_fits(e, &session)) {
+    if (!e->recover_existing && !session_fits(e, &session) && !plan_partial(e, &session)) {
             /* Do not partially install or evict a dirty closed tab. Every
-             * skipped source stays discoverable on subsequent launches. */
-            e->recovery_notice = "additional session recovery deferred; journal retained (tab capacity)";
+             * skipped source stays discoverable on subsequent launches.
+             * edit-zizz: only a source whose unsaved buffers do not all fit
+             * gets here; the notice counts them. */
+            (void)snprintf(e->session_notice, sizeof e->session_notice,
+                "additional session recovery deferred; journal retained (tab capacity: %zu unsaved tab%s)",
+                session.unsaved, session.unsaved == 1u ? "" : "s");
+            e->recovery_notice = e->session_notice;
             e->recovery_notice_mutations = e->stats.mutations;
             fini(&session); return 0;
         }
+        const char *prior = e->recovery_notice;
         rc = install_session(e, &session);
         if (!rc) e->startup_restored = true;
         else if (!e->recover_existing) {
@@ -624,15 +771,35 @@ static int restore_source(editor *e, const char *directory, const char *previous
             e->recovery_retry = true; e->recovering = true;
             fini(&session); return EDITOR_ERR_IO;
         }
+        if (!rc && session.partial && e->recovery_notice == prior) {
+            /* edit-zizz: say what a partial restore left out; a later notice
+             * (changed BASE, set-aside source) still takes precedence. */
+            size_t n = session.unsaved, k = session.unsaved_closed, d = session.dropped;
+            char head[sizeof e->session_notice] = "", tail[sizeof e->session_notice] = "";
+            if (n && k) (void)snprintf(head, sizeof head, "restored %zu unsaved tab%s (%zu closed: Ctrl+Shift+T)", n, n == 1u ? "" : "s", k);
+            else if (n) (void)snprintf(head, sizeof head, "restored %zu unsaved tab%s", n, n == 1u ? "" : "s");
+            if (d) (void)snprintf(tail, sizeof tail, "%zu unmodified tab%s from the last session %s not reopened",
+                d, d == 1u ? "" : "s", d == 1u ? "was" : "were");
+            (void)snprintf(e->session_notice, sizeof e->session_notice, "%s%s%s", head, *head && *tail ? "; " : "", tail);
+            if (*e->session_notice) {
+                e->recovery_notice = e->session_notice;
+                e->recovery_notice_mutations = e->stats.mutations;
+            }
+        }
     }
     for (recovered_buffer *b = session.buffers; !rc && !aside && !session.conflicts && b; b = b->next) if (b->rewritten) {
         e->recovery_notice = "file changed on disk since this session; its unsaved edits were recovered";
         e->recovery_notice_mutations = e->stats.mutations;
     }
     if (!rc && (aside || session.conflicts)) {
-        e->recovery_notice = session.conflicts && !aside ?
+        const char *text = session.conflicts && !aside ?
             "file changed on disk since this session; its unsaved edits were set aside" :
             "session recovery failed; its journal was set aside";
+        if (session.partial && e->recovery_notice == e->session_notice) {
+            /* edit-zizz: keep what the partial restore left out in view too. */
+            size_t used = strlen(e->session_notice);
+            (void)snprintf(e->session_notice + used, sizeof e->session_notice - used, "; %s", text);
+        } else e->recovery_notice = text;
         e->recovery_notice_mutations = e->stats.mutations;
         (void)editor_set_aside(previous, e->recovery_aside, sizeof e->recovery_aside);
         if (!lock_name(lock_path, sizeof lock_path, previous)) (void)os_unlink(lock_path);

@@ -2891,6 +2891,268 @@ done:
     return result;
 }
 static int duuw_all(void) { return duuw_gated() || duuw_save_as_queue() || duuw_burst(); }
+/* edit-zizz: an over-capacity session restores every unsaved buffer first,
+ * then unmodified file tabs in tab order while live room remains; the rest
+ * are dropped (their bytes are on disk). (P) Fixture: six plain clean files
+ * c0..c5, one file edited and undone (x: ops after BASE, bytes equal disk),
+ * one modified file (m) and three untitled buffers with text (u1, u2, and u3,
+ * which is closed): 11 buffers, source tab order
+ * c0 u1 c1 m c2 x c3 u2 c4 c5 with c2 (index 4) active. */
+enum { ZIZZ_PLAIN = 6, ZIZZ_BUFFERS = 11, ZIZZ_UNSAVED = 4, ZIZZ_ACTIVE = 4 };
+typedef struct zizz_launch { char journal[IPC_PATH_CAP]; render_backend backend; editor *e; } zizz_launch;
+static int zizz_add(editor *e, const char *path, const char *text)
+{
+    uint64_t id; T(editor_add_buffer(e, path, NULL, 0, &id) == 0); T(settle(e) == 0);
+    uint64_t limit = deadline();
+    while (e->buffer->pending_open) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
+    if (text) T(press(e, (uint32_t)(unsigned char)text[0], 0, text) == 0);
+    return 0;
+}
+static int zizz_child(const char *root, const char *first)
+{
+    char c[ZIZZ_PLAIN][IPC_PATH_CAP], m[IPC_PATH_CAP], x[IPC_PATH_CAP];
+    for (int i = 0; i < ZIZZ_PLAIN; i++) T(snprintf(c[i], sizeof c[i], "%s/c%d", root, i) > 0);
+    T(snprintf(m, sizeof m, "%s/m", root) > 0); T(snprintf(x, sizeof x, "%s/x", root) > 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.journal_path = first, .start_empty = true, .cols = 32, .rows = 3};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
+    T(zizz_add(e, c[0], NULL) == 0); T(zizz_add(e, NULL, "U1x") == 0); T(zizz_add(e, c[1], NULL) == 0);
+    T(zizz_add(e, m, "M") == 0); T(zizz_add(e, c[2], NULL) == 0);
+    T(zizz_add(e, x, "x") == 0); T(press(e, 0xff08u, 0, NULL) == 0); /* BackSpace: equals disk again */
+    T(zizz_add(e, c[3], NULL) == 0); T(zizz_add(e, NULL, "U2y") == 0);
+    T(zizz_add(e, c[4], NULL) == 0); T(zizz_add(e, c[5], NULL) == 0);
+    T(zizz_add(e, NULL, "U3z") == 0); T(editor_close_tab(e, tabs_active_index(&e->tabs)) == 0); T(settle(e) == 0);
+    T(tabs_count(&e->tabs) == ZIZZ_BUFFERS - 1 && tabs_closed_count(&e->tabs) == 1);
+    T(editor_select_tab(e, ZIZZ_ACTIVE) == 0); T(settle(e) == 0);
+    T(journal_flush(e->journal) == 0 && editor_checkpoint(e) == 0);
+    return 0; /* the caller _exits: a crash, the checkpoint is an orphan */
+}
+static int zizz_source(const char *root, char *first, size_t cap)
+{
+    const char *names[] = {"c0", "c1", "c2", "c3", "c4", "c5", "m", "x"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        char path[IPC_PATH_CAP]; T(snprintf(path, sizeof path, "%s/%s", root, names[i]) > 0);
+        int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600); T(fd >= 0);
+        T(write(fd, names[i], strlen(names[i])) == (ssize_t)strlen(names[i])); T(close(fd) == 0);
+    }
+    T(snprintf(first, cap, "%s/session-XXXXXX", root) > 0);
+    int fd = mkstemp(first); T(fd >= 0); close(fd);
+    pid_t child = fork(); T(child >= 0);
+    if (!child) _exit(zizz_child(root, first));
+    int status; T(waitpid(child, &status, 0) == child); T(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+static int zizz_start(const char *root, zizz_launch *l, size_t live, size_t closed)
+{
+    l->e = NULL;
+    T(snprintf(l->journal, sizeof l->journal, "%s/session-XXXXXX", root) > 0);
+    int fd = mkstemp(l->journal); T(fd >= 0); close(fd);
+    T(render_null_backend(&l->backend) == 0);
+    editor_config config = {.journal_path = l->journal, .start_empty = true, .tab_capacity = live,
+        .closed_capacity = closed, .cols = 32, .rows = 3};
+    T(editor_open(&l->e, &config, &l->backend) == 0 && l->e); return settle(l->e);
+}
+static bool zizz_text(const tabs_tab *tab, const char *text)
+{
+    uint8_t bytes[sizeof "U1x"]; size_t len = strlen(text); /* (P) longest fixture text plus NUL */
+    return tab && len <= sizeof bytes && piece_len(tab->buffer) == len && !piece_read(tab->buffer, 0, bytes, len) &&
+        !memcmp(bytes, text, len);
+}
+static void zizz_remove(const char *root)
+{
+    DIR *d = opendir(root); struct dirent *entry;
+    if (d) {
+        while ((entry = readdir(d))) if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+            (void)unlinkat(dirfd(d), entry->d_name, 0);
+        closedir(d);
+    }
+    (void)rmdir(root);
+}
+/* Live room for every unsaved buffer: (P) tab_capacity 6 holds the four
+ * unsaved buffers live and the first two clean tabs (c0, c1) in tab order;
+ * closed_capacity 1 keeps buffer slots (7) below the 11 buffers. The active
+ * tab c2 is dropped: its right neighbour u2 (live index 4) becomes active. */
+static int zizz_check_live(const zizz_launch *l, const char *first)
+{
+    editor *e = l->e;
+    fprintf(stderr, "editor_session_test: zizz live: tabs=%zu closed=%zu active=%zu notice=%s source=%d\n",
+        tabs_count(&e->tabs), tabs_closed_count(&e->tabs), tabs_active_index(&e->tabs),
+        e->recovery_notice ? e->recovery_notice : "(none)", access(first, F_OK) == 0);
+    T(tabs_count(&e->tabs) == 6 && tabs_closed_count(&e->tabs) == 0);
+    T(zizz_text(editor_tab(e, 0), "c0") && !editor_tab(e, 0)->modified);
+    T(zizz_text(editor_tab(e, 1), "U1x") && editor_tab(e, 1)->modified);
+    T(zizz_text(editor_tab(e, 2), "c1") && !editor_tab(e, 2)->modified);
+    T(zizz_text(editor_tab(e, 3), "Mm") && editor_tab(e, 3)->modified);
+    T(zizz_text(editor_tab(e, 4), "U2y") && editor_tab(e, 4)->modified);
+    T(zizz_text(editor_tab(e, 5), "U3z") && editor_tab(e, 5)->modified);
+    T(tabs_active_index(&e->tabs) == 4);
+    T(e->recovery_notice && !strcmp(e->recovery_notice,
+        "restored 4 unsaved tabs; 5 unmodified tabs from the last session were not reopened"));
+    T(access(first, F_OK) < 0 && !*e->recovery_aside); /* retired: the new checkpoint holds the accepted state */
+    return 0;
+}
+/* Closed overflow: (P) tab_capacity 3 leaves two live slots for unsaved
+ * buffers plus the temporary slot a closed buffer needs before it is
+ * retained; closed_capacity 2 takes the other two. No clean tab fits. The
+ * dropped active c2 has no live right neighbour: m (index 1) is active. */
+static int zizz_check_closed(const zizz_launch *l, const char *first)
+{
+    editor *e = l->e;
+    fprintf(stderr, "editor_session_test: zizz closed: tabs=%zu closed=%zu active=%zu notice=%s source=%d\n",
+        tabs_count(&e->tabs), tabs_closed_count(&e->tabs), tabs_active_index(&e->tabs),
+        e->recovery_notice ? e->recovery_notice : "(none)", access(first, F_OK) == 0);
+    T(tabs_count(&e->tabs) == 2 && tabs_closed_count(&e->tabs) == 2);
+    T(zizz_text(editor_tab(e, 0), "U1x") && editor_tab(e, 0)->modified);
+    T(zizz_text(editor_tab(e, 1), "Mm") && editor_tab(e, 1)->modified);
+    const tabs_tab *a = tabs_closed_at(&e->tabs, 0), *b = tabs_closed_at(&e->tabs, 1);
+    T((zizz_text(a, "U2y") && zizz_text(b, "U3z")) || (zizz_text(a, "U3z") && zizz_text(b, "U2y")));
+    T(a->modified && b->modified);
+    T(tabs_active_index(&e->tabs) == 1);
+    T(e->recovery_notice && !strcmp(e->recovery_notice,
+        "restored 4 unsaved tabs (2 closed: Ctrl+Shift+T); 7 unmodified tabs from the last session were not reopened"));
+    T(access(first, F_OK) < 0 && !*e->recovery_aside);
+    return 0;
+}
+static int zizz_partial(bool closed)
+{
+    char made[] = "build/editor-zizz-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP], first[IPC_PATH_CAP], names[4096]; T(realpath(made, root));
+    zizz_launch a = {0}, b = {0};
+    int rc = zizz_source(root, first, sizeof first);
+    if (!rc) rc = zizz_start(root, &a, closed ? 3 : 6, closed ? 2 : 1);
+    if (!rc) rc = closed ? zizz_check_closed(&a, first) : zizz_check_live(&a, first);
+    size_t live = a.e ? tabs_count(&a.e->tabs) : 0, kept = a.e ? tabs_closed_count(&a.e->tabs) : 0;
+    if (a.e) editor_close(a.e);
+    /* A later launch at the same capacity finds only the partial restore's
+     * own checkpoint: it fits, restores the same tabs, and no stale deferred
+     * source remains. */
+    if (!rc) rc = zizz_start(root, &b, closed ? 3 : 6, closed ? 2 : 1);
+    if (!rc) {
+        editor *e = b.e;
+        size_t count = session_journals(root, names, sizeof names);
+        fprintf(stderr, "editor_session_test: zizz relaunch: tabs=%zu closed=%zu notice=%s journals=%zu [%s]\n",
+            tabs_count(&e->tabs), tabs_closed_count(&e->tabs), e->recovery_notice ? e->recovery_notice : "(none)", count, names);
+        if (tabs_count(&e->tabs) != live || tabs_closed_count(&e->tabs) != kept || e->recovery_notice ||
+            e->recovery_deferred || access(first, F_OK) == 0 || count != 1) rc = 1; /* (P) this launch's own journal */
+    }
+    if (b.e) editor_close(b.e);
+    zizz_remove(root);
+    if (!rc) puts(closed ? "zizz: unsaved buffers beyond live room restored as closed tabs; clean tabs dropped; source retired" :
+        "zizz: unsaved buffers and clean tabs that fit restored in tab order; source retired; relaunch finds no stale source");
+    return rc;
+}
+/* More unsaved buffers than capacity: (P) tab_capacity 2 and closed_capacity 1
+ * hold at most one live unsaved buffer (one slot stays for the temporary
+ * close) and one closed: four do not fit. The source stays whole and
+ * discoverable; the default capacity then restores all 11 buffers. */
+static int zizz_deferred(void)
+{
+    char made[] = "build/editor-zizz-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP], first[IPC_PATH_CAP]; T(realpath(made, root));
+    zizz_launch a = {0}, b = {0};
+    int rc = zizz_source(root, first, sizeof first);
+    if (!rc) rc = zizz_start(root, &a, 2, 1);
+    if (!rc) {
+        editor *e = a.e;
+        fprintf(stderr, "editor_session_test: zizz deferred: tabs=%zu closed=%zu notice=%s source=%d\n",
+            tabs_count(&e->tabs), tabs_closed_count(&e->tabs), e->recovery_notice ? e->recovery_notice : "(none)",
+            access(first, F_OK) == 0);
+        if (tabs_count(&e->tabs) || tabs_closed_count(&e->tabs) || !e->recovery_notice ||
+            strcmp(e->recovery_notice, "additional session recovery deferred; journal retained (tab capacity: 4 unsaved tabs)") ||
+            access(first, F_OK) || *e->recovery_aside || !file_contains(first, "U3z") || !file_contains(first, "U1x")) rc = 1;
+    }
+    if (a.e) editor_close(a.e);
+    if (!rc) rc = zizz_start(root, &b, 0, 0); /* (P) zero selects the default 128 live / 16 retained */
+    if (!rc) {
+        editor *e = b.e;
+        fprintf(stderr, "editor_session_test: zizz full: tabs=%zu closed=%zu notice=%s source=%d\n",
+            tabs_count(&e->tabs), tabs_closed_count(&e->tabs), e->recovery_notice ? e->recovery_notice : "(none)",
+            access(first, F_OK) == 0);
+        if (tabs_count(&e->tabs) != ZIZZ_BUFFERS - 1 || tabs_closed_count(&e->tabs) != 1 || e->recovery_notice ||
+            access(first, F_OK) == 0 || !zizz_text(editor_tab(e, 1), "U1x") || !zizz_text(tabs_closed_at(&e->tabs, 0), "U3z")) rc = 1;
+    }
+    if (b.e) editor_close(b.e);
+    zizz_remove(root);
+    if (!rc) puts("zizz: more unsaved buffers than capacity keeps the source whole; a launch with room restores all");
+    return rc;
+}
+/* A changed BASE (edit-btj conflict) installs only disk text and its edits
+ * stay in the source, which is set aside whole: such a tab ranks as
+ * unmodified, never as unsaved. (P) c0 and c1 are rewritten before the
+ * relaunch; at tab_capacity 6 / closed_capacity 1 the same four unsaved
+ * buffers and two clean-ranked tabs (now c0 and c1 again, as disk text) fit,
+ * and both notices show. */
+static int zizz_changed(void)
+{
+    char made[] = "build/editor-zizz-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP], first[IPC_PATH_CAP]; T(realpath(made, root));
+    zizz_launch a = {0};
+    int rc = zizz_source(root, first, sizeof first);
+    for (int i = 0; !rc && i < 2; i++) {
+        char path[IPC_PATH_CAP]; T(snprintf(path, sizeof path, "%s/c%d", root, i) > 0);
+        int fd = open(path, O_WRONLY | O_TRUNC); T(fd >= 0);
+        T(write(fd, "CHG", strlen("CHG")) == (ssize_t)strlen("CHG")); T(close(fd) == 0);
+    }
+    if (!rc) rc = zizz_start(root, &a, 6, 1);
+    if (!rc) {
+        editor *e = a.e;
+        fprintf(stderr, "editor_session_test: zizz changed: tabs=%zu closed=%zu notice=%s source=%d aside=%d\n",
+            tabs_count(&e->tabs), tabs_closed_count(&e->tabs), e->recovery_notice ? e->recovery_notice : "(none)",
+            access(first, F_OK) == 0, *e->recovery_aside != 0);
+        if (tabs_count(&e->tabs) != 6 || !zizz_text(editor_tab(e, 0), "CHG") || !zizz_text(editor_tab(e, 2), "CHG") ||
+            !zizz_text(editor_tab(e, 1), "U1x") || !zizz_text(editor_tab(e, 5), "U3z") || !e->recovery_notice ||
+            strcmp(e->recovery_notice, "restored 4 unsaved tabs; 5 unmodified tabs from the last session were not reopened; "
+                "file changed on disk since this session; its unsaved edits were set aside") ||
+            access(first, F_OK) == 0 || !*e->recovery_aside || !file_contains(e->recovery_aside, "U3z")) rc = 1;
+    }
+    if (a.e) editor_close(a.e);
+    zizz_remove(root);
+    if (!rc) puts("zizz: changed-on-disk tabs rank as unmodified; the source is set aside whole");
+    return rc;
+}
+/* A clean tab whose file vanished carries no bytes: the over-capacity path
+ * drops it and counts it as not reopened. (P) c0 and c1 are deleted before
+ * the relaunch (a changed BASE, so the source is set aside whole).
+ * tab_capacity 10 / closed_capacity 1 give 11 buffer slots for 11 buffers,
+ * but 10 live + 1 closed fails the temporary-slot rule. Live room 10 holds
+ * the four unsaved buffers and six clean tabs; only five clean files remain
+ * (c2 x c3 c4 c5), so 9 tabs and 2 not reopened (c0, c1). The active c2 stays
+ * active at live index 2 (after u1 and m). */
+static int zizz_vanished(void)
+{
+    char made[] = "build/editor-zizz-XXXXXX"; T(mkdtemp(made));
+    char root[IPC_PATH_CAP], first[IPC_PATH_CAP]; T(realpath(made, root));
+    zizz_launch a = {0};
+    int rc = zizz_source(root, first, sizeof first);
+    for (int i = 0; !rc && i < 2; i++) {
+        char path[IPC_PATH_CAP]; T(snprintf(path, sizeof path, "%s/c%d", root, i) > 0); T(unlink(path) == 0);
+    }
+    if (!rc) rc = zizz_start(root, &a, 10, 1);
+    if (!rc) {
+        editor *e = a.e;
+        fprintf(stderr, "editor_session_test: zizz vanished: tabs=%zu closed=%zu active=%zu notice=%s source=%d aside=%d\n",
+            tabs_count(&e->tabs), tabs_closed_count(&e->tabs), tabs_active_index(&e->tabs),
+            e->recovery_notice ? e->recovery_notice : "(none)", access(first, F_OK) == 0, *e->recovery_aside != 0);
+        const char *want[] = {"U1x", "Mm", "c2", "x", "c3", "U2y", "c4", "c5", "U3z"};
+        if (tabs_count(&e->tabs) != sizeof want / sizeof *want || tabs_closed_count(&e->tabs)) rc = 1;
+        for (size_t i = 0; !rc && i < sizeof want / sizeof *want; i++) if (!zizz_text(editor_tab(e, i), want[i])) {
+            fprintf(stderr, "editor_session_test: zizz vanished: tab %zu is not %s\n", i, want[i]); rc = 1;
+        }
+        if (!rc && (tabs_active_index(&e->tabs) != 2 || !e->recovery_notice ||
+            strcmp(e->recovery_notice, "restored 4 unsaved tabs; 2 unmodified tabs from the last session were not reopened; "
+                "file changed on disk since this session; its unsaved edits were set aside") ||
+            access(first, F_OK) == 0 || !*e->recovery_aside || !file_contains(e->recovery_aside, "U3z"))) rc = 1;
+    }
+    if (a.e) editor_close(a.e);
+    zizz_remove(root);
+    if (!rc) puts("zizz: clean tabs whose files vanished are not reopened and are counted");
+    return rc;
+}
+static int zizz_all(void)
+{
+    int a = zizz_partial(false), b = zizz_partial(true), c = zizz_deferred(), d = zizz_changed(), v = zizz_vanished();
+    return a || b || c || d || v;
+}
 static const test_selector selectors[] = {
     {"--edit-duuw", duuw_all},
     {"--edit-duuw-gated", duuw_gated},
@@ -2909,6 +3171,7 @@ static const test_selector selectors[] = {
     {"--edit-uzrb", select_edit_uzrb},
     {"--edit-dxas", dxas_all},
     {"--edit-14bi", select_edit_14bi},
+    {"--edit-zizz", zizz_all},
 };
 
 int main(int argc, char **argv)
@@ -2946,6 +3209,7 @@ int main(int argc, char **argv)
     T(evicted_saving_tab() == 0); T(checkpoint_during_evicted_save() == 0);
     T(crash_after_evicted_checkpoint() == 0);
     T(retired_named_release(true) == 0); T(retired_named_release(false) == 0);
+    T(zizz_all() == 0);
     puts("editor_session_test: headless save/repeated/new-target, recoverable failure retry, cutoff edits, shared targets, inactive failure, evicted saving tab, retired named buffers release slots and fds, checkpoint during evicted save and crash after it, interrupted-save startup, GB-scale orphan launch, Saving acknowledgement, allocation guard passed");
     return 0;
 }
