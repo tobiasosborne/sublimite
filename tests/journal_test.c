@@ -694,6 +694,24 @@ static int worker_test(void)
     CHECK(journal_flush(j)==0); journal_close(j); work_pool_shutdown(&pool); unlink(path);
     puts("journal_test: worker returns with undrained completion"); return 0;
 }
+/* edit-duuw: a blocking flush's own drain takes a pumped batch's completion.
+ * journal_in_flight is the one answer to "is that job still out": set by the
+ * pump, cleared by the flush, and nothing is left for the owner's drain. */
+static unsigned duuw_routed;
+static void duuw_route(const work_msg *m, void *ctx) { (void)m; (void)ctx; duuw_routed++; }
+static int in_flight_test(void)
+{
+    char path[]="/tmp/journal-in-flight-XXXXXX"; CHECK(temp(path)>=0); work_pool pool; CHECK(work_pool_init(&pool,1,0)==0);
+    journal *j; CHECK(journal_open(&j,path,&pool,NULL)==0);
+    CHECK(!journal_in_flight(j) && !journal_in_flight(NULL));
+    CHECK(journal_insert(j,1,0,(const uint8_t *)"x",1)==0 && journal_pump(j,1,true)==0);
+    CHECK(journal_in_flight(j));
+    CHECK(journal_flush(j)==0 && !journal_in_flight(j));
+    journal_stats s=journal_get_stats(j); CHECK(s.durable_sequence==s.accepted_sequence);
+    duuw_routed=0; (void)work_mailbox_drain(&pool,duuw_route,NULL); CHECK(duuw_routed==0); /* completion was taken */
+    journal_close(j); work_pool_shutdown(&pool); unlink(path);
+    puts("journal_test: flush takes the pump's completion; journal_in_flight follows it"); return 0;
+}
 static int save_names_test(void)
 {
     char directory[]="/tmp/journal-save-names-XXXXXX"; CHECK(mkdtemp(directory));
@@ -2052,6 +2070,7 @@ int main(int argc, char **argv)
         if(!strcmp(argv[1],"--save")) return save_test();
         if(!strcmp(argv[1],"--file-mailbox")) return file_mailbox_test();
         if(!strcmp(argv[1],"--worker")) return worker_test();
+        if(!strcmp(argv[1],"--in-flight")) return in_flight_test();
         if(!strcmp(argv[1],"--cadence")) return cadence_test();
         if(!strcmp(argv[1],"--save-names")) return save_names_test();
         if(!strcmp(argv[1],"--save-shared")) return save_shared_base_test();
@@ -2065,7 +2084,7 @@ int main(int argc, char **argv)
     CHECK(page_cache_test()==0 && append_failure_test()==0 && append_gap_test()==0);
     CHECK(rotate_busy_test()==0 && open_options_test()==0 && rotate_path_test()==0 && directory_fd_test()==0 && exact_prefix_test()==0 && full_test()==0 && paste_test(true)==0 && paste_test(false)==0 && untitled_test()==0 &&
           paths_test()==0 && schema_test(false)==0 && schema_test(true)==0 && base_read_test()==0 && rotate_name_test()==0);
-    CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && file_mailbox_test()==0 && worker_test()==0 &&
+    CHECK(retry_test()==0 && barriers_test()==0 && save_test()==0 && file_mailbox_test()==0 && worker_test()==0 && in_flight_test()==0 &&
           cadence_test()==0 && save_names_test()==0 && save_shared_base_test()==0 &&
           retained_external_test(false)==0 && retained_external_test(true)==0 && retained_copy_test()==0);
 

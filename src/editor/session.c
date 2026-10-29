@@ -540,6 +540,10 @@ bool editor_save_leased(const editor *e)
     return e->publish || (e->session && e->session->saving && e->session->saving->save &&
         savectl_get_model(e->session->saving->save).journal_leased);
 }
+/* While leased the worker owns the journal: the UI may not read it, and it is
+ * busy for every gate that would use it. */
+bool editor_journal_waiting(const editor *e)
+{ return e->journal && (editor_save_leased(e) || journal_in_flight(e->journal)); }
 /* edit-ze59: a worker checkpoint (editor_publish_start) owns the journal like
  * a save prepare does, and it and an in-flight Save As write pin buffers like
  * an active save: every journal, retirement and file-command gate that waits
@@ -615,7 +619,7 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
     s->saving = b; s->pending = true; s->finishing = s->blocked = false; s->pending_submit_ns = 0;
     b->save_revision = b->revision; b->save_cursor = b->history_cursor; b->save_tracking = true;
     undo_break_burst(&b->undo);
-    if (!e->journal_waiting && !e->op_count && !e->journal_group_open && !e->publish) {
+    if (!editor_journal_waiting(e) && !e->op_count && !e->journal_group_open && !e->publish) {
         s->pending = false;
         int rc = start(e, false);
         if (rc) start_failed(s, b, rc);
@@ -640,7 +644,7 @@ void editor_save_tick(editor *e)
     if (!s || !s->saving || s->blocked) return;
     editor_buffer *b = s->saving;
     savectl_tick(b->save); savectl_model model = savectl_get_model(b->save);
-    if (s->pending && !e->journal_waiting && !e->op_count && !e->journal_group_open && !model.busy && !e->publish) {
+    if (s->pending && !editor_journal_waiting(e) && !e->op_count && !e->journal_group_open && !model.busy && !e->publish) {
         s->pending = false;
         int rc = start(e, s->capture.finish);
         if (rc) start_failed(s, b, rc);
@@ -686,7 +690,7 @@ void editor_save_tick(editor *e)
         if (!s->blocked) { s->saving = NULL; save_snapshot_drop(b); }
         (void)editor_begin_frame(e); e->paint_ready = false; return;
     }
-    if (model.needs_finish && !model.busy && !s->finishing && !e->journal_waiting && !e->op_count && !e->journal_group_open) {
+    if (model.needs_finish && !model.busy && !s->finishing && !editor_journal_waiting(e) && !e->op_count && !e->journal_group_open) {
         editor_session_metadata(e);
         capture(e, b, trace_now_ns(), true);
         int rc = start(e, true);

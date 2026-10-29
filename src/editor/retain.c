@@ -94,7 +94,7 @@ void editor_retain_tick(editor *e)
      * here would postpone that choice while save-status repaint resumes on
      * its stale, deliberately unbound layout. */
     if (!editor_checkpoint_due(e) || e->source_choice || editor_activation_busy(e) || e->backend->active || e->queue_count ||
-        (e->dirty && e->frame.last_sequence) || e->op_count || e->journal_waiting ||
+        (e->dirty && e->frame.last_sequence) || e->op_count || editor_journal_waiting(e) ||
         e->journal_metadata_pending || e->journal_group_open || e->stats.journal_error) return;
     journal_stats js = journal_get_stats(e->journal);
     if (js.error || js.pending_bytes || js.accepted_sequence != js.durable_sequence) return;

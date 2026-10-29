@@ -273,11 +273,15 @@ void editor_save_as_close(editor *e)
     }
     e->save_as = NULL; save_as_free(a);
 }
+bool editor_file_command_ready(const editor *e)
+{
+    return e->file_command != KEYS_ACTION_NONE && !e->dirty && !e->backend->active &&
+        !editor_activation_busy(e) && !editor_save_active(e) && !e->op_count && !editor_journal_waiting(e) &&
+        !e->publish_owed; /* edit-ze59: one Save As and its checkpoint at a time */
+}
 int editor_file_command_service(editor *e)
 {
-    if (e->file_command == KEYS_ACTION_NONE || e->dirty || e->backend->active ||
-        editor_activation_busy(e) || editor_save_active(e) || e->op_count || e->journal_waiting ||
-        e->publish_owed) return 0; /* edit-ze59: one Save As and its checkpoint at a time */
+    if (!editor_file_command_ready(e)) return 0;
     keys_action command = e->file_command; e->file_command = KEYS_ACTION_NONE;
     if (e->file_command_owner != e->buffer->id || e->file_command_generation != e->buffer->source_generation) return 0;
     e->recovery_notice = NULL;

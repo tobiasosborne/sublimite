@@ -318,6 +318,12 @@ int journal_decode_window(const journal_record *record, journal_window *out);
  * IO/scheduling delays can extend the window; stats expose durable progress. */
 int journal_pump(journal *j, uint64_t now_ns, bool force);
 bool journal_receive(journal *j, const work_msg *message);
+/* edit-duuw: true while a batch job journal_pump submitted is in flight, i.e.
+ * until its completion is taken, whether by journal_receive or by the drain
+ * inside a blocking journal_flush/rotate/close. The single source of truth for
+ * "the pump is waiting": callers must not shadow it, because any blocking call
+ * can take the completion. Owner thread only (not while a worker leases j). */
+bool journal_in_flight(const journal *j);
 journal_stats journal_get_stats(const journal *j);
 /* Register the application's router for unrelated mailbox messages before
  * using blocking flush/close/rotate with a shared pool. No handler means the

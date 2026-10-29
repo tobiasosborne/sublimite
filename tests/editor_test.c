@@ -70,7 +70,7 @@ static int settle_frame(editor *e, bool glyphs)
         if (!s.pending && !s.render_active && (!glyphs || !font_async_pending(e->fonts))) return 0;
     } while (trace_now_ns() < deadline);
     fprintf(stderr, "settle timeout: queue=%zu action=%d dirty=%d layout=%d op_count=%zu journal_waiting=%d journal_pending=%zu font=%d map=%d full=%d render=%d\n",
-        e->queue_count, e->action, e->dirty, layout_busy(&e->lay), e->op_count, e->journal_waiting,
+        e->queue_count, e->action, e->dirty, layout_busy(&e->lay), e->op_count, editor_journal_waiting(e),
         e->journal ? journal_get_stats(e->journal).pending_bytes : 0u, font_async_pending(e->fonts),
         e->buffer->map_snapshot != NULL, e->full_pending, e->backend->active);
     T(false); return 1;

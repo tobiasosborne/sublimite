@@ -479,7 +479,6 @@ struct editor {
     bool dirty, extra_rows, resize_pending, full_pending;
     bool repair_line_valid;
     bool focused, visible, blinking, quit;
-    bool journal_waiting;
     uint64_t checkpoint_retry_ns; /* edit-dr9: busy close retries on the journal tick */
     /* edit-ivv: a checkpoint the shared directory guard refused (JOURNAL_BUSY)
      * keeps its caller's state; the caller retries once editor_checkpoint_due.
@@ -556,6 +555,10 @@ int editor_save_request(editor *e, uint64_t request_ns);
 void editor_save_tick(editor *e);
 bool editor_save_leased(const editor *e);
 bool editor_save_active(const editor *e);
+/* edit-duuw: a journal job is out (journal_in_flight) or a worker leases the
+ * journal; derived on each call, never stored: any blocking flush or rotate
+ * can take a pump's completion, so a shadow flag can stick. */
+bool editor_journal_waiting(const editor *e);
 void editor_save_overlay(editor *e);
 void editor_save_submitted(editor *e, uint64_t submitted_ns);
 int editor_session_restore(editor *e);
@@ -770,6 +773,9 @@ bool editor_close_prompt_shown(const editor *e);
 bool editor_close_ready(const editor *e);
 int editor_close_service(editor *e);
 void editor_close_overlay(editor *e);
+/* edit-duuw: the one gate for a pending New File / Open / Save As; runnable()
+ * uses it too, so a gated command never keeps the loop from sleeping. */
+bool editor_file_command_ready(const editor *e);
 int editor_file_command_service(editor *e);
 int editor_register_journal(editor *e, editor_buffer *b, uint64_t id);
 /* editor_add_buffer without path reuse: journal recovery only (edit-dlfix). */

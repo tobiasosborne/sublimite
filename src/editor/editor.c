@@ -260,7 +260,7 @@ void editor_route_work(const work_msg *msg, void *ctx)
         if (editor_begin_frame(e)) e->error=EDITOR_ERR_HISTORY;
         e->paint_ready=false; return;
     }
-    if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) { e->journal_waiting = false; return; }
+    if (!editor_save_leased(e) && e->journal && journal_receive(e->journal, msg)) return;
     if (editor_restore_receive(e, msg)) return; /* edit-qct: completion only wakes the loop */
     if (editor_font_event(e, msg)) return;
     if (msg->kind == LINEIDX_MSG_PROGRESS) {
@@ -830,7 +830,7 @@ static bool runnable(const editor *e)
         if (b && b->index && !b->retired && !b->source_stale && !b->pending_open &&
             (lineidx_build_needs_poll(b->index) || (b->index_dirty && !lineidx_building(b->index)))) return true;
     }
-    return (e->file_command != KEYS_ACTION_NONE && !e->dirty && !e->backend->active) ||
+    return editor_file_command_ready(e) || /* edit-duuw: the service's own gate */
            (editor_pointer_scrolling(e) && !e->backend->active && !editor_scroll_waiting(e) && !e->wheel_pending && !editor_clip_busy(e)) ||
            (editor_scroll_waiting(e) && !e->buffer->scroll_resident.pending) ||
            (editor_font_pending(e) && !e->font.handle.epoch) ||
@@ -867,7 +867,7 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
     if (e->journal && !editor_save_leased(e)) {
         journal_stats s = journal_get_stats(e->journal);
         if (s.error) e->stats.journal_error = s.error;
-        if (!editor_save_leased(e) && !e->journal_waiting && s.accepted_sequence > s.durable_sequence) {
+        if (!editor_journal_waiting(e) && s.accepted_sequence > s.durable_sequence) {
             uint64_t next = s.last_sync_ns + UINT64_C(1000000000);
             if (next <= now) next = now + UINT64_C(5000000);
             if (next < deadline) deadline = next;
@@ -1069,7 +1069,7 @@ int editor_step(editor *e, int timeout_ms)
     record_slice(e, submit_start); if (rc) return rc;
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
     rc = present(e);
-    if (!rc && e->journal && !editor_save_leased(e) && !e->journal_waiting) {
+    if (!rc && e->journal && !editor_journal_waiting(e)) {
         journal_stats s = journal_get_stats(e->journal); uint64_t now = trace_now_ns();
         /* Pump only when the default batch/deadline admission is due. A
          * successful pump has scheduled a job; its mailbox advances sync.
@@ -1077,8 +1077,7 @@ int editor_step(editor *e, int timeout_ms)
         if (s.accepted_sequence > s.durable_sequence &&
             (e->op_count || e->journal_metadata_pending || s.pending_bytes >= JOURNAL_PAGE - JOURNAL_HEADER || now - s.last_sync_ns >= UINT64_C(1000000000))) {
             int jr = journal_pump(e->journal, now, e->op_count != 0 || e->journal_metadata_pending);
-            if (!jr) e->journal_waiting = true;
-            else if (jr != JOURNAL_BUSY) e->stats.journal_error = jr;
+            if (jr && jr != JOURNAL_BUSY) e->stats.journal_error = jr;
         }
     }
     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
@@ -1200,7 +1199,6 @@ int editor_flush(editor *e)
         if (metadata == JOURNAL_BUSY) { int jr = journal_flush(e->journal); if (jr) { metadata = jr; break; } }
     } while (metadata == JOURNAL_BUSY);
     int rc = metadata ? metadata : journal_flush(e->journal);
-    e->journal_waiting = false;
     /* edit-fi0p F4: flush is off-path and has joined the journal worker.
      * Repair a failed name barrier (or queued append transport) before
      * considering rotation. Writeback loss still refuses retry and needs

@@ -2670,7 +2670,117 @@ static int select_edit_14bi(void)
 {
     return retained_lazy_case(true, UINT64_MAX, false);
 }
+/* edit-duuw: an open burst makes protected_record (buffers.c) meet
+ * JOURNAL_BUSY and run a blocking journal_flush while the step's pump is in
+ * flight; that flush's own drain takes the pump's completion. Each open is
+ * added right after a step, before the next step's drain, so every open
+ * after a pumping step falls in that window, as the coordinator's repro
+ * (IPC opens admitted in the step after a pump) does. (E) each open re-emits a TABS
+ * record of 48 + 8n bytes for n tabs (journal_set_tabs: 32-byte header,
+ * 16 fixed payload bytes, 8 per id): n opens write 48n + 4n(n + 1) bytes,
+ * first past JOURNAL_DEFAULT_SYNC_BYTES at n = 126 (bead text); the loop sums
+ * the exact records, so crossing that window makes protected_record flush at
+ * least once, within the fixture's 128-tab strip (open 128 is refused: (M)).
+ * After the burst: Ctrl+N completes, the idle step reports EDITOR_OK (not
+ * EDITOR_MORE forever), durable_sequence reaches accepted_sequence, and a
+ * window close finishes. Bounds are deadline() (EDITOR_IDLE_NS); the blocking
+ * step waits at most one journal tick (JOURNAL_DEFAULT_SYNC_NS in ms). */
+static int duuw_burst(void)
+{
+    fixture f = {0}; int result = 0; size_t opened = 0; uint64_t bytes = 0;
+#define C(x) do { if (!(x)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(open_fixture(&f, true, false) == 0);
+    while (bytes <= JOURNAL_DEFAULT_SYNC_BYTES) {
+        char path[IPC_PATH_CAP]; uint64_t id;
+        C(snprintf(path, sizeof path, "%s/small-%zu", f.directory, opened) > 0);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600); C(fd >= 0);
+        ssize_t wrote = write(fd, "x\n", strlen("x\n")); close(fd); C(wrote == (ssize_t)strlen("x\n"));
+        int added = editor_add_buffer(f.e, path, NULL, 0, &id);
+        if (added) fprintf(stderr, "edit-duuw: open %zu refused: %d (journal error %d)\n", opened, added, f.e->stats.journal_error);
+        C(added == 0);
+        opened++; bytes += 48u + 8u * tabs_count(&f.e->tabs); /* this open's TABS record */
+        /* The IPC drain's own admission (buffers.c): no activation or mapped
+         * open in progress; the next open follows the last step's pump. */
+        uint64_t admit = deadline();
+        do { C(turn(f.e) == 0); C(trace_now_ns() < admit); } while (editor_activation_busy(f.e) || f.e->opening);
+    }
+    size_t tabs = tabs_count(&f.e->tabs);
+    fprintf(stderr, "edit-duuw: %zu opens, %zu tabs, %ju TABS bytes\n", opened, tabs, (uintmax_t)bytes);
+    plat_event ctrl_n = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'n', .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
+    C(editor_inject(f.e, &ctrl_n) == 0);
+    uint64_t limit = deadline();
+    while (tabs_count(&f.e->tabs) == tabs) {
+        C(turn(f.e) == 0);
+        if (trace_now_ns() >= limit) {
+            journal_stats s = journal_get_stats(f.e->journal);
+            fprintf(stderr, "edit-duuw: Ctrl+N pending: file_command=%d op_count=%zu accepted=%ju durable=%ju pending_bytes=%ju\n",
+                (int)f.e->file_command, f.e->op_count, (uintmax_t)s.accepted_sequence, (uintmax_t)s.durable_sequence, (uintmax_t)s.pending_bytes);
+        }
+        C(trace_now_ns() < limit); sched_yield();
+    }
+    C(tabs_count(&f.e->tabs) == tabs + 1u && f.e->file_command == KEYS_ACTION_NONE);
+    int rc = EDITOR_MORE; limit = deadline();
+    while (rc == EDITOR_MORE) { rc = editor_step(f.e, 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(rc == EDITOR_OK);
+    const int tick_ms = (int)(JOURNAL_DEFAULT_SYNC_NS / UINT64_C(1000000));
+    limit = deadline();
+    for (;;) {
+        journal_stats s = journal_get_stats(f.e->journal);
+        if (s.durable_sequence == s.accepted_sequence) break;
+        rc = editor_step(f.e, tick_ms); C(rc == EDITOR_OK || rc == EDITOR_MORE); C(trace_now_ns() < limit);
+    }
+    plat_event close_event = {.kind = PLAT_EV_CLOSE};
+    C(editor_inject(f.e, &close_event) == 0);
+    limit = deadline(); rc = EDITOR_MORE;
+    while (rc == EDITOR_OK || rc == EDITOR_MORE) { rc = editor_step(f.e, 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(rc == EDITOR_CLOSED);
+done:
+    if (f.e) editor_close(f.e);
+    fm4_remove_tree(f.directory); /* sources and journal on every exit */
+#undef C
+    if (!result) puts("edit-duuw: after an open burst Ctrl+N completes, the idle step sleeps, the journal stays durable and close finishes");
+    return result;
+}
+/* edit-duuw: a file command gated by an in-flight journal job lets the loop
+ * sleep. The held job occupies the journal pool's one worker (open.c), so a
+ * typed key's pump stays queued behind it; Ctrl+N is then gated by
+ * editor_journal_waiting and the step must report EDITOR_OK, not EDITOR_MORE.
+ * Releasing the worker completes the pump and the command runs. */
+static int duuw_gated(void)
+{
+    fixture f = {0}; held_bulk bulk = {0}; int result = 0;
+#define C(x) do { if (!(x)) { fprintf(stderr, "editor_session_test:%d: FAIL %s\n", __LINE__, #x); result = 1; goto done; } } while (0)
+    C(open_fixture(&f, true, false) == 0);
+    work_handle handle = work_submit(&f.e->journal_pool, (work_job){hold_bulk, &bulk, 0, WORK_BULK}); C(handle.epoch);
+    uint64_t limit = deadline();
+    while (!atomic_load(&bulk.entered)) { C(trace_now_ns() < limit); sched_yield(); }
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8 = "x", .utf8_len = 1, .t0_ns = trace_now_ns()};
+    C(editor_inject(f.e, &key) == 0);
+    limit = deadline();
+    while (!journal_in_flight(f.e->journal)) { C(turn(f.e) == 0); C(trace_now_ns() < limit); sched_yield(); }
+    size_t tabs = tabs_count(&f.e->tabs);
+    plat_event ctrl_n = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'n', .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
+    C(editor_inject(f.e, &ctrl_n) == 0);
+    int rc = EDITOR_MORE; limit = deadline();
+    while (rc == EDITOR_MORE) { rc = editor_step(f.e, 0); C(trace_now_ns() < limit); sched_yield(); }
+    fprintf(stderr, "edit-duuw: gated Ctrl+N: step=%d file_command=%d in_flight=%d tabs=%zu\n",
+        rc, (int)f.e->file_command, journal_in_flight(f.e->journal), tabs_count(&f.e->tabs));
+    C(rc == EDITOR_OK && f.e->file_command == KEYS_ACTION_NEW_FILE && tabs_count(&f.e->tabs) == tabs);
+    atomic_store(&bulk.release, true);
+    limit = deadline();
+    while (tabs_count(&f.e->tabs) == tabs) { C(turn(f.e) == 0); C(trace_now_ns() < limit); sched_yield(); }
+    C(f.e->file_command == KEYS_ACTION_NONE && !journal_get_stats(f.e->journal).error);
+done:
+    atomic_store(&bulk.release, true);
+    if (f.e) editor_close(f.e);
+    fm4_remove_tree(f.directory); /* source and journal on every exit */
+#undef C
+    if (!result) puts("edit-duuw: a Ctrl+N gated by an in-flight journal job sleeps, then runs on its completion");
+    return result;
+}
+static int duuw_all(void) { return duuw_gated() || duuw_burst(); }
 static const test_selector selectors[] = {
+    {"--edit-duuw", duuw_all},
     {"--explicit-changed-base", explicit_changed_base},
     {"--edit-qcuh", select_edit_qcuh},
     {"--edit-ivv", ivv_all},
@@ -2693,6 +2803,7 @@ int main(int argc, char **argv)
     test_select_fn selected = TEST_SELECT(selectors, argc == 2 ? argv[1] : NULL);
     if (selected) return selected();
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
+    T(duuw_all() == 0);
     T(ivv_all() == 0);
     T(xdro_all() == 0);
     T(retained_lazy() == 0);

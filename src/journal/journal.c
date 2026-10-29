@@ -829,6 +829,7 @@ bool journal_receive(journal *j, const work_msg *m)
     j->active=false;
     return true;
 }
+bool journal_in_flight(const journal *j) { return j && j->active; }
 journal_stats journal_get_stats(const journal *j)
 {
     if(!j) return (journal_stats){.error=JOURNAL_INVALID};
