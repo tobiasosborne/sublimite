@@ -32,6 +32,8 @@ Deferred, not forbidden: multiple cursors / column select (v1.x); LSP, autocompl
 
 Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target A, with every enforced Target A gate green in the benchmark harness on battery, and no fallback to another editor during the trial. Usage is part of the criterion, not just measurements.
 
+**Reached 2026-10-29 (Tobias):** "Two weeks is arbitrary. Let us assume I am happy and we have reached this milestone." Sublime was never installed on the ThinkPad after its 2026-10-26 reinstall and was not missed; sublimité has been the only editor there since. The condition for it staying that way: bug fixes from use land quickly. Work after v1, besides M3 Windows, is two hill-climbs (§12).
+
 ## 6. Functional requirements
 
 ### 6.1 Launch and routing
@@ -92,7 +94,7 @@ Sublime Text is uninstalled after **two weeks of exclusive daily use** on Target
 
 ## 9. Milestones (exit by use, not by gate; 2026-10-11)
 
-M0 exited by use 2026-10-26 (Tobias: "the editor is good enough that I can use it and report bugs slowly"; bead edit-pi6). Precondition for every hand-over to Tobias: full `make check` green on that build and the landed beads' own verification. The Astra vs Sublime drive (PLAN P5.1b) was the precondition from 2026-10-11 to 2026-10-25 and is retired (Tobias, 2026-10-26: a bootstrap loop to get the first versions above the buggy floor); it stays available as a test tool on request.
+M1, M2 and v1 exited by use 2026-10-29 (Tobias declared v1 reached, §5). M0 exited by use 2026-10-26 (Tobias: "the editor is good enough that I can use it and report bugs slowly"; bead edit-pi6). Precondition for every hand-over to Tobias: full `make check` green on that build and the landed beads' own verification. The Astra vs Sublime drive (PLAN P5.1b) was the precondition from 2026-10-11 to 2026-10-25 and is retired (Tobias, 2026-10-26: a bootstrap loop to get the first versions above the buggy floor); it stays available as a test tool on request.
 
 | | Scope | Exit criterion |
 |---|---|---|
@@ -118,3 +120,11 @@ M0 exited by use 2026-10-26 (Tobias: "the editor is good enough that I can use i
 - Default font to embed (licence must allow embedding; DejaVu Sans Mono or JetBrains Mono).
 - Whether the hot-exit journal should also back a cross-session "scratch" buffer (Sublime's untitled tabs that never get saved).
 - Initial grammar list: confirm the ten above against what actually gets edited in the trial.
+
+## 12. After v1 (Tobias, 2026-10-29)
+
+Besides M3 Windows, future work is two hill-climbs, each run as its own epic:
+1. **Design:** still not good enough. The bar is `docs/design/rubric.md` (the platonic ultimate design; perf never suffers).
+2. **Code quality:** no slop; performance; refactoring for memory footprint and binary size.
+
+Fixes from Tobias's use stay ahead of both.
