@@ -188,3 +188,127 @@ Manual cold rows remain unmeasured as the benchmark states.
 - Save As policy is settled by matching Linux destination xattrs; no additional
   product decision is needed for streams. EFS and previously documented Windows
   rename power-loss/audit-policy limitations remain outside scope.
+
+## Round 2
+
+Both accepted review findings are fixed in `src/file/file_win.c`: unsupported
+stream-information responses produce an empty list, and empty counted names or
+case-insensitive `::$DATA` identify the snapshot's default stream. Record size,
+name bounds, stream size, and next-offset validation remain active. Other query
+errors and failures copying reported streams remain fatal. The decision document
+records this behavior; no Linux implementation changed.
+
+`tests/win/file_win_test.c` injects each unsupported status through `r2_query`,
+checks successful byte-exact overwrites, and checks that access denial and device
+I/O failure retain the original default and named-stream bytes without temporary
+artifacts. Synthetic counted records exercise empty, lowercase, uppercase, and
+mixed-case default names. Each checks snapshot bytes and no native stream-open
+attempts (every `stream_copy` starts with one, including an empty name). Invalid
+offsets and incomplete headers still fail for each default representation.
+
+Red evidence (M: captured process exits), before the implementation change:
+
+```sh
+taskset -c 48-63 nice -n 10 make TARGET=win -j16 build/win/rel/tests/file_win_test.exe build/win/tools/win_quiet_run.exe
+# exit 0
+taskset -c 48-63 nice -n 10 tools/winrun.sh build/win/rel/tests/file_win_test.exe stream-unsupported
+# exit 1
+```
+
+```text
+tests/win/file_win_test.c:395: FAIL rc == (cases[i].unsupported ? FILE_OK : FILE_ERR_IO) (native 87)
+file_win_test: STATUS_INVALID_PARAMETER: rc=1 native=87
+file_win_test: STATUS_NOT_IMPLEMENTED: rc=1 native=1
+file_win_test: STATUS_INVALID_INFO_CLASS: rc=1 native=87
+file_win_test: STATUS_ACCESS_DENIED: rc=1 native=5
+file_win_test: STATUS_IO_DEVICE_ERROR: rc=1 native=1117
+file_win_test: stream-unsupported: FAILED
+```
+
+```sh
+taskset -c 48-63 nice -n 10 tools/winrun.sh build/win/rel/tests/file_win_test.exe stream-default
+# exit 1
+```
+
+```text
+tests/win/file_win_test.c:415: FAIL r2_save(path, NULL) == FILE_OK (native 13)
+file_win_test: stream-default: FAILED
+```
+
+The unsupported responses each refused the save and failed the byte oracle;
+access denial and device failure passed their refusal/preservation assertions.
+The empty, lowercase, and mixed-case names each failed the success and byte
+assertions, while uppercase passed (M: corresponding case-array order and full
+red log). Full logs: `/tmp/edit-177r.22-round2-red-{build,unsupported,default}.log`.
+Sandboxed attempts could not bind the WSL interop socket; actual Windows runs
+used sandbox escalation and the required private-station runner.
+
+Green verification (M: captured process exits), [AC, desktop Spiral], Tobias
+using the box. The assigned parallelism is derived from the CPU range
+(G: `63 - 48 + 1 = 16`). Before final verification, `uptime` reported load
+averages `9.29, 5.99, 6.01` (M); no battery status exists on this desktop.
+
+```sh
+taskset -c 48-63 nice -n 10 make TARGET=win -j16 \
+  build/win/rel/tests/file_win_test.exe build/win/rel/tests/file_test.exe build/win/rel/tests/savectl_test.exe \
+  build/win/san/tests/file_win_test.exe build/win/san/tests/file_test.exe build/win/san/tests/savectl_test.exe
+# exit 0
+for config in rel san; do
+  for suite in file_win_test file_test savectl_test; do
+    taskset -c 48-63 nice -n 10 tools/winrun.sh "build/win/$config/tests/$suite.exe"
+  done
+done
+# each invocation exit 0 (captured separately, not inferred from the loop exit)
+taskset -c 48-63 nice -n 10 make -j16 all
+# exit 0
+taskset -c 48-63 nice -n 10 env -u DISPLAY make -j16 check
+# exit 0
+```
+
+Relevant Windows green output, present in both configurations:
+
+```text
+file_win_test: STATUS_INVALID_PARAMETER: rc=0 native=0
+file_win_test: STATUS_NOT_IMPLEMENTED: rc=0 native=0
+file_win_test: STATUS_INVALID_INFO_CLASS: rc=0 native=0
+file_win_test: STATUS_ACCESS_DENIED: rc=1 native=5
+file_win_test: STATUS_IO_DEVICE_ERROR: rc=1 native=1117
+file_win_test: stream-unsupported: ok
+file_win_test: stream-default: ok
+file_win_test: 18 cases, ok
+file_test: Windows ok
+savectl production Windows external reload, ADS failure keeps dirty buffer/target/streams, retry preserves MOTW: ok
+savectl_test: ok
+```
+
+The Windows case count is measured from the suite's case-array length (M).
+Native diagnostics and return codes above are observed values (M); the tests
+compare fatal diagnostics against `RtlNtStatusToDosError` and file return codes.
+Existing named-stream preservation/failure/cancellation coverage also passes.
+Build log: `/tmp/edit-177r.22-round2-win-build.log`; individual status summary:
+`/tmp/edit-177r.22-round2-win-status.log`; full suite logs:
+`/tmp/edit-177r.22-round2-{rel,san}-{file_win_test,file_test,savectl_test}.log`.
+
+Linux results (M, [AC, desktop Spiral]; counts and elapsed time come from the
+existing harness, not new limits):
+
+```text
+check: FLAKY os_test (failed in parallel, passed alone; see build/check-logs/os_test.log and build/check-flaky.log)
+check: FLAKY dataloss_test (failed in parallel, passed alone; see build/check-logs/dataloss_test.log and build/check-flaky.log)
+check: 117 test binaries passed in 186.7 s (parallel, 16 jobs, 6 displays)
+test_replay_cli: all passed
+display lock contract: owner PID, alias/timeout, make/scripts, nested inheritance, exit status PASS
+```
+
+Linux logs: `/tmp/edit-177r.22-round2-linux-all.log` and
+`/tmp/edit-177r.22-round2-linux-check.log`. Linux check used its private Xvfbs
+outside the socket-restricted sandbox with `DISPLAY` unset. The display-lock
+contract deliberately prints nested timeout/error results and ends with PASS.
+
+Found, not fixed / coordinator decisions: triage the parallel-only `os_test`
+stray-fault child timeout (`os_proc_wait` returned `OS_E_TIMEDOUT`) and
+`dataloss_test` detached-rewrite recovery failure (`detached_rewrite(false)`,
+recovered original lost). Both passed the harness's serial retry; original and
+retry logs remain in `build/check-logs/`, with records in `build/check-flaky.log`.
+No additional retries or changes to these out-of-scope paths were made. No
+product decision is required for the accepted fixes.

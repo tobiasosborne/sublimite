@@ -338,6 +338,12 @@ static int streams_query(save_transaction *tx, void **out, size_t *length)
         IO_STATUS_BLOCK io = {0};
         NTSTATUS status = NtQueryInformationFile(os_file_handle(&tx->metadata_fd), &io,
             buffer, capacity, FileStreamInformation);
+        if (status == (NTSTATUS)0xc000000du || status == (NTSTATUS)0xc0000002u ||
+            status == (NTSTATUS)0xc0000003u) { /* INVALID_PARAMETER, NOT_IMPLEMENTED, INVALID_INFO_CLASS */
+            /* These volumes report no streams; ordinary overwrites still work. */
+            free(buffer); *out = NULL; *length = 0;
+            return FILE_OK;
+        }
         if (status == (NTSTATUS)0x80000005u || status == (NTSTATUS)0xc0000023u ||
             status == (NTSTATUS)0xc0000004u) { /* OVERFLOW, TOO_SMALL, LENGTH_MISMATCH */
             free(buffer);
@@ -428,13 +434,16 @@ int file_streams_copy(save_transaction *tx)
         if (n > length - at - head || n % sizeof(WCHAR) || n > USHRT_MAX ||
             entry->StreamSize.QuadPart < 0) goto invalid;
         size_t units = n / sizeof(WCHAR);
-        if (units < 7 || entry->StreamName[0] != L':' ||
-            memcmp(entry->StreamName + units - 6, L":$DATA", 6 * sizeof(WCHAR))) goto invalid;
-        /* Refuse malformed/foreign stream types rather than lose them. */
-        for (size_t i = 1; i < units - 6; i++)
-            if (!entry->StreamName[i] || entry->StreamName[i] == L':' ||
-                entry->StreamName[i] == L'/' || entry->StreamName[i] == L'\\') goto invalid;
-        if (units != 7) { /* ::$DATA is the snapshot already written. */
+        /* Both forms name the default stream already written from the snapshot. */
+        bool default_stream = !units || (units == 7 &&
+            CompareStringOrdinal(entry->StreamName, 7, L"::$DATA", 7, TRUE) == CSTR_EQUAL);
+        if (!default_stream) {
+            if (units < 7 || entry->StreamName[0] != L':' ||
+                memcmp(entry->StreamName + units - 6, L":$DATA", 6 * sizeof(WCHAR))) goto invalid;
+            /* Refuse malformed/foreign stream types rather than lose them. */
+            for (size_t i = 1; i < units - 6; i++)
+                if (!entry->StreamName[i] || entry->StreamName[i] == L':' ||
+                    entry->StreamName[i] == L'/' || entry->StreamName[i] == L'\\') goto invalid;
             /* Same transfer bound as default-stream FILE_WRITE_CHUNK:
              * FILE_PREFIX_MAX / 4 = 256 KiB. Save worker only. */
             size_t capacity = FILE_PREFIX_MAX / 4u;

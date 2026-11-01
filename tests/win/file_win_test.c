@@ -24,6 +24,10 @@ static struct {
     const char *source;
     int stream_track, stream_ops, stream_fail_at, stream_cancel_at, stream_cancelled;
     int stream_mode, stream_reads, stream_writes, stream_malformed;
+    NTSTATUS stream_status;
+    const WCHAR *stream_name;
+    ULONG stream_name_bytes;
+    int stream_opens;
     HANDLE stream_source, stream_target;
 } r2;
 static bool r2_stream_hit(void)
@@ -36,8 +40,19 @@ static bool r2_stream_hit(void)
 }
 static NTSTATUS NTAPI r2_query(HANDLE h, PIO_STATUS_BLOCK io, PVOID out, ULONG n, FILE_INFORMATION_CLASS kind)
 {
+    if (kind == FileStreamInformation && r2.stream_status) return r2.stream_status;
     if (kind == FileStreamInformation && (r2.fail_streams || r2_stream_hit())) return (NTSTATUS)0xc0000022u;
-    NTSTATUS status = NtQueryInformationFile(h, io, out, n, kind);
+    NTSTATUS status;
+    if (kind == FileStreamInformation && r2.stream_name) {
+        size_t length = offsetof(FILE_STREAM_INFO, StreamName) + r2.stream_name_bytes;
+        if (n < length) return (NTSTATUS)0x80000005u; /* STATUS_BUFFER_OVERFLOW */
+        memset(out, 0, n);
+        FILE_STREAM_INFO *entry = out;
+        entry->StreamNameLength = r2.stream_name_bytes;
+        entry->StreamSize.QuadPart = sizeof "original" - 1;
+        memcpy(entry->StreamName, r2.stream_name, r2.stream_name_bytes);
+        io->Information = length; io->Status = status = 0;
+    } else status = NtQueryInformationFile(h, io, out, n, kind);
     if (status >= 0 && kind == FileStreamInformation && r2.stream_malformed) {
         FILE_STREAM_INFO *entry = out;
         switch (r2.stream_malformed) {
@@ -118,6 +133,8 @@ static __attribute__((unused)) NTSTATUS NTAPI r2_nt_create(PHANDLE h, ACCESS_MAS
     PLARGE_INTEGER size, ULONG attrs, ULONG share, ULONG disp, ULONG opts, PVOID ea, ULONG n)
 {
     bool stream = oa->ObjectName->Length && oa->ObjectName->Buffer[0] == L':';
+    /* Every stream_copy starts with a native open, including an empty name. */
+    if (stream || (r2.stream_name && !oa->ObjectName->Length)) r2.stream_opens++;
     if (stream && r2_stream_hit()) return (NTSTATUS)0xc0000022u;
     if (r2.moving) {
         r2.moving = 0;
@@ -357,6 +374,57 @@ static void r2_streams(void)
     win_streams(path, false); file_os_no_temps(root);
     os_stat st; CHECK(os_stat_path(path, 0, &st) == OS_OK && !(st.perm & 0200u));
     CHECK(os_unlink(path) == OS_OK);
+}
+static void r2_stream_unsupported(void)
+{
+    char path[OS_PATH_MAX], stream[OS_PATH_MAX]; win_path(path, "stream-unsupported");
+    CHECK(snprintf(stream, sizeof stream, "%s:retained", path) > 0);
+    const struct { NTSTATUS status; const char *name; bool unsupported; } cases[] = {
+        {(NTSTATUS)0xc000000du, "STATUS_INVALID_PARAMETER", true},
+        {(NTSTATUS)0xc0000002u, "STATUS_NOT_IMPLEMENTED", true},
+        {(NTSTATUS)0xc0000003u, "STATUS_INVALID_INFO_CLASS", true},
+        {(NTSTATUS)0xc0000022u, "STATUS_ACCESS_DENIED", false},
+        {(NTSTATUS)0xc0000185u, "STATUS_IO_DEVICE_ERROR", false},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        win_write(path, (const uint8_t *)"original", 8);
+        if (!cases[i].unsupported) win_write(stream, (const uint8_t *)"\0retained\xff", sizeof "\0retained\xff" - 1);
+        r2.stream_status = cases[i].status;
+        int rc = r2_save(path, NULL); r2.stream_status = 0;
+        printf("file_win_test: %s: rc=%d native=%d\n", cases[i].name, rc, r2.last_error);
+        CHECK(rc == (cases[i].unsupported ? FILE_OK : FILE_ERR_IO));
+        if (!cases[i].unsupported) CHECK(r2.last_error == (int)RtlNtStatusToDosError(cases[i].status));
+        win_read_equals(path, (const uint8_t *)(cases[i].unsupported ? "replacement" : "original"),
+                        cases[i].unsupported ? 11 : 8);
+        if (!cases[i].unsupported) win_read_equals(stream, (const uint8_t *)"\0retained\xff", sizeof "\0retained\xff" - 1);
+        file_os_no_temps(root); CHECK(os_unlink(path) == OS_OK);
+    }
+}
+static void r2_stream_default(void)
+{
+    char path[OS_PATH_MAX]; win_path(path, "stream-default");
+    const struct { const WCHAR *name; ULONG bytes; } cases[] = {
+        {L"", 0},
+        {L"::$data", sizeof L"::$data" - sizeof(WCHAR)},
+        {L"::$DATA", sizeof L"::$DATA" - sizeof(WCHAR)},
+        {L"::$DaTa", sizeof L"::$DaTa" - sizeof(WCHAR)},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        win_write(path, (const uint8_t *)"original", 8);
+        r2.stream_name = cases[i].name; r2.stream_name_bytes = cases[i].bytes; r2.stream_opens = 0;
+        CHECK(r2_save(path, NULL) == FILE_OK);
+        CHECK(r2.stream_opens == 0);
+        win_read_equals(path, (const uint8_t *)"replacement", 11); file_os_no_temps(root);
+        /* Default records still require valid offsets and a complete header. */
+        for (int malformed = 2; malformed <= 3; malformed++) {
+            win_write(path, (const uint8_t *)"original", 8); r2.stream_malformed = malformed;
+            CHECK(r2_save(path, NULL) == FILE_ERR_IO && r2.last_error == ERROR_INVALID_DATA);
+            CHECK(r2.stream_opens == 0);
+            win_read_equals(path, (const uint8_t *)"original", 8); file_os_no_temps(root);
+        }
+        r2.stream_malformed = 0; r2.stream_name = NULL;
+        CHECK(os_unlink(path) == OS_OK);
+    }
 }
 static void r2_stream_failures(void)
 {
@@ -675,7 +743,7 @@ int main(int argc, char **argv)
         r2.stream_mode = 6; return r2_save(argv[2], NULL);
     }
     if (argc == 1) {
-        const char *cases[] = {"security", "efs", "streams", "stream-failures", "stream-crash", "stream-many", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
+        const char *cases[] = {"security", "efs", "streams", "stream-unsupported", "stream-default", "stream-failures", "stream-crash", "stream-many", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
         char exe[OS_PATH_MAX]; CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             const char *args[] = {exe, cases[i], NULL}; os_proc child; os_proc_status status;
@@ -693,6 +761,8 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "security")) r2_security();
     else if (!strcmp(argv[1], "efs")) r2_efs();
     else if (!strcmp(argv[1], "streams")) r2_streams();
+    else if (!strcmp(argv[1], "stream-unsupported")) r2_stream_unsupported();
+    else if (!strcmp(argv[1], "stream-default")) r2_stream_default();
     else if (!strcmp(argv[1], "stream-failures")) r2_stream_failures();
     else if (!strcmp(argv[1], "stream-crash")) r2_stream_crash();
     else if (!strcmp(argv[1], "stream-many")) r2_stream_many();

@@ -28,9 +28,18 @@ name array. Reject malformed names/records and unsupported stream types.
 
 Open each `:name:$DATA` relative to the captured source file handle and the
 temporary file handle with `NtCreateFile`. No stream pathname is reconstructed.
-Skip only `::$DATA`, which is already written from the snapshot. Creation uses
-`FILE_CREATE`, so an unexpected pre-existing stream is an error. Source stream
-handles share read/delete but deny concurrent writers while being copied.
+Skip an empty counted name or case-insensitive `::$DATA`, already written from
+the snapshot. Creation uses `FILE_CREATE`, so an unexpected pre-existing stream
+is an error. Source stream handles share read/delete but deny concurrent writers
+while being copied.
+
+Volumes returning `STATUS_INVALID_PARAMETER`, `STATUS_NOT_IMPLEMENTED`, or
+`STATUS_INVALID_INFO_CLASS` for stream enumeration report an empty stream list,
+so ordinary overwrites save the snapshot normally. Successful enumeration may
+represent the default stream with an empty counted name or any casing of
+`::$DATA`; these records retain all record/offset checks and never enter the
+named-stream copy. Access denial, genuine I/O failures, malformed records, and
+failures preserving reported named streams still fail the transaction.
 
 ## Transaction and errors
 
