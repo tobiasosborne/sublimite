@@ -92,6 +92,9 @@ static void queue_warm(editor *e, editor_buffer *b)
 }
 void editor_large_start(editor *e, editor_buffer *b)
 {
+#if defined(_WIN32)
+    if (editor_check_identity(b)) return;
+#endif
     if (b->file) trace_record(TRACE_T5_DEVICE_DONE, editor_large_trace_frame(b->file));
     editor_large_warm_job *j = b->lg.lazy && !b->lg.warm_done ? calloc(1, sizeof *j) : NULL;
     if (!j) return;
@@ -576,6 +579,9 @@ int editor_large_find_begin(editor *e, const uint8_t *needle, size_t len)
 {
     if (!e || e->buffer->source_stale || e->buffer->pending_open || !needle || !len || len > EDITOR_LARGE_NEEDLE_MAX || e->buffer->lg.find_running) return EDITOR_ERR_ARG;
     editor_buffer *b = e->buffer;
+#if defined(_WIN32)
+    if (editor_check_identity(b)) return EDITOR_ERR_IO;
+#endif
     editor_large *lg = &b->lg;
     retire_find(b);
     if (lg->find) {
@@ -604,6 +610,9 @@ int editor_large_save_begin(editor *e)
 {
     if (!e || e->buffer->source_stale || e->buffer->pending_open || !e->buffer->file || e->buffer->lg.save_running) return EDITOR_ERR_ARG;
     editor_buffer *b = e->buffer;
+#if defined(_WIN32)
+    if (editor_check_identity(b)) return EDITOR_ERR_IO;
+#endif
     b->lg.save_done = false; b->lg.save_status = 0;
     if (file_save_begin(b->file, b->tree, 0, ++b->lg.save_gen)) return EDITOR_ERR_IO;
     b->lg.save_running = true; return 0;

@@ -829,6 +829,11 @@ typedef enum editor_reload_outcome {
     EDITOR_RELOAD_DEFERRED, EDITOR_RELOAD_NO_SLOT
 } editor_reload_outcome;
 int editor_activate(editor *e);
+#if defined(_WIN32)
+/* Filesystem I/O: only focus/activation and explicit bulk/save commands. */
+bool editor_check_identity(editor_buffer *b);
+bool editor_refuse_wsl_save(editor_buffer *b);
+#endif
 int editor_cycle_tab(editor *e, bool reverse);
 int editor_compose(editor *e);
 int editor_paint_prepare(editor *e);

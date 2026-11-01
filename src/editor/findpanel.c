@@ -202,7 +202,11 @@ int editor_find_service(editor *e)
     if (!e->find_replace_active && (e->find_id!=e->buffer->id ||
         e->find_source_generation!=e->buffer->source_generation ||
         e->find_buffer_revision!=e->buffer->revision)) {
-        if (e->buffer->source_stale || e->buffer->pending_open) {
+        if (e->buffer->source_stale || e->buffer->pending_open
+#if defined(_WIN32)
+            || (e->buffer->file && !e->buffer->target_rebound && file_changed(e->buffer->file))
+#endif
+        ) {
             (void)findui_set_source(&e->find,NULL,++e->find_revision);
             e->find_id=0; e->find_select_pending=false; e->find_replace_request=0; e->find_range_count=0;
             return 0;
@@ -470,6 +474,23 @@ static int seed_field(editor *e, bool word, bool single_line, bool replacement,
 bool editor_find_action(editor *e, const plat_event *ev, const keys_binding *binding)
 {
     if (!e->find.private_ || !ev->press || !binding) return false;
+#if defined(_WIN32)
+    /* Explicit find commands refresh identity. Query/document typing only
+     * uses resident state and never performs provider I/O here. */
+    switch (binding->action) {
+    case KEYS_ACTION_FIND: case KEYS_ACTION_REPLACE:
+    case KEYS_ACTION_SLURP_FIND: case KEYS_ACTION_SLURP_REPLACE:
+    case KEYS_ACTION_FIND_UNDER: case KEYS_ACTION_FIND_UNDER_PREVIOUS:
+    case KEYS_ACTION_FIND_NEXT: case KEYS_ACTION_FIND_PREVIOUS:
+        if (editor_check_identity(e->buffer)) {
+            (void)findui_set_source(&e->find,NULL,++e->find_revision);
+            e->find_id=0; e->find_range_count=0;
+            return true;
+        }
+        break;
+    default: break;
+    }
+#endif
     switch (binding->action) {
     case KEYS_ACTION_FIND_IN_FILES: /* edit-n95: Where field mode; cancels a running search */
         (void)editor_find_service(e);

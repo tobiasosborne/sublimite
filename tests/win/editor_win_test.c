@@ -11,6 +11,67 @@
 #include "test_isolation.h"
 #include "timeout_diag.h"
 #include "editor_fixture.h"
+/* The file suite's classifier/provider seams, applied to the real editor.
+ * Only this private NTFS subtree models WSL; Windows destinations stay native.
+ * A case-sensitive provider alias A has a separate NTFS backing, so check
+ * does not depend on NTFS directory case-sensitivity privileges. */
+static char wsl_provider_root[OS_PATH_MAX], wsl_upper[OS_PATH_MAX], wsl_upper_backing[OS_PATH_MAX];
+static DWORD wsl_ui_thread;
+static unsigned wsl_ui_stats;
+static bool wsl_refuse_watch, wsl_target_watch;
+static bool provider_is_wsl(const char *path)
+{ return (*wsl_provider_root && !strncmp(path,wsl_provider_root,strlen(wsl_provider_root))) || os_path_is_wsl(path); }
+static const char *provider_path(const char *path)
+{ return *wsl_upper && !strcmp(path,wsl_upper) ? wsl_upper_backing : path; }
+static os_err provider_open(os_file *f,const char *path,unsigned flags)
+{ return os_file_open(f,provider_path(path),flags); }
+static os_err provider_stat(const char *path,unsigned flags,os_stat *st)
+{
+    if(GetCurrentThreadId()==wsl_ui_thread && provider_is_wsl(path)) wsl_ui_stats++;
+    return os_stat_path(provider_path(path),flags,st);
+}
+static os_err provider_canonical(const char *path,char *out,size_t cap)
+{
+    if(*wsl_provider_root && !strncmp(path,wsl_provider_root,strlen(wsl_provider_root))) {
+        if(strlen(path)>=cap) return OS_E_RANGE;
+        strcpy(out,path); return OS_OK;
+    }
+    return os_path_canonical(path,out,cap);
+}
+static BOOL WINAPI provider_watch(HANDLE h,LPVOID data,DWORD bytes,BOOL subtree,DWORD filter,
+    LPDWORD count,LPOVERLAPPED io,LPOVERLAPPED_COMPLETION_ROUTINE completion)
+{
+    if(wsl_refuse_watch) {
+        WCHAR name[OS_PATH_MAX];
+        DWORD n=GetFinalPathNameByHandleW(h,name,OS_PATH_MAX,FILE_NAME_NORMALIZED);
+        if(n>=6u && n<OS_PATH_MAX && !wcscmp(name+n-6u,L"\\share")) {
+            SetLastError(ERROR_INVALID_FUNCTION); return FALSE;
+        }
+    }
+    return ReadDirectoryChangesW(h,data,bytes,subtree,filter,count,io,completion);
+}
+#define os_path_is_wsl provider_is_wsl
+#define os_file_open provider_open
+#define os_stat_path provider_stat
+#define os_path_canonical provider_canonical
+#define ReadDirectoryChangesW provider_watch
+#include "../../src/file/file.c"
+#include "../../src/file/file_win.c"
+#undef ReadDirectoryChangesW
+#undef os_stat_path
+#undef os_file_open
+#include "../../src/editor/source_win.c"
+#undef os_path_is_wsl
+#include "../../src/editor/buffers.c"
+#undef os_path_canonical
+static int provider_target_watch(file_path_watch *member,const char *path)
+{
+    if(wsl_target_watch) return FILE_WATCH_UNSUPPORTED;
+    return file_watch_path_start(member,path);
+}
+#define file_watch_path_start provider_target_watch
+#include "../../src/editor/commands.c"
+#undef file_watch_path_start
 /* Same native call seam as win32_plat_test; no production fault switch. */
 static volatile LONG fail_clip, synthetic_publication;
 static BOOL publication_empty(void)
@@ -1208,8 +1269,9 @@ static int run_child_case(const char *mode,const char *root,DWORD expected)
     /* The close child includes startup, clipboard, shutdown and recovery,
      * not three editor settle loops. See the measured native-phase guard.
      * (P) Crash guard supervises two more native children serially; allow
-     * their two guards plus the outer child's own phase. */
-    uint64_t phases=!strcmp(mode,"--crash-guard") ? 3u : 1u;
+     * their two guards plus the outer child's own phase; WSL journal recovery
+     * runs a second editor lifecycle, so two. */
+    uint64_t phases=!strcmp(mode,"--crash-guard") ? 3u : !strcmp(mode,"--wsl-journal") ? 2u : 1u;
     DWORD result=WaitForSingleObject(process.hProcess,(DWORD)(phases*TEST_WIN_PROCESS_NS/UINT64_C(1000000)));
     if(result!=WAIT_OBJECT_0) {
         fprintf(stderr,"editor_win child timeout mode=%s wait=%lu\n",mode,result);
@@ -1217,6 +1279,8 @@ static int run_child_case(const char *mode,const char *root,DWORD expected)
     }
     DWORD code=0; T(GetExitCodeProcess(process.hProcess,&code));
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    if(result!=WAIT_OBJECT_0 || code!=expected)
+        fprintf(stderr,"editor child %s: wait=%lu exit=%lu expected=%lu\n",mode,result,code,expected);
     T(result==WAIT_OBJECT_0 && code==expected); return 0;
 }
 static int crash_guard_test(const editor_config *config,const char *root)
@@ -1234,6 +1298,155 @@ static int crash_guard_test(const editor_config *config,const char *root)
         editor_close(restored); (void)os_unlink(path);
     }
     puts("round4: CPU crash restores closed; healthy latency-wait death restores live PASS"); return 0;
+}
+static int wsl_write(const char *path,const char *text)
+{
+    os_file f=OS_FILE_INIT; size_t n=0;
+    T(os_file_open(&f,path,OS_OPEN_WRITE|OS_OPEN_CREATE|OS_OPEN_TRUNC)==OS_OK);
+    T(os_file_write(&f,text,strlen(text),&n)==OS_OK && n==strlen(text));
+    os_file_close(&f); return 0;
+}
+static int wsl_bytes(editor *e,const char *text)
+{
+    uint8_t bytes[64]; size_t n=strlen(text); T(n<=sizeof bytes);
+    T(editor_length(e)==n && editor_read(e,0,bytes,n)==0 && !memcmp(bytes,text,n)); return 0;
+}
+static int wsl_disk(const char *path,const char *text)
+{
+    os_file f=OS_FILE_INIT; char bytes[64]; size_t n=0;
+    T(os_file_open(&f,path,OS_OPEN_READ)==OS_OK);
+    T(os_file_read(&f,bytes,sizeof bytes,&n)==OS_OK && n==strlen(text) && !memcmp(bytes,text,n));
+    os_file_close(&f); return 0;
+}
+static int wsl_key(editor *e,uint32_t key,uint16_t mods,const char *text)
+{
+    plat_event event={.kind=PLAT_EV_KEY,.press=true,.keysym=key,.mods=mods};
+    if(text) { event.utf8_len=(uint8_t)strlen(text); memcpy(event.utf8,text,event.utf8_len); }
+    T(editor_inject(e,&event)==0); return settle(e);
+}
+static int wsl_test(editor *e,const char *root,const char *mode)
+{
+    T(settle(e)==0);
+    if(!strcmp(mode,"--wsl-real")) {
+        char real[OS_PATH_MAX]; os_file probe=OS_FILE_INIT;
+        if(os_path_canonical("tests/win/editor_win_test.c",real,sizeof real)!=OS_OK ||
+            !os_path_is_wsl(real) || os_file_open(&probe,real,OS_OPEN_READ)!=OS_OK) {
+            puts("SKIP (WSL provider unavailable: optional real editor read)"); return 0;
+        }
+        os_file_close(&probe);
+        uint64_t real_id=0; T(editor_add_buffer(e,real,NULL,0,&real_id)==0 && settle(e)==0);
+        T(e->buffer->file && file_open_mode(e->buffer->file)==FILE_MODE_COPY);
+        uint8_t first=0; T(editor_read(e,0,&first,1)==0 && first=='/');
+        puts("wsl: real UNC editor read of this worktree's test source PASS (no share write)");
+        return 0;
+    }
+    snprintf(wsl_provider_root,sizeof wsl_provider_root,"%s\\share",root);
+    T(os_mkdir(wsl_provider_root)==OS_OK);
+    size_t end=strlen(wsl_provider_root); T(end+1u<sizeof wsl_provider_root);
+    wsl_provider_root[end]='\\'; wsl_provider_root[end+1u]=0;
+    char path[OS_PATH_MAX]; snprintf(path,sizeof path,"%sa",wsl_provider_root);
+    T(wsl_write(path,"original\n")==0);
+    wsl_refuse_watch=true; wsl_ui_thread=GetCurrentThreadId();
+    uint64_t id=0; T(editor_add_buffer(e,path,NULL,0,&id)==0);
+    T(settle(e)==0); editor_buffer *b=e->buffer;
+    T(b->file && file_open_mode(b->file)==FILE_MODE_COPY && b->watch_fd==-1);
+    T(b->file->watch_slot==SIZE_MAX && b->file->iwd<0);
+    /* No native FILE source may be registered for the unsupported watch. */
+    for(size_t i=0;i<e->poll_set.count;i++) T(e->poll_set.tags[i]!=EDITOR_WAIT_FILE);
+    T(wsl_bytes(e,"original\n")==0);
+    if(!strcmp(mode,"--wsl-open")) {
+        /* Clean reload must accept the same watch capability. */
+        T(wsl_write(path,"reloaded\n")==0);
+        editor_reload_outcome outcome;
+        T(reload_source(e,b,tabs_active_index(&e->tabs),&outcome,false)==0 && outcome==EDITOR_RELOAD_DONE);
+        T(settle(e)==0 && wsl_bytes(e,"reloaded\n")==0);
+        T(e->buffer->watch_fd==-1 && !e->buffer->file->changed);
+        puts("wsl: unsupported watch opens and reloads, no native registration PASS"); return 0;
+    }
+    if(!strcmp(mode,"--wsl-case")) {
+        snprintf(wsl_upper,sizeof wsl_upper,"%sA",wsl_provider_root);
+        snprintf(wsl_upper_backing,sizeof wsl_upper_backing,"%supper-backing",wsl_provider_root);
+        T(wsl_write(wsl_upper_backing,"UPPER\n")==0);
+        uint64_t upper=0; T(editor_add_buffer(e,wsl_upper,NULL,0,&upper)==0 && upper!=id);
+        T(settle(e)==0 && tabs_count(&e->tabs)==3u && wsl_bytes(e,"UPPER\n")==0);
+        T(editor_select_tab(e,1)==0 && settle(e)==0 && wsl_bytes(e,"original\n")==0);
+        T(editor_select_tab(e,2)==0 && settle(e)==0 && wsl_bytes(e,"UPPER\n")==0);
+        puts("wsl: case-sensitive provider a/A retain distinct identities and tabs PASS"); return 0;
+    }
+    wsl_ui_stats=0;
+    T(wsl_key(e,'x',0,"x")==0 && wsl_bytes(e,"xoriginal\n")==0);
+    T(!wsl_ui_stats); /* Copy typing must not stat the provider. */
+    T(tabs_active(&e->tabs)->modified && e->journal && !journal_get_stats(e->journal).error);
+    if(!strcmp(mode,"--wsl-save") || !strcmp(mode,"--wsl-target-watch") || !strcmp(mode,"--wsl-journal")) {
+        T(wsl_key(e,'s',PLAT_MOD_CTRL,NULL)==0);
+        T(editor_flush(e)==0 && settle(e)==0);
+        T(b->save_error==FILE_ERR_UNSUPPORTED && b->save_errno==ERROR_NOT_SUPPORTED);
+        T(tabs_active(&e->tabs)->modified && wsl_bytes(e,"xoriginal\n")==0);
+        T(wsl_disk(path,"original\n")==0 && !journal_get_stats(e->journal).error);
+        T(editor_get_stats(e).journal_records>0);
+        editor_save_overlay(e);
+        uint32_t row=e->grid.dims.rows-1u;
+        size_t length=strlen(FILE_WSL_SAVE_NOTICE);
+        if(length>e->grid.dims.cols) length=e->grid.dims.cols;
+        for(size_t i=0;i<length;i++) T(e->grid.cells[(size_t)row*e->grid.dims.cols+i].glyph_index==(uint8_t)FILE_WSL_SAVE_NOTICE[i]);
+        if(!strcmp(mode,"--wsl-journal")) return 0;
+        char target[IPC_PATH_CAP]; snprintf(target,sizeof target,"%s\\windows.txt",root);
+        /* The target seam covers the defensive unsupported branch at rebind;
+         * it supplies no route past the WSL save refusal. */
+        wsl_refuse_watch=false; wsl_target_watch=!strcmp(mode,"--wsl-target-watch");
+        T(wsl_key(e,'s',PLAT_MOD_CTRL|PLAT_MOD_SHIFT,NULL)==0);
+        T(e->go.active && e->go.kind==KEYS_ACTION_SAVE_AS);
+        strcpy(e->go.digits,target); e->go.length=strlen(target); e->go.cursor=e->go.length;
+        T(wsl_key(e,XKB_KEY_Return,0,NULL)==0);
+        uint64_t limit=os_now_ns()+WATCH_NS;
+        while(e->file_command!=KEYS_ACTION_NONE || e->save_as || e->publish_owed || e->publish) {
+            T(editor_step(e,0)>=0); T(os_now_ns()<limit); os_yield();
+        }
+        T(settle(e)==0 && b->target_rebound && !strcmp(b->path,target));
+        T(!tabs_active(&e->tabs)->modified && wsl_disk(target,"xoriginal\n")==0);
+        T(!e->recovery_notice || strcmp(e->recovery_notice,"save as failed"));
+        T(!b->save_error && !b->source_stale);
+        if(wsl_target_watch) T(b->watch_fd==-1 && !b->target_watch.registered);
+        T(wsl_key(e,'y',0,"y")==0 && wsl_key(e,'s',PLAT_MOD_CTRL,NULL)==0);
+        T(editor_flush(e)==0 && settle(e)==0);
+        T(!tabs_active(&e->tabs)->modified && !b->save_error && wsl_disk(target,"xyoriginal\n")==0);
+        T(wsl_disk(path,"original\n")==0);
+        puts("wsl: Ctrl+S notice preserves edits/journal; Save As and subsequent Windows save PASS"); return 0;
+    }
+    if(!strcmp(mode,"--wsl-activate")) {
+        T(editor_select_tab(e,0)==0 && settle(e)==0);
+        T(wsl_write(path,"external-changed\n")==0);
+        T(!b->source_stale); /* Inactive sources have no notification. */
+        T(editor_select_tab(e,1)==0 && settle(e)==0);
+    } else {
+        T(wsl_write(path,"external-changed\n")==0);
+        if(!strcmp(mode,"--wsl-focus")) {
+            plat_event focus={.kind=PLAT_EV_FOCUS,.focused=true};
+            T(editor_inject(e,&focus)==0 && settle(e)==0);
+        } else if(!strcmp(mode,"--wsl-presave")) {
+            T(wsl_key(e,'s',PLAT_MOD_CTRL,NULL)==0);
+            T(!editor_save_active(e));
+        } else if(!strcmp(mode,"--wsl-large-save")) {
+            T(editor_large_save_begin(e)==EDITOR_ERR_IO);
+            T(file_changed(b->file) && !b->lg.save_running);
+            T(editor_check_sources(e)==0);
+        } else if(!strcmp(mode,"--wsl-warm")) {
+            T(!b->lg.warm); b->lg.lazy=true; b->lg.warm_done=false;
+            editor_large_start(e,b);
+            T(!b->lg.warm && file_changed(b->file));
+            T(editor_check_sources(e)==0);
+        } else if(!strcmp(mode,"--wsl-find")) {
+            T(editor_large_find_begin(e,(const uint8_t *)"original",8)==EDITOR_ERR_IO);
+            T(!b->lg.find_running && !b->lg.find);
+            T(editor_check_sources(e)==0);
+        } else if(!strcmp(mode,"--wsl-findpanel")) {
+            T(wsl_key(e,'f',PLAT_MOD_CTRL,NULL)==0);
+            T(e->find_id!=b->id && !b->find_leases);
+        } else T(false);
+    }
+    T(file_changed(b->file) && b->source_stale && wsl_bytes(e,"xoriginal\n")==0);
+    T(tabs_active(&e->tabs)->modified && !journal_get_stats(e->journal).error);
+    printf("wsl: %s detects external identity before using the private copy PASS\n",mode); return 0;
 }
 int main(int argc, char **argv)
 {
@@ -1312,7 +1525,8 @@ int main(int argc, char **argv)
             win32_plat *native=win32_private(&e->platform);
             native->power_off=native->session_locked=native->session_disconnected=native->minimized=false;
         }
-        int rc=!strcmp(argv[1],"--crash-guard") ? crash_guard_test(&cfg,root) :
+        int rc=!strncmp(argv[1],"--wsl-",6) ? wsl_test(e,root,argv[1]) :
+            !strcmp(argv[1],"--crash-guard") ? crash_guard_test(&cfg,root) :
             !strcmp(argv[1],"--modal-turn") ? native_turn_test(e,WM_KEYDOWN,false,false,false) :
             !strcmp(argv[1],"--modal-close") ? native_turn_test(e,WM_CLOSE,false,false,false) :
             !strcmp(argv[1],"--modal-session") ? native_turn_test(e,WM_QUERYENDSESSION,false,false,false) :
@@ -1356,6 +1570,14 @@ int main(int argc, char **argv)
             T(!memcmp(bytes,"qbase\n",sizeof bytes));
             puts("round30: cancelled Save As recovers exact modified bytes PASS"); editor_close(e);
         }
+        if(!rc && !strcmp(argv[1],"--wsl-journal")) {
+            b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
+            T(editor_open(&e,&cfg,&b)==0 && settle(e)==0);
+            T(tabs_count(&e->tabs)==2u && tabs_active(&e->tabs)->modified);
+            T(wsl_bytes(e,"xoriginal\n")==0 && !journal_get_stats(e->journal).error);
+            puts("wsl: refused save's real editor journal restores the exact dirty text PASS");
+            editor_close(e);
+        }
         if(!rc && (!strcmp(argv[1],"--close-queue") || !strcmp(argv[1],"--close-fence") || !strcmp(argv[1],"--close-save"))) {
             bool fence=strcmp(argv[1],"--close-queue")!=0;
             b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
@@ -1373,7 +1595,7 @@ int main(int argc, char **argv)
         }
         free(large); cleanup(root); return rc;
     }
-    const char *round4[]={"--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard",
+    const char *round4[]={"--wsl-open","--wsl-case","--wsl-focus","--wsl-activate","--wsl-presave","--wsl-large-save","--wsl-warm","--wsl-find","--wsl-findpanel","--wsl-save","--wsl-target-watch","--wsl-journal","--wsl-real","--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard",
         "--read-stuck","--read-close","--read-queue","--saveas-close","--saveas-close-save","--notice","--font-small"};
     for(size_t at=0;at<sizeof round4/sizeof round4[0];at++) T(run_child_case(round4[at],NULL,0)==0);
     T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);

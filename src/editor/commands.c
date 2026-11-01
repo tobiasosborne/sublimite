@@ -190,8 +190,15 @@ static int save_as_adopt(editor *e, editor_buffer *b, size_t tab, editor_save_as
      * Old file handles stay alive because piece/undo snapshots can borrow them. */
     file_watch_dispatch();
     int fd = file_watch_path_start(&b->target_watch, b->path);
+#if defined(_WIN32)
+    if (fd == FILE_WATCH_UNSUPPORTED) fd = -1;
+    else {
+#endif
     if (fd < 0) return EDITOR_ERR_IO;
     if (editor_wait_file(&e->poll_set, fd) != OS_OK) return EDITOR_ERR_IO;
+#if defined(_WIN32)
+    }
+#endif
     b->watch_fd = fd; b->watch_pending = false;
     /* Peers with unsaved history keep their text (edited while the target
      * was written): no reload; the new BASE makes their checkpoint whole-text. */

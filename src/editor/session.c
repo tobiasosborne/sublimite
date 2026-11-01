@@ -604,6 +604,12 @@ static int request_buffer(editor *e, editor_buffer *b, uint64_t request_ns)
         capture(e, s->saving, request_ns ? request_ns : trace_now_ns(), model.needs_finish);
         return editor_begin_frame(e);
     }
+#if defined(_WIN32)
+    /* Cached source epochs do not stat copied originals. Resolve the current
+     * conflict before capturing or dispatching this save, without a watch. */
+    if (editor_check_identity(b)) return editor_check_sources(e);
+    if (editor_refuse_wsl_save(b)) return editor_begin_frame(e);
+#endif
     if (b->source_stale) return 0;
     session_node *leaf = leaf_at(s, b->session_slot);
     if (!leaf || leaf->buffer != b || leaf->revision != b->revision || s->root->live_count != editor_recorded_rank(e, tabs_count(&e->tabs))) { /* edit-3f2k, edit-uzrb */

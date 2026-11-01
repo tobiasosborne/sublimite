@@ -207,6 +207,12 @@ int editor_buffer_prepare(editor *e, const char *path, const uint8_t *bytes, siz
                 b->origin = editor_base_id_of(&opened);
             }
             b->watch_fd = file_watch_start(b->file);
+#if defined(_WIN32)
+            /* WSL provides copied reads without native notifications. Focus,
+             * activation and explicit commands check identity independently. */
+            if (b->watch_fd == FILE_WATCH_UNSUPPORTED) b->watch_fd = -1;
+            else
+#endif
             if (editor_wait_file(&e->poll_set, b->watch_fd) != OS_OK) {
                 rc = EDITOR_ERR_IO; goto fail;
             }
@@ -397,6 +403,11 @@ int editor_activate(editor *e)
         }
     }
     rc = editor_full_layout(e);
+#if defined(_WIN32)
+    /* Inactive copied tabs have no native events. Check on activation; source
+     * maintenance adopts a clean replacement or prompts for edited text. */
+    (void)editor_check_identity(e->buffer);
+#endif
     if (!rc && !e->journal) editor_session_metadata(e);
     return rc ? rc : editor_journal_changed(e);
 }

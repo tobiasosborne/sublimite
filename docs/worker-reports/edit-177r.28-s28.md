@@ -1,5 +1,13 @@
 # edit-177r.28 — safe WSL degraded mode
 
+Round 2 verdict: **done**. The landed Windows editor now opens WSL copied
+buffers without notifications, checks identity at the requested boundaries,
+refuses share saves safely, and supports Windows Save As. Latest required exit
+codes (M): **all 0; Linux check 0; Windows check 0**. Full evidence follows in
+the round-2 section below; historical round-1 status is superseded.
+
+## Historical round-1 report
+
 File-layer implementation and acceptance are complete. Whole-editor signoff is
 **partial pending the sibling's Windows editor integration** described below.
 No Windows editor executable is built by this baseline's mk/win.mk, so this
@@ -260,3 +268,188 @@ Final status (M): all 0; Linux check 0; Windows check 2; real-share target 0;
 standalone Windows release/sanitizer journal reruns 0/0. Final `uptime`:
 `13:07:22 up 4:41, load average: 0.01, 0.44, 1.90` [AC, desktop Spiral].
 No worker processes remain running.
+
+## Round 2 — editor integration (2026-11-01, complete)
+
+The earlier report above records the pre-editor baseline. This round supersedes
+its coordinator integration checklist and will record final verification below.
+Binding lane: `taskset -c 16-31 nice -n 10`, make `-j16`, Windows check
+`WIN_CHECK_JOBS=4` (G, current brief). All Windows execution remains through
+`tools/winrun.sh` on a private station. WSL interop requires sandbox escalation;
+the first unprivileged attempt failed before running the test with
+`UtilBindVsockAnyPort: socket failed 1`. No live desktop or real profile used.
+
+(M) [AC, desktop Spiral], Tobias using the box, start `uptime`:
+`16:06:44 up 7:38, 1 user, load average: 0.28, 0.52, 1.07`. BAT0 absent;
+AC is the binding desktop context. No new performance measurements claimed.
+
+Red: prefixed `tools/winrun.sh build/win/rel/tests/editor_win_test.exe --wsl-open`
+exited 1 at `editor_add_buffer(e,path,NULL,0,&id)==0` after the real file layer
+returned FILE_WATCH_UNSUPPORTED (`build/worker-logs/r2-red-open.log`). Tests stay
+in the existing editor_win_test.c; no fixture extraction or helper write path.
+
+### Round 2 implementation and red/green evidence
+
+- Source/reload setup accepts FILE_WATCH_UNSUPPORTED, normalizes watch_fd to
+  invalid, and skips native wait registration. Save As adoption accepts the
+  same capability without claiming a write failure. The native error branch
+  remains unchanged for other negative results.
+- New Windows-only `src/editor/source_win.c` compares identity at focus,
+  activation, explicit save and warm/find boundaries. A rebound COPY compares
+  its new target, never its retired original pathname. Existing source
+  maintenance owns clean reload versus edited-buffer conflict choices.
+- Session save refreshes identity before dispatch and refuses WSL before
+  preparing the journal transaction. This reconciles the earlier session
+  notice with the landed controller: its failure status is “save or reload
+  failed”, and a prepared failure can retain cancellation ownership. Early
+  refusal displays the established WSL notice and keeps Save As available.
+  File-layer refusal remains unchanged and authoritative for other callers.
+- Real find commands also refresh identity before binding/searching a copied
+  snapshot. Ordinary document/query typing only reads resident state. The
+  test asserts no UI-thread provider stat during document insertion.
+- Tests remain in `tests/win/editor_win_test.c`. The existing real editor,
+  journal, view, command and D3D fixture drives all cases; test-only classifier,
+  canonicalization, acquisition and native-watch seams replace no production
+  editor behavior. `a` and `A` aliases in the same modeled case-sensitive
+  provider resolve to distinct NTFS-backed identities. No new fixture module.
+- `mk/win.mk` was audited after the mechanical merge: full editor source
+  enumeration/application links, standalone WSL targets, and release/sanitizer
+  editor fixture links coexist. Updated fixture link filters omit only editor
+  implementation objects now included by its provider seams; core file symbols
+  are supplied by the fixture TU before archive extraction. Dependency files
+  track the included sources. No Linux build rule changed.
+
+Every command below uses the current CPU/nice prefix. Selector commands are
+`tools/winrun.sh build/win/rel/tests/editor_win_test.exe --wsl-<selector>`;
+rebuilds use `make TARGET=win -j16 build/win/rel/tests/editor_win_test.exe`.
+All exits and output below are (M), captured logs in `build/worker-logs/`.
+
+| Behavior | Red | Green |
+|---|---|---|
+| Open/reload without notifications | `--wsl-open`, exit 1, `FAIL editor_add_buffer(e,path,NULL,0,&id)==0`, `r2-red-open.log` | exit 0, `unsupported watch opens and reloads, no native registration PASS`, `r2-green-open.log` |
+| Activation identity | `--wsl-activate`, exit 1, `FAIL file_changed(b->file) && b->source_stale...`, `r2-red-activate.log` | exit 0, detects external identity, `r2-stage-activate.log` |
+| Pre-save conflict | `--wsl-presave`, exit 1, `FAIL !editor_save_active(e)`, `r2-red-presave.log` | exit 0, conflict present before save dispatch, `r2-stage-presave.log` |
+| Direct bulk-save conflict | `--wsl-large-save`, exit 1, `FAIL file_changed(b->file) && !b->lg.save_running`, `r2-red-large-save.log` | exit 0, `r2-green-large-save.log` |
+| Warm snapshot | `--wsl-warm`, exit 1, `FAIL !b->lg.warm && file_changed(b->file)`, `r2-red-warm.log` | exit 0, no stale warm snapshot, `r2-stage-warm.log` |
+| Find snapshot | `--wsl-find`, exit 1, `FAIL editor_large_find_begin(...)==EDITOR_ERR_IO`, `r2-red-find.log` | exit 0, no stale find job, `r2-stage-find.log` |
+| Real find command | `--wsl-findpanel`, exit 1, `FAIL e->find_id!=b->id && !b->find_leases`, `r2-red-findpanel.log` | exit 0, `r2-stage-findpanel.log` |
+| Notice/Save As | `--wsl-save`, exit 1, exact notice glyph mismatch after completed controller failure, `r2-stage2-save.log` | exit 0, notice, dirty text/journal, Windows Save As and subsequent Ctrl+S all pass, `r2-stage3-save.log` |
+| Unsupported target watch | `--wsl-target-watch`, exit 1, `FAIL !e->recovery_notice || strcmp(...,"save as failed")`, `r2-stage4-target-watch.log` | exit 0, `r2-green-target-watch.log` |
+
+Focus and case-distinct tabs were already correct after unsupported open was
+fixed; their baseline selectors both exited 0 (`r2-red-focus.log` and
+`r2-red-case.log`, filenames denote the baseline campaign, not false red claims).
+The journal selector reopens the real editor after refusal and restores exact
+`xoriginal\n` dirty text, exit 0 (`r2-stage4-journal.log`). The optional real
+UNC selector read this worktree's `tests/win/editor_win_test.c` as COPY, exit 0
+(`r2-stage4-real.log`); it performs no Windows share write and skips if absent.
+
+Test development corrections are not product reds: first save assertions had
+not waited for the worker, and a later sequence-monotonic assertion did not
+account for checkpoint rotation resetting journal counters. The final tests
+wait for transaction completion and prove recovery by reopening the editor.
+
+Linux preprocessor comparison: exit 0 (`r2-linux-preprocess.log`), all touched
+production TUs have identical Linux tokens after normalizing whitespace and
+assertion source-line metadata. `git diff --check`: exit 0 before verification.
+
+Interim whole-check diagnosis (M): the first Windows run reports existing
+editor_exe_test failures at `wait_contents(path,"typed äλ中🙂base\n")` in both
+configurations. A release countercheck rebuilt **every touched editor TU from
+unmodified HEAD**, excluded the new Windows helper, linked the normal untouched
+objects/library/main, and ran the identical executable fixture on its private
+station. It failed at the same line with unchanged `base\n` bytes, exit 1
+(`r2-baseline-build.log`, `r2-baseline-editor-exe.log`). No source rollback or
+state-changing git operation. This is a baseline/coordinator finding, not
+attributed to the WSL integration.
+
+The first whole Windows run also caught the new journal selector's parent
+completion watchdog. Its isolated sanitizer selector passed, exit 0
+(`r2-san-journal-isolated.log`). The test reopens the editor: its parent now
+accounts for **two lifecycles**, using the fixture's existing one-WATCH-per-
+startup/test/teardown derivation: `2 * 3 * WATCH_NS` (E, inherited test policy),
+matching the pre-existing crash-guard's lifecycle arithmetic. The per-operation
+WATCH_NS and every product assertion/deadline remain unchanged. Added a named
+child/wait/exit diagnostic. Final whole Windows recheck passed below.
+
+Linux required check exited 0 (`r2-linux-check.log`): emitted
+`check: 117 test binaries passed in 183.8 s (parallel, 16 jobs, 6 displays)`
+(M, suite enumeration and runner monotonic elapsed; no timing gate). Display-lock
+contract output deliberately includes nested timeout/failure cases before PASS.
+Final `make -j16 all` also exited 0 (`r2-linux-all-final.log`).
+
+Editor TRACK bench exited 0 on a fresh locked private Xvfb, reusing
+`bench/editor_bench.args`: `--track --no-idle --no-p4 --serial-only --keys=64`
+(E, existing module sample policy). Raw log `r2-editor-bench.log`. Context (M)
+[AC, desktop Spiral], Tobias using the box; wrapper uptime recorded in that log.
+BAT0 absent makes the tool print unknown power; desktop AC comes from the brief.
+All emitted rows report structural OK, allocations=0, exact mutations/journal;
+GL uses the observed raster fallback on this Xvfb. TRACK percentiles are not a
+Windows/live-desktop performance claim. The Windows editor's complete release
+suite also reports its existing exact journaled-typing/zero-malloc campaign;
+final full-check results follow below.
+
+First full Windows check completed with exit 2 (`r2-win-check.log`):
+`binaries=130 desktop-passes=6 jobs=4 seconds=647.682 failures=5` (M, runner
+input enumeration/result count and elapsed). Failures: editor_exe_test in both
+configurations; journal_kill_test in both configurations at the previously
+reported randomized-writer `reached && st.how==OS_PROC_ABNORMAL` / native 258
+boundary; and the new sanitizer journal selector's parent watchdog. Release
+editor_win_test completed the entire expanded suite, exit 0. The final recheck
+includes the watchdog correction; no journal or executable fixture was changed.
+
+Final recheck progress (M): complete editor_win_test, editor_exe_test and
+journal_kill_test now all pass in both release and sanitizer configurations.
+The unchanged executable and journal failures did not recur; their earlier
+failures and the HEAD countercheck remain recorded above. The final aggregate full-run exit is 0, as recorded below.
+
+### Round 2 final verification — done
+
+Latest required commands and captured exits (M):
+
+| Command | Exit | Log |
+|---|---|---|
+| `taskset -c 16-31 nice -n 10 make -j16 all` | **0** | `build/worker-logs/r2-linux-all-final.log` |
+| `taskset -c 16-31 nice -n 10 env DEBUGINFOD_URLS= make -j16 check` | **0** | `build/worker-logs/r2-linux-check.log` |
+| `taskset -c 16-31 nice -n 10 env WIN_CHECK_JOBS=4 make TARGET=win -j16 check` | **0** | `build/worker-logs/r2-win-check-final.log` |
+| Existing editor TRACK bench arguments, same CPU prefix, fresh private Xvfb | **0** | `build/worker-logs/r2-editor-bench.log` |
+| Linux preprocessor comparison, normalized whitespace/assertion source lines | **0** | `build/worker-logs/r2-linux-preprocess.log` |
+| `git diff --check` | **0** | final read-only check |
+
+Final Windows checker output prefix (M):
+`Windows check: binaries=130 desktop-passes=6 jobs=4 seconds=637.638 failures=0`.
+Derivation: checker enumerates release/sanitizer inputs, extra private-desktop
+passes and compares actual exits to expected exits; elapsed is monotonic run
+wall time, not a budget. It emits the existing explicit SKIP census. Both
+complete editor configurations pass all added WSL selectors, including exact
+dirty journal restore, Windows Save As/re-save, case-distinct tabs, real find,
+no provider stat during typing, and the optional **real UNC read**. Native
+presentation remains an explicit live-desktop SKIP; none was attempted.
+
+Changed production files: `src/editor/buffers.c`, `commands.c`, `editor.c`,
+`findpanel.c`, `large.c`, `session.c`, `source_win.c`, and `private.h`.
+Other changes: `tests/win/editor_win_test.c`, `mk/win.mk`, this report, and
+`docs/decisions/edit-177r.28.md`. No file/OS/save-controller implementation,
+Linux behavior, external service, real profile, or WSL write route changed.
+No state-changing git command; coordinator owns the commit.
+
+### Round 2 Found, not fixed / open questions
+
+- Initial editor_exe_test failures reproduced with unmodified HEAD editor
+  implementations and disappeared on the final full run. Root cause is not
+  established. The initial failure and baseline evidence remain above; no
+  executable fixture or product parking/input workaround was added.
+- Initial journal_kill_test randomized progress deadlines reproduced the
+  earlier report's failure boundary; final full release and sanitizer runs
+  both pass. No journal implementation or campaign/deadline change.
+- The Windows checker still prints old integration SKIP labels claiming the
+  editor/file modules are unported. Those unrelated labels were left alone;
+  they do not describe the real-editor WSL assertions added here.
+- No product decision is outstanding. WSL saving remains out of scope; active
+  copied sources use the requested focus/activation/explicit-command checks,
+  with no recurring polling timer and no Linux-side save helper.
+
+All started build/test/benchmark sessions have completed. Final context (M)
+[AC, desktop Spiral], Tobias using the box, is recorded by the final uptime
+below. No live desktop interaction or Windows write to a WSL share occurred.
+ 16:45:55 up  8:17,  1 user,  load average: 1.88, 0.95, 2.41

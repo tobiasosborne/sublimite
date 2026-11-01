@@ -943,7 +943,11 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
         e->focused = ev->focused; undo_break_burst(e->undo);
         if (!ev->focused) { int rc = editor_palette_close(e); if (!rc) rc = editor_menu_reset(e); if (rc) return rc; }
         if (ev->focused && e->buffer->file) {
+#if defined(_WIN32)
+            (void)editor_check_identity(e->buffer);
+#else
             (void)file_check(e->buffer->file, NULL);
+#endif
             int rc = editor_check_sources(e); if (rc) return rc;
         }
         keys_reset(&e->keys); tabs_mru_release(&e->tabs);
