@@ -10,12 +10,39 @@
 #include "trace/trace.h"
 #include "test_isolation.h"
 /* Same native call seam as win32_plat_test; no production fault switch. */
-static volatile LONG fail_clip;
+static volatile LONG fail_clip, synthetic_publication;
+static BOOL publication_empty(void)
+{ return InterlockedCompareExchange(&synthetic_publication,0,0) ? TRUE : EmptyClipboard(); }
+static BOOL publication_close(void)
+{ return InterlockedCompareExchange(&synthetic_publication,0,0) ? TRUE : CloseClipboard(); }
+static HANDLE publish_entered, publish_release;
+static HANDLE stalled_publish(UINT format,HANDLE memory)
+{
+    if(publish_entered) {
+        SetEvent(publish_entered);
+        WaitForSingleObject(publish_release,INFINITE);
+    }
+    if(InterlockedCompareExchange(&synthetic_publication,0,0)) {
+        /* This API seam models a late native success. It owns/frees the test
+         * HGLOBAL instead of transferring it to the OS clipboard. */
+        GlobalFree(memory); return (HANDLE)(uintptr_t)1u;
+    }
+    return SetClipboardData(format,memory);
+}
 static BOOL cut_open(HWND window)
-{ return InterlockedCompareExchange(&fail_clip,0,0) ? FALSE : OpenClipboard(window); }
+{
+    if(InterlockedCompareExchange(&fail_clip,0,0)) return FALSE;
+    return InterlockedCompareExchange(&synthetic_publication,0,0) ? TRUE : OpenClipboard(window);
+}
+#define EmptyClipboard publication_empty
+#define CloseClipboard publication_close
+#define SetClipboardData stalled_publish
 #define OpenClipboard cut_open
 #include "../../src/win32/win32_clip_win.c"
 #undef OpenClipboard
+#undef SetClipboardData
+#undef EmptyClipboard
+#undef CloseClipboard
 #include <d3d11.h>
 #include <dwmapi.h>
 static bool fail_native_alloc;
@@ -29,13 +56,13 @@ static HRESULT WINAPI allocation_device(IDXGIAdapter *adapter,D3D_DRIVER_TYPE ty
 /* A non-interactive station refuses visible windows. Only this renderer
  * seam exercises an undrawn visible-surface latency wait and offscreen draw;
  * it supplies no displayed-frame completion. */
-static bool force_paint_visibility;
+static bool force_paint_visibility, force_cloaked;
 static BOOL paint_visible(HWND window)
 { return force_paint_visibility ? TRUE : IsWindowVisible(window); }
 static HRESULT WINAPI paint_attribute(HWND window,DWORD attribute,PVOID value,DWORD bytes)
 {
     if(force_paint_visibility && attribute==DWMWA_CLOAKED && bytes==sizeof(DWORD)) {
-        *(DWORD *)value=0; return S_OK;
+        *(DWORD *)value=force_cloaked ? 1u : 0u; return S_OK;
     }
     return DwmGetWindowAttribute(window,attribute,value,bytes);
 }
@@ -46,11 +73,34 @@ static HRESULT WINAPI paint_attribute(HWND window,DWORD attribute,PVOID value,DW
 #undef D3D11CreateDevice
 #undef IsWindowVisible
 #undef DwmGetWindowAttribute
-static bool refuse_clear;
+static bool refuse_clear, crash_status, observe_status, status_guard_seen, snapshot_guard_seen;
+static bool hold_save_fence;
+static bool test_save_leased(const editor *e)
+{ return hold_save_fence || editor_save_leased(e); }
+static editor *cpu_editor;
+static int snapshot_probe(render_backend *b,const render_grid *g,const render_strip *strips,size_t count)
+{
+    if(observe_status && cpu_editor) snapshot_guard_seen=cpu_editor->journal_paint==cpu_editor->buffer->id;
+    int rc=render_backend_submit(b,g,strips,count);
+    return rc;
+}
+static void status_probe(editor *e)
+{
+    cpu_editor=e;
+    if(observe_status) status_guard_seen=e->journal_paint==e->buffer->id;
+    if(crash_status) ExitProcess(73); /* (P) private child crash sentinel. */
+    editor_status_overlay(e);
+}
 static void clear_guard(editor *e) { if(!refuse_clear) editor_journal_paint_clear(e); }
+#define editor_save_leased test_save_leased
+#define render_backend_submit snapshot_probe
+#define editor_status_overlay status_probe
 #define editor_journal_paint_clear clear_guard
 #include "../../src/editor/editor.c"
 #undef editor_journal_paint_clear
+#undef editor_status_overlay
+#undef render_backend_submit
+#undef editor_save_leased
 /* Observe shutdown's actual mailbox transfer, independently of its handle. */
 static _Atomic unsigned shutdown_sent;
 static unsigned shutdown_received;
@@ -78,7 +128,7 @@ static size_t observed_receive(work_pool *pool,work_handle handle,uint32_t gener
 #include "../../src/editor/backend.c"
 #undef work_publish
 #undef work_mailbox_receive
-#define T(x) do { if(!(x)) { fprintf(stderr,"editor_win:%d FAIL %s\n",__LINE__,#x); return 1; } } while(0)
+#define T(x) do { if(!(x)) { fprintf(stderr,"editor_win:%d FAIL %s\n",__LINE__,#x); if(publish_release) SetEvent(publish_release); return 1; } } while(0)
 /* Counts match Linux allocation_case: alternating insertion/backspace. */
 #define KEYS 10000u
 #define WATCH_NS UINT64_C(5000000000)
@@ -199,7 +249,26 @@ static int deadline_test(editor *e)
     (void)d3d11_set_suspended(e->backend,true);
     e->journal_metadata_pending=false;
     T(nonkey_dispatch(e,&e->queue[e->queue_head])==0); queue_remove(e,0);
-    T(!e->win_unavailable && !e->win_retry_ns);
+    /* Native suspension wins over EXPOSE, including a station's display-off
+     * notification racing startup. It owes no expired probe deadline. */
+    bool suspended=win32_plat_suspended(&e->platform);
+    T(e->win_unavailable==suspended);
+    if(!suspended) T(!e->win_retry_ns);
+    if(suspended) {
+        T(windows_surface(e)==0 && !e->win_retry_ns);
+        win32_plat *native=win32_private(&e->platform);
+        printf("round4: deadline fixture suspended minimized=%d lock=%d disconnected=%d power=%d\n",
+            native->minimized,native->session_locked,native->session_disconnected,native->power_off);
+        /* Native seam: also exercise the awake state independently of station
+         * power notifications, without changing the fixture's watchdog. */
+        bool minimized=native->minimized, locked=native->session_locked;
+        bool disconnected=native->session_disconnected, power=native->power_off;
+        native->minimized=native->session_locked=native->session_disconnected=native->power_off=false;
+        T(nonkey_dispatch(e,&expose)==0);
+        T(!e->win_unavailable && !e->win_retry_ns);
+        native->minimized=minimized; native->session_locked=locked;
+        native->session_disconnected=disconnected; native->power_off=power;
+    }
     T(settle(e)==0);
     e->win_retry_ns=os_now_ns()-1u; e->win_unavailable=false;
     T(wait_timeout(e,100,os_now_ns())>0); e->win_retry_ns=0;
@@ -208,11 +277,16 @@ static int deadline_test(editor *e)
 static int idle_probe_test(editor *e)
 {
     T(settle(e)==0);
-    /* A previously presented image remains valid when no new frame is owed. */
-    e->win_unavailable=true; (void)d3d11_set_suspended(e->backend,true);
+    /* Seam-confirmed last frame with no occlusion/device/suspension since. */
+    force_paint_visibility=true;
+    win32_plat *platform=win32_private(&e->platform);
+    bool power=platform->power_off; platform->power_off=false;
+    e->win_surface_valid=true; e->win_unavailable=false;
+    (void)d3d11_set_suspended(e->backend,false);
     e->win_frame_owed=false; e->win_retry_ns=0;
     T(windows_surface(e)==0); T(e->win_retry_ns==0);
     for(unsigned i=0;i<WORK_MAX_JOBS;i++) T(windows_surface(e)==0 && !e->win_retry_ns);
+    force_paint_visibility=false;
     T(editor_full_layout(e)==0 && settle(e)==0);
     e->win_frame_owed=true;
     /* No native event is delivered between forcing expiry and retry. */
@@ -226,8 +300,9 @@ static int idle_probe_test(editor *e)
         T(windows_surface(e)==0 && e->win_retry_delay_ns<=D3D11_PARK_PROBE_MAX_NS);
     }
     T(e->win_retry_delay_ns==D3D11_PARK_PROBE_MAX_NS);
-    e->win_frame_owed=false; T(windows_surface(e)==0 && !e->win_retry_ns);
-    puts("round3: valid covered idle frame has zero probe deadlines; owed frame retries without events PASS"); return 0;
+    e->win_frame_owed=false; T(windows_surface(e)==0 && e->win_retry_ns);
+    platform->power_off=power;
+    puts("round4: confirmed valid idle has zero deadlines; uncertain/owed frames retry without events PASS"); return 0;
 }
 static editor *drawing_editor;
 static ID3D11DeviceContextVtbl *drawing_original;
@@ -250,6 +325,8 @@ static int undrawn_guard_test(editor *e)
     T(PostMessageW(plat_native_win32(&e->platform),WM_APP+0x51,0,0));
     T(PostMessageW(plat_native_win32(&e->platform),WM_CHAR,'g',1));
     T(wait_mutation(e,before+1u)==0);
+    win32_plat *platform=win32_private(&e->platform);
+    platform->power_off=platform->session_locked=platform->session_disconnected=platform->minimized=false;
     e->buffer->painted=false; e->buffer->win_composed=false; e->buffer->win_draw_safe=false;
     T(!IsIconic(window));
     d3d11_state *native=e->backend->state;
@@ -261,6 +338,7 @@ static int undrawn_guard_test(editor *e)
     while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
     T(editor_paint_prepare(e)==0);
     uint64_t end=os_now_ns()+WATCH_NS;
+    observe_status=true; status_guard_seen=snapshot_guard_seen=false;
     while(e->dirty) {
         while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
         if(e->full_pending) T(editor_full_layout(e)==0);
@@ -270,6 +348,7 @@ static int undrawn_guard_test(editor *e)
         if(os_now_ns()>=end) fprintf(stderr,"submit blocked paint=%d full=%d layout=%d clip=%d active=%d ops=%zu action=%d extra=%d\n",e->paint_ready,e->full_pending,layout_busy(&e->lay),editor_clip_busy(e),e->backend->active,e->op_count,e->action,e->extra_rows);
         T(os_now_ns()<end);
     }
+    observe_status=false; T(status_guard_seen && snapshot_guard_seen);
     T(e->backend->active && !native->drawn && !e->journal_paint);
     uint64_t records=journal_get_stats(e->journal).accepted_sequence;
     for(unsigned i=0;i<WORK_MAX_JOBS;i++) {
@@ -279,13 +358,42 @@ static int undrawn_guard_test(editor *e)
         T(present(e)==0); T(!e->journal_paint && e->backend->active);
     }
     T(journal_get_stats(e->journal).accepted_sequence==records);
+    for(unsigned i=0;i<WORK_MAX_JOBS;i++) {
+        T(d3d11_discard_unpresented(e->backend)==0);
+        e->win_unavailable=true;
+        T(windows_retry(e)==0);
+        while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+        T(editor_paint_prepare(e)==0);
+        while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+        T(submit(e)==0);
+        T(!e->dirty && e->backend->active && !e->journal_paint);
+    }
+    T(journal_get_stats(e->journal).accepted_sequence==records);
+    /* New glyph/source work before any presentation requires a new guard. */
+    T(d3d11_discard_unpresented(e->backend)==0);
+    T(e->buffer->win_composed);
+    T(editor_full_layout(e)==0);
+    observe_status=true; status_guard_seen=snapshot_guard_seen=false;
+    end=os_now_ns()+WATCH_NS;
+    do {
+        while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+        if(e->full_pending) T(editor_full_layout(e)==0);
+        T(editor_paint_prepare(e)==0 && submit(e)==0);
+        if(e->dirty) T(editor_flush(e)==0);
+        T(os_now_ns()<end);
+    } while(e->dirty);
+    observe_status=false; T(status_guard_seen && snapshot_guard_seen);
     native->latency=saved; CloseHandle(blocked);
+    T(editor_flush(e)==0); /* Return protected PAINT credit before native draw. */
     drawing_editor=e; drawing_guard_seen=false; e->buffer->win_draw_safe=false;
     drawing_original=native->context->lpVtbl;
     ID3D11DeviceContextVtbl guarded=*drawing_original; guarded.DrawInstanced=guarded_instances;
     native->context->lpVtbl=&guarded; native->latency_ready=true;
     native->deadline=os_now_ns()+WATCH_NS;
-    T(present(e)==0);
+    ID3D11DeviceContext *instrumented=native->context;
+    int draw_rc=present(e);
+    if(native->context==instrumented) native->context->lpVtbl=drawing_original;
+    T(draw_rc==0);
     T(drawing_guard_seen && !e->journal_paint);
     force_paint_visibility=false;
     T(settle(e)==0);
@@ -410,12 +518,187 @@ static int cut_test(editor *e)
     T(editor_clip_action(e,KEYS_ACTION_CUT,&cut)==0);
     plat_event close={.kind=PLAT_EV_CLOSE}; T(editor_inject(e,&close)==0);
     uint64_t end=os_now_ns()+WATCH_NS;
-    while(e->quit) { T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield(); }
+    while(e->win_close_requested || editor_clip_pending(e)) { T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield(); }
     T(editor_length(e)==1 && e->recovery_notice && !editor_clip_pending(e));
     InterlockedExchange(&fail_clip,0);
     puts("round2: close waits for queued publication; failure cancels close with text intact PASS");
     puts("round2: identified clipboard failure preserves text/selection, success cuts PASS");
     return 0;
+}
+/* Native publication stays blocked until this fixture explicitly releases it. */
+static int publication_start(editor *e)
+{
+    publish_entered=CreateEventW(NULL,TRUE,FALSE,NULL);
+    publish_release=CreateEventW(NULL,TRUE,FALSE,NULL); T(publish_entered && publish_release);
+    e->v.state.selection=(view_selection){.anchor=0,.cursor=4};
+    plat_event cut={.kind=PLAT_EV_KEY,.press=true,.keysym='x',.mods=PLAT_MOD_CTRL};
+    T(editor_inject(e,&cut)==0);
+    uint64_t end=os_now_ns()+WATCH_NS; unsigned retries=0;
+    while(WaitForSingleObject(publish_entered,0)!=WAIT_OBJECT_0) {
+        T(editor_step(e,0)>=0);
+        if(!editor_clip_busy(e) && !e->queue_count) {
+            /* Another isolated suite may occupy native publication first.
+             * An acquisition failure correctly keeps text; retry admission
+             * until this fixture reaches its foreign-call gate. Do not
+             * confuse that earlier native failure with a blocked handler. */
+            T(e->recovery_notice && strstr(e->recovery_notice,"publication failed"));
+            T(editor_inject(e,&cut)==0); retries++;
+        }
+        T(os_now_ns()<end); os_yield();
+    }
+    if(retries) printf("round4: publication fixture native acquisition retries=%u\n",retries);
+    return 0;
+}
+typedef struct close_records { bool deleted,typed,ordered,late; } close_records;
+static int close_record(void *ctx,const journal_record *record)
+{
+    close_records *seen=ctx;
+    if(record->type==JOURNAL_DELETE) seen->deleted=true;
+    if(record->type==JOURNAL_INSERT && record->size==sizeof(uint64_t)+1u) {
+        if(record->data[sizeof(uint64_t)]=='q') { seen->typed=true; seen->ordered=seen->deleted; }
+        if(record->data[sizeof(uint64_t)]=='r') seen->late=true;
+    }
+    return 0;
+}
+static int close_queue_test(editor *e,bool prompt,unsigned fence)
+{
+    T(settle(e)==0);
+    if(fence==1u) e->journal_metadata_pending=true;
+    else if(fence==2u) hold_save_fence=true;
+    else T(publication_start(e)==0);
+    plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
+    T(editor_inject(e,&key)==0);
+    plat_event close={.kind=prompt ? PLAT_EV_KEY : PLAT_EV_CLOSE,.press=true,.keysym='w',.mods=PLAT_MOD_CTRL};
+    T(editor_inject(e,&close)==0);
+    if(!prompt) { key.keysym='r'; key.utf8[0]='r'; T(editor_inject(e,&key)==0); }
+    if(fence) { T(queue_pick(e)==SIZE_MAX); e->journal_metadata_pending=false; hold_save_fence=false; }
+    else SetEvent(publish_release);
+    uint64_t end=os_now_ns()+WATCH_NS; int rc=0;
+    do {
+        rc=editor_step(e,0); T(rc>=0); T(os_now_ns()<end); os_yield();
+    } while(prompt ? !editor_close_prompt_shown(e) : rc!=EDITOR_CLOSED);
+    uint8_t bytes[6]; size_t length=fence ? 6u : 2u;
+    T(editor_length(e)==length && editor_read(e,0,bytes,length)==0);
+    T(!memcmp(bytes,fence ? "qbase\n" : "q\n",length));
+    if(prompt) { T(!e->quit && editor_close_prompt_shown(e)); e->close_prompt=(editor_close_prompt){0}; }
+    T(editor_flush(e)==0);
+    close_records records={0}; journal_replay_result replay;
+    T(journal_replay_file(e->cfg.journal_path,close_record,&records,&replay)==0);
+    T(records.typed && !records.late && (fence || records.ordered));
+    printf("round4: close boundary %s accepted typing exact, late input excluded, prompt=%d PASS\n",fence==2u ? "save fence" : fence ? "journal fence" : "cut",prompt);
+    return 0;
+}
+static int stuck_publication_test(editor *e)
+{
+    /* Isolate the deliberately stuck SetClipboardData from unrelated native
+     * clipboard acquisition failures. Real acquire/publish behavior remains
+     * covered by close_queue_test, cut_test and win32_plat_test. */
+    InterlockedExchange(&synthetic_publication,1);
+    T(settle(e)==0 && publication_start(e)==0);
+    plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
+    /* Preserve the selection while pending, then move to its end before
+     * typing: the failed cut must leave every original byte intact. */
+    T(editor_length(e)==5);
+    e->blinking=false;
+    T(editor_clip_deadline(e)>os_now_ns());
+    T(wait_timeout(e,-1,os_now_ns())>1);
+    plat_event right={.kind=PLAT_EV_KEY,.press=true,.keysym=0xff53};
+    T(editor_inject(e,&right)==0 && editor_inject(e,&key)==0);
+    uint64_t end=os_now_ns()+WATCH_NS;
+    while(editor_clip_busy(e) || e->queue_count) {
+        T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
+    }
+    uint8_t bytes[6]; T(editor_length(e)==6 && editor_read(e,0,bytes,6)==0 && !memcmp(bytes,"baseq\n",6));
+    T(e->recovery_notice && strstr(e->recovery_notice,"text kept"));
+    /* A late native success must be ignored after the expired operation. */
+    SetEvent(publish_release);
+    win32_clip *transport=win32_private(&e->platform)->clip;
+    end=os_now_ns()+WATCH_NS;
+    for(;;) {
+        AcquireSRWLockShared(&transport->lock); unsigned used=transport->used; ReleaseSRWLockShared(&transport->lock);
+        if(!used) break;
+        T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
+    }
+    T(settle(e)==0);
+    CloseHandle(publish_entered); CloseHandle(publish_release);
+    T(editor_length(e)==6 && editor_read(e,0,bytes,6)==0 && !memcmp(bytes,"baseq\n",6));
+    /* Repeat with no release at all: close and native teardown must detach. */
+    publish_entered=NULL; publish_release=NULL;
+    T(publication_start(e)==0);
+    plat_event close={.kind=PLAT_EV_CLOSE}; T(editor_inject(e,&close)==0);
+    int rc;
+    end=os_now_ns()+WATCH_NS;
+    do { rc=editor_step(e,0); T(rc>=0); T(os_now_ns()<end); os_yield(); } while(rc!=EDITOR_CLOSED);
+    T(editor_length(e)==6);
+    puts("round4: stuck publication expires, typing/close proceed, late deletion refused PASS"); return 0;
+}
+static int cloak_test(editor *e)
+{
+    T(settle(e)==0);
+    force_paint_visibility=true; force_cloaked=true;
+    e->win_unavailable=false; T(d3d11_set_suspended(e->backend,false)==0);
+    e->backend->active=true; ((d3d11_state *)e->backend->state)->drawn=false;
+    e->win_frame_owed=true;
+    T(windows_surface(e)==0);
+    T(e->win_unavailable && !e->backend->active && e->win_retry_ns);
+    e->blinking=false;
+    T(wait_timeout(e,100,os_now_ns())==100);
+    uint64_t before=e->stats.poll_returns; T(editor_step(e,100)>=0);
+    T(e->stats.poll_returns<=before+1u);
+    force_cloaked=false; e->win_retry_ns=os_now_ns()-1u;
+    T(windows_surface(e)==0 && !e->win_unavailable && e->dirty);
+    force_paint_visibility=false; T(settle(e)==0);
+    puts("round4: cloaked pending frame parks without polling; eventless uncloak retries PASS"); return 0;
+}
+/* Synthetic native commit/authentication seams, never displayed-frame evidence. */
+static int committed_frame(render_backend *backend,uint32_t frame)
+{ (void)backend; (void)frame; return RENDER_OK; }
+static int uncertain_surface_test(editor *e)
+{
+    T(settle(e)==0);
+    force_paint_visibility=true;
+    d3d11_state *native=e->backend->state;
+    win32_private(&e->platform)->power_off=false;
+    T(d3d11_set_suspended(e->backend,false)==0);
+    e->win_unavailable=false; e->win_surface_valid=false;
+    int (*original)(render_backend *,uint32_t)=e->backend->ops.present;
+    e->backend->ops.present=committed_frame;
+    e->backend->active=true; e->backend->presented=false; native->drawn=true;
+    int committed=present(e); bool premature=e->win_surface_valid;
+    e->backend->ops.present=original;
+    /* T4 acceptance cannot authenticate intact displayed content. */
+    e->backend->active=false; e->backend->presented=false; native->drawn=false;
+    force_paint_visibility=false;
+    T(committed==0 && !premature);
+    /* The same authenticated mailbox route used by the real renderer is
+     * the only point that confirms validity (first PresentCount = 1). */
+    uint64_t ns=os_now_ns(); e->backend->active=true; e->backend->presented=true;
+    native->completion_queued=true; native->completion_ns=ns;
+    native->present_info.statistics_matched=true; native->present_info.observed=1u;
+    platform_complete(e,e->backend->active_frame,ns,1u);
+    bool confirmed=e->win_surface_valid;
+    e->backend->active=false; e->backend->presented=false;
+    T(confirmed);
+    e->win_frame_owed=false; e->win_unavailable=false; e->win_retry_ns=0;
+    ((d3d11_state *)e->backend->state)->occluded=true;
+    T(windows_surface(e)==0);
+    T(e->win_unavailable && e->win_retry_ns);
+    e->win_retry_ns=os_now_ns()-1u;
+    T(windows_surface(e)==0 && !e->win_unavailable && e->dirty);
+    T(settle(e)==0);
+    puts("round4: uncertain surface retains recovery even with no frame previously owed PASS"); return 0;
+}
+static int maximum_grid_test(editor *e)
+{
+    T(e->max_cols*e->grid.dims.cell_w>=e->cfg.max_window_width);
+    T(e->max_rows*e->grid.dims.cell_h>=e->cfg.max_window_height);
+    T(editor_inject(e,&(plat_event){.kind=PLAT_EV_RESIZE,.w=e->cfg.max_window_width,.h=e->cfg.max_window_height})==0);
+    T(settle(e)==0);
+    T(e->grid.dims.cols*e->grid.dims.cell_w+e->grid.dims.cell_w>e->cfg.max_window_width);
+    printf("round4: maximum reserve cols=%u rows=%u cell=%ux%u sizeof(hl_span)=%zu hit=%zu cell=%zu instance=%zu strip=%zu\n",
+        e->max_cols,e->max_rows,e->grid.dims.cell_w,e->grid.dims.cell_h,
+        sizeof(hl_span),sizeof(editor_hit),sizeof(render_cell),sizeof(d3d11_instance),sizeof(d3d11_strip));
+    puts("round4: startup maximum client is covered by prepaid grid PASS"); return 0;
 }
 static int minimize_test(editor *e)
 {
@@ -497,6 +780,9 @@ static void park(editor *e)
 static int retry_test(editor *e)
 {
     T(settle(e)==0);
+    /* This oracle concerns an awake window; lifecycle registration can
+     * deliver the station's display-off state during the preceding settle. */
+    win32_private(&e->platform)->power_off=false;
     plat_event triggers[]={
         {.kind=PLAT_EV_FOCUS,.focused=true},
         {.kind=PLAT_EV_KEY,.press=true,.keysym='x',.utf8_len=1,.utf8={'x'}},
@@ -567,6 +853,41 @@ static int fallback_test(editor *e)
     e->queue_count=0; e->journal_metadata_pending=false;
     puts("round2: full input queue plus journal fence preserves fallback latency credit PASS"); return 0;
 }
+static int run_child_case(const char *mode,const char *root,DWORD expected)
+{
+    WCHAR self[OS_PATH_MAX],command[3u*OS_PATH_MAX];
+    T(GetModuleFileNameW(NULL,self,OS_PATH_MAX)>0);
+    if(root) {
+        WCHAR wide[OS_PATH_MAX]; T(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,root,-1,wide,OS_PATH_MAX)>0);
+        T(swprintf(command,sizeof command/sizeof command[0],L"\"%ls\" %hs \"%ls\"",self,mode,wide)>0);
+    } else T(swprintf(command,sizeof command/sizeof command[0],L"\"%ls\" %hs",self,mode)>0);
+    STARTUPINFOW startup={.cb=sizeof startup,.dwFlags=STARTF_USESTDHANDLES,
+        .hStdInput=GetStdHandle(STD_INPUT_HANDLE),.hStdOutput=GetStdHandle(STD_OUTPUT_HANDLE),.hStdError=GetStdHandle(STD_ERROR_HANDLE)};
+    PROCESS_INFORMATION process={0}; T(CreateProcessW(NULL,command,NULL,NULL,TRUE,0,NULL,NULL,&startup,&process));
+    /* (E) Existing WATCH per startup, test, teardown; no tighter load bound. */
+    uint64_t watches=!strcmp(mode,"--crash-guard") ? 9u : 3u;
+    DWORD result=WaitForSingleObject(process.hProcess,(DWORD)(watches*WATCH_NS/UINT64_C(1000000)));
+    if(result!=WAIT_OBJECT_0) TerminateProcess(process.hProcess,1);
+    DWORD code=0; T(GetExitCodeProcess(process.hProcess,&code));
+    CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    T(result==WAIT_OBJECT_0 && code==expected); return 0;
+}
+static int crash_guard_test(const editor_config *config,const char *root)
+{
+    for(unsigned cpu=0;cpu<2;cpu++) {
+        char path[OS_PATH_MAX]; snprintf(path,sizeof path,"%s\\guard.journal",root);
+        (void)os_unlink(path);
+        T(run_child_case(cpu ? "--cpu-death" : "--latency-death",root,cpu ? 73u : 74u)==0);
+        editor_config cfg=*config; cfg.journal_path=path; cfg.start_empty=true;
+        render_backend backend={0}; T(render_null_backend(&backend)==0);
+        editor *restored=NULL; T(editor_open(&restored,&cfg,&backend)==0);
+        T(tabs_closed_count(&restored->tabs)==cpu);
+        T(tabs_count(&restored->tabs)==(cpu ? 0u : 1u));
+        if(cpu) T(restored->recovery_notice && strstr(restored->recovery_notice,"first paint"));
+        editor_close(restored); (void)os_unlink(path);
+    }
+    puts("round4: CPU crash restores closed; healthy latency-wait death restores live PASS"); return 0;
+}
 int main(int argc, char **argv)
 {
     setvbuf(stdout,NULL,_IONBF,0);
@@ -577,10 +898,13 @@ int main(int argc, char **argv)
     char temp[OS_PATH_MAX],root[OS_PATH_MAX],journal_path[OS_PATH_MAX]; unsigned random;
     T(os_temp_dir(temp,sizeof temp)==OS_OK && os_random(&random,sizeof random)==OS_OK);
     snprintf(root,sizeof root,"%s\\sublimite-test-editor-path-%x",temp,random);
-    T(os_mkdir(root)==OS_OK && os_env_set("SUBLIMITE_PROFILE",root)==OS_OK);
+    if(argc==3) snprintf(root,sizeof root,"%s",argv[2]);
+    else T(os_mkdir(root)==OS_OK);
+    T(os_env_set("SUBLIMITE_PROFILE",root)==OS_OK);
     T(os_env_set("SUBLIMITE_TEST_INPUT","1")==OS_OK);
     render_backend b={0}; T(render_d3d11_backend(&b)==RENDER_OK);
     snprintf(journal_path,sizeof journal_path,"%s\\typing.journal",root);
+    if(argc==3) snprintf(journal_path,sizeof journal_path,"%s\\guard.journal",root);
     char named_path[OS_PATH_MAX]; snprintf(named_path,sizeof named_path,"%s\\minimized.txt",root);
     os_file named=OS_FILE_INIT; size_t wrote;
     T(os_file_open(&named,named_path,OS_OPEN_WRITE|OS_OPEN_CREATE)==OS_OK);
@@ -595,10 +919,59 @@ int main(int argc, char **argv)
         cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
         memset(large,'a',cfg.initial_len); large[cfg.initial_len-1u]='\n'; cfg.initial=large;
     }
+    if(argc==2 && !strcmp(argv[1],"--maximum")) {
+        /* (P) Tobias's display from brief; reserve versus 60% startup width. */
+        cfg.max_window_width=5120; cfg.max_window_height=1440;
+        cfg.window_width=5120u*60u/100u; cfg.window_height=1440u*70u/100u;
+    }
     editor *e=NULL; T(editor_open(&e,&cfg,&b)==0);
     HWND window=plat_native_win32(&e->platform);
+    if(argc==3) {
+        T(settle(e)==0);
+        win32_plat *platform=win32_private(&e->platform);
+        platform->power_off=platform->session_locked=platform->session_disconnected=platform->minimized=false;
+        plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='g',.utf8_len=1,.utf8={'g'}};
+        T(editor_inject(e,&key)==0 && settle(e)==0);
+        /* A changed input must re-arm even though the prior CPU submission
+         * survived. Snapshot death waits until submit clears the marker. */
+        e->buffer->painted=false;
+        crash_status=!strcmp(argv[1],"--cpu-death");
+        force_paint_visibility=true;
+        d3d11_state *native=e->backend->state;
+        native->latency=CreateEventW(NULL,FALSE,FALSE,NULL); T(native->latency);
+        native->latency_ready=false;
+        e->win_unavailable=false; T(d3d11_set_suspended(e->backend,false)==0);
+        T(editor_full_layout(e)==0);
+        uint64_t end=os_now_ns()+WATCH_NS;
+        while(e->dirty) {
+            while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+            if(e->full_pending) T(editor_full_layout(e)==0);
+            T(editor_paint_prepare(e)==0 && submit(e)==0);
+            if(e->dirty) T(editor_flush(e)==0);
+            T(os_now_ns()<end);
+        }
+        T(!crash_status); /* CPU mode must have died after composition. */
+        T(e->backend->active && !native->drawn && !e->journal_paint);
+        T(present(e)==0 && e->backend->active && !native->drawn && !e->journal_paint);
+        ExitProcess(74); /* (P) abrupt death inside the undrawn latency wait. */
+    }
     if(argc==2) {
-        int rc=!strcmp(argv[1],"--resizefail") ? resize_failure_test(e) :
+        /* On a station display-power notifications are real but unrelated to
+         * these renderer seams. --deadline explicitly tests both states. */
+        if(strcmp(argv[1],"--deadline")) {
+            win32_plat *native=win32_private(&e->platform);
+            native->power_off=native->session_locked=native->session_disconnected=native->minimized=false;
+        }
+        int rc=!strcmp(argv[1],"--crash-guard") ? crash_guard_test(&cfg,root) :
+            !strcmp(argv[1],"--close-queue") ? close_queue_test(e,false,false) :
+            !strcmp(argv[1],"--close-fence") ? close_queue_test(e,false,1u) :
+            !strcmp(argv[1],"--close-save") ? close_queue_test(e,false,2u) :
+            !strcmp(argv[1],"--close-prompt") ? close_queue_test(e,true,false) :
+            !strcmp(argv[1],"--stuck") ? stuck_publication_test(e) :
+            !strcmp(argv[1],"--cloak") ? cloak_test(e) :
+            !strcmp(argv[1],"--uncertain") ? uncertain_surface_test(e) :
+            !strcmp(argv[1],"--maximum") ? maximum_grid_test(e) :
+            !strcmp(argv[1],"--resizefail") ? resize_failure_test(e) :
             !strcmp(argv[1],"--allocfail") ? allocation_failure_test(e) :
             !strcmp(argv[1],"--queue") ? queue_cut_test(e) :
             !strcmp(argv[1],"--close-large") ? close_large_test(e) :
@@ -612,6 +985,15 @@ int main(int argc, char **argv)
             !strcmp(argv[1],"--paint") ? paint_discard_test(e) :
             !strcmp(argv[1],"--fallback") ? fallback_test(e) : lifecycle_test(e);
         editor_close(e);
+        if(!rc && (!strcmp(argv[1],"--close-queue") || !strcmp(argv[1],"--close-fence") || !strcmp(argv[1],"--close-save"))) {
+            bool fence=strcmp(argv[1],"--close-queue")!=0;
+            b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
+            T(editor_open(&e,&cfg,&b)==0); T(settle(e)==0);
+            uint8_t recovered[6]; size_t count=fence ? 6u : 2u;
+            T(editor_length(e)==count && editor_read(e,0,recovered,count)==0);
+            T(!memcmp(recovered,fence ? "qbase\n" : "q\n",count));
+            puts("round4: close-boundary recovery bytes exact PASS"); editor_close(e);
+        }
         if(!rc && !strcmp(argv[1],"--close-large")) {
             b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
             T(editor_open(&e,&cfg,&b)==0); T(settle(e)==0);
@@ -620,6 +1002,8 @@ int main(int argc, char **argv)
         }
         free(large); cleanup(root); return rc;
     }
+    const char *round4[]={"--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard"};
+    for(size_t at=0;at<sizeof round4/sizeof round4[0];at++) T(run_child_case(round4[at],NULL,0)==0);
     T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);
     T(larger_surface_test(e)==0); T(allocation_failure_test(e)==0); T(resize_failure_test(e)==0);
     T(cut_test(e)==0); /* Restore the campaign's initial text afterward. */

@@ -90,8 +90,14 @@ static HMONITOR test_monitor(HWND hwnd, DWORD flags)
 static BOOL test_monitor_info(HMONITOR monitor, LPMONITORINFO info)
 {
     if(display_fixture) {
-        MONITORINFOEXW *ex=(MONITORINFOEXW *)info;
-        (void)swprintf(ex->szDevice,CCHDEVICENAME,L"DISPLAY%u",(unsigned)(uintptr_t)monitor);
+        /* (P) synthetic primary is half the brief's 5120-pixel wide screen;
+         * second current monitor needs the full extent. */
+        info->rcWork=(RECT){0,0,monitor==(HMONITOR)(uintptr_t)2u ? 5120 : 5120/2,1440};
+        info->rcMonitor=info->rcWork;
+        if(info->cbSize==sizeof(MONITORINFOEXW)) {
+            MONITORINFOEXW *ex=(MONITORINFOEXW *)info;
+            (void)swprintf(ex->szDevice,CCHDEVICENAME,L"DISPLAY%u",(unsigned)(uintptr_t)monitor);
+        }
         return TRUE;
     }
     return GetMonitorInfoW(monitor,info);
@@ -123,6 +129,13 @@ static LONG test_display_name(DISPLAYCONFIG_DEVICE_INFO_HEADER *header)
     }
     return DisplayConfigGetDeviceInfo(header);
 }
+static BOOL test_monitors(HDC dc,LPCRECT clip,MONITORENUMPROC callback,LPARAM context)
+{
+    if(!display_fixture) return EnumDisplayMonitors(dc,clip,callback,context);
+    return callback((HMONITOR)(uintptr_t)1u,NULL,NULL,context) &&
+        callback((HMONITOR)(uintptr_t)2u,NULL,NULL,context);
+}
+#define EnumDisplayMonitors test_monitors
 #define MonitorFromWindow test_monitor
 #define GetMonitorInfoW test_monitor_info
 #define GetDisplayConfigBufferSizes test_display_sizes
@@ -145,6 +158,7 @@ static LONG test_display_name(DISPLAYCONFIG_DEVICE_INFO_HEADER *header)
 #undef GetClipboardData
 #undef OpenClipboard
 #undef MonitorFromWindow
+#undef EnumDisplayMonitors
 #undef GetMonitorInfoW
 #undef GetDisplayConfigBufferSizes
 #undef QueryDisplayConfig
@@ -518,6 +532,8 @@ static void display_test(fixture *f)
      * follow (P) SI ns/second divided by each fixture's frames/second. */
     CHECK(plat_display_interval_ns(&f->p)==UINT64_C(1000000000)/60u);
     display_output=1; CHECK(plat_display_interval_ns(&f->p)==UINT64_C(1000000000)/144u);
+    uint32_t width=5120u/2u,height=1440;
+    CHECK(win32_plat_max_client(&width,&height)==PLAT_OK && width==5120 && height==1440);
     display_fixture=false;
     printf("win32_plat: live output interval_ns=%llu (M)\n",(unsigned long long)plat_display_interval_ns(&f->p));
     verdict("r2 refresh timing follows HWND output association",before);

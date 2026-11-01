@@ -34,6 +34,10 @@ bool editor_font_event(editor *e, const work_msg *msg)
             (void)font_async_event(e->font.atlas[1u - e->font.current].fonts, msg);
         return true;
     }
+#if defined(_WIN32)
+    /* Even an unpresented tab may receive new glyph pixels during a probe. */
+    e->buffer->win_composed=false; e->buffer->win_draw_safe=false;
+#endif
     (void)font_async_bind(e->fonts, &e->text_grid);
     (void)font_async_bind(e->fonts, &e->grid);
     /* Pixel-only changes need damage even when cell metadata is unchanged.

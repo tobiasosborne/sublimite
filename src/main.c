@@ -16,6 +16,7 @@
 #include <shellapi.h>
 #include <io.h>
 #include "win32/close.h"
+#include "win32/private.h"
 #else
 #include <sys/signalfd.h>
 #endif
@@ -269,6 +270,10 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
         if (display_size.work_width && display_size.work_height) {
             config.max_window_width = display_size.work_width;
             config.max_window_height = display_size.work_height;
+#if defined(_WIN32)
+            int maximum=win32_plat_max_client(&config.max_window_width,&config.max_window_height);
+            if(maximum) rc=EDITOR_ERR_IO;
+#endif
             editor_runtime_window(display_size.work_width, display_size.work_height,
                                   &config.window_width, &config.window_height);
             config.window_size_default = true;

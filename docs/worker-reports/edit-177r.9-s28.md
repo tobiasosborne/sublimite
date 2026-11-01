@@ -296,3 +296,151 @@ Windows check: binaries=130 desktop-passes=6 jobs=4 seconds=597.881 failures=0; 
 Logs: `build/r3-linux-all-final.log`, `build/r3-linux-check-complete.log`, `build/r3-win-check-complete.log`. Full Windows line above is pasted verbatim. (M) The runner counts 130 release/sanitizer binaries, six additional desktop passes and one intentional ASan-negative run; 137 RESULT lines in the log. Failures=0 is the runner's expected-status comparison. Elapsed seconds are its monotonic finish minus start; this is suite wall time, not a performance budget. No FLAKY in the changed suites. `git diff --check` exits 0.
 
 Coordinator: the source is ready to commit; no git state changes were made. Use the fresh normal-depth Windows build directory shown above while the original executable image remains held. The separate pre-existing clipboard storage allocation and live-only coverage are explicitly bounded under Found, not fixed above.
+
+## Round 4 — final review fixes
+
+This section supersedes Round 3's stale-image workaround and the policies corrected below. No `WIN_B` override was used in Round 4. The coordinator's runner-race fix was not copied or changed in this worktree.
+
+Every build/test used `taskset -c 16-47 nice -n 10`, builds used `-j32`, and full Windows checks used `WIN_CHECK_JOBS=4`. Native executables ran only through `tools/winrun.sh`; their test-created children inherited the private station/job. Existing full-check private-desktop passes remained restricted to their clipboard-free cases. No live desktop, user clipboard/profile, registry, package, state-changing git/bd command, sub-agent, HANDOFF or worklog edit occurred.
+
+### Changes and mechanisms
+
+- **0, reported deadline red:** (M) original fixture failed 16/16 attempts, four concurrent lanes crossed with four repetitions (the brief's Windows group count used for both axes), during a concurrent Linux check. Diagnostics showed `win_native_suspended=1 platform_suspended=1`: `power_off=1`, minimized/lock/disconnect clear. A private-station console-display-off notification invalidated the fixture's awake precondition. Suspension correctly takes precedence over expose. The fixture now checks both suspended and explicitly awake states, and checks that suspended parking clears its expired deadline. No watchdog increase or production parking-race workaround. Identical count/concurrency: 16/16 green under concurrent Linux and Windows full checks. Logs: `r4-baseline-deadline-counts.log`, `r4-deadline-diagnostic.log`, `r4-deadline-counts.log` in `build/`.
+- **1, close boundary:** Windows closes admission immediately and continues the normal editor loop until previously admitted events, save/journal fences, mutation/view/undo continuations and staged records drain. Later events cannot enter the FIFO; clipboard terminals retain their separate control slot. Queued Ctrl+W still shows its modified-tab save prompt. Native lifecycle pumping and console-close wakeups use the same boundary. Files: `editor.c`, `backend.c`, `buffers.c`, `clip.c` under `src/editor/`.
+- **2, first paint:** PAINT remains armed through composition, status, validation, repair, D3D's glyph/pixel snapshot and CPU frame bookkeeping. It clears before latency waiting. New frames and adopted glyph pixels invalidate remembered CPU/native safety while the tab has never presented. An unchanged idle probe may reuse it. The existing submitted-source native draw guard remains. Files: `src/editor/editor.c`, `fonts.c`, `private.h`.
+- **3 and 5, cloak/validity:** D3D surface availability includes cloaking. Pending frames park instead of polling. Surface validity is separate from whether a new frame was owed; occlusion, cloak, suspension and device recovery invalidate it until authenticated T6 completion (accepted T4 alone is insufficient). Uncertainty retains the bounded recovery obligation. Confirmed valid idle adds no timer, and native suspension suppresses probes. The existing (E) probe policy remains `3 s * 2^4 = 48 s`, derived from the inherited missing-completion window and four policy doublings; this bounds another attempt, not successful display. Files: `src/d3d11/d3d11_win.c`, `src/editor/editor.c`, `private.h`.
+- **4, stuck publication:** the identified native operation has a UI deadline in the wait set. (E) Deadline envelope = acquisition tolerance plus foreign-handler tolerance = `2 * GetDoubleClickTime()`; zero uses the existing documented 500 ms default, yielding `2 * 500 ms = 1 s` on the private station. Expiry keeps text/selection, invalidates the deletion ID and retained result, displays a notice, and resumes input. Close uses the existing detached worker lifetime. Late native success cannot delete. Contention additionally exposed a stale notice-shown flag after a preceding native failure; both publication failure and expiry now reset it. Files: `src/editor/clip.c`, `editor.c`, `private.h`.
+- **6, maximum client:** Windows startup enumerates all current monitor work areas, reserves their maximum width/height, and reserves grid columns/rows from those client extents with ceiling division. Later larger monitors/restores retain the existing actual-HWND clamp. Files: `src/main.c`, `src/win32/win32_plat.c`, `private.h`, `src/editor/open.c`.
+
+Cost (P), derived in the decision doc: default 10 pt at 96 DPI gives em 13 px and cell width 8 px. On the documented 5120×1440 monitor, columns increase from `max(360, 3072/8)=384` to `ceil(5120/8)=640`. Rows remain at the existing 300-row minimum. Added overscan-inclusive cells: `(640-384)*(300+1)=77,056`. Current ABI storage increments: UI `77,056*(3*24+24+2*20)=10,479,616 B`; D3D CPU instances/strips `77,056*(48+16/2)=4,315,136 B`; GPU instances `77,056*48=3,698,688 B`. Total `18,493,440 B / 1024^2 = 17.64 MiB`, excluding allocator/driver granularity. The already prepaid pixel surfaces, atlas, minimap and row bitmaps do not increase in this example. Larger current monitor extents also increase their existing pixel/row formulas. Linux has the same initial-window/minimum-grid limitation on large monitors; it is reported, not changed.
+
+### Red and green evidence
+
+Commands below all have the CPU/nice prefix. Build: `make TARGET=win -j32 build/win/rel/tests/editor_win_test.exe`. Run: `tools/winrun.sh build/win/rel/tests/editor_win_test.exe --<selector>`. (M) Exit status is the command's returned status; exact byte/order assertions are semantic gates.
+
+| Selector | Original red | Green evidence |
+|---|---|---|
+| `close-queue` | exit 1, expected deletion plus queued q absent (`r4-red-close-queue.log`) | exact `q\n`, deletion before q in journal, later r absent, exact recovered bytes |
+| `close-fence` | exit 1, accepted q absent (`r4-red-close-fence.log`) | exact `qbase\n` and recovery; save-fence counterpart `close-save` also passes |
+| `close-prompt` | existing positive control passed | modified-tab close prompt remains after queued q drains |
+| `guard` | exit 1, PAINT absent after compose at status (`r4-red-guard.log`) | guard observed at status/snapshot and native draw; undrawn waits and WORK_MAX_JOBS identical full retry compositions append no records; a new frame re-arms |
+| `cloak` | exit 1, no parked frame/deadline (`r4-red-cloak.log`) | no active poll cadence, only test-deadline wake, eventless uncloak requests full retry |
+| `uncertain` | exit 1, no obligation when nothing owed (`r4-red-uncertain.log`) | uncertain surface schedules recovery without input; confirmed valid idle has no deadline |
+| `stuck` | inherited WATCH_NS failure; cleanup itself hangs on unfixed code (`r4-red-stuck.log`) | expiry keeps original bytes, queued movement/typing proceeds, late success ignored, second never-returning publication permits close and detached teardown |
+| `maximum` | exit 1, grid width below maximum client (`r4-red-maximum-direct.log`) | maximum client fits the prepaid grid; ABI sizes printed; platform test also checks a larger second current monitor |
+
+The deliberately hanging original red was stopped through only its recorded own runner PID 1454641; shell exit 143. Later assertion failures release the fixture's own gate, avoiding hung cleanup. No process-name killing. A read-only worktree-process query confirmed that original stuck test was gone.
+
+Actual crash/reopen oracle: `--crash-guard` terminates its own child after first composition, before snapshot, and recovers that tab closed with the first-paint notice. Its healthy undrawn latency-wait death reopens live. It passes in the full editor suite. Additional old-source countercheck used HEAD's editor implementation with the same oracle (`editor_r4_cpu_red.exe --crash-guard`), exit 1, `FAIL tabs_closed_count(&restored->tabs)==cpu` (`r4-red-cpu-recovery.log`). This was an independent confirmation after the initial guard-observation red, not a claim that the later countercheck preceded implementation.
+
+The blocked-call test uses native API seams in the test translation unit, with the real worker, identified terminal result, UI deadline and detached lifetime. Its deliberately indefinite SetClipboardData seam avoids acquiring the OS clipboard first, so another concurrent fixture's ordinary acquisition failure cannot prevent it reaching the intended block. On release it models a successful native return and frees its test HGLOBAL. Other cut/close tests and win32_plat_test retain real native acquisition/publication. Initial four-copy runs reproduced legitimate early acquisition failures; once retried, three fixtures exposed the stale timeout-notice state (`r4-stuck-contention-*.log`). That production notice issue is fixed. No application deadline or inherited WATCH_NS was enlarged.
+
+Superseded Windows checks are explicitly excluded: `r4-win-check.log` completed with only the expanded editor fixture failing; `r4-win-check-final.log` was stopped through its own checker PID 1546654's shutdown handler after the concurrency/notice investigation. `r4-win-check-complete.log` then passed every changed suite but hit one unchanged release OS stray-fault-child watchdog; its focused rerun passed. `r4-win-check-verified.log` was superseded through checker PID 1634105 for the additional T4/T6 validity regression. Final log is recorded below.
+
+### Verification and campaigns
+
+Completed release editor integration: `tools/winrun.sh build/win/rel/tests/editor_win_test.exe`, exit 0 (`build/r4-editor-full3.log`), including journal-credit exhaustion, large sliced cut/reopen and all prior lifecycle/parking cases. The final full Windows run includes the later notice fix, fixture correction and authenticated T6 validity boundary.
+
+(M) Four complete release editor suites ran concurrently, count derived from `WIN_CHECK_JOBS=4`, each on its own runner job: **4/4 exit 0**, all changed regressions plus typing/large-cut recovery pass (`build/r4-contention-verified-counts.log`, `r4-contention-verified-{1..4}.log`). Each processes the inherited Linux allocation_case workload of 10,000 alternating keys, exact content and journal mutation count, allocator positive control active, **mallocs=0**. Concurrent per-lane CPU submit p50/p99 ns: 135500/1582000, 148300/494500, 121400/329000, 119100/388000. Derivation: submit_ns minus ingress_ns, nearest-rank index `ceil(N*pct/100)-1`. These are private-station CPU-submit measurements, not native T4/T6 or visible cadence claims.
+
+Release Linux allocator campaigns also exit 0: `EDITOR_ALLOC_ONLY=null build/tests/editor_test` and `EDITOR_ALLOC_ONLY=raster xvfb-run -a build/tests/editor_test`; each reports `10000 keys mallocs=0 guard=active` (`r4-linux-alloc-{null,raster}.log`). Existing benchmark fixture `xvfb-run -a build/bench/editor_bench --track --no-idle --no-p4 --serial-only --keys=64` exits 0 (`r4-linux-bench.log`), structural OK and allocations=0. Its inherited 64-key CPU-raster fallback TRACK T4 p50/p99 = 16,904,113/18,044,724 ns; no new performance gate or Linux improvement is claimed.
+
+All measurements (M) [AC, desktop Spiral], Tobias using the box; BAT0 absent. During contention at 15:20:35, uptime load was 6.11/2.15/1.77; benchmark printed load1=0.44. The benchmark's own [unknown] label only detects BAT0, so this report supplies the desktop power stamp. Counts derive from the logged runner results/workload constants; suite durations are monotonic finish minus start.
+
+Linux preprocessed C tokens for `backend.c`, `buffers.c`, `clip.c`, `editor.c`, `fonts.c`, `open.c`, and `main.c` are identical to HEAD, with only the comparison file's __FILE__ path normalized (`build/r4-linux-tokens.log`). The final Win32 changes disappear under preprocessing; shared headers are included in the comparison. `git diff --check` exits 0.
+
+Final build/check results are recorded below. All required checks completed successfully on the final source.
+
+### Found, not fixed / coordinator boundaries
+
+- Linux large-monitor grid limit described above, explicitly left unchanged by the brief.
+- Existing native clipboard-command payload/job allocation remains. Plain typing is verified allocation-free; no allocation-free clipboard-command claim.
+- Physical maximize/uncover/virtual-desktop presentation and native displayed-frame G1 remain coordinator-only check-live coverage. Private-station tests establish CPU snapshots, parking and eventless retry obligations, not actual scanout.
+- No product decision is deferred. The maximum-grid storage cost and derived clipboard deadline policy are recorded in `docs/decisions/edit-177r.9.md`.
+
+### Exact red/green console excerpts
+
+```text
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --close-queue
+exit=1
+editor_win:473 FAIL editor_length(e)==length && editor_read(e,0,bytes,length)==0
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --close-fence
+exit=1
+editor_win:473 FAIL editor_length(e)==length && editor_read(e,0,bytes,length)==0
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --guard
+exit=1
+editor_win:294 FAIL status_guard_seen
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --cloak
+exit=1
+editor_win:515 FAIL e->win_unavailable && !e->backend->active && e->win_retry_ns
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --uncertain
+exit=1
+editor_win:531 FAIL e->win_unavailable && e->win_retry_ns
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --stuck
+exit=143 (deliberate hung red stopped through own runner PID)
+editor_win:487 FAIL os_now_ns()<end
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe --maximum
+exit=1
+editor_win:539 FAIL e->max_cols*e->grid.dims.cell_w>=e->cfg.max_window_width
+
+taskset -c 16-47 nice -n 10 tools/winrun.sh build/win/rel/tests/editor_win_test.exe
+exit=0
+round4: close boundary cut accepted typing exact, late input excluded, prompt=0 PASS
+round4: close-boundary recovery bytes exact PASS
+round4: close boundary journal fence accepted typing exact, late input excluded, prompt=0 PASS
+round4: close-boundary recovery bytes exact PASS
+round4: close boundary save fence accepted typing exact, late input excluded, prompt=0 PASS
+round4: close-boundary recovery bytes exact PASS
+round4: close boundary cut accepted typing exact, late input excluded, prompt=1 PASS
+round3: covered non-minimized undrawn latency waits leave no PAINT or journal growth PASS
+round4: cloaked pending frame parks without polling; eventless uncloak retries PASS
+round4: uncertain surface retains recovery even with no frame previously owed PASS
+round4: stuck publication expires, typing/close proceed, late deletion refused PASS
+round4: maximum reserve cols=512 rows=300 cell=10x19 sizeof(hl_span)=24 hit=24 cell=20 instance=48 strip=16
+round4: startup maximum client is covered by prepaid grid PASS
+round4: CPU crash restores closed; healthy latency-wait death restores live PASS
+round4: deadline fixture suspended minimized=0 lock=0 disconnected=0 power=1
+round4: confirmed valid idle has zero deadlines; uncertain/owed frames retry without events PASS
+round3: covered non-minimized undrawn latency waits leave no PAINT or journal growth PASS
+editor_win: (M)[AC, desktop Spiral] keys=10000 journal_records=keys mallocs=0 guard=active p50_ns=128600 p99_ns=258900 derivation=submit_ns-ingress_ns; nearest-rank=ceil(N*pct/100); N=Linux allocation_case; surface=occluded (CPU submit, no T4/T6); Linux has no percentile G1 assertion
+```
+
+The additional item-5 audit added a synthetic native T4/T6 oracle: T4 acceptance must leave validity uncertain; only the existing authenticated completion mailbox may confirm it. Red: CPU/nice prefix plus `tools/winrun.sh build/win/rel/tests/editor_win_test.exe --uncertain`, exit 1, `editor_win:672 FAIL committed==0 && !premature` (`build/r4-validity-red.log`). The fix moves validity confirmation from editor present submission to `platform_complete` after `d3d11_present_complete` authenticates it. No native scanout is fabricated by the test seam.
+
+The final T4/T6 validity focused green command is the same `--uncertain` selector in release and sanitizer configurations: both exit 0 (`build/r4-validity-green-counts.log`). Final four-copy full editor contention, including that additional regression, passes **4/4** (`build/r4-contention-verified-counts.log`). At 15:38:01 [AC, desktop Spiral], box in use, uptime load was 1.65/2.28/1.78.
+
+### Round 4 final verdict — done
+
+No required work remains. Final commands and returned statuses:
+
+```text
+taskset -c 16-47 nice -n 10 make -j32 all
+exit=0
+taskset -c 16-47 nice -n 10 env DEBUGINFOD_URLS= make -j32 check
+exit=0
+check: 117 test binaries passed in 96.1 s (parallel, 32 jobs, 6 displays)
+taskset -c 16-47 nice -n 10 env WIN_CHECK_JOBS=4 make TARGET=win -j32 check
+exit=0
+Windows check: binaries=130 desktop-passes=6 jobs=4 seconds=615.125 failures=0; SKIP cases=162: AddressSanitizer owns malloc=1; Linux SIGBUS signal-action chaining and real truncation: native Windows faults use the OS fault trigger; NTFS refuses mapped truncation=2; Linux syscall interposition; real-file integration awaits W2.1/W2.2=2; POSIX FIFO, mode/uid/xattr/ACL and syscall-interposition cases: Windows metadata and native errors exercised above=2; POSIX chmod unreadable directory (Windows uses ACLs)=2; clipboard: needs private station=16; editor panel clipboard/chord integration (editor not in Windows build)=2; editor-dependent group/retire/session/recovery/dataloss integration and first-paint closed-tab restart (editor/platform not ported)=1; hard-link/symlink fixtures: frozen os.h has no link-creation API=2; hl_worker faulted_snapshot (requires W2 mapped file/fault integration)=2; installed layouts are UK/US/German=4; journal/findui integration and editor-dependent cases: those modules await their Windows beads=2; layouts: needs a station with input=8; libxkbcommon differential name oracle (Linux-only library); binding expectations unchanged=2; lineidx combined_ownership (file-backed integration requires W2 file port)=2; name=G6_dense_a file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-4cb16e341678816a (quick: optional all-a fixture absent; full mode requires it)=1; name=G6_dense_a file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-912501eba8800896 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6c file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-4cb16e341678816a (quick: optional all-a fixture absent; full mode requires it)=1; name=G6c file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-912501eba8800896 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_a31b file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-4cb16e341678816a (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_a31b file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-912501eba8800896 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_early file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-4cb16e341678816a (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_early file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-912501eba8800896 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_middle file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-4cb16e341678816a (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_middle file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-912501eba8800896 (quick: optional all-a fixture absent; full mode requires it)=1; needs live desktop: N edits give N frames=2; needs live desktop: committed presentation=4; needs live desktop: diagnostic Present validates timing=4; needs live desktop: displayed frame completion=60; needs live desktop: foreground Unicode input=4; needs live desktop: foreground native input=4; needs live desktop: hardware presentation=4; needs live desktop: native T4 G1; Linux limits (G=2; needs live desktop: physical console input and shell attachment=2; needs live desktop: visible minimize and restore=4; requires Windows main/platform (W2.4)=2; sanitizer owns allocator=2; sanitizer owns malloc=1; src/file save integration (file module not ported); journal_save_prepare/finish/cancel run in journal_safety_test=1; trace_pairs Python cases (SUBLIMITE_TEST_PYTHON native interpreter path unset)=2; work_foreground editor jump (requires Windows editor/platform port)=2; work_foreground real clients (8 cases require W2 savectl/findui/font discovery)=2
+```
+
+Logs: `build/r4-linux-all-final-complete.log`, `build/r4-linux-check-final-complete.log`, `build/r4-win-check-final-complete.log`. No WIN_B override; normal `build/win` was used. The final Windows checker returned 0 and reported 137 RESULT lines: 130 release/sanitizer binaries plus six private-desktop passes and one intentional ASan-negative case. Counts derive from the checker inputs/result log; SKIP is explicit existing coverage, not an assertion pass. Linux reports no FLAKY; its display-lock self-test deliberately exercises failed nested commands before its own PASS. `git diff --check` returns 0.
+
+Final Windows typing samples from the completed full check (M), [AC, desktop Spiral], box in use:
+
+```text
+editor_win: (M)[AC, desktop Spiral] keys=10000 journal_records=keys mallocs=0 guard=active p50_ns=123500 p99_ns=333100 derivation=submit_ns-ingress_ns; nearest-rank=ceil(N*pct/100); N=Linux allocation_case; surface=occluded (CPU submit, no T4/T6); Linux has no percentile G1 assertion
+editor_win: (M)[AC, desktop Spiral] keys=10000 journal_records=keys mallocs=0 guard=ASan-inert p50_ns=441100 p99_ns=852300 derivation=submit_ns-ingress_ns; nearest-rank=ceil(N*pct/100); N=Linux allocation_case; surface=occluded (CPU submit, no T4/T6); Linux has no percentile G1 assertion
+```
+
+Final complete contention run: four concurrent full release editor copies, four exits 0, each 10,000 exact journaled edits and mallocs=0 with active allocator guard (`build/r4-contention-verified-counts.log`). The final T4/T6 regression is included. Earlier superseded failures and their diagnoses remain recorded above; none is silently relabeled a pass. The unchanged OS stray-fault-child timeout was not changed in this bead; focused rerun and both OS configurations in the final whole check pass.
+
+Coordinator: ready for review/commit. No product decision is deferred. Linux's large-monitor grid limitation and existing live-only presentation checks are reported above. No state-changing git command was run.
+
+Final read-only process audit (`build/r4-processes-final.log`) found only its own private runner and audit helper, both now exited: no editor/test orphan from this worktree remained. The crash-oracle process watchdog derives from one inherited WATCH_NS per startup/test/teardown: `3 * WATCH_NS`; its parent with two crash children uses `(1 + 2) * 3 * WATCH_NS = 9 * WATCH_NS`. Application deadlines are independent of those fixture watchdogs.

@@ -156,6 +156,17 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (cols > e->max_cols) e->max_cols = cols;
     if (rows > e->max_rows) e->max_rows = rows;
     if (e->max_cols > 8192 || e->max_rows > 8192) { rc = EDITOR_ERR_ARG; goto fail; }
+#if defined(_WIN32)
+    /* (P) ceil(maximum client / initial cell): a partial edge cell still
+     * needs a column/row reservation. Startup prepays every current monitor. */
+    uint32_t client_cols=config->max_window_width/atlas->cell.cell_w+
+        (config->max_window_width%atlas->cell.cell_w!=0);
+    uint32_t client_rows=config->max_window_height/atlas->cell.cell_h+
+        (config->max_window_height%atlas->cell.cell_h!=0);
+    if(client_cols>e->max_cols) e->max_cols=client_cols;
+    if(client_rows>e->max_rows) e->max_rows=client_rows;
+    if(e->max_cols>8192 || e->max_rows>8192) { rc=EDITOR_ERR_ARG; goto fail; }
+#endif
     e->font.max_width = e->max_cols * atlas->cell.cell_w;
     e->font.max_height = e->max_rows * atlas->cell.cell_h;
     if (config->max_window_width) e->font.max_width = config->max_window_width;

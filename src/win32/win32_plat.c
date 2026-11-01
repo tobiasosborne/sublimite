@@ -750,6 +750,27 @@ const uint8_t *plat_clip_data(const plat *p, size_t *len)
     return s ? s->clip_data : NULL;
 }
 
+typedef struct win32_client_extent { uint32_t width,height; } win32_client_extent;
+static BOOL CALLBACK maximum_client(HMONITOR monitor,HDC dc,LPRECT rect,LPARAM ctx)
+{
+    (void)dc; (void)rect;
+    win32_client_extent *extent=(win32_client_extent *)ctx;
+    MONITORINFO info={.cbSize=sizeof info};
+    if(!GetMonitorInfoW(monitor,&info)) return FALSE;
+    uint32_t width=(uint32_t)(info.rcWork.right-info.rcWork.left);
+    uint32_t height=(uint32_t)(info.rcWork.bottom-info.rcWork.top);
+    if(width>extent->width) extent->width=width;
+    if(height>extent->height) extent->height=height;
+    return TRUE;
+}
+int win32_plat_max_client(uint32_t *width,uint32_t *height)
+{
+    if(!width || !height) return PLAT_ERR_FAIL;
+    win32_client_extent extent={*width,*height};
+    if(!EnumDisplayMonitors(NULL,NULL,maximum_client,(LPARAM)&extent)) return PLAT_ERR_FAIL;
+    *width=extent.width; *height=extent.height;
+    return PLAT_OK;
+}
 int plat_display_size(plat_backend backend, plat_display_info *info)
 {
     if (backend!=PLAT_BACKEND_WIN32 || !info || !awareness()) return PLAT_ERR_FAIL;

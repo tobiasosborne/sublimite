@@ -56,8 +56,9 @@ static void init_result(const work_msg *msg, void *ctx)
 static void init_event(void *ctx, const plat_event *event)
 {
     editor *e = ctx;
-    if (event->kind == PLAT_EV_CLOSE) e->quit = true;
-    else if (e->buffer) (void)editor_inject(e, event);
+    if (e->buffer) (void)editor_inject(e, event);
+    else if (event->kind == PLAT_EV_CLOSE) e->win_close_requested = true;
+    else if (e->win_close_requested) return;
     else if (e->queue_count < EDITOR_INPUT_CAP) {
         size_t at = (e->queue_head + e->queue_count++) % EDITOR_INPUT_CAP;
         e->queue[at] = *event; e->queue_serial[at] = ++e->event_serial;

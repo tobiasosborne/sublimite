@@ -27,7 +27,11 @@ static int windows_retry(editor *e)
     if(!e->backend->initialized || win32_plat_suspended(&e->platform)) return 0;
     e->win_unavailable=false; e->win_retry_ns=0;
     (void)d3d11_set_suspended(e->backend,false);
-    return editor_full_layout(e);
+    /* Only an otherwise idle retry may reuse CPU safety. Any new frame,
+     * input, or adopted glyph invalidates it through editor_begin_frame. */
+    e->win_cpu_probe=!e->dirty;
+    int rc=editor_full_layout(e); e->win_cpu_probe=false;
+    return rc;
 }
 static void windows_paint_clear(editor *e)
 {
@@ -44,8 +48,11 @@ static int windows_surface(editor *e)
         if(suspended) { e->win_unavailable=true; (void)d3d11_set_suspended(b,true); }
         else { int rc=windows_retry(e); if(rc) return rc; }
     }
-    if (d3d11_surface_unavailable(b) || d3d11_recovery_required(b)) e->win_unavailable=true;
-    if(suspended || !e->win_unavailable || !e->win_frame_owed) e->win_retry_ns=0;
+    if(suspended || d3d11_surface_unavailable(b) || d3d11_recovery_required(b)) {
+        e->win_unavailable=true; e->win_surface_valid=false;
+    }
+    bool recovery_owed=e->win_frame_owed || !e->win_surface_valid;
+    if(suspended || !e->win_unavailable || !recovery_owed) e->win_retry_ns=0;
     else if(e->win_retry_ns && os_now_ns()>=e->win_retry_ns) {
         uint64_t delay=e->win_retry_delay_ns;
         e->win_retry_delay_ns=delay<D3D11_PARK_PROBE_MAX_NS/2u ? delay*2u : D3D11_PARK_PROBE_MAX_NS;
@@ -57,6 +64,7 @@ static int windows_surface(editor *e)
         else rebuild=true;
     }
     if(rebuild) {
+        e->win_surface_valid=false;
         render_config cfg=b->config; void *state=b->state;
         (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
         editor_backend_shutdown_sync(e,b);
@@ -65,7 +73,7 @@ static int windows_surface(editor *e)
         e->win_frame_owed=true;
         rc=editor_full_layout(e); if(rc) return rc;
     }
-    if(e->win_unavailable && e->win_frame_owed && !suspended && !e->win_retry_ns) {
+    if(e->win_unavailable && recovery_owed && !suspended && !e->win_retry_ns) {
         if(!e->win_retry_delay_ns) e->win_retry_delay_ns=D3D11_PARK_PROBE_NS;
         e->win_retry_ns=os_now_ns()+e->win_retry_delay_ns;
     }
@@ -182,6 +190,11 @@ static int fail(editor *e, int cause)
 }
 int editor_begin_frame(editor *e)
 {
+#if defined(_WIN32)
+    if(!e->win_cpu_probe && e->buffer && !e->buffer->painted) {
+        e->buffer->win_composed=false; e->buffer->win_draw_safe=false;
+    }
+#endif
     e->hover_only = e->hover_map = false;
     e->caret_only = false;
     e->glyph_only = false;
@@ -373,6 +386,7 @@ static void platform_complete(void *ctx, uint32_t serial, uint64_t ns, uint64_t 
 {
     editor *e=ctx;
     int rc=d3d11_present_complete(e->backend,serial,ns,count);
+    if(!rc) e->win_surface_valid=true; /* Authenticated T6, not merely accepted T4. */
     if(rc && rc!=RENDER_ERR_FRAME && rc!=RENDER_ERR_STATE) e->error=rc;
 }
 #else
@@ -576,19 +590,22 @@ static int submit(editor *e)
     if (editor_journal_paint(e) == JOURNAL_BUSY) return 0; /* edit-dzk1: guard before composing */
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
-#if defined(_WIN32)
-    e->buffer->win_composed=true;
-    windows_paint_clear(e); /* Safe CPU composition is not an undrawn native paint. */
-#endif
     editor_status_overlay(e);
     editor_large_index_progress(e);
+#if defined(_WIN32)
+    if(e->full_pending) { windows_paint_clear(e); return 0; }
+#else
     if (e->full_pending) return 0;
+#endif
     if (e->render_dropped) { /* edit-dzk1: the backend lacks the dropped frame's damage */
         rc = render_mark_full(&e->grid); if (rc) return rc;
         e->caret_only = false;
     }
     rc = render_dirty_strips(&e->grid, e->strips, e->strip_cap, &count); if (rc) return rc;
     if ((e->caret_only || (e->hover_only && !e->grid.region.dirty)) && !count) {
+#if defined(_WIN32)
+        windows_paint_clear(e);
+#endif
         e->dirty = false; /* Visibility changed outside the viewport: no pixels to submit. */
         return 0;
     }
@@ -605,6 +622,9 @@ static int submit(editor *e)
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc && rc != RENDER_ERR_BUSY && render_backend_check(e->backend, &e->grid, e->strips, count))
         rc = render_rejected(e, rc, &count);
+#if defined(_WIN32)
+    if(rc==RENDER_ERR_BUSY || rc==EDITOR_MORE) windows_paint_clear(e);
+#endif
     if (rc == RENDER_ERR_BUSY || rc == EDITOR_MORE) return 0;
     if (rc) return rc;
     e->render_dropped = false;
@@ -653,6 +673,9 @@ static int submit(editor *e)
     if (e->cfg.on_submit) e->cfg.on_submit(e->cfg.hook_ctx, &e->frame);
     e->submitted_plan = e->scroll_plan; e->submitted_plan_valid = true;
 #if defined(_WIN32)
+    /* Complete CPU submission, including value snapshots and frame metadata,
+     * survived. The next phase may wait indefinitely for native latency. */
+    e->buffer->win_composed=true; windows_paint_clear(e);
     if(e->win_unavailable) {
         rc=d3d11_discard_unpresented(e->backend);
         if(!rc) windows_paint_clear(e); /* Deliberate occlusion is no paint crash. */
@@ -1056,6 +1079,8 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
 #if defined(_WIN32)
     if(e->win_unavailable && e->win_retry_ns && !win32_plat_suspended(&e->platform) && e->win_retry_ns<deadline)
         deadline=e->win_retry_ns;
+    uint64_t clip_deadline=editor_clip_deadline(e);
+    if(clip_deadline && clip_deadline<deadline) deadline=clip_deadline;
 #endif
     /* edit-bt1: wake for a deferred scroll slice's retry tick (edit-ci6i:
      * or a deferred wrapped seek's, which keeps wheel_pending instead). */
@@ -1146,9 +1171,14 @@ int editor_inject(editor *e, const plat_event *event)
      * admission and save/journal dispatch fences. The identified publication
      * validates its owner/revision/selection before it starts a replacement. */
     if(event->kind==PLAT_EV_CLIPBOARD) return editor_clip_terminal(e,event);
-#endif
+    /* The admitted FIFO is the close boundary. Keep the ordinary loop alive
+     * through its save/journal fences and every mutation continuation. */
+    if (event->kind == PLAT_EV_CLOSE) { e->win_close_requested=true; return 0; }
+    if (e->win_close_requested) return 0;
+#else
     /* Closing is control flow, independent of command/view/journal capacity. */
     if (event->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
+#endif
     bool parked = (e->buffer->pending_open || e->buffer->placeholder) && !editor_event_control(e, event);
     uint64_t owner = parked ? e->buffer->id : 0;
     uint64_t generation = parked ? e->buffer->source_generation : 0;
@@ -1311,6 +1341,16 @@ int editor_step(editor *e, int timeout_ms)
     if (rc) return fail(e, rc);
     if (e->stats.journal_error) return fail(e, EDITOR_ERR_IO);
     if (e->quit) return close_result(e, timeout_ms);
+#if defined(_WIN32)
+    if(e->win_close_requested && !e->queue_count && !editor_activation_busy(e) &&
+       !editor_save_active(e) && !e->op_count && !e->journal_metadata_pending &&
+       !e->journal_group_open && !e->explicit_group && e->action==EDITOR_ACTION_NONE &&
+       e->file_command==KEYS_ACTION_NONE && !e->find_replace_request && !e->find_select_pending &&
+       !e->wheel_pending && !editor_scroll_waiting(e)) {
+        e->win_close_requested=false;
+        if(!editor_close_prompt_shown(e)) { e->quit=true; return close_result(e,timeout_ms); }
+    }
+#endif
     return runnable(e) ? EDITOR_MORE : EDITOR_OK;
 }
 int editor_run(editor *e)

@@ -82,12 +82,16 @@ static int d3d11_recover(render_backend *b)
     b->info.capabilities &= ~RENDER_CAP_PRESENT_TIMING;
     return RENDER_ERR_UNSUPPORTED;
 }
+static bool d3d11_cloaked(const d3d11_state *s)
+{
+    DWORD cloaked=0;
+    if(s->window) (void)DwmGetWindowAttribute(s->window,DWMWA_CLOAKED,&cloaked,sizeof cloaked);
+    return cloaked!=0;
+}
 static bool d3d11_paused(d3d11_state *s)
 {
     uint64_t now = os_now_ns();
-    DWORD cloaked=0;
-    if(s->window) (void)DwmGetWindowAttribute(s->window,DWMWA_CLOAKED,&cloaked,sizeof cloaked);
-    bool invisible = s->native_deferred || s->suspended || cloaked || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
+    bool invisible = s->native_deferred || s->suspended || d3d11_cloaked(s) || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
     if ((!s->last_observation && s->deadline && now >= s->deadline) ||
         (s->last_observation && now-s->last_observation >= D3D11_COMPLETION_NS) || invisible || s->invisible)
         s->deadline = now+D3D11_COMPLETION_NS;
@@ -879,7 +883,7 @@ bool d3d11_surface_unavailable(const render_backend *b)
 {
     if (!d3d11_descriptor(b) || !b->initialized) return false;
     const d3d11_state *s = b->state;
-    return s->suspended || s->occluded || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
+    return s->suspended || s->occluded || d3d11_cloaked(s) || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
 }
 int d3d11_discard_unpresented(render_backend *b)
 {

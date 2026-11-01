@@ -967,7 +967,7 @@ int editor_poll_sources(editor *e)
     for (size_t at = 0; at < event_count; at++) if (events[at] == EDITOR_WAIT_CLOSE) {
 #if defined(_WIN32)
         os_wake_drain(e->cfg.close_wake);
-        e->quit = true; return 0;
+        e->win_close_requested = true; return 0;
 #else
         /* edit-djg: complete signalfd record only; tolerate stale readiness. */
         struct signalfd_siginfo termination;

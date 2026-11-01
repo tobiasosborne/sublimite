@@ -34,7 +34,7 @@ struct editor_clip {
 #if defined(_WIN32)
     bool publishing, terminal_pending;
     plat_event terminal;
-    uint64_t publication;
+    uint64_t publication, publication_deadline;
     editor_buffer *publication_owner;
     uint64_t publication_revision;
     view_selection publication_selection;
@@ -115,6 +115,11 @@ static int publish_owned(editor *e, int which, x11_clip_buf *b)
             rc=win32_clip_submit_identified(win32_private(&e->platform),which,
                 x11_clip_buf_data(b),x11_clip_buf_len(b),&c->publication);
             if(!rc) {
+                /* (E) Whole native operation: one acquisition tolerance plus
+                 * one foreign-handler tolerance. Both follow the user's OS
+                 * double-click interval, with its documented default. */
+                UINT tolerance=GetDoubleClickTime(); if(!tolerance) tolerance=500;
+                c->publication_deadline=os_now_ns()+2u*(uint64_t)tolerance*UINT64_C(1000000);
                 c->publishing=true; c->publication_owner=e->buffer;
                 c->publication_revision=e->buffer->revision;
                 c->publication_selection=e->v.state.selection;
@@ -262,6 +267,8 @@ bool editor_clip_pending(const editor *e)
     return c && (editor_clip_busy(e) || c->primary.handle.epoch || c->desired);
 }
 #if defined(_WIN32)
+uint64_t editor_clip_deadline(const editor *e)
+{ return e->clipboard && e->clipboard->publishing ? e->clipboard->publication_deadline : 0; }
 static bool terminal_ready(const editor *e);
 #endif
 bool editor_clip_runnable(const editor *e)
@@ -565,15 +572,16 @@ int editor_clip_event(editor *e, const plat_event *ev)
     }
 #if defined(_WIN32)
     if(ev->code==2 && c->publishing && ev->clip_id==c->publication) {
-        c->publishing=false;
+        c->publishing=false; c->publication_deadline=0;
         bool valid=e->buffer==c->publication_owner && e->buffer->revision==c->publication_revision &&
             e->v.state.selection.anchor==c->publication_selection.anchor &&
             e->v.state.selection.cursor==c->publication_selection.cursor;
         if(!ev->clip_ok || !valid) {
             c->cutting=false; e->stats.rejected_commands++;
             e->recovery_notice="clipboard publication failed; text kept";
+            e->recovery_notice_shown=false;
             e->recovery_notice_mutations=e->stats.mutations;
-            e->quit=false; return editor_full_layout(e);
+            e->quit=false; e->win_close_requested=false; return editor_full_layout(e);
         }
         if(c->cutting) {
             e->old_selection=c->publication_selection;
@@ -593,6 +601,17 @@ int editor_clip_poll(editor *e)
     editor_clip *c = e->clipboard;
     if (!c) return 0;
 #if defined(_WIN32)
+    if(c->publishing && os_now_ns()>=c->publication_deadline) {
+        /* Native worker owns its payload/lifetime, so cancellation only
+         * invalidates the UI operation. A late success cannot delete text. */
+        c->publishing=false; c->cutting=false; c->terminal_pending=false;
+        c->publication=0; c->publication_deadline=0;
+        e->stats.rejected_commands++;
+        e->recovery_notice="clipboard publication timed out; text kept";
+        e->recovery_notice_shown=false;
+        e->recovery_notice_mutations=e->stats.mutations;
+        int rc=editor_full_layout(e); if(rc) return rc;
+    }
     if(c->terminal_pending && terminal_ready(e)) {
         plat_event terminal=c->terminal; c->terminal_pending=false;
         int rc=editor_clip_event(e,&terminal); if(rc) return rc;

@@ -65,6 +65,7 @@ static inline win32_plat *win32_private(const plat *p)
 bool win32_plat_suspended(const plat *p);
 uint32_t win32_plat_dpi(const plat *p);
 int win32_plat_limit_client(plat *,uint32_t,uint32_t);
+int win32_plat_max_client(uint32_t *,uint32_t *);
 int win32_clip_init(win32_plat *s);
 void win32_clip_stop(win32_plat *s);
 HANDLE win32_clip_wake(const win32_plat *s);

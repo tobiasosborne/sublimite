@@ -508,6 +508,7 @@ struct editor {
     char busy_source[IPC_PATH_CAP];
 #if defined(_WIN32)
     bool win_unavailable, win_native_suspended;
+    bool win_close_requested, win_cpu_probe, win_surface_valid;
     uint64_t win_retry_ns, win_retry_delay_ns;
     bool win_frame_owed;
     bool win_paint_clear_pending;
@@ -612,6 +613,9 @@ int editor_clip_event(editor *e, const plat_event *ev);
 int editor_clip_poll(editor *e);
 bool editor_clip_busy(const editor *e);
 bool editor_clip_pending(const editor *e);
+#if defined(_WIN32)
+uint64_t editor_clip_deadline(const editor *e);
+#endif
 bool editor_clip_runnable(const editor *e);
 bool editor_clip_holds(const editor *e, const editor_buffer *b);
 int editor_clip_continue(editor *e);
