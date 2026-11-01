@@ -64,6 +64,13 @@ $(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe quiet_r
 
 win-compile: $(WIN_REL_OBJ)
 
+# Explicit share-dependent measurement; never part of all/check/check-live.
+.PHONY: win-wsl-share-probe
+win-wsl-share-probe: $(WIN_B)/rel/tests/wsl_share_probe.exe $(WIN_QUIET)
+$(WIN_B)/rel/tests/wsl_share_probe.exe: tests/win/wsl_share_probe.c tests/win/test_isolation.h src/os/os_win.c $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+
 # W2.4b: filesystem units only; editor linking follows in W2.4d.
 .PHONY: win-editor-fs
 win-editor-fs: $(addprefix $(WIN_B)/rel/src/editor/,$(addsuffix .o,recovery restore runtime retain session))
