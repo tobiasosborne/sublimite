@@ -63,6 +63,9 @@ static int windows_surface(editor *e)
         if(d3d11_discard_unpresented(b)==RENDER_OK) windows_paint_clear(e);
         else rebuild=true;
     }
+    /* Lifecycle workers may synchronously message the UI. Rebuild after the
+     * native dispatcher unwinds; its guarded turn cannot nest another pump. */
+    if(rebuild && e->win_modal_turn) return 0;
     if(rebuild) {
         e->win_surface_valid=false;
         render_config cfg=b->config; void *state=b->state;
@@ -374,14 +377,38 @@ static void platform_event(void *ctx, const plat_event *ev)
 {
     editor *e = ctx;
     if (editor_inject(e, ev) && !e->error) e->error = EDITOR_ERR_INPUT_FULL;
-    e->pump_stopped = true; plat_quit(&e->platform);
+    e->pump_stopped = true;
+#if defined(_WIN32)
+    win32_plat_stop_turn(&e->platform);
+#else
+    plat_quit(&e->platform);
+#endif
 }
 static void platform_work(void *ctx)
 {
     editor *e = ctx; int rc = editor_poll_sources(e); if (rc) e->error = rc;
-    e->pump_stopped = true; plat_quit(&e->platform);
+    e->pump_stopped = true;
+#if defined(_WIN32)
+    win32_plat_stop_turn(&e->platform);
+#else
+    plat_quit(&e->platform);
+#endif
 }
 #if defined(_WIN32)
+static void platform_modal_turn(void *ctx)
+{
+    editor *e=ctx;
+    if(e->win_modal_turn) return;
+    if(e->win_close_requested || e->quit || e->error) { plat_quit(&e->platform); return; }
+    /* The outer editor_step is suspended at its pump boundary. Its local
+     * state holds no layout/renderer borrow. All state changes belong to this
+     * ordinary turn; pump skips the already active native dispatcher. */
+    e->win_modal_turn=true;
+    int rc=editor_step(e,0);
+    e->win_modal_turn=false;
+    if(rc<0) e->error=rc;
+    if(e->quit || e->error || e->win_close_requested) plat_quit(&e->platform);
+}
 static void platform_complete(void *ctx, uint32_t serial, uint64_t ns, uint64_t count)
 {
     editor *e=ctx;
@@ -461,12 +488,17 @@ static int pump(editor *e, int timeout)
         if (!e->backend->active) timeout = 0;
     }
     if (e->has_platform
-#if !defined(_WIN32)
+#if defined(_WIN32)
+        && !e->win_modal_turn
+#else
         && e->queue_count < EDITOR_INPUT_CAP
 #endif
     ) {
         plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work,
             .on_present_complete = platform_complete
+#if defined(_WIN32)
+            , .on_modal_turn = platform_modal_turn
+#endif
         };
         uint64_t before = e->platform.iterations;
         e->platform.quit = false; e->pump_stopped = false;
@@ -1202,6 +1234,9 @@ int editor_inject(editor *e, const plat_event *event)
 static int close_result(editor *e, int timeout_ms)
 {
 #if defined(_WIN32)
+    /* Leave native modality before flush/close: its ordinary boundary owns
+     * accepted FIFO entries, clipboard settlement and durability. */
+    if(e->win_modal_turn) { plat_quit(&e->platform); return EDITOR_MORE; }
     int control=pump(e,0); if(control) return fail(e,control);
     int clip=editor_clip_close_wait(e);
     if(clip<0) return fail(e,clip);

@@ -72,6 +72,11 @@ typedef struct plat_callbacks {
     void (*on_blink)(void *ud);                       /* blink timer fired */
     void (*on_work)(void *ud);                        /* work wake readable */
     void (*on_present_complete)(void *ud, uint32_t serial, uint64_t ust, uint64_t msc); /* T6 */
+#if defined(_WIN32)
+    /* Native modal-loop service, after event/work delivery, with callback
+     * reentry guarded. May advance the application, but must not nest a pump. */
+    void (*on_modal_turn)(void *ud);
+#endif
 } plat_callbacks;
 
 struct os_wake;

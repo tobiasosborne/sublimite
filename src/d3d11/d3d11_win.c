@@ -65,7 +65,7 @@ typedef struct d3d11_state {
     HRESULT present_error;
     d3d11_present_info present_info;
     uint64_t deadline, last_observation, completion_ns;
-    bool completion_queued;
+    bool completion_queued, native_modal;
 } d3d11_state;
 
 static bool d3d11_descriptor(const render_backend *b)
@@ -91,12 +91,18 @@ static bool d3d11_cloaked(const d3d11_state *s)
 static bool d3d11_paused(d3d11_state *s)
 {
     uint64_t now = os_now_ns();
+    const win32_plat *platform=win32_private(s->platform);
+    bool modal=platform && platform->modal_depth;
     bool invisible = s->native_deferred || s->suspended || d3d11_cloaked(s) || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
-    if ((!s->last_observation && s->deadline && now >= s->deadline) ||
+    /* User32/DWM may retain latency or displayed-frame statistics throughout
+     * native sizing/moving/menu tracking. Continue rendering and authenticating
+     * completions, but exclude that hold from the missing-frame watchdog.
+     * The first observation after release gets the ordinary recovery window. */
+    if (modal || s->native_modal || (!s->last_observation && s->deadline && now >= s->deadline) ||
         (s->last_observation && now-s->last_observation >= D3D11_COMPLETION_NS) || invisible || s->invisible)
         s->deadline = now+D3D11_COMPLETION_NS;
     if (s->invisible && !invisible) s->resume_pending = true;
-    s->invisible = invisible; s->last_observation = now;
+    s->native_modal=modal; s->invisible = invisible; s->last_observation = now;
     return invisible;
 }
 static void d3d11_release_native(d3d11_state *s)

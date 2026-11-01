@@ -504,7 +504,7 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_EXITSIZEMOVE: case WM_EXITMENULOOP:
         if (s->modal_depth) s->modal_depth--;
-        if (!s->modal_depth) (void)KillTimer(hwnd,1);
+        if (!s->modal_depth) { (void)KillTimer(hwnd,1); s->modal_cancel=false; }
         return 0;
     case WM_TIMER:
         if (wp==1 && s->modal_depth) { modal_service(s); return 0; }
@@ -570,11 +570,14 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         memset(s->hidden,0,sizeof s->hidden); plat_set_blink(s->owner,s->blink_ms);
         if (msg==WM_KILLFOCUS && GetCapture()==hwnd) (void)ReleaseCapture();
         (void)push(s,(plat_event){.kind=PLAT_EV_FOCUS,.focused=s->owner->focused}); return 0;
-    case WM_CLOSE: (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); return 0;
+    case WM_CLOSE:
+        s->modal_cancel=s->modal_depth!=0;
+        (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); return 0;
     case WM_QUERYENDSESSION:
+        s->modal_cancel=s->modal_depth!=0;
         (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); return TRUE;
     case WM_ENDSESSION:
-        if (wp) (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE});
+        if (wp) { s->modal_cancel=s->modal_depth!=0; (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE}); }
         return 0;
     case WM_ACTIVATE:
         if(LOWORD(wp)!=WA_INACTIVE) (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
@@ -704,7 +707,9 @@ int plat_init(plat *p, const plat_config *cfg)
 void plat_map(plat *p)
 { win32_plat *s=win32_private(p); if (ui(s)) (void)ShowWindow(s->hwnd,SW_SHOWNORMAL); }
 void plat_quit(plat *p)
-{ win32_plat *s=win32_private(p); if (ui(s)) { p->quit=true; (void)PostMessageW(s->hwnd,WM_NULL,0,0); } }
+{ win32_plat *s=win32_private(p); if (ui(s)) { p->quit=true; (void)PostMessageW(s->hwnd,s->modal_depth ? WM_CANCELMODE : WM_NULL,0,0); } }
+void win32_plat_stop_turn(plat *p)
+{ win32_plat *s=win32_private(p); if (ui(s)) { s->turn_stopped=true; if(!s->modal_depth) (void)PostMessageW(s->hwnd,WM_NULL,0,0); } }
 void plat_shutdown(plat *p)
 {
     win32_plat *s=win32_private(p); if (!ui(s)) return;
@@ -811,11 +816,13 @@ uint64_t plat_display_interval_ns(const plat *p)
     }
     free(modes); free(paths); return interval;
 }
+static bool pump_stopped(const win32_plat *s)
+{ return s->owner->quit || (s->turn_stopped && !s->modal_depth); }
 static bool drain(win32_plat *s, const plat_callbacks *cb, uint64_t end)
 {
     /* (G) same bounded message slice as X11; callbacks always precede the
      * next raw message, so focus/close cannot overtake earlier input. */
-    for (unsigned i=0;i<64 && !s->owner->quit;i++) {
+    for (unsigned i=0;i<64 && !s->owner->quit && !s->turn_stopped;i++) {
         plat_event ev;
         if (pop(s,&ev)) {
             if (cb->on_event) { s->callback_depth++; cb->on_event(cb->ud,&ev); s->callback_depth--; }
@@ -843,7 +850,7 @@ static bool drain(win32_plat *s, const plat_callbacks *cb, uint64_t end)
 }
 static void present_drain(win32_plat *s, const plat_callbacks *cb)
 {
-    for (unsigned i=0;i<WIN32_EVENT_CAP && !s->owner->quit;i++) {
+    for (unsigned i=0;i<WIN32_EVENT_CAP && !pump_stopped(s);i++) {
         AcquireSRWLockExclusive(&s->present_lock);
         if (s->present_head==s->present_tail) {
             (void)ResetEvent(s->present_wake); ReleaseSRWLockExclusive(&s->present_lock); return;
@@ -860,7 +867,7 @@ static void repeat_poll(win32_plat *s, const plat_callbacks *cb)
     uint64_t step=NS_S/s->repeat_rate; if (!step) step=1;
     if (now<s->repeat_next) return;
     if ((now-s->repeat_next)/step>2u) s->repeat_next=now; /* (G) P2.2 catch-up cap. */
-    for (unsigned n=0;n<3 && !s->owner->quit && s->repeat_key && now>=s->repeat_next;n++) {
+    for (unsigned n=0;n<3 && !pump_stopped(s) && s->repeat_key && now>=s->repeat_next;n++) {
         plat_event ev=s->repeat_event; ev.repeat=true; ev.t0_ns=now;
         (void)GetKeyboardState(s->keys); ev.mods=mods(s); ev.utf8_len=0;
         WCHAR span[8];
@@ -870,7 +877,7 @@ static void repeat_poll(win32_plat *s, const plat_callbacks *cb)
             /* (P) one scalar uses one or two UTF-16 units and at most four
              * UTF-8 bytes. Stream full spans through the fixed event payload. */
             plat_event part=ev; part.utf8_len=0;
-            for (int i=0;i<units && !s->owner->quit;i++) {
+            for (int i=0;i<units && !pump_stopped(s);i++) {
                 int width=span[i]>=0xd800 && span[i]<=0xdbff && i+1<units ? 2 : 1;
                 uint32_t cp=scalar(span+i,width); i+=width-1;
                 plat_event encoded=ev; encoded.utf8_len=0; text(&encoded,cp);
@@ -881,7 +888,7 @@ static void repeat_poll(win32_plat *s, const plat_callbacks *cb)
                 memcpy(part.utf8+part.utf8_len,encoded.utf8,encoded.utf8_len);
                 part.utf8_len=(uint8_t)(part.utf8_len+encoded.utf8_len);
             }
-            if (!s->owner->quit && cb->on_event) { s->callback_depth++; cb->on_event(cb->ud,&part); s->callback_depth--; }
+            if (!pump_stopped(s) && cb->on_event) { s->callback_depth++; cb->on_event(cb->ud,&part); s->callback_depth--; }
         } else if (cb->on_event) { s->callback_depth++; cb->on_event(cb->ud,&ev); s->callback_depth--; }
     }
     if (s->repeat_key) {
@@ -930,24 +937,27 @@ static void modal_service(win32_plat *s)
         timer(s->blink_timer,s->blink_ms);
         if (cb->on_blink) { s->callback_depth++; cb->on_blink(cb->ud); s->callback_depth--; }
     }
-    if (s->owner->quit) (void)PostMessageW(s->hwnd,WM_CANCELMODE,0,0);
+    if (!s->owner->quit && !s->modal_cancel && cb->on_modal_turn) {
+        s->callback_depth++; cb->on_modal_turn(cb->ud); s->callback_depth--;
+    }
+    if (s->owner->quit || s->modal_cancel) (void)PostMessageW(s->hwnd,WM_CANCELMODE,0,0);
     s->servicing=false;
 }
 int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
 {
     win32_plat *s=win32_private(p); if (!ui(s) || !cb || s->callbacks) return PLAT_ERR_FAIL;
-    s->callbacks=cb;
+    s->callbacks=cb; s->turn_stopped=false;
     uint64_t end=timeout_ms>0 ? os_now_ns()+(uint64_t)timeout_ms*NS_MS : 0;
     bool first=true;
-    while (!p->quit) {
+    while (!p->quit && !s->turn_stopped) {
         bool buffered=drain(s,cb,end);
-        if (p->quit) break;
+        if (p->quit || s->turn_stopped) break;
         present_drain(s,cb);
-        if (p->quit) break;
+        if (p->quit || s->turn_stopped) break;
         if (timeout_ms==0 && !first) break;
         if (timeout_ms>0 && os_now_ns()>=end) break;
         if (!buffered) repeat_poll(s,cb);
-        if (p->quit) break;
+        if (p->quit || s->turn_stopped) break;
         /* (P) four platform handles + bounded editor sources, with one
          * MAXIMUM_WAIT_OBJECTS position reserved for the message queue. */
         HANDLE handles[MAXIMUM_WAIT_OBJECTS - 1u]; DWORD count=0;
@@ -975,7 +985,7 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
         }
         bool consumed=result>=WAIT_OBJECT_0+work_index && result<WAIT_OBJECT_0+count;
         if(consumed && s->work_consumed) s->work_consumed(s->work_sources_ctx,handles[result-WAIT_OBJECT_0]);
-        if (!p->quit && cb->on_work && (consumed || work_ready(s,handles+work_index, work_count)))
+        if (!pump_stopped(s) && cb->on_work && (consumed || work_ready(s,handles+work_index, work_count)))
             { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; } /* Borrowed wake: callback drains before mailbox reads. */
     }
     s->callbacks=NULL;

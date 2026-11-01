@@ -19,7 +19,7 @@ typedef struct win32_clip win32_clip;
 typedef struct win32_plat {
     plat *owner;
     const plat_callbacks *callbacks;
-    bool servicing;
+    bool servicing, turn_stopped, modal_cancel;
     bool test_input, minimized, session_locked, session_disconnected, power_off;
     unsigned modal_depth, callback_depth;
     DWORD ui_thread;
@@ -63,6 +63,9 @@ static inline win32_plat *win32_private(const plat *p)
 { return p && p->backend == PLAT_BACKEND_WIN32 ? p->backend_state : NULL; }
 
 bool win32_plat_suspended(const plat *p);
+/* End this pump turn, retaining DefWindowProc's native move/size/menu loop.
+ * plat_quit is application termination and cancels that loop. UI only. */
+void win32_plat_stop_turn(plat *p);
 uint32_t win32_plat_dpi(const plat *p);
 int win32_plat_limit_client(plat *,uint32_t,uint32_t);
 int win32_plat_max_client(uint32_t *,uint32_t *);

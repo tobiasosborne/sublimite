@@ -92,11 +92,22 @@ static void status_probe(editor *e)
     editor_status_overlay(e);
 }
 static void clear_guard(editor *e) { if(!refuse_clear) editor_journal_paint_clear(e); }
+#define NATIVE_TURN_WORK UINT32_C(0x4d4f444c) /* Test message discriminator. */
+static bool native_work_received;
+static int native_work_event(render_backend *backend,const render_event *ev)
+{
+    if(ev->kind==RENDER_EVENT_WORK && ev->work && ev->work->kind==NATIVE_TURN_WORK) {
+        native_work_received=true; return 0;
+    }
+    return render_backend_event(backend,ev);
+}
 #define editor_save_leased test_save_leased
 #define render_backend_submit snapshot_probe
 #define editor_status_overlay status_probe
 #define editor_journal_paint_clear clear_guard
+#define render_backend_event native_work_event
 #include "../../src/editor/editor.c"
+#undef render_backend_event
 #undef editor_journal_paint_clear
 #undef editor_status_overlay
 #undef render_backend_submit
@@ -731,6 +742,203 @@ static int minimize_test(editor *e)
 }
 static void completed_job(work_ctx *ctx)
 { work_msg msg={.kind=JOURNAL_RETAIN_MESSAGE}; while(!work_publish(ctx,&msg)) os_yield(); }
+static void native_completed_job(work_ctx *ctx)
+{ work_msg msg={.kind=NATIVE_TURN_WORK}; while(!work_publish(ctx,&msg)) os_yield(); }
+typedef struct native_turn_case {
+    editor *e;
+    WNDPROC original;
+    HANDLE entered, done;
+    work_handle job;
+    uint32_t frame;
+    uint64_t rejected;
+    UINT finish;
+    unsigned phase;
+    bool save, clip, draw, drawn, in_loop, survived, progressed, exited, rescued;
+    ID3D11DeviceContextVtbl *draw_original;
+} native_turn_case;
+static native_turn_case *native_turn;
+static void WINAPI native_turn_draw(ID3D11DeviceContext *ctx,UINT vertices,UINT instances,UINT first,UINT start)
+{
+    native_turn_case *c=native_turn;
+    c->drawn=c->drawn || (c->in_loop && c->e->win_modal_turn && c->e->frame.id>c->frame);
+    c->draw_original->DrawInstanced(ctx,vertices,instances,first,start);
+}
+static LRESULT CALLBACK native_turn_window(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
+{
+    native_turn_case *c=native_turn; editor *e=c->e;
+    if(msg==WM_ENTERSIZEMOVE) { c->in_loop=true; SetEvent(c->entered); }
+    if(msg==WM_EXITSIZEMOVE) c->in_loop=false;
+    if((msg==WM_APP+0x61 || msg==WM_APP+0x62) &&
+        (win32_private(&e->platform)->callback_depth || win32_private(&e->platform)->servicing)) return 0;
+    if(msg==WM_APP+0x61) {
+        RECT r; GetWindowRect(hwnd,&r);
+        (void)SetWindowPos(hwnd,NULL,0,0,r.right-r.left-(int)e->grid.dims.cell_w,
+            r.bottom-r.top-(int)e->grid.dims.cell_h,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);
+        c->job=work_submit(&e->pool,(work_job){native_completed_job,NULL,0,WORK_BULK});
+        return 1;
+    }
+    if(msg==WM_APP+0x62) {
+        if(c->draw && c->phase) { c->progressed=c->in_loop && c->drawn; return c->progressed; }
+        if(editor_save_leased(e)) return 0;
+        journal_stats js=journal_get_stats(e->journal);
+        bool delivered=c->job.epoch && native_work_received;
+        c->survived=c->survived || (c->in_loop && e->pump_stopped);
+        bool ready=c->in_loop && editor_length(e)==6 && !e->queue_count &&
+            e->frame.id>c->frame && !e->resize_pending &&
+            e->grid.dims.cols==e->platform.width/e->grid.dims.cell_w &&
+            e->grid.dims.rows==e->platform.height/e->grid.dims.cell_h &&
+            delivered && js.accepted_sequence==js.durable_sequence && !e->op_count &&
+            /* A clipboard timeout records one rejected publication (P:
+             * editor_clip_poll), independently of FIFO admission. */
+            !e->journal_metadata_pending && e->stats.rejected_commands==c->rejected+(c->clip ? 1u : 0u);
+        if(c->clip) ready=ready && !editor_clip_busy(e) && e->recovery_notice &&
+            strstr(e->recovery_notice,"text kept");
+        if(c->draw && ready) {
+            /* Same offscreen/native visibility seam as undrawn_guard_test.
+             * Observe actual D3D drawing by the guarded modal editor turn;
+             * no displayed completion is fabricated on this station. */
+            force_paint_visibility=true;
+            d3d11_state *s=e->backend->state; s->latency_ready=true;
+            (void)d3d11_set_suspended(e->backend,false); e->win_unavailable=false;
+            (void)editor_full_layout(e); c->phase=1; return 0;
+        }
+        if(c->save && ready) {
+            if(!c->phase) {
+                plat_event save={.kind=PLAT_EV_KEY,.press=true,.keysym='s',.mods=PLAT_MOD_CTRL};
+                (void)editor_inject(e,&save); c->phase=1; return 0;
+            }
+            if(editor_save_active(e) || e->file_command!=KEYS_ACTION_NONE ||
+                e->buffer->history_cursor!=e->buffer->saved_cursor || e->buffer->saved_lost) return 0;
+            if(c->phase==1) { e->publish_owed=true; c->phase=2; return 0; }
+            ready=!e->publish_owed && !e->publish;
+        }
+        c->progressed=ready;
+        return c->progressed ? 1 : 0;
+    }
+    if(msg==WM_APP+0x63) return c->in_loop ? 1 : 0;
+    return CallWindowProcW(c->original,hwnd,msg,wp,lp);
+}
+static void native_turn_producer(void *arg)
+{
+    native_turn_case *c=arg; HWND hwnd=plat_native_win32(&c->e->platform);
+    if(WaitForSingleObject(c->entered,(DWORD)(WATCH_NS/UINT64_C(1000000)))==WAIT_OBJECT_0) {
+        uint64_t start_end=os_now_ns()+WATCH_NS;
+        while(!SendMessageW(hwnd,WM_APP+0x61,0,0) && os_now_ns()<start_end) os_sleep_ns(UINT64_C(1000000));
+        (void)SendMessageW(hwnd,WM_UNICHAR,'q',1);
+        /* (G) More native input than fits in the editor FIFO during a held
+         * loop. Releases do not mutate text or consume the clipboard choice. */
+        for(unsigned i=0;!c->clip && i<EDITOR_INPUT_CAP+1u;i++)
+            (void)SendMessageW(hwnd,WM_KEYUP,VK_F12,1);
+        uint64_t end=os_now_ns()+WATCH_NS;
+        do {
+            DWORD_PTR ready=0;
+            if(SendMessageTimeoutW(hwnd,WM_APP+0x62,0,0,SMTO_ABORTIFHUNG,
+                (UINT)(WATCH_NS/UINT64_C(1000000)),&ready) && ready) break;
+            /* Existing 1 ms test wait cadence lets User32 generate WM_TIMER;
+             * a continuous stream of sent probes can starve low-priority timers. */
+            os_sleep_ns(UINT64_C(1000000));
+        } while(os_now_ns()<end);
+    }
+    (void)PostMessageW(hwnd,c->finish,c->finish==WM_KEYDOWN ? VK_RETURN : 0,1);
+    uint64_t end=os_now_ns()+WATCH_NS;
+    do {
+        DWORD_PTR active=1;
+        if(SendMessageTimeoutW(hwnd,WM_APP+0x63,0,0,SMTO_ABORTIFHUNG,
+            (UINT)(WATCH_NS/UINT64_C(1000000)),&active) && !active) { c->exited=true; break; }
+        os_sleep_ns(UINT64_C(1000000));
+    } while(os_now_ns()<end);
+    if(!c->exited) { c->rescued=true; (void)PostMessageW(hwnd,WM_KEYDOWN,VK_ESCAPE,1); }
+    SetEvent(c->done);
+}
+static int native_turn_test(editor *e,UINT finish,bool save,bool clip,bool draw)
+{
+    T(settle(e)==0);
+    if(clip) {
+        InterlockedExchange(&synthetic_publication,1);
+        T(publication_start(e)==0);
+        e->v.state.selection=(view_selection){.anchor=4,.cursor=4};
+    }
+    native_turn_case c={.e=e,.entered=CreateEventW(NULL,TRUE,FALSE,NULL),
+        .done=CreateEventW(NULL,TRUE,FALSE,NULL),.finish=finish,.frame=e->frame.id,
+        .rejected=e->stats.rejected_commands,.save=save,.clip=clip,.draw=draw};
+    T(c.entered && c.done); native_turn=&c;
+    native_work_received=false;
+    d3d11_state *s=e->backend->state;
+    ID3D11DeviceContext *context=s->context;
+    c.draw_original=context->lpVtbl;
+    ID3D11DeviceContextVtbl drawing=*c.draw_original; drawing.DrawInstanced=native_turn_draw;
+    if(draw) context->lpVtbl=&drawing;
+    HWND hwnd=plat_native_win32(&e->platform);
+    c.original=(WNDPROC)SetWindowLongPtrW(hwnd,GWLP_WNDPROC,(LONG_PTR)native_turn_window);
+    os_thread thread; T(os_thread_start(&thread,native_turn_producer,&c)==OS_OK);
+    T(PostMessageW(hwnd,WM_SYSCOMMAND,SC_MOVE,0));
+    int rc=0;
+    do { rc=editor_step(e,0); if(rc<0) break; os_yield(); }
+    while(WaitForSingleObject(c.done,0)!=WAIT_OBJECT_0);
+    T(os_thread_join(&thread)==OS_OK);
+    if(draw && s->context==context && context->lpVtbl==&drawing) context->lpVtbl=c.draw_original;
+    force_paint_visibility=false;
+    SetWindowLongPtrW(hwnd,GWLP_WNDPROC,(LONG_PTR)c.original); native_turn=NULL;
+    CloseHandle(c.entered); CloseHandle(c.done);
+    if(clip) {
+        SetEvent(publish_release);
+        T(settle(e)==0);
+        /* The clipboard worker owns these gates until it has returned. */
+        win32_clip *transport=win32_private(&e->platform)->clip;
+        uint64_t end=os_now_ns()+WATCH_NS;
+        for(;;) {
+            AcquireSRWLockShared(&transport->lock); unsigned used=transport->used; ReleaseSRWLockShared(&transport->lock);
+            if(!used) break;
+            T(editor_step(e,0)>=0 && os_now_ns()<end); os_yield();
+        }
+        CloseHandle(publish_entered); CloseHandle(publish_release);
+        publish_entered=publish_release=NULL;
+        InterlockedExchange(&synthetic_publication,0);
+    }
+    printf("native modal observations: survived=%d progress=%d exited=%d rescue=%d save=%d clip=%d draw=%d rc=%d\n",
+        c.survived,c.progressed,c.exited,c.rescued,save,clip,c.drawn,rc);
+    if(!c.progressed) fprintf(stderr,"native modal pending: len=%llu queue=%zu resize=%d geometry=%u/%u client=%u/%u work=%d rejects=%llu/%llu clip=%d notice=%s\n",
+        (unsigned long long)editor_length(e),e->queue_count,e->resize_pending,e->grid.dims.cols,e->grid.dims.rows,
+        e->platform.width/e->grid.dims.cell_w,e->platform.height/e->grid.dims.cell_h,native_work_received,
+        (unsigned long long)e->stats.rejected_commands,(unsigned long long)c.rejected,editor_clip_busy(e),
+        e->recovery_notice ? e->recovery_notice : "none");
+    T(rc>=0 && c.survived && c.progressed && c.exited && !c.rescued);
+    if(!save && !clip) T(((samples *)e->cfg.hook_ctx)->allocations==0);
+    if(finish!=WM_KEYDOWN) {
+        uint64_t end=os_now_ns()+WATCH_NS;
+        while(rc!=EDITOR_CLOSED && os_now_ns()<end) rc=editor_step(e,0);
+        T(rc==EDITOR_CLOSED && !e->queue_count);
+    }
+    puts("native modal: editor pump stops survive; typing/work/resize/frame/journal advance; explicit finish exits PASS");
+    return 0;
+}
+static int native_watchdog_test(editor *e)
+{
+    T(settle(e)==0);
+    d3d11_state *s=e->backend->state;
+    HANDLE saved=s->latency, blocked=CreateEventW(NULL,FALSE,FALSE,NULL); T(blocked);
+    bool deferred=s->native_deferred, suspended=s->suspended, invisible=s->invisible;
+    force_paint_visibility=true;
+    s->native_deferred=s->suspended=s->invisible=false; s->last_observation=os_now_ns();
+    /* Native latency seam: a retained CPU frame, with no native latency
+     * credit, and an elapsed inherited completion window. No fake T4/T6. */
+    s->latency=blocked; s->latency_ready=false; e->backend->active=true;
+    HWND hwnd=plat_native_win32(&e->platform);
+    SendMessageW(hwnd,WM_ENTERSIZEMOVE,0,0);
+    s->deadline=os_now_ns()-1u;
+    T(!d3d11_present_ready(e->backend)); T(!d3d11_recovery_required(e->backend));
+    SendMessageW(hwnd,WM_EXITSIZEMOVE,0,0);
+    T(!d3d11_present_ready(e->backend));
+    T(!d3d11_recovery_required(e->backend) && s->deadline>os_now_ns());
+    s->deadline=os_now_ns()-1u;
+    T(!d3d11_present_ready(e->backend) && d3d11_recovery_required(e->backend));
+    s->recovery=false; s->latency=saved; s->deadline=0; e->backend->active=false;
+    s->native_deferred=deferred; s->suspended=suspended; s->invisible=invisible;
+    force_paint_visibility=false;
+    CloseHandle(blocked);
+    puts("native modal: held latency is not lost; release rebases watchdog; ordinary expiry still recovers PASS");
+    return 0;
+}
 static editor *lifecycle_owner;
 static _Atomic bool lifecycle_exclusive;
 static void lifecycle_shutdown_probe(render_backend *backend)
@@ -913,7 +1121,7 @@ int main(int argc, char **argv)
     editor_config cfg={.initial=(const uint8_t *)"base\n",.initial_len=5,.cols=80,.rows=24,
         .journal_path=journal_path,.platform_backend=PLAT_BACKEND_WIN32,.font_dpi=96,.font_points=12,
         .hook_ctx=&measurements,.on_ingress=ingress,.on_submit=submitted};
-    if(argc==2 && !strcmp(argv[1],"--minimize")) cfg.path=named_path;
+    if(argc==2 && (!strcmp(argv[1],"--minimize") || !strcmp(argv[1],"--modal-save"))) cfg.path=named_path;
     uint8_t *large=NULL;
     if(argc==2 && !strcmp(argv[1],"--close-large")) {
         cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
@@ -963,6 +1171,13 @@ int main(int argc, char **argv)
             native->power_off=native->session_locked=native->session_disconnected=native->minimized=false;
         }
         int rc=!strcmp(argv[1],"--crash-guard") ? crash_guard_test(&cfg,root) :
+            !strcmp(argv[1],"--modal-turn") ? native_turn_test(e,WM_KEYDOWN,false,false,false) :
+            !strcmp(argv[1],"--modal-close") ? native_turn_test(e,WM_CLOSE,false,false,false) :
+            !strcmp(argv[1],"--modal-session") ? native_turn_test(e,WM_QUERYENDSESSION,false,false,false) :
+            !strcmp(argv[1],"--modal-save") ? native_turn_test(e,WM_KEYDOWN,true,false,false) :
+            !strcmp(argv[1],"--modal-clip") ? native_turn_test(e,WM_KEYDOWN,false,true,false) :
+            !strcmp(argv[1],"--modal-draw") ? native_turn_test(e,WM_KEYDOWN,false,false,true) :
+            !strcmp(argv[1],"--modal-clock") ? native_watchdog_test(e) :
             !strcmp(argv[1],"--close-queue") ? close_queue_test(e,false,false) :
             !strcmp(argv[1],"--close-fence") ? close_queue_test(e,false,1u) :
             !strcmp(argv[1],"--close-save") ? close_queue_test(e,false,2u) :
@@ -1002,7 +1217,7 @@ int main(int argc, char **argv)
         }
         free(large); cleanup(root); return rc;
     }
-    const char *round4[]={"--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard"};
+    const char *round4[]={"--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard"};
     for(size_t at=0;at<sizeof round4/sizeof round4[0];at++) T(run_child_case(round4[at],NULL,0)==0);
     T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);
     T(larger_surface_test(e)==0); T(allocation_failure_test(e)==0); T(resize_failure_test(e)==0);

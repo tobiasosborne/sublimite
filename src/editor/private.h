@@ -508,7 +508,7 @@ struct editor {
     char busy_source[IPC_PATH_CAP];
 #if defined(_WIN32)
     bool win_unavailable, win_native_suspended;
-    bool win_close_requested, win_cpu_probe, win_surface_valid;
+    bool win_close_requested, win_cpu_probe, win_surface_valid, win_modal_turn;
     uint64_t win_retry_ns, win_retry_delay_ns;
     bool win_frame_owed;
     bool win_paint_clear_pending;

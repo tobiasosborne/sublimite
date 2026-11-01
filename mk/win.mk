@@ -253,6 +253,7 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
 WIN_LIVE_TESTS := $(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe d3d11_test.exe))
 check-live: $(WIN_LIVE_TESTS) $(WIN_QUIET)
 	@test "$(WIN_LIVE_OK)" = 1 || { echo "check-live refuses: set WIN_LIVE_OK=1 only with Tobias's explicit approval" >&2; exit 2; }
+	@cat docs/testing/windows-check-live.md
 	@set -e; for t in $(WIN_LIVE_TESTS); do \
 	  echo "== $$t --live-only (live desktop)"; \
 	  WINRUN_ISOLATION=none tools/winrun.sh $$t --live-only; \

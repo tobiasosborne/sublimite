@@ -31,7 +31,7 @@ static void work(void *ud) { os_wake_drain(&((fixture *)ud)->wake); }
 static void blink(void *ud) { (void)ud; }
 static void present(void *ud, uint32_t a, uint64_t b, uint64_t c) { (void)ud; (void)a; (void)b; (void)c; }
 static void pump(fixture *f)
-{ plat_callbacks cb={f,event,blink,work,present}; CHECK(plat_run_for(&f->p,&cb,0)==PLAT_OK); }
+{ plat_callbacks cb={.ud=f,.on_event=event,.on_blink=blink,.on_work=work,.on_present_complete=present}; CHECK(plat_run_for(&f->p,&cb,0)==PLAT_OK); }
 static HWND window(fixture *f) { return plat_native_win32(&f->p); }
 static size_t kind(const fixture *f, plat_ev_kind k)
 { size_t n=0; for (size_t i=0;i<f->count;i++) if (f->events[i].kind==k) n++; return n; }
