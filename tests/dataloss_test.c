@@ -2,8 +2,9 @@
  * Every scenario forks a child editor, kills it (SIGKILL, from the parent or
  * from a worker-thread hook) or lets two instances race, then restarts and
  * compares bytes, modified flags and carets against the child's published
- * oracle. Fixture byte lengths are strlen(literal); waits use EDITOR_IDLE_NS
- * (G, existing loop-policy watchdog, not a latency claim). Geometry: cols =
+ * oracle. Fixture byte lengths are strlen(literal); small waits reuse
+ * EDITOR_IDLE_NS, large checkpoint/replay waits use RECOVERY_GUARD_NS below
+ * (E, hang guards, not latency claims). Geometry: cols =
  * strlen of the longest status prompt + margin, rows = tab + text + status + 1.
  *
  * Probes that FAIL are findings (see docs/worker-reports/edit-dataloss-s6.md)
@@ -34,6 +35,12 @@
 enum { COLS = 40, ROWS = 4, TEXT_CAP = 4096 };
 typedef struct oracle { uint64_t len, cursor; uint8_t text[TEXT_CAP]; } oracle;
 static uint64_t deadline(void) { return trace_now_ns() + EDITOR_IDLE_NS; }
+/* (E) Reuse os_test's existing whole-case hang guard for the large checkpoint
+ * and replay, rather than the editor's idle policy. (M)[AC, desktop Spiral]
+ * eight copies with 32 CPU hogs took up to 18.156 s per detached scenario;
+ * 120 s is >6 times that observation. This only detects a stuck test: the
+ * awaited condition and every byte/modified-state assertion remain required. */
+#define RECOVERY_GUARD_NS UINT64_C(120000000000)
 static int turn(editor *e)
 {
     int rc = editor_step(e, 0);
@@ -900,8 +907,10 @@ static int detached_child(const char *source, const char *other, const char *jpa
         T(write_file(other, "external\n") == 0); T(rename(other, source) == 0);
     }
     T(file_check(e->buffer->file, NULL));
-    limit = deadline();
-    while (*e->buffer->base.path && trace_now_ns() < limit) { T(turn(e) == 0); sched_yield(); }
+    limit = trace_now_ns() + RECOVERY_GUARD_NS;
+    while (*e->buffer->base.path) {
+        T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
+    }
     fprintf(stderr, "dataloss_test: edit-7cj8 %s checkpoint=%s\n", window ? "copy window" : "detached",
         *e->buffer->base.path ? "missing" : "durable");
     T(write(ready, "r", sizeof "r" - 1u) == (ssize_t)(sizeof "r" - 1u));
@@ -935,7 +944,7 @@ static int detached_body(const char *root, detached_fixture *f, bool window)
     editor *e = f->e;
     if (!tabs_count(&e->tabs) && tabs_closed_count(&e->tabs)) {
         T(editor_reopen_tab(e) == 0);
-        uint64_t limit = deadline();
+        uint64_t limit = trace_now_ns() + RECOVERY_GUARD_NS;
         while (e->restore_active || e->buffer->placeholder || e->buffer->pending_open) {
             T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield();
         }
@@ -943,6 +952,11 @@ static int detached_body(const char *root, detached_fixture *f, bool window)
     }
     fprintf(stderr, "dataloss_test: edit-7cj8 %s recovered original=%s modified=%d\n", window ? "copy window" : "detached",
         editor_length(e) == bytes + (sizeof "XY" - 1u) ? "complete" : "lost", editor_tab(e, 0)->modified);
+    if (editor_length(e) != bytes + (sizeof "XY" - 1u))
+        fprintf(stderr, "dataloss_test: recovery len=%llu expected=%llu restore=%zu placeholder=%d open=%d deferred=%zu journal_error=%d notice=[%s]\n",
+            (unsigned long long)editor_length(e), (unsigned long long)(bytes + (sizeof "XY" - 1u)),
+            e->restore_active, e->buffer->placeholder, e->buffer->pending_open,
+            e->recovery_deferred, e->stats.journal_error, e->recovery_notice ? e->recovery_notice : "");
     T(editor_length(e) == bytes + (sizeof "XY" - 1u));
     uint8_t chunk[JOURNAL_INSERT_SLICE_BYTES];
     T(editor_read(e, 0, chunk, sizeof "XYoriginal\n" - 1u) == 0);
@@ -1822,8 +1836,9 @@ static int utin_save_as(utin_reason reason)
     plat_event enter = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_Return, .t0_ns = trace_now_ns()};
     T(editor_inject(e, &enter) == 0);
     uint64_t limit = deadline();
-    /* Return is queued: run until the write started and was adopted (or refused). */
-    bool started = false;
+    /* Return is queued: wait for the lasting adoption result (or refusal).
+     * The worker may finish before the next turn: sampling save_as only after
+     * that turn can miss the whole operation, especially after the chmod. */
     if (reason == UTIN_UNREADABLE) {
         /* No turn runs between the worker's rename and the chmod, so the
          * adoption (maintenance) finds the written target unreadable. */
@@ -1835,8 +1850,8 @@ static int utin_save_as(utin_reason reason)
         }
         T(chmod(target, 0) == 0);
     }
-    while (!(started || e->recovery_notice) || e->file_command != KEYS_ACTION_NONE || e->save_as)
-    { T(turn(e) == 0); started |= e->save_as != NULL; T(trace_now_ns() < limit); sched_yield(); }
+    while ((strcmp(e->buffer->path, target) && !e->recovery_notice) || e->file_command != KEYS_ACTION_NONE || e->save_as)
+    { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
     const editor_buffer *peer = e3z5_buffer(e, peer_id);
     fprintf(stderr, "dataloss_test: edit-utin save_as(%s): notice=%s path_moved=%d owner_modified=%d peer_stale=%d peer_modified=%d\n",
         names[reason], e->recovery_notice ? e->recovery_notice : "(none)", !strcmp(e->buffer->path, target),
@@ -1914,6 +1929,10 @@ static int select_stranded_orphan(void)
 static int select_two_process_reload(void)
 {
     return two_process_save(true);
+}
+static int select_two_process_save(void)
+{
+    return two_process_save(false);
 }
 static int select_y315(void)
 {
@@ -2023,6 +2042,7 @@ static const test_selector selectors[] = {
     {"--shared-save-clean", select_shared_save_clean},
     {"--stranded-orphan", select_stranded_orphan},
     {"--two-process-reload", select_two_process_reload},
+    {"--two-process-save", select_two_process_save},
     {"--open-gib", open_gib},
     {"--y315", select_y315},
     {"--y315-stall", y315_stall},

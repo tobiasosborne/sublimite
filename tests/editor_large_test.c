@@ -123,6 +123,7 @@ static int step_until(editor *e, bool (*done)(editor *), uint64_t budget_ns)
     return 0;
 }
 static bool settled(editor *e) { editor_stats s = editor_get_stats(e); return !s.pending && !s.render_active; }
+static bool opened(editor *e) { return !editor_get_stats(e).open_pending; }
 /* Estimated gutter digits in the default (dark) theme: gutter.foreground halved
  * towards gutter.background (0x4c525d before edit-29y2 moved the page to 0x222226). */
 static uint32_t dark_estimated_fg(void)
@@ -279,8 +280,10 @@ static int index_arrives_during_frame(const char *path)
         .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
         .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
     lineidx_destroy(e->buffer->index);
     e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    editor_large_init(e->buffer);
     piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
     T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
     _Atomic bool release; atomic_init(&release, false);
@@ -318,6 +321,7 @@ static int index_completes_between_steps(const char *path)
         .copy_threshold = 4096, .hook_ctx = &h, .on_ingress = ingress,
         .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
     lineidx_destroy(e->buffer->index);
     e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
     /* The replacement index is incomplete even if open's index won its race. */
@@ -509,9 +513,11 @@ static int mapped_find_boundaries(void)
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
     editor_config cfg = {.path = path, .cols = 60, .rows = 8, .wrap_mode = -1, .copy_threshold = 4096};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
     /* Leave a bound, unbuilt index with no worker. Find must finish anyway. */
     lineidx_destroy(e->buffer->index);
     e->buffer->index = lineidx_create(length); T(e->buffer->index);
+    editor_large_init(e->buffer);
     piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
     T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
     uint8_t dense[256]; memset(dense, 'x', sizeof dense);
@@ -710,8 +716,8 @@ static int wrapped_byte_jump(void)
      * mixed-density bytes. (P) Jump at the next B-line start: A_LINES times
      * sizeof "l000000\n" minus its C terminator, plus B_LEN. B_LEN exceeds
      * the viewport columns, so this is a wrapped logical-line fixture.
-     * (P) The smallest nonempty copy threshold forces mapped acquisition
-     * to finish before the bulk hold, as gutter_estimates requires. */
+     * (P) The smallest nonempty copy threshold selects mapped acquisition;
+     * wait for adoption before installing the bulk hold. */
     char path[] = "build/editor-tn2-wrap-XXXXXX";
     int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);
@@ -721,10 +727,13 @@ static int wrapped_byte_jump(void)
     T(step_until(e, settled, UINT64_C(5000000000)) == 0);
     uint64_t id = 0;
     T(editor_add_buffer(e, path, NULL, 0, &id) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
     T(!e->buffer->pending_open && editor_large_status_get(e).mapped);
-    T(!editor_large_status_get(e).lines_exact);
+    editor_large_close(e->buffer);
     lineidx_destroy(e->buffer->index);
     e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    editor_large_init(e->buffer); /* establish the estimate even if the old index finished */
+    T(!editor_large_status_get(e).lines_exact);
     piece_snapshot *snap = piece_snapshot_take(e->tree); T(snap);
     T(lineidx_bind_snapshot(e->buffer->index, snap) == 0);
     _Atomic bool release; atomic_init(&release, false);
@@ -797,6 +806,7 @@ static int cold_bracket_paint(bool wrapped_edit)
     editor_config cfg = {.path = path, .cols = 40, .rows = 4,
         .wrap_mode = wrapped_edit ? 1 : -1, .copy_threshold = 1};
     editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
     editor_large_close(e->buffer); lineidx_build_cancel(e->buffer->index);
     lineidx_destroy(e->buffer->index); e->buffer->index = lineidx_create(length); T(e->buffer->index);
     uint64_t start = length - 4u * 128u;
@@ -2105,6 +2115,8 @@ int main(void)
     trace_init(); (void)trace_thread_register();
     test_select_fn selected;
     static const test_selector select_edit_mmp_repro_cases[] = {
+        {"P4_COLD_PAINT", select_p4_cold_paint},
+        {"P4_COLD_WRAP", select_p4_cold_wrap},
         {"EDIT_MMP_REPRO", select_edit_mmp_repro},
         {"EDIT_PTN_REPRO", select_edit_ptn_repro},
         {"EDIT_DZ0_REPRO", select_edit_dz0_repro},
@@ -2142,7 +2154,6 @@ int main(void)
     static const test_selector select_p4_estimated_delete_cases[] = {
         {"P4_ESTIMATED_DELETE", select_p4_estimated_delete},
         {"P4_LAZY_LONG_LINE", lazy_long_line_rows},
-        {"P4_COLD_WRAP", select_p4_cold_wrap},
         {"EDIT_2TY_REPRO", select_edit_2ty_repro},
     };
     selected = TEST_SELECT_ENV(select_p4_estimated_delete_cases);
@@ -2170,11 +2181,6 @@ int main(void)
     T(warm_repaint() == 0);
     T(estimated_newline_delete(false) == 0);
     T(estimated_newline_delete(true) == 0);
-    static const test_selector select_p4_cold_paint_cases[] = {
-        {"P4_COLD_PAINT", select_p4_cold_paint},
-    };
-    selected = TEST_SELECT_ENV(select_p4_cold_paint_cases);
-    if (selected) return selected();
     T(cold_bracket_paint(false) == 0);
     T(cold_bracket_paint(true) == 0);
     static const test_selector select_p4_byte_jump_cases[] = {
@@ -2226,6 +2232,19 @@ xzw_fixture:;
     editor_config cfg = {.path = path, .cols = 100, .rows = 30, .copy_threshold = 4096, .closed_capacity = 1,
         .hook_ctx = &h, .on_ingress = ingress, .on_submit = submitted, .on_io = io_boundary};
     editor *e = NULL; T(editor_open(&e, &cfg, &b) == 0);
+    T(step_until(e, opened, EDITOR_IDLE_NS) == 0);
+    /* Opening may already have published the index. Recreate the intended
+     * incomplete-index setup after adoption, before any measured input. */
+    editor_large_close(e->buffer);
+    e->buffer->lg = (editor_large){0};
+    lineidx_destroy(e->buffer->index);
+    e->buffer->index = lineidx_create(editor_length(e)); T(e->buffer->index);
+    T(lineidx_build_reserve(e->buffer->index) == 0);
+    piece_snapshot *index_source = piece_snapshot_take(e->tree); T(index_source);
+    T(lineidx_bind_snapshot(e->buffer->index, index_source) == 0);
+    piece_snapshot_release(index_source);
+    e->buffer->index_dirty = true;
+    editor_large_init(e->buffer); editor_large_start(e, e->buffer);
     /* 1. Before the index arrives: estimated, not exact, and plausibly sized. */
     editor_large_status s = editor_large_status_get(e);
     T(s.mapped); T(!s.lines_exact); T(editor_line_count(e) > 1);
