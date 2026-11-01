@@ -10,6 +10,7 @@
 #include "trace/trace.h"
 #include "test_isolation.h"
 #include "timeout_diag.h"
+#include "editor_fixture.h"
 /* Same native call seam as win32_plat_test; no production fault switch. */
 static volatile LONG fail_clip, synthetic_publication;
 static BOOL publication_empty(void)
@@ -161,7 +162,7 @@ static size_t observed_receive(work_pool *pool,work_handle handle,uint32_t gener
 #define T(x) do { if(!(x)) { fprintf(stderr,"editor_win:%d FAIL %s\n",__LINE__,#x); if(publish_release) SetEvent(publish_release); return 1; } } while(0)
 /* Counts match Linux allocation_case: alternating insertion/backspace. */
 #define KEYS 10000u
-#define WATCH_NS UINT64_C(5000000000)
+#define WATCH_NS EFX_WATCH_NS
 typedef struct samples {
     uint64_t ingress, costs[KEYS];
     size_t count, allocations;
@@ -182,47 +183,11 @@ static void submitted(void *ctx, const editor_frame *frame)
 }
 static int compare(const void *a, const void *b)
 { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b; return (x>y)-(x<y); }
-static int settle(editor *e)
-{
-    uint64_t end=os_now_ns()+WATCH_NS;
-    HWND window=plat_native_win32(&e->platform);
-    uintptr_t token=(uintptr_t)GetPropW(window,L"SublimiteTestBarrier")+1u;
-    T(PostMessageW(window,WM_APP+0x53,token,0));
-    while((uintptr_t)GetPropW(window,L"SublimiteTestBarrier")!=token) {
-        T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
-    }
-    do {
-        int rc=editor_step(e,0); T(rc>=0);
-        editor_stats state=editor_get_stats(e);
-        if(!state.pending && !state.render_active && !state.font_pending) return 0;
-        os_yield();
-    } while(os_now_ns()<end);
-    fprintf(stderr,"settle timeout dirty=%d active=%d queue=%zu\n",e->dirty,e->backend->active,e->queue_count);
-    return 1;
-}
-static int wait_mutation(editor *e, uint64_t target)
-{
-    uint64_t end=os_now_ns()+WATCH_NS;
-    do { T(editor_step(e,0)>=0); if(editor_get_stats(e).mutations>=target) return settle(e); os_yield(); } while(os_now_ns()<end);
-    fprintf(stderr,"mutation timeout target=%llu actual=%llu\n",(unsigned long long)target,(unsigned long long)editor_get_stats(e).mutations);
-    return 1;
-}
-static void cleanup(const char *path)
-{
-    os_dir dir=OS_DIR_INIT; os_dir_iter it;
-    if(os_dir_open(&dir,path)!=OS_OK) return;
-    if(os_dir_iter_open(&it,&dir)==OS_OK) {
-        const char *name;
-        while(os_dir_next(&it,&name)==OS_OK && name) {
-            char child[OS_PATH_MAX]; snprintf(child,sizeof child,"%s\\%s",path,name);
-            os_stat st;
-            if(os_stat_path(child,OS_STAT_NOFOLLOW,&st)==OS_OK && st.kind==OS_KIND_DIR) cleanup(child);
-            else (void)os_unlink(child);
-        }
-        os_dir_iter_close(&it);
-    }
-    os_dir_close(&dir); (void)os_rmdir(path);
-}
+/* edit-177r.14: the shared fixture owns settle/wait_mutation; fail hook releases the held gate. */
+static void release_gate(void) { if(publish_release) SetEvent(publish_release); }
+static int settle(editor *e) { return efx_settle(e); }
+static int wait_mutation(editor *e, uint64_t target) { return efx_wait_mutation(e,target); }
+static void cleanup(const char *path) { if(efx_owned_name(path)) efx_tree_remove(path); }
 typedef struct auto_source { editor_wait_set set; plat platform; bool seen; } auto_source;
 static void auto_source_ready(void *ctx)
 {
@@ -1278,13 +1243,12 @@ int main(int argc, char **argv)
     T(auto_source_test()==0);
     if(argc==2 && !strcmp(argv[1],"--close-campaign")) return run_child_case("--close-queue",NULL,0);
     if(argc==2 && !strcmp(argv[1],"--wait")) return wait_test();
-    char temp[OS_PATH_MAX],root[OS_PATH_MAX],journal_path[OS_PATH_MAX]; unsigned random;
-    T(os_temp_dir(temp,sizeof temp)==OS_OK && os_random(&random,sizeof random)==OS_OK);
-    snprintf(root,sizeof root,"%s\\sublimite-test-editor-path-%x",temp,random);
-    if(argc==3) snprintf(root,sizeof root,"%s",argv[2]);
-    else T(os_mkdir(root)==OS_OK);
-    T(os_env_set("SUBLIMITE_PROFILE",root)==OS_OK);
-    T(os_env_set("SUBLIMITE_TEST_INPUT","1")==OS_OK);
+    char root[OS_PATH_MAX],journal_path[OS_PATH_MAX];
+    efx_fail_hook=release_gate;
+    efx_profile profile;
+    if(argc==3) T(efx_profile_adopt(&profile,argv[2])==0);
+    else T(efx_profile_create(&profile,"editor-path")==0);
+    snprintf(root,sizeof root,"%s",profile.root);
     render_backend b={0}; T(render_d3d11_backend(&b)==RENDER_OK);
     snprintf(journal_path,sizeof journal_path,"%s\\typing.journal",root);
     if(argc==3) snprintf(journal_path,sizeof journal_path,"%s\\guard.journal",root);

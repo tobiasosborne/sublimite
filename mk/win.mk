@@ -326,6 +326,12 @@ $(WIN_B)/san/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(filter-out %/editor/
 $(WIN_B)/rel/tests/editor_win_test.exe: $(WIN_EDITOR_REL)
 $(WIN_B)/san/tests/editor_win_test.exe: $(WIN_EDITOR_SAN)
 
+# Reusable editor fixture (edit-177r.14): the production editor, null backend, no display.
+$(WIN_B)/rel/tests/editor_fixture_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_REL)
+$(WIN_B)/san/tests/editor_fixture_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_SAN)
+$(WIN_B)/rel/tests/editor_fixture_test.exe: $(WIN_EDITOR_REL)
+$(WIN_B)/san/tests/editor_fixture_test.exe: $(WIN_EDITOR_SAN)
+
 # Native console attachment seam uses main.c with a synthetic help argv.
 $(WIN_B)/rel/tests/editor_console_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_REL)
 $(WIN_B)/san/tests/editor_console_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_SAN)

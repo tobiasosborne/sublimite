@@ -532,7 +532,9 @@ static int present(editor *e)
     /* Retain the native latency credit before arming PAINT. If it is absent,
      * never enter present: a signal arriving between two polls must not draw
      * without the guard. The readiness check also runs the latency watchdog. */
-    bool undrawn=!d3d11_frame_drawn(b);
+    /* The headless null backend has no swapchain, latency credit or draw to wait
+     * for (edit-177r.14): it presents at once and signals T5/T6 synchronously. */
+    bool undrawn=!strcmp(b->info.name,"d3d11") && !d3d11_frame_drawn(b);
     if(undrawn && !d3d11_present_ready(b)) return windows_surface(e);
     editor_buffer *paint_owner=NULL;
     for(size_t i=0;i<e->buffer_capacity;i++)
