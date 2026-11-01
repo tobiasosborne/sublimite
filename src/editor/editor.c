@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #if defined(_WIN32)
+static int windows_resize_paint(editor *e);
 /* Relevant events and the parked-state deadline are retry obligations, never
  * evidence of completion. Only the native backend may authenticate T5/T6. */
 static int windows_retry(editor *e)
@@ -409,6 +410,23 @@ static void platform_modal_turn(void *ctx)
     if(rc<0) e->error=rc;
     if(e->quit || e->error || e->win_close_requested) plat_quit(&e->platform);
 }
+void editor_native_resize_turn(void *ctx)
+{
+    editor *e=ctx;
+    win32_plat *p=win32_private(&e->platform);
+    if(e->win_modal_turn || !e->backend->initialized || e->quit || e->error || e->win_close_requested) return;
+    /* Only the ordinary pump lends a reentrant turn. Lifecycle pumps and
+     * synchronous messages from layout/render callbacks retain their events. */
+    if(e->win_step_running && (!p->callbacks || p->callbacks->on_modal_turn!=platform_modal_turn)) return;
+    if(strcmp(e->backend->info.name,"d3d11")) return;
+    /* Geometry and paint use the ordinary layout/compose/submit/present
+     * functions, ahead of input, worker adoption and persistence maintenance.
+     * Keep native rebuilds deferred as in edit-177r.31. */
+    e->win_modal_turn=e->win_resize_turn=true;
+    int rc=windows_resize_paint(e);
+    e->win_modal_turn=e->win_resize_turn=false;
+    if(rc) e->error=rc;
+}
 static void platform_complete(void *ctx, uint32_t serial, uint64_t ns, uint64_t count)
 {
     editor *e=ctx;
@@ -610,10 +628,19 @@ static int submit(editor *e)
      * after this turn's pump. Publish before this frame can leave the editor. */
 #if defined(_WIN32)
     if(e->win_paint_clear_pending) windows_paint_clear(e);
+    if(d3d11_recovery_required(e->backend)) return windows_surface(e);
+    if(!e->win_resize_turn)
 #endif
     editor_large_index_progress(e);
     if (e->op_count || editor_clip_busy(e) || editor_scroll_waiting(e) || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
-    int metadata = editor_journal_metadata(e);
+    int metadata=0;
+#if defined(_WIN32)
+    /* Window/view persistence is owed to the normal turn. It does not gate
+     * a geometry-only repaint; text operation and PAINT fences still do. */
+    if(e->win_resize_turn) e->journal_metadata_pending=e->journal!=NULL;
+    else
+#endif
+    metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
 #if defined(_WIN32)
@@ -633,6 +660,9 @@ static int submit(editor *e)
      * its first status frame has actually entered the backend snapshot. */
     bool notice_first_frame=notice_unshown && e->recovery_notice_shown;
     if(notice_first_frame) e->recovery_notice_shown=false;
+#endif
+#if defined(_WIN32)
+    if(!e->win_resize_turn)
 #endif
     editor_large_index_progress(e);
 #if defined(_WIN32)
@@ -750,7 +780,15 @@ int editor_resize_now(editor *e, uint32_t width, uint32_t height)
     if (!dims.rows) dims.rows = 1;
     if (dims.cols > e->max_cols) dims.cols = e->max_cols;
     if (dims.rows > e->max_rows) dims.rows = e->max_rows;
-    if (dims.cols == e->grid.dims.cols && dims.rows == e->grid.dims.rows) return 0;
+    if (dims.cols == e->grid.dims.cols && dims.rows == e->grid.dims.rows) {
+#if defined(_WIN32)
+        /* Even a sub-cell resize changes the native surface and its margins. */
+        int rc=e->backend->initialized ? render_backend_resize(e->backend,dims) : 0;
+        return rc ? rc : editor_full_layout(e);
+#else
+        return 0;
+#endif
+    }
     return editor_resize_grid(e, dims);
 }
 int editor_resize_grid(editor *e, render_dims dims)
@@ -817,10 +855,66 @@ int editor_text_geometry(editor *e)
 }
 static int resize(editor *e)
 {
+#if defined(_WIN32)
+    if(!e->resize_pending) return 0;
+    if(!strcmp(e->backend->info.name,"d3d11")) {
+        if(d3d11_recovery_required(e->backend)) return 0;
+        int rc=d3d11_supersede_resize(e->backend); if(rc) return rc;
+    } else if(e->backend->active) return 0;
+#else
     if (!e->resize_pending || e->backend->active || e->dirty) return 0;
+#endif
     e->resize_pending = false;
     return editor_resize_now(e, e->resize_w, e->resize_h);
 }
+#if defined(_WIN32)
+static int windows_resize_paint(editor *e)
+{
+    if(d3d11_recovery_required(e->backend) || win32_plat_suspended(&e->platform)) return 0;
+    /* These continuations borrow the old layout. They must first reach their
+     * ordinary safe boundary; their normal work wake remains responsible. */
+    if(view_busy(&e->v) || e->action!=EDITOR_ACTION_NONE || e->find_replace_active ||
+       editor_scroll_waiting(e)) return 0;
+    uint32_t width=e->platform.width,height=e->platform.height;
+    if(e->resize_pending || width!=e->font.window_width || height!=e->font.window_height) {
+        /* SIZE is an explicit surface retry. The geometry below already
+         * requests full damage, so no old-size full layout is needed here. */
+        e->win_unavailable=false; e->win_retry_ns=e->win_retry_delay_ns=0;
+        (void)d3d11_set_suspended(e->backend,false);
+        e->resize_w=width; e->resize_h=height; e->resize_pending=true;
+        e->drag_tab=SIZE_MAX; e->drag_id=0; e->map_drag=e->text_drag=false;
+        int rc=resize(e); if(rc) return rc;
+        e->win_resize_paint=true;
+    }
+    if(!e->win_resize_paint || d3d11_recovery_required(e->backend)) return 0;
+    /* An unwrapped viewport's scroll geometry changes with its row count. */
+    int rc=editor_scroll_slice(e); if(rc) return rc;
+    if(editor_scroll_waiting(e)) return 0;
+    uint64_t start=trace_now_ns();
+    rc=0;
+    while(layout_busy(&e->lay) && trace_now_ns()-start<EDITOR_SLICE_NS) {
+        rc=layout_slice(e); if(rc<0) return rc;
+    }
+    if(!layout_busy(&e->lay)) {
+        if(e->full_pending) rc=editor_full_layout(e);
+        else if(e->extra_rows) {
+            e->extra_rows=false;
+            rc=layout_relayout_rows(&e->lay,e->extra_first,e->extra_end-e->extra_first);
+        } else if(!e->paint_ready) rc=editor_paint_prepare(e);
+        if(rc<0) return rc;
+        rc=submit(e); if(!rc) rc=present(e);
+        if(rc) return rc;
+    }
+    e->win_resize_paint=e->dirty || (e->backend->active && !e->backend->presented);
+    bool ready_work=layout_busy(&e->lay) || e->full_pending || e->extra_rows || !e->paint_ready ||
+        (e->backend->active && !e->backend->presented);
+    /* Credit/PAINT/save/clipboard fences require their owner to make
+     * progress. Do not flood User32 with retries that would starve that work. */
+    if(e->win_resize_paint && ready_work && !e->win_unavailable && !d3d11_recovery_required(e->backend))
+        win32_plat_resize_again(&e->platform);
+    return 0;
+}
+#endif
 static int drop_notice(editor *e, const char *message)
 {
     if (message != e->drop_notice) strcpy(e->drop_notice, message);
@@ -929,6 +1023,10 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_RESIZE) {
 #if defined(_WIN32)
         uint32_t dpi=win32_plat_dpi(&e->platform);
+        /* A synchronous SIZE repaint already consumed this state. Keep the
+         * coalesced event for unsafe callbacks, but do not redo a safe resize. */
+        if(!e->resize_pending && ev->w==e->font.window_width && ev->h==e->font.window_height &&
+           (!dpi || e->font.dpi==(double)dpi)) return 0;
         if(dpi && e->font.dpi != (double)dpi) {
             e->font.dpi=(double)dpi;
             e->font.default_px=editor_runtime_em_px((double)dpi,e->font.default_points);
@@ -937,7 +1035,12 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
 #endif
         e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; e->text_drag=false;
         e->font.window_width = ev->w; e->font.window_height = ev->h;
-        e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
+        e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true;
+#if defined(_WIN32)
+        return resize(e);
+#else
+        return 0;
+#endif
     }
     if (ev->kind == PLAT_EV_FOCUS) {
         e->focused = ev->focused; undo_break_burst(e->undo);
@@ -1281,7 +1384,11 @@ static int close_result(editor *e, int timeout_ms)
     if (rc == EDITOR_MORE) return EDITOR_CLOSED;
     return rc ? fail(e, EDITOR_ERR_IO) : EDITOR_CLOSED;
 }
+#if defined(_WIN32)
+static int editor_step_impl(editor *e, int timeout_ms)
+#else
 int editor_step(editor *e, int timeout_ms)
+#endif
 {
     if (!e || !e->tree) return EDITOR_ERR_ARG;
     if (e->quit) return close_result(e, timeout_ms);
@@ -1408,6 +1515,15 @@ int editor_step(editor *e, int timeout_ms)
 #endif
     return runnable(e) ? EDITOR_MORE : EDITOR_OK;
 }
+#if defined(_WIN32)
+int editor_step(editor *e,int timeout_ms)
+{
+    if(!e) return EDITOR_ERR_ARG;
+    bool running=e->win_step_running; e->win_step_running=true;
+    int rc=editor_step_impl(e,timeout_ms);
+    e->win_step_running=running; return rc;
+}
+#endif
 int editor_run(editor *e)
 {
     int rc; do { rc = editor_step(e, -1); } while (rc == EDITOR_OK || rc == EDITOR_MORE);

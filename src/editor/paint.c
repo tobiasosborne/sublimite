@@ -1,6 +1,9 @@
 #include "editor/private.h"
 #include "editor/theme.h"
 #include "trace/trace.h"
+#if defined(_WIN32)
+#include "win32/private.h"
+#endif
 #include <string.h>
 
 static void paint(void *ctx, uint64_t byte, uint32_t *fg, uint32_t *bg, uint16_t *attrs)
@@ -377,6 +380,9 @@ static int compose(editor *e)
 int editor_compose(editor *e)
 {
     e->grid.surface_background = e->layout_cfg.bg;
+#if defined(_WIN32)
+    if(e->has_platform) win32_plat_background(&e->platform,e->layout_cfg.bg);
+#endif
     trace_record(TRACE_COMPOSE_BEGIN, e->grid.frame_id);
     int rc;
     if (e->hover_only) {

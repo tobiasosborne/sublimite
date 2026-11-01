@@ -345,6 +345,10 @@ static int run_device(HWND window, bool warp, bool background)
     T(initialize(&init) == 0);
     if (init.rc != RENDER_OK) fprintf(stderr,"D3D11 init rc=%d native=%lu\n",init.rc,GetLastError());
     T(init.rc == RENDER_OK);
+    DXGI_SWAP_CHAIN_DESC1 chain_desc;
+    d3d11_state *chain_state = b.state;
+    T(SUCCEEDED(chain_state->swapchain->lpVtbl->GetDesc1(chain_state->swapchain,&chain_desc)));
+    T(chain_desc.Scaling == DXGI_SCALING_NONE);
     bool actual_warp = d3d11_is_warp(&b), debug = d3d11_debug_enabled(&b);
     T(!warp || actual_warp);
     T(d3d11_latency_handle(&b));

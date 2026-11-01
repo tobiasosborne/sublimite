@@ -509,7 +509,8 @@ struct editor {
     char busy_source[IPC_PATH_CAP];
 #if defined(_WIN32)
     bool win_unavailable, win_native_suspended;
-    bool win_close_requested, win_cpu_probe, win_surface_valid, win_modal_turn;
+    bool win_close_requested, win_cpu_probe, win_surface_valid, win_modal_turn, win_step_running;
+    bool win_resize_turn, win_resize_paint;
     uint64_t win_retry_ns, win_retry_delay_ns;
     bool win_frame_owed;
     bool win_paint_clear_pending;
@@ -907,6 +908,9 @@ findui_mutation_result editor_find_insert(void *ctx, undo_log *undo, uint64_t of
     size_t len, uint64_t when, const undo_state *before, const undo_state *after);
 void editor_find_replace_finish(editor *e);
 int editor_poll_sources(editor *e);
+#if defined(_WIN32)
+void editor_native_resize_turn(void *ctx);
+#endif
 int editor_preferences_poll(editor *e);
 int editor_preferences_apply(editor *e);
 int editor_preferences_font_init(editor *e);

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #if defined(_WIN32)
 #include <malloc.h>
+#include "win32/private.h"
 static editor *allocate_editor(void)
 { return _aligned_malloc(sizeof(editor), _Alignof(editor)); }
 #endif
@@ -17,6 +18,7 @@ void editor_close(editor *e)
 {
     if (!e) return;
 #if defined(_WIN32)
+    if(e->has_platform) win32_plat_on_resize(&e->platform,NULL,NULL);
     int cut_rc;
     while((cut_rc=editor_clip_close_wait(e))==EDITOR_MORE) os_sleep_ns(UINT64_C(1000000));
     if(cut_rc<0) { e->error=cut_rc; return; } /* Keep admitted text/journal owned. */
@@ -318,6 +320,9 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         /* edit-29y2: before mapping, so the window manager's first frame already matches. */
         const config_settings *prefs = e->preferences_runtime ? config_runtime_current(e->preferences_runtime) : NULL;
         plat_set_dark(&e->platform, (prefs ? prefs->theme : e->preferences.theme) == CONFIG_DARK);
+#if defined(_WIN32)
+        win32_plat_background(&e->platform,e->layout_cfg.bg);
+#endif
         plat_map(&e->platform);
     }
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
@@ -348,6 +353,9 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     } else rc = editor_activate(e);
     if (rc) goto fail;
     rc = editor_preferences_font_init(e); if (rc) goto fail;
+#if defined(_WIN32)
+    if(e->has_platform) win32_plat_on_resize(&e->platform,editor_native_resize_turn,e);
+#endif
     *out = e; return 0;
 fail:
     if (retry && e->recovery_retry) {

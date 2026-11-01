@@ -215,10 +215,12 @@ static HRESULT STDMETHODCALLTYPE fake_present(IDXGISwapChain2 *chain, UINT inter
 static HRESULT STDMETHODCALLTYPE occluded_present(IDXGISwapChain2 *chain, UINT interval, UINT flags,
     const DXGI_PRESENT_PARAMETERS *params)
 { (void)chain; (void)interval; (void)flags; (void)params; return DXGI_STATUS_OCCLUDED; }
+static HRESULT STDMETHODCALLTYPE fake_background(IDXGISwapChain2 *chain,const DXGI_RGBA *color)
+{ (void)chain; (void)color; return S_OK; }
 static int occlusion_retry(void)
 {
     ID3D11DeviceContextVtbl xv = {.GetData = fake_query}; ID3D11DeviceContext context = {&xv};
-    IDXGISwapChain2Vtbl cv = {.Present1 = occluded_present}; IDXGISwapChain2 chain = {&cv};
+    IDXGISwapChain2Vtbl cv = {.Present1 = occluded_present,.SetBackgroundColor=fake_background}; IDXGISwapChain2 chain = {&cv};
     d3d11_state s = {.context = &context,.swapchain = &chain,.drawn = true,.latency_ready = true,
         .deadline = 1,.last_observation = os_now_ns()};
     render_backend b = {.state = &s};
@@ -238,7 +240,7 @@ static HRESULT STDMETHODCALLTYPE fake_count(IDXGISwapChain2 *chain, UINT *count)
 static int query_waits_for_present(void)
 {
     ID3D11DeviceContextVtbl xv = {.GetData = fake_query}; ID3D11DeviceContext context = {&xv};
-    IDXGISwapChain2Vtbl cv = {.Present1 = fake_present,.GetLastPresentCount = fake_count};
+    IDXGISwapChain2Vtbl cv = {.Present1 = fake_present,.GetLastPresentCount = fake_count,.SetBackgroundColor=fake_background};
     IDXGISwapChain2 chain = {&cv};
     d3d11_state s = {.context = &context,.swapchain = &chain,.drawn = true,.latency_ready = true,.resume_pending = true};
     render_backend b = {.state = &s};
@@ -295,11 +297,28 @@ static int readiness_recovery(void)
     puts("d3d11_win_test: continuously observed missing latency requests healthy-device rebuild PASS");
     return 0;
 }
+static int resize_supersedes(void)
+{
+    d3d11_state s={.drawn=true,.swapped=true,.completion_queued=true,.completion_ns=123,.sync_ready=true};
+    unsigned hooks=0;
+    render_backend b={.info={.name="d3d11"},.state=&s,.initialized=true,.active=true,
+        .presented=true,.active_frame=41,.last_frame=41,.config={.hooks={hook_count,hook_count,&hooks}}};
+    T(d3d11_supersede_resize(&b)==0 && !b.active && b.full_required);
+    T(!hooks && b.last_frame==41 && !s.completion_queued && !s.sync_ready);
+    b.active=true; b.active_frame=42;
+    HRESULT status=S_OK; work_msg old={.generation=41}; memcpy(old.data,&status,sizeof status);
+    d3d11_sync_receive(&old,&b); T(!s.sync_ready);
+    T(d3d11_present_complete(&b,41,123,7)!=0 && b.active && !hooks);
+    old.generation=42; d3d11_sync_receive(&old,&b); T(s.sync_ready);
+    puts("d3d11_win_test: resize supersedes drawn frame; late completion cannot release replacement; no invented hooks PASS");
+    return 0;
+}
 int main(void) {
     T(test_isolation_query() != TEST_ISOLATION_UNKNOWN);
     if(platform_statistics_route()) return 1;
     if (disabled_scroll() || atlas_rectangles()) return 1;
     if (timing_capability()) return 1;
+    if (resize_supersedes()) return 1;
     if (statistics_progress()) return 1;
     if (delayed_retry()) return 1;
     if (teardown_order()) return 1;

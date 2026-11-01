@@ -28,7 +28,7 @@ typedef struct d3d11_state {
     bool native_deferred, native_failed;
     plat *platform;
     bool force_warp, readback, warp, debug, failed, swapped, drawn, query_ready;
-    bool own_arena, full_frame, region_upload, latency_ready;
+    bool own_arena, region_upload, latency_ready;
     bool sync_started, sync_ready, suspended, invisible, resume_pending, recovery, occluded;
     work_pool *sync_pool;
     work_handle sync_job;
@@ -65,7 +65,7 @@ typedef struct d3d11_state {
     HRESULT present_error;
     d3d11_present_info present_info;
     uint64_t deadline, last_observation, completion_ns;
-    bool completion_queued, native_modal;
+    bool completion_queued, native_modal, resize_frame;
 } d3d11_state;
 
 static bool d3d11_descriptor(const render_backend *b)
@@ -187,7 +187,7 @@ static bool d3d11_native_init(d3d11_state *s)
     DXGI_SWAP_CHAIN_DESC1 desc = {.Width = s->width,.Height = s->height,
         .Format = DXGI_FORMAT_B8G8R8A8_UNORM,.SampleDesc = {1,0},
         .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,.BufferCount = 2,
-        .Scaling = DXGI_SCALING_STRETCH,.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        .Scaling = DXGI_SCALING_NONE,.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         .AlphaMode = DXGI_ALPHA_MODE_IGNORE,.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT};
     /* (P) Flip model requires >=2 buffers. MaxFrameLatency=1 and the common
      * adapter's single active frame independently bound the submission queue. */
@@ -195,6 +195,11 @@ static bool d3d11_native_init(d3d11_state *s)
                                                 s->window,&desc,NULL,NULL,&chain);
     if (SUCCEEDED(hr)) hr = factory->lpVtbl->MakeWindowAssociation(factory,s->window,DXGI_MWA_NO_ALT_ENTER);
     if (SUCCEEDED(hr)) hr = chain->lpVtbl->QueryInterface(chain,&IID_IDXGISwapChain2,(void **)&s->swapchain);
+    if(SUCCEEDED(hr)) {
+        uint32_t rgb=s->surface_background;
+        DXGI_RGBA color={(float)((rgb>>16)&255u)/255.0f,(float)((rgb>>8)&255u)/255.0f,(float)(rgb&255u)/255.0f,1};
+        hr=s->swapchain->lpVtbl->SetBackgroundColor(s->swapchain,&color);
+    }
     if (SUCCEEDED(hr)) hr = s->swapchain->lpVtbl->SetMaximumFrameLatency(s->swapchain,1);
     if (SUCCEEDED(hr)) {
         s->latency = s->swapchain->lpVtbl->GetFrameLatencyWaitableObject(s->swapchain);
@@ -401,7 +406,9 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
     b->info.capabilities &= ~RENDER_CAP_PRESENT_TIMING;
     plat *platform = s->platform;
     HWND window = s->window; bool warp = s->force_warp, readback = s->readback;
+    uint32_t background=s->surface_background;
     memset(s,0,sizeof *s); s->platform = platform; s->window = window; s->force_warp = warp; s->readback = readback;
+    s->surface_background=background;
     if (!cfg->platform) return RENDER_ERR_UNSUPPORTED;
     if (!window || !IsWindow(window)) return RENDER_ERR_ARG;
     /* (P) D3D11 feature level 11 texture dimension = 16384; scene reserves an
@@ -478,6 +485,8 @@ static int d3d11_resize(render_backend *b, render_dims dims)
         }
         if(FAILED(hr)) return d3d11_fail(s);
         s->width = w; s->height = h;
+        s->drawn=false; s->swapped=false; s->query_ready=false;
+        s->resize_frame = true;
     }
     s->dims = dims; return RENDER_OK;
 }
@@ -550,7 +559,7 @@ static int d3d11_submit(render_backend *b, const render_grid *g, const render_st
         s->region.pixels = s->region_pixels; s->region.stride = s->region.width;
         s->region.capacity = (size_t)s->region.width*s->region.height;
     }
-    s->full_frame = g->full_frame; s->scroll = g->scroll.cols ? g->scroll : (render_scroll){0};
+    s->scroll = g->scroll.cols ? g->scroll : (render_scroll){0};
     s->completion_queued=false; s->completion_ns=0;
     s->surface_background = g->surface_background; s->swapped = false; s->drawn = false; s->query_ready = false;
     s->resume_pending = false; s->pending_count = 0; s->present_error = S_OK; s->deadline = 0;
@@ -592,11 +601,9 @@ static bool d3d11_draw(d3d11_state *s)
     c->lpVtbl->RSSetState(c,s->rasterizer);
     c->lpVtbl->VSSetConstantBuffers(c,0,1,&s->constants);
     c->lpVtbl->PSSetConstantBuffers(c,0,1,&s->constants);
-    float bg[4]; d3d11_background(s->surface_background,bg);
-    if (s->full_frame) {
-        c->lpVtbl->ClearRenderTargetView(c,s->scene_rtv,bg);
-        c->lpVtbl->ClearRenderTargetView(c,s->target_rtv,bg);
-    }
+    /* Full damage covers every active cell (including overscan), then the
+     * copy pass and margin shader cover every client pixel. Clearing the
+     * much larger reserved targets here is redundant work during resize. */
     c->lpVtbl->OMSetRenderTargets(c,1,&s->scene_rtv,NULL);
     D3D11_VIEWPORT viewport = {0,0,(float)s->max_width,(float)(s->max_height*2u),0,1};
     c->lpVtbl->RSSetViewports(c,1,&viewport);
@@ -679,7 +686,7 @@ static int d3d11_present(render_backend *b, uint32_t id)
     if (!s->deadline) s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
     if (d3d11_paused(s)) return RENDER_ERR_BUSY;
     /* A zero-time poll only. No fence wait or frame-latency wait on UI. */
-    if (!s->latency_ready) {
+    if (!s->latency_ready && !s->resize_frame) {
         DWORD ready = WaitForSingleObject(s->latency,0);
         if (ready == WAIT_TIMEOUT) {
             s->present_info.status = (int32_t)HRESULT_FROM_WIN32(ERROR_IO_PENDING);
@@ -689,6 +696,9 @@ static int d3d11_present(render_backend *b, uint32_t id)
         s->latency_ready = true;
     }
     if (!s->drawn) {
+        float rgba[4]; d3d11_background(s->surface_background,rgba);
+        DXGI_RGBA background={rgba[0],rgba[1],rgba[2],rgba[3]};
+        if(FAILED(s->swapchain->lpVtbl->SetBackgroundColor(s->swapchain,&background))) return d3d11_fail(s);
         if (!d3d11_draw(s)) return d3d11_fail(s);
         s->drawn = true;
     }
@@ -701,7 +711,7 @@ static int d3d11_present(render_backend *b, uint32_t id)
     if (FAILED(hr)) return d3d11_fail(s);
     s->query_ready = hr == S_OK && ready;
     DXGI_PRESENT_PARAMETERS params = {0};
-    hr = s->swapchain->lpVtbl->Present1(s->swapchain,1,DXGI_PRESENT_DO_NOT_WAIT,&params);
+    hr = s->swapchain->lpVtbl->Present1(s->swapchain,s->resize_frame ? 0u : 1u,DXGI_PRESENT_DO_NOT_WAIT,&params);
     s->present_info.status = (int32_t)hr;
     /* Occlusion is suspension, not failed progress on a visible swapchain.
      * Keep the copied frame retryable without repeatedly rebuilding a healthy
@@ -714,7 +724,7 @@ static int d3d11_present(render_backend *b, uint32_t id)
     if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
         return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_ERR_BUSY;
     if (FAILED(hr)) return d3d11_fail(s);
-    s->swapped = true; s->latency_ready = false; s->resume_pending = false;
+    s->swapped = true; s->latency_ready = false; s->resume_pending = false; s->resize_frame = false;
     s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
     s->present_error = s->swapchain->lpVtbl->GetLastPresentCount(s->swapchain,&s->pending_count);
     /* Present committed: latch subsequent failure for event, never invite a
@@ -725,21 +735,17 @@ static int d3d11_present(render_backend *b, uint32_t id)
  * caller's raster/font pool is saturated. It never touches the UI context. */
 static void d3d11_sync_worker(work_ctx *ctx)
 {
-    d3d11_state *s = ctx->arg;
-    UINT expected = s->pending_count;
     HRESULT hr = DwmFlush();
     work_msg msg = {.kind = D3D11_POLL_MESSAGE,.generation = ctx->generation};
-    memcpy(msg.data,&expected,sizeof expected);
-    memcpy(msg.data+sizeof expected,&hr,sizeof hr);
+    memcpy(msg.data,&hr,sizeof hr);
     while (!work_should_stop(ctx) && !work_publish(ctx,&msg)) os_yield();
 }
 static void d3d11_sync_receive(const work_msg *msg, void *arg)
 {
     render_backend *b = arg; d3d11_state *s = b->state;
-    UINT expected; HRESULT hr;
-    memcpy(&expected,msg->data,sizeof expected);
-    memcpy(&hr,msg->data+sizeof expected,sizeof hr);
-    if (!b->active || msg->generation != b->active_frame || expected != s->pending_count) return;
+    HRESULT hr;
+    memcpy(&hr,msg->data,sizeof hr);
+    if (!b->active || msg->generation != b->active_frame) return;
     s->sync_ready = true; s->sync_status = hr;
 }
 static bool d3d11_sync_progress(render_backend *b, uint32_t id)
@@ -830,7 +836,11 @@ int d3d11_bind_platform(render_backend *b, struct plat *platform)
 {
     if (!d3d11_descriptor(b) || !b->state) return RENDER_ERR_ARG;
     if (b->initialized) return RENDER_ERR_STATE;
-    ((d3d11_state *)b->state)->platform = platform;
+    d3d11_state *s=b->state; s->platform=platform;
+    /* Copy on UI before worker ownership; init never reads mutable platform
+     * theme state while a bootstrap could be composing a different theme. */
+    const win32_plat *p=win32_private(platform);
+    s->surface_background=p ? p->background : 0;
     return RENDER_OK;
 }
 int d3d11_diagnostics(render_backend *b, bool force_warp, bool readback)
@@ -875,6 +885,7 @@ bool d3d11_present_ready(render_backend *b)
     d3d11_state *s=b->state;
     if(s->drawn || s->swapped || s->native_deferred || s->recovery || d3d11_paused(s)) return false;
     if(!s->deadline) s->deadline=os_now_ns()+D3D11_COMPLETION_NS;
+    if(s->resize_frame) return true;
     if(!s->latency_ready) {
         DWORD ready=WaitForSingleObject(s->latency,0);
         if(ready==WAIT_OBJECT_0) s->latency_ready=true;
@@ -897,6 +908,19 @@ int d3d11_discard_unpresented(render_backend *b)
     d3d11_state *s = b->state;
     if (s->drawn || s->swapped || b->presented) return RENDER_ERR_STATE;
     b->active = false; b->full_required = true;
+    return RENDER_OK;
+}
+int d3d11_supersede_resize(render_backend *b)
+{
+    if(!d3d11_descriptor(b) || !b->initialized) return RENDER_ERR_STATE;
+    d3d11_state *s=b->state;
+    if(s->failed) return RENDER_ERR_DEVICE;
+    if(s->recovery) return RENDER_ERR_UNSUPPORTED;
+    /* Resource refs stay native-owned; ResizeBuffers orders the backbuffer
+     * work. Late query/statistics mail carries the superseded frame id and
+     * cannot release the replacement's slot. No completion hooks are called. */
+    b->active=false; b->full_required=true;
+    s->completion_queued=false; s->sync_ready=false;
     return RENDER_OK;
 }
 bool d3d11_native_deferred(const render_backend *b)

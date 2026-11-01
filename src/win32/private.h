@@ -11,6 +11,7 @@
 /* (G) same fixed queue capacity as P2.2; no allocation during input. */
 #define WIN32_EVENT_CAP 256u
 #define WIN32_OCCLUSION_MESSAGE (WM_APP+0x54u)
+#define WIN32_RESIZE_MESSAGE (WM_APP+0x55u)
 typedef struct win32_present {
     uint32_t serial;
     uint64_t ust, msc;
@@ -20,6 +21,10 @@ typedef struct win32_plat {
     plat *owner;
     const plat_callbacks *callbacks;
     bool servicing, turn_stopped, modal_cancel;
+    bool resizing, resize_posted;
+    uint32_t background;
+    void (*on_resize)(void *);
+    void *resize_ctx;
     bool test_input, minimized, session_locked, session_disconnected, power_off;
     unsigned modal_depth, callback_depth;
     DWORD ui_thread;
@@ -66,6 +71,12 @@ bool win32_plat_suspended(const plat *p);
 /* End this pump turn, retaining DefWindowProc's native move/size/menu loop.
  * plat_quit is application termination and cancels that loop. UI only. */
 void win32_plat_stop_turn(plat *p);
+/* Borrowed UI callback: only at an idle editor or its native pump boundary.
+ * Queued size events remain available when the callback cannot safely run. */
+void win32_plat_on_resize(plat *p, void (*callback)(void *), void *ctx);
+void win32_plat_background(plat *p, uint32_t rgb);
+/* Continue bounded resize paint on a native message, without a timer wait. */
+void win32_plat_resize_again(plat *p);
 uint32_t win32_plat_dpi(const plat *p);
 int win32_plat_limit_client(plat *,uint32_t,uint32_t);
 int win32_plat_max_client(uint32_t *,uint32_t *);

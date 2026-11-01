@@ -13,15 +13,16 @@ int render_d3d11_backend(render_backend *b);
  * physical completion, shut down any successful backend, then destroy it.
  * Remove the borrowed latency HANDLE from UI wait sets before shutdown.
  *
- * WM_SIZE during an active frame: keep the existing swapchain dimensions,
- * coalesce the latest client size, and resize only after T5/T6 release the slot.
+ * WM_SIZE may supersede an active snapshot with d3d11_supersede_resize before
+ * resizing. The superseded frame receives no fabricated T4/T5/T6.
  * Minimize/session/suspend follow set_suspended and the recovery protocol below.
  * A bootstrap may use GDI/CPU on this HWND. An existing flip-model bootstrap
  * swapchain must be fully destroyed/flushed BEFORE this backend's initial INIT;
  * there is no chain sharing/transfer or deferred finish_init acquisition here.
  * Background init creates its chain without presenting a diagnostic frame. */
 int render_d3d11_backend_for_window(render_backend *b, void *hwnd);
-/* Optional init-only Win32 mailbox destination, borrowed through shutdown.
+/* UI, before handing init to its worker: optional Win32 mailbox destination,
+ * borrowed through shutdown. Copies the initial theme base for worker init.
  * render_config.platform remains an opaque identity for standalone clients. */
 int d3d11_bind_platform(render_backend *b, struct plat *platform);
 /* Init-only diagnostic options. Default: hardware, falling back to WARP.
@@ -56,6 +57,10 @@ int d3d11_set_suspended(render_backend *b, bool suspended);
  * require the documented quiescent rebuild first. No T4/T5/T6 is fabricated. */
 bool d3d11_surface_unavailable(const render_backend *b);
 int d3d11_discard_unpresented(render_backend *b);
+/* UI, safe native SIZE boundary only. Retire the old geometry's snapshot;
+ * ordered immediate-context commands and ResizeBuffers retain GPU lifetimes.
+ * The replacement must be full damage. Never used for ordinary typing. */
+int d3d11_supersede_resize(render_backend *b);
 bool d3d11_native_deferred(const render_backend *b);
 bool d3d11_native_failed(const render_backend *b);
 /* (E) Only an owed frame needs an event-free fallback. Start with the

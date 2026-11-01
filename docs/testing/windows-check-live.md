@@ -17,7 +17,7 @@ builds (G: the configurations in `WIN_LIVE_TESTS` in `mk/win.mk`):
   input, capture theft and `altcode` (native Alt release) also require the live
   desktop.
 - `editor_win_test`: `--modal-turn`, `--modal-close`, `--modal-session`,
-  `--modal-save`, `--modal-clip`, `--modal-draw`; real-loop survival while
+  `--modal-save`, `--modal-clip`, `--modal-draw`, `--resize-live`; real-loop survival while
   typing, work, resize, frame and journal progress, plus save/publication and
   close. The publication case substitutes clipboard APIs and never accesses
   the live clipboard. `--modal-clock` stays hidden-safe because it sends only
@@ -45,3 +45,32 @@ quiet checks. The physical cases below still need a person to exercise them.
 Record the visible result and any untested cases in the worker/coordinator
 report. Printed command-path PASS lines do not certify physical mouse tracking
 or visible D3D11 presentation.
+
+For edit-177r.32, use real text on Spiral's ultrawide display and check both
+the dark and light themes. These Windows cases are **not run** on the final
+worker tree: the revised brief prohibits every Windows executable until the
+coordinator arranges execution with Tobias.
+
+- Drag every edge and corner rapidly, then slowly. Glyph size and position
+  stay fixed during each size transition; the retained frame must never stretch.
+- Grow the window into previously uncovered pixels. The exposed area and the
+  fractional cell margins must use the theme base, without black or white flashes.
+- Maximize, restore, and resize by less than a cell. The drawn surface must
+  follow the client immediately, including while Windows tracks a size loop.
+- Tobias's acceptance is "it should be visually instantaneous". Check the new
+  frame at the next refresh (P: 1000 / 165 Hz = 6.060606 ms). Hidden WARP timing
+  cannot certify that deadline on the RTX 3090.
+- Compare the minimap image and viewport band at startup, after shrinking and
+  growing, maximized, and after a DPI/zoom change. The band uses the Linux
+  fixed-scale model (visible rows times MINIMAP_LINE_PX, clipped to the strip
+  and document). If Tobias still sees the wrong size, capture the window and
+  identify whether he means the band or the map image, with file and zoom.
+
+The ready hidden fixtures are `editor_win_test --resize-sync`,
+`--resize-native-fail`, `--minimap-size` and `--resize-profile`, in release and
+sanitizer builds. They use programmatic size changes and direct modal
+notifications; the real loop prints a live-only SKIP there. Their buffer,
+exact-pixel, background and recovery assertions are **not run** in this worker
+continuation. `--resize-profile` prints QPC stage timings; record `uptime` beside
+the coordinator's eventual run. These checks cannot authenticate a visible DWM
+transition or presentation latency on the RTX 3090.

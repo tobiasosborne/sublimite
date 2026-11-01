@@ -54,6 +54,16 @@ void plat_set_dark(plat *p, bool dark)
     if (FAILED(DwmSetWindowAttribute(s->hwnd, 20, &enabled, sizeof enabled)))
         (void)DwmSetWindowAttribute(s->hwnd, 19, &enabled, sizeof enabled);
 }
+void win32_plat_background(plat *p,uint32_t rgb)
+{ win32_plat *s=win32_private(p); if(ui(s)) s->background=rgb; }
+void win32_plat_on_resize(plat *p,void (*callback)(void *),void *ctx)
+{ win32_plat *s=win32_private(p); if(ui(s)) { s->on_resize=callback; s->resize_ctx=ctx; } }
+void win32_plat_resize_again(plat *p)
+{
+    win32_plat *s=win32_private(p);
+    if(ui(s) && s->on_resize && !s->resize_posted)
+        s->resize_posted=PostMessageW(s->hwnd,WIN32_RESIZE_MESSAGE,0,0)!=0;
+}
 void plat_set_cursor(plat *p, plat_cursor_shape shape)
 {
     win32_plat *s=win32_private(p);
@@ -360,6 +370,14 @@ int win32_plat_limit_client(plat *p,uint32_t width,uint32_t height)
     return SetWindowPos(s->hwnd,NULL,0,0,outer.right-outer.left-client.right+w,
         outer.bottom-outer.top-client.bottom+h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE) ? PLAT_OK : PLAT_ERR_FAIL;
 }
+static void resize_turn(win32_plat *s)
+{
+    if(!s->servicing && !s->callback_depth && s->on_resize) {
+        s->servicing=true; s->callback_depth++;
+        s->on_resize(s->resize_ctx);
+        s->callback_depth--; s->servicing=false;
+    }
+}
 static void resize(win32_plat *s)
 {
     if(s->max_client_width && s->max_client_height &&
@@ -367,7 +385,14 @@ static void resize(win32_plat *s)
     RECT rect;
     if (s->minimized || !GetClientRect(s->hwnd,&rect) || rect.right<=rect.left || rect.bottom<=rect.top) return;
     s->owner->width=(uint32_t)(rect.right-rect.left); s->owner->height=(uint32_t)(rect.bottom-rect.top);
+    /* Deliver SIZE and run its ordinary editor turn before returning to
+     * User32 composition. Synchronous native messages during a callback only
+     * coalesce events; they cannot recursively borrow editor/renderer state. */
+    bool resizing=s->resizing; s->resizing=true;
     (void)push(s,(plat_event){.kind=PLAT_EV_RESIZE,.w=s->owner->width,.h=s->owner->height});
+    if(!resizing) resize_turn(s);
+    s->resizing=resizing;
+    modal_service(s);
 }
 /* ---- drag-and-drop open (edit-cxho.20) ----
  * plat.h promises raw text/uri-list. A Windows path becomes
@@ -584,9 +609,13 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WIN32_OCCLUSION_MESSAGE:
         (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE}); return 0;
+    case WIN32_RESIZE_MESSAGE:
+        s->resize_posted=false; resize_turn(s); return 0;
     case WM_WINDOWPOSCHANGED:
-        (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
-        break; /* DefWindowProc still generates native SIZE/MOVE. */
+        /* Generate SIZE before any expose turn could draw the old geometry. */
+        { LRESULT result=DefWindowProcW(hwnd,msg,wp,lp);
+          if(((WINDOWPOS *)lp)->flags&SWP_NOSIZE) (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
+          return result; }
     case WM_SIZE: {
         bool was_minimized=s->minimized;
         s->minimized = wp == SIZE_MINIMIZED;
@@ -607,7 +636,16 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT paint; (void)BeginPaint(hwnd,&paint); (void)EndPaint(hwnd,&paint);
         (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE,.w=s->owner->width,.h=s->owner->height}); return 0;
     }
-    case WM_ERASEBKGND: return 1;
+    case WM_ERASEBKGND: {
+        RECT rect;
+        if(GetClientRect(hwnd,&rect)) {
+            uint32_t rgb=s->background;
+            COLORREF old=SetDCBrushColor((HDC)wp,RGB((rgb>>16)&255u,(rgb>>8)&255u,rgb&255u));
+            (void)FillRect((HDC)wp,&rect,(HBRUSH)GetStockObject(DC_BRUSH));
+            (void)SetDCBrushColor((HDC)wp,old);
+        }
+        return 1;
+    }
     case WM_NCDESTROY: (void)SetWindowLongPtrW(hwnd,GWLP_USERDATA,0); s->hwnd=NULL; break;
     default: break;
     }
@@ -916,7 +954,7 @@ static bool work_ready(win32_plat *s, const HANDLE *handles, size_t count)
 }
 static void modal_service(win32_plat *s)
 {
-    if (!s->modal_depth || !s->callbacks || s->servicing || s->callback_depth) return;
+    if (!s->modal_depth || !s->callbacks || s->servicing || s->callback_depth || s->resizing) return;
     s->servicing=true;
     flush_text(s);
     const plat_callbacks *cb=s->callbacks;

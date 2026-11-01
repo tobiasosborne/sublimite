@@ -709,6 +709,50 @@ static int minimap_compose_pixels(const char *backend_name)
     free(frame); free(expected); free(rows); editor_close(e);
     puts("edit-d5o compose: minimap pixel rows match independent minimap_pixels reference"); return 0;
 }
+/* Same source and physical resize cases as Windows editor_resize_cases.h.
+ * Full-display startup establishes enough columns before shrinking; Linux
+ * does not use the Windows-only maximum-client reservation extension. */
+static int minimap_resize_linux(void)
+{
+    render_backend backend={0}; T(render_null_backend(&backend)==0);
+    editor_config cfg={.path="src/minimap/minimap.c",
+        .window_width=5120,.window_height=1440,.max_window_width=5120,.max_window_height=1440,
+        .font_dpi=96,.font_points=10,.wrap_mode=-1};
+    editor *e=NULL; T(editor_open(&e,&cfg,&backend)==0 && settle(e)==0 && settle_map(e)==0);
+    const uint32_t sizes[][2]={{3072,1008},{5120,1440},{2561,721},{5119,1439}};
+    for(size_t i=0;i<sizeof sizes/sizeof sizes[0];i++) {
+        plat_event size={.kind=PLAT_EV_RESIZE,.w=sizes[i][0],.h=sizes[i][1]};
+        T(press(e,size)==0 && settle_map(e)==0);
+        const render_pixels *region=&e->grid.region;
+        T(region->width==e->map_cols*e->grid.dims.cell_w && region->stride==region->width);
+        T(region->height==e->v.config.rows*e->grid.dims.cell_h);
+        minimap_input input=editor_map_input(e->buffer); minimap_window window;
+        T(input.index_ready && editor_map_window(e,&input,&window));
+        uint64_t visible=e->v.config.rows<input.lines ? e->v.config.rows : input.lines;
+        uint64_t band=visible*MINIMAP_LINE_PX;
+        T(window.box_height==(band<region->height ? band : region->height));
+        size_t pixels=(size_t)region->width*region->height;
+        uint32_t *expected=malloc(pixels*sizeof *expected),*raster=malloc(pixels*sizeof *raster);
+        minimap_row *rows=calloc(e->map_grid.dims.rows,sizeof *rows); T(expected && raster && rows);
+        minimap reference; T(minimap_init(&reference,rows,e->map_grid.dims.rows)==0);
+        minimap_anchor anchor={.window=window,.first_line=e->v.state.first_line,.first_byte=e->v.state.first_byte};
+        T(minimap_prepare_window(&reference,&input,NULL,&anchor,e->map_grid.dims.rows)==0);
+        minimap_frame frame={.line=window.first_line+window.above,.line_y=window.box_top,
+            .lines=input.lines,.box_top=window.box_top,.box_height=window.box_height,.scale=MINIMAP_LINE_PX};
+        minimap_style colors={e->layout_cfg.bg,e->colors.map_fg,e->layout_cfg.fg,0,false};
+        T(minimap_pixels_window(&reference,expected,pixels,region->width,region->height,region->width,&frame,&colors)==0);
+        render_pixels compact=*region; compact.x=compact.y=0;
+        raster_blit_pixels(&compact,raster,region->width,0,region->height,UINT32_C(0xff000000));
+        for(size_t at=0;at<pixels;at++) {
+            T(region->pixels[at]==expected[at]); T(raster[at]==(expected[at]|UINT32_C(0xff000000)));
+        }
+        printf("resize minimap Linux: client=%ux%u region=%ux%u band=%u visible=%llu total=%llu exact PASS\n",
+            sizes[i][0],sizes[i][1],region->width,region->height,window.box_height,
+            (unsigned long long)visible,(unsigned long long)input.lines);
+        minimap_fini(&reference); free(rows); free(raster); free(expected);
+    }
+    editor_close(e); return 0;
+}
 static int minimap_compose_cost(void)
 {
     /* Stamp buffers follow bench/editor_bench.c's existing power stamp. */
@@ -7708,6 +7752,7 @@ static const test_selector selectors[] = {
     {"--m15-follow", find_follow_before_top_contract},
     {"--dr3-gutter", gutter_line_contract},
     {"--minimap-cost", minimap_compose_cost},
+    {"--resize-minimap", minimap_resize_linux},
     {"--cxho10-track", minimap_track_all},
     {"--minimap-grab-inside", select_minimap_grab_inside},
     {"--minimap-grab-outside", select_minimap_grab_outside},
@@ -7826,6 +7871,7 @@ static int editor_part_3(void)
     T(g02_find_previous_uncached() == 0);
     T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);
+    T(minimap_resize_linux() == 0);
     T(minimap_track_all() == 0);
     T(minimap_text_columns() == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);

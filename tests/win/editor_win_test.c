@@ -123,12 +123,13 @@ static BOOL cut_open(HWND window)
 #include <d3d11.h>
 #include <dwmapi.h>
 static bool fail_native_alloc;
+static bool resize_software;
 static HRESULT WINAPI allocation_device(IDXGIAdapter *adapter,D3D_DRIVER_TYPE type,HMODULE module,
     UINT flags,const D3D_FEATURE_LEVEL *levels,UINT count,UINT sdk,ID3D11Device **device,
     D3D_FEATURE_LEVEL *level,ID3D11DeviceContext **context)
 {
     if(fail_native_alloc) return E_OUTOFMEMORY;
-    return D3D11CreateDevice(adapter,type,module,flags,levels,count,sdk,device,level,context);
+    return D3D11CreateDevice(adapter,resize_software ? D3D_DRIVER_TYPE_WARP : type,module,flags,levels,count,sdk,device,level,context);
 }
 /* A non-interactive station refuses visible windows. Only this renderer
  * seam exercises an undrawn visible-surface latency wait and offscreen draw;
@@ -1528,6 +1529,7 @@ static int wsl_test(editor *e,const char *root,const char *mode)
     T(tabs_active(&e->tabs)->modified && !journal_get_stats(e->journal).error);
     printf("wsl: %s detects external identity before using the private copy PASS\n",mode); return 0;
 }
+#include "editor_resize_cases.h"
 int main(int argc, char **argv)
 {
     setvbuf(stdout,NULL,_IONBF,0);
@@ -1538,7 +1540,7 @@ int main(int argc, char **argv)
         T(test_isolation_query()==TEST_ISOLATION_LIVE);
         /* --modal-clip uses synthetic_publication: no native clipboard access. */
         const char *modes[]={"--modal-turn","--modal-close","--modal-session",
-            "--modal-save","--modal-clip","--modal-draw"};
+            "--modal-save","--modal-clip","--modal-draw","--resize-live"};
         for(size_t at=0;at<sizeof modes/sizeof modes[0];at++) T(run_child_case(modes[at],NULL,0)==0);
         return 0;
     }
@@ -1567,14 +1569,30 @@ int main(int argc, char **argv)
         cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
         memset(large,'a',cfg.initial_len); large[cfg.initial_len-1u]='\n'; cfg.initial=large;
     }
-    if(argc==2 && (!strcmp(argv[1],"--maximum") || !strcmp(argv[1],"--font-small"))) {
+    bool resize_case=argc==2 && (!strcmp(argv[1],"--resize-profile") ||
+        !strcmp(argv[1],"--resize-sync") || !strcmp(argv[1],"--resize-live") ||
+        !strcmp(argv[1],"--resize-native-fail") || !strcmp(argv[1],"--minimap-size"));
+    if(resize_case) {
+        resize_software=true;
+        /* Real source text; shared fixture, read without modifying the repo. */
+        FILE *fixture=fopen("src/minimap/minimap.c","rb"); T(fixture);
+        T(!fseek(fixture,0,SEEK_END)); long bytes=ftell(fixture); T(bytes>0);
+        T(!fseek(fixture,0,SEEK_SET)); large=malloc((size_t)bytes); T(large);
+        T(fread(large,1,(size_t)bytes,fixture)==(size_t)bytes); T(!fclose(fixture));
+        T(os_file_open(&named,named_path,OS_OPEN_WRITE|OS_OPEN_TRUNC)==OS_OK);
+        T(os_file_write(&named,large,(size_t)bytes,&wrote)==OS_OK && wrote==(size_t)bytes);
+        os_file_close(&named); cfg.path=named_path; cfg.initial=NULL; cfg.initial_len=0; cfg.wrap_mode=-1;
+    }
+    if(resize_case || (argc==2 && (!strcmp(argv[1],"--maximum") || !strcmp(argv[1],"--font-small")))) {
         /* (P) Tobias's display from brief; reserve versus 60% startup width. */
         cfg.max_window_width=5120; cfg.max_window_height=1440;
         cfg.window_width=5120u*60u/100u; cfg.window_height=1440u*70u/100u;
         cfg.font_points=10;
     }
     printf("editor_win: opening mode=%s\n",argc>1 ? argv[1] : "full");
-    editor *e=NULL; T(editor_open(&e,&cfg,&b)==0);
+    editor *e=NULL; int open_rc=editor_open(&e,&cfg,&b);
+    if(open_rc) fprintf(stderr,"editor_open rc=%d native=%lu\n",open_rc,GetLastError());
+    T(open_rc==0);
     puts("editor_win: opened");
     HWND window=plat_native_win32(&e->platform);
     if(argc==3) {
@@ -1613,7 +1631,8 @@ int main(int argc, char **argv)
             win32_plat *native=win32_private(&e->platform);
             native->power_off=native->session_locked=native->session_disconnected=native->minimized=false;
         }
-        int rc=!strncmp(argv[1],"--wsl-",6) ? wsl_test(e,root,argv[1]) :
+        int rc=resize_case ? resize_cases(e,argv[1]) :
+            !strncmp(argv[1],"--wsl-",6) ? wsl_test(e,root,argv[1]) :
             !strcmp(argv[1],"--notify-size") ? notification_editor_test(e,false,WM_NULL) :
             !strcmp(argv[1],"--notify-menu") ? notification_editor_test(e,true,WM_NULL) :
             !strcmp(argv[1],"--notify-close") ? notification_editor_test(e,false,WM_CLOSE) :
