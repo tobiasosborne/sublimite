@@ -44,6 +44,9 @@ typedef struct win32_plat {
     uint32_t head, tail, dropped;
     uint8_t *clip_data;
     size_t clip_len;
+    uint8_t *drop_data; /* text/uri-list of the last completed drop (edit-cxho.20) */
+    size_t drop_len;
+    bool tracking; /* TME_LEAVE armed (edit-osn3) */
     win32_clip *clip;
     SRWLOCK present_lock;
     win32_present presents[WIN32_EVENT_CAP];

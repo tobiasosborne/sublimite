@@ -26,10 +26,26 @@ static int hex_digit(uint8_t c)
     return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
 }
 
+#if defined(_WIN32)
+/* Windows (edit-cxho.20): file:///C:/a/b is C:\a\b and file://host/share/f is
+ * the UNC path \\host\share\f. Native results use backslashes. Linux keeps the
+ * POSIX rules; foreign hosts are rejected there. */
+static bool drive_form(const uint8_t *p, size_t n)
+{
+    return n >= 3u && p[0] == '/' && ((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z')) &&
+           p[2] == ':' && (n == 3u || p[3] == '/');
+}
+#endif
+
 static bool decode_path(const uint8_t *line, size_t size, const char *hostname,
                         char path[IPC_PATH_CAP], size_t *length)
 {
     bool uri = line[0] != '/'; /* Caller supplies a nonempty entry. */
+#if defined(_WIN32)
+    bool unc = false;
+    const uint8_t *authority_bytes = NULL;
+    size_t authority_len = 0;
+#endif
     if (uri) {
         const size_t prefix = sizeof "file://" - 1u;
         if (size < prefix || !ascii_equal(line, prefix, "file://")) return false;
@@ -37,12 +53,35 @@ static bool decode_path(const uint8_t *line, size_t size, const char *hostname,
         if (!slash) return false;
         size_t authority = (size_t)(slash - (line + prefix));
         if (authority && !ascii_equal(line + prefix, authority, "localhost") &&
-            !ascii_equal(line + prefix, authority, hostname)) return false;
+            !ascii_equal(line + prefix, authority, hostname)) {
+#if defined(_WIN32)
+            /* Any other authority is a UNC server; it must be a plain host name. */
+            for (size_t k = 0; k < authority; k++) {
+                uint8_t c = line[prefix + k];
+                if (c == '@' || c == ':' || c == '[' || c == ']' || c == '\\' || c == '?' || c == '#') return false;
+            }
+            unc = true;
+            authority_bytes = line + prefix;
+            authority_len = authority;
+#else
+            return false;
+#endif
+        }
         size -= (size_t)(slash - line);
         line = slash;
     }
 
     size_t used = 0;
+#if defined(_WIN32)
+    /* Authority bytes decode with the same escapes, after a leading "\\". */
+    const uint8_t *seq_line = line; size_t seq_size = size;
+    for (int pass = unc ? 0 : 1; pass < 2; pass++) {
+        if (pass == 0) {
+            if (IPC_PATH_CAP < 3u) return false;
+            path[used++] = '/'; path[used++] = '/';
+            line = authority_bytes; size = authority_len;
+        } else { line = seq_line; size = seq_size; }
+#endif
     for (size_t i = 0; i < size;) {
         uint8_t byte = line[i++];
         if (byte == '\r' || (uri && (byte == '?' || byte == '#'))) return false;
@@ -57,6 +96,15 @@ static bool decode_path(const uint8_t *line, size_t size, const char *hostname,
         if (!byte || used == IPC_PATH_CAP - 1u) return false;
         path[used++] = (char)byte;
     }
+#if defined(_WIN32)
+    }
+    if (uri) {
+        size_t start = 0;
+        if (!unc && drive_form((const uint8_t *)path, used)) start = 1u; /* "/C:/x" -> "C:/x" */
+        if (start) { memmove(path, path + start, used - start); used -= start; }
+        for (size_t i = 0; i < used; i++) if (path[i] == '/') path[i] = '\\';
+    }
+#endif
     for (size_t i = 0; i < used;) {
         utf8_step unit = utf8_decode((const uint8_t *)path + i, used - i);
         if (!unit.valid) return false;

@@ -2,6 +2,7 @@
 #if defined(_WIN32)
 #include "private.h"
 #include <windowsx.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -292,7 +293,14 @@ static void pointer(win32_plat *s, UINT msg, WPARAM wp, LPARAM lp)
         int32_t scaled=delta*PLAT_WHEEL_UNIT+*rest, units=scaled/WHEEL_DELTA;
         *rest=scaled%WHEEL_DELTA;
         if (msg==WM_MOUSEWHEEL) ev.dy=-units; else ev.dx=units;
-    } else if (msg==WM_MOUSEMOVE) ev.kind=PLAT_EV_MOTION;
+    } else if (msg==WM_MOUSEMOVE) {
+        ev.kind=PLAT_EV_MOTION;
+        /* TME_LEAVE is one-shot: re-arm after each WM_MOUSELEAVE (edit-osn3). */
+        if (!s->tracking) {
+            TRACKMOUSEEVENT track={sizeof track,TME_LEAVE,s->hwnd,0};
+            s->tracking=TrackMouseEvent(&track)!=0;
+        }
+    }
     else {
         ev.kind=PLAT_EV_BUTTON;
         ev.press=msg==WM_LBUTTONDOWN || msg==WM_MBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_XBUTTONDOWN;
@@ -327,6 +335,98 @@ static void resize(win32_plat *s)
     if (!GetClientRect(s->hwnd,&rect)) return;
     s->owner->width=(uint32_t)(rect.right-rect.left); s->owner->height=(uint32_t)(rect.bottom-rect.top);
     (void)push(s,(plat_event){.kind=PLAT_EV_RESIZE,.w=s->owner->width,.h=s->owner->height});
+}
+/* ---- drag-and-drop open (edit-cxho.20) ----
+ * plat.h promises raw text/uri-list. A Windows path becomes
+ *   C:\Users\x y\u.txt  -> file:///C:/Users/x%20y/%C3%BC.txt
+ *   \\host\share\f      -> file://host/share/f
+ * and src/dnd (under _WIN32) maps those back to the native backslash path. */
+static bool uri_plain(uint8_t c)
+{ return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='.'||c=='_'||c=='~'; }
+/* Appends src[0..n) percent-encoded ('\' becomes '/'); returns the new length, 0 on overflow. */
+static size_t uri_encode(char *out, size_t at, size_t cap, const uint8_t *src, size_t n)
+{
+    static const char hex[]="0123456789ABCDEF";
+    for (size_t i=0;i<n;i++) {
+        uint8_t c=src[i];
+        if (uri_plain(c) || c=='/' || c=='\\') {
+            if (at+1>cap) return 0;
+            out[at++]=c=='\\' ? '/' : (char)c;
+        } else {
+            if (at+3>cap) return 0;
+            out[at++]='%'; out[at++]=hex[c>>4]; out[at++]=hex[c&15u];
+        }
+    }
+    return at;
+}
+/* One CRLF-terminated URI line for a UTF-16 path, malloc'd; NULL when the
+ * path is not absolute or not valid UTF-16. */
+static char *drop_uri_line(const WCHAR *path, size_t *line_len)
+{
+    int n=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,path,-1,NULL,0,NULL,NULL);
+    if (n<=1) return NULL;
+    uint8_t *u=malloc((size_t)n); if (!u) return NULL;
+    if (!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,path,-1,(char *)u,n,NULL,NULL)) { free(u); return NULL; }
+    size_t len=(size_t)n-1, skip=0; bool unc=false;
+    if (len>=4 && !memcmp(u,"\\\\?\\",4)) {                       /* \\?\ verbatim prefix */
+        if (len>=8 && !memcmp(u+4,"UNC\\",4)) { skip=8; unc=true; } /* \\?\UNC\h -> h */
+        else skip=4;
+    } else if (len>=2 && u[0]=='\\' && u[1]=='\\') { skip=2; unc=true; }
+    const uint8_t *p=u+skip; size_t pl=len-skip;
+    bool drive=!unc && pl>=3 && ((p[0]>='A'&&p[0]<='Z')||(p[0]>='a'&&p[0]<='z')) && p[1]==':' && (p[2]=='\\'||p[2]=='/');
+    if (!drive && !(unc && pl>=3 && p[0]!='\\')) { free(u); return NULL; }
+    size_t cap=pl*3+16; char *out=malloc(cap); if (!out) { free(u); return NULL; }
+    size_t at;
+    if (drive) {
+        memcpy(out,"file:///",8); at=8; out[at++]=(char)p[0]; out[at++]=':';
+        at=uri_encode(out,at,cap-2,p+2,pl-2);
+    } else {
+        memcpy(out,"file://",7);
+        at=uri_encode(out,7,cap-2,p,pl);
+    }
+    free(u);
+    if (!at) { free(out); return NULL; }
+    out[at++]='\r'; out[at++]='\n'; *line_len=at; return out;
+}
+static void drop(win32_plat *s, HDROP h)
+{
+    POINT pt={0,0}; (void)DragQueryPoint(h,&pt);
+    UINT count=DragQueryFileW(h,0xFFFFFFFFu,NULL,0);
+    uint8_t *buf=NULL; size_t len=0, cap=0; bool oom=false;
+    for (UINT i=0;i<count && !oom;i++) {
+        UINT w=DragQueryFileW(h,i,NULL,0); if (!w) continue;
+        WCHAR *path=malloc(((size_t)w+1u)*sizeof *path); if (!path) { oom=true; break; }
+        size_t line_len=0; char *line=NULL;
+        if (DragQueryFileW(h,i,path,w+1u)==w) line=drop_uri_line(path,&line_len);
+        free(path);
+        if (!line) continue; /* unrepresentable entry: skipped, the rest still arrive */
+        if (len+line_len>cap) {
+            size_t ncap=cap ? cap*2 : 1024; while (ncap<len+line_len) ncap*=2;
+            uint8_t *grown=realloc(buf,ncap);
+            if (!grown) { oom=true; free(line); break; }
+            buf=grown; cap=ncap;
+        }
+        memcpy(buf+len,line,line_len); len+=line_len; free(line);
+    }
+    DragFinish(h);
+    if (oom || !len) { free(buf); return; } /* keep the previous drop; no event */
+    free(s->drop_data); s->drop_data=buf; s->drop_len=len;
+    (void)push(s,(plat_event){.kind=PLAT_EV_DROP,.x=pt.x,.y=pt.y,.time_ms=(uint32_t)GetMessageTime(),.t0_ns=stamp()});
+}
+/* Elevated process only: Explorer (medium integrity) drags are blocked by UIPI
+ * unless the drop messages are allowed through (docs/decisions/edit-cxho.20.md). */
+#define WIN32_WM_COPYGLOBALDATA 0x0049u /* (P) undocumented id Explorer's drag sends with WM_DROPFILES */
+static void drop_accept(win32_plat *s)
+{
+    DragAcceptFiles(s->hwnd,TRUE);
+    HANDLE token; TOKEN_ELEVATION el; DWORD n;
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) return;
+    bool elevated=GetTokenInformation(token,TokenElevation,&el,sizeof el,&n) && el.TokenIsElevated;
+    (void)CloseHandle(token);
+    if (!elevated) return;
+    static const UINT msgs[]={WM_DROPFILES,WIN32_WM_COPYGLOBALDATA,WM_COPYDATA};
+    for (size_t i=0;i<sizeof msgs/sizeof msgs[0];i++)
+        (void)ChangeWindowMessageFilterEx(s->hwnd,msgs[i],MSGFLT_ALLOW,NULL);
 }
 static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -392,6 +492,12 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: case WM_XBUTTONDOWN:
     case WM_LBUTTONUP: case WM_MBUTTONUP: case WM_RBUTTONUP: case WM_XBUTTONUP:
         pointer(s,msg,wp,lp); return msg==WM_XBUTTONDOWN || msg==WM_XBUTTONUP ? TRUE : 0;
+    case WM_MOUSELEAVE:
+        s->tracking=false;
+        (void)push(s,(plat_event){.kind=PLAT_EV_LEAVE,.x=s->pointer_x,.y=s->pointer_y,
+            .time_ms=(uint32_t)GetMessageTime(),.t0_ns=stamp()});
+        return 0;
+    case WM_DROPFILES: drop(s,(HDROP)wp); return 0;
     case WM_CAPTURECHANGED: capture_cancel(s); return 0;
     case WM_CANCELMODE:
         capture_cancel(s);
@@ -502,6 +608,7 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     free(title); if (!hwnd) goto fail;
     s->dpi=GetDpiForWindow(hwnd); s->layout_altgr=layout_altgr();
     if (win32_clip_init(s)!=PLAT_OK) goto fail;
+    drop_accept(s);
     return PLAT_OK;
 fail:
     plat_shutdown(p); return PLAT_ERR_FAIL;
@@ -524,7 +631,7 @@ void plat_shutdown(plat *p)
     if (s->blink_timer) (void)CloseHandle(s->blink_timer);
     if (s->repeat_timer) (void)CloseHandle(s->repeat_timer);
     if (s->present_wake) (void)CloseHandle(s->present_wake);
-    free(s->clip_data); free(s); memset(p,0,sizeof *p);
+    free(s->clip_data); free(s->drop_data); free(s); memset(p,0,sizeof *p);
 }
 
 int plat_clip_set(plat *p, int which, const void *utf8, size_t len)
@@ -543,9 +650,11 @@ int plat_clip_request(plat *p, int which)
     if (!ui(s) || (which!=PLAT_CLIP_PRIMARY && which!=PLAT_CLIP_CLIPBOARD)) return PLAT_ERR_FAIL;
     return win32_clip_submit(s,false,which,NULL,0);
 }
-/* Win32 drop implementation follows in edit-cxho.20. */
 const uint8_t *plat_drop_data(const plat *p, size_t *len)
-{ (void)p; if (len) *len = 0; return NULL; }
+{
+    win32_plat *s=win32_private(p); if (len) *len=s ? s->drop_len : 0;
+    return s ? s->drop_data : NULL;
+}
 
 const uint8_t *plat_clip_data(const plat *p, size_t *len)
 {
