@@ -83,6 +83,14 @@ $(WIN_B)/rel/tests/wsl_share_probe.exe: tests/win/wsl_share_probe.c tests/win/te
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
 
+# Explicit acceptance fixture, never part of all/check (no WSL dependency there).
+.PHONY: win-wsl-share-degraded
+win-wsl-share-degraded: $(WIN_B)/rel/tests/wsl_share_degraded.exe $(WIN_QUIET)
+	python3 tests/win/wsl_share_degraded.py
+$(WIN_B)/rel/tests/wsl_share_degraded.exe: tests/win/wsl_share_degraded.c tests/win/wsl_share_probe.c tests/win/test_isolation.h src/os/os_win.c $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+
 # W2.4b: filesystem units only; editor linking follows in W2.4d.
 .PHONY: win-editor-fs
 win-editor-fs: $(addprefix $(WIN_B)/rel/src/editor/,$(addsuffix .o,recovery restore runtime retain session))
@@ -337,3 +345,5 @@ $(WIN_B)/rel/tests/editor_console_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_REL)
 $(WIN_B)/san/tests/editor_console_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_SAN)
 $(WIN_B)/rel/tests/editor_console_test.exe: $(WIN_EDITOR_REL)
 $(WIN_B)/san/tests/editor_console_test.exe: $(WIN_EDITOR_SAN)
+# Provider-policy tables participate in both native file builds.
+$(WIN_B)/rel/tests/file_win_test.exe $(WIN_B)/san/tests/file_win_test.exe: tests/win/wsl_classifier_cases.inc tests/win/wsl_degraded_cases.inc

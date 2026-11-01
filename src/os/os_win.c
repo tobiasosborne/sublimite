@@ -1188,6 +1188,21 @@ void os_dir_iter_close(os_dir_iter *it)
 
 /* ---- paths and well-known directories ---------------------------------- */
 static bool is_sep(char c) { return c == '\\' || c == '/'; }
+bool os_path_is_wsl(const char *path)
+{
+    if (!path || !is_sep(path[0]) || !is_sep(path[1])) return false;
+    const char *server = path + 2;
+    if ((server[0] == '?' || server[0] == '.') && is_sep(server[1])) {
+        server += 2;
+        if (_strnicmp(server, "UNC", 3) || !is_sep(server[3])) return false;
+        server += 4;
+    }
+    const char *end = server;
+    while (*end && !is_sep(*end)) end++;
+    size_t n = (size_t)(end - server);
+    return (n == sizeof "wsl.localhost" - 1 && !_strnicmp(server, "wsl.localhost", n)) ||
+           (n == sizeof "wsl$" - 1 && !_strnicmp(server, "wsl$", n));
+}
 bool os_path_is_absolute(const char *path)
 {
     if (!path || !path[0]) return false;

@@ -317,6 +317,17 @@ static void prefix_job(work_ctx *c)
     if (st.size > SIZE_MAX) { en = file_native_error(OS_E_RANGE); rc = FILE_ERR_IO; goto done; }
     file_id_from_stat(&f->prefix_result.id, &st);
     uint64_t threshold = f->threshold ? f->threshold : file_default_copy_threshold();
+#if defined(_WIN32)
+    /* WSL views can stay stale through Linux writes/truncate/replace without
+     * a fault. Never map them. Bound the single private allocation by the
+     * existing RAM-aware copy policy, regardless of a map-selection override. */
+    if (os_path_is_wsl(f->requested_path) || os_path_is_wsl(f->prefix_result.path)) {
+        if (st.size > file_default_copy_threshold()) {
+            en = file_native_error(OS_E_RANGE); rc = FILE_ERR_NOMEM; goto done;
+        }
+        f->prefix_result.mode = FILE_MODE_COPY;
+    } else
+#endif
     f->prefix_result.mode = ((uint64_t)st.size < threshold || st.size == 0)
                            ? FILE_MODE_COPY : FILE_MODE_MMAP;
     rc = acquisition_validate(&fd, f->prefix_result.path, &f->prefix_result.id, &en);
@@ -928,6 +939,11 @@ static int transaction_prepare(save_transaction *tx)
     int mid_fired = 0;
     a->written = 0; a->err_no = 0; tx->done = 0;
     tx->fd = (os_file)OS_FILE_INIT; tx->dfd = (os_dir)OS_DIR_INIT; tx->metadata_fd = (os_file)OS_FILE_INIT; tx->tmp[0] = '\0';
+#if defined(_WIN32)
+    /* Neither metadata preservation nor safe replacement is available through
+     * this provider. Refuse existing/missing/stream targets before any I/O. */
+    if (os_path_is_wsl(a->path)) { a->err_no = file_native_error(OS_E_NOTSUP); return FILE_ERR_UNSUPPORTED; }
+#endif
     if (a->stop && a->stop(a->stop_ctx)) return FILE_ERR_CANCELLED;
     file_split_path(a->path, dir, sizeof dir, tx->base, sizeof tx->base);
     if (os_dir_open(&tx->dfd, dir) != OS_OK) { a->err_no = os_native_error(); return FILE_ERR_IO; }
@@ -1193,6 +1209,9 @@ void file_set_step_hook(file *f, void (*step)(void *, int), void *ctx)
 int file_save_begin(file *f, piece_tree *t, unsigned flags, uint32_t generation)
 {
     piece_snapshot *s;
+#if defined(_WIN32)
+    if (os_path_is_wsl(f->path)) { f->err_no = file_native_error(OS_E_NOTSUP); return FILE_ERR_UNSUPPORTED; }
+#endif
     if (file_save_busy(f)) return FILE_ERR_BUSY;
     if (!file_open_ready(f) || !f->attached) return FILE_ERR_STATE;
     if (!(flags & FILE_SAVE_FORCE)) {

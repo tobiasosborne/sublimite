@@ -3269,7 +3269,24 @@ static int zizz_all(void)
     int w = zizz_rewritten(), p = zizz_paint();
     return a || b || c || d || v || w || p;
 }
+/* Render the exact refusal text without needing a WSL mount or live desktop. */
+static int wsl_save_notice(void)
+{
+    fixture f; T(open_fixture(&f, false, false) == 0);
+    render_grid prior = f.e->grid;
+    render_cell cells[sizeof FILE_WSL_SAVE_NOTICE] = {0}; uint64_t dirty = 0;
+    render_dims dims = {(uint32_t)strlen(FILE_WSL_SAVE_NOTICE), 1, 1, 1};
+    T(render_grid_init(&f.e->grid, dims, cells, sizeof cells / sizeof cells[0], &dirty, 1) == 0);
+    T(render_frame_begin(&f.e->grid, 1) == 0);
+    f.e->buffer->save_error = FILE_ERR_UNSUPPORTED;
+    editor_save_overlay(f.e);
+    uint32_t row = f.e->grid.dims.rows - 1;
+    for (size_t i = 0; i < strlen(FILE_WSL_SAVE_NOTICE); i++)
+        T(f.e->grid.cells[(size_t)row * f.e->grid.dims.cols + i].glyph_index == (uint8_t)FILE_WSL_SAVE_NOTICE[i]);
+    f.e->grid = prior; close_fixture(&f); return 0;
+}
 static const test_selector selectors[] = {
+    {"--wsl-save-notice", wsl_save_notice},
     {"--edit-duuw", duuw_all},
     {"--edit-duuw-gated", duuw_gated},
     {"--edit-duuw-save-as", duuw_save_as_queue},
@@ -3296,6 +3313,7 @@ int main(int argc, char **argv)
     /* (P) executable plus its selector: argc is two; argv skips the executable. */
     test_select_fn selected = TEST_SELECT(selectors, argc == 2 ? argv[1] : NULL);
     if (selected) return selected();
+    T(wsl_save_notice() == 0);
     T(pending_open_save(false) == 0); T(pending_open_save(true) == 0);
     T(duuw_all() == 0);
     T(ivv_all() == 0);

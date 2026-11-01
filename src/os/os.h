@@ -610,6 +610,11 @@ int   os_dir_fd(const os_dir *d);       /* platform code only */
  * "\\server\share" (including \\wsl.localhost\...). Every path entry also
  * accepts a relative path, resolved against the current directory. */
 bool   os_path_is_absolute(const char *path);
+#if defined(_WIN32)
+/* Exact WSL UNC server classification, including extended UNC and slash forms.
+ * CPU-only; preserves the spelling and makes no generic network-drive guess. */
+bool   os_path_is_wsl(const char *path);
+#endif
 /* Absolute path with links resolved (realpath / GetFinalPathNameByHandleW
  * without the \\?\ prefix). OS_E_RANGE if cap is too small. */
 os_err os_path_canonical(const char *path, char *out, size_t cap);

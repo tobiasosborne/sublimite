@@ -12,6 +12,8 @@ NTSYSAPI NTSTATUS NTAPI NtSetSecurityObject(HANDLE, SECURITY_INFORMATION, PSECUR
 #include <string.h>
 
 static struct {
+    int wsl, wsl_oversize, directory_opens, rename_calls;
+    DWORD arm_error, rename_error, open_error;
     int no_write_owner, encrypted, fail_security, unprotect;
     int created, checked;
     HANDLE writer;
@@ -127,6 +129,7 @@ static os_err r2_stat(const os_file *f, os_stat *st)
     if (os_file_handle(f) == r2.stream_source && r2_stream_hit()) return OS_E_ACCESS;
     os_err e = os_file_stat(f, st);
     if (e == OS_OK && r2.delay_close && !r2.closed) st->mtime_ns = 1;
+    if (e == OS_OK && r2.wsl_oversize) st->size = file_default_copy_threshold() + 1;
     return e;
 }
 static __attribute__((unused)) NTSTATUS NTAPI r2_nt_create(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io,
@@ -225,9 +228,28 @@ static BOOL WINAPI r2_read_directory(HANDLE h, LPVOID p, DWORD n, BOOL subtree, 
         os_file_close(&file);
         (void)WaitForSingleObject(r2.wake_event, 5000);
     }
+    if (r2.arm_error) { SetLastError(r2.arm_error); return FALSE; }
     if (r2.fail_arm) { r2.fail_arm = 0; SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
     return ReadDirectoryChangesW(h, p, n, subtree, filter, got, io, done);
 }
+static __attribute__((unused)) bool r2_is_wsl(const char *path) { return r2.wsl || os_path_is_wsl(path); }
+static os_err r2_open(os_file *out, const char *path, unsigned flags)
+{
+    if (r2.open_error) { SetLastError(r2.open_error); return OS_E_IO; }
+    return os_file_open(out, path, flags);
+}
+static os_err r2_dir_open(os_dir *out, const char *path)
+{ r2.directory_opens++; return os_dir_open(out, path); }
+static os_err r2_rename_at(const os_dir *a, const char *from, const os_dir *b, const char *to, unsigned flags)
+{
+    r2.rename_calls++;
+    if (r2.rename_error) { SetLastError(r2.rename_error); return OS_E_INVAL; }
+    return os_rename_at(a, from, b, to, flags);
+}
+#define os_path_is_wsl r2_is_wsl
+#define os_file_open r2_open
+#define os_dir_open r2_dir_open
+#define os_rename_at r2_rename_at
 #define os_file_pwrite_once r2_pwrite
 #define os_file_pread r2_pread
 #define os_file_sync r2_sync
@@ -251,6 +273,10 @@ static BOOL WINAPI r2_read_directory(HANDLE h, LPVOID p, DWORD n, BOOL subtree, 
 #define malloc r2_malloc
 #include FILE_R2_WIN_SOURCE
 #undef malloc
+#undef os_path_is_wsl
+#undef os_file_open
+#undef os_dir_open
+#undef os_rename_at
 #undef os_file_pwrite_once
 #undef os_file_pread
 #undef os_file_sync
@@ -269,6 +295,8 @@ static BOOL WINAPI r2_read_directory(HANDLE h, LPVOID p, DWORD n, BOOL subtree, 
 #define main file_original_main
 #include "../file_win_cases.inc"
 #undef main
+
+#include "wsl_classifier_cases.inc"
 
 static void r2_wide(const char *s, WCHAR *out)
 { CHECK(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, out, OS_PATH_MAX)); }
@@ -383,6 +411,7 @@ static void r2_stream_unsupported(void)
         {(NTSTATUS)0xc000000du, "STATUS_INVALID_PARAMETER", true},
         {(NTSTATUS)0xc0000002u, "STATUS_NOT_IMPLEMENTED", true},
         {(NTSTATUS)0xc0000003u, "STATUS_INVALID_INFO_CLASS", true},
+        {(NTSTATUS)0xc00000bbu, "STATUS_NOT_SUPPORTED", true},
         {(NTSTATUS)0xc0000022u, "STATUS_ACCESS_DENIED", false},
         {(NTSTATUS)0xc0000185u, "STATUS_IO_DEVICE_ERROR", false},
     };
@@ -737,13 +766,15 @@ static void r2_cleanup(const char *directory)
     }
     os_dir_iter_close(&it); os_dir_close(&dir); CHECK(os_rmdir(directory) == OS_OK);
 }
+#include "wsl_degraded_cases.inc"
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "--child-stream-copy")) {
         r2.stream_mode = 6; return r2_save(argv[2], NULL);
     }
     if (argc == 1) {
-        const char *cases[] = {"security", "efs", "streams", "stream-unsupported", "stream-default", "stream-failures", "stream-crash", "stream-many", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
+        const char *cases[] = {"wsl-classifier", "wsl-degraded", "security", "efs", "streams", "stream-unsupported", "stream-default", "stream-failures", "stream-crash", "stream-many", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
         char exe[OS_PATH_MAX]; CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             const char *args[] = {exe, cases[i], NULL}; os_proc child; os_proc_status status;
@@ -758,7 +789,9 @@ int main(int argc, char **argv)
     CHECK(snprintf(root, sizeof root, "%s/sublimite-test-file-r2-%llu-%llu", temp,
           (unsigned long long)os_proc_id(), (unsigned long long)os_wall_ns()) > 0);
     CHECK(os_mkdir(root) == OS_OK); trace_init(); CHECK(work_pool_init(&pool, 1, 1) == 0);
-    if (!strcmp(argv[1], "security")) r2_security();
+    if (!strcmp(argv[1], "wsl-classifier")) wsl_classifier_cases();
+    else if (!strcmp(argv[1], "wsl-degraded")) wsl_degraded_cases();
+    else if (!strcmp(argv[1], "security")) r2_security();
     else if (!strcmp(argv[1], "efs")) r2_efs();
     else if (!strcmp(argv[1], "streams")) r2_streams();
     else if (!strcmp(argv[1], "stream-unsupported")) r2_stream_unsupported();

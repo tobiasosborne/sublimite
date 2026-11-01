@@ -172,9 +172,16 @@ int file_watch_start(file *f)
     int wd = watch_parent(dir);
     f->watch_refresh = wd < 0;
     if (wd < 0) {
+        DWORD error = GetLastError();
         int old = f->iwd; f->iwd = -1;
         if (old >= 0) { f->check_requested = 1; watch_release(f, old); }
-        return -1;
+        if (error == ERROR_INVALID_FUNCTION && os_path_is_wsl(f->path)) {
+            /* No registration and no timer: focus/save/bulk checks remain
+             * authoritative. Distinguish this capability from setup errors. */
+            f->watch_refresh = 0;
+            SetLastError(ERROR_SUCCESS); return FILE_WATCH_UNSUPPORTED;
+        }
+        return watch_error(error);
     }
     if (f->iwd != wd) {
         if (f->iwd >= 0) f->check_requested = 1;
@@ -260,7 +267,11 @@ void file_watch_dispatch(void)
 }
 int file_watch_poll(file *f)
 {
-    file_watch_dispatch(); file_watch_check_pump(f); return file_changed(f);
+    file_watch_dispatch();
+    /* Explicit focus/bulk polling must work without a notification member.
+     * Coalesce through the existing worker/mailbox path; no focused timer. */
+    if (f->iwd < 0 && os_path_is_wsl(f->path) && !file_changed(f)) f->check_requested = 1;
+    file_watch_check_pump(f); return file_changed(f);
 }
 int file_watch_path_start(file_path_watch *member, const char *path)
 {
@@ -273,10 +284,14 @@ int file_watch_path_start(file_path_watch *member, const char *path)
     if (!*name) return watch_error(ERROR_INVALID_NAME);
     int wd = watch_parent(dir);
     if (wd < 0) {
+        DWORD error = GetLastError();
         if (member->registered && member->wd >= 0) {
             int old = member->wd; member->wd = -1; member->pending = true; watch_release(NULL, old);
         }
-        return -1;
+        if (error == ERROR_INVALID_FUNCTION && os_path_is_wsl(path)) {
+            SetLastError(ERROR_SUCCESS); return FILE_WATCH_UNSUPPORTED;
+        }
+        return watch_error(error);
     }
     int old = member->registered ? member->wd : -1;
     member->wd = wd; member->path = path;
@@ -311,7 +326,8 @@ bool file_watch_path_take(file_path_watch *member)
 int file_native_error(os_err error)
 {
     DWORD native = error == OS_E_NAMETOOLONG ? ERROR_FILENAME_EXCED_RANGE
-                 : error == OS_E_RANGE ? ERROR_FILE_TOO_LARGE : ERROR_WRITE_FAULT;
+                 : error == OS_E_RANGE ? ERROR_FILE_TOO_LARGE
+                 : error == OS_E_NOTSUP ? ERROR_NOT_SUPPORTED : ERROR_WRITE_FAULT;
     SetLastError(native);
     return (int)native;
 }
@@ -339,7 +355,8 @@ static int streams_query(save_transaction *tx, void **out, size_t *length)
         NTSTATUS status = NtQueryInformationFile(os_file_handle(&tx->metadata_fd), &io,
             buffer, capacity, FileStreamInformation);
         if (status == (NTSTATUS)0xc000000du || status == (NTSTATUS)0xc0000002u ||
-            status == (NTSTATUS)0xc0000003u) { /* INVALID_PARAMETER, NOT_IMPLEMENTED, INVALID_INFO_CLASS */
+            status == (NTSTATUS)0xc0000003u || status == (NTSTATUS)0xc00000bbu) {
+            /* INVALID_PARAMETER, NOT_IMPLEMENTED, INVALID_INFO_CLASS, NOT_SUPPORTED */
             /* These volumes report no streams; ordinary overwrites still work. */
             free(buffer); *out = NULL; *length = 0;
             return FILE_OK;

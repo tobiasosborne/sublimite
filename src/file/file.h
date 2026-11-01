@@ -16,6 +16,9 @@
  * errors are asynchronous OPEN_FAILED results with a native error code in the payload/getter.
  * Terminal/phase publication retries while cancellable on mailbox saturation.
  * Copy threshold = min(256 MiB, RAM/32), injectable via file_open_opts.
+ * Windows WSL UNC originals always use COPY, even above an injected selection
+ * threshold. The default RAM-aware threshold is their hard allocation cap:
+ * larger originals report OPEN_FAILED/NOMEM (native FILE_TOO_LARGE), never map.
  *
  * CHANGE DETECTION (perf s2.14). Identity includes dev, ino, size, mtime, ctime,
  * permissions, ownership and entry type. Acquisition validates both descriptor
@@ -82,6 +85,9 @@
 #define FILE_ERR_STATE     7   /* not ready / already attached */
 #define FILE_ERR_POOL      8   /* work_submit refused */
 #define FILE_ERR_DIRSYNC   9   /* renamed, but directory fsync failed */
+#define FILE_ERR_UNSUPPORTED 10 /* target provider cannot safely save */
+
+#define FILE_WSL_SAVE_NOTICE "Cannot save to a WSL path from Windows. Use Save As to a Windows path, or edit it in the Linux build."
 
 #define FILE_PREFIX_MAX (1u << 20)
 
@@ -230,7 +236,7 @@ file_mode file_open_mode(const file *f);
  * successful PREFIX_READY. CPU-only; borrowed until file_close. */
 const file_id *file_prefix_identity(const file *f);
 const char *file_path(const file *f);       /* canonical after PREFIX_READY; "" while pending */
-int file_errno(const file *f);              /* native code of the last FILE_ERR_IO */
+int file_errno(const file *f);              /* native diagnostic of the last failure */
 /* 1 once the full content is ready for file_attach. */
 int file_open_ready(const file *f);
 /* Give the content to an empty tree. Valid once; FILE_ERR_STATE if not ready. */
@@ -285,6 +291,12 @@ int file_resolve_keep(file *f);
  * Route CHECK_DONE through decode;
  * detection is asynchronous. Saturated submission is retried on a later poll. */
 int file_watch_start(file *f);
+/* Windows WSL ERROR_INVALID_FUNCTION: known unsupported capability, no watch
+ * registered. Callers must accept open, skip event registration and retain
+ * authoritative checks on focus, before save and before bulk provider reads.
+ * file_watch_poll explicitly schedules an asynchronous identity check even
+ * without registration on WSL; decode CHECK_DONE as usual. No timer is added. */
+#define FILE_WATCH_UNSUPPORTED (-2) /* known provider capability; no watch registered */
 int file_watch_poll(file *f);
 #if defined(_WIN32)
 /* Borrowed aggregate ReadDirectoryChangesW wake event for the platform loop.

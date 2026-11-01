@@ -755,6 +755,16 @@ void editor_save_overlay(editor *e)
 #endif
         status = e->recovery_notice; e->recovery_notice_shown = true; /* edit-btj */
     }
+    if (b->save_error == FILE_ERR_UNSUPPORTED && status && !strcmp(status, "save failed"))
+        status = FILE_WSL_SAVE_NOTICE;
+#if defined(_WIN32)
+    /* Save As failures keep their target in the command buffer. The worker
+     * refuses every WSL destination before creation, including absent files. */
+    if (!e->panel_rows && e->recovery_notice && !strcmp(e->recovery_notice, "save as failed") &&
+        e->stats.mutations == e->recovery_notice_mutations && e->file_command_owner == b->id &&
+        !(e->session && e->session->saving))
+        status = os_path_is_wsl(e->file_command_path) ? FILE_WSL_SAVE_NOTICE : "save as failed";
+#endif
     if (!status || !*status || !e->grid.dims.rows) return;
     size_t len = strlen(status); uint32_t row = e->grid.dims.rows - 1;
     /* edit-cxho.24: the notice row is chrome, not a coloured band (rubric C6). */
