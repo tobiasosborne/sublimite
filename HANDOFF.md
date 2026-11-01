@@ -1,3 +1,41 @@
+# HANDOFF — sublimité, session 28 on Spiral (2026-11-01; Opus 5.5 coordinator, Tobias at the desktop)
+
+## Read first (session 29)
+
+**Windows runs and Tobias is using it.** After the fixes: "it is indeed much better. everything is much quicker." Details: `docs/worklog/2026-11-01.md`.
+
+**DO NOT run `make TARGET=win check` from main while he works.** main still has tests that start native `SC_MOVE`/`SC_SIZE` loops, which **jump his real mouse pointer** (private station or not). The guard is on the branch below. Even with the guard, no Windows test runs while he is working unless he agrees: parallel lanes also made Explorer barely responsive with CPU idle (edit-177r.36). One lane at a time. CPU, RAM and disk numbers do not show this harm.
+
+**Next, in order:**
+1. **Land branch `wt/edit-177r.32-s28`** (pushed; also the live build at `build/live/sublimite.exe` on Spiral, previous at `build/live-prev/`). It stacks edit-177r.29, .30, .14, .28, .33, .32 on main. Linux make check green at the tip; compiled for Windows; **Windows suites never run on this stack**, including the replacement notification tests and the hand-resolved merges in `tests/win/editor_win_test.c`. Needs one full Windows check, about 15 minutes at `WIN_CHECK_JOBS=4`, **on his word, ideally while he is away**. Then ff main and close the six.
+2. **edit-177r.34: minimap stalls on biggish files, minitext goes blank** (his newest finding, not investigated). Also "minimap preview not the right size": no defect established from code; ask for a screenshot.
+3. Resize timing was never measured: his acceptance is "it should be visually instantaneous"; he decides by eye. Stage-timing fixture is ready in edit-177r.32.
+4. Then the fixture wave, all depending on edit-177r.14: .15 hot exit, .16 save/reload (savectl drops ino_hi), .17 commands, .18 large files, .19 fonts/design; .20 native details, .23 registration and icon, .25 check text, .26 shader bytecode, .27 console launcher for PowerShell, .35 handle balance.
+
+**Live check, on his word only:** `make TARGET=win check-live WIN_LIVE_OK=1`; cases in `docs/testing/windows-check-live.md` (on the branch). Only a physical mouse proves drag, snap and sizing.
+
+**Launch command for him** (PowerShell, throwaway profile):
+```powershell
+$p = Join-Path $env:TEMP ('sublimite-test-live-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $p | Out-Null
+[IO.File]::WriteAllText((Join-Path $p 'one.txt'), "base`n", [Text.UTF8Encoding]::new($false))
+$env:SUBLIMITE_PROFILE = $p
+$env:EDIT_TRACE_DUMP = Join-Path $p 'trace.bin'
+& '\\wsl.localhost\Ubuntu\home\tobiasosborne\Projects\sublimite\build\live\sublimite.exe' --new-instance (Join-Path $p 'one.txt')
+```
+
+**Decided by Tobias:** saving onto `\\wsl.localhost` from Windows is out of scope ("when i use sublimite on windows i will save on windows"). A WSL path opens and reads; saves are refused with a notice and Save As.
+
+**How this session ran:** briefs `build/briefs/<bead>-s28.md`, rules `build/briefs/_rules-s28.md` (not in git; add to them that hidden runs do not isolate the pointer, and that no worker may run a Windows lane without the coordinator's say). Worktrees `.wt/<bead>-s28`; `.wt/-s28` is edit-177r.31 (merged), `.wt/integrate-s28` and `.wt/edit-177r.33-s28` are ancestors of the branch; all removable. Codex via `tools/codex_run.py`; Tobias has banked Codex resets, so quota is no limit there.
+
+**Traps:**
+- Xvfb :94-:99 run by hand on Spiral; **`make check` needs :99**. `DEBUGINFOD_URLS=` avoids a debuginfo delay.
+- Beads cross machines only through `.beads/issues.jsonl`: `bd import` after pull, `bd export -o` before push. `bd dolt pull` fails: no remote.
+- Never `pkill -f`; never freeze by cwd from a shell inside `.wt`; do not use `isolation: worktree` on the Agent tool with an assigned worktree.
+- Believe his exact observation over a hypothesis: he was right about the pointer.
+
+---
+
 # HANDOFF — sublimité, session 27 on the ThinkPad (2026-10-29 morning; Opus 5.5 coordinator, Tobias present, partly by phone)
 
 ## Read first (session 28)
