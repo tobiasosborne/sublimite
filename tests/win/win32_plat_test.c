@@ -14,6 +14,9 @@
 #endif
 #include "os/os.h"
 #include "base/base.h"
+#include "test_isolation.h"
+static test_isolation isolation;
+static bool live_only;
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 
 /* The source is included only in this test binary: later cases can supply
@@ -226,6 +229,7 @@ static void key(fixture *f, UINT vk, bool down, bool native_repeat)
 }
 static void keyboard(fixture *f)
 {
+    if(isolation==TEST_ISOLATION_STATION) { test_skip("win32_plat: keyboard","layouts: needs a station with input"); return; }
     int before=failures; HKL original=GetKeyboardLayout(0);
     HKL us=LoadKeyboardLayoutW(L"00000409",KLF_NOTELLSHELL);
     CHECK(us!=NULL); CHECK(ActivateKeyboardLayout(us,0)!=NULL);
@@ -317,11 +321,13 @@ static void geometry_clipboard(fixture *f)
     /* Win32 rejects posting pointer-bearing system messages (1159). */
     (void)SendMessageW(window(f),WM_DPICHANGED,MAKEWPARAM(144,144),(LPARAM)&suggested); CHECK(pump(f,0)==PLAT_OK);
     CHECK(kind(f,PLAT_EV_RESIZE)>n && win32_private(&f->p)->dpi==144);
-    CHECK(InvalidateRect(window(f),NULL,FALSE)); CHECK(pump(f,0)==PLAT_OK); CHECK(kind(f,PLAT_EV_EXPOSE)>0);
+    if(isolation==TEST_ISOLATION_STATION) test_skip("win32_plat: expose","layouts: needs a station with input");
+    else { CHECK(InvalidateRect(window(f),NULL,FALSE)); CHECK(pump(f,0)==PLAT_OK); CHECK(kind(f,PLAT_EV_EXPOSE)>0); }
     plat_display_info info; CHECK(plat_display_size(PLAT_BACKEND_WIN32,&info)==PLAT_OK);
     CHECK(info.dpi>0 && info.work_width>0 && info.work_height>0);
     printf("win32_plat: display dpi=%.1f work=%ux%u interval_ns=%llu (M)\n",info.dpi,info.work_width,info.work_height,(unsigned long long)plat_display_interval_ns(&f->p));
     verdict("resize/DPI/expose/display",before);
+    if(isolation!=TEST_ISOLATION_STATION) { test_skip("win32_plat: Unicode clipboard/PRIMARY","clipboard: needs private station"); return; }
     before=failures; const char text[]="sublimit\xc3\xa9 \xe6\x96\x87 \xf0\x9f\x99\x82";
     CHECK(plat_clip_set(&f->p,PLAT_CLIP_CLIPBOARD,text,sizeof text-1)==PLAT_OK);
     CHECK(plat_clip_request(&f->p,PLAT_CLIP_CLIPBOARD)==PLAT_OK); CHECK(pump(f,100)==PLAT_OK);
@@ -498,7 +504,8 @@ static void clipboard_foreign_contention_test(fixture *f)
      * one failed completion; shutting down another pending request is safe. */
     f->clip_results=0; foreign_clip held={0}; foreign_start(&held,true);
     CHECK(plat_clip_request(&f->p,PLAT_CLIP_CLIPBOARD)==PLAT_OK);
-    CHECK(pump(f,(int)GetDoubleClickTime()+200)==PLAT_OK);
+    UINT tolerance=GetDoubleClickTime(); if(!tolerance) tolerance=500; /* Win32 default; station has no mouse preference. */
+    CHECK(pump(f,(int)tolerance+200)==PLAT_OK);
     CHECK(f->clip_results==1); plat_event *e=last(f,PLAT_EV_CLIPBOARD); CHECK(e && e->code==1 && !e->clip_ok);
     CHECK(plat_clip_set(&f->p,PLAT_CLIP_CLIPBOARD,"pending",7)==PLAT_OK);
     plat_shutdown(&f->p); foreign_stop(&held);
@@ -541,9 +548,11 @@ static void clipboard_async_test(fixture *f)
 static void clipboard_contention_test(fixture *f)
 {
     int before=failures; clip_open_failures=3;
+    printf("win32_plat: retry native double-click ms=%u\n",GetDoubleClickTime());
     CHECK(plat_clip_set(&f->p,PLAT_CLIP_CLIPBOARD,"retry",5)==PLAT_OK);
     CHECK(plat_clip_request(&f->p,PLAT_CLIP_CLIPBOARD)==PLAT_OK); CHECK(pump(f,700)==PLAT_OK);
     CHECK(f->clip_results==1 && f->clip_sizes[0]==5 && !memcmp(f->clip_bytes[0],"retry",5));
+    CHECK(clip_open_failures==0);
     clip_open_failures=0; verdict("r2 clipboard contention retries copy and paste",before);
 }
 static void clipboard_results_test(fixture *f)
@@ -632,7 +641,8 @@ static void ownership_test(fixture *f)
 static void packet_test(fixture *f)
 {
     int before=failures; f->count=0; state(0,0,0);
-    if(GetForegroundWindow()==window(f)) {
+    if(isolation!=TEST_ISOLATION_LIVE) test_skip("win32_plat: KEYEVENTF_UNICODE","needs live desktop: foreground Unicode input");
+    else if(GetForegroundWindow()==window(f)) {
         const WORD units[]={0x03bb,0xd83d,0xde42}; INPUT input[6]={0};
         for(unsigned i=0;i<3;i++) {
             input[2*i].type=INPUT_KEYBOARD; input[2*i].ki.wScan=units[i]; input[2*i].ki.dwFlags=KEYEVENTF_UNICODE;
@@ -644,7 +654,7 @@ static void packet_test(fixture *f)
             memcpy(bytes+len,f->events[i].utf8,f->events[i].utf8_len); len+=f->events[i].utf8_len;
         }
         CHECK(len==6 && !memcmp(bytes,"\xce\xbb\xf0\x9f\x99\x82",6));
-    } else printf("win32_plat: KEYEVENTF_UNICODE: SKIP (not foreground)\n");
+    } else test_skip("win32_plat: KEYEVENTF_UNICODE","needs live desktop: foreground Unicode input (not foreground)");
     key(f,VK_PACKET,false,false); f->count=0;
     post(f,WM_KEYDOWN,VK_PROCESSKEY,1); CHECK(kind(f,PLAT_EV_KEY)==0);
     verdict("r2 VK_PACKET native translation and IME key isolation",before);
@@ -800,9 +810,21 @@ static const r2_case r2_cases[]={
     {"clip-foreign",clipboard_foreign_test},{"clip-foreign-contention",clipboard_foreign_contention_test},
     {"capture",capture_test},{"display",display_test}
 };
+static bool case_allowed(const r2_case *c)
+{
+    if(live_only) return !strcmp(c->name,"packet");
+    if(!strncmp(c->name,"clip-",5) && isolation!=TEST_ISOLATION_STATION) {
+        test_skip(c->name,"clipboard: needs private station"); return false;
+    }
+    if((!strcmp(c->name,"altgr") || !strcmp(c->name,"altcode")) && isolation==TEST_ISOLATION_STATION) {
+        test_skip(c->name,"layouts: needs a station with input"); return false;
+    }
+    return true;
+}
 static void r2_all(void)
 {
     for(size_t i=0;i<sizeof r2_cases/sizeof r2_cases[0];i++) {
+        if(!case_allowed(&r2_cases[i])) continue;
         fixture f={0}; f.ui_thread=GetCurrentThreadId();
         CHECK(os_wake_init(&f.wake)==OS_OK);
         plat_config cfg={"sublimite Win32 regression",320,180,false,&f.wake,0};
@@ -819,7 +841,14 @@ static void r2_all(void)
 }
 int main(int argc, char **argv)
 {
-    if(argc==7 && !strcmp(argv[1],"clip-owner")) return foreign_main(argv);
+    isolation=test_isolation_query();
+    if(isolation==TEST_ISOLATION_UNKNOWN) { puts("win32_plat_test: FAIL unknown isolation"); return 1; }
+    if(argc==7 && !strcmp(argv[1],"clip-owner")) {
+        if(isolation!=TEST_ISOLATION_STATION) return 2;
+        return foreign_main(argv);
+    }
+    live_only=argc==2 && !strcmp(argv[1],"--live-only");
+    if(live_only && isolation!=TEST_ISOLATION_LIVE) { puts("win32_plat_test: FAIL live-only requires live desktop"); return 1; }
     (void)test_translate_message; (void)test_display_sizes; (void)test_display_query; (void)test_display_name;
     setvbuf(stdout,NULL,_IONBF,0); fixture f={0}; f.ui_thread=GetCurrentThreadId();
     CHECK(plat_backend_select(":99","wayland-0")==PLAT_BACKEND_WIN32);
@@ -829,23 +858,29 @@ int main(int argc, char **argv)
     if(plat_init(&f.p,&cfg)!=PLAT_OK) { CHECK(false); return 1; }
     plat_map(&f.p); CHECK(pump(&f,20)==PLAT_OK); plat_set_repeat(&f.p,0,0);
     CHECK(window(&f)!=NULL && f.p.backend==PLAT_BACKEND_WIN32);
-    if(argc==2) {
+    if(argc==2 && !live_only) {
         bool found=false;
         for(size_t i=0;i<sizeof r2_cases/sizeof r2_cases[0];i++) if(!strcmp(argv[1],r2_cases[i].name)) {
-            r2_cases[i].run(&f); found=true; break;
+            if(case_allowed(&r2_cases[i])) r2_cases[i].run(&f); found=true; break;
         }
         CHECK(found); plat_shutdown(&f.p); os_wake_close(&f.wake);
         printf("win32_plat_test: %s (%d failures)\n",failures?"FAIL":"PASS",failures);
         return failures?1:0;
     }
     /* SendInput is allowed only while this window owns foreground focus. */
-    if(GetForegroundWindow()==window(&f)) {
+    if(isolation!=TEST_ISOLATION_LIVE) test_skip("win32_plat: SendInput","needs live desktop: foreground native input");
+    else if(GetForegroundWindow()==window(&f)) {
         INPUT input[2]={{0},{0}}; input[0].type=INPUT_KEYBOARD; input[0].ki.wVk=VK_F12;
         input[1]=input[0]; input[1].ki.dwFlags=KEYEVENTF_KEYUP; f.count=0;
         CHECK(SendInput(2,input,sizeof input[0])==2); CHECK(pump(&f,30)==PLAT_OK);
         plat_event *e=last(&f,PLAT_EV_KEY); CHECK(e && e->keysym==XKB_KEY_F12);
         printf("win32_plat: SendInput: PASS\n");
-    } else printf("win32_plat: SendInput: SKIP (window not foreground; no focus theft)\n");
+    } else test_skip("win32_plat: SendInput","needs live desktop: foreground native input (not foreground)");
+    if(live_only) {
+        packet_test(&f); plat_shutdown(&f.p); os_wake_close(&f.wake);
+        printf("win32_plat_test: %s (%d failures)\n",failures?"FAIL":"PASS",failures);
+        return failures?1:0;
+    }
     keyboard(&f); pointer_test(&f); geometry_clipboard(&f); allocation(&f); loop(&f); plat_shutdown(&f.p);
     int before=failures; DWORD handles_before=0,handles_after=0;
     CHECK(GetProcessHandleCount(GetCurrentProcess(),&handles_before));

@@ -56,7 +56,11 @@ static bool clip_open(win32_clip *c)
     /* (E) retry envelope follows the user's native double-click tolerance;
      * (P) backoff starts at the system's minimum UI timer period and doubles.
      * No retry or foreign clipboard work runs on the application thread. */
-    ULONGLONG end=GetTickCount64()+GetDoubleClickTime(); DWORD delay=USER_TIMER_MINIMUM;
+    UINT tolerance=GetDoubleClickTime();
+    /* Non-interactive stations return zero (M: isolation regression). Use the
+     * Win32 SetDoubleClickTime(0) default, 500 ms, instead of disabling retries. */
+    if (!tolerance) tolerance=500;
+    ULONGLONG end=GetTickCount64()+tolerance; DWORD delay=USER_TIMER_MINIMUM;
     for (;;) {
         if (WaitForSingleObject(c->stop,0)==WAIT_OBJECT_0) return false;
         if (OpenClipboard(c->hwnd)) return true;

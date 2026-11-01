@@ -53,6 +53,7 @@ $(WIN_QUIET): tools/win_quiet_run.c
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $< -luser32 -static -o $@
 $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
+$(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe quiet_run_test.exe d3d11_win_test.exe)): tests/win/test_isolation.h
 # Objects reached only through pattern rules would be intermediates and deleted after each link.
 .SECONDARY: $(WIN_REL_OBJ) $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
 
@@ -153,6 +154,15 @@ $(WIN_B)/san/tests/d3d11_win_test.exe: tests/win/d3d11_win_test.c src/d3d11/d3d1
 	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
 	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
 
+# Pixel oracle also drives native offscreen resources without a displayed frame.
+$(WIN_B)/rel/tests/d3d11_test.exe: tests/win/d3d11_test.c src/d3d11/d3d11_win.c tests/win/test_isolation.h $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_REL_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) $(WIN_WRAP) -static -o $@
+$(WIN_B)/san/tests/d3d11_test.exe: tests/win/d3d11_test.c src/d3d11/d3d11_win.c tests/win/test_isolation.h $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_SAN_F) $(WIN_INC) $< $(filter-out %/d3d11_win.o,$(WIN_SAN_OBJ)) $(WIN_MANIFEST_OBJ) $(WIN_LIBS) -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+
 # White-box journal transport shim; production has no per-syscall indirection.
 $(WIN_B)/rel/tests/journal_transport_test.exe: tests/win/journal_transport_test.c src/journal/journal.c $(WIN_REL_OBJ) $(WIN_MANIFEST_OBJ)
 	@mkdir -p $(@D)
@@ -205,24 +215,24 @@ $(WIN_B)/rel/tests/journal_ack_test.exe $(WIN_B)/san/tests/journal_ack_test.exe:
 # (WOF reparse tag) file that tools/win_reparse_fixture.sh creates as a Windows
 # process under a per-run %TEMP%\sublimite-test-reparse-<id> and removes afterwards.
 # tools/winrun.sh forwards OS_TEST_CASE and OS_TEST_DATA_REPARSE through WSLENV.
+# (E) Eight suite workers share the brief's sixteen-CPU lane. Configurations of
+# the same suite stay serial: the anonymous service station may share clipboard.
+WIN_CHECK_JOBS ?= 8
 check: $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
 	@set -e; fx=$$(tools/win_reparse_fixture.sh create); printf "reparse fixture: %s\n" "$$fx"; \
-	  trap "tools/win_reparse_fixture.sh remove \"$$fx\"" EXIT; status=0; \
-	  for t in $(WIN_TEST_REL) $(WIN_TEST_SAN); do \
-	    echo "== $$t"; \
-	    if OS_TEST_DATA_REPARSE="$$fx" tools/winrun.sh $$t; then echo "RESULT $$t exit=0"; \
-	    else rc=$$?; echo "RESULT $$t exit=$$rc"; status=1; fi; \
-	  done; \
-	  for t in $(filter %smoke_test.exe,$(WIN_TEST_SAN)); do echo "== $$t --expect-asan (must fail)"; \
-	    if tools/winrun.sh $$t --expect-asan 2>$(WIN_B)/asan.err; then echo "ASan did not fire"; status=1; \
-	    elif grep -q AddressSanitizer $(WIN_B)/asan.err; then echo "ASan fired: ok"; \
-	    else echo "no ASan report"; cat $(WIN_B)/asan.err; status=1; fi; \
-	  done; exit $$status
+	  trap 'tools/win_reparse_fixture.sh remove "$$fx"' EXIT; \
+	  OS_TEST_DATA_REPARSE="$$fx" python3 tools/win_check.py --jobs $(WIN_CHECK_JOBS) $(WIN_TEST_REL) $(WIN_TEST_SAN)
 
-	@echo "Windows journal: transport, retained-BASE transactions, wire/CRC/PAD, PAINT, sharing states and process-death oracles passed"
-	@echo "Windows journal: SKIP editor-dependent group/retire/session/recovery/dataloss integration and first-paint closed-tab restart (editor/platform not ported)"
-	@echo "Windows journal: SKIP src/file save integration (file module not ported); journal_save_prepare/finish/cancel run in journal_safety_test"
-	@echo "Windows check: $(words $(WIN_TEST_REL)) release + $(words $(WIN_TEST_SAN)) sanitizer test binaries passed; ASan negative control passed"
+# Explicitly authorised, by-hand coverage only. Do not put quiet_run_test here:
+# it deliberately refuses a live desktop. The selectors never run clipboard.
+.PHONY: check-live
+WIN_LIVE_TESTS := $(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe d3d11_test.exe))
+check-live: $(WIN_LIVE_TESTS) $(WIN_QUIET)
+	@test "$(WIN_LIVE_OK)" = 1 || { echo "check-live refuses: set WIN_LIVE_OK=1 only with Tobias's explicit approval" >&2; exit 2; }
+	@set -e; for t in $(WIN_LIVE_TESTS); do \
+	  echo "== $$t --live-only (live desktop)"; \
+	  WINRUN_ISOLATION=none tools/winrun.sh $$t --live-only; \
+	  done
 
 clean:
 	rm -rf $(WIN_B)

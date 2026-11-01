@@ -13,6 +13,11 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11sdklayers.h>
+#include "test_isolation.h"
+/* Native offscreen drawing/readback needs no displayed frame. Keep the seam
+ * in this test TU, as d3d11_win_test does; production has no test hooks. */
+#include "../../src/d3d11/d3d11_win.c"
+static test_isolation isolation;
 #define T(c) do { if (!(c)) { fprintf(stderr,"d3d11_test:%d: FAIL %s\n",__LINE__,#c); return 1; } } while (0)
 /* (G) Liveness watchdog only, same missing-completion window as GL; no
  * assertion on render speed or the panel's refresh period. */
@@ -21,7 +26,7 @@
  * test-only opaque implementation has no W1.1 layout dependency. */
 struct plat { HWND window; };
 typedef struct stamps {
-    uint32_t id, t5_count, t6_count, stats_frames;
+    uint32_t id, t5_count, t6_count, stats_frames, pixel_frames;
     uint64_t t5, t6, ui;
     bool bad;
     HWND minimize;
@@ -116,9 +121,58 @@ static int debug_live_children(ID3D11Debug *debugger, ID3D11InfoQueue *queue)
     }
     queue->lpVtbl->ClearStoredMessages(queue); return 0;
 }
+static int offscreen_frame(render_backend *b, render_grid *grid, stamps *p,
+                           const uint32_t *want, uint32_t w, uint32_t h, bool mutate)
+{
+    render_strip strips[8]; size_t count = 0;
+    T(render_dirty_strips(grid,strips,8,&count) == RENDER_OK);
+    d3d11_state *native = b->state;
+    edit_malloc_guard_begin();
+    /* Exercise the same production snapshot and draw path directly. This is
+     * offscreen resource coverage: no adapter slot and no invented T4/T5/T6. */
+    T(d3d11_submit(b,grid,strips,count) == RENDER_OK);
+    if (mutate) {
+        memset(grid->cells,0,grid->cell_capacity*sizeof *grid->cells);
+        memset((void *)grid->glyphs,0,grid->glyph_count*sizeof *grid->glyphs);
+        memset((void *)grid->pages,0,grid->page_count*sizeof *grid->pages);
+        if (grid->region.pixels) memset((void *)grid->region.pixels,0,grid->region.capacity*sizeof(uint32_t));
+    }
+    T(d3d11_draw(native));
+    /* Blocking Map is diagnostic-only, just as d3d11_read_pixels is. Unlike
+     * that public diagnostic this does not require a committed Present. */
+    D3D11_MAPPED_SUBRESOURCE map;
+    T(SUCCEEDED(native->context->lpVtbl->Map(native->context,(ID3D11Resource *)native->staging,
+        0,D3D11_MAP_READ,0,&map)));
+    bool equal = true;
+    for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+        const uint32_t *row = (const uint32_t *)((const uint8_t *)map.pData+(size_t)y*map.RowPitch);
+        if (row[x] != want[(size_t)y*w+x]) {
+            fprintf(stderr,"offscreen frame=%u pixel=%u,%u got=%08x want=%08x\n",grid->frame_id,x,y,row[x],want[(size_t)y*w+x]);
+            equal = false;
+        }
+    }
+    native->context->lpVtbl->Unmap(native->context,(ID3D11Resource *)native->staging,0);
+    BOOL ready = FALSE;
+    uint64_t deadline = os_now_ns()+WATCHDOG_NS;
+    do {
+        HRESULT hr = native->context->lpVtbl->GetData(native->context,(ID3D11Asynchronous *)native->query,
+            &ready,sizeof ready,0);
+        T(SUCCEEDED(hr)); T(os_now_ns() < deadline);
+        if (!ready) Sleep(1);
+    } while (!ready);
+    size_t allocations = edit_malloc_guard_end();
+    T(equal); T(!edit_malloc_guard_active() || allocations == 0);
+    T(!b->active && !p->t5_count && !p->t6_count);
+    p->pixel_frames++;
+    test_skip("d3d11_test: frame Present/T5/T6/DXGI statistics","needs live desktop: displayed frame completion");
+    if (p->minimize) test_skip("d3d11_test: minimize/restore","needs live desktop: visible minimize and restore");
+    p->minimize = NULL;
+    return 0;
+}
 static int frame(render_backend *b, render_grid *grid, stamps *p,
                  const uint32_t *want, uint32_t w, uint32_t h, bool mutate)
 {
+    if (isolation != TEST_ISOLATION_LIVE) return offscreen_frame(b,grid,p,want,w,h,mutate);
     render_strip strips[8]; size_t count = 0;
     T(render_dirty_strips(grid,strips,8,&count) == RENDER_OK);
     p->id = grid->frame_id;
@@ -203,7 +257,7 @@ static int frame(render_backend *b, render_grid *grid, stamps *p,
     d3d11_present_info info; T(d3d11_present_stats(b,&info) == RENDER_OK);
     T(b->info.capabilities & RENDER_CAP_PRESENT_TIMING);
     T(info.expected && info.observed == info.expected && info.sync_qpc && info.statistics_matched);
-    p->stats_frames++;
+    p->stats_frames++; p->pixel_frames++;
     T(d3d11_poll_completions(b) == RENDER_OK);
     T(p->t5_count == n5+1 && p->t6_count == n6+1);
     render_event stale = {RENDER_EVENT_DEVICE_DONE,p->id,os_now_ns(),NULL};
@@ -284,7 +338,9 @@ static int run_device(HWND window, bool warp, bool background)
     b.state = state;
     T(render_d3d11_backend_for_window(&b,window) == RENDER_OK);
     T(d3d11_diagnostics(&b,warp,true) == RENDER_OK);
-    init.config.background_init = init_background;
+    if (isolation != TEST_ISOLATION_LIVE && !init_background)
+        test_skip("d3d11_test: ordinary init","needs live desktop: diagnostic Present validates timing");
+    init.config.background_init = isolation == TEST_ISOLATION_LIVE ? init_background : true;
     /* UI dispatches while the init worker owns the descriptor; publication
      * and adoption both cross the work mailbox, including the failure above. */
     T(initialize(&init) == 0);
@@ -297,6 +353,7 @@ static int run_device(HWND window, bool warp, bool background)
     if (debug) T(SUCCEEDED(device->lpVtbl->QueryInterface(device,&IID_ID3D11InfoQueue,(void **)&queue)));
     if (debug) T(SUCCEEDED(device->lpVtbl->QueryInterface(device,&IID_ID3D11Debug,(void **)&debugger)));
     T(p.t5_count == 0 && p.t6_count == 0);
+    background = init.config.background_init;
     T(((b.info.capabilities & RENDER_CAP_PRESENT_TIMING) != 0) == !background);
     T(d3d11_diagnostics(&b,true,true) == RENDER_ERR_STATE);
     render_cell cells[16*5]; render_glyph glyphs[4]; render_atlas_page pages[2];
@@ -365,26 +422,49 @@ static int run_device(HWND window, bool warp, bool background)
     a[0] ^= 255u; /* Previous T5 retired; referenced coverage may now change. */
     p.minimize = window;
     oracle(&g,want,122,51); T(frame(&b,&g,&p,want,122,51,false) == 0);
-    puts("d3d11_test: minimize/restore before Present, post-T5 atlas change exact PASS");
+    if (isolation == TEST_ISOLATION_LIVE) puts("d3d11_test: minimize/restore before Present, post-T5 atlas change exact PASS");
+    else puts("d3d11_test: changed atlas pixels exact PASS");
     T(debug_messages(queue) == 0);
     render_stats stats; T(render_backend_stats(&b,&stats) == RENDER_OK);
-    T(stats.submitted_frames == p.stats_frames && stats.presented_frames == p.stats_frames);
+    if (isolation == TEST_ISOLATION_LIVE) {
+        T(stats.submitted_frames == p.stats_frames && stats.presented_frames == p.stats_frames);
+    } else T(stats.submitted_frames == 0 && stats.presented_frames == 0);
     /* Quiescent shutdown discards pending T5/T6 and releases native refs. */
     T(render_frame_begin(&g,next) == RENDER_OK && render_mark_full(&g) == RENDER_OK);
     render_strip full = {0,small.rows};
     T(render_backend_submit(&b,&g,&full,1) == RENDER_OK);
-    int present_rc;
-    uint64_t deadline = os_now_ns()+WATCHDOG_NS;
-    do {
-        present_rc = render_backend_present(&b,next);
-        if (os_now_ns() >= deadline) {
-            d3d11_present_info pending; T(d3d11_present_stats(&b,&pending) == RENDER_OK);
-            fprintf(stderr,"shutdown present rc=%d status=%08x\n",present_rc,(unsigned)pending.status);
-            return 1;
+    T(render_backend_submit(&b,&g,&full,1) == RENDER_ERR_BUSY);
+    if (isolation != TEST_ISOLATION_LIVE) {
+        d3d11_state *native = b.state;
+        /* Bounded retries span expired deadlines without a rebuild loop.
+         * A station's HWND remains hidden; a private input-station desktop
+         * reaches native Present and reports DXGI_STATUS_OCCLUDED. */
+        for (unsigned attempt = 0; attempt < 3; attempt++) {
+            native->deadline = 1; native->last_observation = os_now_ns();
+            T(render_backend_present(&b,next) == RENDER_ERR_BUSY);
+            T(d3d11_poll_completions(&b) == RENDER_OK);
+            T(!native->failed && !d3d11_recovery_required(&b) && b.active && !b.presented);
+            d3d11_present_info occlusion; T(d3d11_present_stats(&b,&occlusion) == RENDER_OK);
+            T(!IsWindowVisible(window) || occlusion.status == (int32_t)DXGI_STATUS_OCCLUDED);
+            T(!p.t5_count && !p.t6_count);
         }
-        if (present_rc == RENDER_ERR_BUSY) { pump(); Sleep(1); }
-    } while (present_rc == RENDER_ERR_BUSY);
-    T(present_rc == RENDER_OK && b.active);
+        printf("d3d11_test: isolated retry status=%08x visible=%d\n",(unsigned)native->present_info.status,IsWindowVisible(window));
+        puts("d3d11_test: isolated hidden/occluded retries preserve healthy device and pending frame PASS");
+        test_skip("d3d11_test: pending shutdown after Present","needs live desktop: committed presentation");
+    } else {
+        int present_rc;
+        uint64_t deadline = os_now_ns()+WATCHDOG_NS;
+        do {
+            present_rc = render_backend_present(&b,next);
+            if (os_now_ns() >= deadline) {
+                d3d11_present_info pending; T(d3d11_present_stats(&b,&pending) == RENDER_OK);
+                fprintf(stderr,"shutdown present rc=%d status=%08x\n",present_rc,(unsigned)pending.status);
+                return 1;
+            }
+            if (present_rc == RENDER_ERR_BUSY) { pump(); Sleep(1); }
+        } while (present_rc == RENDER_ERR_BUSY);
+        T(present_rc == RENDER_OK && b.active);
+    }
     render_backend_shutdown(&b); render_backend_shutdown(&b);
     T(p.t5_count == p.stats_frames && p.t6_count == p.stats_frames);
     T(debug_messages(queue) == 0);
@@ -403,7 +483,9 @@ static int run_device(HWND window, bool warp, bool background)
     if (debugger) debugger->lpVtbl->Release(debugger);
     if (queue) queue->lpVtbl->Release(queue);
     free(state); work_pool_shutdown(pool); edit_arena_free(&pool_arena);
-    printf("d3d11_test: %s%s pixels=exact frames=%u T5/T6=%u/%u monotone UI resize shutdown-pending PASS T6=DXGI-statistics:%u debug=%s guard=%s init=%s present-timing=validated\n",
+    if (isolation != TEST_ISOLATION_LIVE)
+        printf("d3d11_test: WARP offscreen pixels=exact frames=%u resources/resize/shutdown PASS\n",p.pixel_frames);
+    else printf("d3d11_test: %s%s pixels=exact frames=%u T5/T6=%u/%u monotone UI resize shutdown-pending PASS T6=DXGI-statistics:%u debug=%s guard=%s init=%s present-timing=validated\n",
         warp ? "WARP" : "hardware", !warp && actual_warp ? " unavailable (WARP fallback)" : "",
         p.stats_frames,p.t5_count,p.t6_count,p.stats_frames,debug ? "enabled, no live children" : "SDK layers unavailable",edit_malloc_guard_active() ? "zero allocations" : "sanitizer owns malloc", background ? "background" : "ordinary");
     return 0;
@@ -413,7 +495,13 @@ int main(int argc, char **argv)
     trace_init(); T(trace_thread_register() >= 0);
     /* Keep the authorised display test observable while it runs; restore
      * this thread's execution request on exit. No persistent power-policy change. */
-    EXECUTION_STATE execution = SetThreadExecutionState(ES_CONTINUOUS|ES_DISPLAY_REQUIRED); T(execution);
+    isolation = test_isolation_query(); T(isolation != TEST_ISOLATION_UNKNOWN);
+    bool live_only = argc == 2 && !strcmp(argv[1],"--live-only");
+    T(!live_only || isolation == TEST_ISOLATION_LIVE);
+    EXECUTION_STATE execution = 0;
+    if (isolation == TEST_ISOLATION_LIVE) {
+        execution = SetThreadExecutionState(ES_CONTINUOUS|ES_DISPLAY_REQUIRED); T(execution);
+    }
     /* The binding worker brief authorises this small nonactivating window. */
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW cls = {.lpfnWndProc = DefWindowProcW,.hInstance = instance,.lpszClassName = L"sublimite-d3d11-test"};
@@ -423,11 +511,16 @@ int main(int argc, char **argv)
     T(window); ShowWindow(window,SW_SHOWNOACTIVATE);
     T(SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)); pump();
     bool ordinary = argc > 1 && strcmp(argv[1],"--ordinary") == 0;
-    int rc = run_device(window,argc > 1 && strcmp(argv[1],"--warp") == 0,!ordinary);
-    if (!rc && argc == 1) rc = run_device(window,true,true);
-    if (!rc && argc == 1) rc = run_device(window,false,false);
-    if (!rc && argc == 1) rc = run_device(window,true,false);
+    bool isolated = isolation != TEST_ISOLATION_LIVE;
+    if (isolated) {
+        test_skip("d3d11_test: ordinary init","needs live desktop: diagnostic Present validates timing");
+        test_skip("d3d11_test: hardware driver","needs live desktop: hardware presentation");
+    }
+    int rc = run_device(window,isolated || (argc > 1 && strcmp(argv[1],"--warp") == 0),!ordinary);
+    if (!rc && !isolated && (argc == 1 || live_only)) rc = run_device(window,true,true);
+    if (!rc && !isolated && (argc == 1 || live_only)) rc = run_device(window,false,false);
+    if (!rc && !isolated && (argc == 1 || live_only)) rc = run_device(window,true,false);
     DestroyWindow(window); UnregisterClassW(cls.lpszClassName,instance);
-    (void)SetThreadExecutionState(execution);
+    if (execution) (void)SetThreadExecutionState(execution);
     return rc;
 }

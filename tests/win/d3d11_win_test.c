@@ -17,6 +17,7 @@ static HRESULT WINAPI test_dwm_flush(void)
 }
 #include <stdio.h>
 #include <stdlib.h>
+#include "test_isolation.h"
 #define T(c) do { if (!(c)) { fprintf(stderr,"d3d11_win_test:%d: FAIL %s\n",__LINE__,#c); return 1; } } while (0)
 static int disabled_scroll(void)
 {
@@ -178,6 +179,27 @@ static HRESULT STDMETHODCALLTYPE fake_query(ID3D11DeviceContext *context, ID3D11
 static HRESULT STDMETHODCALLTYPE fake_present(IDXGISwapChain2 *chain, UINT interval, UINT flags,
     const DXGI_PRESENT_PARAMETERS *params)
 { (void)chain; (void)interval; (void)flags; (void)params; present_committed = true; return S_OK; }
+static HRESULT STDMETHODCALLTYPE occluded_present(IDXGISwapChain2 *chain, UINT interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS *params)
+{ (void)chain; (void)interval; (void)flags; (void)params; return DXGI_STATUS_OCCLUDED; }
+static int occlusion_retry(void)
+{
+    ID3D11DeviceContextVtbl xv = {.GetData = fake_query}; ID3D11DeviceContext context = {&xv};
+    IDXGISwapChain2Vtbl cv = {.Present1 = occluded_present}; IDXGISwapChain2 chain = {&cv};
+    d3d11_state s = {.context = &context,.swapchain = &chain,.drawn = true,.latency_ready = true,
+        .deadline = 1,.last_observation = os_now_ns()};
+    render_backend b = {.state = &s};
+    /* Expired observation must not turn ordinary occlusion into device rebuild.
+     * Repeat after expiry again: no swap, completion, failure or recovery. */
+    for (unsigned i = 0; i < 3; i++) {
+        s.deadline = 1;
+        T(d3d11_present(&b,41) == RENDER_ERR_BUSY);
+        T(s.present_info.status == (int32_t)DXGI_STATUS_OCCLUDED);
+        T(!s.failed && !s.recovery && !s.swapped && s.latency_ready);
+    }
+    puts("d3d11_win_test: occlusion across expired deadlines stays retryable, no rebuild PASS");
+    return 0;
+}
 static HRESULT STDMETHODCALLTYPE fake_count(IDXGISwapChain2 *chain, UINT *count)
 { (void)chain; *count = 7; return S_OK; }
 static int query_waits_for_present(void)
@@ -241,12 +263,14 @@ static int readiness_recovery(void)
     return 0;
 }
 int main(void) {
+    T(test_isolation_query() != TEST_ISOLATION_UNKNOWN);
     if (disabled_scroll() || atlas_rectangles()) return 1;
     if (timing_capability()) return 1;
     if (statistics_progress()) return 1;
     if (delayed_retry()) return 1;
     if (teardown_order()) return 1;
     if (query_waits_for_present()) return 1;
+    if (occlusion_retry()) return 1;
     if (statistics_recovery()) return 1;
     return readiness_recovery();
 }

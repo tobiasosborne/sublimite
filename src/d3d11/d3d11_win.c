@@ -655,7 +655,14 @@ static int d3d11_present(render_backend *b, uint32_t id)
     DXGI_PRESENT_PARAMETERS params = {0};
     hr = s->swapchain->lpVtbl->Present1(s->swapchain,1,DXGI_PRESENT_DO_NOT_WAIT,&params);
     s->present_info.status = (int32_t)hr;
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED)
+    /* Occlusion is suspension, not failed progress on a visible swapchain.
+     * Keep the copied frame retryable without repeatedly rebuilding a healthy
+     * device when the desktop remains undisplayed. */
+    if (hr == DXGI_STATUS_OCCLUDED) {
+        s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
+        return RENDER_ERR_BUSY;
+    }
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
         return os_now_ns() >= s->deadline ? d3d11_recover(b) : RENDER_ERR_BUSY;
     if (FAILED(hr)) return d3d11_fail(s);
     s->swapped = true; s->latency_ready = false; s->resume_pending = false;
