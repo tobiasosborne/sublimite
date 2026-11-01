@@ -192,6 +192,11 @@ int editor_font_poll(editor *e)
             if (e->backend->active || e->dirty || view_busy(&e->v) || layout_busy(&e->lay) ||
                 editor_clip_busy(e) || e->action != EDITOR_ACTION_NONE || e->op_count) return 0;
             const font_ascii_atlas *a = &f->atlas[f->preparing].atlas;
+#if defined(_WIN32)
+            int prepared=editor_grid_prepare(e,a->cell);
+            if(prepared==EDITOR_MORE) return 0;
+            if(prepared) return prepared;
+#endif
             render_dims dims = e->grid.dims;
             dims.cell_w = a->cell.cell_w; dims.cell_h = a->cell.cell_h;
             dims.cols = f->window_width / dims.cell_w; dims.rows = f->window_height / dims.cell_h;

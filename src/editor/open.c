@@ -71,6 +71,7 @@ void editor_close(editor *e)
     edit_arena_free(&e->drop_arena);
     edit_arena_free(&e->arena);
 #if defined(_WIN32)
+    edit_arena_free(&e->grid_reservation);
     _aligned_free(e);
 #else
     free(e);

@@ -17,6 +17,18 @@ static BOOL publication_empty(void)
 static BOOL publication_close(void)
 { return InterlockedCompareExchange(&synthetic_publication,0,0) ? TRUE : CloseClipboard(); }
 static HANDLE publish_entered, publish_release;
+static HANDLE read_entered, read_release;
+static HGLOBAL read_memory;
+static HANDLE stalled_read(UINT format)
+{
+    if(read_entered) {
+        SetEvent(read_entered);
+        WaitForSingleObject(read_release,INFINITE);
+        /* Return owned, valid native data after the UI has expired the read. */
+        return read_memory;
+    }
+    return GetClipboardData(format);
+}
 static HANDLE stalled_publish(UINT format,HANDLE memory)
 {
     if(publish_entered) {
@@ -39,7 +51,9 @@ static BOOL cut_open(HWND window)
 #define CloseClipboard publication_close
 #define SetClipboardData stalled_publish
 #define OpenClipboard cut_open
+#define GetClipboardData stalled_read
 #include "../../src/win32/win32_clip_win.c"
+#undef GetClipboardData
 #undef OpenClipboard
 #undef SetClipboardData
 #undef EmptyClipboard
@@ -79,9 +93,13 @@ static bool hold_save_fence;
 static bool test_save_leased(const editor *e)
 { return hold_save_fence || editor_save_leased(e); }
 static editor *cpu_editor;
+static bool hold_notice_submit, notice_submit_seen;
 static int snapshot_probe(render_backend *b,const render_grid *g,const render_strip *strips,size_t count)
 {
     if(observe_status && cpu_editor) snapshot_guard_seen=cpu_editor->journal_paint==cpu_editor->buffer->id;
+    if(hold_notice_submit && cpu_editor && cpu_editor->recovery_notice) {
+        notice_submit_seen=true; return RENDER_ERR_BUSY;
+    }
     int rc=render_backend_submit(b,g,strips,count);
     return rc;
 }
@@ -652,6 +670,120 @@ static int stuck_publication_test(editor *e)
     T(editor_length(e)==6);
     puts("round4: stuck publication expires, typing/close proceed, late deletion refused PASS"); return 0;
 }
+static int stuck_read_test(editor *e,bool queued,bool close)
+{
+    InterlockedExchange(&synthetic_publication,1);
+    T(settle(e)==0);
+    read_entered=CreateEventW(NULL,TRUE,FALSE,NULL);
+    read_release=CreateEventW(NULL,TRUE,FALSE,NULL); T(read_entered && read_release);
+    read_memory=GlobalAlloc(GMEM_MOVEABLE,sizeof(L"late")); T(read_memory);
+    WCHAR *native=GlobalLock(read_memory); T(native);
+    memcpy(native,L"late",sizeof(L"late")); GlobalUnlock(read_memory);
+    if(queued) T(publication_start(e)==0);
+    plat_event paste={.kind=PLAT_EV_KEY,.press=true,.keysym='v',.mods=PLAT_MOD_CTRL};
+    T(editor_inject(e,&paste)==0);
+    uint64_t end=os_now_ns()+WATCH_NS;
+    if(queued) {
+        T(editor_inject(e,&(plat_event){.kind=PLAT_EV_CLOSE})==0);
+        while(e->queue_count) { T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield(); }
+    } else {
+        while(WaitForSingleObject(read_entered,0)!=WAIT_OBJECT_0) {
+            T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
+        }
+        if(close) T(editor_inject(e,&(plat_event){.kind=PLAT_EV_CLOSE})==0);
+    }
+    e->blinking=false;
+    T(editor_clip_busy(e) && editor_clip_deadline(e)>os_now_ns());
+    T(wait_timeout(e,-1,os_now_ns())>0);
+    int rc=0;
+    do { rc=editor_step(e,0); T(rc>=0); T(os_now_ns()<end); os_yield(); }
+    while(close ? rc!=EDITOR_CLOSED : editor_clip_busy(e));
+    uint8_t bytes[5];
+    T(editor_length(e)==5 && editor_read(e,0,bytes,5)==0 && !memcmp(bytes,"base\n",5));
+    T(e->recovery_notice && strstr(e->recovery_notice,"read timed out"));
+    if(close) {
+        /* Teardown must detach with the publication still in its foreign call.
+         * The isolated child process owns and ultimately reclaims that worker. */
+        if(queued) T(WaitForSingleObject(publish_entered,0)==WAIT_OBJECT_0);
+        else T(WaitForSingleObject(read_entered,0)==WAIT_OBJECT_0);
+    } else {
+        /* A later read is a distinct owner even while the old result returns. */
+        T(editor_inject(e,&paste)==0);
+        T(editor_step(e,0)>=0 && editor_clip_busy(e));
+        SetEvent(read_release);
+        T(settle(e)==0);
+        T(editor_length(e)==5u+sizeof "late"-1u);
+        uint8_t text[9]; T(editor_read(e,0,text,sizeof text)==0 && !memcmp(text,"latebase\n",sizeof text));
+        CloseHandle(read_entered); CloseHandle(read_release);
+        GlobalFree(read_memory); read_memory=NULL;
+        read_entered=read_release=NULL;
+    }
+    printf("round30: %s read expires with exact text, notice, and late-result isolation PASS\n",queued ? "queued" : "foreign");
+    return 0;
+}
+static int save_as_close_test(editor *e,bool save)
+{
+    T(settle(e)==0);
+    plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
+    T(editor_inject(e,&key)==0 && settle(e)==0);
+    key=(plat_event){.kind=PLAT_EV_KEY,.press=true,.keysym='w',.mods=PLAT_MOD_CTRL};
+    T(editor_inject(e,&key)==0 && settle(e)==0 && editor_close_prompt_shown(e));
+    key=(plat_event){.kind=PLAT_EV_KEY,.press=true,.keysym='s',.utf8_len=1,.utf8={'s'}};
+    T(editor_inject(e,&key)==0 && settle(e)==0);
+    T(e->go.active && e->close_prompt.saving==e->buffer->id);
+    for(unsigned request=0;request<2u;request++) { /* (P) original and repeated close. */
+        T(editor_inject(e,&(plat_event){.kind=PLAT_EV_CLOSE})==0);
+        T(editor_step(e,0)!=EDITOR_CLOSED);
+        T(!e->quit && !e->win_close_requested && e->go.active);
+    }
+    if(save) {
+        char path[OS_PATH_MAX]; snprintf(path,sizeof path,"%s.saved",e->cfg.journal_path);
+        for(const char *at=path;*at;at++) {
+            key=(plat_event){.kind=PLAT_EV_KEY,.press=true,.keysym=(uint8_t)*at,.utf8_len=1,.utf8={(uint8_t)*at}};
+            T(editor_inject(e,&key)==0 && settle(e)==0);
+        }
+        key=(plat_event){.kind=PLAT_EV_KEY,.press=true,.keysym=0xff0d};
+        T(editor_inject(e,&key)==0 && settle(e)==0 && !e->go.active);
+        os_file file=OS_FILE_INIT; uint8_t bytes[6]; size_t got=0;
+        T(os_file_open(&file,path,OS_OPEN_READ)==OS_OK);
+        T(os_file_read(&file,bytes,sizeof bytes,&got)==OS_OK && got==sizeof bytes && !memcmp(bytes,"qbase\n",sizeof bytes));
+        os_file_close(&file);
+    } else {
+        key=(plat_event){.kind=PLAT_EV_KEY,.press=true,.keysym=0xff1b};
+        T(editor_inject(e,&key)==0 && settle(e)==0 && !e->go.active);
+        T(editor_length(e)==6);
+        uint8_t bytes[6]; T(editor_read(e,0,bytes,sizeof bytes)==0 && !memcmp(bytes,"qbase\n",sizeof bytes));
+    }
+    T(editor_inject(e,&(plat_event){.kind=PLAT_EV_CLOSE})==0);
+    uint64_t end=os_now_ns()+WATCH_NS; int rc;
+    do { rc=editor_step(e,0); T(rc>=0); T(os_now_ns()<end); } while(rc!=EDITOR_CLOSED);
+    printf("round30: close Save As retains answer ownership, %s completes PASS\n",save ? "save" : "cancel"); return 0;
+}
+static int timeout_notice_test(editor *e)
+{
+    InterlockedExchange(&synthetic_publication,1);
+    T(settle(e)==0 && publication_start(e)==0);
+    plat_event right={.kind=PLAT_EV_KEY,.press=true,.keysym=0xff53};
+    plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
+    hold_notice_submit=true;
+    T(editor_inject(e,&right)==0 && editor_inject(e,&key)==0);
+    uint64_t end=os_now_ns()+WATCH_NS;
+    while(!notice_submit_seen) { T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield(); }
+    T(!e->recovery_notice_shown); /* A busy backend has not accepted a status frame. */
+    key.keysym='r'; key.utf8[0]='r'; T(editor_inject(e,&key)==0);
+    while(e->queue_count || e->op_count || view_busy(&e->v)) {
+        T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
+    }
+    hold_notice_submit=false; T(settle(e)==0);
+    T(e->recovery_notice_shown);
+    uint32_t row=e->grid.dims.rows-1u;
+    const char *notice="clipboard publication timed out; text kept";
+    for(size_t at=0;at<strlen(notice);at++) T(e->grid.cells[(size_t)row*e->grid.dims.cols+at].glyph_index==(uint8_t)notice[at]);
+    SetEvent(publish_release); T(settle(e)==0);
+    key.keysym='t'; key.utf8[0]='t';
+    T(editor_inject(e,&key)==0 && settle(e)==0 && !e->recovery_notice);
+    puts("round30: queued typing cannot hide an unshown timeout notice PASS"); return 0;
+}
 static int cloak_test(editor *e)
 {
     T(settle(e)==0);
@@ -719,6 +851,33 @@ static int maximum_grid_test(editor *e)
         e->max_cols,e->max_rows,e->grid.dims.cell_w,e->grid.dims.cell_h,
         sizeof(hl_span),sizeof(editor_hit),sizeof(render_cell),sizeof(d3d11_instance),sizeof(d3d11_strip));
     puts("round4: startup maximum client is covered by prepaid grid PASS"); return 0;
+}
+static int smaller_font_test(editor *e)
+{
+    T(maximum_grid_test(e)==0);
+    /* (P) brief's 10 -> 9 pt at 96 DPI: em 13 -> 12, cells 8 -> 7. */
+    T(e->grid.dims.cell_w==8u);
+    T(editor_font_zoom(e,-1)==0 && settle(e)==0);
+    T(e->grid.dims.cell_w==7u);
+    T(e->grid.dims.cols==e->cfg.max_window_width/e->grid.dims.cell_w);
+    T(e->grid.dims.rows==e->cfg.max_window_height/e->grid.dims.cell_h);
+    printf("round30: smaller font covers maximum client cols=%u rows=%u cell=%ux%u PASS\n",
+        e->grid.dims.cols,e->grid.dims.rows,e->grid.dims.cell_w,e->grid.dims.cell_h);
+    printf("round30: grid reservation bytes=%zu wrap=%zu indent=%zu render_strip=%zu glyph_slots=%zu words=%zu alignment=%zu\n",
+        e->grid_reservation.used,sizeof(layout_wrap_row),sizeof(indent_range),sizeof(render_strip),
+        e->font_row_slots,e->font_row_words,_Alignof(max_align_t));
+    /* (P) 9 -> 2 pt exercises row growth too; returning to 9 pt must reuse
+     * that reservation. The supported minimum is one positive whole em. */
+    T(editor_font_zoom(e,-7)==0 && settle(e)==0);
+    T(e->max_rows>300u && e->grid.dims.rows==e->cfg.max_window_height/e->grid.dims.cell_h);
+    uint8_t *reserved=e->grid_reservation.base;
+    T(editor_font_zoom(e,7)==0 && settle(e)==0 && e->grid_reservation.base==reserved);
+    samples *counts=e->cfg.hook_ctx; size_t allocations=counts->allocations;
+    plat_event typed={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
+    T(editor_inject(e,&typed)==0 && settle(e)==0 && counts->allocations==allocations);
+    T(editor_length(e)==6);
+    puts("round30: row growth, reservation reuse, and zero-allocation typing PASS");
+    return 0;
 }
 static int minimize_test(editor *e)
 {
@@ -1143,10 +1302,11 @@ int main(int argc, char **argv)
         cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
         memset(large,'a',cfg.initial_len); large[cfg.initial_len-1u]='\n'; cfg.initial=large;
     }
-    if(argc==2 && !strcmp(argv[1],"--maximum")) {
+    if(argc==2 && (!strcmp(argv[1],"--maximum") || !strcmp(argv[1],"--font-small"))) {
         /* (P) Tobias's display from brief; reserve versus 60% startup width. */
         cfg.max_window_width=5120; cfg.max_window_height=1440;
         cfg.window_width=5120u*60u/100u; cfg.window_height=1440u*70u/100u;
+        cfg.font_points=10;
     }
     printf("editor_win: opening mode=%s\n",argc>1 ? argv[1] : "full");
     editor *e=NULL; T(editor_open(&e,&cfg,&b)==0);
@@ -1201,6 +1361,13 @@ int main(int argc, char **argv)
             !strcmp(argv[1],"--close-save") ? close_queue_test(e,false,2u) :
             !strcmp(argv[1],"--close-prompt") ? close_queue_test(e,true,false) :
             !strcmp(argv[1],"--stuck") ? stuck_publication_test(e) :
+            !strcmp(argv[1],"--read-stuck") ? stuck_read_test(e,false,false) :
+            !strcmp(argv[1],"--read-close") ? stuck_read_test(e,false,true) :
+            !strcmp(argv[1],"--read-queue") ? stuck_read_test(e,true,true) :
+            !strcmp(argv[1],"--saveas-close") ? save_as_close_test(e,false) :
+            !strcmp(argv[1],"--saveas-close-save") ? save_as_close_test(e,true) :
+            !strcmp(argv[1],"--notice") ? timeout_notice_test(e) :
+            !strcmp(argv[1],"--font-small") ? smaller_font_test(e) :
             !strcmp(argv[1],"--cloak") ? cloak_test(e) :
             !strcmp(argv[1],"--uncertain") ? uncertain_surface_test(e) :
             !strcmp(argv[1],"--maximum") ? maximum_grid_test(e) :
@@ -1218,6 +1385,13 @@ int main(int argc, char **argv)
             !strcmp(argv[1],"--paint") ? paint_discard_test(e) :
             !strcmp(argv[1],"--fallback") ? fallback_test(e) : lifecycle_test(e);
         puts("editor_win: closing"); editor_close(e); puts("editor_win: closed");
+        if(!rc && !strcmp(argv[1],"--saveas-close")) {
+            b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
+            T(editor_open(&e,&cfg,&b)==0 && settle(e)==0);
+            uint8_t bytes[6]; T(editor_length(e)==sizeof bytes && editor_read(e,0,bytes,sizeof bytes)==0);
+            T(!memcmp(bytes,"qbase\n",sizeof bytes));
+            puts("round30: cancelled Save As recovers exact modified bytes PASS"); editor_close(e);
+        }
         if(!rc && (!strcmp(argv[1],"--close-queue") || !strcmp(argv[1],"--close-fence") || !strcmp(argv[1],"--close-save"))) {
             bool fence=strcmp(argv[1],"--close-queue")!=0;
             b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
@@ -1235,7 +1409,8 @@ int main(int argc, char **argv)
         }
         free(large); cleanup(root); return rc;
     }
-    const char *round4[]={"--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard"};
+    const char *round4[]={"--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard",
+        "--read-stuck","--read-close","--read-queue","--saveas-close","--saveas-close-save","--notice","--font-small"};
     for(size_t at=0;at<sizeof round4/sizeof round4[0];at++) T(run_child_case(round4[at],NULL,0)==0);
     T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);
     T(larger_surface_test(e)==0); T(allocation_failure_test(e)==0); T(resize_failure_test(e)==0);

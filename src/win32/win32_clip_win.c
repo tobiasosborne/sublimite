@@ -206,13 +206,15 @@ static int clip_submit(win32_plat *s, bool set, int which, const void *bytes, si
     }
     AcquireSRWLockExclusive(&c->lock);
     if (c->used==WIN32_EVENT_CAP) { ReleaseSRWLockExclusive(&c->lock); clip_job_free(j); return PLAT_ERR_FAIL; }
-    if(set) { j->id=++c->next_id; if(id) *id=j->id; }
+    j->id=++c->next_id; if(id) *id=j->id;
     c->used++;
     if (c->last) c->last->next=j; else c->first=j;
     c->last=j; (void)SetEvent(c->tasks); ReleaseSRWLockExclusive(&c->lock); return PLAT_OK;
 }
 int win32_clip_submit(win32_plat *s, bool set, int which, const void *bytes, size_t len)
 { return clip_submit(s,set,which,bytes,len,NULL); }
+int win32_clip_request_identified(win32_plat *s, int which, uint64_t *id)
+{ return clip_submit(s,false,which,NULL,0,id); }
 int win32_clip_submit_identified(win32_plat *s, int which, const void *bytes, size_t len, uint64_t *id)
 {
     if(which!=PLAT_CLIP_CLIPBOARD || len>INT_MAX || (!bytes && len) ||

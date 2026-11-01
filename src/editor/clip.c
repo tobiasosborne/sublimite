@@ -35,6 +35,7 @@ struct editor_clip {
     bool publishing, terminal_pending;
     plat_event terminal;
     uint64_t publication, publication_deadline;
+    uint64_t read, read_deadline;
     editor_buffer *publication_owner;
     uint64_t publication_revision;
     view_selection publication_selection;
@@ -103,6 +104,15 @@ int editor_clip_init(editor *e)
 }
 static x11_clip_buf *new_owned(editor_clip *c, size_t len)
 { return x11_clip_buf_new_alloc(len, clip_alloc, clip_free, c); }
+#if defined(_WIN32)
+static uint64_t native_deadline(void)
+{
+    /* (E) One acquisition tolerance plus one foreign-handler tolerance,
+     * including queueing. Win32's SetDoubleClickTime(0) default is 500 ms. */
+    UINT tolerance=GetDoubleClickTime(); if(!tolerance) tolerance=500;
+    return os_now_ns()+2u*(uint64_t)tolerance*UINT64_C(1000000);
+}
+#endif
 static int publish_owned(editor *e, int which, x11_clip_buf *b)
 {
     if (!b) return EDITOR_ERR_MEMORY;
@@ -115,11 +125,7 @@ static int publish_owned(editor *e, int which, x11_clip_buf *b)
             rc=win32_clip_submit_identified(win32_private(&e->platform),which,
                 x11_clip_buf_data(b),x11_clip_buf_len(b),&c->publication);
             if(!rc) {
-                /* (E) Whole native operation: one acquisition tolerance plus
-                 * one foreign-handler tolerance. Both follow the user's OS
-                 * double-click interval, with its documented default. */
-                UINT tolerance=GetDoubleClickTime(); if(!tolerance) tolerance=500;
-                c->publication_deadline=os_now_ns()+2u*(uint64_t)tolerance*UINT64_C(1000000);
+                c->publication_deadline=native_deadline();
                 c->publishing=true; c->publication_owner=e->buffer;
                 c->publication_revision=e->buffer->revision;
                 c->publication_selection=e->v.state.selection;
@@ -268,7 +274,10 @@ bool editor_clip_pending(const editor *e)
 }
 #if defined(_WIN32)
 uint64_t editor_clip_deadline(const editor *e)
-{ return e->clipboard && e->clipboard->publishing ? e->clipboard->publication_deadline : 0; }
+{
+    const editor_clip *c=e->clipboard;
+    return !c ? 0 : c->publishing ? c->publication_deadline : c->read_deadline;
+}
 static bool terminal_ready(const editor *e);
 #endif
 bool editor_clip_runnable(const editor *e)
@@ -391,7 +400,12 @@ static int request_paste(editor *e, int which, bool find_field)
     c->primary_waiting = false;
     if (e->has_platform) {
         if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
+#if defined(_WIN32)
+        int rc=win32_clip_request_identified(win32_private(&e->platform),which,&c->read);
+        if(!rc) c->read_deadline=native_deadline();
+#else
         int rc = plat_clip_request(&e->platform, which);
+#endif
         if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
         if (rc) { c->waiting = false; e->stats.rejected_commands++; }
         return 0;
@@ -548,7 +562,7 @@ int editor_clip_terminal(editor *e,const plat_event *ev)
     /* One explicit native operation at a time. Ownership-loss notifications
      * are independent and cannot overwrite its retained terminal result. */
     if((ev->code==2 && ev->clip_id && c->publishing && ev->clip_id==c->publication) ||
-       (ev->code!=2 && c->waiting && ev->clip_which==c->which)) {
+       (ev->code!=2 && c->waiting && c->read && ev->clip_id==c->read && ev->clip_which==c->which)) {
         c->terminal=*ev; c->terminal_pending=true;
     }
     return 0;
@@ -590,6 +604,10 @@ int editor_clip_event(editor *e, const plat_event *ev)
         return 0;
     }
 #endif
+#if defined(_WIN32)
+    if(ev->code==2 || !c->read || ev->clip_id!=c->read) return 0;
+    c->read=0; c->read_deadline=0;
+#endif
     if (e->buffer->source_stale || e->buffer->pending_open) { c->waiting = false; return 0; }
     if (!c->waiting || ev->clip_which != c->which || ev->code == 2) return 0;
     if (!ev->clip_ok || ev->code) { c->waiting = false; return 0; }
@@ -608,6 +626,17 @@ int editor_clip_poll(editor *e)
         c->publication=0; c->publication_deadline=0;
         e->stats.rejected_commands++;
         e->recovery_notice="clipboard publication timed out; text kept";
+        e->recovery_notice_shown=false;
+        e->recovery_notice_mutations=e->stats.mutations;
+        int rc=editor_full_layout(e); if(rc) return rc;
+    }
+    if(c->read && os_now_ns()>=c->read_deadline) {
+        /* Worker-owned native data may outlive this UI operation. Identity
+         * prevents its late result from satisfying a subsequent paste. */
+        c->read=0; c->read_deadline=0; c->waiting=false;
+        c->find_paste=false; c->terminal_pending=false;
+        e->stats.rejected_commands++;
+        e->recovery_notice="clipboard read timed out; text kept";
         e->recovery_notice_shown=false;
         e->recovery_notice_mutations=e->stats.mutations;
         int rc=editor_full_layout(e); if(rc) return rc;

@@ -744,7 +744,15 @@ void editor_save_overlay(editor *e)
         else status = savectl_get_model(e->session->saving->save).status;
     } else if (b->save_error && !b->source_stale) status = "save failed";
     /* edit-djg: panel chrome owns its rows; retain the notice for panel close. */
-    else if (!e->panel_rows && e->recovery_notice && e->stats.mutations == e->recovery_notice_mutations) {
+    else if (!e->panel_rows && e->recovery_notice &&
+#if defined(_WIN32)
+        (!e->recovery_notice_shown || e->stats.mutations == e->recovery_notice_mutations)) {
+        /* Apply mutation-based expiry only after a status frame can show the
+         * notice. Queued editing may resume before its first composition. */
+        e->recovery_notice_mutations=e->stats.mutations;
+#else
+        e->stats.mutations == e->recovery_notice_mutations) {
+#endif
         status = e->recovery_notice; e->recovery_notice_shown = true; /* edit-btj */
     }
     if (!status || !*status || !e->grid.dims.rows) return;

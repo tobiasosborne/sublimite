@@ -621,8 +621,17 @@ static int submit(editor *e)
 #endif
     if (editor_journal_paint(e) == JOURNAL_BUSY) return 0; /* edit-dzk1: guard before composing */
     size_t count = 0;
+#if defined(_WIN32)
+    bool notice_unshown=!e->recovery_notice_shown;
+#endif
     int rc = editor_compose(e); if (rc) return rc;
     editor_status_overlay(e);
+#if defined(_WIN32)
+    /* Composition can be retried or refused. Start notice expiry only once
+     * its first status frame has actually entered the backend snapshot. */
+    bool notice_first_frame=notice_unshown && e->recovery_notice_shown;
+    if(notice_first_frame) e->recovery_notice_shown=false;
+#endif
     editor_large_index_progress(e);
 #if defined(_WIN32)
     if(e->full_pending) { windows_paint_clear(e); return 0; }
@@ -665,6 +674,9 @@ static int submit(editor *e)
 #endif
     trace_record(TRACE_STARTUP_FIRST_SUBMIT, 0);
     e->frame.submit_ns = trace_now_ns(); e->active_frame = e->frame;
+#if defined(_WIN32)
+    if(notice_first_frame) e->recovery_notice_shown=true;
+#endif
     editor_save_submitted(e, e->frame.submit_ns);
     e->active_frame.scroll = e->scroll_plan;
     e->active_frame.selection = e->v.state.selection;
@@ -1383,7 +1395,9 @@ int editor_step(editor *e, int timeout_ms)
        e->file_command==KEYS_ACTION_NONE && !e->find_replace_request && !e->find_select_pending &&
        !e->wheel_pending && !editor_scroll_waiting(e)) {
         e->win_close_requested=false;
-        if(!editor_close_prompt_shown(e)) { e->quit=true; return close_result(e,timeout_ms); }
+        bool save_as_answer=e->close_prompt.saving && e->go.active &&
+            e->go.owner==e->close_prompt.saving && e->go.kind==KEYS_ACTION_SAVE_AS;
+        if(!editor_close_prompt_shown(e) && !save_as_answer) { e->quit=true; return close_result(e,timeout_ms); }
     }
 #endif
     return runnable(e) ? EDITOR_MORE : EDITOR_OK;

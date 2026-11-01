@@ -415,6 +415,7 @@ struct editor {
 #if defined(_WIN32)
     work_pool lifecycle_pool;
     bool lifecycle_pool_ready;
+    edit_arena grid_reservation; /* font preparation replaces this off typing */
 #endif
     editor_backend_init startup;
     render_backend retired_backend;
@@ -648,6 +649,9 @@ bool editor_font_receive(editor *e, const work_msg *msg);
 int editor_font_poll(editor *e);
 bool editor_font_pending(const editor *e);
 int editor_resize_grid(editor *e, render_dims dims);
+#if defined(_WIN32)
+int editor_grid_prepare(editor *, font_cell);
+#endif
 void editor_journal_staged(editor *e);
 int editor_checkpoint(editor *e);
 /* edit-ivv: JOURNAL_BUSY retry on the journal tick (checkpoint.c). */
