@@ -22,7 +22,37 @@ static struct {
     HANDLE wake_event;
     char move_from[OS_PATH_MAX], move_to[OS_PATH_MAX];
     const char *source;
+    int stream_track, stream_ops, stream_fail_at, stream_cancel_at, stream_cancelled;
+    int stream_mode, stream_reads, stream_writes, stream_malformed;
+    HANDLE stream_source, stream_target;
 } r2;
+static bool r2_stream_hit(void)
+{
+    if (!r2.stream_track) return false;
+    r2.stream_ops++;
+    if (r2.stream_ops == r2.stream_cancel_at) r2.stream_cancelled = 1;
+    if (r2.stream_ops != r2.stream_fail_at) return false;
+    SetLastError(ERROR_ACCESS_DENIED); return true;
+}
+static NTSTATUS NTAPI r2_query(HANDLE h, PIO_STATUS_BLOCK io, PVOID out, ULONG n, FILE_INFORMATION_CLASS kind)
+{
+    if (kind == FileStreamInformation && (r2.fail_streams || r2_stream_hit())) return (NTSTATUS)0xc0000022u;
+    NTSTATUS status = NtQueryInformationFile(h, io, out, n, kind);
+    if (status >= 0 && kind == FileStreamInformation && r2.stream_malformed) {
+        FILE_STREAM_INFO *entry = out;
+        switch (r2.stream_malformed) {
+        case 1: entry->StreamNameLength = n; break;
+        case 2: entry->NextEntryOffset = 1; break;
+        case 3: io->Information = offsetof(FILE_STREAM_INFO, StreamName) - 1; break;
+        case 4: entry->StreamNameLength |= 1; break;
+        case 5: entry->StreamSize.QuadPart = -1; break;
+        case 6: io->Information = (ULONG_PTR)n + 1; break;
+        case 7: entry->StreamName[0] = L'\\'; break;
+        }
+    }
+    return status;
+}
+static void *r2_malloc(size_t n) { return r2_stream_hit() ? NULL : malloc(n); }
 static __attribute__((unused)) HANDLE WINAPI r2_reopen(HANDLE h, DWORD access, DWORD share, DWORD flags)
 {
     if (r2.no_write_owner && (access & WRITE_OWNER)) {
@@ -36,7 +66,6 @@ static __attribute__((unused)) HANDLE WINAPI r2_reopen(HANDLE h, DWORD access, D
 }
 static BOOL WINAPI r2_info(HANDLE h, FILE_INFO_BY_HANDLE_CLASS kind, LPVOID out, DWORD n)
 {
-    if (r2.fail_streams && kind == FileStreamInfo) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
     BOOL ok = GetFileInformationByHandleEx(h, kind, out, n);
     if (ok && r2.encrypted && kind == FileBasicInfo)
         ((FILE_BASIC_INFO *)out)->FileAttributes |= FILE_ATTRIBUTE_ENCRYPTED;
@@ -74,10 +103,13 @@ static __attribute__((unused)) DWORD WINAPI r2_final_name(HANDLE h, LPWSTR out, 
 static void r2_close(os_file *f)
 {
     if (r2.delay_close && os_file_handle(f) == r2.writer) r2.closed = 1;
+    if (os_file_handle(f) == r2.stream_source) r2.stream_source = NULL;
+    if (os_file_handle(f) == r2.stream_target) r2.stream_target = NULL;
     os_file_close(f);
 }
 static os_err r2_stat(const os_file *f, os_stat *st)
 {
+    if (os_file_handle(f) == r2.stream_source && r2_stream_hit()) return OS_E_ACCESS;
     os_err e = os_file_stat(f, st);
     if (e == OS_OK && r2.delay_close && !r2.closed) st->mtime_ns = 1;
     return e;
@@ -85,6 +117,8 @@ static os_err r2_stat(const os_file *f, os_stat *st)
 static __attribute__((unused)) NTSTATUS NTAPI r2_nt_create(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io,
     PLARGE_INTEGER size, ULONG attrs, ULONG share, ULONG disp, ULONG opts, PVOID ea, ULONG n)
 {
+    bool stream = oa->ObjectName->Length && oa->ObjectName->Buffer[0] == L':';
+    if (stream && r2_stream_hit()) return (NTSTATUS)0xc0000022u;
     if (r2.moving) {
         r2.moving = 0;
         (void)os_rename(r2.move_from, r2.move_to, OS_RENAME_NOREPLACE); (void)os_mkdir(r2.move_from);
@@ -103,10 +137,48 @@ static __attribute__((unused)) NTSTATUS NTAPI r2_nt_create(PHANDLE h, ACCESS_MAS
         if (GetSecurityDescriptorControl(oa->SecurityDescriptor, &control, &revision) &&
             (control & SE_DACL_PROTECTED) && !(rights & (FILE_READ_DATA | FILE_WRITE_DATA))) r2.secure_create++;
     }
-    return NtCreateFile(h, access, oa, io, size, attrs, share, disp, opts, ea, n);
+    NTSTATUS status = NtCreateFile(h, access, oa, io, size, attrs, share, disp, opts, ea, n);
+    if (status >= 0 && stream) {
+        if (disp == FILE_CREATE) r2.stream_target = *h;
+        else r2.stream_source = *h;
+    }
+    return status;
+}
+static os_err r2_pread(os_file *f, void *p, size_t n, uint64_t offset, size_t *got)
+{
+    if (os_file_handle(f) == r2.stream_source) {
+        r2.stream_reads++;
+        if (r2_stream_hit()) return OS_E_ACCESS;
+        if (r2.stream_mode == 1 && n > 4093u) n = 4093u; /* prime-sized short transfers */
+        if (r2.stream_mode == 3) { *got = 0; return OS_OK; }
+        if (r2.stream_mode == 4 && r2.stream_reads == 1) return OS_E_INTR;
+        if ((r2.stream_mode == 5 || r2.stream_mode == 8) && r2.stream_reads == 2) {
+            os_file other = OS_FILE_INIT; size_t done = 0;
+            if (os_file_open(&other, r2.source, OS_OPEN_RDWR) == OS_OK)
+                (void)os_file_pwrite_once(&other, "!", 1, 0, &done);
+            os_file_close(&other);
+            if (r2.stream_mode == 8) { SetLastError(ERROR_READ_FAULT); return OS_E_IO; }
+        }
+        if (r2.stream_mode == 6 && offset) ExitProcess(77); /* death during a large ADS */
+        if (r2.stream_mode == 7 && r2.stream_reads == 2)
+            (void)os_rename(r2.source, r2.move_to, OS_RENAME_REPLACE);
+    }
+    return os_file_pread(f, p, n, offset, got);
+}
+static os_err r2_sync(os_file *f)
+{
+    if (os_file_handle(f) == r2.stream_target && r2_stream_hit()) return OS_E_ACCESS;
+    return os_file_sync(f);
 }
 static os_err r2_pwrite(os_file *f, const void *p, size_t n, uint64_t offset, size_t *written)
 {
+    if (os_file_handle(f) == r2.stream_target) {
+        r2.stream_writes++;
+        if (r2_stream_hit()) return OS_E_ACCESS;
+        if (r2.stream_mode == 1 && n > 4091u) n = 4091u;
+        if (r2.stream_mode == 2) { *written = 0; return OS_OK; }
+        if (r2.stream_mode == 4 && r2.stream_writes == 1) return OS_E_INTR;
+    }
     r2.write_calls++;
     if (r2.write_mode == 1 && r2.write_calls <= 3) { *written = 0; SetLastError(ERROR_OPERATION_ABORTED); return OS_E_INTR; }
     if (r2.write_mode == 2 && r2.write_calls == 2) { *written = 0; SetLastError(ERROR_DISK_FULL); return OS_E_NOSPC; }
@@ -140,6 +212,9 @@ static BOOL WINAPI r2_read_directory(HANDLE h, LPVOID p, DWORD n, BOOL subtree, 
     return ReadDirectoryChangesW(h, p, n, subtree, filter, got, io, done);
 }
 #define os_file_pwrite_once r2_pwrite
+#define os_file_pread r2_pread
+#define os_file_sync r2_sync
+#define NtQueryInformationFile r2_query
 #define NtSetSecurityObject r2_set_object
 #define GetOverlappedResult r2_result
 #define ReadDirectoryChangesW r2_read_directory
@@ -156,8 +231,13 @@ static BOOL WINAPI r2_read_directory(HANDLE h, LPVOID p, DWORD n, BOOL subtree, 
 #define FILE_R2_WIN_SOURCE "../../src/file/file_win.c"
 #endif
 #include FILE_R2_COMMON_SOURCE
+#define malloc r2_malloc
 #include FILE_R2_WIN_SOURCE
+#undef malloc
 #undef os_file_pwrite_once
+#undef os_file_pread
+#undef os_file_sync
+#undef NtQueryInformationFile
 #undef NtSetSecurityObject
 #undef GetOverlappedResult
 #undef ReadDirectoryChangesW
@@ -220,12 +300,13 @@ static void r2_temp_step(void *ctx, int step)
     }
     os_dir_iter_close(&it); os_dir_close(&d);
 }
+static int r2_stream_stop(void *ctx) { (void)ctx; return r2.stream_cancelled; }
 static int r2_save(const char *path, void (*step)(void *, int))
 {
     piece_allocator a = piece_default_allocator(); piece_tree *t = piece_create(&a);
     CHECK(t && piece_init_copy(t, (const uint8_t *)"replacement", 11) == PIECE_OK);
     piece_snapshot *s = piece_snapshot_take(t); CHECK(s);
-    file_save_args args = {.path = path, .snap = s, .step = step};
+    file_save_args args = {.path = path, .snap = s, .step = step, .stop = r2_stream_stop};
     r2.source = path;
     int rc = file_save_write(&args); r2.last_error = args.err_no;
     piece_snapshot_release(s); piece_destroy(t); return rc;
@@ -265,15 +346,111 @@ static void r2_efs(void)
 }
 static void r2_streams(void)
 {
-    char path[OS_PATH_MAX], stream[OS_PATH_MAX]; win_path(path, "streams");
+    char path[OS_PATH_MAX]; win_path(path, "streams");
     win_write(path, (const uint8_t *)"original", 8);
-    CHECK(snprintf(stream, sizeof stream, "%s:first", path) > 0); win_write(stream, (const uint8_t *)"one", 3);
-    CHECK(snprintf(stream, sizeof stream, "%s:Zone.Identifier", path) > 0); win_write(stream, (const uint8_t *)"two", 3);
-    CHECK(r2_save(path, r2_temp_step) == FILE_ERR_IO && r2.last_error == ERROR_NOT_SUPPORTED);
-    CHECK(r2.created == 0); win_read_equals(path, (const uint8_t *)"original", 8);
-    win_read_equals(stream, (const uint8_t *)"two", 3);
-    CHECK(snprintf(stream, sizeof stream, "%s:first", path) > 0); win_read_equals(stream, (const uint8_t *)"one", 3);
+    win_streams(path, true);
+    os_file attributes = OS_FILE_INIT;
+    CHECK(os_file_open(&attributes, path, OS_OPEN_RDWR) == OS_OK);
+    CHECK(os_file_set_mode(&attributes, 0444) == OS_OK); os_file_close(&attributes);
+    CHECK(r2_save(path, NULL) == FILE_OK);
+    win_read_equals(path, (const uint8_t *)"replacement", 11);
+    win_streams(path, false); file_os_no_temps(root);
+    os_stat st; CHECK(os_stat_path(path, 0, &st) == OS_OK && !(st.perm & 0200u));
     CHECK(os_unlink(path) == OS_OK);
+}
+static void r2_stream_failures(void)
+{
+    char path[OS_PATH_MAX]; win_path(path, "stream-failures");
+    win_write(path, (const uint8_t *)"original", 8); win_streams(path, true);
+    r2.stream_track = 1;
+    CHECK(r2_save(path, NULL) == FILE_OK);
+    int steps = r2.stream_ops;
+    CHECK(steps > 0);
+    for (int step = 1; step <= steps; step++) {
+        win_write(path, (const uint8_t *)"original", 8); win_streams(path, true);
+        r2.stream_ops = 0; r2.stream_fail_at = step;
+        int rc = r2_save(path, NULL);
+        if (rc != FILE_ERR_IO) fprintf(stderr, "stream failure step=%d/%d rc=%d native=%d\n", step, steps, rc, r2.last_error);
+        CHECK(rc == FILE_ERR_IO && r2.last_error != 0);
+        CHECK(!r2.stream_source && !r2.stream_target);
+        win_read_equals(path, (const uint8_t *)"original", 8); win_streams(path, false); file_os_no_temps(root);
+    }
+    r2.stream_fail_at = 0;
+    for (int step = 1; step <= steps; step++) {
+        r2.stream_ops = 0; r2.stream_cancel_at = step; r2.stream_cancelled = 0;
+        CHECK(r2_save(path, NULL) == FILE_ERR_CANCELLED);
+        CHECK(!r2.stream_source && !r2.stream_target);
+        win_read_equals(path, (const uint8_t *)"original", 8); win_streams(path, false); file_os_no_temps(root);
+    }
+    r2.stream_cancel_at = 0; r2.stream_cancelled = 0;
+    for (int mode = 1; mode <= 5; mode++) {
+        r2.stream_mode = mode; r2.stream_reads = 0; r2.stream_writes = 0;
+        int expected = mode == 2 ? FILE_ERR_IO : mode == 3 || mode == 5 ? FILE_ERR_CHANGED : FILE_OK;
+        CHECK(r2_save(path, NULL) == expected);
+        win_read_equals(path, (const uint8_t *)(mode == 5 ? "!riginal" : expected == FILE_OK ? "replacement" : "original"),
+                        mode == 5 || expected != FILE_OK ? 8 : 11);
+        win_streams(path, false); file_os_no_temps(root);
+        win_write(path, (const uint8_t *)"original", 8); win_streams(path, true);
+    }
+    r2.stream_mode = 0;
+    r2.stream_reads = 0; r2.stream_mode = 8;
+    CHECK(r2_save(path, NULL) == FILE_ERR_CHANGED);
+    win_read_equals(path, (const uint8_t *)"!riginal", 8); win_streams(path, false); file_os_no_temps(root);
+    win_write(path, (const uint8_t *)"original", 8); win_streams(path, true); r2.stream_mode = 0;
+    for (int malformed = 1; malformed <= 7; malformed++) {
+        r2.stream_malformed = malformed;
+        CHECK(r2_save(path, NULL) == FILE_ERR_IO && r2.last_error == ERROR_INVALID_DATA);
+        win_read_equals(path, (const uint8_t *)"original", 8); win_streams(path, false); file_os_no_temps(root);
+    }
+    r2.stream_malformed = 0;
+    /* A rename of the target during a read still opens streams on the pinned
+     * original, then refuses at the existing pathname identity check. */
+    win_path(r2.move_to, "stream-moved"); r2.stream_mode = 7; r2.stream_reads = 0;
+    CHECK(r2_save(path, NULL) == FILE_ERR_CHANGED);
+    win_read_equals(r2.move_to, (const uint8_t *)"original", 8); win_streams(r2.move_to, false);
+    CHECK(os_unlink(r2.move_to) == OS_OK); file_os_no_temps(root);
+    r2.stream_mode = 0; r2.stream_track = 0;
+    printf("file_win_test: stream copy failure and cancellation at all %d observed operations: ok\n", steps);
+}
+static void r2_stream_crash(void)
+{
+    char path[OS_PATH_MAX], exe[OS_PATH_MAX]; win_path(path, "stream-crash");
+    win_write(path, (const uint8_t *)"original", 8); win_streams(path, true);
+    CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
+    const char *args[] = {exe, "--child-stream-copy", path, NULL}; os_proc child; os_proc_status status;
+    CHECK(os_proc_spawn(&child, args) == OS_OK);
+    CHECK(os_proc_wait(&child, INT64_C(120) * INT64_C(1000000000), &status) == OS_OK);
+    CHECK(status.how == OS_PROC_EXITED && status.code == 77);
+    win_read_equals(path, (const uint8_t *)"original", 8); win_streams(path, false);
+    /* Process death may leave its private temporary; verify it is never the
+     * public target, then remove the test-owned artifact like win_durability. */
+    CHECK(os_unlink(path) == OS_OK);
+    os_dir dir = OS_DIR_INIT; os_dir_iter it; const char *name; bool seen = false;
+    CHECK(os_dir_open(&dir, root) == OS_OK && os_dir_iter_open(&it, &dir) == OS_OK);
+    for (;;) {
+        CHECK(os_dir_next(&it, &name) == OS_OK); if (!name) break;
+        CHECK(!strncmp(name, ".edit-", strlen(".edit-"))); seen = true;
+        CHECK(os_unlink_at(&dir, name) == OS_OK);
+    }
+    CHECK(seen); os_dir_iter_close(&it); os_dir_close(&dir);
+}
+static void r2_stream_many(void)
+{
+    char path[OS_PATH_MAX]; win_path(path, "stream-many"); win_write(path, (const uint8_t *)"original", 8);
+    /* Exceed the removed 65536-byte enumeration cap using near-component-limit
+     * names. Count derives from the API entry header and counted UTF-16 name. */
+    size_t units = 240, count = 65536u / (offsetof(FILE_STREAM_INFO, StreamName) + (240u + 7u) * sizeof(WCHAR)) + 1u;
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < count; i++) {
+            char name[256], stream[OS_PATH_MAX]; memset(name, 'x', units); name[units] = 0;
+            CHECK(snprintf(name, 9, "%08zu", i) == 8); name[8] = 'x';
+            CHECK(snprintf(stream, sizeof stream, "%s:%s", path, name) > 0);
+            if (!pass) win_write(stream, (const uint8_t *)name, units);
+            else win_read_equals(stream, (const uint8_t *)name, units);
+        }
+        if (!pass) CHECK(r2_save(path, NULL) == FILE_OK);
+    }
+    win_read_equals(path, (const uint8_t *)"replacement", 11); CHECK(os_unlink(path) == OS_OK);
 }
 static void r2_descriptor(void)
 {
@@ -494,8 +671,11 @@ static void r2_cleanup(const char *directory)
 }
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--child-stream-copy")) {
+        r2.stream_mode = 6; return r2_save(argv[2], NULL);
+    }
     if (argc == 1) {
-        const char *cases[] = {"security", "efs", "streams", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
+        const char *cases[] = {"security", "efs", "streams", "stream-failures", "stream-crash", "stream-many", "descriptor", "rights", "label", "identity", "wake", "parent", "cache", "unicode", "failures", "watch-errors"};
         char exe[OS_PATH_MAX]; CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             const char *args[] = {exe, cases[i], NULL}; os_proc child; os_proc_status status;
@@ -513,6 +693,9 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "security")) r2_security();
     else if (!strcmp(argv[1], "efs")) r2_efs();
     else if (!strcmp(argv[1], "streams")) r2_streams();
+    else if (!strcmp(argv[1], "stream-failures")) r2_stream_failures();
+    else if (!strcmp(argv[1], "stream-crash")) r2_stream_crash();
+    else if (!strcmp(argv[1], "stream-many")) r2_stream_many();
     else if (!strcmp(argv[1], "descriptor")) r2_descriptor();
     else if (!strcmp(argv[1], "rights")) r2_rights();
     else if (!strcmp(argv[1], "label")) r2_label();

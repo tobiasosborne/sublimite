@@ -9,6 +9,7 @@
 #ifndef NtSetSecurityObject
 NTSYSAPI NTSTATUS NTAPI NtSetSecurityObject(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
 #endif
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -315,35 +316,165 @@ int file_native_error(os_err error)
     return (int)native;
 }
 
-/* EFS and named streams require a separate preservation transaction. Refuse
- * before creating a temporary rather than silently changing either state. */
+/* EFS needs a separate encryption-preservation transaction. */
 int file_metadata_check(const os_file *source)
 {
     FILE_BASIC_INFO basic;
     if (!GetFileInformationByHandleEx(os_file_handle(source), FileBasicInfo, &basic, sizeof basic)) return -1;
     if (basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED) return watch_error(ERROR_FILE_ENCRYPTED);
-    /* A descriptor-sized native stream buffer; an overlarge enumeration is a
-     * refusal, never a reason to assume the file has no additional streams. */
-    DWORD capacity = 65536u; /* (P) maximum native security descriptor size */
-    FILE_STREAM_INFO *streams = malloc(capacity);
-    if (!streams) return watch_error(ERROR_NOT_ENOUGH_MEMORY);
+    return 0;
+}
+
+/* Query the retained object, not a pathname that could now name another file.
+ * NtQueryInformationFile supplies the actual returned byte length. A truncated
+ * list is retried with a larger buffer, never treated as a complete list. */
+static int streams_query(save_transaction *tx, void **out, size_t *length)
+{
+    ULONG capacity = sizeof(FILE_STREAM_INFO);
+    for (;;) {
+        if (tx->args.stop && tx->args.stop(tx->args.stop_ctx)) return FILE_ERR_CANCELLED;
+        void *buffer = malloc(capacity);
+        if (!buffer) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FILE_ERR_IO; }
+        IO_STATUS_BLOCK io = {0};
+        NTSTATUS status = NtQueryInformationFile(os_file_handle(&tx->metadata_fd), &io,
+            buffer, capacity, FileStreamInformation);
+        if (status == (NTSTATUS)0x80000005u || status == (NTSTATUS)0xc0000023u ||
+            status == (NTSTATUS)0xc0000004u) { /* OVERFLOW, TOO_SMALL, LENGTH_MISMATCH */
+            free(buffer);
+            if (capacity > MAXDWORD / 2u) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FILE_ERR_IO; }
+            capacity *= 2u;
+            continue;
+        }
+        if (status < 0 || io.Information > capacity) {
+            free(buffer);
+            SetLastError(status < 0 ? RtlNtStatusToDosError(status) : ERROR_INVALID_DATA);
+            return FILE_ERR_IO;
+        }
+        *out = buffer; *length = (size_t)io.Information;
+        return FILE_OK;
+    }
+}
+static int stream_open(const os_file *base, const FILE_STREAM_INFO *entry, bool write, os_file *out)
+{
+    /* The API supplies a counted UTF-16 name; no terminator or fixed name cap.
+     * UNICODE_STRING's USHORT length is the native open boundary. */
+    UNICODE_STRING name = {(USHORT)entry->StreamNameLength, (USHORT)entry->StreamNameLength,
+                           (WCHAR *)entry->StreamName};
+    OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK io;
+    InitializeObjectAttributes(&oa, &name, 0, os_file_handle(base), NULL);
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    NTSTATUS status = NtCreateFile(&handle, (write ? FILE_GENERIC_WRITE : FILE_GENERIC_READ),
+        &oa, &io, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_DELETE,
+        write ? FILE_CREATE : FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (status < 0) return watch_error(RtlNtStatusToDosError(status));
+    out->handle = handle;
+    return 0;
+}
+static int stream_copy(save_transaction *tx, const FILE_STREAM_INFO *entry, uint8_t *buffer, size_t capacity)
+{
+    os_file source = OS_FILE_INIT, target = OS_FILE_INIT;
+    int rc = FILE_ERR_IO;
     DWORD error = ERROR_SUCCESS;
-    if (!GetFileInformationByHandleEx(os_file_handle(source), FileStreamInfo, streams, capacity)) error = GetLastError();
-    else {
+    if (stream_open(&tx->metadata_fd, entry, false, &source) != 0 ||
+        stream_open(&tx->fd, entry, true, &target) != 0) goto done;
+    /* Stream opens are relative to the captured file objects, including when
+     * the parent or target pathname moves during the copy. */
+    uint64_t offset = 0, size = (uint64_t)entry->StreamSize.QuadPart;
+    while (offset < size) {
+        if (tx->args.stop && tx->args.stop(tx->args.stop_ctx)) { rc = FILE_ERR_CANCELLED; goto done; }
+        size_t n = size - offset < capacity ? (size_t)(size - offset) : capacity, got = 0;
+        os_err result = os_file_pread(&source, buffer, n, offset, &got);
+        if (result == OS_E_INTR) continue;
+        if (result != OS_OK) goto done;
+        if (!got) { rc = FILE_ERR_CHANGED; goto done; }
         size_t at = 0;
-        for (;;) {
-            FILE_STREAM_INFO *entry = (void *)((BYTE *)streams + at);
-            size_t head = offsetof(FILE_STREAM_INFO, StreamName);
-            if (at > capacity - head || entry->StreamNameLength > capacity - at - head) { error = ERROR_INVALID_DATA; break; }
-            if (entry->StreamNameLength != sizeof(L"::$DATA") - sizeof(WCHAR) ||
-                memcmp(entry->StreamName, L"::$DATA", sizeof(L"::$DATA") - sizeof(WCHAR))) { error = ERROR_NOT_SUPPORTED; break; }
-            if (!entry->NextEntryOffset) break;
-            if (entry->NextEntryOffset < head || entry->NextEntryOffset > capacity - at - head) { error = ERROR_INVALID_DATA; break; }
-            at += entry->NextEntryOffset;
+        while (at < got) {
+            if (tx->args.stop && tx->args.stop(tx->args.stop_ctx)) { rc = FILE_ERR_CANCELLED; goto done; }
+            size_t written = 0;
+            result = os_file_pwrite_once(&target, buffer + at, got - at, offset + at, &written);
+            if (result == OS_E_INTR) continue;
+            if (result != OS_OK) goto done;
+            if (!written) { SetLastError(ERROR_WRITE_FAULT); goto done; }
+            at += written;
+        }
+        offset += got;
+    }
+    /* Detect growth/truncation even if default-stream timestamps are deferred. */
+    os_stat st;
+    if (os_file_stat(&source, &st) != OS_OK) goto done;
+    if (st.size != size) { rc = FILE_ERR_CHANGED; goto done; }
+    if (tx->args.stop && tx->args.stop(tx->args.stop_ctx)) { rc = FILE_ERR_CANCELLED; goto done; }
+    if (os_file_sync(&target) != OS_OK) goto done;
+    rc = FILE_OK;
+done:
+    error = GetLastError();
+    os_file_close(&target); os_file_close(&source);
+    SetLastError(error);
+    return rc;
+}
+int file_streams_copy(save_transaction *tx)
+{
+    if (!os_file_is_open(&tx->metadata_fd)) return FILE_OK;
+    void *list = NULL; size_t length = 0;
+    uint8_t *buffer = NULL;
+    int rc = streams_query(tx, &list, &length);
+    if (rc != FILE_OK) goto done;
+    size_t at = 0, head = offsetof(FILE_STREAM_INFO, StreamName);
+    while (at < length) {
+        if (tx->args.stop && tx->args.stop(tx->args.stop_ctx)) { rc = FILE_ERR_CANCELLED; goto done; }
+        if (length - at < head) goto invalid;
+        FILE_STREAM_INFO *entry = (void *)((BYTE *)list + at);
+        size_t n = entry->StreamNameLength;
+        if (n > length - at - head || n % sizeof(WCHAR) || n > USHRT_MAX ||
+            entry->StreamSize.QuadPart < 0) goto invalid;
+        size_t units = n / sizeof(WCHAR);
+        if (units < 7 || entry->StreamName[0] != L':' ||
+            memcmp(entry->StreamName + units - 6, L":$DATA", 6 * sizeof(WCHAR))) goto invalid;
+        /* Refuse malformed/foreign stream types rather than lose them. */
+        for (size_t i = 1; i < units - 6; i++)
+            if (!entry->StreamName[i] || entry->StreamName[i] == L':' ||
+                entry->StreamName[i] == L'/' || entry->StreamName[i] == L'\\') goto invalid;
+        if (units != 7) { /* ::$DATA is the snapshot already written. */
+            /* Same transfer bound as default-stream FILE_WRITE_CHUNK:
+             * FILE_PREFIX_MAX / 4 = 256 KiB. Save worker only. */
+            size_t capacity = FILE_PREFIX_MAX / 4u;
+            if (!buffer) buffer = malloc(capacity);
+            if (!buffer) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); rc = FILE_ERR_IO; goto done; }
+            rc = stream_copy(tx, entry, buffer, capacity);
+            if (rc != FILE_OK) goto done;
+        }
+        if (!entry->NextEntryOffset) break;
+        if (entry->NextEntryOffset < head + n || entry->NextEntryOffset % _Alignof(FILE_STREAM_INFO) ||
+            entry->NextEntryOffset > length - at - head) goto invalid;
+        at += entry->NextEntryOffset;
+    }
+    rc = FILE_OK;
+    goto done;
+invalid:
+    SetLastError(ERROR_INVALID_DATA); rc = FILE_ERR_IO;
+done:;
+    DWORD error = GetLastError();
+    /* A vanished/changed stream can make an open/read fail. Give the caller
+     * the transaction's normal CHANGED result if the captured target changed;
+     * genuine copy errors retain their native diagnostic. Success is checked
+     * again by metadata_apply and the existing pre-rename pathname check. */
+    if (rc == FILE_ERR_IO) {
+        os_stat st; file_id observed;
+        if (os_file_stat(&tx->metadata_fd, &st) == OS_OK) {
+            file_id_from_stat(&observed, &st);
+            if (file_id_diff(&tx->metadata_id, &observed)) rc = FILE_ERR_CHANGED;
+        }
+        os_err result = os_stat_at(&tx->dfd, tx->base, OS_STAT_NOFOLLOW, &st);
+        if (result == OS_E_NOENT || result == OS_E_NOTDIR) rc = FILE_ERR_CHANGED;
+        else if (result == OS_OK) {
+            file_id_from_stat(&observed, &st);
+            if (file_id_diff(&tx->metadata_id, &observed)) rc = FILE_ERR_CHANGED;
         }
     }
-    free(streams);
-    return error == ERROR_SUCCESS ? 0 : watch_error(error);
+    free(buffer); free(list);
+    if (rc == FILE_ERR_IO) tx->args.err_no = (int)error;
+    SetLastError(error);
+    return rc;
 }
 
 /* Non-audit access-control state is queryable with READ_CONTROL. Unknown
@@ -414,7 +545,7 @@ int file_save_temp(save_transaction *tx)
     return 0;
 }
 
-int file_metadata_copy(const os_file *source, os_file *target, const file_id *identity)
+static int metadata_copy(const os_file *source, os_file *target, const file_id *identity, bool final)
 {
     (void)identity;
     PSECURITY_DESCRIPTOR original = NULL, current = NULL;
@@ -463,15 +594,20 @@ int file_metadata_copy(const os_file *source, os_file *target, const file_id *id
         attributes.FileAttributes = basic.FileAttributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
             FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_OFFLINE |
             FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+        /* New stream handles must still be creatable on a read-only target.
+         * The final application restores READONLY before flush/replacement. */
+        if (!final) attributes.FileAttributes &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
         if (!attributes.FileAttributes) attributes.FileAttributes = FILE_ATTRIBUTE_NORMAL;
         if (!SetFileInformationByHandle(os_file_handle(target), FileBasicInfo, &attributes, sizeof attributes)) error = GetLastError();
     }
     return error == ERROR_SUCCESS ? 0 : watch_error(error);
 }
+int file_metadata_copy(const os_file *source, os_file *target, const file_id *identity)
+{ return metadata_copy(source, target, identity, true); }
 int file_metadata_prepare(save_transaction *tx)
 {
     if (!os_file_is_open(&tx->metadata_fd)) return 0;
-    return file_metadata_copy(&tx->metadata_fd, &tx->fd, &tx->metadata_id);
+    return metadata_copy(&tx->metadata_fd, &tx->fd, &tx->metadata_id, false);
 }
 
 #endif

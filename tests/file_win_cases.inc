@@ -42,6 +42,24 @@ static void win_read_equals(const char *path, const uint8_t *bytes, size_t n)
     CHECK(os_file_pread(&source, got, n, 0, &done) == OS_OK && done == n && !memcmp(got, bytes, n));
     free(got); os_file_close(&source);
 }
+/* Large ADS spans the save transfer chunk, with a tail to detect truncation.
+ * The other fixtures cover MOTW, UTF-16 names, multiple streams and empty ADS. */
+static void win_streams(const char *path, bool create)
+{
+    const char *names[] = {"Zone.Identifier", "large", "métadonnées-界-😀", "empty"};
+    const uint8_t zone[] = "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.test/download\r\n";
+    size_t large_len = FILE_PREFIX_MAX + 1u;
+    uint8_t *large = malloc(large_len); CHECK(large);
+    for (size_t i = 0; i < large_len; i++) large[i] = (uint8_t)(i ^ (i >> 8));
+    const uint8_t *bytes[] = {zone, large, (const uint8_t *)"\0\xff\x01unicode", zone};
+    size_t lengths[] = {sizeof zone - 1, large_len, sizeof "\0\xff\x01unicode" - 1, 0};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        char stream[OS_PATH_MAX]; CHECK(snprintf(stream, sizeof stream, "%s:%s", path, names[i]) > 0);
+        if (create) win_write(stream, bytes[i], lengths[i]);
+        else win_read_equals(stream, bytes[i], lengths[i]);
+    }
+    free(large);
+}
 static file *win_open(const char *path, uint64_t threshold)
 {
     file_open_opts opts = {threshold, 7}; file *f = NULL; file_msg m = {0};
@@ -134,6 +152,30 @@ static file_msg win_wait_save(file *f)
         os_sleep_ns(1000000);
     } while (os_now_ns() < until);
     CHECK(0); return messages.message;
+}
+static void win_stream_save_as(void)
+{
+    char source[OS_PATH_MAX], target[OS_PATH_MAX], stream[OS_PATH_MAX];
+    win_path(source, "save-as-source"); win_path(target, "save-as-target");
+    win_write(source, (const uint8_t *)"source", 6);
+    CHECK(snprintf(stream, sizeof stream, "%s:source-only", source) > 0);
+    win_write(stream, (const uint8_t *)"source metadata", 15);
+    file *f = win_open(source, UINT64_MAX); piece_tree *tree = win_tree(f);
+    CHECK(piece_insert(tree, 0, (const uint8_t *)"new ", 4) == PIECE_OK);
+    piece_snapshot *snapshot = piece_snapshot_take(tree); CHECK(snapshot);
+    win_write(target, (const uint8_t *)"destination", 11); win_streams(target, true);
+    file_save_args args = {.path = target, .snap = snapshot};
+    CHECK(file_save_write(&args) == FILE_OK);
+    win_read_equals(target, (const uint8_t *)"new source", 10); win_streams(target, false);
+    win_read_equals(source, (const uint8_t *)"source", 6); win_read_equals(stream, (const uint8_t *)"source metadata", 15);
+    CHECK(snprintf(stream, sizeof stream, "%s:source-only", target) > 0);
+    os_file absent = OS_FILE_INIT; CHECK(os_file_open(&absent, stream, OS_OPEN_READ) == OS_E_NOENT); os_file_close(&absent);
+    CHECK(os_unlink(target) == OS_OK);
+    CHECK(file_save_write(&args) == FILE_OK); /* new Save As target gets no source ADS */
+    CHECK(os_file_open(&absent, stream, OS_OPEN_READ) == OS_E_NOENT); os_file_close(&absent);
+    piece_snapshot_release(snapshot); piece_destroy(tree); file_close(f);
+    CHECK(os_unlink(source) == OS_OK && os_unlink(target) == OS_OK); file_os_no_temps(root);
+    puts("file_test: Save As preserves destination streams, source streams stay with source: ok");
 }
 static void win_save_step(void *ctx, int step) { *(int *)ctx = step; }
 static void win_save_roundtrip(void)
@@ -282,6 +324,7 @@ static void win_durability(void)
     CHECK(os_proc_self_path(exe, sizeof exe) == OS_OK);
     for (int step = FILE_STEP_TEMP_CREATED; step <= FILE_STEP_DIR_SYNCED; step++) {
         win_write(path, old, sizeof old - 1);
+        win_streams(path, true);
         PSECURITY_DESCRIPTOR sd = NULL; PACL acl = NULL; BOOL present, def;
         CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;OW)", SDDL_REVISION_1, &sd, NULL));
         CHECK(GetSecurityDescriptorDacl(sd, &present, &acl, &def));
@@ -300,6 +343,7 @@ static void win_durability(void)
         const uint8_t *expected = step >= FILE_STEP_RENAMED ? next : old;
         size_t n = step >= FILE_STEP_RENAMED ? FILE_PREFIX_MAX : sizeof old - 1;
         win_read_equals(path, expected, n);
+        win_streams(path, false);
         os_dir dir = OS_DIR_INIT; os_dir_iter it; const char *name;
         CHECK(os_dir_open(&dir, root) == OS_OK && os_dir_iter_open(&it, &dir) == OS_OK);
         for (;;) {
@@ -337,7 +381,7 @@ int main(int argc, char **argv)
     CHECK(os_mkdir(root) == OS_OK); trace_init(); CHECK(work_pool_init(&pool, 1, 1) == 0);
     file_os_migration_cases(&pool, root);
     file_os_round2_cases(&pool, root);
-    win_eol_and_copy(); win_copy_suffix(); win_mapping(); win_save_roundtrip(); win_save_errors(); win_notifications(); win_durability();
+    win_eol_and_copy(); win_copy_suffix(); win_mapping(); win_save_roundtrip(); win_save_errors(); win_stream_save_as(); win_notifications(); win_durability();
     CHECK(file_test_guard_registry() == 3);
     work_pool_shutdown(&pool); CHECK(os_rmdir(root) == OS_OK);
     puts("file_test: SKIP Linux SIGBUS signal-action chaining and real truncation: native Windows faults use the OS fault trigger; NTFS refuses mapped truncation");

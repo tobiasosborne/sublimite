@@ -14,9 +14,9 @@ static void before_rename(void *ctx, int step)
 static void contents(const char *path, const char *expected)
 {
     os_file file=OS_FILE_INIT; CHECK(os_file_open(&file,path,OS_OPEN_READ)==OS_OK);
-    uint8_t bytes[sizeof "saved"]; size_t n=0;
-    CHECK(os_file_read(&file,bytes,sizeof bytes,&n)==OS_OK);
-    CHECK(n==strlen(expected) && !memcmp(bytes,expected,n)); os_file_close(&file);
+    size_t capacity=strlen(expected)+1, n=0; uint8_t *bytes=malloc(capacity); CHECK(bytes);
+    CHECK(os_file_read(&file,bytes,capacity,&n)==OS_OK);
+    CHECK(n==strlen(expected) && !memcmp(bytes,expected,n)); free(bytes); os_file_close(&file);
 }
 static void no_save_temporary(fixture *f)
 {
@@ -63,12 +63,40 @@ static void production_save(void)
     piece_destroy(tree); fini(&f);
     puts("savectl production Windows fsynced before rename, mapped old target, bytes/status/baseline: ok");
 }
+static void production_streams(void)
+{
+    fixture f; init(&f,(const uint8_t *)"old",3);
+    char stream[OS_PATH_MAX]; CHECK(snprintf(stream,sizeof stream,"%s:Zone.Identifier",f.path)>0);
+    const uint8_t zone[]="[ZoneTransfer]\r\nZoneId=3\r\n";
+    put(f.path,(const uint8_t *)"external",8);
+    put(stream,zone,sizeof zone-1);
+    CHECK(savectl_reload(f.s)==SAVECTL_OK); wait_idle(f.s);
+    piece_tree *tree=NULL; savectl_view view={0}; int rc;
+    do { rc=savectl_take_reload(f.s,&tree,&view); } while(rc==SAVECTL_BUSY);
+    CHECK(rc==SAVECTL_OK && tree && piece_len(tree)==8);
+    CHECK(piece_insert(tree,0,(const uint8_t *)"!",1)==PIECE_OK); savectl_modified(f.s);
+    os_file locked=OS_FILE_INIT; CHECK(os_file_open(&locked,stream,OS_OPEN_RDWR)==OS_OK);
+    /* An existing ADS writer cannot share with our copy reader's deny-write
+     * lease. This is a real stream-open failure after the default temp write. */
+    CHECK(savectl_save(f.s,tree,NULL,NULL,0)==SAVECTL_OK); wait_idle(f.s);
+    savectl_model model=savectl_get_model(f.s);
+    CHECK(model.state==SAVECTL_FAILED && model.file_error==FILE_ERR_IO &&
+          model.err_no==ERROR_SHARING_VIOLATION && model.modified);
+    contents(f.path,"external"); contents(stream,"[ZoneTransfer]\r\nZoneId=3\r\n"); no_save_temporary(&f);
+    uint8_t retained[9]; CHECK(piece_read(tree,0,retained,sizeof retained)==PIECE_OK && !memcmp(retained,"!external",9));
+    os_file_close(&locked);
+    CHECK(savectl_save(f.s,tree,NULL,NULL,0)==SAVECTL_OK); wait_idle(f.s);
+    model=savectl_get_model(f.s); CHECK(model.state==SAVECTL_SAVED && !model.modified);
+    contents(f.path,"!external"); contents(stream,"[ZoneTransfer]\r\nZoneId=3\r\n"); no_save_temporary(&f);
+    piece_destroy(tree); fini(&f);
+    puts("savectl production Windows external reload, ADS failure keeps dirty buffer/target/streams, retry preserves MOTW: ok");
+}
 #endif
 int main(int argc, char **argv)
 {
     if(argc==2 && !strcmp(argv[1],"--require-production")) {
 #if defined(EDIT_WIN_SAVECTL_REAL_DEPS)
-        production_save(); return 0;
+        production_save(); production_streams(); return 0;
 #else
         fputs("savectl production save required: file/journal Windows dependencies unavailable\n",stderr); return 1;
 #endif
@@ -94,6 +122,7 @@ int main(int argc, char **argv)
     fini(&f);
 #if defined(EDIT_WIN_SAVECTL_REAL_DEPS)
     production_save();
+    production_streams();
 #else
     puts("savectl production save: SKIP W2.1 file and W2.2 journal not in WIN_MODULES; check-savectl-production requires them");
 #endif

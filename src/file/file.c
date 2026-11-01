@@ -965,6 +965,10 @@ static int transaction_prepare(save_transaction *tx)
     }
     rc = FILE_ERR_IO;
     if (!mid_fired) step_call(a, FILE_STEP_MID_WRITE);
+#if defined(_WIN32)
+    rc = file_streams_copy(tx);
+    if (rc != FILE_OK) goto fail;
+#endif
     rc = metadata_apply(tx);
     if (rc != FILE_OK) goto fail;
     rc = FILE_ERR_IO;
