@@ -1046,6 +1046,7 @@ static void native_turn_producer(void *arg)
 }
 static int native_turn_test(editor *e,UINT finish,bool save,bool clip,bool draw)
 {
+    LIVE_ONLY_NATIVE_LOOP("editor_win: native modal turn",0);
     T(settle(e)==0);
     if(clip) {
         InterlockedExchange(&synthetic_publication,1);
@@ -1118,19 +1119,98 @@ static int native_watchdog_test(editor *e)
      * credit, and an elapsed inherited completion window. No fake T4/T6. */
     s->latency=blocked; s->latency_ready=false; e->backend->active=true;
     HWND hwnd=plat_native_win32(&e->platform);
-    SendMessageW(hwnd,WM_ENTERSIZEMOVE,0,0);
-    s->deadline=os_now_ns()-1u;
-    T(!d3d11_present_ready(e->backend)); T(!d3d11_recovery_required(e->backend));
-    SendMessageW(hwnd,WM_EXITSIZEMOVE,0,0);
-    T(!d3d11_present_ready(e->backend));
-    T(!d3d11_recovery_required(e->backend) && s->deadline>os_now_ns());
-    s->deadline=os_now_ns()-1u;
-    T(!d3d11_present_ready(e->backend) && d3d11_recovery_required(e->backend));
+    const UINT enter[]={WM_ENTERSIZEMOVE,WM_ENTERMENULOOP};
+    const UINT leave[]={WM_EXITSIZEMOVE,WM_EXITMENULOOP};
+    for(size_t at=0;at<sizeof enter/sizeof enter[0];at++) {
+        SendMessageW(hwnd,enter[at],0,0);
+        s->deadline=os_now_ns()-1u;
+        T(!d3d11_present_ready(e->backend)); T(!d3d11_recovery_required(e->backend));
+        SendMessageW(hwnd,leave[at],0,0);
+        T(!d3d11_present_ready(e->backend));
+        T(!d3d11_recovery_required(e->backend) && s->deadline>os_now_ns());
+        s->deadline=os_now_ns()-1u;
+        T(!d3d11_present_ready(e->backend) && d3d11_recovery_required(e->backend));
+        s->recovery=false;
+    }
     s->recovery=false; s->latency=saved; s->deadline=0; e->backend->active=false;
     s->native_deferred=deferred; s->suspended=suspended; s->invisible=invisible;
     force_paint_visibility=false;
     CloseHandle(blocked);
     puts("native modal: held latency is not lost; release rebases watchdog; ordinary expiry still recovers PASS");
+    return 0;
+}
+static unsigned notification_turns;
+static void notification_editor_turn(void *ctx)
+{
+    notification_turns++;
+    platform_modal_turn(ctx);
+}
+static void notification_editor_send(editor *e,const plat_callbacks *cb,UINT msg,WPARAM wp,LPARAM lp)
+{
+    win32_plat *s=win32_private(&e->platform);
+    s->callbacks=cb;
+    SendMessageW(plat_native_win32(&e->platform),msg,wp,lp);
+    /* Restore before any assertion can return: a failed test must not leave
+     * a pointer to its stack callbacks installed during editor_close. */
+    s->callbacks=NULL;
+}
+static int notification_editor_test(editor *e,bool menu,UINT finish)
+{
+    T(settle(e)==0);
+    /* UI-thread notifications exercise the production modal service and
+     * on_modal_turn without entering a native loop. This no longer proves
+     * that the real loop survives: that assertion runs only in check-live. */
+    HWND hwnd=plat_native_win32(&e->platform);
+    win32_plat *s=win32_private(&e->platform);
+    plat_callbacks cb={.ud=e,.on_event=platform_event,.on_work=platform_work,
+        .on_present_complete=platform_complete,.on_modal_turn=notification_editor_turn};
+    T(!s->callbacks && !s->modal_depth);
+    MSG message;
+    T(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+    notification_turns=0; native_work_received=false;
+    e->platform.quit=false; e->pump_stopped=false; s->turn_stopped=false;
+    notification_editor_send(e,&cb,menu ? WM_ENTERMENULOOP : WM_ENTERSIZEMOVE,0,0);
+    T(s->modal_depth==1);
+    uint32_t frame=e->frame.id;
+    work_handle job=work_submit(&e->pool,(work_job){native_completed_job,NULL,0,WORK_BULK});
+    T(job.epoch);
+    notification_editor_send(e,&cb,EFX_MOD_HOOK,0,0);
+    notification_editor_send(e,&cb,WM_UNICHAR,'q',1);
+    notification_editor_send(e,&cb,WM_SIZE,SIZE_RESTORED,MAKELPARAM(e->platform.width,e->platform.height));
+    uint64_t end=os_now_ns()+WATCH_NS;
+    for(;;) {
+        notification_editor_send(e,&cb,WM_TIMER,1,0);
+        T(!e->error && !e->platform.quit && s->modal_depth==1);
+        T(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+        journal_stats js=journal_get_stats(e->journal);
+        if(editor_length(e)==6 && !e->queue_count && native_work_received &&
+            e->frame.id>frame && !e->resize_pending && !e->op_count &&
+            !e->journal_metadata_pending && js.accepted_sequence==js.durable_sequence) break;
+        T(os_now_ns()<end); os_yield();
+    }
+    T(notification_turns && e->pump_stopped && s->turn_stopped);
+    unsigned turns=notification_turns;
+    notification_editor_send(e,&cb,WM_TIMER,1,0); T(notification_turns>turns);
+    T(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+    T(efx_expect_bytes(e,"qbase\n",6)==0);
+    if(finish!=WM_NULL) {
+        if(finish==WM_QUIT) plat_quit(&e->platform);
+        else notification_editor_send(e,&cb,finish,0,0);
+        T(PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_REMOVE));
+        if(finish!=WM_QUIT) T(e->win_close_requested);
+        while(PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_REMOVE)) {}
+    }
+    notification_editor_send(e,&cb,menu ? WM_EXITMENULOOP : WM_EXITSIZEMOVE,0,0);
+    T(!s->modal_depth && !s->modal_cancel);
+    if(finish==WM_QUIT) e->win_close_requested=true;
+    if(finish!=WM_NULL) {
+        int rc=EDITOR_MORE; end=os_now_ns()+WATCH_NS;
+        do { rc=editor_step(e,0); T(rc>=0 && os_now_ns()<end); os_yield(); }
+        while(rc!=EDITOR_CLOSED);
+        T(!e->queue_count && efx_expect_bytes(e,"qbase\n",6)==0);
+    } else T(settle(e)==0);
+    printf("direct modal notifications: menu=%d finish=%u turns=%u; stop keeps servicing, close cancels PASS\n",
+        menu,finish,notification_turns);
     return 0;
 }
 static editor *lifecycle_owner;
@@ -1454,6 +1534,14 @@ int main(int argc, char **argv)
     (void)SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     trace_init(); T(trace_thread_register()>=0);
     T(auto_source_test()==0);
+    if(argc==2 && !strcmp(argv[1],"--live-only")) {
+        T(test_isolation_query()==TEST_ISOLATION_LIVE);
+        /* --modal-clip uses synthetic_publication: no native clipboard access. */
+        const char *modes[]={"--modal-turn","--modal-close","--modal-session",
+            "--modal-save","--modal-clip","--modal-draw"};
+        for(size_t at=0;at<sizeof modes/sizeof modes[0];at++) T(run_child_case(modes[at],NULL,0)==0);
+        return 0;
+    }
     if(argc==2 && !strcmp(argv[1],"--close-campaign")) return run_child_case("--close-queue",NULL,0);
     if(argc==2 && !strcmp(argv[1],"--wait")) return wait_test();
     char root[OS_PATH_MAX],journal_path[OS_PATH_MAX];
@@ -1526,6 +1614,12 @@ int main(int argc, char **argv)
             native->power_off=native->session_locked=native->session_disconnected=native->minimized=false;
         }
         int rc=!strncmp(argv[1],"--wsl-",6) ? wsl_test(e,root,argv[1]) :
+            !strcmp(argv[1],"--notify-size") ? notification_editor_test(e,false,WM_NULL) :
+            !strcmp(argv[1],"--notify-menu") ? notification_editor_test(e,true,WM_NULL) :
+            !strcmp(argv[1],"--notify-close") ? notification_editor_test(e,false,WM_CLOSE) :
+            !strcmp(argv[1],"--notify-menu-close") ? notification_editor_test(e,true,WM_CLOSE) :
+            !strcmp(argv[1],"--notify-session") ? notification_editor_test(e,false,WM_QUERYENDSESSION) :
+            !strcmp(argv[1],"--notify-quit") ? notification_editor_test(e,false,WM_QUIT) :
             !strcmp(argv[1],"--crash-guard") ? crash_guard_test(&cfg,root) :
             !strcmp(argv[1],"--modal-turn") ? native_turn_test(e,WM_KEYDOWN,false,false,false) :
             !strcmp(argv[1],"--modal-close") ? native_turn_test(e,WM_CLOSE,false,false,false) :
@@ -1597,6 +1691,9 @@ int main(int argc, char **argv)
     }
     const char *round4[]={"--wsl-open","--wsl-case","--wsl-focus","--wsl-activate","--wsl-presave","--wsl-large-save","--wsl-warm","--wsl-find","--wsl-findpanel","--wsl-save","--wsl-target-watch","--wsl-journal","--wsl-real","--modal-turn","--modal-close","--modal-session","--modal-save","--modal-clip","--modal-draw","--modal-clock","--close-queue","--close-fence","--close-save","--close-prompt","--guard","--cloak","--uncertain","--stuck","--maximum","--crash-guard",
         "--read-stuck","--read-close","--read-queue","--saveas-close","--saveas-close-save","--notice","--font-small"};
+    const char *notifications[]={"--notify-size","--notify-menu","--notify-close",
+        "--notify-menu-close","--notify-session","--notify-quit"};
+    for(size_t at=0;at<sizeof notifications/sizeof notifications[0];at++) T(run_child_case(notifications[at],NULL,0)==0);
     for(size_t at=0;at<sizeof round4/sizeof round4[0];at++) T(run_child_case(round4[at],NULL,0)==0);
     T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);
     T(larger_surface_test(e)==0); T(allocation_failure_test(e)==0); T(resize_failure_test(e)==0);

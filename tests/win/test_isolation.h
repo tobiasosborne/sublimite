@@ -28,4 +28,14 @@ static inline test_isolation test_isolation_query(void)
 }
 static inline void test_skip(const char *name, const char *reason)
 { printf("%s: SKIP (%s)\n",name,reason); }
+/* A private station/desktop does NOT isolate the system pointer. This must
+ * be the first statement of any test function using native pointer/input
+ * operations; tools/check_win_pointer.py checks that contract before check.
+ * Empty __VA_ARGS__ returns from void fixtures; integer fixtures pass 0. */
+#define LIVE_ONLY_NATIVE_LOOP(name, ...) do { \
+    if (test_isolation_query() != TEST_ISOLATION_LIVE) { \
+        test_skip(name, "needs live desktop: native move/size loop moves the real pointer"); \
+        return __VA_ARGS__; \
+    } \
+} while (0)
 #endif

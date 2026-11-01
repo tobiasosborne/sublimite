@@ -2,9 +2,30 @@
 
 Only the coordinator runs `make TARGET=win check-live WIN_LIVE_OK=1`, after
 Tobias explicitly authorizes use of his desktop. Run these cases with the real
-editor as part of that live check. The quiet suites cannot prove them: their
-SC_MOVE is keyboard-mode, their resize is programmatic, and hidden stations do
-not receive physical mouse input or authenticate visible presents.
+editor as part of that live check. Private stations/desktops do not isolate the
+system pointer: keyboard-mode native move/size can warp the real pointer even
+when the window is hidden. Quiet suites skip native loops and use direct modal
+notifications instead. They cannot prove real-loop survival, physical mouse
+tracking or visible presentation.
+
+The automated live selectors also run these cases, in release and sanitizer
+builds (G: the configurations in `WIN_LIVE_TESTS` in `mk/win.mk`):
+
+- `win32_plat_test`: `modal`, `move`, `menu`, `turn`, `turn-size`, `turn-menu`,
+  `turn-close`, `turn-session`, `turn-quit`; native pointer loops, turn-stop
+  survival and explicit close/session/quit termination. `packet`, native F12
+  input, capture theft and `altcode` (native Alt release) also require the live
+  desktop.
+- `editor_win_test`: `--modal-turn`, `--modal-close`, `--modal-session`,
+  `--modal-save`, `--modal-clip`, `--modal-draw`; real-loop survival while
+  typing, work, resize, frame and journal progress, plus save/publication and
+  close. The publication case substitutes clipboard APIs and never accesses
+  the live clipboard. `--modal-clock` stays hidden-safe because it sends only
+  entry/exit notifications; the physical long-hold check below is still needed.
+
+Maximize, restore, minimize, close and caption double-click commands do not
+enter the native move/size pointer loop; their command-path tests remain in
+quiet checks. The physical cases below still need a person to exercise them.
 
 - Drag the caption, hold it while editor work completes, then release elsewhere.
 - Drag a maximized caption to restore, continue moving, and release.

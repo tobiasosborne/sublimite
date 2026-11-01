@@ -250,7 +250,13 @@ $(WIN_B)/rel/tests/journal_ack_test.exe $(WIN_B)/san/tests/journal_ack_test.exe:
 # (E) Eight suite workers share the brief's sixteen-CPU lane. Configurations of
 # the same suite stay serial: the anonymous service station may share clipboard.
 WIN_CHECK_JOBS ?= 8
-check: $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
+# Source-only safety check completes before the recipe can launch even the
+# reparse fixture. It is also runnable alone, with no Windows dependency.
+.PHONY: check-win-pointer
+check-win-pointer:
+	python3 tools/check_win_pointer.py
+	python3 tests/win_pointer_guard_test.py
+check: check-win-pointer $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
 	@set -e; fx=$$(tools/win_reparse_fixture.sh create); printf "reparse fixture: %s\n" "$$fx"; \
 	  trap 'tools/win_reparse_fixture.sh remove "$$fx"' EXIT; \
 	  OS_TEST_DATA_REPARSE="$$fx" python3 tools/win_check.py --jobs $(WIN_CHECK_JOBS) $(WIN_TEST_REL) $(WIN_TEST_SAN)
@@ -258,8 +264,8 @@ check: $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
 # Explicitly authorised, by-hand coverage only. Do not put quiet_run_test here:
 # it deliberately refuses a live desktop. The selectors never run clipboard.
 .PHONY: check-live
-WIN_LIVE_TESTS := $(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe d3d11_test.exe))
-check-live: $(WIN_LIVE_TESTS) $(WIN_QUIET)
+WIN_LIVE_TESTS := $(foreach c,rel san,$(addprefix $(WIN_B)/$(c)/tests/,win32_plat_test.exe d3d11_test.exe editor_win_test.exe))
+check-live: check-win-pointer $(WIN_LIVE_TESTS) $(WIN_QUIET)
 	@test "$(WIN_LIVE_OK)" = 1 || { echo "check-live refuses: set WIN_LIVE_OK=1 only with Tobias's explicit approval" >&2; exit 2; }
 	@cat docs/testing/windows-check-live.md
 	@set -e; for t in $(WIN_LIVE_TESTS); do \

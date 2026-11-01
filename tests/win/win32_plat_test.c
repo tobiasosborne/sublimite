@@ -541,6 +541,7 @@ static void display_test(fixture *f)
 }
 static void capture_test(fixture *f)
 {
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: native capture theft");
     int before=failures; f->count=0;
     HWND thief=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"capture fixture",WS_POPUP,0,0,1,1,NULL,NULL,GetModuleHandleW(NULL),NULL);
     CHECK(thief!=NULL); post(f,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(7,9));
@@ -657,6 +658,7 @@ static void ownership_test(fixture *f)
 }
 static void packet_test(fixture *f)
 {
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: KEYEVENTF_UNICODE");
     int before=failures; f->count=0; state(0,0,0);
     if(isolation!=TEST_ISOLATION_LIVE) test_skip("win32_plat: KEYEVENTF_UNICODE","needs live desktop: foreground Unicode input");
     else if(GetForegroundWindow()==window(f)) {
@@ -711,6 +713,9 @@ static void multiscalar_test(fixture *f)
 }
 static void altcode_test(fixture *f)
 {
+    /* DefWindowProc handles the Alt release. Conservatively keep any native
+     * menu activation on the live desktop, even for the numeric-input case. */
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: native Alt+numpad/Alt release");
     int before=failures; HKL saved=GetKeyboardLayout(0);
     HKL us=LoadKeyboardLayoutW(L"00000409",KLF_NOTELLSHELL); CHECK(ActivateKeyboardLayout(us,0)!=NULL);
     post(f,WM_INPUTLANGCHANGE,0,(LPARAM)us); f->count=0;
@@ -778,6 +783,7 @@ static void modal_producer(void *arg)
 }
 static void modal_test_common(fixture *f, WPARAM command)
 {
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: native modal loop");
     int before=failures; f->count=0; f->work=0; f->presents=0;
     modal_entered=CreateEventW(NULL,TRUE,FALSE,NULL);
     modal_serviced=CreateEventW(NULL,TRUE,FALSE,NULL); modal_fixture=f;
@@ -800,9 +806,12 @@ static void modal_test_common(fixture *f, WPARAM command)
     (void)CloseHandle(modal_entered); (void)CloseHandle(modal_serviced); modal_fixture=NULL;
     verdict("r2 native sizing loop services work/T6/close and final geometry",before);
 }
-static void modal_test(fixture *f) { modal_test_common(f,SC_SIZE|WMSZ_BOTTOMRIGHT); }
-static void move_test(fixture *f) { modal_test_common(f,SC_MOVE); }
-static void menu_test(fixture *f) { modal_test_common(f,0); state(0,0,0); }
+static void modal_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: modal"); modal_test_common(f,SC_SIZE|WMSZ_BOTTOMRIGHT); }
+static void move_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: move"); modal_test_common(f,SC_MOVE); }
+static void menu_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: menu"); modal_test_common(f,0); state(0,0,0); }
 typedef struct turn_case {
     fixture *f;
     HANDLE done;
@@ -842,6 +851,7 @@ static void turn_producer(void *arg)
 }
 static void turn_test_common(fixture *f,WPARAM command,UINT finish,WPARAM key)
 {
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: native turn loop");
     int before=failures; f->count=0; f->work=f->presents=0; f->stop_turn=true;
     modal_entered=CreateEventW(NULL,TRUE,FALSE,NULL); modal_fixture=f;
     turn_exited=CreateEventW(NULL,TRUE,FALSE,NULL);
@@ -869,17 +879,75 @@ static void turn_test_common(fixture *f,WPARAM command,UINT finish,WPARAM key)
     CloseHandle(modal_entered); CloseHandle(c.done); CloseHandle(turn_exited); turn_exited=NULL; modal_fixture=NULL;
     verdict("native move survives editor pump stops; explicit finish exits",before);
 }
-static void turn_test(fixture *f) { turn_test_common(f,SC_MOVE,WM_KEYDOWN,VK_RETURN); }
-static void turn_size_test(fixture *f) { turn_test_common(f,SC_SIZE,WM_KEYDOWN,VK_ESCAPE); }
-/* A hidden system menu does not reliably consume posted Escape as physical
- * input. Test survival here, cancel it explicitly, and leave real Escape to
- * check-live. Move/size above still finish by posted Enter/Escape. */
-static void turn_menu_test(fixture *f) { turn_test_common(f,0,WM_CANCELMODE,0); state(0,0,0); }
-static void turn_close_test(fixture *f) { turn_test_common(f,SC_MOVE,WM_CLOSE,0); }
-static void turn_session_test(fixture *f) { turn_test_common(f,SC_MOVE,WM_QUERYENDSESSION,0); }
-static void turn_quit_test(fixture *f) { turn_test_common(f,SC_MOVE,WM_APP+0x62,0); }
+static void turn_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn"); turn_test_common(f,SC_MOVE,WM_KEYDOWN,VK_RETURN); }
+static void turn_size_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn-size"); turn_test_common(f,SC_SIZE,WM_KEYDOWN,VK_ESCAPE); }
+/* Native system menus are live-only too: the menu offers Move/Size and may
+ * consume real input. Escape with a physical keyboard belongs to check-live. */
+static void turn_menu_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn-menu"); turn_test_common(f,0,WM_CANCELMODE,0); state(0,0,0); }
+static void turn_close_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn-close"); turn_test_common(f,SC_MOVE,WM_CLOSE,0); }
+static void turn_session_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn-session"); turn_test_common(f,SC_MOVE,WM_QUERYENDSESSION,0); }
+static void turn_quit_test(fixture *f)
+{ LIVE_ONLY_NATIVE_LOOP("win32_plat: turn-quit"); turn_test_common(f,SC_MOVE,WM_APP+0x62,0); }
+static void notification_turn(void *arg)
+{
+    fixture *f=arg;
+    CHECK(GetCurrentThreadId()==f->ui_thread);
+    CHECK(win32_private(&f->p)->modal_depth!=0);
+    CHECK(win32_private(&f->p)->turn_stopped);
+    f->blink++; /* A separate counter for actual on_modal_turn invocations. */
+}
+static void notification_test(fixture *f)
+{
+    int before=failures;
+    /* Send notifications on the UI thread; never enter DefWindowProc's native
+     * loop. This checks stop/cancel policy and servicing, but no longer proves
+     * that the REAL loop survives an editor turn stop. check-live owns that. */
+    const UINT enter[]={WM_ENTERSIZEMOVE,WM_ENTERMENULOOP};
+    const UINT leave[]={WM_EXITSIZEMOVE,WM_EXITMENULOOP};
+    const UINT finish[]={WM_NULL,WM_CLOSE,WM_QUERYENDSESSION,WM_QUIT};
+    HWND hwnd=window(f); win32_plat *s=win32_private(&f->p);
+    plat_callbacks cb={.ud=f,.on_event=event,.on_work=work,
+        .on_present_complete=present,.on_modal_turn=notification_turn};
+    for(size_t mode=0;mode<sizeof enter/sizeof enter[0];mode++) {
+        for(size_t end=0;end<sizeof finish/sizeof finish[0];end++) {
+            f->count=0; f->work=f->presents=f->blink=0; f->stop_turn=true; f->p.quit=false;
+            s->turn_stopped=false; CHECK(!s->callbacks); s->callbacks=&cb;
+            MSG message; CHECK(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+            (void)SendMessageW(hwnd,enter[mode],0,0); CHECK(s->modal_depth==1);
+            os_wake_signal(&f->wake);
+            CHECK(win32_plat_present_complete(&f->p,31,37,41)==PLAT_OK);
+            (void)SendMessageW(hwnd,WM_KEYUP,VK_F12,1);
+            (void)SendMessageW(hwnd,WM_TIMER,1,0);
+            CHECK(s->turn_stopped && !f->p.quit && s->modal_depth==1);
+            CHECK(f->work==1 && f->presents==1 && kind(f,PLAT_EV_KEY)==1 && f->blink>=1);
+            CHECK(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+            unsigned turns=f->blink;
+            (void)SendMessageW(hwnd,WM_TIMER,1,0);
+            CHECK(f->blink>turns); /* Further turns run after the stop. */
+            CHECK(!PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_NOREMOVE));
+            if(finish[end]!=WM_NULL) {
+                if(finish[end]==WM_QUIT) plat_quit(&f->p);
+                else (void)SendMessageW(hwnd,finish[end],0,0);
+                CHECK(PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_REMOVE));
+                if(finish[end]!=WM_QUIT) CHECK(kind(f,PLAT_EV_CLOSE)==1);
+                while(PeekMessageW(&message,hwnd,WM_CANCELMODE,WM_CANCELMODE,PM_REMOVE)) {}
+            }
+            (void)SendMessageW(hwnd,leave[mode],0,0);
+            CHECK(!s->modal_depth && !s->modal_cancel);
+            s->callbacks=NULL; f->stop_turn=false; f->p.quit=false;
+        }
+    }
+    verdict("direct modal notifications: turn stops never cancel; work/T6/turns advance; close/session/quit cancel",before);
+}
 static void caption_test(fixture *f)
 {
+    /* Maximize/restore/minimize/close and caption double-click do not start
+     * a move/size pointer loop. Keep their ordinary hidden coverage. */
     int before=failures; HWND hwnd=window(f); f->count=0;
     DWORD_PTR result=0;
     CHECK(SendMessageTimeoutW(hwnd,WM_SYSCOMMAND,SC_MAXIMIZE,0,SMTO_ABORTIFHUNG,1000,&result));
@@ -924,6 +992,7 @@ static void sent_test(fixture *f)
 }
 typedef struct r2_case { const char *name; void (*run)(fixture *); } r2_case;
 static const r2_case r2_cases[]={
+    {"notifications",notification_test},
     {"sent",sent_test},{"modal",modal_test},{"move",move_test},{"menu",menu_test},{"affinity",affinity_test},
     {"turn",turn_test},{"turn-close",turn_close_test},{"turn-session",turn_session_test},
     {"turn-size",turn_size_test},{"turn-menu",turn_menu_test},{"turn-quit",turn_quit_test},
@@ -937,11 +1006,13 @@ static const r2_case r2_cases[]={
 };
 static bool case_allowed(const r2_case *c)
 {
-    if(live_only) return !strcmp(c->name,"packet");
+    if(live_only) return !strcmp(c->name,"packet") || !strcmp(c->name,"capture") || !strcmp(c->name,"altcode") ||
+        !strcmp(c->name,"modal") || !strcmp(c->name,"move") || !strcmp(c->name,"menu") ||
+        !strcmp(c->name,"turn") || !strncmp(c->name,"turn-",5);
     if(!strncmp(c->name,"clip-",5) && isolation!=TEST_ISOLATION_STATION) {
         test_skip(c->name,"clipboard: needs private station"); return false;
     }
-    if((!strcmp(c->name,"altgr") || !strcmp(c->name,"altcode")) && isolation==TEST_ISOLATION_STATION) {
+    if(!strcmp(c->name,"altgr") && isolation==TEST_ISOLATION_STATION) {
         test_skip(c->name,"layouts: needs a station with input"); return false;
     }
     return true;
@@ -963,6 +1034,17 @@ static void r2_all(void)
         printf("win32_plat: case %s\n",r2_cases[i].name); r2_cases[i].run(&f);
         plat_shutdown(&f.p); os_wake_close(&f.wake);
     }
+}
+static void native_input_test(fixture *f)
+{
+    LIVE_ONLY_NATIVE_LOOP("win32_plat: SendInput");
+    if(GetForegroundWindow()==window(f)) {
+        INPUT input[2]={{0},{0}}; input[0].type=INPUT_KEYBOARD; input[0].ki.wVk=VK_F12;
+        input[1]=input[0]; input[1].ki.dwFlags=KEYEVENTF_KEYUP; f->count=0;
+        CHECK(SendInput(2,input,sizeof input[0])==2); CHECK(pump(f,30)==PLAT_OK);
+        plat_event *e=last(f,PLAT_EV_KEY); CHECK(e && e->keysym==XKB_KEY_F12);
+        printf("win32_plat: SendInput: PASS\n");
+    } else test_skip("win32_plat: SendInput","needs live desktop: foreground native input (not foreground)");
 }
 int main(int argc, char **argv)
 {
@@ -992,19 +1074,11 @@ int main(int argc, char **argv)
         printf("win32_plat_test: %s (%d failures)\n",failures?"FAIL":"PASS",failures);
         return failures?1:0;
     }
-    /* SendInput is allowed only while this window owns foreground focus. */
-    if(isolation!=TEST_ISOLATION_LIVE) test_skip("win32_plat: SendInput","needs live desktop: foreground native input");
-    else if(GetForegroundWindow()==window(&f)) {
-        INPUT input[2]={{0},{0}}; input[0].type=INPUT_KEYBOARD; input[0].ki.wVk=VK_F12;
-        input[1]=input[0]; input[1].ki.dwFlags=KEYEVENTF_KEYUP; f.count=0;
-        CHECK(SendInput(2,input,sizeof input[0])==2); CHECK(pump(&f,30)==PLAT_OK);
-        plat_event *e=last(&f,PLAT_EV_KEY); CHECK(e && e->keysym==XKB_KEY_F12);
-        printf("win32_plat: SendInput: PASS\n");
-    } else test_skip("win32_plat: SendInput","needs live desktop: foreground native input (not foreground)");
+    native_input_test(&f);
     test_skip("win32_plat: physical caption/buttons/edge/corner/drag-to-restore/Aero Snap",
         "needs live desktop: physical mouse; docs/testing/windows-check-live.md");
     if(live_only) {
-        packet_test(&f); plat_shutdown(&f.p); os_wake_close(&f.wake);
+        plat_shutdown(&f.p); os_wake_close(&f.wake); r2_all();
         printf("win32_plat_test: %s (%d failures)\n",failures?"FAIL":"PASS",failures);
         return failures?1:0;
     }

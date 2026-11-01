@@ -1,8 +1,10 @@
-/* win_quiet_run <exe> [args...]: run a Windows test where it cannot touch the
+/* win_quiet_run <exe> [args...]: hide Windows test windows from the
  * person using this desktop (Tobias, 2026-11-01). The child gets a private window
  * station and desktop that are never switched to: its windows are invisible and
- * can never take focus, the clipboard is the station's own, and input injection
- * cannot reach the user's applications. Below-normal priority yields the CPU to
+ * can never take focus, and the clipboard is the station's own. The system
+ * pointer is SHARED: native keyboard-mode move/size loops can warp it even
+ * here. Tests must live-gate native loops and pointer/input APIs; the runner
+ * cannot make them safe. Below-normal priority yields the CPU to
  * the user; a kill-on-close job leaves no orphan test process when a run is cut.
  *
  * WINRUN_ISOLATION selects the isolation (default station):
