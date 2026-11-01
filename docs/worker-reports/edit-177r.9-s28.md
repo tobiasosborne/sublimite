@@ -193,3 +193,106 @@ Nearest-rank p50/p99 use index `ceil(N * percentile / 100) - 1`, with N=10000 in
 Final verdict on editor_test.part-3: **test I/O-deadline bug**. The exact failure is reproduced on both HEAD and before W2.4c with a legitimately delayed save; controller completion preserves exact disk and crash-replay assertions. Natural contention passed 64/64 on each revision; fixed contention passed 64/64. No Linux product behavior changed.
 
 Coordinator: authorize/perform only the check-live list above when Tobias is ready; separately track the existing Linux XDG profile/IPC namespace gap and the already deferred PowerShell console launcher. No live execution or state-changing git/bd command occurred in this round.
+
+## Round 3 — re-review fixes complete
+
+Read the accepted round-2 review and binding `_rules-s28.md`. All build/test work uses `taskset -c 16-47 nice -n 10`, `-j32`; Windows full checks use `WIN_CHECK_JOBS=4`. Measurements are [AC, desktop Spiral], desktop in use; BAT0 absent; initial `uptime` load 0.17/0.32/1.02 (M).
+
+Initial reproduction: original `build/win/rel/tests/editor_win_test.exe --cut` failed 6/6, then another 6/6 after rebuilding/replacing its Linux inode, always the old line 117 with none of the rebuilt diagnostic strings (M; counts = shell loop iterations). A fresh pathname of exactly the rebuilt binary passed 1/1 and showed before/after length=5, revision=0. Native reads of original/fresh paths both read 11,328,512 bytes, FNV `4f0b7e75e53e2935`; native overwrite returns sharing violation 32 (M). This is a held/stale Windows image mapping, not evidence to weaken the text assertion. No process belonging to another session was killed. Fresh names are used for red/green; clean Windows verification will use a fresh build directory.
+
+Red commands (all prefixed with required CPU/nice): `make TARGET=win -j32 build/win/rel/tests/editor_win_test.exe`; copy to `editor_r3_red.exe`; `tools/winrun.sh build/win/rel/tests/editor_r3_red.exe --<case>`. Every case exited 1:
+
+```
+queue: FAIL os_now_ns()<end
+close-large: FAIL editor_length(e)==1 && e->v.state.selection.cursor==0 && !e->explicit_group && !e->journal_group_open
+guard: FAIL e->backend->active && !native->drawn && !e->journal_paint
+deadline: FAIL !e->win_unavailable && !e->win_retry_ns
+idle: FAIL e->win_retry_ns==0
+larger: FAIL (uint32_t)client.right<=e->font.max_width && (uint32_t)client.bottom<=e->font.max_height
+```
+
+Shutdown red, same build/runner with `editor_r3_shutdown_red.exe --lifecycle`, exit 1: `FAIL shutdown_received==received+1u && atomic_load(&shutdown_sent)==sent+1u`. The test observes publication AND consumption through the actual lifecycle mailbox; physical job completion alone cannot pass it.
+
+Green/verification and final findings follow below when complete.
+
+Round 3 implementation and final verification are complete; final command/result evidence is below.
+
+- `editor.c`, `clip.c`, `private.h`, `open.c`: terminal clipboard results use a dedicated retained slot. Native control/completion pumping stays enabled at full ordinary FIFO capacity. Slot consumption keeps the existing save/journal/view mutation fences. Close runs every replacement/view/undo/journal continuation; negative results propagate instead of being discarded. Direct editor cleanup also retains ownership on continuation error.
+- `editor.c`, `checkpoint.c`, `d3d11_win.c`, `d3d11.h`: safe CPU composition clears PAINT before an undrawn latency wait. Native readiness retains its auto-reset credit before arming the submitted source tab's native draw guard. A successful native draw clears it; per-tab phase state prevents repeated parked probes from appending records. Guard clearing respects an active save lease. Clearing the native guard does not invent T4/T5/T6.
+- Parking uses one exit helper, clears the deadline on every exit and ignores it outside `win_unavailable`. Only an owed frame has a probe timer. Native occlusion notification, cloak status, window position/activation/expose/input and native suspension are handled; owed eventless fallback doubles from the inherited observation interval to the documented cap. No timer exists for a valid unchanged covered frame. Decision and primary-source API evidence are in `docs/decisions/edit-177r.9.md`.
+- `win32_plat.c`, `win32/private.h`, `backend.c`: constrain the actual client rectangle before native init and resize to the existing prepaid dimensions, with current native nonclient extents. Additional surface memory = zero (P); two limits cost `2 * sizeof(uint32_t) = 8 bytes` before struct padding. Native initialization resource failure retains CPU snapshot storage and parks with a notice. Actual `ResizeBuffers` E_OUTOFMEMORY follows worker recovery instead of a fatal loop return.
+- `backend.c`, `mk/win.mk`: shutdown publishes and UI consumes an explicit lifecycle result mailbox. The physical completion handle protects job storage lifetime only. The white-box suite intercepts publication/receipt and tests exclusive descriptor ownership under ordinary-pool saturation.
+- `editor_win_test.c`, `editor_exe_test.c`: every new regression runs in the normal suite, including large-cut close, exact native clipboard bytes, committed replay and actual reopen with exact remaining text. The executable crash case is covered and non-minimized. Non-interactive stations refuse visible HWNDs; the deterministic latency/draw unit oracle uses a renderer-only visibility/cloak seam, then calls the real native offscreen drawing code and observes its armed PAINT. It supplies no displayed completion. The same final recoverable-tab guard fixture was rerun against HEAD's editor loop and failed at `e->backend->active && !native->drawn && !e->journal_paint` (exit 1, `r3-red-guard-final.log`); the working editor source was restored byte-for-byte before rebuilding.
+
+Further red/green:
+
+```
+--allocfail red: exit 1, FAIL rc==0 && e->backend->initialized && d3d11_native_deferred(e->backend)
+--resizefail red: exit 1, FAIL editor_resize_grid(e,e->grid.dims)==0
+```
+
+Commands: CPU/nice prefix plus `make TARGET=win -j32 build/win/rel/tests/editor_win_test.exe`, then `tools/winrun.sh` on `editor_r3_alloc_red.exe --allocfail` / `editor_r3_resize_red.exe --resizefail`. Both native failures are injected only through test-TU native call/vtable seams, with no release fault switch.
+
+Green: CPU/nice prefix plus `tools/winrun.sh build/win/rel/tests/editor_r3_final.exe`, exit 0 (`r3-editor-final.log`): all round-3 cases, prior minimize/restore, saturation, fallback credit, publication failures and typing campaign PASS; large cut replay/reopen PASS. The test's no-growth iteration count reuses `WORK_MAX_JOBS`, not a new timing budget; accepted journal sequence is unchanged across those undrawn probes. The backoff oracle forces deadlines and checks doubling/cap without real-time sleeps. Its timer-free idle oracle repeatedly finds no deadline. Native allocation recovery forces expiry without delivering a native event and successfully recreates the native resources.
+
+Initial-red diagnosis completed: a fresh-path binary with HEAD's editor loop passed the original `--cut` case 6/6 (M; same shell loop count; `r3-baseline-fresh-{1..6}.log`). The held original pathname failed 12/12 across the earlier loops and continued executing the old line/string layout despite identical current native file hashes. This is a stale executable/image artifact, not a reason to loosen a fixture bound or the exact bytes/selection assertion. No product change was made to accommodate that initial failure.
+
+Verification already complete (all commands use CPU/nice prefix):
+
+| Command | Exit | Evidence |
+|---|---:|---|
+| `make -j32 all` | 0 | `build/r3-linux-all-final.log` |
+| `DEBUGINFOD_URLS= make -j32 check` | 0 | `build/r3-linux-check-final.log`: `check: 117 test binaries passed in 107.0 s (parallel, 32 jobs, 6 displays)`; no FLAKY, shell/display-lock contracts PASS |
+| release `EDITOR_ALLOC_ONLY=null ... build/tests/editor_test` | 0 | `build/r3-linux-allocator-null.log`: `null 10000 keys mallocs=0 guard=active` |
+| release `EDITOR_ALLOC_ONLY=raster xvfb-run -a ... build/tests/editor_test` | 0 | `build/r3-linux-allocator-raster.log`: `raster 10000 keys mallocs=0 guard=active` |
+| existing `editor_bench` fixture, private Xvfb, `--track --no-idle --no-p4 --serial-only --keys=64` | 0 | `build/r3-linux-bench.log`: CPU-raster fallback, structural OK, allocations=0; TRACK latency misses retained |
+| Linux preprocessed-token comparison against HEAD | 0 | `backend.c`, `checkpoint.c`, `clip.c`, `editor.c`, `open.c` all identical, including current shared headers; gcc preprocessing plus whitespace-independent C token comparison |
+| `git diff --check` | 0 | source/docs clean |
+
+Measurements (M), [AC, desktop Spiral], desktop in use; BAT0 absent. Benchmark-time load 0.25 (its own printed load1); the benchmark itself prints `[unknown]` because it only detects BAT0. Existing software-raster T4 TRACK p50/p99 were 16,905,903 / 17,360,212 ns; samples=64 inherited from the repository fixture, elapsed = native submit minus injection, nearest-rank percentiles. No Linux performance change is claimed. The release null/raster allocation campaigns each inherit Linux's 10,000 alternating-key count, require the positive control, and observed zero mallocs.
+
+The first normal-depth Windows run used `WIN_B=build/win-r3` to avoid the externally held original image while preserving fixture directory depth. The earlier `build/win/r3-check` attempt was superseded and deliberately interrupted through its own checker PID: the extra directory level broke font fixture root discovery; it also contained the earlier unprepared guard oracle. Its failures are not counted as final verification. The corrected full-run editor and executable cases already pass in release and ASan/UBSan.
+
+The final close audit added protected-credit exhaustion to the existing large-cut oracle. Before publication/close, append valid empty PAINT-clear records until the inherited `JOURNAL_DEFAULT_SYNC_BYTES` window refuses admission with JOURNAL_BUSY. This exposed a real missing scheduling edge: CLOSE bypasses the ordinary editor-step durability pump. Red command: CPU/nice prefix plus `tools/winrun.sh build/win/rel/tests/editor_r3_credit_red.exe --close-large`, exit 1, `editor_win:379 FAIL os_now_ns()<end` (`r3-red-credit.log`). The fixture flushes before failed-test cleanup so it does not leave a hung process. Close now explicitly schedules a forced journal pump while accepted records await durability, continuing native/mailbox pumping and bounded mutation/group completion. Green: identical selector on `editor_r3_credit_green.exe`, exit 0, exact clipboard, committed replay and reopened cut-result assertions PASS (`r3-green-credit.log`). This pressure case also runs in the default Windows editor suite.
+
+The `build/win-r3` full run was also superseded through its own checker PID after this final audit; all completed cases, including both editor/executable configurations, had passed. Final verification is now `WIN_CHECK_JOBS=4 make TARGET=win WIN_B=build/win-r3-final -j32 check`, with logs in `build/r3-win-check-complete.log`; Linux counterpart is `build/r3-linux-check-complete.log`. Neither superseded run is presented as a completed full-check result.
+
+Final editor campaign from the pressure-enabled full Windows run (M), [AC, desktop Spiral], desktop in use; during-run `uptime` at 14:15:37 reported load 3.65/4.99/3.26:
+
+```text
+editor_win: keys=10000 journal_records=keys mallocs=0 guard=active p50_ns=117500 p99_ns=246600
+editor_win: keys=10000 journal_records=keys mallocs=0 guard=ASan-inert p50_ns=426700 p99_ns=653100
+RESULT rel.editor_win_test.station exit=0 PASS
+RESULT san.editor_win_test.station exit=0 PASS
+```
+
+Derivation: N=10,000 inherited alternating insert/backspace keys; elapsed sample is CPU submit timestamp minus native ingress; nearest-rank percentile index = `ceil(N * percentile / 100) - 1`. Exact mutation count, content and journal data-record count pass; release allocator positive control is required and active. ASan's inert guard is labeled, not an allocation proof. These private-station samples do not claim native T4, T6 or visible cadence. Both executable configurations also pass the covered non-minimized kill/recovery oracle with exact restored bytes.
+
+Final Linux source/verification: `make -j32 all` exit 0, then `DEBUGINFOD_URLS= make -j32 check` exit 0, `check: 117 test binaries passed in 90.6 s (parallel, 32 jobs, 6 displays)` (`r3-linux-check-complete.log`). No FLAKY. The final journal-credit-only change is Windows-guarded; the final `clip.c` Linux preprocessed tokens were re-compared to HEAD and remain identical. Prior comparisons for the other changed shared sources also remain identical.
+
+### Found, not fixed / boundaries
+
+- The already reviewed native clipboard submission still allocates job/payload storage in `win32_clip_win.c`. The seven enumerated round-3 mechanisms above do not change that transport storage; no allocation-free clipboard-command claim is made. Plain typing is verified allocation-free.
+- Native displayed-frame G1, “N edits give N frames”, and physical monitor/uncover behavior remain the existing coordinator-only check-live coverage. No live desktop, shared clipboard desktop case, focus injection or user registry/profile access occurred.
+- The original default-path executable image is externally held/stale. Fresh-path repetitions of the original cut assertion pass; coordinator should use the fresh build directory or release the owning image before reusing that pathname. This worker did not kill another session's process.
+
+No product decision is deferred for these round-3 fixes: rectangle constraining and the owed-frame-only capped-backoff policy are recorded in the decision doc. No state-changing git/bd command, main-checkout edit, HANDOFF/worklog edit, sub-agent, package install or live test occurred.
+
+### Final verdict / check completion
+
+Done for the seven enumerated round-3 fixes and the initial-red investigation. No required verification remains. Commands and exit codes:
+
+```text
+taskset -c 16-47 nice -n 10 make -j32 all
+exit=0
+taskset -c 16-47 nice -n 10 env DEBUGINFOD_URLS= make -j32 check
+exit=0
+check: 117 test binaries passed in 90.6 s (parallel, 32 jobs, 6 displays)
+taskset -c 16-47 nice -n 10 env WIN_CHECK_JOBS=4 make TARGET=win WIN_B=build/win-r3-final -j32 check
+exit=0
+Windows check: binaries=130 desktop-passes=6 jobs=4 seconds=597.881 failures=0; SKIP cases=162: AddressSanitizer owns malloc=1; Linux SIGBUS signal-action chaining and real truncation: native Windows faults use the OS fault trigger; NTFS refuses mapped truncation=2; Linux syscall interposition; real-file integration awaits W2.1/W2.2=2; POSIX FIFO, mode/uid/xattr/ACL and syscall-interposition cases: Windows metadata and native errors exercised above=2; POSIX chmod unreadable directory (Windows uses ACLs)=2; clipboard: needs private station=16; editor panel clipboard/chord integration (editor not in Windows build)=2; editor-dependent group/retire/session/recovery/dataloss integration and first-paint closed-tab restart (editor/platform not ported)=1; hard-link/symlink fixtures: frozen os.h has no link-creation API=2; hl_worker faulted_snapshot (requires W2 mapped file/fault integration)=2; installed layouts are UK/US/German=4; journal/findui integration and editor-dependent cases: those modules await their Windows beads=2; layouts: needs a station with input=8; libxkbcommon differential name oracle (Linux-only library); binding expectations unchanged=2; lineidx combined_ownership (file-backed integration requires W2 file port)=2; name=G6_dense_a file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-abf353b264e52b74 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6_dense_a file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-e042330b4a266ab4 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6c file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-abf353b264e52b74 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6c file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-e042330b4a266ab4 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_a31b file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-abf353b264e52b74 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_a31b file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-e042330b4a266ab4 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_early file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-abf353b264e52b74 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_early file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-e042330b4a266ab4 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_middle file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-abf353b264e52b74 (quick: optional all-a fixture absent; full mode requires it)=1; name=G6v_first_last_middle file=C:\Users\tobia\AppData\Local\Temp/sublimite-test-find-bench-e042330b4a266ab4 (quick: optional all-a fixture absent; full mode requires it)=1; needs live desktop: N edits give N frames=2; needs live desktop: committed presentation=4; needs live desktop: diagnostic Present validates timing=4; needs live desktop: displayed frame completion=60; needs live desktop: foreground Unicode input=4; needs live desktop: foreground native input=4; needs live desktop: hardware presentation=4; needs live desktop: native T4 G1; Linux limits (G=2; needs live desktop: physical console input and shell attachment=2; needs live desktop: visible minimize and restore=4; requires Windows main/platform (W2.4)=2; sanitizer owns allocator=2; sanitizer owns malloc=1; src/file save integration (file module not ported); journal_save_prepare/finish/cancel run in journal_safety_test=1; trace_pairs Python cases (SUBLIMITE_TEST_PYTHON native interpreter path unset)=2; work_foreground editor jump (requires Windows editor/platform port)=2; work_foreground real clients (8 cases require W2 savectl/findui/font discovery)=2
+```
+
+Logs: `build/r3-linux-all-final.log`, `build/r3-linux-check-complete.log`, `build/r3-win-check-complete.log`. Full Windows line above is pasted verbatim. (M) The runner counts 130 release/sanitizer binaries, six additional desktop passes and one intentional ASan-negative run; 137 RESULT lines in the log. Failures=0 is the runner's expected-status comparison. Elapsed seconds are its monotonic finish minus start; this is suite wall time, not a performance budget. No FLAKY in the changed suites. `git diff --check` exits 0.
+
+Coordinator: the source is ready to commit; no git state changes were made. Use the fresh normal-depth Windows build directory shown above while the original executable image remains held. The separate pre-existing clipboard storage allocation and live-only coverage are explicitly bounded under Found, not fixed above.

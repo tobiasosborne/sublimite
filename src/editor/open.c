@@ -17,7 +17,9 @@ void editor_close(editor *e)
 {
     if (!e) return;
 #if defined(_WIN32)
-    while(editor_clip_close_wait(e)) os_sleep_ns(UINT64_C(1000000));
+    int cut_rc;
+    while((cut_rc=editor_clip_close_wait(e))==EDITOR_MORE) os_sleep_ns(UINT64_C(1000000));
+    if(cut_rc<0) { e->error=cut_rc; return; } /* Keep admitted text/journal owned. */
 #endif
     config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
     editor_hl_close(e);

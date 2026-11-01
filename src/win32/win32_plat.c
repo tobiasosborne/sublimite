@@ -345,8 +345,25 @@ static void capture_cancel(win32_plat *s)
             .time_ms=GetTickCount(),.t0_ns=os_now_ns()});
     }
 }
+int win32_plat_limit_client(plat *p,uint32_t width,uint32_t height)
+{
+    win32_plat *s=win32_private(p); if(!ui(s) || !width || !height) return PLAT_ERR_FAIL;
+    s->max_client_width=width; s->max_client_height=height;
+    RECT client,outer;
+    if(!GetClientRect(s->hwnd,&client)) return PLAT_ERR_FAIL;
+    if(IsIconic(s->hwnd) || client.right<=0 || client.bottom<=0) return PLAT_OK;
+    if((uint32_t)client.right<=width && (uint32_t)client.bottom<=height) return PLAT_OK;
+    if(!GetWindowRect(s->hwnd,&outer)) return PLAT_ERR_FAIL;
+    LONG w=client.right>(LONG)width ? (LONG)width : client.right;
+    LONG h=client.bottom>(LONG)height ? (LONG)height : client.bottom;
+    /* Actual current nonclient extents include the current monitor's DPI. */
+    return SetWindowPos(s->hwnd,NULL,0,0,outer.right-outer.left-client.right+w,
+        outer.bottom-outer.top-client.bottom+h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE) ? PLAT_OK : PLAT_ERR_FAIL;
+}
 static void resize(win32_plat *s)
 {
+    if(s->max_client_width && s->max_client_height &&
+       win32_plat_limit_client(s->owner,s->max_client_width,s->max_client_height)!=PLAT_OK) return;
     RECT rect;
     if (s->minimized || !GetClientRect(s->hwnd,&rect) || rect.right<=rect.left || rect.bottom<=rect.top) return;
     s->owner->width=(uint32_t)(rect.right-rect.left); s->owner->height=(uint32_t)(rect.bottom-rect.top);
@@ -562,6 +579,8 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if(LOWORD(wp)!=WA_INACTIVE) (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
         break;
+    case WIN32_OCCLUSION_MESSAGE:
+        (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE}); return 0;
     case WM_WINDOWPOSCHANGED:
         (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
         break; /* DefWindowProc still generates native SIZE/MOVE. */

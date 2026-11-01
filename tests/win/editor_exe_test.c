@@ -236,9 +236,9 @@ int main(int argc, char **argv)
     puts("editor_exe: GUI executable inherited usage/error streams and useful exit codes PASS");
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
     window=wait_window(child.id); CHECK(window);
-    /* Native minimization disables unexplained parked probes. The hot-exit
-     * oracle kills after a protected edit, outside a first native paint. */
-    (void)ShowWindow(window,SW_MINIMIZE); CHECK(IsIconic(window));
+    /* Private station is covered, never minimized: a parked undrawn first
+     * frame must not classify this healthy recovered tab as a paint crash. */
+    CHECK(!IsIconic(window));
     CHECK(post_character(window,'!'));
     CHECK(wait_crash_edit(root,'!'));
     CHECK(os_proc_kill(&child)==OS_OK);

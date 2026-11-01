@@ -25,7 +25,7 @@ typedef struct d3d11_strip { render_strip rows; UINT first, count; } d3d11_strip
 typedef struct d3d11_constants { uint32_t surface[4], motion[4]; } d3d11_constants;
 typedef struct d3d11_state {
     HWND window;
-    bool native_deferred;
+    bool native_deferred, native_failed;
     plat *platform;
     bool force_warp, readback, warp, debug, failed, swapped, drawn, query_ready;
     bool own_arena, full_frame, region_upload, latency_ready;
@@ -39,6 +39,8 @@ typedef struct d3d11_state {
     ID3D11DeviceContext *context;
     IDXGISwapChain2 *swapchain;
     IDXGISwapChainMedia *media;
+    IDXGIFactory2 *occlusion_factory;
+    DWORD occlusion_cookie;
     HANDLE latency;
     ID3D11Texture2D *backbuffer, *scene, *target, *atlas, *region_texture, *staging;
     ID3D11RenderTargetView *scene_rtv, *target_rtv;
@@ -83,7 +85,9 @@ static int d3d11_recover(render_backend *b)
 static bool d3d11_paused(d3d11_state *s)
 {
     uint64_t now = os_now_ns();
-    bool invisible = s->suspended || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
+    DWORD cloaked=0;
+    if(s->window) (void)DwmGetWindowAttribute(s->window,DWMWA_CLOAKED,&cloaked,sizeof cloaked);
+    bool invisible = s->native_deferred || s->suspended || cloaked || (s->window && (!IsWindowVisible(s->window) || IsIconic(s->window)));
     if ((!s->last_observation && s->deadline && now >= s->deadline) ||
         (s->last_observation && now-s->last_observation >= D3D11_COMPLETION_NS) || invisible || s->invisible)
         s->deadline = now+D3D11_COMPLETION_NS;
@@ -91,10 +95,8 @@ static bool d3d11_paused(d3d11_state *s)
     s->invisible = invisible; s->last_observation = now;
     return invisible;
 }
-static void d3d11_release(d3d11_state *s)
+static void d3d11_release_native(d3d11_state *s)
 {
-    /* Join before releasing borrowed swapchain/window state or the arena. */
-    if (s->sync_started) { work_pool_shutdown(s->sync_pool); s->sync_started = false; }
     if (s->context) {
         s->context->lpVtbl->ClearState(s->context);
         s->context->lpVtbl->Flush(s->context);
@@ -129,12 +131,20 @@ static void d3d11_release(d3d11_state *s)
         s->context->lpVtbl->ClearState(s->context);
         s->context->lpVtbl->Flush(s->context);
     }
+    if(s->occlusion_factory) s->occlusion_factory->lpVtbl->UnregisterOcclusionStatus(s->occlusion_factory,s->occlusion_cookie);
+    D3D11_RELEASE(s->occlusion_factory);
     D3D11_RELEASE(s->media); D3D11_RELEASE(s->swapchain);
     if (s->context) s->context->lpVtbl->Flush(s->context);
     if (s->latency) { CloseHandle(s->latency); s->latency = NULL; }
     D3D11_RELEASE(s->context); D3D11_RELEASE(s->device);
     if (s->compiler) { FreeLibrary(s->compiler); s->compiler = NULL; }
-    if (s->own_arena) edit_arena_free(&s->arena);
+}
+static void d3d11_release(d3d11_state *s)
+{
+    /* Join before releasing borrowed swapchain/window state or the arena. */
+    if(s->sync_started) { work_pool_shutdown(s->sync_pool); s->sync_started=false; }
+    d3d11_release_native(s);
+    if(s->own_arena) edit_arena_free(&s->arena);
 }
 static HRESULT d3d11_try_device(d3d11_state *s, D3D_DRIVER_TYPE driver)
 {
@@ -182,6 +192,10 @@ static bool d3d11_native_init(d3d11_state *s)
     }
     if (SUCCEEDED(hr)) hr = s->swapchain->lpVtbl->GetBuffer(s->swapchain,0,&IID_ID3D11Texture2D,(void **)&s->backbuffer);
     if (SUCCEEDED(hr)) (void)s->swapchain->lpVtbl->QueryInterface(s->swapchain,&IID_IDXGISwapChainMedia,(void **)&s->media);
+    if(SUCCEEDED(hr) && SUCCEEDED(factory->lpVtbl->RegisterOcclusionStatusWindow(factory,s->window,
+        WIN32_OCCLUSION_MESSAGE,&s->occlusion_cookie))) {
+        s->occlusion_factory=factory; factory=NULL;
+    }
     D3D11_RELEASE(chain); D3D11_RELEASE(factory); D3D11_RELEASE(adapter); D3D11_RELEASE(dxgi);
     return SUCCEEDED(hr);
 }
@@ -404,9 +418,9 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
     if (!d3d11_reserve(s,cfg)) goto fail;
     if(s->native_deferred) return RENDER_OK;
     rc = RENDER_ERR_UNSUPPORTED;
-    if (!d3d11_native_init(s)) goto fail;
+    if (!d3d11_native_init(s)) goto native_fail;
     rc = RENDER_ERR_INIT;
-    if (!d3d11_resources(s,cfg)) goto fail;
+    if (!d3d11_resources(s,cfg)) goto native_fail;
     rc = RENDER_ERR_UNSUPPORTED;
     if (!cfg->background_init) {
         if (!d3d11_probe(s)) goto fail;
@@ -419,6 +433,12 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
          * timing only after its first real matching-frame observation. */
     }
     return RENDER_OK;
+native_fail:
+    if(cfg->background_init) {
+        d3d11_release_native(s);
+        s->native_deferred=true; s->native_failed=true;
+        return RENDER_OK; /* Prepaid CPU snapshots remain usable after native OOM. */
+    }
 fail:
     d3d11_release(s);
     if (cfg->arena) edit_arena_reset_to_mark(cfg->arena,mark);
@@ -441,8 +461,12 @@ static int d3d11_resize(render_backend *b, render_dims dims)
         D3D11_RELEASE(s->backbuffer);
         HRESULT hr = s->swapchain->lpVtbl->ResizeBuffers(s->swapchain,0,w,h,DXGI_FORMAT_UNKNOWN,
                                                     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
-        if (FAILED(hr) || FAILED(s->swapchain->lpVtbl->GetBuffer(s->swapchain,0,&IID_ID3D11Texture2D,(void **)&s->backbuffer)))
-            return d3d11_fail(s);
+        if(SUCCEEDED(hr)) hr=s->swapchain->lpVtbl->GetBuffer(s->swapchain,0,&IID_ID3D11Texture2D,(void **)&s->backbuffer);
+        if(hr==E_OUTOFMEMORY) {
+            s->native_failed=true; s->recovery=true; s->dims=dims;
+            return RENDER_OK; /* Worker rebuild/CPU parking is a UI obligation. */
+        }
+        if(FAILED(hr)) return d3d11_fail(s);
         s->width = w; s->height = h;
     }
     s->dims = dims; return RENDER_OK;
@@ -835,6 +859,22 @@ int d3d11_set_suspended(render_backend *b, bool suspended)
     s->suspended = suspended; s->deadline = os_now_ns()+D3D11_COMPLETION_NS;
     return RENDER_OK;
 }
+bool d3d11_present_ready(render_backend *b)
+{
+    if(!d3d11_descriptor(b) || !b->initialized || !b->active) return false;
+    d3d11_state *s=b->state;
+    if(s->drawn || s->swapped || s->native_deferred || s->recovery || d3d11_paused(s)) return false;
+    if(!s->deadline) s->deadline=os_now_ns()+D3D11_COMPLETION_NS;
+    if(!s->latency_ready) {
+        DWORD ready=WaitForSingleObject(s->latency,0);
+        if(ready==WAIT_OBJECT_0) s->latency_ready=true;
+        else if(ready==WAIT_TIMEOUT && os_now_ns()>=s->deadline) (void)d3d11_recover(b);
+        else if(ready!=WAIT_TIMEOUT) (void)d3d11_fail(s);
+    }
+    return s->latency_ready;
+}
+bool d3d11_frame_drawn(const render_backend *b)
+{ return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->drawn; }
 bool d3d11_surface_unavailable(const render_backend *b)
 {
     if (!d3d11_descriptor(b) || !b->initialized) return false;
@@ -851,6 +891,8 @@ int d3d11_discard_unpresented(render_backend *b)
 }
 bool d3d11_native_deferred(const render_backend *b)
 { return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->native_deferred; }
+bool d3d11_native_failed(const render_backend *b)
+{ return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->native_failed; }
 bool d3d11_recovery_required(const render_backend *b)
 { return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->recovery; }
 int d3d11_present_stats(const render_backend *b, d3d11_present_info *out)

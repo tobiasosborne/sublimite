@@ -129,6 +129,9 @@ typedef struct editor_buffer {
     size_t saved_cursor;
     bool saved_lost, undo_ready, index_dirty, retired;
     bool painted; /* edit-dzk1: one of its frames presented in this launch */
+#if defined(_WIN32)
+    bool win_composed, win_draw_safe; /* first CPU/native paint survived */
+#endif
     /* edit-qct: closed-tab stand-in for a deferred session journal (restore.c):
      * inert, never recorded in this launch's journal or session tree. */
     bool placeholder;
@@ -505,7 +508,8 @@ struct editor {
     char busy_source[IPC_PATH_CAP];
 #if defined(_WIN32)
     bool win_unavailable, win_native_suspended;
-    uint64_t win_retry_ns;
+    uint64_t win_retry_ns, win_retry_delay_ns;
+    bool win_frame_owed;
     bool win_paint_clear_pending;
 #endif
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
@@ -596,7 +600,8 @@ bool editor_same_path(const char *path, const char *other);
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);
 #if defined(_WIN32)
-bool editor_clip_close_wait(editor *e);
+int editor_clip_close_wait(editor *e);
+int editor_clip_terminal(editor *,const plat_event *);
 #endif
 void editor_clip_close(editor *e);
 void editor_clip_selection(editor *e);
@@ -684,6 +689,9 @@ int editor_journal_changed(editor *e);
  * submitting. painted records that buffer id presented; paint_clear is the
  * clean-close path (no paint is in flight). */
 int editor_journal_paint(editor *e);
+#if defined(_WIN32)
+int editor_journal_paint_frame(editor *,uint64_t);
+#endif
 void editor_journal_painted(editor *e, uint64_t id);
 void editor_journal_paint_clear(editor *e);
 void editor_encode_view(view_state state, uint8_t out[JOURNAL_VIEW_STATE_BYTES]);

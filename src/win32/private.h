@@ -10,6 +10,7 @@
 
 /* (G) same fixed queue capacity as P2.2; no allocation during input. */
 #define WIN32_EVENT_CAP 256u
+#define WIN32_OCCLUSION_MESSAGE (WM_APP+0x54u)
 typedef struct win32_present {
     uint32_t serial;
     uint64_t ust, msc;
@@ -31,6 +32,7 @@ typedef struct win32_plat {
     size_t (*work_sources)(void *, void **, size_t);
     void *work_sources_ctx;
     void (*work_consumed)(void *, void *);
+    uint32_t max_client_width, max_client_height;
     uint32_t dpi, blink_ms, repeat_delay, repeat_rate, repeat_key, buttons;
     HCURSOR cursors[2];
     plat_cursor_shape cursor_shape;
@@ -62,6 +64,7 @@ static inline win32_plat *win32_private(const plat *p)
 
 bool win32_plat_suspended(const plat *p);
 uint32_t win32_plat_dpi(const plat *p);
+int win32_plat_limit_client(plat *,uint32_t,uint32_t);
 int win32_clip_init(win32_plat *s);
 void win32_clip_stop(win32_plat *s);
 HANDLE win32_clip_wake(const win32_plat *s);

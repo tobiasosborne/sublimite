@@ -57,9 +57,15 @@ int d3d11_set_suspended(render_backend *b, bool suspended);
 bool d3d11_surface_unavailable(const render_backend *b);
 int d3d11_discard_unpresented(render_backend *b);
 bool d3d11_native_deferred(const render_backend *b);
-/* (E) Retry one existing missing-completion observation window after parking.
- * Bounded liveness, at most 1/3 Hz while unexplained; zero while suspended. */
+bool d3d11_native_failed(const render_backend *b);
+/* (E) Only an owed frame needs an event-free fallback. Start with the
+ * inherited missing-completion window; four doublings reduce sustained
+ * covered retries sixteenfold, capped at 3 s * 2^4 = 48 s. No idle timer. */
 #define D3D11_PARK_PROBE_NS UINT64_C(3000000000)
+#define D3D11_PARK_PROBE_MAX_NS (D3D11_PARK_PROBE_NS*16u)
+/* UI zero-time readiness check retains any auto-reset latency credit. */
+bool d3d11_present_ready(render_backend *b);
+bool d3d11_frame_drawn(const render_backend *b);
 bool d3d11_recovery_required(const render_backend *b);
 /* Diagnostic-only blocking read of the last pre-Present staging snapshot.
  * Output is opaque 0xffRRGGBB, top down; stride/capacity in uint32_t pixels. */

@@ -16,12 +16,68 @@ static BOOL cut_open(HWND window)
 #define OpenClipboard cut_open
 #include "../../src/win32/win32_clip_win.c"
 #undef OpenClipboard
+#include <d3d11.h>
+#include <dwmapi.h>
+static bool fail_native_alloc;
+static HRESULT WINAPI allocation_device(IDXGIAdapter *adapter,D3D_DRIVER_TYPE type,HMODULE module,
+    UINT flags,const D3D_FEATURE_LEVEL *levels,UINT count,UINT sdk,ID3D11Device **device,
+    D3D_FEATURE_LEVEL *level,ID3D11DeviceContext **context)
+{
+    if(fail_native_alloc) return E_OUTOFMEMORY;
+    return D3D11CreateDevice(adapter,type,module,flags,levels,count,sdk,device,level,context);
+}
+/* A non-interactive station refuses visible windows. Only this renderer
+ * seam exercises an undrawn visible-surface latency wait and offscreen draw;
+ * it supplies no displayed-frame completion. */
+static bool force_paint_visibility;
+static BOOL paint_visible(HWND window)
+{ return force_paint_visibility ? TRUE : IsWindowVisible(window); }
+static HRESULT WINAPI paint_attribute(HWND window,DWORD attribute,PVOID value,DWORD bytes)
+{
+    if(force_paint_visibility && attribute==DWMWA_CLOAKED && bytes==sizeof(DWORD)) {
+        *(DWORD *)value=0; return S_OK;
+    }
+    return DwmGetWindowAttribute(window,attribute,value,bytes);
+}
+#define D3D11CreateDevice allocation_device
+#define IsWindowVisible paint_visible
+#define DwmGetWindowAttribute paint_attribute
 #include "../../src/d3d11/d3d11_win.c"
+#undef D3D11CreateDevice
+#undef IsWindowVisible
+#undef DwmGetWindowAttribute
 static bool refuse_clear;
 static void clear_guard(editor *e) { if(!refuse_clear) editor_journal_paint_clear(e); }
 #define editor_journal_paint_clear clear_guard
 #include "../../src/editor/editor.c"
 #undef editor_journal_paint_clear
+/* Observe shutdown's actual mailbox transfer, independently of its handle. */
+static _Atomic unsigned shutdown_sent;
+static unsigned shutdown_received;
+static bool observed_publish(work_ctx *ctx,const work_msg *msg)
+{
+    bool ok=work_publish(ctx,msg);
+    if(ok && msg->kind==UINT32_C(0x45445344)) atomic_fetch_add(&shutdown_sent,1u);
+    return ok;
+}
+typedef struct result_observer { void (*cb)(const work_msg *,void *); void *ctx; } result_observer;
+static void observe_result(const work_msg *msg,void *ctx)
+{
+    result_observer *o=ctx;
+    if(msg->kind==UINT32_C(0x45445344)) shutdown_received++;
+    o->cb(msg,o->ctx);
+}
+static size_t observed_receive(work_pool *pool,work_handle handle,uint32_t generation,
+    void (*cb)(const work_msg *,void *),void *ctx)
+{
+    result_observer observer={cb,ctx};
+    return work_mailbox_receive(pool,handle,generation,observe_result,&observer);
+}
+#define work_publish observed_publish
+#define work_mailbox_receive observed_receive
+#include "../../src/editor/backend.c"
+#undef work_publish
+#undef work_mailbox_receive
 #define T(x) do { if(!(x)) { fprintf(stderr,"editor_win:%d FAIL %s\n",__LINE__,#x); return 1; } } while(0)
 /* Counts match Linux allocation_case: alternating insertion/backspace. */
 #define KEYS 10000u
@@ -110,6 +166,230 @@ static int auto_source_test(void)
     puts("editor_win: auto-reset readiness survives native wait until owner dispatch PASS");
     return 0;
 }
+/* Terminal publication and native control must survive a completely full FIFO. */
+static int queue_cut_test(editor *e)
+{
+    T(settle(e)==0);
+    e->v.state.selection=(view_selection){.anchor=0,.cursor=4};
+    plat_event cut={.kind=PLAT_EV_KEY,.press=true,.keysym='x',.mods=PLAT_MOD_CTRL};
+    InterlockedExchange(&fail_clip,1);
+    T(editor_clip_action(e,KEYS_ACTION_CUT,&cut)==0);
+    plat_event key={.kind=PLAT_EV_KEY,.press=false};
+    for(size_t i=0;i<EDITOR_INPUT_CAP;i++) T(editor_inject(e,&key)==0);
+    T(e->queue_count==EDITOR_INPUT_CAP);
+    HWND window=plat_native_win32(&e->platform);
+    uintptr_t token=(uintptr_t)GetPropW(window,L"SublimiteTestBarrier")+1u;
+    T(PostMessageW(window,WM_APP+0x53,token,0));
+    uint64_t end=os_now_ns()+WATCH_NS;
+    while(editor_clip_busy(e) || (uintptr_t)GetPropW(window,L"SublimiteTestBarrier")!=token) {
+        T(editor_step(e,0)>=0); T(os_now_ns()<end); os_yield();
+    }
+    T(editor_length(e)==5 && e->recovery_notice);
+    InterlockedExchange(&fail_clip,0);
+    T(settle(e)==0);
+    puts("round3: full input FIFO still pumps clipboard terminal and native control PASS"); return 0;
+}
+static int deadline_test(editor *e)
+{
+    T(settle(e)==0);
+    plat_event expose={.kind=PLAT_EV_EXPOSE};
+    e->journal_metadata_pending=true;
+    T(editor_inject(e,&expose)==0); T(queue_pick(e)==SIZE_MAX);
+    e->win_unavailable=true; e->win_retry_ns=os_now_ns()-1u;
+    (void)d3d11_set_suspended(e->backend,true);
+    e->journal_metadata_pending=false;
+    T(nonkey_dispatch(e,&e->queue[e->queue_head])==0); queue_remove(e,0);
+    T(!e->win_unavailable && !e->win_retry_ns);
+    T(settle(e)==0);
+    e->win_retry_ns=os_now_ns()-1u; e->win_unavailable=false;
+    T(wait_timeout(e,100,os_now_ns())>0); e->win_retry_ns=0;
+    puts("round3: expose behind journal fence clears expired deadline PASS"); return 0;
+}
+static int idle_probe_test(editor *e)
+{
+    T(settle(e)==0);
+    /* A previously presented image remains valid when no new frame is owed. */
+    e->win_unavailable=true; (void)d3d11_set_suspended(e->backend,true);
+    e->win_frame_owed=false; e->win_retry_ns=0;
+    T(windows_surface(e)==0); T(e->win_retry_ns==0);
+    for(unsigned i=0;i<WORK_MAX_JOBS;i++) T(windows_surface(e)==0 && !e->win_retry_ns);
+    T(editor_full_layout(e)==0 && settle(e)==0);
+    e->win_frame_owed=true;
+    /* No native event is delivered between forcing expiry and retry. */
+    e->win_unavailable=true; (void)d3d11_set_suspended(e->backend,true);
+    e->win_retry_ns=os_now_ns()-1u;
+    T(windows_surface(e)==0 && !e->win_unavailable && !e->win_retry_ns);
+    e->win_retry_delay_ns=D3D11_PARK_PROBE_NS;
+    for(unsigned i=0;i<WORK_MAX_JOBS;i++) {
+        e->win_unavailable=true; (void)d3d11_set_suspended(e->backend,true);
+        e->win_retry_ns=os_now_ns()-1u;
+        T(windows_surface(e)==0 && e->win_retry_delay_ns<=D3D11_PARK_PROBE_MAX_NS);
+    }
+    T(e->win_retry_delay_ns==D3D11_PARK_PROBE_MAX_NS);
+    e->win_frame_owed=false; T(windows_surface(e)==0 && !e->win_retry_ns);
+    puts("round3: valid covered idle frame has zero probe deadlines; owed frame retries without events PASS"); return 0;
+}
+static editor *drawing_editor;
+static ID3D11DeviceContextVtbl *drawing_original;
+static bool drawing_guard_seen;
+static void WINAPI guarded_instances(ID3D11DeviceContext *context,UINT vertices,UINT instances,UINT first,UINT start)
+{
+    drawing_guard_seen=drawing_editor->journal_paint==drawing_editor->active_frame.source_id;
+    context->lpVtbl=drawing_original;
+    drawing_original->DrawInstanced(context,vertices,instances,first,start);
+}
+static int undrawn_guard_test(editor *e)
+{
+    T(settle(e)==0);
+    HWND window=plat_native_win32(&e->platform);
+    (void)ShowWindow(window,SW_SHOWNOACTIVATE);
+    T(!IsIconic(window));
+    /* PAINT only guards a recorded, recoverable tab. A pristine unnamed
+     * fixture is deliberately absent from journal tab metadata. */
+    uint64_t before=e->stats.mutations;
+    T(PostMessageW(plat_native_win32(&e->platform),WM_APP+0x51,0,0));
+    T(PostMessageW(plat_native_win32(&e->platform),WM_CHAR,'g',1));
+    T(wait_mutation(e,before+1u)==0);
+    e->buffer->painted=false; e->buffer->win_composed=false; e->buffer->win_draw_safe=false;
+    T(!IsIconic(window));
+    d3d11_state *native=e->backend->state;
+    HANDLE saved=native->latency, blocked=CreateEventW(NULL,FALSE,FALSE,NULL); T(blocked);
+    force_paint_visibility=true;
+    native->latency=blocked; native->latency_ready=false;
+    e->win_unavailable=false; T(d3d11_set_suspended(e->backend,false)==0);
+    T(editor_full_layout(e)==0);
+    while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+    T(editor_paint_prepare(e)==0);
+    uint64_t end=os_now_ns()+WATCH_NS;
+    while(e->dirty) {
+        while(layout_busy(&e->lay)) T(layout_slice(e)>=0);
+        if(e->full_pending) T(editor_full_layout(e)==0);
+        T(editor_paint_prepare(e)==0);
+        T(submit(e)==0);
+        if(e->dirty) T(editor_flush(e)==0);
+        if(os_now_ns()>=end) fprintf(stderr,"submit blocked paint=%d full=%d layout=%d clip=%d active=%d ops=%zu action=%d extra=%d\n",e->paint_ready,e->full_pending,layout_busy(&e->lay),editor_clip_busy(e),e->backend->active,e->op_count,e->action,e->extra_rows);
+        T(os_now_ns()<end);
+    }
+    T(e->backend->active && !native->drawn && !e->journal_paint);
+    uint64_t records=journal_get_stats(e->journal).accepted_sequence;
+    for(unsigned i=0;i<WORK_MAX_JOBS;i++) {
+        /* This oracle is guard growth, independently of the missing-latency
+         * watchdog; slow native RPCs on an inactive station may outlast it. */
+        native->deadline=os_now_ns()+WATCH_NS;
+        T(present(e)==0); T(!e->journal_paint && e->backend->active);
+    }
+    T(journal_get_stats(e->journal).accepted_sequence==records);
+    native->latency=saved; CloseHandle(blocked);
+    drawing_editor=e; drawing_guard_seen=false; e->buffer->win_draw_safe=false;
+    drawing_original=native->context->lpVtbl;
+    ID3D11DeviceContextVtbl guarded=*drawing_original; guarded.DrawInstanced=guarded_instances;
+    native->context->lpVtbl=&guarded; native->latency_ready=true;
+    native->deadline=os_now_ns()+WATCH_NS;
+    T(present(e)==0);
+    T(drawing_guard_seen && !e->journal_paint);
+    force_paint_visibility=false;
+    T(settle(e)==0);
+    plat_event undo={.kind=PLAT_EV_KEY,.press=true,.keysym='z',.mods=PLAT_MOD_CTRL};
+    T(editor_inject(e,&undo)==0 && settle(e)==0);
+    puts("round3: covered non-minimized undrawn latency waits leave no PAINT or journal growth PASS"); return 0;
+}
+static IDXGISwapChain2Vtbl *resize_original;
+static HRESULT WINAPI no_resize_memory(IDXGISwapChain2 *chain,UINT count,UINT width,UINT height,DXGI_FORMAT format,UINT flags)
+{
+    (void)count; (void)width; (void)height; (void)format; (void)flags;
+    chain->lpVtbl=resize_original;
+    return E_OUTOFMEMORY;
+}
+static int resize_failure_test(editor *e)
+{
+    T(settle(e)==0);
+    d3d11_state *native=e->backend->state;
+    T(native->swapchain);
+    resize_original=native->swapchain->lpVtbl;
+    IDXGISwapChain2Vtbl failing=*resize_original; failing.ResizeBuffers=no_resize_memory;
+    native->swapchain->lpVtbl=&failing;
+    /* A smaller valid client rectangle still makes DXGI allocate buffers. */
+    native->width+=e->grid.dims.cell_w;
+    T(editor_resize_grid(e,e->grid.dims)==0);
+    T(!native->failed && e->recovery_notice);
+    T(editor_step(e,0)>=0 && settle(e)==0);
+    puts("round3: ResizeBuffers allocation failure stays alive with notice PASS"); return 0;
+}
+static int allocation_failure_test(editor *e)
+{
+    T(settle(e)==0);
+    render_config cfg=e->backend->config; void *state=e->backend->state;
+    editor_backend_shutdown_sync(e,e->backend);
+    fail_native_alloc=true;
+    int rc=editor_backend_init_sync(e,cfg,state);
+    fail_native_alloc=false;
+    T(rc==0 && e->backend->initialized && d3d11_native_deferred(e->backend));
+    T(editor_step(e,0)>=0 && e->win_unavailable && e->recovery_notice);
+    e->win_frame_owed=true; e->win_retry_ns=os_now_ns()-1u;
+    T(windows_surface(e)==0 && !d3d11_native_deferred(e->backend) && !d3d11_native_failed(e->backend));
+    T(editor_full_layout(e)==0 && settle(e)==0);
+    T(!e->error);
+    puts("round3: native allocation failure preserves CPU editing, parks with notice, retries PASS"); return 0;
+}
+static int larger_surface_test(editor *e)
+{
+    T(settle(e)==0);
+    HWND window=plat_native_win32(&e->platform);
+    /* Reduce the reservation's admissible client bound to avoid a giant test
+     * allocation; restored rectangle is one existing cell larger in each axis. */
+    e->font.max_width=e->font.window_width; e->font.max_height=e->font.window_height;
+    d3d11_state *native=e->backend->state;
+    native->max_width=e->font.max_width; native->max_height=e->font.max_height;
+    RECT rect={0,0,(LONG)(e->font.max_width+e->grid.dims.cell_w),(LONG)(e->font.max_height+e->grid.dims.cell_h)};
+    T(AdjustWindowRectEx(&rect,(DWORD)GetWindowLongPtrW(window,GWL_STYLE),FALSE,(DWORD)GetWindowLongPtrW(window,GWL_EXSTYLE)));
+    T(SetWindowPos(window,NULL,0,0,rect.right-rect.left,rect.bottom-rect.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE));
+    T(settle(e)==0);
+    RECT client; T(GetClientRect(window,&client));
+    T((uint32_t)client.right<=e->font.max_width && (uint32_t)client.bottom<=e->font.max_height);
+    T(!e->error && !native->failed);
+    puts("round3: larger restored client constrained to reserved surface; editor stays alive PASS"); return 0;
+}
+typedef struct cut_replay { uint64_t deletes; bool open; } cut_replay;
+static int cut_record(void *ctx,const journal_record *record)
+{
+    cut_replay *r=ctx;
+    if(record->type==JOURNAL_GROUP_BEGIN) r->open=true;
+    if(record->type==JOURNAL_GROUP_COMMIT) r->open=false;
+    if(record->type==JOURNAL_DELETE && record->size==16) { uint64_t n; memcpy(&n,record->data+8,sizeof n); r->deletes+=n; }
+    return 0;
+}
+static int close_large_test(editor *e)
+{
+    T(settle(e)==0);
+    uint64_t total=editor_length(e); T(total>VIEW_MUTATION_BOUND);
+    /* Exhaust the inherited protected-sync window, independently of cut
+     * slice size. CLOSE must schedule the flush that returns this credit. */
+    int credit;
+    do { credit=journal_append_protected(e->journal,JOURNAL_PAINT,0,NULL,0); } while(!credit);
+    T(credit==JOURNAL_BUSY);
+    e->v.state.selection=(view_selection){.anchor=0,.cursor=total-1u};
+    plat_event cut={.kind=PLAT_EV_KEY,.press=true,.keysym='x',.mods=PLAT_MOD_CTRL};
+    T(editor_clip_action(e,KEYS_ACTION_CUT,&cut)==0);
+    plat_event close={.kind=PLAT_EV_CLOSE}; T(editor_inject(e,&close)==0);
+    uint64_t end=os_now_ns()+WATCH_NS; int rc;
+    do {
+        rc=editor_step(e,0); T(rc>=0);
+        if(os_now_ns()>=end) {
+            /* Permit failing-test cleanup to release its own native objects. */
+            T(journal_flush(e->journal)==0); T(os_now_ns()<end);
+        }
+        os_yield();
+    } while(rc!=EDITOR_CLOSED);
+    T(editor_length(e)==1 && e->v.state.selection.cursor==0 && !e->explicit_group && !e->journal_group_open);
+    T(OpenClipboard(NULL)); HANDLE data=GetClipboardData(CF_UNICODETEXT); T(data);
+    WCHAR *text=GlobalLock(data); T(text && wcslen(text)==total-1u);
+    for(size_t i=0;i<(size_t)total-1u;i++) T(text[i]=='a');
+    GlobalUnlock(data); T(CloseClipboard());
+    cut_replay replay={0}; journal_replay_result result;
+    T(journal_replay_file(e->cfg.journal_path,cut_record,&replay,&result)==0);
+    T(replay.deletes==total-1u && !replay.open);
+    puts("round3: large cut closes only after selection/undo/journal commit; clipboard and replay exact PASS"); return 0;
+}
 static int cut_test(editor *e)
 {
     T(test_isolation_query()==TEST_ISOLATION_STATION);
@@ -189,7 +469,9 @@ static int lifecycle_test(editor *e)
     for(size_t at=0;at<count;at++) while(!work_handle_finished(&e->pool,jobs[at])) os_yield();
     render_config cfg=e->backend->config; void *state=e->backend->state;
     lifecycle_owner=e; e->backend->ops.shutdown=lifecycle_shutdown_probe;
+    unsigned received=shutdown_received, sent=atomic_load(&shutdown_sent);
     editor_backend_shutdown_sync(e,e->backend);
+    T(shutdown_received==received+1u && atomic_load(&shutdown_sent)==sent+1u);
     T(atomic_load(&lifecycle_exclusive));
     T(editor_backend_init_sync(e,cfg,state)==0);
     for(size_t at=0;at<count;at++) T(atomic_load(&e->pool.slots[jobs[at].slot].pending)==0);
@@ -226,7 +508,7 @@ static int retry_test(editor *e)
         T(settle(e)==0);
     }
     HWND window=plat_native_win32(&e->platform);
-    UINT messages[]={WM_ACTIVATE,WM_WINDOWPOSCHANGED,WM_POWERBROADCAST};
+    UINT messages[]={WM_ACTIVATE,WM_WINDOWPOSCHANGED,WM_POWERBROADCAST,WIN32_OCCLUSION_MESSAGE};
     for(size_t at=0;at<sizeof messages/sizeof messages[0];at++) {
         park(e); WINDOWPOS position={.hwnd=window,.flags=SWP_NOSIZE|SWP_NOMOVE|SWP_NOZORDER};
         if(at==1) T(SetWindowPos(window,NULL,0,0,0,0,position.flags|SWP_FRAMECHANGED|SWP_NOACTIVATE));
@@ -308,16 +590,38 @@ int main(int argc, char **argv)
         .journal_path=journal_path,.platform_backend=PLAT_BACKEND_WIN32,.font_dpi=96,.font_points=12,
         .hook_ctx=&measurements,.on_ingress=ingress,.on_submit=submitted};
     if(argc==2 && !strcmp(argv[1],"--minimize")) cfg.path=named_path;
+    uint8_t *large=NULL;
+    if(argc==2 && !strcmp(argv[1],"--close-large")) {
+        cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
+        memset(large,'a',cfg.initial_len); large[cfg.initial_len-1u]='\n'; cfg.initial=large;
+    }
     editor *e=NULL; T(editor_open(&e,&cfg,&b)==0);
     HWND window=plat_native_win32(&e->platform);
     if(argc==2) {
-        int rc=!strcmp(argv[1],"--cut") ? cut_test(e) :
+        int rc=!strcmp(argv[1],"--resizefail") ? resize_failure_test(e) :
+            !strcmp(argv[1],"--allocfail") ? allocation_failure_test(e) :
+            !strcmp(argv[1],"--queue") ? queue_cut_test(e) :
+            !strcmp(argv[1],"--close-large") ? close_large_test(e) :
+            !strcmp(argv[1],"--guard") ? undrawn_guard_test(e) :
+            !strcmp(argv[1],"--deadline") ? deadline_test(e) :
+            !strcmp(argv[1],"--idle") ? idle_probe_test(e) :
+            !strcmp(argv[1],"--larger") ? larger_surface_test(e) :
+            !strcmp(argv[1],"--cut") ? cut_test(e) :
             !strcmp(argv[1],"--minimize") ? minimize_test(e) :
             !strcmp(argv[1],"--retry") ? retry_test(e) :
             !strcmp(argv[1],"--paint") ? paint_discard_test(e) :
             !strcmp(argv[1],"--fallback") ? fallback_test(e) : lifecycle_test(e);
-        editor_close(e); cleanup(root); return rc;
+        editor_close(e);
+        if(!rc && !strcmp(argv[1],"--close-large")) {
+            b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
+            T(editor_open(&e,&cfg,&b)==0); T(settle(e)==0);
+            uint8_t last=0; T(editor_length(e)==1 && editor_read(e,0,&last,1)==0 && last=='\n');
+            puts("round3: large cut recovery restores exactly the cut result PASS"); editor_close(e);
+        }
+        free(large); cleanup(root); return rc;
     }
+    T(queue_cut_test(e)==0); T(deadline_test(e)==0); T(idle_probe_test(e)==0); T(undrawn_guard_test(e)==0);
+    T(larger_surface_test(e)==0); T(allocation_failure_test(e)==0); T(resize_failure_test(e)==0);
     T(cut_test(e)==0); /* Restore the campaign's initial text afterward. */
     editor_close(e); (void)os_unlink(journal_path); b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
     cfg.path=named_path;
@@ -399,6 +703,14 @@ int main(int argc, char **argv)
      * These apply at native T4, which an occluded surface cannot establish. */
     puts("SKIP (needs live desktop: native T4 G1; Linux limits (G) p50=1000000 ns/p99=2000000 ns, perf/01-perf-target.md section 0.2)");
     puts("SKIP (needs live desktop: N edits give N frames)");
-    editor_close(e); cleanup(root);
+    editor_close(e); (void)os_unlink(journal_path);
+    cfg.initial_len=2u*VIEW_MUTATION_BOUND+1u; large=malloc(cfg.initial_len); T(large);
+    memset(large,'a',cfg.initial_len); large[cfg.initial_len-1u]='\n'; cfg.initial=large;
+    b=(render_backend){0}; T(render_d3d11_backend(&b)==0); T(editor_open(&e,&cfg,&b)==0);
+    T(close_large_test(e)==0); editor_close(e);
+    b=(render_backend){0}; T(render_d3d11_backend(&b)==0); T(editor_open(&e,&cfg,&b)==0); T(settle(e)==0);
+    uint8_t last=0; T(editor_length(e)==1 && editor_read(e,0,&last,1)==0 && last=='\n');
+    puts("round3: large cut recovery restores exactly the cut result PASS");
+    editor_close(e); free(large); cleanup(root);
     return 0;
 }

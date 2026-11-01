@@ -2,6 +2,7 @@
 #include "raster/raster.h"
 #if defined(_WIN32)
 #include "d3d11/d3d11.h"
+#include "win32/private.h"
 #else
 #include "gl/gl.h"
 #endif
@@ -66,6 +67,8 @@ static void init_event(void *ctx, const plat_event *event)
 int editor_backend_init_sync(editor *e, render_config config, void *state)
 {
 #if defined(_WIN32)
+    if(e->has_platform && win32_plat_limit_client(&e->platform,config.max_width,config.max_height)!=PLAT_OK)
+        return EDITOR_ERR_IO;
     config.background_init = true; /* Authenticate the first real frame, never an init probe. */
 #endif
     editor_backend_init arg = {.backend = *e->backend, .config = config, .state = state, .result = RENDER_ERR_INIT};
@@ -98,10 +101,33 @@ int editor_backend_init_sync(editor *e, render_config config, void *state)
         (void)os_wake_wait(work_pool_wake(pool), INT64_C(1000000)); /* same quiescent cadence */
     }
     *e->backend = arg.backend;
+#if defined(_WIN32)
+    if(!arg.result && d3d11_native_failed(e->backend)) {
+        e->win_unavailable=true;
+        e->recovery_notice="display allocation unavailable; editing and saving remain available";
+        e->recovery_notice_mutations=e->stats.mutations;
+        (void)d3d11_set_suspended(e->backend,true);
+    }
+#endif
     return arg.result;
 }
 #if defined(_WIN32)
-static void shutdown_worker(work_ctx *job) { render_backend_shutdown(job->arg); }
+#define EDITOR_SHUTDOWN_MSG UINT32_C(0x45445344)
+static void shutdown_worker(work_ctx *job)
+{
+    render_backend_shutdown(job->arg);
+    work_msg msg={.kind=EDITOR_SHUTDOWN_MSG};
+    memcpy(msg.data,&job->arg,sizeof job->arg);
+    (void)work_publish(job,&msg); /* Dedicated lifecycle mailbox has one result. */
+}
+typedef struct shutdown_result { render_backend *target; bool received; } shutdown_result;
+static void shutdown_receive(const work_msg *msg,void *ctx)
+{
+    shutdown_result *result=ctx;
+    if(msg->kind!=EDITOR_SHUTDOWN_MSG) return;
+    render_backend *retired; memcpy(&retired,msg->data,sizeof retired);
+    *result->target=*retired; result->received=true;
+}
 #endif
 void editor_backend_shutdown_sync(editor *e, render_backend *backend)
 {
@@ -114,14 +140,15 @@ void editor_backend_shutdown_sync(editor *e, render_backend *backend)
         render_backend retiring=*backend;
         backend->initialized=false; backend->active=false;
         work_handle handle = {0};
+        shutdown_result result={.target=backend};
         do {
             if (!handle.epoch) handle = work_submit(&e->lifecycle_pool, (work_job){shutdown_worker, &retiring, 0, WORK_BULK});
-            if (handle.epoch && work_handle_finished(&e->lifecycle_pool, handle)) break;
+            if(handle.epoch) (void)work_mailbox_receive(&e->lifecycle_pool,handle,0,shutdown_receive,&result);
+            if (result.received && work_handle_finished(&e->lifecycle_pool, handle)) break;
             (void)work_mailbox_drain(&e->pool,editor_route_work,e);
             plat_callbacks cb = {.ud = e, .on_event = init_event};
             e->platform.quit = false; (void)plat_run_for(&e->platform, &cb, 1);
         } while (true);
-        *backend=retiring; /* physical completion publishes the worker result */
         (void)work_mailbox_drain(&e->pool,editor_route_work,e);
         return;
     }

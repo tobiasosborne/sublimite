@@ -320,8 +320,8 @@ $(WIN_B)/rel/tests/editor_wait_test.exe $(WIN_B)/san/tests/editor_wait_test.exe:
 
 $(WIN_B)/rel/tests/editor_exe_test.exe: $(WIN_B)/rel/sublimite.exe
 $(WIN_B)/san/tests/editor_exe_test.exe: $(WIN_B)/san/sublimite.exe
-$(WIN_B)/rel/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(filter-out %/editor/editor.o,$(WIN_EDITOR_REL))
-$(WIN_B)/san/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(filter-out %/editor/editor.o,$(WIN_EDITOR_SAN))
+$(WIN_B)/rel/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(filter-out %/editor/editor.o %/editor/backend.o,$(WIN_EDITOR_REL))
+$(WIN_B)/san/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(filter-out %/editor/editor.o %/editor/backend.o,$(WIN_EDITOR_SAN))
 $(WIN_B)/rel/tests/editor_win_test.exe: $(WIN_EDITOR_REL)
 $(WIN_B)/san/tests/editor_win_test.exe: $(WIN_EDITOR_SAN)
 

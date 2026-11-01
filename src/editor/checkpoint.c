@@ -437,16 +437,40 @@ int editor_journal_paint(editor *e)
     if (!rc) e->journal_paint = pending;
     return 0;
 }
+#if defined(_WIN32)
+/* A latency-waiting frame may outlive tab activation. Its guard names the
+ * copied frame's source, never the tab that happens to be active now. */
+int editor_journal_paint_frame(editor *e,uint64_t id)
+{
+    const editor_buffer *b=NULL;
+    for(size_t i=0;i<e->buffer_capacity;i++)
+        if(e->buffers[i] && e->buffers[i]->id==id) { b=e->buffers[i]; break; }
+    uint64_t pending=!b || b->painted || b->placeholder || b->derived ? 0 : id;
+    if(pending==e->journal_paint || !e->journal || e->recovering || editor_save_leased(e)) return 0;
+    if(e->tabs.next_id==1+e->recovery_placeholder_ids && !recorded_tabs(e,NULL)) return 0;
+    int rc=journal_append_protected(e->journal,JOURNAL_PAINT,pending,NULL,0);
+    if(rc==JOURNAL_BUSY) { e->journal_metadata_pending=true; return rc; }
+    if(!rc) e->journal_paint=pending;
+    return 0;
+}
+#endif
 void editor_journal_painted(editor *e, uint64_t id)
 {
     editor_buffer *b = e->buffer && e->buffer->id == id ? e->buffer : NULL;
     for (size_t i = 0; !b && i < e->buffer_capacity; i++)
         if (e->buffers[i] && e->buffers[i]->id == id) b = e->buffers[i];
     if (b) b->painted = true;
+#if defined(_WIN32)
+    editor_journal_paint_clear(e);
+#else
     (void)editor_journal_paint(e);
+#endif
 }
 void editor_journal_paint_clear(editor *e)
 {
+#if defined(_WIN32)
+    if(editor_save_leased(e)) return; /* Worker owns the journal until its mailbox. */
+#endif
     if (e->journal && e->journal_paint && !journal_append_protected(e->journal, JOURNAL_PAINT, 0, NULL, 0))
         e->journal_paint = 0;
 }

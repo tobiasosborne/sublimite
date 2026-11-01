@@ -32,7 +32,8 @@ struct editor_clip {
     bool ready, waiting, cutting, hitting, cluster_live, primary_waiting;
     bool cut_line;
 #if defined(_WIN32)
-    bool publishing;
+    bool publishing, terminal_pending;
+    plat_event terminal;
     uint64_t publication;
     editor_buffer *publication_owner;
     uint64_t publication_revision;
@@ -260,10 +261,17 @@ bool editor_clip_pending(const editor *e)
     const editor_clip *c = e->clipboard;
     return c && (editor_clip_busy(e) || c->primary.handle.epoch || c->desired);
 }
+#if defined(_WIN32)
+static bool terminal_ready(const editor *e);
+#endif
 bool editor_clip_runnable(const editor *e)
 {
     const editor_clip *c = e->clipboard;
-    return c && ((c->desired && !c->primary.handle.epoch) ||
+    return c && (
+#if defined(_WIN32)
+        (c->terminal_pending && terminal_ready(e)) ||
+#endif
+        (c->desired && !c->primary.handle.epoch) ||
         (c->primary.handle.epoch && c->primary.received) ||
         (c->command.handle.epoch && c->command.received));
 }
@@ -525,6 +533,25 @@ static int middle_target(editor *e, const plat_event *ev, bool *accepted)
     c->hitting = true; c->cluster_live = false; e->action = EDITOR_ACTION_CLIP;
     *accepted = true; return 0;
 }
+#if defined(_WIN32)
+int editor_clip_terminal(editor *e,const plat_event *ev)
+{
+    editor_clip *c=e->clipboard;
+    if(!c) return 0;
+    /* One explicit native operation at a time. Ownership-loss notifications
+     * are independent and cannot overwrite its retained terminal result. */
+    if((ev->code==2 && ev->clip_id && c->publishing && ev->clip_id==c->publication) ||
+       (ev->code!=2 && c->waiting && ev->clip_which==c->which)) {
+        c->terminal=*ev; c->terminal_pending=true;
+    }
+    return 0;
+}
+static bool terminal_ready(const editor *e)
+{
+    return !editor_save_leased(e) && !e->op_count && !e->journal_metadata_pending &&
+        !view_busy(&e->v) && e->file_command==KEYS_ACTION_NONE;
+}
+#endif
 int editor_clip_event(editor *e, const plat_event *ev)
 {
     editor_clip *c = e->clipboard;
@@ -565,6 +592,12 @@ int editor_clip_poll(editor *e)
 {
     editor_clip *c = e->clipboard;
     if (!c) return 0;
+#if defined(_WIN32)
+    if(c->terminal_pending && terminal_ready(e)) {
+        plat_event terminal=c->terminal; c->terminal_pending=false;
+        int rc=editor_clip_event(e,&terminal); if(rc) return rc;
+    }
+#endif
     clip_job *p = &c->primary, *j = &c->command;
     if (p->handle.epoch && p->received && work_handle_finished(&e->pool, p->handle)) {
         bool installed = false;
@@ -614,36 +647,41 @@ int editor_clip_poll(editor *e)
 }
 
 #if defined(_WIN32)
-/* Close must resolve admitted native writes while the buffer/journal still
- * exist. Reads may be abandoned; cuts may not. Direct polling avoids parking
- * the terminal event behind the quit/save input fence. */
-bool editor_clip_close_wait(editor *e)
+/* Close owns the cut through bounded replacement, view repair, undo and
+ * journal commit. Keep native/control and worker completions pumping on UI. */
+int editor_clip_close_wait(editor *e)
 {
     editor_clip *c=e->clipboard;
-    if(!c) return false;
-    if(c->command.handle.epoch && !c->command.paste) {
-        (void)work_mailbox_drain(&e->pool,editor_route_work,e);
-        (void)editor_clip_poll(e);
-        if(c->command.handle.epoch) return true;
-    }
-    if(!c->publishing) return false;
-    /* A completion may already have entered the FIFO before CLOSE bypassed
-     * dispatch. Remove only publication results, retaining every other event. */
-    for(size_t n=0;n<e->queue_count;) {
-        size_t at=(e->queue_head+n)%EDITOR_INPUT_CAP;
-        plat_event terminal=e->queue[at];
-        if(terminal.kind!=PLAT_EV_CLIPBOARD || terminal.code!=2 || !terminal.clip_id) { n++; continue; }
-        (void)editor_clip_event(e,&terminal);
-        for(size_t i=n;i+1u<e->queue_count;i++) {
-            size_t dest=(e->queue_head+i)%EDITOR_INPUT_CAP,next=(dest+1u)%EDITOR_INPUT_CAP;
-            e->queue[dest]=e->queue[next]; e->queue_serial[dest]=e->queue_serial[next];
-            e->queue_owner[dest]=e->queue_owner[next]; e->queue_generation[dest]=e->queue_generation[next];
+    if(!c || !e->buffer) return 0;
+    int sources=editor_poll_sources(e); if(sources) return sources;
+    /* Closing does not reach editor_step's ordinary durability scheduling.
+     * Return protected append credit while the cut/group is still pending. */
+    if(e->journal && !editor_journal_waiting(e)) {
+        journal_stats stats=journal_get_stats(e->journal);
+        if(stats.accepted_sequence>stats.durable_sequence) {
+            int flushed=journal_pump(e->journal,os_now_ns(),true);
+            if(flushed && flushed!=JOURNAL_BUSY) { e->stats.journal_error=flushed; return EDITOR_ERR_IO; }
         }
-        e->queue_count--;
     }
-    plat_event event;
-    while(win32_clip_poll(win32_private(&e->platform),&event))
-        (void)editor_clip_event(e,&event);
-    return c->publishing;
+    editor_journal_staged(e);
+    if(e->journal_metadata_pending) { int metadata=editor_journal_changed(e); if(metadata) return metadata; }
+    (void)work_mailbox_drain(&e->pool,editor_route_work,e);
+    plat_event terminal;
+    while(e->has_platform && win32_clip_poll(win32_private(&e->platform),&terminal)) {
+        int event_rc=editor_clip_terminal(e,&terminal); if(event_rc) return event_rc;
+    }
+    int rc=editor_clip_poll(e); if(rc) return rc;
+    if(c->publishing || (c->command.handle.epoch && !c->command.paste)) return EDITOR_MORE;
+    editor_journal_staged(e);
+    if(e->stats.journal_error) return EDITOR_ERR_IO;
+    if(e->action==EDITOR_ACTION_CLIP || e->action==EDITOR_ACTION_REPAIR ||
+       (e->explicit_group && view_busy(&e->v))) {
+        rc=editor_continue_action(e); if(rc) return rc;
+        editor_session_publish(e,e->buffer);
+        editor_journal_staged(e);
+        if(e->stats.journal_error) return EDITOR_ERR_IO;
+    }
+    return e->action==EDITOR_ACTION_CLIP || e->action==EDITOR_ACTION_REPAIR ||
+        e->explicit_group || e->op_count || e->journal_group_open ? EDITOR_MORE : 0;
 }
 #endif
