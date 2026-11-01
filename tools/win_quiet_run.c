@@ -11,6 +11,7 @@
  *            station refuses; invisible and focus-free, but it SHARES the clipboard
  * Exit code: the child's; 125 when isolation or the launch failed. Never falls
  * back to the live desktop: tools/winrun.sh takes WINRUN_ISOLATION=none, by hand. */
+#define _WIN32_WINNT 0x0A00 /* PROC_THREAD_ATTRIBUTE_JOB_LIST */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -44,7 +45,8 @@ int main(void)
     wchar_t station[64], desktop[128], mode[16] = L"station";
     (void)GetEnvironmentVariableW(L"WINRUN_ISOLATION", mode, 16);
     _snwprintf(station, 64, L"sublimite-test-%lu", GetCurrentProcessId());
-    STARTUPINFOW si; ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+    STARTUPINFOEXW ex; ZeroMemory(&ex, sizeof ex); ex.StartupInfo.cb = sizeof ex;
+    STARTUPINFOW *si = &ex.StartupInfo;
     if (!wcscmp(mode, L"station")) {
         HWINSTA own = GetProcessWindowStation();
         /* NULL name: Windows refuses a named station to this unelevated interop token
@@ -63,20 +65,28 @@ int main(void)
         fputs("win_quiet_run: WINRUN_ISOLATION must be station or desktop\n", stderr);
         return (int)FAIL_EXIT;
     }
-    si.lpDesktop = desktop;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    inherit(STD_INPUT_HANDLE, &si.hStdInput);
-    inherit(STD_OUTPUT_HANDLE, &si.hStdOutput);
-    inherit(STD_ERROR_HANDLE, &si.hStdError);
+    si->lpDesktop = desktop;
+    si->dwFlags = STARTF_USESTDHANDLES;
+    inherit(STD_INPUT_HANDLE, &si->hStdInput);
+    inherit(STD_OUTPUT_HANDLE, &si->hStdOutput);
+    inherit(STD_ERROR_HANDLE, &si->hStdError);
     HANDLE job = CreateJobObjectW(NULL, NULL); if (!job) die("CreateJobObject");
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits; ZeroMemory(&limits, sizeof limits);
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits)) die("SetInformationJobObject");
+    /* The job is part of creation (Windows 10 1607+; this box's minimum per
+     * windows-port.md), so no descendant exists outside it even for an instant:
+     * assigning a suspended child afterwards stranded orphans when a run was killed
+     * in between (M: eight, 2026-11-01). */
+    SIZE_T attribute_bytes = 0;
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
+    static char attribute_storage[256]; /* (M) one attribute needs 48 bytes on x64; checked below. */
+    if (attribute_bytes > sizeof attribute_storage) { fputs("win_quiet_run: attribute list too large\n", stderr); return (int)FAIL_EXIT; }
+    ex.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)attribute_storage;
+    if (!InitializeProcThreadAttributeList(ex.lpAttributeList, 1, 0, &attribute_bytes)) die("InitializeProcThreadAttributeList");
+    if (!UpdateProcThreadAttribute(ex.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof job, NULL, NULL)) die("UpdateProcThreadAttribute");
     PROCESS_INFORMATION pi;
-    /* Suspended until in the job, so no descendant can escape it. */
-    if (!CreateProcessW(NULL, rest, NULL, NULL, TRUE, CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi)) die("CreateProcess");
-    if (!AssignProcessToJobObject(job, pi.hProcess)) { TerminateProcess(pi.hProcess, FAIL_EXIT); die("AssignProcessToJobObject"); }
-    if (ResumeThread(pi.hThread) == (DWORD)-1) { TerminateProcess(pi.hProcess, FAIL_EXIT); die("ResumeThread"); }
+    if (!CreateProcessW(NULL, rest, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT | BELOW_NORMAL_PRIORITY_CLASS, NULL, NULL, si, &pi)) die("CreateProcess");
     if (WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_OBJECT_0) die("WaitForSingleObject");
     DWORD code = FAIL_EXIT;
     if (!GetExitCodeProcess(pi.hProcess, &code)) die("GetExitCodeProcess");
