@@ -9,8 +9,10 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 #include "x11/plat.h"
-/* (G) existing editor settle watchdog, tests/editor_test.c. */
-#define WATCH_NS UINT64_C(5000000000)
+#include "timeout_diag.h"
+/* (G) Existing observation sleep exceeds the D3D 3 s observation window.
+ * Native completion waits use the separately derived child guard. */
+#define OBSERVE_NS UINT64_C(5000000000)
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"editor_exe:%d FAIL %s native=%lu\n",__LINE__,#x,GetLastError()); goto fail; } } while (0)
 typedef struct search { DWORD pid; HWND window; } search;
 static BOOL CALLBACK find_window(HWND window, LPARAM arg)
@@ -22,8 +24,19 @@ static BOOL CALLBACK find_window(HWND window, LPARAM arg)
 }
 static HWND wait_window(DWORD pid)
 {
-    search s = {pid,NULL}; uint64_t end = os_now_ns()+WATCH_NS;
-    do { EnumWindows(find_window,(LPARAM)&s); if (s.window) return s.window; Sleep(1); } while (os_now_ns()<end);
+    search s = {pid,NULL}; uint64_t started=os_now_ns(), end = started+TEST_WIN_PROCESS_NS;
+    do {
+        EnumWindows(find_window,(LPARAM)&s);
+        if(s.window) {
+            fprintf(stderr,"editor_exe: ready pid=%lu elapsed_ms=%llu\n",pid,
+                (unsigned long long)((os_now_ns()-started)/UINT64_C(1000000)));
+            return s.window;
+        }
+        Sleep(1);
+    } while(os_now_ns()<end);
+    fprintf(stderr,"editor_exe: ready window timeout elapsed_ms=%llu pid=%lu\n",
+        (unsigned long long)((os_now_ns()-started)/UINT64_C(1000000)),pid);
+    test_timeout_process(pid);
     return NULL;
 }
 static bool contents(const char *path, const char *expected)
@@ -35,8 +48,15 @@ static bool contents(const char *path, const char *expected)
 }
 static bool wait_contents(const char *path, const char *expected)
 {
-    uint64_t end=os_now_ns()+WATCH_NS;
-    do { if(contents(path,expected)) return true; Sleep(1); } while(os_now_ns()<end);
+    uint64_t started=os_now_ns(), end=started+TEST_WIN_PROCESS_NS;
+    do {
+        if(contents(path,expected)) {
+            fprintf(stderr,"editor_exe: exact saved bytes elapsed_ms=%llu\n",
+                (unsigned long long)((os_now_ns()-started)/UINT64_C(1000000)));
+            return true;
+        }
+        Sleep(1);
+    } while(os_now_ns()<end);
     os_file f=OS_FILE_INIT; char bytes[256]; size_t count=0;
     if(os_file_open(&f,path,OS_OPEN_READ)==OS_OK) {
         (void)os_file_read(&f,bytes,sizeof bytes,&count); os_file_close(&f);
@@ -83,17 +103,78 @@ static bool journal_has_crash_edit(const char *profile, uint8_t marker)
             char path[OS_PATH_MAX]; snprintf(path,sizeof path,"%s\\%s",directory,name);
             journal_replay_result result; crash_state state={.marker=marker};
             (void)journal_scan_file(path,saw_crash_edit,&state,&result);
+            if(state.seen && !state.paint) fprintf(stderr,"editor_exe: marker=%c records=%llu journal=%s\n",
+                marker,(unsigned long long)result.records,path);
             seen=seen || (state.seen && !state.paint);
         }
         os_dir_iter_close(&it);
     }
     os_dir_close(&dir); return seen;
 }
+static int dump_record(void *ctx,const journal_record *record)
+{
+    (void)ctx;
+    fprintf(stderr,"journal state seq=%llu type=%u buffer=%llu size=%zu",
+        (unsigned long long)record->sequence,record->type,(unsigned long long)record->buffer_id,record->size);
+    if(record->type==JOURNAL_INSERT && record->size>sizeof(uint64_t))
+        fprintf(stderr," inserted=[%.*s]",(int)(record->size-sizeof(uint64_t)),record->data+sizeof(uint64_t));
+    if(record->type==JOURNAL_DELETE && record->size==2u*sizeof(uint64_t)) {
+        uint64_t offset=0,length=0; memcpy(&offset,record->data,sizeof offset); memcpy(&length,record->data+sizeof offset,sizeof length);
+        fprintf(stderr," deleted_offset=%llu length=%llu",(unsigned long long)offset,(unsigned long long)length);
+    }
+    fputc('\n',stderr); return 0;
+}
+static void dump_journals(const char *path)
+{
+    os_dir dir=OS_DIR_INIT; os_dir_iter it;
+    if(os_dir_open(&dir,path)!=OS_OK) return;
+    if(os_dir_iter_open(&it,&dir)==OS_OK) {
+        const char *name;
+        while(os_dir_next(&it,&name)==OS_OK && name) {
+            char child[OS_PATH_MAX]; snprintf(child,sizeof child,"%s\\%s",path,name);
+            os_stat st;
+            if(os_stat_path(child,OS_STAT_NOFOLLOW,&st)==OS_OK && st.kind==OS_KIND_DIR) dump_journals(child);
+            else if(!strncmp(name,"session-",8)) {
+                fprintf(stderr,"journal state file=%s\n",child); journal_replay_result replay;
+                int rc=journal_scan_file(child,dump_record,NULL,&replay);
+                fprintf(stderr,"journal state scan=%d records=%llu corrupt=%d\n",rc,(unsigned long long)replay.records,replay.corrupt);
+            }
+        }
+        os_dir_iter_close(&it);
+    }
+    os_dir_close(&dir);
+}
 static bool wait_crash_edit(const char *root, uint8_t marker)
 {
-    uint64_t end=os_now_ns()+WATCH_NS;
+    uint64_t end=os_now_ns()+TEST_WIN_PROCESS_NS;
     do { if(journal_has_crash_edit(root,marker)) return true; Sleep(1); } while(os_now_ns()<end);
     return false;
+}
+static bool kill_committed_edit(os_proc *child,HWND window,const char *root,uint8_t marker)
+{
+    DWORD pid=0,tid=GetWindowThreadProcessId(window,&pid);
+    if(!tid || pid!=(DWORD)child->id) return false;
+    HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,tid);
+    if(!thread) return false;
+    uint64_t end=os_now_ns()+TEST_WIN_PROCESS_NS;
+    bool killed=false;
+    do {
+        if(!journal_has_crash_edit(root,marker)) { Sleep(1); continue; }
+        /* The scan and TerminateProcess are separate operations. PAINT can
+         * arm between them; that death intentionally restores the tab closed.
+         * Freeze only our child's UI, synchronize the suspension with context
+         * capture, then recheck the exact edit/no-PAINT condition before kill.
+         * Workers can finish I/O, but cannot begin a new UI paint boundary. */
+        if(SuspendThread(thread)==(DWORD)-1) break;
+        CONTEXT context={.ContextFlags=CONTEXT_CONTROL};
+        bool stopped=GetThreadContext(thread,&context)!=0;
+        bool safe=stopped && journal_has_crash_edit(root,marker);
+        if(stopped && !safe) fprintf(stderr,"editor_exe: kill boundary raced PAINT marker=%c; resume/retry\n",marker);
+        if(safe) killed=os_proc_kill(child)==OS_OK;
+        if(!killed) (void)ResumeThread(thread);
+        if(killed || !stopped) break;
+    } while(os_now_ns()<end);
+    CloseHandle(thread); return killed;
 }
 static DWORD child_process(DWORD parent)
 {
@@ -138,7 +219,7 @@ static bool captured_usage(const char *exe, const WCHAR *option, DWORD expected)
     CloseHandle(write_pipe);
     char text[4096]={0}; DWORD bytes=0,code=0;
     if(ok) {
-        ok=WaitForSingleObject(pi.hProcess,(DWORD)(WATCH_NS/UINT64_C(1000000)))==WAIT_OBJECT_0;
+        ok=WaitForSingleObject(pi.hProcess,(DWORD)(TEST_WIN_PROCESS_NS/UINT64_C(1000000)))==WAIT_OBJECT_0;
         if(!ok) TerminateProcess(pi.hProcess,1);
         else ok=GetExitCodeProcess(pi.hProcess,&code) && code==expected &&
             ReadFile(read_pipe,text,sizeof text-1u,&bytes,NULL) && bytes>0 &&
@@ -151,7 +232,7 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout,NULL,_IONBF,0);
     char temp[OS_PATH_MAX],root[OS_PATH_MAX]={0},path[OS_PATH_MAX],self[OS_PATH_MAX],exe[OS_PATH_MAX];
-    os_proc child={0}; bool running=false; int result=1; os_file file=OS_FILE_INIT; size_t done;
+    os_proc child={0},other={0}; bool running=false; int result=1; os_file file=OS_FILE_INIT; size_t done;
     CHECK(os_temp_dir(temp,sizeof temp)==OS_OK);
     unsigned random=0; CHECK(os_random(&random,sizeof random)==OS_OK);
     CHECK(snprintf(root,sizeof root,"%s\\sublimite-test-editor-%lu-%x",temp,GetCurrentProcessId(),random)>0);
@@ -178,7 +259,7 @@ int main(int argc, char **argv)
         text(window); save(window);
         CHECK(wait_contents(path,"typed äλ中🙂base\n"));
         CHECK(PostMessageW(window,WM_CLOSE,0,0)); os_proc_status input_status;
-        CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&input_status)==OS_OK); running=false;
+        CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&input_status)==OS_OK); running=false;
         CHECK(input_status.how==OS_PROC_EXITED && input_status.code==0);
         puts("editor_exe: posted text resets inherited modifier state PASS"); result=0; goto fail;
     }
@@ -188,12 +269,13 @@ int main(int argc, char **argv)
     CHECK(os_file_open(&file,other_path,OS_OPEN_WRITE|OS_OPEN_CREATE|OS_OPEN_EXCL)==OS_OK);
     CHECK(os_file_write(&file,"other\n",6,&done)==OS_OK && done==6); os_file_close(&file);
     const char *other_args[]={exe,other_path,NULL};
-    os_proc other={0}; CHECK(os_proc_spawn(&other,other_args)==OS_OK);
+    CHECK(os_proc_spawn(&other,other_args)==OS_OK);
+    puts("editor_exe: other profile startup");
     HWND other_window=wait_window(other.id); CHECK(other_window);
     (void)ShowWindow(other_window,SW_MINIMIZE); CHECK(IsIconic(other_window));
     CHECK(post_character(other_window,'@')); CHECK(wait_crash_edit(profile2,'@'));
-    CHECK(os_proc_kill(&other)==OS_OK);
-    os_proc_status other_status; CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(kill_committed_edit(&other,other_window,profile2,'@'));
+    os_proc_status other_status; CHECK(os_proc_wait(&other,(int64_t)TEST_WIN_PROCESS_NS,&other_status)==OS_OK);
     CHECK(other_status.how==OS_PROC_ABNORMAL);
     CHECK(os_proc_spawn(&other,other_args)==OS_OK); other_window=wait_window(other.id); CHECK(other_window);
     (void)ShowWindow(other_window,SW_MINIMIZE); CHECK(IsIconic(other_window));
@@ -203,35 +285,35 @@ int main(int argc, char **argv)
     PostMessageW(other_window,WM_APP+0x51,0,0); save(other_window);
     CHECK(wait_contents(other_path,"@other\n") && contents(path,"base\n"));
     CHECK(PostMessageW(other_window,WM_CLOSE,0,0));
-    CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(os_proc_wait(&other,(int64_t)TEST_WIN_PROCESS_NS,&other_status)==OS_OK);
     CHECK(other_status.how==OS_PROC_EXITED && other_status.code==0);
     CHECK(os_env_set("SUBLIMITE_PROFILE",path)==OS_OK); /* file, invalid profile */
     CHECK(os_proc_spawn(&other,args)==OS_OK);
-    CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(os_proc_wait(&other,(int64_t)TEST_WIN_PROCESS_NS,&other_status)==OS_OK);
     CHECK(other_status.how==OS_PROC_EXITED && other_status.code!=0);
     CHECK(os_env_set("SUBLIMITE_PROFILE",root)==OS_OK);
     puts("editor_exe: distinct profiles do not hand off; invalid profile fails before IPC PASS");
     /* (G) exceed the existing D3D observation window (3 s), using the
      * editor's existing 5 s settle watchdog. The process must keep editing. */
-    Sleep((DWORD)(WATCH_NS/UINT64_C(1000000)));
+    Sleep((DWORD)(OBSERVE_NS/UINT64_C(1000000)));
     /* Negative-control state is deliberate: text() must clear it. */
     CHECK(PostMessageW(window,WM_APP+0x51,PLAT_MOD_CTRL,0));
     text(window); save(window);
     CHECK(wait_contents(path,"typed äλ中🙂base\n"));
     CHECK(PostMessageW(window,WM_CLOSE,0,0));
     os_proc_status status;
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==0);
     puts("editor_exe: occluded argv file, posted Unicode, Ctrl+S, close exit=0 PASS");
     CHECK(captured_usage(exe,L"--help",0));
     CHECK(captured_usage(exe,L"--invalid-test-option",2));
     const char *help[]={exe,"--help",NULL};
     CHECK(os_proc_spawn(&child,help)==OS_OK); running=true;
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==0);
     const char *bad[]={exe,"--invalid-test-option",NULL};
     CHECK(os_proc_spawn(&child,bad)==OS_OK); running=true;
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==2);
     puts("editor_exe: GUI executable inherited usage/error streams and useful exit codes PASS");
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
@@ -241,8 +323,8 @@ int main(int argc, char **argv)
     CHECK(!IsIconic(window));
     CHECK(post_character(window,'!'));
     CHECK(wait_crash_edit(root,'!'));
-    CHECK(os_proc_kill(&child)==OS_OK);
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(kill_committed_edit(&child,window,root,'!'));
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_ABNORMAL);
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
     window=wait_window(child.id); CHECK(window);
@@ -255,25 +337,28 @@ int main(int argc, char **argv)
     PostMessageW(window,WM_APP+0x51,0,0); save(window);
     CHECK(wait_contents(path,"typed äλ中🙂!base\n"));
     CHECK(PostMessageW(window,WM_CLOSE,0,0));
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==0);
     puts("editor_exe: TerminateProcess mid-edit -> same-profile relaunch -> byte-exact recovery PASS");
     const char *wait_args[]={exe,"--wait","--new-instance",path,NULL};
     CHECK(os_proc_spawn(&child,wait_args)==OS_OK); running=true;
-    uint64_t end=os_now_ns()+WATCH_NS; DWORD ui=0;
+    uint64_t end=os_now_ns()+TEST_WIN_PROCESS_NS; DWORD ui=0;
     do { ui=child_process(child.id); if(ui) break; Sleep(1); } while(os_now_ns()<end);
     CHECK(ui); window=wait_window(ui); CHECK(window);
     HANDLE ui_process=OpenProcess(SYNCHRONIZE,FALSE,ui); CHECK(ui_process);
     CHECK(PostMessageW(window,WM_CLOSE,0,0));
-    CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
+    CHECK(os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==0);
-    CHECK(WaitForSingleObject(ui_process,(DWORD)(WATCH_NS/UINT64_C(1000000)))==WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(ui_process,(DWORD)(TEST_WIN_PROCESS_NS/UINT64_C(1000000)))==WAIT_OBJECT_0);
     CloseHandle(ui_process);
     puts("editor_exe: --wait launcher returns 0 after UI close; no leftover UI process PASS");
     result=0;
 fail:
+    if(result && *root) dump_journals(root);
+    if(result && other.process) test_timeout_process((DWORD)other.id);
+    if(result && running) test_timeout_process((DWORD)child.id);
     os_file_close(&file);
-    if(running) { os_proc_status killed; (void)os_proc_kill(&child); (void)os_proc_wait(&child,(int64_t)WATCH_NS,&killed); }
+    if(running) { os_proc_status killed; (void)os_proc_kill(&child); (void)os_proc_wait(&child,(int64_t)TEST_WIN_PROCESS_NS,&killed); }
     if(*root) cleanup(root);
     return result;
 }

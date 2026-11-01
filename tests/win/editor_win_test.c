@@ -9,6 +9,7 @@
 #include "win32/private.h"
 #include "trace/trace.h"
 #include "test_isolation.h"
+#include "timeout_diag.h"
 /* Same native call seam as win32_plat_test; no production fault switch. */
 static volatile LONG fail_clip, synthetic_publication;
 static BOOL publication_empty(void)
@@ -573,10 +574,12 @@ static int close_record(void *ctx,const journal_record *record)
 }
 static int close_queue_test(editor *e,bool prompt,unsigned fence)
 {
+    puts("close_queue: settle");
     T(settle(e)==0);
     if(fence==1u) e->journal_metadata_pending=true;
     else if(fence==2u) hold_save_fence=true;
-    else T(publication_start(e)==0);
+    else { puts("close_queue: publication_start"); T(publication_start(e)==0); }
+    puts("close_queue: enqueue input/close and release publication");
     plat_event key={.kind=PLAT_EV_KEY,.press=true,.keysym='q',.utf8_len=1,.utf8={'q'}};
     T(editor_inject(e,&key)==0);
     plat_event close={.kind=prompt ? PLAT_EV_KEY : PLAT_EV_CLOSE,.press=true,.keysym='w',.mods=PLAT_MOD_CTRL};
@@ -586,7 +589,13 @@ static int close_queue_test(editor *e,bool prompt,unsigned fence)
     else SetEvent(publish_release);
     uint64_t end=os_now_ns()+WATCH_NS; int rc=0;
     do {
-        rc=editor_step(e,0); T(rc>=0); T(os_now_ns()<end); os_yield();
+        rc=editor_step(e,0); T(rc>=0);
+        if(os_now_ns()>=end) {
+            fprintf(stderr,"close_queue timeout rc=%d queue=%zu quit=%d close=%d clip=%d dirty=%d active=%d journal_metadata=%d\n",
+                rc,e->queue_count,e->quit,e->win_close_requested,editor_clip_busy(e),e->dirty,e->backend->active,e->journal_metadata_pending);
+            test_timeout_process(GetCurrentProcessId()); return 1;
+        }
+        os_yield();
     } while(prompt ? !editor_close_prompt_shown(e) : rc!=EDITOR_CLOSED);
     uint8_t bytes[6]; size_t length=fence ? 6u : 2u;
     T(editor_length(e)==length && editor_read(e,0,bytes,length)==0);
@@ -1072,10 +1081,16 @@ static int run_child_case(const char *mode,const char *root,DWORD expected)
     STARTUPINFOW startup={.cb=sizeof startup,.dwFlags=STARTF_USESTDHANDLES,
         .hStdInput=GetStdHandle(STD_INPUT_HANDLE),.hStdOutput=GetStdHandle(STD_OUTPUT_HANDLE),.hStdError=GetStdHandle(STD_ERROR_HANDLE)};
     PROCESS_INFORMATION process={0}; T(CreateProcessW(NULL,command,NULL,NULL,TRUE,0,NULL,NULL,&startup,&process));
-    /* (E) Existing WATCH per startup, test, teardown; no tighter load bound. */
-    uint64_t watches=!strcmp(mode,"--crash-guard") ? 9u : 3u;
-    DWORD result=WaitForSingleObject(process.hProcess,(DWORD)(watches*WATCH_NS/UINT64_C(1000000)));
-    if(result!=WAIT_OBJECT_0) TerminateProcess(process.hProcess,1);
+    /* The close child includes startup, clipboard, shutdown and recovery,
+     * not three editor settle loops. See the measured native-phase guard.
+     * (P) Crash guard supervises two more native children serially; allow
+     * their two guards plus the outer child's own phase. */
+    uint64_t phases=!strcmp(mode,"--crash-guard") ? 3u : 1u;
+    DWORD result=WaitForSingleObject(process.hProcess,(DWORD)(phases*TEST_WIN_PROCESS_NS/UINT64_C(1000000)));
+    if(result!=WAIT_OBJECT_0) {
+        fprintf(stderr,"editor_win child timeout mode=%s wait=%lu\n",mode,result);
+        test_timeout_process(process.dwProcessId); TerminateProcess(process.hProcess,1);
+    }
     DWORD code=0; T(GetExitCodeProcess(process.hProcess,&code));
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
     T(result==WAIT_OBJECT_0 && code==expected); return 0;
@@ -1102,6 +1117,7 @@ int main(int argc, char **argv)
     (void)SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     trace_init(); T(trace_thread_register()>=0);
     T(auto_source_test()==0);
+    if(argc==2 && !strcmp(argv[1],"--close-campaign")) return run_child_case("--close-queue",NULL,0);
     if(argc==2 && !strcmp(argv[1],"--wait")) return wait_test();
     char temp[OS_PATH_MAX],root[OS_PATH_MAX],journal_path[OS_PATH_MAX]; unsigned random;
     T(os_temp_dir(temp,sizeof temp)==OS_OK && os_random(&random,sizeof random)==OS_OK);
@@ -1132,7 +1148,9 @@ int main(int argc, char **argv)
         cfg.max_window_width=5120; cfg.max_window_height=1440;
         cfg.window_width=5120u*60u/100u; cfg.window_height=1440u*70u/100u;
     }
+    printf("editor_win: opening mode=%s\n",argc>1 ? argv[1] : "full");
     editor *e=NULL; T(editor_open(&e,&cfg,&b)==0);
+    puts("editor_win: opened");
     HWND window=plat_native_win32(&e->platform);
     if(argc==3) {
         T(settle(e)==0);
@@ -1199,11 +1217,11 @@ int main(int argc, char **argv)
             !strcmp(argv[1],"--retry") ? retry_test(e) :
             !strcmp(argv[1],"--paint") ? paint_discard_test(e) :
             !strcmp(argv[1],"--fallback") ? fallback_test(e) : lifecycle_test(e);
-        editor_close(e);
+        puts("editor_win: closing"); editor_close(e); puts("editor_win: closed");
         if(!rc && (!strcmp(argv[1],"--close-queue") || !strcmp(argv[1],"--close-fence") || !strcmp(argv[1],"--close-save"))) {
             bool fence=strcmp(argv[1],"--close-queue")!=0;
             b=(render_backend){0}; T(render_d3d11_backend(&b)==0);
-            T(editor_open(&e,&cfg,&b)==0); T(settle(e)==0);
+            puts("editor_win: recovery opening"); T(editor_open(&e,&cfg,&b)==0); puts("editor_win: recovery opened"); T(settle(e)==0);
             uint8_t recovered[6]; size_t count=fence ? 6u : 2u;
             T(editor_length(e)==count && editor_read(e,0,recovered,count)==0);
             T(!memcmp(recovered,fence ? "qbase\n" : "q\n",count));

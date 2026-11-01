@@ -6,6 +6,7 @@
 #define main journal_boundaries_main
 #include "../journal_hot_exit_test.c"
 #undef main
+#include "timeout_diag.h"
 
 typedef struct kill_model { uint8_t bytes[256]; size_t len; uint64_t rng, edits; } kill_model;
 typedef struct progress { uint64_t issued, cached, ack, error; } progress;
@@ -104,14 +105,27 @@ static int random_campaign(unsigned trials)
         char seed_arg[sizeof "18446744073709551615"], before[sizeof "1"];
         n=snprintf(seed_arg,sizeof seed_arg,"%" PRIu64,seed); T(n>0 && (size_t)n<sizeof seed_arg); strcpy(before,t==0?"1":"0");
         const char *args[]={self,"--random-writer",path,shared,seed_arg,before,NULL}; os_proc child; O(os_proc_spawn(&child,args));
-        uint64_t end=os_now_ns()+UINT64_C(10000000000); bool reached=false;
+        /* Native startup plus the seeded target, never an arbitrary 10 s
+         * performance assertion. (P) At most 100000 edits, each with two
+         * progress writes and a flush every 4096. (M) The slowest completed
+         * target in red was 83865 edits in 3.718 s; scaled to the full script
+         * that is 3.718*100000/83865 < 4.434 s. The shared native-phase guard
+         * has >27 times that work allowance and >3 times observed lifecycle
+         * time at the runner's priority. It cannot authorize an early kill. */
+        uint64_t started=os_now_ns(), end=started+TEST_WIN_PROCESS_NS; bool reached=false;
+        progress previous={0};
         while(os_now_ns()<end) {
+            previous=p;
             O(os_file_pread(&f,&p,sizeof p,0,&moved)); T(moved==sizeof p);
             if(p.cached>=target) { reached=true; break; }
             os_proc_status st; os_err e=os_proc_wait(&child,0,&st);
             if(e==OS_OK) { fprintf(stderr,"journal_kill_test: random writer exited trial=%u code=%d\n",t,st.code); return 1; }
             T(e==OS_E_TIMEDOUT && !p.error); os_sleep_ns(50000);
         }
+        fprintf(stderr,"journal random trial=%u target=%" PRIu64 " issued=%" PRIu64 " cached=%" PRIu64
+            " ack=%" PRIu64 " error=%" PRIu64 " previous_cached=%" PRIu64 " elapsed_ms=%" PRIu64 " reached=%d\n",
+            t,target,p.issued,p.cached,p.ack,p.error,previous.cached,(os_now_ns()-started)/UINT64_C(1000000),reached);
+        if(!reached) test_timeout_process((DWORD)child.id);
         O(os_proc_kill(&child)); os_proc_status st; O(os_proc_wait(&child,-1,&st)); T(reached && st.how==OS_PROC_ABNORMAL);
         O(os_file_pread(&f,&p,sizeof p,0,&moved)); T(moved==sizeof p && !p.error); os_file_close(&f);
         piece_allocator a=piece_default_allocator(); restored r={.script={.rng=seed},.tree=piece_create(&a)}; T(r.tree);
@@ -133,6 +147,7 @@ int main(int argc, char **argv)
         return random_writer(argv[2],argv[3],seed,!strcmp(argv[5],"1"));
     }
     if(argc==2 && !strcmp(argv[1],"--metadata-only")) return random_campaign(1);
+    if(argc==2 && !strcmp(argv[1],"--random-only")) return random_campaign(50);
     if(argc!=1) return journal_boundaries_main(argc,argv);
     T(journal_boundaries_main(argc,argv)==0); return random_campaign(50);
 }

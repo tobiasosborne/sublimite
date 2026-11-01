@@ -8,9 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include "win/timeout_diag.h"
+#endif
 #define T(c) do { if(!(c)) { fprintf(stderr,"journal_hot_exit_test:%d FAIL %s native=%d\n",__LINE__,#c,os_native_error()); return 1; } } while(0)
 #define O(c) T((c)==OS_OK)
-typedef enum phase { CACHE, DURABLE, BEGIN, DELETE, BEFORE_COMMIT, COMMIT, PAINT, TORN_INSERT, TORN_COMMIT,
+typedef enum phase { CACHE, DURABLE, BEGIN, DELETE_BOUNDARY, BEFORE_COMMIT, COMMIT, PAINT, TORN_INSERT, TORN_COMMIT,
     ROTATE_CLEAN, ROTATE_FAILED, ROTATE_MISSING, ROTATE_ASCII, ROTATE_UTF8,
     ROTATE_WRITEBACK, ROTATE_REPLACED, ROTATE_ADOPTED, ROTATE_CLEANUP, COPY_PARTIAL, PHASE_END } phase;
 typedef struct crash { char ready[OS_PATH_MAX], path[OS_PATH_MAX]; os_file copy; phase at; } crash;
@@ -121,7 +124,7 @@ static int writer(const char *path, const char *ready, phase at)
     T(journal_append(j,JOURNAL_GROUP_BEGIN,0,NULL,0)==0);
     if(at==BEGIN) { T(notify(ready)==0); park(); }
     T(journal_delete(j,1,0,sizeof "before"-1u)==0);
-    if(at==DELETE) { T(notify(ready)==0); park(); }
+    if(at==DELETE_BOUNDARY) { T(notify(ready)==0); park(); }
     T(journal_flush(j)==0); /* PAD across a batch boundary within the action */
     T(journal_insert(j,1,0,(const uint8_t *)"after",sizeof "after"-1u)==0);
     if(at==BEFORE_COMMIT) { T(notify(ready)==0); park(); }
@@ -178,7 +181,12 @@ static int trial(const char *self, const char *dir, phase at)
     n=snprintf(ready,sizeof ready,"%s/ready",dir); T(n>0 && (size_t)n<sizeof ready);
     n=snprintf(role,sizeof role,"--writer=%u",(unsigned)at); T(n>0 && (size_t)n<sizeof role);
     const char *args[]={self,role,path,ready,NULL}; os_proc child; O(os_proc_spawn(&child,args));
-    bool reached=false; uint64_t end=os_now_ns()+UINT64_C(10000000000); /* existing os_test case guard */
+    bool reached=false;
+#if defined(_WIN32)
+    uint64_t end=os_now_ns()+TEST_WIN_PROCESS_NS; /* native startup + named protocol boundary */
+#else
+    uint64_t end=os_now_ns()+UINT64_C(10000000000); /* existing os_test case guard */
+#endif
     while(os_now_ns()<end) {
         os_stat st;
         if(os_stat_path(ready,0,&st)==OS_OK && st.size==sizeof "ready"-1u) { reached=true; break; }
@@ -187,7 +195,13 @@ static int trial(const char *self, const char *dir, phase at)
         if(e==OS_OK) { fprintf(stderr,"journal_hot_exit_test: child exited code=%d phase=%d\n",status.code,at); return 1; }
         T(e==OS_E_TIMEDOUT); os_sleep_ns(1000000);
     }
-    if(!reached) { (void)os_proc_kill(&child); os_proc_status status; (void)os_proc_wait(&child,-1,&status); T(reached); }
+    if(!reached) {
+#if defined(_WIN32)
+        fprintf(stderr,"journal boundary timeout phase=%d ready=%s\n",at,ready);
+        test_timeout_process((DWORD)child.id);
+#endif
+        (void)os_proc_kill(&child); os_proc_status status; (void)os_proc_wait(&child,-1,&status); T(reached);
+    }
     if(at>=ROTATE_CLEAN) T(journal_retire_directory(dir,path)==JOURNAL_BUSY);
     char tmp[OS_PATH_MAX]; size_t count=0;
     if(at>=ROTATE_CLEAN && at<=ROTATE_CLEANUP) {
@@ -213,7 +227,7 @@ static int trial(const char *self, const char *dir, phase at)
         model m={0}; journal_replay_result rr; T(journal_replay_file(path,replay,&m,&rr)==0);
         const char *want=at==COMMIT?"after":"before";
         T(m.len==strlen(want) && !memcmp(m.text,want,m.len));
-        T(rr.corrupt==(at==BEGIN || at==DELETE || at==BEFORE_COMMIT || at==TORN_INSERT || at==TORN_COMMIT)); T(m.paint==(at==PAINT?1u:0u));
+        T(rr.corrupt==(at==BEGIN || at==DELETE_BOUNDARY || at==BEFORE_COMMIT || at==TORN_INSERT || at==TORN_COMMIT)); T(m.paint==(at==PAINT?1u:0u));
         os_stat st; O(os_stat_path(path,0,&st)); T((uint64_t)st.size==rr.valid_bytes);
     }
     T(cleanup(dir)==0); return 0;
