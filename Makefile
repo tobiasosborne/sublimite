@@ -62,7 +62,7 @@ MAINC  := $(wildcard src/main.c)
 TESTS  := $(sort $(wildcard tests/*_test.c))
 BENCHS := $(sort $(wildcard bench/*_bench.c))
 FUZZS  := $(sort $(wildcard fuzz/*_fuzz.c))
-TOOLS  := $(sort $(wildcard tools/*.c))
+TOOLS  := $(sort $(filter-out tools/win_%,$(wildcard tools/*.c))) # tools/win_* build for TARGET=win (mk/win.mk).
 
 REL_OBJ  := $(SRCS:%.c=$(B)/rel/%.o)
 SAN_OBJ  := $(SRCS:%.c=$(B)/san/%.o)
