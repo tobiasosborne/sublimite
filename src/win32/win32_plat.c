@@ -348,7 +348,7 @@ static void capture_cancel(win32_plat *s)
 static void resize(win32_plat *s)
 {
     RECT rect;
-    if (!GetClientRect(s->hwnd,&rect)) return;
+    if (s->minimized || !GetClientRect(s->hwnd,&rect) || rect.right<=rect.left || rect.bottom<=rect.top) return;
     s->owner->width=(uint32_t)(rect.right-rect.left); s->owner->height=(uint32_t)(rect.bottom-rect.top);
     (void)push(s,(plat_event){.kind=PLAT_EV_RESIZE,.w=s->owner->width,.h=s->owner->height});
 }
@@ -559,7 +559,19 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ENDSESSION:
         if (wp) (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE});
         return 0;
-    case WM_SIZE: s->minimized = wp == SIZE_MINIMIZED; resize(s); return 0;
+    case WM_ACTIVATE:
+        if(LOWORD(wp)!=WA_INACTIVE) (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
+        break;
+    case WM_WINDOWPOSCHANGED:
+        (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
+        break; /* DefWindowProc still generates native SIZE/MOVE. */
+    case WM_SIZE: {
+        bool was_minimized=s->minimized;
+        s->minimized = wp == SIZE_MINIMIZED;
+        resize(s);
+        if(was_minimized!=s->minimized) (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE});
+        return 0;
+    }
     case WM_DPICHANGED: {
         s->dpi=HIWORD(wp); RECT *r=(RECT *)lp;
         uint32_t old_w=s->owner->width,old_h=s->owner->height;

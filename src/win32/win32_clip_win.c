@@ -11,6 +11,7 @@ typedef struct win32_clip_job {
     struct win32_clip_job *next;
     uint8_t *bytes;
     size_t len;
+    uint64_t id;
     int which;
     bool set, ok;
 } win32_clip_job;
@@ -22,6 +23,7 @@ struct win32_clip {
     WCHAR class_name[64]; /* (P) prefix + pointer hex + NUL fits. */
     win32_clip_job *first, *last, *done, *done_last;
     unsigned used, lost;
+    uint64_t next_id;
     bool started, owned, publishing, busy, stopping;
 };
 static void clip_job_free(win32_clip_job *j)
@@ -154,8 +156,7 @@ static DWORD WINAPI clip_thread(void *arg)
         j->ok=j->set ? clip_write(c,j) : clip_read(c,j);
         AcquireSRWLockExclusive(&c->lock);
         c->busy=false;
-        if (j->set && j->ok) { c->used--; clip_job_free(j); }
-        else {
+        {
             if (c->done_last) c->done_last->next=j; else c->done=j;
             c->done_last=j; (void)SetEvent(c->completed);
         }
@@ -194,7 +195,7 @@ void win32_clip_stop(win32_plat *s)
 }
 HANDLE win32_clip_wake(const win32_plat *s)
 { return s->clip ? s->clip->completed : NULL; }
-int win32_clip_submit(win32_plat *s, bool set, int which, const void *bytes, size_t len)
+static int clip_submit(win32_plat *s, bool set, int which, const void *bytes, size_t len, uint64_t *id)
 {
     win32_clip *c=s->clip; if (!c) return PLAT_ERR_FAIL;
     win32_clip_job *j=calloc(1,sizeof *j); if (!j) return PLAT_ERR_FAIL;
@@ -205,9 +206,19 @@ int win32_clip_submit(win32_plat *s, bool set, int which, const void *bytes, siz
     }
     AcquireSRWLockExclusive(&c->lock);
     if (c->used==WIN32_EVENT_CAP) { ReleaseSRWLockExclusive(&c->lock); clip_job_free(j); return PLAT_ERR_FAIL; }
+    if(set) { j->id=++c->next_id; if(id) *id=j->id; }
     c->used++;
     if (c->last) c->last->next=j; else c->first=j;
     c->last=j; (void)SetEvent(c->tasks); ReleaseSRWLockExclusive(&c->lock); return PLAT_OK;
+}
+int win32_clip_submit(win32_plat *s, bool set, int which, const void *bytes, size_t len)
+{ return clip_submit(s,set,which,bytes,len,NULL); }
+int win32_clip_submit_identified(win32_plat *s, int which, const void *bytes, size_t len, uint64_t *id)
+{
+    if(which!=PLAT_CLIP_CLIPBOARD || len>INT_MAX || (!bytes && len) ||
+       (len && (memchr(bytes,0,len) || !MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,bytes,(int)len,NULL,0))))
+        return PLAT_ERR_FAIL;
+    return clip_submit(s,true,which,bytes,len,id);
 }
 bool win32_clip_poll(win32_plat *s, plat_event *ev)
 {
@@ -222,6 +233,7 @@ bool win32_clip_poll(win32_plat *s, plat_event *ev)
     if (!j && !lost) return false;
     *ev=(plat_event){.kind=PLAT_EV_CLIPBOARD,.clip_which=PLAT_CLIP_CLIPBOARD,.code=2};
     if (j) {
+        ev->clip_id=j->id;
         ev->clip_which=(uint8_t)j->which; ev->clip_ok=j->ok; ev->code=j->set ? 2u : (j->ok ? 0u : 1u);
         if (!j->set) {
             free(s->clip_data); s->clip_data=j->ok ? j->bytes : NULL; s->clip_len=j->ok ? j->len : 0;

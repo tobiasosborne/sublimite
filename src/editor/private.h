@@ -409,6 +409,10 @@ struct editor {
     struct editor_restore_buffer *restore_prepare;
     int restore_fault; /* edit-601 test seam: a nonzero journal code fails the next restore scan with it */
     work_pool pool, journal_pool, startup_pool;
+#if defined(_WIN32)
+    work_pool lifecycle_pool;
+    bool lifecycle_pool_ready;
+#endif
     editor_backend_init startup;
     render_backend retired_backend;
     bool startup_pool_ready, startup_presented;
@@ -501,6 +505,8 @@ struct editor {
     char busy_source[IPC_PATH_CAP];
 #if defined(_WIN32)
     bool win_unavailable, win_native_suspended;
+    uint64_t win_retry_ns;
+    bool win_paint_clear_pending;
 #endif
     bool pool_ready, tabs_ready, has_platform, pump_stopped;
     uint32_t tab_rows, map_cols; /* tab_rows: every row above the text (menu bar + tab strip) */
@@ -589,6 +595,9 @@ bool editor_same_path(const char *path, const char *other);
 /* Internal cross-file helpers; UI only. */
 int editor_clip_init(editor *e);
 void editor_clip_stop(editor *e);
+#if defined(_WIN32)
+bool editor_clip_close_wait(editor *e);
+#endif
 void editor_clip_close(editor *e);
 void editor_clip_selection(editor *e);
 int editor_clip_action(editor *e, keys_action action, const plat_event *ev);

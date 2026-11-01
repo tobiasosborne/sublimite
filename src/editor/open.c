@@ -16,6 +16,9 @@ static editor *allocate_editor(void)
 void editor_close(editor *e)
 {
     if (!e) return;
+#if defined(_WIN32)
+    while(editor_clip_close_wait(e)) os_sleep_ns(UINT64_C(1000000));
+#endif
     config_runtime_close(e->preferences_runtime); e->preferences_runtime = NULL;
     editor_hl_close(e);
     editor_find_close(e);
@@ -47,6 +50,9 @@ void editor_close(editor *e)
     editor_backend_close_probe(e);
     if (e->backend) editor_backend_shutdown_sync(e, e->backend);
     editor_backend_shutdown_sync(e, &e->retired_backend);
+#if defined(_WIN32)
+    if(e->lifecycle_pool_ready) work_pool_shutdown(&e->lifecycle_pool);
+#endif
     if (e->buffers) for (size_t i = 0; i < e->buffer_capacity; i++) editor_buffer_destroy(e->buffers[i]);
     editor_buffer_destroy(e->empty);
     if (e->pool_ready) work_pool_shutdown(&e->pool);
@@ -119,6 +125,11 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     uint32_t nraster = (may_fallback || (info.capabilities & RENDER_CAP_RASTER_POOL)) ? 4u : 0u;
     if (work_pool_init_foreground(&e->pool, 1, nraster)) { rc = EDITOR_ERR_MEMORY; goto fail; }
     e->pool_ready = true;
+#if defined(_WIN32)
+    /* One serialized lifecycle operation, independent of background I/O. */
+    if(work_pool_init(&e->lifecycle_pool,1,0)) { rc=EDITOR_ERR_MEMORY; goto fail; }
+    e->lifecycle_pool_ready=true;
+#endif
     if (config->load_preferences || config->preferences_path) {
         /* Read and parse on the config worker before the DPI atlas is built.
          * Invalid/absent preferences leave the default startup usable. */

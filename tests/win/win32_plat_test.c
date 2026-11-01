@@ -883,6 +883,13 @@ int main(int argc, char **argv)
     }
     keyboard(&f); pointer_test(&f); geometry_clipboard(&f); allocation(&f); loop(&f); plat_shutdown(&f.p);
     int before=failures; DWORD handles_before=0,handles_after=0;
+    /* Session/power registration can activate process-wide native services
+     * after the first HWND is gone. Warm with the same lifecycle fixture,
+     * then retain the exact no-growth assertion on a second complete run.
+     * (E) Warm count reuses the existing four-lifecycle leak fixture below. */
+    for(unsigned i=0;i<4;i++) {
+        CHECK(plat_init(&f.p,&cfg)==PLAT_OK); plat_shutdown(&f.p);
+    }
     CHECK(GetProcessHandleCount(GetCurrentProcess(),&handles_before));
     /* (G) repeated lifecycle must not grow the process handle count. Windows
      * may retire unrelated lazily created handles during this interval. */

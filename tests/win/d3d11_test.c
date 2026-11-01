@@ -22,9 +22,8 @@ static test_isolation isolation;
 /* (G) Liveness watchdog only, same missing-completion window as GL; no
  * assertion on render speed or the panel's refresh period. */
 #define WATCHDOG_NS UINT64_C(3000000000)
-/* Frozen render_config requires a borrowed non-NULL platform identity. This
- * test-only opaque implementation has no W1.1 layout dependency. */
-struct plat { HWND window; };
+/* The standalone renderer uses the real plat type only as a borrowed
+ * identity. Its HWND is explicitly supplied by backend_for_window. */
 typedef struct stamps {
     uint32_t id, t5_count, t6_count, stats_frames, pixel_frames;
     uint64_t t5, t6, ui;
@@ -209,8 +208,8 @@ static int frame(render_backend *b, render_grid *grid, stamps *p,
         if (os_now_ns() >= deadline) {
             d3d11_present_info info; T(d3d11_present_stats(b,&info) == RENDER_OK);
             fprintf(stderr,"present timeout frame=%u rc=%d status=%08x visible=%d iconic=%d\n",
-                p->id,rc,(unsigned)info.status,IsWindowVisible(((struct plat *)b->config.platform)->window),
-                IsIconic(((struct plat *)b->config.platform)->window));
+                p->id,rc,(unsigned)info.status,IsWindowVisible(((d3d11_state *)b->state)->window),
+                IsIconic(((d3d11_state *)b->state)->window));
             ID3D11Device *native = d3d11_device(b);
             fprintf(stderr,"device removal=%08x\n",(unsigned)native->lpVtbl->GetDeviceRemovedReason(native));
             ID3D11InfoQueue *messages = NULL;
@@ -326,7 +325,7 @@ static int run_device(HWND window, bool warp, bool background)
     b.state = state;
     T(render_d3d11_backend_for_window(&b,window) == RENDER_OK);
     T(d3d11_diagnostics(&b,warp,true) == RENDER_OK);
-    struct plat platform = {window}; init.config.platform = &platform;
+    plat platform = {0}; init.config.platform = &platform;
     /* Ordinary init must roll back native acquisitions when no diagnostic
      * presentation can be displayed; retry on this same HWND must succeed. */
     bool init_background = init.config.background_init;

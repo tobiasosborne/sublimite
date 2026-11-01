@@ -19,28 +19,50 @@
 #include <unistd.h>
 
 #if defined(_WIN32)
-/* A nonpresented CPU snapshot may retire without a display completion. A
- * native in-flight frame instead ends its entire backend lifetime on worker.
- * Rebuild once, park presentation, and keep editing/layout/submit operational. */
+/* Relevant events and the parked-state deadline are retry obligations, never
+ * evidence of completion. Only the native backend may authenticate T5/T6. */
+static int windows_retry(editor *e)
+{
+    if(!e->win_unavailable || !e->backend->initialized || win32_plat_suspended(&e->platform)) return 0;
+    e->win_unavailable=false; e->win_retry_ns=0;
+    (void)d3d11_set_suspended(e->backend,false);
+    return editor_full_layout(e);
+}
+static void windows_paint_clear(editor *e)
+{
+    editor_journal_paint_clear(e);
+    e->win_paint_clear_pending=e->journal_paint!=0;
+}
 static int windows_surface(editor *e)
 {
     render_backend *b=e->backend;
     if (!e->has_platform || !b->initialized || strcmp(b->info.name,"d3d11")) return 0;
     bool suspended=win32_plat_suspended(&e->platform);
     if (suspended != e->win_native_suspended) {
-        e->win_native_suspended=suspended; e->win_unavailable=suspended;
-        (void)d3d11_set_suspended(b,suspended);
-        if (!suspended) { int rc=editor_full_layout(e); if(rc) return rc; }
+        e->win_native_suspended=suspended;
+        if(suspended) { e->win_unavailable=true; (void)d3d11_set_suspended(b,true); }
+        else { int rc=windows_retry(e); if(rc) return rc; }
     }
     if (d3d11_surface_unavailable(b) || d3d11_recovery_required(b)) e->win_unavailable=true;
-    if (e->win_unavailable && b->active && d3d11_discard_unpresented(b)!=RENDER_OK) {
+    if(suspended) e->win_retry_ns=0;
+    else if(e->win_unavailable && e->win_retry_ns && os_now_ns()>=e->win_retry_ns) {
+        int rc=windows_retry(e); if(rc) return rc;
+    }
+    bool rebuild=(!suspended && d3d11_native_deferred(b)) || d3d11_recovery_required(b);
+    if(e->win_unavailable && b->active) {
+        if(d3d11_discard_unpresented(b)==RENDER_OK) windows_paint_clear(e);
+        else rebuild=true;
+    }
+    if(rebuild) {
         render_config cfg=b->config; void *state=b->state;
         (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
         editor_backend_shutdown_sync(e,b);
         int rc=editor_backend_init_sync(e,cfg,state); if(rc) return rc;
-        (void)d3d11_set_suspended(b,true);
-        return editor_full_layout(e);
+        (void)d3d11_set_suspended(b,e->win_unavailable);
+        rc=editor_full_layout(e); if(rc) return rc;
     }
+    if(e->win_unavailable && !suspended && !e->win_retry_ns)
+        e->win_retry_ns=os_now_ns()+D3D11_PARK_PROBE_NS;
     return 0;
 }
 #endif
@@ -432,6 +454,11 @@ static int pump(editor *e, int timeout)
         uint32_t tag; size_t count;
         if (editor_wait_ready(&e->poll_set, timeout, &tag, 1, &count) != OS_OK) return EDITOR_ERR_IO;
         e->stats.poll_returns++;
+#if defined(_WIN32)
+        /* Preserve the consumed auto-reset credit for the normal source owner. */
+        for(size_t at=0; count && at<e->poll_set.count; at++)
+            if(e->poll_set.tags[at]==tag) e->poll_set.consumed[at]=true;
+#endif
     }
     probe_rc = editor_backend_poll_probe(e); if (probe_rc) return probe_rc;
     if (e->pool_ready) return editor_poll_sources(e);
@@ -497,11 +524,19 @@ static int submit(editor *e)
 {
     /* A bounded consumer (including minimap) may adopt the final index range
      * after this turn's pump. Publish before this frame can leave the editor. */
+#if defined(_WIN32)
+    if(e->win_paint_clear_pending) windows_paint_clear(e);
+#endif
     editor_large_index_progress(e);
     if (e->op_count || editor_clip_busy(e) || editor_scroll_waiting(e) || e->action == EDITOR_ACTION_REPLAY_WORK || e->action == EDITOR_ACTION_GOTO || !e->dirty || !e->paint_ready || e->full_pending || layout_busy(&e->lay) || view_busy(&e->v) || e->extra_rows || e->backend->active) return 0;
     int metadata = editor_journal_metadata(e);
     if (metadata == JOURNAL_BUSY) return 0;
     if (metadata) { e->stats.journal_error = metadata; return EDITOR_ERR_IO; }
+#if defined(_WIN32)
+    /* A known CPU-only discard cannot enter native painting. The next actual
+     * attempt rearms the guard after windows_retry requests full damage. */
+    if(!e->win_unavailable)
+#endif
     if (editor_journal_paint(e) == JOURNAL_BUSY) return 0; /* edit-dzk1: guard before composing */
     size_t count = 0;
     int rc = editor_compose(e); if (rc) return rc;
@@ -577,7 +612,7 @@ static int submit(editor *e)
 #if defined(_WIN32)
     if(e->win_unavailable) {
         rc=d3d11_discard_unpresented(e->backend);
-        if(!rc) editor_journal_paint_clear(e); /* Deliberate occlusion is no paint crash. */
+        if(!rc) windows_paint_clear(e); /* Deliberate occlusion is no paint crash. */
         return rc;
     }
 #endif
@@ -955,12 +990,16 @@ static int wait_timeout(editor *e, int requested, uint64_t now)
 #if defined(_WIN32)
     /* D3D11 can wait for frame latency before Present as well as after it.
      * Reuse the existing active-GPU cadence; an idle backend has no timer. */
-    if ((e->backend->info.capabilities & RENDER_CAP_GPU) && e->backend->active &&
+    if (!e->win_unavailable && (e->backend->info.capabilities & RENDER_CAP_GPU) && e->backend->active &&
         (requested < 0 || requested > 1)) requested = 1;
 #else
     if (gpu_pending(e) && (requested < 0 || requested > 1)) requested = 1;
 #endif
     uint64_t deadline = e->checkpoint_retry_ns ? e->checkpoint_retry_ns : e->blinking ? e->next_blink : UINT64_MAX;
+#if defined(_WIN32)
+    if(e->win_retry_ns && !win32_plat_suspended(&e->platform) && e->win_retry_ns<deadline)
+        deadline=e->win_retry_ns;
+#endif
     /* edit-bt1: wake for a deferred scroll slice's retry tick (edit-ci6i:
      * or a deferred wrapped seek's, which keeps wheel_pending instead). */
     if (e->buffer->scroll_retry_ns && (e->buffer->scroll_pending || e->wheel_pending) && e->buffer->scroll_retry_ns < deadline)
@@ -1034,6 +1073,15 @@ static int input_notice(editor *e)
 }
 int editor_inject(editor *e, const plat_event *event)
 {
+#if defined(_WIN32)
+    if(e && event && e->has_platform && e->win_unavailable &&
+        (event->kind==PLAT_EV_EXPOSE || event->kind==PLAT_EV_RESIZE || (event->kind==PLAT_EV_FOCUS && event->focused) ||
+         event->kind==PLAT_EV_KEY || event->kind==PLAT_EV_BUTTON || event->kind==PLAT_EV_WHEEL ||
+         event->kind==PLAT_EV_MOTION)) {
+        int rc=windows_retry(e); if(rc) return rc;
+    }
+#endif
+
     if (!e || !event || event->utf8_len > PLAT_UTF8_MAX) return EDITOR_ERR_ARG;
     /* Closing is control flow, independent of command/view/journal capacity. */
     if (event->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
@@ -1059,6 +1107,10 @@ int editor_inject(editor *e, const plat_event *event)
 }
 static int close_result(editor *e, int timeout_ms)
 {
+#if defined(_WIN32)
+    if(editor_clip_close_wait(e)) { os_sleep_ns(UINT64_C(1000000)); return EDITOR_MORE; }
+    if(!e->quit) return EDITOR_MORE; /* publication failure keeps the notice visible */
+#endif
     if (e->checkpoint_retry_ns && trace_now_ns() < e->checkpoint_retry_ns) {
         int pumped = pump(e, wait_timeout(e, timeout_ms, trace_now_ns()));
         if (pumped) return fail(e, pumped);

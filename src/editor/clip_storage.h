@@ -28,10 +28,7 @@ static inline void x11_clip_buf_free(x11_clip_buf *b)
 { if (b) b->release(b->ctx, b, sizeof *b + b->len); }
 static inline uint8_t *x11_clip_buf_data(x11_clip_buf *b) { return b->data; }
 static inline size_t x11_clip_buf_len(const x11_clip_buf *b) { return b ? b->len : 0; }
-static inline int x11_clip_set_buf(plat *p, int which, x11_clip_buf *b)
-{
-    int rc = plat_clip_set(p, which, b->data, b->len);
-    x11_clip_buf_free(b); return rc;
-}
+/* Windows publication is identified in clip.c; admission alone never permits
+ * a cut. The native queue owns its copied bytes through terminal delivery. */
 #endif
 #endif

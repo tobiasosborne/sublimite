@@ -44,10 +44,16 @@ static bool wait_contents(const char *path, const char *expected)
     }
     return false;
 }
+static BOOL post_character(HWND window, WPARAM scalar)
+{
+    /* Posted text has no physical key state. Establish its intended modifiers
+     * just as save() establishes Ctrl; never inherit state from native startup. */
+    return PostMessageW(window,WM_APP+0x51,0,0) && PostMessageW(window,WM_CHAR,scalar,1);
+}
 static void text(HWND window)
 {
     const WCHAR chars[]=L"typed \u00e4\u03bb\u4e2d\xd83d\xde42";
-    for(size_t i=0;i<sizeof chars/sizeof chars[0]-1u;i++) PostMessageW(window,WM_CHAR,chars[i],1);
+    for(size_t i=0;i<sizeof chars/sizeof chars[0]-1u;i++) post_character(window,chars[i]);
 }
 static void save(HWND window)
 {
@@ -58,15 +64,15 @@ static void save(HWND window)
     PostMessageW(window,WM_KEYUP,'S',1);
     PostMessageW(window,WM_APP+0x51,0,0);
 }
-typedef struct crash_state { bool seen; uint64_t paint; } crash_state;
+typedef struct crash_state { bool seen; uint64_t paint; uint8_t marker; } crash_state;
 static int saw_crash_edit(void *ctx, const journal_record *record)
 {
     crash_state *state=ctx;
-    if(record->type==JOURNAL_INSERT && record->size==9 && record->data[8]=='!') state->seen=true;
+    if(record->type==JOURNAL_INSERT && record->size==9 && record->data[8]==state->marker) state->seen=true;
     if(record->type==JOURNAL_PAINT) state->paint=record->buffer_id;
     return 0;
 }
-static bool journal_has_crash_edit(const char *profile)
+static bool journal_has_crash_edit(const char *profile, uint8_t marker)
 {
     char directory[OS_PATH_MAX]; snprintf(directory,sizeof directory,"%s\\data\\sublimite",profile);
     os_dir dir=OS_DIR_INIT; os_dir_iter it; bool seen=false;
@@ -75,7 +81,7 @@ static bool journal_has_crash_edit(const char *profile)
         const char *name;
         while(os_dir_next(&it,&name)==OS_OK && name) if(!strncmp(name,"session-",8)) {
             char path[OS_PATH_MAX]; snprintf(path,sizeof path,"%s\\%s",directory,name);
-            journal_replay_result result; crash_state state={0};
+            journal_replay_result result; crash_state state={.marker=marker};
             (void)journal_scan_file(path,saw_crash_edit,&state,&result);
             seen=seen || (state.seen && !state.paint);
         }
@@ -83,10 +89,10 @@ static bool journal_has_crash_edit(const char *profile)
     }
     os_dir_close(&dir); return seen;
 }
-static bool wait_crash_edit(const char *root)
+static bool wait_crash_edit(const char *root, uint8_t marker)
 {
     uint64_t end=os_now_ns()+WATCH_NS;
-    do { if(journal_has_crash_edit(root)) return true; Sleep(1); } while(os_now_ns()<end);
+    do { if(journal_has_crash_edit(root,marker)) return true; Sleep(1); } while(os_now_ns()<end);
     return false;
 }
 static DWORD child_process(DWORD parent)
@@ -116,8 +122,34 @@ static void cleanup(const char *path)
     }
     os_dir_close(&dir); (void)os_rmdir(path);
 }
-int main(void)
+/* Native child owns the inherited pipe endpoints. Capture both usage paths
+ * so a missing output call fails even when the process status is correct. */
+static bool captured_usage(const char *exe, const WCHAR *option, DWORD expected)
 {
+    SECURITY_ATTRIBUTES sa={sizeof sa,NULL,TRUE}; HANDLE read_pipe=NULL,write_pipe=NULL;
+    if(!CreatePipe(&read_pipe,&write_pipe,&sa,0)) return false;
+    SetHandleInformation(read_pipe,HANDLE_FLAG_INHERIT,0);
+    WCHAR wide[OS_PATH_MAX],command[OS_PATH_MAX+128];
+    bool ok=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,exe,-1,wide,OS_PATH_MAX)>0;
+    if(ok) ok=swprintf(command,sizeof command/sizeof command[0],L"\"%ls\" %ls",wide,option)>0;
+    STARTUPINFOW si={.cb=sizeof si,.dwFlags=STARTF_USESTDHANDLES,.hStdInput=GetStdHandle(STD_INPUT_HANDLE),
+        .hStdOutput=write_pipe,.hStdError=write_pipe}; PROCESS_INFORMATION pi={0};
+    if(ok) ok=CreateProcessW(NULL,command,NULL,NULL,TRUE,0,NULL,NULL,&si,&pi)!=0;
+    CloseHandle(write_pipe);
+    char text[4096]={0}; DWORD bytes=0,code=0;
+    if(ok) {
+        ok=WaitForSingleObject(pi.hProcess,(DWORD)(WATCH_NS/UINT64_C(1000000)))==WAIT_OBJECT_0;
+        if(!ok) TerminateProcess(pi.hProcess,1);
+        else ok=GetExitCodeProcess(pi.hProcess,&code) && code==expected &&
+            ReadFile(read_pipe,text,sizeof text-1u,&bytes,NULL) && bytes>0 &&
+            strstr(text,"usage: sublimite ") && strstr(text,"--wait") && strstr(text,"[path[:line[:col]]");
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    CloseHandle(read_pipe); return ok;
+}
+int main(int argc, char **argv)
+{
+    setvbuf(stdout,NULL,_IONBF,0);
     char temp[OS_PATH_MAX],root[OS_PATH_MAX]={0},path[OS_PATH_MAX],self[OS_PATH_MAX],exe[OS_PATH_MAX];
     os_proc child={0}; bool running=false; int result=1; os_file file=OS_FILE_INIT; size_t done;
     CHECK(os_temp_dir(temp,sizeof temp)==OS_OK);
@@ -132,12 +164,58 @@ int main(void)
     CHECK(os_proc_self_path(self,sizeof self)==OS_OK);
     char *slash=strrchr(self,'\\'); CHECK(slash); *slash=0;
     CHECK(snprintf(exe,sizeof exe,"%s\\..\\sublimite.exe",self)>0);
-    const char *args[]={exe,"--new-instance",path,NULL};
+    if(argc>=2 && !strcmp(argv[1],"--streams")) {
+        const char *target=argc==3 ? argv[2] : exe;
+        CHECK(captured_usage(target,L"--help",0) && captured_usage(target,L"--invalid-test-option",2));
+        puts("editor_exe: captured help/error contents PASS"); result=0; goto fail;
+    }
+    const char *args[]={exe,path,NULL};
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
     HWND window=wait_window(child.id); CHECK(window);
+    if(argc==2 && !strcmp(argv[1],"--input-state")) {
+        (void)ShowWindow(window,SW_MINIMIZE); CHECK(IsIconic(window));
+        CHECK(PostMessageW(window,WM_APP+0x51,PLAT_MOD_CTRL,0));
+        text(window); save(window);
+        CHECK(wait_contents(path,"typed äλ中🙂base\n"));
+        CHECK(PostMessageW(window,WM_CLOSE,0,0)); os_proc_status input_status;
+        CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&input_status)==OS_OK); running=false;
+        CHECK(input_status.how==OS_PROC_EXITED && input_status.code==0);
+        puts("editor_exe: posted text resets inherited modifier state PASS"); result=0; goto fail;
+    }
+    char profile2[OS_PATH_MAX]; snprintf(profile2,sizeof profile2,"%s\\other-profile",root);
+    CHECK(os_mkdir(profile2)==OS_OK && os_env_set("SUBLIMITE_PROFILE",profile2)==OS_OK);
+    char other_path[OS_PATH_MAX]; snprintf(other_path,sizeof other_path,"%s\\other.txt",profile2);
+    CHECK(os_file_open(&file,other_path,OS_OPEN_WRITE|OS_OPEN_CREATE|OS_OPEN_EXCL)==OS_OK);
+    CHECK(os_file_write(&file,"other\n",6,&done)==OS_OK && done==6); os_file_close(&file);
+    const char *other_args[]={exe,other_path,NULL};
+    os_proc other={0}; CHECK(os_proc_spawn(&other,other_args)==OS_OK);
+    HWND other_window=wait_window(other.id); CHECK(other_window);
+    (void)ShowWindow(other_window,SW_MINIMIZE); CHECK(IsIconic(other_window));
+    CHECK(post_character(other_window,'@')); CHECK(wait_crash_edit(profile2,'@'));
+    CHECK(os_proc_kill(&other)==OS_OK);
+    os_proc_status other_status; CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(other_status.how==OS_PROC_ABNORMAL);
+    CHECK(os_proc_spawn(&other,other_args)==OS_OK); other_window=wait_window(other.id); CHECK(other_window);
+    (void)ShowWindow(other_window,SW_MINIMIZE); CHECK(IsIconic(other_window));
+    CHECK(post_character(other_window,'$')); CHECK(wait_crash_edit(profile2,'$'));
+    PostMessageW(other_window,WM_APP+0x51,PLAT_MOD_CTRL,0);
+    PostMessageW(other_window,WM_KEYDOWN,'Z',1); PostMessageW(other_window,WM_KEYUP,'Z',1);
+    PostMessageW(other_window,WM_APP+0x51,0,0); save(other_window);
+    CHECK(wait_contents(other_path,"@other\n") && contents(path,"base\n"));
+    CHECK(PostMessageW(other_window,WM_CLOSE,0,0));
+    CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(other_status.how==OS_PROC_EXITED && other_status.code==0);
+    CHECK(os_env_set("SUBLIMITE_PROFILE",path)==OS_OK); /* file, invalid profile */
+    CHECK(os_proc_spawn(&other,args)==OS_OK);
+    CHECK(os_proc_wait(&other,(int64_t)WATCH_NS,&other_status)==OS_OK);
+    CHECK(other_status.how==OS_PROC_EXITED && other_status.code!=0);
+    CHECK(os_env_set("SUBLIMITE_PROFILE",root)==OS_OK);
+    puts("editor_exe: distinct profiles do not hand off; invalid profile fails before IPC PASS");
     /* (G) exceed the existing D3D observation window (3 s), using the
      * editor's existing 5 s settle watchdog. The process must keep editing. */
     Sleep((DWORD)(WATCH_NS/UINT64_C(1000000)));
+    /* Negative-control state is deliberate: text() must clear it. */
+    CHECK(PostMessageW(window,WM_APP+0x51,PLAT_MOD_CTRL,0));
     text(window); save(window);
     CHECK(wait_contents(path,"typed äλ中🙂base\n"));
     CHECK(PostMessageW(window,WM_CLOSE,0,0));
@@ -145,6 +223,8 @@ int main(void)
     CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_EXITED && status.code==0);
     puts("editor_exe: occluded argv file, posted Unicode, Ctrl+S, close exit=0 PASS");
+    CHECK(captured_usage(exe,L"--help",0));
+    CHECK(captured_usage(exe,L"--invalid-test-option",2));
     const char *help[]={exe,"--help",NULL};
     CHECK(os_proc_spawn(&child,help)==OS_OK); running=true;
     CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
@@ -156,13 +236,23 @@ int main(void)
     puts("editor_exe: GUI executable inherited usage/error streams and useful exit codes PASS");
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
     window=wait_window(child.id); CHECK(window);
-    CHECK(PostMessageW(window,WM_CHAR,'!',1));
-    CHECK(wait_crash_edit(root));
+    /* Native minimization disables unexplained parked probes. The hot-exit
+     * oracle kills after a protected edit, outside a first native paint. */
+    (void)ShowWindow(window,SW_MINIMIZE); CHECK(IsIconic(window));
+    CHECK(post_character(window,'!'));
+    CHECK(wait_crash_edit(root,'!'));
     CHECK(os_proc_kill(&child)==OS_OK);
     CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;
     CHECK(status.how==OS_PROC_ABNORMAL);
     CHECK(os_proc_spawn(&child,args)==OS_OK); running=true;
-    window=wait_window(child.id); CHECK(window); save(window);
+    window=wait_window(child.id); CHECK(window);
+    /* A new marker cannot be found in the old source journal. Its protected
+     * admission proves the restored tab is editable before undo/save. */
+    (void)ShowWindow(window,SW_MINIMIZE); CHECK(IsIconic(window));
+    CHECK(post_character(window,'?')); CHECK(wait_crash_edit(root,'?'));
+    PostMessageW(window,WM_APP+0x51,PLAT_MOD_CTRL,0);
+    PostMessageW(window,WM_KEYDOWN,'Z',1); PostMessageW(window,WM_KEYUP,'Z',1);
+    PostMessageW(window,WM_APP+0x51,0,0); save(window);
     CHECK(wait_contents(path,"typed äλ中🙂!base\n"));
     CHECK(PostMessageW(window,WM_CLOSE,0,0));
     CHECK(os_proc_wait(&child,(int64_t)WATCH_NS,&status)==OS_OK); running=false;

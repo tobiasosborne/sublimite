@@ -3,6 +3,9 @@
 #include "trace/trace.h"
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "win32/private.h"
+#endif
 
 /* The bulk crossover is the bead's >= MiB requirement (G), expressed as
  * binary KiB * KiB. Mutation/copy slices reuse view's existing byte bounds. */
@@ -28,6 +31,13 @@ struct editor_clip {
     os_mutex mutex;
     bool ready, waiting, cutting, hitting, cluster_live, primary_waiting;
     bool cut_line;
+#if defined(_WIN32)
+    bool publishing;
+    uint64_t publication;
+    editor_buffer *publication_owner;
+    uint64_t publication_revision;
+    view_selection publication_selection;
+#endif
     uint64_t cut_off, cut_len;
     bool find_paste, find_replacement;
     uint64_t hit_byte, hit_column, hit_target, cluster_start, pointer_ns;
@@ -97,7 +107,22 @@ static int publish_owned(editor *e, int which, x11_clip_buf *b)
     if (!b) return EDITOR_ERR_MEMORY;
     if (e->has_platform) {
         if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
+#if defined(_WIN32)
+        editor_clip *c=e->clipboard;
+        int rc=0;
+        if(which!=PLAT_CLIP_PRIMARY) {
+            rc=win32_clip_submit_identified(win32_private(&e->platform),which,
+                x11_clip_buf_data(b),x11_clip_buf_len(b),&c->publication);
+            if(!rc) {
+                c->publishing=true; c->publication_owner=e->buffer;
+                c->publication_revision=e->buffer->revision;
+                c->publication_selection=e->v.state.selection;
+            }
+        }
+        x11_clip_buf_free(b);
+#else
         int rc = x11_clip_set_buf(&e->platform, which, b);
+#endif
         if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
         return rc ? EDITOR_ERR_CAPACITY : 0;
     }
@@ -224,7 +249,11 @@ void editor_clip_selection(editor *e)
 bool editor_clip_busy(const editor *e)
 {
     const editor_clip *c = e->clipboard;
-    return c && (c->waiting || c->command.handle.epoch || e->action == EDITOR_ACTION_CLIP);
+    return c && (
+#if defined(_WIN32)
+        c->publishing ||
+#endif
+        c->waiting || c->command.handle.epoch || e->action == EDITOR_ACTION_CLIP);
 }
 bool editor_clip_pending(const editor *e)
 {
@@ -367,6 +396,9 @@ int editor_clip_find_copy(editor *e, const uint8_t *bytes, size_t length)
     /* Field capacity already bounds this copy. Reuse the clipboard arena's
      * recycler and transport ownership; no document snapshot or mutation. */
     editor_clip *c=e->clipboard;
+#if defined(_WIN32)
+    c->cutting=false;
+#endif
     x11_clip_buf *b=new_owned(c,length);
     if (!b) return EDITOR_ERR_MEMORY;
     memcpy(x11_clip_buf_data(b),bytes,length);
@@ -401,7 +433,18 @@ int editor_clip_action(editor *e, keys_action action, const plat_event *ev)
     piece_snapshot_release(c->desired); c->desired = NULL;
     if (length <= VIEW_SCAN_BOUND) {
         rc = copy_small(e, off, (size_t)length, false);
-        if (rc) { e->stats.rejected_commands++; return 0; }
+        if (rc) {
+            e->stats.rejected_commands++;
+#if defined(_WIN32)
+            c->cutting=false; e->recovery_notice="clipboard publication failed; text kept";
+            e->recovery_notice_mutations=e->stats.mutations; return editor_full_layout(e);
+#else
+            return 0;
+#endif
+        }
+#if defined(_WIN32)
+        if(c->publishing) return 0;
+#endif
         return c->cutting ? start_replace(e, NULL, 0, 0) : 0;
     }
     clip_job *j = &c->command;
@@ -493,6 +536,25 @@ int editor_clip_event(editor *e, const plat_event *ev)
         rc = begin_command(e, ev->t0_ns); if (rc) return rc;
         return request_paste(e, PLAT_CLIP_PRIMARY, false);
     }
+#if defined(_WIN32)
+    if(ev->code==2 && c->publishing && ev->clip_id==c->publication) {
+        c->publishing=false;
+        bool valid=e->buffer==c->publication_owner && e->buffer->revision==c->publication_revision &&
+            e->v.state.selection.anchor==c->publication_selection.anchor &&
+            e->v.state.selection.cursor==c->publication_selection.cursor;
+        if(!ev->clip_ok || !valid) {
+            c->cutting=false; e->stats.rejected_commands++;
+            e->recovery_notice="clipboard publication failed; text kept";
+            e->recovery_notice_mutations=e->stats.mutations;
+            e->quit=false; return editor_full_layout(e);
+        }
+        if(c->cutting) {
+            e->old_selection=c->publication_selection;
+            int rc=start_replace(e,NULL,0,0); c->cutting=false; return rc;
+        }
+        return 0;
+    }
+#endif
     if (e->buffer->source_stale || e->buffer->pending_open) { c->waiting = false; return 0; }
     if (!c->waiting || ev->clip_which != c->which || ev->code == 2) return 0;
     if (!ev->clip_ok || ev->code) { c->waiting = false; return 0; }
@@ -542,8 +604,46 @@ int editor_clip_poll(editor *e)
         }
         clear_job(e, j);
         if (rc) { e->stats.rejected_commands++; return 0; }
+#if defined(_WIN32)
+        if(c->publishing) return 0;
+#endif
         if (c->cutting) return start_replace(e, NULL, 0, 0);
     }
     editor_clip_selection(e);
     return 0;
 }
+
+#if defined(_WIN32)
+/* Close must resolve admitted native writes while the buffer/journal still
+ * exist. Reads may be abandoned; cuts may not. Direct polling avoids parking
+ * the terminal event behind the quit/save input fence. */
+bool editor_clip_close_wait(editor *e)
+{
+    editor_clip *c=e->clipboard;
+    if(!c) return false;
+    if(c->command.handle.epoch && !c->command.paste) {
+        (void)work_mailbox_drain(&e->pool,editor_route_work,e);
+        (void)editor_clip_poll(e);
+        if(c->command.handle.epoch) return true;
+    }
+    if(!c->publishing) return false;
+    /* A completion may already have entered the FIFO before CLOSE bypassed
+     * dispatch. Remove only publication results, retaining every other event. */
+    for(size_t n=0;n<e->queue_count;) {
+        size_t at=(e->queue_head+n)%EDITOR_INPUT_CAP;
+        plat_event terminal=e->queue[at];
+        if(terminal.kind!=PLAT_EV_CLIPBOARD || terminal.code!=2 || !terminal.clip_id) { n++; continue; }
+        (void)editor_clip_event(e,&terminal);
+        for(size_t i=n;i+1u<e->queue_count;i++) {
+            size_t dest=(e->queue_head+i)%EDITOR_INPUT_CAP,next=(dest+1u)%EDITOR_INPUT_CAP;
+            e->queue[dest]=e->queue[next]; e->queue_serial[dest]=e->queue_serial[next];
+            e->queue_owner[dest]=e->queue_owner[next]; e->queue_generation[dest]=e->queue_generation[next];
+        }
+        e->queue_count--;
+    }
+    plat_event event;
+    while(win32_clip_poll(win32_private(&e->platform),&event))
+        (void)editor_clip_event(e,&event);
+    return c->publishing;
+}
+#endif

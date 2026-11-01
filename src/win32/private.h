@@ -65,6 +65,7 @@ uint32_t win32_plat_dpi(const plat *p);
 int win32_clip_init(win32_plat *s);
 void win32_clip_stop(win32_plat *s);
 HANDLE win32_clip_wake(const win32_plat *s);
+int win32_clip_submit_identified(win32_plat *, int, const void *, size_t, uint64_t *);
 int win32_clip_submit(win32_plat *s, bool set, int which, const void *bytes, size_t len);
 bool win32_clip_poll(win32_plat *s, plat_event *ev);
 

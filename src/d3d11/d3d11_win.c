@@ -25,6 +25,7 @@ typedef struct d3d11_strip { render_strip rows; UINT first, count; } d3d11_strip
 typedef struct d3d11_constants { uint32_t surface[4], motion[4]; } d3d11_constants;
 typedef struct d3d11_state {
     HWND window;
+    bool native_deferred;
     plat *platform;
     bool force_warp, readback, warp, debug, failed, swapped, drawn, query_ready;
     bool own_arena, full_frame, region_upload, latency_ready;
@@ -386,8 +387,12 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
         cfg->max_cells > UINT_MAX/sizeof(d3d11_instance) ||
         cfg->max_atlas_bytes > (size_t)limit*limit) return RENDER_ERR_CAPACITY;
     RECT client;
-    if (!GetClientRect(window,&client) || client.right <= 0 || client.bottom <= 0) return RENDER_ERR_UNSUPPORTED;
-    s->width = (uint32_t)client.right; s->height = (uint32_t)client.bottom;
+    if (!GetClientRect(window,&client)) return RENDER_ERR_UNSUPPORTED;
+    s->native_deferred=IsIconic(window) || client.right<=0 || client.bottom<=0;
+    /* Retain usable CPU geometry. No native device/chain is recreated until
+     * restoration; real CPU snapshotting remains available while minimized. */
+    s->width=s->native_deferred ? cfg->dims.cols*cfg->dims.cell_w : (uint32_t)client.right;
+    s->height=s->native_deferred ? cfg->dims.rows*cfg->dims.cell_h : (uint32_t)client.bottom;
     if (s->width > cfg->max_width || s->height > cfg->max_height) return RENDER_ERR_CAPACITY;
     s->max_width = cfg->max_width; s->max_height = cfg->max_height; s->dims = cfg->dims;
     s->atlas_width = cfg->max_atlas_bytes < limit ? (uint32_t)cfg->max_atlas_bytes : limit;
@@ -397,6 +402,7 @@ static int d3d11_init(render_backend *b, const render_config *cfg)
     edit_arena_mark_t mark = cfg->arena ? edit_arena_mark(cfg->arena) : 0;
     int rc = RENDER_ERR_INIT;
     if (!d3d11_reserve(s,cfg)) goto fail;
+    if(s->native_deferred) return RENDER_OK;
     rc = RENDER_ERR_UNSUPPORTED;
     if (!d3d11_native_init(s)) goto fail;
     rc = RENDER_ERR_INIT;
@@ -424,7 +430,10 @@ static int d3d11_resize(render_backend *b, render_dims dims)
     if (s->failed) return RENDER_ERR_DEVICE;
     if (s->recovery) return RENDER_ERR_UNSUPPORTED;
     RECT client;
-    if (!GetClientRect(s->window,&client) || client.right <= 0 || client.bottom <= 0) return RENDER_ERR_BOUNDS;
+    if (!GetClientRect(s->window,&client)) return RENDER_ERR_BOUNDS;
+    if(IsIconic(s->window) || client.right<=0 || client.bottom<=0 || s->native_deferred) {
+        s->dims=dims; return RENDER_OK;
+    }
     uint32_t w = (uint32_t)client.right, h = (uint32_t)client.bottom;
     if (w > s->max_width || h > s->max_height) return RENDER_ERR_CAPACITY;
     if (w != s->width || h != s->height) {
@@ -840,6 +849,8 @@ int d3d11_discard_unpresented(render_backend *b)
     b->active = false; b->full_required = true;
     return RENDER_OK;
 }
+bool d3d11_native_deferred(const render_backend *b)
+{ return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->native_deferred; }
 bool d3d11_recovery_required(const render_backend *b)
 { return d3d11_descriptor(b) && b->initialized && ((d3d11_state *)b->state)->recovery; }
 int d3d11_present_stats(const render_backend *b, d3d11_present_info *out)

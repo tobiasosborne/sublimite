@@ -85,7 +85,21 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
 #endif
     ipc_server server = {0}; bool owns_server = false;
 #if defined(_WIN32)
-    const char *display = NULL;
+    /* Validate storage before considering handoff. Native directory identity
+     * follows canonical aliases and fits the bounded IPC namespace. */
+    char journal_path[4097], canonical[OS_PATH_MAX], profile_identity[IPC_PATH_CAP];
+    os_stat profile_stat;
+    if(journal_default_dir(journal_path,sizeof journal_path)!=JOURNAL_OK ||
+       editor_make_directory(journal_path,NULL,NULL) ||
+       os_path_canonical(journal_path,canonical,sizeof canonical)!=OS_OK ||
+       os_stat_path(canonical,0,&profile_stat)!=OS_OK || profile_stat.kind!=OS_KIND_DIR) {
+        fprintf(stderr,"sublimite: cannot resolve journal directory\n"); goto startup_fail;
+    }
+    int profile_size=snprintf(profile_identity,sizeof profile_identity,"profile-%llx-%llx-%llx",
+        (unsigned long long)profile_stat.id.volume,(unsigned long long)profile_stat.id.index[0],
+        (unsigned long long)profile_stat.id.index[1]);
+    if(profile_size<0 || (size_t)profile_size>=sizeof profile_identity) goto startup_fail;
+    const char *display = profile_identity;
     plat_backend platform_backend = PLAT_BACKEND_WIN32;
 #else
     const char *display = getenv("DISPLAY");
@@ -143,11 +157,13 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
 #if defined(_WIN32)
     if (args.request.has_stdin && ipc_args_read_stdin(&args, _fileno(stdin)) != IPC_OK) goto startup_fail;
 #endif
+#if !defined(_WIN32)
     char journal_path[4097];
     if (journal_default_dir(journal_path, sizeof journal_path) != JOURNAL_OK) {
         fprintf(stderr, "sublimite: cannot resolve journal directory\n"); goto startup_fail;
     }
     if (editor_make_directory(journal_path, NULL, NULL)) { perror("sublimite: journal directory"); goto startup_fail; }
+#endif
     char journal_dir[sizeof journal_path];
     memcpy(journal_dir, journal_path, sizeof journal_dir);
     os_file session_lease = OS_FILE_INIT;
@@ -327,6 +343,8 @@ int main(int argc, char **argv)
      * parent console; inherited pipe/file streams keep their CRT descriptors. */
     bool attached=AttachConsole(ATTACH_PARENT_PROCESS)!=0;
     if(attached) {
+        if(_fileno(stdin)<0 || _get_osfhandle(_fileno(stdin))==-2 || _get_osfhandle(_fileno(stdin))==-1)
+            (void)freopen("CONIN$","r",stdin);
         if(_fileno(stdout)<0 || _get_osfhandle(_fileno(stdout))==-2 || _get_osfhandle(_fileno(stdout))==-1)
             (void)freopen("CONOUT$","w",stdout);
         if(_fileno(stderr)<0 || _get_osfhandle(_fileno(stderr))==-2 || _get_osfhandle(_fileno(stderr))==-1)

@@ -48,13 +48,18 @@ int d3d11_present_complete(render_backend *b, uint32_t id, uint64_t ns, uint64_t
  * Adapter keeps its active slot. Stop input, remove borrowed wait handles,
  * quiescent shutdown, re-init on worker while pumping, then full repaint with
  * a fresh grid/backend lifetime. DEVICE instead denotes native device failure.
- * Poll/retry on a finite UI timeout while active; idle needs no polling. */
+ * Poll/retry on a finite UI timeout while active; the editor owns the bounded
+ * parked-state probe and disables it during native suspension. */
 int d3d11_set_suspended(render_backend *b, bool suspended);
 /* Unavailable surfaces keep CPU snapshots moving without claiming a present.
  * Discard is legal only before drawing/native Present. Drawn/committed frames
  * require the documented quiescent rebuild first. No T4/T5/T6 is fabricated. */
 bool d3d11_surface_unavailable(const render_backend *b);
 int d3d11_discard_unpresented(render_backend *b);
+bool d3d11_native_deferred(const render_backend *b);
+/* (E) Retry one existing missing-completion observation window after parking.
+ * Bounded liveness, at most 1/3 Hz while unexplained; zero while suspended. */
+#define D3D11_PARK_PROBE_NS UINT64_C(3000000000)
 bool d3d11_recovery_required(const render_backend *b);
 /* Diagnostic-only blocking read of the last pre-Present staging snapshot.
  * Output is opaque 0xffRRGGBB, top down; stride/capacity in uint32_t pixels. */

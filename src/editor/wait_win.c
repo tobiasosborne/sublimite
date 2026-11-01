@@ -61,6 +61,8 @@ os_err editor_wait_ready(editor_wait_set *set, int timeout_ms,
                                               timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
         if (result == WAIT_FAILED) return OS_E_IO;
         if (result == WAIT_TIMEOUT) return OS_OK;
+        if (result >= WAIT_OBJECT_0 + set->count) return OS_E_IO;
+        set->consumed[result - WAIT_OBJECT_0] = true;
     } else if (timeout_ms && !set->count && !pending) {
         Sleep(timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
     }

@@ -3575,6 +3575,13 @@ static int ck4_session_restore(void *ctx, const journal_record *record)
     if(record->buffer_id>3) return 1;
     return ck4_restore(&session->buffers[record->buffer_id-1],record);
 }
+static bool ck4_slow_save;
+static void ck4_slow_step(void *ctx, int step)
+{
+    (void)ctx;
+    /* (E) Two old one-second polling windows model slow durable I/O. */
+    if (step == FILE_STEP_FSYNCED) os_sleep_ns(UINT64_C(2000000000));
+}
 static int ck4_recovery(unsigned choice)
 {
     char source[] = "build/ck4-source-XXXXXX", log[] = "build/ck4-log-XXXXXX";
@@ -3592,20 +3599,21 @@ static int ck4_recovery(unsigned choice)
         T(editor_select_tab(e,0)==0); T(settle(e)==0);
         T(press(e, key('x', 0, "x")) == 0);
         if (!choice) {
+            if (ck4_slow_save) T(savectl_set_step_hook(e->buffer->save, ck4_slow_step, NULL) == 0);
             T(press(e, key('s', PLAT_MOD_CTRL, NULL)) == 0);
-            uint64_t deadline = trace_now_ns() + UINT64_C(1000000000);
+            /* Wait for the save's completion, then inspect the file. A rename
+             * observed before the terminal mailbox is not a durability fence.
+             * (G) Existing suite settle watchdog; no one-second I/O budget. */
+            uint64_t deadline = trace_now_ns() + SETTLE_NS;
+            while (editor_save_active(e)) {
+                T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield();
+            }
             char saved[2] = {0};
-            do {
-                T(editor_step(e, 0) >= 0);
-                fd = open(source, O_RDONLY); T(fd >= 0);
-                ssize_t n = read(fd, saved, sizeof saved); close(fd);
-                if (n == 2 && !memcmp(saved, "xa", 2)) break;
-                sched_yield();
-            } while (trace_now_ns() < deadline);
+            fd = open(source, O_RDONLY); T(fd >= 0);
+            T(read(fd, saved, sizeof saved) == (ssize_t)sizeof saved); close(fd);
             T(!memcmp(saved, "xa", 2));
             uint8_t actual[sizeof saved]; T(editor_read(e, 0, actual, sizeof actual) == 0);
             T(!memcmp(actual, saved, sizeof saved));
-            while (editor_save_active(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
             T(!editor_tab(e, 0)->modified);
             savectl_model completed = savectl_get_model(e->buffer->save);
             T(completed.saving_submitted_ns >= completed.request_ns && !completed.saving_frame_pending);
@@ -6994,6 +7002,8 @@ static int select_ck4_save(void)
      * keep/reload, followed by the corresponding mapped keep/reload cases. */
     return ck4_recovery(0);
 }
+static int select_ck4_slow_save(void)
+{ ck4_slow_save = true; return ck4_recovery(0); }
 static int select_ck4_keep(void)
 {
     return ck4_recovery(1);
@@ -7747,6 +7757,7 @@ static const test_selector selectors[] = {
     {"--ck4-credit", ck4_credit},
     {"--ck4-startup", ck4_startup},
     {"--ck4-save", select_ck4_save},
+    {"--ck4-slow-save", select_ck4_slow_save},
     {"--clean-source-change", clean_source_change},
     {"--source-prompt-placement", source_prompt_placement},
     {"--ck4-keep", select_ck4_keep},
@@ -7836,7 +7847,7 @@ static int editor_part_3(void)
     T(clipboard_crlf_empty_test() == 0);
     T(clipboard_crlf_bulk_test() == 0);
     T(clipboard_test(false) == 0); T(clipboard_large_test() == 0); T(clipboard_middle_long_test() == 0); T(clipboard_pending_primary_test() == 0); T(clipboard_no_tabs_test() == 0);
-    T(ck4_recovery(0) == 0); T(ck4_startup() == 0);
+    T(ck4_recovery(0) == 0); T(select_ck4_slow_save() == 0); ck4_slow_save=false; T(ck4_startup() == 0);
     T(clean_source_change() == 0);
     T(source_prompt_placement() == 0);
     T(close_prompt_contract() == 0); T(close_evict_contract() == 0); T(close_review_contract() == 0);

@@ -77,20 +77,25 @@ int editor_backend_init_sync(editor *e, render_config config, void *state)
         if (attached) return attached;
     }
 #endif
-    work_handle handle = work_submit(&e->pool, (work_job){init_worker, &arg, 0, WORK_BULK});
+    work_pool *pool=&e->pool;
+#if defined(_WIN32)
+    pool=&e->lifecycle_pool;
+#endif
+    work_handle handle = work_submit(pool, (work_job){init_worker, &arg, 0, WORK_BULK});
     if (!handle.epoch) return EDITOR_ERR_MEMORY;
     /* Only strict GPU selection and bootstrap init use this synchronous path.
      * The requested fallback-capable GPU never occupies this pool. */
-    while (!arg.received || !work_handle_finished(&e->pool, handle)) {
-        (void)work_mailbox_receive(&e->pool, handle, 0, init_result, &arg);
-        if (arg.received && work_handle_finished(&e->pool, handle)) break;
+    while (!arg.received || !work_handle_finished(pool, handle)) {
+        (void)work_mailbox_receive(pool, handle, 0, init_result, &arg);
+        if (arg.received && work_handle_finished(pool, handle)) break;
 #if defined(_WIN32)
+        if(e->pool_ready) (void)work_mailbox_drain(&e->pool,editor_route_work,e);
         if (e->has_platform) {
             plat_callbacks cb = {.ud = e, .on_event = init_event};
             e->platform.quit = false; (void)plat_run_for(&e->platform, &cb, 1);
         } else
 #endif
-        (void)os_wake_wait(work_pool_wake(&e->pool), INT64_C(1000000)); /* same quiescent cadence */
+        (void)os_wake_wait(work_pool_wake(pool), INT64_C(1000000)); /* same quiescent cadence */
     }
     *e->backend = arg.backend;
     return arg.result;
@@ -104,13 +109,20 @@ void editor_backend_shutdown_sync(editor *e, render_backend *backend)
     if (!backend || !backend->initialized) return;
     (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
     if (e->pool_ready && e->has_platform) {
+        /* Publish unavailability on UI before worker ownership. Mailbox
+         * callbacks may inspect e->backend while this exclusive copy retires. */
+        render_backend retiring=*backend;
+        backend->initialized=false; backend->active=false;
         work_handle handle = {0};
         do {
-            if (!handle.epoch) handle = work_submit(&e->pool, (work_job){shutdown_worker, backend, 0, WORK_BULK});
-            if (handle.epoch && work_handle_finished(&e->pool, handle)) break;
+            if (!handle.epoch) handle = work_submit(&e->lifecycle_pool, (work_job){shutdown_worker, &retiring, 0, WORK_BULK});
+            if (handle.epoch && work_handle_finished(&e->lifecycle_pool, handle)) break;
+            (void)work_mailbox_drain(&e->pool,editor_route_work,e);
             plat_callbacks cb = {.ud = e, .on_event = init_event};
             e->platform.quit = false; (void)plat_run_for(&e->platform, &cb, 1);
         } while (true);
+        *backend=retiring; /* physical completion publishes the worker result */
+        (void)work_mailbox_drain(&e->pool,editor_route_work,e);
         return;
     }
 #else

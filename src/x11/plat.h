@@ -59,6 +59,9 @@ typedef struct plat_event {
     int32_t  dx, dy;        /* WHEEL: PLAT_WHEEL_UNIT per notch; +dy = content scrolls down (wheel toward user) */
     bool     smooth;        /* WHEEL: from XI2 smooth-scroll valuators (else core buttons 4-7) */
     bool     clip_ok;       /* CLIPBOARD: data available via plat_clip_data; false = failed/lost */
+#if defined(_WIN32)
+    uint64_t clip_id;       /* native publication identity; zero = ownership/read */
+#endif
     uint8_t  clip_which;    /* CLIPBOARD: PLAT_CLIP_* */
     uint64_t t0_ns;         /* monotonic ns of the physical event (never later than ingest) */
 } plat_event;
