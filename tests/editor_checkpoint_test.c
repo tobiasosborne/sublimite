@@ -490,7 +490,7 @@ static bool child_no_retain;
 static int small_child(const char *source, const char *log, const int *lease)
 {
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config config = {.path = source, .journal_path = log, .session_lease = lease, .cols = 32, .rows = 3};
+    editor_config config = {.path = source, .journal_path = log, .session_lease = lease ? &(os_file){.fd=*lease} : NULL, .cols = 32, .rows = 3};
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(wait_adopted(e) == 0);
     if (child_no_retain) e->retain_limit = 0;
     T(editor_set_cursor(e, SMALL) == 0); T(type_text(e, "EF") == 0);
@@ -591,7 +591,7 @@ static int changed_base_body(const char *root, uint8_t *base, uint8_t *got)
     char journal_path[IPC_PATH_CAP]; int lease = -1;
     T(journal_session_create(dir, journal_path, sizeof journal_path, &lease) == JOURNAL_OK);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor_config config = {.journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .start_empty = true, .cols = 32, .rows = 3};
     editor *e = NULL; int rc = editor_open(&e, &config, &backend);
     if (!rc) rc = settle(e);
     size_t got_len = 0; bool aside = false, clean = false, notice = false;

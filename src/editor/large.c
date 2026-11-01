@@ -113,7 +113,7 @@ void editor_large_close(editor_buffer *b)
         work_cancel(pool, lg->find_retiring_h);
         while (!work_handle_finished(pool, lg->warm_h) || !work_handle_finished(pool, lg->find_h) ||
                !work_handle_finished(pool, lg->find_retiring_h)) {
-            struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+            (void)os_sleep_ns(UINT64_C(1000000));
         }
     }
     if (lg->warm) { if (!atomic_exchange(&lg->warm->released, true)) piece_snapshot_release(lg->warm->snap); free(lg->warm); }
@@ -180,7 +180,9 @@ static bool previous_start(editor *e, uint64_t end, uint64_t rows, bool line_sta
             !lineidx_complete(e->buffer->index)) return false;
         size_t n = (size_t)take;
         const uint8_t *nl;
-        while ((nl = memrchr(bytes, '\n', n))) {
+        while (n && (nl = bytes + n - 1u)) {
+            while (nl > bytes && *nl != '\n') nl--;
+            if (*nl != '\n') break;
             if (--rows == 0) { *out = end + (uint64_t)(nl - bytes) + 1u; return true; }
             n = (size_t)(nl - bytes);
         }
@@ -476,7 +478,7 @@ int editor_large_goto_byte(editor *e, uint64_t byte)
         (void)work_mailbox_bind(&e->pool, h, 1, byte_seek_receive, &seek);
         while (!seek.done || !work_handle_finished(&e->pool, h)) {
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
-            if (!seek.done) nanosleep(&(struct timespec){0, 100000}, NULL);
+            if (!seek.done) os_sleep_ns(UINT64_C(100000));
         }
         (void)work_mailbox_bind(&e->pool, h, 1, NULL, NULL);
     }

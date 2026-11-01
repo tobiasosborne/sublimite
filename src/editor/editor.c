@@ -2,6 +2,7 @@
 #include "trace/trace.h"
 #if defined(_WIN32)
 #include "d3d11/d3d11.h"
+#include "win32/private.h"
 #else
 #include "gl/gl.h"
 #endif
@@ -17,6 +18,32 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(_WIN32)
+/* A nonpresented CPU snapshot may retire without a display completion. A
+ * native in-flight frame instead ends its entire backend lifetime on worker.
+ * Rebuild once, park presentation, and keep editing/layout/submit operational. */
+static int windows_surface(editor *e)
+{
+    render_backend *b=e->backend;
+    if (!e->has_platform || !b->initialized || strcmp(b->info.name,"d3d11")) return 0;
+    bool suspended=win32_plat_suspended(&e->platform);
+    if (suspended != e->win_native_suspended) {
+        e->win_native_suspended=suspended; e->win_unavailable=suspended;
+        (void)d3d11_set_suspended(b,suspended);
+        if (!suspended) { int rc=editor_full_layout(e); if(rc) return rc; }
+    }
+    if (d3d11_surface_unavailable(b) || d3d11_recovery_required(b)) e->win_unavailable=true;
+    if (e->win_unavailable && b->active && d3d11_discard_unpresented(b)!=RENDER_OK) {
+        render_config cfg=b->config; void *state=b->state;
+        (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
+        editor_backend_shutdown_sync(e,b);
+        int rc=editor_backend_init_sync(e,cfg,state); if(rc) return rc;
+        (void)d3d11_set_suspended(b,true);
+        return editor_full_layout(e);
+    }
+    return 0;
+}
+#endif
 static bool runnable(const editor *e);
 static int refresh_caret(editor *e);
 
@@ -313,7 +340,14 @@ static void platform_work(void *ctx)
     editor *e = ctx; int rc = editor_poll_sources(e); if (rc) e->error = rc;
     e->pump_stopped = true; plat_quit(&e->platform);
 }
-#if !defined(_WIN32)
+#if defined(_WIN32)
+static void platform_complete(void *ctx, uint32_t serial, uint64_t ns, uint64_t count)
+{
+    editor *e=ctx;
+    int rc=d3d11_present_complete(e->backend,serial,ns,count);
+    if(rc && rc!=RENDER_ERR_FRAME && rc!=RENDER_ERR_STATE) e->error=rc;
+}
+#else
 static bool gpu_pending(const editor *e)
 {
     return (e->backend->info.capabilities & RENDER_CAP_GPU) &&
@@ -333,7 +367,11 @@ static void platform_complete(void *ctx, uint32_t serial, uint64_t ust, uint64_t
 static int raster_poll_set(editor *e)
 {
 #if defined(_WIN32)
-    (void)e;
+    (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
+    if(e->backend->active && !e->win_unavailable) {
+        void *handle=d3d11_latency_handle(e->backend);
+        if(handle && editor_wait_add_handle(&e->poll_set,handle,EDITOR_WAIT_D3D11)!=OS_OK) return EDITOR_ERR_IO;
+    }
 #else
     int fd = raster_completion_fd(e->backend);
     if (e->caret_only && !e->dirty && !e->queue_count && !e->resize_pending) fd = -1;
@@ -373,15 +411,16 @@ static int pump(editor *e, int timeout)
         render_event ev = {RENDER_EVENT_WORK, e->backend->active_frame, 0, &msg};
         int rc = render_backend_event(e->backend, &ev);
 #endif
+#if defined(_WIN32)
+        if (rc == RENDER_ERR_UNSUPPORTED && d3d11_recovery_required(e->backend)) rc=windows_surface(e);
+#endif
         if (rc) return fail(e, rc);
         /* A completed frame may unblock already prepared/input work. */
         if (!e->backend->active) timeout = 0;
     }
     if (e->has_platform && e->queue_count < EDITOR_INPUT_CAP) {
         plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work,
-#if !defined(_WIN32)
             .on_present_complete = platform_complete
-#endif
         };
         uint64_t before = e->platform.iterations;
         e->platform.quit = false; e->pump_stopped = false;
@@ -401,8 +440,15 @@ static int pump(editor *e, int timeout)
 static int present(editor *e)
 {
     render_backend *b = e->backend;
+#if defined(_WIN32)
+    int surface=windows_surface(e); if(surface) return surface;
+#endif
     if (!b->active || b->presented) return 0;
     int rc = render_backend_present(b, b->active_frame);
+#if defined(_WIN32)
+    if (rc == RENDER_ERR_BUSY || (rc == RENDER_ERR_UNSUPPORTED && d3d11_recovery_required(b)))
+        return windows_surface(e);
+#endif
     if (rc == RENDER_ERR_BUSY) return 0;
     if (rc) return rc;
     trace_record(TRACE_STARTUP_FIRST_PRESENT, 0);
@@ -475,6 +521,12 @@ static int submit(editor *e)
 #if !defined(_WIN32)
     raster_set_caret_only(e->backend, e->caret_only);
 #endif
+#if defined(_WIN32)
+    if(e->win_unavailable) {
+        rc=render_mark_full(&e->grid); if(rc) return rc;
+        rc=render_dirty_strips(&e->grid,e->strips,e->strip_cap,&count); if(rc) return rc;
+    }
+#endif
     rc = render_backend_submit(e->backend, &e->grid, e->strips, count);
     if (rc && rc != RENDER_ERR_BUSY && render_backend_check(e->backend, &e->grid, e->strips, count))
         rc = render_rejected(e, rc, &count);
@@ -522,6 +574,13 @@ static int submit(editor *e)
     e->dirty = false;
     if (e->cfg.on_submit) e->cfg.on_submit(e->cfg.hook_ctx, &e->frame);
     e->submitted_plan = e->scroll_plan; e->submitted_plan_valid = true;
+#if defined(_WIN32)
+    if(e->win_unavailable) {
+        rc=d3d11_discard_unpresented(e->backend);
+        if(!rc) editor_journal_paint_clear(e); /* Deliberate occlusion is no paint crash. */
+        return rc;
+    }
+#endif
     return 0;
 }
 int editor_resize_now(editor *e, uint32_t width, uint32_t height)
@@ -627,7 +686,7 @@ static int drop_files(editor *e)
         return drop_notice(e, "Drop: not enough memory");
     edit_arena_reset(&e->drop_arena);
     char hostname[IPC_PATH_CAP]; /* (P) reuse the parser's existing path bound. */
-    const char *local_hostname = gethostname(hostname, sizeof hostname) ? NULL : hostname;
+    const char *local_hostname = os_host_name(hostname, sizeof hostname) != OS_OK ? NULL : hostname;
     hostname[sizeof hostname - 1u] = '\0'; /* (P) C terminator at the last byte. */
     ipc_request request; dnd_counts counts;
     dnd_result parsed = dnd_parse_uri_list(data, size, local_hostname, &e->drop_arena, &request, &counts);
@@ -636,9 +695,9 @@ static int drop_files(editor *e)
     bool folders = false, failed = false, capacity = false;
     size_t retained = 0;
     for (size_t i = 0; i < request.count; i++) {
-        struct stat st;
-        if (stat(request.paths[i].path, &st)) { failed = true; continue; }
-        if (S_ISDIR(st.st_mode)) { folders = true; continue; }
+        os_stat st;
+        if (os_stat_path(request.paths[i].path, 0, &st) != OS_OK) { failed = true; continue; }
+        if (st.kind == OS_KIND_DIR) { folders = true; continue; }
         request.paths[retained++] = request.paths[i];
     }
     request.count = retained;
@@ -698,8 +757,23 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
     if (ev->kind == PLAT_EV_CLIPBOARD || (ev->kind == PLAT_EV_BUTTON && ev->code == 2))
         return editor_clip_event(e, ev);
     if (ev->kind == PLAT_EV_CLOSE) { e->quit = true; return 0; }
-    if (ev->kind == PLAT_EV_EXPOSE) return editor_full_layout(e);
+    if (ev->kind == PLAT_EV_EXPOSE) {
+#if defined(_WIN32)
+        if (!win32_plat_suspended(&e->platform)) {
+            e->win_unavailable=false; (void)d3d11_set_suspended(e->backend,false);
+        }
+#endif
+        return editor_full_layout(e);
+    }
     if (ev->kind == PLAT_EV_RESIZE) {
+#if defined(_WIN32)
+        uint32_t dpi=win32_plat_dpi(&e->platform);
+        if(dpi && e->font.dpi != (double)dpi) {
+            e->font.dpi=(double)dpi;
+            e->font.default_px=editor_runtime_em_px((double)dpi,e->font.default_points);
+            e->font.requested_px=editor_runtime_em_px((double)dpi,e->font.points);
+        }
+#endif
         e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; e->text_drag=false;
         e->font.window_width = ev->w; e->font.window_height = ev->h;
         e->resize_w = ev->w; e->resize_h = ev->h; e->resize_pending = true; return 0;
@@ -1193,10 +1267,8 @@ int editor_flush_settle(editor *e)
     if (rc != JOURNAL_BUSY) return rc;
     /* edit-ivv: exit has no later tick. Wait the one close_result retries on
      * (JOURNAL_DEFAULT_SYNC_NS) and ask once more; the text and the open
-     * journal are untouched by the refusal. (P) ns per s split for timespec. */
-    struct timespec tick = {(time_t)(JOURNAL_DEFAULT_SYNC_NS / UINT64_C(1000000000)),
-                            (long)(JOURNAL_DEFAULT_SYNC_NS % UINT64_C(1000000000))};
-    while (nanosleep(&tick, &tick) && errno == EINTR) {}
+     * journal are untouched by the refusal. */
+    (void)os_sleep_ns(JOURNAL_DEFAULT_SYNC_NS);
     return editor_flush(e);
 }
 int editor_flush(editor *e)

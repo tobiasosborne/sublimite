@@ -1055,7 +1055,7 @@ static int fm4_orphan(const char *dir, const char *source, char *journal_path)
         int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         uint64_t limit = deadline();
         while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
@@ -1111,7 +1111,7 @@ static int large_orphans_body(const char *root)
     char journal_path[IPC_PATH_CAP]; int lease = -1;
     T(journal_session_create(dir, journal_path, sizeof journal_path, &lease) == JOURNAL_OK);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor_config config = {.journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .start_empty = true, .cols = 32, .rows = 3};
     editor *e = NULL;
     uint64_t t0 = trace_now_ns();
     int rc = editor_open(&e, &config, &backend);
@@ -1165,7 +1165,7 @@ static int clean_launch(const char *dir, const char *source, bool expect_tab, ch
     int lease = -1;
     T(journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease) == JOURNAL_OK);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease,
+    editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease},
         .start_empty = source == NULL, .cols = 32, .rows = 3};
     editor *e = NULL; int rc = editor_open(&e, &config, &backend);
     if (!rc) rc = settle(e);
@@ -1258,7 +1258,7 @@ static int qct_orphan(const char *dir, const char *source, char *journal_path)
         int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         uint64_t limit = deadline();
         while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
@@ -1281,7 +1281,7 @@ static int qct_start_threshold(const char *dir, qct_launch *l, uint64_t threshol
     l->lease = -1; l->e = NULL;
     T(journal_session_create(dir, l->journal, sizeof l->journal, &l->lease) == JOURNAL_OK);
     T(render_null_backend(&l->backend) == 0);
-    editor_config config = {.journal_path = l->journal, .session_lease = &l->lease, .start_empty = true,
+    editor_config config = {.journal_path = l->journal, .session_lease = &(os_file){.fd=l->lease}, .start_empty = true,
         .copy_threshold = threshold, .cols = 32, .rows = 3};
     T(editor_open(&l->e, &config, &l->backend) == 0); return settle(l->e);
 }
@@ -1743,7 +1743,7 @@ static int e601_duplicate_orphan(const char *dir, const char *source, char *jour
         int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         uint64_t limit = deadline();
         while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
@@ -1901,7 +1901,7 @@ static int c26_first_launch(const char *dir, const char *source, char *journal_p
         int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor_config config = {.path = source, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         uint64_t limit = deadline();
         while (e->buffer->pending_open) { if (turn(e) || trace_now_ns() >= limit) _exit(5); sched_yield(); }
@@ -1930,7 +1930,7 @@ static int c26_relaunch(const char *dir, char *orphan, const char *head, const c
     char journal_path[IPC_PATH_CAP]; int lease = -1;
     T(journal_session_create(dir, journal_path, sizeof journal_path, &lease) == JOURNAL_OK);
     render_backend backend = {0}; T(render_null_backend(&backend) == 0);
-    editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor_config config = {.journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .start_empty = true, .cols = 32, .rows = 3};
     editor *e = NULL; uint64_t t0 = trace_now_ns();
     int rc = editor_open(&e, &config, &backend);
     int opened = rc;
@@ -2102,7 +2102,7 @@ static int leased_install_failure_body(const char *root, bool leased, bool start
     size_t nbefore = fm4_list(root, before, sizeof before / sizeof before[0]); T(nbefore != SIZE_MAX);
     struct stat original; T(stat(first, &original) == 0);
     launch->backend = (render_backend){0}; T(render_null_backend(&launch->backend) == 0);
-    config = (editor_config){.journal_path = next, .session_lease = leased ? &launch->lease : NULL,
+    config = (editor_config){.journal_path = next, .session_lease = leased ? &(os_file){.fd=launch->lease} : NULL,
         .start_empty = start_empty, .cols = (uint32_t)strlen(notice), .rows = 1u + 1u + 1u};
     int rc = editor_open(&launch->e, &config, &launch->backend);
     fprintf(stderr, "edit-y5x: leased=%s start_empty=%s editor_open=%d\n",
@@ -2136,7 +2136,9 @@ static int leased_install_failure_body(const char *root, bool leased, bool start
     }
     struct stat named, held; T(stat(lock, &named) == 0);
     T(e->session_lock_owned);
-    T(fstat(e->session_lock, &held) == 0 && held.st_dev == named.st_dev && held.st_ino == named.st_ino);
+    os_stat portable_held, portable_named;
+    T(os_file_stat(&e->session_lock,&portable_held)==OS_OK && os_stat_path(lock,0,&portable_named)==OS_OK);
+    T(os_identity_equal(&portable_held.id,&portable_named.id));
     if (leased) T(fstat(launch->lease, &held) == 0 && held.st_dev == named.st_dev && held.st_ino == named.st_ino);
     char aside[IPC_PATH_CAP]; strcpy(aside, e->recovery_aside);
     editor_close(e); launch->e = NULL;
@@ -2221,7 +2223,7 @@ static int ivv_recovery_body(const char *root, ivv_paths *p, editor **out, rende
     while (e->busy_checkpoint) { T(turn(e) == 0); T(trace_now_ns() < limit); sched_yield(); }
     fprintf(stderr, "edit-ivv (a): guard released refusals=%u source_kept=%s lock_kept=%s\n", e->busy_refusals,
         access(first, F_OK) ? "no" : "yes", access(lock, F_OK) ? "no" : "yes");
-    T(e->busy_refusals == 0 && access(first, F_OK) < 0 && access(lock, F_OK) < 0 && e->busy_source_lease < 0);
+    T(e->busy_refusals == 0 && access(first, F_OK) < 0 && access(lock, F_OK) < 0 && !os_file_is_open(&e->busy_source_lease));
     T(ivv_text(e, "MK") == 0);
     editor_close(e); *out = NULL;
     T(file_contains(next, "MK"));
@@ -2529,7 +2531,7 @@ static int dzk1_first_launch(const char *dir, const char *alpha, const char *bra
         char journal_path[IPC_PATH_CAP]; int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.path = alpha, .journal_path = journal_path, .session_lease = &lease, .cols = 32, .rows = 3};
+        editor_config config = {.path = alpha, .journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || dzk1_opened(e)) _exit(4);
         if (press(e, 'x', 0, "x")) _exit(5);
         uint64_t id; if (editor_add_buffer(e, bravo, NULL, 0, &id) || dzk1_opened(e)) _exit(6);
@@ -2551,7 +2553,7 @@ static int dzk1_killed_launch(const char *dir)
         char journal_path[IPC_PATH_CAP]; int lease = -1;
         if (journal_session_create(dir, journal_path, IPC_PATH_CAP, &lease)) _exit(2);
         render_backend backend = {0}; if (render_null_backend(&backend)) _exit(3);
-        editor_config config = {.journal_path = journal_path, .session_lease = &lease, .start_empty = true, .cols = 32, .rows = 3};
+        editor_config config = {.journal_path = journal_path, .session_lease = &(os_file){.fd=lease}, .start_empty = true, .cols = 32, .rows = 3};
         editor *e = NULL; if (editor_open(&e, &config, &backend) || settle(e)) _exit(4);
         if (tabs_count(&e->tabs) != 2 || tabs_active_index(&e->tabs) != 0) _exit(5); /* (P) the two launch-1 tabs */
         dzk1_editor = e; dzk1_victim = editor_tab(e, 1)->id;
@@ -2570,7 +2572,7 @@ static int dzk1_start(const char *dir, dzk1_launch *l)
     l->lease = -1; l->e = NULL; l->backend = (render_backend){0};
     T(journal_session_create(dir, l->journal_path, sizeof l->journal_path, &l->lease) == JOURNAL_OK);
     T(render_null_backend(&l->backend) == 0);
-    editor_config config = {.journal_path = l->journal_path, .session_lease = &l->lease, .start_empty = true, .cols = 32, .rows = 3};
+    editor_config config = {.journal_path = l->journal_path, .session_lease = &(os_file){.fd=l->lease}, .start_empty = true, .cols = 32, .rows = 3};
     T(editor_open(&l->e, &config, &l->backend) == 0);
     return settle(l->e);
 }

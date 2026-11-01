@@ -1526,6 +1526,11 @@ static bool relative_to_cwd(const char *abs, char *out, size_t cap)
 
 static void case_paths(void)
 {
+    char hostname[256];
+    OK(os_host_name(hostname,sizeof hostname));
+    CHECK(*hostname && strlen(hostname)<sizeof hostname);
+    CHECK(os_host_name(hostname,1)==OS_E_RANGE);
+
     /* Relative paths resolve against the current directory. */
     char abs_file[OS_PATH_MAX], rel_dir[OS_PATH_MAX], rel_file[OS_PATH_MAX], rel2[OS_PATH_MAX];
     join(abs_file, sizeof abs_file, work_root, "rel.txt");

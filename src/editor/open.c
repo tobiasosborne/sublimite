@@ -33,20 +33,15 @@ void editor_close(editor *e)
         /* A failed startup can close before any BASE/metadata was admitted.
          * Such a placeholder carries no recovery state. Nonempty sources,
          * including failed restores, must survive teardown. */
-        if (e->session_lock < 0 || e->session_lock_owned) journal_close_discard_empty(e->journal);
+        if (!os_file_is_open(&e->session_lock) || e->session_lock_owned) journal_close_discard_empty(e->journal);
         else journal_close(e->journal); /* another editor owns the session */
         e->journal = NULL;
     }
     /* edit-cxo: a discarded empty session leaves no lease file behind. */
-#if defined(_WIN32)
-    if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path && e->cfg.session_lease)
-        (void)journal_session_release_file(e->cfg.journal_path, e->cfg.session_lease);
-#else
-    if (e->session_lock >= 0 && e->session_lock_owned && e->cfg.journal_path)
-        (void)journal_session_release(e->cfg.journal_path, e->session_lock);
-#endif
-    if (e->session_lock >= 0) close(e->session_lock);
-    if (e->busy_source_lease >= 0) close(e->busy_source_lease); /* edit-ivv: source stays discoverable */
+    if (os_file_is_open(&e->session_lock) && e->session_lock_owned && e->cfg.journal_path)
+        (void)journal_session_release_file(e->cfg.journal_path, &e->session_lock);
+    os_file_close(&e->session_lock);
+    os_file_close(&e->busy_source_lease); /* source stays discoverable */
     if (e->journal_pool_ready) work_pool_shutdown(&e->journal_pool);
     editor_clip_stop(e);
     editor_backend_close_probe(e);
@@ -96,7 +91,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
 #endif
     if (!e) return EDITOR_ERR_MEMORY;
     memset(e, 0, sizeof *e);
-    e->raster_poll_fd = -1; e->session_lock = -1; e->busy_source_lease = -1; e->recovery_skip = skip_recovery;
+    e->raster_poll_fd = -1; e->session_lock = (os_file)OS_FILE_INIT; e->busy_source_lease = (os_file)OS_FILE_INIT; e->recovery_skip = skip_recovery;
     e->preferences_watchfd = -1; e->drag_tab = SIZE_MAX;
     atomic_init(&e->font_logged, false);
     /* edit-m25u: every tab's save controller shares one pinned reload-cache
@@ -289,7 +284,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (!(backend->info.capabilities & RENDER_CAP_HEADLESS)) {
         plat_config pc = {.title = "sublimité", .width = e->font.window_width, .height = e->font.window_height,
 #if defined(_WIN32)
-            .work_sources = editor_wait_handles, .work_sources_ctx = &e->poll_set};
+            .work_sources = editor_wait_handles, .work_sources_ctx = &e->poll_set, .work_consumed = editor_wait_consumed};
 #else
             .work_wake = editor_wait_wake(&e->poll_set)};
 #endif

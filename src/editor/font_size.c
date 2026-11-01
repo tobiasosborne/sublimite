@@ -121,7 +121,7 @@ static void font_worker(work_ctx *ctx)
     f->result = rc;
     work_msg msg = {.kind = FONT_SIZE_MSG};
     while (!work_should_stop(ctx) && !work_publish(ctx, &msg)) {
-        struct timespec delay = {0, 1000000}; (void)nanosleep(&delay, NULL);
+        (void)os_sleep_ns(UINT64_C(1000000));
     }
 }
 bool editor_font_receive(editor *e, const work_msg *msg)

@@ -21,6 +21,9 @@ int render_d3d11_backend(render_backend *b);
  * there is no chain sharing/transfer or deferred finish_init acquisition here.
  * Background init creates its chain without presenting a diagnostic frame. */
 int render_d3d11_backend_for_window(render_backend *b, void *hwnd);
+/* Optional init-only Win32 mailbox destination, borrowed through shutdown.
+ * render_config.platform remains an opaque identity for standalone clients. */
+int d3d11_bind_platform(render_backend *b, struct plat *platform);
 /* Init-only diagnostic options. Default: hardware, falling back to WARP.
  * force_warp tests the software device; readback reserves a staging snapshot
  * and copies the actual back buffer immediately before each Present. */
@@ -34,6 +37,9 @@ void *d3d11_latency_handle(const render_backend *b);
  * that readiness here before retrying present (auto-reset HANDLE). */
 int d3d11_notify_latency_ready(render_backend *b);
 int d3d11_poll_completions(render_backend *b);
+/* UI mailbox consumer: accepts only the authenticated record queued by this
+ * backend lifetime. Unrelated, stale or duplicate native records are refused. */
+int d3d11_present_complete(render_backend *b, uint32_t id, uint64_t ns, uint64_t count);
 /* UI: set for session lock/disconnect, suspend, display/compositor unavailable;
  * clear on resume. Hidden/minimized HWNDs are detected automatically. Before
  * Present, BUSY retains the copied frame without drawing invisible work.
@@ -44,6 +50,11 @@ int d3d11_poll_completions(render_backend *b);
  * a fresh grid/backend lifetime. DEVICE instead denotes native device failure.
  * Poll/retry on a finite UI timeout while active; idle needs no polling. */
 int d3d11_set_suspended(render_backend *b, bool suspended);
+/* Unavailable surfaces keep CPU snapshots moving without claiming a present.
+ * Discard is legal only before drawing/native Present. Drawn/committed frames
+ * require the documented quiescent rebuild first. No T4/T5/T6 is fabricated. */
+bool d3d11_surface_unavailable(const render_backend *b);
+int d3d11_discard_unpresented(render_backend *b);
 bool d3d11_recovery_required(const render_backend *b);
 /* Diagnostic-only blocking read of the last pre-Present staging snapshot.
  * Output is opaque 0xffRRGGBB, top down; stride/capacity in uint32_t pixels. */

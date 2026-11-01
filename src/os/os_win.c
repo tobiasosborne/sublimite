@@ -946,6 +946,15 @@ static os_err dirlock_open(os_dir *d)
     char path[OS_PATH_MAX];
     int n = snprintf(path, sizeof path, "%s\\dirlocks", base);
     if (n < 0 || (size_t)n >= sizeof path) return fail_with(OS_E_NAMETOOLONG);
+    /* A private profile adds a data parent below its existing root. Known
+     * folder parents already exist. Resolve it here, before either lock level. */
+    char parent[OS_PATH_MAX]; strcpy(parent,base);
+    char *sep=strrchr(parent,'\\');
+    if(sep) {
+        *sep=0;
+        rc=os_mkdir(parent);
+        if(rc!=OS_OK && rc!=OS_E_EXIST) return rc;
+    }
     /* Create both levels if missing (FILE_OPEN_IF on a directory). */
     for (int level = 0; level < 2; level++) {
         WCHAR w[OS_PATH_MAX];
@@ -1212,6 +1221,13 @@ os_err os_path_canonical(const char *path, char *out, size_t cap)
     close_keep(h);
     return rc;
 }
+os_err os_host_name(char *out, size_t cap)
+{
+    if (!out || !cap) return fail_with(OS_E_INVAL);
+    WCHAR name[MAX_COMPUTERNAME_LENGTH + 1u]; DWORD n = MAX_COMPUTERNAME_LENGTH + 1u;
+    if (!GetComputerNameW(name, &n)) return fail();
+    return to_utf8(name, (int)n + 1, out, cap);
+}
 os_err os_cwd(char *out, size_t cap)
 {
     WCHAR w[OS_PATH_MAX];
@@ -1246,7 +1262,13 @@ os_err os_app_dir(os_app_dir_kind kind, char *out, size_t cap)
     static const GUID roaming = {0x3EB685DB, 0x65F9, 0x4CF6, {0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D}};
     static const GUID local = {0xF1B32785, 0x6FBA, 0x4FCF, {0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91}};
     char root[OS_PATH_MAX];
-    os_err rc;
+    os_err rc = os_env_get("SUBLIMITE_PROFILE", root, sizeof root);
+    if(rc!=OS_OK && rc!=OS_E_NOENT) return rc;
+    if (rc == OS_OK && *root) {
+        if (!os_path_is_absolute(root)) return fail_with(OS_E_INVAL);
+        if (kind != OS_APP_CONFIG && kind != OS_APP_DATA) return fail_with(OS_E_INVAL);
+        return root_join(out, cap, root, kind == OS_APP_CONFIG ? "\\config\\sublimite" : "\\data\\sublimite");
+    }
     if (kind == OS_APP_CONFIG) rc = known_folder(&roaming, "APPDATA", root, sizeof root);
     else if (kind == OS_APP_DATA) rc = known_folder(&local, "LOCALAPPDATA", root, sizeof root);
     else return fail_with(OS_E_INVAL);

@@ -23,7 +23,7 @@ WIN_SAN_OBJ := $(WIN_SRCS:%.c=$(WIN_B)/san/%.o)
 WIN_TEST_REL := $(addprefix $(WIN_B)/rel/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 WIN_TEST_SAN := $(addprefix $(WIN_B)/san/tests/,$(addsuffix .exe,$(basename $(notdir $(WIN_TESTS)))))
 # OS imports plus D3D11/DXGI and interface GUIDs. Shader compiler is runtime-loaded.
-WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid -ldwmapi -ladvapi32 -luser32 -lshcore
+WIN_LIBS := -lntdll -lbcrypt -lshell32 -lole32 -ld3d11 -ldxgi -ldxguid -ldwmapi -ladvapi32 -luser32 -lshcore -lwtsapi32 -lpowrprof
 # UTF-8 activeCodePage manifest (src/os/utf8.manifest, decision doc edit-177r.2
 # §3.9), embedded as RT_MANIFEST 1 through a windres-compiled resource and linked
 # into every Windows executable: the CRT's narrow argv, fopen and getenv become UTF-8.
@@ -54,6 +54,18 @@ $(WIN_B)/san/tests/fif_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
 WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl journal
 WIN_QUIET := $(WIN_B)/tools/win_quiet_run.exe
 all: $(WIN_TEST_REL) $(WIN_QUIET)
+
+# W2.4d: production application, with every portable/editor translation unit.
+WIN_EDITOR_SRCS := $(wildcard src/editor/*.c)
+WIN_EDITOR_REL := $(WIN_EDITOR_SRCS:%.c=$(WIN_B)/rel/%.o)
+WIN_EDITOR_SAN := $(WIN_EDITOR_SRCS:%.c=$(WIN_B)/san/%.o)
+all: $(WIN_B)/rel/sublimite.exe
+$(WIN_B)/rel/sublimite.exe: $(WIN_B)/rel/src/main.o $(WIN_EDITOR_REL) $(WIN_REL_LIB) $(WIN_MANIFEST_OBJ)
+	$(WIN_CC) $(WIN_REL_F) $^ $(WIN_LIBS) $(WIN_WRAP) -static -mwindows -o $@
+$(WIN_B)/san/sublimite.exe: $(WIN_B)/san/src/main.o $(WIN_EDITOR_SAN) $(WIN_SAN_LIB) $(WIN_MANIFEST_OBJ)
+	$(WIN_CC) $(WIN_SAN_F) $^ $(WIN_LIBS) -mwindows -o $@
+	@cp -u $(addprefix $(WIN_TOOLCHAIN)/x86_64-w64-mingw32/bin/,$(WIN_SAN_DLLS)) $(@D)/
+.SECONDARY: $(WIN_EDITOR_REL) $(WIN_EDITOR_SAN)
 $(WIN_QUIET): tools/win_quiet_run.c
 	@mkdir -p $(@D)
 	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $< -luser32 -static -o $@
@@ -305,3 +317,10 @@ check: win-editor-loop
 win-editor-loop: $(WIN_EDITOR_LOOP_SRC:%.c=$(WIN_B)/rel/%.o) $(WIN_EDITOR_LOOP_SRC:%.c=$(WIN_B)/san/%.o)
 
 $(WIN_B)/rel/tests/editor_wait_test.exe $(WIN_B)/san/tests/editor_wait_test.exe: src/win32/win32_close_win.c src/win32/close.h
+
+$(WIN_B)/rel/tests/editor_exe_test.exe: $(WIN_B)/rel/sublimite.exe
+$(WIN_B)/san/tests/editor_exe_test.exe: $(WIN_B)/san/sublimite.exe
+$(WIN_B)/rel/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_REL)
+$(WIN_B)/san/tests/editor_win_test.exe: WIN_TEST_FLAGS += $(WIN_EDITOR_SAN)
+$(WIN_B)/rel/tests/editor_win_test.exe: $(WIN_EDITOR_REL)
+$(WIN_B)/san/tests/editor_win_test.exe: $(WIN_EDITOR_SAN)

@@ -1,5 +1,9 @@
 #include "editor/private.h"
+#if defined(_WIN32)
+#include "d3d11/d3d11.h"
+#else
 #include "gl/gl.h"
+#endif
 #include "raster/raster.h"
 #include "trace/trace.h"
 
@@ -38,7 +42,14 @@ void editor_refresh_flush(editor *e)
     bool synthetic = (e->backend->info.capabilities & RENDER_CAP_HEADLESS) != 0;
     uint64_t sequence = 0, ust = 0;
     if (synthetic) sequence = e->refresh_sequence + 1u;
+#if defined(_WIN32)
+    else { d3d11_present_info info;
+        if (d3d11_present_stats(e->backend, &info) == RENDER_OK && info.statistics_matched) sequence = info.observed;
+    }
+    (void)ust;
+#else
     else if (!raster_last_present(e->backend, &ust, &sequence)) sequence = gl_displayed_msc(e->backend);
+#endif
     /* Absence of MSC is explicitly unsupported. Do not invent a physical
      * refresh counter from the number of submissions. */
     if (!sequence) {

@@ -127,7 +127,7 @@ static int make_leased_session(const char *root, char *out, size_t cap, int *lea
 static int open_editor_leased(editor **e, render_backend *backend, const char *path, const char *jpath, const int *lease)
 {
     *backend = (render_backend){0}; T(render_null_backend(backend) == 0);
-    editor_config cfg = {.path = path, .journal_path = jpath, .session_lease = lease, .start_empty = !path, .cols = COLS, .rows = ROWS};
+    editor_config cfg = {.path = path, .journal_path = jpath, .session_lease = lease ? &(os_file){.fd=*lease} : NULL, .start_empty = !path, .cols = COLS, .rows = ROWS};
     *e = NULL; int rc = editor_open(e, &cfg, backend);
     if (rc) fprintf(stderr, "dataloss_test: editor_open returned %d\n", rc);
     T(rc == 0); return settle(*e);

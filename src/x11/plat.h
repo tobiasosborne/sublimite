@@ -87,6 +87,9 @@ typedef struct plat_config {
      * At most PLAT_WORK_SOURCE_CAP; SIZE_MAX reports invalid/overflow. */
     size_t (*work_sources)(void *ctx, void **handles, size_t capacity);
     void *work_sources_ctx;
+    /* A wait may consume an auto-reset source. Record that readiness before
+     * on_work; the source owner still owns draining and lifetime. */
+    void (*work_consumed)(void *ctx, void *handle);
 #endif
 } plat_config;
 

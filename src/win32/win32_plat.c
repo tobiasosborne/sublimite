@@ -1,6 +1,9 @@
 /* Win32 implementation of the portable platform contract. */
 #if defined(_WIN32)
 #include "private.h"
+#include <dwmapi.h>
+#include <wtsapi32.h>
+#include <powrprof.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
@@ -37,6 +40,19 @@ static bool pop(win32_plat *s, plat_event *out)
 {
     if (s->head==s->tail) return win32_clip_poll(s,out);
     *out=s->queue[s->head++ % WIN32_EVENT_CAP]; return true;
+}
+bool win32_plat_suspended(const plat *p)
+{ const win32_plat *s=win32_private(p); return s && (s->minimized || s->session_locked || s->session_disconnected || s->power_off); }
+uint32_t win32_plat_dpi(const plat *p)
+{ const win32_plat *s=win32_private(p); return s ? s->dpi : 0; }
+void plat_set_dark(plat *p, bool dark)
+{
+    win32_plat *s = win32_private(p);
+    if (!ui(s)) return;
+    BOOL enabled = dark;
+    /* Windows 10 immersive dark nonclient decoration, before/after 20H1. */
+    if (FAILED(DwmSetWindowAttribute(s->hwnd, 20, &enabled, sizeof enabled)))
+        (void)DwmSetWindowAttribute(s->hwnd, 19, &enabled, sizeof enabled);
 }
 void plat_set_cursor(plat *p, plat_cursor_shape shape)
 {
@@ -437,6 +453,34 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (!s) return DefWindowProcW(hwnd,msg,wp,lp);
     switch (msg) {
+    case WM_APP+0x53:
+        if(s->test_input) (void)SetPropW(hwnd,L"SublimiteTestBarrier",(HANDLE)wp);
+        return 0;
+    case WM_APP+0x51:
+        if (s->test_input) {
+            BYTE keys[256] = {0};
+            if (wp & PLAT_MOD_CTRL) keys[VK_CONTROL] = keys[VK_LCONTROL] = 0x80;
+            if (wp & PLAT_MOD_SHIFT) keys[VK_SHIFT] = keys[VK_LSHIFT] = 0x80;
+            if (wp & PLAT_MOD_ALT) keys[VK_MENU] = keys[VK_LMENU] = 0x80;
+            (void)SetKeyboardState(keys);
+        }
+        return 0;
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK) s->session_locked = true;
+        else if (wp == WTS_SESSION_UNLOCK) s->session_locked = false;
+        else if (wp == WTS_CONSOLE_DISCONNECT || wp == WTS_REMOTE_DISCONNECT) s->session_disconnected = true;
+        else if (wp == WTS_CONSOLE_CONNECT || wp == WTS_REMOTE_CONNECT) s->session_disconnected = false;
+        (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE}); return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) s->power_off = true;
+        else if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) s->power_off = false;
+        else if (wp == PBT_POWERSETTINGCHANGE && lp) {
+            const POWERBROADCAST_SETTING *setting = (const void *)lp;
+            if (IsEqualGUID(&setting->PowerSetting, &GUID_CONSOLE_DISPLAY_STATE) && setting->DataLength == sizeof(DWORD)) {
+                DWORD state; memcpy(&state,setting->Data,sizeof state); s->power_off = state == 0;
+            }
+        }
+        (void)push(s,(plat_event){.kind=PLAT_EV_EXPOSE}); return TRUE;
     case WM_ENTERSIZEMOVE: case WM_ENTERMENULOOP:
         s->modal_depth++;
         (void)SetTimer(hwnd,1,USER_TIMER_MINIMUM,NULL);
@@ -515,7 +559,7 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ENDSESSION:
         if (wp) (void)push(s,(plat_event){.kind=PLAT_EV_CLOSE});
         return 0;
-    case WM_SIZE: resize(s); return 0;
+    case WM_SIZE: s->minimized = wp == SIZE_MINIMIZED; resize(s); return 0;
     case WM_DPICHANGED: {
         s->dpi=HIWORD(wp); RECT *r=(RECT *)lp;
         uint32_t old_w=s->owner->width,old_h=s->owner->height;
@@ -592,6 +636,7 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     win32_plat *s=calloc(1,sizeof *s); if (!s) return PLAT_ERR_FAIL;
     p->backend_state=s; p->width=cfg->width; p->height=cfg->height; s->owner=p; s->ui_thread=GetCurrentThreadId();
     s->work_wake=cfg->work_wake; s->work_sources=cfg->work_sources;
+    s->work_consumed=cfg->work_consumed;
     s->work_sources_ctx=cfg->work_sources_ctx; s->instance=GetModuleHandleW(NULL);
     s->repeat_delay=400; s->repeat_rate=30; /* (G) P2.2 shared defaults. */
     s->present_enabled=true; InitializeSRWLock(&s->present_lock);
@@ -604,6 +649,7 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     s->cursors[PLAT_CURSOR_DEFAULT]=LoadCursorW(NULL,MAKEINTRESOURCEW(32512));
     s->cursors[PLAT_CURSOR_TEXT]=LoadCursorW(NULL,MAKEINTRESOURCEW(32513));
     cls.hCursor=s->cursors[PLAT_CURSOR_DEFAULT]; cls.lpszClassName=s->class_name;
+    s->test_input = GetEnvironmentVariableW(L"SUBLIMITE_TEST_INPUT",NULL,0) != 0;
     if (!RegisterClassExW(&cls)) goto fail;
     WCHAR *title=wide_utf8(cfg->title ? cfg->title : "sublimite",strlen(cfg->title ? cfg->title : "sublimite"));
     if (!title) goto fail;
@@ -613,6 +659,8 @@ int plat_init_backend(plat *p, const plat_config *cfg, plat_backend backend)
     HWND hwnd=CreateWindowExW(0,s->class_name,title,WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,
         rect.right-rect.left,rect.bottom-rect.top,NULL,NULL,s->instance,s);
     free(title); if (!hwnd) goto fail;
+    (void)WTSRegisterSessionNotification(hwnd,NOTIFY_FOR_THIS_SESSION);
+    s->power_notify=RegisterPowerSettingNotification(hwnd,&GUID_CONSOLE_DISPLAY_STATE,DEVICE_NOTIFY_WINDOW_HANDLE);
     s->dpi=GetDpiForWindow(hwnd); s->layout_altgr=layout_altgr();
     if (win32_clip_init(s)!=PLAT_OK) goto fail;
     drop_accept(s);
@@ -631,6 +679,8 @@ void plat_shutdown(plat *p)
     win32_plat *s=win32_private(p); if (!ui(s)) return;
     if (s->callbacks) return;
     clear_compose(s);
+    if(s->power_notify) { (void)UnregisterPowerSettingNotification(s->power_notify); s->power_notify=NULL; }
+    if(s->hwnd) (void)WTSUnRegisterSessionNotification(s->hwnd);
     /* Never release userdata while DestroyWindow can still call it. */
     if (s->hwnd && !DestroyWindow(s->hwnd)) return;
     win32_clip_stop(s);
@@ -796,10 +846,13 @@ static size_t work_handles(win32_plat *s, HANDLE *handles)
     }
     return 0;
 }
-static bool work_ready(const HANDLE *handles, size_t count)
+static bool work_ready(win32_plat *s, const HANDLE *handles, size_t count)
 {
     for (size_t i = 0; i < count; i++)
-        if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) return true;
+        if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) {
+            if(s->work_consumed) s->work_consumed(s->work_sources_ctx,handles[i]);
+            return true;
+        }
     return false;
 }
 static void modal_service(win32_plat *s)
@@ -817,7 +870,7 @@ static void modal_service(win32_plat *s)
     HANDLE handles[PLAT_WORK_SOURCE_CAP];
     size_t count = work_handles(s, handles);
     if (count > PLAT_WORK_SOURCE_CAP) { plat_quit(s->owner); }
-    else if (!s->owner->quit && cb->on_work && work_ready(handles, count))
+    else if (!s->owner->quit && cb->on_work && work_ready(s, handles, count))
         { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; }
     if (!s->owner->quit) repeat_poll(s,cb);
     if (!s->owner->quit && s->owner->focused && s->blink_ms &&
@@ -868,7 +921,9 @@ int plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms)
             timer(s->blink_timer,s->blink_ms);
             if (cb->on_blink) { s->callback_depth++; cb->on_blink(cb->ud); s->callback_depth--; }
         }
-        if (!p->quit && cb->on_work && work_ready(handles+work_index, work_count))
+        bool consumed=result>=WAIT_OBJECT_0+work_index && result<WAIT_OBJECT_0+count;
+        if(consumed && s->work_consumed) s->work_consumed(s->work_sources_ctx,handles[result-WAIT_OBJECT_0]);
+        if (!p->quit && cb->on_work && (consumed || work_ready(s,handles+work_index, work_count)))
             { s->callback_depth++; cb->on_work(cb->ud); s->callback_depth--; } /* Borrowed wake: callback drains before mailbox reads. */
     }
     s->callbacks=NULL;

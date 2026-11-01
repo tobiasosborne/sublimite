@@ -40,7 +40,7 @@ int editor_scroll_retire(editor_buffer *b)
 void editor_scroll_close(editor_buffer *b)
 {
     /* Quiescent shutdown only; maintenance never blocks physical retirement. */
-    while (editor_scroll_retire(b) == EDITOR_MORE) sched_yield();
+    while (editor_scroll_retire(b) == EDITOR_MORE) os_yield();
 }
 /* edit-bt1: a refused snapshot allocation is no editor failure. The
  * displayed window stays; the slice retries on the next tick, reusing

@@ -19,15 +19,18 @@ typedef struct win32_plat {
     plat *owner;
     const plat_callbacks *callbacks;
     bool servicing;
+    bool test_input, minimized, session_locked, session_disconnected, power_off;
     unsigned modal_depth, callback_depth;
     DWORD ui_thread;
     HWND hwnd;
+    HPOWERNOTIFY power_notify;
     HINSTANCE instance;
     WCHAR class_name[64]; /* (P) prefix + pointer hex + terminating NUL fits. */
     HANDLE blink_timer, repeat_timer, present_wake;
     const os_wake *work_wake;
     size_t (*work_sources)(void *, void **, size_t);
     void *work_sources_ctx;
+    void (*work_consumed)(void *, void *);
     uint32_t dpi, blink_ms, repeat_delay, repeat_rate, repeat_key, buttons;
     HCURSOR cursors[2];
     plat_cursor_shape cursor_shape;
@@ -57,6 +60,8 @@ typedef struct win32_plat {
 static inline win32_plat *win32_private(const plat *p)
 { return p && p->backend == PLAT_BACKEND_WIN32 ? p->backend_state : NULL; }
 
+bool win32_plat_suspended(const plat *p);
+uint32_t win32_plat_dpi(const plat *p);
 int win32_clip_init(win32_plat *s);
 void win32_clip_stop(win32_plat *s);
 HANDLE win32_clip_wake(const win32_plat *s);

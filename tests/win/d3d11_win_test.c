@@ -1,5 +1,6 @@
 /* White-box regressions: compile the C backend here; production has no hooks. */
 #include <windows.h>
+#include "x11/plat.h"
 #include <dwmapi.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -128,6 +129,38 @@ static int statistics_progress(void)
     T(s.present_info.statistics_matched && s.present_info.expected == 7);
     s.swapchain = NULL; s.device = NULL; d3d11_release(&s);
     puts("d3d11_win_test: stale statistics require worker DwmFlush, original ID hooks once PASS");
+    return 0;
+}
+typedef struct completion_route { render_backend *backend; unsigned calls; } completion_route;
+static void routed_complete(void *ctx, uint32_t id, uint64_t ns, uint64_t count)
+{
+    completion_route *route=ctx;
+    if (d3d11_present_complete(route->backend,id,ns,count)==RENDER_OK) route->calls++;
+}
+static int platform_statistics_route(void)
+{
+    plat platform={0}; plat_config pc={.width=80,.height=80};
+    T(plat_init_backend(&platform,&pc,PLAT_BACKEND_WIN32)==PLAT_OK);
+    d3d11_state s={.query_ready=true,.latency_ready=true,.swapped=true,.pending_count=7,.platform=&platform};
+    IDXGISwapChain2Vtbl cv={.GetFrameStatistics=fake_stats}; IDXGISwapChain2 chain={&cv};
+    ID3D11DeviceVtbl dv={.GetDeviceRemovedReason=fake_removed}; ID3D11Device device={&dv};
+    s.swapchain=&chain; s.device=&device; s.deadline=os_now_ns()+D3D11_COMPLETION_NS;
+    render_config cfg={.max_cells=1,.max_pages=1,.max_glyphs=1,.max_region_width=1,.max_region_height=1};
+    s.atlas_width=s.atlas_height=1; T(d3d11_reserve(&s,&cfg));
+    unsigned hooks=0;
+    render_backend b={.info={.name="d3d11"},.ops={.event=d3d11_event},.state=&s,.initialized=true,.active=true,.presented=true,.active_frame=41,
+        .config={.platform=&platform,.hooks={hook_count,hook_count,&hooks}}};
+    completion_route route={&b,0};
+    plat_callbacks cb={.ud=&route,.on_present_complete=routed_complete};
+    atomic_store(&flush_thread,0); empty_statistics=false;
+    while(b.active && os_now_ns()<s.deadline) {
+        T(d3d11_poll_completions(&b)==RENDER_OK);
+        T(plat_run_for(&platform,&cb,1)==PLAT_OK);
+    }
+    T(!b.active && route.calls==1 && hooks==2);
+    T(d3d11_present_complete(&b,41,os_now_ns(),7)!=RENDER_OK);
+    s.swapchain=NULL; s.device=NULL; d3d11_release(&s); plat_shutdown(&platform);
+    puts("d3d11_win_test: exact frame statistics -> Win32 mailbox -> UI T6 exactly once PASS");
     return 0;
 }
 static int delayed_retry(void)
@@ -264,6 +297,7 @@ static int readiness_recovery(void)
 }
 int main(void) {
     T(test_isolation_query() != TEST_ISOLATION_UNKNOWN);
+    if(platform_statistics_route()) return 1;
     if (disabled_scroll() || atlas_rectangles()) return 1;
     if (timing_capability()) return 1;
     if (statistics_progress()) return 1;

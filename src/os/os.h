@@ -614,6 +614,8 @@ bool   os_path_is_absolute(const char *path);
  * without the \\?\ prefix). OS_E_RANGE if cap is too small. */
 os_err os_path_canonical(const char *path, char *out, size_t cap);
 os_err os_cwd(char *out, size_t cap);
+/* UTF-8 local host name, for local file URI classification. */
+os_err os_host_name(char *out, size_t cap);
 /* Per-user application directories, not created:
  *   OS_APP_CONFIG  $XDG_CONFIG_HOME/sublimite, else $HOME/.config/sublimite
  *                  Windows %APPDATA%\sublimite (FOLDERID_RoamingAppData)

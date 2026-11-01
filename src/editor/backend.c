@@ -65,11 +65,15 @@ static void init_event(void *ctx, const plat_event *event)
 #endif
 int editor_backend_init_sync(editor *e, render_config config, void *state)
 {
+#if defined(_WIN32)
+    config.background_init = true; /* Authenticate the first real frame, never an init probe. */
+#endif
     editor_backend_init arg = {.backend = *e->backend, .config = config, .state = state, .result = RENDER_ERR_INIT};
 #if defined(_WIN32)
     if (!strcmp(arg.backend.info.name, "d3d11")) {
         memset(state, 0, arg.backend.info.state_size); arg.backend.state = state;
         int attached = render_d3d11_backend_for_window(&arg.backend, plat_native_win32(&e->platform));
+        if (!attached) attached = d3d11_bind_platform(&arg.backend, &e->platform);
         if (attached) return attached;
     }
 #endif
@@ -98,6 +102,7 @@ void editor_backend_shutdown_sync(editor *e, render_backend *backend)
 {
 #if defined(_WIN32)
     if (!backend || !backend->initialized) return;
+    (void)editor_wait_remove(&e->poll_set,EDITOR_WAIT_D3D11);
     if (e->pool_ready && e->has_platform) {
         work_handle handle = {0};
         do {

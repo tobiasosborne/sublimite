@@ -1,5 +1,8 @@
 #include "editor/private.h"
 #include "raster/raster.h"
+#if defined(_WIN32)
+#include "d3d11/d3d11.h"
+#endif
 #include "trace/trace.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -731,20 +734,20 @@ static int position_buffer(editor *e, editor_buffer *b, uint32_t line, uint32_t 
             if (e->error || b->source_stale || file_snapshot_faulted(snap)) {
                 piece_snapshot_release(snap); return EDITOR_ERR_IO;
             }
-            nanosleep(&(struct timespec){0, 100000}, NULL);
+            os_sleep_ns(UINT64_C(100000));
         }
         lineidx_result target;
         while (!lineidx_seek_result(b->index, &target)) {
             (void)work_mailbox_drain(&e->pool, editor_route_work, e);
             if (e->error || b->source_stale || file_changed(b->file)) return EDITOR_ERR_IO;
-            nanosleep(&(struct timespec){0, 100000}, NULL);
+            os_sleep_ns(UINT64_C(100000));
         }
         /* Seeking stops as soon as the requested LF is found, including
          * before the target chunk is globally counted. Its offset itself is
          * the proof; only a proven EOF may clamp the requested line. */
         while (lineidx_building(b->index)) {
             (void)lineidx_poll(b->index);
-            nanosleep(&(struct timespec){0, 100000}, NULL);
+            os_sleep_ns(UINT64_C(100000));
         }
         start = target.value;
         lineidx_result total = lineidx_line_count(b->index);
@@ -957,6 +960,10 @@ int editor_poll_sources(editor *e)
     /* (G) existing maintenance batch, unchanged from the epoll loop. */
     uint32_t events[16]; size_t event_count = 0;
     if (editor_wait_ready(&e->poll_set, 0, events, 16, &event_count) != OS_OK) return EDITOR_ERR_IO;
+#if defined(_WIN32)
+    for(size_t at=0;at<event_count;at++) if(events[at]==EDITOR_WAIT_D3D11)
+        (void)d3d11_notify_latency_ready(e->backend);
+#endif
     for (size_t at = 0; at < event_count; at++) if (events[at] == EDITOR_WAIT_CLOSE) {
 #if defined(_WIN32)
         os_wake_drain(e->cfg.close_wake);

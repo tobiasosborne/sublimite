@@ -19,6 +19,7 @@ os_err editor_wait_add_handle(editor_wait_set *set, void *handle, uint32_t tag)
         if (set->tags[i] == tag || set->sources[i] == handle) return OS_E_EXIST;
     }
     if (set->count == EDITOR_WAIT_CAP) return OS_E_NOSPC;
+    set->consumed[set->count]=false;
     set->sources[set->count] = handle; set->tags[set->count++] = tag;
     return OS_OK;
 }
@@ -31,9 +32,15 @@ os_err editor_wait_remove(editor_wait_set *set, uint32_t tag)
     if (!set) return OS_E_INVAL;
     for (size_t i = 0; i < set->count; i++) if (set->tags[i] == tag) {
         set->count--; set->sources[i] = set->sources[set->count]; set->tags[i] = set->tags[set->count];
+        set->consumed[i]=set->consumed[set->count];
         break;
     }
     return OS_OK;
+}
+void editor_wait_consumed(void *ctx, void *handle)
+{
+    editor_wait_set *set=ctx;
+    for(size_t i=0;i<set->count;i++) if(set->sources[i]==handle) { set->consumed[i]=true; break; }
 }
 size_t editor_wait_handles(void *ctx, void **handles, size_t capacity)
 {
@@ -47,18 +54,20 @@ os_err editor_wait_ready(editor_wait_set *set, int timeout_ms,
 {
     if (!set || !tags || !capacity || !count) return OS_E_INVAL;
     *count = 0;
-    if (timeout_ms && set->count) {
+    bool pending = false;
+    for (size_t i = 0; i < set->count; i++) pending |= set->consumed[i];
+    if (timeout_ms && set->count && !pending) {
         DWORD result = WaitForMultipleObjects((DWORD)set->count, set->sources, FALSE,
                                               timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
         if (result == WAIT_FAILED) return OS_E_IO;
         if (result == WAIT_TIMEOUT) return OS_OK;
-    } else if (timeout_ms && !set->count) {
+    } else if (timeout_ms && !set->count && !pending) {
         Sleep(timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
     }
     for (size_t i = 0; i < set->count && *count < capacity; i++) {
-        DWORD result = WaitForSingleObject(set->sources[i], 0);
+        DWORD result = set->consumed[i] ? WAIT_OBJECT_0 : WaitForSingleObject(set->sources[i], 0);
         if (result == WAIT_FAILED) return OS_E_IO;
-        if (result == WAIT_OBJECT_0) tags[(*count)++] = set->tags[i];
+        if (result == WAIT_OBJECT_0) { tags[(*count)++] = set->tags[i]; set->consumed[i]=false; }
     }
     return OS_OK;
 }

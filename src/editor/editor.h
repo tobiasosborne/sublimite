@@ -52,11 +52,7 @@ typedef struct editor_config {
     /* Optional: the session lease journal_session_create already holds for
      * journal_path. Borrowed; open duplicates it, so the caller may close its
      * descriptor at any time after editor_open returns. */
-#if defined(_WIN32)
     const os_file *session_lease;
-#else
-    const int *session_lease;
-#endif
     /* Optional nonblocking signalfd for termination, borrowed until close.
      * Caller blocks its signals before starting workers; the UI requests the
      * same clean close as a window close when this descriptor is readable. */

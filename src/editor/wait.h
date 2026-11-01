@@ -10,7 +10,7 @@
 typedef enum editor_wait_tag {
     EDITOR_WAIT_POOL = 1, EDITOR_WAIT_JOURNAL, EDITOR_WAIT_STARTUP,
     EDITOR_WAIT_CONFIG, EDITOR_WAIT_IPC, EDITOR_WAIT_CLOSE,
-    EDITOR_WAIT_FILE, EDITOR_WAIT_RASTER
+    EDITOR_WAIT_FILE, EDITOR_WAIT_RASTER, EDITOR_WAIT_D3D11
 } editor_wait_tag;
 typedef struct editor_wait_set {
 #if !defined(_WIN32)
@@ -18,6 +18,7 @@ typedef struct editor_wait_set {
     int sources[EDITOR_WAIT_CAP];
 #else
     void *sources[EDITOR_WAIT_CAP];
+    bool consumed[EDITOR_WAIT_CAP];
 #endif
     uint32_t tags[EDITOR_WAIT_CAP];
     size_t count;
@@ -37,6 +38,7 @@ os_err editor_wait_ready(editor_wait_set *set, int timeout_ms,
 /* Native shared file-watch service (manual-reset event), never owned here. */
 os_err editor_wait_add_handle(editor_wait_set *set, void *handle, uint32_t tag);
 /* Callback for plat_config. Returns SIZE_MAX if capacity is insufficient. */
+void editor_wait_consumed(void *set, void *handle);
 size_t editor_wait_handles(void *set, void **handles, size_t capacity);
 #else
 /* Native signalfd, shared file-watch and raster completion descriptors. */

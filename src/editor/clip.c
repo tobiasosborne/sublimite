@@ -1,5 +1,5 @@
 #include "editor/private.h"
-#include "x11/clip.h"
+#include "editor/clip_storage.h"
 #include "trace/trace.h"
 #include <string.h>
 #include <time.h>
@@ -25,7 +25,7 @@ typedef struct clip_job {
 } clip_job;
 struct editor_clip {
     edit_arena arena;
-    pthread_mutex_t mutex;
+    os_mutex mutex;
     bool ready, waiting, cutting, hitting, cluster_live, primary_waiting;
     bool cut_line;
     uint64_t cut_off, cut_len;
@@ -57,12 +57,12 @@ static void *clip_alloc(void *ctx, size_t bytes)
         if (capacity > SIZE_MAX / 2 || bin + 1 == EDITOR_PIECE_BINS) return NULL;
         capacity *= 2; bin++;
     }
-    pthread_mutex_lock(&c->mutex);
+    os_mutex_lock(&c->mutex);
     clip_block *block = c->free[bin];
     if (block) c->free[bin] = block->next;
     else block = edit_arena_alloc(&c->arena, capacity, _Alignof(clip_block));
     if (block) block->bin = bin;
-    pthread_mutex_unlock(&c->mutex);
+    os_mutex_unlock(&c->mutex);
     return block ? block + 1 : NULL;
 }
 static void clip_free(void *ctx, void *ptr, size_t bytes)
@@ -71,16 +71,16 @@ static void clip_free(void *ctx, void *ptr, size_t bytes)
     if (!ptr) return;
     editor_clip *c = ctx;
     clip_block *block = (clip_block *)ptr - 1;
-    pthread_mutex_lock(&c->mutex);
+    os_mutex_lock(&c->mutex);
     block->next = c->free[block->bin]; c->free[block->bin] = block;
-    pthread_mutex_unlock(&c->mutex);
+    os_mutex_unlock(&c->mutex);
 }
 int editor_clip_init(editor *e)
 {
     editor_clip *c = edit_arena_alloc(&e->arena, sizeof *c, _Alignof(editor_clip));
     if (!c) return EDITOR_ERR_MEMORY;
     memset(c, 0, sizeof *c); e->clipboard = c;
-    if (pthread_mutex_init(&c->mutex, NULL)) return EDITOR_ERR_MEMORY;
+    if (os_mutex_init(&c->mutex)) return EDITOR_ERR_MEMORY;
     c->ready = true;
     /* Reservation derives from the platform's existing live-byte admission
      * bound: owned transport + editor receive staging. (P) Each received LF
@@ -173,8 +173,7 @@ void editor_clip_stop(editor *e)
     /* Shutdown only: snapshots pin buffer arenas until physical completion. */
     while (!work_handle_finished(&e->pool, c->primary.handle) ||
            !work_handle_finished(&e->pool, c->command.handle)) {
-        struct timespec pause = {0, 1000000}; /* same close-time poll as open.c */
-        (void)nanosleep(&pause, NULL);
+        (void)os_sleep_ns(UINT64_C(1000000));
     }
     clear_job(e, &c->primary); clear_job(e, &c->command);
     piece_snapshot_release(c->desired); c->desired = NULL;
@@ -184,7 +183,7 @@ void editor_clip_close(editor *e)
     editor_clip *c = e->clipboard;
     if (!c) return;
     x11_clip_buf_free(c->owned[PLAT_CLIP_CLIPBOARD]); x11_clip_buf_free(c->owned[PLAT_CLIP_PRIMARY]);
-    if (c->ready) pthread_mutex_destroy(&c->mutex);
+    if (c->ready) os_mutex_destroy(&c->mutex);
     edit_arena_free(&c->arena); e->clipboard = NULL;
 }
 static int copy_small(editor *e, uint64_t off, size_t len, bool primary)

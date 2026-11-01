@@ -67,7 +67,9 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     uint64_t startup_ns = trace_now_ns();
     /* edit-m25u: one open file holds one descriptor, and a desktop launch
      * starts at soft 1024. An optimisation: a failure keeps today's limit. */
+#if !defined(_WIN32)
     (void)os_fd_limit_raise(NULL);
+#endif
     trace_init(); (void)trace_thread_register();
     trace_record_at(startup_ns, TRACE_T0_INGRESS, 0);
     trace_record_at(startup_ns, TRACE_STARTUP_PROCESS_START, 0);
@@ -148,11 +150,7 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     if (editor_make_directory(journal_path, NULL, NULL)) { perror("sublimite: journal directory"); goto startup_fail; }
     char journal_dir[sizeof journal_path];
     memcpy(journal_dir, journal_path, sizeof journal_dir);
-#if defined(_WIN32)
     os_file session_lease = OS_FILE_INIT;
-#else
-    int session_lease = -1;
-#endif
     ipc_token initial_token = 0;
     if (args.request.wait) {
         if (!owns_server) {
@@ -189,22 +187,14 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     }
     /* edit-cxo: the lease is held before the session name is visible, so a
      * concurrently starting instance's housekeeping cannot retire it. */
-#if defined(_WIN32)
     int created = journal_session_create_file(journal_dir, journal_path, sizeof journal_path, &session_lease);
-#else
-    int created = journal_session_create(journal_dir, journal_path, sizeof journal_path, &session_lease);
-#endif
     if (created != JOURNAL_OK) {
         fprintf(stderr, "sublimite: cannot create session journal in %s\n", journal_dir); goto startup_fail;
     }
     os_stat placeholder;
     if (os_stat_path(journal_path, OS_STAT_NOFOLLOW, &placeholder) != OS_OK) {
         (void)os_unlink(journal_path);
-#if defined(_WIN32)
         (void)journal_session_release_file(journal_path, &session_lease); os_file_close(&session_lease);
-#else
-        (void)journal_session_release(journal_path, session_lease); close(session_lease);
-#endif
         goto startup_fail;
     }
     render_backend backend = {0};
@@ -277,6 +267,12 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     if (!rc) rc = editor_open(&e, &config, &backend);
     if (!rc) rc = editor_open_request(e, &args.request, initial_token);
     ipc_args_fini(&args);
+#if defined(_WIN32)
+    /* Test-only startup barrier: the HWND exists while worker init pumps,
+     * before argv acceptance. Posted-input fixtures wait for the real target. */
+    if(!rc && getenv("SUBLIMITE_TEST_INPUT") && backend.config.platform)
+        (void)SetPropW(plat_native_win32(backend.config.platform),L"SublimiteTestReady",(HANDLE)(uintptr_t)1);
+#endif
     if (!rc) rc = editor_run(e);
     if (e) {
         int flushed = editor_flush_settle(e); /* edit-ivv: bounded JOURNAL_BUSY retry */
@@ -296,12 +292,9 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     if (os_stat_path(journal_path, OS_STAT_NOFOLLOW, &remaining) == OS_OK && remaining.kind == OS_KIND_FILE && !remaining.size &&
         os_identity_equal(&remaining.id, &placeholder.id))
         (void)os_unlink(journal_path);
-#if defined(_WIN32)
-    (void)journal_session_release_file(journal_path, &session_lease); os_file_close(&session_lease);
-#else
-    (void)journal_session_release(journal_path, session_lease); /* no-op if the journal remains */
-    close(session_lease); /* after the placeholder check: still ours throughout */
-#endif
+    (void)journal_session_release_file(journal_path, &session_lease);
+    os_file_close(&session_lease);
+
     /* editor_close joins workers: the trace rings are quiescent here. */
     const char *dump_path = getenv("EDIT_TRACE_DUMP");
     if (dump_path) {
@@ -330,6 +323,15 @@ int main(int argc, char **argv)
 {
 #if defined(_WIN32)
     (void)argc; (void)argv;
+    /* GUI subsystem suppresses Explorer's console. Attach only to an existing
+     * parent console; inherited pipe/file streams keep their CRT descriptors. */
+    bool attached=AttachConsole(ATTACH_PARENT_PROCESS)!=0;
+    if(attached) {
+        if(_fileno(stdout)<0 || _get_osfhandle(_fileno(stdout))==-2 || _get_osfhandle(_fileno(stdout))==-1)
+            (void)freopen("CONOUT$","w",stdout);
+        if(_fileno(stderr)<0 || _get_osfhandle(_fileno(stderr))==-2 || _get_osfhandle(_fileno(stderr))==-1)
+            (void)freopen("CONOUT$","w",stderr);
+    }
     int wide_argc = 0;
     WCHAR **wide = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
     if (!wide || wide_argc <= 0) { if (wide) LocalFree(wide); return 1; }

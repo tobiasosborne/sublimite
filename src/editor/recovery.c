@@ -1,9 +1,5 @@
 /* Startup only: validate and replay before any editor frame is submitted. Keep
  * the prior artifact until a complete recovered checkpoint is durable. */
-/* Unported editor storage in private.h still names pthread types. */
-#if defined(_WIN32)
-#include <pthread.h>
-#endif
 #include "editor/private.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -33,9 +29,6 @@ static bool canonical_path(const char *path, char *out, size_t cap)
     if (os_path_canonical(path, out, cap) != OS_OK) return false;
     path_slashes(out); return true;
 }
-
-/* Portable ownership transfer; the legacy private.h entry remains for Linux. */
-int editor_restore_defer_file(editor *e, const char *directory, const char *source, os_file lease);
 
 /* edit-4da: the cost scan decides which buffers can replay only their ops.
  * COPY/whole-text buffers keep the existing materialised recovery path. */
@@ -1007,25 +1000,14 @@ int editor_session_restore(editor *e)
          * visible (journal_session_create). Share its open file description:
          * a second flock on a new description would conflict with it. Refuse
          * a descriptor that does not guard this journal's lock name. */
-#if defined(_WIN32)
-        /* editor_config still carries the Linux lease API until W2.4d. */
-        return EDITOR_ERR_ARG;
-#else
-        os_stat held, named; os_file lease = OS_FILE_INIT;
-        os_file creator = os_file_from_fd(*e->cfg.session_lease);
-        if (os_file_dup(&lease, &creator) != OS_OK) return EDITOR_ERR_IO;
-        e->session_lock = os_file_fd(&lease);
-        if (os_file_stat(&lease, &held) != OS_OK || os_stat_path(lock_path, 0, &named) != OS_OK ||
+        os_stat held, named;
+        if (os_file_dup(&e->session_lock, e->cfg.session_lease) != OS_OK) return EDITOR_ERR_IO;
+        if (os_file_stat(&e->session_lock, &held) != OS_OK || os_stat_path(lock_path, 0, &named) != OS_OK ||
             !os_identity_equal(&held.id, &named.id)) return EDITOR_ERR_IO;
-#endif
     } else {
         os_file lease = OS_FILE_INIT;
         if (os_file_open(&lease, lock_path, OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_NOFOLLOW) != OS_OK) return EDITOR_ERR_IO;
-#if defined(_WIN32)
         e->session_lock = lease;
-#else
-        e->session_lock = os_file_fd(&lease);
-#endif
         if (os_file_try_lock(&lease, OS_LOCK_EXCLUSIVE) != OS_OK) return EDITOR_ERR_IO;
     }
     e->session_lock_owned = true;
@@ -1065,11 +1047,7 @@ int editor_session_restore(editor *e)
         rc = restore_source(e, directory, previous, &cost);
         cost_fini(&cost);
         /* edit-ivv: a source awaiting the owed checkpoint keeps its lease. */
-#if defined(_WIN32)
         if (!rc && *e->busy_source && !os_file_is_open(&e->busy_source_lease)) e->busy_source_lease = previous_file;
-#else
-        if (!rc && *e->busy_source && e->busy_source_lease < 0) e->busy_source_lease = os_file_fd(&previous_file);
-#endif
         else os_file_close(&previous_file);
         if (rc) return rc;
         if (e->busy_checkpoint) return 0; /* edit-ivv: later sources stay discoverable */
@@ -1092,10 +1070,5 @@ void editor_recovery_owed_done(editor *e)
         if (os_dir_open(&dir, directory) == OS_OK) { (void)os_dir_sync(&dir); os_dir_close(&dir); }
         e->busy_source[0] = 0;
     }
-#if defined(_WIN32)
     os_file_close(&e->busy_source_lease);
-#else
-    os_file lease = os_file_from_fd(e->busy_source_lease); os_file_close(&lease);
-    e->busy_source_lease = -1; /* (P) no descriptor */
-#endif
 }

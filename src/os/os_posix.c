@@ -641,6 +641,13 @@ os_err os_path_canonical(const char *path, char *out, size_t cap)
     if (!realpath(path, tmp)) return fail();
     return copy_out(out, cap, tmp, strlen(tmp));
 }
+os_err os_host_name(char *out, size_t cap)
+{
+    if (!out || !cap) return OS_E_INVAL;
+    if (gethostname(out, cap)) return errno==ENAMETOOLONG ? OS_E_RANGE : fail();
+    if (!memchr(out, 0, cap)) return OS_E_RANGE;
+    return OS_OK;
+}
 os_err os_cwd(char *out, size_t cap)
 {
     if (!out || !cap) return fail_with(OS_E_RANGE);

@@ -3,10 +3,6 @@
  * a build step). docs/decisions/edit-fi2.md. Nothing here runs on the typing
  * path: the tick runs in source maintenance (editor_poll_sources), the copy
  * is one WORK_BULK job on the journal pool, and the UI never waits for it. */
-/* Unported editor storage in private.h still names pthread types. */
-#if defined(_WIN32)
-#include <pthread.h>
-#endif
 #include "editor/private.h"
 #include <string.h>
 

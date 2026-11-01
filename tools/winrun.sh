@@ -15,7 +15,7 @@
 # WINRUN_ISOLATION=none runs on the live desktop: only by hand, with Tobias's word.
 set -u
 export WINRUN_ISOLATION="${WINRUN_ISOLATION:-station}"
-export WSLENV="WINRUN_ISOLATION:OS_TEST_CASE:OS_TEST_DATA_REPARSE:SUBLIMITE_TEST_PYTHON:SUBLIMITE_TEST_CORPUS${WSLENV:+:$WSLENV}"
+export WSLENV="SUBLIMITE_PROFILE:WINRUN_ISOLATION:OS_TEST_CASE:OS_TEST_DATA_REPARSE:SUBLIMITE_TEST_PYTHON:SUBLIMITE_TEST_CORPUS${WSLENV:+:$WSLENV}"
 [ $# -ge 1 ] || { echo "usage: winrun.sh <exe> [args...]" >&2; exit 2; }
 export SUBLIMITE_TEST_CORPUS="$(wslpath -w "${EDIT_CORPUS:-/tmp/edit-corpus}")"
 exe=$(readlink -f "$1"); shift

@@ -326,7 +326,7 @@ static int startup_window(void)
     int other=open(lock,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600); T(other>=0);
     T(flock(other,LOCK_EX|LOCK_NB)!=0); close(other); /* red: lease free for others */
     render_backend backend={0}; T(render_null_backend(&backend)==0);
-    editor_config config={.journal_path=path,.start_empty=true,.session_lease=&lease}; editor *e=NULL;
+    editor_config config={.journal_path=path,.start_empty=true,.session_lease = &(os_file){.fd=lease}}; editor *e=NULL;
     T(editor_open(&e,&config,&backend)==0);
     T(close(lease)==0); /* the editor holds its own duplicate of the lease */
     other=open(lock,O_RDWR|O_CLOEXEC|O_NOFOLLOW); T(other>=0);
@@ -336,7 +336,7 @@ static int startup_window(void)
     char stray[sizeof path]; int wrong=-1;
     T(journal_session_create(root,stray,sizeof stray,&wrong)==0);
     char second[sizeof path]; int held=-1; T(journal_session_create(root,second,sizeof second,&held)==0);
-    config.journal_path=second; config.session_lease=&wrong; e=NULL;
+    config.journal_path=second; config.session_lease = &(os_file){.fd=wrong}; e=NULL;
     int rc=editor_open(&e,&config,&backend); if(e) editor_close(e); T(rc!=0);
     T(close(wrong)==0); T(close(held)==0);
     T(cleanup(root)==0); return 0;

@@ -7,10 +7,6 @@
  * acquisition (mapped for large files), applies the program when the original
  * is attached, swaps the result into the placeholder's tab and checkpoints it.
  * The UI thread never reads the journal; it copies only journalled bytes. */
-/* Unported editor storage in private.h still names pthread types. */
-#if defined(_WIN32)
-#include <pthread.h>
-#endif
 #include "editor/private.h"
 #include <errno.h>
 #include <stdatomic.h>

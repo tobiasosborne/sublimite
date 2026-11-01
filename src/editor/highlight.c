@@ -44,7 +44,7 @@ void editor_hl_close(editor *e)
     editor_highlight *h=&e->hl;
     if (h->snapshot) {
         work_cancel(&e->pool,h->handle);
-        while (!work_handle_finished(&e->pool,h->handle)) sched_yield(); /* quiescent close only */
+        while (!work_handle_finished(&e->pool,h->handle)) os_yield(); /* quiescent close only */
         release(e);
     }
     hl_query_destroy(&h->query); hl_worker_destroy(&h->worker);

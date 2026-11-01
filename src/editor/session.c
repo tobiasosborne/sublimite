@@ -1,9 +1,5 @@
 /* Published immutable session graph. Save input pins a root and selected
  * snapshot; complete checkpoint encoding and all filesystem work are bulk jobs. */
-/* Unported editor storage in private.h still names pthread types. */
-#if defined(_WIN32)
-#include <pthread.h>
-#endif
 #include "editor/private.h"
 #include "trace/trace.h"
 #include <stdlib.h>
