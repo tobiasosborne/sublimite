@@ -171,6 +171,7 @@ install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/subli
 	install -d "$(PREFIX)/bin" "$(PREFIX)/share/applications" "$(PREFIX)/share/icons/hicolor/scalable/apps"
 	install -m 755 $(B)/sublimite "$(PREFIX)/bin/sublimite"
 	install -m 755 $(B)/tools/tracedump "$(PREFIX)/bin/tracedump"
+	@if command -v wslpath >/dev/null; then install -m 755 tools/sublimite-win "$(PREFIX)/bin/sublimite-win"; fi
 	install -m 644 tools/sublimite.desktop "$(PREFIX)/share/applications/sublimite.desktop"
 	install -m 644 tools/sublimite.svg "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
 	@set -e; for s in $(ICON_SIZES); do install -d "$(PREFIX)/share/icons/hicolor/$${s}x$$s/apps"; install -m 644 tools/icons/sublimite-$$s.png "$(PREFIX)/share/icons/hicolor/$${s}x$$s/apps/sublimite.png"; done
@@ -180,7 +181,7 @@ install: $(B)/sublimite $(B)/tools/tracedump tools/sublimite.desktop tools/subli
 	@printf '%s\n' 'Installed:' "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
 
 uninstall:
-	rm -f "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
+	rm -f "$(PREFIX)/bin/sublimite" "$(PREFIX)/bin/tracedump" "$(PREFIX)/bin/sublimite-win" "$(PREFIX)/share/applications/sublimite.desktop" "$(PREFIX)/share/icons/hicolor/scalable/apps/sublimite.svg"
 	rm -f $(foreach s,$(ICON_SIZES),"$(PREFIX)/share/icons/hicolor/$(s)x$(s)/apps/sublimite.png")
 	@if command -v update-desktop-database >/dev/null; then if test -d "$(PREFIX)/share/applications"; then update-desktop-database "$(PREFIX)/share/applications"; fi; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
 	@if command -v gtk-update-icon-cache >/dev/null; then if test -d "$(PREFIX)/share/icons/hicolor"; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; fi; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
@@ -255,11 +256,13 @@ endif
 check: $(TEST_SAN) $(B)/tools/replay
 	@$(SAFE_DISPLAY); DISPLAY=$$d $(CHECK_RUNNER) --display $(DISPLAY_TEST_SAN) -- $(TEST_SAN)
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
+	@echo "== tools/test_sublimite_win.sh"; sh tools/test_sublimite_win.sh
 	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
 
 check-serial: $(TEST_SAN) $(B)/tools/replay
 	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; case " $(DISPLAY_TEST_SAN) " in *" $$t "*) DISPLAY=$$d sh tools/with_display_lock.sh $$t;; *) DISPLAY=$$d $$t;; esac; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
+	@echo "== tools/test_sublimite_win.sh"; sh tools/test_sublimite_win.sh
 	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
 
 # Shell contract tests that need release benches (slow, ~1 min): run on demand.

@@ -1,0 +1,88 @@
+#!/bin/bash
+# sublimite-win [options] [--] [path[:line[:col]] ...] [-]
+# WSL launcher for the native Windows build (windows-port.md §5.4, PRD §6.1).
+# `sublimite` stays the Linux build. Every file argument is translated with
+# `wslpath -w` and handed to sublimite.exe, which does its own :line:col parsing
+# (src/ipc/args.c). Nothing is written, no background job is started: the exe is
+# exec'd, so its exit status (--wait) and its stdin ("-") are the launcher's.
+#
+# Suffix rule, matching src/ipc/args.c: a name that exists exactly as given
+# (lstat, so a dangling symlink counts) is a file and never a coordinate; only a
+# truly absent name has up to two trailing ":<digits>" parts peeled off.
+# Paths are made absolute and resolved like args.c does (realpath -m: existing
+# prefix physically, the rest lexically). A path that does not exist yet has its
+# deepest existing ancestor translated and the remainder appended with "\".
+# Options: --font-file takes a path (PATH[#INDEX]) and is translated; every other
+# option and the "--" marker pass through unchanged.
+# Exe lookup: $SUBLIMITE_WIN_EXE; the per-user install
+# /mnt/c/Users/<u>/AppData/Local/Programs/sublimite/sublimite.exe when exactly
+# one user has it (found by looking at the filesystem, no Windows process is
+# started); build/win/rel/sublimite.exe of the repo this script lives in.
+set -u
+die() { echo "sublimite-win: $*" >&2; exit 127; }
+command -v wslpath >/dev/null 2>&1 || die "wslpath not found (this launcher is for WSL)"
+command -v realpath >/dev/null 2>&1 || die "realpath not found"
+
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+exe=${SUBLIMITE_WIN_EXE:-}
+if [ -z "$exe" ]; then
+    found=(); shopt -s nullglob
+    for c in /mnt/c/Users/*/AppData/Local/Programs/sublimite/sublimite.exe; do found+=("$c"); done
+    shopt -u nullglob
+    if [ "${#found[@]}" -eq 1 ]; then exe=${found[0]}
+    elif [ "${#found[@]}" -gt 1 ]; then die "several per-user installs found; set SUBLIMITE_WIN_EXE"
+    else exe=${self%/*}/../build/win/rel/sublimite.exe; fi
+fi
+[ -f "$exe" ] || die "sublimite.exe not found at '$exe' (set SUBLIMITE_WIN_EXE, install it, or run 'make TARGET=win all')"
+
+# win_path <path-without-suffix>: sets $REPLY.
+win_path() {
+    local p=$1 abs q rest="" w
+    case $p in /*) abs=$p;; *) abs=$PWD/$p;; esac
+    abs=$(realpath -m -- "$abs"; echo x); abs=${abs%x}; abs=${abs%$'\n'}
+    q=$abs
+    while [ ! -e "$q" ] && [ ! -L "$q" ]; do
+        rest="/${q##*/}$rest"; q=${q%/*}; [ -n "$q" ] || q=/
+    done
+    w=$(wslpath -w -- "$q" && echo x) || die "wslpath failed for '$q'"
+    w=${w%x}; w=${w%$'\n'}
+    if [ -n "$rest" ]; then w=${w%\\}; rest=${rest//\//\\}; fi
+    REPLY=$w$rest
+}
+# translate <arg> <sep>: peel coordinates (sep ':' ) or #index (sep '#') only when
+# the name is absent; sets $REPLY.
+translate() {
+    local name=$1 sep=$2 tail="" t n
+    if [ -n "$name" ] && [ ! -e "$name" ] && [ ! -L "$name" ]; then
+        for n in 1 2; do
+            [ "$sep" = '#' ] && [ "$n" = 2 ] && break
+            t=${name##*"$sep"}
+            case $t in ''|*[!0-9]*) break;; esac
+            [ "$t" = "$name" ] && break
+            tail="$sep$t$tail"; name=${name%"$sep$t"}
+        done
+    fi
+    [ -n "$name" ] || { REPLY=$1; return; }
+    win_path "$name"; REPLY=$REPLY$tail
+}
+
+args=(); opts=1
+while [ $# -gt 0 ]; do
+    a=$1; shift
+    if [ "$opts" = 1 ] && [ "$a" = "--" ]; then args+=("$a"); opts=0; continue; fi
+    if [ "$a" = "-" ]; then args+=("$a"); continue; fi
+    if [ "$opts" = 1 ]; then
+        case $a in
+        --font-file=*) translate "${a#--font-file=}" '#'; args+=("--font-file=$REPLY"); continue;;
+        --font-file)
+            args+=("$a")
+            if [ $# -gt 0 ]; then translate "$1" '#'; args+=("$REPLY"); shift; fi
+            continue;;
+        --font-family|--font-fallbacks)
+            args+=("$a"); if [ $# -gt 0 ]; then args+=("$1"); shift; fi; continue;;
+        -*) args+=("$a"); continue;;
+        esac
+    fi
+    translate "$a" ':'; args+=("$REPLY")
+done
+exec "$exe" ${args[@]+"${args[@]}"}
