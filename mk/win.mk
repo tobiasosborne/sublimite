@@ -47,7 +47,11 @@ $(WIN_B)/san/tests/hl_test.exe: WIN_TEST_FLAGS := $(foreach l,$(WIN_HL_OPTIN),$(
 # exceeding PE's default 1 MiB reserve. Match this host's Linux 8192 KiB stack.
 $(WIN_B)/san/tests/layout_test.exe: WIN_TEST_FLAGS := -Wl,--stack,8388608
 WIN_COMPILE_MODULES := base trace work piece undo scroll lineidx layout view utf8 scan find hl journal
-all: $(WIN_TEST_REL)
+WIN_QUIET := $(WIN_B)/tools/win_quiet_run.exe
+all: $(WIN_TEST_REL) $(WIN_QUIET)
+$(WIN_QUIET): tools/win_quiet_run.c
+	@mkdir -p $(@D)
+	$(WIN_CC) $(WIN_WARN) $(WIN_REL_F) $< -luser32 -static -o $@
 $(WIN_TEST_REL) $(WIN_TEST_SAN): mk/win.mk
 # Objects reached only through pattern rules would be intermediates and deleted after each link.
 .SECONDARY: $(WIN_REL_OBJ) $(WIN_SAN_OBJ) $(WIN_MANIFEST_OBJ)
@@ -201,7 +205,7 @@ $(WIN_B)/rel/tests/journal_ack_test.exe $(WIN_B)/san/tests/journal_ack_test.exe:
 # (WOF reparse tag) file that tools/win_reparse_fixture.sh creates as a Windows
 # process under a per-run %TEMP%\sublimite-test-reparse-<id> and removes afterwards.
 # tools/winrun.sh forwards OS_TEST_CASE and OS_TEST_DATA_REPARSE through WSLENV.
-check: $(WIN_TEST_REL) $(WIN_TEST_SAN)
+check: $(WIN_TEST_REL) $(WIN_TEST_SAN) $(WIN_QUIET)
 	@set -e; fx=$$(tools/win_reparse_fixture.sh create); printf "reparse fixture: %s\n" "$$fx"; \
 	  trap "tools/win_reparse_fixture.sh remove \"$$fx\"" EXIT; status=0; \
 	  for t in $(WIN_TEST_REL) $(WIN_TEST_SAN); do \

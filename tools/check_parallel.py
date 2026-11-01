@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket as socketlib
 import subprocess
 import sys
 import time
@@ -49,6 +50,21 @@ class Task:
 class Interrupted(Exception):
     def __init__(self, signum):
         self.signum = signum
+
+
+def x_server_ready(number):
+    """True once display :number accepts connections. Under WSLg /tmp/.X11-unix is
+    a read-only mount, so Xvfb binds only its abstract socket and no path appears."""
+    if Path(f"/tmp/.X11-unix/X{number}").exists():
+        return True
+    probe = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    try:
+        probe.connect(f"\0/tmp/.X11-unix/X{number}")
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 def interrupt(signum, _frame):
@@ -168,7 +184,7 @@ class Runner:
                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
             self.servers.append((process, log))
             deadline = time.monotonic() + STARTUP_SECONDS
-            while not socket.exists():
+            while not x_server_ready(number):
                 raise_if_interrupted()
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError(f"Xvfb {display} did not become ready:\n{tail(log)}")
