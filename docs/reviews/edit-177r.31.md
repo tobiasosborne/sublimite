@@ -1,0 +1,15 @@
+No actionable BLOCKER, MAJOR, or MINOR findings. Reviewed `main...HEAD` statically; edited nothing and ran no build, test, or application executable.
+
+- **Reentry:** [editor.c:1276](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/editor/editor.c:1276) holds only scalar control state across the ordinary pump. No layout/buffer/render borrow, arena mark, input iterator, or journal transaction remains on that stack. Nested turns skip native dispatch. `e->error` propagates through source polling; `pump_stopped` affects accounting. Backend initialization/shutdown waits use separate callbacks without `on_modal_turn`, protecting their stack-owned lifecycle state.
+
+- **Ordering:** [win32_plat.c:917](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/win32/win32_plat.c:917) removes platform events before delivering them; nested turns consume the existing editor FIFO through its normal clipboard, save, undo, and journal gates. I found no double dispatch or mutation replay. Admitted commands can now advance tab closes and editor prompts during a hold; they retain the ordinary command ordering.
+
+- **Quit/close:** [win32_plat.c:573](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/win32/win32_plat.c:573) requests modal cancellation before delivering close/session-close. That suppresses the nested turn until modality unwinds. [editor.c:1239](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/editor/editor.c:1239) also defers final close settlement. Event/work callbacks use the separate turn-stop operation; actual editor quit/error paths still call `plat_quit`. I found no missed turn-stop conversion in backend/init waits.
+
+- **D3D/watchdog:** Rendering callbacks cannot recursively run another editor turn; resize requires an inactive backend, and synchronous rebuild is deferred. Same-thread DXGI window-message delivery is supported by [Microsoft’s documented threading model](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/dxgi-best-practices). [d3d11_win.c:101](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/d3d11/d3d11_win.c:101) excludes the hold, then clears `native_modal` on the first observation after release and restores the ordinary three-second deadline. It does not permanently disable recovery.
+
+- **Timer/buttons:** [win32_plat.c:501](/home/tobiasosborne/Projects/sublimite/.wt/-s28/src/win32/win32_plat.c:501) schedules full turns every 10 ms during an idle hold; CPU cost is unmeasured. Exit kills the timer, and the depth check ignores residual timer messages, which [KillTimer can leave queued](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-killtimer). Caption mouse messages still reach `DefWindowProc`; I found no remaining cancellation route that defeats the buttons. Physical tracking and visible presentation remain unverified.
+
+- **Linux:** No behavior change found; the callback addition and changed control paths are Windows-only.
+
+safe to merge: yes
