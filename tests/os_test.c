@@ -249,6 +249,7 @@ static void case_clocks(void)
     uint64_t cpu0 = os_thread_cpu_ns(), guard = os_now_ns() + HANG_GUARD_NS;
     volatile uint64_t spin = 0;
     while (os_thread_cpu_ns() == cpu0 && os_now_ns() < guard) spin++;
+    (void)spin;
     CHECK(os_thread_cpu_ns() > cpu0);
     /* ...and not while sleeping. (P) 50 ms is above Windows' default
      * 15.625 ms scheduler tick (1/64 s), so a tick-quantised thread clock
@@ -340,10 +341,10 @@ static void rheld_body(void *arg)
     os_rmutex_unlock(r->m);
 }
 
-static os_once once_flag = OS_ONCE_INIT;
+static os_once once_ctl = OS_ONCE_INIT;
 static _Atomic int once_runs;
 static void once_body(void) { atomic_fetch_add(&once_runs, 1); os_sleep_ns(MS); }
-static void once_thread(void *arg) { (void)arg; os_once_run(&once_flag, once_body); }
+static void once_thread(void *arg) { (void)arg; os_once_run(&once_ctl, once_body); }
 
 static os_mutex static_mutex = OS_MUTEX_INIT;
 
@@ -403,7 +404,7 @@ static void case_threads(void)
 
     os_thread o[4];
     for (int i = 0; i < 4; i++) OK(os_thread_start(&o[i], once_thread, NULL));
-    os_once_run(&once_flag, once_body);
+    os_once_run(&once_ctl, once_body);
     for (int i = 0; i < 4; i++) OK(os_thread_join(&o[i]));
     CHECK(atomic_load(&once_runs) == 1);
 

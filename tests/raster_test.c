@@ -238,8 +238,7 @@ static int blend_exact_test(void)
 }
 
 static unsigned char *visits;
-static uint32_t visit_last;
-static void visit(void *u, uint32_t row) { (void)u; visits[row]++; visit_last = row; }
+static void visit(void *u, uint32_t row) { (void)u; visits[row]++; }
 static int partition_test(void)
 {
     visits = malloc(512);

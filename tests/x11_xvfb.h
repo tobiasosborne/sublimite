@@ -44,12 +44,27 @@ static int xvfb_explicit_display(char *display, size_t capacity) {
     close(fd);
     return 0;
 }
+/* /usr/bin/Xvfb first (distribution package); otherwise the first Xvfb on PATH
+ * (a user-space install, e.g. monolith's ~/.local/bin/Xvfb, edit-b6ai.1). */
+static char xvfb_path[4096];
+static int xvfb_find(void) {
+    if (access("/usr/bin/Xvfb", X_OK) == 0) { snprintf(xvfb_path, sizeof xvfb_path, "/usr/bin/Xvfb"); return 1; }
+    const char *path = getenv("PATH");
+    while (path && *path) {
+        const char *end = strchr(path, ':');
+        size_t len = end ? (size_t)(end - path) : strlen(path);
+        if (len > 0 && (size_t)snprintf(xvfb_path, sizeof xvfb_path, "%.*s/Xvfb", (int)len, path) < sizeof xvfb_path &&
+            access(xvfb_path, X_OK) == 0) return 1;
+        path = end ? end + 1 : NULL;
+    }
+    return 0;
+}
 static int xvfb_start(void) {
     /* An explicitly selected safe display is already owned by the caller. */
     const char *display = getenv("DISPLAY"), *requested = getenv("EDIT_DISPLAY");
     if (display && requested && !strcmp(display, ":99") && !strcmp(requested, ":99"))
         return 1;
-    if (access("/usr/bin/Xvfb", X_OK) != 0) return 0;
+    if (!xvfb_find()) return 0;
     char explicit_display[32] = "";
     if (access("/tmp/.X11-unix", W_OK) != 0 &&
         !xvfb_explicit_display(explicit_display, sizeof explicit_display)) return 0;
@@ -66,9 +81,9 @@ static int xvfb_start(void) {
         /* Explicit selection permits a partial listener set (abstract only);
          * automatic -displayfd selection requires the pathname socket too. */
         if (*explicit_display)
-            execl("/usr/bin/Xvfb", "Xvfb", explicit_display, "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
+            execl(xvfb_path, "Xvfb", explicit_display, "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
         else
-            execl("/usr/bin/Xvfb", "Xvfb", "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
+            execl(xvfb_path, "Xvfb", "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
         _exit(127);
     }
     close(fds[1]);

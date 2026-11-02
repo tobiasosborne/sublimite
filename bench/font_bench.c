@@ -101,6 +101,7 @@ int main(int argc, char **argv)
     bench_samples s;
     bench_samples_init(&s, samples_buf, N_OPS);
     volatile uint32_t sink = 0;
+    (void)sink; /* read-only sink keeps the stores live (gcc 16 -Wunused-but-set-variable) */
     int failed = 0, raster_failures = 0, raster_valid = 0;
     {   /* warm up, then law-2 gate: zero libc mallocs across the whole timed loop */
         edit_arena_mark_t wm = edit_arena_mark(&a);

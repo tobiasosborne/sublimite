@@ -28,6 +28,7 @@ int main(void) {
         void *b = edit_pool_get(&p);
         EDIT_ASSERT(b != NULL);
         sink ^= (uintptr_t)b;
+        (void)sink;
         EDIT_ASSERT(edit_pool_put(&p, b));
         samples[i] = now_ns() - t0;
     }

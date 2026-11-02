@@ -914,6 +914,7 @@ int main(int argc, char **argv)
         if (!m) fail_fast("mapping failed or fixture size changed");
         volatile uint8_t sink = 0;
         for (uint64_t o = 0; o < n; o += 4096) sink ^= m[o];
+        (void)sink;
         bench_samples_init(&sm, buf, 256);
         for (int r = 0; r < reps; r++) {
             flat f = { m, n };

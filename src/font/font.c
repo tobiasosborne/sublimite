@@ -747,25 +747,11 @@ int font_glyph_ui_metrics(const font_t *f, uint32_t cp, font_metric *out)
     return FONT_OK;
 }
 
-/* by_id: cp is a glyph id (worker path only, never with ui). */
-static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int ui, int by_id)
+/* Rasterises glyph g into a bitmap of out's size from arena. Split from
+ * raster_glyph so the setjmp lives in a function with no status locals
+ * (gcc 16 -Wclobbered); gcc never inlines a function that calls setjmp. */
+static int raster_glyph_draw(font_t *f, int g, edit_arena *arena, font_bitmap *out, int ui)
 {
-    int g = 0;
-    if (!f || !arena || !out || !f->data || f->px == 0 || (ui && by_id)) return FONT_ERR_ARG;
-    out->pixels = NULL;
-    out->w = 0;
-    out->h = 0;
-    memset(&out->m, 0, sizeof out->m);
-    int r = by_id ? glyph_checked(f, cp, &g) : glyph_of(f, cp, &g);
-    if (r != FONT_OK) return r;
-    if (f->glyf_len && !ui) { /* UI admission below performs the bounded proof. */
-        int budget = FONT_COMPOSITE_BUDGET;
-        if (!shape_ok(f, (uint32_t)g, 0, &budget, NULL)) return FONT_ERR_INIT;
-    }
-    r = ui ? font_glyph_ui_metrics(f, cp, &out->m) : metrics_of_glyph(f, g, &out->m, 0);
-    if (r != FONT_OK) { out->m.w = out->m.h = 0; return r; }
-    out->w = out->m.w;
-    out->h = out->m.h;
     if (out->w == 0 || out->h == 0) return FONT_OK;
     if ((size_t)out->w > SIZE_MAX / out->h) return FONT_ERR_NOMEM;
     edit_arena_mark_t start = edit_arena_mark(arena);
@@ -834,6 +820,29 @@ static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *
     out->pixels = px;
     return FONT_OK;
 }
+
+/* by_id: cp is a glyph id (worker path only, never with ui). */
+static int raster_glyph(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out, int ui, int by_id)
+{
+    int g = 0;
+    if (!f || !arena || !out || !f->data || f->px == 0 || (ui && by_id)) return FONT_ERR_ARG;
+    out->pixels = NULL;
+    out->w = 0;
+    out->h = 0;
+    memset(&out->m, 0, sizeof out->m);
+    int r = by_id ? glyph_checked(f, cp, &g) : glyph_of(f, cp, &g);
+    if (r != FONT_OK) return r;
+    if (f->glyf_len && !ui) { /* UI admission below performs the bounded proof. */
+        int budget = FONT_COMPOSITE_BUDGET;
+        if (!shape_ok(f, (uint32_t)g, 0, &budget, NULL)) return FONT_ERR_INIT;
+    }
+    r = ui ? font_glyph_ui_metrics(f, cp, &out->m) : metrics_of_glyph(f, g, &out->m, 0);
+    if (r != FONT_OK) { out->m.w = out->m.h = 0; return r; }
+    out->w = out->m.w;
+    out->h = out->m.h;
+    return raster_glyph_draw(f, g, arena, out, ui);
+}
+
 
 #if defined(_WIN32)
 int font_raster_glyph_stb(font_t *f, uint32_t cp, edit_arena *arena, font_bitmap *out)

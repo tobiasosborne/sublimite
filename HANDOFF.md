@@ -1,3 +1,20 @@
+# HANDOFF — sublimité, session 29 on monolith (2026-11-02; Opus 5.5 coordinator, Tobias present)
+
+## Read first (session 30)
+
+**New box: monolith** (Omarchy 4 alpha = Arch + Hyprland Wayland, 36 CPUs, no battery, gcc 16 / clang 23). Everything needed is installed in user space (Xvfb, fonts, llvm-mingw, bd); after a reboot restart `Xvfb :99 -screen 0 2880x1800x24 -dpi 100 -nolisten tcp -noreset` and rebuild /tmp/edit-corpus (tmpfs). Record: `docs/worklog/2026-11-02.md`. Never run `bd init` here without checking git: it auto-commits scaffolding.
+
+**New line of work: epic edit-b6ai, Omarchy fit and Wayland first-class.** Tobias: fit Omarchy's styling, "as long as speed and perf are not affected", "active support for x11, wayland, windows". Decisions and research links are in the epic; research in `docs/design/omarchy-2026-11-02/`.
+
+**Next, in order (Tobias agreed to start these next session, in parallel):**
+1. **edit-b6ai.1** (in progress): make check is 114/117 here. undo_test and savectl_test fail from transparent hugepages = always (a real footprint issue on Arch kernels; MADV_NOHUGEPAGE for pools); keys_test vs libxkbcommon 1.13. Notes on the bead.
+2. **edit-b6ai.2**: follow the Omarchy palette live (colors.toml; muted needs a contrast-preserving mix; caret on accent).
+3. **edit-b6ai.5**: Wayland bring-up on Hyprland; needs Tobias to use it. sublimité runs under XWayland today (dispatch.c:22 prefers DISPLAY).
+
+The Windows items from session 28 below still stand (branch wt/edit-177r.32-s28 waits on a full Windows check on Spiral, on Tobias's word).
+
+---
+
 # HANDOFF — sublimité, session 28 on Spiral (2026-11-01; Opus 5.5 coordinator, Tobias at the desktop)
 
 ## Read first (session 29)
