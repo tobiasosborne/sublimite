@@ -191,6 +191,10 @@ typedef struct render_config {
     struct work_pool *workers;  /* borrowed; CPU MT4 jobs use WORK_RASTER */
     render_hooks hooks;          /* NULL functions use trace defaults */
     uint32_t max_region_width, max_region_height; /* init-only pixel reserve */
+    /* CPU (RASTER_POOL) per-frame cell admission. Zero or less than
+     * RASTER_FRAME_CELL_LIMIT keeps that floor; the editor raises it to the
+     * cells covering its largest reserved client (edit-b6ai.16). */
+    size_t max_frame_cells;
     /* INIT runs concurrently with a visible bootstrap backend. It must not
      * present diagnostic frames to that window. GL arms its private Present
      * subscription and validates the first real frame after UI adoption. */

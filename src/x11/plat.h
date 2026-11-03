@@ -117,6 +117,10 @@ typedef struct plat {
 typedef struct plat_display_info {
     double dpi;
     uint32_t work_width, work_height;
+    /* Largest client the window can reach (edit-b6ai.16): per-axis maximum
+     * over connected active outputs (X11 RandR CRTCs; Wayland outputs in
+     * the selected buffer scale). Zero = unknown; use the work area. */
+    uint32_t max_width, max_height;
 } plat_display_info;
 /* INIT only: X resources/active RandR output/EWMH work area, or Wayland
  * current output DPI and physical buffer dimensions. Returns PLAT_* errors. */

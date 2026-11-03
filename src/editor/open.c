@@ -160,9 +160,11 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (cols > e->max_cols) e->max_cols = cols;
     if (rows > e->max_rows) e->max_rows = rows;
     if (e->max_cols > 8192 || e->max_rows > 8192) { rc = EDITOR_ERR_ARG; goto fail; }
-#if defined(_WIN32)
     /* (P) ceil(maximum client / initial cell): a partial edge cell still
-     * needs a column/row reservation. Startup prepays every current monitor. */
+     * needs a column/row reservation. Startup prepays the largest output
+     * the platform reported (edit-b6ai.16: X11 and Wayland too, not only
+     * Windows; the fixed 360-column floor ended a 3840 px window at
+     * 360*8 = 2880 px with an 8 px cell). */
     uint32_t client_cols=config->max_window_width/atlas->cell.cell_w+
         (config->max_window_width%atlas->cell.cell_w!=0);
     uint32_t client_rows=config->max_window_height/atlas->cell.cell_h+
@@ -170,7 +172,10 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if(client_cols>e->max_cols) e->max_cols=client_cols;
     if(client_rows>e->max_rows) e->max_rows=client_rows;
     if(e->max_cols>8192 || e->max_rows>8192) { rc=EDITOR_ERR_ARG; goto fail; }
-#endif
+    /* The CPU frame budget (edit-5o0) admits at least the whole largest
+     * client at the startup cell; zoom-out beyond it still clamps rows. */
+    e->frame_cell_limit = (size_t)client_cols * client_rows;
+    if (e->frame_cell_limit < RASTER_FRAME_CELL_LIMIT) e->frame_cell_limit = RASTER_FRAME_CELL_LIMIT;
     e->font.max_width = e->max_cols * atlas->cell.cell_w;
     e->font.max_height = e->max_rows * atlas->cell.cell_h;
     if (config->max_window_width) e->font.max_width = config->max_window_width;
@@ -329,6 +334,7 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         .max_cells = cells, .max_glyphs = font_glyphs, .max_pages = font_pages, .max_atlas_bytes = font_pixels,
         .platform = e->has_platform ? &e->platform : NULL, .workers = &e->pool,
         .max_region_width = map_width, .max_region_height = map_height,
+        .max_frame_cells = e->frame_cell_limit,
         .hooks = {.present_complete = editor_refresh_complete, .user = e}};
     /* Raster rejects Wayland (edit-v0o.1): no raster bootstrap/fallback there;
      * Wayland GL initializes synchronously (strict path). */

@@ -577,7 +577,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
         return RENDER_ERR_UNSUPPORTED;
     if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT ||
         g->page_count > RASTER_FRAME_PAGE_LIMIT ||
-        (size_t)g->dims.cols * g->dims.rows > RASTER_FRAME_CELL_LIMIT) return RENDER_ERR_CAPACITY;
+        (size_t)g->dims.cols * g->dims.rows > raster_frame_cell_limit(&b->config)) return RENDER_ERR_CAPACITY;
     int retire_rc = cpu_retire_jobs(st);
     if (retire_rc != RENDER_OK) return retire_rc;
     cpu_paint_margins(st, b, g);

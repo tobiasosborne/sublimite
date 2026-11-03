@@ -16,10 +16,13 @@ int main(void)
 {
     plat_display_info display;
     T(plat_display_size(PLAT_BACKEND_X11, &display) == 0);
+    /* edit-b6ai.16: the reservation extent is the largest output, never
+     * smaller than the launch work area it contains. */
+    T(display.max_width >= display.work_width && display.max_height >= display.work_height);
     uint32_t width, height;
     editor_runtime_window(display.work_width, display.work_height, &width, &height);
     editor_config config = {.font_dpi = display.dpi, .window_width = width, .window_height = height,
-        .max_window_width = display.work_width, .max_window_height = display.work_height,
+        .max_window_width = display.max_width, .max_window_height = display.max_height,
         .initial = (const uint8_t *)"tatic", .initial_len = sizeof "tatic" - 1};
     render_backend backend = {0}; T(render_cpu_backend(&backend) == 0);
     editor *e = NULL; T(editor_open(&e, &config, &backend) == 0); T(settle(e) == 0);
@@ -35,7 +38,8 @@ int main(void)
     key.keysym = XKB_KEY_equal; T(editor_inject(e, &key) == 0); T(settle(e) == 0);
     key.keysym = XKB_KEY_0; T(editor_inject(e, &key) == 0); T(settle(e) == 0);
     T(editor_grid(e)->dims.cell_h == before.cell_h);
-    printf("x11_font_size_test: DPI %.6f from X resources/physical display; em %u = round(%.1f*DPI/72); window %ux%u = floor(work-area %ux%u * .60,.70); native zoom passed\n",
-        display.dpi, e->font.default_px, EDITOR_FONT_DEFAULT_PT, width, height, display.work_width, display.work_height);
+    printf("x11_font_size_test: DPI %.6f from X resources/physical display; em %u = round(%.1f*DPI/72); window %ux%u = floor(work-area %ux%u * .60,.70); native zoom passed; reserve %ux%u\n",
+        display.dpi, e->font.default_px, EDITOR_FONT_DEFAULT_PT, width, height, display.work_width, display.work_height,
+        display.max_width, display.max_height);
     editor_close(e); return 0;
 }

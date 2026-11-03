@@ -746,8 +746,8 @@ int editor_resize_grid(editor *e, render_dims dims)
     if (dims.cols > cols) dims.cols = cols;
     if (dims.rows > rows_limit) dims.rows = rows_limit;
     if ((e->backend->info.capabilities & RENDER_CAP_RASTER_POOL) &&
-        (size_t)dims.cols * dims.rows > RASTER_FRAME_CELL_LIMIT)
-        dims.rows = RASTER_FRAME_CELL_LIMIT / dims.cols;
+        (size_t)dims.cols * dims.rows > e->frame_cell_limit)
+        dims.rows = (uint32_t)(e->frame_cell_limit / dims.cols);
     /* Recovery resizes the prepaid grids before platform/backend creation.
      * Backend init receives those final dimensions from editor_open. */
     int rc = e->backend->initialized ? render_backend_resize(e->backend, dims) : 0;

@@ -449,6 +449,7 @@ struct editor {
     uint32_t *row_used;
     size_t strip_cap;
     uint32_t max_cols, max_rows;
+    size_t frame_cell_limit; /* raster per-frame cells; open.c, edit-b6ai.16 */
     plat_event queue[EDITOR_INPUT_CAP];
     uint64_t queue_owner[EDITOR_INPUT_CAP], queue_generation[EDITOR_INPUT_CAP];
     size_t queue_head, queue_count;

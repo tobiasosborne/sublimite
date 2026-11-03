@@ -137,8 +137,48 @@ static int restored_window(const char *journal_path, uint32_t width, uint32_t he
     editor_close(capture.e);
     return 0;
 }
+/* edit-b6ai.16 (terra drive 2026-11-03): Xvfb :97 is 3840x2160 at -dpi 52;
+ * EDIT_FONT_SIZE_PT=18 gives em round(18*52/72) = 13 px, so a cell is far
+ * narrower than 3840/360 = 10.67 px and the fixed 360-column floor ended
+ * the grid near x = 360*cell_w. Launch at m3g's 60%/70% default, then
+ * resize to the full reserved display: the grid must cover every whole
+ * cell of it, with no allocation on the resize/paint path (law 2). */
+static int large_low_dpi_window(bool raster_pool)
+{
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    if (raster_pool) backend.info.capabilities |= RENDER_CAP_RASTER_POOL;
+    frame_capture capture = {0};
+    editor_runtime_window(3840, 2160, &capture.width, &capture.height);
+    editor_config cfg = {.font_dpi = 52.0, .font_points = 18.0, .window_width = capture.width,
+        .window_height = capture.height, .window_size_default = true,
+        .max_window_width = 3840, .max_window_height = 2160,
+        .on_submit = submitted, .hook_ctx = &capture};
+    T(editor_open(&capture.e, &cfg, &backend) == 0);
+    T(settle(capture.e) == 0);
+    render_dims dims = editor_grid(capture.e)->dims;
+    T(dims.cols == capture.width / dims.cell_w && dims.rows == capture.height / dims.cell_h);
+    capture.width = cfg.max_window_width; capture.height = cfg.max_window_height;
+    plat_event resize = {.kind = PLAT_EV_RESIZE, .w = capture.width, .h = capture.height};
+    T(editor_inject(capture.e, &resize) == 0);
+    edit_malloc_guard_begin(); T(settle(capture.e) == 0);
+    size_t allocations = edit_malloc_guard_end();
+    if (edit_malloc_guard_active()) T(allocations == 0); /* (G) law 2 */
+    render_dims after = editor_grid(capture.e)->dims;
+    printf("window_size_test: %s 3840x2160 at 52 dpi/18 pt: cell %ux%u grid %ux%u covers %ux%u px\n",
+        raster_pool ? "raster" : "gpu", after.cell_w, after.cell_h, after.cols, after.rows,
+        after.cols * after.cell_w, after.rows * after.cell_h);
+    T(after.cols == capture.width / after.cell_w);
+    T(after.rows == capture.height / after.cell_h);
+    T(backend.config.dims.cols == after.cols && backend.config.dims.rows == after.rows);
+    T(capture.last.cols == after.cols && capture.last.rows == after.rows);
+    editor_close(capture.e);
+    return 0;
+}
 int main(void)
 {
+    T(large_low_dpi_window(false) == 0);
+    T(large_low_dpi_window(true) == 0);
+    puts("window_size_test: low-DPI window resized to the full reserved display uses every whole cell");
     T(sized_window(NULL) == 0);
     puts("window_size_test: configured initial grid, submitted frame and resize passed");
     char root[] = "build/window-size-XXXXXX"; T(mkdtemp(root));

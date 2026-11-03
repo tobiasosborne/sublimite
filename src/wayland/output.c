@@ -59,15 +59,25 @@ int wayland_display_size_on(void *display, wayland_display_info *info)
     /* (P) Registry announcement, then bound-output events: each requires its
      * own roundtrip, since bind requests arise during the first dispatch. */
     if (wl_display_roundtrip(display) < 0 || wl_display_roundtrip(display) < 0 || query.failed) goto done;
+    uint32_t logical_w = 0, logical_h = 0;
     for (output_mode *mode = query.outputs; mode; mode = mode->next) {
         if (!mode->width || !mode->height || mode->scale > INT32_MAX) continue;
+        bool turned = mode->transform == WL_OUTPUT_TRANSFORM_90 || mode->transform == WL_OUTPUT_TRANSFORM_270 ||
+            mode->transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 || mode->transform == WL_OUTPUT_TRANSFORM_FLIPPED_270;
+        uint32_t w = turned ? mode->height : mode->width, h = turned ? mode->width : mode->height;
+        /* (P) a surface on this output is at most its logical extent. */
+        uint32_t lw = w / mode->scale + (w % mode->scale != 0), lh = h / mode->scale + (h % mode->scale != 0);
+        if (lw > logical_w) logical_w = lw;
+        if (lh > logical_h) logical_h = lh;
         if (result.width && mode->scale < result.scale) continue;
-        result = (wayland_display_info){96.0 * mode->scale, mode->width, mode->height, mode->scale};
-        if (mode->transform == WL_OUTPUT_TRANSFORM_90 || mode->transform == WL_OUTPUT_TRANSFORM_270 ||
-            mode->transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 || mode->transform == WL_OUTPUT_TRANSFORM_FLIPPED_270) {
-            result.width = mode->height; result.height = mode->width;
-        }
+        result = (wayland_display_info){96.0 * mode->scale, w, h, mode->scale, 0, 0};
     }
+    /* (P) wayland.c multiplies configure's logical size by this scale. */
+    if ((uint64_t)logical_w * result.scale <= UINT32_MAX && (uint64_t)logical_h * result.scale <= UINT32_MAX) {
+        result.max_width = logical_w * result.scale; result.max_height = logical_h * result.scale;
+    }
+    if (result.max_width < result.width) result.max_width = result.width;
+    if (result.max_height < result.height) result.max_height = result.height;
     *info = result; rc = PLAT_OK;
 done:
     while (query.outputs) {

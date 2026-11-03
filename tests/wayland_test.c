@@ -145,10 +145,23 @@ static void output_test(void)
     plat_display_info shared;
     assert(plat_display_size(PLAT_BACKEND_WAYLAND, &shared) == PLAT_OK);
     assert(shared.dpi == info.dpi && shared.work_width == info.width && shared.work_height == info.height);
+    assert(info.max_width == info.width && info.max_height == info.height); /* one output */
+    assert(shared.max_width == info.max_width && shared.max_height == info.max_height);
     assert(plat_display_interval_ns(NULL) == 0);
     plat unknown = {.backend = PLAT_BACKEND_WAYLAND};
     assert(plat_display_interval_ns(&unknown) == 0);
     mock_join(child);
+    /* edit-b6ai.16: a second, unity-scale output wider and taller than the
+     * scaled one (fixture: 3 x 5 logical px, distinct axes). The selected
+     * buffer scale stays the higher one; the reservation covers the wide
+     * output at that scale: 3*scale x 5*scale buffer px. */
+    mock_wide_output_w = 3; mock_wide_output_h = 5;
+    child = mock_start_options(true, false, NULL, 0, scale, false);
+    assert(wayland_display_size(&info) == PLAT_OK);
+    assert(info.scale == (uint32_t)scale && info.width == info.scale && info.height == info.scale);
+    assert(info.max_width == 3u * (uint32_t)scale && info.max_height == 5u * (uint32_t)scale);
+    mock_join(child);
+    mock_wide_output_w = mock_wide_output_h = 0;
     child = mock_start_options(true, false, NULL, 0, scale, false);
     plat p; plat_config cfg = {.width = (uint32_t)scale, .height = (uint32_t)scale, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);

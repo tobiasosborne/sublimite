@@ -36,6 +36,8 @@ static int x11_display_size(plat_display_info *size)
     uint32_t width = screen->width_in_pixels, height = screen->height_in_pixels;
     uint32_t mm_w = screen->width_in_millimeters, mm_h = screen->height_in_millimeters;
     int32_t x = 0, y = 0;
+    /* Without RandR outputs the root window is the only output. */
+    uint32_t max_w = width, max_h = height;
     const xcb_query_extension_reply_t *ext = xcb_get_extension_data(c, &xcb_randr_id);
     if (ext && ext->present) {
         xcb_randr_get_output_primary_reply_t *primary = xcb_randr_get_output_primary_reply(c,
@@ -45,6 +47,22 @@ static int x11_display_size(plat_display_info *size)
         if (res) {
             xcb_randr_output_t *outputs = xcb_randr_get_screen_resources_current_outputs(res);
             int count = xcb_randr_get_screen_resources_current_outputs_length(res);
+            /* edit-b6ai.16: reserve for the largest output, per axis, so a
+             * window moved to or resized on a bigger monitor is covered. */
+            uint32_t largest_w = 0, largest_h = 0;
+            for (int i = 0; i < count; i++) {
+                xcb_randr_get_output_info_reply_t *o = xcb_randr_get_output_info_reply(c,
+                    xcb_randr_get_output_info(c, outputs[i], res->config_timestamp), NULL);
+                if (o && o->connection == XCB_RANDR_CONNECTION_CONNECTED && o->crtc) {
+                    xcb_randr_get_crtc_info_reply_t *crtc = xcb_randr_get_crtc_info_reply(c,
+                        xcb_randr_get_crtc_info(c, o->crtc, res->config_timestamp), NULL);
+                    if (crtc && crtc->width > largest_w) largest_w = crtc->width;
+                    if (crtc && crtc->height > largest_h) largest_h = crtc->height;
+                    free(crtc);
+                }
+                free(o);
+            }
+            if (largest_w && largest_h) { max_w = largest_w; max_h = largest_h; }
             /* Prefer the primary, otherwise the first connected active output. */
             for (int pass = 0; pass < 2; pass++) {
                 bool found = false;
@@ -88,6 +106,8 @@ static int x11_display_size(plat_display_info *size)
     size->dpi = editor_runtime_dpi_x11(xft, xwayland, editor_runtime_scale(getenv("EDIT_DISPLAY_SCALE")),
         width, height, mm_w, mm_h);
     size->work_width = width; size->work_height = height;
+    size->max_width = max_w > width ? max_w : width;
+    size->max_height = max_h > height ? max_h : height;
     uint32_t desktop = 0;
     r = property(c, screen->root, "_NET_CURRENT_DESKTOP", XCB_ATOM_CARDINAL);
     if (r && r->type == XCB_ATOM_CARDINAL && r->format == 32 && xcb_get_property_value_length(r) == (int)sizeof desktop)
@@ -116,7 +136,7 @@ int plat_display_size(plat_backend backend, plat_display_info *info)
     if (backend != PLAT_BACKEND_WAYLAND) return PLAT_ERR_FAIL;
     wayland_display_info output;
     int rc = wayland_display_size(&output);
-    if (!rc) *info = (plat_display_info){output.dpi, output.width, output.height};
+    if (!rc) *info = (plat_display_info){output.dpi, output.width, output.height, output.max_width, output.max_height};
     return rc;
 }
 

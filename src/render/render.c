@@ -398,7 +398,7 @@ int render_backend_check(const render_backend *b, const render_grid *g, const re
     if ((b->info.capabilities & RENDER_CAP_RASTER_POOL) &&
         (g->glyph_count > RASTER_FRAME_GLYPH_LIMIT ||
          g->page_count > RASTER_FRAME_PAGE_LIMIT ||
-         (size_t)g->dims.cols * g->dims.rows > RASTER_FRAME_CELL_LIMIT)) return RENDER_ERR_CAPACITY;
+         (size_t)g->dims.cols * g->dims.rows > raster_frame_cell_limit(&b->config))) return RENDER_ERR_CAPACITY;
     size_t bytes;
     rc = render_atlas_validate(g, &bytes);
     if (rc != RENDER_OK) return rc;

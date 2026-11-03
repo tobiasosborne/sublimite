@@ -11,6 +11,9 @@
 typedef struct wayland_display_info {
     double dpi;
     uint32_t width, height, scale;
+    /* Largest output in buffer pixels at the selected scale: per axis,
+     * max over outputs of ceil(mode / output scale) * scale (edit-b6ai.16). */
+    uint32_t max_width, max_height;
 } wayland_display_info;
 /* INIT only: highest-scale current wl_output mode. Physical buffer pixels;
  * DPI = conventional desktop base DPI times the compositor integer scale. */

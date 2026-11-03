@@ -268,8 +268,12 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
     if (!rc && native_size) {
         config.font_dpi = display_size.dpi;
         if (display_size.work_width && display_size.work_height) {
-            config.max_window_width = display_size.work_width;
-            config.max_window_height = display_size.work_height;
+            /* edit-b6ai.16: the launch size follows the work area; the
+             * reservation covers the largest output (decisions/edit-b6ai.16.md). */
+            config.max_window_width = display_size.max_width > display_size.work_width ?
+                display_size.max_width : display_size.work_width;
+            config.max_window_height = display_size.max_height > display_size.work_height ?
+                display_size.max_height : display_size.work_height;
 #if defined(_WIN32)
             int maximum=win32_plat_max_client(&config.max_window_width,&config.max_window_height);
             if(maximum) rc=EDITOR_ERR_IO;

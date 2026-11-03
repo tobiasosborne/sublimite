@@ -786,7 +786,8 @@ int plat_display_size(plat_backend backend, plat_display_info *info)
     if (!monitor || !GetMonitorInfoW(monitor,&mi)) return PLAT_ERR_NO_DISPLAY;
     UINT x=0,y=0;
     if (FAILED(GetDpiForMonitor(monitor,MDT_EFFECTIVE_DPI,&x,&y)) || !x) return PLAT_ERR_FAIL;
-    *info=(plat_display_info){(double)x,(uint32_t)(mi.rcWork.right-mi.rcWork.left),(uint32_t)(mi.rcWork.bottom-mi.rcWork.top)};
+    *info=(plat_display_info){(double)x,(uint32_t)(mi.rcWork.right-mi.rcWork.left),(uint32_t)(mi.rcWork.bottom-mi.rcWork.top),
+        0,0}; /* largest monitor: main.c asks win32_plat_max_client (edit-b6ai.16) */
     return PLAT_OK;
 }
 uint64_t plat_display_interval_ns(const plat *p)

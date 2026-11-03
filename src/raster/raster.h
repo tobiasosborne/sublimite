@@ -31,6 +31,10 @@ bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
 #define RASTER_FRAME_GLYPH_LIMIT 4096u
 #define RASTER_FRAME_PAGE_LIMIT 64u
 #define RASTER_FRAME_CELL_LIMIT 65536u
+/* Effective cell admission: the floor above, or the init-time
+ * render_config.max_frame_cells when larger (edit-b6ai.16). */
+static inline size_t raster_frame_cell_limit(const render_config *c)
+{ return c && c->max_frame_cells > RASTER_FRAME_CELL_LIMIT ? c->max_frame_cells : RASTER_FRAME_CELL_LIMIT; }
 
 /* UI-only diagnostic snapshot. Worker timings arrive through work messages.
  * Times are CLOCK_MONOTONIC ns, durations are explicit; no allocation. */

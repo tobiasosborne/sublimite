@@ -256,6 +256,17 @@ static void mock_bind_output(struct wl_client *client, void *data, uint32_t vers
     wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT, m->output_scale, m->output_scale, 0);
     wl_output_send_scale(r, m->output_scale); wl_output_send_done(r);
 }
+/* edit-b6ai.16: optional second output, unity scale, mode set by the test
+ * before mock_start_options forks (the child inherits it). Zero = absent. */
+static int32_t mock_wide_output_w, mock_wide_output_h;
+static void mock_bind_wide_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_output_interface, (int)version, id);
+    wl_output_send_geometry(r, 0, 0, 0, 0, WL_OUTPUT_SUBPIXEL_UNKNOWN, "mock", "wide", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT, mock_wide_output_w, mock_wide_output_h, 0);
+    wl_output_send_scale(r, 1); wl_output_send_done(r);
+}
 static void mock_client_gone(struct wl_listener *listener, void *data)
 { (void)data; mock_wayland *m = *(mock_wayland **)(listener + 1); wl_display_terminate(m->display); }
 static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, size_t len, int32_t scale, bool no_presentation)
@@ -269,6 +280,8 @@ static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, 
         assert(wl_global_create(m.display, &wl_seat_interface, WL_POINTER_AXIS_VALUE120_SINCE_VERSION, &m, mock_bind_seat));
         if (!m.no_presentation) assert(wl_global_create(m.display, &wp_presentation_interface, 1, &m, mock_bind_presentation));
         if (m.output_scale) assert(wl_global_create(m.display, &wl_output_interface, WL_OUTPUT_SCALE_SINCE_VERSION, &m, mock_bind_output));
+        if (mock_wide_output_w && mock_wide_output_h)
+            assert(wl_global_create(m.display, &wl_output_interface, WL_OUTPUT_SCALE_SINCE_VERSION, &m, mock_bind_wide_output));
         assert(wl_global_create(m.display, &wl_data_device_manager_interface, 1, &m, mock_bind_manager));
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};
