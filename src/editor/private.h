@@ -631,6 +631,8 @@ int editor_replace_end(editor *e, uint64_t target);
 
 void editor_backend_shutdown_sync(editor *, render_backend *);
 int editor_backend_init_sync(editor *e, render_config config, void *state);
+/* Startup diagnostic for a GPU init that the raster fallback replaces. */
+void editor_backend_log_fallback(int rc);
 int editor_backend_start_probe(editor *e, render_backend backend, render_config config, void *state);
 int editor_backend_poll_probe(editor *e);
 void editor_backend_close_probe(editor *e);

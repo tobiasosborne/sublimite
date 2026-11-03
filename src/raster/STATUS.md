@@ -1,5 +1,10 @@
 # raster — P2.5c review harness fixes (edit-e6x.23)
 
+edit-b6ai.6 (2026-11-03): Wayland wl_shm variant of the CPU backend, with a
+private retained image, two release-tracked slots, exact damage and
+frame-callback completion without wp_presentation. See
+docs/decisions/edit-b6ai.6.md. The XShm/Present path is unchanged.
+
 Backend/kernel history: docs/decisions/P2.5.md. Current harness decisions and
 red/green evidence: docs/decisions/P2.5c.md. Backend implementation review work
 belongs to P2.5b; this bead changes no raster/render implementation or header.

@@ -339,8 +339,10 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         .max_region_width = map_width, .max_region_height = map_height,
         .max_frame_cells = e->frame_cell_limit,
         .hooks = {.present_complete = editor_refresh_complete, .user = e}};
-    /* Raster rejects Wayland (edit-v0o.1): no raster bootstrap/fallback there;
-     * Wayland GL initializes synchronously (strict path). */
+    /* Wayland GL initializes synchronously (strict path; its background
+     * init and handover are X11 Present-specific). edit-b6ai.6: when that
+     * init refuses or fails, the reserved wl_shm raster replaces it once,
+     * synchronously, before the first frame (decisions/edit-b6ai.6.md). */
     if (may_fallback && e->platform.backend != PLAT_BACKEND_WAYLAND) {
         render_backend requested = *backend;
         void *gpu_state = state;
@@ -350,7 +352,18 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         trace_record(TRACE_STARTUP_RASTER_FALLBACK, 0);
         rc = editor_backend_init_sync(e, render, state);
         if (!rc) rc = editor_backend_start_probe(e, requested, render, gpu_state);
-    } else rc = editor_backend_init_sync(e, render, state);
+    } else {
+        rc = editor_backend_init_sync(e, render, state);
+        if (rc && may_fallback) {
+            e->stats.backend_init_error = rc;
+            editor_backend_log_fallback(rc);
+            *backend = fallback;
+            state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);
+            if (!state) { rc = EDITOR_ERR_MEMORY; goto fail; }
+            trace_record(TRACE_STARTUP_RASTER_FALLBACK, 0);
+            rc = editor_backend_init_sync(e, render, state);
+        }
+    }
     if (rc) goto fail;
     if (e->has_platform && (backend->info.capabilities & RENDER_CAP_RASTER_POOL)) {
         rc = plat_set_present_events(&e->platform, false); if (rc) goto fail;

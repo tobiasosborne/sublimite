@@ -43,6 +43,9 @@ int connect(int fd, const struct sockaddr *address, socklen_t length)
 #include <sys/eventfd.h>
 #include <poll.h>
 #include "wayland_mock.h"
+#include "raster/raster.h"
+#include "work/work.h"
+#include "trace/trace.h"
 
 typedef struct observed { bool focus, key, release, button, motion, leave, wheel, clip, close, lost, repeat, blink, work, stop_key, priority_key; unsigned wheels; plat *platform; int work_fd; } observed;
 static void observe(void *user, const plat_event *ev)
@@ -63,16 +66,313 @@ static void blink(void *user)
 { observed *o = user; o->blink = true; plat_quit(o->platform); }
 static void work(void *user)
 { observed *o = user; uint64_t ticks; assert(read(o->work_fd, &ticks, sizeof ticks) == sizeof ticks); o->work = true; plat_quit(o->platform); }
-static void presentation_fallback_test(bool require_fallback)
+/* edit-b6ai.6: without wp_presentation a frame arms only its frame callback
+ * and that callback's done is the frame's completion (decisions/edit-b6ai.6.md). */
+static void presentation_fallback_test(void)
 {
+    mock_shm = (mock_shm_options){.enabled = true};
     pid_t child = mock_start_options(true, false, NULL, 0, 0, true);
     plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
     assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK && !plat_present_available(&p));
-    int armed = wayland_frame_arm(&p, 1); /* (P) first nonzero frame identity */
-    if (require_fallback) assert(armed == PLAT_OK);
-    else assert(armed == PLAT_ERR_FAIL);
-    plat_shutdown(&p); mock_join(child);
-    puts("wayland_test: missing wp_presentation is detected; CPU fallback remains unsupported");
+    assert(wayland_shm(&p)); /* the raster fallback's buffer factory */
+    uint32_t id = 1; /* (P) first nonzero frame identity */
+    assert(wayland_frame_arm(&p, id) == PLAT_OK);
+    bool ready = true; uint64_t ns = 0, msc = 1;
+    assert(wayland_frame_result(&p, id, &ready, &ns, &msc) == PLAT_OK && !ready);
+    wl_surface_commit(wayland_surface(&p));
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
+    assert(wayland_frame_result(&p, id, &ready, &ns, &msc) == PLAT_OK && ready && ns && !msc);
+    assert(!wayland_frame_discarded(&p, id));
+    plat_shutdown(&p); mock_join(child); mock_shm = (mock_shm_options){0};
+    puts("wayland_test: missing wp_presentation arms a frame callback whose done completes the frame");
+}
+
+/* ---- edit-b6ai.6: Wayland CPU raster backend over wl_shm --------------- */
+/* (P) Grid: the P2.5 live-pixel fixture of tests/raster_test.c, 4 x 6 cells
+ * of 8 x 16 px = 32 x 96 px, one 8 x 16 glyph page. The surface adds four
+ * buffer px on each axis (36 x 100) so both margins are painted and damaged;
+ * both extents are even so scale 2 divides them. Resize grows each axis by
+ * four more (40 x 104). Reserve: 64 x 128, the raster live fixture's. */
+#define WLR_COLS 4u
+#define WLR_ROWS 6u
+#define WLR_CW 8u
+#define WLR_CH 16u
+#define WLR_W 36u
+#define WLR_H 100u
+#define WLR_RW 40u
+#define WLR_RH 104u
+#define WLR_BACKGROUND 0x203040u /* any opaque RGB distinct from the cell colours */
+typedef struct wlr_fixture {
+    plat p; work_pool pool; render_backend b; void *state; render_config cfg;
+    render_cell cells[WLR_COLS * WLR_ROWS]; uint64_t bits[1]; render_grid g;
+    uint8_t pixels[WLR_CW * WLR_CH]; render_atlas_page page; render_glyph glyph;
+    mock_shm_shared *shared; pid_t child;
+    uint32_t width, height, resize_w, resize_h, device, displayed, last_id; uint64_t t5, t6;
+    bool resized;
+} wlr_fixture;
+static void wlr_device(void *user, uint32_t id, uint64_t ns)
+{ wlr_fixture *f = user; assert(id == f->last_id); f->device++; f->t5 = ns; }
+static void wlr_displayed(void *user, uint32_t id, uint64_t ns)
+{ wlr_fixture *f = user; assert(id == f->last_id); f->displayed++; f->t6 = ns; }
+static void wlr_work(const work_msg *m, void *user)
+{
+    render_event ev = {RENDER_EVENT_WORK, m->generation, 0, m};
+    (void)render_backend_event(user, &ev); /* stale frames report FRAME; ignored */
+}
+static void wlr_complete(void *user, uint32_t id, uint64_t ns, uint64_t msc)
+{ (void)id; (void)ns; (void)msc; wlr_fixture *f = user; assert(raster_poll_completions(&f->b) == RENDER_OK); }
+static void wlr_event(void *user, const plat_event *ev)
+{
+    wlr_fixture *f = user;
+    if (ev->kind == PLAT_EV_RESIZE) { f->resized = true; f->resize_w = ev->w; f->resize_h = ev->h; }
+}
+static void wlr_pump(wlr_fixture *f)
+{
+    (void)work_mailbox_drain(&f->pool, wlr_work, &f->b);
+    plat_callbacks cb = {.ud = f, .on_event = wlr_event, .on_present_complete = wlr_complete};
+    f->p.quit = false; assert(plat_run_for(&f->p, &cb, 1) == PLAT_OK); /* (P) minimum nonzero wait in plat's ms ABI */
+    assert(raster_poll_completions(&f->b) == RENDER_OK);
+}
+static void wlr_compare(wlr_fixture *f)
+{
+    if (f->shared->width != f->width || f->shared->height != f->height)
+        fprintf(stderr, "wayland_test: screen %ux%u, surface %ux%u, commits %u\n", f->shared->width, f->shared->height, f->width, f->height, f->shared->commits);
+    assert(f->shared->width == f->width && f->shared->height == f->height);
+    uint32_t want[WLR_COLS * WLR_CW * WLR_ROWS * WLR_CH];
+    raster_scene scene = {f->cfg.dims, f->cells, &f->glyph, 1, &f->page, 1, 0};
+    for (uint32_t row = 0; row < WLR_ROWS; row++)
+        raster_row_scalar(&scene, want + (size_t)row * WLR_CH * WLR_COLS * WLR_CW, WLR_COLS * WLR_CW, row);
+    size_t bad = 0;
+    for (uint32_t y = 0; y < f->height; y++) for (uint32_t x = 0; x < f->width; x++) {
+        uint32_t expected = x < WLR_COLS * WLR_CW && y < WLR_ROWS * WLR_CH ?
+            want[(size_t)y * WLR_COLS * WLR_CW + x] : WLR_BACKGROUND;
+        if ((f->shared->screen[(size_t)y * f->width + x] & 0xffffffu) != expected) bad++;
+    }
+    if (bad) fprintf(stderr, "wayland_test: %zu raster screen pixels differ\n", bad);
+    assert(!bad);
+}
+/* Present frame id and wait for its completion; returns the post-submit
+ * allocation count (present request marshalling and completion dispatch). */
+static size_t wlr_finish(wlr_fixture *f, uint32_t id)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* (G) editor_test's existing settle deadline */
+    size_t allocations = 0; int rc;
+    for (;;) {
+        edit_malloc_guard_begin(); rc = render_backend_present(&f->b, id); allocations += edit_malloc_guard_end();
+        if (rc != RENDER_ERR_BUSY) break;
+        wlr_pump(f); assert(trace_now_ns() < deadline);
+    }
+    assert(rc == RENDER_OK);
+    while (f->b.active) {
+        edit_malloc_guard_begin(); wlr_pump(f); allocations += edit_malloc_guard_end();
+        assert(trace_now_ns() < deadline);
+    }
+    assert(f->device == f->displayed && f->t6 >= f->t5);
+    return allocations;
+}
+static void wlr_open(wlr_fixture *f, bool presentation, bool present_always, int32_t scale, bool immediate, uint32_t resize_after)
+{
+    memset(f, 0, sizeof *f);
+    f->shared = mmap(NULL, sizeof *f->shared, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert(f->shared != MAP_FAILED);
+    int32_t unit = scale ? scale : 1;
+    mock_shm = (mock_shm_options){.enabled = true, .present_always = present_always, .release_immediately = immediate,
+        .configure_set = true, .configure_w = (int32_t)WLR_W / unit, .configure_h = (int32_t)WLR_H / unit,
+        .resize_after = resize_after, .resize_w = (int32_t)WLR_RW / unit, .resize_h = (int32_t)WLR_RH / unit, .shared = f->shared};
+    f->child = mock_start_options(true, false, NULL, 0, scale, !presentation);
+    plat_config pc = {.width = WLR_W, .height = WLR_H, .work_wake = NULL};
+    assert(plat_init_backend(&f->p, &pc, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    assert(f->p.width == WLR_W && f->p.height == WLR_H);
+    f->width = WLR_W; f->height = WLR_H;
+    assert(wayland_buffer_scale(&f->p) == (uint32_t)unit);
+    plat_event ev; while (plat_poll_event(&f->p, &ev)) { /* retire the mock's startup input */ }
+    assert(!work_pool_init(&f->pool, 1, RASTER_JOBS));
+    for (size_t i = 0; i < sizeof f->pixels; i++) f->pixels[i] = (uint8_t)(i * 7u); /* raster_test's ramp */
+    f->page = (render_atlas_page){f->pixels, sizeof f->pixels, WLR_CW, WLR_CW, WLR_CH};
+    f->glyph = (render_glyph){65, 0, 0, 0, WLR_CW, WLR_CH};
+    f->cfg = (render_config){.dims = {WLR_COLS, WLR_ROWS, WLR_CW, WLR_CH}, .max_width = 64, .max_height = 128,
+        .max_cells = WLR_COLS * WLR_ROWS, .max_glyphs = 1, .max_pages = 1, .max_atlas_bytes = sizeof f->pixels,
+        .platform = &f->p, .workers = &f->pool, .hooks = {wlr_device, wlr_displayed, f}};
+    assert(render_cpu_backend(&f->b) == RENDER_OK);
+    render_backend_info info; assert(render_backend_query(&f->b, &info) == RENDER_OK);
+    f->state = aligned_alloc(info.state_align, (info.state_size + info.state_align - 1u) / info.state_align * info.state_align);
+    assert(f->state);
+    int rc = render_backend_init(&f->b, &f->cfg, f->state, info.state_size);
+    if (rc) fprintf(stderr, "wayland_test: raster init returned %d\n", rc);
+    assert(rc == RENDER_OK);
+    assert(raster_platform_completion(&f->b) && raster_completion_fd(&f->b) < 0);
+    assert(render_grid_init(&f->g, f->cfg.dims, f->cells, WLR_COLS * WLR_ROWS, f->bits, 1) == RENDER_OK);
+    f->g.pages = &f->page; f->g.page_count = 1; f->g.glyphs = &f->glyph; f->g.glyph_count = 1;
+    f->g.surface_background = WLR_BACKGROUND;
+    for (uint32_t i = 0; i < WLR_COLS * WLR_ROWS; i++)
+        f->cells[i] = (render_cell){i % 3 ? 65u : 0u, i % 3 ? 0u : RENDER_NO_SLOT, 0xf0e0d0u - i * 0x010101u, i * 0x050505u,
+            (uint16_t)(i % 5 == 0 ? RENDER_ATTR_UNDERLINE : i % 7 == 0 ? RENDER_ATTR_INVERSE : 0), 0};
+}
+static void wlr_close(wlr_fixture *f)
+{
+    assert(wl_display_roundtrip(wayland_display(&f->p)) >= 0 && !f->shared->held_destroyed);
+    render_backend_shutdown(&f->b); free(f->state);
+    work_pool_shutdown(&f->pool); plat_shutdown(&f->p); mock_join(f->child);
+    munmap(f->shared, sizeof *f->shared); mock_shm = (mock_shm_options){0};
+}
+static void wlr_full(wlr_fixture *f, uint32_t id)
+{
+    f->last_id = id;
+    assert(render_frame_begin(&f->g, id) == RENDER_OK && render_mark_full(&f->g) == RENDER_OK);
+    render_strip full = {0, WLR_ROWS};
+    assert(render_backend_submit(&f->b, &f->g, &full, 1) == RENDER_OK);
+}
+/* One raster run: full frame, ten partial edits (raster_test's disconnected
+ * rows), four caret-only frames, then optionally a surface resize. */
+static void wlr_case(const char *name, bool presentation, bool present_always, int32_t scale, bool immediate, bool resize)
+{
+    /* (P) resize fires after the fifteenth buffer commit: frames 1..15 below. */
+    uint32_t frames = 1u + 10u + 4u;
+    wlr_fixture f; wlr_open(&f, presentation, present_always, scale, immediate, resize ? frames : 0);
+    wlr_full(&f, 1);
+    size_t present_allocs = wlr_finish(&f, 1), typing_allocs = 0;
+    wlr_compare(&f);
+    raster_metrics m; assert(raster_frame_metrics(&f.b, &m) && m.frame_id == 1);
+    uint32_t kind = !presentation ? RASTER_PRESENT_FRAME_CALLBACK : RASTER_PRESENT_FEEDBACK;
+    assert(m.present_kind == kind);
+    uint64_t ust = 1, msc = 1; assert(raster_last_present(&f.b, &ust, &msc));
+    assert(presentation ? msc == 1 : !msc); /* mock feedback sequence is one; no MSC without presentation */
+    uint32_t initial_fg = f.cells[8].fg;
+    for (uint32_t id = 2; id < 12; id++) {
+        render_strip strips[3]; size_t count = 0; f.last_id = id;
+        edit_malloc_guard_begin();
+        f.cells[8].fg = (initial_fg + id * 0x010203u) & 0xffffffu;
+        assert(render_frame_begin(&f.g, id) == RENDER_OK && render_mark_rows(&f.g, 2, 1) == RENDER_OK);
+        if (id % 2 == 0) {
+            f.cells[0].bg = id * 0x030201u; f.cells[20].bg = id * 0x010307u;
+            assert(render_mark_rows(&f.g, 0, 1) == RENDER_OK && render_mark_rows(&f.g, 5, 1) == RENDER_OK);
+        } else {
+            f.cells[12].bg = id * 0x010305u; assert(render_mark_rows(&f.g, 3, 1) == RENDER_OK);
+        }
+        assert(render_dirty_strips(&f.g, strips, 3, &count) == RENDER_OK);
+        int rc = render_backend_submit(&f.b, &f.g, strips, count);
+        typing_allocs += edit_malloc_guard_end(); assert(rc == RENDER_OK);
+        present_allocs += wlr_finish(&f, id);
+        wlr_compare(&f);
+        assert(raster_frame_metrics(&f.b, &m) && m.frame_id == id);
+        assert(m.present_kind == (presentation && !present_always ? RASTER_PRESENT_DISCARDED : kind));
+    }
+    for (uint32_t id = 12; id < 16; id++) {
+        f.last_id = id;
+        assert(render_frame_begin(&f.g, id) == RENDER_OK);
+        f.cells[9].attrs ^= RENDER_ATTR_CURSOR;
+        f.cells[9].fg = (f.cells[9].fg ^ 0x808080u) & 0xffffffu;
+        f.cells[9].bg = (f.cells[9].bg ^ 0x303030u) & 0xffffffu;
+        assert(render_mark_rows(&f.g, 2, 1) == RENDER_OK);
+        render_strip one = {2, 1};
+        raster_set_caret_only(&f.b, true);
+        edit_malloc_guard_begin(); int rc = render_backend_submit(&f.b, &f.g, &one, 1); typing_allocs += edit_malloc_guard_end();
+        assert(rc == RENDER_OK);
+        present_allocs += wlr_finish(&f, id);
+        assert(raster_frame_metrics(&f.b, &m) && m.jobs == 0 && m.inline_cells == 1);
+        wlr_compare(&f);
+    }
+    raster_set_caret_only(&f.b, false);
+    if (edit_malloc_guard_active()) assert(!typing_allocs);
+    /* Release/reuse: release-on-replace alternates two slots; immediate
+     * release reuses the most recently written one. No buffer per frame. */
+    assert(f.shared->commits == frames && f.shared->distinct == (immediate ? 1u : 2u));
+    assert(f.shared->scale == (uint32_t)(scale ? scale : 1));
+    if (resize) {
+        uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* (G) settle deadline as above */
+        while (!f.resized) { wlr_pump(&f); assert(trace_now_ns() < deadline); }
+        assert(f.resize_w == WLR_RW && f.resize_h == WLR_RH && f.p.width == WLR_RW);
+        f.width = f.resize_w; f.height = f.resize_h; /* frames below draw at the new size */
+        for (uint32_t id = 16; id < 18; id++) { wlr_full(&f, id); present_allocs += wlr_finish(&f, id); wlr_compare(&f); }
+        /* (P) each slot recreated once at the new size, as it is next used. */
+        assert(f.shared->distinct == (immediate ? 2u : 4u));
+    }
+    if (resize) frames += 2u; /* (P) frames 16 and 17 at the new size */
+    printf("wayland_test: raster %s passed: frames=%u commits=%u buffers=%u damage_rects=%u releases=%u typing_mallocs=%zu post_submit_mallocs=%zu guard=%s\n",
+        name, frames, f.shared->commits, f.shared->distinct, f.shared->damage_rects, f.shared->releases,
+        typing_allocs, present_allocs, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    wlr_close(&f);
+}
+static void raster_unsupported_test(void)
+{
+    /* No wl_shm global: the raster backend refuses at init. */
+    pid_t child = mock_start(true);
+    plat p; plat_config pc = {.width = WLR_W, .height = WLR_H, .work_wake = NULL};
+    assert(plat_init_backend(&p, &pc, PLAT_BACKEND_WAYLAND) == PLAT_OK && !wayland_shm(&p));
+    work_pool pool; assert(!work_pool_init(&pool, 1, RASTER_JOBS));
+    render_backend b; assert(render_cpu_backend(&b) == RENDER_OK);
+    render_backend_info info; assert(render_backend_query(&b, &info) == RENDER_OK);
+    void *state = aligned_alloc(info.state_align, (info.state_size + info.state_align - 1u) / info.state_align * info.state_align);
+    render_config cfg = {.dims = {WLR_COLS, WLR_ROWS, WLR_CW, WLR_CH}, .max_width = 64, .max_height = 128,
+        .max_cells = WLR_COLS * WLR_ROWS, .max_glyphs = 1, .max_pages = 1, .max_atlas_bytes = WLR_CW * WLR_CH,
+        .platform = &p, .workers = &pool};
+    assert(render_backend_init(&b, &cfg, state, info.state_size) == RENDER_ERR_UNSUPPORTED);
+    free(state); work_pool_shutdown(&pool); plat_shutdown(&p); mock_join(child);
+    puts("wayland_test: raster without wl_shm is unsupported");
+}
+static void raster_test(void)
+{
+    raster_unsupported_test();
+    wlr_case("presentation-feedback", true, true, 0, false, false);
+    wlr_case("presentation-discard", true, false, 0, false, false);
+    wlr_case("no-presentation", false, false, 0, false, false);
+    wlr_case("immediate-release", true, true, 0, true, false);
+    wlr_case("scale-2", true, true, 1 + 1, false, false); /* (P) first integer scale above unity */
+    wlr_case("resize", false, false, 0, false, true);
+    wlr_case("resize-immediate-scale-2", true, true, 1 + 1, true, true);
+}
+/* Editor on the Wayland raster fallback: wp_presentation is absent, so GL
+ * refuses at init and the editor must select raster (no X11 change). The
+ * typing bracket is the editor's own on_ingress -> on_submit (law 2). */
+typedef struct wl_counted { bool active; size_t allocations, frames; } wl_counted;
+static void wl_ingress(void *ctx, uint64_t seq, uint64_t ns)
+{ wl_counted *c = ctx; (void)seq; (void)ns; if (!c->active) { edit_malloc_guard_begin(); c->active = true; } }
+static void wl_submitted(void *ctx, const editor_frame *frame)
+{ wl_counted *c = ctx; (void)frame; if (c->active) { c->allocations += edit_malloc_guard_end(); c->active = false; } c->frames++; }
+static void wl_settle(editor *e)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* (G) editor_test's existing settle deadline */
+    for (;;) {
+        int rc = editor_step(e, 20); assert(rc == EDITOR_OK || rc == EDITOR_MORE); /* editor_test's step slice */
+        editor_stats s = editor_get_stats(e);
+        if (!s.pending && !s.render_active) return;
+        assert(trace_now_ns() < deadline);
+    }
+}
+static void editor_raster_test(void)
+{
+    mock_shm_shared *shared = mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert(shared != MAP_FAILED);
+    mock_shm = (mock_shm_options){.enabled = true, .configure_set = true, .configure_w = 320, .configure_h = 240, .shared = shared};
+    pid_t child = mock_start_options(true, false, NULL, 0, 0, true);
+    render_backend b = {0}; assert(editor_backend_select(&b, NULL) == 0); /* GL, the application default */
+    wl_counted c = {0};
+    editor_config cfg = {.cols = 30, .rows = 6, .raster_fallback = true, .platform_backend = PLAT_BACKEND_WAYLAND,
+        .hook_ctx = &c, .on_ingress = wl_ingress, .on_submit = wl_submitted};
+    editor *e = NULL; int rc = editor_open(&e, &cfg, &b);
+    if (rc) fprintf(stderr, "wayland_test: editor_open on Wayland raster returned %d\n", rc);
+    assert(rc == EDITOR_OK);
+    assert(!strcmp(b.info.name, "cpu-raster") && raster_platform_completion(&b));
+    assert(editor_get_stats(e).backend_init_error == RENDER_ERR_UNSUPPORTED);
+    wl_settle(e);
+    assert(shared->commits && shared->width && shared->height);
+    size_t before = c.allocations; c.allocations = 0;
+    /* (P) editor_test's allocation case: alternating insert/backspace keys,
+     * here one hundred, settled after every key so each frame completes. */
+    for (unsigned i = 0; i < 100; i++) {
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = i % 2 ? XKB_KEY_BackSpace : 'x'};
+        if (!(i % 2)) { ev.utf8[0] = 'x'; ev.utf8_len = 1; }
+        assert(editor_inject(e, &ev) == EDITOR_OK);
+        wl_settle(e);
+    }
+    assert(!c.active);
+    if (c.allocations) fprintf(stderr, "wayland_test: editor raster allocation diagnostic: allocations=%zu\n", c.allocations);
+    if (edit_malloc_guard_active()) assert(!c.allocations);
+    uint32_t commits = shared->commits;
+    editor_close(e); mock_join(child);
+    printf("wayland_test: editor on Wayland without wp_presentation fell back to raster: startup_bracket=%zu typing_mallocs=%zu frames=%zu commits=%u guard=%s\n",
+        before, c.allocations, c.frames, commits, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
 }
 static void submitted(void *user, const editor_frame *frame)
 { (void)frame; *(bool *)user = true; }
@@ -334,10 +634,10 @@ static void socket_path_test(void)
 int main(int argc, char **argv)
 {
 #ifdef EDIT_HAVE_WAYLAND_SERVER
-    /* (P) program name plus one acceptance-probe argument. This opt-in probe
-     * stays red until the separately required Wayland CPU renderer exists. */
+    /* (P) program name plus one acceptance-probe argument: the edit-1zm probe,
+     * green since edit-b6ai.6 (frame-callback completion + wl_shm raster). */
     if (argc == 1 + 1 && !strcmp(argv[1], "--require-presentation-fallback")) {
-        presentation_fallback_test(true); return 0;
+        presentation_fallback_test(); raster_test(); return 0;
     }
 #else
     (void)argc; (void)argv;
@@ -360,7 +660,9 @@ int main(int argc, char **argv)
     plat_shutdown(&p);
     puts("wayland_test: selection and headless lifecycle passed");
 #ifdef EDIT_HAVE_WAYLAND_SERVER
-    presentation_fallback_test(false);
+    presentation_fallback_test();
+    raster_test();
+    editor_raster_test();
     allocation_test();
     output_test();
     protocol_test();

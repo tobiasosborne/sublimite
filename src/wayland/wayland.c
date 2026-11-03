@@ -61,6 +61,7 @@ typedef struct wayland_state {
     wayland_offer *offers, *selection, *drag;
     struct wp_presentation *presentation;
     struct wp_presentation_feedback *feedback;
+    struct wl_shm *shm; /* edit-b6ai.6: raster buffer factory */
     struct wl_callback *frame;
     uint32_t compositor_name, shell_name, seat_name, presentation_name;
     uint32_t pending_width, pending_height, scale;
@@ -423,6 +424,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         wl_seat_add_listener(s->seat, &seat_listener, s);
     } else if (!strcmp(interface, "wl_data_device_manager") && !s->manager) {
         s->manager = wl_registry_bind(registry, name, &wl_data_device_manager_interface, 1);
+    } else if (!strcmp(interface, "wl_shm") && !s->shm) {
+        s->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1); /* (P) v1 suffices: XRGB8888 is mandatory */
     } else if (!strcmp(interface, "wp_presentation") && !s->presentation) {
         s->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1); s->presentation_name = name;
         wp_presentation_add_listener(s->presentation, &presentation_listener, s);
@@ -501,10 +504,17 @@ void *wayland_display(const plat *p) { return W(p) ? W(p)->conn : NULL; }
 bool wayland_present_available(const plat *p) { return W(p) && W(p)->present_ok; }
 void *wayland_egl_window(const plat *p) { return W(p) ? W(p)->window : NULL; }
 void *wayland_surface(const plat *p) { return W(p) ? W(p)->surface : NULL; }
+void *wayland_shm(const plat *p) { return W(p) ? W(p)->shm : NULL; }
+uint32_t wayland_buffer_scale(const plat *p) { return W(p) ? W(p)->scale : 1; }
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
 {
     (void)time; wayland_state *s = data;
-    if (s->frame == callback) { s->frame_ready = true; s->frame = NULL; }
+    if (s->frame == callback) {
+        s->frame_ready = true; s->frame = NULL;
+        /* edit-b6ai.6: no wp_presentation, so done is the completion. Its
+         * time is this dispatch: the server's ms stamp has no stated epoch. */
+        if (!s->presentation) { s->presented_ns = trace_now_ns(); s->msc = 0; s->displayed = true; s->notify = true; }
+    }
     wl_callback_destroy(callback);
 }
 static const struct wl_callback_listener frame_listener = {.done = frame_done};
@@ -542,12 +552,13 @@ void wayland_frame_cancel(plat *p)
 int wayland_frame_arm(plat *p, uint32_t id)
 {
     wayland_state *s = W(p);
-    if (!s || s->failed || !s->presentation || !id || (s->frame_id && !s->displayed && !s->discarded)) return PLAT_ERR_FAIL;
+    if (!s || s->failed || !id || (s->frame_id && !s->displayed && !s->discarded)) return PLAT_ERR_FAIL;
     wayland_frame_cancel(p);
     s->frame_id = id; s->displayed = s->discarded = s->frame_ready = false;
     s->presented_ns = s->msc = 0;
     s->frame = wl_surface_frame(s->surface); if (!s->frame) goto fail;
     wl_callback_add_listener(s->frame, &frame_listener, s);
+    if (!s->presentation) return PLAT_OK; /* frame-callback completion (edit-b6ai.6) */
     s->feedback = wp_presentation_feedback(s->presentation, s->surface); if (!s->feedback) goto fail;
     wp_presentation_feedback_add_listener(s->feedback, &feedback_listener, s);
     return PLAT_OK;
@@ -560,6 +571,10 @@ int wayland_frame_result(plat *p, uint32_t id, bool *ready, uint64_t *ns, uint64
     if (!s || !ready || !ns || !msc || id != s->frame_id || s->failed || s->discarded) return PLAT_ERR_FAIL;
     *ready = s->displayed; *ns = s->presented_ns; *msc = s->msc; return PLAT_OK;
 }
+bool wayland_frame_discarded(const plat *p, uint32_t id)
+{ const wayland_state *s = W(p); return s && id && id == s->frame_id && !s->failed && s->discarded; }
+void wayland_frame_notify(plat *p)
+{ wayland_state *s = W(p); if (s && s->frame_id) s->notify = true; }
 static void clip_result(wayland_state *s, bool ok, uint32_t code)
 { push(s, (plat_event){.kind = PLAT_EV_CLIPBOARD, .clip_ok = ok, .code = code, .clip_which = PLAT_CLIP_CLIPBOARD}); }
 static void blob_unref(wayland_state *s, wayland_blob *blob)
@@ -755,6 +770,7 @@ void wayland_plat_shutdown(plat *p)
         if (s->xdg) xdg_surface_destroy(s->xdg);
         if (s->surface) wl_surface_destroy(s->surface);
         if (s->presentation) wp_presentation_destroy(s->presentation);
+        if (s->shm) wl_shm_destroy(s->shm);
         if (s->shell) xdg_wm_base_destroy(s->shell);
         if (s->compositor) wl_compositor_destroy(s->compositor);
         if (s->registry) wl_registry_destroy(s->registry);
@@ -789,6 +805,10 @@ void *wayland_display(const plat *p) { (void)p; return NULL; }
 bool wayland_present_available(const plat *p) { (void)p; return false; }
 void *wayland_egl_window(const plat *p) { (void)p; return NULL; }
 void *wayland_surface(const plat *p) { (void)p; return NULL; }
+void *wayland_shm(const plat *p) { (void)p; return NULL; }
+uint32_t wayland_buffer_scale(const plat *p) { (void)p; return 1; }
+bool wayland_frame_discarded(const plat *p, uint32_t id) { (void)p; (void)id; return false; }
+void wayland_frame_notify(plat *p) { (void)p; }
 int wayland_frame_arm(plat *p, uint32_t id) { (void)p; (void)id; return PLAT_ERR_FAIL; }
 void wayland_frame_cancel(plat *p) { (void)p; }
 int wayland_frame_result(plat *p, uint32_t id, bool *ready, uint64_t *ns, uint64_t *msc)

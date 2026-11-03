@@ -425,6 +425,15 @@ static bool gpu_pending(const editor *e)
 static void platform_complete(void *ctx, uint32_t serial, uint64_t ust, uint64_t msc)
 {
     editor *e = ctx;
+    if (raster_platform_completion(e->backend)) {
+        /* edit-b6ai.6: Wayland raster retires on the platform connection.
+         * A retired frame ends this turn so waiting damage can submit. */
+        bool active = e->backend->active;
+        int rc = raster_poll_completions(e->backend);
+        if (rc && !e->error) e->error = rc;
+        if (rc || (active && !e->backend->active)) { e->pump_stopped = true; plat_quit(&e->platform); }
+        return;
+    }
     if (!gpu_pending(e)) return;
     int rc = gl_present_complete(e->backend, serial, ust, msc);
     if (rc && rc != RENDER_ERR_FRAME && rc != RENDER_ERR_STATE) e->error = rc;

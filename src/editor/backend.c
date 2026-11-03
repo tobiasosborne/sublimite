@@ -30,6 +30,7 @@ static void log_probe_failure(int rc)
         rc == RENDER_ERR_ARG ? "invalid GL configuration" : "backend initialization error";
     fprintf(stderr, "sublimite: EGL init failed: %s (code=%d); using raster; no retry\n", reason, rc);
 }
+void editor_backend_log_fallback(int rc) { log_probe_failure(rc); }
 static void init_worker(work_ctx *job)
 {
     editor_backend_init *a = job->arg;

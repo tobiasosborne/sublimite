@@ -282,6 +282,7 @@ static xcb_void_cookie_t transport_region(xcb_connection_t *conn,xcb_xfixes_regi
 #define raster_poll_completions ownership_poll_completions
 #define raster_completion_timeout ownership_completion_timeout
 #define raster_set_caret_only ownership_set_caret_only
+#define raster_platform_completion ownership_platform_completion
 #define work_submit transport_submit
 #define work_submit_batch transport_batch
 #define work_publish transport_publish

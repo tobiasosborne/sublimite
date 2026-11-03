@@ -6,7 +6,8 @@
 #include "render/render.h"
 
 /* Factory: fills b (zeroed or shut-down). init needs config.platform (X11 plat
- * with a window) and config.workers (pool with >= 1 WORK_RASTER worker). */
+ * with a window, or a Wayland plat advertising wl_shm: edit-b6ai.6) and
+ * config.workers (pool with >= 1 WORK_RASTER worker). */
 int render_cpu_backend(render_backend *b);
 
 /* Private completion connection. UI integrates this fd with its existing poll
@@ -22,8 +23,18 @@ int raster_poll_completions(render_backend *b);
 int raster_completion_timeout(const render_backend *b, int requested);
 
 /* UST (us) and MSC of the latest matching-frame Present completion (UI only,
- * valid after that frame's PRESENT_COMPLETE event was routed). */
+ * valid after that frame's PRESENT_COMPLETE event was routed). Wayland: UST
+ * is the completion's CLOCK_MONOTONIC us; MSC is the presentation sequence,
+ * zero for the frame-callback fallback and for discarded feedback. */
 bool raster_last_present(const render_backend *b, uint64_t *ust, uint64_t *msc);
+/* edit-b6ai.6: true for the Wayland wl_shm variant. Its completions arrive
+ * on the platform connection: route plat's on_present_complete (and every
+ * pump turn) to raster_poll_completions; raster_completion_fd stays -1. */
+bool raster_platform_completion(const render_backend *b);
+/* Wayland raster_metrics.present_kind: what retired the frame. */
+#define RASTER_PRESENT_FEEDBACK 0u        /* wp_presentation presented */
+#define RASTER_PRESENT_FRAME_CALLBACK 1u  /* no wp_presentation: frame done */
+#define RASTER_PRESENT_DISCARDED 2u       /* feedback discarded: retired untimed */
 
 #define RASTER_JOBS 4u
 /* Per-frame descriptor budget; larger init storage does not enlarge UI work.

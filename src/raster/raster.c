@@ -3,7 +3,13 @@
  * into a retained off-screen pixmap. present submits that pixmap exactly once.
  * T5: TriggerFence + AwaitFence + QueryFence after the upload/presentation.
  * T6: matching serial/kind PresentCompleteNotify, with pixmap idle before reuse.
- * Workers publish all timing/completion state through the work mailboxes. */
+ * Workers publish all timing/completion state through the work mailboxes.
+ * edit-b6ai.6 Wayland variant: the same strips render into a private retained
+ * image; present copies this frame's damage (plus what the chosen wl_shm slot
+ * missed) into a released slot, attaches it with damage_buffer and commits.
+ * T5: that copy and commit (CPU work is done). T6: wp_presentation presented,
+ * or the frame callback's done without wp_presentation, with a released slot
+ * before retirement (docs/decisions/edit-b6ai.6.md). */
 #include "raster/raster.h"
 #include "base/base.h"
 #include "trace/trace.h"
@@ -23,6 +29,12 @@
 #include <xcb/xcb.h>
 #include <xcb/xcbext.h>
 #include <xcb/xfixes.h>
+#ifdef EDIT_HAVE_WAYLAND
+#include <wayland-client.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
 
 /* edit-5o0 §15 window for a missing completion (inline and fence job), 2 s (G,
  * planning value from edit-5o0, not derived). edit-cee re-bases it at the
@@ -32,7 +44,24 @@ enum { MSG_STRIPS = 1, MSG_FENCE = 2, MSG_PRESENT = 3, MSG_FAIL = 4 };
 typedef struct msg_payload { uint64_t ns, ust, msc; int32_t status; } msg_payload;
 _Static_assert(sizeof(msg_payload) <= WORK_MSG_DATA, "raster message fits mailbox");
 
+/* edit-b6ai.6 (P): two wl_shm slots. wl_buffer.release semantics let the
+ * compositor keep the committed buffer as the surface's content until a later
+ * commit replaces it; the client writes the other slot meanwhile. */
+#define RASTER_WL_SLOTS 2u
+/* (P) Per-frame damage: every strip, or at most two inline cells (the inline
+ * cap below), plus the region and one margin per surface axis. */
+#define RASTER_WL_EXTRA_RECTS (2u + 1u + 2u)
+typedef struct wl_rect { uint32_t x, y, w, h; } wl_rect;
 struct cpu_state;
+typedef struct wl_slot {
+    struct cpu_state *st;
+    struct wl_buffer *buffer;
+    uint32_t *pix;            /* this slot's pixels in the shared pool mapping */
+    int32_t offset;
+    uint32_t width, height;
+    uint64_t written;         /* present sequence that last filled it; 0 = never */
+    bool busy;                /* attached and not yet released */
+} wl_slot;
 typedef struct strip_job { struct cpu_state *st; uint32_t index, njobs; raster_palette palette; } strip_job;
 /* Immutable inputs, initialized before work_submit's mailbox handoff. The
  * worker never reads subsequently written UI fields from cpu_state. */
@@ -93,6 +122,19 @@ typedef struct cpu_state {
     work_handle fence_handle;
     uint64_t last_ust, last_msc;   /* UI-thread copy of the latest Present completion */
     raster_metrics metrics;
+    /* edit-b6ai.6 Wayland wl_shm variant (UI thread except pix, which the
+     * strip jobs write exactly as they write the X11 staging image). */
+    bool wl, wl_waiting;
+    struct plat *platform;
+    struct wl_shm_pool *wl_pool;
+    int wl_fd;
+    void *wl_map;
+    size_t wl_bytes, pix_bytes;
+    wl_slot slots[RASTER_WL_SLOTS];
+    wl_rect *damage, *prev_damage;
+    size_t ndamage, nprev, max_damage;
+    uint64_t present_seq;
+    uint32_t surf_w, surf_h, painted_w, painted_h;
 } cpu_state;
 
 /* Essential acknowledgements must outlive mailbox saturation. UI draining
@@ -299,8 +341,17 @@ static void fence_job_fn(work_ctx *c)
 }
 
 /* ---- ops ---- */
+static void wl_release_native(cpu_state *st);
 static void cpu_release(cpu_state *st)
 {
+    if (st->wl) {
+        wl_release_native(st);
+        free(st->cells); free(st->glyphs); free(st->pages); free(st->strips);
+        free(st->region_pixels); free(st->damage); free(st->prev_damage);
+        memset(st, 0, sizeof *st);
+        st->shmid = -1; st->wl_fd = -1;
+        return;
+    }
     if (st->special) xcb_unregister_for_special_event(st->conn, st->special);
     if (st->conn) {
         if (st->seg) xcb_shm_detach(st->conn, st->seg);
@@ -360,6 +411,88 @@ static void cpu_paint_margins(cpu_state *st, const render_backend *b, const rend
     xcb_flush(st->conn);
 }
 
+/* Backend-owned snapshot storage, shared by the X11 and Wayland variants. */
+static int cpu_snapshot_init(cpu_state *st, const render_config *cfg)
+{
+    st->max_cells = cfg->max_cells; st->max_glyphs = cfg->max_glyphs; st->max_pages = cfg->max_pages;
+    st->max_strips = (size_t)(cfg->max_cells < cfg->max_height ? cfg->max_cells : cfg->max_height) / 2u + 1u;
+    st->cells = calloc(st->max_cells ? st->max_cells : 1, sizeof *st->cells);
+    st->glyphs = calloc(st->max_glyphs ? st->max_glyphs : 1, sizeof *st->glyphs);
+    st->pages = calloc(st->max_pages ? st->max_pages : 1, sizeof *st->pages);
+    st->strips = calloc(st->max_strips, sizeof *st->strips);
+    size_t region_capacity = (size_t)cfg->max_region_width * cfg->max_region_height;
+    if (region_capacity) {
+        st->region_pixels = calloc(region_capacity, sizeof *st->region_pixels);
+        if (!st->region_pixels) return RENDER_ERR_INIT;
+    }
+    if (!st->cells || !st->glyphs || !st->pages || !st->strips) return RENDER_ERR_INIT;
+    st->scene = (raster_scene){cfg->dims, st->cells, st->glyphs, 0, st->pages, 0, st->alpha_or};
+    return RENDER_OK;
+}
+
+#ifdef EDIT_HAVE_WAYLAND
+static void wl_buffer_released(void *data, struct wl_buffer *buffer)
+{
+    (void)buffer; wl_slot *slot = data;
+    slot->busy = false;
+    /* A frame whose completion waits for a free slot retires on this turn. */
+    wayland_frame_notify(slot->st->platform);
+}
+static const struct wl_buffer_listener wl_slot_listener = {.release = wl_buffer_released};
+static void wl_release_native(cpu_state *st)
+{
+    for (uint32_t i = 0; i < RASTER_WL_SLOTS; i++)
+        if (st->slots[i].buffer) wl_buffer_destroy(st->slots[i].buffer);
+    if (st->wl_pool) wl_shm_pool_destroy(st->wl_pool);
+    if (st->platform && wayland_display(st->platform)) (void)wl_display_flush(wayland_display(st->platform));
+    if (st->wl_map) munmap(st->wl_map, st->wl_bytes);
+    if (st->wl_fd >= 0) close(st->wl_fd);
+    if (st->pix) munmap(st->pix, st->pix_bytes);
+}
+/* INIT (any thread: requests only, no events, before UI dispatch adopts the
+ * backend). One memfd pool holds both slots at the reserved extents; the
+ * slots' wl_buffers are created on UI at first use and on surface resize. */
+static int wl_init(cpu_state *st, const render_config *cfg)
+{
+    plat *pl = cfg->platform;
+    struct wl_shm *shm = wayland_shm(pl);
+    st->wl = true; st->wl_fd = -1; st->platform = pl; st->pool = cfg->workers;
+    if (!shm || !wayland_surface(pl)) return RENDER_ERR_UNSUPPORTED;
+    /* XRGB8888 (mandatory format); opaque X keeps ARGB readers opaque too. */
+    st->alpha_or = 0xff000000u;
+    st->max_w = cfg->max_width; st->max_h = cfg->max_height; st->stride_px = cfg->max_width;
+    size_t frame = (size_t)st->max_w * st->max_h * 4u;
+    /* (P) wl_shm_pool size, buffer offset and stride are int32 on the wire. */
+    if (frame > (size_t)INT32_MAX / RASTER_WL_SLOTS || (size_t)st->max_w * 4u > (size_t)INT32_MAX)
+        return RENDER_ERR_UNSUPPORTED;
+    st->wl_bytes = frame * RASTER_WL_SLOTS; st->pix_bytes = frame;
+    void *pix = mmap(NULL, frame, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pix == MAP_FAILED) return RENDER_ERR_INIT;
+    st->pix = pix;
+    for (size_t i = 0; i < (size_t)st->max_w * st->max_h; i++) st->pix[i] = st->alpha_or; /* fault pages in */
+    st->wl_fd = memfd_create("sublimite-raster", MFD_CLOEXEC);
+    if (st->wl_fd < 0 || ftruncate(st->wl_fd, (off_t)st->wl_bytes) != 0) return RENDER_ERR_INIT;
+    void *map = mmap(NULL, st->wl_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, st->wl_fd, 0);
+    if (map == MAP_FAILED) return RENDER_ERR_INIT;
+    st->wl_map = map;
+    st->wl_pool = wl_shm_create_pool(shm, st->wl_fd, (int32_t)st->wl_bytes);
+    if (!st->wl_pool) return RENDER_ERR_INIT;
+    for (uint32_t i = 0; i < RASTER_WL_SLOTS; i++)
+        st->slots[i] = (wl_slot){.st = st, .pix = (uint32_t *)((uint8_t *)map + frame * i), .offset = (int32_t)(frame * i)};
+    int rc = cpu_snapshot_init(st, cfg);
+    if (rc) return rc;
+    st->max_damage = st->max_strips + RASTER_WL_EXTRA_RECTS;
+    st->damage = calloc(st->max_damage, sizeof *st->damage);
+    st->prev_damage = calloc(st->max_damage, sizeof *st->prev_damage);
+    if (!st->damage || !st->prev_damage) return RENDER_ERR_INIT;
+    st->up = true;
+    return RENDER_OK;
+}
+#else
+static void wl_release_native(cpu_state *st) { (void)st; }
+static int wl_init(cpu_state *st, const render_config *cfg) { (void)st; (void)cfg; return RENDER_ERR_UNSUPPORTED; }
+#endif
+
 static int cpu_init(render_backend *b, const render_config *cfg)
 {
     cpu_state *st = b->state;
@@ -373,7 +506,11 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     if (cfg->max_width > UINT16_MAX || cfg->max_height > INT16_MAX ||
         cfg->workers->n_workers <= cfg->workers->n_bulk) return RENDER_ERR_UNSUPPORTED;
     const plat *pl = cfg->platform;
-    if (pl->backend == PLAT_BACKEND_WAYLAND) return RENDER_ERR_UNSUPPORTED;
+    if (pl->backend == PLAT_BACKEND_WAYLAND) {
+        int wl_rc = wl_init(st, cfg);
+        if (wl_rc) cpu_release(st);
+        return wl_rc;
+    }
     st->win = native.window; st->depth = native.depth; st->pool = cfg->workers;
     st->alpha_or = native.depth == 32 ? 0xff000000u : 0u;
     st->max_w = cfg->max_width; st->max_h = cfg->max_height;
@@ -448,19 +585,8 @@ static int cpu_init(render_backend *b, const render_config *cfg)
     st->shmid = -1;
     for (size_t i = 0; i < (size_t)st->max_w * st->max_h; i++) st->pix[i] = st->alpha_or; /* fault pages in */
     /* snapshot storage */
-    st->max_cells = cfg->max_cells; st->max_glyphs = cfg->max_glyphs; st->max_pages = cfg->max_pages;
-    st->max_strips = (size_t)(cfg->max_cells < cfg->max_height ? cfg->max_cells : cfg->max_height) / 2u + 1u;
-    st->cells = calloc(st->max_cells ? st->max_cells : 1, sizeof *st->cells);
-    st->glyphs = calloc(st->max_glyphs ? st->max_glyphs : 1, sizeof *st->glyphs);
-    st->pages = calloc(st->max_pages ? st->max_pages : 1, sizeof *st->pages);
-    st->strips = calloc(st->max_strips, sizeof *st->strips);
-    size_t region_capacity = (size_t)cfg->max_region_width * cfg->max_region_height;
-    if (region_capacity) {
-        st->region_pixels = calloc(region_capacity, sizeof *st->region_pixels);
-        if (!st->region_pixels) { rc = RENDER_ERR_INIT; goto fail; }
-    }
-    if (!st->cells || !st->glyphs || !st->pages || !st->strips) { rc = RENDER_ERR_INIT; goto fail; }
-    st->scene = (raster_scene){cfg->dims, st->cells, st->glyphs, 0, st->pages, 0, st->alpha_or};
+    rc = cpu_snapshot_init(st, cfg);
+    if (rc) goto fail;
     st->up = true;
     return RENDER_OK;
 fail:
@@ -559,13 +685,173 @@ static void upload_cursor_cells(cpu_state *st)
         cell.dims.rows = 1;
         cell.cells = st->cells + at;
         raster_row_sse2(&cell, st->pix + (size_t)y * st->stride_px + x, st->stride_px, 0);
+        if (st->wl) continue; /* present copies the damaged cells into the shm slot */
         xcb_shm_put_image(st->conn, st->pixmap, st->gc,
             (uint16_t)st->max_w, (uint16_t)st->max_h, (uint16_t)x, (uint16_t)y,
             (uint16_t)(cell.dims.cols * d.cell_w), (uint16_t)d.cell_h, (int16_t)x, (int16_t)y,
             st->depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, st->seg, 0);
     }
-    xcb_flush(st->conn);
+    if (!st->wl) xcb_flush(st->conn);
 }
+
+/* ---- edit-b6ai.6 Wayland damage, margins and slots (UI thread) ---- */
+static void wl_damage_add(cpu_state *st, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    /* Clip to the surface: a grid wider than a shrunk window is not shown. */
+    if (x >= st->surf_w || y >= st->surf_h || !w || !h) return;
+    if (w > st->surf_w - x) w = st->surf_w - x;
+    if (h > st->surf_h - y) h = st->surf_h - y;
+    if (st->ndamage < st->max_damage) { st->damage[st->ndamage++] = (wl_rect){x, y, w, h}; return; }
+    /* Unreachable within the (P) capacity above; stay correct regardless. */
+    st->damage[0] = (wl_rect){0, 0, st->surf_w, st->surf_h}; st->ndamage = 1;
+}
+/* Surface size in buffer pixels: the platform's configured size, within the
+ * init reserve, on the buffer-scale grid (wl_surface invalid_size). */
+static void wl_surface_size(cpu_state *st)
+{
+    uint32_t scale = wayland_buffer_scale(st->platform);
+    uint32_t w = st->platform->width < st->max_w ? st->platform->width : st->max_w;
+    uint32_t h = st->platform->height < st->max_h ? st->platform->height : st->max_h;
+    if (!scale) scale = 1;
+    w -= w % scale; h -= h % scale;
+    st->surf_w = w ? w : (scale <= st->max_w ? scale : st->max_w);
+    st->surf_h = h ? h : (scale <= st->max_h ? scale : st->max_h);
+}
+/* edit-u82's disjoint right/bottom margins, painted into the retained image
+ * only when they can have changed: first frame, grid resize, background or
+ * surface size. (P) two axes yield at most two rectangles. */
+static void wl_paint_margins(cpu_state *st, const render_grid *g)
+{
+    uint32_t w = g->dims.cols * g->dims.cell_w, h = g->dims.rows * g->dims.cell_h;
+    bool due = !st->snapshot_valid || st->surface_background != g->surface_background ||
+        st->painted_w != st->surf_w || st->painted_h != st->surf_h;
+    st->surface_background = g->surface_background;
+    st->painted_w = st->surf_w; st->painted_h = st->surf_h;
+    st->margin_damage = false;
+    if (!due) return;
+    wl_rect rects[2]; uint32_t count = 0;
+    if (st->surf_w > w) rects[count++] = (wl_rect){w, 0, st->surf_w - w, st->surf_h};
+    if (st->surf_h > h) rects[count++] = (wl_rect){0, h, st->surf_w < w ? st->surf_w : w, st->surf_h - h};
+    uint32_t color = g->surface_background | st->alpha_or;
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t y = rects[i].y; y < rects[i].y + rects[i].h; y++) {
+            uint32_t *row = st->pix + (size_t)y * st->stride_px + rects[i].x;
+            for (uint32_t x = 0; x < rects[i].w; x++) row[x] = color;
+        }
+        wl_damage_add(st, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
+    }
+    st->margin_damage = count != 0;
+}
+/* This frame's damage after the snapshot: strips or inline cells, region. */
+static void wl_frame_damage(cpu_state *st)
+{
+    const render_dims d = st->scene.dims;
+    if (st->inline_frame) {
+        for (uint32_t i = 0; i < st->inline_count; i++) {
+            uint32_t at = st->inline_at[i];
+            if (st->cells[at].attrs & RENDER_ATTR_WIDE_RIGHT) continue;
+            uint32_t cols = (st->cells[at].attrs & RENDER_ATTR_WIDE_LEFT) ? 2u : 1u;
+            wl_damage_add(st, (at % d.cols) * d.cell_w, (at / d.cols) * d.cell_h, cols * d.cell_w, d.cell_h);
+        }
+    } else for (size_t i = 0; i < st->nstrips; i++)
+        wl_damage_add(st, 0, st->strips[i].first_row * d.cell_h, d.cols * d.cell_w, st->strips[i].row_count * d.cell_h);
+    if (st->region.pixels && st->region.dirty)
+        wl_damage_add(st, st->region.x, st->region.y, st->region.width, st->region.height);
+}
+#ifdef EDIT_HAVE_WAYLAND
+/* Released slot to write next: the most recently filled one needs only this
+ * frame's damage; otherwise the older one also needs the previous frame's. */
+static wl_slot *wl_pick(cpu_state *st)
+{
+    wl_slot *best = NULL;
+    for (uint32_t i = 0; i < RASTER_WL_SLOTS; i++) {
+        wl_slot *slot = &st->slots[i];
+        if (!slot->busy && (!best || slot->written > best->written)) best = slot;
+    }
+    return best;
+}
+static void wl_copy(cpu_state *st, wl_slot *slot, const wl_rect *r)
+{
+    for (uint32_t y = r->y; y < r->y + r->h; y++) {
+        size_t at = (size_t)y * st->stride_px + r->x;
+        memcpy(slot->pix + at, st->pix + at, (size_t)r->w * sizeof *st->pix);
+    }
+}
+static int wl_present(render_backend *b, uint32_t frame_id)
+{
+    cpu_state *st = b->state;
+    if (st->failed) return RENDER_ERR_DEVICE;
+    if (!st->up || !st->have_frame || frame_id != st->frame_id) return RENDER_ERR_STATE;
+    if (st->pending != 0) return RENDER_ERR_BUSY;
+    wl_slot *slot = wl_pick(st);
+    if (!slot) return RENDER_ERR_BUSY; /* completion requires a released slot; unreachable in order */
+    plat *pl = st->platform;
+    struct wl_surface *surface = wayland_surface(pl);
+    st->metrics.present_ns = trace_now_ns();
+    uint64_t seq = ++st->present_seq;
+    if (!slot->buffer || slot->width != st->surf_w || slot->height != st->surf_h) {
+        /* Startup or surface resize: never per frame. The slot is released. */
+        if (slot->buffer) wl_buffer_destroy(slot->buffer);
+        slot->buffer = wl_shm_pool_create_buffer(st->wl_pool, slot->offset, (int32_t)st->surf_w,
+            (int32_t)st->surf_h, (int32_t)(st->stride_px * 4u), WL_SHM_FORMAT_XRGB8888);
+        if (!slot->buffer) { st->failed = true; return RENDER_ERR_DEVICE; }
+        wl_buffer_add_listener(slot->buffer, &wl_slot_listener, slot);
+        slot->width = st->surf_w; slot->height = st->surf_h; slot->written = 0;
+    }
+    if (!slot->written || slot->written + 2u < seq) {
+        wl_rect all = {0, 0, st->surf_w, st->surf_h};
+        wl_copy(st, slot, &all);
+    } else {
+        if (slot->written + 2u == seq) for (size_t i = 0; i < st->nprev; i++) wl_copy(st, slot, &st->prev_damage[i]);
+        for (size_t i = 0; i < st->ndamage; i++) wl_copy(st, slot, &st->damage[i]);
+    }
+    if (wayland_frame_arm(pl, frame_id) != PLAT_OK) { st->failed = true; return RENDER_ERR_DEVICE; }
+    wl_surface_attach(surface, slot->buffer, 0, 0);
+    if (wl_proxy_get_version((struct wl_proxy *)surface) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+        for (size_t i = 0; i < st->ndamage; i++)
+            wl_surface_damage_buffer(surface, (int32_t)st->damage[i].x, (int32_t)st->damage[i].y,
+                (int32_t)st->damage[i].w, (int32_t)st->damage[i].h);
+        /* A commit without damage may never be repainted, so its frame
+         * callback could wait indefinitely: damage one unchanged pixel. */
+        if (!st->ndamage) wl_surface_damage_buffer(surface, 0, 0, 1, 1);
+    } else wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX); /* (P) surface-coordinate whole-surface damage */
+    wl_surface_commit(surface);
+    if (wl_display_flush(wayland_display(pl)) < 0 && errno != EAGAIN) { st->failed = true; return RENDER_ERR_DEVICE; }
+    slot->busy = true; slot->written = seq;
+    wl_rect *swap = st->prev_damage; st->prev_damage = st->damage; st->damage = swap;
+    st->nprev = st->ndamage; st->ndamage = 0;
+    uint64_t done = trace_now_ns();
+    st->metrics.issue_ns = done - st->metrics.present_ns;
+    st->metrics.upload_queued_ns = done;
+    st->have_frame = false; st->wl_waiting = true;
+    /* T5: the CPU finished the pixels and the commit is on the wire. Held by
+     * the adapter until present returns (render.h). */
+    return render_backend_signal(b, RENDER_EVENT_DEVICE_DONE, frame_id, done);
+}
+static int wl_poll(render_backend *b)
+{
+    cpu_state *st = b->state;
+    if (st->failed) return RENDER_ERR_DEVICE;
+    if (!st->wl_waiting || !b->active || !b->presented) return RENDER_OK;
+    plat *pl = st->platform;
+    bool ready = false; uint64_t ns = 0, msc = 0;
+    uint32_t kind = plat_present_available(pl) ? RASTER_PRESENT_FEEDBACK : RASTER_PRESENT_FRAME_CALLBACK;
+    if (wayland_frame_result(pl, st->frame_id, &ready, &ns, &msc) != PLAT_OK) {
+        if (!wayland_frame_discarded(pl, st->frame_id)) { st->failed = true; return RENDER_ERR_DEVICE; }
+        /* Not shown (superseded or hidden): retire without a display time. */
+        ready = true; ns = 0; msc = 0; kind = RASTER_PRESENT_DISCARDED;
+    }
+    if (!ready || !wl_pick(st)) return RENDER_OK; /* the release re-notifies */
+    st->wl_waiting = false; st->fence_done = st->present_done = true;
+    if (!ns) ns = trace_now_ns();
+    st->metrics.present_kind = kind; st->metrics.present_mode = 0; st->metrics.server_ns = ns;
+    st->last_ust = ns / UINT64_C(1000); st->last_msc = msc; /* (P) ns -> us */
+    return render_backend_signal(b, RENDER_EVENT_PRESENT_COMPLETE, st->frame_id, ns);
+}
+#else
+static int wl_present(render_backend *b, uint32_t frame_id) { (void)b; (void)frame_id; return RENDER_ERR_UNSUPPORTED; }
+static int wl_poll(render_backend *b) { (void)b; return RENDER_ERR_UNSUPPORTED; }
+#endif
 
 static int cpu_submit(render_backend *b, const render_grid *g, const render_strip *strips, size_t count)
 {
@@ -573,14 +859,15 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     if (!st->up) return RENDER_ERR_STATE;
     if (st->failed) return RENDER_ERR_DEVICE;
     if (st->have_frame) return RENDER_ERR_BUSY; /* previous frame not yet fully presented */
-    if (g->region.pixels && (g->region.x > INT16_MAX || g->region.y > INT16_MAX))
+    if (!st->wl && g->region.pixels && (g->region.x > INT16_MAX || g->region.y > INT16_MAX))
         return RENDER_ERR_UNSUPPORTED;
     if (count > st->max_strips || g->glyph_count > RASTER_FRAME_GLYPH_LIMIT ||
         g->page_count > RASTER_FRAME_PAGE_LIMIT ||
         (size_t)g->dims.cols * g->dims.rows > raster_frame_cell_limit(&b->config)) return RENDER_ERR_CAPACITY;
     int retire_rc = cpu_retire_jobs(st);
     if (retire_rc != RENDER_OK) return retire_rc;
-    cpu_paint_margins(st, b, g);
+    if (st->wl) { st->ndamage = 0; wl_surface_size(st); wl_paint_margins(st, g); }
+    else cpu_paint_margins(st, b, g);
     st->metrics = (raster_metrics){.frame_id = g->frame_id, .submit_ns = trace_now_ns()};
     st->inline_frame = !g->scroll.origin_y_q8 && inline_cursor_damage(st, g, strips, count);
     if (g->region.pixels) {
@@ -619,6 +906,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     st->fence_done = false; st->present_done = false; st->present_issued = false;
     st->fence_handle = (work_handle){0};
     st->pending = njobs;
+    if (st->wl) wl_frame_damage(st);
     if (st->inline_frame) {
         st->inline_fence = st->inline_present = st->inline_idle = false;
         uint64_t start = trace_now_ns();
@@ -636,6 +924,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
     }
     if (work_submit_batch(st->pool, batch, njobs, st->handles) != 0) {
         st->pending = 0;
+        st->painted_w = 0; /* Wayland: margins painted for a refused frame repaint and re-damage next time */
         return RENDER_ERR_CAPACITY;
     }
     st->nhandles = njobs;
@@ -647,6 +936,7 @@ static int cpu_submit(render_backend *b, const render_grid *g, const render_stri
 static int cpu_present(render_backend *b, uint32_t frame_id)
 {
     cpu_state *st = b->state;
+    if (st->wl) return wl_present(b, frame_id);
     if (st->failed) return RENDER_ERR_DEVICE;
     if (!st->up || !st->have_frame || frame_id != st->frame_id) return RENDER_ERR_STATE;
     if (st->pending != 0) return RENDER_ERR_BUSY;
@@ -724,10 +1014,10 @@ static int cpu_event(render_backend *b, const render_event *event)
     case MSG_STRIPS: {
         if (!st->pending || st->strip_done[p.msc]) return RENDER_ERR_STATE;
         uint64_t upload_start = trace_now_ns();
-        upload_strip(st, (uint32_t)p.msc);
+        if (!st->wl) upload_strip(st, (uint32_t)p.msc);
         st->strip_done[p.msc] = true;
         st->pending--;
-        if (!st->pending) upload_region(st);
+        if (!st->pending && !st->wl) upload_region(st);
         uint64_t queued = trace_now_ns();
         st->metrics.strip_ns[p.msc] = p.ns - p.ust;
         st->metrics.queue_ns[p.msc] = p.ust - st->metrics.submit_ns;
@@ -784,11 +1074,17 @@ int raster_completion_fd(const render_backend *b)
 {
     if (!b || !b->initialized || !b->state || b->ops.init != cpu_init) return -1;
     const cpu_state *st = b->state;
+    if (st->wl) return -1; /* completions arrive on the platform connection */
     /* The legacy full-frame fence worker owns its own connection reads. */
     return st->inline_frame && b->active && b->presented ? xcb_get_file_descriptor(st->conn) : -1;
 }
+bool raster_platform_completion(const render_backend *b)
+{
+    return b && b->initialized && b->state && b->ops.init == cpu_init && ((const cpu_state *)b->state)->wl;
+}
 int raster_poll_completions(render_backend *b)
 {
+    if (raster_platform_completion(b)) return wl_poll(b);
     if (raster_completion_fd(b) < 0) return RENDER_OK;
     cpu_state *st = b->state;
     if (st->failed) return RENDER_ERR_DEVICE;

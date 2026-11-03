@@ -33,6 +33,32 @@ int getsockopt(int fd, int level, int option, void *value, socklen_t *len)
 /* Protocol literals derive from the core and stable XML. Test input uses
  * Linux KEY_A / BTN_LEFT. Sizes derive from literal lengths, not budgets. */
 typedef struct mock_wayland mock_wayland;
+/* edit-b6ai.6: wl_shm raster fixtures. Options are set by the test before
+ * mock_start_options forks (the child inherits them, as mock_wide_output).
+ * The screen is the compositor's damage-driven copy of the surface: each
+ * commit copies only the damaged rectangles of the attached buffer into it,
+ * then asserts the whole buffer equals the screen. A buffer stale outside its
+ * damage, or damage missing a change, therefore fails in the child. The
+ * parent reads the screen through a MAP_SHARED mapping created before fork.
+ * (P) MOCK_SCREEN_PX bounds the largest fixture surface: the editor case's
+ * 320 x 240 configure (tests/wayland_test.c); the raster fixture reserves
+ * 64 x 128 and the backend clamps every buffer to its reserve. */
+#define MOCK_SCREEN_PX (320u * 240u)
+#define MOCK_DAMAGE_CAP 64u /* (E) fixture rect list; overflow damages the whole buffer */
+#define MOCK_BUFFER_CAP 8u  /* (P) distinct buffers: two slots x (initial + resized) x two */
+typedef struct mock_shm_shared {
+    uint32_t commits, distinct, width, height, scale, damage_rects, releases, held_destroyed;
+    uint32_t screen[MOCK_SCREEN_PX];
+} mock_shm_shared;
+typedef struct mock_shm_options {
+    bool enabled, present_always, release_immediately, configure_set;
+    int32_t configure_w, configure_h;      /* logical toplevel size of the first configure */
+    uint32_t resize_after;                 /* buffer commits before a second configure; 0 = none */
+    int32_t resize_w, resize_h;            /* logical size of that configure */
+    mock_shm_shared *shared;
+} mock_shm_options;
+static mock_shm_options mock_shm;
+typedef struct mock_buffer_seen { struct wl_listener gone; struct wl_resource *buffer; mock_wayland *mock; } mock_buffer_seen;
 typedef struct mock_tx {
     mock_wayland *mock; int fd; size_t len;
     uint8_t bytes[sizeof "owned clipboard" - 1]; struct wl_event_source *event;
@@ -45,13 +71,95 @@ struct mock_wayland {
     const uint8_t *payload; size_t payload_len;
     mock_tx tx[2]; /* parallel requests for the two advertised UTF-8 MIME names */
     size_t tx_done; unsigned rx_requests; struct wl_resource *source;
+    /* wl_shm surface state (edit-b6ai.6) */
+    struct wl_resource *pending_buffer, *held;
+    bool attached, damage_full;
+    int32_t scale, pending_scale;
+    int32_t damage[MOCK_DAMAGE_CAP][4]; size_t damage_count;
+    mock_buffer_seen seen[MOCK_BUFFER_CAP];
 };
 static void mock_destroy(struct wl_client *client, struct wl_resource *resource)
 { (void)client; wl_resource_destroy(resource); }
+static void mock_buffer_gone(struct wl_listener *listener, void *data)
+{
+    mock_buffer_seen *seen = wl_container_of(listener, seen, gone); (void)data;
+    /* Legal at teardown, a defect while the backend runs: tests assert the
+     * count before shutting the backend down (wl_buffer.destroy while held). */
+    if (seen->mock->held == seen->buffer) { seen->mock->held = NULL; if (mock_shm.shared) mock_shm.shared->held_destroyed++; }
+    if (seen->mock->pending_buffer == seen->buffer) seen->mock->pending_buffer = NULL;
+    seen->buffer = NULL;
+}
 static void mock_surface_attach(struct wl_client *client, struct wl_resource *r, struct wl_resource *buffer, int32_t x, int32_t y)
-{ (void)client; (void)r; (void)buffer; (void)x; (void)y; }
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    assert(!x && !y); m->pending_buffer = buffer; m->attached = true;
+}
 static void mock_damage(struct wl_client *client, struct wl_resource *r, int32_t x, int32_t y, int32_t w, int32_t h)
-{ (void)client; (void)r; (void)x; (void)y; (void)w; (void)h; }
+{ (void)client; (void)x; (void)y; (void)w; (void)h; ((mock_wayland *)wl_resource_get_user_data(r))->damage_full = true; }
+static void mock_damage_buffer(struct wl_client *client, struct wl_resource *r, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    assert(w > 0 && h > 0);
+    if (m->damage_count == MOCK_DAMAGE_CAP) { m->damage_full = true; return; }
+    int32_t *d = m->damage[m->damage_count++]; d[0] = x; d[1] = y; d[2] = w; d[3] = h;
+}
+static void mock_buffer_scale(struct wl_client *client, struct wl_resource *r, int32_t scale)
+{ (void)client; assert(scale > 0); ((mock_wayland *)wl_resource_get_user_data(r))->pending_scale = scale; }
+static void mock_configure_toplevel(mock_wayland *m, int32_t width, int32_t height)
+{
+    struct wl_array states; wl_array_init(&states);
+    xdg_toplevel_send_configure(m->top, width, height, &states);
+    xdg_surface_send_configure(m->xdg, wl_display_next_serial(m->display));
+    wl_array_release(&states);
+}
+/* Commit of an attached shm buffer: damage-driven screen copy, full-buffer
+ * equality, release policy, distinct-buffer count and the resize trigger. */
+static void mock_commit_buffer(mock_wayland *m)
+{
+    struct wl_resource *br = m->pending_buffer;
+    mock_shm_shared *out = mock_shm.shared;
+    if (m->pending_scale) m->scale = m->pending_scale;
+    int32_t scale = m->scale ? m->scale : 1;
+    if (!br) return;
+    assert(out && mock_shm.enabled);
+    assert(br != m->held); /* never rewritten or re-attached before release */
+    struct wl_shm_buffer *sb = wl_shm_buffer_get(br); assert(sb);
+    int32_t w = wl_shm_buffer_get_width(sb), h = wl_shm_buffer_get_height(sb), stride = wl_shm_buffer_get_stride(sb);
+    uint32_t format = wl_shm_buffer_get_format(sb);
+    assert(format == WL_SHM_FORMAT_XRGB8888 || format == WL_SHM_FORMAT_ARGB8888);
+    assert(w > 0 && h > 0 && w % scale == 0 && h % scale == 0); /* wl_surface invalid_size */
+    assert((uint64_t)w * (uint64_t)h <= MOCK_SCREEN_PX && stride >= w * 4);
+    bool full = m->damage_full || (uint32_t)w != out->width || (uint32_t)h != out->height;
+    out->width = (uint32_t)w; out->height = (uint32_t)h; out->scale = (uint32_t)scale;
+    wl_shm_buffer_begin_access(sb);
+    const uint8_t *data = wl_shm_buffer_get_data(sb);
+    size_t rects = full ? 1u : m->damage_count;
+    for (size_t i = 0; i < rects; i++) {
+        int32_t x0 = full ? 0 : m->damage[i][0], y0 = full ? 0 : m->damage[i][1];
+        int32_t x1 = full ? w : x0 + m->damage[i][2], y1 = full ? h : y0 + m->damage[i][3];
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > w) x1 = w;
+        if (y1 > h) y1 = h;
+        for (int32_t y = y0; y < y1 && x0 < x1; y++)
+            memcpy(out->screen + (size_t)y * (size_t)w + (size_t)x0, data + (size_t)y * (size_t)stride + (size_t)x0 * 4u, (size_t)(x1 - x0) * 4u);
+    }
+    for (int32_t y = 0; y < h; y++)
+        assert(!memcmp(out->screen + (size_t)y * (size_t)w, data + (size_t)y * (size_t)stride, (size_t)w * 4u));
+    wl_shm_buffer_end_access(sb);
+    out->damage_rects += (uint32_t)rects; out->commits++;
+    bool known = false;
+    for (size_t i = 0; i < MOCK_BUFFER_CAP; i++) if (m->seen[i].buffer == br) known = true;
+    for (size_t i = 0; !known && i < MOCK_BUFFER_CAP; i++) if (!m->seen[i].buffer) {
+        m->seen[i] = (mock_buffer_seen){.gone = {.notify = mock_buffer_gone}, .buffer = br, .mock = m};
+        wl_resource_add_destroy_listener(br, &m->seen[i].gone); out->distinct++; known = true;
+    }
+    assert(known);
+    if (mock_shm.release_immediately) { wl_buffer_send_release(br); out->releases++; }
+    else { if (m->held) { wl_buffer_send_release(m->held); out->releases++; } m->held = br; }
+    if (mock_shm.resize_after && out->commits == mock_shm.resize_after)
+        mock_configure_toplevel(m, mock_shm.resize_w, mock_shm.resize_h);
+}
 static void mock_frame(struct wl_client *client, struct wl_resource *r, uint32_t id)
 {
     mock_wayland *m = wl_resource_get_user_data(r); assert(!m->frame);
@@ -65,7 +173,8 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
     if (!m->configured) {
         m->configured = true;
         struct wl_array states; wl_array_init(&states);
-        xdg_toplevel_send_configure(m->top, 2, 0, &states); /* minimum unit width plus one; zero height = client chooses */
+        if (mock_shm.configure_set) xdg_toplevel_send_configure(m->top, mock_shm.configure_w, mock_shm.configure_h, &states);
+        else xdg_toplevel_send_configure(m->top, 2, 0, &states); /* minimum unit width plus one; zero height = client chooses */
         xdg_surface_send_configure(m->xdg, wl_display_next_serial(m->display));
         wl_keyboard_send_enter(m->keyboard, wl_display_next_serial(m->display), m->surface, &states);
         wl_array_release(&states);
@@ -92,6 +201,9 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
         return;
     }
     assert(m->acked);
+    if (m->attached) mock_commit_buffer(m);
+    else if (m->pending_scale) m->scale = m->pending_scale;
+    m->attached = false; m->pending_buffer = NULL; m->damage_full = false; m->damage_count = 0; m->pending_scale = 0;
     if (!m->frame && !m->feedback) {
         if (!m->holding) {
             m->holding = true;
@@ -113,14 +225,14 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
             wp_presentation_feedback_send_presented(m->feedback, (uint32_t)(seconds >> 32), (uint32_t)seconds,
                 (uint32_t)stamp.tv_nsec, 0, 0, 1, WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
         }
-        wl_resource_destroy(m->feedback); m->feedback = NULL; m->discard = true;
+        wl_resource_destroy(m->feedback); m->feedback = NULL; m->discard = !mock_shm.present_always;
     }
 }
 static void mock_transform(struct wl_client *client, struct wl_resource *r, int32_t transform)
 { (void)client; (void)r; (void)transform; }
 static const struct wl_surface_interface mock_surface_ops = {.destroy = mock_destroy, .attach = mock_surface_attach,
     .damage = mock_damage, .frame = mock_frame, .set_opaque_region = mock_region_set, .set_input_region = mock_region_set,
-    .commit = mock_commit, .set_buffer_transform = mock_transform, .set_buffer_scale = mock_transform, .damage_buffer = mock_damage};
+    .commit = mock_commit, .set_buffer_transform = mock_transform, .set_buffer_scale = mock_buffer_scale, .damage_buffer = mock_damage_buffer};
 static void mock_create_surface(struct wl_client *client, struct wl_resource *r, uint32_t id)
 {
     mock_wayland *m = wl_resource_get_user_data(r);
@@ -283,6 +395,7 @@ static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, 
         if (mock_wide_output_w && mock_wide_output_h)
             assert(wl_global_create(m.display, &wl_output_interface, WL_OUTPUT_SCALE_SINCE_VERSION, &m, mock_bind_wide_output));
         assert(wl_global_create(m.display, &wl_data_device_manager_interface, 1, &m, mock_bind_manager));
+        if (mock_shm.enabled) assert(!wl_display_init_shm(m.display)); /* libwayland-server's real wl_shm */
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};
         wl_client_add_destroy_listener(client, &gone.listener);

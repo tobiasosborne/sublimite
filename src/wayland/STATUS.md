@@ -12,13 +12,20 @@ covers decoded input, mutation, layout and null backend submit. Calibration
 proves that the release interposer is active; sanitizer counts remain inert.
 Actual EGL-driver submit allocation and physical input latency need a compositor.
 
-Missing: a Wayland CPU raster renderer. The XShm/Present CPU backend rejects
-Wayland, so GL still requires wp_presentation and no CPU fallback is available
-without it. The opt-in headless acceptance probe remains red:
-`build/tests/wayland_test --require-presentation-fallback`.
-This needs wl_shm buffer ownership/release and a decision about completion when
-matching presentation timestamps are unavailable; it is larger than a local
-backend guard correction. The bead remains incomplete.
+CPU raster fallback (edit-b6ai.6): `render_cpu_backend` has a wl_shm variant.
+It uses one memfd pool, two slots sized at init and recreated only on surface
+resize, release before reuse, `damage_buffer` per damage rectangle, the frame
+callback, and T6 from `wp_presentation` feedback. Without wp_presentation,
+`wayland_frame_arm` arms only the frame callback and its `done` is the
+completion (MSC 0). The rule and its trace consequences are in
+[decisions/edit-b6ai.6.md](../../docs/decisions/edit-b6ai.6.md). wl_shm is bound
+here (`wayland_shm`), and `wayland_buffer_scale` exposes the applied scale.
+`wayland_frame_notify` re-delivers completion on `wl_buffer.release`. Wayland GL
+that refuses or fails at init falls back to raster once (open.c). The opt-in
+probe `build/tests/wayland_test --require-presentation-fallback` is green. The
+mock (`tests/wayland_mock.h`) now has libwayland-server's real wl_shm. Its
+screen copies only damaged rectangles and asserts the whole buffer equals it,
+and it supports release-on-replace or immediate release and a resize configure.
 
 Startup output selection is the highest-scale advertised output. Surface-enter
 selection, output moves, runtime DPI/font changes, old compositor versions

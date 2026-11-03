@@ -852,6 +852,7 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #define raster_poll_completions raster_review_poll_completions
 #define raster_completion_timeout raster_review_completion_timeout
 #define raster_set_caret_only raster_review_set_caret_only
+#define raster_platform_completion raster_review_platform_completion
 #define work_submit review_submit
 #define work_submit_batch review_submit_batch
 #define work_publish review_publish
@@ -878,6 +879,7 @@ static xcb_void_cookie_t review_present(xcb_connection_t *c, xcb_window_t w, xcb
 #undef raster_frame_metrics
 #undef raster_completion_fd
 #undef raster_poll_completions
+#undef raster_platform_completion
 #undef raster_completion_timeout
 #undef raster_set_caret_only
 #undef work_submit
