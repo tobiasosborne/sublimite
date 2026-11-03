@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <dirent.h>
@@ -916,8 +917,29 @@ static uint64_t anonymous_bytes(void)
     }
     CHECK(fclose(status)==0 && found); return (uint64_t)kb*1024u;
 }
+/* The sanitizer allocator's size-class regions fault in whole 2 MB pages under
+ * THP=always, so ASan counts them as anonymous ownership of the reload (edit-
+ * b6ai.1: 5.4 to 7.5 MB here, 1.3 MB with THP off; the release build, glibc
+ * malloc, measures 20 KB). Turn THP off for this measurement only, in
+ * sanitizer builds only; the bound is unchanged. */
+#if defined(__SANITIZE_ADDRESS__)
+#define SAVECTL_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SAVECTL_TEST_ASAN 1
+#endif
+#endif
+static void thp_off_for_sanitizer(int off)
+{
+#if defined(SAVECTL_TEST_ASAN) && defined(PR_SET_THP_DISABLE)
+    (void)prctl(PR_SET_THP_DISABLE, off, 0, 0, 0);
+#else
+    (void)off;
+#endif
+}
 static void reload_memory_bound(void)
 {
+    thp_off_for_sanitizer(1);
     fixture f; init(&f,"old"); CHECK(savectl_destroy(f.s)==0);
     savectl_options o={.pool=f.pool,.path=f.path,.baseline=base_id(f.path),
         .source_mode=FILE_MODE_COPY,.reload_allocator=piece_default_allocator(),
@@ -936,6 +958,7 @@ static void reload_memory_bound(void)
         (unsigned long long)(after>before ? after-before : 0),2u*FILE_PREFIX_MAX);
     fflush(stdout);
     CHECK(after<=before+2u*FILE_PREFIX_MAX);
+    thp_off_for_sanitizer(0);
     piece_tree *replacement=NULL; savectl_view view;
     int rc; do { rc=savectl_take_reload(f.s,&replacement,&view); } while (rc==SAVECTL_BUSY);
     CHECK(rc==SAVECTL_OK);

@@ -753,6 +753,12 @@ os_err os_vm_reserve(void **out, size_t len)
     if (!len || len % os_page_size()) return fail_with(OS_E_INVAL);
     void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return fail();
+#ifdef MADV_NOHUGEPAGE
+    /* decommit is page-granular (MADV_DONTNEED): under THP=always a huge page
+     * would keep memory resident after a release (edit-b6ai.1). Once, at map
+     * time; best effort. */
+    (void)madvise(p, len, MADV_NOHUGEPAGE);
+#endif
     *out = p;
     return OS_OK;
 }

@@ -292,18 +292,85 @@ static const expectation expected[] = {
 };
 
 #if !defined(_WIN32)
+#include <strings.h>
+/* Linux oracle, version-tolerant (edit-b6ai.1, docs/decisions/edit-b6ai.1.md).
+ * keys_keysym_names is generated from the pinned vendor/xkbcommon header
+ * (libxkbcommon 1.6.0 naming) so it is identical on every platform. A newer host
+ * libxkbcommon (1.13.2 on Arch) renames some keysyms' preferred spelling and
+ * prefers the lower-case keysym when a case-insensitive lookup is ambiguous.
+ * Both spellings stay in the table and resolve; only the host's winner differs,
+ * plus the newer host's acceptance of control-character Uxxxx forms and its
+ * unpadded spelling of non-BMP Unicode keysym names.
+ * These helpers map exactly the known host winners back to the pinned ones, so
+ * an old host (no skew) and a new host both compare equal and any other
+ * difference still fails. */
+typedef struct { uint32_t value; const char *pinned, *host; } name_skew;
+static const name_skew name_skews[] = {
+    {0xff7eu,"Mode_switch","ISO_Group_Shift"}, {0xfe8au,"dead_schwa","dead_small_schwa"},
+    {0xfe8bu,"dead_SCHWA","dead_capital_schwa"}, {0x00abu,"guillemetleft","guillemotleft"},
+    {0x00bbu,"guillemetright","guillemotright"}, {0x00bau,"ordmasculine","masculine"},
+};
+typedef struct { const char *folded; uint32_t pinned, host; } fold_skew;
+static const fold_skew fold_skews[] = {
+    {"dead_i",0xfe85u,0xfe84u}, {"dead_o",0xfe87u,0xfe86u}, {"dead_schwa",0xfe8bu,0xfe8au},
+    {"kana_ya",0x4d4u,0x4acu}, {"kana_yo",0x4d6u,0x4aeu}, {"kana_tsu",0x4c2u,0x4afu},
+};
+/* Newer libxkbcommon maps "Uxxxx" for C0/C1 control characters (U+0001..1F,
+ * U+007F..9F) to keysyms; the pinned 1.6.0 rule rejects them (NoSymbol). */
+static bool control_unicode_form(const char *name)
+{
+    if (strlen(name)!=5u || (name[0]!='U' && name[0]!='u')) return false;
+    uint32_t value=0;
+    for (size_t i=1;i<5u;i++) {
+        char c=name[i];
+        if (c>='A' && c<='F') c=(char)(c-'A'+'a');
+        if (!((c>='0' && c<='9') || (c>='a' && c<='f'))) return false;
+        value=value*16u+(uint32_t)(c<='9' ? c-'0' : c-'a'+10);
+    }
+    return value<0x20u || (value>=0x7fu && value<0xa0u);
+}
+static uint32_t host_fold(const char *name)
+{
+    uint32_t v=xkb_keysym_from_name(name,XKB_KEYSYM_CASE_INSENSITIVE);
+    if (control_unicode_form(name)) return 0;
+    for (size_t i=0;i<sizeof fold_skews/sizeof fold_skews[0];i++)
+        if (!strcasecmp(name,fold_skews[i].folded) && v==fold_skews[i].host) return fold_skews[i].pinned;
+    return v;
+}
+static int host_name(uint32_t value, char *buffer, size_t size)
+{
+    int n=xkb_keysym_get_name(value,buffer,size);
+    if (value>0x0100ffffu && value<=0x0110ffffu) {
+        /* Beyond the BMP the pinned rule pads to eight digits ("U00010000");
+         * newer hosts print "U10000". Accept exactly that spelling. */
+        char newer[16];
+        int m=snprintf(newer,sizeof newer,"U%X",value&0xffffffu);
+        if (n==m && (size==0 || !strncmp(buffer,newer,size-1)))
+            return snprintf(buffer,size,"U%08X",value&0xffffffu);
+        return n;
+    }
+    for (size_t i=0;i<sizeof name_skews/sizeof name_skews[0];i++) {
+        if (value!=name_skews[i].value || n!=(int)strlen(name_skews[i].host)) continue;
+        if (size>0 && strncmp(buffer,name_skews[i].host,size-1)) continue;
+        return snprintf(buffer,size,"%s",name_skews[i].pinned);
+    }
+    return n;
+}
+#endif
+
+#if !defined(_WIN32)
 /* Linux oracle: keep libxkbcommon in this test, never in keys/config. */
 static void keysym_roundtrip(const char *name, uint32_t value)
 {
-    uint32_t folded=xkb_keysym_from_name(name,XKB_KEYSYM_CASE_INSENSITIVE);
+    uint32_t folded=host_fold(name);
     CHECK(keys_keysym_from_name(name)==folded);
     char actual[KEYS_KEYSYM_NAME_CAP], oracle[KEYS_KEYSYM_NAME_CAP]; /* (P) longest generated name plus NUL. */
-    int n=xkb_keysym_get_name(value,oracle,sizeof oracle);
+    int n=host_name(value,oracle,sizeof oracle);
     CHECK(n>0 && (size_t)n<sizeof oracle);
     CHECK(keys_keysym_name(value,actual,sizeof actual)==n);
     if (strcmp(actual,oracle)) fprintf(stderr,"keysym %#x: %s != %s\n",value,actual,oracle);
     CHECK(!strcmp(actual,oracle));
-    CHECK(keys_keysym_from_name(actual)==xkb_keysym_from_name(oracle,XKB_KEYSYM_CASE_INSENSITIVE));
+    CHECK(keys_keysym_from_name(actual)==host_fold(oracle));
     char upper[sizeof actual], lower[sizeof actual];
     CHECK(strlen(name)<sizeof upper);
     for (size_t i=0;i<=strlen(name);i++) {
@@ -311,8 +378,8 @@ static void keysym_roundtrip(const char *name, uint32_t value)
         upper[i]=(char)(c>='a' && c<='z' ? c-'a'+'A' : c);
         lower[i]=(char)(c>='A' && c<='Z' ? c-'A'+'a' : c);
     }
-    CHECK(keys_keysym_from_name(upper)==xkb_keysym_from_name(upper,XKB_KEYSYM_CASE_INSENSITIVE));
-    CHECK(keys_keysym_from_name(lower)==xkb_keysym_from_name(lower,XKB_KEYSYM_CASE_INSENSITIVE));
+    CHECK(keys_keysym_from_name(upper)==host_fold(upper));
+    CHECK(keys_keysym_from_name(lower)==host_fold(lower));
 }
 static void keysym_names(void)
 {
@@ -329,7 +396,7 @@ static void keysym_names(void)
         "UFFFFFFFFF", "U000000041", "0x000000041", "XF86_AudioMute", "XF86__AudioMute", "0x00000041", "0XFF51", "0x1fffffff", "0x20000000", "0xffffffff", "0x",
         "0x+41", "0x 41", "0x-1", "0x100000000", "U-1", " U0041", "U0041 ", "Greek_LAMBDA"};
     for (size_t i=0;i<sizeof forms/sizeof forms[0];i++)
-        CHECK(keys_keysym_from_name(forms[i])==xkb_keysym_from_name(forms[i],XKB_KEYSYM_CASE_INSENSITIVE));
+        CHECK(keys_keysym_from_name(forms[i])==host_fold(forms[i]));
     CHECK(keys_keysym_from_name(NULL)==0);
     const uint32_t values[] = {0,1,31,32,65,0x01000041u,0x010000ffu,0x01000100u,0x0100d800u,
         0x01010000u,0x0110ffffu,0x01110000u,0x1fffffffu,0x20000000u,UINT32_MAX};
@@ -337,7 +404,7 @@ static void keysym_names(void)
         char actual[sizeof "0xffffffff"], oracle[sizeof actual];
         for (size_t cap=0;cap<=sizeof actual;cap++) {
             memset(actual,'?',sizeof actual); memset(oracle,'?',sizeof oracle);
-            CHECK(keys_keysym_name(values[i],actual,cap)==xkb_keysym_get_name(values[i],oracle,cap));
+            CHECK(keys_keysym_name(values[i],actual,cap)==host_name(values[i],oracle,cap));
             CHECK(!memcmp(actual,oracle,sizeof actual));
         }
     }
@@ -351,7 +418,7 @@ static void keysym_names(void)
         int n=snprintf(source,sizeof source,"[keymap]\nundo='Ctrl+%s'\n",name);
         CHECK(n>0 && (size_t)n<sizeof source);
         keys_binding expected_binding={.keysym=strlen(name)==1u ? (uint8_t)*name :
-            xkb_keysym_from_name(name,XKB_KEYSYM_CASE_INSENSITIVE),.modifiers=PLAT_MOD_CTRL};
+            host_fold(name),.modifiers=PLAT_MOD_CTRL};
         bool valid=keys_binding_normalize(&expected_binding);
         config_settings settings; config_error error;
         int rc=config_parse((const uint8_t *)source,(size_t)n,&settings,&error);
@@ -375,7 +442,7 @@ static void stroke(const char *text, uint32_t *sym, uint16_t *mods)
         else break;
     }
 #if !defined(_WIN32)
-    CHECK(keys_keysym_from_name(text)==xkb_keysym_from_name(text,XKB_KEYSYM_CASE_INSENSITIVE));
+    CHECK(keys_keysym_from_name(text)==host_fold(text));
     *sym=xkb_keysym_from_name(text,XKB_KEYSYM_NO_FLAGS);
 #else
     *sym=keys_keysym_from_name(text);
