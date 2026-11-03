@@ -861,7 +861,6 @@ static void wrapped_relative(void)
 {
     const char tail[]="tail one\nmid two\nlast line wraps here";
     size_t prefix=32u*VIEW_SCAN_BOUND, n=prefix+sizeof tail-1u;
-    uint64_t last=prefix+9u+8u;          /* start of "last ..." (P: tail spelling) */
     uint8_t *p=malloc(n); CHECK(p);
     for(size_t i=0;i<prefix;++i) p[i]=i%8u==7u?'\n':(uint8_t)('a'+i%8u);
     memcpy(p+prefix,tail,sizeof tail-1u);
@@ -879,11 +878,16 @@ static void wrapped_relative(void)
     CHECK(rel.v.seek_scanned-seek_before<=VIEW_SCAN_BOUND);   /* one LF walk over the last line */
     CHECK(exact.v.line_scanned>=prefix);                      /* the exact path counts the prefix */
     CHECK(rel.v.state.selection.cursor==n && exact.v.state.selection.cursor==n);
-    CHECK(rel.v.state.first_byte==last && exact.v.state.first_byte==last);
-    CHECK(rel.v.state.visual_byte==exact.v.state.visual_byte && rel.v.state.visual_byte>last);
+    /* edit-b6ai.18: EOF's row is the bottom row. (P) the last line takes
+     * two 10-column rows ("last line " and "wraps here"), so the third row
+     * up, the top, is "mid two"'s, the line before the proven last line
+     * (found by layout's backward LF pass, not a line query). */
+    uint64_t mid=prefix+9u;
+    CHECK(rel.v.state.first_byte==mid && exact.v.state.first_byte==mid);
+    CHECK(rel.v.state.visual_byte==exact.v.state.visual_byte && rel.v.state.visual_byte==mid);
     CHECK(rel.v.relative && rel.v.relative_top && rel.v.state.approximate);
     CHECK(rel.v.state.first_line==0);                         /* the previous label, relabelled by the host */
-    CHECK(exact.v.state.first_line==prefix/8u+2u && !exact.v.relative_top);
+    CHECK(exact.v.state.first_line==prefix/8u+1u && !exact.v.relative_top);
     /* Document Home: byte 0 is its own certified ordinal. */
     rc=finish_command(&rel,view_relative_command(&rel.v,VIEW_DOC_HOME,false,&c));
     CHECK(rc==VIEW_OK && rel.v.line_scanned==line_before);

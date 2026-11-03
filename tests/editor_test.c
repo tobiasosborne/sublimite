@@ -6943,6 +6943,152 @@ static int cxho25_typing_jump(void)
     return 0;
 }
 
+/* edit-b6ai.18 (terra drive 2026-11-03, "Large-file Ctrl+End discards
+ * visible context"): in wrapped mode a far caret jump below the viewport put
+ * the caret's row alone at the top (Ctrl+End: the last line at the top of an
+ * otherwise blank editor), where unwrapped mode stops at the last page.
+ * Rule pinned here, both modes: a caret jump that must reveal a caret below
+ * the screen scrolls minimally, so the caret's row is the bottom row and the
+ * rows above it fill the viewport. When the last logical line wraps over
+ * more rows than the viewport, the caret's (last) row is still the bottom
+ * row; the rows above it are that line's continuations. A go-to-line target
+ * stays the top row unless fewer rows than the viewport follow it, then the
+ * last row is the bottom row (unwrapped: the scroll module's last page).
+ * A document shorter than the viewport keeps its first row at the top.
+ * Fixture (P): 200 lines "line NNN: " plus 0, 45 or 90 letters (i % 3), so
+ * at the 80-column window's text width a third of the lines take two rows;
+ * the window is the c25 one (24 text rows plus chrome). */
+static int b18_caret_row(editor *e, const char *what, int64_t want)
+{
+    int64_t R = (int64_t)e->v.config.rows;
+    view_state v = editor_view(e);
+    uint64_t top = c25_top(e);
+    int64_t idx = c25_rows(e, top, v.selection.cursor, v.visual_end, R);
+    bool viewtop = v.wrap ? v.visual_byte == top : v.first_byte == top;
+    bool filled = true;
+    for (int64_t i = 0; i < R; i++) filled &= e->row_byte[i] != LAYOUT_VOID_ROW;
+    if (idx == want && viewtop && (want != R - 1 || filled)) return 0;
+    fprintf(stderr, "edit-b6ai.18 %s: wrap %d caret row %lld (want %lld) of %lld rows, top %llu (view %llu) filled %d caret %llu len %llu\n",
+        what, (int)v.wrap, (long long)idx, (long long)want, (long long)R, (unsigned long long)top,
+        (unsigned long long)(v.wrap ? v.visual_byte : v.first_byte), (int)filled,
+        (unsigned long long)v.selection.cursor, (unsigned long long)editor_length(e));
+    return 1;
+}
+static size_t b18_fixture(char *text, size_t cap, unsigned lines, bool long_tail)
+{
+    size_t n = 0;
+    for (unsigned i = 0; i < lines; i++) {
+        n += (size_t)snprintf(text + n, cap - n, "line %03u: ", i);
+        for (unsigned k = 0; k < (i % 3u) * 45u; k++) text[n++] = (char)('a' + k % 26u);
+        text[n++] = '\n';
+    }
+    if (long_tail) {
+        /* (P) 6000 bytes of five-letter words: 1200 words, about 80 rows at
+         * the 80-column text width, more than three 24-row screens. */
+        for (unsigned k = 0; k < 6000u; k++) text[n++] = k % 6u == 5u ? ' ' : (char)('a' + k % 26u);
+    }
+    return n;
+}
+static render_backend b18_backend; /* the editor keeps the backend pointer */
+static int b18_open(editor **e, int wrap_mode, unsigned lines, bool long_tail, counted *count)
+{
+    static char text[64u * 1024u];
+    size_t n = b18_fixture(text, sizeof text, lines, long_tail);
+    render_backend *backend = &b18_backend; *backend = (render_backend){0}; T(render_null_backend(backend) == 0);
+    editor_config cfg = {.initial = (const uint8_t *)text, .initial_len = n, .cols = 80u, .rows = 1u + 3u + 24u,
+        .wrap_mode = wrap_mode, .hook_ctx = count, .on_ingress = ingress, .on_submit = submitted};
+    T(editor_open(e, &cfg, backend) == 0); T(settle(*e) == 0);
+    T(editor_view(*e).wrap == (wrap_mode > 0));
+    return 0;
+}
+static int b18_goto(editor *e, unsigned line)
+{
+    char digits[16]; int len = snprintf(digits, sizeof digits, "%u", line); T(len > 0);
+    T(press(e, key(XKB_KEY_g, PLAT_MOD_CTRL, NULL)) == 0);
+    for (int i = 0; i < len; i++) { char one[2] = {digits[i], 0}; T(press(e, key((uint32_t)(uint8_t)digits[i], 0, one)) == 0); }
+    T(press(e, key(XKB_KEY_Return, 0, NULL)) == 0);
+    return 0;
+}
+static int b18_end_case(int wrap_mode)
+{
+    editor *e = NULL; counted count = {0}; int failed = 0;
+    T(b18_open(&e, wrap_mode, 200u, false, &count) == 0);
+    int64_t R = (int64_t)e->v.config.rows; T(R >= 4);
+    const char *mode = wrap_mode > 0 ? "wrapped" : "unwrapped";
+    char what[96];
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_view(e).selection.cursor == editor_length(e));
+    snprintf(what, sizeof what, "%s Ctrl+End from the top", mode); failed += b18_caret_row(e, what, R - 1);
+    if (wrap_mode < 0 && e->lay.first_line != 201u - (uint64_t)R) { fprintf(stderr, "edit-b6ai.18 unwrapped Ctrl+End top %llu\n", (unsigned long long)e->lay.first_line); failed++; }
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    snprintf(what, sizeof what, "%s Ctrl+Home", mode); failed += b18_caret_row(e, what, 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    snprintf(what, sizeof what, "%s Ctrl+End again", mode); failed += b18_caret_row(e, what, R - 1);
+    /* Ctrl+G to the last line (the empty one after the final LF): the same
+     * picture. Then a mid-file line, which is the top row (pinned), then a
+     * line three lines above the end, inside the last page: the last row is
+     * the bottom row and the target's line stays on screen. */
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    T(b18_goto(e, 201u) == 0);
+    snprintf(what, sizeof what, "%s Ctrl+G last line", mode); failed += b18_caret_row(e, what, R - 1);
+    T(b18_goto(e, 100u) == 0);
+    snprintf(what, sizeof what, "%s Ctrl+G mid-file", mode); failed += b18_caret_row(e, what, 0);
+    T(b18_goto(e, 198u) == 0);
+    {
+        view_state v = editor_view(e); uint64_t top = c25_top(e);
+        int64_t caret = c25_rows(e, top, v.selection.cursor, v.visual_end, R);
+        int64_t last = c25_rows(e, top, editor_length(e), false, R);
+        if (last != R - 1 || caret < 0 || caret >= R) {
+            fprintf(stderr, "edit-b6ai.18 %s Ctrl+G into the last page: caret row %lld, last row %lld of %lld\n",
+                mode, (long long)caret, (long long)last, (long long)R);
+            failed++;
+        }
+    }
+    T(!count.active && count.allocations == 0);
+    editor_close(e);
+    return failed;
+}
+static int b18_long_tail_case(void)
+{
+    editor *e = NULL; counted count = {0}; int failed = 0;
+    T(b18_open(&e, 1, 30u, true, &count) == 0);
+    int64_t R = (int64_t)e->v.config.rows;
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    T(editor_view(e).selection.cursor == editor_length(e));
+    failed += b18_caret_row(e, "wrapped Ctrl+End onto a last line taller than the viewport", R - 1);
+    if (!e->lay.wrap_rows[0].continuation) { fprintf(stderr, "edit-b6ai.18 long tail: top row is not a continuation\n"); failed++; }
+    T(press(e, key(XKB_KEY_Home, PLAT_MOD_CTRL, NULL)) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    failed += b18_caret_row(e, "wrapped Ctrl+End onto a long last line again", R - 1);
+    T(!count.active && count.allocations == 0);
+    editor_close(e);
+    return failed;
+}
+static int b18_short_case(int wrap_mode)
+{
+    editor *e = NULL; counted count = {0}; int failed = 0;
+    T(b18_open(&e, wrap_mode, 6u, false, &count) == 0);
+    T(press(e, key(XKB_KEY_End, PLAT_MOD_CTRL, NULL)) == 0);
+    if (c25_top(e) != 0) { fprintf(stderr, "edit-b6ai.18 short document scrolled: top %llu\n", (unsigned long long)c25_top(e)); failed++; }
+    T(b18_goto(e, 6u) == 0);
+    if (c25_top(e) != 0) { fprintf(stderr, "edit-b6ai.18 short document Ctrl+G scrolled: top %llu\n", (unsigned long long)c25_top(e)); failed++; }
+    T(!count.active && count.allocations == 0);
+    editor_close(e);
+    return failed;
+}
+static int b6ai18_end(void)
+{
+    int failed = 0;
+    failed += b18_end_case(1);
+    failed += b18_end_case(-1);
+    failed += b18_long_tail_case();
+    failed += b18_short_case(1);
+    failed += b18_short_case(-1);
+    T(failed == 0);
+    puts("edit-b6ai.18: Ctrl+End and go-to into the last page fill the viewport, wrapped and unwrapped");
+    return 0;
+}
+
 /* edit-dzk1: a render-rule violation in submit must not end the loop. The
  * test hook is private access to the font cache's bound descriptor table and
  * pages. First the edit-2ghs shape (a zero-sized descriptor, after the font
@@ -7761,6 +7907,7 @@ static const test_selector selectors[] = {
     {"--6090-typing", n6090_typing_top},
     {"--vp4m-return", vp4m_return_bottom},
     {"--cxho25-typing", cxho25_typing_jump},
+    {"--b6ai18-end", b6ai18_end},
     {"--5vz-full", n5vz_results_full},
     {"--5vz-open", n5vz_open_refused},
     {"--bt1-geometry", nbt1_results_geometry},
@@ -7897,6 +8044,7 @@ static int editor_part_3(void)
 {
     T(vp4m_return_bottom() == 0);
     T(cxho25_typing_jump() == 0);
+    T(b6ai18_end() == 0);
     T(n5vz_results_full() == 0); T(n5vz_open_refused() == 0);
     T(nbt1_results_geometry() == 0);
     T(nci6i_map_refused() == 0);

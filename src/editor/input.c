@@ -825,6 +825,19 @@ static int goto_continue(editor *e)
     e->v.state.first_line = line;
     e->v.state.first_byte = e->v.state.visual_byte = pos.value;
     e->v.state.visual_end = false; e->v.state.approximate = false; e->v.state.hscroll = 0;
+    /* edit-b6ai.18: wrapped, a target with fewer rows than the viewport
+     * below it shows the last page (EOF's row at the bottom), as unwrapped
+     * scroll clamps its top to lines - rows. (P) every logical line takes at
+     * least one row, so with an exact count and at least `rows` lines from
+     * the target on, nothing can clamp and no row is queried. */
+    if (e->v.state.wrap && !(count.exact && count.value - line >= e->lay.grid->dims.rows)) {
+        layout_wrap_row target = {.line_start = pos.value, .line = line}, top; bool clamped = false, approximate = false;
+        int clamp = layout_wrap_clamp_end(&e->lay, e->tree, &target, &top, &clamped, &approximate);
+        if (clamp == LAYOUT_DONE && clamped) {
+            e->v.state.visual_byte = top.start; e->v.state.first_byte = top.line_start;
+            e->v.state.first_line = top.line; e->v.state.approximate = approximate;
+        }
+    }
     editor_seed_view_lines(e);
     int rc = goto_scroll_to(e, pos.value, line, false); if (rc) return rc;
     if (go->accept) {

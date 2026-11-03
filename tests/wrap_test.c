@@ -592,6 +592,17 @@ static void c26_follow_truth(void)
                     (unsigned long long)(moved?top.start:0),(unsigned long long)want);
             checked++;
         }
+        /* edit-b6ai.18: LAYOUT_SCROLL_ANY (caret jumps) scrolls minimally at
+         * any distance; the truth knows rows up to TALL-1. */
+        if(i<TALL) {
+            layout_wrap_row top; bool moved=false, ap=false;
+            CHECK(layout_wrap_follow_edit(&f.l,f.tree,0,&c,LAYOUT_SCROLL_ANY,&top,&moved,&ap)==LAYOUT_DONE);
+            bool ok=i<N?!moved:moved && top.start==t.l.wrap_rows[i-(N-1u)].start;
+            if(!ok && wrong++<8)
+                fprintf(stderr,"edit-b6ai.18 follow seed %llu: caret %llu row idx %u, any distance: moved %d top %llu\n",
+                    (unsigned long long)seed,(unsigned long long)caret,i,moved,(unsigned long long)(moved?top.start:0));
+            checked++;
+        }
         destroy(&t); destroy(&f);
     }
     printf("edit-cxho.26: %u follow decisions checked against a fresh layout, %u wrong "

@@ -2072,6 +2072,130 @@ static int vun_case(void)
 }
 /* (P) Adapters retain existing fixture arguments and environment value
  * parsing. Numeric inputs are copied from the original selector branches. */
+/* edit-b6ai.18 (terra drive 2026-11-03, build/terra/shots/big-end.png): the
+ * 50,000,000-byte prefix of the 1 GiB log corpus, a .txt (wrapped by
+ * default), Ctrl+End while the line index is still building (bulk lane held
+ * from open, as wv7_body). Before: the final partial line alone on the top
+ * row of an otherwise blank editor. Asserted: every text row is laid out,
+ * the rows are contiguous, the bottom row holds EOF (the caret), each row's
+ * logical start follows an LF in the file (independent pread oracle), and
+ * no visual-row query made a piece line query (edit-1vun probe: on the
+ * unindexed mapping one counts newlines from byte 0 on the UI thread).
+ * After the lane is released and the index publishes, the same picture with
+ * exact labels. Window (P): 100 columns, 40 text rows; a corpus row is about
+ * 115 bytes (head of log_1g.txt), so a line takes two rows. Settle times are
+ * tracked prints (law 1). */
+#define B18_BYTES UINT64_C(50000000)
+static int b18_rows(editor *e, int fd, uint64_t size, const char *when)
+{
+    uint32_t n = e->v.config.rows; int bad = 0;
+    for (uint32_t i = 0; i < n && !bad; i++) {
+        const layout_wrap_row *r = &e->lay.wrap_rows[i];
+        uint8_t prev = '\n';
+        if (r->start == LAYOUT_VOID_ROW || e->row_byte[i] == LAYOUT_VOID_ROW) bad = 1;
+        else if (i + 1u < n && r->next != e->lay.wrap_rows[i + 1u].start) bad = 2;
+        else if (r->line_start && pread(fd, &prev, 1, (off_t)(r->line_start - 1u)) != 1) bad = 3;
+        else if (prev != '\n') bad = 4;
+        if (bad) fprintf(stderr, "editor_large_test: edit-b6ai.18 %s row %u of %u: reason %d start=%llu next=%llu line_start=%llu\n",
+            when, i, n, bad, (unsigned long long)r->start, (unsigned long long)r->next, (unsigned long long)r->line_start);
+    }
+    const layout_wrap_row *last = &e->lay.wrap_rows[n - 1u];
+    if (!bad && !(last->start <= size && size <= last->end && last->next == LAYOUT_VOID_ROW)) {
+        fprintf(stderr, "editor_large_test: edit-b6ai.18 %s: EOF %llu not on the bottom row [%llu, %llu] next %llu; top row %llu\n",
+            when, (unsigned long long)size, (unsigned long long)last->start, (unsigned long long)last->end,
+            (unsigned long long)last->next, (unsigned long long)e->lay.wrap_rows[0].start);
+        bad = 5;
+    }
+    if (!bad && editor_view(e).visual_byte != e->lay.wrap_rows[0].start) bad = 6;
+    return bad;
+}
+static int b18_body(const char *root)
+{
+    const char *corpus = "/tmp/edit-corpus/log_1g.txt";
+    char path[256], xdg[256];
+    T(snprintf(path, sizeof path, "%s/log-50m.txt", root) > 0); T(snprintf(xdg, sizeof xdg, "%s/xdg", root) > 0);
+    {
+        int in = open(corpus, O_RDONLY | O_CLOEXEC); T(in >= 0);
+        int out = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600); T(out >= 0);
+        static uint8_t chunk[1u << 20]; bool ok = true;
+        for (uint64_t at = 0; ok && at < B18_BYTES; ) {
+            size_t want = B18_BYTES - at < sizeof chunk ? (size_t)(B18_BYTES - at) : sizeof chunk;
+            ok = pread(in, chunk, want, (off_t)at) == (ssize_t)want && write(out, chunk, want) == (ssize_t)want;
+            at += want;
+        }
+        T(close(in) == 0); T(close(out) == 0); T(ok);
+    }
+    T(mkdir(xdg, 0700) == 0); T(setenv("XDG_DATA_HOME", xdg, 1) == 0);
+    int fd = open(path, O_RDONLY | O_CLOEXEC); T(fd >= 0);
+    uint8_t tail = 0; T(pread(fd, &tail, 1, (off_t)(B18_BYTES - 1u)) == 1);
+    printf("editor_large_test: edit-b6ai.18 fixture %llu bytes, last byte %s\n", (unsigned long long)B18_BYTES,
+        tail == '\n' ? "LF" : "mid-line (a final partial line)");
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config config = {.path = path, .cols = 100, .rows = 1u + 3u + 40u};
+    editor *e = NULL; T(editor_open(&e, &config, &backend) == 0);
+    uint64_t queries = 0; e->lay.line_query_probe = &queries;
+    lane_hold lane; atomic_init(&lane.release, false); atomic_init(&lane.running, false);
+    work_handle held = work_submit(&e->pool, (work_job){hold_lane, &lane, 0, WORK_BULK});
+    int rc = held.epoch ? 0 : 1;
+    mmp_tally t = {0}; bool bad = false;
+    uint64_t deadline = trace_now_ns() + EDITOR_IDLE_NS;
+    while (!rc && !atomic_load(&lane.running)) { if (editor_step(e, 0) < 0 || trace_now_ns() >= deadline) rc = 1; }
+    if (!rc) rc = mmp_settle(e, &t, &bad);
+    if (!rc && (editor_index_complete(e) || e->buffer->lg.lines_exact || !e->v.state.wrap)) rc = 1;
+    if (!rc) {
+        uint64_t before = queries;
+        plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = XKB_KEY_End, .mods = PLAT_MOD_CTRL, .t0_ns = trace_now_ns()};
+        T(editor_inject(e, &key) == 0);
+        t.keys = true; rc = mmp_settle(e, &t, &bad); t.keys = false;
+        char power[32]; double load1; ptn_stamp(power, sizeof power, &load1);
+        printf("editor_large_test: edit-b6ai.18 ctrl+end rows=%u layout_line_queries=%llu key_settle=%.3f ms (M) rc=%d power=\"%s\" load1=%.2f\n",
+            e->v.config.rows, (unsigned long long)(queries - before), (double)t.max_key_ns / 1e6, rc, power, load1);
+        if (!rc && (bad || editor_index_complete(e) || queries != before)) rc = 1;
+        if (!rc && editor_view(e).selection.cursor != B18_BYTES) rc = 1;
+        if (!rc && b18_rows(e, fd, B18_BYTES, "index building")) rc = 1;
+    }
+    atomic_store(&lane.release, true);
+    while (held.epoch && !work_handle_finished(&e->pool, held)) nanosleep(&(struct timespec){0, 100000}, NULL);
+    if (!rc) {
+        uint64_t start = trace_now_ns(); deadline = start + EDITOR_IDLE_NS;
+        while (!rc && !wv7_index_done(e)) {
+            int s = editor_step(e, 5); if (s != EDITOR_OK && s != EDITOR_MORE) rc = 1;
+            if (trace_now_ns() >= deadline) rc = 1;
+        }
+        if (!rc) rc = mmp_settle(e, &t, &bad);
+        printf("editor_large_test: edit-b6ai.18 index published after %.3f ms (M) rc=%d\n", (double)(trace_now_ns() - start) / 1e6, rc);
+        if (!rc && b18_rows(e, fd, B18_BYTES, "index published")) rc = 1;
+        lineidx_src cur = editor_source(e->buffer);
+        view_state s = editor_view(e);
+        lineidx_result top = lineidx_byte_to_line(e->buffer->index, &cur, s.first_byte);
+        if (!rc && (!top.exact || top.value != s.first_line || s.approximate)) {
+            fprintf(stderr, "editor_large_test: edit-b6ai.18 top label %llu, exact %llu (%d) approximate %d\n",
+                (unsigned long long)s.first_line, (unsigned long long)top.value, (int)top.exact, (int)s.approximate);
+            rc = 1;
+        }
+    }
+    editor_close(e); T(close(fd) == 0);
+    return rc;
+}
+static int b18_case(void)
+{
+    struct stat st;
+    if (stat("/tmp/edit-corpus/log_1g.txt", &st) != 0 || (uint64_t)st.st_size < B18_BYTES) {
+        fputs("editor_large_test: edit-b6ai.18 needs /tmp/edit-corpus/log_1g.txt (tools/mkcorpus)\n", stderr);
+        return 1;
+    }
+    char root[] = "build/editor-large-b18-XXXXXX"; T(mkdtemp(root));
+    const char *saved = getenv("XDG_DATA_HOME"); char keep[256] = "";
+    if (saved) (void)snprintf(keep, sizeof keep, "%s", saved);
+    int rc = b18_body(root);
+    if (saved) (void)setenv("XDG_DATA_HOME", keep, 1); else (void)unsetenv("XDG_DATA_HOME");
+    int removed = mmp_remove_tree(root);
+    printf("editor_large_test: edit-b6ai.18 rc=%d\n", rc);
+    T(fflush(stdout) == 0);
+    T(removed == 0); T(rc == 0);
+    puts("editor_large_test: edit-b6ai.18 wrapped Ctrl+End at the end of a 50 MB log fills the viewport");
+    return 0;
+}
 static int select_edit_dz0_repro(void)
 {
     return dz0_key_at_end(getenv("EDIT_DZ0_WRAP") != NULL);
@@ -2122,6 +2246,7 @@ int main(void)
         {"EDIT_DZ0_REPRO", select_edit_dz0_repro},
         {"EDIT_WV7_REPRO", wv7_case},
         {"EDIT_1VUN_REPRO", vun_case},
+        {"EDIT_B6AI18_REPRO", b18_case},
         {"EDIT_JF9_VIEW", relative_motion},
     };
     selected = TEST_SELECT_ENV(select_edit_mmp_repro_cases);
@@ -2221,6 +2346,7 @@ int main(void)
     T(ptn_case(PTN_KEYS) == 0);
     T(wv7_case() == 0);
     T(vun_case() == 0);
+    T(b18_case() == 0);
 xzw_fixture:;
     char path[] = "build/editor-large-test-XXXXXX"; int fd = mkstemp(path); T(fd >= 0); close(fd);
     T(write_fixture(path) == 0);

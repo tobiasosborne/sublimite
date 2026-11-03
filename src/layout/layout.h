@@ -275,10 +275,16 @@ int layout_visual_row_fresh(const layout *l, const piece_tree *t, uint64_t byte,
  * farther it is the caret's row. At most rows-1+max_scroll row queries. */
 int layout_wrap_follow_edit(const layout *l, const piece_tree *t, uint64_t top, const layout_wrap_row *caret,
                             uint32_t max_scroll, layout_wrap_row *new_top, bool *moved, bool *approximate);
+/* edit-b6ai.18: max_scroll for a caret jump (Ctrl+End, a far motion): the
+ * minimal top at any distance, caret on the bottom row; at most rows-1 row
+ * queries. */
+#define LAYOUT_SCROLL_ANY UINT32_MAX
 /* edit-cxho.26: the same with the caret's logical line certified by the
  * caller (line_start, line; the ordinal may be a label). Rows on that line
- * come from layout_visual_row_anchored; rows above it only from layout's
- * resident top (no piece line query), else LAYOUT_ERR_STATE: unproven. */
+ * come from layout_visual_row_anchored; rows above it from the line before,
+ * proven by a backward LF pass of at most LAYOUT_BYTE_BUDGET bytes
+ * (edit-b6ai.18), or from layout's resident top (no piece line query), else
+ * LAYOUT_ERR_STATE: unproven. */
 int layout_wrap_follow_edit_anchored(const layout *l, const piece_tree *t, uint64_t top, const layout_wrap_row *caret,
                             uint32_t max_scroll, const layout_wrap_row *line, layout_wrap_row *new_top, bool *moved,
                             bool *approximate);
@@ -289,6 +295,14 @@ int layout_wrap_follow_edit_anchored(const layout *l, const piece_tree *t, uint6
  * busy) leaves rows 1.. empty (LAYOUT_VOID_ROW), never zeroed rows that read
  * as byte 0. Readers of wrap_rows outside the layout check this first. */
 uint32_t layout_wrap_current_rows(const layout *l, const piece_tree *t);
+/* edit-b6ai.18: `line` (line_start, line; the ordinal may be a label) is a
+ * go-to target placed as the top row. When fewer than the grid's rows rows
+ * run from it to EOF, *clamped is set and *new_top is the row rows-1 above
+ * EOF's row (byte 0's row for a short document): the last page, as unwrapped
+ * scroll clamps. At most 2 (rows-1) anchored row queries; no piece line
+ * query, no allocation. */
+int layout_wrap_clamp_end(const layout *l, const piece_tree *t, const layout_wrap_row *line,
+                          layout_wrap_row *new_top, bool *clamped, bool *approximate);
 /* Same bounded visual query using a caller-certified logical line start and
  * ordinal (which may be estimated). Avoids whole-source piece line queries;
  * deep unindexed wrap phase retains the existing explicit approximation. */

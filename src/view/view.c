@@ -522,6 +522,21 @@ static int follow_line(view *v)
     uint64_t byte; rc=line_start(v,first,&byte); if(rc!=VIEW_OK) return rc;
     v->state.first_line=first; v->state.first_byte=byte; v->line=line; return VIEW_OK;
 }
+/* edit-b6ai.18: how far below the screen a caret is followed by scrolling
+ * minimally (caret on the bottom row) before its row becomes the top. An
+ * edit: up to a screen (edit-cxho.25). A page key: one row, its page
+ * displacement is the scroll. A repair (empty TYPE: a target the host
+ * installed) keeps the far-jump placement. Any other caret motion (Ctrl+End,
+ * Down, a word or selection key) at any distance, as unwrapped mode and
+ * Sublime do: Ctrl+End shows the last row at the bottom with the rows above
+ * it, not the last line alone at the top. */
+static uint32_t follow_scroll(const view *v)
+{
+    uint32_t n=v->wrap_layout->grid->dims.rows;
+    if(v->edited) return n ? n-1u : 0u;
+    if(v->key==VIEW_PAGE_UP || v->key==VIEW_PAGE_DOWN || v->key==VIEW_TYPE) return 1u;
+    return LAYOUT_SCROLL_ANY;
+}
 /* edit-6090, edit-cxho.25: after a mutation the cached rows are stale from
  * the edited line on, so `cursor>=bottom` (the pre-edit end of the last row)
  * cannot tell a caret still on screen (a letter typed at the end of the
@@ -545,10 +560,9 @@ static bool follow_rows(view *v,uint64_t cursor,const layout_wrap_row *r,const l
     }
     if(c.start<v->state.visual_byte) { *top=c; return true; }
     /* An edit scrolls minimally while the caret is less than a screen below
-     * (Return bursts, a paste); a motion over a rebuilding layout keeps the
-     * one-row rule of the cached path and follows farther targets directly. */
-    uint32_t n=l->grid->dims.rows, scroll=v->edited ? (n ? n-1u : 0u) : 1u;
-    int rc=layout_wrap_follow_edit_anchored(l,v->tree,v->state.visual_byte,&c,scroll,line,top,&moved,approx);
+     * (Return bursts, a paste); a motion over a rebuilding layout follows as
+     * the cached path does (follow_scroll). */
+    int rc=layout_wrap_follow_edit_anchored(l,v->tree,v->state.visual_byte,&c,follow_scroll(v),line,top,&moved,approx);
     if(rc!=LAYOUT_DONE) { *top=c; return true; } /* unproven: keep the caret's row visible */
     return moved;
 }
@@ -556,6 +570,19 @@ static void fresh_follow(view *v,uint64_t cursor,const layout_wrap_row *r,bool *
 {
     layout_wrap_row top;
     if(follow_rows(v,cursor,r,NULL,&top,approx)) v->state.visual_byte=top.start;
+}
+/* edit-b6ai.18: the top for caret row c below the cached bottom row, from an
+ * idle, current layout. follow_scroll's rule; the walk up from c is anchored
+ * at c's certified logical line, so no row query asks piece for a line. If
+ * the rows above are unproven, c's row is the top (the caret stays visible). */
+static void far_follow(view *v,const layout_wrap_row *c,const layout_wrap_row *line,layout_wrap_row *top,bool *approx)
+{
+    bool moved=true;
+    uint32_t scroll=follow_scroll(v);
+    const layout_wrap_row *anchor=line && line->line!=LAYOUT_LINE_UNKNOWN ? line : NULL;
+    if(scroll==1u || layout_wrap_follow_edit_anchored(v->wrap_layout,v->tree,v->state.visual_byte,c,scroll,anchor,
+                                                     top,&moved,approx)!=LAYOUT_DONE) *top=*c;
+    else if(!moved) { top->start=v->state.visual_byte; top->line_start=v->state.first_byte; } /* on screen after all */
 }
 /* edit-wv7: wrapped placement with an inexact external line count. The
  * exact path (finish_move below) labels the new top with line_at/line_start,
@@ -604,7 +631,13 @@ static int relative_wrap_place(view *v, uint64_t start)
                 if(r.start==bottom &&
                    layout_visual_row(l,v->tree,v->state.visual_byte,1,&top,&top_approx)==LAYOUT_DONE) {
                     v->state.visual_byte=top.start; top_start=top.line_start; approx|=top_approx;
-                } else { v->state.visual_byte=r.start; top_start=r.line_start; }
+                } else {
+                    /* edit-b6ai.18: rows above the caret's proven line start
+                     * come from backward LF passes, never a line query. */
+                    layout_wrap_row line={.line_start=start,.line=label};
+                    far_follow(v,&r,&line,&top,&approx);
+                    v->state.visual_byte=top.start; top_start=top.line_start;
+                }
             }
         }
         v->state.approximate|=approx;
@@ -653,12 +686,16 @@ static int finish_move(view *v)
             /* Cached viewport row membership avoids logical-line scrolling. */
             else if(bottom!=LAYOUT_VOID_ROW && c.start>=bottom) {
                 /* One-row downward motion exposes one row and advances top
-                 * by one visual row. Larger jumps follow the target directly. */
+                 * by one visual row. Larger jumps: far_follow (edit-b6ai.18). */
                 layout_wrap_row top;
                 if(c.start==bottom &&
                    layout_visual_row(v->wrap_layout,v->tree,v->state.visual_byte,1,&top,&approx)==LAYOUT_DONE)
                     v->state.visual_byte=top.start;
-                else v->state.visual_byte=c.start;
+                else {
+                    layout_wrap_row line={.line_start=c.line_start,.line=c.line};
+                    far_follow(v,&c,&line,&top,&approx);
+                    v->state.visual_byte=top.start;
+                }
             }
             uint64_t line, byte;
             int rc=line_at(v,v->state.visual_byte,&line); if(rc!=VIEW_OK) return rc;
