@@ -1,3 +1,20 @@
+# HANDOFF — sublimité, session 30 on monolith (2026-11-03; Opus 5.5 coordinator; Tobias present until ~16:20, then away)
+
+## Read first (session 31)
+
+**sublimité is installed on monolith and Tobias uses it** ("yep that is better"). Today's landings: docs/worklog/2026-11-03.md. Epic edit-b6ai (Omarchy fit, Wayland first-class): .1 .2 .11 .14 .15 .16 .17 .18 .19 closed.
+
+**Waiting for Tobias:**
+1. `make install-omarchy` (edit-b6ai.11): makes sublimité Omarchy's default editor through a wrapper named `fresh` (the only way Omarchy's launcher waits for git commit). Non-inline opens may flash an empty terminal; he should see it. `make uninstall-omarchy` restores.
+2. edit-b6ai.4 padding/chrome/top edge (his eye), edit-b6ai.5 Wayland on Hyprland (his use), then .10 prefer Wayland.
+3. Question: should wrapped mode stop scrolling past the end (unwrapped does)? Kept Sublime's scroll-past-end for now.
+
+**Box traps (monolith):** never start an Xvfb without an explicit display number (edit-b6ai.19); never inject input on :0; if /tmp/.X11-unix/X0 is missing, `ln /tmp/.X11-unix/X0_ /tmp/.X11-unix/X0`. After a reboot restart Xvfb :99 (and :97 for drives: 3840x2160, -dpi 52) and rebuild /tmp/edit-corpus. Codex must be logged in (`codex login status`). Rules for workers: build/briefs/_rules-s29.md (13 rules). Claude workers only until Tobias says Codex is back under pace.
+
+**Next, in order:** .3 (system monospace font), .6 (Wayland raster wl_shm), .7/.8 (fractional scale, activation), then the backlog beads .12/.13/.20/.21 and flakes edit-ecbb and the scroll_test bead only when they bite. Windows line (session 28) unchanged: branch wt/edit-177r.32-s28 waits on a full Windows check on Spiral, on Tobias's word.
+
+---
+
 # HANDOFF — sublimité, session 29 on monolith (2026-11-02; Opus 5.5 coordinator, Tobias present)
 
 ## Read first (session 30)
