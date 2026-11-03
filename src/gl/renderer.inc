@@ -1,4 +1,4 @@
-/* EGL renderer: Mesa DRI3 on X11, native Wayland; loader runs on init worker. */
+/* EGL renderer: Mesa DRI3 or NVIDIA egl-x11 on X11, native Wayland; loader runs on init worker. */
 #include "gl/gl.h"
 #include "base/base.h"
 #include "trace/trace.h"
@@ -711,8 +711,9 @@ static void gl_draw(gl_state *s)
     GLint native_h=(GLint)s->native_height;
     s->gBlitFramebuffer(0,0,(GLint)w,(GLint)h,0,native_h-(GLint)h,(GLint)w,native_h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
 }
-/* EGL has no portable Present serial API. Restrict to Mesa DRI3 and prove its
- * low-32-bit SBC serial convention with three real swaps before accepting init.
+/* EGL has no portable Present serial API. Restrict to Mesa DRI3 and NVIDIA
+ * egl-x11 (gl_x11_vendor_supported) and prove the low-32-bit SBC serial
+ * convention with three real swaps before accepting strict init.
  * No NotifyMSC surrogate: only PIXMAP Complete events acknowledge our swaps. */
 static bool gl_display_mode(uint8_t mode)
 {
@@ -757,6 +758,14 @@ static bool gl_probe_present(gl_state *s)
         if (!seen) ok=false;
     }
     return ok;
+}
+/* X11 EGL vendors whose PresentPixmap serial convention was observed: low 32
+ * bits of the SBC, starting at 1, PresentPixmap and PIXMAP Complete on the
+ * EGL connection. Mesa DRI3 (P2.4); NVIDIA's egl-x11 platform library
+ * (edit-b6ai.14, 580.178.04 + egl-x11 1.0.6 on XWayland 24.1.14). */
+static bool gl_x11_vendor_supported(const char *vendor)
+{
+    return vendor!=NULL && (strstr(vendor,"Mesa")!=NULL || strcmp(vendor,"NVIDIA")==0);
 }
 static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_interval)
 {
@@ -805,7 +814,7 @@ static int gl_context_init(gl_state *s,const render_config *cfg,EGLint swap_inte
     s->egl_live=true;
     const char *extensions=s->eQueryString(s->display,EGL_EXTENSIONS);
     const char *vendor=s->eQueryString(s->display,EGL_VENDOR);
-    if (!gl_extension(extensions,"EGL_KHR_create_context") || (!wayland && (vendor==NULL || strstr(vendor,"Mesa")==NULL))) goto fail;
+    if (!gl_extension(extensions,"EGL_KHR_create_context") || (!wayland && !gl_x11_vendor_supported(vendor))) goto fail;
     if (!s->eBindAPI(EGL_OPENGL_API)) goto fail;
     EGLConfig configs[256]; EGLint count=0;
     const EGLint attrs[]={EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_BIT,

@@ -786,6 +786,22 @@ static int gl_review_modes_test(void)
     puts("gl_review: section=4 PASS (Skip fails without T6; Copy, Flip, SuboptimalCopy displayed)");
     return 0;
 }
+/* edit-b6ai.14: NVIDIA's egl-x11 platform (580.178.04, egl-x11 1.0.6) was
+ * observed on monolith XWayland to issue PresentPixmap on the EGL connection
+ * with serials 1,2,3.. and PIXMAP Complete in Copy/Flip/SuboptimalCopy, the
+ * same convention as Mesa DRI3. Unknown vendors stay refused. */
+static int gl_review_vendor_test(void)
+{
+    GL_CHECK(gl_x11_vendor_supported("Mesa Project"));
+    GL_CHECK(gl_x11_vendor_supported("Mesa"));
+    GL_CHECK(gl_x11_vendor_supported("NVIDIA"));
+    GL_CHECK(!gl_x11_vendor_supported(NULL));
+    GL_CHECK(!gl_x11_vendor_supported(""));
+    GL_CHECK(!gl_x11_vendor_supported("NVIDIA Corporation"));
+    GL_CHECK(!gl_x11_vendor_supported("Advanced Micro Devices, Inc."));
+    puts("gl_review: vendor PASS (Mesa and NVIDIA accepted on X11; unknown refused)");
+    return 0;
+}
 static int gl_review_notify_test(void)
 {
     gl_state s; render_backend b; plat p; gl_review_queue q={.count=1};
@@ -1668,6 +1684,7 @@ int main(int argc, char **argv)
     bool native_available=false;
     GL_CHECK(gl_review_native_available(&native_available)==0);
     if (!native_available) {
+        GL_CHECK(gl_review_vendor_test()==0);
         GL_CHECK(gl_review_modes_test()==0 && gl_review_notify_test()==0);
         GL_CHECK(gl_review_budget_test()==0 && gl_review_completion_faults()==0);
         GL_CHECK(gl_review_stalled_server()==0 && gl_review_trace_test()==0);
@@ -1678,6 +1695,7 @@ int main(int argc, char **argv)
     GL_CHECK(gl_review_startup_test()==0);
     GL_CHECK(gl_review_startup_resize_test()==0);
     GL_CHECK(gl_review_failures_test()==0);
+    GL_CHECK(gl_review_vendor_test()==0);
     GL_CHECK(gl_review_modes_test()==0);
     GL_CHECK(gl_review_notify_test()==0);
     GL_CHECK(gl_review_budget_test()==0);
