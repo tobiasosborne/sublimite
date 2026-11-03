@@ -239,6 +239,28 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
 fail:
     ipc_args_fini(out); return rc;
 }
+static bool activation_text(const char *s)
+{
+    size_t n=s?strnlen(s,IPC_ACTIVATION_CAP):0;
+    if(n==0 || n>=IPC_ACTIVATION_CAP) return false;
+    for(size_t i=0;i<n;i++) if((unsigned char)s[i]<0x21u || (unsigned char)s[i]==0x7fu) return false;
+    return true;
+}
+ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id)
+{
+    if(args==NULL) return IPC_INVALID;
+    args->request.activation_token=args->request.startup_id=NULL;
+    /* The block must fit beside the paths and stdin already read (stdin takes
+     * every byte of the wire that remains); otherwise drop it, not the file. */
+    size_t used=24u+strlen(args->request.cwd)+1u+args->request.stdin_size;
+    for(size_t i=0;i<args->request.count;i++) used+=12u+strlen(args->request.paths[i].path)+1u;
+    bool token_ok=activation_text(token), startup_ok=activation_text(startup_id);
+    size_t block=token_ok||startup_ok ? 4u+(token_ok?strlen(token)+1u:0)+(startup_ok?strlen(startup_id)+1u:0) : 0;
+    if(used+block>IPC_MAX_WIRE) return IPC_OK;
+    if(token_ok) { args->request.activation_token=copy_string(&args->arena,token); if(!args->request.activation_token) return IPC_IO; }
+    if(startup_ok) { args->request.startup_id=copy_string(&args->arena,startup_id); if(!args->request.startup_id) return IPC_IO; }
+    return IPC_OK;
+}
 ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
 {
     if(args==NULL || !args->request.has_stdin || args->request.stdin_data!=NULL) return IPC_INVALID;

@@ -8,6 +8,7 @@
 #include "protocol/presentation-client.h"
 #include "protocol/viewporter-client.h"
 #include "protocol/fractional-scale-v1-client.h"
+#include "protocol/xdg-activation-v1-client.h"
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <xkbcommon/xkbcommon.h>
@@ -71,6 +72,11 @@ typedef struct wayland_state {
     struct wp_fractional_scale_manager_v1 *fraction_manager;
     struct wp_viewport *viewport;
     struct wp_fractional_scale_v1 *fraction;
+    /* edit-b6ai.8: xdg_activation_v1; token is a self-requested token in
+     * flight; input_serial the last key, button or keyboard-enter serial. */
+    struct xdg_activation_v1 *activation;
+    struct xdg_activation_token_v1 *token;
+    uint32_t input_serial;
     bool fractional, scale_dirty;
     uint32_t scale120, logical_w, logical_h, pending_logical_w, pending_logical_h, dest_w, dest_h;
     uint32_t compositor_name, shell_name, seat_name, presentation_name;
@@ -255,7 +261,7 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
     push(s, (plat_event){.kind = PLAT_EV_KEYMAP});
 }
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
-{ (void)keyboard; (void)surface; (void)keys; wayland_state *s = data; s->serial = serial; focus(s, true); }
+{ (void)keyboard; (void)surface; (void)keys; wayland_state *s = data; s->serial = s->input_serial = serial; focus(s, true); }
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface)
 { (void)keyboard; (void)surface; wayland_state *s = data; s->serial = serial; focus(s, false); }
 static uint64_t input_stamp(wayland_state *s, uint32_t ms)
@@ -305,7 +311,7 @@ bool wayland_input_key(plat *p, uint32_t key, uint32_t time, bool press, bool re
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
 {
-    (void)keyboard; wayland_state *s = data; s->serial = serial; s->last_time = time;
+    (void)keyboard; wayland_state *s = data; s->serial = s->input_serial = serial; s->last_time = time;
     bool press = state == WL_KEYBOARD_KEY_STATE_PRESSED;
     bool emitted = wayland_input_key(s->p, key, time, press, false);
     if (press && emitted && s->keymap && key <= UINT32_MAX - 8u && xkb_keymap_key_repeats(s->keymap, key + 8u)) {
@@ -351,7 +357,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
 }
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
 {
-    (void)pointer; wayland_state *s = data; s->serial = serial;
+    (void)pointer; wayland_state *s = data; s->serial = s->input_serial = serial;
     uint32_t code;
     switch (button) { /* Linux input-event-codes.h BTN_* -> plat.h button ABI */
     case 0x110: code = 1; break; case 0x111: code = 3; break; case 0x112: code = 2; break;
@@ -491,10 +497,40 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         s->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1); /* (P) stable v1 */
     } else if (!strcmp(interface, "wp_fractional_scale_manager_v1") && !s->fraction_manager) {
         s->fraction_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1); /* (P) v1 */
+    } else if (!strcmp(interface, "xdg_activation_v1") && !s->activation) {
+        s->activation = wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1); /* (P) v1 */
     } else if (!strcmp(interface, "wp_presentation") && !s->presentation) {
         s->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1); s->presentation_name = name;
         wp_presentation_add_listener(s->presentation, &presentation_listener, s);
     }
+}
+/* edit-b6ai.8: a self-requested token arrives; activate with it once. */
+static void token_done(void *data, struct xdg_activation_token_v1 *token, const char *text)
+{
+    wayland_state *s = data;
+    if (s->activation && s->surface && text && *text) xdg_activation_v1_activate(s->activation, text, s->surface);
+    xdg_activation_token_v1_destroy(token); if (s->token == token) s->token = NULL;
+    (void)wl_display_flush(s->conn);
+}
+static const struct xdg_activation_token_v1_listener token_listener = {.done = token_done};
+int wayland_plat_activate(plat *p, const char *token, const char *startup_id)
+{
+    (void)startup_id; /* an X11 startup-notification id is not a Wayland token */
+    wayland_state *s = W(p);
+    if (!s || !s->activation || !s->surface) return PLAT_ERR_FAIL;
+    if (token && *token) xdg_activation_v1_activate(s->activation, token, s->surface);
+    else if (!s->token) {
+        /* Without the launcher's token, ask for one tied to our last input
+         * and surface. Compositors decide whether to honour such a token
+         * (focus-stealing prevention); see docs/decisions/edit-b6ai.8.md. */
+        s->token = xdg_activation_v1_get_activation_token(s->activation);
+        if (!s->token) return PLAT_ERR_FAIL;
+        xdg_activation_token_v1_add_listener(s->token, &token_listener, s);
+        if (s->input_serial && s->seat) xdg_activation_token_v1_set_serial(s->token, s->input_serial, s->seat);
+        xdg_activation_token_v1_set_surface(s->token, s->surface);
+        xdg_activation_token_v1_commit(s->token);
+    }
+    return wl_display_flush(s->conn) < 0 && errno != EAGAIN ? PLAT_ERR_FAIL : PLAT_OK;
 }
 static void registry_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
@@ -861,6 +897,8 @@ void wayland_plat_shutdown(plat *p)
         if (s->fraction) wp_fractional_scale_v1_destroy(s->fraction);
         if (s->viewport) wp_viewport_destroy(s->viewport);
         if (s->surface) wl_surface_destroy(s->surface);
+        if (s->token) xdg_activation_token_v1_destroy(s->token);
+        if (s->activation) xdg_activation_v1_destroy(s->activation);
         if (s->fraction_manager) wp_fractional_scale_manager_v1_destroy(s->fraction_manager);
         if (s->viewporter) wp_viewporter_destroy(s->viewporter);
         if (s->presentation) wp_presentation_destroy(s->presentation);
@@ -887,6 +925,7 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
 void wayland_plat_shutdown(plat *p) { (void)p; }
 void wayland_plat_map(plat *p) { (void)p; }
 void wayland_plat_set_blink(plat *p, uint32_t ms) { (void)p; (void)ms; }
+int wayland_plat_activate(plat *p, const char *token, const char *startup_id) { (void)p; (void)token; (void)startup_id; return PLAT_ERR_FAIL; }
 void wayland_plat_set_repeat(plat *p, uint32_t delay_ms, uint32_t rate_hz) { (void)p; (void)delay_ms; (void)rate_hz; }
 int wayland_plat_set_present_events(plat *p, bool enabled) { (void)p; (void)enabled; return PLAT_ERR_FAIL; }
 bool wayland_plat_poll_event(plat *p, plat_event *out) { (void)p; (void)out; return false; }

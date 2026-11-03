@@ -53,6 +53,12 @@ void plat_set_cursor(plat *p, plat_cursor_shape shape)
     x11_plat_set_cursor(p, shape);
 }
 
+int plat_activate(plat *p, const char *token, const char *startup_id)
+{
+    if (p && p->backend == PLAT_BACKEND_WAYLAND) return wayland_plat_activate(p, token, startup_id);
+    return x11_plat_activate(p, token, startup_id);
+}
+
 int plat_set_present_events(plat *p, bool enabled)
 {
     if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_set_present_events(p, enabled); }

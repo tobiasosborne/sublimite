@@ -95,6 +95,7 @@ void gl_review_plat_shutdown(plat *p);
 #define x11_plat_set_blink gl_review_plat_set_blink
 #define x11_plat_set_cursor gl_test_x11_plat_set_cursor
 #define x11_plat_set_dark gl_review_plat_set_dark
+#define x11_plat_activate gl_review_plat_activate
 #define plat_quit gl_review_plat_quit
 #define plat_run gl_review_plat_run
 #define x11_plat_run gl_review_plat_run
@@ -124,6 +125,7 @@ void gl_review_plat_shutdown(plat *p);
 #undef x11_plat_set_blink
 #undef x11_plat_set_cursor
 #undef x11_plat_set_dark
+#undef x11_plat_activate
 #undef plat_quit
 #undef plat_run
 #undef x11_plat_run

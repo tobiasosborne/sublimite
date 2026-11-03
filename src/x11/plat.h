@@ -148,6 +148,15 @@ void plat_set_dark(plat *p, bool dark);
 typedef enum plat_cursor_shape { PLAT_CURSOR_DEFAULT, PLAT_CURSOR_TEXT } plat_cursor_shape;
 /* Changes only on a new wanted shape. Unsupported backends leave it alone. */
 void plat_set_cursor(plat *p, plat_cursor_shape shape);
+/* edit-b6ai.8: raise and focus the window for a second launch's handoff.
+ * token is the launcher's XDG_ACTIVATION_TOKEN, startup_id its
+ * DESKTOP_STARTUP_ID; either may be NULL. X11 sends _NET_ACTIVE_WINDOW
+ * (source indication 1) with the startup id's _TIME<n> timestamp, else a fresh
+ * server time, else the last input time. Wayland activates with the token,
+ * or requests one from the last input serial and activates when it arrives.
+ * Asynchronous: PLAT_OK means requested; the window manager or compositor
+ * decides. UI only, IPC handoff path, never typing. */
+int  plat_activate(plat *p, const char *token, const char *startup_id);
 /* Raster owns completion on its private connection; avoid duplicate UI wakes. */
 int  plat_set_present_events(plat *p, bool enabled);
 void plat_quit(plat *p);

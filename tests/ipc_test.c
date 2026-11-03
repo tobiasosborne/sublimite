@@ -1068,6 +1068,125 @@ static void t_astra_many_open(const char *dir, bool handoff)
     puts("astra_many_open: shared epoll survives retirement; clean source change reloaded");
     editor_close(e); if (handoff) ipc_server_fini(&server); rm_rf(rt);
 }
+
+/* ---- edit-b6ai.8: activation fields (XDG_ACTIVATION_TOKEN, DESKTOP_STARTUP_ID) ---- */
+#define ACT_TOKEN "5f0a3c-token_X.1"
+#define ACT_STARTUP "host;4242;sublimite;_TIME987654"
+/* The decoder of every build before this bead, as a model: header rules only.
+ * It must accept a request without activation and reject one with it, which
+ * is why the client retries without the fields on IPC_PROTOCOL. */
+static bool legacy_accepts(const uint8_t *wire, size_t size)
+{
+    return size>=24 && memcmp(wire,"EDIP",4)==0 && wire[4]==1 && wire[5]<=3 && wire[6]==0 && wire[7]==0;
+}
+static ipc_result act_seen(const ipc_request *r, ipc_token token, void *ctx)
+{
+    (void)token; ipc_request *out=ctx;
+    CHECK(r->count==1 && r->activation_token!=NULL && r->startup_id!=NULL);
+    CHECK(strcmp(r->activation_token,ACT_TOKEN)==0 && strcmp(r->startup_id,ACT_STARTUP)==0);
+    out->count++; return IPC_OK;
+}
+/* A server of the previous release on the real socket name: header rules of
+ * legacy_accepts, replies like ipc_posix. Reports "verdict flagbyte" per
+ * connection through fd. */
+static void legacy_server(int listener, int report)
+{
+    for(int i=0;i<2;i++) {
+        int fd=accept(listener,NULL,NULL); if(fd<0) _exit(3);
+        uint8_t head[24]; size_t got=0;
+        while(got<24) { ssize_t k=read(fd,head+got,24-got); if(k<=0) _exit(4); got+=(size_t)k; }
+        size_t total=(size_t)head[8]|(size_t)head[9]<<8|(size_t)head[10]<<16|(size_t)head[11]<<24;
+        uint8_t rest[4096]; if(total<24 || total-24>sizeof rest) _exit(5);
+        got=0; while(got<total-24) { ssize_t k=read(fd,rest+got,total-24-got); if(k<=0) _exit(6); got+=(size_t)k; }
+        bool ok=legacy_accepts(head,total);
+        uint8_t verdict[2]={ok?0:1,head[5]}; if(write(report,verdict,2)!=2) _exit(7);
+        uint8_t reply[8]={'E','D','I','R','A',ok?(uint8_t)IPC_OK:(uint8_t)IPC_PROTOCOL,0,0};
+        if(write(fd,reply,8)!=8) _exit(8);
+        close(fd);
+    }
+    _exit(0);
+}
+static void t_activation(const char *dir)
+{
+    uint8_t wire[8192]; size_t n=0; ipc_request r=request(false,true), out={0};
+    /* Absent fields: byte-identical to the previous format. */
+    CHECK(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK && legacy_accepts(wire,n) && !(wire[5]&4u));
+    CHECK(ipc_wire_decode(wire,n,&out)==IPC_OK && out.activation_token==NULL && out.startup_id==NULL);
+    /* Both, token only, startup id only: exact round trip. */
+    const struct { const char *token,*startup; } cases[]={{ACT_TOKEN,ACT_STARTUP},{ACT_TOKEN,NULL},{NULL,ACT_STARTUP},{"",""}};
+    for(size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
+        r.activation_token=cases[i].token; r.startup_id=cases[i].startup;
+        bool any=(cases[i].token&&cases[i].token[0])||(cases[i].startup&&cases[i].startup[0]);
+        CHECK(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
+        CHECK(((wire[5]&4u)!=0)==any && legacy_accepts(wire,n)==!any);
+        ipc_request d={0}; CHECK(ipc_wire_decode(wire,n,&d)==IPC_OK);
+        CHECK(d.has_stdin && d.stdin_size==5 && memcmp(d.stdin_data,"a\0b\nc",5)==0 && d.count==1);
+        CHECK(any ? (cases[i].token&&cases[i].token[0] ? d.activation_token&&strcmp(d.activation_token,cases[i].token)==0 : d.activation_token==NULL) : d.activation_token==NULL);
+        CHECK(any ? (cases[i].startup&&cases[i].startup[0] ? d.startup_id&&strcmp(d.startup_id,cases[i].startup)==0 : d.startup_id==NULL) : d.startup_id==NULL);
+        for(size_t k=0;k<n;k++) CHECK(ipc_wire_decode(wire,k,&d)==IPC_PROTOCOL); /* every truncation */
+    }
+    /* Encoder refuses unusable strings; the decoder refuses malformed blocks. */
+    char big[IPC_ACTIVATION_CAP+8]; memset(big,'a',sizeof big); big[sizeof big-1]=0;
+    const char *bad[]={"has space","ctrl\x01x","tab\tx","del\x7f",big};
+    for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+        r.activation_token=bad[i]; r.startup_id=NULL; CHECK(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_INVALID && n==0);
+        r.activation_token=NULL; r.startup_id=bad[i]; CHECK(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_INVALID);
+    }
+    r.activation_token=ACT_TOKEN; r.startup_id=ACT_STARTUP; CHECK(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
+    size_t blk=(size_t)wire[6]|(size_t)wire[7]<<8; CHECK(blk==4u+sizeof ACT_TOKEN+sizeof ACT_STARTUP && blk<n);
+    uint8_t m[8192]; ipc_request d;
+    memcpy(m,wire,n); m[5]&=(uint8_t)~4u; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);   /* block size without the flag */
+    memcpy(m,wire,n); m[6]=m[7]=0; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);           /* flag without a block */
+    memcpy(m,wire,n); m[6]=3; m[7]=0; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* block shorter than its header */
+    memcpy(m,wire,n); m[7]=0xff; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);             /* block larger than the request */
+    memcpy(m,wire,n); m[5]|=8u; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);              /* unknown flag */
+    memcpy(m,wire,n); m[n-blk]++; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* token length disagrees with block */
+    memcpy(m,wire,n); m[n-1]='x'; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* no trailing NUL */
+    memcpy(m,wire,n); m[n-blk+4+2]=0; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* NUL inside the token */
+    memcpy(m,wire,n); m[n-blk+4]=' '; CHECK(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* space inside the token */
+    /* Launcher helper: copies, drops unusable values instead of failing the handoff. */
+    char *av[]={"sublimite","/tmp/x"}; ipc_args a={0}; CHECK(ipc_parse_args(2,av,&a)==IPC_OK);
+    CHECK(a.request.activation_token==NULL && a.request.startup_id==NULL);
+    char token[]=ACT_TOKEN, startup[]=ACT_STARTUP;
+    CHECK(ipc_args_set_activation(&a,token,startup)==IPC_OK);
+    token[0]='Z'; startup[0]='Z'; /* the request owns copies */
+    CHECK(strcmp(a.request.activation_token,ACT_TOKEN)==0 && strcmp(a.request.startup_id,ACT_STARTUP)==0);
+    CHECK(ipc_args_set_activation(&a,"bad token",big)==IPC_OK && a.request.activation_token==NULL && a.request.startup_id==NULL);
+    CHECK(ipc_args_set_activation(&a,NULL,"")==IPC_OK && a.request.activation_token==NULL && a.request.startup_id==NULL);
+    ipc_args_fini(&a);
+    /* New launcher, new server: the callback sees both fields. */
+    {
+        ipc_server s={0}; CHECK(ipc_server_init(&s,dir)==IPC_OK);
+        pid_t child=fork(); CHECK(child>=0);
+        if(child==0) { ipc_request q=request(false,false); q.activation_token=ACT_TOKEN; q.startup_id=ACT_STARTUP;
+            _exit(ipc_client_send(dir,&q,CLIENT_TIMEOUT_MS)==IPC_OK?0:2); }
+        ipc_request seen={0};
+        for(int i=0;i<40 && seen.count==0;i++) (void)pump(&s,act_seen,&seen,500);
+        CHECK(seen.count==1); reap_ok(child); ipc_server_fini(&s);
+    }
+    /* New launcher, previous-release server: rejected once, then resent
+     * without the fields and accepted. Old launcher, new server is the
+     * no-flag format above. */
+    {
+        char legacy[IPC_PATH_CAP]; subdir(dir,"legacy",legacy);
+        char path[IPC_PATH_CAP]; sock_path(legacy,path);
+        int listener=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); CHECK(listener>=0);
+        struct sockaddr_un addr={.sun_family=AF_UNIX}; CHECK(strlen(path)<sizeof addr.sun_path);
+        strcpy(addr.sun_path,path); CHECK(bind(listener,(struct sockaddr *)&addr,sizeof addr)==0 && listen(listener,4)==0);
+        int rp[2]; CHECK(pipe(rp)==0);
+        pid_t server=fork(); CHECK(server>=0);
+        if(server==0) { close(rp[0]); legacy_server(listener,rp[1]); }
+        close(listener); close(rp[1]);
+        ipc_request q=request(false,false); q.activation_token=ACT_TOKEN; q.startup_id=ACT_STARTUP;
+        CHECK(ipc_client_send(legacy,&q,CLIENT_TIMEOUT_MS)==IPC_OK);
+        uint8_t v[4]; CHECK(read(rp[0],v,4)==4);
+        CHECK(v[0]==1 && (v[1]&4u)); /* first attempt carried activation and was refused */
+        CHECK(v[2]==0 && !(v[3]&4u)); /* the resend is the previous format and was accepted */
+        close(rp[0]); int st; CHECK(waitpid(server,&st,0)==server && WIFEXITED(st) && WEXITSTATUS(st)==0);
+        CHECK(unlink(path)==0); CHECK(rmdir(legacy)==0);
+    }
+}
+
 static int run_suite(const char *only, int ns_fd)
 {
     alarm(120); const char *dir=test_ipc_isolate(); CHECK(dir!=NULL);
@@ -1087,7 +1206,7 @@ static int run_suite(const char *only, int ns_fd)
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));
-    T("display",t_display(dir)); T("memory",t_memory(dir)); T("wait_disconnect",t_wait_disconnect(dir)); T("launcher",t_launcher(dir));
+    T("display",t_display(dir)); T("memory",t_memory(dir)); T("wait_disconnect",t_wait_disconnect(dir)); T("launcher",t_launcher(dir)); T("activation",t_activation(dir));
 #undef T
     if(only!=NULL) { rm_rf(dir); return 0; }
     char p[IPC_PATH_CAP]; const char *names[]={"a:1","link","real"};

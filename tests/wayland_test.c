@@ -225,6 +225,43 @@ static void fractional_test(void)
     fractional_absent_test();
 }
 
+/* ---- edit-b6ai.8: xdg_activation_v1 for a second launch's handoff ------ */
+static void activation_test(void)
+{
+    mock_shm_shared *shared = frac_shared();
+    mock_shm = (mock_shm_options){.activation = true, .shared = shared};
+    pid_t child = mock_start(true);
+    plat p; plat_config cfg = {.width = 1, .height = 1, .work_wake = NULL};
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
+    plat_event ev; while (plat_poll_event(&p, &ev)) {}
+    /* Forwarded launcher token: activate with it, on our surface, no request. */
+    assert(plat_activate(&p, "launcher-token", NULL) == PLAT_OK);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
+    assert(shared->activations == 1 && !strcmp(shared->activated, "launcher-token"));
+    assert(shared->activate_surface_ok && shared->tokens == 0);
+    /* No token (an X11 startup id is not one): request a token from the last
+     * input serial and our surface, then activate with what the compositor
+     * returns. Whether it honours a self-requested token is its policy. */
+    assert(shared->input_serial != 0);
+    assert(plat_activate(&p, NULL, "host_TIME5") == PLAT_OK);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0); /* token done dispatched -> activate sent */
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0); /* activate processed */
+    assert(shared->tokens == 1 && shared->token_serial == shared->input_serial);
+    assert(shared->token_seat_ok && shared->token_surface_ok);
+    assert(shared->activations == 2 && !strcmp(shared->activated, "mock-token-1") && shared->activate_surface_ok);
+    plat_shutdown(&p); mock_join(child);
+    /* Without the global: a clean refusal, nothing sent. */
+    mock_shm = (mock_shm_options){.shared = shared}; shared->activations = 0;
+    child = mock_start(true);
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    assert(plat_activate(&p, "launcher-token", NULL) == PLAT_ERR_FAIL);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0 && shared->activations == 0);
+    plat_shutdown(&p); mock_join(child);
+    munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
+    puts("wayland_test: xdg_activation_v1 forwarded token, self-requested token (input serial + surface), absent global");
+}
+
 /* ---- edit-b6ai.6: Wayland CPU raster backend over wl_shm --------------- */
 /* (P) Grid: the P2.5 live-pixel fixture of tests/raster_test.c, 4 x 6 cells
  * of 8 x 16 px = 32 x 96 px, one 8 x 16 glyph page. The surface adds four
@@ -875,6 +912,7 @@ int main(int argc, char **argv)
     raster_test();
     editor_raster_test();
     fractional_test();
+    activation_test();
     editor_fractional_test();
     allocation_test();
     output_test();

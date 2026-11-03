@@ -60,6 +60,18 @@ void plat_set_cursor(plat *p, plat_cursor_shape shape)
     if (!ui(s) || (unsigned)shape>PLAT_CURSOR_TEXT || s->cursor_shape==shape) return;
     s->cursor_shape=shape; SetCursor(s->cursors[shape]);
 }
+/* edit-b6ai.8: Windows has no activation token; the second launch grants
+ * foreground rights with AllowSetForegroundWindow before its handoff
+ * (src/ipc/ipc_win.c). Without the grant SetForegroundWindow only flashes
+ * the taskbar button, which is the system's focus-stealing policy. */
+int plat_activate(plat *p, const char *token, const char *startup_id)
+{
+    (void)token; (void)startup_id;
+    win32_plat *s=win32_private(p);
+    if (!ui(s)) return PLAT_ERR_FAIL;
+    if (IsIconic(s->hwnd)) (void)ShowWindow(s->hwnd, SW_RESTORE);
+    return SetForegroundWindow(s->hwnd) ? PLAT_OK : PLAT_ERR_FAIL;
+}
 bool plat_poll_event(plat *p, plat_event *out)
 {
     win32_plat *s=win32_private(p);

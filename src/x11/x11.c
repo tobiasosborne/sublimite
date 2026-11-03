@@ -536,6 +536,7 @@ int x11_plat_init(plat *p, const plat_config *cfg) {
     xcb_screen_t *s = si.data;
     x11_private(p)->visual = s->root_visual;
     x11_private(p)->depth = s->root_depth;
+    x11_private(p)->root = s->root;
     for (xcb_depth_iterator_t di = xcb_screen_allowed_depths_iterator(s); di.rem; xcb_depth_next(&di)) {
         if (di.data->depth != 32) continue;
         xcb_visualtype_iterator_t vi = xcb_depth_visuals_iterator(di.data);
@@ -645,6 +646,52 @@ void x11_plat_set_dark(plat *p, bool dark) {
     xcb_flush(c);
 }
 
+/* edit-b6ai.8: startup-notification ids end in "_TIME<timestamp>" (the
+ * launcher's X server time of the user action). Zero or malformed: none. */
+static bool startup_time(const char *id, uint32_t *out)
+{
+    const char *at = NULL;
+    for (const char *s = id ? strstr(id, "_TIME") : NULL; s; s = strstr(s + 1, "_TIME")) at = s;
+    if (!at || !at[5]) return false;
+    uint64_t t = 0;
+    for (const char *d = at + 5; *d; d++) {
+        if (*d < '0' || *d > '9') return false;
+        t = t * 10u + (uint64_t)(*d - '0');
+        if (t > UINT32_MAX) return false;
+    }
+    *out = (uint32_t)t; return t != 0;
+}
+/* EWMH _NET_ACTIVE_WINDOW: source indication 1 (application), timestamp,
+ * no currently active window of ours. Delivered to the window manager by
+ * a SubstructureRedirect|SubstructureNotify send to the root. */
+static void send_active(x11_plat *x, uint32_t time)
+{
+    xcb_client_message_event_t m;
+    memset(&m, 0, sizeof m);
+    m.response_type = XCB_CLIENT_MESSAGE; m.format = 32; m.window = x->win; m.type = x->net_active;
+    m.data.data32[0] = 1; m.data.data32[1] = time;
+    xcb_send_event(x->conn, 0, x->root, XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY, (const char *)&m);
+    xcb_flush(x->conn);
+}
+/* IPC handoff only (atom round trips at most once per connection), never typing. */
+int x11_plat_activate(plat *p, const char *token, const char *startup_id)
+{
+    (void)token; /* Wayland's activation token has no X11 meaning */
+    x11_plat *x = x11_private(p);
+    if (!x || !x->conn || !x->win || !x->root) return PLAT_ERR_FAIL;
+    xcb_connection_t *c = x->conn;
+    if (!x->net_active) x->net_active = atom(c, "_NET_ACTIVE_WINDOW");
+    if (!x->net_active) return PLAT_ERR_FAIL;
+    uint32_t time = 0;
+    if (startup_time(startup_id, &time)) { send_active(x, time); return PLAT_OK; }
+    if (x->activate_pending) return PLAT_OK; /* one stamp in flight serves both */
+    if (!x->activate_prop) x->activate_prop = atom(c, "_SUBLIMITE_ACTIVATE_TIME");
+    if (!x->activate_prop) { send_active(x, x->last_time); return PLAT_OK; }
+    xcb_change_property(c, XCB_PROP_MODE_APPEND, x->win, x->activate_prop, XCB_ATOM_STRING, 8, 0, NULL);
+    x->activate_pending = true; xcb_flush(c);
+    return PLAT_OK;
+}
+
 int x11_plat_set_present_events(plat *p, bool enabled) {
     if (!x11_private(p) || !x11_private(p)->conn) return PLAT_ERR_FAIL;
     if (!x11_private(p)->present_ok) return PLAT_OK;
@@ -720,6 +767,12 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e) 
         ev.t0_ns = x11_clock_map(&IN(p)->clock, x->time, trace_now_ns());
         x11_q_push(IN(p), &ev); break; }
     case XCB_SELECTION_REQUEST: case XCB_SELECTION_CLEAR: case XCB_SELECTION_NOTIFY: case XCB_PROPERTY_NOTIFY:
+        if (t == XCB_PROPERTY_NOTIFY && x11_private(p)->activate_pending) {
+            const xcb_property_notify_event_t *n = (const xcb_property_notify_event_t *)e;
+            if (n->window == x11_private(p)->win && n->atom == x11_private(p)->activate_prop) {
+                x11_private(p)->activate_pending = false; send_active(x11_private(p), n->time); break; /* edit-b6ai.8 */
+            }
+        }
         if (x11_clip_event(p, e, &ev)) x11_q_push(IN(p), &ev);
         break;
     case XCB_GE_GENERIC: {

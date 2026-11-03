@@ -187,20 +187,13 @@ static ipc_result receive_reply(HANDLE pipe, char kind, uint64_t deadline)
     if(memcmp(bytes,"EDIR",4) || bytes[4]!=(uint8_t)kind || bytes[5]>IPC_REJECTED || bytes[6] || bytes[7]) return IPC_PROTOCOL;
     return (ipc_result)bytes[5];
 }
-ipc_result ipc_client_send_display(const char *runtime, const char *display, const ipc_request *r, int timeout_ms)
+static ipc_result deliver(const endpoint *ep, uint8_t *wire, size_t n, bool wait, uint64_t deadline)
 {
-    if(timeout_ms < -1) return IPC_INVALID;
-    endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
-    if(rc!=IPC_OK) return rc;
-    edit_arena arena={0}; HANDLE pipe=INVALID_HANDLE_VALUE;
-    if(edit_arena_init(&arena,IPC_MAX_WIRE)!=0) { LocalFree(ep.security); return IPC_IO; }
-    uint8_t *wire=edit_arena_alloc(&arena,IPC_MAX_WIRE,1); size_t n=0;
-    rc=ipc_wire_encode(r,wire,IPC_MAX_WIRE,&n);
-    uint64_t deadline=timeout_ms<0?UINT64_MAX:milliseconds()+(uint64_t)timeout_ms;
-    while(rc==IPC_OK) {
-        pipe=published_connect(&ep);
+    HANDLE pipe=INVALID_HANDLE_VALUE; ipc_result rc=IPC_OK;
+    for(;;) {
+        pipe=published_connect(ep);
         if(pipe!=INVALID_HANDLE_VALUE) break;
-        HANDLE owner=OpenMutexW(SYNCHRONIZE,FALSE,ep.mutex);
+        HANDLE owner=OpenMutexW(SYNCHRONIZE,FALSE,ep->mutex);
         if(!owner) { rc=IPC_IO; break; }
         CloseHandle(owner);
         DWORD left=timeout_left(deadline);
@@ -209,11 +202,37 @@ ipc_result ipc_client_send_display(const char *runtime, const char *display, con
          * Reuse the OS process-wait poll interval, under the same deadline. */
         os_sleep_ns(UINT64_C(1000000));
     }
-    if(rc==IPC_OK && !own_peer(pipe,ep.sid,true)) rc=IPC_REJECTED;
+    if(rc==IPC_OK && !own_peer(pipe,ep->sid,true)) rc=IPC_REJECTED;
+    if(rc==IPC_OK) {
+        /* edit-b6ai.8: a launch the user just started may hand its foreground
+         * right to the running instance, which raises its window on receipt.
+         * Fails harmlessly when this process is not in the foreground. */
+        ULONG server=0;
+        if(GetNamedPipeServerProcessId(pipe,&server) && server) (void)AllowSetForegroundWindow(server);
+    }
     if(rc==IPC_OK) rc=transfer(pipe,wire,n,true,deadline);
     if(rc==IPC_OK) rc=receive_reply(pipe,'A',deadline);
-    if(rc==IPC_OK && r->wait) rc=receive_reply(pipe,'C',UINT64_MAX);
+    if(rc==IPC_OK && wait) rc=receive_reply(pipe,'C',UINT64_MAX);
     if(pipe!=INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    return rc;
+}
+ipc_result ipc_client_send_display(const char *runtime, const char *display, const ipc_request *r, int timeout_ms)
+{
+    if(timeout_ms < -1) return IPC_INVALID;
+    endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
+    if(rc!=IPC_OK) return rc;
+    edit_arena arena={0};
+    if(edit_arena_init(&arena,IPC_MAX_WIRE)!=0) { LocalFree(ep.security); return IPC_IO; }
+    uint8_t *wire=edit_arena_alloc(&arena,IPC_MAX_WIRE,1); size_t n=0;
+    rc=ipc_wire_encode(r,wire,IPC_MAX_WIRE,&n);
+    uint64_t deadline=timeout_ms<0?UINT64_MAX:milliseconds()+(uint64_t)timeout_ms;
+    if(rc==IPC_OK) rc=deliver(&ep,wire,n,r->wait,deadline);
+    if(rc==IPC_PROTOCOL && (r->activation_token!=NULL || r->startup_id!=NULL)) {
+        /* edit-b6ai.8: a server of an earlier release refuses the activation
+         * block. Resend in the previous format: the files still open. */
+        ipc_request plain=*r; plain.activation_token=plain.startup_id=NULL;
+        if(ipc_wire_encode(&plain,wire,IPC_MAX_WIRE,&n)==IPC_OK) rc=deliver(&ep,wire,n,r->wait,deadline);
+    }
     LocalFree(ep.security); edit_arena_free(&arena); return rc;
 }
 ipc_result ipc_client_send(const char *runtime, const ipc_request *r, int timeout_ms)

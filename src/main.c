@@ -141,6 +141,10 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
             }
             if (args.request.has_stdin && ipc_args_read_stdin(&args, _fileno(stdin)) != IPC_OK) goto startup_fail;
 #endif
+            /* edit-b6ai.8: forward the launcher's activation ids so the
+             * running instance can raise its window. A bad value is dropped
+             * by the helper; only an exhausted argument arena fails here. */
+            if (ipc_args_set_activation(&args, getenv("XDG_ACTIVATION_TOKEN"), getenv("DESKTOP_STARTUP_ID")) != IPC_OK) goto startup_fail;
             ipc_result sent = ipc_client_send_display(NULL, display, &args.request, 2000);
 #if defined(_WIN32)
             if (owns_server) {

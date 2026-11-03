@@ -931,7 +931,11 @@ int editor_open_request(editor *e, const ipc_request *request, ipc_token token)
 }
 static ipc_result open_request(const ipc_request *request, ipc_token token, void *ctx)
 {
-    int rc = editor_open_request(ctx, request, token);
+    editor *e = ctx;
+    int rc = editor_open_request(e, request, token);
+    /* edit-b6ai.8: only a second launch's handoff raises the window; the
+     * first launch's own open (editor_open_request directly) never does. */
+    if (!rc && e->has_platform) (void)plat_activate(&e->platform, request->activation_token, request->startup_id);
     return !rc ? IPC_OK : rc == EDITOR_ERR_CAPACITY ? IPC_LIMIT : IPC_REJECTED;
 }
 static void sweep_waits(editor *e)

@@ -197,6 +197,12 @@ ipc_result ipc_client_send_display(const char *runtime, const char *display, con
     rc=ipc_wire_encode(r,wire,IPC_MAX_WIRE,&n);
     uint64_t deadline=timeout_ms<0?UINT64_MAX:milliseconds()+(uint64_t)timeout_ms;
     if(rc==IPC_OK) rc=deliver(&ep,wire,n,r->wait,deadline);
+    if(rc==IPC_PROTOCOL && (r->activation_token!=NULL || r->startup_id!=NULL)) {
+        /* edit-b6ai.8: a server of an earlier release refuses the activation
+         * block. Resend in the previous format: the files still open. */
+        ipc_request plain=*r; plain.activation_token=plain.startup_id=NULL;
+        if(ipc_wire_encode(&plain,wire,IPC_MAX_WIRE,&n)==IPC_OK) rc=deliver(&ep,wire,n,r->wait,deadline);
+    }
     if(rc==IPC_REJECTED && ep.abstract) {
         /* Foreign uid on the abstract name; nothing was sent. Try the private path. */
         endpoint fb; if(resolve_fallback(display,&fb)==IPC_OK) {

@@ -20,6 +20,11 @@ typedef struct x11_plat {
     int32_t xkb_dev;
     bool core_wheel;
     uint32_t xi_scroll_ms;
+    /* edit-b6ai.8: plat_activate. root receives _NET_ACTIVE_WINDOW; a
+     * zero-length append to activate_prop stamps a fresh server time, and
+     * activate_pending sends the request when its PropertyNotify arrives. */
+    uint32_t root, net_active, activate_prop;
+    bool activate_pending;
 } x11_plat;
 
 /* Backend and white-box fixtures only; NULL before init/after shutdown. */

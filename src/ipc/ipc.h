@@ -10,6 +10,12 @@
 #define IPC_PATH_CAP 4096u
 #define IPC_MAX_WIRE (1024u * 1024u)
 #define IPC_MAX_CLIENTS 32u
+/* edit-b6ai.8: one activation string (XDG_ACTIVATION_TOKEN / DESKTOP_STARTUP_ID)
+ * is at most this many bytes with its NUL: both are short opaque ids
+ * (compositors issue tokens of a few dozen characters; the startup-notification
+ * spec's id is host;pid;program;_TIMEn), 512 leaves an order of magnitude
+ * of room while bounding the block at 4 + 2 x 512 bytes. */
+#define IPC_ACTIVATION_CAP 512u
 /* edit-457.21: bounded UI work per drain call (§10), request deadlines and
  * pressure eviction (§11), lifecycle lock deadline (§12), receive pool (§14). */
 #define IPC_DRAIN_BYTES (256u * 1024u)
@@ -36,6 +42,10 @@ typedef struct ipc_request {
     const uint8_t *stdin_data;
     size_t stdin_size;
     bool wait, has_stdin, new_instance;
+    /* edit-b6ai.8: the launcher's XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID
+     * (NULL = absent). The running instance uses them to raise its window;
+     * see docs/decisions/edit-b6ai.8.md for the wire format and compatibility. */
+    const char *activation_token, *startup_id;
 } ipc_request;
 typedef struct ipc_args {
     ipc_request request;
@@ -53,9 +63,18 @@ typedef struct ipc_args {
  * empty explicitly requests an empty chain. */
 ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out);
 ipc_result ipc_args_read_stdin(ipc_args *args, int fd);
+/* edit-b6ai.8: copy the launcher's activation environment into the request.
+ * NULL, empty and unusable values (control characters, spaces, longer than
+ * IPC_ACTIVATION_CAP) leave the field absent: a bad environment never fails
+ * the handoff. Returns IPC_IO only if the argument arena is exhausted. */
+ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id);
 void ipc_args_fini(ipc_args *args);
 /* Decoder borrows wire storage. Strings include a checked trailing NUL.
- * On any failure out is zeroed. Encoder never serializes new_instance. */
+ * On any failure out is zeroed. Encoder never serializes new_instance.
+ * Activation strings are serialized in a trailing block flagged by bit 2 of
+ * the flags byte, its size in header bytes 6-7; a request without them is
+ * byte-identical to the previous format, and the client resends in that form
+ * when a server of an earlier release answers IPC_PROTOCOL. */
 ipc_result ipc_wire_encode(const ipc_request *request, uint8_t *wire,
                            size_t capacity, size_t *size);
 ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out);

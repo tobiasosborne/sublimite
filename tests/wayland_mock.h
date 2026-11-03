@@ -7,6 +7,7 @@
 #include "wayland/protocol/presentation-server.h"
 #include "wayland/protocol/viewporter-server.h"
 #include "wayland/protocol/fractional-scale-v1-server.h"
+#include "wayland/protocol/xdg-activation-v1-server.h"
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -59,6 +60,14 @@ typedef struct mock_shm_shared {
     uint32_t commits, distinct, width, height, scale, damage_rects, releases, held_destroyed;
     uint32_t viewport_w, viewport_h, viewports, fractions, scales_sent;
     uint32_t request_scale; int32_t request_w, request_h;
+    /* edit-b6ai.8 xdg_activation_v1: input_serial is the last key/button/
+     * keyboard-enter serial sent; tokens counts committed token requests,
+     * token_serial their set_serial (zero = none) and *_ok whether the seat
+     * and surface were the client's; activations counts activate requests,
+     * activated holds the last token, activate_surface_ok its surface check. */
+    uint32_t input_serial, tokens, token_serial, activations;
+    bool token_seat_ok, token_surface_ok, activate_surface_ok;
+    char activated[64]; /* (P) longer than both fixture tokens; overflow truncates and fails the compare */
     uint32_t screen[MOCK_SCREEN_PX];
 } mock_shm_shared;
 typedef struct mock_shm_options {
@@ -72,6 +81,7 @@ typedef struct mock_shm_options {
      * a second preferred_scale of scale_to (0 = none). pointer_set replaces
      * the startup pointer position (surface-local, wl_fixed). */
     bool viewporter, fractional, pointer_set;
+    bool activation; /* edit-b6ai.8: advertise xdg_activation_v1 */
     uint32_t preferred_scale, scale_after, scale_to;
     wl_fixed_t pointer_x, pointer_y;
     mock_shm_shared *shared;
@@ -99,7 +109,16 @@ struct mock_wayland {
     /* edit-b6ai.7 add-ons: wp_viewport double-buffered destination */
     struct wl_resource *viewport, *fraction;
     int32_t dest_w, dest_h; bool dest_pending; uint32_t sent_scale;
+    struct wl_resource *seat; /* edit-b6ai.8: compared by set_serial */
+    uint32_t tokens_issued;
 };
+/* edit-b6ai.8: an input-event serial, recorded for the activation fixture. */
+static uint32_t mock_input(mock_wayland *m)
+{
+    uint32_t serial = wl_display_next_serial(m->display);
+    if (mock_shm.shared) mock_shm.shared->input_serial = serial;
+    return serial;
+}
 static void mock_destroy(struct wl_client *client, struct wl_resource *resource)
 { (void)client; wl_resource_destroy(resource); }
 static void mock_buffer_gone(struct wl_listener *listener, void *data)
@@ -224,24 +243,24 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
         if (mock_shm.configure_set) xdg_toplevel_send_configure(m->top, mock_shm.configure_w, mock_shm.configure_h, &states);
         else xdg_toplevel_send_configure(m->top, 2, 0, &states); /* minimum unit width plus one; zero height = client chooses */
         xdg_surface_send_configure(m->xdg, wl_display_next_serial(m->display));
-        wl_keyboard_send_enter(m->keyboard, wl_display_next_serial(m->display), m->surface, &states);
+        wl_keyboard_send_enter(m->keyboard, mock_input(m), m->surface, &states);
         wl_array_release(&states);
         wl_keyboard_send_modifiers(m->keyboard, wl_display_next_serial(m->display), 0, 0, 0, 0);
-        wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
-        wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_RELEASED);
+        wl_keyboard_send_key(m->keyboard, mock_input(m), 0, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
+        wl_keyboard_send_key(m->keyboard, mock_input(m), 0, 30, WL_KEYBOARD_KEY_STATE_RELEASED);
         wl_fixed_t px = mock_shm.pointer_set ? mock_shm.pointer_x : wl_fixed_from_int(1);
         wl_fixed_t py = mock_shm.pointer_set ? mock_shm.pointer_y : wl_fixed_from_int(1);
         wl_pointer_send_enter(m->pointer, wl_display_next_serial(m->display), m->surface, px, py);
         wl_pointer_send_motion(m->pointer, 0, px, py);
-        wl_pointer_send_button(m->pointer, wl_display_next_serial(m->display), 0, 0x110, WL_POINTER_BUTTON_STATE_PRESSED);
-        wl_pointer_send_button(m->pointer, wl_display_next_serial(m->display), 0, 0x110, WL_POINTER_BUTTON_STATE_RELEASED);
+        wl_pointer_send_button(m->pointer, mock_input(m), 0, 0x110, WL_POINTER_BUTTON_STATE_PRESSED);
+        wl_pointer_send_button(m->pointer, mock_input(m), 0, 0x110, WL_POINTER_BUTTON_STATE_RELEASED);
         wl_pointer_send_axis(m->pointer, 0, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(10));
         if (wl_resource_get_version(m->pointer) >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
             wl_pointer_send_axis_value120(m->pointer, WL_POINTER_AXIS_VERTICAL_SCROLL, 120);
             wl_pointer_send_frame(m->pointer);
         }
         for (size_t i = 0; i < m->payload_len; i++) {
-            wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), (uint32_t)i,
+            wl_keyboard_send_key(m->keyboard, mock_input(m), (uint32_t)i,
                 m->payload[i], m->payload[i] & 1u ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
             wl_pointer_send_axis(m->pointer, (uint32_t)i, m->payload[i] & 1u ? WL_POINTER_AXIS_HORIZONTAL_SCROLL : WL_POINTER_AXIS_VERTICAL_SCROLL,
                 (wl_fixed_t)((int)m->payload[i] - (int)UINT8_MAX / 2) * PLAT_WHEEL_UNIT);
@@ -258,10 +277,10 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
     if (!m->frame && !m->feedback) {
         if (!m->holding) {
             m->holding = true;
-            wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
+            wl_keyboard_send_key(m->keyboard, mock_input(m), 0, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
         } else {
             m->holding = false;
-            wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_RELEASED);
+            wl_keyboard_send_key(m->keyboard, mock_input(m), 0, 30, WL_KEYBOARD_KEY_STATE_RELEASED);
             wl_keyboard_send_leave(m->keyboard, wl_display_next_serial(m->display), m->surface);
         }
         return;
@@ -404,7 +423,7 @@ static void mock_bind_compositor(struct wl_client *client, void *data, uint32_t 
 static void mock_bind_shell(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &xdg_wm_base_interface, (int)version, id); wl_resource_set_implementation(r, &mock_shell_ops, data, NULL); xdg_wm_base_send_ping(r, wl_display_next_serial(((mock_wayland *)data)->display)); }
 static void mock_bind_seat(struct wl_client *client, void *data, uint32_t version, uint32_t id)
-{ assert(version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION); struct wl_resource *r = wl_resource_create(client, &wl_seat_interface, (int)version, id); wl_resource_set_implementation(r, &mock_seat_ops, data, NULL); wl_seat_send_capabilities(r, WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER); }
+{ assert(version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION); struct wl_resource *r = wl_resource_create(client, &wl_seat_interface, (int)version, id); wl_resource_set_implementation(r, &mock_seat_ops, data, NULL); ((mock_wayland *)data)->seat = r; wl_seat_send_capabilities(r, WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER); }
 static void mock_bind_presentation(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wp_presentation_interface, (int)version, id); wl_resource_set_implementation(r, &mock_presentation_ops, data, NULL); wp_presentation_send_clock_id(r, (uint32_t)CLOCK_MONOTONIC); }
 /* edit-b6ai.7: wp_viewporter and wp_fractional_scale_manager_v1 */
@@ -446,6 +465,43 @@ static void mock_bind_viewporter(struct wl_client *client, void *data, uint32_t 
 { struct wl_resource *r = wl_resource_create(client, &wp_viewporter_interface, (int)version, id); wl_resource_set_implementation(r, &mock_viewporter_ops, data, NULL); }
 static void mock_bind_fraction_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wp_fractional_scale_manager_v1_interface, (int)version, id); wl_resource_set_implementation(r, &mock_fraction_manager_ops, data, NULL); }
+/* edit-b6ai.8: xdg_activation_v1. A committed token request is answered at
+ * once with "mock-token-<n>"; activate records the token and its surface. */
+static void mock_token_serial(struct wl_client *client, struct wl_resource *r, uint32_t serial, struct wl_resource *seat)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    if (mock_shm.shared) { mock_shm.shared->token_serial = serial; mock_shm.shared->token_seat_ok = seat == m->seat; }
+}
+static void mock_token_app_id(struct wl_client *client, struct wl_resource *r, const char *app_id)
+{ (void)client; (void)r; (void)app_id; }
+static void mock_token_surface(struct wl_client *client, struct wl_resource *r, struct wl_resource *surface)
+{ (void)client; mock_wayland *m = wl_resource_get_user_data(r); if (mock_shm.shared) mock_shm.shared->token_surface_ok = surface == m->surface; }
+static void mock_token_commit(struct wl_client *client, struct wl_resource *r)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    char token[32]; /* (P) "mock-token-" plus at most ten uint32_t digits and NUL */
+    (void)snprintf(token, sizeof token, "mock-token-%u", ++m->tokens_issued);
+    if (mock_shm.shared) mock_shm.shared->tokens++;
+    xdg_activation_token_v1_send_done(r, token);
+}
+static const struct xdg_activation_token_v1_interface mock_token_ops = {.set_serial = mock_token_serial,
+    .set_app_id = mock_token_app_id, .set_surface = mock_token_surface, .commit = mock_token_commit, .destroy = mock_destroy};
+static void mock_get_token(struct wl_client *client, struct wl_resource *r, uint32_t id)
+{
+    struct wl_resource *token = wl_resource_create(client, &xdg_activation_token_v1_interface, 1, id);
+    wl_resource_set_implementation(token, &mock_token_ops, wl_resource_get_user_data(r), NULL);
+}
+static void mock_activate(struct wl_client *client, struct wl_resource *r, const char *token, struct wl_resource *surface)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    if (!mock_shm.shared) return;
+    mock_shm.shared->activations++; mock_shm.shared->activate_surface_ok = surface == m->surface;
+    (void)snprintf(mock_shm.shared->activated, sizeof mock_shm.shared->activated, "%s", token);
+}
+static const struct xdg_activation_v1_interface mock_activation_ops = {.destroy = mock_destroy,
+    .get_activation_token = mock_get_token, .activate = mock_activate};
+static void mock_bind_activation(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{ struct wl_resource *r = wl_resource_create(client, &xdg_activation_v1_interface, (int)version, id); wl_resource_set_implementation(r, &mock_activation_ops, data, NULL); }
 static void mock_bind_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wl_data_device_manager_interface, (int)version, id); wl_resource_set_implementation(r, &mock_manager_ops, data, NULL); }
 /* (P) Unit logical output = minimum nonzero dimensions; scale is the
@@ -488,6 +544,7 @@ static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, 
         if (mock_shm.enabled) assert(!wl_display_init_shm(m.display)); /* libwayland-server's real wl_shm */
         if (mock_shm.viewporter) assert(wl_global_create(m.display, &wp_viewporter_interface, 1, &m, mock_bind_viewporter));
         if (mock_shm.fractional) assert(wl_global_create(m.display, &wp_fractional_scale_manager_v1_interface, 1, &m, mock_bind_fraction_manager));
+        if (mock_shm.activation) assert(wl_global_create(m.display, &xdg_activation_v1_interface, 1, &m, mock_bind_activation)); /* (P) v1 */
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};
         wl_client_add_destroy_listener(client, &gone.listener);
