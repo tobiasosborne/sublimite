@@ -81,6 +81,30 @@ static int display_default(void)
     T(round(editor_runtime_dpi(0, 2430, 2430, 254, 254)) == dpi); /* nearest whole DPI */
     T(editor_runtime_dpi(96, 2430, 2430, 254, 254) == 96); /* explicit Xft overrides hardware */
     T(editor_runtime_dpi(0, 0, 0, 0, 0) == 96); /* conventional fallback */
+    /* edit-b6ai.15: XWayland reports the compositor output's physical mm, not
+     * a scaled logical size. Tobias's box (M): DP-9 3840x2160 at 1860x1040 mm
+     * is hypot(3840,2160)*25.4/hypot(1860,1040) = 52.5 DPI, so 10 pt is
+     * 7.3 px (tiny). Under XWayland and no Xft.dpi the rule is 96 * scale. */
+    T(round(editor_runtime_dpi_x11(0, false, 1, 3840, 2160, 1860, 1040) * 10) == 525); /* unchanged physical */
+    T(editor_runtime_em_px(editor_runtime_dpi_x11(0, false, 1, 3840, 2160, 1860, 1040), EDITOR_FONT_DEFAULT_PT) == 7u);
+    T(editor_runtime_dpi_x11(0, true, 1, 3840, 2160, 1860, 1040) == 96); /* XWayland: 96 x 1 */
+    T(editor_runtime_em_px(editor_runtime_dpi_x11(0, true, 1, 3840, 2160, 1860, 1040), EDITOR_FONT_DEFAULT_PT) == 13u);
+    T(editor_runtime_dpi_x11(0, true, 1.5, 3840, 2160, 1860, 1040) == 144); /* (P) 96 * 1.5 */
+    T(editor_runtime_dpi_x11(0, true, 2, 0, 0, 0, 0) == 192);
+    T(editor_runtime_dpi_x11(0, true, 0, 3840, 2160, 1860, 1040) == 96); /* invalid scale is 1 */
+    T(editor_runtime_dpi_x11(0, true, NAN, 1, 1, 1, 1) == 96);
+    T(editor_runtime_dpi_x11(0, true, 1e308, 1, 1, 1, 1) == 96); /* 96 * scale must stay finite */
+    T(editor_runtime_dpi_x11(144, true, 2, 3840, 2160, 1860, 1040) == 144); /* explicit Xft.dpi wins */
+    T(editor_runtime_dpi_x11(144, false, 1, 3840, 2160, 1860, 1040) == 144);
+    /* Real X11 (ThinkPad, (P) 2880x1800 at 14 inch diagonal; 355.6 mm
+     * diagonal = 14 in * 25.4): numbers identical to editor_runtime_dpi. */
+    T(editor_runtime_dpi_x11(0, false, 1, 2880, 1800, 310, 194) == editor_runtime_dpi(0, 2880, 1800, 310, 194));
+    T(editor_runtime_dpi_x11(0, false, 2, 2880, 1800, 310, 194) == editor_runtime_dpi(0, 2880, 1800, 310, 194)); /* scale unused off XWayland */
+    T(editor_runtime_dpi_x11(0, false, 1, 2880, 1800, 0, 0) == 96); /* Xvfb without mm */
+    T(editor_runtime_scale(NULL) == 1 && editor_runtime_scale("") == 1);
+    T(editor_runtime_scale("2") == 2 && editor_runtime_scale("1.5") == 1.5);
+    T(editor_runtime_scale("0") == 1 && editor_runtime_scale("-2") == 1 && editor_runtime_scale("2x") == 1);
+    T(editor_runtime_scale("nan") == 1 && editor_runtime_scale("inf") == 1 && editor_runtime_scale("1e308") == 1);
     const char resources[] = "! comment\nXft.dpi:\t243.0\n";
     T(editor_runtime_xft_dpi(resources, sizeof resources - 1) == dpi);
     const char bad[] = "Xft.dpi: nan\nXft.dpi: 243junk\nOther.dpi: 243\n";

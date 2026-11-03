@@ -31,6 +31,15 @@ at startup and request its existing atlas worker on reload; reset uses the
 configured size. Removing the file setting restores the environment override
 or default.
 
+Display density (X11 and XWayland, edit-b6ai.15): an explicit `Xft.dpi` always
+wins. Otherwise, on an XWayland server (detected by its `XWAYLAND` X extension)
+the density is 96 times `EDIT_DISPLAY_SCALE` (default 1), because XWayland
+reports the monitor's physical size, which is not a UI density: a 4K monitor
+reporting 1860 x 1040 mm gave 52.5 dpi and 7 px text. On a real X server the
+physical RandR size is used as before. Set `EDIT_DISPLAY_SCALE=1.5` (finite,
+positive) if your compositor scales the monitor and does not scale XWayland
+clients; `EDIT_FONT_SIZE_PT` or `font.size` also remain available.
+
 Font selection uses the highest supplied source as a whole family/file pair:
 `--font-family` / `--font-file`, then nonempty `EDIT_FONT_FAMILY` /
 `EDIT_FONT_FILE`, then `[font] family` / `file`, then embedded DejaVu Sans Mono.

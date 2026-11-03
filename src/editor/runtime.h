@@ -1,5 +1,6 @@
 #ifndef EDIT_EDITOR_RUNTIME_H
 #define EDIT_EDITOR_RUNTIME_H
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 /* (P) one typographic inch is 72 points. (E) default matches the bead's
@@ -12,6 +13,13 @@
 #define EDITOR_FONT_MAX_PX 62u
 double editor_runtime_dpi(double xft, uint32_t width, uint32_t height,
                           uint32_t mm_width, uint32_t mm_height);
+/* X11 selection (edit-b6ai.15): explicit Xft.dpi wins; else on XWayland
+ * 96 * scale (the X server there reports the compositor output's physical
+ * mm, which is not a UI density); else editor_runtime_dpi's physical mm. */
+double editor_runtime_dpi_x11(double xft, bool xwayland, double scale, uint32_t width, uint32_t height,
+                              uint32_t mm_width, uint32_t mm_height);
+/* Parse EDIT_DISPLAY_SCALE text: finite, positive, 96*scale finite; else 1. */
+double editor_runtime_scale(const char *text);
 double editor_runtime_xft_dpi(const char *resources, size_t len);
 uint32_t editor_runtime_em_px(double dpi, double points);
 void editor_runtime_window(uint32_t work_width, uint32_t work_height,

@@ -12,6 +12,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(dimensions, data, take);
     double dpi = editor_runtime_dpi(xft, dimensions[0], dimensions[1], dimensions[2], dimensions[3]);
     EDIT_ASSERT(isfinite(dpi) && dpi > 0);
+    char text[33] = {0};
+    memcpy(text, data, size < sizeof text - 1 ? size : sizeof text - 1);
+    double scale = editor_runtime_scale(text);
+    EDIT_ASSERT(isfinite(scale) && scale > 0 && isfinite(96.0 * scale));
+    double wayland = editor_runtime_dpi_x11(xft, true, scale, dimensions[0], dimensions[1], dimensions[2], dimensions[3]);
+    EDIT_ASSERT(isfinite(wayland) && wayland > 0);
+    EDIT_ASSERT(editor_runtime_dpi_x11(xft, false, scale, dimensions[0], dimensions[1], dimensions[2], dimensions[3]) == dpi);
     uint32_t em = editor_runtime_em_px(dpi, EDITOR_FONT_DEFAULT_PT);
     EDIT_ASSERT(em >= 1u && em <= EDITOR_FONT_MAX_PX); /* positive whole em to prepaid atlas bound */
     uint32_t width, height;

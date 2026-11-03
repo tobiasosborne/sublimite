@@ -75,7 +75,18 @@ static int x11_display_size(plat_display_info *size)
     double xft = r && r->type == XCB_ATOM_STRING && r->format == 8 ?
         editor_runtime_xft_dpi(xcb_get_property_value(r), (size_t)xcb_get_property_value_length(r)) : 0;
     free(r);
-    size->dpi = editor_runtime_dpi(xft, width, height, mm_w, mm_h);
+    /* XWayland is identified by its "XWAYLAND" extension (xserver hw/xwayland
+     * registers it; M: present on DISPLAY=:0, absent on Xvfb). Output names
+     * are not usable: current XWayland names RandR outputs after the
+     * compositor's (DP-9), not XWAYLAND0. The scale is invisible to an X
+     * client under force_zero_scaling, so it is assumed 1 unless
+     * EDIT_DISPLAY_SCALE says otherwise (decisions/edit-b6ai.15.md). */
+    xcb_query_extension_reply_t *xwl = xcb_query_extension_reply(c,
+        xcb_query_extension(c, (uint16_t)strlen("XWAYLAND"), "XWAYLAND"), NULL);
+    bool xwayland = xwl && xwl->present;
+    free(xwl);
+    size->dpi = editor_runtime_dpi_x11(xft, xwayland, editor_runtime_scale(getenv("EDIT_DISPLAY_SCALE")),
+        width, height, mm_w, mm_h);
     size->work_width = width; size->work_height = height;
     uint32_t desktop = 0;
     r = property(c, screen->root, "_NET_CURRENT_DESKTOP", XCB_ATOM_CARDINAL);

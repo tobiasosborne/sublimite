@@ -25,6 +25,26 @@ double editor_runtime_dpi(double xft, uint32_t width, uint32_t height,
                hypot((double)mm_width, (double)mm_height);
     return 96.0; /* (E) conventional Xft fallback when physical size is absent. */
 }
+double editor_runtime_scale(const char *text)
+{
+    if (!text || !*text) return 1.0;
+    char *tail = NULL; double scale = strtod(text, &tail);
+    if (tail == text || *tail || !isfinite(scale) || scale <= 0 || !isfinite(96.0 * scale)) return 1.0;
+    return scale;
+}
+double editor_runtime_dpi_x11(double xft, bool xwayland, double scale, uint32_t width, uint32_t height,
+                              uint32_t mm_width, uint32_t mm_height)
+{
+    if (isfinite(xft) && xft > 0) return xft;
+    if (xwayland) {
+        /* (P) XWayland exposes the output's physical mm (a 4K 1860x1040 mm
+         * screen gives 52.5 DPI), while 96 logical px/inch times the output
+         * scale is the desktop convention (as native Wayland: 96 * scale). */
+        if (!isfinite(scale) || scale <= 0 || !isfinite(96.0 * scale)) scale = 1.0;
+        return 96.0 * scale;
+    }
+    return editor_runtime_dpi(0, width, height, mm_width, mm_height);
+}
 double editor_runtime_xft_dpi(const char *resources, size_t len)
 {
     if (!resources) return 0;
