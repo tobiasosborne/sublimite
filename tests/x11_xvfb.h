@@ -23,13 +23,25 @@ static pid_t xvfb_pid = -1;
 static void xvfb_stop(void) {
     if (xvfb_pid > 0) { kill(xvfb_pid, SIGTERM); waitpid(xvfb_pid, NULL, 0); xvfb_pid = -1; }
 }
-static int xvfb_explicit_display(char *display, size_t capacity) {
-    /* Probe by binding, not connecting: no requests reach an existing server.
-     * Xvfb's own lock/bind still arbitrates a race after the probe is closed.
-     * (P) Search positive uint16_t display numbers; zero is the real desktop. */
+/* Never let Xvfb pick its own number (-displayfd alone): it binds display 0 when
+ * :0's abstract name is free, unlinking the live /tmp/.X11-unix/X0 of a server
+ * that listens on its path only (Hyprland's XWayland), and then removes it on
+ * exit, so no new X client can reach the desktop (edit-b6ai.19, monolith
+ * 2026-11-03, reproduced in a private namespace). Choose explicitly: skip any
+ * number whose socket path or X lock file exists, or whose abstract name is
+ * bound. Probe by binding, not connecting: no requests reach an existing
+ * server. Xvfb's own lock/bind still arbitrates a race after the probe closes.
+ * (P) Search positive uint16_t display numbers from `first`; zero is the real
+ * desktop. Returns the number, 0 when none is free. */
+static unsigned xvfb_explicit_display(char *display, size_t capacity, unsigned first) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 0;
-    for (unsigned number = 1; number <= UINT16_MAX; number++) {
+    for (unsigned number = first ? first : 1u; number <= UINT16_MAX; number++) {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/.X11-unix/X%u", number);
+        if (access(path, F_OK) == 0) continue;
+        snprintf(path, sizeof path, "/tmp/.X%u-lock", number);
+        if (access(path, F_OK) == 0) continue;
         struct sockaddr_un address = {.sun_family = AF_UNIX};
         int n = snprintf(address.sun_path + 1, sizeof address.sun_path - 1,
                          "/tmp/.X11-unix/X%u", number);
@@ -37,7 +49,7 @@ static int xvfb_explicit_display(char *display, size_t capacity) {
         if (bind(fd, (struct sockaddr *)&address, length) == 0) {
             close(fd);
             snprintf(display, capacity, ":%u", number);
-            return 1;
+            return number;
         }
         if (errno != EADDRINUSE) break;
     }
@@ -65,43 +77,47 @@ static int xvfb_start(void) {
     if (display && requested && !strcmp(display, ":99") && !strcmp(requested, ":99"))
         return 1;
     if (!xvfb_find()) return 0;
-    char explicit_display[32] = "";
-    if (access("/tmp/.X11-unix", W_OK) != 0 &&
-        !xvfb_explicit_display(explicit_display, sizeof explicit_display)) return 0;
-    int fds[2];
-    if (pipe(fds)) return 0;
-    char fdarg[16];
-    snprintf(fdarg, sizeof fdarg, "%d", fds[1]);
-    pid_t pid = fork();
-    if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
-    if (pid == 0) {
-        close(fds[0]);
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-        unsetenv("DISPLAY");
-        /* Explicit selection permits a partial listener set (abstract only);
-         * automatic -displayfd selection requires the pathname socket too. */
-        if (*explicit_display)
+    /* (E) a few numbers absorb a race with a concurrent probe; each loss costs
+     * one failed Xvfb start, and Xvfb's lock keeps two servers off one number. */
+    unsigned first = 1;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        char explicit_display[32];
+        unsigned number = xvfb_explicit_display(explicit_display, sizeof explicit_display, first);
+        if (!number) return 0;
+        first = number + 1u;
+        int fds[2];
+        if (pipe(fds)) return 0;
+        char fdarg[16];
+        snprintf(fdarg, sizeof fdarg, "%d", fds[1]);
+        pid_t pid = fork();
+        if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+        if (pid == 0) {
+            close(fds[0]);
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            unsetenv("DISPLAY");
+            /* Explicit selection also permits an abstract-only listener set
+             * (a read-only WSLg socket directory). */
             execl(xvfb_path, "Xvfb", explicit_display, "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
-        else
-            execl(xvfb_path, "Xvfb", "-displayfd", fdarg, "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset", (char *)NULL);
-        _exit(127);
+            _exit(127);
+        }
+        close(fds[1]);
+        char buf[32]; size_t n = 0;
+        while (n < sizeof buf - 1) {
+            ssize_t r = read(fds[0], buf + n, 1);
+            if (r <= 0) break;
+            if (buf[n] == '\n') break;
+            n++;
+        }
+        close(fds[0]);
+        buf[n] = 0;
+        if (n == 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); continue; }
+        char disp[48];
+        snprintf(disp, sizeof disp, ":%s", buf);
+        setenv("DISPLAY", disp, 1);
+        xvfb_pid = pid;
+        atexit(xvfb_stop);
+        return 1;
     }
-    close(fds[1]);
-    char buf[32]; size_t n = 0;
-    while (n < sizeof buf - 1) {
-        ssize_t r = read(fds[0], buf + n, 1);
-        if (r <= 0) break;
-        if (buf[n] == '\n') break;
-        n++;
-    }
-    close(fds[0]);
-    buf[n] = 0;
-    if (n == 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); return 0; }
-    char disp[48];
-    snprintf(disp, sizeof disp, ":%s", buf);
-    setenv("DISPLAY", disp, 1);
-    xvfb_pid = pid;
-    atexit(xvfb_stop);
-    return 1;
+    return 0;
 }
 #endif
