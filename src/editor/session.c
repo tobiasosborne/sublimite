@@ -750,8 +750,7 @@ void editor_save_overlay(editor *e)
     if (!status || !*status || !e->grid.dims.rows) return;
     size_t len = strlen(status); uint32_t row = e->grid.dims.rows - 1;
     /* edit-cxho.24: the notice row is chrome, not a coloured band (rubric C6). */
-    uint32_t fg = config_theme_color(e->preferences.theme, "tab.active.foreground");
-    uint32_t bg = config_theme_color(e->preferences.theme, "chrome.background");
+    uint32_t fg = e->colors.tab_fg, bg = e->colors.chrome_bg; /* edit-b6ai.2: the applied palette */
     for (uint32_t col = 0; col < e->grid.dims.cols; col++) {
         uint32_t ch = col < len ? (uint8_t)status[col] : (uint32_t)' ';
         render_cell cell = {ch, ch - ' ', fg, bg, 0, 0};

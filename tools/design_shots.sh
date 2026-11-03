@@ -5,6 +5,10 @@
 # private Xvfb, writes NN-name-theme.png, manifest.json and contact-sheet.png.
 # Needs: Xvfb xdotool import(ImageMagick) montage sha256sum.
 # Env: EDIT_SHOTS_DISPLAY (default :91, private; never :0).
+# EDIT_SHOTS_THEMES (edit-b6ai.2): two lane themes, default "dark light". A
+# name other than dark/light is a stock Omarchy theme: the scene runs with
+# theme = "system" and a read-only copy of
+# /usr/share/omarchy/themes/<name>/colors.toml in its private XDG_STATE_HOME.
 set -eu
 [ $# -eq 2 ] || { echo "usage: $0 <binary> <outdir>" >&2; exit 2; }
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -15,6 +19,9 @@ fix=$here/design_fixtures
 # Two private displays, one lane per theme, so the two ~10 s-per-scene idle
 # waits overlap. Only :91 and :92 (never :0, :95, :97, :99).
 disp_dark=:91; disp_light=:92
+themes=${EDIT_SHOTS_THEMES:-dark light}
+theme_a=${themes%% *}; theme_b=${themes#* }
+[ -n "$theme_a" ] && [ -n "$theme_b" ] && [ "$theme_b" = "${theme_b%% *}" ] || { echo "EDIT_SHOTS_THEMES needs two names" >&2; exit 2; }
 
 # (M) Tobias's ThinkPad X1 Carbon Gen 11 panel screenshots are 3296x2060.
 W=3296; H=2060
@@ -119,7 +126,13 @@ run_scene() {
     name=$1; theme=$2; keys=$3; shift 3
     sd=$work/scene-$theme; rm -rf "$sd"; mkdir -p "$sd/home" "$sd/cfg/sublimite" "$sd/data" "$sd/run" "$sd/state"
     chmod 700 "$sd/run"
-    printf 'theme = "%s"\n' "$theme" >"$sd/cfg/sublimite/config.toml"
+    case $theme in
+        dark|light) printf 'theme = "%s"\n' "$theme" >"$sd/cfg/sublimite/config.toml" ;;
+        *) printf 'theme = "system"\n' >"$sd/cfg/sublimite/config.toml"
+           mkdir -p "$sd/state/omarchy/current/theme"
+           cp "/usr/share/omarchy/themes/$theme/colors.toml" "$sd/state/omarchy/current/theme/colors.toml"
+           printf '%s\n' "$theme" >"$sd/state/omarchy/current/theme.name" ;;
+    esac
     env HOME="$sd/home" XDG_CONFIG_HOME="$sd/cfg" XDG_DATA_HOME="$sd/data" \
         XDG_RUNTIME_DIR="$sd/run" XDG_STATE_HOME="$sd/state" XDG_CACHE_HOME="$sd/state" \
         "$bin" "$@" >"$sd/ed.log" 2>&1 &
@@ -214,8 +227,8 @@ key Return" "$big" ;;
         esac
     done
 }
-( lane dark "$disp_dark" ) & lane_pids="$!"
-( lane light "$disp_light" ) & lane_pids="$lane_pids $!"
+( lane "$theme_a" "$disp_dark" ) & lane_pids="$!"
+( lane "$theme_b" "$disp_light" ) & lane_pids="$lane_pids $!"
 rc=0
 for p in $lane_pids; do wait "$p" || rc=1; done
 lane_pids=""
@@ -227,7 +240,7 @@ bsha=$(sha256sum "$bin" | cut -d' ' -f1)
 {
     printf '{\n  "binary_sha256": "%s",\n  "dpi": %d,\n  "width": %d,\n  "height": %d,\n  "power": "%s",\n  "scenes": [\n' "$bsha" "$DPI" "$W" "$H" "$power"
     first=1
-    for theme in dark light; do
+    for theme in $themes; do
         for s in $all_scenes; do
             f=$out/$s-$theme.png
             [ $first -eq 1 ] || printf ',\n'
@@ -240,6 +253,6 @@ bsha=$(sha256sum "$bin" | cut -d' ' -f1)
 } >"$out/manifest.json"
 
 # Contact sheet: 4 columns, each tile 800 px wide (E: 4 x 800 = 3200 px sheet).
-montage $(for theme in dark light; do for s in $all_scenes; do printf '%s ' "$out/$s-$theme.png"; done; done) \
+montage $(for theme in $themes; do for s in $all_scenes; do printf '%s ' "$out/$s-$theme.png"; done; done) \
     -tile 4x -geometry 800x+6+6 -background "#808080" -strip "$out/contact-sheet.png"
-echo "design_shots: $(ls "$out"/*-dark.png "$out"/*-light.png | wc -l) scenes in $out"
+echo "design_shots: $(ls "$out"/*-"$theme_a".png "$out"/*-"$theme_b".png | wc -l) scenes in $out"

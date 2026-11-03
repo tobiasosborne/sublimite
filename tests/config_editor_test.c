@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/stat.h>
 
 #define T(x) do { if (!(x)) { fprintf(stderr, "config_editor_test: FAIL %s\n", #x); return 1; } } while (0)
 typedef struct probe {
@@ -205,6 +206,65 @@ static int scroll_preferences_test(const char *root, const char *path)
     puts("config_editor_test: scrolled file wrap off/on and tab-width reloads resync the first submitted frame passed");
     return 0;
 }
+/* edit-b6ai.2: the editor follows the system palette and swaps it in one
+ * frame generation; the stock-theme mapping itself is config_palette_test. */
+static const char dark_palette[] = "mode = 'dark'\naccent = '#7aa2f7'\nselection = '#292e42'\nmuted = '#414868'\n"
+    "background = '#1a1b26'\nforeground = '#a9b1d6'\nbright_foreground = '#c0caf5'\n";
+static const char light_palette[] = "mode = 'light'\naccent = '#205EA6'\nselection = '#CECDC3'\nmuted = '#B7B5AC'\n"
+    "background = '#FFFCF0'\nforeground = '#100F0F'\n";
+static int wait_bg(editor *e, uint32_t bg)
+{
+    while (e->layout_cfg.bg != bg) { int rc = editor_step(e, 0); T(rc == EDITOR_OK || rc == EDITOR_MORE); sched_yield(); }
+    return settle(e);
+}
+static int palette_preferences_test(const char *root, const char *path)
+{
+    char state[CONFIG_TEXT_CAP], theme[CONFIG_TEXT_CAP], colors[CONFIG_TEXT_CAP], next[CONFIG_TEXT_CAP],
+         next_colors[CONFIG_TEXT_CAP], name[CONFIG_TEXT_CAP];
+    T(snprintf(state, sizeof state, "%s/current", root) > 0 && mkdir(state, 0700) == 0);
+    T(snprintf(theme, sizeof theme, "%s/theme", state) > 0 && mkdir(theme, 0700) == 0);
+    T(snprintf(colors, sizeof colors, "%s/colors.toml", theme) > 0);
+    T(snprintf(next, sizeof next, "%s/next-theme", state) > 0);
+    T(snprintf(next_colors, sizeof next_colors, "%s/colors.toml", next) > 0);
+    T(snprintf(name, sizeof name, "%s/theme.name", state) > 0);
+    T(write_config(colors, dark_palette) == 0 && write_config(name, "tokyo-night\n") == 0);
+    T(write_config(path, "wrap=false\n") == 0);
+    render_backend backend = {0}; T(render_null_backend(&backend) == RENDER_OK);
+    probe p = {0};
+    editor_config cfg = {.initial = (const uint8_t *)"hello\n", .initial_len = sizeof("hello\n") - 1u,
+        .cols = 8u + 16u, .rows = 1u + 2u, .max_cols = 8u + 16u, .max_rows = 1u + 2u,
+        .preferences_path = path, .palette_path = colors, .hook_ctx = &p, .on_io = io, .on_submit = submitted};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == EDITOR_OK); p.owner = e;
+    T(settle(e) == 0);
+    config_palette want; config_error error;
+    T(config_palette_parse((const uint8_t *)dark_palette, strlen(dark_palette), false, CONFIG_DARK, &want, &error) == 0);
+    T(e->layout_cfg.bg == 0x1a1b26 && e->layout_cfg.fg == 0xa9b1d6);
+    T(e->layout_cfg.cursor_bg == 0x7aa2f7 && e->layout_cfg.sel_bg == 0x292e42);
+    T(e->layout_cfg.gutter_fg == config_palette_color(&want, "gutter.foreground"));
+    T(e->colors.chrome_fg == config_palette_color(&want, "chrome.foreground"));
+    T(e->syntax_colors[0] == config_palette_color(&want, hl_scope_key((hl_scope)0)));
+    T(editor_grid(e)->cells[e->grid.dims.cols].bg == 0x1a1b26);
+    T(!p.failed);
+    /* omarchy-theme-set order: stage, delete, rename in, write theme.name. */
+    T(mkdir(next, 0700) == 0 && write_config(next_colors, light_palette) == 0);
+    T(unlink(colors) == 0 && rmdir(theme) == 0 && rename(next, theme) == 0);
+    T(write_config(name, "flexoki-light\n") == 0);
+    T(wait_bg(e, 0xfffcf0) == 0);
+    T(e->layout_cfg.cursor_bg == 0x205ea6 && editor_grid(e)->cells[e->grid.dims.cols].bg == 0xfffcf0);
+    T(!p.failed && p.seen_generation == editor_preferences_generation(e));
+    /* Typing path unchanged: no allocation after a palette swap. */
+    plat_event key = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x'};
+    edit_malloc_guard_begin(); T(editor_inject(e, &key) == EDITOR_OK); T(settle(e) == 0);
+    size_t allocations = edit_malloc_guard_end(); T(!edit_malloc_guard_active() || !allocations);
+    /* theme = "dark" pins the built-in palette. */
+    T(write_config(path, "theme='dark'\n") == 0);
+    T(wait_bg(e, config_theme_color(CONFIG_DARK, "editor.background")) == 0);
+    T(e->layout_cfg.cursor_bg == config_theme_color(CONFIG_DARK, "caret.background") && !p.failed);
+    editor_close(e);
+    T(unlink(colors) == 0 && rmdir(theme) == 0 && unlink(name) == 0 && rmdir(state) == 0);
+    puts("config_editor_test: system palette startup, live delete/rename/write switch in one frame generation, pin passed");
+    return 0;
+}
 int main(void)
 {
     char root[] = "/tmp/sublimite-config-editor-XXXXXX", path[CONFIG_TEXT_CAP]; T(mkdtemp(root));
@@ -242,6 +302,7 @@ int main(void)
     T(!p.failed); editor_close(e);
     T(scroll_preferences_test(root, path) == 0);
     T(font_preferences_test(path) == 0);
+    T(palette_preferences_test(root, path) == 0);
     T(unlink(path) == 0 && rmdir(root) == 0);
     puts("config_editor_test: next frame generation, theme, wrap, tabs, font contract and keymap without typing allocations passed");
     return 0;

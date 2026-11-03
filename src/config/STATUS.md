@@ -31,3 +31,8 @@ attempted. Display/Unix-socket denials and the existing editor stale-minimap
 assertion keep full make check non-green; exact failures and the successful
 large-editor headless rerun are in the worker report. Leak scanning needs the
 coordinator outside the sandbox.
+
+edit-b6ai.2: `theme = "system"` (default) follows the Omarchy palette
+(`config_palette_parse`, `config_runtime_open_palette`), reloaded live through
+the same worker, mailbox and shared parent watch; see
+[the decision](../../docs/decisions/edit-b6ai.2.md).

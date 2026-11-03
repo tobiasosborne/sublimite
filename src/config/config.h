@@ -52,7 +52,12 @@ typedef struct config_settings {
      * CONFIG_TEXT_CAP buffer with a NUL per entry, so the joined form fits.
      * Empty = per-scalar fontconfig discovery only. */
     char font_fallbacks[CONFIG_TEXT_CAP];
+    /* edit-b6ai.2: theme = "system" (default, theme_pinned false) follows the
+     * system palette when one is configured and readable; theme then names
+     * only the built-in fallback mode (dark). "dark"/"light" pin the
+     * built-in palette. */
     config_theme theme;
+    bool theme_pinned;
     config_trailing trailing;
     bool trailing_warning; /* invalid value accepted as none; runtime reports it */
     uint32_t tab_width; /* zero = per-buffer detected/default indentation */
@@ -75,12 +80,37 @@ typedef struct config_token { const char *name; uint32_t rgb; } config_token;
  * approved. RGB values are palette data, not measured contrast claims. */
 const config_token *config_theme_tokens(config_theme, size_t *);
 uint32_t config_theme_color(config_theme, const char *);
+/* edit-b6ai.2: a resolved palette, one RGB per token in config_theme_tokens
+ * order (P: the 31 entries of each built-in table, checked statically). */
+#define CONFIG_THEME_TOKENS 31u
+typedef struct config_palette { config_theme mode; uint32_t rgb[CONFIG_THEME_TOKENS]; } config_palette;
+void config_palette_builtin(config_theme, config_palette *);
+uint32_t config_palette_color(const config_palette *, const char *); /* 0 for unknown names */
+/* Omarchy colors.toml (flat `key = "value"` TOML) -> tokens, with the shell
+ * resolver's aliases and fallbacks (omarchy-theme-color). Mode precedence:
+ * mode key, theme_type key, light_marker (a light.mode file beside it),
+ * background luminance R+G+B > 382, then fallback. Background and foreground
+ * are required; any other missing source keeps that token's built-in value
+ * for the mode. On failure *out is the built-in palette for the detected
+ * mode. No allocation or I/O; worker-side, never on the typing path. */
+int config_palette_parse(const uint8_t *, size_t, bool light_marker, config_theme fallback,
+                         config_palette *, config_error *);
+/* $XDG_STATE_HOME/omarchy/current/theme/colors.toml (HOME/.local/state when
+ * unset or relative). Windows has no system palette: CONFIG_ERR_ARG. */
+int config_palette_path(char *, size_t);
 
 typedef struct config_runtime config_runtime;
 /* UI-owned, allocating setup/close outside typing. path=NULL uses XDG with
  * HOME fallback on Linux, RoamingAppData/sublimite on Windows. Worker reads/parses; work mailbox installs immutable results.
  * A private worker pool keeps config I/O independent of editor bulk work. */
 int config_runtime_open(config_runtime **, const char *);
+/* edit-b6ai.2: palette = absolute colors.toml to follow while settings are
+ * not pinned, NULL for none. Its directory and the sibling <dir>.name are
+ * watched on their stable parent (Omarchy deletes and renames the theme
+ * directory, then writes theme.name). Absent at startup = built-in; absent
+ * later keeps the last palette; malformed = built-in of the detected mode
+ * plus one stderr notice from the worker per episode. */
+int config_runtime_open_palette(config_runtime **, const char *config, const char *palette);
 void config_runtime_close(config_runtime *);
 struct os_wake;
 const struct os_wake *config_runtime_wake(const config_runtime *);
@@ -93,6 +123,9 @@ int config_runtime_watchfd(const config_runtime *);
  * in this call. Returns true if the caller should relayout this generation. */
 bool config_runtime_tick(config_runtime *);
 const config_settings *config_runtime_current(const config_runtime *);
+/* Effective palette; changes bump the generation like settings do. */
+const config_palette *config_runtime_palette(const config_runtime *);
+int config_runtime_palette_error(const config_runtime *); /* last read: OK, ERR_SYNTAX/VALUE/LIMIT/IO */
 uint64_t config_runtime_generation(const config_runtime *);
 /* Includes CONFIG_ERR_VALUE for an accepted trailing-whitespace fallback. */
 config_error config_runtime_error(const config_runtime *);

@@ -135,7 +135,11 @@ static int open_editor(editor **out, const editor_config *config, render_backend
     if (config->load_preferences || config->preferences_path) {
         /* Read and parse on the config worker before the DPI atlas is built.
          * Invalid/absent preferences leave the default startup usable. */
-        if (config_runtime_open(&e->preferences_runtime, config->preferences_path) == CONFIG_OK) {
+        /* edit-b6ai.2: native startup follows the Omarchy palette when present. */
+        char system_palette[CONFIG_TEXT_CAP]; const char *palette = config->palette_path;
+        if (!palette && config->load_preferences &&
+            config_palette_path(system_palette, sizeof system_palette) == CONFIG_OK) palette = system_palette;
+        if (config_runtime_open_palette(&e->preferences_runtime, config->preferences_path, palette) == CONFIG_OK) {
             do {
                 (void)config_runtime_tick(e->preferences_runtime);
                 if (!config_runtime_busy(e->preferences_runtime)) break;
@@ -315,8 +319,8 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         rc = plat_init_backend(&e->platform, &pc, config->platform_backend); if (rc) goto fail;
         e->has_platform = true; plat_set_blink(&e->platform, 0);
         /* edit-29y2: before mapping, so the window manager's first frame already matches. */
-        const config_settings *prefs = e->preferences_runtime ? config_runtime_current(e->preferences_runtime) : NULL;
-        plat_set_dark(&e->platform, (prefs ? prefs->theme : e->preferences.theme) == CONFIG_DARK);
+        const config_palette *prefs = e->preferences_runtime ? config_runtime_palette(e->preferences_runtime) : NULL;
+        plat_set_dark(&e->platform, (prefs ? prefs->mode : e->preferences.theme) == CONFIG_DARK); /* edit-b6ai.2 */
         plat_map(&e->platform);
     }
     void *state = edit_arena_alloc(&e->arena, backend->info.state_size, backend->info.state_align);

@@ -99,6 +99,11 @@ typedef struct editor_config {
     uint32_t max_window_width, max_window_height;
     bool load_preferences;            /* native startup enables XDG config */
     const char *preferences_path;     /* optional absolute setup/test override */
+    /* edit-b6ai.2: absolute system palette (Omarchy colors.toml) to follow
+     * while theme = "system". NULL: load_preferences uses
+     * config_palette_path(); otherwise no system palette (tests stay
+     * hermetic on an Omarchy box). */
+    const char *palette_path;
     /* Startup selection (native CLI): either non-NULL pointer overrides the
      * environment pair and config pair. Empty explicitly selects embedded.
      * Copied during open; file wins within the selected source. */

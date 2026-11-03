@@ -127,20 +127,25 @@ int editor_preferences_poll(editor *e)
     }
     return 0;
 }
+/* edit-b6ai.2: every themed colour comes from one resolved palette. */
+void editor_theme_palette_cache(editor *e, const config_palette *p)
+{
+    for (unsigned i = 0; i < HL_SCOPE_COUNT; i++) e->syntax_colors[i] = config_palette_color(p, hl_scope_key((hl_scope)i));
+    e->colors.panel = config_palette_color(p, "panel.background");
+    e->colors.hover = config_palette_color(p, "hover.background");
+    e->colors.chrome_fg = config_palette_color(p, "chrome.foreground");
+    e->colors.chrome_bg = config_palette_color(p, "chrome.background");
+    e->colors.tab_fg = config_palette_color(p, "tab.active.foreground");
+    e->colors.tab_bg = config_palette_color(p, "tab.active.background");
+    e->colors.tab_hover = config_palette_color(p, "tab.hover.foreground");
+    e->colors.error_fg = config_palette_color(p, "error.foreground");
+    e->colors.error_bg = config_palette_color(p, "error.background");
+    e->colors.map_fg = config_palette_color(p, "minimap.foreground");
+    e->colors.warning = config_palette_color(p, "warning.foreground");
+}
 void editor_theme_cache(editor *e, config_theme t)
 {
-    for (unsigned i = 0; i < HL_SCOPE_COUNT; i++) e->syntax_colors[i] = config_theme_color(t, hl_scope_key((hl_scope)i));
-    e->colors.panel = config_theme_color(t, "panel.background");
-    e->colors.hover = config_theme_color(t, "hover.background");
-    e->colors.chrome_fg = config_theme_color(t, "chrome.foreground");
-    e->colors.chrome_bg = config_theme_color(t, "chrome.background");
-    e->colors.tab_fg = config_theme_color(t, "tab.active.foreground");
-    e->colors.tab_bg = config_theme_color(t, "tab.active.background");
-    e->colors.tab_hover = config_theme_color(t, "tab.hover.foreground");
-    e->colors.error_fg = config_theme_color(t, "error.foreground");
-    e->colors.error_bg = config_theme_color(t, "error.background");
-    e->colors.map_fg = config_theme_color(t, "minimap.foreground");
-    e->colors.warning = config_theme_color(t, "warning.foreground");
+    config_palette p; config_palette_builtin(t, &p); editor_theme_palette_cache(e, &p);
 }
 int editor_preferences_apply(editor *e)
 {
@@ -168,18 +173,18 @@ int editor_preferences_apply(editor *e)
             e->font.default_px = e->font.requested_px = px;
         }
     }
-    config_theme theme = s->theme;
-    if (e->has_platform) plat_set_dark(&e->platform, theme == CONFIG_DARK); /* edit-29y2 */
-    e->layout_cfg.fg = config_theme_color(theme, "editor.foreground");
-    e->layout_cfg.bg = config_theme_color(theme, "editor.background");
-    e->layout_cfg.gutter_fg = config_theme_color(theme, "gutter.foreground");
-    e->layout_cfg.gutter_bg = config_theme_color(theme, "gutter.background");
-    e->layout_cfg.cursor_fg = config_theme_color(theme, "caret.foreground");
-    e->layout_cfg.cursor_bg = config_theme_color(theme, "caret.background");
-    e->layout_cfg.sel_fg = config_theme_color(theme, "selection.foreground");
-    e->layout_cfg.sel_bg = config_theme_color(theme, "selection.background");
-    e->find_bg = config_theme_color(theme, "bracket.background");
-    editor_theme_cache(e, theme);
+    const config_palette *palette = config_runtime_palette(e->preferences_runtime);
+    if (e->has_platform) plat_set_dark(&e->platform, palette->mode == CONFIG_DARK); /* edit-29y2 */
+    e->layout_cfg.fg = config_palette_color(palette, "editor.foreground");
+    e->layout_cfg.bg = config_palette_color(palette, "editor.background");
+    e->layout_cfg.gutter_fg = config_palette_color(palette, "gutter.foreground");
+    e->layout_cfg.gutter_bg = config_palette_color(palette, "gutter.background");
+    e->layout_cfg.cursor_fg = config_palette_color(palette, "caret.foreground");
+    e->layout_cfg.cursor_bg = config_palette_color(palette, "caret.background");
+    e->layout_cfg.sel_fg = config_palette_color(palette, "selection.foreground");
+    e->layout_cfg.sel_bg = config_palette_color(palette, "selection.background");
+    e->find_bg = config_palette_color(palette, "bracket.background");
+    editor_theme_palette_cache(e, palette);
     e->layout_cfg.tab_width = e->buffer->style.width;
     e->lay.cfg = e->layout_cfg; e->lay.tab = e->buffer->style.width;
     int rc = view_set_tab_width(&e->v, e->buffer->style.width); if (rc) return EDITOR_ERR_ARG;

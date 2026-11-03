@@ -757,6 +757,7 @@ int editor_palette_key(editor *, const plat_event *);
 bool editor_palette_pointer(editor *, const plat_event *, int *rc);
 int editor_palette_paint(editor *);
 void editor_theme_cache(editor *, config_theme);
+void editor_theme_palette_cache(editor *, const config_palette *); /* edit-b6ai.2 */
 int editor_hover_pointer(editor *, const plat_event *);
 bool editor_menu_hover(editor *, uint32_t row, uint32_t col, editor_hover *);
 /* edit-yey menu bar (menubar.c). key/pointer return true when consumed,

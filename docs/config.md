@@ -7,7 +7,7 @@ invalid edits preserve the previous settings. Removing settings, or deleting
 the file, restores their defaults.
 
 ```toml
-theme = "light" # "dark" is the default
+theme = "light" # "system" (follow Omarchy, else dark) is the default
 wrap = true    # otherwise use the existing per-file default
 
 [font]
@@ -62,6 +62,25 @@ precedence works like font selection: `--font-fallbacks A,B` (an empty value
 also counts), then a nonempty `EDIT_FONT_FALLBACKS=A,B`, then
 `[font] fallbacks`. Spaces around commas are ignored. Families are resolved on
 a worker; see [edit-6e2](decisions/edit-6e2.md).
+
+`theme` takes `"system"` (the default), `"dark"` or `"light"`. `"system"`
+follows the Omarchy palette at
+`$XDG_STATE_HOME/omarchy/current/theme/colors.toml` (`$HOME/.local/state/...`
+when the XDG value is unset or relative). On a box without that file the
+editor uses the built-in dark palette, exactly as before. `"dark"` and
+`"light"` always use the built-in palettes, even on Omarchy. Windows has no
+system palette, so `"system"` means the built-in dark palette there.
+
+When you switch theme in Omarchy (`omarchy-theme-set`), the editor picks it
+up: it watches the `current/` directory, reads the new file on a worker and
+swaps the colours at a frame boundary. No polling is involved. A malformed
+file gives the built-in palette for the mode it names (dark if it names
+none) and logs one line to stderr. While the theme directory is briefly
+missing during a switch, the previous palette stays. Only the file is read; no
+Omarchy command is run and nothing is installed. Comment, line-number,
+minimap and inactive-tab colours are lifted toward the foreground until they
+match the built-in themes' contrast, and the caret uses `accent`. The token
+mapping and the contrast rule are in [edit-b6ai.2](decisions/edit-b6ai.2.md).
 
 Theme token names and RGB values are provisional until the visual spec is
 present and approved.

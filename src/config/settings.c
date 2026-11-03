@@ -83,8 +83,10 @@ static int setting(void *ctx, const char *path, const config_value *v)
         if (!v->count) s->font_fallbacks[0] = 0;
     } else if (!strcmp(path, "theme")) {
         if (v->type != CONFIG_STRING) return CONFIG_ERR_VALUE;
-        if (!strcmp(v->string, "dark")) s->theme = CONFIG_DARK;
-        else if (!strcmp(v->string, "light")) s->theme = CONFIG_LIGHT;
+        /* edit-b6ai.2: "system" is the default; dark/light pin built-ins. */
+        if (!strcmp(v->string, "dark")) { s->theme = CONFIG_DARK; s->theme_pinned = true; }
+        else if (!strcmp(v->string, "light")) { s->theme = CONFIG_LIGHT; s->theme_pinned = true; }
+        else if (!strcmp(v->string, "system")) { s->theme = CONFIG_DARK; s->theme_pinned = false; }
         else return CONFIG_ERR_VALUE;
     } else if (!strcmp(path, "whitespace.trailing")) {
         if (v->type == CONFIG_STRING && !strcmp(v->string, "all")) s->trailing = CONFIG_TRAILING_ALL;
