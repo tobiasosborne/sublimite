@@ -104,3 +104,13 @@ supply the arguments; custom multi-stroke prefixes are outside the subset.
 
 The supported TOML forms and explicit parser bounds are documented in
 [the config decision](decisions/edit-v0o.7.md).
+
+## Omarchy default editor
+
+This is not a setting in `config.toml`. `make install-omarchy` (opt-in, see the
+README) writes Omarchy's own `defaults/editor` file and a menu row. The only
+knob it adds is an environment variable read by the installed launcher script:
+`SUBLIMITE_OMARCHY_WAIT=1` makes it wait until the tab is closed even when
+Omarchy opened it, `SUBLIMITE_OMARCHY_WAIT=0` makes it return at once even for
+`$EDITOR`. Unset, it waits exactly when the caller is not an Omarchy-launched
+terminal window. See [edit-b6ai.11](decisions/edit-b6ai.11.md).

@@ -35,6 +35,24 @@ needed. Use `make install PREFIX=/path/to/prefix` for another destination.
 Remove the installed files with `make uninstall`, using the same `PREFIX` if
 overridden. Your journals and preferences stay in their existing user folders.
 
+### Omarchy (opt-in)
+
+```sh
+make install            # first
+make install-omarchy    # then, only if you want it
+make uninstall-omarchy  # puts everything back
+```
+
+`make install-omarchy` makes sublimité Omarchy's default editor (Setup >
+Default > Editor also gets a sublimité row), points the text MIME types at it,
+and keeps `$EDITOR` working: `git commit`, `crontab -e` and
+`omarchy-launch-editor --inline FILE` wait until you close the tab, while
+Omarchy's menus and bindings open files without blocking. `EDITOR` itself is
+not changed. Every file it touches is backed up and restored by
+`make uninstall-omarchy`. On a machine without Omarchy it prints a message and
+does nothing. Design and costs: `docs/decisions/edit-b6ai.11.md`. Test:
+`sh tools/test_install_omarchy.sh` (part of `make check`).
+
 ## Licence
 
 AGPL-3.0-or-later, see `LICENSE`. Vendored third-party code and data keep their

@@ -158,7 +158,7 @@ $(B)/tests/file_acquire_test $(B)/san/tests/file_acquire_test: LDLIBS += -Wl,--w
 # Linux-only oracle; production keys/config have no libxkbcommon dependency.
 $(B)/tests/keys_test $(B)/san/tests/keys_test: LDLIBS += -lxkbcommon
 
-.PHONY: all lib install uninstall check check-serial check-sh bench bench-zygote fuzz clean
+.PHONY: all lib install uninstall install-omarchy uninstall-omarchy check check-serial check-sh bench bench-zygote fuzz clean
 .SECONDARY:
 all: $(REL_LIB) $(EDIT_BIN) $(TOOL_BIN) $(TEST_REL) $(BENCH_BIN)
 lib: $(REL_LIB)
@@ -185,6 +185,13 @@ uninstall:
 	rm -f $(foreach s,$(ICON_SIZES),"$(PREFIX)/share/icons/hicolor/$(s)x$(s)/apps/sublimite.png")
 	@if command -v update-desktop-database >/dev/null; then if test -d "$(PREFIX)/share/applications"; then update-desktop-database "$(PREFIX)/share/applications"; fi; else printf '%s\n' 'Run: update-desktop-database "$(PREFIX)/share/applications"'; fi
 	@if command -v gtk-update-icon-cache >/dev/null; then if test -d "$(PREFIX)/share/icons/hicolor"; then gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"; fi; else printf '%s\n' 'Run: gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor"'; fi
+
+# Opt-in Omarchy integration (edit-b6ai.11); never run by install. Run `make install` first.
+# A machine without Omarchy gets a message and no changes.
+install-omarchy:
+	PREFIX="$(PREFIX)" sh tools/install-omarchy.sh install
+uninstall-omarchy:
+	PREFIX="$(PREFIX)" sh tools/install-omarchy.sh uninstall
 
 # ---- objects (one tree per configuration) ----
 $(B)/rel/%.o: %.c
@@ -257,12 +264,14 @@ check: $(TEST_SAN) $(B)/tools/replay
 	@$(SAFE_DISPLAY); DISPLAY=$$d $(CHECK_RUNNER) --display $(DISPLAY_TEST_SAN) -- $(TEST_SAN)
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
 	@echo "== tools/test_sublimite_win.sh"; sh tools/test_sublimite_win.sh
+	@echo "== tools/test_install_omarchy.sh"; sh tools/test_install_omarchy.sh
 	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
 
 check-serial: $(TEST_SAN) $(B)/tools/replay
 	@set -e; $(SAFE_DISPLAY); for t in $(TEST_SAN); do echo "== $$t"; case " $(DISPLAY_TEST_SAN) " in *" $$t "*) DISPLAY=$$d sh tools/with_display_lock.sh $$t;; *) DISPLAY=$$d $$t;; esac; done; echo "check: $(words $(TEST_SAN)) test binaries passed"
 	@echo "== tools/test_replay_cli.sh"; sh tools/test_replay_cli.sh $(B)
 	@echo "== tools/test_sublimite_win.sh"; sh tools/test_sublimite_win.sh
+	@echo "== tools/test_install_omarchy.sh"; sh tools/test_install_omarchy.sh
 	@echo "== tools/test_display_lock.sh contract"; sh tools/test_display_lock.sh contract $(B)/san/tests/refwin_test
 
 # Shell contract tests that need release benches (slow, ~1 min): run on demand.

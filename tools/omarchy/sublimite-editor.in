@@ -1,0 +1,31 @@
+#!/bin/sh
+# Installed by `make install-omarchy` as <prefix>/libexec/sublimite/omarchy/fresh.
+# Omarchy's omarchy-launch-editor runs an editor whose basename is nvim, vim,
+# nano, micro, hx, helix or fresh in place (`omarchy-launch-editor --inline`, the
+# default $EDITOR: git commit, crontab -e) and inside a terminal window otherwise
+# (Super+Shift+N, the Setup > Config menu rows). Every other name is detached
+# through uwsm-app, which can never be waited for. This wrapper borrows the
+# in-place name and then decides which of the two callers it has:
+#   a caller that waits for the file (no terminal launched by Omarchy)
+#       -> exec sublimite --wait; returns when the tab is closed
+#   Omarchy's own terminal window (parent command line carries org.omarchy.<name>)
+#       -> start sublimite detached and exit, so the window closes at once
+# SUBLIMITE_OMARCHY_WAIT=1 or =0 forces one of the two. See docs/decisions/edit-b6ai.11.md.
+sub='@SUBLIMITE@'
+name=${0##*/}
+[ "${1:-}" = -- ] && shift
+mode=${SUBLIMITE_OMARCHY_WAIT:-}
+if [ -z "$mode" ]; then
+    mode=1
+    if parent=$(tr '\0' ' ' </proc/$PPID/cmdline 2>/dev/null); then
+        case $parent in *"org.omarchy.$name"*) mode=0;; esac
+    fi
+fi
+if [ "$mode" = 0 ]; then
+    if command -v setsid >/dev/null 2>&1; then
+        exec setsid -f "$sub" -- "$@" </dev/null >/dev/null 2>&1
+    fi
+    nohup "$sub" -- "$@" </dev/null >/dev/null 2>&1 &
+    exit 0
+fi
+exec "$sub" --wait -- "$@"
