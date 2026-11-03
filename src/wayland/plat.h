@@ -14,6 +14,10 @@ typedef struct wayland_display_info {
     /* Largest output in buffer pixels at the selected scale: per axis,
      * max over outputs of ceil(mode / output scale) * scale (edit-b6ai.16). */
     uint32_t max_width, max_height;
+    /* edit-b6ai.7: wp_fractional_scale_manager_v1 and wp_viewporter are both
+     * advertised. dpi is then the scale-one floor (96): the surface's
+     * preferred scale is known only once mapped (wayland_dpi). */
+    bool fractional;
 } wayland_display_info;
 /* INIT only: highest-scale current wl_output mode. Physical buffer pixels;
  * DPI = conventional desktop base DPI times the compositor integer scale. */
@@ -49,4 +53,16 @@ void *wayland_shm(const plat *p);
 /* Integer buffer scale applied to the surface; p->width/height are buffer
  * pixels and multiples of it. One before init or without set_buffer_scale. */
 uint32_t wayland_buffer_scale(const plat *p);
+/* edit-b6ai.7: surface scale in 120ths (wp_fractional_scale_v1's unit).
+ * With wp_fractional_scale_v1 + wp_viewporter: the compositor's preferred
+ * scale; p->width/height = round(logical x scale / 120) buffer pixels, the
+ * viewport destination is the logical size and the buffer scale is one.
+ * Otherwise 120 x the startup wl_output.scale (the integer path). 120 before
+ * init. */
+uint32_t wayland_scale120(const plat *p);
+/* True when the fractional path above is active. */
+bool wayland_fractional(const plat *p);
+/* Font DPI the surface scale implies: 96 x scale120 / 120 (the edit-b6ai.15
+ * rule, 96 dpi x scale on Wayland sessions). Zero before init. */
+double wayland_dpi(const plat *p);
 #endif

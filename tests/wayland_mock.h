@@ -5,6 +5,8 @@
 #include <xkbcommon/xkbcommon.h>
 #include "wayland/protocol/xdg-shell-server.h"
 #include "wayland/protocol/presentation-server.h"
+#include "wayland/protocol/viewporter-server.h"
+#include "wayland/protocol/fractional-scale-v1-server.h"
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -46,8 +48,17 @@ typedef struct mock_wayland mock_wayland;
 #define MOCK_SCREEN_PX (320u * 240u)
 #define MOCK_DAMAGE_CAP 64u /* (E) fixture rect list; overflow damages the whole buffer */
 #define MOCK_BUFFER_CAP 8u  /* (P) distinct buffers: two slots x (initial + resized) x two */
+/* edit-b6ai.7: fractional fields. viewport_* is the committed wp_viewport
+ * destination (zero = never set), viewports/fractions count the add-on
+ * objects created. The parent requests runtime changes through request_*:
+ * the child reads them at each commit after the first, sends a
+ * preferred_scale (request_scale, when it differs from the last one sent) or
+ * a toplevel configure of logical size request_w x request_h (then zeroes
+ * them), and counts scales_sent. */
 typedef struct mock_shm_shared {
     uint32_t commits, distinct, width, height, scale, damage_rects, releases, held_destroyed;
+    uint32_t viewport_w, viewport_h, viewports, fractions, scales_sent;
+    uint32_t request_scale; int32_t request_w, request_h;
     uint32_t screen[MOCK_SCREEN_PX];
 } mock_shm_shared;
 typedef struct mock_shm_options {
@@ -55,6 +66,14 @@ typedef struct mock_shm_options {
     int32_t configure_w, configure_h;      /* logical toplevel size of the first configure */
     uint32_t resize_after;                 /* buffer commits before a second configure; 0 = none */
     int32_t resize_w, resize_h;            /* logical size of that configure */
+    /* edit-b6ai.7: advertise wp_viewporter / wp_fractional_scale_manager_v1;
+     * preferred_scale (120ths, 0 = none) is sent as soon as the client
+     * creates its wp_fractional_scale_v1. scale_after: buffer commits before
+     * a second preferred_scale of scale_to (0 = none). pointer_set replaces
+     * the startup pointer position (surface-local, wl_fixed). */
+    bool viewporter, fractional, pointer_set;
+    uint32_t preferred_scale, scale_after, scale_to;
+    wl_fixed_t pointer_x, pointer_y;
     mock_shm_shared *shared;
 } mock_shm_options;
 static mock_shm_options mock_shm;
@@ -77,6 +96,9 @@ struct mock_wayland {
     int32_t scale, pending_scale;
     int32_t damage[MOCK_DAMAGE_CAP][4]; size_t damage_count;
     mock_buffer_seen seen[MOCK_BUFFER_CAP];
+    /* edit-b6ai.7 add-ons: wp_viewport double-buffered destination */
+    struct wl_resource *viewport, *fraction;
+    int32_t dest_w, dest_h; bool dest_pending; uint32_t sent_scale;
 };
 static void mock_destroy(struct wl_client *client, struct wl_resource *resource)
 { (void)client; wl_resource_destroy(resource); }
@@ -159,6 +181,32 @@ static void mock_commit_buffer(mock_wayland *m)
     else { if (m->held) { wl_buffer_send_release(m->held); out->releases++; } m->held = br; }
     if (mock_shm.resize_after && out->commits == mock_shm.resize_after)
         mock_configure_toplevel(m, mock_shm.resize_w, mock_shm.resize_h);
+    if (mock_shm.scale_after && out->commits == mock_shm.scale_after && m->fraction) {
+        wp_fractional_scale_v1_send_preferred_scale(m->fraction, mock_shm.scale_to);
+        m->sent_scale = mock_shm.scale_to; out->scales_sent++;
+    }
+}
+/* edit-b6ai.7: double-buffered viewport state and the parent's requests. */
+static void mock_commit_fractional(mock_wayland *m)
+{
+    mock_shm_shared *out = mock_shm.shared;
+    if (m->dest_pending) {
+        m->dest_pending = false;
+        if (out) { out->viewport_w = m->dest_w > 0 ? (uint32_t)m->dest_w : 0; out->viewport_h = m->dest_h > 0 ? (uint32_t)m->dest_h : 0; }
+    }
+    /* The fractional protocol keeps the wl_surface buffer scale at one. */
+    if (m->viewport && m->dest_w > 0) assert(m->scale <= 1);
+    if (!out) return;
+    uint32_t want = __atomic_load_n(&out->request_scale, __ATOMIC_ACQUIRE);
+    if (want && want != m->sent_scale && m->fraction) {
+        wp_fractional_scale_v1_send_preferred_scale(m->fraction, want);
+        m->sent_scale = want; out->scales_sent++;
+    }
+    int32_t w = __atomic_load_n(&out->request_w, __ATOMIC_ACQUIRE), h = __atomic_load_n(&out->request_h, __ATOMIC_ACQUIRE);
+    if (w > 0 && h > 0) {
+        __atomic_store_n(&out->request_w, 0, __ATOMIC_RELEASE); __atomic_store_n(&out->request_h, 0, __ATOMIC_RELEASE);
+        mock_configure_toplevel(m, w, h);
+    }
 }
 static void mock_frame(struct wl_client *client, struct wl_resource *r, uint32_t id)
 {
@@ -181,8 +229,10 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
         wl_keyboard_send_modifiers(m->keyboard, wl_display_next_serial(m->display), 0, 0, 0, 0);
         wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
         wl_keyboard_send_key(m->keyboard, wl_display_next_serial(m->display), 0, 30, WL_KEYBOARD_KEY_STATE_RELEASED);
-        wl_pointer_send_enter(m->pointer, wl_display_next_serial(m->display), m->surface, wl_fixed_from_int(1), wl_fixed_from_int(1));
-        wl_pointer_send_motion(m->pointer, 0, wl_fixed_from_int(1), wl_fixed_from_int(1));
+        wl_fixed_t px = mock_shm.pointer_set ? mock_shm.pointer_x : wl_fixed_from_int(1);
+        wl_fixed_t py = mock_shm.pointer_set ? mock_shm.pointer_y : wl_fixed_from_int(1);
+        wl_pointer_send_enter(m->pointer, wl_display_next_serial(m->display), m->surface, px, py);
+        wl_pointer_send_motion(m->pointer, 0, px, py);
         wl_pointer_send_button(m->pointer, wl_display_next_serial(m->display), 0, 0x110, WL_POINTER_BUTTON_STATE_PRESSED);
         wl_pointer_send_button(m->pointer, wl_display_next_serial(m->display), 0, 0x110, WL_POINTER_BUTTON_STATE_RELEASED);
         wl_pointer_send_axis(m->pointer, 0, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(10));
@@ -203,6 +253,7 @@ static void mock_commit(struct wl_client *client, struct wl_resource *r)
     assert(m->acked);
     if (m->attached) mock_commit_buffer(m);
     else if (m->pending_scale) m->scale = m->pending_scale;
+    mock_commit_fractional(m);
     m->attached = false; m->pending_buffer = NULL; m->damage_full = false; m->damage_count = 0; m->pending_scale = 0;
     if (!m->frame && !m->feedback) {
         if (!m->holding) {
@@ -356,6 +407,45 @@ static void mock_bind_seat(struct wl_client *client, void *data, uint32_t versio
 { assert(version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION); struct wl_resource *r = wl_resource_create(client, &wl_seat_interface, (int)version, id); wl_resource_set_implementation(r, &mock_seat_ops, data, NULL); wl_seat_send_capabilities(r, WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER); }
 static void mock_bind_presentation(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wp_presentation_interface, (int)version, id); wl_resource_set_implementation(r, &mock_presentation_ops, data, NULL); wp_presentation_send_clock_id(r, (uint32_t)CLOCK_MONOTONIC); }
+/* edit-b6ai.7: wp_viewporter and wp_fractional_scale_manager_v1 */
+static void mock_viewport_source(struct wl_client *client, struct wl_resource *r, wl_fixed_t x, wl_fixed_t y, wl_fixed_t w, wl_fixed_t h)
+{ (void)client; (void)r; (void)x; (void)y; (void)w; (void)h; assert(false); /* the client never crops */ }
+static void mock_viewport_destination(struct wl_client *client, struct wl_resource *r, int32_t w, int32_t h)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r);
+    assert((w > 0 && h > 0) || (w == -1 && h == -1)); /* wp_viewport bad_value */
+    m->dest_w = w; m->dest_h = h; m->dest_pending = true;
+}
+static const struct wp_viewport_interface mock_viewport_ops = {.destroy = mock_destroy,
+    .set_source = mock_viewport_source, .set_destination = mock_viewport_destination};
+static void mock_viewport_gone(struct wl_resource *r) { ((mock_wayland *)wl_resource_get_user_data(r))->viewport = NULL; }
+static void mock_get_viewport(struct wl_client *client, struct wl_resource *r, uint32_t id, struct wl_resource *surface)
+{
+    mock_wayland *m = wl_resource_get_user_data(r); assert(surface == m->surface && !m->viewport);
+    m->viewport = wl_resource_create(client, &wp_viewport_interface, 1, id);
+    wl_resource_set_implementation(m->viewport, &mock_viewport_ops, m, mock_viewport_gone);
+    if (mock_shm.shared) mock_shm.shared->viewports++;
+}
+static const struct wp_viewporter_interface mock_viewporter_ops = {.destroy = mock_destroy, .get_viewport = mock_get_viewport};
+static const struct wp_fractional_scale_v1_interface mock_fraction_ops = {.destroy = mock_destroy};
+static void mock_fraction_gone(struct wl_resource *r) { ((mock_wayland *)wl_resource_get_user_data(r))->fraction = NULL; }
+static void mock_get_fraction(struct wl_client *client, struct wl_resource *r, uint32_t id, struct wl_resource *surface)
+{
+    mock_wayland *m = wl_resource_get_user_data(r); assert(surface == m->surface && !m->fraction);
+    m->fraction = wl_resource_create(client, &wp_fractional_scale_v1_interface, 1, id);
+    wl_resource_set_implementation(m->fraction, &mock_fraction_ops, m, mock_fraction_gone);
+    if (mock_shm.shared) mock_shm.shared->fractions++;
+    if (mock_shm.preferred_scale) {
+        wp_fractional_scale_v1_send_preferred_scale(m->fraction, mock_shm.preferred_scale);
+        m->sent_scale = mock_shm.preferred_scale; if (mock_shm.shared) mock_shm.shared->scales_sent++;
+    }
+}
+static const struct wp_fractional_scale_manager_v1_interface mock_fraction_manager_ops = {.destroy = mock_destroy,
+    .get_fractional_scale = mock_get_fraction};
+static void mock_bind_viewporter(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{ struct wl_resource *r = wl_resource_create(client, &wp_viewporter_interface, (int)version, id); wl_resource_set_implementation(r, &mock_viewporter_ops, data, NULL); }
+static void mock_bind_fraction_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{ struct wl_resource *r = wl_resource_create(client, &wp_fractional_scale_manager_v1_interface, (int)version, id); wl_resource_set_implementation(r, &mock_fraction_manager_ops, data, NULL); }
 static void mock_bind_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wl_data_device_manager_interface, (int)version, id); wl_resource_set_implementation(r, &mock_manager_ops, data, NULL); }
 /* (P) Unit logical output = minimum nonzero dimensions; scale is the
@@ -396,6 +486,8 @@ static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, 
             assert(wl_global_create(m.display, &wl_output_interface, WL_OUTPUT_SCALE_SINCE_VERSION, &m, mock_bind_wide_output));
         assert(wl_global_create(m.display, &wl_data_device_manager_interface, 1, &m, mock_bind_manager));
         if (mock_shm.enabled) assert(!wl_display_init_shm(m.display)); /* libwayland-server's real wl_shm */
+        if (mock_shm.viewporter) assert(wl_global_create(m.display, &wp_viewporter_interface, 1, &m, mock_bind_viewporter));
+        if (mock_shm.fractional) assert(wl_global_create(m.display, &wp_fractional_scale_manager_v1_interface, 1, &m, mock_bind_fraction_manager));
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};
         wl_client_add_destroy_listener(client, &gone.listener);

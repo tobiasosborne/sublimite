@@ -6,6 +6,8 @@
 #ifdef EDIT_HAVE_WAYLAND
 #include "protocol/xdg-shell-client.h"
 #include "protocol/presentation-client.h"
+#include "protocol/viewporter-client.h"
+#include "protocol/fractional-scale-v1-client.h"
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <xkbcommon/xkbcommon.h>
@@ -63,6 +65,14 @@ typedef struct wayland_state {
     struct wp_presentation_feedback *feedback;
     struct wl_shm *shm; /* edit-b6ai.6: raster buffer factory */
     struct wl_callback *frame;
+    /* edit-b6ai.7: fractional path (both globals bound): buffer scale one,
+     * buffer = round(logical x scale120 / 120), destination = logical. */
+    struct wp_viewporter *viewporter;
+    struct wp_fractional_scale_manager_v1 *fraction_manager;
+    struct wp_viewport *viewport;
+    struct wp_fractional_scale_v1 *fraction;
+    bool fractional, scale_dirty;
+    uint32_t scale120, logical_w, logical_h, pending_logical_w, pending_logical_h, dest_w, dest_h;
     uint32_t compositor_name, shell_name, seat_name, presentation_name;
     uint32_t pending_width, pending_height, scale;
     uint32_t frame_id, serial, buttons, repeat_key, delay_ms, rate_hz;
@@ -154,9 +164,49 @@ static void focus(wayland_state *s, bool focused)
 static void shell_ping(void *data, struct xdg_wm_base *shell, uint32_t serial)
 { (void)data; xdg_wm_base_pong(shell, serial); }
 static const struct xdg_wm_base_listener shell_listener = {.ping = shell_ping};
+/* (P) wp_fractional_scale_v1: a toplevel's buffer is its logical size times
+ * scale/120, rounded halfway away from zero (+ 60/120 = + 0.5 for the
+ * non-negative sizes here); at least one pixel, within the int32 wire type. */
+static uint32_t fractional_px(uint32_t logical, uint32_t scale120)
+{
+    uint64_t px = ((uint64_t)logical * scale120 + 60u) / 120u;
+    return px > INT32_MAX ? (uint32_t)INT32_MAX : px ? (uint32_t)px : 1u;
+}
+/* Logical size or preferred scale changed: viewport destination (double-
+ * buffered: applies with the next commit), buffer size, EGL window, RESIZE.
+ * A scale change always reports RESIZE so the editor re-reads wayland_dpi;
+ * the editor applies both at its next frame boundary (resize_pending and
+ * editor_font_poll), never inside input -> submit. No allocation here. */
+static void fractional_apply(wayland_state *s)
+{
+    if (s->viewport && (s->dest_w != s->logical_w || s->dest_h != s->logical_h)) {
+        wp_viewport_set_destination(s->viewport, (int32_t)s->logical_w, (int32_t)s->logical_h);
+        s->dest_w = s->logical_w; s->dest_h = s->logical_h;
+    }
+    uint32_t width = fractional_px(s->logical_w, s->scale120), height = fractional_px(s->logical_h, s->scale120);
+    if (s->p->width == width && s->p->height == height && !s->scale_dirty) return;
+    s->scale_dirty = false; s->p->width = width; s->p->height = height;
+    if (s->window) wl_egl_window_resize(s->window, (int)width, (int)height, 0, 0);
+    push(s, (plat_event){.kind = PLAT_EV_RESIZE, .w = width, .h = height});
+}
+static void fraction_preferred(void *data, struct wp_fractional_scale_v1 *fraction, uint32_t scale)
+{
+    (void)fraction; wayland_state *s = data;
+    if (!scale || scale == s->scale120) return; /* zero is no scale; ignore it */
+    s->scale120 = scale; s->scale_dirty = true;
+    if (s->configured) fractional_apply(s); /* else the first configure applies it */
+}
+static const struct wp_fractional_scale_v1_listener fraction_listener = {.preferred_scale = fraction_preferred};
 static void configure(void *data, struct xdg_surface *surface, uint32_t serial)
 {
     wayland_state *s = data; xdg_surface_ack_configure(surface, serial);
+    if (s->fractional) {
+        if (s->pending_logical_w) s->logical_w = s->pending_logical_w;
+        if (s->pending_logical_h) s->logical_h = s->pending_logical_h;
+        fractional_apply(s); s->configured = true;
+        push(s, (plat_event){.kind = PLAT_EV_EXPOSE, .w = s->p->width, .h = s->p->height});
+        return;
+    }
     /* Toplevel dimensions form a configure transaction. Apply only when the
      * serial-bearing surface configure arrives, even if packets are split. */
     uint32_t width = s->pending_width ? s->pending_width : s->p->width;
@@ -174,6 +224,11 @@ static void top_configure(void *data, struct xdg_toplevel *top, int32_t width, i
 {
     (void)top; (void)states; wayland_state *s = data;
     /* xdg-shell zero means client chooses, independently for each dimension. */
+    if (s->fractional) {
+        s->pending_logical_w = width > 0 ? (uint32_t)width : s->logical_w;
+        s->pending_logical_h = height > 0 ? (uint32_t)height : s->logical_h;
+        return;
+    }
     if ((width > 0 && (uint32_t)width > (uint32_t)INT32_MAX / s->scale) ||
         (height > 0 && (uint32_t)height > (uint32_t)INT32_MAX / s->scale)) { s->failed = true; return; }
     s->pending_width = width > 0 ? (uint32_t)width * s->scale : s->p->width;
@@ -274,18 +329,24 @@ static void keyboard_repeat(void *data, struct wl_keyboard *keyboard, int32_t ra
 { (void)keyboard; wayland_state *s = data; wayland_plat_set_repeat(s->p, delay > 0 ? (uint32_t)delay : 0, rate > 0 ? (uint32_t)rate : 0); }
 static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard_keymap, .enter = keyboard_enter,
     .leave = keyboard_leave, .key = keyboard_key, .modifiers = keyboard_modifiers, .repeat_info = keyboard_repeat};
-static int32_t pointer_pixel(wl_fixed_t value, uint32_t scale)
+static int32_t pointer_pixel(wl_fixed_t value, const wayland_state *s)
 {
-    int64_t pixel = (int64_t)wl_fixed_to_int(value) * scale;
+    int64_t pixel = (int64_t)wl_fixed_to_int(value) * s->scale;
+    if (s->fractional) {
+        /* edit-b6ai.7: the buffer pixel containing the point, floor(v x
+         * scale120 / 120) with v in wl_fixed's 1/256 units. */
+        int64_t n = (int64_t)value * s->scale120, d = INT64_C(256) * 120;
+        pixel = n / d; if (n % d && n < 0) pixel--;
+    }
     return pixel > INT32_MAX ? INT32_MAX : pixel < INT32_MIN ? INT32_MIN : (int32_t)pixel;
 }
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
-{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale); }
+{ (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; s->x = pointer_pixel(x, s); s->y = pointer_pixel(y, s); }
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
 { (void)pointer; (void)surface; wayland_state *s = data; s->serial = serial; push(s, (plat_event){.kind=PLAT_EV_LEAVE, .t0_ns=trace_now_ns()}); }
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
-    (void)pointer; wayland_state *s = data; s->x = pointer_pixel(x, s->scale); s->y = pointer_pixel(y, s->scale);
+    (void)pointer; wayland_state *s = data; s->x = pointer_pixel(x, s); s->y = pointer_pixel(y, s);
     push(s, (plat_event){.kind = PLAT_EV_MOTION, .x = s->x, .y = s->y, .buttons = s->buttons, .mods = s->mods, .time_ms = time, .t0_ns = input_stamp(s, time)});
 }
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
@@ -426,6 +487,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         s->manager = wl_registry_bind(registry, name, &wl_data_device_manager_interface, 1);
     } else if (!strcmp(interface, "wl_shm") && !s->shm) {
         s->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1); /* (P) v1 suffices: XRGB8888 is mandatory */
+    } else if (!strcmp(interface, "wp_viewporter") && !s->viewporter) {
+        s->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1); /* (P) stable v1 */
+    } else if (!strcmp(interface, "wp_fractional_scale_manager_v1") && !s->fraction_manager) {
+        s->fraction_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1); /* (P) v1 */
     } else if (!strcmp(interface, "wp_presentation") && !s->presentation) {
         s->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1); s->presentation_name = name;
         wp_presentation_add_listener(s->presentation, &presentation_listener, s);
@@ -473,14 +538,35 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
     if (wl_display_roundtrip(display) < 0 || s->failed) goto fail;
     wayland_display_info output;
     if (wayland_display_size_on(display, &output) != PLAT_OK) goto fail;
-    if (wl_proxy_get_version((struct wl_proxy *)s->compositor) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
-        s->scale = output.scale;
-    /* (P) buffer pixel extents must be divisible by the integer scale. Round
-     * down within the caller's reserve; the minimum surface is one logical pixel. */
-    p->width = (p->width / s->scale ? p->width / s->scale : 1) * s->scale;
-    p->height = (p->height / s->scale ? p->height / s->scale : 1) * s->scale;
+    /* (P) font DPI unit: the integer path implies 120ths x wl_output.scale. */
+    s->scale120 = output.scale <= UINT32_MAX / 120u ? output.scale * 120u : UINT32_MAX;
+    s->fractional = s->viewporter && s->fraction_manager;
+    if (s->fractional) {
+        /* edit-b6ai.7: the launch logical size is today's (reserve over the
+         * integer output scale); the scale is one (output.c's 96 dpi floor)
+         * until the compositor's preferred_scale arrives. */
+        s->scale120 = 120u;
+        s->logical_w = p->width / output.scale ? p->width / output.scale : 1;
+        s->logical_h = p->height / output.scale ? p->height / output.scale : 1;
+        p->width = fractional_px(s->logical_w, s->scale120); p->height = fractional_px(s->logical_h, s->scale120);
+    } else {
+        if (wl_proxy_get_version((struct wl_proxy *)s->compositor) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+            s->scale = output.scale;
+        /* (P) buffer pixel extents must be divisible by the integer scale. Round
+         * down within the caller's reserve; the minimum surface is one logical pixel. */
+        p->width = (p->width / s->scale ? p->width / s->scale : 1) * s->scale;
+        p->height = (p->height / s->scale ? p->height / s->scale : 1) * s->scale;
+    }
     s->surface = wl_compositor_create_surface(s->compositor);
-    if (wl_proxy_get_version((struct wl_proxy *)s->surface) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    if (s->fractional) {
+        /* Buffer scale stays at its default of one (fractional-scale-v1). */
+        s->viewport = wp_viewporter_get_viewport(s->viewporter, s->surface);
+        s->fraction = wp_fractional_scale_manager_v1_get_fractional_scale(s->fraction_manager, s->surface);
+        if (!s->viewport || !s->fraction) goto fail;
+        wp_fractional_scale_v1_add_listener(s->fraction, &fraction_listener, s);
+        s->dest_w = s->logical_w; s->dest_h = s->logical_h;
+        wp_viewport_set_destination(s->viewport, (int32_t)s->logical_w, (int32_t)s->logical_h);
+    } else if (wl_proxy_get_version((struct wl_proxy *)s->surface) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
         wl_surface_set_buffer_scale(s->surface, (int32_t)s->scale);
     s->xdg = xdg_wm_base_get_xdg_surface(s->shell, s->surface); xdg_surface_add_listener(s->xdg, &xdg_listener, s);
     s->top = xdg_surface_get_toplevel(s->xdg); xdg_toplevel_add_listener(s->top, &top_listener, s);
@@ -506,6 +592,10 @@ void *wayland_egl_window(const plat *p) { return W(p) ? W(p)->window : NULL; }
 void *wayland_surface(const plat *p) { return W(p) ? W(p)->surface : NULL; }
 void *wayland_shm(const plat *p) { return W(p) ? W(p)->shm : NULL; }
 uint32_t wayland_buffer_scale(const plat *p) { return W(p) ? W(p)->scale : 1; }
+uint32_t wayland_scale120(const plat *p) { return W(p) ? W(p)->scale120 : 120u; }
+bool wayland_fractional(const plat *p) { return W(p) && W(p)->fractional; }
+/* (E) 96 logical px/inch, output.c's desktop base, times the scale. */
+double wayland_dpi(const plat *p) { return W(p) ? 96.0 * W(p)->scale120 / 120.0 : 0.0; }
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
 {
     (void)time; wayland_state *s = data;
@@ -768,7 +858,11 @@ void wayland_plat_shutdown(plat *p)
         if (s->window) wl_egl_window_destroy(s->window);
         if (s->top) xdg_toplevel_destroy(s->top);
         if (s->xdg) xdg_surface_destroy(s->xdg);
+        if (s->fraction) wp_fractional_scale_v1_destroy(s->fraction);
+        if (s->viewport) wp_viewport_destroy(s->viewport);
         if (s->surface) wl_surface_destroy(s->surface);
+        if (s->fraction_manager) wp_fractional_scale_manager_v1_destroy(s->fraction_manager);
+        if (s->viewporter) wp_viewporter_destroy(s->viewporter);
         if (s->presentation) wp_presentation_destroy(s->presentation);
         if (s->shm) wl_shm_destroy(s->shm);
         if (s->shell) xdg_wm_base_destroy(s->shell);
@@ -807,6 +901,9 @@ void *wayland_egl_window(const plat *p) { (void)p; return NULL; }
 void *wayland_surface(const plat *p) { (void)p; return NULL; }
 void *wayland_shm(const plat *p) { (void)p; return NULL; }
 uint32_t wayland_buffer_scale(const plat *p) { (void)p; return 1; }
+uint32_t wayland_scale120(const plat *p) { (void)p; return 120u; }
+bool wayland_fractional(const plat *p) { (void)p; return false; }
+double wayland_dpi(const plat *p) { (void)p; return 0.0; }
 bool wayland_frame_discarded(const plat *p, uint32_t id) { (void)p; (void)id; return false; }
 void wayland_frame_notify(plat *p) { (void)p; }
 int wayland_frame_arm(plat *p, uint32_t id) { (void)p; (void)id; return PLAT_ERR_FAIL; }

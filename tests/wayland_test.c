@@ -46,6 +46,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length)
 #include "raster/raster.h"
 #include "work/work.h"
 #include "trace/trace.h"
+#include <wayland-egl-backend.h> /* edit-b6ai.7: the GL surface's requested size */
 
 typedef struct observed { bool focus, key, release, button, motion, leave, wheel, clip, close, lost, repeat, blink, work, stop_key, priority_key; unsigned wheels; plat *platform; int work_fd; } observed;
 static void observe(void *user, const plat_event *ev)
@@ -87,6 +88,143 @@ static void presentation_fallback_test(void)
     puts("wayland_test: missing wp_presentation arms a frame callback whose done completes the frame");
 }
 
+/* ---- edit-b6ai.7: wp_fractional_scale_v1 + wp_viewporter --------------- */
+/* (P) Omarchy's fractional steps (omarchy-hyprland-monitor-scaling SCALES
+ * 1 1.25 1.6 2 3 4) in the protocol's 120ths: 1.25 x 120 = 150, 1.6 x 120 = 192. */
+#define FRAC_125 150u
+#define FRAC_160 192u
+/* (P) Logical fixture 30 x 80: 30 x 1.25 = 37.5 exercises the protocol's
+ * half-away-from-zero toplevel rounding (38); 80 x 1.25 = 100; 30 x 1.6 = 48;
+ * 80 x 1.6 = 128. The resize adds one to each axis (31 x 81): 31 x 1.6 = 49.6
+ * -> 50, 81 x 1.6 = 129.6 -> 130, 31 x 1.25 = 38.75 -> 39, 81 x 1.25 = 101.25 -> 101. */
+#define FRAC_LW 30u
+#define FRAC_LH 80u
+/* round(logical x scale / 120), halfway away from zero: + 60/120 = + 0.5. */
+static uint32_t frac_px(uint32_t logical, uint32_t scale)
+{ return (uint32_t)(((uint64_t)logical * scale + 60u) / 120u); }
+/* Buffer pixel containing a surface-local wl_fixed point (24.8 fixed point,
+ * so one logical px = 256): floor(v x scale / (256 x 120)). */
+static int32_t frac_pointer(wl_fixed_t v, uint32_t scale)
+{
+    int64_t n = (int64_t)v * scale, d = INT64_C(256) * 120;
+    int64_t q = n / d; if (n % d && n < 0) q--;
+    return (int32_t)q;
+}
+static mock_shm_shared *frac_shared(void)
+{
+    mock_shm_shared *shared = mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert(shared != MAP_FAILED); return shared;
+}
+/* Commit plus roundtrip: the mock applies double-buffered viewport state and
+ * the parent's request_* at a commit; the roundtrip dispatches its events. */
+static void frac_commit(plat *p)
+{ wl_surface_commit(wayland_surface(p)); assert(wl_display_roundtrip(wayland_display(p)) >= 0); }
+static bool frac_resize_event(plat *p, uint32_t w, uint32_t h)
+{
+    bool seen = false; plat_event ev;
+    while (plat_poll_event(p, &ev)) if (ev.kind == PLAT_EV_RESIZE) { assert(ev.w == w && ev.h == h); seen = true; }
+    return seen;
+}
+/* Platform-level case: startup preferred scale, pointer mapping, viewport
+ * destination, GL window size, then a runtime scale change and a logical
+ * resize at the new scale. */
+static void fractional_plat_case(uint32_t scale, uint32_t to)
+{
+    mock_shm_shared *shared = frac_shared();
+    /* (P) pointer fixture 10.5, 20.25 logical px: non-integer, so the integer
+     * path's truncate-then-scale and the fractional scale-then-floor differ. */
+    mock_shm = (mock_shm_options){.configure_set = true, .configure_w = (int32_t)FRAC_LW, .configure_h = (int32_t)FRAC_LH,
+        .viewporter = true, .fractional = true, .preferred_scale = scale, .pointer_set = true,
+        .pointer_x = wl_fixed_from_double(10.5), .pointer_y = wl_fixed_from_double(20.25), .shared = shared};
+    /* Integer wl_output.scale 2 (1 + 1): Hyprland reports the ceiling of a
+     * fractional monitor scale there; the preferred scale must win. */
+    pid_t child = mock_start_options(true, false, NULL, 0, 1 + 1, false);
+    wayland_display_info info; assert(wayland_display_size(&info) == PLAT_OK);
+    /* Startup font DPI on a fractional session is the scale-one floor; the
+     * surface's preferred scale raises it at runtime (decisions/edit-b6ai.7.md). */
+    assert(info.fractional && info.dpi == 96.0 && info.scale == 1u + 1u);
+    mock_join(child); shared->fractions = shared->viewports = shared->scales_sent = 0;
+    child = mock_start_options(true, false, NULL, 0, 1 + 1, false);
+    plat p; plat_config cfg = {.width = 2u * FRAC_LW, .height = 2u * FRAC_LH, .work_wake = NULL};
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    assert(wayland_fractional(&p) && wayland_scale120(&p) == scale && wayland_buffer_scale(&p) == 1);
+    assert(wayland_dpi(&p) == 96.0 * scale / 120.0);
+    assert(p.width == frac_px(FRAC_LW, scale) && p.height == frac_px(FRAC_LH, scale));
+    struct wl_egl_window *window = wayland_egl_window(&p);
+    assert(window && window->width == (int)p.width && window->height == (int)p.height);
+    bool motion = false, resized = false; plat_event ev;
+    while (plat_poll_event(&p, &ev)) {
+        if (ev.kind == PLAT_EV_MOTION) {
+            assert(ev.x == frac_pointer(mock_shm.pointer_x, scale) && ev.y == frac_pointer(mock_shm.pointer_y, scale));
+            motion = true;
+        }
+        if (ev.kind == PLAT_EV_RESIZE) { assert(ev.w == p.width && ev.h == p.height); resized = true; }
+    }
+    assert(motion && resized);
+    frac_commit(&p);
+    assert(shared->viewports == 1 && shared->fractions == 1 && shared->scales_sent == 1);
+    assert(shared->viewport_w == FRAC_LW && shared->viewport_h == FRAC_LH);
+    /* Runtime preferred_scale change: new buffer size, same destination. */
+    __atomic_store_n(&shared->request_scale, to, __ATOMIC_RELEASE);
+    frac_commit(&p);
+    assert(shared->scales_sent == 2 && wayland_scale120(&p) == to && wayland_dpi(&p) == 96.0 * to / 120.0);
+    assert(p.width == frac_px(FRAC_LW, to) && p.height == frac_px(FRAC_LH, to));
+    assert(window->width == (int)p.width && window->height == (int)p.height);
+    assert(frac_resize_event(&p, p.width, p.height));
+    frac_commit(&p);
+    assert(shared->viewport_w == FRAC_LW && shared->viewport_h == FRAC_LH);
+    /* Logical resize at the new scale: destination follows the configure. */
+    __atomic_store_n(&shared->request_w, (int32_t)FRAC_LW + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&shared->request_h, (int32_t)FRAC_LH + 1, __ATOMIC_RELEASE);
+    frac_commit(&p);
+    assert(p.width == frac_px(FRAC_LW + 1u, to) && p.height == frac_px(FRAC_LH + 1u, to));
+    assert(window->width == (int)p.width && window->height == (int)p.height);
+    assert(frac_resize_event(&p, p.width, p.height));
+    frac_commit(&p);
+    assert(shared->viewport_w == FRAC_LW + 1u && shared->viewport_h == FRAC_LH + 1u);
+    printf("wayland_test: fractional %u/120 -> %u/120: buffer %ux%u for logical %ux%u, dpi %.1f, pointer (%d,%d)\n",
+        scale, to, p.width, p.height, FRAC_LW + 1u, FRAC_LH + 1u, wayland_dpi(&p),
+        frac_pointer(mock_shm.pointer_x, scale), frac_pointer(mock_shm.pointer_y, scale));
+    plat_shutdown(&p); mock_join(child);
+    munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
+}
+/* Either protocol alone: the integer path, byte for byte as output_test. */
+static void fractional_absent_test(void)
+{
+    for (int variant = 0; variant < 1 + 1; variant++) { /* (P) the two single-protocol subsets */
+        mock_shm_shared *shared = frac_shared();
+        mock_shm = (mock_shm_options){.viewporter = variant == 1, .fractional = variant == 0,
+            .preferred_scale = FRAC_125, .shared = shared};
+        int32_t scale = 1 + 1; /* output_test's first scale above unity */
+        pid_t child = mock_start_options(true, false, NULL, 0, scale, false);
+        wayland_display_info info; assert(wayland_display_size(&info) == PLAT_OK);
+        assert(!info.fractional && info.dpi == 96.0 * scale);
+        mock_join(child);
+        child = mock_start_options(true, false, NULL, 0, scale, false);
+        plat p; plat_config cfg = {.width = (uint32_t)scale, .height = (uint32_t)scale, .work_wake = NULL};
+        assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+        assert(!wayland_fractional(&p) && wayland_buffer_scale(&p) == (uint32_t)scale);
+        assert(wayland_scale120(&p) == 120u * (uint32_t)scale && wayland_dpi(&p) == 96.0 * scale);
+        assert(p.width == (uint32_t)scale * cfg.width && p.height == cfg.height);
+        bool motion = false; plat_event event;
+        while (plat_poll_event(&p, &event)) if (event.kind == PLAT_EV_MOTION) {
+            assert(event.x == scale && event.y == scale); motion = true;
+        }
+        assert(motion);
+        frac_commit(&p);
+        assert(!shared->viewports && !shared->fractions && !shared->viewport_w);
+        plat_shutdown(&p); mock_join(child);
+        munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
+    }
+    puts("wayland_test: wp_viewporter or wp_fractional_scale_v1 alone keeps the integer path");
+}
+static void fractional_test(void)
+{
+    fractional_plat_case(FRAC_125, FRAC_160);
+    fractional_plat_case(FRAC_160, FRAC_125);
+    fractional_absent_test();
+}
+
 /* ---- edit-b6ai.6: Wayland CPU raster backend over wl_shm --------------- */
 /* (P) Grid: the P2.5 live-pixel fixture of tests/raster_test.c, 4 x 6 cells
  * of 8 x 16 px = 32 x 96 px, one 8 x 16 glyph page. The surface adds four
@@ -102,6 +240,13 @@ static void presentation_fallback_test(void)
 #define WLR_RW 40u
 #define WLR_RH 104u
 #define WLR_BACKGROUND 0x203040u /* any opaque RGB distinct from the cell colours */
+/* edit-b6ai.7: fractional raster runs. (P) logical 28 x 80: 28 x 1.25 = 35,
+ * 80 x 1.25 = 100; 28 x 1.6 = 44.8 -> 45, 80 x 1.6 = 128: each covers the
+ * 32 x 96 grid and stays within the 64 x 128 reserve. scale/to set by
+ * raster_test before wlr_case; the "resize" there becomes a scale change. */
+#define WLR_FW 28u
+#define WLR_FH 80u
+static struct { uint32_t scale, to; } wlr_frac;
 typedef struct wlr_fixture {
     plat p; work_pool pool; render_backend b; void *state; render_config cfg;
     render_cell cells[WLR_COLS * WLR_ROWS]; uint64_t bits[1]; render_grid g;
@@ -179,12 +324,19 @@ static void wlr_open(wlr_fixture *f, bool presentation, bool present_always, int
     mock_shm = (mock_shm_options){.enabled = true, .present_always = present_always, .release_immediately = immediate,
         .configure_set = true, .configure_w = (int32_t)WLR_W / unit, .configure_h = (int32_t)WLR_H / unit,
         .resize_after = resize_after, .resize_w = (int32_t)WLR_RW / unit, .resize_h = (int32_t)WLR_RH / unit, .shared = f->shared};
+    uint32_t want_w = WLR_W, want_h = WLR_H;
+    if (wlr_frac.scale) {
+        mock_shm.configure_w = (int32_t)WLR_FW; mock_shm.configure_h = (int32_t)WLR_FH;
+        mock_shm.viewporter = mock_shm.fractional = true; mock_shm.preferred_scale = wlr_frac.scale;
+        mock_shm.scale_after = resize_after; mock_shm.scale_to = wlr_frac.to; mock_shm.resize_after = 0;
+        want_w = frac_px(WLR_FW, wlr_frac.scale); want_h = frac_px(WLR_FH, wlr_frac.scale);
+    }
     f->child = mock_start_options(true, false, NULL, 0, scale, !presentation);
     plat_config pc = {.width = WLR_W, .height = WLR_H, .work_wake = NULL};
     assert(plat_init_backend(&f->p, &pc, PLAT_BACKEND_WAYLAND) == PLAT_OK);
-    assert(f->p.width == WLR_W && f->p.height == WLR_H);
-    f->width = WLR_W; f->height = WLR_H;
-    assert(wayland_buffer_scale(&f->p) == (uint32_t)unit);
+    assert(f->p.width == want_w && f->p.height == want_h);
+    f->width = want_w; f->height = want_h;
+    assert(wayland_buffer_scale(&f->p) == (wlr_frac.scale ? 1u : (uint32_t)unit));
     plat_event ev; while (plat_poll_event(&f->p, &ev)) { /* retire the mock's startup input */ }
     assert(!work_pool_init(&f->pool, 1, RASTER_JOBS));
     for (size_t i = 0; i < sizeof f->pixels; i++) f->pixels[i] = (uint8_t)(i * 7u); /* raster_test's ramp */
@@ -277,15 +429,19 @@ static void wlr_case(const char *name, bool presentation, bool present_always, i
     /* Release/reuse: release-on-replace alternates two slots; immediate
      * release reuses the most recently written one. No buffer per frame. */
     assert(f.shared->commits == frames && f.shared->distinct == (immediate ? 1u : 2u));
-    assert(f.shared->scale == (uint32_t)(scale ? scale : 1));
+    assert(f.shared->scale == (wlr_frac.scale ? 1u : (uint32_t)(scale ? scale : 1))); /* fractional: buffer scale one */
     if (resize) {
         uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* (G) settle deadline as above */
         while (!f.resized) { wlr_pump(&f); assert(trace_now_ns() < deadline); }
-        assert(f.resize_w == WLR_RW && f.resize_h == WLR_RH && f.p.width == WLR_RW);
+        uint32_t rw = wlr_frac.scale ? frac_px(WLR_FW, wlr_frac.to) : WLR_RW;
+        uint32_t rh = wlr_frac.scale ? frac_px(WLR_FH, wlr_frac.to) : WLR_RH;
+        assert(f.resize_w == rw && f.resize_h == rh && f.p.width == rw);
         f.width = f.resize_w; f.height = f.resize_h; /* frames below draw at the new size */
         for (uint32_t id = 16; id < 18; id++) { wlr_full(&f, id); present_allocs += wlr_finish(&f, id); wlr_compare(&f); }
         /* (P) each slot recreated once at the new size, as it is next used. */
         assert(f.shared->distinct == (immediate ? 2u : 4u));
+        /* edit-b6ai.7: the destination stays logical; buffer scale stays one. */
+        if (wlr_frac.scale) assert(f.shared->viewport_w == WLR_FW && f.shared->viewport_h == WLR_FH && f.shared->scale == 1);
     }
     if (resize) frames += 2u; /* (P) frames 16 and 17 at the new size */
     printf("wayland_test: raster %s passed: frames=%u commits=%u buffers=%u damage_rects=%u releases=%u typing_mallocs=%zu post_submit_mallocs=%zu guard=%s\n",
@@ -320,6 +476,12 @@ static void raster_test(void)
     wlr_case("scale-2", true, true, 1 + 1, false, false); /* (P) first integer scale above unity */
     wlr_case("resize", false, false, 0, false, true);
     wlr_case("resize-immediate-scale-2", true, true, 1 + 1, true, true);
+    /* edit-b6ai.7: integer output scale 2 advertised, fractional preferred. */
+    wlr_frac.scale = FRAC_125; wlr_frac.to = FRAC_160;
+    wlr_case("fractional-1.25-to-1.6", true, true, 1 + 1, false, true);
+    wlr_frac.scale = FRAC_160; wlr_frac.to = FRAC_125;
+    wlr_case("fractional-1.6-to-1.25-immediate", false, false, 1 + 1, true, true);
+    wlr_frac.scale = wlr_frac.to = 0;
 }
 /* Editor on the Wayland raster fallback: wp_presentation is absent, so GL
  * refuses at init and the editor must select raster (no X11 change). The
@@ -372,6 +534,55 @@ static void editor_raster_test(void)
     editor_close(e); mock_join(child);
     printf("wayland_test: editor on Wayland without wp_presentation fell back to raster: startup_bracket=%zu typing_mallocs=%zu frames=%zu commits=%u guard=%s\n",
         before, c.allocations, c.frames, commits, edit_malloc_guard_active() ? "active" : "ASan-inert");
+    munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
+}
+/* edit-b6ai.7: the editor on a fractional session. Startup DPI 96 (what main
+ * reports on a fractional session), preferred 1.25 at map, then 1.6 while
+ * typing: the font is re-selected at each change (cell height grows), the
+ * raster buffer follows round(logical x scale), the destination stays
+ * logical, and the typing bracket (on_ingress -> on_submit) stays malloc-free. */
+static void editor_fractional_test(void)
+{
+    mock_shm_shared *shared = frac_shared();
+    /* (P) logical 160 x 120: at 1.6 the buffer is 256 x 192 = 49152 px, within
+     * MOCK_SCREEN_PX (320 x 240), the reserve passed below. */
+    uint32_t lw = 160, lh = 120;
+    mock_shm = (mock_shm_options){.enabled = true, .configure_set = true, .configure_w = (int32_t)lw, .configure_h = (int32_t)lh,
+        .viewporter = true, .fractional = true, .preferred_scale = FRAC_125, .shared = shared};
+    pid_t child = mock_start_options(true, false, NULL, 0, 0, true);
+    render_backend b = {0}; assert(editor_backend_select(&b, NULL) == 0);
+    wl_counted c = {0};
+    editor_config cfg = {.cols = 30, .rows = 6, .raster_fallback = true, .platform_backend = PLAT_BACKEND_WAYLAND,
+        .font_dpi = 96.0, .max_window_width = 320, .max_window_height = 240,
+        .hook_ctx = &c, .on_ingress = wl_ingress, .on_submit = wl_submitted};
+    editor *e = NULL; assert(editor_open(&e, &cfg, &b) == EDITOR_OK);
+    uint32_t cell96 = editor_grid(e)->dims.cell_h;
+    wl_settle(e);
+    uint32_t cell125 = editor_grid(e)->dims.cell_h;
+    if (cell125 <= cell96) fprintf(stderr, "wayland_test: cell height %u at 96 dpi, %u after 1.25\n", cell96, cell125);
+    assert(cell125 > cell96);
+    assert(shared->width == frac_px(lw, FRAC_125) && shared->height == frac_px(lh, FRAC_125));
+    assert(shared->viewport_w == lw && shared->viewport_h == lh && shared->scale == 1);
+    c.allocations = 0;
+    __atomic_store_n(&shared->request_scale, FRAC_160, __ATOMIC_RELEASE);
+    /* (P) editor_raster_test's hundred alternating keys, settled after each. */
+    for (unsigned i = 0; i < 100; i++) {
+        plat_event ev = {.kind = PLAT_EV_KEY, .press = true, .keysym = i % 2 ? XKB_KEY_BackSpace : 'x'};
+        if (!(i % 2)) { ev.utf8[0] = 'x'; ev.utf8_len = 1; }
+        assert(editor_inject(e, &ev) == EDITOR_OK);
+        wl_settle(e);
+    }
+    assert(!c.active && shared->scales_sent == 2);
+    uint32_t cell160 = editor_grid(e)->dims.cell_h;
+    if (cell160 <= cell125) fprintf(stderr, "wayland_test: cell height %u after 1.25, %u after 1.6\n", cell125, cell160);
+    assert(cell160 > cell125);
+    assert(shared->width == frac_px(lw, FRAC_160) && shared->height == frac_px(lh, FRAC_160));
+    assert(shared->viewport_w == lw && shared->viewport_h == lh && shared->scale == 1);
+    if (c.allocations) fprintf(stderr, "wayland_test: editor fractional allocation diagnostic: allocations=%zu\n", c.allocations);
+    if (edit_malloc_guard_active()) assert(!c.allocations);
+    editor_close(e); mock_join(child);
+    printf("wayland_test: editor fractional 96 dpi -> 1.25 -> 1.6: cell_h %u -> %u -> %u, buffer %ux%u, typing_mallocs=%zu guard=%s\n",
+        cell96, cell125, cell160, shared->width, shared->height, c.allocations, edit_malloc_guard_active() ? "active" : "ASan-inert");
     munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
 }
 static void submitted(void *user, const editor_frame *frame)
@@ -663,6 +874,8 @@ int main(int argc, char **argv)
     presentation_fallback_test();
     raster_test();
     editor_raster_test();
+    fractional_test();
+    editor_fractional_test();
     allocation_test();
     output_test();
     protocol_test();

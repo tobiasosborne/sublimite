@@ -11,7 +11,7 @@ typedef struct output_mode {
     uint32_t width, height, scale;
     int32_t transform;
 } output_mode;
-typedef struct output_query { output_mode *outputs; bool failed; } output_query;
+typedef struct output_query { output_mode *outputs; bool failed, viewporter, fractional; } output_query;
 static void output_geometry(void *data, struct wl_output *output, int32_t x, int32_t y,
     int32_t mm_w, int32_t mm_h, int32_t subpixel, const char *make, const char *model, int32_t transform)
 {
@@ -33,6 +33,9 @@ static const struct wl_output_listener output_listener = {.geometry = output_geo
 static void output_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
 {
     output_query *query = data;
+    /* edit-b6ai.7: presence only; wayland_plat_init binds them. */
+    if (!strcmp(interface, "wp_viewporter")) query->viewporter = true;
+    if (!strcmp(interface, "wp_fractional_scale_manager_v1")) query->fractional = true;
     if (strcmp(interface, "wl_output")) return;
     output_mode *mode = calloc(1, sizeof *mode); /* INIT only; exactly one node per advertised output */
     if (!mode) { query->failed = true; return; }
@@ -70,7 +73,7 @@ int wayland_display_size_on(void *display, wayland_display_info *info)
         if (lw > logical_w) logical_w = lw;
         if (lh > logical_h) logical_h = lh;
         if (result.width && mode->scale < result.scale) continue;
-        result = (wayland_display_info){96.0 * mode->scale, w, h, mode->scale, 0, 0};
+        result = (wayland_display_info){96.0 * mode->scale, w, h, mode->scale, 0, 0, false};
     }
     /* (P) wayland.c multiplies configure's logical size by this scale. */
     if ((uint64_t)logical_w * result.scale <= UINT32_MAX && (uint64_t)logical_h * result.scale <= UINT32_MAX) {
@@ -78,6 +81,12 @@ int wayland_display_size_on(void *display, wayland_display_info *info)
     }
     if (result.max_width < result.width) result.max_width = result.width;
     if (result.max_height < result.height) result.max_height = result.height;
+    /* edit-b6ai.7: on a fractional session the surface's preferred scale
+     * (known once mapped) sets the font DPI; start from the scale-one floor
+     * so the editor's cell reservation, sized at this DPI, covers every
+     * scale >= 1 (decisions/edit-b6ai.7.md). Scale and reserve stay integer. */
+    result.fractional = query.viewporter && query.fractional;
+    if (result.fractional) result.dpi = 96.0;
     *info = result; rc = PLAT_OK;
 done:
     while (query.outputs) {

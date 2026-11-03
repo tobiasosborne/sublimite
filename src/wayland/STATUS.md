@@ -27,10 +27,25 @@ mock (`tests/wayland_mock.h`) now has libwayland-server's real wl_shm. Its
 screen copies only damaged rectangles and asserts the whole buffer equals it,
 and it supports release-on-replace or immediate release and a resize configure.
 
-Startup output selection is the highest-scale advertised output. Surface-enter
-selection, output moves, runtime DPI/font changes, old compositor versions
-without buffer scaling, and font-DPI startup on inherited WAYLAND_SOCKET are
-not complete. The inherited descriptor is preserved for platform initialization;
+Fractional scale (edit-b6ai.7): when the compositor advertises both
+`wp_fractional_scale_manager_v1` and `wp_viewporter`, the surface gets a
+viewport and a fractional-scale object. The buffer is round(logical x
+preferred_scale / 120), the destination is the logical size, and the buffer
+scale stays 1. `preferred_scale` resizes the buffer and the EGL window and
+pushes RESIZE. The editor re-reads `wayland_dpi()` (96 x scale) there and
+re-selects the font at its frame boundary. Pointer coordinates use the same
+factor. Startup DPI on such sessions is the 96 floor, so the cell reservation
+covers every scale >= 1, until the compositor's first `preferred_scale` arrives.
+With either protocol missing, the integer path is unchanged. Mock cases: 1.25
+and 1.6, a runtime change both ways, a logical resize at a fractional scale,
+both rasters, the editor font change and its typing bracket, and absence.
+[Decisions](../../docs/decisions/edit-b6ai.7.md).
+
+Startup output selection on the integer path is the highest-scale advertised
+output. Surface-enter selection and output moves on the integer path (runtime
+`set_buffer_scale`), scales below 1 beyond the cell reservation, old
+compositor versions without buffer scaling, and font-DPI startup on inherited
+WAYLAND_SOCKET are not complete. The inherited descriptor is preserved for platform initialization;
 main cannot consume that existing protocol connection in a preliminary query.
 
 No compositor exists in this sandbox. Real Wayland EGL pixels, compositor
@@ -39,5 +54,6 @@ X display suites must be re-run by the coordinator on the private Xvfb display
 specified in the worker brief. Full check also encounters sandbox LeakSanitizer
 and IPC restrictions, detailed in the worker report.
 
-[Worker report](../../docs/worker-reports/edit-1zm-s6.md).
+[Worker report](../../docs/worker-reports/edit-1zm-s6.md);
+fractional scale: [edit-b6ai.7](../../docs/worker-reports/edit-b6ai.7-s29.md).
 [Decisions](../../docs/decisions/edit-1zm.md).

@@ -8,6 +8,9 @@
 #endif
 #include "raster/raster.h"
 #include "dnd/dnd.h"
+#if !defined(_WIN32)
+#include "wayland/plat.h"
+#endif
 #include "../../vendor/xkbcommon/xkbcommon-keysyms.h"
 #include <errno.h>
 #include <limits.h>
@@ -928,6 +931,19 @@ static int nonkey_dispatch(editor *e, const plat_event *ev)
             e->font.dpi=(double)dpi;
             e->font.default_px=editor_runtime_em_px((double)dpi,e->font.default_points);
             e->font.requested_px=editor_runtime_em_px((double)dpi,e->font.points);
+        }
+#else
+        /* edit-b6ai.7: a Wayland preferred-scale change arrives as RESIZE; the
+         * font follows 96 dpi x scale like the Windows DPI path above. The
+         * worker prepares the atlas; editor_font_poll adopts it at a frame
+         * boundary. Explicit-pixel (legacy) fonts keep their size. */
+        if (e->has_platform && e->platform.backend == PLAT_BACKEND_WAYLAND && !e->font.legacy) {
+            double dpi = wayland_dpi(&e->platform);
+            if (dpi > 0.0 && e->font.dpi != dpi) {
+                e->font.dpi = dpi;
+                e->font.default_px = editor_runtime_em_px(dpi, e->font.default_points);
+                e->font.requested_px = editor_runtime_em_px(dpi, e->font.points);
+            }
         }
 #endif
         e->drag_tab = SIZE_MAX; e->drag_id = 0; e->map_drag = false; e->text_drag=false;
