@@ -11,7 +11,9 @@
 
 **Box traps (monolith):** never start an Xvfb without an explicit display number (edit-b6ai.19); never inject input on :0; if /tmp/.X11-unix/X0 is missing, `ln /tmp/.X11-unix/X0_ /tmp/.X11-unix/X0`. After a reboot restart Xvfb :99 (and :97 for drives: 3840x2160, -dpi 52) and rebuild /tmp/edit-corpus. Codex must be logged in (`codex login status`). Rules for workers: build/briefs/_rules-s29.md (13 rules). Claude workers only until Tobias says Codex is back under pace.
 
-**Next, in order:** .3 (system monospace font), .6 (Wayland raster wl_shm), .7/.8 (fractional scale, activation), then the backlog beads .12/.13/.20/.21 and flakes edit-ecbb and the scroll_test bead only when they bite. Windows line (session 28) unchanged: branch wt/edit-177r.32-s28 waits on a full Windows check on Spiral, on Tobias's word.
+**Landed while Tobias was away:** .3 (system font), .6 (Wayland raster), .7 (fractional scale), .8 (raise on handoff), .9 (Wayland primary selection). Every Wayland item is mock-verified only: edit-b6ai.5 carries the real-Hyprland checklist (notes).
+
+**Next, in order:** with Tobias: .5 Wayland bring-up, .4 chrome, .10 prefer Wayland, `make install-omarchy`; then the backlog beads .12/.13/.20/.21 and flakes edit-ecbb and the scroll_test bead only when they bite. Windows line (session 28) unchanged: branch wt/edit-177r.32-s28 waits on a full Windows check on Spiral, on Tobias's word.
 
 ---
 
