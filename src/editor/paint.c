@@ -232,7 +232,7 @@ static int compose_map_pixels(editor *e, minimap_input input, uint64_t first,
              * the job for the new anchor lands. */
             minimap_frame frame = {.line_y = w.box_top, .line = w.first_line + w.above,
                 .lines = input.lines, .box_top = w.box_top, .box_height = w.box_height,
-                .scale = w.scale, .pending = !retained};
+                .scale = w.scale, .pending = !retained, .clip_to_end = input.index_ready && !w.scrolls};
             if (e->map_drag && e->map_drag_id == e->buffer->id &&
                 e->map_drag_generation == e->buffer->source_generation) frame.box_top = e->map_drag_top;
             if (retained && !(!map->stale && map->window_exact && input.index_ready)) {

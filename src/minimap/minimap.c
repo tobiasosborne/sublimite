@@ -666,6 +666,15 @@ int minimap_pixels_window(const minimap *m, uint32_t *pixels, size_t capacity,
     uint32_t edge_bg = blend(style->background, style->viewport, 96);
     uint32_t edge_ink = blend(ink, style->viewport, 96);
     int64_t top = f->box_top, bottom = f->box_top + (int64_t)f->box_height;
+    if (f->clip_to_end) {
+        /* (P) the document's end, saturated to a span past the strip as
+         * the pending placeholder does. */
+        uint64_t span = (uint64_t)height + (uint64_t)(f->line_y < 0 ? -f->line_y : f->line_y);
+        uint64_t below = f->lines > f->line ? f->lines - f->line : 0;
+        uint64_t down = below < span / f->scale ? below * f->scale : span;
+        int64_t end = f->line_y + (int64_t)down;
+        if (bottom > end) bottom = end > top ? end : top + 1;
+    }
     for (uint32_t y = 0; y < height; y++) {
         bool band = (int64_t)y >= top && (int64_t)y < bottom;
         bool edge_row = band && ((int64_t)y == top || (int64_t)y + 1 == bottom);

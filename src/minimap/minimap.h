@@ -271,6 +271,17 @@ typedef struct minimap_frame {
     uint32_t box_height;
     uint32_t scale;       /* px per line, > 0 */
     bool pending;
+    /* edit-b6ai.17: clip the box's bottom to the document's last line,
+     * line_y + (lines - line) * scale (P: line `line` starts at line_y, so
+     * line `lines` starts that far below), but never below one scanline.
+     * The box then covers only strip lines that exist: a short document
+     * scrolled past its end (the wrapped view lets the top reach the last
+     * line) shows a box over the visible tail, not one hanging below the
+     * strip. Needs exact `line` and `lines` (an indexed document). The
+     * editor sets it only for a window that does not scroll: a scrolling
+     * window keeps its constant box (edit-cxho.8), which cannot leave the
+     * strip because its travel ends at H - B. */
+    bool clip_to_end;
 } minimap_frame;
 int minimap_pixels_window(const minimap *m, uint32_t *pixels, size_t capacity,
                           uint32_t width, uint32_t height, size_t stride,

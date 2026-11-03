@@ -908,6 +908,21 @@ static void window_paint(void)
     fr.box_height = 0;
     CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
     CHECK(px[0] == bg && px[2 * W] == ink && px[3 * W] == bg);
+    /* edit-b6ai.17: clip_to_end. Line 0 at y = 3, 4 lines of 2 px: the
+     * document ends at y = 3 + 4 * 2 = 11 (P). A 10 px box at y = 5 would end
+     * at 15; clipped it covers y 5..10 with its bottom edge on y = 10. Without
+     * the flag it is untouched; a box starting past the end keeps one row. */
+    fr.line = 0; fr.line_y = 3; fr.box_top = 5; fr.box_height = 10;
+    CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
+    CHECK(px[11 * W + 1] != bg);                    /* unclipped: band reaches y = 11 */
+    fr.clip_to_end = true;
+    CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
+    CHECK(px[10 * W + 1] != bg && px[10 * W + 1] != px[7 * W + 1]); /* bottom edge row */
+    CHECK(px[11 * W + 1] == bg && px[11 * W] == bg);                /* nothing below the document */
+    fr.box_top = 11;
+    CHECK(minimap_pixels_window(&m, px, W * H, W, H, W, &fr, &style) == 0);
+    CHECK(px[11 * W + 1] != bg && px[10 * W + 1] == bg);
+    fr.clip_to_end = false; fr.box_top = 5; fr.box_height = 4;
     /* Pending: placeholder ink only on lines 0..1 (scanlines 3..6). */
     minimap_frame pend = {.line_y = 3, .line = 0, .lines = 2, .box_top = 100, .box_height = 4, .scale = 2, .pending = true};
     CHECK(minimap_pixels_window(NULL, px, W * H, W, H, W, &pend, &style) == 0);

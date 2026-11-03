@@ -497,6 +497,83 @@ static int minimap_track_all(void)
     for (int kind = TRACK_SKEW20K; kind <= TRACK_WRAP; kind++) failed |= minimap_track_contract(kind);
     return failed;
 }
+/* edit-b6ai.17: a short document's viewport box covers exactly the strip's
+ * lines that are visible, never past the strip's last line, and the drag
+ * cannot scroll past the editor's own maximum. Fixtures (P): 20 lines of
+ * "abc" joined by LF (no final LF, so N = 20), 30 text rows, 40 columns, so
+ * v = min(N, rows) = 20, B = 2v = 40 px and the strip's document part is
+ * 2N = 40 px. The editor's maximum top is 0 unwrapped (N < rows) and N - 1
+ * = 19 wrapped (the visual-row view scrolls the last line to the top,
+ * docs/decisions/edit-cxho.10.md). The long fixture is one 4000 B line
+ * (N = 1) that wraps over more than the 30 visual rows at 40 columns. Horizontal: the
+ * painted box's first and last strip columns carry the box edge. */
+enum { SHORT_PLAIN, SHORT_WRAP, SHORT_LONG };
+static int minimap_short_contract(int kind)
+{
+    const char *name = kind == SHORT_PLAIN ? "short unwrapped" : kind == SHORT_WRAP ? "short wrapped" : "one long wrapped line";
+    uint64_t lines = kind == SHORT_LONG ? 1u : 20u;
+    uint8_t text[4000]; size_t length = 0;
+    if (kind == SHORT_LONG) { for (; length < sizeof text; length++) text[length] = (length % 7u) ? 'x' : ' '; }
+    else for (uint64_t i = 0; i < lines; i++) {
+        memcpy(text + length, "abc", 3); length += 3;
+        if (i + 1u < lines) text[length++] = '\n';
+    }
+    render_backend backend = {0}; T(render_null_backend(&backend) == 0);
+    editor_config cfg = {.initial = text, .initial_len = length, .cols = 40, .rows = 30,
+        .wrap_mode = kind == SHORT_PLAIN ? -1 : 1};
+    editor *e = NULL; T(editor_open(&e, &cfg, &backend) == 0);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* existing settle bound */
+    while (!editor_index_complete(e)) { T(editor_step(e, 0) >= 0); T(trace_now_ns() < deadline); sched_yield(); }
+    T(track_settle(e) == 0);
+    const render_pixels *region = &e->grid.region;
+    T(region->pixels && region->height > 0);
+    int64_t H = region->height, v = lines < e->v.config.rows ? (int64_t)lines : (int64_t)e->v.config.rows;
+    int64_t B = 2 * v, strip_end = 2 * (int64_t)lines; /* the document's part of the strip */
+    int64_t max_first = kind == SHORT_PLAIN ? 0 : (int64_t)lines - 1; /* editor's own maximum */
+    int64_t top = 0; uint32_t height = 0; int failed = 0;
+    track_box(e, &top, &height);
+    printf("edit-b6ai.17 %s: N=%llu H=%lld strip_end=%lld box top=%lld height=%u\n", name,
+        (unsigned long long)lines, (long long)H, (long long)strip_end, (long long)top, height);
+    failed += top != 0 || (int64_t)height != B || B > strip_end;
+    plat_event ev = {.kind = PLAT_EV_BUTTON, .code = 1, .press = true,
+        .x = (int32_t)(region->x + 1u), .y = (int32_t)(region->y + (uint32_t)(B > 1 ? B / 2 : 0))};
+    T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+    ev.kind = PLAT_EV_MOTION;
+    for (int k = 0; k <= 10; k++) {
+        ev.y = (int32_t)(region->y + (uint32_t)(B / 2 + (k < 10 ? (H - B) * k / 9 : H + 40)));
+        T(editor_pointer(e, &ev) == 0); T(track_settle(e) == 0);
+        track_box(e, &top, &height);
+        int64_t first = (int64_t)e->v.state.first_line;
+        /* The box lies inside the document's strip, covers at least one
+         * line, and the document stays within the editor's own maximum. */
+        bool bad = top < 0 || top + (int64_t)height > strip_end || height < 2u || first > max_first;
+        /* Every box row spans the strip's whole width: edge columns. */
+        if (top >= 0 && height > 2u) {
+            size_t row = (size_t)(top + 1) * region->stride;
+            bad |= region->pixels[row] != region->pixels[row + region->width - 1u] ||
+                region->width != e->map_cols * e->grid.dims.cell_w;
+        }
+        printf("edit-b6ai.17 %s: pointer step %d box top=%lld height=%u first_line=%lld (max %lld)%s\n", name, k,
+            (long long)top, height, (long long)first, (long long)max_first, bad ? " FAIL" : "");
+        failed += bad;
+    }
+    /* Bottom: the box ends where the document's strip ends. */
+    failed += top + (int64_t)height != strip_end;
+    ev.kind = PLAT_EV_BUTTON; ev.press = false; T(editor_pointer(e, &ev) == 0); T(!e->map_drag);
+    T(track_settle(e) == 0);
+    track_box(e, &top, &height);
+    failed += top + (int64_t)height != strip_end || (int64_t)e->v.state.first_line != (kind == SHORT_WRAP ? max_first : 0);
+    editor_close(e);
+    printf("edit-b6ai.17 %s: %d failures\n", name, failed);
+    T(failed == 0);
+    return 0;
+}
+static int minimap_short_all(void)
+{
+    int failed = 0; /* every case runs, so a report shows all three */
+    for (int kind = SHORT_PLAIN; kind <= SHORT_LONG; kind++) failed |= minimap_short_contract(kind);
+    return failed;
+}
 /* edit-2mhd: (P) the alphabet fixture has one character plus LF per line;
  * sizeof supplies its byte stride and line count. (E) reuse the existing
  * minimap compose fixture's geometry. The initial top is one viewport down,
@@ -7709,6 +7786,7 @@ static const test_selector selectors[] = {
     {"--dr3-gutter", gutter_line_contract},
     {"--minimap-cost", minimap_compose_cost},
     {"--cxho10-track", minimap_track_all},
+    {"--b6ai17-short", minimap_short_all},
     {"--minimap-grab-inside", select_minimap_grab_inside},
     {"--minimap-grab-outside", select_minimap_grab_outside},
     {"--9f63-columns", minimap_text_columns},
@@ -7827,6 +7905,7 @@ static int editor_part_3(void)
     T(minimap_grab_contract(false) == 0); T(minimap_grab_contract(true) == 0);
     T(minimap_compose_pixels(NULL) == 0);
     T(minimap_track_all() == 0);
+    T(minimap_short_all() == 0);
     T(minimap_text_columns() == 0);
     T(pointer_overscan_contract()==0); T(pointer_chain_contract(false)==0); T(pointer_chain_contract(true)==0);
     T(pointer_empty_rows_contract()==0); T(findpanel_resize_contract()==0);
