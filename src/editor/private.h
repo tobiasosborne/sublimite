@@ -318,6 +318,10 @@ struct editor {
     char preferences_font_family[FONT_FALLBACK_PATH_MAX];
     char preferences_font_file[FONT_FALLBACK_PATH_MAX];
     bool preferences_font_selection_override, preferences_font_selection_pending;
+    /* edit-b6ai.3: fonts.conf changed: re-resolve "monospace" even though the
+     * request text is unchanged. */
+    bool preferences_font_refresh;
+    uint64_t preferences_fonts_generation;
     char preferences_font_fallbacks[FONT_CHAIN_TEXT_MAX]; /* edit-6e2: effective chain */
     bool preferences_font_fallbacks_override; /* CLI or env chain wins over the config key */
     int preferences_watchfd;

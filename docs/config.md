@@ -42,7 +42,8 @@ clients; `EDIT_FONT_SIZE_PT` or `font.size` also remain available.
 
 Font selection uses the highest supplied source as a whole family/file pair:
 `--font-family` / `--font-file`, then nonempty `EDIT_FONT_FAMILY` /
-`EDIT_FONT_FILE`, then `[font] family` / `file`, then embedded DejaVu Sans Mono.
+`EDIT_FONT_FILE`, then `[font] family` / `file`, then the default: Fontconfig's `monospace` while the
+editor follows Omarchy (see below), else embedded DejaVu Sans Mono.
 Within a source, `file` wins. For example, a CLI family overrides an environment
 file. Flags accept a following value or `=VALUE`; an explicitly empty CLI pair
 selects the embedded default. Flags apply when launching an editor; use
@@ -57,6 +58,25 @@ config. A failed selection uses embedded DejaVu and logs once per editor.
 Use Iosevka Fixed or Term: the cell grid has no HarfBuzz, ligatures or contextual
 alternates, and proportional advances are rejected. The exact precedence and
 ownership decisions are in [edit-5ih](decisions/edit-5ih.md).
+
+Following the system font (edit-b6ai.3): when none of the sources above names a
+family or file, and the Omarchy palette is in force (`theme = "system"` and
+`$XDG_STATE_HOME/omarchy/current/theme/colors.toml` exists), the default family is
+Fontconfig's `monospace` match. `omarchy font set` stores its choice there
+(`~/.config/fontconfig/fonts.conf`; this box: JetBrainsMono Nerd Font). The editor
+watches `$XDG_CONFIG_HOME/fontconfig/fonts.conf` (`$HOME/.config/...` when unset or
+relative) on its parent directory, so atomic replacement is seen, and also when
+`fontconfig/` does not exist yet. A change makes the font worker resolve
+`monospace` again and the new face swaps at a frame boundary, like any font
+change. No polling is involved: an unchanged box costs nothing. gsettings is not
+read. The size stays sublimité's own (`font.size`, `EDIT_FONT_SIZE_PT`, zoom).
+An explicit `--font-family` / `--font-file`, `EDIT_FONT_FAMILY` / `EDIT_FONT_FILE`,
+`font.family` or `font.file` always wins, even when the Omarchy rule would
+capture it (an exact family name is matched without configuration rules if the
+configured match names another family). Without Omarchy, or with `theme =
+"dark"` / `"light"`, the default stays the embedded DejaVu Sans Mono. The proportional-face
+rule still applies: a `monospace` that is not fixed-pitch falls back to the
+embedded face with one log line. Details: [edit-b6ai.3](decisions/edit-b6ai.3.md).
 
 `fallbacks` is an ordered array of font families (Fontconfig patterns) or
 `file:PATH[#INDEX]` entries. For a character that the primary font does not

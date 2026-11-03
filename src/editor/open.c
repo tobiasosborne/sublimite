@@ -139,7 +139,10 @@ static int open_editor(editor **out, const editor_config *config, render_backend
         char system_palette[CONFIG_TEXT_CAP]; const char *palette = config->palette_path;
         if (!palette && config->load_preferences &&
             config_palette_path(system_palette, sizeof system_palette) == CONFIG_OK) palette = system_palette;
-        if (config_runtime_open_palette(&e->preferences_runtime, config->preferences_path, palette) == CONFIG_OK) {
+        char system_fontconf[CONFIG_TEXT_CAP]; const char *fontconf = config->fontconf_path;
+        if (!fontconf && config->load_preferences &&
+            config_fontconf_path(system_fontconf, sizeof system_fontconf) == CONFIG_OK) fontconf = system_fontconf;
+        if (config_runtime_open_follow(&e->preferences_runtime, config->preferences_path, palette, fontconf) == CONFIG_OK) {
             do {
                 (void)config_runtime_tick(e->preferences_runtime);
                 if (!config_runtime_busy(e->preferences_runtime)) break;

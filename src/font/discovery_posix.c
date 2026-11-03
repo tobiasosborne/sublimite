@@ -319,35 +319,46 @@ int font_selection_resolve(const char *pattern, char *file, size_t cap, uint32_t
     if (!h || !fc_bind(&api, h)) return FONT_ERR_MISSING;
     FcConfig *cfg = api.InitLoadConfigAndFonts();
     FcPattern *requested = api.NameParse((const FcChar8 *)pattern);
-    FcPattern *query = api.NameParse((const FcChar8 *)pattern);
-    FcPattern *match = NULL;
     int result = FONT_ERR_MISSING;
-    if (!cfg || !requested || !query) goto done;
-    if (!api.ConfigSubstitute(cfg, query, FC_MATCH_PATTERN)) goto done;
-    api.DefaultSubstitute(query);
-    FcResult status = FC_RESULT_MATCH;
-    match = api.FontMatch(cfg, query, &status);
-    if (!match || status != FC_RESULT_MATCH) goto done;
-    int family_ok = 0;
-    for (int i = 0;; i++) {
-        FcChar8 *want = NULL;
-        if (api.PatternGetString(requested, "family", i, &want) != FC_RESULT_MATCH) break;
-        if (!strcasecmp((const char *)want, "monospace")) family_ok = 1;
-        for (int j = 0;; j++) {
-            FcChar8 *got = NULL;
-            if (api.PatternGetString(match, "family", j, &got) != FC_RESULT_MATCH) break;
-            if (!strcasecmp((const char *)want, (const char *)got)) family_ok = 1;
+    if (!cfg || !requested) goto done;
+    /* edit-b6ai.3: pass 0 applies the user's configuration (the generic
+     * `monospace` alias, aliases that name a concrete family). A user rule
+     * such as omarchy's strong `prepend_first` on monospace also captures
+     * concrete families that fontconfig classes as monospace (fc-match
+     * "Go Mono" then returns the Omarchy font), which would defeat an
+     * explicit choice. Pass 1 matches the concrete name as written, without
+     * configuration rules. */
+    for (int pass = 0; pass < 2 && result != FONT_OK; pass++) {
+        FcPattern *query = api.NameParse((const FcChar8 *)pattern);
+        FcPattern *match = NULL;
+        if (!query) break;
+        if (pass == 0 && !api.ConfigSubstitute(cfg, query, FC_MATCH_PATTERN)) { api.PatternDestroy(query); break; }
+        api.DefaultSubstitute(query);
+        FcResult status = FC_RESULT_MATCH;
+        match = api.FontMatch(cfg, query, &status);
+        if (match && status == FC_RESULT_MATCH) {
+            int family_ok = 0;
+            for (int i = 0;; i++) {
+                FcChar8 *want = NULL;
+                if (api.PatternGetString(requested, "family", i, &want) != FC_RESULT_MATCH) break;
+                if (pass == 0 && !strcasecmp((const char *)want, "monospace")) family_ok = 1;
+                for (int j = 0;; j++) {
+                    FcChar8 *got = NULL;
+                    if (api.PatternGetString(match, "family", j, &got) != FC_RESULT_MATCH) break;
+                    if (!strcasecmp((const char *)want, (const char *)got)) family_ok = 1;
+                }
+            }
+            FcChar8 *path = NULL; int face = 0;
+            if (family_ok && api.PatternGetString(match, "file", 0, &path) == FC_RESULT_MATCH && path &&
+                api.PatternGetInteger(match, "index", 0, &face) == FC_RESULT_MATCH && face >= 0 && face <= UINT16_MAX &&
+                strlen((const char *)path) < cap) {
+                memcpy(file, path, strlen((const char *)path) + 1u); *index = (uint32_t)face; result = FONT_OK;
+            }
         }
-    }
-    FcChar8 *path = NULL; int face = 0;
-    if (family_ok && api.PatternGetString(match, "file", 0, &path) == FC_RESULT_MATCH && path &&
-        api.PatternGetInteger(match, "index", 0, &face) == FC_RESULT_MATCH && face >= 0 && face <= UINT16_MAX &&
-        strlen((const char *)path) < cap) {
-        memcpy(file, path, strlen((const char *)path) + 1u); *index = (uint32_t)face; result = FONT_OK;
+        if (match) api.PatternDestroy(match);
+        api.PatternDestroy(query);
     }
 done:
-    if (match) api.PatternDestroy(match);
-    if (query) api.PatternDestroy(query);
     if (requested) api.PatternDestroy(requested);
     if (cfg) api.ConfigDestroy(cfg);
     api.Fini();

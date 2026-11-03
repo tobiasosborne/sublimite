@@ -2,11 +2,16 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static void font_selection_set(editor *e, const char *family, const char *font_file)
 {
     if (!family) family = "";
     if (!font_file) font_file = "";
+    /* edit-b6ai.3: with no explicit choice anywhere (CLI, env, config) and
+     * the system palette in force, follow fontconfig's monospace. */
+    if (!e->preferences_font_selection_override && !*family && !*font_file &&
+        config_runtime_system_font(e->preferences_runtime)) family = "monospace";
     font_selection parsed = {0};
     if (font_selection_parse(&parsed, family, font_file)) {
         /* Invalid selection syntax still restores the guaranteed fallback;
@@ -49,8 +54,19 @@ static void font_fallbacks_set(editor *e, const char *chain)
     memcpy(e->preferences_font_fallbacks, chain, strlen(chain) + 1u);
     e->preferences_font_selection_pending = true;
 }
+/* edit-b6ai.3: a fonts.conf notice matters only to a request that goes
+ * through Fontconfig's generic alias. */
+static bool font_follows_alias(const editor *e)
+{
+    return !e->preferences_font_file[0] && !strcasecmp(e->preferences_font_family, "monospace");
+}
 static int font_selection_poll(editor *e)
 {
+    uint64_t fonts = config_runtime_fonts_generation(e->preferences_runtime);
+    if (fonts != e->preferences_fonts_generation) {
+        e->preferences_fonts_generation = fonts;
+        if (font_follows_alias(e)) { e->preferences_font_refresh = true; e->preferences_font_selection_pending = true; }
+    }
     if (!e->preferences_font_selection_pending) return 0;
     font_selection parsed = {0};
     if (font_selection_parse(&parsed, e->preferences_font_family, e->preferences_font_file))
@@ -58,7 +74,8 @@ static int font_selection_poll(editor *e)
     const font_selection *requested = &e->font.selection;
     /* A reload can return to the in-flight selection before it is adopted.
      * Compare original UI requests, never worker-resolved file paths. */
-    if (!strcmp(parsed.family, requested->family) && !strcmp(parsed.file, requested->file) &&
+    if (!e->preferences_font_refresh &&
+        !strcmp(parsed.family, requested->family) && !strcmp(parsed.file, requested->file) &&
         parsed.index == requested->index &&
         !strcmp(e->preferences_font_fallbacks, e->font.fallbacks)) {
         e->preferences_font_selection_pending = false; return 0;
@@ -66,7 +83,7 @@ static int font_selection_poll(editor *e)
     int rc = editor_font_request_chain(e, e->preferences_font_family, e->preferences_font_file,
                                        e->preferences_font_fallbacks);
     if (rc == EDITOR_MORE) return 0; /* retained and retried on the next turn */
-    if (!rc) e->preferences_font_selection_pending = false;
+    if (!rc) e->preferences_font_selection_pending = e->preferences_font_refresh = false;
     return rc;
 }
 int editor_preferences_font_init(editor *e)
@@ -82,6 +99,7 @@ int editor_preferences_font_init(editor *e)
         family = settings ? settings->font_family : NULL;
         font_file = settings ? settings->font_file : NULL;
     }
+    e->preferences_fonts_generation = config_runtime_fonts_generation(e->preferences_runtime);
     font_selection_set(e, family, font_file);
     /* edit-6e2: the chain has its own edit-5ih precedence: CLI (even empty)
      * > EDIT_FONT_FALLBACKS (non-empty) > config font.fallbacks. */

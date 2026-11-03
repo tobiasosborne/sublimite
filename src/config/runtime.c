@@ -31,6 +31,14 @@ struct config_runtime {
     int palette_error, staged_palette_status;
     bool palette_watch_tried, palette_system;
     bool palette_noticed; /* worker-owned: one notice per malformed episode */
+    /* edit-b6ai.3: fonts.conf is never read here (Fontconfig re-reads it on
+     * the font worker); only its changes are noticed, on the UI thread.
+     * fonts_watch[1] is the file's parent; fonts_watch[0] is the directory's
+     * own entry in its parent, kept only while that directory is missing. */
+    char fontconf_path[CONFIG_TEXT_CAP], fontconf_dir[CONFIG_TEXT_CAP];
+    file_path_watch fonts_watch[2];
+    uint64_t fonts_generation;
+    bool fonts_watch_tried;
 };
 static int directory(config_runtime *r)
 {
@@ -185,7 +193,8 @@ static void receive(const work_msg *msg, void *ctx)
         break;
     default: break;
     }
-    bool palette = memcmp(&next, &r->palette, sizeof next) != 0;
+    /* edit-b6ai.3: the system font follows the same switch as the palette. */
+    bool palette = memcmp(&next, &r->palette, sizeof next) != 0 || system != r->palette_system;
     r->palette_error = palette_error;
     if (settings || palette) {
         if (r->generation == UINT64_MAX) { r->error.code = CONFIG_ERR_LIMIT; return; }
@@ -214,12 +223,17 @@ int config_runtime_open(config_runtime **out, const char *path)
 }
 int config_runtime_open_palette(config_runtime **out, const char *path, const char *palette)
 {
+    return config_runtime_open_follow(out, path, palette, NULL);
+}
+int config_runtime_open_follow(config_runtime **out, const char *path, const char *palette, const char *fontconf)
+{
     if (!out) return CONFIG_ERR_ARG;
     *out = NULL;
     config_runtime *r = config_runtime_alloc(_Alignof(config_runtime), sizeof *r);
     if (!r) return CONFIG_ERR_IO;
     memset(r, 0, sizeof *r); r->watchfd = -1; r->watch.wd = -1;
     r->palette_watch[0].wd = r->palette_watch[1].wd = -1;
+    r->fonts_watch[0].wd = r->fonts_watch[1].wd = -1;
     config_palette_builtin(CONFIG_DARK, &r->palette); /* config_defaults' theme */
     int rc = CONFIG_OK;
     if (path) {
@@ -237,6 +251,18 @@ int config_runtime_open_palette(config_runtime **out, const char *path, const ch
             memcpy(r->palette_name, palette, dir); strcpy(r->palette_name + dir, ".name");
         }
     }
+    if (!rc && fontconf) {
+        /* fonts.conf lives in <dir>; <dir> itself must have a parent entry. */
+        const char *slash = strrchr(fontconf, '/');
+        size_t dir = slash ? (size_t)(slash - fontconf) : 0;
+        const char *up = NULL; /* the directory's own parent separator */
+        for (size_t i = dir; i-- > 0;) if (fontconf[i] == '/') { up = fontconf + i; break; }
+        if (!os_path_is_absolute(fontconf) || !dir || !up || up == fontconf || strlen(fontconf) >= sizeof r->fontconf_path) rc = CONFIG_ERR_ARG;
+        else {
+            strcpy(r->fontconf_path, fontconf);
+            memcpy(r->fontconf_dir, fontconf, dir); r->fontconf_dir[dir] = 0;
+        }
+    }
     if (rc) goto fail;
     if (edit_arena_init(&r->arena, CONFIG_SOURCE_CAP)) { rc = CONFIG_ERR_IO; goto fail; }
     r->source = edit_arena_alloc(&r->arena, CONFIG_SOURCE_CAP, _Alignof(uint8_t));
@@ -250,6 +276,7 @@ void config_runtime_close(config_runtime *r)
     if (!r) return;
     file_watch_path_stop(&r->watch);
     file_watch_path_stop(&r->palette_watch[0]); file_watch_path_stop(&r->palette_watch[1]);
+    file_watch_path_stop(&r->fonts_watch[0]); file_watch_path_stop(&r->fonts_watch[1]);
     if (r->pool_ready) work_pool_shutdown(&r->pool);
     edit_arena_free(&r->arena); config_runtime_free(r);
 }
@@ -258,6 +285,33 @@ const os_wake *config_runtime_wake(const config_runtime *r) { return r ? work_po
 int config_runtime_eventfd(const config_runtime *r) { return r ? work_pool_eventfd(&r->pool) : -1; }
 #endif
 int config_runtime_watchfd(const config_runtime *r) { return r ? r->watchfd : -1; }
+/* edit-b6ai.3: keep the narrowest watch that can see fonts.conf appear or
+ * change. While the fontconfig directory exists, only it is watched (events
+ * for its entries). While it is missing, its entry in the parent is watched
+ * (a busy directory such as ~/.config), and dropped again as soon as the
+ * directory can be watched. Any notice, and every (re)start of the file
+ * watch, bumps fonts_generation: the file may have appeared in between. */
+static void fonts_sync(config_runtime *r, bool first)
+{
+    file_path_watch *conf = &r->fonts_watch[1], *entry = &r->fonts_watch[0];
+    if (conf->registered && conf->wd >= 0) return;
+    int fd = file_watch_path_start(conf, r->fontconf_path);
+    if (fd >= 0) {
+        file_watch_path_stop(entry);
+        if (!first) r->fonts_generation++;
+    } else if (!entry->registered || entry->wd < 0) fd = file_watch_path_start(entry, r->fontconf_dir);
+    if (fd >= 0 && r->watchfd < 0) r->watchfd = fd;
+}
+static void fonts_tick(config_runtime *r)
+{
+    if (!r->fontconf_path[0] || !r->palette_path[0] || !r->received) return;
+    bool first = !r->fonts_watch_tried;
+    r->fonts_watch_tried = true;
+    bool noticed = file_watch_path_take(&r->fonts_watch[0]);
+    noticed = file_watch_path_take(&r->fonts_watch[1]) || noticed;
+    if (first || noticed) fonts_sync(r, first);
+    if (noticed) r->fonts_generation++;
+}
 bool config_runtime_tick(config_runtime *r)
 {
     if (!r) return false;
@@ -285,10 +339,16 @@ bool config_runtime_tick(config_runtime *r)
         if (r->palette_watch[i].wd < 0)
             (void)file_watch_path_start(&r->palette_watch[i], i ? r->palette_name : r->palette_dir);
     }
+    fonts_tick(r);
     request(r);
     return before != r->generation;
 }
 const config_settings *config_runtime_current(const config_runtime *r) { return r ? &r->current : NULL; }
+bool config_runtime_system_font(const config_runtime *r)
+{
+    return r && r->fontconf_path[0] && r->palette_system && !r->current.theme_pinned;
+}
+uint64_t config_runtime_fonts_generation(const config_runtime *r) { return r ? r->fonts_generation : 0; }
 const config_palette *config_runtime_palette(const config_runtime *r) { return r ? &r->palette : NULL; }
 int config_runtime_palette_error(const config_runtime *r) { return r ? r->palette_error : CONFIG_ERR_ARG; }
 uint64_t config_runtime_generation(const config_runtime *r) { return r ? r->generation : 0; }

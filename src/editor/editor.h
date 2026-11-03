@@ -104,6 +104,11 @@ typedef struct editor_config {
      * config_palette_path(); otherwise no system palette (tests stay
      * hermetic on an Omarchy box). */
     const char *palette_path;
+    /* edit-b6ai.3: absolute fonts.conf to watch; also the switch for the
+     * follow-the-system font (default family "monospace" while the system
+     * palette is active). NULL: load_preferences uses config_fontconf_path();
+     * otherwise the font is not followed (tests stay hermetic). */
+    const char *fontconf_path;
     /* Startup selection (native CLI): either non-NULL pointer overrides the
      * environment pair and config pair. Empty explicitly selects embedded.
      * Copied during open; file wins within the selected source. */

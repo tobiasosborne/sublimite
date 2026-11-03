@@ -98,6 +98,9 @@ int config_palette_parse(const uint8_t *, size_t, bool light_marker, config_them
 /* $XDG_STATE_HOME/omarchy/current/theme/colors.toml (HOME/.local/state when
  * unset or relative). Windows has no system palette: CONFIG_ERR_ARG. */
 int config_palette_path(char *, size_t);
+/* edit-b6ai.3: $XDG_CONFIG_HOME/fontconfig/fonts.conf (HOME/.config when
+ * unset or relative), where `omarchy font set` writes. Windows: CONFIG_ERR_ARG. */
+int config_fontconf_path(char *, size_t);
 
 typedef struct config_runtime config_runtime;
 /* UI-owned, allocating setup/close outside typing. path=NULL uses XDG with
@@ -111,6 +114,21 @@ int config_runtime_open(config_runtime **, const char *);
  * later keeps the last palette; malformed = built-in of the detected mode
  * plus one stderr notice from the worker per episode. */
 int config_runtime_open_palette(config_runtime **, const char *config, const char *palette);
+/* edit-b6ai.3: fontconf = absolute fonts.conf (Omarchy: ~/.config/fontconfig/
+ * fonts.conf) whose changes mean "fontconfig's monospace may now resolve
+ * differently". NULL = do not follow the system font. Watched on its stable
+ * parent (or, while that directory does not exist yet, on the entry in the
+ * grandparent), like the palette; no polling, no read: Fontconfig itself is
+ * re-run by the font worker. Following needs the system palette to be active. */
+int config_runtime_open_follow(config_runtime **, const char *config, const char *palette,
+                               const char *fontconf);
+/* True when the editor follows the system font: a fonts.conf path was given,
+ * settings are not pinned (theme = "system") and the system palette is in
+ * force. Changes only together with the config generation. */
+bool config_runtime_system_font(const config_runtime *);
+/* Bumped by the UI thread when the watched fonts.conf (or its directory)
+ * changed. Does not bump config_runtime_generation. */
+uint64_t config_runtime_fonts_generation(const config_runtime *);
 void config_runtime_close(config_runtime *);
 struct os_wake;
 const struct os_wake *config_runtime_wake(const config_runtime *);
