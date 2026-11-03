@@ -9,6 +9,8 @@
 #include "protocol/viewporter-client.h"
 #include "protocol/fractional-scale-v1-client.h"
 #include "protocol/xdg-activation-v1-client.h"
+#include "protocol/primary-selection-unstable-v1-client.h"
+#include "x11/clip.h"
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <xkbcommon/xkbcommon.h>
@@ -35,12 +37,19 @@
 #define WL_CLIP_SENDS 16u /* inherits X11 NSERVE */
 #define NS_SECOND UINT64_C(1000000000)
 #define NS_MS UINT64_C(1000000)
+/* edit-b6ai.9: two selections share one transfer path. The index is the
+ * platform's PLAT_CLIP_* number; an offer is a wl_data_offer (CLIPBOARD) or a
+ * zwp_primary_selection_offer_v1 (PRIMARY), told apart by `primary`. */
+#define WL_SEL_N 2u
 typedef struct wayland_offer {
     struct wayland_offer *next;
     struct wl_data_offer *proxy;
-    bool utf8, text;
+    struct zwp_primary_selection_offer_v1 *pproxy;
+    bool primary, utf8, text;
 } wayland_offer;
-typedef struct wayland_blob { size_t refs, len; uint8_t bytes[]; } wayland_blob;
+/* Owned bytes: the adopted clipboard buffer (zero-copy for the editor's bulk
+ * publication) plus its length, shared by the source and in-flight transfers. */
+typedef struct wayland_blob { size_t refs, len; x11_clip_buf *buf; } wayland_blob;
 typedef struct wayland_tx { int fd; size_t offset; wayland_blob *blob; } wayland_tx;
 typedef struct wayland_state {
     plat *p;
@@ -61,7 +70,12 @@ typedef struct wayland_state {
     struct wl_data_device_manager *manager;
     struct wl_data_device *device;
     struct wl_data_source *source;
-    wayland_offer *offers, *selection, *drag;
+    /* edit-b6ai.9: zwp_primary_selection_device_manager_v1; absent = PRIMARY
+     * fails as before. Offers of both kinds live in one list. */
+    struct zwp_primary_selection_device_manager_v1 *pmanager;
+    struct zwp_primary_selection_device_v1 *pdevice;
+    struct zwp_primary_selection_source_v1 *psource;
+    wayland_offer *offers, *selection, *pselection, *drag;
     struct wp_presentation *presentation;
     struct wp_presentation_feedback *feedback;
     struct wl_shm *shm; /* edit-b6ai.6: raster buffer factory */
@@ -99,7 +113,8 @@ typedef struct wayland_state {
     plat_event events[WL_EVENT_CAP];
     size_t head, count;
     uint64_t dropped;
-    wayland_blob *owned; uint8_t *received, *incoming;
+    wayland_blob *owned[WL_SEL_N]; uint8_t *received, *incoming;
+    int rx_which; /* the selection the receive in flight (or local copy) answers */
     size_t received_len, received_cap, incoming_len, incoming_cap, clip_bytes;
     bool local_receive;
     int rx_fd; wayland_tx tx[WL_CLIP_SENDS];
@@ -439,11 +454,20 @@ static void offer_mime(void *data, struct wl_data_offer *offer, const char *mime
     if (!strcmp(mime, "text/plain")) o->text = true;
 }
 static const struct wl_data_offer_listener offer_listener = {.offer = offer_mime};
+static void poffer_mime(void *data, struct zwp_primary_selection_offer_v1 *offer, const char *mime)
+{ offer_mime(data, NULL, mime); (void)offer; }
+static const struct zwp_primary_selection_offer_v1_listener poffer_listener = {.offer = poffer_mime};
 static void offer_destroy(wayland_state *s, wayland_offer *o)
 {
     wayland_offer **at = &s->offers;
     while (*at && *at != o) at = &(*at)->next;
-    if (*at) { *at = o->next; wl_data_offer_destroy(o->proxy); free(o); }
+    if (!*at) return;
+    *at = o->next;
+    if (o->primary) zwp_primary_selection_offer_v1_destroy(o->pproxy); else wl_data_offer_destroy(o->proxy);
+    if (s->selection == o) s->selection = NULL;
+    if (s->pselection == o) s->pselection = NULL;
+    if (s->drag == o) s->drag = NULL;
+    free(o);
 }
 static void device_offer(void *data, struct wl_data_device *device, struct wl_data_offer *proxy)
 {
@@ -453,10 +477,27 @@ static void device_offer(void *data, struct wl_data_device *device, struct wl_da
     o->proxy = proxy; o->next = s->offers; s->offers = o;
     wl_data_offer_add_listener(proxy, &offer_listener, o);
 }
+static void pdevice_offer(void *data, struct zwp_primary_selection_device_v1 *device, struct zwp_primary_selection_offer_v1 *proxy)
+{
+    (void)device; wayland_state *s = data;
+    wayland_offer *o = calloc(1, sizeof *o);
+    if (!o) { zwp_primary_selection_offer_v1_destroy(proxy); s->failed = true; return; }
+    o->pproxy = proxy; o->primary = true; o->next = s->offers; s->offers = o;
+    zwp_primary_selection_offer_v1_add_listener(proxy, &poffer_listener, o);
+}
+static void pdevice_selection(void *data, struct zwp_primary_selection_device_v1 *device, struct zwp_primary_selection_offer_v1 *proxy)
+{
+    (void)device; wayland_state *s = data;
+    wayland_offer *selection = NULL;
+    for (wayland_offer *o = s->offers; o; o = o->next) if (o->primary && o->pproxy == proxy) selection = o;
+    if (s->pselection && s->pselection != selection) offer_destroy(s, s->pselection);
+    s->pselection = selection;
+}
+static const struct zwp_primary_selection_device_v1_listener pdevice_listener = {.data_offer = pdevice_offer, .selection = pdevice_selection};
 static void device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer)
 {
     (void)device; (void)surface; (void)x; (void)y; wayland_state *s = data;
-    for (wayland_offer *o = s->offers; o; o = o->next) if (o->proxy == offer) s->drag = o;
+    for (wayland_offer *o = s->offers; o; o = o->next) if (!o->primary && o->proxy == offer) s->drag = o;
     if (offer) wl_data_offer_accept(offer, serial, NULL); /* file drops outside this backend's scope */
 }
 static void device_leave(void *data, struct wl_data_device *device)
@@ -472,7 +513,7 @@ static void device_selection(void *data, struct wl_data_device *device, struct w
 {
     (void)device; wayland_state *s = data;
     wayland_offer *selection = NULL;
-    for (wayland_offer *o = s->offers; o; o = o->next) if (o->proxy == proxy) selection = o;
+    for (wayland_offer *o = s->offers; o; o = o->next) if (!o->primary && o->proxy == proxy) selection = o;
     if (s->selection && s->selection != selection) offer_destroy(s, s->selection);
     s->selection = selection;
 }
@@ -491,6 +532,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         wl_seat_add_listener(s->seat, &seat_listener, s);
     } else if (!strcmp(interface, "wl_data_device_manager") && !s->manager) {
         s->manager = wl_registry_bind(registry, name, &wl_data_device_manager_interface, 1);
+    } else if (!strcmp(interface, "zwp_primary_selection_device_manager_v1") && !s->pmanager) {
+        s->pmanager = wl_registry_bind(registry, name, &zwp_primary_selection_device_manager_v1_interface, 1); /* (P) unstable v1 */
     } else if (!strcmp(interface, "wl_shm") && !s->shm) {
         s->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1); /* (P) v1 suffices: XRGB8888 is mandatory */
     } else if (!strcmp(interface, "wp_viewporter") && !s->viewporter) {
@@ -570,6 +613,10 @@ int wayland_plat_init(plat *p, const plat_config *cfg)
     if (s->manager) {
         s->device = wl_data_device_manager_get_data_device(s->manager, s->seat);
         wl_data_device_add_listener(s->device, &device_listener, s);
+    }
+    if (s->pmanager) {
+        s->pdevice = zwp_primary_selection_device_manager_v1_get_device(s->pmanager, s->seat);
+        zwp_primary_selection_device_v1_add_listener(s->pdevice, &pdevice_listener, s);
     }
     if (wl_display_roundtrip(display) < 0 || s->failed) goto fail;
     wayland_display_info output;
@@ -701,75 +748,145 @@ bool wayland_frame_discarded(const plat *p, uint32_t id)
 { const wayland_state *s = W(p); return s && id && id == s->frame_id && !s->failed && s->discarded; }
 void wayland_frame_notify(plat *p)
 { wayland_state *s = W(p); if (s && s->frame_id) s->notify = true; }
-static void clip_result(wayland_state *s, bool ok, uint32_t code)
-{ push(s, (plat_event){.kind = PLAT_EV_CLIPBOARD, .clip_ok = ok, .code = code, .clip_which = PLAT_CLIP_CLIPBOARD}); }
+static void clip_result(wayland_state *s, int which, bool ok, uint32_t code)
+{ push(s, (plat_event){.kind = PLAT_EV_CLIPBOARD, .clip_ok = ok, .code = code, .clip_which = (uint8_t)which}); }
 static void blob_unref(wayland_state *s, wayland_blob *blob)
 {
-    if (blob && !--blob->refs) { s->clip_bytes -= blob->len; free(blob); }
+    if (blob && !--blob->refs) { s->clip_bytes -= blob->len; x11_clip_buf_free(blob->buf); free(blob); }
 }
+static const uint8_t *blob_bytes(wayland_blob *blob) { return x11_clip_buf_data(blob->buf); }
 static void tx_close(wayland_state *s, wayland_tx *tx)
 { close(tx->fd); tx->fd = -1; blob_unref(s, tx->blob); tx->blob = NULL; }
+/* The one place a source asks for bytes: either selection's source lands here. */
+static void serve(wayland_state *s, int which, const char *mime, int32_t fd)
+{
+    wayland_blob *blob = s->owned[which];
+    if (!blob || (strcmp(mime, "text/plain;charset=utf-8") && strcmp(mime, "text/plain")) ||
+        fcntl(fd, F_SETFL, O_NONBLOCK) < 0) { close(fd); return; }
+    for (size_t i = 0; i < WL_CLIP_SENDS; i++) if (s->tx[i].fd < 0) {
+        s->tx[i] = (wayland_tx){.fd = fd, .blob = blob}; blob->refs++; return;
+    }
+    close(fd); /* the established X11 transfer-capacity bound applies here too */
+}
 static void source_target(void *data, struct wl_data_source *source, const char *mime) { (void)data; (void)source; (void)mime; }
 static void source_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
 {
     wayland_state *s = data;
-    if (source != s->source || !s->owned || (strcmp(mime, "text/plain;charset=utf-8") && strcmp(mime, "text/plain")) ||
-        fcntl(fd, F_SETFL, O_NONBLOCK) < 0) { close(fd); return; }
-    for (size_t i = 0; i < WL_CLIP_SENDS; i++) if (s->tx[i].fd < 0) {
-        s->tx[i] = (wayland_tx){.fd = fd, .blob = s->owned}; s->owned->refs++; return;
-    }
-    close(fd); /* the established X11 transfer-capacity bound applies here too */
+    if (source != s->source) { close(fd); return; }
+    serve(s, PLAT_CLIP_CLIPBOARD, mime, fd);
 }
 static void source_cancelled(void *data, struct wl_data_source *source)
 {
     wayland_state *s = data;
-    if (s->source == source) { s->source = NULL; blob_unref(s, s->owned); s->owned = NULL; clip_result(s, false, 2); }
+    if (s->source == source) {
+        s->source = NULL; blob_unref(s, s->owned[PLAT_CLIP_CLIPBOARD]); s->owned[PLAT_CLIP_CLIPBOARD] = NULL;
+        clip_result(s, PLAT_CLIP_CLIPBOARD, false, 2);
+    }
     wl_data_source_destroy(source);
 }
 static const struct wl_data_source_listener source_listener = {.target = source_target, .send = source_send, .cancelled = source_cancelled};
+static void psource_send(void *data, struct zwp_primary_selection_source_v1 *source, const char *mime, int32_t fd)
+{
+    wayland_state *s = data;
+    if (source != s->psource) { close(fd); return; }
+    serve(s, PLAT_CLIP_PRIMARY, mime, fd);
+}
+static void psource_cancelled(void *data, struct zwp_primary_selection_source_v1 *source)
+{
+    wayland_state *s = data;
+    if (s->psource == source) {
+        s->psource = NULL; blob_unref(s, s->owned[PLAT_CLIP_PRIMARY]); s->owned[PLAT_CLIP_PRIMARY] = NULL;
+        clip_result(s, PLAT_CLIP_PRIMARY, false, 2);
+    }
+    zwp_primary_selection_source_v1_destroy(source);
+}
+static const struct zwp_primary_selection_source_v1_listener psource_listener = {.send = psource_send, .cancelled = psource_cancelled};
+static bool sel_available(const wayland_state *s, int which)
+{
+    if (which == PLAT_CLIP_CLIPBOARD) return s->manager && s->device;
+    return which == PLAT_CLIP_PRIMARY && s->pmanager && s->pdevice;
+}
+/* Takes the buffer whether or not it succeeds (the x11_clip_set_buf rule). */
+static int claim(wayland_state *s, int which, x11_clip_buf *buf)
+{
+    if (!buf) return PLAT_ERR_FAIL;
+    size_t len = x11_clip_buf_len(buf);
+    wayland_blob *old = s->owned[which];
+    size_t reclaim = old && old->refs == 1 ? old->len : 0;
+    wayland_blob *blob = NULL;
+    if (!s->serial || len > WL_CLIP_MAX || len > WL_CLIP_BUDGET - (s->clip_bytes - reclaim) ||
+        !(blob = malloc(sizeof *blob))) { x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
+    if (which == PLAT_CLIP_CLIPBOARD) {
+        struct wl_data_source *source = wl_data_device_manager_create_data_source(s->manager);
+        if (!source) { free(blob); x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
+        wl_data_source_add_listener(source, &source_listener, s);
+        if (s->source) wl_data_source_destroy(s->source);
+        s->source = source;
+        wl_data_source_offer(source, "text/plain;charset=utf-8"); wl_data_source_offer(source, "text/plain");
+        wl_data_device_set_selection(s->device, source, s->serial);
+    } else {
+        struct zwp_primary_selection_source_v1 *source = zwp_primary_selection_device_manager_v1_create_source(s->pmanager);
+        if (!source) { free(blob); x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
+        zwp_primary_selection_source_v1_add_listener(source, &psource_listener, s);
+        if (s->psource) zwp_primary_selection_source_v1_destroy(s->psource);
+        s->psource = source;
+        zwp_primary_selection_source_v1_offer(source, "text/plain;charset=utf-8");
+        zwp_primary_selection_source_v1_offer(source, "text/plain");
+        zwp_primary_selection_device_v1_set_selection(s->pdevice, source, s->serial);
+    }
+    *blob = (wayland_blob){.refs = 1, .len = len, .buf = buf};
+    blob_unref(s, old); s->owned[which] = blob; s->clip_bytes += len;
+    return PLAT_OK;
+}
+int wayland_plat_clip_set_buf(plat *p, int which, x11_clip_buf *buf)
+{
+    wayland_state *s = W(p);
+    if (!s || (which != PLAT_CLIP_CLIPBOARD && which != PLAT_CLIP_PRIMARY)) { x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
+    /* No primary-selection global: nothing to claim, and no error for the
+     * selection change that asked (PRIMARY is a best-effort side effect of
+     * selecting; the clipboard copy next to it is unaffected). */
+    if (which == PLAT_CLIP_PRIMARY && !sel_available(s, which)) { x11_clip_buf_free(buf); return PLAT_OK; }
+    if (!sel_available(s, which)) { x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
+    return claim(s, which, buf);
+}
 int wayland_plat_clip_set(plat *p, int which, const void *utf8, size_t len)
 {
     wayland_state *s = W(p);
-    if (!s || which != PLAT_CLIP_CLIPBOARD || !s->manager || !s->device || !s->serial ||
-        len > WL_CLIP_MAX || (len && !utf8)) return PLAT_ERR_FAIL;
-    size_t reclaim = s->owned && s->owned->refs == 1 ? s->owned->len : 0;
-    if (len > WL_CLIP_BUDGET - (s->clip_bytes - reclaim)) return PLAT_ERR_FAIL;
-    wayland_blob *copy = malloc(sizeof *copy + len); if (!copy) return PLAT_ERR_FAIL;
-    copy->refs = 1; copy->len = len; if (len) memcpy(copy->bytes, utf8, len);
-    struct wl_data_source *source = wl_data_device_manager_create_data_source(s->manager);
-    if (!source) { free(copy); return PLAT_ERR_FAIL; }
-    wl_data_source_add_listener(source, &source_listener, s);
-    if (s->source) wl_data_source_destroy(s->source);
-    blob_unref(s, s->owned); s->owned = copy; s->clip_bytes += len; s->source = source;
-    wl_data_source_offer(s->source, "text/plain;charset=utf-8"); wl_data_source_offer(s->source, "text/plain");
-    wl_data_device_set_selection(s->device, s->source, s->serial); return PLAT_OK;
+    if (!s || !sel_available(s, which) || !s->serial || len > WL_CLIP_MAX || (len && !utf8)) return PLAT_ERR_FAIL;
+    x11_clip_buf *buf = x11_clip_buf_new(len); if (!buf) return PLAT_ERR_FAIL;
+    if (len) memcpy(x11_clip_buf_data(buf), utf8, len);
+    return claim(s, which, buf);
 }
 static void receive_complete(wayland_state *s)
 {
     uint8_t *old = s->received; size_t old_cap = s->received_cap;
     s->received = s->incoming; s->received_len = s->incoming_len; s->received_cap = s->incoming_cap;
     s->incoming = old; s->incoming_cap = old_cap; s->incoming_len = 0;
-    clip_result(s, true, 0);
+    clip_result(s, s->rx_which, true, 0);
 }
 int wayland_plat_clip_request(plat *p, int which)
 {
     wayland_state *s = W(p);
-    if (!s || which != PLAT_CLIP_CLIPBOARD || s->rx_fd >= 0 || s->local_receive) return PLAT_ERR_FAIL;
-    if (s->owned && s->source) {
-        if (s->incoming_cap < s->owned->len) {
-            uint8_t *copy = realloc(s->incoming, s->owned->len); if (!copy) return PLAT_ERR_FAIL;
-            s->incoming = copy; s->incoming_cap = s->owned->len;
+    if (!s || !sel_available(s, which) || s->rx_fd >= 0 || s->local_receive) return PLAT_ERR_FAIL;
+    wayland_blob *own = s->owned[which];
+    if (own) {
+        if (s->incoming_cap < own->len) {
+            uint8_t *copy = realloc(s->incoming, own->len); if (!copy) return PLAT_ERR_FAIL;
+            s->incoming = copy; s->incoming_cap = own->len;
         }
-        s->incoming_len = s->owned->len;
-        if (s->incoming_len) memcpy(s->incoming, s->owned->bytes, s->incoming_len);
-        s->local_receive = true; return PLAT_OK;
+        s->incoming_len = own->len;
+        if (s->incoming_len) memcpy(s->incoming, blob_bytes(own), s->incoming_len);
+        s->rx_which = which; s->local_receive = true; return PLAT_OK;
     }
-    s->incoming_len = 0;
-    if (!s->selection || (!s->selection->utf8 && !s->selection->text)) { clip_result(s, false, 1); return PLAT_OK; }
+    s->incoming_len = 0; s->rx_which = which;
+    wayland_offer *offer = which == PLAT_CLIP_PRIMARY ? s->pselection : s->selection;
+    if (!offer || (!offer->utf8 && !offer->text)) { clip_result(s, which, false, 1); return PLAT_OK; }
     int fds[2]; /* pipe's read/write endpoints, derived from POSIX pipe ABI */
     if (pipe2(fds, O_CLOEXEC) < 0) return PLAT_ERR_FAIL;
     if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0) { close(fds[0]); close(fds[1]); return PLAT_ERR_FAIL; }
-    wl_data_offer_receive(s->selection->proxy, s->selection->utf8 ? "text/plain;charset=utf-8" : "text/plain", fds[1]);
+    const char *mime = offer->utf8 ? "text/plain;charset=utf-8" : "text/plain";
+    if (offer->primary) zwp_primary_selection_offer_v1_receive(offer->pproxy, mime, fds[1]);
+    else wl_data_offer_receive(offer->proxy, mime, fds[1]);
     close(fds[1]); s->rx_fd = fds[0]; return PLAT_OK;
 }
 const uint8_t *wayland_plat_clip_data(const plat *p, size_t *len)
@@ -782,7 +899,7 @@ static void clip_receive(wayland_state *s)
         uint8_t byte; ssize_t n = read(s->rx_fd, &byte, sizeof byte);
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
         close(s->rx_fd); s->rx_fd = -1;
-        if (n == 0) receive_complete(s); else { s->incoming_len = 0; clip_result(s, false, 1); }
+        if (n == 0) receive_complete(s); else { s->incoming_len = 0; clip_result(s, s->rx_which, false, 1); }
         return;
     }
     size_t available = WL_CLIP_MAX - s->incoming_len; if (chunk > available) chunk = available;
@@ -791,14 +908,14 @@ static void clip_receive(wayland_state *s)
         size_t cap = s->incoming_cap ? s->incoming_cap : chunk;
         while (cap < need) cap = cap > WL_CLIP_MAX / 2u ? WL_CLIP_MAX : cap * 2u;
         uint8_t *copy = realloc(s->incoming, cap);
-        if (!copy) { close(s->rx_fd); s->rx_fd = -1; s->incoming_len = 0; clip_result(s, false, 1); return; }
+        if (!copy) { close(s->rx_fd); s->rx_fd = -1; s->incoming_len = 0; clip_result(s, s->rx_which, false, 1); return; }
         s->incoming = copy; s->incoming_cap = cap;
     }
     ssize_t n = read(s->rx_fd, s->incoming + s->incoming_len, chunk);
     if (n > 0) s->incoming_len += (size_t)n;
     else if (!n || (errno != EAGAIN && errno != EINTR)) {
         close(s->rx_fd); s->rx_fd = -1;
-        if (n == 0) receive_complete(s); else { s->incoming_len = 0; clip_result(s, false, 1); }
+        if (n == 0) receive_complete(s); else { s->incoming_len = 0; clip_result(s, s->rx_which, false, 1); }
     }
 }
 static void clip_send(wayland_state *s, wayland_tx *tx)
@@ -808,7 +925,7 @@ static void clip_send(wayland_state *s, wayland_tx *tx)
      * consume only a signal generated here; preserve the process disposition. */
     sigset_t set, old, pending; sigemptyset(&set); sigaddset(&set, SIGPIPE);
     (void)pthread_sigmask(SIG_BLOCK, &set, &old); (void)sigpending(&pending);
-    ssize_t n = write(tx->fd, tx->blob->bytes + tx->offset, tx->blob->len - tx->offset);
+    ssize_t n = write(tx->fd, blob_bytes(tx->blob) + tx->offset, tx->blob->len - tx->offset);
     int saved = errno;
     if (n < 0 && saved == EPIPE && !sigismember(&pending, SIGPIPE)) {
         struct timespec zero = {0}; (void)sigtimedwait(&set, NULL, &zero);
@@ -885,9 +1002,12 @@ void wayland_plat_shutdown(plat *p)
         if (s->rx_fd >= 0) close(s->rx_fd);
         for (size_t i = 0; i < WL_CLIP_SENDS; i++) if (s->tx[i].fd >= 0) tx_close(s, &s->tx[i]);
         if (s->source) wl_data_source_destroy(s->source);
+        if (s->psource) zwp_primary_selection_source_v1_destroy(s->psource);
         while (s->offers) offer_destroy(s, s->offers);
         if (s->device) wl_data_device_destroy(s->device);
         if (s->manager) wl_data_device_manager_destroy(s->manager);
+        if (s->pdevice) zwp_primary_selection_device_v1_destroy(s->pdevice);
+        if (s->pmanager) zwp_primary_selection_device_manager_v1_destroy(s->pmanager);
         if (s->keyboard) wl_keyboard_release(s->keyboard);
         if (s->pointer) wl_pointer_release(s->pointer);
         if (s->seat) wl_seat_destroy(s->seat);
@@ -908,7 +1028,8 @@ void wayland_plat_shutdown(plat *p)
         if (s->registry) wl_registry_destroy(s->registry);
         xkb_compose_state_unref(s->compose); xkb_compose_table_unref(s->compose_table);
         xkb_state_unref(s->keys); xkb_keymap_unref(s->keymap); xkb_context_unref(s->context);
-        blob_unref(s, s->owned); free(s->received); free(s->incoming);
+        for (size_t i = 0; i < WL_SEL_N; i++) blob_unref(s, s->owned[i]);
+        free(s->received); free(s->incoming);
     }
     if (s && W(p)->timer_fd >= 0) close(W(p)->timer_fd);
     if (s && W(p)->repeat_fd >= 0) close(W(p)->repeat_fd);
@@ -932,6 +1053,7 @@ bool wayland_plat_poll_event(plat *p, plat_event *out) { (void)p; (void)out; ret
 int wayland_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms) { (void)p; (void)cb; (void)timeout_ms; return PLAT_ERR_NO_DISPLAY; }
 int wayland_plat_run(plat *p, const plat_callbacks *cb) { return wayland_plat_run_for(p, cb, -1); }
 int wayland_plat_clip_set(plat *p, int which, const void *utf8, size_t len) { (void)p; (void)which; (void)utf8; (void)len; return PLAT_ERR_FAIL; }
+int wayland_plat_clip_set_buf(plat *p, int which, x11_clip_buf *buf) { (void)p; (void)which; x11_clip_buf_free(buf); return PLAT_ERR_FAIL; }
 int wayland_plat_clip_request(plat *p, int which) { (void)p; (void)which; return PLAT_ERR_FAIL; }
 const uint8_t *wayland_plat_clip_data(const plat *p, size_t *len) { (void)p; if (len) *len = 0; return NULL; }
 void *wayland_display(const plat *p) { (void)p; return NULL; }

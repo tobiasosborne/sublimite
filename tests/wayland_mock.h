@@ -8,6 +8,7 @@
 #include "wayland/protocol/viewporter-server.h"
 #include "wayland/protocol/fractional-scale-v1-server.h"
 #include "wayland/protocol/xdg-activation-v1-server.h"
+#include "wayland/protocol/primary-selection-unstable-v1-server.h"
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -68,6 +69,18 @@ typedef struct mock_shm_shared {
     uint32_t input_serial, tokens, token_serial, activations;
     bool token_seat_ok, token_surface_ok, activate_surface_ok;
     char activated[64]; /* (P) longer than both fixture tokens; overflow truncates and fails the compare */
+    /* edit-b6ai.9 zwp_primary_selection_v1: claims counts device.set_selection
+     * with a source; claim_serial its serial; claim_mimes a bitmask of the
+     * source's offers (bit 0 text/plain;charset=utf-8, bit 1 text/plain, bit 2
+     * anything else); served[i]/served_len[i] the bytes the mock read through
+     * the pipe it handed the source for mime i (0 utf-8, 1 plain); clears counts
+     * set_selection(NULL); receives/receive_mime what the client asked of the
+     * foreign offer (receive_mime: bit 0 utf-8, bit 1 plain, bit 2 other). The
+     * parent sets steal before a claim to have the mock cancel that source at
+     * once (another client took PRIMARY); sends_offer = 0 starts without one. */
+    uint32_t pclaims, pclaim_serial, pclaim_mimes, pclears, preceives, preceive_mime, psources;
+    uint32_t pserved_len[2]; char pserved[2][64]; /* (P) longer than the fixture strings */
+    bool psteal, pno_initial, pdone[2];
     uint32_t screen[MOCK_SCREEN_PX];
 } mock_shm_shared;
 typedef struct mock_shm_options {
@@ -82,6 +95,7 @@ typedef struct mock_shm_options {
      * the startup pointer position (surface-local, wl_fixed). */
     bool viewporter, fractional, pointer_set;
     bool activation; /* edit-b6ai.8: advertise xdg_activation_v1 */
+    bool primary;    /* edit-b6ai.9: advertise zwp_primary_selection_device_manager_v1 */
     uint32_t preferred_scale, scale_after, scale_to;
     wl_fixed_t pointer_x, pointer_y;
     mock_shm_shared *shared;
@@ -502,6 +516,82 @@ static const struct xdg_activation_v1_interface mock_activation_ops = {.destroy 
     .get_activation_token = mock_get_token, .activate = mock_activate};
 static void mock_bind_activation(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &xdg_activation_v1_interface, (int)version, id); wl_resource_set_implementation(r, &mock_activation_ops, data, NULL); }
+/* ---- edit-b6ai.9: zwp_primary_selection_device_manager_v1 -------------- */
+typedef struct mock_ptx { mock_wayland *mock; int fd; unsigned mime; size_t len; struct wl_event_source *event; struct wl_resource *source; } mock_ptx;
+static mock_ptx mock_ptxs[2]; /* one per advertised UTF-8 mime name, for the latest claim */
+static const char *mock_pmime(unsigned bits_index)
+{ return bits_index ? "text/plain" : "text/plain;charset=utf-8"; }
+static void mock_poffer_receive(struct wl_client *client, struct wl_resource *r, const char *mime, int32_t fd)
+{
+    (void)client; (void)r; mock_wayland *m = wl_resource_get_user_data(r); (void)m;
+    mock_shm_shared *sh = mock_shm.shared;
+    uint32_t bit = !strcmp(mime, "text/plain;charset=utf-8") ? 1u : !strcmp(mime, "text/plain") ? 2u : 4u;
+    if (sh) { sh->preceives++; sh->preceive_mime |= bit; }
+    if (bit != 4u) { const char *text = "mock primary"; assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text)); }
+    close(fd);
+}
+static const struct zwp_primary_selection_offer_v1_interface mock_poffer_ops = {.receive = mock_poffer_receive, .destroy = mock_destroy};
+static void mock_pdevice_selection_offer(struct wl_client *client, struct wl_resource *device)
+{
+    mock_wayland *m = wl_resource_get_user_data(device);
+    struct wl_resource *offer = wl_resource_create(client, &zwp_primary_selection_offer_v1_interface, 1, 0);
+    wl_resource_set_implementation(offer, &mock_poffer_ops, m, NULL);
+    zwp_primary_selection_device_v1_send_data_offer(device, offer);
+    zwp_primary_selection_offer_v1_send_offer(offer, "text/plain;charset=utf-8");
+    zwp_primary_selection_device_v1_send_selection(device, offer);
+}
+static void mock_psource_offer(struct wl_client *client, struct wl_resource *r, const char *mime)
+{
+    (void)client; (void)r; mock_shm_shared *sh = mock_shm.shared; if (!sh) return;
+    sh->pclaim_mimes |= !strcmp(mime, "text/plain;charset=utf-8") ? 1u : !strcmp(mime, "text/plain") ? 2u : 4u;
+}
+static const struct zwp_primary_selection_source_v1_interface mock_psource_ops = {.offer = mock_psource_offer, .destroy = mock_destroy};
+static void mock_psource(struct wl_client *client, struct wl_resource *r, uint32_t id)
+{
+    mock_wayland *m = wl_resource_get_user_data(r);
+    struct wl_resource *source = wl_resource_create(client, &zwp_primary_selection_source_v1_interface, 1, id);
+    wl_resource_set_implementation(source, &mock_psource_ops, m, NULL);
+    if (mock_shm.shared) { mock_shm.shared->psources++; mock_shm.shared->pclaim_mimes = 0; }
+}
+static int mock_ptx_read(int fd, uint32_t mask, void *data)
+{
+    (void)mask; mock_ptx *tx = data; mock_shm_shared *sh = mock_shm.shared;
+    uint8_t byte; ssize_t n = read(fd, &byte, sizeof byte);
+    if (n > 0) { if (sh && tx->len < sizeof sh->pserved[0]) sh->pserved[tx->mime][tx->len] = (char)byte; tx->len++; }
+    else if (!n) {
+        if (sh) { sh->pserved_len[tx->mime] = (uint32_t)tx->len; __atomic_store_n(&sh->pdone[tx->mime], true, __ATOMIC_RELEASE); }
+        wl_event_source_remove(tx->event); tx->event = NULL; close(tx->fd); tx->fd = -1;
+    }
+    return 0;
+}
+static void mock_pdevice_set(struct wl_client *client, struct wl_resource *r, struct wl_resource *source, uint32_t serial)
+{
+    (void)client; mock_wayland *m = wl_resource_get_user_data(r); mock_shm_shared *sh = mock_shm.shared;
+    if (!source) { if (sh) sh->pclears++; return; }
+    if (sh) { /* reset before the count moves: the parent waits on the count, then on pdone */
+        sh->pdone[0] = sh->pdone[1] = false; sh->pserved_len[0] = sh->pserved_len[1] = 0; sh->pclaim_serial = serial;
+        __atomic_store_n(&sh->pclaims, sh->pclaims + 1, __ATOMIC_RELEASE);
+    }
+    if (sh && sh->psteal) { sh->psteal = false; zwp_primary_selection_source_v1_send_cancelled(source); return; }
+    for (unsigned i = 0; i < 2; i++) {
+        int fds[2]; assert(!pipe2(fds, O_CLOEXEC | O_NONBLOCK));
+        mock_ptx *tx = &mock_ptxs[i]; *tx = (mock_ptx){.mock = m, .fd = fds[0], .mime = i, .source = source};
+        tx->event = wl_event_loop_add_fd(wl_display_get_event_loop(m->display), tx->fd, WL_EVENT_READABLE, mock_ptx_read, tx); assert(tx->event);
+        zwp_primary_selection_source_v1_send_send(source, mock_pmime(i), fds[1]); close(fds[1]);
+    }
+}
+static const struct zwp_primary_selection_device_v1_interface mock_pdevice_ops = {.set_selection = mock_pdevice_set, .destroy = mock_destroy};
+static void mock_pget_device(struct wl_client *client, struct wl_resource *r, uint32_t id, struct wl_resource *seat)
+{
+    (void)seat; mock_wayland *m = wl_resource_get_user_data(r);
+    struct wl_resource *device = wl_resource_create(client, &zwp_primary_selection_device_v1_interface, 1, id);
+    wl_resource_set_implementation(device, &mock_pdevice_ops, m, NULL);
+    if (!(mock_shm.shared && mock_shm.shared->pno_initial)) mock_pdevice_selection_offer(client, device);
+}
+static const struct zwp_primary_selection_device_manager_v1_interface mock_pmanager_ops = {.create_source = mock_psource,
+    .get_device = mock_pget_device, .destroy = mock_destroy};
+static void mock_bind_primary(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{ struct wl_resource *r = wl_resource_create(client, &zwp_primary_selection_device_manager_v1_interface, (int)version, id); wl_resource_set_implementation(r, &mock_pmanager_ops, data, NULL); }
 static void mock_bind_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 { struct wl_resource *r = wl_resource_create(client, &wl_data_device_manager_interface, (int)version, id); wl_resource_set_implementation(r, &mock_manager_ops, data, NULL); }
 /* (P) Unit logical output = minimum nonzero dimensions; scale is the
@@ -544,6 +634,7 @@ static pid_t mock_start_options(bool shell, bool defer, const uint8_t *payload, 
         if (mock_shm.enabled) assert(!wl_display_init_shm(m.display)); /* libwayland-server's real wl_shm */
         if (mock_shm.viewporter) assert(wl_global_create(m.display, &wp_viewporter_interface, 1, &m, mock_bind_viewporter));
         if (mock_shm.fractional) assert(wl_global_create(m.display, &wp_fractional_scale_manager_v1_interface, 1, &m, mock_bind_fraction_manager));
+        if (mock_shm.primary) assert(wl_global_create(m.display, &zwp_primary_selection_device_manager_v1_interface, 1, &m, mock_bind_primary)); /* (P) v1 */
         if (mock_shm.activation) assert(wl_global_create(m.display, &xdg_activation_v1_interface, 1, &m, mock_bind_activation)); /* (P) v1 */
         struct wl_client *client = wl_client_create(m.display, sockets[1]); if (!client) perror("mock wl_client_create"); assert(client);
         struct { struct wl_listener listener; mock_wayland *mock; } gone = {.listener = {.notify = mock_client_gone}, .mock = &m};

@@ -1,6 +1,7 @@
 #ifndef EDIT_WAYLAND_PRIVATE_H
 #define EDIT_WAYLAND_PRIVATE_H
 #include "wayland/plat.h"
+#include "x11/clip.h"
 int x11_plat_init(plat *p, const plat_config *cfg);
 void x11_plat_map(plat *p);
 void x11_plat_set_blink(plat *p, uint32_t ms);
@@ -31,6 +32,7 @@ int wayland_plat_run_for(plat *p, const plat_callbacks *cb, int timeout_ms);
 int wayland_plat_run(plat *p, const plat_callbacks *cb);
 void wayland_plat_shutdown(plat *p);
 int wayland_plat_clip_set(plat *p, int which, const void *utf8, size_t len);
+int wayland_plat_clip_set_buf(plat *p, int which, x11_clip_buf *buf); /* takes buf; edit-b6ai.9 */
 int wayland_plat_clip_request(plat *p, int which);
 const uint8_t * wayland_plat_clip_data(const plat *p, size_t *len);
 /* Decoder seam shared by native keyboard/repeat and allocation regression. */

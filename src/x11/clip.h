@@ -54,6 +54,9 @@ size_t        x11_clip_buf_len(const x11_clip_buf *b);
 uint8_t      *x11_clip_buf_data(x11_clip_buf *b);
 void          x11_clip_buf_free(x11_clip_buf *b);    /* only for a buffer that was not adopted */
 int           x11_clip_set_buf(plat *p, int which, x11_clip_buf *b);
+/* Backend-neutral x11_clip_set_buf: Wayland platforms route to their own selection
+ * sources (edit-b6ai.9), everything else to x11_clip_set_buf. Same ownership rule. POSIX only. */
+int           plat_clip_set_buf(plat *p, int which, x11_clip_buf *b);
 /* In-flight transfers (serving INCR/MULTIPLE jobs, receives that are not idle, deferred buffer frees): 0 when quiescent. */
 size_t x11_clip_busy(const plat *p);
 /* Earliest monotonic deadline (ns, trace_now_ns clock) the loop must wake for, 0 = none. */

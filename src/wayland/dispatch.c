@@ -3,6 +3,7 @@
 #include <string.h>
 #include "x11/private.h"
 #include "x11/dnd.h"
+#include "x11/clip.h"
 
 const char *wayland_display_select(const char *display, const char *safe, const char *allow)
 {
@@ -99,6 +100,12 @@ int plat_clip_set(plat *p, int which, const void *utf8, size_t len)
 {
     if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_clip_set(p, which, utf8, len); }
     return x11_plat_clip_set(p, which, utf8, len);
+}
+
+int plat_clip_set_buf(plat *p, int which, x11_clip_buf *b)
+{
+    if (p && p->backend == PLAT_BACKEND_WAYLAND) { return wayland_plat_clip_set_buf(p, which, b); }
+    return x11_clip_set_buf(p, which, b);
 }
 
 int plat_clip_request(plat *p, int which)

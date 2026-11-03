@@ -5,6 +5,8 @@
 #include "wayland/private.h"
 #include "base/base.h"
 #include "editor/editor.h"
+#include "editor/private.h"
+#include "x11/clip.h"
 #include "../bench/harness.h"
 #include <assert.h>
 #include <stdio.h>
@@ -261,6 +263,7 @@ static void activation_test(void)
     munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
     puts("wayland_test: xdg_activation_v1 forwarded token, self-requested token (input serial + surface), absent global");
 }
+
 
 /* ---- edit-b6ai.6: Wayland CPU raster backend over wl_shm --------------- */
 /* (P) Grid: the P2.5 live-pixel fixture of tests/raster_test.c, 4 x 6 cells
@@ -573,6 +576,186 @@ static void editor_raster_test(void)
         before, c.allocations, c.frames, commits, edit_malloc_guard_active() ? "active" : "ASan-inert");
     munmap(shared, sizeof *shared); mock_shm = (mock_shm_options){0};
 }
+/* ---- edit-b6ai.9: zwp_primary_selection_v1 (middle-click paste parity) ---- */
+typedef struct pobs { bool primary_ok, primary_fail, primary_lost, clipboard_ok, close; } pobs;
+static void pobserve(void *user, const plat_event *ev)
+{
+    pobs *o = user;
+    if (ev->kind == PLAT_EV_CLOSE) o->close = true;
+    if (ev->kind != PLAT_EV_CLIPBOARD) return;
+    if (ev->code == 2) { if (ev->clip_which == PLAT_CLIP_PRIMARY) o->primary_lost = true; return; }
+    if (ev->clip_which == PLAT_CLIP_PRIMARY) { if (ev->clip_ok) o->primary_ok = true; else o->primary_fail = true; }
+    else if (ev->clip_ok) o->clipboard_ok = true;
+}
+static uint32_t pload(const uint32_t *v) { return __atomic_load_n(v, __ATOMIC_ACQUIRE); }
+static bool pdone(mock_shm_shared *sh) { return __atomic_load_n(&sh->pdone[0], __ATOMIC_ACQUIRE) && __atomic_load_n(&sh->pdone[1], __ATOMIC_ACQUIRE); }
+static void ppump_until(plat *p, const plat_callbacks *cb, bool *flag)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000); /* (G) wl_settle's deadline, reused */
+    while (!*flag) { assert(plat_run_for(p, cb, 0) == PLAT_OK); assert(trace_now_ns() < deadline); }
+}
+/* Wait for the mock to have seen claim number `claims`, then for both source pipes to drain. The mock
+ * clears pdone before it counts the claim, so the count is the barrier against a previous claim's flags. */
+static void ppump_served(plat *p, const plat_callbacks *cb, mock_shm_shared *sh, uint32_t claims)
+{
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (pload(&sh->pclaims) < claims || !pdone(sh)) { assert(plat_run_for(p, cb, 0) == PLAT_OK); assert(trace_now_ns() < deadline); }
+}
+static void primary_plat_test(void)
+{
+    mock_shm_shared *sh = frac_shared();
+    mock_shm = (mock_shm_options){.primary = true, .shared = sh};
+    pid_t child = mock_start(true);
+    plat p; plat_config cfg = {.width = 1, .height = 1};
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    pobs o = {0}; plat_callbacks cb = {.ud = &o, .on_event = pobserve};
+    assert(plat_run_for(&p, &cb, 0) == PLAT_OK); /* the mock's key/button serials arrive */
+    assert(sh->input_serial);
+    /* A foreign primary offer is read through a pipe, text/plain;charset=utf-8 only. */
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_ok);
+    size_t len; const uint8_t *bytes = plat_clip_data(&p, &len);
+    assert(len == sizeof "mock primary" - 1 && !memcmp(bytes, "mock primary", len));
+    assert(sh->preceives == 1 && sh->preceive_mime == 1u);
+    /* The regular clipboard is unaffected and its completion is not a PRIMARY one. */
+    o.primary_ok = false;
+    assert(plat_clip_request(&p, PLAT_CLIP_CLIPBOARD) == PLAT_OK);
+    ppump_until(&p, &cb, &o.clipboard_ok);
+    bytes = plat_clip_data(&p, &len); assert(len == sizeof "mock clipboard" - 1 && !o.primary_ok);
+    /* Claiming PRIMARY: both text mime types, a nonzero serial, bytes through the source pipes. */
+    assert(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "selected text", sizeof "selected text" - 1) == PLAT_OK);
+    ppump_served(&p, &cb, sh, 1);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
+    assert(sh->pclaims == 1 && sh->pclaim_mimes == 3u && sh->pclaim_serial != 0 && sh->psources == 1);
+    for (unsigned i = 0; i < 2; i++)
+        assert(sh->pserved_len[i] == sizeof "selected text" - 1 && !memcmp(sh->pserved[i], "selected text", sh->pserved_len[i]));
+    /* Our own PRIMARY is read locally: no round trip to the compositor. */
+    o.primary_ok = false;
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_ok);
+    bytes = plat_clip_data(&p, &len);
+    assert(len == sizeof "selected text" - 1 && !memcmp(bytes, "selected text", len) && sh->preceives == 1);
+    /* A second claim replaces the first source. */
+    assert(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "second", sizeof "second" - 1) == PLAT_OK);
+    ppump_served(&p, &cb, sh, 2);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0);
+    assert(sh->pclaims == 2 && sh->pserved_len[0] == sizeof "second" - 1 && !memcmp(sh->pserved[0], "second", sh->pserved_len[0]));
+    /* Another client taking PRIMARY cancels our source: a PRIMARY loss event (code 2),
+     * and the next paste reads the foreign offer again. */
+    sh->psteal = true;
+    assert(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "stolen", sizeof "stolen" - 1) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_lost);
+    o.primary_ok = false;
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_ok);
+    bytes = plat_clip_data(&p, &len);
+    assert(len == sizeof "mock primary" - 1 && !memcmp(bytes, "mock primary", len) && sh->preceives == 2);
+    /* CLIPBOARD and PRIMARY are independent: owning one does not disturb the other. */
+    assert(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "kept", sizeof "kept" - 1) == PLAT_OK);
+    ppump_served(&p, &cb, sh, 4);
+    assert(plat_clip_set(&p, PLAT_CLIP_CLIPBOARD, "owned clipboard", sizeof "owned clipboard" - 1) == PLAT_OK);
+    o.primary_ok = false;
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_ok);
+    bytes = plat_clip_data(&p, &len);
+    assert(len == sizeof "kept" - 1 && !memcmp(bytes, "kept", len));
+    ppump_until(&p, &cb, &o.close); /* the clipboard mock cancels its source and closes once served */
+    plat_shutdown(&p); mock_join(child);
+    /* The editor's adoption entry (plat_clip_set_buf) claims PRIMARY the same way. */
+    mock_shm = (mock_shm_options){.primary = true, .shared = sh}; memset(sh->pserved, 0, sizeof sh->pserved);
+    sh->pclaims = 0; sh->psteal = false;
+    child = mock_start(true);
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    o = (pobs){0}; assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
+    x11_clip_buf *b = x11_clip_buf_new(sizeof "adopted" - 1); assert(b);
+    memcpy(x11_clip_buf_data(b), "adopted", sizeof "adopted" - 1);
+    assert(plat_clip_set_buf(&p, PLAT_CLIP_PRIMARY, b) == PLAT_OK);
+    ppump_served(&p, &cb, sh, 1);
+    assert(sh->pclaims == 1 && sh->pserved_len[1] == sizeof "adopted" - 1 && !memcmp(sh->pserved[1], "adopted", sh->pserved_len[1]));
+    plat_shutdown(&p); mock_join(child);
+    /* Compositor with the global but no current primary selection: the paste fails cleanly. */
+    sh->pno_initial = true; sh->preceives = 0;
+    child = mock_start(true);
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    o = (pobs){0}; assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_OK);
+    ppump_until(&p, &cb, &o.primary_fail);
+    assert(sh->preceives == 0);
+    plat_shutdown(&p); mock_join(child);
+    /* Without the global: PRIMARY behaves as before (no paste, no claim, no error from
+     * the editor's adoption entry), the regular clipboard is untouched. */
+    sh->pno_initial = false; sh->pclaims = 0; sh->psources = 0;
+    mock_shm = (mock_shm_options){.shared = sh};
+    child = mock_start(true);
+    assert(plat_init_backend(&p, &cfg, PLAT_BACKEND_WAYLAND) == PLAT_OK);
+    o = (pobs){0}; assert(plat_run_for(&p, &cb, 0) == PLAT_OK);
+    assert(plat_clip_request(&p, PLAT_CLIP_PRIMARY) == PLAT_ERR_FAIL);
+    assert(plat_clip_set(&p, PLAT_CLIP_PRIMARY, "x", 1) == PLAT_ERR_FAIL);
+    b = x11_clip_buf_new(1); assert(b); x11_clip_buf_data(b)[0] = 'x';
+    assert(plat_clip_set_buf(&p, PLAT_CLIP_PRIMARY, b) == PLAT_OK);
+    assert(wl_display_roundtrip(wayland_display(&p)) >= 0 && sh->pclaims == 0 && sh->psources == 0);
+    assert(plat_clip_request(&p, PLAT_CLIP_CLIPBOARD) == PLAT_OK);
+    ppump_until(&p, &cb, &o.clipboard_ok);
+    plat_shutdown(&p); mock_join(child);
+    munmap(sh, sizeof *sh); mock_shm = (mock_shm_options){0};
+    puts("wayland_test: primary selection: foreign offer through a pipe, claim with both text mimes and a serial, own PRIMARY local, replace, cancel, independent of CLIPBOARD, adoption entry, no current offer, absent global");
+}
+
+/* The editor end to end on a Wayland session with the primary-selection global:
+ * a middle click pastes the foreign PRIMARY; a selection claims PRIMARY with its bytes
+ * (select all is observed through what the mock is served); a second middle click
+ * pastes our own PRIMARY with no receive from the compositor. */
+static void primary_editor_test(void)
+{
+    mock_shm_shared *sh = frac_shared();
+    mock_shm = (mock_shm_options){.enabled = true, .configure_set = true, .configure_w = 320, .configure_h = 240, .primary = true, .shared = sh};
+    pid_t child = mock_start_options(true, false, NULL, 0, 0, true);
+    render_backend b = {0}; assert(editor_backend_select(&b, NULL) == 0);
+    editor_config cfg = {.cols = 30, .rows = 6, .raster_fallback = true, .platform_backend = PLAT_BACKEND_WAYLAND};
+    editor *e = NULL; assert(editor_open(&e, &cfg, &b) == EDITOR_OK);
+    wl_settle(e);
+    assert(sh->input_serial);
+    plat_event click = {.kind = PLAT_EV_BUTTON, .press = true, .code = 2,
+        .x = (int32_t)(4 * e->grid.dims.cell_w), .y = (int32_t)(e->tab_rows * e->grid.dims.cell_h)};
+    plat_event ctrl_a = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'a', .mods = PLAT_MOD_CTRL};
+    plat_event key_x = {.kind = PLAT_EV_KEY, .press = true, .keysym = 'x', .utf8 = {'x'}, .utf8_len = 1};
+    assert(editor_inject(e, &key_x) == EDITOR_OK); wl_settle(e);
+    click.t0_ns = trace_now_ns();
+    assert(editor_inject(e, &click) == EDITOR_OK);
+    uint64_t deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (pload(&sh->preceives) < 1) { assert(editor_step(e, 20) != EDITOR_ERR_MEMORY); assert(trace_now_ns() < deadline); }
+    wl_settle(e);
+    assert(sh->preceive_mime == 1u);
+    /* Select all: the editor claims PRIMARY with the whole buffer, "x" + "mock primary". */
+    assert(editor_inject(e, &ctrl_a) == EDITOR_OK);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!pdone(sh)) { assert(editor_step(e, 20) != EDITOR_ERR_MEMORY); assert(trace_now_ns() < deadline); }
+    wl_settle(e);
+    assert(sh->pclaims >= 1 && sh->pclaim_mimes == 3u && sh->pclaim_serial);
+    /* The mock's own first-commit key types an 'a' too, so the buffer is the pasted text around
+     * that and our 'x' (the click is at column 0 of the first row): check the paste is in it,
+     * both mime names carry the same bytes, and remember the size. */
+    size_t first = sh->pserved_len[0];
+    assert(first >= sizeof "mock primary" - 1 + 1 && first <= sizeof "mock primary" - 1 + 3);
+    assert(sh->pserved_len[1] == first && !memcmp(sh->pserved[0], sh->pserved[1], first));
+    assert(memmem(sh->pserved[0], first, "mock primary", sizeof "mock primary" - 1));
+    /* Our own PRIMARY now: the next middle click pastes it locally and the compositor sees no receive. */
+    uint32_t claims = sh->pclaims;
+    click.t0_ns = trace_now_ns(); assert(editor_inject(e, &click) == EDITOR_OK); wl_settle(e);
+    assert(sh->preceives == 1);
+    assert(editor_inject(e, &ctrl_a) == EDITOR_OK);
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (pload(&sh->pclaims) == claims) { assert(editor_step(e, 20) != EDITOR_ERR_MEMORY); assert(trace_now_ns() < deadline); }
+    deadline = trace_now_ns() + UINT64_C(5000000000);
+    while (!pdone(sh)) { assert(editor_step(e, 20) != EDITOR_ERR_MEMORY); assert(trace_now_ns() < deadline); }
+    wl_settle(e);
+    /* Our PRIMARY (the whole buffer) was inserted once more, so the new whole buffer is twice as long. */
+    assert(sh->pserved_len[0] >= 2 * first && sh->pserved_len[1] == sh->pserved_len[0] && sh->preceives == 1);
+    editor_close(e); mock_join(child);
+    munmap(sh, sizeof *sh); mock_shm = (mock_shm_options){0};
+    puts("wayland_test: editor on Wayland: middle click pastes the foreign PRIMARY, selection claims PRIMARY, own PRIMARY pasted locally");
+}
+
 /* edit-b6ai.7: the editor on a fractional session. Startup DPI 96 (what main
  * reports on a fractional session), preferred 1.25 at map, then 1.6 while
  * typing: the font is re-selected at each change (cell height grows), the
@@ -913,6 +1096,8 @@ int main(int argc, char **argv)
     editor_raster_test();
     fractional_test();
     activation_test();
+    primary_plat_test();
+    primary_editor_test();
     editor_fractional_test();
     allocation_test();
     output_test();

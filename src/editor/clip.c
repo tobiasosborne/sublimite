@@ -127,7 +127,7 @@ static int publish_owned(editor *e, int which, x11_clip_buf *b)
         }
         x11_clip_buf_free(b);
 #else
-        int rc = x11_clip_set_buf(&e->platform, which, b);
+        int rc = plat_clip_set_buf(&e->platform, which, b);
 #endif
         if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, false);
         return rc ? EDITOR_ERR_CAPACITY : 0;

@@ -8,6 +8,7 @@ Generated with the locally installed `wayland-scanner` from:
 - `/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml` (edit-b6ai.7, wayland-scanner 1.26.0; staging protocol, MIT licence like the others)
 
 - `/usr/share/wayland-protocols/staging/xdg-activation/xdg-activation-v1.xml` (edit-b6ai.8, wayland-scanner 1.26.0; staging protocol, MIT licence like the others)
+- `/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml` (edit-b6ai.9, wayland-scanner 1.26.0; unstable v1, MIT licence like the others; stem `primary-selection-unstable-v1`)
 
 Commands, per protocol `P` with output stem `S` (`viewporter`, `fractional-scale-v1`, `xdg-activation-v1`):
 `wayland-scanner client-header P S-client.h`, `wayland-scanner server-header P S-server.h`,

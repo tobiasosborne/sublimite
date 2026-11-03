@@ -57,3 +57,15 @@ and IPC restrictions, detailed in the worker report.
 [Worker report](../../docs/worker-reports/edit-1zm-s6.md);
 fractional scale: [edit-b6ai.7](../../docs/worker-reports/edit-b6ai.7-s29.md).
 [Decisions](../../docs/decisions/edit-1zm.md).
+
+Primary selection (edit-b6ai.9): `zwp_primary_selection_device_manager_v1` v1 is
+bound when advertised. PRIMARY and CLIPBOARD share one transfer path (offer
+list, `claim`, `serve`, one receive pipe tagged by `rx_which`); events carry
+`clip_which`. The editor now publishes through `plat_clip_set_buf` (dispatch.c),
+which routes Wayland to `wayland_plat_clip_set_buf` (zero-copy adoption of the
+editor's buffer); before this it called the X11 function on a Wayland plat.
+Without the global: `plat_clip_request/set(PRIMARY)` fail as before and
+`plat_clip_set_buf(PRIMARY)` frees the buffer and returns OK. Claim uses the
+last serial, as the clipboard does. Mock cases: tests/wayland_test.c
+`primary_plat_test`, `primary_editor_test`. Not done: UTF8_STRING/other mime
+names on receive (only text/plain;charset=utf-8 and text/plain, as CLIPBOARD).

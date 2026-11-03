@@ -7,4 +7,5 @@
 #include "protocol/viewporter.inc"
 #include "protocol/fractional-scale-v1.inc"
 #include "protocol/xdg-activation-v1.inc"
+#include "protocol/primary-selection-unstable-v1.inc"
 #endif
