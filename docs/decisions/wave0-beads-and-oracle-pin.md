@@ -100,3 +100,13 @@ Green = the 120 sanitizer suites pass with **zero FLAKY lines on a quiet box**. 
 scripts are outside it by name: `tools/test_install_omarchy.sh` (install / install-omarchy) and
 `tools/test_sublimite_win.sh` (WSL only). Runs export `EDITOR=true` (works around the v1 test bug in
 test_install_omarchy.sh line 177, worklog 2026-11-22) and say so in the stamp.
+
+## 9. Baseline verdict (advisor, 2026-11-22)
+
+**120 of 120 pass on a quiet box; one named v1 test race (`editor_session_test` `ivv_save`, :2299), accepted as a
+known exception; installer scripts outside the baseline.** Mechanism (advisor, reading `tests/editor_session_test.c`
+at the pin): `ivv_save` takes `ivv_hold(f.directory)` right after `press('x')`; `f.directory` is the fixture's own
+private directory, so the other flock holder can only be that same editor's journal work for the keypress — never
+another suite and never the live profile. A nonblocking lock taken without waiting for the journal work; it shows
+under parallel CPU contention. A v1 finding for Tobias; nothing done in v1. No further oracle `make check` runs are
+needed for Wave 0.
