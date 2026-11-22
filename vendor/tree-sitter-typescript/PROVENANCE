@@ -1,0 +1,7 @@
+tree-sitter-typescript v0.23.2 from GitHub release/archive tarball tree-sitter-typescript-v0.23.2.tar.gz
+sha256 2c4ce711ae8d1218a3b2f899189298159d672870b5b34dff5d937bed2f3e8983
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+
+Local integration: normalized external_scanner_create(void) to match the generated parser/runtime callback prototype (UBSan function type).
+Local integration: pruned generator/build/package metadata and non-highlight queries; retained parser/scanner ABI headers, highlights.scm, LICENSE and this provenance.
+Local integration: retained required common/scanner.h; omitted TSX after compiled/link size measurement against the supplied total binary goal.

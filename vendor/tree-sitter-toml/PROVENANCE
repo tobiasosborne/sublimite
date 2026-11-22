@@ -1,0 +1,6 @@
+tree-sitter-toml v0.7.0 from GitHub release/archive tarball tree-sitter-toml-v0.7.0.tar.gz
+sha256 7d52a7d4884f307aabc872867c69084d94456d8afcdc63b0a73031a8b29036dc
+extracted 2026-10-13 without bindings/, test/, examples/, corpus/ (the worker prunes further to src/, queries/highlights.scm, LICENSE)
+
+Local integration: normalized external_scanner_create(void) to match the generated parser/runtime callback prototype (UBSan function type).
+Local integration: pruned generator/build/package metadata and non-highlight queries; retained parser/scanner ABI headers, highlights.scm, LICENSE and this provenance.
