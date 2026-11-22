@@ -30,7 +30,7 @@ import clex  # noqa: E402
 INTRA_RULES = [
     # L0 core
     "os < base < trace < work",
-    "os < ipc",
+    "base < ipc",  # amended: docs/decisions/wave0-plan-amendments.md
     # L1 text
     "scan,utf8 < piece < undo,lineidx,indent,find",
     # L2 persist
