@@ -92,3 +92,11 @@ PLAN_V2 §6 lists four known v1 bugs as expected-failure specs. At the pin `6fec
   between c95b6eb and 6fec2e8. It stays a spec only until a deciding unit probe proves it red on v1 (Wave 1, red first).
 - **Wayland clipboard copy: fixed** by `73beeb4` (parent of 6fec2e8). Moves to green-on-v1, mock-verified only;
   the real-compositor check is a Wave 2 gate item.
+
+## 8. What "green" means for the oracle's own make check (advisor, 2026-11-22)
+
+The oracle's `make check` is a box-health baseline, not the Wave 0 gate (the gate is the contract suite, PLAN_V2 §6).
+Green = the 120 sanitizer suites pass with **zero FLAKY lines on a quiet box**. Installer and desktop-integration
+scripts are outside it by name: `tools/test_install_omarchy.sh` (install / install-omarchy) and
+`tools/test_sublimite_win.sh` (WSL only). Runs export `EDITOR=true` (works around the v1 test bug in
+test_install_omarchy.sh line 177, worklog 2026-11-22) and say so in the stamp.
