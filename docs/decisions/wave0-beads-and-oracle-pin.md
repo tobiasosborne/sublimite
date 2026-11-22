@@ -68,3 +68,27 @@ X11's XShm raster stays in v2 and also covers XWayland.
 
 Push branch `v2` to `origin/v2` after each verified landing and at session end. Only `v2`; never push or move
 `main`. Fetch first; if `origin/v2` has moved, stop and tell the advisor.
+
+## 6. Oracle build recipe on the ThinkPad (gcc 13 / clang 18)
+
+`tests/wayland_test.c` (since `8b86245`) includes `<wayland-egl-backend.h>`, which this box does not have
+installed. No sudo: the matching package is unpacked into the oracle's own build tree.
+
+```
+cd <scratch> && apt-get download libwayland-egl-backend-dev        # 1.22.0-2.1build1, matches libwayland 1.22
+dpkg -x libwayland-egl-backend-dev_*.deb /home/tobias/Projects/sublimite-v1-oracle/build/sysroot
+cd /home/tobias/Projects/sublimite-v1-oracle && export CPATH=$PWD/build/sysroot/usr/include && make check
+```
+
+The Makefile does not ask pkg-config for it, so `PKG_CONFIG_PATH` is not needed. With this, all 120 sanitizer
+suites build. The oracle is "6fec2e8 + this header", nothing else.
+
+## 7. Correction to PLAN_V2 §6 expected-failure list (from M3, docs/decisions/wave0-known-bugs.md)
+
+PLAN_V2 §6 lists four known v1 bugs as expected-failure specs. At the pin `6fec2e8`:
+- **Post-rename save conflict: live** (`savectl_tick` installs the foreign BASE with `needs_finish` set). XFAIL spec.
+- **`LINEIDX_EDIT_MAX_CHUNKS` delete+undo above 32 MiB: live** (512 chunks × 64 KiB = 33,554,432 B (P), `plan_edit`). XFAIL spec.
+- **17-leaf piece root collapse: unconfirmed.** No v1 source, test, bead or review names it; `src/piece/` is unchanged
+  between c95b6eb and 6fec2e8. It stays a spec only until a deciding unit probe proves it red on v1 (Wave 1, red first).
+- **Wayland clipboard copy: fixed** by `73beeb4` (parent of 6fec2e8). Moves to green-on-v1, mock-verified only;
+  the real-compositor check is a Wave 2 gate item.
