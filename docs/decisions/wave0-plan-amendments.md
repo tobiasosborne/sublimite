@@ -35,3 +35,15 @@ ADD boundary is funded. Multiplying it by retained revisions proves nothing. The
 live revisions, their path/reserve classes and the boundary prepayment in `checkpoint_snapshot_storage`. Also, the
 plan's `session.c:142` reference names two different retainers at the pin (`publish`'s leaf holds `saved_snapshot`;
 `capture` holds `b->save_snapshot`), with different lifetimes.
+
+## A5. §2, §3, §4.1, §6: "pinned os_fault lease" becomes generation-validated fault ids, no pins
+
+PLAN_V2 asked for `os_fault_pin(slot, gen)` / `os_fault_unpin` + `os_fault_poll`. The Wave 1 spec
+(docs/decisions/wave1-os-fault-lease.md, revision 40ba37b, signed off by the advisor) delivers validated lock-free
+polling with no pins. Reason (Astra's answer to the advisor's question 1, by symbol at the pin): every production
+reader of registered document bytes either owns the backing or borrows from an owner through its last access, so a
+persistent pin count duplicates the backing refcount and prevents no further failure. Retire is owner-only at final
+backing release; an unexpected "still in use" there is a contract violation (ASSERT; release builds keep the mapping).
+Generation overflow: one comparison (ASSERT in debug, existing NOSPC in release) — the 584.5-year figure rests on an
+(E) rate, so it is not a physical bound. CLAUDE.md's globals line said "pinned `os_fault_service`", meaning the fixed
+global; reworded to "the fixed `os_fault_service` (... no pins)" so it cannot be read as the removed API.

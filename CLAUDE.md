@@ -30,7 +30,7 @@ v2 is a clean-slate rebuild on branch `v2`. v1 (`main`, `~/.local/bin/sublimite`
 ## Code conventions
 
 - C11, gcc 13 release, clang 18 sanitizers. One directory per module under `src/`, one public header, `snake_case`, `module_` prefix on every exported symbol.
-- Globals only where `docs/PLAN_V2.md` names them (trace ring, allocator hook, pinned `os_fault_service`). Anything else needs a `docs/decisions/` entry.
+- Globals only where `docs/PLAN_V2.md` names them (trace ring, allocator hook, the fixed `os_fault_service` (one process-wide fault registry; it has no pins)). Anything else needs a `docs/decisions/` entry.
 - Fixed-width types, `size_t` for sizes, byte offsets `uint64_t`.
 - Errors are return codes; no `abort()` outside `ASSERT`. No `printf` on the UI thread.
 - Threads: the UI thread owns the buffer; workers get snapshots. Shared state crosses only through `src/work` mailboxes.

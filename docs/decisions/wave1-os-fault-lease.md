@@ -140,3 +140,9 @@ Test the integration through its actual entry points. A bound index must become 
 * **Snapshot budget.** The 1,920 B per live-snapshot edit in `src/piece/piece.h` is the frozen G10f allowance (G, MEMORY BOUND). V1 `docs/decisions/P1.4e.md`, “Unresolved frozen contracts”, shows that deeper paths exceed it before private ADD boundary storage. A sufficient reserve must account for actual path/allocator classes, distinct retained revisions and `src/piece/piece.c:checkpoint_snapshot_storage`. `src/editor/session.c:publish` allocates a leaf at PLAN's cited line and retains `saved_snapshot`; `capture` retains the in-flight `save_snapshot`. Constant-time directory sharing is also a v2 target: `src/piece/piece.c:add_store_prefix` walks chunk pointers during `piece_checkpoint_begin` at the pin.
 
 VERDICT: Adopt one backing lifetime, generation-validated lock-free polling and one serialized handler drain. Remove persistent OS pins and BUSY retirement. Finalizer ownership violations assert and preserve the mapping in release builds.
+
+## Sign-off
+
+Advisor, 2026-11-22: signed off on revision 40ba37b, including (e) — the overflow comparison with ASSERT and the
+existing NOSPC is the correct form, since the 10^9/s rate was (E). Plan wording corrected in
+docs/decisions/wave0-plan-amendments.md A5. This file is the acceptance of the Wave 1 L0 lease bead.
