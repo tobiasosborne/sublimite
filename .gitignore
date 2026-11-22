@@ -1,0 +1,13 @@
+build/
+*.o
+*.d
+*.a
+.wt/
+*.log
+.DS_Store
+# editor swap / temp files
+*.swp
+*.swo
+*~
+.#*
+\#*#
