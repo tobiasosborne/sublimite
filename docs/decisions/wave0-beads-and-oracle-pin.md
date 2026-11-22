@@ -47,4 +47,24 @@ v1's checkout and `main` branch are unchanged by this. Consequences:
 - HANDOFF step 1 becomes `git checkout 6fec2e8 -- vendor/`.
 - PLAN_V2 line references were written against `c95b6eb`; each is re-resolved to a symbol at `6fec2e8`
   before it enters a bead (the M2–M4 dossiers do this).
-- The wl_shm raster at `6fec2e8` stays out of the MVP (PLAN_V2 §1) pending Tobias's call.
+- The wl_shm raster at `6fec2e8` is excluded (§4 below, Tobias).
+
+## 3. Hook check (advisor, 23:3x)
+
+Checked once, empirically: marker file, then commit `c0e9e2c` in the v2 worktree (hooks active via v1's
+`core.hookspath`), then `find /home/tobias/Projects/sublimite -newer marker` excluding `.git/` and `.wt/`:
+no file in v1's tree was written. The hooks act on the v2 database from the v2 cwd. No `core.hooksPath`
+override is needed; if a later hook run does write into v1, commit with `git -c core.hooksPath=/dev/null`.
+
+## 4. Exclusion from the 6fec2e8 baseline: Wayland wl_shm raster (Tobias, 2026-11-22)
+
+The wl_shm raster fallback in `6fec2e8` (commit `d84adf9`) is **not harvested** and stays out of the v2 MVP,
+as PLAN_V2 §1 says. Evidence: this laptop runs Cinnamon on X11 (`XDG_SESSION_TYPE=x11`, no `WAYLAND_DISPLAY`),
+and v1's `plat_backend_select` picks X11 whenever `DISPLAY` is set, so the fallback is unreachable here;
+X11's XShm raster stays in v2 and also covers XWayland.
+**Reopening condition:** a native-Wayland box on which EGL fails.
+
+## 5. Push policy (Tobias, 2026-11-22)
+
+Push branch `v2` to `origin/v2` after each verified landing and at session end. Only `v2`; never push or move
+`main`. Fetch first; if `origin/v2` has moved, stop and tell the advisor.
