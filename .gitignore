@@ -5,6 +5,8 @@ build/
 .wt/
 *.log
 .DS_Store
+__pycache__/
+*.pyc
 # editor swap / temp files
 *.swp
 *.swo
