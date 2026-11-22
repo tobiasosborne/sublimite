@@ -25,3 +25,13 @@ Two XFAIL specs remain: post-rename save conflict, `LINEIDX_EDIT_MAX_CHUNKS` del
 (512 × 64 KiB = 33,554,432 B (P)). Wayland clipboard copy is fixed in v1 by `73beeb4` and moves to green-on-v1,
 mock-verified only; the real-compositor check stays a Wave 2 gate item. See also
 docs/decisions/wave0-beads-and-oracle-pin.md §7.
+
+## A4. §4.1 snapshot prepayment: 1,920 B/edit is (G), not (P)
+
+From the lease specification (docs/decisions/wave1-os-fault-lease.md, "Plan corrections"): v1 `src/piece/piece.h`
+MEMORY BOUND gives 1,920 B per edit with a live snapshot as a G10f allowance (G, frozen v1 header), and v1
+`docs/decisions/P1.4e.md` ("Unresolved frozen contracts") shows a configured deeper path exceeds it before a private
+ADD boundary is funded. Multiplying it by retained revisions proves nothing. The pool is sized by counting distinct
+live revisions, their path/reserve classes and the boundary prepayment in `checkpoint_snapshot_storage`. Also, the
+plan's `session.c:142` reference names two different retainers at the pin (`publish`'s leaf holds `saved_snapshot`;
+`capture` holds `b->save_snapshot`), with different lifetimes.
