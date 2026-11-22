@@ -171,3 +171,34 @@ Proposed scopes for the coordinator. Each row is one bead owned by one worker. â
 At each later feature wave, the feature owner takes the corresponding ledger assertions as a separate scoped conversion bead once its public interface exists. W4 integrates those receipts and its seeded full R31 torture run. No time estimates or perf thresholds are inferred from this split.
 
 VERDICT: Build the ordered X11 inspector in Wave 0. Require the five named user regressions on the pinned oracle, witness X3 before recording the sole binary XFAIL, carry X1/X2 to deciding W1 probes, and verify the already mock-green Wayland clipboard on a real compositor in W2.
+
+## Advisor review (2026-11-22, approved with trims)
+
+Approved: the X ClientMessage fence on the driver's own connection (an EDIP reply does not order behind input),
+`--inspect-fds`, sealed memfd plus one fixed packet, containment rules, first failure is final, XFAIL/XPASS policy,
+no keyinject/refwin in the driver, Python stdlib runner plus one C XCB/XTest helper.
+
+Principle for the trims: the protocol is implemented twice (v1 patch now, v2 natively in Wave 2) and the v1 half
+is discarded at cutover. The wire format stays as designed (no re-versioning later); v1 implements less of it.
+
+- **T1.** No ARM and no first-action witness in the v1 patch. Implemented: SNAP and NEXT; ARM's code stays reserved
+  and answers INVALID. Frame count is 1. R2 moves to Wave 2 (native inspector). R1 keeps its gate place with the
+  settled frame only (its defect was a wrong settled view).
+- **T2.** No minimap decode in the v1 patch. The frame header gains a provided-sections word (cells, tabs, bottom
+  row, minimap); the v1 adapter does not set the minimap bit; a case that needs an unprovided section is an ERROR,
+  never a pass. R21, R12, R27 move to Wave 2.
+- **T3.** v1 text resolution: baked ASCII and known replacement artwork only; everything else is unresolved. No
+  font_async slot-key inversion. Gate fixtures are ASCII. If baked ASCII is not trivially invertible from the
+  submitted cell, the adapter worker stops and reports before writing an inversion.
+- **T4.** Required green on the oracle: R1, R3, R4, R5, R6 (PLAN_V2's five); X3 the sole XFAIL after its red witness;
+  controls: sandbox self-tests, wire conformance, stock-binary disk/clipboard control, below-boundary X3 twin,
+  pre-ACK and post-ACK SIGKILL recovery controls. R2, R7, R8, R10, R21, R30 enter with their ledger wave and are
+  calibrated on the oracle then; not half-run now.
+- **T5.** R4 stays in the gate as its own bead, last. Stop condition: if the pressure precondition (measured capacity C,
+  partial restore actually triggered) cannot be established deterministically in two attempts at the fixture design,
+  the worker stops with evidence and the advisor decides between a plan amendment and a different fixture. Ledger
+  note for v2: the case assumes a discoverable live-tab capacity refusal.
+
+Wave 0 beads: sandbox; X driver; inspect client; v1 adapter patch (report real line count against the 320 (E));
+navigation R1 + R6; files R3 + R5; crash-recovery controls; large_undo X3; runner and gate; R4 capacity (last).
+Order: sandbox, then driver and inspect client in parallel, then adapter, then the case beads in parallel worktrees.
