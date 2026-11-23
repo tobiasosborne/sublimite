@@ -23,3 +23,7 @@ FUZZ_SUITES += fuzz/work_fuzz.c
 # ipc (v2-0fv.6)
 TSAN_SUITES += tests/ipc_test.c
 FUZZ_SUITES += fuzz/ipc_fuzz.c
+
+# scan (v2-0fv.10)
+SAN_SUITES += tests/scan_test.c
+FUZZ_SUITES += fuzz/scan_fuzz.c
