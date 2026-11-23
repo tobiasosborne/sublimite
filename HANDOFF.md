@@ -43,7 +43,10 @@ os, base and fault ids land.
   Baseline: 120/120 sanitizer suites on a quiet box, one named v1 test race (pin decision §9).
 - Xvfb: explicit display only, `-noreset -nolisten tcp`; lanes were given disjoint ranges :120–:169.
 - PLAN_V2 is kept true by amendments A1–A5 (docs/decisions/wave0-plan-amendments.md).
-- Quota routing (advisor, 2026-11-23 noon): Codex weekly reset ~11:56; up to pace only (≈0.6 pt/h): Astra first, at most
+- Reading quota: when t3quota's AGE for a provider is older than your last dispatch on it, the row does not include that
+  dispatch: read the system `quota` tool instead (it also reports Muse).
+- Quota routing (advisor, 2026-11-23 12:42: Codex is reserved for Astra reviews — fault-id diff, Wave 0 whole-wave review,
+  piece/undo diffs; Sol writes no code unless Tobias relaxes the pace rule; code goes to Opus, two workers): Codex weekly reset ~11:56; up to pace only (≈0.6 pt/h): Astra first, at most
   one Sol lane when t3quota shows room > 0. New code beads go to Opus (≤ 2 workers, stop at Claude room 3). Muse one lane;
   Gemini prose only. L0 beads count as critical path under the battery plan.
 - Routing: Codex's cyber filter refused test-case beads that describe a defect or a process kill (v2-he7.7, .15, .14;
