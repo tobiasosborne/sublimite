@@ -49,6 +49,20 @@ def main() -> int:
             if resets and dur:
                 rt = datetime.datetime.fromisoformat(resets.replace("Z", "+00:00"))
                 left_min = (rt - now).total_seconds() / 60.0
+                if left_min < 0:
+                    # The window has reset since T3 Code last read it: "used" is
+                    # from the old window. Report the reset, claim no room.
+                    stale_min = -left_min
+                    rows.append({
+                        "provider": name, "window": w.get("label") or w.get("id"),
+                        "used": None, "delta": None, "room": None,
+                        "resets_in_min": None, "reset_ago_min": int(stale_min),
+                        # Pace of the new window if nothing was used since the
+                        # reset: an upper bound on room, not a reading.
+                        "pace_if_unused": round(100.0 * (stale_min % dur) / dur, 1),
+                        "age_s": age_s, "reset_credits": credits,
+                    })
+                    continue
                 delta = used - 100.0 * (1.0 - left_min / dur)
             rows.append({
                 "provider": name, "window": w.get("label") or w.get("id"),
@@ -68,6 +82,11 @@ def main() -> int:
             print(f"{r['provider']:<12} error: {r['error']}")
         elif r["window"] is None:
             print(f"{r['provider']:<12} no data in T3 Code's cache (ask the vendor CLI or Tobias)")
+        elif r.get("reset_ago_min") is not None:
+            m = r["reset_ago_min"]
+            age = "-" if r["age_s"] is None else f"{r['age_s']}s"
+            print(f"{r['provider']:<12} {r['window'][:34]:<34} stale: window reset {m // 60}h {m % 60}m ago; "
+                  f"room at most {r['pace_if_unused']:.1f} if unused since (reading {age} old)")
         else:
             d = r["delta"]
             pace = "-" if d is None else (f"{d:+.1f} ahead" if d > 0 else f"{-d:.1f} behind")
