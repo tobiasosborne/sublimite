@@ -47,8 +47,9 @@ Source pin `6fec2e8` (read-only oracle at
   used through os: `os_cwd`, `os_path_canonical`, `os_stat_path`,
   `os_path_is_absolute`, `os_file_read` (stdin), `os_now_ns`
   (deadlines), `os_sleep_ns` (lock/retry waits), `os_env_get`
-  (`XDG_RUNTIME_DIR`, `EDIT_IPC_NAMESPACE`, `EDIT_IPC_FALLBACK_DIR`,
-  `EDIT_IPC_TEST_PEER_UID`). os offers no socket, epoll, timerfd,
+  (`XDG_RUNTIME_DIR`, `EDIT_IPC_NAMESPACE`, `EDIT_IPC_FALLBACK_DIR`;
+  `EDIT_IPC_TEST_PEER_UID` was removed by v2-0fv.13, see below). os
+  offered no socket, epoll, timerfd,
   peer-credential or uid API, so those imports are granted to `ipc`
   in `tools/system-symbols.txt`, one line with a reason each — the
   mechanism `docs/decisions/v2-he7.22.md` defines ("a worker landing
@@ -71,10 +72,10 @@ Source pin `6fec2e8` (read-only oracle at
   (`OS_E_NOENT`) still selects the default; an overlong
   `XDG_RUNTIME_DIR`/`EDIT_IPC_FALLBACK_DIR` gives `IPC_INVALID`
   (v1: the same, via failing `open`); an overlong namespace gives
-  `IPC_LIMIT` (v1: the same, via the `snprintf` guard). One
-  test-hook-only narrowing: `EDIT_IPC_TEST_PEER_UID` is read into a
-  32-byte buffer, so a value longer than any uid spelling is ignored
-  instead of prefix-parsed by `strtoul`. No production path reads it.
+  `IPC_LIMIT` (v1: the same, via the `snprintf` guard).
+  *Superseded by v2-0fv.13:* the `EDIT_IPC_TEST_PEER_UID` hook is gone
+  from shipped code. Tests reach the peer-identity decision through a
+  link-time wrap of `os_stream_peer_uid` (`tests/ipc_peer_seam.h`).
 - **Test fixture lives under `build/`.** `tests/ipc_isolation.h`
   keeps v1's structure but mkdtemps `build/ipc-test-XXXXXX` under the
   absolute cwd (never `/tmp`, never real XDG) and derives the
@@ -188,14 +189,14 @@ descriptor accounting in main/editor), plus their harness
 
 ## Reported, not fixed
 
-- **os has no socket surface.** `socket/bind/listen/accept4/connect/
-  send/recv/getsockopt/epoll_*/timerfd_*/socketpair/getuid` and the
-  fd-identity operations on the pinned directory are granted to
-  `ipc` (list in `tools/system-symbols.txt`). If the coordinator
-  wants the seam closed, that is an os bead (socketpair + Unix
-  endpoints + poll set + uid), not an ipc rewrite. The restricted
-  fixture's expected diagnostic for `read` now reads
-  "granted only to ipc, os" (grant-list data, same rejection).
+- **os has no socket surface. Resolved by v2-0fv.13.** At this
+  bead, `socket/bind/listen/accept4/connect/send/recv/getsockopt/
+  epoll_*/timerfd_*/socketpair/getuid` and the fd-identity operations
+  on the pinned directory were granted to `ipc`. v2-0fv.13 added the
+  os local stream endpoint and the `os_waitset` wait primitive,
+  moved ipc onto them and deleted all 29 ipc grants. The restricted
+  fixture's expected diagnostic for `read` is back to "granted only
+  to os". See `docs/decisions/v2-0fv.13.md`.
 - **`edit-jmn` existing-file EMFILE** (v1 `src/ipc/STATUS.md`):
   root cause is per-file watcher allocation in v1 `src/file`;
   inherited L2 business, untouched here.

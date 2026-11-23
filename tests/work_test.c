@@ -9,6 +9,24 @@
 #include <unistd.h>
 
 static work_pool pool;
+
+/* The pool's wake through a one-member wait set, the one wait primitive
+ * (v2-0fv.13). Negative timeout: no deadline. Never drains. */
+static os_err wake_wait(const os_wake *w, int64_t timeout_ns)
+{
+    os_waitset ws = OS_WAITSET_INIT;
+    os_err e = os_waitset_init(&ws);
+    if (e == OS_OK) e = os_waitset_add(&ws, os_wake_fd(w), OS_WAIT_IN, 1);
+    if (e == OS_OK) {
+        os_wait_event ev;
+        size_t n = 0;
+        uint64_t deadline = timeout_ns < 0 ? OS_DEADLINE_NEVER : os_now_ns() + (uint64_t)timeout_ns;
+        e = os_waitset_wait(&ws, deadline, &ev, 1, &n);
+        if (e == OS_OK && n == 0) e = OS_E_TIMEDOUT;
+    }
+    os_waitset_close(&ws);
+    return e;
+}
 static _Atomic int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: FAIL %s\n", __FILE__, __LINE__, #c); atomic_fetch_add(&fails, 1); } } while (0)
 
@@ -372,7 +390,7 @@ static void test_slice(void)
     size_t n = work_mailbox_drain(&pool, slow_collect, &c);
     /* Descheduling before the first callback can also exhaust the slice. */
     CHECK(n <= 1 && n == c.n && work_mailbox_pending(&pool));
-    CHECK(os_wake_wait(work_pool_wake(&pool), 0) == OS_OK);
+    CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     while (c.n < f.n) {
         size_t got = work_mailbox_drain_bounded(&pool, collect, &c, WORK_DRAIN_MAX_MESSAGES, 0);
         if (!got) { CHECK(false); break; }
@@ -463,13 +481,13 @@ static void test_budget_controls(void)
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 1) == 0);
     CHECK(work_mailbox_pending(&pool));
 
-    CHECK(os_wake_wait(work_pool_wake(&pool), 0) == OS_OK);
+    CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 11);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 22);
     work_cancel(&pool, b);
     CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 0);
     CHECK(atomic_load(&pool.slots[b.slot].pending) == WORK_MAILBOX_CAP - 2u);
-    CHECK(os_wake_wait(work_pool_wake(&pool), 0) == OS_OK);
+    CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     work_pool_shutdown(&pool);
     /* Dropping stale messages after shutdown must still release reservations. */
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
@@ -555,7 +573,7 @@ static void test_live_ordering(void)
     while (c.total < 3u * fixtures[0].n && os_now_ns() < end && atomic_load(&fails) == before) {
         (void)work_mailbox_drain(&pool, stream_collect, &c);
         if (!work_mailbox_pending(&pool))
-            (void)os_wake_wait(work_pool_wake(&pool), 10000000);
+            (void)wake_wait(work_pool_wake(&pool), 10000000);
     }
     CHECK(c.total == 3u * fixtures[0].n);
     for (size_t i = 0; i < 3; i++) CHECK(c.next[i] == fixtures[i].n);
@@ -952,7 +970,7 @@ static void test_receive_slices(void)
     CHECK(atomic_load(&pool.mb[0].head) == origin); /* foreign head still owns capacity */
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 129);
 
-    CHECK(os_wake_wait(work_pool_wake(&pool), 0) == OS_OK);
+    CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     collection others = {0};
     while (work_mailbox_pending(&pool))
         (void)work_mailbox_drain_bounded(&pool, collect, &others, 1, 0);
@@ -1220,7 +1238,7 @@ static void test_foreground_progress(void)
     work_handle fg = work_submit(&pool, (work_job){job_foreground_reply, NULL, 84, WORK_FOREGROUND});
     CHECK(fg.epoch);
     /* v1 foreground fixture watchdog bounds the wait for one publication. */
-    CHECK(os_wake_wait(work_pool_wake(&pool), 2000000000) == OS_OK);
+    CHECK(wake_wait(work_pool_wake(&pool), 2000000000) == OS_OK);
     selective_collection seen = {.h = fg, .generation = 84};
     CHECK(work_mailbox_receive_bounded(&pool, fg, 84, collect_selected, &seen, WORK_MAILBOX_CAP, 0) == 1);
     CHECK(seen.n == 1 && !work_handle_finished(&pool, bulk));

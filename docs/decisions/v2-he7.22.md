@@ -18,8 +18,9 @@ of these conditions:
 Anything else fails. A system symbol granted only to other modules fails
 as `[restricted]`. A symbol with no entry fails as `[unknown]`. Kernel
 entry and process-global state are reachable only by direct import from
-modules with grants. In the current tree those modules are `os` and the
-reported `hl` exception below.
+modules with grants. In the current tree those modules are `os`, `base`
+(the allocation interposer and CPU detection, v2-0fv.3) and the reported `hl`
+exception below.
 
 ## Format
 
@@ -76,15 +77,18 @@ library's own kernel entry runs on x11's behalf.
 ## Counts (M)
 
 Measured with `grep -v '^#' tools/system-symbols.txt | awk 'NF{print $2}' | sort | uniq -c`.
-The symbol set matches the previous global list: 107 symbols, and a
-`diff` of the sorted names is empty.
+When this bead landed, the symbol set matched the previous global list (107 symbols,
+an empty `diff` of the sorted names). Later beads changed the lines as shown below.
+Current counts are re-measured at the v2-0fv.13 send-back.
 
-| Scope | Lines |
-|---|---|
-| `*` | 18 |
-| `os` | 75 |
-| `hl` | 15 |
-| **Total** | 108 lines, 107 symbols. `fdopen` has both an `os` and an `hl` line. |
+| Scope | At he7.22 | Now | Changed by |
+|---|---|---|---|
+| `*` | 18 | 21 | v2-0fv.6 added `__memcpy_chk`, `strnlen` and `strrchr` |
+| `os` | 75 | 93 | v2-0fv.13 added 16 stream and wait-set imports; v2-0fv.2 added 10 fault-service imports (`abort gettid raise sem_destroy sem_init sem_post sem_wait sigaction sigemptyset syscall`); the v2-0fv.13 send-back removed 8 process and poll imports (`environ kill poll posix_spawn posix_spawn_file_actions_{init,destroy,addclosefrom_np} waitpid`) |
+| `hl` | 15 | 15 | |
+| `base` | — | 5 | v2-0fv.3 (allocator interposer, CPU detection) |
+| `ipc` | — | 0 | v2-0fv.6 added 29 grants; v2-0fv.13 deleted them, so ipc makes no kernel call |
+| **Total** | 108 lines, 107 symbols | 134 lines, 132 symbols | `fdopen` (os, hl) and `abort` (os, hl) each have two lines |
 
 ## Current violation (reported, granted as found)
 
@@ -111,7 +115,7 @@ to `hl` with reasons. Two consequences need a decision:
   vendor's heap, stdio and `dup` grants. A separate pseudo-module for the
   vendored objects in the he7.18 module map would close that gap.
 
-No other non-os module imports a restricted symbol. `piece` imports
+Apart from `base` (above), no other non-os module imports a restricted symbol. `piece` imports
 `strlen`, which is `*`. `edit`, `render`, `viewport`, `app` and `main`
 import only project symbols.
 

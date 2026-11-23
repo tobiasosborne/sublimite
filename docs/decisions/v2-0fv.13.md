@@ -84,8 +84,8 @@ launcher parent, never in the UI loop. The minimal-L5 bead turns this into a tes
     its peers' deadlines, as v1 did, and L5 has one next deadline by PLAN §4.7. Separate
     timers add a type, a registration and an acknowledgement call per client, plus a way
     to forget the acknowledgement, which leaves a timer reported forever (red run 7).
-- **Absolute deadlines (ns), with `NEVER` = UINT64_MAX**, unlike the relative
-  `os_wake_wait` and `os_proc_wait` timeouts. *Counter-example to relative:* a wait
+- **Absolute deadlines (ns), with `NEVER` = UINT64_MAX**, unlike the relative timeouts
+  of `os_wake_wait` and `os_proc_wait`, which the send-back round deleted. *Counter-example to relative:* a wait
   restarted after EINTR or a stale alarm must recompute the time left from a fixed point.
   The L5 loop also derives an absolute next deadline. Here 0 simply means "already past",
   so polling needs no special value, and `alarm(NEVER)` disarms with the same constant.
@@ -108,10 +108,10 @@ launcher parent, never in the UI loop. The minimal-L5 bead turns this into a tes
   `fchmod` on an `O_PATH` fd is `EBADF`, so the `/proc/self/fd` path is the way to change
   the mode of a pinned inode.
 - **Peer credentials live in os as a primitive (`os_stream_peer_uid`). The ownership
-  policy (which uid, the abstract-namespace test hook, the squatter fallback) stays in
-  ipc.** *Counter-example to moving the policy down:* the test hook
-  `EDIT_IPC_TEST_PEER_UID` and the fallback directory are ipc's endpoint policy, and
-  `os` must not read app environment variables on a client's behalf.
+  policy (the peer must be our uid, plus the squatter fallback) stays in ipc.**
+  *Counter-example to moving the policy down:* the fallback directory is ipc's endpoint
+  policy, and `os` must not choose endpoints on a client's behalf. The policy has no
+  override in shipped code (send-back round, below).
 - **`os_stream_adopt` owns the fd on every result.** *Counter-example to "on failure the
   fd stays the caller's":* `ipc_launcher_wait` must always consume its fd, and with only
   that contract ipc would need its own `close` import to do it. With unconditional
@@ -145,12 +145,12 @@ launcher parent, never in the UI loop. The minimal-L5 bead turns this into a tes
   at the deadline is still read. Both are visible only in races.
 - The `ipc_launcher_pair` ends are now nonblocking. The `--wait` launcher waits through
   its own one-member set. The header documents this.
-- `EDIT_IPC_TEST_PEER_UID` is parsed as leading decimal digits that wrap at 32 bits.
-  This narrows the test hook: no whitespace or sign prefix. No production path reads it.
+- The send-back round removed `EDIT_IPC_TEST_PEER_UID` (below).
 
 ## Grants (M)
 
-Counted with `grep -v '^#' tools/system-symbols.txt | awk 'NF{print $2}' | sort | uniq -c`:
+These are the counts at the first landing. The send-back section below has the current
+ones. Counted with `grep -v '^#' tools/system-symbols.txt | awk 'NF{print $2}' | sort | uniq -c`:
 
 | Scope | Before | After |
 |---|---|---|
@@ -218,15 +218,113 @@ binary. Its wraps are `OS_ENDPOINT_TEST_WRAPS` in the Makefile. It is not in TSa
 it starts no threads. The Law-1 fuzz exemption of v2-0fv.1 still holds, because the
 endpoint layer parses nothing.
 
-## Left for other beads (reported, not done)
+## Send-back round (advisor, after landing as fcb1f9c)
 
-- **Minimal L5:** make the invariant executable. Ideally the loop is the only UI-thread
-  caller of `os_waitset_wait` with a nonzero deadline. A wrap-counting test in the loop
-  suite would assert that one step reaches `epoll_wait` with a nonzero timeout exactly
-  once, and only from the root set.
-- **`os_wake_wait` / `os_proc_wait`** are still separate poll-based waits. Today neither
-  has a caller outside os (`work.h` only mentions `os_wake_wait`). The UI loop must
-  register `os_wake_fd` in its root set instead. Whether to delete `os_wake_wait` is a
-  call for the wave-end deletion review.
-- `docs/decisions/v2-he7.22.md`'s counts table and v2-0fv.6's "Reported, not fixed: os has
-  no socket surface" are superseded by this file. Neither was edited here.
+The advisor raised three items that round 1 had left as notes. Notes are not tracking
+(Law 7), so all three are now done.
+
+### 1. One wait primitive: `os_wake_wait` and child processes deleted
+
+No landed module and no filed bead calls `os_wake_wait`, `os_proc_spawn`,
+`os_proc_kill` or `os_proc_wait`. Callers before this round:
+
+- `os_wake_wait`: `tests/os_test.c`, `tests/work_test.c` and `bench/work_bench.c`.
+- The process calls: `tests/os_test.c` and the landed `tests/os_fault_test.c`.
+- `work.h` named `os_wake_wait` only in a comment.
+
+The process calls all go, because spawn and kill without a reaper would leave a
+zombie-producing API with no client. The process types (`os_proc`,
+`os_proc_how`, `os_proc_status`) go with them. `os_proc_id` and `os_proc_self_path`
+stay, because they are not waits and are outside this round's scope. No module outside os
+calls them either: only the os suites do, and the fault suite needs the second to re-exec
+itself. That is reported below for the deletion review.
+
+The bead that needs one of these adds it together with its client. Candidates:
+
+- Wave 2 font discovery.
+- The minimal-L5 bead's `--wait` launcher `fork`. `ipc.h` documents that main forks.
+- Its subprocess tests of the built binary (wave1-L0-harvest.md §5.3). Those can spawn
+  from the test, as the os suites now do.
+
+Where each former caller went:
+
+| Former caller | Now |
+|---|---|
+| `work_test.c` (6 calls) | Its own `wake_wait`: a one-member `os_waitset` over `os_wake_fd(work_pool_wake(..))`. |
+| `work_bench.c` (3 calls) | The same wait, but on one set kept for the bench's lifetime, so the foreground sample does not include creating a set. |
+| `os_test.c` `case_wake` | Checks the same contract through the wait set: starts clear, finite wait lasts its timeout, signals coalesce, waiting does not drain, one drain clears, another thread wakes a blocked waiter, a closed wake is refused (`OS_E_INVAL` on add). |
+| `os_test.c` `case_proc` | Keeps self-path, process id, "a lock dies with its holder" and the descriptor-limit raise. The children are forked by the harness. The exit-code, kill, timeout, argv-bytes and descriptor-inheritance cases tested the deleted spawn and went with it. |
+| `os_fault_test.c` | Spawns its case children with `posix_spawn` and `addclosefrom_np(3)` in the test, which is the same environment `os_proc_spawn` gave. |
+| `work.h` | Now says: add `os_wake_fd` to your `os_waitset`. |
+
+Neither work nor ipc ever called `os_wake_wait`. The L5 loop gets the pool's wake through
+its root set.
+
+**Grants:** os falls from 101 to 93 on the current tree. It was 91 at fcb1f9c, then
+v2-0fv.2's fault service added 10. The 8 grants removed are `environ kill poll
+posix_spawn posix_spawn_file_actions_{init,destroy,addclosefrom_np} waitpid`. `nm -u
+-P` of the release `os_posix.o` imports none of them, and no grant is left without a
+matching import. `os` now imports no `poll`.
+
+### 2. `EDIT_IPC_TEST_PEER_UID` removed from shipped code; test-only seam
+
+`own_peer` is now `os_stream_peer_uid(s) == os_user_id()` on every endpoint, with no
+environment read. The tests reach that decision through a link-time seam:
+
+- `tests/ipc_peer_seam.h` defines `__wrap_os_stream_peer_uid`.
+- The Makefile adds `-Wl,--wrap=os_stream_peer_uid` (`IPC_PEER_SEAM`) only to the
+  `ipc_test` links (rel, san, tsan) and to `ipc_fuzz`.
+- While `ipc_seam_foreign_abstract` is set, a stream whose endpoint is an abstract name
+  reports uid + 1. The wrap identifies that from its own `getpeername` and `getsockname`.
+
+This keeps the old hook's abstract-only scope, so the squatter case still falls back to
+the private directory. No `EDIT_*` name was added.
+
+Shipped-code evidence (`build/os-endpoint-evidence/r2-shipped.log`):
+
+```text
+strings -a <f> | grep -c PEER_UID
+  build/rel/src/ipc/{args,ipc_posix,result,wire}.o: 0   build/rel/libcore.a: 0   build/sublimite-v2: 0
+nm -u -P build/rel/src/ipc/ipc_posix.o  (non-project)   memcpy __memcpy_chk __stack_chk_fail strlen
+nm build/sublimite-v2 | grep -c '__wrap_\|__real_'     0
+nm build/rel/tests/ipc_test                             T __wrap_os_stream_peer_uid
+```
+
+`build/sublimite-v2` does not link ipc yet, because the minimal L5 does not exist, so
+the object and `libcore.a` lines are the ones that decide. Two `EDIT_IPC_*` strings
+remain in `ipc_posix.o`. `EDIT_IPC_NAMESPACE` changes only the abstract name.
+`EDIT_IPC_FALLBACK_DIR` changes only where the fallback endpoint lives. Neither one
+changes whom the server accepts. Both were reported to the coordinator for triage and
+were not changed here.
+
+Red and green:
+
+| Run | Build | Result |
+|---|---|---|
+| Red, shipped read removed first | The old test, still setting the env var | `client foreign-server rc=6` / `FAIL tests/ipc_test.c:525: rc==IPC_REJECTED`, exit 1 |
+| Red, seam forced foreign | Client accepts any uid (`own_peer` without `uid==os_user_id()`) | `FAIL tests/ipc_test.c:525: rc==IPC_REJECTED`, exit 1 |
+| Red, seam forced foreign | Server accept skips `own_peer` | `FAIL tests/ipc_test.c:529: WIFEXITED(st) && WEXITSTATUS(st)==0` (the foreign client got an answer), exit 1 |
+| Green | Current tree: `build/san/tests/ipc_test foreign_cred` and the full suite | exit 0 |
+
+The two seam reds are build-local copies of `ipc_posix.c` linked against
+`build/rel/tests/ipc_test.o` and `libcore.a`, with the wrap. The fuzzer's foreign
+part 4 uses the same seam.
+
+### 3. Stale decision files corrected
+
+- `v2-he7.22.md`: the counts table now has the at-landing and current columns, with the
+  changing bead per row. The kernel-granted module list now names `base`.
+- `v2-0fv.6.md`: "os has no socket surface" is marked resolved by this bead, and the
+  peer-uid hook text is marked superseded.
+- Also corrected, in the same spirit:
+  - `v2-0fv.5.md` pointed clients at `os_wake_wait`.
+  - `v2-0fv.1.md` gained an amendment note for the deleted process and wake-wait rows.
+
+## Reported for the coordinator (not done here; to file or triage)
+
+- **Minimal-L5 acceptance line:** one `app_step` reaches a blocking wait exactly once,
+  and only on the root set. Test it by wrapping `epoll_wait` in the loop suite and
+  counting nonzero timeouts.
+- **Shipped env hooks** `EDIT_IPC_NAMESPACE` and `EDIT_IPC_FALLBACK_DIR` (above).
+- **`os_proc_id` and `os_proc_self_path`** have no caller outside os (wave-end deletion
+  review).

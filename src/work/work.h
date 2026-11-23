@@ -145,8 +145,8 @@ int  work_pool_init_foreground(work_pool *p, uint32_t n_bulk, uint32_t n_raster)
  * caller-owned, including dropped jobs. Undrained messages remain reserved
  * until drained (and are stale); drain is allowed after shutdown. */
 void work_pool_shutdown(work_pool *p);
-/* Borrowed wake object, NULL while inactive. Platform loops use its native
- * accessor; ordinary clients can use os_wake_wait. Never drain it separately
+/* Borrowed wake object, NULL while inactive. The owner adds os_wake_fd to its
+ * os_waitset (the one wait primitive, v2-0fv.13). Never drain it separately
  * from the mailbox protocol. */
 const os_wake *work_pool_wake(const work_pool *p);
 /* os_thread_self identity for ownership diagnostics; zero before that worker

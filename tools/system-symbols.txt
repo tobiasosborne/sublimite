@@ -50,7 +50,6 @@ clock_gettime          os # POSIX clock read
 close                  os # release a file descriptor
 closedir               os # release a directory stream
 connect                os # connect a local stream endpoint
-environ                os # glibc process environment
 epoll_create1          os # wait set (the one wait primitive)
 epoll_ctl              os # add, modify and remove wait set members
 epoll_wait             os # wait set readiness with a deadline
@@ -76,7 +75,6 @@ getsockopt             os # SO_PEERCRED peer user ID of a local stream
 getuid                 os # real user ID for endpoint names and ownership checks
 gettid                 os # calling thread ID for the fault test trigger
 ioctl                  os # Linux FICLONE reflink request
-kill                   os # send a signal to a child process
 listen                 os # listen on a bound local stream endpoint
 lstat                  os # path metadata without following the final symlink
 madvise                os # Linux mapping advice
@@ -86,11 +84,6 @@ mmap                   os # create an address space mapping
 munmap                 os # release an address space mapping
 nanosleep              os # relative monotonic sleep
 openat                 os # path or directory-relative descriptor open
-poll                   os # wait for descriptor readiness
-posix_spawn            os # launch a process with explicit file actions
-posix_spawn_file_actions_addclosefrom_np os # glibc child descriptor inheritance control
-posix_spawn_file_actions_destroy os # release spawn file actions
-posix_spawn_file_actions_init os # initialize spawn file actions
 pread                  os # positioned file read
 pthread_cond_broadcast os # wake all condition waiters
 pthread_cond_destroy   os # release a condition variable
@@ -138,7 +131,6 @@ syscall                os # rt_tgsigqueueinfo for the fault test trigger
 unlink                 os # remove a non-directory name
 unlinkat               os # directory-relative name removal
 unsetenv               os # remove a process environment variable
-waitpid                os # wait for and reap a child process
 write                  os # sequential write or eventfd signal
 
 # hl: the vendored tree-sitter runtime (lib.o) and grammar scanners. Upstream

@@ -1,5 +1,11 @@
 # v2-0fv.1 · Linux OS boundary
 
+> Amended by v2-0fv.13. That bead added local streams and `os_waitset`, the one
+> wait primitive. It removed `os_wake_wait` and child processes
+> (`os_proc_spawn`, `os_proc_kill`, `os_proc_wait`, `os_proc_status`), because
+> no module called them. The process rows and the poll-based wake wait below
+> describe that earlier state.
+
 Harvested from the read-only v1 oracle at `6fec2e8`. L0 `os` has one public
 header, one Linux implementation and zero dependencies on other editor modules.
 

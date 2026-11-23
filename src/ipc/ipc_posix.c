@@ -54,22 +54,13 @@ static uint64_t milliseconds(void)
 {
     return os_now_ns()/NS_PER_MS;
 }
-/* Leading decimal digits, wrapping at 32 bits as (uid_t)strtoul did; test
- * hook only, so no sign or whitespace prefix. */
-static uint32_t parse_uid(const char *h)
+/* Peer credentials: a peer must run as our uid, on every endpoint. Tests
+ * model a foreign peer by wrapping os_stream_peer_uid in their own link
+ * (tests/ipc_peer_seam.h); the shipped code has no override. */
+static bool own_peer(const os_stream *s)
 {
-    uint32_t v=0;
-    for(; *h>='0' && *h<='9'; h++) v=v*10u+(uint32_t)(*h-'0');
-    return v;
-}
-/* Peer credentials. EDIT_IPC_TEST_PEER_UID is a test hook for the abstract
- * namespace only: it names the uid a peer must have, so tests can model a
- * foreign squatter without a second user. Filesystem endpoints ignore it. */
-static bool own_peer(const os_stream *s, bool abstract)
-{
-    uint32_t want=os_user_id(), uid=0;
-    if(abstract) { char h[32]; if(os_env_get("EDIT_IPC_TEST_PEER_UID",h,sizeof h)==OS_OK && h[0]) want=parse_uid(h); }
-    return os_stream_peer_uid(s,&uid)==OS_OK && uid==want;
+    uint32_t uid=0;
+    return os_stream_peer_uid(s,&uid)==OS_OK && uid==os_user_id();
 }
 static void ep_close(endpoint *ep)
 {
@@ -165,11 +156,11 @@ static ipc_result ready(conn *c, unsigned interest, uint64_t deadline)
     return n?IPC_OK:IPC_TIMEOUT;
 }
 /* *why keeps the os outcome: OS_E_REFUSED marks a stale filesystem socket. */
-static ipc_result connect_socket(const os_dir *dir, const char *name, bool abstract, os_stream *out, os_err *why)
+static ipc_result connect_socket(const os_dir *dir, const char *name, os_stream *out, os_err *why)
 {
     *why=os_connect_local(out,dir,name);
     if(*why!=OS_OK) return IPC_IO;
-    if(!own_peer(out,abstract)) { os_stream_close(out); return IPC_REJECTED; }
+    if(!own_peer(out)) { os_stream_close(out); return IPC_REJECTED; }
     return IPC_OK;
 }
 static ipc_result transfer(conn *c, uint8_t *bytes, size_t n, bool sending, uint64_t deadline)
@@ -198,7 +189,7 @@ static ipc_result receive_reply(conn *c, char kind, uint64_t deadline)
 static ipc_result deliver(const endpoint *ep, uint8_t *wire, size_t n, bool wait, uint64_t deadline)
 {
     conn c={OS_STREAM_INIT,OS_WAITSET_INIT}; os_err why;
-    ipc_result rc=connect_socket(ep_dir(ep),ep->name,ep->abstract,&c.s,&why);
+    ipc_result rc=connect_socket(ep_dir(ep),ep->name,&c.s,&why);
     if(rc==IPC_OK) rc=conn_watch(&c);
     if(rc==IPC_OK) rc=transfer(&c,wire,n,true,deadline);
     if(rc==IPC_OK) rc=receive_reply(&c,'A',deadline);
@@ -408,7 +399,7 @@ ipc_result ipc_server_drain(ipc_server *s, ipc_open_callback callback, void *ctx
                     if(e!=OS_OK) return IPC_IO;
                     b.accepts--;
                     struct ipc_peer *p=take_slot(s,b.now);
-                    if(p==NULL || !own_peer(&c,!s->owns_path) || s->next_token==UINT64_MAX) { os_stream_close(&c); continue; }
+                    if(p==NULL || !own_peer(&c) || s->next_token==UINT64_MAX) { os_stream_close(&c); continue; }
                     p->stream=c; p->token=++s->next_token; p->accepted_ms=p->active_ms=b.now;
                     if(os_waitset_add(&s->set,os_stream_fd(&p->stream),OS_WAIT_IN,p->token)!=OS_OK) { drop_peer(s,p); continue; }
                     process_peer(s,p,callback,ctx,&b);
@@ -505,7 +496,7 @@ static ipc_result start_endpoint(ipc_server *s, endpoint *ep, bool *foreign)
         e=os_stat_at(&s->dir,ep->name,OS_STAT_NOFOLLOW,&st);
         if(e==OS_OK) {
             if(st.kind!=OS_KIND_SOCKET || st.uid!=os_user_id()) { rc=IPC_INVALID; goto done; }
-            os_stream probe=OS_STREAM_INIT; rc=connect_socket(dir,ep->name,false,&probe,&why);
+            os_stream probe=OS_STREAM_INIT; rc=connect_socket(dir,ep->name,&probe,&why);
             if(rc==IPC_OK) { os_stream_close(&probe); rc=IPC_EXISTS; goto done; }
             if(rc!=IPC_IO || why!=OS_E_REFUSED) { rc=IPC_EXISTS; goto done; }
             if(os_unlink_at(&s->dir,ep->name)!=OS_OK) { rc=IPC_IO; goto done; }
@@ -518,7 +509,7 @@ static ipc_result start_endpoint(ipc_server *s, endpoint *ep, bool *foreign)
         if(e!=OS_E_EXIST) { rc=IPC_IO; goto done; }
         rc=IPC_EXISTS;
         if(ep->abstract) for(int attempt=0;attempt<3;attempt++) {
-            os_stream probe=OS_STREAM_INIT; ipc_result pr=connect_socket(NULL,ep->name,true,&probe,&why);
+            os_stream probe=OS_STREAM_INIT; ipc_result pr=connect_socket(NULL,ep->name,&probe,&why);
             if(pr==IPC_OK) { os_stream_close(&probe); break; }                          /* ours: a live incumbent */
             if(pr==IPC_REJECTED) { *foreign=true; break; }                               /* another uid */
             if(why!=OS_E_REFUSED) break;

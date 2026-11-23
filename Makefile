@@ -180,6 +180,10 @@ LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sigaction,--wrap=sysconf,--wrap=
 # Test-hook objects (A15 generation setter) only for the fault suites.
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/os_fault_test: $(B)/$(c)/src/os/os_posix_test_hooks.o))
 $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
+# ipc's peer-identity decision is reached through a test-only link seam
+# (tests/ipc_peer_seam.h); the shipped binary has no override (v2-0fv.13).
+IPC_PEER_SEAM := -Wl,--wrap=os_stream_peer_uid
+$(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_PEER_SEAM)
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))

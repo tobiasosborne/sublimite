@@ -1,6 +1,7 @@
 /* Linux conformance tests for the OS boundary. */
 #include "os/os.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void check(bool ok, const char *expression, int line)
@@ -336,31 +338,47 @@ static void wake_later(void *arg)
     os_wake_signal(c->w);
 }
 
+/* The owner waits for a wake through a one-member wait set (v2-0fv.13). */
+static bool wake_ready(os_waitset *ws, uint64_t deadline)
+{
+    os_wait_event ev;
+    size_t n = 0;
+    OK(os_waitset_wait(ws, deadline, &ev, 1, &n));
+    CHECK(n == 0 || (ev.tag == 1 && ev.events == OS_WAIT_IN));
+    return n == 1;
+}
+
 static void case_wake(void)
 {
     os_wake w;
     OK(os_wake_init(&w));
-    EXPECT(os_wake_wait(&w, 0), OS_E_TIMEDOUT);           /* starts clear */
+    os_waitset ws = OS_WAITSET_INIT;
+    OK(os_waitset_init(&ws));
+    OK(os_waitset_add(&ws, os_wake_fd(&w), OS_WAIT_IN, 1));
+    CHECK(!wake_ready(&ws, 0));                           /* starts clear */
     uint64_t t0 = os_now_ns();
-    EXPECT(os_wake_wait(&w, MS), OS_E_TIMEDOUT);
-    CHECK(os_now_ns() - t0 >= MS);                    /* waited the timeout */
+    CHECK(!wake_ready(&ws, t0 + MS));
+    CHECK(os_now_ns() - t0 >= MS);                        /* waited the timeout */
     os_wake_signal(&w);
     os_wake_signal(&w);                                   /* coalesces */
-    OK(os_wake_wait(&w, 0));
-    OK(os_wake_wait(&w, 0));                              /* wait does not drain */
+    CHECK(wake_ready(&ws, 0));
+    CHECK(wake_ready(&ws, 0));                            /* waiting does not drain */
     os_wake_drain(&w);
-    EXPECT(os_wake_wait(&w, 0), OS_E_TIMEDOUT);           /* one drain clears all */
+    CHECK(!wake_ready(&ws, 0));                           /* one drain clears all */
     os_wake_drain(&w);                                    /* drain when clear: no-op */
-    EXPECT(os_wake_wait(&w, 0), OS_E_TIMEDOUT);
+    CHECK(!wake_ready(&ws, 0));
     /* Another thread wakes a blocked waiter. */
     wake_ctx c = {&w, MS}; /* Delay to exercise the wait or a pending signal. */
     os_thread t;
     OK(os_thread_start(&t, wake_later, &c));
-    OK(os_wake_wait(&w, -1));
+    CHECK(wake_ready(&ws, OS_DEADLINE_NEVER));
     OK(os_thread_join(&t));
     os_wake_drain(&w);
+    os_waitset_remove(&ws, os_wake_fd(&w));
     os_wake_close(&w);
-    EXPECT(os_wake_wait(&w, 0), OS_E_INVAL);
+    CHECK(os_wake_fd(&w) == -1);
+    EXPECT(os_waitset_add(&ws, os_wake_fd(&w), OS_WAIT_IN, 1), OS_E_INVAL); /* a closed wake */
+    os_waitset_close(&ws);
 }
 
 /* ---- file handles ------------------------------------------------------- */
@@ -1129,86 +1147,57 @@ static void case_paths(void)
     os_dir_close(&dir);
 }
 
-/* ---- processes ---------------------------------------------------------- */
-/* Arguments that must arrive byte for byte in the child. */
-static const char *const tricky_args[] = {
-    "",
-    "two words",
-    "quote\"inside",
-    "trailing\\",
-    "trailing two\\\\",
-    "back\\\"slash quote",
-    " lead and trail ",
-    "tab\there",
-    ("gr\xc3\xbc\xc3\x9f" "e-\xce\xa9-\xe6\x97\xa5\xe6\x9c\xac-\xf0\x9f\x99\x82"),
-};
-enum { TRICKY = sizeof tricky_args / sizeof tricky_args[0] };
-
-static int run_child(const char *role, int argc, char **argv)
+/* ---- process identity ------------------------------------------------- */
+/* os spawns no processes since v2-0fv.13, so the harness forks: the child runs
+ * one role and exits with its result. */
+static pid_t fork_role(int (*role)(const char *), const char *arg)
 {
-    /* Bound child lifetime even when a failed parent case exits early. */
-    alarm(CASE_GUARD_SECONDS);
-    const char *arg = argc >= 3 ? argv[2] : "";
-    if (strcmp(role, "exit7") == 0) return 7;
-    if (strcmp(role, "sleep") == 0) {
-        for (;;) os_sleep_ns(1000 * MS);
+    fflush(NULL);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        /* Bound child lifetime even when a failed parent case exits early. */
+        alarm(CASE_GUARD_SECONDS);
+        _exit(role(arg));
     }
-    if (strcmp(role, "lock") == 0) {
-        /* Takes an exclusive lock on arg, then sleeps until killed. */
-        os_file f = OS_FILE_INIT;
-        if (os_file_open(&f, arg, OS_OPEN_RDWR) != OS_OK) return 2;
-        uint64_t guard = os_now_ns() + HANG_GUARD_NS;
-        while (os_file_try_lock(&f, OS_LOCK_EXCLUSIVE) != OS_OK) {
-            if (os_now_ns() > guard) return 3;
-            os_sleep_ns(MS);
-        }
-        for (;;) os_sleep_ns(1000 * MS);
+    return pid;
+}
+static int reap(pid_t pid)
+{
+    int status = 0;
+    pid_t r;
+    do r = waitpid(pid, &status, 0); while (r < 0 && errno == EINTR);
+    CHECK(r == pid);
+    return status;
+}
+/* Takes an exclusive lock on arg, then sleeps until killed. */
+static int role_lock(const char *arg)
+{
+    os_file f = OS_FILE_INIT;
+    if (os_file_open(&f, arg, OS_OPEN_RDWR) != OS_OK) return 2;
+    uint64_t guard = os_now_ns() + HANG_GUARD_NS;
+    while (os_file_try_lock(&f, OS_LOCK_EXCLUSIVE) != OS_OK) {
+        if (os_now_ns() > guard) return 3;
+        os_sleep_ns(MS);
     }
-    if (strcmp(role, "args") == 0) {
-        /* argv[2..] must equal tricky_args exactly. */
-        if (argc != 2 + TRICKY) return 10;
-        for (int i = 0; i < TRICKY; i++)
-            if (strcmp(argv[2 + i], tricky_args[i]) != 0) return 11 + i;
-        return 0;
-    }
-    if (strcmp(role, "fdscan") == 0) {
-        /* Inspect device and inode rather than descriptor number, since
-         * the child may reuse a closed descriptor. */
-        os_stat want;
-        if (os_stat_path(arg, 0, &want) != OS_OK) return 2;
-        os_dir fds = OS_DIR_INIT;
-        if (os_dir_open(&fds, "/proc/self/fd") != OS_OK) return 3;
-        os_dir_iter it;
-        if (os_dir_iter_open(&it, &fds) != OS_OK) return 3;
-        const char *name;
-        int found = 0;
-        for (;;) {
-            OK(os_dir_next(&it, &name));
-            if (!name) break;
-            os_stat st;
-            if (os_stat_at(&fds, name, 0, &st) == OS_OK && os_identity_equal(&st.id, &want.id))
-                found = 1;
-        }
-        os_dir_iter_close(&it);
-        os_dir_close(&fds);
-        return found;
-    }
-    if (strcmp(role, "fdlimit") == 0) {
-        struct rlimit limit;
-        CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
-        /* Lower soft by one to exercise an actual raise in the child only. */
-        CHECK(limit.rlim_cur > STDERR_FILENO + 1);
-        limit.rlim_cur--;
-        CHECK(setrlimit(RLIMIT_NOFILE, &limit) == 0);
-        uint64_t soft = 0;
-        OK(os_fd_limit_raise(&soft));
-        CHECK(soft == (uint64_t)limit.rlim_max);
-        CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
-        CHECK(limit.rlim_cur == limit.rlim_max);
-        OK(os_fd_limit_raise(NULL));
-        return 0;
-    }
-    return 99;
+    for (;;) os_sleep_ns(1000 * MS);
+}
+static int role_fdlimit(const char *arg)
+{
+    (void)arg;
+    struct rlimit limit;
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
+    /* Lower soft by one to exercise an actual raise in the child only. */
+    CHECK(limit.rlim_cur > STDERR_FILENO + 1);
+    limit.rlim_cur--;
+    CHECK(setrlimit(RLIMIT_NOFILE, &limit) == 0);
+    uint64_t soft = 0;
+    OK(os_fd_limit_raise(&soft));
+    CHECK(soft == (uint64_t)limit.rlim_max);
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
+    CHECK(limit.rlim_cur == limit.rlim_max);
+    OK(os_fd_limit_raise(NULL));
+    return 0;
 }
 
 static void case_proc(void)
@@ -1221,52 +1210,12 @@ static void case_proc(void)
     CHECK(st.kind == OS_KIND_FILE);
     CHECK(os_proc_id() == (uint64_t)getpid());
 
-    os_proc p;
-    os_proc_status s = {0, 0};
-    const char *exit7[] = {exe, "--child=exit7", NULL};
-    OK(os_proc_spawn(&p, exit7));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_EXITED && s.code == 7);
-
-    const char *sleeper[] = {exe, "--child=sleep", NULL};
-    OK(os_proc_spawn(&p, sleeper));
-    EXPECT(os_proc_wait(&p, 0, &s), OS_E_TIMEDOUT);
-    EXPECT(os_proc_wait(&p, (int64_t)(5 * MS), &s), OS_E_TIMEDOUT);
-    OK(os_proc_kill(&p));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_ABNORMAL && s.code == SIGKILL);
-
-    /* argv reaches the child byte for byte as UTF-8. */
-    const char *args[2 + TRICKY + 1];
-    args[0] = exe;
-    args[1] = "--child=args";
-    for (int i = 0; i < TRICKY; i++) args[2 + i] = tricky_args[i];
-    args[2 + TRICKY] = NULL;
-    OK(os_proc_spawn(&p, args));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_EXITED && s.code == 0);
-
-    /* No handle reaches the child except the standard streams, not even
-     * one opened outside os.h without close-on-exec (C stdio here). */
-    char sentinel[OS_PATH_MAX];
-    join(sentinel, sizeof sentinel, work_root, "sentinel");
-    FILE *leak = fopen(sentinel, "w");
-    CHECK(leak != NULL);
-    CHECK((fcntl(fileno(leak), F_GETFD) & FD_CLOEXEC) == 0);
-    const char *scan[] = {exe, "--child=fdscan", sentinel, NULL};
-    OK(os_proc_spawn(&p, scan));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_EXITED && s.code == 0);
-    CHECK(fclose(leak) == 0);
-    OK(os_unlink(sentinel));
-
     /* A lock held by a process is released when that process dies. */
     char path[OS_PATH_MAX];
     join(path, sizeof path, work_root, "proc.lock");
     os_file f = OS_FILE_INIT;
     OK(os_file_open(&f, path, OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_EXCL));
-    const char *locker[] = {exe, "--child=lock", path, NULL};
-    OK(os_proc_spawn(&p, locker));
+    pid_t locker = fork_role(role_lock, path);
     uint64_t guard = os_now_ns() + HANG_GUARD_NS;
     bool child_holds = false;
     while (!child_holds && os_now_ns() < guard) {
@@ -1275,19 +1224,16 @@ static void case_proc(void)
         else { if (rc == OS_OK) os_file_unlock(&f); os_sleep_ns(MS); }
     }
     CHECK(child_holds);
-    OK(os_proc_kill(&p));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_ABNORMAL && s.code == SIGKILL);
+    CHECK(kill(locker, SIGKILL) == 0);
+    int status = reap(locker);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
     OK(os_file_try_lock(&f, OS_LOCK_EXCLUSIVE));
-    EXPECT(os_proc_wait(&p, 0, &s), OS_E_INVAL);
     os_file_unlock(&f);
     os_file_close(&f);
     OK(os_unlink(path));
 
-    const char *fdlimit[] = {exe, "--child=fdlimit", NULL};
-    OK(os_proc_spawn(&p, fdlimit));
-    OK(os_proc_wait(&p, (int64_t)HANG_GUARD_NS, &s));
-    CHECK(s.how == OS_PROC_EXITED && s.code == 0);
+    status = reap(fork_role(role_fdlimit, NULL));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 static void check_app_dir(os_app_dir_kind kind, const char *root, const char *suffix)
@@ -1377,9 +1323,7 @@ static const struct {
 
 int main(int argc, char **argv)
 {
-    if (argc >= 2 && strncmp(argv[1], "--child=", sizeof "--child=" - 1) == 0)
-        return run_child(argv[1] + sizeof "--child=" - 1, argc, argv);
-
+    (void)argv;
     CHECK(argc == 1);
     char cwd[OS_PATH_MAX];
     OK(os_cwd(cwd, sizeof cwd));

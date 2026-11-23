@@ -39,6 +39,27 @@ static void capture_start(const work_msg *msg, void *arg)
     memcpy(arg, msg->data, sizeof(uint64_t));
 }
 
+/* The pool's wake through the one wait primitive (v2-0fv.13). One set is
+ * kept for the bench's lifetime so the foreground sample does not include
+ * creating it. Never drains. */
+static os_waitset bench_set = OS_WAITSET_INIT;
+static int bench_fd = -1;
+static os_err wake_wait(const os_wake *w, uint64_t timeout_ns)
+{
+    if (bench_fd != os_wake_fd(w)) {
+        os_waitset_close(&bench_set);
+        bench_fd = -1;
+        os_err e = os_waitset_init(&bench_set);
+        if (e == OS_OK) e = os_waitset_add(&bench_set, os_wake_fd(w), OS_WAIT_IN, 1);
+        if (e != OS_OK) return e;
+        bench_fd = os_wake_fd(w);
+    }
+    os_wait_event ev;
+    size_t n = 0;
+    os_err e = os_waitset_wait(&bench_set, os_now_ns() + timeout_ns, &ev, 1, &n);
+    return e == OS_OK && n == 0 ? OS_E_TIMEDOUT : e;
+}
+
 static bool finish(const work_pool *p, work_handle h)
 {
     uint64_t deadline = os_now_ns() + WAIT_NS;
@@ -54,7 +75,7 @@ static bool trial(work_pool *p, samples *s, size_t i)
     uint64_t t0 = os_now_ns();
     work_handle job = work_submit(p, (work_job){publish, NULL, 0, WORK_BULK});
     s->submit[i] = os_now_ns() - t0;
-    if (!job.epoch || os_wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
+    if (!job.epoch || wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
     uint64_t start = 0;
     uint64_t drain = os_now_ns();
     if (work_mailbox_drain_bounded(p, capture_start, &start, 1, 0) != 1) return false;
@@ -63,12 +84,12 @@ static bool trial(work_pool *p, samples *s, size_t i)
     if (!finish(p, job)) return false;
 
     work_handle bulk = work_submit(p, (work_job){hold_bulk, NULL, 0, WORK_BULK});
-    if (!bulk.epoch || os_wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
+    if (!bulk.epoch || wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
     /* Consume the start token so the next wake comes from foreground. */
     if (work_mailbox_drain_bounded(p, capture_start, &start, 1, 0) != 1) return false;
     t0 = os_now_ns();
     work_handle fg = work_submit(p, (work_job){publish, NULL, 0, WORK_FOREGROUND});
-    if (!fg.epoch || os_wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
+    if (!fg.epoch || wake_wait(work_pool_wake(p), WAIT_NS) != OS_OK) return false;
     if (work_mailbox_drain_bounded(p, capture_start, &start, 1, 0) != 1) return false;
     s->foreground[i] = os_now_ns() - t0;
     if (!finish(p, fg)) return false;

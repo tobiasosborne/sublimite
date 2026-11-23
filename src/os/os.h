@@ -20,7 +20,7 @@
  * Clocks, thread identity, yield, mutex lock/unlock, condition signal and
  * broadcast, wake signal/drain and positioned file I/O never allocate.
  * Thread start, directory iteration, canonicalization, environment mutation,
- * stdio conversion and process spawn may allocate and are off the typing path.
+ * and stdio conversion may allocate and are off the typing path.
  *
  * File transfers restart EINTR unless the entry is explicitly single-attempt.
  * A short successful transfer is returned to the caller. Closing a descriptor
@@ -122,19 +122,16 @@ typedef struct os_once { pthread_once_t once; } os_once;
 #define OS_ONCE_INIT { PTHREAD_ONCE_INIT }
 void os_once_run(os_once *o, void (*fn)(void));
 
-/* Signals coalesce until drained. Any thread may signal and one owner waits
- * and drains. Drain before consuming the announced state. */
+/* Signals coalesce until drained. Any thread may signal; one owner waits for
+ * it through an os_waitset (os_wake_fd) and drains. Drain before consuming the
+ * announced state. */
 typedef struct os_wake { int fd; } os_wake;
 os_err os_wake_init(os_wake *w);
 void os_wake_close(os_wake *w);
 /* Async-signal-safe. */
 void os_wake_signal(const os_wake *w);
 void os_wake_drain(const os_wake *w);
-/* Waits without draining. Negative timeout waits indefinitely, zero polls.
- * Finite poll intervals round up to whole milliseconds. A closed wake gives
- * OS_E_INVAL. */
-os_err os_wake_wait(const os_wake *w, int64_t timeout_ns);
-int os_wake_fd(const os_wake *w); /* Platform poll loop only. */
+int os_wake_fd(const os_wake *w); /* Borrowed: os_waitset_add. */
 
 typedef enum os_kind {
     OS_KIND_FILE = 1,
@@ -370,20 +367,8 @@ void os_vm_release(void *addr, size_t len);
 /* Fill the entire buffer with getrandom, restarting interrupted transfers. */
 os_err os_random(void *buf, size_t n);
 
-typedef struct os_proc { int pid; } os_proc;
-typedef enum os_proc_how {
-    OS_PROC_EXITED = 1, /* code is the exit status. */
-    OS_PROC_ABNORMAL    /* code is the terminating signal. */
-} os_proc_how;
-typedef struct os_proc_status { os_proc_how how; int code; } os_proc_status;
-/* Spawn argv[0] directly and pass argv and the environment to the child.
- * The child inherits the working directory and standard streams only. */
-os_err os_proc_spawn(os_proc *out, const char *const argv[]);
-/* Send SIGKILL to a child owned by p. The caller must still reap it. */
-os_err os_proc_kill(os_proc *p);
-/* A successful wait reaps the child and spends p. Negative timeout waits
- * indefinitely, zero polls. OS_E_TIMEDOUT leaves p live. Use one reaper. */
-os_err os_proc_wait(os_proc *p, int64_t timeout_ns, os_proc_status *st);
+/* Child processes (spawn, kill, wait) were removed in v2-0fv.13: no module
+ * called them. The bead that needs one adds it together with its client. */
 uint64_t os_proc_id(void);
 os_err os_proc_self_path(char *out, size_t cap);
 

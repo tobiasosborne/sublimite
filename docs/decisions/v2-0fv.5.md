@@ -28,8 +28,8 @@ gives these hunks. The ranges locate the original v1 lines.
 | 581 | Documented the selective receive snapshot's tail acquire. |
 
 The header drops `work_pool_eventfd` and its Windows guard. v2 clients
-borrow `work_pool_wake()` for `os_wake_wait()`, or use `os_wake_fd()` in a
-platform poll loop. The header guard and introductory comments now describe
+borrow `work_pool_wake()` and add its `os_wake_fd()` to their `os_waitset`.
+That is the one wait primitive; v2-0fv.13 removed `os_wake_wait`. The header guard and introductory comments now describe
 the v2 module. The scheduling classes, slot partition, polling and drain
 constants, FIFO policy and memory orders match the pinned implementation.
 The worker still selects its scheduling class from its fixed identity before

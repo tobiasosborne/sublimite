@@ -11,6 +11,7 @@
  *   callback nor get an ACK (credential regression traps).
  * Part 5 (v2): NUL-split argv through ipc_parse_args + stdin + activation. */
 #include "ipc/ipc.h"
+#include "../tests/ipc_peer_seam.h"
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -101,8 +102,7 @@ static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, b
         g_srv_state=ipc_server_init(&g_srv,NULL)==IPC_OK?1:-1;
     }
     if(g_srv_state<0) return;
-    char uid[32]; snprintf(uid,sizeof uid,"%lu",(unsigned long)getuid()+1ul);
-    if(foreign) BASE_ASSERT(setenv("EDIT_IPC_TEST_PEER_UID",uid,1)==0);
+    ipc_seam_foreign_abstract=foreign;
     sink s={m,0}; int fd=e2e_connect();
     BASE_ASSERT(send(fd,w,n,MSG_NOSIGNAL)==(ssize_t)n);
     uint8_t reply[8]; ssize_t got=-2;
@@ -112,7 +112,7 @@ static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, b
         if(k>0 || k==0 || (k<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)) got=k;
     }
     if(foreign) {
-        unsetenv("EDIT_IPC_TEST_PEER_UID");
+        ipc_seam_foreign_abstract=false;
         /* credential regression: a foreign peer must never reach the callback or see an ACK */
         BASE_ASSERT(s.calls==0 && got!=8 && got!=-2);
     } else {

@@ -11,14 +11,18 @@
 #include <errno.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+extern char **environ;
 
 
 static void expect(os_err got, os_err want, const char *expression, int line)
@@ -1238,20 +1242,32 @@ int main(int argc, char **argv)
         ASSERT(n >= 0 && (size_t)n < sizeof flag);
         printf("os_fault_test: %s\n", cases[i].name);
         fflush(stdout);
+        /* os spawns no processes since v2-0fv.13, so the harness does: the
+         * child inherits only the standard streams, as os_proc_spawn did. */
         const char *child[] = {exe, flag, dir, NULL};
-        os_proc p;
-        os_proc_status s = {OS_PROC_EXITED, -1};
-        OK(os_proc_spawn(&p, child));
-        OK(os_proc_wait(&p, -1, &s)); /* The child's alarm bounds the wait. */
+        posix_spawn_file_actions_t fa;
+        pid_t pid = -1;
+        ASSERT(posix_spawn_file_actions_init(&fa) == 0);
+        ASSERT(posix_spawn_file_actions_addclosefrom_np(&fa, 3) == 0);
+        int rc = posix_spawn(&pid, exe, &fa, NULL, (char *const *)(uintptr_t)child, environ);
+        (void)posix_spawn_file_actions_destroy(&fa);
+        ASSERT(rc == 0);
+        int status = 0;
+        pid_t reaped;
+        do reaped = waitpid(pid, &status, 0); /* The child's alarm bounds the wait. */
+        while (reaped < 0 && errno == EINTR);
+        ASSERT(reaped == pid);
+        bool exited = WIFEXITED(status);
+        int code = exited ? WEXITSTATUS(status) : WIFSIGNALED(status) ? WTERMSIG(status) : -1;
         bool ok = false;
         switch (cases[i].want) {
-        case EXITS_ZERO: ok = s.how == OS_PROC_EXITED && s.code == 0; break;
-        case DIES_BY_SIGBUS: ok = s.how == OS_PROC_ABNORMAL && s.code == SIGBUS; break;
-        case DIES_BY_SIGABRT: ok = s.how == OS_PROC_ABNORMAL && s.code == SIGABRT; break;
+        case EXITS_ZERO: ok = exited && code == 0; break;
+        case DIES_BY_SIGBUS: ok = !exited && code == SIGBUS; break;
+        case DIES_BY_SIGABRT: ok = !exited && code == SIGABRT; break;
         }
         if (!ok) {
             fprintf(stderr, "os_fault_test: %s child %s %d\n", cases[i].name,
-                    s.how == OS_PROC_EXITED ? "exited" : "died by signal", s.code);
+                    exited ? "exited" : "died by signal", code);
             return EXIT_FAILURE;
         }
         if (cases[i].stderr_has) {

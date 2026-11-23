@@ -5,11 +5,9 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/fs.h>
-#include <poll.h>
 #include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -27,7 +25,6 @@
 #include <sys/timerfd.h>
 #include <sys/un.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,12 +36,10 @@ _Static_assert(sizeof(off_t) == sizeof(int64_t), "file offsets require a 64-bit 
 _Static_assert(OS_PATH_MAX == PATH_MAX && OS_NAME_MAX == NAME_MAX + 1u,
                "public capacities must match Linux path and name limits");
 
-extern char **environ;
-
 /* Restarts a call that returns -1 with errno EINTR (os.h retry policy). */
 #define RETRY(var, call) do { (var) = (call); } while ((var) == -1 && errno == EINTR)
 
-/* (P) SI conversions for timespec and poll. */
+/* (P) SI conversions for timespec and epoll. */
 #define NS_PER_SEC INT64_C(1000000000)
 #define NS_PER_MS INT64_C(1000000)
 
@@ -243,33 +238,6 @@ void os_wake_drain(const os_wake *w)
     RETRY(r, read(w->fd, &v, sizeof v));
     (void)r;
     errno = saved;
-}
-os_err os_wake_wait(const os_wake *w, int64_t timeout_ns)
-{
-    if (w->fd < 0) return fail_with(OS_E_INVAL);
-    uint64_t start = timeout_ns > 0 ? os_now_ns() : 0;
-    for (;;) {
-        int ms = -1;
-        if (timeout_ns == 0) ms = 0;
-        else if (timeout_ns > 0) {
-            uint64_t elapsed = os_now_ns() - start;
-            uint64_t timeout = (uint64_t)timeout_ns;
-            uint64_t left = timeout > elapsed ? timeout - elapsed : 0;
-            uint64_t up = (left + NS_PER_MS - 1u) / NS_PER_MS;
-            ms = up > (uint64_t)INT_MAX ? INT_MAX : (int)up;
-        }
-        struct pollfd p = {w->fd, POLLIN, 0};
-        int n = poll(&p, 1, ms);
-        if (n > 0) {
-            if (p.revents & POLLIN) return OS_OK;
-            return fail_with(OS_E_IO);
-        }
-        if (n < 0 && errno != EINTR) return fail();
-        if (n == 0 && (timeout_ns == 0 ||
-                       (timeout_ns > 0 && os_now_ns() - start >= (uint64_t)timeout_ns)))
-            return fail_with(OS_E_TIMEDOUT);
-        /* EINTR, or a short poll: go round with the time left. */
-    }
 }
 int os_wake_fd(const os_wake *w) { return w->fd; }
 
@@ -1198,60 +1166,7 @@ os_err os_random(void *buf, size_t n)
     return OS_OK;
 }
 
-/* ---- processes ---------------------------------------------------------- */
-os_err os_proc_spawn(os_proc *out, const char *const argv[])
-{
-    out->pid = -1;
-    if (!argv || !argv[0]) return fail_with(OS_E_INVAL);
-    /* Only the standard streams reach the child: close every descriptor from
-     * 3 up, including ones opened without O_CLOEXEC outside os.h (os.h). */
-    posix_spawn_file_actions_t fa;
-    int rc = posix_spawn_file_actions_init(&fa);
-    if (rc) { errno = rc; return fail(); }
-    rc = posix_spawn_file_actions_addclosefrom_np(&fa, 3);
-    pid_t pid = -1;
-    /* posix_spawn's argv is char *const[] for historical reasons; it does not
-     * modify the strings. */
-    if (!rc) rc = posix_spawn(&pid, argv[0], &fa, NULL, (char *const *)(uintptr_t)argv, environ);
-    (void)posix_spawn_file_actions_destroy(&fa);
-    if (rc) { errno = rc; return fail(); }
-    out->pid = (int)pid;
-    return OS_OK;
-}
-os_err os_proc_kill(os_proc *p)
-{
-    if (p->pid <= 0) return fail_with(OS_E_INVAL);
-    return kill((pid_t)p->pid, SIGKILL) ? fail() : OS_OK;
-}
-static void status_of(int status, os_proc_status *st)
-{
-    if (WIFEXITED(status)) { st->how = OS_PROC_EXITED; st->code = WEXITSTATUS(status); }
-    else { st->how = OS_PROC_ABNORMAL; st->code = WIFSIGNALED(status) ? WTERMSIG(status) : 0; }
-}
-os_err os_proc_wait(os_proc *p, int64_t timeout_ns, os_proc_status *st)
-{
-    if (p->pid <= 0) return fail_with(OS_E_INVAL);
-    int status = 0;
-    pid_t r;
-    if (timeout_ns < 0) {
-        RETRY(r, waitpid((pid_t)p->pid, &status, 0));
-    } else {
-        uint64_t start = os_now_ns();
-        for (;;) {
-            RETRY(r, waitpid((pid_t)p->pid, &status, WNOHANG));
-            if (r != 0) break;
-            uint64_t elapsed = os_now_ns() - start;
-            if (elapsed >= (uint64_t)timeout_ns) return fail_with(OS_E_TIMEDOUT);
-            uint64_t left = (uint64_t)timeout_ns - elapsed;
-            /* Preserve v1 font discovery's 1 ms waitpid polling interval. */
-            os_sleep_ns(left < NS_PER_MS ? left : NS_PER_MS);
-        }
-    }
-    if (r < 0) return fail();
-    status_of(status, st);
-    p->pid = -1;
-    return OS_OK;
-}
+/* ---- process identity --------------------------------------------------- */
 uint64_t os_proc_id(void) { return (uint64_t)getpid(); }
 os_err os_fd_limit_raise(uint64_t *soft)
 {

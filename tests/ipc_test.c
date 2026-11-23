@@ -1,5 +1,6 @@
 #include "ipc/ipc.h"
 #include "ipc_isolation.h"
+#include "ipc_peer_seam.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -512,20 +513,19 @@ static void t_lock_timeout(const char *dir)
 /* 13 + 17: foreign credentials, squatting, fallback endpoint. */
 static void t_foreign_cred(const char *dir)
 {
-    char rt[IPC_PATH_CAP], uidbuf[32]; subdir(dir,"cred",rt); CHECK(unsetenv("XDG_RUNTIME_DIR")==0);
+    char rt[IPC_PATH_CAP]; subdir(dir,"cred",rt); CHECK(unsetenv("XDG_RUNTIME_DIR")==0);
     char ns[128]; CHECK(snprintf(ns,sizeof ns,"%s-cred",getenv("EDIT_IPC_NAMESPACE"))>0);
     CHECK(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); CHECK(setenv("EDIT_IPC_FALLBACK_DIR",rt,1)==0);
-    CHECK(snprintf(uidbuf,sizeof uidbuf,"%lu",(unsigned long)getuid()+1ul)>0);
     ipc_request r=request(false,false); capture c={0};
     /* client refuses a server whose credentials are foreign */
     ipc_server s={0}; CHECK(ipc_server_init(&s,NULL)==IPC_OK);
-    CHECK(setenv("EDIT_IPC_TEST_PEER_UID",uidbuf,1)==0);
+    ipc_seam_foreign_abstract=true;
     ipc_result rc=ipc_client_send(NULL,&r,1000);
     if(rc!=IPC_REJECTED) fprintf(stderr,"client foreign-server rc=%d\n",(int)rc);
     CHECK(rc==IPC_REJECTED);
     /* server refuses a foreign client: connection dropped, callback never runs */
     pid_t ch=fork(); CHECK(ch>=0);
-    if(ch==0) { unsetenv("EDIT_IPC_TEST_PEER_UID"); ipc_result x=ipc_client_send(NULL,&r,5000); _exit(x==IPC_IO?0:2); }
+    if(ch==0) { ipc_seam_foreign_abstract=false; ipc_result x=ipc_client_send(NULL,&r,5000); _exit(x==IPC_IO?0:2); }
     for(int i=0;i<10;i++) { int st; if(waitpid(ch,&st,WNOHANG)==ch) { CHECK(WIFEXITED(st) && WEXITSTATUS(st)==0); ch=-1; break; } (void)pump(&s,count_only,&c,200); }
     CHECK(ch==-1 && c.calls==0);
     ipc_server_fini(&s);
@@ -541,7 +541,7 @@ static void t_foreign_cred(const char *dir)
     ipc_server other={0}; CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS);
     ch=spawn_client(NULL,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
     ipc_server_fini(&s); close(squat);
-    CHECK(unsetenv("EDIT_IPC_TEST_PEER_UID")==0); CHECK(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
+    ipc_seam_foreign_abstract=false; CHECK(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
     CHECK(setenv("EDIT_IPC_NAMESPACE",ns+0,1)==0);
     char saved[128]; CHECK(snprintf(saved,sizeof saved,"%s",ns)>0); saved[strlen(ns)-5]='\0';
     CHECK(setenv("EDIT_IPC_NAMESPACE",saved,1)==0); CHECK(setenv("XDG_RUNTIME_DIR",dir,1)==0);
