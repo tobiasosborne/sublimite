@@ -55,8 +55,15 @@ Held: env hooks (.20). L2 edit placeholder (.15) carries acceptance lines. Specs
   piece/undo diffs; Sol writes no code unless Tobias relaxes the pace rule; code goes to Opus, two workers): Codex weekly reset ~11:56; up to pace only (≈0.6 pt/h): Astra first, at most
   one Sol lane when t3quota shows room > 0. New code beads go to Opus (≤ 2 workers, stop at Claude room 3). Muse one lane;
   Gemini prose only. L0 beads count as critical path under the battery plan.
-- Routing: Codex's cyber filter refused test-case beads that describe a defect or a process kill (v2-he7.7, .15, .14;
-  worklog). Those go to Opus or Muse from the start; Sol does lint, tool and patch beads. Muse and Gemini: up to pace only.
+- Routing (advisor, 2026-11-23, after five Codex cyber-filter stops: v2-he7.7, .15, .14, 7b on Sol, Astra's undo
+  re-read): any Codex job, implementation OR review, whose work includes running or writing tests that inject faults,
+  truncate mapped files or kill processes goes to Claude or Muse from the start. A filtered job is never resent to Codex
+  in other words. Codex keeps derivation and source reading without execution (Astra design reads, production-source
+  derivation checks) and lint/tool/patch beads (Sol). Landing reads of fault-heavy code are split: Astra reads the
+  production source as a derivation check (runs nothing); a fresh Claude/Muse reviewer reads and runs the suites; if
+  Astra is filtered, the Claude/Muse reviewer takes the source too. Muse and Gemini: up to pace only; Tobias rates Muse
+  for review. Both Claude and Codex up to pace (Tobias, 2026-11-23); Opus stop line 2; four Opus lanes while Claude
+  room > 4, two below.
 - Worker briefs carry: no rm -rf, no mktemp with a clean-up trap, nothing outside the checkout is created or removed,
   HOME for any tool that writes caches is under the checkout's build/, build under build/, report instead of running
   anything that needs approval; never profile the oracle (perf record -N if ever). T3 thread timestamps are UTC.
