@@ -25,11 +25,14 @@ v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
 1. Land whatever the in-flight lanes left (each worker's worktree is committed on its branch; see the list above or
    the final session-end note below if one was written).
 2. W0.6e and W0.6g post-ACK on the landed adapter, then W0.6i, then W0.6j.
-3. **The Wave 0 gate run is the first full-suite run of the next session**: no other lane running, stamped with
+3. Whole-wave deletion-lens code review by Astra (bead W0.7, docs/reviews/wave0-code-astra.md) and its triage.
+4. **The Wave 0 gate run is the first full-suite run of the next session**: no other lane running, stamped with
    power state and load at start (AC preferred; [bat] acceptable on a quiet box). Then report to the advisor (checkpoint d).
-4. Then open Wave 1 beads under epic v2-0fv (its description carries the exit criteria and acceptance items).
+5. Then open Wave 1 beads under epic v2-0fv (its description carries the exit criteria and acceptance items).
 
 ### Facts the next session needs
+- Quality bar (Tobias, 2026-11-23): genius-level engineering; push back on sloppy work. Owner-read every landing,
+  one send-back round; designs state invariant, simplest alternative, defeating counter-example (worklog).
 - Oracle: /home/tobias/Projects/sublimite-v1-oracle, detached 6fec2e8, built; `build/sysroot` holds
   wayland-egl-backend.h (export CPATH=$PWD/build/sysroot/usr/include). Stock editor: build/sublimite.
   Baseline: 120/120 sanitizer suites on a quiet box, one named v1 test race (pin decision §9).
