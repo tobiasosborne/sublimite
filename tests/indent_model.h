@@ -137,9 +137,9 @@ static bool gtext_allow(gtext *g, const indent_range *w, size_t k)
     return true;
 }
 
-/* ---- reference model ----------------------------------------------------- */
+/* ---- reference models ----------------------------------------------------- */
 
-#define MODEL_T ((uint64_t)INDENT_TYPING_BYTES)
+#define MODEL_B ((uint64_t)INDENT_BLANK_BYTES)
 
 static bool model_ws(uint8_t c) { return c == ' ' || c == '\t'; }
 
@@ -154,27 +154,28 @@ static uint64_t model_line_end(const uint8_t *L, uint64_t n, uint64_t c)
     while (c < n && L[c] != '\n') c++;
     return c;
 }
-static bool model_split(const uint8_t *L, uint64_t n, uint64_t c)
+
+/* -- v1 (pin 6fec2e8), over the logical text L with the selection removed and
+ *    the caret at c. v1 answered only when the caret was not between CR and LF
+ *    and both line boundaries lay within its 8192-byte windows; the v1 model
+ *    says whether it answered and, if so, what. */
+#define MODEL_V1_T 8192u /* v1 INDENT_TYPING_BYTES, only to know when v1 answered */
+
+static bool model_v1_answered(const uint8_t *L, uint64_t n, uint64_t c)
 {
-    return c > 0 && c < n && L[c - 1] == '\r' && L[c] == '\n';
+    if (c > 0 && c < n && L[c - 1] == '\r' && L[c] == '\n') return false;
+    uint64_t s = model_line_start(L, c), e = model_line_end(L, n, c);
+    if (s > 0 ? s - 1 + MODEL_V1_T < c : c > MODEL_V1_T) return false;
+    if (e < n ? e - c >= MODEL_V1_T : n - c > MODEL_V1_T) return false;
+    return true;
 }
 
-static indent_code model_enter(const uint8_t *L, uint64_t n, uint64_t c, uint8_t *out, size_t *length)
+/* v1 Enter's leading bytes: the SP/TAB run from the line start up to c. */
+static uint64_t model_v1_lead(const uint8_t *L, uint64_t c)
 {
-    *length = 0;
-    if (model_split(L, n, c)) return INDENT_ERR_RANGE;
-    uint64_t s = model_line_start(L, c), e = model_line_end(L, n, c);
-    /* The LF before the line (or the start of the text) must lie in [c - T, c),
-     * and the line's LF in [c, c + T) or the text end within c + T. */
-    if (s > 0 ? s - 1 + MODEL_T < c : c > MODEL_T) return INDENT_ERR_LIMIT;
-    if (e < n ? e - c >= MODEL_T : n - c > MODEL_T) return INDENT_ERR_LIMIT;
-    bool crlf = e < n ? e > 0 && L[e - 1] == '\r' : s >= 2 && L[s - 2] == '\r';
-    size_t k = 0;
-    if (crlf) out[k++] = '\r';
-    out[k++] = '\n';
-    for (uint64_t i = s; i < c && model_ws(L[i]); i++) out[k++] = L[i];
-    *length = k;
-    return INDENT_OK;
+    uint64_t s = model_line_start(L, c), i = s;
+    while (i < c && model_ws(L[i])) i++;
+    return i - s;
 }
 
 /* Visual-column statement (v1 fuzz oracle): the stop before the cursor is
@@ -192,45 +193,35 @@ static uint64_t model_dedent(const uint8_t *L, uint64_t s, uint64_t c, unsigned 
     return keep;
 }
 
-typedef enum model_side { SIDE_CONTENT, SIDE_EDGE, SIDE_UNKNOWN } model_side;
-
-/* *consistent is cleared when the windowed verdict contradicts the whole line. */
-static indent_code model_brace(const uint8_t *L, uint64_t n, uint64_t c, unsigned width,
-                               uint64_t *from, bool *consistent)
+/* v1 '}' over the whole line, terminator excluded. */
+static uint64_t model_v1_brace(const uint8_t *L, uint64_t n, uint64_t c, unsigned width)
 {
-    *from = INDENT_NONE;
-    *consistent = true;
-    if (width == 0 || width > INDENT_MAX_WIDTH) return INDENT_ERR_ARGUMENT;
-    if (model_split(L, n, c)) return INDENT_ERR_RANGE;
     uint64_t s = model_line_start(L, c), e = model_line_end(L, n, c), body = e;
     if (e < n && e > s && L[e - 1] == '\r') body--;
-    bool white = true;
-    for (uint64_t i = s; i < body; i++) white = white && model_ws(L[i]);
-    uint64_t answer = white ? model_dedent(L, s, c, width) : c;
+    for (uint64_t i = s; i < body; i++)
+        if (!model_ws(L[i])) return c;
+    return model_dedent(L, s, c, width);
+}
 
-    /* What the two typing windows alone show. */
-    uint64_t bound = c > MODEL_T ? c - MODEL_T : 0, j = c;
-    while (j > bound && model_ws(L[j - 1])) j--;
-    model_side before = j > bound ? (L[j - 1] == '\n' ? SIDE_EDGE : SIDE_CONTENT)
-                                  : (bound == 0 ? SIDE_EDGE : SIDE_UNKNOWN);
-    uint64_t top = n - c > MODEL_T ? c + MODEL_T : n, q = c;
-    while (q < top && model_ws(L[q])) q++;
-    model_side after;
-    if (q == top) after = top == n ? SIDE_EDGE : SIDE_UNKNOWN;
-    else if (L[q] == '\n') after = SIDE_EDGE;
-    else if (L[q] != '\r') after = SIDE_CONTENT;
-    else if (q + 1 < top) after = L[q + 1] == '\n' ? SIDE_EDGE : SIDE_CONTENT;
-    else after = q + 1 == n ? SIDE_CONTENT : SIDE_UNKNOWN;
+/* -- v2, over the text p with the selection [lo, hi) and the caller's line
+ *    start ls (header contract). */
+static indent_range model_enter(const uint8_t *p, uint64_t ls, uint64_t lo)
+{
+    uint64_t k = 0;
+    while (ls + k < lo && model_ws(p[ls + k])) k++;
+    return (indent_range){ls, k > MODEL_B ? ls : ls + k};
+}
 
-    if (before == SIDE_CONTENT || after == SIDE_CONTENT) {
-        *consistent = !white;
-        *from = c;
-        return INDENT_OK;
-    }
-    if (before == SIDE_UNKNOWN || after == SIDE_UNKNOWN) return INDENT_ERR_LIMIT;
-    *consistent = white;
-    *from = answer;
-    return INDENT_OK;
+static uint64_t model_brace(const uint8_t *p, uint64_t n, uint64_t ls, uint64_t lo, uint64_t hi, unsigned width)
+{
+    if (lo - ls > MODEL_B) return lo;
+    for (uint64_t i = ls; i < lo; i++)
+        if (!model_ws(p[i])) return lo;
+    uint64_t q = hi;
+    while (q < n && model_ws(p[q])) q++;
+    if (q - hi > MODEL_B) return lo;
+    bool edge = q == n || p[q] == '\n' || (p[q] == '\r' && q + 1 < n && p[q + 1] == '\n');
+    return edge ? model_dedent(p, ls, lo, width) : lo;
 }
 
 static indent_pair model_match(const uint8_t *p, uint64_t cursor, uint64_t lo, uint64_t hi)
@@ -288,7 +279,12 @@ static uint64_t model_gcd(uint64_t a, uint64_t b)
 
 static indent_style model_detect(const uint8_t *p, uint64_t n)
 {
-    uint64_t m = n > INDENT_PREFIX_BYTES ? INDENT_PREFIX_BYTES : n, tabs = 0, spaces = 0, g = 0;
+    uint64_t m = n > INDENT_PREFIX_BYTES ? INDENT_PREFIX_BYTES : n, tabs = 0, spaces = 0, g = 0, crlf = 0, lf = 0;
+    for (uint64_t i = 0; i < m; i++)
+        if (p[i] == '\n') {
+            if (i > 0 && p[i - 1] == '\r') crlf++;
+            else lf++;
+        }
     for (uint64_t s = 0; s < m;) {
         uint64_t e = s;
         while (e < m && p[e] != '\n') e++;
@@ -304,7 +300,7 @@ static indent_style model_detect(const uint8_t *p, uint64_t n)
         }
         s = e + 1;
     }
-    return (indent_style){tabs > spaces ? INDENT_TABS : INDENT_SPACES,
+    return (indent_style){tabs > spaces ? INDENT_TABS : INDENT_SPACES, crlf > lf ? INDENT_CRLF : INDENT_LF,
                           (uint8_t)(g >= 1 && g <= INDENT_MAX_WIDTH ? g : INDENT_DEFAULT_WIDTH)};
 }
 

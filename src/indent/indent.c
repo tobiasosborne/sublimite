@@ -1,16 +1,16 @@
 /* L1 indent (docs/decisions/v2-0fv.12.md).
  *
- * Every scan is a forward walk over the spans of one window of the text.
- * No window contains the selection: the backward typing window ends at lo
- * and the forward one starts at hi, so the typing queries read the text
- * itself and need no logical-to-physical mapping. Offsets below lo are the
- * same in the text with and without the selection. */
+ * Every read is a forward walk over the spans of one window of the text.
+ * The typing queries are handed the cursor line's start and read only the
+ * blank run from it and the bytes from the end of the selection, so their
+ * cost is the length of the indentation, never a search for a line edge. */
 #include "indent/indent.h"
+#include "os/os.h"
 
 #include <stdbool.h>
 #include <string.h>
 
-#define T ((uint64_t)INDENT_TYPING_BYTES)
+#define B ((uint64_t)INDENT_BLANK_BYTES)
 
 /* A walk over the window [pos, end): the spans returned so far cover the
  * window up to pos, and the text's iterator stands at pos. */
@@ -52,169 +52,89 @@ static void copy(const indent_text *t, uint64_t pos, uint8_t *out, size_t n)
 
 static bool ws(uint8_t c) { return c == ' ' || c == '\t'; }
 
-static uint64_t back_bound(uint64_t lo) { return lo > T ? lo - T : 0; }
-static uint64_t forward_end(const indent_text *t, uint64_t hi) { return t->length - hi > T ? hi + T : t->length; }
-
-/* Shared typing preconditions. The cursor's neighbours in the text without
- * the selection are the bytes at lo - 1 and hi. */
-static bool typing_range_ok(const indent_text *t, uint64_t lo, uint64_t hi)
+static void typing_preconditions(const indent_text *t, uint64_t ls, uint64_t lo, uint64_t hi)
 {
-    if (lo > hi || hi > t->length) return false;
-    return !(lo > 0 && hi < t->length && byte_at(t, hi) == '\n' && byte_at(t, lo - 1) == '\r');
+    ASSERT(ls <= lo && lo <= hi && hi <= t->length);
+    if (ls != 0 && ls != lo) {
+        uint8_t before = byte_at(t, ls - 1);
+        ASSERT(before == '\n');
+    }
 }
 
 /* ---- Enter ----------------------------------------------------------------- */
 
-/* One past the last LF of the backward window, else 0 when the window starts
- * the text, else INDENT_NONE. */
-static uint64_t line_start(const indent_text *t, uint64_t lo)
+indent_range indent_on_enter(const indent_text *t, uint64_t ls, uint64_t lo)
 {
-    uint64_t bound = back_bound(lo), start = bound ? INDENT_NONE : 0;
-    walk w = walk_open(t, bound, lo);
-    const uint8_t *p;
-    for (size_t n; (n = walk_next(&w, &p));)
-        for (size_t i = n; i > 0; i--)
-            if (p[i - 1] == '\n') {
-                start = w.pos - n + i;
-                break;
-            }
-    return start;
-}
-
-typedef enum term { TERM_LF, TERM_CRLF, TERM_EOF, TERM_UNKNOWN } term;
-
-/* The cursor line's terminator, from the forward window. A LF at hi is
- * never the end of a CRLF: typing_range_ok refused that cursor. */
-static term line_term(const indent_text *t, uint64_t hi)
-{
-    uint64_t end = forward_end(t, hi);
-    walk w = walk_open(t, hi, end);
-    const uint8_t *p;
-    uint8_t prev = 0;
-    for (size_t n; (n = walk_next(&w, &p)); prev = p[n - 1]) {
-        const uint8_t *lf = memchr(p, '\n', n);
-        if (lf) return (lf > p ? lf[-1] : prev) == '\r' ? TERM_CRLF : TERM_LF;
-    }
-    return end == t->length ? TERM_EOF : TERM_UNKNOWN;
-}
-
-indent_code indent_on_enter(const indent_text *t, uint64_t lo, uint64_t hi,
-                            uint8_t out[INDENT_ENTER_MAX], size_t *length)
-{
-    *length = 0;
-    if (!typing_range_ok(t, lo, hi)) return INDENT_ERR_RANGE;
-    uint64_t start = line_start(t, lo);
-    if (start == INDENT_NONE) return INDENT_ERR_LIMIT;
-    size_t k = 0;
-    switch (line_term(t, hi)) {
-    case TERM_UNKNOWN: return INDENT_ERR_LIMIT;
-    case TERM_LF: break;
-    case TERM_CRLF: out[k++] = '\r'; break;
-    case TERM_EOF:
-        /* start >= 2 means a LF at start - 1; the byte before it names the
-         * previous line's terminator. */
-        if (start >= 2 && byte_at(t, start - 2) == '\r') out[k++] = '\r';
-        break;
-    }
-    out[k++] = '\n';
-    /* (P) lo - start <= T, so k <= INDENT_ENTER_MAX. */
-    walk w = walk_open(t, start, lo);
+    typing_preconditions(t, ls, lo, lo);
+    /* Reading B + 1 bytes is enough to tell a run longer than B. */
+    uint64_t run = ls;
+    walk w = walk_open(t, ls, lo - ls > B ? ls + B + 1 : lo);
     const uint8_t *p;
     for (size_t n; (n = walk_next(&w, &p));) {
         size_t i = 0;
         while (i < n && ws(p[i])) i++;
-        memcpy(out + k, p, i);
-        k += i;
+        run += i;
         if (i < n) break;
     }
-    *length = k;
-    return INDENT_OK;
+    return (indent_range){ls, run - ls > B ? ls : run};
 }
 
 /* ---- '}' ------------------------------------------------------------------- */
 
-/* What one typing window shows of the cursor line: a byte other than SP/TAB
- * (CONTENT), the line's edge after SP/TAB only (EDGE), or SP/TAB up to the
- * window's end short of the line's edge (UNKNOWN). */
-typedef enum side { SIDE_CONTENT, SIDE_EDGE, SIDE_UNKNOWN } side;
-
-/* The last byte of the backward window other than SP/TAB decides: a LF is
- * the edge and *start is one past it. Reaching the text start is the edge. */
-static side before_side(const indent_text *t, uint64_t lo, uint64_t *start)
-{
-    uint64_t bound = back_bound(lo);
-    side s = bound ? SIDE_UNKNOWN : SIDE_EDGE;
-    *start = 0;
-    walk w = walk_open(t, bound, lo);
-    const uint8_t *p;
-    for (size_t n; (n = walk_next(&w, &p));) {
-        size_t i = n;
-        while (i > 0 && ws(p[i - 1])) i--;
-        if (i == 0) continue;
-        s = p[i - 1] == '\n' ? SIDE_EDGE : SIDE_CONTENT;
-        *start = w.pos - n + i;
-    }
-    return s;
-}
-
+/* BLANK: only SP/TAB were seen. CR: they were followed by one CR, whose
+ * successor decides. */
 typedef enum tail { TAIL_BLANK, TAIL_CR } tail;
 
-/* The first byte of the forward window other than SP/TAB decides: a LF or a
- * CRLF is the edge, a lone CR or anything else is content. The text end is
- * the edge, unless it follows a lone CR. */
-static side after_side(const indent_text *t, uint64_t hi)
+/* True when the bytes from hi are at most B blanks, then a LF, a CRLF or
+ * the end of the text. Within B + 2 bytes the answer is always decided, so
+ * a walk that runs out has reached the end of the text. */
+static bool blank_tail(const indent_text *t, uint64_t hi)
 {
-    uint64_t end = forward_end(t, hi);
+    uint64_t blanks = 0;
     tail st = TAIL_BLANK;
-    walk w = walk_open(t, hi, end);
+    walk w = walk_open(t, hi, t->length - hi > B + 2 ? hi + B + 2 : t->length);
     const uint8_t *p;
     for (size_t n; (n = walk_next(&w, &p));)
         for (size_t i = 0; i < n; i++) {
             switch (st) {
-            case TAIL_CR: return p[i] == '\n' ? SIDE_EDGE : SIDE_CONTENT;
+            case TAIL_CR: return p[i] == '\n';
             case TAIL_BLANK:
-                if (ws(p[i])) break;
-                if (p[i] == '\n') return SIDE_EDGE;
-                if (p[i] != '\r') return SIDE_CONTENT;
+                if (ws(p[i])) {
+                    if (++blanks > B) return false;
+                    break;
+                }
+                if (p[i] == '\n') return true;
+                if (p[i] != '\r') return false;
                 st = TAIL_CR;
                 break;
             }
         }
-    if (end < t->length) return SIDE_UNKNOWN;
-    return st == TAIL_CR ? SIDE_CONTENT : SIDE_EDGE;
+    return st == TAIL_BLANK; /* a lone CR at the end is text */
 }
 
-indent_code indent_on_close_brace(const indent_text *t, uint64_t lo, uint64_t hi,
-                                  uint8_t width, uint64_t *from)
+uint64_t indent_on_close_brace(const indent_text *t, uint64_t ls, uint64_t lo, uint64_t hi, uint8_t width)
 {
-    *from = INDENT_NONE;
-    if (width == 0 || width > INDENT_MAX_WIDTH) return INDENT_ERR_ARGUMENT;
-    if (!typing_range_ok(t, lo, hi)) return INDENT_ERR_RANGE;
-    uint64_t start;
-    side before = before_side(t, lo, &start);
-    side after = before == SIDE_CONTENT ? SIDE_CONTENT : after_side(t, hi);
-    if (before == SIDE_CONTENT || after == SIDE_CONTENT) {
-        *from = lo;
-        return INDENT_OK;
-    }
-    if (before == SIDE_UNKNOWN || after == SIDE_UNKNOWN) return INDENT_ERR_LIMIT;
-    /* [start, lo) is SP/TAB only. stop is one past the last completed stop
-     * (start if none), prev the one before it, column < width the columns
-     * since stop. */
-    uint64_t stop = start, prev = start;
+    ASSERT(width >= 1 && width <= INDENT_MAX_WIDTH);
+    typing_preconditions(t, ls, lo, hi);
+    if (lo - ls > B) return lo; /* degraded: more than B blanks count as text */
+    /* Over the SP/TAB run [ls, x): stop is one past the last completed
+     * indent stop (ls if none), prev the one before it, and column < width
+     * the columns since stop. */
+    uint64_t stop = ls, prev = ls;
     unsigned column = 0;
-    walk w = walk_open(t, start, lo);
+    walk w = walk_open(t, ls, lo);
     const uint8_t *p;
     for (size_t n; (n = walk_next(&w, &p));)
         for (size_t i = 0; i < n; i++) {
+            if (!ws(p[i])) return lo;
             column = p[i] == '\t' ? width : column + 1;
             if (column < width) continue;
             prev = stop;
             stop = w.pos - n + i + 1;
             column = 0;
         }
-    *from = column ? stop : prev;
-    return INDENT_OK;
+    if (!blank_tail(t, hi)) return lo;
+    return column ? stop : prev;
 }
 
 /* ---- brackets ---------------------------------------------------------------- */
@@ -245,11 +165,12 @@ static uint64_t mate_forward(const indent_text *t, uint64_t pos, uint64_t hi, ui
     return INDENT_NONE;
 }
 
-/* Backward through copied blocks. The block is T bytes so that this, the
- * only stack scratch in the module, has the one size already justified. */
+/* Backward through copied blocks: a forward iterator cannot run in reverse.
+ * (E) One seek per block. The block reuses the module's one bound, so the
+ * stack scratch is INDENT_BLANK_BYTES and introduces no new number. */
 static uint64_t mate_backward(const indent_text *t, uint64_t lo, uint64_t end, uint8_t close, uint8_t open)
 {
-    uint8_t block[INDENT_TYPING_BYTES];
+    uint8_t block[INDENT_BLANK_BYTES];
     uint64_t depth = 1;
     while (end > lo) {
         size_t n = end - lo > sizeof block ? sizeof block : (size_t)(end - lo);
@@ -263,20 +184,18 @@ static uint64_t mate_backward(const indent_text *t, uint64_t lo, uint64_t end, u
     return INDENT_NONE;
 }
 
-indent_code indent_bracket_match(const indent_text *t, uint64_t cursor,
-                                 uint64_t lo, uint64_t hi, indent_pair *pair)
+indent_pair indent_bracket_match(const indent_text *t, uint64_t cursor, uint64_t lo, uint64_t hi)
 {
-    *pair = (indent_pair){INDENT_NONE, INDENT_NONE};
-    if (cursor > t->length || lo > hi || hi > t->length) return INDENT_ERR_RANGE;
+    ASSERT(cursor <= t->length && lo <= hi && hi <= t->length);
+    indent_pair none = {INDENT_NONE, INDENT_NONE};
     uint64_t source = cursor;
     uint8_t c = 0, mate = 0;
     if (cursor >= lo && cursor < hi) mate = partner(c = byte_at(t, cursor));
     if (!mate && cursor > lo && cursor <= hi) mate = partner(c = byte_at(t, source = cursor - 1));
-    if (!mate) return INDENT_OK;
+    if (!mate) return none;
     uint64_t found = c == '(' || c == '[' || c == '{' ? mate_forward(t, source + 1, hi, c, mate)
                                                       : mate_backward(t, lo, source, c, mate);
-    if (found != INDENT_NONE) *pair = (indent_pair){source, found};
-    return INDENT_OK;
+    return found == INDENT_NONE ? none : (indent_pair){source, found};
 }
 
 /* ---- trailing whitespace ----------------------------------------------------- */
@@ -291,11 +210,10 @@ static void emit(indent_range *out, size_t cap, size_t *count, uint64_t lo, uint
     ++*count;
 }
 
-indent_code indent_trailing_ws(const indent_text *t, uint64_t lo, uint64_t hi,
-                               indent_range *out, size_t cap, size_t *count)
+size_t indent_trailing_ws(const indent_text *t, uint64_t lo, uint64_t hi, indent_range *out, size_t cap)
 {
-    *count = 0;
-    if (lo > hi || hi > t->length) return INDENT_ERR_RANGE;
+    ASSERT(lo <= hi && hi <= t->length);
+    size_t count = 0;
     trail st = TRAIL_TEXT;
     uint64_t run = 0;
     walk w = walk_open(t, lo, hi);
@@ -309,19 +227,19 @@ indent_code indent_trailing_ws(const indent_text *t, uint64_t lo, uint64_t hi,
                 if (ws(c)) { st = TRAIL_RUN; run = at; }
                 break;
             case TRAIL_RUN:
-                if (c == '\n') { emit(out, cap, count, run, at); st = TRAIL_TEXT; }
+                if (c == '\n') { emit(out, cap, &count, run, at); st = TRAIL_TEXT; }
                 else if (c == '\r') st = TRAIL_RUN_CR;
                 else if (!ws(c)) st = TRAIL_TEXT;
                 break;
             case TRAIL_RUN_CR:
-                if (c == '\n') { emit(out, cap, count, run, at - 1); st = TRAIL_TEXT; }
+                if (c == '\n') { emit(out, cap, &count, run, at - 1); st = TRAIL_TEXT; }
                 else if (ws(c)) { st = TRAIL_RUN; run = at; } /* the lone CR was text */
                 else st = TRAIL_TEXT;
                 break;
             }
         }
-    if (hi == t->length && st == TRAIL_RUN) emit(out, cap, count, run, hi);
-    return *count > cap ? INDENT_ERR_CAPACITY : INDENT_OK;
+    if (hi == t->length && st == TRAIL_RUN) emit(out, cap, &count, run, hi);
+    return count;
 }
 
 /* ---- detection ------------------------------------------------------------------ */
@@ -331,7 +249,7 @@ indent_code indent_trailing_ws(const indent_text *t, uint64_t lo, uint64_t hi,
  * other than SP/TAB/CR was seen. */
 typedef enum phase { PHASE_LEAD, PHASE_BLANK, PHASE_BODY } phase;
 
-typedef struct votes { uint64_t tabs, spaces, gcd; } votes;
+typedef struct votes { uint64_t tabs, spaces, gcd, crlf, lf; } votes;
 
 static uint64_t gcd(uint64_t a, uint64_t b)
 {
@@ -360,18 +278,21 @@ static void vote(votes *v, phase ph, uint64_t lead, indent_kind kind)
 indent_style indent_detect(const indent_text *t)
 {
     uint64_t end = t->length > INDENT_PREFIX_BYTES ? INDENT_PREFIX_BYTES : t->length;
-    votes v = {0, 0, 0};
+    votes v = {0, 0, 0, 0, 0};
     /* The current line: its phase, the length of its leading SP/TAB run and
-     * whether that run holds a tab. */
+     * whether that run holds a tab; prev is the byte before the current one. */
     phase ph = PHASE_LEAD;
     uint64_t lead = 0;
     indent_kind kind = INDENT_SPACES;
+    uint8_t prev = 0;
     walk w = walk_open(t, 0, end);
     const uint8_t *p;
     for (size_t n; (n = walk_next(&w, &p));)
-        for (size_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; prev = p[i++]) {
             uint8_t c = p[i];
             if (c == '\n') {
+                if (prev == '\r') v.crlf++;
+                else v.lf++;
                 vote(&v, ph, lead, kind);
                 ph = PHASE_LEAD;
                 lead = 0;
@@ -395,5 +316,6 @@ indent_style indent_detect(const indent_text *t)
         }
     if (end == t->length) vote(&v, ph, lead, kind); /* the final line is complete */
     uint64_t width = v.gcd >= 1 && v.gcd <= INDENT_MAX_WIDTH ? v.gcd : INDENT_DEFAULT_WIDTH;
-    return (indent_style){v.tabs > v.spaces ? INDENT_TABS : INDENT_SPACES, (uint8_t)width};
+    return (indent_style){v.tabs > v.spaces ? INDENT_TABS : INDENT_SPACES,
+                          v.crlf > v.lf ? INDENT_CRLF : INDENT_LF, (uint8_t)width};
 }

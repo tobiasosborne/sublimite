@@ -1,7 +1,8 @@
-/* indent fuzzer: every query against the reference model in
- * tests/indent_model.h, once guarded (bytes outside the query's readable
- * windows on PROT_NONE pages) and once with spans that straddle the window
- * edges. A mismatch or an out-of-window read crashes the fuzzer.
+/* indent fuzzer: every query against the v2 model in tests/indent_model.h,
+ * and every typing case v1 answered against the v1 whole-line model. Each
+ * runs once guarded (bytes outside what the query may read on PROT_NONE
+ * pages) and once with spans that straddle those edges. A mismatch or an
+ * out-of-window read crashes the fuzzer.
  *
  * Input: [flags][cursor 2][lo 2][hi 2][width][stride][text...]
  *   flags bit 0: map text bytes onto the bytes the module distinguishes
@@ -10,70 +11,68 @@
 
 #include <stdio.h>
 
-#define T MODEL_T
+#define B MODEL_B
 enum { HEADER = 9 };
-/* (P) a cursor line longer than both typing windows, plus its CRLF. */
-#define MAX_TEXT (3u * INDENT_TYPING_BYTES + 2u)
+/* (P) a blank run past the bound on both sides of a selection, plus a CRLF. */
+#define MAX_TEXT (3u * INDENT_BLANK_BYTES + 8u)
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "indent_fuzz: %s:%d: %s\n", __FILE__, __LINE__, #c); \
     __builtin_trap(); } } while (0)
 
 static uint64_t pick(const uint8_t *d, uint64_t n) { return ((uint64_t)d[0] << 8 | d[1]) % (n + 1); }
+static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }
+static uint64_t pre(uint64_t ls, uint64_t lo) { return ls > 0 && ls < lo ? ls - 1 : ls; }
 
-static void typing_windows(uint64_t n, uint64_t lo, uint64_t hi, indent_range w[2])
+/* What the typing queries may read: [0] Enter, [1] and [2] '}'. */
+static void typing_windows(uint64_t n, uint64_t ls, uint64_t lo, uint64_t hi, indent_range w[3])
 {
-    w[0] = (indent_range){lo > T + 1 ? lo - T - 1 : 0, lo};
-    w[1] = (indent_range){hi, n - hi > T ? hi + T : n};
+    w[0] = (indent_range){pre(ls, lo), min64(lo, ls + B + 1)};
+    w[1] = (indent_range){pre(ls, lo), lo - ls > B ? ls : lo};
+    w[2] = (indent_range){hi, min64(n, hi + B + 2)};
 }
 
-static void typing(gtext *g, bool guarded, const uint8_t *b, uint64_t n, uint64_t lo, uint64_t hi, unsigned width)
+static void typing(gtext *g, bool guarded, const uint8_t *b, uint64_t n, uint64_t ls, uint64_t lo, uint64_t hi,
+                   unsigned width)
 {
-    if (guarded) {
-        indent_range w[2];
-        typing_windows(n, lo, hi, w);
-        CHECK(gtext_allow(g, w, 2));
-    }
+    indent_range w[3];
+    typing_windows(n, ls, lo, hi, w);
+    if (guarded) CHECK(gtext_allow(g, w, 1));
+    indent_range run = indent_on_enter(&g->text, ls, lo), want = model_enter(b, ls, lo);
+    CHECK(run.lo == want.lo && run.hi == want.hi);
+    if (guarded) CHECK(gtext_allow(g, w + 1, 2));
+    uint64_t from = indent_on_close_brace(&g->text, ls, lo, hi, (uint8_t)width);
+    CHECK(from == model_brace(b, n, ls, lo, hi, width));
+
+    if (ls != model_line_start(b, lo)) return;
     static uint8_t L[MAX_TEXT];
     memcpy(L, b, lo);
     memcpy(L + lo, b + hi, n - hi);
     uint64_t ln = n - (hi - lo);
-    uint8_t out[INDENT_ENTER_MAX], want[INDENT_ENTER_MAX];
-    memset(out, 0xa5, sizeof out);
-    size_t len = 99, wlen = 0;
-    indent_code rc = indent_on_enter(&g->text, lo, hi, out, &len);
-    CHECK(rc == model_enter(L, ln, lo, want, &wlen));
-    CHECK(len == wlen && memcmp(out, want, wlen) == 0);
-    for (size_t i = rc == INDENT_OK ? len : 0; i < sizeof out; i++) CHECK(out[i] == 0xa5);
-    uint64_t from = 7, wfrom = 0;
-    bool consistent = false;
-    rc = indent_on_close_brace(&g->text, lo, hi, (uint8_t)width, &from);
-    CHECK(rc == model_brace(L, ln, lo, width, &wfrom, &consistent));
-    CHECK(consistent && from == wfrom);
+    if (!model_v1_answered(L, ln, lo)) return;
+    CHECK(run.hi - run.lo == model_v1_lead(L, lo));
+    CHECK(from == model_v1_brace(L, ln, lo, width));
 }
 
 static void queries(gtext *g, bool guarded, const uint8_t *b, uint64_t n, uint64_t cursor,
                     uint64_t lo, uint64_t hi, unsigned width)
 {
-    typing(g, guarded, b, n, cursor, cursor, width);
-    typing(g, guarded, b, n, lo, hi, width);
+    typing(g, guarded, b, n, model_line_start(b, cursor), cursor, cursor, width);
+    typing(g, guarded, b, n, model_line_start(b, lo), lo, hi, width);
+    typing(g, guarded, b, n, lo, lo, hi, width); /* unknown line start */
 
     if (guarded) CHECK(gtext_allow(g, &(indent_range){lo, hi}, 1));
-    indent_pair pair;
-    indent_pair want = model_match(b, cursor, lo, hi);
-    CHECK(indent_bracket_match(&g->text, cursor, lo, hi, &pair) == INDENT_OK);
+    indent_pair pair = indent_bracket_match(&g->text, cursor, lo, hi), want = model_match(b, cursor, lo, hi);
     CHECK(pair.source == want.source && pair.mate == want.mate);
 
     static indent_range got[MAX_TEXT + 1], exp[MAX_TEXT + 1];
-    size_t count = 0, wcount = model_trailing(b, n, lo, hi, exp);
-    CHECK(indent_trailing_ws(&g->text, lo, hi, got, MAX_TEXT + 1, &count) == INDENT_OK);
+    size_t wcount = model_trailing(b, n, lo, hi, exp);
+    size_t count = indent_trailing_ws(&g->text, lo, hi, got, MAX_TEXT + 1);
     CHECK(count == wcount && memcmp(got, exp, count * sizeof *got) == 0);
-    size_t cap = width % (wcount + 1);
-    CHECK(indent_trailing_ws(&g->text, lo, hi, got, cap, &count) == (wcount > cap ? INDENT_ERR_CAPACITY : INDENT_OK));
-    CHECK(count == wcount);
+    CHECK(indent_trailing_ws(&g->text, lo, hi, got, width % (wcount + 1)) == wcount);
 
-    if (guarded) CHECK(gtext_allow(g, &(indent_range){0, n > INDENT_PREFIX_BYTES ? INDENT_PREFIX_BYTES : n}, 1));
+    if (guarded) CHECK(gtext_allow(g, &(indent_range){0, min64(n, INDENT_PREFIX_BYTES)}, 1));
     indent_style st = indent_detect(&g->text), ws = model_detect(b, n);
-    CHECK(st.kind == ws.kind && st.width == ws.width);
+    CHECK(st.kind == ws.kind && st.eol == ws.eol && st.width == ws.width);
     CHECK(g->bad == 0);
 }
 
@@ -92,7 +91,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     uint64_t stride = (uint64_t)data[8] + 1;
 
     /* Straddled: chunk edges every stride bytes only. */
-    static uint64_t cuts[MAX_TEXT + 16];
+    static uint64_t cuts[MAX_TEXT + 32];
     size_t k = 0;
     for (uint64_t at = stride; at < n; at += stride) cuts[k++] = at;
     gtext g;
@@ -103,28 +102,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* Guarded: plus every window edge the queries read up to. */
     k = 0;
     for (uint64_t at = stride; at < n; at += stride) cuts[k++] = at;
-    indent_range w[4];
-    typing_windows(n, cursor, cursor, w);
-    typing_windows(n, lo, hi, w + 2);
-    for (size_t i = 0; i < 4; i++) { cuts[k++] = w[i].lo; cuts[k++] = w[i].hi; }
+    indent_range w[9];
+    typing_windows(n, model_line_start(b, cursor), cursor, cursor, w);
+    typing_windows(n, model_line_start(b, lo), lo, hi, w + 3);
+    typing_windows(n, lo, lo, hi, w + 6);
+    for (size_t i = 0; i < 9; i++) { cuts[k++] = w[i].lo; cuts[k++] = w[i].hi; }
+    cuts[k++] = lo;
+    cuts[k++] = hi;
     cuts[k++] = INDENT_PREFIX_BYTES;
     CHECK(gtext_init(&g, b, (size_t)n, cuts, k));
     queries(&g, true, b, n, cursor, lo, hi, width);
-    gtext_fini(&g);
-
-    /* Contract errors: no output. */
-    uint8_t out[INDENT_ENTER_MAX];
-    size_t len = 99;
-    uint64_t from = 7;
-    indent_pair pair;
-    CHECK(gtext_init(&g, b, (size_t)n, NULL, 0));
-    CHECK(indent_on_enter(&g.text, n + 1, n + 1, out, &len) == INDENT_ERR_RANGE && len == 0);
-    if (lo < hi) {
-        CHECK(indent_on_enter(&g.text, hi, lo, out, &len) == INDENT_ERR_RANGE && len == 0);
-        CHECK(indent_on_close_brace(&g.text, hi, lo, (uint8_t)width, &from) == INDENT_ERR_RANGE && from == INDENT_NONE);
-        CHECK(indent_bracket_match(&g.text, cursor, hi, lo, &pair) == INDENT_ERR_RANGE && pair.mate == INDENT_NONE);
-    }
-    CHECK(indent_on_close_brace(&g.text, cursor, cursor, 0, &from) == INDENT_ERR_ARGUMENT && from == INDENT_NONE);
     gtext_fini(&g);
     return 0;
 }

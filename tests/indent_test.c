@@ -1,9 +1,12 @@
-/* indent: v1's cases, an exhaustive small-text sweep, a sweep of every
- * typing-bound edge and long bracket and prefix cases. Every query is
- * compared with the reference model in tests/indent_model.h and run twice:
- * guarded (every chunk outside the query's readable windows is PROT_NONE,
- * so a read outside them faults in every build) and straddled (spans cross
- * every window edge, so a missing clip gives a wrong answer). */
+/* indent: v1's cases, ASSERT preconditions, the degraded answers, an
+ * exhaustive small-text sweep, a sweep of every INDENT_BLANK_BYTES edge and
+ * long bracket and prefix cases. Every query is compared with the v2 model
+ * in tests/indent_model.h. Every typing case that v1 answered is also
+ * compared with the v1 whole-line model, which pins v1 behaviour for
+ * ordinary lines. Each query runs twice: guarded (every chunk outside the
+ * bytes the query may read is PROT_NONE, so a read outside them faults in
+ * every build) and straddled (spans cross every window edge, so a missing
+ * clip gives a wrong answer). */
 #include "indent_model.h"
 
 #include <signal.h>
@@ -12,10 +15,11 @@
 #include <unistd.h>
 
 static int failures;
+static size_t v1_pinned;
 #define CHECK(c, ...) do { if (!(c)) { failures++; fprintf(stderr, "%s:%d: FAIL ", __FILE__, __LINE__); \
     fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-#define T MODEL_T
+#define B MODEL_B
 #define U(x) ((unsigned long long)(x))
 
 typedef enum mode { GUARDED, STRADDLED } mode;
@@ -57,101 +61,102 @@ static void text_of(gtext *g, const char *s, bool bytes)
     else build(g, (const uint8_t *)s, n, NULL, 0);
 }
 
-/* The readable windows of a typing query: T bytes plus the terminator
- * probe before the cursor, T bytes after the selection. */
-static void typing_windows(uint64_t n, uint64_t lo, uint64_t hi, indent_range w[2])
+static uint64_t min64(uint64_t a, uint64_t b) { return a < b ? a : b; }
+
+/* The bytes a typing query may read (header contract). The precondition
+ * check reads the byte before ls unless ls is 0 or lo. */
+static uint64_t pre(uint64_t ls, uint64_t lo) { return ls > 0 && ls < lo ? ls - 1 : ls; }
+static indent_range enter_window(uint64_t ls, uint64_t lo)
 {
-    w[0] = (indent_range){lo > T + 1 ? lo - T - 1 : 0, lo};
-    w[1] = (indent_range){hi, n - hi > T ? hi + T : n};
+    return (indent_range){pre(ls, lo), min64(lo, ls + B + 1)};
+}
+static void brace_windows(uint64_t n, uint64_t ls, uint64_t lo, uint64_t hi, indent_range w[2])
+{
+    w[0] = (indent_range){pre(ls, lo), lo - ls > B ? ls : lo};
+    w[1] = (indent_range){hi, min64(n, hi + B + 2)};
 }
 
 /* ---- differential checks --------------------------------------------------- */
 
-static bool all_bytes(const uint8_t *p, size_t from, size_t to, uint8_t v)
-{
-    for (size_t i = from; i < to; i++)
-        if (p[i] != v) return false;
-    return true;
-}
-
-static void check_typing(gtext *g, const uint8_t *phys, uint64_t n, uint64_t lo, uint64_t hi,
+static void check_typing(gtext *g, const uint8_t *p, uint64_t n, uint64_t ls, uint64_t lo, uint64_t hi,
                          mode m, const unsigned *widths, size_t nw, const char *tag)
 {
+    if (m == GUARDED) allow(g, &(indent_range){enter_window(ls, lo).lo, enter_window(ls, lo).hi}, 1);
+    indent_range run = indent_on_enter(&g->text, ls, lo), want = model_enter(p, ls, lo);
+    CHECK(run.lo == want.lo && run.hi == want.hi, "%s enter n=%llu ls=%llu lo=%llu: [%llu,%llu) want [%llu,%llu)",
+          tag, U(n), U(ls), U(lo), U(run.lo), U(run.hi), U(want.lo), U(want.hi));
     if (m == GUARDED) {
         indent_range w[2];
-        typing_windows(n, lo, hi, w);
+        brace_windows(n, ls, lo, hi, w);
         allow(g, w, 2);
     }
+    uint64_t from[INDENT_MAX_WIDTH + 1];
+    for (size_t i = 0; i < nw; i++) {
+        from[i] = indent_on_close_brace(&g->text, ls, lo, hi, (uint8_t)widths[i]);
+        uint64_t wf = model_brace(p, n, ls, lo, hi, widths[i]);
+        CHECK(from[i] == wf, "%s brace n=%llu ls=%llu lo=%llu hi=%llu width=%u: from %llu want %llu",
+              tag, U(n), U(ls), U(lo), U(hi), widths[i], U(from[i]), U(wf));
+    }
+    CHECK(g->bad == 0, "%s adapter saw a seek past the text", tag);
+
+    /* v1 pin: with the true line start, every case v1 answered keeps v1's answer. */
+    if (ls != model_line_start(p, lo)) return;
     uint64_t ln = n - (hi - lo);
     uint8_t *L = malloc(ln + 1);
     if (!L) exit(1);
-    memcpy(L, phys, lo);
-    memcpy(L + lo, phys + hi, n - hi);
-
-    uint8_t out[INDENT_ENTER_MAX], want[INDENT_ENTER_MAX];
-    memset(out, 0xa5, sizeof out);
-    size_t len = 99, wlen = 0;
-    indent_code rc = indent_on_enter(&g->text, lo, hi, out, &len);
-    indent_code wrc = model_enter(L, ln, lo, want, &wlen);
-    bool untouched = all_bytes(out, rc == INDENT_OK ? len : 0, sizeof out, 0xa5);
-    CHECK(rc == wrc && len == wlen && memcmp(out, want, wlen) == 0 && untouched,
-          "%s enter n=%llu lo=%llu hi=%llu: rc %d want %d, length %zu want %zu, tail untouched %d",
-          tag, U(n), U(lo), U(hi), rc, wrc, len, wlen, untouched);
-    for (size_t i = 0; i < nw; i++) {
-        uint64_t from = 7, wfrom = 0;
-        bool consistent = false;
-        rc = indent_on_close_brace(&g->text, lo, hi, (uint8_t)widths[i], &from);
-        wrc = model_brace(L, ln, lo, widths[i], &wfrom, &consistent);
-        CHECK(consistent, "%s model brace verdict contradicts its whole line n=%llu lo=%llu", tag, U(n), U(lo));
-        CHECK(rc == wrc && from == wfrom, "%s brace n=%llu lo=%llu hi=%llu width=%u: rc %d want %d, from %llu want %llu",
-              tag, U(n), U(lo), U(hi), widths[i], rc, wrc, U(from), U(wfrom));
+    memcpy(L, p, lo);
+    memcpy(L + lo, p + hi, n - hi);
+    if (model_v1_answered(L, ln, lo)) {
+        v1_pinned++;
+        CHECK(run.hi - run.lo == model_v1_lead(L, lo), "%s v1 enter lead n=%llu lo=%llu hi=%llu", tag, U(n), U(lo), U(hi));
+        for (size_t i = 0; i < nw; i++)
+            CHECK(from[i] == model_v1_brace(L, ln, lo, widths[i]), "%s v1 brace n=%llu lo=%llu hi=%llu width=%u",
+                  tag, U(n), U(lo), U(hi), widths[i]);
     }
-    CHECK(g->bad == 0, "%s adapter saw a seek past the text", tag);
     free(L);
 }
 
-static void check_bracket(gtext *g, const uint8_t *phys, uint64_t cursor, uint64_t lo, uint64_t hi,
+static void check_bracket(gtext *g, const uint8_t *p, uint64_t cursor, uint64_t lo, uint64_t hi,
                           mode m, const char *tag)
 {
     if (m == GUARDED) allow(g, &(indent_range){lo, hi}, 1);
-    indent_pair pair = {7, 7}, want = model_match(phys, cursor, lo, hi);
-    indent_code rc = indent_bracket_match(&g->text, cursor, lo, hi, &pair);
-    CHECK(rc == INDENT_OK && pair.source == want.source && pair.mate == want.mate,
-          "%s bracket cursor=%llu [%llu,%llu): rc %d source %llu want %llu, mate %llu want %llu",
-          tag, U(cursor), U(lo), U(hi), rc, U(pair.source), U(want.source), U(pair.mate), U(want.mate));
+    indent_pair pair = indent_bracket_match(&g->text, cursor, lo, hi), want = model_match(p, cursor, lo, hi);
+    CHECK(pair.source == want.source && pair.mate == want.mate,
+          "%s bracket cursor=%llu [%llu,%llu): source %llu want %llu, mate %llu want %llu",
+          tag, U(cursor), U(lo), U(hi), U(pair.source), U(want.source), U(pair.mate), U(want.mate));
 }
 
-static void check_trailing(gtext *g, const uint8_t *phys, uint64_t n, uint64_t lo, uint64_t hi,
+static void check_trailing(gtext *g, const uint8_t *p, uint64_t n, uint64_t lo, uint64_t hi,
                            mode m, const char *tag)
 {
     if (m == GUARDED) allow(g, &(indent_range){lo, hi}, 1);
     size_t room = (size_t)(hi - lo) + 1;
     indent_range *got = calloc(room, sizeof *got), *want = calloc(room, sizeof *want);
     if (!got || !want) exit(1);
-    size_t count = 99, wcount = model_trailing(phys, n, lo, hi, want);
-    indent_code rc = indent_trailing_ws(&g->text, lo, hi, got, room, &count);
-    CHECK(rc == INDENT_OK && count == wcount && memcmp(got, want, wcount * sizeof *got) == 0,
-          "%s trailing [%llu,%llu): rc %d count %zu want %zu", tag, U(lo), U(hi), rc, count, wcount);
+    size_t wcount = model_trailing(p, n, lo, hi, want);
+    size_t count = indent_trailing_ws(&g->text, lo, hi, got, room);
+    CHECK(count == wcount && memcmp(got, want, wcount * sizeof *got) == 0,
+          "%s trailing [%llu,%llu): count %zu want %zu", tag, U(lo), U(hi), count, wcount);
     if (wcount > 0) {
         memset(got, 0, room * sizeof *got);
-        rc = indent_trailing_ws(&g->text, lo, hi, got, wcount - 1, &count);
-        CHECK(rc == INDENT_ERR_CAPACITY && count == wcount
-              && memcmp(got, want, (wcount - 1) * sizeof *got) == 0 && got[wcount - 1].hi == 0,
-              "%s trailing capacity [%llu,%llu): rc %d count %zu want %zu", tag, U(lo), U(hi), rc, count, wcount);
+        count = indent_trailing_ws(&g->text, lo, hi, got, wcount - 1);
+        CHECK(count == wcount && memcmp(got, want, (wcount - 1) * sizeof *got) == 0 && got[wcount - 1].hi == 0,
+              "%s trailing capacity [%llu,%llu): count %zu want %zu", tag, U(lo), U(hi), count, wcount);
     }
     free(got);
     free(want);
 }
 
-static void check_detect(gtext *g, const uint8_t *phys, uint64_t n, mode m, const char *tag)
+static void check_detect(gtext *g, const uint8_t *p, uint64_t n, mode m, const char *tag)
 {
-    if (m == GUARDED) allow(g, &(indent_range){0, n > INDENT_PREFIX_BYTES ? INDENT_PREFIX_BYTES : n}, 1);
-    indent_style got = indent_detect(&g->text), want = model_detect(phys, n);
-    CHECK(got.kind == want.kind && got.width == want.width, "%s detect n=%llu: %d/%u want %d/%u",
-          tag, U(n), got.kind, got.width, want.kind, want.width);
+    if (m == GUARDED) allow(g, &(indent_range){0, min64(n, INDENT_PREFIX_BYTES)}, 1);
+    indent_style got = indent_detect(&g->text), want = model_detect(p, n);
+    CHECK(got.kind == want.kind && got.eol == want.eol && got.width == want.width,
+          "%s detect n=%llu: %d/%d/%u want %d/%d/%u", tag, U(n), got.kind, got.eol, got.width,
+          want.kind, want.eol, want.width);
 }
 
-/* ---- guard positive control ------------------------------------------------- */
+/* ---- forked probes: guard positive control and ASSERT preconditions -------- */
 
 enum { PROBE_FAULTED = 3 };
 static void on_segv(int sig)
@@ -200,18 +205,70 @@ static bool guard_armed(void)
         && after2 == PROBE_FAULTED && out3 == PROBE_FAULTED;
 }
 
+typedef enum call { C_ENTER, C_BRACE, C_BRACKET, C_TRAILING } call;
+typedef struct bad_call { call c; uint64_t a, b, d; unsigned width; const char *what; } bad_call;
+
+/* The call must die by the always-on ASSERT (SIGABRT); its message goes to /dev/null. */
+static bool dies(const indent_text *t, bad_call k)
+{
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        FILE *null = freopen("/dev/null", "w", stderr);
+        (void)null;
+        switch (k.c) {
+        case C_ENTER: (void)indent_on_enter(t, k.a, k.b); break;
+        case C_BRACE: (void)indent_on_close_brace(t, k.a, k.b, k.d, (uint8_t)k.width); break;
+        case C_BRACKET: (void)indent_bracket_match(t, k.a, k.b, k.d); break;
+        case C_TRAILING: (void)indent_trailing_ws(t, k.a, k.b, NULL, 0); break;
+        }
+        _exit(0);
+    }
+    int status = 0;
+    return waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+
+static void assert_cases(void)
+{
+    gtext g;
+    text_of(&g, "ab\ncd", false); /* length 5, line starts 0 and 3 */
+    static const bad_call bad[] = {
+        {C_ENTER, 2, 1, 0, 0, "enter line_start > lo"},
+        {C_ENTER, 3, 6, 0, 0, "enter lo past the text"},
+        {C_ENTER, 1, 2, 0, 0, "enter line_start not after a LF"},
+        {C_BRACE, 3, 4, 3, 4, "brace hi < lo"},
+        {C_BRACE, 3, 4, 6, 4, "brace hi past the text"},
+        {C_BRACE, 4, 5, 5, 4, "brace line_start not after a LF"},
+        {C_BRACE, 3, 4, 4, 0, "brace width 0"},
+        {C_BRACE, 3, 4, 4, INDENT_MAX_WIDTH + 1, "brace width 17"},
+        {C_BRACKET, 6, 0, 5, 0, "bracket cursor past the text"},
+        {C_BRACKET, 2, 3, 2, 0, "bracket lo > hi"},
+        {C_BRACKET, 2, 0, 6, 0, "bracket hi past the text"},
+        {C_TRAILING, 3, 2, 0, 0, "trailing lo > hi"},
+        {C_TRAILING, 0, 6, 0, 0, "trailing hi past the text"},
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++)
+        CHECK(dies(&g.text, bad[i]), "ASSERT did not fire: %s", bad[i].what);
+    /* The boundaries themselves are legal. */
+    CHECK(indent_on_close_brace(&g.text, 3, 5, 5, INDENT_MAX_WIDTH) == 5, "width 16, caret at the end");
+    CHECK(indent_on_enter(&g.text, 5, 5).lo == 5, "line_start == lo == length");
+    gtext_fini(&g);
+    printf("indent_test: %zu precondition violations die by ASSERT\n", sizeof bad / sizeof bad[0]);
+}
+
 /* ---- v1 cases (tests/indent_test.c at the pin, on the v2 API) --------------- */
 
-static void enter_case(const char *s, uint64_t lo, uint64_t hi, const char *want)
+static void enter_case(const char *s, uint64_t lo, uint64_t want_lead)
 {
     for (int bytes = 0; bytes < 2; bytes++) {
         gtext g;
-    text_of(&g, s, bytes);
-        uint8_t out[INDENT_ENTER_MAX];
-        size_t n = 99;
-        indent_code rc = indent_on_enter(&g.text, lo, hi, out, &n);
-        CHECK(rc == INDENT_OK && n == strlen(want) && memcmp(out, want, n) == 0,
-              "enter \"%s\" [%llu,%llu): rc %d length %zu", s, U(lo), U(hi), rc, n);
+        text_of(&g, s, bytes);
+        uint64_t ls = model_line_start((const uint8_t *)s, lo);
+        indent_range r = indent_on_enter(&g.text, ls, lo);
+        CHECK(r.lo == ls && r.hi - r.lo == want_lead, "enter \"%s\" at %llu: [%llu,%llu) want %llu blanks",
+              s, U(lo), U(r.lo), U(r.hi), U(want_lead));
         gtext_fini(&g);
     }
 }
@@ -220,47 +277,29 @@ static void brace_case(const char *s, uint64_t cursor, unsigned width, uint64_t 
 {
     for (int bytes = 0; bytes < 2; bytes++) {
         gtext g;
-    text_of(&g, s, bytes);
-        uint64_t from = 7;
-        indent_code rc = indent_on_close_brace(&g.text, cursor, cursor, (uint8_t)width, &from);
-        CHECK(rc == INDENT_OK && from == want, "brace \"%s\" at %llu width %u: rc %d from %llu want %llu",
-              s, U(cursor), width, rc, U(from), U(want));
+        text_of(&g, s, bytes);
+        uint64_t ls = model_line_start((const uint8_t *)s, cursor);
+        uint64_t from = indent_on_close_brace(&g.text, ls, cursor, cursor, (uint8_t)width);
+        CHECK(from == want, "brace \"%s\" at %llu width %u: from %llu want %llu", s, U(cursor), width, U(from), U(want));
         gtext_fini(&g);
     }
 }
 
 static void match_case(const indent_text *t, uint64_t cursor, uint64_t lo, uint64_t hi, uint64_t want)
 {
-    indent_pair p = {0, 0};
-    indent_code rc = indent_bracket_match(t, cursor, lo, hi, &p);
-    CHECK(rc == INDENT_OK && p.mate == want && (want == INDENT_NONE) == (p.source == INDENT_NONE),
-          "match cursor=%llu [%llu,%llu): rc %d mate %llu want %llu", U(cursor), U(lo), U(hi), rc, U(p.mate), U(want));
+    indent_pair p = indent_bracket_match(t, cursor, lo, hi);
+    CHECK(p.mate == want && (want == INDENT_NONE) == (p.source == INDENT_NONE),
+          "match cursor=%llu [%llu,%llu): mate %llu want %llu", U(cursor), U(lo), U(hi), U(p.mate), U(want));
 }
 
 static void v1_cases(void)
 {
-    enter_case("", 0, 0, "\n"); enter_case("  a", 3, 3, "\n  ");
-    enter_case("\t  a\n", 4, 4, "\n\t  "); enter_case("\t  a\n", 5, 5, "\n");
-    enter_case("    abc", 2, 2, "\n  "); enter_case("  {", 3, 3, "\n  ");
-    enter_case("  x\r\n\ty", 7, 7, "\r\n\t"); enter_case("  x\r\n", 3, 3, "\r\n  ");
-    enter_case("  x\r\n", 5, 5, "\r\n"); enter_case("\tfoo\r\n", 2, 2, "\r\n\t");
-    /* Selections: the omitted bytes are not part of the line. */
-    enter_case("    XX\n", 4, 6, "\n    "); enter_case("  x\r\n\ty", 6, 7, "\r\n\t");
-
-    gtext g;
-    text_of(&g, "a\r\n", false);
-    uint8_t out[INDENT_ENTER_MAX];
-    size_t n = 99;
-    uint64_t from = 7;
-    CHECK(indent_on_enter(&g.text, 2, 2, out, &n) == INDENT_ERR_RANGE && n == 0, "enter between CR and LF");
-    CHECK(indent_on_enter(&g.text, 4, 4, out, &n) == INDENT_ERR_RANGE && n == 0, "enter past the end");
-    CHECK(indent_on_enter(&g.text, 2, 1, out, &n) == INDENT_ERR_RANGE && n == 0, "enter lo > hi");
-    CHECK(indent_on_close_brace(&g.text, 2, 2, 4, &from) == INDENT_ERR_RANGE && from == INDENT_NONE, "brace CR|LF");
-    CHECK(indent_on_close_brace(&g.text, 0, 4, 4, &from) == INDENT_ERR_RANGE && from == INDENT_NONE, "brace hi > n");
-    CHECK(indent_on_close_brace(&g.text, 0, 0, 0, &from) == INDENT_ERR_ARGUMENT && from == INDENT_NONE, "width 0");
-    CHECK(indent_on_close_brace(&g.text, 0, 0, INDENT_MAX_WIDTH + 1, &from) == INDENT_ERR_ARGUMENT, "width 17");
-    CHECK(indent_on_close_brace(&g.text, 0, 0, INDENT_MAX_WIDTH, &from) == INDENT_OK && from == 0, "width 16");
-    gtext_fini(&g);
+    /* v1 expected "\n" + these bytes (or "\r\n" + them); the line break is now the buffer's. */
+    enter_case("", 0, 0); enter_case("  a", 3, 2);
+    enter_case("\t  a\n", 4, 3); enter_case("\t  a\n", 5, 0);
+    enter_case("    abc", 2, 2); enter_case("  {", 3, 2);
+    enter_case("  x\r\n\ty", 7, 1); enter_case("  x\r\n", 3, 2);
+    enter_case("  x\r\n", 5, 0); enter_case("\tfoo\r\n", 2, 1);
 
     brace_case("", 0, 4, 0); brace_case("        ", 8, 4, 4);
     brace_case("      \r\n", 6, 4, 4); brace_case("\t\t", 2, 4, 1);
@@ -270,6 +309,7 @@ static void v1_cases(void)
     brace_case("  \t", 3, 3, 0); /* tab columns use the caller's width */
 
     const char bracket_text[] = "\xc3\xa9{([])}x";
+    gtext g;
     for (int bytes = 0; bytes < 2; bytes++) {
         text_of(&g, bracket_text, bytes);
         match_case(&g.text, 2, 2, 8, 7); match_case(&g.text, 8, 2, 8, 2);
@@ -278,10 +318,6 @@ static void v1_cases(void)
         match_case(&g.text, 2, 2, 7, INDENT_NONE); match_case(&g.text, 7, 3, 8, INDENT_NONE);
         match_case(&g.text, 0, 0, 9, INDENT_NONE); match_case(&g.text, 9, 0, 9, INDENT_NONE);
         match_case(&g.text, 2, 2, 2, INDENT_NONE);
-        indent_pair p;
-        CHECK(indent_bracket_match(&g.text, 10, 0, 9, &p) == INDENT_ERR_RANGE && p.source == INDENT_NONE, "cursor > n");
-        CHECK(indent_bracket_match(&g.text, 2, 8, 2, &p) == INDENT_ERR_RANGE && p.mate == INDENT_NONE, "lo > hi");
-        CHECK(indent_bracket_match(&g.text, 2, 0, 10, &p) == INDENT_ERR_RANGE, "hi > n");
         gtext_fini(&g);
     }
     text_of(&g, "\"{\"}\r\n", false);
@@ -292,88 +328,105 @@ static void v1_cases(void)
     for (int bytes = 0; bytes < 2; bytes++) {
         text_of(&g, ws, bytes);
         indent_range r[8];
-        size_t c = 0;
-        CHECK(indent_trailing_ws(&g.text, 0, 15, r, 8, &c) == INDENT_OK && c == 4
-              && r[0].lo == 1 && r[0].hi == 3 && r[1].lo == 5 && r[1].hi == 7
+        size_t c = indent_trailing_ws(&g.text, 0, 15, r, 8);
+        CHECK(c == 4 && r[0].lo == 1 && r[0].hi == 3 && r[1].lo == 5 && r[1].hi == 7
               && r[2].lo == 10 && r[2].hi == 11 && r[3].lo == 13 && r[3].hi == 15, "trailing v1 text: %zu", c);
-        CHECK(indent_trailing_ws(&g.text, 2, 5, r, 8, &c) == INDENT_OK && c == 1 && r[0].lo == 2 && r[0].hi == 3,
-              "trailing clipped start");
-        CHECK(indent_trailing_ws(&g.text, 0, 4, r, 8, &c) == INDENT_OK && c == 0, "trailing cut run");
-        CHECK(indent_trailing_ws(&g.text, 0, 15, r, 1, &c) == INDENT_ERR_CAPACITY && c == 4, "trailing capacity");
-        CHECK(indent_trailing_ws(&g.text, 0, 15, NULL, 0, &c) == INDENT_ERR_CAPACITY && c == 4, "trailing count only");
-        CHECK(indent_trailing_ws(&g.text, 8, 3, r, 8, &c) == INDENT_ERR_RANGE && c == 0, "trailing lo > hi");
+        c = indent_trailing_ws(&g.text, 2, 5, r, 8);
+        CHECK(c == 1 && r[0].lo == 2 && r[0].hi == 3, "trailing clipped start");
+        CHECK(indent_trailing_ws(&g.text, 0, 4, r, 8) == 0, "trailing cut run");
+        CHECK(indent_trailing_ws(&g.text, 0, 15, r, 1) == 4, "trailing capacity");
+        CHECK(indent_trailing_ws(&g.text, 0, 15, NULL, 0) == 4, "trailing count only");
         gtext_fini(&g);
     }
 
-    struct { const char *s; indent_kind kind; unsigned width; } det[] = {
-        {"", INDENT_SPACES, 4}, {"x\n \t \r\n", INDENT_SPACES, 4},
-        {"  a\r\n    b\r\n", INDENT_SPACES, 2}, {"    a\n        b", INDENT_SPACES, 4},
-        {"\ta\n\t b\n  c", INDENT_TABS, 2}, {"\ta\n  b", INDENT_SPACES, 2},
-        {"   a\n      b", INDENT_SPACES, 3}, {" a", INDENT_SPACES, 1},
+    struct { const char *s; indent_kind kind; indent_eol eol; unsigned width; } det[] = {
+        {"", INDENT_SPACES, INDENT_LF, 4}, {"x\n \t \r\n", INDENT_SPACES, INDENT_LF, 4},
+        {"  a\r\n    b\r\n", INDENT_SPACES, INDENT_CRLF, 2}, {"    a\n        b", INDENT_SPACES, INDENT_LF, 4},
+        {"\ta\n\t b\n  c", INDENT_TABS, INDENT_LF, 2}, {"\ta\n  b", INDENT_SPACES, INDENT_LF, 2},
+        {"   a\n      b", INDENT_SPACES, INDENT_LF, 3}, {" a", INDENT_SPACES, INDENT_LF, 1},
         /* v2: "nonblank" means a byte other than SP, TAB, CR (v1 counted "  \r " as content). */
-        {"\t\r \n  a\n", INDENT_SPACES, 2},
+        {"\t\r \n  a\n", INDENT_SPACES, INDENT_LF, 2},
+        /* v2: the line break votes; a tie chooses LF. */
+        {"a\r\nb\r\nc\n", INDENT_SPACES, INDENT_CRLF, 4}, {"a\r\nb\n", INDENT_SPACES, INDENT_LF, 4},
+        {"\r\n", INDENT_SPACES, INDENT_CRLF, 4},
     };
     for (size_t i = 0; i < sizeof det / sizeof det[0]; i++) {
         text_of(&g, det[i].s, true);
         indent_style st = indent_detect(&g.text);
-        CHECK(st.kind == det[i].kind && st.width == det[i].width, "detect \"%s\": %d/%u", det[i].s, st.kind, st.width);
+        CHECK(st.kind == det[i].kind && st.eol == det[i].eol && st.width == det[i].width,
+              "detect \"%s\": %d/%d/%u", det[i].s, st.kind, st.eol, st.width);
         gtext_fini(&g);
     }
 }
 
-/* ---- ERR_LIMIT: no writes, and only when the answer needs unread bytes ------ */
+/* ---- v1's ERR_LIMIT and ERR_RANGE cases now have defined answers ------------ */
 
-static void limit_cases(void)
+static void defined_cases(void)
 {
-    size_t n = 4 * T;
-    uint8_t *spaces = malloc(n), *solid = malloc(n);
-    if (!spaces || !solid) exit(1);
-    memset(spaces, ' ', n);
+    size_t n = 4 * B;
+    uint8_t *blank = malloc(n), *solid = malloc(n);
+    if (!blank || !solid) exit(1);
+    memset(blank, ' ', n);
     memset(solid, 'x', n);
-    uint64_t cuts[] = {T, 3 * T};
+    memcpy(solid, "    ", 4);
+    uint64_t cuts[] = {5, B, B + 1, B + 2, 3 * B};
     gtext g;
-    build(&g, spaces, n, cuts, 2);
-    uint8_t out[INDENT_ENTER_MAX];
-    for (int side = 0; side < 2; side++) {
-        uint64_t c = side ? n : 0;
-        /* Only the typing window on the open side is readable. */
-        allow(&g, &(indent_range){side ? 3 * T : 0, side ? n : T}, 1);
-        memset(out, 0xa5, sizeof out);
-        size_t len = 99;
-        uint64_t from = 7;
-        CHECK(indent_on_enter(&g.text, c, c, out, &len) == INDENT_ERR_LIMIT && len == 0
-              && all_bytes(out, 0, sizeof out, 0xa5), "enter on a 4T blank line at %llu: limit, no writes", U(c));
-        CHECK(indent_on_close_brace(&g.text, c, c, 4, &from) == INDENT_ERR_LIMIT && from == INDENT_NONE,
-              "brace on a 4T blank line at %llu: limit", U(c));
-    }
-    /* A giant selection is never read: [T, 3T) stays PROT_NONE. */
-    uint8_t *sel = malloc(n);
-    if (!sel) exit(1);
-    memset(sel, ' ', n);
-    sel[n - 1] = '\n';
-    gtext_fini(&g);
-    build(&g, sel, n, cuts, 2);
-    allow(&g, (indent_range[]){{0, T}, {3 * T, n}}, 2);
-    size_t len = 99;
-    uint64_t from = 7;
-    CHECK(indent_on_enter(&g.text, T, 3 * T, out, &len) == INDENT_OK && len == T + 1 && out[0] == '\n'
-          && all_bytes(out, 1, T + 1, ' '), "enter over a giant selection: length %zu", len);
-    CHECK(indent_on_close_brace(&g.text, T, 3 * T, 4, &from) == INDENT_OK && from == T - 4,
-          "brace over a giant selection: from %llu", U(from));
+    build(&g, blank, n, cuts, 5);
+    /* A blank line longer than the bound: Enter and '}' read at most B + 1
+     * bytes and take the degraded answer; nothing past [0, B + 1) is readable. */
+    allow(&g, &(indent_range){0, B + 1}, 1);
+    indent_range r = indent_on_enter(&g.text, 0, n);
+    CHECK(r.lo == 0 && r.hi == 0, "enter after a 4B blank run: degraded empty run, got [%llu,%llu)", U(r.lo), U(r.hi));
+    CHECK(indent_on_close_brace(&g.text, 0, n, n, 4) == n, "brace after a 4B blank run: plain insertion");
+    allow(&g, &(indent_range){0, B + 1}, 1);
+    r = indent_on_enter(&g.text, 0, B + 1);
+    CHECK(r.hi == 0, "enter after B + 1 blanks: degraded");
+    allow(&g, &(indent_range){0, B}, 1);
+    r = indent_on_enter(&g.text, 0, B);
+    CHECK(r.lo == 0 && r.hi == B, "enter after exactly B blanks: the full run, got %llu", U(r.hi));
+    /* Caret at the line start of a 4B blank line (v1: LIMIT). */
+    allow(&g, &(indent_range){0, B + 2}, 1);
+    r = indent_on_enter(&g.text, 0, 0);
+    CHECK(r.lo == 0 && r.hi == 0, "enter at the start of a long blank line: empty run");
+    CHECK(indent_on_close_brace(&g.text, 0, 0, 0, 4) == 0, "brace at the start of a long blank line: degraded plain");
     gtext_fini(&g);
 
-    /* v1 returned LIMIT here; content inside the windows decides the answer. */
-    build(&g, solid, n, NULL, 0);
-    for (int side = 0; side < 2; side++) {
-        uint64_t c = side ? n : 0;
-        CHECK(indent_on_close_brace(&g.text, c, c, 4, &from) == INDENT_OK && from == c,
-              "brace on a 4T solid line at %llu: from %llu", U(c), U(from));
-        CHECK(indent_on_enter(&g.text, c, c, out, &len) == INDENT_ERR_LIMIT, "enter on a 4T solid line still limits");
-    }
+    /* F1: Enter far into a long solid line keeps the line's indent (v1: LIMIT, a rejected keystroke). */
+    build(&g, solid, n, cuts, 5);
+    allow(&g, &(indent_range){0, 5}, 1);
+    r = indent_on_enter(&g.text, 0, n);
+    CHECK(r.lo == 0 && r.hi == 4, "enter at the end of a 4B solid line: [%llu,%llu) want [0,4)", U(r.lo), U(r.hi));
+    CHECK(indent_on_close_brace(&g.text, 0, n, n, 4) == n, "brace at the end of a 4B solid line: plain");
     gtext_fini(&g);
-    free(spaces);
+
+    /* A giant selection is never read. */
+    blank[n - 1] = '\n';
+    build(&g, blank, n, cuts, 5);
+    allow(&g, (indent_range[]){{0, B}, {3 * B, n}}, 2);
+    r = indent_on_enter(&g.text, 0, B);
+    CHECK(r.hi == B, "enter before a giant selection");
+    CHECK(indent_on_close_brace(&g.text, 0, B, 3 * B, 4) == B - 4, "brace over a giant selection");
+    gtext_fini(&g);
+
+    /* Caret between CR and LF (v1: ERR_RANGE). Input can put it there, e.g.
+     * pasting "\r" before a LF, so it is an answer, not an assertion. */
+    text_of(&g, "  x\r\n", true);
+    r = indent_on_enter(&g.text, 0, 4);
+    CHECK(r.lo == 0 && r.hi == 2, "enter between CR and LF copies the line's run");
+    CHECK(indent_on_close_brace(&g.text, 0, 4, 4, 4) == 4, "brace between CR and LF: plain (x and CR are text)");
+    gtext_fini(&g);
+    text_of(&g, "    \r\n", true);
+    CHECK(indent_on_close_brace(&g.text, 0, 5, 5, 4) == 5, "brace after a blank run and a CR: plain");
+    gtext_fini(&g);
+
+    /* Unknown line start: the caller passes lo. */
+    text_of(&g, "\n        ", true);
+    r = indent_on_enter(&g.text, 9, 9);
+    CHECK(r.lo == 9 && r.hi == 9, "enter with an unknown line start: bare line break");
+    CHECK(indent_on_close_brace(&g.text, 9, 9, 9, 4) == 9, "brace with an unknown line start: plain");
+    gtext_fini(&g);
+    free(blank);
     free(solid);
-    free(sel);
 }
 
 /* ---- exhaustive small texts ------------------------------------------------- */
@@ -403,10 +456,11 @@ static void small_sweep(void)
                 mode m = pass == 0 ? GUARDED : STRADDLED;
                 for (uint64_t lo = 0; lo <= n; lo++)
                     for (uint64_t hi = lo; hi <= n; hi++) {
-                        check_typing(g, b, n, lo, hi, m, widths, 4, "small");
+                        check_typing(g, b, n, model_line_start(b, lo), lo, hi, m, widths, 4, "small");
+                        check_typing(g, b, n, lo, lo, hi, m, widths, 4, "small unknown-start");
                         check_trailing(g, b, n, lo, hi, m, "small");
                         for (uint64_t c = 0; c <= n; c++) check_bracket(g, b, c, lo, hi, m, "small");
-                        queries += 3 + n;
+                        queries += 2 * 5 + 1 + n + 1;
                     }
                 check_detect(g, b, n, m, "small");
             }
@@ -419,68 +473,73 @@ static void small_sweep(void)
            texts, SMALL_MAX, 2 * queries);
 }
 
-/* ---- typing-bound edges ------------------------------------------------------- */
+/* ---- INDENT_BLANK_BYTES edges ------------------------------------------------ */
 
 /* The cursor line is head + fill1 * k1 | selection | fill2 * k2 + tail. The k
- * values put the previous LF, the text start, the line's LF, its CR and the
- * text end one byte inside and one byte outside each typing window (P). */
+ * values put a blank run one byte inside and one byte past the bound on each
+ * side of the caret (P); the tails cover LF, CRLF, a lone CR, text and the end. */
 static void bound_sweep(void)
 {
     static const char *heads[] = {"", "\n", "\r\n", "x\n"};
-    static const char *tails[] = {"", "\n", "\r\n", "x"};
-    static const uint64_t k1s[] = {2, T - 1, T, T + 1};
-    static const uint64_t k2s[] = {2, T - 2, T - 1, T, T + 1};
-    static const uint64_t sels[] = {0, 1, T + 1};
-    static const uint8_t fills[] = {' ', 'x', '\t'};
-    static const unsigned widths[] = {3, 4}; /* (P) one width divides T, one does not */
+    static const char *tails[] = {"", "\n", "\r\n", "x", "\r", "\r\r"};
+    static const uint64_t ks[] = {0, 2, B, B + 1};
+    static const uint64_t sels[] = {0, 1, B + 2};
+    static const uint8_t fills[] = {' ', '\t', 'x'};
+    static const unsigned widths[] = {3, 4}; /* (P) one width divides B, one does not */
     size_t cases = 0;
-    uint8_t *b = malloc(4 * T);
+    uint8_t *b = malloc(4 * B);
     if (!b) exit(1);
     for (size_t h = 0; h < 4; h++)
     for (size_t i1 = 0; i1 < 4; i1++)
     for (size_t f1 = 0; f1 < 3; f1++)
     for (size_t s = 0; s < 3; s++)
-    for (size_t i2 = 0; i2 < 5; i2++)
+    for (size_t i2 = 0; i2 < 4; i2++)
     for (size_t f2 = 0; f2 < 3; f2++)
-    for (size_t t = 0; t < 4; t++) {
+    for (size_t t = 0; t < 6; t++) {
         uint64_t n = 0;
         memcpy(b, heads[h], strlen(heads[h]));
         n += strlen(heads[h]);
-        memset(b + n, fills[f1], k1s[i1]);
-        n += k1s[i1];
+        uint64_t ls = n;
+        memset(b + n, fills[f1], ks[i1]);
+        n += ks[i1];
         uint64_t lo = n;
         for (uint64_t j = 0; j < sels[s]; j++) b[n++] = j % 2 ? 'x' : '\n';
         uint64_t hi = n;
-        memset(b + n, fills[f2], k2s[i2]);
-        n += k2s[i2];
+        memset(b + n, fills[f2], ks[i2]);
+        n += ks[i2];
         memcpy(b + n, tails[t], strlen(tails[t]));
         n += strlen(tails[t]);
 
-        indent_range w[2];
-        typing_windows(n, lo, hi, w);
-        uint64_t edges[] = {w[0].lo, w[0].hi, w[1].lo, w[1].hi};
-        uint64_t cuts[12];
-        size_t k = 0;
-        for (size_t e = 0; e < 4; e++) cuts[k++] = edges[e];
-        cuts[k++] = (w[0].lo + w[0].hi) / 2;
-        cuts[k++] = (w[1].lo + w[1].hi) / 2;
-        gtext g;
-        build(&g, b, n, cuts, k);
-        check_typing(&g, b, n, lo, hi, GUARDED, widths, 2, "bound");
-        gtext_fini(&g);
-        k = 0;
-        for (size_t e = 0; e < 4; e++) {
-            if (edges[e] > 0) cuts[k++] = edges[e] - 1;
-            cuts[k++] = edges[e] + 1;
+        for (int unknown = 0; unknown < 2; unknown++) {
+            uint64_t start = unknown ? lo : ls;
+            indent_range w[3];
+            w[0] = enter_window(start, lo);
+            brace_windows(n, start, lo, hi, w + 1);
+            uint64_t cuts[16];
+            size_t k = 0;
+            for (size_t e = 0; e < 3; e++) { cuts[k++] = w[e].lo; cuts[k++] = w[e].hi; }
+            cuts[k++] = (w[0].lo + w[0].hi) / 2;
+            cuts[k++] = (w[2].lo + w[2].hi) / 2;
+            gtext g;
+            build(&g, b, n, cuts, k);
+            check_typing(&g, b, n, start, lo, hi, GUARDED, widths, 2, "bound");
+            gtext_fini(&g);
+            k = 0;
+            for (size_t e = 0; e < 3; e++)
+                for (int side = 0; side < 2; side++) {
+                    uint64_t edge = side ? w[e].hi : w[e].lo;
+                    if (edge > 0) cuts[k++] = edge - 1;
+                    cuts[k++] = edge + 1;
+                }
+            build(&g, b, n, cuts, k);
+            check_typing(&g, b, n, start, lo, hi, STRADDLED, widths, 2, "bound");
+            gtext_fini(&g);
         }
-        build(&g, b, n, cuts, k);
-        check_typing(&g, b, n, lo, hi, STRADDLED, widths, 2, "bound");
-        gtext_fini(&g);
         cases++;
     }
     free(b);
-    printf("indent_test: bound sweep: %zu cursor lines around INDENT_TYPING_BYTES=%u, guarded and straddled\n",
-           cases, INDENT_TYPING_BYTES);
+    printf("indent_test: bound sweep: %zu cursor lines around INDENT_BLANK_BYTES=%u, true and unknown line start, "
+           "guarded and straddled\n", cases, INDENT_BLANK_BYTES);
 }
 
 /* ---- long bracket windows and the detection prefix ----------------------------- */
@@ -488,20 +547,20 @@ static void bound_sweep(void)
 static void long_cases(void)
 {
     /* Brackets on both sides of the backward copy blocks' edges, which lie at
-     * multiples of T below the source (P). */
-    uint64_t n = 3 * T + 5;
+     * multiples of the block size below the source (P). */
+    uint64_t blk = INDENT_BLANK_BYTES, n = 3 * blk + 5;
     uint8_t *b = malloc(n);
     if (!b) exit(1);
     memset(b, 'x', n);
-    uint64_t at[] = {0, 1, 2, 4, T - 1, T, T + 1, T + 4, 2 * T, 2 * T + 3, 3 * T, 3 * T + 3, 3 * T + 4};
+    uint64_t at[] = {0, 1, 2, 4, blk - 1, blk, blk + 1, blk + 4, 2 * blk, 2 * blk + 3, 3 * blk, 3 * blk + 3, 3 * blk + 4};
     const char kinds[] = "{({[{]}}(){})";
     for (size_t i = 0; i < sizeof at / sizeof at[0]; i++) b[at[i]] = (uint8_t)kinds[i];
     for (int win = 0; win < 2; win++) {
         uint64_t lo = win ? 1 : 0, hi = win ? n - 1 : n;
-        uint64_t cuts[] = {lo, hi, T / 2, 2 * T + 1};
+        uint64_t cuts[] = {lo, hi, blk / 2, 2 * blk + 1};
         gtext guarded, straddled;
         build(&guarded, b, n, cuts, 4);
-        uint64_t scuts[] = {lo + 1, hi - 1, T + 2};
+        uint64_t scuts[] = {lo + 1, hi - 1, blk + 2};
         build(&straddled, b, n, scuts, 3);
         for (size_t i = 0; i < sizeof at / sizeof at[0]; i++)
             for (uint64_t c = at[i]; c <= at[i] + 1; c++) {
@@ -515,20 +574,21 @@ static void long_cases(void)
     free(b);
 
     /* Detection reads only the prefix; the line it cuts does not vote. */
-    n = INDENT_PREFIX_BYTES + T;
+    n = INDENT_PREFIX_BYTES + blk;
     b = malloc(n);
     if (!b) exit(1);
     memset(b, 'x', n);
-    memcpy(b, "  a\n    b\n", 10);
+    memcpy(b, "  a\r\n    b\r\n", 12);
     b[INDENT_PREFIX_BYTES - 8] = '\n';
     memcpy(b + INDENT_PREFIX_BYTES - 7, "\t\t\t\t\t\t\t", 7); /* cut line: would vote tabs */
-    b[INDENT_PREFIX_BYTES + 2] = '\n';
+    for (uint64_t i = INDENT_PREFIX_BYTES + 2; i + 1 < n; i += 4) memcpy(b + i, "\t\n", 2); /* unread: LF lines */
     uint64_t cut = INDENT_PREFIX_BYTES;
     gtext g;
     build(&g, b, n, &cut, 1);
     check_detect(&g, b, n, GUARDED, "prefix");
     indent_style st = indent_detect(&g.text);
-    CHECK(st.kind == INDENT_SPACES && st.width == 2, "prefix detect %d/%u", st.kind, st.width);
+    CHECK(st.kind == INDENT_SPACES && st.eol == INDENT_CRLF && st.width == 2, "prefix detect %d/%d/%u",
+          st.kind, st.eol, st.width);
     gtext_fini(&g);
     uint64_t scut = INDENT_PREFIX_BYTES - 1;
     build(&g, b, n, &scut, 1);
@@ -543,11 +603,13 @@ int main(void)
         fprintf(stderr, "indent_test: FAIL guard pages not armed; guarded runs would be inert\n");
         return 1;
     }
+    assert_cases();
     v1_cases();
-    limit_cases();
+    defined_cases();
     small_sweep();
     bound_sweep();
     long_cases();
+    printf("indent_test: %zu typing cases v1 answered keep v1's answer\n", v1_pinned);
     if (failures) {
         fprintf(stderr, "indent_test: %d FAILURES\n", failures);
         return 1;

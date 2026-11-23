@@ -3,7 +3,9 @@
  * failure and exits 1. Rows follow v1 bench/indent_bench.c; its corpus
  * files are replaced by a generated C-like text, and each typing row runs
  * over one span (a flat buffer) and over one-byte spans (P: the most
- * fragmented text a span iterator can present). */
+ * fragmented text a span iterator can present). The worst_blank rows read
+ * the most a typing query can read; their per-byte cost derives
+ * INDENT_BLANK_BYTES (docs/decisions/v2-0fv.12.md). */
 #include "indent/indent.h"
 #include "os/os.h"
 #include "trace/trace.h"
@@ -15,8 +17,10 @@
 
 /* v1 bench sample counts and viewport rows. */
 enum { TYPING_SAMPLES = 20000, DETECT_SAMPLES = 2000, VIEW_ROWS = 300 };
-/* v1 long-line fixture: 32 KiB of spaces, four typing windows. */
-#define LONG_BYTES (4u * INDENT_TYPING_BYTES)
+/* Worst-case typing line: "\n", B blanks, the caret, B blanks, "\n". '}'
+ * reads both blank parts and the LF, 2B + 1 bytes; Enter at the line end
+ * reads B + 1 of its 2B blanks (P). */
+#define WORST_BYTES (2u * INDENT_BLANK_BYTES + 2u)
 
 typedef struct source {
     const uint8_t *bytes;
@@ -89,61 +93,73 @@ static size_t generate(uint8_t *out, size_t cap, uint64_t *ends, size_t *nends)
 
 int main(void)
 {
-    static uint8_t code[2u * INDENT_PREFIX_BYTES], spaces[LONG_BYTES];
+    static uint8_t code[2u * INDENT_PREFIX_BYTES], worst[WORST_BYTES];
     uint64_t ends[VIEW_ROWS];
     size_t nends;
     uint64_t len = generate(code, sizeof code, ends, &nends);
-    memset(spaces, ' ', sizeof spaces);
+    const uint64_t blank = INDENT_BLANK_BYTES, caret = 1 + blank;
+    memset(worst, ' ', sizeof worst);
+    worst[0] = '\n';
+    worst[sizeof worst - 1] = '\n';
     uint64_t brackets[VIEW_ROWS * 16];
     size_t nb = 0, view = (size_t)ends[nends - 1];
     for (size_t i = 0; i < view && nb < sizeof brackets / sizeof brackets[0]; i++)
         if (strchr("()[]{}", code[i])) brackets[nb++] = i;
     int bad = nends != VIEW_ROWS || nb == 0;
+    /* Line starts of the Enter cursors: what the caller hands in. */
+    uint64_t starts[VIEW_ROWS];
+    for (size_t r = 0; r < nends; r++) {
+        uint64_t s = ends[r];
+        while (s > 0 && code[s - 1] != '\n') s--;
+        starts[r] = s;
+    }
 
     stamp("start");
     static const size_t spans[] = {0, 1};
     for (size_t sp = 0; sp < 2 && !bad; sp++) {
         source s = {code, len, 0, spans[sp]};
         indent_text t = text_of(&s);
-        uint8_t out[INDENT_ENTER_MAX];
-        size_t n;
         for (size_t i = 0; i < TYPING_SAMPLES; i++) {
-            uint64_t c = ends[i % VIEW_ROWS], t0 = os_now_ns();
-            indent_code rc = indent_on_enter(&t, c, c, out, &n);
+            size_t r = i % VIEW_ROWS;
+            uint64_t t0 = os_now_ns();
+            indent_range run = indent_on_enter(&t, starts[r], ends[r]);
             ns[i] = os_now_ns() - t0;
-            bad |= rc != INDENT_OK || n < 1 || out[n - 1] != ' ';
+            bad |= run.lo != starts[r] || run.hi == run.lo || code[run.hi - 1] != ' ';
         }
         report(sp ? "enter viewport_rows=300 span=1" : "enter viewport_rows=300 flat", TYPING_SAMPLES);
-        uint64_t from;
         for (size_t i = 0; i < TYPING_SAMPLES; i++) {
-            uint64_t c = ends[i % VIEW_ROWS], t0 = os_now_ns();
-            indent_code rc = indent_on_close_brace(&t, c, c, 4, &from);
+            size_t r = i % VIEW_ROWS;
+            uint64_t t0 = os_now_ns();
+            uint64_t from = indent_on_close_brace(&t, starts[r], ends[r], ends[r], 4);
             ns[i] = os_now_ns() - t0;
-            bad |= rc != INDENT_OK || from != c;
+            bad |= from != ends[r];
         }
         report(sp ? "brace viewport_rows=300 span=1" : "brace viewport_rows=300 flat", TYPING_SAMPLES);
-        indent_pair pair;
         for (size_t i = 0; i < TYPING_SAMPLES; i++) {
             uint64_t t0 = os_now_ns();
-            indent_code rc = indent_bracket_match(&t, brackets[i % nb], 0, view, &pair);
+            indent_pair pair = indent_bracket_match(&t, brackets[i % nb], 0, view);
             ns[i] = os_now_ns() - t0;
-            bad |= rc != INDENT_OK || (pair.mate != INDENT_NONE && pair.mate >= view);
+            bad |= pair.mate != INDENT_NONE && pair.mate >= view;
         }
         report(sp ? "bracket viewport_rows=300 span=1" : "bracket viewport_rows=300 flat", TYPING_SAMPLES);
     }
     for (size_t sp = 0; sp < 2 && !bad; sp++) {
-        source s = {spaces, sizeof spaces, 0, spans[sp]};
+        source s = {worst, sizeof worst, 0, spans[sp]};
         indent_text t = text_of(&s);
-        uint8_t out[INDENT_ENTER_MAX];
-        size_t n;
-        uint64_t from;
         for (size_t i = 0; i < TYPING_SAMPLES; i++) {
-            uint64_t c = i % 2 ? sizeof spaces : 0, t0 = os_now_ns();
-            indent_code rc = i % 4 < 2 ? indent_on_enter(&t, c, c, out, &n) : indent_on_close_brace(&t, c, c, 4, &from);
+            uint64_t t0 = os_now_ns();
+            uint64_t from = indent_on_close_brace(&t, 1, caret, caret, 4);
             ns[i] = os_now_ns() - t0;
-            bad |= rc != INDENT_ERR_LIMIT;
+            bad |= from != caret - 4;
         }
-        report(sp ? "long_line_limit enter+brace span=1" : "long_line_limit enter+brace flat", TYPING_SAMPLES);
+        report(sp ? "worst_blank brace 2B+1 bytes span=1" : "worst_blank brace 2B+1 bytes flat", TYPING_SAMPLES);
+        for (size_t i = 0; i < TYPING_SAMPLES; i++) {
+            uint64_t t0 = os_now_ns();
+            indent_range run = indent_on_enter(&t, 1, sizeof worst - 1);
+            ns[i] = os_now_ns() - t0;
+            bad |= run.hi != 1; /* more than B blanks: degraded */
+        }
+        report(sp ? "worst_blank enter B+1 bytes span=1" : "worst_blank enter B+1 bytes flat", TYPING_SAMPLES);
     }
     if (!bad) {
         source s = {code, len, 0, 0};
@@ -152,7 +168,7 @@ int main(void)
             uint64_t t0 = os_now_ns();
             indent_style st = indent_detect(&t);
             ns[i] = os_now_ns() - t0;
-            bad |= st.kind != INDENT_SPACES || st.width != 4;
+            bad |= st.kind != INDENT_SPACES || st.eol != INDENT_LF || st.width != 4;
         }
         report("detect prefix=64KiB flat", DETECT_SAMPLES);
     }
