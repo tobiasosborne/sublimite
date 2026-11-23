@@ -1,0 +1,12 @@
+contract gate v1-20261123T215001Z-843898: PASS (exit 0)
+target v1-pin role v1; power Charging, load 0.84
+  sandbox: exit 0, 21 records, 0.867 s, display None, invoked 1x
+  wire: exit 0, 18 records, 0.165 s, display None, invoked 1x
+  adapter: exit 0, 9 records, 2.571 s, display :190, invoked 1x
+  navigation: exit 0, 10 records, 4.176 s, display :191, invoked 1x
+  files: exit 0, 15 records, 2.521 s, display :192, invoked 1x
+  recovery: exit 0, 4 records, 2.221 s, display :193, invoked 1x
+  large-undo: exit 3, 10 records, 7.741 s, display :194, invoked 1x
+  capacity: exit 0, 10 records, 115.592 s, display :195, invoked 1x
+  X3.over.roundtrip: XFAIL (expected XFAIL): editor exited 1 with error -105 before saving, destination untouched
+  outcomes: PASS 96, XFAIL 1

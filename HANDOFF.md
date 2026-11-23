@@ -10,18 +10,20 @@ W0.1 vendor (c0e9e2c) · W0.3a include DAG from compiler dependency files (86509
 · W0.3c fail-closed lanes, suite manifest `tests/lanes.mk`, tools registry (3f26948) · W0.4 app identity guard +
 isolation lint (10cec71). `make check` green.
 
-### Wave 0 exit, second half: contract suite landed; W0.7 review says HOLD (state at 20:3x UTC 2026-11-23)
-All W0.6 beads landed (sandbox, X driver, wire client, v1 inspector patch, R1/R6, R3/R5, recovery pre/post-ACK,
-X3, runner + gate record, R4 with survivor identity). Astra's whole-wave review docs/reviews/wave0-code-astra.md
-found 12 false-PASS risks; triage (advisor): phase 1 beads B1 runner v2-he7.27 (0.79), B5 files+adapter .31 and
-B3 navigation .29 (0.80), B4 capacity .30 (0.81), B2 X3 .28 (0.82), B7 scaffold .32 (0.83) — all landed; B2 has
-one more round open (advisor ruling 2: journal-commit fence between Delete and Ctrl+Z, re-measure, amend A8; if v1
-survives Undo after the fence, STOP and report). Phase 2 B6 cross-cutting .33 (brief carries ruling 1: R6/R1 count
-IDs required on both targets — v1 instrument health, v2 count == 0 in the manifest; fresh X server per scored
-launch; settle CONTRACT_DIGESTS env vs argument) starts after the B2 round lands. Phase 3 Astra reads
-run.py/records.py; THEN the gate run ([AC], quiet box incl. the Paris-talk thread's jobs paused; slot after 05:00
-CET Tue unless phase 2 + Astra finish for 23:00–03:00; state load and power in the gate record). Finding 10
-(fatal UBSan) done by the coordinator (0.77). Backlog .34. Fault epoch: plain increment + ASSERT (1.15).
+### Wave 0: GATE PASSED (2026-11-23 22:50 CET; advisor acknowledged)
+`make contract-gate` exit 0, run v1-20261123T215001Z-843898: PASS 96, XFAIL 1 (X3.over.roundtrip, A8 signature, dies in
+Undo after a journaled delete). Commit c16bfc2, [AC] Charging 86 %, load 0.84. Evidence committed under
+docs/gates/wave0/v1-20261123T215001Z-843898/ (gate.json, summary.txt, record.txt). Epic v2-he7 closed; backlogs .20,
+.25, .34 remain backlog.
+- What it means: the contract instrument is proven against v1 at the pin, with one reviewed expected failure.
+- What it does not mean: nothing yet about v2. The per-target predicates (the zero Law-2 counts on R1, R3, R4, R5, R6;
+  X3 as PASS) are what v2 will be held to when Wave 1 exits.
+- Timing for the next announcement: the run took 137 s wall (M), because the runner runs the cases in parallel on
+  displays :190–:195 (capacity, 115.6 s, is the critical path). Ask the Paris-talk thread for about five minutes, not
+  fifty. Use tools/run_gate.sh (start time, give-up time, derived quiet condition: no build/test processes, no foreign
+  job, 1-min load <= 2.8 = the regime the watchdogs were measured in).
+- W0.7 path: phase 1 B1–B5, B7 (0.79–0.83), X3 fences (0.84), phase 2 B6 (0.85, 0.86), phase 3 Astra runner read
+  GATE-READY (docs/reviews/wave0-runner-astra.md).
 
 ### Wave 1 (A10: L0/L1 now; L2/L5 after the Wave 0 gate)
 Landed piece 7a (1.16): frozen piece.h except its Lines section (second Astra read pending; A19 and

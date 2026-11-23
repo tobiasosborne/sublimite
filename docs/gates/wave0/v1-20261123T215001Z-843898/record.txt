@@ -1,0 +1,36 @@
+== Wave 0 gate run
+start: 2026-11-23 22:50:00 CET
+uptime start:  22:50:00 up 1 day, 4 min,  1 user,  load average: 0,84, 1,57, 2,58
+condition (a) build/test processes: 0
+condition (b) Paris toy jobs: 0
+condition (c) 1-min load: 0.84 (<= 2.8)
+top processes at start:
+    PID  NI %CPU     ELAPSED COMMAND
+ 843865   0  200       00:00 ps
+ 830278   0  6.4       15:34 claude
+  12095   0  5.1    23:57:46 chrome
+   4106   0  4.8    23:59:56 t3code
+  17471   0  3.9    23:46:49 chrome
+   1731   0  3.7  1-00:04:00 qemu-system-x86
+   3933   0  2.9    23:59:56 t3code
+ 378971   0  2.4    02:29:15 codex
+ 132160   0  2.0    12:37:55 thunderbird-bin
+   2188   0  2.0  1-00:03:57 cinnamon
+ 255582   0  2.0    05:20:56 claude
+BAT0: Charging 86%
+commit: c16bfc252d014fb10704c1a21ecdbcc588ce4027 (status: 0 changed paths)
+manifest sha256: 5224cdef696ce6f12e7bbd4786cfa4e3e3bc83ca34112e8ea2be84fde7f5abaa
+oracle sha256: 64c27b03f20f51abbfc512fc0b5441883e2d2b8f1ca916b9061c6eb18ca71115 /home/tobias/Projects/sublimite-v1-oracle/build/sublimite
+runner/make exit: 0
+wall: 137 s
+end: 2026-11-23 22:52:17 CET
+uptime end:  22:52:17 up 1 day, 6 min,  1 user,  load average: 1,29, 1,54, 2,43
+inspector oracle sha256: 
+contract gate v1-20261123T215001Z-843898: PASS (exit 0)
+  outcomes: PASS 96, XFAIL 1
+gate record: /home/tobias/Projects/sublimite-v2/build/contract-gate/v1-20261123T215001Z-843898/gate.json
+
+NOTE (coordinator, added at commit; the lines above are the record as written): the "inspector oracle sha256:"
+line is blank because the recording script hashed a directory path; the inspector build's digests are in gate.json
+("identity.oracle_build"): sublimite ed75336c…2195, sublimite-drop-submit 5323f7ff…a6b2, sublimite-stock b8faeab5…0d69.
+Wall 137 s (M): the runner runs the cases in parallel on displays :190–:195; capacity (115.6 s) is the critical path.
