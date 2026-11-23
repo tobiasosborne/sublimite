@@ -24,7 +24,10 @@ CET Tue unless phase 2 + Astra finish for 23:00–03:00; state load and power in
 (fatal UBSan) done by the coordinator (0.77). Backlog .34. Fault epoch: plain increment + ASSERT (1.15).
 
 ### Wave 1 (A10: L0/L1 now; L2/L5 after the Wave 0 gate)
-Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11),
+Landed piece 7a (1.16): frozen piece.h except its Lines section (second Astra read pending; A19 and
+docs/decisions/wave1-piece-lines.md), flat reference model tests/piece_model.h, model-run suite + fuzzer. Running on
+the model: find (.19, Sol), undo (.8, Sol; Astra reads its diff before landing). 7b and lineidx (.18, rescoped by
+A19) wait for the Lines freeze. Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11),
 fault ids (1.10) + A15 follow-up (1.12), ASSERT migration (1.14). Landed L1: scan (1.6), utf8 (1.7), indent (1.9,
 1.13). In flight: piece 7a (v2-0fv.7: frozen piece.h + reference model + suite; FREEZE GATE: advisor reads piece.h
 before the suite is finished). Filed, waiting on 7a: 7b implementation (.17), undo (.8), lineidx (.18), find (.19).
