@@ -21,15 +21,19 @@ Per variant (twin first, then over), each session in a fresh sandbox with a fres
   control  ctl.delete      Ctrl+A, Delete, Ctrl+S: bytes == b"" (sister of the scored run)
   control  ctl.exit        Ctrl+Q: exit status 0
   scored   roundtrip       Ctrl+A, Delete, Ctrl+Z, load fence, Ctrl+S: bytes == fixture
-A control or harness failure is final: it records ERROR and the run stops.
+A control or harness failure is final: it records ERROR and the run stops. A key counts as
+injected only on xdriver's acknowledgement while the editor's pidfd is not readable (inject).
+A failed session keeps its destination's bytes when they differ from the fixture's.
 
 Scored outcomes (classify), the same on every target: PASS (saved, bytes equal, Ctrl+Q exits
 0); FAIL (saved, bytes differ, including a 0 B save); FAIL with signature SIGNATURE_EXIT_105
-when the editor exits with status 1, stderr contains "error -105", and the destination's
-bytes and inode metadata are unchanged (amendment A8); ERROR for every other editor exit, a
-changed input fixture or an expired hang detector. Whether that signature is the reviewed
-expected failure of a target is decided by the runner against tests/contract/expectations.json,
-never here. Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
+when, after the scored Ctrl+Z was injected, the editor exits with status 1, its last stderr
+line is v1's terminal diagnostic "sublimite: error -105; journal: <its session journal>", and
+the destination's bytes and inode metadata are unchanged (amendment A8); ERROR for every other
+editor exit (including one before the Ctrl+Z was injected), a changed input fixture or an
+expired hang detector. Whether that signature is the reviewed expected failure of a target is
+decided by the runner against tests/contract/expectations.json, never here. Records and exit
+statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
 Derivations: docs/decisions/v2-he7.15.md.
 """
 
@@ -41,7 +45,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import select
 import selectors
 import shutil
 import socket
@@ -67,7 +73,7 @@ CASE = "X3"
 SIGNATURE_EXIT_105 = "exit-1-error-105-destination-untouched"
 EVIDENCE = "A"  # Tier A: file bytes and exit status only.
 FIRST_REQUIRED_WAVE = 2  # The public GUI case; W1 owns the headless index-limit test.
-V1_CAPACITY_ERROR = "error -105"  # v1 main.c:342 prints EDITOR_ERR_CAPACITY (editor.h:27)
+SCORED_KEYS = (("Control_L", "a"), "Delete", ("Control_L", "z"))
 
 # One deadline per class of wait. These are a hang detector, not a gate: expiry is ERROR
 # (run invalid), never PASS or FAIL. All are (E): at least 2x the slowest step
@@ -297,6 +303,9 @@ class Run:
             session = Session(self, box, child, driver, watch, path, label, before)
             try:
                 yield session
+            except BaseException:
+                session.failed = True
+                raise
             finally:
                 session.finish_artifacts()
 
@@ -310,6 +319,24 @@ class Run:
         return entry
 
 
+def inject(driver, actions, alive):
+    """Send `actions` in order; return (acknowledged, error). Each acknowledgement is a receipt:
+    the editor was alive just before (`alive()`, its pidfd not readable) and xdriver faked the
+    key under a server grab after verifying focus on the bound window (xdriver.c guarded_input).
+    Injection stops at the first action that meets a dead editor or a refusing driver."""
+    for sent, action in enumerate(actions):
+        if not alive():
+            return sent, None
+        try:
+            if isinstance(action, tuple):
+                driver.chord(*action)
+            else:
+                driver.key(action)
+        except XDriverError as exc:
+            return sent, exc
+    return len(actions), None
+
+
 def journal_commit(label, mask, name):
     return label == "journal" and bool(mask & IN_MOVED_TO) and name.startswith("session-")
 
@@ -319,15 +346,22 @@ class Session:
         self.run, self.box, self.child, self.driver = run, box, child, driver
         self.watch, self.path, self.label, self.before = watch, path, label, before
         self.exit_status = None
+        self.failed = False  # set by a failing scored verdict or an exception (Run.editor)
+
+    def alive(self):
+        return not select.select([self.watch.pidfd], [], [], 0)[0]
+
+    def inject(self, actions):
+        sent, error = inject(self.driver, actions, self.alive)
+        self.run.step("keys", label=self.label, injected=sent,
+                      actions=[list(a) if isinstance(a, tuple) else a for a in actions])
+        return sent, error
 
     def keys(self, *actions):
-        for action in actions:
-            if isinstance(action, tuple):
-                self.driver.chord(*action)
-            else:
-                self.driver.key(action)
-        self.run.step("keys", label=self.label, actions=[list(a) if isinstance(a, tuple) else a
-                                                         for a in actions])
+        sent, error = self.inject(actions)
+        if sent < len(actions):
+            raise error or HarnessError(f"X3.{self.label}", "editor exited before the keys were injected",
+                                        {"injected": sent}, {"injected": len(actions)})
 
     def reap(self, assertion):
         """The pidfd reported exit: collect the status without another timer."""
@@ -337,21 +371,21 @@ class Session:
 
     def edits_applied(self, assertion, *actions):
         """Send edit keys and wait for the journal commit they cause (load fence).
-        Returns "event" or "exited"."""
+        Returns ("event" or "exited", number of keys injected)."""
         self.watch.drain()
         started = time.monotonic()
-        try:
-            self.keys(*actions)
-        except XDriverError:
+        sent, error = self.inject(actions)
+        if sent < len(actions):
             if self.wait_exit(assertion) is None:
-                raise
-            return "exited"
+                raise error or HarnessError(assertion, "editor alive but not injectable", {"injected": sent},
+                                            {"injected": len(actions)})
+            return "exited", sent
         result = self.watch.wait("journal commit", journal_commit, JOURNAL_COMMIT_S, assertion)
         if result == "exited":
             self.reap(assertion)
         self.run.step("journaled" if result == "event" else "exit-before-commit", label=self.label,
                       assertion=assertion, seconds=round(time.monotonic() - started, 3))
-        return result
+        return result, sent
 
     def wait_exit(self, assertion):
         """After the driver lost the window: exit status if the editor exits in time."""
@@ -393,7 +427,8 @@ class Session:
         return (self.run.dir / f"{self.label}.stderr").read_text(errors="replace")
 
     def finish_artifacts(self):
-        """Keep the transcript, the child status and the destination bytes of this session."""
+        """Keep the transcript and the child status of this session, and the destination's bytes
+        when the session failed and they are not the fixture's (its digest is in the manifest)."""
         self.watch.drain()
         (self.run.dir / f"{self.label}.inotify.json").write_text(json.dumps(self.watch.transcript, indent=1) + "\n")
         if self.exit_status is None and self.child.poll() is not None:
@@ -401,7 +436,7 @@ class Session:
         final = {"label": self.label, "destination": describe(self.path), "exit": self.exit_status,
                  "running": self.child.poll() is None,
                  "journal_dir": sorted(os.listdir(self.box.data_dir))}
-        if self.path.exists():
+        if self.failed and final["destination"].get("sha256") not in (None, self.before["sha256"]):
             kept = self.run.dir / f"{self.label}.destination"
             shutil.copyfile(self.path, kept)
             final["preserved"] = str(kept)
@@ -437,18 +472,29 @@ def digest_of(*parts):
     return length, digest.hexdigest()
 
 
+def capacity_exit(stderr, journal_dir):
+    """Whether the last stderr line is v1's terminal diagnostic for EDITOR_ERR_CAPACITY (-105,
+    editor.h:27) naming a session journal in `journal_dir`: main.c:342 `fprintf(stderr,
+    "sublimite: error %d; journal: %s\\n", rc, journal_path)` is its last write before exit 1."""
+    line = f"sublimite: error -105; journal: {re.escape(journal_dir)}/session-[^/\\n]+\\n"
+    return re.search(f"(?:\\A|\\n){line}\\Z", stderr) is not None
+
+
 def classify(original, outcome, input_after):
     """Return (status, predicate, expected, signature) for a scored assertion, on any target.
 
     outcome is {"kind": "saved", "output": describe(), "quit_exit": int} or
-    {"kind": "exited", "exit": int, "stderr": str, "before": identity(), "after": identity()}.
+    {"kind": "exited", "undo_injected": bool, "exit": int, "stderr": str, "journal_dir": str,
+     "before": identity(), "after": identity()}.
     signature is SIGNATURE_EXIT_105 for exactly the A8 failure mode, otherwise None.
     """
     want = {"bytes": original["bytes"], "sha256": original["sha256"]}
     if {k: input_after.get(k) for k in want} != want:
         return "ERROR", "input fixture changed during the run", {"input": want}, None
     if outcome["kind"] == "exited":
-        if (outcome["exit"] == 1 and V1_CAPACITY_ERROR in outcome["stderr"]
+        if not outcome["undo_injected"]:
+            return "ERROR", "editor exited before the scored Ctrl+Z was injected", want, None
+        if (outcome["exit"] == 1 and capacity_exit(outcome["stderr"], outcome["journal_dir"])
                 and outcome["after"] == outcome["before"]):
             return ("FAIL", "editor exited 1 with error -105 before saving, destination untouched",
                     want, SIGNATURE_EXIT_105)
@@ -464,7 +510,7 @@ def variant_run(run, x, variant):
     source = run.fixtures[variant]
     original = (source["bytes"], source["sha256"])
     with run.editor(x, f"{variant}-control", variant) as s:
-        if s.edits_applied(f"X3.{variant}.ctl.load_save", "x") == "exited":
+        if s.edits_applied(f"X3.{variant}.ctl.load_save", "x")[0] == "exited":
             raise HarnessError(f"X3.{variant}.ctl.load_save", "editor exited during a control",
                                {"exit": s.exit_status, "stderr": s.stderr()[-400:]}, "running")
         control(run, s, f"X3.{variant}.ctl.load_save", s.save(f"X3.{variant}.ctl.load_save"),
@@ -481,19 +527,17 @@ def variant_run(run, x, variant):
                    {"exit": 0}, kind="control")
     assertion = f"X3.{variant}.roundtrip"
     with run.editor(x, f"{variant}-scored", variant) as s:
-        result = s.edits_applied(assertion, ("Control_L", "a"), "Delete", ("Control_L", "z"))
-        took = None
-        if result == "event":
-            kind, output, took = s.save(assertion)
-        else:
-            kind = "exited"
+        result, sent = s.edits_applied(assertion, *SCORED_KEYS)
+        kind, output, took = s.save(assertion) if result == "event" else ("exited", None, None)
         if kind == "saved":
             outcome = {"kind": "saved", "output": output, "quit_exit": s.quit(assertion)}
         else:
-            outcome = {"kind": "exited", "exit": s.exit_status,
-                       "stderr": s.stderr(), "before": s.before, "after": identity(s.path)}
-    input_after = describe(source["path"])
-    status, predicate, expected, signature = classify(source, outcome, input_after)
+            outcome = {"kind": "exited", "undo_injected": sent == len(SCORED_KEYS),
+                       "exit": s.exit_status, "stderr": s.stderr(), "journal_dir": str(s.box.data_dir),
+                       "before": s.before, "after": identity(s.path)}
+        input_after = describe(source["path"])
+        status, predicate, expected, signature = classify(source, outcome, input_after)
+        s.failed = status != "PASS"
     if outcome["kind"] == "exited":
         outcome["stderr"] = outcome["stderr"][-400:]
     run.record(assertion, status, predicate, {**outcome, "input_after": input_after}, expected,

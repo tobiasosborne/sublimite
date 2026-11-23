@@ -22,13 +22,19 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 LINEIDX_CHUNK = 65_536
 LINEIDX_EDIT_MAX_CHUNKS = 512
 LINE_BYTES = 64
 TWIN_BYTES = LINEIDX_EDIT_MAX_CHUNKS * LINEIDX_CHUNK
 OVER_BYTES = (LINEIDX_EDIT_MAX_CHUNKS + 1) * LINEIDX_CHUNK
-VARIANTS = {"twin": TWIN_BYTES, "over": OVER_BYTES}
+# The reviewed files (docs/decisions/v2-he7.15.md fixture table): an oracle independent of
+# line(), so a changed generator is rejected instead of deriving its own expectation.
+REVIEWED = {
+    "twin": (TWIN_BYTES, "f3d8ccc6a575bb8c88884f583d1e46f5348f66ba2217d74f76eac83adfd39a46"),
+    "over": (OVER_BYTES, "7b5afe68bc3d7257923dd352789ef38ee788013263db54331006f0926948855e"),
+}
 _ALPHABET = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 _LINES_PER_BLOCK = LINEIDX_CHUNK // LINE_BYTES
 
@@ -49,55 +55,59 @@ def blocks(size):
         yield b"".join(line(n) for n in range(first, min(lines, first + _LINES_PER_BLOCK)))
 
 
-def expected_digest(size):
-    """SHA-256 computed from the generator, independent of any file on disk."""
-    digest = hashlib.sha256()
-    for block in blocks(size):
-        digest.update(block)
-    return digest.hexdigest()
-
-
 def file_digest(path):
     with open(path, "rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def _publish(path, fill, check=None):
+    """Write `fill(stream)` into a temporary private to this writer, run `check` on it once,
+    then rename it over `path`: concurrent writers each publish complete bytes."""
+    fd, partial = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".partial", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fill(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if check is not None:
+            check(partial)
+        os.replace(partial, path)
+    except BaseException:
+        os.unlink(partial)
+        raise
+
+
 def write(directory, variant):
-    """Create (or verify) the fixture and its manifest; return the manifest."""
-    size = VARIANTS[variant]
+    """Publish the reviewed fixture (a valid cached file is hashed once) and its manifest."""
+    size, sha256 = REVIEWED[variant]
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"large_undo_{variant}.txt"
-    record = directory / f"large_undo_{variant}.json"
-    expected = expected_digest(size)
-    if not path.exists() or path.stat().st_size != size or file_digest(path) != expected:
-        partial = path.with_suffix(".partial")
-        with open(partial, "wb") as stream:
-            for block in blocks(size):
-                stream.write(block)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(partial, path)
-    on_disk = file_digest(path)
-    if path.stat().st_size != size or on_disk != expected:
-        raise RuntimeError(f"fixture verification failed: {path}")
+
+    def reviewed(name):
+        return os.stat(name).st_size == size and file_digest(name) == sha256
+
+    def verify(name):
+        if not reviewed(name):
+            raise RuntimeError(f"generated {variant} fixture is not the reviewed one: {sha256}")
+
+    if not (path.is_file() and reviewed(path)):
+        _publish(path, lambda stream: stream.writelines(blocks(size)), verify)
     manifest = {
         "variant": variant, "path": str(path.resolve()), "bytes": size,
-        "lines": size // LINE_BYTES, "chunks": -(-size // LINEIDX_CHUNK),
-        "sha256": on_disk, "generator_sha256": expected,
+        "lines": size // LINE_BYTES, "chunks": -(-size // LINEIDX_CHUNK), "sha256": sha256,
     }
-    partial = record.with_suffix(".partial")
-    partial.write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
-    os.replace(partial, record)
+    _publish(directory / f"large_undo_{variant}.json",
+             lambda stream: stream.write((json.dumps(manifest, indent=2) + "\n").encode("ascii")))
     return manifest
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True, help="fixture directory (under build/)")
-    parser.add_argument("variants", nargs="*", choices=sorted(VARIANTS))
+    parser.add_argument("variants", nargs="*", choices=sorted(REVIEWED))
     args = parser.parse_args(argv)
-    for variant in args.variants or sorted(VARIANTS):
+    for variant in args.variants or sorted(REVIEWED):
         print(json.dumps(write(args.out, variant)))
     return 0
 
