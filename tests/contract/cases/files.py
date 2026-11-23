@@ -10,7 +10,6 @@ Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/record
 
 import argparse
 from contextlib import ExitStack, contextmanager
-import ctypes
 import hashlib
 import json
 import os
@@ -19,6 +18,7 @@ import re
 import secrets
 import selectors
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -33,7 +33,7 @@ from files_fixtures import BINARY_SEED, SEARCH_FILES, binary_bytes, search_resul
 import records
 from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
-from test_oracle_inspector import GUARD, Inspector
+from test_oracle_inspector import GUARD, IN_MOVED_TO, Inspector, directory_watch, wait_for_file_event
 from xdriver import XDriver
 
 
@@ -60,20 +60,16 @@ ASSERTIONS = {
 }
 EVIDENCE = {"results-between-a-and-b": "B", "results-text-still-visible": "B",
             "header-painted": "B", "settled-binary-tab-revisit": "B",
-            "adjacent-text-and-sibling-save": "A+B", "law2-count": "B",
-            "search-readiness": "B", "edit-b": "B", "edit-a": "B", "edit-sibling": "B"}
+            "adjacent-text-and-sibling-save": "A+B", "law2-count": "B"}
 NEGATIVES = tuple(f"{case}.{assertion}" for case, assertions in ASSERTIONS.items()
-                  for assertion in assertions) + ("R3.save-signal", "R3.snapshot-reply")
+                  for assertion in assertions) + ("R3.save-signal", "R3.snapshot-reply",
+                                                   "R3.search-results", "R5.nonzero-exit")
 RESULTS_TITLE = "Find Results"
 TAB_TRAILER = 2  # v1's last two tab cells hold the modified dot and spacing.
 UNRESOLVED = "▯"  # Stands for an unresolved cell; never part of an expected ASCII text.
 SEARCH_END = re.compile(r"\d+ match(es)? (across \d+ files|in 1 file)$|Search (failed|truncated|cancelled)")
 SIBLING = b"sibling text\n"
 IN_ACCESS = 0x00000001
-IN_MOVED_TO = 0x00000080
-IN_Q_OVERFLOW = 0x00004000
-IN_IGNORED = 0x00008000
-INOTIFY_EVENT = struct.Struct("=iIII")
 
 
 class Mismatch(Exception):
@@ -144,53 +140,6 @@ def private_display(display, artifacts):
                 if not exited(server, WATCHDOG):
                     server.kill()
             server.wait()
-
-
-@contextmanager
-def directory_watch(path, mask):
-    libc = ctypes.CDLL(None, use_errno=True)
-    fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
-    if fd < 0:
-        raise OSError(os.strerror(ctypes.get_errno()))
-    try:
-        if libc.inotify_add_watch(fd, os.fsencode(path), mask) < 0:
-            raise OSError(f"inotify watch {path}: {os.strerror(ctypes.get_errno())}")
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def wait_for_file_event(fd, path, mask, child):
-    deadline = time.monotonic() + WATCHDOG
-    # Linux pads each event's NUL-terminated name to struct alignment.
-    event_bytes = os.pathconf(path.parent, "PC_NAME_MAX") + 2 * INOTIFY_EVENT.size
-    pidfd = os.pidfd_open(child.pid)
-    try:
-        with selectors.DefaultSelector() as ready:
-            ready.register(fd, selectors.EVENT_READ)
-            ready.register(pidfd, selectors.EVENT_READ)
-            while time.monotonic() < deadline:
-                pending_fds = {key.fd for key, _ in ready.select(max(0, deadline - time.monotonic()))}
-                if pidfd in pending_fds:
-                    raise Refused(f"editor exited while waiting for {path.name}: {child.wait()}")
-                if fd not in pending_fds:
-                    break
-                pending = os.read(fd, event_bytes)
-                matched = False
-                offset = 0
-                while offset < len(pending):
-                    _, event_mask, _, length = INOTIFY_EVENT.unpack_from(pending, offset)
-                    offset += INOTIFY_EVENT.size
-                    name = pending[offset:offset + length].rstrip(b"\0")
-                    offset += length
-                    if event_mask & (IN_Q_OVERFLOW | IN_IGNORED):
-                        raise Refused(f"inotify watch lost for {path.parent}: {event_mask:#x}")
-                    matched |= bool(event_mask & mask and name == os.fsencode(path.name))
-                if matched:
-                    return
-    finally:
-        os.close(pidfd)
-    raise TimeoutError(f"no {mask:#x} file event for {path.name} before deadline")
 
 
 def exited(process, timeout):
@@ -293,11 +242,13 @@ class Case:
         with (self.artifacts / "steps.log").open("a", encoding="utf-8") as file:
             print(message, file=file)
 
-    def step(self, assertion, expected):
+    def step(self, assertion, expected, *, part=None):
+        """Enter a step. A prerequisite `part` is scored under its listed `assertion`."""
         self.assertion = assertion
+        self.part = part
         self.expected = expected
         self.observed = None
-        self.note(assertion)
+        self.note(assertion if part is None else f"{assertion}/{part}")
 
     def emit(self, status, *, reason=None):
         record = {
@@ -305,6 +256,7 @@ class Case:
             "evidence": EVIDENCE.get(self.assertion, "A"),
             "first_required_wave": 3 if self.id == "R3" else 2,
             "status": status, "predicate": reason or self.assertion,
+            "step": self.part or self.assertion,
             "observed": self.observed, "expected": self.expected,
             "ticket": self.ticket, "submit_serial": self.serial,
             "seed": self.seed, "negative": self.negative,
@@ -336,12 +288,21 @@ class Case:
         if self.observed != self.expected:
             raise Mismatch(f"{assertion}: observed value differs from expectation")
         self.emit("PASS")
+        # Work after a PASS belongs to no assertion until the next step names one.
+        self.step(f"after-{assertion}", None)
 
     def failure(self, exc):
         # The first failure in a case is final; its later steps do not run.
-        if "FAIL" not in self.results and "ERROR" not in self.results:
-            self.emit("FAIL" if isinstance(exc, Mismatch) else "ERROR",
-                      reason=f"{type(exc).__name__}: {exc}")
+        if "FAIL" in self.results or "ERROR" in self.results:
+            return
+        reason = f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, Mismatch):
+            self.emit("ERROR", reason=reason)
+        elif self.assertion in ASSERTIONS[self.id]:
+            self.emit("FAIL", reason=reason)
+        else:
+            # A FAIL is scored only under a listed ID; a mismatch elsewhere is a harness bug.
+            self.emit("ERROR", reason=f"mismatch outside a listed assertion: {reason}")
 
     def launch(self, stack, start, paths, driver):
         """Start one inspected editor, owned by `stack` for its lifetime."""
@@ -396,19 +357,22 @@ class Case:
         return frame
 
     def quit(self):
-        """Ctrl+Q; the editor must exit 0 (reaped on its pidfd)."""
+        """Ctrl+Q, reaped on the editor's pidfd; the caller scores the exit status."""
         if self.child.poll() is not None:
             raise Refused(f"editor exited before deliberate quit: {self.child.returncode}")
-        self.driver.chord("Control_L", "q")
+        if self.negative == "R5.nonzero-exit":
+            # A deliberately nonzero reaped exit in place of Ctrl+Q's.
+            self.note("negative control sent SIGKILL instead of Ctrl+Q")
+            signal.pidfd_send_signal(self.inspector.pidfd, signal.SIGKILL)
+        else:
+            self.driver.chord("Control_L", "q")
         if not exited(self.child, WATCHDOG):
             raise TimeoutError("editor did not exit before watchdog after Ctrl+Q")
-        status = self.child.wait()
-        if status != 0:
-            raise Refused(f"editor exited abnormally after Ctrl+Q: {status}")
-        return status
+        return self.child.wait()
 
-    def allocation_count(self):
+    def allocation_count(self, part):
         """The passive Law-2 report printed by the last editor's clean exit."""
+        self.step("law2-count", "an active guard's report with measured scopes", part=part)
         report = GUARD.search(self.logs[-1].read_bytes())
         if report is None:
             raise Refused(f"{self.logs[-1].name} has no allocation count")
@@ -422,7 +386,8 @@ class Case:
 
 def search_frame(case, expected):
     """NEXT until a frame draws the search's end line, then compare that frame once."""
-    case.step("search-readiness", "the completed Find Results frame draws the fixture results")
+    case.step("results-between-a-and-b", "the completed Find Results frame draws the fixture results",
+              part="search-readiness")
     deadline = time.monotonic() + WATCHDOG
     frame = case.frame("search submitted", deadline=deadline)
     while not (active_title(frame) == RESULTS_TITLE
@@ -436,8 +401,8 @@ def search_frame(case, expected):
     return frame
 
 
-def save(case, path, original):
-    case.step(f"save-{path.stem}-signal", f"IN_MOVED_TO for {path.name}")
+def save(case, assertion, path, original):
+    case.step(assertion, f"IN_MOVED_TO for {path.name}", part=f"save-{path.stem}-signal")
     with directory_watch(path.parent, IN_MOVED_TO) as watch:
         case.observed = path.read_bytes()
         if case.observed != original:
@@ -495,7 +460,9 @@ def r3(case, sandbox, driver):
         for byte in os.fsencode(root):
             driver.key(byte)
         driver.key("Return")
-        search_frame(case, results)
+        # The negative expects a completed search with one match fewer.
+        search_frame(case, results.replace("9 matches", "8 matches")
+                     if case.negative == "R3.search-results" else results)
 
         case.step("open-b-match", "Go to Line 8, Return on the scatter result")
         driver.chord("Control_L", "g")
@@ -506,7 +473,8 @@ def r3(case, sandbox, driver):
         case.check("results-between-a-and-b", tab_strip(frame), (strip, 2),
                    (["a.txt", "b.c", RESULTS_TITLE], 1))
 
-        case.step("edit-b", "b drawn and its first journal entry before Ctrl+S (A9)")
+        case.step("save-b-bytes", "b drawn and its first journal entry before Ctrl+S (A9)",
+                  part="edit-b")
         journals = sorted(sandbox.data_dir.glob("session-*"))
         if len(journals) != 1:
             raise Refused(f"expected one session journal, found {[p.name for p in journals]}")
@@ -516,16 +484,16 @@ def r3(case, sandbox, driver):
             # v1 commits the session's first edit by renaming its journal (large_undo.py).
             wait_for_file_event(journal, journals[0], IN_MOVED_TO, case.child)
         case.note(f"IN_MOVED_TO {journals[0].name}")
-        saved_b = save(case, root / b, SEARCH_FILES[b])
+        saved_b = save(case, "save-b-bytes", root / b, SEARCH_FILES[b])
         case.check("save-b-bytes", saved_b, expected_b, expected_a)
         after_b = unrelated_files(root, {a, b})
 
-        case.step("edit-a", "Alt+1, Ctrl+Home, type a; a drawn before Ctrl+S")
+        case.step("save-a-bytes", "Alt+1, Ctrl+Home, type a; a drawn before Ctrl+S", part="edit-a")
         driver.chord("Alt_L", "1")
         driver.chord("Control_L", "Home")
         driver.key("a")
         typed(case, "type a", "a.txt", "aAlpha cat")
-        saved_a = save(case, root / a, SEARCH_FILES[a])
+        saved_a = save(case, "save-a-bytes", root / a, SEARCH_FILES[a])
         case.check("save-a-bytes", (saved_a, (root / b).read_bytes()),
                    (expected_a, expected_b), (expected_b, expected_b))
 
@@ -537,11 +505,16 @@ def r3(case, sandbox, driver):
         wrong = hard_wrapped(results.replace("9 matches", "8 matches"), d.width, d.height)
         case.check("results-text-still-visible", (*tab_strip(frame), document_rows(frame)),
                    (strip, 1, model), (strip, 1, wrong))
-        case.step("quit", "Ctrl+Q exits 0")
-        case.quit()
+        case.step("quit", "Ctrl+Q reaped")
+        status = case.quit()
     case.check("other-files-unchanged", (after_b, unrelated_files(root, {a, b})),
                (others, others), ({}, {}))
-    count = case.allocation_count()
+    # R3 lists no exit assertion; its count is the clean exit's report, so it scores the exit.
+    case.step("law2-count", 0, part="quit-exit")
+    case.observed = status
+    if status != 0:
+        raise Mismatch(f"editor exited {status} after Ctrl+Q")
+    count = case.allocation_count("report")
     # v1 measured 0 for this window (docs/decisions/v2-he7.13.md), so the count rule asserts 0.
     case.check("law2-count", [count["allocations"]], [0], [1])
 
@@ -587,12 +560,13 @@ def r5(case, sandbox, driver):
                 case.check("header-painted", tab_view(frame, 1), header,
                            (path.name, ["%PDF-1.4"]))
 
-                case.step("edit-sibling", "Alt+2, type s; s drawn before Ctrl+S")
+                case.step("adjacent-text-and-sibling-save", "Alt+2, type s; s drawn before Ctrl+S",
+                          part="edit-sibling")
                 driver.chord("Alt_L", "2")
                 driver.key("s")
                 frame = typed(case, "type into sibling", sibling.name, "s" + SIBLING.decode().rstrip())
                 drawn = tab_view(frame, 1)
-                saved = save(case, sibling, SIBLING)
+                saved = save(case, "adjacent-text-and-sibling-save", sibling, SIBLING)
                 case.check("adjacent-text-and-sibling-save", (*drawn, saved),
                            (sibling.name, ["s" + SIBLING.decode().rstrip()], b"s" + SIBLING),
                            (sibling.name, ["s" + SIBLING.decode().rstrip()], SIBLING))
@@ -616,7 +590,7 @@ def r5(case, sandbox, driver):
             status = case.quit()
             case.check(f"{phase}-exit", status, 0, 1)
             on_disk.append(path.read_bytes())
-            counts.append(case.allocation_count()["allocations"])
+            counts.append(case.allocation_count(f"{phase}-report")["allocations"])
     case.check("bytes-unchanged", on_disk, [expected, expected], [expected, b"!" + expected[1:]])
     # v1 measured 0 for both windows (docs/decisions/v2-he7.13.md); the count rule asserts 0.
     case.check("law2-count", counts, [0, 0], [0, 1])

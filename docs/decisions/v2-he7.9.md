@@ -56,3 +56,20 @@ make check
 ```
 
 The server reported a 16,777,212-byte maximum on `:120` and the INCR test transferred 16,777,213 bytes in each direction. SHA-256 of the tested release helper is `1402b68433e43c8762672f36d38667653315216d5f079ce1cc75ed788f584f34`. The concatenated Makefile, driver C, wrapper Python, fixture C and test Python sources in that order hash to `860ea3eabd674aa621c4fc3c40f17ae6e2db83594bd2aa6706668bd3514dbdf4`.
+
+## W0.7-B5 (2026-11-23): readiness expiry is ERROR
+
+Wave 0 review [finding 15](../reviews/wave0-code-astra.md) found that
+`readable()` raised `AssertionError` for a silent fd. Inside a test method,
+unittest scores that as FAIL, so a stalled fixture or Xvfb counted against
+the driver. `readable()` now raises `TimeoutError`, which the adapter scores
+as ERROR. A deadline that is already spent (timeout ≤ 0) counts as expired
+even when input is queued. Callers that share one deadline across several
+reads therefore cannot renew it on irrelevant input
+([finding 29](../reviews/wave0-code-astra.md)). The watchdog is unchanged
+(15 s, above).
+
+Proof: a method calling `readable()` on a silent pipe with a 0.2 s timeout,
+run through `records.run_suite` by a scratch harness, gave FAIL before and
+ERROR after. The conformance suite then passed 8/8 on `:120` (AC, one-minute
+load 10.72 at start, M). Xvfb teardown (findings 9/19) is left to its own bead.

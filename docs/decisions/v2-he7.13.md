@@ -269,3 +269,72 @@ touched only `files.py`.
 HOME="$PWD/build/home" TMPDIR="$PWD/build" make all > build/files-make-all.log 2>&1
 HOME="$PWD/build/home" TMPDIR="$PWD/build" make check > build/files-make-check.log 2>&1
 ```
+
+## W0.7-B5 (2026-11-23): failures scored under listed IDs
+
+Wave 0 review [finding 8](../reviews/wave0-code-astra.md) found two false
+FAILs-turned-ERRORs. A completed, contradictory observation at an unlisted
+step (`search-readiness`, `edit-b`, `save-b-signal` …) was emitted as FAIL
+under that step's name, which the runner treats as a malformed, unowned
+record (ERROR). A real nonzero exit after Ctrl+Q raised `Refused` (ERROR)
+before `R5.open-exit` could compare it.
+
+**Rule.** A record's `assertion_id` is always the listed assertion the step
+serves. A prerequisite runs as `step(<listed ID>, …, part=<step>)`, and every
+record carries the executed step in `step`. A `Mismatch` is FAIL only under a
+listed ID. `failure()` reports a mismatch anywhere else as an explicit ERROR
+("mismatch outside a listed assertion"). After a PASS the case enters
+`after-<ID>`, so a later error cannot produce a second record for the
+assertion that just passed. ERROR remains the outcome for missing or unusable
+observations: a watchdog, an editor exit while waiting, a lost watch.
+
+| Step (`part`) | Scored under |
+|---|---|
+| `search-readiness` | `R3.results-between-a-and-b` (the scatter match it opens) |
+| `edit-b`, `save-b-signal` | `R3.save-b-bytes` |
+| `edit-a`, `save-a-signal` | `R3.save-a-bytes` |
+| `quit-exit`, `report` | `R3.law2-count`. R3 lists no exit assertion, and its count is the clean exit's report. |
+| `edit-sibling`, `save-sibling-signal` | `R5.adjacent-text-and-sibling-save` |
+| `open-report`, `reopen-report` | `R5.law2-count` |
+
+`Case.quit()` now returns the reaped status. `R5.open-exit` and
+`R5.reopen-exit` compare it, and R3 compares it under `law2-count`.
+
+Two diagnostic negatives were added test-first, outside the gate manifest
+like the others. `R3.search-results` expects one match fewer (`8 matches`)
+from the completed search. `R5.nonzero-exit` sends SIGKILL by pidfd in place
+of Ctrl+Q.
+
+**Receipts.** Every run used AC power (BAT0 `Charging`). The load given is the
+one-minute average at the start (M). Runner runs used a scratch copy of
+`expectations.json` restricted to the `files` invocation, with the negative
+appended to its argv (`build/b5/manifest-*.json`).
+
+| Proof | Code | Exit | Outcome | Case run under `build/` | Load |
+|---|---|---|---|---|---|
+| `R3.search-results` via run.py | before | 4 | unowned `R3.search-readiness` FAIL | `contract-files-56t046ud` | 12.95 |
+| `R3.search-results` via run.py | after | 3 | `R3.results-between-a-and-b` FAIL, step `search-readiness` | `contract-files-s_th5hyi` | 6.12 |
+| `R5.nonzero-exit` via run.py | before | 4 | `R5.open-exit` ERROR, `Refused … -9` | `contract-files-8w81of8f` | 12.04 |
+| `R5.nonzero-exit` via run.py | after | 3 | `R5.open-exit` FAIL, observed −9, expected 0 | `contract-files-eejby3fa` | 6.12 |
+| `R3.snapshot-reply` (case) | after | 4 | `R3.results-between-a-and-b` ERROR, step `search-readiness`, missing reply | `contract-files-8x206yvi` | 6.12 |
+| `R3.save-signal` (case) | after | 4 | `R3.save-b-bytes` ERROR, step `save-b-signal`, no `IN_MOVED_TO` | `contract-files-4pndd2q8` | 6.12 |
+| plain via run.py | after | 0 | PASS 15 | `contract-files-83zeyf8r` | 10.72 |
+
+The four 6.12 rows ran in parallel on `:161`–`:164`, and the plain run on
+`:165` ran beside the two adapter suites. The last two rows supersede the stop
+points in the historical `R3.snapshot-reply` and `R3.save-signal` receipts
+above. Withheld events still end in ERROR, now under the listed ID that the
+step serves.
+
+`directory_watch` and `wait_for_file_event` moved unchanged into
+`test_oracle_inspector.py`, beside `Inspector`, because the adapter now arms
+a save rename too ([v2-he7.11](v2-he7.11.md)). `files.py` imports them from
+there, and its names are unchanged for `cases/navigation.py`.
+
+```sh
+python3 -B tests/contract/run.py --manifest build/b5/manifest-R3.search-results.json --role v1 \
+    --exe oracle=/home/tobias/Projects/sublimite-v1-oracle/build/sublimite \
+    --oracle-build /home/tobias/Projects/sublimite-v1-inspect/build/contract-oracle \
+    --displays :160-:169 --out build/b5/runs
+python3 -B tests/contract/cases/files.py --build-dir "$B" --display :163 --negative R3.snapshot-reply
+```

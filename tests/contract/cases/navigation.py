@@ -27,7 +27,7 @@ from navigation_fixtures import (
 )
 from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
-from test_oracle_inspector import Inspector
+from test_oracle_inspector import GUARD, Inspector
 from test_xdriver import WATCHDOG, available
 from xdriver import XDriver
 
@@ -160,6 +160,7 @@ class Case:
         self.path.mkdir(mode=0o700)
         self.negative = negative
         self.child = None
+        self.law2 = None
         self.ticket = self.serial = None
         self.transcript = self.path / "snapshots.jsonl"
         self.results = []
@@ -196,12 +197,31 @@ class Case:
             for record in self.results:
                 record["child_status"] = ({"pid": self.child.pid, "exit": self.child.poll()}
                                           if self.child else None)
+                record["law2"] = self.law2
                 print(json.dumps(record, default=describe), file=log)
                 records.emit(record, default=describe)
                 if record["status"] != "PASS":
                     print(f"{self.id}.{record['assertion_id']}: {record['status']} {record['reason']}",
                           file=sys.stderr)
-        return all(record["status"] == "PASS" for record in self.results)
+
+    def law2_count(self):
+        """Record the passive Law-2 report the editor printed at its clean exit.
+
+        Fails closed like files.py: a missing report, an inert guard or a window
+        that measured nothing is ERROR (v2-he7.11). The count is recorded, not
+        asserted: v1 counts nonzero for R1 and R6 (docs/decisions/v2-he7.12.md W0.7-B3).
+        """
+        self.stage("law2-report")
+        self.predicate = "editor log carries an active guard over a positive scope count"
+        log = self.path / "editor.log"
+        report = GUARD.search(log.read_bytes())
+        if report is None:
+            raise Refused(f"{log.name} has no allocation count")
+        active, allocations, scopes = map(int, report.groups())
+        self.note(law2=report.group().decode("ascii"))
+        if active != 1 or scopes == 0:
+            raise Refused(f"allocation guard inert or no window measured: {report.group()!r}")
+        self.law2 = {"allocations": allocations, "scopes": scopes}
 
     @contextmanager
     def assertion_group(self, assertion):
@@ -472,8 +492,10 @@ def r6(case, box, driver):
                              wrong_row=tail[index].text.rstrip(" "))
             with case.assertion_group("occupied-navigation"):
                 occupied(case, box, driver, path, tail, page)
-    finally:
+    except BaseException:
+        # A green input regenerates from LOG_SEED; keep it only as failure evidence.
         path.replace(case.path / path.name)
+        raise
 
 
 def run_case(case, scenario, target, display, auth):
@@ -483,6 +505,7 @@ def run_case(case, scenario, target, display, auth):
             with XDriver(BUILD / "xdriver", display, env=box.env, timeout=2 * WATCHDOG) as driver:
                 try:
                     scenario(case, box, driver)
+                    case.law2_count()
                     case.stage("assertion-inventory")
                     passed = tuple(result["assertion_id"] for result in case.results)
                     if passed != ASSERTIONS[case.id]:

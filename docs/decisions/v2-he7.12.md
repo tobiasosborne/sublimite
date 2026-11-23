@@ -145,3 +145,55 @@ wrapped large-file variants and minimap coverage to their owning gates.
 This lane uses baked ASCII and carries no latency threshold or worker hold.
 The layout check requires no registry rows for Python helpers under
 `tests/contract/`.
+
+## W0.7-B3 (2026-11-23): the Law-2 count, retention, publish
+
+Review findings 4, 27 (the R6 half) and 26 (the navigation part) of
+`docs/reviews/wave0-code-astra.md`.
+
+**Count (finding 4).** After its scenario, each case parses the editor's
+`oracle law2:` line with files.py's checks. A missing report, `active != 1`
+or `scopes == 0` is ERROR at `law2-report`. A valid count is attached to
+every record of the case as `law2: {allocations, scopes}`. That count is
+recorded and **not asserted**, for R6 as well as R1. This departs from the
+brief, which asked for R6 to be asserted at 0. The R6 measurement on v1
+depends on run order:
+
+| Invocation (all [AC] `Charging`, start load 7.4–17.6 (M, 1 min)) | R6 runs | R6 `allocations` (M) |
+| --- | ---: | --- |
+| R6 first on a fresh Xvfb (`--case R6`, `--negative R6.*`) | 10 | 4 in all 10 |
+| R6 after R1 on the same Xvfb (the runner's `navigation` argv) | 6 | 0 in all 6 |
+
+`--negative R6.tail-navigation` sends only Ctrl+End. It measured 4 with
+`scopes=1`, so all four are in the first scope after arrival. R1 measured 4
+in every run. Its four are also in the first scope after arrival (the Go To
+Line burst, v2-he7.23). The R6 calls are probably the same libxcb
+`read_packet` path, but no backtrace was taken, so this is (E). The
+"zero for R6" above came from a combined run (the second row). The count rule
+in `wave0-contract-design.md` asserts on v1 only where v1 shows 0, and R6's
+zero holds only if R1 ran first on the same server. An R6 zero assertion
+would couple R6's verdict to case order. R3 and R5 already assert 0 on v1,
+which proves the adapter's window. The coordinator may still choose to assert
+R6. In that case `--case R6` FAILs on v1.
+
+The static oracle cannot be preloaded or rebuilt here. So the red controls
+edited the `oracle law2:` line in `editor.log` after a clean editor exit and
+before the case read it. The editing wrapper was a scratch script and is not
+committed.
+
+| Injection | Before (unchanged case) | After |
+| --- | --- | --- |
+| one more allocation | R6 alone: 4 PASS, exit 0, the report (5) is never read | R1+R6: 8 PASS, exit 0, records carry `law2.allocations` 5 (R1) and 1 (R6) |
+| line removed, R1+R6 | 8 PASS, exit 0 | 8 PASS + `R1/R6.law2-report` ERROR, exit 4 |
+| `active=0`, R1+R6 | 8 PASS, exit 0 | 8 PASS + 2 ERROR, exit 4 |
+| `scopes=0`, R1+R6 | 8 PASS, exit 0 | 8 PASS + 2 ERROR, exit 4 |
+
+**Retention (finding 27).** `tail.log` is moved into the case artifacts only
+when the R6 interaction raises, which covers FAIL and ERROR. On success the
+sandbox removes it with the rest of its root. A run's seed, size and
+transcript stay in `snapshots.jsonl` either way. Green
+`contract-navigation-ldwcipws/R6/` holds no `tail.log`. Red
+`--negative R6.marker` (`0gx8wwg4`) holds the 1 GiB input.
+
+**Publish (finding 26).** `Case.publish` no longer returns the bool that
+nothing read.

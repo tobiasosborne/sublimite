@@ -96,3 +96,54 @@ make check
 The suite distinguishes stale replies, a dropped submit, an overwide clipped tab, ARM, and a missing minimap. It also covers idle and typed SNAP, one repaint for a no-op, NEXT after a later edit, clipboard paste, SIZE, and disconnect followed by editing, saving and copying. Stock, patched ordinary and patched inspected runs compare identical destination bytes and clipboard bytes. All guarded runs must report an active interposer with zero allocations (G, Law 2).
 
 The green runner reported eight passing tests (M, unittest summary). Every guarded editor reported `active=1 allocations=0` (M, shutdown counts, [bat], one-minute host load sampled after the run at 10.19). Both v2 make commands exited successfully.
+
+## W0.7-B5 (2026-11-23): adapter waits end on their own events
+
+Wave 0 review [finding 15](../reviews/wave0-code-astra.md) found a shared
+deadline in `disk_clipboard`. It busy-polled the clipboard owner, then polled
+the disk every 1 ms for the *correct* bytes. Expiry fell through to the final
+comparison, so a delayed save became FAIL. An incorrect first save also
+passed if a later write corrected it.
+
+- **Save.** An `IN_MOVED_TO` watch on the destination is armed before Ctrl+S
+  (`directory_watch` / `wait_for_file_event`, moved here unchanged from
+  `cases/files.py`). The case waits for the rename, or the editor's pidfd,
+  under the 15 s watchdog, then reads the first committed bytes once. A
+  missing rename is `TimeoutError` (ERROR), and an editor exit is `Refused`
+  (ERROR).
+- **Owner.** Select All and Copy follow the committed save. Ownership has
+  its own 15 s deadline and the 10 ms observation cadence of
+  `cases/recovery.py` ([finding 28](../reviews/wave0-code-astra.md)). A
+  sentinel or zero owner keeps waiting. A third owner raises `RuntimeError`
+  and expiry raises `TimeoutError` (both ERROR). Copy is not reissued.
+- **Compare.** The saved bytes and the clipboard bytes are compared only
+  after both are ready. A mismatch is the only FAIL.
+- **Dropped submit.** `next_event()` waits under a single deadline for the
+  first fault-control byte that is not `P`. A stream of repaints until expiry
+  is ERROR. Previously each `P` renewed the full wait.
+- **HUP.** If the `POLLHUP` wait in the EPIPE disconnect path expires, the
+  result is `TimeoutError` (ERROR), not a failed assertion.
+
+**Proof** (scratch harness: fake driver, `sleep` stand-in child, adapter
+`WATCHDOG` patched to 3 s (E, above the 1 s late delay), scored by
+`records.run_suite`):
+
+| Scenario | Before | After |
+|---|---|---|
+| owner and save each 1 s late | PASS | PASS |
+| no rename | FAIL | ERROR |
+| completed wrong bytes | FAIL (after the watchdog) | FAIL |
+| wrong first save, corrected by a second | PASS | FAIL |
+| foreign owner | ERROR (at the read, after the watchdog) | ERROR (immediately) |
+| owner never transfers | ERROR (at the read) | ERROR (`TimeoutError`) |
+| `P` stream past the deadline | not testable (the inline loop is unbounded) | ERROR |
+
+The full adapter suite then passed 9/9 once on `:130` against the existing
+`build/contract-oracle`, without a rebuild (AC, one-minute load 10.72 at
+start, M).
+
+```sh
+python3 -B tests/contract/test_oracle_inspector.py \
+    --build-dir /home/tobias/Projects/sublimite-v1-inspect/build/contract-oracle \
+    --driver "$PWD/build/xdriver" --display :130
+```

@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
 from dataclasses import replace
 import fcntl
 import json
@@ -21,7 +22,7 @@ import unittest
 
 from build_oracle import EDITOR, FAULT, PATCH, STAMP, STOCK, manifest, sha256
 import records
-from sandbox import CONTRACT_DISPLAY, RunTarget, Sandbox
+from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
 from test_xdriver import WATCHDOG, available, readable, stop
 from xdriver import XDriver, XDriverError
@@ -37,6 +38,10 @@ CAPACITY = (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
             + WIDTH * (HEIGHT + 1) * (wire.CELL_HEADER.size + len("�".encode()))
             + WIDTH * (wire.RECT.size + wire.WORD.size))
 GUARD = re.compile(rb"oracle law2: active=(\d+) allocations=(\d+) scopes=(\d+)")
+IN_MOVED_TO = 0x00000080
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+INOTIFY_EVENT = struct.Struct("=iIII")
 
 
 @contextmanager
@@ -66,6 +71,62 @@ def display(number, scratch):
                 raise RuntimeError(f"Xvfb did not start. See {scratch / 'Xvfb.log'}")
         print(f"Xvfb {number}, owned PID {server.pid}", flush=True)
         yield record
+
+
+@contextmanager
+def directory_watch(path, mask):
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    if fd < 0:
+        raise OSError(os.strerror(ctypes.get_errno()))
+    try:
+        if libc.inotify_add_watch(fd, os.fsencode(path), mask) < 0:
+            raise OSError(f"inotify watch {path}: {os.strerror(ctypes.get_errno())}")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def wait_for_file_event(fd, path, mask, child):
+    deadline = time.monotonic() + WATCHDOG
+    # Linux pads each event's NUL-terminated name to struct alignment.
+    event_bytes = os.pathconf(path.parent, "PC_NAME_MAX") + 2 * INOTIFY_EVENT.size
+    pidfd = os.pidfd_open(child.pid)
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(fd, selectors.EVENT_READ)
+            ready.register(pidfd, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                pending_fds = {key.fd for key, _ in ready.select(max(0, deadline - time.monotonic()))}
+                if pidfd in pending_fds:
+                    raise Refused(f"editor exited while waiting for {path.name}: {child.wait()}")
+                if fd not in pending_fds:
+                    break
+                pending = os.read(fd, event_bytes)
+                matched = False
+                offset = 0
+                while offset < len(pending):
+                    _, event_mask, _, length = INOTIFY_EVENT.unpack_from(pending, offset)
+                    offset += INOTIFY_EVENT.size
+                    name = pending[offset:offset + length].rstrip(b"\0")
+                    offset += length
+                    if event_mask & (IN_Q_OVERFLOW | IN_IGNORED):
+                        raise Refused(f"inotify watch lost for {path.parent}: {event_mask:#x}")
+                    matched |= bool(event_mask & mask and name == os.fsencode(path.name))
+                if matched:
+                    return
+    finally:
+        os.close(pidfd)
+    raise TimeoutError(f"no {mask:#x} file event for {path.name} before deadline")
+
+
+def next_event(control, deadline, ignore=b"P"):
+    """The first fault-control byte other than `ignore`; one deadline for the whole wait."""
+    while True:
+        readable(control, deadline - time.monotonic())
+        event = control.recv(1)
+        if event != ignore:
+            return event
 
 
 def target(path):
@@ -256,11 +317,8 @@ class OracleTests(unittest.TestCase):
 
             control.sendall(b"D")
             request = inspector.send(driver)
-            event = b"P"
-            while event == b"P":
-                readable(control)
-                event = control.recv(1)
-            self.assertEqual(event, b"D")
+            # Repaints may precede the drop; a stream of them until expiry is ERROR.
+            self.assertEqual(next_event(control, time.monotonic() + WATCHDOG), b"D")
             self.assertFalse(ready_now(inspector.reader), "dropped submit completed SNAP")
             control.sendall(b"R")
             driver.key("x")
@@ -290,21 +348,27 @@ class OracleTests(unittest.TestCase):
             self.finish(child, guarded=True, typed=True, allocations=1)
 
     def disk_clipboard(self, child, driver, window, path):
+        """Save then copy; each wait ends on its own event, and expiry is ERROR."""
         text = b"disk and clipboard"
-        driver.own("CLIPBOARD", b"prior owner")
+        sentinel = driver.own("CLIPBOARD", b"prior owner")
         for char in text.decode():
             driver.key("space" if char == " " else char)
-        driver.chord("Control_L", "s")
+        # The destination rename is armed before Ctrl+S; its first committed bytes are scored.
+        with directory_watch(path.parent, IN_MOVED_TO) as watch:
+            driver.chord("Control_L", "s")
+            wait_for_file_event(watch, path, IN_MOVED_TO, child)
+        saved = path.read_bytes()
         driver.chord("Control_L", "a")
         driver.chord("Control_L", "c")
         deadline = time.monotonic() + WATCHDOG
-        while time.monotonic() < deadline and driver.owner("CLIPBOARD") != window:
+        while (owner := driver.owner("CLIPBOARD")) != window:
+            if owner not in (0, sentinel):
+                raise RuntimeError(f"unexpected clipboard owner {owner}, expected window {window}")
             self.assert_editor_alive(child, "taking clipboard ownership")
-        clipboard = driver.read("CLIPBOARD", window, WATCHDOG * 1000)
-        while time.monotonic() < deadline and path.read_bytes() != text:
-            self.assert_editor_alive(child, "saving")
-            time.sleep(0.001)  # v1 mailbox retry cadence while waiting for disk bytes
-        result = path.read_bytes(), clipboard
+            if time.monotonic() >= deadline:
+                raise TimeoutError("editor did not claim CLIPBOARD after Select All and Copy")
+            time.sleep(0.01)  # observe ownership without reissuing Copy (cases/recovery.py)
+        result = saved, driver.read("CLIPBOARD", window, WATCHDOG * 1000)
         self.assertEqual(result, (text, text))
         return result
 
@@ -323,8 +387,9 @@ class OracleTests(unittest.TestCase):
                     poll = select.poll()
                     poll.register(inspector.reader, select.POLLHUP)
                     events = poll.poll(WATCHDOG * 1000)
-                    self.assertTrue(events and events[0][1] & select.POLLHUP,
-                                    "inspector did not close after reply send failed")
+                    if not events:
+                        raise TimeoutError("inspector did not close after reply send failed")
+                    self.assertTrue(events[0][1] & select.POLLHUP, f"poll events {events}")
                     inspector.reader.close()
                 self.assert_editor_alive(child, "editing after inspection disconnected")
                 inspected.append(self.disk_clipboard(child, driver, window, paths[0]))

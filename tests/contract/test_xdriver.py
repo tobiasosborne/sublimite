@@ -28,10 +28,12 @@ PARTIAL_MS = 500
 
 
 def readable(fd, timeout=WATCHDOG):
+    """Wait for input; expiry is a harness ERROR (TimeoutError), never an assertion FAIL."""
     with selectors.DefaultSelector() as selector:
         selector.register(fd, selectors.EVENT_READ)
-        if not selector.select(timeout):
-            raise AssertionError("timed out waiting for Xvfb or fixture output")
+        # A spent deadline is expired even when input is already queued.
+        if timeout <= 0 or not selector.select(timeout):
+            raise TimeoutError("timed out waiting for Xvfb or fixture output")
 
 
 def available(number):
