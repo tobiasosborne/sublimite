@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the release archive symbol DAG and per-module LDLIBS entries."""
+"""Check the release archive symbol DAG, per-module system imports and LDLIBS entries."""
 
 import argparse
 import os
@@ -13,6 +13,7 @@ from check_dag import INTRA_RULES
 
 
 ALLOWLIST = Path(__file__).resolve().with_name('system-symbols.txt')
+ANY_MODULE = '*'
 UNDEFINED = frozenset('Uwv')
 L5_FORBIDDEN = {'x11', 'wayland', 'gl', 'raster'}
 TS_RUNTIME = Path('vendor/tree-sitter/lib/src/lib.o')
@@ -74,16 +75,28 @@ def symbol_module(symbol, layers):
     return None
 
 
-def read_allowlist(layers):
-    symbols = set()
-    for number, line in enumerate(ALLOWLIST.read_text(encoding='ascii').splitlines(), 1):
-        name = line.partition('#')[0].strip()
-        if not name:
+def read_allowlist(path, layers):
+    """Map each system symbol to its scopes: {'*'} or the modules granted it."""
+    scopes = {}
+    for number, line in enumerate(path.read_text(encoding='ascii').splitlines(), 1):
+        entry, _, reason = line.partition('#')
+        fields = entry.split()
+        if not fields:
             continue
-        if not SYMBOL_NAME.fullmatch(name) or name in symbols or symbol_module(name, layers):
-            raise ValueError(f'{ALLOWLIST}:{number}: invalid, duplicate or project symbol {name!r}')
-        symbols.add(name)
-    return symbols
+        where = f'{path}:{number}'
+        if len(fields) != 2 or not reason.strip():
+            raise ValueError(f'{where}: expected SYMBOL SCOPE # reason')
+        name, scope = fields
+        if not SYMBOL_NAME.fullmatch(name) or symbol_module(name, layers):
+            raise ValueError(f'{where}: invalid or project symbol {name!r}')
+        if scope != ANY_MODULE and scope not in layers:
+            raise ValueError(f'{where}: {name} is granted to unknown module {scope!r}')
+        held = scopes.setdefault(name, set())
+        # A '*' entry is its symbol's only entry; each module grant appears once.
+        if held and (ANY_MODULE in held | {scope} or scope in held):
+            raise ValueError(f'{where}: {name} {scope} duplicates or contradicts an earlier entry')
+        held.add(scope)
+    return scopes
 
 
 def ldlibs_errors(directory, layer_libs):
@@ -181,17 +194,20 @@ def audit_object(rows, where, member, module, layers, order, allowlist):
         elif kind != 'U':
             if not owns_symbol(member, module, owner, symbol):
                 violation = f'[prefix] {module} defines {symbol} without its own prefix'
-        elif symbol not in allowlist:
-            if owner is None or owner not in layers:
-                violation = f'[unknown] undefined symbol {symbol} has no known module prefix or system entry'
-            else:
-                edge = f'{module} (L{layer}) references {symbol} from {owner} (L{layers[owner]})'
-                if layer == layers['app'] and owner in L5_FORBIDDEN:
-                    violation = f'[forbidden] {edge}'
-                elif layers[owner] > layer:
-                    violation = f'[inter-layer] {edge}: upward dependency'
-                elif layers[owner] == layer and owner != module and (owner, module) not in order:
-                    violation = f'[intra-layer] {edge}: dependency is outside INTRA_RULES'
+        elif symbol in allowlist:
+            if not allowlist[symbol] & {ANY_MODULE, module}:
+                granted = ', '.join(sorted(allowlist[symbol]))
+                violation = f'[restricted] {module} imports {symbol}, granted only to {granted}'
+        elif owner is None or owner not in layers:
+            violation = f'[unknown] undefined symbol {symbol} has no known module prefix or system entry'
+        else:
+            edge = f'{module} (L{layer}) references {symbol} from {owner} (L{layers[owner]})'
+            if layer == layers['app'] and owner in L5_FORBIDDEN:
+                violation = f'[forbidden] {edge}'
+            elif layers[owner] > layer:
+                violation = f'[inter-layer] {edge}: upward dependency'
+            elif layers[owner] == layer and owner != module and (owner, module) not in order:
+                violation = f'[intra-layer] {edge}: dependency is outside INTRA_RULES'
         if violation:
             errors.append(f'{where}: error: {violation}')
     return errors
@@ -207,6 +223,7 @@ def main():
     parser.add_argument('--nm', default='nm')
     parser.add_argument('--ldlibs-dir', type=Path, default=Path('src'))
     parser.add_argument('--ldlibs-only', action='store_true')
+    parser.add_argument('--system-symbols', type=Path, default=ALLOWLIST)
     args = parser.parse_args()
     errors = []
     try:
@@ -217,7 +234,7 @@ def main():
                 raise ValueError('expected an nm command and at least one archive')
             layers = read_module_map(args.module_map)
             order = intra_order(layers)
-            allowlist = read_allowlist(layers)
+            allowlist = read_allowlist(args.system_symbols, layers)
             for specification in args.archive:
                 layer_id, path, *objects = specification
                 layer, archive = int(layer_id), Path(path)

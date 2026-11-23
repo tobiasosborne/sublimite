@@ -1,0 +1,3 @@
+# An any-module entry must be its symbol's only entry.
+read os # descriptor read
+read * # contradicts the os grant

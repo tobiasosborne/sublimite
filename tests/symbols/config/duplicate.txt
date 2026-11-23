@@ -1,0 +1,3 @@
+# Each (symbol, module) grant appears once.
+read os # descriptor read
+read os # descriptor read again

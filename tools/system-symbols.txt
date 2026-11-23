@@ -1,113 +1,138 @@
-# Exact strong imports from the release toolchain and its C library.
-_GLOBAL_OFFSET_TABLE_ # ELF linker-generated GOT base
-__assert_fail # glibc assert implementation
-__cpu_indicator_init # compiler runtime CPU capability initialization
-__cpu_model # compiler runtime CPU feature bits
-__ctype_b_loc # glibc narrow character-class table
-__errno_location # glibc calling-thread errno
-__fprintf_chk # fortified fprintf
-__libc_calloc # glibc allocation beneath the Law-2 interposer
-__libc_malloc # glibc allocation beneath the Law-2 interposer
-__libc_realloc # glibc allocation beneath the Law-2 interposer
-__realpath_chk # fortified realpath
-__snprintf_chk # fortified snprintf
-__stack_chk_fail # compiler stack protector failure handler
-__vsnprintf_chk # fortified vsnprintf
-abort # process termination
-calloc # zero-initializing allocation
-clock_getres # POSIX clock resolution
-clock_gettime # POSIX clock read
-close # release a file descriptor
-closedir # release a directory stream
-dup # file descriptor duplication
-environ # glibc process environment
-eventfd # Linux event counter descriptor
-fchmod # set file permission bits by descriptor
-fclose # stream close
-fcntl # query descriptor flags or duplicate with close-on-exec
-fdatasync # flush file data and required metadata
-fdopen # open a stream over an existing descriptor
-fdopendir # open an iterator over a directory descriptor
-flock # advisory file or directory lock
-fputc # write a character to a stream
-free # allocation release
-fstat # metadata by descriptor
-fstatat # directory-relative metadata
-fsync # flush file or directory data and metadata
-ftruncate # resize a file
-fwrite # stream write
-getcwd # current working directory
-getenv # lookup in the process environment
-gethostname # local host name
-getpagesize # Linux base page size
-getpid # calling process ID
-getrandom # Linux kernel random bytes
-getrlimit # current process resource limits
-ioctl # Linux FICLONE reflink request
-iswalnum # wide-character alphanumeric classification
-iswalpha # wide-character alphabetic classification
-iswdigit # wide-character digit classification
-iswspace # wide-character whitespace classification
-kill # send a signal to a child process
-lstat # path metadata without following the final symlink
-madvise # Linux mapping advice
-malloc # allocation
-memchr # locate a byte in a bounded span
-memcmp # compare bytes
-memcpy # copy bytes
-memmove # copy potentially overlapping bytes
-memset # fill bytes
-mkdir # create a directory
-mkdirat # directory-relative directory creation
-mmap # create an address space mapping
-munmap # release an address space mapping
-nanosleep # relative monotonic sleep
-openat # path or directory-relative descriptor open
-poll # wait for descriptor readiness
-posix_spawn # launch a process with explicit file actions
-posix_spawn_file_actions_addclosefrom_np # glibc child descriptor inheritance control
-posix_spawn_file_actions_destroy # release spawn file actions
-posix_spawn_file_actions_init # initialize spawn file actions
-pread # positioned file read
-pthread_cond_broadcast # wake all condition waiters
-pthread_cond_destroy # release a condition variable
-pthread_cond_init # initialize a condition variable
-pthread_cond_signal # wake a condition waiter
-pthread_cond_wait # condition wait with mutex release and reacquire
-pthread_create # start a POSIX thread
-pthread_join # reap a POSIX thread
-pthread_mutex_destroy # release a mutex
-pthread_mutex_init # initialize a mutex
-pthread_mutex_lock # acquire a mutex
-pthread_mutex_unlock # release a held mutex
-pthread_mutexattr_destroy # release mutex attributes
-pthread_mutexattr_init # initialize mutex attributes
-pthread_mutexattr_settype # select recursive mutex semantics
-pthread_once # thread-safe one-time initialization
-pthread_self # calling thread identity
-pwrite # positioned file write
-read # sequential read or eventfd drain
-readdir # advance a directory stream
-readlink # read a symlink target
-realloc # resize allocation
-renameat # directory-relative atomic rename
-renameat2 # Linux atomic rename with no replacement
-rewinddir # reset a directory stream cursor
-rmdir # remove an empty directory
-sched_yield # yield the calling thread
-setenv # set a process environment variable
-setrlimit # update a process resource limit
-snprintf # bounded formatted string output
-stat # path metadata following symlinks
-stderr # standard error stream
-strchr # locate a character in a C string
-strcmp # compare strings
-strlen # string length
-strncmp # bounded string comparison
-sysconf # query Linux physical page count
-towlower # wide-character lowercase conversion
-unlink # remove a non-directory name
-unlinkat # directory-relative name removal
-unsetenv # remove a process environment variable
-waitpid # wait for and reap a child process
-write # sequential write or eventfd signal
+# Exact strong imports from the release toolchain and its C library, per module.
+#
+# One grant per line: SYMBOL SCOPE # reason
+#   SCOPE '*'     any module. Only for imports that neither enter the kernel
+#                 nor touch process-global state; a '*' line is the symbol's
+#                 only line.
+#   SCOPE MODULE  that module only, one line per module granted. Everything
+#                 that enters the kernel or touches process-global state:
+#                 syscall wrappers, file, memory and heap calls, signals,
+#                 processes, threads, clocks, environment, errno, stdio.
+# MODULE must be in the layer map (mk/layers.mk). Keep each block sorted;
+# a module's grants form one block so parallel additions do not collide.
+# Rationale and borderline cases: docs/decisions/v2-he7.22.md.
+
+# Any module: pure byte and string functions.
+memchr                 * # locate a byte in a bounded span
+memcmp                 * # compare bytes
+memcpy                 * # copy bytes
+memmove                * # copy potentially overlapping bytes
+memset                 * # fill bytes
+strchr                 * # locate a character in a C string
+strcmp                 * # compare strings
+strlen                 * # string length
+strncmp                * # bounded string comparison
+# Any module: character classes. They read the C locale; setlocale, uselocale
+# and newlocale are granted to no module, so the result depends on the argument only.
+__ctype_b_loc          * # glibc narrow character-class table
+iswalnum               * # wide-character alphanumeric classification
+iswalpha               * # wide-character alphabetic classification
+iswdigit               * # wide-character digit classification
+iswspace               * # wide-character whitespace classification
+towlower               * # wide-character lowercase conversion
+# Any module: emitted by the toolchain or by assert, not chosen per call site.
+_GLOBAL_OFFSET_TABLE_  * # ELF linker-generated GOT base, no runtime code
+__assert_fail          * # <assert.h> failure path; terminal, never returns
+__stack_chk_fail       * # compiler-inserted stack protector failure; terminal
+
+# os: the POSIX syscall boundary (docs/PLAN_V2.md section 2).
+__errno_location       os # calling-thread errno; the native error behind os_err
+__realpath_chk         os # fortified realpath
+clock_getres           os # POSIX clock resolution
+clock_gettime          os # POSIX clock read
+close                  os # release a file descriptor
+closedir               os # release a directory stream
+environ                os # glibc process environment
+eventfd                os # Linux event counter descriptor
+fchmod                 os # set file permission bits by descriptor
+fcntl                  os # query descriptor flags or duplicate with close-on-exec
+fdatasync              os # flush file data and required metadata
+fdopen                 os # stdio transfer of an owned descriptor
+fdopendir              os # open an iterator over a directory descriptor
+flock                  os # advisory file or directory lock
+fstat                  os # metadata by descriptor
+fstatat                os # directory-relative metadata
+fsync                  os # flush file or directory data and metadata
+ftruncate              os # resize a file
+getcwd                 os # current working directory
+getenv                 os # lookup in the process environment
+gethostname            os # local host name
+getpagesize            os # Linux base page size
+getpid                 os # calling process ID
+getrandom              os # Linux kernel random bytes
+getrlimit              os # current process resource limits
+ioctl                  os # Linux FICLONE reflink request
+kill                   os # send a signal to a child process
+lstat                  os # path metadata without following the final symlink
+madvise                os # Linux mapping advice
+mkdir                  os # create a directory
+mkdirat                os # directory-relative directory creation
+mmap                   os # create an address space mapping
+munmap                 os # release an address space mapping
+nanosleep              os # relative monotonic sleep
+openat                 os # path or directory-relative descriptor open
+poll                   os # wait for descriptor readiness
+posix_spawn            os # launch a process with explicit file actions
+posix_spawn_file_actions_addclosefrom_np os # glibc child descriptor inheritance control
+posix_spawn_file_actions_destroy os # release spawn file actions
+posix_spawn_file_actions_init os # initialize spawn file actions
+pread                  os # positioned file read
+pthread_cond_broadcast os # wake all condition waiters
+pthread_cond_destroy   os # release a condition variable
+pthread_cond_init      os # initialize a condition variable
+pthread_cond_signal    os # wake a condition waiter
+pthread_cond_wait      os # condition wait with mutex release and reacquire
+pthread_create         os # start a POSIX thread
+pthread_join           os # reap a POSIX thread
+pthread_mutex_destroy  os # release a mutex
+pthread_mutex_init     os # initialize a mutex
+pthread_mutex_lock     os # acquire a mutex
+pthread_mutex_unlock   os # release a held mutex
+pthread_mutexattr_destroy os # release mutex attributes
+pthread_mutexattr_init os # initialize mutex attributes
+pthread_mutexattr_settype os # select recursive mutex semantics
+pthread_once           os # thread-safe one-time initialization
+pthread_self           os # calling thread identity
+pwrite                 os # positioned file write
+read                   os # sequential read or eventfd drain
+readdir                os # advance a directory stream
+readlink               os # read a symlink target
+renameat               os # directory-relative atomic rename
+renameat2              os # Linux atomic rename with no replacement
+rewinddir              os # reset a directory stream cursor
+rmdir                  os # remove an empty directory
+sched_yield            os # yield the calling thread
+setenv                 os # set a process environment variable
+setrlimit              os # update a process resource limit
+stat                   os # path metadata following symlinks
+sysconf                os # query Linux physical page count
+unlink                 os # remove a non-directory name
+unlinkat               os # directory-relative name removal
+unsetenv               os # remove a process environment variable
+waitpid                os # wait for and reap a child process
+write                  os # sequential write or eventfd signal
+
+# hl: the vendored tree-sitter runtime (lib.o) and grammar scanners. Upstream
+# code, granted as found; the debug-graph and allocation-failure paths are a
+# reported exception to the os boundary (docs/decisions/v2-he7.22.md).
+__fprintf_chk          hl # fortified fprintf: dot-graph output, allocation-failure message
+__snprintf_chk         hl # fortified snprintf: ts_subtree_string node names
+__vsnprintf_chk        hl # fortified vsnprintf: ts_lexer debug log formatting
+abort                  hl # ts_malloc_default failure; tree-sitter-yaml scanner invariant
+calloc                 hl # ts_current_calloc default allocator
+dup                    hl # ts_tree_print_dot_graph duplicates the caller's descriptor
+fclose                 hl # close the dot-graph stream
+fdopen                 hl # dot-graph stream over a caller descriptor
+fputc                  hl # dot-graph character output
+free                   hl # ts_current_free default allocator
+fwrite                 hl # dot-graph string output (fputs lowered by the compiler)
+malloc                 hl # ts_current_malloc default allocator
+realloc                hl # ts_current_realloc default allocator
+snprintf               hl # ts_subtree_string node names
+stderr                 hl # default dot-graph stream and allocation-failure message
+# base: the release allocation interposer and one-time CPU detection.
+__libc_calloc base # glibc allocation beneath the Law-2 interposer
+__libc_malloc base # glibc allocation beneath the Law-2 interposer
+__libc_realloc base # glibc allocation beneath the Law-2 interposer
+__cpu_indicator_init base # compiler runtime CPU capability initialization (process-global)
+__cpu_model base # compiler runtime CPU feature bits (process-global)

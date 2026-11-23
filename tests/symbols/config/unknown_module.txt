@@ -1,0 +1,2 @@
+# A grant must name a module in the layer map.
+read nosuchmod # descriptor read
