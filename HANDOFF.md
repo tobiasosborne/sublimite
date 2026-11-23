@@ -15,7 +15,7 @@ Landed: W0.6a sandbox (7dfb7bb) · W0.6b X driver (28976cf) · W0.6c wire client
 W0.6g pre-ACK recovery controls (996f3da; bead stays open for post-ACK) · W0.6f R3 + R5 Tier A, 8 PASS (0.30; bead open for 5 screen assertions).
 In flight at the time of this commit (worktrees under ~/.t3/worktrees/sublimite-v2/, one branch each):
 - v2-he7.11 W0.6d v1 adapter patch (Sol xhigh) — worker output on its branch (1c55dcf; patch applied in /home/tobias/Projects/sublimite-v1-inspect, disposable detached 6fec2e8). NOT landed: coordinator run on :138 failed test_disconnect_and_stock_disk_clipboard (editor exited 1 after reader disconnect); sent back to the same worker. Patch 452+/6− vs 320 (E).
-- v2-he7.15 W0.6h large delete+undo X3 on the stock v1 build (Opus) — first running-v1 reproduction; stop if v1 does not show it.
+- v2-he7.15 W0.6h large delete+undo X3 (Opus) — STOP CONDITION FIRED, output on branch 20b6ebd (docs/decisions/v2-he7.15.md): on stock v1 Ctrl+Z after deleting 33,619,968 B makes the editor exit 1 (`error -105`), not an empty save; twin round-trips. Awaiting the advisor's decision on the XFAIL signature and a relaunch-recovery assertion; not landed.
 - Wave 1 prep: piece pool derivation landed (e0f176f, docs/decisions/wave1-piece-pool.md), advisor review pending.
 Open, not started: v2-he7.12 W0.6e navigation R1 + R6 (needs the adapter) · W0.6g post-ACK (needs the adapter) ·
 v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; registry slash-row fixture) ·
