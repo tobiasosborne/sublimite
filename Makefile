@@ -135,6 +135,10 @@ check:
 check-contract-sandbox:
 	python3 -B tests/contract/test_sandbox.py
 
+.PHONY: check-contract-inspect
+check-contract-inspect:
+	python3 -B tests/contract/test_inspect.py
+
 # The include lints use the .d files emitted when compiling these objects.
 check-lints: $(LINT_OBJS)
 	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
