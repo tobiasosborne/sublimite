@@ -180,6 +180,46 @@ def check_lint_objects(repo, baseline):
     return True
 
 
+UB_SOURCE = """#include <limits.h>
+#include <stdint.h>
+#include <stddef.h>
+static volatile int sink;
+static int add(int a, int b) { return a + b; }
+"""
+
+
+def check_ubsan_fatal(repo):
+    """W0.7 finding 10: a runtime signed overflow must fail the sanitizer and fuzz lanes'
+    binaries (built with the lanes' own flags), not log and exit 0."""
+    write(repo, 'tests/ubsan_probe_test.c', UB_SOURCE +
+          'int main(void) { volatile int big = INT_MAX; sink = add(big, 1); return 0; }\n')
+    write(repo, 'fuzz/ubsan_probe_fuzz.c', UB_SOURCE +
+          'int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n);\n'
+          'int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {\n'
+          '    (void)d; volatile int big = INT_MAX; if (n) sink = add(big, 1); return 0; }\n')
+    ok = True
+    for target, argv in (('build/case/san/tests/ubsan_probe_test', []),
+                         ('build/case/fuzz/ubsan_probe_fuzz', ['-runs=1'])):
+        built = run(repo, target)
+        if built.returncode != 0:
+            print(f'ubsan fatal: FAIL could not build {target}')
+            print(built.stdout, end='')
+            ok = False
+            continue
+        seed = repo / 'build' / 'ubsan-seed'
+        seed.write_bytes(b'x')
+        result = subprocess.run([str(repo / target), *argv, *([str(seed)] if argv else [])],
+                                cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, check=False)
+        if result.returncode != 0 and 'runtime error: signed integer overflow' in result.stdout:
+            print(f'ubsan fatal ({target.rsplit("/", 1)[1]}): rejected as expected')
+        else:
+            print(f'ubsan fatal ({target.rsplit("/", 1)[1]}): FAIL exit {result.returncode}')
+            print(result.stdout, end='')
+            ok = False
+    return int(ok)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, required=True)
@@ -212,6 +252,12 @@ def main():
         repo.mkdir()
         prepare(repo)
         passed += check_lint_objects(repo, args.baseline)
+
+        total += 1
+        repo = root / 'ubsan-fatal'
+        repo.mkdir()
+        prepare(repo)
+        passed += check_ubsan_fatal(repo)
     print(f'lane fixtures: {passed}/{total} passed')
     return int(passed != total)
 

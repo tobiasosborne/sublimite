@@ -32,9 +32,9 @@ INC    := -Isrc -Ivendor/tree-sitter/lib/include
 DEP    := -MMD -MP
 
 REL_F   := -O2 -g -msse2
-SAN_F   := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
+SAN_F   := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g
 TSAN_F  := -fsanitize=thread -fno-omit-frame-pointer -O1 -g
-FUZZ_F  := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -O1 -g
+FUZZ_F  := -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g
 
 # Configuration trees: build/rel (gcc -O2, Law-2/G1 lane + shipped binary),
 # build/san (clang ASan+UBSan), build/tsan (clang TSan), build/fuzz (libFuzzer).
@@ -189,7 +189,7 @@ OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_sett
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
+	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
 
 $(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
