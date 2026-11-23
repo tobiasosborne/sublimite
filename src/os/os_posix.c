@@ -936,7 +936,11 @@ static bool fault_recover(uintptr_t a)
         }
         /* Overlap is excluded at registration, so this is the only match.
          * Taint, then fence, so no zero page is readable before the count. */
-        (void)atomic_fetch_add(&slot->epoch, 1u);
+        /* The epoch does not saturate; overflow is impossible on the audited
+         * target (pages x threads <= 2^57 with 4-level paging, spec) and an
+         * ASSERT elsewhere (5-level paging allows 2^66). */
+        uint64_t before = atomic_fetch_add(&slot->epoch, 1u);
+        ASSERT(before != UINT64_MAX);
         atomic_thread_fence(memory_order_seq_cst);
         /* From the faulting page through the logical end; the kernel rounds
          * the length up within the registered page-rounded extent. Failure

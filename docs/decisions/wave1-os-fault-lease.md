@@ -185,3 +185,15 @@ same instruction as a weaker load and a seq_cst RMW the same locked instruction;
 and none is in poll (P). A weaker order needs a proof and a measured need; the default needs neither. The poll fence
 stays: the mapped byte loads are not atomic, so the closing validation needs a barrier compiler and machine both respect.
 A weak-memory litmus for the poll fence is an obligation of the bead that adds a weakly ordered target.
+
+
+## Epoch width (advisor ruling, 2026-11-23; supersedes "saturated at UINT64_MAX" in the poll row, "saturation
+## cannot restore pristine" in Read bytes, "still saturates by checked CAS" in Transient count width, and "until
+## successful or saturated" in the handler paragraph)
+
+The epoch does not saturate: saturation never kept the invariant (stuck at the maximum, a later recovery is invisible
+to a reader comparing epochs). A bare increment that could wrap to 0 would be worse. So: plain increment, and the
+handler ASSERTs that the value before the increment is not UINT64_MAX (ASSERT is async-signal-safe). Bound (P):
+recoveries ≤ pages × threads, since a recovered page never faults again; 2^35 × 2^22 = 2^57 with a 2^47-byte user
+address space (4-level paging) and PID_MAX_LIMIT 2^22; with 5-level paging 2^44 × 2^22 = 2^66, which does not fit —
+hence the ASSERT rather than an argument. One comparison, no hook, no silent wrong answer on any machine.
