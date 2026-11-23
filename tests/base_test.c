@@ -8,6 +8,7 @@ typedef struct cpu_probe {
     pthread_barrier_t *start;
     bool avx2;
     bool popcnt;
+    bool sse42;
 } cpu_probe;
 
 static void probe_cpu(void *arg)
@@ -17,6 +18,7 @@ static void probe_cpu(void *arg)
     ASSERT(rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD);
     probe->avx2 = base_cpu_has_avx2();
     probe->popcnt = base_cpu_has_popcnt();
+    probe->sse42 = base_cpu_has_sse42();
 }
 
 static void test_cpu(void)
@@ -34,7 +36,12 @@ static void test_cpu(void)
 
     ASSERT(left.avx2 == right.avx2 && left.avx2 == base_cpu_has_avx2());
     ASSERT(left.popcnt == right.popcnt && left.popcnt == base_cpu_has_popcnt());
-    printf("cpu: avx2=%d popcnt=%d\n", (int)left.avx2, (int)left.popcnt);
+    ASSERT(left.sse42 == right.sse42 && left.sse42 == base_cpu_has_sse42());
+    /* The predicate reports the compiler runtime's own answer verbatim. */
+    __builtin_cpu_init();
+    ASSERT(left.sse42 == (__builtin_cpu_supports("sse4.2") != 0));
+    printf("cpu: avx2=%d popcnt=%d sse42=%d\n", (int)left.avx2, (int)left.popcnt,
+           (int)left.sse42);
 }
 
 static void test_version(void)

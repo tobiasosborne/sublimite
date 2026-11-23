@@ -225,6 +225,9 @@ LDFLAGS_find_fault_test := -Wl,--wrap=os_fault_poll,--wrap=piece_iter_next
 LDFLAGS_find_p1r_test := -Wl,--wrap=work_should_stop
 LDFLAGS_find_simd_filter_verify_test := -Wl,--wrap=base_cpu_has_avx2
 LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
+# journal codec (L2-2a): CRC32C hardware/portable selection is forced in the
+# suite through the base CPU predicate (no env switch, harvest 2.3).
+LDFLAGS_journal_codec_test := -Wl,--wrap=base_cpu_has_sse42
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench/find_bench))
 # Undo likewise uses the frozen piece model until 7b. Its suite observes the
 # span/count arrays offered to the batch planner and can refuse a replay step.

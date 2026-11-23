@@ -130,3 +130,9 @@ bool base_cpu_has_popcnt(void)
     os_once_run(&cpu_once, cpu_detect);
     return __builtin_cpu_supports("popcnt") != 0;
 }
+
+bool base_cpu_has_sse42(void)
+{
+    os_once_run(&cpu_once, cpu_detect);
+    return __builtin_cpu_supports("sse4.2") != 0;
+}

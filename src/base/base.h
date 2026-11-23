@@ -56,6 +56,8 @@ void  base_pool_free(base_pool *p);
 /* ---- SIMD dispatch: cached after first call ---------------------------- */
 bool base_cpu_has_avx2(void);
 bool base_cpu_has_popcnt(void);
+/* SSE4.2 (the CRC32 instruction), selected by journal's CRC32C. */
+bool base_cpu_has_sse42(void);
 
 /* Release builds interpose malloc, calloc and realloc. The guard is inert
  * in sanitizer builds, whose runtime owns those entry points. One owner
