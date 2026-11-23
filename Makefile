@@ -85,6 +85,19 @@ RUN = $(if $(TEST_TIMEOUT),timeout $(TEST_TIMEOUT) )
 
 all: $(EDIT_BIN) $(call libs_desc,rel) $(LAYER_TEST_BINS) $(LAYER_L5_BIN) $(TEST_REL)
 
+# Persistent X11 contract helper and independently linked conformance client.
+.PHONY: xdriver check-xdriver
+xdriver: $(B)/xdriver
+$(B)/xdriver $(B)/xdriver-test-client: | $(B)
+$(B)/xdriver: tests/contract/xdriver.c
+	$(CC_RELEASE) $(WARN) $(REL_F) $< -lxcb -lxkbcommon-x11 -lxkbcommon -ldl -o $@
+$(B)/xdriver-test-client: tests/contract/xdriver_test_client.c
+	$(CC_RELEASE) $(WARN) $(REL_F) $< -lxcb -o $@
+$(B):
+	mkdir -p $@
+check-xdriver: $(B)/xdriver $(B)/xdriver-test-client
+	python3 -B tests/contract/test_xdriver.py
+
 # ---- objects (one tree per configuration) ----
 define CFG_COMPILE
 $(B)/$(1)/%.o: %.c
