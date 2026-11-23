@@ -167,3 +167,17 @@ prior SIGBUS handler: the sanitizer runtime and libFuzzer); SIG_IGN emulation, S
 inheritance, the second cell/selector and the install-race machinery are cut. Memory orders in the fault service are
 seq_cst throughout with no _explicit forms (x86-64 cost derivation in the spec). Spec rewritten:
 docs/decisions/wave1-os-fault-lease.md, section "Chain and install (A18)".
+
+## A19. Line counts live in the piece tree; PLAN §4.3 superseded (advisor, 2026-11-23, at the piece.h freeze read)
+
+Newline counts are a monoid annotation (bytes, newlines, unknown) on the piece tree's leaf and branch entries, keyed by
+source coordinates and maintained in O(h) by each edit; ORIGINAL is counted off path per 64 KiB chunk into a core-owned,
+revision-independent table. Design, invariants and suite contract: docs/decisions/wave1-piece-lines.md (Lines section
+under Astra review until frozen). Consequences:
+- PLAN §4.3 is superseded: no incremental cap (`LINEIDX_EDIT_MAX_CHUNKS`), no degraded mode, no off-path regrowth, no
+  resumable goto-line continuation.
+- §6 Wave 1 exit (A13's last sentence): the 513-chunk `lineidx` degraded/regrowth regression is replaced by: "after
+  ORIGINAL is counted, line queries are exact after any edit or undo of any size, in O(h) node visits, counted; fixture:
+  the 513-chunk delete and its undo, with line queries checked against the model before, between and after".
+- `lineidx` (v2-0fv.18) is rescoped to the off-path chunk counter and the estimate used while a prefix is unknown; v2-0fv.9
+  follows it.
