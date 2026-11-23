@@ -181,7 +181,7 @@ fitting edit succeeds, and reopening repacks. The model's hook means "no shape: 
 - extent accounting;
 - read counting.
 
-## 9. Lines (draft, under review)
+## 9. Lines (frozen at the advisor's read of aefec2f, with the single-poll cut)
 
 The ruling keeps counts in the tree: the signed layout and fanouts stand, and the tree answers line queries. A separate
 offset-keyed line table would have to be shifted by every edit. v1's 512-chunk cap, its degraded mode, its regrowth and
@@ -250,8 +250,8 @@ rulings". Each is written into the header.
   - `piece_lines_adopt` takes the batch's `os_fault_id` and revalidates source identity and epoch.
   - A disagreeing count is a *result* (false), not an ASSERT. An unsignalled in-place overwrite can produce it, and that
     is input (A15).
-  - Scanning queries put an opening and a closing poll around their mapped loads; a query that reads no mapped byte
-    linearizes at one poll. A poll error fails closed.
+  - Scanning queries poll once, after the last mapped load the answer depends on (the opening poll was cut at the freeze,
+    below); a query that reads no mapped byte linearizes at one poll. A poll error fails closed.
   - A snapshot's answers are stable only while its backing is trusted.
 - **E. Wording.**
   - An edit reads none of its inserted source and at most 65,536 B of destination cuts. It splices at its own seam
@@ -388,7 +388,10 @@ bead for the job and the estimate, inside those owners.
   - no debug check;
   - snapshots following live knowledge.
 
-  Each fails the suite. Removing only the opening poll is not observable against a persistent simulated fault, because
-  the closing poll still catches it. I record that as a limit of the simulation, not as a gap in the contract.
+  Each fails the suite. Removing only the opening poll survived; at the freeze the advisor read that as redundant code,
+  not a limit of the simulation: a registration's epoch never decreases, so a closing poll reporting generation match and
+  epoch 0 proves every earlier load was file-backed. The opening poll is cut from the contract, the model and this list;
+  an implementation may poll first as an early-out, and no test depends on it. Reversal condition: a trace where a
+  closing poll reports epoch 0 and a loaded byte came from a repaired page.
 - **Lanes.** `make check CONTRACT_CHECK_DISPLAYS=:170-:179`, `make check-tsan` (7 suites) and `make fuzz-smoke`
   (9 fuzzers) all exit 0.

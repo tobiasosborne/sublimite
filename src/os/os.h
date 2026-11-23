@@ -357,8 +357,10 @@ os_err os_fault_register(const os_map *view, os_fault_id *out);
 /* Any thread, lock-free, on a copied issued id, concurrently with anything
  * else. On OS_OK *epoch is the registration's recovery count (0: pristine;
  * it never returns to 0). OS_E_NOENT once the owner has retired the id;
- * *epoch is then untouched. Bracket mapped reads with two polls and require
- * 0 from both: the poll orders the caller's earlier reads before it. */
+ * *epoch is then untouched. Poll once after the mapped reads a result
+ * depends on and require 0: the poll orders the caller's earlier reads
+ * before it, and since the epoch never decreases, 0 then means 0 at every
+ * earlier read (advisor, piece Lines freeze; an early poll is optional). */
 os_err os_fault_poll(os_fault_id id, uint64_t *epoch);
 /* The owner, once, at final release after all byte access has ended.
  * Invalidates the id, waits for handlers already inside the view to finish

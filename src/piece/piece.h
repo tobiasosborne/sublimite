@@ -151,8 +151,11 @@ typedef struct piece_span_nl {
  * acquire adds one owner and release drops one; either may run on any
  * thread, and the last release retires the fault id and unmaps. The bytes
  * stay mapped while any owner remains. After a fault they read zero from the
- * faulting page on: a reader that must trust mapped bytes brackets its reads
- * with two os_fault_poll calls on `fault` and requires epoch 0 from both. */
+ * faulting page on: a reader that must trust mapped bytes polls `fault`
+ * once with os_fault_poll after the last load its result depends on and
+ * requires epoch 0 (one poll suffices: a registration's epoch never
+ * decreases, so epoch 0 at the closing poll means epoch 0 at every earlier
+ * load; a retire and re-registration fails the generation check). */
 typedef struct piece_backing {
     const uint8_t *bytes;
     size_t len;
@@ -399,7 +402,7 @@ piece_err piece_replenish(piece_tree *t);
  * before it reports PIECE_ERR_NOMEM, and close drains the rest. */
 bool piece_reclaim(piece_tree *t, size_t budget);
 
-/* ---- Lines (DRAFT for the freeze read) ---------------------------------- */
+/* ---- Lines (frozen at the advisor's read, 2026-11-23) ------------------- */
 
 /* A line break is '\n'. Lines are numbered from 0: a text with k newlines
  * has k + 1 lines, line i > 0 starts one past the i-th newline, and a text
@@ -452,10 +455,15 @@ bool piece_reclaim(piece_tree *t, size_t budget);
  * per partial entry.
  *
  * FAULTS. Every scan of mapped bytes (a cut, a resolve scan, a scanning
- * query) is enclosed by an opening and a closing poll of the backing's fault
- * id, in the fault service's order (os.h), the closing poll after every load
- * the result depends on; the result is used only when both report epoch 0.
- * A query that reads no mapped byte linearises at one poll. A nonzero epoch
+ * query) is followed by one poll of the backing's fault id, after every load
+ * the result depends on (the poll's fence orders those loads before its
+ * epoch load); the result is used only when it reports epoch 0. One poll
+ * suffices because a registration's epoch never decreases: epoch 0 then was
+ * epoch 0 at every earlier load, so no recovery had run and every byte read
+ * was file-backed; a retire and re-registration in between fails the
+ * generation check, closed. An implementation may also poll first as an
+ * early-out; that is not part of this contract. A query that reads no mapped
+ * byte still polls once. A nonzero epoch
  * or a failed poll makes a query answer inexact with lower bound 0 (line 0
  * excepted) and leaves a cut's or a resolve's entry unknown. A batch is
  * revalidated at adoption (source identity and epoch) and discarded if
@@ -473,8 +481,8 @@ bool piece_reclaim(piece_tree *t, size_t budget);
 
 /* Rank: newlines in [0, off). An offset on an entry boundary excludes the
  * entry that follows, even an unknown one; an offset inside an entry scans
- * that entry's part before off, at most PIECE_CHUNK bytes, within the FAULTS
- * polls; a rank that scans nothing polls once. True when *count is exact:
+ * that entry's part before off, at most PIECE_CHUNK bytes, then polls once
+ * (FAULTS); a rank that scans nothing polls once. True when *count is exact:
  * no unknown entry lies wholly before off and every poll reports epoch 0.
  * Otherwise false, and *count is a lower bound: the counted part, or 0 when
  * a poll reports a nonzero epoch or fails. O(h).
@@ -485,7 +493,7 @@ bool piece_lines_before(const piece_view *v, uint64_t off, uint64_t *count);
  * [0, *off). Past the last line, *off = piece_length(v) and *before is the
  * total. Descends through an unknown-marked ancestor's exact leading
  * children; locating the newline inside its entry is one pass of at most
- * PIECE_CHUNK bytes (P) within the FAULTS polls. True when *off is exact.
+ * PIECE_CHUNK bytes (P), followed by the FAULTS poll. True when *off is exact.
  * False when an unknown entry before the line's start blocks the search,
  * which then reads no further unknown entry: *off is that entry's start,
  * *before the exact count before it (less than line), and the line starts
@@ -496,8 +504,8 @@ bool piece_lines_start(const piece_view *v, uint64_t line, uint64_t *off,
                        uint64_t *before);
 
 /* Off-path counter. Counts the newlines of chunks [first, first + n) of b
- * into counts[0, n) between an opening and a closing poll of b->fault; false,
- * counts discarded, unless both report epoch 0. Any thread while the caller
+ * into counts[0, n), then polls b->fault once (FAULTS); false, counts
+ * discarded, unless it reports epoch 0. Any thread while the caller
  * owns a backing reference; touches no tree, allocates nothing, reads at
  * most n x PIECE_CHUNK bytes. ASSERT: b, counts != NULL;
  * first + n <= ceil(b->len / PIECE_CHUNK). */

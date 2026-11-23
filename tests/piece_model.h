@@ -487,14 +487,13 @@ static inline size_t pm_iter_next(pm_iter *it, const uint8_t **p)
 
 /* The record of coordinates [src, src + len): head and tail per piece.h. A
  * mapped part is unknown when its chunk is unknown to the view, or when a
- * poll around its scan fails or shows a fault. */
+ * poll after its scan fails or shows a fault (one closing poll, piece.h FAULTS). */
 static inline uint32_t pm_nl_part(const pm_view *v, uint64_t src, uint64_t len)
 {
     const pm_core *c = pm_view_core(v);
-    uint64_t e0 = 0, e1 = 0;
+    uint64_t e1 = 0;
     bool mapped = c->mapped && !pm_is_add(src);
     if (mapped && !pm_chunk_known(v, pm_off(src) / PIECE_CHUNK)) return PIECE_NL_UNKNOWN;
-    if (mapped && (os_fault_poll(c->backing.fault, &e0) != OS_OK || e0 != 0)) return PIECE_NL_UNKNOWN;
     uint64_t n = pm_count_nl(v, src, len);
     if (mapped && (os_fault_poll(c->backing.fault, &e1) != OS_OK || e1 != 0)) return PIECE_NL_UNKNOWN;
     return (uint32_t)n;
@@ -644,8 +643,7 @@ static inline piece_err pm_replace_spans(pm_tree *t, uint64_t off, uint64_t del,
             uint64_t o = pm_off(spans[i].src), tag = spans[i].src & PIECE_SPAN_ADD;
             uint64_t ci = o / PIECE_CHUNK, cj = (o + spans[i].len - 1u) / PIECE_CHUNK;
             bool mapped = t->core->mapped && !tag;
-            uint64_t e0 = 1, e1 = 1;
-            if (mapped && (os_fault_poll(t->core->backing.fault, &e0) != OS_OK || e0 != 0)) continue;
+            uint64_t e1 = 1;
             uint64_t head_len = ci == cj ? spans[i].len : (ci + 1u) * PIECE_CHUNK - o;
             uint64_t head = pm_count_nl(&t->view, spans[i].src, head_len);
             uint64_t tail = ci == cj ? 0 : pm_count_nl(&t->view, tag | (cj * PIECE_CHUNK), o + spans[i].len - cj * PIECE_CHUNK);
@@ -799,7 +797,7 @@ static inline bool pm_reclaim(pm_tree *t, size_t budget)
 
 /* ---- Lines --------------------------------------------------------------- */
 
-/* Both polls report epoch 0 (mapped only; private storage needs none). */
+/* The one poll reports epoch 0 (mapped only; private storage needs none). */
 static inline bool pm_poll_ok(const pm_core *c)
 {
     uint64_t e = 1;
@@ -880,15 +878,13 @@ static inline bool pm_lines_count(const piece_backing *b, uint64_t first, uint32
     ASSERT(b != NULL && counts != NULL);
     uint64_t chunks = (b->len + PIECE_CHUNK - 1u) / PIECE_CHUNK;
     ASSERT(first <= chunks && n <= chunks - first);
-    uint64_t e = 1;
-    if (os_fault_poll(b->fault, &e) != OS_OK || e != 0) return false;
     for (size_t i = 0; i < n; i++) {
         uint64_t lo = (first + i) * PIECE_CHUNK, hi = pm_min(lo + PIECE_CHUNK, b->len);
         uint32_t k = 0;
         for (uint64_t at = lo; at < hi; at++) k += b->bytes[at] == '\n';
         counts[i] = k;
     }
-    e = 1;
+    uint64_t e = 1;
     return os_fault_poll(b->fault, &e) == OS_OK && e == 0;
 }
 
