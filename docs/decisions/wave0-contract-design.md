@@ -202,3 +202,10 @@ is discarded at cutover. The wire format stays as designed (no re-versioning lat
 Wave 0 beads: sandbox; X driver; inspect client; v1 adapter patch (report real line count against the 320 (E));
 navigation R1 + R6; files R3 + R5; crash-recovery controls; large_undo X3; runner and gate; R4 capacity (last).
 Order: sandbox, then driver and inspect client in parallel, then adapter, then the case beads in parallel worktrees.
+
+## Law-2 count rule for inspected cases (advisor, 2026-11-23)
+
+Every case with an input-to-submit window carries the passive allocation count. On v2 it is **asserted to be 0**
+(Law 2). On the v1 reference build it is **recorded, not asserted**, unless v1 shows 0 for that case, in which case
+it is asserted there too, so the adapter's window is proven correct on at least one case. (R1 recorded 4 on v1 at
+0.48; attribution in bead W0.9.)
