@@ -8,6 +8,7 @@ import bisect
 import re
 
 _INCLUDE_BEFORE = re.compile(r'^[ \t]*#[ \t]*(?:include|include_next|import)[ \t]*$')
+_LITERAL_PREFIX = re.compile(r'(?<!\w)(?:u8|[LuU])\Z')
 
 
 def lex(text):
@@ -47,7 +48,9 @@ def lex(text):
             toks.append(('comment', i, j))
             i = start = j
         elif c == '"' or c == "'":
-            flush(i)
+            prefix = _LITERAL_PREFIX.search(text, start, i)
+            a = prefix.start() if prefix else i
+            flush(a)
             j = i + 1
             while j < n and text[j] != c and text[j] != '\n':
                 j += 2 if text[j] == '\\' else 1
@@ -55,7 +58,7 @@ def lex(text):
                 j += 1
             else:
                 j = min(j, n)
-            toks.append(('string' if c == '"' else 'char', i, j))
+            toks.append(('string' if c == '"' else 'char', a, j))
             i = start = j
         elif c == '<' and _INCLUDE_BEFORE.match(text[text.rfind('\n', 0, i) + 1:i]):
             flush(i)

@@ -24,7 +24,10 @@ AR         ?= ar
 # App identity: every OS path and IPC leaf is built from EDIT_APP_ID, never a
 # literal (tools/check_isolation.py), so v2 cannot touch v1's XDG/IPC names.
 APP_ID := sublimite-v2
-WARN   := -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wswitch-enum -D_GNU_SOURCE -pthread -DEDIT_APP_ID=\"$(APP_ID)\"
+ifneq ($(APP_ID),sublimite-v2)
+$(error APP_ID must be sublimite-v2)
+endif
+WARN   := -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wswitch-enum -D_GNU_SOURCE -pthread
 INC    := -Isrc -Ivendor/tree-sitter/lib/include
 DEP    := -MMD -MP
 
@@ -102,7 +105,7 @@ check-xdriver: $(B)/xdriver $(B)/xdriver-test-client
 define CFG_COMPILE
 $(B)/$(1)/%.o: %.c
 	@mkdir -p $$(@D)
-	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -c $$< -o $$@
+	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -c $$< -o $$@
 endef
 $(foreach c,$(CFGS),$(eval $(call CFG_COMPILE,$(c))))
 
@@ -157,6 +160,7 @@ check-lints: $(LINT_OBJS)
 	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
 	python3 tools/check_no_c_includes.py --build-dir "$(B)"
 	python3 tools/check_isolation.py
+	python3 -B tests/isolation/run.py --build-dir "$(B)"
 	python3 tests/lint/run.py
 
 # Isolated --whole-archive link per layer against lower archives only, then run.
