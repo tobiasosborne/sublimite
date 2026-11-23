@@ -149,3 +149,12 @@ it takes the emoji font and width 2 only when followed by U+FE0F. The same rule 
 code point whose Emoji_Presentation is No (❤ and ‼ among them), and the test enumerates that set from the tables,
 not from a hand list. If v1 at the pin sends bare ❤ or ‼ to the emoji font, that is a v1 rendering difference to
 record, not a behaviour to carry.
+
+## A17. Wave 3 acceptance line for session restore and tabs: opening or restoring N tabs is O(N) total
+
+From R4 (v2-he7.17, docs/decisions/v2-he7.17.md, measured (M) [AC, load 0.67]): v1's per-open handoff cost grows
+linearly with the live tab count — 128-path handoffs took 0.3, 0.6, 0.9, 1.2, 1.5 and about 1.8 s at 1, 129, 257, 385,
+513 and 641 tabs, and timed out at 769 — so filling 1000 tabs is quadratic. The worker measured the growth but did not
+name the per-tab operation responsible; the Wave 3 session-restore/tabs bead first identifies it by symbol at the pin
+(starting from src/editor/buffers.c editor_open_request), then states the acceptance: opening or restoring N tabs
+performs O(N) work in total, tested by counting that per-tab operation, not by timing.
