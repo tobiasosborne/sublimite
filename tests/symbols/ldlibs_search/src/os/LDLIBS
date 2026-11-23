@@ -1,0 +1,1 @@
+-Lbuild/rel -lapp -l:libapp.a

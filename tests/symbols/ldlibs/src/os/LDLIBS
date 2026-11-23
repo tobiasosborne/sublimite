@@ -1,0 +1,1 @@
+-Wl,--start-group build/rel/libapp.a build/rel/libui.a build/rel/libgfx_plat.a build/rel/libpersist.a build/rel/libtext.a -Wl,--end-group

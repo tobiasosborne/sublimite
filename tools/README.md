@@ -10,3 +10,5 @@
 | `clex.py` | Minimal C lexer for the source-level identity string check. | Imported by `tools/check_isolation.py` | `check-lints` |
 | `tests/lint/run.py` | Compiles fixture translation units and verifies both dependency lints' verdicts. | `python3 tests/lint/run.py` | `check-lints` |
 | `t3quota.py` | Quota and pace per provider (Claude, Codex, Gemini), read from T3 Code's caches (`~/.t3/caches/<provider>.json`, `usageLimits`). The coordinator runs it before each dispatch wave; ROOM is the points left before uniform pace. Muse and Pi report no data there. | `python3 tools/t3quota.py [--json]` | none (coordinator tool) |
+| `check_symbols.py` | Audits release archive imports and exports against the module DAG and validates per-module `LDLIBS`. | `make check-symbols` | `check-lints`, `check-module-ldlibs` |
+| `system-symbols.txt` | Exact, reviewed libc and release toolchain imports with a reason for each entry. | Read by `tools/check_symbols.py` | `check-lints` |

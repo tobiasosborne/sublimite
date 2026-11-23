@@ -143,6 +143,23 @@ check-layers: $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
 	@set -e; for t in $(LAYER_TEST_BINS) $(LAYER_L5_BIN); do echo "== $$t"; $(RUN)$$t; done; \
 	echo "check-layers: 6 isolated layer links passed (L0-L4 tests, L5 via main.o)"
 
+# Link-level module DAG. Use the same member order as the archive recipes.
+symbol_modules := $(foreach l,$(LAYERS),$(foreach m,$($(l)_MODS),$(l):$(m)))
+symbol_layer_libs := $(foreach l,$(LAYERS),$($(l)_LIB))
+
+.PHONY: check-symbols check-module-ldlibs
+check-lints: check-symbols
+check-symbols: $(call libs_desc,rel) $(B)/rel/src/main.o
+	python3 tools/check_symbols.py --nm '$(or $(NM),nm)' --module-map $(symbol_modules) \
+	    --layer-libs $(symbol_layer_libs) --main $(B)/rel/src/main.o \
+	    $(foreach l,$(LAYERS),--archive $(patsubst L%,%,$(l)) $(call lib_of,rel,$(l)) \
+	        $(patsubst $(B)/rel/%,%,$($(l)_OBJ_rel)))
+	+$(MAKE) --no-print-directory -f Makefile -f tests/symbols/fixtures.mk check-symbol-fixtures
+
+$(LAYER_TEST_BINS) $(LAYER_L5_BIN): | check-module-ldlibs
+check-module-ldlibs:
+	python3 tools/check_symbols.py --ldlibs-only --layer-libs $(symbol_layer_libs)
+
 # ASan + UBSan over every tests/*_test.c (layer tests included).
 check-san: $(TEST_SAN)
 	@set -e; n=0; for t in $(TEST_SAN); do echo "== $$t"; $(RUN)$$t; n=$$((n+1)); done; echo "check-san: $$n test binaries passed"
