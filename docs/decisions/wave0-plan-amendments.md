@@ -60,3 +60,22 @@ The v2 holder list itself is being redone from PLAN_V2 §2/§4 (advisor challeng
 From the same file (correction c): at the pin `add_store_prefix` walks the chunk directory during checkpoint
 **begin**, not per snapshot retain. O(1) directory sharing at begin is an acceptance condition of the Wave 1 piece
 bead, tested so that a single linear-sized allocation or loop cannot hide behind an allocation-call count.
+
+## A8. §6 X3 expected failure: v1 terminates, it does not save empty
+
+Reproduced on the pinned stock build (bead v2-he7.15, docs/decisions/v2-he7.15.md): on a 33,619,968 B file
+((512 + 1) × 65,536 (P), `LINEIDX_EDIT_MAX_CHUNKS` × `LINEIDX_CHUNK` + one chunk), Select All, Delete, Ctrl+Z makes
+v1 exit with status 1 and print `sublimite: error -105` (over capacity): `replay_history` returns it
+(`input.c:718`), the key handler propagates it (`input.c:1281`), the main loop treats any key error as fatal
+(`editor.c:1376`), `main.c:342–344` exits 1. M3's "nothing happens, forever" is corrected in wave0-known-bugs.md.
+The X3 XFAIL now names exactly this failure: exit status 1, stderr contains "error -105", no write to the file
+(bytes and inode metadata unchanged), within the watchdog. Any other v1 outcome (hang, other error, a 0 B save,
+harness ERROR) is not the expected failure. v2 expectation unchanged: undo succeeds, bytes round-trip (PASS).
+X3 stays the sole XFAIL.
+
+## A9. Wave 2 acceptance line for the input path: events apply in the order sent, across an in-progress open
+
+Observed in W0.6h's red run on the pinned build: while a file is still opening, Ctrl+S can overtake keys v1 holds
+back and the save silently does nothing (`editor.c:1064–1086`, `session.c:591`). v2 contract: input events are
+applied in the order sent, including across an in-progress open. The contract navigation bead (v2-he7.12) carries
+the case once the snapshot adapter exists; no case is added now.

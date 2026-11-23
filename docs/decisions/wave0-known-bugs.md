@@ -308,7 +308,7 @@ editor before any mutation:
   caller does that recreation.
 
 User-visible effect: delete a >32 MiB selection in a large file
-(works), press Ctrl+Z (nothing happens, forever), and the only
+(works), press Ctrl+Z (**correction, 2026-11-23, reproduced on the pinned build: the editor exits with status 1 and prints `sublimite: error -105`**, see docs/decisions/v2-he7.15.md and amendment A8; this note's original reading was "nothing happens, forever"), and the only
 recovery is reload-from-disk — if the buffer is instead saved,
 the accidental deletion becomes permanent. Redo of a >32 MiB
 insert and paste/replace-all producing a >32 MiB contiguous
