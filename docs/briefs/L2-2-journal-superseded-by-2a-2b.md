@@ -1,0 +1,38 @@
+Bead L2-2 — L2 journal core: the v2 wire format, the typing-path append, worker transport, replay into piece. (Dossier bead L2-2; the save transaction is L2-3.) sublimité v2 is a clean-slate C11 editor rebuild; your checkout is a worktree of /home/tobias/Projects/sublimite-v2 (branch v2). One worker, one bead; do exactly this scope, then stop. Routing: Opus (the tests kill processes and tear writes; not Codex).
+
+THE FORMAT IS FOR EVER. The record set below is decided; field layouts are yours to derive and are read by the advisor before you implement past the header: write src/journal/journal.h's wire section (preamble, record header, every record's fields, sizes with (P) arithmetic, version and feature rules) FIRST, send it to the coordinator, and continue with the implementation only on the advisor's word — as was done for piece.h.
+
+Read first (absolute paths under /home/tobias/Projects/sublimite-v2):
+1. CLAUDE.md (L2 includes only L0/L1; one public header; journal_ prefix; A15; Law 2 on the typing path; explicit FSM enums under -Wswitch-enum, no coordinating booleans; checked allocations; no env-var feature switches; tests link the archive, never #include a .c, inject syscalls with -Wl,--wrap).
+2. docs/decisions/wave0-plan-amendments.md A13, A14, A19, A20, A22, A23 (the save protocol: rules 1–7, the self-contained-size rule, the T5 product contract and its acceptance line).
+3. docs/decisions/wave1-L2-L5-harvest.md §0 and §2 in full (v1 sources by function, API to carry and its changes, the v1 wire, acceptance lines that exist, v1 structure NOT to carry, tests to port).
+4. docs/decisions/wave1-L2-derivations.md Q1 (generation key, declaration, re-declaration at every checkpoint), Q5 (24 B SJNL preamble), Q6 (one os_file_pwrite_once per record on the UI thread; page cache suffices for a process kill), Q7 (one shared work pool; UI-only submission and mailbox consumption; workers do leased journal work inline), Q14 (ABSENT | PRESENT(os_stat)); Q3 (BASE-range replay after restart; by value for a foreign generation); and docs/decisions/wave1-L2-q2-protocol.md (the record table and recovery rules; T1–T5).
+5. docs/decisions/wave1-piece-pool.md "Journal encoding and durable source lifetime" and "Wire and integration".
+6. Headers as they stand: src/piece/piece.h, src/undo/undo.h (journal staging sits after the last undo_replace and before undo_commit, published after success), src/os/os.h, src/work/work.h, src/base/base.h.
+7. v1 evidence, read-only (never build there): /home/tobias/Projects/sublimite-v1-oracle/src/journal/ and its tests listed in dossier §2.7.
+
+Record set (decided, A23): SJNL preamble (Q5) + PAD; GENERATION; BASE; TARGET; INSERT; DELETE; RESTORE_BASE_RANGE; GROUP_BEGIN / GROUP_COMMIT; CHECKPOINT_BY_VALUE (followed by literal INSERT slices inside one group); SAVE(PREPARED / FINISHED / CANCELLED); VIEW; TABS. No WINDOW, no PAINT (GUI records: defined by the Wave 2 bead that needs them). Each with its emission point, sync requirement and recovery use per wave1-L2-q2-protocol.md "Records for L2-2". The SAVE records' writers are L2-3's; you define and parse them and test their round trip.
+
+Design points this bead owns:
+- The self-contained size (A23): a buffer whose text is at or below it is made self-contained in the journal (CHECKPOINT_BY_VALUE of its text) once it has an acknowledged edit, written off the typing path by the worker. DERIVE the size from the measured journal append rate on this machine and what a worker may write per checkpoint without delaying other journal work; cite v1's whole-text versus delta-encoded split at the pin as evidence; write the derivation beside the constant. Until that checkpoint is durable the first edits are BASE-relative; the typing path does not change.
+- Recovery refuses to replay BASE-relative records onto a file whose identity does not match, in every path (A23). It reports an unresolved BASE and offers the literal bytes the journal does hold.
+- Two orthogonal state enums replace v1's seven booleans (worker transport; recovery suspension) — states derived against journal_retry (dossier §2.6).
+- CRC32C hardware/portable selection through base_cpu_has_* (add sse42 to base if needed), both paths tested through a --wrap of the CPU predicate; no env switch.
+- Every arena allocation checked or ASSERTed with its sizing derivation (dossier §2.6 lists v1's unchecked sites).
+- journal_apply_piece on the v2 piece API: INSERT -> piece_replace(t, off, 0, bytes, n); DELETE -> piece_replace(t, off, len, NULL, 0); RESTORE_BASE_RANGE -> piece_replace_spans(..., NULL, 1) ONLY when the generation key resolves to a verified source that is the tree's ORIGINAL, otherwise by value per Q3. Recovery builds trees without history (it calls piece directly, never undo).
+
+Acceptance (each a test, red first):
+- The PLAN §4.2 oracle at journal level: kill at every group boundary (AFTER_BEGIN, AFTER_DELETE, BEFORE_COMMIT, AFTER_COMMIT; port v1 journal_kill_test.c and journal_hot_exit_test.c): before ack pre-edit or whole-edit, after ack whole-edit.
+- An unknown version or required feature is refused and the file set aside WITHOUT truncation (red: a v1-style truncating scan).
+- Group atomicity under torn tails; a torn group has no effect.
+- RESTORE_BASE_RANGE round-trips and is rejected on kind, bounds, arithmetic overflow and source-identity mismatch.
+- A23's T5 test: a BASE-relative journal whose BASE was replaced by a foreign file recovers as "unresolved BASE" with the journal's literal bytes offered, never applied to the wrong file.
+- CHECKPOINT_BY_VALUE: a self-contained buffer recovers exactly after its BASE file is deleted or replaced.
+- Typing-path append and insert_step under the release malloc guard: active && count == 0 (law2 suite).
+- Q6's Wave 1 exit number (A22): input-to-submit median and tail with the append, during ordinary typing and under heavy writeback from another process, stamped [bat]/[AC] + load — measured with a bench in this bead; if the tail fails G1, report it (the comparison would be a preallocated shared mapping of the journal segment).
+- Q3's measurement belongs here (A22): on the 10 GiB class, peak ADD extents, nodes, scratch, RSS and temporary disk for recovery of a mixed-generation checkpoint with repeated ranges — or, if 7b has not landed when you get there, the harness ready and the measurement listed as the one missing item.
+- `make check-tsan` on the journal suites; fuzz/journal_fuzz.c ported with preamble/version, GENERATION, RESTORE_BASE_RANGE and CHECKPOINT_BY_VALUE ops; bench/journal_bench.c ported.
+
+Build against: the piece model (tests/piece_model.o ahead of libtext.a, as find/undo do) until 7b lands; when 7b is on v2 switch to the real tree. Scope files: src/journal/{journal.h,journal.c,private.h,path.c,session.c} (v1's retire.c and manual.c are NOT carried: A23 deletes the retention artifacts and their retirement scan; manual replay is deferred), tests and fuzz per dossier §2.7 (core subset), docs/decisions/L2-2-journal.md (each mechanism: invariant, simplest alternative, defeating counter-example; v1 kept/cut).
+
+Rules: no git (not even git add -N), no bd. No rm -rf, no mktemp with a clean-up trap, nothing outside your checkout; HOME for cache-writing tools under build/; build under build/; at most nice make -j2; no starts Tue 24 Nov 03:45–05:00 CET; run date before each; report rather than run anything needing approval. Acceptance lanes: nice make -j2 check (CONTRACT_CHECK_DISPLAYS from the coordinator), check-tsan, fuzz-smoke. Report: the wire section first (for the advisor), then red/green per acceptance line, the self-contained size with its derivation and measurements, lines removed vs added, anything outside scope (report only).
