@@ -164,13 +164,13 @@ endif
 
 $(B)/rel/tests/%: $(B)/rel/tests/%.o $(call libs_desc,rel)
 	@mkdir -p $(@D)
-	$(CC_RELEASE) $(REL_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,rel) $(LDLIBS) -o $@
+	$(CC_RELEASE) $(REL_F) -pthread $< $(filter %_test_hooks.o %_model.o,$^) $(LDFLAGS_$*) $(call libs_desc,rel) $(LDLIBS) -o $@
 $(B)/san/tests/%: $(B)/san/tests/%.o $(call libs_desc,san)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(SAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,san) $(LDLIBS) -o $@
+	$(CC_SAN) $(SAN_F) -pthread $< $(filter %_test_hooks.o %_model.o,$^) $(LDFLAGS_$*) $(call libs_desc,san) $(LDLIBS) -o $@
 $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
+	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o %_model.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
 # Work initialization faults are injected at the OS boundary in this suite.
 WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
                    os_cond_init os_cond_destroy os_thread_start os_thread_join
@@ -186,12 +186,20 @@ $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
 # (tests/ipc_peer_seam.h); the shipped binary has no override (v2-0fv.13).
 IPC_PEER_SEAM := -Wl,--wrap=os_stream_peer_uid
 $(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_PEER_SEAM)
+# piece (v2-0fv.7): base refusal is injected at its one reservation path. The
+# flat model (tests/piece_model.c defines every piece.h symbol) stands in for
+# src/piece until v2-0fv.7b, which deletes the two model lines below and links
+# $(B)/<cfg>/src/piece/piece_test_hooks.o into piece_test instead.
+LDFLAGS_piece_test := -Wl,--wrap=os_vm_reserve
+$(B)/fuzz/piece_fuzz: private LDLIBS += -Wl,--wrap=os_vm_reserve
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/piece_test: $(B)/$(c)/tests/piece_model.o))
+$(B)/fuzz/piece_fuzz: $(B)/fuzz/tests/piece_model.o
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
+	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(filter %_model.o,$^) $(call libs_desc,fuzz) $(LDLIBS) -o $@
 
 $(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
