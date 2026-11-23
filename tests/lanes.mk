@@ -13,3 +13,9 @@ SAN_SUITES += tests/trace_test.c
 LAW2_SUITES += tests/law2_trace_test.c
 TSAN_SUITES += tests/trace_test.c
 FUZZ_SUITES += fuzz/trace_fuzz.c
+
+# work (v2-0fv.5)
+SAN_SUITES += tests/work_test.c
+LAW2_SUITES += tests/law2_work_test.c
+TSAN_SUITES += tests/work_test.c
+FUZZ_SUITES += fuzz/work_fuzz.c

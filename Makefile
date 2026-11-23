@@ -150,11 +150,18 @@ $(B)/san/tests/%: $(B)/san/tests/%.o $(call libs_desc,san)
 $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(TSAN_F) -pthread $< $(call libs_desc,tsan) $(LDLIBS) -o $@
+# Work initialization faults are injected at the OS boundary in this suite.
+WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
+                   os_cond_init os_cond_destroy os_thread_start os_thread_join
+$(foreach c,rel san tsan,$(B)/$(c)/tests/work_test): private LDLIBS += $(foreach s,$(WORK_TEST_WRAPS),-Wl,--wrap=$(s))
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
 
 $(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
+$(B)/rel/bench/work_bench: $(B)/rel/bench/work_bench.o $(call lib_of,rel,L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
 
 $(B)/trace_bench: bench/trace_bench.c $(call lib_of,rel,L0)
