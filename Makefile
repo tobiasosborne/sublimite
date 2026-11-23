@@ -111,6 +111,7 @@ check-contract-oracle: $(B)/xdriver
 .PHONY: check-contract-recovery
 check-contract-recovery: $(B)/xdriver
 	python3 -B tests/contract/cases/recovery.py --oracle "$$ORACLE" \
+		$${ORACLE_TREE:+--build-dir "$$ORACLE_TREE/build/contract-oracle"} \
 		--display "$$RECOVERY_DISPLAY" --case "$${RECOVERY_CASE:-pre-ack}"
 
 # ---- objects (one tree per configuration) ----
