@@ -24,6 +24,9 @@ FUZZ_SUITES += fuzz/work_fuzz.c
 TSAN_SUITES += tests/ipc_test.c
 FUZZ_SUITES += fuzz/ipc_fuzz.c
 
+# os local streams and wait set (v2-0fv.13)
+SAN_SUITES += tests/os_endpoint_test.c
+
 # scan (v2-0fv.10)
 SAN_SUITES += tests/scan_test.c
 FUZZ_SUITES += fuzz/scan_fuzz.c

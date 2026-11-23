@@ -9,16 +9,21 @@
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,7 +50,7 @@ static os_err map_errno(int e)
 {
     switch (e) {
     case ENOENT: return OS_E_NOENT;
-    case EEXIST: case ENOTEMPTY: return OS_E_EXIST;
+    case EEXIST: case ENOTEMPTY: case EADDRINUSE: return OS_E_EXIST;
     case EACCES: case EPERM: case EROFS: return OS_E_ACCESS;
     case EBUSY: case ETXTBSY: return OS_E_BUSY;
     case ELOOP: return OS_E_LOOP;
@@ -61,6 +66,7 @@ static os_err map_errno(int e)
     case ENOMEM: return OS_E_NOMEM;
     case ERANGE: return OS_E_RANGE;
     case EINTR: return OS_E_INTR;
+    case ECONNREFUSED: return OS_E_REFUSED;
     default: return OS_E_IO;
     }
 }
@@ -75,7 +81,7 @@ const char *os_err_name(os_err e)
         "OS_OK", "OS_E_NOENT", "OS_E_EXIST", "OS_E_ACCESS", "OS_E_BUSY", "OS_E_LOOP",
         "OS_E_NOTDIR", "OS_E_ISDIR", "OS_E_XDEV", "OS_E_NOSPC", "OS_E_NAMETOOLONG",
         "OS_E_INVAL", "OS_E_NOTSUP", "OS_E_AGAIN", "OS_E_TIMEDOUT", "OS_E_NOMEM",
-        "OS_E_RANGE", "OS_E_IO", "OS_E_INTR"};
+        "OS_E_RANGE", "OS_E_IO", "OS_E_INTR", "OS_E_REFUSED"};
     unsigned i = (unsigned)e;
     return i < sizeof names / sizeof names[0] ? names[i] : "OS_E_?";
 }
@@ -268,7 +274,8 @@ static void from_stat(os_stat *o, const struct stat *s)
     o->id.volume = (uint64_t)s->st_dev;
     o->id.index[0] = (uint64_t)s->st_ino;
     o->kind = S_ISREG(s->st_mode) ? OS_KIND_FILE : S_ISDIR(s->st_mode) ? OS_KIND_DIR
-            : S_ISLNK(s->st_mode) ? OS_KIND_LINK : OS_KIND_OTHER;
+            : S_ISLNK(s->st_mode) ? OS_KIND_LINK : S_ISSOCK(s->st_mode) ? OS_KIND_SOCKET
+            : OS_KIND_OTHER;
     o->size = s->st_size < 0 ? 0 : (uint64_t)s->st_size;
     o->mtime_ns = ts_ns(s->st_mtim);
     o->ctime_ns = ts_ns(s->st_ctim);
@@ -896,3 +903,384 @@ os_err os_proc_self_path(char *out, size_t cap)
     if ((size_t)n >= sizeof tmp) return fail_with(OS_E_NAMETOOLONG);
     return copy_out(out, cap, tmp, (size_t)n);
 }
+
+/* ---- local streams (v2-0fv.13) ----------------------------------------- */
+uint32_t os_user_id(void) { return (uint32_t)getuid(); }
+
+static void close_quiet(int fd)
+{
+    int e = errno;
+    (void)close(fd);
+    errno = e;
+}
+
+/* (P) "/proc/self/fd/" is 14 bytes, an int descriptor at most 10 digits,
+ * plus the NUL. */
+#define PROC_FD_CAP 32u
+static size_t proc_fd_path(char out[PROC_FD_CAP], int fd)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    char digits[12];
+    size_t d = sizeof digits;
+    unsigned v = (unsigned)fd;
+    do { digits[--d] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    size_t n = sizeof prefix - 1u, nd = sizeof digits - d;
+    memcpy(out, prefix, n);
+    memcpy(out + n, digits + d, nd);
+    out[n + nd] = 0;
+    return n + nd;
+}
+
+/* A directory name is addressed as /proc/self/fd/<dirfd>/<name>: the pinned
+ * directory resolves it, so renaming the path cannot redirect the call, and a
+ * deep runtime directory still fits sun_path. An abstract name starts with a
+ * NUL and has no terminator. */
+static os_err local_addr(struct sockaddr_un *a, socklen_t *len, const os_dir *dir,
+                         const char *name)
+{
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    if (!name || !name[0]) return fail_with(OS_E_INVAL);
+    size_t n = strlen(name);
+    if (!dir) {
+        if (n > sizeof a->sun_path - 1u) return fail_with(OS_E_NAMETOOLONG);
+        memcpy(a->sun_path + 1, name, n);
+        *len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1u + n);
+        return OS_OK;
+    }
+    if (bad_name(name) || dir->fd < 0) return fail_with(OS_E_INVAL);
+    char base[PROC_FD_CAP];
+    size_t at = proc_fd_path(base, dir->fd);
+    if (at + 1u + n >= sizeof a->sun_path) return fail_with(OS_E_NAMETOOLONG);
+    memcpy(a->sun_path, base, at);
+    a->sun_path[at++] = '/';
+    memcpy(a->sun_path + at, name, n + 1u);
+    *len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + at + n + 1u);
+    return OS_OK;
+}
+
+static void unlink_if_same(int dirfd, const char *name, const struct stat *want)
+{
+    int e = errno, rc;
+    struct stat now;
+    RETRY(rc, fstatat(dirfd, name, &now, AT_SYMLINK_NOFOLLOW));
+    if (rc == 0 && now.st_dev == want->st_dev && now.st_ino == want->st_ino)
+        (void)unlinkat(dirfd, name, 0);
+    errno = e;
+}
+
+os_err os_listen_local(os_listener *out, const os_dir *dir, const char *name,
+                       uint32_t backlog, os_stat *bound)
+{
+    out->fd = -1;
+    if (backlog == 0 || backlog > (uint32_t)INT_MAX) return fail_with(OS_E_INVAL);
+    struct sockaddr_un a;
+    socklen_t len;
+    os_err e = local_addr(&a, &len, dir, name);
+    if (e != OS_OK) return e;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return fail();
+    int rc;
+    RETRY(rc, bind(fd, (const struct sockaddr *)&a, len));
+    if (rc != 0) {
+        e = fail();
+        close_quiet(fd);
+        return e;
+    }
+    struct stat st;
+    memset(&st, 0, sizeof st);
+    bool ours = false; /* The name names the socket bound here. */
+    if (dir) {
+        /* Pin first, then check and chmod the pinned inode: no name lookup
+         * sits between the check and the mode change. */
+        int pin;
+        RETRY(pin, openat(dir->fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC));
+        if (pin < 0) e = fail();
+        else {
+            RETRY(rc, fstat(pin, &st));
+            if (rc != 0) e = fail();
+            else if (!S_ISSOCK(st.st_mode) || st.st_uid != getuid()) e = fail_with(OS_E_ACCESS);
+            else {
+                ours = true;
+                char path[PROC_FD_CAP];
+                (void)proc_fd_path(path, pin);
+                RETRY(rc, chmod(path, 0600));
+                if (rc != 0) e = fail();
+            }
+            close_quiet(pin);
+        }
+    }
+    if (e == OS_OK) {
+        RETRY(rc, listen(fd, (int)backlog));
+        if (rc != 0) e = fail();
+    }
+    if (e != OS_OK) {
+        if (ours) unlink_if_same(dir->fd, name, &st);
+        close_quiet(fd);
+        return e;
+    }
+    if (dir && bound) from_stat(bound, &st);
+    out->fd = fd;
+    return OS_OK;
+}
+os_err os_listener_accept(os_listener *l, os_stream *out)
+{
+    out->fd = -1;
+    int fd;
+    RETRY(fd, accept4(l->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC));
+    if (fd < 0) return fail();
+    out->fd = fd;
+    return OS_OK;
+}
+void os_listener_close(os_listener *l)
+{
+    if (l->fd >= 0) close_quiet(l->fd);
+    l->fd = -1;
+}
+int os_listener_fd(const os_listener *l) { return l->fd; }
+
+os_err os_connect_local(os_stream *out, const os_dir *dir, const char *name)
+{
+    out->fd = -1;
+    struct sockaddr_un a;
+    socklen_t len;
+    os_err e = local_addr(&a, &len, dir, name);
+    if (e != OS_OK) return e;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return fail();
+    int rc = connect(fd, (const struct sockaddr *)&a, len);
+    /* An interrupted connect can still complete; the retry then says EISCONN. */
+    while (rc != 0 && errno == EINTR) {
+        rc = connect(fd, (const struct sockaddr *)&a, len);
+        if (rc != 0 && errno == EISCONN) rc = 0;
+    }
+    if (rc != 0) {
+        e = fail();
+        close_quiet(fd);
+        return e;
+    }
+    out->fd = fd;
+    return OS_OK;
+}
+os_err os_stream_pair(os_stream *a, os_stream *b)
+{
+    int fds[2];
+    a->fd = b->fd = -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) != 0) return fail();
+    a->fd = fds[0];
+    b->fd = fds[1];
+    return OS_OK;
+}
+os_err os_stream_adopt(os_stream *out, int fd)
+{
+    out->fd = fd;
+    if (fd < 0) return fail_with(OS_E_INVAL);
+    struct stat st;
+    int rc, fl;
+    RETRY(rc, fstat(fd, &st));
+    if (rc != 0) return fail();
+    if (!S_ISSOCK(st.st_mode)) return fail_with(OS_E_INVAL);
+    RETRY(fl, fcntl(fd, F_GETFL));
+    if (fl < 0) return fail();
+    if (!(fl & O_NONBLOCK)) {
+        RETRY(rc, fcntl(fd, F_SETFL, fl | O_NONBLOCK));
+        if (rc != 0) return fail();
+    }
+    RETRY(fl, fcntl(fd, F_GETFD));
+    if (fl < 0) return fail();
+    if (!(fl & FD_CLOEXEC)) {
+        RETRY(rc, fcntl(fd, F_SETFD, fl | FD_CLOEXEC));
+        if (rc != 0) return fail();
+    }
+    return OS_OK;
+}
+static os_err stream_recv(os_stream *s, void *buf, size_t n, size_t *got, int flags)
+{
+    ssize_t r;
+    *got = 0;
+    RETRY(r, recv(s->fd, buf, n, flags));
+    if (r < 0) return fail();
+    *got = (size_t)r;
+    return OS_OK;
+}
+os_err os_stream_read(os_stream *s, void *buf, size_t n, size_t *got)
+{
+    return stream_recv(s, buf, n, got, 0);
+}
+os_err os_stream_peek(os_stream *s, void *buf, size_t n, size_t *got)
+{
+    return stream_recv(s, buf, n, got, MSG_PEEK);
+}
+os_err os_stream_write(os_stream *s, const void *buf, size_t n, size_t *done)
+{
+    ssize_t r;
+    *done = 0;
+    /* MSG_NOSIGNAL: a closed peer is EPIPE here, never a process signal. */
+    RETRY(r, send(s->fd, buf, n, MSG_NOSIGNAL));
+    if (r < 0) return fail();
+    *done = (size_t)r;
+    return OS_OK;
+}
+os_err os_stream_peer_uid(const os_stream *s, uint32_t *uid)
+{
+    struct ucred cred;
+    socklen_t n = sizeof cred;
+    if (getsockopt(s->fd, SOL_SOCKET, SO_PEERCRED, &cred, &n) != 0) return fail();
+    *uid = (uint32_t)cred.uid;
+    return OS_OK;
+}
+void os_stream_close(os_stream *s)
+{
+    if (s->fd >= 0) close_quiet(s->fd);
+    s->fd = -1;
+}
+int os_stream_fd(const os_stream *s) { return s->fd; }
+
+/* ---- wait set (v2-0fv.13) ---------------------------------------------- */
+/* (E) Stack batch of 64 x 12 B = 768 B, the harvested ipc drain batch
+ * (v2-0fv.6). Correctness does not depend on it: epoll is level-triggered, so
+ * members past the batch stay ready for the next call. */
+#define WAIT_BATCH 64
+
+os_err os_waitset_init(os_waitset *ws)
+{
+    ws->fd = ws->alarm_fd = -1;
+    ws->alarm_ns = OS_DEADLINE_NEVER;
+    int fd = epoll_create1(EPOLL_CLOEXEC);
+    if (fd < 0) return fail();
+    int alarm = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    os_err e = OS_OK;
+    if (alarm < 0) e = fail();
+    else {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.events = EPOLLIN;
+        ev.data.u64 = OS_WAIT_ALARM;
+        int rc;
+        RETRY(rc, epoll_ctl(fd, EPOLL_CTL_ADD, alarm, &ev));
+        if (rc != 0) {
+            e = fail();
+            close_quiet(alarm);
+        }
+    }
+    if (e != OS_OK) {
+        close_quiet(fd);
+        return e;
+    }
+    ws->fd = fd;
+    ws->alarm_fd = alarm;
+    return OS_OK;
+}
+void os_waitset_close(os_waitset *ws)
+{
+    if (ws->alarm_fd >= 0) close_quiet(ws->alarm_fd);
+    if (ws->fd >= 0) close_quiet(ws->fd);
+    ws->fd = ws->alarm_fd = -1;
+    ws->alarm_ns = OS_DEADLINE_NEVER;
+}
+static os_err waitset_ctl(os_waitset *ws, int op, int fd, unsigned interest, uint64_t tag)
+{
+    if (ws->fd < 0 || fd < 0 || tag == OS_WAIT_ALARM ||
+        (interest & ~(unsigned)(OS_WAIT_IN | OS_WAIT_OUT)))
+        return fail_with(OS_E_INVAL);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    /* RDHUP with IN: a half-closed peer wakes its owner to read the end. */
+    if (interest & OS_WAIT_IN) ev.events |= EPOLLIN | EPOLLRDHUP;
+    if (interest & OS_WAIT_OUT) ev.events |= EPOLLOUT;
+    ev.data.u64 = tag;
+    int rc;
+    RETRY(rc, epoll_ctl(ws->fd, op, fd, &ev));
+    return rc ? fail() : OS_OK;
+}
+os_err os_waitset_add(os_waitset *ws, int fd, unsigned interest, uint64_t tag)
+{
+    return waitset_ctl(ws, EPOLL_CTL_ADD, fd, interest, tag);
+}
+os_err os_waitset_modify(os_waitset *ws, int fd, unsigned interest, uint64_t tag)
+{
+    return waitset_ctl(ws, EPOLL_CTL_MOD, fd, interest, tag);
+}
+void os_waitset_remove(os_waitset *ws, int fd)
+{
+    if (ws->fd < 0 || fd < 0) return;
+    int e = errno;
+    (void)epoll_ctl(ws->fd, EPOLL_CTL_DEL, fd, NULL);
+    errno = e;
+}
+os_err os_waitset_alarm(os_waitset *ws, uint64_t deadline_ns)
+{
+    if (ws->fd < 0) return fail_with(OS_E_INVAL);
+    if (deadline_ns == ws->alarm_ns) return OS_OK;
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    if (deadline_ns != OS_DEADLINE_NEVER) {
+        /* An all-zero value would disarm; 1 ns is equally long past. */
+        uint64_t d = deadline_ns ? deadline_ns : 1u;
+        its.it_value.tv_sec = (time_t)(d / (uint64_t)NS_PER_SEC);
+        its.it_value.tv_nsec = (long)(d % (uint64_t)NS_PER_SEC);
+    }
+    int rc;
+    RETRY(rc, timerfd_settime(ws->alarm_fd, TFD_TIMER_ABSTIME, &its, NULL));
+    if (rc != 0) return fail();
+    ws->alarm_ns = deadline_ns;
+    return OS_OK;
+}
+/* Milliseconds to the deadline, rounded up so a wait never ends early. */
+static int wait_ms(uint64_t deadline_ns)
+{
+    if (deadline_ns == OS_DEADLINE_NEVER) return -1;
+    uint64_t now = os_now_ns();
+    if (now >= deadline_ns) return 0;
+    uint64_t left = deadline_ns - now, ms = (uint64_t)NS_PER_MS;
+    uint64_t up = left / ms + (left % ms != 0);
+    return up > (uint64_t)INT_MAX ? INT_MAX : (int)up;
+}
+/* Consumes a fired alarm. False when it was re-armed after readiness. */
+static bool alarm_take(os_waitset *ws)
+{
+    uint64_t ticks;
+    ssize_t r;
+    int e = errno;
+    RETRY(r, read(ws->alarm_fd, &ticks, sizeof ticks));
+    errno = e;
+    if (r != (ssize_t)sizeof ticks) return false;
+    ws->alarm_ns = OS_DEADLINE_NEVER;
+    return true;
+}
+static unsigned wait_events(uint32_t e)
+{
+    unsigned r = 0;
+    if (e & EPOLLIN) r |= OS_WAIT_IN;
+    if (e & EPOLLOUT) r |= OS_WAIT_OUT;
+    if (e & (EPOLLHUP | EPOLLRDHUP)) r |= OS_WAIT_HUP;
+    if (e & EPOLLERR) r |= OS_WAIT_ERR;
+    return r;
+}
+os_err os_waitset_wait(os_waitset *ws, uint64_t deadline_ns, os_wait_event *ev,
+                       size_t cap, size_t *n)
+{
+    *n = 0;
+    if (ws->fd < 0 || !ev || cap == 0) return fail_with(OS_E_INVAL);
+    struct epoll_event raw[WAIT_BATCH];
+    int max = cap < (size_t)WAIT_BATCH ? (int)cap : WAIT_BATCH;
+    for (;;) {
+        int got = epoll_wait(ws->fd, raw, max, wait_ms(deadline_ns));
+        if (got < 0 && errno != EINTR) return fail();
+        size_t k = 0;
+        for (int i = 0; i < got; i++) {
+            if (raw[i].data.u64 == OS_WAIT_ALARM && !alarm_take(ws)) continue;
+            ev[k].tag = raw[i].data.u64;
+            ev[k].events = wait_events(raw[i].events);
+            k++;
+        }
+        if (k) {
+            *n = k;
+            return OS_OK;
+        }
+        /* Deadline reached; else EINTR, a stale alarm or a rounded-short
+         * wait: go round with the time left. */
+        if (wait_ms(deadline_ns) == 0) return OS_OK;
+    }
+}
+int os_waitset_fd(const os_waitset *ws) { return ws->fd; }

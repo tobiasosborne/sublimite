@@ -46,7 +46,8 @@ typedef enum os_err {
     OS_E_NOMEM,
     OS_E_RANGE,
     OS_E_IO,
-    OS_E_INTR
+    OS_E_INTR,
+    OS_E_REFUSED /* A local stream name exists with no listener (stale socket). */
 } os_err;
 
 const char *os_err_name(os_err e);
@@ -129,7 +130,8 @@ typedef enum os_kind {
     OS_KIND_FILE = 1,
     OS_KIND_DIR,
     OS_KIND_LINK,
-    OS_KIND_OTHER
+    OS_KIND_OTHER,
+    OS_KIND_SOCKET
 } os_kind;
 
 /* Device and inode identity. The second index word is zero on Linux and
@@ -318,6 +320,99 @@ os_err os_proc_kill(os_proc *p);
 os_err os_proc_wait(os_proc *p, int64_t timeout_ns, os_proc_status *st);
 uint64_t os_proc_id(void);
 os_err os_proc_self_path(char *out, size_t cap);
+
+/* The real user ID, for endpoint names and ownership checks. */
+uint32_t os_user_id(void);
+
+/* ---- local streams (v2-0fv.13) ----
+ * Unix-domain stream endpoints. Every descriptor is close-on-exec and
+ * nonblocking, and no call here waits: OS_E_AGAIN means nothing can move now,
+ * so register the descriptor in an os_waitset and retry on readiness.
+ * Transfers restart EINTR, and a write to a closed peer returns OS_E_IO
+ * without raising SIGPIPE. A name is one component inside a pinned directory,
+ * or, with dir NULL, a Linux abstract name (no filesystem entry; it ends with
+ * the last listener). A name the kernel address cannot hold gives
+ * OS_E_NAMETOOLONG. Not async-signal-safe. */
+typedef struct os_stream { int fd; } os_stream;
+#define OS_STREAM_INIT { -1 }
+typedef struct os_listener { int fd; } os_listener;
+#define OS_LISTENER_INIT { -1 }
+
+/* Binds and listens with a backlog in [1, INT_MAX]. OS_E_EXIST: the name is
+ * bound. In a directory, the bound name must then be a socket owned by
+ * os_user_id() (else OS_E_ACCESS), and it is made owner-only (0600) through a
+ * pinned reference, never by name; *bound (optional) receives that inode's
+ * stat, so the owner can later unlink only that inode. On failure after the
+ * bind, the name is unlinked if it still names the inode bound here. */
+os_err os_listen_local(os_listener *out, const os_dir *dir, const char *name,
+                       uint32_t backlog, os_stat *bound);
+/* OS_E_AGAIN when no connection is queued. */
+os_err os_listener_accept(os_listener *l, os_stream *out);
+void os_listener_close(os_listener *l); /* Idempotent for an initialized handle. */
+int os_listener_fd(const os_listener *l); /* Borrowed: os_waitset_add, diagnostics. */
+
+/* Connects at once or fails (P: a nonblocking Linux AF_UNIX stream connect
+ * completes or fails in the call, net/unix/af_unix.c unix_stream_connect).
+ * OS_E_REFUSED: the name exists with no listener. OS_E_NOENT: no such name.
+ * OS_E_AGAIN: the listener's backlog is full. */
+os_err os_connect_local(os_stream *out, const os_dir *dir, const char *name);
+/* A connected pair. */
+os_err os_stream_pair(os_stream *a, os_stream *b);
+/* Takes a stream socket descriptor, e.g. one end of a pair inherited across
+ * fork, and makes it nonblocking and close-on-exec. *out owns fd on every
+ * result; on error the caller closes it with os_stream_close, or forgets the
+ * handle to keep fd. A descriptor that is not a socket gives OS_E_INVAL. */
+os_err os_stream_adopt(os_stream *out, int fd);
+/* A successful read with *got == 0 and n > 0 is end of stream. */
+os_err os_stream_read(os_stream *s, void *buf, size_t n, size_t *got);
+/* As read, leaving the bytes queued. */
+os_err os_stream_peek(os_stream *s, void *buf, size_t n, size_t *got);
+os_err os_stream_write(os_stream *s, const void *buf, size_t n, size_t *done);
+/* The peer's user ID as the kernel recorded it at connect or pair time. */
+os_err os_stream_peer_uid(const os_stream *s, uint32_t *uid);
+void os_stream_close(os_stream *s); /* Idempotent for an initialized handle. */
+int os_stream_fd(const os_stream *s); /* Borrowed: os_waitset_add, handoff. */
+
+/* ---- the wait set: the one wait primitive (v2-0fv.13) ----
+ * Members are descriptors, each with an interest and a caller tag, plus one
+ * alarm: an absolute deadline on the os_now_ns clock. The set's own
+ * descriptor is readable while a member is ready or the alarm has fired, so
+ * a set nests in another set and carries its alarm with it.
+ * Invariant (docs/decisions/v2-0fv.13.md): a thread blocks in os_waitset_wait
+ * on one set only, its loop's root set; an owner polls a nested set with
+ * deadline 0. Waiting does no I/O on any member: it reports readiness and the
+ * member's owner reads. One thread owns a set; others may only make members
+ * ready (os_wake_signal). Deadlines are absolute: 0 and any past value poll,
+ * OS_DEADLINE_NEVER never expires. */
+#define OS_DEADLINE_NEVER UINT64_MAX
+#define OS_WAIT_ALARM UINT64_MAX /* Tag of the alarm event; no member may use it. */
+enum {
+    OS_WAIT_IN  = 1u << 0,
+    OS_WAIT_OUT = 1u << 1,
+    OS_WAIT_HUP = 1u << 2, /* Reported, never requested: peer hung up. */
+    OS_WAIT_ERR = 1u << 3  /* Reported, never requested: descriptor error. */
+};
+typedef struct os_wait_event { uint64_t tag; unsigned events; } os_wait_event;
+typedef struct os_waitset { int fd, alarm_fd; uint64_t alarm_ns; } os_waitset;
+#define OS_WAITSET_INIT { -1, -1, UINT64_MAX }
+os_err os_waitset_init(os_waitset *ws);
+void os_waitset_close(os_waitset *ws); /* Idempotent for an initialized handle. */
+/* interest is OS_WAIT_IN, OS_WAIT_OUT or both. A descriptor joins once
+ * (OS_E_EXIST). Remove it before closing it. */
+os_err os_waitset_add(os_waitset *ws, int fd, unsigned interest, uint64_t tag);
+os_err os_waitset_modify(os_waitset *ws, int fd, unsigned interest, uint64_t tag);
+void os_waitset_remove(os_waitset *ws, int fd);
+/* Arms the one-shot alarm; OS_DEADLINE_NEVER disarms it and a past deadline
+ * fires at once. Re-arming the armed deadline makes no call. A failure leaves
+ * the previous alarm. */
+os_err os_waitset_alarm(os_waitset *ws, uint64_t deadline_ns);
+/* Waits for readiness or the deadline and fills up to cap events. *n == 0
+ * only when the deadline has passed. A fired alarm is consumed, disarmed and
+ * reported once as an OS_WAIT_ALARM event. Interrupted waits restart with the
+ * time left; finite waits round up to whole milliseconds. Never allocates. */
+os_err os_waitset_wait(os_waitset *ws, uint64_t deadline_ns, os_wait_event *ev,
+                       size_t cap, size_t *n);
+int os_waitset_fd(const os_waitset *ws); /* Borrowed: nest in an outer set. */
 
 /* Startup only. Raise the soft RLIMIT_NOFILE to the hard limit. Never lowers
  * it. If getrlimit succeeded, *soft (optional) receives the limit in force. */

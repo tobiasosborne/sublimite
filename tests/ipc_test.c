@@ -161,7 +161,7 @@ static void endpoint_validation(const char *dir)
     int n=snprintf(name,sizeof name,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),saved);
     CHECK(n>0 && (size_t)n<sizeof name);
     struct sockaddr_un bound={0}; socklen_t len=sizeof bound;
-    CHECK(getsockname(s.listener,(struct sockaddr *)&bound,&len)==0);
+    CHECK(getsockname(os_listener_fd(&s.listener),(struct sockaddr *)&bound,&len)==0);
     CHECK(bound.sun_path[0]=='\0' && len==offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     CHECK(memcmp(bound.sun_path+1,name,(size_t)n)==0);
     ipc_server other={0}; CHECK(ipc_server_init(&other,NULL)==IPC_EXISTS);
@@ -612,7 +612,7 @@ static void t_launcher(const char *dir)
     char rt[IPC_PATH_CAP]; subdir(dir,"launch",rt);
     for(int isolated=0;isolated<2;isolated++) {
         ipc_server s={0}; ipc_result rc=isolated?ipc_server_init_isolated(&s):ipc_server_init(&s,rt); CHECK(rc==IPC_OK);
-        if(isolated) { char sp[IPC_PATH_CAP]; struct stat st; sock_path(rt,sp); CHECK(s.listener<0 && !s.owns_path && lstat(sp,&st)!=0); }
+        if(isolated) { char sp[IPC_PATH_CAP]; struct stat st; sock_path(rt,sp); CHECK(os_listener_fd(&s.listener)<0 && !s.owns_path && lstat(sp,&st)!=0); }
         int fds[2]; pid_t ch=launcher_child(fds,IPC_OK); ipc_token t=0;
         CHECK(ipc_server_adopt_wait(&s,fds[0],&t)==IPC_OK && t!=0 && ipc_server_token_live(&s,t));
         usleep(50000); int st; CHECK(waitpid(ch,&st,WNOHANG)==0); /* launcher blocks until completion */
@@ -811,7 +811,7 @@ static void t_namespace(const char *dir)
     CHECK(bind(vfd,(struct sockaddr *)&va,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)vn))==0 && listen(vfd,1)==0);
     CHECK(ipc_server_init(&s,NULL)==IPC_OK);
     struct sockaddr_un bound={0}; socklen_t bl=sizeof bound;
-    CHECK(getsockname(s.listener,(struct sockaddr *)&bound,&bl)==0);
+    CHECK(getsockname(os_listener_fd(&s.listener),(struct sockaddr *)&bound,&bl)==0);
     char awant[128]; int an=snprintf(awant,sizeof awant,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ns);
     CHECK(an>0 && bound.sun_path[0]==0 && memcmp(bound.sun_path+1,awant,(size_t)an)==0);
     capture c={0}; pid_t ch=spawn_client(NULL,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);

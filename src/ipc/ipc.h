@@ -83,15 +83,20 @@ typedef uint64_t ipc_token;
 struct ipc_peer;
 struct ipc_rx;
 typedef struct ipc_server {
-    int fd, listener, lock_fd;
+    /* v2-0fv.13: every kernel object is an os handle. The wait set holds the
+     * listener and peers and its alarm is the request deadline; its
+     * descriptor is ipc_server_fd. */
+    os_waitset set;
+    os_listener listener; /* closed for an isolated server */
+    os_file lock;         /* lifecycle lock leaf; closed for abstract */
+    os_dir dir;           /* pinned, verified runtime directory; closed for abstract */
     base_arena arena;
     struct ipc_peer *peers;
     uint64_t next_token;
-    char socket_path[108]; /* leaf name inside dir_fd (edit-457.21); abstract: empty */
-    uint64_t socket_device, socket_inode;
+    char socket_path[108]; /* leaf name inside dir (edit-457.21); abstract: empty */
+    os_identity socket_id;
     bool owns_path;
     /* edit-457.21 additions. Init sets the defaults; tests may lower them. */
-    int dir_fd, timer_fd;
     uint32_t request_deadline_ms, evict_idle_ms;
     uint64_t wait_drops;  /* wait clients that vanished before their closed reply */
     uint64_t drain_bytes; /* bytes received by the most recent drain call */
@@ -123,7 +128,8 @@ ipc_result ipc_client_send_display(const char *runtime, const char *display,
 int ipc_server_fd(const ipc_server *server);
 /* Nonblocking; borrowed request is valid only inside callback. Callback OK
  * queues ACK; other result rejects. Retain token for wait; copy desired data.
- * Call drain on epoll readability, and after report_closed. */
+ * Call drain when ipc_server_fd is readable, and after report_closed. The
+ * descriptor is an os_waitset: add it to the loop's root set; drain only polls. */
 ipc_result ipc_server_drain(ipc_server *server, ipc_open_callback callback, void *ctx);
 ipc_result ipc_server_report_closed(ipc_server *server, ipc_token token);
 void ipc_server_fini(ipc_server *server);
@@ -139,7 +145,9 @@ ipc_result ipc_server_init_isolated(ipc_server *server);
  * the UI starts, main creates a pair with ipc_launcher_pair and fork()s. The
  * child (UI) adopts adopt_fd and associates the returned token with the
  * initial request; the parent calls ipc_launcher_wait(launcher_fd) and exits
- * with its result once the closed reply arrives (IPC_IO if the UI exits first). */
+ * with its result once the closed reply arrives (IPC_IO if the UI exits first).
+ * Both pair descriptors are nonblocking and close-on-exec. adopt_wait owns its
+ * descriptor only on IPC_OK; launcher_wait always consumes its descriptor. */
 ipc_result ipc_launcher_pair(int fds[2]);
 ipc_result ipc_server_adopt_wait(ipc_server *server, int adopt_fd, ipc_token *token);
 ipc_result ipc_launcher_wait(int launcher_fd);

@@ -28,7 +28,7 @@ CASES = (
     Case('global', {0: ('os',)}, ('[prefix]', 'stray_export', 'base_wrong_owner')),
     Case('clean', {0: ('os', 'base', 'trace'), 1: ('piece',)}, (), ('strlen',)),
     Case('restricted', {1: ('piece',), 5: ('app',)},
-         ('[restricted] piece imports read, granted only to ipc, os',
+         ('[restricted] piece imports read, granted only to os',
           '[restricted] app imports malloc, granted only to hl')),
     Case('granted', {0: ('os',), 4: ('hl',)}, (), ('read', 'fdopen')),
     Case('pure', {1: ('piece',), 5: ('app',)}, (), ('memcpy', 'strcmp')),
