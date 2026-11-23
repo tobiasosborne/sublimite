@@ -39,13 +39,31 @@ To inspect O, the peer must inherit the inspector pair. `Sandbox.relay` gained `
 | `partial-restore-triggered` | A+B | live tabs = C, every filler present, the older session **not** restored whole, nothing unclassified |
 | `notice-visible` | B | bottom row = v1's notice `restored 2 unsaved tabs; 2 unmodified tabs from the last session were not reopened; the old session journal was set aside`, clipped to the row width (96 columns at this geometry) |
 | `dirty-restored` | A+B | CLIPBOARD bytes of `m.txt` and the untitled tab equal the typed bytes |
-| `excess-clean-absent` | B | older clean tabs restored = room_clean = C − fill − U = 1 (P): two known clean tabs are absent and none displaced a dirty one |
+| `clean-survivor-tab-order` | A+B | by path: the surviving clean tab is `<fixtures>/c0.txt`, and `c1.txt` and `c2.txt` are dropped (rule below). The walk shows c0 and no c1 or c2 (B). At C live tabs, a forwarded open of c0's path is admitted and activates c0, while c1 and c2 are each refused for capacity (A) |
 | `omitted-state-recoverable` | A | DATA holds exactly one `<older source>.set-aside-*` whose bytes equal O's journal copied before the relaunch (opaque comparison). F's source is gone, so the restore checkpoint is durable before the SIGKILL; otherwise ERROR |
 | `second-recovery` | A+B | after SIGKILL and relaunch: the same tab set and the same dirty bytes by clipboard |
 | `disk-intact` | A | every fixture file byte-identical after both recoveries |
 | `law2-count` | B | relaunched editor's passive count is 0 |
 
-On v1, the notice wording and the choice of kept clean tab (`c0.txt`, the first in recorded tab order) are v1 policy. When W3 converts R4, the v2 notice text must be bound in the case. `excess-clean-absent` asserts only the count against the room, not which clean tab survives.
+On v1, the notice wording is v1 policy. When W3 converts R4, the v2 notice text must be bound in the case.
+
+### Which clean tab survives: v1's rule is deterministic
+
+Round 2 (advisor: "some clean tab" is no rule). The first version asserted only that the number of surviving older clean tabs equalled the room. That check is replaced by `clean-survivor-tab-order`, which names the survivor and each dropped tab by path.
+
+**Rule (P, v1 `src/editor/recovery.c:plan_partial`, comment "Unmodified tabs in recorded tab order (buffer order without TABS)").** `editor_session_restore` restores newest source first, and `restore_source` calls `plan_partial` once `session_fits` fails. Every unsaved buffer is picked first. The rest is `spare` = live room − unsaved buffers placed live (− 1 for the temporary slot when some go closed), capped by free buffer slots. `plan_partial` then walks `s->tabs`, the last `JOURNAL_TABS` record replayed by `restore_record` (the strip order at the source's last checkpoint), and marks the first `spare` buffers that are still `PICK_DROP` as `PICK_LIVE`. It skips the buffer named by `JOURNAL_PAINT` (the `edit-dzk1` first-paint guard) and any whose target `target_vanished` reports gone. Everything else is dropped. Without a valid TABS record it uses the buffer list order instead.
+
+**Determinism.** The choice reads only the TABS array, the PAINT id, a stat of each target, and room counts. It reads no clock, hash or unordered container; `find` is a lookup by id. Given the same journal and the same files, the same tabs survive.
+
+**Fixture inputs.**
+- TABS = `c0 c1 m c2 untitled`. `producers-admitted` now also asserts O's strip, `older_strip`. All five tabs fit on screen, so the strip is the order the hot-exit checkpoint records.
+- PAINT = 0. Each older tab presented during the producer walk, and `editor_journal_painted` appends PAINT 0 after a buffer's first present.
+- All targets exist.
+- spare = C − fill − U = 1.
+
+Therefore `<fixtures>/c0.txt` survives, and `<fixtures>/c1.txt` and `<fixtures>/c2.txt` are dropped. In the fixture, c1 is a clean tab ordered before the dirty `m.txt`, so the result also shows a dirty tab outranking an earlier clean one.
+
+**Observation by path.** The tab walk identifies each tab by title and unique contents; titles are basenames in the single fixtures directory. Path identity comes from public opens. Once `partial-restore-triggered` has asserted that live = C, forwarding a path that is still open is admitted (exit 0) and activates that tab, and forwarding an absent path can only be refused for capacity. The case forwards c0, c1 and c2 one at a time and then reads the active tab.
 
 **Law-2 count rule.** The relaunched editor's windows (1007/1008 input-to-submit scopes: the 1000-tab walk, copies and moves) measured **0** allocations on v1. The count is therefore asserted on v1 as well. The older producer's typing window measured 4 allocations in 11 scopes. That is the known v1 typing-path allocation (`v2-he7.23.md`). It is recorded in `facts.law2_older_typing` and not asserted.
 
@@ -55,7 +73,7 @@ Commands are run from the checkout root. Oracle: `/home/tobias/Projects/sublimit
 
 ```
 python3 -B tests/contract/cases/capacity.py --build-dir /home/tobias/Projects/sublimite-v1-inspect/build/contract-oracle --display :195
-python3 -B tests/contract/cases/capacity.py --build-dir … --display :196 --negative excess-clean-absent
+python3 -B tests/contract/cases/capacity.py --build-dir … --display :196 --negative excess-clean-absent   # round 1; that assertion is now clean-survivor-tab-order
 python3 -B tests/contract/cases/capacity.py --build-dir … --display :196 --negative no-pressure
 ```
 
@@ -69,6 +87,23 @@ python3 -B tests/contract/cases/capacity.py --build-dir … --display :196 --neg
 
 Every run measured C = 1000. The fixture design held deterministically at its first attempt, so the T5 stop condition was not reached.
 
+**Round 2** (`clean-survivor-tab-order`; box on battery, so stamped [bat]; display `:195`):
+
+```
+python3 -B tests/contract/cases/capacity.py --build-dir /home/tobias/Projects/sublimite-v1-inspect/build/contract-oracle --display :195 --negative clean-survivor-tab-order
+python3 -B tests/contract/cases/capacity.py --build-dir … --display :195 --negative no-pressure
+python3 -B tests/contract/cases/capacity.py --build-dir … --display :195
+```
+
+| run | power, load | outcome |
+|---|---|---|
+| `contract-capacity-pamg49eo` red, swapped survivor | [bat] Discharging, 0.64 | FAIL `clean-survivor-tab-order`. Observed: c0 kept; c1 and c2 dropped; handoffs c0 admitted, c1 and c2 refused; c0 active. Expected (swapped): c2 kept, c0 and c1 dropped. The five earlier assertions PASS |
+| `contract-capacity-jk_oelwv` red, no pressure, fill = 1 | [bat] Discharging, 2.85 | FAIL `producers-admitted`: `filler_newer` False. A control defect: with fill = 1 the filler writes nothing after the older editor's hot exit, so its journal is not reliably newer (round 1's run passed this by chance). Fixed: the no-pressure control uses fill = 2 |
+| `contract-capacity-3m_6n91x` green | [bat] Discharging, 2.59 | PASS ×10 in 175 s; C = 1000; `<fixtures>/c0.txt` kept; `c1.txt` and `c2.txt` dropped, each refused for capacity by path; law-2 0 over 1007 scopes |
+| `contract-capacity-owkarpgp` red, no pressure, fill = 2 | [bat] Discharging, 2.31 | FAIL `partial-restore-triggered`: live 7 ≠ 1000, older session restored whole; `capacity-measured` and `producers-admitted` PASS |
+
+The fill = 2 change touches only the `--negative no-pressure` branch. The green run's code path (fill = C − U − 1) is identical before and after it.
+
 **Batch size (Law 4).** The ceiling is `IPC_MAX_PATHS` = 128 (P). A forwarding launch gives up after 2000 ms (P, `ipc_client_send_display(…, 2000)`). v1's per-open cost grows with the live tab count. In attempt 1 (M, [AC, load 0.67]), 128-path handoffs took 0.3, 0.6, 0.9, 1.2, 1.5 and about 1.8 s at 1, 129, 257, 385, 513 and 641 tabs (handoff log mtimes), and timed out at 769. (E) a quarter of that batch, 32, stays near 0.6 s at 1000 tabs. A timeout leaves the admission unknown and stays ERROR.
 
 **Runner timeout.** 1900 s = (M) 183 s green × 10 (E) headroom, rounded up. Each serial 15 s hang detector (P, `WATCHDOG`; about 2100 serial waits, dominated by the two 1000-tab walks) bounds one hung wait. Their sum is no meaningful run bound.
@@ -77,7 +112,7 @@ Every run measured C = 1000. The fixture design held deterministically at its fi
 
 ## Ledger note for v2
 
-R4 assumes a **discoverable live-tab capacity refusal through a public open**. A forwarded open that would exceed the live pool must be refused as a capacity refusal the client can tell apart from resource exhaustion (exit status plus message), while an already-open path stays admissible. v2 must provide that, or R4 needs a plan amendment before W3. It also assumes a public way to run a second editor on the same profile alongside the primary (v1 `--new-instance`).
+R4 assumes a **discoverable live-tab capacity refusal through a public open**. A forwarded open that would exceed the live pool must be refused as a capacity refusal the client can tell apart from resource exhaustion (exit status plus message), while an already-open path stays admissible. v2 must provide that, or R4 needs a plan amendment before W3. It also assumes a public way to run a second editor on the same profile alongside the primary (v1 `--new-instance`). `clean-survivor-tab-order` is required of v2 as written. Under pressure, clean tabs survive in recorded tab order up to the room left after every unsaved tab. Here that means `c0.txt` survives and `c1.txt` and `c2.txt` are dropped. A v2 restore rule that picks differently needs a plan amendment, not a quietly edited expectation.
 
 ## Observed, not fixed (report only)
 

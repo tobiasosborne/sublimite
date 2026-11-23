@@ -13,7 +13,13 @@ One run per invocation against the pinned, inspected v1 oracle
    journal is the newer source.
 3. Restore. An argument-free relaunch restores F whole and O under pressure. The case
    observes the notice, walks every live tab with Ctrl+PageDown, copies the dirty tabs,
-   SIGKILLs that editor, relaunches and walks again.
+   names the surviving and dropped clean tabs by path, SIGKILLs that editor, relaunches and
+   walks again.
+
+Which clean tab survives is v1's stated rule, not "some": plan_partial in v1
+src/editor/recovery.c keeps unmodified tabs "in recorded tab order" (the last TABS record),
+skipping only the PAINT-named buffer and vanished targets, until the live room left after
+every unsaved tab is spent. Here that room is one tab, so c0 survives and c1, c2 are dropped.
 
 Every wait is on an event: a snapshot reply on the inspector socket, or a pidfd. Timers
 are hang detectors only; an expired one is ERROR. Records and exit statuses (PASS 0,
@@ -51,14 +57,15 @@ WAIT_MS = WATCHDOG * 1000
 CASE_ID = "R4"
 FIRST_WAVE = 3
 ASSERTIONS = ("capacity-measured", "producers-admitted", "partial-restore-triggered",
-              "notice-visible", "dirty-restored", "excess-clean-absent",
+              "notice-visible", "dirty-restored", "clean-survivor-tab-order",
               "omitted-state-recoverable", "second-recovery", "disk-intact", "law2-count")
 EVIDENCE = {"capacity-measured": "A", "producers-admitted": "A+B",
             "partial-restore-triggered": "A+B", "notice-visible": "B", "dirty-restored": "A+B",
-            "excess-clean-absent": "B", "omitted-state-recoverable": "A",
+            "clean-survivor-tab-order": "A+B", "omitted-state-recoverable": "A",
             "second-recovery": "A+B", "disk-intact": "A", "law2-count": "B"}
-# Red controls: a wrong expectation on one assertion, or a fixture without pressure.
-NEGATIVES = ("excess-clean-absent", "no-pressure")
+# Red controls: a swapped survivor (c2 expected to survive instead of c0), or a fixture
+# without pressure.
+NEGATIVES = ("clean-survivor-tab-order", "no-pressure")
 
 # Paths per handoff. (P) v1 src/ipc/ipc.h IPC_MAX_PATHS = 128 is the ceiling, but v1's
 # per-open cost grows with the live tab count and a forwarding launch gives up after
@@ -434,6 +441,8 @@ def producers(case, sandbox, driver, stack, capacity, fill):
     older.driver.chord("Control_L", "n")
     older.type_text(untitled_marker)
     older_ring = older.ring(len(OLDER) + UNSAVED)
+    # All five tabs fit O's strip, so its titles are the tab order a hot exit records (TABS).
+    older_strip = tab_strip(older.frame())[0]
     older_journal = older.hot_exit()
     # Count rule: the producer's typing window is recorded, not asserted; v1 counts its known
     # typing-path allocation there (xcb read_packet, docs/decisions/v2-he7.23.md).
@@ -463,6 +472,7 @@ def producers(case, sandbox, driver, stack, capacity, fill):
     turn = names.index("c0.txt")
     rows = {name: row for name, (_, row) in zip(names, older_ring)}
     observed = {
+        "older_strip": [UNTITLED if title not in dict(OLDER) else title for title in older_strip],
         "older_ring": names[turn:] + names[:turn],
         "older_rows": rows,
         "older_journal": older_journal == older_source,
@@ -473,6 +483,7 @@ def producers(case, sandbox, driver, stack, capacity, fill):
         "below_startup_scan": max(len(older_bytes), len(filler_bytes)) < STARTUP_SCAN_BYTES,
     }
     expected = {
+        "older_strip": [name for name, _ in OLDER] + [UNTITLED],
         "older_ring": [name for name, _ in OLDER] + [UNTITLED],
         "older_rows": {**{name: data.decode() for name, data in OLDER},
                        DIRTY_FILE: expected_dirty[DIRTY_FILE].decode(),
@@ -543,9 +554,31 @@ def restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
     copies = {key: first.copy_at(walked, dirty[key]) if key in dirty else None
               for key in (DIRTY_FILE, UNTITLED)}
     case.check("dirty-restored", copies, expected_dirty)
-    # (P) the fixture leaves live room for exactly room_clean = C - fill - U = 1 clean tab of
-    # the older session's three, so at least two known clean tabs are excess.
-    case.check("excess-clean-absent", len(older_clean), room_clean, wrong=len(OLDER_CLEAN))
+    # v1's rule (P, src/editor/recovery.c:plan_partial, "Unmodified tabs in recorded tab
+    # order"): after every unsaved buffer is placed, the clean tabs of the last TABS record are
+    # kept in that order, skipping the PAINT-named buffer and vanished targets, while
+    # spare = room - live unsaved (- 1 with closed ones) remains. Fixture inputs: TABS is
+    # c0 c1 m c2 untitled (producers-admitted, older_strip); every target exists; PAINT is 0
+    # because each older tab presented during the producer walk (editor_journal_painted
+    # appends PAINT 0); spare = room_clean = C - fill - U = 1. So c0 survives, c1 and c2 drop.
+    # By path, publicly: at C live tabs a forwarded open of a live path is admitted (it
+    # activates that tab) and of an absent path is refused for capacity (no room exists:
+    # partial-restore-triggered asserted live == C).
+    paths = {name: str(sandbox.fixtures / name) for name in OLDER_CLEAN}
+    admitted = {paths[name]: handoff(case, sandbox, [sandbox.fixtures / name], f"restored-{name}")
+                for name in OLDER_CLEAN}
+    active = list(first.tab(first.frame()))
+
+    def clean_choice(kept):
+        return {"kept": [paths[name] for name in OLDER_CLEAN if name in kept],
+                "dropped": [paths[name] for name in OLDER_CLEAN if name not in kept],
+                "handoff_admitted": {paths[name]: name in kept for name in OLDER_CLEAN},
+                "active_after_handoffs": [kept[-1], dict(OLDER)[kept[-1]].decode()]}
+
+    observed = clean_choice(older_clean) if older_clean else {"kept": [], "dropped": list(paths.values())}
+    observed.update(handoff_admitted=admitted, active_after_handoffs=active)
+    case.check("clean-survivor-tab-order", observed, clean_choice(OLDER_CLEAN[:room_clean]),
+               wrong=clean_choice(OLDER_CLEAN[-room_clean:]))
     aside = [name for name in data_after
              if name.startswith(older_source.name + ".set-aside-")]
     if filler_source.name in data_after:
@@ -592,8 +625,11 @@ def scenario(case, target, display, auth):
     case.check("capacity-measured", receipt,
                {"refused_one_path": True, "reopen_admitted": True, "alive": True,
                 "active_after_reopen": [probe_name(0), content(probe_name(0)).decode()]})
-    fill = 1 if case.negative == "no-pressure" else capacity - UNSAVED - 1
-    if fill < 1:
+    # The filler must admit at least one file after the older editor's hot exit, or nothing
+    # makes its journal the newer source (no-pressure red, run contract-capacity-jk_oelwv:
+    # filler_newer was False with fill = 1). The no-pressure control keeps that write: fill = 2.
+    fill = 2 if case.negative == "no-pressure" else capacity - UNSAVED - 1
+    if fill < 2:
         raise Refused(f"capacity {capacity} leaves no room for a filler")
     with Sandbox(case.artifacts, target, display=display) as sandbox, ExitStack() as stack:
         Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())

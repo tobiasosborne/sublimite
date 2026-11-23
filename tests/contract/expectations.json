@@ -407,9 +407,7 @@
      "evidence": "B"
     },
     "dirty-restored": {},
-    "excess-clean-absent": {
-     "evidence": "B"
-    },
+    "clean-survivor-tab-order": {},
     "omitted-state-recoverable": {
      "evidence": "A"
     },
