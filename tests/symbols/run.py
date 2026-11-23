@@ -28,6 +28,7 @@ CASES = (
     Case('ldlibs_search', {0: ('os',)}, ('[ldlibs]', '-Lbuild/rel', '-lapp', '-l:libapp.a')),
     Case('unknown', {0: ('os',)}, ('[unknown]', 'mystery_import')),
     Case('global', {0: ('os',)}, ('[prefix]', 'stray_export', 'base_wrong_owner')),
+    Case('test_export', {0: ('os',)}, ('[test]', 'os_test_probe')),
     Case('clean', {0: ('os', 'base', 'trace'), 1: ('piece',)}, (), ('strlen',)),
     Case('restricted', {1: ('piece',), 5: ('app',)},
          ('[restricted] piece imports read, granted only to os',

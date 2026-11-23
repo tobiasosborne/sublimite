@@ -1,5 +1,5 @@
-#ifndef EDIT_OS_H
-#define EDIT_OS_H
+#ifndef OS_OS_H
+#define OS_OS_H
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -316,8 +316,11 @@ void os_map_prefetch(const os_map *m, size_t off, size_t len);
  * An id is a copyable value. Generation 0 is the absent id; issued
  * generations never repeat, so a stale id never reads another registration.
  * An id grants no access to bytes: readers hold the backing that owns the
- * view, and only its final release retires the id. None of these four
- * functions allocate; none may be called from a signal handler. */
+ * view, and only its final release retires the id. None of these functions
+ * allocate; none may be called from a signal handler. Only conditions an
+ * input can produce are returned (A15): misuse is an ASSERT, including a
+ * null, empty or unaligned view, an overlapping registration, an absent or
+ * forged id, and a second retire. */
 #define OS_FAULT_SLOTS 256
 
 typedef struct os_fault_id {
@@ -327,34 +330,22 @@ typedef struct os_fault_id {
 
 #define OS_FAULT_ID_INIT { .slot = 0, .gen = 0 }
 
-/* Owner, before publishing readable bytes. The view is a live read-only
- * private os_map_file view, borrowed until a successful retire. Null inputs,
- * an empty or unaligned view, or an end (or page-rounded end) past the address
- * space give OS_E_INVAL; a page-rounded extent intersecting a registered one
- * gives OS_E_EXIST (distinct views of one file are fine); OS_E_NOTSUP if the
- * service cannot be installed (sticky); OS_E_NOSPC with no free slot or no
- * issuable generation. On failure *out is the absent id. */
+/* The owner, before publishing readable bytes. The view is a live
+ * read-only private os_map_file view, or a page-aligned part of one,
+ * borrowed until retire; its page-rounded extent intersects no registered
+ * one. OS_E_NOSPC when all OS_FAULT_SLOTS views are registered or no
+ * generation is left to issue; *out is then the absent id. */
 os_err os_fault_register(const os_map *view, os_fault_id *out);
-/* Any thread, lock-free, on a copied id, concurrently with anything else.
- * On OS_OK *epoch is the registration's recovery count (0: pristine; it
- * saturates at UINT64_MAX and never returns to 0). A zero generation, an
- * index outside the table or a null epoch give OS_E_INVAL; an id that is not
- * registered (retired, or superseded by a later registration) OS_E_NOENT.
- * Failure leaves *epoch untouched. Bracket mapped reads with two polls and
- * require 0 from both: the poll orders the caller's earlier reads before it. */
+/* Any thread, lock-free, on a copied issued id, concurrently with anything
+ * else. On OS_OK *epoch is the registration's recovery count (0: pristine;
+ * it never returns to 0). OS_E_NOENT once the owner has retired the id;
+ * *epoch is then untouched. Bracket mapped reads with two polls and require
+ * 0 from both: the poll orders the caller's earlier reads before it. */
 os_err os_fault_poll(os_fault_id id, uint64_t *epoch);
-/* The registration owner only, at final release after all byte access has
- * ended. Invalidates the id, waits for handlers already inside the view to
- * finish, and frees the slot; only OS_OK permits unmapping the view.
- * OS_E_INVAL for a malformed id, OS_E_NOENT for a missing or stale one, which
- * leaves the current registration untouched. */
-os_err os_fault_retire(os_fault_id id);
-/* TEST ONLY. Sends SIGBUS (code BUS_ADRERR, address view->addr + off) to the
- * calling thread, which must have SIGBUS unblocked; it is delivered before
- * the call returns. OS_E_INVAL for a null view or off >= view->len; the
- * native send error otherwise. A recovered or forwarded and returning signal
- * gives OS_OK; a forwarded signal can also terminate the process. */
-os_err os_fault_test_trigger(const os_map *view, size_t off);
+/* The owner, once, at final release after all byte access has ended.
+ * Invalidates the id, waits for handlers already inside the view to finish
+ * and frees the slot; the view may then be unmapped. */
+void os_fault_retire(os_fault_id id);
 
 /* Reservation uses lazily backed read/write pages. Commit validates the
  * page-aligned range. Decommit discards its backing and the next touch reads

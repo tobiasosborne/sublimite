@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check the release archive symbol DAG, per-module system imports and LDLIBS entries."""
+"""Check the release archive symbol DAG, per-module system imports, LDLIBS entries and that no
+shipped object defines a *_test_* symbol."""
 
 import argparse
 import os
@@ -27,6 +28,8 @@ BASE_ALLOCATOR_HOOK = Path('src/base/malloc_guard.o')
 BASE_ALLOCATOR_EXPORTS = {'malloc', 'calloc', 'realloc'}
 SYSTEM_LIBRARY = re.compile(r'-l[A-Za-z0-9][A-Za-z0-9_.+-]*')
 SYMBOL_NAME = re.compile(r'[A-Za-z0-9_.$@]+')
+# Test entry points live in test-hooks variants, never in a shipped object.
+TEST_SYMBOL = re.compile(r'.*_test_.*')
 
 
 def read_module_map(entries):
@@ -198,7 +201,9 @@ def audit_object(rows, where, member, module, layers, order, allowlist):
         if kind in {'w', 'v'}:
             violation = f'[weak] weak undefined symbol {symbol} ({kind})'
         elif kind != 'U':
-            if not owns_symbol(member, module, owner, symbol):
+            if TEST_SYMBOL.fullmatch(symbol):
+                violation = f'[test] {module} ships test symbol {symbol}'
+            elif not owns_symbol(member, module, owner, symbol):
                 violation = f'[prefix] {module} defines {symbol} without its own prefix'
         elif symbol in allowlist:
             if not allowlist[symbol] & {ANY_MODULE, module}:

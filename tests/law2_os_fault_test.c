@@ -1,14 +1,14 @@
 /* Law 2 over the fault service (docs/decisions/wave1-os-fault-lease.md,
  * "All four are ordinary thread entries, with no C heap allocation"): first
- * registration with its installation, validated polls, a delivered and
- * recovered fault, a stale poll, retirement and generation exhaustion at full
- * width, under the live release allocation guard, with the shipped release
+ * registration with its installation, validated polls, a real fault and its
+ * recovery, a stale poll, retirement and generation exhaustion at full width,
+ * under the live release allocation guard, with the shipped release
  * settings. Fails closed on an inert guard. */
 #include "base/base.h"
 #include "os/os.h"
 
-/* os_posix.c, EDIT_TEST_HOOKS builds only (A15; tests/lanes.mk). */
-os_err os_fault_test_next_gen(uint64_t next);
+/* The OS_TEST_HOOKS variant of os_posix.c (A15; tests/lanes.mk). */
+void os_fault_test_next_gen(uint64_t next);
 
 static bool guard_live(void)
 {
@@ -27,12 +27,25 @@ static bool guard_live(void)
 static bool fault_window(void)
 {
     size_t ps = os_page_size();
+    /* Fixture setup may allocate; it stays outside the window. An unnamed
+     * file under build/ of three pages, mapped, then emptied: every page of
+     * the view faults when read. */
+    os_dir d = OS_DIR_INIT;
     os_file f = OS_FILE_INIT;
     os_map m = {0};
-    /* Fixture setup may allocate; it stays outside the window. */
-    ASSERT(os_file_open(&f, "/proc/self/exe", OS_OPEN_READ) == OS_OK);
-    ASSERT(os_map_file(&m, &f, 0, 3 * ps) == OS_OK);
+    os_err rc = os_dir_open(&d, "build");
+    ASSERT(rc == OS_OK);
+    rc = os_file_open_anon(&f, &d);
+    ASSERT(rc == OS_OK);
+    os_dir_close(&d);
+    rc = os_file_set_size(&f, 3 * ps);
+    ASSERT(rc == OS_OK);
+    rc = os_map_file(&m, &f, 0, 3 * ps);
+    ASSERT(rc == OS_OK);
+    rc = os_file_set_size(&f, 0);
+    ASSERT(rc == OS_OK);
     os_file_close(&f);
+    const volatile unsigned char *v = m.addr;
     os_map first = {m.addr, ps}, second = {(const unsigned char *)m.addr + ps, ps},
            third = {(const unsigned char *)m.addr + 2 * ps, ps};
 
@@ -42,15 +55,16 @@ static bool fault_window(void)
     uint64_t before = 1, after = 0, stale = 0;
     bool ok = os_fault_register(&first, &id) == OS_OK;
     ok = ok && os_fault_poll(id, &before) == OS_OK;
-    ok = ok && os_fault_test_trigger(&first, 1) == OS_OK;
+    ok = ok && v[1] == 0; /* A real fault, recovered. */
     ok = ok && os_fault_poll(id, &after) == OS_OK;
-    ok = ok && os_fault_retire(id) == OS_OK;
+    if (ok) os_fault_retire(id);
     ok = ok && os_fault_poll(id, &stale) == OS_E_NOENT;
-    ok = ok && os_fault_register(&first, &again) == OS_OK && os_fault_retire(again) == OS_OK;
-    ok = ok && os_fault_test_next_gen(UINT64_MAX) == OS_OK;
+    ok = ok && os_fault_register(&first, &again) == OS_OK;
+    if (ok) os_fault_retire(again);
+    if (ok) os_fault_test_next_gen(UINT64_MAX);
     ok = ok && os_fault_register(&second, &top) == OS_OK && top.gen == UINT64_MAX;
     ok = ok && os_fault_register(&third, &none) == OS_E_NOSPC && none.gen == 0;
-    ok = ok && os_fault_retire(top) == OS_OK;
+    if (ok) os_fault_retire(top);
     size_t count = base_malloc_guard_end();
 
     bool active = base_malloc_guard_active();
@@ -59,10 +73,8 @@ static bool fault_window(void)
     /* A failed step may have left a registration over the view: never unmap
      * it then; the process exits. */
     if (!ok) return false;
-    const volatile unsigned char *v = m.addr;
-    bool zero = v[0] == 0;
     os_unmap(&m);
-    return active && count == 0 && zero && before == 0 && after == 1;
+    return active && count == 0 && before == 0 && after == 1;
 }
 
 int main(void)

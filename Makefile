@@ -131,12 +131,14 @@ $(B)/$(1)/%.o: %.c
 	@mkdir -p $$(@D)
 	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -c $$< -o $$@
 endef
-# A test-hooks object is its module source with EDIT_TEST_HOOKS; a suite
-# links it ahead of the archives (tests/lanes.mk), which never contain it.
+# A test-hooks variant (CLAUDE.md) is src/<module>/<file>.c compiled with
+# <MODULE>_TEST_HOOKS. Only the suites whose rules below name it link it,
+# ahead of the archives; no archive or shipped binary contains it.
+upper = $(shell printf '%s' '$(1)' | tr a-z A-Z)
 define CFG_TEST_HOOKS
 $(B)/$(1)/%_test_hooks.o: %.c
 	@mkdir -p $$(@D)
-	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -DEDIT_TEST_HOOKS -c $$< -o $$@
+	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -D$$(call upper,$$(word 2,$$(subst /, ,$$*)))_TEST_HOOKS -c $$< -o $$@
 endef
 $(foreach c,$(CFGS),$(eval $(call CFG_COMPILE,$(c))))
 $(foreach c,$(CFGS),$(eval $(call CFG_TEST_HOOKS,$(c))))
@@ -175,9 +177,9 @@ WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
 $(foreach c,rel san tsan,$(B)/$(c)/tests/work_test): private LDLIBS += $(foreach s,$(WORK_TEST_WRAPS),-Wl,--wrap=$(s))
 # Fault-service faults are injected beneath os (v2-0fv.2): per-suite link flags,
 # LDFLAGS_<suite stem>, consumed by the test link rules.
-LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sigaction,--wrap=sysconf,--wrap=syscall \
-                         -Wl,--wrap=sem_init,--wrap=sem_destroy,--wrap=sem_wait,--wrap=sem_post
-# Test-hook objects (A15 generation setter) only for the fault suites.
+LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sem_wait,--wrap=sem_post
+# Test-hooks variants (CFG_TEST_HOOKS), linked only into the fault suites:
+# os_posix.c with OS_TEST_HOOKS (the generation setter, A15).
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/os_fault_test: $(B)/$(c)/src/os/os_posix_test_hooks.o))
 $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
 # ipc's peer-identity decision is reached through a test-only link seam

@@ -74,7 +74,6 @@ getrandom              os # Linux kernel random bytes
 getrlimit              os # current process resource limits
 getsockopt             os # SO_PEERCRED peer user ID of a local stream
 getuid                 os # real user ID for endpoint names and ownership checks
-gettid                 os # calling thread ID for the fault test trigger
 ioctl                  os # Linux FICLONE reflink request
 listen                 os # listen on a bound local stream endpoint
 lstat                  os # path metadata without following the final symlink
@@ -122,13 +121,11 @@ stat                   os # path metadata following symlinks
 sysconf                os # query Linux physical page count
 timerfd_create         os # wait set alarm
 timerfd_settime        os # arm or disarm the wait set alarm
-sem_destroy            os # release the fault drain semaphore after a failed installation
 sem_init               os # fault drain semaphore at installation
 sem_post               os # last handler leaving a retiring fault slot (async-signal-safe)
 sem_wait               os # retiring owner waits for admitted fault handlers
 sigaction              os # query, install and reset the SIGBUS action (fault service)
 sigemptyset            os # empty mask for the fault chain's default action
-syscall                os # rt_tgsigqueueinfo for the fault test trigger
 unlink                 os # remove a non-directory name
 unlinkat               os # directory-relative name removal
 unsetenv               os # remove a process environment variable

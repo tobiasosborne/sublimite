@@ -1,11 +1,14 @@
 /* Mapped-file fault service conformance: the acceptance tables of
- * docs/decisions/wave1-os-fault-lease.md ("Implementation acceptance tests").
+ * docs/decisions/wave1-os-fault-lease.md, under A15 and A18 (v2-0fv.16).
+ *
+ * Every fault is real: the file shrinks under the view and a read faults.
+ * Two cases also send SIGBUS themselves, for what a truncation cannot
+ * produce: a device I/O error (BUS_OBJERR) and a sigqueue (SI_QUEUE).
  *
  * The service is one process-global installation, so every case runs in a
- * fresh self-exec child. The suite links with -Wl,--wrap for the service's
- * native calls (tests/lanes.mk LDFLAGS_os_fault_test); each wrapper passes
- * through until a case arms it. Test code calls the __real_ entry points
- * itself, so the counters see only the service's calls. */
+ * fresh self-exec child. The suite links with -Wl,--wrap for the recovery
+ * remap and the drain semaphore (tests/lanes.mk LDFLAGS_os_fault_test); each
+ * wrapper passes through until a case arms it. */
 #include "os/os.h"
 
 #include <errno.h>
@@ -41,37 +44,26 @@ static void expect(os_err got, os_err want, const char *expression, int line)
 #define CASE_GUARD_SECONDS 120u
 
 static const char *work_root;
+static size_t page; /* os_page_size(), read once so signal handlers may use it. */
 
-/* Defined in os_posix.c only when built with EDIT_TEST_HOOKS (A15); the suite
- * links that object ahead of libcore.a (tests/lanes.mk). */
-os_err os_fault_test_next_gen(uint64_t next);
+/* The OS_TEST_HOOKS variant of os_posix.c defines it (A15); the suite links
+ * that object ahead of libcore.a (tests/lanes.mk). */
+void os_fault_test_next_gen(uint64_t next);
 
 /* ---- native fault injection (-Wl,--wrap) -------------------------------- */
 /* Switches and counters the signal handler touches are lock-free atomics
  * (checked in main). Handler-side wrappers call only write, read, _exit and
  * the real entry point, all async-signal-safe. */
 void *__real_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
-int __real_sigaction(int sig, const struct sigaction *act, struct sigaction *old);
-int __real_sem_init(sem_t *s, int pshared, unsigned value);
-int __real_sem_destroy(sem_t *s);
 int __real_sem_wait(sem_t *s);
 int __real_sem_post(sem_t *s);
-long __real_sysconf(int name);
-long __real_syscall(long n, ...);
 
 void *__wrap_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
-int __wrap_sigaction(int sig, const struct sigaction *act, struct sigaction *old);
-int __wrap_sem_init(sem_t *s, int pshared, unsigned value);
-int __wrap_sem_destroy(sem_t *s);
 int __wrap_sem_wait(sem_t *s);
 int __wrap_sem_post(sem_t *s);
-long __wrap_sysconf(int name);
-long __wrap_syscall(long n, ...);
 
-static _Atomic long page_override; /* Nonzero replaces sysconf(_SC_PAGESIZE). */
-static _Atomic bool fail_sem_init, fail_query, fail_install, fail_remap, fail_send;
-static _Atomic bool pause_remap, gate_wait, wait_eintr;
-static _Atomic unsigned n_pagesize, n_sem_init, n_sem_destroy, n_query, n_install, n_remap, n_send, n_wait_entry, n_wait_done, n_post;
+static _Atomic bool fail_remap, pause_remap, gate_wait, wait_eintr;
+static _Atomic unsigned n_remap, n_wait_entry, n_wait_done, n_post;
 
 /* (P) The retire race holds at most two handlers at once, one per retiree. */
 enum { PAUSE_TICKETS = 2 };
@@ -80,7 +72,7 @@ static int paused_pipe[2] = {-1, -1}, go_pipe[PAUSE_TICKETS][2], entered_pipe[2]
            wait_go_pipe[2] = {-1, -1};
 
 /* Distinct exit codes name a broken fixture rather than a failed oracle. */
-enum { FIXTURE_IO = 96, FIXTURE_TICKET = 95, FIXTURE_SYSCALL = 94 };
+enum { FIXTURE_IO = 96, FIXTURE_TICKET = 95 };
 
 static void put_bytes(int fd, const void *p, size_t n)
 {
@@ -125,52 +117,6 @@ void *__wrap_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
     return __real_mmap(addr, len, prot, flags, fd, off);
 }
 
-/* The sanitizer runtimes import sigaction and sysconf themselves, and --wrap
- * redirects every input's references: their startup calls arrive here before
- * the runtime is initialized. These two wrappers therefore carry no sanitizer
- * instrumentation, and main zeroes the counters once a case starts. */
-#if defined(__has_attribute)
-#if __has_attribute(disable_sanitizer_instrumentation)
-#define RUNTIME_SAFE __attribute__((disable_sanitizer_instrumentation))
-#endif
-#endif
-#ifndef RUNTIME_SAFE
-#define RUNTIME_SAFE
-#endif
-
-RUNTIME_SAFE int __wrap_sigaction(int sig, const struct sigaction *act, struct sigaction *old)
-{
-    if (sig == SIGBUS && !act) {
-        atomic_fetch_add(&n_query, 1);
-        if (atomic_load(&fail_query)) { errno = EINVAL; return -1; }
-    } else if (sig == SIGBUS && (act->sa_flags & SA_SIGINFO)) {
-        atomic_fetch_add(&n_install, 1);
-        if (atomic_load(&fail_install)) { errno = EINVAL; return -1; }
-    }
-    return __real_sigaction(sig, act, old);
-}
-
-RUNTIME_SAFE long __wrap_sysconf(int name)
-{
-    if (name == _SC_PAGESIZE) {
-        atomic_fetch_add(&n_pagesize, 1);
-        long o = atomic_load(&page_override);
-        if (o) return o;
-    }
-    return __real_sysconf(name);
-}
-
-int __wrap_sem_init(sem_t *s, int pshared, unsigned value)
-{
-    atomic_fetch_add(&n_sem_init, 1);
-    if (atomic_load(&fail_sem_init)) { errno = ENOSYS; return -1; }
-    return __real_sem_init(s, pshared, value);
-}
-int __wrap_sem_destroy(sem_t *s)
-{
-    atomic_fetch_add(&n_sem_destroy, 1);
-    return __real_sem_destroy(s);
-}
 int __wrap_sem_wait(sem_t *s)
 {
     atomic_fetch_add(&n_wait_entry, 1);
@@ -188,21 +134,6 @@ int __wrap_sem_post(sem_t *s)
 {
     atomic_fetch_add(&n_post, 1);
     return __real_sem_post(s);
-}
-
-long __wrap_syscall(long n, ...)
-{
-    /* The service's only raw system call is the test trigger's
-     * rt_tgsigqueueinfo, passed as four long-sized words (os_posix.c). */
-    if (n != SYS_rt_tgsigqueueinfo) _exit(FIXTURE_SYSCALL);
-    va_list ap;
-    va_start(ap, n);
-    long tgid = va_arg(ap, long), tid = va_arg(ap, long), sig = va_arg(ap, long);
-    siginfo_t *si = va_arg(ap, siginfo_t *);
-    va_end(ap);
-    atomic_fetch_add(&n_send, 1);
-    if (atomic_load(&fail_send)) { errno = EAGAIN; return -1; }
-    return __real_syscall(n, tgid, tid, sig, si);
 }
 
 static void open_pipes(void)
@@ -248,30 +179,37 @@ static os_file pattern_file(const char *name, size_t len)
     free(buf);
     return f;
 }
-static os_map pattern_map(const char *name, size_t len)
+/* A view of len pattern bytes whose file then shrinks to size: a read at or
+ * past the first page beyond size faults. */
+static os_map shrunk_map(const char *name, size_t len, size_t size)
 {
     os_file f = pattern_file(name, len);
     os_map m = {0};
     OK(os_map_file(&m, &f, 0, len));
+    if (size < len) OK(os_file_set_size(&f, size));
     os_file_close(&f);
     return m;
 }
+static os_map pattern_map(const char *name, size_t len) { return shrunk_map(name, len, len); }
 static os_map sub(const os_map *m, size_t off, size_t len)
 {
     ASSERT(off < m->len && len <= m->len - off);
     os_map s = {(const unsigned char *)m->addr + off, len};
     return s;
 }
-static bool is_pattern(const os_map *m, size_t from, size_t to)
+static unsigned char touch(const os_map *m, size_t off)
 {
     const volatile unsigned char *v = m->addr;
-    for (size_t i = from; i < to; i++) if (v[i] != pattern_at(i)) return false;
+    return v[off];
+}
+static bool is_pattern(const os_map *m, size_t from, size_t to)
+{
+    for (size_t i = from; i < to; i++) if (touch(m, i) != pattern_at(i)) return false;
     return true;
 }
 static bool is_zero(const os_map *m, size_t from, size_t to)
 {
-    const volatile unsigned char *v = m->addr;
-    for (size_t i = from; i < to; i++) if (v[i] != 0) return false;
+    for (size_t i = from; i < to; i++) if (touch(m, i) != 0) return false;
     return true;
 }
 
@@ -299,7 +237,8 @@ static os_fault_id registered(const os_map *view)
     return id;
 }
 
-/* A real kernel-style SIGBUS to this thread with any code, sent by the test. */
+/* What a truncation cannot produce: SIGBUS with another code, to this
+ * thread, at a chosen address. */
 static void send_bus(const void *addr, int code)
 {
     siginfo_t si;
@@ -307,43 +246,36 @@ static void send_bus(const void *addr, int code)
     si.si_signo = SIGBUS;
     si.si_code = code;
     si.si_addr = (void *)(uintptr_t)addr;
-    ASSERT(__real_syscall(SYS_rt_tgsigqueueinfo, (long)getpid(), (long)gettid(), (long)SIGBUS, &si) == 0);
+    ASSERT(syscall(SYS_rt_tgsigqueueinfo, (long)getpid(), (long)gettid(), (long)SIGBUS, &si) == 0);
 }
 
-static void set_prior(void (*handler)(int), void (*info)(int, siginfo_t *, void *), unsigned flags,
-                      int masked)
+static void set_prior(void (*handler)(int), void (*info)(int, siginfo_t *, void *))
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     if (info) sa.sa_sigaction = info;
     else sa.sa_handler = handler;
-    sa.sa_flags = (int)(flags | (info ? SA_SIGINFO : 0u));
+    sa.sa_flags = info ? SA_SIGINFO : 0;
     ASSERT(sigemptyset(&sa.sa_mask) == 0);
-    if (masked) ASSERT(sigaddset(&sa.sa_mask, masked) == 0);
-    ASSERT(__real_sigaction(SIGBUS, &sa, NULL) == 0);
-}
-static struct sigaction current_bus(void)
-{
-    struct sigaction sa;
-    ASSERT(__real_sigaction(SIGBUS, NULL, &sa) == 0);
-    return sa;
-}
-/* Handler, flags and every signal of the mask. */
-static bool same_action(const struct sigaction *a, const struct sigaction *b)
-{
-    if (a->sa_sigaction != b->sa_sigaction || a->sa_flags != b->sa_flags) return false;
-    for (int sig = 1; sig <= SIGRTMAX; sig++)
-        if (sigismember(&a->sa_mask, sig) != sigismember(&b->sa_mask, sig)) return false;
-    return true;
+    ASSERT(sigaction(SIGBUS, &sa, NULL) == 0);
 }
 
-/* Prior-handler probes. Written from a signal handler, read after it. */
+/* Prior-handler probes. Written from a signal handler, read after it. Each
+ * repairs the faulting page itself (bypassing the wrapped remap) so that a
+ * real fault does not repeat when it returns. */
 static volatile sig_atomic_t prior_calls, prior_sig, prior_code, prior_ctx_ok;
-static void *volatile prior_addr;
+static void *volatile prior_addr, *volatile stray_page;
+static void repair(void *at)
+{
+    void *from = (void *)((uintptr_t)at & ~(uintptr_t)(page - 1u));
+    if (__real_mmap(from, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+        _exit(FIXTURE_IO);
+}
 static void prior_simple(int sig)
 {
     prior_calls++;
     prior_sig = sig;
+    repair(stray_page);
     errno = EIO; /* The service must restore the interrupted errno. */
 }
 static void prior_info(int sig, siginfo_t *si, void *uc)
@@ -355,188 +287,115 @@ static void prior_info(int sig, siginfo_t *si, void *uc)
     /* The interrupted context ran with SIGBUS unblocked: the original
      * ucontext arrived, not one built by the service. */
     prior_ctx_ok = uc && sigismember(&((ucontext_t *)uc)->uc_sigmask, SIGBUS) == 0;
+    if (si->si_code == BUS_ADRERR) repair(si->si_addr);
     errno = EIO;
 }
 
-/* ---- single-thread public cases -------------------------------------------- */
+/* ---- single-thread cases -------------------------------------------------- */
 static void case_stale(void)
 {
-    size_t ps = os_page_size();
-    os_map a = pattern_map("a", 3 * ps), b = pattern_map("b", 3 * ps);
+    os_map a = shrunk_map("a", 2 * page, page), b = shrunk_map("b", 2 * page, page);
     os_fault_id ia = registered(&a);
     ASSERT(epoch_of(ia) == 0);
-    OK(os_fault_test_trigger(&a, ps + 1));
+    ASSERT(touch(&a, page) == 0);
     ASSERT(epoch_of(ia) == 1);
 
     os_fault_id saved = ia; /* A value copy outlives the registration. */
-    OK(os_fault_retire(ia));
+    os_fault_retire(ia);
     expect_gone(saved); /* Before reuse: the slot is free. */
     os_fault_id ib = registered(&b);
     ASSERT(ib.slot == saved.slot && ib.gen != saved.gen);
     ASSERT(epoch_of(ib) == 0);
     expect_gone(saved); /* After reuse: never the new tenant's epoch. */
-    EXPECT(os_fault_retire(saved), OS_E_NOENT);
-    ASSERT(epoch_of(ib) == 0);
 
-    OK(os_fault_test_trigger(&b, 1));
+    ASSERT(touch(&b, page + 1) == 0);
     ASSERT(epoch_of(ib) == 1);
     expect_gone(saved);
-    OK(os_fault_retire(ib));
+    os_fault_retire(ib);
     expect_gone(ib);
-    EXPECT(os_fault_retire(ib), OS_E_NOENT);
     os_unmap(&a);
     os_unmap(&b);
 }
 
-static void case_args(void)
+static void case_extents(void)
 {
-    size_t ps = os_page_size();
-    os_map v = pattern_map("v", 4 * ps);
-    os_fault_id id = {7, 7};
-    uint64_t e = UNTOUCHED;
-
-    EXPECT(os_fault_register(&v, NULL), OS_E_INVAL);
-    EXPECT(os_fault_register(NULL, &id), OS_E_INVAL);
-    ASSERT(absent(id));
-    os_map bad = {NULL, ps};
-    id.slot = 7;
-    EXPECT(os_fault_register(&bad, &id), OS_E_INVAL);
-    ASSERT(absent(id));
-    bad = sub(&v, 0, 0);
-    EXPECT(os_fault_register(&bad, &id), OS_E_INVAL);
-    bad = sub(&v, 1, ps);
-    EXPECT(os_fault_register(&bad, &id), OS_E_INVAL);
-    /* (P) Ends past the address space: the logical end, then only its page
-     * rounding. Neither extent is mapped; validation rejects both. */
-    bad.addr = (const void *)(UINTPTR_MAX - ps + 1);
-    bad.len = ps;
-    EXPECT(os_fault_register(&bad, &id), OS_E_INVAL);
-    bad.addr = (const void *)(UINTPTR_MAX - 2 * ps + 1);
-    bad.len = ps + 1;
-    EXPECT(os_fault_register(&bad, &id), OS_E_INVAL);
-    ASSERT(absent(id));
-
-    os_fault_id ok = registered(&v);
-    os_fault_id malformed[] = {{ok.slot, 0}, {OS_FAULT_SLOTS, ok.gen}, {UINT32_MAX, ok.gen}};
-    for (size_t i = 0; i < sizeof malformed / sizeof malformed[0]; i++) {
-        EXPECT(os_fault_poll(malformed[i], &e), OS_E_INVAL);
-        EXPECT(os_fault_retire(malformed[i]), OS_E_INVAL);
-    }
-    ASSERT(e == UNTOUCHED);
-    EXPECT(os_fault_poll(ok, NULL), OS_E_INVAL);
-    os_fault_id other = {ok.slot + 1u, ok.gen};
-    expect_gone(other);
-    EXPECT(os_fault_retire(other), OS_E_NOENT);
-    other.slot = ok.slot;
-    other.gen = ok.gen + 1u;
-    expect_gone(other);
-
-    EXPECT(os_fault_test_trigger(NULL, 0), OS_E_INVAL);
-    EXPECT(os_fault_test_trigger(&v, v.len), OS_E_INVAL);
-    bad.addr = NULL;
-    bad.len = ps;
-    EXPECT(os_fault_test_trigger(&bad, 0), OS_E_INVAL);
-    ASSERT(epoch_of(ok) == 0);
-    OK(os_fault_retire(ok));
-
-    /* Overlap is decided on page-rounded extents. */
-    os_fault_id r1 = registered(&(os_map){v.addr, ps + 1}); /* rounds to [0, 2 pages) */
-    os_map dup = sub(&v, 0, ps + 1), second = sub(&v, ps, ps), r2v = sub(&v, 2 * ps, ps),
-           r3v = sub(&v, 3 * ps, ps);
-    id.slot = 7;
-    EXPECT(os_fault_register(&dup, &id), OS_E_EXIST);
-    ASSERT(absent(id));
-    EXPECT(os_fault_register(&second, &id), OS_E_EXIST);
-    EXPECT(os_fault_register(&v, &id), OS_E_EXIST);
-    os_fault_id r2 = registered(&r2v), r3 = registered(&r3v); /* adjacent */
-    OK(os_fault_test_trigger(&r2v, 1));
+    /* Page-rounded extents side by side register and repair independently. */
+    os_map v = shrunk_map("v", 4 * page, 2 * page);
+    os_map r1v = sub(&v, 0, page + 1), r2v = sub(&v, 2 * page, page), r3v = sub(&v, 3 * page, page);
+    os_fault_id r1 = registered(&r1v), r2 = registered(&r2v), r3 = registered(&r3v);
+    ASSERT(touch(&v, 2 * page) == 0);
     ASSERT(epoch_of(r1) == 0 && epoch_of(r2) == 1 && epoch_of(r3) == 0);
-    ASSERT(is_pattern(&v, 0, 2 * ps) && is_zero(&v, 2 * ps, 3 * ps) && is_pattern(&v, 3 * ps, 4 * ps));
-    OK(os_fault_retire(r1));
-    OK(os_fault_retire(r2));
-    OK(os_fault_retire(r3));
+    ASSERT(is_pattern(&v, 0, 2 * page) && is_zero(&v, 2 * page, 3 * page));
+    ASSERT(touch(&v, 3 * page + 1) == 0);
+    ASSERT(epoch_of(r1) == 0 && epoch_of(r2) == 1 && epoch_of(r3) == 1);
+    os_fault_retire(r1);
+    os_fault_retire(r2);
+    os_fault_retire(r3);
     os_unmap(&v);
 
     /* Distinct views of one file register and taint independently. */
-    os_file f = pattern_file("same", 2 * ps);
+    os_file f = pattern_file("same", 2 * page);
     os_map m1 = {0}, m2 = {0};
-    OK(os_map_file(&m1, &f, 0, 2 * ps));
-    OK(os_map_file(&m2, &f, 0, 2 * ps));
+    OK(os_map_file(&m1, &f, 0, 2 * page));
+    OK(os_map_file(&m2, &f, 0, 2 * page));
+    OK(os_file_set_size(&f, 0));
     os_file_close(&f);
     os_fault_id i1 = registered(&m1), i2 = registered(&m2);
-    OK(os_fault_test_trigger(&m1, 0));
-    ASSERT(epoch_of(i1) == 1 && epoch_of(i2) == 0);
-    ASSERT(is_zero(&m1, 0, 2 * ps) && is_pattern(&m2, 0, 2 * ps));
-    OK(os_fault_retire(i1));
-    OK(os_fault_retire(i2));
+    ASSERT(touch(&m1, 0) == 0);
+    ASSERT(epoch_of(i1) == 1 && epoch_of(i2) == 0 && is_zero(&m1, 0, 2 * page));
+    os_fault_retire(i1);
+    os_fault_retire(i2);
     os_unmap(&m1);
     os_unmap(&m2);
 }
 
 static void case_capacity(void)
 {
-    size_t ps = os_page_size();
-    os_map v = pattern_map("cap", (OS_FAULT_SLOTS + 1) * ps);
+    os_map v = pattern_map("cap", (OS_FAULT_SLOTS + 1) * page);
     static os_fault_id ids[OS_FAULT_SLOTS];
     for (uint32_t i = 0; i < OS_FAULT_SLOTS; i++) {
-        os_map one = sub(&v, i * ps, ps);
+        os_map one = sub(&v, i * page, page);
         ids[i] = registered(&one);
         ASSERT(ids[i].slot == i); /* The lowest free index. */
         ASSERT(i == 0 || ids[i].gen > ids[i - 1].gen);
     }
-    os_map extra = sub(&v, OS_FAULT_SLOTS * ps, ps);
+    os_map extra = sub(&v, OS_FAULT_SLOTS * page, page);
     os_fault_id x = {7, 7};
     EXPECT(os_fault_register(&extra, &x), OS_E_NOSPC);
     ASSERT(absent(x));
     /* (P) An interior index: neither the lowest nor the last issued. */
     const uint32_t k = OS_FAULT_SLOTS / 2;
-    OK(os_fault_retire(ids[k]));
+    os_fault_retire(ids[k]);
     x = registered(&extra);
     ASSERT(x.slot == k && x.gen > ids[OS_FAULT_SLOTS - 1].gen);
     expect_gone(ids[k]);
     ids[k] = x;
-    for (uint32_t i = 0; i < OS_FAULT_SLOTS; i++) OK(os_fault_retire(ids[i]));
+    for (uint32_t i = 0; i < OS_FAULT_SLOTS; i++) os_fault_retire(ids[i]);
     os_unmap(&v);
 }
 
 static void case_recover(void)
 {
     /* (P) One page per role: prefix, earlier and later suffix start, then a
-     * partial final page. */
-    size_t ps = os_page_size(), len = 3 * ps + ps / 2;
+     * partial final page. The file shrinks twice: later, then earlier. */
+    size_t len = 3 * page + page / 2;
     os_file f = pattern_file("recover", len);
     os_map m = {0};
     OK(os_map_file(&m, &f, 0, len));
     os_fault_id id = registered(&m);
-    OK(os_fault_test_trigger(&m, 2 * ps));
+    OK(os_file_set_size(&f, 2 * page));
+    ASSERT(touch(&m, 2 * page + 1) == 0);
     ASSERT(epoch_of(id) == 1);
-    ASSERT(is_pattern(&m, 0, 2 * ps) && is_zero(&m, 2 * ps, len));
-    OK(os_fault_test_trigger(&m, ps + ps / 2));
+    ASSERT(is_pattern(&m, 0, 2 * page) && is_zero(&m, 2 * page, len));
+    OK(os_file_set_size(&f, page));
+    ASSERT(touch(&m, page + page / 2) == 0);
     ASSERT(epoch_of(id) == 2);
-    ASSERT(is_pattern(&m, 0, ps) && is_zero(&m, ps, len));
-    OK(os_fault_retire(id));
+    ASSERT(is_pattern(&m, 0, page) && is_zero(&m, page, len));
+    ASSERT(epoch_of(id) == 2); /* The recovered suffix does not fault again. */
+    os_fault_retire(id);
     os_unmap(&m);
-    OK(os_map_file(&m, &f, 0, len)); /* Recovery never touched the file. */
-    ASSERT(is_pattern(&m, 0, len));
-    os_unmap(&m);
-    os_file_close(&f);
-}
-
-static void case_truncate(void)
-{
-    /* A real kernel SIGBUS: the file shrinks under a registered view. */
-    size_t ps = os_page_size();
-    os_file f = pattern_file("truncate", 3 * ps);
-    os_map m = {0};
-    OK(os_map_file(&m, &f, 0, 3 * ps));
-    os_fault_id id = registered(&m);
-    OK(os_file_set_size(&f, ps));
-    const volatile unsigned char *v = m.addr;
-    ASSERT(v[ps + 1] == 0);
-    ASSERT(epoch_of(id) == 1);
-    ASSERT(is_pattern(&m, 0, ps) && is_zero(&m, ps, 3 * ps));
-    ASSERT(epoch_of(id) == 1); /* The recovered suffix does not fault again. */
-    OK(os_fault_retire(id));
+    OK(os_map_file(&m, &f, 0, page)); /* The surviving file prefix is intact. */
+    ASSERT(is_pattern(&m, 0, page));
     os_unmap(&m);
     os_file_close(&f);
 }
@@ -545,27 +404,22 @@ static void case_truncate(void)
 static void install_service(void)
 {
     static os_map reg;
-    reg = pattern_map("reg", os_page_size());
+    reg = pattern_map("reg", page);
     (void)registered(&reg);
 }
 
 /* A native fault in a view no registration covers. Surviving it fails. */
 static void stray_native_fault(void)
 {
-    size_t ps = os_page_size();
-    os_file f = pattern_file("stray", 2 * ps);
-    os_map stray = {0};
-    OK(os_map_file(&stray, &f, 0, 2 * ps));
-    OK(os_file_set_size(&f, ps));
-    const volatile unsigned char *v = stray.addr;
-    (void)v[ps];
+    os_map stray = shrunk_map("stray", 2 * page, page);
+    (void)touch(&stray, page);
     fprintf(stderr, "os_fault_test.c: survived an unrepaired fault\n");
     exit(EXIT_FAILURE);
 }
 
 static void case_chain_default(void)
 {
-    set_prior(SIG_DFL, NULL, 0, 0);
+    set_prior(SIG_DFL, NULL);
     install_service();
     stray_native_fault();
 }
@@ -574,44 +428,43 @@ static void case_chain_default(void)
  * faulting instruction with nothing changed. */
 static void case_chain_ignore(void)
 {
-    set_prior(SIG_IGN, NULL, 0, 0);
+    set_prior(SIG_IGN, NULL);
     install_service();
     stray_native_fault();
 }
 
 static void case_chain_simple(void)
 {
-    set_prior(prior_simple, NULL, 0, 0);
+    set_prior(prior_simple, NULL);
     install_service();
-    size_t ps = os_page_size();
-    os_map stray = pattern_map("stray", ps), mine = pattern_map("mine", 2 * ps);
+    os_map stray = shrunk_map("stray", 2 * page, page), mine = pattern_map("mine", 2 * page);
+    stray_page = (unsigned char *)(uintptr_t)stray.addr + page;
     errno = EDOM;
-    OK(os_fault_test_trigger(&stray, 1));
+    ASSERT(touch(&stray, page) == 0);
     ASSERT(errno == EDOM);
     ASSERT(prior_calls == 1 && prior_sig == SIGBUS);
 
-    /* An unrelated code at a registered address goes to the prior handler
-     * unrepaired; a repaired fault (either recovery code) does not. */
+    /* A sigqueue at a registered address goes to the prior handler
+     * unrepaired; a device error (BUS_OBJERR) is repaired and does not. */
     os_fault_id id = registered(&mine);
-    send_bus((const unsigned char *)mine.addr + 1, BUS_ADRALN);
-    ASSERT(prior_calls == 2 && epoch_of(id) == 0 && is_pattern(&mine, 0, 2 * ps));
-    send_bus((const unsigned char *)mine.addr + ps, BUS_OBJERR);
-    ASSERT(prior_calls == 2 && epoch_of(id) == 1 && is_pattern(&mine, 0, ps) && is_zero(&mine, ps, 2 * ps));
-    send_bus((const unsigned char *)mine.addr, BUS_ADRERR);
-    ASSERT(prior_calls == 2 && epoch_of(id) == 2 && is_zero(&mine, 0, 2 * ps));
-    OK(os_fault_retire(id));
+    send_bus((const unsigned char *)mine.addr + 1, SI_QUEUE);
+    ASSERT(prior_calls == 2 && epoch_of(id) == 0 && is_pattern(&mine, 0, 2 * page));
+    send_bus((const unsigned char *)mine.addr + page, BUS_OBJERR);
+    ASSERT(prior_calls == 2 && epoch_of(id) == 1);
+    ASSERT(is_pattern(&mine, 0, page) && is_zero(&mine, page, 2 * page));
+    os_fault_retire(id);
 }
 
 static void case_chain_siginfo(void)
 {
-    set_prior(NULL, prior_info, 0, 0);
+    set_prior(NULL, prior_info);
     install_service();
-    os_map stray = pattern_map("stray", os_page_size());
+    os_map stray = shrunk_map("stray", 2 * page, page);
     errno = EDOM;
-    OK(os_fault_test_trigger(&stray, 1));
+    ASSERT(touch(&stray, page + 1) == 0);
     ASSERT(errno == EDOM);
     ASSERT(prior_calls == 1 && prior_sig == SIGBUS && prior_code == BUS_ADRERR);
-    ASSERT(prior_addr == (const unsigned char *)stray.addr + 1 && prior_ctx_ok);
+    ASSERT(prior_addr == (const unsigned char *)stray.addr + page + 1 && prior_ctx_ok);
 }
 
 /* The one ASSERT (A15): a fixed message on stderr, then death by SIGABRT. */
@@ -630,106 +483,50 @@ static void case_assert(void)
  * keep working, and a free slot does not help. */
 static void case_exhaustion(void)
 {
-    size_t ps = os_page_size();
-    os_map v = pattern_map("gens", 4 * ps);
-    os_map p0 = sub(&v, 0, ps), p1 = sub(&v, ps, ps), p2 = sub(&v, 2 * ps, ps), p3 = sub(&v, 3 * ps, ps);
+    os_map v = shrunk_map("gens", 4 * page, 0);
+    os_map p0 = sub(&v, 0, page), p1 = sub(&v, page, page), p2 = sub(&v, 2 * page, page),
+           p3 = sub(&v, 3 * page, page);
     os_fault_id a = registered(&p0);
-    EXPECT(os_fault_test_next_gen(a.gen), OS_E_INVAL); /* Forward only. */
-    OK(os_fault_test_next_gen(UINT64_MAX - 1));
+    os_fault_test_next_gen(UINT64_MAX - 1);
     os_fault_id b = registered(&p1), c = registered(&p2), x = {7, 7};
     ASSERT(b.gen == UINT64_MAX - 1 && c.gen == UINT64_MAX);
     EXPECT(os_fault_register(&p3, &x), OS_E_NOSPC);
     ASSERT(absent(x));
-    OK(os_fault_retire(b));
+    os_fault_retire(b);
     x.slot = 7;
     EXPECT(os_fault_register(&p3, &x), OS_E_NOSPC);
     ASSERT(absent(x));
     expect_gone(b);
-    OK(os_fault_test_trigger(&p0, 1));
-    OK(os_fault_test_trigger(&p2, 1));
+    ASSERT(touch(&p0, 1) == 0 && touch(&p2, 1) == 0);
     ASSERT(epoch_of(a) == 1 && epoch_of(c) == 1);
-    OK(os_fault_retire(a));
-    OK(os_fault_retire(c));
+    os_fault_retire(a);
+    os_fault_retire(c);
     os_unmap(&v);
 }
 
-/* ---- native errors ---------------------------------------------------------- */
-static void expect_unavailable(void)
-{
-    /* A distinctive prior: handler, flag and mask must all survive. */
-    set_prior(prior_simple, NULL, SA_RESTART, SIGUSR1);
-    struct sigaction before = current_bus();
-    os_map v = pattern_map("v", os_page_size());
-    for (int round = 0; round < 2; round++) { /* (P) once to fail, once to prove it sticks */
-        os_fault_id id = {7, 7};
-        EXPECT(os_fault_register(&v, &id), OS_E_NOTSUP);
-        ASSERT(absent(id));
-    }
-    struct sigaction after = current_bus();
-    ASSERT(same_action(&before, &after));
-    os_unmap(&v);
-}
-static void case_err_pagesize(void)
-{
-    atomic_store(&page_override, 3); /* (P) positive but not a power of two */
-    expect_unavailable();
-    ASSERT(atomic_load(&n_pagesize) == 1 && atomic_load(&n_install) == 0);
-}
-static void case_err_sem(void)
-{
-    atomic_store(&fail_sem_init, true);
-    expect_unavailable();
-    ASSERT(atomic_load(&n_sem_init) == 1 && atomic_load(&n_install) == 0);
-}
-static void case_err_query(void)
-{
-    atomic_store(&fail_query, true);
-    expect_unavailable();
-    ASSERT(atomic_load(&n_query) == 1 && atomic_load(&n_install) == 0);
-    ASSERT(atomic_load(&n_sem_init) == 1 && atomic_load(&n_sem_destroy) == 1);
-}
-static void case_err_install(void)
-{
-    atomic_store(&fail_install, true);
-    expect_unavailable();
-    ASSERT(atomic_load(&n_install) == 1);
-    ASSERT(atomic_load(&n_sem_init) == 1 && atomic_load(&n_sem_destroy) == 1);
-}
+/* The recovery remap fails (ENOMEM: the map-count limit). */
 static void case_err_remap(void)
 {
-    set_prior(NULL, prior_info, 0, 0);
-    size_t ps = os_page_size();
-    os_map m = pattern_map("m", 2 * ps);
+    set_prior(NULL, prior_info);
+    os_map m = shrunk_map("m", 2 * page, page);
     os_fault_id id = registered(&m);
     atomic_store(&fail_remap, true);
-    OK(os_fault_test_trigger(&m, ps + 1));
+    ASSERT(touch(&m, page + 1) == 0); /* The prior handler repaired it. */
     ASSERT(atomic_load(&n_remap) == 1);
-    ASSERT(prior_calls == 1 && prior_addr == (const unsigned char *)m.addr + ps + 1);
-    ASSERT(epoch_of(id) == 1 && is_pattern(&m, 0, 2 * ps)); /* Tainted, not repaired. */
-    OK(os_fault_retire(id));
+    ASSERT(prior_calls == 1 && prior_addr == (const unsigned char *)m.addr + page + 1);
+    ASSERT(epoch_of(id) == 1 && is_pattern(&m, 0, page)); /* Tainted all the same. */
+    os_fault_retire(id);
     os_unmap(&m);
 }
 static void case_err_remap_default(void)
 {
-    set_prior(SIG_DFL, NULL, 0, 0);
-    size_t ps = os_page_size();
-    os_map m = pattern_map("m", 2 * ps);
+    set_prior(SIG_DFL, NULL);
+    os_map m = shrunk_map("m", 2 * page, page);
     (void)registered(&m);
     atomic_store(&fail_remap, true);
-    (void)os_fault_test_trigger(&m, ps + 1); /* Unrepaired, no prior: death by SIGBUS. */
+    (void)touch(&m, page + 1); /* Unrepaired, no prior: death by SIGBUS. */
     fprintf(stderr, "os_fault_test.c: survived a failed repair\n");
     exit(EXIT_FAILURE);
-}
-static void case_err_send(void)
-{
-    os_map m = pattern_map("m", os_page_size());
-    os_fault_id id = registered(&m);
-    atomic_store(&fail_send, true);
-    EXPECT(os_fault_test_trigger(&m, 1), OS_E_AGAIN);
-    ASSERT(os_native_error() == EAGAIN);
-    ASSERT(atomic_load(&n_send) == 1 && epoch_of(id) == 0);
-    OK(os_fault_retire(id));
-    os_unmap(&m);
 }
 
 /* ---- threaded cases (TSan lane) --------------------------------------------- */
@@ -759,17 +556,18 @@ static void barrier_wait(barrier *b)
     os_mutex_unlock(&b->mu);
 }
 
-typedef struct trigger_job { const os_map *view; size_t off; os_err rc; } trigger_job;
-static void trigger_body(void *arg)
+/* A thread that reads one byte of a view, faulting if it lies past the end. */
+typedef struct fault_job { const os_map *view; size_t off; unsigned got; } fault_job;
+static void fault_body(void *arg)
 {
-    trigger_job *j = arg;
-    j->rc = os_fault_test_trigger(j->view, j->off);
+    fault_job *j = arg;
+    j->got = touch(j->view, j->off);
 }
-typedef struct retire_job { os_fault_id id; os_err rc; _Atomic bool done; } retire_job;
+typedef struct retire_job { os_fault_id id; _Atomic bool done; } retire_job;
 static void retire_body(void *arg)
 {
     retire_job *j = arg;
-    j->rc = os_fault_retire(j->id);
+    os_fault_retire(j->id);
     atomic_store(&j->done, true);
 }
 static void spin_until_gone(os_fault_id id)
@@ -805,10 +603,9 @@ static void observe_body(void *arg)
 
 static void case_race_reuse(void)
 {
-    size_t ps = os_page_size();
-    os_map a = pattern_map("a", ps), b = pattern_map("b", ps);
+    os_map a = shrunk_map("a", 2 * page, page), b = pattern_map("b", page);
     os_fault_id ia = registered(&a);
-    OK(os_fault_test_trigger(&a, 0)); /* A carries 1, B will read pristine 0. */
+    ASSERT(touch(&a, page) == 0); /* A carries 1, B will read pristine 0. */
     barrier start;
     barrier_init(&start, 2);
     observer o = {.id = ia, .want = 1, .start = &start};
@@ -816,7 +613,7 @@ static void case_race_reuse(void)
     OK(os_thread_start(&t, observe_body, &o));
     barrier_wait(&start);
     while (atomic_load(&o.hits) == 0 && !atomic_load(&o.bad)) os_yield(); /* polled while live */
-    OK(os_fault_retire(ia));
+    os_fault_retire(ia);
     expect_gone(ia); /* After completed invalidation, while the slot is free. */
     os_fault_id ib = registered(&b);
     atomic_store(&o.reused, true); /* The observer's next poll follows the reuse. */
@@ -825,7 +622,7 @@ static void case_race_reuse(void)
     ASSERT(ib.slot == ia.slot && ib.gen != ia.gen);
     expect_gone(ia); /* After synchronized reuse: always NOENT. */
     ASSERT(epoch_of(ib) == 0);
-    OK(os_fault_retire(ib));
+    os_fault_retire(ib);
     expect_gone(ia);
     os_unmap(&a);
     os_unmap(&b);
@@ -834,49 +631,48 @@ static void case_race_reuse(void)
 static void case_race_delivery(void)
 {
     open_pipes();
-    size_t ps = os_page_size();
-    os_map m = pattern_map("m", 2 * ps);
+    os_map m = shrunk_map("m", 2 * page, page);
     os_fault_id id = registered(&m);
     ASSERT(epoch_of(id) == 0);
     atomic_store(&pause_remap, true);
-    trigger_job j = {&m, ps + 1, OS_E_IO};
+    fault_job j = {&m, page + 1, 1};
     os_thread t;
-    OK(os_thread_start(&t, trigger_body, &j));
+    OK(os_thread_start(&t, fault_body, &j));
     (void)await_pause();
-    ASSERT(epoch_of(id) == 1);         /* The taint precedes the replacement... */
-    ASSERT(is_pattern(&m, 0, 2 * ps)); /* ...which has not happened yet. */
+    /* The handler waits inside the remap call, before the replacement: the
+     * taint is already visible. */
+    ASSERT(epoch_of(id) == 1 && is_pattern(&m, 0, page));
     release_pause(0);
     OK(os_thread_join(&t));
-    OK(j.rc);
-    ASSERT(epoch_of(id) == 1 && is_pattern(&m, 0, ps) && is_zero(&m, ps, 2 * ps));
-    OK(os_fault_retire(id));
+    ASSERT(j.got == 0);
+    ASSERT(epoch_of(id) == 1 && is_pattern(&m, 0, page) && is_zero(&m, page, 2 * page));
+    os_fault_retire(id);
     os_unmap(&m);
 }
 
-/* The delivering thread is ordered after the registration only by a relaxed
+/* The faulting thread is ordered after the registration only by a relaxed
  * flag, which TSan treats as no synchronization: the handler's read of the
  * slot's base and length is ordered after register's writes solely by the
- * service's admission (acquire CAS on the release store of LIVE). */
-typedef struct admit_job { const os_map *view; _Atomic bool *ready; os_err rc; } admit_job;
+ * service's admission CAS on the store of LIVE. */
+typedef struct admit_job { const os_map *view; _Atomic bool *ready; unsigned got; } admit_job;
 static void admit_body(void *arg)
 {
     admit_job *j = arg;
     while (!atomic_load_explicit(j->ready, memory_order_relaxed)) os_yield();
-    j->rc = os_fault_test_trigger(j->view, 1);
+    j->got = touch(j->view, 1);
 }
 static void case_race_admission(void)
 {
-    os_map m = pattern_map("m", os_page_size());
+    os_map m = shrunk_map("m", page, 0);
     _Atomic bool ready = false;
-    admit_job j = {&m, &ready, OS_E_IO};
+    admit_job j = {&m, &ready, 1};
     os_thread t;
     OK(os_thread_start(&t, admit_body, &j)); /* Started before the registration. */
     os_fault_id id = registered(&m);
     atomic_store_explicit(&ready, true, memory_order_relaxed);
     OK(os_thread_join(&t));
-    OK(j.rc);
-    ASSERT(epoch_of(id) == 1 && is_zero(&m, 0, m.len));
-    OK(os_fault_retire(id));
+    ASSERT(j.got == 0 && epoch_of(id) == 1 && is_zero(&m, 0, m.len));
+    os_fault_retire(id);
     os_unmap(&m);
 }
 
@@ -885,29 +681,28 @@ static void case_race_admission(void)
  * handler's thread. Completion is announced by a relaxed flag, so the only
  * edge from the handler's reads of base and len to register's rewrite of
  * them is the departure on the control word, observed by the close. */
-typedef struct depart_job { const os_map *view; _Atomic bool done; os_err rc; } depart_job;
+typedef struct depart_job { const os_map *view; _Atomic bool done; unsigned got; } depart_job;
 static void depart_body(void *arg)
 {
     depart_job *j = arg;
-    j->rc = os_fault_test_trigger(j->view, 1);
+    j->got = touch(j->view, 1);
     atomic_store_explicit(&j->done, true, memory_order_relaxed);
 }
 static void case_race_departure(void)
 {
-    size_t ps = os_page_size();
-    os_map a = pattern_map("a", ps), b = pattern_map("b", ps);
+    os_map a = shrunk_map("a", page, 0), b = pattern_map("b", page);
     os_fault_id ia = registered(&a);
-    depart_job j = {.view = &a, .rc = OS_E_IO};
+    depart_job j = {.view = &a, .got = 1};
     os_thread t;
     OK(os_thread_start(&t, depart_body, &j));
     while (!atomic_load_explicit(&j.done, memory_order_relaxed)) os_yield();
-    OK(os_fault_retire(ia));         /* Zero count at close. */
+    os_fault_retire(ia);             /* Zero count at close. */
     os_fault_id ib = registered(&b); /* Same slot, new base and len. */
     OK(os_thread_join(&t));
-    OK(j.rc);
-    ASSERT(ib.slot == ia.slot && epoch_of(ib) == 0 && is_zero(&a, 0, ps));
+    ASSERT(j.got == 0);
+    ASSERT(ib.slot == ia.slot && epoch_of(ib) == 0 && is_zero(&a, 0, page));
     ASSERT(atomic_load(&n_wait_entry) == 0 && atomic_load(&n_post) == 0);
-    OK(os_fault_retire(ib));
+    os_fault_retire(ib);
     os_unmap(&a);
     os_unmap(&b);
 }
@@ -918,16 +713,17 @@ static counts drain_counts(void)
     counts c = {atomic_load(&n_wait_entry), atomic_load(&n_wait_done), atomic_load(&n_post)};
     return c;
 }
-static void hold_handler(os_thread *t, trigger_job *j, const os_map *view, unsigned ticket)
+/* A fresh view whose second page faults, so each held handler is a real one. */
+static os_map faulting(const char *name) { return shrunk_map(name, 2 * page, page); }
+static void hold_handler(os_thread *t, fault_job *j, const os_map *view, unsigned ticket)
 {
-    *j = (trigger_job){view, 1, OS_E_IO};
-    OK(os_thread_start(t, trigger_body, j));
+    *j = (fault_job){view, page, 1};
+    OK(os_thread_start(t, fault_body, j));
     ASSERT(await_pause() == ticket);
 }
 static void start_retire(os_thread *t, retire_job *r, os_fault_id id)
 {
     r->id = id;
-    r->rc = OS_E_IO;
     atomic_store(&r->done, false);
     OK(os_thread_start(t, retire_body, r));
 }
@@ -940,19 +736,18 @@ static void spin_until_waiting(unsigned entries, const retire_job *r)
 static void case_race_retire(void)
 {
     open_pipes();
-    size_t ps = os_page_size();
-    os_map a = pattern_map("a", ps), b = pattern_map("b", ps);
     os_thread t1, t2, r1, r2;
-    trigger_job j1, j2;
+    fault_job j1, j2;
     retire_job x1, x2;
     atomic_store(&pause_remap, true);
 
     /* 1. The final post lands after retire entered its wait; a second
      * retiree with no admitted handler waits behind it and consumes nothing. */
-    os_fault_id ia = registered(&a), ib = registered(&b);
+    os_map a1 = faulting("a1"), b1 = pattern_map("b1", page);
+    os_fault_id ia = registered(&a1), ib = registered(&b1);
     counts c0 = drain_counts();
     atomic_store(&pause_next, 0);
-    hold_handler(&t1, &j1, &a, 0);
+    hold_handler(&t1, &j1, &a1, 0);
     ASSERT(epoch_of(ia) == 1);
     atomic_store(&wait_eintr, true); /* The first wait is interrupted once. */
     start_retire(&r1, &x1, ia);
@@ -963,11 +758,9 @@ static void case_race_retire(void)
     ASSERT(atomic_load(&n_post) == c0.post && !atomic_load(&x1.done));
     release_pause(0);
     OK(os_thread_join(&t1));
-    OK(j1.rc);
+    ASSERT(j1.got == 0);
     OK(os_thread_join(&r1));
     OK(os_thread_join(&r2));
-    OK(x1.rc);
-    OK(x2.rc);
     counts c1 = drain_counts();
     ASSERT(c1.entry == c0.entry + 2 && c1.done == c0.done + 1 && c1.post == c0.post + 1);
     ASSERT(!atomic_load(&wait_eintr));
@@ -975,9 +768,10 @@ static void case_race_retire(void)
 
     /* 2. The final post lands before retire calls the real wait: the
      * semaphore keeps it. */
-    ia = registered(&a);
+    os_map a2 = faulting("a2");
+    ia = registered(&a2);
     atomic_store(&pause_next, 0);
-    hold_handler(&t1, &j1, &a, 0);
+    hold_handler(&t1, &j1, &a2, 0);
     atomic_store(&gate_wait, true);
     start_retire(&r1, &x1, ia);
     char c;
@@ -985,72 +779,66 @@ static void case_race_retire(void)
     atomic_store(&gate_wait, false);
     release_pause(0);
     OK(os_thread_join(&t1));
-    OK(j1.rc);
     ASSERT(atomic_load(&n_post) == c1.post + 1 && !atomic_load(&x1.done));
     put_bytes(wait_go_pipe[1], &c, 1);
     OK(os_thread_join(&r1));
-    OK(x1.rc);
     counts c2 = drain_counts();
     ASSERT(c2.entry == c1.entry + 1 && c2.done == c1.done + 1 && c2.post == c1.post + 1);
 
     /* 3. Both slots hold a handler. B's departure while B is still live
      * posts nothing, so retiree 1 cannot take it; then retiree 2 finds B
      * drained and consumes nothing. */
-    ia = registered(&a);
-    ib = registered(&b);
+    os_map a3 = faulting("a3"), b3 = faulting("b3");
+    ia = registered(&a3);
+    ib = registered(&b3);
     atomic_store(&pause_next, 0);
-    hold_handler(&t1, &j1, &a, 0);
-    hold_handler(&t2, &j2, &b, 1);
+    hold_handler(&t1, &j1, &a3, 0);
+    hold_handler(&t2, &j2, &b3, 1);
     start_retire(&r1, &x1, ia);
     spin_until_waiting(c2.entry + 1, &x1);
     start_retire(&r2, &x2, ib);
     release_pause(1);
     OK(os_thread_join(&t2));
-    OK(j2.rc);
     ASSERT(atomic_load(&n_post) == c2.post && !atomic_load(&x1.done));
     release_pause(0);
     OK(os_thread_join(&t1));
     OK(os_thread_join(&r1));
     OK(os_thread_join(&r2));
-    OK(x1.rc);
-    OK(x2.rc);
     counts c3 = drain_counts();
     ASSERT(c3.entry == c2.entry + 1 && c3.done == c2.done + 1 && c3.post == c2.post + 1);
 
     /* 4. Both retirees drain a positive count: one consumed post each. */
-    ia = registered(&a);
-    ib = registered(&b);
+    os_map a4 = faulting("a4"), b4 = faulting("b4");
+    ia = registered(&a4);
+    ib = registered(&b4);
     atomic_store(&pause_next, 0);
-    hold_handler(&t1, &j1, &a, 0);
-    hold_handler(&t2, &j2, &b, 1);
+    hold_handler(&t1, &j1, &a4, 0);
+    hold_handler(&t2, &j2, &b4, 1);
     start_retire(&r1, &x1, ia);
     spin_until_waiting(c3.entry + 1, &x1);
     start_retire(&r2, &x2, ib);
     release_pause(0);
     OK(os_thread_join(&t1));
     OK(os_thread_join(&r1));
-    OK(x1.rc);
     spin_until_waiting(c3.entry + 2, &x2);
     release_pause(1);
     OK(os_thread_join(&t2));
     OK(os_thread_join(&r2));
-    OK(x2.rc);
     counts c4 = drain_counts();
     ASSERT(c4.entry == c3.entry + 2 && c4.done == c3.done + 2 && c4.post == c3.post + 2);
 
-    /* Both mappings register and fault independently afterwards. */
+    /* Two more mappings register and fault independently afterwards. */
     atomic_store(&pause_remap, false);
-    ia = registered(&a);
-    ib = registered(&b);
-    OK(os_fault_test_trigger(&a, 0));
+    os_map a5 = faulting("a5"), b5 = faulting("b5");
+    ia = registered(&a5);
+    ib = registered(&b5);
+    ASSERT(touch(&a5, page) == 0);
     ASSERT(epoch_of(ia) == 1 && epoch_of(ib) == 0);
-    OK(os_fault_test_trigger(&b, 0));
+    ASSERT(touch(&b5, page) == 0);
     ASSERT(epoch_of(ia) == 1 && epoch_of(ib) == 1);
-    OK(os_fault_retire(ia));
-    OK(os_fault_retire(ib));
+    os_fault_retire(ia);
+    os_fault_retire(ib);
     ASSERT(drain_counts().post == c4.post); /* No handler was admitted at either close. */
-    os_unmap(&a);
-    os_unmap(&b);
 }
 
 /* (M) v1 tests/os_test.c case_fault ran four concurrent installers. */
@@ -1068,7 +856,7 @@ static void reader_body(void *arg)
     r->monotonic = true;
     barrier_wait(r->start);
     for (;;) {
-        bool synced = atomic_load(r->tainted); /* acquire: the trigger was joined */
+        bool synced = atomic_load(r->tainted); /* The fault's thread was joined. */
         uint64_t e = UNTOUCHED;
         if (os_fault_poll(r->id, &e) != OS_OK || e < last) r->monotonic = false;
         last = e;
@@ -1081,8 +869,7 @@ static void reader_body(void *arg)
 }
 static void case_readers(void)
 {
-    size_t ps = os_page_size();
-    os_map m = pattern_map("m", 2 * ps);
+    os_map m = shrunk_map("m", 2 * page, page);
     os_fault_id id = registered(&m);
     barrier start;
     barrier_init(&start, READERS + 1);
@@ -1094,19 +881,18 @@ static void case_readers(void)
         OK(os_thread_start(&ts[i], reader_body, &rs[i]));
     }
     barrier_wait(&start);
-    trigger_job j = {&m, ps, OS_E_IO};
+    fault_job j = {&m, page, 1};
     os_thread t;
-    OK(os_thread_start(&t, trigger_body, &j));
+    OK(os_thread_start(&t, fault_body, &j));
     OK(os_thread_join(&t));
-    OK(j.rc);
+    ASSERT(j.got == 0);
     atomic_store(&tainted, true);
     for (int i = 0; i < READERS; i++) {
         OK(os_thread_join(&ts[i]));
         ASSERT(rs[i].monotonic && rs[i].saw_taint_after_sync);
     }
     os_fault_id saved = id;
-    OK(os_fault_retire(id));
-    EXPECT(os_fault_retire(saved), OS_E_NOENT); /* Retired exactly once. */
+    os_fault_retire(id);
     expect_gone(saved);
     os_unmap(&m);
 }
@@ -1115,7 +901,8 @@ typedef struct installer {
     barrier *start;
     os_map view;
     os_fault_id id;
-    os_err reg, trig;
+    os_err reg;
+    unsigned got;
     uint64_t epoch;
 } installer;
 static void installer_body(void *arg)
@@ -1125,27 +912,29 @@ static void installer_body(void *arg)
     c->id = (os_fault_id){7, 7};
     c->reg = os_fault_register(&c->view, &c->id);
     if (c->reg != OS_OK) return;
-    c->trig = os_fault_test_trigger(&c->view, 1);
+    c->got = touch(&c->view, 1);
     c->epoch = UNTOUCHED;
     (void)os_fault_poll(c->id, &c->epoch);
 }
 static void case_install_race(void)
 {
+    /* A prior handler shows how many installations ran: after two, the
+     * second's prior would be the service itself, and an unrepaired fault
+     * would recurse instead of reaching prior_info exactly once. */
+    set_prior(NULL, prior_info);
     /* (P) Capacity plus one disjoint request: exactly one must lose. */
     enum { RACERS = OS_FAULT_SLOTS + 1 };
-    size_t ps = os_page_size();
-    os_map v = pattern_map("race", RACERS * ps);
+    os_map v = shrunk_map("race", RACERS * page, 0);
     static installer cs[RACERS];
     static os_thread ts[RACERS];
     barrier start;
     barrier_init(&start, RACERS);
     for (size_t i = 0; i < RACERS; i++) {
-        cs[i] = (installer){.start = &start, .view = sub(&v, i * ps, ps)};
+        cs[i] = (installer){.start = &start, .view = sub(&v, i * page, page), .got = 1};
         OK(os_thread_start(&ts[i], installer_body, &cs[i]));
     }
     /* Join every racer before retiring any slot (v1 edit-nafu). */
     for (size_t i = 0; i < RACERS; i++) OK(os_thread_join(&ts[i]));
-    ASSERT(atomic_load(&n_install) == 1);
     size_t wins = 0, loser = RACERS;
     uint64_t top = 0;
     static bool used[OS_FAULT_SLOTS];
@@ -1156,21 +945,22 @@ static void case_install_race(void)
             continue;
         }
         OK(cs[i].reg);
-        OK(cs[i].trig);
-        ASSERT(cs[i].epoch == 1 && is_zero(&v, i * ps, (i + 1) * ps));
+        ASSERT(cs[i].got == 0 && cs[i].epoch == 1 && is_zero(&v, i * page, (i + 1) * page));
         ASSERT(!used[cs[i].id.slot]);
         used[cs[i].id.slot] = true;
         for (size_t k = 0; k < i; k++) ASSERT(cs[k].reg != OS_OK || cs[k].id.gen != cs[i].id.gen);
         if (cs[i].id.gen > top) top = cs[i].id.gen;
         wins++;
     }
-    ASSERT(wins == OS_FAULT_SLOTS && loser < RACERS);
+    ASSERT(wins == OS_FAULT_SLOTS && loser < RACERS && prior_calls == 0);
+    ASSERT(touch(&cs[loser].view, 1) == 0); /* Unregistered: the prior repairs it. */
+    ASSERT(prior_calls == 1 && prior_code == BUS_ADRERR);
     size_t first = loser == 0 ? 1 : 0;
-    OK(os_fault_retire(cs[first].id));
+    os_fault_retire(cs[first].id);
     os_fault_id again = registered(&cs[loser].view);
     ASSERT(again.slot == cs[first].id.slot && again.gen > top);
     cs[first].id = again;
-    for (size_t i = 0; i < RACERS; i++) if (i != loser) OK(os_fault_retire(cs[i].id));
+    for (size_t i = 0; i < RACERS; i++) if (i != loser) os_fault_retire(cs[i].id);
     os_unmap(&v);
 }
 
@@ -1183,23 +973,17 @@ static const struct {
     const char *stderr_has; /* The child's stderr file must contain this. */
 } cases[] = {
     {"stale", case_stale, EXITS_ZERO, NULL},
-    {"args", case_args, EXITS_ZERO, NULL},
+    {"extents", case_extents, EXITS_ZERO, NULL},
     {"capacity", case_capacity, EXITS_ZERO, NULL},
     {"recover", case_recover, EXITS_ZERO, NULL},
-    {"truncate", case_truncate, EXITS_ZERO, NULL},
     {"chain_default", case_chain_default, DIES_BY_SIGBUS, NULL},
     {"chain_ignore", case_chain_ignore, DIES_BY_SIGBUS, NULL},
     {"chain_simple", case_chain_simple, EXITS_ZERO, NULL},
     {"chain_siginfo", case_chain_siginfo, EXITS_ZERO, NULL},
     {"assert", case_assert, DIES_BY_SIGABRT, ": ASSERT failed: prior_calls == 1\n"},
     {"exhaustion", case_exhaustion, EXITS_ZERO, NULL},
-    {"err_pagesize", case_err_pagesize, EXITS_ZERO, NULL},
-    {"err_sem", case_err_sem, EXITS_ZERO, NULL},
-    {"err_query", case_err_query, EXITS_ZERO, NULL},
-    {"err_install", case_err_install, EXITS_ZERO, NULL},
     {"err_remap", case_err_remap, EXITS_ZERO, NULL},
     {"err_remap_default", case_err_remap_default, DIES_BY_SIGBUS, NULL},
-    {"err_send", case_err_send, EXITS_ZERO, NULL},
     {"race_reuse", case_race_reuse, EXITS_ZERO, NULL},
     {"race_delivery", case_race_delivery, EXITS_ZERO, NULL},
     {"race_admission", case_race_admission, EXITS_ZERO, NULL},
@@ -1215,12 +999,10 @@ int main(int argc, char **argv)
     /* Handler-side switches and counters must be lock-free (AS-safe). */
     ASSERT(atomic_is_lock_free(&n_post) && atomic_is_lock_free(&fail_remap) &&
           atomic_is_lock_free(&pause_next));
+    page = os_page_size();
     if (argc == 3 && strncmp(argv[1], "--case=", sizeof "--case=" - 1) == 0) {
         alarm(CASE_GUARD_SECONDS);
         work_root = argv[2];
-        _Atomic unsigned *counters[] = {&n_pagesize, &n_sem_init, &n_sem_destroy, &n_query, &n_install,
-                                        &n_remap, &n_send, &n_wait_entry, &n_wait_done, &n_post};
-        for (size_t i = 0; i < sizeof counters / sizeof counters[0]; i++) atomic_store(counters[i], 0);
         for (size_t i = 0; i < CASES; i++) {
             if (strcmp(cases[i].name, argv[1] + sizeof "--case=" - 1) == 0) {
                 cases[i].run();

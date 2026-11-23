@@ -24,7 +24,6 @@
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -820,8 +819,8 @@ void os_vm_release(void *addr, size_t len)
  *
  * The handler takes no lock, waits for nothing, allocates nothing and logs
  * nothing. It calls mmap, sem_post, sigemptyset, sigaction and raise (and,
- * on a broken invariant, ASSERT's write and abort), uses only atomics checked
- * lock-free at installation, and restores errno. */
+ * on a broken invariant, ASSERT's write and abort), uses only lock-free
+ * atomics, and restores errno. */
 
 /* The control word: a phase in its low two bits plus FAULT_HANDLER per
  * admitted handler. */
@@ -835,10 +834,14 @@ typedef enum fault_phase { SLOT_FREE, SLOT_LIVE, SLOT_RETIRING } fault_phase;
 _Static_assert(sizeof(void *) == sizeof(uint64_t), "fault count bound: 64-bit address space");
 _Static_assert(sizeof(siginfo_t) > 8, "fault count bound: signal frame larger than eight bytes");
 
-typedef enum fault_install_state { FAULT_COLD, FAULT_READY, FAULT_UNAVAILABLE } fault_install_state;
 /* Where an unrepaired SIGBUS goes: death by SIGBUS, or the callable handler
  * installed before the service, in its signature. */
 typedef enum fault_prior { PRIOR_NONE, PRIOR_HANDLER, PRIOR_SIGINFO } fault_prior;
+
+/* The handler and the lock-free poll need lock-free atomics: a property of
+ * this ABI, so the compiler checks it. */
+_Static_assert(ATOMIC_LONG_LOCK_FREE == 2 && sizeof(uint64_t) == sizeof(long), "lock-free 64-bit atomics");
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(fault_prior) == sizeof(int), "lock-free enum atomic");
 
 typedef struct fault_slot {
     /* Only the mutex holder changes the phase. Handlers add FAULT_HANDLER
@@ -847,8 +850,15 @@ typedef struct fault_slot {
     _Atomic uint64_t control;
     /* The issued generation from publication to invalidation, else 0. */
     _Atomic uint64_t gen;
-    /* Recoveries of the current registration, saturating at UINT64_MAX;
-     * reset only by register while gen is 0 and no handler is admitted. */
+    /* Recoveries of the current registration; reset only by register while
+     * gen is 0 and no handler is admitted. (P) It cannot wrap: a recovery
+     * turns the faulting page through the view's end into anonymous zero
+     * pages, which never fault, so each increment is one thread's fault on a
+     * still file-backed page. That is at most 2^35 pages (a 2^47-byte user
+     * address space of pages of at least 2^12 bytes) times 2^22 threads (the
+     * kernel's PID_MAX_LIMIT), 2^57 < 2^64. Another process cannot forge a
+     * counted fault: Linux refuses a positive si_code sent to another
+     * process. */
     _Atomic uint64_t epoch;
     /* Written by the registering owner while FREE; read by a handler only
      * after its admission, so they are the registration it entered. */
@@ -863,9 +873,8 @@ typedef struct fault_service {
     pthread_mutex_t mu;
     /* Last issued generation across all slots; under mu, never polled. */
     uint64_t issued;
+    /* The first registration installs the handler, exactly once. */
     os_once once;
-    /* Written once by fault_install; read after os_once_run returns. */
-    fault_install_state install;
     /* Zero except between the last departure from a closed slot and its
      * retiring owner's wait, both inside that owner's hold of mu. */
     sem_t drain;
@@ -879,7 +888,6 @@ typedef struct fault_service {
 static fault_service os_fault_service = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
     .once = OS_ONCE_INIT,
-    .install = FAULT_COLD,
 };
 
 static uintptr_t fault_end(uintptr_t base, size_t len, uintptr_t page)
@@ -926,13 +934,13 @@ static bool fault_recover(uintptr_t a)
             fault_leave(slot);
             continue;
         }
-        /* Overlap rejection makes this the only match. Taint, saturating,
-         * then fence, so no zero page is readable before the count. */
-        uint64_t e = atomic_load(&slot->epoch);
-        while (e != UINT64_MAX && !atomic_compare_exchange_weak(&slot->epoch, &e, e + 1u)) {}
+        /* Overlap is excluded at registration, so this is the only match.
+         * Taint, then fence, so no zero page is readable before the count. */
+        (void)atomic_fetch_add(&slot->epoch, 1u);
         atomic_thread_fence(memory_order_seq_cst);
         /* From the faulting page through the logical end; the kernel rounds
-         * the length up within the registered page-rounded extent. */
+         * the length up within the registered page-rounded extent. Failure
+         * (ENOMEM: the map-count limit) leaves the fault unrepaired. */
         uintptr_t from = a & ~(s->page - 1u);
         bool ok = mmap((void *)from, base + len - from, PROT_READ,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != MAP_FAILED;
@@ -945,6 +953,9 @@ static bool fault_recover(uintptr_t a)
 static void fault_handler(int sig, siginfo_t *si, void *uc)
 {
     int saved = errno;
+    /* A kernel fault on a mapping carries BUS_ADRERR (past the end of the
+     * file) or BUS_OBJERR (I/O error) and its address. A kill or sigqueue
+     * from another process carries a nonpositive code and no address. */
     if ((si->si_code == BUS_ADRERR || si->si_code == BUS_OBJERR) && fault_recover((uintptr_t)si->si_addr)) {
         errno = saved;
         return;
@@ -983,42 +994,34 @@ static void fault_handler(int sig, siginfo_t *si, void *uc)
     errno = saved;
 }
 
+/* None of these calls can fail on the audited target (v2-0fv.16.md): the
+ * kernel ABI supplies a power-of-two page size; glibc's process-private
+ * sem_init has no failure path; sigaction on SIGBUS with valid pointers fails
+ * only under a seccomp filter refusing rt_sigaction, where glibc's
+ * posix_spawn child (os_proc_spawn) cannot work either. */
 static void fault_install(void)
 {
     fault_service *s = &os_fault_service;
-    s->install = FAULT_UNAVAILABLE;
-    for (size_t i = 0; i < OS_FAULT_SLOTS; i++) {
-        fault_slot *slot = &s->slots[i];
-        if (!atomic_is_lock_free(&slot->control) || !atomic_is_lock_free(&slot->gen) ||
-            !atomic_is_lock_free(&slot->epoch))
-            return;
-    }
-    if (!atomic_is_lock_free(&s->prior_kind)) return;
-    long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || (page & (page - 1)) != 0) return;
-    s->page = (uintptr_t)page;
-    if (sem_init(&s->drain, 0, 0) != 0) return;
+    size_t page = os_page_size();
+    ASSERT(page != 0 && (page & (page - 1u)) == 0);
+    s->page = page;
+    int rc = sem_init(&s->drain, 0, 0);
+    ASSERT(rc == 0);
     /* A fixed action: SA_SIGINFO, empty mask. */
     struct sigaction sa = {.sa_sigaction = fault_handler, .sa_flags = SA_SIGINFO};
-    int empty = sigemptyset(&sa.sa_mask);
-    ASSERT(empty == 0);
-    if (sigaction(SIGBUS, NULL, &s->prior) != 0) {
-        (void)sem_destroy(&s->drain);
-        return;
-    }
+    rc = sigemptyset(&sa.sa_mask);
+    ASSERT(rc == 0);
+    rc = sigaction(SIGBUS, NULL, &s->prior);
+    ASSERT(rc == 0);
     void (*h)(int) = s->prior.sa_handler;
     atomic_store(&s->prior_kind, h == SIG_DFL || h == SIG_IGN ? PRIOR_NONE
                                  : (s->prior.sa_flags & SA_SIGINFO) ? PRIOR_SIGINFO
                                                                      : PRIOR_HANDLER);
-    if (sigaction(SIGBUS, &sa, NULL) != 0) {
-        (void)sem_destroy(&s->drain);
-        return;
-    }
-    s->install = FAULT_READY;
+    rc = sigaction(SIGBUS, &sa, NULL);
+    ASSERT(rc == 0);
 }
 
-/* Under mu. Rejects intersecting rounded extents, then takes the lowest free
- * slot and publishes a fresh generation. */
+/* Under mu. Takes the lowest free slot and publishes a fresh generation. */
 static os_err fault_claim(fault_service *s, uintptr_t base, size_t len, os_fault_id *out)
 {
     uintptr_t end = fault_end(base, len, s->page);
@@ -1029,9 +1032,13 @@ static os_err fault_claim(fault_service *s, uintptr_t base, size_t len, os_fault
         case SLOT_FREE:
             if (at == OS_FAULT_SLOTS) at = i;
             break;
-        case SLOT_LIVE:
-            if (base < fault_end(slot->base, slot->len, s->page) && slot->base < end) return OS_E_EXIST;
+        case SLOT_LIVE: {
+            /* Live mappings never share pages: an intersection is a view
+             * registered twice or unmapped before its retire. */
+            bool overlap = base < fault_end(slot->base, slot->len, s->page) && slot->base < end;
+            ASSERT(!overlap);
             break;
+        }
         case SLOT_RETIRING:
             ASSERT(false && "RETIRING outside its owner's hold of mu");
             break;
@@ -1055,21 +1062,13 @@ static os_err fault_claim(fault_service *s, uintptr_t base, size_t len, os_fault
 
 os_err os_fault_register(const os_map *view, os_fault_id *out)
 {
-    if (!out) return fail_with(OS_E_INVAL);
+    ASSERT(out != NULL && view != NULL && view->addr != NULL && view->len != 0);
     *out = (os_fault_id)OS_FAULT_ID_INIT;
-    if (!view || !view->addr || !view->len) return fail_with(OS_E_INVAL);
     fault_service *s = &os_fault_service;
     os_once_run(&s->once, fault_install);
-    switch (s->install) {
-    case FAULT_READY:
-        break;
-    case FAULT_COLD:
-    case FAULT_UNAVAILABLE:
-        return fail_with(OS_E_NOTSUP);
-    }
     uintptr_t base = (uintptr_t)view->addr, mask = s->page - 1u;
-    if ((base & mask) || view->len > UINTPTR_MAX - base || base + view->len > UINTPTR_MAX - mask)
-        return fail_with(OS_E_INVAL);
+    /* A view from os_map_file is page-aligned and inside the address space. */
+    ASSERT((base & mask) == 0 && view->len <= UINTPTR_MAX - mask - base);
     (void)pthread_mutex_lock(&s->mu);
     os_err rc = fault_claim(s, base, view->len, out);
     (void)pthread_mutex_unlock(&s->mu);
@@ -1078,7 +1077,7 @@ os_err os_fault_register(const os_map *view, os_fault_id *out)
 
 os_err os_fault_poll(os_fault_id id, uint64_t *epoch)
 {
-    if (!epoch || !id.gen || id.slot >= OS_FAULT_SLOTS) return fail_with(OS_E_INVAL);
+    ASSERT(epoch != NULL && id.gen != 0 && id.slot < OS_FAULT_SLOTS);
     /* The mapped byte loads are not atomic, so the closing validation needs
      * a barrier compiler and machine both respect. */
     atomic_thread_fence(memory_order_seq_cst);
@@ -1092,17 +1091,15 @@ os_err os_fault_poll(os_fault_id id, uint64_t *epoch)
     return OS_OK;
 }
 
-os_err os_fault_retire(os_fault_id id)
+void os_fault_retire(os_fault_id id)
 {
-    if (!id.gen || id.slot >= OS_FAULT_SLOTS) return fail_with(OS_E_INVAL);
+    ASSERT(id.gen != 0 && id.slot < OS_FAULT_SLOTS);
     fault_service *s = &os_fault_service;
     fault_slot *slot = &s->slots[id.slot];
     (void)pthread_mutex_lock(&s->mu);
-    /* Under mu a published generation means LIVE, and only this id's. */
-    if (atomic_load(&slot->gen) != id.gen) {
-        (void)pthread_mutex_unlock(&s->mu);
-        return fail_with(OS_E_NOENT);
-    }
+    /* Only the owner retires, once: under mu its generation is published. */
+    uint64_t published = atomic_load(&slot->gen);
+    ASSERT(published == id.gen);
     /* Invalidate before the close and before any later epoch reset. */
     atomic_store(&slot->gen, 0);
     /* Close LIVE -> RETIRING keeping the count: no admission after this. */
@@ -1121,38 +1118,21 @@ os_err os_fault_retire(os_fault_id id)
     ASSERT(w == SLOT_RETIRING);
     atomic_store(&slot->control, SLOT_FREE);
     (void)pthread_mutex_unlock(&s->mu);
-    return OS_OK;
 }
 
-#ifdef EDIT_TEST_HOOKS
-/* Test builds only (A15): register next issues generation `next` (nonzero,
- * forward only). Neither os.h nor libcore.a carries it (tests/lanes.mk). */
-os_err os_fault_test_next_gen(uint64_t next);
-os_err os_fault_test_next_gen(uint64_t next)
+#ifdef OS_TEST_HOOKS
+/* Test-hooks variant only (A15): register next issues generation `next`,
+ * nonzero and forward only. Neither os.h nor libcore.a carries it. */
+void os_fault_test_next_gen(uint64_t next);
+void os_fault_test_next_gen(uint64_t next)
 {
     fault_service *s = &os_fault_service;
     (void)pthread_mutex_lock(&s->mu);
-    bool ok = next != 0 && next - 1u >= s->issued;
-    if (ok) s->issued = next - 1u;
+    ASSERT(next != 0 && next - 1u >= s->issued);
+    s->issued = next - 1u;
     (void)pthread_mutex_unlock(&s->mu);
-    return ok ? OS_OK : fail_with(OS_E_INVAL);
 }
 #endif
-
-os_err os_fault_test_trigger(const os_map *view, size_t off)
-{
-    if (!view || !view->addr || off >= view->len || off > UINTPTR_MAX - (uintptr_t)view->addr)
-        return fail_with(OS_E_INVAL);
-    siginfo_t si;
-    memset(&si, 0, sizeof si);
-    si.si_signo = SIGBUS;
-    si.si_code = BUS_ADRERR;
-    si.si_addr = (void *)((uintptr_t)view->addr + off);
-    /* Linux accepts a positive si_code only for the caller's own process.
-     * Four long words (tests/os_fault_test.c forwards exactly these). */
-    long rc = syscall(SYS_rt_tgsigqueueinfo, (long)getpid(), (long)gettid(), (long)SIGBUS, &si);
-    return rc ? fail() : OS_OK;
-}
 
 /* ---- random ------------------------------------------------------------- */
 os_err os_random(void *buf, size_t n)
