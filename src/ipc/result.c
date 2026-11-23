@@ -13,5 +13,7 @@ const char *ipc_result_string(ipc_result result)
     case IPC_BUSY: return "running instance is busy";
     case IPC_REJECTED: return "running instance rejected the open request";
     }
-    return "unknown IPC error";
+    /* Received codes are range-checked and callback codes clamped before they
+     * become an ipc_result, so only a caller's cast reaches here. */
+    ASSERT(false);
 }

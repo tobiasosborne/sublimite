@@ -35,9 +35,9 @@ static void put16(uint8_t *p, size_t n) { p[0]=(uint8_t)n; p[1]=(uint8_t)(n>>8);
 static size_t present(const char *s) { return s!=NULL && s[0] ? strnlen(s,IPC_ACTIVATION_CAP+1u)+1u : 0; }
 ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out)
 {
-    if(out==NULL) return IPC_INVALID;
+    ASSERT(out != NULL && (wire != NULL || size == 0));
     memset(out,0,sizeof *out);
-    if(wire==NULL || size<24 || size>IPC_MAX_WIRE) return IPC_PROTOCOL;
+    if(size<24 || size>IPC_MAX_WIRE) return IPC_PROTOCOL;
     if(memcmp(wire,"EDIP",4)!=0 || wire[4]!=1 || wire[5]>7 || get32(wire+8)!=size) return IPC_PROTOCOL;
     /* Bytes 6-7: size of the trailing activation block, zero without bit 2. */
     size_t block=get16(wire+6);
@@ -69,21 +69,32 @@ ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out)
 }
 ipc_result ipc_wire_encode(const ipc_request *r, uint8_t *wire, size_t capacity, size_t *size)
 {
-    if(size!=NULL) *size=0;
-    if(r==NULL || wire==NULL || size==NULL || r->cwd==NULL || r->count>IPC_MAX_PATHS || (!r->has_stdin && r->stdin_size) || (r->stdin_size && r->stdin_data==NULL)) return IPC_INVALID;
+    /* A request comes from ipc_parse_args or ipc_wire_decode, which yield only
+     * what this encoder accepts; anything else, or input aliasing the output,
+     * is a caller bug (A15). Only size limits are return codes. */
+    ASSERT(r != NULL && wire != NULL && size != NULL);
+    *size=0;
+    ASSERT(r->cwd != NULL && r->count <= IPC_MAX_PATHS);
+    ASSERT(r->has_stdin || r->stdin_size == 0);
+    ASSERT(r->stdin_size == 0 || r->stdin_data != NULL);
     size_t cwdn=strnlen(r->cwd,IPC_PATH_CAP)+1u, plen[IPC_MAX_PATHS];
-    if(cwdn>IPC_PATH_CAP || !string_ok((const uint8_t *)r->cwd,cwdn) || overlaps(r->cwd,cwdn,wire,capacity)) return IPC_INVALID;
+    ASSERT(cwdn <= IPC_PATH_CAP && string_ok((const uint8_t *)r->cwd, cwdn));
+    ASSERT(!overlaps(r->cwd, cwdn, wire, capacity));
     size_t total=24u+cwdn;
     size_t tn=present(r->activation_token), sn=present(r->startup_id), block=tn||sn ? 4u+tn+sn : 0;
-    if((tn && (!activation_ok((const uint8_t *)r->activation_token,tn) || overlaps(r->activation_token,tn,wire,capacity))) ||
-       (sn && (!activation_ok((const uint8_t *)r->startup_id,sn) || overlaps(r->startup_id,sn,wire,capacity)))) return IPC_INVALID;
+    ASSERT(tn == 0 || (activation_ok((const uint8_t *)r->activation_token, tn) &&
+                       !overlaps(r->activation_token, tn, wire, capacity)));
+    ASSERT(sn == 0 || (activation_ok((const uint8_t *)r->startup_id, sn) &&
+                       !overlaps(r->startup_id, sn, wire, capacity)));
     for(size_t i=0;i<r->count;i++) {
-        const ipc_path *p=&r->paths[i]; if(p->path==NULL || !p->line || !p->col) return IPC_INVALID;
+        const ipc_path *p=&r->paths[i];
+        ASSERT(p->path != NULL && p->line != 0 && p->col != 0);
         size_t n=strnlen(p->path,IPC_PATH_CAP)+1u;
-        if(n>IPC_PATH_CAP || !string_ok((const uint8_t *)p->path,n) || overlaps(p->path,n,wire,capacity)) return IPC_INVALID;
+        ASSERT(n <= IPC_PATH_CAP && string_ok((const uint8_t *)p->path, n));
+        ASSERT(!overlaps(p->path, n, wire, capacity));
         plen[i]=n; total+=12u+n;
     }
-    if(r->stdin_size<=IPC_MAX_WIRE && overlaps(r->stdin_data,r->stdin_size,wire,capacity)) return IPC_INVALID;
+    ASSERT(r->stdin_size > IPC_MAX_WIRE || !overlaps(r->stdin_data, r->stdin_size, wire, capacity));
     if(r->stdin_size>IPC_MAX_WIRE || total>IPC_MAX_WIRE-r->stdin_size || total+r->stdin_size+block>IPC_MAX_WIRE) return IPC_LIMIT;
     total+=r->stdin_size+block;
     if(total>capacity) return IPC_LIMIT;

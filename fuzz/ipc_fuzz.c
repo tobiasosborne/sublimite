@@ -4,7 +4,7 @@
  *   one structural mutation is applied to the envelope. The model predicts the
  *   outcome exactly: either IPC_PROTOCOL (the right code) or IPC_OK with a
  *   request equal field-for-field to the expected one. Any other outcome traps.
- * Part 3: encoder contract (limits, aliasing, determinism, new_instance).
+ * Part 3: encoder contract (limits, determinism, new_instance).
  * Part 4: end to end through a real abstract-namespace server for ~1/32 of the
  *   inputs: the ACK code must equal the model, the callback must see exactly
  *   the expected request, and a peer whose uid is foreign must never reach the
@@ -65,46 +65,46 @@ static bool same(const ipc_request *g, const model *m)
 static void expect_ok(const uint8_t *w, size_t n, const model *m)
 {
     ipc_request o; ipc_result rc=ipc_wire_decode(w,n,&o);
-    BASE_ASSERT(rc==IPC_OK && same(&o,m));
+    ASSERT(rc==IPC_OK && same(&o,m));
 }
 static void expect_proto(const uint8_t *w, size_t n)
 {
     ipc_request o; ipc_result rc=ipc_wire_decode(w,n,&o);
-    BASE_ASSERT(rc==IPC_PROTOCOL);
-    BASE_ASSERT(o.count==0 && o.cwd==NULL && o.stdin_data==NULL && o.stdin_size==0 && !o.wait && !o.has_stdin);
+    ASSERT(rc==IPC_PROTOCOL);
+    ASSERT(o.count==0 && o.cwd==NULL && o.stdin_data==NULL && o.stdin_size==0 && !o.wait && !o.has_stdin);
 }
 
 /* ---- end to end server (lazy; process lifetime) ---- */
 typedef struct sink { const model *want; int calls; } sink;
 static ipc_result on_open(const ipc_request *r, ipc_token t, void *ctx)
 {
-    (void)t; sink *s=ctx; BASE_ASSERT(s->want!=NULL && same(r,s->want)); s->calls++; return IPC_OK;
+    (void)t; sink *s=ctx; ASSERT(s->want!=NULL && same(r,s->want)); s->calls++; return IPC_OK;
 }
 static ipc_server g_srv; static int g_srv_state; /* 0 untried, 1 up, -1 unavailable */
 static int e2e_connect(void)
 {
     struct sockaddr_un a; memset(&a,0,sizeof a); a.sun_family=AF_UNIX;
     int n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),getenv("EDIT_IPC_NAMESPACE"));
-    int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); BASE_ASSERT(fd>=0);
-    BASE_ASSERT(connect(fd,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0);
+    int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); ASSERT(fd>=0);
+    ASSERT(connect(fd,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0);
     return fd;
 }
 static void pump(sink *s, int ms)
 {
     struct pollfd p={ipc_server_fd(&g_srv),POLLIN,0};
-    if(poll(&p,1,ms)>0) BASE_ASSERT(ipc_server_drain(&g_srv,on_open,s)==IPC_OK);
+    if(poll(&p,1,ms)>0) ASSERT(ipc_server_drain(&g_srv,on_open,s)==IPC_OK);
 }
 static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, bool foreign)
 {
     if(g_srv_state==0) {
         char ns[64]; snprintf(ns,sizeof ns,"fuzz-%ld",(long)getpid());
-        BASE_ASSERT(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); unsetenv("XDG_RUNTIME_DIR");
+        ASSERT(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); unsetenv("XDG_RUNTIME_DIR");
         g_srv_state=ipc_server_init(&g_srv,NULL)==IPC_OK?1:-1;
     }
     if(g_srv_state<0) return;
     ipc_seam_foreign_abstract=foreign;
     sink s={m,0}; int fd=e2e_connect();
-    BASE_ASSERT(send(fd,w,n,MSG_NOSIGNAL)==(ssize_t)n);
+    ASSERT(send(fd,w,n,MSG_NOSIGNAL)==(ssize_t)n);
     uint8_t reply[8]; ssize_t got=-2;
     for(int i=0;i<60 && got==-2;i++) {
         pump(&s,50);
@@ -114,10 +114,10 @@ static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, b
     if(foreign) {
         ipc_seam_foreign_abstract=false;
         /* credential regression: a foreign peer must never reach the callback or see an ACK */
-        BASE_ASSERT(s.calls==0 && got!=8 && got!=-2);
+        ASSERT(s.calls==0 && got!=8 && got!=-2);
     } else {
-        BASE_ASSERT(got==8 && memcmp(reply,"EDIR",4)==0 && reply[4]=='A' && reply[5]==(uint8_t)expect);
-        BASE_ASSERT(s.calls==(expect==IPC_OK?1:0));
+        ASSERT(got==8 && memcmp(reply,"EDIR",4)==0 && reply[4]=='A' && reply[5]==(uint8_t)expect);
+        ASSERT(s.calls==(expect==IPC_OK?1:0));
     }
     close(fd);
     for(int i=0;i<3;i++) pump(&s,0); /* retire the slot (wait clients too) */
@@ -127,12 +127,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /* Part 1: raw bytes. */
     ipc_request out={0}; ipc_result rc=ipc_wire_decode(data,size,&out);
-    BASE_ASSERT(rc==IPC_OK || rc==IPC_PROTOCOL);
+    ASSERT(rc==IPC_OK || rc==IPC_PROTOCOL);
     if(rc==IPC_OK) {
-        BASE_ASSERT(out.count<=IPC_MAX_PATHS && out.cwd!=NULL && out.cwd[0]=='/');
-        for(size_t i=0;i<out.count;i++) BASE_ASSERT(out.paths[i].path[0]=='/' && out.paths[i].line && out.paths[i].col);
-        BASE_ASSERT(!out.new_instance);
-    } else BASE_ASSERT(out.count==0 && out.cwd==NULL && out.stdin_data==NULL && out.stdin_size==0);
+        ASSERT(out.count<=IPC_MAX_PATHS && out.cwd!=NULL && out.cwd[0]=='/');
+        for(size_t i=0;i<out.count;i++) ASSERT(out.paths[i].path[0]=='/' && out.paths[i].line && out.paths[i].col);
+        ASSERT(!out.new_instance);
+    } else ASSERT(out.count==0 && out.cwd==NULL && out.stdin_data==NULL && out.stdin_size==0);
 
     /* Part 2: build the model. Control bytes come first, stdin payload last. */
     rd r={data,size,0};
@@ -148,13 +148,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
     ipc_request q; to_request(&m,&q); q.new_instance=(sel&0x80u)!=0;
     uint8_t wire[4096], base[4096]; size_t n=0;
-    BASE_ASSERT(ipc_wire_encode(&q,base,sizeof base,&n)==IPC_OK);
-    BASE_ASSERT(n>=24 && get32(base+8)==n && memcmp(base,"EDIP",4)==0);
+    ASSERT(ipc_wire_encode(&q,base,sizeof base,&n)==IPC_OK);
+    ASSERT(n>=24 && get32(base+8)==n && memcmp(base,"EDIP",4)==0);
     expect_ok(base,n,&m);
     /* Offsets of the structural fields, derived from the model. */
     size_t cwdn=strlen(m.cwd)+1u, pos=24u+cwdn, hdr[MAXP], str[MAXP], len[MAXP];
     for(size_t i=0;i<m.count;i++) { len[i]=strlen(m.path[i])+1u; hdr[i]=pos; str[i]=pos+12u; pos+=12u+len[i]; }
-    BASE_ASSERT(n==pos+m.stdin_size && get32(base+12)==m.count && get32(base+16)==cwdn && get32(base+20)==m.stdin_size);
+    ASSERT(n==pos+m.stdin_size && get32(base+12)==m.count && get32(base+16)==cwdn && get32(base+20)==m.stdin_size);
 
     memcpy(wire,base,n); size_t wn=n; model e=m; bool want_ok=true; bool ambiguous=false;
     switch((sel&0x3fu)%17u) {
@@ -191,32 +191,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                break; }
     default: if(m.stdin_size) { size_t i=arg%m.stdin_size; uint8_t b=(uint8_t)(arg2); wire[pos+i]=b; e.stdin_buf[i]=b; } break; /* payload byte */
     }
-    if(ambiguous) { ipc_request o; rc=ipc_wire_decode(wire,wn,&o); BASE_ASSERT(rc==IPC_OK||rc==IPC_PROTOCOL); want_ok=(rc==IPC_OK); if(want_ok) {/* a lucky parse: nothing exact to assert */} }
+    if(ambiguous) { ipc_request o; rc=ipc_wire_decode(wire,wn,&o); ASSERT(rc==IPC_OK||rc==IPC_PROTOCOL); want_ok=(rc==IPC_OK); if(want_ok) {/* a lucky parse: nothing exact to assert */} }
     else if(want_ok) expect_ok(wire,wn,&e);
     else expect_proto(wire,wn);
 
     /* Part 3: encoder contract. */
     uint8_t again[4096]; size_t n2=0;
-    BASE_ASSERT(ipc_wire_encode(&q,again,sizeof again,&n2)==IPC_OK && n2==n && memcmp(again,base,n)==0); /* deterministic, new_instance not serialized */
-    size_t sink_n=7; BASE_ASSERT(ipc_wire_encode(&q,again,(size_t)arg%n,&sink_n)==IPC_LIMIT && sink_n==0);
-    { ipc_request b=q; b.cwd=NULL; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID); }
-    { ipc_request b=q; b.count=IPC_MAX_PATHS+1u; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID); }
-    { ipc_request b=q; b.cwd="relative"; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID); }
-    if(m.count) { ipc_request b=q; b.paths[0].line=0; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID);
-                  b=q; b.paths[0].col=0; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID);
-                  b=q; b.paths[0].path="rel"; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID); }
-    if(!m.has_stdin) { ipc_request b=q; b.stdin_size=1; b.stdin_data=data; BASE_ASSERT(ipc_wire_encode(&b,again,sizeof again,&n2)==IPC_INVALID); }
-    { /* input aliasing the output buffer is rejected, never silently corrupted (review §1) */
-        char inbuf[64]; snprintf(inbuf,sizeof inbuf,"%s",m.cwd); ipc_request b=q; b.cwd=inbuf;
-        BASE_ASSERT(ipc_wire_encode(&b,(uint8_t *)inbuf,sizeof inbuf,&n2)==IPC_INVALID);
-        if(m.stdin_size) { uint8_t sb[4096]; memcpy(sb,m.stdin_buf,m.stdin_size); b=q; b.stdin_data=sb;
-            BASE_ASSERT(ipc_wire_encode(&b,sb,sizeof sb,&n2)==IPC_INVALID); }
-    }
+    ASSERT(ipc_wire_encode(&q,again,sizeof again,&n2)==IPC_OK && n2==n && memcmp(again,base,n)==0); /* deterministic, new_instance not serialized */
+    size_t sink_n=7; ASSERT(ipc_wire_encode(&q,again,(size_t)arg%n,&sink_n)==IPC_LIMIT && sink_n==0);
+    /* Requests the parser and decoder cannot produce, and input aliasing the
+     * output, are caller bugs that die by ASSERT (A15): not encoder outcomes. */
 
     /* Part 4: end to end, deterministic 1/32 sample, only envelopes the server will answer. */
     if((mk&0x0cu)==0x0cu && ((arg2>>24)&7u)==3u && !ambiguous && wn>=24 && wn<=sizeof wire && (memcmp(wire,"EDIP",4)!=0 || get32(wire+8)==wn)) {
         ipc_request o; ipc_result d=ipc_wire_decode(wire,wn,&o);
-        BASE_ASSERT(d==IPC_OK || d==IPC_PROTOCOL);
+        ASSERT(d==IPC_OK || d==IPC_PROTOCOL);
         bool foreign=(sel&0x40u)!=0 && (arg&3u)==0;
         e2e(wire,wn,&e,d,foreign);
     }
@@ -237,24 +226,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             argv[argc]=storage[argc]; argc++; at+=alen+1;
         }
         ipc_args a; ipc_result prc=ipc_parse_args(argc,argv,&a);
-        BASE_ASSERT(prc>=IPC_OK && prc<=IPC_REJECTED);
+        ASSERT(prc>=IPC_OK && prc<=IPC_REJECTED);
         if(prc==IPC_OK) {
-            BASE_ASSERT(a.request.count<=IPC_MAX_PATHS && a.request.cwd && a.request.cwd[0]=='/');
+            ASSERT(a.request.count<=IPC_MAX_PATHS && a.request.cwd && a.request.cwd[0]=='/');
             for(size_t i=0;i<a.request.count;i++)
-                BASE_ASSERT(a.request.paths[i].path[0]=='/' && a.request.paths[i].line && a.request.paths[i].col);
+                ASSERT(a.request.paths[i].path[0]=='/' && a.request.paths[i].line && a.request.paths[i].col);
             if(a.request.has_stdin) {
-                int p[2]; BASE_ASSERT(pipe(p)==0);
+                int p[2]; ASSERT(pipe(p)==0);
                 size_t payload=size<128?size:128;
-                BASE_ASSERT(write(p[1],data,payload)==(ssize_t)payload); close(p[1]);
+                ASSERT(write(p[1],data,payload)==(ssize_t)payload); close(p[1]);
                 ipc_result src2=ipc_args_read_stdin(&a,p[0]); close(p[0]);
-                BASE_ASSERT(src2==IPC_OK && a.request.stdin_size==payload &&
+                ASSERT(src2==IPC_OK && a.request.stdin_size==payload &&
                             (payload==0 || memcmp(a.request.stdin_data,data,payload)==0));
             }
             const char *tok=argc>1?storage[1]:NULL;
             ipc_result arc=ipc_args_set_activation(&a,tok,NULL);
-            BASE_ASSERT(arc==IPC_OK || arc==IPC_IO);
-            if(a.request.activation_token) BASE_ASSERT(strcmp(a.request.activation_token,tok)==0);
-            BASE_ASSERT(a.request.startup_id==NULL);
+            ASSERT(arc==IPC_OK || arc==IPC_IO);
+            if(a.request.activation_token) ASSERT(strcmp(a.request.activation_token,tok)==0);
+            ASSERT(a.request.startup_id==NULL);
         }
         ipc_args_fini(&a);
     }

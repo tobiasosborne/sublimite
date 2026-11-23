@@ -199,7 +199,7 @@ static ipc_result deliver(const endpoint *ep, uint8_t *wire, size_t n, bool wait
 }
 ipc_result ipc_client_send_display(const char *runtime, const char *display, const ipc_request *r, int timeout_ms)
 {
-    if(timeout_ms < -1) return IPC_INVALID;
+    ASSERT(r != NULL && timeout_ms >= -1);
     endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
     if(rc!=IPC_OK) return rc;
     base_arena arena={0}; if(base_arena_init(&arena,IPC_MAX_WIRE)!=0) { ep_close(&ep); return IPC_IO; }
@@ -323,9 +323,10 @@ static void process_peer(ipc_server *s, struct ipc_peer *p, ipc_open_callback ca
         reply(p->reply,'A',rc); p->reply_size=8; flush_peer(s,p); return;
     }
 }
+/* Server entries take an initialized server; tokens start at 1. */
 ipc_result ipc_server_report_closed(ipc_server *s, ipc_token token)
 {
-    if(s==NULL || s->peers==NULL || !token) return IPC_INVALID;
+    ASSERT(s != NULL && s->peers != NULL && token != 0);
     for(size_t i=0;i<IPC_MAX_CLIENTS;i++) {
         struct ipc_peer *p=&s->peers[i];
         if(peer_live(p) && p->token==token && p->opened && p->wait) {
@@ -339,7 +340,7 @@ ipc_result ipc_server_report_closed(ipc_server *s, ipc_token token)
 }
 bool ipc_server_token_live(const ipc_server *s, ipc_token token)
 {
-    if(s==NULL || s->peers==NULL || !token) return false;
+    ASSERT(s != NULL && s->peers != NULL && token != 0);
     for(size_t i=0;i<IPC_MAX_CLIENTS;i++) {
         const struct ipc_peer *p=&s->peers[i];
         if(peer_live(p) && p->token==token) return peer_waiting(p);
@@ -380,7 +381,7 @@ static struct ipc_peer *take_slot(ipc_server *s, uint64_t now)
 }
 ipc_result ipc_server_drain(ipc_server *s, ipc_open_callback callback, void *ctx)
 {
-    if(s==NULL || s->peers==NULL || callback==NULL) return IPC_INVALID;
+    ASSERT(s != NULL && s->peers != NULL && callback != NULL);
     struct budget b={IPC_DRAIN_BYTES,IPC_DRAIN_CALLBACKS,IPC_DRAIN_ACCEPTS,milliseconds()};
     s->drain_bytes=0;
     expire_peers(s,b.now);
@@ -415,7 +416,11 @@ ipc_result ipc_server_drain(ipc_server *s, ipc_open_callback callback, void *ctx
     rearm_timer(s);
     return IPC_OK;
 }
-int ipc_server_fd(const ipc_server *s) { return s!=NULL?os_waitset_fd(&s->set):-1; }
+int ipc_server_fd(const ipc_server *s)
+{
+    ASSERT(s != NULL);
+    return os_waitset_fd(&s->set);
+}
 
 static ipc_result lock_with_deadline(os_file *lock)
 {
@@ -453,7 +458,7 @@ static void teardown(ipc_server *s, bool locked)
 }
 void ipc_server_fini(ipc_server *s)
 {
-    if(s==NULL) return;
+    ASSERT(s != NULL);
     bool locked=!os_file_is_open(&s->lock);
     /* A bounded wait: if the lock cannot be taken the socket is left for the
      * next startup's stale-socket recovery rather than unlinked blind. */
@@ -533,7 +538,7 @@ done:
 }
 ipc_result ipc_server_init_display(ipc_server *s, const char *runtime, const char *display)
 {
-    if(s==NULL) return IPC_INVALID;
+    ASSERT(s != NULL);
     reset_server(s);
     endpoint ep; ipc_result rc=resolve(runtime,display,&ep);
     if(rc!=IPC_OK) return rc;
@@ -549,7 +554,7 @@ ipc_result ipc_server_init_display(ipc_server *s, const char *runtime, const cha
 }
 ipc_result ipc_server_init_isolated(ipc_server *s)
 {
-    if(s==NULL) return IPC_INVALID;
+    ASSERT(s != NULL);
     reset_server(s);
     ipc_result rc=setup_runtime(s);
     if(rc!=IPC_OK) teardown(s,true);
@@ -557,7 +562,7 @@ ipc_result ipc_server_init_isolated(ipc_server *s)
 }
 ipc_result ipc_launcher_pair(int fds[2])
 {
-    if(fds==NULL) return IPC_INVALID;
+    ASSERT(fds != NULL);
     os_stream a=OS_STREAM_INIT, b=OS_STREAM_INIT;
     if(os_stream_pair(&a,&b)!=OS_OK) return IPC_IO;
     fds[0]=os_stream_fd(&a); fds[1]=os_stream_fd(&b); /* ownership passes to the caller */
@@ -565,7 +570,9 @@ ipc_result ipc_launcher_pair(int fds[2])
 }
 ipc_result ipc_server_adopt_wait(ipc_server *s, int fd, ipc_token *token)
 {
-    if(s==NULL || s->peers==NULL || fd<0 || token==NULL || s->next_token==UINT64_MAX) return IPC_INVALID;
+    ASSERT(s != NULL && s->peers != NULL && fd >= 0 && token != NULL);
+    /* (P) 2^64 issued tokens: exhaustion stays a return code (A15). */
+    if(s->next_token==UINT64_MAX) return IPC_LIMIT;
     struct ipc_peer *p=NULL;
     for(size_t i=0;i<IPC_MAX_CLIENTS;i++) if(!peer_live(&s->peers[i])) { p=&s->peers[i]; break; }
     if(p==NULL) return IPC_LIMIT;
@@ -579,7 +586,7 @@ ipc_result ipc_server_adopt_wait(ipc_server *s, int fd, ipc_token *token)
 }
 ipc_result ipc_launcher_wait(int fd)
 {
-    if(fd<0) return IPC_INVALID;
+    ASSERT(fd >= 0);
     conn c={OS_STREAM_INIT,OS_WAITSET_INIT}; ipc_result rc=IPC_IO;
     if(os_stream_adopt(&c.s,fd)==OS_OK && conn_watch(&c)==IPC_OK) rc=receive_reply(&c,'C',OS_DEADLINE_NEVER);
     conn_close(&c); return rc;

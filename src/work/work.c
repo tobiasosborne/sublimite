@@ -99,11 +99,18 @@ static void worker_main(void *vp)
         trace_thread_release();
 }
 
+/* A handle is a submit result: {0, 0} when refused, otherwise an issued slot
+ * and epoch. Submission never issues UINT32_MAX (a slot retires first), so
+ * anything else is forged by the caller. */
+static void assert_handle(work_handle h)
+{
+    ASSERT(h.slot < WORK_MAX_JOBS && h.epoch != UINT32_MAX);
+}
+
 static int pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster, bool foreground)
 {
+    ASSERT(n_bulk == 1 && n_raster <= WORK_MAX_RASTER);
     *p = (work_pool){0};
-    if (n_bulk != 1 || n_raster > WORK_MAX_RASTER)
-        return -1;
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
         atomic_init(&p->slots[i].epoch, 1u);
     p->n_bulk = n_bulk;
@@ -214,31 +221,30 @@ void work_pool_shutdown(work_pool *p)
 const os_wake *work_pool_wake(const work_pool *p) { return p->active ? &p->wake : NULL; }
 uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker)
 {
-    return worker < WORK_MAX_MAILBOXES ?
-        atomic_load_explicit(&p->worker_ids[worker], memory_order_acquire) : 0;
+    ASSERT(worker < WORK_MAX_MAILBOXES);
+    return atomic_load_explicit(&p->worker_ids[worker], memory_order_acquire);
 }
 
 work_handle work_submit(work_pool *p, work_job job)
 {
     work_handle h = {0, 0};
-    /* Preserve the original single-submit class interpretation. */
-    if (job.cls != WORK_FOREGROUND)
-        job.cls = job.cls == WORK_BULK ? WORK_BULK : WORK_RASTER;
     (void)work_submit_batch(p, &job, 1, &h);
     return h;
 }
 
 int work_prioritize(work_pool *p, work_handle h)
 {
-    if (!p->active || p->shutting_down || !p->foreground_enabled ||
-        h.slot >= WORK_MAX_JOBS || !h.epoch || h.epoch == UINT32_MAX) return -1;
+    assert_handle(h);
+    if (!p->active || !h.epoch) return -1;
+    ASSERT(p->foreground_enabled);
     os_mutex_lock(&p->mu);
     work_slot *s = &p->slots[h.slot];
-    if (atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch ||
-        (s->job.cls != WORK_BULK && s->job.cls != WORK_FOREGROUND)) {
+    if (atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch) {
         os_mutex_unlock(&p->mu);
         return -1;
     }
+    /* The caller chose the live lease's class at submit. */
+    ASSERT(s->job.cls != WORK_RASTER);
     if (s->job.cls == WORK_FOREGROUND) {
         os_mutex_unlock(&p->mu);
         return 0;
@@ -271,16 +277,18 @@ int work_prioritize(work_pool *p, work_handle h)
 int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles)
 {
     if (count == 0) return 0;
-    if (count > WORK_MAX_JOBS || jobs == NULL || handles == NULL ||
-        !p->active || p->shutting_down)
+    ASSERT(count <= WORK_MAX_JOBS && jobs != NULL && handles != NULL);
+    /* An init that failed on resources leaves the pool inactive. */
+    if (!p->active)
         return -1;
     uint32_t needed[3] = {0};
     for (size_t j = 0; j < count; j++) {
-        if (jobs[j].fn == NULL ||
-            (jobs[j].cls != WORK_BULK && jobs[j].cls != WORK_RASTER && jobs[j].cls != WORK_FOREGROUND) ||
-            (jobs[j].cls == WORK_RASTER && p->n_workers <= p->n_bulk) ||
-            (jobs[j].cls == WORK_FOREGROUND && !p->foreground_enabled))
-            return -1;
+        /* A class the caller did not configure is a caller bug. */
+        ASSERT(jobs[j].fn != NULL);
+        ASSERT(jobs[j].cls == WORK_BULK || jobs[j].cls == WORK_RASTER ||
+               jobs[j].cls == WORK_FOREGROUND);
+        ASSERT(jobs[j].cls != WORK_RASTER || p->n_workers > p->n_bulk);
+        ASSERT(jobs[j].cls != WORK_FOREGROUND || p->foreground_enabled);
         needed[(uint32_t)jobs[j].cls]++;
     }
     os_mutex_lock(&p->mu);
@@ -363,15 +371,16 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
 
 bool work_handle_finished(const work_pool *p, work_handle h)
 {
-    if (h.epoch == 0 || h.epoch == UINT32_MAX || h.slot >= WORK_MAX_JOBS || !p->active)
+    assert_handle(h);
+    if (h.epoch == 0 || !p->active)
         return true;
     return atomic_load_explicit(&p->slots[h.slot].finished_epoch, memory_order_acquire) >= h.epoch;
 }
 
 void work_cancel(work_pool *p, work_handle h)
 {
-    if (!p->active || p->shutting_down || h.epoch == 0 ||
-        h.epoch == UINT32_MAX || h.slot >= WORK_MAX_JOBS)
+    assert_handle(h);
+    if (!p->active || h.epoch == 0)
         return;
     os_mutex_lock(&p->mu);
     work_slot *s = &p->slots[h.slot];
@@ -469,7 +478,8 @@ bool work_mailbox_pending(const work_pool *p)
 int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
     void (*cb)(const work_msg *, void *), void *ud)
 {
-    if (h.slot >= WORK_MAX_JOBS || h.epoch == 0 || h.epoch == UINT32_MAX) return -1;
+    assert_handle(h);
+    if (h.epoch == 0) return -1;
     work_slot *s = &p->slots[h.slot];
     if (cb == NULL) {
         if (s->receive_epoch == h.epoch && s->receive_generation == generation) {
@@ -478,7 +488,7 @@ int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
         }
         return 0;
     }
-    if (!p->active || p->shutting_down ||
+    if (!p->active ||
         atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch ||
         s->job.generation != generation)
         return -1;
@@ -546,7 +556,8 @@ static void mailbox_end_drain(work_pool *p)
 size_t work_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
                                   void *ud, size_t max_messages, uint64_t deadline_ns)
 {
-    if (p->draining || cb == NULL) return 0;
+    ASSERT(cb != NULL);
+    if (p->draining) return 0;
     p->draining = true;
     mailbox_clear_notification(p);
     size_t n = 0, examined = 0;
@@ -582,7 +593,9 @@ size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), vo
 size_t work_mailbox_receive_bounded(work_pool *p, work_handle handle, uint32_t generation,
     void (*cb)(const work_msg *, void *), void *ud, size_t max_messages, uint64_t deadline_ns)
 {
-    if (p->draining || cb == NULL || handle.slot >= WORK_MAX_JOBS || !handle.epoch)
+    ASSERT(cb != NULL);
+    assert_handle(handle);
+    if (p->draining || !handle.epoch)
         return 0;
     work_slot *selected = &p->slots[handle.slot];
     /* A reused slot cannot have outstanding messages from its old lease. */

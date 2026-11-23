@@ -76,14 +76,17 @@ static int coordinate(const char *s, uint32_t *out)
 }
 void ipc_args_fini(ipc_args *args)
 {
-    if(args==NULL) return;
+    ASSERT(args != NULL);
     base_arena_free(&args->arena); memset(args,0,sizeof *args);
 }
 ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
 {
-    if(out==NULL) return IPC_INVALID;
+    ASSERT(out != NULL && argv != NULL);
+    /* The kernel passes argv[0..argc-1] non-NULL. argc 0 is an exec with an
+     * empty argv (Linux before 5.18 delivers it): input, not a caller bug. */
+    for(int i=0;i<argc;i++) ASSERT(argv[i] != NULL);
     memset(out,0,sizeof *out);
-    if(argc<1 || argv==NULL) return IPC_INVALID;
+    if(argc<1) return IPC_INVALID;
     if(base_arena_init(&out->arena,2u*IPC_MAX_WIRE)!=0) return IPC_IO;
     ipc_result rc=IPC_OK; char cwd[IPC_PATH_CAP];
     if(os_cwd(cwd,sizeof cwd)!=OS_OK) { rc=IPC_IO; goto fail; }
@@ -92,7 +95,6 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
     bool options=true;
     for(int i=1;i<argc;i++) {
         const char *arg=argv[i];
-        if(arg==NULL) { rc=IPC_INVALID; goto fail; }
         if(options && strcmp(arg,"--")==0) { options=false; continue; }
         if(options && strcmp(arg,"--wait")==0) { out->request.wait=true; continue; }
         if(options && strcmp(arg,"--new-instance")==0) { out->request.new_instance=true; continue; }
@@ -107,7 +109,7 @@ ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out)
                 const char *value=arg+flag_len;
                 if(*value=='=') value++;
                 else {
-                    if(i+1>=argc || !argv[i+1] || !strncmp(argv[i+1],"--",strlen("--"))) { rc=IPC_INVALID; goto fail; }
+                    if(i+1>=argc || !strncmp(argv[i+1],"--",strlen("--"))) { rc=IPC_INVALID; goto fail; }
                     value=argv[++i];
                 }
                 if(strlen(value)>=IPC_PATH_CAP) { rc=IPC_LIMIT; goto fail; }
@@ -161,7 +163,7 @@ static bool activation_text(const char *s)
 }
 ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id)
 {
-    if(args==NULL) return IPC_INVALID;
+    ASSERT(args != NULL);
     args->request.activation_token=args->request.startup_id=NULL;
     /* The block must fit beside the paths and stdin already read (stdin takes
      * every byte of the wire that remains); otherwise drop it, not the file. */
@@ -176,7 +178,8 @@ ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char
 }
 ipc_result ipc_args_read_stdin(ipc_args *args, int fd)
 {
-    if(args==NULL || !args->request.has_stdin || args->request.stdin_data!=NULL) return IPC_INVALID;
+    /* Once, after a parse that saw '-'. */
+    ASSERT(args != NULL && args->request.has_stdin && args->request.stdin_data == NULL);
     size_t cap=IPC_MAX_WIRE-24u-strlen(args->request.cwd)-1u;
     for(size_t i=0;i<args->request.count;i++) cap-=12u+strlen(args->request.paths[i].path)+1u;
     uint8_t *data=base_arena_alloc(&args->arena,cap,1);

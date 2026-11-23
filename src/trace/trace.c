@@ -50,7 +50,7 @@ int trace_thread_register(void) {
 
 void trace_thread_release(void) {
     trace_ring *r = tl_ring;
-    if (r == NULL) return;
+    ASSERT(r != NULL);
     uint32_t bit = UINT32_C(1) << (r - g_rings);
     tl_ring = NULL;
     /* Bitmap updates are RMWs, preserving release sequences across slots. */
@@ -169,8 +169,8 @@ static inline trace_input_rec *in_slot(uint64_t t0_ns, enum trace_in_kind kind) 
 
 void trace_input_key(uint64_t t0_ns, enum trace_in_kind kind, uint32_t keysym, uint32_t state,
                      int repeat, const char *utf8, size_t utf8_len) {
+    ASSERT(utf8 != NULL || utf8_len == 0);
     trace_input_rec *r = in_slot(t0_ns, kind);
-    if (utf8 == NULL) utf8_len = 0;
     if (utf8_len > sizeof r->p.key.utf8) utf8_len = sizeof r->p.key.utf8;
     r->p.key.keysym = keysym;
     r->p.key.state = state;

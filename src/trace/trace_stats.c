@@ -105,7 +105,8 @@ static int compare_ns(const void *a, const void *b) {
 }
 
 uint64_t trace_fmt_pct(uint64_t *values, size_t n, unsigned pct) {
-    if (n == 0 || pct == 0 || pct > 100) return 0;
+    ASSERT(pct >= 1 && pct <= 100);
+    if (n == 0) return 0;
     sort(values, n, sizeof values[0], compare_ns);
     /* ceil(n * pct / 100), expressed without overflowing the product. */
     size_t rank = n / 100u * pct + (n % 100u * pct + 99u) / 100u;

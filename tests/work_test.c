@@ -1,10 +1,12 @@
 #include "work/work.h"
 #include "base/base.h"
 #include "trace/trace.h"
+#include "assert_death.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -70,7 +72,7 @@ os_err __wrap_os_mutex_init(os_mutex *m)
 void __wrap_os_mutex_destroy(os_mutex *m)
 {
     if (m == &pool.mu) {
-        BASE_ASSERT(mutex_live);
+        ASSERT(mutex_live);
         mutex_live = false;
     }
     __real_os_mutex_destroy(m);
@@ -79,7 +81,7 @@ void __wrap_os_mutex_destroy(os_mutex *m)
 void __wrap_os_mutex_lock(os_mutex *m)
 {
     /* mutex_live changes only before worker creation or after all joins. */
-    if (m == &pool.mu) BASE_ASSERT(mutex_live);
+    if (m == &pool.mu) ASSERT(mutex_live);
     __real_os_mutex_lock(m);
 }
 
@@ -104,7 +106,7 @@ void __wrap_os_cond_destroy(os_cond *c)
 {
     bool *live = condition_live(c);
     if (live) {
-        BASE_ASSERT(*live);
+        ASSERT(*live);
         *live = false;
     }
     __real_os_cond_destroy(c);
@@ -150,7 +152,7 @@ static void wait_finished(work_handle h)
     /* Same hang bound as the v1 per-job wait. */
     uint64_t end = os_now_ns() + 5000000000ull;
     while (!work_handle_finished(&pool, h)) {
-        BASE_ASSERT(os_now_ns() < end);
+        ASSERT(os_now_ns() < end);
         sleep_ms(1);
     }
 }
@@ -267,8 +269,6 @@ static void test_epoch(void)
     CHECK(atomic_load(&pool.slots[old.slot].epoch) == UINT32_MAX);
     if (init_pool(0)) {
         for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) atomic_store(&pool.slots[i].epoch, UINT32_MAX);
-        work_cancel(&pool, (work_handle){0, UINT32_MAX});
-        CHECK(atomic_load(&pool.slots[0].epoch) == UINT32_MAX);
         CHECK(work_submit(&pool, (work_job){job_noop, &f, 0, WORK_BULK}).epoch == 0);
         work_pool_shutdown(&pool);
         for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) CHECK(atomic_load(&pool.slots[i].epoch) == UINT32_MAX);
@@ -329,10 +329,6 @@ static void check_init_errors(int (*init)(work_pool *, uint32_t, uint32_t),
         CHECK(stage == 1 || (wake_fd >= 0 && fcntl(wake_fd, F_GETFD) == -1 && errno == EBADF));
         work_pool_shutdown(&pool);
     }
-    CHECK(init(&pool, 0, 0) == -1 && work_pool_wake(&pool) == NULL);
-    work_pool_shutdown(&pool);
-    CHECK(init(&pool, 1, WORK_MAX_RASTER + 1u) == -1 && work_pool_wake(&pool) == NULL);
-    work_pool_shutdown(&pool);
     CHECK(init(&pool, 1, 2) == 0);
     work_pool_shutdown(&pool);
 }
@@ -433,7 +429,6 @@ static void test_reservations(void)
     int before = atomic_load(&fails);
     if (!init_pool(0)) return;
     fixture f = {.n = 3}, noop = {0};
-    CHECK(work_submit(&pool, (work_job){job_noop, &noop, 0, WORK_RASTER}).epoch == 0);
     work_handle a = work_submit(&pool, (work_job){job_pub, &f, 0, WORK_BULK});
     CHECK(a.epoch); wait_finished(a);
     work_handle b = work_submit(&pool, (work_job){job_noop, &noop, 0, WORK_BULK});
@@ -681,11 +676,11 @@ static void test_trace_pool_lifetimes(void)
 
     char path[] = "build/work-trace-XXXXXX";
     int fd = mkstemp(path);
-    BASE_ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
     os_file file = os_file_from_fd(fd);
-    BASE_ASSERT(trace_dump(&file) == 0);
+    ASSERT(trace_dump(&file) == 0);
     trace_loaded loaded;
-    BASE_ASSERT(trace_fmt_load_dump(&file, &loaded) == 0);
+    ASSERT(trace_fmt_load_dump(&file, &loaded) == 0);
     size_t seen = 0;
     for (size_t i = 0; i < loaded.nrecs; i++) {
         const trace_rec *rec = &loaded.recs[i];
@@ -715,10 +710,23 @@ static void test_foreground_init_errors(void);
 static void test_continuations(void);
 static void test_foreground_priority(void);
 static bool init_foreground_pool(uint32_t raster);
+/* The pool shape is the caller's configuration: n_bulk != 1 is a caller bug (A15). */
+static void init_two_bulk(void)
+{
+    (void)work_pool_init(&pool, 2, 0);
+}
+static void test_precondition_death(void)
+{
+    int before = atomic_load(&fails);
+    CHECK(assert_death(init_two_bulk, "src/work/work.c", "n_bulk == 1 && n_raster <= WORK_MAX_RASTER"));
+    result("precondition_death", before);
+}
+
 int main(int argc, char **argv)
 {
+    /* The death case runs first, before any worker thread exists. */
     struct test { const char *name; void (*fn)(void); } tests[] = {
-        {"1", test_recursive}, {"2", test_alignment}, {"3", test_epoch},
+        {"death", test_precondition_death}, {"1", test_recursive}, {"2", test_alignment}, {"3", test_epoch},
         {"4", test_shutdown}, {"5", test_closed_submit}, {"6", test_init_errors},
         {"7", test_churn}, {"8", test_slice}, {"15", test_live_ordering},
         {"15", test_full_wrap}, {"15", test_state_machine},
@@ -1093,18 +1101,6 @@ static void test_batch_contracts(void)
     CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
     CHECK(memcmp(saved, handles, sizeof saved) == 0 && atomic_load(&visible.ran) == 0);
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
-    jobs[3].fn = NULL;
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
-    CHECK(memcmp(saved, handles, sizeof saved) == 0);
-    jobs[3].fn = job_batch_visible;
-    jobs[3].cls = WORK_RASTER;
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
-    jobs[3].cls = (work_class)42;
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
-    jobs[3].cls = WORK_BULK;
-    CHECK(work_submit_batch(&pool, NULL, 4, handles) == -1);
-    CHECK(work_submit_batch(&pool, jobs, 4, NULL) == -1);
-    CHECK(work_submit_batch(&pool, jobs, WORK_MAX_JOBS + 1u, handles) == -1);
     CHECK(work_submit_batch(NULL, NULL, 0, NULL) == 0);
     CHECK(work_submit_batch(&pool, jobs, WORK_MAX_JOBS, handles) == 0);
     (void)wait_value(&visible.ran, WORK_MAX_JOBS);
@@ -1259,14 +1255,6 @@ static void test_foreground_progress(void)
 static void test_foreground_contracts(void)
 {
     int before = atomic_load(&fails);
-    if (!init_pool(1)) return;
-    fixture unused = {0};
-    work_job unavailable = {job_noop, &unused, 0, WORK_FOREGROUND};
-    work_handle unchanged = {UINT32_MAX, UINT32_MAX};
-    CHECK(work_submit(&pool, unavailable).epoch == 0);
-    CHECK(work_submit_batch(&pool, &unavailable, 1, &unchanged) == -1);
-    CHECK(unchanged.slot == UINT32_MAX && unchanged.epoch == UINT32_MAX);
-    work_pool_shutdown(&pool);
     if (!init_foreground_pool(1)) return;
     CHECK(pool.n_workers == 2 && pool.foreground_started);
     fixture blocked = {0}, queued = {0}, pub = {.n = 1};
@@ -1325,7 +1313,6 @@ static void test_foreground_cancel_shutdown(void)
 {
     int before = atomic_load(&fails);
     if (!init_foreground_pool(0)) return;
-    CHECK(work_submit(&pool, (work_job){job_noop, NULL, 0, WORK_RASTER}).epoch == 0);
     fixture blocked = {0}, queued[5] = {{0}};
     work_handle blocker = work_submit(&pool, (work_job){job_block, &blocked, 0, WORK_FOREGROUND});
     CHECK(blocker.epoch); (void)wait_value(&blocked.started, 1);

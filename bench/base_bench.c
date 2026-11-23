@@ -2,6 +2,8 @@
 #include "os/os.h"
 
 #include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* (M) Sample count inherited from the v1 base benchmark. The percentile
  * indices below are ranks in the sorted samples, with times in ns. */
@@ -17,14 +19,15 @@ int main(void)
 {
     base_pool pool;
     /* v1's 64-byte blocks represent one x86-64 cache line each. */
-    BASE_ASSERT(base_pool_init(&pool, 64, 64, 64) == 0);
+    ASSERT(base_pool_init(&pool, 64, 64, 64) == 0);
     uint64_t *samples = malloc(sizeof *samples * N_OPS);
-    BASE_ASSERT(samples != NULL);
+    ASSERT(samples != NULL);
 
     for (unsigned i = 0; i < N_OPS; i++) {
         uint64_t start = os_now_ns();
         void *block = base_pool_get(&pool);
-        BASE_ASSERT(block && base_pool_put(&pool, block));
+        ASSERT(block != NULL);
+        base_pool_put(&pool, block);
         samples[i] = os_now_ns() - start;
     }
     qsort(samples, N_OPS, sizeof *samples, cmp_u64);

@@ -1,6 +1,6 @@
 #include "trace/trace.h"
+#include "assert_death.h"
 
-#include <assert.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,15 +8,15 @@
 static void open_scratch(os_file *f) {
     char path[] = "build/trace-test-XXXXXX";
     int fd = mkstemp(path);
-    assert(fd >= 0 && os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
     *f = os_file_from_fd(fd);
 }
 
 static void read_test_bytes(os_file *f, char *data, size_t len) {
     os_stat st;
     size_t got;
-    assert(os_file_stat(f, &st) == OS_OK && st.size == len);
-    assert(os_file_pread(f, data, len, 0, &got) == OS_OK && got == len);
+    ASSERT(os_file_stat(f, &st) == OS_OK && st.size == len);
+    ASSERT(os_file_pread(f, data, len, 0, &got) == OS_OK && got == len);
 }
 
 static int load_bytes(const char *data, size_t len, trace_loaded *dump) {
@@ -24,7 +24,7 @@ static int load_bytes(const char *data, size_t len, trace_loaded *dump) {
     open_scratch(&f);
     if (len) {
         size_t written;
-        assert(os_file_write(&f, data, len, &written) == OS_OK && written == len);
+        ASSERT(os_file_write(&f, data, len, &written) == OS_OK && written == len);
     }
     int result = trace_fmt_load_dump(&f, dump);
     os_file_close(&f);
@@ -34,9 +34,9 @@ static int load_bytes(const char *data, size_t len, trace_loaded *dump) {
 static trace_loaded load_snapshot(void) {
     os_file f = OS_FILE_INIT;
     open_scratch(&f);
-    assert(trace_dump(&f) == 0);
+    ASSERT(trace_dump(&f) == 0);
     trace_loaded dump;
-    assert(trace_fmt_load_dump(&f, &dump) == 0);
+    ASSERT(trace_fmt_load_dump(&f, &dump) == 0);
     os_file_close(&f);
     return dump;
 }
@@ -49,17 +49,16 @@ typedef struct trace_writer {
 static void record_one(void *arg) {
     trace_writer *writer = arg;
     writer->slot = trace_thread_register();
-    assert(trace_thread_register() == writer->slot);
+    ASSERT(trace_thread_register() == writer->slot);
     trace_record_at(writer->frame, TRACE_T2_MUTATION_DONE, writer->frame);
-    trace_thread_release();
     trace_thread_release();
     trace_record_at(writer->frame, TRACE_RENDER_REJECTED, writer->frame);
 }
 
 static void joined_writer(trace_writer *writer) {
     os_thread thread;
-    assert(os_thread_start(&thread, record_one, writer) == OS_OK);
-    assert(os_thread_join(&thread) == OS_OK);
+    ASSERT(os_thread_start(&thread, record_one, writer) == OS_OK);
+    ASSERT(os_thread_join(&thread) == OS_OK);
 }
 
 static void test_sequential_reuse(void) {
@@ -76,11 +75,11 @@ static void test_sequential_reuse(void) {
     trace_loaded dump = load_snapshot();
     printf("trace sequential reuse: registered %u/%u; dumped %zu/%u\n",
            registered, THREADS, dump.nrecs, THREADS);
-    assert(registered == THREADS && dump.nrecs == THREADS);
+    ASSERT(registered == THREADS && dump.nrecs == THREADS);
     for (size_t i = 0; i < dump.nrecs; i++) {
-        assert(dump.recs[i].frame_id == i + 1u);
-        assert(dump.recs[i].ns == i + 1u);
-        assert(dump.recs[i].ev == TRACE_T2_MUTATION_DONE && dump.recs[i].thread == 0);
+        ASSERT(dump.recs[i].frame_id == i + 1u);
+        ASSERT(dump.recs[i].ns == i + 1u);
+        ASSERT(dump.recs[i].ev == TRACE_T2_MUTATION_DONE && dump.recs[i].thread == 0);
     }
     trace_fmt_dump_free(&dump);
 }
@@ -95,7 +94,7 @@ typedef enum trace_race_phase {
  * supplies the happens-before edge between the two writers. */
 static void record_first(void *arg) {
     _Atomic trace_race_phase *phase = arg;
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
     trace_record_at(1, TRACE_T0_INGRESS, 1);
     atomic_store_explicit(phase, TRACE_RACE_OCCUPIED, memory_order_relaxed);
     while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_CONTENDED) os_yield();
@@ -105,7 +104,7 @@ static void record_first(void *arg) {
 static void record_second(void *arg) {
     _Atomic trace_race_phase *phase = arg;
     while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_OCCUPIED) os_yield();
-    assert(trace_thread_register() == 1);
+    ASSERT(trace_thread_register() == 1);
     trace_record_at(2, TRACE_T1_DEQUEUE, 1);
     trace_thread_release();
     atomic_store_explicit(phase, TRACE_RACE_CONTENDED, memory_order_relaxed);
@@ -115,7 +114,7 @@ static void record_second(void *arg) {
         trace_thread_release();
         os_yield();
     }
-    assert(slot == 0);
+    ASSERT(slot == 0);
     trace_record_at(3, TRACE_T4_PRESENT_SUBMITTED, 1);
     trace_thread_release();
 }
@@ -124,22 +123,22 @@ static void test_concurrent_reuse(void) {
     trace_reset();
     _Atomic trace_race_phase phase = TRACE_RACE_START;
     os_thread a, b;
-    assert(os_thread_start(&a, record_first, &phase) == OS_OK);
-    assert(os_thread_start(&b, record_second, &phase) == OS_OK);
-    assert(os_thread_join(&a) == OS_OK);
-    assert(os_thread_join(&b) == OS_OK);
+    ASSERT(os_thread_start(&a, record_first, &phase) == OS_OK);
+    ASSERT(os_thread_start(&b, record_second, &phase) == OS_OK);
+    ASSERT(os_thread_join(&a) == OS_OK);
+    ASSERT(os_thread_join(&b) == OS_OK);
 
     trace_loaded dump = load_snapshot();
-    assert(dump.nrecs == 3);
-    assert(dump.recs[0].thread == 0 && dump.recs[0].ns == 1);
-    assert(dump.recs[1].thread == 0 && dump.recs[1].ns == 3);
-    assert(dump.recs[2].thread == 1 && dump.recs[2].ns == 2);
+    ASSERT(dump.nrecs == 3);
+    ASSERT(dump.recs[0].thread == 0 && dump.recs[0].ns == 1);
+    ASSERT(dump.recs[1].thread == 0 && dump.recs[1].ns == 3);
+    ASSERT(dump.recs[2].thread == 1 && dump.recs[2].ns == 2);
     trace_fmt_dump_free(&dump);
 }
 
 static void hold_slot(void *arg) {
     atomic_uint *ready = arg;
-    assert(trace_thread_register() >= 0);
+    ASSERT(trace_thread_register() >= 0);
     atomic_fetch_add_explicit(ready, 1u, memory_order_relaxed);
     /* Hold the slot until the main thread has checked full-pool behavior. */
     while (atomic_load_explicit(ready, memory_order_relaxed) <= TRACE_MAX_THREADS) os_yield();
@@ -151,40 +150,40 @@ static void test_live_capacity(void) {
     atomic_uint ready = 0;
     os_thread threads[TRACE_MAX_THREADS];
     for (size_t i = 0; i < TRACE_MAX_THREADS; i++) {
-        assert(os_thread_start(&threads[i], hold_slot, &ready) == OS_OK);
+        ASSERT(os_thread_start(&threads[i], hold_slot, &ready) == OS_OK);
     }
     while (atomic_load_explicit(&ready, memory_order_relaxed) != TRACE_MAX_THREADS) os_yield();
-    assert(trace_thread_register() == -1);
+    ASSERT(trace_thread_register() == -1);
     atomic_fetch_add_explicit(&ready, 1u, memory_order_relaxed);
     for (size_t i = 0; i < TRACE_MAX_THREADS; i++) {
-        assert(os_thread_join(&threads[i]) == OS_OK);
+        ASSERT(os_thread_join(&threads[i]) == OS_OK);
     }
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
     trace_thread_release();
 }
 
 static void test_sparse_dump_and_reset(void) {
     trace_reset();
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
     trace_record_at(1, TRACE_T2_MUTATION_DONE, 1);
     trace_reset();
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
     trace_writer writer = {.frame = 2};
     joined_writer(&writer);
-    assert(writer.slot == 1);
+    ASSERT(writer.slot == 1);
     trace_thread_release();
 
     trace_loaded dump = load_snapshot();
-    assert(dump.nrecs == 1);
-    assert(dump.recs[0].thread == 1 && dump.recs[0].frame_id == writer.frame);
-    assert(dump.has_input && dump.nin == 0 && dump.in_dropped == 0);
+    ASSERT(dump.nrecs == 1);
+    ASSERT(dump.recs[0].thread == 1 && dump.recs[0].frame_id == writer.frame);
+    ASSERT(dump.has_input && dump.nin == 0 && dump.in_dropped == 0);
     trace_fmt_dump_free(&dump);
 
     trace_reset();
     trace_record_at(3, TRACE_STARTUP_FIRST_SUBMIT, 0);
     dump = load_snapshot();
-    assert(dump.nrecs == 1 && dump.recs[0].thread == 0);
-    assert(dump.recs[0].ev == TRACE_STARTUP_FIRST_SUBMIT && dump.recs[0].ns == 3);
+    ASSERT(dump.nrecs == 1 && dump.recs[0].thread == 0);
+    ASSERT(dump.recs[0].ev == TRACE_STARTUP_FIRST_SUBMIT && dump.recs[0].ns == 3);
     trace_fmt_dump_free(&dump);
 }
 
@@ -192,7 +191,7 @@ static void test_wrap(void) {
     trace_reset();
     trace_record_at(1, TRACE_STARTUP_PROCESS_START, 0);
     trace_record_at(2, TRACE_STARTUP_PROCESS_START, 0);
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
 
     /* One past capacity drops one event, plus one slot-zero startup stamp. */
     for (uint32_t i = 0; i <= TRACE_RING_CAP; i++) trace_record_at(i, TRACE_T0_INGRESS, i);
@@ -200,16 +199,16 @@ static void test_wrap(void) {
     for (uint32_t i = 0; i <= TRACE_INPUT_CAP; i++) trace_input_resize(i, i, i);
 
     trace_loaded dump = load_snapshot();
-    assert(dump.nrecs == TRACE_RING_CAP && dump.recs[0].ns == 1);
-    assert(dump.recs[0].ev == TRACE_STARTUP_PROCESS_START && dump.recs[0].frame_id == 0);
+    ASSERT(dump.nrecs == TRACE_RING_CAP && dump.recs[0].ns == 1);
+    ASSERT(dump.recs[0].ev == TRACE_STARTUP_PROCESS_START && dump.recs[0].frame_id == 0);
     for (size_t i = 1; i < dump.nrecs; i++) {
-        assert(dump.recs[i].ns == i + 1u && dump.recs[i].frame_id == i + 1u);
-        assert(dump.recs[i].ev == TRACE_T0_INGRESS && dump.recs[i].thread == 0);
+        ASSERT(dump.recs[i].ns == i + 1u && dump.recs[i].frame_id == i + 1u);
+        ASSERT(dump.recs[i].ev == TRACE_T0_INGRESS && dump.recs[i].thread == 0);
     }
-    assert(dump.nin == TRACE_INPUT_CAP && dump.in_dropped == 1);
+    ASSERT(dump.nin == TRACE_INPUT_CAP && dump.in_dropped == 1);
     for (size_t i = 0; i < dump.nin; i++) {
-        assert(dump.in[i].seq == i + 1u && dump.in[i].t0_ns == i + 1u);
-        assert(dump.in[i].kind == TRACE_IN_RESIZE && dump.in[i].p.resize.w == i + 1u);
+        ASSERT(dump.in[i].seq == i + 1u && dump.in[i].t0_ns == i + 1u);
+        ASSERT(dump.in[i].kind == TRACE_IN_RESIZE && dump.in[i].p.resize.w == i + 1u);
     }
     trace_fmt_dump_free(&dump);
 }
@@ -227,13 +226,13 @@ static void test_latency_pairs(void) {
     uint64_t lat[3];
     size_t n;
     size_t nrecs = sizeof recs / sizeof recs[0];
-    assert(trace_fmt_latencies(recs, nrecs, TRACE_T0_INGRESS, TRACE_T4_PRESENT_SUBMITTED,
+    ASSERT(trace_fmt_latencies(recs, nrecs, TRACE_T0_INGRESS, TRACE_T4_PRESENT_SUBMITTED,
                               lat, sizeof lat / sizeof lat[0], &n) == 0);
-    assert(n == 3);
-    assert(trace_fmt_pct(lat, n, 50) == 2 && trace_fmt_pct(lat, n, 99) == 3);
-    assert(trace_fmt_latencies(recs, nrecs, TRACE_T0_INGRESS, TRACE_T4_PRESENT_SUBMITTED,
+    ASSERT(n == 3);
+    ASSERT(trace_fmt_pct(lat, n, 50) == 2 && trace_fmt_pct(lat, n, 99) == 3);
+    ASSERT(trace_fmt_latencies(recs, nrecs, TRACE_T0_INGRESS, TRACE_T4_PRESENT_SUBMITTED,
                               lat, sizeof lat / sizeof lat[0] - 1u, &n) == -1);
-    assert(n == 0);
+    ASSERT(n == 0);
 }
 
 typedef struct trace_sink_cursor {
@@ -243,7 +242,7 @@ typedef struct trace_sink_cursor {
 
 static void replay_one(const trace_input_rec *rec, void *arg) {
     trace_sink_cursor *cursor = arg;
-    assert(rec == cursor->next);
+    ASSERT(rec == cursor->next);
     cursor->next++;
     cursor->delivered++;
 }
@@ -256,19 +255,19 @@ static void test_timed_replay(void) {
     trace_replay_opts opts = {.speed = 2.0};
     trace_sink_cursor cursor = {.next = input};
     uint64_t before = os_now_ns();
-    assert(trace_replay(input, sizeof input / sizeof input[0], &opts, replay_one, &cursor) == 0);
-    assert(cursor.delivered == 2 && os_now_ns() - before >= gap / 2);
+    ASSERT(trace_replay(input, sizeof input / sizeof input[0], &opts, replay_one, &cursor) == 0);
+    ASSERT(cursor.delivered == 2 && os_now_ns() - before >= gap / 2);
 
     opts.speed = 0.5;
     input[1].t0_ns = UINT64_MAX;
     cursor = (trace_sink_cursor){.next = input};
-    assert(trace_replay(input, sizeof input / sizeof input[0], &opts, replay_one, &cursor) == -1);
-    assert(cursor.delivered == 1);  /* the second deadline cannot be represented */
+    ASSERT(trace_replay(input, sizeof input / sizeof input[0], &opts, replay_one, &cursor) == -1);
+    ASSERT(cursor.delivered == 1);  /* the second deadline cannot be represented */
 }
 
 static void record_fixture_events(void) {
     trace_reset();
-    assert(trace_thread_register() == 0);
+    ASSERT(trace_thread_register() == 0);
     trace_record_at(1, TRACE_STARTUP_PROCESS_START, 0);
     trace_record_at(2, TRACE_T0_INGRESS, 1);
     trace_record_at(3, TRACE_T4_PRESENT_SUBMITTED, 1);
@@ -296,52 +295,52 @@ enum {
 
 static void test_legacy_v1_loads(char fixture[FIXTURE_SIZE]) {
     os_file f = OS_FILE_INIT;
-    assert(os_file_open(&f, "fuzz/corpus/trace/v1-6fec2e8.edtrace", OS_OPEN_READ) == OS_OK);
+    ASSERT(os_file_open(&f, "fuzz/corpus/trace/v1-6fec2e8.edtrace", OS_OPEN_READ) == OS_OK);
     read_test_bytes(&f, fixture, FIXTURE_SIZE);
     trace_loaded dump;
-    assert(trace_fmt_load_dump(&f, &dump) == 0);
+    ASSERT(trace_fmt_load_dump(&f, &dump) == 0);
     char first_byte;
     size_t got;
-    assert(os_file_read(&f, &first_byte, 1, &got) == OS_OK && got == 1);
-    assert(first_byte == fixture[0]);  /* loader leaves the caller's position alone */
+    ASSERT(os_file_read(&f, &first_byte, 1, &got) == OS_OK && got == 1);
+    ASSERT(first_byte == fixture[0]);  /* loader leaves the caller's position alone */
     os_file_close(&f);
-    assert(dump.nrecs == 3 && dump.recs[0].ev == TRACE_STARTUP_PROCESS_START);
-    assert(dump.recs[1].ns == 2 && dump.recs[1].ev == TRACE_T0_INGRESS);
-    assert(dump.recs[2].ns == 3 && dump.recs[2].ev == TRACE_T4_PRESENT_SUBMITTED);
-    assert(dump.has_input && dump.in_dropped == 0 && dump.nin == FIXTURE_INPUT_COUNT);
+    ASSERT(dump.nrecs == 3 && dump.recs[0].ev == TRACE_STARTUP_PROCESS_START);
+    ASSERT(dump.recs[1].ns == 2 && dump.recs[1].ev == TRACE_T0_INGRESS);
+    ASSERT(dump.recs[2].ns == 3 && dump.recs[2].ev == TRACE_T4_PRESENT_SUBMITTED);
+    ASSERT(dump.has_input && dump.in_dropped == 0 && dump.nin == FIXTURE_INPUT_COUNT);
     for (size_t i = 0; i < dump.nin; i++) {
-        assert(dump.in[i].seq == i && dump.in[i].kind == i + 1u);
+        ASSERT(dump.in[i].seq == i && dump.in[i].kind == i + 1u);
     }
-    assert(dump.in[0].p.key.utf8_len == sizeof dump.in[0].p.key.utf8);
-    assert(memcmp(dump.in[0].p.key.utf8, "abcdefgh", sizeof dump.in[0].p.key.utf8) == 0);
-    assert(dump.in[2].p.pointer.x == -5 && dump.in[5].p.wheel.dy == -256);
-    assert(dump.in[6].p.resize.w == 80 && dump.in[7].p.focus.focused == 0);
-    assert(dump.in[8].p.clipboard.length == 4 && dump.in[9].p.filechange.watch_id == 7);
+    ASSERT(dump.in[0].p.key.utf8_len == sizeof dump.in[0].p.key.utf8);
+    ASSERT(memcmp(dump.in[0].p.key.utf8, "abcdefgh", sizeof dump.in[0].p.key.utf8) == 0);
+    ASSERT(dump.in[2].p.pointer.x == -5 && dump.in[5].p.wheel.dy == -256);
+    ASSERT(dump.in[6].p.resize.w == 80 && dump.in[7].p.focus.focused == 0);
+    ASSERT(dump.in[8].p.clipboard.length == 4 && dump.in[9].p.filechange.watch_id == 7);
 
     trace_sink_cursor cursor = {.next = dump.in};
     const trace_replay_opts fast = {.fast = 1, .speed = 1.0};
-    assert(trace_replay(dump.in, dump.nin, &fast, replay_one, &cursor) == 0);
-    assert(cursor.delivered == dump.nin);
+    ASSERT(trace_replay(dump.in, dump.nin, &fast, replay_one, &cursor) == 0);
+    ASSERT(cursor.delivered == dump.nin);
     trace_fmt_dump_free(&dump);
 
     /* Before INPT was introduced the dump ended at this ring boundary. */
-    assert(load_bytes(fixture, TIMING_END, &dump) == 0);
-    assert(dump.nrecs == 3 && !dump.has_input && dump.in == NULL && dump.nin == 0);
+    ASSERT(load_bytes(fixture, TIMING_END, &dump) == 0);
+    ASSERT(dump.nrecs == 3 && !dump.has_input && dump.in == NULL && dump.nin == 0);
     trace_fmt_dump_free(&dump);
 
     record_fixture_events();
     open_scratch(&f);
-    assert(trace_dump(&f) == 0);
+    ASSERT(trace_dump(&f) == 0);
     char bytes[FIXTURE_SIZE];
     read_test_bytes(&f, bytes, sizeof bytes);
     os_file_close(&f);
-    assert(memcmp(bytes, fixture, FIXTURE_SIZE) == 0);
+    ASSERT(memcmp(bytes, fixture, FIXTURE_SIZE) == 0);
 }
 
 static void reject_bytes(const char *data, size_t len) {
     trace_loaded dump;
-    assert(load_bytes(data, len, &dump) == -1);
-    assert(dump.recs == NULL && dump.in == NULL && dump.nrecs == 0 &&
+    ASSERT(load_bytes(data, len, &dump) == -1);
+    ASSERT(dump.recs == NULL && dump.in == NULL && dump.nrecs == 0 &&
            dump.nin == 0 && !dump.has_input && dump.in_dropped == 0 && dump.storage.base == NULL);
 }
 
@@ -391,8 +390,16 @@ static void test_malformed(char fixture[FIXTURE_SIZE]) {
     reject_bytes(bytes, FIXTURE_SIZE);
 }
 
+/* A percentile outside 1..100 is a caller bug (A15). */
+static void percentile_zero(void) {
+    uint64_t value = 1;
+    (void)trace_fmt_pct(&value, 1, 0);
+}
+
 int main(void) {
     char fixture[FIXTURE_SIZE];
+    /* Before any thread exists: the death child forks a one-thread process. */
+    ASSERT(assert_death(percentile_zero, "src/trace/trace_stats.c", "pct >= 1 && pct <= 100"));
     test_sequential_reuse();
     test_concurrent_reuse();
     test_live_capacity();

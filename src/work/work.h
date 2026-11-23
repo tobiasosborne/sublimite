@@ -8,7 +8,9 @@
  * work_publish / work_should_stop: worker thread (inside a job) only.
  * No allocation here; the caller owns storage aligned to _Alignof(work_pool)
  * (64 bytes). Heap callers use aligned_alloc(_Alignof(work_pool), sizeof *p).
- * Idle workers sleep on a condvar (no wakeups when nothing is queued). */
+ * Idle workers sleep on a condvar (no wakeups when nothing is queued).
+ * Stated preconditions are ASSERTed (os.h, A15): a handle is a submit result,
+ * a job's class is one the pool was configured for, callbacks are non-NULL. */
 #ifndef WORK_WORK_H
 #define WORK_WORK_H
 
@@ -124,10 +126,11 @@ typedef struct work_pool {
     bool foreground_enabled, foreground_started;
 } work_pool;
 
-/* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success, -1 on
- * failure. Failure releases all initialized resources and leaves an inactive
- * pool safe for shutdown, refused submit/cancel, or another init. Never init
- * an active pool; shutdown first. */
+/* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success, -1 when
+ * an OS resource (wake, mutex, condition, thread) cannot be acquired. Failure
+ * releases all initialized resources and leaves an inactive pool safe for
+ * shutdown, refused submit/cancel, or another init. Never init an active
+ * pool; shutdown first. */
 int  work_pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster);
 /* Same lifecycle/error contract, plus one dedicated foreground worker and
  * mailbox. WORK_FOREGROUND never waits for a bulk/raster function to return,
@@ -150,11 +153,12 @@ void work_pool_shutdown(work_pool *p);
  * from the mailbox protocol. */
 const os_wake *work_pool_wake(const work_pool *p);
 /* os_thread_self identity for ownership diagnostics; zero before that worker
- * starts. Foreground uses WORK_FOREGROUND_WORKER. Never a native thread handle. */
+ * starts. worker < WORK_MAX_MAILBOXES; foreground uses WORK_FOREGROUND_WORKER.
+ * Never a native thread handle. */
 uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker);
 
-/* Returns handle with epoch 0 if the pool is full / shutting down, or all
- * otherwise free slots exhausted their identities. Slots retire before epoch
+/* Returns handle {0, 0} if the pool is full or inactive, or all otherwise
+ * free slots exhausted their identities. Slots retire before epoch
  * wrap. Handles belong to one initialized pool lifetime; discard all handles
  * before shutdown/reinitialization and never use them with another pool. */
 work_handle work_submit(work_pool *p, work_job job);
@@ -167,18 +171,20 @@ work_handle work_submit(work_pool *p, work_job job);
  * first migrated invocation, the UI must drain results from the old worker;
  * other foreground jobs remain runnable while that delivery is pending.
  * This preserves per-lease result order across the mailbox handoff. Returns -1
- * for an inactive pool, stale identity or raster lease; otherwise 0, including
- * an already finished valid lease. No allocation or additional slot. */
+ * for an inactive pool, the refused handle or a stale identity; otherwise 0,
+ * including an already finished valid lease. A live raster lease is a caller
+ * bug. No allocation or additional slot. */
 int work_prioritize(work_pool *p, work_handle h);
-/* UI-only atomic enqueue. Returns 0 on success, -1 on invalid arguments,
- * capacity/identity exhaustion, unavailable class, or inactive pool. count is
- * at most WORK_MAX_JOBS; zero succeeds without accessing jobs/handles/pool.
+/* UI-only atomic enqueue. Returns 0 on success, -1 on capacity/identity
+ * exhaustion or an inactive pool. count is at most WORK_MAX_JOBS; zero
+ * succeeds without accessing jobs/handles/pool. Every job has a non-NULL fn
+ * and a class the pool was configured for.
  * All available classes may appear, preserving input FIFO order within each class.
  * Failure changes no slots, queues, or output handles and starts no jobs.
  * Success fills handles in input order before any worker can dequeue the batch.
  * No allocation. Arrays must not overlap pool storage or each other. */
 int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles);
-/* UI-only physical lease acknowledgement. True for an invalid handle, after
+/* UI-only physical lease acknowledgement. True for the refused handle, after
  * shutdown, or once its worker has returned / queued cancellation removed it.
  * Cancellation alone does not finish a running lease. Valid across slot reuse
  * within the same initialized pool lifetime, whose identities never wrap. */
@@ -239,9 +245,9 @@ size_t work_mailbox_receive(work_pool *p, work_handle h, uint32_t generation,
  * matching validated messages here instead of their fallback callback, so a
  * shared-pool dispatcher cannot steal another client's result. Selective
  * receive uses the same handler when bound. Bind after submit, before any UI
- * pumping; worker publication may already have occurred. Returns -1 for a
- * stale/invalid binding. cb=NULL removes only this identity's binding (also
- * allowed after cancellation/shutdown). Unbind before freeing ud; do not
+ * pumping; worker publication may already have occurred. Returns -1 for the
+ * refused handle or a stale binding. cb=NULL removes only this identity's
+ * binding (also allowed after cancellation/shutdown). Unbind before freeing ud; do not
  * init/shutdown/free a bound receiver from inside its callback. */
 int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
     void (*cb)(const work_msg *, void *), void *ud);

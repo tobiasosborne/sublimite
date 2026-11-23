@@ -1,6 +1,9 @@
 #include "base/base.h"
 #include "trace/trace.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 static bool test_guard_active(void) {
     /* Force one real allocation at release optimization. */
     void *(*volatile allocate)(size_t) = malloc;

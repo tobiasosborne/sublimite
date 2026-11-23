@@ -56,7 +56,7 @@ typedef struct trace_rec {
 int trace_thread_register(void);
 
 /* Returns the calling thread's slot for reuse, retaining its bounded history.
- * A later owner appends to that slot. No effect without a registration. */
+ * A later owner appends to that slot. Only a registered thread releases. */
 void trace_thread_release(void);
 
 /* Records an event at the current monotonic time or at a supplied timestamp.
@@ -110,7 +110,8 @@ typedef struct trace_input_rec {
     } p;
 } trace_input_rec;
 
-/* Typed append helpers. t0_ns is the ingress timestamp. */
+/* Typed append helpers. t0_ns is the ingress timestamp. utf8 may be NULL
+ * only with utf8_len 0. */
 void trace_input_key(uint64_t t0_ns, enum trace_in_kind kind, uint32_t keysym, uint32_t state,
                      int repeat, const char *utf8, size_t utf8_len);   /* utf8 clipped to 8 bytes */
 void trace_input_pointer(uint64_t t0_ns, enum trace_in_kind kind, int32_t x, int32_t y,
@@ -143,7 +144,7 @@ void trace_fmt_dump_free(trace_loaded *dump);
  * is insufficient, returns -1 with *nlat == 0. */
 int trace_fmt_latencies(const trace_rec *recs, size_t n, enum trace_ev from,
                         enum trace_ev to, uint64_t *lat, size_t cap, size_t *nlat);
-/* Nearest rank, percentile in 1..100. Sorts in place. Empty input returns 0. */
+/* Nearest rank, pct in 1..100. Sorts in place. Empty input returns 0. */
 uint64_t trace_fmt_pct(uint64_t *values, size_t n, unsigned pct);
 
 /* Replay: delivers records to a sink with their original spacing (scaled by speed)
@@ -153,7 +154,8 @@ typedef struct trace_replay_opts {
     int fast;        /* nonzero: no waiting */
     double speed;    /* > 0 and finite; 2.0 halves the gaps */
 } trace_replay_opts;
-/* Returns 0 on success, -1 on bad arguments or an unrepresentable deadline. */
+/* opts and sink non-NULL, recs non-NULL unless n is 0. Returns 0 on success,
+ * -1 when a record's deadline is unrepresentable. */
 int trace_replay(const trace_input_rec *recs, size_t n, const trace_replay_opts *opts,
                  trace_input_sink sink, void *user);
 

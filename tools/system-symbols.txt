@@ -34,9 +34,9 @@ iswalpha               * # wide-character alphabetic classification
 iswdigit               * # wide-character digit classification
 iswspace               * # wide-character whitespace classification
 towlower               * # wide-character lowercase conversion
-# Any module: emitted by the toolchain or by assert, not chosen per call site.
+# Any module: emitted by the toolchain, not chosen per call site. <assert.h>
+# is not: the tree's one ASSERT lives in os (A15).
 _GLOBAL_OFFSET_TABLE_  * # ELF linker-generated GOT base, no runtime code
-__assert_fail          * # <assert.h> failure path; terminal, never returns
 __stack_chk_fail       * # compiler-inserted stack protector failure; terminal
 
 # os: the POSIX syscall boundary (docs/PLAN_V2.md section 2).
@@ -137,6 +137,7 @@ write                  os # sequential write or eventfd signal
 # exception to the os boundary (docs/decisions/v2-he7.22.md). The heap, stdio,
 # abort and dup lines go when Wave 3 hl supplies a base allocator
 # (docs/decisions/v2-he7.24.md).
+__assert_fail          vendor_ts # upstream <assert.h>: tree-sitter runtime and grammar scanner invariants
 __fprintf_chk          vendor_ts # fortified fprintf: dot-graph output, allocation-failure message
 __snprintf_chk         vendor_ts # fortified snprintf: ts_subtree_string node names
 __vsnprintf_chk        vendor_ts # fortified vsnprintf: ts_lexer debug log formatting

@@ -32,6 +32,9 @@ typedef enum ipc_result {
     IPC_OK = 0, IPC_EXISTS, IPC_INVALID, IPC_LIMIT, IPC_IO,
     IPC_PROTOCOL, IPC_TIMEOUT, IPC_BUSY, IPC_REJECTED
 } ipc_result;
+/* Pointer, descriptor and token arguments, and requests handed to the
+ * encoder, are preconditions ASSERTed (os.h, A15). Every ipc_result below
+ * reports something input, the environment, the peer or exhaustion caused. */
 /* Static descriptive text for command-line diagnostics; no allocation. */
 const char *ipc_result_string(ipc_result result);
 typedef struct ipc_path { const char *path; uint32_t line, col; } ipc_path;
@@ -70,7 +73,10 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd);
 ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id);
 void ipc_args_fini(ipc_args *args);
 /* Decoder borrows wire storage. Strings include a checked trailing NUL.
- * On any failure out is zeroed. Encoder never serializes new_instance.
+ * On any failure out is zeroed. The encoder takes a request built by
+ * ipc_parse_args (plus ipc_args_read_stdin / ipc_args_set_activation) or
+ * ipc_wire_decode, in storage disjoint from wire; it returns only IPC_OK or
+ * IPC_LIMIT, and never serializes new_instance.
  * Activation strings are serialized in a trailing block flagged by bit 2 of
  * the flags byte, its size in header bytes 6-7; a request without them is
  * byte-identical to the previous format, and the client resends in that form

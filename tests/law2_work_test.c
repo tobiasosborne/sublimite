@@ -1,6 +1,9 @@
 #include "base/base.h"
 #include "work/work.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 static bool guard_proven(void)
 {
     /* Force one counted allocation at release optimization, as in law2_trace_test. */
@@ -25,18 +28,18 @@ static void block_bulk(work_ctx *ctx)
 static void never_run(work_ctx *ctx)
 {
     (void)ctx;
-    BASE_ASSERT(false);
+    ASSERT(false);
 }
 
 static void publish(work_ctx *ctx)
 {
     work_msg msg = {.generation = ctx->generation};
-    BASE_ASSERT(work_publish(ctx, &msg));
+    ASSERT(work_publish(ctx, &msg));
 }
 
 static void count_message(const work_msg *msg, void *arg)
 {
-    BASE_ASSERT(msg->generation != 0);
+    ASSERT(msg->generation != 0);
     (*(size_t *)arg)++;
 }
 
@@ -44,9 +47,9 @@ static void finish(const work_pool *pool, work_handle h)
 {
     /* The v1 work-test per-job hang bound and poll cadence. */
     uint64_t deadline = os_now_ns() + 5000000000ull;
-    BASE_ASSERT(h.epoch);
+    ASSERT(h.epoch);
     while (!work_handle_finished(pool, h)) {
-        BASE_ASSERT(os_now_ns() < deadline);
+        ASSERT(os_now_ns() < deadline);
         os_sleep_ns(1000000);
     }
 }
@@ -56,13 +59,13 @@ int main(void)
     if (!guard_proven()) return EXIT_FAILURE;
 
     work_pool pool;
-    BASE_ASSERT(work_pool_init_foreground(&pool, 1, 1) == 0);
+    ASSERT(work_pool_init_foreground(&pool, 1, 1) == 0);
     _Atomic bool started = false;
     work_handle blocked = work_submit(&pool, (work_job){block_bulk, &started, 0, WORK_BULK});
-    BASE_ASSERT(blocked.epoch);
+    ASSERT(blocked.epoch);
     uint64_t deadline = os_now_ns() + 5000000000ull; /* same v1 hang bound */
     while (!atomic_load_explicit(&started, memory_order_acquire)) {
-        BASE_ASSERT(os_now_ns() < deadline);
+        ASSERT(os_now_ns() < deadline);
         os_sleep_ns(1000000);
     }
 
@@ -77,17 +80,17 @@ int main(void)
             {publish, NULL, gen, WORK_FOREGROUND},
         };
         work_handle handles[sizeof jobs / sizeof jobs[0]];
-        BASE_ASSERT(work_submit_batch(&pool, jobs, sizeof jobs / sizeof jobs[0], handles) == 0);
+        ASSERT(work_submit_batch(&pool, jobs, sizeof jobs / sizeof jobs[0], handles) == 0);
         work_cancel(&pool, handles[0]);
         work_cancel(&pool, handles[0]); /* repeated cancellation is harmless */
-        BASE_ASSERT(work_handle_finished(&pool, handles[0]));
+        ASSERT(work_handle_finished(&pool, handles[0]));
         finish(&pool, handles[1]);
         finish(&pool, handles[2]);
 
         if (gen > 1) {
             for (size_t i = 0; i < sizeof previous / sizeof previous[0]; i++) {
-                BASE_ASSERT(previous[i].slot == handles[i + 1].slot);
-                BASE_ASSERT(previous[i].epoch < handles[i + 1].epoch);
+                ASSERT(previous[i].slot == handles[i + 1].slot);
+                ASSERT(previous[i].epoch < handles[i + 1].epoch);
                 work_cancel(&pool, previous[i]);
             }
         }
@@ -95,15 +98,15 @@ int main(void)
         previous[1] = handles[2];
 
         size_t selected = 0, ordinary = 0;
-        BASE_ASSERT(work_mailbox_bind(&pool, handles[2], gen, count_message, &selected) == 0);
-        BASE_ASSERT(work_mailbox_receive_bounded(&pool, handles[2], gen, count_message,
+        ASSERT(work_mailbox_bind(&pool, handles[2], gen, count_message, &selected) == 0);
+        ASSERT(work_mailbox_receive_bounded(&pool, handles[2], gen, count_message,
                                                 &ordinary, WORK_MAILBOX_CAP, 0) == 1);
-        BASE_ASSERT(selected == 1 && ordinary == 0);
-        BASE_ASSERT(work_mailbox_bind(&pool, handles[2], gen, NULL, NULL) == 0);
+        ASSERT(selected == 1 && ordinary == 0);
+        ASSERT(work_mailbox_bind(&pool, handles[2], gen, NULL, NULL) == 0);
         if (gen % 2u == 0) work_cancel(&pool, handles[1]);
         size_t expected = gen % 2u;
-        BASE_ASSERT(work_mailbox_drain_bounded(&pool, count_message, &ordinary, 1, 0) == expected);
-        BASE_ASSERT(ordinary == expected && !work_mailbox_pending(&pool));
+        ASSERT(work_mailbox_drain_bounded(&pool, count_message, &ordinary, 1, 0) == expected);
+        ASSERT(ordinary == expected && !work_mailbox_pending(&pool));
     }
     work_cancel(&pool, blocked);
     finish(&pool, blocked);

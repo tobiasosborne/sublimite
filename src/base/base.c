@@ -17,12 +17,13 @@ static size_t align_up(size_t n, size_t align)
 static int reserve(void **out, size_t bytes)
 {
     size_t page = os_page_size();
-    if (bytes == 0 || bytes > SIZE_MAX - (page - 1)) return -1;
+    if (bytes > SIZE_MAX - (page - 1)) return -1;
     return os_vm_reserve(out, align_up(bytes, page)) == OS_OK ? 0 : -1;
 }
 
 int base_arena_init(base_arena *a, size_t size)
 {
+    ASSERT(size != 0);
     *a = (base_arena){0};
     void *mem;
     if (reserve(&mem, size) != 0) return -1;
@@ -33,7 +34,7 @@ int base_arena_init(base_arena *a, size_t size)
 
 void *base_arena_alloc(base_arena *a, size_t size, size_t align)
 {
-    if (!a->base || !is_pow2(align)) return NULL;
+    ASSERT(a->base != NULL && is_pow2(align));
     unsigned char *cursor = a->base + a->used;
     size_t padding = (size_t)(-(uintptr_t)cursor & (align - 1));
     size_t remaining = a->size - a->used;
@@ -46,7 +47,8 @@ base_arena_mark_t base_arena_mark(const base_arena *a) { return a->used; }
 
 void base_arena_reset_to_mark(base_arena *a, base_arena_mark_t mark)
 {
-    if (mark <= a->used) a->used = mark;
+    ASSERT(mark <= a->used);
+    a->used = mark;
 }
 
 void base_arena_reset(base_arena *a) { a->used = 0; }
@@ -59,9 +61,9 @@ void base_arena_free(base_arena *a)
 
 int base_pool_init(base_pool *p, size_t block_size, size_t block_align, size_t capacity)
 {
+    size_t page = os_page_size();
+    ASSERT(block_size != 0 && capacity != 0 && is_pow2(block_align) && block_align <= page);
     *p = (base_pool){0};
-    if (!block_size || !capacity || !is_pow2(block_align) || block_align > os_page_size())
-        return -1;
     if (block_size < sizeof(void *)) block_size = sizeof(void *);
     if (block_align < _Alignof(void *)) block_align = _Alignof(void *);
     if (block_size > SIZE_MAX - (block_align - 1)) return -1;
@@ -90,16 +92,14 @@ void *base_pool_get(base_pool *p)
     return block;
 }
 
-bool base_pool_put(base_pool *p, void *ptr)
+void base_pool_put(base_pool *p, void *ptr)
 {
     /* Integer addresses also make foreign pointers safe to compare. */
     uintptr_t offset = (uintptr_t)ptr - (uintptr_t)p->base;
-    if (p->live == 0 || offset >= p->fresh * p->stride || offset % p->stride != 0)
-        return false;
+    ASSERT(p->live != 0 && offset < p->fresh * p->stride && offset % p->stride == 0);
     *(void **)ptr = p->free_head;
     p->free_head = ptr;
     p->live--;
-    return true;
 }
 
 size_t base_pool_count_live(const base_pool *p) { return p->live; }

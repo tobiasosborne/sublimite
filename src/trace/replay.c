@@ -4,8 +4,8 @@
 
 int trace_replay(const trace_input_rec *recs, size_t n, const trace_replay_opts *opts,
                  trace_input_sink sink, void *user) {
-    if (opts == NULL || sink == NULL || (n != 0 && recs == NULL)) return -1;
-    if (!(opts->speed > 0.0) || !isfinite(opts->speed)) return -1;
+    ASSERT(opts != NULL && sink != NULL && (n == 0 || recs != NULL));
+    ASSERT(opts->speed > 0.0 && isfinite(opts->speed));
 
     /* Absolute monotonic deadlines prevent sink cost from accumulating. */
     uint64_t start = opts->fast ? 0 : os_now_ns();

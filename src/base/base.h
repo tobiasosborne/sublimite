@@ -4,26 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-#define BASE_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define BASE_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
-/* The only sanctioned abort() site. */
-#define BASE_ASSERT(x)                                                        \
-    do {                                                                      \
-        if (BASE_UNLIKELY(!(x))) {                                            \
-            fprintf(stderr, "%s:%d: assertion failed: %s\n", __FILE__,        \
-                    __LINE__, #x);                                            \
-            abort();                                                          \
-        }                                                                     \
-    } while (0)
 
 const char *base_version(void);
 
 /* Arena and pool objects are single-owner. Init takes a handle with no
- * live reservation. Each reservation is writable and backed on first touch. */
+ * live reservation. Each reservation is writable and backed on first touch.
+ * Preconditions below are ASSERTed (os.h, A15); a size the OS cannot reserve
+ * is a return code. */
 typedef struct base_arena {
     unsigned char *base;
     size_t         size;
@@ -32,12 +19,13 @@ typedef struct base_arena {
 
 typedef size_t base_arena_mark_t;
 
-/* Returns 0 on success, -1 on reservation failure or size == 0. */
+/* size > 0. Returns 0 on success, -1 when the reservation fails. */
 int   base_arena_init(base_arena *a, size_t size);
-/* Aligns the returned address to a power of two. Returns NULL on invalid
- * alignment or exhaustion without advancing the cursor. */
+/* Initialized arena, align a power of two. Returns NULL on exhaustion
+ * without advancing the cursor. */
 void *base_arena_alloc(base_arena *a, size_t size, size_t align);
 base_arena_mark_t base_arena_mark(const base_arena *a);
+/* m is a mark of this arena at or behind the current cursor. */
 void  base_arena_reset_to_mark(base_arena *a, base_arena_mark_t m);
 void  base_arena_reset(base_arena *a);
 void  base_arena_free(base_arena *a);
@@ -53,14 +41,15 @@ typedef struct base_pool {
     void          *free_head;   /* intrusive singly linked free list */
 } base_pool;
 
-/* Block alignment is a power of two up to the OS page size. Returns 0 on
- * success, -1 on error. */
+/* block_size and capacity > 0; block_align a power of two up to the OS page
+ * size. Returns 0 on success, -1 when the extent is unrepresentable or the
+ * reservation fails. */
 int   base_pool_init(base_pool *p, size_t block_size, size_t block_align,
                      size_t capacity);
 void *base_pool_get(base_pool *p);             /* NULL when full */
-/* Return a currently checked-out block exactly once. Rejects foreign,
- * interior and unissued addresses without modifying the pool. */
-bool  base_pool_put(base_pool *p, void *ptr);
+/* Return a currently checked-out block exactly once. A foreign, interior or
+ * unissued address fails the ASSERT; a second return is not detected. */
+void  base_pool_put(base_pool *p, void *ptr);
 size_t base_pool_count_live(const base_pool *p);
 void  base_pool_free(base_pool *p);
 

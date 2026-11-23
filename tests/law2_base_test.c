@@ -2,6 +2,8 @@
 #include "os/os.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -27,28 +29,30 @@ static bool test_allocator_window(void)
     size_t page = os_page_size();
     const size_t alignment = _Alignof(max_align_t);
     /* One page for bump and rewind, two blocks for fresh and recycled slots. */
-    BASE_ASSERT(base_arena_init(&arena, page) == 0);
-    BASE_ASSERT(base_pool_init(&pool, alignment, alignment, 2) == 0);
+    ASSERT(base_arena_init(&arena, page) == 0);
+    ASSERT(base_pool_init(&pool, alignment, alignment, 2) == 0);
 
     base_malloc_guard_begin();
     base_arena_mark_t mark = base_arena_mark(&arena);
     void *first = base_arena_alloc(&arena, 1, 1);
     void *aligned = base_arena_alloc(&arena, alignment, alignment);
-    BASE_ASSERT(first != NULL && aligned != NULL);
+    ASSERT(first != NULL && aligned != NULL);
     memset(aligned, 0xa5, alignment);
     base_arena_reset_to_mark(&arena, mark);
-    BASE_ASSERT(base_arena_alloc(&arena, 1, 1) == first);
+    ASSERT(base_arena_alloc(&arena, 1, 1) == first);
     base_arena_reset(&arena);
-    BASE_ASSERT(base_arena_alloc(&arena, page, 1) == first);
-    BASE_ASSERT(base_arena_alloc(&arena, 1, 1) == NULL);
+    ASSERT(base_arena_alloc(&arena, page, 1) == first);
+    ASSERT(base_arena_alloc(&arena, 1, 1) == NULL);
 
     void *a = base_pool_get(&pool);
     void *b = base_pool_get(&pool);
-    BASE_ASSERT(a != NULL && b != NULL && a != b);
-    BASE_ASSERT(base_pool_get(&pool) == NULL);
-    BASE_ASSERT(base_pool_put(&pool, a) && base_pool_get(&pool) == a);
-    BASE_ASSERT(base_pool_put(&pool, b) && base_pool_put(&pool, a));
-    BASE_ASSERT(base_pool_count_live(&pool) == 0);
+    ASSERT(a != NULL && b != NULL && a != b);
+    ASSERT(base_pool_get(&pool) == NULL);
+    base_pool_put(&pool, a);
+    ASSERT(base_pool_get(&pool) == a);
+    base_pool_put(&pool, b);
+    base_pool_put(&pool, a);
+    ASSERT(base_pool_count_live(&pool) == 0);
     size_t count = base_malloc_guard_end();
 
     base_arena_free(&arena);
@@ -68,7 +72,7 @@ static void allocate_byte(void)
 {
     void *(*volatile allocate)(size_t) = malloc;
     void *p = allocate(1);
-    BASE_ASSERT(p != NULL);
+    ASSERT(p != NULL);
     free(p);
 }
 
@@ -86,7 +90,7 @@ static size_t guard_worker_window(bool exempt)
 {
     guard_probe probe = {.exempt = exempt};
     os_thread worker;
-    BASE_ASSERT(os_thread_start(&worker, probe_worker, &probe) == OS_OK);
+    ASSERT(os_thread_start(&worker, probe_worker, &probe) == OS_OK);
 
     base_malloc_guard_begin();
     base_malloc_guard_exempt_begin();
@@ -98,7 +102,7 @@ static size_t guard_worker_window(bool exempt)
     while (!atomic_load(&probe.done)) os_yield();
     base_malloc_guard_exempt_end();
     size_t count = base_malloc_guard_end();
-    BASE_ASSERT(os_thread_join(&worker) == OS_OK);
+    ASSERT(os_thread_join(&worker) == OS_OK);
     return count;
 }
 
@@ -113,10 +117,10 @@ static bool test_guard_exempt(void)
     void *(*volatile allocate)(size_t, size_t) = calloc;
     void *(*volatile resize)(void *, size_t) = realloc;
     void *p = allocate(1, 1);
-    BASE_ASSERT(p != NULL);
+    ASSERT(p != NULL);
     /* A larger request exercises realloc separately from the calloc. */
     p = resize(p, 2);
-    BASE_ASSERT(p != NULL);
+    ASSERT(p != NULL);
     size_t after_close = base_malloc_guard_end();
     free(p);
 
@@ -166,25 +170,25 @@ static bool test_os_window(void)
     os_cond cold_cond;
     os_once cold_once = OS_ONCE_INIT;
     os_wake wake;
-    BASE_ASSERT(os_mutex_init(&probe.mutex) == OS_OK);
-    BASE_ASSERT(os_rmutex_init(&probe.recursive) == OS_OK);
-    BASE_ASSERT(os_cond_init(&probe.cond) == OS_OK);
-    BASE_ASSERT(os_mutex_init(&cold_mutex) == OS_OK);
-    BASE_ASSERT(os_rmutex_init(&cold_recursive) == OS_OK);
-    BASE_ASSERT(os_cond_init(&cold_cond) == OS_OK);
-    BASE_ASSERT(os_wake_init(&wake) == OS_OK);
+    ASSERT(os_mutex_init(&probe.mutex) == OS_OK);
+    ASSERT(os_rmutex_init(&probe.recursive) == OS_OK);
+    ASSERT(os_cond_init(&probe.cond) == OS_OK);
+    ASSERT(os_mutex_init(&cold_mutex) == OS_OK);
+    ASSERT(os_rmutex_init(&cold_recursive) == OS_OK);
+    ASSERT(os_cond_init(&cold_cond) == OS_OK);
+    ASSERT(os_wake_init(&wake) == OS_OK);
 
     char path[] = "build/law2-os-XXXXXX";
     int fd = mkstemp(path);
-    BASE_ASSERT(fd >= 0 && close(fd) == 0);
+    ASSERT(fd >= 0 && close(fd) == 0);
     os_file file = OS_FILE_INIT;
-    BASE_ASSERT(os_file_open(&file, path, OS_OPEN_RDWR) == OS_OK);
-    BASE_ASSERT(os_unlink(path) == OS_OK);
+    ASSERT(os_file_open(&file, path, OS_OPEN_RDWR) == OS_OK);
+    ASSERT(os_unlink(path) == OS_OK);
 
     os_thread contender, waiter;
     os_mutex_lock(&probe.mutex);
-    BASE_ASSERT(os_thread_start(&contender, contend, &probe) == OS_OK);
-    BASE_ASSERT(os_thread_start(&waiter, wait_on_cond, &probe) == OS_OK);
+    ASSERT(os_thread_start(&contender, contend, &probe) == OS_OK);
+    ASSERT(os_thread_start(&waiter, wait_on_cond, &probe) == OS_OK);
     /* Inherit the v1 probe's record width and loop count. Repeating the
      * operations exercises both cold and established contended paths. */
     char record[64] = "positioned Law-2 I/O", back[sizeof record];
@@ -218,12 +222,12 @@ static bool test_os_window(void)
 
         size_t n;
         uint64_t off = i * sizeof record;
-        BASE_ASSERT(os_file_pwrite_once(&file, record, sizeof record, off, &n) == OS_OK);
-        BASE_ASSERT(n == sizeof record);
-        BASE_ASSERT(os_file_pwrite(&file, record, sizeof record, off, &n) == OS_OK);
-        BASE_ASSERT(n == sizeof record);
-        BASE_ASSERT(os_file_pread(&file, back, sizeof back, off, &n) == OS_OK);
-        BASE_ASSERT(n == sizeof back && memcmp(record, back, n) == 0);
+        ASSERT(os_file_pwrite_once(&file, record, sizeof record, off, &n) == OS_OK);
+        ASSERT(n == sizeof record);
+        ASSERT(os_file_pwrite(&file, record, sizeof record, off, &n) == OS_OK);
+        ASSERT(n == sizeof record);
+        ASSERT(os_file_pread(&file, back, sizeof back, off, &n) == OS_OK);
+        ASSERT(n == sizeof back && memcmp(record, back, n) == 0);
     }
     os_yield();
     size_t count = base_malloc_guard_end();
@@ -232,9 +236,9 @@ static bool test_os_window(void)
     atomic_store(&probe.stop, true);
     os_cond_broadcast(&probe.cond);
     os_mutex_unlock(&probe.mutex);
-    BASE_ASSERT(os_thread_join(&contender) == OS_OK);
-    BASE_ASSERT(os_thread_join(&waiter) == OS_OK);
-    BASE_ASSERT(clock_sum != 0);
+    ASSERT(os_thread_join(&contender) == OS_OK);
+    ASSERT(os_thread_join(&waiter) == OS_OK);
+    ASSERT(clock_sum != 0);
     os_file_close(&file);
     os_wake_close(&wake);
     os_cond_destroy(&cold_cond);

@@ -7,6 +7,8 @@
 #include "base/base.h"
 #include "os/os.h"
 
+#include <stdlib.h>
+
 /* The OS_TEST_HOOKS variant of os_posix.c (A15; tests/lanes.mk). */
 void os_fault_test_next_gen(uint64_t next);
 
