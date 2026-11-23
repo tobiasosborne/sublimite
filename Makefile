@@ -70,9 +70,12 @@ LINT_OBJS := $(LINT_REL_SRCS:%.c=$(B)/rel/%.o) $(LINT_FUZZ_SRCS:%.c=$(B)/fuzz/%.
 
 TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(SAN_SUITES))
 TEST_REL  := $(patsubst tests/%.c,$(B)/rel/tests/%,$(filter-out $(LAYER_SUITES),$(sort $(SAN_SUITES) $(LAW2_SUITES) $(TSAN_SUITES))))
+TEST_LAW2 := $(patsubst tests/%.c,$(B)/rel/tests/%,$(LAW2_SUITES))
 TEST_TSAN := $(patsubst tests/%.c,$(B)/tsan/tests/%,$(TSAN_SUITES))
 FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZ_SUITES))
 EDIT_BIN  := $(B)/$(APP_ID)
+# Pull the interposer from libcore.a even when allocation is only in a DSO.
+REL_GUARD := -Wl,--undefined=base_malloc_guard_active
 
 # Per-task test timeout: unset (none). Set TEST_TIMEOUT=<secs> only with a
 # derivation beside it (CLAUDE.md law 4); no silent retries either way.
@@ -118,19 +121,23 @@ $(B)/$(1)/%.o: %.c
 endef
 $(foreach c,$(CFGS),$(eval $(call CFG_COMPILE,$(c))))
 
+# The release binary owns the allocation hooks. Sanitizers own them in all
+# other configurations.
+$(B)/rel/src/base/malloc_guard.o: private CF_rel += -DBASE_MALLOC_GUARD_RELEASE
+
 # ---- binaries ----
 # Strict topological link: main.o, then L5 .. L0; a downward-only DAG needs no
 # --start-group.
 $(EDIT_BIN): $(B)/rel/src/main.o $(call libs_desc,rel)
 	@mkdir -p $(@D)
-	$(CC_RELEASE) $(REL_F) -pthread $< $(call libs_desc,rel) $(LDLIBS) -o $@
+	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_GUARD) $(call libs_desc,rel) $(LDLIBS) -o $@
 
 # Grammar archive members link only when referenced; the default editor carries
 # none until hl dispatches to them. `make build/sublimite-v2-<lang>` forces one
 # opt-in wrapper in (mk/grammars.mk HL_OPTIN).
 ifneq ($(HL_OPTIN),)
 $(addprefix $(EDIT_BIN)-,$(HL_OPTIN)): $(EDIT_BIN)-%: $(B)/rel/src/main.o $(call libs_desc,rel)
-	$(CC_RELEASE) $(REL_F) -pthread $< -Wl,--undefined=hl_language_$* $(call libs_desc,rel) $(LDLIBS) -o $@
+	$(CC_RELEASE) $(REL_F) -pthread $< $(REL_GUARD) -Wl,--undefined=hl_language_$* $(call libs_desc,rel) $(LDLIBS) -o $@
 endif
 
 $(B)/rel/tests/%: $(B)/rel/tests/%.o $(call libs_desc,rel)
@@ -145,6 +152,9 @@ $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
+
+$(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.
@@ -237,14 +247,12 @@ check-san: check-suites $(TEST_SAN)
 	@set -e; n=0; $(call run_test_binaries,$(TEST_SAN)); \
 	$(call assert_suite_count,$(SAN_SUITES)); echo "$@: $$n test binaries passed"
 
-# Wave 0 has no guard behind edit_malloc_guard. Any declared Law-2/G1 suite
-# requires a live release guard before this lane can run it.
-check-law2: check-suites
-ifneq ($(strip $(LAW2_SUITES)),)
-	@echo "$@: FAIL release allocation guard state is unavailable (src/base)"; exit 1
-else
-	@$(call declared_empty,$(LAW2_EMPTY_WAVE))
-endif
+# The release base suite proves interposition with a deliberate allocation
+# and requires a live guard with a zero count for every Law-2 window.
+check-law2: check-suites $(TEST_LAW2)
+	@set -e; n=0; $(call run_test_binaries,$(TEST_LAW2)); \
+	$(call assert_suite_count,$(LAW2_SUITES)); \
+	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(LAW2_EMPTY_WAVE)); else echo "$@: $$n release suites passed"; fi
 
 # TSan is a wave-end / per-touched-module gate.
 check-tsan: check-suites $(TEST_TSAN)

@@ -150,7 +150,7 @@ Model the four independent axes explicitly under `-Wswitch-enum`:
 - **Tiered check lanes:**
   - **Local / per-commit `make check`:**
     1. **ASan + UBSan lane** (explicit display-lane tagging, per-task timeouts, zero silent flake-forgiving retries, zero silent pass-on-missing-mock like `wayland_gl_test.c:82`).
-    2. **Release Law-2 + G1 lane (`gcc -O2`):** Runs allocation-guard & G1 suites, **failing closed** if `edit_malloc_guard` reports inert!
+    2. **Release Law-2 + G1 lane (`gcc -O2`):** Runs allocation-guard & G1 suites, **failing closed** if `base_malloc_guard_active()` reports inert!
     3. **Structural lints:** per-module include-DAG check, `#include "*.c"` == 0, isolated `--whole-archive` layer links, generator `--check` (UCD, keysyms, Wayland XMLs, font hashes), Wave 0 namespace isolation grep.
   - **Per-touched-module & wave-end / AC gates:**
     4. **`make check-tsan`:** TSan lane on threaded suites (`work`, `piece`, `journal`, `savectl`, `font_async`, `hl`, `find_session`, `app_session`), including explicit Wave 1 budget to verify/annotate pools and signal handlers cleanly.

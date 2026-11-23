@@ -11,7 +11,6 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = Path('tests/lanes.mk')
-TEST_SOURCE = 'int main(void) { return 0; }\n'
 
 
 def write(root, path, text):
@@ -47,9 +46,15 @@ def reject(result, diagnostic):
     return result.returncode != 0 and diagnostic in result.stdout
 
 
-def register_law2(root):
-    write(root, 'tests/contract/g1_test.c', TEST_SOURCE)
-    append(root, MANIFEST, '\nLAW2_EMPTY_WAVE :=\nLAW2_SUITES += tests/contract/g1_test.c\n')
+def stub_law2_guard(root, active):
+    guard = f"""#include "base/base.h"
+bool base_malloc_guard_active(void) {{ return {active}; }}
+void base_malloc_guard_begin(void) {{}}
+size_t base_malloc_guard_end(void) {{ return 0; }}
+void base_malloc_guard_exempt_begin(void) {{}}
+void base_malloc_guard_exempt_end(void) {{}}
+"""
+    write(root, 'src/base/malloc_guard.c', guard)
 
 
 def leave_stale_suite_binary(root):
@@ -62,16 +67,18 @@ def leave_stale_suite_binary(root):
 def cases(baseline):
     registry = 'check-lints' if baseline else 'check-layout'
     yield ('empty Law-2 lane without a declaration',
-           lambda repo: append(repo, MANIFEST, '\nLAW2_EMPTY_WAVE :=\n'),
+           lambda repo: append(repo, MANIFEST, '\nLAW2_SUITES :=\n'),
            ('check-law2',), 'check-law2 has no suites and no first-wave declaration')
     yield ('listed suite missing on disk',
            leave_stale_suite_binary, ('check-san',),
            'listed suite is missing: tests/absent_test.c')
     yield ('unlisted nested suite',
-           lambda repo: write(repo, 'tests/contract/unlisted_test.c', TEST_SOURCE),
+           lambda repo: write(repo, 'tests/contract/unlisted_test.c', 'int main(void) { return 0; }\n'),
            ('check-san',), 'unlisted suite: tests/contract/unlisted_test.c')
-    yield ('Law-2 suite without a live guard', register_law2, ('check-law2',),
-           'release allocation guard state is unavailable')
+    for active in ('false', 'true'):
+        yield (f'Law-2 guard without interposition (active={active})',
+               lambda repo, value=active: stub_law2_guard(repo, value),
+               ('check-law2',), f'guard positive control: active={int(active == "true")} count=0')
     yield ('unregistered nested tool file',
            lambda repo: write(repo, 'tools/helpers/unregistered.txt', ''),
            (registry,), 'unregistered file: tools/helpers/unregistered.txt')

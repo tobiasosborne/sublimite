@@ -17,6 +17,9 @@ UNDEFINED = frozenset('Uwv')
 L5_FORBIDDEN = {'x11', 'wayland', 'gl', 'raster'}
 TS_RUNTIME = Path('vendor/tree-sitter/lib/src/lib.o')
 TS_RUNTIME_EXPORTS = {'_ts_dup', 'range_intersects', 'range_within'}
+# These definitions must use the libc ABI names to interpose at link time.
+BASE_ALLOCATOR_HOOK = Path('src/base/malloc_guard.o')
+BASE_ALLOCATOR_EXPORTS = {'malloc', 'calloc', 'realloc'}
 SYSTEM_LIBRARY = re.compile(r'-l[A-Za-z0-9][A-Za-z0-9_.+-]*')
 SYMBOL_NAME = re.compile(r'[A-Za-z0-9_.$@]+')
 
@@ -152,6 +155,8 @@ def object_module(path):
 
 
 def owns_symbol(member, module, owner, symbol):
+    if member == BASE_ALLOCATOR_HOOK and symbol in BASE_ALLOCATOR_EXPORTS:
+        return True
     if member == TS_RUNTIME:
         return symbol.startswith('ts_') or symbol in TS_RUNTIME_EXPORTS
     if member.parts[0] == 'vendor':

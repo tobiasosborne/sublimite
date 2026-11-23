@@ -1,9 +1,14 @@
 # Exact strong imports from the release toolchain and its C library.
 _GLOBAL_OFFSET_TABLE_ # ELF linker-generated GOT base
 __assert_fail # glibc assert implementation
+__cpu_indicator_init # compiler runtime CPU capability initialization
+__cpu_model # compiler runtime CPU feature bits
 __ctype_b_loc # glibc narrow character-class table
 __errno_location # glibc calling-thread errno
 __fprintf_chk # fortified fprintf
+__libc_calloc # glibc allocation beneath the Law-2 interposer
+__libc_malloc # glibc allocation beneath the Law-2 interposer
+__libc_realloc # glibc allocation beneath the Law-2 interposer
 __realpath_chk # fortified realpath
 __snprintf_chk # fortified snprintf
 __stack_chk_fail # compiler stack protector failure handler
