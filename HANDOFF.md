@@ -25,21 +25,31 @@ docs/gates/wave0/v1-20261123T215001Z-843898/ (gate.json, summary.txt, record.txt
 - W0.7 path: phase 1 B1–B5, B7 (0.79–0.83), X3 fences (0.84), phase 2 B6 (0.85, 0.86), phase 3 Astra runner read
   GATE-READY (docs/reviews/wave0-runner-astra.md).
 
-### Wave 1 (A10: L0/L1 now; L2/L5 after the Wave 0 gate)
-Landed piece 7a (1.16): frozen piece.h except its Lines section (second Astra read pending; A19 and
-docs/decisions/wave1-piece-lines.md), flat reference model tests/piece_model.h, model-run suite + fuzzer. Running on
-the model: find (.19, Sol), undo (.8, Sol; Astra reads its diff before landing). 7b and lineidx (.18, rescoped by
-A19) wait for the Lines freeze. Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11),
-fault ids (1.10) + A15 follow-up (1.12), ASSERT migration (1.14). Landed L1: scan (1.6), utf8 (1.7), indent (1.9,
-1.13). In flight: piece 7a (v2-0fv.7: frozen piece.h + reference model + suite; FREEZE GATE: advisor reads piece.h
-before the suite is finished). Filed, waiting on 7a: 7b implementation (.17), undo (.8), lineidx (.18), find (.19).
-Held: env hooks (.20). L2 edit placeholder (.15) carries acceptance lines. Specs: docs/decisions/wave1-piece-pool.md
-(signed), wave1-os-fault-lease.md (+A18). Amendments A1–A18 in docs/decisions/wave0-plan-amendments.md.
+### Wave 1 (L2/L5 unblocked by the Wave 0 gate, A10)
+Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11), fault ids
+(1.10, 1.12, 1.15), ASSERT migration (1.14), no test env vars + dead exports (1.20). Landed L1: scan (1.6), utf8 (1.7),
+indent (1.9, 1.13), piece 7a = frozen piece.h incl. Lines + flat model + model-run suite (1.16–1.18, erratum d028acf,
+piece_span_nl_join with undo), find (1.19), undo (1.21). lineidx removed (A19). Early leaves (A21): dnd (4.1).
+In flight (state at 23:45 CET 2026-11-23):
+- 7b real piece tree (v2-0fv.17) on Opus xhigh, continuing the Sol wip (build/review/7b-sol-wip.diff); landing gate =
+  piece/find/undo suites green on the real tree; exact memory gate 25,950 slots (A20); landing read split (Astra on the
+  production source only, a fresh Claude/Muse reviewer runs the suites and fault traces).
+- L2-0a os watch object + metadata/xattr copy (Opus): green, one send-back round for a fuzz harness (Law 1).
+- LF-2 TOML parser (Muse), no pool (A21).
+- Q2 save protocol: advisor rules 1–7 (no retention; synced PREPARED with the temp's identity and S; by-value restores
+  from snapshot capture; peer and kept-state self-contained checkpoints before rename; one buffer per file identity);
+  Astra's pass: T1–T4 hold, T5 (foreign rename after our rename, then crash before the conflict checkpoint) breaks;
+  advisor ruling on T5 pending (option: keep the new file reachable by a private hard link until FINISHED, or accept
+  as product contract). Then Q2/Q4/Q11 rewritten, L2-2/L2-3 briefs.
+L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md (beads L2-0..L2-6, L5-1..L5-3), derivations wave1-L2-derivations.md,
+wave1-L2-q2-crash-consistency.md, wave1-L2-q2-protocol.md; amendments A19–A22. Provisional brief for v2-0fv.15 (edit):
+build/briefs/v2-0fv.15-edit.md (untracked; rewrite after undo landed: done — undo_begin/replace/commit/abort, join flag,
+burst policy in edit, one maintenance function incl. undo_maintain). Filed: v2-0fv.21 os export deletion + nm gate.
 
 ### Next session, in order
-1. Land whatever lanes left (each worktree is committed on its branch: "wip ..." commits).
-2. W0.7 phase 1 → phase 2 (B6) → phase 3 (Astra read) → Wave 0 gate run (`make contract-gate`, [AC], quiet box).
-3. piece 7a freeze → 7b, undo, lineidx, find in parallel lanes.
+1. Land whatever lanes left (each worktree is committed on its branch as "wip ..." or reported with a path).
+2. 7b landing (split read), then L2-1 file (after L2-0a) and the L2 briefs from the Q2 ruling; v2-0fv.21.
+3. Wave 1 exit numbers recorded in A22 (Q6 G1 under writeback; Q3 10 GiB recovery measurement in L2-2).
 
 ### Facts the next session needs
 - Quality bar (Tobias, 2026-11-23): genius-level engineering; push back on sloppy work. Owner-read every landing,
