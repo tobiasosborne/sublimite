@@ -395,3 +395,12 @@ bead for the job and the estimate, inside those owners.
   closing poll reports epoch 0 and a loaded byte came from a repaired page.
 - **Lanes.** `make check CONTRACT_CHECK_DISPLAYS=:170-:179`, `make check-tsan` (7 suites) and `make fuzz-smoke`
   (9 fuzzers) all exit 0.
+
+## Erratum (7b, advisor 2026-11-23)
+
+The frozen sentence on `piece_replace_spans` said "no byte of the inserted source is copied or read". 7b showed that
+Lines' private-source counting contradicts the literal reading: ADD prefixes are per 512 B block, so two private chunks
+with the same prefixes and totals can place an LF at offset 0 or 1, and a NULL-count ADD span reinserted at EOF needs a
+scan to stay exact. Corrected text: no byte of the inserted source is copied and no mapped byte of it is read; a private
+source may be scanned within the bounds stated under Lines, at most PIECE_CHUNK / 2 = 32,768 B per span end (P). The
+guarantee was always about mapped bytes, which can fault and block on storage; private memory can do neither.

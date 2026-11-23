@@ -295,9 +295,13 @@ piece_err piece_replace(piece_tree *t, uint64_t off, uint64_t del,
                         const uint8_t *bytes, size_t n);
 
 /* Replaces [off, off + del) with the bytes that spans[0, count) name, by
- * reference: their coordinates are inserted as given, and no byte of the
- * inserted source is copied or read; its destination cuts read as the Editing
- * preamble states. nl is NULL or count records carried with the spans
+ * reference: their coordinates are inserted as given, no byte of the
+ * inserted source is copied, and no mapped byte of it is read; a private
+ * source (ADD, a private-copy ORIGINAL) may be scanned within the bounds
+ * stated under Lines, at most PIECE_CHUNK / 2 = 32,768 B per span end (P),
+ * to count it (erratum at 7b, advisor 2026-11-23: the guarantee was always
+ * about mapped bytes, which can fault and block on storage; private memory
+ * can do neither). Its destination cuts read as the Editing preamble states. nl is NULL or count records carried with the spans
  * (piece_span_nl; its provenance rule is a precondition of this call). A
  * counted part goes in counted; a whole chunk whose count the core's table
  * holds is counted from the table whatever the record says; private storage

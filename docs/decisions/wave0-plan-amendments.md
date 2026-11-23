@@ -221,3 +221,17 @@ under Astra review until frozen). Consequences:
   reclaim, in that order, from one function that is their only caller) is an acceptance line of v2-0fv.15.
 - The fault-read rule is one closing poll after the last dependent load (epoch 0, generation match); the opening poll
   was cut at the freeze (wave1-os-fault-lease.md "Read bytes", amended).
+
+## A20. Memory and count gates carried from v1 are replaced by v2's own exact derivation (advisor, 2026-11-23, at 7b)
+
+A memory or count gate carried from a v1 fixture is replaced by the v2 design's own exact (P) derivation for that
+fixture, asserted exactly where the quantity is a count (slots, extents) and by stated derivation where it is bytes; the
+v1 figure becomes a recorded comparison, not an assertion. A loose outer (G) bound may stay as a second check but never
+as the only one: a bound with large slack lets a real leak pass. First application, v1 `version_headers` under 7b: live
+slots == 950 + 5,000 × 5 = 25,950 (P: 833 leaves + 104 + 12 + 1 branches for 10,000 uncoalescable pieces at the signed
+fanouts; one leaf-to-root path of 4 slots and one header per held version); extents ceil(25,950 / 10) × 4,096 =
+10,629,120 B, plus the page-rounded ADD chunk 69,632 B, plus the fixed terms each with its own derivation; the signed
+11,608,382 B outer bound also holds; v1's runtime formula at the actual 10,000 pieces (10,648,382 B) is recorded as a
+comparison (v2 is 0.47 % above it: the 96 B per page a 400 B slot leaves). Re-deriving the slot geometry to win that
+50 KB, or charging requested bytes instead of mappings, were both rejected.
+
