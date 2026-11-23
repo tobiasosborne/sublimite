@@ -1,6 +1,6 @@
 # tools/ registry
 
-**Rule: every tool in `tools/` must be registered in this file** (purpose, invocation, make target). An unregistered tool is a fossil and is deleted on sight; `make check-lints` may fail on it. Do not add one-off scripts here — keep those out of the repo.
+**Rule: every file under `tools/` must have a row in this table** with its backticked path relative to `tools/`, purpose, invocation and make target. `make check-lints` fails for unregistered files and rows whose file is missing. The registry itself and generated `__pycache__/` directories are exempt.
 
 | Tool | Purpose | Invocation | Make target |
 |---|---|---|---|
@@ -14,3 +14,6 @@
 | `check_symbols.py` | Audits release archive imports and exports against the module DAG and validates per-module `LDLIBS`. | `make check-symbols` | `check-lints`, `check-module-ldlibs` |
 | `system-symbols.txt` | Exact, reviewed libc and release toolchain imports with a reason for each entry. | Read by `tools/check_symbols.py` | `check-lints` |
 | `tests/contract/xdriver.c` and `xdriver.py` | Persistent XCB/XTest input, selection transfers and ordered inspection markers for the behavioral contract. | `build/xdriver --display :NUMBER` on the runner's authenticated display, or import `XDriver` from `tests/contract/xdriver.py`. | `xdriver`, `check-xdriver` |
+| `check_layout.py` | Validates suite registration, checks the tools registry and forbidden directories, and checks real test/fuzzer dependencies for C implementation includes. | `make check-layout` and `make check-includes` | `check-lints`, suite lanes |
+
+`make check-lints` runs `tests/lint/run.py` for compiler-dependency fixtures and `tests/lanes/run.py` for suite, registry and lint inventory fixtures.

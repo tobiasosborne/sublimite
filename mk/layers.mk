@@ -63,7 +63,7 @@ $(foreach c,$(CFGS),$(foreach l,$(LAYERS),$(eval $(call LAYER_ARCHIVE,$(c),$(l))
 # upward reference cannot hide behind an unselected object: the link fails.
 # Layer 5 is checked the same way with src/main.o as the entry point.
 LAYER_TEST_IDS  := 0 1 2 3 4
-LAYER_TEST_BINS := $(foreach n,$(LAYER_TEST_IDS),$(B)/rel/tests/layer_L$(n)_test)
+LAYER_TEST_BINS := $(patsubst tests/%.c,$(B)/rel/tests/%,$(LAYER_SUITES))
 LAYER_L5_BIN    := $(B)/rel/tests/layer_L5_link
 LAYER_TESTS_SRC := $(foreach n,$(LAYER_TEST_IDS),tests/layer_L$(n)_test.c)
 

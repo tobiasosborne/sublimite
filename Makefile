@@ -2,8 +2,7 @@
 #
 # Layout: mk/layers.mk declares the 5 layers and their archives (no monolithic
 # libedit.a), mk/grammars.mk the vendored tree-sitter table (a no-op until
-# vendor/ is imported). Drop files in src/<module>/, tests/<m>_test.c,
-# bench/<m>_bench.c, fuzz/<m>_fuzz.c; globs pick them up.
+# vendor/ is imported). Register tests and fuzzers in tests/lanes.mk.
 #
 # Targets: all  check  check-lints  check-layers  check-san  check-law2
 #          check-tsan  fuzz  fuzz-smoke  clean
@@ -55,34 +54,32 @@ LDLIBS += $(foreach f,$(wildcard src/*/LDLIBS),$(shell cat $(f)))
 B := build
 
 include mk/grammars.mk
+-include tests/lanes.mk
 include mk/layers.mk
 
-TESTS      := $(sort $(wildcard tests/*_test.c))
-FUZZS      := $(sort $(wildcard fuzz/*_fuzz.c))
-# The dependency lints cover every translation unit in these directories,
-# including sources that are not linked by a check lane.
-LINT_REL_SRCS := $(shell find $(wildcard src tests) -name '*.c' \( -type f -o -xtype f \))
-LINT_FUZZ_SRCS := $(if $(wildcard fuzz),$(shell find fuzz -name '*.c' \( -type f -o -xtype f \)))
+# Include unlinked translation units under src/, tests/ and fuzz/. The test
+# fixture trees have their own runners and fuzz/corpus/ contains input data.
+C_FILES := -name '*.c' \( -type f -o -xtype f \) -print
+lint_sources = $(if $(wildcard $(1)),$(shell find $(1) $(2) $(C_FILES))\
+    $(if $(filter-out 0,$(.SHELLSTATUS)),$(error failed to enumerate translation units under $(1))))
+LINT_SRC_SRCS := $(call lint_sources,src)
+LINT_TEST_SRCS := $(call lint_sources,tests,\( -path tests/lint -o -path tests/symbols -o -path tests/lanes \) -prune -o)
+LINT_FUZZ_SRCS := $(call lint_sources,fuzz,-path fuzz/corpus -prune -o)
+LINT_REL_SRCS := $(LINT_SRC_SRCS) $(LINT_TEST_SRCS)
 LINT_OBJS := $(LINT_REL_SRCS:%.c=$(B)/rel/%.o) $(LINT_FUZZ_SRCS:%.c=$(B)/fuzz/%.o)
-# Law-2 + G1 suites run on the release (gcc -O2) tree: the allocation guard is
-# live there, and the suite must fail closed if it is inert.
-LAW2_TESTS := $(filter tests/law2_%_test.c tests/g1_%_test.c,$(TESTS))
-# Threaded suites (docs/PLAN_V2.md §5.4); present ones run under TSan.
-TSAN_SUITES := work piece journal savectl font_async hl find_session app_session
-TSAN_TESTS  := $(filter $(TSAN_SUITES:%=tests/%_test.c),$(TESTS))
 
-TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(TESTS))
-TEST_REL  := $(patsubst tests/%.c,$(B)/rel/tests/%,$(filter-out $(LAYER_TESTS_SRC),$(TESTS)))
-TEST_LAW2 := $(patsubst tests/%.c,$(B)/rel/tests/%,$(LAW2_TESTS))
-TEST_TSAN := $(patsubst tests/%.c,$(B)/tsan/tests/%,$(TSAN_TESTS))
-FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZS))
+TEST_SAN  := $(patsubst tests/%.c,$(B)/san/tests/%,$(SAN_SUITES))
+TEST_REL  := $(patsubst tests/%.c,$(B)/rel/tests/%,$(filter-out $(LAYER_SUITES),$(sort $(SAN_SUITES) $(LAW2_SUITES) $(TSAN_SUITES))))
+TEST_TSAN := $(patsubst tests/%.c,$(B)/tsan/tests/%,$(TSAN_SUITES))
+FUZZ_BIN  := $(patsubst fuzz/%.c,$(B)/fuzz/%,$(FUZZ_SUITES))
 EDIT_BIN  := $(B)/$(APP_ID)
 
 # Per-task test timeout: unset (none). Set TEST_TIMEOUT=<secs> only with a
 # derivation beside it (CLAUDE.md law 4); no silent retries either way.
 RUN = $(if $(TEST_TIMEOUT),timeout $(TEST_TIMEOUT) )
 
-.PHONY: all check check-lints check-layers check-san check-law2 check-tsan fuzz fuzz-smoke clean
+.PHONY: all check check-lints check-layout check-suites check-includes \
+        check-layers check-san check-law2 check-tsan fuzz fuzz-smoke clean
 .SECONDARY:
 .DEFAULT_GOAL := all
 
@@ -138,8 +135,7 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -pthread $< $(call libs_desc,fuzz) $(LDLIBS) -o $@
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
-# Sequential lanes, fail-fast; each lane is internally parallel. A lane with no
-# suites yet says so loudly rather than passing silently.
+# Sequential local lanes, fail-fast. Each lane can build in parallel.
 check:
 	@$(MAKE) --no-print-directory check-lints
 	@$(MAKE) --no-print-directory check-layers
@@ -155,18 +151,40 @@ check-contract-sandbox:
 check-contract-inspect:
 	python3 -B tests/contract/test_inspect.py
 
-# The include lints use the .d files emitted when compiling these objects.
-check-lints: $(LINT_OBJS)
-	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
-	python3 tools/check_no_c_includes.py --build-dir "$(B)"
+check-lints: check-layout check-includes
 	python3 tools/check_isolation.py
 	python3 -B tests/isolation/run.py --build-dir "$(B)"
-	python3 tests/lint/run.py
+	TMPDIR="$(abspath $(B))" python3 tests/lint/run.py
+	python3 tests/lanes/run.py --build-dir "$(B)"
+
+check-layout: check-suites
+	python3 tools/check_layout.py registry
+
+# Direct lane invocations also check the inventory, even with cached binaries.
+check-suites:
+	@python3 tools/check_layout.py suites \
+	    --required-layers $(LAYER_TESTS_SRC) --layers $(LAYER_SUITES) --san $(SAN_SUITES) \
+	    --law2 $(LAW2_SUITES) --law2-empty-wave "$(LAW2_EMPTY_WAVE)" \
+	    --tsan $(TSAN_SUITES) --tsan-empty-wave "$(TSAN_EMPTY_WAVE)" \
+	    --fuzz $(FUZZ_SUITES) --fuzz-empty-wave "$(FUZZ_EMPTY_WAVE)" \
+	    --tests-on-disk $(filter %_test.c,$(LINT_TEST_SRCS)) \
+	    --fuzz-on-disk $(filter %_fuzz.c,$(LINT_FUZZ_SRCS))
+
+# The include lints use the .d files emitted when compiling these objects.
+check-includes: $(LINT_OBJS)
+	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
+	python3 tools/check_layout.py includes --build-dir "$(B)" --tests $(LINT_TEST_SRCS) --fuzz $(LINT_FUZZ_SRCS)
+
+run_test_binaries = for t in $(1); do echo "== $$t"; $(RUN)"$$t"; n=$$((n+1)); done
+assert_suite_count = if [ "$$n" -ne "$(words $(1))" ]; then \
+	echo "$@: FAIL ran $$n of $(words $(1)) declared suites"; exit 1; fi
+declared_empty = echo "$@: declared empty (first suites due in Wave $(1))"
 
 # Isolated --whole-archive link per layer against lower archives only, then run.
-check-layers: $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
-	@set -e; for t in $(LAYER_TEST_BINS) $(LAYER_L5_BIN); do echo "== $$t"; $(RUN)$$t; done; \
-	echo "check-layers: 6 isolated layer links passed (L0-L4 tests, L5 via main.o)"
+check-layers: check-suites $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
+	@set -e; n=0; $(call run_test_binaries,$(LAYER_TEST_BINS) $(LAYER_L5_BIN)); \
+	$(call assert_suite_count,$(LAYER_SUITES) src/main.c); \
+	echo "check-layers: $$n isolated layer links passed (L0-L4 tests, L5 via main.o)"
 
 # Link-level module DAG. Use the same member order as the archive recipes.
 symbol_modules := $(foreach l,$(LAYERS),$(foreach m,$($(l)_MODS),$(l):$(m)))
@@ -185,33 +203,42 @@ $(LAYER_TEST_BINS) $(LAYER_L5_BIN): | check-module-ldlibs
 check-module-ldlibs:
 	python3 tools/check_symbols.py --ldlibs-only --layer-libs $(symbol_layer_libs)
 
-# ASan + UBSan over every tests/*_test.c (layer tests included).
-check-san: $(TEST_SAN)
-	@set -e; n=0; for t in $(TEST_SAN); do echo "== $$t"; $(RUN)$$t; n=$$((n+1)); done; echo "check-san: $$n test binaries passed"
+# ASan + UBSan over the registered sanitizer suites (layer tests included).
+check-san: check-suites $(TEST_SAN)
+	@set -e; n=0; $(call run_test_binaries,$(TEST_SAN)); \
+	$(call assert_suite_count,$(SAN_SUITES)); echo "$@: $$n test binaries passed"
 
-# Release (gcc -O2) Law-2 + G1 lane; suites tests/law2_*_test.c, tests/g1_*_test.c
-# must themselves fail closed when edit_malloc_guard reports inert.
-check-law2: $(TEST_LAW2)
-	@set -e; n=0; for t in $(TEST_LAW2); do echo "== $$t"; $(RUN)$$t; n=$$((n+1)); done; \
-	if [ $$n -eq 0 ]; then echo "check-law2: NOTE no Law-2/G1 suites yet (tests/law2_*_test.c, tests/g1_*_test.c land in Wave 1); nothing ran"; else echo "check-law2: $$n release suites passed"; fi
+# Wave 0 has no guard behind edit_malloc_guard. Any declared Law-2/G1 suite
+# requires a live release guard before this lane can run it.
+check-law2: check-suites
+ifneq ($(strip $(LAW2_SUITES)),)
+	@echo "$@: FAIL release allocation guard state is unavailable (src/base)"; exit 1
+else
+	@$(call declared_empty,$(LAW2_EMPTY_WAVE))
+endif
 
-# TSan over the threaded suites that exist (wave-end / per-touched-module gate).
-check-tsan: $(TEST_TSAN)
-	@set -e; n=0; for t in $(TEST_TSAN); do echo "== $$t"; $(RUN)$$t; n=$$((n+1)); done; \
-	if [ $$n -eq 0 ]; then echo "check-tsan: NOTE no threaded suites yet ($(TSAN_SUITES)); nothing ran"; else echo "check-tsan: $$n threaded suites passed"; fi
+# TSan is a wave-end / per-touched-module gate.
+check-tsan: check-suites $(TEST_TSAN)
+	@set -e; n=0; $(call run_test_binaries,$(TEST_TSAN)); \
+	$(call assert_suite_count,$(TSAN_SUITES)); \
+	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(TSAN_EMPTY_WAVE)); else echo "$@: $$n threaded suites passed"; fi
 
-fuzz: $(FUZZ_BIN)
-	@echo "fuzz: $(words $(FUZZ_BIN)) fuzzers built"
+fuzz: check-suites $(FUZZ_BIN)
+	@$(if $(FUZZ_BIN),echo "$@: $(words $(FUZZ_BIN)) fuzzers built",$(call declared_empty,$(FUZZ_EMPTY_WAVE)))
 
 # Replay each fuzzer over its committed seed corpus fuzz/corpus/<name>/ only
 # (-runs=0: no generated inputs, so no invented iteration budget).
-fuzz-smoke: $(FUZZ_BIN)
-	@set -e; n=0; for f in $(FUZZ_BIN); do m=$$(basename $$f _fuzz); \
-	  if [ ! -d fuzz/corpus/$$m ]; then echo "fuzz-smoke: FAIL fuzz/corpus/$$m missing (commit minimal seeds)"; exit 1; fi; \
-	  echo "== $$f fuzz/corpus/$$m"; $(RUN)$$f -runs=0 fuzz/corpus/$$m; n=$$((n+1)); done; \
-	if [ $$n -eq 0 ]; then echo "fuzz-smoke: NOTE no fuzzers yet (fuzz/<m>_fuzz.c); nothing ran"; else echo "fuzz-smoke: $$n fuzzers replayed their seeds"; fi
+fuzz-smoke: check-suites $(FUZZ_BIN)
+	@set -e; n=0; for f in $(FUZZ_BIN); do m=$${f#$(B)/fuzz/}; corpus=fuzz/corpus/$${m%_fuzz}; \
+	  if [ ! -d "$$corpus" ]; then echo "$@: FAIL $$corpus missing (commit minimal seeds)"; exit 1; fi; \
+	  echo "== $$f $$corpus"; $(RUN)"$$f" -runs=0 "$$corpus"; n=$$((n+1)); done; \
+	$(call assert_suite_count,$(FUZZ_SUITES)); \
+	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(FUZZ_EMPTY_WAVE)); else echo "$@: $$n fuzzers replayed their seeds"; fi
 
 clean:
 	rm -rf $(B)
 
--include $(shell find $(B) -name '*.d' 2>/dev/null)
+# Fixture runners can create separate build trees under B. Their dependency
+# paths are relative to their fixture roots, so import only our configurations.
+DEP_DIRS := $(wildcard $(addprefix $(B)/,$(CFGS)))
+-include $(if $(DEP_DIRS),$(shell find $(DEP_DIRS) -name '*.d'))
