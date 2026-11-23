@@ -306,3 +306,19 @@ by-value group is accepted); Q11 (buffers sharing a path) by rules 4 and 6. L2-3
 checkpointing, finish and cancel. L2-2's record set: SJNL preamble + PAD, GENERATION, BASE, TARGET, INSERT, DELETE,
 RESTORE_BASE_RANGE, GROUP_BEGIN/COMMIT, CHECKPOINT_BY_VALUE, SAVE(PREPARED/FINISHED/CANCELLED), VIEW, TABS.
 
+## A24. 7b source-read rulings (advisor, 2026-11-24; docs/reviews/wave1-piece-7b-source-astra.md)
+
+- E: piece_lines_resolve funds its copies from the core's free slots, the reserve and base, and never walks the
+  retirement queue; when those do not suffice it returns PIECE_ERR_NOMEM with nothing changed, and the caller's next
+  piece_reclaim (its own budget) frees what is queued. "One call visits at most budget nodes" then holds as written.
+  The post-submit maintenance order becomes: piece_reclaim, piece_lines_resolve, piece_replenish, then undo_maintain,
+  from one function that is their only caller (corrects A19's "resolve, replenish, reclaim"; v2-0fv.15).
+- D: ownership decided on the visited path, so an update that needs no slot never asks for one.
+- F: core ownership and snapshot owner counts become 64-bit; every owner occupies storage of its own, so 2^64 owners
+  cannot exist in a 2^47 or 2^56-byte address space (P); the overflow ASSERT stays as the statement of that bound,
+  with the precondition in the header. No saturation logic.
+- C: no shorter-side logic for private cuts; a cut inside private storage scans at most 511 B (P, one 512 B prefix block
+  less one); the Lines text is corrected where it says PIECE_CHUNK / 2 per end for private sources.
+- A, B, G as Astra states them; for A the rule beside the code is the header's sentence: NOMEM exactly when base refused
+  the remainder, the remainder computed after the last funding step that can change it.
+
