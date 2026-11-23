@@ -111,3 +111,26 @@ Refusal in L2 precedes the PLAN §4.2 journal publish point. A failure inside an
 - Dossier §0.1 and §4.5(d) describe a proposed OS pin. The accepted fault-ID design uses a backing reference; `lineidx_bind_snapshot` alone contributes zero retained roots (P, only a backing token). A build that owns a snapshot contributes its source revision until physical completion. `find_source` borrows its source from its caller. These distinctions determine who pays for a tree node.
 
 VERDICT: Fund the occupied class counts, the configured divergence credits and the whole next foreground operation. Prepay the private ADD boundary independently, enforce the height and reader limits, and make insufficient capacity an atomic, recoverable refusal.
+
+## Advisor review (2026-11-23, not signed yet)
+
+Kept: the reserve table, the slab arithmetic, the ADD boundary analysis and the test list. Corrections (a)–(d)
+accepted (L1 dossier correction note; amendments A6/A7). Prepayment without an unlimited-edit promise is fine; as
+behaviour it is not, because the saved BASE stays pinned from one save to the next in every modified buffer.
+Challenges (refute with a counter-example by symbol, or cut):
+1. Specify the refill: invariant (e.g. after every committed command and before the next input, free slots per
+   class ≥ W at the current height), trigger, amount, placement relative to the Law 2 guard (input → submit), storage
+   source in src/base. Guarantee: "edit not applied, buffer memory is full" only when the base allocator refuses,
+   never because a refill had not run. State v1's equivalent symbol and when it grows relative to the counting test.
+2. (R − 1)·U: one command copies a path once whatever the number of older revisions, so its consumption is bounded
+   by its entry reserve; R bounds only headers. Then N = O + W + headers with refill between commands, and (R−1)·U is
+   a refill-frequency knob. Give a refusing sequence or cut the term; service-revision limits ("latest request wins,
+   at most K") belong to the find/index modules, not to piece admission.
+3. Redo the holder list from PLAN_V2 §2/§4 (app_session immutable leaves, savectl fd-captured BASE), with v1's list as
+   evidence; name the v1 holders v2 does not have.
+4. Evaluate one UI-owned process-level reserve (W slabs + one boundary chunk) drawn by the active buffer at
+   admission and refilled under 1, versus per-buffer prepay (118,648 B per empty tab, 11,864,800 B for 100 tabs (P)).
+   State what it loses and the per-empty-tab cost that remains.
+5. Height gate at H = 16 accepted; before repack becomes code, a tagged lower bound on reaching height 16 through
+   public operations (live node bytes or root splits). Unreachable within the address space → no repack; reachable →
+   the sequence becomes the fixture. No rate-based argument.

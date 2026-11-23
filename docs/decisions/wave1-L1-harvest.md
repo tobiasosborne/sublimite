@@ -1585,3 +1585,11 @@ parallel):
   a bump safe.
 
 VERDICT: L1 is harvestable at pin 6fec2e8 with zero post-c95b6eb drift (§8), structured as two verbatim leaves (scan §1, indent §3), one located one-function bug (utf8 gcb_of's <0x300 shortcut orphaning ©/® from UCD_EXT_PICT, §2.5), the piece centre split into verbatim harvest then four probe-first fixes (root promotion, staged-init cache, shared add-dir with boundary privatization, L0 fault-token hook, §4.5), undo as preserve-and-prove fallout (§5.5), and two modules blocked on killing their upward file/file.h edge via that fault hook (lineidx §6 plus PLAN §4.3 degraded-mode/off-path regrowth replacing the lineidx.c:858 veto; find §7 plus visit promotion and native fold/whole-word absorbing findui/literal.c) — seven beads L1-1…L1-7 (L1-5 split a/b), gated on L0-1/L0-2/L0-3/L0-5 from the L0 dossier, with exactly three #include "*.c" rewrites (lineidx_os_test, find_p1r_test ×2 includes, undo_bench) and no Windows code or unlisted globals anywhere in the layer.
+## Correction note (2026-11-23, coordinator, from docs/decisions/wave1-piece-pool.md)
+
+- §0.2 and §4.2 use v1's 1,920 B/edit as a physical multiplier. It is a (G) allowance (amendment A4); size the pool
+  per docs/decisions/wave1-piece-pool.md.
+- §0.1 and §4.5(d) describe a proposed OS pin. The accepted fault-id design has no pins: readers hold a backing
+  reference (amendment A5, docs/decisions/wave1-os-fault-lease.md).
+- §4.5(c) places the add-dir walk "per snapshot retain"; at the pin it happens in `piece_checkpoint_begin`
+  (`add_store_prefix`), see amendment A7.

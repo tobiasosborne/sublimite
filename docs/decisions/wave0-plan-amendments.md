@@ -47,3 +47,16 @@ backing release; an unexpected "still in use" there is a contract violation (ASS
 Generation overflow: one comparison (ASSERT in debug, existing NOSPC in release) — the 584.5-year figure rests on an
 (E) rate, so it is not a physical bound. CLAUDE.md's globals line said "pinned `os_fault_service`", meaning the fixed
 global; reworded to "the fixed `os_fault_service` (... no pins)" so it cannot be read as the removed API.
+
+## A6. §4.1 live revisions: add the edit/replay checkpoint and the current text of a published session leaf
+
+From docs/decisions/wave1-piece-pool.md (correction b, accepted by the advisor): the plan's list of simultaneously
+retained revisions also needs the forward-edit / undo-replay checkpoint (v1 `src/undo/undo.c` `begin_replay` is the
+only production caller of `piece_checkpoint_begin` outside piece) and the published session leaf's current text.
+The v2 holder list itself is being redone from PLAN_V2 §2/§4 (advisor challenge 3), not copied from v1's session graph.
+
+## A7. §2 L1 piece: constant-time add-dir sharing at checkpoint begin is an acceptance condition
+
+From the same file (correction c): at the pin `add_store_prefix` walks the chunk directory during checkpoint
+**begin**, not per snapshot retain. O(1) directory sharing at begin is an acceptance condition of the Wave 1 piece
+bead, tested so that a single linear-sized allocation or loop cannot hide behind an allocation-call count.
